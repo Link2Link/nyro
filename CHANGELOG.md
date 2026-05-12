@@ -11,6 +11,7 @@ All notable changes to Nyro will be documented in this file.
 #### Fixes
 
 - **musl static build: eliminate OpenSSL dependency** (#125): add `default-features = false` to the workspace `reqwest` dependency and switch to `rustls-tls-native-roots`; this removes the `default-tls` feature that was silently pulling `native-tls` → `openssl-sys` into the build graph, which caused the `*-unknown-linux-musl` CI jobs to fail; `http2`, `charset`, and `macos-system-configuration` are retained explicitly to avoid regressions; TLS engine remains `rustls` on all platforms while native certificate stores (Windows Cert Store / macOS Keychain / Linux `/etc/ssl/certs`) continue to be used on non-musl targets
+- **musl static build: sqlite-vec BSD type compatibility** (#125): inject `CFLAGS_<target>=-Du_int8_t=uint8_t -Du_int16_t=uint16_t -Du_int64_t=uint64_t` in CI for musl targets so that `sqlite-vec v0.1.9`'s C source (which uses POSIX `u_int*_t` types absent from musl libc) compiles correctly via cc-rs's target-specific CFLAGS lookup
 
 ---
 

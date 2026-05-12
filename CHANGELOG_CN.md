@@ -11,6 +11,7 @@ Nyro 的所有重要变更均记录在此文件中。
 #### 修复
 
 - **musl 静态构建：消除 OpenSSL 依赖** (#125)：为工作区 `reqwest` 依赖添加 `default-features = false` 并切换至 `rustls-tls-native-roots`；根本原因是 `default-tls`（reqwest 默认 feature）会静默引入 `native-tls` → `openssl-sys` 依赖链，导致 `*-unknown-linux-musl` CI 构建失败；同时显式保留 `http2`、`charset`、`macos-system-configuration` 避免功能回归；所有平台的 TLS 引擎均保持 `rustls`，非 musl 目标继续使用系统原生证书库（Windows 证书库 / macOS Keychain / Linux `/etc/ssl/certs`），musl 静态二进制自动回退至打包的 Mozilla 根证书
+- **musl 静态构建：sqlite-vec BSD 类型兼容** (#125)：在 CI musl 构建步骤中注入 `CFLAGS_<target>=-Du_int8_t=uint8_t -Du_int16_t=uint16_t -Du_int64_t=uint64_t`；`sqlite-vec v0.1.9` 的 C 源码使用了 POSIX 扩展类型 `u_int*_t`，这些类型在 musl libc 中不存在，通过 cc-rs 的 target-specific CFLAGS 机制注入宏定义使编译正常通过
 
 ---
 
