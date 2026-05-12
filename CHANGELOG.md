@@ -4,6 +4,46 @@ All notable changes to Nyro will be documented in this file.
 
 ---
 
+## v1.7.0
+
+> Released on 2026-05-12
+
+#### Features
+
+- **System tray lifecycle fix** (#118): prevent app exit on window close — hide to tray instead; fix `TrayIcon` drop bug by managing lifetime via `app.manage()`; left-click tray icon restores window
+- **nyro-tools proxy subcommand rewrite** (#111): replace `--upstream-protocol` + `--upstream-endpoint` with single `--url` (`-u`); auto-detect and strip client version prefix from egress URL; restrict forwarding to known LLM ingress paths; add structured JSON logging with UUID correlation id and protocol-aware SSE assembly for all four protocols; add `-o/--output` for log file output and `-l/--log-mode` (all|req|resp) filter
+- **Claude Code OAuth on latest architecture** (#101): new `auth/drivers/claude.rs` PKCE driver registered through vendor-registry pipeline; add `anthropic/claude-code` channel and extension with OAuth-owned auth headers; introduce `compose_upstream_headers` helper centralizing the "OAuth driver suppresses default auth" invariant across all four upstream call sites; pin invariant with regression tests
+- **OAuth provider flow** (#58): add full OAuth credential support, Codex OAuth channel, and runtime wiring into proxy and Tauri
+- **Three-layer CI testing pyramid** (#84): Phase 1 — unit tests for protocol transformers (tool-call fragments, Anthropic thinking deltas, DeepSeek reasoning, Responses output items, tool correlation); Phase 2 — build artifact job + L3 Ollama E2E (7 links); Phase 3 — L2 aimock static E2E with 4 isolated instances (8 fixtures); Phase 4 — migrate smoke tests to `tests/e2e/`, add `storage-backends.yml` (pgvector daily schedule)
+- **Protocol / ProtocolEndpoint / Vendor three-concept model** (#89–#97, #119): replace the ambiguous `ProtocolFamily` with a clean orthogonal identity system — `Protocol` (enum: `OpenAICompatible` / `OpenAIResponses` / `AnthropicMessages` / `GoogleGenerativeAI`) for wire-format suite, `ProtocolEndpoint` (`{protocol, name, version}`) for specific API endpoint, `Vendor` via existing `Provider.vendor`; canonical short names (`openai-compat`, `openai-resps`, `anthropic-msgs`, `google-genai`) in config/JSON; three-tier alias table for full backward compatibility (old canonical strings, legacy brand names `openai`/`claude`/`gemini`, short aliases) with no data migration; `protocol_endpoints` JSON upgraded to protocol-keyed format (`base_url` at protocol level, optional `endpoints` subset array) with automatic migration on first read via `normalize_endpoints_json`
+- **Upstream response headers logging**: `call_non_stream` now returns `(Value, u16, HeaderMap)` preserving headers before `.json()` consumes the response; all three proxy paths (JSON, SSE stream, force-stream) capture upstream response headers and persist to `response_headers` in the request log
+- **Root health endpoint**: `GET /` and `HEAD /` return `{"status":"ok"}`, enabling load-balancer and Kubernetes liveness probes that default to `HEAD /`
+
+#### Refactoring
+
+- **Provider layer overhaul** (#107): merge `ProviderAdapter` + `VendorExtension` into unified `Vendor` trait via `VendorRegistry`; activate PassThrough fast-path through `negotiate()` to skip IR codec round-trip when ingress == egress protocol; `dispatch_pipeline` takes `RawEnvelope` + `AiRequest` at surface; `dispatcher.rs` split into `mod.rs` + `util.rs` + `accumulator.rs`; `Gateway` runtime fields migrated from `RwLock` to `ArcSwap` eliminating hot-path `.await`; CODEC_SCHEMA_VERSION bumped to 2
+- **Kernel stabilization** (#104): unified `GatewayError` taxonomy (15 variants, stable codes); `RequestContext` lifecycle tracking; observability and security split out of `handler.rs` into dedicated modules; single-orchestration `dispatcher.rs` replacing prior multi-file handler split
+- **OAuth credential storage** (#82): split credentials into dedicated `provider_oauth_credentials` table with CAS state machine (`connected` / `refreshing` / `error`) and optimistic lock (`status_version`); `OAuthCredentialStore` trait with 8 methods implemented for SQLite, PostgreSQL, and Memory; remove `access_token` / `refresh_token` / `expires_at` from `Provider` struct; auto-migrate existing OAuth data from `providers` table on startup; background refresh now uses `list_expiring()` + CAS
+- **Codec directories restructured by protocol**: old `codec/openai/`, `codec/anthropic/`, `codec/google/` removed; replaced by fully self-contained `codec/openai_compatible/`, `codec/openai_responses/`, `codec/anthropic_messages/`, `codec/google_generative/`
+- **Trait and type renames**: `ProtocolHandler` → `EndpointHandler`; `ProtocolCapabilities` → `EndpointCapabilities`; `ProtocolRegistration` → `EndpointRegistration`; `list_by_family` → `list_by_protocol`; backward-compat `pub use` aliases retained; `ProtocolFamily` and `VendorScope::Family` removed
+- **authMode normalization** (#73): rename preset JSON field `auth_mode` → `authMode`, narrow value `"api_key"` → `"apikey"` across JSON, DB, Rust and TypeScript; add SQLite/Postgres startup migration; reshape provider create/edit OAuth panel layout
+- **`protocol-id.ts` replaced by `protocol.ts`**: new `PROTOCOL_TABLE`, `PROTOCOL_ALIASES`, `resolveProtocol`, `parseProtocolEndpoint`; `prettyName` returns Protocol display name only; Providers/Connect/Routes pages aligned to canonical IDs
+
+#### Fixes
+
+- Preserve thinking metadata across protocol conversion (#114)
+- Preserve full Anthropic usage fields; enable native passthrough for ZhipuAI and MiniMax (#115)
+- Fix stream passthrough error propagation and `RawEvent` forwarding (#112)
+- `passthrough_run` now substitutes virtual model alias with `actual_model` (#109)
+- Preserve `reasoning_content` through proxy for DeepSeek thinking mode (#98)
+- Correct URL and auth header composition for OpenAI-compat vendors on Anthropic egress (#105)
+- Handle mlx-lm `reasoning` field name; include `reasoning_content` in non-streaming responses (#103)
+- Preserve Anthropic Thinking blocks through gateway (#90)
+- Fix dark mode text contrast for `text-slate-800` (#100)
+- Fix missing lock file and directory in runtime Docker build (#71)
+
+---
+
 ## v1.6.2
 
 > Released on 2026-04-19

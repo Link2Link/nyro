@@ -4,6 +4,46 @@ Nyro 的所有重要变更均记录在此文件中。
 
 ---
 
+## v1.7.0
+
+> 发布于 2026-05-12
+
+#### 功能
+
+- **系统托盘生命周期修复** (#118)：关闭窗口时改为隐藏到托盘而非退出应用；修复 `TrayIcon` 因所有权提前释放导致托盘消失的 bug（通过 `app.manage()` 管理生命周期）；点击托盘图标可恢复窗口
+- **nyro-tools proxy 子命令重写** (#111)：将 `--upstream-protocol` + `--upstream-endpoint` 合并为单一 `--url`（`-u`）参数；自动检测并剥离出口 URL 中的客户端版本前缀；仅转发已知 LLM 入口路径；新增结构化 JSON 日志（含 UUID 关联 ID 和四种协议的 SSE 聚合）；新增 `-o/--output` 指定日志输出文件和 `-l/--log-mode`（all|req|resp）过滤模式
+- **Claude Code OAuth 重构接入** (#101)：新增 `auth/drivers/claude.rs` PKCE 驱动，通过 vendor-registry 流水线注册；新增 `anthropic/claude-code` channel，auth header 完全由 OAuth 驱动管理；引入 `compose_upstream_headers` 统一处理四处上游调用点的"OAuth 驱动优先于默认 auth"不变量；通过回归测试锁定该不变量
+- **Codex OAuth Provider 流程** (#58)：新增完整 OAuth 凭证支持、Codex OAuth channel，并接入代理与 Tauri 运行时
+- **三层 CI 测试金字塔** (#84)：Phase 1 — 协议转换单测（tool-call 片段、Anthropic 思考增量、DeepSeek reasoning、Responses 输出项、工具关联）；Phase 2 — 构建产物 job + L3 Ollama E2E（7 链路）；Phase 3 — L2 aimock 静态 E2E（4 隔离实例 / 8 测试用例）；Phase 4 — smoke 测试迁移至 `tests/e2e/`，新增 `storage-backends.yml`（pgvector 每日定时）
+- **Protocol / ProtocolEndpoint / Vendor 三概念正交模型** (#89–#97, #119)：用清晰的三层身份体系取代歧义的 `ProtocolFamily`——`Protocol`（枚举：`OpenAICompatible` / `OpenAIResponses` / `AnthropicMessages` / `GoogleGenerativeAI`）表示 wire-format 协议套件，`ProtocolEndpoint`（`{protocol, name, version}`）标识具体 API 端点，`Vendor` 复用现有 `Provider.vendor`；配置/JSON 使用规范短名（`openai-compat`、`openai-resps`、`anthropic-msgs`、`google-genai`）；三层 alias 表保障完全向后兼容（旧 canonical 字符串、遗留品牌名 `openai`/`claude`/`gemini`、短别名），无需数据迁移；`protocol_endpoints` JSON 升级为 protocol-keyed 格式（`base_url` 移至协议层、可选 `endpoints` 子集数组），首次读取时通过 `normalize_endpoints_json` 自动迁移
+- **上游响应头捕获入日志**：`call_non_stream` 返回类型升级为 `(Value, u16, HeaderMap)`，在 `.json()` 消费响应前保存响应头；三条代理路径（JSON 非流式、SSE 流式、force-stream）均捕获上游响应头并持久化至日志 `response_headers` 字段
+- **根路径健康检查端点**：`GET /` 和 `HEAD /` 均返回 `{"status":"ok"}`，支持默认使用 `HEAD /` 探活的负载均衡器和 Kubernetes liveness probe
+
+#### 重构
+
+- **Provider 层全面重构** (#107)：合并 `ProviderAdapter` + `VendorExtension` 为统一 `Vendor` trait（通过 `VendorRegistry`）；通过 `negotiate()` 激活 PassThrough 快速路径（ingress == egress 协议时跳过 IR 编解码往返）；`dispatch_pipeline` 接口改为 `RawEnvelope` + `AiRequest`；`dispatcher.rs` 拆分为 `mod.rs` + `util.rs` + `accumulator.rs`；`Gateway` 运行时字段从 `RwLock` 迁移至 `ArcSwap`，消除热路径 `.await`；CODEC_SCHEMA_VERSION 升至 2
+- **内核稳定化** (#104)：统一 `GatewayError` 分类体系（15 个变体，稳定错误码）；`RequestContext` 生命周期追踪；可观测性与安全鉴权逻辑从 `handler.rs` 拆分至独立模块；`dispatcher.rs` 整合为单一编排层
+- **OAuth 凭证存储** (#82)：将 OAuth 凭证拆分至专用 `provider_oauth_credentials` 表，实现 CAS 状态机（`connected` / `refreshing` / `error`）和乐观锁（`status_version`）；`OAuthCredentialStore` trait 提供 8 个方法，实现覆盖 SQLite、PostgreSQL、Memory 三端；将 `access_token` / `refresh_token` / `expires_at` 从 `Provider` 结构体移除；启动时自动迁移现有 OAuth 数据；后台刷新改为 `list_expiring()` + CAS 机制
+- **codec 目录按协议重新组织**：移除旧 `codec/openai/`、`codec/anthropic/`、`codec/google/` 目录；替换为完全自包含的 `codec/openai_compatible/`、`codec/openai_responses/`、`codec/anthropic_messages/`、`codec/google_generative/`
+- **Trait 与类型重命名**：`ProtocolHandler` → `EndpointHandler`；`ProtocolCapabilities` → `EndpointCapabilities`；`ProtocolRegistration` → `EndpointRegistration`；`list_by_family` → `list_by_protocol`；保留 `pub use` 向后兼容别名；移除 `ProtocolFamily` 和 `VendorScope::Family`
+- **authMode 字段规范化** (#73)：预设 JSON 字段 `auth_mode` → `authMode`，值 `"api_key"` → `"apikey"`，覆盖 JSON/DB/Rust/TypeScript；新增 SQLite/Postgres 启动迁移；调整 Provider 创建/编辑 OAuth 面板布局
+- **`protocol-id.ts` 替换为 `protocol.ts`**：新增 `PROTOCOL_TABLE`、`PROTOCOL_ALIASES`、`resolveProtocol`、`parseProtocolEndpoint`；`prettyName` 仅返回 Protocol 显示名；Providers/Connect/Routes 页面全面对齐规范 ID
+
+#### 修复
+
+- 修复协议转换过程中思考元数据丢失问题 (#114)
+- 修复 Anthropic 完整 usage 字段丢失；为 ZhipuAI/MiniMax 启用原生 passthrough (#115)
+- 修复流式 passthrough 错误传播与 `RawEvent` 转发 (#112)
+- `passthrough_run` 现正确将虚拟模型别名替换为 `actual_model` (#109)
+- 修复 DeepSeek 思考模式下 `reasoning_content` 在代理中丢失的问题 (#98)
+- 修复 OpenAI-compat vendor 在 Anthropic egress 时 URL 与鉴权头构造错误 (#105)
+- 修复 mlx-lm `reasoning` 字段名处理；非流式响应中正确包含 `reasoning_content` (#103)
+- 修复 Anthropic Thinking block 在网关中丢失的问题 (#90)
+- 修复 `text-slate-800` 在深色模式下对比度异常 (#100)
+- 修复运行时 Docker 构建缺失 lock 文件与目录 (#71)
+
+---
+
 ## v1.6.2
 
 > 发布于 2026-04-19
