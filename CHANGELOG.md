@@ -4,6 +4,17 @@ All notable changes to Nyro will be documented in this file.
 
 ---
 
+## v1.7.5
+
+> Released on 2026-05-19
+
+#### Fixes
+
+- **Ingress decode failure logging** (#164): record request-decode failures from Anthropic Messages, OpenAI-compatible Chat Completions / Embeddings / Responses, and Google Generate Content ingress handlers in the in-app log module with request metadata and 400 responses
+- **Anthropic context management beta compatibility** (#165): accept the `context_management` request shape sent by the Anthropic `context-management-2025-06-27` beta, preserving it as pass-through JSON instead of rejecting requests that omit the obsolete outer `type` field
+
+---
+
 ## v1.7.4
 
 > Released on 2026-05-19

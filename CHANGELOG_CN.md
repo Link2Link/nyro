@@ -4,6 +4,17 @@ Nyro 的所有重要变更均记录在此文件中。
 
 ---
 
+## v1.7.5
+
+> 发布于 2026-05-19
+
+#### 修复
+
+- **Ingress decode 失败日志记录** (#164)：Anthropic Messages、OpenAI-compatible Chat Completions / Embeddings / Responses 与 Google Generate Content 入口在请求 decode 失败时，现在会在应用内日志模块记录请求元数据与 400 响应
+- **Anthropic context management beta 兼容** (#165)：兼容 Anthropic `context-management-2025-06-27` beta 发送的 `context_management` 请求形状，将其作为透传 JSON 保留，不再因缺少旧的外层 `type` 字段而返回 400
+
+---
+
 ## v1.7.4
 
 > 发布于 2026-05-19
