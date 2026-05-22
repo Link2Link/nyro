@@ -4,6 +4,36 @@ Nyro 的所有重要变更均记录在此文件中。
 
 ---
 
+## v1.7.6
+
+> 发布于 2026-05-22
+
+#### 新功能
+
+- **Vertex AI Provider 支持** (#172)：新增 Vertex AI 内置 Provider，修复 Gemini 入口认证处理
+- **Provider 复制工作流** (#173)：支持一键复制已有 Provider 配置
+- **Provider 复制时继承路由目标** (#178)：复制 Provider 时自动关联原 Provider 的路由目标
+- **客户端缓存提示透传** (#181)：将客户端请求中的 `anthropic-beta` 缓存控制提示转发至上游 Provider，同时不泄露客户端身份头
+- **上游错误信息保留** (#184)：代理转发失败时捕获并展示上游响应体和状态码，改善调试可见性
+- **Gemini 流式 JSON 处理** (#182)：处理 Gemini 流式端点返回的非流式 JSON 响应，将其解析到统一 IR 流式管线中
+
+#### 改进 / 重构
+
+- **Protocol 标识统一** (#174)：将不透明的短代码替换为描述性的规范 Protocol 标识符
+- **GoogleGenerativeAI → GoogleGemini 重命名** (#175)：重命名协议枚举变体并统一所有 Google/Gemini 端点常量
+- **Codec 目录重组** (#176)：将 Codec 模块按 `vendor/endpoint` 目录结构重组，与协议边界对齐
+- **Admin 模块化** (#180)：将单体 Admin Handler 拆分为专注的子模块，实现更清晰的职责分离
+
+#### 修复
+
+- **Storage E2E 模型同步** (#167)：对齐 Storage E2E 测试与当前模型定义
+- **Storage E2E 认证模式** (#168)：在 Storage E2E 测试中使用有效的 `apikey` 认证模式
+- **Storage E2E Token 检查** (#169)：移除 Storage E2E 测试中不可靠的 `total_output_tokens` 断言
+- **Postgres api_keys INSERT** (#170)：移除 api_keys INSERT 语句中过时的 `status` 列
+- **Postgres AVG() f64 兼容** (#171)：将 `AVG()` 结果转换为 `FLOAT8`，确保 Rust 中 f64 类型映射正确
+
+---
+
 ## v1.7.5
 
 > 发布于 2026-05-19
