@@ -4,6 +4,36 @@ All notable changes to Nyro will be documented in this file.
 
 ---
 
+## v1.7.6
+
+> Released on 2026-05-22
+
+#### Features
+
+- **Vertex AI provider support** (#172): add Vertex AI as a built-in provider and fix Gemini ingress authentication handling
+- **Provider copy workflow** (#173): allow duplicating an existing provider configuration with a single action
+- **Route target inheritance in provider copy** (#178): automatically append route target associations when copying a provider
+- **Client cache hint forwarding** (#181): forward `anthropic-beta` cache-control hints from the client request to the upstream provider without leaking client identity headers
+- **Upstream error evidence preservation** (#184): capture and surface upstream response body and status code when proxy forwarding fails, improving debugging visibility
+- **Gemini stream JSON handling** (#182): handle non-streaming JSON responses returned by Gemini stream endpoints, parsing them into the unified IR stream pipeline
+
+#### Improvements / Refactoring
+
+- **Protocol slug unification** (#174): replace opaque short codes with descriptive canonical Protocol identifiers across the codebase
+- **GoogleGenerativeAI → GoogleGemini rename** (#175): rename the protocol enum variant and unify all Google/Gemini endpoint constants
+- **Codec directory restructuring** (#176): reorganize the codec module into a `vendor/endpoint` directory layout aligned with protocol boundaries
+- **Admin modularization** (#180): split monolithic admin handler into focused sub-modules for cleaner separation of concerns
+
+#### Fixes
+
+- **Storage E2E model sync** (#167): align storage E2E test harness with current model definitions
+- **Storage E2E auth mode** (#168): use valid `apikey` auth_mode in storage E2E harness
+- **Storage E2E token check** (#169): remove unreliable `total_output_tokens` assertion from storage E2E tests
+- **Postgres api_keys INSERT** (#170): remove stale `status` column from the api_keys INSERT statement
+- **Postgres AVG() f64 compatibility** (#171): cast `AVG()` results to `FLOAT8` for proper f64 mapping in Rust
+
+---
+
 ## v1.7.5
 
 > Released on 2026-05-19
