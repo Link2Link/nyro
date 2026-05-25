@@ -1,4 +1,5 @@
 use axum::Router;
+use axum::extract::DefaultBodyLimit;
 use axum::http::{HeaderValue, Method, header};
 use axum::middleware;
 use axum::routing::{get, post};
@@ -9,6 +10,9 @@ use super::context::inject_context;
 use super::handler;
 use super::ingress;
 use crate::Gateway;
+
+// Multimodal Gemini/OpenAI-compatible requests commonly carry base64 media in JSON.
+const PROXY_JSON_BODY_LIMIT_BYTES: usize = 100 * 1024 * 1024;
 
 pub fn create_router(gateway: Gateway) -> Router {
     let router = Router::new()
@@ -42,6 +46,7 @@ pub fn create_router(gateway: Gateway) -> Router {
     );
 
     router
+        .layer(DefaultBodyLimit::max(PROXY_JSON_BODY_LIMIT_BYTES))
         .layer(middleware::from_fn(inject_context))
         .layer(cors)
         .layer(TraceLayer::new_for_http())
@@ -100,5 +105,67 @@ fn parse_allow_origin(origins: &[String]) -> AllowOrigin {
         AllowOrigin::any()
     } else {
         AllowOrigin::list(values)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use crate::config::GatewayConfig;
+
+    use super::*;
+
+    async fn spawn_proxy() -> String {
+        let mut config = GatewayConfig::default();
+        config.data_dir = PathBuf::from(std::env::temp_dir()).join(format!(
+            "nyro-proxy-body-limit-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let (gateway, _log_rx) = Gateway::new(config).await.expect("gateway init");
+        let app = create_router(gateway);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test proxy");
+        let addr = listener.local_addr().expect("test proxy address");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn proxy_accepts_json_bodies_larger_than_axum_default_limit() {
+        let base_url = spawn_proxy().await;
+        let large_content = "x".repeat(2 * 1024 * 1024);
+        let body = serde_json::json!({
+            "contents": [
+                {
+                    "role": "user",
+                    "parts": [
+                        {
+                            "text": large_content,
+                        }
+                    ],
+                }
+            ],
+        });
+
+        let response = reqwest::Client::new()
+            .post(format!(
+                "{base_url}/v1beta/models/unconfigured-gemini:generateContent"
+            ))
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(body.to_string())
+            .send()
+            .await
+            .expect("proxy response");
+
+        assert_ne!(
+            response.status(),
+            reqwest::StatusCode::PAYLOAD_TOO_LARGE,
+            "proxy must not reject large Gemini JSON bodies with axum's default 2 MiB limit"
+        );
     }
 }
