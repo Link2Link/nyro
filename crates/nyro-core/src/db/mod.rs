@@ -28,6 +28,11 @@ pub async fn init_pool(data_dir: &Path) -> anyhow::Result<SqlitePool> {
 
 pub async fn migrate(pool: &SqlitePool) -> anyhow::Result<()> {
     sqlx::raw_sql(INIT_SQL).execute(pool).await?;
+
+    // Rename columns for MySQL compat: must happen before any code references new column names
+    rename_column_if_needed(pool, "settings", "key", "name").await?;
+    rename_column_if_needed(pool, "api_keys", "key", "token").await?;
+
     ensure_provider_column(pool, "vendor", "TEXT").await?;
     ensure_provider_column(pool, "preset_key", "TEXT").await?;
     ensure_provider_column(pool, "channel", "TEXT").await?;
@@ -107,7 +112,7 @@ pub async fn migrate(pool: &SqlitePool) -> anyhow::Result<()> {
     ensure_model_column(pool, "enable_payload", "INTEGER").await?;
 
     // Rename settings key log_record_payloads → enable_payload
-    sqlx::query("UPDATE settings SET key = 'enable_payload' WHERE key = 'log_record_payloads'")
+    sqlx::query("UPDATE settings SET name = 'enable_payload' WHERE name = 'log_record_payloads'")
         .execute(pool)
         .await
         .ok();
@@ -510,7 +515,7 @@ async fn ensure_api_key_tables(pool: &SqlitePool) -> anyhow::Result<()> {
     sqlx::query(
         r#"CREATE TABLE IF NOT EXISTS api_keys (
             id          TEXT PRIMARY KEY,
-            key         TEXT NOT NULL UNIQUE,
+            token       TEXT NOT NULL UNIQUE,
             name        TEXT NOT NULL,
             rpm         INTEGER,
             rpd         INTEGER,
@@ -535,7 +540,7 @@ async fn ensure_api_key_tables(pool: &SqlitePool) -> anyhow::Result<()> {
     .execute(pool)
     .await?;
 
-    sqlx::query("CREATE INDEX IF NOT EXISTS idx_api_keys_key ON api_keys(key)")
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_api_keys_token ON api_keys(token)")
         .execute(pool)
         .await?;
     sqlx::query(
@@ -843,7 +848,7 @@ CREATE TABLE IF NOT EXISTS request_logs (
 );
 
 CREATE TABLE IF NOT EXISTS settings (
-    key        TEXT PRIMARY KEY,
+    name       TEXT PRIMARY KEY,
     value      TEXT NOT NULL,
     updated_at TEXT DEFAULT (datetime('now'))
 );
