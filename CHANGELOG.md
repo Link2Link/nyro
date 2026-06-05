@@ -4,6 +4,37 @@ All notable changes to Nyro will be documented in this file.
 
 ---
 
+## v1.8.0
+
+> Released on 2026-06-05
+
+#### Features
+
+- **MySQL storage backend** (#196): add complete MySQL storage implementation with infrastructure, config, connection pool, and documentation
+- **Multi-replica production readiness** (#203): add config epoch sync, health probes, and webui-dir support for multi-replica deployments
+- **Per-model payload logging control** (#195): add per-model payload logging toggle and unify `enable_*` naming convention
+- **Graceful shutdown** (#192): add graceful shutdown handling for the server
+- **Gemini API max request body** (#188): add configurable maximum request body setting for Gemini API proxy
+
+#### Improvements / Refactoring
+
+- **AI Gateway terminology unification** (#190): rename `routes` to `models` across the codebase for standard AI gateway terminology
+- **Request logs field renaming** (#191): rename `route_id`/`route_name` → `model_id`/`model_name` and `strategy` → `balance` in `request_logs`
+- **Virtual model field merge** (#194): merge `virtual_model` into the `name` field, simplifying the data model
+- **Response cache removal** (#187): remove exact match and semantic similarity response cache modules
+- **Unused crypto module cleanup** (#198): remove unused AES-256-GCM crypto module and stale sqlite-vec CI step
+- **Unused dependency cleanup** (#199): remove 8 unused Cargo dependencies
+- **WebUI model label style** (#197): use code label style for model name in model list
+
+#### Fixes
+
+- **Gemini proxy auth and streaming** (#186): fix native Gemini proxy authentication and streaming behavior
+- **MySQL SUM type compatibility** (#201): cast MySQL `SUM()` results to `SIGNED` for proper i64 mapping in Rust
+- **MySQL AVG type compatibility** (#202): cast MySQL `AVG()` results to `DOUBLE` for proper f64 mapping in Rust
+- **Storage E2E MySQL backend** (#200): sync storage E2E test harness with renamed struct fields and add MySQL backend
+
+---
+
 ## v1.7.6
 
 > Released on 2026-05-22
