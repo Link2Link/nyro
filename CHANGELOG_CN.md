@@ -4,6 +4,31 @@ Nyro 的所有重要变更均记录在此文件中。
 
 ---
 
+## v1.8.1
+
+> 发布于 2026-06-15
+
+#### 新功能
+
+- **服务端部署模式** (#206)：新增 `--mode` 启动参数和 `embed-webui` Cargo feature，支持服务端分布式部署
+- **K8S 外部数据库迁移** (#207)：支持 K8S 环境下外部数据库迁移工作流，适配生产环境部署
+- **清空所有日志** (#216)：WebUI 中新增一键清空全部请求日志功能
+
+#### 改进 / 重构
+
+- **Makefile 构建工具** (#210, #213)：新增 `build nyro-tools` 和 `cargo test` Makefile 命令
+- **Clippy 警告清理** (#218)：修复 nyro-core 和 nyro-server 中全部 clippy 警告
+- **发版文档** (#219)：新增本地发版操作手册和 AGENTS 发版流程文档
+
+#### 修复
+
+- **Gemini from_uri 内容缺失** (#205)：修复 Gemini 处理时 `from_uri` 消息内容被跳过的问题
+- **OpenAI responses 工具调用解析** (#212)：修复 OpenAI responses API 工具调用完成事件解析错误
+- **Desktop 执行测试导入错误** (#214)：修复 desktop 执行测试中的导入错误
+- **Anthropic 内联 system 消息** (#217)：支持 Claude Code >=2.1.154 发送的内联 `system` 角色消息
+
+---
+
 ## v1.8.0
 
 > 发布于 2026-06-05

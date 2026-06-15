@@ -4,6 +4,31 @@ All notable changes to Nyro will be documented in this file.
 
 ---
 
+## v1.8.1
+
+> Released on 2026-06-15
+
+#### Features
+
+- **Server deployment modes** (#206): add `--mode` flag and `embed-webui` cargo feature for server distributed deployment
+- **K8S external database migration** (#207): support K8S external database migration workflow for production deployments
+- **Clear all logs** (#216): add clear all request logs functionality in the WebUI
+
+#### Improvements / Refactoring
+
+- **Makefile build tooling** (#210, #213): add `build nyro-tools` and `cargo test` commands to Makefile
+- **Clippy warnings cleanup** (#218): fix all clippy warnings across nyro-core and nyro-server
+- **Release documentation** (#219): add local release runbook and AGENTS release process documentation
+
+#### Fixes
+
+- **Gemini from_uri content** (#205): fix `from_uri` message content being skipped during Gemini processing
+- **OpenAI responses tool call parsing** (#212): fix tool call done event parsing in OpenAI responses API
+- **Desktop execute tests** (#214): fix import error in desktop execute tests
+- **Anthropic inline system messages** (#217): support inline `system` role messages from Claude Code >=2.1.154
+
+---
+
 ## v1.8.0
 
 > Released on 2026-06-05
