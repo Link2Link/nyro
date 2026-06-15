@@ -26,8 +26,11 @@ flowchart TD
 ```bash
 git checkout master
 git pull
+git fetch --tags --prune --prune-tags  # sync tags with remote (tags are created on GitHub)
 git checkout -b release/vX.Y.Z
 ```
+
+> Tags are created remotely on GitHub, so always `fetch --tags` before determining the previous version. Otherwise `git describe` / `git tag -l` may report a stale tag and the changelog range will be wrong.
 
 ## Step 2: Bump the version
 
@@ -53,8 +56,10 @@ The changelog content is derived from **all commits since the last version tag**
 1. Collect the commits:
 
 ```bash
-git log $(git describe --tags --abbrev=0)..HEAD --no-merges --oneline
+git --no-pager log $(git --no-pager describe --tags --abbrev=0)..HEAD --no-merges --oneline
 ```
+
+> Use `--no-pager` so the command prints directly without opening the `less` pager (which would otherwise require `q` to exit).
 
 2. Summarize into the following three categories, each annotated with its PR number (consistent with the existing changelog style):
    - Features
