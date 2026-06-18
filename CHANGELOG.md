@@ -4,6 +4,18 @@ All notable changes to Nyro will be documented in this file.
 
 ---
 
+## v1.8.2
+
+> Released on 2026-06-18
+
+#### Fixes
+
+- **Codec extra field passthrough** (#225): skip cross-protocol internal keys when passing through the extra field
+- **Access control toggle copy** (#224): clarify the access control toggle copy in the WebUI to describe the current state
+- **WebUI build on pnpm 10+** (#223): allow the esbuild build script for pnpm 10+ and bump CI pnpm to 11 (Node 22)
+
+---
+
 ## v1.8.1
 
 > Released on 2026-06-15
