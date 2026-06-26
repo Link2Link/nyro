@@ -62,7 +62,7 @@ export default function LogsPage() {
   const providerOptions = useMemo(
     () => [
       { value: "", label: isZh ? "全部提供商" : "All Providers" },
-      ...providers.map((p) => ({ value: p.name, label: p.name })),
+      ...providers.map((p) => ({ value: p.id, label: p.name })),
     ],
     [providers, isZh],
   );
