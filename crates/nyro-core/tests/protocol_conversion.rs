@@ -2260,3 +2260,122 @@ fn gemini_encoder_file_data_with_mime_type_emits_mime_type() {
     );
     assert_eq!(fd["mimeType"].as_str(), Some("application/pdf"));
 }
+
+#[test]
+fn anthropic_to_openai_strips_tool_use_from_content_array() {
+    // Regression for Anthropic Messages → OpenAI Chat Completions cross-protocol
+    // conversion: the Anthropic decoder carries an assistant `tool_use` BOTH in
+    // `content` blocks AND in `tool_calls`. The OpenAI encoder must NOT emit the
+    // ToolUse block into the `content` array (OpenAI only accepts text/image/...
+    // part types there) — otherwise strict upstreams reject with:
+    //   400 "messages[N]: unknown variant `function`, expected `text`".
+    // The tool call must instead live solely in the `tool_calls` array.
+    let raw = serde_json::json!({
+        "model": "deepseek-v4-flash",
+        "max_tokens": 1024,
+        "tools": [{
+            "name": "Bash",
+            "description": "run a shell command",
+            "input_schema": {
+                "type": "object",
+                "properties": {"command": {"type": "string"}}
+            }
+        }],
+        "messages": [
+            {"role": "user", "content": [{"type": "text", "text": "list the project files"}]},
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "text", "text": "Sure, listing files."},
+                    {"type": "tool_use", "id": "call_a", "name": "Bash", "input": {"command": "ls -la"}}
+                ]
+            },
+            {
+                "role": "user",
+                "content": [
+                    {"type": "tool_result", "tool_use_id": "call_a", "content": "file1\nfile2"}
+                ]
+            }
+        ]
+    });
+
+    let ir = AnthropicDecoder
+        .decode_request(raw)
+        .expect("decode anthropic request");
+
+    let (body, _) = OpenAIEncoder
+        .encode_request(&ir)
+        .expect("encode openai body");
+
+    let msgs = body
+        .get("messages")
+        .and_then(|v| v.as_array())
+        .expect("messages array");
+
+    // (a) No assistant content part may carry type:"function" (the bug).
+    for (i, m) in msgs.iter().enumerate() {
+        if m.get("role").and_then(|v| v.as_str()) != Some("assistant") {
+            continue;
+        }
+        if let Some(arr) = m.get("content").and_then(|v| v.as_array()) {
+            for part in arr {
+                let ty = part.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                assert_ne!(
+                    ty, "function",
+                    "assistant[{i}] content leaked a `function` part into content array: {part:?}"
+                );
+            }
+        }
+    }
+
+    // (b) The tool call survives intact in tool_calls (id / name / arguments).
+    let call = msgs
+        .iter()
+        .filter_map(|m| m.get("tool_calls").and_then(|v| v.as_array()))
+        .flatten()
+        .find(|tc| tc.get("id").and_then(|v| v.as_str()) == Some("call_a"))
+        .expect("tool_call call_a must be preserved in tool_calls");
+    assert_eq!(call.get("type").and_then(|v| v.as_str()), Some("function"));
+    assert_eq!(
+        call.get("function")
+            .and_then(|f| f.get("name"))
+            .and_then(|v| v.as_str()),
+        Some("Bash")
+    );
+    let args = call
+        .get("function")
+        .and_then(|f| f.get("arguments"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    assert!(
+        args.contains("ls -la"),
+        "tool call arguments must survive, got: {args}"
+    );
+
+    // (c) tool_result message is correlated back to the same id.
+    let tool_msg = msgs
+        .iter()
+        .find(|m| m.get("role").and_then(|v| v.as_str()) == Some("tool"))
+        .expect("tool message present");
+    assert_eq!(
+        tool_msg.get("tool_call_id").and_then(|v| v.as_str()),
+        Some("call_a")
+    );
+
+    // (d) tool definitions survive.
+    let tools = body
+        .get("tools")
+        .and_then(|v| v.as_array())
+        .expect("tools array");
+    assert_eq!(
+        tools[0].get("type").and_then(|v| v.as_str()),
+        Some("function")
+    );
+    assert_eq!(
+        tools[0]
+            .get("function")
+            .and_then(|f| f.get("name"))
+            .and_then(|v| v.as_str()),
+        Some("Bash")
+    );
+}

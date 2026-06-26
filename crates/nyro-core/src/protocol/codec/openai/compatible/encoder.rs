@@ -450,25 +450,40 @@ fn encode_message(msg: &Message) -> Result<Value> {
             map.insert("content".into(), Value::String(t.clone()));
         }
         MessageContent::Blocks(blocks) => {
-            // Strip Thinking blocks for assistant messages — they are surfaced
-            // via the top-level `reasoning_content` field carried in `meta`
-            // (see anthropic::messages decoder). Emitting them as plain text
-            // would duplicate reasoning into the visible content and break
-            // upstreams like Xiaomi Mimo that require strict thinking-mode
-            // round-tripping via `reasoning_content`.
-            let filter_thinking = msg.role == Role::Assistant;
+            // For assistant messages, strip blocks that are already expressed
+            // elsewhere in the OpenAI shape:
+            //   - Thinking / RedactedThinking: surfaced via the top-level
+            //     `reasoning_content` field carried in `meta` (see the Anthropic
+            //     messages decoder). Emitting them as plain text would duplicate
+            //     reasoning and break strict thinking-mode upstreams.
+            //   - ToolUse: already expressed via the `tool_calls` array below.
+            //     Encoding it into `content` would produce `{type:"function"}`,
+            //     which OpenAI chat/completions rejects with
+            //     "unknown variant `function`, expected `text`". This is the
+            //     root cause of tool calls failing in Anthropic Messages →
+            //     OpenAI cross-protocol conversion (the Anthropic decoder
+            //     carries `tool_use` in BOTH `content` and `tool_calls`).
+            let strip_for_assistant = msg.role == Role::Assistant;
             let parts: Vec<Value> = blocks
                 .iter()
                 .filter(|b| {
-                    !(filter_thinking
+                    !(strip_for_assistant
                         && matches!(
                             b,
-                            ContentBlock::Thinking { .. } | ContentBlock::RedactedThinking { .. }
+                            ContentBlock::Thinking { .. }
+                                | ContentBlock::RedactedThinking { .. }
+                                | ContentBlock::ToolUse { .. }
                         ))
                 })
                 .map(encode_content_block_for_openai)
                 .collect();
-            map.insert("content".into(), Value::Array(parts));
+            if !parts.is_empty() {
+                map.insert("content".into(), Value::Array(parts));
+            }
+            // An assistant turn that carries only tool calls / thinking has no
+            // textual content — leave `content` unset (OpenAI accepts its
+            // absence when `tool_calls` is present) rather than emitting `[]`,
+            // which some strict upstreams reject.
         }
     }
 
