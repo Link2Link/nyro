@@ -122,6 +122,7 @@ pub fn create_router(gateway: Gateway, admin_token: Option<String>) -> Router {
         .route("/stats/hourly", get(stats_hourly))
         .route("/stats/models", get(stats_by_model))
         .route("/stats/providers", get(stats_by_provider))
+        .route("/stats/api-keys", get(stats_by_api_key))
         .route("/settings/:key", get(get_setting).put(set_setting))
         .route("/status", get(get_status))
         .route("/config/export", get(export_config_handler))
@@ -508,6 +509,7 @@ struct LogQueryParams {
     model: Option<String>,
     status_min: Option<i32>,
     status_max: Option<i32>,
+    api_key: Option<String>,
 }
 
 async fn get_log_handler(
@@ -536,6 +538,7 @@ async fn query_logs_handler(
         model: params.model,
         status_min: params.status_min,
         status_max: params.status_max,
+        api_key: params.api_key,
     };
     match gw.admin().query_logs(q).await {
         Ok(v) => Json(serde_json::json!({ "data": v })).into_response(),
@@ -602,6 +605,16 @@ async fn stats_by_provider(
     Query(params): Query<StatsRangeParams>,
 ) -> impl IntoResponse {
     match gw.admin().get_stats_by_provider(params.hours).await {
+        Ok(v) => Json(serde_json::json!({ "data": v })).into_response(),
+        Err(e) => err(e),
+    }
+}
+
+async fn stats_by_api_key(
+    State(gw): State<Gateway>,
+    Query(params): Query<StatsRangeParams>,
+) -> impl IntoResponse {
+    match gw.admin().get_stats_by_api_key(params.hours).await {
         Ok(v) => Json(serde_json::json!({ "data": v })).into_response(),
         Err(e) => err(e),
     }
