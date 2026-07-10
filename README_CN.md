@@ -1,3 +1,6 @@
+> 本仓库是 Nyro Rust 版本的独立维护分支，与原维护者不存在隶属或官方授权关系。
+> 上游 Go 重写版本保留在 `upstream-go` 分支。
+
 <p align="center">
   <img width="120" src="docs/images/NYRO-logo.png">
 </p>

@@ -1,3 +1,7 @@
+> This repository is an independently maintained Rust fork of Nyro.
+> It is not affiliated with or endorsed by the original maintainers.
+> The Go rewrite is preserved in the `upstream-go` branch.
+
 <p align="center">
   <img width="120" src="docs/images/NYRO-logo.png">
 </p>
