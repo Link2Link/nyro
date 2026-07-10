@@ -4,163 +4,177 @@ on:
   push:
     branches:
       - master
-      - 'release/**'
+      - "release/**"
   pull_request:
+    branches:
+      - master
   workflow_dispatch:
+
+permissions:
+  contents: read
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  build:
+  webui-check:
+    name: WebUI check
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Rust cache
-        uses: Swatinem/rust-cache@v2
-
-      - name: Setup Node
-        uses: actions/setup-node@v4
-        with:
-          node-version: 22
-
-      - name: Setup pnpm
-        uses: pnpm/action-setup@v4
-        with:
-          version: 11
-
-      - name: Install Linux system deps
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends \
-            pkg-config libssl-dev
-
-      - name: Build webui
-        run: |
-          pnpm -C webui install --frozen-lockfile
-          pnpm -C webui build
-
-      - name: Rust fmt check
-        run: cargo fmt --all -- --check
-
-      - name: Cargo check
-        run: cargo check --workspace --exclude nyro-desktop
-
-      - name: Build nyro-server (debug)
-        run: cargo build -p nyro-server
-
-      - name: Check nyro-server slim build (no embed-webui, no webui/dist required)
-        run: cargo check -p nyro-server --no-default-features
-
-      - name: Build nyro-tools (debug)
-        run: cargo build -p nyro-tools
-
-      - name: Upload nyro-server binary
-        uses: actions/upload-artifact@v4
-        with:
-          name: nyro-server-linux-x86_64
-          path: target/debug/nyro-server
-          retention-days: 1
-
-      - name: Upload nyro-tools binary
-        uses: actions/upload-artifact@v4
-        with:
-          name: nyro-tools-linux-x86_64
-          path: target/debug/nyro-tools
-          retention-days: 1
-
-  unit-tests:
-    needs: build
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Rust cache
-        uses: Swatinem/rust-cache@v2
-
-      - name: Install Linux system deps
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends \
-            pkg-config libssl-dev
-
-      - name: Run unit tests
-        run: cargo test --workspace --exclude nyro-desktop --exclude nyro-server
-
-  e2e-proxy-tests:
-    needs: build
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
     timeout-minutes: 15
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Download nyro-server binary
-        uses: actions/download-artifact@v4
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
         with:
-          name: nyro-server-linux-x86_64
-          path: target/debug
+          version: 11
+          run_install: false
 
-      - name: Download nyro-tools binary
-        uses: actions/download-artifact@v4
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
         with:
-          name: nyro-tools-linux-x86_64
-          path: target/debug
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: webui/pnpm-lock.yaml
 
-      - name: Make binaries executable
-        run: chmod +x target/debug/nyro-server target/debug/nyro-tools
+      - name: Install dependencies
+        run: pnpm -C webui install --frozen-lockfile
 
-      - name: Install Python test deps
-        run: python3 -m pip install -r requirements-dev.txt
+      - name: Build
+        run: pnpm -C webui build
 
-      - name: Run proxy E2E protocol-matrix tests
-        run: python3 -m pytest tests/e2e/proxy -vv -s -rA -m proxy
-        env:
-          NYRO_BINARY: target/debug/nyro-server
-          NYRO_TOOLS_BINARY: target/debug/nyro-tools
+      - name: Upload WebUI bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: webui-dist
+          path: webui/dist
+          if-no-files-found: error
+          retention-days: 1
 
-  e2e-admin-tests:
-    needs: build
+  rust-check:
+    name: Rust check
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
+    timeout-minutes: 30
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Download nyro-server binary
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends pkg-config libssl-dev
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Check workspace
+        run: cargo check --workspace --exclude nyro-desktop
+
+  unit-tests:
+    name: Unit tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends pkg-config libssl-dev
+
+      - name: Run unit tests
+        run: cargo test --workspace --exclude nyro-desktop --exclude nyro-server
+
+  build-e2e-binaries:
+    name: Build E2E binaries
+    needs: webui-check
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends pkg-config libssl-dev
+
+      - name: Download WebUI bundle
         uses: actions/download-artifact@v4
         with:
-          name: nyro-server-linux-x86_64
+          name: webui-dist
+          path: webui/dist
+
+      - name: Build E2E binaries
+        run: cargo build -p nyro-server -p nyro-tools
+
+      - name: Upload E2E binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-binaries
+          path: |
+            target/debug/nyro-server
+            target/debug/nyro-tools
+          if-no-files-found: error
+          retention-days: 1
+
+  e2e-tests:
+    name: E2E (${{ matrix.suite }})
+    needs: build-e2e-binaries
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        suite:
+          - proxy
+          - admin
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download E2E binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: e2e-binaries
           path: target/debug
 
-      - name: Make binary executable
-        run: chmod +x target/debug/nyro-server
+      - name: Make binaries executable
+        run: chmod +x target/debug/nyro-server target/debug/nyro-tools
 
-      - name: Install Python test deps
+      - name: Install Python dependencies
         run: python3 -m pip install -r requirements-dev.txt
 
-      - name: Run admin E2E tests
-        run: python3 -m pytest tests/e2e/admin -vv -s -rA -m admin
+      - name: Run E2E suite
+        run: python3 -m pytest tests/e2e/${{ matrix.suite }} -vv -s -rA -m ${{ matrix.suite }}
         env:
           NYRO_BINARY: target/debug/nyro-server
+          NYRO_TOOLS_BINARY: target/debug/nyro-tools
