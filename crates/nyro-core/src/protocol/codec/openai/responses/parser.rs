@@ -174,7 +174,13 @@ impl ResponsesStreamParser {
         payload: &Value,
         deltas: &mut Vec<AiStreamDelta>,
     ) {
-        match event.unwrap_or("") {
+        // Some OpenAI-compatible providers emit data-only SSE blocks and put
+        // the event name exclusively in the JSON payload's `type` field.
+        let event = event
+            .or_else(|| payload.get("type").and_then(Value::as_str))
+            .unwrap_or("");
+
+        match event {
             "response.created" | "response.in_progress" => {
                 if self.started {
                     return;
@@ -249,7 +255,7 @@ impl ResponsesStreamParser {
                         if self.started_tool_call_indexes.insert(index) {
                             deltas.push(AiStreamDelta::ToolCallStart { index, id, name });
                         }
-                        if event == Some("response.output_item.done")
+                        if event == "response.output_item.done"
                             && !self.streamed_tool_call_argument_indexes.contains(&index)
                             && let Some(arguments) = item.get("arguments").and_then(|v| v.as_str())
                             && !arguments.is_empty()
@@ -493,6 +499,32 @@ mod tests {
         assert!(
             has_done,
             "expected Done on [DONE] sentinel, got: {deltas:?}"
+        );
+    }
+
+    #[test]
+    fn test_stream_data_only_completed_extracts_usage() {
+        let sse = sse_data(
+            r#"{"type":"response.completed","response":{"id":"resp_data_only","model":"gpt-5.6-sol","status":"completed","output":[],"usage":{"input_tokens":13582,"input_tokens_details":{"cached_tokens":13056},"output_tokens":19,"output_tokens_details":{"reasoning_tokens":0},"total_tokens":13601}}}"#,
+        );
+        let mut parser = ResponsesStreamParser::new();
+        let deltas = parser.parse_chunk(&sse).unwrap();
+
+        let usage = deltas.iter().find_map(|delta| {
+            if let AiStreamDelta::Usage(usage) = delta {
+                Some(usage)
+            } else {
+                None
+            }
+        });
+
+        assert_eq!(usage.map(|usage| usage.prompt_tokens), Some(13582));
+        assert_eq!(usage.map(|usage| usage.completion_tokens), Some(19));
+        assert!(
+            deltas
+                .iter()
+                .any(|delta| matches!(delta, AiStreamDelta::Done { stop_reason } if stop_reason == "completed")),
+            "expected completed Done event, got: {deltas:?}"
         );
     }
 
