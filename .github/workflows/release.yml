@@ -1,4 +1,5 @@
 name: Release
+run-name: Release ${{ inputs.version }} (publish=${{ inputs.publish }}, desktop=${{ inputs.build_desktop }})
 
 on:
   workflow_dispatch:
@@ -43,7 +44,7 @@ jobs:
         shell: bash
         env:
           VERSION: ${{ inputs.version }}
-          PUBLISH: ${{ inputs.publish }}
+          PUBLISH: ${{ github.event.inputs.publish }}
         run: |
           if [[ ! "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
             echo "Invalid version: $VERSION (expected vX.Y.Z)" >&2
@@ -165,7 +166,7 @@ jobs:
 
   build-desktop:
     name: Desktop (${{ matrix.platform }})
-    if: ${{ inputs.build_desktop }}
+    if: ${{ github.event.inputs.build_desktop == 'true' }}
     needs: validate
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
@@ -284,7 +285,7 @@ jobs:
           merge-multiple: true
 
       - name: Download desktop artifacts
-        if: ${{ inputs.build_desktop }}
+        if: ${{ github.event.inputs.build_desktop == 'true' }}
         uses: actions/download-artifact@v8
         with:
           pattern: release-desktop-*
@@ -304,7 +305,7 @@ jobs:
           fi
 
       - name: Generate desktop updater manifest
-        if: ${{ inputs.build_desktop }}
+        if: ${{ github.event.inputs.build_desktop == 'true' }}
         env:
           VERSION: ${{ needs.validate.outputs.version }}
           REPO: ${{ github.repository }}
@@ -328,7 +329,7 @@ jobs:
 
   publish:
     name: Publish GitHub Release
-    if: ${{ inputs.publish }}
+    if: ${{ github.event.inputs.publish == 'true' }}
     needs:
       - validate
       - package
