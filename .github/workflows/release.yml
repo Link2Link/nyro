@@ -329,7 +329,11 @@ jobs:
 
   publish:
     name: Publish GitHub Release
-    if: ${{ github.event.inputs.publish == 'true' }}
+    if: >-
+      ${{ always() &&
+          github.event.inputs.publish == 'true' &&
+          needs.validate.result == 'success' &&
+          needs.package.result == 'success' }}
     needs:
       - validate
       - package
