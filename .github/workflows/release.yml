@@ -1,0 +1,363 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version, for example v1.8.3"
+        required: true
+        type: string
+      build_desktop:
+        description: "Build signed desktop installers"
+        required: true
+        default: false
+        type: boolean
+      publish:
+        description: "Create the tag and GitHub Release"
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ inputs.version }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    name: Validate release
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      package_version: ${{ steps.version.outputs.package_version }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate version and source branch
+        id: version
+        shell: bash
+        env:
+          VERSION: ${{ inputs.version }}
+          PUBLISH: ${{ inputs.publish }}
+        run: |
+          if [[ ! "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+            echo "Invalid version: $VERSION (expected vX.Y.Z)" >&2
+            exit 1
+          fi
+
+          if [[ "$PUBLISH" == "true" && "$GITHUB_REF" != "refs/heads/master" ]]; then
+            echo "Published releases must run from master; current ref is $GITHUB_REF" >&2
+            exit 1
+          fi
+
+          PACKAGE_VERSION="${VERSION#v}"
+          CARGO_VERSION="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)"
+          TAURI_VERSION="$(jq -r '.version' src-tauri/tauri.conf.json)"
+          WEBUI_VERSION="$(jq -r '.version' webui/package.json)"
+
+          for entry in \
+            "Cargo.toml:$CARGO_VERSION" \
+            "src-tauri/tauri.conf.json:$TAURI_VERSION" \
+            "webui/package.json:$WEBUI_VERSION"; do
+            file="${entry%%:*}"
+            value="${entry#*:}"
+            if [[ "$value" != "$PACKAGE_VERSION" ]]; then
+              echo "$file version is $value, expected $PACKAGE_VERSION" >&2
+              exit 1
+            fi
+          done
+
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "package_version=$PACKAGE_VERSION" >> "$GITHUB_OUTPUT"
+
+  build-webui:
+    name: Build WebUI
+    needs: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11
+          run_install: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: webui/pnpm-lock.yaml
+
+      - name: Install dependencies
+        run: pnpm -C webui install --frozen-lockfile
+
+      - name: Build WebUI
+        run: pnpm -C webui build
+
+      - name: Upload WebUI bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-webui-dist
+          path: webui/dist
+          if-no-files-found: error
+          retention-days: 1
+
+  build-server:
+    name: Server (${{ matrix.platform }})
+    needs:
+      - validate
+      - build-webui
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-x86_64
+            os: ubuntu-latest
+            binary: nyro-server
+            asset: nyro-server-linux-x86_64
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-server-${{ matrix.platform }}
+
+      - name: Download WebUI bundle
+        uses: actions/download-artifact@v4
+        with:
+          name: release-webui-dist
+          path: webui/dist
+
+      - name: Build server
+        run: cargo build -p nyro-server --release
+
+      - name: Package server
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp "target/release/${{ matrix.binary }}" "dist/${{ matrix.asset }}"
+
+      - name: Upload server artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-server-${{ matrix.platform }}
+          path: dist/${{ matrix.asset }}
+          if-no-files-found: error
+          retention-days: 1
+
+  build-desktop:
+    name: Desktop (${{ matrix.platform }})
+    if: ${{ inputs.build_desktop }}
+    needs: validate
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-x86_64
+            os: ubuntu-latest
+            bundles: appimage
+          - platform: macos-aarch64
+            os: macos-latest
+            bundles: app,dmg
+            arch_suffix: aarch64
+          - platform: windows-x86_64
+            os: windows-latest
+            bundles: nsis
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-desktop-${{ matrix.platform }}
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11
+          run_install: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: webui/pnpm-lock.yaml
+
+      - name: Install Linux desktop dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            xdg-utils libwebkit2gtk-4.1-dev libgtk-3-dev \
+            libayatana-appindicator3-dev librsvg2-dev patchelf
+
+      - name: Install frontend dependencies
+        run: pnpm -C webui install --frozen-lockfile
+
+      - name: Install Tauri CLI
+        run: cargo install tauri-cli --version "^2" --locked
+
+      - name: Build signed desktop bundles
+        shell: bash
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: cargo tauri build --bundles "${{ matrix.bundles }}"
+
+      - name: Add architecture suffix to macOS updater bundle
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          for file in target/release/bundle/macos/*.app.tar.gz; do
+            [[ -f "$file" ]] || continue
+            directory="$(dirname "$file")"
+            basename="$(basename "$file" .app.tar.gz)"
+            renamed="${directory}/${basename}_${{ matrix.arch_suffix }}.app.tar.gz"
+            mv "$file" "$renamed"
+            [[ -f "${file}.sig" ]] && mv "${file}.sig" "${renamed}.sig"
+          done
+
+      - name: Upload desktop artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-desktop-${{ matrix.platform }}
+          path: |
+            target/**/release/bundle/**/*.AppImage
+            target/**/release/bundle/**/*.AppImage.sig
+            target/**/release/bundle/**/*.dmg
+            target/**/release/bundle/**/*.app.tar.gz
+            target/**/release/bundle/**/*.app.tar.gz.sig
+            target/**/release/bundle/**/*-setup.exe
+            target/**/release/bundle/**/*-setup.exe.sig
+          if-no-files-found: error
+          retention-days: 1
+
+  package:
+    name: Package release
+    if: >-
+      ${{ always() &&
+          needs.validate.result == 'success' &&
+          needs.build-server.result == 'success' &&
+          (needs.build-desktop.result == 'success' || needs.build-desktop.result == 'skipped') }}
+    needs:
+      - validate
+      - build-server
+      - build-desktop
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download server artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: release-server-*
+          path: artifacts/server
+          merge-multiple: true
+
+      - name: Download desktop artifacts
+        if: ${{ inputs.build_desktop }}
+        uses: actions/download-artifact@v4
+        with:
+          pattern: release-desktop-*
+          path: artifacts/desktop
+          merge-multiple: true
+
+      - name: Collect release assets
+        shell: bash
+        run: |
+          mkdir -p release-assets
+          find artifacts/server -type f -exec cp -f {} release-assets/ \;
+          if [[ -d artifacts/desktop ]]; then
+            find artifacts/desktop -type f \( \
+              -name "*.dmg" -o -name "*.AppImage" -o -name "*-setup.exe" \
+              -o -name "*.app.tar.gz" -o -name "*.sig" \
+            \) -exec cp -f {} release-assets/ \;
+          fi
+
+      - name: Generate desktop updater manifest
+        if: ${{ inputs.build_desktop }}
+        env:
+          VERSION: ${{ needs.validate.outputs.version }}
+          REPO: ${{ github.repository }}
+        run: python3 scripts/release/gen_latest_json.py --assets-dir release-assets --output release-assets/latest.json
+
+      - name: Generate checksums
+        shell: bash
+        run: |
+          cd release-assets
+          find . -maxdepth 1 -type f ! -name SHA256SUMS.txt -printf '%f\n' \
+            | sort \
+            | xargs sha256sum > SHA256SUMS.txt
+
+      - name: Upload release pack
+        uses: actions/upload-artifact@v4
+        with:
+          name: nyro-${{ needs.validate.outputs.version }}-release-pack
+          path: release-assets/*
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish GitHub Release
+    if: ${{ inputs.publish }}
+    needs:
+      - validate
+      - package
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: release
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download release pack
+        uses: actions/download-artifact@v4
+        with:
+          name: nyro-${{ needs.validate.outputs.version }}-release-pack
+          path: release-assets
+
+      - name: Create tag and GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.validate.outputs.version }}
+        shell: bash
+        run: |
+          if gh release view "$VERSION" >/dev/null 2>&1; then
+            echo "Release $VERSION already exists" >&2
+            exit 1
+          fi
+
+          gh release create "$VERSION" release-assets/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "Nyro $VERSION" \
+            --generate-notes
