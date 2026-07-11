@@ -4,6 +4,30 @@ All notable changes to Nyro will be documented in this file.
 
 ---
 
+## v2.0.0
+
+> Released on 2026-07-11
+
+This is the first independently maintained release of the Nyro Rust codebase.
+
+#### Features
+
+- **Independent Rust maintenance**: establish this repository as the maintained Rust continuation of Nyro while preserving the upstream Go rewrite on a separate branch
+- **Manual release workflow**: add an independently controlled GitHub Actions release workflow for producing the Linux x86_64 server with the WebUI embedded
+
+#### Improvements / Refactoring
+
+- **Independent project configuration**: migrate repository, release, installer, feedback, and documentation links to `Link2Link/nyro`
+- **CI workflow ownership**: replace the upstream workflows with a manually triggered Rust/WebUI CI pipeline and reusable E2E build artifacts
+- **Distribution cleanup**: remove references to upstream Homebrew and Docker distribution channels that are not maintained by this fork
+
+#### Fixes
+
+- **Responses API usage accounting**: recognize data-only SSE events through their JSON `type` field so final input and output token usage is recorded correctly
+- **Embedded WebUI CI build**: make Rust checks wait for and download the WebUI bundle before compiling `nyro-server`
+
+---
+
 ## v1.8.2
 
 > Released on 2026-06-18
