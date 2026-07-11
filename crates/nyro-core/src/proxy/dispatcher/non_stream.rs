@@ -147,9 +147,29 @@ pub(super) async fn handle_non_stream(
             egress = egress_str,
             "bypassing IR round-trip"
         );
+        // Preserve the wire response while still decoding usage for logging.
+        // A best-effort side parse must never turn a valid passthrough response
+        // into an error returned to the client.
+        let usage = match adapter
+            .parse_response(
+                InboundResponse {
+                    status,
+                    body: resp.clone(),
+                },
+                ctx,
+            )
+            .await
+        {
+            Ok(ai_resp) => ai_resp.usage,
+            Err(error) => {
+                tracing::warn!(%error, egress = egress_str, "failed to parse passthrough usage");
+                Default::default()
+            }
+        };
         let resp_str = serde_json::to_string(&resp).ok();
         log.status(status)
             .upstream_url(url)
+            .usage(usage)
             .with_upstream_request(upstream_req_hdrs_str, upstream_req_body_str)
             .with_upstream_response(
                 status as i32,
@@ -267,9 +287,11 @@ mod tests {
     use crate::db::models::Provider;
     use crate::error::GatewayError;
     use crate::protocol::ids::{
-        GOOGLE_GEMINI_GENERATE_CONTENT_V1BETA, OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1,
+        ANTHROPIC_MESSAGES_2023_06_01, GOOGLE_GEMINI_GENERATE_CONTENT_V1BETA,
+        OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1,
     };
     use crate::protocol::ir::{AiRequest, AiResponse};
+    use crate::provider::anthropic::AnthropicVendor;
     use crate::provider::outbound::OutboundRequest;
     use crate::provider::registry::VendorScope;
     use crate::provider::vendor::Vendor;
@@ -355,6 +377,140 @@ mod tests {
                 .expect("write response");
         });
         format!("http://{addr}/v1beta/models/gemini:generateContent?key=secret")
+    }
+
+    async fn serve_anthropic_response_once() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let addr = listener.local_addr().expect("local addr");
+        let body = serde_json::json!({
+            "id": "msg_test",
+            "type": "message",
+            "role": "assistant",
+            "model": "deepseek-v4-pro",
+            "content": [{"type": "text", "text": "ok"}],
+            "stop_reason": "end_turn",
+            "usage": {
+                "cache_read_input_tokens": 26624,
+                "input_tokens": 282,
+                "output_tokens": 595
+            }
+        })
+        .to_string();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept request");
+            let mut buf = [0_u8; 2048];
+            let _ = socket.read(&mut buf).await.expect("read request");
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            socket
+                .write_all(response.as_bytes())
+                .await
+                .expect("write response");
+        });
+        format!("http://{addr}/v1/messages")
+    }
+
+    #[tokio::test]
+    async fn logs_usage_for_non_stream_native_passthrough_response() {
+        let url = serve_anthropic_response_once().await;
+        let provider = Provider {
+            id: "provider-anthropic".into(),
+            name: "Anthropic-compatible".into(),
+            vendor: Some("anthropic".into()),
+            protocol: "anthropic-messages".into(),
+            base_url: url.clone(),
+            preset_key: None,
+            channel: Some("default".into()),
+            models_source: None,
+            static_models: None,
+            api_key: "secret".into(),
+            auth_mode: "apikey".into(),
+            use_proxy: false,
+            last_test_success: None,
+            last_test_at: None,
+            is_enabled: true,
+            created_at: String::new(),
+            updated_at: String::new(),
+        };
+        let config = GatewayConfig {
+            data_dir: std::env::temp_dir().join(format!(
+                "nyro-passthrough-usage-test-{}",
+                uuid::Uuid::new_v4()
+            )),
+            ..Default::default()
+        };
+        let (gw, mut log_rx) = Gateway::new(config).await.expect("gateway init");
+        let req_ext = crate::proxy::context::ContextBag::new();
+        let call_ctx = CallCtx {
+            gw: gw.clone(),
+            provider: &provider,
+            model_id: "route-anthropic",
+            model_name: "Anthropic route",
+            egress: ANTHROPIC_MESSAGES_2023_06_01,
+            ingress: ANTHROPIC_MESSAGES_2023_06_01,
+            ingress_str: "anthropic-messages/messages/2023-06-01",
+            egress_str: "anthropic-messages/messages/2023-06-01",
+            request_model: "deepseek-v4-pro",
+            actual_model: "deepseek-v4-pro",
+            api_key_id: None,
+            api_key_name: None,
+            is_stream: false,
+            enable_payload: None,
+            start: std::time::Instant::now(),
+            req_ext,
+        };
+        let req_extras = RequestExtras {
+            method: "POST".into(),
+            path: "/v1/messages".into(),
+            headers: None,
+            body: None,
+        };
+        let provider_ctx = ProviderCtx {
+            provider: &provider,
+            protocol: ANTHROPIC_MESSAGES_2023_06_01,
+            egress_base_url: &provider.base_url,
+            api_key: "secret",
+            actual_model: "deepseek-v4-pro",
+            credential: None,
+            gw: &gw,
+            disable_default_auth: false,
+        };
+        let mut req_ctx = crate::proxy::context::RequestContext::new(
+            ANTHROPIC_MESSAGES_2023_06_01,
+            std::time::Duration::from_secs(30),
+        );
+        let mut req_ir = AiRequest::new("deepseek-v4-pro", Vec::new());
+        let host = HostContext::new(&gw);
+
+        let response = handle_non_stream(
+            ProxyClient::new(reqwest::Client::new()),
+            &url,
+            ReqwestHeaderMap::new(),
+            serde_json::json!({"model": "deepseek-v4-pro"}),
+            &call_ctx,
+            &req_extras,
+            &AnthropicVendor,
+            &provider_ctx,
+            true,
+            &mut req_ctx,
+            &mut req_ir,
+            &host,
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let entry = tokio::time::timeout(std::time::Duration::from_secs(1), log_rx.recv())
+            .await
+            .expect("log entry should be emitted")
+            .expect("log channel should remain open");
+        assert_eq!(entry.input_tokens(), 282);
+        assert_eq!(entry.output_tokens(), 595);
+        assert_eq!(entry.cache_read_tokens(), 26624);
     }
 
     #[tokio::test]
