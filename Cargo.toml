@@ -6,7 +6,7 @@ members = ["crates/nyro-core", "crates/nyro-tools", "src-tauri", "src-server"]
 version = "1.8.2"
 edition = "2024"
 license = "Apache-2.0"
-repository = "https://github.com/nyroway/nyro"
+repository = "https://github.com/Link2Link/nyro"
 
 [workspace.dependencies]
 tokio = { version = "1", features = ["full"] }

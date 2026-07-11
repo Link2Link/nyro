@@ -13,7 +13,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/nyroway/nyro/releases/latest"><img src="https://img.shields.io/github/v/release/nyroway/nyro" alt="Release"></a>
+  <a href="https://github.com/Link2Link/nyro/releases/latest"><img src="https://img.shields.io/github/v/release/Link2Link/nyro" alt="Release"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache%202.0-blue.svg" alt="License"></a>
   <a href="README.md"><img src="https://img.shields.io/badge/Language-English-2d7ff9" alt="English"></a>
 </p>
@@ -174,26 +174,19 @@ Nyro 会自动检测已安装工具，为所选路由生成正确配置并一键
 
 ### 桌面应用
 
-**Homebrew（macOS / Linux）**
-
-```bash
-brew tap nyroway/nyro
-brew install --cask nyro
-```
-
 **Shell 脚本**
 
 ```bash
 # macOS / Linux
-curl -fsSL https://raw.githubusercontent.com/nyroway/nyro/master/scripts/install/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/Link2Link/nyro/master/scripts/install/install.sh | bash
 
 # Windows (PowerShell)
-irm https://raw.githubusercontent.com/nyroway/nyro/master/scripts/install/install.ps1 | iex
+irm https://raw.githubusercontent.com/Link2Link/nyro/master/scripts/install/install.ps1 | iex
 ```
 
 **手动下载**
 
-从 [GitHub Releases](https://github.com/nyroway/nyro/releases/latest) 下载你平台对应的最新安装包。
+从 [GitHub Releases](https://github.com/Link2Link/nyro/releases/latest) 下载你平台对应的最新安装包。
 
 > **macOS**：手动安装后请运行 `sudo xattr -rd com.apple.quarantine /Applications/Nyro.app`，或使用安装脚本自动处理。
 >
@@ -203,7 +196,7 @@ irm https://raw.githubusercontent.com/nyroway/nyro/master/scripts/install/instal
 
 ```bash
 # 下载
-curl -LO https://github.com/nyroway/nyro/releases/latest/download/nyro-server-linux-x86_64
+curl -LO https://github.com/Link2Link/nyro/releases/latest/download/nyro-server-linux-x86_64
 chmod +x nyro-server-linux-x86_64
 
 # 启动（仅 localhost，无需鉴权）— 默认 all 模式
@@ -288,28 +281,6 @@ NYRO_MYSQL_DSN=mysql://...         # backend=mysql 时必须设置
 NYRO_CONFIG_POLL_INTERVAL=3        # 配置 epoch 轮询间隔（秒，默认 3，0=禁用）
 NYRO_WEBUI_DIR=/path/to/dist       # 从外部目录提供 WebUI（不填则使用嵌入资源；仅 admin/all 模式）
 ```
-
-### Docker
-
-预构建的服务端镜像在独立仓库 [nyroway/docker-nyro](https://github.com/nyroway/docker-nyro) 中维护，发布到 Docker Hub 的 [nyroway/nyro](https://hub.docker.com/r/nyroway/nyro)。
-
-快速开始：
-
-```bash
-docker run --rm \
-  -e NYRO_ADMIN_TOKEN=change-me \
-  -p 19530:19530 \
-  -p 19531:19531 \
-  -v nyro-data:/var/lib/nyro \
-  nyroway/nyro:latest
-```
-
-打开 `http://127.0.0.1:19531` 进入管理界面。管理 API 请求时，请使用同一个 `NYRO_ADMIN_TOKEN` 作为 Bearer Token。
-
-如需使用 Postgres / MySQL 后端或 `docker compose` 部署，请参考 [docker-nyro README](https://github.com/nyroway/docker-nyro)。
-
-
----
 
 ## 快速开始
 

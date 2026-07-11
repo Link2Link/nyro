@@ -14,7 +14,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/nyroway/nyro/releases/latest"><img src="https://img.shields.io/github/v/release/nyroway/nyro" alt="Release"></a>
+  <a href="https://github.com/Link2Link/nyro/releases/latest"><img src="https://img.shields.io/github/v/release/Link2Link/nyro" alt="Release"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache%202.0-blue.svg" alt="License"></a>
   <a href="README_CN.md"><img src="https://img.shields.io/badge/文档-中文-8A2BE2" alt="中文"></a>
 </p>
@@ -175,26 +175,19 @@ Nyro detects installed tools, generates the correct configuration for the select
 
 ### Desktop App
 
-**Homebrew (macOS / Linux)**
-
-```bash
-brew tap nyroway/nyro
-brew install --cask nyro
-```
-
 **Shell Script**
 
 ```bash
 # macOS / Linux
-curl -fsSL https://raw.githubusercontent.com/nyroway/nyro/master/scripts/install/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/Link2Link/nyro/master/scripts/install/install.sh | bash
 
 # Windows (PowerShell)
-irm https://raw.githubusercontent.com/nyroway/nyro/master/scripts/install/install.ps1 | iex
+irm https://raw.githubusercontent.com/Link2Link/nyro/master/scripts/install/install.ps1 | iex
 ```
 
 **Manual Download**
 
-Download the latest installer for your platform from [GitHub Releases](https://github.com/nyroway/nyro/releases/latest).
+Download the latest installer for your platform from [GitHub Releases](https://github.com/Link2Link/nyro/releases/latest).
 
 > **macOS**: After manual install run `sudo xattr -rd com.apple.quarantine /Applications/Nyro.app`, or use the install script which handles this automatically.
 >
@@ -204,7 +197,7 @@ Download the latest installer for your platform from [GitHub Releases](https://g
 
 ```bash
 # Download
-curl -LO https://github.com/nyroway/nyro/releases/latest/download/nyro-server-linux-x86_64
+curl -LO https://github.com/Link2Link/nyro/releases/latest/download/nyro-server-linux-x86_64
 chmod +x nyro-server-linux-x86_64
 
 # Start (localhost only, no auth required) — default all mode
@@ -289,27 +282,6 @@ NYRO_MYSQL_DSN=mysql://...         # Required when backend=mysql
 NYRO_CONFIG_POLL_INTERVAL=3        # Seconds between config epoch polls (default: 3, 0=disabled)
 NYRO_WEBUI_DIR=/path/to/dist       # Serve WebUI from external directory instead of embedded assets (admin/all modes only)
 ```
-
-### Docker
-
-Pre-built server images are distributed via the separate [nyroway/docker-nyro](https://github.com/nyroway/docker-nyro) repository and published to Docker Hub as [nyroway/nyro](https://hub.docker.com/r/nyroway/nyro).
-
-Quick start:
-
-```bash
-docker run --rm \
-  -e NYRO_ADMIN_TOKEN=change-me \
-  -p 19530:19530 \
-  -p 19531:19531 \
-  -v nyro-data:/var/lib/nyro \
-  nyroway/nyro:latest
-```
-
-Open `http://127.0.0.1:19531` for the management UI. Use the same `NYRO_ADMIN_TOKEN` value as the Bearer token for admin API requests.
-
-For Postgres- or MySQL-backed deployments and `docker compose` usage, see the [docker-nyro README](https://github.com/nyroway/docker-nyro).
-
----
 
 ## Quick Start
 
