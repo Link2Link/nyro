@@ -36,7 +36,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Validate version and source branch
         id: version
@@ -83,7 +83,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
@@ -92,7 +92,7 @@ jobs:
           run_install: false
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6
         with:
           node-version: 22
           cache: pnpm
@@ -105,7 +105,7 @@ jobs:
         run: pnpm -C webui build
 
       - name: Upload WebUI bundle
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: release-webui-dist
           path: webui/dist
@@ -130,7 +130,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
@@ -141,7 +141,7 @@ jobs:
           shared-key: release-server-${{ matrix.platform }}
 
       - name: Download WebUI bundle
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: release-webui-dist
           path: webui/dist
@@ -156,7 +156,7 @@ jobs:
           cp "target/release/${{ matrix.binary }}" "dist/${{ matrix.asset }}"
 
       - name: Upload server artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: release-server-${{ matrix.platform }}
           path: dist/${{ matrix.asset }}
@@ -186,7 +186,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
@@ -203,7 +203,7 @@ jobs:
           run_install: false
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6
         with:
           node-version: 22
           cache: pnpm
@@ -244,7 +244,7 @@ jobs:
           done
 
       - name: Upload desktop artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: release-desktop-${{ matrix.platform }}
           path: |
@@ -274,10 +274,10 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Download server artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: release-server-*
           path: artifacts/server
@@ -285,7 +285,7 @@ jobs:
 
       - name: Download desktop artifacts
         if: ${{ inputs.build_desktop }}
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: release-desktop-*
           path: artifacts/desktop
@@ -319,7 +319,7 @@ jobs:
             | xargs sha256sum > SHA256SUMS.txt
 
       - name: Upload release pack
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: nyro-${{ needs.validate.outputs.version }}-release-pack
           path: release-assets/*
@@ -340,7 +340,7 @@ jobs:
 
     steps:
       - name: Download release pack
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: nyro-${{ needs.validate.outputs.version }}-release-pack
           path: release-assets
