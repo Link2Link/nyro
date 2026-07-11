@@ -4,6 +4,16 @@ All notable changes to Nyro will be documented in this file.
 
 ---
 
+## v2.0.1
+
+> Released on 2026-07-11
+
+#### Fixes
+
+- **Native passthrough usage accounting**: parse token usage for non-streaming native protocol passthrough responses while preserving the upstream response unchanged
+
+---
+
 ## v2.0.0
 
 > Released on 2026-07-11
