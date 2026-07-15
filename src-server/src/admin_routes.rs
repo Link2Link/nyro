@@ -510,6 +510,8 @@ struct LogQueryParams {
     status_min: Option<i32>,
     status_max: Option<i32>,
     api_key: Option<String>,
+    after: Option<i64>,
+    before: Option<i64>,
 }
 
 async fn get_log_handler(
@@ -539,6 +541,8 @@ async fn query_logs_handler(
         status_min: params.status_min,
         status_max: params.status_max,
         api_key: params.api_key,
+        after: params.after,
+        before: params.before,
     };
     match gw.admin().query_logs(q).await {
         Ok(v) => Json(serde_json::json!({ "data": v })).into_response(),

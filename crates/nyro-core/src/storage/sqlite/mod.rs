@@ -1058,6 +1058,16 @@ impl LogStore for SqliteLogStore {
             data_sql.push_str(" AND api_key_id = ?");
             bind_values.push(api_key);
         }
+        if let Some(after) = query.after {
+            count_sql.push_str(" AND created_at >= ?");
+            data_sql.push_str(" AND created_at >= ?");
+            bind_values.push(after.to_string());
+        }
+        if let Some(before) = query.before {
+            count_sql.push_str(" AND created_at <= ?");
+            data_sql.push_str(" AND created_at <= ?");
+            bind_values.push(before.to_string());
+        }
 
         data_sql.push_str(" ORDER BY created_at DESC LIMIT ? OFFSET ?");
         let mut count_query = sqlx::query_scalar::<_, i64>(&count_sql);
@@ -1133,7 +1143,7 @@ impl LogStore for SqliteLogStore {
 
     async fn stats_hourly(&self, hours: i64) -> anyhow::Result<Vec<StatsHourly>> {
         Ok(sqlx::query_as::<_, StatsHourly>(
-            "SELECT strftime('%Y-%m-%d %H:00:00', datetime(created_at/1000, 'unixepoch')) AS hour, COUNT(*) AS request_count, COALESCE(SUM(CASE WHEN client_status_code >= 400 THEN 1 ELSE 0 END), 0) AS error_count, COALESCE(SUM(input_tokens), 0) AS total_input_tokens, COALESCE(SUM(output_tokens), 0) AS total_output_tokens, COALESCE(AVG(latency_total_ms), 0.0) AS avg_duration_ms FROM request_logs WHERE created_at >= CAST(strftime('%s', 'now', ?) AS INTEGER) * 1000 GROUP BY hour ORDER BY hour ASC",
+            "SELECT strftime('%Y-%m-%d %H:00:00', datetime(created_at/1000, 'unixepoch')) AS hour, COUNT(*) AS request_count, COALESCE(SUM(CASE WHEN client_status_code >= 400 THEN 1 ELSE 0 END), 0) AS error_count, COALESCE(SUM(input_tokens), 0) AS total_input_tokens, COALESCE(SUM(output_tokens), 0) AS total_output_tokens, COALESCE(SUM(cache_read_tokens), 0) AS total_cache_read_tokens, COALESCE(AVG(latency_total_ms), 0.0) AS avg_duration_ms FROM request_logs WHERE created_at >= CAST(strftime('%s', 'now', ?) AS INTEGER) * 1000 GROUP BY hour ORDER BY hour ASC",
         )
         .bind(format!("-{hours} hours"))
         .fetch_all(&self.pool)
@@ -1143,14 +1153,14 @@ impl LogStore for SqliteLogStore {
     async fn stats_by_model(&self, hours: Option<i64>) -> anyhow::Result<Vec<ModelStats>> {
         if let Some(hours) = hours {
             Ok(sqlx::query_as::<_, ModelStats>(
-                "SELECT upstream_model AS model, COUNT(*) AS request_count, COALESCE(SUM(input_tokens), 0) AS total_input_tokens, COALESCE(SUM(output_tokens), 0) AS total_output_tokens, COALESCE(AVG(latency_total_ms), 0.0) AS avg_duration_ms FROM request_logs WHERE created_at >= CAST(strftime('%s', 'now', ?) AS INTEGER) * 1000 GROUP BY upstream_model ORDER BY request_count DESC",
+                "SELECT upstream_model AS model, COUNT(*) AS request_count, COALESCE(SUM(input_tokens), 0) AS total_input_tokens, COALESCE(SUM(output_tokens), 0) AS total_output_tokens, COALESCE(SUM(cache_read_tokens), 0) AS total_cache_read_tokens, COALESCE(AVG(latency_total_ms), 0.0) AS avg_duration_ms, CAST(COALESCE(SUM(latency_upstream_ms), 0) AS REAL) AS total_upstream_ms FROM request_logs WHERE created_at >= CAST(strftime('%s', 'now', ?) AS INTEGER) * 1000 GROUP BY upstream_model ORDER BY request_count DESC",
             )
             .bind(format!("-{hours} hours"))
             .fetch_all(&self.pool)
             .await?)
         } else {
             Ok(sqlx::query_as::<_, ModelStats>(
-                "SELECT upstream_model AS model, COUNT(*) AS request_count, COALESCE(SUM(input_tokens), 0) AS total_input_tokens, COALESCE(SUM(output_tokens), 0) AS total_output_tokens, COALESCE(AVG(latency_total_ms), 0.0) AS avg_duration_ms FROM request_logs GROUP BY upstream_model ORDER BY request_count DESC",
+                "SELECT upstream_model AS model, COUNT(*) AS request_count, COALESCE(SUM(input_tokens), 0) AS total_input_tokens, COALESCE(SUM(output_tokens), 0) AS total_output_tokens, COALESCE(SUM(cache_read_tokens), 0) AS total_cache_read_tokens, COALESCE(AVG(latency_total_ms), 0.0) AS avg_duration_ms, CAST(COALESCE(SUM(latency_upstream_ms), 0) AS REAL) AS total_upstream_ms FROM request_logs GROUP BY upstream_model ORDER BY request_count DESC",
             )
             .fetch_all(&self.pool)
             .await?)

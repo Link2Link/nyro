@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { ChevronLeft, ChevronRight, GitBranch, Pencil, Plus, Route as RouteIcon, Trash2, ToggleRight, ToggleLeft, X } from "lucide-react";
+import { GitBranch, Pencil, Plus, Route as RouteIcon, Trash2, ToggleRight, ToggleLeft, X } from "lucide-react";
 
 import { backend } from "@/lib/backend";
 import { localizeBackendErrorMessage } from "@/lib/backend-error";
@@ -29,8 +29,6 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-
-const PAGE_SIZE = 7;
 
 type ModelForm = {
   name: string;
@@ -318,7 +316,6 @@ export default function ModelsPage() {
 
   const [showForm, setShowForm] = useState(false);
   const [editingId, setEditingId] = useState<string | null>(null);
-  const [page, setPage] = useState(0);
   const [createForm, setCreateForm] = useState<ModelForm>(emptyCreate);
   const [editForm, setEditForm] = useState<(ModelForm & { id: string }) | null>(null);
   const [editError, setEditError] = useState<string | null>(null);
@@ -400,13 +397,6 @@ export default function ModelsPage() {
     () => new Map(providers.map((p) => [p.id, p])),
     [providers],
   );
-
-  const totalPages = Math.max(1, Math.ceil(routes.length / PAGE_SIZE));
-  const pagedRoutes = routes.slice(page * PAGE_SIZE, page * PAGE_SIZE + PAGE_SIZE);
-
-  useEffect(() => {
-    if (page > totalPages - 1) setPage(0);
-  }, [page, totalPages]);
 
   function startEdit(route: ModelType) {
     setEditingId(route.id);
@@ -616,7 +606,7 @@ export default function ModelsPage() {
         </div>
       ) : (
         <div className="grid gap-3">
-          {pagedRoutes.map((route) => {
+          {routes.map((route) => {
             const isEditing = editingId === route.id && editForm;
 
             if (isEditing && editForm) {
@@ -819,32 +809,6 @@ export default function ModelsPage() {
               </div>
             );
           })}
-
-          {routes.length > PAGE_SIZE && (
-            <div className="flex items-center justify-between px-1 pt-1">
-              <span className="text-xs text-slate-500">
-                {isZh ? `第 ${page + 1} / ${totalPages} 页` : `Page ${page + 1} of ${totalPages}`}
-              </span>
-              <div className="flex gap-1">
-                <Button
-                  onClick={() => setPage(Math.max(0, page - 1))}
-                  disabled={page === 0}
-                  variant="outline"
-                  size="icon"
-                >
-                  <ChevronLeft className="h-4 w-4" />
-                </Button>
-                <Button
-                  onClick={() => setPage(Math.min(totalPages - 1, page + 1))}
-                  disabled={page >= totalPages - 1}
-                  variant="outline"
-                  size="icon"
-                >
-                  <ChevronRight className="h-4 w-4" />
-                </Button>
-              </div>
-            </div>
-          )}
         </div>
       )}
 

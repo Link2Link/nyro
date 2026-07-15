@@ -5,7 +5,7 @@ import { backend } from "@/lib/backend";
 import type { StatsOverview, StatsHourly, ModelStats, ProviderStats, ApiKeyStats } from "@/lib/types";
 import { Zap, Clock, Activity } from "lucide-react";
 import { useLocale } from "@/lib/i18n";
-import { formatLogTime, formatLocalHourLabel } from "@/lib/format";
+import { formatLogTime, formatLocalHourLabel, formatTps } from "@/lib/format";
 import {
   Select,
   SelectContent,
@@ -27,6 +27,11 @@ function fmtLatency(ms: number) {
     return `${(ms / 1000).toFixed(ms >= 10_000 ? 1 : 2)}s`;
   }
   return `${ms.toFixed(0)}ms`;
+}
+
+// 图表 tooltip 数值格式化：大数字用 K/M，与表格保持一致
+function chartTooltipFormatter(value: number | string, name: string): [string, string] {
+  return [fmt(Number(value)), name];
 }
 
 export default function StatsPage() {
@@ -69,6 +74,7 @@ export default function StatsPage() {
     hour: formatLocalHourLabel(h.hour),
     input: h.total_input_tokens,
     output: h.total_output_tokens,
+    cache: h.total_cache_read_tokens,
   }));
 
   const modelPie = modelStats.slice(0, 6).map((m) => ({
@@ -128,8 +134,9 @@ export default function StatsPage() {
                   <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#e2e8f0" />
                   <XAxis dataKey="hour" tick={{ fill: "#64748b", fontSize: 11 }} axisLine={false} tickLine={false} />
                   <YAxis tick={{ fill: "#64748b", fontSize: 11 }} axisLine={false} tickLine={false} width={50} tickFormatter={fmt} />
-                  <Tooltip />
+                  <Tooltip formatter={chartTooltipFormatter} />
                   <Bar dataKey="input" name={isZh ? "输入" : "Input"} stackId="a" fill="#3b82f6" />
+                  <Bar dataKey="cache" name={isZh ? "缓存命中" : "Cache"} stackId="a" fill="#f59e0b" />
                   <Bar dataKey="output" name={isZh ? "输出" : "Output"} stackId="a" fill="#10b981" radius={[4, 4, 0, 0]} />
                 </BarChart>
               </ResponsiveContainer>
@@ -161,7 +168,7 @@ export default function StatsPage() {
                         <Cell key={i} fill={COLORS[i % COLORS.length]} />
                       ))}
                     </Pie>
-                    <Tooltip />
+                    <Tooltip formatter={chartTooltipFormatter} />
                   </PieChart>
                 </ResponsiveContainer>
             ) : (
@@ -256,6 +263,48 @@ export default function StatsPage() {
                       {cacheRate > 0 && <span className="ml-1 text-[11px] text-slate-400">{cacheRate}%</span>}
                     </td>
                     <td className="px-4 py-2.5 text-right text-xs text-slate-500 whitespace-nowrap">{formatLogTime(k.last_used_at)}</td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div className="glass rounded-2xl p-6">
+        <h3 className="mb-4 text-sm font-semibold text-slate-800">{isZh ? "模型 Token 统计（调用次数前 10）" : "Model Token Stats (Top 10 by Requests)"}</h3>
+        <div className="overflow-x-auto rounded-xl border border-white/70 bg-white/50">
+          <table className="w-full text-sm">
+            <thead className="bg-white/70 text-slate-500">
+              <tr>
+                <th className="px-4 py-2.5 text-left font-medium">{isZh ? "模型" : "Model"}</th>
+                <th className="px-4 py-2.5 text-right font-medium">{isZh ? "输入 Token" : "Input Tokens"}</th>
+                <th className="px-4 py-2.5 text-right font-medium">{isZh ? "输出 Token" : "Output Tokens"}</th>
+                <th className="px-4 py-2.5 text-right font-medium">{isZh ? "缓存命中" : "Cache Hits"}</th>
+                <th className="px-4 py-2.5 text-right font-medium">{isZh ? "缓存命中率" : "Cache Rate"}</th>
+                <th className="px-4 py-2.5 text-right font-medium">{isZh ? "平均延迟" : "Avg Latency"}</th>
+                <th className="px-4 py-2.5 text-right font-medium">TPS</th>
+              </tr>
+            </thead>
+            <tbody>
+              {modelStats.length === 0 && (
+                <tr><td className="px-4 py-6 text-center text-slate-400" colSpan={7}>{isZh ? "暂无数据" : "No data"}</td></tr>
+              )}
+              {modelStats.slice(0, 10).map((m) => {
+                const cacheTotal = m.total_input_tokens + m.total_cache_read_tokens;
+                const cacheRate = cacheTotal > 0 ? Math.round((m.total_cache_read_tokens / cacheTotal) * 100) : 0;
+                const tps = m.total_upstream_ms > 0 && m.total_output_tokens > 0
+                  ? m.total_output_tokens / (m.total_upstream_ms / 1000)
+                  : null;
+                return (
+                  <tr key={m.model} className="border-t border-white/70 text-slate-700">
+                    <td className="px-4 py-2.5 font-medium">{m.model || "–"}</td>
+                    <td className="px-4 py-2.5 text-right">{fmt(m.total_input_tokens)}</td>
+                    <td className="px-4 py-2.5 text-right">{fmt(m.total_output_tokens)}</td>
+                    <td className="px-4 py-2.5 text-right">{fmt(m.total_cache_read_tokens)}</td>
+                    <td className="px-4 py-2.5 text-right">{cacheRate}%</td>
+                    <td className="px-4 py-2.5 text-right">{fmtLatency(m.avg_duration_ms)}</td>
+                    <td className="px-4 py-2.5 text-right">{formatTps(tps)}</td>
                   </tr>
                 );
               })}

@@ -380,6 +380,10 @@ pub struct LogQuery {
     pub status_min: Option<i32>,
     pub status_max: Option<i32>,
     pub api_key: Option<String>,
+    /// Unix 毫秒时间戳，筛选 created_at >= after
+    pub after: Option<i64>,
+    /// Unix 毫秒时间戳，筛选 created_at <= before
+    pub before: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -404,6 +408,7 @@ pub struct StatsHourly {
     pub error_count: i64,
     pub total_input_tokens: i64,
     pub total_output_tokens: i64,
+    pub total_cache_read_tokens: i64,
     pub avg_duration_ms: f64,
 }
 
@@ -413,7 +418,9 @@ pub struct ModelStats {
     pub request_count: i64,
     pub total_input_tokens: i64,
     pub total_output_tokens: i64,
+    pub total_cache_read_tokens: i64,
     pub avg_duration_ms: f64,
+    pub total_upstream_ms: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]

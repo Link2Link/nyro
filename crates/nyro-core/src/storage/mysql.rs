@@ -995,6 +995,16 @@ impl LogStore for MysqlLogStore {
             data_sql.push_str(" AND api_key_id = ?");
             bind_values.push(api_key);
         }
+        if let Some(after) = query.after {
+            count_sql.push_str(" AND created_at >= ?");
+            data_sql.push_str(" AND created_at >= ?");
+            bind_values.push(after.to_string());
+        }
+        if let Some(before) = query.before {
+            count_sql.push_str(" AND created_at <= ?");
+            data_sql.push_str(" AND created_at <= ?");
+            bind_values.push(before.to_string());
+        }
 
         data_sql.push_str(" ORDER BY created_at DESC LIMIT ? OFFSET ?");
 
@@ -1066,7 +1076,7 @@ impl LogStore for MysqlLogStore {
 
     async fn stats_hourly(&self, hours: i64) -> anyhow::Result<Vec<StatsHourly>> {
         let sql = format!(
-            "SELECT DATE_FORMAT(FROM_UNIXTIME(created_at/1000), '%Y-%m-%d %H:00:00') AS hour, COUNT(*) AS request_count, CAST(COALESCE(SUM(CASE WHEN client_status_code >= 400 THEN 1 ELSE 0 END), 0) AS SIGNED) AS error_count, CAST(COALESCE(SUM(input_tokens), 0) AS SIGNED) AS total_input_tokens, CAST(COALESCE(SUM(output_tokens), 0) AS SIGNED) AS total_output_tokens, CAST(COALESCE(AVG(latency_total_ms), 0) AS DOUBLE) AS avg_duration_ms FROM request_logs WHERE created_at >= UNIX_TIMESTAMP(NOW() - INTERVAL {hours} HOUR) * 1000 GROUP BY hour ORDER BY hour ASC"
+            "SELECT DATE_FORMAT(FROM_UNIXTIME(created_at/1000), '%Y-%m-%d %H:00:00') AS hour, COUNT(*) AS request_count, CAST(COALESCE(SUM(CASE WHEN client_status_code >= 400 THEN 1 ELSE 0 END), 0) AS SIGNED) AS error_count, CAST(COALESCE(SUM(input_tokens), 0) AS SIGNED) AS total_input_tokens, CAST(COALESCE(SUM(output_tokens), 0) AS SIGNED) AS total_output_tokens, CAST(COALESCE(SUM(cache_read_tokens), 0) AS SIGNED) AS total_cache_read_tokens, CAST(COALESCE(AVG(latency_total_ms), 0) AS DOUBLE) AS avg_duration_ms FROM request_logs WHERE created_at >= UNIX_TIMESTAMP(NOW() - INTERVAL {hours} HOUR) * 1000 GROUP BY hour ORDER BY hour ASC"
         );
         Ok(sqlx::query_as::<_, StatsHourly>(&sql)
             .fetch_all(&self.pool)
@@ -1076,10 +1086,10 @@ impl LogStore for MysqlLogStore {
     async fn stats_by_model(&self, hours: Option<i64>) -> anyhow::Result<Vec<ModelStats>> {
         let sql = if let Some(hours) = hours {
             format!(
-                "SELECT upstream_model AS model, COUNT(*) AS request_count, CAST(COALESCE(SUM(input_tokens), 0) AS SIGNED) AS total_input_tokens, CAST(COALESCE(SUM(output_tokens), 0) AS SIGNED) AS total_output_tokens, CAST(COALESCE(AVG(latency_total_ms), 0) AS DOUBLE) AS avg_duration_ms FROM request_logs WHERE created_at >= UNIX_TIMESTAMP(NOW() - INTERVAL {hours} HOUR) * 1000 GROUP BY upstream_model ORDER BY request_count DESC"
+                "SELECT upstream_model AS model, COUNT(*) AS request_count, CAST(COALESCE(SUM(input_tokens), 0) AS SIGNED) AS total_input_tokens, CAST(COALESCE(SUM(output_tokens), 0) AS SIGNED) AS total_output_tokens, CAST(COALESCE(SUM(cache_read_tokens), 0) AS SIGNED) AS total_cache_read_tokens, CAST(COALESCE(AVG(latency_total_ms), 0) AS DOUBLE) AS avg_duration_ms, CAST(COALESCE(SUM(latency_upstream_ms), 0) AS DOUBLE) AS total_upstream_ms FROM request_logs WHERE created_at >= UNIX_TIMESTAMP(NOW() - INTERVAL {hours} HOUR) * 1000 GROUP BY upstream_model ORDER BY request_count DESC"
             )
         } else {
-            "SELECT upstream_model AS model, COUNT(*) AS request_count, CAST(COALESCE(SUM(input_tokens), 0) AS SIGNED) AS total_input_tokens, CAST(COALESCE(SUM(output_tokens), 0) AS SIGNED) AS total_output_tokens, CAST(COALESCE(AVG(latency_total_ms), 0) AS DOUBLE) AS avg_duration_ms FROM request_logs GROUP BY upstream_model ORDER BY request_count DESC".to_string()
+            "SELECT upstream_model AS model, COUNT(*) AS request_count, CAST(COALESCE(SUM(input_tokens), 0) AS SIGNED) AS total_input_tokens, CAST(COALESCE(SUM(output_tokens), 0) AS SIGNED) AS total_output_tokens, CAST(COALESCE(SUM(cache_read_tokens), 0) AS SIGNED) AS total_cache_read_tokens, CAST(COALESCE(AVG(latency_total_ms), 0) AS DOUBLE) AS avg_duration_ms, CAST(COALESCE(SUM(latency_upstream_ms), 0) AS DOUBLE) AS total_upstream_ms FROM request_logs GROUP BY upstream_model ORDER BY request_count DESC".to_string()
         };
         Ok(sqlx::query_as::<_, ModelStats>(&sql)
             .fetch_all(&self.pool)

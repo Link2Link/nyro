@@ -24,8 +24,6 @@ import {
   Loader2,
   Pencil,
   X,
-  ChevronLeft,
-  ChevronRight,
   Eye,
   EyeOff,
   Info,
@@ -80,7 +78,6 @@ const emptyCreate: CreateProvider = {
   static_models: "",
   api_key: "",
 };
-const PAGE_SIZE = 7;
 const DEFAULT_PRESET_ID = "nyro";
 const protocolOptions = [
   { label: "OpenAI Compatible", value: "openai-compatible" },
@@ -381,7 +378,6 @@ export default function ProvidersPage() {
   const qc = useQueryClient();
   const [showForm, setShowForm] = useState(false);
   const [editingId, setEditingId] = useState<string | null>(null);
-  const [page, setPage] = useState(0);
   const [testingId, setTestingId] = useState<string | null>(null);
   const [testResult, setTestResult] = useState<Record<string, TestResult>>(loadProviderTestResults);
   const [testDialogOpen, setTestDialogOpen] = useState(false);
@@ -1219,8 +1215,6 @@ export default function ProvidersPage() {
     setForm(emptyCreate);
   }
 
-  const totalPages = Math.max(1, Math.ceil(providers.length / PAGE_SIZE));
-  const pagedProviders = providers.slice(page * PAGE_SIZE, page * PAGE_SIZE + PAGE_SIZE);
   const createChannelOptions = selectedPreset ? presetChannels(selectedPreset) : [fallbackChannelPreset()];
   const createChannelValue =
     selectedPreset?.channels?.length
@@ -1238,12 +1232,6 @@ export default function ProvidersPage() {
       ? createOAuthStatus.requires_manual_code
       : createOAuthSession?.requires_manual_code ?? false;
   const showCreateOAuthGuide = createResolvedAuthMode === "oauth" && !createOAuthReady;
-
-  useEffect(() => {
-    if (page > totalPages - 1) {
-      setPage(0);
-    }
-  }, [page, totalPages]);
 
   useEffect(() => {
     if (!logsContainerRef.current) return;
@@ -1787,7 +1775,7 @@ export default function ProvidersPage() {
         </div>
       ) : (
         <div className="grid gap-3">
-          {pagedProviders.map((p) => {
+          {providers.map((p) => {
             const tr = testResult[p.id];
             const status = tr ? (tr.success ? "success" : "failed") : null;
             const isEditing = editingId === p.id;
@@ -2431,32 +2419,6 @@ export default function ProvidersPage() {
               </div>
             );
           })}
-
-          {providers.length > PAGE_SIZE && (
-            <div className="flex items-center justify-between px-1 pt-1">
-              <span className="text-xs text-slate-500">
-                {isZh ? `第 ${page + 1} / ${totalPages} 页` : `Page ${page + 1} of ${totalPages}`}
-              </span>
-              <div className="flex gap-1">
-                <Button
-                  onClick={() => setPage(Math.max(0, page - 1))}
-                  disabled={page === 0}
-                  variant="outline"
-                  size="icon"
-                >
-                  <ChevronLeft className="h-4 w-4" />
-                </Button>
-                <Button
-                  onClick={() => setPage(Math.min(totalPages - 1, page + 1))}
-                  disabled={page >= totalPages - 1}
-                  variant="outline"
-                  size="icon"
-                >
-                  <ChevronRight className="h-4 w-4" />
-                </Button>
-              </div>
-            </div>
-          )}
         </div>
       )}
 

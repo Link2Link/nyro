@@ -1,6 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useMemo, useState } from "react";
-import { ChevronLeft, ChevronRight, ScrollText, Trash2 } from "lucide-react";
+import { Calendar, ChevronLeft, ChevronRight, ScrollText, Trash2, X } from "lucide-react";
 
 import { backend } from "@/lib/backend";
 import type { ApiKey, LogPage, LogQuery, ModelStats, Provider, RequestLog } from "@/lib/types";
@@ -20,6 +20,7 @@ import {
 } from "@/components/ui/select";
 import { LogDetailDialog } from "@/components/log-detail-dialog";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 
 const PAGE_SIZE = 11;
 const ALL_OPTION = "__all__";
@@ -109,6 +110,22 @@ export default function LogsPage() {
         ? "error"
         : ALL_OPTION;
 
+  // 日期选择：将日期字符串转为 Unix 毫秒时间戳
+  function dateToTs(dateStr: string, endOfDay: boolean): number {
+    if (endOfDay) {
+      return new Date(dateStr + "T23:59:59.999").getTime();
+    }
+    return new Date(dateStr + "T00:00:00").getTime();
+  }
+  // Unix 毫秒时间戳 → YYYY-MM-DD 字符串
+  function tsToDateStr(ts: number | undefined): string {
+    if (!ts) return "";
+    const d = new Date(ts);
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+  }
+  const dateFromStr = tsToDateStr(filter.after);
+  const dateToStr = tsToDateStr(filter.before);
+
   return (
     <div className="space-y-5">
       <div className="flex items-center justify-between">
@@ -197,6 +214,76 @@ export default function LogsPage() {
               ))}
             </SelectContent>
           </Select>
+          <Popover>
+            <PopoverTrigger asChild>
+              <Button
+                variant="outline"
+                className={cn(
+                  "h-10 gap-2 px-3 text-xs",
+                  (filter.after || filter.before) && "border-sky-400 text-sky-700",
+                )}
+              >
+                <Calendar className="h-3.5 w-3.5" />
+                {filter.after && filter.before
+                  ? `${dateFromStr} → ${dateToStr}`
+                  : filter.after
+                    ? `${isZh ? "从" : "From"} ${dateFromStr}`
+                    : filter.before
+                      ? `${isZh ? "至" : "To"} ${dateToStr}`
+                      : isZh
+                        ? "选择日期"
+                        : "Select Date"}
+              </Button>
+            </PopoverTrigger>
+            <PopoverContent className="w-64 p-3" align="end">
+              <div className="space-y-3">
+                <div className="space-y-1.5">
+                  <label className="text-xs font-medium text-slate-600">
+                    {isZh ? "起始日期" : "From"}
+                  </label>
+                  <input
+                    type="date"
+                    value={dateFromStr}
+                    onChange={(e) => {
+                      const v = e.target.value;
+                      setFilter({ ...filter, after: v ? dateToTs(v, false) : undefined });
+                      setPage(0);
+                    }}
+                    className="h-9 w-full rounded-lg border border-slate-300 bg-white px-3 text-xs text-slate-700"
+                  />
+                </div>
+                <div className="space-y-1.5">
+                  <label className="text-xs font-medium text-slate-600">
+                    {isZh ? "结束日期" : "To"}
+                  </label>
+                  <input
+                    type="date"
+                    value={dateToStr}
+                    onChange={(e) => {
+                      const v = e.target.value;
+                      setFilter({ ...filter, before: v ? dateToTs(v, true) : undefined });
+                      setPage(0);
+                    }}
+                    className="h-9 w-full rounded-lg border border-slate-300 bg-white px-3 text-xs text-slate-700"
+                  />
+                </div>
+                {(filter.after || filter.before) && (
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    className="h-8 w-full text-xs text-slate-500"
+                    onClick={() => {
+                      setFilter({ ...filter, after: undefined, before: undefined });
+                      setPage(0);
+                    }}
+                  >
+                    <X className="mr-1 h-3 w-3" />
+                    {isZh ? "清除日期" : "Clear"}
+                  </Button>
+                )}
+              </div>
+            </PopoverContent>
+          </Popover>
           <Button
             variant="outline"
             size="icon"

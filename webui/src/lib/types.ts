@@ -131,6 +131,7 @@ export interface StatsHourly {
   error_count: number;
   total_input_tokens: number;
   total_output_tokens: number;
+  total_cache_read_tokens: number;
   avg_duration_ms: number;
 }
 
@@ -139,7 +140,9 @@ export interface ModelStats {
   request_count: number;
   total_input_tokens: number;
   total_output_tokens: number;
+  total_cache_read_tokens: number;
   avg_duration_ms: number;
+  total_upstream_ms: number;
 }
 
 export interface ProviderStats {
@@ -302,6 +305,10 @@ export interface LogQuery {
   status_min?: number;
   status_max?: number;
   api_key?: string;
+  /** 起始时间(Unix 毫秒)，筛选 created_at >= after */
+  after?: number;
+  /** 结束时间(Unix 毫秒)，筛选 created_at <= before */
+  before?: number;
 }
 
 export interface ExportData {
