@@ -4,6 +4,7 @@ import { backend } from "@/lib/backend";
 import type { StatsOverview, StatsHourly, ModelStats, ProviderStats, GatewayStatus, Provider, Model as ModelType } from "@/lib/types";
 import { Activity, Zap, Clock, AlertTriangle, Server, Route as RouteIcon } from "lucide-react";
 import { useLocale } from "@/lib/i18n";
+import { formatLocalHourLabel } from "@/lib/format";
 
 function fmt(n: number) {
   if (n >= 1_000_000) return (n / 1_000_000).toFixed(1) + "M";
@@ -77,7 +78,7 @@ export default function DashboardPage() {
   ];
 
   const chartHourly = hourly.map((h) => ({
-    hour: h.hour.slice(11, 16),
+    hour: formatLocalHourLabel(h.hour),
     requests: h.request_count,
     errors: h.error_count,
     latency: latencyUseSeconds

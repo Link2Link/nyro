@@ -8,6 +8,7 @@ import type {
   ImportResult,
 } from "@/lib/types";
 import { useLocale } from "@/lib/i18n";
+import { formatLocalDateStamp } from "@/lib/format";
 import {
   Download,
   HelpCircle,
@@ -171,7 +172,7 @@ export default function SettingsPage() {
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
       a.href = url;
-      a.download = `nyro-config-${new Date().toISOString().slice(0, 10)}.json`;
+      a.download = `nyro-config-${formatLocalDateStamp(Date.now())}.json`;
       a.click();
       URL.revokeObjectURL(url);
     },

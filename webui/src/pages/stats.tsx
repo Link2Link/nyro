@@ -5,7 +5,7 @@ import { backend } from "@/lib/backend";
 import type { StatsOverview, StatsHourly, ModelStats, ProviderStats, ApiKeyStats } from "@/lib/types";
 import { Zap, Clock, Activity } from "lucide-react";
 import { useLocale } from "@/lib/i18n";
-import { formatLogTime } from "@/lib/format";
+import { formatLogTime, formatLocalHourLabel } from "@/lib/format";
 import {
   Select,
   SelectContent,
@@ -66,7 +66,7 @@ export default function StatsPage() {
   });
 
   const tokenChart = hourly.map((h) => ({
-    hour: h.hour.slice(11, 16),
+    hour: formatLocalHourLabel(h.hour),
     input: h.total_input_tokens,
     output: h.total_output_tokens,
   }));

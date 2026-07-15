@@ -6,6 +6,7 @@ import { backend } from "@/lib/backend";
 import { localizeBackendErrorMessage } from "@/lib/backend-error";
 import type { ApiKey, CreateApiKey, Model as ModelType, UpdateApiKey } from "@/lib/types";
 import { useLocale } from "@/lib/i18n";
+import { formatLocalDateTime } from "@/lib/format";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Badge } from "@/components/ui/badge";
@@ -57,7 +58,7 @@ function quotaText(value: number | null | undefined) {
 
 function formatExpiresText(value: string | null | undefined, isZh: boolean) {
   if (!value) return isZh ? "永不过期" : "Never";
-  return value.replace("T", " ").slice(0, 19);
+  return formatLocalDateTime(value);
 }
 
 function isApiKeyExpired(expiresAt: string | null | undefined) {
