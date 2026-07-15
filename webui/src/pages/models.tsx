@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { GitBranch, Pencil, Plus, Route as RouteIcon, Trash2, ToggleRight, ToggleLeft, X } from "lucide-react";
+import { GitBranch, Pencil, Plus, Route as RouteIcon, Search, Trash2, ToggleRight, ToggleLeft, X } from "lucide-react";
 
 import { backend } from "@/lib/backend";
 import { localizeBackendErrorMessage } from "@/lib/backend-error";
@@ -321,6 +321,7 @@ export default function ModelsPage() {
   const [editError, setEditError] = useState<string | null>(null);
   const [modelToDelete, setModelToDelete] = useState<ModelType | null>(null);
   const [errorDialog, setErrorDialog] = useState<{ title: string; description?: string } | null>(null);
+  const [modelNameFilter, setModelNameFilter] = useState("");
 
   function formatErrorMessage(error: unknown) {
     return localizeBackendErrorMessage(error, isZh);
@@ -397,6 +398,14 @@ export default function ModelsPage() {
     () => new Map(providers.map((p) => [p.id, p])),
     [providers],
   );
+  const filteredRoutes = useMemo(() => {
+    const normalizeForSearch = (value: string) =>
+      value.toLocaleLowerCase().replace(/[\s._\p{Pd}]+/gu, "");
+    const query = normalizeForSearch(modelNameFilter);
+    return routes
+      .filter((route) => !query || normalizeForSearch(route.name).includes(query))
+      .sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: "base" }));
+  }, [modelNameFilter, routes]);
 
   function startEdit(route: ModelType) {
     setEditingId(route.id);
@@ -597,6 +606,18 @@ export default function ModelsPage() {
         </div>
       )}
 
+      {!isLoading && routes.length > 0 && (
+        <div className="relative max-w-md">
+          <Search className="pointer-events-none absolute top-1/2 left-3 h-4 w-4 -translate-y-1/2 text-slate-400" />
+          <Input
+            value={modelNameFilter}
+            onChange={(event) => setModelNameFilter(event.target.value)}
+            placeholder={isZh ? "按模型名称筛选" : "Filter by model name"}
+            className="pl-9"
+          />
+        </div>
+      )}
+
       {isLoading ? (
         <div className="py-12 text-center text-sm text-slate-500">{isZh ? "加载中..." : "Loading..."}</div>
       ) : routes.length === 0 ? (
@@ -604,9 +625,14 @@ export default function ModelsPage() {
           <RouteIcon className="mx-auto h-10 w-10 text-slate-400" />
           <p className="mt-3 text-sm text-slate-500">{isZh ? "还没有配置模型" : "No models configured"}</p>
         </div>
+      ) : filteredRoutes.length === 0 ? (
+        <div className="glass rounded-2xl p-12 text-center">
+          <Search className="mx-auto h-10 w-10 text-slate-400" />
+          <p className="mt-3 text-sm text-slate-500">{isZh ? "没有匹配的模型" : "No matching models"}</p>
+        </div>
       ) : (
         <div className="grid gap-3">
-          {routes.map((route) => {
+          {filteredRoutes.map((route) => {
             const isEditing = editingId === route.id && editForm;
 
             if (isEditing && editForm) {
