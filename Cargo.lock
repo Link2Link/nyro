@@ -2884,7 +2884,7 @@ dependencies = [
 
 [[package]]
 name = "nyro-core"
-version = "2.0.1"
+version = "2.0.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2914,7 +2914,7 @@ dependencies = [
 
 [[package]]
 name = "nyro-desktop"
-version = "2.0.1"
+version = "2.0.2"
 dependencies = [
  "nyro-core",
  "serde",
@@ -2931,7 +2931,7 @@ dependencies = [
 
 [[package]]
 name = "nyro-server"
-version = "2.0.1"
+version = "2.0.2"
 dependencies = [
  "anyhow",
  "axum",
@@ -2952,7 +2952,7 @@ dependencies = [
 
 [[package]]
 name = "nyro-tools"
-version = "2.0.1"
+version = "2.0.2"
 dependencies = [
  "anyhow",
  "axum",

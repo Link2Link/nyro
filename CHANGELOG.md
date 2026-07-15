@@ -4,6 +4,28 @@ All notable changes to Nyro will be documented in this file.
 
 ---
 
+## v2.0.2
+
+> Released on 2026-07-15
+
+#### Features
+
+- **Model token statistics**: new table showing the top 10 models by request count with input/output tokens, cache hits, cache hit rate, avg latency, and TPS
+- **Log date range filter**: filter request logs by start/end date via a date range picker
+- **Token usage chart**: add cache hits as a third stacked series in the token usage over time chart
+- **Scrollable lists**: providers and models pages now scroll instead of paginating
+
+#### Improvements / Refactoring
+
+- **Chart tooltip formatting**: large numbers in stats chart tooltips now display as K/M
+
+#### Fixes
+
+- **Timezone display**: convert backend UTC times to the browser's local timezone across the web UI
+- **Popover background**: fix transparent popover background causing underlying text to show through
+
+---
+
 ## v2.0.1
 
 > Released on 2026-07-11

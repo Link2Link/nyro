@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/nyro-core", "crates/nyro-tools", "src-tauri", "src-server"]
 
 [workspace.package]
-version = "2.0.1"
+version = "2.0.2"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/Link2Link/nyro"
