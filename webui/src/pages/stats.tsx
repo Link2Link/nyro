@@ -209,23 +209,30 @@ export default function StatsPage() {
                 <th className="px-4 py-2.5 text-right font-medium">{isZh ? "错误数" : "Errors"}</th>
                 <th className="px-4 py-2.5 text-right font-medium">{isZh ? "错误率" : "Error Rate"}</th>
                 <th className="px-4 py-2.5 text-right font-medium">{isZh ? "平均延迟" : "Avg Latency"}</th>
+                <th className="px-4 py-2.5 text-right font-medium">TPS</th>
               </tr>
             </thead>
             <tbody>
               {providerStats.length === 0 && (
-                <tr><td className="px-4 py-6 text-center text-slate-400" colSpan={5}>{isZh ? "暂无数据" : "No data"}</td></tr>
+                <tr><td className="px-4 py-6 text-center text-slate-400" colSpan={6}>{isZh ? "暂无数据" : "No data"}</td></tr>
               )}
-              {providerStats.slice(0, 8).map((p) => (
-                <tr key={p.provider} className="border-t border-white/70 text-slate-700">
-                  <td className="px-4 py-2.5 font-medium">{p.provider}</td>
-                  <td className="px-4 py-2.5 text-right">{fmt(p.request_count)}</td>
-                  <td className="px-4 py-2.5 text-right text-red-500">{p.error_count}</td>
-                  <td className="px-4 py-2.5 text-right">
-                    {p.request_count > 0 ? ((p.error_count / p.request_count) * 100).toFixed(1) : "0"}%
-                  </td>
-                  <td className="px-4 py-2.5 text-right">{fmtLatency(p.avg_duration_ms)}</td>
-                </tr>
-              ))}
+              {providerStats.slice(0, 8).map((p) => {
+                const tps = p.total_upstream_ms > 0 && p.total_output_tokens > 0
+                  ? p.total_output_tokens / (p.total_upstream_ms / 1000)
+                  : null;
+                return (
+                  <tr key={p.provider} className="border-t border-white/70 text-slate-700">
+                    <td className="px-4 py-2.5 font-medium">{p.provider}</td>
+                    <td className="px-4 py-2.5 text-right">{fmt(p.request_count)}</td>
+                    <td className="px-4 py-2.5 text-right text-red-500">{p.error_count}</td>
+                    <td className="px-4 py-2.5 text-right">
+                      {p.request_count > 0 ? ((p.error_count / p.request_count) * 100).toFixed(1) : "0"}%
+                    </td>
+                    <td className="px-4 py-2.5 text-right">{fmtLatency(p.avg_duration_ms)}</td>
+                    <td className="px-4 py-2.5 text-right">{formatTps(tps)}</td>
+                  </tr>
+                );
+              })}
             </tbody>
           </table>
         </div>
@@ -239,6 +246,7 @@ export default function StatsPage() {
               <tr>
                 <th className="px-4 py-2.5 text-left font-medium">{isZh ? "密钥" : "API Key"}</th>
                 <th className="px-4 py-2.5 text-right font-medium">{isZh ? "请求数" : "Requests"}</th>
+                <th className="px-4 py-2.5 text-right font-medium">{isZh ? "失败数" : "Failures"}</th>
                 <th className="px-4 py-2.5 text-right font-medium">{isZh ? "输入 Token" : "Input Tokens"}</th>
                 <th className="px-4 py-2.5 text-right font-medium">{isZh ? "输出 Token" : "Output Tokens"}</th>
                 <th className="px-4 py-2.5 text-right font-medium">{isZh ? "缓存命中" : "Cache Hits"}</th>
@@ -247,7 +255,7 @@ export default function StatsPage() {
             </thead>
             <tbody>
               {apiKeyStats.length === 0 && (
-                <tr><td className="px-4 py-6 text-center text-slate-400" colSpan={6}>{isZh ? "暂无数据" : "No data"}</td></tr>
+                <tr><td className="px-4 py-6 text-center text-slate-400" colSpan={7}>{isZh ? "暂无数据" : "No data"}</td></tr>
               )}
               {apiKeyStats.slice(0, 8).map((k) => {
                 const cacheTotal = k.total_input_tokens + k.cache_read_tokens;
@@ -256,6 +264,7 @@ export default function StatsPage() {
                   <tr key={k.api_key_id} className="border-t border-white/70 text-slate-700">
                     <td className="px-4 py-2.5 font-medium">{k.api_key_name || k.api_key_id}</td>
                     <td className="px-4 py-2.5 text-right">{fmt(k.request_count)}</td>
+                    <td className="px-4 py-2.5 text-right text-red-500">{fmt(k.error_count)}</td>
                     <td className="px-4 py-2.5 text-right">{fmt(k.total_input_tokens)}</td>
                     <td className="px-4 py-2.5 text-right">{fmt(k.total_output_tokens)}</td>
                     <td className="px-4 py-2.5 text-right">

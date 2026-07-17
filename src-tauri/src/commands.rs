@@ -385,6 +385,17 @@ pub async fn get_stats_by_provider(
         .map_err(|e| e.to_string())
 }
 
+#[tauri::command]
+pub async fn get_stats_by_api_key(
+    gw: State<'_, Gateway>,
+    hours: Option<i32>,
+) -> Result<Vec<ApiKeyStats>, String> {
+    gw.admin()
+        .get_stats_by_api_key(hours)
+        .await
+        .map_err(|e| e.to_string())
+}
+
 // ── Settings ──
 
 #[tauri::command]

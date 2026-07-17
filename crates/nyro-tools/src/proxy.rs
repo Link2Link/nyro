@@ -469,13 +469,14 @@ fn body_to_json(bytes: &[u8]) -> serde_json::Value {
 }
 
 /// Parse all `data:` lines from an SSE buffer into JSON values, skipping `[DONE]`.
+/// Tolerates both "data: x" and compact "data:x" forms.
 fn parse_sse_data(buf: &[u8]) -> Vec<serde_json::Value> {
     let text = String::from_utf8_lossy(buf);
     text.split("\n\n")
         .flat_map(|block| block.lines())
-        .filter(|line| line.starts_with("data: "))
-        .filter_map(|line| {
-            let data = line["data: ".len()..].trim();
+        .filter_map(|line| line.strip_prefix("data:"))
+        .filter_map(|data| {
+            let data = data.trim();
             if data == "[DONE]" {
                 return None;
             }
@@ -936,6 +937,16 @@ mod tests {
         let chunks = parse_sse_data(buf);
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0]["a"].as_u64().unwrap(), 1);
+    }
+
+    #[test]
+    fn sse_compact_no_space_data_is_parsed() {
+        // Kimi-style frames without a space after the colon must parse too.
+        let buf = b"data:{\"a\":1}\n\ndata:{\"b\":2}\n\n";
+        let chunks = parse_sse_data(buf);
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0]["a"].as_u64().unwrap(), 1);
+        assert_eq!(chunks[1]["b"].as_u64().unwrap(), 2);
     }
 
     // body_to_json

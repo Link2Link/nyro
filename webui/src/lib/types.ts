@@ -150,12 +150,15 @@ export interface ProviderStats {
   request_count: number;
   error_count: number;
   avg_duration_ms: number;
+  total_output_tokens: number;
+  total_upstream_ms: number;
 }
 
 export interface ApiKeyStats {
   api_key_id: string;
   api_key_name: string;
   request_count: number;
+  error_count: number;
   total_input_tokens: number;
   total_output_tokens: number;
   cache_read_tokens: number;

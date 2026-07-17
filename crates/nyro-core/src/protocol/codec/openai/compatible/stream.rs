@@ -175,7 +175,8 @@ impl StreamResponseDecoder for OpenAIStreamParser {
             self.buffer = self.buffer[pos + 2..].to_string();
 
             for line in block.lines() {
-                if let Some(data) = line.strip_prefix("data: ") {
+                // Tolerate both "data: x" and compact "data:x" forms.
+                if let Some(data) = line.strip_prefix("data:") {
                     let data = data.trim();
                     if data == "[DONE]" {
                         if !self.done {

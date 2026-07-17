@@ -168,7 +168,8 @@ impl StreamResponseDecoder for GoogleStreamParser {
 
             let mut saw_sse_data = false;
             for line in block.lines() {
-                if let Some(data) = line.strip_prefix("data: ") {
+                // Tolerate both "data: x" and compact "data:x" forms.
+                if let Some(data) = line.strip_prefix("data:") {
                     saw_sse_data = true;
                     let data = data.trim();
                     if let Ok(chunk) = serde_json::from_str::<Value>(data) {

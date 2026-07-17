@@ -429,6 +429,8 @@ pub struct ProviderStats {
     pub request_count: i64,
     pub error_count: i64,
     pub avg_duration_ms: f64,
+    pub total_output_tokens: i64,
+    pub total_upstream_ms: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
@@ -436,6 +438,7 @@ pub struct ApiKeyStats {
     pub api_key_id: String,
     pub api_key_name: String,
     pub request_count: i64,
+    pub error_count: i64,
     pub total_input_tokens: i64,
     pub total_output_tokens: i64,
     pub cache_read_tokens: i64,

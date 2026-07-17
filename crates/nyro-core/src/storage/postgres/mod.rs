@@ -1074,10 +1074,10 @@ impl LogStore for PostgresLogStore {
     async fn stats_by_provider(&self, hours: Option<i64>) -> anyhow::Result<Vec<ProviderStats>> {
         let sql = if let Some(hours) = hours {
             format!(
-                "SELECT COALESCE(provider_name, provider_id, '') AS provider, COUNT(*) AS request_count, COALESCE(SUM(CASE WHEN client_status_code >= 400 THEN 1 ELSE 0 END), 0) AS error_count, COALESCE(AVG(latency_total_ms)::FLOAT8, 0) AS avg_duration_ms FROM request_logs WHERE created_at >= EXTRACT(EPOCH FROM CURRENT_TIMESTAMP - INTERVAL '{hours} hours') * 1000 GROUP BY COALESCE(provider_name, provider_id, '') ORDER BY request_count DESC"
+                "SELECT COALESCE(provider_name, provider_id, '') AS provider, COUNT(*) AS request_count, COALESCE(SUM(CASE WHEN client_status_code >= 400 THEN 1 ELSE 0 END), 0) AS error_count, COALESCE(AVG(latency_total_ms)::FLOAT8, 0) AS avg_duration_ms, COALESCE(SUM(output_tokens), 0) AS total_output_tokens, COALESCE(SUM(latency_upstream_ms), 0)::FLOAT8 AS total_upstream_ms FROM request_logs WHERE created_at >= EXTRACT(EPOCH FROM CURRENT_TIMESTAMP - INTERVAL '{hours} hours') * 1000 GROUP BY COALESCE(provider_name, provider_id, '') ORDER BY request_count DESC"
             )
         } else {
-            "SELECT COALESCE(provider_name, provider_id, '') AS provider, COUNT(*) AS request_count, COALESCE(SUM(CASE WHEN client_status_code >= 400 THEN 1 ELSE 0 END), 0) AS error_count, COALESCE(AVG(latency_total_ms)::FLOAT8, 0) AS avg_duration_ms FROM request_logs GROUP BY COALESCE(provider_name, provider_id, '') ORDER BY request_count DESC".to_string()
+            "SELECT COALESCE(provider_name, provider_id, '') AS provider, COUNT(*) AS request_count, COALESCE(SUM(CASE WHEN client_status_code >= 400 THEN 1 ELSE 0 END), 0) AS error_count, COALESCE(AVG(latency_total_ms)::FLOAT8, 0) AS avg_duration_ms, COALESCE(SUM(output_tokens), 0) AS total_output_tokens, COALESCE(SUM(latency_upstream_ms), 0)::FLOAT8 AS total_upstream_ms FROM request_logs GROUP BY COALESCE(provider_name, provider_id, '') ORDER BY request_count DESC".to_string()
         };
         Ok(sqlx::query_as::<_, ProviderStats>(&sql)
             .fetch_all(&self.pool)
@@ -1087,10 +1087,10 @@ impl LogStore for PostgresLogStore {
     async fn stats_by_api_key(&self, hours: Option<i64>) -> anyhow::Result<Vec<ApiKeyStats>> {
         let sql = if let Some(hours) = hours {
             format!(
-                "SELECT COALESCE(api_key_id, '') AS api_key_id, COALESCE(api_key_name, api_key_id, '') AS api_key_name, COUNT(*) AS request_count, COALESCE(SUM(input_tokens), 0) AS total_input_tokens, COALESCE(SUM(output_tokens), 0) AS total_output_tokens, COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens, MAX(created_at) AS last_used_at FROM request_logs WHERE api_key_id IS NOT NULL AND api_key_id <> '' AND created_at >= EXTRACT(EPOCH FROM CURRENT_TIMESTAMP - INTERVAL '{hours} hours') * 1000 GROUP BY api_key_id, api_key_name ORDER BY request_count DESC"
+                "SELECT COALESCE(api_key_id, '') AS api_key_id, COALESCE(api_key_name, api_key_id, '') AS api_key_name, COUNT(*) AS request_count, COALESCE(SUM(CASE WHEN client_status_code >= 400 THEN 1 ELSE 0 END), 0) AS error_count, COALESCE(SUM(input_tokens), 0) AS total_input_tokens, COALESCE(SUM(output_tokens), 0) AS total_output_tokens, COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens, MAX(created_at) AS last_used_at FROM request_logs WHERE api_key_id IS NOT NULL AND api_key_id <> '' AND created_at >= EXTRACT(EPOCH FROM CURRENT_TIMESTAMP - INTERVAL '{hours} hours') * 1000 GROUP BY api_key_id, api_key_name ORDER BY request_count DESC"
             )
         } else {
-            "SELECT COALESCE(api_key_id, '') AS api_key_id, COALESCE(api_key_name, api_key_id, '') AS api_key_name, COUNT(*) AS request_count, COALESCE(SUM(input_tokens), 0) AS total_input_tokens, COALESCE(SUM(output_tokens), 0) AS total_output_tokens, COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens, MAX(created_at) AS last_used_at FROM request_logs WHERE api_key_id IS NOT NULL AND api_key_id <> '' GROUP BY api_key_id, api_key_name ORDER BY request_count DESC".to_string()
+            "SELECT COALESCE(api_key_id, '') AS api_key_id, COALESCE(api_key_name, api_key_id, '') AS api_key_name, COUNT(*) AS request_count, COALESCE(SUM(CASE WHEN client_status_code >= 400 THEN 1 ELSE 0 END), 0) AS error_count, COALESCE(SUM(input_tokens), 0) AS total_input_tokens, COALESCE(SUM(output_tokens), 0) AS total_output_tokens, COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens, MAX(created_at) AS last_used_at FROM request_logs WHERE api_key_id IS NOT NULL AND api_key_id <> '' GROUP BY api_key_id, api_key_name ORDER BY request_count DESC".to_string()
         };
         Ok(sqlx::query_as::<_, ApiKeyStats>(&sql)
             .fetch_all(&self.pool)

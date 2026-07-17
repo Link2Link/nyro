@@ -134,11 +134,12 @@ impl StreamResponseDecoder for ResponsesStreamParser {
 
             let mut event_name: Option<String> = None;
             for line in block.lines() {
-                if let Some(event) = line.strip_prefix("event: ") {
+                // Tolerate both "event: x" / "data: x" and compact no-space forms.
+                if let Some(event) = line.strip_prefix("event:") {
                     event_name = Some(event.trim().to_string());
                     continue;
                 }
-                let Some(data) = line.strip_prefix("data: ") else {
+                let Some(data) = line.strip_prefix("data:") else {
                     continue;
                 };
                 let data = data.trim();

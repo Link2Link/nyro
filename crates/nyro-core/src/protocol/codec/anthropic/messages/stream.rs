@@ -211,9 +211,11 @@ impl StreamResponseDecoder for AnthropicStreamParser {
             let mut data_str = None;
 
             for line in block.lines() {
-                if let Some(ev) = line.strip_prefix("event: ") {
+                // Tolerate both "event: x" (standard) and "event:x" (compact,
+                // e.g. Kimi) — the SSE spec allows optional space after colon.
+                if let Some(ev) = line.strip_prefix("event:") {
                     event_type = Some(ev.trim().to_string());
-                } else if let Some(d) = line.strip_prefix("data: ") {
+                } else if let Some(d) = line.strip_prefix("data:") {
                     data_str = Some(d.trim().to_string());
                 }
             }
@@ -614,10 +616,11 @@ impl StreamResponseEncoder for AnthropicStreamFormatter {
                     let mut ev_type = None;
                     let mut ev_data = String::new();
                     for line in raw.lines() {
-                        if let Some(t) = line.strip_prefix("event: ") {
-                            ev_type = Some(t.to_string());
-                        } else if let Some(d) = line.strip_prefix("data: ") {
-                            ev_data = d.to_string();
+                        // Tolerate both "event: x" and compact "event:x" forms.
+                        if let Some(t) = line.strip_prefix("event:") {
+                            ev_type = Some(t.trim().to_string());
+                        } else if let Some(d) = line.strip_prefix("data:") {
+                            ev_data = d.trim().to_string();
                         }
                     }
                     if let Some(et) = ev_type {
@@ -852,6 +855,47 @@ mod tests {
             .iter()
             .any(|d| matches!(d, AiStreamDelta::Done { stop_reason } if stop_reason == "stop"));
         assert!(has_text, "expected TextDelta('hello'), got: {deltas:?}");
+        assert!(has_done, "expected Done(stop), got: {deltas:?}");
+    }
+
+    #[test]
+    fn test_stream_compact_no_space_sse() {
+        // Kimi emits SSE without the space after the colon: "event:x\ndata:{...}".
+        // The parser must accept both spaced and compact forms (SSE spec makes the
+        // space optional) — previously this silently dropped every event and
+        // recorded IN=0 OUT=0 token stats.
+        let sse = concat!(
+            "event:message_start\n",
+            "data:{\"type\":\"message_start\",\"message\":{\"id\":\"msg_k\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"model\":\"k3\",\"stop_reason\":null,\"usage\":{\"input_tokens\":48980,\"output_tokens\":0}}}\n\n",
+            "event:content_block_start\n",
+            "data:{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+            "event:content_block_delta\n",
+            "data:{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n",
+            "event:message_delta\n",
+            "data:{\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":7}}\n\n",
+        );
+
+        let mut parser = AnthropicStreamParser::new();
+        let deltas = parser.parse_chunk(sse).unwrap();
+
+        let usage = deltas.iter().find_map(|d| {
+            if let AiStreamDelta::Usage(u) = d {
+                Some(u)
+            } else {
+                None
+            }
+        });
+        assert!(
+            usage.is_some_and(|u| u.prompt_tokens == 48980),
+            "expected Usage with prompt_tokens=48980, got: {deltas:?}"
+        );
+        let has_text = deltas
+            .iter()
+            .any(|d| matches!(d, AiStreamDelta::TextDelta(t) if t == "hi"));
+        let has_done = deltas
+            .iter()
+            .any(|d| matches!(d, AiStreamDelta::Done { stop_reason } if stop_reason == "stop"));
+        assert!(has_text, "expected TextDelta('hi'), got: {deltas:?}");
         assert!(has_done, "expected Done(stop), got: {deltas:?}");
     }
 

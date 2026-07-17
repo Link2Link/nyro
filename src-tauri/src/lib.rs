@@ -104,6 +104,7 @@ pub fn run() {
             commands::get_stats_hourly,
             commands::get_stats_by_model,
             commands::get_stats_by_provider,
+            commands::get_stats_by_api_key,
             commands::get_setting,
             commands::set_setting,
             commands::get_gateway_status,
