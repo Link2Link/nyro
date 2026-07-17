@@ -166,6 +166,27 @@ pub async fn passthrough_run(
             "model".to_string(),
             serde_json::Value::String(ctx.actual_model.to_string()),
         );
+
+        // OpenAI chat-completions streaming only populates `usage` in the final
+        // chunk when the client opts in via `stream_options.include_usage`.
+        // PassThrough forwards the client body verbatim, so it bypasses
+        // `OpenAIEncoder` — which injects this on the transcode path
+        // (encoder.rs "Always include_usage when streaming"). Mirror it here so
+        // usage stays observable for logging/cost on the native path too. An
+        // explicit client `stream_options` is preserved verbatim (same
+        // precedence as the encoder). Embeddings (non-streaming, different
+        // shape), Responses, and Anthropic/Gemini (usage reported by default)
+        // are excluded.
+        if is_stream
+            && ctx.protocol.protocol == crate::protocol::ids::Protocol::OpenAICompatible
+            && ctx.protocol.name == "chat-completions"
+            && !obj.contains_key("stream_options")
+        {
+            obj.insert(
+                "stream_options".to_string(),
+                serde_json::json!({"include_usage": true}),
+            );
+        }
     }
 
     let vendor_ctx = ctx.to_vendor_ctx();
@@ -511,6 +532,97 @@ mod tests {
             out.url,
             "https://gemini-proxy.local/v1beta/models/gemini-2.5-flash:streamGenerateContent?alt=sse",
             "Gemini stream passthrough selects streaming from the URL action, not a body stream flag",
+        );
+    }
+
+    fn openai_chat_ctx<'a>(
+        provider: &'a Provider,
+        gw: &'a Gateway,
+        actual_model: &'a str,
+    ) -> ProviderCtx<'a> {
+        ProviderCtx {
+            provider,
+            protocol: OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1,
+            egress_base_url: "https://upstream.local",
+            api_key: &provider.api_key,
+            actual_model,
+            credential: None,
+            gw,
+            disable_default_auth: false,
+        }
+    }
+
+    /// The whole reason this injection exists: a native OpenAI chat-completions
+    /// stream with no `stream_options` would otherwise be forwarded verbatim
+    /// and the upstream would never report `usage`, so logging/cost sees 0/0.
+    #[tokio::test]
+    async fn passthrough_injects_include_usage_for_openai_streaming() {
+        let gw = build_test_gateway().await;
+        let provider = provider_with_api_key("apikey-abc");
+        let ctx = openai_chat_ctx(&provider, &gw, "gpt-test");
+
+        let out = passthrough_run(
+            &FakeApiKeyVendor,
+            serde_json::json!({ "messages": [{"role":"user","content":"ping"}], "stream": true }),
+            &ctx,
+            true,
+        )
+        .await
+        .expect("passthrough succeeds");
+
+        assert_eq!(
+            out.body["stream_options"]["include_usage"], true,
+            "native openai stream without stream_options must get include_usage injected",
+        );
+    }
+
+    /// A client that explicitly sets `stream_options` (even to opt out of
+    /// usage) owns that decision — the proxy must not override it.
+    #[tokio::test]
+    async fn passthrough_preserves_explicit_client_stream_options() {
+        let gw = build_test_gateway().await;
+        let provider = provider_with_api_key("apikey-abc");
+        let ctx = openai_chat_ctx(&provider, &gw, "gpt-test");
+
+        let out = passthrough_run(
+            &FakeApiKeyVendor,
+            serde_json::json!({
+                "messages": [{"role":"user","content":"ping"}],
+                "stream": true,
+                "stream_options": {"include_usage": false}
+            }),
+            &ctx,
+            true,
+        )
+        .await
+        .expect("passthrough succeeds");
+
+        assert_eq!(
+            out.body["stream_options"]["include_usage"], false,
+            "explicit client stream_options must be preserved verbatim",
+        );
+    }
+
+    /// Non-streaming requests carry `usage` in the regular response body, so
+    /// there is nothing to inject — and we must not pollute the body.
+    #[tokio::test]
+    async fn passthrough_skips_include_usage_when_not_streaming() {
+        let gw = build_test_gateway().await;
+        let provider = provider_with_api_key("apikey-abc");
+        let ctx = openai_chat_ctx(&provider, &gw, "gpt-test");
+
+        let out = passthrough_run(
+            &FakeApiKeyVendor,
+            serde_json::json!({ "messages": [{"role":"user","content":"ping"}] }),
+            &ctx,
+            false,
+        )
+        .await
+        .expect("passthrough succeeds");
+
+        assert!(
+            out.body.get("stream_options").is_none(),
+            "non-streaming passthrough must not inject stream_options",
         );
     }
 }

@@ -415,7 +415,11 @@ async fn passthrough_run_sets_stream_path_for_streaming_body() {
     .await
     .expect("passthrough_run must succeed");
 
-    assert_eq!(out.body, raw_body);
+    // passthrough_run injects stream_options.include_usage for native OpenAI
+    // streaming so usage stays observable on the passthrough path too.
+    let mut expected = raw_body;
+    expected["stream_options"] = json!({"include_usage": true});
+    assert_eq!(out.body, expected);
     assert!(
         out.url.contains("/v1/chat/completions"),
         "stream path same as non-stream for chat"
