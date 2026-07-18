@@ -77,8 +77,8 @@ pub(super) fn ensure_model_backends_valid(backends: &[CreateModelBackend]) -> an
             anyhow::bail!("backend weight must be >= 0");
         }
         let priority = backend.priority.unwrap_or(1);
-        if !(1..=2).contains(&priority) {
-            anyhow::bail!("backend priority must be 1 or 2");
+        if priority < 1 {
+            anyhow::bail!("backend priority must be a positive integer");
         }
     }
     Ok(())

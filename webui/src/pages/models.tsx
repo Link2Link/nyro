@@ -59,7 +59,7 @@ function FieldLabel({ children }: { children: string }) {
 }
 
 function balanceLabel(value: ModelBalance, isZh: boolean) {
-  if (value === "priority") return isZh ? "主备分级" : "Priority";
+  if (value === "priority") return isZh ? "优先分级" : "Priority";
   return isZh ? "加权轮询" : "Weighted";
 }
 
@@ -279,18 +279,17 @@ function TargetRow({
             placeholder={isZh ? "权重" : "Weight"}
           />
         ) : (
-          <Select
-            value={String(target.priority)}
-            onValueChange={(value) => onUpdate(index, { priority: Number(value) })}
-          >
-            <SelectTrigger className="bg-white">
-              <SelectValue />
-            </SelectTrigger>
-            <SelectContent>
-              <SelectItem value="1">{isZh ? "主" : "Primary"}</SelectItem>
-              <SelectItem value="2">{isZh ? "备" : "Fallback"}</SelectItem>
-            </SelectContent>
-          </Select>
+          <Input
+            className="bg-white"
+            type="number"
+            min={1}
+            value={target.priority}
+            onChange={(e) => {
+              const next = Number(e.target.value || 0);
+              onUpdate(index, { priority: Math.max(1, next) });
+            }}
+            placeholder={isZh ? "优先级" : "Priority"}
+          />
         )}
 
         <button
@@ -521,13 +520,20 @@ export default function ModelsPage() {
                 </SelectTrigger>
                 <SelectContent>
                   <SelectItem value="weighted">{isZh ? "加权轮询" : "Weighted"}</SelectItem>
-                  <SelectItem value="priority">{isZh ? "主备分级" : "Priority"}</SelectItem>
+                  <SelectItem value="priority">{isZh ? "优先分级" : "Priority"}</SelectItem>
                 </SelectContent>
               </Select>
             </div>
             <div className="col-span-2 space-y-2">
               <div className="flex items-center justify-between">
-                <FieldLabel>{isZh ? "目标列表" : "Targets"}</FieldLabel>
+                <div className="flex items-center gap-2">
+                  <FieldLabel>{isZh ? "目标列表" : "Targets"}</FieldLabel>
+                  {createForm.balance === "priority" && (
+                    <span className="text-[11px] text-slate-400">
+                      {isZh ? "数字越小，优先级越高（1 最高）" : "lower number = higher priority (1 = highest)"}
+                    </span>
+                  )}
+                </div>
                 <span className="text-xs text-slate-500">
                   {isZh ? `共 ${createForm.targets.length} 个节点` : `${createForm.targets.length} nodes`}
                 </span>
@@ -672,13 +678,20 @@ export default function ModelsPage() {
                         </SelectTrigger>
                         <SelectContent>
                           <SelectItem value="weighted">{isZh ? "加权轮询" : "Weighted"}</SelectItem>
-                          <SelectItem value="priority">{isZh ? "主备分级" : "Priority"}</SelectItem>
+                          <SelectItem value="priority">{isZh ? "优先分级" : "Priority"}</SelectItem>
                         </SelectContent>
                       </Select>
                     </div>
                     <div className="col-span-2 space-y-2">
                       <div className="flex items-center justify-between">
-                        <FieldLabel>{isZh ? "目标列表" : "Targets"}</FieldLabel>
+                        <div className="flex items-center gap-2">
+                          <FieldLabel>{isZh ? "目标列表" : "Targets"}</FieldLabel>
+                          {editForm.balance === "priority" && (
+                            <span className="text-[11px] text-slate-400">
+                              {isZh ? "数字越小，优先级越高（1 最高）" : "lower number = higher priority (1 = highest)"}
+                            </span>
+                          )}
+                        </div>
                         <span className="text-xs text-slate-500">
                           {isZh ? `共 ${editForm.targets.length} 个节点` : `${editForm.targets.length} nodes`}
                         </span>
