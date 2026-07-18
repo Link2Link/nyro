@@ -397,6 +397,12 @@ export default function LogsPage() {
                               {formatTokenCount(log.input_tokens)}
                             </span>
                           </span>
+                          <span className="inline-flex items-center gap-1 text-amber-600">
+                            <span className="font-semibold tracking-wide">CACHE</span>
+                            <span title={String(log.cache_read_tokens ?? 0)}>
+                              {formatTokenCount(log.cache_read_tokens ?? 0)}
+                            </span>
+                          </span>
                           {routeType === "embedding" && log.output_tokens === 0 ? null : (
                             <span className="inline-flex items-center gap-1 text-emerald-600">
                               <span className="font-semibold tracking-wide">OUT</span>

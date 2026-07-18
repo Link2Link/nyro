@@ -508,7 +508,11 @@ mod tests {
             .await
             .expect("log entry should be emitted")
             .expect("log channel should remain open");
-        assert_eq!(entry.input_tokens(), 282);
+        // After the IR-usage gross/net unification, prompt_tokens is the
+        // GROSS input (net input 282 + cache_read 26624 = 26906). The wire
+        // shape sent back to Anthropic clients is unchanged (still
+        // input_tokens=282); only the IR / DB representation is gross now.
+        assert_eq!(entry.input_tokens(), 26906);
         assert_eq!(entry.output_tokens(), 595);
         assert_eq!(entry.cache_read_tokens(), 26624);
     }

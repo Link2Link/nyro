@@ -97,6 +97,7 @@ export interface RequestLog {
   latency_upstream_ms?: number;
   input_tokens: number;
   output_tokens: number;
+  cache_read_tokens?: number;
 
   is_stream: boolean;
   stream_chunks_count: number;

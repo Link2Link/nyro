@@ -700,11 +700,24 @@ fn extract_anthropic_usage(v: &Value) -> Usage {
             .and_then(|v| v.as_u64())
             .unwrap_or(0) as u32,
     });
+    // Anthropic reports `input_tokens` as a NET figure that EXCLUDES cached
+    // tokens; `cache_read_input_tokens` and `cache_creation_input_tokens` are
+    // reported separately on top. To keep IR `Usage.prompt_tokens` uniform
+    // across protocols (always GROSS = total prompt tokens billed), we fold
+    // the two cache components into prompt_tokens here. The Anthropic
+    // formatter (`extend_usage_json`) reverses this when writing back to
+    // Anthropic clients so the wire format stays spec-compliant.
+    let cache_read = get_opt_u32("cache_read_input_tokens");
+    let cache_creation = get_opt_u32("cache_creation_input_tokens");
+    let net_input = get_u32("input_tokens");
+    let gross_input = net_input
+        .saturating_add(cache_read.unwrap_or(0))
+        .saturating_add(cache_creation.unwrap_or(0));
     Usage {
-        prompt_tokens: get_u32("input_tokens"),
+        prompt_tokens: gross_input,
         completion_tokens: get_u32("output_tokens"),
-        cache_read_tokens: get_opt_u32("cache_read_input_tokens"),
-        cache_creation_tokens: get_opt_u32("cache_creation_input_tokens"),
+        cache_read_tokens: cache_read,
+        cache_creation_tokens: cache_creation,
         server_tool_use,
         ..Usage::default()
     }
@@ -712,7 +725,22 @@ fn extract_anthropic_usage(v: &Value) -> Usage {
 
 /// Append optional Anthropic-specific usage fields to an existing JSON usage object.
 /// Omits keys whose values are `None`.
+///
+/// Also reverses the IR-side gross→net normalization done in
+/// `extract_anthropic_usage`: Anthropic's wire spec defines `input_tokens`
+/// as a NET figure that excludes cached tokens, while IR `Usage.prompt_tokens`
+/// is always GROSS. We subtract the cache components before emitting
+/// `input_tokens` so Anthropic SDK clients see the spec-compliant shape:
+/// `input_tokens + cache_creation_input_tokens + cache_read_input_tokens`.
 fn extend_usage_json(obj: &mut Value, u: &Usage) {
+    // Convert gross→net for the Anthropic wire format. Only subtract when
+    // cache components are present and don't exceed the gross total.
+    if let Some(input) = obj.get("input_tokens").and_then(Value::as_u64) {
+        let net = input
+            .saturating_sub(u.cache_read_tokens.unwrap_or(0) as u64)
+            .saturating_sub(u.cache_creation_tokens.unwrap_or(0) as u64);
+        obj["input_tokens"] = net.into();
+    }
     if let Some(v) = u.cache_read_tokens {
         obj["cache_read_input_tokens"] = v.into();
     }
@@ -1306,6 +1334,9 @@ mod tests {
                 }
             })
             .expect("Usage delta must be present");
+        // IR prompt_tokens is GROSS: input_tokens (100) + cache_read (50)
+        // + cache_creation (200) = 350.
+        assert_eq!(usage.prompt_tokens, 350);
         assert_eq!(usage.cache_read_tokens, Some(50));
         assert_eq!(usage.cache_creation_tokens, Some(200));
     }
@@ -1342,8 +1373,10 @@ mod tests {
     #[test]
     fn test_formatter_message_start_includes_cache_fields() {
         // Usage delta carrying cache fields must appear in the message_start SSE output.
+        // IR prompt_tokens is GROSS. Pick 350 so net = 350 - 50 - 200 = 100
+        // matches the wire-format expectation.
         let usage = Usage {
-            prompt_tokens: 100,
+            prompt_tokens: 350,
             completion_tokens: 0,
             cache_read_tokens: Some(50),
             cache_creation_tokens: Some(200),
@@ -1425,8 +1458,9 @@ mod tests {
         let mut resp = AiResponse::new("m3", "claude");
         resp.content = "hi".to_string();
         resp.stop_reason = Some("stop".to_string());
+        // IR prompt_tokens is GROSS. Pick 30 so net = 30 - 3 - 7 = 20.
         resp.usage = Usage {
-            prompt_tokens: 10,
+            prompt_tokens: 30,
             completion_tokens: 5,
             cache_read_tokens: Some(3),
             cache_creation_tokens: Some(7),
@@ -1438,7 +1472,9 @@ mod tests {
         };
         let json = AnthropicResponseFormatter.format_response(&resp);
         let u = &json["usage"];
-        assert_eq!(u["input_tokens"].as_u64(), Some(10));
+        // Wire-format input_tokens must be the NET figure (30 - 3 - 7 = 20)
+        // to stay compliant with the Anthropic spec.
+        assert_eq!(u["input_tokens"].as_u64(), Some(20));
         assert_eq!(u["output_tokens"].as_u64(), Some(5));
         assert_eq!(u["cache_read_input_tokens"].as_u64(), Some(3));
         assert_eq!(u["cache_creation_input_tokens"].as_u64(), Some(7));
