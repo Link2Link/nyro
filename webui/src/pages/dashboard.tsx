@@ -68,9 +68,22 @@ export default function DashboardPage() {
 
   const latencyUseSeconds = hourly.some((h) => h.avg_duration_ms >= 1000);
 
+  // Total Tokens 卡片附带缓存命中率: cache_read / input (GROSS 语义)。
+  const totalInputForCache = overview?.total_input_tokens ?? 0;
+  const totalCacheRead = overview?.total_cache_read_tokens ?? 0;
+  const cacheRate = totalInputForCache > 0
+    ? Math.round((totalCacheRead / totalInputForCache) * 100)
+    : 0;
+  const totalTokensValue = fmt(
+    (overview?.total_input_tokens ?? 0) + (overview?.total_output_tokens ?? 0),
+  ) + (totalCacheRead > 0 ? ` (${cacheRate}%)` : "");
+  const totalTokensTitle = isZh
+    ? `缓存命中 ${fmt(totalCacheRead)} token,占输入 ${cacheRate}%`
+    : `${fmt(totalCacheRead)} tokens from cache (${cacheRate}% of input)`;
+
   const cards = [
     { label: isZh ? "总请求数" : "Total Requests", value: fmt(overview?.total_requests ?? 0), icon: Activity, color: "text-blue-600" },
-    { label: isZh ? "总 Token" : "Total Tokens", value: fmt((overview?.total_input_tokens ?? 0) + (overview?.total_output_tokens ?? 0)), icon: Zap, color: "text-amber-600" },
+    { label: isZh ? "总 Token" : "Total Tokens", value: totalTokensValue, title: totalTokensTitle, icon: Zap, color: "text-amber-600" },
     { label: isZh ? "平均延迟" : "Avg Latency", value: fmtLatency(overview?.avg_duration_ms ?? 0), icon: Clock, color: "text-green-600" },
     { label: isZh ? "错误率" : "Error Rate", value: `${errorRate}%`, icon: AlertTriangle, color: "text-red-500" },
     { label: isZh ? "提供商" : "Providers", value: String(providers.length), icon: Server, color: "text-purple-600" },
@@ -99,7 +112,11 @@ export default function DashboardPage() {
 
       <div className="grid grid-cols-2 gap-3 lg:grid-cols-3 xl:grid-cols-6">
         {cards.map((c) => (
-          <div key={c.label} className="glass rounded-2xl p-4 transition-all hover:-translate-y-0.5 hover:shadow-lg">
+          <div
+            key={c.label}
+            title={(c as { title?: string }).title}
+            className="glass rounded-2xl p-4 transition-all hover:-translate-y-0.5 hover:shadow-lg"
+          >
             <div className="flex items-center gap-2">
               <c.icon className={`h-4 w-4 ${c.color}`} />
               <p className="text-xs font-medium text-slate-500">{c.label}</p>

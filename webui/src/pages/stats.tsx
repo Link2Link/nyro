@@ -108,8 +108,6 @@ export default function StatsPage() {
       <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
         {[
           { label: isZh ? "总请求数" : "Total Requests", value: fmt(overview?.total_requests ?? 0), icon: Activity, color: "text-blue-600" },
-          { label: isZh ? "输入 Token" : "Input Tokens", value: fmt(overview?.total_input_tokens ?? 0), icon: Zap, color: "text-amber-600" },
-          { label: isZh ? "输出 Token" : "Output Tokens", value: fmt(overview?.total_output_tokens ?? 0), icon: Zap, color: "text-green-600" },
           { label: isZh ? "平均延迟" : "Avg Latency", value: `${(overview?.avg_duration_ms ?? 0).toFixed(0)}ms`, icon: Clock, color: "text-purple-600" },
         ].map((c) => (
           <div key={c.label} className="glass rounded-2xl p-4">
@@ -122,6 +120,56 @@ export default function StatsPage() {
             </p>
           </div>
         ))}
+        {(() => {
+          // 输入 Token 卡片单独渲染,带缓存命中率标注。
+          // 命中率 = cache_read / input (input 已含 cache, GROSS 语义)。
+          const inputTokens = overview?.total_input_tokens ?? 0;
+          const cacheRead = overview?.total_cache_read_tokens ?? 0;
+          const cacheRate = inputTokens > 0
+            ? Math.round((cacheRead / inputTokens) * 100)
+            : 0;
+          return (
+            <div className="glass rounded-2xl p-4">
+              <div className="flex items-center gap-2">
+                <Zap className="h-4 w-4 text-amber-600" />
+                <p className="text-xs font-medium text-slate-500">
+                  {isZh ? "输入 Token" : "Input Tokens"}
+                </p>
+              </div>
+              <div className="mt-1.5 flex items-baseline gap-1.5">
+                <p className="text-[24px] leading-none font-semibold text-slate-900">
+                  {fmt(inputTokens)}
+                </p>
+                {cacheRead > 0 && (
+                  <span
+                    className="text-[11px] font-medium text-amber-600"
+                    title={isZh
+                      ? `缓存命中 ${fmt(cacheRead)} token,占输入 ${cacheRate}%`
+                      : `${fmt(cacheRead)} tokens from cache (${cacheRate}% of input)`}
+                  >
+                    ({cacheRate}%)
+                  </span>
+                )}
+              </div>
+            </div>
+          );
+        })()}
+        {(() => {
+          const outputTokens = overview?.total_output_tokens ?? 0;
+          return (
+            <div className="glass rounded-2xl p-4">
+              <div className="flex items-center gap-2">
+                <Zap className="h-4 w-4 text-green-600" />
+                <p className="text-xs font-medium text-slate-500">
+                  {isZh ? "输出 Token" : "Output Tokens"}
+                </p>
+              </div>
+              <p className="mt-1.5 text-[24px] leading-none font-semibold text-slate-900">
+                {fmt(outputTokens)}
+              </p>
+            </div>
+          );
+        })()}
       </div>
 
       <div className="grid grid-cols-1 gap-3 xl:grid-cols-2">

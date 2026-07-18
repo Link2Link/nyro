@@ -181,8 +181,14 @@ export function LogDetailDialog({ logId, summary, open, onOpenChange }: LogDetai
           {log ? (
             <span className="inline-flex items-center gap-2">
               <span className="inline-flex items-center gap-1 text-sky-600">
-                <span className="text-[10px] font-semibold tracking-wide">IN</span>
-                <span title={String(log.input_tokens)}>{formatTokenCount(log.input_tokens)}</span>
+                <span className="text-[10px] font-semibold tracking-wide">NEW</span>
+                <span
+                  title={`net input (input_tokens ${log.input_tokens} − cache_read_tokens ${log.cache_read_tokens ?? 0})`}
+                >
+                  {formatTokenCount(
+                    Math.max(log.input_tokens - (log.cache_read_tokens ?? 0), 0),
+                  )}
+                </span>
               </span>
               <span className="inline-flex items-center gap-1 text-emerald-600">
                 <span className="text-[10px] font-semibold tracking-wide">OUT</span>

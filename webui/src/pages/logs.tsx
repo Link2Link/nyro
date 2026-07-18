@@ -392,9 +392,13 @@ export default function LogsPage() {
                       <td className="px-3 py-2">
                         <div className="flex flex-col items-start leading-tight text-[11px] tabular-nums">
                           <span className="inline-flex items-center gap-1 text-sky-600">
-                            <span className="font-semibold tracking-wide">IN</span>
-                            <span title={String(log.input_tokens)}>
-                              {formatTokenCount(log.input_tokens)}
+                            <span className="font-semibold tracking-wide">NEW</span>
+                            <span
+                              title={`net input (input_tokens ${log.input_tokens} − cache_read_tokens ${log.cache_read_tokens ?? 0})`}
+                            >
+                              {formatTokenCount(
+                                Math.max(log.input_tokens - (log.cache_read_tokens ?? 0), 0),
+                              )}
                             </span>
                           </span>
                           <span className="inline-flex items-center gap-1 text-amber-600">

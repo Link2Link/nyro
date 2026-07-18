@@ -397,6 +397,7 @@ pub struct StatsOverview {
     pub total_requests: i64,
     pub total_input_tokens: i64,
     pub total_output_tokens: i64,
+    pub total_cache_read_tokens: i64,
     pub avg_duration_ms: f64,
     pub error_count: i64,
 }

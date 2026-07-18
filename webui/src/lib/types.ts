@@ -122,6 +122,7 @@ export interface StatsOverview {
   total_requests: number;
   total_input_tokens: number;
   total_output_tokens: number;
+  total_cache_read_tokens: number;
   avg_duration_ms: number;
   error_count: number;
 }
