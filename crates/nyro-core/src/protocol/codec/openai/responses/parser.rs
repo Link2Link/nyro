@@ -76,17 +76,34 @@ impl ResponseDecoder for ResponsesResponseParser {
             }
         }
 
+        // Cache stats live under `usage.input_tokens_details` in the Responses
+        // API (both `cached_tokens` and `cache_write_tokens`). Surface them
+        // on the IR Usage so downstream cost / cache-hit analytics see them
+        // instead of treating the whole prompt as full-price input. Mirrors
+        // the extraction done for the OpenAI-compatible chat codec.
+        let usage_obj = resp.get("usage");
+        let input_details = usage_obj.and_then(|v| v.get("input_tokens_details"));
+        let cache_read = input_details
+            .and_then(|d| d.get("cached_tokens"))
+            .and_then(Value::as_u64)
+            .filter(|&v| v > 0)
+            .map(|v| v as u32);
+        let cache_creation = input_details
+            .and_then(|d| d.get("cache_write_tokens"))
+            .and_then(Value::as_u64)
+            .filter(|&v| v > 0)
+            .map(|v| v as u32);
         let usage = Usage {
-            prompt_tokens: resp
-                .get("usage")
+            prompt_tokens: usage_obj
                 .and_then(|v| v.get("input_tokens"))
-                .and_then(|v| v.as_u64())
+                .and_then(Value::as_u64)
                 .unwrap_or(0) as u32,
-            completion_tokens: resp
-                .get("usage")
+            completion_tokens: usage_obj
                 .and_then(|v| v.get("output_tokens"))
-                .and_then(|v| v.as_u64())
+                .and_then(Value::as_u64)
                 .unwrap_or(0) as u32,
+            cache_read_tokens: cache_read,
+            cache_creation_tokens: cache_creation,
             ..Usage::default()
         };
 
@@ -272,17 +289,31 @@ impl ResponsesStreamParser {
             }
             "response.completed" => {
                 let response = payload.get("response").unwrap_or(payload);
+                // See note above: surface cache stats from
+                // `usage.input_tokens_details` on the IR Usage.
+                let usage_obj = response.get("usage");
+                let input_details = usage_obj.and_then(|v| v.get("input_tokens_details"));
+                let cache_read = input_details
+                    .and_then(|d| d.get("cached_tokens"))
+                    .and_then(Value::as_u64)
+                    .filter(|&v| v > 0)
+                    .map(|v| v as u32);
+                let cache_creation = input_details
+                    .and_then(|d| d.get("cache_write_tokens"))
+                    .and_then(Value::as_u64)
+                    .filter(|&v| v > 0)
+                    .map(|v| v as u32);
                 let usage = Usage {
-                    prompt_tokens: response
-                        .get("usage")
+                    prompt_tokens: usage_obj
                         .and_then(|v| v.get("input_tokens"))
-                        .and_then(|v| v.as_u64())
+                        .and_then(Value::as_u64)
                         .unwrap_or(0) as u32,
-                    completion_tokens: response
-                        .get("usage")
+                    completion_tokens: usage_obj
                         .and_then(|v| v.get("output_tokens"))
-                        .and_then(|v| v.as_u64())
+                        .and_then(Value::as_u64)
                         .unwrap_or(0) as u32,
+                    cache_read_tokens: cache_read,
+                    cache_creation_tokens: cache_creation,
                     ..Usage::default()
                 };
                 if usage.prompt_tokens > 0 || usage.completion_tokens > 0 {
@@ -338,6 +369,74 @@ mod tests {
         assert_eq!(r.content, "hello");
         assert_eq!(r.stop_reason.as_deref(), Some("completed"));
         assert_eq!(r.usage.prompt_tokens, 5);
+    }
+
+    #[test]
+    fn test_parse_response_extracts_cache_token_details() {
+        // Regression: Responses-API usage reports cache stats under
+        // `input_tokens_details`. Non-stream parser must surface them on
+        // the IR Usage so cache-hit analytics see them.
+        let resp = serde_json::json!({
+            "id": "resp_cache",
+            "model": "gpt-5.6-terra",
+            "status": "completed",
+            "output": [
+                {
+                    "type": "message",
+                    "id": "msg_1",
+                    "status": "completed",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "hi"}]
+                }
+            ],
+            "usage": {
+                "input_tokens": 60840,
+                "input_tokens_details": {
+                    "cached_tokens": 59136,
+                    "cache_write_tokens": 0
+                },
+                "output_tokens": 692,
+                "total_tokens": 61532
+            }
+        });
+        let r = ResponsesResponseParser.parse_response(resp).unwrap();
+        assert_eq!(r.usage.prompt_tokens, 60840);
+        assert_eq!(r.usage.completion_tokens, 692);
+        assert_eq!(r.usage.cache_read_tokens, Some(59136));
+        // cache_write_tokens == 0 must NOT become Some(0); stay None so the
+        // column isn't polluted with meaningless zeros.
+        assert_eq!(r.usage.cache_creation_tokens, None);
+    }
+
+    #[test]
+    fn test_parse_response_extracts_cache_write_tokens() {
+        // First-turn write side: cache_write_tokens > 0, cached_tokens 0.
+        let resp = serde_json::json!({
+            "id": "resp_write",
+            "model": "gpt-5.6-terra",
+            "status": "completed",
+            "output": [
+                {
+                    "type": "message",
+                    "id": "msg_1",
+                    "status": "completed",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "hi"}]
+                }
+            ],
+            "usage": {
+                "input_tokens": 5000,
+                "input_tokens_details": {
+                    "cached_tokens": 0,
+                    "cache_write_tokens": 4800
+                },
+                "output_tokens": 100
+            }
+        });
+        let r = ResponsesResponseParser.parse_response(resp).unwrap();
+        assert_eq!(r.usage.cache_creation_tokens, Some(4800));
+        // cached_tokens == 0 stays None for the same reason as above.
+        assert_eq!(r.usage.cache_read_tokens, None);
     }
 
     #[test]
@@ -521,6 +620,14 @@ mod tests {
 
         assert_eq!(usage.map(|usage| usage.prompt_tokens), Some(13582));
         assert_eq!(usage.map(|usage| usage.completion_tokens), Some(19));
+        // Regression guard: input_tokens_details.cached_tokens must surface as
+        // cache_read_tokens. A missing or zero cache_write_tokens must NOT
+        // produce Some(0) (which would skew analytics) — it must stay None.
+        assert_eq!(
+            usage.and_then(|usage| usage.cache_read_tokens),
+            Some(13056)
+        );
+        assert_eq!(usage.and_then(|usage| usage.cache_creation_tokens), None);
         assert!(
             deltas
                 .iter()
