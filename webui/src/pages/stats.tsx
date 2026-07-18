@@ -1,6 +1,6 @@
 import { useQuery } from "@tanstack/react-query";
 import { useState } from "react";
-import { Bar, BarChart, CartesianGrid, ResponsiveContainer, Tooltip, XAxis, YAxis, PieChart, Pie, Cell } from "recharts";
+import { Line, LineChart, CartesianGrid, ResponsiveContainer, Tooltip, XAxis, YAxis, PieChart, Pie, Cell } from "recharts";
 import { backend } from "@/lib/backend";
 import type { StatsOverview, StatsHourly, ModelStats, ProviderStats, ApiKeyStats } from "@/lib/types";
 import { Zap, Clock, Activity } from "lucide-react";
@@ -130,15 +130,15 @@ export default function StatsPage() {
           <div className="h-48">
             {tokenChart.length > 0 ? (
               <ResponsiveContainer width="100%" height="100%">
-                <BarChart data={tokenChart}>
+                <LineChart data={tokenChart}>
                   <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#e2e8f0" />
                   <XAxis dataKey="hour" tick={{ fill: "#64748b", fontSize: 11 }} axisLine={false} tickLine={false} />
                   <YAxis tick={{ fill: "#64748b", fontSize: 11 }} axisLine={false} tickLine={false} width={50} tickFormatter={fmt} />
                   <Tooltip formatter={chartTooltipFormatter} />
-                  <Bar dataKey="input" name={isZh ? "输入" : "Input"} stackId="a" fill="#3b82f6" />
-                  <Bar dataKey="cache" name={isZh ? "缓存命中" : "Cache"} stackId="a" fill="#f59e0b" />
-                  <Bar dataKey="output" name={isZh ? "输出" : "Output"} stackId="a" fill="#10b981" radius={[4, 4, 0, 0]} />
-                </BarChart>
+                  <Line type="monotone" dataKey="input" name={isZh ? "输入" : "Input"} stroke="#3b82f6" strokeWidth={2} dot={false} />
+                  <Line type="monotone" dataKey="cache" name={isZh ? "缓存命中" : "Cache"} stroke="#f59e0b" strokeWidth={2} dot={false} />
+                  <Line type="monotone" dataKey="output" name={isZh ? "输出" : "Output"} stroke="#10b981" strokeWidth={2} dot={false} />
+                </LineChart>
               </ResponsiveContainer>
             ) : (
               <div className="flex h-full items-center justify-center text-sm text-slate-400">{isZh ? "暂无数据" : "No data"}</div>
@@ -248,8 +248,8 @@ export default function StatsPage() {
                 <th className="px-4 py-2.5 text-right font-medium">{isZh ? "请求数" : "Requests"}</th>
                 <th className="px-4 py-2.5 text-right font-medium">{isZh ? "失败数" : "Failures"}</th>
                 <th className="px-4 py-2.5 text-right font-medium">{isZh ? "输入 Token" : "Input Tokens"}</th>
-                <th className="px-4 py-2.5 text-right font-medium">{isZh ? "输出 Token" : "Output Tokens"}</th>
                 <th className="px-4 py-2.5 text-right font-medium">{isZh ? "缓存命中" : "Cache Hits"}</th>
+                <th className="px-4 py-2.5 text-right font-medium">{isZh ? "输出 Token" : "Output Tokens"}</th>
                 <th className="px-4 py-2.5 text-right font-medium">{isZh ? "最后调用" : "Last Used"}</th>
               </tr>
             </thead>
@@ -258,19 +258,22 @@ export default function StatsPage() {
                 <tr><td className="px-4 py-6 text-center text-slate-400" colSpan={7}>{isZh ? "暂无数据" : "No data"}</td></tr>
               )}
               {apiKeyStats.slice(0, 8).map((k) => {
-                const cacheTotal = k.total_input_tokens + k.cache_read_tokens;
-                const cacheRate = cacheTotal > 0 ? Math.round((k.cache_read_tokens / cacheTotal) * 100) : 0;
+                // input_tokens 已包含 cache_read_tokens (GROSS 语义),
+                // 所以命中率 = cache_read / input,不应再相加成总池子。
+                const cacheRate = k.total_input_tokens > 0
+                  ? Math.round((k.cache_read_tokens / k.total_input_tokens) * 100)
+                  : 0;
                 return (
                   <tr key={k.api_key_id} className="border-t border-white/70 text-slate-700">
                     <td className="px-4 py-2.5 font-medium">{k.api_key_name || k.api_key_id}</td>
                     <td className="px-4 py-2.5 text-right">{fmt(k.request_count)}</td>
                     <td className="px-4 py-2.5 text-right text-red-500">{fmt(k.error_count)}</td>
                     <td className="px-4 py-2.5 text-right">{fmt(k.total_input_tokens)}</td>
-                    <td className="px-4 py-2.5 text-right">{fmt(k.total_output_tokens)}</td>
                     <td className="px-4 py-2.5 text-right">
                       <span>{fmt(k.cache_read_tokens)}</span>
                       {cacheRate > 0 && <span className="ml-1 text-[11px] text-slate-400">{cacheRate}%</span>}
                     </td>
+                    <td className="px-4 py-2.5 text-right">{fmt(k.total_output_tokens)}</td>
                     <td className="px-4 py-2.5 text-right text-xs text-slate-500 whitespace-nowrap">{formatLogTime(k.last_used_at)}</td>
                   </tr>
                 );
@@ -288,8 +291,8 @@ export default function StatsPage() {
               <tr>
                 <th className="px-4 py-2.5 text-left font-medium">{isZh ? "模型" : "Model"}</th>
                 <th className="px-4 py-2.5 text-right font-medium">{isZh ? "输入 Token" : "Input Tokens"}</th>
-                <th className="px-4 py-2.5 text-right font-medium">{isZh ? "输出 Token" : "Output Tokens"}</th>
                 <th className="px-4 py-2.5 text-right font-medium">{isZh ? "缓存命中" : "Cache Hits"}</th>
+                <th className="px-4 py-2.5 text-right font-medium">{isZh ? "输出 Token" : "Output Tokens"}</th>
                 <th className="px-4 py-2.5 text-right font-medium">{isZh ? "缓存命中率" : "Cache Rate"}</th>
                 <th className="px-4 py-2.5 text-right font-medium">{isZh ? "平均延迟" : "Avg Latency"}</th>
                 <th className="px-4 py-2.5 text-right font-medium">TPS</th>
@@ -300,8 +303,10 @@ export default function StatsPage() {
                 <tr><td className="px-4 py-6 text-center text-slate-400" colSpan={7}>{isZh ? "暂无数据" : "No data"}</td></tr>
               )}
               {modelStats.slice(0, 10).map((m) => {
-                const cacheTotal = m.total_input_tokens + m.total_cache_read_tokens;
-                const cacheRate = cacheTotal > 0 ? Math.round((m.total_cache_read_tokens / cacheTotal) * 100) : 0;
+                // 同上:input_tokens 已含 cache_read_tokens,直接相除。
+                const cacheRate = m.total_input_tokens > 0
+                  ? Math.round((m.total_cache_read_tokens / m.total_input_tokens) * 100)
+                  : 0;
                 const tps = m.total_upstream_ms > 0 && m.total_output_tokens > 0
                   ? m.total_output_tokens / (m.total_upstream_ms / 1000)
                   : null;
@@ -309,8 +314,8 @@ export default function StatsPage() {
                   <tr key={m.model} className="border-t border-white/70 text-slate-700">
                     <td className="px-4 py-2.5 font-medium">{m.model || "–"}</td>
                     <td className="px-4 py-2.5 text-right">{fmt(m.total_input_tokens)}</td>
-                    <td className="px-4 py-2.5 text-right">{fmt(m.total_output_tokens)}</td>
                     <td className="px-4 py-2.5 text-right">{fmt(m.total_cache_read_tokens)}</td>
+                    <td className="px-4 py-2.5 text-right">{fmt(m.total_output_tokens)}</td>
                     <td className="px-4 py-2.5 text-right">{cacheRate}%</td>
                     <td className="px-4 py-2.5 text-right">{fmtLatency(m.avg_duration_ms)}</td>
                     <td className="px-4 py-2.5 text-right">{formatTps(tps)}</td>
