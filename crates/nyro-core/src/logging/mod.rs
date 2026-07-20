@@ -144,7 +144,10 @@ async fn flush(storage: DynStorage, buffer: &mut Vec<LogEntry>) {
     let global_enabled = read_enable_payload(&storage).await;
     for entry in entries.iter_mut() {
         // AND 语义：全局 OFF 则一切不记录，全局 ON 时按模型开关
-        let should_record = global_enabled && entry.enable_payload.unwrap_or(true);
+        // 例外：客户端返回 4xx（请求出错）时，无论开关是否开启都保留载荷，便于排查问题
+        let is_client_error = (400..=499).contains(&entry.client_status_code);
+        let should_record =
+            is_client_error || (global_enabled && entry.enable_payload.unwrap_or(true));
         if !should_record {
             entry.client_request_headers = None;
             entry.client_request_body = None;
