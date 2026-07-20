@@ -327,7 +327,7 @@ use axum::response::Response;
 /// Axum middleware that creates a `RequestContext` and stores it as an
 /// `Extension`.  Mount this as the outermost layer on the proxy router.
 ///
-/// The timeout used is 300 s (matching the existing reqwest client timeout).
+/// The timeout used is 600 s (matching the existing reqwest client timeout).
 /// P2 can thread per-route timeouts through here once `RequestContext` carries
 /// a configurable timeout.
 pub async fn inject_context(mut request: Request, next: Next) -> Response {
@@ -337,7 +337,7 @@ pub async fn inject_context(mut request: Request, next: Next) -> Response {
     use crate::protocol::ids::OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1;
     let ctx = RequestContext::new(
         OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1,
-        Duration::from_secs(300),
+        Duration::from_secs(600),
     );
     request.extensions_mut().insert(ctx);
     next.run(request).await

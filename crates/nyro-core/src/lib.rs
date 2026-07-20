@@ -170,7 +170,7 @@ impl Gateway {
         mysql_pool: Option<Pool<MySql>>,
     ) -> anyhow::Result<(Self, mpsc::Receiver<LogEntry>)> {
         let http_client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(300))
+            .timeout(std::time::Duration::from_secs(600))
             .build()?;
 
         let model_cache = Arc::new(tokio::sync::RwLock::new(
@@ -344,7 +344,7 @@ impl Gateway {
             return Ok(cached.client);
         }
 
-        let mut builder = reqwest::Client::builder().timeout(std::time::Duration::from_secs(300));
+        let mut builder = reqwest::Client::builder().timeout(std::time::Duration::from_secs(600));
         if force_http1 {
             builder = builder.http1_only();
         }
