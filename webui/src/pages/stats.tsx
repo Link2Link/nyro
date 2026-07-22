@@ -70,8 +70,10 @@ export default function StatsPage() {
     refetchInterval: 30_000,
   });
 
+  // 跨度超过 24 小时时,仅显示小时会出现重复,改为附带日期的标签。
+  const showDateOnAxis = hours > 24;
   const tokenChart = hourly.map((h) => ({
-    hour: formatLocalHourLabel(h.hour),
+    hour: formatLocalHourLabel(h.hour, showDateOnAxis),
     input: h.total_input_tokens,
     output: h.total_output_tokens,
     cache: h.total_cache_read_tokens,

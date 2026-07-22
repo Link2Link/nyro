@@ -1,6 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useMemo, useState } from "react";
-import { Calendar, ChevronLeft, ChevronRight, ScrollText, Trash2, X } from "lucide-react";
+import { useMemo, useState, type KeyboardEvent } from "react";
+import { Calendar, ChevronLeft, ChevronRight, ChevronsLeft, ScrollText, Trash2, X } from "lucide-react";
 
 import { backend } from "@/lib/backend";
 import type { ApiKey, LogPage, LogQuery, ModelStats, Provider, RequestLog } from "@/lib/types";
@@ -10,6 +10,7 @@ import { prettyName } from "@/lib/protocol";
 import { cn } from "@/lib/utils";
 import { useLocale } from "@/lib/i18n";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
 import { Badge } from "@/components/ui/badge";
 import {
   Select,
@@ -31,6 +32,7 @@ export default function LogsPage() {
   const qc = useQueryClient();
 
   const [page, setPage] = useState(0);
+  const [jumpPage, setJumpPage] = useState("");
   const [filter, setFilter] = useState<LogQuery>({ limit: PAGE_SIZE, offset: 0 });
   const [selected, setSelected] = useState<RequestLog | null>(null);
   const [confirmOpen, setConfirmOpen] = useState(false);
@@ -67,6 +69,14 @@ export default function LogsPage() {
   const items = data?.items ?? [];
   const total = data?.total ?? 0;
   const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE));
+
+  const handleJumpToPage = (e: KeyboardEvent<HTMLInputElement>) => {
+    if (e.key !== "Enter") return;
+    const num = parseInt(jumpPage, 10);
+    if (Number.isNaN(num)) return;
+    setPage(Math.min(Math.max(0, num - 1), totalPages - 1));
+    setJumpPage("");
+  };
 
   const providerOptions = useMemo(
     () => [
@@ -447,16 +457,41 @@ export default function LogsPage() {
             </table>
           </div>
 
-          <div className="flex items-center justify-between border-t border-slate-200/80 px-4 py-3">
-            <span className="text-xs text-slate-500">
-              {isZh ? `第 ${page + 1} / ${totalPages} 页` : `Page ${page + 1} of ${totalPages}`}
-            </span>
+          <div className="flex flex-wrap items-center justify-between gap-2 border-t border-slate-200/80 px-4 py-3">
+            <div className="flex items-center gap-3">
+              <span className="text-xs text-slate-500">
+                {isZh ? `第 ${page + 1} / ${totalPages} 页` : `Page ${page + 1} of ${totalPages}`}
+              </span>
+              <div className="flex items-center gap-1.5">
+                <span className="text-xs text-slate-500">{isZh ? "跳至" : "Go to"}</span>
+                <Input
+                  value={jumpPage}
+                  onChange={(e) => setJumpPage(e.target.value.replace(/[^0-9]/g, ""))}
+                  onKeyDown={handleJumpToPage}
+                  inputMode="numeric"
+                  placeholder={isZh ? "页" : "page"}
+                  aria-label={isZh ? "跳转到页码" : "Jump to page"}
+                  className="h-8 w-14 px-2 text-xs"
+                />
+                {isZh && <span className="text-xs text-slate-500">页</span>}
+              </div>
+            </div>
             <div className="flex gap-1">
+              <Button
+                onClick={() => setPage(0)}
+                disabled={page === 0}
+                variant="outline"
+                size="icon"
+                title={isZh ? "第一页" : "First page"}
+              >
+                <ChevronsLeft className="h-4 w-4" />
+              </Button>
               <Button
                 onClick={() => setPage(Math.max(0, page - 1))}
                 disabled={page === 0}
                 variant="outline"
                 size="icon"
+                title={isZh ? "上一页" : "Previous"}
               >
                 <ChevronLeft className="h-4 w-4" />
               </Button>
@@ -465,6 +500,7 @@ export default function LogsPage() {
                 disabled={page >= totalPages - 1}
                 variant="outline"
                 size="icon"
+                title={isZh ? "下一页" : "Next"}
               >
                 <ChevronRight className="h-4 w-4" />
               </Button>

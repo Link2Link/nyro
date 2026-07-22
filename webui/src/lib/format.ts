@@ -46,12 +46,18 @@ export function formatLocalDateTime(ts: number | string | null | undefined): str
     + `${pad2(date.getHours())}:${pad2(date.getMinutes())}:${pad2(date.getSeconds())}`;
 }
 
-/** 仅小时标签 "HH:00"(本地时区),用于按小时聚合的图表 X 轴。后端按 UTC 整点分桶,
- *  这里把 UTC 桶标签转成本地小时显示。 */
-export function formatLocalHourLabel(ts: string | null | undefined): string {
+/** 按小时聚合的图表 X 轴标签(本地时区)。后端按 UTC 整点分桶,
+ *  这里把 UTC 桶标签转成本地小时显示。
+ *  withDate=true 时附带日期 "MM/DD HH:00",用于跨度超过 24 小时、
+ *  仅显示小时会出现重复的场景。 */
+export function formatLocalHourLabel(ts: string | null | undefined, withDate = false): string {
   const date = parseBackendTime(ts);
   if (!date) return "";
-  return `${pad2(date.getHours())}:00`;
+  const hh = pad2(date.getHours());
+  if (!withDate) return `${hh}:00`;
+  const mm = pad2(date.getMonth() + 1);
+  const dd = pad2(date.getDate());
+  return `${mm}/${dd} ${hh}:00`;
 }
 
 /** 日期戳 YYYYMMDD(本地时区),用于导出文件名等。 */
