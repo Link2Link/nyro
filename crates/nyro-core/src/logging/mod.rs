@@ -139,15 +139,25 @@ async fn read_enable_payload(storage: &DynStorage) -> bool {
         .unwrap_or(DEFAULT_RECORD_PAYLOADS)
 }
 
+fn should_record_payload(
+    global_enabled: bool,
+    model_enabled: Option<bool>,
+    upstream_status_code: Option<i32>,
+) -> bool {
+    let is_upstream_4xx = matches!(upstream_status_code, Some(400..=499));
+    is_upstream_4xx || (global_enabled && model_enabled.unwrap_or(true))
+}
+
 async fn flush(storage: DynStorage, buffer: &mut Vec<LogEntry>) {
     let mut entries = std::mem::take(buffer);
     let global_enabled = read_enable_payload(&storage).await;
     for entry in entries.iter_mut() {
-        // AND 语义：全局 OFF 则一切不记录，全局 ON 时按模型开关
-        // 例外：客户端返回 4xx（请求出错）时，无论开关是否开启都保留载荷，便于排查问题
-        let is_client_error = (400..=499).contains(&entry.client_status_code);
-        let should_record =
-            is_client_error || (global_enabled && entry.enable_payload.unwrap_or(true));
+        // 全局与模型开关默认采用 AND 语义；上游 4xx 始终保留载荷，便于排查问题。
+        let should_record = should_record_payload(
+            global_enabled,
+            entry.enable_payload,
+            entry.upstream_status_code,
+        );
         if !should_record {
             entry.client_request_headers = None;
             entry.client_request_body = None;
@@ -162,4 +172,32 @@ async fn flush(storage: DynStorage, buffer: &mut Vec<LogEntry>) {
         entry.enable_payload = None;
     }
     let _ = storage.logs().append_batch(entries).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_record_payload;
+
+    #[test]
+    fn preserves_payload_for_upstream_4xx_when_disabled() {
+        for status in [400, 401, 429, 499] {
+            assert!(should_record_payload(false, None, Some(status)));
+            assert!(should_record_payload(false, Some(false), Some(status)));
+            assert!(should_record_payload(true, Some(false), Some(status)));
+        }
+    }
+
+    #[test]
+    fn clears_payload_for_non_4xx_when_disabled() {
+        for status in [Some(200), Some(302), Some(500), None] {
+            assert!(!should_record_payload(false, Some(false), status));
+        }
+    }
+
+    #[test]
+    fn retains_existing_enabled_behavior_for_non_4xx() {
+        assert!(should_record_payload(true, None, Some(500)));
+        assert!(should_record_payload(true, Some(true), Some(200)));
+        assert!(!should_record_payload(true, Some(false), Some(500)));
+    }
 }
