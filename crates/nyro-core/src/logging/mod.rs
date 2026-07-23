@@ -142,20 +142,24 @@ async fn read_enable_payload(storage: &DynStorage) -> bool {
 fn should_record_payload(
     global_enabled: bool,
     model_enabled: Option<bool>,
+    client_status_code: i32,
     upstream_status_code: Option<i32>,
 ) -> bool {
-    let is_upstream_4xx = matches!(upstream_status_code, Some(400..=499));
-    is_upstream_4xx || (global_enabled && model_enabled.unwrap_or(true))
+    let is_http_error = |status| (400..=599).contains(&status);
+    is_http_error(client_status_code)
+        || upstream_status_code.is_some_and(is_http_error)
+        || (global_enabled && model_enabled.unwrap_or(true))
 }
 
 async fn flush(storage: DynStorage, buffer: &mut Vec<LogEntry>) {
     let mut entries = std::mem::take(buffer);
     let global_enabled = read_enable_payload(&storage).await;
     for entry in entries.iter_mut() {
-        // 全局与模型开关默认采用 AND 语义；上游 4xx 始终保留载荷，便于排查问题。
+        // 全局与模型开关默认采用 AND 语义；HTTP 4xx/5xx 始终保留载荷，便于排查问题。
         let should_record = should_record_payload(
             global_enabled,
             entry.enable_payload,
+            entry.client_status_code,
             entry.upstream_status_code,
         );
         if !should_record {
@@ -179,25 +183,52 @@ mod tests {
     use super::should_record_payload;
 
     #[test]
-    fn preserves_payload_for_upstream_4xx_when_disabled() {
-        for status in [400, 401, 429, 499] {
-            assert!(should_record_payload(false, None, Some(status)));
-            assert!(should_record_payload(false, Some(false), Some(status)));
-            assert!(should_record_payload(true, Some(false), Some(status)));
+    fn preserves_payload_for_http_errors_when_disabled() {
+        for (client_status, upstream_status) in
+            [(400, None), (500, None), (200, Some(429)), (200, Some(503))]
+        {
+            assert!(should_record_payload(
+                false,
+                Some(false),
+                client_status,
+                upstream_status
+            ));
         }
     }
 
     #[test]
-    fn clears_payload_for_non_4xx_when_disabled() {
-        for status in [Some(200), Some(302), Some(500), None] {
-            assert!(!should_record_payload(false, Some(false), status));
+    fn clears_payload_for_success_when_disabled() {
+        for (client_status, upstream_status) in [(200, Some(200)), (201, Some(201)), (204, None)] {
+            assert!(!should_record_payload(
+                false,
+                Some(false),
+                client_status,
+                upstream_status
+            ));
         }
     }
 
     #[test]
-    fn retains_existing_enabled_behavior_for_non_4xx() {
-        assert!(should_record_payload(true, None, Some(500)));
-        assert!(should_record_payload(true, Some(true), Some(200)));
-        assert!(!should_record_payload(true, Some(false), Some(500)));
+    fn treats_only_http_4xx_and_5xx_as_errors() {
+        for status in [399, 600] {
+            assert!(!should_record_payload(false, Some(false), status, None));
+            assert!(!should_record_payload(
+                false,
+                Some(false),
+                200,
+                Some(status)
+            ));
+        }
+        for status in [400, 499, 500, 599] {
+            assert!(should_record_payload(false, Some(false), status, None));
+            assert!(should_record_payload(false, Some(false), 200, Some(status)));
+        }
+    }
+
+    #[test]
+    fn retains_existing_enabled_behavior_for_success() {
+        assert!(should_record_payload(true, None, 200, Some(200)));
+        assert!(should_record_payload(true, Some(true), 200, Some(200)));
+        assert!(!should_record_payload(true, Some(false), 200, Some(200)));
     }
 }

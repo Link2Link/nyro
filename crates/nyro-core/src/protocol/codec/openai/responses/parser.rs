@@ -623,10 +623,7 @@ mod tests {
         // Regression guard: input_tokens_details.cached_tokens must surface as
         // cache_read_tokens. A missing or zero cache_write_tokens must NOT
         // produce Some(0) (which would skew analytics) — it must stay None.
-        assert_eq!(
-            usage.and_then(|usage| usage.cache_read_tokens),
-            Some(13056)
-        );
+        assert_eq!(usage.and_then(|usage| usage.cache_read_tokens), Some(13056));
         assert_eq!(usage.and_then(|usage| usage.cache_creation_tokens), None);
         assert!(
             deltas
