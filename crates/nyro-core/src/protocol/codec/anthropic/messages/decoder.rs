@@ -9,12 +9,13 @@ use anyhow::Result;
 use serde_json::Value;
 
 use crate::protocol::RequestDecoder;
+use crate::protocol::codec::reasoning::parse_reasoning_effort;
 use crate::protocol::ids::ANTHROPIC_MESSAGES_2023_06_01;
 use crate::protocol::ir::DocumentSource as IrDocumentSource;
 use crate::protocol::ir::{
     AiRequest, AnthropicExt, CacheTtl, ContentBlock, GenerationConfig, MediaSource, Message,
-    MessageContent, ProtocolExt, ReasoningConfig, Role, StreamConfig, ToolCall, ToolChoice,
-    ToolSpec,
+    MessageContent, ProtocolExt, ReasoningConfig, ReasoningEffort, Role, StreamConfig, ToolCall,
+    ToolChoice, ToolSpec,
 };
 
 use super::types::{
@@ -159,21 +160,41 @@ impl RequestDecoder for AnthropicDecoder {
         let tool_choice = req.tool_choice.map(parse_tool_choice);
 
         // ── Reasoning config ──────────────────────────────────────────────────
-        let reasoning = if let Some(ref thinking) = req.thinking {
-            let enabled = thinking.kind == "enabled";
-            ReasoningConfig {
-                enabled,
-                budget_tokens: thinking.budget_tokens,
-                ..Default::default()
-            }
+        let effort = req
+            .output_config
+            .as_ref()
+            .and_then(|config| config.get("effort"))
+            .and_then(Value::as_str)
+            .and_then(parse_reasoning_effort);
+        let thinking_enabled = req
+            .thinking
+            .as_ref()
+            .is_some_and(|thinking| matches!(thinking.kind.as_str(), "enabled" | "adaptive"));
+        let effort = if effort.is_none()
+            && req
+                .thinking
+                .as_ref()
+                .is_some_and(|thinking| thinking.kind == "disabled")
+        {
+            Some(ReasoningEffort::None)
         } else {
-            ReasoningConfig::default()
+            effort
+        };
+        let reasoning = ReasoningConfig {
+            enabled: thinking_enabled || effort.is_some(),
+            budget_tokens: req
+                .thinking
+                .as_ref()
+                .and_then(|thinking| thinking.budget_tokens),
+            effort,
+            ..Default::default()
         };
 
         // ── AnthropicExt ──────────────────────────────────────────────────────
         let ant_ext = AnthropicExt {
             top_k: req.top_k,
             container: req.container.as_ref().map(|c| Value::String(c.clone())),
+            output_config: req.output_config.clone(),
             service_tier: req.service_tier.clone(),
             server_tools: if server_tools.is_empty() {
                 None
@@ -199,6 +220,9 @@ impl RequestDecoder for AnthropicDecoder {
             && let Ok(v) = serde_json::to_value(thinking)
         {
             ingress.insert("__anthropic_thinking".into(), v);
+        }
+        if let Some(ref output_config) = req.output_config {
+            ingress.insert("__anthropic_output_config".into(), output_config.clone());
         }
         if let Some(ref cm) = req.context_management {
             ingress.insert("__anthropic_context_management".into(), cm.clone());

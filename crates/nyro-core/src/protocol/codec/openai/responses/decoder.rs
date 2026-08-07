@@ -6,10 +6,11 @@ use anyhow::Result;
 use serde_json::Value;
 
 use crate::protocol::RequestDecoder;
+use crate::protocol::codec::reasoning::parse_reasoning_effort;
 use crate::protocol::ids::OPENAI_RESPONSES_V1;
 use crate::protocol::ir::{
     AiRequest, GenerationConfig, Message, MessageContent, OpenAIResponsesExt, ProtocolExt,
-    ReasoningConfig, Role, StreamConfig, ToolCall, ToolChoice, ToolSpec,
+    ReasoningConfig, ReasoningEffort, Role, StreamConfig, ToolCall, ToolChoice, ToolSpec,
 };
 
 pub struct ResponsesDecoder;
@@ -164,11 +165,14 @@ impl RequestDecoder for ResponsesDecoder {
 
         // ── Reasoning ─────────────────────────────────────────────────────────
         let reasoning = if let Some(r) = obj.get("reasoning") {
-            let effort_str = r.get("effort").and_then(|e| e.as_str());
+            let effort = r
+                .get("effort")
+                .and_then(|e| e.as_str())
+                .and_then(parse_reasoning_effort);
             let summary = r.get("summary").and_then(|s| s.as_str()).map(String::from);
             ReasoningConfig {
-                enabled: true,
-                effort: effort_str.map(parse_reasoning_effort),
+                enabled: !matches!(effort.as_ref(), Some(ReasoningEffort::None)),
+                effort,
                 display: summary,
                 ..Default::default()
             }
@@ -451,14 +455,5 @@ fn parse_tool_choice(v: Value) -> ToolChoice {
             ToolChoice::Raw(v)
         }
         _ => ToolChoice::Raw(v),
-    }
-}
-
-fn parse_reasoning_effort(s: &str) -> crate::protocol::ir::ReasoningEffort {
-    use crate::protocol::ir::ReasoningEffort;
-    match s {
-        "low" => ReasoningEffort::Low,
-        "high" => ReasoningEffort::High,
-        _ => ReasoningEffort::Medium,
     }
 }

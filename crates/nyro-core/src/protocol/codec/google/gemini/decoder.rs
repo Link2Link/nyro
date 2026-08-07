@@ -8,10 +8,12 @@ use anyhow::Result;
 use serde_json::Value;
 
 use crate::protocol::RequestDecoder;
+use crate::protocol::codec::reasoning::parse_reasoning_effort;
 use crate::protocol::ids::GOOGLE_GEMINI_GENERATE_CONTENT_V1BETA;
 use crate::protocol::ir::{
     AiRequest, ContentBlock, GenerationConfig, GoogleExt, MediaSource, Message, MessageContent,
-    ProtocolExt, ReasoningConfig, Role, SafetySettings, StreamConfig, ToolCall, ToolSpec,
+    ProtocolExt, ReasoningConfig, ReasoningEffort, Role, SafetySettings, StreamConfig, ToolCall,
+    ToolSpec,
 };
 
 use super::types::*;
@@ -150,11 +152,21 @@ impl GoogleDecoder {
         let reasoning = if let Some(tc) = gc.and_then(|c| c.thinking_config.as_ref()) {
             let budget = tc
                 .get("thinkingBudget")
-                .and_then(|v| v.as_u64())
-                .map(|v| v as u32);
+                .or_else(|| tc.get("thinking_budget"))
+                .and_then(Value::as_i64);
+            let budget_tokens = budget.and_then(|value| u32::try_from(value).ok());
+            let level_effort = tc
+                .get("thinkingLevel")
+                .or_else(|| tc.get("thinking_level"))
+                .and_then(Value::as_str)
+                .and_then(parse_reasoning_effort);
+            let enabled = level_effort.is_some() || budget.is_some_and(|value| value != 0);
+            let effort =
+                level_effort.or_else(|| (budget == Some(0)).then_some(ReasoningEffort::None));
             ReasoningConfig {
-                enabled: budget.map(|b| b > 0).unwrap_or(false),
-                budget_tokens: budget,
+                enabled,
+                budget_tokens,
+                effort,
                 ..Default::default()
             }
         } else {

@@ -345,26 +345,29 @@ pub enum ReasoningEffort {
     Medium,
     High,
     Xhigh,
-    /// Budget in tokens (Anthropic `budget_tokens`).
+    Max,
+    /// Budget in tokens (Anthropic `budget_tokens` / Gemini `thinkingBudget`).
     Budget(u32),
 }
 
 /// Reasoning / extended-thinking configuration.
 ///
 /// Normalized from:
-/// - OpenAI `reasoning.effort` + `reasoning.summary`
-/// - Anthropic `thinking: { type: "enabled", budget_tokens, display }`
+/// - OpenAI Chat Completions `reasoning_effort`
+/// - OpenAI Responses `reasoning.{effort,summary}`
+/// - Anthropic `thinking.{type,budget_tokens}` + `output_config.effort`
+/// - Gemini `generationConfig.thinkingConfig.{thinkingLevel,thinkingBudget}`
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ReasoningConfig {
     /// Whether extended reasoning / thinking is requested.
     pub enabled: bool,
-    /// Token budget for thinking (Anthropic `budget_tokens`).
+    /// Token budget for thinking (Anthropic `budget_tokens` / Gemini `thinkingBudget`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub budget_tokens: Option<u32>,
-    /// Effort level (OpenAI `reasoning.effort`).
+    /// Qualitative effort level shared by reasoning-capable protocols.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub effort: Option<ReasoningEffort>,
-    /// Display mode for thinking content (Anthropic `display: "summarized" | "omitted"`).
+    /// Requested reasoning summary/display mode.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub display: Option<String>,
 }

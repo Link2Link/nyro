@@ -12,7 +12,7 @@ pub struct CacheControl {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ThinkingConfig {
     #[serde(rename = "type")]
-    pub kind: String, // "enabled" | "disabled"
+    pub kind: String, // "enabled" | "adaptive" | "disabled"
     #[serde(skip_serializing_if = "Option::is_none")]
     pub budget_tokens: Option<u32>,
 }
@@ -35,6 +35,7 @@ pub struct AnthropicRequest {
 
     // PR-10 additions ─────────────────────────────────────────────────────────
     pub thinking: Option<ThinkingConfig>,
+    pub output_config: Option<Value>,
     pub context_management: Option<Value>,
     pub container: Option<String>,
     pub service_tier: Option<String>,

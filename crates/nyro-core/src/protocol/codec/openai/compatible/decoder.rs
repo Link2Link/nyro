@@ -8,6 +8,7 @@ use anyhow::Result;
 use serde_json::Value;
 
 use crate::protocol::RequestDecoder;
+use crate::protocol::codec::reasoning::parse_reasoning_effort;
 use crate::protocol::ids::OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1;
 use crate::protocol::ir::{
     AiRequest, ContentBlock, GenerationConfig, MediaSource, Message, MessageContent, OpenAIChatExt,
@@ -57,13 +58,15 @@ impl RequestDecoder for OpenAIDecoder {
         // Prefer max_completion_tokens (o-models), fall back to max_tokens.
         let effective_max_tokens = req.max_completion_tokens.or(req.max_tokens);
 
-        let reasoning = match &req.reasoning_effort {
-            Some(s) => ReasoningConfig {
-                enabled: true,
-                effort: Some(parse_reasoning_effort(s)),
-                ..Default::default()
-            },
-            None => ReasoningConfig::default(),
+        let effort = req
+            .reasoning_effort
+            .as_deref()
+            .and_then(parse_reasoning_effort);
+        let reasoning = ReasoningConfig {
+            enabled: req.reasoning_effort.is_some()
+                && !matches!(effort.as_ref(), Some(ReasoningEffort::None)),
+            effort,
+            ..Default::default()
         };
 
         let include_usage = req
@@ -314,14 +317,6 @@ fn parse_tool_choice(v: Value) -> ToolChoice {
             ToolChoice::Raw(v)
         }
         _ => ToolChoice::Raw(v),
-    }
-}
-
-fn parse_reasoning_effort(s: &str) -> ReasoningEffort {
-    match s {
-        "low" => ReasoningEffort::Low,
-        "high" => ReasoningEffort::High,
-        _ => ReasoningEffort::Medium,
     }
 }
 

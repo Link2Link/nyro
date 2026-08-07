@@ -6,6 +6,23 @@
 
 ---
 
+## [未发布] 推理强度跨协议归一化 — 2026-08-07
+
+### 新增 / 变更
+
+- `ReasoningEffort` 新增独立的 `Max`，不再把 `max` 折叠为 `Xhigh`。
+- OpenAI Chat Completions、OpenAI Responses、Anthropic Messages 和 Gemini GenerateContent 的定性推理强度统一进入 `AiRequest.reasoning.effort`。
+- Anthropic/Gemini 的 token budget 在两者之间精确保留；转换到 OpenAI 时按 budget 与最大输出 token 的比例映射为定性强度。
+- Gemini `thinkingBudget: 0` 归一化为禁用，`-1` 归一化为动态推理；原始配置仍用于同协议无损回放。
+- 目标协议不支持某个等级时只在出口降级：OpenAI 保留七级，Anthropic 将 `minimal` 降为 `low`，Gemini 将 `xhigh/max` 降为 `HIGH`。
+
+### 修复
+
+- Anthropic `output_config.effort` 现在可正确传递到 OpenAI `reasoning_effort` / `reasoning.effort`。
+- 阻止 Chat 的 `reasoning_effort` 与 Responses 的 `reasoning` 在互转时泄漏为错误的顶层字段。
+
+---
+
 ## [PR-C] 6 个 codec trait 统一重命名 — 2026-05-16
 
 ### 重命名 / 变更
@@ -413,7 +430,7 @@
 **新类型**
 - `MediaSource { Base64 { media_type, data }, Url(String), FileId { file_id, detail? } }`
 - `DocumentSource { Base64Pdf, PlainText, Url, Blocks }`
-- `ReasoningEffort { None, Minimal, Low, Medium, High, Xhigh, Budget(u32) }`
+- `ReasoningEffort { None, Minimal, Low, Medium, High, Xhigh, Max, Budget(u32) }`
 
 **AiRequest 新字段**
 - `disable_parallel_tool_calls: Option<bool>` — 与 ANT `disable_parallel_tool_use` 对应

@@ -3,8 +3,11 @@ use reqwest::header::HeaderMap;
 use serde_json::Value;
 
 use crate::protocol::RequestEncoder;
+use crate::protocol::codec::reasoning::google_thinking_level;
 use crate::protocol::ir::AiRequest;
-use crate::protocol::ir::request::{ContentBlock, MediaSource, Message, MessageContent, Role};
+use crate::protocol::ir::request::{
+    ContentBlock, MediaSource, Message, MessageContent, ReasoningConfig, ReasoningEffort, Role,
+};
 
 pub struct GoogleEncoder;
 
@@ -62,6 +65,11 @@ impl RequestEncoder for GoogleEncoder {
         }
         if let Some(p) = req.generation.top_p {
             gen_config.insert("topP".into(), p.into());
+        }
+        if !gen_config.contains_key("thinkingConfig")
+            && let Some(thinking_config) = google_reasoning_config(&req.reasoning)
+        {
+            gen_config.insert("thinkingConfig".into(), thinking_config);
         }
 
         if !gen_config.is_empty() {
@@ -130,6 +138,26 @@ impl RequestEncoder for GoogleEncoder {
             format!("/v1beta/models/{}:generateContent", model)
         }
     }
+}
+
+fn google_reasoning_config(reasoning: &ReasoningConfig) -> Option<Value> {
+    let budget = reasoning.budget_tokens.or(match reasoning.effort.as_ref() {
+        Some(ReasoningEffort::Budget(tokens)) => Some(*tokens),
+        _ => None,
+    });
+
+    if let Some(tokens) = budget {
+        return Some(serde_json::json!({"thinkingBudget": tokens}));
+    }
+    if matches!(reasoning.effort.as_ref(), Some(ReasoningEffort::None)) {
+        return Some(serde_json::json!({"thinkingBudget": 0}));
+    }
+    if let Some(level) = reasoning.effort.as_ref().and_then(google_thinking_level) {
+        return Some(serde_json::json!({"thinkingLevel": level}));
+    }
+    reasoning
+        .enabled
+        .then_some(Value::Object(serde_json::Map::new()))
 }
 
 // ── Schema sanitisation ───────────────────────────────────────────────────────

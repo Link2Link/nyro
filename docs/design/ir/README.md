@@ -25,7 +25,7 @@ AiRequest
 ├── tools: Vec<ToolSpec>            ← 用户自定义工具（ProtocolExt 存 server tools）
 ├── tool_config: ToolConfig         ← choice / parallel / disable_parallel
 ├── generation: GenerationConfig    ← temperature / top_p / max_tokens / stop / ...
-├── reasoning: Option<ReasoningConfig> ← effort / budget_tokens / display（ANT+OAI）
+├── reasoning: ReasoningConfig       ← effort / budget_tokens / display（OAI+ANT+GGL）
 ├── response_format: Option<ResponseFormat> ← text / json_object / json_schema
 ├── safety_settings: Option<Vec<SafetySetting>> ← Google safetySettings
 ├── stream: bool
@@ -49,7 +49,7 @@ AiResponse
 | `OpenAIChatExt` | OAI Chat | `audio`, `logit_bias`, `logprobs`, `top_logprobs`, `modalities`, `n`, `prediction`, `prompt_cache_retention`, `stream_options`, `verbosity`, `web_search_options` |
 | `OpenAIResponsesExt` | OAI Responses | `background`, `context_management`, `conversation`, `include`, `previous_response_id`, `prompt`, `prompt_cache_retention`, `stream_options`, `top_logprobs`, `truncation`, `tool_choice_ext` |
 | `AnthropicExt` | Anthropic | `top_k`, `container`, `inference_geo`, `output_config`, `service_tier`, `server_tools` |
-| `GoogleExt` | Google GenAI | `top_k`, `candidate_count`, `response_logprobs`, `logprobs`, `response_mime_type`, `response_json_schema`, `tool_config`, `cached_content`, `response_modalities`, `thinking_config`, `image_config` |
+| `GoogleExt` | Google GenAI | `top_k`, `candidate_count`, `response_logprobs`, `logprobs`, `response_mime_type`, `response_json_schema`, `tool_config`, `cached_content`, `response_modalities`, 原始 `thinking_config`, `image_config` |
 
 ### ContentBlock 变体（统一内容枚举）
 
@@ -113,7 +113,7 @@ AiErrorKind::is_retryable() → bool
 
 1. **Hybrid IR 架构**：IR 核心保持瘦身（只存跨协议语义等价字段），协议特有字段进 ProtocolExt，纯透传字段进 VendorBag。
 2. **`n` / `candidateCount` 不合并 IR**：响应结构差异大，合并对 Parser 无收益。
-3. **Thinking 三协议部分合并**：ANT `thinking` + OAI `reasoning` 合并为 `AiRequest.reasoning`；GGL `thinkingConfig` 保留在 `GoogleExt`。
+3. **Thinking 四协议统一**：OAI Chat `reasoning_effort`、OAI Responses `reasoning`、ANT `thinking`/`output_config.effort`、GGL `thinkingConfig` 统一进入 `AiRequest.reasoning`；原始协议结构同时保留，用于同协议无损回放。
 4. **`service_tier` 不合并 IR**：各协议枚举值不对齐，无跨协议语义。
 5. **server tools 归 ProtocolExt**：Anthropic server tools 和 OAI built-in tools 架构差异大，不进 `AiRequest.tools`。
 6. **ContentBlock::Document 与 File 分开**：Anthropic `DocumentBlockParam` 有 `context`/`citations` 语义，与 `File` 不同。

@@ -168,7 +168,7 @@ pub struct GoogleExt {
     /// Requested response modalities (`["TEXT"]`, `["IMAGE"]`, etc.).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub response_modalities: Option<Vec<String>>,
-    /// Thinking / reasoning budget configuration (`thinkingBudget`).
+    /// Raw `thinkingConfig`, retained for exact same-protocol round trips.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thinking_config: Option<Value>,
     /// Image generation configuration.

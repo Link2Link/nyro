@@ -77,7 +77,7 @@
 | `tools` | IR | `AiRequest.tools` | `FunctionDefinition[]` → `Vec<ToolSpec>` |
 | `tool_choice` | IR | `AiRequest.tool_config.choice` | `none/auto/required/function{}` → `ToolChoice` enum |
 | `parallel_tool_calls` | IR | `AiRequest.tool_config.parallel` | 与 Responses API 语义等价 |
-| `reasoning_effort` | IR | `AiRequest.reasoning.effort` | `none/low/medium/high/xhigh` → `ReasoningEffort` enum |
+| `reasoning_effort` | IR | `AiRequest.reasoning.effort` | `none/minimal/low/medium/high/xhigh/max` → `ReasoningEffort` enum |
 | `response_format` | IR | `AiRequest.response_format` | `text / json_object / json_schema` → `ResponseFormat` |
 | `stream` | IR | `AiRequest.stream` | |
 | `audio` | OAIChat | `OpenAIChatExt.audio` | 音频输出参数，仅此协议 |
@@ -131,7 +131,7 @@
 | `tools` | IR | `AiRequest.tools` | function + built-in tools |
 | `tool_choice` | IR | `AiRequest.tool_config.choice` | |
 | `parallel_tool_calls` | IR | `AiRequest.tool_config.parallel` | |
-| `reasoning` | IR | `AiRequest.reasoning` | `{effort, summary}` → `ReasoningConfig` |
+| `reasoning` | IR | `AiRequest.reasoning` | `{effort, summary}` → `ReasoningConfig`；effort 支持 `none/minimal/low/medium/high/xhigh/max` |
 | `text` | IR | `AiRequest.response_format` | `ResponseTextConfig.format` → `ResponseFormat` |
 | `stream` | IR | `AiRequest.stream` | |
 | `background` | OAIResp | `OpenAIResponsesExt.background` | 后台模式，Encoder 写入 |
@@ -187,12 +187,12 @@ Responses API 流式事件不归属到 `AiRequest`，由 `StreamParser` 消费�
 | `top_p` | IR | `AiRequest.generation.top_p` | |
 | `tools` | IR | `AiRequest.tools` | user `Tool` → `ToolSpec`；server tools → `AnthropicExt.server_tools` |
 | `tool_choice` | IR | `AiRequest.tool_config.choice` | `ToolChoiceAuto/Any/Tool/None` → `ToolChoice` |
-| `thinking` | IR | `AiRequest.reasoning` | `ThinkingConfigParam` → `ReasoningConfig {enabled, budget_tokens, display}` |
+| `thinking` | IR | `AiRequest.reasoning` | `enabled/adaptive/disabled` 与 `budget_tokens` → `ReasoningConfig` |
 | `stop_sequences` | IR | `AiRequest.generation.stop` | |
 | `top_k` | ANT | `AnthropicExt.top_k` | Anthropic 专有采样参数 |
 | `container` | ANT | `AnthropicExt.container` | 代码执行容器配置 |
 | `inference_geo` | ANT | `AnthropicExt.inference_geo` | 地理位置路由 |
-| `output_config` | ANT | `AnthropicExt.output_config` | `{effort, format: json_schema}` 结构化输出 |
+| `output_config` | IR + ANT | `AiRequest.reasoning.effort` + `AnthropicExt.output_config` | `effort`（`low/medium/high/xhigh/max`）进入 IR；完整原值保留供同协议回放 |
 | `service_tier` | ANT | `AnthropicExt.service_tier` | Anthropic 有自己的 tier 定义，不与 OAI 合并 |
 | `metadata` | BAG↓pass | `VendorExtensions.passthrough_safe["metadata"]` | `{user_id}` |
 | (beta headers) | BAG↓ing | `VendorExtensions.ingress["anthropic-beta"]` | Decoder 读取 request header |
@@ -269,7 +269,7 @@ Anthropic 的 server tool 规范（`ToolBash`, `WebSearchTool`, `CodeExecutionTo
 | `toolConfig` | `toolConfig` | GGL | `GoogleExt.tool_config` | function calling mode |
 | `cachedContent` | `cachedContent` | GGL | `GoogleExt.cached_content` | GGL 服务端缓存引用 |
 | `responseModalities` | `generationConfig.responseModalities` | GGL | `GoogleExt.response_modalities` | `["TEXT","IMAGE","AUDIO"]` |
-| `thinkingConfig` | `generationConfig.thinkingConfig` | GGL | `GoogleExt.thinking_config` | 思考预算（与 ANT thinking 不合并，枚举不对齐） |
+| `thinkingConfig` | `generationConfig.thinkingConfig` | IR + GGL | `AiRequest.reasoning` + `GoogleExt.thinking_config` | `thinkingLevel`/`thinkingBudget` 进入 IR；完整原值保留供同协议回放 |
 | `imageConfig` | `generationConfig.imageConfig` | GGL | `GoogleExt.image_config` | 图像生成配置 |
 | `routingConfig` | `generationConfig.routingConfig` | BAG↓pass | `VendorExtensions.passthrough_safe["routing_config"]` | auto/manual 路由 |
 | `modelSelectionConfig` | `generationConfig.modelSelectionConfig` | BAG↓pass | `VendorExtensions.passthrough_safe["model_selection_config"]` | |
@@ -431,7 +431,7 @@ CacheControl {
 | 字段 | 争议 | 决策 | 理由 |
 |------|------|------|------|
 | `n` (OAI) vs `candidateCount` (GGL) | 语义相同，是否合并到 IR？ | **不合并，各入 ProtocolExt** | 两者响应结构差异大（choices vs candidates），合并 IR 对 Parser 意义不大，会污染核心 |
-| `thinkingConfig` (GGL) vs `thinking` (ANT) vs `reasoning` (OAI) | 三协议思考配置，是否合并？ | **ANT + OAI 合并到 `AiRequest.reasoning`；GGL 单独 `GoogleExt.thinking_config`** | ANT budget_tokens + OAI effort 可互操；GGL thinking 是实验性且结构不同 |
+| `thinkingConfig` (GGL) vs `thinking` (ANT) vs `reasoning` (OAI) | 四种 wire 协议的思考配置，是否合并？ | **规范化语义全部进入 `AiRequest.reasoning`；原始结构留在对应 Ext/VendorBag** | 跨协议转换需要传递强度；同协议回放仍优先原值，避免丢失未归一化字段 |
 | `service_tier` (OAI/ANT/GGL 都有) | 是否合并到 IR？ | **不合并，各入 BAG↓pass（OAI/GGL）或 AnthropicExt（ANT）** | 各协议的 tier 枚举值完全不同，合并为 IR 字段没有语义意义 |
 | `tool_choice` (OAI 有 `allowed_tools`/MCP 变体) | 是否把所有 OAI 变体存 IR？ | **IR 存规范化的 `ToolChoice` 枚举（none/auto/required/forced{name}）；OAI 特有变体（allowed_tools/MCP）存 `OpenAIResponsesExt.tool_choice_ext`** | 避免 IR 被 OAI 特有扩展污染 |
 | `prompt_cache_retention` 在 OAIChat 和 OAIResp 各出现一次 | 合并到 IR 还是各 Ext？ | **各入对应 ProtocolExt** | 虽语义相同，但是否合并不影响跨协议互操作，保持 Ext 边界清晰 |

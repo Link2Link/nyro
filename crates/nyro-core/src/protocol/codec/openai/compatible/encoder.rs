@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 
 use crate::protocol::RequestEncoder;
+use crate::protocol::codec::reasoning::{effective_openai_effort, reasoning_effort_name};
 use crate::protocol::ir::request::{
     ContentBlock, MediaSource, Message, MessageContent, Role, ToolChoice, ToolSpec,
 };
@@ -98,11 +99,19 @@ impl RequestEncoder for OpenAIEncoder {
             }
         }
 
+        if !obj.contains_key("reasoning_effort")
+            && let Some(effort) = effective_openai_effort(&req.reasoning, req.generation.max_tokens)
+                .as_ref()
+                .and_then(reasoning_effort_name)
+        {
+            obj.insert("reasoning_effort".into(), Value::String(effort.into()));
+        }
+
         // Passthrough any remaining unknown extra fields.
         // Skip cross-protocol internal keys (e.g. __anthropic_*, __google_*)
         // that are only meaningful to their respective codecs.
         for (k, v) in ingress {
-            if k.starts_with("__anthropic_") || k.starts_with("__google_") {
+            if k == "reasoning" || k.starts_with("__anthropic_") || k.starts_with("__google_") {
                 continue;
             }
             obj.entry(k.clone()).or_insert_with(|| v.clone());

@@ -3,9 +3,11 @@ use reqwest::header::{HeaderMap, HeaderValue};
 use serde_json::Value;
 
 use crate::protocol::RequestEncoder;
+use crate::protocol::codec::reasoning::anthropic_effort_name;
 use crate::protocol::ir::AiRequest;
 use crate::protocol::ir::request::{
-    ContentBlock, MediaSource, Message, MessageContent, Role, ToolChoice,
+    ContentBlock, MediaSource, Message, MessageContent, ReasoningConfig, ReasoningEffort, Role,
+    ToolChoice,
 };
 
 pub struct AnthropicEncoder;
@@ -113,7 +115,11 @@ impl RequestEncoder for AnthropicEncoder {
         }
 
         // ── Extra fields ──────────────────────────────────────────────────────
-        for key in &["__anthropic_thinking", "__anthropic_context_management"] {
+        for key in &[
+            "__anthropic_thinking",
+            "__anthropic_output_config",
+            "__anthropic_context_management",
+        ] {
             if let Some(v) = ingress.get(*key) {
                 let field_name = key.trim_start_matches("__anthropic_");
                 obj.insert(field_name.into(), v.clone());
@@ -132,6 +138,8 @@ impl RequestEncoder for AnthropicEncoder {
             }
         }
 
+        encode_reasoning_config(obj, &req.reasoning);
+
         validate_anthropic_payload(&body)?;
 
         let mut headers = HeaderMap::new();
@@ -142,6 +150,45 @@ impl RequestEncoder for AnthropicEncoder {
 
     fn egress_path(&self, _model: &str, _stream: bool) -> String {
         "/v1/messages".to_string()
+    }
+}
+
+fn encode_reasoning_config(body: &mut serde_json::Map<String, Value>, reasoning: &ReasoningConfig) {
+    let budget = reasoning.budget_tokens.or(match reasoning.effort.as_ref() {
+        Some(ReasoningEffort::Budget(tokens)) => Some(*tokens),
+        _ => None,
+    });
+
+    if !body.contains_key("thinking") {
+        let thinking = if let Some(tokens) = budget {
+            if tokens == 0 {
+                Some(serde_json::json!({"type": "disabled"}))
+            } else {
+                Some(serde_json::json!({
+                    "type": "enabled",
+                    "budget_tokens": tokens,
+                }))
+            }
+        } else if matches!(reasoning.effort.as_ref(), Some(ReasoningEffort::None)) {
+            Some(serde_json::json!({"type": "disabled"}))
+        } else if reasoning.effort.is_some() || reasoning.enabled {
+            Some(serde_json::json!({"type": "adaptive"}))
+        } else {
+            None
+        };
+
+        if let Some(thinking) = thinking {
+            body.insert("thinking".into(), thinking);
+        }
+    }
+
+    if !body.contains_key("output_config")
+        && let Some(effort) = reasoning.effort.as_ref().and_then(anthropic_effort_name)
+    {
+        body.insert(
+            "output_config".into(),
+            serde_json::json!({"effort": effort}),
+        );
     }
 }
 

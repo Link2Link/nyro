@@ -1,8 +1,10 @@
 use nyro_core::protocol::codec::anthropic::messages::decoder::AnthropicDecoder;
 use nyro_core::protocol::codec::anthropic::messages::encoder::AnthropicEncoder;
 use nyro_core::protocol::codec::anthropic::messages::stream::AnthropicResponseFormatter;
+use nyro_core::protocol::codec::google::gemini::decoder::GoogleDecoder;
 use nyro_core::protocol::codec::google::gemini::encoder::GoogleEncoder;
 use nyro_core::protocol::codec::google::gemini::stream::GoogleStreamFormatter;
+use nyro_core::protocol::codec::openai::compatible::decoder::OpenAIDecoder;
 use nyro_core::protocol::codec::openai::compatible::encoder::OpenAIEncoder;
 use nyro_core::protocol::codec::openai::compatible::stream::OpenAIStreamFormatter;
 use nyro_core::protocol::codec::openai::responses::decoder::ResponsesDecoder;
@@ -21,7 +23,7 @@ use nyro_core::protocol::ir::usage::Usage;
 use nyro_core::protocol::ir::{
     AiRequest, AiResponse as IrAiResponse, AiStreamDelta as IrStreamDelta,
     ContentBlock as IrContentBlock, MediaSource, Message, MessageContent as IrMessageContent,
-    Role as IrRole, StreamConfig, ToolCall, ToolSpec,
+    ReasoningConfig, ReasoningEffort, Role as IrRole, StreamConfig, ToolCall, ToolSpec,
 };
 use nyro_core::protocol::{
     RequestDecoder, RequestEncoder, ResponseDecoder, ResponseEncoder, StreamResponseDecoder,
@@ -2445,5 +2447,380 @@ fn responses_decoder_tolerates_empty_name_function_call_item() {
     assert!(
         orphan_tool_msgs.is_empty(),
         "all tool results should be correlated after normalize"
+    );
+}
+
+#[test]
+fn anthropic_adaptive_effort_is_forwarded_to_openai_responses() {
+    let body = serde_json::json!({
+        "model": "gpt-5.6-sol",
+        "max_tokens": 32000,
+        "messages": [{"role": "user", "content": "hello"}],
+        "thinking": {"type": "adaptive"},
+        "output_config": {"effort": "high"},
+        "stream": true
+    });
+
+    let ir = AnthropicDecoder
+        .decode_request(body)
+        .expect("decode anthropic request");
+
+    assert!(ir.reasoning.enabled);
+    assert_eq!(ir.reasoning.effort, Some(ReasoningEffort::High));
+
+    let (responses_body, _) = ResponsesEncoder
+        .encode_request(&ir)
+        .expect("encode responses request");
+    assert_eq!(responses_body["reasoning"]["effort"], "high");
+
+    let (anthropic_body, _) = AnthropicEncoder
+        .encode_request(&ir)
+        .expect("re-encode anthropic request");
+    assert_eq!(anthropic_body["thinking"]["type"], "adaptive");
+    assert_eq!(anthropic_body["output_config"]["effort"], "high");
+}
+
+fn simple_reasoning_request(effort: ReasoningEffort) -> AiRequest {
+    let mut req = AiRequest::new(
+        "reasoning-model",
+        vec![Message {
+            role: IrRole::User,
+            content: IrMessageContent::Text("hello".into()),
+            tool_calls: None,
+            tool_call_id: None,
+            meta: None,
+        }],
+    );
+    req.generation.max_tokens = Some(10_000);
+    req.reasoning = ReasoningConfig {
+        enabled: effort != ReasoningEffort::None,
+        effort: Some(effort),
+        ..Default::default()
+    };
+    req
+}
+
+fn decode_chat_effort(effort: &str) -> AiRequest {
+    OpenAIDecoder
+        .decode_request(serde_json::json!({
+            "model": "reasoning-model",
+            "messages": [{"role": "user", "content": "hello"}],
+            "max_completion_tokens": 10000,
+            "reasoning_effort": effort
+        }))
+        .expect("decode chat reasoning effort")
+}
+
+fn decode_responses_effort(effort: &str) -> AiRequest {
+    ResponsesDecoder
+        .decode_request(serde_json::json!({
+            "model": "reasoning-model",
+            "input": "hello",
+            "max_output_tokens": 10000,
+            "reasoning": {"effort": effort}
+        }))
+        .expect("decode responses reasoning effort")
+}
+
+fn decode_anthropic_effort(effort: &str) -> AiRequest {
+    AnthropicDecoder
+        .decode_request(serde_json::json!({
+            "model": "reasoning-model",
+            "messages": [{"role": "user", "content": "hello"}],
+            "max_tokens": 10000,
+            "thinking": {"type": "adaptive"},
+            "output_config": {"effort": effort}
+        }))
+        .expect("decode anthropic reasoning effort")
+}
+
+fn decode_google_effort(effort: &str) -> AiRequest {
+    GoogleDecoder
+        .decode_with_model(
+            serde_json::json!({
+                "contents": [{"role": "user", "parts": [{"text": "hello"}]}],
+                "generationConfig": {
+                    "maxOutputTokens": 10000,
+                    "thinkingConfig": {"thinkingLevel": effort}
+                }
+            }),
+            "gemini-reasoning-model",
+            false,
+        )
+        .expect("decode google reasoning effort")
+}
+
+#[test]
+fn reasoning_decoders_preserve_every_supported_effort_level() {
+    let openai_levels = [
+        ("none", ReasoningEffort::None),
+        ("minimal", ReasoningEffort::Minimal),
+        ("low", ReasoningEffort::Low),
+        ("medium", ReasoningEffort::Medium),
+        ("high", ReasoningEffort::High),
+        ("xhigh", ReasoningEffort::Xhigh),
+        ("max", ReasoningEffort::Max),
+    ];
+    for (name, expected) in openai_levels {
+        let chat = decode_chat_effort(name);
+        let responses = decode_responses_effort(name);
+        assert_eq!(chat.reasoning.effort.as_ref(), Some(&expected));
+        assert_eq!(responses.reasoning.effort.as_ref(), Some(&expected));
+    }
+
+    let anthropic_levels = [
+        ("low", ReasoningEffort::Low),
+        ("medium", ReasoningEffort::Medium),
+        ("high", ReasoningEffort::High),
+        ("xhigh", ReasoningEffort::Xhigh),
+        ("max", ReasoningEffort::Max),
+    ];
+    for (name, expected) in anthropic_levels {
+        let request = decode_anthropic_effort(name);
+        assert_eq!(request.reasoning.effort, Some(expected));
+    }
+
+    let google_levels = [
+        ("MINIMAL", ReasoningEffort::Minimal),
+        ("LOW", ReasoningEffort::Low),
+        ("MEDIUM", ReasoningEffort::Medium),
+        ("HIGH", ReasoningEffort::High),
+    ];
+    for (name, expected) in google_levels {
+        let request = decode_google_effort(name);
+        assert_eq!(request.reasoning.effort, Some(expected));
+    }
+}
+
+#[test]
+fn reasoning_encoders_emit_target_specific_effort_levels() {
+    let levels = [
+        (ReasoningEffort::None, "none", None, None, Some(0)),
+        (
+            ReasoningEffort::Minimal,
+            "minimal",
+            Some("low"),
+            Some("MINIMAL"),
+            None,
+        ),
+        (ReasoningEffort::Low, "low", Some("low"), Some("LOW"), None),
+        (
+            ReasoningEffort::Medium,
+            "medium",
+            Some("medium"),
+            Some("MEDIUM"),
+            None,
+        ),
+        (
+            ReasoningEffort::High,
+            "high",
+            Some("high"),
+            Some("HIGH"),
+            None,
+        ),
+        (
+            ReasoningEffort::Xhigh,
+            "xhigh",
+            Some("xhigh"),
+            Some("HIGH"),
+            None,
+        ),
+        (ReasoningEffort::Max, "max", Some("max"), Some("HIGH"), None),
+    ];
+
+    for (effort, openai, anthropic, google_level, google_budget) in levels {
+        let request = simple_reasoning_request(effort);
+        let (chat, _) = OpenAIEncoder.encode_request(&request).expect("encode chat");
+        let (responses, _) = ResponsesEncoder
+            .encode_request(&request)
+            .expect("encode responses");
+        let (anthropic_body, _) = AnthropicEncoder
+            .encode_request(&request)
+            .expect("encode anthropic");
+        let (google, _) = GoogleEncoder
+            .encode_request(&request)
+            .expect("encode google");
+
+        assert_eq!(chat["reasoning_effort"], openai);
+        assert_eq!(responses["reasoning"]["effort"], openai);
+        match anthropic {
+            Some(expected) => {
+                assert_eq!(anthropic_body["thinking"]["type"], "adaptive");
+                assert_eq!(anthropic_body["output_config"]["effort"], expected);
+            }
+            None => {
+                assert_eq!(anthropic_body["thinking"]["type"], "disabled");
+                assert!(anthropic_body.get("output_config").is_none());
+            }
+        }
+        if let Some(expected) = google_level {
+            assert_eq!(
+                google["generationConfig"]["thinkingConfig"]["thinkingLevel"],
+                expected
+            );
+        }
+        if let Some(expected) = google_budget {
+            assert_eq!(
+                google["generationConfig"]["thinkingConfig"]["thinkingBudget"],
+                expected
+            );
+        }
+    }
+}
+
+fn assert_high_effort_in_every_egress(request: &AiRequest) {
+    let (chat, _) = OpenAIEncoder.encode_request(request).expect("encode chat");
+    assert_eq!(chat["reasoning_effort"], "high");
+    assert!(chat.get("reasoning").is_none());
+
+    let (responses, _) = ResponsesEncoder
+        .encode_request(request)
+        .expect("encode responses");
+    assert_eq!(responses["reasoning"]["effort"], "high");
+    assert!(responses.get("reasoning_effort").is_none());
+
+    let (anthropic, _) = AnthropicEncoder
+        .encode_request(request)
+        .expect("encode anthropic");
+    assert_eq!(anthropic["thinking"]["type"], "adaptive");
+    assert_eq!(anthropic["output_config"]["effort"], "high");
+
+    let (google, _) = GoogleEncoder
+        .encode_request(request)
+        .expect("encode google");
+    assert_eq!(
+        google["generationConfig"]["thinkingConfig"]["thinkingLevel"],
+        "HIGH"
+    );
+}
+
+#[test]
+fn high_effort_survives_every_protocol_pair() {
+    assert_high_effort_in_every_egress(&decode_chat_effort("high"));
+    assert_high_effort_in_every_egress(&decode_responses_effort("high"));
+    assert_high_effort_in_every_egress(&decode_anthropic_effort("high"));
+    assert_high_effort_in_every_egress(&decode_google_effort("HIGH"));
+}
+
+#[test]
+fn native_reasoning_fields_take_priority_over_normalized_ir() {
+    let mut chat = decode_chat_effort("high");
+    chat.reasoning.effort = Some(ReasoningEffort::Low);
+    assert_eq!(
+        OpenAIEncoder.encode_request(&chat).unwrap().0["reasoning_effort"],
+        "high"
+    );
+
+    let mut responses = decode_responses_effort("high");
+    responses.reasoning.effort = Some(ReasoningEffort::Low);
+    assert_eq!(
+        ResponsesEncoder.encode_request(&responses).unwrap().0["reasoning"]["effort"],
+        "high"
+    );
+
+    let mut anthropic = decode_anthropic_effort("high");
+    anthropic.reasoning.effort = Some(ReasoningEffort::Low);
+    assert_eq!(
+        AnthropicEncoder.encode_request(&anthropic).unwrap().0["output_config"]["effort"],
+        "high"
+    );
+
+    let mut google = decode_google_effort("HIGH");
+    google.reasoning.effort = Some(ReasoningEffort::Low);
+    assert_eq!(
+        GoogleEncoder.encode_request(&google).unwrap().0["generationConfig"]["thinkingConfig"]["thinkingLevel"],
+        "HIGH"
+    );
+}
+
+#[test]
+fn token_budgets_are_preserved_or_mapped_without_being_dropped() {
+    let anthropic = AnthropicDecoder
+        .decode_request(serde_json::json!({
+            "model": "reasoning-model",
+            "messages": [{"role": "user", "content": "hello"}],
+            "max_tokens": 10000,
+            "thinking": {"type": "enabled", "budget_tokens": 8000}
+        }))
+        .expect("decode anthropic budget");
+    assert_eq!(anthropic.reasoning.budget_tokens, Some(8000));
+    assert_eq!(
+        OpenAIEncoder.encode_request(&anthropic).unwrap().0["reasoning_effort"],
+        "high"
+    );
+    assert_eq!(
+        ResponsesEncoder.encode_request(&anthropic).unwrap().0["reasoning"]["effort"],
+        "high"
+    );
+    assert_eq!(
+        GoogleEncoder.encode_request(&anthropic).unwrap().0["generationConfig"]["thinkingConfig"]["thinkingBudget"],
+        8000
+    );
+
+    let google = GoogleDecoder
+        .decode_with_model(
+            serde_json::json!({
+                "contents": [{"role": "user", "parts": [{"text": "hello"}]}],
+                "generationConfig": {
+                    "maxOutputTokens": 10000,
+                    "thinkingConfig": {"thinkingBudget": 2000}
+                }
+            }),
+            "gemini-2.5-flash",
+            false,
+        )
+        .expect("decode google budget");
+    assert_eq!(google.reasoning.budget_tokens, Some(2000));
+    assert_eq!(
+        AnthropicEncoder.encode_request(&google).unwrap().0["thinking"]["budget_tokens"],
+        2000
+    );
+    assert_eq!(
+        OpenAIEncoder.encode_request(&google).unwrap().0["reasoning_effort"],
+        "low"
+    );
+}
+
+#[test]
+fn gemini_disabled_and_dynamic_budgets_map_to_explicit_intent() {
+    let decode_budget = |budget| {
+        GoogleDecoder
+            .decode_with_model(
+                serde_json::json!({
+                    "contents": [{"role": "user", "parts": [{"text": "hello"}]}],
+                    "generationConfig": {
+                        "maxOutputTokens": 10000,
+                        "thinkingConfig": {"thinkingBudget": budget}
+                    }
+                }),
+                "gemini-2.5-flash",
+                false,
+            )
+            .expect("decode google budget")
+    };
+
+    let disabled = decode_budget(0);
+    assert!(!disabled.reasoning.enabled);
+    assert_eq!(disabled.reasoning.effort, Some(ReasoningEffort::None));
+    assert_eq!(
+        ResponsesEncoder.encode_request(&disabled).unwrap().0["reasoning"]["effort"],
+        "none"
+    );
+    assert_eq!(
+        AnthropicEncoder.encode_request(&disabled).unwrap().0["thinking"]["type"],
+        "disabled"
+    );
+
+    let dynamic = decode_budget(-1);
+    assert!(dynamic.reasoning.enabled);
+    assert_eq!(dynamic.reasoning.budget_tokens, None);
+    assert_eq!(dynamic.reasoning.effort, None);
+    assert_eq!(
+        ResponsesEncoder.encode_request(&dynamic).unwrap().0["reasoning"]["effort"],
+        "medium"
+    );
+    assert_eq!(
+        AnthropicEncoder.encode_request(&dynamic).unwrap().0["thinking"]["type"],
+        "adaptive"
     );
 }

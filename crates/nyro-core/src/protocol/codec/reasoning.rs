@@ -1,4 +1,88 @@
-use crate::protocol::ir::AiResponse;
+use crate::protocol::ir::{AiResponse, ReasoningConfig, ReasoningEffort};
+
+pub fn parse_reasoning_effort(value: &str) -> Option<ReasoningEffort> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "none" => Some(ReasoningEffort::None),
+        "minimal" => Some(ReasoningEffort::Minimal),
+        "low" => Some(ReasoningEffort::Low),
+        "medium" => Some(ReasoningEffort::Medium),
+        "high" => Some(ReasoningEffort::High),
+        "xhigh" => Some(ReasoningEffort::Xhigh),
+        "max" => Some(ReasoningEffort::Max),
+        _ => None,
+    }
+}
+
+pub fn reasoning_effort_name(effort: &ReasoningEffort) -> Option<&'static str> {
+    match effort {
+        ReasoningEffort::None => Some("none"),
+        ReasoningEffort::Minimal => Some("minimal"),
+        ReasoningEffort::Low => Some("low"),
+        ReasoningEffort::Medium => Some("medium"),
+        ReasoningEffort::High => Some("high"),
+        ReasoningEffort::Xhigh => Some("xhigh"),
+        ReasoningEffort::Max => Some("max"),
+        ReasoningEffort::Budget(_) => None,
+    }
+}
+
+pub fn anthropic_effort_name(effort: &ReasoningEffort) -> Option<&'static str> {
+    match effort {
+        ReasoningEffort::None => None,
+        ReasoningEffort::Minimal => Some("low"),
+        _ => reasoning_effort_name(effort),
+    }
+}
+
+pub fn google_thinking_level(effort: &ReasoningEffort) -> Option<&'static str> {
+    match effort {
+        ReasoningEffort::None | ReasoningEffort::Budget(_) => None,
+        ReasoningEffort::Minimal => Some("MINIMAL"),
+        ReasoningEffort::Low => Some("LOW"),
+        ReasoningEffort::Medium => Some("MEDIUM"),
+        ReasoningEffort::High | ReasoningEffort::Xhigh | ReasoningEffort::Max => Some("HIGH"),
+    }
+}
+
+pub fn effective_openai_effort(
+    reasoning: &ReasoningConfig,
+    max_tokens: Option<u32>,
+) -> Option<ReasoningEffort> {
+    match reasoning.effort.as_ref() {
+        Some(ReasoningEffort::Budget(tokens)) => Some(effort_from_budget(*tokens, max_tokens)),
+        Some(effort) => Some(effort.clone()),
+        None => reasoning
+            .budget_tokens
+            .map(|tokens| effort_from_budget(tokens, max_tokens))
+            .or_else(|| reasoning.enabled.then_some(ReasoningEffort::Medium)),
+    }
+}
+
+fn effort_from_budget(budget: u32, max_tokens: Option<u32>) -> ReasoningEffort {
+    if budget == 0 {
+        return ReasoningEffort::None;
+    }
+    let Some(max_tokens) = max_tokens.filter(|max_tokens| *max_tokens > 0) else {
+        return ReasoningEffort::Medium;
+    };
+
+    // Match the published OpenRouter budget-to-effort thresholds.
+    let budget = u64::from(budget) * 100;
+    let max_tokens = u64::from(max_tokens);
+    if budget <= max_tokens * 10 {
+        ReasoningEffort::Minimal
+    } else if budget <= max_tokens * 20 {
+        ReasoningEffort::Low
+    } else if budget <= max_tokens * 50 {
+        ReasoningEffort::Medium
+    } else if budget <= max_tokens * 80 {
+        ReasoningEffort::High
+    } else if budget <= max_tokens * 95 {
+        ReasoningEffort::Xhigh
+    } else {
+        ReasoningEffort::Max
+    }
+}
 
 pub fn normalize_response_reasoning(resp: &mut AiResponse) {
     if resp.reasoning_content.is_some() {
@@ -115,5 +199,82 @@ mod tests {
         normalize_response_reasoning(&mut resp);
         assert_eq!(resp.reasoning_content.as_deref(), Some("my reasoning"));
         assert_eq!(resp.content, "final answer");
+    }
+
+    #[test]
+    fn reasoning_effort_names_cover_all_qualitative_levels() {
+        let levels = [
+            ("none", ReasoningEffort::None),
+            ("minimal", ReasoningEffort::Minimal),
+            ("low", ReasoningEffort::Low),
+            ("medium", ReasoningEffort::Medium),
+            ("high", ReasoningEffort::High),
+            ("xhigh", ReasoningEffort::Xhigh),
+            ("max", ReasoningEffort::Max),
+        ];
+
+        for (name, effort) in levels {
+            assert_eq!(parse_reasoning_effort(name), Some(effort.clone()));
+            assert_eq!(reasoning_effort_name(&effort), Some(name));
+        }
+        assert_eq!(parse_reasoning_effort("HIGH"), Some(ReasoningEffort::High));
+        assert_eq!(parse_reasoning_effort("unknown"), None);
+    }
+
+    #[test]
+    fn target_effort_names_clamp_only_unsupported_extremes() {
+        assert_eq!(
+            anthropic_effort_name(&ReasoningEffort::Minimal),
+            Some("low")
+        );
+        assert_eq!(anthropic_effort_name(&ReasoningEffort::Max), Some("max"));
+        assert_eq!(
+            google_thinking_level(&ReasoningEffort::Minimal),
+            Some("MINIMAL")
+        );
+        assert_eq!(google_thinking_level(&ReasoningEffort::Xhigh), Some("HIGH"));
+        assert_eq!(google_thinking_level(&ReasoningEffort::Max), Some("HIGH"));
+    }
+
+    #[test]
+    fn token_budgets_map_to_openai_effort_by_output_ratio() {
+        let config = |budget_tokens| ReasoningConfig {
+            enabled: budget_tokens > 0,
+            budget_tokens: Some(budget_tokens),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            effective_openai_effort(&config(0), Some(10_000)),
+            Some(ReasoningEffort::None)
+        );
+        assert_eq!(
+            effective_openai_effort(&config(1_000), Some(10_000)),
+            Some(ReasoningEffort::Minimal)
+        );
+        assert_eq!(
+            effective_openai_effort(&config(2_000), Some(10_000)),
+            Some(ReasoningEffort::Low)
+        );
+        assert_eq!(
+            effective_openai_effort(&config(5_000), Some(10_000)),
+            Some(ReasoningEffort::Medium)
+        );
+        assert_eq!(
+            effective_openai_effort(&config(8_000), Some(10_000)),
+            Some(ReasoningEffort::High)
+        );
+        assert_eq!(
+            effective_openai_effort(&config(9_500), Some(10_000)),
+            Some(ReasoningEffort::Xhigh)
+        );
+        assert_eq!(
+            effective_openai_effort(&config(9_501), Some(10_000)),
+            Some(ReasoningEffort::Max)
+        );
+        assert_eq!(
+            effective_openai_effort(&config(4_096), None),
+            Some(ReasoningEffort::Medium)
+        );
     }
 }

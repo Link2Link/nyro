@@ -14,8 +14,9 @@ use reqwest::header::HeaderMap;
 use serde_json::Value;
 
 use crate::protocol::RequestEncoder;
+use crate::protocol::codec::reasoning::{effective_openai_effort, reasoning_effort_name};
 use crate::protocol::ir::AiRequest;
-use crate::protocol::ir::request::{Role, ToolChoice};
+use crate::protocol::ir::request::{ReasoningConfig, Role, ToolChoice};
 
 /// Encoder for the OpenAI Responses API (`POST /v1/responses`).
 ///
@@ -24,7 +25,14 @@ use crate::protocol::ir::request::{Role, ToolChoice};
 pub struct ResponsesEncoder;
 
 // Fields that must NOT be copied blindly from extra into the egress body.
-const SKIP_FROM_EXTRA: &[&str] = &["messages", "input", "instructions", "stream", "model"];
+const SKIP_FROM_EXTRA: &[&str] = &[
+    "messages",
+    "input",
+    "instructions",
+    "stream",
+    "model",
+    "reasoning_effort",
+];
 
 impl RequestEncoder for ResponsesEncoder {
     fn encode_request(&self, req: &AiRequest) -> Result<(Value, HeaderMap)> {
@@ -152,6 +160,12 @@ impl RequestEncoder for ResponsesEncoder {
             }
         }
 
+        if !obj.contains_key("reasoning")
+            && let Some(reasoning) = reasoning_to_value(&req.reasoning, req.generation.max_tokens)
+        {
+            obj.insert("reasoning".into(), reasoning);
+        }
+
         // Passthrough remaining unknown extra fields.
         // Skip cross-protocol internal keys (e.g. __anthropic_*, __google_*)
         // that are only meaningful to their respective codecs.
@@ -171,6 +185,23 @@ impl RequestEncoder for ResponsesEncoder {
     fn egress_path(&self, _model: &str, _stream: bool) -> String {
         "/v1/responses".to_string()
     }
+}
+
+fn reasoning_to_value(reasoning: &ReasoningConfig, max_tokens: Option<u32>) -> Option<Value> {
+    let mut value = serde_json::Map::new();
+
+    if let Some(effort) = effective_openai_effort(reasoning, max_tokens)
+        .as_ref()
+        .and_then(reasoning_effort_name)
+    {
+        value.insert("effort".into(), Value::String(effort.into()));
+    }
+
+    if let Some(summary) = &reasoning.display {
+        value.insert("summary".into(), Value::String(summary.clone()));
+    }
+
+    (!value.is_empty()).then_some(Value::Object(value))
 }
 
 fn tool_choice_to_value(tc: &ToolChoice) -> Value {
