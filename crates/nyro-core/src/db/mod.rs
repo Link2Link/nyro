@@ -42,7 +42,10 @@ pub async fn migrate(pool: &SqlitePool) -> anyhow::Result<()> {
     ensure_provider_column(pool, "last_test_success", "INTEGER").await?;
     ensure_provider_column(pool, "last_test_at", "TEXT").await?;
     ensure_provider_column(pool, "use_proxy", "INTEGER DEFAULT 0").await?;
+    ensure_provider_column(pool, "protocol_mode", "TEXT NOT NULL DEFAULT 'fixed'").await?;
+    ensure_provider_protocol_endpoints_table(pool).await?;
     migrate_collapse_provider_protocol_columns(pool).await?;
+    backfill_provider_protocol_endpoints(pool).await?;
     ensure_route_column(pool, "virtual_model", "TEXT").await?;
     ensure_route_column(pool, "balance", "TEXT DEFAULT 'weighted'").await?;
     ensure_route_column(pool, "access_control", "INTEGER DEFAULT 0").await?;
@@ -120,18 +123,26 @@ pub async fn migrate(pool: &SqlitePool) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Rewrites legacy / alias protocol identifiers in `providers.protocol` into
-/// canonical protocol-suite strings (for example, `openai` -> `openai-compatible`).
+/// Rewrites legacy / alias protocol identifiers in `providers.protocol`.
+/// Fixed providers store a suite; adaptive providers must retain an exact
+/// endpoint so their configured default survives process restarts.
 async fn normalize_provider_protocols(pool: &SqlitePool) -> anyhow::Result<()> {
     let reg = ProtocolRegistry::global();
-    let rows = sqlx::query("SELECT id, protocol FROM providers")
-        .fetch_all(pool)
-        .await?;
+    let rows = sqlx::query(
+        "SELECT id, protocol, COALESCE(protocol_mode, 'fixed') AS protocol_mode FROM providers",
+    )
+    .fetch_all(pool)
+    .await?;
 
     for row in rows {
         let id: String = row.try_get("id")?;
         let raw_protocol: String = row.try_get("protocol").unwrap_or_default();
-        let new_protocol = normalize_provider_protocol_value(reg, &raw_protocol);
+        let protocol_mode: String = row.try_get("protocol_mode").unwrap_or_default();
+        let new_protocol = normalize_provider_protocol_value(
+            reg,
+            &raw_protocol,
+            protocol_mode.trim() == models::PROVIDER_PROTOCOL_MODE_ADAPTIVE,
+        );
 
         if new_protocol == raw_protocol {
             continue;
@@ -153,10 +164,22 @@ async fn normalize_provider_protocols(pool: &SqlitePool) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn normalize_provider_protocol_value(reg: &ProtocolRegistry, raw: &str) -> String {
+fn normalize_provider_protocol_value(reg: &ProtocolRegistry, raw: &str, adaptive: bool) -> String {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return String::new();
+    }
+    if adaptive {
+        return reg
+            .resolve_alias(trimmed)
+            .map(|endpoint| endpoint.to_string())
+            .unwrap_or_else(|| {
+                tracing::warn!(
+                    value = trimmed,
+                    "leaving unrecognized adaptive provider endpoint unchanged"
+                );
+                trimmed.to_string()
+            });
     }
     match reg.parse_protocol(trimmed) {
         Some(protocol) => protocol.as_str().to_string(),
@@ -239,25 +262,75 @@ async fn migrate_collapse_provider_protocol_columns(pool: &SqlitePool) -> anyhow
     }
 
     if has_protocol_endpoints {
-        let rows = sqlx::query("SELECT id, protocol, base_url, protocol_endpoints FROM providers")
-            .fetch_all(pool)
-            .await?;
+        let rows = sqlx::query(
+            "SELECT id, protocol, base_url, api_key, protocol_endpoints FROM providers",
+        )
+        .fetch_all(pool)
+        .await?;
         for row in rows {
             let id: String = row.try_get("id")?;
             let protocol: String = row.try_get("protocol").unwrap_or_default();
             let base_url: String = row.try_get("base_url").unwrap_or_default();
-            if !base_url.trim().is_empty() {
+            let api_key: String = row.try_get("api_key").unwrap_or_default();
+            let raw_endpoints: String = row.try_get("protocol_endpoints").unwrap_or_default();
+            let Some(mut legacy) = models::normalize_legacy_provider_protocol_config(
+                &raw_endpoints,
+                &protocol,
+                &api_key,
+            ) else {
+                continue;
+            };
+
+            let effective_base_url = if base_url.trim().is_empty() {
+                legacy.default_base_url().unwrap_or_default().to_string()
+            } else {
+                base_url.trim().to_string()
+            };
+
+            if !legacy.adaptive {
+                if base_url.trim().is_empty() && !effective_base_url.is_empty() {
+                    sqlx::query("UPDATE providers SET base_url = ?1 WHERE id = ?2")
+                        .bind(effective_base_url)
+                        .bind(id)
+                        .execute(pool)
+                        .await?;
+                }
                 continue;
             }
-            let raw_endpoints: String = row.try_get("protocol_endpoints").unwrap_or_default();
-            if let Some(next_base_url) = base_url_from_protocol_endpoints(&raw_endpoints, &protocol)
+
+            if let Some(default) = legacy
+                .endpoints
+                .iter_mut()
+                .find(|endpoint| endpoint.protocol == legacy.default_protocol)
+                && !effective_base_url.is_empty()
             {
-                sqlx::query("UPDATE providers SET base_url = ?1 WHERE id = ?2")
-                    .bind(next_base_url)
-                    .bind(id)
-                    .execute(pool)
-                    .await?;
+                default.base_url = effective_base_url.clone();
             }
+            for endpoint in legacy.endpoints {
+                sqlx::query(
+                    "INSERT OR IGNORE INTO provider_protocol_endpoints \
+                     (id, provider_id, protocol, base_url, api_key, auth_scheme, is_enabled, priority) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                )
+                .bind(uuid::Uuid::new_v4().to_string())
+                .bind(&id)
+                .bind(endpoint.protocol)
+                .bind(endpoint.base_url)
+                .bind(endpoint.api_key)
+                .bind(endpoint.auth_scheme)
+                .bind(endpoint.is_enabled)
+                .bind(endpoint.priority)
+                .execute(pool)
+                .await?;
+            }
+            sqlx::query(
+                "UPDATE providers SET protocol = ?1, base_url = ?2, protocol_mode = 'adaptive' WHERE id = ?3",
+            )
+            .bind(legacy.default_protocol)
+            .bind(effective_base_url)
+            .bind(id)
+            .execute(pool)
+            .await?;
         }
     }
 
@@ -271,41 +344,47 @@ async fn migrate_collapse_provider_protocol_columns(pool: &SqlitePool) -> anyhow
     Ok(())
 }
 
-fn base_url_from_protocol_endpoints(raw: &str, protocol: &str) -> Option<String> {
-    let reg = ProtocolRegistry::global();
-    let target = reg.parse_protocol(protocol)?;
-    let value = serde_json::from_str::<serde_json::Value>(raw.trim()).ok()?;
-    let obj = value.as_object()?;
-    let mut skipped = 0usize;
-    let mut matched = None;
-    for (key, entry) in obj {
-        let Some(entry_protocol) = reg.parse_protocol(key) else {
-            skipped += 1;
-            continue;
-        };
-        if entry_protocol == target {
-            matched = entry
-                .as_object()
-                .and_then(|object| object.get("base_url"))
-                .and_then(|value| value.as_str())
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(ToString::to_string);
-            if matched.is_some() {
-                break;
-            }
-        } else {
-            skipped += 1;
-        }
-    }
-    if skipped > 0 {
-        tracing::warn!(
-            protocol = protocol,
-            skipped_entries = skipped,
-            "dropping non-selected protocol_endpoints entries during provider protocol collapse"
+async fn ensure_provider_protocol_endpoints_table(pool: &SqlitePool) -> anyhow::Result<()> {
+    sqlx::raw_sql(
+        r#"
+        CREATE TABLE IF NOT EXISTS provider_protocol_endpoints (
+            id          TEXT PRIMARY KEY,
+            provider_id TEXT NOT NULL REFERENCES providers(id) ON DELETE CASCADE,
+            protocol    TEXT NOT NULL,
+            base_url    TEXT NOT NULL,
+            api_key     TEXT NOT NULL,
+            auth_scheme TEXT NOT NULL DEFAULT 'auto',
+            is_enabled  INTEGER NOT NULL DEFAULT 1,
+            priority    INTEGER NOT NULL DEFAULT 0,
+            test_status TEXT NOT NULL DEFAULT 'untested',
+            test_error  TEXT,
+            tested_at   TEXT,
+            created_at  TEXT DEFAULT (datetime('now')),
+            updated_at  TEXT DEFAULT (datetime('now')),
+            UNIQUE(provider_id, protocol)
         );
-    }
-    matched
+        CREATE INDEX IF NOT EXISTS idx_provider_protocol_endpoints_provider
+            ON provider_protocol_endpoints(provider_id, is_enabled, priority);
+        "#,
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+async fn backfill_provider_protocol_endpoints(pool: &SqlitePool) -> anyhow::Result<()> {
+    sqlx::query(
+        "INSERT INTO provider_protocol_endpoints \
+         (id, provider_id, protocol, base_url, api_key, auth_scheme, is_enabled, priority) \
+         SELECT id || '-default-endpoint', id, protocol, base_url, api_key, 'auto', 1, 0 \
+         FROM providers p \
+         WHERE NOT EXISTS (\
+             SELECT 1 FROM provider_protocol_endpoints e WHERE e.provider_id = p.id\
+         )",
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
 }
 
 async fn ensure_provider_column(
@@ -768,6 +847,7 @@ CREATE TABLE IF NOT EXISTS providers (
     vendor      TEXT,
     protocol    TEXT NOT NULL,
     base_url    TEXT NOT NULL,
+    protocol_mode TEXT NOT NULL DEFAULT 'fixed',
     preset_key  TEXT,
     channel     TEXT,
     models_source TEXT,
@@ -785,6 +865,26 @@ CREATE TABLE IF NOT EXISTS providers (
     created_at  TEXT DEFAULT (datetime('now')),
     updated_at  TEXT DEFAULT (datetime('now'))
 );
+
+CREATE TABLE IF NOT EXISTS provider_protocol_endpoints (
+    id          TEXT PRIMARY KEY,
+    provider_id TEXT NOT NULL REFERENCES providers(id) ON DELETE CASCADE,
+    protocol    TEXT NOT NULL,
+    base_url    TEXT NOT NULL,
+    api_key     TEXT NOT NULL,
+    auth_scheme TEXT NOT NULL DEFAULT 'auto',
+    is_enabled  INTEGER NOT NULL DEFAULT 1,
+    priority    INTEGER NOT NULL DEFAULT 0,
+    test_status TEXT NOT NULL DEFAULT 'untested',
+    test_error  TEXT,
+    tested_at   TEXT,
+    created_at  TEXT DEFAULT (datetime('now')),
+    updated_at  TEXT DEFAULT (datetime('now')),
+    UNIQUE(provider_id, protocol)
+);
+
+CREATE INDEX IF NOT EXISTS idx_provider_protocol_endpoints_provider
+    ON provider_protocol_endpoints(provider_id, is_enabled, priority);
 
 CREATE TABLE IF NOT EXISTS routes (
     id                TEXT PRIMARY KEY,

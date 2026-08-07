@@ -18,7 +18,7 @@ use crate::auth::types::{
 use crate::db::models::*;
 use crate::provider::metadata::CapabilitiesSource;
 use crate::provider::{VendorRegistry, vertexai};
-use crate::storage::traits::ProviderTestResult;
+use crate::storage::traits::{ProviderEndpointTestResult, ProviderTestResult};
 
 mod api_keys;
 mod auth_data;

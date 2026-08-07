@@ -89,6 +89,8 @@ pub struct ProviderCtx<'a> {
     /// Resolved egress base URL.
     pub egress_base_url: &'a str,
     pub api_key: &'a str,
+    /// Endpoint-specific auth strategy (`auto`, `bearer`, `x-api-key`, `query`, `none`).
+    pub auth_scheme: &'a str,
     pub actual_model: &'a str,
     pub credential: Option<&'a StoredCredential>,
     pub gw: &'a Gateway,

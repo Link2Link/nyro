@@ -101,7 +101,8 @@ where
 
     // 7. build URL
     let egress_path = encoder.egress_path(ctx.actual_model, req.stream.enabled);
-    let url = vendor.build_url(&vendor_ctx, ctx.egress_base_url, &egress_path);
+    let mut url = vendor.build_url(&vendor_ctx, ctx.egress_base_url, &egress_path);
+    apply_explicit_auth_scheme(&mut headers, &mut url, ctx)?;
 
     Ok(crate::provider::outbound::OutboundRequest { url, headers, body })
 }
@@ -213,13 +214,80 @@ pub async fn passthrough_run(
         .handler()
         .make_request_encoder()
         .egress_path(ctx.actual_model, is_stream);
-    let url = vendor.build_url(&vendor_ctx, ctx.egress_base_url, &egress_path);
+    let mut url = vendor.build_url(&vendor_ctx, ctx.egress_base_url, &egress_path);
+    apply_explicit_auth_scheme(&mut headers, &mut url, ctx)?;
 
     Ok(crate::provider::outbound::OutboundRequest {
         url,
         headers,
         body: raw_body,
     })
+}
+
+fn apply_explicit_auth_scheme(
+    headers: &mut HeaderMap,
+    url: &mut String,
+    ctx: &crate::provider::vendor::ProviderCtx<'_>,
+) -> Result<(), GatewayError> {
+    let scheme = ctx.auth_scheme.trim();
+    if scheme.is_empty() || scheme == "auto" {
+        return Ok(());
+    }
+
+    headers.remove(reqwest::header::AUTHORIZATION);
+    headers.remove("x-api-key");
+    remove_query_api_key(url)?;
+
+    match scheme {
+        "bearer" => {
+            let value = reqwest::header::HeaderValue::from_str(&format!("Bearer {}", ctx.api_key))
+                .map_err(|error| GatewayError::internal(anyhow::Error::new(error)))?;
+            headers.insert(reqwest::header::AUTHORIZATION, value);
+        }
+        "x-api-key" => {
+            let value = reqwest::header::HeaderValue::from_str(ctx.api_key)
+                .map_err(|error| GatewayError::internal(anyhow::Error::new(error)))?;
+            headers.insert("x-api-key", value);
+        }
+        "query" => set_query_api_key(url, ctx.api_key)?,
+        "none" => {}
+        other => {
+            return Err(GatewayError::internal(anyhow::anyhow!(
+                "unsupported endpoint auth scheme: {other}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn remove_query_api_key(raw_url: &mut String) -> Result<(), GatewayError> {
+    rewrite_query_api_key(raw_url, None)
+}
+
+fn set_query_api_key(raw_url: &mut String, api_key: &str) -> Result<(), GatewayError> {
+    rewrite_query_api_key(raw_url, Some(api_key))
+}
+
+fn rewrite_query_api_key(raw_url: &mut String, api_key: Option<&str>) -> Result<(), GatewayError> {
+    let mut parsed = reqwest::Url::parse(raw_url)
+        .map_err(|error| GatewayError::internal(anyhow::Error::new(error)))?;
+    let existing = parsed
+        .query_pairs()
+        .filter(|(key, _)| key != "key")
+        .map(|(key, value)| (key.into_owned(), value.into_owned()))
+        .collect::<Vec<_>>();
+    {
+        let mut query = parsed.query_pairs_mut();
+        query.clear();
+        for (key, value) in existing {
+            query.append_pair(&key, &value);
+        }
+        if let Some(api_key) = api_key {
+            query.append_pair("key", api_key);
+        }
+    }
+    *raw_url = parsed.to_string();
+    Ok(())
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -351,6 +419,8 @@ mod tests {
             vendor: Some("fake-test".into()),
             protocol: "openai".into(),
             base_url: "https://upstream.local".into(),
+            protocol_mode: "fixed".into(),
+            protocol_endpoints: Vec::new(),
             preset_key: Some("fake-test".into()),
             channel: Some("default".into()),
             models_source: None,
@@ -399,6 +469,7 @@ mod tests {
             protocol: OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1,
             egress_base_url: "https://upstream.local",
             api_key: &provider.api_key,
+            auth_scheme: "auto",
             actual_model: "gpt-test",
             credential: None,
             gw: &gw,
@@ -424,6 +495,7 @@ mod tests {
             protocol: OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1,
             egress_base_url: "https://upstream.local",
             api_key: &provider.api_key,
+            auth_scheme: "auto",
             actual_model: "gpt-test",
             credential: None,
             gw: &gw,
@@ -436,6 +508,47 @@ mod tests {
             out.headers.get("x-api-key").and_then(|v| v.to_str().ok()),
             Some("apikey-abc"),
             "API-key path must still propagate x-api-key to upstream",
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_query_auth_uses_endpoint_credential_and_removes_header_auth() {
+        let gw = build_test_gateway().await;
+        let provider = provider_with_api_key("provider-level-key");
+        let ctx = ProviderCtx {
+            provider: &provider,
+            protocol: GOOGLE_GEMINI_GENERATE_CONTENT_V1BETA,
+            egress_base_url: "https://gemini.example",
+            api_key: "endpoint-specific-key",
+            auth_scheme: "query",
+            actual_model: "gemini-test",
+            credential: None,
+            gw: &gw,
+            disable_default_auth: false,
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            reqwest::header::AUTHORIZATION,
+            reqwest::header::HeaderValue::from_static("Bearer stale"),
+        );
+        headers.insert(
+            "x-api-key",
+            reqwest::header::HeaderValue::from_static("stale"),
+        );
+        let mut url = "https://gemini.example/v1?existing=1&key=stale".to_string();
+
+        apply_explicit_auth_scheme(&mut headers, &mut url, &ctx).unwrap();
+
+        assert!(!headers.contains_key(reqwest::header::AUTHORIZATION));
+        assert!(!headers.contains_key("x-api-key"));
+        let parsed = reqwest::Url::parse(&url).unwrap();
+        let query = parsed
+            .query_pairs()
+            .collect::<std::collections::HashMap<_, _>>();
+        assert_eq!(query.get("existing").map(|value| value.as_ref()), Some("1"));
+        assert_eq!(
+            query.get("key").map(|value| value.as_ref()),
+            Some("endpoint-specific-key")
         );
     }
 
@@ -452,6 +565,7 @@ mod tests {
             protocol: ANTHROPIC_MESSAGES_2023_06_01,
             egress_base_url: "https://api.anthropic.com",
             api_key: "oauth_bearer_token_should_not_become_xapikey",
+            auth_scheme: "auto",
             actual_model: "claude-sonnet-4-6",
             credential: None,
             gw: &gw,
@@ -485,6 +599,7 @@ mod tests {
             protocol: ANTHROPIC_MESSAGES_2023_06_01,
             egress_base_url: "https://api.anthropic.com",
             api_key: &provider.api_key,
+            auth_scheme: "auto",
             actual_model: "claude-sonnet-4-6",
             credential: None,
             gw: &gw,
@@ -513,6 +628,7 @@ mod tests {
             protocol: GOOGLE_GEMINI_GENERATE_CONTENT_V1BETA,
             egress_base_url: "https://gemini-proxy.local",
             api_key: &provider.api_key,
+            auth_scheme: "auto",
             actual_model: "gemini-2.5-flash",
             credential: None,
             gw: &gw,
@@ -545,6 +661,7 @@ mod tests {
             protocol: OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1,
             egress_base_url: "https://upstream.local",
             api_key: &provider.api_key,
+            auth_scheme: "auto",
             actual_model,
             credential: None,
             gw,

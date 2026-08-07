@@ -8,6 +8,21 @@ pub fn default_provider_auth_mode() -> String {
     "apikey".to_string()
 }
 
+pub const PROVIDER_PROTOCOL_MODE_FIXED: &str = "fixed";
+pub const PROVIDER_PROTOCOL_MODE_ADAPTIVE: &str = "adaptive";
+
+pub fn default_provider_protocol_mode() -> String {
+    PROVIDER_PROTOCOL_MODE_FIXED.to_string()
+}
+
+pub fn default_provider_endpoint_auth_scheme() -> String {
+    "auto".to_string()
+}
+
+pub fn default_provider_endpoint_enabled() -> bool {
+    true
+}
+
 pub fn is_valid_provider_auth_mode(value: &str) -> bool {
     matches!(value.trim(), "apikey" | "oauth")
 }
@@ -55,6 +70,11 @@ pub struct Provider {
     pub vendor: Option<String>,
     pub protocol: String,
     pub base_url: String,
+    #[serde(default = "default_provider_protocol_mode")]
+    pub protocol_mode: String,
+    #[serde(default)]
+    #[sqlx(skip)]
+    pub protocol_endpoints: Vec<ProviderProtocolEndpoint>,
     pub preset_key: Option<String>,
     pub channel: Option<String>,
     #[serde(alias = "modelsEndpoint")]
@@ -70,6 +90,131 @@ pub struct Provider {
     pub is_enabled: bool,
     pub created_at: String,
     pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow, PartialEq, Eq)]
+pub struct ProviderProtocolEndpoint {
+    pub id: String,
+    pub provider_id: String,
+    pub protocol: String,
+    pub base_url: String,
+    pub api_key: String,
+    #[serde(default = "default_provider_endpoint_auth_scheme")]
+    pub auth_scheme: String,
+    pub is_enabled: bool,
+    pub priority: i32,
+    pub test_status: String,
+    pub test_error: Option<String>,
+    pub tested_at: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CreateProviderProtocolEndpoint {
+    pub protocol: String,
+    pub base_url: String,
+    pub api_key: String,
+    #[serde(default = "default_provider_endpoint_auth_scheme")]
+    pub auth_scheme: String,
+    #[serde(default = "default_provider_endpoint_enabled")]
+    pub is_enabled: bool,
+    #[serde(default)]
+    pub priority: i32,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct LegacyProviderProtocolConfig {
+    pub default_protocol: String,
+    pub endpoints: Vec<CreateProviderProtocolEndpoint>,
+    pub adaptive: bool,
+}
+
+impl LegacyProviderProtocolConfig {
+    pub fn default_base_url(&self) -> Option<&str> {
+        self.endpoints
+            .iter()
+            .find(|endpoint| endpoint.protocol == self.default_protocol)
+            .map(|endpoint| endpoint.base_url.as_str())
+    }
+}
+
+/// Convert the removed JSON protocol map into normalized endpoint rows.
+/// Legacy protocol keys represented suites, so each key expands to every
+/// registered endpoint in that suite, matching the pre-collapse runtime.
+pub(crate) fn normalize_legacy_provider_protocol_config(
+    raw: &str,
+    default_protocol: &str,
+    api_key: &str,
+) -> Option<LegacyProviderProtocolConfig> {
+    let registry = crate::protocol::registry::ProtocolRegistry::global();
+    let value = serde_json::from_str::<serde_json::Value>(raw.trim()).ok()?;
+    let entries = value.as_object()?;
+    let mut endpoints = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut valid_sources = 0usize;
+
+    for (raw_protocol, entry) in entries {
+        let Some(protocol) = registry.parse_protocol(raw_protocol) else {
+            continue;
+        };
+        let Some(base_url) = entry
+            .as_object()
+            .and_then(|object| object.get("base_url"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            continue;
+        };
+        valid_sources += 1;
+
+        for handler in registry.list_by_protocol(protocol) {
+            let endpoint = handler.id().to_string();
+            if !seen.insert(endpoint.clone()) {
+                continue;
+            }
+            endpoints.push(CreateProviderProtocolEndpoint {
+                protocol: endpoint,
+                base_url: base_url.to_string(),
+                api_key: api_key.to_string(),
+                auth_scheme: "auto".to_string(),
+                is_enabled: true,
+                priority: endpoints.len() as i32,
+            });
+        }
+    }
+
+    let default = registry
+        .resolve_alias(default_protocol)
+        .filter(|candidate| {
+            endpoints
+                .iter()
+                .any(|endpoint| endpoint.protocol == candidate.to_string())
+        })
+        .or_else(|| {
+            let protocol = registry.parse_protocol(default_protocol)?;
+            registry
+                .list_by_protocol(protocol)
+                .into_iter()
+                .map(|handler| handler.id())
+                .find(|candidate| {
+                    endpoints
+                        .iter()
+                        .any(|endpoint| endpoint.protocol == candidate.to_string())
+                })
+        })
+        .or_else(|| {
+            endpoints
+                .first()
+                .and_then(|endpoint| registry.resolve_alias(&endpoint.protocol))
+        })?;
+
+    Some(LegacyProviderProtocolConfig {
+        default_protocol: default.to_string(),
+        endpoints,
+        adaptive: valid_sources > 1,
+    })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
@@ -269,6 +414,10 @@ pub struct CreateProvider {
     pub vendor: Option<String>,
     pub protocol: String,
     pub base_url: String,
+    #[serde(default = "default_provider_protocol_mode")]
+    pub protocol_mode: String,
+    #[serde(default)]
+    pub protocol_endpoints: Vec<CreateProviderProtocolEndpoint>,
     pub preset_key: Option<String>,
     pub channel: Option<String>,
     #[serde(alias = "modelsSource")]
@@ -287,6 +436,8 @@ pub struct UpdateProvider {
     pub vendor: Option<String>,
     pub protocol: Option<String>,
     pub base_url: Option<String>,
+    pub protocol_mode: Option<String>,
+    pub protocol_endpoints: Option<Vec<CreateProviderProtocolEndpoint>>,
     pub preset_key: Option<String>,
     pub channel: Option<String>,
     #[serde(alias = "modelsSource")]
@@ -452,6 +603,19 @@ pub struct TestResult {
     pub latency_ms: u64,
     pub model: Option<String>,
     pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub endpoints: Vec<EndpointTestResult>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EndpointTestResult {
+    pub endpoint_id: String,
+    pub protocol: String,
+    pub base_url: String,
+    pub success: bool,
+    pub latency_ms: u64,
+    pub error: Option<String>,
+    pub tested_at: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -484,6 +648,10 @@ pub struct ExportProvider {
     pub vendor: Option<String>,
     pub protocol: String,
     pub base_url: String,
+    #[serde(default = "default_provider_protocol_mode")]
+    pub protocol_mode: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub endpoints: Vec<CreateProviderProtocolEndpoint>,
     #[serde(default, skip_serializing)]
     pub default_protocol: String,
     #[serde(default, skip_serializing)]
@@ -522,6 +690,10 @@ pub struct ImportResult {
 }
 
 impl Provider {
+    pub fn is_adaptive(&self) -> bool {
+        self.protocol_mode.trim() == PROVIDER_PROTOCOL_MODE_ADAPTIVE
+    }
+
     pub fn effective_auth_mode(&self) -> String {
         resolve_preset_channel_auth_mode(self.preset_key.as_deref(), self.channel.as_deref())
             .unwrap_or_else(|| {

@@ -369,6 +369,8 @@ mod tests {
             vendor: Some("anthropic".into()),
             protocol: "anthropic-messages".into(),
             base_url: String::new(),
+            protocol_mode: "fixed".into(),
+            protocol_endpoints: Vec::new(),
             preset_key: Some("anthropic".into()),
             channel: Some("claude-code".into()),
             models_source: None,

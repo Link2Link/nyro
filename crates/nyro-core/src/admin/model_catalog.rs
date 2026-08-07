@@ -13,9 +13,12 @@ pub(super) fn resolve_models_endpoint(provider: &Provider) -> Option<String> {
     }
 
     let base = provider.base_url.trim_end_matches('/');
-    match provider.protocol.as_str() {
-        "openai" | "openai-compatible" | "openai-compat" | "openai-responses" | "openai-resps"
-        | "anthropic" | "anthropic-messages" | "anthropic-msgs" => {
+    match crate::protocol::registry::ProtocolRegistry::global().parse_protocol(&provider.protocol) {
+        Some(
+            crate::protocol::ids::Protocol::OpenAICompatible
+            | crate::protocol::ids::Protocol::OpenAIResponses
+            | crate::protocol::ids::Protocol::AnthropicMessages,
+        ) => {
             let has_base_path = reqwest::Url::parse(base)
                 .ok()
                 .map(|url| {
@@ -29,7 +32,7 @@ pub(super) fn resolve_models_endpoint(provider: &Provider) -> Option<String> {
                 Some(format!("{base}/v1/models"))
             }
         }
-        "gemini" | "google-gemini" | "google-genai" => Some(format!("{base}/v1beta/models")),
+        Some(crate::protocol::ids::Protocol::GoogleGemini) => Some(format!("{base}/v1beta/models")),
         _ => None,
     }
 }
@@ -54,12 +57,12 @@ pub(super) fn build_model_headers(
     let is_google_vendor = vendor
         .map(str::trim)
         .is_some_and(|value| value.eq_ignore_ascii_case("google"));
-    match protocol {
-        "anthropic" => {
+    match crate::protocol::registry::ProtocolRegistry::global().parse_protocol(protocol) {
+        Some(crate::protocol::ids::Protocol::AnthropicMessages) => {
             headers.insert("x-api-key", HeaderValue::from_str(api_key)?);
             headers.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
         }
-        "gemini" => {
+        Some(crate::protocol::ids::Protocol::GoogleGemini) => {
             // Google providers may expose OpenAI-compatible /v1/models endpoints.
             // Add Bearer auth in addition to Gemini key query param.
             if is_google_vendor {
@@ -77,6 +80,11 @@ pub(super) fn build_model_headers(
         }
     }
     Ok(headers)
+}
+
+pub(super) fn is_google_protocol(protocol: &str) -> bool {
+    crate::protocol::registry::ProtocolRegistry::global().parse_protocol(protocol)
+        == Some(crate::protocol::ids::Protocol::GoogleGemini)
 }
 
 pub(super) fn extract_models_from_response(

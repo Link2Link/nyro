@@ -4,6 +4,8 @@ export interface Provider {
   vendor?: string | null;
   protocol: string;
   base_url: string;
+  protocol_mode?: ProviderProtocolMode;
+  protocol_endpoints?: ProviderProtocolEndpoint[];
   api_key?: string;
   use_proxy: boolean;
   auth_mode?: "apikey" | "oauth";
@@ -15,6 +17,8 @@ export interface Provider {
   channel?: string | null;
   models_source?: string | null;
   static_models?: string | null;
+  last_test_success?: boolean | null;
+  last_test_at?: string | null;
   is_enabled: boolean;
   created_at: string;
   updated_at: string;
@@ -172,6 +176,17 @@ export interface TestResult {
   latency_ms: number;
   model?: string;
   error?: string;
+  endpoints?: EndpointTestResult[];
+}
+
+export interface EndpointTestResult {
+  endpoint_id: string;
+  protocol: string;
+  base_url: string;
+  success: boolean;
+  latency_ms: number;
+  error?: string;
+  tested_at: string;
 }
 
 export interface ModelCapabilities {
@@ -190,6 +205,39 @@ export type ProviderProtocol =
   | "openai-responses"
   | "anthropic-messages"
   | "google-gemini";
+
+export type ProviderProtocolMode = "fixed" | "adaptive";
+
+export type ProviderEndpointProtocol =
+  | "openai-compatible/chat-completions/v1"
+  | "openai-compatible/embeddings/v1"
+  | "openai-responses/responses/v1"
+  | "anthropic-messages/messages/2023-06-01"
+  | "google-gemini/generate-content/v1beta";
+
+export type ProviderEndpointAuthScheme = "auto" | "bearer" | "x-api-key" | "query" | "none";
+
+export interface CreateProviderProtocolEndpoint {
+  protocol: string;
+  base_url: string;
+  api_key: string;
+  auth_scheme?: ProviderEndpointAuthScheme;
+  is_enabled?: boolean;
+  priority?: number;
+}
+
+export interface ProviderProtocolEndpoint extends CreateProviderProtocolEndpoint {
+  id: string;
+  provider_id: string;
+  auth_scheme: ProviderEndpointAuthScheme;
+  is_enabled: boolean;
+  priority: number;
+  test_status: "untested" | "success" | "failed" | string;
+  test_error?: string | null;
+  tested_at?: string | null;
+  created_at: string;
+  updated_at: string;
+}
 
 export interface ProviderChannelPreset {
   id: string;
@@ -221,6 +269,8 @@ export interface CreateProvider {
   vendor?: string;
   protocol: string;
   base_url: string;
+  protocol_mode?: ProviderProtocolMode;
+  protocol_endpoints?: CreateProviderProtocolEndpoint[];
   use_proxy?: boolean;
   auth_mode?: "apikey" | "oauth";
   preset_key?: string;
@@ -235,6 +285,8 @@ export interface UpdateProvider {
   vendor?: string;
   protocol?: string;
   base_url?: string;
+  protocol_mode?: ProviderProtocolMode;
+  protocol_endpoints?: CreateProviderProtocolEndpoint[];
   use_proxy?: boolean;
   auth_mode?: "apikey" | "oauth";
   preset_key?: string;

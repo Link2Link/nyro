@@ -14,6 +14,7 @@ CREATE TABLE IF NOT EXISTS providers (
     vendor TEXT,
     protocol TEXT NOT NULL,
     base_url TEXT NOT NULL,
+    protocol_mode TEXT NOT NULL DEFAULT 'fixed',
     preset_key TEXT,
     channel TEXT,
     models_source TEXT,
@@ -31,6 +32,26 @@ CREATE TABLE IF NOT EXISTS providers (
     created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
 );
+
+CREATE TABLE IF NOT EXISTS provider_protocol_endpoints (
+    id TEXT PRIMARY KEY,
+    provider_id TEXT NOT NULL REFERENCES providers(id) ON DELETE CASCADE,
+    protocol TEXT NOT NULL,
+    base_url TEXT NOT NULL,
+    api_key TEXT NOT NULL,
+    auth_scheme TEXT NOT NULL DEFAULT 'auto',
+    is_enabled BOOLEAN NOT NULL DEFAULT TRUE,
+    priority INTEGER NOT NULL DEFAULT 0,
+    test_status TEXT NOT NULL DEFAULT 'untested',
+    test_error TEXT,
+    tested_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(provider_id, protocol)
+);
+
+CREATE INDEX IF NOT EXISTS idx_provider_protocol_endpoints_provider
+    ON provider_protocol_endpoints(provider_id, is_enabled, priority);
 
 -- Final name: models (renamed from routes)
 CREATE TABLE IF NOT EXISTS models (

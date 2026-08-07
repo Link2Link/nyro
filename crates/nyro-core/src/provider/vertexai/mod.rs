@@ -323,6 +323,8 @@ mod tests {
             vendor: Some("vertexai".into()),
             protocol: "openai-compatible".into(),
             base_url: "https://aiplatform.googleapis.com/v1/projects/demo/locations/global/endpoints/openapi".into(),
+            protocol_mode: "fixed".into(),
+            protocol_endpoints: Vec::new(),
             preset_key: None,
             channel: None,
             models_source: None,

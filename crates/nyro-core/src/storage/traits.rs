@@ -17,6 +17,13 @@ pub struct ProviderTestResult {
     pub tested_at: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct ProviderEndpointTestResult {
+    pub success: bool,
+    pub error: Option<String>,
+    pub tested_at: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UsageWindow {
     Minute,
@@ -62,6 +69,11 @@ pub trait ProviderStore: Send + Sync {
         &self,
         provider_id: &str,
         result: ProviderTestResult,
+    ) -> anyhow::Result<()>;
+    async fn record_endpoint_test_result(
+        &self,
+        endpoint_id: &str,
+        result: ProviderEndpointTestResult,
     ) -> anyhow::Result<()>;
 }
 

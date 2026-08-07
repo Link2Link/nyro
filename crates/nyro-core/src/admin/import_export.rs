@@ -1,42 +1,31 @@
 use super::*;
 
 pub(super) fn import_provider_protocol(provider: &ExportProvider) -> String {
-    if provider.default_protocol.trim().is_empty() {
+    let configured = if provider.default_protocol.trim().is_empty() {
         provider.protocol.clone()
     } else {
         provider.default_protocol.clone()
-    }
+    };
+    crate::db::models::normalize_legacy_provider_protocol_config(
+        &provider.protocol_endpoints,
+        &configured,
+        &provider.api_key,
+    )
+    .map(|legacy| legacy.default_protocol)
+    .unwrap_or(configured)
 }
 
 pub(super) fn import_provider_base_url(provider: &ExportProvider) -> String {
     if !provider.base_url.trim().is_empty() {
         return provider.base_url.clone();
     }
-    base_url_from_protocol_endpoints(
+    crate::db::models::normalize_legacy_provider_protocol_config(
         &provider.protocol_endpoints,
         &import_provider_protocol(provider),
+        &provider.api_key,
     )
+    .and_then(|legacy| legacy.default_base_url().map(ToString::to_string))
     .unwrap_or_default()
-}
-
-pub(super) fn base_url_from_protocol_endpoints(raw: &str, protocol: &str) -> Option<String> {
-    let reg = crate::protocol::registry::ProtocolRegistry::global();
-    let target = reg.parse_protocol(protocol)?;
-    let value = serde_json::from_str::<serde_json::Value>(raw.trim()).ok()?;
-    let obj = value.as_object()?;
-    obj.iter().find_map(|(key, entry)| {
-        let entry_protocol = reg.parse_protocol(key)?;
-        if entry_protocol != target {
-            return None;
-        }
-        entry
-            .as_object()
-            .and_then(|object| object.get("base_url"))
-            .and_then(|value| value.as_str())
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(ToString::to_string)
-    })
 }
 
 impl AdminService {
@@ -48,24 +37,40 @@ impl AdminService {
         let settings = self.gw.storage.settings().list_all().await?;
 
         Ok(ExportData {
-            version: 1,
+            version: 2,
             providers: providers
                 .into_iter()
-                .map(|p| ExportProvider {
-                    name: p.name,
-                    vendor: p.vendor,
-                    protocol: p.protocol,
-                    base_url: p.base_url,
-                    default_protocol: String::new(),
-                    protocol_endpoints: String::new(),
-                    preset_key: p.preset_key,
-                    channel: p.channel,
-                    models_source: p.models_source,
-                    static_models: p.static_models,
-                    api_key: p.api_key,
-                    auth_mode: p.auth_mode,
-                    use_proxy: p.use_proxy,
-                    is_enabled: p.is_enabled,
+                .map(|p| {
+                    let endpoints = p
+                        .protocol_endpoints
+                        .iter()
+                        .map(|endpoint| CreateProviderProtocolEndpoint {
+                            protocol: endpoint.protocol.clone(),
+                            base_url: endpoint.base_url.clone(),
+                            api_key: endpoint.api_key.clone(),
+                            auth_scheme: endpoint.auth_scheme.clone(),
+                            is_enabled: endpoint.is_enabled,
+                            priority: endpoint.priority,
+                        })
+                        .collect();
+                    ExportProvider {
+                        name: p.name,
+                        vendor: p.vendor,
+                        protocol: p.protocol,
+                        base_url: p.base_url,
+                        protocol_mode: p.protocol_mode,
+                        endpoints,
+                        default_protocol: String::new(),
+                        protocol_endpoints: String::new(),
+                        preset_key: p.preset_key,
+                        channel: p.channel,
+                        models_source: p.models_source,
+                        static_models: p.static_models,
+                        api_key: p.api_key,
+                        auth_mode: p.auth_mode,
+                        use_proxy: p.use_proxy,
+                        is_enabled: p.is_enabled,
+                    }
                 })
                 .collect(),
             models: models
@@ -96,6 +101,33 @@ impl AdminService {
                 .await
                 .unwrap_or(false);
 
+            let legacy = if p.endpoints.is_empty() {
+                crate::db::models::normalize_legacy_provider_protocol_config(
+                    &p.protocol_endpoints,
+                    &import_provider_protocol(p),
+                    &p.api_key,
+                )
+            } else {
+                None
+            };
+            let protocol_mode = if p.protocol_mode.trim() == PROVIDER_PROTOCOL_MODE_ADAPTIVE
+                || legacy.as_ref().is_some_and(|config| config.adaptive)
+            {
+                PROVIDER_PROTOCOL_MODE_ADAPTIVE.to_string()
+            } else {
+                PROVIDER_PROTOCOL_MODE_FIXED.to_string()
+            };
+            let protocol_endpoints = if !p.endpoints.is_empty() {
+                p.endpoints.clone()
+            } else if protocol_mode == PROVIDER_PROTOCOL_MODE_ADAPTIVE {
+                legacy
+                    .as_ref()
+                    .map(|config| config.endpoints.clone())
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+
             if !exists
                 && self
                     .create_provider(CreateProvider {
@@ -103,6 +135,8 @@ impl AdminService {
                         vendor: p.vendor.clone(),
                         protocol: import_provider_protocol(p),
                         base_url: import_provider_base_url(p),
+                        protocol_mode,
+                        protocol_endpoints,
                         preset_key: p.preset_key.clone(),
                         channel: p.channel.clone(),
                         models_source: p.models_source.clone(),

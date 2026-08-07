@@ -12,6 +12,8 @@ import type {
   ProviderPreset,
   ProviderChannelPreset,
   ProviderProtocol,
+  ProviderEndpointAuthScheme,
+  CreateProviderProtocolEndpoint,
   ProviderOAuthStatusData,
 } from "@/lib/types";
 import {
@@ -57,7 +59,7 @@ import {
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
-import { resolveProtocol, PROTOCOL_TABLE } from "@/lib/protocol";
+import { resolveProtocol, PROTOCOL_ENDPOINT_TABLE, PROTOCOL_TABLE } from "@/lib/protocol";
 import { openExternalUrl } from "@/lib/open-external";
 
 function protocolUrl(protocol: string) {
@@ -70,6 +72,8 @@ const emptyCreate: CreateProvider = {
   vendor: undefined,
   protocol: "openai-compatible",
   base_url: "https://api.openai.com/v1",
+  protocol_mode: "fixed",
+  protocol_endpoints: [],
   use_proxy: false,
   auth_mode: "apikey",
   preset_key: "",
@@ -78,6 +82,211 @@ const emptyCreate: CreateProvider = {
   static_models: "",
   api_key: "",
 };
+
+function endpointOption(rawProtocol: string) {
+  const exact = PROTOCOL_ENDPOINT_TABLE.find((option) => option.id === rawProtocol);
+  if (exact) return exact;
+  const suite = resolveProtocol(rawProtocol);
+  return PROTOCOL_ENDPOINT_TABLE.find((option) => resolveProtocol(option.id) === suite)
+    ?? PROTOCOL_ENDPOINT_TABLE[0];
+}
+
+function endpointDisplayName(rawProtocol: string) {
+  return PROTOCOL_ENDPOINT_TABLE.find((option) => option.id === rawProtocol)?.displayName
+    ?? rawProtocol;
+}
+
+function seedAdaptiveEndpoint(
+  protocol: string,
+  baseUrl: string,
+  apiKey: string,
+): CreateProviderProtocolEndpoint {
+  const option = endpointOption(protocol);
+  return {
+    protocol: option.id,
+    base_url: baseUrl || option.defaultBaseUrl,
+    api_key: apiKey,
+    auth_scheme: "auto",
+    is_enabled: true,
+    priority: 0,
+  };
+}
+
+function validateAdaptiveEndpoints(
+  endpoints: CreateProviderProtocolEndpoint[],
+  defaultProtocol: string,
+  isZh: boolean,
+): string | null {
+  const enabled = endpoints.filter((endpoint) => endpoint.is_enabled !== false);
+  if (!enabled.length) {
+    return isZh ? "至少需要一个启用的协议端点" : "At least one enabled protocol endpoint is required";
+  }
+  if (!enabled.some((endpoint) => endpoint.protocol === defaultProtocol)) {
+    return isZh ? "默认协议必须是已启用的端点" : "Default protocol must be an enabled endpoint";
+  }
+  const seen = new Set<string>();
+  for (const endpoint of endpoints) {
+    if (seen.has(endpoint.protocol)) {
+      return isZh ? "协议端点不能重复" : "Protocol endpoints must be unique";
+    }
+    seen.add(endpoint.protocol);
+    const validation = validateProviderEndpoint(endpoint.protocol, endpoint.base_url, isZh);
+    if (validation) return validation;
+    if ((endpoint.auth_scheme ?? "auto") !== "none" && !endpoint.api_key.trim()) {
+      return isZh ? "每个启用认证的端点都需要 API Key" : "Each authenticated endpoint requires an API key";
+    }
+  }
+  return null;
+}
+
+function AdaptiveEndpointEditor({
+  endpoints,
+  defaultProtocol,
+  isZh,
+  onChange,
+}: {
+  endpoints: CreateProviderProtocolEndpoint[];
+  defaultProtocol: string;
+  isZh: boolean;
+  onChange: (endpoints: CreateProviderProtocolEndpoint[], defaultProtocol: string) => void;
+}) {
+  const updateEndpoint = (index: number, patch: Partial<CreateProviderProtocolEndpoint>) => {
+    const current = endpoints[index];
+    const next = endpoints.map((endpoint, endpointIndex) => (
+      endpointIndex === index ? { ...endpoint, ...patch } : endpoint
+    ));
+    let nextDefault = defaultProtocol;
+    if (patch.protocol && current?.protocol === defaultProtocol) {
+      nextDefault = patch.protocol;
+    }
+    if (patch.is_enabled === false && current?.protocol === nextDefault) {
+      nextDefault = next.find((endpoint) => endpoint.is_enabled !== false)?.protocol ?? "";
+    } else if (patch.is_enabled === true && !nextDefault) {
+      nextDefault = current?.protocol ?? "";
+    }
+    onChange(next, nextDefault);
+  };
+  const removeEndpoint = (index: number) => {
+    const next = endpoints.filter((_, endpointIndex) => endpointIndex !== index)
+      .map((endpoint, endpointIndex) => ({ ...endpoint, priority: endpointIndex }));
+    const nextDefault = next.some((endpoint) => endpoint.protocol === defaultProtocol)
+      ? defaultProtocol
+      : (next.find((endpoint) => endpoint.is_enabled !== false)?.protocol ?? next[0]?.protocol ?? "");
+    onChange(next, nextDefault);
+  };
+  const addEndpoint = () => {
+    const used = new Set(endpoints.map((endpoint) => endpoint.protocol));
+    const option = PROTOCOL_ENDPOINT_TABLE.find((candidate) => !used.has(candidate.id));
+    if (!option) return;
+    const next = [
+      ...endpoints,
+      {
+        protocol: option.id,
+        base_url: option.defaultBaseUrl,
+        api_key: "",
+        auth_scheme: "auto" as ProviderEndpointAuthScheme,
+        is_enabled: true,
+        priority: endpoints.length,
+      },
+    ];
+    onChange(next, defaultProtocol || option.id);
+  };
+
+  return (
+    <div className="col-span-2 space-y-3">
+      <div className="space-y-2">
+        <FieldLabel>{isZh ? "默认协议" : "Default Protocol"}</FieldLabel>
+        <Select value={defaultProtocol} onValueChange={(value) => onChange(endpoints, value)}>
+          <SelectTrigger>
+            <SelectValue placeholder={isZh ? "选择默认协议" : "Select default protocol"} />
+          </SelectTrigger>
+          <SelectContent>
+            {endpoints.filter((endpoint) => endpoint.is_enabled !== false).map((endpoint) => (
+              <SelectItem key={endpoint.protocol} value={endpoint.protocol}>
+                {PROTOCOL_ENDPOINT_TABLE.find((option) => option.id === endpoint.protocol)?.displayName ?? endpoint.protocol}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+      </div>
+
+      <div className="divide-y divide-slate-200 border-y border-slate-200">
+        {endpoints.map((endpoint, index) => (
+          <div key={`${endpoint.protocol}-${index}`} className="grid grid-cols-1 gap-3 py-3 md:grid-cols-2 xl:grid-cols-[minmax(12rem,1.2fr)_minmax(14rem,1.5fr)_minmax(10rem,1fr)_9rem_auto_auto] xl:items-end">
+            <div className="space-y-2">
+              <FieldLabel>{isZh ? "协议端点" : "Protocol Endpoint"}</FieldLabel>
+              <Select
+                value={endpoint.protocol}
+                onValueChange={(value) => {
+                  const option = PROTOCOL_ENDPOINT_TABLE.find((candidate) => candidate.id === value);
+                  updateEndpoint(index, {
+                    protocol: value,
+                    base_url: option?.defaultBaseUrl ?? endpoint.base_url,
+                  });
+                }}
+              >
+                <SelectTrigger><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  {PROTOCOL_ENDPOINT_TABLE.map((option) => (
+                    <SelectItem
+                      key={option.id}
+                      value={option.id}
+                      disabled={endpoints.some((item, endpointIndex) => endpointIndex !== index && item.protocol === option.id)}
+                    >
+                      {option.displayName}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
+            <div className="space-y-2">
+              <FieldLabel>Base URL</FieldLabel>
+              <Input value={endpoint.base_url} onChange={(event) => updateEndpoint(index, { base_url: event.target.value })} />
+            </div>
+            <div className="space-y-2">
+              <FieldLabel>API Key</FieldLabel>
+              <Input type="password" value={endpoint.api_key} onChange={(event) => updateEndpoint(index, { api_key: event.target.value })} />
+            </div>
+            <div className="space-y-2">
+              <FieldLabel>{isZh ? "认证" : "Authentication"}</FieldLabel>
+              <Select
+                value={endpoint.auth_scheme ?? "auto"}
+                onValueChange={(value) => updateEndpoint(index, { auth_scheme: value as ProviderEndpointAuthScheme })}
+              >
+                <SelectTrigger><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="auto">Auto</SelectItem>
+                  <SelectItem value="bearer">Bearer</SelectItem>
+                  <SelectItem value="x-api-key">x-api-key</SelectItem>
+                  <SelectItem value="query">Query key</SelectItem>
+                  <SelectItem value="none">None</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+            <div className="flex h-9 items-center justify-between gap-2 lg:justify-center">
+              <span className="text-xs text-slate-600">{isZh ? "启用" : "Enabled"}</span>
+              <Switch checked={endpoint.is_enabled !== false} onCheckedChange={(checked) => updateEndpoint(index, { is_enabled: checked })} />
+            </div>
+            <Button
+              type="button"
+              variant="ghost"
+              size="icon"
+              onClick={() => removeEndpoint(index)}
+              aria-label={isZh ? "删除端点" : "Remove endpoint"}
+              title={isZh ? "删除端点" : "Remove endpoint"}
+            >
+              <Trash2 className="h-4 w-4" />
+            </Button>
+          </div>
+        ))}
+      </div>
+      <Button type="button" variant="outline" size="sm" onClick={addEndpoint} disabled={endpoints.length >= PROTOCOL_ENDPOINT_TABLE.length}>
+        <Plus className="h-4 w-4" />
+        {isZh ? "添加协议端点" : "Add Protocol Endpoint"}
+      </Button>
+    </div>
+  );
+}
 const DEFAULT_PRESET_ID = "nyro";
 const protocolOptions = [
   { label: "OpenAI Compatible", value: "openai-compatible" },
@@ -99,7 +308,10 @@ function validateProviderEndpoint(
     return isZh ? "Base URL 不能为空" : "Base URL is required";
   }
   try {
-    new URL(trimmed);
+    const parsed = new URL(trimmed);
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+      return isZh ? "Base URL 必须使用 http 或 https" : "Base URL must use http or https";
+    }
   } catch {
     return isZh ? `无效的 Base URL: ${baseUrl}` : `Invalid base URL: ${baseUrl}`;
   }
@@ -354,6 +566,7 @@ function loadProviderTestResults(): Record<string, TestResult> {
         latency_ms: Number.isFinite(value.latency_ms) ? value.latency_ms : 0,
         model: typeof value.model === "string" ? value.model : undefined,
         error: typeof value.error === "string" ? value.error : undefined,
+        endpoints: Array.isArray(value.endpoints) ? value.endpoints : undefined,
       };
     }
     return normalized;
@@ -451,6 +664,8 @@ export default function ProvidersPage() {
     vendor: undefined,
     protocol: "",
     base_url: "",
+    protocol_mode: "fixed",
+    protocol_endpoints: [],
     use_proxy: false,
     preset_key: "",
     channel: "",
@@ -484,7 +699,9 @@ export default function ProvidersPage() {
     onSuccess: async (createdProvider: Provider) => {
       qc.invalidateQueries({ queryKey: ["providers"] });
       closeCreateForm();
-      await handleTest(createdProvider);
+      if (createdProvider.protocol_mode !== "adaptive") {
+        await handleTest(createdProvider);
+      }
     },
     onError: (error: unknown) => {
       showErrorDialog("创建提供商失败", "Failed to create provider", error);
@@ -987,6 +1204,7 @@ export default function ProvidersPage() {
       if (isCanceled()) return;
       appendTestLog(level, finalMessage);
       setTestResult((prev) => ({ ...prev, [provider.id]: result }));
+      void qc.invalidateQueries({ queryKey: ["providers"] });
       setIsTestRunning(false);
       setTestingId(null);
     };
@@ -994,13 +1212,36 @@ export default function ProvidersPage() {
     try {
       const protocol = (resolveProtocol(provider.protocol || "openai") ?? "openai-compatible") as ProviderProtocol;
       const baseUrl = provider.base_url?.trim() ?? "";
+      const isAdaptive = provider.protocol_mode === "adaptive";
+      const configuredEndpoints = (provider.protocol_endpoints ?? [])
+        .filter((endpoint) => endpoint.is_enabled !== false);
 
       appendTestLog("info", isZh ? `开始测试 ${provider.name}...` : `Start testing ${provider.name}...`);
       appendTestLog("info", isZh ? "▶ 连通性检测" : "▶ Connectivity check");
-      appendTestLog("info", `→ [${protocol}] ${baseUrl}`);
+      if (isAdaptive) {
+        configuredEndpoints.forEach((endpoint) => {
+          appendTestLog("info", `→ [${endpointDisplayName(endpoint.protocol)}] ${endpoint.base_url}`);
+        });
+      } else {
+        appendTestLog("info", `→ [${protocol}] ${baseUrl}`);
+      }
 
       const connectivity = await backend<TestResult>("test_provider", { id: provider.id });
       if (isCanceled()) return;
+
+      connectivity.endpoints?.forEach((endpoint) => {
+        if (endpoint.success) {
+          appendTestLog(
+            "success",
+            `${isZh ? "✓ 端点可用" : "✓ Endpoint reachable"} [${endpointDisplayName(endpoint.protocol)}] ${endpoint.latency_ms}ms`,
+          );
+        } else {
+          appendTestLog(
+            "error",
+            `${isZh ? "✗ 端点失败" : "✗ Endpoint failed"} [${endpointDisplayName(endpoint.protocol)}]: ${endpoint.error ?? (isZh ? "连接失败" : "Connection failed")}`,
+          );
+        }
+      });
 
       if (!connectivity.success) {
         const reason = connectivity.error ?? (isZh ? "连接失败" : "Connectivity check failed");
@@ -1010,6 +1251,7 @@ export default function ProvidersPage() {
             latency_ms: connectivity.latency_ms ?? 0,
             model: undefined,
             error: reason,
+            endpoints: connectivity.endpoints,
           },
           `${isZh ? "✗ 连通性检测失败" : "✗ Connectivity check failed"}: ${reason}`,
           "error",
@@ -1019,13 +1261,21 @@ export default function ProvidersPage() {
 
       appendTestLog(
         "success",
-        `${isZh ? "✓ 连接成功，响应" : "✓ Connectivity ok, latency"} ${connectivity.latency_ms}ms`,
+        isAdaptive
+          ? `${isZh ? "✓ 所有启用端点可用，总耗时" : "✓ All enabled endpoints reachable, total"} ${connectivity.latency_ms}ms`
+          : `${isZh ? "✓ 连接成功，响应" : "✓ Connectivity ok, latency"} ${connectivity.latency_ms}ms`,
       );
 
       const modelsSource = provider.models_source?.trim();
       if (!modelsSource) {
         finish(
-          { success: true, latency_ms: connectivity.latency_ms, model: undefined, error: undefined },
+          {
+            success: true,
+            latency_ms: connectivity.latency_ms,
+            model: undefined,
+            error: undefined,
+            endpoints: connectivity.endpoints,
+          },
           isZh ? "✓ 未配置模型发现源，测试完成" : "✓ Model discovery source not configured, test finished",
           "success",
         );
@@ -1045,6 +1295,7 @@ export default function ProvidersPage() {
             latency_ms: connectivity.latency_ms,
             model: undefined,
             error: isZh ? "模型列表为空或格式异常" : "Model list is empty or malformed",
+            endpoints: connectivity.endpoints,
           },
           isZh ? "✗ 模型列表为空或格式异常" : "✗ Model list is empty or malformed",
           "error",
@@ -1064,6 +1315,7 @@ export default function ProvidersPage() {
           latency_ms: connectivity.latency_ms,
           model: models[0],
           error: undefined,
+          endpoints: connectivity.endpoints,
         },
         isZh ? "✓ 测试完成" : "✓ Test completed",
         "success",
@@ -1091,12 +1343,22 @@ export default function ProvidersPage() {
     const safeProtocol = presetForEdit
       ? resolvePresetProtocol(presetForEdit, channel, savedProtocol)
       : savedProtocol;
+    const protocolMode = p.protocol_mode === "adaptive" ? "adaptive" : "fixed";
     setEditForm({
       id: p.id,
       name: p.name,
       vendor: p.vendor ?? (p.preset_key || undefined),
-      protocol: safeProtocol,
+      protocol: protocolMode === "adaptive" ? p.protocol : safeProtocol,
       base_url: p.base_url,
+      protocol_mode: protocolMode,
+      protocol_endpoints: (p.protocol_endpoints ?? []).map((endpoint) => ({
+        protocol: endpoint.protocol,
+        base_url: endpoint.base_url,
+        api_key: endpoint.api_key,
+        auth_scheme: endpoint.auth_scheme,
+        is_enabled: endpoint.is_enabled,
+        priority: endpoint.priority,
+      })),
       use_proxy: p.use_proxy,
       preset_key: p.preset_key || DEFAULT_PRESET_ID,
       channel,
@@ -1137,6 +1399,7 @@ export default function ProvidersPage() {
 
   function handlePresetChannelChange(nextChannelId: string) {
     if (!selectedPreset) return;
+    const nextAuthMode = presetChannelAuthMode(selectedPreset, nextChannelId);
     const nextProtocol = resolvePresetProtocol(
       selectedPreset,
       nextChannelId,
@@ -1148,11 +1411,22 @@ export default function ProvidersPage() {
       const baseUrl = isVertexProviderSelection(prev)
         ? (nextBaseUrl || defaultVertexBaseUrl(nextProtocol))
         : nextBaseUrl;
+      if (prev.protocol_mode === "adaptive" && nextAuthMode === "apikey" && !isVertexProviderSelection(prev)) {
+        return {
+          ...prev,
+          channel: nextChannelId,
+          auth_mode: nextAuthMode,
+          models_source: config.modelsSource,
+          static_models: config.staticModels,
+        };
+      }
       return {
         ...prev,
         channel: nextChannelId,
         protocol: nextProtocol,
-        auth_mode: presetChannelAuthMode(selectedPreset, nextChannelId),
+        protocol_mode: "fixed",
+        protocol_endpoints: [],
+        auth_mode: nextAuthMode,
         base_url: baseUrl,
         models_source: config.modelsSource,
         static_models: config.staticModels,
@@ -1197,6 +1471,8 @@ export default function ProvidersPage() {
               preset_key: preset.id,
               channel: nextChannelId,
               protocol: nextProtocol,
+              protocol_mode: "fixed",
+              protocol_endpoints: [],
               base_url: baseUrl,
               models_source: config.modelsSource,
               static_models: config.staticModels,
@@ -1586,7 +1862,44 @@ export default function ProvidersPage() {
                   onChange={(e) => setForm({ ...form, name: e.target.value })}
                 />
               </div>
-              {createResolvedAuthMode !== "oauth" && (
+              {createResolvedAuthMode !== "oauth" && !createUsesVertexServiceAccount && (
+                <div className="space-y-2">
+                  <FieldLabel>{isZh ? "协议模式" : "Protocol Mode"}</FieldLabel>
+                  <ToggleGroup
+                    type="single"
+                    value={form.protocol_mode ?? "fixed"}
+                    onValueChange={(value) => {
+                      if (value !== "fixed" && value !== "adaptive") return;
+                      if (value === "adaptive") {
+                        const endpoint = seedAdaptiveEndpoint(form.protocol, form.base_url, form.api_key);
+                        setForm({
+                          ...form,
+                          protocol_mode: "adaptive",
+                          protocol: endpoint.protocol,
+                          protocol_endpoints: form.protocol_endpoints?.length ? form.protocol_endpoints : [endpoint],
+                        });
+                        return;
+                      }
+                      const selected = form.protocol_endpoints?.find((endpoint) => endpoint.protocol === form.protocol)
+                        ?? form.protocol_endpoints?.[0];
+                      const suite = resolveProtocol(selected?.protocol ?? form.protocol) ?? "openai-compatible";
+                      setForm({
+                        ...form,
+                        protocol_mode: "fixed",
+                        protocol: suite,
+                        base_url: selected?.base_url ?? protocolUrl(suite),
+                        api_key: selected?.api_key ?? form.api_key,
+                        protocol_endpoints: [],
+                      });
+                    }}
+                    className="grid grid-cols-2"
+                  >
+                    <ToggleGroupItem value="fixed">{isZh ? "固定" : "Fixed"}</ToggleGroupItem>
+                    <ToggleGroupItem value="adaptive">{isZh ? "自适应" : "Adaptive"}</ToggleGroupItem>
+                  </ToggleGroup>
+                </div>
+              )}
+              {createResolvedAuthMode !== "oauth" && form.protocol_mode !== "adaptive" && (
                 <div className={createUsesVertexServiceAccount ? "col-span-2 space-y-2" : "space-y-2"}>
                   <FieldLabel
                     info={
@@ -1629,7 +1942,7 @@ export default function ProvidersPage() {
                   )}
                 </div>
               )}
-              {createResolvedAuthMode !== "oauth" && (
+              {createResolvedAuthMode !== "oauth" && form.protocol_mode !== "adaptive" && (
               <div className="space-y-2">
                 <FieldLabel>{isZh ? "协议" : "Protocol"}</FieldLabel>
                 <Select
@@ -1672,7 +1985,7 @@ export default function ProvidersPage() {
                 </Select>
               </div>
               )}
-              {createResolvedAuthMode !== "oauth" && (
+              {createResolvedAuthMode !== "oauth" && form.protocol_mode !== "adaptive" && (
               <div className="space-y-2">
                 <FieldLabel>Base URL</FieldLabel>
                 <Input
@@ -1681,6 +1994,18 @@ export default function ProvidersPage() {
                   onChange={(e) => setForm({ ...form, base_url: e.target.value })}
                 />
               </div>
+              )}
+              {createResolvedAuthMode !== "oauth" && form.protocol_mode === "adaptive" && (
+                <AdaptiveEndpointEditor
+                  endpoints={form.protocol_endpoints ?? []}
+                  defaultProtocol={form.protocol}
+                  isZh={isZh}
+                  onChange={(protocolEndpoints, defaultProtocol) => setForm({
+                    ...form,
+                    protocol: defaultProtocol,
+                    protocol_endpoints: protocolEndpoints,
+                  })}
+                />
               )}
               {createResolvedAuthMode !== "oauth" && (
               <div className="space-y-2">
@@ -1719,8 +2044,15 @@ export default function ProvidersPage() {
                 <Button
                   onClick={() => {
                     const protocol = form.protocol || "openai-compatible";
-                    const baseUrl = toGatewayBaseUrl(form.base_url ?? "");
-                    const validation = validateProviderEndpoint(protocol, baseUrl, isZh);
+                    const adaptive = form.protocol_mode === "adaptive";
+                    const protocolEndpoints = form.protocol_endpoints ?? [];
+                    const defaultEndpoint = protocolEndpoints.find((endpoint) => endpoint.protocol === protocol);
+                    const baseUrl = toGatewayBaseUrl(
+                      adaptive ? (defaultEndpoint?.base_url ?? "") : (form.base_url ?? ""),
+                    );
+                    const validation = adaptive
+                      ? validateAdaptiveEndpoints(protocolEndpoints, protocol, isZh)
+                      : validateProviderEndpoint(protocol, baseUrl, isZh);
                     if (validation) {
                       setErrorDialog({
                         title: isZh ? "创建提供商失败" : "Failed to create provider",
@@ -1732,6 +2064,14 @@ export default function ProvidersPage() {
                       ...form,
                       protocol,
                       base_url: baseUrl,
+                      api_key: adaptive ? (defaultEndpoint?.api_key ?? "") : form.api_key,
+                      protocol_endpoints: adaptive
+                        ? protocolEndpoints.map((endpoint, index) => ({
+                            ...endpoint,
+                            base_url: toGatewayBaseUrl(endpoint.base_url),
+                            priority: index,
+                          }))
+                        : [],
                     };
                     if (createResolvedAuthMode === "oauth") {
                       const sessionId = createOAuthSession?.session_id;
@@ -1745,7 +2085,11 @@ export default function ProvidersPage() {
                     createMut.isPending
                     || createOAuthMut.isPending
                     || !form.name.trim()
-                    || (createResolvedAuthMode === "apikey" && !form.api_key)
+                    || (createResolvedAuthMode === "apikey"
+                      && form.protocol_mode !== "adaptive"
+                      && !form.api_key)
+                    || (form.protocol_mode === "adaptive"
+                      && !(form.protocol_endpoints ?? []).some((endpoint) => endpoint.is_enabled !== false))
                     || (createResolvedAuthMode === "oauth" && !createOAuthReady)
                   }
                 >
@@ -1777,12 +2121,44 @@ export default function ProvidersPage() {
         <div className="grid gap-3">
           {providers.map((p) => {
             const tr = testResult[p.id];
-            const status = tr ? (tr.success ? "success" : "failed") : null;
+            const status = tr
+              ? (tr.success ? "success" : "failed")
+              : p.last_test_success === true
+                ? "success"
+                : p.last_test_success === false
+                  ? "failed"
+                  : null;
             const isEditing = editingId === p.id;
             const editingPresetId = editForm.preset_key || DEFAULT_PRESET_ID;
             const editingPreset =
               providerPresets.find((preset) => preset.id === editingPresetId) ?? providerPresets[0] ?? null;
-            const protocolLabels = [(resolveProtocol(p.protocol || "openai") ?? "openai-compatible") as ProviderProtocol];
+            const adaptiveProvider = p.protocol_mode === "adaptive";
+            const endpointResults = new Map(
+              (tr?.endpoints ?? []).map((endpoint) => [endpoint.endpoint_id, endpoint]),
+            );
+            const protocolBadges = adaptiveProvider
+              ? (p.protocol_endpoints ?? []).map((endpoint) => {
+                  const result = endpointResults.get(endpoint.id);
+                  return {
+                    key: endpoint.id,
+                    protocol: (resolveProtocol(endpoint.protocol) ?? "openai-compatible") as ProviderProtocol,
+                    label: endpointDisplayName(endpoint.protocol),
+                    enabled: endpoint.is_enabled,
+                    testStatus: !endpoint.is_enabled
+                      ? "disabled"
+                      : result
+                        ? (result.success ? "success" : "failed")
+                        : endpoint.test_status,
+                  };
+                })
+              : [{
+                  key: `fixed-${p.protocol}`,
+                  protocol: (resolveProtocol(p.protocol || "openai") ?? "openai-compatible") as ProviderProtocol,
+                  label: PROTOCOL_TABLE.find((item) => item.id === resolveProtocol(p.protocol))?.displayName
+                    ?? p.protocol,
+                  enabled: true,
+                  testStatus: null,
+                }];
             const selectedPreset = providerPresets.find((preset) => preset.id === (p.preset_key || p.vendor || ""));
             const selectedProviderName = selectedPreset
               ? presetLabel(selectedPreset, isZh)
@@ -1898,10 +2274,23 @@ export default function ProvidersPage() {
                             ? (nextBaseUrl || defaultVertexBaseUrl(resolvedProtocol))
                             : nextBaseUrl;
                           setEditError(null);
+                          if (editForm.protocol_mode === "adaptive" && nextAuthMode === "apikey" && !editUsesVertexServiceAccount) {
+                            setEditForm({
+                              ...editForm,
+                              channel: value,
+                              auth_mode: nextAuthMode,
+                              models_source: config.modelsSource,
+                              static_models: config.staticModels,
+                            });
+                            return;
+                          }
                           setEditForm({
                             ...editForm,
                             channel: value,
                             protocol: resolvedProtocol,
+                            protocol_mode: "fixed",
+                            protocol_endpoints: [],
+                            auth_mode: nextAuthMode,
                             base_url: baseUrl,
                             models_source: config.modelsSource,
                             static_models: config.staticModels,
@@ -2112,7 +2501,50 @@ export default function ProvidersPage() {
                         onChange={(e) => setEditForm({ ...editForm, name: e.target.value })}
                       />
                     </div>
-                    {editingResolvedAuthMode !== "oauth" ? (
+                    {editingResolvedAuthMode !== "oauth" && !editUsesVertexServiceAccount ? (
+                      <div className="space-y-2">
+                        <FieldLabel>{isZh ? "协议模式" : "Protocol Mode"}</FieldLabel>
+                        <ToggleGroup
+                          type="single"
+                          value={editForm.protocol_mode ?? "fixed"}
+                          onValueChange={(value) => {
+                            if (value !== "fixed" && value !== "adaptive") return;
+                            if (value === "adaptive") {
+                              const endpoint = seedAdaptiveEndpoint(
+                                editForm.protocol ?? "openai-compatible",
+                                editForm.base_url ?? "",
+                                editForm.api_key ?? "",
+                              );
+                              setEditForm({
+                                ...editForm,
+                                protocol_mode: "adaptive",
+                                protocol: endpoint.protocol,
+                                protocol_endpoints: [endpoint],
+                              });
+                              return;
+                            }
+                            const selected = editForm.protocol_endpoints?.find(
+                              (endpoint) => endpoint.protocol === editForm.protocol,
+                            ) ?? editForm.protocol_endpoints?.[0];
+                            const suite = resolveProtocol(selected?.protocol ?? editForm.protocol)
+                              ?? "openai-compatible";
+                            setEditForm({
+                              ...editForm,
+                              protocol_mode: "fixed",
+                              protocol: suite,
+                              base_url: selected?.base_url ?? protocolUrl(suite),
+                              api_key: selected?.api_key ?? editForm.api_key,
+                              protocol_endpoints: [],
+                            });
+                          }}
+                          className="grid grid-cols-2"
+                        >
+                          <ToggleGroupItem value="fixed">{isZh ? "固定" : "Fixed"}</ToggleGroupItem>
+                          <ToggleGroupItem value="adaptive">{isZh ? "自适应" : "Adaptive"}</ToggleGroupItem>
+                        </ToggleGroup>
+                      </div>
+                    ) : null}
+                    {editingResolvedAuthMode !== "oauth" && editForm.protocol_mode !== "adaptive" ? (
                       <div className={editUsesVertexServiceAccount ? "col-span-2 space-y-2" : "space-y-2"}>
                         <FieldLabel
                           info={
@@ -2155,7 +2587,7 @@ export default function ProvidersPage() {
                         )}
                       </div>
                     ) : null}
-                    {editingResolvedAuthMode !== "oauth" ? (
+                    {editingResolvedAuthMode !== "oauth" && editForm.protocol_mode !== "adaptive" ? (
                     <div className="space-y-2">
                       <FieldLabel>{isZh ? "协议" : "Protocol"}</FieldLabel>
                       <Select
@@ -2198,7 +2630,7 @@ export default function ProvidersPage() {
                       </Select>
                     </div>
                     ) : null}
-                    {editingResolvedAuthMode !== "oauth" ? (
+                    {editingResolvedAuthMode !== "oauth" && editForm.protocol_mode !== "adaptive" ? (
                     <div className="space-y-2">
                       <FieldLabel>Base URL</FieldLabel>
                       <Input
@@ -2207,6 +2639,18 @@ export default function ProvidersPage() {
                         onChange={(e) => setEditForm({ ...editForm, base_url: e.target.value })}
                       />
                     </div>
+                    ) : null}
+                    {editingResolvedAuthMode !== "oauth" && editForm.protocol_mode === "adaptive" ? (
+                      <AdaptiveEndpointEditor
+                        endpoints={editForm.protocol_endpoints ?? []}
+                        defaultProtocol={editForm.protocol ?? ""}
+                        isZh={isZh}
+                        onChange={(protocolEndpoints, defaultProtocol) => setEditForm({
+                          ...editForm,
+                          protocol: defaultProtocol,
+                          protocol_endpoints: protocolEndpoints,
+                        })}
+                      />
                     ) : null}
                     {editingResolvedAuthMode !== "oauth" ? (
                     <div className="space-y-2">
@@ -2246,8 +2690,17 @@ export default function ProvidersPage() {
                       onClick={() => {
                         setEditError(null);
                         const protocol = editForm.protocol || "openai-compatible";
-                        const baseUrl = toGatewayBaseUrl(editForm.base_url ?? "");
-                        const validation = validateProviderEndpoint(protocol, baseUrl, isZh);
+                        const adaptive = editForm.protocol_mode === "adaptive";
+                        const protocolEndpoints = editForm.protocol_endpoints ?? [];
+                        const defaultEndpoint = protocolEndpoints.find(
+                          (endpoint) => endpoint.protocol === protocol,
+                        );
+                        const baseUrl = toGatewayBaseUrl(
+                          adaptive ? (defaultEndpoint?.base_url ?? "") : (editForm.base_url ?? ""),
+                        );
+                        const validation = adaptive
+                          ? validateAdaptiveEndpoints(protocolEndpoints, protocol, isZh)
+                          : validateProviderEndpoint(protocol, baseUrl, isZh);
                         if (validation) {
                           setEditError(validation);
                           return;
@@ -2257,16 +2710,31 @@ export default function ProvidersPage() {
                           vendor: editForm.vendor || undefined,
                           protocol,
                           base_url: baseUrl,
+                          protocol_mode: adaptive ? "adaptive" : "fixed",
+                          protocol_endpoints: adaptive
+                            ? protocolEndpoints.map((endpoint, index) => ({
+                                ...endpoint,
+                                base_url: toGatewayBaseUrl(endpoint.base_url),
+                                priority: endpoint.priority === 0 ? index : endpoint.priority,
+                              }))
+                            : [],
                           use_proxy: Boolean(editForm.use_proxy),
                           preset_key: editForm.preset_key || undefined,
                           channel: editForm.channel || undefined,
                           models_source: editForm.models_source ?? "",
                           static_models: editForm.static_models || undefined,
-                          api_key: editForm.api_key || undefined,
+                          api_key: adaptive ? (defaultEndpoint?.api_key ?? "") : (editForm.api_key || undefined),
                         };
                         updateMut.mutate({ id: editForm.id, ...input });
                       }}
-                      disabled={updateMut.isPending || editRequiresNewOAuthProvider || reconnectOAuthMut.isPending || logoutOAuthMut.isPending}
+                      disabled={
+                        updateMut.isPending
+                        || editRequiresNewOAuthProvider
+                        || reconnectOAuthMut.isPending
+                        || logoutOAuthMut.isPending
+                        || (editForm.protocol_mode === "adaptive"
+                          && !(editForm.protocol_endpoints ?? []).some((endpoint) => endpoint.is_enabled !== false))
+                      }
                     >
                       {updateMut.isPending ? (isZh ? "保存中..." : "Saving...") : (isZh ? "保存" : "Save")}
                     </Button>
@@ -2311,19 +2779,34 @@ export default function ProvidersPage() {
                         <code className="inline-flex h-5 items-center rounded bg-slate-100 px-2 py-0.5 text-[10px] leading-none font-medium text-slate-600">
                           {selectedProviderName}
                         </code>
-                        {protocolLabels.map((protocol) => (
+                        {adaptiveProvider && (
+                          <Badge variant="secondary" className="connect-label-badge bg-sky-50 text-sky-700">
+                            {isZh ? "自适应" : "Adaptive"}
+                          </Badge>
+                        )}
+                        {protocolBadges.map((item) => (
                           <Badge
-                            key={`${p.id}-${protocol}`}
+                            key={`${p.id}-${item.key}`}
                             variant={
-                              protocol === "anthropic-messages"
+                              !item.enabled
+                                ? "secondary"
+                                : item.protocol === "anthropic-messages"
                                 ? "warning"
-                                : protocol === "google-gemini"
+                                : item.protocol === "google-gemini"
                                   ? "secondary"
                                   : "success"
                             }
-                            className={`connect-label-badge ${protocol === "google-gemini" ? "bg-violet-50 text-violet-700" : ""}`}
+                            className={`connect-label-badge gap-1 ${item.protocol === "google-gemini" ? "bg-violet-50 text-violet-700" : ""} ${!item.enabled ? "opacity-60" : ""}`}
+                            title={!item.enabled ? (isZh ? "端点已禁用" : "Endpoint disabled") : undefined}
                           >
-                            {PROTOCOL_TABLE.find((pt) => pt.id === protocol)?.displayName ?? protocol}
+                            <span>{item.label}</span>
+                            {item.testStatus === "success" ? (
+                              <CheckCircle className="h-3 w-3" aria-label={isZh ? "端点测试成功" : "Endpoint test passed"} />
+                            ) : item.testStatus === "failed" ? (
+                              <XCircle className="h-3 w-3" aria-label={isZh ? "端点测试失败" : "Endpoint test failed"} />
+                            ) : item.testStatus === "disabled" ? (
+                              <ToggleLeft className="h-3 w-3" aria-label={isZh ? "端点已禁用" : "Endpoint disabled"} />
+                            ) : null}
                           </Badge>
                         ))}
                         {isGlobalProxyEnabled && p.use_proxy && (

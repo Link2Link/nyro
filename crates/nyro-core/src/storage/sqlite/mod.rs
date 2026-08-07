@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::Context;
@@ -9,15 +10,17 @@ use crate::config::GatewayConfig;
 use crate::db;
 use crate::db::models::{
     ApiKey, ApiKeyStats, ApiKeyWithBindings, CreateApiKey, CreateModel, CreateModelBackend,
-    CreateProvider, LogPage, LogQuery, Model, ModelBackend, ModelStats, OAuthCredential, Provider,
-    ProviderStats, RequestLog, StatsHourly, StatsOverview, UpdateApiKey, UpdateModel,
-    UpdateProvider, UpsertOAuthCredential, is_valid_provider_auth_mode,
+    CreateProvider, CreateProviderProtocolEndpoint, LogPage, LogQuery, Model, ModelBackend,
+    ModelStats, OAuthCredential, Provider, ProviderProtocolEndpoint, ProviderStats, RequestLog,
+    StatsHourly, StatsOverview, UpdateApiKey, UpdateModel, UpdateProvider, UpsertOAuthCredential,
+    is_valid_provider_auth_mode,
 };
 use crate::logging::LogEntry;
 use crate::storage::traits::{
     ApiKeyAccessRecord, ApiKeyStore, AuthAccessStore, LogStore, ModelBackendStore,
-    ModelSnapshotStore, ModelStore, OAuthCredentialStore, ProviderStore, ProviderTestResult,
-    SettingsStore, Storage, StorageBackend, StorageBootstrap, StorageHealth, UsageWindow,
+    ModelSnapshotStore, ModelStore, OAuthCredentialStore, ProviderEndpointTestResult,
+    ProviderStore, ProviderTestResult, SettingsStore, Storage, StorageBackend, StorageBootstrap,
+    StorageHealth, UsageWindow,
 };
 
 #[derive(Clone)]
@@ -297,40 +300,96 @@ struct SqliteProviderStore {
     pool: SqlitePool,
 }
 
+impl SqliteProviderStore {
+    async fn load_endpoints(
+        &self,
+        provider_id: Option<&str>,
+    ) -> anyhow::Result<Vec<ProviderProtocolEndpoint>> {
+        let base = "SELECT id, provider_id, protocol, base_url, api_key, COALESCE(auth_scheme, 'auto') AS auth_scheme, COALESCE(is_enabled, 1) AS is_enabled, COALESCE(priority, 0) AS priority, COALESCE(test_status, 'untested') AS test_status, test_error, tested_at, created_at, updated_at FROM provider_protocol_endpoints";
+        let endpoints = if let Some(provider_id) = provider_id {
+            sqlx::query_as::<_, ProviderProtocolEndpoint>(&format!(
+                "{base} WHERE provider_id = ? ORDER BY priority, created_at, id"
+            ))
+            .bind(provider_id)
+            .fetch_all(&self.pool)
+            .await?
+        } else {
+            sqlx::query_as::<_, ProviderProtocolEndpoint>(&format!(
+                "{base} ORDER BY provider_id, priority, created_at, id"
+            ))
+            .fetch_all(&self.pool)
+            .await?
+        };
+        Ok(endpoints)
+    }
+}
+
+fn endpoint_inputs_or_legacy(input: &CreateProvider) -> Vec<CreateProviderProtocolEndpoint> {
+    if !input.protocol_endpoints.is_empty() {
+        return input.protocol_endpoints.clone();
+    }
+    vec![CreateProviderProtocolEndpoint {
+        protocol: input.protocol.clone(),
+        base_url: input.base_url.clone(),
+        api_key: input.api_key.clone(),
+        auth_scheme: "auto".to_string(),
+        is_enabled: true,
+        priority: 0,
+    }]
+}
+
 #[async_trait]
 impl ProviderStore for SqliteProviderStore {
     async fn list(&self) -> anyhow::Result<Vec<Provider>> {
-        Ok(sqlx::query_as::<_, Provider>(
-            "SELECT id, name, vendor, protocol, base_url, preset_key, channel, models_source, static_models, api_key, COALESCE(auth_mode, 'apikey') AS auth_mode, COALESCE(use_proxy, 0) AS use_proxy, last_test_success, last_test_at, COALESCE(is_enabled, 1) AS is_enabled, created_at, updated_at FROM providers ORDER BY created_at DESC",
+        let mut providers = sqlx::query_as::<_, Provider>(
+            "SELECT id, name, vendor, protocol, base_url, COALESCE(protocol_mode, 'fixed') AS protocol_mode, preset_key, channel, models_source, static_models, api_key, COALESCE(auth_mode, 'apikey') AS auth_mode, COALESCE(use_proxy, 0) AS use_proxy, last_test_success, last_test_at, COALESCE(is_enabled, 1) AS is_enabled, created_at, updated_at FROM providers ORDER BY created_at DESC",
         )
         .fetch_all(&self.pool)
-        .await?)
+        .await?;
+        let mut by_provider: HashMap<String, Vec<ProviderProtocolEndpoint>> = HashMap::new();
+        for endpoint in self.load_endpoints(None).await? {
+            by_provider
+                .entry(endpoint.provider_id.clone())
+                .or_default()
+                .push(endpoint);
+        }
+        for provider in &mut providers {
+            provider.protocol_endpoints = by_provider.remove(&provider.id).unwrap_or_default();
+        }
+        Ok(providers)
     }
 
     async fn get(&self, id: &str) -> anyhow::Result<Option<Provider>> {
-        Ok(sqlx::query_as::<_, Provider>(
-            "SELECT id, name, vendor, protocol, base_url, preset_key, channel, models_source, static_models, api_key, COALESCE(auth_mode, 'apikey') AS auth_mode, COALESCE(use_proxy, 0) AS use_proxy, last_test_success, last_test_at, COALESCE(is_enabled, 1) AS is_enabled, created_at, updated_at FROM providers WHERE id = ?",
+        let mut provider = sqlx::query_as::<_, Provider>(
+            "SELECT id, name, vendor, protocol, base_url, COALESCE(protocol_mode, 'fixed') AS protocol_mode, preset_key, channel, models_source, static_models, api_key, COALESCE(auth_mode, 'apikey') AS auth_mode, COALESCE(use_proxy, 0) AS use_proxy, last_test_success, last_test_at, COALESCE(is_enabled, 1) AS is_enabled, created_at, updated_at FROM providers WHERE id = ?",
         )
         .bind(id)
         .fetch_optional(&self.pool)
-        .await?)
+        .await?;
+        if let Some(provider) = &mut provider {
+            provider.protocol_endpoints = self.load_endpoints(Some(id)).await?;
+        }
+        Ok(provider)
     }
 
     async fn create(&self, input: CreateProvider) -> anyhow::Result<Provider> {
         let id = uuid::Uuid::new_v4().to_string();
         let vendor = normalize_provider_vendor(input.vendor.as_deref());
         let models_source = input.effective_models_source().map(ToString::to_string);
+        let endpoint_inputs = endpoint_inputs_or_legacy(&input);
         if !is_valid_provider_auth_mode(&input.auth_mode) {
             anyhow::bail!("unsupported provider auth_mode: {}", input.auth_mode);
         }
+        let mut tx = self.pool.begin().await?;
         sqlx::query(
-            "INSERT INTO providers (id, name, vendor, protocol, base_url, preset_key, channel, models_source, static_models, api_key, auth_mode, use_proxy) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO providers (id, name, vendor, protocol, base_url, protocol_mode, preset_key, channel, models_source, static_models, api_key, auth_mode, use_proxy) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&id)
         .bind(&input.name)
         .bind(&vendor)
         .bind(&input.protocol)
         .bind(&input.base_url)
+        .bind(&input.protocol_mode)
         .bind(&input.preset_key)
         .bind(&input.channel)
         .bind(&models_source)
@@ -338,8 +397,24 @@ impl ProviderStore for SqliteProviderStore {
         .bind(&input.api_key)
         .bind(&input.auth_mode)
         .bind(input.use_proxy)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        for endpoint in endpoint_inputs {
+            sqlx::query(
+                "INSERT INTO provider_protocol_endpoints (id, provider_id, protocol, base_url, api_key, auth_scheme, is_enabled, priority) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(uuid::Uuid::new_v4().to_string())
+            .bind(&id)
+            .bind(endpoint.protocol.trim())
+            .bind(endpoint.base_url.trim())
+            .bind(endpoint.api_key)
+            .bind(endpoint.auth_scheme.trim())
+            .bind(endpoint.is_enabled)
+            .bind(endpoint.priority)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
         self.get(&id)
             .await?
             .context("provider missing after create")
@@ -350,6 +425,8 @@ impl ProviderStore for SqliteProviderStore {
             .get(id)
             .await?
             .context("provider not found for update")?;
+        let replace_endpoints = input.protocol_endpoints.is_some();
+        let endpoint_inputs = input.protocol_endpoints.clone();
         let models_source_input = input.models_source.map(|value| value.trim().to_string());
         let name = input.name.unwrap_or(current.name);
         let vendor = if input.vendor.is_some() {
@@ -360,6 +437,7 @@ impl ProviderStore for SqliteProviderStore {
         let models_source = models_source_input.or_else(|| current.models_source.clone());
         let protocol = input.protocol.unwrap_or(current.protocol.clone());
         let base_url = input.base_url.unwrap_or(current.base_url);
+        let protocol_mode = input.protocol_mode.unwrap_or(current.protocol_mode);
         let preset_key = input.preset_key.or(current.preset_key);
         let channel = input.channel.or(current.channel);
         let static_models = input.static_models.or(current.static_models);
@@ -371,13 +449,15 @@ impl ProviderStore for SqliteProviderStore {
         let use_proxy = input.use_proxy.unwrap_or(current.use_proxy);
         let is_enabled = input.is_enabled.unwrap_or(current.is_enabled);
 
+        let mut tx = self.pool.begin().await?;
         sqlx::query(
-            "UPDATE providers SET name=?, vendor=?, protocol=?, base_url=?, preset_key=?, channel=?, models_source=?, static_models=?, api_key=?, auth_mode=?, use_proxy=?, is_enabled=?, updated_at=datetime('now') WHERE id=?",
+            "UPDATE providers SET name=?, vendor=?, protocol=?, base_url=?, protocol_mode=?, preset_key=?, channel=?, models_source=?, static_models=?, api_key=?, auth_mode=?, use_proxy=?, is_enabled=?, updated_at=datetime('now') WHERE id=?",
         )
         .bind(name)
         .bind(vendor)
         .bind(&protocol)
-        .bind(base_url)
+        .bind(&base_url)
+        .bind(&protocol_mode)
         .bind(preset_key)
         .bind(channel)
         .bind(&models_source)
@@ -387,8 +467,30 @@ impl ProviderStore for SqliteProviderStore {
         .bind(use_proxy)
         .bind(is_enabled)
         .bind(id)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        if replace_endpoints {
+            sqlx::query("DELETE FROM provider_protocol_endpoints WHERE provider_id = ?")
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+            for endpoint in endpoint_inputs.unwrap_or_default() {
+                sqlx::query(
+                    "INSERT INTO provider_protocol_endpoints (id, provider_id, protocol, base_url, api_key, auth_scheme, is_enabled, priority) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                )
+                .bind(uuid::Uuid::new_v4().to_string())
+                .bind(id)
+                .bind(endpoint.protocol.trim())
+                .bind(endpoint.base_url.trim())
+                .bind(endpoint.api_key)
+                .bind(endpoint.auth_scheme.trim())
+                .bind(endpoint.is_enabled)
+                .bind(endpoint.priority)
+                .execute(&mut *tx)
+                .await?;
+            }
+        }
+        tx.commit().await?;
         self.get(id).await?.context("provider missing after update")
     }
 
@@ -406,6 +508,11 @@ impl ProviderStore for SqliteProviderStore {
         .await?;
 
         sqlx::query("DELETE FROM models WHERE target_provider = ?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+
+        sqlx::query("DELETE FROM provider_protocol_endpoints WHERE provider_id = ?")
             .bind(id)
             .execute(&mut *tx)
             .await?;
@@ -450,6 +557,23 @@ impl ProviderStore for SqliteProviderStore {
         )
         .bind(result.success)
         .bind(provider_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn record_endpoint_test_result(
+        &self,
+        endpoint_id: &str,
+        result: ProviderEndpointTestResult,
+    ) -> anyhow::Result<()> {
+        sqlx::query(
+            "UPDATE provider_protocol_endpoints SET test_status = ?, test_error = ?, tested_at = ?, updated_at = datetime('now') WHERE id = ?",
+        )
+        .bind(if result.success { "success" } else { "failed" })
+        .bind(result.error)
+        .bind(result.tested_at)
+        .bind(endpoint_id)
         .execute(&self.pool)
         .await?;
         Ok(())

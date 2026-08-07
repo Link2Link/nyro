@@ -6,8 +6,8 @@
  *   Endpoint  — specific API path           (e.g. "chat-completions")
  *   Vendor    — provider organisation       (e.g. "openai")
  *
- * UI only surfaces the Protocol display name; endpoints and versions are
- * internal implementation details not shown to users.
+ * Fixed providers surface the Protocol display name. Adaptive providers also
+ * expose exact endpoint identities so each Base URL and credential is explicit.
  *
  * Keep the alias table in sync with the Rust side:
  *   crates/nyro-core/src/protocol/registry.rs::default_protocol_aliases
@@ -132,13 +132,47 @@ export function prettyName(raw: string | null | undefined): string | null {
   return protocolDisplayName(raw);
 }
 
-// ── ProtocolEndpoint (internal, not shown in UI) ───────────────────────────
+// ── ProtocolEndpoint ───────────────────────────────────────────────────────
 
 export interface ProtocolEndpoint {
   protocol: Protocol;
   name: string;
   version: string;
 }
+
+export interface ProtocolEndpointMeta {
+  id: string;
+  displayName: string;
+  defaultBaseUrl: string;
+}
+
+export const PROTOCOL_ENDPOINT_TABLE: ProtocolEndpointMeta[] = [
+  {
+    id: "openai-compatible/chat-completions/v1",
+    displayName: "OpenAI Chat Completions",
+    defaultBaseUrl: "https://api.openai.com/v1",
+  },
+  {
+    id: "openai-compatible/embeddings/v1",
+    displayName: "OpenAI Embeddings",
+    defaultBaseUrl: "https://api.openai.com/v1",
+  },
+  {
+    id: "openai-responses/responses/v1",
+    displayName: "OpenAI Responses",
+    defaultBaseUrl: "https://api.openai.com/v1",
+  },
+  {
+    id: "anthropic-messages/messages/2023-06-01",
+    displayName: "Anthropic Messages",
+    defaultBaseUrl: "https://api.anthropic.com",
+  },
+  {
+    id: "google-gemini/generate-content/v1beta",
+    displayName: "Google Gemini GenerateContent",
+    defaultBaseUrl: "https://generativelanguage.googleapis.com",
+  },
+];
 
 /** Parse a canonical `protocol/name/version` string into a `ProtocolEndpoint`. */
 export function parseProtocolEndpoint(raw: string | null | undefined): ProtocolEndpoint | null {

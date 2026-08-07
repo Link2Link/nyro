@@ -115,13 +115,24 @@ impl SseEvent {
 #[derive(Debug, Clone)]
 pub struct ProviderProtocols {
     pub default: ProtocolEndpoint,
+    pub endpoints: Vec<ProviderProtocolTarget>,
+    pub adaptive: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct ProviderProtocolTarget {
+    pub record_id: Option<String>,
+    pub protocol: ProtocolEndpoint,
     pub base_url: String,
+    pub auth_scheme: String,
 }
 
 #[derive(Debug, Clone)]
 pub struct ResolvedEgress {
     pub protocol: ProtocolEndpoint,
     pub base_url: String,
+    pub endpoint_id: Option<String>,
+    pub auth_scheme: String,
     pub needs_conversion: bool,
 }
 
@@ -139,37 +150,117 @@ impl ProviderProtocols {
 
     /// Build from a provider DB row.
     pub fn from_provider(provider: &Provider) -> Self {
+        let registry = registry::ProtocolRegistry::global();
+        if provider.is_adaptive() {
+            let mut configured = provider
+                .protocol_endpoints
+                .iter()
+                .filter(|endpoint| endpoint.is_enabled)
+                .filter_map(|endpoint| {
+                    let protocol = registry.resolve_alias(&endpoint.protocol)?;
+                    Some((
+                        endpoint.priority,
+                        ProviderProtocolTarget {
+                            record_id: Some(endpoint.id.clone()),
+                            protocol,
+                            base_url: endpoint.base_url.trim().to_string(),
+                            auth_scheme: endpoint.auth_scheme.trim().to_string(),
+                        },
+                    ))
+                })
+                .collect::<Vec<_>>();
+            configured.sort_by(|left, right| {
+                left.0
+                    .cmp(&right.0)
+                    .then_with(|| left.1.protocol.cmp(&right.1.protocol))
+            });
+            let endpoints = configured
+                .into_iter()
+                .map(|(_, endpoint)| endpoint)
+                .collect::<Vec<_>>();
+
+            let declared_default = registry.resolve_alias(provider.protocol.trim());
+            let declared_suite = registry.parse_protocol(provider.protocol.trim());
+            let default = declared_default
+                .filter(|candidate| endpoints.iter().any(|target| target.protocol == *candidate))
+                .or_else(|| {
+                    declared_suite.and_then(|suite| {
+                        endpoints
+                            .iter()
+                            .find(|target| target.protocol.protocol == suite)
+                            .map(|target| target.protocol)
+                    })
+                })
+                .or_else(|| endpoints.first().map(|target| target.protocol))
+                .unwrap_or(OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1);
+
+            return Self {
+                default,
+                endpoints,
+                adaptive: true,
+            };
+        }
+
         let default = Self::parse_protocol_key(provider.protocol.trim())
             .unwrap_or(OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1);
+        let suite = registry
+            .parse_protocol(provider.protocol.trim())
+            .unwrap_or(default.protocol);
+        let endpoints = registry
+            .list_by_protocol(suite)
+            .into_iter()
+            .map(|handler| ProviderProtocolTarget {
+                record_id: None,
+                protocol: handler.id(),
+                base_url: provider.base_url.trim().to_string(),
+                auth_scheme: "auto".to_string(),
+            })
+            .collect();
 
         Self {
             default,
-            base_url: provider.base_url.trim().to_string(),
+            endpoints,
+            adaptive: false,
         }
     }
 
     /// Returns `true` if the provider declares support for `protocol`.
     pub fn supports(&self, protocol: ProtocolEndpoint) -> bool {
-        self.default.protocol == protocol.protocol
+        self.get(protocol).is_some()
     }
 
-    /// Deterministic two-tier egress resolution:
+    pub fn get(&self, protocol: ProtocolEndpoint) -> Option<&ProviderProtocolTarget> {
+        self.endpoints
+            .iter()
+            .find(|endpoint| endpoint.protocol == protocol)
+    }
+
+    /// Deterministic exact-or-default egress resolution:
     ///
-    /// 1. **Same protocol suite** — use the ingress endpoint and provider base URL.
+    /// 1. **Exact endpoint** — use the endpoint configured for the ingress.
     /// 2. **Provider default** — last resort with conversion.
-    pub fn resolve_egress(&self, ingress: ProtocolEndpoint) -> ResolvedEgress {
-        if self.supports(ingress) {
-            return ResolvedEgress {
+    pub fn resolve_egress(&self, ingress: ProtocolEndpoint) -> Option<ResolvedEgress> {
+        if let Some(endpoint) = self.get(ingress) {
+            return Some(ResolvedEgress {
                 protocol: ingress,
-                base_url: self.base_url.clone(),
+                base_url: endpoint.base_url.clone(),
+                endpoint_id: endpoint.record_id.clone(),
+                auth_scheme: endpoint.auth_scheme.clone(),
                 needs_conversion: false,
-            };
+            });
         }
 
-        ResolvedEgress {
-            protocol: self.default,
-            base_url: self.base_url.clone(),
-            needs_conversion: true,
+        if ingress.name == "embeddings" || self.default.name == "embeddings" {
+            return None;
         }
+
+        let endpoint = self.get(self.default)?;
+        Some(ResolvedEgress {
+            protocol: self.default,
+            base_url: endpoint.base_url.clone(),
+            endpoint_id: endpoint.record_id.clone(),
+            auth_scheme: endpoint.auth_scheme.clone(),
+            needs_conversion: true,
+        })
     }
 }

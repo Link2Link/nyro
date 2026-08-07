@@ -99,9 +99,7 @@ impl TryFrom<YamlProviderRaw> for YamlProvider {
                 ));
             }
             (Some(v), None) | (None, Some(v)) => v,
-            (None, None) => {
-                return Err(format!("provider '{}': 'api_key' is required", r.name));
-            }
+            (None, None) => String::new(),
         };
         if r.capabilities_source.is_some() {
             tracing::warn!(
@@ -135,6 +133,22 @@ impl YamlProvider {
 #[derive(Debug, Deserialize)]
 pub struct YamlEndpoint {
     pub base_url: String,
+    #[serde(default)]
+    pub api_key: Option<String>,
+    #[serde(default = "default_endpoint_auth_scheme")]
+    pub auth_scheme: String,
+    #[serde(default = "default_endpoint_enabled")]
+    pub is_enabled: bool,
+    #[serde(default)]
+    pub priority: i32,
+}
+
+fn default_endpoint_auth_scheme() -> String {
+    "auto".to_string()
+}
+
+fn default_endpoint_enabled() -> bool {
+    true
 }
 
 #[derive(Debug, Deserialize)]
@@ -213,9 +227,79 @@ impl YamlConfig {
                     p.name
                 )
             })?;
-            if !p.endpoints.contains_key(resolved) {
+            let adaptive = p.endpoints.len() > 1;
+            let mut canonical_endpoints = std::collections::HashSet::new();
+            let mut enabled_endpoints = std::collections::HashSet::new();
+            for (protocol, endpoint) in &p.endpoints {
+                let canonical = canonical_yaml_endpoint(protocol, adaptive)?;
+                if !canonical_endpoints.insert(canonical.clone()) {
+                    anyhow::bail!(
+                        "providers[{i}] ({}): duplicate protocol endpoint '{}'",
+                        p.name,
+                        protocol
+                    );
+                }
+                if endpoint.is_enabled {
+                    enabled_endpoints.insert(canonical);
+                }
+                let url = endpoint
+                    .base_url
+                    .trim()
+                    .parse::<axum::http::Uri>()
+                    .map_err(|_| {
+                        anyhow::anyhow!(
+                            "providers[{i}] ({}): invalid Base URL '{}'",
+                            p.name,
+                            endpoint.base_url
+                        )
+                    })?;
+                if !matches!(url.scheme_str(), Some("http" | "https")) {
+                    anyhow::bail!(
+                        "providers[{i}] ({}): Base URL must use http or https",
+                        p.name
+                    );
+                }
+                let auth_scheme = endpoint.auth_scheme.trim();
+                if !matches!(
+                    auth_scheme,
+                    "" | "auto" | "bearer" | "x-api-key" | "query" | "none"
+                ) {
+                    anyhow::bail!(
+                        "providers[{i}] ({}): unsupported auth_scheme '{}'",
+                        p.name,
+                        auth_scheme
+                    );
+                }
+                let api_key = endpoint.api_key.as_deref().unwrap_or(&p.api_key).trim();
+                if api_key.is_empty() && auth_scheme != "none" {
+                    anyhow::bail!(
+                        "providers[{i}] ({}): endpoint '{}' requires api_key",
+                        p.name,
+                        protocol
+                    );
+                }
+            }
+            if enabled_endpoints.is_empty() {
                 anyhow::bail!(
-                    "providers[{i}] ({}): protocol '{}' has no matching endpoint in 'endpoints'",
+                    "providers[{i}] ({}): at least one endpoint must be enabled",
+                    p.name
+                );
+            }
+            if adaptive
+                && [p.vendor.as_deref()]
+                    .into_iter()
+                    .flatten()
+                    .any(|vendor| vendor.trim().eq_ignore_ascii_case("vertexai"))
+            {
+                anyhow::bail!(
+                    "providers[{i}] ({}): adaptive protocol mode does not support Vertex AI providers",
+                    p.name
+                );
+            }
+            let resolved_endpoint = canonical_yaml_endpoint(resolved, adaptive)?;
+            if !enabled_endpoints.contains(&resolved_endpoint) {
+                anyhow::bail!(
+                    "providers[{i}] ({}): protocol '{}' has no matching endpoint enabled in 'endpoints'",
                     p.name,
                     resolved
                 );
@@ -257,7 +341,27 @@ impl YamlConfig {
     }
 }
 
-use nyro_core::db::models::{Model, ModelBackend, Provider};
+fn canonical_yaml_endpoint(raw: &str, require_exact: bool) -> anyhow::Result<String> {
+    let registry = nyro_core::protocol::registry::ProtocolRegistry::global();
+    if let Some(endpoint) = registry.resolve_alias(raw) {
+        return Ok(endpoint.to_string());
+    }
+    let protocol = registry
+        .parse_protocol(raw)
+        .ok_or_else(|| anyhow::anyhow!("unsupported protocol endpoint: {raw}"))?;
+    let endpoints = registry.list_by_protocol(protocol);
+    if require_exact && endpoints.len() != 1 {
+        anyhow::bail!(
+            "protocol '{raw}' has multiple endpoints; select a concrete protocol endpoint"
+        );
+    }
+    endpoints
+        .first()
+        .map(|endpoint| endpoint.id().to_string())
+        .ok_or_else(|| anyhow::anyhow!("protocol has no registered endpoint: {raw}"))
+}
+
+use nyro_core::db::models::{Model, ModelBackend, Provider, ProviderProtocolEndpoint};
 
 pub fn build_providers(yaml: &YamlConfig) -> Vec<Provider> {
     use nyro_core::protocol::registry::ProtocolRegistry;
@@ -269,33 +373,64 @@ pub fn build_providers(yaml: &YamlConfig) -> Vec<Provider> {
         .map(|(i, yp)| {
             let id = format!("yaml-provider-{i}");
             let raw_protocol = yp.resolved_protocol().unwrap_or_default().to_string();
-            let resolved_protocol = reg
-                .parse_protocol(&raw_protocol)
-                .map(|protocol| protocol.as_str().to_string())
-                .unwrap_or(raw_protocol);
-            let default_ep = yp
+            let adaptive = yp.endpoints.len() > 1;
+            let resolved_endpoint = canonical_yaml_endpoint(&raw_protocol, adaptive)
+                .expect("validated YAML protocol endpoint");
+            let resolved_protocol = if adaptive {
+                resolved_endpoint.clone()
+            } else {
+                reg.parse_protocol(&raw_protocol)
+                    .map(|protocol| protocol.as_str().to_string())
+                    .unwrap_or_else(|| resolved_endpoint.clone())
+            };
+            let now = chrono::Utc::now().to_rfc3339();
+            let protocol_endpoints = yp
                 .endpoints
                 .iter()
-                .find(|(proto, _)| {
-                    reg.parse_protocol(proto)
-                        .map(|protocol| protocol.as_str().to_string())
-                        .as_deref()
-                        == Some(&resolved_protocol)
+                .enumerate()
+                .map(|(j, (protocol, endpoint))| ProviderProtocolEndpoint {
+                    id: format!("{id}-endpoint-{j}"),
+                    provider_id: id.clone(),
+                    protocol: canonical_yaml_endpoint(protocol, adaptive)
+                        .expect("validated YAML endpoint"),
+                    base_url: endpoint.base_url.trim().trim_end_matches('/').to_string(),
+                    api_key: endpoint
+                        .api_key
+                        .clone()
+                        .unwrap_or_else(|| yp.api_key.clone()),
+                    auth_scheme: endpoint.auth_scheme.clone(),
+                    is_enabled: endpoint.is_enabled,
+                    priority: if endpoint.priority == 0 {
+                        j as i32
+                    } else {
+                        endpoint.priority
+                    },
+                    test_status: "untested".to_string(),
+                    test_error: None,
+                    tested_at: None,
+                    created_at: now.clone(),
+                    updated_at: now.clone(),
                 })
-                .map(|(_, ep)| ep);
-            let base_url = default_ep.map(|e| e.base_url.clone()).unwrap_or_default();
-            let now = chrono::Utc::now().to_rfc3339();
+                .collect::<Vec<_>>();
+            let default_ep = protocol_endpoints
+                .iter()
+                .find(|endpoint| endpoint.protocol == resolved_endpoint)
+                .expect("validated default endpoint");
+            let base_url = default_ep.base_url.clone();
+            let api_key = default_ep.api_key.clone();
             Provider {
                 id,
                 name: yp.name.clone(),
                 vendor: yp.vendor.clone(),
                 protocol: resolved_protocol,
                 base_url,
+                protocol_mode: if adaptive { "adaptive" } else { "fixed" }.to_string(),
+                protocol_endpoints,
                 preset_key: None,
                 channel: None,
                 models_source: yp.models_source.clone(),
                 static_models: yp.static_models.as_ref().map(|v| v.join("\n")),
-                api_key: yp.api_key.clone(),
+                api_key,
                 auth_mode: "apikey".to_string(),
                 use_proxy: yp.use_proxy,
                 last_test_success: None,
@@ -465,16 +600,48 @@ apikey: sk-b
     }
 
     #[test]
-    fn missing_api_key_rejects() {
+    fn missing_api_key_rejects_during_validation() {
         let yaml = r#"
-name: openai
-protocol: openai
-endpoints:
-  openai:
-    base_url: https://api.openai.com/v1
+providers:
+  - name: openai
+    protocol: openai
+    endpoints:
+      openai:
+        base_url: https://api.openai.com/v1
 "#;
-        let err = parse_provider(yaml).expect_err("should reject").to_string();
+        let cfg: YamlConfig = serde_yaml::from_str(yaml).expect("parse");
+        let err = cfg.validate().expect_err("should reject").to_string();
         assert!(err.contains("api_key"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn adaptive_provider_accepts_endpoint_specific_credentials() {
+        let yaml = r#"
+providers:
+  - name: multi-api
+    default_protocol: openai-compatible/chat-completions/v1
+    endpoints:
+      openai-compatible/chat-completions/v1:
+        base_url: https://chat.example/v1
+        api_key: sk-chat
+        auth_scheme: bearer
+      anthropic-messages/messages/2023-06-01:
+        base_url: https://messages.example
+        api_key: sk-anthropic
+        auth_scheme: x-api-key
+"#;
+        let cfg: YamlConfig = serde_yaml::from_str(yaml).expect("parse");
+        cfg.validate().expect("validate");
+
+        let providers = build_providers(&cfg);
+        let provider = &providers[0];
+        assert_eq!(provider.protocol_mode, "adaptive");
+        assert_eq!(provider.protocol, "openai-compatible/chat-completions/v1");
+        assert_eq!(provider.base_url, "https://chat.example/v1");
+        assert_eq!(provider.api_key, "sk-chat");
+        assert_eq!(provider.protocol_endpoints.len(), 2);
+        assert_eq!(provider.protocol_endpoints[0].api_key, "sk-chat");
+        assert_eq!(provider.protocol_endpoints[1].api_key, "sk-anthropic");
     }
 
     #[test]
@@ -556,7 +723,7 @@ models:
     }
 
     #[test]
-    fn build_providers_normalizes_legacy_protocol_keys_to_canonical_suite() {
+    fn build_providers_normalizes_adaptive_default_to_canonical_endpoint() {
         let yaml = r#"
 providers:
   - name: vendor1
@@ -573,8 +740,9 @@ providers:
         let providers = build_providers(&cfg);
         assert_eq!(providers.len(), 1);
         let p = &providers[0];
-        assert_eq!(p.protocol, "openai-compatible");
+        assert_eq!(p.protocol, "openai-compatible/chat-completions/v1");
         assert_eq!(p.base_url, "https://a.example/v1");
+        assert_eq!(p.protocol_mode, "adaptive");
     }
 
     #[test]

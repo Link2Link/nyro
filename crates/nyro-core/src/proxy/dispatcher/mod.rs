@@ -333,10 +333,6 @@ async fn dispatch_pipeline_inner(
 
     let mut last_response: Option<Response> = None;
     for target in ordered_targets {
-        let target_key = format!("{}:{}", target.provider_id, target.model);
-        if !gw.health_registry.is_healthy(&target_key) {
-            continue;
-        }
         let provider = match get_provider(&access_store, &target.provider_id).await {
             Ok(p) => p,
             Err(_) => continue,
@@ -348,17 +344,6 @@ async fn dispatch_pipeline_inner(
         };
 
         let mut request_for_target = request.clone();
-
-        let provider_runtime = match gw.admin().resolve_provider_runtime(&provider).await {
-            Ok(runtime) => runtime,
-            Err(e) => {
-                last_response = Some(error_response(
-                    502,
-                    &format!("provider credential error: {e}"),
-                ));
-                continue;
-            }
-        };
 
         // Resolve egress protocol + base URL via negotiate().
         // The request-scoped `ctx` is threaded end-to-end from the ingress
@@ -373,6 +358,36 @@ async fn dispatch_pipeline_inner(
             }
         };
         let egress = plan.egress;
+        let target_key = format!("{}:{}:{}", target.provider_id, egress, actual_model);
+        if !gw.health_registry.is_healthy(&target_key) {
+            continue;
+        }
+
+        let mut provider_runtime = match gw.admin().resolve_provider_runtime(&provider).await {
+            Ok(runtime) => runtime,
+            Err(e) => {
+                last_response = Some(error_response(
+                    502,
+                    &format!("provider credential error: {e}"),
+                ));
+                continue;
+            }
+        };
+        if let Some(endpoint_id) = plan.endpoint_id.as_deref() {
+            let Some(endpoint) = provider
+                .protocol_endpoints
+                .iter()
+                .find(|endpoint| endpoint.id == endpoint_id && endpoint.is_enabled)
+            else {
+                last_response = Some(error_response(
+                    503,
+                    "adaptive provider endpoint is missing or disabled",
+                ));
+                continue;
+            };
+            provider_runtime.access_token = endpoint.api_key.clone();
+            provider_runtime.binding = crate::auth::types::RuntimeBinding::default();
+        }
         let egress_base_url = if let Some(base_url_override) = provider_runtime
             .binding
             .base_url_override
@@ -434,6 +449,7 @@ async fn dispatch_pipeline_inner(
             protocol: egress,
             egress_base_url: &egress_base_url,
             api_key: &credential,
+            auth_scheme: &plan.auth_scheme,
             actual_model: &actual_model,
             credential: None,
             gw: &gw,

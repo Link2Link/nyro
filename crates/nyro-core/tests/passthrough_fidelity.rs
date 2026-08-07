@@ -51,7 +51,13 @@ async fn build_test_gateway() -> Gateway {
 fn single_decl(proto: ProtocolId, url: &str) -> ProviderProtocols {
     ProviderProtocols {
         default: proto,
-        base_url: url.to_string(),
+        endpoints: vec![nyro_core::protocol::ProviderProtocolTarget {
+            record_id: None,
+            protocol: proto,
+            base_url: url.to_string(),
+            auth_scheme: "auto".to_string(),
+        }],
+        adaptive: true,
     }
 }
 
@@ -116,6 +122,8 @@ fn fake_provider(api_key: &str) -> Provider {
         vendor: Some("test".into()),
         protocol: "openai".into(),
         base_url: "https://upstream.local".into(),
+        protocol_mode: "fixed".into(),
+        protocol_endpoints: Vec::new(),
         preset_key: None,
         channel: Some("default".into()),
         models_source: None,
@@ -314,6 +322,7 @@ async fn passthrough_run_preserves_vendor_specific_fields() {
         protocol: OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1,
         egress_base_url: "https://api.openai.com",
         api_key: &provider.api_key,
+        auth_scheme: "auto",
         actual_model: "gpt-4o",
         credential: None,
         gw: &gw,
@@ -371,6 +380,7 @@ async fn passthrough_run_rewrites_model_to_actual_model() {
         protocol: OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1,
         egress_base_url: "https://api.openai.com",
         api_key: &provider.api_key,
+        auth_scheme: "auto",
         actual_model: "glm-4-flash",
         credential: None,
         gw: &gw,
@@ -400,6 +410,7 @@ async fn passthrough_run_sets_stream_path_for_streaming_body() {
         protocol: OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1,
         egress_base_url: "https://api.openai.com",
         api_key: &provider.api_key,
+        auth_scheme: "auto",
         actual_model: "gpt-4o",
         credential: None,
         gw: &gw,

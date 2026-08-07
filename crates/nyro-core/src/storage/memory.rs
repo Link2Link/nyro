@@ -13,8 +13,8 @@ use crate::logging::LogEntry;
 
 use super::traits::{
     ApiKeyStore, AuthAccessStore, LogStore, ModelBackendStore, ModelSnapshotStore, ModelStore,
-    OAuthCredentialStore, ProviderStore, ProviderTestResult, SettingsStore, Storage,
-    StorageBackend, StorageBootstrap, StorageHealth,
+    OAuthCredentialStore, ProviderEndpointTestResult, ProviderStore, ProviderTestResult,
+    SettingsStore, Storage, StorageBackend, StorageBootstrap, StorageHealth,
 };
 
 use std::sync::Arc;
@@ -121,6 +121,26 @@ impl ProviderStore for MemoryStorage {
         _provider_id: &str,
         _result: ProviderTestResult,
     ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn record_endpoint_test_result(
+        &self,
+        endpoint_id: &str,
+        result: ProviderEndpointTestResult,
+    ) -> anyhow::Result<()> {
+        let mut providers = self.providers.write().await;
+        for endpoint in providers
+            .iter_mut()
+            .flat_map(|provider| provider.protocol_endpoints.iter_mut())
+        {
+            if endpoint.id == endpoint_id {
+                endpoint.test_status = if result.success { "success" } else { "failed" }.into();
+                endpoint.test_error = result.error;
+                endpoint.tested_at = Some(result.tested_at);
+                break;
+            }
+        }
         Ok(())
     }
 }

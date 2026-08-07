@@ -122,6 +122,31 @@ routes:
 
 > 规范名与别名**不能同时出现**（例如同时写 `default_protocol` 和 `protocol`），否则启动时报错。
 
+### 自适应协议与端点级凭据
+
+声明多个端点时会启用自适应模式。每个端点可以使用不同的 Base URL、API Key 和认证方式，Provider 级 `api_key` 仅作为未单独配置时的回退值：
+
+```yaml
+providers:
+  - name: multi-protocol-provider
+    default_protocol: openai-compatible/chat-completions/v1
+    endpoints:
+      openai-compatible/chat-completions/v1:
+        base_url: https://chat.example.com/v1
+        api_key: ${CHAT_API_KEY}
+        auth_scheme: bearer
+      openai-responses/responses/v1:
+        base_url: https://responses.example.com/v1
+        api_key: ${RESPONSES_API_KEY}
+        auth_scheme: bearer
+      anthropic-messages/messages/2023-06-01:
+        base_url: https://messages.example.com
+        api_key: ${ANTHROPIC_API_KEY}
+        auth_scheme: x-api-key
+```
+
+Nyro 不自动发现协议能力：配置的端点就是能力声明。入口请求精确匹配时直接使用对应端点；不匹配时只转换到 `default_protocol`。Embedding 请求必须配置精确的 Embeddings 端点，不会回落到聊天协议。
+
 ---
 
 ## 配置字段说明
@@ -140,15 +165,25 @@ routes:
 | 字段 | 别名 | 必填 | 说明 |
 |------|------|------|------|
 | `name` | — | 是 | Provider 名称，路由中通过此名称引用 |
-| `default_protocol` | `protocol` | 否 | 默认出口协议，必须在 `endpoints` 中有对应条目；省略时自动取 `endpoints` 声明顺序的第一个协议（多 endpoint 时会打印 WARN 日志建议显式设置） |
-| `endpoints` | — | 是 | 协议 → 端点映射，key 为协议名（`openai` / `anthropic` / `gemini`），保留 YAML 声明顺序 |
-| `api_key` | `apikey` | 是 | API 密钥，支持 `${ENV_VAR}` 环境变量引用 |
+| `default_protocol` | `protocol` | 否 | 默认出口协议，必须对应一个已启用端点；省略时取 `endpoints` 声明顺序的第一个协议（多端点时建议显式设置） |
+| `endpoints` | — | 是 | 协议 → 端点映射；多端点模式建议使用完整 `protocol/name/version` ID |
+| `api_key` | `apikey` | 否 | Provider 级回退密钥；端点未配置 `api_key` 时使用，支持 `${ENV_VAR}` |
 | `use_proxy` | — | 否 | 是否使用系统 HTTP 代理（默认 `false`） |
 | `models_source` | — | 否 | 模型发现 URL 或 `ai://models.dev/{vendor}` |
-| `capabilities_source` | — | 否 | 模型能力发现 URL 或 `ai://models.dev/{vendor}` |
+| `capabilities_source` | — | 否 | 已弃用并忽略，仅为旧配置兼容保留 |
 | `static_models` | — | 否 | 静态模型列表，无 API 时的硬编码兜底 |
 
 > 规范名与别名互斥：同一 provider 下同时出现 `default_protocol` + `protocol`，或 `api_key` + `apikey`，启动时直接报错。
+
+### providers[].endpoints.*
+
+| 字段 | 必填 | 说明 |
+|------|------|------|
+| `base_url` | 是 | 端点 Base URL，仅允许 `http` / `https` |
+| `api_key` | 否 | 端点专用密钥；省略时使用 Provider 级 `api_key` |
+| `auth_scheme` | 否 | `auto`（默认）、`bearer`、`x-api-key`、`query` 或 `none` |
+| `is_enabled` | 否 | 是否启用（默认 `true`）；默认协议必须指向启用端点 |
+| `priority` | 否 | 稳定排序值；省略时按声明顺序生成 |
 
 ### routes[]
 
@@ -208,17 +243,20 @@ cache:
 ```yaml
 providers:
   - name: deepseek
-    default_protocol: openai
+    default_protocol: openai-compatible/chat-completions/v1
     endpoints:
-      openai:
+      openai-compatible/chat-completions/v1:
         base_url: https://api.deepseek.com/v1
-      anthropic:
+        api_key: ${DEEPSEEK_API_KEY}
+      anthropic-messages/messages/2023-06-01:
         base_url: https://api.deepseek.com/anthropic
+        api_key: ${DEEPSEEK_API_KEY}
 ```
 
-- OpenAI 客户端请求 → 直接转发到 `openai` 端点
-- Anthropic 客户端请求 → 直接转发到 `anthropic` 端点
-- Gemini 客户端请求 → Provider 不支持，自动转换为 `default_protocol`（`openai`）后转发
+- OpenAI Chat 请求 → 直接转发到 Chat Completions 端点
+- Anthropic Messages 请求 → 直接转发到 Messages 端点
+- Gemini 请求 → 转换为 `default_protocol` 后转发
+- 上游请求发出后不会跨协议重试；后续失败转移仍按模型的 Provider 目标执行
 
 ---
 

@@ -5,8 +5,8 @@
 //! capability matrix (PR-07), it returns a `ProtocolPlan` or a typed error.
 //!
 //! Determinism guarantee: for identical inputs the output is always identical.
-//! Provider declarations now describe a single protocol suite and base URL,
-//! so resolution is deterministic by construction.
+//! Provider declarations preserve endpoint order and resolve exact matches
+//! before falling back to the configured default endpoint.
 
 use crate::db::models::ModelBackend;
 use crate::error::GatewayError;
@@ -28,6 +28,10 @@ pub struct ProtocolPlan {
     /// The base URL for the upstream call (may be overridden by the provider
     /// adapter in PR-13).
     pub base_url: String,
+    /// Normalized provider endpoint row selected for adaptive routing.
+    pub endpoint_id: Option<String>,
+    /// Endpoint-specific authentication strategy.
+    pub auth_scheme: String,
     /// Whether the codec must do a lossy transform (fields will be dropped).
     pub needs_conversion: bool,
 }
@@ -115,6 +119,8 @@ pub fn negotiate(
             egress: ingress,
             mode: ProtocolMode::Native,
             base_url: String::new(),
+            endpoint_id: None,
+            auth_scheme: "auto".to_string(),
             needs_conversion: false,
         };
         ctx.egress_protocol = Some(ingress);
@@ -124,6 +130,9 @@ pub fn negotiate(
     // Tier 1: route-level preference.
     if let Some(pref) = route_pref {
         if decl.supports(pref) {
+            let endpoint = decl
+                .get(pref)
+                .expect("supported provider endpoint must be retrievable");
             let mode = if pref == ingress {
                 ProtocolMode::Native
             } else {
@@ -135,7 +144,9 @@ pub fn negotiate(
                 ingress,
                 egress: pref,
                 mode,
-                base_url: decl.base_url.clone(),
+                base_url: endpoint.base_url.clone(),
+                endpoint_id: endpoint.record_id.clone(),
+                auth_scheme: endpoint.auth_scheme.clone(),
                 needs_conversion: pref != ingress,
             });
         }
@@ -146,7 +157,12 @@ pub fn negotiate(
     }
 
     // Tiers 2–4: delegate to ProviderProtocols::resolve_egress.
-    let resolved = decl.resolve_egress(ingress);
+    let resolved =
+        decl.resolve_egress(ingress)
+            .ok_or_else(|| GatewayError::ProtocolUnsupported {
+                ingress: ingress.to_string(),
+                egress: decl.default.to_string(),
+            })?;
 
     // Check lossy-reject policy from the egress endpoint's capability matrix.
     let egress_caps = resolved.protocol.handler().capabilities();
@@ -188,6 +204,8 @@ pub fn negotiate(
         egress: resolved.protocol,
         mode,
         base_url: resolved.base_url,
+        endpoint_id: resolved.endpoint_id,
+        auth_scheme: resolved.auth_scheme,
         needs_conversion: resolved.needs_conversion,
     })
 }
@@ -206,7 +224,13 @@ mod tests {
     fn make_decl(default: ProtocolId, base_url: &str) -> ProviderProtocols {
         ProviderProtocols {
             default,
-            base_url: base_url.to_string(),
+            endpoints: vec![crate::protocol::ProviderProtocolTarget {
+                record_id: None,
+                protocol: default,
+                base_url: base_url.to_string(),
+                auth_scheme: "auto".to_string(),
+            }],
+            adaptive: true,
         }
     }
 
@@ -237,24 +261,30 @@ mod tests {
     }
 
     #[test]
-    fn native_when_same_protocol_family() {
+    fn embeddings_require_an_exact_endpoint() {
         let decl = make_decl(
             OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1,
             "https://api.openai.com",
         );
         let mut c = ctx();
-        let plan = negotiate(OPENAI_COMPATIBLE_EMBEDDINGS_V1, None, Some(&decl), &mut c).unwrap();
-        assert_eq!(plan.mode, ProtocolMode::Native);
-        assert_eq!(plan.egress, OPENAI_COMPATIBLE_EMBEDDINGS_V1);
-        assert!(!plan.needs_conversion);
+        let error = negotiate(OPENAI_COMPATIBLE_EMBEDDINGS_V1, None, Some(&decl), &mut c)
+            .expect_err("embeddings must not fall back to chat");
+        assert!(matches!(error, GatewayError::ProtocolUnsupported { .. }));
     }
 
     #[test]
     fn route_pref_in_same_protocol_wins_over_ingress_match() {
-        let decl = make_decl(
+        let mut decl = make_decl(
             OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1,
             "https://api.openai.com",
         );
+        decl.endpoints
+            .push(crate::protocol::ProviderProtocolTarget {
+                record_id: Some("embeddings-endpoint".to_string()),
+                protocol: OPENAI_COMPATIBLE_EMBEDDINGS_V1,
+                base_url: "https://embeddings.example/v1".to_string(),
+                auth_scheme: "bearer".to_string(),
+            });
         let mut c = ctx();
         let plan = negotiate(
             OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1,
@@ -264,6 +294,9 @@ mod tests {
         )
         .unwrap();
         assert_eq!(plan.egress, OPENAI_COMPATIBLE_EMBEDDINGS_V1);
+        assert_eq!(plan.base_url, "https://embeddings.example/v1");
+        assert_eq!(plan.endpoint_id.as_deref(), Some("embeddings-endpoint"));
+        assert_eq!(plan.auth_scheme, "bearer");
     }
 
     #[test]

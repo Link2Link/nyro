@@ -38,12 +38,50 @@ async fn migration_collapses_legacy_columns_and_is_idempotent() {
 
     migrate(&pool).await.unwrap();
 
-    let row = sqlx::query("SELECT protocol, base_url FROM providers WHERE id = 'p1'")
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-    assert_eq!(row.get::<String, _>("protocol"), "anthropic-messages");
+    let row =
+        sqlx::query("SELECT protocol, base_url, protocol_mode FROM providers WHERE id = 'p1'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        row.get::<String, _>("protocol"),
+        "anthropic-messages/messages/2023-06-01"
+    );
     assert_eq!(row.get::<String, _>("base_url"), "https://b.example/v1");
+    assert_eq!(row.get::<String, _>("protocol_mode"), "adaptive");
+
+    let endpoints = sqlx::query(
+        "SELECT protocol, base_url, api_key FROM provider_protocol_endpoints \
+         WHERE provider_id = 'p1' ORDER BY priority",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap()
+    .into_iter()
+    .map(|row| {
+        (
+            row.get::<String, _>("protocol"),
+            row.get::<String, _>("base_url"),
+            row.get::<String, _>("api_key"),
+        )
+    })
+    .collect::<Vec<_>>();
+    assert_eq!(endpoints.len(), 3);
+    assert!(endpoints.iter().any(|(protocol, base_url, api_key)| {
+        protocol == "anthropic-messages/messages/2023-06-01"
+            && base_url == "https://b.example/v1"
+            && api_key == "k"
+    }));
+    assert!(endpoints.iter().any(|(protocol, base_url, api_key)| {
+        protocol == "openai-compatible/chat-completions/v1"
+            && base_url == "https://a.example/v1"
+            && api_key == "k"
+    }));
+    assert!(endpoints.iter().any(|(protocol, base_url, api_key)| {
+        protocol == "openai-compatible/embeddings/v1"
+            && base_url == "https://a.example/v1"
+            && api_key == "k"
+    }));
 
     let columns = sqlx::query("PRAGMA table_info(providers)")
         .fetch_all(&pool)
@@ -55,35 +93,35 @@ async fn migration_collapses_legacy_columns_and_is_idempotent() {
     assert!(!columns.iter().any(|name| name == "default_protocol"));
     assert!(!columns.iter().any(|name| name == "protocol_endpoints"));
 
-    let snapshot_before = sqlx::query("SELECT id, protocol, base_url FROM providers ORDER BY id")
-        .fetch_all(&pool)
-        .await
-        .unwrap()
-        .into_iter()
-        .map(|r| {
-            (
-                r.get::<String, _>("id"),
-                r.get::<String, _>("protocol"),
-                r.get::<String, _>("base_url"),
-            )
-        })
-        .collect::<Vec<_>>();
+    let snapshot_before =
+        sqlx::query("SELECT protocol, base_url FROM provider_protocol_endpoints ORDER BY protocol")
+            .fetch_all(&pool)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| {
+                (
+                    r.get::<String, _>("protocol"),
+                    r.get::<String, _>("base_url"),
+                )
+            })
+            .collect::<Vec<_>>();
 
     migrate(&pool).await.unwrap();
 
-    let snapshot_after = sqlx::query("SELECT id, protocol, base_url FROM providers ORDER BY id")
-        .fetch_all(&pool)
-        .await
-        .unwrap()
-        .into_iter()
-        .map(|r| {
-            (
-                r.get::<String, _>("id"),
-                r.get::<String, _>("protocol"),
-                r.get::<String, _>("base_url"),
-            )
-        })
-        .collect::<Vec<_>>();
+    let snapshot_after =
+        sqlx::query("SELECT protocol, base_url FROM provider_protocol_endpoints ORDER BY protocol")
+            .fetch_all(&pool)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| {
+                (
+                    r.get::<String, _>("protocol"),
+                    r.get::<String, _>("base_url"),
+                )
+            })
+            .collect::<Vec<_>>();
 
     assert_eq!(
         snapshot_before, snapshot_after,

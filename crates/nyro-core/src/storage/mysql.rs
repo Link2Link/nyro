@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::Context;
@@ -7,17 +8,19 @@ use std::time::Duration;
 
 use crate::db::models::{
     ApiKey, ApiKeyStats, ApiKeyWithBindings, CreateApiKey, CreateModel, CreateModelBackend,
-    CreateProvider, LogPage, LogQuery, Model, ModelBackend, ModelStats, OAuthCredential, Provider,
-    ProviderStats, RequestLog, StatsHourly, StatsOverview, UpdateApiKey, UpdateModel,
-    UpdateProvider, UpsertOAuthCredential, is_valid_provider_auth_mode,
+    CreateProvider, CreateProviderProtocolEndpoint, LogPage, LogQuery, Model, ModelBackend,
+    ModelStats, OAuthCredential, Provider, ProviderProtocolEndpoint, ProviderStats, RequestLog,
+    StatsHourly, StatsOverview, UpdateApiKey, UpdateModel, UpdateProvider, UpsertOAuthCredential,
+    is_valid_provider_auth_mode,
 };
 use crate::logging::LogEntry;
 use crate::storage::sql::config::SqlBackendConfig;
 use crate::storage::sql::pool::RelationalPool;
 use crate::storage::traits::{
     ApiKeyAccessRecord, ApiKeyStore, AuthAccessStore, LogStore, ModelBackendStore,
-    ModelSnapshotStore, ModelStore, OAuthCredentialStore, ProviderStore, ProviderTestResult,
-    SettingsStore, Storage, StorageBackend, StorageBootstrap, StorageHealth, UsageWindow,
+    ModelSnapshotStore, ModelStore, OAuthCredentialStore, ProviderEndpointTestResult,
+    ProviderStore, ProviderTestResult, SettingsStore, Storage, StorageBackend, StorageBootstrap,
+    StorageHealth, UsageWindow,
 };
 
 #[derive(Clone)]
@@ -303,38 +306,92 @@ struct MysqlProviderStore {
     pool: Pool<MySql>,
 }
 
+impl MysqlProviderStore {
+    async fn load_endpoints(
+        &self,
+        provider_id: Option<&str>,
+    ) -> anyhow::Result<Vec<ProviderProtocolEndpoint>> {
+        let base = "SELECT id, provider_id, protocol, base_url, api_key, COALESCE(auth_scheme, 'auto') AS auth_scheme, COALESCE(is_enabled, 1) AS is_enabled, COALESCE(priority, 0) AS priority, COALESCE(test_status, 'untested') AS test_status, test_error, DATE_FORMAT(tested_at, '%Y-%m-%d %H:%i:%S') AS tested_at, DATE_FORMAT(created_at, '%Y-%m-%d %H:%i:%S') AS created_at, DATE_FORMAT(updated_at, '%Y-%m-%d %H:%i:%S') AS updated_at FROM provider_protocol_endpoints";
+        let endpoints = if let Some(provider_id) = provider_id {
+            sqlx::query_as::<_, ProviderProtocolEndpoint>(&format!(
+                "{base} WHERE provider_id = ? ORDER BY priority, created_at, id"
+            ))
+            .bind(provider_id)
+            .fetch_all(&self.pool)
+            .await?
+        } else {
+            sqlx::query_as::<_, ProviderProtocolEndpoint>(&format!(
+                "{base} ORDER BY provider_id, priority, created_at, id"
+            ))
+            .fetch_all(&self.pool)
+            .await?
+        };
+        Ok(endpoints)
+    }
+}
+
+fn mysql_endpoint_inputs_or_legacy(input: &CreateProvider) -> Vec<CreateProviderProtocolEndpoint> {
+    if !input.protocol_endpoints.is_empty() {
+        return input.protocol_endpoints.clone();
+    }
+    vec![CreateProviderProtocolEndpoint {
+        protocol: input.protocol.clone(),
+        base_url: input.base_url.clone(),
+        api_key: input.api_key.clone(),
+        auth_scheme: "auto".to_string(),
+        is_enabled: true,
+        priority: 0,
+    }]
+}
+
 #[async_trait]
 impl ProviderStore for MysqlProviderStore {
     async fn list(&self) -> anyhow::Result<Vec<Provider>> {
-        Ok(sqlx::query_as::<_, Provider>(&provider_select(None))
+        let mut providers = sqlx::query_as::<_, Provider>(&provider_select(None))
             .fetch_all(&self.pool)
-            .await?)
+            .await?;
+        let mut by_provider: HashMap<String, Vec<ProviderProtocolEndpoint>> = HashMap::new();
+        for endpoint in self.load_endpoints(None).await? {
+            by_provider
+                .entry(endpoint.provider_id.clone())
+                .or_default()
+                .push(endpoint);
+        }
+        for provider in &mut providers {
+            provider.protocol_endpoints = by_provider.remove(&provider.id).unwrap_or_default();
+        }
+        Ok(providers)
     }
 
     async fn get(&self, id: &str) -> anyhow::Result<Option<Provider>> {
-        Ok(
-            sqlx::query_as::<_, Provider>(&provider_select(Some("WHERE id = ?")))
-                .bind(id)
-                .fetch_optional(&self.pool)
-                .await?,
-        )
+        let mut provider = sqlx::query_as::<_, Provider>(&provider_select(Some("WHERE id = ?")))
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?;
+        if let Some(provider) = &mut provider {
+            provider.protocol_endpoints = self.load_endpoints(Some(id)).await?;
+        }
+        Ok(provider)
     }
 
     async fn create(&self, input: CreateProvider) -> anyhow::Result<Provider> {
         let id = uuid::Uuid::new_v4().to_string();
         let vendor = normalize_provider_vendor(input.vendor.as_deref());
         let models_source = input.effective_models_source().map(ToString::to_string);
+        let endpoint_inputs = mysql_endpoint_inputs_or_legacy(&input);
         if !is_valid_provider_auth_mode(&input.auth_mode) {
             anyhow::bail!("unsupported provider auth_mode: {}", input.auth_mode);
         }
+        let mut tx = self.pool.begin().await?;
         sqlx::query(
-            "INSERT INTO providers (id, name, vendor, protocol, base_url, preset_key, channel, models_source, static_models, api_key, auth_mode, use_proxy) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO providers (id, name, vendor, protocol, base_url, protocol_mode, preset_key, channel, models_source, static_models, api_key, auth_mode, use_proxy) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&id)
         .bind(input.name.trim())
         .bind(vendor)
         .bind(input.protocol.trim())
         .bind(input.base_url.trim())
+        .bind(input.protocol_mode.trim())
         .bind(input.preset_key)
         .bind(input.channel)
         .bind(models_source)
@@ -342,8 +399,24 @@ impl ProviderStore for MysqlProviderStore {
         .bind(input.api_key)
         .bind(input.auth_mode)
         .bind(input.use_proxy)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        for endpoint in endpoint_inputs {
+            sqlx::query(
+                "INSERT INTO provider_protocol_endpoints (id, provider_id, protocol, base_url, api_key, auth_scheme, is_enabled, priority) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(uuid::Uuid::new_v4().to_string())
+            .bind(&id)
+            .bind(endpoint.protocol.trim())
+            .bind(endpoint.base_url.trim())
+            .bind(endpoint.api_key)
+            .bind(endpoint.auth_scheme.trim())
+            .bind(endpoint.is_enabled)
+            .bind(endpoint.priority)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
         self.get(&id)
             .await?
             .context("provider missing after create")
@@ -354,6 +427,8 @@ impl ProviderStore for MysqlProviderStore {
             .get(id)
             .await?
             .context("provider not found for update")?;
+        let replace_endpoints = input.protocol_endpoints.is_some();
+        let endpoint_inputs = input.protocol_endpoints.clone();
         let models_source_input = input.models_source.map(|value| value.trim().to_string());
         let name = input.name.unwrap_or(current.name);
         let vendor = if input.vendor.is_some() {
@@ -364,6 +439,7 @@ impl ProviderStore for MysqlProviderStore {
         let models_source = models_source_input.or_else(|| current.models_source.clone());
         let protocol = input.protocol.unwrap_or(current.protocol.clone());
         let base_url = input.base_url.unwrap_or(current.base_url);
+        let protocol_mode = input.protocol_mode.unwrap_or(current.protocol_mode);
         let preset_key = input.preset_key.or(current.preset_key);
         let channel = input.channel.or(current.channel);
         let static_models = input.static_models.or(current.static_models);
@@ -375,13 +451,15 @@ impl ProviderStore for MysqlProviderStore {
         let use_proxy = input.use_proxy.unwrap_or(current.use_proxy);
         let is_enabled = input.is_enabled.unwrap_or(current.is_enabled);
 
+        let mut tx = self.pool.begin().await?;
         sqlx::query(
-            "UPDATE providers SET name=?, vendor=?, protocol=?, base_url=?, preset_key=?, channel=?, models_source=?, static_models=?, api_key=?, auth_mode=?, use_proxy=?, is_enabled=?, updated_at=NOW() WHERE id=?",
+            "UPDATE providers SET name=?, vendor=?, protocol=?, base_url=?, protocol_mode=?, preset_key=?, channel=?, models_source=?, static_models=?, api_key=?, auth_mode=?, use_proxy=?, is_enabled=?, updated_at=NOW() WHERE id=?",
         )
         .bind(name.trim())
         .bind(vendor)
         .bind(protocol.trim())
         .bind(base_url.trim())
+        .bind(protocol_mode.trim())
         .bind(preset_key)
         .bind(channel)
         .bind(models_source)
@@ -391,8 +469,30 @@ impl ProviderStore for MysqlProviderStore {
         .bind(use_proxy)
         .bind(is_enabled)
         .bind(id)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        if replace_endpoints {
+            sqlx::query("DELETE FROM provider_protocol_endpoints WHERE provider_id = ?")
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+            for endpoint in endpoint_inputs.unwrap_or_default() {
+                sqlx::query(
+                    "INSERT INTO provider_protocol_endpoints (id, provider_id, protocol, base_url, api_key, auth_scheme, is_enabled, priority) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                )
+                .bind(uuid::Uuid::new_v4().to_string())
+                .bind(id)
+                .bind(endpoint.protocol.trim())
+                .bind(endpoint.base_url.trim())
+                .bind(endpoint.api_key)
+                .bind(endpoint.auth_scheme.trim())
+                .bind(endpoint.is_enabled)
+                .bind(endpoint.priority)
+                .execute(&mut *tx)
+                .await?;
+            }
+        }
+        tx.commit().await?;
         self.get(id).await?.context("provider missing after update")
     }
 
@@ -410,6 +510,11 @@ impl ProviderStore for MysqlProviderStore {
         .await?;
 
         sqlx::query("DELETE FROM models WHERE target_provider = ?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+
+        sqlx::query("DELETE FROM provider_protocol_endpoints WHERE provider_id = ?")
             .bind(id)
             .execute(&mut *tx)
             .await?;
@@ -454,6 +559,23 @@ impl ProviderStore for MysqlProviderStore {
         )
         .bind(result.success)
         .bind(provider_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn record_endpoint_test_result(
+        &self,
+        endpoint_id: &str,
+        result: ProviderEndpointTestResult,
+    ) -> anyhow::Result<()> {
+        sqlx::query(
+            "UPDATE provider_protocol_endpoints SET test_status = ?, test_error = ?, tested_at = ?, updated_at = NOW() WHERE id = ?",
+        )
+        .bind(if result.success { "success" } else { "failed" })
+        .bind(result.error)
+        .bind(result.tested_at)
+        .bind(endpoint_id)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -1165,6 +1287,13 @@ impl StorageBootstrap for MysqlBootstrap {
             "TINYINT(1) NOT NULL DEFAULT 0",
         )
         .await?;
+        mysql_add_column_if_not_exists(
+            pool,
+            "providers",
+            "protocol_mode",
+            "VARCHAR(32) NOT NULL DEFAULT 'fixed'",
+        )
+        .await?;
 
         // Add auth_mode to providers
         mysql_add_column_if_not_exists(
@@ -1187,6 +1316,17 @@ impl StorageBootstrap for MysqlBootstrap {
 
         // Collapse provider protocol columns (MySQL variant)
         migrate_collapse_provider_protocol_columns_mysql(pool).await?;
+        sqlx::query(
+            "INSERT INTO provider_protocol_endpoints \
+             (id, provider_id, protocol, base_url, api_key, auth_scheme, is_enabled, priority) \
+             SELECT UUID(), p.id, p.protocol, p.base_url, p.api_key, 'auto', 1, 0 \
+             FROM providers p \
+             WHERE NOT EXISTS (\
+                 SELECT 1 FROM provider_protocol_endpoints e WHERE e.provider_id = p.id\
+             )",
+        )
+        .execute(pool)
+        .await?;
 
         // Backfill route_targets
         sqlx::query(
@@ -1443,23 +1583,69 @@ async fn migrate_collapse_provider_protocol_columns_mysql(
     }
 
     if has_protocol_endpoints {
-        let rows: Vec<(String, String, String, Option<String>)> =
-            sqlx::query_as("SELECT id, protocol, base_url, protocol_endpoints FROM providers")
-                .fetch_all(pool)
-                .await?;
-        for (id, protocol, base_url, raw_endpoints) in rows {
-            if !base_url.trim().is_empty() {
+        let rows: Vec<(String, String, String, String, Option<String>)> = sqlx::query_as(
+            "SELECT id, protocol, base_url, api_key, protocol_endpoints FROM providers",
+        )
+        .fetch_all(pool)
+        .await?;
+        for (id, protocol, base_url, api_key, raw_endpoints) in rows {
+            let Some(mut legacy) = crate::db::models::normalize_legacy_provider_protocol_config(
+                raw_endpoints.as_deref().unwrap_or(""),
+                &protocol,
+                &api_key,
+            ) else {
+                continue;
+            };
+            let effective_base_url = if base_url.trim().is_empty() {
+                legacy.default_base_url().unwrap_or_default().to_string()
+            } else {
+                base_url.trim().to_string()
+            };
+
+            if !legacy.adaptive {
+                if base_url.trim().is_empty() && !effective_base_url.is_empty() {
+                    sqlx::query("UPDATE providers SET base_url = ? WHERE id = ?")
+                        .bind(effective_base_url)
+                        .bind(id)
+                        .execute(pool)
+                        .await?;
+                }
                 continue;
             }
-            if let Some(next_base_url) =
-                base_url_from_protocol_endpoints(raw_endpoints.as_deref().unwrap_or(""), &protocol)
+
+            if let Some(default) = legacy
+                .endpoints
+                .iter_mut()
+                .find(|endpoint| endpoint.protocol == legacy.default_protocol)
+                && !effective_base_url.is_empty()
             {
-                sqlx::query("UPDATE providers SET base_url = ? WHERE id = ?")
-                    .bind(next_base_url)
-                    .bind(id)
-                    .execute(pool)
-                    .await?;
+                default.base_url = effective_base_url.clone();
             }
+            for endpoint in legacy.endpoints {
+                sqlx::query(
+                    "INSERT IGNORE INTO provider_protocol_endpoints \
+                     (id, provider_id, protocol, base_url, api_key, auth_scheme, is_enabled, priority) \
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                )
+                .bind(uuid::Uuid::new_v4().to_string())
+                .bind(&id)
+                .bind(endpoint.protocol)
+                .bind(endpoint.base_url)
+                .bind(endpoint.api_key)
+                .bind(endpoint.auth_scheme)
+                .bind(endpoint.is_enabled)
+                .bind(endpoint.priority)
+                .execute(pool)
+                .await?;
+            }
+            sqlx::query(
+                "UPDATE providers SET protocol = ?, base_url = ?, protocol_mode = 'adaptive' WHERE id = ?",
+            )
+            .bind(legacy.default_protocol)
+            .bind(effective_base_url)
+            .bind(id)
+            .execute(pool)
+            .await?;
         }
     }
 
@@ -1477,54 +1663,22 @@ async fn migrate_collapse_provider_protocol_columns_mysql(
     Ok(())
 }
 
-fn base_url_from_protocol_endpoints(raw: &str, protocol: &str) -> Option<String> {
-    let reg = crate::protocol::registry::ProtocolRegistry::global();
-    let target = reg.parse_protocol(protocol)?;
-    let value = serde_json::from_str::<serde_json::Value>(raw.trim()).ok()?;
-    let obj = value.as_object()?;
-    let mut skipped = 0usize;
-    let mut matched = None;
-    for (key, entry) in obj {
-        let Some(entry_protocol) = reg.parse_protocol(key) else {
-            skipped += 1;
-            continue;
-        };
-        if entry_protocol == target {
-            matched = entry
-                .as_object()
-                .and_then(|object| object.get("base_url"))
-                .and_then(|value| value.as_str())
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(ToString::to_string);
-            if matched.is_some() {
-                break;
-            }
-        } else {
-            skipped += 1;
-        }
-    }
-    if skipped > 0 {
-        tracing::warn!(
-            protocol = protocol,
-            skipped_entries = skipped,
-            "dropping non-selected protocol_endpoints entries during provider protocol collapse (mysql)"
-        );
-    }
-    matched
-}
-
 /// MySQL counterpart of provider protocol normalization.
 async fn normalize_provider_protocols_mysql(pool: &Pool<MySql>) -> anyhow::Result<()> {
     use crate::protocol::registry::ProtocolRegistry;
 
     let reg = ProtocolRegistry::global();
-    let rows: Vec<(String, String)> = sqlx::query_as("SELECT id, protocol FROM providers")
-        .fetch_all(pool)
-        .await?;
+    let rows: Vec<(String, String, String)> =
+        sqlx::query_as("SELECT id, protocol, COALESCE(protocol_mode, 'fixed') FROM providers")
+            .fetch_all(pool)
+            .await?;
 
-    for (id, raw_protocol) in rows {
-        let new_protocol = normalize_provider_protocol_value(reg, &raw_protocol);
+    for (id, raw_protocol, protocol_mode) in rows {
+        let new_protocol = normalize_provider_protocol_value(
+            reg,
+            &raw_protocol,
+            protocol_mode.trim() == crate::db::models::PROVIDER_PROTOCOL_MODE_ADAPTIVE,
+        );
         if new_protocol == raw_protocol {
             continue;
         }
@@ -1548,10 +1702,23 @@ async fn normalize_provider_protocols_mysql(pool: &Pool<MySql>) -> anyhow::Resul
 fn normalize_provider_protocol_value(
     reg: &crate::protocol::registry::ProtocolRegistry,
     raw: &str,
+    adaptive: bool,
 ) -> String {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return String::new();
+    }
+    if adaptive {
+        return reg
+            .resolve_alias(trimmed)
+            .map(|endpoint| endpoint.to_string())
+            .unwrap_or_else(|| {
+                tracing::warn!(
+                    value = trimmed,
+                    "leaving unrecognized adaptive provider endpoint unchanged (mysql)"
+                );
+                trimmed.to_string()
+            });
     }
     match reg.parse_protocol(trimmed) {
         Some(protocol) => protocol.as_str().to_string(),
@@ -1571,7 +1738,7 @@ fn normalize_provider_protocol_value(
 
 fn provider_select(suffix: Option<&str>) -> String {
     let mut sql = String::from(
-        "SELECT id, name, vendor, protocol, base_url, preset_key, channel, models_source, static_models, api_key, COALESCE(auth_mode, 'apikey') AS auth_mode, COALESCE(use_proxy, 0) AS use_proxy, last_test_success, DATE_FORMAT(last_test_at, '%Y-%m-%d %H:%i:%S') AS last_test_at, COALESCE(is_enabled, 1) AS is_enabled, DATE_FORMAT(created_at, '%Y-%m-%d %H:%i:%S') AS created_at, DATE_FORMAT(updated_at, '%Y-%m-%d %H:%i:%S') AS updated_at FROM providers",
+        "SELECT id, name, vendor, protocol, base_url, COALESCE(protocol_mode, 'fixed') AS protocol_mode, preset_key, channel, models_source, static_models, api_key, COALESCE(auth_mode, 'apikey') AS auth_mode, COALESCE(use_proxy, 0) AS use_proxy, last_test_success, DATE_FORMAT(last_test_at, '%Y-%m-%d %H:%i:%S') AS last_test_at, COALESCE(is_enabled, 1) AS is_enabled, DATE_FORMAT(created_at, '%Y-%m-%d %H:%i:%S') AS created_at, DATE_FORMAT(updated_at, '%Y-%m-%d %H:%i:%S') AS updated_at FROM providers",
     );
     if let Some(suffix) = suffix {
         sql.push(' ');
@@ -1676,6 +1843,7 @@ CREATE TABLE IF NOT EXISTS providers (
     vendor VARCHAR(255),
     protocol VARCHAR(255) NOT NULL,
     base_url TEXT NOT NULL,
+    protocol_mode VARCHAR(32) NOT NULL DEFAULT 'fixed',
     preset_key VARCHAR(255),
     channel VARCHAR(255),
     models_source TEXT,
@@ -1692,6 +1860,25 @@ CREATE TABLE IF NOT EXISTS providers (
     priority INTEGER DEFAULT 0,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS provider_protocol_endpoints (
+    id VARCHAR(36) PRIMARY KEY,
+    provider_id VARCHAR(36) NOT NULL,
+    protocol VARCHAR(255) NOT NULL,
+    base_url TEXT NOT NULL,
+    api_key TEXT NOT NULL,
+    auth_scheme VARCHAR(32) NOT NULL DEFAULT 'auto',
+    is_enabled TINYINT(1) NOT NULL DEFAULT 1,
+    priority INTEGER NOT NULL DEFAULT 0,
+    test_status VARCHAR(32) NOT NULL DEFAULT 'untested',
+    test_error TEXT,
+    tested_at DATETIME,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    UNIQUE KEY uq_provider_protocol_endpoints_provider_protocol (provider_id, protocol),
+    KEY idx_provider_protocol_endpoints_provider (provider_id, is_enabled, priority),
+    FOREIGN KEY (provider_id) REFERENCES providers(id) ON DELETE CASCADE
 ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
 
 CREATE TABLE IF NOT EXISTS routes (

@@ -443,6 +443,81 @@ async fn storage_health_is_reachable_for_sqlite_gateway() -> anyhow::Result<()> 
 }
 
 #[tokio::test]
+async fn sqlite_provider_endpoints_are_transactional_and_persist_test_status() -> anyhow::Result<()>
+{
+    let gw = build_gateway().await?;
+    let input = CreateProvider {
+        name: "adaptive-storage-provider".to_string(),
+        vendor: None,
+        protocol: "openai-compatible/chat-completions/v1".to_string(),
+        base_url: "https://chat.example/v1".to_string(),
+        protocol_mode: "adaptive".to_string(),
+        protocol_endpoints: vec![
+            CreateProviderProtocolEndpoint {
+                protocol: "openai-compatible/chat-completions/v1".to_string(),
+                base_url: "https://chat.example/v1".to_string(),
+                api_key: "sk-chat".to_string(),
+                auth_scheme: "bearer".to_string(),
+                is_enabled: true,
+                priority: 0,
+            },
+            CreateProviderProtocolEndpoint {
+                protocol: "anthropic-messages/messages/2023-06-01".to_string(),
+                base_url: "https://messages.example".to_string(),
+                api_key: "sk-anthropic".to_string(),
+                auth_scheme: "x-api-key".to_string(),
+                is_enabled: true,
+                priority: 1,
+            },
+        ],
+        preset_key: None,
+        channel: None,
+        models_source: None,
+        static_models: None,
+        api_key: "sk-chat".to_string(),
+        auth_mode: "apikey".to_string(),
+        use_proxy: false,
+    };
+
+    let provider = gw.storage.providers().create(input.clone()).await?;
+    assert_eq!(provider.protocol_endpoints.len(), 2);
+    let endpoint_id = provider.protocol_endpoints[1].id.clone();
+    gw.storage
+        .providers()
+        .record_endpoint_test_result(
+            &endpoint_id,
+            nyro_core::storage::traits::ProviderEndpointTestResult {
+                success: false,
+                error: Some("HTTP 401 Unauthorized".to_string()),
+                tested_at: "2026-08-07T00:00:00Z".to_string(),
+            },
+        )
+        .await?;
+    let provider = gw.storage.providers().get(&provider.id).await?.unwrap();
+    let tested = provider
+        .protocol_endpoints
+        .iter()
+        .find(|endpoint| endpoint.id == endpoint_id)
+        .unwrap();
+    assert_eq!(tested.test_status, "failed");
+    assert_eq!(tested.test_error.as_deref(), Some("HTTP 401 Unauthorized"));
+
+    let mut duplicate = input;
+    duplicate.name = "duplicate-endpoint-provider".to_string();
+    duplicate.protocol_endpoints[1].protocol = "openai-compatible/chat-completions/v1".to_string();
+    assert!(gw.storage.providers().create(duplicate).await.is_err());
+    assert!(
+        !gw.storage
+            .providers()
+            .exists_by_name("duplicate-endpoint-provider", None)
+            .await?,
+        "provider insert must roll back when an endpoint insert fails"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn schema_compatible_is_false_when_migrations_skipped() -> anyhow::Result<()> {
     // Create a SQLite pool on a fresh directory without running any migrations.
     // Gateway::new() would fail at ModelCache load, so test directly at storage level.
@@ -473,6 +548,8 @@ fn oauth_provider_input() -> CreateProvider {
         vendor: Some("openai".to_string()),
         protocol: "openai".to_string(),
         base_url: CODEX_RUNTIME_URL.to_string(),
+        protocol_mode: "fixed".to_string(),
+        protocol_endpoints: Vec::new(),
         preset_key: Some("openai".to_string()),
         channel: Some("codex".to_string()),
         models_source: None,
@@ -489,6 +566,8 @@ fn api_key_provider_input(name: &str) -> CreateProvider {
         vendor: Some("openai".to_string()),
         protocol: "openai-compatible".to_string(),
         base_url: "https://api.openai.com/v1".to_string(),
+        protocol_mode: "fixed".to_string(),
+        protocol_endpoints: Vec::new(),
         preset_key: Some("openai".to_string()),
         channel: Some("default".to_string()),
         models_source: Some("https://api.openai.com/v1/models".to_string()),

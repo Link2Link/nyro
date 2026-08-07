@@ -14,6 +14,7 @@ CREATE TABLE IF NOT EXISTS providers (
     vendor VARCHAR(255),
     protocol VARCHAR(255) NOT NULL,
     base_url TEXT NOT NULL,
+    protocol_mode VARCHAR(32) NOT NULL DEFAULT 'fixed',
     preset_key VARCHAR(255),
     channel VARCHAR(255),
     models_source TEXT,
@@ -30,6 +31,25 @@ CREATE TABLE IF NOT EXISTS providers (
     priority INTEGER DEFAULT 0,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS provider_protocol_endpoints (
+    id VARCHAR(36) PRIMARY KEY,
+    provider_id VARCHAR(36) NOT NULL,
+    protocol VARCHAR(255) NOT NULL,
+    base_url TEXT NOT NULL,
+    api_key TEXT NOT NULL,
+    auth_scheme VARCHAR(32) NOT NULL DEFAULT 'auto',
+    is_enabled TINYINT(1) NOT NULL DEFAULT 1,
+    priority INTEGER NOT NULL DEFAULT 0,
+    test_status VARCHAR(32) NOT NULL DEFAULT 'untested',
+    test_error TEXT,
+    tested_at DATETIME,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    UNIQUE KEY uq_provider_protocol_endpoints_provider_protocol (provider_id, protocol),
+    KEY idx_provider_protocol_endpoints_provider (provider_id, is_enabled, priority),
+    FOREIGN KEY (provider_id) REFERENCES providers(id) ON DELETE CASCADE
 ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
 
 -- Final name: models (renamed from routes)

@@ -6,8 +6,8 @@ Nyro supports three storage backends — **SQLite** (default), **PostgreSQL**, a
 
 ```
 providers ──1:N── model_backends ──N:1── models
-    │                                    │
-    └──1:1── provider_oauth_credentials  └──M:N── api_keys (via api_key_models)
+    ├──1:N── provider_protocol_endpoints
+    └──1:1── provider_oauth_credentials
 
 api_keys ──M:N── models (via api_key_models)
 request_logs (append-only)
@@ -25,13 +25,14 @@ AI 模型供应商配置（API endpoint、密钥、认证方式等）。
 | `id` | TEXT PK | — | 主键，UUID |
 | `name` | TEXT NOT NULL | — | 显示名称 |
 | `vendor` | TEXT | NULL | 供应商标识（如 `openai`、`anthropic`） |
-| `protocol` | TEXT NOT NULL | — | 默认通信协议（如 `openai-compatible`） |
-| `base_url` | TEXT NOT NULL | — | API 端点基础 URL |
+| `protocol` | TEXT NOT NULL | — | 默认通信协议；固定模式为协议族，自适应模式为精确端点 ID |
+| `base_url` | TEXT NOT NULL | — | 默认端点 Base URL（兼容旧客户端和模型发现） |
+| `protocol_mode` | TEXT NOT NULL | `'fixed'` | 协议模式：`fixed` 或 `adaptive` |
 | `preset_key` | TEXT | NULL | 预设模板 key（内置供应商模板标识） |
 | `channel` | TEXT | NULL | 预设通道 ID（如 `default`、`azure`） |
 | `models_source` | TEXT | NULL | 模型列表获取方式 |
 | `static_models` | TEXT | NULL | 静态模型列表（`\n` 分隔） |
-| `api_key` | TEXT NOT NULL | — | API 密钥 |
+| `api_key` | TEXT NOT NULL | — | 默认端点 API 密钥（兼容字段） |
 | `auth_mode` | TEXT | `'apikey'` | 认证方式：`apikey` 或 `oauth` |
 | `access_token` | TEXT | NULL | OAuth access token（迁移至 oauth 表后弃用） |
 | `refresh_token` | TEXT | NULL | OAuth refresh token（迁移至 oauth 表后弃用） |
@@ -43,6 +44,32 @@ AI 模型供应商配置（API endpoint、密钥、认证方式等）。
 | `priority` | INTEGER | `0` | 优先级（预留） |
 | `created_at` | TEXT | `datetime('now')` | 创建时间 |
 | `updated_at` | TEXT | `datetime('now')` | 更新时间 |
+
+---
+
+## provider_protocol_endpoints
+
+Provider 的协议端点明细。固定模式保留一条兼容记录；自适应模式可配置多个精确协议端点，每个端点独立保存 Base URL、凭据和认证方式。
+
+| Column | Type | Default | Description |
+|---|---|---|---|
+| `id` | TEXT PK | — | 主键，UUID |
+| `provider_id` | TEXT NOT NULL | — | 所属 Provider（FK → providers.id, ON DELETE CASCADE） |
+| `protocol` | TEXT NOT NULL | — | 精确协议端点 ID，如 `openai-compatible/chat-completions/v1` |
+| `base_url` | TEXT NOT NULL | — | 该协议端点的 Base URL |
+| `api_key` | TEXT NOT NULL | — | 该协议端点的 API Key |
+| `auth_scheme` | TEXT NOT NULL | `'auto'` | `auto`、`bearer`、`x-api-key`、`query` 或 `none` |
+| `is_enabled` | INTEGER | `1` | 是否参与协议匹配 |
+| `priority` | INTEGER | `0` | 稳定显示与默认排序顺序 |
+| `test_status` | TEXT NOT NULL | `'untested'` | 最近测试状态：`untested`、`success` 或 `failed` |
+| `test_error` | TEXT | NULL | 最近一次测试错误 |
+| `tested_at` | TEXT | NULL | 最近一次测试时间 |
+| `created_at` | TEXT | `datetime('now')` | 创建时间 |
+| `updated_at` | TEXT | `datetime('now')` | 更新时间 |
+
+**唯一约束**：`(provider_id, protocol)`
+
+**索引**：`idx_provider_protocol_endpoints_provider` on `(provider_id, is_enabled, priority)`
 
 ---
 
@@ -223,5 +250,9 @@ request_logs.route_name → request_logs.model_name
 settings.key       → settings.name
 api_keys.key       → api_keys.token
 ```
+
+旧版 `providers.protocol_endpoints` JSON 在迁移时会转换为
+`provider_protocol_endpoints` 行；包含多个协议声明的 Provider 会迁移为
+`adaptive`，并保留原有默认协议、Base URL 和共享 API Key。
 
 所有 rename 操作均为幂等：先检查旧列存在且新列不存在，才执行 `ALTER TABLE RENAME`。

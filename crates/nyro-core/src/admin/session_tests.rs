@@ -199,6 +199,8 @@ fn oauth_provider_input() -> CreateProvider {
         vendor: None,
         protocol: "openai".to_string(),
         base_url: "https://placeholder.invalid".to_string(),
+        protocol_mode: "fixed".to_string(),
+        protocol_endpoints: Vec::new(),
         preset_key: Some("openai".to_string()),
         channel: Some("codex".to_string()),
         models_source: None,
