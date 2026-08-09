@@ -14,17 +14,34 @@ use crate::protocol::ir::vendor_ext::VendorExtensions;
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ResponseItem {
     /// A text output block.
-    OutputText { text: String },
+    OutputText {
+        text: String,
+    },
     /// A thinking / reasoning block.
-    Thinking { text: String },
+    Thinking {
+        text: String,
+    },
     /// A tool call issued by the model.
     FunctionCall {
         call_id: String,
         name: String,
         arguments: String,
     },
+    /// A Responses API custom-tool call with arbitrary text input.
+    CustomToolCall {
+        call_id: String,
+        name: String,
+        input: String,
+    },
     /// A tool result provided by the client (in multi-turn Responses API).
-    FunctionCallOutput { call_id: String, output: String },
+    FunctionCallOutput {
+        call_id: String,
+        output: String,
+    },
+    CustomToolCallOutput {
+        call_id: String,
+        output: String,
+    },
     /// A web-search result block (OpenAI built-in tool).
     WebSearchResult {
         url: String,
@@ -32,7 +49,9 @@ pub enum ResponseItem {
         snippet: Option<String>,
     },
     /// Unknown item type — preserved verbatim.
-    Unknown { raw: Value },
+    Unknown {
+        raw: Value,
+    },
 }
 
 // ── AiResponse ────────────────────────────────────────────────────────────────

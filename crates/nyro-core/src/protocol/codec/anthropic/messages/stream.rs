@@ -2,7 +2,7 @@ use anyhow::Result;
 use serde_json::Value;
 use uuid::Uuid;
 
-use crate::protocol::ir::request::ToolCall;
+use crate::protocol::ir::request::{ToolCall, ToolCallKind};
 use crate::protocol::ir::usage::{ServerToolUsage, Usage};
 use crate::protocol::ir::{AiResponse, AiStreamDelta};
 use crate::protocol::*;
@@ -66,6 +66,7 @@ impl ResponseDecoder for AnthropicResponseParser {
                             tool_calls.push(ToolCall {
                                 id: tc_id.to_string(),
                                 name: name.to_string(),
+                                kind: ToolCallKind::Function,
                                 arguments: input.to_string(),
                             });
                         }
@@ -285,6 +286,7 @@ fn parse_anthropic_event(event_type: Option<&str>, data: &Value, deltas: &mut Ve
                             index: idx,
                             id,
                             name,
+                            kind: ToolCallKind::Function,
                         });
                     }
                     // Anthropic server-side tool blocks (web_search, code_execution,
@@ -534,7 +536,9 @@ impl StreamResponseEncoder for AnthropicStreamFormatter {
                         delta_ev.to_string(),
                     ));
                 }
-                AiStreamDelta::ToolCallStart { index: _, id, name } => {
+                AiStreamDelta::ToolCallStart {
+                    index: _, id, name, ..
+                } => {
                     self.ensure_message_start(&mut events);
                     self.close_thinking_block_if_open(&mut events);
                     self.close_text_block_if_open(&mut events);
@@ -570,21 +574,7 @@ impl StreamResponseEncoder for AnthropicStreamFormatter {
                     ));
                 }
                 AiStreamDelta::Usage(u) => {
-                    if u.prompt_tokens > 0 {
-                        self.usage.prompt_tokens = u.prompt_tokens;
-                    }
-                    if u.completion_tokens > 0 {
-                        self.usage.completion_tokens = u.completion_tokens;
-                    }
-                    if u.cache_read_tokens.is_some() {
-                        self.usage.cache_read_tokens = u.cache_read_tokens;
-                    }
-                    if u.cache_creation_tokens.is_some() {
-                        self.usage.cache_creation_tokens = u.cache_creation_tokens;
-                    }
-                    if u.server_tool_use.is_some() {
-                        self.usage.server_tool_use = u.server_tool_use.clone();
-                    }
+                    self.usage.merge_partial(u);
                 }
                 AiStreamDelta::Done { stop_reason } => {
                     self.ensure_message_start(&mut events);
@@ -597,6 +587,7 @@ impl StreamResponseEncoder for AnthropicStreamFormatter {
                         other => other,
                     };
                     let mut usage = serde_json::json!({
+                        "input_tokens": self.usage.prompt_tokens,
                         "output_tokens": self.usage.completion_tokens
                     });
                     extend_usage_json(&mut usage, &self.usage);

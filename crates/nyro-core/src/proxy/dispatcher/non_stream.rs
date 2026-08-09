@@ -13,6 +13,7 @@ use serde_json::Value;
 
 use crate::integrations::{HookContext, HookRegistry};
 use crate::plugin::phase::{HostContext, Phase, PhaseOutcome, ResponseView};
+use crate::protocol::codec::tool_bridge::ToolRoutePlan;
 use crate::protocol::ir::AiRequest;
 use crate::provider::inbound::InboundResponse;
 use crate::provider::vendor::ProviderCtx;
@@ -39,6 +40,7 @@ pub(super) async fn handle_non_stream(
     ctx: &ProviderCtx<'_>,
     // When true: Native protocol + no response mutations → skip IR round-trip.
     passthrough_resp: bool,
+    tool_route_plan: &ToolRoutePlan,
     // Request-scoped context + IR + host boundary, threaded for the OnResponse phase.
     req_ctx: &mut RequestContext,
     req_ir: &mut AiRequest,
@@ -209,6 +211,7 @@ pub(super) async fn handle_non_stream(
             return error_response(500, &format!("parse error: {e}"));
         }
     };
+    tool_route_plan.restore_response(&mut ai_resp);
 
     // Ensure actual_model is set in the response.
     if ai_resp.model.is_empty() {
@@ -491,6 +494,7 @@ mod tests {
         );
         let mut req_ir = AiRequest::new("deepseek-v4-pro", Vec::new());
         let host = HostContext::new(&gw);
+        let tool_route_plan = ToolRoutePlan::default();
 
         let response = handle_non_stream(
             ProxyClient::new(reqwest::Client::new()),
@@ -502,6 +506,7 @@ mod tests {
             &AnthropicVendor,
             &provider_ctx,
             true,
+            &tool_route_plan,
             &mut req_ctx,
             &mut req_ir,
             &host,
@@ -582,6 +587,7 @@ mod tests {
         );
         let mut onresp_req = AiRequest::new("virtual-gemini", Vec::new());
         let onresp_host = HostContext::new(&gw);
+        let tool_route_plan = ToolRoutePlan::default();
 
         let response = handle_non_stream(
             ProxyClient::new(reqwest::Client::new()),
@@ -593,6 +599,7 @@ mod tests {
             &NoopVendor,
             &provider_ctx,
             false,
+            &tool_route_plan,
             &mut onresp_ctx,
             &mut onresp_req,
             &onresp_host,
@@ -657,6 +664,7 @@ pub(super) async fn handle_non_stream_via_upstream_stream(
     headers: ReqwestHeaderMap,
     body: Value,
     call_ctx: &CallCtx<'_>,
+    mut tool_route_plan: ToolRoutePlan,
     req_ctx: &mut RequestContext,
     req_ir: &mut AiRequest,
     host: &HostContext<'_>,
@@ -732,13 +740,16 @@ pub(super) async fn handle_non_stream_via_upstream_stream(
         };
         let text = String::from_utf8_lossy(&bytes);
         if let Ok(ai_deltas) = stream_parser.parse_chunk(&text) {
+            let ai_deltas = tool_route_plan.restore_stream_deltas(ai_deltas);
             accumulator.apply_all(&ai_deltas);
         }
     }
 
     if let Ok(ai_deltas) = stream_parser.finish() {
+        let ai_deltas = tool_route_plan.restore_stream_deltas(ai_deltas);
         accumulator.apply_all(&ai_deltas);
     }
+    accumulator.apply_all(&tool_route_plan.finish_stream());
 
     let mut ai_resp = accumulator.into_ai_response();
     if ai_resp.id.is_empty() {

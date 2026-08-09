@@ -2,7 +2,7 @@ use anyhow::Result;
 use serde_json::Value;
 use std::collections::HashMap;
 
-use crate::protocol::ir::request::ToolCall;
+use crate::protocol::ir::request::{ToolCall, ToolCallKind};
 use crate::protocol::ir::response::ResponseItem;
 use crate::protocol::ir::usage::Usage;
 use crate::protocol::ir::{AiResponse, AiStreamDelta};
@@ -57,6 +57,7 @@ impl ResponseDecoder for GoogleResponseParser {
                     tool_calls.push(ToolCall {
                         id: call_id.clone(),
                         name: name.clone(),
+                        kind: ToolCallKind::Function,
                         arguments: arguments.clone(),
                     });
                     if is_plain_function_call_part(part) {
@@ -245,6 +246,7 @@ fn parse_gemini_chunk(chunk: &Value, deltas: &mut Vec<AiStreamDelta>, first: &mu
                         index: 0,
                         id,
                         name: name.clone(),
+                        kind: ToolCallKind::Function,
                     });
                     let args = fc.get("args").map(|a| a.to_string()).unwrap_or_default();
                     if !args.is_empty() && args != "{}" {
@@ -348,7 +350,9 @@ impl StreamResponseEncoder for GoogleStreamFormatter {
                     });
                     events.push(SseEvent::new(None, chunk.to_string()));
                 }
-                AiStreamDelta::ToolCallStart { index, id: _, name } => {
+                AiStreamDelta::ToolCallStart {
+                    index, id: _, name, ..
+                } => {
                     self.tool_names.insert(*index, name.clone());
                     self.tool_arg_buffers.insert(*index, String::new());
                 }
@@ -372,12 +376,7 @@ impl StreamResponseEncoder for GoogleStreamFormatter {
                     events.push(SseEvent::new(None, chunk.to_string()));
                 }
                 AiStreamDelta::Usage(u) => {
-                    if u.prompt_tokens > 0 {
-                        self.usage.prompt_tokens = u.prompt_tokens;
-                    }
-                    if u.completion_tokens > 0 {
-                        self.usage.completion_tokens = u.completion_tokens;
-                    }
+                    self.usage.merge_partial(u);
                 }
                 AiStreamDelta::Unknown { raw } => {
                     let Ok(value) = serde_json::from_str::<Value>(raw) else {

@@ -3,14 +3,16 @@ use std::collections::HashMap;
 use uuid::Uuid;
 
 use crate::protocol::ir::AiStreamDelta;
+use crate::protocol::ir::request::ToolCallKind;
 use crate::protocol::ir::usage::Usage;
 use crate::protocol::{SseEvent, StreamResponseEncoder};
 
-struct PendingFunctionCall {
+struct PendingToolCall {
     output_index: usize,
     item_id: String,
     call_id: String,
     name: String,
+    kind: ToolCallKind,
     arguments: String,
 }
 
@@ -27,7 +29,7 @@ pub struct ResponsesStreamFormatter {
     reasoning_item_id: Option<String>,
     reasoning_output_index: Option<usize>,
     tool_index_map: HashMap<usize, usize>,
-    tool_calls: Vec<PendingFunctionCall>,
+    tool_calls: Vec<PendingToolCall>,
 }
 
 impl Default for ResponsesStreamFormatter {
@@ -157,17 +159,28 @@ impl ResponsesStreamFormatter {
         }
 
         for call in &self.tool_calls {
-            let tool_done = serde_json::json!({
-                "type": "response.output_item.done",
-                "output_index": call.output_index,
-                "item": {
+            let item = match call.kind {
+                ToolCallKind::Function => serde_json::json!({
                     "type": "function_call",
                     "id": call.item_id,
                     "call_id": call.call_id,
                     "name": call.name,
                     "arguments": call.arguments,
                     "status": "completed"
-                }
+                }),
+                ToolCallKind::Custom => serde_json::json!({
+                    "type": "custom_tool_call",
+                    "id": call.item_id,
+                    "call_id": call.call_id,
+                    "name": call.name,
+                    "input": call.arguments,
+                    "status": "completed"
+                }),
+            };
+            let tool_done = serde_json::json!({
+                "type": "response.output_item.done",
+                "output_index": call.output_index,
+                "item": item
             });
             events.push(SseEvent::new(
                 Some("response.output_item.done"),
@@ -235,14 +248,24 @@ impl ResponsesStreamFormatter {
             }));
         }
         for call in &self.tool_calls {
-            output.push(serde_json::json!({
-                "type": "function_call",
-                "id": call.item_id,
-                "call_id": call.call_id,
-                "name": call.name,
-                "arguments": call.arguments,
-                "status": "completed"
-            }));
+            output.push(match call.kind {
+                ToolCallKind::Function => serde_json::json!({
+                    "type": "function_call",
+                    "id": call.item_id,
+                    "call_id": call.call_id,
+                    "name": call.name,
+                    "arguments": call.arguments,
+                    "status": "completed"
+                }),
+                ToolCallKind::Custom => serde_json::json!({
+                    "type": "custom_tool_call",
+                    "id": call.item_id,
+                    "call_id": call.call_id,
+                    "name": call.name,
+                    "input": call.arguments,
+                    "status": "completed"
+                }),
+            });
         }
         output.push(serde_json::json!({
             "type": "message",
@@ -345,11 +368,24 @@ impl StreamResponseEncoder for ResponsesStreamFormatter {
                         ev.to_string(),
                     ));
                 }
-                AiStreamDelta::ToolCallStart { index, id, name } => {
+                AiStreamDelta::ToolCallStart {
+                    index,
+                    id,
+                    name,
+                    kind,
+                } => {
                     self.ensure_started(&mut events);
                     let output_index = self.next_output_index;
                     self.next_output_index += 1;
-                    let item_id = format!("fc_{}", Uuid::new_v4().simple());
+                    let item_id = format!(
+                        "{}_{}",
+                        if *kind == ToolCallKind::Custom {
+                            "ctc"
+                        } else {
+                            "fc"
+                        },
+                        Uuid::new_v4().simple()
+                    );
                     let call_id = if id.is_empty() {
                         format!("call_{}", Uuid::new_v4().simple())
                     } else {
@@ -357,25 +393,37 @@ impl StreamResponseEncoder for ResponsesStreamFormatter {
                     };
 
                     self.tool_index_map.insert(*index, self.tool_calls.len());
-                    self.tool_calls.push(PendingFunctionCall {
+                    self.tool_calls.push(PendingToolCall {
                         output_index,
                         item_id: item_id.clone(),
                         call_id: call_id.clone(),
                         name: name.clone(),
+                        kind: *kind,
                         arguments: String::new(),
                     });
 
-                    let added = serde_json::json!({
-                        "type": "response.output_item.added",
-                        "output_index": output_index,
-                        "item": {
+                    let item = match kind {
+                        ToolCallKind::Function => serde_json::json!({
                             "type": "function_call",
                             "id": item_id,
                             "call_id": call_id,
                             "name": name,
                             "arguments": "",
                             "status": "in_progress"
-                        }
+                        }),
+                        ToolCallKind::Custom => serde_json::json!({
+                            "type": "custom_tool_call",
+                            "id": item_id,
+                            "call_id": call_id,
+                            "name": name,
+                            "input": "",
+                            "status": "in_progress"
+                        }),
+                    };
+                    let added = serde_json::json!({
+                        "type": "response.output_item.added",
+                        "output_index": output_index,
+                        "item": item
                     });
                     events.push(SseEvent::new(
                         Some("response.output_item.added"),
@@ -387,40 +435,26 @@ impl StreamResponseEncoder for ResponsesStreamFormatter {
                         && let Some(call) = self.tool_calls.get_mut(pos)
                     {
                         call.arguments.push_str(arguments);
+                        let event_type = if call.kind == ToolCallKind::Custom {
+                            "response.custom_tool_call_input.delta"
+                        } else {
+                            "response.function_call_arguments.delta"
+                        };
                         let ev = serde_json::json!({
-                            "type": "response.function_call_arguments.delta",
+                            "type": event_type,
                             "item_id": call.item_id,
                             "output_index": call.output_index,
                             "delta": arguments
                         });
-                        events.push(SseEvent::new(
-                            Some("response.function_call_arguments.delta"),
-                            ev.to_string(),
-                        ));
+                        events.push(SseEvent::new(Some(event_type), ev.to_string()));
                     }
                 }
                 AiStreamDelta::Usage(u) => {
-                    if u.prompt_tokens > 0 {
-                        self.usage.prompt_tokens = u.prompt_tokens;
-                    }
-                    if u.completion_tokens > 0 {
-                        self.usage.completion_tokens = u.completion_tokens;
-                    }
-                    if u.cache_read_tokens.is_some() {
-                        self.usage.cache_read_tokens = u.cache_read_tokens;
-                    }
-                    if u.cache_creation_tokens.is_some() {
-                        self.usage.cache_creation_tokens = u.cache_creation_tokens;
-                    }
-                    if u.server_tool_use.is_some() {
-                        self.usage.server_tool_use = u.server_tool_use.clone();
-                    }
+                    self.usage.merge_partial(u);
                 }
-                AiStreamDelta::Done { .. } => {
-                    if !self.completed {
-                        self.completed = true;
-                        events.extend(self.emit_completed());
-                    }
+                AiStreamDelta::Done { .. } if !self.completed => {
+                    self.completed = true;
+                    events.extend(self.emit_completed());
                 }
                 _ => {}
             }

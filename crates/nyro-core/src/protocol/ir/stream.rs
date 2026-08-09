@@ -1,7 +1,7 @@
 //! Stream deltas for `AiResponse`.
 
 use crate::protocol::ir::error::AiError;
-use crate::protocol::ir::request::ToolCall;
+use crate::protocol::ir::request::{ToolCall, ToolCallKind};
 use crate::protocol::ir::usage::Usage;
 
 /// A single parsed delta from a streaming response.
@@ -24,6 +24,7 @@ pub enum StreamDelta {
         index: usize,
         id: String,
         name: String,
+        kind: ToolCallKind,
     },
     /// Incremental tool call argument JSON fragment.
     ToolCallDelta { index: usize, arguments: String },

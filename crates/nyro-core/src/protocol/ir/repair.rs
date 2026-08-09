@@ -16,7 +16,7 @@
 use std::collections::VecDeque;
 
 use crate::protocol::ir::request::{
-    AiRequest, ContentBlock, Message, MessageContent, Role, ToolCall,
+    AiRequest, ContentBlock, Message, MessageContent, Role, ToolCall, ToolCallKind,
 };
 
 // ── fill_tool_call_ids ────────────────────────────────────────────────────────
@@ -118,6 +118,7 @@ pub fn fill_tool_call_ids(req: &mut AiRequest) {
                 tool_calls: Some(vec![ToolCall {
                     id: final_id.clone(),
                     name: synth_name,
+                    kind: ToolCallKind::Function,
                     arguments: "{}".to_string(),
                 }]),
                 tool_call_id: None,
@@ -186,6 +187,7 @@ mod tests {
             tool_calls: Some(vec![ToolCall {
                 id: id.to_string(),
                 name: name.to_string(),
+                kind: ToolCallKind::Function,
                 arguments: "{}".to_string(),
             }]),
             tool_call_id: None,

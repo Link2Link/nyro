@@ -15,7 +15,7 @@ use crate::protocol::ir::DocumentSource as IrDocumentSource;
 use crate::protocol::ir::{
     AiRequest, AnthropicExt, CacheTtl, ContentBlock, GenerationConfig, MediaSource, Message,
     MessageContent, ProtocolExt, ReasoningConfig, ReasoningEffort, Role, StreamConfig, ToolCall,
-    ToolChoice, ToolSpec,
+    ToolCallKind, ToolChoice, ToolSpec, ToolSpecKind,
 };
 
 use super::types::{
@@ -138,6 +138,7 @@ impl RequestDecoder for AnthropicDecoder {
                     user_tools.push(ToolSpec {
                         name: format!("__builtin__{}", tool_type),
                         description: t.description,
+                        kind: ToolSpecKind::Function,
                         parameters: t.input_schema.unwrap_or(Value::Object(Default::default())),
                         strict: None,
                         cache_control: t.cache_control.as_ref().map(map_cache_control),
@@ -147,6 +148,7 @@ impl RequestDecoder for AnthropicDecoder {
                     user_tools.push(ToolSpec {
                         name: t.name,
                         description: t.description,
+                        kind: ToolSpecKind::Function,
                         parameters: schema,
                         strict: None,
                         cache_control: t.cache_control.as_ref().map(map_cache_control),
@@ -347,6 +349,7 @@ fn decode_message(msg: AnthropicMessage) -> Result<Vec<Message>> {
                         tcs.push(ToolCall {
                             id: id.clone(),
                             name: name.clone(),
+                            kind: ToolCallKind::Function,
                             arguments: input.to_string(),
                         });
                         content_blocks.push(ContentBlock::ToolUse {

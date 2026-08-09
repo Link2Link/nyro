@@ -21,6 +21,7 @@ use std::sync::Arc;
 
 use crate::Gateway;
 use crate::plugin::phase::{HostContext, Phase, PhaseHook, PhaseHookRegistry, ResponseView};
+use crate::protocol::codec::tool_bridge::ToolRoutePlan;
 use crate::protocol::ids::ProtocolEndpoint;
 use crate::protocol::ir::{AiRequest, AiStreamDelta};
 use crate::proxy::client::ProxyClient;
@@ -43,6 +44,7 @@ pub(super) async fn handle_stream(
     call_ctx: &CallCtx<'_>,
     req_extras: &RequestExtras,
     passthrough_resp: bool,
+    mut tool_route_plan: ToolRoutePlan,
     // Cloned into the streaming task for the per-chunk OnResponse phase; the
     // spawned task outlives the borrow, so owned copies (not borrows) cross in.
     req_ctx: &RequestContext,
@@ -281,9 +283,11 @@ pub(super) async fn handle_stream(
                     // P1: emit an explicit terminal event instead of silently breaking,
                     // so the client receives a defined stop_reason and does not hang.
                     tracing::warn!(error = %e, "upstream stream error; emitting terminal event");
-                    let error_deltas = [AiStreamDelta::Done {
-                        stop_reason: "error".to_string(),
-                    }];
+                    let error_deltas =
+                        tool_route_plan.restore_stream_deltas(vec![AiStreamDelta::Done {
+                            stop_reason: "error".to_string(),
+                        }]);
+                    accumulator.apply_all(&error_deltas);
                     let events = stream_formatter.format_deltas(&error_deltas);
                     for ev in events {
                         let _ = tx.send(Ok(ev.to_sse_string())).await;
@@ -297,7 +301,8 @@ pub(super) async fn handle_stream(
             chunks_count += 1;
             upstream_raw_buf.extend_from_slice(&bytes);
             let text = String::from_utf8_lossy(&bytes);
-            if let Ok(mut ai_deltas) = stream_parser.parse_chunk(&text) {
+            if let Ok(ai_deltas) = stream_parser.parse_chunk(&text) {
+                let mut ai_deltas = tool_route_plan.restore_stream_deltas(ai_deltas);
                 run_stream_on_response(
                     &on_response_hooks,
                     on_response_host.as_ref(),
@@ -318,7 +323,8 @@ pub(super) async fn handle_stream(
             }
         }
 
-        if let Ok(mut ai_deltas) = stream_parser.finish() {
+        if let Ok(ai_deltas) = stream_parser.finish() {
+            let mut ai_deltas = tool_route_plan.restore_stream_deltas(ai_deltas);
             run_stream_on_response(
                 &on_response_hooks,
                 on_response_host.as_ref(),
@@ -330,6 +336,24 @@ pub(super) async fn handle_stream(
             accumulator.apply_all(&ai_deltas);
             let events = stream_formatter.format_deltas(&ai_deltas);
             for ev in events {
+                let sse = ev.to_sse_string();
+                client_sse_parts.push(sse.clone());
+                let _ = tx.send(Ok(sse)).await;
+            }
+        }
+
+        let mut bridge_deltas = tool_route_plan.finish_stream();
+        if !bridge_deltas.is_empty() {
+            run_stream_on_response(
+                &on_response_hooks,
+                on_response_host.as_ref(),
+                hook_req_ctx.as_mut(),
+                hook_req_ir.as_mut(),
+                &mut bridge_deltas,
+            )
+            .await;
+            accumulator.apply_all(&bridge_deltas);
+            for ev in stream_formatter.format_deltas(&bridge_deltas) {
                 let sse = ev.to_sse_string();
                 client_sse_parts.push(sse.clone());
                 let _ = tx.send(Ok(sse)).await;

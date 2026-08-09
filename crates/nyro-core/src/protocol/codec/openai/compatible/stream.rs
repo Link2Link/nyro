@@ -2,7 +2,7 @@ use anyhow::Result;
 use serde_json::Value;
 use uuid::Uuid;
 
-use crate::protocol::ir::request::ToolCall;
+use crate::protocol::ir::request::{ToolCall, ToolCallKind};
 use crate::protocol::ir::usage::Usage;
 use crate::protocol::ir::{AiResponse, AiStreamDelta};
 use crate::protocol::*;
@@ -53,6 +53,7 @@ impl ResponseDecoder for OpenAIResponseParser {
                         Some(ToolCall {
                             id: tc.get("id")?.as_str()?.to_string(),
                             name: func.get("name")?.as_str()?.to_string(),
+                            kind: ToolCallKind::Function,
                             arguments: func
                                 .get("arguments")
                                 .and_then(|a| a.as_str())
@@ -143,6 +144,7 @@ pub struct OpenAIStreamParser {
     buffer: String,
     started: bool,
     done: bool,
+    pending_stop_reason: Option<String>,
     think_buffer: String,
     in_think_block: bool,
 }
@@ -159,6 +161,7 @@ impl OpenAIStreamParser {
             buffer: String::new(),
             started: false,
             done: false,
+            pending_stop_reason: None,
             think_buffer: String::new(),
             in_think_block: false,
         }
@@ -180,9 +183,13 @@ impl StreamResponseDecoder for OpenAIStreamParser {
                     let data = data.trim();
                     if data == "[DONE]" {
                         if !self.done {
+                            deltas.extend(self.flush_pending_text());
                             self.done = true;
                             deltas.push(AiStreamDelta::Done {
-                                stop_reason: "stop".to_string(),
+                                stop_reason: self
+                                    .pending_stop_reason
+                                    .take()
+                                    .unwrap_or_else(|| "stop".to_string()),
                             });
                         }
                         continue;
@@ -204,6 +211,12 @@ impl StreamResponseDecoder for OpenAIStreamParser {
             ai_deltas.extend(self.parse_chunk(&format!("{remaining}\n\n"))?);
         }
         ai_deltas.extend(self.flush_pending_text());
+        if !self.done
+            && let Some(stop_reason) = self.pending_stop_reason.take()
+        {
+            self.done = true;
+            ai_deltas.push(AiStreamDelta::Done { stop_reason });
+        }
         Ok(ai_deltas)
     }
 }
@@ -259,6 +272,7 @@ impl OpenAIStreamParser {
                                 index: idx,
                                 id,
                                 name: name.to_string(),
+                                kind: ToolCallKind::Function,
                             });
                         }
                         if let Some(args) = func.get("arguments").and_then(|v| v.as_str())
@@ -274,14 +288,10 @@ impl OpenAIStreamParser {
             }
         }
 
-        if !self.done
-            && let Some(reason) = choice.get("finish_reason").and_then(|v| v.as_str())
+        if let Some(reason) = choice.get("finish_reason").and_then(|v| v.as_str())
             && !reason.is_empty()
         {
-            self.done = true;
-            deltas.push(AiStreamDelta::Done {
-                stop_reason: reason.to_string(),
-            });
+            self.pending_stop_reason = Some(reason.to_string());
         }
 
         let u = extract_usage(chunk);
@@ -420,7 +430,9 @@ impl StreamResponseEncoder for OpenAIStreamFormatter {
                     });
                     events.push(SseEvent::new(None, chunk.to_string()));
                 }
-                AiStreamDelta::ToolCallStart { index, id, name } => {
+                AiStreamDelta::ToolCallStart {
+                    index, id, name, ..
+                } => {
                     self.saw_tool_call = true;
                     let chunk = serde_json::json!({
                         "id": self.id,
@@ -445,7 +457,7 @@ impl StreamResponseEncoder for OpenAIStreamFormatter {
                     events.push(SseEvent::new(None, chunk.to_string()));
                 }
                 AiStreamDelta::Usage(u) => {
-                    self.usage = u.clone();
+                    self.usage.merge_partial(u);
                 }
                 AiStreamDelta::Done { stop_reason } => {
                     let final_reason = if self.saw_tool_call {
@@ -962,5 +974,41 @@ mod tests {
             done_count, 1,
             "expected exactly 1 Done (finish_reason + [DONE] deduped), got {done_count}: {deltas:?}"
         );
+    }
+
+    #[test]
+    fn test_stream_defers_done_until_after_late_usage_chunk() {
+        let mut parser = OpenAIStreamParser::new();
+        let finish = parser
+            .parse_chunk(&data_sse(
+                r#"{"id":"chatcmpl-late","model":"gpt-4o","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#,
+            ))
+            .unwrap();
+        assert!(
+            finish
+                .iter()
+                .all(|delta| !matches!(delta, AiStreamDelta::Done { .. })),
+            "finish_reason must remain pending until usage or sentinel: {finish:?}"
+        );
+
+        let usage = parser
+            .parse_chunk(&data_sse(
+                r#"{"id":"chatcmpl-late","model":"gpt-4o","choices":[],"usage":{"prompt_tokens":12,"completion_tokens":7}}"#,
+            ))
+            .unwrap();
+        assert!(matches!(
+            usage.as_slice(),
+            [AiStreamDelta::Usage(Usage {
+                prompt_tokens: 12,
+                completion_tokens: 7,
+                ..
+            })]
+        ));
+
+        let done = parser.parse_chunk(&data_sse("[DONE]")).unwrap();
+        assert!(matches!(
+            done.as_slice(),
+            [AiStreamDelta::Done { stop_reason }] if stop_reason == "tool_calls"
+        ));
     }
 }

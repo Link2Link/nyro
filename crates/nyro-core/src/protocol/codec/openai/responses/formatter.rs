@@ -3,6 +3,7 @@ use uuid::Uuid;
 
 use crate::protocol::ResponseEncoder;
 use crate::protocol::ir::AiResponse;
+use crate::protocol::ir::request::ToolCallKind;
 use crate::protocol::ir::response::ResponseItem;
 
 pub struct ResponsesResponseFormatter;
@@ -46,6 +47,20 @@ impl ResponseEncoder for ResponsesResponseFormatter {
                             "status": "completed"
                         }));
                     }
+                    ResponseItem::CustomToolCall {
+                        call_id,
+                        name,
+                        input,
+                    } => {
+                        output.push(serde_json::json!({
+                            "type": "custom_tool_call",
+                            "id": format!("ctc_{}", Uuid::new_v4().simple()),
+                            "call_id": call_id,
+                            "name": name,
+                            "input": input,
+                            "status": "completed"
+                        }));
+                    }
                     ResponseItem::OutputText { text } => {
                         output_text.push_str(text);
                     }
@@ -64,14 +79,24 @@ impl ResponseEncoder for ResponsesResponseFormatter {
                 }));
             }
             for tc in &resp.tool_calls {
-                output.push(serde_json::json!({
-                    "type": "function_call",
-                    "id": format!("fc_{}", Uuid::new_v4().simple()),
-                    "call_id": tc.id,
-                    "name": tc.name,
-                    "arguments": tc.arguments,
-                    "status": "completed"
-                }));
+                output.push(match tc.kind {
+                    ToolCallKind::Function => serde_json::json!({
+                        "type": "function_call",
+                        "id": format!("fc_{}", Uuid::new_v4().simple()),
+                        "call_id": tc.id,
+                        "name": tc.name,
+                        "arguments": tc.arguments,
+                        "status": "completed"
+                    }),
+                    ToolCallKind::Custom => serde_json::json!({
+                        "type": "custom_tool_call",
+                        "id": format!("ctc_{}", Uuid::new_v4().simple()),
+                        "call_id": tc.id,
+                        "name": tc.name,
+                        "input": tc.arguments,
+                        "status": "completed"
+                    }),
+                });
             }
             output_text.push_str(&resp.content);
         }

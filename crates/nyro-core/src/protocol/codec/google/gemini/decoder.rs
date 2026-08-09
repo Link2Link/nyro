@@ -13,7 +13,7 @@ use crate::protocol::ids::GOOGLE_GEMINI_GENERATE_CONTENT_V1BETA;
 use crate::protocol::ir::{
     AiRequest, ContentBlock, GenerationConfig, GoogleExt, MediaSource, Message, MessageContent,
     ProtocolExt, ReasoningConfig, ReasoningEffort, Role, SafetySettings, StreamConfig, ToolCall,
-    ToolSpec,
+    ToolCallKind, ToolSpec, ToolSpecKind,
 };
 
 use super::types::*;
@@ -94,6 +94,7 @@ impl GoogleDecoder {
                         defs.push(ToolSpec {
                             name: fd.name.clone(),
                             description: fd.description.clone(),
+                            kind: ToolSpecKind::Function,
                             parameters: fd
                                 .parameters
                                 .clone()
@@ -108,6 +109,7 @@ impl GoogleDecoder {
                     defs.push(ToolSpec {
                         name: "__builtin__google_search".into(),
                         description: None,
+                        kind: ToolSpecKind::Function,
                         parameters: Value::Object(Default::default()),
                         strict: None,
                         cache_control: None,
@@ -118,6 +120,7 @@ impl GoogleDecoder {
                     defs.push(ToolSpec {
                         name: "__builtin__code_execution".into(),
                         description: None,
+                        kind: ToolSpecKind::Function,
                         parameters: Value::Object(Default::default()),
                         strict: None,
                         cache_control: None,
@@ -128,6 +131,7 @@ impl GoogleDecoder {
                     defs.push(ToolSpec {
                         name: "__builtin__google_search_retrieval".into(),
                         description: None,
+                        kind: ToolSpecKind::Function,
                         parameters: Value::Object(Default::default()),
                         strict: None,
                         cache_control: None,
@@ -310,6 +314,7 @@ fn decode_content(content: GoogleContent) -> Result<Message> {
                 tool_calls.push(ToolCall {
                     id: id.clone(),
                     name: function_call.name.clone(),
+                    kind: ToolCallKind::Function,
                     arguments: function_call.args.to_string(),
                 });
                 blocks.push(ContentBlock::ToolUse {

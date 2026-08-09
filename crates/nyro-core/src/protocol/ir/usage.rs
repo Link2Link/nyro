@@ -34,3 +34,28 @@ pub struct Usage {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub server_tool_use: Option<ServerToolUsage>,
 }
+
+impl Usage {
+    /// Merge a streaming usage snapshot whose omitted counters are represented
+    /// as zero or absent optional values.
+    pub fn merge_partial(&mut self, next: &Self) {
+        if next.prompt_tokens > 0 {
+            self.prompt_tokens = next.prompt_tokens;
+        }
+        if next.completion_tokens > 0 {
+            self.completion_tokens = next.completion_tokens;
+        }
+        if next.total_tokens > 0 {
+            self.total_tokens = next.total_tokens;
+        }
+        if next.cache_read_tokens.is_some() {
+            self.cache_read_tokens = next.cache_read_tokens;
+        }
+        if next.cache_creation_tokens.is_some() {
+            self.cache_creation_tokens = next.cache_creation_tokens;
+        }
+        if next.server_tool_use.is_some() {
+            self.server_tool_use = next.server_tool_use.clone();
+        }
+    }
+}

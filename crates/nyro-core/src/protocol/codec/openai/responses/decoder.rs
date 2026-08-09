@@ -10,7 +10,8 @@ use crate::protocol::codec::reasoning::parse_reasoning_effort;
 use crate::protocol::ids::OPENAI_RESPONSES_V1;
 use crate::protocol::ir::{
     AiRequest, GenerationConfig, Message, MessageContent, OpenAIResponsesExt, ProtocolExt,
-    ReasoningConfig, ReasoningEffort, Role, StreamConfig, ToolCall, ToolChoice, ToolSpec,
+    ReasoningConfig, ReasoningEffort, Role, StreamConfig, ToolCall, ToolCallKind, ToolChoice,
+    ToolSpec, ToolSpecKind,
 };
 
 pub struct ResponsesDecoder;
@@ -62,6 +63,7 @@ impl RequestDecoder for ResponsesDecoder {
 
         // ── System (instructions) ─────────────────────────────────────────────
         let mut messages: Vec<Message> = Vec::new();
+        let mut additional_tools: Vec<ToolSpec> = Vec::new();
 
         if let Some(inst) = obj.get("instructions").and_then(|v| v.as_str())
             && !inst.is_empty()
@@ -93,6 +95,12 @@ impl RequestDecoder for ResponsesDecoder {
             Value::Array(items) => {
                 let mut pending_reasoning: Option<String> = None;
                 for item in items {
+                    if item.get("type").and_then(Value::as_str) == Some("additional_tools") {
+                        let parsed = parse_tools(item.get("tools"))?.unwrap_or_default();
+                        merge_tool_specs(&mut additional_tools, parsed)?;
+                        continue;
+                    }
+
                     if item
                         .get("type")
                         .and_then(|v| v.as_str())
@@ -160,7 +168,9 @@ impl RequestDecoder for ResponsesDecoder {
         }
 
         // ── Tools ─────────────────────────────────────────────────────────────
-        let tools = parse_tools(obj.get("tools"))?;
+        let mut tools = parse_tools(obj.get("tools"))?.unwrap_or_default();
+        merge_tool_specs(&mut tools, additional_tools)?;
+        let tools = (!tools.is_empty()).then_some(tools);
         let tool_choice = obj.get("tool_choice").cloned().map(parse_tool_choice);
 
         // ── Reasoning ─────────────────────────────────────────────────────────
@@ -257,7 +267,7 @@ fn decode_input_item(item: &Value) -> Result<Option<Message>> {
         .unwrap_or("message");
 
     match item_type {
-        "function_call_output" => {
+        "function_call_output" | "custom_tool_call_output" => {
             let call_id = item
                 .get("call_id")
                 .or_else(|| item.get("tool_call_id"))
@@ -278,11 +288,12 @@ fn decode_input_item(item: &Value) -> Result<Option<Message>> {
                 content: MessageContent::Text(output_text),
                 tool_calls: None,
                 tool_call_id: Some(call_id),
-                meta: None,
+                meta: (item_type == "custom_tool_call_output")
+                    .then(|| serde_json::json!({"__nyro_tool_call_kind": "custom"})),
             }))
         }
 
-        "function_call" => {
+        "function_call" | "custom_tool_call" => {
             let call_id = item
                 .get("call_id")
                 .or_else(|| item.get("id"))
@@ -295,9 +306,17 @@ fn decode_input_item(item: &Value) -> Result<Option<Message>> {
                 .unwrap_or("")
                 .to_string();
             let arguments = item
-                .get("arguments")
+                .get(if item_type == "custom_tool_call" {
+                    "input"
+                } else {
+                    "arguments"
+                })
                 .and_then(|v| v.as_str())
-                .unwrap_or("{}")
+                .unwrap_or(if item_type == "custom_tool_call" {
+                    ""
+                } else {
+                    "{}"
+                })
                 .to_string();
             if call_id.trim().is_empty() || name.trim().is_empty() {
                 // Tolerate malformed `function_call` input items instead of
@@ -315,6 +334,11 @@ fn decode_input_item(item: &Value) -> Result<Option<Message>> {
                 tool_calls: Some(vec![ToolCall {
                     id: call_id,
                     name,
+                    kind: if item_type == "custom_tool_call" {
+                        ToolCallKind::Custom
+                    } else {
+                        ToolCallKind::Function
+                    },
                     arguments,
                 }]),
                 tool_call_id: None,
@@ -406,8 +430,31 @@ fn parse_tools(raw_tools: Option<&Value>) -> Result<Option<Vec<ToolSpec>>> {
                 tools.push(ToolSpec {
                     name,
                     description,
+                    kind: ToolSpecKind::Function,
                     parameters,
                     strict: item.get("strict").and_then(|v| v.as_bool()),
+                    cache_control: None,
+                    meta: None,
+                });
+            }
+            "custom" => {
+                let name = item
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("custom tool missing 'name' field"))?
+                    .to_string();
+                let description = item
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .map(String::from);
+                tools.push(ToolSpec {
+                    name,
+                    description,
+                    kind: ToolSpecKind::Custom {
+                        format: item.get("format").cloned(),
+                    },
+                    parameters: Value::Object(Default::default()),
+                    strict: None,
                     cache_control: None,
                     meta: None,
                 });
@@ -416,6 +463,7 @@ fn parse_tools(raw_tools: Option<&Value>) -> Result<Option<Vec<ToolSpec>>> {
                 tools.push(ToolSpec {
                     name: format!("__builtin__{}", tool_type),
                     description: Some(format!("built-in tool: {}", tool_type)),
+                    kind: ToolSpecKind::Function,
                     parameters: item.clone(),
                     strict: None,
                     cache_control: None,
@@ -433,6 +481,23 @@ fn parse_tools(raw_tools: Option<&Value>) -> Result<Option<Vec<ToolSpec>>> {
     }
 }
 
+fn merge_tool_specs(existing: &mut Vec<ToolSpec>, incoming: Vec<ToolSpec>) -> Result<()> {
+    for tool in incoming {
+        let Some(current) = existing
+            .iter()
+            .find(|candidate| candidate.name == tool.name)
+        else {
+            existing.push(tool);
+            continue;
+        };
+
+        if serde_json::to_value(current)? != serde_json::to_value(&tool)? {
+            anyhow::bail!("conflicting tool definitions for '{}'", tool.name);
+        }
+    }
+    Ok(())
+}
+
 fn parse_tool_choice(v: Value) -> ToolChoice {
     match &v {
         Value::String(s) => match s.as_str() {
@@ -442,12 +507,14 @@ fn parse_tool_choice(v: Value) -> ToolChoice {
             _ => ToolChoice::Raw(v),
         },
         Value::Object(obj) => {
-            if obj.get("type").and_then(|t| t.as_str()) == Some("function")
-                && let Some(name) = obj
-                    .get("function")
+            if matches!(
+                obj.get("type").and_then(Value::as_str),
+                Some("function" | "custom")
+            ) && let Some(name) = obj.get("name").and_then(Value::as_str).or_else(|| {
+                obj.get("function")
                     .and_then(|f| f.get("name"))
-                    .and_then(|n| n.as_str())
-            {
+                    .and_then(Value::as_str)
+            }) {
                 return ToolChoice::Named {
                     name: name.to_string(),
                 };

@@ -36,7 +36,7 @@ pub use ext::{AnthropicExt, GoogleExt, OpenAIChatExt, OpenAIResponsesExt, Protoc
 pub use request::{
     AiRequest, ContentBlock, DocumentSource, GenerationConfig, MediaSource, Message,
     MessageContent, ReasoningConfig, ReasoningEffort, RequestMetadata, ResponseFormat, Role,
-    SafetySettings, StreamConfig, ToolCall, ToolChoice, ToolSpec,
+    SafetySettings, StreamConfig, ToolCall, ToolCallKind, ToolChoice, ToolSpec, ToolSpecKind,
 };
 
 // ── Response ──────────────────────────────────────────────────────────────────

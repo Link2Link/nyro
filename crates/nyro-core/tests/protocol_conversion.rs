@@ -23,7 +23,8 @@ use nyro_core::protocol::ir::usage::Usage;
 use nyro_core::protocol::ir::{
     AiRequest, AiResponse as IrAiResponse, AiStreamDelta as IrStreamDelta,
     ContentBlock as IrContentBlock, MediaSource, Message, MessageContent as IrMessageContent,
-    ReasoningConfig, ReasoningEffort, Role as IrRole, StreamConfig, ToolCall, ToolSpec,
+    ReasoningConfig, ReasoningEffort, Role as IrRole, StreamConfig, ToolCall, ToolCallKind,
+    ToolSpec, ToolSpecKind,
 };
 use nyro_core::protocol::{
     RequestDecoder, RequestEncoder, ResponseDecoder, ResponseEncoder, StreamResponseDecoder,
@@ -70,6 +71,7 @@ fn anthropic_encoder_replays_reasoning_extra_as_thinking_block() {
         content: IrMessageContent::Text("".to_string()),
         tool_calls: Some(vec![ToolCall {
             id: "call_1".to_string(),
+            kind: ToolCallKind::Function,
             name: "exec_command".to_string(),
             arguments: "{\"cmd\":\"echo hello\"}".to_string(),
         }]),
@@ -105,6 +107,7 @@ fn openai_to_responses_reasoning_and_function_call_items() {
     resp.reasoning_content = Some("chain".to_string());
     resp.tool_calls = vec![ToolCall {
         id: "call_123".to_string(),
+        kind: ToolCallKind::Function,
         name: "ls".to_string(),
         arguments: "{\"path\":\".\"}".to_string(),
     }];
@@ -137,6 +140,7 @@ fn openai_formatter_sets_tool_calls_finish_reason_when_tool_calls_present() {
     let mut resp = IrAiResponse::new("gen_1", "gemini-2.5-flash");
     resp.tool_calls = vec![ToolCall {
         id: "call_1".to_string(),
+        kind: ToolCallKind::Function,
         name: "bash".to_string(),
         arguments: "{\"command\":\"ls\"}".to_string(),
     }];
@@ -169,6 +173,7 @@ fn openai_stream_formatter_sets_tool_calls_finish_reason_when_tool_calls_seen() 
         IrStreamDelta::ToolCallStart {
             index: 0,
             id: "call_1".to_string(),
+            kind: ToolCallKind::Function,
             name: "bash".to_string(),
         },
         IrStreamDelta::ToolCallDelta {
@@ -202,6 +207,7 @@ fn gemini_tool_result_correlation_success() {
             content: IrMessageContent::Text(String::new()),
             tool_calls: Some(vec![ToolCall {
                 id: "call_abc".to_string(),
+                kind: ToolCallKind::Function,
                 name: "read_file".to_string(),
                 arguments: "{\"path\":\"src/main.rs\"}".to_string(),
             }]),
@@ -245,11 +251,13 @@ fn gemini_tool_result_id_hint_matches_out_of_order_calls() {
             tool_calls: Some(vec![
                 ToolCall {
                     id: "call_a".to_string(),
+                    kind: ToolCallKind::Function,
                     name: "Glob".to_string(),
                     arguments: "{}".to_string(),
                 },
                 ToolCall {
                     id: "call_b".to_string(),
+                    kind: ToolCallKind::Function,
                     name: "Bash".to_string(),
                     arguments: "{}".to_string(),
                 },
@@ -487,6 +495,7 @@ fn openai_encoder_injects_adjacent_tool_call_for_non_adjacent_match() {
             content: IrMessageContent::Text("will call".to_string()),
             tool_calls: Some(vec![ToolCall {
                 id: "call_x".to_string(),
+                kind: ToolCallKind::Function,
                 name: "ls".to_string(),
                 arguments: "{}".to_string(),
             }]),
@@ -555,6 +564,7 @@ fn openai_encoder_drops_intermediate_assistant_text_before_tool_result() {
             content: IrMessageContent::Text("plan".to_string()),
             tool_calls: Some(vec![ToolCall {
                 id: "call_keep".to_string(),
+                kind: ToolCallKind::Function,
                 name: "exec_command".to_string(),
                 arguments: "{\"command\":\"ls -la\"}".to_string(),
             }]),
@@ -624,6 +634,7 @@ fn openai_encoder_remaps_duplicate_tool_call_ids() {
             content: IrMessageContent::Text(String::new()),
             tool_calls: Some(vec![ToolCall {
                 id: "call_dup".to_string(),
+                kind: ToolCallKind::Function,
                 name: "exec_command".to_string(),
                 arguments: "{}".to_string(),
             }]),
@@ -635,6 +646,7 @@ fn openai_encoder_remaps_duplicate_tool_call_ids() {
             content: IrMessageContent::Text(String::new()),
             tool_calls: Some(vec![ToolCall {
                 id: "call_dup".to_string(),
+                kind: ToolCallKind::Function,
                 name: "exec_command".to_string(),
                 arguments: "{}".to_string(),
             }]),
@@ -708,6 +720,7 @@ fn anthropic_encoder_maps_required_tool_choice_to_any() {
     }];
     let tools = Some(vec![ToolSpec {
         name: "exec_command".to_string(),
+        kind: ToolSpecKind::Function,
         description: Some("Execute command".to_string()),
         parameters: serde_json::json!({"type":"object","properties":{"command":{"type":"string"}}}),
         strict: None,
@@ -748,6 +761,7 @@ fn anthropic_encoder_maps_function_tool_choice_to_tool_name() {
     }];
     let tools = Some(vec![ToolSpec {
         name: "exec_command".to_string(),
+        kind: ToolSpecKind::Function,
         description: Some("Execute command".to_string()),
         parameters: serde_json::json!({"type":"object","properties":{"command":{"type":"string"}}}),
         strict: None,
@@ -815,6 +829,7 @@ fn anthropic_encoder_merges_consecutive_roles_and_drops_empty_text() {
             content: IrMessageContent::Text("tool".to_string()),
             tool_calls: Some(vec![ToolCall {
                 id: "call_1".to_string(),
+                kind: ToolCallKind::Function,
                 name: "exec_command".to_string(),
                 arguments: "{}".to_string(),
             }]),
@@ -875,6 +890,7 @@ fn anthropic_encoder_normalizes_tool_use_ids_for_tool_and_result() {
             content: IrMessageContent::Text(String::new()),
             tool_calls: Some(vec![ToolCall {
                 id: "call_function_abc_1".to_string(),
+                kind: ToolCallKind::Function,
                 name: "glob".to_string(),
                 arguments: "{}".to_string(),
             }]),
@@ -896,6 +912,7 @@ fn anthropic_encoder_normalizes_tool_use_ids_for_tool_and_result() {
     ];
     let tools = Some(vec![ToolSpec {
         name: "glob".to_string(),
+        kind: ToolSpecKind::Function,
         description: None,
         parameters: serde_json::json!({"type":"object","properties":{}}),
         strict: None,
@@ -961,6 +978,227 @@ fn responses_decoder_ignores_empty_message_content_item() {
     );
 }
 
+fn transcode_responses_to_openai_compatible(body: serde_json::Value) -> serde_json::Value {
+    let request = ResponsesDecoder
+        .decode_request(body)
+        .expect("decode Responses request");
+    OpenAIEncoder
+        .encode_request(&request)
+        .expect("encode OpenAI-compatible request")
+        .0
+}
+
+fn encoded_openai_tool_name(tool: &serde_json::Value) -> Option<&str> {
+    tool.pointer("/function/name")
+        .or_else(|| tool.pointer("/custom/name"))
+        .or_else(|| tool.get("name"))
+        .and_then(|value| value.as_str())
+}
+
+#[test]
+fn responses_top_level_function_tool_survives_openai_compatible_transcode() {
+    let body = serde_json::json!({
+        "model": "gpt-5.6",
+        "input": [{
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "wait for the task"}]
+        }],
+        "tools": [{
+            "type": "function",
+            "name": "wait",
+            "description": "Wait for a running task",
+            "parameters": {
+                "type": "object",
+                "properties": {"task_id": {"type": "string"}},
+                "required": ["task_id"],
+                "additionalProperties": false
+            },
+            "strict": false
+        }],
+        "tool_choice": "auto"
+    });
+
+    let encoded = transcode_responses_to_openai_compatible(body);
+    let tools = encoded["tools"].as_array().expect("tools array");
+
+    assert_eq!(tools.len(), 1);
+    assert_eq!(encoded_openai_tool_name(&tools[0]), Some("wait"));
+}
+
+// Regression reproduced from Codex Desktop requests: dynamically available
+// tools are carried by an `additional_tools` input item instead of top-level
+// `tools`. The Responses -> OpenAI-compatible transcode must not drop them.
+#[test]
+fn responses_additional_function_tool_survives_openai_compatible_transcode() {
+    let body = serde_json::json!({
+        "model": "gpt-5.6",
+        "input": [
+            {
+                "type": "additional_tools",
+                "role": "developer",
+                "tools": [{
+                    "type": "function",
+                    "name": "wait",
+                    "description": "Wait for a running task",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"task_id": {"type": "string"}},
+                        "required": ["task_id"],
+                        "additionalProperties": false
+                    },
+                    "strict": false
+                }]
+            },
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "wait for the task"}]
+            }
+        ],
+        "tool_choice": "auto"
+    });
+
+    let encoded = transcode_responses_to_openai_compatible(body);
+    let tools = encoded["tools"]
+        .as_array()
+        .expect("additional function tool must reach the upstream request");
+
+    assert_eq!(tools.len(), 1);
+    assert_eq!(encoded_openai_tool_name(&tools[0]), Some("wait"));
+}
+
+#[test]
+fn responses_additional_mixed_tools_survive_openai_compatible_transcode() {
+    let body = serde_json::json!({
+        "model": "gpt-5.6",
+        "input": [
+            {
+                "type": "additional_tools",
+                "role": "developer",
+                "tools": [
+                    {
+                        "type": "custom",
+                        "name": "exec",
+                        "description": "Run JavaScript code",
+                        "format": {
+                            "type": "grammar",
+                            "syntax": "lark",
+                            "definition": "start: source\nsource: /.+/"
+                        }
+                    },
+                    {
+                        "type": "function",
+                        "name": "wait",
+                        "description": "Wait for a running task",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"task_id": {"type": "string"}},
+                            "required": ["task_id"],
+                            "additionalProperties": false
+                        },
+                        "strict": false
+                    },
+                    {
+                        "type": "function",
+                        "name": "request_user_input",
+                        "description": "Request a decision from the user",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"question": {"type": "string"}},
+                            "required": ["question"],
+                            "additionalProperties": false
+                        },
+                        "strict": false
+                    }
+                ]
+            },
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "inspect the project"}]
+            }
+        ],
+        "parallel_tool_calls": false,
+        "tool_choice": "auto"
+    });
+
+    let encoded = transcode_responses_to_openai_compatible(body);
+    let names: Vec<&str> = encoded["tools"]
+        .as_array()
+        .expect("all additional tools must reach the upstream request")
+        .iter()
+        .filter_map(encoded_openai_tool_name)
+        .collect();
+
+    assert_eq!(names, ["exec", "wait", "request_user_input"]);
+}
+
+#[test]
+fn responses_identical_top_level_and_additional_tools_are_deduplicated() {
+    let tool = serde_json::json!({
+        "type": "function",
+        "name": "wait",
+        "description": "Wait for a running task",
+        "parameters": {
+            "type": "object",
+            "properties": {"task_id": {"type": "string"}},
+            "required": ["task_id"],
+            "additionalProperties": false
+        },
+        "strict": false
+    });
+    let body = serde_json::json!({
+        "model": "gpt-5.6",
+        "tools": [tool.clone()],
+        "input": [
+            {"type": "additional_tools", "role": "developer", "tools": [tool]},
+            {"type": "message", "role": "user", "content": "wait for the task"}
+        ]
+    });
+
+    let request = ResponsesDecoder
+        .decode_request(body)
+        .expect("identical tool definitions should merge");
+    let tools = request.tools.expect("merged tools");
+    assert_eq!(tools.len(), 1);
+    assert_eq!(tools[0].name, "wait");
+}
+
+#[test]
+fn responses_conflicting_top_level_and_additional_tools_are_rejected() {
+    let body = serde_json::json!({
+        "model": "gpt-5.6",
+        "tools": [{
+            "type": "function",
+            "name": "wait",
+            "parameters": {"type": "object", "properties": {"task_id": {"type": "string"}}}
+        }],
+        "input": [
+            {
+                "type": "additional_tools",
+                "role": "developer",
+                "tools": [{
+                    "type": "function",
+                    "name": "wait",
+                    "parameters": {"type": "object", "properties": {"seconds": {"type": "number"}}}
+                }]
+            },
+            {"type": "message", "role": "user", "content": "wait for the task"}
+        ]
+    });
+
+    let error = ResponsesDecoder
+        .decode_request(body)
+        .expect_err("conflicting definitions must not be silently overwritten");
+    assert!(
+        error
+            .to_string()
+            .contains("conflicting tool definitions for 'wait'"),
+        "unexpected error: {error:#}"
+    );
+}
+
 #[test]
 fn openai_encoder_remaps_reused_tool_result_id_with_synthetic_adjacent_call() {
     let messages = vec![
@@ -969,6 +1207,7 @@ fn openai_encoder_remaps_reused_tool_result_id_with_synthetic_adjacent_call() {
             content: IrMessageContent::Text(String::new()),
             tool_calls: Some(vec![ToolCall {
                 id: "call_same".to_string(),
+                kind: ToolCallKind::Function,
                 name: "exec_command".to_string(),
                 arguments: "{}".to_string(),
             }]),
@@ -999,6 +1238,7 @@ fn openai_encoder_remaps_reused_tool_result_id_with_synthetic_adjacent_call() {
     ];
     let tools = Some(vec![ToolSpec {
         name: "exec_command".to_string(),
+        kind: ToolSpecKind::Function,
         description: None,
         parameters: serde_json::json!({"type":"object","properties":{}}),
         strict: None,
@@ -1043,11 +1283,13 @@ fn openai_encoder_rewrites_multi_tool_call_history_to_adjacent_pairs() {
             tool_calls: Some(vec![
                 ToolCall {
                     id: "call_a".to_string(),
+                    kind: ToolCallKind::Function,
                     name: "Glob".to_string(),
                     arguments: "{}".to_string(),
                 },
                 ToolCall {
                     id: "call_b".to_string(),
+                    kind: ToolCallKind::Function,
                     name: "Bash".to_string(),
                     arguments: "{}".to_string(),
                 },
@@ -1072,6 +1314,7 @@ fn openai_encoder_rewrites_multi_tool_call_history_to_adjacent_pairs() {
     ];
     let tools = Some(vec![ToolSpec {
         name: "Glob".to_string(),
+        kind: ToolSpecKind::Function,
         description: None,
         parameters: serde_json::json!({"type":"object","properties":{}}),
         strict: None,
@@ -1158,11 +1401,13 @@ fn openai_encoder_preserves_reasoning_content_across_parallel_tool_calls() {
             tool_calls: Some(vec![
                 ToolCall {
                     id: "call_tokyo".to_string(),
+                    kind: ToolCallKind::Function,
                     name: "get_time".to_string(),
                     arguments: "{\"location\":\"Tokyo\"}".to_string(),
                 },
                 ToolCall {
                     id: "call_paris".to_string(),
+                    kind: ToolCallKind::Function,
                     name: "get_time".to_string(),
                     arguments: "{\"location\":\"Paris\"}".to_string(),
                 },
@@ -1187,6 +1432,7 @@ fn openai_encoder_preserves_reasoning_content_across_parallel_tool_calls() {
     ];
     let tools = Some(vec![ToolSpec {
         name: "get_time".to_string(),
+        kind: ToolSpecKind::Function,
         description: None,
         parameters: serde_json::json!({"type":"object","properties":{"location":{"type":"string"}}}),
         strict: None,
@@ -1373,11 +1619,13 @@ fn openai_encoder_drops_orphan_assistant_tool_calls_without_results() {
             tool_calls: Some(vec![
                 ToolCall {
                     id: "call_old_1".to_string(),
+                    kind: ToolCallKind::Function,
                     name: String::new(),
                     arguments: "{}".to_string(),
                 },
                 ToolCall {
                     id: "call_old_2".to_string(),
+                    kind: ToolCallKind::Function,
                     name: "list_directory".to_string(),
                     arguments: "{}".to_string(),
                 },
@@ -1390,6 +1638,7 @@ fn openai_encoder_drops_orphan_assistant_tool_calls_without_results() {
             content: IrMessageContent::Text(String::new()),
             tool_calls: Some(vec![ToolCall {
                 id: "call_new".to_string(),
+                kind: ToolCallKind::Function,
                 name: "glob".to_string(),
                 arguments: "{}".to_string(),
             }]),
@@ -1406,6 +1655,7 @@ fn openai_encoder_drops_orphan_assistant_tool_calls_without_results() {
     ];
     let tools = Some(vec![ToolSpec {
         name: "glob".to_string(),
+        kind: ToolSpecKind::Function,
         description: None,
         parameters: serde_json::json!({"type":"object","properties":{}}),
         strict: None,
@@ -1454,6 +1704,7 @@ fn gemini_stream_formatter_keeps_tool_name_for_argument_deltas() {
             index: 0,
             id: "call_1".to_string(),
             name: "run_shell_command".to_string(),
+            kind: ToolCallKind::Function,
         },
         IrStreamDelta::ToolCallDelta {
             index: 0,
@@ -1506,6 +1757,7 @@ fn gemini_stream_formatter_normalizes_common_tool_argument_aliases() {
             index: 0,
             id: "call_1".to_string(),
             name: "glob".to_string(),
+            kind: ToolCallKind::Function,
         },
         IrStreamDelta::ToolCallDelta {
             index: 0,
@@ -1559,6 +1811,7 @@ fn gemini_encoder_sanitizes_unsupported_json_schema_fields() {
     }];
     let tools = Some(vec![ToolSpec {
         name: "glob".to_string(),
+        kind: ToolSpecKind::Function,
         description: Some("glob files".to_string()),
         parameters: serde_json::json!({
             "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -1705,6 +1958,7 @@ fn responses_encoder_emits_function_call_and_function_call_output_items() {
                 content: IrMessageContent::Text(String::new()),
                 tool_calls: Some(vec![ToolCall {
                     id: "call_abc".to_string(),
+                    kind: ToolCallKind::Function,
                     name: "list_dir".to_string(),
                     arguments: "{\"path\":\".\"}".to_string(),
                 }]),
@@ -1827,7 +2081,7 @@ data: {\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":7,\"ou
     assert_eq!(text_concat, "Hello");
     assert_eq!(usage_input, 7);
     assert_eq!(usage_output, 2);
-    assert_eq!(done_reason.as_deref(), Some("completed"));
+    assert_eq!(done_reason.as_deref(), Some("stop"));
 }
 
 #[test]
@@ -1891,7 +2145,7 @@ fn responses_response_parser_extracts_text_tool_calls_and_usage() {
     assert_eq!(resp.id, "resp_42");
     assert_eq!(resp.model, "gpt-5.4");
     assert_eq!(resp.content, "Hi there");
-    assert_eq!(resp.stop_reason.as_deref(), Some("completed"));
+    assert_eq!(resp.stop_reason.as_deref(), Some("tool_calls"));
     assert_eq!(resp.usage.prompt_tokens, 11);
     assert_eq!(resp.usage.completion_tokens, 3);
     assert_eq!(resp.tool_calls.len(), 1);

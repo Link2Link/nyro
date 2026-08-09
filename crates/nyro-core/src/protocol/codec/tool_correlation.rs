@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 
 use crate::protocol::ir::request::{
-    AiRequest, ContentBlock, Message, MessageContent, Role, ToolCall,
+    AiRequest, ContentBlock, Message, MessageContent, Role, ToolCall, ToolCallKind,
 };
 
 pub fn normalize_request_tool_results(req: &mut AiRequest) {
@@ -97,6 +97,7 @@ pub fn normalize_request_tool_results(req: &mut AiRequest) {
                 tool_calls: Some(vec![ToolCall {
                     id: final_id.clone(),
                     name: synth_name,
+                    kind: ToolCallKind::Function,
                     arguments: "{}".to_string(),
                 }]),
                 tool_call_id: None,
@@ -140,6 +141,7 @@ mod tests {
             tool_calls: Some(vec![ToolCall {
                 id: tool_id.to_string(),
                 name: tool_name.to_string(),
+                kind: ToolCallKind::Function,
                 arguments: "{}".to_string(),
             }]),
             tool_call_id: None,
@@ -204,6 +206,7 @@ mod tests {
                 tool_calls: Some(vec![ToolCall {
                     id: "".to_string(),
                     name: "my_tool".to_string(),
+                    kind: ToolCallKind::Function,
                     arguments: "{}".to_string(),
                 }]),
                 tool_call_id: None,
@@ -242,11 +245,13 @@ mod tests {
                     ToolCall {
                         id: "call_1".to_string(),
                         name: "tool_a".to_string(),
+                        kind: ToolCallKind::Function,
                         arguments: "{}".to_string(),
                     },
                     ToolCall {
                         id: "call_2".to_string(),
                         name: "tool_b".to_string(),
+                        kind: ToolCallKind::Function,
                         arguments: "{}".to_string(),
                     },
                 ]),

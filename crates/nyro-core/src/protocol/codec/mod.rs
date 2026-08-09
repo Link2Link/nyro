@@ -6,4 +6,5 @@ pub mod anthropic;
 pub mod google;
 pub mod openai;
 pub mod reasoning;
+pub mod tool_bridge;
 pub mod tool_correlation;

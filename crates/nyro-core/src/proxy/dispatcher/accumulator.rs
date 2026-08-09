@@ -38,11 +38,17 @@ impl StreamResponseAccumulator {
             AiStreamDelta::ThinkingDelta(text) => self.reasoning_content.push_str(text),
             AiStreamDelta::ThinkingSignature(sig) => self.reasoning_signature.push_str(sig),
             AiStreamDelta::TextDelta(text) => self.content.push_str(text),
-            AiStreamDelta::ToolCallStart { index, id, name } => {
+            AiStreamDelta::ToolCallStart {
+                index,
+                id,
+                name,
+                kind,
+            } => {
                 ensure_tool_index(&mut self.tool_calls, *index);
                 self.tool_calls[*index] = Some(ToolCall {
                     id: id.clone(),
                     name: name.clone(),
+                    kind: *kind,
                     arguments: String::new(),
                 });
             }
@@ -54,6 +60,7 @@ impl StreamResponseAccumulator {
                     self.tool_calls[*index] = Some(ToolCall {
                         id: format!("tool-{index}"),
                         name: String::new(),
+                        kind: Default::default(),
                         arguments: arguments.clone(),
                     });
                 }
@@ -62,7 +69,7 @@ impl StreamResponseAccumulator {
                 ensure_tool_index(&mut self.tool_calls, *index);
                 self.tool_calls[*index] = Some(tool_call.clone());
             }
-            AiStreamDelta::Usage(usage) => self.usage = usage.clone(),
+            AiStreamDelta::Usage(usage) => self.usage.merge_partial(usage),
             AiStreamDelta::Done { stop_reason } => self.stop_reason = Some(stop_reason.clone()),
             AiStreamDelta::StreamError { error } => {
                 self.stop_reason = Some("error".to_string());

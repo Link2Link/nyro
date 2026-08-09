@@ -273,7 +273,51 @@ pub struct Message {
 pub struct ToolCall {
     pub id: String,
     pub name: String,
+    /// The wire-level tool-call family. Function arguments are JSON text;
+    /// custom-tool input is arbitrary text.
+    #[serde(default)]
+    pub kind: ToolCallKind,
     pub arguments: String,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolCallKind {
+    #[default]
+    Function,
+    Custom,
+}
+
+impl ToolCall {
+    pub fn function(
+        id: impl Into<String>,
+        name: impl Into<String>,
+        arguments: impl Into<String>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            name: name.into(),
+            kind: ToolCallKind::Function,
+            arguments: arguments.into(),
+        }
+    }
+
+    pub fn custom(
+        id: impl Into<String>,
+        name: impl Into<String>,
+        input: impl Into<String>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            name: name.into(),
+            kind: ToolCallKind::Custom,
+            arguments: input.into(),
+        }
+    }
+
+    pub fn is_custom(&self) -> bool {
+        self.kind == ToolCallKind::Custom
+    }
 }
 
 // ── Tool spec ─────────────────────────────────────────────────────────────────
@@ -283,7 +327,10 @@ pub struct ToolSpec {
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    #[serde(default)]
+    pub kind: ToolSpecKind,
     /// JSON Schema for the tool's input parameters.
+    /// Empty for custom tools, whose input is unconstrained text.
     pub parameters: Value,
     /// Whether to enforce strict JSON Schema validation (OpenAI + Anthropic).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -294,6 +341,30 @@ pub struct ToolSpec {
     /// Vendor-specific extra fields not covered by the IR.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub meta: Option<Value>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ToolSpecKind {
+    #[default]
+    Function,
+    Custom {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        format: Option<Value>,
+    },
+}
+
+impl ToolSpec {
+    pub fn is_custom(&self) -> bool {
+        matches!(self.kind, ToolSpecKind::Custom { .. })
+    }
+
+    pub fn custom_format(&self) -> Option<&Value> {
+        match &self.kind {
+            ToolSpecKind::Custom { format } => format.as_ref(),
+            ToolSpecKind::Function => None,
+        }
+    }
 }
 
 /// `tool_choice` — how the model selects tools.

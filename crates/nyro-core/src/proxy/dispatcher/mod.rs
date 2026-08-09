@@ -45,6 +45,7 @@ use crate::plugin::phase::{
     ResponseView,
 };
 use crate::protocol::ProviderProtocols;
+use crate::protocol::codec::tool_bridge::ToolRoutePlan;
 use crate::protocol::ids::ProtocolId;
 use crate::protocol::ir::Usage;
 use crate::protocol::ir::{AiRequest, AiResponse, RawEnvelope};
@@ -440,6 +441,10 @@ async fn dispatch_pipeline_inner(
             }
         }
 
+        let mut upstream_request = request_for_target.clone();
+        let tool_route_plan = ToolRoutePlan::for_request(&upstream_request, egress);
+        tool_route_plan.prepare_upstream_request(&mut upstream_request);
+
         let credential = provider_runtime.access_token.clone();
         // Vendor-level provider context for codec ops. Named distinctly so it
         // does NOT shadow the threaded `RequestContext` (`ctx`), which the
@@ -457,8 +462,9 @@ async fn dispatch_pipeline_inner(
         };
 
         // Build outbound request — PassThrough (Native + no mutations) or full 7-step pipeline.
-        let passthrough_req =
-            plan.mode == ProtocolMode::Native && !adapter.declared_request_mutations();
+        let passthrough_req = plan.mode == ProtocolMode::Native
+            && !adapter.declared_request_mutations()
+            && !tool_route_plan.is_active();
         let passthrough_resp =
             plan.mode == ProtocolMode::Native && !adapter.declared_response_mutations();
         let mut outbound = if passthrough_req {
@@ -479,7 +485,7 @@ async fn dispatch_pipeline_inner(
             }
         } else {
             match adapter
-                .build_request(&mut request_for_target, &provider_ctx)
+                .build_request(&mut upstream_request, &provider_ctx)
                 .await
             {
                 Ok(o) => o,
@@ -557,6 +563,7 @@ async fn dispatch_pipeline_inner(
                 &call_ctx,
                 &req_extras,
                 passthrough_resp,
+                tool_route_plan,
                 ctx,
                 &request_for_target,
             )
@@ -568,6 +575,7 @@ async fn dispatch_pipeline_inner(
                 outbound.headers,
                 outbound.body,
                 &call_ctx,
+                tool_route_plan,
                 ctx,
                 &mut request_for_target,
                 host,
@@ -584,6 +592,7 @@ async fn dispatch_pipeline_inner(
                 adapter.as_ref(),
                 &provider_ctx,
                 passthrough_resp,
+                &tool_route_plan,
                 ctx,
                 &mut request_for_target,
                 host,
@@ -978,11 +987,31 @@ fn ai_response_to_deltas(resp: &AiResponse) -> Vec<crate::protocol::ir::AiStream
                         index: tool_index,
                         id: call_id.clone(),
                         name: name.clone(),
+                        kind: crate::protocol::ir::ToolCallKind::Function,
                     });
                     if !arguments.is_empty() {
                         deltas.push(AiStreamDelta::ToolCallDelta {
                             index: tool_index,
                             arguments: arguments.clone(),
+                        });
+                    }
+                    tool_index += 1;
+                }
+                ResponseItem::CustomToolCall {
+                    call_id,
+                    name,
+                    input,
+                } => {
+                    deltas.push(AiStreamDelta::ToolCallStart {
+                        index: tool_index,
+                        id: call_id.clone(),
+                        name: name.clone(),
+                        kind: crate::protocol::ir::ToolCallKind::Custom,
+                    });
+                    if !input.is_empty() {
+                        deltas.push(AiStreamDelta::ToolCallDelta {
+                            index: tool_index,
+                            arguments: input.clone(),
                         });
                     }
                     tool_index += 1;
@@ -1004,6 +1033,7 @@ fn ai_response_to_deltas(resp: &AiResponse) -> Vec<crate::protocol::ir::AiStream
                 index,
                 id: tool_call.id.clone(),
                 name: tool_call.name.clone(),
+                kind: tool_call.kind,
             });
             if !tool_call.arguments.is_empty() {
                 deltas.push(AiStreamDelta::ToolCallDelta {

@@ -3,7 +3,8 @@ use std::collections::HashSet;
 use anyhow::Result;
 use serde_json::Value;
 
-use crate::protocol::ir::request::ToolCall;
+use crate::protocol::ir::request::{ToolCall, ToolCallKind};
+use crate::protocol::ir::response::ResponseItem;
 use crate::protocol::ir::usage::Usage;
 use crate::protocol::ir::{AiResponse, AiStreamDelta};
 use crate::protocol::{ResponseDecoder, StreamResponseDecoder};
@@ -22,13 +23,9 @@ impl ResponseDecoder for ResponsesResponseParser {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
-        let stop_reason = resp
-            .get("status")
-            .and_then(|v| v.as_str())
-            .map(str::to_string);
-
         let mut content = String::new();
         let mut tool_calls = Vec::new();
+        let mut response_items = Vec::new();
 
         if let Some(items) = resp.get("output").and_then(|v| v.as_array()) {
             for item in items {
@@ -42,11 +39,20 @@ impl ResponseDecoder for ResponsesResponseParser {
                                 ) && let Some(text) = block.get("text").and_then(|v| v.as_str())
                                 {
                                     content.push_str(text);
+                                    response_items.push(ResponseItem::OutputText {
+                                        text: text.to_string(),
+                                    });
                                 }
                             }
                         }
                     }
-                    "function_call" => {
+                    "function_call" | "custom_tool_call" => {
+                        let item_type = item.get("type").and_then(Value::as_str).unwrap_or("");
+                        let kind = if item_type == "custom_tool_call" {
+                            ToolCallKind::Custom
+                        } else {
+                            ToolCallKind::Function
+                        };
                         let call_id = item
                             .get("call_id")
                             .or_else(|| item.get("id"))
@@ -59,15 +65,36 @@ impl ResponseDecoder for ResponsesResponseParser {
                             .unwrap_or("")
                             .to_string();
                         let arguments = item
-                            .get("arguments")
+                            .get(if kind == ToolCallKind::Custom {
+                                "input"
+                            } else {
+                                "arguments"
+                            })
                             .and_then(|v| v.as_str())
-                            .unwrap_or("{}")
+                            .unwrap_or(if kind == ToolCallKind::Custom {
+                                ""
+                            } else {
+                                "{}"
+                            })
                             .to_string();
                         if !call_id.is_empty() && !name.is_empty() {
                             tool_calls.push(ToolCall {
-                                id: call_id,
-                                name,
-                                arguments,
+                                id: call_id.clone(),
+                                name: name.clone(),
+                                kind,
+                                arguments: arguments.clone(),
+                            });
+                            response_items.push(match kind {
+                                ToolCallKind::Function => ResponseItem::FunctionCall {
+                                    call_id,
+                                    name,
+                                    arguments,
+                                },
+                                ToolCallKind::Custom => ResponseItem::CustomToolCall {
+                                    call_id,
+                                    name,
+                                    input: arguments,
+                                },
                             });
                         }
                     }
@@ -110,7 +137,8 @@ impl ResponseDecoder for ResponsesResponseParser {
         let mut ai_resp = AiResponse::new(id, model);
         ai_resp.content = content;
         ai_resp.tool_calls = tool_calls;
-        ai_resp.stop_reason = stop_reason;
+        ai_resp.items = (!response_items.is_empty()).then_some(response_items);
+        ai_resp.stop_reason = responses_stop_reason(&resp, !ai_resp.tool_calls.is_empty());
         ai_resp.usage = usage;
         Ok(ai_resp)
     }
@@ -119,6 +147,7 @@ impl ResponseDecoder for ResponsesResponseParser {
 pub struct ResponsesStreamParser {
     buffer: String,
     started: bool,
+    done: bool,
     started_tool_call_indexes: HashSet<usize>,
     streamed_tool_call_argument_indexes: HashSet<usize>,
 }
@@ -134,6 +163,7 @@ impl ResponsesStreamParser {
         Self {
             buffer: String::new(),
             started: false,
+            done: false,
             started_tool_call_indexes: HashSet::new(),
             streamed_tool_call_argument_indexes: HashSet::new(),
         }
@@ -161,9 +191,16 @@ impl StreamResponseDecoder for ResponsesStreamParser {
                 };
                 let data = data.trim();
                 if data == "[DONE]" {
-                    deltas.push(AiStreamDelta::Done {
-                        stop_reason: "stop".to_string(),
-                    });
+                    if !self.done {
+                        self.done = true;
+                        deltas.push(AiStreamDelta::Done {
+                            stop_reason: if self.started_tool_call_indexes.is_empty() {
+                                "stop".to_string()
+                            } else {
+                                "tool_calls".to_string()
+                            },
+                        });
+                    }
                     continue;
                 }
                 let Ok(payload) = serde_json::from_str::<Value>(data) else {
@@ -236,7 +273,7 @@ impl ResponsesStreamParser {
                     deltas.push(AiStreamDelta::ThinkingDelta(text.to_string()));
                 }
             }
-            "response.function_call_arguments.delta" => {
+            "response.function_call_arguments.delta" | "response.custom_tool_call_input.delta" => {
                 let index = payload
                     .get("output_index")
                     .and_then(|v| v.as_u64())
@@ -257,7 +294,13 @@ impl ResponsesStreamParser {
                     .and_then(|v| v.as_u64())
                     .unwrap_or(0) as usize;
                 let item = payload.get("item").unwrap_or(payload);
-                if item.get("type").and_then(|v| v.as_str()) == Some("function_call") {
+                let item_type = item.get("type").and_then(Value::as_str);
+                if matches!(item_type, Some("function_call" | "custom_tool_call")) {
+                    let kind = if item_type == Some("custom_tool_call") {
+                        ToolCallKind::Custom
+                    } else {
+                        ToolCallKind::Function
+                    };
                     let id = item
                         .get("call_id")
                         .or_else(|| item.get("id"))
@@ -271,11 +314,22 @@ impl ResponsesStreamParser {
                         .to_string();
                     if !id.is_empty() && !name.is_empty() {
                         if self.started_tool_call_indexes.insert(index) {
-                            deltas.push(AiStreamDelta::ToolCallStart { index, id, name });
+                            deltas.push(AiStreamDelta::ToolCallStart {
+                                index,
+                                id,
+                                name,
+                                kind,
+                            });
                         }
                         if event == "response.output_item.done"
                             && !self.streamed_tool_call_argument_indexes.contains(&index)
-                            && let Some(arguments) = item.get("arguments").and_then(|v| v.as_str())
+                            && let Some(arguments) = item
+                                .get(if kind == ToolCallKind::Custom {
+                                    "input"
+                                } else {
+                                    "arguments"
+                                })
+                                .and_then(Value::as_str)
                             && !arguments.is_empty()
                         {
                             self.streamed_tool_call_argument_indexes.insert(index);
@@ -287,7 +341,7 @@ impl ResponsesStreamParser {
                     }
                 }
             }
-            "response.completed" => {
+            "response.completed" | "response.incomplete" => {
                 let response = payload.get("response").unwrap_or(payload);
                 // See note above: surface cache stats from
                 // `usage.input_tokens_details` on the IR Usage.
@@ -319,16 +373,54 @@ impl ResponsesStreamParser {
                 if usage.prompt_tokens > 0 || usage.completion_tokens > 0 {
                     deltas.push(AiStreamDelta::Usage(usage));
                 }
-                deltas.push(AiStreamDelta::Done {
-                    stop_reason: response
-                        .get("status")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("completed")
-                        .to_string(),
-                });
+                if !self.done {
+                    self.done = true;
+                    let has_tool_calls = !self.started_tool_call_indexes.is_empty()
+                        || response_has_tool_calls(response);
+                    deltas.push(AiStreamDelta::Done {
+                        stop_reason: responses_stop_reason(response, has_tool_calls)
+                            .unwrap_or_else(|| "stop".to_string()),
+                    });
+                }
             }
             _ => {}
         }
+    }
+}
+
+fn response_has_tool_calls(response: &Value) -> bool {
+    response
+        .get("output")
+        .and_then(Value::as_array)
+        .is_some_and(|items| {
+            items.iter().any(|item| {
+                matches!(
+                    item.get("type").and_then(Value::as_str),
+                    Some("function_call" | "custom_tool_call")
+                )
+            })
+        })
+}
+
+fn responses_stop_reason(response: &Value, has_tool_calls: bool) -> Option<String> {
+    match response.get("status").and_then(Value::as_str)? {
+        "completed" => Some(if has_tool_calls {
+            "tool_calls".to_string()
+        } else {
+            "stop".to_string()
+        }),
+        "incomplete" => Some(
+            match response
+                .pointer("/incomplete_details/reason")
+                .and_then(Value::as_str)
+            {
+                Some("max_output_tokens") => "length",
+                Some(reason) if !reason.is_empty() => reason,
+                _ => "length",
+            }
+            .to_string(),
+        ),
+        status => Some(status.to_string()),
     }
 }
 
@@ -367,7 +459,7 @@ mod tests {
         });
         let r = ResponsesResponseParser.parse_response(resp).unwrap();
         assert_eq!(r.content, "hello");
-        assert_eq!(r.stop_reason.as_deref(), Some("completed"));
+        assert_eq!(r.stop_reason.as_deref(), Some("stop"));
         assert_eq!(r.usage.prompt_tokens, 5);
     }
 
@@ -495,6 +587,47 @@ mod tests {
         assert_eq!(r.tool_calls.len(), 1);
         assert_eq!(r.tool_calls[0].id, "call_abc");
         assert_eq!(r.tool_calls[0].name, "get_weather");
+    }
+
+    #[test]
+    fn test_parse_incomplete_response_maps_max_output_tokens_to_length() {
+        let response = serde_json::json!({
+            "id": "resp_incomplete",
+            "model": "gpt-5",
+            "status": "incomplete",
+            "incomplete_details": {"reason": "max_output_tokens"},
+            "output": []
+        });
+
+        let parsed = ResponsesResponseParser.parse_response(response).unwrap();
+        assert_eq!(parsed.stop_reason.as_deref(), Some("length"));
+    }
+
+    #[test]
+    fn test_parse_custom_tool_call_output() {
+        let response = serde_json::json!({
+            "id": "resp_custom",
+            "model": "gpt-5",
+            "status": "completed",
+            "output": [{
+                "type": "custom_tool_call",
+                "id": "ctc_1",
+                "call_id": "call_exec",
+                "name": "exec",
+                "input": "console.log(\"ok\");"
+            }]
+        });
+
+        let parsed = ResponsesResponseParser.parse_response(response).unwrap();
+        assert_eq!(parsed.stop_reason.as_deref(), Some("tool_calls"));
+        assert!(matches!(
+            parsed.tool_calls.as_slice(),
+            [ToolCall {
+                kind: ToolCallKind::Custom,
+                arguments,
+                ..
+            }] if arguments == "console.log(\"ok\");"
+        ));
     }
 
     // ── ResponsesStreamParser ──
@@ -628,8 +761,8 @@ mod tests {
         assert!(
             deltas
                 .iter()
-                .any(|delta| matches!(delta, AiStreamDelta::Done { stop_reason } if stop_reason == "completed")),
-            "expected completed Done event, got: {deltas:?}"
+                .any(|delta| matches!(delta, AiStreamDelta::Done { stop_reason } if stop_reason == "stop")),
+            "expected normalized stop Done event, got: {deltas:?}"
         );
     }
 

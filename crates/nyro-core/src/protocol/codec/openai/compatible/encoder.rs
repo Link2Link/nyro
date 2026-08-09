@@ -9,7 +9,7 @@ use crate::protocol::codec::reasoning::{effective_openai_effort, reasoning_effor
 use crate::protocol::ir::request::{
     ContentBlock, MediaSource, Message, MessageContent, Role, ToolChoice, ToolSpec,
 };
-use crate::protocol::ir::{AiRequest, ToolCall};
+use crate::protocol::ir::{AiRequest, ToolCall, ToolCallKind};
 
 pub struct OpenAIEncoder;
 
@@ -231,6 +231,7 @@ fn normalize_messages_for_openai(messages: &[Message], tools: Option<&[ToolSpec]
                     tool_calls: Some(vec![ToolCall {
                         id: final_id.clone(),
                         name: synth_name,
+                        kind: ToolCallKind::Function,
                         arguments: "{}".to_string(),
                     }]),
                     tool_call_id: None,

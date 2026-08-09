@@ -13,7 +13,7 @@ use crate::protocol::ids::OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1;
 use crate::protocol::ir::{
     AiRequest, ContentBlock, GenerationConfig, MediaSource, Message, MessageContent, OpenAIChatExt,
     ProtocolExt, ReasoningConfig, ReasoningEffort, ResponseFormat, Role, StreamConfig, ToolCall,
-    ToolChoice, ToolSpec,
+    ToolCallKind, ToolChoice, ToolSpec, ToolSpecKind,
 };
 
 use super::types::*;
@@ -41,6 +41,7 @@ impl RequestDecoder for OpenAIDecoder {
                             .get("description")
                             .and_then(|d| d.as_str())
                             .map(String::from),
+                        kind: ToolSpecKind::Function,
                         parameters: func
                             .get("parameters")
                             .cloned()
@@ -265,6 +266,7 @@ fn decode_message(msg: OpenAIMessage) -> Result<Message> {
             .map(|tc| ToolCall {
                 id: tc.id,
                 name: tc.function.name,
+                kind: ToolCallKind::Function,
                 arguments: tc.function.arguments,
             })
             .collect()
