@@ -225,6 +225,20 @@ chmod +x nyro-server-linux-x86_64
 
 打开 `http://localhost:19531` 进入管理界面。详细配置参见 [Server 文档](docs/server/README.md) 和 [Standalone 文档](docs/standalone/README.md)。
 
+### 本地 Docker 镜像
+
+在 Linux amd64 或 arm64 主机上，先构建服务端，再把编译结果打包成本地 Docker 镜像和归档文件：
+
+```bash
+make server
+./make-docker.sh
+docker compose up -d
+```
+
+`make-docker.sh` 会构建 `nyro:mine` 镜像、导出 `nyro-mine.tar`，并在 `.env` 不存在时创建该私有文件及随机 `NYRO_ADMIN_TOKEN`。打开 `http://localhost:19531`，使用 `.env` 中的令牌登录。
+
+如需在另一台兼容的 Linux 主机上导入归档，请将 `compose.yaml` 放在归档旁边，创建包含强随机 `NYRO_ADMIN_TOKEN` 的 `.env`，先执行 `docker load -i nyro-mine.tar`，再执行 `docker compose up -d`。归档内是本机架构的原生二进制，因此目标主机必须使用相同的 CPU 架构。
+
 ### SQL 存储后端
 
 默认使用 `--data-dir` 下的本地 SQLite。如需切换到 PostgreSQL 或 MySQL：

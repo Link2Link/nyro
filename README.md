@@ -226,6 +226,20 @@ Available server binaries: `linux-x86_64`, `linux-aarch64`, `macos-x86_64`, `mac
 
 Open `http://localhost:19531` for the management UI. See [Server docs](docs/server/README.md) and [Standalone docs](docs/standalone/README.md) for full configuration reference.
 
+### Local Docker Image
+
+On a Linux amd64 or arm64 host, build the server and package the resulting binary into a local Docker image and archive:
+
+```bash
+make server
+./make-docker.sh
+docker compose up -d
+```
+
+`make-docker.sh` builds the `nyro:mine` image, exports it as `nyro-mine.tar`, and creates a private `.env` with a random `NYRO_ADMIN_TOKEN` when one does not already exist. Open `http://localhost:19531` and sign in with the token stored in `.env`.
+
+To import the archive on another compatible Linux host, place `compose.yaml` beside it, create a `.env` containing a strong `NYRO_ADMIN_TOKEN`, and run `docker load -i nyro-mine.tar` before `docker compose up -d`. The archive contains a native binary and therefore must be loaded on the same CPU architecture on which it was built.
+
 ### SQL Storage Backends
 
 Default behavior: local SQLite under `--data-dir`. To use PostgreSQL or MySQL:

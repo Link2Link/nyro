@@ -1,0 +1,20 @@
+name: nyro
+
+services:
+  nyro:
+    image: nyro:mine
+    pull_policy: never
+    container_name: nyro
+    restart: unless-stopped
+    environment:
+      NYRO_ADMIN_TOKEN: ${NYRO_ADMIN_TOKEN:?Run ./make-docker.sh to generate .env}
+      NYRO_STORAGE_BACKEND: ${NYRO_STORAGE_BACKEND:-sqlite}
+      NYRO_LOG_LEVEL: ${NYRO_LOG_LEVEL:-info}
+    ports:
+      - "19530:19530"
+      - "19531:19531"
+    volumes:
+      - nyro-data:/var/lib/nyro
+
+volumes:
+  nyro-data:

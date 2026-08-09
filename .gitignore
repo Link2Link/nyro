@@ -37,6 +37,10 @@ Thumbs.db
 # Logs
 *.log
 
+# Local Docker artifacts
+/nyro-mine.tar
+/.nyro-mine.tar.*
+
 # pnpm
 .pnpm-store/
 
