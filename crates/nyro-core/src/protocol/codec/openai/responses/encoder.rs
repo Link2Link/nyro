@@ -19,7 +19,8 @@ use crate::protocol::RequestEncoder;
 use crate::protocol::codec::reasoning::{effective_openai_effort, reasoning_effort_name};
 use crate::protocol::ir::AiRequest;
 use crate::protocol::ir::request::{
-    ReasoningConfig, Role, ToolCallKind, ToolChoice, ToolSpec, ToolSpecKind,
+    ContentBlock, MessageContent, ReasoningConfig, Role, ToolCallKind, ToolChoice, ToolSpec,
+    ToolSpecKind,
 };
 
 /// Encoder for the OpenAI Responses API (`POST /v1/responses`).
@@ -61,6 +62,25 @@ impl RequestEncoder for ResponsesEncoder {
                     }
                 }
                 Role::User | Role::Assistant => {
+                    // Block-form tool results (llm-bridge keeps them in user
+                    // messages): emit one `*_tool_call_output` item per block.
+                    let default_call_id = message.tool_call_id.clone().unwrap_or_default();
+                    let custom_from_meta = message
+                        .meta
+                        .as_ref()
+                        .and_then(|meta| meta.get("__nyro_tool_call_kind"))
+                        .and_then(Value::as_str)
+                        == Some("custom");
+                    if push_tool_result_items(
+                        &mut input,
+                        message,
+                        &default_call_id,
+                        custom_from_meta,
+                        &call_kinds,
+                    ) {
+                        continue;
+                    }
+
                     let text = message.content.to_text();
                     if !text.is_empty() {
                         let role_str = match message.role {
@@ -107,6 +127,20 @@ impl RequestEncoder for ResponsesEncoder {
                         .and_then(|meta| meta.get("__nyro_tool_call_kind"))
                         .and_then(Value::as_str)
                         == Some("custom");
+
+                    // Block-form tool results: one item per result block
+                    // (llm-bridge semantics); a plain-text tool message still
+                    // collapses to a single item.
+                    if push_tool_result_items(
+                        &mut input,
+                        message,
+                        &call_id,
+                        custom_from_meta,
+                        &call_kinds,
+                    ) {
+                        continue;
+                    }
+
                     let item_type = if custom_from_meta
                         || call_kinds.get(call_id.as_str()) == Some(&ToolCallKind::Custom)
                     {
@@ -153,6 +187,12 @@ impl RequestEncoder for ResponsesEncoder {
         }
         if let Some(p) = req.generation.top_p {
             obj.insert("top_p".into(), p.into());
+        }
+        // `max_output_tokens` round-trips only when the request itself carried
+        // it (kept in the ingress bag by the decoder); the codex-compatible
+        // egress must not emit it for requests built from other protocols.
+        if let Some(v) = ingress.get("max_output_tokens") {
+            obj.insert("max_output_tokens".into(), v.clone());
         }
 
         // ── Tools (function + custom + built-in) ──────────────────────────────
@@ -230,6 +270,61 @@ impl RequestEncoder for ResponsesEncoder {
     fn egress_path(&self, _model: &str, _stream: bool) -> String {
         "/v1/responses".to_string()
     }
+}
+
+/// Emit one `*_tool_call_output` item per `ToolResult` block of a message.
+/// Returns `true` when the message was consumed as tool results (the caller
+/// should not also emit it as a plain message item).
+fn push_tool_result_items(
+    input: &mut Vec<Value>,
+    message: &crate::protocol::ir::Message,
+    default_call_id: &str,
+    custom_from_meta: bool,
+    call_kinds: &HashMap<&str, ToolCallKind>,
+) -> bool {
+    let MessageContent::Blocks(blocks) = &message.content else {
+        return false;
+    };
+    let results: Vec<&ContentBlock> = blocks
+        .iter()
+        .filter(|b| matches!(b, ContentBlock::ToolResult { .. }))
+        .collect();
+    if results.is_empty() {
+        return false;
+    }
+    for block in results {
+        let ContentBlock::ToolResult {
+            tool_use_id,
+            content,
+            ..
+        } = block
+        else {
+            continue;
+        };
+        let block_call_id = if tool_use_id.trim().is_empty() {
+            default_call_id.to_string()
+        } else {
+            tool_use_id.clone()
+        };
+        let item_type = if custom_from_meta
+            || call_kinds.get(block_call_id.as_str()) == Some(&ToolCallKind::Custom)
+        {
+            "custom_tool_call_output"
+        } else {
+            "function_call_output"
+        };
+        let output = match content {
+            Value::String(s) => s.clone(),
+            Value::Null => String::new(),
+            other => other.to_string(),
+        };
+        input.push(serde_json::json!({
+            "type": item_type,
+            "call_id": block_call_id,
+            "output": output,
+        }));
+    }
+    true
 }
 
 fn reasoning_to_value(reasoning: &ReasoningConfig, max_tokens: Option<u32>) -> Option<Value> {

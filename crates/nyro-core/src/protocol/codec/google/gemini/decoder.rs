@@ -65,7 +65,7 @@ impl GoogleDecoder {
                 .parts
                 .iter()
                 .filter_map(|p| match p {
-                    GooglePart::Text { text } => Some(text.as_str()),
+                    GooglePart::Text { text, .. } => Some(text.as_str()),
                     _ => None,
                 })
                 .collect::<Vec<_>>()
@@ -281,12 +281,22 @@ fn decode_content(content: GoogleContent) -> Result<Message> {
 
     for part in content.parts {
         match part {
-            GooglePart::Text { text } => {
-                text_parts.push(text.clone());
-                blocks.push(ContentBlock::Text {
-                    text,
-                    cache_control: None,
-                });
+            GooglePart::Text { text, thought } => {
+                if thought == Some(true) {
+                    // Gemini 2.5 extended thinking: keep the thought content
+                    // separate from the visible text (and out of the
+                    // single-text collapse below).
+                    blocks.push(ContentBlock::Thinking {
+                        thinking: text,
+                        signature: None,
+                    });
+                } else {
+                    text_parts.push(text.clone());
+                    blocks.push(ContentBlock::Text {
+                        text,
+                        cache_control: None,
+                    });
+                }
             }
             GooglePart::InlineData { inline_data } => {
                 blocks.push(ContentBlock::Image {

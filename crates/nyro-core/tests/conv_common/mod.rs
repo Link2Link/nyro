@@ -305,8 +305,9 @@ pub fn delta_trace(deltas: &[StreamDelta]) -> String {
                 index,
                 id,
                 name,
+                namespace,
                 kind,
-            } => format!("tool_start({index},{id},{name},{kind:?})"),
+            } => format!("tool_start({index},{id},{name},{namespace:?},{kind:?})"),
             StreamDelta::ToolCallDelta { index, arguments } => {
                 format!("tool_delta({index},{arguments:?})")
             }
@@ -343,7 +344,11 @@ pub fn delta_text(deltas: &[StreamDelta]) -> String {
 // helpers give the conversion suites structural equality on the delta model.
 
 fn tool_call_eq(a: &ToolCall, b: &ToolCall) -> bool {
-    a.id == b.id && a.name == b.name && a.kind == b.kind && a.arguments == b.arguments
+    a.id == b.id
+        && a.name == b.name
+        && a.kind == b.kind
+        && a.arguments == b.arguments
+        && a.namespace == b.namespace
 }
 
 fn usage_eq(a: &Usage, b: &Usage) -> bool {
@@ -366,9 +371,9 @@ pub fn delta_eq(a: &StreamDelta, b: &StreamDelta) -> bool {
         (StreamDelta::ThinkingDelta(a), StreamDelta::ThinkingDelta(b)) => a == b,
         (StreamDelta::ThinkingSignature(a), StreamDelta::ThinkingSignature(b)) => a == b,
         (
-            StreamDelta::ToolCallStart { index: ai, id: aid, name: an, kind: ak },
-            StreamDelta::ToolCallStart { index: bi, id: bid, name: bn, kind: bk },
-        ) => ai == bi && aid == bid && an == bn && ak == bk,
+            StreamDelta::ToolCallStart { index: ai, id: aid, name: an, namespace: ans, kind: ak },
+            StreamDelta::ToolCallStart { index: bi, id: bid, name: bn, namespace: bns, kind: bk },
+        ) => ai == bi && aid == bid && an == bn && ans == bns && ak == bk,
         (StreamDelta::ToolCallDelta { index: ai, arguments: aa }, StreamDelta::ToolCallDelta { index: bi, arguments: ba }) => {
             ai == bi && aa == ba
         }

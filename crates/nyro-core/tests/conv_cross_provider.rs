@@ -527,7 +527,6 @@ fn developer_merges_with_existing_system_to_google() {
 // ── structured output across providers ───────────────────────────────────────
 
 #[test]
-#[ignore = "KNOWN GAP: the Google encoder never maps IR `response_format` (JsonSchema) into `generationConfig.responseMimeType` / `responseSchema`; structured output only round-trips within Google via the raw generation config bag"]
 fn openai_json_schema_to_google_response_schema() {
     let out = translate(
         P::OpenAiChat,
@@ -559,7 +558,6 @@ fn openai_json_schema_to_google_response_schema() {
 }
 
 #[test]
-#[ignore = "KNOWN GAP: the OpenAI Chat encoder never maps `generationConfig.responseMimeType`/`responseSchema` (held in GoogleExt) into `response_format`; structured output only round-trips within Google"]
 fn google_response_schema_to_openai_response_format() {
     let out = translate(
         P::GoogleGemini,
@@ -609,7 +607,6 @@ fn tool_choice_auto_to_anthropic() {
 }
 
 #[test]
-#[ignore = "KNOWN GAP: the Google encoder never maps IR `tool_choice` into `toolConfig.functionCallingConfig.mode`; toolConfig only passes through from Google's own `__google_tool_config` ingress key"]
 fn tool_choice_auto_to_google_tool_config() {
     let out = translate(
         P::OpenAiChat,
@@ -650,7 +647,6 @@ fn tool_choice_required_to_anthropic() {
 }
 
 #[test]
-#[ignore = "KNOWN GAP: as with AUTO, IR `tool_choice` is never mapped into the Google `toolConfig.functionCallingConfig.mode`"]
 fn tool_choice_required_to_google_tool_config() {
     let out = translate(
         P::OpenAiChat,

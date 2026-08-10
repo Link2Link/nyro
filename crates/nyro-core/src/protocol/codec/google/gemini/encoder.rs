@@ -6,7 +6,8 @@ use crate::protocol::RequestEncoder;
 use crate::protocol::codec::reasoning::google_thinking_level;
 use crate::protocol::ir::AiRequest;
 use crate::protocol::ir::request::{
-    ContentBlock, MediaSource, Message, MessageContent, ReasoningConfig, ReasoningEffort, Role,
+    ContentBlock, MediaSource, Message, MessageContent, ReasoningConfig, ReasoningEffort,
+    ResponseFormat, Role, ToolChoice,
 };
 
 pub struct GoogleEncoder;
@@ -72,6 +73,26 @@ impl RequestEncoder for GoogleEncoder {
             gen_config.insert("thinkingConfig".into(), thinking_config);
         }
 
+        // ── Structured output: IR `response_format` → `responseMimeType` /
+        //    `responseSchema` (cross-provider bridge; same-protocol raw values
+        //    already present in the ingress bag win).
+        if !gen_config.contains_key("responseMimeType")
+            && let Some(rf) = &req.response_format
+        {
+            match rf {
+                ResponseFormat::JsonSchema { schema, .. } => {
+                    gen_config.insert("responseMimeType".into(), "application/json".into());
+                    if !gen_config.contains_key("responseSchema") {
+                        gen_config.insert("responseSchema".into(), schema.clone());
+                    }
+                }
+                ResponseFormat::JsonObject => {
+                    gen_config.insert("responseMimeType".into(), "application/json".into());
+                }
+                ResponseFormat::Text => {}
+            }
+        }
+
         if !gen_config.is_empty() {
             obj.insert("generationConfig".into(), Value::Object(gen_config));
         }
@@ -128,6 +149,35 @@ impl RequestEncoder for GoogleEncoder {
             obj.insert("cachedContent".into(), v.clone());
         }
 
+        // ── Tool choice: IR `tool_choice` → `toolConfig.functionCallingConfig`
+        //    (cross-provider bridge; a same-protocol raw `__google_tool_config`
+        //    already takes precedence above).
+        if !obj.contains_key("toolConfig")
+            && let Some(tc) = &req.tool_choice
+        {
+            let fcc: Option<Value> = match tc {
+                ToolChoice::Auto => Some(serde_json::json!({"mode": "AUTO"})),
+                ToolChoice::Required => Some(serde_json::json!({"mode": "ANY"})),
+                ToolChoice::None => Some(serde_json::json!({"mode": "NONE"})),
+                ToolChoice::Named { name, .. } => Some(serde_json::json!({
+                    "mode": "ANY",
+                    "allowed_function_names": [name]
+                })),
+                ToolChoice::Raw(v) => match v.as_str() {
+                    Some("auto") => Some(serde_json::json!({"mode": "AUTO"})),
+                    Some("any") | Some("required") => Some(serde_json::json!({"mode": "ANY"})),
+                    Some("none") => Some(serde_json::json!({"mode": "NONE"})),
+                    _ => None,
+                },
+            };
+            if let Some(fcc) = fcc {
+                obj.insert(
+                    "toolConfig".into(),
+                    serde_json::json!({"functionCallingConfig": fcc}),
+                );
+            }
+        }
+
         Ok((body, HeaderMap::new()))
     }
 
@@ -145,19 +195,27 @@ fn google_reasoning_config(reasoning: &ReasoningConfig) -> Option<Value> {
         Some(ReasoningEffort::Budget(tokens)) => Some(*tokens),
         _ => None,
     });
+    let level = reasoning.effort.as_ref().and_then(google_thinking_level);
 
-    if let Some(tokens) = budget {
-        return Some(serde_json::json!({"thinkingBudget": tokens}));
+    match (budget, level) {
+        // Keep both dimensions when the IR carries both: llm-bridge writes
+        // `thinkingBudget` + `thinkingLevel` together.
+        (Some(tokens), Some(level)) => Some(serde_json::json!({
+            "thinkingBudget": tokens,
+            "thinkingLevel": level
+        })),
+        (Some(tokens), None) => Some(serde_json::json!({"thinkingBudget": tokens})),
+        (None, Some(level)) => Some(serde_json::json!({"thinkingLevel": level})),
+        (None, None) => {
+            if matches!(reasoning.effort.as_ref(), Some(ReasoningEffort::None)) {
+                Some(serde_json::json!({"thinkingBudget": 0}))
+            } else {
+                reasoning
+                    .enabled
+                    .then_some(Value::Object(serde_json::Map::new()))
+            }
+        }
     }
-    if matches!(reasoning.effort.as_ref(), Some(ReasoningEffort::None)) {
-        return Some(serde_json::json!({"thinkingBudget": 0}));
-    }
-    if let Some(level) = reasoning.effort.as_ref().and_then(google_thinking_level) {
-        return Some(serde_json::json!({"thinkingLevel": level}));
-    }
-    reasoning
-        .enabled
-        .then_some(Value::Object(serde_json::Map::new()))
 }
 
 // ── Schema sanitisation ───────────────────────────────────────────────────────

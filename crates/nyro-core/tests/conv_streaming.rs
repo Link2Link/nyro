@@ -67,6 +67,7 @@ fn openai_parser_tool_call_deltas() {
             id: "call_abc".to_string(),
             name: "get_weather".to_string(),
             kind: ToolCallKind::Function,
+            namespace: None,
         },
         "{trace}"
     );
@@ -464,6 +465,7 @@ fn responses_parser_function_call_events() {
             id,
             name,
             kind: ToolCallKind::Function,
+            namespace: None,
         } if id == "call_xyz" && name == "get_weather"
     ), "{trace}");
     let joined: String = deltas
@@ -623,6 +625,7 @@ fn anthropic_emitter_parallel_tool_calls_unique_block_indices() {
                 id: "call_1".to_string(),
                 name: "get_weather".to_string(),
                 kind: ToolCallKind::Function,
+                namespace: None,
             },
             StreamDelta::ToolCallDelta {
                 index: 0,
@@ -633,6 +636,7 @@ fn anthropic_emitter_parallel_tool_calls_unique_block_indices() {
                 id: "call_2".to_string(),
                 name: "get_time".to_string(),
                 kind: ToolCallKind::Function,
+                namespace: None,
             },
             StreamDelta::ToolCallDelta {
                 index: 1,
@@ -738,6 +742,7 @@ fn anthropic_emitter_sequential_tool_calls() {
                 id: "call_1".to_string(),
                 name: "get_weather".to_string(),
                 kind: ToolCallKind::Function,
+                namespace: None,
             },
             StreamDelta::ToolCallDelta {
                 index: 0,
@@ -752,6 +757,7 @@ fn anthropic_emitter_sequential_tool_calls() {
                 id: "call_2".to_string(),
                 name: "get_time".to_string(),
                 kind: ToolCallKind::Function,
+                namespace: None,
             },
             StreamDelta::ToolCallDelta {
                 index: 1,
@@ -854,6 +860,7 @@ fn responses_emitter_tool_calls() {
                 id: "call_abc".to_string(),
                 name: "get_weather".to_string(),
                 kind: ToolCallKind::Function,
+                namespace: None,
             },
             StreamDelta::ToolCallDelta {
                 index: 0,
@@ -924,6 +931,7 @@ fn responses_emitter_text_closed_before_tool_calls() {
                 id: "call_1".to_string(),
                 name: "search".to_string(),
                 kind: ToolCallKind::Function,
+                namespace: None,
             },
             StreamDelta::ToolCallDelta {
                 index: 0,

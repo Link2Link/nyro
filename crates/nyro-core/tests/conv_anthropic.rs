@@ -275,7 +275,6 @@ fn tool_definitions_with_input_schema() {
 }
 
 #[test]
-#[ignore = "KNOWN GAP: the Anthropic decoder only maps the object form `{\"type\": \"auto\"}`; the spec-valid string form `\"auto\"` lands in ToolChoice::Raw instead of ToolChoice::Auto (llm-bridge keeps it verbatim)"]
 fn tool_choice_auto_to_universal() {
     // KNOWN GAP: the Anthropic decoder only maps the object form
     // `{"type": "auto"}`; the spec-valid string form `"auto"` lands in
@@ -302,7 +301,6 @@ fn tool_choice_auto_to_universal() {
 }
 
 #[test]
-#[ignore = "KNOWN GAP: as with `auto`, only the object form of `tool_choice` is parsed today; the string form `\"any\"` lands in ToolChoice::Raw instead of ToolChoice::Required (llm-bridge keeps `any` verbatim in universal)"]
 fn tool_choice_any_maps_to_required() {
     // llm-bridge keeps `"any"` verbatim; Nyro's IR normalises it to Required.
     // KNOWN GAP: as with `"auto"`, only the object form is parsed today.
@@ -479,7 +477,6 @@ fn thinking_content_block_with_signature() {
 }
 
 #[test]
-#[ignore = "KNOWN GAP: the block encoder supports `redacted_thinking` but the final payload validation (ALLOWED_BLOCK_TYPES) rejects it, so the request fails with \"unsupported block type\" instead of round-tripping"]
 fn redacted_thinking_encodes_from_ir() {
     // KNOWN GAP: the block encoder supports `redacted_thinking` but the final
     // payload validation (`ALLOWED_BLOCK_TYPES`) rejects it, so the request
@@ -835,6 +832,7 @@ fn tool_choice_named_emits_tool_wire_format() {
         name: "calculator".to_string(),
         description: Some("Do math".to_string()),
         kind: Default::default(),
+        namespace: None,
         parameters: json!({"type": "object", "properties": {}}),
         strict: None,
         cache_control: None,
@@ -842,6 +840,7 @@ fn tool_choice_named_emits_tool_wire_format() {
     }]);
     req.tool_choice = Some(ToolChoice::Named {
         name: "calculator".to_string(),
+        namespace: None,
     });
 
     let out = encode_request(P::AnthropicMessages, &req);

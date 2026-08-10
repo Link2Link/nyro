@@ -389,7 +389,6 @@ fn round_trip_preserves_generation_params() {
 }
 
 #[test]
-#[ignore = "KNOWN GAP: the OpenAI Chat encoder drops `strict` from function tools, so the flag does not survive the round trip"]
 fn round_trip_tool_definitions() {
     // KNOWN GAP: the OpenAI Chat encoder drops `strict` from function tools,
     // so the flag does not survive the round trip.

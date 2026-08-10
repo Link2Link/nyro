@@ -72,8 +72,7 @@ fn multi_turn_input_with_roles() {
 // ── input_image content type ─────────────────────────────────────────────────
 
 #[test]
-#[ignore = "KNOWN GAP: `input_image` content blocks are dropped by the Responses decoder (only `input_text`-style blocks are kept); the text part survives, the image does not"]
-fn input_image_decode_gap() {
+fn input_image_decodes_to_image_block() {
     // KNOWN GAP: `input_image` content blocks are dropped by the Responses
     // decoder (only `input_text`-style blocks are kept). The text part
     // survives; the image does not.
@@ -206,7 +205,6 @@ fn reasoning_config_maps_to_reasoning() {
 // ── structured output ────────────────────────────────────────────────────────
 
 #[test]
-#[ignore = "KNOWN GAP: `text.format` is only pass-through in the ingress bag; the Responses decoder does not map json_schema into `response_format`"]
 fn text_format_json_schema_maps_to_response_format() {
     // KNOWN GAP: `text.format` is only pass-through in the ingress bag; the
     // Responses decoder does not map it into `response_format`.
@@ -262,7 +260,6 @@ fn text_format_json_schema_maps_to_response_format() {
 }
 
 #[test]
-#[ignore = "KNOWN GAP: `text.format` json_object is not mapped into IR `response_format` by the Responses decoder"]
 fn text_format_json_object_maps_to_response_format() {
     // KNOWN GAP: as above, `text.format` json_object is not mapped into IR.
     let req = decode_request(
@@ -349,8 +346,7 @@ fn round_trip_basic_conversation() {
 }
 
 #[test]
-#[ignore = "KNOWN GAP: `max_output_tokens` is decoded to IR but the Responses encoder never re-emits it"]
-fn round_trip_max_output_tokens_gap() {
+fn round_trip_max_output_tokens() {
     let out = round_trip_request(
         P::OpenAiResponses,
         json!({
@@ -521,7 +517,6 @@ fn round_trip_builtin_tools_alongside_function_tools() {
 // ── fix-verification ported cases ────────────────────────────────────────────
 
 #[test]
-#[ignore = "KNOWN GAP: the Responses encoder emits one `function_call_output` item per Role::Tool message via `content.to_text()`, which drops block-form tool results (multiple results collapse into a single item with empty output); llm-bridge emits one item per tool_result block"]
 fn multiple_tool_results_become_function_call_output_items() {
     // fix-verification "should convert multiple tool_results in user message to
     // function_call_output items": llm-bridge emits one item per tool_result.

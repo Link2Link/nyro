@@ -9,7 +9,7 @@ use crate::protocol::codec::reasoning::{effective_openai_effort, reasoning_effor
 use crate::protocol::ir::request::{
     ContentBlock, MediaSource, Message, MessageContent, Role, ToolChoice, ToolSpec,
 };
-use crate::protocol::ir::{AiRequest, ToolCall, ToolCallKind};
+use crate::protocol::ir::{AiRequest, ProtocolExt, ToolCall, ToolCallKind};
 
 pub struct OpenAIEncoder;
 
@@ -56,6 +56,11 @@ impl RequestEncoder for OpenAIEncoder {
                         f.as_object_mut()
                             .unwrap()
                             .insert("description".into(), desc.clone().into());
+                    }
+                    if let Some(strict) = t.strict {
+                        f.as_object_mut()
+                            .unwrap()
+                            .insert("strict".into(), strict.into());
                     }
                     serde_json::json!({
                         "type": "function",
@@ -105,6 +110,33 @@ impl RequestEncoder for OpenAIEncoder {
                 .and_then(reasoning_effort_name)
         {
             obj.insert("reasoning_effort".into(), Value::String(effort.into()));
+        }
+
+        // Cross-provider structured output: Google's
+        // `responseMimeType`/`responseSchema` (held in GoogleExt) → OpenAI
+        // `response_format`. Only fires when the request carries no
+        // `response_format` of its own (ingress passthrough above wins).
+        if !obj.contains_key("response_format")
+            && let Some(ProtocolExt::Google(ext)) = &req.ext
+        {
+            let wants_json = ext.response_mime_type.as_deref() == Some("application/json")
+                || ext.response_json_schema.is_some();
+            if wants_json {
+                if let Some(schema) = &ext.response_json_schema {
+                    obj.insert(
+                        "response_format".into(),
+                        serde_json::json!({
+                            "type": "json_schema",
+                            "json_schema": {"schema": schema}
+                        }),
+                    );
+                } else {
+                    obj.insert(
+                        "response_format".into(),
+                        serde_json::json!({"type": "json_object"}),
+                    );
+                }
+            }
         }
 
         // Passthrough any remaining unknown extra fields.

@@ -37,6 +37,11 @@ pub struct GoogleContent {
 pub enum GooglePart {
     Text {
         text: String,
+        /// Gemini 2.5 extended-thinking marker (`{"thought": true, "text": ...}`).
+        /// Kept on the variant so the untagged deserialiser does not fold
+        /// thought parts into plain text.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        thought: Option<bool>,
     },
     InlineData {
         #[serde(rename = "inlineData")]

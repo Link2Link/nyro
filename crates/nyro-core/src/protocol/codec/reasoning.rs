@@ -34,13 +34,16 @@ pub fn anthropic_effort_name(effort: &ReasoningEffort) -> Option<&'static str> {
     }
 }
 
+/// Gemini `thinkingConfig.thinkingLevel` values are lowercase per the API spec
+/// (`low` / `medium` / `high`), unlike the uppercase wire conventions of the
+/// OpenAI-family protocols.
 pub fn google_thinking_level(effort: &ReasoningEffort) -> Option<&'static str> {
     match effort {
         ReasoningEffort::None | ReasoningEffort::Budget(_) => None,
-        ReasoningEffort::Minimal => Some("MINIMAL"),
-        ReasoningEffort::Low => Some("LOW"),
-        ReasoningEffort::Medium => Some("MEDIUM"),
-        ReasoningEffort::High | ReasoningEffort::Xhigh | ReasoningEffort::Max => Some("HIGH"),
+        ReasoningEffort::Minimal => Some("low"),
+        ReasoningEffort::Low => Some("low"),
+        ReasoningEffort::Medium => Some("medium"),
+        ReasoningEffort::High | ReasoningEffort::Xhigh | ReasoningEffort::Max => Some("high"),
     }
 }
 
@@ -228,12 +231,9 @@ mod tests {
             Some("low")
         );
         assert_eq!(anthropic_effort_name(&ReasoningEffort::Max), Some("max"));
-        assert_eq!(
-            google_thinking_level(&ReasoningEffort::Minimal),
-            Some("MINIMAL")
-        );
-        assert_eq!(google_thinking_level(&ReasoningEffort::Xhigh), Some("HIGH"));
-        assert_eq!(google_thinking_level(&ReasoningEffort::Max), Some("HIGH"));
+        assert_eq!(google_thinking_level(&ReasoningEffort::Minimal), Some("low"));
+        assert_eq!(google_thinking_level(&ReasoningEffort::Xhigh), Some("high"));
+        assert_eq!(google_thinking_level(&ReasoningEffort::Max), Some("high"));
     }
 
     #[test]

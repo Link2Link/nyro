@@ -9,9 +9,9 @@ use crate::protocol::RequestDecoder;
 use crate::protocol::codec::reasoning::parse_reasoning_effort;
 use crate::protocol::ids::OPENAI_RESPONSES_V1;
 use crate::protocol::ir::{
-    AiRequest, GenerationConfig, Message, MessageContent, OpenAIResponsesExt, ProtocolExt,
-    ReasoningConfig, ReasoningEffort, Role, StreamConfig, ToolCall, ToolCallKind, ToolChoice,
-    ToolSpec, ToolSpecKind,
+    AiRequest, ContentBlock, GenerationConfig, MediaSource, Message, MessageContent,
+    OpenAIResponsesExt, ProtocolExt, ReasoningConfig, ReasoningEffort, ResponseFormat, Role,
+    StreamConfig, ToolCall, ToolCallKind, ToolChoice, ToolSpec, ToolSpecKind,
 };
 
 pub struct ResponsesDecoder;
@@ -190,6 +190,23 @@ impl RequestDecoder for ResponsesDecoder {
             ReasoningConfig::default()
         };
 
+        // ── Structured output via `text.format` ───────────────────────────────
+        let response_format = obj.get("text").and_then(|t| t.get("format")).map(|fmt| {
+            match fmt.get("type").and_then(Value::as_str) {
+                Some("json_schema") => ResponseFormat::JsonSchema {
+                    name: fmt
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string(),
+                    schema: fmt.get("schema").cloned().unwrap_or(Value::Null),
+                    strict: fmt.get("strict").and_then(Value::as_bool),
+                },
+                Some("json_object") => ResponseFormat::JsonObject,
+                _ => ResponseFormat::Text,
+            }
+        });
+
         // ── ProtocolExt ───────────────────────────────────────────────────────
         let resp_ext = OpenAIResponsesExt {
             background: obj.get("background").and_then(|v| v.as_bool()),
@@ -233,6 +250,15 @@ impl RequestDecoder for ResponsesDecoder {
                 ingress.entry(key.to_string()).or_insert_with(|| v.clone());
             }
         }
+        // Keep the original `max_output_tokens` in the ingress bag so a
+        // responses→responses round trip re-emits it, while requests built
+        // from other protocols (which must not leak the field into the
+        // codex-compatible egress) stay untouched.
+        if let Some(v) = obj.get("max_output_tokens") {
+            ingress
+                .entry("max_output_tokens".to_string())
+                .or_insert_with(|| v.clone());
+        }
 
         // ── Build AiRequest ───────────────────────────────────────────────────
         let mut ai_req = AiRequest::new(model, messages);
@@ -250,6 +276,7 @@ impl RequestDecoder for ResponsesDecoder {
         ai_req.tool_choice = tool_choice;
         ai_req.parallel_tool_calls = parallel_tool_calls;
         ai_req.reasoning = reasoning;
+        ai_req.response_format = response_format;
         ai_req.ext = Some(ProtocolExt::OpenAiResponses(resp_ext));
         ai_req.meta.source_protocol = Some(OPENAI_RESPONSES_V1);
         ai_req.meta.vendor.ingress = ingress;
@@ -372,22 +399,52 @@ fn decode_message_item(item: &Value) -> Result<Option<Message>> {
         Some(Value::String(text)) => MessageContent::Text(text.clone()),
         Some(Value::Array(blocks)) => {
             let mut texts = Vec::new();
+            let mut content_blocks: Vec<ContentBlock> = Vec::new();
             for block in blocks {
                 let block_type = block.get("type").and_then(|v| v.as_str()).unwrap_or("text");
                 match block_type {
                     "input_text" | "output_text" | "text" => {
                         if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
                             texts.push(text.to_string());
+                            content_blocks.push(ContentBlock::Text {
+                                text: text.to_string(),
+                                cache_control: None,
+                            });
+                        }
+                    }
+                    "input_image" => {
+                        let url = match block.get("image_url").cloned() {
+                            Some(Value::String(s)) => s,
+                            Some(Value::Object(o)) => o
+                                .get("url")
+                                .and_then(|u| u.as_str())
+                                .unwrap_or("")
+                                .to_string(),
+                            _ => String::new(),
+                        };
+                        if !url.is_empty() {
+                            content_blocks.push(ContentBlock::Image {
+                                source: MediaSource::Url(url),
+                                cache_control: None,
+                            });
                         }
                     }
                     _ => {}
                 }
             }
-            let text = texts.join("");
-            if text.is_empty() {
-                return Ok(None);
+            if content_blocks
+                .iter()
+                .any(|b| matches!(b, ContentBlock::Image { .. }))
+            {
+                // Keep multimodal input as blocks; the image must survive.
+                MessageContent::Blocks(content_blocks)
+            } else {
+                let text = texts.join("");
+                if text.is_empty() {
+                    return Ok(None);
+                }
+                MessageContent::Text(text)
             }
-            MessageContent::Text(text)
         }
         Some(_) => anyhow::bail!("unsupported content type in responses input item"),
         None => return Ok(None),

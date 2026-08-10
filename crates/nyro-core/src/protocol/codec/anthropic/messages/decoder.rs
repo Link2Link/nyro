@@ -609,6 +609,16 @@ fn map_doc_source(src: WireDocumentSource) -> IrDocumentSource {
 }
 
 fn parse_tool_choice(v: Value) -> ToolChoice {
+    // The Anthropic API accepts the bare string forms `"auto"` / `"any"` /
+    // `"none"` in addition to the object form `{"type": ...}`.
+    if let Some(s) = v.as_str() {
+        return match s {
+            "auto" => ToolChoice::Auto,
+            "any" => ToolChoice::Required,
+            "none" => ToolChoice::None,
+            _ => ToolChoice::Raw(v),
+        };
+    }
     match v.get("type").and_then(|t| t.as_str()) {
         Some("auto") => ToolChoice::Auto,
         Some("any") => ToolChoice::Required,

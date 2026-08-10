@@ -336,7 +336,6 @@ fn thinking_budget_and_level_together() {
 // ── thought parts ────────────────────────────────────────────────────────────
 
 #[test]
-#[ignore = "KNOWN GAP: `GooglePart` is `#[serde(untagged)]` and declares `Text` before the `Other` catch-all, so a `{\"thought\": true, \"text\": ...}` part deserialises as plain `Text` and the thinking marker is lost"]
 fn thought_parts_become_thinking_blocks() {
     // KNOWN GAP: `GooglePart` is `#[serde(untagged)]` and declares `Text`
     // before the `Other` catch-all, so a `{"thought": true, "text": ...}`
@@ -640,6 +639,7 @@ fn universal_tools_to_google_function_declarations() {
         name: "search".to_string(),
         description: Some("Search the web".to_string()),
         kind: Default::default(),
+        namespace: None,
         parameters: json!({
             "type": "object",
             "properties": {"query": {"type": "string"}}
@@ -658,7 +658,6 @@ fn universal_tools_to_google_function_declarations() {
 }
 
 #[test]
-#[ignore = "KNOWN GAP: `google_reasoning_config` returns only `thinkingBudget` when a budget is present, silently dropping the effort level even though the IR carries both"]
 fn universal_thinking_config_written_back() {
     // KNOWN GAP: `google_reasoning_config` returns only `thinkingBudget` when
     // a budget is present, silently dropping the effort level even though the
@@ -1035,6 +1034,7 @@ fn schema_unsupported_fields_stripped_for_gemini() {
             "additionalProperties": false
         }),
         kind: Default::default(),
+        namespace: None,
         strict: None,
         cache_control: None,
         meta: None,

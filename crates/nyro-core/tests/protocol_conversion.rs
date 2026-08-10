@@ -3298,32 +3298,32 @@ fn reasoning_encoders_emit_target_specific_effort_levels() {
             ReasoningEffort::Minimal,
             "minimal",
             Some("low"),
-            Some("MINIMAL"),
+            Some("low"),
             None,
         ),
-        (ReasoningEffort::Low, "low", Some("low"), Some("LOW"), None),
+        (ReasoningEffort::Low, "low", Some("low"), Some("low"), None),
         (
             ReasoningEffort::Medium,
             "medium",
             Some("medium"),
-            Some("MEDIUM"),
+            Some("medium"),
             None,
         ),
         (
             ReasoningEffort::High,
             "high",
             Some("high"),
-            Some("HIGH"),
+            Some("high"),
             None,
         ),
         (
             ReasoningEffort::Xhigh,
             "xhigh",
             Some("xhigh"),
-            Some("HIGH"),
+            Some("high"),
             None,
         ),
-        (ReasoningEffort::Max, "max", Some("max"), Some("HIGH"), None),
+        (ReasoningEffort::Max, "max", Some("max"), Some("high"), None),
     ];
 
     for (effort, openai, anthropic, google_level, google_budget) in levels {
@@ -3386,9 +3386,15 @@ fn assert_high_effort_in_every_egress(request: &AiRequest) {
     let (google, _) = GoogleEncoder
         .encode_request(request)
         .expect("encode google");
-    assert_eq!(
-        google["generationConfig"]["thinkingConfig"]["thinkingLevel"],
-        "HIGH"
+    // The Google egress keeps the effort either via the IR reasoning config
+    // (lowercase, API-spec) or the raw generation-config passthrough (verbatim
+    // from the upstream request), so compare case-insensitively.
+    let google_level = google["generationConfig"]["thinkingConfig"]["thinkingLevel"]
+        .as_str()
+        .unwrap_or_else(|| panic!("missing google thinkingLevel: {google}"));
+    assert!(
+        google_level.eq_ignore_ascii_case("high"),
+        "high effort must survive the Google egress, got {google_level:?}"
     );
 }
 
