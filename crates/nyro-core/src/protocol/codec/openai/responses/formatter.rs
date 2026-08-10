@@ -36,30 +36,36 @@ impl ResponseEncoder for ResponsesResponseFormatter {
                     ResponseItem::FunctionCall {
                         call_id,
                         name,
+                        namespace,
                         arguments,
                     } => {
-                        output.push(serde_json::json!({
+                        let mut item = serde_json::json!({
                             "type": "function_call",
                             "id": format!("fc_{}", Uuid::new_v4().simple()),
                             "call_id": call_id,
                             "name": name,
                             "arguments": arguments,
                             "status": "completed"
-                        }));
+                        });
+                        insert_optional_namespace(&mut item, namespace.as_deref());
+                        output.push(item);
                     }
                     ResponseItem::CustomToolCall {
                         call_id,
                         name,
+                        namespace,
                         input,
                     } => {
-                        output.push(serde_json::json!({
+                        let mut item = serde_json::json!({
                             "type": "custom_tool_call",
                             "id": format!("ctc_{}", Uuid::new_v4().simple()),
                             "call_id": call_id,
                             "name": name,
                             "input": input,
                             "status": "completed"
-                        }));
+                        });
+                        insert_optional_namespace(&mut item, namespace.as_deref());
+                        output.push(item);
                     }
                     ResponseItem::OutputText { text } => {
                         output_text.push_str(text);
@@ -79,7 +85,7 @@ impl ResponseEncoder for ResponsesResponseFormatter {
                 }));
             }
             for tc in &resp.tool_calls {
-                output.push(match tc.kind {
+                let mut item = match tc.kind {
                     ToolCallKind::Function => serde_json::json!({
                         "type": "function_call",
                         "id": format!("fc_{}", Uuid::new_v4().simple()),
@@ -96,7 +102,9 @@ impl ResponseEncoder for ResponsesResponseFormatter {
                         "input": tc.arguments,
                         "status": "completed"
                     }),
-                });
+                };
+                insert_optional_namespace(&mut item, tc.namespace.as_deref());
+                output.push(item);
             }
             output_text.push_str(&resp.content);
         }
@@ -128,5 +136,14 @@ impl ResponseEncoder for ResponsesResponseFormatter {
                 "total_tokens": resp.usage.prompt_tokens + resp.usage.completion_tokens
             }
         })
+    }
+}
+
+fn insert_optional_namespace(value: &mut Value, namespace: Option<&str>) {
+    if let Some(namespace) = namespace {
+        value
+            .as_object_mut()
+            .expect("tool call object")
+            .insert("namespace".into(), Value::String(namespace.to_string()));
     }
 }

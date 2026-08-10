@@ -981,12 +981,14 @@ fn ai_response_to_deltas(resp: &AiResponse) -> Vec<crate::protocol::ir::AiStream
                 ResponseItem::FunctionCall {
                     call_id,
                     name,
+                    namespace,
                     arguments,
                 } => {
                     deltas.push(AiStreamDelta::ToolCallStart {
                         index: tool_index,
                         id: call_id.clone(),
                         name: name.clone(),
+                        namespace: namespace.clone(),
                         kind: crate::protocol::ir::ToolCallKind::Function,
                     });
                     if !arguments.is_empty() {
@@ -1000,12 +1002,14 @@ fn ai_response_to_deltas(resp: &AiResponse) -> Vec<crate::protocol::ir::AiStream
                 ResponseItem::CustomToolCall {
                     call_id,
                     name,
+                    namespace,
                     input,
                 } => {
                     deltas.push(AiStreamDelta::ToolCallStart {
                         index: tool_index,
                         id: call_id.clone(),
                         name: name.clone(),
+                        namespace: namespace.clone(),
                         kind: crate::protocol::ir::ToolCallKind::Custom,
                     });
                     if !input.is_empty() {
@@ -1033,6 +1037,7 @@ fn ai_response_to_deltas(resp: &AiResponse) -> Vec<crate::protocol::ir::AiStream
                 index,
                 id: tool_call.id.clone(),
                 name: tool_call.name.clone(),
+                namespace: tool_call.namespace.clone(),
                 kind: tool_call.kind,
             });
             if !tool_call.arguments.is_empty() {

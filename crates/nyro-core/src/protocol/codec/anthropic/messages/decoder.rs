@@ -137,6 +137,7 @@ impl RequestDecoder for AnthropicDecoder {
                     // Also keep sentinel ToolSpec so dispatcher knows about it.
                     user_tools.push(ToolSpec {
                         name: format!("__builtin__{}", tool_type),
+                        namespace: None,
                         description: t.description,
                         kind: ToolSpecKind::Function,
                         parameters: t.input_schema.unwrap_or(Value::Object(Default::default())),
@@ -147,6 +148,7 @@ impl RequestDecoder for AnthropicDecoder {
                 } else if let Some(schema) = t.input_schema {
                     user_tools.push(ToolSpec {
                         name: t.name,
+                        namespace: None,
                         description: t.description,
                         kind: ToolSpecKind::Function,
                         parameters: schema,
@@ -349,6 +351,7 @@ fn decode_message(msg: AnthropicMessage) -> Result<Vec<Message>> {
                         tcs.push(ToolCall {
                             id: id.clone(),
                             name: name.clone(),
+                            namespace: None,
                             kind: ToolCallKind::Function,
                             arguments: input.to_string(),
                         });
@@ -614,6 +617,7 @@ fn parse_tool_choice(v: Value) -> ToolChoice {
             if let Some(name) = v.get("name").and_then(|n| n.as_str()) {
                 ToolChoice::Named {
                     name: name.to_string(),
+                    namespace: None,
                 }
             } else {
                 ToolChoice::Raw(v)

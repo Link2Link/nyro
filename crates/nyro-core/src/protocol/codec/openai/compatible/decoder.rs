@@ -37,6 +37,7 @@ impl RequestDecoder for OpenAIDecoder {
                     let func = t.get("function")?;
                     Some(ToolSpec {
                         name: func.get("name")?.as_str()?.to_string(),
+                        namespace: None,
                         description: func
                             .get("description")
                             .and_then(|d| d.as_str())
@@ -266,6 +267,7 @@ fn decode_message(msg: OpenAIMessage) -> Result<Message> {
             .map(|tc| ToolCall {
                 id: tc.id,
                 name: tc.function.name,
+                namespace: None,
                 kind: ToolCallKind::Function,
                 arguments: tc.function.arguments,
             })
@@ -314,6 +316,7 @@ fn parse_tool_choice(v: Value) -> ToolChoice {
             {
                 return ToolChoice::Named {
                     name: name.to_string(),
+                    namespace: None,
                 };
             }
             ToolChoice::Raw(v)

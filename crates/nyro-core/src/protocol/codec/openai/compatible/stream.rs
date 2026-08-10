@@ -53,6 +53,7 @@ impl ResponseDecoder for OpenAIResponseParser {
                         Some(ToolCall {
                             id: tc.get("id")?.as_str()?.to_string(),
                             name: func.get("name")?.as_str()?.to_string(),
+                            namespace: None,
                             kind: ToolCallKind::Function,
                             arguments: func
                                 .get("arguments")
@@ -272,6 +273,7 @@ impl OpenAIStreamParser {
                                 index: idx,
                                 id,
                                 name: name.to_string(),
+                                namespace: None,
                                 kind: ToolCallKind::Function,
                             });
                         }

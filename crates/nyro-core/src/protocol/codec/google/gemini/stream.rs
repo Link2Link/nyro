@@ -57,6 +57,7 @@ impl ResponseDecoder for GoogleResponseParser {
                     tool_calls.push(ToolCall {
                         id: call_id.clone(),
                         name: name.clone(),
+                        namespace: None,
                         kind: ToolCallKind::Function,
                         arguments: arguments.clone(),
                     });
@@ -64,6 +65,7 @@ impl ResponseDecoder for GoogleResponseParser {
                         items.push(ResponseItem::FunctionCall {
                             call_id,
                             name,
+                            namespace: None,
                             arguments,
                         });
                     } else {
@@ -246,6 +248,7 @@ fn parse_gemini_chunk(chunk: &Value, deltas: &mut Vec<AiStreamDelta>, first: &mu
                         index: 0,
                         id,
                         name: name.clone(),
+                        namespace: None,
                         kind: ToolCallKind::Function,
                     });
                     let args = fc.get("args").map(|a| a.to_string()).unwrap_or_default();

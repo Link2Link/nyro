@@ -13,7 +13,9 @@ use nyro_core::protocol::codec::openai::responses::formatter::ResponsesResponseF
 use nyro_core::protocol::codec::openai::responses::parser::{
     ResponsesResponseParser, ResponsesStreamParser,
 };
+use nyro_core::protocol::codec::openai::responses::stream::ResponsesStreamFormatter;
 use nyro_core::protocol::codec::reasoning::normalize_response_reasoning;
+use nyro_core::protocol::codec::tool_bridge::ToolRoutePlan;
 use nyro_core::protocol::codec::tool_correlation::normalize_request_tool_results;
 use nyro_core::protocol::ids::{
     ANTHROPIC_MESSAGES_2023_06_01, GOOGLE_GEMINI_GENERATE_CONTENT_V1BETA,
@@ -70,6 +72,7 @@ fn anthropic_encoder_replays_reasoning_extra_as_thinking_block() {
         role: IrRole::Assistant,
         content: IrMessageContent::Text("".to_string()),
         tool_calls: Some(vec![ToolCall {
+            namespace: None,
             id: "call_1".to_string(),
             kind: ToolCallKind::Function,
             name: "exec_command".to_string(),
@@ -106,6 +109,7 @@ fn openai_to_responses_reasoning_and_function_call_items() {
     resp.content = "done".to_string();
     resp.reasoning_content = Some("chain".to_string());
     resp.tool_calls = vec![ToolCall {
+        namespace: None,
         id: "call_123".to_string(),
         kind: ToolCallKind::Function,
         name: "ls".to_string(),
@@ -139,6 +143,7 @@ fn openai_to_responses_reasoning_and_function_call_items() {
 fn openai_formatter_sets_tool_calls_finish_reason_when_tool_calls_present() {
     let mut resp = IrAiResponse::new("gen_1", "gemini-2.5-flash");
     resp.tool_calls = vec![ToolCall {
+        namespace: None,
         id: "call_1".to_string(),
         kind: ToolCallKind::Function,
         name: "bash".to_string(),
@@ -173,6 +178,7 @@ fn openai_stream_formatter_sets_tool_calls_finish_reason_when_tool_calls_seen() 
         IrStreamDelta::ToolCallStart {
             index: 0,
             id: "call_1".to_string(),
+            namespace: None,
             kind: ToolCallKind::Function,
             name: "bash".to_string(),
         },
@@ -206,6 +212,7 @@ fn gemini_tool_result_correlation_success() {
             role: IrRole::Assistant,
             content: IrMessageContent::Text(String::new()),
             tool_calls: Some(vec![ToolCall {
+                namespace: None,
                 id: "call_abc".to_string(),
                 kind: ToolCallKind::Function,
                 name: "read_file".to_string(),
@@ -250,12 +257,14 @@ fn gemini_tool_result_id_hint_matches_out_of_order_calls() {
             content: IrMessageContent::Text(String::new()),
             tool_calls: Some(vec![
                 ToolCall {
+                    namespace: None,
                     id: "call_a".to_string(),
                     kind: ToolCallKind::Function,
                     name: "Glob".to_string(),
                     arguments: "{}".to_string(),
                 },
                 ToolCall {
+                    namespace: None,
                     id: "call_b".to_string(),
                     kind: ToolCallKind::Function,
                     name: "Bash".to_string(),
@@ -494,6 +503,7 @@ fn openai_encoder_injects_adjacent_tool_call_for_non_adjacent_match() {
             role: IrRole::Assistant,
             content: IrMessageContent::Text("will call".to_string()),
             tool_calls: Some(vec![ToolCall {
+                namespace: None,
                 id: "call_x".to_string(),
                 kind: ToolCallKind::Function,
                 name: "ls".to_string(),
@@ -563,6 +573,7 @@ fn openai_encoder_drops_intermediate_assistant_text_before_tool_result() {
             role: IrRole::Assistant,
             content: IrMessageContent::Text("plan".to_string()),
             tool_calls: Some(vec![ToolCall {
+                namespace: None,
                 id: "call_keep".to_string(),
                 kind: ToolCallKind::Function,
                 name: "exec_command".to_string(),
@@ -633,6 +644,7 @@ fn openai_encoder_remaps_duplicate_tool_call_ids() {
             role: IrRole::Assistant,
             content: IrMessageContent::Text(String::new()),
             tool_calls: Some(vec![ToolCall {
+                namespace: None,
                 id: "call_dup".to_string(),
                 kind: ToolCallKind::Function,
                 name: "exec_command".to_string(),
@@ -645,6 +657,7 @@ fn openai_encoder_remaps_duplicate_tool_call_ids() {
             role: IrRole::Assistant,
             content: IrMessageContent::Text(String::new()),
             tool_calls: Some(vec![ToolCall {
+                namespace: None,
                 id: "call_dup".to_string(),
                 kind: ToolCallKind::Function,
                 name: "exec_command".to_string(),
@@ -719,6 +732,7 @@ fn anthropic_encoder_maps_required_tool_choice_to_any() {
         meta: None,
     }];
     let tools = Some(vec![ToolSpec {
+        namespace: None,
         name: "exec_command".to_string(),
         kind: ToolSpecKind::Function,
         description: Some("Execute command".to_string()),
@@ -760,6 +774,7 @@ fn anthropic_encoder_maps_function_tool_choice_to_tool_name() {
         meta: None,
     }];
     let tools = Some(vec![ToolSpec {
+        namespace: None,
         name: "exec_command".to_string(),
         kind: ToolSpecKind::Function,
         description: Some("Execute command".to_string()),
@@ -828,6 +843,7 @@ fn anthropic_encoder_merges_consecutive_roles_and_drops_empty_text() {
             role: IrRole::Assistant,
             content: IrMessageContent::Text("tool".to_string()),
             tool_calls: Some(vec![ToolCall {
+                namespace: None,
                 id: "call_1".to_string(),
                 kind: ToolCallKind::Function,
                 name: "exec_command".to_string(),
@@ -889,6 +905,7 @@ fn anthropic_encoder_normalizes_tool_use_ids_for_tool_and_result() {
             role: IrRole::Assistant,
             content: IrMessageContent::Text(String::new()),
             tool_calls: Some(vec![ToolCall {
+                namespace: None,
                 id: "call_function_abc_1".to_string(),
                 kind: ToolCallKind::Function,
                 name: "glob".to_string(),
@@ -911,6 +928,7 @@ fn anthropic_encoder_normalizes_tool_use_ids_for_tool_and_result() {
         },
     ];
     let tools = Some(vec![ToolSpec {
+        namespace: None,
         name: "glob".to_string(),
         kind: ToolSpecKind::Function,
         description: None,
@@ -979,9 +997,11 @@ fn responses_decoder_ignores_empty_message_content_item() {
 }
 
 fn transcode_responses_to_openai_compatible(body: serde_json::Value) -> serde_json::Value {
-    let request = ResponsesDecoder
+    let mut request = ResponsesDecoder
         .decode_request(body)
         .expect("decode Responses request");
+    let route_plan = ToolRoutePlan::for_request(&request, OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1);
+    route_plan.prepare_upstream_request(&mut request);
     OpenAIEncoder
         .encode_request(&request)
         .expect("encode OpenAI-compatible request")
@@ -1134,6 +1154,276 @@ fn responses_additional_mixed_tools_survive_openai_compatible_transcode() {
     assert_eq!(names, ["exec", "wait", "request_user_input"]);
 }
 
+// Codex Desktop groups dynamically available tools inside a namespace. The
+// Responses -> OpenAI-compatible transcode must flatten the namespace instead
+// of silently dropping all of its child tools.
+#[test]
+fn responses_namespaced_additional_tools_survive_openai_compatible_transcode() {
+    let body = serde_json::json!({
+        "model": "gpt-5.6",
+        "input": [
+            {
+                "type": "additional_tools",
+                "role": "developer",
+                "tools": [{
+                    "type": "namespace",
+                    "name": "functions",
+                    "description": "",
+                    "tools": [
+                        {
+                            "type": "custom",
+                            "name": "exec",
+                            "description": "Run JavaScript code",
+                            "format": {
+                                "type": "grammar",
+                                "syntax": "lark",
+                                "definition": "start: source\nsource: /.+/"
+                            }
+                        },
+                        {
+                            "type": "function",
+                            "name": "wait",
+                            "description": "Wait for a running task",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {"task_id": {"type": "string"}},
+                                "required": ["task_id"],
+                                "additionalProperties": false
+                            },
+                            "strict": false
+                        },
+                        {
+                            "type": "function",
+                            "name": "request_user_input",
+                            "description": "Request a decision from the user",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {"question": {"type": "string"}},
+                                "required": ["question"],
+                                "additionalProperties": false
+                            },
+                            "strict": false
+                        }
+                    ]
+                }]
+            },
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "inspect the project"}]
+            }
+        ],
+        "parallel_tool_calls": false,
+        "tool_choice": "auto"
+    });
+
+    let encoded = transcode_responses_to_openai_compatible(body);
+    let tools = encoded["tools"]
+        .as_array()
+        .expect("namespaced additional tools must reach the upstream request");
+    let names: Vec<&str> = tools.iter().filter_map(encoded_openai_tool_name).collect();
+
+    assert_eq!(names, ["exec", "wait", "request_user_input"]);
+    assert!(tools.iter().all(|tool| tool["type"] == "function"));
+
+    let exec = tools
+        .iter()
+        .find(|tool| tool["function"]["name"] == "exec")
+        .expect("bridged exec tool");
+    assert_eq!(exec["function"]["description"], "Run JavaScript code");
+    assert_eq!(
+        exec["function"]["parameters"],
+        serde_json::json!({
+            "type": "object",
+            "properties": {"input": {"type": "string"}},
+            "required": ["input"],
+            "additionalProperties": false
+        })
+    );
+
+    let wait = tools
+        .iter()
+        .find(|tool| tool["function"]["name"] == "wait")
+        .expect("flattened wait tool");
+    assert_eq!(
+        wait["function"]["parameters"]["properties"]["task_id"]["type"],
+        "string"
+    );
+    assert!(tools.iter().all(|tool| {
+        tool.get("namespace").is_none() && tool["function"].get("namespace").is_none()
+    }));
+}
+
+// Mirrors the namespace and deferred-function example in the official OpenAI
+// function-calling and hosted tool-search guides. Chat Completions has no
+// namespace/tool-search surface, so every declared child must be made eagerly
+// available as a flat function tool.
+#[test]
+fn responses_official_namespace_eagerly_flattens_to_openai_compatible_tools() {
+    let body = serde_json::json!({
+        "model": "gpt-5.6",
+        "input": "List open orders for customer CUST-12345.",
+        "tools": [
+            {
+                "type": "namespace",
+                "name": "crm",
+                "description": "CRM tools for customer lookup and order management.",
+                "tools": [
+                    {
+                        "type": "function",
+                        "name": "get_customer_profile",
+                        "description": "Fetch a customer profile by customer ID.",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"customer_id": {"type": "string"}},
+                            "required": ["customer_id"],
+                            "additionalProperties": false
+                        }
+                    },
+                    {
+                        "type": "function",
+                        "name": "list_open_orders",
+                        "description": "List open orders for a customer ID.",
+                        "defer_loading": true,
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"customer_id": {"type": "string"}},
+                            "required": ["customer_id"],
+                            "additionalProperties": false
+                        }
+                    }
+                ]
+            },
+            {"type": "tool_search"}
+        ],
+        "parallel_tool_calls": false
+    });
+
+    let encoded = transcode_responses_to_openai_compatible(body);
+    let tools = encoded["tools"]
+        .as_array()
+        .expect("namespace children must become Chat Completions tools");
+    let names: Vec<&str> = tools.iter().filter_map(encoded_openai_tool_name).collect();
+
+    assert_eq!(names, ["get_customer_profile", "list_open_orders"]);
+    for tool in tools {
+        let function = &tool["function"];
+        assert_eq!(tool["type"], "function");
+        assert!(
+            function["description"]
+                .as_str()
+                .is_some_and(|v| !v.is_empty())
+        );
+        assert_eq!(
+            function["parameters"]["properties"]["customer_id"]["type"],
+            "string"
+        );
+        assert!(
+            function.get("defer_loading").is_none(),
+            "Responses-only defer_loading must not leak to Chat Completions"
+        );
+    }
+}
+
+#[test]
+fn responses_namespace_requires_name_and_tools() {
+    let invalid_namespaces = [
+        (
+            "missing name",
+            serde_json::json!({
+                "type": "namespace",
+                "tools": [{
+                    "type": "function",
+                    "name": "lookup",
+                    "parameters": {"type": "object", "properties": {}}
+                }]
+            }),
+        ),
+        (
+            "missing tools",
+            serde_json::json!({
+                "type": "namespace",
+                "name": "crm"
+            }),
+        ),
+    ];
+
+    for (case, namespace) in invalid_namespaces {
+        let body = serde_json::json!({
+            "model": "gpt-5.6",
+            "input": "Look up the customer.",
+            "tools": [namespace]
+        });
+        let error = ResponsesDecoder.decode_request(body).expect_err(case);
+        assert!(
+            error.to_string().contains("namespace"),
+            "{case}: error should identify the invalid namespace, got {error:#}"
+        );
+    }
+}
+
+#[test]
+fn responses_namespace_survives_request_decode_encode_round_trip() {
+    let body = serde_json::json!({
+        "model": "gpt-5.6",
+        "input": [
+            {
+                "type": "function_call",
+                "call_id": "call_history",
+                "name": "lookup_customer",
+                "namespace": "crm",
+                "arguments": "{\"customer_id\":\"CUST-12345\"}"
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "call_history",
+                "output": "found"
+            },
+            {
+                "type": "message",
+                "role": "user",
+                "content": "Look it up again."
+            }
+        ],
+        "tools": [{
+            "type": "namespace",
+            "name": "crm",
+            "description": "CRM tools.",
+            "tools": [{
+                "type": "function",
+                "name": "lookup_customer",
+                "description": "Look up a CRM customer.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"customer_id": {"type": "string"}},
+                    "required": ["customer_id"],
+                    "additionalProperties": false
+                }
+            }]
+        }]
+    });
+
+    let request = ResponsesDecoder
+        .decode_request(body)
+        .expect("decode namespace");
+    let (encoded, _) = ResponsesEncoder
+        .encode_request(&request)
+        .expect("re-encode namespace");
+    let namespace = encoded["tools"]
+        .as_array()
+        .and_then(|tools| tools.iter().find(|tool| tool["type"] == "namespace"))
+        .expect("namespace tool container");
+    assert_eq!(namespace["name"], "crm");
+    assert_eq!(namespace["tools"][0]["name"], "lookup_customer");
+
+    let history_call = encoded["input"]
+        .as_array()
+        .and_then(|input| input.iter().find(|item| item["type"] == "function_call"))
+        .expect("history function call");
+    assert_eq!(history_call["name"], "lookup_customer");
+    assert_eq!(history_call["namespace"], "crm");
+}
+
 #[test]
 fn responses_identical_top_level_and_additional_tools_are_deduplicated() {
     let tool = serde_json::json!({
@@ -1163,6 +1453,48 @@ fn responses_identical_top_level_and_additional_tools_are_deduplicated() {
     let tools = request.tools.expect("merged tools");
     assert_eq!(tools.len(), 1);
     assert_eq!(tools[0].name, "wait");
+}
+
+#[test]
+fn responses_namespaced_tools_merge_by_qualified_identity() {
+    let leaf = |description: &str| {
+        serde_json::json!({
+            "type": "function",
+            "name": "lookup_customer",
+            "description": description,
+            "parameters": {"type": "object", "properties": {}}
+        })
+    };
+    let crm = serde_json::json!({
+        "type": "namespace",
+        "name": "crm",
+        "tools": [leaf("CRM lookup")]
+    });
+    let support = serde_json::json!({
+        "type": "namespace",
+        "name": "support",
+        "tools": [leaf("Support lookup")]
+    });
+    let body = serde_json::json!({
+        "model": "gpt-5.6",
+        "tools": [crm.clone(), support],
+        "input": [
+            {"type": "additional_tools", "role": "developer", "tools": [crm]},
+            {"type": "message", "role": "user", "content": "lookup"}
+        ]
+    });
+
+    let request = ResponsesDecoder
+        .decode_request(body)
+        .expect("qualified tool identities should merge");
+    let tools = request.tools.expect("namespaced tools");
+    assert_eq!(tools.len(), 2);
+    assert!(tools.iter().any(|tool| {
+        tool.namespace.as_deref() == Some("crm") && tool.name == "lookup_customer"
+    }));
+    assert!(tools.iter().any(|tool| {
+        tool.namespace.as_deref() == Some("support") && tool.name == "lookup_customer"
+    }));
 }
 
 #[test]
@@ -1206,6 +1538,7 @@ fn openai_encoder_remaps_reused_tool_result_id_with_synthetic_adjacent_call() {
             role: IrRole::Assistant,
             content: IrMessageContent::Text(String::new()),
             tool_calls: Some(vec![ToolCall {
+                namespace: None,
                 id: "call_same".to_string(),
                 kind: ToolCallKind::Function,
                 name: "exec_command".to_string(),
@@ -1237,6 +1570,7 @@ fn openai_encoder_remaps_reused_tool_result_id_with_synthetic_adjacent_call() {
         },
     ];
     let tools = Some(vec![ToolSpec {
+        namespace: None,
         name: "exec_command".to_string(),
         kind: ToolSpecKind::Function,
         description: None,
@@ -1282,12 +1616,14 @@ fn openai_encoder_rewrites_multi_tool_call_history_to_adjacent_pairs() {
             content: IrMessageContent::Text("".to_string()),
             tool_calls: Some(vec![
                 ToolCall {
+                    namespace: None,
                     id: "call_a".to_string(),
                     kind: ToolCallKind::Function,
                     name: "Glob".to_string(),
                     arguments: "{}".to_string(),
                 },
                 ToolCall {
+                    namespace: None,
                     id: "call_b".to_string(),
                     kind: ToolCallKind::Function,
                     name: "Bash".to_string(),
@@ -1313,6 +1649,7 @@ fn openai_encoder_rewrites_multi_tool_call_history_to_adjacent_pairs() {
         },
     ];
     let tools = Some(vec![ToolSpec {
+        namespace: None,
         name: "Glob".to_string(),
         kind: ToolSpecKind::Function,
         description: None,
@@ -1400,12 +1737,14 @@ fn openai_encoder_preserves_reasoning_content_across_parallel_tool_calls() {
             content: IrMessageContent::Text("".to_string()),
             tool_calls: Some(vec![
                 ToolCall {
+                    namespace: None,
                     id: "call_tokyo".to_string(),
                     kind: ToolCallKind::Function,
                     name: "get_time".to_string(),
                     arguments: "{\"location\":\"Tokyo\"}".to_string(),
                 },
                 ToolCall {
+                    namespace: None,
                     id: "call_paris".to_string(),
                     kind: ToolCallKind::Function,
                     name: "get_time".to_string(),
@@ -1431,6 +1770,7 @@ fn openai_encoder_preserves_reasoning_content_across_parallel_tool_calls() {
         },
     ];
     let tools = Some(vec![ToolSpec {
+        namespace: None,
         name: "get_time".to_string(),
         kind: ToolSpecKind::Function,
         description: None,
@@ -1618,12 +1958,14 @@ fn openai_encoder_drops_orphan_assistant_tool_calls_without_results() {
             content: IrMessageContent::Text(String::new()),
             tool_calls: Some(vec![
                 ToolCall {
+                    namespace: None,
                     id: "call_old_1".to_string(),
                     kind: ToolCallKind::Function,
                     name: String::new(),
                     arguments: "{}".to_string(),
                 },
                 ToolCall {
+                    namespace: None,
                     id: "call_old_2".to_string(),
                     kind: ToolCallKind::Function,
                     name: "list_directory".to_string(),
@@ -1637,6 +1979,7 @@ fn openai_encoder_drops_orphan_assistant_tool_calls_without_results() {
             role: IrRole::Assistant,
             content: IrMessageContent::Text(String::new()),
             tool_calls: Some(vec![ToolCall {
+                namespace: None,
                 id: "call_new".to_string(),
                 kind: ToolCallKind::Function,
                 name: "glob".to_string(),
@@ -1654,6 +1997,7 @@ fn openai_encoder_drops_orphan_assistant_tool_calls_without_results() {
         },
     ];
     let tools = Some(vec![ToolSpec {
+        namespace: None,
         name: "glob".to_string(),
         kind: ToolSpecKind::Function,
         description: None,
@@ -1704,6 +2048,7 @@ fn gemini_stream_formatter_keeps_tool_name_for_argument_deltas() {
             index: 0,
             id: "call_1".to_string(),
             name: "run_shell_command".to_string(),
+            namespace: None,
             kind: ToolCallKind::Function,
         },
         IrStreamDelta::ToolCallDelta {
@@ -1757,6 +2102,7 @@ fn gemini_stream_formatter_normalizes_common_tool_argument_aliases() {
             index: 0,
             id: "call_1".to_string(),
             name: "glob".to_string(),
+            namespace: None,
             kind: ToolCallKind::Function,
         },
         IrStreamDelta::ToolCallDelta {
@@ -1810,6 +2156,7 @@ fn gemini_encoder_sanitizes_unsupported_json_schema_fields() {
         meta: None,
     }];
     let tools = Some(vec![ToolSpec {
+        namespace: None,
         name: "glob".to_string(),
         kind: ToolSpecKind::Function,
         description: Some("glob files".to_string()),
@@ -1957,6 +2304,7 @@ fn responses_encoder_emits_function_call_and_function_call_output_items() {
                 role: IrRole::Assistant,
                 content: IrMessageContent::Text(String::new()),
                 tool_calls: Some(vec![ToolCall {
+                    namespace: None,
                     id: "call_abc".to_string(),
                     kind: ToolCallKind::Function,
                     name: "list_dir".to_string(),
@@ -2152,6 +2500,102 @@ fn responses_response_parser_extracts_text_tool_calls_and_usage() {
     assert_eq!(resp.tool_calls[0].id, "call_1");
     assert_eq!(resp.tool_calls[0].name, "search");
     assert_eq!(resp.tool_calls[0].arguments, "{\"q\":\"rust\"}");
+}
+
+// The official hosted tool-search response carries the leaf function name and
+// its namespace as separate fields. A native Responses parse/format cycle must
+// preserve both fields even though the generic tool-call IR is involved.
+#[test]
+fn responses_function_call_namespace_survives_non_stream_round_trip() {
+    let body = serde_json::json!({
+        "id": "resp_namespace",
+        "object": "response",
+        "status": "completed",
+        "model": "gpt-5.6",
+        "output": [{
+            "type": "function_call",
+            "id": "fc_namespace",
+            "call_id": "call_namespace",
+            "name": "list_open_orders",
+            "namespace": "crm",
+            "arguments": "{\"customer_id\":\"CUST-12345\"}",
+            "status": "completed"
+        }],
+        "usage": {"input_tokens": 10, "output_tokens": 4, "total_tokens": 14}
+    });
+
+    let response = ResponsesResponseParser
+        .parse_response(body)
+        .expect("parse namespaced Responses function call");
+    let formatted = ResponsesResponseFormatter.format_response(&response);
+    let call = formatted["output"]
+        .as_array()
+        .expect("Responses output array")
+        .iter()
+        .find(|item| item["type"] == "function_call")
+        .expect("formatted function_call");
+
+    assert_eq!(call["name"], "list_open_orders");
+    assert_eq!(call["namespace"], "crm");
+    assert_eq!(call["call_id"], "call_namespace");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(call["arguments"].as_str().unwrap()).unwrap(),
+        serde_json::json!({"customer_id": "CUST-12345"})
+    );
+}
+
+#[test]
+fn responses_function_call_namespace_survives_stream_round_trip() {
+    let sse = concat!(
+        "event: response.created\n",
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_namespace\",\"model\":\"gpt-5.6\"}}\n\n",
+        "event: response.output_item.added\n",
+        "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"fc_namespace\",\"call_id\":\"call_namespace\",\"name\":\"list_open_orders\",\"namespace\":\"crm\",\"arguments\":\"\",\"status\":\"in_progress\"}}\n\n",
+        "event: response.function_call_arguments.delta\n",
+        "data: {\"type\":\"response.function_call_arguments.delta\",\"item_id\":\"fc_namespace\",\"output_index\":0,\"delta\":\"{\\\"customer_id\\\":\\\"CUST-12345\\\"}\"}\n\n",
+        "event: response.output_item.done\n",
+        "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"fc_namespace\",\"call_id\":\"call_namespace\",\"name\":\"list_open_orders\",\"namespace\":\"crm\",\"arguments\":\"{\\\"customer_id\\\":\\\"CUST-12345\\\"}\",\"status\":\"completed\"}}\n\n",
+        "event: response.completed\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_namespace\",\"model\":\"gpt-5.6\",\"status\":\"completed\",\"usage\":{\"input_tokens\":10,\"output_tokens\":4,\"total_tokens\":14}}}\n\n"
+    );
+
+    let mut parser = ResponsesStreamParser::new();
+    let deltas = parser
+        .parse_chunk(sse)
+        .expect("parse namespaced Responses stream");
+    let mut formatter = ResponsesStreamFormatter::new();
+    let mut events = formatter.format_deltas(&deltas);
+    events.extend(formatter.format_done());
+
+    let payloads: Vec<serde_json::Value> = events
+        .iter()
+        .filter_map(|event| serde_json::from_str(&event.data).ok())
+        .collect();
+    let call_items: Vec<&serde_json::Value> = payloads
+        .iter()
+        .filter_map(|payload| payload.get("item"))
+        .filter(|item| item["type"] == "function_call")
+        .collect();
+
+    assert!(
+        !call_items.is_empty(),
+        "formatter emitted no function_call items"
+    );
+    assert!(
+        call_items
+            .iter()
+            .all(|item| item["name"] == "list_open_orders" && item["namespace"] == "crm"),
+        "every streamed function_call item must preserve its namespace"
+    );
+
+    let completed_call = payloads
+        .iter()
+        .find(|payload| payload["type"] == "response.completed")
+        .and_then(|payload| payload["response"]["output"].as_array())
+        .and_then(|output| output.iter().find(|item| item["type"] == "function_call"))
+        .expect("response.completed function_call");
+    assert_eq!(completed_call["name"], "list_open_orders");
+    assert_eq!(completed_call["namespace"], "crm");
 }
 
 #[test]

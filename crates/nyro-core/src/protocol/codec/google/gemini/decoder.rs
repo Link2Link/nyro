@@ -93,6 +93,7 @@ impl GoogleDecoder {
                     for fd in decls {
                         defs.push(ToolSpec {
                             name: fd.name.clone(),
+                            namespace: None,
                             description: fd.description.clone(),
                             kind: ToolSpecKind::Function,
                             parameters: fd
@@ -108,6 +109,7 @@ impl GoogleDecoder {
                 if entry.google_search.is_some() {
                     defs.push(ToolSpec {
                         name: "__builtin__google_search".into(),
+                        namespace: None,
                         description: None,
                         kind: ToolSpecKind::Function,
                         parameters: Value::Object(Default::default()),
@@ -119,6 +121,7 @@ impl GoogleDecoder {
                 if entry.code_execution.is_some() {
                     defs.push(ToolSpec {
                         name: "__builtin__code_execution".into(),
+                        namespace: None,
                         description: None,
                         kind: ToolSpecKind::Function,
                         parameters: Value::Object(Default::default()),
@@ -130,6 +133,7 @@ impl GoogleDecoder {
                 if entry.google_search_retrieval.is_some() {
                     defs.push(ToolSpec {
                         name: "__builtin__google_search_retrieval".into(),
+                        namespace: None,
                         description: None,
                         kind: ToolSpecKind::Function,
                         parameters: Value::Object(Default::default()),
@@ -314,6 +318,7 @@ fn decode_content(content: GoogleContent) -> Result<Message> {
                 tool_calls.push(ToolCall {
                     id: id.clone(),
                     name: function_call.name.clone(),
+                    namespace: None,
                     kind: ToolCallKind::Function,
                     arguments: function_call.args.to_string(),
                 });

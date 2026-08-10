@@ -64,6 +64,10 @@ impl ResponseDecoder for ResponsesResponseParser {
                             .and_then(|v| v.as_str())
                             .unwrap_or("")
                             .to_string();
+                        let namespace = item
+                            .get("namespace")
+                            .and_then(Value::as_str)
+                            .map(String::from);
                         let arguments = item
                             .get(if kind == ToolCallKind::Custom {
                                 "input"
@@ -81,6 +85,7 @@ impl ResponseDecoder for ResponsesResponseParser {
                             tool_calls.push(ToolCall {
                                 id: call_id.clone(),
                                 name: name.clone(),
+                                namespace: namespace.clone(),
                                 kind,
                                 arguments: arguments.clone(),
                             });
@@ -88,11 +93,13 @@ impl ResponseDecoder for ResponsesResponseParser {
                                 ToolCallKind::Function => ResponseItem::FunctionCall {
                                     call_id,
                                     name,
+                                    namespace,
                                     arguments,
                                 },
                                 ToolCallKind::Custom => ResponseItem::CustomToolCall {
                                     call_id,
                                     name,
+                                    namespace,
                                     input: arguments,
                                 },
                             });
@@ -312,12 +319,17 @@ impl ResponsesStreamParser {
                         .and_then(|v| v.as_str())
                         .unwrap_or("")
                         .to_string();
+                    let namespace = item
+                        .get("namespace")
+                        .and_then(Value::as_str)
+                        .map(String::from);
                     if !id.is_empty() && !name.is_empty() {
                         if self.started_tool_call_indexes.insert(index) {
                             deltas.push(AiStreamDelta::ToolCallStart {
                                 index,
                                 id,
                                 name,
+                                namespace,
                                 kind,
                             });
                         }

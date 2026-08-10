@@ -97,6 +97,7 @@ pub fn normalize_request_tool_results(req: &mut AiRequest) {
                 tool_calls: Some(vec![ToolCall {
                     id: final_id.clone(),
                     name: synth_name,
+                    namespace: None,
                     kind: ToolCallKind::Function,
                     arguments: "{}".to_string(),
                 }]),
@@ -141,6 +142,7 @@ mod tests {
             tool_calls: Some(vec![ToolCall {
                 id: tool_id.to_string(),
                 name: tool_name.to_string(),
+                namespace: None,
                 kind: ToolCallKind::Function,
                 arguments: "{}".to_string(),
             }]),
@@ -206,6 +208,7 @@ mod tests {
                 tool_calls: Some(vec![ToolCall {
                     id: "".to_string(),
                     name: "my_tool".to_string(),
+                    namespace: None,
                     kind: ToolCallKind::Function,
                     arguments: "{}".to_string(),
                 }]),
@@ -245,12 +248,14 @@ mod tests {
                     ToolCall {
                         id: "call_1".to_string(),
                         name: "tool_a".to_string(),
+                        namespace: None,
                         kind: ToolCallKind::Function,
                         arguments: "{}".to_string(),
                     },
                     ToolCall {
                         id: "call_2".to_string(),
                         name: "tool_b".to_string(),
+                        namespace: None,
                         kind: ToolCallKind::Function,
                         arguments: "{}".to_string(),
                     },
