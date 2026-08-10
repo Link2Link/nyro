@@ -130,7 +130,7 @@ fn tool_choice_to_value(tc: &ToolChoice) -> Value {
         ToolChoice::Auto => Value::String("auto".into()),
         ToolChoice::None => Value::String("none".into()),
         ToolChoice::Required => Value::String("required".into()),
-        ToolChoice::Named { name } => serde_json::json!({
+        ToolChoice::Named { name, .. } => serde_json::json!({
             "type": "function",
             "function": {"name": name}
         }),
@@ -231,6 +231,7 @@ fn normalize_messages_for_openai(messages: &[Message], tools: Option<&[ToolSpec]
                     tool_calls: Some(vec![ToolCall {
                         id: final_id.clone(),
                         name: synth_name,
+                        namespace: None,
                         kind: ToolCallKind::Function,
                         arguments: "{}".to_string(),
                     }]),

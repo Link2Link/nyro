@@ -118,6 +118,7 @@ pub fn fill_tool_call_ids(req: &mut AiRequest) {
                 tool_calls: Some(vec![ToolCall {
                     id: final_id.clone(),
                     name: synth_name,
+                    namespace: None,
                     kind: ToolCallKind::Function,
                     arguments: "{}".to_string(),
                 }]),
@@ -187,6 +188,7 @@ mod tests {
             tool_calls: Some(vec![ToolCall {
                 id: id.to_string(),
                 name: name.to_string(),
+                namespace: None,
                 kind: ToolCallKind::Function,
                 arguments: "{}".to_string(),
             }]),

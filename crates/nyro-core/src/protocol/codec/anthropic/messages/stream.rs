@@ -66,6 +66,7 @@ impl ResponseDecoder for AnthropicResponseParser {
                             tool_calls.push(ToolCall {
                                 id: tc_id.to_string(),
                                 name: name.to_string(),
+                                namespace: None,
                                 kind: ToolCallKind::Function,
                                 arguments: input.to_string(),
                             });
@@ -286,6 +287,7 @@ fn parse_anthropic_event(event_type: Option<&str>, data: &Value, deltas: &mut Ve
                             index: idx,
                             id,
                             name,
+                            namespace: None,
                             kind: ToolCallKind::Function,
                         });
                     }

@@ -80,7 +80,7 @@ impl RequestEncoder for ResponsesEncoder {
                     }
                     if let Some(tool_calls) = &message.tool_calls {
                         for tool_call in tool_calls {
-                            let item = match tool_call.kind {
+                            let mut item = match tool_call.kind {
                                 ToolCallKind::Function => serde_json::json!({
                                     "type": "function_call",
                                     "call_id": tool_call.id,
@@ -94,6 +94,7 @@ impl RequestEncoder for ResponsesEncoder {
                                     "input": tool_call.arguments,
                                 }),
                             };
+                            insert_optional_namespace(&mut item, tool_call.namespace.as_deref());
                             input.push(item);
                         }
                     }
@@ -156,53 +157,28 @@ impl RequestEncoder for ResponsesEncoder {
 
         // ── Tools (function + custom + built-in) ──────────────────────────────
         if let Some(ref tools) = req.tools {
-            let tools_val: Vec<Value> = tools
-                .iter()
-                .map(|t| {
-                    if t.name.starts_with("__builtin__") {
-                        t.parameters.clone()
+            let mut tools_val: Vec<Value> = Vec::new();
+            let mut namespace_indexes: HashMap<&str, usize> = HashMap::new();
+            for tool in tools {
+                let encoded = encode_tool(tool);
+                if let Some(namespace) = tool.namespace.as_deref() {
+                    if let Some(index) = namespace_indexes.get(namespace).copied() {
+                        tools_val[index]["tools"]
+                            .as_array_mut()
+                            .expect("namespace tools array")
+                            .push(encoded);
                     } else {
-                        match &t.kind {
-                            ToolSpecKind::Function => {
-                                let mut tool = serde_json::json!({
-                                    "type": "function",
-                                    "name": t.name,
-                                    "parameters": t.parameters,
-                                });
-                                let fields = tool.as_object_mut().expect("function tool object");
-                                if let Some(description) = &t.description {
-                                    fields.insert(
-                                        "description".into(),
-                                        Value::String(description.clone()),
-                                    );
-                                }
-                                if let Some(strict) = t.strict {
-                                    fields.insert("strict".into(), Value::Bool(strict));
-                                }
-                                tool
-                            }
-                            ToolSpecKind::Custom { format } => {
-                                let mut tool = serde_json::json!({
-                                    "type": "custom",
-                                    "name": t.name,
-                                });
-                                if let Some(description) = &t.description {
-                                    tool.as_object_mut().expect("custom tool object").insert(
-                                        "description".into(),
-                                        Value::String(description.clone()),
-                                    );
-                                }
-                                if let Some(format) = format {
-                                    tool.as_object_mut()
-                                        .expect("custom tool object")
-                                        .insert("format".into(), format.clone());
-                                }
-                                tool
-                            }
-                        }
+                        namespace_indexes.insert(namespace, tools_val.len());
+                        tools_val.push(serde_json::json!({
+                            "type": "namespace",
+                            "name": namespace,
+                            "tools": [encoded]
+                        }));
                     }
-                })
-                .collect();
+                } else {
+                    tools_val.push(encoded);
+                }
+            }
             obj.insert("tools".into(), Value::Array(tools_val));
         }
         if let Some(ref tc) = req.tool_choice {
@@ -278,17 +254,70 @@ fn tool_choice_to_value(tc: &ToolChoice, tools: Option<&[ToolSpec]>) -> Value {
         ToolChoice::Auto => Value::String("auto".into()),
         ToolChoice::None => Value::String("none".into()),
         ToolChoice::Required => Value::String("required".into()),
-        ToolChoice::Named { name } => {
+        ToolChoice::Named { name, namespace } => {
             let tool_type = if tools
-                .and_then(|tools| tools.iter().find(|tool| tool.name == *name))
+                .and_then(|tools| {
+                    tools.iter().find(|tool| {
+                        tool.name == *name && tool.namespace.as_ref() == namespace.as_ref()
+                    })
+                })
                 .is_some_and(ToolSpec::is_custom)
             {
                 "custom"
             } else {
                 "function"
             };
-            serde_json::json!({"type": tool_type, "name": name})
+            let mut value = serde_json::json!({"type": tool_type, "name": name});
+            insert_optional_namespace(&mut value, namespace.as_deref());
+            value
         }
         ToolChoice::Raw(v) => v.clone(),
+    }
+}
+
+fn encode_tool(tool: &ToolSpec) -> Value {
+    if tool.name.starts_with("__builtin__") {
+        return tool.parameters.clone();
+    }
+
+    match &tool.kind {
+        ToolSpecKind::Function => {
+            let mut value = serde_json::json!({
+                "type": "function",
+                "name": tool.name,
+                "parameters": tool.parameters,
+            });
+            let fields = value.as_object_mut().expect("function tool object");
+            if let Some(description) = &tool.description {
+                fields.insert("description".into(), Value::String(description.clone()));
+            }
+            if let Some(strict) = tool.strict {
+                fields.insert("strict".into(), Value::Bool(strict));
+            }
+            value
+        }
+        ToolSpecKind::Custom { format } => {
+            let mut value = serde_json::json!({
+                "type": "custom",
+                "name": tool.name,
+            });
+            let fields = value.as_object_mut().expect("custom tool object");
+            if let Some(description) = &tool.description {
+                fields.insert("description".into(), Value::String(description.clone()));
+            }
+            if let Some(format) = format {
+                fields.insert("format".into(), format.clone());
+            }
+            value
+        }
+    }
+}
+
+fn insert_optional_namespace(value: &mut Value, namespace: Option<&str>) {
+    if let Some(namespace) = namespace {
+        value
+            .as_object_mut()
+            .expect("tool value object")
+            .insert("namespace".into(), Value::String(namespace.to_string()));
     }
 }

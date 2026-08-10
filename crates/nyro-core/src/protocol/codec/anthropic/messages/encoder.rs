@@ -199,7 +199,7 @@ fn tool_choice_to_value_raw(tc: &ToolChoice) -> Value {
         ToolChoice::Auto => Value::String("auto".into()),
         ToolChoice::None => Value::String("none".into()),
         ToolChoice::Required => Value::String("required".into()),
-        ToolChoice::Named { name } => serde_json::json!({
+        ToolChoice::Named { name, .. } => serde_json::json!({
             "type": "tool",
             "name": name,
         }),

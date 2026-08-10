@@ -1677,6 +1677,383 @@ fn assert_custom_stream_response_conversion(target: TestProtocol) {
     assert_eq!(client_done, ["tool_calls"]);
 }
 
+fn duplicate_namespaced_request_fixture() -> Value {
+    json!({
+        "model": MODEL,
+        "stream": false,
+        "input": [
+            {
+                "type": "message",
+                "role": "user",
+                "content": "Look up customer CUST-12345 in CRM."
+            },
+            {
+                "type": "function_call",
+                "call_id": "call_history_crm",
+                "name": "lookup_customer",
+                "namespace": "crm",
+                "arguments": "{\"customer_id\":\"CUST-12345\"}"
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "call_history_crm",
+                "output": "Customer found"
+            },
+            {
+                "type": "message",
+                "role": "user",
+                "content": "Now look up the same customer in both systems."
+            }
+        ],
+        "tools": [
+            {
+                "type": "namespace",
+                "name": "crm",
+                "description": "CRM customer records.",
+                "tools": [{
+                    "type": "function",
+                    "name": "lookup_customer",
+                    "description": "Look up a customer in CRM.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"customer_id": {"type": "string"}},
+                        "required": ["customer_id"],
+                        "additionalProperties": false
+                    }
+                }]
+            },
+            {
+                "type": "namespace",
+                "name": "support",
+                "description": "Support customer records.",
+                "tools": [{
+                    "type": "function",
+                    "name": "lookup_customer",
+                    "description": "Look up a customer in support.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"customer_id": {"type": "string"}},
+                        "required": ["customer_id"],
+                        "additionalProperties": false
+                    }
+                }]
+            }
+        ],
+        "tool_choice": "auto"
+    })
+}
+
+// Namespace is part of a Responses tool's logical identity. Chat Completions
+// only exposes flat function names, so duplicate leaves need distinct wire
+// aliases and must be restored to the original (namespace, name) pair.
+#[test]
+fn namespaced_duplicate_function_names_round_trip_through_openai_compatible() {
+    let request = decode_request(
+        TestProtocol::OpenAiResponses,
+        duplicate_namespaced_request_fixture(),
+    );
+    let plan = ToolRoutePlan::for_request(&request, TestProtocol::OpenAiCompatible.endpoint());
+    let mut upstream_request = request.clone();
+    plan.prepare_upstream_request(&mut upstream_request);
+    let upstream_body = encode_request(TestProtocol::OpenAiCompatible, &upstream_request);
+    let tools = upstream_body["tools"]
+        .as_array()
+        .expect("namespaced tools must reach Chat Completions");
+
+    assert_eq!(tools.len(), 2);
+    let alias_for = |description: &str| {
+        tools
+            .iter()
+            .find(|tool| tool["function"]["description"] == description)
+            .and_then(|tool| tool["function"]["name"].as_str())
+            .unwrap_or_else(|| panic!("missing flattened tool: {description}"))
+            .to_string()
+    };
+    let crm_alias = alias_for("Look up a customer in CRM.");
+    let support_alias = alias_for("Look up a customer in support.");
+    assert_ne!(
+        crm_alias, support_alias,
+        "flat Chat tool names must be unique"
+    );
+
+    let messages = upstream_body["messages"]
+        .as_array()
+        .expect("Chat Completions messages");
+    let history_call = messages
+        .iter()
+        .filter_map(|message| message["tool_calls"].as_array())
+        .flatten()
+        .find(|call| call["id"] == "call_history_crm")
+        .expect("namespaced history function call");
+    assert_eq!(
+        history_call["function"]["name"], crm_alias,
+        "history must select the CRM alias rather than the same-named support tool"
+    );
+    assert!(messages.iter().any(|message| {
+        message["role"] == "tool" && message["tool_call_id"] == "call_history_crm"
+    }));
+
+    let mut response = parse_response(
+        TestProtocol::OpenAiCompatible,
+        json!({
+            "id": "resp_namespaced",
+            "object": "chat.completion",
+            "model": MODEL,
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [
+                        {
+                            "id": "call_crm",
+                            "type": "function",
+                            "function": {
+                                "name": crm_alias,
+                                "arguments": "{\"customer_id\":\"CUST-12345\"}"
+                            }
+                        },
+                        {
+                            "id": "call_support",
+                            "type": "function",
+                            "function": {
+                                "name": support_alias,
+                                "arguments": "{\"customer_id\":\"CUST-12345\"}"
+                            }
+                        }
+                    ]
+                },
+                "finish_reason": "tool_calls"
+            }],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 4}
+        }),
+    );
+    plan.restore_response(&mut response);
+
+    let client_body = format_response(TestProtocol::OpenAiResponses, &response);
+    let output = client_body["output"].as_array().expect("Responses output");
+    let call_by_id = |call_id: &str| {
+        output
+            .iter()
+            .find(|item| item["type"] == "function_call" && item["call_id"] == call_id)
+            .unwrap_or_else(|| panic!("missing restored call {call_id}"))
+    };
+
+    let crm_call = call_by_id("call_crm");
+    assert_eq!(crm_call["name"], "lookup_customer");
+    assert_eq!(crm_call["namespace"], "crm");
+
+    let support_call = call_by_id("call_support");
+    assert_eq!(support_call["name"], "lookup_customer");
+    assert_eq!(support_call["namespace"], "support");
+}
+
+fn namespaced_custom_request_fixture() -> Value {
+    json!({
+        "model": MODEL,
+        "stream": true,
+        "input": [
+            {
+                "type": "additional_tools",
+                "role": "developer",
+                "tools": [{
+                    "type": "namespace",
+                    "name": "functions",
+                    "description": "Local execution tools.",
+                    "tools": [
+                        {
+                            "type": "custom",
+                            "name": CUSTOM_TOOL_NAME,
+                            "description": "Run source code",
+                            "format": {
+                                "type": "grammar",
+                                "syntax": "lark",
+                                "definition": "start: source\nsource: /.+/"
+                            }
+                        },
+                        {
+                            "type": "function",
+                            "name": FUNCTION_TOOL_NAME,
+                            "description": "Wait for a task",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {"task_id": {"type": "string"}},
+                                "required": ["task_id"],
+                                "additionalProperties": false
+                            },
+                            "strict": false
+                        }
+                    ]
+                }]
+            },
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "Run and wait"}]
+            }
+        ],
+        "parallel_tool_calls": true,
+        "tool_choice": "auto"
+    })
+}
+
+// Codex Desktop extends namespace children with custom tools. Verify that the
+// existing custom-tool function bridge composes with namespace restoration in
+// both incremental events and the terminal Responses output.
+#[test]
+fn namespaced_custom_and_function_stream_round_trip_through_openai_compatible() {
+    let request = decode_request(
+        TestProtocol::OpenAiResponses,
+        namespaced_custom_request_fixture(),
+    );
+    let mut plan = ToolRoutePlan::for_request(&request, TestProtocol::OpenAiCompatible.endpoint());
+    let mut upstream_request = request.clone();
+    plan.prepare_upstream_request(&mut upstream_request);
+    let upstream_body = encode_request(TestProtocol::OpenAiCompatible, &upstream_request);
+    let tools = upstream_body["tools"]
+        .as_array()
+        .expect("namespaced custom and function tools must reach Chat Completions");
+
+    let custom_alias = tools
+        .iter()
+        .find(|tool| tool["function"]["parameters"]["properties"]["input"]["type"] == "string")
+        .and_then(|tool| tool["function"]["name"].as_str())
+        .expect("bridged custom tool alias")
+        .to_string();
+    let function_alias = tools
+        .iter()
+        .find(|tool| tool["function"]["parameters"]["properties"]["task_id"]["type"] == "string")
+        .and_then(|tool| tool["function"]["name"].as_str())
+        .expect("function tool alias")
+        .to_string();
+
+    let wrapped_custom_input = json!({"input": CUSTOM_TOOL_INPUT}).to_string();
+    let upstream_sse = [
+        sse_event(
+            None,
+            json!({
+                "id": "resp_namespaced_stream",
+                "object": "chat.completion.chunk",
+                "model": MODEL,
+                "choices": [{
+                    "index": 0,
+                    "delta": {"role": "assistant"},
+                    "finish_reason": null
+                }]
+            }),
+        ),
+        sse_event(
+            None,
+            json!({
+                "id": "resp_namespaced_stream",
+                "object": "chat.completion.chunk",
+                "model": MODEL,
+                "choices": [{
+                    "index": 0,
+                    "delta": {"tool_calls": [{
+                        "index": 0,
+                        "id": CUSTOM_TOOL_CALL_ID,
+                        "type": "function",
+                        "function": {
+                            "name": custom_alias,
+                            "arguments": wrapped_custom_input
+                        }
+                    }]},
+                    "finish_reason": null
+                }]
+            }),
+        ),
+        sse_event(
+            None,
+            json!({
+                "id": "resp_namespaced_stream",
+                "object": "chat.completion.chunk",
+                "model": MODEL,
+                "choices": [{
+                    "index": 0,
+                    "delta": {"tool_calls": [{
+                        "index": 1,
+                        "id": FUNCTION_TOOL_CALL_ID,
+                        "type": "function",
+                        "function": {
+                            "name": function_alias,
+                            "arguments": "{\"task_id\":\"job-1\"}"
+                        }
+                    }]},
+                    "finish_reason": null
+                }]
+            }),
+        ),
+        sse_event(
+            None,
+            json!({
+                "id": "resp_namespaced_stream",
+                "object": "chat.completion.chunk",
+                "model": MODEL,
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}],
+                "usage": {
+                    "prompt_tokens": PROMPT_TOKENS,
+                    "completion_tokens": COMPLETION_TOKENS,
+                    "total_tokens": PROMPT_TOKENS + COMPLETION_TOKENS
+                }
+            }),
+        ),
+        "data: [DONE]\n\n".to_string(),
+    ]
+    .concat();
+
+    let mut restored =
+        plan.restore_stream_deltas(parse_stream(TestProtocol::OpenAiCompatible, &upstream_sse));
+    restored.extend(plan.finish_stream());
+    let (events, _) = format_stream(TestProtocol::OpenAiResponses, &restored);
+    let payloads: Vec<Value> = events
+        .iter()
+        .filter_map(|event| serde_json::from_str(&event.data).ok())
+        .collect();
+
+    let added_items: Vec<&Value> = payloads
+        .iter()
+        .filter(|payload| payload["type"] == "response.output_item.added")
+        .filter_map(|payload| payload.get("item"))
+        .collect();
+    let custom_item = added_items
+        .iter()
+        .find(|item| item["type"] == "custom_tool_call")
+        .expect("namespaced custom_tool_call item");
+    assert_eq!(custom_item["name"], CUSTOM_TOOL_NAME);
+    assert_eq!(custom_item["namespace"], "functions");
+
+    let function_item = added_items
+        .iter()
+        .find(|item| item["type"] == "function_call")
+        .expect("namespaced function_call item");
+    assert_eq!(function_item["name"], FUNCTION_TOOL_NAME);
+    assert_eq!(function_item["namespace"], "functions");
+
+    let restored_custom_input = payloads
+        .iter()
+        .filter(|payload| payload["type"] == "response.custom_tool_call_input.delta")
+        .filter_map(|payload| payload["delta"].as_str())
+        .collect::<String>();
+    assert_eq!(restored_custom_input, CUSTOM_TOOL_INPUT);
+
+    let completed_output = payloads
+        .iter()
+        .find(|payload| payload["type"] == "response.completed")
+        .and_then(|payload| payload["response"]["output"].as_array())
+        .expect("response.completed output");
+    assert!(completed_output.iter().any(|item| {
+        item["type"] == "custom_tool_call"
+            && item["name"] == CUSTOM_TOOL_NAME
+            && item["namespace"] == "functions"
+    }));
+    assert!(completed_output.iter().any(|item| {
+        item["type"] == "function_call"
+            && item["name"] == FUNCTION_TOOL_NAME
+            && item["namespace"] == "functions"
+    }));
+}
+
 macro_rules! matrix_case {
     ($name:ident, $runner:ident, $source:ident => $target:ident) => {
         #[test]

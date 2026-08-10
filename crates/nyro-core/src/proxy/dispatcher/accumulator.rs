@@ -42,12 +42,14 @@ impl StreamResponseAccumulator {
                 index,
                 id,
                 name,
+                namespace,
                 kind,
             } => {
                 ensure_tool_index(&mut self.tool_calls, *index);
                 self.tool_calls[*index] = Some(ToolCall {
                     id: id.clone(),
                     name: name.clone(),
+                    namespace: namespace.clone(),
                     kind: *kind,
                     arguments: String::new(),
                 });
@@ -60,6 +62,7 @@ impl StreamResponseAccumulator {
                     self.tool_calls[*index] = Some(ToolCall {
                         id: format!("tool-{index}"),
                         name: String::new(),
+                        namespace: None,
                         kind: Default::default(),
                         arguments: arguments.clone(),
                     });

@@ -273,6 +273,9 @@ pub struct Message {
 pub struct ToolCall {
     pub id: String,
     pub name: String,
+    /// Responses API namespace containing this tool. Flat protocols leave this unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<String>,
     /// The wire-level tool-call family. Function arguments are JSON text;
     /// custom-tool input is arbitrary text.
     #[serde(default)]
@@ -280,7 +283,9 @@ pub struct ToolCall {
     pub arguments: String,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolCallKind {
     #[default]
@@ -297,6 +302,7 @@ impl ToolCall {
         Self {
             id: id.into(),
             name: name.into(),
+            namespace: None,
             kind: ToolCallKind::Function,
             arguments: arguments.into(),
         }
@@ -310,6 +316,7 @@ impl ToolCall {
         Self {
             id: id.into(),
             name: name.into(),
+            namespace: None,
             kind: ToolCallKind::Custom,
             arguments: input.into(),
         }
@@ -325,6 +332,9 @@ impl ToolCall {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolSpec {
     pub name: String,
+    /// Responses API namespace containing this tool. Flat protocols leave this unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     #[serde(default)]
@@ -378,7 +388,11 @@ pub enum ToolChoice {
     /// Model must call at least one tool.
     Required,
     /// Force a specific tool by name.
-    Named { name: String },
+    Named {
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        namespace: Option<String>,
+    },
     /// Pass-through raw value for protocol-specific options.
     Raw(Value),
 }

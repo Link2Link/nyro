@@ -25,12 +25,16 @@ pub enum ResponseItem {
     FunctionCall {
         call_id: String,
         name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        namespace: Option<String>,
         arguments: String,
     },
     /// A Responses API custom-tool call with arbitrary text input.
     CustomToolCall {
         call_id: String,
         name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        namespace: Option<String>,
         input: String,
     },
     /// A tool result provided by the client (in multi-turn Responses API).

@@ -24,6 +24,8 @@ pub enum StreamDelta {
         index: usize,
         id: String,
         name: String,
+        /// Responses API namespace containing this tool.
+        namespace: Option<String>,
         kind: ToolCallKind,
     },
     /// Incremental tool call argument JSON fragment.

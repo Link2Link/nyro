@@ -334,6 +334,10 @@ fn decode_input_item(item: &Value) -> Result<Option<Message>> {
                 tool_calls: Some(vec![ToolCall {
                     id: call_id,
                     name,
+                    namespace: item
+                        .get("namespace")
+                        .and_then(Value::as_str)
+                        .map(String::from),
                     kind: if item_type == "custom_tool_call" {
                         ToolCallKind::Custom
                     } else {
@@ -401,78 +405,19 @@ fn decode_message_item(item: &Value) -> Result<Option<Message>> {
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 fn parse_tools(raw_tools: Option<&Value>) -> Result<Option<Vec<ToolSpec>>> {
-    let Some(Value::Array(items)) = raw_tools else {
+    let Some(raw_tools) = raw_tools else {
         return Ok(None);
     };
+    let items = raw_tools
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("'tools' must be an array"))?;
 
-    let mut tools = Vec::new();
+    let mut parsed_tools = Vec::new();
     for item in items {
-        let tool_type = item
-            .get("type")
-            .and_then(|v| v.as_str())
-            .unwrap_or("function");
-
-        match tool_type {
-            "function" => {
-                let name = item
-                    .get("name")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| anyhow::anyhow!("function tool missing 'name' field"))?
-                    .to_string();
-                let description = item
-                    .get("description")
-                    .and_then(|v| v.as_str())
-                    .map(String::from);
-                let parameters = item
-                    .get("parameters")
-                    .cloned()
-                    .unwrap_or(Value::Object(Default::default()));
-                tools.push(ToolSpec {
-                    name,
-                    description,
-                    kind: ToolSpecKind::Function,
-                    parameters,
-                    strict: item.get("strict").and_then(|v| v.as_bool()),
-                    cache_control: None,
-                    meta: None,
-                });
-            }
-            "custom" => {
-                let name = item
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| anyhow::anyhow!("custom tool missing 'name' field"))?
-                    .to_string();
-                let description = item
-                    .get("description")
-                    .and_then(Value::as_str)
-                    .map(String::from);
-                tools.push(ToolSpec {
-                    name,
-                    description,
-                    kind: ToolSpecKind::Custom {
-                        format: item.get("format").cloned(),
-                    },
-                    parameters: Value::Object(Default::default()),
-                    strict: None,
-                    cache_control: None,
-                    meta: None,
-                });
-            }
-            "web_search_preview" | "file_search" | "computer_use_preview" | "code_interpreter" => {
-                tools.push(ToolSpec {
-                    name: format!("__builtin__{}", tool_type),
-                    description: Some(format!("built-in tool: {}", tool_type)),
-                    kind: ToolSpecKind::Function,
-                    parameters: item.clone(),
-                    strict: None,
-                    cache_control: None,
-                    meta: None,
-                });
-            }
-            _ => {}
-        }
+        parse_tool_item(item, None, &mut parsed_tools)?;
     }
+    let mut tools = Vec::new();
+    merge_tool_specs(&mut tools, parsed_tools)?;
 
     if tools.is_empty() {
         Ok(None)
@@ -481,18 +426,119 @@ fn parse_tools(raw_tools: Option<&Value>) -> Result<Option<Vec<ToolSpec>>> {
     }
 }
 
+fn parse_tool_item(item: &Value, namespace: Option<&str>, tools: &mut Vec<ToolSpec>) -> Result<()> {
+    let tool_type = item
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or("function");
+
+    match tool_type {
+        "namespace" => {
+            if namespace.is_some() {
+                anyhow::bail!("nested tool namespaces are not supported");
+            }
+            let name = required_non_empty_tool_name(item, "namespace")?;
+            let children = item
+                .get("tools")
+                .and_then(Value::as_array)
+                .ok_or_else(|| anyhow::anyhow!("namespace '{name}' missing array 'tools' field"))?;
+            for child in children {
+                parse_tool_item(child, Some(&name), tools)?;
+            }
+        }
+        "function" => {
+            let name = required_non_empty_tool_name(item, "function")?;
+            tools.push(ToolSpec {
+                name,
+                namespace: namespace.map(String::from),
+                description: item
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .map(String::from),
+                kind: ToolSpecKind::Function,
+                parameters: item
+                    .get("parameters")
+                    .cloned()
+                    .unwrap_or(Value::Object(Default::default())),
+                strict: item.get("strict").and_then(Value::as_bool),
+                cache_control: None,
+                meta: None,
+            });
+        }
+        "custom" => {
+            let name = required_non_empty_tool_name(item, "custom")?;
+            tools.push(ToolSpec {
+                name,
+                namespace: namespace.map(String::from),
+                description: item
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .map(String::from),
+                kind: ToolSpecKind::Custom {
+                    format: item.get("format").cloned(),
+                },
+                parameters: Value::Object(Default::default()),
+                strict: None,
+                cache_control: None,
+                meta: None,
+            });
+        }
+        "web_search_preview" | "file_search" | "computer_use_preview" | "code_interpreter" => {
+            if let Some(namespace) = namespace {
+                anyhow::bail!("unsupported tool type '{tool_type}' in namespace '{namespace}'");
+            }
+            tools.push(ToolSpec {
+                name: format!("__builtin__{tool_type}"),
+                namespace: None,
+                description: Some(format!("built-in tool: {tool_type}")),
+                kind: ToolSpecKind::Function,
+                parameters: item.clone(),
+                strict: None,
+                cache_control: None,
+                meta: None,
+            });
+        }
+        // A flat target cannot reproduce hosted discovery. Namespace children are
+        // already exposed eagerly, so the marker itself is intentionally omitted.
+        "tool_search" if namespace.is_none() => {}
+        unsupported if namespace.is_some() => {
+            anyhow::bail!(
+                "unsupported tool type '{unsupported}' in namespace '{}'",
+                namespace.expect("checked above")
+            );
+        }
+        _ => {}
+    }
+
+    Ok(())
+}
+
+fn required_non_empty_tool_name(item: &Value, tool_type: &str) -> Result<String> {
+    item.get("name")
+        .and_then(Value::as_str)
+        .filter(|name| !name.trim().is_empty())
+        .map(String::from)
+        .ok_or_else(|| anyhow::anyhow!("{tool_type} tool missing non-empty 'name' field"))
+}
+
 fn merge_tool_specs(existing: &mut Vec<ToolSpec>, incoming: Vec<ToolSpec>) -> Result<()> {
     for tool in incoming {
-        let Some(current) = existing
-            .iter()
-            .find(|candidate| candidate.name == tool.name)
-        else {
+        let Some(current) = existing.iter().find(|candidate| {
+            candidate.name == tool.name
+                && candidate.namespace == tool.namespace
+                && candidate.is_custom() == tool.is_custom()
+        }) else {
             existing.push(tool);
             continue;
         };
 
         if serde_json::to_value(current)? != serde_json::to_value(&tool)? {
-            anyhow::bail!("conflicting tool definitions for '{}'", tool.name);
+            let qualified_name = tool
+                .namespace
+                .as_ref()
+                .map(|namespace| format!("{namespace}.{}", tool.name))
+                .unwrap_or_else(|| tool.name.clone());
+            anyhow::bail!("conflicting tool definitions for '{qualified_name}'");
         }
     }
     Ok(())
@@ -517,6 +563,10 @@ fn parse_tool_choice(v: Value) -> ToolChoice {
             }) {
                 return ToolChoice::Named {
                     name: name.to_string(),
+                    namespace: obj
+                        .get("namespace")
+                        .and_then(Value::as_str)
+                        .map(String::from),
                 };
             }
             ToolChoice::Raw(v)

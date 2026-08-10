@@ -12,6 +12,7 @@ struct PendingToolCall {
     item_id: String,
     call_id: String,
     name: String,
+    namespace: Option<String>,
     kind: ToolCallKind,
     arguments: String,
 }
@@ -159,7 +160,7 @@ impl ResponsesStreamFormatter {
         }
 
         for call in &self.tool_calls {
-            let item = match call.kind {
+            let mut item = match call.kind {
                 ToolCallKind::Function => serde_json::json!({
                     "type": "function_call",
                     "id": call.item_id,
@@ -177,6 +178,7 @@ impl ResponsesStreamFormatter {
                     "status": "completed"
                 }),
             };
+            insert_optional_namespace(&mut item, call.namespace.as_deref());
             let tool_done = serde_json::json!({
                 "type": "response.output_item.done",
                 "output_index": call.output_index,
@@ -248,7 +250,7 @@ impl ResponsesStreamFormatter {
             }));
         }
         for call in &self.tool_calls {
-            output.push(match call.kind {
+            let mut item = match call.kind {
                 ToolCallKind::Function => serde_json::json!({
                     "type": "function_call",
                     "id": call.item_id,
@@ -265,7 +267,9 @@ impl ResponsesStreamFormatter {
                     "input": call.arguments,
                     "status": "completed"
                 }),
-            });
+            };
+            insert_optional_namespace(&mut item, call.namespace.as_deref());
+            output.push(item);
         }
         output.push(serde_json::json!({
             "type": "message",
@@ -372,6 +376,7 @@ impl StreamResponseEncoder for ResponsesStreamFormatter {
                     index,
                     id,
                     name,
+                    namespace,
                     kind,
                 } => {
                     self.ensure_started(&mut events);
@@ -398,11 +403,12 @@ impl StreamResponseEncoder for ResponsesStreamFormatter {
                         item_id: item_id.clone(),
                         call_id: call_id.clone(),
                         name: name.clone(),
+                        namespace: namespace.clone(),
                         kind: *kind,
                         arguments: String::new(),
                     });
 
-                    let item = match kind {
+                    let mut item = match kind {
                         ToolCallKind::Function => serde_json::json!({
                             "type": "function_call",
                             "id": item_id,
@@ -420,6 +426,7 @@ impl StreamResponseEncoder for ResponsesStreamFormatter {
                             "status": "in_progress"
                         }),
                     };
+                    insert_optional_namespace(&mut item, namespace.as_deref());
                     let added = serde_json::json!({
                         "type": "response.output_item.added",
                         "output_index": output_index,
@@ -475,5 +482,14 @@ impl StreamResponseEncoder for ResponsesStreamFormatter {
 
     fn usage(&self) -> Usage {
         self.usage.clone()
+    }
+}
+
+fn insert_optional_namespace(value: &mut serde_json::Value, namespace: Option<&str>) {
+    if let Some(namespace) = namespace {
+        value.as_object_mut().expect("tool call object").insert(
+            "namespace".into(),
+            serde_json::Value::String(namespace.to_string()),
+        );
     }
 }
