@@ -1088,7 +1088,7 @@ impl LogStore for SqliteLogStore {
                 r#"INSERT INTO request_logs
                     (id, created_at, api_key_id, api_key_name,
                      client_protocol, upstream_protocol, provider_id, provider_name, model_id, model_name, upstream_url,
-                     client_model, upstream_model,
+                     client_model, upstream_model, reasoning_effort,
                      method, path,
                      client_request_headers, client_request_body,
                      client_response_headers, client_response_body,
@@ -1098,7 +1098,7 @@ impl LogStore for SqliteLogStore {
                      latency_total_ms, latency_upstream_ms,
                      input_tokens, output_tokens, cache_read_tokens,
                      is_stream, stream_chunks_count, stream_first_chunk_ms)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
             )
             .bind(&id)
             .bind(entry.created_at)
@@ -1113,6 +1113,7 @@ impl LogStore for SqliteLogStore {
             .bind(&entry.upstream_url)
             .bind(&entry.client_model)
             .bind(&entry.upstream_model)
+            .bind(&entry.reasoning_effort)
             .bind(&entry.method)
             .bind(&entry.path)
             .bind(&entry.client_request_headers)
@@ -1145,7 +1146,7 @@ impl LogStore for SqliteLogStore {
         let mut data_sql = String::from(
             "SELECT id, COALESCE(CAST(created_at AS INTEGER), 0) AS created_at, api_key_id, api_key_name, \
              client_protocol, upstream_protocol, provider_id, provider_name, model_id, model_name, upstream_url, \
-             client_model, upstream_model, method, path, \
+             client_model, upstream_model, reasoning_effort, method, path, \
              NULL AS client_request_headers, NULL AS client_request_body, \
              NULL AS client_response_headers, NULL AS client_response_body, \
              NULL AS upstream_request_headers, NULL AS upstream_request_body, \
@@ -1213,7 +1214,7 @@ impl LogStore for SqliteLogStore {
         let row = sqlx::query_as::<_, RequestLog>(
             "SELECT id, COALESCE(CAST(created_at AS INTEGER), 0) AS created_at, api_key_id, api_key_name, \
              client_protocol, upstream_protocol, provider_id, provider_name, model_id, model_name, upstream_url, \
-             client_model, upstream_model, method, path, \
+             client_model, upstream_model, reasoning_effort, method, path, \
              client_request_headers, client_request_body, \
              client_response_headers, client_response_body, \
              upstream_request_headers, upstream_request_body, \

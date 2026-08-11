@@ -81,6 +81,9 @@ export interface RequestLog {
   client_model?: string;
   upstream_model?: string;
 
+  /** 客户端请求的归一化推理强度（"high" 等定性值或 "budget:<n>"），未声明时缺省 */
+  reasoning_effort?: string | null;
+
   method?: string;
   path?: string;
 

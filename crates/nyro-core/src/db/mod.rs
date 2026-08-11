@@ -88,6 +88,7 @@ pub async fn migrate(pool: &SqlitePool) -> anyhow::Result<()> {
     ensure_request_log_column(pool, "model_id", "TEXT").await?;
     ensure_request_log_column(pool, "model_name", "TEXT").await?;
     ensure_request_log_column(pool, "cache_read_tokens", "INTEGER DEFAULT 0").await?;
+    ensure_request_log_column(pool, "reasoning_effort", "TEXT").await?;
 
     // Rename tables: routes → models, route_targets → model_backends, api_key_routes → api_key_models
     rename_table_if_needed(pool, "routes", "models").await?;
@@ -925,6 +926,7 @@ CREATE TABLE IF NOT EXISTS request_logs (
     upstream_url              TEXT,
     client_model              TEXT,
     upstream_model            TEXT,
+    reasoning_effort          TEXT,
     method                    TEXT,
     path                      TEXT,
     client_request_headers    TEXT,

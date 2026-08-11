@@ -80,6 +80,7 @@ export function LogDetailDialog({ logId, summary, open, onOpenChange }: LogDetai
       `# TPS: ${tps != null ? formatTps(tps) : "–"}  (gen ${formatDuration(generationMs)})`,
       `# Provider: ${log.provider_name ?? log.provider_id ?? "–"}  Model: ${log.model_name ?? log.model_id ?? "–"}  ApiKey: ${log.api_key_name ?? log.api_key_id ?? "–"}`,
       `# Client Model: ${log.client_model ?? "–"}  Upstream Model: ${log.upstream_model ?? "–"}`,
+      `# Reasoning Effort: ${log.reasoning_effort ?? "–"}`,
       `# Protocol: ${proto}`,
       `# Tokens: IN=${log.input_tokens} OUT=${log.output_tokens}`,
       isStream ? `# Stream: chunks=${log.stream_chunks_count} ttfb=${log.stream_first_chunk_ms ?? "–"}ms` : `# Stream: false`,
@@ -166,6 +167,15 @@ export function LogDetailDialog({ logId, summary, open, onOpenChange }: LogDetai
           ) : null}
           {log?.upstream_model ? (
             <span className="text-slate-500 font-mono">{log.upstream_model}</span>
+          ) : null}
+          {log?.reasoning_effort ? (
+            <Badge
+              variant="outline"
+              className="border-violet-200 bg-violet-50 text-violet-700"
+              title={isZh ? "推理强度" : "Reasoning Effort"}
+            >
+              {log.reasoning_effort}
+            </Badge>
           ) : null}
           {log?.latency_total_ms != null ? (
             <span className="text-slate-500">{formatDuration(log.latency_total_ms)}</span>

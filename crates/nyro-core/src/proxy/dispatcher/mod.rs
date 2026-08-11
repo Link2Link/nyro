@@ -191,6 +191,10 @@ async fn dispatch_pipeline_inner(
         body: request_body_str.clone(),
     };
     let start = Instant::now();
+    // Snapshot the client-requested reasoning effort from the normalized IR
+    // before hooks or provider-specific processing can mutate the request.
+    // This metadata is logged independently of payload recording.
+    let reasoning_effort = crate::protocol::codec::reasoning::effort_snapshot(&request.reasoning);
 
     // ── OnRequest phase ──────────────────────────────────────────────────────
     // Hooks run before the routing key is derived, so they may reshape the
@@ -220,6 +224,7 @@ async fn dispatch_pipeline_inner(
             let msg = format!("no route for model: {request_model}");
             LogBuilder::from_dispatch(&gw, &ingress_str, &request_model, None, start)
                 .stream_flag(is_stream)
+                .reasoning_effort(reasoning_effort.clone())
                 .status(404)
                 .with_req_extras(&req_extras)
                 .resp_body(Some(
@@ -239,6 +244,7 @@ async fn dispatch_pipeline_inner(
             let status = resp.status().as_u16() as i32;
             LogBuilder::from_dispatch(&gw, &ingress_str, &request_model, None, start)
                 .stream_flag(is_stream)
+                .reasoning_effort(reasoning_effort.clone())
                 .status_i32(status)
                 .with_req_extras(&req_extras)
                 .emit();
@@ -267,6 +273,7 @@ async fn dispatch_pipeline_inner(
                     start,
                 )
                 .stream_flag(is_stream)
+                .reasoning_effort(reasoning_effort.clone())
                 .status(500)
                 .with_req_extras(&req_extras)
                 .emit();
@@ -292,6 +299,7 @@ async fn dispatch_pipeline_inner(
                 start,
             )
             .stream_flag(is_stream)
+            .reasoning_effort(reasoning_effort.clone())
             .status_i32(status)
             .with_req_extras(&req_extras)
             .emit();
@@ -311,6 +319,7 @@ async fn dispatch_pipeline_inner(
             start,
         )
         .stream_flag(is_stream)
+        .reasoning_effort(reasoning_effort.clone())
         .status(503)
         .with_req_extras(&req_extras)
         .emit();
@@ -326,6 +335,7 @@ async fn dispatch_pipeline_inner(
             start,
         )
         .stream_flag(is_stream)
+        .reasoning_effort(reasoning_effort.clone())
         .status(503)
         .with_req_extras(&req_extras)
         .emit();
@@ -548,6 +558,7 @@ async fn dispatch_pipeline_inner(
             api_key_name: auth_key.name.as_deref(),
             is_stream,
             enable_payload: route.enable_payload,
+            reasoning_effort: reasoning_effort.clone(),
             start,
             req_ext: req_ctx_ext.clone(),
         };
@@ -625,6 +636,7 @@ async fn dispatch_pipeline_inner(
             start,
         )
         .stream_flag(is_stream)
+        .reasoning_effort(reasoning_effort.clone())
         .status(502)
         .with_req_extras(&req_extras)
         .emit();
@@ -682,6 +694,8 @@ struct CallCtx<'a> {
     api_key_name: Option<&'a str>,
     is_stream: bool,
     enable_payload: Option<bool>,
+    /// Client-requested reasoning effort snapshot (payload-independent).
+    reasoning_effort: Option<String>,
     start: Instant,
     /// Shared request-scoped extension bag (clone of `RequestContext::extensions`);
     /// handlers write the canonical `ResponseStats` snapshot here.
@@ -722,6 +736,8 @@ struct LogBuilder {
     model_name: Option<String>,
     is_stream: bool,
     enable_payload: Option<bool>,
+    /// Client-requested reasoning effort snapshot (payload-independent).
+    reasoning_effort: Option<String>,
     start: Instant,
     client_status_code: i32,
     usage: Usage,
@@ -748,6 +764,7 @@ impl LogBuilder {
             model_name: Some(call_ctx.model_name.to_string()),
             is_stream: call_ctx.is_stream,
             enable_payload: call_ctx.enable_payload,
+            reasoning_effort: call_ctx.reasoning_effort.clone(),
             start: call_ctx.start,
             client_status_code: 200,
             usage: Usage::default(),
@@ -780,6 +797,7 @@ impl LogBuilder {
             model_name: None,
             is_stream: false,
             enable_payload: None,
+            reasoning_effort: None,
             start,
             client_status_code: 200,
             usage: Usage::default(),
@@ -790,6 +808,12 @@ impl LogBuilder {
 
     fn stream_flag(mut self, v: bool) -> Self {
         self.is_stream = v;
+        self
+    }
+
+    /// Attach the client-requested reasoning effort snapshot.
+    fn reasoning_effort(mut self, v: Option<String>) -> Self {
+        self.reasoning_effort = v;
         self
     }
 
@@ -918,6 +942,7 @@ impl LogBuilder {
             upstream_url: self.extras.upstream_url,
             client_model: self.client_model,
             upstream_model: self.upstream_model,
+            reasoning_effort: self.reasoning_effort,
             method: self.extras.method,
             path: self.extras.path,
             client_request_headers: self.extras.client_request_headers,
@@ -1392,5 +1417,94 @@ mod tests {
             resp.model, "mutated-by-hook",
             "OnResponse Full hook must mutate the response in place"
         );
+    }
+
+    #[tokio::test]
+    async fn dispatch_logs_reasoning_effort_snapshot_from_ir() {
+        use crate::protocol::ir::{ReasoningConfig, ReasoningEffort};
+
+        let config = crate::config::GatewayConfig {
+            data_dir: std::env::temp_dir().join(format!(
+                "nyro-reasoning-effort-log-test-{}",
+                uuid::Uuid::new_v4()
+            )),
+            ..Default::default()
+        };
+        let (gw, mut log_rx) = Gateway::new(config).await.expect("gateway init");
+        let envelope = RawEnvelope::new(
+            Some(serde_json::json!({"model": "missing-model"})),
+            HashMap::new(),
+            "POST",
+            "/v1/chat/completions",
+        );
+        let mut request = AiRequest::new("missing-model", Vec::new());
+        request.reasoning = ReasoningConfig {
+            enabled: true,
+            effort: Some(ReasoningEffort::High),
+            ..Default::default()
+        };
+
+        let response = dispatch_pipeline(
+            gw,
+            HeaderMap::new(),
+            envelope,
+            request,
+            OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1,
+            crate::proxy::context::RequestContext::new(
+                OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1,
+                std::time::Duration::from_secs(30),
+            ),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let entry = tokio::time::timeout(std::time::Duration::from_secs(1), log_rx.recv())
+            .await
+            .expect("log entry should be emitted")
+            .expect("log channel should remain open");
+        assert_eq!(
+            entry.reasoning_effort.as_deref(),
+            Some("high"),
+            "normalized IR effort must be logged even on the error path"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_logs_reasoning_effort_none_when_not_declared() {
+        let config = crate::config::GatewayConfig {
+            data_dir: std::env::temp_dir().join(format!(
+                "nyro-reasoning-effort-none-test-{}",
+                uuid::Uuid::new_v4()
+            )),
+            ..Default::default()
+        };
+        let (gw, mut log_rx) = Gateway::new(config).await.expect("gateway init");
+        let envelope = RawEnvelope::new(
+            Some(serde_json::json!({"model": "missing-model"})),
+            HashMap::new(),
+            "POST",
+            "/v1/chat/completions",
+        );
+        let request = AiRequest::new("missing-model", Vec::new());
+
+        let response = dispatch_pipeline(
+            gw,
+            HeaderMap::new(),
+            envelope,
+            request,
+            OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1,
+            crate::proxy::context::RequestContext::new(
+                OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1,
+                std::time::Duration::from_secs(30),
+            ),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let entry = tokio::time::timeout(std::time::Duration::from_secs(1), log_rx.recv())
+            .await
+            .expect("log entry should be emitted")
+            .expect("log channel should remain open");
+        assert_eq!(entry.reasoning_effort, None);
     }
 }

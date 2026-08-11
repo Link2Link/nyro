@@ -468,6 +468,7 @@ mod tests {
             api_key_name: None,
             is_stream: false,
             enable_payload: None,
+            reasoning_effort: None,
             start: std::time::Instant::now(),
             req_ext,
         };
@@ -555,6 +556,7 @@ mod tests {
             api_key_name: None,
             is_stream: false,
             enable_payload: None,
+            reasoning_effort: None,
             start: std::time::Instant::now(),
             req_ext: req_ext.clone(),
         };

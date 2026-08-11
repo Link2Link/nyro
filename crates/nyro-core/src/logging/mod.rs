@@ -27,6 +27,11 @@ pub struct LogEntry {
     pub client_model: String,
     pub upstream_model: String,
 
+    // === 推理 ===
+    /// 客户端请求的归一化推理强度（IR 快照，不受载荷开关影响）。
+    /// 定性值小写（"high" 等）；仅 budget 时为 `budget:<n>`；未声明为 None。
+    pub reasoning_effort: Option<String>,
+
     // === HTTP 元 ===
     pub method: Option<String>,
     pub path: Option<String>,
@@ -151,6 +156,17 @@ fn should_record_payload(
         || (global_enabled && model_enabled.unwrap_or(true))
 }
 
+fn clear_payload(entry: &mut LogEntry) {
+    entry.client_request_headers = None;
+    entry.client_request_body = None;
+    entry.client_response_headers = None;
+    entry.client_response_body = None;
+    entry.upstream_request_headers = None;
+    entry.upstream_request_body = None;
+    entry.upstream_response_headers = None;
+    entry.upstream_response_body = None;
+}
+
 async fn flush(storage: DynStorage, buffer: &mut Vec<LogEntry>) {
     let mut entries = std::mem::take(buffer);
     let global_enabled = read_enable_payload(&storage).await;
@@ -163,14 +179,7 @@ async fn flush(storage: DynStorage, buffer: &mut Vec<LogEntry>) {
             entry.upstream_status_code,
         );
         if !should_record {
-            entry.client_request_headers = None;
-            entry.client_request_body = None;
-            entry.client_response_headers = None;
-            entry.client_response_body = None;
-            entry.upstream_request_headers = None;
-            entry.upstream_request_body = None;
-            entry.upstream_response_headers = None;
-            entry.upstream_response_body = None;
+            clear_payload(entry);
         }
         // Clear transient field before DB write
         entry.enable_payload = None;
@@ -180,7 +189,8 @@ async fn flush(storage: DynStorage, buffer: &mut Vec<LogEntry>) {
 
 #[cfg(test)]
 mod tests {
-    use super::should_record_payload;
+    use super::{LogEntry, clear_payload, should_record_payload};
+    use crate::protocol::ir::Usage;
 
     #[test]
     fn preserves_payload_for_http_errors_when_disabled() {
@@ -230,5 +240,56 @@ mod tests {
         assert!(should_record_payload(true, None, 200, Some(200)));
         assert!(should_record_payload(true, Some(true), 200, Some(200)));
         assert!(!should_record_payload(true, Some(false), 200, Some(200)));
+    }
+
+    #[test]
+    fn clearing_payload_preserves_reasoning_effort_metadata() {
+        let payload = Some("payload".to_string());
+        let mut entry = LogEntry {
+            api_key_id: None,
+            api_key_name: None,
+            created_at: 0,
+            client_protocol: String::new(),
+            upstream_protocol: String::new(),
+            provider_id: String::new(),
+            provider_name: String::new(),
+            model_id: None,
+            model_name: None,
+            upstream_url: None,
+            client_model: String::new(),
+            upstream_model: String::new(),
+            reasoning_effort: Some("high".to_string()),
+            method: None,
+            path: None,
+            client_request_headers: payload.clone(),
+            client_request_body: payload.clone(),
+            client_response_headers: payload.clone(),
+            client_response_body: payload.clone(),
+            upstream_request_headers: payload.clone(),
+            upstream_request_body: payload.clone(),
+            upstream_response_headers: payload.clone(),
+            upstream_response_body: payload,
+            upstream_status_code: Some(200),
+            client_status_code: 200,
+            latency_total_ms: 0,
+            latency_upstream_ms: None,
+            usage: Usage::default(),
+            is_stream: false,
+            stream_chunks_count: 0,
+            stream_first_chunk_ms: None,
+            enable_payload: Some(false),
+        };
+
+        clear_payload(&mut entry);
+
+        assert!(entry.client_request_headers.is_none());
+        assert!(entry.client_request_body.is_none());
+        assert!(entry.client_response_headers.is_none());
+        assert!(entry.client_response_body.is_none());
+        assert!(entry.upstream_request_headers.is_none());
+        assert!(entry.upstream_request_body.is_none());
+        assert!(entry.upstream_response_headers.is_none());
+        assert!(entry.upstream_response_body.is_none());
+        assert_eq!(entry.reasoning_effort.as_deref(), Some("high"));
     }
 }

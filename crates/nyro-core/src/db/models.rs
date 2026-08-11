@@ -372,6 +372,10 @@ pub struct RequestLog {
     pub client_model: Option<String>,
     pub upstream_model: Option<String>,
 
+    /// 客户端请求的归一化推理强度快照（不受载荷记录开关影响）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
+
     pub method: Option<String>,
     pub path: Option<String>,
 

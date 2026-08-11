@@ -34,6 +34,19 @@ pub fn anthropic_effort_name(effort: &ReasoningEffort) -> Option<&'static str> {
     }
 }
 
+/// Snapshot of the client-requested reasoning effort for logging: the
+/// normalized qualitative name, `budget:<n>` when only a token budget was
+/// declared, or `None` when the request carried no reasoning directive.
+pub fn effort_snapshot(reasoning: &ReasoningConfig) -> Option<String> {
+    match reasoning.effort.as_ref() {
+        Some(ReasoningEffort::Budget(tokens)) => Some(format!("budget:{tokens}")),
+        Some(effort) => reasoning_effort_name(effort).map(str::to_string),
+        None => reasoning
+            .budget_tokens
+            .map(|tokens| format!("budget:{tokens}")),
+    }
+}
+
 /// Gemini `thinkingConfig.thinkingLevel` values are lowercase per the API spec
 /// (`low` / `medium` / `high`), unlike the uppercase wire conventions of the
 /// OpenAI-family protocols.
@@ -219,9 +232,41 @@ mod tests {
         for (name, effort) in levels {
             assert_eq!(parse_reasoning_effort(name), Some(effort.clone()));
             assert_eq!(reasoning_effort_name(&effort), Some(name));
+            assert_eq!(
+                effort_snapshot(&ReasoningConfig {
+                    enabled: !matches!(&effort, ReasoningEffort::None),
+                    effort: Some(effort),
+                    ..Default::default()
+                })
+                .as_deref(),
+                Some(name)
+            );
         }
         assert_eq!(parse_reasoning_effort("HIGH"), Some(ReasoningEffort::High));
         assert_eq!(parse_reasoning_effort("unknown"), None);
+    }
+
+    #[test]
+    fn reasoning_effort_snapshot_handles_budgets_and_missing_values() {
+        assert_eq!(
+            effort_snapshot(&ReasoningConfig {
+                enabled: true,
+                budget_tokens: Some(4096),
+                ..Default::default()
+            })
+            .as_deref(),
+            Some("budget:4096")
+        );
+        assert_eq!(
+            effort_snapshot(&ReasoningConfig {
+                enabled: true,
+                effort: Some(ReasoningEffort::Budget(2048)),
+                ..Default::default()
+            })
+            .as_deref(),
+            Some("budget:2048")
+        );
+        assert_eq!(effort_snapshot(&ReasoningConfig::default()), None);
     }
 
     #[test]
@@ -231,7 +276,10 @@ mod tests {
             Some("low")
         );
         assert_eq!(anthropic_effort_name(&ReasoningEffort::Max), Some("max"));
-        assert_eq!(google_thinking_level(&ReasoningEffort::Minimal), Some("low"));
+        assert_eq!(
+            google_thinking_level(&ReasoningEffort::Minimal),
+            Some("low")
+        );
         assert_eq!(google_thinking_level(&ReasoningEffort::Xhigh), Some("high"));
         assert_eq!(google_thinking_level(&ReasoningEffort::Max), Some("high"));
     }

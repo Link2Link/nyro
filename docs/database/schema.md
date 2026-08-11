@@ -191,6 +191,7 @@ OAuth 凭据存储，用于需要 OAuth 认证的供应商（如 Google Vertex A
 | `upstream_url` | TEXT | NULL | 上游请求 URL |
 | `client_model` | TEXT | NULL | 客户端请求中的模型名 |
 | `upstream_model` | TEXT | NULL | 实际发送给上游的模型名 |
+| `reasoning_effort` | TEXT | NULL | 客户端请求的归一化推理强度（`high` 等定性值或 `budget:<n>`；不受载荷记录开关影响） |
 | `method` | TEXT | NULL | HTTP 方法 |
 | `path` | TEXT | NULL | 请求路径 |
 | `client_request_headers` | TEXT | NULL | 客户端请求头（JSON，可选记录） |

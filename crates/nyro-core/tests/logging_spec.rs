@@ -123,6 +123,7 @@ fn log_entry_timestamp_is_unix_millis() {
         upstream_url: None,
         client_model: "gpt-4".into(),
         upstream_model: "gpt-4".into(),
+        reasoning_effort: Some("high".into()),
         method: Some("POST".into()),
         path: Some("/v1/chat/completions".into()),
         client_request_headers: None,
@@ -165,6 +166,7 @@ fn stream_indicator_via_chunks_count() {
         upstream_url: None,
         client_model: String::new(),
         upstream_model: String::new(),
+        reasoning_effort: None,
         method: None,
         path: None,
         client_request_headers: None,
@@ -204,7 +206,7 @@ fn stream_indicator_via_chunks_count() {
     assert_eq!(stream.stream_first_chunk_ms, Some(120));
 }
 
-// ── 5. DB schema SQL contains all 26 new columns ─────────────────────────────
+// ── 5. DB schema SQL contains all new columns ─────────────────────────────
 
 #[test]
 fn db_schema_sql_contains_new_columns() {
@@ -225,6 +227,7 @@ fn db_schema_sql_contains_new_columns() {
         "upstream_url",
         "client_model",
         "upstream_model",
+        "reasoning_effort",
         "method",
         "path",
         "client_request_headers",
@@ -241,14 +244,15 @@ fn db_schema_sql_contains_new_columns() {
         "latency_upstream_ms",
         "input_tokens",
         "output_tokens",
+        "cache_read_tokens",
         "is_stream",
         "stream_chunks_count",
         "stream_first_chunk_ms",
     ];
     assert_eq!(
         expected_columns.len(),
-        32,
-        "schema requires 32 columns (id + 31 data columns)"
+        34,
+        "schema requires 34 columns (id + 33 data columns)"
     );
 
     // Verify RequestLog struct has the same field names via a compile-time
@@ -268,6 +272,7 @@ fn db_schema_sql_contains_new_columns() {
         let _: &Option<String> = &r.upstream_url;
         let _: &Option<String> = &r.client_model;
         let _: &Option<String> = &r.upstream_model;
+        let _: &Option<String> = &r.reasoning_effort;
         let _: &Option<String> = &r.method;
         let _: &Option<String> = &r.path;
         let _: &Option<String> = &r.client_request_headers;
@@ -284,6 +289,7 @@ fn db_schema_sql_contains_new_columns() {
         let _: &Option<i64> = &r.latency_upstream_ms;
         let _: i32 = r.input_tokens;
         let _: i32 = r.output_tokens;
+        let _: i32 = r.cache_read_tokens;
         let _: bool = r.is_stream;
         let _: i32 = r.stream_chunks_count;
         let _: &Option<i64> = &r.stream_first_chunk_ms;
@@ -305,4 +311,82 @@ fn redaction_covers_openai_and_anthropic_keys() {
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v[*key], "***", "header '{key}' must be redacted");
     }
+}
+
+#[tokio::test]
+async fn sqlite_round_trips_reasoning_effort_in_list_and_detail() {
+    use nyro_core::db;
+    use nyro_core::db::models::LogQuery;
+    use nyro_core::logging::LogEntry;
+    use nyro_core::protocol::ir::Usage;
+    use nyro_core::storage::{SqliteStorage, Storage};
+    use sqlx::sqlite::SqlitePoolOptions;
+
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .expect("connect in-memory sqlite");
+    db::migrate(&pool).await.expect("migrate sqlite schema");
+    let storage = SqliteStorage::from_pool(pool);
+
+    storage
+        .logs()
+        .append_batch(vec![LogEntry {
+            api_key_id: None,
+            api_key_name: None,
+            created_at: 1,
+            client_protocol: "openai/chat/v1".into(),
+            upstream_protocol: "openai/chat/v1".into(),
+            provider_id: "provider-1".into(),
+            provider_name: "Provider".into(),
+            model_id: Some("model-1".into()),
+            model_name: Some("Model".into()),
+            upstream_url: None,
+            client_model: "gpt-test".into(),
+            upstream_model: "gpt-test".into(),
+            reasoning_effort: Some("high".into()),
+            method: Some("POST".into()),
+            path: Some("/v1/chat/completions".into()),
+            client_request_headers: None,
+            client_request_body: Some(r#"{"reasoning_effort":"high"}"#.into()),
+            client_response_headers: None,
+            client_response_body: None,
+            upstream_request_headers: None,
+            upstream_request_body: None,
+            upstream_response_headers: None,
+            upstream_response_body: None,
+            upstream_status_code: Some(200),
+            client_status_code: 200,
+            latency_total_ms: 1,
+            latency_upstream_ms: Some(1),
+            usage: Usage::default(),
+            is_stream: false,
+            stream_chunks_count: 0,
+            stream_first_chunk_ms: None,
+            enable_payload: None,
+        }])
+        .await
+        .expect("append log");
+
+    let page = storage
+        .logs()
+        .query(LogQuery::default())
+        .await
+        .expect("query log list");
+    assert_eq!(page.total, 1);
+    assert_eq!(page.items[0].reasoning_effort.as_deref(), Some("high"));
+    assert!(page.items[0].client_request_body.is_none());
+
+    let detail = storage
+        .logs()
+        .find_by_id(&page.items[0].id)
+        .await
+        .expect("query log detail")
+        .expect("log detail should exist");
+    assert_eq!(detail.reasoning_effort.as_deref(), Some("high"));
+    assert_eq!(
+        detail.client_request_body.as_deref(),
+        Some(r#"{"reasoning_effort":"high"}"#)
+    );
 }

@@ -332,6 +332,9 @@ export default function LogsPage() {
                   <th className="px-3 py-2.5 text-left font-medium">
                     {isZh ? "模型" : "Model"}
                   </th>
+                  <th className="px-3 py-2.5 text-left font-medium whitespace-nowrap">
+                    {isZh ? "推理强度" : "Reasoning Effort"}
+                  </th>
                   <th className="px-3 py-2.5 text-left font-medium">
                     {isZh ? "协议" : "Protocol"}
                   </th>
@@ -384,6 +387,9 @@ export default function LogsPage() {
                             {log.upstream_model ? `: ${log.upstream_model}` : ""}
                           </span>
                         </div>
+                      </td>
+                      <td className="px-3 py-2 text-xs text-slate-600 whitespace-nowrap">
+                        {log.reasoning_effort ?? "–"}
                       </td>
                       <td className="px-3 py-2">
                         <div className="flex items-center gap-1.5 text-xs text-slate-500">

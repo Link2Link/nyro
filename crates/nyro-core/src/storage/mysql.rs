@@ -1022,7 +1022,7 @@ impl LogStore for MysqlLogStore {
                 r#"INSERT INTO request_logs
                     (id, created_at, api_key_id, api_key_name,
                      client_protocol, upstream_protocol, provider_id, provider_name, model_id, model_name, upstream_url,
-                     client_model, upstream_model,
+                     client_model, upstream_model, reasoning_effort,
                      method, path,
                      client_request_headers, client_request_body,
                      client_response_headers, client_response_body,
@@ -1032,7 +1032,7 @@ impl LogStore for MysqlLogStore {
                      latency_total_ms, latency_upstream_ms,
                      input_tokens, output_tokens, cache_read_tokens,
                      is_stream, stream_chunks_count, stream_first_chunk_ms)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"#,
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"#,
             )
             .bind(&id)
             .bind(entry.created_at)
@@ -1047,6 +1047,7 @@ impl LogStore for MysqlLogStore {
             .bind(&entry.upstream_url)
             .bind(&entry.client_model)
             .bind(&entry.upstream_model)
+            .bind(&entry.reasoning_effort)
             .bind(&entry.method)
             .bind(&entry.path)
             .bind(&entry.client_request_headers)
@@ -1079,7 +1080,7 @@ impl LogStore for MysqlLogStore {
         let mut data_sql = String::from(
             "SELECT id, COALESCE(created_at, 0) AS created_at, api_key_id, api_key_name, \
              client_protocol, upstream_protocol, provider_id, provider_name, model_id, model_name, upstream_url, \
-             client_model, upstream_model, method, path, \
+             client_model, upstream_model, reasoning_effort, method, path, \
              CAST(NULL AS CHAR) AS client_request_headers, CAST(NULL AS CHAR) AS client_request_body, \
              CAST(NULL AS CHAR) AS client_response_headers, CAST(NULL AS CHAR) AS client_response_body, \
              CAST(NULL AS CHAR) AS upstream_request_headers, CAST(NULL AS CHAR) AS upstream_request_body, \
@@ -1150,7 +1151,7 @@ impl LogStore for MysqlLogStore {
         let row = sqlx::query_as::<_, RequestLog>(
             "SELECT id, COALESCE(created_at, 0) AS created_at, api_key_id, api_key_name, \
              client_protocol, upstream_protocol, provider_id, provider_name, model_id, model_name, upstream_url, \
-             client_model, upstream_model, method, path, \
+             client_model, upstream_model, reasoning_effort, method, path, \
              client_request_headers, client_request_body, \
              client_response_headers, client_response_body, \
              upstream_request_headers, upstream_request_body, \
@@ -1417,6 +1418,8 @@ impl StorageBootstrap for MysqlBootstrap {
             "INTEGER DEFAULT 0",
         )
         .await?;
+        mysql_add_column_if_not_exists(pool, "request_logs", "reasoning_effort", "VARCHAR(64)")
+            .await?;
 
         // Rename tables: routes → models, route_targets → model_backends, api_key_routes → api_key_models
         mysql_rename_table_if_needed(pool, "routes", "models").await?;
@@ -1923,6 +1926,7 @@ CREATE TABLE IF NOT EXISTS request_logs (
     upstream_url              TEXT,
     client_model              VARCHAR(255),
     upstream_model            VARCHAR(255),
+    reasoning_effort          VARCHAR(64),
     method                    VARCHAR(255),
     path                      TEXT,
     client_request_headers    TEXT,
