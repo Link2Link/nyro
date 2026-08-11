@@ -154,12 +154,29 @@ where
 /// come from the decoded ingress request, not just a raw body field: native
 /// Gemini expresses streaming in the URL action (`:streamGenerateContent`)
 /// rather than a JSON `stream` property.
+fn normalize_openai_developer_roles(body: &mut serde_json::Value) {
+    if let Some(messages) = body
+        .get_mut("messages")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        for message in messages {
+            if message.get("role").and_then(serde_json::Value::as_str) == Some("developer") {
+                message["role"] = serde_json::Value::String("system".to_string());
+            }
+        }
+    }
+}
+
 pub async fn passthrough_run(
     vendor: &dyn Vendor,
     mut raw_body: serde_json::Value,
     ctx: &crate::provider::vendor::ProviderCtx<'_>,
     is_stream: bool,
 ) -> Result<crate::provider::outbound::OutboundRequest, GatewayError> {
+    let vendor_ctx = ctx.to_vendor_ctx();
+    let is_openai_chat = ctx.protocol.protocol == crate::protocol::ids::Protocol::OpenAICompatible
+        && ctx.protocol.name == "chat-completions";
+
     // Replace the model field with the route-configured actual model so the
     // upstream receives the real model name, not the client's virtual alias.
     if let Some(obj) = raw_body.as_object_mut() {
@@ -178,11 +195,7 @@ pub async fn passthrough_run(
         // precedence as the encoder). Embeddings (non-streaming, different
         // shape), Responses, and Anthropic/Gemini (usage reported by default)
         // are excluded.
-        if is_stream
-            && ctx.protocol.protocol == crate::protocol::ids::Protocol::OpenAICompatible
-            && ctx.protocol.name == "chat-completions"
-            && !obj.contains_key("stream_options")
-        {
+        if is_stream && is_openai_chat && !obj.contains_key("stream_options") {
             obj.insert(
                 "stream_options".to_string(),
                 serde_json::json!({"include_usage": true}),
@@ -190,7 +203,9 @@ pub async fn passthrough_run(
         }
     }
 
-    let vendor_ctx = ctx.to_vendor_ctx();
+    if is_openai_chat {
+        normalize_openai_developer_roles(&mut raw_body);
+    }
 
     let mut headers = if ctx.disable_default_auth {
         HeaderMap::new()
@@ -691,6 +706,32 @@ mod tests {
             out.body["stream_options"]["include_usage"], true,
             "native openai stream without stream_options must get include_usage injected",
         );
+    }
+
+    #[tokio::test]
+    async fn passthrough_converts_openai_developer_role_to_system() {
+        let gw = build_test_gateway().await;
+        let provider = provider_with_api_key("apikey-abc");
+        let ctx = openai_chat_ctx(&provider, &gw, "deepseek-v4-flash");
+
+        let out = passthrough_run(
+            &FakeApiKeyVendor,
+            serde_json::json!({
+                "messages": [
+                    {"role": "developer", "content": "instructions"},
+                    {"role": "user", "content": "hello"},
+                    {"role": "assistant", "content": "hi"}
+                ]
+            }),
+            &ctx,
+            false,
+        )
+        .await
+        .expect("passthrough succeeds");
+
+        assert_eq!(out.body["messages"][0]["role"], "system");
+        assert_eq!(out.body["messages"][1]["role"], "user");
+        assert_eq!(out.body["messages"][2]["role"], "assistant");
     }
 
     /// A client that explicitly sets `stream_options` (even to opt out of
