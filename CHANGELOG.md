@@ -4,6 +4,43 @@ All notable changes to Nyro will be documented in this file.
 
 ---
 
+## v2.0.3
+
+> Released on 2026-08-12
+
+#### Features
+
+- **Provider adaptive protocol mode**: providers now automatically adapt to the optimal protocol mode
+- **Custom tool cross-protocol bridging**: custom tools can be bridged and invoked across protocols
+- **Tool namespace cross-protocol support**: tool namespaces are now translated across protocols
+- **Cache hit display**: show cache hits on the overview and request log pages
+- **Reasoning intensity logging**: record reasoning effort in request logs
+- **Forced payload logging for 4xx errors**: request/response payloads are now force-recorded on 4xx errors
+- **Model list filtering**: filter the model list by keyword
+- **Local Docker packaging**: add a local Docker build and packaging flow
+- **Protocol conversion test suite**: add correctness tests for cross-protocol conversion
+
+#### Improvements / Refactoring
+
+- **Unified prompt_tokens semantics**: align the meaning of `prompt_tokens` across all protocols
+- **Extended forced payload logging to 4xx/5xx**: broaden the scope of forced payload recording
+- **Refactored payload record decision logic**: simplified and covered with unit tests
+- **Upstream request timeout**: increased to 600 seconds
+- **Stats page Token visualization**: improved token chart layout and column arrangement
+- **Log pagination & axis labels**: refined log pagination and statistics axis labels
+- **Model backend priority**: relaxed to accept any positive integer
+
+#### Fixes
+
+- **OpenAI `developer` message role compatibility**: fixed `developer` role handling for non-OpenAI adapters
+- **Cross-protocol conversion gaps**: filled known conversion gaps
+- **Reasoning intensity cross-protocol transfer**: fixed reasoning effort not passing through conversions
+- **SSE compact format compatibility**: fixed parsing of compact SSE responses
+- **OpenAI streaming passthrough usage stats**: token usage now recorded on streaming passthrough
+- **Responses protocol cache-hit stats**: cache hit count no longer always zero
+
+---
+
 ## v2.0.2
 
 > Released on 2026-07-15
