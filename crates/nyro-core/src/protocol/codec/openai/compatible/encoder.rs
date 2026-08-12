@@ -516,6 +516,7 @@ fn encode_message(msg: &Message) -> Result<Value> {
                             ContentBlock::Thinking { .. }
                                 | ContentBlock::RedactedThinking { .. }
                                 | ContentBlock::ToolUse { .. }
+                                | ContentBlock::ServerToolUse { .. }
                         ))
                 })
                 .map(encode_content_block_for_openai)

@@ -39,6 +39,8 @@ pub struct AnthropicRequest {
     pub context_management: Option<Value>,
     pub container: Option<String>,
     pub service_tier: Option<String>,
+    /// Fast mode (`"fast"`), Claude Code >=2.8 / fast-mode beta.
+    pub speed: Option<String>,
     pub metadata: Option<Value>,
     pub stop_sequences: Option<Vec<String>>,
 }
@@ -97,6 +99,10 @@ pub enum AnthropicContentBlock {
         #[serde(skip_serializing_if = "Option::is_none")]
         cache_control: Option<CacheControl>,
     },
+    /// Redacted thinking block (returned when the thinking signature fails
+    /// verification; echoed back verbatim in subsequent request history).
+    #[serde(rename = "redacted_thinking")]
+    RedactedThinking { data: String },
     #[serde(rename = "image")]
     Image {
         source: AnthropicImageSource,
@@ -115,6 +121,16 @@ pub enum AnthropicContentBlock {
     ToolResult {
         tool_use_id: String,
         content: Option<Value>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_control: Option<CacheControl>,
+    },
+    /// Server-executed tool call (Claude Code >=2.8 / Agent SDK emits
+    /// `server_tool_use` blocks for server tools like webReader / webSearch).
+    #[serde(rename = "server_tool_use")]
+    ServerToolUse {
+        id: String,
+        name: String,
+        input: Value,
         #[serde(skip_serializing_if = "Option::is_none")]
         cache_control: Option<CacheControl>,
     },
@@ -148,8 +164,10 @@ impl AnthropicContentBlock {
             | Self::Image { cache_control, .. }
             | Self::ToolUse { cache_control, .. }
             | Self::ToolResult { cache_control, .. }
+            | Self::ServerToolUse { cache_control, .. }
             | Self::Document { cache_control, .. }
             | Self::InputAudio { cache_control, .. } => cache_control.as_ref(),
+            Self::RedactedThinking { .. } => None,
         }
     }
 

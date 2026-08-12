@@ -368,6 +368,359 @@ fn assistant_tool_use_blocks_become_tool_calls() {
     );
 }
 
+// ── server_tool_use blocks (Claude Code >=2.8 / server tools) ─────────────────
+
+#[test]
+fn server_tool_use_block_decodes() {
+    // Regression: Claude Code 2.8.x emits `server_tool_use` blocks for
+    // server-side tools (webReader / webSearch). Before the fix this payload
+    // failed with "data did not match any variant of untagged enum
+    // AnthropicContent" (400 from the gateway).
+    let req = decode_request(
+        P::AnthropicMessages,
+        json!({
+            "model": "glm-5.2",
+            "max_tokens": 65535,
+            "messages": [
+                {"role": "user", "content": "评审变更"},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "thinking", "thinking": "Let me review.", "signature": "sig_01"},
+                        {"type": "text", "text": "我来评审当前的变更。"},
+                        {
+                            "type": "server_tool_use",
+                            "id": "call_de0eb30ed07a4f0dbc7688f4",
+                            "name": "webReader",
+                            "input": {"url": "file:///dev/null"}
+                        }
+                    ]
+                },
+                {
+                    "role": "user",
+                    "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": "call_de0eb30ed07a4f0dbc7688f4",
+                        "content": [{"type": "text", "text": "MCP error -400"}]
+                    }]
+                }
+            ]
+        }),
+    );
+
+    assert_eq!(req.messages.len(), 3);
+    assert_eq!(req.messages[0].role, Role::User);
+    assert_eq!(req.messages[1].role, Role::Assistant);
+
+    let calls = tool_calls(&req);
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].id, "call_de0eb30ed07a4f0dbc7688f4");
+    assert_eq!(calls[0].name, "webReader");
+    assert_eq!(calls[0].arguments, "{\"url\":\"file:///dev/null\"}");
+
+    let MessageContent::Blocks(blocks) = &req.messages[1].content else {
+        panic!("assistant content must be block form");
+    };
+    assert!(matches!(
+        blocks[2],
+        ContentBlock::ServerToolUse { ref name, .. } if name == "webReader"
+    ));
+
+    // The tool result resolves to a Role::Tool message carrying the call id.
+    assert_eq!(req.messages[2].role, Role::Tool);
+    assert_eq!(
+        req.messages[2].tool_call_id.as_deref(),
+        Some("call_de0eb30ed07a4f0dbc7688f4")
+    );
+}
+
+#[test]
+fn server_tool_use_round_trips_to_anthropic() {
+    let body = json!({
+        "model": "glm-5.2",
+        "max_tokens": 1024,
+        "messages": [
+            {"role": "user", "content": "What's the latest news?"},
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "text", "text": "Let me search."},
+                    {
+                        "type": "server_tool_use",
+                        "id": "srvtool_01",
+                        "name": "webSearch",
+                        "input": {"query": "claude code 2.8"}
+                    }
+                ]
+            }
+        ]
+    });
+
+    let out = round_trip_request(P::AnthropicMessages, body);
+
+    let content = field(&out, "/messages/1/content")
+        .as_array()
+        .expect("content array");
+    assert_eq!(content.len(), 2);
+    assert_eq!(content[1]["type"], "server_tool_use");
+    assert_eq!(content[1]["id"], "srvtool_01");
+    assert_eq!(content[1]["name"], "webSearch");
+    assert_eq!(content[1]["input"], json!({"query": "claude code 2.8"}));
+}
+
+#[test]
+fn server_tool_use_translates_to_openai_chat() {
+    // Cross-protocol: a server tool call must surface as an OpenAI
+    // `tool_calls` entry and must NOT leak into `content` (OpenAI
+    // chat/completions rejects unknown content part types). The call is
+    // paired with its tool_result, as real Claude Code traffic always is.
+    let out = translate(
+        P::AnthropicMessages,
+        json!({
+            "model": "glm-5.2",
+            "max_tokens": 1024,
+            "messages": [
+                {"role": "user", "content": "What's the latest news?"},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "server_tool_use",
+                            "id": "srvtool_01",
+                            "name": "webSearch",
+                            "input": {"query": "claude code"}
+                        }
+                    ]
+                },
+                {
+                    "role": "user",
+                    "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": "srvtool_01",
+                        "content": "2.8.4 released"
+                    }]
+                }
+            ]
+        }),
+        P::OpenAiChat,
+    );
+
+    let calls = field(&out, "/messages/1/tool_calls")
+        .as_array()
+        .expect("tool_calls array");
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0]["function"]["name"], "webSearch");
+    assert_eq!(calls[0]["id"], "srvtool_01");
+
+    let content = field(&out, "/messages/1/content");
+    assert!(
+        content.is_null() || content.as_array().is_none_or(|a| a.is_empty()),
+        "server_tool_use must be stripped from OpenAI content, got: {content}"
+    );
+
+    assert_eq!(field(&out, "/messages/2/role"), "tool");
+    assert_eq!(field(&out, "/messages/2/tool_call_id"), "srvtool_01");
+}
+
+// ── redacted_thinking blocks ──────────────────────────────────────────────────
+
+#[test]
+fn redacted_thinking_block_decodes() {
+    // Regression: the wire decoder must accept redacted thinking blocks
+    // (returned when the thinking signature fails verification and echoed
+    // back verbatim in subsequent request history). Same failure class as
+    // server_tool_use — "data did not match any variant of untagged enum
+    // AnthropicContent".
+    let req = decode_request(
+        P::AnthropicMessages,
+        json!({
+            "model": "claude-sonnet-4-20250514",
+            "max_tokens": 1024,
+            "messages": [
+                {"role": "user", "content": "Think hard."},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "redacted_thinking", "data": "YWJjZGVmZ2hpams="},
+                        {"type": "text", "text": "Done thinking."}
+                    ]
+                }
+            ]
+        }),
+    );
+
+    assert_eq!(req.messages.len(), 2);
+    assert_eq!(req.messages[1].role, Role::Assistant);
+
+    let MessageContent::Blocks(blocks) = &req.messages[1].content else {
+        panic!("assistant content must be block form");
+    };
+    assert_eq!(blocks.len(), 2);
+    assert!(matches!(
+        blocks[0],
+        ContentBlock::RedactedThinking { ref data } if data == "YWJjZGVmZ2hpams="
+    ));
+    assert_eq!(blocks[1].as_text(), Some("Done thinking."));
+}
+
+#[test]
+fn redacted_thinking_round_trips_to_anthropic() {
+    let body = json!({
+        "model": "claude-sonnet-4-20250514",
+        "max_tokens": 1024,
+        "messages": [
+            {"role": "user", "content": "Think hard."},
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "redacted_thinking", "data": "YWJjZGVmZ2hpams="},
+                    {"type": "text", "text": "Done thinking."}
+                ]
+            }
+        ]
+    });
+
+    let out = round_trip_request(P::AnthropicMessages, body);
+
+    let content = field(&out, "/messages/1/content")
+        .as_array()
+        .expect("content array");
+    assert_eq!(content.len(), 2);
+    assert_eq!(content[0]["type"], "redacted_thinking");
+    assert_eq!(content[0]["data"], "YWJjZGVmZ2hpams=");
+}
+
+// ── fast mode passthrough ─────────────────────────────────────────────────────
+
+#[test]
+fn speed_field_round_trips() {
+    // Claude Code >=2.8 sends `speed: "fast"` when fast mode is on; it must
+    // survive the Anthropic round-trip instead of being silently dropped.
+    let body = json!({
+        "model": "glm-5.2",
+        "max_tokens": 1024,
+        "speed": "fast",
+        "messages": [{"role": "user", "content": "Hello"}]
+    });
+
+    let out = round_trip_request(P::AnthropicMessages, body);
+    assert_eq!(field(&out, "/speed"), "fast");
+}
+
+#[test]
+fn no_speed_when_absent() {
+    let body = json!({
+        "model": "glm-5.2",
+        "max_tokens": 1024,
+        "messages": [{"role": "user", "content": "Hello"}]
+    });
+
+    let out = round_trip_request(P::AnthropicMessages, body);
+    assert!(
+        out.get("speed").is_none(),
+        "no speed expected, got: {:?}",
+        out.get("speed")
+    );
+}
+
+#[test]
+fn full_claude_code_request_shape_round_trips() {
+    // End-to-end shape test mirroring the real Claude Code 2.8.4 → glm-5.2
+    // traffic that triggered the original 400: block-form system with
+    // cache_control, adaptive thinking, output_config effort, fast speed,
+    // a thinking+signature block, a server_tool_use call paired with its
+    // tool_result, and metadata. Every part must survive decode → encode
+    // without error.
+    let body = json!({
+        "model": "glm-5.2",
+        "max_tokens": 65535,
+        "speed": "fast",
+        "stream": true,
+        "thinking": {"type": "adaptive"},
+        "output_config": {"effort": "max"},
+        "metadata": {"user_id": "device-1", "session_id": "sess-1"},
+        "system": [
+            {"type": "text", "text": "You are Claude Code."},
+            {
+                "type": "text",
+                "text": "Long instructions...",
+                "cache_control": {"type": "ephemeral"}
+            }
+        ],
+        "messages": [
+            {"role": "user", "content": "评审变更"},
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "thinking", "thinking": "Let me review.", "signature": "sig_01"},
+                    {"type": "text", "text": "我来评审。"},
+                    {
+                        "type": "server_tool_use",
+                        "id": "call_de0eb30ed07a4f0dbc7688f4",
+                        "name": "webReader",
+                        "input": {"url": "file:///dev/null"}
+                    }
+                ]
+            },
+            {
+                "role": "user",
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "call_de0eb30ed07a4f0dbc7688f4",
+                    "content": [{"type": "text", "text": "MCP error -400"}]
+                }]
+            }
+        ]
+    });
+
+    let out = round_trip_request(P::AnthropicMessages, body.clone());
+
+    assert_eq!(field(&out, "/model"), "glm-5.2");
+    assert_eq!(field(&out, "/max_tokens"), &json!(65535));
+    assert_eq!(field(&out, "/speed"), "fast");
+    assert_eq!(field(&out, "/stream"), &json!(true));
+    assert_eq!(field(&out, "/thinking"), &json!({"type": "adaptive"}));
+    assert_eq!(field(&out, "/output_config"), &json!({"effort": "max"}));
+    assert_eq!(
+        field(&out, "/metadata"),
+        &json!({"user_id": "device-1", "session_id": "sess-1"})
+    );
+
+    // system blocks (with cache_control) preserved as an array.
+    let system = field(&out, "/system").as_array().expect("system array");
+    assert_eq!(system.len(), 2);
+    assert_eq!(system[1]["cache_control"], json!({"type": "ephemeral"}));
+
+    // Assistant turn keeps thinking + text + server_tool_use in order.
+    let content = field(&out, "/messages/1/content").as_array().expect("content array");
+    assert_eq!(content.len(), 3);
+    assert_eq!(content[0]["type"], "thinking");
+    assert_eq!(content[0]["signature"], "sig_01");
+    assert_eq!(content[2]["type"], "server_tool_use");
+    assert_eq!(content[2]["name"], "webReader");
+
+    // Tool result survives as a user message with a tool_result block.
+    let tool_msg = field(&out, "/messages/2/content").as_array().expect("tool content array");
+    assert_eq!(tool_msg[0]["type"], "tool_result");
+    assert_eq!(tool_msg[0]["tool_use_id"], "call_de0eb30ed07a4f0dbc7688f4");
+
+    // And the decoded IR is equally sound. The block-form system becomes a
+    // leading Role::System message, so: [system, user, assistant, tool].
+    let req = decode_request(P::AnthropicMessages, body);
+    assert_eq!(req.generation.max_tokens, Some(65535));
+    assert_eq!(req.stream.enabled, true);
+    assert!(req.reasoning.enabled);
+    assert_eq!(req.messages[0].role, Role::System);
+    assert_eq!(req.messages[2].role, Role::Assistant);
+    assert_eq!(req.messages[3].role, Role::Tool);
+    assert_eq!(tool_calls(&req)[0].name, "webReader");
+    // The server tool result keeps its upstream-issued id.
+    assert_eq!(
+        req.messages[3].tool_call_id.as_deref(),
+        Some("call_de0eb30ed07a4f0dbc7688f4")
+    );
+}
+
 #[test]
 fn tool_result_to_tool_message() {
     let req = decode_request(

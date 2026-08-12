@@ -113,8 +113,25 @@ impl RequestDecoder for AnthropicDecoder {
             }
         }
 
+        // Server tool call ids are issued by the upstream (e.g. `call_...`,
+        // `srvtool_...`); their results must round-trip unchanged so the
+        // encoder does not rewrite them with the `toolu_` client prefix.
+        let server_tool_ids: std::collections::HashSet<String> = req
+            .messages
+            .iter()
+            .filter_map(|m| match &m.content {
+                AnthropicContent::Blocks(blocks) => Some(blocks),
+                _ => None,
+            })
+            .flatten()
+            .filter_map(|b| match b {
+                AnthropicContentBlock::ServerToolUse { id, .. } => Some(id.clone()),
+                _ => None,
+            })
+            .collect();
+
         for msg in req.messages {
-            messages.extend(decode_message(msg)?);
+            messages.extend(decode_message(msg, &server_tool_ids)?);
         }
 
         // ── Tools ─────────────────────────────────────────────────────────────
@@ -237,6 +254,9 @@ impl RequestDecoder for AnthropicDecoder {
         if let Some(ref st) = req.service_tier {
             ingress.insert("__anthropic_service_tier".into(), Value::String(st.clone()));
         }
+        if let Some(ref s) = req.speed {
+            ingress.insert("__anthropic_speed".into(), Value::String(s.clone()));
+        }
         if let Some(ref meta) = req.metadata {
             ingress.insert("__anthropic_metadata".into(), meta.clone());
         }
@@ -281,7 +301,10 @@ impl RequestDecoder for AnthropicDecoder {
 
 // ── Message decoding helpers ──────────────────────────────────────────────────
 
-fn decode_message(msg: AnthropicMessage) -> Result<Vec<Message>> {
+fn decode_message(
+    msg: AnthropicMessage,
+    server_tool_ids: &std::collections::HashSet<String>,
+) -> Result<Vec<Message>> {
     let role = match msg.role.as_str() {
         "user" => Role::User,
         "assistant" => Role::Assistant,
@@ -295,7 +318,7 @@ fn decode_message(msg: AnthropicMessage) -> Result<Vec<Message>> {
     if role == Role::User
         && let AnthropicContent::Blocks(blocks) = msg.content
     {
-        return decode_user_blocks(blocks);
+        return decode_user_blocks(blocks, server_tool_ids);
     }
 
     let (content, tool_calls, tool_call_id) = match msg.content {
@@ -331,6 +354,9 @@ fn decode_message(msg: AnthropicMessage) -> Result<Vec<Message>> {
                             signature,
                         });
                     }
+                    AnthropicContentBlock::RedactedThinking { data } => {
+                        content_blocks.push(ContentBlock::RedactedThinking { data });
+                    }
                     AnthropicContentBlock::Image {
                         source,
                         cache_control,
@@ -359,6 +385,28 @@ fn decode_message(msg: AnthropicMessage) -> Result<Vec<Message>> {
                             id,
                             name,
                             input,
+                            cache_control: cache_control.as_ref().map(map_cache_control),
+                        });
+                    }
+                    AnthropicContentBlock::ServerToolUse {
+                        id,
+                        name,
+                        input,
+                        cache_control,
+                        ..
+                    } => {
+                        tcs.push(ToolCall {
+                            id: id.clone(),
+                            name: name.clone(),
+                            namespace: None,
+                            kind: ToolCallKind::Function,
+                            arguments: input.to_string(),
+                        });
+                        content_blocks.push(ContentBlock::ServerToolUse {
+                            id,
+                            name,
+                            input,
+                            server_type: None,
                             cache_control: cache_control.as_ref().map(map_cache_control),
                         });
                     }
@@ -450,7 +498,10 @@ fn build_reasoning_meta(thinking_texts: &[String]) -> Option<Value> {
     Some(serde_json::json!({ "reasoning_content": joined }))
 }
 
-fn decode_user_blocks(blocks: Vec<AnthropicContentBlock>) -> Result<Vec<Message>> {
+fn decode_user_blocks(
+    blocks: Vec<AnthropicContentBlock>,
+    server_tool_ids: &std::collections::HashSet<String>,
+) -> Result<Vec<Message>> {
     let mut messages: Vec<Message> = Vec::new();
     let mut user_blocks: Vec<ContentBlock> = Vec::new();
 
@@ -466,12 +517,17 @@ fn decode_user_blocks(blocks: Vec<AnthropicContentBlock>) -> Result<Vec<Message>
                     Value::Null => String::new(),
                     other => other.to_string(),
                 };
+                // Server tool ids are upstream-issued; mark the message so the
+                // encoder skips the `toolu_` client-id rewrite for its result.
+                let is_server = server_tool_ids.contains(&tool_use_id);
                 messages.push(Message {
                     role: Role::Tool,
                     content: MessageContent::Text(tool_text),
                     tool_calls: None,
                     tool_call_id: Some(tool_use_id),
-                    meta: None,
+                    meta: is_server.then(|| {
+                        serde_json::json!({ "__nyro_server_tool_result": true })
+                    }),
                 });
             }
             AnthropicContentBlock::Text {
@@ -494,6 +550,9 @@ fn decode_user_blocks(blocks: Vec<AnthropicContentBlock>) -> Result<Vec<Message>
                     signature,
                 });
             }
+            AnthropicContentBlock::RedactedThinking { data } => {
+                user_blocks.push(ContentBlock::RedactedThinking { data });
+            }
             AnthropicContentBlock::Image {
                 source,
                 cache_control,
@@ -515,6 +574,21 @@ fn decode_user_blocks(blocks: Vec<AnthropicContentBlock>) -> Result<Vec<Message>
                     id,
                     name,
                     input,
+                    cache_control: cache_control.as_ref().map(map_cache_control),
+                });
+            }
+            AnthropicContentBlock::ServerToolUse {
+                id,
+                name,
+                input,
+                cache_control,
+                ..
+            } => {
+                user_blocks.push(ContentBlock::ServerToolUse {
+                    id,
+                    name,
+                    input,
+                    server_type: None,
                     cache_control: cache_control.as_ref().map(map_cache_control),
                 });
             }

@@ -128,6 +128,7 @@ impl RequestEncoder for AnthropicEncoder {
         for key in &[
             "__anthropic_container",
             "__anthropic_service_tier",
+            "__anthropic_speed",
             "__anthropic_metadata",
             "__anthropic_stop_sequences",
             "__anthropic_top_k",
@@ -272,6 +273,7 @@ const ALLOWED_BLOCK_TYPES: &[&str] = &[
     "redacted_thinking",
     "tool_use",
     "tool_result",
+    "server_tool_use",
     "document",
     "input_audio",
 ];
@@ -322,12 +324,12 @@ fn validate_anthropic_payload(body: &Value) -> Result<()> {
                             );
                         }
                         match btype {
-                            "tool_use" => {
+                            "tool_use" | "server_tool_use" => {
                                 let id = block.get("id").and_then(|v| v.as_str()).unwrap_or("");
                                 let name = block.get("name").and_then(|v| v.as_str()).unwrap_or("");
                                 if id.is_empty() || name.is_empty() {
                                     anyhow::bail!(
-                                        "anthropic payload message[{idx}] tool_use block[{bidx}] missing id/name"
+                                        "anthropic payload message[{idx}] {btype} block[{bidx}] missing id/name"
                                     );
                                 }
                             }
@@ -390,12 +392,28 @@ fn encode_message(msg: &Message) -> Result<Value> {
 
     if msg.role == Role::Tool {
         let (tool_content, hinted_tool_use_id) = anthropic_tool_result_payload(msg);
+        // Server tool results reference upstream-issued ids (`call_...`,
+        // `srvtool_...`); the decoder marks them so they survive the
+        // `toolu_` client-id rewrite and still pair with the upstream's
+        // original server_tool_use block.
+        let is_server_result = msg
+            .meta
+            .as_ref()
+            .and_then(|m| m.get("__nyro_server_tool_result"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         let tool_use_id = msg
             .tool_call_id
             .clone()
             .filter(|v| !v.trim().is_empty())
             .or(hinted_tool_use_id)
-            .map(|v| normalize_anthropic_tool_id(&v))
+            .map(|v| {
+                if is_server_result {
+                    v
+                } else {
+                    normalize_anthropic_tool_id(&v)
+                }
+            })
             .unwrap_or_else(|| normalize_anthropic_tool_id("tool_result"));
         return Ok(serde_json::json!({
             "role": role,
@@ -651,10 +669,12 @@ fn normalize_anthropic_messages(messages: Vec<Value>) -> Vec<Value> {
         let Some(arr) = msg.get_mut("content").and_then(|v| v.as_array_mut()) else {
             continue;
         };
-        if !arr
-            .iter()
-            .any(|b| b.get("type").and_then(|v| v.as_str()) == Some("tool_use"))
-        {
+        if !arr.iter().any(|b| {
+            matches!(
+                b.get("type").and_then(|v| v.as_str()),
+                Some("tool_use" | "server_tool_use")
+            )
+        }) {
             continue;
         }
         let mut thinking: Vec<Value> = Vec::new();
@@ -663,7 +683,7 @@ fn normalize_anthropic_messages(messages: Vec<Value>) -> Vec<Value> {
         for b in arr.drain(..) {
             match b.get("type").and_then(|v| v.as_str()).unwrap_or("") {
                 "thinking" => thinking.push(b),
-                "tool_use" => tool_uses.push(b),
+                "tool_use" | "server_tool_use" => tool_uses.push(b),
                 _ => others.push(b),
             }
         }

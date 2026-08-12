@@ -1106,8 +1106,17 @@ pub(crate) fn log_decode_error(
         .and_then(|b| serde_json::to_string(b).ok());
     let request_headers_str = serde_json::to_string(&envelope.headers).ok();
     let ingress_str = ingress.to_string();
+    // The decoder never ran, so `request.stream.enabled` is unavailable; sniff
+    // the raw body so the log's `Stream` line reflects what the client asked.
+    let is_stream = envelope
+        .body
+        .as_ref()
+        .and_then(|b| b.get("stream"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
     LogBuilder::from_dispatch(gw, &ingress_str, "", None, Instant::now())
         .status(400)
+        .stream_flag(is_stream)
         .with_req_extras(&RequestExtras {
             method: envelope.method.clone(),
             path: envelope.path.clone(),

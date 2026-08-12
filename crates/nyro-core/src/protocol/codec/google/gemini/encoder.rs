@@ -339,6 +339,9 @@ fn encode_content_block_for_gemini(b: &ContentBlock) -> Value {
         ContentBlock::ToolUse { name, input, .. } => {
             serde_json::json!({"functionCall": {"name": name, "args": input}})
         }
+        ContentBlock::ServerToolUse { name, input, .. } => {
+            serde_json::json!({"functionCall": {"name": name, "args": input}})
+        }
         ContentBlock::ToolResult {
             tool_use_id,
             content,
