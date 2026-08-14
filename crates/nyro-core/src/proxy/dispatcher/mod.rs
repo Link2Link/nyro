@@ -21,6 +21,7 @@
 
 mod accumulator;
 mod auth;
+mod compat;
 mod non_stream;
 mod stream;
 mod util;
@@ -35,6 +36,7 @@ use std::time::Instant;
 
 use axum::http::HeaderMap;
 use axum::response::Response;
+use bytes::Bytes;
 use serde_json::Value;
 
 use crate::Gateway;
@@ -181,6 +183,14 @@ async fn dispatch_pipeline_inner(
         .body
         .as_ref()
         .and_then(|b| serde_json::to_string(b).ok());
+    let raw_body = envelope.raw_body.clone().or_else(|| {
+        envelope
+            .body
+            .as_ref()
+            .and_then(|body| serde_json::to_vec(body).ok())
+            .map(Bytes::from)
+    });
+    let baseline_request = request.clone();
     let request_headers_str =
         crate::proxy::observability::header_map_to_redacted_json(&envelope.headers);
     // Built early so it can be used by both pre-loop log entries and the per-target handlers.
@@ -451,9 +461,54 @@ async fn dispatch_pipeline_inner(
             }
         }
 
+        let compat_selection = if compat::supports_compat_request(
+            ingress,
+            egress,
+            &provider,
+            &egress_base_url,
+            &actual_model,
+        ) {
+            let Some(raw_body) = raw_body.as_deref() else {
+                last_response = Some(error_response(500, "compat request is missing raw body"));
+                continue;
+            };
+            match compat::select_compat_request(
+                ingress,
+                egress,
+                &provider,
+                &egress_base_url,
+                &actual_model,
+                is_stream,
+                &headers,
+                raw_body,
+                &baseline_request,
+                &request_for_target,
+            ) {
+                Ok(selection) => selection,
+                Err(error) => {
+                    last_response = Some(error_response(
+                        500,
+                        &format!("compat request preparation failed: {error}"),
+                    ));
+                    continue;
+                }
+            }
+        } else {
+            None
+        };
+        let compat_candidate = compat_selection.is_some();
+        let transport_model = compat_selection
+            .as_ref()
+            .and_then(|selection| selection.profile.model.as_deref())
+            .unwrap_or(&actual_model);
         let mut upstream_request = request_for_target.clone();
-        let tool_route_plan = ToolRoutePlan::for_request(&upstream_request, egress);
-        tool_route_plan.prepare_upstream_request(&mut upstream_request);
+        let tool_route_plan = if compat_candidate {
+            ToolRoutePlan::default()
+        } else {
+            let plan = ToolRoutePlan::for_request(&upstream_request, egress);
+            plan.prepare_upstream_request(&mut upstream_request);
+            plan
+        };
 
         let credential = provider_runtime.access_token.clone();
         // Vendor-level provider context for codec ops. Named distinctly so it
@@ -465,18 +520,29 @@ async fn dispatch_pipeline_inner(
             egress_base_url: &egress_base_url,
             api_key: &credential,
             auth_scheme: &plan.auth_scheme,
-            actual_model: &actual_model,
+            actual_model: transport_model,
             credential: None,
             gw: &gw,
             disable_default_auth: provider_runtime.binding.disable_default_auth,
         };
 
         // Build outbound request — PassThrough (Native + no mutations) or full 7-step pipeline.
-        let passthrough_req = plan.mode == ProtocolMode::Native
+        let passthrough_req = !compat_candidate
+            && plan.mode == ProtocolMode::Native
             && !adapter.declared_request_mutations()
             && !tool_route_plan.is_active();
-        let passthrough_resp =
-            plan.mode == ProtocolMode::Native && !adapter.declared_response_mutations();
+        let passthrough_resp = !compat_candidate
+            && plan.mode == ProtocolMode::Native
+            && !adapter.declared_response_mutations();
+        let vendor_wire_before = if compat_candidate {
+            let encoder = egress.handler().make_request_encoder();
+            encoder
+                .encode_request(&upstream_request)
+                .ok()
+                .map(|encoded| encoded.0)
+        } else {
+            None
+        };
         let mut outbound = if passthrough_req {
             let raw = envelope.body.clone().unwrap_or_default();
             match crate::provider::common::pipeline::passthrough_run(
@@ -529,6 +595,56 @@ async fn dispatch_pipeline_inner(
             }
         }
 
+        let prepared_compat = if let Some(selection) = compat_selection.as_ref() {
+            let (Some(raw_body), Some(vendor_wire_before)) =
+                (raw_body.clone(), vendor_wire_before.as_ref())
+            else {
+                last_response = Some(error_response(
+                    500,
+                    "compat request is missing its raw or pre-vendor wire body",
+                ));
+                continue;
+            };
+            match compat::prepare_compat_request(
+                gw.compat_engine.as_ref(),
+                selection,
+                raw_body,
+                vendor_wire_before,
+                &outbound.body,
+            )
+            .await
+            {
+                Ok(prepared) => {
+                    if let Err(error) = compat::normalize_compat_request_headers(
+                        &mut outbound.headers,
+                        selection,
+                        &req_extras.path,
+                    ) {
+                        last_response = Some(error_response(
+                            500,
+                            &format!("compat request header preparation failed: {error}"),
+                        ));
+                        continue;
+                    }
+                    Some(prepared)
+                }
+                Err(error) => {
+                    // Invalid client history fails on every provider the same
+                    // way; cc-switch classifies these NonRetryable and so do
+                    // we — return to the client instead of replaying the
+                    // broken request at each target.
+                    let message = format!("compat request preparation failed: {error}");
+                    if error.is_invalid_request() {
+                        return error_response(400, &message);
+                    }
+                    last_response = Some(error_response(500, &message));
+                    continue;
+                }
+            }
+        } else {
+            None
+        };
+
         let client = match gw.http_client_for_provider(provider.use_proxy).await {
             Ok(http_client) => ProxyClient::new(http_client),
             Err(e) => {
@@ -565,62 +681,83 @@ async fn dispatch_pipeline_inner(
         // `OnLog` runs once at the pipeline boundary (see `dispatch_pipeline`).
         // The handlers run the `OnResponse` phase: non-stream paths see a full
         // `AiResponse`, the streaming path is invoked per `AiStreamDelta`.
-        let response = if is_stream {
-            handle_stream(
+        let (response, compat_retryable, health_managed) = if let Some(prepared) = prepared_compat {
+            let attempt = compat::handle_compat(
                 client,
                 &outbound.url,
                 outbound.headers,
-                outbound.body,
+                prepared,
                 &call_ctx,
                 &req_extras,
-                passthrough_resp,
-                tool_route_plan,
-                ctx,
-                &request_for_target,
-            )
-            .await
-        } else if upstream_forces_stream {
-            handle_non_stream_via_upstream_stream(
-                client,
-                &outbound.url,
-                outbound.headers,
-                outbound.body,
-                &call_ctx,
-                tool_route_plan,
                 ctx,
                 &mut request_for_target,
                 host,
             )
-            .await
+            .await;
+            (attempt.response, attempt.retryable, attempt.health_managed)
         } else {
-            handle_non_stream(
-                client,
-                &outbound.url,
-                outbound.headers,
-                outbound.body,
-                &call_ctx,
-                &req_extras,
-                adapter.as_ref(),
-                &provider_ctx,
-                passthrough_resp,
-                &tool_route_plan,
-                ctx,
-                &mut request_for_target,
-                host,
-            )
-            .await
+            let response = if is_stream {
+                handle_stream(
+                    client,
+                    &outbound.url,
+                    outbound.headers,
+                    outbound.body,
+                    &call_ctx,
+                    &req_extras,
+                    passthrough_resp,
+                    tool_route_plan,
+                    ctx,
+                    &request_for_target,
+                )
+                .await
+            } else if upstream_forces_stream {
+                handle_non_stream_via_upstream_stream(
+                    client,
+                    &outbound.url,
+                    outbound.headers,
+                    outbound.body,
+                    &call_ctx,
+                    tool_route_plan,
+                    ctx,
+                    &mut request_for_target,
+                    host,
+                )
+                .await
+            } else {
+                handle_non_stream(
+                    client,
+                    &outbound.url,
+                    outbound.headers,
+                    outbound.body,
+                    &call_ctx,
+                    &req_extras,
+                    adapter.as_ref(),
+                    &provider_ctx,
+                    passthrough_resp,
+                    &tool_route_plan,
+                    ctx,
+                    &mut request_for_target,
+                    host,
+                )
+                .await
+            };
+            (response, false, false)
         };
 
         let status = response.status().as_u16();
         if status < 400 {
-            gw.health_registry.record_success(&target_key);
+            if !health_managed {
+                gw.health_registry.record_success(&target_key);
+            }
             let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
             TargetSelector::record_selected(&route.balance, &target_key);
             TargetSelector::record_latency(&route.balance, &target_key, elapsed_ms);
             return response;
         }
-        gw.health_registry.record_failure(&target_key);
-        if is_retryable(status) {
+        if !health_managed {
+            gw.health_registry.record_failure(&target_key);
+        }
+        if compat_retryable || is_retryable(status) {
             last_response = Some(response);
             continue;
         }

@@ -56,6 +56,7 @@ pub struct Gateway {
     pub model_cache: Arc<tokio::sync::RwLock<router::ModelCache>>,
     pub health_registry: Arc<HealthRegistry>,
     pub ollama_capability_cache: Arc<tokio::sync::RwLock<HashMap<String, CapabilityCacheEntry>>>,
+    pub(crate) compat_engine: Arc<nyro_ccswitch_compat::CompatEngine>,
     pub log_tx: mpsc::Sender<LogEntry>,
     pub(crate) auth_sessions: Arc<tokio::sync::RwLock<HashMap<String, AuthSession>>>,
     #[allow(dead_code)]
@@ -190,6 +191,7 @@ impl Gateway {
             model_cache,
             health_registry,
             ollama_capability_cache,
+            compat_engine: Arc::new(nyro_ccswitch_compat::CompatEngine::default()),
             log_tx,
             auth_sessions: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             sqlite_pool,
