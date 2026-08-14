@@ -652,6 +652,169 @@ mod tests {
         assert_eq!(stats.upstream_status, Some(200));
         assert_eq!(stats.stream_chunks, 0);
     }
+
+    /// Regression (live MiniMax finding): a passthrough body carries no
+    /// `stream` flag, but the force-upstream-stream handler must request SSE
+    /// explicitly; and when the upstream ignores the flag and answers with a
+    /// plain JSON document, the handler must fall back to the full-response
+    /// decoder instead of returning an empty success.
+    #[tokio::test]
+    async fn forced_upstream_stream_sets_stream_flag_and_parses_json_fallback() {
+        use crate::protocol::ids::OPENAI_RESPONSES_V1;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let addr = listener.local_addr().expect("test addr");
+        let (request_tx, request_rx) = tokio::sync::oneshot::channel::<Vec<u8>>();
+        let body = serde_json::json!({
+            "id": "resp_plainjson",
+            "object": "response",
+            "created_at": 1786730493,
+            "model": "MiniMax-M2.7-highspeed",
+            "status": "completed",
+            "output": [
+                {"id": "rs", "type": "reasoning", "status": "completed", "summary": [],
+                 "content": [{"type": "reasoning_text", "text": "thinking"}]},
+                {"id": "msg", "type": "message", "status": "completed", "role": "assistant",
+                 "content": [{"type": "output_text", "text": "PLAIN-JSON-OK", "annotations": []}]}
+            ],
+            "usage": {"input_tokens": 47, "output_tokens": 115, "total_tokens": 162}
+        })
+        .to_string();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept request");
+            let mut buf = Vec::new();
+            let mut chunk = [0_u8; 4096];
+            loop {
+                let n = socket.read(&mut chunk).await.expect("read request");
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&chunk[..n]);
+                if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let content_length = std::str::from_utf8(&buf[..pos])
+                        .ok()
+                        .and_then(|headers| {
+                            headers
+                                .lines()
+                                .find_map(|l| l.strip_prefix("content-length:"))
+                        })
+                        .and_then(|v| v.trim().parse::<usize>().ok())
+                        .unwrap_or_default();
+                    if buf.len() >= pos + 4 + content_length {
+                        break;
+                    }
+                }
+            }
+            let _ = request_tx.send(buf);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            socket
+                .write_all(response.as_bytes())
+                .await
+                .expect("write response");
+        });
+        let url = format!("http://{addr}/v1/responses");
+
+        let provider = Provider {
+            id: "provider-resp".into(),
+            name: "Responses-compatible".into(),
+            vendor: Some("custom".into()),
+            protocol: "openai-responses".into(),
+            base_url: url.clone(),
+            protocol_mode: "fixed".into(),
+            protocol_endpoints: Vec::new(),
+            preset_key: None,
+            channel: None,
+            models_source: None,
+            static_models: None,
+            api_key: "secret".into(),
+            auth_mode: "apikey".into(),
+            use_proxy: false,
+            last_test_success: None,
+            last_test_at: None,
+            is_enabled: true,
+            created_at: String::new(),
+            updated_at: String::new(),
+        };
+        let config = GatewayConfig {
+            data_dir: std::env::temp_dir()
+                .join(format!("nyro-forced-stream-test-{}", uuid::Uuid::new_v4())),
+            ..Default::default()
+        };
+        let (gw, _log_rx) = Gateway::new(config).await.expect("gateway init");
+        let call_ctx = CallCtx {
+            gw: gw.clone(),
+            provider: &provider,
+            model_id: "route-resp",
+            model_name: "Responses route",
+            egress: OPENAI_RESPONSES_V1,
+            ingress: OPENAI_RESPONSES_V1,
+            ingress_str: "openai-responses/responses/v1",
+            egress_str: "openai-responses/responses/v1",
+            request_model: "mm-resp",
+            actual_model: "MiniMax-M2.7-highspeed",
+            api_key_id: None,
+            api_key_name: None,
+            is_stream: false,
+            enable_payload: None,
+            reasoning_effort: None,
+            start: std::time::Instant::now(),
+            req_ext: crate::proxy::context::ContextBag::new(),
+        };
+        let mut req_ctx =
+            RequestContext::new(OPENAI_RESPONSES_V1, std::time::Duration::from_secs(30));
+        let mut req_ir = AiRequest::new("MiniMax-M2.7-highspeed", Vec::new());
+        let host = HostContext::new(&gw);
+        let tool_route_plan = ToolRoutePlan::default();
+        let client = ProxyClient::new(reqwest::Client::new());
+
+        let response = handle_non_stream_via_upstream_stream(
+            client,
+            &url,
+            ReqwestHeaderMap::new(),
+            serde_json::json!({"model": "mm-resp", "input": "hi"}),
+            &call_ctx,
+            tool_route_plan,
+            &mut req_ctx,
+            &mut req_ir,
+            &host,
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let value: Value = serde_json::from_slice(&body).expect("json body");
+        assert_eq!(value["id"], "resp_plainjson");
+        let text: String = value["output"]
+            .as_array()
+            .expect("output items")
+            .iter()
+            .filter(|item| item["type"] == "message")
+            .flat_map(|item| item["content"].as_array().cloned().unwrap_or_default())
+            .filter(|part| part["type"] == "output_text")
+            .map(|part| part["text"].as_str().unwrap_or_default().to_string())
+            .collect();
+        assert_eq!(text, "PLAIN-JSON-OK");
+        assert_eq!(value["usage"]["input_tokens"], 47);
+
+        let request = request_rx.await.expect("captured upstream request");
+        let request_body = String::from_utf8_lossy(&request);
+        let sent: Value = serde_json::from_str(
+            &request_body[request_body
+                .find("\r\n\r\n")
+                .map(|p| p + 4)
+                .unwrap_or_default()..],
+        )
+        .expect("upstream request json");
+        assert_eq!(sent["stream"], true, "force-stream must set stream:true");
+    }
 }
 
 // ── Force-stream non-stream handler ──────────────────────────────────────────
@@ -675,6 +838,16 @@ pub(super) async fn handle_non_stream_via_upstream_stream(
     let ingress = call_ctx.ingress;
     let actual_model = call_ctx.actual_model;
     let log = LogBuilder::from_ctx(call_ctx).upstream_url(url);
+
+    let mut body = body;
+    // `force_upstream_stream` semantics: the upstream call is always made in
+    // streaming mode regardless of the client's `stream` flag. A passthrough
+    // body carries the client's (absent) flag, so set it explicitly — an
+    // upstream that never receives `stream: true` answers with plain JSON,
+    // which the SSE parser below cannot read.
+    if let Some(obj) = body.as_object_mut() {
+        obj.insert("stream".to_string(), Value::Bool(true));
+    }
 
     let upstream_start = std::time::Instant::now();
     let call_result = match client.call_stream(url, headers.clone(), body.clone()).await {
@@ -723,6 +896,7 @@ pub(super) async fn handle_non_stream_via_upstream_stream(
     let mut stream_parser = egress.handler().make_stream_response_decoder();
     let mut byte_stream = resp.bytes_stream();
     let mut accumulator = StreamResponseAccumulator::default();
+    let mut raw_text = String::new();
 
     while let Some(chunk) = byte_stream.next().await {
         let bytes = match chunk {
@@ -741,6 +915,7 @@ pub(super) async fn handle_non_stream_via_upstream_stream(
             }
         };
         let text = String::from_utf8_lossy(&bytes);
+        raw_text.push_str(&text);
         if let Ok(ai_deltas) = stream_parser.parse_chunk(&text) {
             let ai_deltas = tool_route_plan.restore_stream_deltas(ai_deltas);
             accumulator.apply_all(&ai_deltas);
@@ -754,6 +929,22 @@ pub(super) async fn handle_non_stream_via_upstream_stream(
     accumulator.apply_all(&tool_route_plan.finish_stream());
 
     let mut ai_resp = accumulator.into_ai_response();
+    // Some Responses-compatible gateways ignore `stream: true` and answer with
+    // a complete JSON document. The SSE parser yields nothing for that shape;
+    // fall back to the full-response decoder instead of returning an empty
+    // success (mirrors cc-switch's #2234 unlabelled-JSON fallback).
+    let parsed_nothing =
+        ai_resp.id.is_empty() && ai_resp.content.is_empty() && ai_resp.items.is_none();
+    if parsed_nothing
+        && raw_text.trim_start().starts_with('{')
+        && let Ok(full) = serde_json::from_str::<Value>(&raw_text)
+        && let Ok(parsed) = egress
+            .handler()
+            .make_response_decoder()
+            .parse_response(full)
+    {
+        ai_resp = parsed;
+    }
     if ai_resp.id.is_empty() {
         ai_resp.id = format!("chatcmpl-{}", uuid::Uuid::new_v4().simple());
     }
