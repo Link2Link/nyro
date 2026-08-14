@@ -34,10 +34,16 @@ const METADATA: VendorMetadata = VendorMetadata {
             zh: "默认",
             en: "Default",
         },
-        base_urls: &[ProtocolBaseUrl {
-            protocol: "openai-compatible",
-            base_url: "https://api.x.ai/v1",
-        }],
+        base_urls: &[
+            ProtocolBaseUrl {
+                protocol: "openai-compatible",
+                base_url: "https://api.x.ai/v1",
+            },
+            ProtocolBaseUrl {
+                protocol: "openai-responses",
+                base_url: "https://api.x.ai/v1",
+            },
+        ],
         api_key: None,
         models_source: Some("https://api.x.ai/v1/models"),
         capabilities_source: CapabilitiesSource::ModelsDev("xai"),
@@ -68,8 +74,8 @@ impl Vendor for XaiVendor {
         "xai"
     }
     fn supported_protocols(&self) -> &'static [ProtocolId] {
-        use crate::protocol::ids::OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1;
-        &[OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1]
+        use crate::protocol::ids::{OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1, OPENAI_RESPONSES_V1};
+        &[OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1, OPENAI_RESPONSES_V1]
     }
     fn declared_request_mutations(&self) -> bool {
         false

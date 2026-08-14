@@ -205,7 +205,8 @@
           "en": "Default"
         },
         "baseUrls": {
-          "openai-compatible": "https://api.x.ai/v1"
+          "openai-compatible": "https://api.x.ai/v1",
+          "openai-responses": "https://api.x.ai/v1"
         },
         "modelsSource": "https://api.x.ai/v1/models",
         "authMode": "apikey"
