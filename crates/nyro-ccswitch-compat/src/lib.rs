@@ -2,7 +2,7 @@
 //!
 //! The mechanically ported conversion core is derived from cc-switch at
 //! commit `eb69e4922ee187a261fd29c216a738e838f85bc4` under the MIT License.
-//! See `THIRD_PARTY_LICENSES/cc-switch-MIT.txt`.
+//! See `../../THIRD_PARTY_LICENSES/cc-switch-MIT.txt` at the repository root.
 //!
 //! This crate deliberately exposes bytes and small context/profile types rather
 //! than `serde_json::Value`, keeping its ordered JSON implementation private at
