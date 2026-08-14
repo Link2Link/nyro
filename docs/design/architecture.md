@@ -196,6 +196,19 @@ Gateway::shutdown()       → 优雅关闭
 
 ## 3. 协议转换架构
 
+### 3.0 cc-switch 兼容层（raw-wire parity）
+
+跨协议转换的线级行为由 `crates/nyro-ccswitch-compat` 提供：该 crate 从 cc-switch（commit `eb69e492`，MIT）机械移植了全部转换核心（`transform_*`、`streaming_*`、SSE 工具、内容解码等，含内嵌测试），并封装为字节进字节出的 `CompatEngine`。`nyro-core` 的 dispatcher（`proxy/dispatcher/compat.rs`）在以下方向选用该引擎，绕过 IR 往返以获得与 cc-switch 完全一致的线级行为：
+
+| ingress → egress | 说明 |
+|---|---|
+| Anthropic Messages → OpenAI Chat / Responses / Gemini | Claude Code 客户端接 OpenAI/Gemini 系上游 |
+| OpenAI Responses → OpenAI Chat / Anthropic Messages | Codex 客户端接 Chat 或 Claude 系上游 |
+| OpenAI Responses → Responses（xai） | xAI 原生 Responses 的 namespace 扁平化/还原与 xAI sanitize |
+| Anthropic Messages → Anthropic Messages（DeepSeek/MiMo 系） | 同协议直通 + cc-switch 的 thinking 历史回放归一化与 DeepSeek 官方 effort 剥离 |
+
+对齐程度由 `scripts/check_cc_switch_parity_inventory.py` 审计 `tests/parity_inventory.toml`（1168 个源测试：518 直接移植 + 142 断言级映射 + 508 经批准排除），要求 `--require-complete` 通过。完整的移植分析、模块映射与维护指南见 [cc-switch-porting-report.md](./cc-switch-porting-report.md)。
+
 ### 3.1 核心设计原则
 
 - **统一错误 taxonomy**：`GatewayError` 覆盖 15 种错误类型，每个错误有稳定 code、HTTP status、user message、internal detail 和 retryable 标志。

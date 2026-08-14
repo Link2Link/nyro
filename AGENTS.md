@@ -21,6 +21,7 @@ Nyro is a Rust workspace for a local AI protocol gateway with a Tauri desktop ap
 | Directory | Purpose |
 |-----------|---------|
 | `crates/nyro-core/` | Core Rust library: gateway, proxy, protocol conversion, provider adapters, storage, admin service. |
+| `crates/nyro-ccswitch-compat/` | Raw-wire cc-switch protocol compatibility layer: mechanically ported conversion core (tests included); parity audited by `scripts/check_cc_switch_parity_inventory.py` against `tests/parity_inventory.toml`. |
 | `crates/nyro-tools/` | Rust CLI/tooling crate. |
 | `src-server/` | Standalone server binary exposing proxy/admin HTTP surfaces. |
 | `src-tauri/` | Tauri desktop application shell and IPC integration. |
