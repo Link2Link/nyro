@@ -10,6 +10,32 @@ nyro-server
 
 默认使用 SQLite，数据目录 `~/.nyro`，代理端口 `19530`，管理端口 `19531`。WebUI 已内嵌在二进制中，无需额外部署，启动后访问 `http://localhost:19531` 即可。
 
+### 从源码构建并手动启动
+
+```bash
+# 1. 进入项目目录
+cd <nyro 仓库路径>
+
+# 2. 构建(debug 或 release 二选一)
+cargo build -p nyro-server               # debug,产物在 target/debug/nyro-server
+# cargo build -p nyro-server --release   # release,产物在 target/release/nyro-server
+
+# 3. 手动启动(默认 mode=all:代理 19530 + 管理 19531)
+./target/debug/nyro-server \
+  --data-dir ~/.nyro \
+  --admin-token <你的管理token> \
+  --log-level info
+```
+
+**验证启动：**
+
+```bash
+curl http://127.0.0.1:19530/health          # 代理面健康检查
+curl http://127.0.0.1:19531/healthz         # 管理面健康检查
+```
+
+启动后打开 `http://127.0.0.1:19531`(WebUI)创建 provider 与模型即可开始使用；API 密钥只填写在 WebUI/管理 API 中，不会写入代码或版本历史。
+
 > 如需无数据库的纯 YAML 配置模式，参见 [Standalone 模式](../standalone/README.md)。
 
 ---
