@@ -29,15 +29,21 @@ fn openai_parser_basic_content_deltas() {
          \ndata: [DONE]",
     );
 
-    assert_delta_eq(&deltas[0], &StreamDelta::MessageStart {
-        id: "chatcmpl-1".to_string(),
-        model: "gpt-4".to_string(),
-    });
+    assert_delta_eq(
+        &deltas[0],
+        &StreamDelta::MessageStart {
+            id: "chatcmpl-1".to_string(),
+            model: "gpt-4".to_string(),
+        },
+    );
     let texts = delta_text(&deltas);
     assert_eq!(texts, "Hello world");
-    assert_last_delta(&deltas, &StreamDelta::Done {
-        stop_reason: "stop".to_string(),
-    });
+    assert_last_delta(
+        &deltas,
+        &StreamDelta::Done {
+            stop_reason: "stop".to_string(),
+        },
+    );
 }
 
 #[test]
@@ -58,7 +64,7 @@ fn openai_parser_tool_call_deltas() {
             id: "chatcmpl-2".to_string(),
             model: "gpt-4".to_string(),
         },
-        "{trace}"
+        "{trace}",
     );
     assert_delta_eq_msg(
         &deltas[1],
@@ -69,7 +75,7 @@ fn openai_parser_tool_call_deltas() {
             kind: ToolCallKind::Function,
             namespace: None,
         },
-        "{trace}"
+        "{trace}",
     );
     // Arguments accumulate across fragments.
     let joined: String = deltas
@@ -84,7 +90,7 @@ fn openai_parser_tool_call_deltas() {
         &deltas,
         &StreamDelta::Done {
             stop_reason: "tool_calls".to_string(),
-        }
+        },
     );
 }
 
@@ -96,9 +102,12 @@ fn openai_parser_done_marker() {
          \ndata: [DONE]",
     );
 
-    assert_last_delta(&deltas, &StreamDelta::Done {
-        stop_reason: "stop".to_string(),
-    });
+    assert_last_delta(
+        &deltas,
+        &StreamDelta::Done {
+            stop_reason: "stop".to_string(),
+        },
+    );
 }
 
 #[test]
@@ -110,9 +119,12 @@ fn openai_parser_without_done_marker() {
          \ndata: {\"id\":\"chatcmpl-1\",\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}",
     );
 
-    assert_last_delta(&deltas, &StreamDelta::Done {
-        stop_reason: "stop".to_string(),
-    });
+    assert_last_delta(
+        &deltas,
+        &StreamDelta::Done {
+            stop_reason: "stop".to_string(),
+        },
+    );
 }
 
 #[test]
@@ -129,9 +141,12 @@ fn openai_parser_usage_chunk_no_double_end() {
         .filter(|d| matches!(d, StreamDelta::Done { .. }))
         .collect();
     assert_eq!(ends.len(), 1, "exactly one Done: {}", delta_trace(&deltas));
-    assert_delta_eq(ends[0], &StreamDelta::Done {
-        stop_reason: "stop".to_string(),
-    });
+    assert_delta_eq(
+        ends[0],
+        &StreamDelta::Done {
+            stop_reason: "stop".to_string(),
+        },
+    );
     assert!(
         deltas.iter().any(|d| matches!(d, StreamDelta::Usage(u) if u.prompt_tokens == 10 && u.completion_tokens == 5)),
         "usage captured: {}",
@@ -154,11 +169,11 @@ fn openai_parser_preserves_finish_reason_when_usage_arrives_separately() {
         &deltas,
         &StreamDelta::Done {
             stop_reason: "stop".to_string(),
-        }
+        },
     );
-    assert!(
-        deltas.iter().any(|d| matches!(d, StreamDelta::Usage(u) if u.prompt_tokens == 12 && u.completion_tokens == 3))
-    );
+    assert!(deltas.iter().any(
+        |d| matches!(d, StreamDelta::Usage(u) if u.prompt_tokens == 12 && u.completion_tokens == 3)
+    ));
 }
 
 #[test]
@@ -177,11 +192,11 @@ fn openai_parser_preserves_tool_calls_finish_reason_with_usage() {
         &deltas,
         &StreamDelta::Done {
             stop_reason: "tool_calls".to_string(),
-        }
+        },
     );
-    assert!(
-        deltas.iter().any(|d| matches!(d, StreamDelta::Usage(u) if u.prompt_tokens == 20 && u.completion_tokens == 8))
-    );
+    assert!(deltas.iter().any(
+        |d| matches!(d, StreamDelta::Usage(u) if u.prompt_tokens == 20 && u.completion_tokens == 8)
+    ));
 }
 
 #[test]
@@ -193,9 +208,12 @@ fn openai_parser_done_fallback_uses_last_finish_reason() {
          \ndata: [DONE]",
     );
 
-    assert_last_delta(&deltas, &StreamDelta::Done {
-        stop_reason: "stop".to_string(),
-    });
+    assert_last_delta(
+        &deltas,
+        &StreamDelta::Done {
+            stop_reason: "stop".to_string(),
+        },
+    );
 }
 
 // ── Anthropic parser ─────────────────────────────────────────────────────────
@@ -218,10 +236,13 @@ fn anthropic_parser_message_start() {
         "usage surfaces from message_start: {}",
         delta_trace(&deltas)
     );
-    assert_delta_eq(&deltas[1], &StreamDelta::MessageStart {
-        id: "msg_01".to_string(),
-        model: "claude-3-5-sonnet".to_string(),
-    });
+    assert_delta_eq(
+        &deltas[1],
+        &StreamDelta::MessageStart {
+            id: "msg_01".to_string(),
+            model: "claude-3-5-sonnet".to_string(),
+        },
+    );
 }
 
 #[test]
@@ -250,7 +271,7 @@ fn anthropic_parser_text_deltas() {
         &StreamDelta::Done {
             // IR normalises Anthropic `end_turn` to the OpenAI vocabulary.
             stop_reason: "stop".to_string(),
-        }
+        },
     );
     assert!(
         deltas
@@ -281,7 +302,7 @@ fn anthropic_parser_usage_from_message_delta() {
         &deltas,
         &StreamDelta::Done {
             stop_reason: "stop".to_string(),
-        }
+        },
     );
     assert!(
         deltas.iter().any(|d| matches!(d, StreamDelta::Usage(u) if u.prompt_tokens == 25 && u.completion_tokens == 13)),
@@ -331,13 +352,15 @@ fn google_parser_content_deltas() {
 
     // Nyro synthesises `gen-<uuid>` ids and reads the model from `modelVersion`
     // (absent in these chunks), so the start delta has an empty model.
-    assert!(matches!(&deltas[0], StreamDelta::MessageStart { id, model } if id.starts_with("gen-") && model.is_empty()));
+    assert!(
+        matches!(&deltas[0], StreamDelta::MessageStart { id, model } if id.starts_with("gen-") && model.is_empty())
+    );
     assert_eq!(delta_text(&deltas), "Hi there");
     assert_last_delta(
         &deltas,
         &StreamDelta::Done {
             stop_reason: "stop".to_string(),
-        }
+        },
     );
     assert!(
         deltas.iter().any(|d| matches!(d, StreamDelta::Usage(u) if u.prompt_tokens == 5 && u.completion_tokens == 2)),
@@ -358,7 +381,7 @@ fn google_parser_finish_reason_without_usage() {
         &deltas,
         &StreamDelta::Done {
             stop_reason: "stop".to_string(),
-        }
+        },
     );
 }
 
@@ -379,7 +402,9 @@ fn google_parser_no_done_without_finish_reason() {
         delta_trace(&deltas)
     );
     assert!(
-        deltas.iter().any(|d| matches!(d, StreamDelta::MessageStart { .. })),
+        deltas
+            .iter()
+            .any(|d| matches!(d, StreamDelta::MessageStart { .. })),
         "start delta present: {}",
         delta_trace(&deltas)
     );
@@ -399,12 +424,15 @@ fn google_parser_no_duplicate_message_end() {
         .filter(|d| matches!(d, StreamDelta::Done { .. }))
         .collect();
     assert_eq!(ends.len(), 1, "exactly one Done: {}", delta_trace(&deltas));
-    assert_delta_eq(ends[0], &StreamDelta::Done {
-        stop_reason: "stop".to_string(),
-    });
-    assert!(
-        deltas.iter().any(|d| matches!(d, StreamDelta::Usage(u) if u.prompt_tokens == 10 && u.completion_tokens == 3))
+    assert_delta_eq(
+        ends[0],
+        &StreamDelta::Done {
+            stop_reason: "stop".to_string(),
+        },
     );
+    assert!(deltas.iter().any(
+        |d| matches!(d, StreamDelta::Usage(u) if u.prompt_tokens == 10 && u.completion_tokens == 3)
+    ));
 }
 
 // ── OpenAI Responses parser ──────────────────────────────────────────────────
@@ -423,20 +451,23 @@ fn responses_parser_created_and_text_deltas() {
          data: {\"response\":{\"id\":\"resp_01\",\"status\":\"completed\",\"usage\":{\"input_tokens\":10,\"output_tokens\":5}}}",
     );
 
-    assert_delta_eq(&deltas[0], &StreamDelta::MessageStart {
-        id: "resp_01".to_string(),
-        model: "gpt-4o".to_string(),
-    });
+    assert_delta_eq(
+        &deltas[0],
+        &StreamDelta::MessageStart {
+            id: "resp_01".to_string(),
+            model: "gpt-4o".to_string(),
+        },
+    );
     assert_eq!(delta_text(&deltas), "Hello world");
     assert_last_delta(
         &deltas,
         &StreamDelta::Done {
             stop_reason: "stop".to_string(),
-        }
+        },
     );
-    assert!(
-        deltas.iter().any(|d| matches!(d, StreamDelta::Usage(u) if u.prompt_tokens == 10 && u.completion_tokens == 5))
-    );
+    assert!(deltas.iter().any(
+        |d| matches!(d, StreamDelta::Usage(u) if u.prompt_tokens == 10 && u.completion_tokens == 5)
+    ));
 }
 
 #[test]
@@ -458,16 +489,19 @@ fn responses_parser_function_call_events() {
     );
 
     let trace = delta_trace(&deltas);
-    assert!(matches!(
-        &deltas[1],
-        StreamDelta::ToolCallStart {
-            index: 0,
-            id,
-            name,
-            kind: ToolCallKind::Function,
-            namespace: None,
-        } if id == "call_xyz" && name == "get_weather"
-    ), "{trace}");
+    assert!(
+        matches!(
+            &deltas[1],
+            StreamDelta::ToolCallStart {
+                index: 0,
+                id,
+                name,
+                kind: ToolCallKind::Function,
+                namespace: None,
+            } if id == "call_xyz" && name == "get_weather"
+        ),
+        "{trace}"
+    );
     let joined: String = deltas
         .iter()
         .filter_map(|d| match d {
@@ -480,7 +514,9 @@ fn responses_parser_function_call_events() {
     // nyro IR surface for this protocol is ToolCallStart + ToolCallDelta only
     // (llm-bridge's parser completes calls from `output_item.done`).
     assert!(
-        !deltas.iter().any(|d| matches!(d, StreamDelta::ToolCallComplete { .. })),
+        !deltas
+            .iter()
+            .any(|d| matches!(d, StreamDelta::ToolCallComplete { .. })),
         "no ToolCallComplete from the Responses parser: {trace}"
     );
 }
@@ -519,9 +555,7 @@ fn responses_parser_multiple_concurrent_function_calls() {
     let deltas_by_index: Vec<_> = deltas
         .iter()
         .filter_map(|d| match d {
-            StreamDelta::ToolCallDelta { index, arguments } => {
-                Some((*index, arguments.as_str()))
-            }
+            StreamDelta::ToolCallDelta { index, arguments } => Some((*index, arguments.as_str())),
             _ => None,
         })
         .collect();
@@ -533,7 +567,9 @@ fn responses_parser_multiple_concurrent_function_calls() {
     // KNOWN GAP: as with the single-call case, the Responses parser never
     // emits `ToolCallComplete`; completion state is implied by the deltas.
     assert!(
-        !deltas.iter().any(|d| matches!(d, StreamDelta::ToolCallComplete { .. })),
+        !deltas
+            .iter()
+            .any(|d| matches!(d, StreamDelta::ToolCallComplete { .. })),
         "no ToolCallComplete from the Responses parser: {trace}"
     );
 }
@@ -605,7 +641,12 @@ fn anthropic_emitter_format() {
     assert_eq!(start["message"]["model"], "claude-3-5-sonnet");
     let delta = jsons
         .iter()
-        .find(|j| j.get("delta").and_then(|d| d.get("type")).and_then(|t| t.as_str()) == Some("text_delta"))
+        .find(|j| {
+            j.get("delta")
+                .and_then(|d| d.get("type"))
+                .and_then(|t| t.as_str())
+                == Some("text_delta")
+        })
         .expect("text_delta");
     assert_eq!(delta["delta"]["text"], "Hi");
 }
@@ -711,7 +752,9 @@ fn anthropic_emitter_multiple_thinking_deltas_one_block() {
     let thinking_deltas = jsons
         .iter()
         .filter(|j| {
-            j.get("delta").and_then(|d| d.get("type")).and_then(|t| t.as_str())
+            j.get("delta")
+                .and_then(|d| d.get("type"))
+                .and_then(|t| t.as_str())
                 == Some("thinking_delta")
         })
         .count();
@@ -1101,19 +1144,25 @@ fn responses_stream_round_trip_parse_emit_parse() {
          data: {\"response\":{\"id\":\"resp_rt\",\"status\":\"completed\",\"usage\":{\"input_tokens\":8,\"output_tokens\":3}}}";
 
     let deltas = parse_stream(P::OpenAiResponses, raw);
-    assert_delta_eq(&deltas[0], &StreamDelta::MessageStart {
-        id: "resp_rt".to_string(),
-        model: "gpt-4o".to_string(),
-    });
+    assert_delta_eq(
+        &deltas[0],
+        &StreamDelta::MessageStart {
+            id: "resp_rt".to_string(),
+            model: "gpt-4o".to_string(),
+        },
+    );
     assert_eq!(delta_text(&deltas), "Round-trip test");
 
     let re_emitted = sse_string(&format_stream(P::OpenAiResponses, &deltas));
     let reparsed = parse_stream(P::OpenAiResponses, &re_emitted);
     assert_eq!(delta_text(&reparsed), "Round-trip test");
-    assert_delta_eq(&reparsed[0], &StreamDelta::MessageStart {
-        id: "resp_rt".to_string(),
-        model: "gpt-4o".to_string(),
-    });
+    assert_delta_eq(
+        &reparsed[0],
+        &StreamDelta::MessageStart {
+            id: "resp_rt".to_string(),
+            model: "gpt-4o".to_string(),
+        },
+    );
     assert!(
         reparsed.iter().any(|d| matches!(d, StreamDelta::Usage(u) if u.prompt_tokens == 8 && u.completion_tokens == 3)),
         "usage survives: {}",
@@ -1138,12 +1187,15 @@ fn responses_tool_call_stream_round_trip() {
 
     let deltas = parse_stream(P::OpenAiResponses, raw);
     let trace = delta_trace(&deltas);
-    assert!(matches!(
-        &deltas[1],
-        StreamDelta::ToolCallStart {
-            id, name, ..
-        } if id == "call_rt" && name == "get_weather"
-    ), "{trace}");
+    assert!(
+        matches!(
+            &deltas[1],
+            StreamDelta::ToolCallStart {
+                id, name, ..
+            } if id == "call_rt" && name == "get_weather"
+        ),
+        "{trace}"
+    );
     let joined: String = deltas
         .iter()
         .filter_map(|d| match d {
@@ -1155,13 +1207,21 @@ fn responses_tool_call_stream_round_trip() {
     // KNOWN GAP: the Responses parser never emits `ToolCallComplete`
     // (see `responses_parser_function_call_events`).
     assert!(
-        !deltas.iter().any(|d| matches!(d, StreamDelta::ToolCallComplete { .. })),
+        !deltas
+            .iter()
+            .any(|d| matches!(d, StreamDelta::ToolCallComplete { .. })),
         "no ToolCallComplete from the Responses parser: {trace}"
     );
 
     let re_emitted = sse_string(&format_stream(P::OpenAiResponses, &deltas));
-    assert!(re_emitted.contains("event: response.output_item.added"), "{re_emitted}");
-    assert!(re_emitted.contains("\"arguments\":\"{\\\"city\\\":\\\"NYC\\\"}\""), "{re_emitted}");
+    assert!(
+        re_emitted.contains("event: response.output_item.added"),
+        "{re_emitted}"
+    );
+    assert!(
+        re_emitted.contains("\"arguments\":\"{\\\"city\\\":\\\"NYC\\\"}\""),
+        "{re_emitted}"
+    );
 }
 
 // ── fix-verification Google stream cases ─────────────────────────────────────
@@ -1186,7 +1246,7 @@ fn google_parser_usage_carried_forward_when_finish_chunk_has_no_usage() {
         &deltas,
         &StreamDelta::Done {
             stop_reason: "stop".to_string(),
-        }
+        },
     );
 }
 

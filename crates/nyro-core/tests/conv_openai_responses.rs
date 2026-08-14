@@ -31,7 +31,10 @@ fn string_input_becomes_single_user_message() {
 
     assert_eq!(req.model, "gpt-4o");
     assert_roles(&req, &[Role::User]);
-    assert_eq!(req.messages[0].content.to_text(), "What is the capital of France?");
+    assert_eq!(
+        req.messages[0].content.to_text(),
+        "What is the capital of France?"
+    );
 }
 
 #[test]
@@ -99,7 +102,9 @@ fn input_image_decodes_to_image_block() {
         );
     };
     assert!(
-        blocks.iter().any(|b| matches!(b, ContentBlock::Image { .. })),
+        blocks
+            .iter()
+            .any(|b| matches!(b, ContentBlock::Image { .. })),
         "KNOWN GAP: input_image should decode to an image block: {blocks:?}"
     );
 }
@@ -158,7 +163,10 @@ fn flattened_tool_format_to_universal() {
     let tools = req.tools.expect("tools preserved");
     assert_eq!(tools.len(), 1);
     assert_eq!(tools[0].name, "get_weather");
-    assert_eq!(tools[0].description.as_deref(), Some("Get the weather for a city"));
+    assert_eq!(
+        tools[0].description.as_deref(),
+        Some("Get the weather for a city")
+    );
     assert_eq!(tools[0].strict, Some(true));
     assert_eq!(
         tools[0].parameters,
@@ -232,9 +240,10 @@ fn text_format_json_schema_maps_to_response_format() {
         }),
     );
 
-    match req.response_format.expect(
-        "KNOWN GAP: text.format json_schema should map to ResponseFormat::JsonSchema",
-    ) {
+    match req
+        .response_format
+        .expect("KNOWN GAP: text.format json_schema should map to ResponseFormat::JsonSchema")
+    {
         ResponseFormat::JsonSchema {
             name,
             schema,
@@ -304,7 +313,9 @@ fn builtin_tools_become_prefixed_tool_specs() {
     let tools = req.tools.expect("tools preserved");
     assert_eq!(tools.len(), 2);
     assert!(
-        tools.iter().any(|t| t.name == "__builtin__web_search_preview"),
+        tools
+            .iter()
+            .any(|t| t.name == "__builtin__web_search_preview"),
         "builtin tool should be prefixed: {:?}",
         tools.iter().map(|t| &t.name).collect::<Vec<_>>()
     );
@@ -334,10 +345,7 @@ fn round_trip_basic_conversation() {
     assert_eq!(field(&out, "/top_p"), &json!(0.9));
     // System message is lifted to `instructions` on the wire (llm-bridge keeps
     // it in `input`; both round-trip the information).
-    assert_eq!(
-        field(&out, "/instructions"),
-        "You are a helpful assistant."
-    );
+    assert_eq!(field(&out, "/instructions"), "You are a helpful assistant.");
     let input = field(&out, "/input").as_array().expect("input array");
     assert_eq!(input.len(), 1);
     assert_eq!(input[0]["type"], "message");
@@ -520,28 +528,31 @@ fn round_trip_builtin_tools_alongside_function_tools() {
 fn multiple_tool_results_become_function_call_output_items() {
     // fix-verification "should convert multiple tool_results in user message to
     // function_call_output items": llm-bridge emits one item per tool_result.
-    let mut req = request("gpt-4o", vec![Message {
-        role: Role::User,
-        content: MessageContent::Blocks(vec![
-            ContentBlock::ToolResult {
-                tool_use_id: "call_abc".to_string(),
-                content: json!("Weather is sunny"),
-                is_error: None,
-                cache_control: None,
-            },
-            ContentBlock::ToolResult {
-                tool_use_id: "call_def".to_string(),
-                content: json!({"temperature": 72}),
-                is_error: None,
-                cache_control: None,
-            },
-        ]),
-        tool_calls: None,
-        tool_call_id: None,
-        meta: None,
-    }]);
+    let req = request(
+        "gpt-4o",
+        vec![Message {
+            role: Role::User,
+            content: MessageContent::Blocks(vec![
+                ContentBlock::ToolResult {
+                    tool_use_id: "call_abc".to_string(),
+                    content: json!("Weather is sunny"),
+                    is_error: None,
+                    cache_control: None,
+                },
+                ContentBlock::ToolResult {
+                    tool_use_id: "call_def".to_string(),
+                    content: json!({"temperature": 72}),
+                    is_error: None,
+                    cache_control: None,
+                },
+            ]),
+            tool_calls: None,
+            tool_call_id: None,
+            meta: None,
+        }],
+    );
 
-    let out = encode_request(P::OpenAiResponses, &mut req);
+    let out = encode_request(P::OpenAiResponses, &req);
     let input = field(&out, "/input").as_array().expect("input array");
     let outputs: Vec<_> = input
         .iter()

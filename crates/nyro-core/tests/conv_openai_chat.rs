@@ -30,8 +30,14 @@ fn basic_text_messages_to_universal() {
 
     assert_eq!(req.model, "gpt-4o");
     assert_roles(&req, &[Role::User, Role::Assistant]);
-    assert_eq!(req.messages[0].content.to_text(), "What is the capital of France?");
-    assert_eq!(req.messages[1].content.to_text(), "The capital of France is Paris.");
+    assert_eq!(
+        req.messages[0].content.to_text(),
+        "What is the capital of France?"
+    );
+    assert_eq!(
+        req.messages[1].content.to_text(),
+        "The capital of France is Paris."
+    );
 }
 
 #[test]
@@ -50,7 +56,10 @@ fn system_message_becomes_leading_system_role_message() {
     );
 
     assert_roles(&req, &[Role::System, Role::User]);
-    assert_eq!(req.messages[0].content.to_text(), "You are a helpful assistant.");
+    assert_eq!(
+        req.messages[0].content.to_text(),
+        "You are a helpful assistant."
+    );
     assert_eq!(req.messages[1].content.to_text(), "Hello");
 }
 
@@ -71,7 +80,10 @@ fn developer_role_is_mapped_to_system_role_message() {
     );
 
     assert_roles(&req, &[Role::System, Role::System, Role::User]);
-    assert_eq!(req.messages[1].content.to_text(), "Follow these guidelines strictly.");
+    assert_eq!(
+        req.messages[1].content.to_text(),
+        "Follow these guidelines strictly."
+    );
     assert_eq!(req.messages[2].content.to_text(), "Hello");
 }
 
@@ -137,7 +149,10 @@ fn tool_definitions_preserve_strict_metadata() {
     let tools = req.tools.expect("tools preserved");
     assert_eq!(tools.len(), 1);
     assert_eq!(tools[0].name, "get_weather");
-    assert_eq!(tools[0].description.as_deref(), Some("Get current weather for a location"));
+    assert_eq!(
+        tools[0].description.as_deref(),
+        Some("Get current weather for a location")
+    );
     assert_eq!(tools[0].strict, Some(true));
     assert_eq!(
         tools[0].parameters,
@@ -708,51 +723,62 @@ fn malformed_json_arguments_kept_as_raw_text() {
 fn base64_image_reconstructed_as_data_url() {
     // fix-verification "should reconstruct data URL from base64 when no URL
     // available".
-    let mut req = request("gpt-4o", vec![Message {
-        role: Role::User,
-        content: MessageContent::Blocks(vec![ContentBlock::Image {
-            source: MediaSource::Base64 {
-                media_type: "image/png".to_string(),
-                data: "iVBORw0KGgo=".to_string(),
-            },
-            cache_control: None,
-        }]),
-        tool_calls: None,
-        tool_call_id: None,
-        meta: None,
-    }]);
+    let req = request(
+        "gpt-4o",
+        vec![Message {
+            role: Role::User,
+            content: MessageContent::Blocks(vec![ContentBlock::Image {
+                source: MediaSource::Base64 {
+                    media_type: "image/png".to_string(),
+                    data: "iVBORw0KGgo=".to_string(),
+                },
+                cache_control: None,
+            }]),
+            tool_calls: None,
+            tool_call_id: None,
+            meta: None,
+        }],
+    );
 
-    let out = encode_request(P::OpenAiChat, &mut req);
+    let out = encode_request(P::OpenAiChat, &req);
     let part = field(&out, "/messages/0/content/0");
     assert_eq!(part["type"], "image_url");
-    assert_eq!(part["image_url"]["url"], "data:image/png;base64,iVBORw0KGgo=");
+    assert_eq!(
+        part["image_url"]["url"],
+        "data:image/png;base64,iVBORw0KGgo="
+    );
 }
 
 #[test]
 fn audio_block_encodes_as_input_audio() {
     // fix-verification "should reconstruct input_audio parts in complex
     // content".
-    let mut req = request("gpt-4o-audio", vec![Message {
-        role: Role::User,
-        content: MessageContent::Blocks(vec![
-            ContentBlock::Text {
-                text: "What does this say?".to_string(),
-                cache_control: None,
-            },
-            ContentBlock::Audio {
-                source: MediaSource::Base64 {
-                    media_type: "audio/wav".to_string(),
-                    data: "base64audiodata".to_string(),
+    let req = request(
+        "gpt-4o-audio",
+        vec![Message {
+            role: Role::User,
+            content: MessageContent::Blocks(vec![
+                ContentBlock::Text {
+                    text: "What does this say?".to_string(),
+                    cache_control: None,
                 },
-            },
-        ]),
-        tool_calls: None,
-        tool_call_id: None,
-        meta: None,
-    }]);
+                ContentBlock::Audio {
+                    source: MediaSource::Base64 {
+                        media_type: "audio/wav".to_string(),
+                        data: "base64audiodata".to_string(),
+                    },
+                },
+            ]),
+            tool_calls: None,
+            tool_call_id: None,
+            meta: None,
+        }],
+    );
 
-    let out = encode_request(P::OpenAiChat, &mut req);
-    let parts = field(&out, "/messages/0/content").as_array().expect("content");
+    let out = encode_request(P::OpenAiChat, &req);
+    let parts = field(&out, "/messages/0/content")
+        .as_array()
+        .expect("content");
     assert_eq!(parts.len(), 2);
     assert_eq!(parts[0]["type"], "text");
     assert_eq!(parts[1]["type"], "input_audio");
@@ -770,27 +796,34 @@ fn tool_result_message_encodes_with_tool_call_id() {
     // fix-verification "should extract tool_call_id from tool_result content
     // when metadata is missing": a Role::Tool message encodes with
     // `tool_call_id` on the wire.
-    let req = request("gpt-4o", vec![
-        Message {
-            role: Role::Assistant,
-            content: MessageContent::Text(String::new()),
-            tool_calls: Some(vec![ToolCall::function("call_xyz", "search", "{\"q\":\"a\"}")]),
-            tool_call_id: None,
-            meta: None,
-        },
-        Message {
-            role: Role::Tool,
-            content: MessageContent::Blocks(vec![ContentBlock::ToolResult {
-                tool_use_id: "call_xyz".to_string(),
-                content: json!("Found results"),
-                is_error: None,
-                cache_control: None,
-            }]),
-            tool_calls: None,
-            tool_call_id: None,
-            meta: None,
-        },
-    ]);
+    let req = request(
+        "gpt-4o",
+        vec![
+            Message {
+                role: Role::Assistant,
+                content: MessageContent::Text(String::new()),
+                tool_calls: Some(vec![ToolCall::function(
+                    "call_xyz",
+                    "search",
+                    "{\"q\":\"a\"}",
+                )]),
+                tool_call_id: None,
+                meta: None,
+            },
+            Message {
+                role: Role::Tool,
+                content: MessageContent::Blocks(vec![ContentBlock::ToolResult {
+                    tool_use_id: "call_xyz".to_string(),
+                    content: json!("Found results"),
+                    is_error: None,
+                    cache_control: None,
+                }]),
+                tool_calls: None,
+                tool_call_id: None,
+                meta: None,
+            },
+        ],
+    );
 
     let out = encode_request(P::OpenAiChat, &req);
     let messages = field(&out, "/messages").as_array().expect("messages");

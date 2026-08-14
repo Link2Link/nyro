@@ -71,7 +71,10 @@ fn multi_turn_conversation() {
         ]
     }));
 
-    assert_roles(&req, &[Role::User, Role::Assistant, Role::User, Role::Assistant]);
+    assert_roles(
+        &req,
+        &[Role::User, Role::Assistant, Role::User, Role::Assistant],
+    );
 }
 
 // ── systemInstruction ────────────────────────────────────────────────────────
@@ -84,7 +87,10 @@ fn system_instruction_becomes_system_message() {
     }));
 
     assert_roles(&req, &[Role::System, Role::User]);
-    assert_eq!(req.messages[0].content.to_text(), "You are a helpful assistant.");
+    assert_eq!(
+        req.messages[0].content.to_text(),
+        "You are a helpful assistant."
+    );
 }
 
 #[test]
@@ -212,10 +218,7 @@ fn function_response_to_tool_result() {
             ..
         } => {
             assert_eq!(tool_use_id, "get_weather");
-            assert_eq!(
-                *content,
-                json!({"temperature": 22, "condition": "sunny"})
-            );
+            assert_eq!(*content, json!({"temperature": 22, "condition": "sunny"}));
         }
         other => panic!("expected tool_result block, got {other:?}"),
     }
@@ -354,7 +357,10 @@ fn thought_parts_become_thinking_blocks() {
     }));
 
     let MessageContent::Blocks(blocks) = &req.messages[1].content else {
-        panic!("KNOWN GAP: thought part should not collapse to text: {:?}", req.messages[1].content);
+        panic!(
+            "KNOWN GAP: thought part should not collapse to text: {:?}",
+            req.messages[1].content
+        );
     };
     assert_eq!(blocks.len(), 2);
     match &blocks[0] {
@@ -456,7 +462,10 @@ fn round_trip_system_instruction() {
         }),
     );
 
-    assert_eq!(field(&out, "/systemInstruction/parts/0/text"), "You are a pirate.");
+    assert_eq!(
+        field(&out, "/systemInstruction/parts/0/text"),
+        "You are a pirate."
+    );
 }
 
 #[test]
@@ -480,7 +489,10 @@ fn round_trip_tools() {
 
     let tools = field(&out, "/tools").as_array().expect("tools array");
     assert_eq!(tools.len(), 1);
-    assert_eq!(tools[0]["functionDeclarations"].as_array().map(Vec::len), Some(1));
+    assert_eq!(
+        tools[0]["functionDeclarations"].as_array().map(Vec::len),
+        Some(1)
+    );
     assert_eq!(tools[0]["functionDeclarations"][0]["name"], "get_weather");
 }
 
@@ -496,8 +508,14 @@ fn round_trip_thinking_config() {
         }),
     );
 
-    assert_eq!(field(&out, "/generationConfig/thinkingConfig/thinkingBudget"), &json!(4096));
-    assert_eq!(field(&out, "/generationConfig/thinkingConfig/thinkingLevel"), "high");
+    assert_eq!(
+        field(&out, "/generationConfig/thinkingConfig/thinkingBudget"),
+        &json!(4096)
+    );
+    assert_eq!(
+        field(&out, "/generationConfig/thinkingConfig/thinkingLevel"),
+        "high"
+    );
 }
 
 #[test]
@@ -515,7 +533,10 @@ fn round_trip_generation_config_params() {
     );
 
     assert_eq!(field(&out, "/generationConfig/temperature"), &json!(0.7));
-    assert_eq!(field(&out, "/generationConfig/maxOutputTokens"), &json!(4096));
+    assert_eq!(
+        field(&out, "/generationConfig/maxOutputTokens"),
+        &json!(4096)
+    );
     assert_eq!(field(&out, "/generationConfig/topP"), &json!(0.9));
 }
 
@@ -567,7 +588,11 @@ fn universal_image_to_google_inline_data() {
 fn universal_tool_call_to_google_function_call() {
     let req = request(
         "gemini-pro",
-        vec![assistant_tool_call_msg("call_123", "get_weather", "{\"location\":\"Paris\"}")],
+        vec![assistant_tool_call_msg(
+            "call_123",
+            "get_weather",
+            "{\"location\":\"Paris\"}",
+        )],
     );
 
     let out = encode_request(P::GoogleGemini, &req);
@@ -597,7 +622,10 @@ fn universal_tool_result_to_google_function_response() {
     let out = encode_request(P::GoogleGemini, &req);
     let part = field(&out, "/contents/0/parts/0");
     assert_eq!(part["functionResponse"]["name"], "call_123");
-    assert_eq!(part["functionResponse"]["response"], json!({"temperature": 25}));
+    assert_eq!(
+        part["functionResponse"]["response"],
+        json!({"temperature": 25})
+    );
 }
 
 #[test]
@@ -625,7 +653,9 @@ fn universal_thinking_content_to_google_thought_part() {
     );
 
     let out = encode_request(P::GoogleGemini, &req);
-    let parts = field(&out, "/contents/0/parts").as_array().expect("parts array");
+    let parts = field(&out, "/contents/0/parts")
+        .as_array()
+        .expect("parts array");
     assert_eq!(parts.len(), 2);
     assert_eq!(parts[0]["text"], "Let me think...");
     assert_eq!(parts[1]["text"], "The answer is 42.");
@@ -652,9 +682,15 @@ fn universal_tools_to_google_function_declarations() {
     let out = encode_request(P::GoogleGemini, &req);
     let tools = field(&out, "/tools").as_array().expect("tools array");
     assert_eq!(tools.len(), 1);
-    assert_eq!(tools[0]["functionDeclarations"].as_array().map(Vec::len), Some(1));
+    assert_eq!(
+        tools[0]["functionDeclarations"].as_array().map(Vec::len),
+        Some(1)
+    );
     assert_eq!(tools[0]["functionDeclarations"][0]["name"], "search");
-    assert_eq!(tools[0]["functionDeclarations"][0]["description"], "Search the web");
+    assert_eq!(
+        tools[0]["functionDeclarations"][0]["description"],
+        "Search the web"
+    );
 }
 
 #[test]
@@ -678,9 +714,9 @@ fn universal_thinking_config_written_back() {
     );
     match field(&out, "/generationConfig/thinkingConfig/thinkingLevel").as_str() {
         Some("medium") => {}
-        other => panic!(
-            "KNOWN GAP: effort level should survive alongside the budget, got {other:?}"
-        ),
+        other => {
+            panic!("KNOWN GAP: effort level should survive alongside the budget, got {other:?}")
+        }
     }
 }
 
@@ -795,7 +831,10 @@ fn google_system_instruction() {
     }));
 
     assert_roles(&req, &[Role::System, Role::User]);
-    assert_eq!(req.messages[0].content.to_text(), "You are a helpful assistant");
+    assert_eq!(
+        req.messages[0].content.to_text(),
+        "You are a helpful assistant"
+    );
 }
 
 #[test]
@@ -812,7 +851,10 @@ fn universal_to_google_format() {
     assert_eq!(contents[0]["role"], "user");
     assert_eq!(contents[0]["parts"][0]["text"], "Hello Gemini");
     assert_eq!(field(&out, "/generationConfig/temperature"), &json!(0.8));
-    assert_eq!(field(&out, "/generationConfig/maxOutputTokens"), &json!(150));
+    assert_eq!(
+        field(&out, "/generationConfig/maxOutputTokens"),
+        &json!(150)
+    );
 }
 
 // ── fix-verification / universal-conversion ported cases ─────────────────────
@@ -876,16 +918,19 @@ fn file_data_image_uses_url_source() {
 fn file_block_round_trips_as_file_data() {
     // `document` → `fileData` on the wire (fix-verification "should use
     // fileData when media has fileUri").
-    let req = request("gemini-pro", vec![Message {
-        role: Role::User,
-        content: MessageContent::Blocks(vec![ContentBlock::File {
-            source: MediaSource::Url("gs://bucket/document.pdf".to_string()),
-            media_type: Some("application/pdf".to_string()),
-        }]),
-        tool_calls: None,
-        tool_call_id: None,
-        meta: None,
-    }]);
+    let req = request(
+        "gemini-pro",
+        vec![Message {
+            role: Role::User,
+            content: MessageContent::Blocks(vec![ContentBlock::File {
+                source: MediaSource::Url("gs://bucket/document.pdf".to_string()),
+                media_type: Some("application/pdf".to_string()),
+            }]),
+            tool_calls: None,
+            tool_call_id: None,
+            meta: None,
+        }],
+    );
 
     let out = encode_request(P::GoogleGemini, &req);
     let part = field(&out, "/contents/0/parts/0");
@@ -901,27 +946,30 @@ fn tool_result_string_wraps_in_result_object() {
     // decoder) Nyro wraps the string result in `{"result": ...}` instead of
     // llm-bridge's `{"output": ...}`. Block-form results pass through raw
     // (see `tool_result_object_passes_through`).
-    let req = request("gemini-pro", vec![
-        Message {
-            role: Role::Assistant,
-            content: MessageContent::Blocks(vec![ContentBlock::ToolUse {
-                id: "call_1".to_string(),
-                name: "search".to_string(),
-                input: json!({"q": "test"}),
-                cache_control: None,
-            }]),
-            tool_calls: None,
-            tool_call_id: None,
-            meta: None,
-        },
-        Message {
-            role: Role::Tool,
-            content: MessageContent::Text("Found 5 results".to_string()),
-            tool_calls: None,
-            tool_call_id: Some("call_1".to_string()),
-            meta: None,
-        },
-    ]);
+    let req = request(
+        "gemini-pro",
+        vec![
+            Message {
+                role: Role::Assistant,
+                content: MessageContent::Blocks(vec![ContentBlock::ToolUse {
+                    id: "call_1".to_string(),
+                    name: "search".to_string(),
+                    input: json!({"q": "test"}),
+                    cache_control: None,
+                }]),
+                tool_calls: None,
+                tool_call_id: None,
+                meta: None,
+            },
+            Message {
+                role: Role::Tool,
+                content: MessageContent::Text("Found 5 results".to_string()),
+                tool_calls: None,
+                tool_call_id: Some("call_1".to_string()),
+                meta: None,
+            },
+        ],
+    );
 
     let out = encode_request(P::GoogleGemini, &req);
     let part = field(&out, "/contents/1/parts/0");
@@ -934,32 +982,35 @@ fn tool_result_string_wraps_in_result_object() {
 
 #[test]
 fn tool_result_object_passes_through_for_gemini() {
-    let req = request("gemini-pro", vec![
-        Message {
-            role: Role::Assistant,
-            content: MessageContent::Blocks(vec![ContentBlock::ToolUse {
-                id: "call_1".to_string(),
-                name: "search".to_string(),
-                input: json!({"q": "test"}),
-                cache_control: None,
-            }]),
-            tool_calls: None,
-            tool_call_id: None,
-            meta: None,
-        },
-        Message {
-            role: Role::Tool,
-            content: MessageContent::Blocks(vec![ContentBlock::ToolResult {
-                tool_use_id: "call_1".to_string(),
-                content: json!({"count": 5, "items": ["a", "b"]}),
-                is_error: None,
-                cache_control: None,
-            }]),
-            tool_calls: None,
-            tool_call_id: Some("call_1".to_string()),
-            meta: None,
-        },
-    ]);
+    let req = request(
+        "gemini-pro",
+        vec![
+            Message {
+                role: Role::Assistant,
+                content: MessageContent::Blocks(vec![ContentBlock::ToolUse {
+                    id: "call_1".to_string(),
+                    name: "search".to_string(),
+                    input: json!({"q": "test"}),
+                    cache_control: None,
+                }]),
+                tool_calls: None,
+                tool_call_id: None,
+                meta: None,
+            },
+            Message {
+                role: Role::Tool,
+                content: MessageContent::Blocks(vec![ContentBlock::ToolResult {
+                    tool_use_id: "call_1".to_string(),
+                    content: json!({"count": 5, "items": ["a", "b"]}),
+                    is_error: None,
+                    cache_control: None,
+                }]),
+                tool_calls: None,
+                tool_call_id: Some("call_1".to_string()),
+                meta: None,
+            },
+        ],
+    );
 
     let out = encode_request(P::GoogleGemini, &req);
     let part = field(&out, "/contents/1/parts/0");
@@ -993,8 +1044,8 @@ fn default_model_is_gemini_2_flash() {
     // fix-verification "should fallback to gemini-pro when model not in body":
     // Nyro's Google decoder defaults to `gemini-2.0-flash` when the model is
     // not supplied.
-    use nyro_core::protocol::codec::google::gemini::decoder::GoogleDecoder;
     use nyro_core::protocol::RequestDecoder;
+    use nyro_core::protocol::codec::google::gemini::decoder::GoogleDecoder;
 
     let req = GoogleDecoder
         .decode_request(json!({"contents": [{"role": "user", "parts": [{"text": "Hello"}]}]}))
@@ -1048,7 +1099,11 @@ fn schema_unsupported_fields_stripped_for_gemini() {
     assert!(query.get("$schema").is_none());
     assert!(query.get("$comment").is_some(), "passes through: {query}");
     assert!(query.get("default").is_some(), "passes through: {query}");
-    assert!(params["properties"]["nested"].get("additionalProperties").is_none());
+    assert!(
+        params["properties"]["nested"]
+            .get("additionalProperties")
+            .is_none()
+    );
     assert!(
         params["properties"]["nested"]["properties"]["inner"]
             .get("additionalProperties")
@@ -1082,21 +1137,24 @@ fn redacted_thinking_serializes_verbatim_for_gemini() {
     // the block falls through to the serde fallback and round-trips as an
     // opaque `{"type":"redacted_thinking",...}` part rather than llm-bridge's
     // `{thought: true, text: ""}`.
-    let req = request("gemini-pro", vec![Message {
-        role: Role::Assistant,
-        content: MessageContent::Blocks(vec![
-            ContentBlock::RedactedThinking {
-                data: "base64data".to_string(),
-            },
-            ContentBlock::Text {
-                text: "Hello".to_string(),
-                cache_control: None,
-            },
-        ]),
-        tool_calls: None,
-        tool_call_id: None,
-        meta: None,
-    }]);
+    let req = request(
+        "gemini-pro",
+        vec![Message {
+            role: Role::Assistant,
+            content: MessageContent::Blocks(vec![
+                ContentBlock::RedactedThinking {
+                    data: "base64data".to_string(),
+                },
+                ContentBlock::Text {
+                    text: "Hello".to_string(),
+                    cache_control: None,
+                },
+            ]),
+            tool_calls: None,
+            tool_call_id: None,
+            meta: None,
+        }],
+    );
 
     let out = encode_request(P::GoogleGemini, &req);
     let parts = field(&out, "/contents/0/parts").as_array().expect("parts");
@@ -1110,30 +1168,38 @@ fn multiple_text_blocks_in_system_message_join_into_single_part() {
     // universal-conversion "should handle multimodal system messages in Google
     // format": llm-bridge emits one systemInstruction part per text block;
     // Nyro emits one part per system *message*, with the blocks concatenated.
-    let req = request("gemini-pro", vec![
-        Message {
-            role: Role::System,
-            content: MessageContent::Blocks(vec![
-                ContentBlock::Text {
-                    text: "You are a helpful assistant.".to_string(),
-                    cache_control: None,
-                },
-                ContentBlock::Text {
-                    text: "Additional context.".to_string(),
-                    cache_control: None,
-                },
-            ]),
-            tool_calls: None,
-            tool_call_id: None,
-            meta: None,
-        },
-        user_msg("Hello!"),
-    ]);
+    let req = request(
+        "gemini-pro",
+        vec![
+            Message {
+                role: Role::System,
+                content: MessageContent::Blocks(vec![
+                    ContentBlock::Text {
+                        text: "You are a helpful assistant.".to_string(),
+                        cache_control: None,
+                    },
+                    ContentBlock::Text {
+                        text: "Additional context.".to_string(),
+                        cache_control: None,
+                    },
+                ]),
+                tool_calls: None,
+                tool_call_id: None,
+                meta: None,
+            },
+            user_msg("Hello!"),
+        ],
+    );
 
     let out = encode_request(P::GoogleGemini, &req);
-    let parts = field(&out, "/systemInstruction/parts").as_array().expect("parts");
+    let parts = field(&out, "/systemInstruction/parts")
+        .as_array()
+        .expect("parts");
     assert_eq!(parts.len(), 1);
-    assert_eq!(parts[0]["text"], "You are a helpful assistant.Additional context.");
+    assert_eq!(
+        parts[0]["text"],
+        "You are a helpful assistant.Additional context."
+    );
     let contents = field(&out, "/contents").as_array().expect("contents");
     assert_eq!(contents.len(), 1);
     assert_eq!(contents[0]["role"], "user");
@@ -1144,8 +1210,8 @@ fn non_array_system_parts_is_a_decode_error() {
     // fix-verification "should handle non-array parts gracefully": llm-bridge
     // tolerates `systemInstruction.parts: "not an array"`; Nyro's typed
     // `GoogleRequest` rejects it with a decode error.
-    use nyro_core::protocol::codec::google::gemini::decoder::GoogleDecoder;
     use nyro_core::protocol::RequestDecoder;
+    use nyro_core::protocol::codec::google::gemini::decoder::GoogleDecoder;
 
     let result = GoogleDecoder.decode_request(json!({
         "contents": [{"role": "user", "parts": [{"text": "Hello"}]}],

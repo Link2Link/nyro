@@ -312,7 +312,10 @@ pub fn delta_trace(deltas: &[StreamDelta]) -> String {
                 format!("tool_delta({index},{arguments:?})")
             }
             StreamDelta::ToolCallComplete { index, tool_call } => {
-                format!("tool_complete({index},{}={})", tool_call.name, tool_call.arguments)
+                format!(
+                    "tool_complete({index},{}={})",
+                    tool_call.name, tool_call.arguments
+                )
             }
             StreamDelta::Usage(u) => format!(
                 "usage(prompt={},completion={})",
@@ -357,35 +360,65 @@ fn usage_eq(a: &Usage, b: &Usage) -> bool {
         && a.total_tokens == b.total_tokens
         && a.cache_read_tokens == b.cache_read_tokens
         && a.cache_creation_tokens == b.cache_creation_tokens
-        && a.server_tool_use.as_ref().map(|s| (&s.web_search_requests, &s.web_fetch_requests))
-            == b.server_tool_use.as_ref().map(|s| (&s.web_search_requests, &s.web_fetch_requests))
+        && a.server_tool_use
+            .as_ref()
+            .map(|s| (&s.web_search_requests, &s.web_fetch_requests))
+            == b.server_tool_use
+                .as_ref()
+                .map(|s| (&s.web_search_requests, &s.web_fetch_requests))
 }
 
 /// Structural equality for stream deltas.
 pub fn delta_eq(a: &StreamDelta, b: &StreamDelta) -> bool {
     match (a, b) {
-        (StreamDelta::MessageStart { id: ai, model: am }, StreamDelta::MessageStart { id: bi, model: bm }) => {
-            ai == bi && am == bm
-        }
+        (
+            StreamDelta::MessageStart { id: ai, model: am },
+            StreamDelta::MessageStart { id: bi, model: bm },
+        ) => ai == bi && am == bm,
         (StreamDelta::TextDelta(a), StreamDelta::TextDelta(b)) => a == b,
         (StreamDelta::ThinkingDelta(a), StreamDelta::ThinkingDelta(b)) => a == b,
         (StreamDelta::ThinkingSignature(a), StreamDelta::ThinkingSignature(b)) => a == b,
         (
-            StreamDelta::ToolCallStart { index: ai, id: aid, name: an, namespace: ans, kind: ak },
-            StreamDelta::ToolCallStart { index: bi, id: bid, name: bn, namespace: bns, kind: bk },
+            StreamDelta::ToolCallStart {
+                index: ai,
+                id: aid,
+                name: an,
+                namespace: ans,
+                kind: ak,
+            },
+            StreamDelta::ToolCallStart {
+                index: bi,
+                id: bid,
+                name: bn,
+                namespace: bns,
+                kind: bk,
+            },
         ) => ai == bi && aid == bid && an == bn && ans == bns && ak == bk,
-        (StreamDelta::ToolCallDelta { index: ai, arguments: aa }, StreamDelta::ToolCallDelta { index: bi, arguments: ba }) => {
-            ai == bi && aa == ba
-        }
-        (StreamDelta::ToolCallComplete { index: ai, tool_call: at }, StreamDelta::ToolCallComplete { index: bi, tool_call: bt }) => {
-            ai == bi && tool_call_eq(at, bt)
-        }
+        (
+            StreamDelta::ToolCallDelta {
+                index: ai,
+                arguments: aa,
+            },
+            StreamDelta::ToolCallDelta {
+                index: bi,
+                arguments: ba,
+            },
+        ) => ai == bi && aa == ba,
+        (
+            StreamDelta::ToolCallComplete {
+                index: ai,
+                tool_call: at,
+            },
+            StreamDelta::ToolCallComplete {
+                index: bi,
+                tool_call: bt,
+            },
+        ) => ai == bi && tool_call_eq(at, bt),
         (StreamDelta::Usage(a), StreamDelta::Usage(b)) => usage_eq(a, b),
         (StreamDelta::Done { stop_reason: a }, StreamDelta::Done { stop_reason: b }) => a == b,
-        (
-            StreamDelta::StreamError { error: a },
-            StreamDelta::StreamError { error: b },
-        ) => a.kind == b.kind && a.message == b.message && a.status_code == b.status_code,
+        (StreamDelta::StreamError { error: a }, StreamDelta::StreamError { error: b }) => {
+            a.kind == b.kind && a.message == b.message && a.status_code == b.status_code
+        }
         (StreamDelta::UnexpectedEof, StreamDelta::UnexpectedEof) => true,
         (StreamDelta::Unknown { raw: a }, StreamDelta::Unknown { raw: b }) => a == b,
         _ => false,
@@ -420,8 +453,8 @@ pub fn assert_last_delta(deltas: &[StreamDelta], expected: &StreamDelta) {
 }
 
 // Re-export commonly used items so test files only need `use conv_common::*;`.
-pub use serde_json::json;
 pub use nyro_core::protocol::ir::{
     AiStreamDelta as StreamDelta, CacheControl, GenerationConfig, MediaSource, ReasoningConfig,
     ReasoningEffort, ResponseFormat, StreamConfig, ToolCallKind as ToolKind, ToolChoice, ToolSpec,
 };
+pub use serde_json::json;

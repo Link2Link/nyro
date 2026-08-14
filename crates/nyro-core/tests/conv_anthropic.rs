@@ -692,7 +692,9 @@ fn full_claude_code_request_shape_round_trips() {
     assert_eq!(system[1]["cache_control"], json!({"type": "ephemeral"}));
 
     // Assistant turn keeps thinking + text + server_tool_use in order.
-    let content = field(&out, "/messages/1/content").as_array().expect("content array");
+    let content = field(&out, "/messages/1/content")
+        .as_array()
+        .expect("content array");
     assert_eq!(content.len(), 3);
     assert_eq!(content[0]["type"], "thinking");
     assert_eq!(content[0]["signature"], "sig_01");
@@ -700,7 +702,9 @@ fn full_claude_code_request_shape_round_trips() {
     assert_eq!(content[2]["name"], "webReader");
 
     // Tool result survives as a user message with a tool_result block.
-    let tool_msg = field(&out, "/messages/2/content").as_array().expect("tool content array");
+    let tool_msg = field(&out, "/messages/2/content")
+        .as_array()
+        .expect("tool content array");
     assert_eq!(tool_msg[0]["type"], "tool_result");
     assert_eq!(tool_msg[0]["tool_use_id"], "call_de0eb30ed07a4f0dbc7688f4");
 
@@ -708,7 +712,7 @@ fn full_claude_code_request_shape_round_trips() {
     // leading Role::System message, so: [system, user, assistant, tool].
     let req = decode_request(P::AnthropicMessages, body);
     assert_eq!(req.generation.max_tokens, Some(65535));
-    assert_eq!(req.stream.enabled, true);
+    assert!(req.stream.enabled);
     assert!(req.reasoning.enabled);
     assert_eq!(req.messages[0].role, Role::System);
     assert_eq!(req.messages[2].role, Role::Assistant);
@@ -769,8 +773,14 @@ fn tool_result_is_error_flag_decode_gap() {
     );
 
     assert_eq!(req.messages[0].role, Role::Tool);
-    assert_eq!(req.messages[0].tool_call_id.as_deref(), Some("toolu_error_123"));
-    assert_eq!(req.messages[0].content.to_text(), "Error: Location not found");
+    assert_eq!(
+        req.messages[0].tool_call_id.as_deref(),
+        Some("toolu_error_123")
+    );
+    assert_eq!(
+        req.messages[0].content.to_text(),
+        "Error: Location not found"
+    );
 }
 
 // ── extended thinking ────────────────────────────────────────────────────────
@@ -820,7 +830,10 @@ fn thinking_content_block_with_signature() {
     };
     assert_eq!(blocks.len(), 2);
     match &blocks[0] {
-        ContentBlock::Thinking { thinking, signature } => {
+        ContentBlock::Thinking {
+            thinking,
+            signature,
+        } => {
             assert_eq!(thinking, "Let me reason through this step by step...");
             assert_eq!(signature.as_deref(), Some("ErUBCkYIAxgCIkD3sMj2test_sig"));
         }
@@ -834,8 +847,8 @@ fn redacted_thinking_encodes_from_ir() {
     // KNOWN GAP: the block encoder supports `redacted_thinking` but the final
     // payload validation (`ALLOWED_BLOCK_TYPES`) rejects it, so the request
     // fails with "unsupported block type" instead of round-tripping.
-    use nyro_core::protocol::codec::anthropic::messages::encoder::AnthropicEncoder;
     use nyro_core::protocol::RequestEncoder;
+    use nyro_core::protocol::codec::anthropic::messages::encoder::AnthropicEncoder;
 
     let req = request(
         "claude-sonnet-4-20250514",
@@ -862,7 +875,9 @@ fn redacted_thinking_encodes_from_ir() {
     let (out, _) = AnthropicEncoder
         .encode_request(&req)
         .expect("redacted_thinking blocks should encode");
-    let blocks = field(&out, "/messages/1/content").as_array().expect("content array");
+    let blocks = field(&out, "/messages/1/content")
+        .as_array()
+        .expect("content array");
     assert_eq!(blocks[0]["type"], "redacted_thinking");
     assert_eq!(blocks[0]["data"], "base64encodeddata...");
     assert_eq!(blocks[1]["type"], "text");
@@ -896,7 +911,9 @@ fn cache_control_on_content_block_round_trips() {
     );
 
     let out = encode_request(P::AnthropicMessages, &req);
-    let blocks = field(&out, "/messages/0/content").as_array().expect("content array");
+    let blocks = field(&out, "/messages/0/content")
+        .as_array()
+        .expect("content array");
     assert_eq!(blocks[0]["type"], "text");
     assert_eq!(blocks[0]["cache_control"], json!({"type": "ephemeral"}));
 }
@@ -919,7 +936,9 @@ fn no_cache_control_when_absent() {
     // No cache breakpoint was requested, so the wire round-trip must not
     // invent one.
     let out = encode_request(P::AnthropicMessages, &req);
-    let blocks = field(&out, "/messages/0/content").as_array().expect("content array");
+    let blocks = field(&out, "/messages/0/content")
+        .as_array()
+        .expect("content array");
     assert_eq!(blocks[0]["type"], "text");
     assert_eq!(blocks[0]["text"], "Normal message");
     assert!(
@@ -987,10 +1006,7 @@ fn round_trip_basic_text_messages() {
 
     field_str_eq(&out, "/model", "claude-sonnet-4-20250514");
     assert_eq!(field(&out, "/max_tokens"), &json!(1024));
-    assert_eq!(
-        field(&out, "/messages").as_array().map(Vec::len),
-        Some(3)
-    );
+    assert_eq!(field(&out, "/messages").as_array().map(Vec::len), Some(3));
 }
 
 #[test]
@@ -1083,7 +1099,9 @@ fn round_trip_thinking_block_with_signature() {
         }),
     );
 
-    let blocks = field(&out, "/messages/1/content").as_array().expect("content array");
+    let blocks = field(&out, "/messages/1/content")
+        .as_array()
+        .expect("content array");
     let thinking = blocks
         .iter()
         .find(|b| b["type"] == "thinking")
@@ -1125,7 +1143,9 @@ fn thinking_signature_survives_direct_ir_construction() {
     );
 
     let out = encode_request(P::AnthropicMessages, &req);
-    let blocks = field(&out, "/messages/1/content").as_array().expect("content array");
+    let blocks = field(&out, "/messages/1/content")
+        .as_array()
+        .expect("content array");
     let thinking = blocks
         .iter()
         .find(|b| b["type"] == "thinking")
@@ -1179,7 +1199,10 @@ fn tool_choice_auto_emits_object_wire_format() {
 
 #[test]
 fn tool_choice_named_emits_tool_wire_format() {
-    let req = request("claude-sonnet-4-20250514", vec![user_msg("Use the calculator")]);
+    let req = request(
+        "claude-sonnet-4-20250514",
+        vec![user_msg("Use the calculator")],
+    );
     let mut req = req;
     req.tools = Some(vec![ToolSpec {
         name: "calculator".to_string(),
@@ -1276,7 +1299,9 @@ fn universal_thinking_content_back_to_anthropic() {
     );
 
     let out = encode_request(P::AnthropicMessages, &req);
-    let blocks = field(&out, "/messages/0/content").as_array().expect("content array");
+    let blocks = field(&out, "/messages/0/content")
+        .as_array()
+        .expect("content array");
     assert_eq!(blocks[0]["type"], "thinking");
     assert_eq!(blocks[0]["thinking"], "Let me think...");
     assert_eq!(blocks[1]["type"], "text");
@@ -1436,9 +1461,15 @@ fn anthropic_to_google_cross_provider() {
     assert_eq!(contents.len(), 1);
     assert_eq!(contents[0]["role"], "user");
     assert_eq!(contents[0]["parts"][0]["text"], "Hello Claude");
-    assert_eq!(field(&out, "/systemInstruction/parts/0/text"), "You are Claude");
+    assert_eq!(
+        field(&out, "/systemInstruction/parts/0/text"),
+        "You are Claude"
+    );
     assert_eq!(field(&out, "/generationConfig/temperature"), &json!(0.5));
-    assert_eq!(field(&out, "/generationConfig/maxOutputTokens"), &json!(200));
+    assert_eq!(
+        field(&out, "/generationConfig/maxOutputTokens"),
+        &json!(200)
+    );
 }
 
 // ── fix-verification ported cases ────────────────────────────────────────────
@@ -1459,32 +1490,38 @@ fn developer_message_missing_text_does_not_produce_undefined() {
     // messages with missing text": with IR text blocks the text is always
     // present (possibly empty); the encoded system prompt must never contain
     // the literal "undefined".
-    let req = request("claude-3-sonnet-20240229", vec![
-        Message {
-            role: Role::System,
-            content: MessageContent::Blocks(vec![
-                ContentBlock::Text {
-                    text: "Be helpful".to_string(),
-                    cache_control: None,
-                },
-                ContentBlock::Text {
-                    text: String::new(),
-                    cache_control: None,
-                },
-                ContentBlock::Image {
-                    source: MediaSource::Url("https://example.com/img.png".to_string()),
-                    cache_control: None,
-                },
-            ]),
-            tool_calls: None,
-            tool_call_id: None,
-            meta: None,
-        },
-        user_msg("Hello"),
-    ]);
+    let req = request(
+        "claude-3-sonnet-20240229",
+        vec![
+            Message {
+                role: Role::System,
+                content: MessageContent::Blocks(vec![
+                    ContentBlock::Text {
+                        text: "Be helpful".to_string(),
+                        cache_control: None,
+                    },
+                    ContentBlock::Text {
+                        text: String::new(),
+                        cache_control: None,
+                    },
+                    ContentBlock::Image {
+                        source: MediaSource::Url("https://example.com/img.png".to_string()),
+                        cache_control: None,
+                    },
+                ]),
+                tool_calls: None,
+                tool_call_id: None,
+                meta: None,
+            },
+            user_msg("Hello"),
+        ],
+    );
 
     let out = encode_request(P::AnthropicMessages, &req);
     let system = field_str(&out, "/system");
     assert!(system.contains("Be helpful"), "system: {system:?}");
-    assert!(!system.contains("undefined"), "no undefined text: {system:?}");
+    assert!(
+        !system.contains("undefined"),
+        "no undefined text: {system:?}"
+    );
 }

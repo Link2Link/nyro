@@ -38,7 +38,10 @@ fn openai_text_to_anthropic() {
     assert_eq!(messages[0]["role"], "user");
     assert_eq!(messages[0]["content"][0]["text"], "Hello!");
     assert_eq!(messages[1]["role"], "assistant");
-    assert_eq!(messages[1]["content"][0]["text"], "Hi there! How can I help?");
+    assert_eq!(
+        messages[1]["content"][0]["text"],
+        "Hi there! How can I help?"
+    );
 }
 
 #[test]
@@ -328,7 +331,9 @@ fn openai_data_url_image_to_anthropic_base64() {
         P::AnthropicMessages,
     );
 
-    let blocks = field(&out, "/messages/0/content").as_array().expect("content");
+    let blocks = field(&out, "/messages/0/content")
+        .as_array()
+        .expect("content");
     let image = blocks
         .iter()
         .find(|b| b["type"] == "image")
@@ -417,7 +422,9 @@ fn google_inline_data_image_to_anthropic_base64() {
         P::AnthropicMessages,
     );
 
-    let blocks = field(&out, "/messages/0/content").as_array().expect("content");
+    let blocks = field(&out, "/messages/0/content")
+        .as_array()
+        .expect("content");
     let image = blocks
         .iter()
         .find(|b| b["type"] == "image")
@@ -464,9 +471,13 @@ fn developer_message_to_google_system_instruction() {
         P::GoogleGemini,
     );
 
-    let parts = field(&out, "/systemInstruction/parts").as_array().expect("parts");
+    let parts = field(&out, "/systemInstruction/parts")
+        .as_array()
+        .expect("parts");
     assert!(
-        parts.iter().any(|p| p["text"] == "Always respond in haiku."),
+        parts
+            .iter()
+            .any(|p| p["text"] == "Always respond in haiku."),
         "developer text in systemInstruction: {parts:?}"
     );
     let contents = field(&out, "/contents").as_array().expect("contents");
@@ -512,11 +523,10 @@ fn developer_merges_with_existing_system_to_google() {
         P::GoogleGemini,
     );
 
-    let parts = field(&out, "/systemInstruction/parts").as_array().expect("parts");
-    let joined: Vec<&str> = parts
-        .iter()
-        .filter_map(|p| p["text"].as_str())
-        .collect();
+    let parts = field(&out, "/systemInstruction/parts")
+        .as_array()
+        .expect("parts");
+    let joined: Vec<&str> = parts.iter().filter_map(|p| p["text"].as_str()).collect();
     assert!(
         joined.iter().any(|t| t.contains("You are an expert."))
             && joined.iter().any(|t| t.contains("Be brief.")),
@@ -550,7 +560,11 @@ fn openai_json_schema_to_google_response_schema() {
         P::GoogleGemini,
     );
 
-    field_str_eq(&out, "/generationConfig/responseMimeType", "application/json");
+    field_str_eq(
+        &out,
+        "/generationConfig/responseMimeType",
+        "application/json",
+    );
     let schema = field(&out, "/generationConfig/responseSchema");
     assert_eq!(schema["type"], "object");
     assert!(schema["properties"].get("name").is_some());
@@ -580,8 +594,16 @@ fn google_response_schema_to_openai_response_format() {
 
     let rf = field(&out, "/response_format");
     assert_eq!(rf["type"], "json_schema");
-    assert!(rf["json_schema"]["schema"]["properties"].get("title").is_some());
-    assert!(rf["json_schema"]["schema"]["properties"].get("count").is_some());
+    assert!(
+        rf["json_schema"]["schema"]["properties"]
+            .get("title")
+            .is_some()
+    );
+    assert!(
+        rf["json_schema"]["schema"]["properties"]
+            .get("count")
+            .is_some()
+    );
 }
 
 // ── tool choice modes across providers ───────────────────────────────────────
@@ -723,7 +745,10 @@ fn anthropic_tool_call_to_google() {
     let contents = field(&out, "/contents").as_array().expect("contents");
     let call_part = contents[1]["parts"][0].clone();
     assert_eq!(call_part["functionCall"]["name"], "get_weather");
-    assert_eq!(call_part["functionCall"]["args"], json!({"location": "NYC"}));
+    assert_eq!(
+        call_part["functionCall"]["args"],
+        json!({"location": "NYC"})
+    );
     // Nyro writes the tool message's `tool_call_id` as the functionResponse
     // name and wraps the string result in `{"result": ...}` (llm-bridge
     // resolves the tool name from the earlier call and wraps in `{output: ...}`).
