@@ -233,6 +233,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "async-stream"
+version = "0.3.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0b5a71a6f37880a80d1d7f19efd781e4b5de42c88f0722cc13bcb6cc2cfe8476"
+dependencies = [
+ "async-stream-impl",
+ "futures-core",
+ "pin-project-lite",
+]
+
+[[package]]
+name = "async-stream-impl"
+version = "0.3.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c7c24de15d275a1ecfd47a380fb4d5ec9bfe0933f309ed5e705b775596a3574d"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
+]
+
+[[package]]
 name = "async-task"
 version = "4.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -328,7 +350,7 @@ dependencies = [
  "pin-project-lite",
  "rustversion",
  "serde",
- "serde_json",
+ "serde_json 1.0.150",
  "serde_path_to_error",
  "serde_urlencoded",
  "sync_wrapper",
@@ -452,13 +474,34 @@ dependencies = [
 
 [[package]]
 name = "brotli"
+version = "7.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cc97b8f16f944bba54f0433f07e30be199b6dc2bd25937444bbad560bcea29bd"
+dependencies = [
+ "alloc-no-stdlib",
+ "alloc-stdlib",
+ "brotli-decompressor 4.0.3",
+]
+
+[[package]]
+name = "brotli"
 version = "8.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8119e4516436f5708bbc474a9d395bf12f1b5395e93a92a56e647ac3388c8610"
 dependencies = [
  "alloc-no-stdlib",
  "alloc-stdlib",
- "brotli-decompressor",
+ "brotli-decompressor 5.0.1",
+]
+
+[[package]]
+name = "brotli-decompressor"
+version = "4.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a334ef7c9e23abf0ce748e8cd309037da93e606ad52eb372e4ce327a0dcfbdfd"
+dependencies = [
+ "alloc-no-stdlib",
+ "alloc-stdlib",
 ]
 
 [[package]]
@@ -560,7 +603,7 @@ dependencies = [
  "cargo-platform",
  "semver",
  "serde",
- "serde_json",
+ "serde_json 1.0.150",
  "thiserror 2.0.18",
 ]
 
@@ -1535,7 +1578,7 @@ dependencies = [
  "ring",
  "rustls-pki-types",
  "serde",
- "serde_json",
+ "serde_json 1.0.150",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -2470,7 +2513,7 @@ checksum = "863726d7afb6bc2590eeff7135d923545e5e964f004c2ccf8716c25e70a86f08"
 dependencies = [
  "jsonptr",
  "serde",
- "serde_json",
+ "serde_json 1.0.150",
  "thiserror 1.0.69",
 ]
 
@@ -2481,7 +2524,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5dea2b27dd239b2556ed7a25ba842fe47fd602e7fc7433c2a8d6106d4d9edd70"
 dependencies = [
  "serde",
- "serde_json",
+ "serde_json 1.0.150",
 ]
 
 [[package]]
@@ -2883,6 +2926,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "nyro-ccswitch-compat"
+version = "2.0.3"
+dependencies = [
+ "async-stream",
+ "base64 0.22.1",
+ "brotli 7.0.0",
+ "bytes",
+ "flate2",
+ "futures",
+ "serde",
+ "serde_json 1.0.149",
+ "sha2",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "uuid",
+ "zstd",
+]
+
+[[package]]
 name = "nyro-core"
 version = "2.0.3"
 dependencies = [
@@ -2894,13 +2957,15 @@ dependencies = [
  "chrono",
  "dashmap",
  "dirs 6.0.0",
+ "flate2",
  "futures",
  "gcp_auth",
  "inventory",
+ "nyro-ccswitch-compat",
  "rand 0.8.6",
  "reqwest 0.12.28",
  "serde",
- "serde_json",
+ "serde_json 1.0.150",
  "sha2",
  "sqlx",
  "tempfile",
@@ -2918,7 +2983,7 @@ version = "2.0.3"
 dependencies = [
  "nyro-core",
  "serde",
- "serde_json",
+ "serde_json 1.0.150",
  "tauri",
  "tauri-build",
  "tauri-plugin-autostart",
@@ -2941,7 +3006,7 @@ dependencies = [
  "nyro-core",
  "rust-embed",
  "serde",
- "serde_json",
+ "serde_json 1.0.150",
  "serde_yaml",
  "shellexpand",
  "tokio",
@@ -2963,7 +3028,7 @@ dependencies = [
  "futures",
  "reqwest 0.12.28",
  "serde",
- "serde_json",
+ "serde_json 1.0.150",
  "tempfile",
  "tokio",
  "tracing",
@@ -3237,7 +3302,7 @@ dependencies = [
  "objc2-foundation",
  "objc2-osa-kit",
  "serde",
- "serde_json",
+ "serde_json 1.0.150",
  "thiserror 2.0.18",
 ]
 
@@ -3883,7 +3948,7 @@ dependencies = [
  "rustls-native-certs",
  "rustls-pki-types",
  "serde",
- "serde_json",
+ "serde_json 1.0.150",
  "serde_urlencoded",
  "sync_wrapper",
  "tokio",
@@ -3923,7 +3988,7 @@ dependencies = [
  "rustls-pki-types",
  "rustls-platform-verifier",
  "serde",
- "serde_json",
+ "serde_json 1.0.150",
  "sync_wrapper",
  "tokio",
  "tokio-rustls",
@@ -4155,7 +4220,7 @@ dependencies = [
  "indexmap 1.9.3",
  "schemars_derive",
  "serde",
- "serde_json",
+ "serde_json 1.0.150",
  "url",
  "uuid",
 ]
@@ -4169,7 +4234,7 @@ dependencies = [
  "dyn-clone",
  "ref-cast",
  "serde",
- "serde_json",
+ "serde_json 1.0.150",
 ]
 
 [[package]]
@@ -4181,7 +4246,7 @@ dependencies = [
  "dyn-clone",
  "ref-cast",
  "serde",
- "serde_json",
+ "serde_json 1.0.150",
 ]
 
 [[package]]
@@ -4309,6 +4374,18 @@ dependencies = [
 
 [[package]]
 name = "serde_json"
+version = "1.0.149"
+dependencies = [
+ "indexmap 2.14.0",
+ "itoa",
+ "memchr",
+ "serde",
+ "serde_core",
+ "zmij",
+]
+
+[[package]]
+name = "serde_json"
 version = "1.0.150"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e8014e44b4736ed0538adeecded0fce2a272f22dc9578a7eb6b2d9993c74cfb9"
@@ -4387,7 +4464,7 @@ dependencies = [
  "schemars 0.9.0",
  "schemars 1.2.1",
  "serde_core",
- "serde_json",
+ "serde_json 1.0.150",
  "serde_with_macros",
  "time",
 ]
@@ -4424,7 +4501,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "04f3666a07a197cdb77cdf306c32be9b7f598d7060d50cfd4d5aa04bfd92f6c5"
 dependencies = [
  "serde",
- "serde_json",
+ "serde_json 1.0.150",
  "serialize-to-javascript-impl",
 ]
 
@@ -4672,7 +4749,7 @@ dependencies = [
  "percent-encoding",
  "rustls",
  "serde",
- "serde_json",
+ "serde_json 1.0.150",
  "sha2",
  "smallvec",
  "thiserror 2.0.18",
@@ -4710,7 +4787,7 @@ dependencies = [
  "proc-macro2",
  "quote",
  "serde",
- "serde_json",
+ "serde_json 1.0.150",
  "sha2",
  "sqlx-core",
  "sqlx-mysql",
@@ -4790,7 +4867,7 @@ dependencies = [
  "once_cell",
  "rand 0.8.6",
  "serde",
- "serde_json",
+ "serde_json 1.0.150",
  "sha2",
  "smallvec",
  "sqlx-core",
@@ -4885,7 +4962,7 @@ checksum = "4057c98e2e852d51fdcfca832aac7b571f6b351ad159f9eda5db1655f8d0c4d7"
 dependencies = [
  "base64 0.21.7",
  "serde",
- "serde_json",
+ "serde_json 1.0.150",
 ]
 
 [[package]]
@@ -5063,7 +5140,7 @@ dependencies = [
  "raw-window-handle",
  "reqwest 0.13.4",
  "serde",
- "serde_json",
+ "serde_json 1.0.150",
  "serde_repr",
  "serialize-to-javascript",
  "swift-rs",
@@ -5097,7 +5174,7 @@ dependencies = [
  "schemars 0.8.22",
  "semver",
  "serde",
- "serde_json",
+ "serde_json 1.0.150",
  "tauri-utils",
  "tauri-winres",
  "walkdir",
@@ -5110,7 +5187,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e4a0319528a025a38c4078e7dae2c446f4e63620ddb0659a643ede1cb38f90e9"
 dependencies = [
  "base64 0.22.1",
- "brotli",
+ "brotli 8.0.3",
  "ico",
  "json-patch",
  "plist",
@@ -5119,7 +5196,7 @@ dependencies = [
  "quote",
  "semver",
  "serde",
- "serde_json",
+ "serde_json 1.0.150",
  "sha2",
  "syn 2.0.117",
  "tauri-utils",
@@ -5155,7 +5232,7 @@ dependencies = [
  "plist",
  "schemars 0.8.22",
  "serde",
- "serde_json",
+ "serde_json 1.0.150",
  "tauri-utils",
  "walkdir",
 ]
@@ -5168,7 +5245,7 @@ checksum = "459383cebc193cdd03d1ba4acc40f2c408a7abce419d64bdcd2d745bc2886f70"
 dependencies = [
  "auto-launch",
  "serde",
- "serde_json",
+ "serde_json 1.0.150",
  "tauri",
  "tauri-plugin",
  "thiserror 2.0.18",
@@ -5187,7 +5264,7 @@ dependencies = [
  "open",
  "schemars 0.8.22",
  "serde",
- "serde_json",
+ "serde_json 1.0.150",
  "tauri",
  "tauri-plugin",
  "thiserror 2.0.18",
@@ -5203,7 +5280,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5c8f29386f5e9fdc699182388a33ee80a56de436d91b67459e86afef426282af"
 dependencies = [
  "serde",
- "serde_json",
+ "serde_json 1.0.150",
  "tauri",
  "thiserror 2.0.18",
  "tracing",
@@ -5231,7 +5308,7 @@ dependencies = [
  "rustls",
  "semver",
  "serde",
- "serde_json",
+ "serde_json 1.0.150",
  "tar",
  "tauri",
  "tauri-plugin",
@@ -5260,7 +5337,7 @@ dependencies = [
  "objc2-web-kit",
  "raw-window-handle",
  "serde",
- "serde_json",
+ "serde_json 1.0.150",
  "tauri-utils",
  "thiserror 2.0.18",
  "url",
@@ -5302,7 +5379,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "092379df9a707631978e6c56b1bc2401d387f01e2d4a3c123360d167bbb9aa95"
 dependencies = [
  "anyhow",
- "brotli",
+ "brotli 8.0.3",
  "cargo_metadata",
  "ctor",
  "dom_query",
@@ -5322,7 +5399,7 @@ dependencies = [
  "semver",
  "serde",
  "serde-untagged",
- "serde_json",
+ "serde_json 1.0.150",
  "serde_with",
  "swift-rs",
  "thiserror 2.0.18",
@@ -6966,7 +7043,7 @@ dependencies = [
  "log",
  "serde",
  "serde_derive",
- "serde_json",
+ "serde_json 1.0.150",
  "wasm-encoder",
  "wasm-metadata",
  "wasmparser",
@@ -6986,7 +7063,7 @@ dependencies = [
  "semver",
  "serde",
  "serde_derive",
- "serde_json",
+ "serde_json 1.0.150",
  "unicode-xid",
  "wasmparser",
 ]

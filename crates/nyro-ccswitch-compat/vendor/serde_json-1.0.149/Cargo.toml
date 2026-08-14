@@ -1,0 +1,57 @@
+# Vendored verbatim source for serde_json 1.0.149. The manifest is reduced to
+# production targets/dependencies so this path dependency remains isolated from
+# Nyro's registry serde_json 1.0.150 feature set.
+
+[package]
+name = "serde_json"
+version = "1.0.149"
+edition = "2021"
+rust-version = "1.68"
+authors = [
+    "Erick Tryzelaar <erick.tryzelaar@gmail.com>",
+    "David Tolnay <dtolnay@gmail.com>",
+]
+description = "A JSON serialization file format"
+documentation = "https://docs.rs/serde_json"
+repository = "https://github.com/serde-rs/json"
+license = "MIT OR Apache-2.0"
+build = "build.rs"
+
+[features]
+alloc = ["serde_core/alloc"]
+arbitrary_precision = []
+default = ["std"]
+float_roundtrip = []
+preserve_order = ["indexmap", "std"]
+raw_value = []
+std = ["memchr/std", "serde_core/std"]
+unbounded_depth = []
+
+[lib]
+name = "serde_json"
+path = "src/lib.rs"
+# The vendored manifest drops dev-dependencies, so the crate's own doctests
+# cannot compile; they are upstream documentation examples, not Nyro behavior.
+doctest = false
+
+[dependencies.indexmap]
+version = "2.2.3"
+optional = true
+
+[dependencies.itoa]
+version = "1.0"
+
+[dependencies.memchr]
+version = "2"
+default-features = false
+
+[dependencies.serde_core]
+version = "1.0.220"
+default-features = false
+
+[dependencies.zmij]
+version = "1.0"
+
+[target."cfg(any())".dependencies.serde]
+version = "1.0.220"
+default-features = false
