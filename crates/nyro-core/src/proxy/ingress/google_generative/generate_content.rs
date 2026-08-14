@@ -1,10 +1,8 @@
 //! Thin ingress shell: POST /v1beta/models/:model_action
 
-use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue};
 use axum::response::Response;
-use serde_json::Value;
 use std::collections::HashMap;
 
 use crate::Gateway;
@@ -13,6 +11,7 @@ use crate::protocol::ids::GOOGLE_GEMINI_GENERATE_CONTENT_V1BETA;
 use crate::protocol::ir::RawEnvelope;
 use crate::proxy::context::RequestContext;
 use crate::proxy::dispatcher::{dispatch_pipeline, log_decode_error};
+use crate::proxy::intake::JsonIntake;
 
 pub async fn handler(
     State(gw): State<Gateway>,
@@ -20,9 +19,10 @@ pub async fn handler(
     headers: HeaderMap,
     Path(model_action): Path<String>,
     Query(query): Query<HashMap<String, String>>,
-    Json(body): Json<Value>,
+    intake: JsonIntake,
 ) -> Response {
     ctx.ingress_protocol = GOOGLE_GEMINI_GENERATE_CONTENT_V1BETA;
+    let JsonIntake { value: body, raw } = intake;
     let (model, action) = match model_action.rsplit_once(':') {
         Some((m, a)) => (m.to_string(), a.to_string()),
         None => (model_action.clone(), "generateContent".to_string()),
@@ -37,7 +37,8 @@ pub async fn handler(
                 .map(|vs| (k.as_str().to_lowercase(), vs.to_string()))
         })
         .collect();
-    let envelope = RawEnvelope::new(Some(body.clone()), flat_headers, "POST", &path);
+    let envelope =
+        RawEnvelope::new(Some(body.clone()), flat_headers, "POST", &path).with_raw_body(raw);
     let mut auth_headers = headers.clone();
     inject_query_key_for_auth(&mut auth_headers, &query);
     let request = match GoogleDecoder.decode_with_model(body, &model, is_stream) {

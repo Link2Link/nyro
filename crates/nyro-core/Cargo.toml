@@ -19,6 +19,7 @@ uuid = { workspace = true }
 chrono = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
+nyro-ccswitch-compat = { path = "../nyro-ccswitch-compat" }
 
 tokio-stream = "0.1"
 futures = "0.3"
@@ -33,3 +34,4 @@ gcp_auth = "0.12.6"
 
 [dev-dependencies]
 tempfile = "3"
+flate2 = "1"

@@ -1,24 +1,24 @@
 //! Thin ingress shell: POST /v1/chat/completions
 
-use axum::Json;
 use axum::extract::State;
 use axum::http::HeaderMap;
 use axum::response::Response;
-use serde_json::Value;
 
 use crate::Gateway;
 use crate::protocol::ids::OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1;
 use crate::protocol::ir::RawEnvelope;
 use crate::proxy::context::RequestContext;
 use crate::proxy::dispatcher::{dispatch_pipeline, log_decode_error};
+use crate::proxy::intake::JsonIntake;
 
 pub async fn handler(
     State(gw): State<Gateway>,
     mut ctx: axum::extract::Extension<RequestContext>,
     headers: HeaderMap,
-    Json(body): Json<Value>,
+    intake: JsonIntake,
 ) -> Response {
     ctx.ingress_protocol = OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1;
+    let JsonIntake { value: body, raw } = intake;
     let flat_headers: std::collections::HashMap<String, String> = headers
         .iter()
         .filter_map(|(k, v)| {
@@ -32,7 +32,8 @@ pub async fn handler(
         flat_headers,
         "POST",
         "/v1/chat/completions",
-    );
+    )
+    .with_raw_body(raw);
     let decoder = OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1
         .handler()
         .make_request_decoder();

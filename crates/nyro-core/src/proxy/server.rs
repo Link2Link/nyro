@@ -13,7 +13,7 @@ use super::ingress;
 use crate::Gateway;
 
 // Multimodal Gemini/OpenAI-compatible requests commonly carry base64 media in JSON.
-const PROXY_JSON_BODY_LIMIT_BYTES: usize = 100 * 1024 * 1024;
+pub(crate) const PROXY_JSON_BODY_LIMIT_BYTES: usize = 100 * 1024 * 1024;
 
 pub fn create_router(gateway: Gateway) -> Router {
     let router = Router::new()

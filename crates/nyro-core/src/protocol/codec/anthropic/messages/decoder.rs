@@ -525,9 +525,8 @@ fn decode_user_blocks(
                     content: MessageContent::Text(tool_text),
                     tool_calls: None,
                     tool_call_id: Some(tool_use_id),
-                    meta: is_server.then(|| {
-                        serde_json::json!({ "__nyro_server_tool_result": true })
-                    }),
+                    meta: is_server
+                        .then(|| serde_json::json!({ "__nyro_server_tool_result": true })),
                 });
             }
             AnthropicContentBlock::Text {
