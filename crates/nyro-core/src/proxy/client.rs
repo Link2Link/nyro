@@ -89,8 +89,35 @@ impl ProxyClient {
             .send()
             .await?;
         let status = response.status().as_u16();
-        let headers = response.headers().clone();
-        let body = response.bytes().await?;
+        let mut headers = response.headers().clone();
+        // Some gateways force-compress even when the client never advertised
+        // accept-encoding; decode a supported content-encoding before JSON
+        // parsing instead of failing with a misleading decode error.
+        let encoding = headers
+            .get(reqwest::header::CONTENT_ENCODING)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_ascii_lowercase);
+        let body = match encoding
+            .as_deref()
+            .filter(|encoding| nyro_ccswitch_compat::is_supported_content_encoding(encoding))
+        {
+            Some(encoding) => {
+                let compressed = response.bytes().await?;
+                match nyro_ccswitch_compat::decompress_body_with_limit(
+                    encoding,
+                    &compressed,
+                    MAX_UPSTREAM_RESPONSE_BODY_BYTES,
+                ) {
+                    Ok(Some(decompressed)) => {
+                        headers.remove(reqwest::header::CONTENT_ENCODING);
+                        headers.remove(reqwest::header::CONTENT_LENGTH);
+                        Bytes::from(decompressed)
+                    }
+                    _ => compressed,
+                }
+            }
+            None => response.bytes().await?,
+        };
         let json: Value = match serde_json::from_slice(&body) {
             Ok(json) => json,
             Err(source) => {
@@ -228,6 +255,36 @@ mod tests {
     fn request_body(request: &[u8]) -> &[u8] {
         let body_start = header_end(request).expect("request headers") + 4;
         &request[body_start..]
+    }
+
+    #[tokio::test]
+    async fn non_stream_decodes_gzip_content_encoding_response() {
+        // A gateway that force-compresses without being asked must not break
+        // the buffered JSON path.
+        let json = br#"{"id":"chatcmpl_gz","choices":[{"index":0,"message":{"role":"assistant","content":"GZIP-OK"},"finish_reason":"stop"}]}"#;
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        std::io::Write::write_all(&mut encoder, json).unwrap();
+        let compressed = encoder.finish().unwrap();
+        let mut response = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-encoding: gzip\r\ncontent-length: {}\r\n\r\n",
+            compressed.len()
+        )
+        .into_bytes();
+        response.extend_from_slice(&compressed);
+        let (url, _captured) = serve_once(&response).await;
+        let client = ProxyClient::new(reqwest::Client::new());
+
+        let (value, status, headers) = client
+            .call_non_stream(
+                &url,
+                HeaderMap::new(),
+                serde_json::json!({"model": "m", "messages": []}),
+            )
+            .await
+            .expect("gzip response decodes");
+        assert_eq!(status, 200);
+        assert_eq!(value["choices"][0]["message"]["content"], "GZIP-OK");
+        assert!(headers.get("content-encoding").is_none());
     }
 
     #[tokio::test]

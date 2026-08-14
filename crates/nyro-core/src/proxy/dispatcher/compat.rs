@@ -1363,14 +1363,16 @@ fn request_patch(baseline: &AiRequest, current: &AiRequest) -> Result<Option<Byt
         .source_protocol
         .ok_or_else(|| "request is missing its source protocol".to_string())?;
     let encoder = source_protocol.handler().make_request_encoder();
-    let baseline = encoder
-        .encode_request(baseline)
-        .map_err(|error| error.to_string())?
-        .0;
-    let current = encoder
-        .encode_request(current)
-        .map_err(|error| error.to_string())?
-        .0;
+    // The patch only replays hook mutations onto the compat wire body. When
+    // either IR snapshot cannot re-encode (e.g. the ingress codec rejects a
+    // degenerate request), skip the patch entirely and let the real
+    // conversion path surface the proper client-facing error.
+    let (Ok(baseline), Ok(current)) = (
+        encoder.encode_request(baseline).map(|encoded| encoded.0),
+        encoder.encode_request(current).map(|encoded| encoded.0),
+    ) else {
+        return Ok(None);
+    };
     value_patch(&baseline, &current)
 }
 

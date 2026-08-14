@@ -632,12 +632,15 @@ async fn dispatch_pipeline_inner(
                     // Invalid client history fails on every provider the same
                     // way; cc-switch classifies these NonRetryable and so do
                     // we — return to the client instead of replaying the
-                    // broken request at each target.
+                    // broken request at each target. Other conversion errors
+                    // carry their cc-switch status (422 for transform
+                    // failures) instead of a generic 500.
                     let message = format!("compat request preparation failed: {error}");
+                    let status = error.http_status();
                     if error.is_invalid_request() {
-                        return error_response(400, &message);
+                        return error_response(status, &message);
                     }
-                    last_response = Some(error_response(500, &message));
+                    last_response = Some(unprocessable_response(status, &message));
                     continue;
                 }
             }
@@ -1295,6 +1298,24 @@ pub(crate) fn error_response(status: u16, message: &str) -> Response {
 }
 
 // StreamResponseAccumulator and ensure_tool_index are in accumulator.rs.
+
+/// Renders a compat conversion failure with its own HTTP status (typically
+/// 422) in the gateway's standard error envelope. `error_response` has no
+/// 422 arm, and routing these through `GatewayError::Internal` would mask
+/// the real status as 500.
+fn unprocessable_response(status: u16, message: &str) -> Response {
+    let body = serde_json::json!({
+        "error": {"code": status, "message": message, "type": "NYRO_UNPROCESSABLE_ENTITY"}
+    });
+    Response::builder()
+        .status(
+            axum::http::StatusCode::from_u16(status)
+                .unwrap_or(axum::http::StatusCode::UNPROCESSABLE_ENTITY),
+        )
+        .header(axum::http::header::CONTENT_TYPE, "application/json")
+        .body(axum::body::Body::from(body.to_string()))
+        .expect("static response build")
+}
 
 #[cfg(test)]
 mod tests {
