@@ -202,10 +202,10 @@ chmod +x nyro-server-linux-x86_64
 # 启动（仅 localhost，无需鉴权）— 默认 all 模式
 ./nyro-server-linux-x86_64
 
-# 启动（暴露到网络，必须鉴权）
+# 启动（局域网访问，强制鉴权：代理数据面 Bearer + Admin 令牌）
 ./nyro-server-linux-x86_64 \
-  --proxy-host 0.0.0.0 \
-  --admin-host 0.0.0.0 \
+  --lan \
+  --proxy-auth-key YOUR_PROXY_KEY \
   --admin-token YOUR_ADMIN_TOKEN
 
 # 仅代理模式 — 只启动 :19530，无 Admin API、无 WebUI
@@ -221,6 +221,8 @@ chmod +x nyro-server-linux-x86_64
 ./nyro-server-linux-x86_64 --config config.yaml
 ```
 
+局域网访问时，其他设备将客户端指向 `http://<主机IP>:19530`，并携带 `Authorization: Bearer YOUR_PROXY_KEY`。详见 [Server 文档](docs/server/README.md) 的「局域网访问」章节。
+
 可用服务端二进制：`linux-x86_64`、`linux-aarch64`、`macos-x86_64`、`macos-aarch64`、`windows-x86_64.exe`、`windows-arm64.exe`
 
 打开 `http://localhost:19531` 进入管理界面。详细配置参见 [Server 文档](docs/server/README.md) 和 [Standalone 文档](docs/standalone/README.md)。
@@ -235,9 +237,9 @@ make server
 docker compose up -d
 ```
 
-`make-docker.sh` 会构建 `nyro:mine` 镜像、导出 `nyro-mine.tar`，并在 `.env` 不存在时创建该私有文件及随机 `NYRO_ADMIN_TOKEN`。打开 `http://localhost:19531`，使用 `.env` 中的令牌登录。
+`make-docker.sh` 会构建 `nyro:mine` 镜像、导出 `nyro-mine.tar`，并在 `.env` 不存在时创建该私有文件及随机 `NYRO_ADMIN_TOKEN` 与 `NYRO_PROXY_AUTH_KEY`（旧 `.env` 会自动补上缺失的 key）。Docker 端口默认发布到 `0.0.0.0`（局域网可访问），因此代理数据面强制 Bearer 鉴权：客户端需携带 `Authorization: Bearer <NYRO_PROXY_AUTH_KEY>`。打开 `http://localhost:19531`，使用 `.env` 中的令牌登录。
 
-如需在另一台兼容的 Linux 主机上导入归档，请将 `compose.yaml` 放在归档旁边，创建包含强随机 `NYRO_ADMIN_TOKEN` 的 `.env`，先执行 `docker load -i nyro-mine.tar`，再执行 `docker compose up -d`。归档内是本机架构的原生二进制，因此目标主机必须使用相同的 CPU 架构。
+如需在另一台兼容的 Linux 主机上导入归档，请将 `compose.yaml` 放在归档旁边，创建包含强随机 `NYRO_ADMIN_TOKEN` 与 `NYRO_PROXY_AUTH_KEY` 的 `.env`（也可运行 `./make-docker.sh` 自动生成），先执行 `docker load -i nyro-mine.tar`，再执行 `docker compose up -d`。归档内是本机架构的原生二进制，因此目标主机必须使用相同的 CPU 架构。
 
 ### SQL 存储后端
 

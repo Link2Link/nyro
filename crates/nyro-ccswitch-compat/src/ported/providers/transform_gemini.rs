@@ -361,11 +361,59 @@ fn build_generation_config(body: &Value) -> Option<Value> {
     if let Some(value) = body.get("stop_sequences") {
         config.insert("stopSequences".to_string(), value.clone());
     }
+    if let Some(thinking_config) = anthropic_thinking_to_gemini_config(body) {
+        config.insert("thinkingConfig".to_string(), thinking_config);
+    }
 
     if config.is_empty() {
         None
     } else {
         Some(Value::Object(config))
+    }
+}
+
+/// Map the Anthropic `thinking` / `output_config.effort` directive to a Gemini
+/// `thinkingConfig`, mirroring the IR-path google encoder.
+///
+/// - Gemini 3 series use the qualitative `thinkingLevel`; an explicit
+///   `budget_tokens` is forwarded as `thinkingBudget` alongside it.
+/// - Gemini 2.5 and earlier only accept `thinkingBudget`, so only an explicit
+///   client budget is forwarded (effort tiers have no canonical budget).
+/// - `thinking.type = "disabled"` maps to `thinkingBudget: 0`.
+fn anthropic_thinking_to_gemini_config(body: &Value) -> Option<Value> {
+    let disabled = body
+        .pointer("/thinking/type")
+        .and_then(Value::as_str)
+        .is_some_and(|kind| kind == "disabled");
+    if disabled {
+        return Some(json!({"thinkingBudget": 0}));
+    }
+
+    let budget = body
+        .pointer("/thinking/budget_tokens")
+        .and_then(Value::as_u64);
+
+    let is_gemini_3 = body
+        .get("model")
+        .and_then(Value::as_str)
+        .is_some_and(is_gemini_3_series);
+    if !is_gemini_3 {
+        return budget.map(|tokens| json!({"thinkingBudget": tokens}));
+    }
+
+    let level = super::transform::resolve_reasoning_effort(body).map(|effort| match effort {
+        "low" => "low",
+        "medium" => "medium",
+        _ => "high", // high / xhigh collapse to Gemini's top tier
+    });
+
+    match (level, budget) {
+        (Some(level), Some(budget)) => Some(json!({
+            "thinkingBudget": budget,
+            "thinkingLevel": level
+        })),
+        (Some(level), None) => Some(json!({"thinkingLevel": level})),
+        (None, budget) => budget.map(|tokens| json!({"thinkingBudget": tokens})),
     }
 }
 
@@ -1288,6 +1336,61 @@ mod tests {
         assert_eq!(result["contents"][0]["role"], "user");
         assert_eq!(result["contents"][0]["parts"][0]["text"], "Hello");
         assert_eq!(result["generationConfig"]["maxOutputTokens"], 128);
+    }
+
+    #[test]
+    fn anthropic_to_gemini_gemini3_effort_maps_to_thinking_level() {
+        let input = json!({
+            "model": "gemini-3-pro",
+            "thinking": {"type": "adaptive"},
+            "output_config": {"effort": "max"},
+            "messages": [{ "role": "user", "content": "Hello" }]
+        });
+
+        let result = anthropic_to_gemini(input).unwrap();
+        assert_eq!(result["generationConfig"]["thinkingConfig"]["thinkingLevel"], "high");
+    }
+
+    #[test]
+    fn anthropic_to_gemini_gemini3_budget_kept_with_level() {
+        let input = json!({
+            "model": "gemini-3-pro",
+            "thinking": {"type": "enabled", "budget_tokens": 8192},
+            "messages": [{ "role": "user", "content": "Hello" }]
+        });
+
+        let result = anthropic_to_gemini(input).unwrap();
+        let thinking = &result["generationConfig"]["thinkingConfig"];
+        assert_eq!(thinking["thinkingBudget"], 8192);
+        // enabled + 8000-ish budget derives "medium"
+        assert_eq!(thinking["thinkingLevel"], "medium");
+    }
+
+    #[test]
+    fn anthropic_to_gemini_gemini25_budget_only_no_level() {
+        // Gemini 2.5 rejects `thinkingLevel`; only an explicit budget may pass.
+        let input = json!({
+            "model": "gemini-2.5-pro",
+            "thinking": {"type": "enabled", "budget_tokens": 8192},
+            "messages": [{ "role": "user", "content": "Hello" }]
+        });
+
+        let result = anthropic_to_gemini(input).unwrap();
+        let thinking = &result["generationConfig"]["thinkingConfig"];
+        assert_eq!(thinking["thinkingBudget"], 8192);
+        assert!(thinking.get("thinkingLevel").is_none());
+    }
+
+    #[test]
+    fn anthropic_to_gemini_disabled_thinking_zero_budget() {
+        let input = json!({
+            "model": "gemini-3-pro",
+            "thinking": {"type": "disabled"},
+            "messages": [{ "role": "user", "content": "Hello" }]
+        });
+
+        let result = anthropic_to_gemini(input).unwrap();
+        assert_eq!(result["generationConfig"]["thinkingConfig"]["thinkingBudget"], 0);
     }
 
     #[test]

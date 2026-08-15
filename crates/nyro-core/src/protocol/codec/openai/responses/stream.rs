@@ -31,6 +31,7 @@ pub struct ResponsesStreamFormatter {
     reasoning_output_index: Option<usize>,
     tool_index_map: HashMap<usize, usize>,
     tool_calls: Vec<PendingToolCall>,
+    stop_reason: String,
 }
 
 impl Default for ResponsesStreamFormatter {
@@ -55,6 +56,7 @@ impl ResponsesStreamFormatter {
             reasoning_output_index: None,
             tool_index_map: HashMap::new(),
             tool_calls: Vec::new(),
+            stop_reason: String::new(),
         }
     }
 
@@ -138,6 +140,38 @@ impl ResponsesStreamFormatter {
     fn emit_completed(&mut self) -> Vec<SseEvent> {
         let mut events = Vec::new();
 
+        // Synthesize a visible-text fallback for reasoning-only turns (Codex
+        // rejects reasoning output without a message item). Only when no real
+        // text and no tool call consumed the turn.
+        let synthesized = self.accumulated_text.is_empty()
+            && self.tool_calls.is_empty()
+            && !self.accumulated_reasoning.trim().is_empty();
+        let visible_text = if synthesized {
+            self.accumulated_reasoning.trim().to_string()
+        } else {
+            self.accumulated_text.clone()
+        };
+
+        // A message item is only present when the turn produced (real or
+        // synthesized) visible text; tool-call-only turns omit it.
+        let show_message = !visible_text.is_empty() || self.tool_calls.is_empty();
+
+        if synthesized {
+            // Clients that assemble text from deltas need the fallback text as
+            // a delta, not only in the terminal done events.
+            let delta = serde_json::json!({
+                "type": "response.output_text.delta",
+                "item_id": self.msg_id,
+                "output_index": 0,
+                "content_index": 0,
+                "delta": visible_text
+            });
+            events.push(SseEvent::new(
+                Some("response.output_text.delta"),
+                delta.to_string(),
+            ));
+        }
+
         if let (Some(item_id), Some(output_index)) =
             (&self.reasoning_item_id, self.reasoning_output_index)
         {
@@ -190,53 +224,55 @@ impl ResponsesStreamFormatter {
             ));
         }
 
-        let text_done = serde_json::json!({
-            "type": "response.output_text.done",
-            "item_id": self.msg_id,
-            "output_index": 0,
-            "content_index": 0,
-            "text": self.accumulated_text
-        });
-        events.push(SseEvent::new(
-            Some("response.output_text.done"),
-            text_done.to_string(),
-        ));
+        if show_message {
+            let text_done = serde_json::json!({
+                "type": "response.output_text.done",
+                "item_id": self.msg_id,
+                "output_index": 0,
+                "content_index": 0,
+                "text": visible_text
+            });
+            events.push(SseEvent::new(
+                Some("response.output_text.done"),
+                text_done.to_string(),
+            ));
 
-        let part_done = serde_json::json!({
-            "type": "response.content_part.done",
-            "item_id": self.msg_id,
-            "output_index": 0,
-            "content_index": 0,
-            "part": {
-                "type": "output_text",
-                "text": self.accumulated_text,
-                "annotations": []
-            }
-        });
-        events.push(SseEvent::new(
-            Some("response.content_part.done"),
-            part_done.to_string(),
-        ));
-
-        let item_done = serde_json::json!({
-            "type": "response.output_item.done",
-            "output_index": 0,
-            "item": {
-                "type": "message",
-                "id": self.msg_id,
-                "status": "completed",
-                "role": "assistant",
-                "content": [{
+            let part_done = serde_json::json!({
+                "type": "response.content_part.done",
+                "item_id": self.msg_id,
+                "output_index": 0,
+                "content_index": 0,
+                "part": {
                     "type": "output_text",
-                    "text": self.accumulated_text,
+                    "text": visible_text,
                     "annotations": []
-                }]
-            }
-        });
-        events.push(SseEvent::new(
-            Some("response.output_item.done"),
-            item_done.to_string(),
-        ));
+                }
+            });
+            events.push(SseEvent::new(
+                Some("response.content_part.done"),
+                part_done.to_string(),
+            ));
+
+            let item_done = serde_json::json!({
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": {
+                    "type": "message",
+                    "id": self.msg_id,
+                    "status": "completed",
+                    "role": "assistant",
+                    "content": [{
+                        "type": "output_text",
+                        "text": visible_text,
+                        "annotations": []
+                    }]
+                }
+            });
+            events.push(SseEvent::new(
+                Some("response.output_item.done"),
+                item_done.to_string(),
+            ));
+        }
 
         let mut output: Vec<serde_json::Value> = Vec::new();
         if let Some(item_id) = &self.reasoning_item_id {
@@ -271,27 +307,49 @@ impl ResponsesStreamFormatter {
             insert_optional_namespace(&mut item, call.namespace.as_deref());
             output.push(item);
         }
-        output.push(serde_json::json!({
-            "type": "message",
-            "id": self.msg_id,
-            "status": "completed",
-            "role": "assistant",
-            "content": [{
-                "type": "output_text",
-                "text": self.accumulated_text,
-                "annotations": []
-            }]
-        }));
+        if show_message {
+            output.push(serde_json::json!({
+                "type": "message",
+                "id": self.msg_id,
+                "status": "completed",
+                "role": "assistant",
+                "content": [{
+                    "type": "output_text",
+                    "text": visible_text,
+                    "annotations": []
+                }]
+            }));
+        }
 
-        let completed = serde_json::json!({
-            "type": "response.completed",
+        // Terminal status: truncation by token budget maps to `incomplete`
+        // with `incomplete_details.reason = "max_output_tokens"`; everything
+        // else completes normally (sub2api parity).
+        // IR stop-reason vocabulary is OpenAI-style: truncation by token budget
+        // is `length` (the Responses parser maps incomplete/max_output_tokens
+        // to it), which surfaces back as `response.incomplete`.
+        let (event_type, status, incomplete_details) = if self.stop_reason == "length" {
+            (
+                "response.incomplete",
+                "incomplete",
+                serde_json::json!({"reason": "max_output_tokens"}),
+            )
+        } else {
+            (
+                "response.completed",
+                "completed",
+                serde_json::Value::Null,
+            )
+        };
+
+        let mut completed = serde_json::json!({
+            "type": event_type,
             "response": {
                 "id": self.resp_id,
                 "object": "response",
-                "status": "completed",
+                "status": status,
                 "model": self.model,
                 "output": output,
-                "output_text": self.accumulated_text,
+                "output_text": visible_text,
                 "usage": {
                     "input_tokens": self.usage.prompt_tokens,
                     "output_tokens": self.usage.completion_tokens,
@@ -299,10 +357,10 @@ impl ResponsesStreamFormatter {
                 }
             }
         });
-        events.push(SseEvent::new(
-            Some("response.completed"),
-            completed.to_string(),
-        ));
+        if !incomplete_details.is_null() {
+            completed["response"]["incomplete_details"] = incomplete_details;
+        }
+        events.push(SseEvent::new(Some(event_type), completed.to_string()));
 
         events
     }
@@ -459,9 +517,14 @@ impl StreamResponseEncoder for ResponsesStreamFormatter {
                 AiStreamDelta::Usage(u) => {
                     self.usage.merge_partial(u);
                 }
-                AiStreamDelta::Done { .. } if !self.completed => {
-                    self.completed = true;
-                    events.extend(self.emit_completed());
+                AiStreamDelta::Done { stop_reason } => {
+                    // Record the IR stop reason so the terminal event can map
+                    // `max_tokens` → `response.incomplete`.
+                    self.stop_reason = stop_reason.clone();
+                    if !self.completed {
+                        self.completed = true;
+                        events.extend(self.emit_completed());
+                    }
                 }
                 _ => {}
             }

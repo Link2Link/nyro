@@ -1370,6 +1370,44 @@ mod tests {
     }
 
     #[test]
+    fn test_anthropic_to_responses_third_party_reasoning_effort() {
+        // Regression: GLM/DeepSeek-style upstreams were blocked by a positive
+        // model allowlist and the reasoning directive never reached the wire.
+        let input = json!({
+            "model": "glm-5.3",
+            "max_tokens": 4096,
+            "thinking": {"type": "adaptive"},
+            "output_config": {"effort": "max"},
+            "messages": [{"role": "user", "content": "Hello"}]
+        });
+
+        let result = anthropic_to_responses(input, None, false, false).unwrap();
+        assert_eq!(result["reasoning"]["effort"], "max");
+
+        let input = json!({
+            "model": "deepseek-v4-flash",
+            "max_tokens": 4096,
+            "thinking": {"type": "enabled", "budget_tokens": 20000},
+            "messages": [{"role": "user", "content": "Hello"}]
+        });
+
+        let result = anthropic_to_responses(input, None, false, false).unwrap();
+        assert_eq!(result["reasoning"]["effort"], "high");
+    }
+
+    #[test]
+    fn test_anthropic_to_responses_no_reasoning_directive_omits_field() {
+        let input = json!({
+            "model": "glm-5.3",
+            "max_tokens": 4096,
+            "messages": [{"role": "user", "content": "Hello"}]
+        });
+
+        let result = anthropic_to_responses(input, None, false, false).unwrap();
+        assert!(result.get("reasoning").is_none());
+    }
+
+    #[test]
     fn test_anthropic_to_responses_image() {
         let input = json!({
             "model": "gpt-4o",
@@ -1901,7 +1939,7 @@ mod tests {
     }
 
     #[test]
-    fn test_responses_output_config_max_sets_reasoning_xhigh() {
+    fn test_responses_output_config_max_passes_through() {
         let input = json!({
             "model": "gpt-5.4",
             "max_tokens": 1024,
@@ -1910,7 +1948,7 @@ mod tests {
         });
 
         let result = anthropic_to_responses(input, None, false, false).unwrap();
-        assert_eq!(result["reasoning"]["effort"], "xhigh");
+        assert_eq!(result["reasoning"]["effort"], "max");
     }
 
     #[test]
@@ -1967,7 +2005,7 @@ mod tests {
     }
 
     #[test]
-    fn test_responses_thinking_adaptive_sets_reasoning_xhigh() {
+    fn test_responses_thinking_adaptive_sets_reasoning_max() {
         let input = json!({
             "model": "gpt-5.4",
             "max_tokens": 1024,
@@ -1976,7 +2014,7 @@ mod tests {
         });
 
         let result = anthropic_to_responses(input, None, false, false).unwrap();
-        assert_eq!(result["reasoning"]["effort"], "xhigh");
+        assert_eq!(result["reasoning"]["effort"], "max");
     }
 
     #[test]

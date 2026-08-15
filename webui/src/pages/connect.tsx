@@ -526,7 +526,16 @@ export default function ConnectPage() {
     selectedRoute?.enable_auth ? selectedApiKey?.key ?? UNSELECTED_KEY_PLACEHOLDER : OPTIONAL_KEY_PLACEHOLDER;
   const proxyPort = status?.proxy_port;
   const hasProxyPort = typeof proxyPort === "number" && Number.isFinite(proxyPort) && proxyPort > 0;
-  const host = hasProxyPort ? `http://localhost:${proxyPort}` : "http://localhost:<proxy-port>";
+  // Show the actual bind host (e.g. a LAN address when the server runs with
+  // --lan) instead of hard-coding localhost; loopback binds stay "localhost".
+  const statusProxyHost = status?.proxy_host;
+  const proxyHostName =
+    typeof statusProxyHost === "string" && statusProxyHost.trim().length > 0
+      ? statusProxyHost.trim()
+      : "localhost";
+  const proxyDisplayHost =
+    proxyHostName === "127.0.0.1" || proxyHostName === "::1" ? "localhost" : proxyHostName;
+  const host = hasProxyPort ? `http://${proxyDisplayHost}:${proxyPort}` : "http://localhost:<proxy-port>";
   const codeModel = selectedRoute?.name ?? "gpt-4o";
   const codeRouteType: RouteKind = "chat";
   const codeProtocol = selectedCodeProtocol;

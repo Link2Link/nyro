@@ -164,3 +164,112 @@ fn hex_encode(bytes: &[u8]) -> String {
     }
     s
 }
+
+/// Derive the reasoning-effort label that was actually sent to the upstream
+/// from the encoded upstream request body.
+///
+/// Recognizes the wire shapes produced by every egress codec / compat
+/// transform, checked from most to least specific:
+/// - OpenAI Chat top-level `reasoning_effort`
+/// - OpenAI Responses / OpenRouter `reasoning.effort`
+/// - Zhipu-style `output_config.effort`
+/// - Gemini `generationConfig.thinkingConfig.thinkingLevel`
+/// - Anthropic / DeepSeek `thinking` (`budget_tokens` preferred, else the
+///   `type` discriminator so adaptive/enabled/disabled stays distinguishable)
+pub(crate) fn upstream_reasoning_effort(body: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(body).ok()?;
+    let labelled = value
+        .get("reasoning_effort")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+        .or_else(|| {
+            value
+                .pointer("/reasoning/effort")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
+        .or_else(|| {
+            value
+                .pointer("/output_config/effort")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
+        .or_else(|| {
+            value
+                .pointer("/generationConfig/thinkingConfig/thinkingLevel")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
+        .or_else(|| {
+            value.get("thinking").and_then(|thinking| {
+                thinking
+                    .get("budget_tokens")
+                    .and_then(serde_json::Value::as_u64)
+                    .map(|tokens| format!("budget:{tokens}"))
+                    .or_else(|| {
+                        thinking
+                            .get("type")
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::to_string)
+                    })
+            })
+        });
+    labelled.filter(|label| !label.trim().is_empty())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::upstream_reasoning_effort;
+
+    #[test]
+    fn reads_openai_chat_top_level_effort() {
+        let body = r#"{"model":"deepseek-v4-flash","reasoning_effort":"high","messages":[]}"#;
+        assert_eq!(upstream_reasoning_effort(body).as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn reads_responses_and_openrouter_reasoning_effort() {
+        let body = r#"{"model":"glm-5.3","reasoning":{"effort":"xhigh"},"input":[]}"#;
+        assert_eq!(upstream_reasoning_effort(body).as_deref(), Some("xhigh"));
+    }
+
+    #[test]
+    fn reads_output_config_effort() {
+        let body = r#"{"model":"glm-5.3","output_config":{"effort":"max"}}"#;
+        assert_eq!(upstream_reasoning_effort(body).as_deref(), Some("max"));
+    }
+
+    #[test]
+    fn reads_gemini_thinking_level() {
+        let body =
+            r#"{"contents":[],"generationConfig":{"thinkingConfig":{"thinkingLevel":"high"}}}"#;
+        assert_eq!(upstream_reasoning_effort(body).as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn reads_anthropic_thinking_budget_before_type() {
+        let body = r#"{"model":"claude","thinking":{"type":"enabled","budget_tokens":16384}}"#;
+        assert_eq!(
+            upstream_reasoning_effort(body).as_deref(),
+            Some("budget:16384")
+        );
+    }
+
+    #[test]
+    fn reads_anthropic_thinking_type_without_budget() {
+        let body = r#"{"model":"glm","thinking":{"type":"adaptive"}}"#;
+        assert_eq!(upstream_reasoning_effort(body).as_deref(), Some("adaptive"));
+    }
+
+    #[test]
+    fn no_reasoning_directive_yields_none() {
+        let body = r#"{"model":"deepseek-v4-flash","messages":[{"role":"user","content":"hi"}]}"#;
+        assert!(upstream_reasoning_effort(body).is_none());
+    }
+
+    #[test]
+    fn invalid_json_yields_none() {
+        assert!(upstream_reasoning_effort("not json").is_none());
+        assert!(upstream_reasoning_effort("").is_none());
+    }
+}

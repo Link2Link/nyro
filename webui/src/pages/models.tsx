@@ -50,8 +50,8 @@ const emptyCreate: ModelForm = {
   name: "",
   balance: "weighted",
   targets: [{ provider_id: "", model: "", weight: 100, priority: 1 }],
-  enable_auth: false,
-  enable_payload: false,
+  enable_auth: true,
+  enable_payload: true,
 };
 
 function FieldLabel({ children }: { children: string }) {

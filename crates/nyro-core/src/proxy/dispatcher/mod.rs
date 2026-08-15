@@ -34,10 +34,13 @@ use self::util::*;
 use std::sync::Arc;
 use std::time::Instant;
 
+use axum::body::Body;
 use axum::http::HeaderMap;
 use axum::response::Response;
 use bytes::Bytes;
+use futures::StreamExt;
 use serde_json::Value;
+use tokio_stream::wrappers::ReceiverStream;
 
 use crate::Gateway;
 use crate::db::models::Provider;
@@ -58,6 +61,147 @@ use crate::proxy::context::{ContextBag, RequestContext};
 use crate::proxy::observability::{LogExtras, send_log};
 use crate::proxy::planner::{ProtocolMode, negotiate};
 use crate::router::TargetSelector;
+use crate::router::health::HealthPermit;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum HealthOutcome {
+    Success,
+    Failure,
+    Neutral,
+    Deferred,
+}
+
+pub(super) fn health_outcome_from_status(status: u16) -> HealthOutcome {
+    if status < 400 {
+        HealthOutcome::Success
+    } else if is_health_failure(status) {
+        HealthOutcome::Failure
+    } else {
+        HealthOutcome::Neutral
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct LocalHealthNeutral;
+
+fn health_outcome_from_response(response: &Response) -> HealthOutcome {
+    if response.extensions().get::<LocalHealthNeutral>().is_some() {
+        HealthOutcome::Neutral
+    } else {
+        health_outcome_from_status(response.status().as_u16())
+    }
+}
+
+fn defer_stream_health(
+    response: Response,
+    ingress: ProtocolId,
+    req_ctx: &RequestContext,
+    health_permit: HealthPermit,
+) -> Response {
+    let (parts, body) = response.into_parts();
+    let mut body = body.into_data_stream();
+    let mut parser = ingress.handler().make_stream_response_decoder();
+    let deadline = req_ctx.deadline.clone();
+    let (tx, rx) = tokio::sync::mpsc::channel(1);
+
+    tokio::spawn(async move {
+        let mut completed = false;
+        let mut failed = false;
+        loop {
+            let item = tokio::select! {
+                biased;
+                _ = tx.closed() => {
+                    if failed {
+                        health_permit.failure();
+                    } else {
+                        health_permit.neutral();
+                    }
+                    return;
+                }
+                _ = tokio::time::sleep(deadline.remaining()) => {
+                    health_permit.failure();
+                    return;
+                }
+                item = body.next() => item,
+            };
+            let Some(item) = item else {
+                break;
+            };
+            let bytes = match item {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    health_permit.failure();
+                    let _ = tx.send(Err(error)).await;
+                    return;
+                }
+            };
+            match parser.parse_chunk(&String::from_utf8_lossy(&bytes)) {
+                Ok(deltas) => update_stream_health_state(&deltas, &mut completed, &mut failed),
+                Err(_) => failed = true,
+            }
+            tokio::select! {
+                biased;
+                _ = tx.closed() => {
+                    if failed {
+                        health_permit.failure();
+                    } else {
+                        health_permit.neutral();
+                    }
+                    return;
+                }
+                _ = tokio::time::sleep(deadline.remaining()) => {
+                    if failed {
+                        health_permit.failure();
+                    } else {
+                        health_permit.neutral();
+                    }
+                    return;
+                }
+                result = tx.send(Ok(bytes)) => {
+                    if result.is_err() {
+                        if failed {
+                            health_permit.failure();
+                        } else {
+                            health_permit.neutral();
+                        }
+                        return;
+                    }
+                }
+            }
+        }
+        match parser.finish() {
+            Ok(deltas) => update_stream_health_state(&deltas, &mut completed, &mut failed),
+            Err(_) => failed = true,
+        }
+        if completed && !failed {
+            health_permit.success();
+        } else {
+            health_permit.failure();
+        }
+    });
+
+    Response::from_parts(parts, Body::from_stream(ReceiverStream::new(rx)))
+}
+
+fn update_stream_health_state(
+    deltas: &[crate::protocol::ir::AiStreamDelta],
+    completed: &mut bool,
+    failed: &mut bool,
+) {
+    for delta in deltas {
+        match delta {
+            crate::protocol::ir::AiStreamDelta::Done { stop_reason }
+                if !stop_reason.eq_ignore_ascii_case("error") =>
+            {
+                *completed = true;
+            }
+            crate::protocol::ir::AiStreamDelta::Done { .. }
+            | crate::protocol::ir::AiStreamDelta::StreamError { .. }
+            | crate::protocol::ir::AiStreamDelta::UnexpectedEof => *failed = true,
+            _ => {}
+        }
+    }
+}
 
 // ── Phase hook dispatch (lifecycle RFC P1-c) ────────────────────────────────────
 
@@ -81,7 +225,30 @@ async fn run_phase_hooks(
         return PhaseOutcome::Continue;
     }
     let hooks = registry.for_phase(phase);
-    run_phase_hooks_slice(&hooks, req_ctx, request, response, host).await
+    let outcome = run_phase_hooks_slice(&hooks, req_ctx, request, response, host).await;
+    normalize_phase_outcome(phase, outcome)
+}
+
+fn normalize_phase_outcome(phase: Phase, outcome: PhaseOutcome) -> PhaseOutcome {
+    if phase != Phase::OnResponse {
+        return outcome;
+    }
+    match outcome {
+        PhaseOutcome::ShortCircuit(mut response) => {
+            if is_health_failure(response.status().as_u16()) {
+                response.extensions_mut().insert(LocalHealthNeutral);
+            }
+            PhaseOutcome::ShortCircuit(response)
+        }
+        PhaseOutcome::Reject(error) => {
+            let mut response = error.render(None);
+            if is_health_failure(response.status().as_u16()) {
+                response.extensions_mut().insert(LocalHealthNeutral);
+            }
+            PhaseOutcome::ShortCircuit(response)
+        }
+        PhaseOutcome::Continue => PhaseOutcome::Continue,
+    }
 }
 
 /// Run a precomputed list of phase hooks against one [`PhaseCtx`].
@@ -248,7 +415,14 @@ async fn dispatch_pipeline_inner(
     // ── Auth ─────────────────────────────────────────────────────────────────
 
     let access_store = GatewayProxyAccessStore::new(&gw);
-    let auth_key = match authorize_model_access(&access_store, &route, &headers).await {
+    let auth_key = match authorize_model_access(
+        &access_store,
+        &route,
+        &headers,
+        gw.config.auth_key.as_deref(),
+    )
+    .await
+    {
         Ok(v) => v,
         Err(resp) => {
             let status = resp.status().as_u16() as i32;
@@ -380,9 +554,9 @@ async fn dispatch_pipeline_inner(
         };
         let egress = plan.egress;
         let target_key = format!("{}:{}:{}", target.provider_id, egress, actual_model);
-        if !gw.health_registry.is_healthy(&target_key) {
+        let Some(health_permit) = gw.health_registry.try_acquire(&target_key) else {
             continue;
-        }
+        };
 
         let mut provider_runtime = match gw.admin().resolve_provider_runtime(&provider).await {
             Ok(runtime) => runtime,
@@ -684,7 +858,8 @@ async fn dispatch_pipeline_inner(
         // `OnLog` runs once at the pipeline boundary (see `dispatch_pipeline`).
         // The handlers run the `OnResponse` phase: non-stream paths see a full
         // `AiResponse`, the streaming path is invoked per `AiStreamDelta`.
-        let (response, compat_retryable, health_managed) = if let Some(prepared) = prepared_compat {
+        let uses_compat = prepared_compat.is_some();
+        let (response, compat_retryable, health_outcome) = if let Some(prepared) = prepared_compat {
             let attempt = compat::handle_compat(
                 client,
                 &outbound.url,
@@ -695,9 +870,14 @@ async fn dispatch_pipeline_inner(
                 ctx,
                 &mut request_for_target,
                 host,
+                health_permit.clone(),
             )
             .await;
-            (attempt.response, attempt.retryable, attempt.health_managed)
+            (
+                attempt.response,
+                attempt.force_retry,
+                attempt.health_outcome,
+            )
         } else {
             let response = if is_stream {
                 handle_stream(
@@ -744,21 +924,34 @@ async fn dispatch_pipeline_inner(
                 )
                 .await
             };
-            (response, false, false)
+            let health_outcome = health_outcome_from_response(&response);
+            (response, false, health_outcome)
         };
 
         let status = response.status().as_u16();
+        let defer_native_stream_health =
+            !uses_compat && is_stream && health_outcome == HealthOutcome::Success;
+        let response = if defer_native_stream_health {
+            defer_stream_health(response, ingress, ctx, health_permit.clone())
+        } else {
+            response
+        };
+        let health_outcome = if defer_native_stream_health {
+            HealthOutcome::Deferred
+        } else {
+            health_outcome
+        };
+        match health_outcome {
+            HealthOutcome::Success => health_permit.success(),
+            HealthOutcome::Failure => health_permit.failure(),
+            HealthOutcome::Neutral => health_permit.neutral(),
+            HealthOutcome::Deferred => drop(health_permit),
+        }
         if status < 400 {
-            if !health_managed {
-                gw.health_registry.record_success(&target_key);
-            }
             let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
             TargetSelector::record_selected(&route.balance, &target_key);
             TargetSelector::record_latency(&route.balance, &target_key, elapsed_ms);
             return response;
-        }
-        if !health_managed {
-            gw.health_registry.record_failure(&target_key);
         }
         if compat_retryable || is_retryable(status) {
             last_response = Some(response);
@@ -876,7 +1069,8 @@ struct LogBuilder {
     model_name: Option<String>,
     is_stream: bool,
     enable_payload: Option<bool>,
-    /// Client-requested reasoning effort snapshot (payload-independent).
+    /// Client-requested reasoning effort snapshot; only a fallback for `emit`,
+    /// which prefers the effort actually sent on the upstream wire.
     reasoning_effort: Option<String>,
     start: Instant,
     client_status_code: i32,
@@ -1054,9 +1248,21 @@ impl LogBuilder {
         self
     }
 
+    /// Reasoning effort as sent on the upstream wire, derived from the encoded
+    /// upstream request body; falls back to the client-requested snapshot when
+    /// no upstream body was recorded (early failures, payload disabled).
+    fn resolve_reasoning_effort(&self) -> Option<String> {
+        self.extras
+            .upstream_request_body
+            .as_deref()
+            .and_then(crate::proxy::observability::upstream_reasoning_effort)
+            .or_else(|| self.reasoning_effort.clone())
+    }
+
     fn emit(self) {
         use crate::logging::LogEntry;
         let latency_total_ms = self.start.elapsed().as_millis() as i64;
+        let reasoning_effort = self.resolve_reasoning_effort();
         // OnResponse → ctx: mirror the final metrics into a single canonical
         // snapshot so OnLog (and OnLogHook) read consistent values.
         if let Some(ext) = &self.ext {
@@ -1082,7 +1288,7 @@ impl LogBuilder {
             upstream_url: self.extras.upstream_url,
             client_model: self.client_model,
             upstream_model: self.upstream_model,
-            reasoning_effort: self.reasoning_effort,
+            reasoning_effort,
             method: self.extras.method,
             path: self.extras.path,
             client_request_headers: self.extras.client_request_headers,
@@ -1294,7 +1500,11 @@ pub(crate) fn error_response(status: u16, message: &str) -> Response {
             source: anyhow::anyhow!("{}", message),
         },
     };
-    err.render(None)
+    let mut response = err.render(None);
+    if status == 500 {
+        response.extensions_mut().insert(LocalHealthNeutral);
+    }
+    response
 }
 
 // StreamResponseAccumulator and ensure_tool_index are in accumulator.rs.
@@ -1328,7 +1538,7 @@ mod tests {
     use crate::protocol::ir::{AiRequest, AiResponse, RawEnvelope};
     use async_trait::async_trait;
     use axum::http::{HeaderMap, StatusCode};
-    use axum::response::IntoResponse;
+    use axum::response::{IntoResponse, Response};
     use serde_json::Value;
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -1548,6 +1758,210 @@ mod tests {
             }
             PhaseOutcome::Continue
         }
+    }
+
+    #[test]
+    fn local_server_errors_are_neutral_for_provider_health() {
+        let local = super::error_response(500, "local parse error");
+        let upstream = axum::response::IntoResponse::into_response((
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "upstream error",
+        ));
+
+        assert_eq!(
+            super::health_outcome_from_response(&local),
+            super::HealthOutcome::Neutral
+        );
+        assert_eq!(
+            super::health_outcome_from_response(&upstream),
+            super::HealthOutcome::Failure
+        );
+    }
+
+    #[test]
+    fn on_response_hook_errors_are_neutral_for_provider_health() {
+        let short_circuit = super::normalize_phase_outcome(
+            Phase::OnResponse,
+            PhaseOutcome::ShortCircuit(
+                (StatusCode::BAD_GATEWAY, "hook short circuit").into_response(),
+            ),
+        );
+        let PhaseOutcome::ShortCircuit(short_circuit) = short_circuit else {
+            panic!("short circuit should remain a response");
+        };
+        assert_eq!(
+            super::health_outcome_from_response(&short_circuit),
+            super::HealthOutcome::Neutral
+        );
+
+        let reject = super::normalize_phase_outcome(
+            Phase::OnResponse,
+            PhaseOutcome::Reject(crate::error::GatewayError::ProviderUnavailable {
+                provider: "hook".to_string(),
+                reason: "local rejection".to_string(),
+            }),
+        );
+        let PhaseOutcome::ShortCircuit(reject) = reject else {
+            panic!("reject should render as a response");
+        };
+        assert_eq!(
+            super::health_outcome_from_response(&reject),
+            super::HealthOutcome::Neutral
+        );
+
+        let upstream_phase = super::normalize_phase_outcome(
+            Phase::OnUpstream,
+            PhaseOutcome::ShortCircuit(
+                (StatusCode::BAD_GATEWAY, "upstream phase response").into_response(),
+            ),
+        );
+        let PhaseOutcome::ShortCircuit(upstream_phase) = upstream_phase else {
+            panic!("short circuit should remain a response");
+        };
+        assert_eq!(
+            super::health_outcome_from_response(&upstream_phase),
+            super::HealthOutcome::Failure
+        );
+    }
+
+    #[tokio::test]
+    async fn complete_native_stream_resets_provider_health() {
+        let registry = Arc::new(crate::router::health::HealthRegistry::new());
+        let health_key = "native-stream-success";
+        registry.try_acquire(health_key).unwrap().failure();
+        registry.try_acquire(health_key).unwrap().failure();
+        let permit = registry.try_acquire(health_key).unwrap();
+        let ctx = crate::proxy::context::RequestContext::new(
+            OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1,
+            std::time::Duration::from_secs(30),
+        );
+        let sse = concat!(
+            "data: {\"id\":\"chatcmpl-health\",\"model\":\"test\",\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let response = Response::builder()
+            .status(StatusCode::OK)
+            .body(axum::body::Body::from(sse))
+            .unwrap();
+
+        let response = super::defer_stream_health(
+            response,
+            OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1,
+            &ctx,
+            permit,
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(body.as_ref(), sse.as_bytes());
+
+        registry.try_acquire(health_key).unwrap().failure();
+        registry.try_acquire(health_key).unwrap().failure();
+        assert!(registry.try_acquire(health_key).is_some());
+    }
+
+    #[tokio::test]
+    async fn truncated_native_stream_fails_provider_health() {
+        let registry = Arc::new(crate::router::health::HealthRegistry::new());
+        let health_key = "native-stream-truncated";
+        registry.try_acquire(health_key).unwrap().failure();
+        registry.try_acquire(health_key).unwrap().failure();
+        let permit = registry.try_acquire(health_key).unwrap();
+        let ctx = crate::proxy::context::RequestContext::new(
+            OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1,
+            std::time::Duration::from_secs(30),
+        );
+        let partial = "data: {\"id\":\"chatcmpl-health\",\"model\":\"test\",\"choices\":[{\"delta\":{\"content\":\"partial\"},\"finish_reason\":null}]}\n\n";
+        let response = Response::builder()
+            .status(StatusCode::OK)
+            .body(axum::body::Body::from(partial))
+            .unwrap();
+
+        let response = super::defer_stream_health(
+            response,
+            OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1,
+            &ctx,
+            permit,
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(body.as_ref(), partial.as_bytes());
+        assert!(!registry.is_healthy(health_key));
+        assert!(registry.try_acquire(health_key).is_none());
+    }
+
+    #[tokio::test]
+    async fn hanging_native_stream_deadline_fails_provider_health() {
+        let registry = Arc::new(crate::router::health::HealthRegistry::new());
+        let health_key = "native-stream-deadline";
+        registry.try_acquire(health_key).unwrap().failure();
+        registry.try_acquire(health_key).unwrap().failure();
+        let permit = registry.try_acquire(health_key).unwrap();
+        let ctx = crate::proxy::context::RequestContext::new(
+            OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1,
+            std::time::Duration::from_millis(20),
+        );
+        let pending = futures::stream::pending::<Result<bytes::Bytes, std::convert::Infallible>>();
+        let response = Response::builder()
+            .status(StatusCode::OK)
+            .body(axum::body::Body::from_stream(pending))
+            .unwrap();
+
+        let response = super::defer_stream_health(
+            response,
+            OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1,
+            &ctx,
+            permit,
+        );
+        let body = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            axum::body::to_bytes(response.into_body(), usize::MAX),
+        )
+        .await
+        .expect("response body should close at the request deadline")
+        .unwrap();
+        assert!(body.is_empty());
+        assert!(!registry.is_healthy(health_key));
+        assert!(registry.try_acquire(health_key).is_none());
+    }
+
+    #[tokio::test]
+    async fn dropped_native_stream_response_is_neutral_for_provider_health() {
+        let registry = Arc::new(crate::router::health::HealthRegistry::new());
+        let health_key = "native-stream-client-disconnect";
+        registry.try_acquire(health_key).unwrap().failure();
+        registry.try_acquire(health_key).unwrap().failure();
+        let permit = registry.try_acquire(health_key).unwrap();
+        let ctx = crate::proxy::context::RequestContext::new(
+            OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1,
+            std::time::Duration::from_secs(30),
+        );
+        let (source_tx, source_rx) = tokio::sync::mpsc::channel(1);
+        source_tx
+            .send(Ok::<_, std::convert::Infallible>(bytes::Bytes::from_static(
+                b"data: {\"id\":\"chatcmpl-health\",\"model\":\"test\",\"choices\":[{\"delta\":{\"content\":\"partial\"},\"finish_reason\":null}]}\n\n",
+            )))
+            .await
+            .unwrap();
+        let response = Response::builder()
+            .status(StatusCode::OK)
+            .body(axum::body::Body::from_stream(
+                tokio_stream::wrappers::ReceiverStream::new(source_rx),
+            ))
+            .unwrap();
+
+        let response = super::defer_stream_health(
+            response,
+            OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1,
+            &ctx,
+            permit,
+        );
+        drop(response);
+        tokio::time::timeout(std::time::Duration::from_secs(1), source_tx.closed())
+            .await
+            .expect("dropping the client body should stop the observer");
+        assert!(registry.try_acquire(health_key).is_some());
     }
 
     #[tokio::test]

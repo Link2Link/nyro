@@ -39,11 +39,22 @@ pub async fn models_list(State(gw): State<Gateway>, headers: HeaderMap) -> Respo
         }
     }
 
+    // The gateway key (NYRO_PROXY_AUTH_KEY) is a master key: it sees every model.
+    let master_key = gw
+        .config
+        .auth_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|k| !k.is_empty());
+    let is_master = extract_api_key(&headers)
+        .map(|token| master_key == Some(token.as_str()))
+        .unwrap_or(false);
+
     let cache = gw.model_cache.read().await;
     let models = cache
         .models
         .iter()
-        .filter(|model| !model.enable_auth || accessible_route_ids.contains(&model.id))
+        .filter(|model| is_master || !model.enable_auth || accessible_route_ids.contains(&model.id))
         .map(|model| model.name.trim())
         .filter(|model| !model.is_empty())
         .map(ToString::to_string)

@@ -7,6 +7,7 @@ use axum::routing::{get, post};
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use tower_http::trace::TraceLayer;
 
+use super::auth::{ProxyAuth, bearer_auth};
 use super::context::inject_context;
 use super::handler;
 use super::ingress;
@@ -16,7 +17,7 @@ use crate::Gateway;
 pub(crate) const PROXY_JSON_BODY_LIMIT_BYTES: usize = 100 * 1024 * 1024;
 
 pub fn create_router(gateway: Gateway) -> Router {
-    let router = Router::new()
+    let api = Router::new()
         .route(
             "/v1/chat/completions",
             post(ingress::openai_compatible::chat_completions::handler),
@@ -37,7 +38,29 @@ pub fn create_router(gateway: Gateway) -> Router {
             "/v1beta/models/:model_action",
             post(ingress::google_generative::generate_content::handler),
         )
-        .route("/v1/models", get(handler::models_list))
+        .route("/v1/models", get(handler::models_list));
+
+    // Global proxy auth: when `auth_key` is configured, every data-plane route
+    // requires `Authorization: Bearer <auth_key>`. Health endpoints stay open
+    // (they are merged in below, outside the auth layer) so load balancers and
+    // uptime probes keep working without a key.
+    let api = match gateway.config.auth_key.as_deref().map(str::trim) {
+        Some(key) if !key.is_empty() => {
+            let auth = ProxyAuth {
+                gateway_key: key.to_string(),
+                storage: gateway.storage.clone(),
+            };
+            api.route_layer(middleware::from_fn(
+                move |mut request: axum::extract::Request, next: middleware::Next| {
+                    request.extensions_mut().insert(auth.clone());
+                    bearer_auth(request, next)
+                },
+            ))
+        }
+        _ => api,
+    };
+
+    let router = api
         .route("/health", get(health))
         .route("/healthz", get(health))
         .route("/readyz", get(readyz))
@@ -184,5 +207,80 @@ mod tests {
             reqwest::StatusCode::PAYLOAD_TOO_LARGE,
             "proxy must not reject large Gemini JSON bodies with axum's default 2 MiB limit"
         );
+    }
+
+    async fn spawn_proxy_with_auth(auth_key: &str) -> String {
+        let config = GatewayConfig {
+            data_dir: std::env::temp_dir().join(format!(
+                "nyro-proxy-auth-test-{}",
+                uuid::Uuid::new_v4()
+            )),
+            auth_key: Some(auth_key.to_string()),
+            ..Default::default()
+        };
+        let (gateway, _log_rx) = Gateway::new(config).await.expect("gateway init");
+        let app = create_router(gateway);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test proxy");
+        let addr = listener.local_addr().expect("test proxy address");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn proxy_with_auth_key_rejects_missing_or_wrong_bearer() {
+        let base_url = spawn_proxy_with_auth("secret-key").await;
+
+        // No Authorization header → 401.
+        let no_auth = reqwest::Client::new()
+            .post(format!("{base_url}/v1/chat/completions"))
+            .json(&serde_json::json!({"model": "gpt-4o", "messages": []}))
+            .send()
+            .await
+            .expect("proxy response");
+        assert_eq!(no_auth.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+        // Wrong token → 401.
+        let wrong = reqwest::Client::new()
+            .post(format!("{base_url}/v1/chat/completions"))
+            .bearer_auth("not-the-key")
+            .json(&serde_json::json!({"model": "gpt-4o", "messages": []}))
+            .send()
+            .await
+            .expect("proxy response");
+        assert_eq!(wrong.status(), reqwest::StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn proxy_with_auth_key_passes_correct_bearer() {
+        let base_url = spawn_proxy_with_auth("secret-key").await;
+
+        let ok = reqwest::Client::new()
+            .post(format!("{base_url}/v1/chat/completions"))
+            .bearer_auth("secret-key")
+            .json(&serde_json::json!({"model": "gpt-4o", "messages": []}))
+            .send()
+            .await
+            .expect("proxy response");
+
+        // The unconfigured model route 404s downstream; the point is that auth
+        // no longer blocks the request (any non-401 means the key was accepted).
+        assert_ne!(ok.status(), reqwest::StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn proxy_health_stays_open_when_auth_key_set() {
+        let base_url = spawn_proxy_with_auth("secret-key").await;
+
+        let health = reqwest::Client::new()
+            .get(format!("{base_url}/health"))
+            .send()
+            .await
+            .expect("health response");
+        assert_eq!(health.status(), reqwest::StatusCode::OK);
     }
 }

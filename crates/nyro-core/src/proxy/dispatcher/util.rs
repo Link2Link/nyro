@@ -39,7 +39,11 @@ pub(super) async fn load_model_backends(gw: &Gateway, model: &Model) -> Vec<Mode
 // ── Retry ─────────────────────────────────────────────────────────────────────
 
 pub(super) fn is_retryable(status: u16) -> bool {
-    matches!(status, 408 | 429 | 500 | 502 | 503 | 529)
+    matches!(status, 408 | 429 | 500 | 502 | 503 | 504 | 529)
+}
+
+pub(super) fn is_health_failure(status: u16) -> bool {
+    is_retryable(status)
 }
 
 // ── Runtime-binding extra headers ─────────────────────────────────────────────
@@ -148,6 +152,18 @@ mod tests {
     use axum::http::{HeaderMap, HeaderValue};
 
     use super::*;
+
+    #[test]
+    fn health_failures_exclude_request_scoped_errors() {
+        for status in [400, 401, 403, 404, 409, 413, 422] {
+            assert!(!is_retryable(status), "status {status}");
+            assert!(!is_health_failure(status), "status {status}");
+        }
+        for status in [408, 429, 500, 502, 503, 504, 529] {
+            assert!(is_retryable(status), "status {status}");
+            assert!(is_health_failure(status), "status {status}");
+        }
+    }
 
     #[test]
     fn forwarded_client_headers_keep_cache_hints() {

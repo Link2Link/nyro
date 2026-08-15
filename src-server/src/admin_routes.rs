@@ -654,6 +654,7 @@ async fn set_setting(
 async fn get_status(State(gw): State<Gateway>) -> impl IntoResponse {
     Json(serde_json::json!({
         "status": "running",
+        "proxy_host": gw.config.proxy_host,
         "proxy_port": gw.config.proxy_port,
     }))
 }

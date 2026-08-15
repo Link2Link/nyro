@@ -26,13 +26,16 @@ use crate::protocol::ids::{
 use crate::protocol::ir::{AiRequest, Usage};
 use crate::proxy::client::{MAX_UPSTREAM_RESPONSE_BODY_BYTES, ProxyClient, RawUpstreamResponse};
 use crate::proxy::context::RequestContext;
+use crate::router::health::HealthPermit;
 
-use super::{CallCtx, LogBuilder, RequestExtras, error_response};
+use super::{
+    CallCtx, HealthOutcome, LogBuilder, RequestExtras, error_response, health_outcome_from_status,
+};
 
 pub(super) struct CompatAttempt {
     pub response: Response,
-    pub retryable: bool,
-    pub health_managed: bool,
+    pub force_retry: bool,
+    pub health_outcome: HealthOutcome,
 }
 
 type UpstreamByteStream =
@@ -366,6 +369,7 @@ pub(super) async fn handle_compat(
     req_ctx: &mut RequestContext,
     req_ir: &mut AiRequest,
     host: &crate::plugin::phase::HostContext<'_>,
+    health_permit: HealthPermit,
 ) -> CompatAttempt {
     let log = LogBuilder::from_ctx(call_ctx)
         .with_req_extras(req_extras)
@@ -404,8 +408,8 @@ pub(super) async fn handle_compat(
                 .emit();
             return CompatAttempt {
                 response,
-                retryable: true,
-                health_managed: false,
+                force_retry: true,
+                health_outcome: HealthOutcome::Failure,
             };
         }
     };
@@ -436,8 +440,8 @@ pub(super) async fn handle_compat(
                     .emit();
                 return CompatAttempt {
                     response: error_response(502, &message),
-                    retryable: true,
-                    health_managed: false,
+                    force_retry: true,
+                    health_outcome: HealthOutcome::Failure,
                 };
             }
         };
@@ -490,8 +494,8 @@ pub(super) async fn handle_compat(
                 .emit();
             return CompatAttempt {
                 response,
-                retryable: true,
-                health_managed: false,
+                force_retry: true,
+                health_outcome: HealthOutcome::Failure,
             };
         }
     };
@@ -534,8 +538,8 @@ pub(super) async fn handle_compat(
                 .emit();
             return CompatAttempt {
                 response,
-                retryable: true,
-                health_managed: false,
+                force_retry: true,
+                health_outcome: HealthOutcome::Neutral,
             };
         }
     };
@@ -552,6 +556,7 @@ pub(super) async fn handle_compat(
         call_ctx,
         req_ctx,
         req_ir,
+        health_permit,
     )
 }
 
@@ -589,8 +594,8 @@ async fn handle_buffered_compat(
                 .emit();
             return CompatAttempt {
                 response: error_response(502, &message),
-                retryable: true,
-                health_managed: false,
+                force_retry: true,
+                health_outcome: HealthOutcome::Failure,
             };
         }
     };
@@ -616,8 +621,8 @@ async fn handle_buffered_compat(
                 ResponseMetadata::new(422).rebuilt("application/json"),
                 Body::from(client_body),
             ),
-            retryable: true,
-            health_managed: false,
+            force_retry: true,
+            health_outcome: HealthOutcome::Failure,
         };
     }
 
@@ -627,6 +632,7 @@ async fn handle_buffered_compat(
         // nonstandard upstream bodies normalized); other clients keep the
         // upstream body as-is. Retryability is decided by the outer loop's
         // `is_retryable(status)`.
+        let health_outcome = health_outcome_from_status(metadata.status);
         if let Some(client_body) = codex_ingress_error_body(
             session,
             call_ctx,
@@ -653,14 +659,14 @@ async fn handle_buffered_compat(
                     metadata.rebuilt("application/json"),
                     Body::from(client_body),
                 ),
-                retryable: false,
-                health_managed: false,
+                force_retry: false,
+                health_outcome,
             };
         }
         return CompatAttempt {
             response: build_compat_response(metadata, Body::from(body)),
-            retryable: false,
-            health_managed: false,
+            force_retry: false,
+            health_outcome,
         };
     }
 
@@ -684,8 +690,8 @@ async fn handle_buffered_compat(
                 .emit();
             return CompatAttempt {
                 response: compat_error_response(status, &message),
-                retryable: true,
-                health_managed: false,
+                force_retry: true,
+                health_outcome: HealthOutcome::Neutral,
             };
         }
     };
@@ -699,8 +705,8 @@ async fn handle_buffered_compat(
         let message = "compat buffered conversion returned a stream";
         return CompatAttempt {
             response: compat_error_response(500, message),
-            retryable: true,
-            health_managed: false,
+            force_retry: true,
+            health_outcome: HealthOutcome::Neutral,
         };
     };
 
@@ -712,8 +718,8 @@ async fn handle_buffered_compat(
             BufferedHookResult::Override(response) => {
                 return CompatAttempt {
                     response,
-                    retryable: false,
-                    health_managed: false,
+                    force_retry: false,
+                    health_outcome: HealthOutcome::Neutral,
                 };
             }
         };
@@ -733,8 +739,8 @@ async fn handle_buffered_compat(
 
     CompatAttempt {
         response: build_compat_response(metadata, Body::from(body)),
-        retryable: false,
-        health_managed: false,
+        force_retry: false,
+        health_outcome: HealthOutcome::Success,
     }
 }
 
@@ -910,6 +916,7 @@ fn build_streaming_compat_response(
     call_ctx: &CallCtx<'_>,
     req_ctx: &RequestContext,
     req_ir: &AiRequest,
+    health_permit: HealthPermit,
 ) -> CompatAttempt {
     let ConvertedResponse {
         metadata,
@@ -920,8 +927,8 @@ fn build_streaming_compat_response(
         let message = "compat streaming conversion returned a buffered body";
         return CompatAttempt {
             response: compat_error_response(500, message),
-            retryable: true,
-            health_managed: false,
+            force_retry: true,
+            health_outcome: HealthOutcome::Neutral,
         };
     };
 
@@ -930,10 +937,6 @@ fn build_streaming_compat_response(
     let client_protocol = call_ctx.ingress;
     let actual_model = call_ctx.actual_model.to_string();
     let request_context = req_ctx.clone();
-    let health_key = format!(
-        "{}:{}:{}",
-        call_ctx.provider.id, call_ctx.egress, call_ctx.actual_model
-    );
     let gateway = call_ctx.gw.clone();
     let on_response_hooks = crate::plugin::phase::PhaseHookRegistry::global()
         .for_phase(crate::plugin::phase::Phase::OnResponse);
@@ -961,9 +964,29 @@ fn build_streaming_compat_response(
         let mut client_body = Vec::new();
         let mut chunks = 0_i32;
         let mut stream_error = None;
-        let mut client_disconnected = false;
+        let mut upstream_ended = false;
 
-        while let Some(item) = stream.next().await {
+        loop {
+            let item = tokio::select! {
+                biased;
+                _ = tx.closed() => {
+                    request_context.cancellation.cancel();
+                    let _ = bridge.push_chunk(Ok(()));
+                    stream_error = Some("client disconnected".to_string());
+                    break;
+                }
+                _ = tokio::time::sleep(request_context.deadline.remaining()) => {
+                    let message = "upstream stream deadline exceeded".to_string();
+                    let _ = bridge.push_chunk(Err(crate::proxy::stream::StreamFailure::Timeout));
+                    stream_error = Some(message);
+                    break;
+                }
+                item = stream.next() => item,
+            };
+            let Some(item) = item else {
+                upstream_ended = true;
+                break;
+            };
             let bytes = match item {
                 Ok(bytes) => bytes,
                 Err(error) => {
@@ -1005,8 +1028,13 @@ fn build_streaming_compat_response(
                 bytes
             };
             client_body.extend_from_slice(&outgoing);
-            if tx.send(Ok(outgoing)).await.is_err() {
-                client_disconnected = true;
+            let sent = tokio::select! {
+                biased;
+                _ = tx.closed() => false,
+                _ = tokio::time::sleep(request_context.deadline.remaining()) => false,
+                result = tx.send(Ok(outgoing)) => result.is_ok(),
+            };
+            if !sent {
                 request_context.cancellation.cancel();
                 let _ = bridge.push_chunk(Ok(()));
                 stream_error = Some("client disconnected".to_string());
@@ -1041,32 +1069,51 @@ fn build_streaming_compat_response(
                         .collect::<String>(),
                 );
                 client_body.extend_from_slice(&outgoing);
-                if tx.send(Ok(outgoing)).await.is_ok() {
+                let sent = tokio::select! {
+                    biased;
+                    _ = tx.closed() => false,
+                    _ = tokio::time::sleep(request_context.deadline.remaining()) => false,
+                    result = tx.send(Ok(outgoing)) => result.is_ok(),
+                };
+                if sent {
                     chunks += 1;
+                } else {
+                    request_context.cancellation.cancel();
+                    let _ = bridge.push_chunk(Ok(()));
+                    stream_error = Some("client disconnected".to_string());
                 }
             }
         }
 
-        if client_disconnected {
-            // Client disconnect is neutral for provider health; StreamBridge has
-            // already recorded ClientCancelled/PartialSuccess.
-        } else if stream_error.is_none() && terminal.error.is_none() && terminal.success {
-            bridge.finish();
-            gateway.health_registry.record_success(&health_key);
-        } else {
-            let message = terminal
-                .error
-                .clone()
-                .or_else(|| stream_error.clone())
-                .unwrap_or_else(|| "compat stream ended without a terminal event".to_string());
-            if stream_error.is_none() {
-                let _ = bridge.push_chunk(Err(crate::proxy::stream::StreamFailure::parse(Some(
-                    message.clone(),
-                ))));
+        let stream_completed =
+            stream_error.is_none() && terminal.error.is_none() && terminal.success;
+        let provider_error = terminal.error.is_some() || (upstream_ended && !terminal.success);
+        match stream_health_outcome(
+            bridge.state(),
+            stream_completed,
+            provider_error,
+            tx.is_closed(),
+        ) {
+            StreamHealthOutcome::Neutral => health_permit.neutral(),
+            StreamHealthOutcome::Success => {
+                bridge.finish();
+                health_permit.success();
             }
-            gateway.health_registry.record_failure(&health_key);
-            if stream_error.is_none() {
-                stream_error = Some(message);
+            StreamHealthOutcome::Failure => {
+                let message = terminal
+                    .error
+                    .clone()
+                    .or_else(|| stream_error.clone())
+                    .unwrap_or_else(|| "compat stream ended without a terminal event".to_string());
+                if stream_error.is_none() {
+                    let _ = bridge.push_chunk(Err(crate::proxy::stream::StreamFailure::parse(
+                        Some(message.clone()),
+                    )));
+                }
+                health_permit.failure();
+                if stream_error.is_none() {
+                    stream_error = Some(message);
+                }
             }
         }
 
@@ -1102,8 +1149,33 @@ fn build_streaming_compat_response(
             response_metadata,
             Body::from_stream(ReceiverStream::new(rx)),
         ),
-        retryable: false,
-        health_managed: true,
+        force_retry: false,
+        health_outcome: HealthOutcome::Deferred,
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum StreamHealthOutcome {
+    Success,
+    Failure,
+    Neutral,
+}
+
+fn stream_health_outcome(
+    state: &crate::proxy::stream::StreamState,
+    completed: bool,
+    provider_error: bool,
+    client_disconnected: bool,
+) -> StreamHealthOutcome {
+    match state {
+        crate::proxy::stream::StreamState::Failed(
+            crate::proxy::stream::StreamFailure::ClientCancelled,
+        ) if !provider_error => StreamHealthOutcome::Neutral,
+        crate::proxy::stream::StreamState::Failed(_) => StreamHealthOutcome::Failure,
+        _ if provider_error => StreamHealthOutcome::Failure,
+        _ if client_disconnected => StreamHealthOutcome::Neutral,
+        _ if completed => StreamHealthOutcome::Success,
+        _ => StreamHealthOutcome::Failure,
     }
 }
 
@@ -1427,6 +1499,51 @@ mod tests {
     use crate::protocol::ir::request::{Message, MessageContent, Role};
     use crate::proxy::context::RequestOutcome;
 
+    #[test]
+    fn cancelled_stream_is_neutral_for_provider_health() {
+        let state = crate::proxy::stream::StreamState::Failed(
+            crate::proxy::stream::StreamFailure::ClientCancelled,
+        );
+
+        assert_eq!(
+            stream_health_outcome(&state, false, false, false),
+            StreamHealthOutcome::Neutral
+        );
+        assert_eq!(
+            stream_health_outcome(&state, true, false, false),
+            StreamHealthOutcome::Neutral
+        );
+        assert_eq!(
+            stream_health_outcome(&state, false, true, true),
+            StreamHealthOutcome::Failure
+        );
+    }
+
+    #[test]
+    fn stream_failure_cannot_be_overridden_by_a_terminal_success_event() {
+        let state = crate::proxy::stream::StreamState::Failed(
+            crate::proxy::stream::StreamFailure::upstream("connection reset"),
+        );
+
+        assert_eq!(
+            stream_health_outcome(&state, true, false, true),
+            StreamHealthOutcome::Failure
+        );
+    }
+
+    #[test]
+    fn closed_response_channel_is_neutral_for_provider_health() {
+        assert_eq!(
+            stream_health_outcome(
+                &crate::proxy::stream::StreamState::Streaming,
+                true,
+                false,
+                true,
+            ),
+            StreamHealthOutcome::Neutral
+        );
+    }
+
     fn provider(vendor: &str, channel: &str) -> Provider {
         Provider {
             id: "provider-test".into(),
@@ -1616,6 +1733,44 @@ mod tests {
         (format!("http://{addr}/v1/chat/completions"), request_rx)
     }
 
+    async fn serve_hanging_sse(
+        first_event: &'static [u8],
+    ) -> (String, tokio::sync::oneshot::Sender<()>) {
+        use tokio::io::AsyncWriteExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind hanging compatibility mock");
+        let addr = listener.local_addr().expect("hanging mock local addr");
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept hanging mock");
+            let _ = read_mock_request(&mut socket).await;
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\n\r\n",
+                )
+                .await
+                .expect("write hanging mock headers");
+            socket
+                .write_all(format!("{:X}\r\n", first_event.len()).as_bytes())
+                .await
+                .expect("write hanging chunk length");
+            socket
+                .write_all(first_event)
+                .await
+                .expect("write hanging first event");
+            socket
+                .write_all(b"\r\n")
+                .await
+                .expect("finish hanging first chunk");
+            socket.flush().await.expect("flush hanging first chunk");
+            let _ = release_rx.await;
+            let _ = socket.shutdown().await;
+        });
+        (format!("http://{addr}/v1/chat/completions"), release_tx)
+    }
+
     async fn response_body(response: Response) -> Bytes {
         use futures::StreamExt;
 
@@ -1723,10 +1878,11 @@ mod tests {
             &mut req_ctx,
             &mut req_ir,
             &host,
+            gw.health_registry.try_acquire("compat-test").unwrap(),
         )
         .await;
         assert_eq!(attempt.response.status(), StatusCode::OK);
-        assert!(!attempt.retryable);
+        assert!(!attempt.force_retry);
         let body = response_body(attempt.response).await;
         let value: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(value["type"], "message");
@@ -1802,10 +1958,12 @@ mod tests {
             &mut req_ctx,
             &mut req_ir,
             &host,
+            gw.health_registry.try_acquire("compat-test").unwrap(),
         )
         .await;
         assert_eq!(attempt.response.status(), StatusCode::UNPROCESSABLE_ENTITY);
-        assert!(attempt.retryable);
+        assert!(attempt.force_retry);
+        assert_eq!(attempt.health_outcome, HealthOutcome::Failure);
         let body = response_body(attempt.response).await;
         let value: Value = serde_json::from_slice(&body).unwrap();
         assert!(
@@ -1858,10 +2016,11 @@ mod tests {
             &mut req_ctx,
             &mut req_ir,
             &host,
+            gw.health_registry.try_acquire("compat-test").unwrap(),
         )
         .await;
         assert_eq!(attempt.response.status(), StatusCode::OK);
-        assert!(attempt.health_managed);
+        assert_eq!(attempt.health_outcome, HealthOutcome::Deferred);
         assert_eq!(
             attempt
                 .response
@@ -1933,6 +2092,7 @@ mod tests {
             &mut req_ctx,
             &mut req_ir,
             &host,
+            gw.health_registry.try_acquire("compat-test").unwrap(),
         )
         .await;
         assert_eq!(attempt.response.status(), StatusCode::OK);
@@ -1945,6 +2105,131 @@ mod tests {
             req_ctx.get_outcome(),
             Some(RequestOutcome::PartialSuccess { .. }) | Some(RequestOutcome::Failed { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn hanging_stream_deadline_releases_and_fails_health_permit() {
+        let (gw, _log_rx) = test_gateway().await;
+        let provider = provider("custom", "default");
+        let prepared = gw
+            .compat_engine
+            .prepare_request(
+                ConversionProfile::anthropic_to_chat(true).with_model("upstream-model"),
+                Bytes::from_static(
+                    br#"{"model":"virtual-model","max_tokens":128,"stream":true,"messages":[{"role":"user","content":"hello"}]}"#,
+                ),
+                nyro_ccswitch_compat::SessionIdentity::generated("test"),
+            )
+            .await
+            .unwrap();
+        let (url, release_server) = serve_hanging_sse(
+            b"data: {\"id\":\"chatcmpl_hanging\",\"model\":\"upstream-model\",\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n",
+        )
+        .await;
+        let (call_ctx, mut req_ctx, mut req_ir, req_extras) = call_context(
+            &gw,
+            &provider,
+            ANTHROPIC_MESSAGES_2023_06_01,
+            OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1,
+            true,
+        );
+        req_ctx.deadline =
+            crate::proxy::context::Deadline::from_now(std::time::Duration::from_millis(200));
+        let host = crate::plugin::phase::HostContext::new(&gw);
+        let health_key = "compat-hanging-deadline";
+        gw.health_registry
+            .try_acquire(health_key)
+            .unwrap()
+            .failure();
+        gw.health_registry
+            .try_acquire(health_key)
+            .unwrap()
+            .failure();
+
+        let attempt = handle_compat(
+            ProxyClient::new(reqwest::Client::new()),
+            &url,
+            ReqwestHeaderMap::new(),
+            prepared,
+            &call_ctx,
+            &req_extras,
+            &mut req_ctx,
+            &mut req_ir,
+            &host,
+            gw.health_registry.try_acquire(health_key).unwrap(),
+        )
+        .await;
+        assert_eq!(attempt.health_outcome, HealthOutcome::Deferred);
+        let body = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            response_body(attempt.response),
+        )
+        .await
+        .expect("response body should close at the request deadline");
+        assert!(String::from_utf8_lossy(&body).contains("partial"));
+        assert!(!gw.health_registry.is_healthy(health_key));
+        assert!(gw.health_registry.try_acquire(health_key).is_none());
+        let _ = release_server.send(());
+    }
+
+    #[tokio::test]
+    async fn dropped_hanging_stream_releases_health_permit_neutrally() {
+        let (gw, mut log_rx) = test_gateway().await;
+        let provider = provider("custom", "default");
+        let prepared = gw
+            .compat_engine
+            .prepare_request(
+                ConversionProfile::anthropic_to_chat(true).with_model("upstream-model"),
+                Bytes::from_static(
+                    br#"{"model":"virtual-model","max_tokens":128,"stream":true,"messages":[{"role":"user","content":"hello"}]}"#,
+                ),
+                nyro_ccswitch_compat::SessionIdentity::generated("test"),
+            )
+            .await
+            .unwrap();
+        let (url, release_server) = serve_hanging_sse(
+            b"data: {\"id\":\"chatcmpl_cancel\",\"model\":\"upstream-model\",\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n",
+        )
+        .await;
+        let (call_ctx, mut req_ctx, mut req_ir, req_extras) = call_context(
+            &gw,
+            &provider,
+            ANTHROPIC_MESSAGES_2023_06_01,
+            OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1,
+            true,
+        );
+        let host = crate::plugin::phase::HostContext::new(&gw);
+        let health_key = "compat-hanging-cancelled";
+        gw.health_registry
+            .try_acquire(health_key)
+            .unwrap()
+            .failure();
+        gw.health_registry
+            .try_acquire(health_key)
+            .unwrap()
+            .failure();
+
+        let attempt = handle_compat(
+            ProxyClient::new(reqwest::Client::new()),
+            &url,
+            ReqwestHeaderMap::new(),
+            prepared,
+            &call_ctx,
+            &req_extras,
+            &mut req_ctx,
+            &mut req_ir,
+            &host,
+            gw.health_registry.try_acquire(health_key).unwrap(),
+        )
+        .await;
+        assert_eq!(attempt.health_outcome, HealthOutcome::Deferred);
+        drop(attempt.response);
+        tokio::time::timeout(std::time::Duration::from_secs(1), log_rx.recv())
+            .await
+            .expect("client cancellation should stop the stream task")
+            .expect("stream task should emit a log entry");
+        assert!(gw.health_registry.try_acquire(health_key).is_some());
+        let _ = release_server.send(());
     }
 
     #[test]
@@ -2324,10 +2609,11 @@ mod tests {
             &mut req_ctx,
             &mut req_ir,
             &host,
+            gw.health_registry.try_acquire("compat-test").unwrap(),
         )
         .await;
-        assert!(attempt.retryable);
-        assert!(!attempt.health_managed);
+        assert!(attempt.force_retry);
+        assert_ne!(attempt.health_outcome, HealthOutcome::Deferred);
         assert_ne!(attempt.response.status(), StatusCode::OK);
     }
 
@@ -2376,6 +2662,7 @@ mod tests {
             &mut req_ctx,
             &mut req_ir,
             &host,
+            gw.health_registry.try_acquire("compat-test").unwrap(),
         )
         .await;
         assert_eq!(attempt.response.status(), StatusCode::OK);
@@ -2423,9 +2710,11 @@ mod tests {
             &mut req_ctx,
             &mut req_ir,
             &host,
+            gw.health_registry.try_acquire("compat-test").unwrap(),
         )
         .await;
         assert_eq!(attempt.response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(attempt.health_outcome, HealthOutcome::Neutral);
         let body = response_body(attempt.response).await;
         let value: Value = serde_json::from_slice(&body).unwrap();
         let message = value["error"]["message"].as_str().unwrap();
@@ -2479,9 +2768,11 @@ mod tests {
             &mut req_ctx,
             &mut req_ir,
             &host,
+            gw.health_registry.try_acquire("compat-test").unwrap(),
         )
         .await;
         assert_eq!(attempt.response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(attempt.health_outcome, HealthOutcome::Failure);
         let body = response_body(attempt.response).await;
         let value: Value = serde_json::from_slice(&body).unwrap();
         let message = value["error"]["message"].as_str().unwrap();
@@ -2531,9 +2822,11 @@ mod tests {
             &mut req_ctx,
             &mut req_ir,
             &host,
+            gw.health_registry.try_acquire("compat-test").unwrap(),
         )
         .await;
         assert_eq!(attempt.response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(attempt.health_outcome, HealthOutcome::Failure);
         let body = response_body(attempt.response).await;
         let value: Value = serde_json::from_slice(&body).unwrap();
         let message = value["error"]["message"].as_str().unwrap();
@@ -2585,6 +2878,7 @@ mod tests {
             &mut req_ctx,
             &mut req_ir,
             &host,
+            gw.health_registry.try_acquire("compat-test").unwrap(),
         )
         .await;
         assert_eq!(attempt.response.status(), StatusCode::OK);

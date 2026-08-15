@@ -122,6 +122,7 @@ export interface LogPage {
 
 export interface GatewayStatus {
   status: string;
+  proxy_host?: string;
   proxy_port: number;
 }
 

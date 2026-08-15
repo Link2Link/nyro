@@ -50,7 +50,20 @@ impl RequestEncoder for AnthropicEncoder {
                 }
                 raw_messages.push(encode_message(msg)?);
             }
-            Value::Array(normalize_anthropic_messages(raw_messages))
+            let normalized = normalize_anthropic_messages(raw_messages);
+            // Tool-pairing repair applies to cross-protocol conversions (e.g.
+            // Responses → Anthropic): drop tool_use/tool_result blocks whose
+            // counterpart is missing, which Anthropic rejects with a 400.
+            // Native Anthropic requests (and IR built directly by callers) keep
+            // their messages verbatim.
+            let needs_pairing_repair = req.meta.source_protocol.is_some_and(|p| {
+                p != crate::protocol::ids::ANTHROPIC_MESSAGES_2023_06_01
+            });
+            Value::Array(if needs_pairing_repair {
+                prune_unpaired_tool_blocks(normalized)
+            } else {
+                normalized
+            })
         };
 
         let max_tokens = req.generation.max_tokens.unwrap_or(4096);
@@ -696,6 +709,75 @@ fn normalize_anthropic_messages(messages: Vec<Value>) -> Vec<Value> {
     }
 
     normalized
+}
+
+/// Drop `tool_use` / `tool_result` blocks that have no counterpart anywhere in
+/// the message sequence (sub2api parity: Responses→Anthropic conversions must
+/// never emit tool calls whose result is missing, or results whose call was
+/// never announced — Anthropic rejects both with a 400). Messages left with an
+/// empty content array are removed. Only called for cross-protocol requests
+/// (see `encode_request`); native Anthropic payloads bypass it via
+/// `__anthropic_raw_messages` and IR built directly by callers keeps its
+/// messages verbatim.
+fn prune_unpaired_tool_blocks(messages: Vec<Value>) -> Vec<Value> {
+    let mut use_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut result_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    for msg in &messages {
+        let Some(blocks) = msg.get("content").and_then(Value::as_array) else {
+            continue;
+        };
+        for b in blocks {
+            match b.get("type").and_then(Value::as_str).unwrap_or("") {
+                "tool_use" | "server_tool_use" => {
+                    if let Some(id) = b.get("id").and_then(Value::as_str) {
+                        use_ids.insert(normalize_anthropic_tool_id(id));
+                    }
+                }
+                "tool_result" => {
+                    if let Some(id) = b.get("tool_use_id").and_then(Value::as_str) {
+                        result_ids.insert(normalize_anthropic_tool_id(id));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let mut out: Vec<Value> = Vec::with_capacity(messages.len());
+    for mut msg in messages {
+        let Some(blocks) = msg.get("content").and_then(Value::as_array) else {
+            out.push(msg);
+            continue;
+        };
+        let kept: Vec<Value> = blocks
+            .iter()
+            .filter(|b| {
+                match b.get("type").and_then(Value::as_str).unwrap_or("") {
+                    "tool_use" | "server_tool_use" => b
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .map(|id| result_ids.contains(&normalize_anthropic_tool_id(id)))
+                        .unwrap_or(false),
+                    "tool_result" => b
+                        .get("tool_use_id")
+                        .and_then(Value::as_str)
+                        .map(|id| use_ids.contains(&normalize_anthropic_tool_id(id)))
+                        .unwrap_or(false),
+                    _ => true,
+                }
+            })
+            .cloned()
+            .collect();
+        if kept.is_empty() {
+            continue;
+        }
+        if let Some(obj) = msg.as_object_mut() {
+            obj.insert("content".into(), Value::Array(kept));
+        }
+        out.push(msg);
+    }
+    out
 }
 
 fn content_to_blocks(content: Value) -> Vec<Value> {

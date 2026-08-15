@@ -61,55 +61,57 @@ pub fn is_openai_o_series(model: &str) -> bool {
         && model.as_bytes().get(1).is_some_and(|b| b.is_ascii_digit())
 }
 
-/// Detect Responses-compatible models that support reasoning effort.
+/// Detect whether the upstream model accepts OpenAI `reasoning_effort` /
+/// Responses `reasoning.effort`.
 ///
-/// Supported families:
-/// - o-series: o1, o3, o4-mini, etc.
-/// - GPT-5+: gpt-5, gpt-5.1, gpt-5.4, gpt-5-codex, etc.
-/// - xAI Grok Build models. `grok-4.5` is the current documented Grok Build
-///   model; retain the previous `grok-build-*` family for saved providers.
+/// Default is to pass reasoning through: modern OpenAI-compatible upstreams
+/// (GLM, DeepSeek, Kimi, Qwen, Grok, ...) accept the parameter or ignore it,
+/// and a positive allowlist cannot track them. Only families known to
+/// hard-reject the parameter (legacy non-reasoning OpenAI models) or that
+/// never expose reasoning on OpenAI-style endpoints (Claude, Gemini) are
+/// excluded:
+/// - rejected: gpt-3.5*, gpt-4o*, gpt-4-turbo*, gpt-4.*, gpt-4, chatgpt-*,
+///   claude-*, gemini-*
+/// - accepted: o-series, gpt-5+, grok-*, and every other/unknown model
 pub fn supports_reasoning_effort(model: &str) -> bool {
     let normalized = model.to_lowercase();
-    is_openai_o_series(&normalized)
-        || normalized
-            .strip_prefix("gpt-")
-            .and_then(|rest| rest.chars().next())
-            .is_some_and(|c| c.is_ascii_digit() && c >= '5')
-        || normalized == "grok-4.5"
-        || normalized.starts_with("grok-4.5-")
-        || normalized.starts_with("grok-build-")
+    !(normalized.starts_with("gpt-3.5")
+        || normalized.starts_with("gpt-4o")
+        || normalized.starts_with("gpt-4-turbo")
+        || normalized.starts_with("gpt-4.")
+        || normalized == "gpt-4"
+        || normalized.starts_with("chatgpt-")
+        || normalized.starts_with("claude-")
+        || normalized.starts_with("gemini-"))
 }
 
-/// Resolve the appropriate OpenAI `reasoning_effort` from an Anthropic request body.
+/// Resolve the reasoning effort to forward upstream from an Anthropic request body.
 ///
 /// Priority:
-/// 1. Explicit `output_config.effort` — preserves the user's intent directly.
-///    `low`/`medium`/`high` map 1:1; `max` maps to `xhigh`
-///    (supported by mainstream GPT models). Unknown values are ignored.
-/// 2. Fallback: `thinking.type` + `budget_tokens`:
-///    - `adaptive` → `xhigh` (adaptive = maximum reasoning effort)
+/// 1. Explicit `output_config.effort` — forwarded **verbatim**. Upstream
+///    vendors normalize their own effort scales; rewriting values here
+///    (e.g. `max` → `xhigh`) would silently change what the client asked for.
+/// 2. Fallback: `thinking.type` + `budget_tokens` (no explicit effort was
+///    sent, so a tier is derived from what the client did send):
+///    - `adaptive` → `max` (adaptive = maximum reasoning effort)
 ///    - `enabled` with budget → `low` (<4 000) / `medium` (4 000–15 999) / `high` (≥16 000)
 ///    - `enabled` without budget → `high` (conservative default)
 ///    - `disabled` / absent → `None`
-pub fn resolve_reasoning_effort(body: &Value) -> Option<&'static str> {
-    // --- Priority 1: explicit output_config.effort ---
+pub fn resolve_reasoning_effort(body: &Value) -> Option<&str> {
+    // --- Priority 1: explicit output_config.effort, passed through verbatim ---
     if let Some(effort) = body
         .pointer("/output_config/effort")
         .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
     {
-        return match effort {
-            "low" => Some("low"),
-            "medium" => Some("medium"),
-            "high" => Some("high"),
-            "max" => Some("xhigh"), // OpenAI xhigh = maximum reasoning effort
-            _ => None,              // unknown value — do not inject
-        };
+        return Some(effort);
     }
 
     // --- Priority 2: thinking.type + budget_tokens fallback ---
     let thinking = body.get("thinking")?;
     match thinking.get("type").and_then(|t| t.as_str()) {
-        Some("adaptive") => Some("xhigh"),
+        Some("adaptive") => Some("max"),
         Some("enabled") => {
             let budget = thinking.get("budget_tokens").and_then(|b| b.as_u64());
             match budget {
@@ -1762,6 +1764,17 @@ mod tests {
         assert!(supports_reasoning_effort("grok-build-0.1"));
         assert!(!supports_reasoning_effort("gpt-4o"));
         assert!(!supports_reasoning_effort("claude-sonnet-4-6"));
+        // Non-exhausted third-party reasoning families must pass through.
+        assert!(supports_reasoning_effort("glm-5.3"));
+        assert!(supports_reasoning_effort("deepseek-v4-flash"));
+        assert!(supports_reasoning_effort("kimi-k2.5"));
+        assert!(supports_reasoning_effort("qwen3-max"));
+        // Legacy OpenAI non-reasoning families hard-reject the parameter.
+        assert!(!supports_reasoning_effort("gpt-4o-mini"));
+        assert!(!supports_reasoning_effort("gpt-4.1"));
+        assert!(!supports_reasoning_effort("gpt-3.5-turbo"));
+        assert!(!supports_reasoning_effort("chatgpt-4o-latest"));
+        assert!(!supports_reasoning_effort("gemini-2.5-pro"));
     }
 
     // ── resolve_reasoning_effort unit tests ──
@@ -1785,9 +1798,16 @@ mod tests {
     }
 
     #[test]
-    fn test_output_config_max_maps_to_reasoning_effort_xhigh() {
+    fn test_output_config_max_passes_through_verbatim() {
         let body = json!({"output_config": {"effort": "max"}});
-        assert_eq!(resolve_reasoning_effort(&body), Some("xhigh"));
+        assert_eq!(resolve_reasoning_effort(&body), Some("max"));
+    }
+
+    #[test]
+    fn test_output_config_custom_effort_passes_through_verbatim() {
+        // Vendors normalize their own scales; unknown values are forwarded as-is.
+        let body = json!({"output_config": {"effort": "extreme"}});
+        assert_eq!(resolve_reasoning_effort(&body), Some("extreme"));
     }
 
     #[test]
@@ -1801,9 +1821,9 @@ mod tests {
     }
 
     #[test]
-    fn test_output_config_unknown_value_no_reasoning_effort() {
+    fn test_output_config_unknown_value_passes_through() {
         let body = json!({"output_config": {"effort": "turbo"}});
-        assert_eq!(resolve_reasoning_effort(&body), None);
+        assert_eq!(resolve_reasoning_effort(&body), Some("turbo"));
     }
 
     #[test]
@@ -1831,9 +1851,9 @@ mod tests {
     }
 
     #[test]
-    fn test_thinking_adaptive_maps_xhigh() {
+    fn test_thinking_adaptive_maps_max() {
         let body = json!({"thinking": {"type": "adaptive"}});
-        assert_eq!(resolve_reasoning_effort(&body), Some("xhigh"));
+        assert_eq!(resolve_reasoning_effort(&body), Some("max"));
     }
 
     #[test]
@@ -1886,7 +1906,7 @@ mod tests {
         });
 
         let result = anthropic_to_openai(input).unwrap();
-        assert_eq!(result["reasoning_effort"], "xhigh");
+        assert_eq!(result["reasoning_effort"], "max");
     }
 
     #[test]
@@ -1912,7 +1932,34 @@ mod tests {
         });
 
         let result = anthropic_to_openai(input).unwrap();
-        assert_eq!(result["reasoning_effort"], "xhigh");
+        assert_eq!(result["reasoning_effort"], "max");
+    }
+
+    #[test]
+    fn test_third_party_reasoning_model_effort_passes_through() {
+        // Regression: third-party reasoning models (GLM/DeepSeek/Kimi/...) were
+        // blocked by a positive allowlist and silently dropped the client's
+        // reasoning directive.
+        let input = json!({
+            "model": "glm-5.3",
+            "max_tokens": 1024,
+            "thinking": {"type": "adaptive"},
+            "output_config": {"effort": "max"},
+            "messages": [{"role": "user", "content": "Hello"}]
+        });
+
+        let result = anthropic_to_openai(input).unwrap();
+        assert_eq!(result["reasoning_effort"], "max");
+
+        let input = json!({
+            "model": "deepseek-v4-flash",
+            "max_tokens": 1024,
+            "thinking": {"type": "enabled", "budget_tokens": 8000},
+            "messages": [{"role": "user", "content": "Hello"}]
+        });
+
+        let result = anthropic_to_openai(input).unwrap();
+        assert_eq!(result["reasoning_effort"], "medium");
     }
 
     #[test]

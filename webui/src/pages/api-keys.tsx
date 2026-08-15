@@ -314,12 +314,28 @@ export default function ApiKeysPage() {
             <div className="space-y-3">
               <p className="text-sm font-semibold text-slate-700">{isZh ? "2. 访问权限" : "2. Access Permission"}</p>
               <div className="space-y-2">
+                <div className="flex items-center justify-between gap-2">
                 <FieldLabel>
                   {isZh
                     ? "绑定模型（不勾选=不可访问受控模型）"
                     : "Bind Models (none = deny on protected models)"}
                 </FieldLabel>
-                <MultiSelect
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  className="h-6 px-2 text-xs"
+                  onClick={() =>
+                    setCreateForm((prev) => ({
+                      ...prev,
+                      model_ids: routeOptions.map((option) => option.value),
+                    }))
+                  }
+                >
+                  {isZh ? "绑定全部" : "Bind All"}
+                </Button>
+              </div>
+              <MultiSelect
                   options={routeOptions}
                   values={createForm.model_ids}
                   placeholder={
@@ -486,12 +502,32 @@ export default function ApiKeysPage() {
                     <div className="space-y-3">
                       <p className="text-sm font-semibold text-slate-700">{isZh ? "2. 访问权限" : "2. Access Permission"}</p>
                       <div className="space-y-2">
+                        <div className="flex items-center justify-between gap-2">
                         <FieldLabel>
                           {isZh
                             ? "绑定路由（不勾选=不可访问受控路由）"
                             : "Bind Routes (none = deny on protected routes)"}
                         </FieldLabel>
-                        <MultiSelect
+                        <Button
+                          type="button"
+                          variant="outline"
+                          size="sm"
+                          className="h-6 px-2 text-xs"
+                          onClick={() =>
+                            setEditForm((prev) =>
+                              prev
+                                ? {
+                                    ...prev,
+                                    model_ids: routeOptions.map((option) => option.value),
+                                  }
+                                : prev,
+                            )
+                          }
+                        >
+                          {isZh ? "绑定全部" : "Bind All"}
+                        </Button>
+                      </div>
+                      <MultiSelect
                           options={routeOptions}
                           values={editForm.model_ids}
                           placeholder={

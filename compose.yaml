@@ -8,9 +8,12 @@ services:
     restart: unless-stopped
     environment:
       NYRO_ADMIN_TOKEN: ${NYRO_ADMIN_TOKEN:?Run ./make-docker.sh to generate .env}
+      NYRO_PROXY_AUTH_KEY: ${NYRO_PROXY_AUTH_KEY:?Run ./make-docker.sh to generate .env}
       NYRO_STORAGE_BACKEND: ${NYRO_STORAGE_BACKEND:-sqlite}
       NYRO_LOG_LEVEL: ${NYRO_LOG_LEVEL:-info}
     ports:
+      # Published on all interfaces (0.0.0.0) so LAN devices can reach the
+      # gateway; NYRO_PROXY_AUTH_KEY above guards the data plane.
       - "19530:19530"
       - "19531:19531"
     volumes:

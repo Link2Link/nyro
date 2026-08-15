@@ -95,6 +95,24 @@ struct Args {
 
     #[arg(
         long,
+        env = "NYRO_PROXY_AUTH_KEY",
+        help = "Require `Authorization: Bearer <key>` on every proxy data-plane route (health endpoints stay open). Recommended whenever the proxy listens beyond loopback.",
+        help_heading = "Server"
+    )]
+    proxy_auth_key: Option<String>,
+
+    #[arg(
+        long,
+        default_value = "false",
+        action = clap::ArgAction::SetTrue,
+        env = "NYRO_LAN",
+        help = "Expose the gateway to the local network: bind proxy and admin listeners to 0.0.0.0. Requires --proxy-auth-key and --admin-token (refuses to start without them).",
+        help_heading = "Server"
+    )]
+    lan: bool,
+
+    #[arg(
+        long,
         env = "NYRO_ADMIN_TOKEN",
         help = "Bearer token for admin API authentication",
         help_heading = "Server"
@@ -314,7 +332,22 @@ async fn run_standalone(config_path: &str, args: &Args) -> anyhow::Result<()> {
     tracing::info!("standalone mode: loading {config_path}");
     let yaml = yaml_config::YamlConfig::load(config_path)?;
 
-    let proxy_host = yaml.server.proxy_host.clone();
+    // --lan overrides the YAML server section and requires proxy auth.
+    let proxy_host = if args.lan {
+        if args.proxy_auth_key.as_deref().map(str::trim).is_none_or(str::is_empty) {
+            anyhow::bail!(
+                "--lan requires --proxy-auth-key (or NYRO_PROXY_AUTH_KEY): \
+                 exposing the proxy without auth would let any LAN device call your models"
+            );
+        }
+        tracing::info!(
+            "--lan: overriding YAML proxy_host {} → 0.0.0.0",
+            yaml.server.proxy_host
+        );
+        "0.0.0.0".to_string()
+    } else {
+        yaml.server.proxy_host.clone()
+    };
     let proxy_port = yaml.server.proxy_port;
 
     let providers = yaml_config::build_providers(&yaml);
@@ -341,6 +374,7 @@ async fn run_standalone(config_path: &str, args: &Args) -> anyhow::Result<()> {
         proxy_host: proxy_host.clone(),
         proxy_port,
         proxy_cors_origins,
+        auth_key: args.proxy_auth_key.clone().filter(|k| !k.trim().is_empty()),
         data_dir: PathBuf::from(data_dir),
         storage: GatewayStorageConfig::default(),
         ..Default::default()
@@ -376,9 +410,34 @@ async fn run_full(args: &Args) -> anyhow::Result<()> {
         }
     }
 
+    // ── LAN mode: bind every listener to 0.0.0.0 and refuse to run without auth ──
+    let (proxy_host, admin_host) = if args.lan {
+        if args.proxy_auth_key.as_deref().map(str::trim).is_none_or(str::is_empty) {
+            anyhow::bail!(
+                "--lan requires --proxy-auth-key (or NYRO_PROXY_AUTH_KEY): \
+                 exposing the proxy without auth would let any LAN device call your models"
+            );
+        }
+        if matches!(args.mode, Mode::Admin | Mode::All) && admin_token.is_none() {
+            anyhow::bail!(
+                "--lan requires --admin-token: the admin API would otherwise be open to the whole LAN"
+            );
+        }
+        tracing::info!(
+            "--lan: proxy {}/{} → 0.0.0.0, admin {}/{} → 0.0.0.0",
+            args.proxy_host,
+            args.proxy_port,
+            args.admin_host,
+            args.admin_port
+        );
+        ("0.0.0.0".to_string(), "0.0.0.0".to_string())
+    } else {
+        (args.proxy_host.clone(), args.admin_host.clone())
+    };
+
     // Admin token enforcement only when the admin listener is active.
     if matches!(args.mode, Mode::Admin | Mode::All)
-        && !is_loopback_host(&args.admin_host)
+        && !is_loopback_host(&admin_host)
         && admin_token.is_none()
     {
         anyhow::bail!(
@@ -398,13 +457,13 @@ async fn run_full(args: &Args) -> anyhow::Result<()> {
     };
 
     let config = GatewayConfig {
-        proxy_host: args.proxy_host.clone(),
+        proxy_host: proxy_host.clone(),
         proxy_port: args.proxy_port,
         proxy_cors_origins,
+        auth_key: args.proxy_auth_key.clone().filter(|k| !k.trim().is_empty()),
         data_dir: PathBuf::from(data_dir),
         storage: build_storage_config(args)?,
         config_poll_interval: Duration::from_secs(args.config_poll_interval),
-        ..Default::default()
     };
 
     let (gateway, log_rx) = Gateway::new(config).await?;
@@ -416,14 +475,14 @@ async fn run_full(args: &Args) -> anyhow::Result<()> {
 
     match args.mode {
         Mode::Proxy => {
-            let proxy_addr = format!("{}:{}", args.proxy_host, args.proxy_port);
+            let proxy_addr = format!("{}:{}", proxy_host, args.proxy_port);
             tracing::info!("mode=proxy  proxy → http://{proxy_addr}");
             tracing::info!("admin API and WebUI are disabled in proxy mode");
             gateway.start_proxy_with_shutdown(shutdown_signal()).await?;
         }
 
         Mode::Admin => {
-            let admin_addr = format!("{}:{}", args.admin_host, args.admin_port);
+            let admin_addr = format!("{}:{}", admin_host, args.admin_port);
             let admin_router = admin_routes::create_router(gateway, admin_token.clone());
             let app = build_admin_app(admin_router, &args.webui_dir, &admin_cors_origins);
             let listener = tokio::net::TcpListener::bind(&admin_addr).await?;
@@ -453,10 +512,10 @@ async fn run_full(args: &Args) -> anyhow::Result<()> {
 
             let admin_router = admin_routes::create_router(gateway, admin_token.clone());
             let app = build_admin_app(admin_router, &args.webui_dir, &admin_cors_origins);
-            let admin_addr = format!("{}:{}", args.admin_host, args.admin_port);
+            let admin_addr = format!("{}:{}", admin_host, args.admin_port);
             let listener = tokio::net::TcpListener::bind(&admin_addr).await?;
 
-            let proxy_addr = format!("{}:{}", args.proxy_host, args.proxy_port);
+            let proxy_addr = format!("{}:{}", proxy_host, args.proxy_port);
             tracing::info!("mode=all  proxy → http://{proxy_addr}");
             tracing::info!("mode=all  admin → http://{admin_addr}");
 

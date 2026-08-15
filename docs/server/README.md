@@ -48,9 +48,11 @@ curl http://127.0.0.1:19531/healthz         # 管理面健康检查
 |------|----------|--------|------|
 | `--proxy-host` | `NYRO_PROXY_HOST` | `127.0.0.1` | 代理监听地址 |
 | `--proxy-port` | `NYRO_PROXY_PORT` | `19530` | 代理监听端口 |
+| `--proxy-auth-key` | `NYRO_PROXY_AUTH_KEY` | 无 | 代理数据面强制 `Authorization: Bearer <key>`（健康检查端点保持开放）。代理监听非回环地址时建议必须设置 |
 | `--admin-host` | `NYRO_ADMIN_HOST` | `127.0.0.1` | Admin API 监听地址 |
 | `--admin-port` | `NYRO_ADMIN_PORT` | `19531` | Admin API 监听端口 |
 | `--admin-token` | `NYRO_ADMIN_TOKEN` | 无 | Admin API Bearer Token 鉴权 |
+| `--lan` | `NYRO_LAN` | `false` | 局域网模式：代理与 Admin 监听均绑定 `0.0.0.0`。要求同时设置 `--proxy-auth-key` 与 `--admin-token`，否则拒绝启动 |
 | `--log-level` | `NYRO_LOG_LEVEL` | `info` | 日志级别：`error` / `warn` / `info` / `debug` / `trace` |
 
 ### Storage
@@ -123,17 +125,57 @@ nyro-server
 
 ---
 
-## Admin API 鉴权
+## 局域网访问
 
-当 `--admin-host` 不是回环地址（`127.0.0.1` / `localhost` / `::1`）时，**必须**设置 `--admin-token`：
+默认所有监听都绑定回环地址，仅本机可访问。要让局域网内其他设备使用 Nyro，有两种方式：
+
+### 方式一：`--lan` 一键开启（推荐）
 
 ```bash
-nyro-server \
-  --admin-host 0.0.0.0 \
+nyro-server --lan \
+  --proxy-auth-key "your-proxy-key" \
   --admin-token "your-secret-token"
 ```
 
-客户端请求 Admin API 时需携带 `Authorization: Bearer your-secret-token`。
+`--lan` 会把代理（`:19530`）与 Admin/WebUI（`:19531`）监听都绑定到 `0.0.0.0`，并要求：
+
+- `--proxy-auth-key`：代理数据面强制 Bearer 鉴权，局域网设备调用模型时必须携带 `Authorization: Bearer your-proxy-key`；
+- `--admin-token`：Admin API 强制 Bearer 鉴权，WebUI 登录需要该令牌。
+
+两者缺一即拒绝启动。客户端使用示例：
+
+```bash
+# 局域网内其他设备（假设主机 IP 为 192.168.1.10）
+curl http://192.168.1.10:19530/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer your-proxy-key" \
+  -d '{"model": "gpt-4o", "messages": [{"role": "user", "content": "hello"}]}'
+```
+
+### 方式二：手动指定监听地址
+
+```bash
+nyro-server \
+  --proxy-host 0.0.0.0 \
+  --admin-host 0.0.0.0 \
+  --proxy-auth-key "your-proxy-key" \
+  --admin-token "your-secret-token"
+```
+
+当 `--admin-host` 不是回环地址（`127.0.0.1` / `localhost` / `::1`）时，**必须**设置 `--admin-token`。代理监听非回环地址时强烈建议设置 `--proxy-auth-key`，否则任何能访问该端口的设备都可以无鉴权调用你的模型。
+
+### 浏览器访问 WebUI
+
+`--lan` 或非回环 Admin 地址下，局域网浏览器访问 `http://<主机IP>:19531` 时需要放行跨域来源（默认仅允许本机与 Tauri 来源）：
+
+```bash
+nyro-server --lan \
+  --proxy-auth-key "your-proxy-key" \
+  --admin-token "your-secret-token" \
+  --admin-cors-origin "http://192.168.1.20:19531"   # 可重复；* 表示任意来源
+```
+
+命令行客户端（curl / Claude Code / SDK）不受 CORS 限制，无需配置此项。
 
 ---
 

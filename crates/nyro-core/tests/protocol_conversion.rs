@@ -68,19 +68,30 @@ fn anthropic_encoder_replays_reasoning_extra_as_thinking_block() {
         serde_json::Value::String("I should run a shell command.".to_string()),
     );
 
-    let messages = vec![Message {
-        role: IrRole::Assistant,
-        content: IrMessageContent::Text("".to_string()),
-        tool_calls: Some(vec![ToolCall {
-            namespace: None,
-            id: "call_1".to_string(),
-            kind: ToolCallKind::Function,
-            name: "exec_command".to_string(),
-            arguments: "{\"cmd\":\"echo hello\"}".to_string(),
-        }]),
-        tool_call_id: None,
-        meta: Some(serde_json::Value::Object(extra.into_iter().collect())),
-    }];
+    let messages = vec![
+        Message {
+            role: IrRole::Assistant,
+            content: IrMessageContent::Text("".to_string()),
+            tool_calls: Some(vec![ToolCall {
+                namespace: None,
+                id: "call_1".to_string(),
+                kind: ToolCallKind::Function,
+                name: "exec_command".to_string(),
+                arguments: "{\"cmd\":\"echo hello\"}".to_string(),
+            }]),
+            tool_call_id: None,
+            meta: Some(serde_json::Value::Object(extra.into_iter().collect())),
+        },
+        // The tool call needs its matching result: cross-protocol conversions
+        // drop unpaired tool_use blocks (Anthropic rejects them with a 400).
+        Message {
+            role: IrRole::Tool,
+            content: IrMessageContent::Text("hello".to_string()),
+            tool_calls: None,
+            tool_call_id: Some("call_1".to_string()),
+            meta: None,
+        },
+    ];
     let mut req = AiRequest::new("deepseek-v4-flash", messages);
     req.stream = StreamConfig {
         enabled: false,

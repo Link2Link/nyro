@@ -203,10 +203,10 @@ chmod +x nyro-server-linux-x86_64
 # Start (localhost only, no auth required) — default all mode
 ./nyro-server-linux-x86_64
 
-# Start (network-exposed, auth required)
+# Start (LAN access, auth enforced: proxy Bearer key + admin token)
 ./nyro-server-linux-x86_64 \
-  --proxy-host 0.0.0.0 \
-  --admin-host 0.0.0.0 \
+  --lan \
+  --proxy-auth-key YOUR_PROXY_KEY \
   --admin-token YOUR_ADMIN_TOKEN
 
 # Proxy-only mode — binds :19530 only, no Admin API, no WebUI
@@ -222,6 +222,8 @@ chmod +x nyro-server-linux-x86_64
 ./nyro-server-linux-x86_64 --config config.yaml
 ```
 
+For LAN access, point other devices at `http://<host-ip>:19530` with `Authorization: Bearer YOUR_PROXY_KEY`. See the "LAN access" section in the [Server docs](docs/server/README.md).
+
 Available server binaries: `linux-x86_64`, `linux-aarch64`, `macos-x86_64`, `macos-aarch64`, `windows-x86_64.exe`, `windows-arm64.exe`
 
 Open `http://localhost:19531` for the management UI. See [Server docs](docs/server/README.md) and [Standalone docs](docs/standalone/README.md) for full configuration reference.
@@ -236,9 +238,9 @@ make server
 docker compose up -d
 ```
 
-`make-docker.sh` builds the `nyro:mine` image, exports it as `nyro-mine.tar`, and creates a private `.env` with a random `NYRO_ADMIN_TOKEN` when one does not already exist. Open `http://localhost:19531` and sign in with the token stored in `.env`.
+`make-docker.sh` builds the `nyro:mine` image, exports it as `nyro-mine.tar`, and creates a private `.env` with random `NYRO_ADMIN_TOKEN` and `NYRO_PROXY_AUTH_KEY` when one does not already exist (existing `.env` files get the missing key appended). The Docker ports are published on `0.0.0.0`, so the proxy data plane requires Bearer auth: clients must send `Authorization: Bearer <NYRO_PROXY_AUTH_KEY>`. Open `http://localhost:19531` and sign in with the token stored in `.env`.
 
-To import the archive on another compatible Linux host, place `compose.yaml` beside it, create a `.env` containing a strong `NYRO_ADMIN_TOKEN`, and run `docker load -i nyro-mine.tar` before `docker compose up -d`. The archive contains a native binary and therefore must be loaded on the same CPU architecture on which it was built.
+To import the archive on another compatible Linux host, place `compose.yaml` beside it, create a `.env` containing strong `NYRO_ADMIN_TOKEN` and `NYRO_PROXY_AUTH_KEY` values (or run `./make-docker.sh` to generate them), and run `docker load -i nyro-mine.tar` before `docker compose up -d`. The archive contains a native binary and therefore must be loaded on the same CPU architecture on which it was built.
 
 ### SQL Storage Backends
 

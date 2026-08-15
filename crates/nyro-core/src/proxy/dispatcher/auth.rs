@@ -88,7 +88,20 @@ pub(super) async fn authorize_model_access<S: ProxyAccessStore + ?Sized>(
     access_store: &S,
     model: &Model,
     headers: &HeaderMap,
+    master_key: Option<&str>,
 ) -> Result<AuthenticatedKey, Response> {
+    // The startup-configured gateway key (NYRO_PROXY_AUTH_KEY) is a master key:
+    // it already passed the proxy middleware and bypasses per-model
+    // binding/quota checks.
+    if let Some(master) = master_key.filter(|k| !k.trim().is_empty())
+        && extract_api_key(headers).as_deref() == Some(master)
+    {
+        return Ok(AuthenticatedKey {
+            id: None,
+            name: None,
+        });
+    }
+
     if !model.enable_auth {
         return Ok(AuthenticatedKey {
             id: None,
