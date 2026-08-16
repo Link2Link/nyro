@@ -52,6 +52,7 @@ const METADATA: VendorMetadata = VendorMetadata {
             auth_mode: AuthMode::ApiKey,
             oauth: None,
             runtime: None,
+            shared_key_protocols: false,
         },
         ChannelDef {
             id: "china",
@@ -68,14 +69,19 @@ const METADATA: VendorMetadata = VendorMetadata {
                     protocol: "anthropic-messages",
                     base_url: "https://api.minimaxi.com/anthropic",
                 },
+                ProtocolBaseUrl {
+                    protocol: "openai-responses",
+                    base_url: "https://api.minimaxi.com/v1",
+                },
             ],
             api_key: None,
-            models_source: Some("ai://models.dev/minimax"),
+            models_source: Some("https://api.minimaxi.com/v1/models"),
             capabilities_source: CapabilitiesSource::ModelsDev("minimax"),
             static_models: &[],
             auth_mode: AuthMode::ApiKey,
             oauth: None,
             runtime: None,
+            shared_key_protocols: true,
         },
     ],
 };
@@ -104,10 +110,12 @@ impl Vendor for MinimaxVendor {
     fn supported_protocols(&self) -> &'static [ProtocolId] {
         use crate::protocol::ids::{
             ANTHROPIC_MESSAGES_2023_06_01, OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1,
+            OPENAI_RESPONSES_V1,
         };
         &[
             ANTHROPIC_MESSAGES_2023_06_01,
             OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1,
+            OPENAI_RESPONSES_V1,
         ]
     }
     fn declared_request_mutations(&self) -> bool {

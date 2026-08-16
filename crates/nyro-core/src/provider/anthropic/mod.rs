@@ -45,6 +45,7 @@ const METADATA: VendorMetadata = VendorMetadata {
             auth_mode: AuthMode::ApiKey,
             oauth: None,
             runtime: None,
+            shared_key_protocols: false,
         },
         ChannelDef {
             id: "claude-code",
@@ -80,6 +81,7 @@ const METADATA: VendorMetadata = VendorMetadata {
                 scope: "user:inference user:profile",
             }),
             runtime: None,
+            shared_key_protocols: false,
         },
     ],
 };

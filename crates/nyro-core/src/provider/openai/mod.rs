@@ -49,6 +49,7 @@ const METADATA: VendorMetadata = VendorMetadata {
             auth_mode: AuthMode::ApiKey,
             oauth: None,
             runtime: None,
+            shared_key_protocols: false,
         },
         ChannelDef {
             id: "codex",
@@ -78,6 +79,7 @@ const METADATA: VendorMetadata = VendorMetadata {
                 models_url: "https://chatgpt.com/backend-api/codex/models",
                 models_client_version: "0.99.0",
             }),
+            shared_key_protocols: false,
         },
     ],
 };

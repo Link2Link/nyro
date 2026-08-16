@@ -846,6 +846,14 @@ impl AdminService {
         let provider = self.get_provider(id).await?;
         let runtime = self.resolve_provider_runtime(&provider).await?;
         let credential = runtime.access_token.clone();
+        // Adaptive providers: the discovery endpoint is OpenAI-style even when
+        // the default protocol is not — authenticate with an enabled
+        // OpenAI-family endpoint's Bearer key instead of the default
+        // protocol's scheme (e.g. Anthropic `x-api-key`).
+        let (auth_protocol, auth_credential) = match adaptive_model_fetch_auth(&provider) {
+            Some((protocol, api_key)) => (protocol, api_key),
+            None => (provider.protocol.clone(), credential),
+        };
         if let Some(static_list) = runtime.binding.static_models_override.as_deref() {
             let models: Vec<String> = static_list
                 .iter()
@@ -875,7 +883,7 @@ impl AdminService {
         let mut headers = if runtime.binding.disable_default_auth {
             HeaderMap::new()
         } else {
-            build_model_headers(&provider.protocol, provider.vendor.as_deref(), &credential)?
+            build_model_headers(&auth_protocol, provider.vendor.as_deref(), &auth_credential)?
         };
         headers.extend(runtime_binding_headers(&runtime.binding)?);
         let mut request = self
@@ -885,15 +893,15 @@ impl AdminService {
             .headers(headers)
             .timeout(Duration::from_secs(10));
 
-        if is_google_protocol(&provider.protocol) && !runtime.binding.disable_default_auth {
+        if is_google_protocol(&auth_protocol) && !runtime.binding.disable_default_auth {
             let separator = if endpoint.contains('?') { '&' } else { '?' };
             let mut headers =
-                build_model_headers(&provider.protocol, provider.vendor.as_deref(), &credential)?;
+                build_model_headers(&auth_protocol, provider.vendor.as_deref(), &auth_credential)?;
             headers.extend(runtime_binding_headers(&runtime.binding)?);
             request = self
                 .gw
                 .http_client
-                .get(format!("{endpoint}{separator}key={}", credential))
+                .get(format!("{endpoint}{separator}key={}", auth_credential))
                 .headers(headers)
                 .timeout(Duration::from_secs(10));
         }
@@ -922,6 +930,11 @@ impl AdminService {
         let provider = self.get_provider(id).await?;
         let runtime = self.resolve_provider_runtime(&provider).await?;
         let credential = runtime.access_token.clone();
+        // Same adaptive-auth rationale as `test_provider_models` above.
+        let (auth_protocol, auth_credential) = match adaptive_model_fetch_auth(&provider) {
+            Some((protocol, api_key)) => (protocol, api_key),
+            None => (provider.protocol.clone(), credential),
+        };
         if let Some(static_list) = runtime.binding.static_models_override.as_deref() {
             let models: Vec<String> = static_list
                 .iter()
@@ -948,23 +961,23 @@ impl AdminService {
             let mut headers = if runtime.binding.disable_default_auth {
                 HeaderMap::new()
             } else {
-                build_model_headers(&provider.protocol, provider.vendor.as_deref(), &credential)?
+                build_model_headers(&auth_protocol, provider.vendor.as_deref(), &auth_credential)?
             };
             headers.extend(runtime_binding_headers(&runtime.binding)?);
             let mut request = self.gw.http_client.get(&endpoint).headers(headers);
 
-            if is_google_protocol(&provider.protocol) && !runtime.binding.disable_default_auth {
+            if is_google_protocol(&auth_protocol) && !runtime.binding.disable_default_auth {
                 let separator = if endpoint.contains('?') { '&' } else { '?' };
                 let mut headers = build_model_headers(
-                    &provider.protocol,
+                    &auth_protocol,
                     provider.vendor.as_deref(),
-                    &credential,
+                    &auth_credential,
                 )?;
                 headers.extend(runtime_binding_headers(&runtime.binding)?);
                 request = self
                     .gw
                     .http_client
-                    .get(format!("{endpoint}{separator}key={}", credential))
+                    .get(format!("{endpoint}{separator}key={}", auth_credential))
                     .headers(headers);
             }
 

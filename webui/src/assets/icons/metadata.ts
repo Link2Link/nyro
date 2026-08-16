@@ -326,9 +326,9 @@ export const iconMetadata: Record<string, IconMetadata> = {
   },
   zhipu: {
     name: "zhipu",
-    displayName: "Zhipu AI",
+    displayName: "GLM",
     category: "ai-provider",
-    keywords: ["chatglm", "glm"],
+    keywords: ["chatglm", "glm", "zhipu"],
     defaultColor: "#0F62FE",
   },
   openrouter: {

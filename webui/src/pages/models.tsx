@@ -252,9 +252,11 @@ function TargetRow({
               value: model,
               label: model,
             }))}
-            placeholder={isZh ? "选择目标模型 ID" : "Select target model ID"}
-            searchPlaceholder={isZh ? "搜索模型..." : "Search model..."}
-            emptyText={isZh ? "暂无可用模型" : "No models available"}
+            allowCustom
+            placeholder={isZh ? "选择或输入目标模型 ID" : "Select or enter target model ID"}
+            searchPlaceholder={isZh ? "搜索或输入模型 ID..." : "Search or type a model ID..."}
+            emptyText={isZh ? "列表为空，可直接输入模型 ID" : "No models listed — type a model ID instead"}
+            customCreateText={isZh ? "使用自定义模型" : "Use custom model"}
             onValueChange={(value) => {
               onUpdate(index, { model: value });
               setCapsQueryModel(value.trim());

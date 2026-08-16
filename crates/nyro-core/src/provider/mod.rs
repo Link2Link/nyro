@@ -29,6 +29,7 @@ pub mod anthropic;
 pub mod custom;
 pub mod deepseek;
 pub mod google;
+pub mod kimi_code;
 pub mod minimax;
 pub mod moonshotai;
 pub mod nvidia;

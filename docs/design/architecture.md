@@ -15,7 +15,7 @@ Claude Code · Codex CLI · Gemini CLI · OpenCode
             (localhost:19530)
                       ↓
     OpenAI · Anthropic · Google · DeepSeek
-    MiniMax · xAI · Zhipu · Ollama · ...
+    MiniMax · xAI · GLM · Ollama · ...
 ```
 
 **部署形态：**
@@ -576,7 +576,7 @@ inventory::submit! { ExtensionRegistration { make: || Box::new(XxxChannel) } }
 | Anthropic | `anthropic` | `x-api-key` + `anthropic-version`；含 `claude-code` channel |
 | Google | `google` | URL 追加 `?key=<api_key>`；`override_model_in_body=true` |
 | Vertex AI | `vertexai` | Service account auth + 区域 endpoint |
-| DeepSeek / Moonshot / Zhipu / MiniMax / xAI / ZAI / OpenRouter / Nvidia / Ollama | 各自 vendor_id | 委托 `GenericOpenAICompatibleAdapter` / openai_compat_* |
+| DeepSeek / Moonshot / GLM (zhipuai) / MiniMax / xAI / ZAI / OpenRouter / Nvidia / Ollama | 各自 vendor_id | 委托 `GenericOpenAICompatibleAdapter` / openai_compat_* |
 | custom | `custom` | 用户自定义 vendor preset |
 
 ---
@@ -884,7 +884,7 @@ OnLog 阶段 + `ResponseStats` 已提供标准化的请求指标消费点（见 
 
 ### 12.7 长尾厂商适配
 
-当前覆盖主流厂商（OpenAI / Anthropic / Google / Vertex AI / DeepSeek / Moonshot / Zhipu / MiniMax / xAI / ZAI / OpenRouter / Nvidia / Ollama）。待补充：
+当前覆盖主流厂商（OpenAI / Anthropic / Google / Vertex AI / DeepSeek / Moonshot / GLM (zhipuai) / MiniMax / xAI / ZAI / OpenRouter / Nvidia / Ollama）。待补充：
 - AWS Bedrock（SigV4 签名 + wrapper protocol）
 - Azure AI Foundry（Azure AD token + deployment URL pattern）
 - Cohere / Mistral / Together AI 等

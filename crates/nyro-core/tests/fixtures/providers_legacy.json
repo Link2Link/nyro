@@ -229,11 +229,13 @@
           "en": "Default"
         },
         "baseUrls": {
-          "openai-compatible": "https://api.deepseek.com/v1",
-          "anthropic-messages": "https://api.deepseek.com/anthropic"
+          "openai-compatible": "https://api.deepseek.com",
+          "anthropic-messages": "https://api.deepseek.com/anthropic",
+          "openai-responses": "https://api.deepseek.com"
         },
         "modelsSource": "https://api.deepseek.com/v1/models",
-        "authMode": "apikey"
+        "authMode": "apikey",
+        "sharedKeyProtocols": true
       }
     ]
   },
@@ -275,6 +277,31 @@
     ]
   },
   {
+    "id": "kimi-code",
+    "label": {
+      "zh": "Kimi Code",
+      "en": "Kimi Code"
+    },
+    "icon": "kimi",
+    "defaultProtocol": "openai-compatible",
+    "channels": [
+      {
+        "id": "default",
+        "label": {
+          "zh": "默认",
+          "en": "Default"
+        },
+        "baseUrls": {
+          "openai-compatible": "https://api.kimi.com/coding/v1",
+          "anthropic-messages": "https://api.kimi.com/coding"
+        },
+        "modelsSource": "https://api.kimi.com/coding/v1/models",
+        "authMode": "apikey",
+        "sharedKeyProtocols": true
+      }
+    ]
+  },
+  {
     "id": "minimax",
     "label": {
       "zh": "MiniMax",
@@ -305,19 +332,21 @@
         },
         "baseUrls": {
           "openai-compatible": "https://api.minimaxi.com/v1",
-          "anthropic-messages": "https://api.minimaxi.com/anthropic"
+          "anthropic-messages": "https://api.minimaxi.com/anthropic",
+          "openai-responses": "https://api.minimaxi.com/v1"
         },
-        "modelsSource": "ai://models.dev/minimax",
+        "modelsSource": "https://api.minimaxi.com/v1/models",
         "staticModels": [],
-        "authMode": "apikey"
+        "authMode": "apikey",
+        "sharedKeyProtocols": true
       }
     ]
   },
   {
     "id": "zhipuai",
     "label": {
-      "zh": "Zhipu AI",
-      "en": "Zhipu AI"
+      "zh": "GLM",
+      "en": "GLM"
     },
     "icon": "zhipu",
     "defaultProtocol": "openai-compatible",
@@ -343,10 +372,12 @@
         },
         "baseUrls": {
           "openai-compatible": "https://open.bigmodel.cn/api/coding/paas/v4",
-          "anthropic-messages": "https://open.bigmodel.cn/api/anthropic"
+          "anthropic-messages": "https://open.bigmodel.cn/api/anthropic",
+          "openai-responses": "https://open.bigmodel.cn/api/v1"
         },
-        "modelsSource": "https://open.bigmodel.cn/api/coding/paas/v4/models",
-        "authMode": "apikey"
+        "modelsSource": "https://open.bigmodel.cn/api/v1/models",
+        "authMode": "apikey",
+        "sharedKeyProtocols": true
       }
     ]
   },

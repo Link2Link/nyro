@@ -495,3 +495,198 @@ fn placeholder_vendors_are_not_registered() {
         );
     }
 }
+
+// ── 5. GLM (zhipuai) shared-key multi-protocol Coding Plan channel ─────────
+
+#[test]
+fn zhipuai_coding_plan_channel_is_shared_key_multi_protocol() {
+    let reg = VendorRegistry::global();
+    let meta = reg.metadata("zhipuai").expect("zhipuai vendor metadata");
+    assert_eq!(meta.label.en, "GLM");
+    assert_eq!(meta.label.zh, "GLM");
+
+    let coding = meta
+        .channels
+        .iter()
+        .find(|channel| channel.id == "coding")
+        .expect("zhipuai coding channel");
+    assert!(
+        coding.shared_key_protocols,
+        "coding channel must be shared-key"
+    );
+
+    let base_urls: std::collections::HashMap<&str, &str> = coding
+        .base_urls
+        .iter()
+        .map(|entry| (entry.protocol, entry.base_url))
+        .collect();
+    assert_eq!(
+        base_urls.get("openai-compatible").copied(),
+        Some("https://open.bigmodel.cn/api/coding/paas/v4")
+    );
+    assert_eq!(
+        base_urls.get("anthropic-messages").copied(),
+        Some("https://open.bigmodel.cn/api/anthropic")
+    );
+    assert_eq!(
+        base_urls.get("openai-responses").copied(),
+        Some("https://open.bigmodel.cn/api/v1")
+    );
+    assert_eq!(
+        coding.models_source,
+        Some("https://open.bigmodel.cn/api/v1/models")
+    );
+
+    let default = meta
+        .channels
+        .iter()
+        .find(|channel| channel.id == "default")
+        .expect("zhipuai default channel");
+    assert!(!default.shared_key_protocols);
+
+    // Wire shape: the flag serializes camelCase and is skipped when false.
+    let json = serde_json::to_value(reg.list_metadata_for_webui()).unwrap();
+    let coding_json = json
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["id"] == "zhipuai")
+        .unwrap();
+    let coding_channel = coding_json["channels"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|channel| channel["id"] == "coding")
+        .unwrap();
+    assert_eq!(coding_channel["sharedKeyProtocols"], Value::Bool(true));
+    let default_channel = coding_json["channels"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|channel| channel["id"] == "default")
+        .unwrap();
+    assert!(default_channel.get("sharedKeyProtocols").is_none());
+}
+
+// ── 6. MiniMax China (minimaxi.com) shared-key multi-protocol channel ──────
+
+#[test]
+fn minimax_china_channel_is_shared_key_multi_protocol() {
+    let reg = VendorRegistry::global();
+    let meta = reg.metadata("minimax").expect("minimax vendor metadata");
+
+    let china = meta
+        .channels
+        .iter()
+        .find(|channel| channel.id == "china")
+        .expect("minimax china channel");
+    assert!(
+        china.shared_key_protocols,
+        "china channel must be shared-key"
+    );
+
+    let base_urls: std::collections::HashMap<&str, &str> = china
+        .base_urls
+        .iter()
+        .map(|entry| (entry.protocol, entry.base_url))
+        .collect();
+    assert_eq!(
+        base_urls.get("openai-compatible").copied(),
+        Some("https://api.minimaxi.com/v1")
+    );
+    assert_eq!(
+        base_urls.get("anthropic-messages").copied(),
+        Some("https://api.minimaxi.com/anthropic")
+    );
+    assert_eq!(
+        base_urls.get("openai-responses").copied(),
+        Some("https://api.minimaxi.com/v1")
+    );
+    assert_eq!(
+        china.models_source,
+        Some("https://api.minimaxi.com/v1/models")
+    );
+
+    let default = meta
+        .channels
+        .iter()
+        .find(|channel| channel.id == "default")
+        .expect("minimax default channel");
+    assert!(!default.shared_key_protocols);
+    assert_eq!(default.models_source, Some("ai://models.dev/minimax"));
+}
+
+// ── 7. DeepSeek shared-key multi-protocol channel ──────────────────────────
+
+#[test]
+fn deepseek_channel_is_shared_key_multi_protocol() {
+    let reg = VendorRegistry::global();
+    let meta = reg.metadata("deepseek").expect("deepseek vendor metadata");
+
+    let channel = meta
+        .channels
+        .iter()
+        .find(|channel| channel.id == "default")
+        .expect("deepseek default channel");
+    assert!(channel.shared_key_protocols, "channel must be shared-key");
+
+    let base_urls: std::collections::HashMap<&str, &str> = channel
+        .base_urls
+        .iter()
+        .map(|entry| (entry.protocol, entry.base_url))
+        .collect();
+    assert_eq!(
+        base_urls.get("openai-compatible").copied(),
+        Some("https://api.deepseek.com")
+    );
+    assert_eq!(
+        base_urls.get("anthropic-messages").copied(),
+        Some("https://api.deepseek.com/anthropic")
+    );
+    assert_eq!(
+        base_urls.get("openai-responses").copied(),
+        Some("https://api.deepseek.com")
+    );
+    assert_eq!(
+        channel.models_source,
+        Some("https://api.deepseek.com/v1/models")
+    );
+}
+
+// ── 8. Kimi Code shared-key multi-protocol channel ─────────────────────────
+
+#[test]
+fn kimi_code_channel_is_shared_key_multi_protocol() {
+    let reg = VendorRegistry::global();
+    let meta = reg
+        .metadata("kimi-code")
+        .expect("kimi-code vendor metadata");
+    assert_eq!(meta.label.en, "Kimi Code");
+    assert_eq!(meta.icon, "kimi");
+
+    let channel = meta
+        .channels
+        .iter()
+        .find(|channel| channel.id == "default")
+        .expect("kimi-code default channel");
+    assert!(channel.shared_key_protocols, "channel must be shared-key");
+
+    let base_urls: std::collections::HashMap<&str, &str> = channel
+        .base_urls
+        .iter()
+        .map(|entry| (entry.protocol, entry.base_url))
+        .collect();
+    assert_eq!(base_urls.len(), 2);
+    assert_eq!(
+        base_urls.get("openai-compatible").copied(),
+        Some("https://api.kimi.com/coding/v1")
+    );
+    assert_eq!(
+        base_urls.get("anthropic-messages").copied(),
+        Some("https://api.kimi.com/coding")
+    );
+    assert_eq!(
+        channel.models_source,
+        Some("https://api.kimi.com/coding/v1/models")
+    );
+}

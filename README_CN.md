@@ -41,7 +41,7 @@ Claude Code · Codex CLI · Gemini CLI · OpenCode
             (localhost:19530)
                       ↓
    OpenAI · Anthropic · Google · DeepSeek
-    MiniMax · xAI · Zhipu · Ollama · ...
+    MiniMax · xAI · GLM · Ollama · ...
 ```
 
 Nyro 同时提供 **桌面应用**（macOS / Windows / Linux）和 **独立服务端二进制**，适用于无头部署与自托管场景。

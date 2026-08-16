@@ -90,6 +90,13 @@ pub struct ChannelDef {
     pub oauth: Option<OAuthConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub runtime: Option<RuntimeConfig>,
+    /// Shared-key multi-protocol channel: one API key is valid for every
+    /// protocol in `base_urls`. When true, the WebUI renders a single API
+    /// key field plus per-protocol checkboxes instead of the single-protocol
+    /// form, and creates the provider in adaptive mode with one endpoint per
+    /// checked protocol (all carrying the same key).
+    #[serde(skip_serializing_if = "is_false")]
+    pub shared_key_protocols: bool,
 }
 
 /// Top-level vendor entry. One `VendorMetadata` per vendor.
@@ -101,6 +108,10 @@ pub struct VendorMetadata {
     pub icon: &'static str,
     pub default_protocol: &'static str,
     pub channels: &'static [ChannelDef],
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 fn serialize_base_urls<S>(base_urls: &&[ProtocolBaseUrl], serializer: S) -> Result<S::Ok, S::Error>

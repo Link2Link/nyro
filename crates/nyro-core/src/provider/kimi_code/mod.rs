@@ -1,4 +1,7 @@
-//! NVIDIA vendor (OpenAI-compatible).
+//! Kimi Code vendor (api.kimi.com/coding — Kimi coding plan).
+//!
+//! OpenAI-compatible core with an Anthropic Messages endpoint; one API key
+//! is valid for both protocols.
 
 use async_trait::async_trait;
 use reqwest::header::HeaderMap;
@@ -21,12 +24,12 @@ use crate::provider::vendor::{ProviderCtx, Vendor};
 use crate::provider::vendor_ext::VendorCtx;
 
 const METADATA: VendorMetadata = VendorMetadata {
-    id: "nvidia",
+    id: "kimi-code",
     label: Label {
-        zh: "NVIDIA",
-        en: "NVIDIA",
+        zh: "Kimi Code",
+        en: "Kimi Code",
     },
-    icon: "nvidia",
+    icon: "kimi",
     default_protocol: "openai-compatible",
     channels: &[ChannelDef {
         id: "default",
@@ -34,28 +37,34 @@ const METADATA: VendorMetadata = VendorMetadata {
             zh: "默认",
             en: "Default",
         },
-        base_urls: &[ProtocolBaseUrl {
-            protocol: "openai-compatible",
-            base_url: "https://integrate.api.nvidia.com/v1",
-        }],
+        base_urls: &[
+            ProtocolBaseUrl {
+                protocol: "openai-compatible",
+                base_url: "https://api.kimi.com/coding/v1",
+            },
+            ProtocolBaseUrl {
+                protocol: "anthropic-messages",
+                base_url: "https://api.kimi.com/coding",
+            },
+        ],
         api_key: None,
-        models_source: Some("https://integrate.api.nvidia.com/v1/models"),
-        capabilities_source: CapabilitiesSource::ModelsDev("nvidia"),
+        models_source: Some("https://api.kimi.com/coding/v1/models"),
+        capabilities_source: CapabilitiesSource::ModelsDev("kimi-for-coding"),
         static_models: &[],
         auth_mode: AuthMode::ApiKey,
         oauth: None,
         runtime: None,
-        shared_key_protocols: false,
+        shared_key_protocols: true,
     }],
 };
 
-pub struct NvidiaVendor;
+pub struct KimiCodeVendor;
 
 #[async_trait]
-impl Vendor for NvidiaVendor {
+impl Vendor for KimiCodeVendor {
     fn scope(&self) -> VendorScope {
         VendorScope::Vendor {
-            vendor_id: "nvidia",
+            vendor_id: "kimi-code",
         }
     }
     fn metadata(&self) -> Option<&'static VendorMetadata> {
@@ -68,11 +77,16 @@ impl Vendor for NvidiaVendor {
         openai_build_url(base_url, path)
     }
     fn vendor_id(&self) -> &'static str {
-        "nvidia"
+        "kimi-code"
     }
     fn supported_protocols(&self) -> &'static [ProtocolId] {
-        use crate::protocol::ids::OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1;
-        &[OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1]
+        use crate::protocol::ids::{
+            ANTHROPIC_MESSAGES_2023_06_01, OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1,
+        };
+        &[
+            ANTHROPIC_MESSAGES_2023_06_01,
+            OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1,
+        ]
     }
     fn declared_request_mutations(&self) -> bool {
         false
@@ -95,8 +109,8 @@ impl Vendor for NvidiaVendor {
         pipeline::parse_response(self, resp, ctx).await
     }
     fn map_error(&self, status: u16, body: Value) -> GatewayError {
-        openai_map_error("nvidia", status, body)
+        openai_map_error("kimi-code", status, body)
     }
 }
 
-inventory::submit! { VendorRegistration { make: || Box::new(NvidiaVendor) } }
+inventory::submit! { VendorRegistration { make: || Box::new(KimiCodeVendor) } }

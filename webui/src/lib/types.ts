@@ -255,6 +255,8 @@ export interface ProviderChannelPreset {
   apiKey?: string;
   modelsEndpoint?: string;
   staticModels?: string[];
+  /** One API key is valid for every protocol in `baseUrls`; the form renders a single key field plus protocol checkboxes. */
+  sharedKeyProtocols?: boolean;
 }
 
 export interface ProviderPreset {

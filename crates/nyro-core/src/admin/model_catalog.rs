@@ -48,6 +48,36 @@ pub(super) fn runtime_binding_headers(binding: &RuntimeBinding) -> anyhow::Resul
     Ok(headers)
 }
 
+/// Resolve the `(protocol, api_key)` pair used to authenticate the model-list
+/// fetch for adaptive providers.
+///
+/// Adaptive providers may default to a non-OpenAI protocol (e.g. Anthropic
+/// Messages sends `x-api-key`), but shared-key channels expose an OpenAI-style
+/// `/models` discovery endpoint that expects `Authorization: Bearer`. When any
+/// enabled OpenAI-family endpoint exists, prefer its credential and Bearer
+/// auth so the fetch matches the discovery endpoint's expectations regardless
+/// of which protocol the user picked as the default.
+pub(super) fn adaptive_model_fetch_auth(provider: &Provider) -> Option<(String, String)> {
+    if !provider.is_adaptive() {
+        return None;
+    }
+    let registry = crate::protocol::registry::ProtocolRegistry::global();
+    let endpoint = provider
+        .protocol_endpoints
+        .iter()
+        .filter(|endpoint| endpoint.is_enabled)
+        .find(|endpoint| {
+            registry.resolve_alias(&endpoint.protocol).is_some_and(|id| {
+                matches!(
+                    id.protocol,
+                    crate::protocol::ids::Protocol::OpenAICompatible
+                        | crate::protocol::ids::Protocol::OpenAIResponses
+                )
+            })
+        })?;
+    Some(("openai-compatible".to_string(), endpoint.api_key.clone()))
+}
+
 pub(super) fn build_model_headers(
     protocol: &str,
     vendor: Option<&str>,

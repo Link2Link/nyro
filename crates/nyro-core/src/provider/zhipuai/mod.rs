@@ -1,4 +1,5 @@
-//! Zhipu AI vendor (OpenAI-compatible).
+//! GLM (Zhipu AI, open.bigmodel.cn) vendor — OpenAI-compatible core with
+//! Anthropic Messages and OpenAI Responses endpoints.
 
 use async_trait::async_trait;
 use reqwest::header::HeaderMap;
@@ -23,8 +24,8 @@ use crate::provider::vendor_ext::VendorCtx;
 const METADATA: VendorMetadata = VendorMetadata {
     id: "zhipuai",
     label: Label {
-        zh: "Zhipu AI",
-        en: "Zhipu AI",
+        zh: "GLM",
+        en: "GLM",
     },
     icon: "zhipu",
     default_protocol: "openai-compatible",
@@ -52,6 +53,7 @@ const METADATA: VendorMetadata = VendorMetadata {
             auth_mode: AuthMode::ApiKey,
             oauth: None,
             runtime: None,
+            shared_key_protocols: false,
         },
         ChannelDef {
             id: "coding",
@@ -68,14 +70,19 @@ const METADATA: VendorMetadata = VendorMetadata {
                     protocol: "anthropic-messages",
                     base_url: "https://open.bigmodel.cn/api/anthropic",
                 },
+                ProtocolBaseUrl {
+                    protocol: "openai-responses",
+                    base_url: "https://open.bigmodel.cn/api/v1",
+                },
             ],
             api_key: None,
-            models_source: Some("https://open.bigmodel.cn/api/coding/paas/v4/models"),
+            models_source: Some("https://open.bigmodel.cn/api/v1/models"),
             capabilities_source: CapabilitiesSource::ModelsDev("zhipuai"),
             static_models: &[],
             auth_mode: AuthMode::ApiKey,
             oauth: None,
             runtime: None,
+            shared_key_protocols: true,
         },
     ],
 };
@@ -104,10 +111,12 @@ impl Vendor for ZhipuaiVendor {
     fn supported_protocols(&self) -> &'static [ProtocolId] {
         use crate::protocol::ids::{
             ANTHROPIC_MESSAGES_2023_06_01, OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1,
+            OPENAI_RESPONSES_V1,
         };
         &[
             ANTHROPIC_MESSAGES_2023_06_01,
             OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1,
+            OPENAI_RESPONSES_V1,
         ]
     }
     fn declared_request_mutations(&self) -> bool {

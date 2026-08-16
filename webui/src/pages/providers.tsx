@@ -295,6 +295,167 @@ const protocolOptions = [
   { label: "Google Gemini", value: "google-gemini" },
 ] as const satisfies ReadonlyArray<{ label: string; value: ProviderProtocol }>;
 
+// ── Shared-key multi-protocol channels (e.g. GLM Coding Plan) ────────────────
+
+interface SharedKeyProtocolEntry {
+  protocol: ProviderProtocol;
+  baseUrl: string;
+}
+
+function presetSharedKeyChannel(
+  preset?: ProviderPreset | null,
+  channelId?: string | null,
+): ProviderChannelPreset | null {
+  const channel = presetChannels(preset).find((item) => item.id === channelId)
+    ?? presetChannels(preset)[0];
+  return channel?.sharedKeyProtocols === true ? channel : null;
+}
+
+function sharedKeyProtocolEntries(channel: ProviderChannelPreset): SharedKeyProtocolEntry[] {
+  const known = new Set(protocolOptions.map((item) => item.value));
+  return Object.entries(channel.baseUrls ?? {})
+    .map(([key, baseUrl]) => ({
+      protocol: resolveProtocol(key) as ProviderProtocol | null,
+      baseUrl: toGatewayBaseUrl(baseUrl),
+    }))
+    .filter((entry): entry is SharedKeyProtocolEntry =>
+      entry.protocol !== null && known.has(entry.protocol));
+}
+
+function seedSharedKeyEndpoints(
+  entries: SharedKeyProtocolEntry[],
+  apiKey: string,
+  defaultProtocolHint?: string,
+): { endpoints: CreateProviderProtocolEndpoint[]; defaultProtocol: string } {
+  const endpoints = entries.map((entry, index) => ({
+    protocol: endpointOption(entry.protocol).id,
+    base_url: entry.baseUrl,
+    api_key: apiKey,
+    auth_scheme: "auto" as ProviderEndpointAuthScheme,
+    is_enabled: true,
+    priority: index,
+  }));
+  const hintEndpoint = defaultProtocolHint
+    ? endpoints.find((endpoint) => endpoint.protocol === defaultProtocolHint
+      || resolveProtocol(endpoint.protocol) === resolveProtocol(defaultProtocolHint))
+    : undefined;
+  return {
+    endpoints,
+    defaultProtocol: hintEndpoint?.protocol ?? endpoints[0]?.protocol ?? "",
+  };
+}
+
+function SharedKeyProtocolPicker({
+  entries,
+  endpoints,
+  defaultProtocol,
+  isZh,
+  onChange,
+}: {
+  entries: SharedKeyProtocolEntry[];
+  endpoints: CreateProviderProtocolEndpoint[];
+  defaultProtocol: string;
+  isZh: boolean;
+  onChange: (endpoints: CreateProviderProtocolEndpoint[], defaultProtocol: string) => void;
+}) {
+  const enabled = endpoints.filter((endpoint) => endpoint.is_enabled !== false);
+
+  const toggleProtocol = (entry: SharedKeyProtocolEntry, checked: boolean) => {
+    const endpointId = endpointOption(entry.protocol).id;
+    const selected = new Set(endpoints.map((endpoint) => endpoint.protocol));
+    if (checked) {
+      selected.add(endpointId);
+    } else {
+      selected.delete(endpointId);
+    }
+    const sharedKey = endpoints[0]?.api_key ?? "";
+    const next = entries
+      .filter((candidate) => selected.has(endpointOption(candidate.protocol).id))
+      .map((candidate, index) => {
+        const candidateId = endpointOption(candidate.protocol).id;
+        const existing = endpoints.find((endpoint) => endpoint.protocol === candidateId);
+        return existing ?? {
+          protocol: candidateId,
+          base_url: candidate.baseUrl,
+          api_key: sharedKey,
+          auth_scheme: "auto" as ProviderEndpointAuthScheme,
+          is_enabled: true,
+          priority: index,
+        };
+      });
+    let nextDefault = defaultProtocol;
+    if (!next.some((endpoint) => endpoint.protocol === nextDefault)) {
+      nextDefault = next[0]?.protocol ?? "";
+    }
+    onChange(next, nextDefault);
+  };
+
+  return (
+    <div className="col-span-2 space-y-3">
+      <div className="space-y-2">
+        <FieldLabel
+          info={
+            isZh
+              ? "勾选要通过此提供商使用的协议，全部协议共用同一个 API Key。"
+              : "Pick the protocols to use with this provider; all of them share the same API key."
+          }
+        >
+          {isZh ? "协议" : "Protocols"}
+        </FieldLabel>
+        <div className="divide-y divide-slate-200 rounded-xl border border-slate-200 bg-white">
+          {entries.map((entry) => {
+            const endpointId = endpointOption(entry.protocol).id;
+            const existing = endpoints.find((endpoint) => endpoint.protocol === endpointId);
+            const checked = Boolean(existing);
+            const baseUrl = existing?.base_url || entry.baseUrl;
+            return (
+              <label
+                key={entry.protocol}
+                className="flex cursor-pointer items-start gap-3 px-3 py-2.5"
+              >
+                <Checkbox
+                  checked={checked}
+                  onCheckedChange={(value) => toggleProtocol(entry, value === true)}
+                  className="mt-0.5"
+                />
+                <div className="min-w-0 flex-1">
+                  <div className="text-sm font-medium text-slate-800">
+                    {endpointDisplayName(endpointId)}
+                  </div>
+                  <div className="mt-0.5 truncate text-xs text-slate-500" title={baseUrl}>
+                    {baseUrl}
+                  </div>
+                </div>
+                {defaultProtocol === endpointId && checked && (
+                  <Badge variant="secondary">{isZh ? "默认" : "Default"}</Badge>
+                )}
+              </label>
+            );
+          })}
+        </div>
+      </div>
+      <div className="space-y-2">
+        <FieldLabel>{isZh ? "默认协议" : "Default Protocol"}</FieldLabel>
+        <Select
+          value={enabled.some((endpoint) => endpoint.protocol === defaultProtocol) ? defaultProtocol : ""}
+          onValueChange={(value) => onChange(endpoints, value)}
+        >
+          <SelectTrigger>
+            <SelectValue placeholder={isZh ? "选择默认协议" : "Select default protocol"} />
+          </SelectTrigger>
+          <SelectContent>
+            {enabled.map((endpoint) => (
+              <SelectItem key={endpoint.protocol} value={endpoint.protocol}>
+                {endpointDisplayName(endpoint.protocol)}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+      </div>
+    </div>
+  );
+}
+
 function validateProviderEndpoint(
   protocol: string | undefined,
   baseUrl: string | undefined,
@@ -1344,6 +1505,48 @@ export default function ProvidersPage() {
       ? resolvePresetProtocol(presetForEdit, channel, savedProtocol)
       : savedProtocol;
     const protocolMode = p.protocol_mode === "adaptive" ? "adaptive" : "fixed";
+
+    // Shared-key channels (e.g. GLM Coding Plan) always edit in adaptive mode
+    // with one endpoint per checked protocol sharing the provider API key.
+    const sharedChannel = presetForEdit ? presetSharedKeyChannel(presetForEdit, channel) : null;
+    if (sharedChannel) {
+      const entries = sharedKeyProtocolEntries(sharedChannel);
+      const savedEndpointId = endpointOption(p.protocol || safeProtocol).id;
+      const existing = (p.protocol_endpoints ?? [])
+        .filter((endpoint) =>
+          entries.some((entry) => endpointOption(entry.protocol).id === endpoint.protocol))
+        .map((endpoint) => ({
+          protocol: endpoint.protocol,
+          base_url: endpoint.base_url,
+          api_key: p.api_key || endpoint.api_key,
+          auth_scheme: endpoint.auth_scheme,
+          is_enabled: endpoint.is_enabled,
+          priority: endpoint.priority,
+        }));
+      const seeded = seedSharedKeyEndpoints(entries, p.api_key ?? "", savedEndpointId);
+      const endpoints = existing.length ? existing : seeded.endpoints;
+      const defaultEndpoint = endpoints.find((endpoint) => endpoint.protocol === savedEndpointId)
+        ?? endpoints.find((endpoint) => endpoint.is_enabled !== false)
+        ?? endpoints[0];
+      setEditForm({
+        id: p.id,
+        name: p.name,
+        vendor: p.vendor ?? (p.preset_key || undefined),
+        protocol: defaultEndpoint?.protocol ?? seeded.defaultProtocol,
+        base_url: defaultEndpoint?.base_url ?? p.base_url,
+        protocol_mode: "adaptive",
+        protocol_endpoints: endpoints,
+        use_proxy: p.use_proxy,
+        preset_key: p.preset_key || DEFAULT_PRESET_ID,
+        channel,
+        models_source: p.models_source ?? "",
+        static_models: p.static_models ?? "",
+        api_key: p.api_key ?? "",
+        auth_mode: normalizeAuthMode(p.auth_mode),
+      });
+      return;
+    }
+
     setEditForm({
       id: p.id,
       name: p.name,
@@ -1381,6 +1584,32 @@ export default function ProvidersPage() {
     const config = resolvePresetConfig(preset, nextProtocol, nextChannelId);
     const nextBaseUrl = config.baseUrl || protocolUrl(nextProtocol);
 
+    const sharedChannel = presetSharedKeyChannel(preset, nextChannelId);
+    if (sharedChannel) {
+      const seeded = seedSharedKeyEndpoints(
+        sharedKeyProtocolEntries(sharedChannel),
+        config.apiKey || "",
+        endpointOption(nextProtocol).id,
+      );
+      setForm({
+        ...emptyCreate,
+        vendor: preset.id === DEFAULT_PRESET_ID ? undefined : preset.id,
+        protocol: seeded.defaultProtocol,
+        base_url: seeded.endpoints.find((endpoint) => endpoint.protocol === seeded.defaultProtocol)?.base_url ?? "",
+        protocol_mode: "adaptive",
+        protocol_endpoints: seeded.endpoints,
+        use_proxy: false,
+        auth_mode: presetChannelAuthMode(preset, nextChannelId),
+        preset_key: preset.id,
+        channel: nextChannelId,
+        models_source: config.modelsSource,
+        static_models: config.staticModels,
+        api_key: config.apiKey || "",
+        name: "",
+      });
+      return;
+    }
+
     setForm({
       ...emptyCreate,
       vendor: preset.id === DEFAULT_PRESET_ID ? undefined : preset.id,
@@ -1407,11 +1636,39 @@ export default function ProvidersPage() {
     );
     const config = resolvePresetConfig(selectedPreset, nextProtocol, nextChannelId);
     const nextBaseUrl = config.baseUrl || protocolUrl(nextProtocol);
+
+    const nextSharedChannel = presetSharedKeyChannel(selectedPreset, nextChannelId);
+    if (nextSharedChannel && nextAuthMode === "apikey") {
+      const seeded = seedSharedKeyEndpoints(
+        sharedKeyProtocolEntries(nextSharedChannel),
+        form.api_key,
+        endpointOption(nextProtocol).id,
+      );
+      setForm((prev) => ({
+        ...prev,
+        channel: nextChannelId,
+        protocol: seeded.defaultProtocol,
+        protocol_mode: "adaptive",
+        protocol_endpoints: seeded.endpoints,
+        base_url: seeded.endpoints.find((endpoint) => endpoint.protocol === seeded.defaultProtocol)?.base_url ?? prev.base_url,
+        auth_mode: nextAuthMode,
+        models_source: config.modelsSource,
+        static_models: config.staticModels,
+      }));
+      return;
+    }
+
     setForm((prev) => {
       const baseUrl = isVertexProviderSelection(prev)
         ? (nextBaseUrl || defaultVertexBaseUrl(nextProtocol))
         : nextBaseUrl;
-      if (prev.protocol_mode === "adaptive" && nextAuthMode === "apikey" && !isVertexProviderSelection(prev)) {
+      const prevChannelWasSharedKey = presetSharedKeyChannel(selectedPreset, prev.channel) !== null;
+      if (
+        prev.protocol_mode === "adaptive"
+        && nextAuthMode === "apikey"
+        && !prevChannelWasSharedKey
+        && !isVertexProviderSelection(prev)
+      ) {
         return {
           ...prev,
           channel: nextChannelId,
@@ -1502,6 +1759,13 @@ export default function ProvidersPage() {
   const hasCreatePresets = providerPresets.length > 0;
   const createResolvedAuthMode = presetChannelAuthMode(selectedPreset, createChannelValue);
   const createUsesVertexServiceAccount = isVertexProviderSelection(form);
+  const createSharedKeyChannel = presetSharedKeyChannel(selectedPreset, createChannelValue);
+  const createIsSharedKey = createResolvedAuthMode === "apikey"
+    && createSharedKeyChannel !== null
+    && !createUsesVertexServiceAccount;
+  const createSharedKeyEntries = createSharedKeyChannel
+    ? sharedKeyProtocolEntries(createSharedKeyChannel)
+    : [];
   const createOAuthReady = createOAuthStatus?.status === "ready";
   const createOAuthRequiresManualCode =
     createOAuthStatus?.status === "pending"
@@ -1862,7 +2126,7 @@ export default function ProvidersPage() {
                   onChange={(e) => setForm({ ...form, name: e.target.value })}
                 />
               </div>
-              {createResolvedAuthMode !== "oauth" && !createUsesVertexServiceAccount && (
+              {createResolvedAuthMode !== "oauth" && !createUsesVertexServiceAccount && !createIsSharedKey && (
                 <div className="space-y-2">
                   <FieldLabel>{isZh ? "协议模式" : "Protocol Mode"}</FieldLabel>
                   <ToggleGroup
@@ -1899,13 +2163,15 @@ export default function ProvidersPage() {
                   </ToggleGroup>
                 </div>
               )}
-              {createResolvedAuthMode !== "oauth" && form.protocol_mode !== "adaptive" && (
+              {createResolvedAuthMode !== "oauth" && (form.protocol_mode !== "adaptive" || createIsSharedKey) && (
                 <div className={createUsesVertexServiceAccount ? "col-span-2 space-y-2" : "space-y-2"}>
                   <FieldLabel
                     info={
                       createUsesVertexServiceAccount
                         ? (isZh ? "粘贴 Google Cloud 服务账号 JSON，需包含 project_id、client_email、private_key。" : "Paste the Google Cloud service account JSON with project_id, client_email, and private_key.")
-                        : undefined
+                        : createIsSharedKey
+                          ? (isZh ? "所有勾选的协议共用这一个 API Key。" : "Every checked protocol shares this single API key.")
+                          : undefined
                     }
                   >
                     {createUsesVertexServiceAccount ? (isZh ? "服务账号 JSON" : "Service Account JSON") : "API Key"}
@@ -1928,7 +2194,21 @@ export default function ProvidersPage() {
                         type={showCreateApiKey ? "text" : "password"}
                         value={form.api_key}
                         className="pr-10"
-                        onChange={(e) => setForm({ ...form, api_key: e.target.value })}
+                        onChange={(e) => {
+                          const apiKey = e.target.value;
+                          setForm({
+                            ...form,
+                            api_key: apiKey,
+                            ...(createIsSharedKey
+                              ? {
+                                  protocol_endpoints: (form.protocol_endpoints ?? []).map((endpoint) => ({
+                                    ...endpoint,
+                                    api_key: apiKey,
+                                  })),
+                                }
+                              : {}),
+                          });
+                        }}
                       />
                       <button
                         type="button"
@@ -1942,7 +2222,7 @@ export default function ProvidersPage() {
                   )}
                 </div>
               )}
-              {createResolvedAuthMode !== "oauth" && form.protocol_mode !== "adaptive" && (
+              {createResolvedAuthMode !== "oauth" && form.protocol_mode !== "adaptive" && !createIsSharedKey && (
               <div className="space-y-2">
                 <FieldLabel>{isZh ? "协议" : "Protocol"}</FieldLabel>
                 <Select
@@ -1985,7 +2265,7 @@ export default function ProvidersPage() {
                 </Select>
               </div>
               )}
-              {createResolvedAuthMode !== "oauth" && form.protocol_mode !== "adaptive" && (
+              {createResolvedAuthMode !== "oauth" && form.protocol_mode !== "adaptive" && !createIsSharedKey && (
               <div className="space-y-2">
                 <FieldLabel>Base URL</FieldLabel>
                 <Input
@@ -1995,7 +2275,7 @@ export default function ProvidersPage() {
                 />
               </div>
               )}
-              {createResolvedAuthMode !== "oauth" && form.protocol_mode === "adaptive" && (
+              {createResolvedAuthMode !== "oauth" && form.protocol_mode === "adaptive" && !createIsSharedKey && (
                 <AdaptiveEndpointEditor
                   endpoints={form.protocol_endpoints ?? []}
                   defaultProtocol={form.protocol}
@@ -2005,6 +2285,25 @@ export default function ProvidersPage() {
                     protocol: defaultProtocol,
                     protocol_endpoints: protocolEndpoints,
                   })}
+                />
+              )}
+              {createResolvedAuthMode !== "oauth" && createIsSharedKey && (
+                <SharedKeyProtocolPicker
+                  entries={createSharedKeyEntries}
+                  endpoints={form.protocol_endpoints ?? []}
+                  defaultProtocol={form.protocol}
+                  isZh={isZh}
+                  onChange={(protocolEndpoints, defaultProtocol) => {
+                    const defaultEndpoint = protocolEndpoints.find(
+                      (endpoint) => endpoint.protocol === defaultProtocol,
+                    );
+                    setForm({
+                      ...form,
+                      protocol: defaultProtocol || form.protocol,
+                      protocol_endpoints: protocolEndpoints,
+                      base_url: defaultEndpoint?.base_url ?? form.base_url,
+                    });
+                  }}
                 />
               )}
               {createResolvedAuthMode !== "oauth" && (
@@ -2086,7 +2385,7 @@ export default function ProvidersPage() {
                     || createOAuthMut.isPending
                     || !form.name.trim()
                     || (createResolvedAuthMode === "apikey"
-                      && form.protocol_mode !== "adaptive"
+                      && (form.protocol_mode !== "adaptive" || createIsSharedKey)
                       && !form.api_key)
                     || (form.protocol_mode === "adaptive"
                       && !(form.protocol_endpoints ?? []).some((endpoint) => endpoint.is_enabled !== false))
@@ -2175,6 +2474,13 @@ export default function ProvidersPage() {
               );
               const editingResolvedAuthMode = presetChannelAuthMode(editingPreset, editingChannelValue);
               const editUsesVertexServiceAccount = isVertexProviderSelection(editForm);
+              const editingSharedKeyChannel = presetSharedKeyChannel(editingPreset, editingChannelValue);
+              const editingIsSharedKey = editingResolvedAuthMode === "apikey"
+                && editingSharedKeyChannel !== null
+                && !editUsesVertexServiceAccount;
+              const editingSharedKeyEntries = editingSharedKeyChannel
+                ? sharedKeyProtocolEntries(editingSharedKeyChannel)
+                : [];
               const currentProviderIsOAuth =
                 normalizeAuthMode(p.auth_mode) === "oauth"
                 || normalizeAuthMode(editForm.auth_mode) === "oauth";
@@ -2274,7 +2580,32 @@ export default function ProvidersPage() {
                             ? (nextBaseUrl || defaultVertexBaseUrl(resolvedProtocol))
                             : nextBaseUrl;
                           setEditError(null);
-                          if (editForm.protocol_mode === "adaptive" && nextAuthMode === "apikey" && !editUsesVertexServiceAccount) {
+                          const nextSharedChannel = presetSharedKeyChannel(editingPreset, value);
+                          if (nextSharedChannel && nextAuthMode === "apikey" && !editUsesVertexServiceAccount) {
+                            const seeded = seedSharedKeyEndpoints(
+                              sharedKeyProtocolEntries(nextSharedChannel),
+                              editForm.api_key ?? "",
+                              endpointOption(resolvedProtocol).id,
+                            );
+                            setEditForm({
+                              ...editForm,
+                              channel: value,
+                              auth_mode: nextAuthMode,
+                              protocol_mode: "adaptive",
+                              protocol: seeded.defaultProtocol,
+                              protocol_endpoints: seeded.endpoints,
+                              base_url: seeded.endpoints.find((endpoint) => endpoint.protocol === seeded.defaultProtocol)?.base_url ?? baseUrl,
+                              models_source: config.modelsSource,
+                              static_models: config.staticModels,
+                            });
+                            return;
+                          }
+                          if (
+                            editForm.protocol_mode === "adaptive"
+                            && nextAuthMode === "apikey"
+                            && !editUsesVertexServiceAccount
+                            && presetSharedKeyChannel(editingPreset, editForm.channel) === null
+                          ) {
                             setEditForm({
                               ...editForm,
                               channel: value,
@@ -2501,7 +2832,7 @@ export default function ProvidersPage() {
                         onChange={(e) => setEditForm({ ...editForm, name: e.target.value })}
                       />
                     </div>
-                    {editingResolvedAuthMode !== "oauth" && !editUsesVertexServiceAccount ? (
+                    {editingResolvedAuthMode !== "oauth" && !editUsesVertexServiceAccount && !editingIsSharedKey ? (
                       <div className="space-y-2">
                         <FieldLabel>{isZh ? "协议模式" : "Protocol Mode"}</FieldLabel>
                         <ToggleGroup
@@ -2544,13 +2875,15 @@ export default function ProvidersPage() {
                         </ToggleGroup>
                       </div>
                     ) : null}
-                    {editingResolvedAuthMode !== "oauth" && editForm.protocol_mode !== "adaptive" ? (
+                    {editingResolvedAuthMode !== "oauth" && (editForm.protocol_mode !== "adaptive" || editingIsSharedKey) ? (
                       <div className={editUsesVertexServiceAccount ? "col-span-2 space-y-2" : "space-y-2"}>
                         <FieldLabel
                           info={
                             editUsesVertexServiceAccount
                               ? (isZh ? "粘贴 Google Cloud 服务账号 JSON，需包含 project_id、client_email、private_key。" : "Paste the Google Cloud service account JSON with project_id, client_email, and private_key.")
-                              : undefined
+                              : editingIsSharedKey
+                                ? (isZh ? "所有勾选的协议共用这一个 API Key。" : "Every checked protocol shares this single API key.")
+                                : undefined
                           }
                         >
                           {editUsesVertexServiceAccount ? (isZh ? "服务账号 JSON" : "Service Account JSON") : (isZh ? "API Key" : "API Key")}
@@ -2573,7 +2906,21 @@ export default function ProvidersPage() {
                               type={showEditApiKey ? "text" : "password"}
                               value={editForm.api_key ?? ""}
                               className="pr-10"
-                              onChange={(e) => setEditForm({ ...editForm, api_key: e.target.value })}
+                              onChange={(e) => {
+                                const apiKey = e.target.value;
+                                setEditForm({
+                                  ...editForm,
+                                  api_key: apiKey,
+                                  ...(editingIsSharedKey
+                                    ? {
+                                        protocol_endpoints: (editForm.protocol_endpoints ?? []).map((endpoint) => ({
+                                          ...endpoint,
+                                          api_key: apiKey,
+                                        })),
+                                      }
+                                    : {}),
+                                });
+                              }}
                             />
                             <button
                               type="button"
@@ -2587,7 +2934,7 @@ export default function ProvidersPage() {
                         )}
                       </div>
                     ) : null}
-                    {editingResolvedAuthMode !== "oauth" && editForm.protocol_mode !== "adaptive" ? (
+                    {editingResolvedAuthMode !== "oauth" && editForm.protocol_mode !== "adaptive" && !editingIsSharedKey ? (
                     <div className="space-y-2">
                       <FieldLabel>{isZh ? "协议" : "Protocol"}</FieldLabel>
                       <Select
@@ -2630,7 +2977,7 @@ export default function ProvidersPage() {
                       </Select>
                     </div>
                     ) : null}
-                    {editingResolvedAuthMode !== "oauth" && editForm.protocol_mode !== "adaptive" ? (
+                    {editingResolvedAuthMode !== "oauth" && editForm.protocol_mode !== "adaptive" && !editingIsSharedKey ? (
                     <div className="space-y-2">
                       <FieldLabel>Base URL</FieldLabel>
                       <Input
@@ -2640,7 +2987,7 @@ export default function ProvidersPage() {
                       />
                     </div>
                     ) : null}
-                    {editingResolvedAuthMode !== "oauth" && editForm.protocol_mode === "adaptive" ? (
+                    {editingResolvedAuthMode !== "oauth" && editForm.protocol_mode === "adaptive" && !editingIsSharedKey ? (
                       <AdaptiveEndpointEditor
                         endpoints={editForm.protocol_endpoints ?? []}
                         defaultProtocol={editForm.protocol ?? ""}
@@ -2650,6 +2997,25 @@ export default function ProvidersPage() {
                           protocol: defaultProtocol,
                           protocol_endpoints: protocolEndpoints,
                         })}
+                      />
+                    ) : null}
+                    {editingResolvedAuthMode !== "oauth" && editingIsSharedKey ? (
+                      <SharedKeyProtocolPicker
+                        entries={editingSharedKeyEntries}
+                        endpoints={editForm.protocol_endpoints ?? []}
+                        defaultProtocol={editForm.protocol ?? ""}
+                        isZh={isZh}
+                        onChange={(protocolEndpoints, defaultProtocol) => {
+                          const defaultEndpoint = protocolEndpoints.find(
+                            (endpoint) => endpoint.protocol === defaultProtocol,
+                          );
+                          setEditForm({
+                            ...editForm,
+                            protocol: defaultProtocol || editForm.protocol,
+                            protocol_endpoints: protocolEndpoints,
+                            base_url: defaultEndpoint?.base_url ?? editForm.base_url,
+                          });
+                        }}
                       />
                     ) : null}
                     {editingResolvedAuthMode !== "oauth" ? (

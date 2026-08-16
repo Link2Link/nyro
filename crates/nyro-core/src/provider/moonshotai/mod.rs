@@ -52,6 +52,7 @@ const METADATA: VendorMetadata = VendorMetadata {
             auth_mode: AuthMode::ApiKey,
             oauth: None,
             runtime: None,
+            shared_key_protocols: false,
         },
         ChannelDef {
             id: "china",
@@ -76,6 +77,7 @@ const METADATA: VendorMetadata = VendorMetadata {
             auth_mode: AuthMode::ApiKey,
             oauth: None,
             runtime: None,
+            shared_key_protocols: false,
         },
     ],
 };

@@ -37,11 +37,15 @@ const METADATA: VendorMetadata = VendorMetadata {
         base_urls: &[
             ProtocolBaseUrl {
                 protocol: "openai-compatible",
-                base_url: "https://api.deepseek.com/v1",
+                base_url: "https://api.deepseek.com",
             },
             ProtocolBaseUrl {
                 protocol: "anthropic-messages",
                 base_url: "https://api.deepseek.com/anthropic",
+            },
+            ProtocolBaseUrl {
+                protocol: "openai-responses",
+                base_url: "https://api.deepseek.com",
             },
         ],
         api_key: None,
@@ -51,6 +55,7 @@ const METADATA: VendorMetadata = VendorMetadata {
         auth_mode: AuthMode::ApiKey,
         oauth: None,
         runtime: None,
+        shared_key_protocols: true,
     }],
 };
 
@@ -76,8 +81,15 @@ impl Vendor for DeepseekVendor {
         "deepseek"
     }
     fn supported_protocols(&self) -> &'static [ProtocolId] {
-        use crate::protocol::ids::OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1;
-        &[OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1]
+        use crate::protocol::ids::{
+            ANTHROPIC_MESSAGES_2023_06_01, OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1,
+            OPENAI_RESPONSES_V1,
+        };
+        &[
+            ANTHROPIC_MESSAGES_2023_06_01,
+            OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1,
+            OPENAI_RESPONSES_V1,
+        ]
     }
     fn declared_request_mutations(&self) -> bool {
         false
