@@ -83,6 +83,18 @@ pub struct ProviderUsageBalance {
     pub topped_up: f64,
 }
 
+/// A spend figure (consumed amount over a period), e.g. DeepSeek's
+/// today/month cost read from the platform dashboard API.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct ProviderUsageSpend {
+    /// `today` | `month`
+    pub name: String,
+    /// Consumed amount in the account currency.
+    pub amount: f64,
+    /// ISO currency code, e.g. `CNY`.
+    pub currency: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ProviderUsage {
     pub provider_id: String,
@@ -97,6 +109,8 @@ pub struct ProviderUsage {
     pub tiers: Vec<ProviderUsageTier>,
     /// Account balances (pay-as-you-go vendors).
     pub balances: Vec<ProviderUsageBalance>,
+    /// Spend figures over periods (e.g. DeepSeek today/month cost).
+    pub spends: Vec<ProviderUsageSpend>,
     /// Account availability flag when the upstream reports one.
     pub is_available: Option<bool>,
     pub queried_at: String,
@@ -540,13 +554,150 @@ fn parse_ark_tiers(result: &Value) -> Vec<ProviderUsageTier> {
     tiers
 }
 
-/// Settings keys for the per-provider Volcengine IAM credentials used by the
-/// Ark usage query (distinct from the inference API key).
-fn ark_credential_keys(provider_id: &str) -> (String, String) {
+/// Settings keys for the per-provider usage-query credentials (distinct from
+/// the inference API key). Two generic slots: Volcengine Ark stores its IAM
+/// AK/SK pair; DeepSeek stores the platform userToken in slot A. Reads fall
+/// back to the legacy `usage.ark.*` keys so existing Ark setups keep working.
+fn usage_credential_keys(provider_id: &str) -> ((String, String), (String, String)) {
     (
-        format!("usage.ark.ak.{provider_id}"),
-        format!("usage.ark.sk.{provider_id}"),
+        (
+            format!("usage.cred.a.{provider_id}"),
+            format!("usage.cred.b.{provider_id}"),
+        ),
+        (
+            format!("usage.ark.ak.{provider_id}"),
+            format!("usage.ark.sk.{provider_id}"),
+        ),
     )
+}
+
+/// Parse the DeepSeek platform dashboard `usage/cost` response into
+/// today's and the month's total spend.
+///
+/// Envelope (private API, verified against the web console):
+/// `{ code: 0, data: { biz_code: 0, biz_data: { days: [ { date:
+/// "YYYY-MM-DD", data: [ { usage: [ { cost|amount } ] } ] } ] } } } }`
+/// (`biz_data` may also be a one-element array). Days are keyed by the
+/// account's local calendar date; every model's usage cost is summed per
+/// day, the month total across all days. Returns an empty list on any
+/// envelope/shape mismatch (the caller then just omits spend rows).
+fn parse_deepseek_spends(body: &Value, currency: &str) -> Vec<ProviderUsageSpend> {
+    if body.get("code").and_then(Value::as_i64) != Some(0) {
+        return Vec::new();
+    }
+    let Some(data) = body.get("data") else {
+        return Vec::new();
+    };
+    if data.get("biz_code").and_then(Value::as_i64) != Some(0) {
+        return Vec::new();
+    }
+    let Some(biz_data) = data.get("biz_data") else {
+        return Vec::new();
+    };
+    let container = biz_data
+        .as_array()
+        .and_then(|items| items.first())
+        .unwrap_or(biz_data);
+    let Some(days) = container.get("days").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let mut today_amount = None;
+    let mut month_amount = 0.0;
+    for day in days {
+        let date = day.get("date").and_then(Value::as_str).unwrap_or("");
+        let mut day_total = 0.0;
+        for model_entry in day
+            .get("data")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            for usage in model_entry
+                .get("usage")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                if let Some(cost) = usage
+                    .get("cost")
+                    .or_else(|| usage.get("amount"))
+                    .and_then(parse_f64)
+                {
+                    day_total += cost;
+                }
+            }
+        }
+        month_amount += day_total;
+        if date == today {
+            today_amount = Some(day_total);
+        }
+    }
+
+    let mut spends = Vec::new();
+    if let Some(amount) = today_amount {
+        spends.push(ProviderUsageSpend {
+            name: "today".to_string(),
+            amount: (amount * 100.0).round() / 100.0,
+            currency: currency.to_string(),
+        });
+    }
+    spends.push(ProviderUsageSpend {
+        name: "month".to_string(),
+        amount: (month_amount * 100.0).round() / 100.0,
+        currency: currency.to_string(),
+    });
+    spends
+}
+
+/// Fetch the current month's cost from the DeepSeek platform dashboard API.
+/// Auth is the web session `userToken` (platform.deepseek.com localStorage),
+/// NOT the inference API key. Envelope errors (expired token: 40002/40003)
+/// surface as errors the caller silently ignores.
+async fn fetch_deepseek_platform_cost(
+    client: &reqwest::Client,
+    token: &str,
+) -> anyhow::Result<Value> {
+    use chrono::Datelike;
+    let now = chrono::Local::now();
+    let url = format!(
+        "https://platform.deepseek.com/api/v0/usage/cost?month={}&year={}",
+        now.month(),
+        now.year()
+    );
+    let resp = client
+        .get(url)
+        .header(AUTHORIZATION, format!("Bearer {token}"))
+        .header("Accept", "application/json")
+        .header("x-app-version", "1.0.0")
+        .timeout(Duration::from_secs(15))
+        .send()
+        .await
+        .map_err(|e| anyhow::anyhow!("platform usage request failed: {e}"))?;
+    let status = resp.status();
+    let raw = resp
+        .bytes()
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to read platform usage response: {e}"))?;
+    let body: Value = serde_json::from_slice(&raw)
+        .map_err(|e| anyhow::anyhow!("failed to parse platform usage response: {e}"))?;
+    if !status.is_success() {
+        let code = body.get("code").and_then(Value::as_i64).unwrap_or(0);
+        anyhow::bail!("HTTP {status} (code {code})");
+    }
+    if body.get("code").and_then(Value::as_i64) == Some(40002)
+        || body.get("code").and_then(Value::as_i64) == Some(40003)
+    {
+        anyhow::bail!(
+            "platform token expired: re-login platform.deepseek.com and update the token"
+        );
+    }
+    if body.get("code").and_then(Value::as_i64) != Some(0) {
+        let code = body.get("code").and_then(Value::as_i64).unwrap_or(-1);
+        anyhow::bail!("platform usage error (code {code})");
+    }
+    Ok(body)
 }
 
 /// Resolve the API key for a usage query. GLM coding plans are plain
@@ -624,7 +775,7 @@ impl AdminService {
             anyhow::bail!("provider api key is empty");
         };
 
-        let (tiers, balances, level, is_available) = match backend {
+        let (tiers, balances, level, is_available, spends) = match backend {
             UsageBackend::GlmCn | UsageBackend::GlmGlobal => {
                 let site_base = match backend {
                     UsageBackend::GlmCn => "https://open.bigmodel.cn",
@@ -679,7 +830,13 @@ impl AdminService {
                     .get("level")
                     .and_then(Value::as_str)
                     .map(str::to_string);
-                (parse_glm_quota_tiers(data), Vec::new(), level, None)
+                (
+                    parse_glm_quota_tiers(data),
+                    Vec::new(),
+                    level,
+                    None,
+                    Vec::new(),
+                )
             }
             UsageBackend::MinimaxCn | UsageBackend::MinimaxGlobal => {
                 let domain = match backend {
@@ -704,13 +861,19 @@ impl AdminService {
                         anyhow::bail!("API error (code {status_code}): {msg}");
                     }
                 }
-                (parse_minimax_tiers(&body), Vec::new(), None, None)
+                (
+                    parse_minimax_tiers(&body),
+                    Vec::new(),
+                    None,
+                    None,
+                    Vec::new(),
+                )
             }
             UsageBackend::KimiCode => {
                 let body = fetch_usage_json(&self.gw.http_client, KIMI_USAGE_URL, &api_key).await?;
                 // Kimi reports failures via plain HTTP statuses; a 200 body
                 // with tiers (or an empty one) is the success shape.
-                (parse_kimi_tiers(&body), Vec::new(), None, None)
+                (parse_kimi_tiers(&body), Vec::new(), None, None, Vec::new())
             }
             UsageBackend::DeepSeek => {
                 // DeepSeek reports failures via plain HTTP statuses; the
@@ -719,14 +882,39 @@ impl AdminService {
                 let body =
                     fetch_usage_json(&self.gw.http_client, DEEPSEEK_BALANCE_URL, &api_key).await?;
                 let (balances, is_available) = parse_deepseek_balances(&body);
-                (Vec::new(), balances, None, is_available)
+
+                // Optional spend detail (today/month) from the platform
+                // dashboard API — needs the web-session userToken, not the
+                // API key. Without a token (or on any failure) the spend
+                // rows are silently omitted; the balance still shows.
+                let mut spends = Vec::new();
+                if let Ok((Some(platform_token), _)) =
+                    self.get_provider_usage_credentials(&provider.id).await
+                {
+                    if let Ok(cost_body) =
+                        fetch_deepseek_platform_cost(&self.gw.http_client, &platform_token).await
+                    {
+                        let currency = balances
+                            .first()
+                            .map(|b| b.currency.clone())
+                            .unwrap_or_else(|| "CNY".to_string());
+                        spends = parse_deepseek_spends(&cost_body, &currency);
+                    }
+                }
+                (Vec::new(), balances, None, is_available, spends)
             }
             UsageBackend::OpencodeGo => {
                 // OpenCode Go reports failures via plain HTTP statuses; the
                 // 200 body carries three ready-made percentage windows.
                 let body =
                     fetch_usage_json(&self.gw.http_client, OPENCODE_GO_USAGE_URL, &api_key).await?;
-                (parse_opencode_tiers(&body), Vec::new(), None, None)
+                (
+                    parse_opencode_tiers(&body),
+                    Vec::new(),
+                    None,
+                    None,
+                    Vec::new(),
+                )
             }
             UsageBackend::ArkCoding => {
                 // The Ark control-plane OpenAPI needs IAM AK/SK signing; the
@@ -792,7 +980,7 @@ impl AdminService {
                     anyhow::bail!("API error (code {code}): {message}");
                 }
                 let result = body.get("Result").cloned().unwrap_or(Value::Null);
-                (parse_ark_tiers(&result), Vec::new(), None, None)
+                (parse_ark_tiers(&result), Vec::new(), None, None, Vec::new())
             }
         };
 
@@ -803,29 +991,37 @@ impl AdminService {
             level,
             tiers,
             balances,
+            spends,
             is_available,
             queried_at: chrono::Utc::now().to_rfc3339(),
         })
     }
 
-    /// Get the stored usage-query credentials for a provider. Currently only
-    /// Ark providers use them (Volcengine IAM AK/SK). Empty strings are
-    /// normalized to `None`.
+    /// Get the stored usage-query credentials for a provider. Two generic
+    /// slots: Ark stores its IAM AK/SK pair, DeepSeek its platform userToken
+    /// in slot A. Legacy `usage.ark.*` keys are read as a fallback so
+    /// existing Ark setups keep working. Empty strings are normalized to
+    /// `None`.
     pub async fn get_provider_usage_credentials(
         &self,
         provider_id: &str,
     ) -> anyhow::Result<(Option<String>, Option<String>)> {
-        let (ak_key, sk_key) = ark_credential_keys(provider_id);
+        let ((a_key, b_key), (legacy_a, legacy_b)) = usage_credential_keys(provider_id);
         let store = self.gw.storage.settings();
         let normalize = |value: Option<String>| {
             value
                 .map(|v| v.trim().to_string())
                 .filter(|v| !v.is_empty())
         };
-        Ok((
-            normalize(store.get(&ak_key).await?),
-            normalize(store.get(&sk_key).await?),
-        ))
+        let a = match normalize(store.get(&a_key).await?) {
+            Some(value) => Some(value),
+            None => normalize(store.get(&legacy_a).await?),
+        };
+        let b = match normalize(store.get(&b_key).await?) {
+            Some(value) => Some(value),
+            None => normalize(store.get(&legacy_b).await?),
+        };
+        Ok((a, b))
     }
 
     /// Store (or clear, when empty) the usage-query credentials for a
@@ -836,10 +1032,10 @@ impl AdminService {
         access_key: &str,
         secret_key: &str,
     ) -> anyhow::Result<()> {
-        let (ak_key, sk_key) = ark_credential_keys(provider_id);
+        let ((a_key, b_key), _) = usage_credential_keys(provider_id);
         let store = self.gw.storage.settings();
-        store.set(&ak_key, access_key.trim()).await?;
-        store.set(&sk_key, secret_key.trim()).await?;
+        store.set(&a_key, access_key.trim()).await?;
+        store.set(&b_key, secret_key.trim()).await?;
         Ok(())
     }
 }
@@ -1338,6 +1534,74 @@ mod tests {
     }
 
     #[test]
+    fn deepseek_spends_parse_today_and_month() {
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        let body = serde_json::json!({
+            "code": 0,
+            "data": { "biz_code": 0, "biz_data": { "days": [
+                { "date": "2026-08-01", "data": [
+                    { "usage": [ { "cost": "1.25" } ] },
+                ]},
+                { "date": today, "data": [
+                    { "usage": [ { "cost": "0.5" }, { "amount": "0.25" } ] },
+                    { "usage": [ { "cost": "0.1" } ] },
+                ]},
+            ]}},
+        });
+        let spends = parse_deepseek_spends(&body, "CNY");
+        assert_eq!(spends.len(), 2);
+        assert_eq!(spends[0].name, "today");
+        assert_eq!(spends[0].amount, 0.85); // 0.5 + 0.25 + 0.1
+        assert_eq!(spends[0].currency, "CNY");
+        assert_eq!(spends[1].name, "month");
+        assert_eq!(spends[1].amount, 2.10); // 1.25 + 0.85
+    }
+
+    #[test]
+    fn deepseek_spends_without_today_row_only_month() {
+        let body = serde_json::json!({
+            "code": 0,
+            "data": { "biz_code": 0, "biz_data": { "days": [
+                { "date": "2026-08-01", "data": [
+                    { "usage": [ { "cost": 3 } ] },
+                ]},
+            ]}},
+        });
+        let spends = parse_deepseek_spends(&body, "CNY");
+        assert_eq!(spends.len(), 1);
+        assert_eq!(spends[0].name, "month");
+        assert_eq!(spends[0].amount, 3.0);
+    }
+
+    #[test]
+    fn deepseek_spends_bad_envelope_is_empty() {
+        // Non-zero envelope codes (e.g. expired token 40002) yield no rows —
+        // the caller silently omits spend detail.
+        for body in [
+            serde_json::json!({ "code": 40002 }),
+            serde_json::json!({ "code": 0, "data": { "biz_code": 1 } }),
+            serde_json::json!({ "code": 0, "data": { "biz_code": 0, "biz_data": {} } }),
+        ] {
+            assert!(parse_deepseek_spends(&body, "CNY").is_empty());
+        }
+    }
+
+    #[test]
+    fn deepseek_spends_accepts_biz_data_array() {
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        let body = serde_json::json!({
+            "code": 0,
+            "data": { "biz_code": 0, "biz_data": [
+                { "days": [ { "date": today, "data": [ { "usage": [ { "cost": 2 } ] } ] } ] },
+            ]},
+        });
+        let spends = parse_deepseek_spends(&body, "CNY");
+        assert_eq!(spends.len(), 2);
+        assert_eq!(spends[0].amount, 2.0);
+        assert_eq!(spends[1].amount, 2.0);
+    }
+
+    #[test]
     fn opencode_three_windows_pass_through_percentages() {
         // Real response shape (observed 2026-08-16): percent is already a
         // used percentage, resetsAt already ISO — both passed through, in
@@ -1385,7 +1649,13 @@ mod tests {
         assert_eq!(tiers[2].name, "monthly");
         // ResetTimestamp <= 0 → no resets_at.
         assert_eq!(tiers[2].resets_at, None);
-        assert!(tiers[0].resets_at.as_deref().unwrap_or("").starts_with("2026-"));
+        assert!(
+            tiers[0]
+                .resets_at
+                .as_deref()
+                .unwrap_or("")
+                .starts_with("2026-")
+        );
     }
 
     #[test]

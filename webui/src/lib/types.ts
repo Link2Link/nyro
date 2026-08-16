@@ -285,10 +285,20 @@ export interface ModelProbeOutcome {
   results: ModelProbeResult[];
 }
 
-/** Usage-query credentials for a provider (currently Ark IAM AK/SK only). */
+/** Usage-query credentials for a provider (Ark IAM AK/SK, DeepSeek platform token, ...). */
 export interface ProviderUsageCredentials {
   access_key?: string | null;
   secret_key?: string | null;
+}
+
+/** A spend figure over a period (e.g. DeepSeek today/month cost). */
+export interface ProviderUsageSpend {
+  /** `today` | `month` */
+  name: string;
+  /** Consumed amount in the account currency. */
+  amount: number;
+  /** ISO currency code, e.g. `CNY`. */
+  currency: string;
 }
 
 export interface ProviderPreset {
@@ -533,6 +543,8 @@ export interface ProviderUsage {
   tiers: ProviderUsageTier[];
   /** Account balances (pay-as-you-go vendors). */
   balances?: ProviderUsageBalance[];
+  /** Spend figures over periods (e.g. DeepSeek today/month cost). */
+  spends?: ProviderUsageSpend[];
   /** Account availability flag when the upstream reports one. */
   is_available?: boolean | null;
   queried_at: string;

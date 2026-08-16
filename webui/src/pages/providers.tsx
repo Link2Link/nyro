@@ -2669,6 +2669,7 @@ export default function ProvidersPage() {
                 ? sharedKeyProtocolEntries(editingSharedKeyChannel)
                 : [];
               const editingProviderIsArk = p.base_url.toLowerCase().includes("volces.com");
+              const editingProviderIsDeepSeek = p.base_url.toLowerCase().includes("api.deepseek.com");
               const currentProviderIsOAuth =
                 normalizeAuthMode(p.auth_mode) === "oauth"
                 || normalizeAuthMode(editForm.auth_mode) === "oauth";
@@ -3264,6 +3265,28 @@ export default function ProvidersPage() {
                             />
                           </div>
                         </div>
+                      </div>
+                    )}
+                    {editingProviderIsDeepSeek && (
+                      <div className="col-span-2 space-y-2 rounded-xl border border-slate-200 bg-slate-50/60 p-3">
+                        <FieldLabel
+                          info={
+                            isZh
+                              ? "用于查询每日/每月消费明细（余额无需此令牌）。登录 platform.deepseek.com 后，从浏览器开发者工具 → Application → Local Storage 中复制 userToken 的值。留空保存即清除。"
+                              : "Used to query today/month spend detail (balance works without it). Sign in to platform.deepseek.com, then copy the userToken value from DevTools → Application → Local Storage. Save with blanks to clear."
+                          }
+                        >
+                          {isZh ? "消费查询平台令牌（DeepSeek）" : "Spend Query Platform Token (DeepSeek)"}
+                        </FieldLabel>
+                        <Input
+                          className="bg-white"
+                          type="password"
+                          placeholder="eyJ..."
+                          autoComplete="off"
+                          spellCheck={false}
+                          value={editUsageAk}
+                          onChange={(e) => setEditUsageAk(e.target.value)}
+                        />
                       </div>
                     )}
                     {isGlobalProxyEnabled && editingResolvedAuthMode !== "oauth" && (

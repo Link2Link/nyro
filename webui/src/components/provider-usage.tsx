@@ -7,6 +7,8 @@ import type {
   Provider,
   ProviderUsage,
   ProviderUsageBalance,
+  ProviderUsageCredentials,
+  ProviderUsageSpend,
   ProviderUsageTier,
 } from "@/lib/types";
 
@@ -48,6 +50,36 @@ function countdownStr(resetsAt?: string | null): string | null {
   return `${minutes}m`;
 }
 
+/** Window length per tier, used to place the steady-pace marker. */
+function tierWindowMs(name: string): number | null {
+  switch (name) {
+    case "five_hour":
+      return 5 * 3600_000;
+    case "weekly_limit":
+      return 7 * 24 * 3600_000;
+    case "monthly":
+      return 30 * 24 * 3600_000;
+    default:
+      return null;
+  }
+}
+
+/**
+ * Steady-pace progress: the position (0-100) a perfectly even consumer would
+ * sit at right now. Computed from the reset time walking the window
+ * backwards: `elapsed / window` — 0 right after reset, 100 at reset time.
+ * Returns null when the tier carries no reset time or unknown window.
+ */
+function steadyPacePercent(tier: ProviderUsageTier, now: number): number | null {
+  if (!tier.resets_at) return null;
+  const windowMs = tierWindowMs(tier.name);
+  if (windowMs == null) return null;
+  const remaining = new Date(tier.resets_at).getTime() - now;
+  if (remaining <= 0) return 100;
+  if (remaining >= windowMs) return 0;
+  return ((windowMs - remaining) / windowMs) * 100;
+}
+
 const TIER_LABELS_ZH: Record<string, string> = {
   five_hour: "5小时",
   weekly_limit: "每周",
@@ -72,19 +104,44 @@ function formatRelativeTime(timestamp: string, now: number, isZh: boolean): stri
   return isZh ? `${Math.floor(diff / 86400)} 天前` : `${Math.floor(diff / 86400)}d ago`;
 }
 
-function TierBar({ tier, isZh }: { tier: ProviderUsageTier; isZh: boolean }) {
+function TierBar({
+  tier,
+  isZh,
+  now,
+}: {
+  tier: ProviderUsageTier;
+  isZh: boolean;
+  /** Tracked so the steady-pace marker re-evaluates on the 30s tick. */
+  now: number;
+}) {
   const countdown = countdownStr(tier.resets_at);
   const used = Math.min(Math.max(tier.used_percent, 0), 100);
+  const pace = steadyPacePercent(tier, now);
   return (
     <div className="flex items-center gap-3 text-xs">
       <span className="w-14 shrink-0 font-medium text-slate-500">
         {tierLabel(tier.name, isZh)}
       </span>
-      <div className="h-2 flex-1 overflow-hidden rounded-full bg-slate-100">
+      <div className="relative h-2 flex-1 overflow-hidden rounded-full bg-slate-100">
         <div
           className={`h-full rounded-full transition-all ${utilizationBarClass(used)}`}
           style={{ width: `${used}%` }}
         />
+        {pace != null && (
+          <div
+            // Steady-pace marker: where an even consumer would be right now
+            // (0% right after reset → 100% at reset time). White-outlined
+            // needle stays legible over both the colored fill and the pale
+            // unused track.
+            className="absolute inset-y-0 w-[3px] -translate-x-1/2 rounded-full bg-slate-700 shadow-[0_0_0_1.5px_rgba(255,255,255,0.9)]"
+            style={{ left: `${Math.min(Math.max(pace, 0), 100)}%` }}
+            title={
+              isZh
+                ? `匀速参考线：${Math.round(pace)}%（按整窗匀速使用推进）`
+                : `Steady pace: ${Math.round(pace)}% (even consumption over the window)`
+            }
+          />
+        )}
       </div>
       <span className={`w-10 shrink-0 text-right font-semibold tabular-nums ${utilizationColor(used)}`}>
         {Math.round(used)}%
@@ -100,6 +157,30 @@ function TierBar({ tier, isZh }: { tier: ProviderUsageTier; isZh: boolean }) {
           </>
         ) : null}
       </span>
+    </div>
+  );
+}
+
+function SpendRow({ spend, isZh }: { spend: ProviderUsageSpend; isZh: boolean }) {
+  const symbol = spend.currency === "CNY" ? "¥" : spend.currency === "USD" ? "$" : "";
+  const label =
+    spend.name === "today"
+      ? isZh
+        ? "今日"
+        : "Today"
+      : spend.name === "month"
+        ? isZh
+          ? "本月"
+          : "Month"
+        : spend.name;
+  return (
+    <div className="flex items-center justify-between gap-3 text-xs">
+      <span className="w-14 shrink-0 font-medium text-slate-500">{label}</span>
+      <span className="flex-1 font-semibold tabular-nums text-slate-700">
+        {symbol}
+        {spend.amount.toFixed(2)}
+      </span>
+      <span className="w-14 shrink-0" />
     </div>
   );
 }
@@ -147,6 +228,24 @@ export function ProviderUsageFooter({ provider }: { provider: Provider }) {
   const isZh = locale === "zh-CN";
   const [now, setNow] = useState(() => Date.now());
 
+  // Ark usage needs Volcengine IAM AK/SK (distinct from the inference key).
+  // Until they are configured the footer stays hidden — no error banner.
+  const isArk = provider.base_url.toLowerCase().includes("volces.com");
+  const { data: arkCredentials } = useQuery<ProviderUsageCredentials | null>({
+    queryKey: ["provider-usage-credentials", provider.id],
+    queryFn: () =>
+      backend<ProviderUsageCredentials | null>("get_provider_usage_credentials", {
+        id: provider.id,
+      }).catch(() => null),
+    enabled: isArk,
+    staleTime: 5 * 60 * 1000,
+    retry: false,
+    refetchOnWindowFocus: false,
+  });
+  const arkConfigured = Boolean(
+    arkCredentials?.access_key?.trim() && arkCredentials?.secret_key?.trim(),
+  );
+
   const { data: usage, isFetching, error, refetch } = useQuery<ProviderUsage, Error>({
     queryKey: ["provider-usage", provider.id],
     queryFn: () => backend<ProviderUsage>("get_provider_usage", { id: provider.id }),
@@ -155,6 +254,7 @@ export function ProviderUsageFooter({ provider }: { provider: Provider }) {
     staleTime: 60 * 1000,
     retry: 1,
     refetchOnWindowFocus: false,
+    enabled: !isArk || arkConfigured,
   });
 
   // Keep the "queried X ago" label and countdowns fresh.
@@ -162,6 +262,11 @@ export function ProviderUsageFooter({ provider }: { provider: Provider }) {
     const interval = setInterval(() => setNow(Date.now()), 30_000);
     return () => clearInterval(interval);
   }, []);
+
+  // Volcengine without IAM keys: render nothing (no warning text).
+  if (isArk && !arkConfigured) {
+    return null;
+  }
 
   const shown = usage;
   const balances = shown?.balances ?? [];
@@ -214,7 +319,7 @@ export function ProviderUsageFooter({ provider }: { provider: Provider }) {
       ) : shown && shown.tiers.length > 0 ? (
         <div className="flex flex-col gap-1.5">
           {shown.tiers.map((tier) => (
-            <TierBar key={tier.name} tier={tier} isZh={isZh} />
+            <TierBar key={tier.name} tier={tier} isZh={isZh} now={now} />
           ))}
         </div>
       ) : balances.length > 0 ? (
@@ -226,6 +331,9 @@ export function ProviderUsageFooter({ provider }: { provider: Provider }) {
               isAvailable={shown?.is_available !== false}
               isZh={isZh}
             />
+          ))}
+          {(shown?.spends ?? []).map((spend) => (
+            <SpendRow key={spend.name} spend={spend} isZh={isZh} />
           ))}
         </div>
       ) : isFetching ? (
