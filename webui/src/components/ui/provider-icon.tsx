@@ -43,6 +43,7 @@ const ICON_ALIASES: Record<string, string> = {
   hunyuan: "tencent",
   glm: "zhipu",
   chatglm: "zhipu",
+  opencode: "opencode-logo-light",
 };
 
 function tokenize(value?: string): string[] {

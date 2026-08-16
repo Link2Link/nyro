@@ -466,6 +466,29 @@
     ]
   },
   {
+    "id": "opencode-go",
+    "label": {
+      "zh": "Opencode Go",
+      "en": "Opencode Go"
+    },
+    "icon": "opencode",
+    "defaultProtocol": "openai-compatible",
+    "channels": [
+      {
+        "id": "default",
+        "label": {
+          "zh": "默认",
+          "en": "Default"
+        },
+        "baseUrls": {
+          "openai-compatible": "https://opencode.ai/zen/go"
+        },
+        "modelsSource": "https://opencode.ai/zen/go/v1/models",
+        "authMode": "apikey"
+      }
+    ]
+  },
+  {
     "id": "ollama",
     "label": {
       "zh": "Ollama",

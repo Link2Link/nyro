@@ -690,3 +690,29 @@ fn kimi_code_channel_is_shared_key_multi_protocol() {
         Some("https://api.kimi.com/coding/v1/models")
     );
 }
+
+// ── 9. Opencode Go single-protocol channel ─────────────────────────────────
+
+#[test]
+fn opencode_go_channel_is_openai_compatible() {
+    let reg = VendorRegistry::global();
+    let meta = reg
+        .metadata("opencode-go")
+        .expect("opencode-go vendor metadata");
+    assert_eq!(meta.label.en, "Opencode Go");
+    assert_eq!(meta.icon, "opencode");
+
+    let channel = meta
+        .channels
+        .iter()
+        .find(|channel| channel.id == "default")
+        .expect("opencode-go default channel");
+    assert!(!channel.shared_key_protocols);
+    assert_eq!(channel.base_urls.len(), 1);
+    assert_eq!(channel.base_urls[0].protocol, "openai-compatible");
+    assert_eq!(channel.base_urls[0].base_url, "https://opencode.ai/zen/go");
+    assert_eq!(
+        channel.models_source,
+        Some("https://opencode.ai/zen/go/v1/models")
+    );
+}
