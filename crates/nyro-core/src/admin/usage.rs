@@ -485,15 +485,18 @@ fn parse_opencode_tiers(body: &Value) -> Vec<ProviderUsageTier> {
 
 /// Parse the Volcengine `GetCodingPlanUsage` OpenAPI result into tiers.
 ///
-/// Each usage window carries a `Level` label (`5h` / `weekly` / `monthly`),
-/// a used `Percent` (0-100), and a `ResetTimestamp` in unix seconds
-/// (`<= 0` means "no reset scheduled" and is dropped). Windows with unknown
-/// labels are skipped. The parser walks any nesting inside `Result` so minor
-/// upstream shape changes do not break it.
+/// Each usage window carries a `Level` label (`5h` / `session` / `weekly` /
+/// `monthly`), a used `Percent` (0-100), and a `ResetTimestamp` in unix
+/// seconds (`<= 0` means "no reset scheduled" and is dropped). Volcengine's
+/// coding plan reports its 5-hour rolling window as `session`, which maps to
+/// the `five_hour` tier. Windows with unknown labels are skipped. The parser
+/// walks any nesting inside `Result` so minor upstream shape changes do not
+/// break it.
 fn parse_ark_tiers(result: &Value) -> Vec<ProviderUsageTier> {
     fn tier_name(level: &str) -> Option<&'static str> {
         match level.trim().to_ascii_lowercase().as_str() {
-            "5h" | "five_hour" | "fivehour" => Some(TIER_FIVE_HOUR),
+            // The coding-plan API labels its 5-hour rolling window "session".
+            "5h" | "five_hour" | "fivehour" | "session" => Some(TIER_FIVE_HOUR),
             "weekly" | "week" => Some(TIER_WEEKLY_LIMIT),
             "monthly" | "month" => Some(TIER_MONTHLY),
             _ => None,
@@ -1656,6 +1659,26 @@ mod tests {
                 .unwrap_or("")
                 .starts_with("2026-")
         );
+    }
+
+    #[test]
+    fn ark_session_level_maps_to_five_hour() {
+        // The coding-plan API reports its 5-hour rolling window as `session`
+        // (AgentPlan's GetAFPUsage calls the same window `5h`). Without this
+        // mapping the window is dropped and only weekly/monthly show up.
+        let result = serde_json::json!({
+            "Usage": [
+                { "Level": "session", "Percent": 31.5, "ResetTimestamp": 1784784000 },
+                { "Level": "weekly",  "Percent": 42.5, "ResetTimestamp": 1784848000 },
+                { "Level": "monthly", "Percent": 7,    "ResetTimestamp": 0 },
+            ]
+        });
+        let tiers = parse_ark_tiers(&result);
+        assert_eq!(tiers.len(), 3);
+        assert_eq!(tiers[0].name, "five_hour");
+        assert_eq!(tiers[0].used_percent, 31.5);
+        assert_eq!(tiers[1].name, "weekly_limit");
+        assert_eq!(tiers[2].name, "monthly");
     }
 
     #[test]
