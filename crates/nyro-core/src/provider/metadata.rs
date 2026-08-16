@@ -44,6 +44,19 @@ pub struct ProtocolBaseUrl {
     pub base_url: &'static str,
 }
 
+/// Per-protocol authentication-scheme override for a channel.
+///
+/// Some vendors expose an Anthropic-compatible endpoint that authenticates
+/// with `Authorization: Bearer` instead of the Anthropic-standard `x-api-key`
+/// (e.g. Volcengine Ark). The WebUI seeds provider protocol endpoints with
+/// this scheme so both the connectivity probe and proxy egress send the
+/// header the vendor actually expects.
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct ProtocolAuthScheme {
+    pub protocol: &'static str,
+    pub auth_scheme: &'static str,
+}
+
 /// OAuth configuration for a channel.
 #[derive(Debug, Clone, Copy, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -97,6 +110,13 @@ pub struct ChannelDef {
     /// checked protocol (all carrying the same key).
     #[serde(skip_serializing_if = "is_false")]
     pub shared_key_protocols: bool,
+    /// Per-protocol auth-scheme overrides (serialized as
+    /// `authSchemes: {protocol: scheme}`); `None` = protocol defaults.
+    #[serde(
+        serialize_with = "serialize_auth_schemes",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub auth_schemes: Option<&'static [ProtocolAuthScheme]>,
 }
 
 /// Top-level vendor entry. One `VendorMetadata` per vendor.
@@ -122,6 +142,22 @@ where
     let mut map = serializer.serialize_map(Some(base_urls.len()))?;
     for entry in base_urls.iter() {
         map.serialize_entry(entry.protocol, entry.base_url)?;
+    }
+    map.end()
+}
+
+fn serialize_auth_schemes<S>(
+    auth_schemes: &Option<&'static [ProtocolAuthScheme]>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    use serde::ser::SerializeMap;
+    let entries = auth_schemes.unwrap_or_default();
+    let mut map = serializer.serialize_map(Some(entries.len()))?;
+    for entry in entries.iter() {
+        map.serialize_entry(entry.protocol, entry.auth_scheme)?;
     }
     map.end()
 }

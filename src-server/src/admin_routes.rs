@@ -61,9 +61,19 @@ pub fn create_router(gateway: Gateway, admin_token: Option<String>) -> Router {
         .route("/providers/:id/copy", post(copy_provider_handler))
         .route("/providers/:id", providers_item)
         .route("/providers/:id/test", get(test_provider_handler))
+        .route("/providers/:id/usage", get(provider_usage_handler))
         .route(
             "/providers/:id/test-models",
             get(test_provider_models_handler),
+        )
+        .route(
+            "/providers/:id/probe-models",
+            post(probe_provider_models_handler),
+        )
+        .route(
+            "/providers/:id/usage-credentials",
+            get(get_provider_usage_credentials_handler)
+                .put(put_provider_usage_credentials_handler),
         )
         .route("/providers/:id/models", get(provider_models_handler))
         .route(
@@ -256,6 +266,60 @@ async fn test_provider_models_handler(
     Path(id): Path<String>,
 ) -> impl IntoResponse {
     match gw.admin().test_provider_models(&id).await {
+        Ok(v) => Json(serde_json::json!({ "data": v })).into_response(),
+        Err(e) => err(e),
+    }
+}
+
+async fn probe_provider_models_handler(
+    State(gw): State<Gateway>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    match gw.admin().probe_provider_models(&id).await {
+        Ok(v) => Json(serde_json::json!({ "data": v })).into_response(),
+        Err(e) => err(e),
+    }
+}
+
+async fn get_provider_usage_credentials_handler(
+    State(gw): State<Gateway>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    match gw.admin().get_provider_usage_credentials(&id).await {
+        Ok((ak, sk)) => {
+            Json(serde_json::json!({ "data": { "access_key": ak, "secret_key": sk } }))
+                .into_response()
+        }
+        Err(e) => err(e),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct UsageCredentialsInput {
+    access_key: String,
+    secret_key: String,
+}
+
+async fn put_provider_usage_credentials_handler(
+    State(gw): State<Gateway>,
+    Path(id): Path<String>,
+    body: axum::Json<UsageCredentialsInput>,
+) -> impl IntoResponse {
+    match gw
+        .admin()
+        .set_provider_usage_credentials(&id, &body.access_key, &body.secret_key)
+        .await
+    {
+        Ok(()) => Json(serde_json::json!({ "ok": true })).into_response(),
+        Err(e) => err(e),
+    }
+}
+
+async fn provider_usage_handler(
+    State(gw): State<Gateway>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    match gw.admin().get_provider_usage(&id).await {
         Ok(v) => Json(serde_json::json!({ "data": v })).into_response(),
         Err(e) => err(e),
     }

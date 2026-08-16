@@ -4,6 +4,7 @@ import { GitBranch, Pencil, Plus, Route as RouteIcon, Search, Trash2, ToggleRigh
 
 import { backend } from "@/lib/backend";
 import { localizeBackendErrorMessage } from "@/lib/backend-error";
+import { failedProbeModels } from "@/lib/model-probe";
 import type {
   CreateModel,
   CreateModelBackend,
@@ -181,6 +182,18 @@ function TargetRow({
     staleTime: 60_000,
   });
 
+  // Hide models whose latest "hi" probe failed (providers page → Test Models).
+  // The currently-saved model stays visible so existing routes remain editable;
+  // hidden models can still be entered manually via the combobox custom input.
+  const unreachableModels = useMemo(
+    () => failedProbeModels(target.provider_id),
+    [target.provider_id],
+  );
+  const selectableModels = useMemo(
+    () => targetModels.filter((model) => !unreachableModels.has(model)),
+    [targetModels, unreachableModels],
+  );
+
   useEffect(() => {
     if (!target.provider_id || !providerHasModelDiscovery) {
       setCapsQueryModel("");
@@ -248,7 +261,7 @@ function TargetRow({
           <Combobox
             value={target.model}
             className="bg-white"
-            options={withCurrentModel(targetModels, target.model).map((model) => ({
+            options={withCurrentModel(selectableModels, target.model).map((model) => ({
               value: model,
               label: model,
             }))}

@@ -55,6 +55,7 @@ const METADATA: VendorMetadata = VendorMetadata {
         oauth: None,
         runtime: None,
         shared_key_protocols: true,
+        auth_schemes: None,
     }],
 };
 

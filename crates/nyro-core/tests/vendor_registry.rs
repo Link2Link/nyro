@@ -716,3 +716,76 @@ fn opencode_go_channel_is_openai_compatible() {
         Some("https://opencode.ai/zen/go/v1/models")
     );
 }
+
+// ── 10. Ark Coding (Volcengine) shared-key multi-protocol channel ──────────
+
+#[test]
+fn ark_coding_channel_is_shared_key_multi_protocol() {
+    let reg = VendorRegistry::global();
+    let meta = reg
+        .metadata("ark-coding")
+        .expect("ark-coding vendor metadata");
+    assert_eq!(meta.label.en, "Ark Coding");
+    assert_eq!(meta.icon, "doubao");
+
+    let channel = meta
+        .channels
+        .iter()
+        .find(|channel| channel.id == "default")
+        .expect("ark-coding default channel");
+    assert!(channel.shared_key_protocols, "channel must be shared-key");
+
+    let base_urls: std::collections::HashMap<&str, &str> = channel
+        .base_urls
+        .iter()
+        .map(|entry| (entry.protocol, entry.base_url))
+        .collect();
+    assert_eq!(base_urls.len(), 3);
+    assert_eq!(
+        base_urls.get("openai-compatible").copied(),
+        Some("https://ark.cn-beijing.volces.com/api/coding/v3")
+    );
+    assert_eq!(
+        base_urls.get("openai-responses").copied(),
+        Some("https://ark.cn-beijing.volces.com/api/coding/v3")
+    );
+    assert_eq!(
+        base_urls.get("anthropic-messages").copied(),
+        Some("https://ark.cn-beijing.volces.com/api/coding")
+    );
+    assert_eq!(
+        channel.models_source,
+        Some("https://ark.cn-beijing.volces.com/api/coding/v3/models")
+    );
+
+    // Ark's Anthropic endpoint authenticates with Bearer, not x-api-key.
+    let auth_schemes: std::collections::HashMap<&str, &str> = channel
+        .auth_schemes
+        .unwrap_or_default()
+        .iter()
+        .map(|entry| (entry.protocol, entry.auth_scheme))
+        .collect();
+    assert_eq!(
+        auth_schemes.get("anthropic-messages").copied(),
+        Some("bearer")
+    );
+    assert_eq!(auth_schemes.len(), 1);
+
+    // Ark's /models response is incomplete; the preset declares these
+    // coding-plan models as extras to be merged into the fetched list.
+    let mut declared: Vec<&str> = channel.static_models.iter().copied().collect();
+    declared.sort();
+    assert_eq!(
+        declared,
+        vec![
+            "deepseek-v4-flash",
+            "deepseek-v4-pro",
+            "doubao-seed-2.0-lite",
+            "doubao-seed-2.1-turbo",
+            "glm-5.2",
+            "glm-5.3",
+            "kimi-k2.7-code",
+            "minimax-m3",
+        ]
+    );
+}

@@ -96,12 +96,63 @@ pub async fn test_provider(gw: State<'_, Gateway>, id: String) -> Result<TestRes
 }
 
 #[tauri::command]
+pub async fn get_provider_usage(
+    gw: State<'_, Gateway>,
+    id: String,
+) -> Result<nyro_core::admin::ProviderUsage, String> {
+    gw.admin()
+        .get_provider_usage(&id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 pub async fn test_provider_models(
     gw: State<'_, Gateway>,
     id: String,
 ) -> Result<Vec<String>, String> {
     gw.admin()
         .test_provider_models(&id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn probe_provider_models(
+    gw: State<'_, Gateway>,
+    id: String,
+) -> Result<nyro_core::admin::ProviderModelProbeOutcome, String> {
+    gw.admin()
+        .probe_provider_models(&id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn get_provider_usage_credentials(
+    gw: State<'_, Gateway>,
+    id: String,
+) -> Result<HashMap<String, Option<String>>, String> {
+    let (access_key, secret_key) = gw
+        .admin()
+        .get_provider_usage_credentials(&id)
+        .await
+        .map_err(|e| e.to_string())?;
+    let mut out = HashMap::new();
+    out.insert("access_key".to_string(), access_key);
+    out.insert("secret_key".to_string(), secret_key);
+    Ok(out)
+}
+
+#[tauri::command]
+pub async fn set_provider_usage_credentials(
+    gw: State<'_, Gateway>,
+    id: String,
+    access_key: String,
+    secret_key: String,
+) -> Result<(), String> {
+    gw.admin()
+        .set_provider_usage_credentials(&id, &access_key, &secret_key)
         .await
         .map_err(|e| e.to_string())
 }

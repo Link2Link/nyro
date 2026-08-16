@@ -80,8 +80,23 @@ function resolveHTTP(cmd: string, args?: Record<string, unknown>): HTTPMapping {
       return { method: "DELETE", url: `${base}/providers/${args?.id}` };
     case "test_provider":
       return { method: "GET", url: `${base}/providers/${args?.id}/test` };
+    case "get_provider_usage":
+      return { method: "GET", url: `${base}/providers/${args?.id}/usage` };
+    case "get_provider_usage_credentials":
+      return { method: "GET", url: `${base}/providers/${args?.id}/usage-credentials` };
+    case "set_provider_usage_credentials":
+      return {
+        method: "PUT",
+        url: `${base}/providers/${args?.id}/usage-credentials`,
+        body: {
+          access_key: String(args?.access_key ?? ""),
+          secret_key: String(args?.secret_key ?? ""),
+        },
+      };
     case "test_provider_models":
       return { method: "GET", url: `${base}/providers/${args?.id}/test-models` };
+    case "probe_provider_models":
+      return { method: "POST", url: `${base}/providers/${args?.id}/probe-models` };
     case "get_provider_models":
       return { method: "GET", url: `${base}/providers/${args?.id}/models` };
     case "get_model_capabilities":

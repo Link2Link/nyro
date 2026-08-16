@@ -15,7 +15,14 @@ import type {
   ProviderEndpointAuthScheme,
   CreateProviderProtocolEndpoint,
   ProviderOAuthStatusData,
+  ModelProbeOutcome,
+  ProviderUsageCredentials,
 } from "@/lib/types";
+import {
+  loadModelProbeResults,
+  saveModelProbeResults,
+  type ProviderModelProbeRecord,
+} from "@/lib/model-probe";
 import {
   Server,
   Plus,
@@ -32,6 +39,7 @@ import {
   ToggleRight,
   ToggleLeft,
   Copy,
+  ListChecks,
 } from "lucide-react";
 import { useLocale } from "@/lib/i18n";
 import { ProviderIcon } from "@/components/ui/provider-icon";
@@ -58,6 +66,7 @@ import {
 } from "@/components/ui/select";
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
+import { ProviderUsageFooter } from "@/components/provider-usage";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { resolveProtocol, PROTOCOL_ENDPOINT_TABLE, PROTOCOL_TABLE } from "@/lib/protocol";
 import { openExternalUrl } from "@/lib/open-external";
@@ -300,6 +309,7 @@ const protocolOptions = [
 interface SharedKeyProtocolEntry {
   protocol: ProviderProtocol;
   baseUrl: string;
+  authScheme: ProviderEndpointAuthScheme;
 }
 
 function presetSharedKeyChannel(
@@ -311,15 +321,30 @@ function presetSharedKeyChannel(
   return channel?.sharedKeyProtocols === true ? channel : null;
 }
 
+function channelAuthScheme(
+  channel: ProviderChannelPreset,
+  protocol: ProviderProtocol,
+): ProviderEndpointAuthScheme {
+  const declared = channel.authSchemes?.[protocol];
+  return declared === "bearer" || declared === "x-api-key" || declared === "query" || declared === "none"
+    ? declared
+    : "auto";
+}
+
 function sharedKeyProtocolEntries(channel: ProviderChannelPreset): SharedKeyProtocolEntry[] {
   const known = new Set(protocolOptions.map((item) => item.value));
   return Object.entries(channel.baseUrls ?? {})
-    .map(([key, baseUrl]) => ({
-      protocol: resolveProtocol(key) as ProviderProtocol | null,
-      baseUrl: toGatewayBaseUrl(baseUrl),
-    }))
-    .filter((entry): entry is SharedKeyProtocolEntry =>
-      entry.protocol !== null && known.has(entry.protocol));
+    .map(([key, baseUrl]) => {
+      const protocol = resolveProtocol(key) as ProviderProtocol | null;
+      return protocol && known.has(protocol)
+        ? {
+            protocol,
+            baseUrl: toGatewayBaseUrl(baseUrl),
+            authScheme: channelAuthScheme(channel, protocol),
+          }
+        : null;
+    })
+    .filter((entry): entry is SharedKeyProtocolEntry => entry !== null);
 }
 
 function seedSharedKeyEndpoints(
@@ -331,7 +356,7 @@ function seedSharedKeyEndpoints(
     protocol: endpointOption(entry.protocol).id,
     base_url: entry.baseUrl,
     api_key: apiKey,
-    auth_scheme: "auto" as ProviderEndpointAuthScheme,
+    auth_scheme: entry.authScheme,
     is_enabled: true,
     priority: index,
   }));
@@ -378,7 +403,7 @@ function SharedKeyProtocolPicker({
           protocol: candidateId,
           base_url: candidate.baseUrl,
           api_key: sharedKey,
-          auth_scheme: "auto" as ProviderEndpointAuthScheme,
+          auth_scheme: candidate.authScheme,
           is_enabled: true,
           priority: index,
         };
@@ -703,7 +728,24 @@ type TestLogEntry = {
 
 const PROVIDER_TEST_RESULTS_STORAGE_KEY = "nyro.provider-test-results.v1";
 
+/** Providers whose vendor has a coding-plan usage-query backend. Mirrors
+ * nyro-core `admin::usage::UsageBackend::detect` (host substring match). */
+function usageSupported(provider: Pick<Provider, "base_url">): boolean {
+  const url = provider.base_url.toLowerCase();
+  return (
+    url.includes("bigmodel.cn") ||
+    url.includes("z.ai") ||
+    url.includes("minimaxi.com") ||
+    url.includes("minimax.io") ||
+    url.includes("api.kimi.com") ||
+    url.includes("api.deepseek.com") ||
+    url.includes("opencode.ai/zen") ||
+    url.includes("volces.com")
+  );
+}
+
 function nowTimestamp() {
+
   const now = new Date();
   const hh = String(now.getHours()).padStart(2, "0");
   const mm = String(now.getMinutes()).padStart(2, "0");
@@ -752,7 +794,11 @@ export default function ProvidersPage() {
   const qc = useQueryClient();
   const [showForm, setShowForm] = useState(false);
   const [editingId, setEditingId] = useState<string | null>(null);
+  const editingIdRef = useRef<string | null>(null);
   const [testingId, setTestingId] = useState<string | null>(null);
+  const [probingId, setProbingId] = useState<string | null>(null);
+  const [modelProbeResults, setModelProbeResults] =
+    useState<Record<string, ProviderModelProbeRecord>>(loadModelProbeResults);
   const [testResult, setTestResult] = useState<Record<string, TestResult>>(loadProviderTestResults);
   const [testDialogOpen, setTestDialogOpen] = useState(false);
   const [testLogs, setTestLogs] = useState<TestLogEntry[]>([]);
@@ -782,6 +828,10 @@ export default function ProvidersPage() {
   const [editOAuthCode, setEditOAuthCode] = useState("");
   const [showEditReauth, setShowEditReauth] = useState(false);
   const editOAuthPollerRef = useRef<number | null>(null);
+  // Edit-mode Ark usage-query IAM credentials (AK/SK, distinct from the
+  // inference API key).
+  const [editUsageAk, setEditUsageAk] = useState("");
+  const [editUsageSk, setEditUsageSk] = useState("");
   const activeTestRunRef = useRef(0);
   const logsContainerRef = useRef<HTMLDivElement | null>(null);
 
@@ -914,7 +964,7 @@ export default function ProvidersPage() {
     onSuccess: () => {
       setEditError(null);
       qc.invalidateQueries({ queryKey: ["providers"] });
-      setEditingId(null);
+      setEditingId(null); editingIdRef.current = null;
     },
     onError: (err: Error) => {
       setEditError(String(err));
@@ -972,6 +1022,7 @@ export default function ProvidersPage() {
     activeTestRunRef.current += 1;
     setIsTestRunning(false);
     setTestingId(null);
+    setProbingId(null);
     setTestDialogOpen(false);
   }
 
@@ -1492,10 +1543,121 @@ export default function ProvidersPage() {
     }
   }
 
+  async function handleModelProbe(provider: Provider) {
+    const runId = activeTestRunRef.current + 1;
+    activeTestRunRef.current = runId;
+    const isCanceled = () => activeTestRunRef.current !== runId;
+
+    setProbingId(provider.id);
+    setTestTarget(provider);
+    setTestLogs([]);
+    setTestDialogOpen(true);
+    setIsTestRunning(true);
+
+    const finishProbing = (finalMessage: string, level: "success" | "error") => {
+      if (isCanceled()) return;
+      appendTestLog(level, finalMessage);
+      setIsTestRunning(false);
+      setProbingId(null);
+    };
+
+    try {
+      appendTestLog(
+        "info",
+        isZh
+          ? `开始模型测试 ${provider.name}（向每个模型发送 "hi"）...`
+          : `Start model probing ${provider.name} (sending "hi" to every model)...`,
+      );
+      appendTestLog("info", isZh ? "▶ 获取模型列表" : "▶ Fetch model list");
+
+      const outcome = await backend<ModelProbeOutcome>("probe_provider_models", {
+        id: provider.id,
+      });
+      if (isCanceled()) return;
+
+      const results = outcome.results;
+      const probeProtocol = outcome.meta?.protocol
+        ? (endpointDisplayName(outcome.meta.protocol) ?? outcome.meta.protocol)
+        : "";
+      appendTestLog(
+        "info",
+        isZh
+          ? `▶ 探测协议 [${probeProtocol}] ${outcome.meta?.base_url ?? ""}`
+          : `▶ Probe protocol [${probeProtocol}] ${outcome.meta?.base_url ?? ""}`,
+      );
+
+      const ok = results.filter((result) => result.success);
+      const failed = results.filter((result) => !result.success);
+      appendTestLog(
+        "success",
+        isZh
+          ? `✓ 模型测试完成：${ok.length} 个可用，${failed.length} 个不可用（共 ${results.length} 个）`
+          : `✓ Model probing finished: ${ok.length} reachable, ${failed.length} unreachable (of ${results.length})`,
+      );
+
+      setModelProbeResults((prev) => ({
+        ...prev,
+        [provider.id]: {
+          results,
+          tested_at: new Date().toISOString(),
+        },
+      }));
+
+      for (const result of results) {
+        const protocolLabel = result.protocol
+          ? (endpointDisplayName(result.protocol) ?? result.protocol)
+          : "";
+        const replyPreview = (result.reply ?? "").replace(/\s+/g, " ").trim().slice(0, 80);
+        if (result.success) {
+          appendTestLog(
+            "success",
+            `✓ ${result.model} [${protocolLabel}] (${result.latency_ms}ms)${replyPreview ? ` → "${replyPreview}"` : ""}`,
+          );
+        } else {
+          appendTestLog(
+            "error",
+            `✗ ${result.model} [${protocolLabel}]: ${result.error ?? (isZh ? "调用失败" : "call failed")}`,
+          );
+        }
+      }
+
+      if (failed.length > 0) {
+        appendTestLog(
+          "info",
+          isZh
+            ? "· 不可用的模型已从模型编辑的目标列表中隐藏（仍可手动输入）"
+            : "· Unreachable models are hidden from route target pickers (still enterable manually)",
+        );
+      }
+      finishProbing(
+        isZh ? "✓ 模型测试完成" : "✓ Model probing completed",
+        "success",
+      );
+    } catch (error: unknown) {
+      if (isCanceled()) return;
+      const message = normalizeErrorMessage(error);
+      finishProbing(`${isZh ? "✗ 模型测试失败" : "✗ Model probing failed"}: ${message}`, "error");
+    }
+  }
+
   function startEdit(p: Provider) {
     setEditingId(p.id);
+    editingIdRef.current = p.id;
     setEditError(null);
     setShowEditApiKey(false);
+    setEditUsageAk("");
+    setEditUsageSk("");
+    if (usageSupported(p)) {
+      void backend<ProviderUsageCredentials>("get_provider_usage_credentials", { id: p.id })
+        .then((credentials) => {
+          if (editingIdRef.current !== p.id) return;
+          setEditUsageAk(credentials?.access_key ?? "");
+          setEditUsageSk(credentials?.secret_key ?? "");
+        })
+        .catch(() => {
+          // Credentials are optional; failure to load leaves them blank.
+        });
+    }
     const presetForEdit = providerPresets.find(
       (item) => item.id === (p.preset_key || DEFAULT_PRESET_ID),
     );
@@ -1515,14 +1677,23 @@ export default function ProvidersPage() {
       const existing = (p.protocol_endpoints ?? [])
         .filter((endpoint) =>
           entries.some((entry) => endpointOption(entry.protocol).id === endpoint.protocol))
-        .map((endpoint) => ({
-          protocol: endpoint.protocol,
-          base_url: endpoint.base_url,
-          api_key: p.api_key || endpoint.api_key,
-          auth_scheme: endpoint.auth_scheme,
-          is_enabled: endpoint.is_enabled,
-          priority: endpoint.priority,
-        }));
+        .map((endpoint) => {
+          // Refresh endpoints still on "auto" with the preset's declared
+          // scheme so auth fixes reach providers created before the preset
+          // declared them (user-set explicit schemes are preserved).
+          const declared = entries.find(
+            (entry) => endpointOption(entry.protocol).id === endpoint.protocol,
+          )?.authScheme;
+          const stored = endpoint.auth_scheme ?? "auto";
+          return {
+            protocol: endpoint.protocol,
+            base_url: endpoint.base_url,
+            api_key: p.api_key || endpoint.api_key,
+            auth_scheme: stored === "auto" && declared ? declared : stored,
+            is_enabled: endpoint.is_enabled,
+            priority: endpoint.priority,
+          };
+        });
       const seeded = seedSharedKeyEndpoints(entries, p.api_key ?? "", savedEndpointId);
       const endpoints = existing.length ? existing : seeded.endpoints;
       const defaultEndpoint = endpoints.find((endpoint) => endpoint.protocol === savedEndpointId)
@@ -1783,6 +1954,10 @@ export default function ProvidersPage() {
   }, [testResult]);
 
   useEffect(() => {
+    saveModelProbeResults(modelProbeResults);
+  }, [modelProbeResults]);
+
+  useEffect(() => {
     if (isLoading) return;
     const validIds = new Set(providers.map((provider) => provider.id));
     setTestResult((prev) => {
@@ -1791,6 +1966,18 @@ export default function ProvidersPage() {
       for (const [id, result] of Object.entries(prev)) {
         if (validIds.has(id)) {
           next[id] = result;
+        } else {
+          changed = true;
+        }
+      }
+      return changed ? next : prev;
+    });
+    setModelProbeResults((prev) => {
+      let changed = false;
+      const next: Record<string, ProviderModelProbeRecord> = {};
+      for (const [id, record] of Object.entries(prev)) {
+        if (validIds.has(id)) {
+          next[id] = record;
         } else {
           changed = true;
         }
@@ -1816,7 +2003,7 @@ export default function ProvidersPage() {
         </div>
         <Button
           onClick={() => {
-            setEditingId(null);
+            setEditingId(null); editingIdRef.current = null;
             if (showForm) {
               closeCreateForm();
               return;
@@ -2481,6 +2668,7 @@ export default function ProvidersPage() {
               const editingSharedKeyEntries = editingSharedKeyChannel
                 ? sharedKeyProtocolEntries(editingSharedKeyChannel)
                 : [];
+              const editingProviderIsArk = p.base_url.toLowerCase().includes("volces.com");
               const currentProviderIsOAuth =
                 normalizeAuthMode(p.auth_mode) === "oauth"
                 || normalizeAuthMode(editForm.auth_mode) === "oauth";
@@ -2490,7 +2678,7 @@ export default function ProvidersPage() {
                 <div key={p.id} className="glass rounded-2xl p-5 space-y-4">
                   <div className="flex items-center justify-between">
                     <h3 className="text-sm font-semibold text-slate-900">{isZh ? "编辑提供商" : "Edit Provider"}</h3>
-                    <button onClick={() => setEditingId(null)} className="p-1 text-slate-400 hover:text-slate-600 cursor-pointer">
+                    <button onClick={() => { setEditingId(null); editingIdRef.current = null; }} className="p-1 text-slate-400 hover:text-slate-600 cursor-pointer">
                       <X className="h-4 w-4" />
                     </button>
                   </div>
@@ -2673,7 +2861,7 @@ export default function ProvidersPage() {
                               type="button"
                               className="ml-1 font-medium text-amber-800 underline hover:text-amber-900 cursor-pointer"
                               onClick={() => {
-                                setEditingId(null);
+                                setEditingId(null); editingIdRef.current = null;
                                 setShowForm(true);
                                 handlePresetChange("openai");
                               }}
@@ -3036,6 +3224,48 @@ export default function ProvidersPage() {
                       />
                     </div>
                     ) : null}
+                    {editingProviderIsArk && (
+                      <div className="col-span-2 space-y-2 rounded-xl border border-slate-200 bg-slate-50/60 p-3">
+                        <FieldLabel
+                          info={
+                            isZh
+                              ? "用量查询走火山引擎控制面 OpenAPI（open.volcengineapi.com），需要账号级 IAM 密钥签名，与推理用的 API Key 不同。在 console.volcengine.com/iam/keymanage 创建。留空保存即清除。"
+                              : "Usage queries go through the Volcengine control-plane OpenAPI (open.volcengineapi.com) and require account-level IAM key signing — different from the inference API key. Create one at console.volcengine.com/iam/keymanage. Save with blanks to clear."
+                          }
+                        >
+                          {isZh ? "用量查询 IAM 密钥（火山引擎）" : "Usage Query IAM Keys (Volcengine)"}
+                        </FieldLabel>
+                        <div className="grid gap-3 md:grid-cols-2">
+                          <div className="space-y-1.5">
+                            <span className="ml-1 text-xs text-slate-500">
+                              AccessKey ID
+                            </span>
+                            <Input
+                              className="bg-white"
+                              placeholder="AK..."
+                              autoComplete="off"
+                              spellCheck={false}
+                              value={editUsageAk}
+                              onChange={(e) => setEditUsageAk(e.target.value)}
+                            />
+                          </div>
+                          <div className="space-y-1.5">
+                            <span className="ml-1 text-xs text-slate-500">
+                              Secret Access Key
+                            </span>
+                            <Input
+                              className="bg-white"
+                              type="password"
+                              placeholder="SK..."
+                              autoComplete="off"
+                              spellCheck={false}
+                              value={editUsageSk}
+                              onChange={(e) => setEditUsageSk(e.target.value)}
+                            />
+                          </div>
+                        </div>
+                      </div>
+                    )}
                     {isGlobalProxyEnabled && editingResolvedAuthMode !== "oauth" && (
                       <div className="space-y-2">
                         <FieldLabel>{isZh ? "使用本地代理" : "Use Local Proxy"}</FieldLabel>
@@ -3092,6 +3322,15 @@ export default function ProvidersPage() {
                           api_key: adaptive ? (defaultEndpoint?.api_key ?? "") : (editForm.api_key || undefined),
                         };
                         updateMut.mutate({ id: editForm.id, ...input });
+                        // Persist usage-query IAM credentials alongside the
+                        // provider (fire-and-forget; blank clears).
+                        void backend("set_provider_usage_credentials", {
+                          id: editForm.id,
+                          access_key: editUsageAk,
+                          secret_key: editUsageSk,
+                        }).catch(() => {
+                          // Non-fatal: usage query simply stays unconfigured.
+                        });
                       }}
                       disabled={
                         updateMut.isPending
@@ -3105,7 +3344,7 @@ export default function ProvidersPage() {
                       {updateMut.isPending ? (isZh ? "保存中..." : "Saving...") : (isZh ? "保存" : "Save")}
                     </Button>
                     <Button
-                      onClick={() => { setEditingId(null); setEditError(null); }}
+                      onClick={() => { setEditingId(null); editingIdRef.current = null; setEditError(null); }}
                       variant="secondary"
                     >
                       {isZh ? "取消" : "Cancel"}
@@ -3224,7 +3463,7 @@ export default function ProvidersPage() {
                     </button>
                     <button
                       onClick={() => handleTest(p)}
-                      disabled={Boolean(testingId)}
+                      disabled={Boolean(testingId) || Boolean(probingId)}
                       title={isZh ? "测试" : "Test"}
                       className="rounded-lg p-2 text-slate-400 transition-colors hover:bg-amber-50 hover:text-amber-500 cursor-pointer disabled:opacity-50"
                     >
@@ -3232,6 +3471,18 @@ export default function ProvidersPage() {
                         <Loader2 className="h-3.5 w-3.5 animate-spin" />
                       ) : (
                         <Zap className="h-3.5 w-3.5" />
+                      )}
+                    </button>
+                    <button
+                      onClick={() => handleModelProbe(p)}
+                      disabled={Boolean(testingId) || Boolean(probingId)}
+                      title={isZh ? "模型测试" : "Test Models"}
+                      className="rounded-lg p-2 text-slate-400 transition-colors hover:bg-violet-50 hover:text-violet-500 cursor-pointer disabled:opacity-50"
+                    >
+                      {probingId === p.id ? (
+                        <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                      ) : (
+                        <ListChecks className="h-3.5 w-3.5" />
                       )}
                     </button>
                     <button
@@ -3265,6 +3516,7 @@ export default function ProvidersPage() {
                     </button>
                   </div>
                 </div>
+                {usageSupported(p) && <ProviderUsageFooter provider={p} />}
               </div>
             );
           })}

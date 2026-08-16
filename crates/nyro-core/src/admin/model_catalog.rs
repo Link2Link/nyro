@@ -67,13 +67,15 @@ pub(super) fn adaptive_model_fetch_auth(provider: &Provider) -> Option<(String, 
         .iter()
         .filter(|endpoint| endpoint.is_enabled)
         .find(|endpoint| {
-            registry.resolve_alias(&endpoint.protocol).is_some_and(|id| {
-                matches!(
-                    id.protocol,
-                    crate::protocol::ids::Protocol::OpenAICompatible
-                        | crate::protocol::ids::Protocol::OpenAIResponses
-                )
-            })
+            registry
+                .resolve_alias(&endpoint.protocol)
+                .is_some_and(|id| {
+                    matches!(
+                        id.protocol,
+                        crate::protocol::ids::Protocol::OpenAICompatible
+                            | crate::protocol::ids::Protocol::OpenAIResponses
+                    )
+                })
         })?;
     Some(("openai-compatible".to_string(), endpoint.api_key.clone()))
 }
@@ -180,6 +182,37 @@ pub(super) fn parse_static_models(raw: Option<&str>) -> Vec<String> {
         .filter(|line| !line.is_empty())
         .map(ToString::to_string)
         .collect::<Vec<_>>();
+    models.sort();
+    models.dedup();
+    models
+}
+
+/// Extra model ids declared by the provider's preset channel (e.g. Ark
+/// Coding's coding-plan models missing from its `/models` response).
+/// Returns an empty list when no preset channel declares any.
+pub(super) fn preset_extra_models(provider: &Provider) -> Vec<String> {
+    let Some(ref preset_key) = provider.preset_key else {
+        return Vec::new();
+    };
+    let Some(meta) = VendorRegistry::global().metadata(preset_key) else {
+        return Vec::new();
+    };
+    let channel_id = provider.channel.as_deref().unwrap_or("default");
+    let Some(channel) = meta.channels.iter().find(|c| c.id == channel_id) else {
+        return Vec::new();
+    };
+    channel
+        .static_models
+        .iter()
+        .map(|m| m.trim().to_string())
+        .filter(|m| !m.is_empty())
+        .collect()
+}
+
+/// Merge two model lists, sorted and deduplicated.
+pub(super) fn merge_model_lists(primary: Vec<String>, extra: Vec<String>) -> Vec<String> {
+    let mut models = primary;
+    models.extend(extra);
     models.sort();
     models.dedup();
     models

@@ -1,4 +1,6 @@
-//! OpenRouter vendor (OpenAI-compatible aggregator).
+//! Ark Coding vendor (ark.cn-beijing.volces.com/api/coding — Volcengine Ark
+//! coding plan). OpenAI-compatible core (chat completions + Responses API)
+//! with an Anthropic Messages endpoint; one API key is valid for all.
 
 use async_trait::async_trait;
 use reqwest::header::HeaderMap;
@@ -13,7 +15,8 @@ use crate::provider::common::openai::{
 use crate::provider::common::pipeline;
 use crate::provider::inbound::InboundResponse;
 use crate::provider::metadata::{
-    AuthMode, CapabilitiesSource, ChannelDef, Label, ProtocolBaseUrl, VendorMetadata,
+    AuthMode, CapabilitiesSource, ChannelDef, Label, ProtocolAuthScheme, ProtocolBaseUrl,
+    VendorMetadata,
 };
 use crate::provider::outbound::OutboundRequest;
 use crate::provider::registry::{VendorRegistration, VendorScope};
@@ -21,12 +24,12 @@ use crate::provider::vendor::{ProviderCtx, Vendor};
 use crate::provider::vendor_ext::VendorCtx;
 
 const METADATA: VendorMetadata = VendorMetadata {
-    id: "openrouter",
+    id: "ark-coding",
     label: Label {
-        zh: "OpenRouter",
-        en: "OpenRouter",
+        zh: "Ark Coding",
+        en: "Ark Coding",
     },
-    icon: "openrouter",
+    icon: "doubao",
     default_protocol: "openai-compatible",
     channels: &[ChannelDef {
         id: "default",
@@ -37,32 +40,53 @@ const METADATA: VendorMetadata = VendorMetadata {
         base_urls: &[
             ProtocolBaseUrl {
                 protocol: "openai-compatible",
-                base_url: "https://openrouter.ai/api/v1",
+                base_url: "https://ark.cn-beijing.volces.com/api/coding/v3",
+            },
+            ProtocolBaseUrl {
+                protocol: "openai-responses",
+                base_url: "https://ark.cn-beijing.volces.com/api/coding/v3",
             },
             ProtocolBaseUrl {
                 protocol: "anthropic-messages",
-                base_url: "https://openrouter.ai/api",
+                base_url: "https://ark.cn-beijing.volces.com/api/coding",
             },
         ],
         api_key: None,
-        models_source: Some("https://openrouter.ai/api/v1/models"),
-        capabilities_source: CapabilitiesSource::Http("https://openrouter.ai/api/v1/models"),
-        static_models: &[],
+        models_source: Some("https://ark.cn-beijing.volces.com/api/coding/v3/models"),
+        capabilities_source: CapabilitiesSource::Auto,
+        // Volcengine's /models endpoint returns an incomplete subset; these
+        // coding-plan models are merged into the fetched list (deduped).
+        static_models: &[
+            "deepseek-v4-flash",
+            "deepseek-v4-pro",
+            "doubao-seed-2.0-lite",
+            "doubao-seed-2.1-turbo",
+            "glm-5.2",
+            "glm-5.3",
+            "kimi-k2.7-code",
+            "minimax-m3",
+        ],
         auth_mode: AuthMode::ApiKey,
         oauth: None,
         runtime: None,
-        shared_key_protocols: false,
-        auth_schemes: None,
+        shared_key_protocols: true,
+        // Ark's Anthropic-compatible endpoint authenticates with
+        // `Authorization: Bearer` (Volcengine's Claude Code integration uses
+        // ANTHROPIC_AUTH_TOKEN), not the Anthropic-standard `x-api-key`.
+        auth_schemes: Some(&[ProtocolAuthScheme {
+            protocol: "anthropic-messages",
+            auth_scheme: "bearer",
+        }]),
     }],
 };
 
-pub struct OpenrouterVendor;
+pub struct ArkCodingVendor;
 
 #[async_trait]
-impl Vendor for OpenrouterVendor {
+impl Vendor for ArkCodingVendor {
     fn scope(&self) -> VendorScope {
         VendorScope::Vendor {
-            vendor_id: "openrouter",
+            vendor_id: "ark-coding",
         }
     }
     fn metadata(&self) -> Option<&'static VendorMetadata> {
@@ -75,11 +99,18 @@ impl Vendor for OpenrouterVendor {
         openai_build_url(base_url, path)
     }
     fn vendor_id(&self) -> &'static str {
-        "openrouter"
+        "ark-coding"
     }
     fn supported_protocols(&self) -> &'static [ProtocolId] {
-        use crate::protocol::ids::OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1;
-        &[OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1]
+        use crate::protocol::ids::{
+            ANTHROPIC_MESSAGES_2023_06_01, OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1,
+            OPENAI_RESPONSES_V1,
+        };
+        &[
+            ANTHROPIC_MESSAGES_2023_06_01,
+            OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1,
+            OPENAI_RESPONSES_V1,
+        ]
     }
     fn declared_request_mutations(&self) -> bool {
         false
@@ -102,8 +133,8 @@ impl Vendor for OpenrouterVendor {
         pipeline::parse_response(self, resp, ctx).await
     }
     fn map_error(&self, status: u16, body: Value) -> GatewayError {
-        openai_map_error("openrouter", status, body)
+        openai_map_error("ark-coding", status, body)
     }
 }
 
-inventory::submit! { VendorRegistration { make: || Box::new(OpenrouterVendor) } }
+inventory::submit! { VendorRegistration { make: || Box::new(ArkCodingVendor) } }

@@ -9,6 +9,240 @@ struct NormalizedProtocolConfig {
     endpoints: Vec<CreateProviderProtocolEndpoint>,
 }
 
+/// Per-model result of the "send hi" probe over a provider's model list.
+#[derive(Debug, Clone, Serialize)]
+pub struct ProviderModelProbeResult {
+    pub model: String,
+    pub success: bool,
+    pub error: Option<String>,
+    pub latency_ms: u64,
+    /// Canonical protocol endpoint id used for the probe (e.g.
+    /// `openai-compatible/chat-completions/v1`).
+    pub protocol: String,
+    /// Assistant text received for the "hi" probe (success only).
+    pub reply: Option<String>,
+}
+
+/// Which protocol/base_url the probe ran through (reported once per run).
+#[derive(Debug, Clone, Serialize)]
+pub struct ProviderModelProbeMeta {
+    pub protocol: String,
+    pub base_url: String,
+}
+
+/// Full probe response: shared run metadata plus per-model results.
+#[derive(Debug, Clone, Serialize)]
+pub struct ProviderModelProbeOutcome {
+    pub meta: ProviderModelProbeMeta,
+    pub results: Vec<ProviderModelProbeResult>,
+}
+
+/// Probe one model with a minimal non-streaming "hi" request (20s timeout).
+async fn probe_single_model(
+    client: reqwest::Client,
+    suite: crate::protocol::ids::Protocol,
+    base_url: &str,
+    api_key: &str,
+    auth_scheme: &str,
+    model: &str,
+    protocol_id: &str,
+) -> ProviderModelProbeResult {
+    let start = Instant::now();
+
+    let outcome = tokio::time::timeout(Duration::from_secs(30), async {
+        // Reasoning models (e.g. glm-5.3) burn the whole completion budget on
+        // thinking before emitting any visible text — a small budget truncates
+        // with an empty `content` (finish_reason=length). 1024 leaves room for
+        // a thought plus reply.
+        let (path, body) = match suite {
+            crate::protocol::ids::Protocol::OpenAICompatible => (
+                "/v1/chat/completions",
+                serde_json::json!({
+                    "model": model,
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "max_tokens": 1024,
+                    "stream": false,
+                }),
+            ),
+            crate::protocol::ids::Protocol::OpenAIResponses => (
+                "/v1/responses",
+                serde_json::json!({
+                    "model": model,
+                    "input": "hi",
+                    "max_output_tokens": 1024,
+                    "stream": false,
+                }),
+            ),
+            crate::protocol::ids::Protocol::AnthropicMessages => (
+                "/v1/messages",
+                serde_json::json!({
+                    "model": model,
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "max_tokens": 1024,
+                }),
+            ),
+            crate::protocol::ids::Protocol::GoogleGemini => {
+                anyhow::bail!("google-gemini probe is not supported");
+            }
+        };
+
+        let mut url = crate::provider::common::openai::openai_build_url(base_url, path);
+        let mut headers = HeaderMap::new();
+        match auth_scheme {
+            "bearer" => {
+                headers.insert(
+                    AUTHORIZATION,
+                    HeaderValue::from_str(&format!("Bearer {api_key}"))?,
+                );
+            }
+            "x-api-key" => {
+                headers.insert("x-api-key", HeaderValue::from_str(api_key)?);
+                if suite == crate::protocol::ids::Protocol::AnthropicMessages {
+                    headers.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
+                }
+            }
+            "query" => {
+                let separator = if url.contains('?') { '&' } else { '?' };
+                url = format!("{url}{separator}key={api_key}");
+            }
+            "none" => {}
+            other => anyhow::bail!("unsupported auth scheme: {other}"),
+        }
+
+        let response = client
+            .post(url)
+            .headers(headers)
+            .json(&body)
+            .timeout(Duration::from_secs(30))
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!(format_connectivity_error(&e)))?;
+        let status = response.status();
+        if !status.is_success() {
+            let body_text = response.text().await.unwrap_or_default();
+            let preview: String = body_text.chars().take(120).collect();
+            anyhow::bail!("HTTP {status}: {preview}");
+        }
+        let body_text = response.text().await.unwrap_or_default();
+        let reply = extract_probe_reply(&body_text)
+            .ok_or_else(|| anyhow::anyhow!("response did not contain a readable reply"))?;
+        Ok::<String, anyhow::Error>(reply)
+    })
+    .await;
+
+    let (success, error, reply) = match outcome {
+        Ok(Ok(reply)) => (true, None, Some(reply)),
+        Ok(Err(error)) => (false, Some(error.to_string()), None),
+        Err(_) => (false, Some("timeout after 20s".to_string()), None),
+    };
+    ProviderModelProbeResult {
+        model: model.to_string(),
+        success,
+        error,
+        latency_ms: start.elapsed().as_millis() as u64,
+        protocol: protocol_id.to_string(),
+        reply,
+    }
+}
+
+/// Extract the assistant's text reply from a probe response body for any of
+/// the three supported wire formats. Returns `None` when no text is present
+/// (e.g. content filter, empty choices) — the probe then reports failure.
+///
+/// Reasoning models may spend the whole budget on thinking; when `content`
+/// is empty the reasoning text is used as a fallback (prefixed with a marker
+/// so the log makes clear it is a thought, not the final answer).
+fn extract_probe_reply(body: &str) -> Option<String> {
+    let json: Value = serde_json::from_str(body.trim_start()).ok()?;
+    let raw = match &json {
+        // OpenAI chat.completions: choices[0].message.content, falling back
+        // to reasoning_content for thinking-only replies.
+        Value::Object(map) if map.contains_key("choices") => {
+            let message = json.pointer("/choices/0/message")?;
+            let content = message
+                .get("content")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            match content.filter(|text| !text.trim().is_empty()) {
+                Some(text) => Some(text),
+                None => message
+                    .get("reasoning_content")
+                    .and_then(Value::as_str)
+                    .filter(|text| !text.trim().is_empty())
+                    .map(|text| format!("[thinking] {}", text)),
+            }
+        }
+        // OpenAI responses: output[] text parts. Reasoning models put their
+        // thought in a `reasoning` output item — used as a fallback when no
+        // text part was produced.
+        Value::Object(map) if map.contains_key("output") => {
+            let output = json.pointer("/output")?.as_array()?;
+            let text_parts = output
+                .iter()
+                .filter_map(|item| {
+                    let text = item.pointer("/content/0/text").and_then(Value::as_str)?;
+                    Some(text.to_string())
+                })
+                .collect::<Vec<_>>()
+                .join("");
+            if !text_parts.trim().is_empty() {
+                Some(text_parts)
+            } else {
+                let reasoning = output
+                    .iter()
+                    .filter_map(|item| {
+                        let text = item
+                            .pointer("/summary/0/text")
+                            .or_else(|| item.get("text"))
+                            .and_then(Value::as_str)?;
+                        Some(text.to_string())
+                    })
+                    .collect::<Vec<_>>()
+                    .join("");
+                (!reasoning.trim().is_empty()).then(|| format!("[thinking] {reasoning}"))
+            }
+        }
+        // Anthropic messages: content[] text blocks. Thinking models emit
+        // `thinking` blocks first — used as a fallback when no text block
+        // was produced (e.g. budget exhausted mid-thought).
+        Value::Object(map) if map.contains_key("content") => {
+            let content = json.pointer("/content")?.as_array()?;
+            let text_parts = content
+                .iter()
+                .filter_map(|item| {
+                    if item.get("type").and_then(Value::as_str) == Some("text") {
+                        item.get("text").and_then(Value::as_str).map(str::to_string)
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("");
+            if !text_parts.trim().is_empty() {
+                Some(text_parts)
+            } else {
+                let thinking = content
+                    .iter()
+                    .filter_map(|item| {
+                        if item.get("type").and_then(Value::as_str) == Some("thinking") {
+                            item.get("thinking")
+                                .and_then(Value::as_str)
+                                .map(str::to_string)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join("");
+                (!thinking.trim().is_empty()).then(|| format!("[thinking] {thinking}"))
+            }
+        }
+        _ => None,
+    }?;
+    let trimmed = raw.trim().to_string();
+    (!trimmed.is_empty()).then_some(trimmed)
+}
+
 fn normalize_protocol_config(
     mode: &str,
     default_protocol: &str,
@@ -824,6 +1058,118 @@ impl AdminService {
         }
     }
 
+    /// Send a minimal "hi" chat request to every model in the provider's
+    /// discovered list and report which ones actually answer. The WebUI uses
+    /// the results to hide non-callable models from route target pickers.
+    pub async fn probe_provider_models(
+        &self,
+        id: &str,
+    ) -> anyhow::Result<ProviderModelProbeOutcome> {
+        use futures::StreamExt;
+
+        let provider = self.get_provider(id).await?;
+        let models = self.get_provider_models(id).await?;
+        if models.is_empty() {
+            anyhow::bail!("provider model list is empty");
+        }
+
+        // Pick the probe endpoint: adaptive providers probe through the
+        // endpoint matching their configured default protocol
+        // (`provider.protocol`); if the default is disabled or missing, fall
+        // back to the first enabled endpoint. Fixed providers probe through
+        // their single configuration.
+        let registry = crate::protocol::registry::ProtocolRegistry::global();
+        let (suite_raw, base_url, api_key, auth_scheme) = if provider.is_adaptive() {
+            let enabled: Vec<&ProviderProtocolEndpoint> = provider
+                .protocol_endpoints
+                .iter()
+                .filter(|endpoint| endpoint.is_enabled)
+                .collect();
+            if enabled.is_empty() {
+                anyhow::bail!("provider has no enabled protocol endpoints");
+            }
+            let preferred = enabled
+                .iter()
+                .find(|endpoint| endpoint.protocol == provider.protocol)
+                .or_else(|| enabled.first())
+                .expect("enabled endpoints is non-empty");
+            (
+                preferred.protocol.clone(),
+                preferred.base_url.clone(),
+                preferred.api_key.clone(),
+                preferred.auth_scheme.clone(),
+            )
+        } else {
+            (
+                provider.protocol.clone(),
+                provider.base_url.clone(),
+                provider.api_key.clone(),
+                "auto".to_string(),
+            )
+        };
+
+        let suite = registry
+            .parse_protocol(&suite_raw)
+            .ok_or_else(|| anyhow::anyhow!("unsupported provider protocol: {suite_raw}"))?;
+        if suite == crate::protocol::ids::Protocol::GoogleGemini {
+            anyhow::bail!("model probe does not support google-gemini providers");
+        }
+        if base_url.trim().is_empty() {
+            anyhow::bail!("provider base URL is empty");
+        }
+        if api_key.trim().is_empty() && auth_scheme.trim() != "none" {
+            anyhow::bail!("provider api key is empty");
+        }
+
+        let effective_scheme = match auth_scheme.trim() {
+            "" | "auto" => match suite {
+                crate::protocol::ids::Protocol::AnthropicMessages => "x-api-key",
+                _ => "bearer",
+            },
+            explicit => explicit,
+        };
+
+        let client = self.gw.http_client_for_provider(provider.use_proxy).await?;
+        let base_url = base_url.trim().to_string();
+        let api_key = api_key.trim().to_string();
+        let protocol_id = registry
+            .resolve_alias(&suite_raw)
+            .map(|endpoint| endpoint.to_string())
+            .unwrap_or_else(|| suite_raw.clone());
+
+        let mut results: Vec<ProviderModelProbeResult> = futures::stream::iter(models)
+            .map(|model| {
+                let client = client.clone();
+                let base_url = base_url.clone();
+                let api_key = api_key.clone();
+                let scheme = effective_scheme.to_string();
+                let protocol_id = protocol_id.clone();
+                async move {
+                    probe_single_model(
+                        client,
+                        suite,
+                        &base_url,
+                        &api_key,
+                        &scheme,
+                        &model,
+                        &protocol_id,
+                    )
+                    .await
+                }
+            })
+            .buffer_unordered(4)
+            .collect()
+            .await;
+        results.sort_by(|a, b| a.model.cmp(&b.model));
+        Ok(ProviderModelProbeOutcome {
+            meta: ProviderModelProbeMeta {
+                protocol: protocol_id,
+                base_url,
+            },
+            results,
+        })
+    }
+
     async fn record_provider_test_result(
         &self,
         provider_id: &str,
@@ -924,7 +1270,7 @@ impl AdminService {
             anyhow::bail!("Model list format is invalid or empty");
         }
 
-        Ok(models)
+        Ok(merge_model_lists(models, preset_extra_models(&provider)))
     }
     pub async fn get_provider_models(&self, id: &str) -> anyhow::Result<Vec<String>> {
         let provider = self.get_provider(id).await?;
@@ -991,12 +1337,17 @@ impl AdminService {
                     &json,
                 );
                 if !models.is_empty() {
-                    return Ok(models);
+                    return Ok(merge_model_lists(models, preset_extra_models(&provider)));
                 }
             }
         }
 
-        Ok(parse_static_models(provider.static_models.as_deref()))
+        let static_list = parse_static_models(provider.static_models.as_deref());
+        let extra = preset_extra_models(&provider);
+        if !extra.is_empty() {
+            return Ok(merge_model_lists(static_list, extra));
+        }
+        Ok(static_list)
     }
 
     pub async fn get_model_capabilities(
@@ -1107,6 +1458,75 @@ impl AdminService {
         }
         let json: Value = resp.json().await.unwrap_or_default();
         Ok(parse_ollama_capability(&json, model))
+    }
+}
+
+#[cfg(test)]
+mod probe_reply_tests {
+    use super::*;
+
+    #[test]
+    fn openai_chat_reply_prefers_content() {
+        let body = r#"{"choices":[{"message":{"role":"assistant","content":"hello","reasoning_content":"thought"}}]}"#;
+        assert_eq!(extract_probe_reply(body).as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn openai_chat_falls_back_to_reasoning_when_content_empty() {
+        // Reasoning model whose visible text was cut by the token budget.
+        let body = r#"{"choices":[{"message":{"role":"assistant","content":"","reasoning_content":"Let me think"}}]}"#;
+        assert_eq!(
+            extract_probe_reply(body).as_deref(),
+            Some("[thinking] Let me think")
+        );
+    }
+
+    #[test]
+    fn openai_responses_text_parts_win() {
+        let body = r#"{"output":[
+            {"type":"reasoning","summary":[{"type":"summary_text","text":"hmm"}]},
+            {"type":"message","content":[{"type":"output_text","text":"hi there"}]}
+        ]}"#;
+        assert_eq!(extract_probe_reply(body).as_deref(), Some("hi there"));
+    }
+
+    #[test]
+    fn openai_responses_falls_back_to_reasoning_summary() {
+        let body = r#"{"output":[
+            {"type":"reasoning","summary":[{"type":"summary_text","text":"pondering"}]}
+        ]}"#;
+        assert_eq!(
+            extract_probe_reply(body).as_deref(),
+            Some("[thinking] pondering")
+        );
+    }
+
+    #[test]
+    fn anthropic_text_blocks_win() {
+        let body = r#"{"content":[
+            {"type":"thinking","thinking":"internal"},
+            {"type":"text","text":"answer"}
+        ]}"#;
+        assert_eq!(extract_probe_reply(body).as_deref(), Some("answer"));
+    }
+
+    #[test]
+    fn anthropic_falls_back_to_thinking_block() {
+        let body = r#"{"content":[
+            {"type":"thinking","thinking":"budget exhausted mid-thought"}
+        ]}"#;
+        assert_eq!(
+            extract_probe_reply(body).as_deref(),
+            Some("[thinking] budget exhausted mid-thought")
+        );
+    }
+
+    #[test]
+    fn no_text_anywhere_is_none() {
+        let body = r#"{"choices":[{"message":{"role":"assistant","content":""}}]}"#;
+        assert_eq!(extract_probe_reply(body), None);
+        let body = r#"{"content":[]}"#;
+        assert_eq!(extract_probe_reply(body), None);
     }
 }
 

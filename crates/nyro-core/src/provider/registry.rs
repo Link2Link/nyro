@@ -225,6 +225,7 @@ impl VendorRegistry {
             "custom",
             "openai",
             "anthropic",
+            "ark-coding",
             "google",
             "vertexai",
             "xai",

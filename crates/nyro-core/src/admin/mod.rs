@@ -31,6 +31,8 @@ mod oauth;
 mod observability;
 mod providers;
 pub mod settings;
+mod usage;
+mod volcengine_sign;
 
 use auth_data::*;
 use model_catalog::*;
@@ -38,6 +40,8 @@ pub use model_catalog::{
     refresh_models_dev_runtime_cache_if_stale, refresh_models_dev_runtime_cache_on_startup,
 };
 use model_data::*;
+pub use providers::{ProviderModelProbeMeta, ProviderModelProbeOutcome, ProviderModelProbeResult};
+pub use usage::{ProviderUsage, ProviderUsageBalance, ProviderUsageTier};
 
 #[cfg(test)]
 mod session_tests;

@@ -257,6 +257,38 @@ export interface ProviderChannelPreset {
   staticModels?: string[];
   /** One API key is valid for every protocol in `baseUrls`; the form renders a single key field plus protocol checkboxes. */
   sharedKeyProtocols?: boolean;
+  /** Per-protocol auth-scheme overrides (e.g. `{ "anthropic-messages": "bearer" }`); absent protocol = "auto". */
+  authSchemes?: Record<string, string>;
+}
+
+/** Per-model result of the "send hi" probe over a provider's model list. */
+export interface ModelProbeResult {
+  model: string;
+  success: boolean;
+  error?: string | null;
+  latency_ms: number;
+  /** Canonical protocol endpoint id used for the probe. */
+  protocol: string;
+  /** Assistant text received for the "hi" probe (success only). */
+  reply?: string | null;
+}
+
+/** Which protocol/base_url a model probe ran through. */
+export interface ModelProbeMeta {
+  protocol: string;
+  base_url: string;
+}
+
+/** Full model-probe response: shared run metadata plus per-model results. */
+export interface ModelProbeOutcome {
+  meta: ModelProbeMeta;
+  results: ModelProbeResult[];
+}
+
+/** Usage-query credentials for a provider (currently Ark IAM AK/SK only). */
+export interface ProviderUsageCredentials {
+  access_key?: string | null;
+  secret_key?: string | null;
 }
 
 export interface ProviderPreset {
@@ -465,4 +497,43 @@ export interface ProviderOAuthStatusData {
   last_error?: string | null;
   updated_at?: string | null;
   has_refresh_token: boolean;
+}
+
+/** Coding-plan usage tier (e.g. GLM 5-hour / weekly quota windows). */
+export interface ProviderUsageTier {
+  /** `five_hour` | `weekly_limit` */
+  name: string;
+  /** Used percentage (0-100). */
+  used_percent: number;
+  /** ISO 8601 reset time when the upstream reports one. */
+  resets_at?: string | null;
+}
+
+/** Pay-as-you-go account balance, one entry per currency (DeepSeek shape). */
+export interface ProviderUsageBalance {
+  /** ISO currency code, e.g. `CNY`. */
+  currency: string;
+  /** Total remaining balance. */
+  total: number;
+  /** Granted (free/promo) portion of the balance. */
+  granted: number;
+  /** Topped-up (paid) portion of the balance. */
+  topped_up: number;
+}
+
+export interface ProviderUsage {
+  provider_id: string;
+  /** Query backend kind, e.g. `glm_coding_plan`. */
+  kind: string;
+  /** Site the quota was read from: `cn` | `global`. */
+  site: string;
+  /** Plan tier reported by the upstream (e.g. `max`), when present. */
+  level?: string | null;
+  /** Time-window usage tiers (coding plans). */
+  tiers: ProviderUsageTier[];
+  /** Account balances (pay-as-you-go vendors). */
+  balances?: ProviderUsageBalance[];
+  /** Account availability flag when the upstream reports one. */
+  is_available?: boolean | null;
+  queried_at: string;
 }

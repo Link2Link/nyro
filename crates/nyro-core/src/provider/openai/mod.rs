@@ -50,6 +50,7 @@ const METADATA: VendorMetadata = VendorMetadata {
             oauth: None,
             runtime: None,
             shared_key_protocols: false,
+            auth_schemes: None,
         },
         ChannelDef {
             id: "codex",
@@ -80,6 +81,7 @@ const METADATA: VendorMetadata = VendorMetadata {
                 models_client_version: "0.99.0",
             }),
             shared_key_protocols: false,
+            auth_schemes: None,
         },
     ],
 };
