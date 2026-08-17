@@ -23,6 +23,7 @@ mod accumulator;
 mod auth;
 mod compat;
 mod non_stream;
+mod param_overrides;
 mod stream;
 mod util;
 use self::accumulator::*;
@@ -706,11 +707,6 @@ async fn dispatch_pipeline_inner(
             disable_default_auth: provider_runtime.binding.disable_default_auth,
         };
 
-        // Build outbound request — PassThrough (Native + no mutations) or full 7-step pipeline.
-        let passthrough_req = !compat_candidate
-            && plan.mode == ProtocolMode::Native
-            && !adapter.declared_request_mutations()
-            && !tool_route_plan.is_active();
         let passthrough_resp = !compat_candidate
             && plan.mode == ProtocolMode::Native
             && !adapter.declared_response_mutations();
@@ -723,6 +719,26 @@ async fn dispatch_pipeline_inner(
         } else {
             None
         };
+
+        // Provider/model-specific parameter rewrites. Applied after
+        // `vendor_wire_before` on purpose: the compat path rebuilds the
+        // upstream body from the raw client body (which still carries the
+        // rejected value) and merges in the before -> after vendor patch, so
+        // rewriting here makes the change ride that patch. A rewrite also
+        // forces the re-encode path below, skipping the native passthrough
+        // that would forward the verbatim client body.
+        let param_override_applied = param_overrides::apply_upstream_param_overrides(
+            &mut upstream_request,
+            &provider,
+            &actual_model,
+        );
+
+        // Build outbound request — PassThrough (Native + no mutations) or full 7-step pipeline.
+        let passthrough_req = !compat_candidate
+            && plan.mode == ProtocolMode::Native
+            && !adapter.declared_request_mutations()
+            && !tool_route_plan.is_active()
+            && !param_override_applied;
         let mut outbound = if passthrough_req {
             let raw = envelope.body.clone().unwrap_or_default();
             match crate::provider::common::pipeline::passthrough_run(
