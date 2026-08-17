@@ -32,9 +32,10 @@
 //! (official but undocumented; no workspace id / auth cookie). The response
 //! carries THREE windows — `rolling` (5h), `weekly`, `monthly` — each with
 //! `{ status, percent, resetsAt }`; `percent` is already a used percentage
-//! and `resetsAt` is an ISO string, both passed through untouched. Windows
-//! whose `status` is not `"ok"` are skipped (verified against a live key
-//! 2026-08-16 and the community scripts in cc-switch #6433 /
+//! and `resetsAt` is an ISO string, both passed through untouched. A numeric
+//! `percent` is authoritative even when `status` is not `"ok"`: exhausted or
+//! blocked windows must remain visible at their reported utilization (verified
+//! against a live key 2026-08-16 and the community scripts in cc-switch #6433 /
 //! dsh-opencode-go-usage).
 
 use reqwest::header::CONTENT_TYPE;
@@ -451,8 +452,10 @@ fn parse_deepseek_balances(body: &Value) -> (Vec<ProviderUsageBalance>, Option<b
 /// Shape (verified live 2026-08-16): `{ usage: { rolling, weekly, monthly }
 /// }`, each window `{ status, percent, resetsAt }`. `percent` is already a
 /// used percentage (0-100) and `resetsAt` is an ISO string — both passed
-/// through. Windows whose `status` is not `"ok"` are skipped, as are
-/// missing windows; emission order is rolling → weekly → monthly.
+/// through. A window is emitted whenever it has a numeric `percent`, regardless
+/// of `status`, so exhausted/blocked limits do not disappear. Missing windows
+/// or windows without a percentage are skipped; emission order is rolling →
+/// weekly → monthly.
 fn parse_opencode_tiers(body: &Value) -> Vec<ProviderUsageTier> {
     let Some(usage) = body.get("usage") else {
         return Vec::new();
@@ -466,9 +469,6 @@ fn parse_opencode_tiers(body: &Value) -> Vec<ProviderUsageTier> {
         .into_iter()
         .filter_map(|(key, tier_name)| {
             let window = usage.get(key)?;
-            if window.get("status").and_then(Value::as_str) != Some("ok") {
-                return None;
-            }
             let used_percent = window.get("percent").and_then(Value::as_f64)?;
             let resets_at = window
                 .get("resetsAt")
@@ -1694,9 +1694,9 @@ mod tests {
     }
 
     #[test]
-    fn opencode_non_ok_windows_are_skipped() {
-        // Windows whose status is not "ok" (e.g. exhausted / unknown) are
-        // not emitted; missing windows are simply absent.
+    fn opencode_non_ok_window_with_percent_is_preserved() {
+        // An exhausted/blocked rolling window still carries valid utilization.
+        // Dropping it makes the 5-hour quota disappear exactly when it matters.
         let body = serde_json::json!({
             "usage": {
                 "rolling": { "status": "blocked", "percent": 100,
@@ -1708,7 +1708,10 @@ mod tests {
         let tiers = parse_opencode_tiers(&body);
         assert_eq!(
             tiers,
-            vec![tier("weekly_limit", 63.0, Some("2026-08-17T00:00:00.827Z"))]
+            vec![
+                tier("five_hour", 100.0, Some("2026-08-16T14:04:53.827Z")),
+                tier("weekly_limit", 63.0, Some("2026-08-17T00:00:00.827Z")),
+            ]
         );
     }
 
