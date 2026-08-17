@@ -192,6 +192,13 @@ function resolveHTTP(cmd: string, args?: Record<string, unknown>): HTTPMapping {
         url: `${base}/stats/models${hours != null ? `?hours=${hours}` : ""}`,
       };
     }
+    case "get_model_usage_stats": {
+      const params = new URLSearchParams({ model: String(args?.model ?? "") });
+      return {
+        method: "GET",
+        url: `${base}/providers/${args?.providerId}/model-usage?${params.toString()}`,
+      };
+    }
     case "get_stats_by_provider": {
       const hours = args?.hours;
       return {

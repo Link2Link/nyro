@@ -426,6 +426,18 @@ pub async fn get_stats_by_model(
 }
 
 #[tauri::command]
+pub async fn get_model_usage_stats(
+    gw: State<'_, Gateway>,
+    provider_id: String,
+    model: String,
+) -> Result<ModelUsageStats, String> {
+    gw.admin()
+        .get_model_usage_stats(&provider_id, &model)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 pub async fn get_stats_by_provider(
     gw: State<'_, Gateway>,
     hours: Option<i32>,

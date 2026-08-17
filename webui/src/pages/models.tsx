@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useSearchParams } from "react-router-dom";
 import { GitBranch, Pencil, Plus, Route as RouteIcon, Search, Trash2, ToggleRight, ToggleLeft, X } from "lucide-react";
 
 import { backend } from "@/lib/backend";
@@ -174,6 +175,9 @@ function TargetRow({
   const [capsQueryModel, setCapsQueryModel] = useState("");
   const provider = providerMap.get(target.provider_id);
   const providerHasModelDiscovery = hasProviderModelsEndpoint(provider);
+  const effectiveCapsQueryModel = target.provider_id && providerHasModelDiscovery
+    ? capsQueryModel.trim()
+    : "";
 
   const { data: targetModels = [] } = useQuery<string[]>({
     queryKey: ["provider-models", mode, index, target.provider_id],
@@ -195,10 +199,7 @@ function TargetRow({
   );
 
   useEffect(() => {
-    if (!target.provider_id || !providerHasModelDiscovery) {
-      setCapsQueryModel("");
-      return;
-    }
+    if (!target.provider_id || !providerHasModelDiscovery) return;
     const handle = window.setTimeout(() => {
       setCapsQueryModel(target.model.trim());
     }, 1000);
@@ -206,19 +207,19 @@ function TargetRow({
   }, [target.provider_id, target.model, providerHasModelDiscovery]);
 
   const { data: modelCaps } = useQuery<ModelCapabilities | null>({
-    queryKey: ["model-capabilities", mode, index, target.provider_id, capsQueryModel],
+    queryKey: ["model-capabilities", mode, index, target.provider_id, effectiveCapsQueryModel],
     queryFn: async () => {
-      if (!target.provider_id || !capsQueryModel.trim()) return null;
+      if (!target.provider_id || !effectiveCapsQueryModel) return null;
       try {
         return await backend<ModelCapabilities>("get_model_capabilities", {
           providerId: target.provider_id,
-          model: capsQueryModel.trim(),
+          model: effectiveCapsQueryModel,
         });
       } catch {
         return null;
       }
     },
-    enabled: Boolean(target.provider_id && capsQueryModel.trim() && providerHasModelDiscovery),
+    enabled: Boolean(target.provider_id && effectiveCapsQueryModel),
     retry: false,
     staleTime: 60_000,
   });
@@ -316,7 +317,7 @@ function TargetRow({
           <Trash2 className="h-4 w-4" />
         </button>
       </div>
-      {modelCaps && (
+      {providerHasModelDiscovery && modelCaps && (
         <ModelCapabilitySummary caps={modelCaps} isZh={isZh} />
       )}
     </div>
@@ -327,10 +328,20 @@ export default function ModelsPage() {
   const { locale } = useLocale();
   const isZh = locale === "zh-CN";
   const qc = useQueryClient();
+  const [searchParams] = useSearchParams();
+  const prefillProviderId = searchParams.get("provider")?.trim() ?? "";
+  const prefillModel = searchParams.get("model")?.trim() ?? "";
+  const hasPrefill = Boolean(prefillProviderId && prefillModel);
 
-  const [showForm, setShowForm] = useState(false);
+  const [showForm, setShowForm] = useState(hasPrefill);
   const [editingId, setEditingId] = useState<string | null>(null);
-  const [createForm, setCreateForm] = useState<ModelForm>(emptyCreate);
+  const [createForm, setCreateForm] = useState<ModelForm>(() => hasPrefill
+    ? {
+        ...emptyCreate,
+        name: prefillModel,
+        targets: [{ provider_id: prefillProviderId, model: prefillModel, weight: 100, priority: 1 }],
+      }
+    : emptyCreate);
   const [editForm, setEditForm] = useState<(ModelForm & { id: string }) | null>(null);
   const [editError, setEditError] = useState<string | null>(null);
   const [modelToDelete, setModelToDelete] = useState<ModelType | null>(null);
@@ -492,9 +503,11 @@ export default function ModelsPage() {
     <div className="space-y-5">
       <div className="flex items-center justify-between">
         <div>
-          <h1 className="text-2xl font-bold text-slate-900">{isZh ? "模型" : "Models"}</h1>
+          <h1 className="text-2xl font-bold text-slate-900">{isZh ? "模型映射" : "Model Mapping"}</h1>
           <p className="mt-1 text-sm text-slate-500">
-            {isZh ? "按模型名称精确匹配，自动开放所有接入协议" : "Exact match by model name, all ingress protocols enabled"}
+            {isZh
+              ? "将客户端模型 ID 映射到一个或多个供应商模型"
+              : "Map client-facing model IDs to one or more provider models"}
           </p>
         </div>
         <Button
@@ -506,13 +519,13 @@ export default function ModelsPage() {
           className="flex items-center gap-2"
         >
           <Plus className="h-4 w-4" />
-          {isZh ? "新增模型" : "Add Model"}
+          {isZh ? "新增映射" : "Add Mapping"}
         </Button>
       </div>
 
       {showForm && (
         <div className="glass rounded-2xl p-6 space-y-4">
-          <h2 className="text-lg font-semibold text-slate-900">{isZh ? "新建模型" : "New Model"}</h2>
+          <h2 className="text-lg font-semibold text-slate-900">{isZh ? "新建映射" : "New Mapping"}</h2>
           <div className="grid grid-cols-2 gap-4">
             <div className="space-y-2">
               <FieldLabel>{isZh ? "模型名称（虚拟模型 ID）" : "Model Name (Virtual Model ID)"}</FieldLabel>
@@ -644,7 +657,7 @@ export default function ModelsPage() {
       ) : routes.length === 0 ? (
         <div className="glass rounded-2xl p-12 text-center">
           <RouteIcon className="mx-auto h-10 w-10 text-slate-400" />
-          <p className="mt-3 text-sm text-slate-500">{isZh ? "还没有配置模型" : "No models configured"}</p>
+          <p className="mt-3 text-sm text-slate-500">{isZh ? "还没有配置模型映射" : "No model mappings configured"}</p>
         </div>
       ) : filteredRoutes.length === 0 ? (
         <div className="glass rounded-2xl p-12 text-center">
@@ -660,7 +673,7 @@ export default function ModelsPage() {
               return (
                 <div key={route.id} className="glass rounded-2xl p-5 space-y-4">
                   <div className="flex items-center justify-between">
-                    <h3 className="text-sm font-semibold text-slate-900">{isZh ? "编辑模型" : "Edit Model"}</h3>
+                    <h3 className="text-sm font-semibold text-slate-900">{isZh ? "编辑映射" : "Edit Mapping"}</h3>
                     <button
                       onClick={() => {
                         setEditingId(null);

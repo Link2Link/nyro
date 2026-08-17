@@ -9,8 +9,9 @@ use std::time::Duration;
 use crate::db::models::{
     ApiKey, ApiKeyStats, ApiKeyWithBindings, CreateApiKey, CreateModel, CreateModelBackend,
     CreateProvider, CreateProviderProtocolEndpoint, LogPage, LogQuery, Model, ModelBackend,
-    ModelStats, OAuthCredential, Provider, ProviderProtocolEndpoint, ProviderStats, RequestLog,
-    StatsHourly, StatsOverview, UpdateApiKey, UpdateModel, UpdateProvider, UpsertOAuthCredential,
+    ModelStats, ModelUsageStats, ModelUsageTotals, OAuthCredential, Provider,
+    ProviderProtocolEndpoint, ProviderStats, RecentModelPerformance, RequestLog, StatsHourly,
+    StatsOverview, UpdateApiKey, UpdateModel, UpdateProvider, UpsertOAuthCredential,
     is_valid_provider_auth_mode,
 };
 use crate::logging::LogEntry;
@@ -1217,6 +1218,36 @@ impl LogStore for MysqlLogStore {
         Ok(sqlx::query_as::<_, ModelStats>(&sql)
             .fetch_all(&self.pool)
             .await?)
+    }
+
+    async fn model_usage_stats(
+        &self,
+        provider_id: &str,
+        upstream_model: &str,
+    ) -> anyhow::Result<ModelUsageStats> {
+        let totals = sqlx::query_as::<_, ModelUsageTotals>(
+            "SELECT COUNT(*) AS request_count, \
+             CAST(COALESCE(SUM(input_tokens), 0) AS SIGNED) AS total_input_tokens, \
+             CAST(COALESCE(SUM(output_tokens), 0) AS SIGNED) AS total_output_tokens, \
+             CAST(COALESCE(SUM(cache_read_tokens), 0) AS SIGNED) AS total_cache_read_tokens, \
+             CAST(MAX(created_at) AS SIGNED) AS last_called_at \
+             FROM request_logs WHERE provider_id = ? AND upstream_model = ?",
+        )
+        .bind(provider_id)
+        .bind(upstream_model)
+        .fetch_one(&self.pool)
+        .await?;
+        let samples = sqlx::query_as::<_, RecentModelPerformance>(
+            "SELECT output_tokens, COALESCE(is_stream, 0) AS is_stream, \
+             stream_chunks_count, latency_upstream_ms, latency_total_ms, stream_first_chunk_ms \
+             FROM request_logs WHERE provider_id = ? AND upstream_model = ? \
+             ORDER BY created_at DESC LIMIT 10",
+        )
+        .bind(provider_id)
+        .bind(upstream_model)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(ModelUsageStats::from_samples(totals, &samples))
     }
 
     async fn stats_by_provider(&self, hours: Option<i64>) -> anyhow::Result<Vec<ProviderStats>> {

@@ -2,6 +2,7 @@ import { NavLink } from "react-router-dom";
 import { cn } from "@/lib/utils";
 import {
   LayoutDashboard,
+  Boxes,
   Route,
   Server,
   ScrollText,
@@ -21,7 +22,8 @@ import { openExternalUrl } from "@/lib/open-external";
 const NAV_ITEMS = [
   { label: "Dashboard", path: "/", icon: LayoutDashboard },
   { label: "Providers", path: "/providers", icon: Server },
-  { label: "Models", path: "/models", icon: Route },
+  { label: "Available Models", path: "/available-models", icon: Boxes },
+  { label: "Model Mapping", path: "/models", icon: Route },
   { label: "API Keys", path: "/api-keys", icon: KeyRound },
   { label: "Connect", path: "/connect", icon: Plug },
   { type: "divider" as const },
@@ -126,8 +128,10 @@ export function Sidebar({ collapsed, onToggle }: SidebarProps) {
                       ? "概览"
                       : label === "Providers"
                         ? "提供商"
-                        : label === "Models"
-                          ? "模型"
+                        : label === "Available Models"
+                          ? "可用模型"
+                          : label === "Model Mapping"
+                            ? "模型映射"
                           : label === "API Keys"
                             ? "密钥"
                           : label === "Connect"

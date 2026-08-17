@@ -81,6 +81,10 @@ pub fn create_router(gateway: Gateway, admin_token: Option<String>) -> Router {
             get(provider_model_capabilities_handler),
         )
         .route(
+            "/providers/:id/model-usage",
+            get(provider_model_usage_handler),
+        )
+        .route(
             "/providers/:id/oauth/status",
             get(get_provider_oauth_status_handler),
         )
@@ -338,7 +342,7 @@ async fn provider_models_handler(
 async fn provider_model_capabilities_handler(
     State(gw): State<Gateway>,
     Path(id): Path<String>,
-    Query(query): Query<ModelCapabilitiesQuery>,
+    Query(query): Query<ProviderModelQuery>,
 ) -> impl IntoResponse {
     match gw.admin().get_model_capabilities(&id, &query.model).await {
         Ok(v) => Json(serde_json::json!({ "data": v })).into_response(),
@@ -346,8 +350,19 @@ async fn provider_model_capabilities_handler(
     }
 }
 
+async fn provider_model_usage_handler(
+    State(gw): State<Gateway>,
+    Path(id): Path<String>,
+    Query(query): Query<ProviderModelQuery>,
+) -> impl IntoResponse {
+    match gw.admin().get_model_usage_stats(&id, &query.model).await {
+        Ok(v) => Json(serde_json::json!({ "data": v })).into_response(),
+        Err(e) => err(e),
+    }
+}
+
 #[derive(Deserialize)]
-struct ModelCapabilitiesQuery {
+struct ProviderModelQuery {
     model: String,
 }
 

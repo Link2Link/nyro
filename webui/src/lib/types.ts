@@ -155,6 +155,17 @@ export interface ModelStats {
   total_upstream_ms: number;
 }
 
+export interface ModelUsageStats {
+  request_count: number;
+  total_input_tokens: number;
+  total_output_tokens: number;
+  total_cache_read_tokens: number;
+  last_called_at?: number | null;
+  recent_sample_count: number;
+  average_tps?: number | null;
+  average_first_token_ms?: number | null;
+}
+
 export interface ProviderStats {
   provider: string;
   request_count: number;
@@ -198,6 +209,9 @@ export interface ModelCapabilities {
   model_id: string;
   context_window: number;
   embedding_length?: number | null;
+  output_max_tokens?: number | null;
+  input_cost?: number | null;
+  output_cost?: number | null;
   tool_call: boolean;
   reasoning: boolean;
   input_modalities: string[];

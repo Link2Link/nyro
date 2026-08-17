@@ -47,6 +47,18 @@ impl AdminService {
             .await
     }
 
+    pub async fn get_model_usage_stats(
+        &self,
+        provider_id: &str,
+        upstream_model: &str,
+    ) -> anyhow::Result<ModelUsageStats> {
+        self.gw
+            .storage
+            .logs()
+            .model_usage_stats(provider_id, upstream_model)
+            .await
+    }
+
     pub async fn get_stats_by_provider(
         &self,
         hours: Option<i32>,

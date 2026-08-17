@@ -579,6 +579,132 @@ pub struct ModelStats {
     pub total_upstream_ms: f64,
 }
 
+#[derive(Debug, Clone, Default, FromRow)]
+pub struct ModelUsageTotals {
+    pub request_count: i64,
+    pub total_input_tokens: i64,
+    pub total_output_tokens: i64,
+    pub total_cache_read_tokens: i64,
+    pub last_called_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, FromRow)]
+pub struct RecentModelPerformance {
+    pub output_tokens: i32,
+    pub is_stream: bool,
+    pub stream_chunks_count: i32,
+    pub latency_upstream_ms: Option<i64>,
+    pub latency_total_ms: Option<i64>,
+    pub stream_first_chunk_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ModelUsageStats {
+    pub request_count: i64,
+    pub total_input_tokens: i64,
+    pub total_output_tokens: i64,
+    pub total_cache_read_tokens: i64,
+    pub last_called_at: Option<i64>,
+    pub recent_sample_count: i64,
+    pub average_tps: Option<f64>,
+    pub average_first_token_ms: Option<f64>,
+}
+
+impl ModelUsageStats {
+    pub fn from_samples(totals: ModelUsageTotals, samples: &[RecentModelPerformance]) -> Self {
+        let mut tps_total = 0.0;
+        let mut tps_count = 0;
+        let mut first_token_total = 0.0;
+        let mut first_token_count = 0;
+
+        for sample in samples {
+            let is_stream = sample.is_stream || sample.stream_chunks_count > 0;
+            let generation_ms = match (
+                is_stream,
+                sample.latency_upstream_ms,
+                sample.stream_first_chunk_ms,
+            ) {
+                (true, Some(upstream), Some(first_token)) if upstream > 0 => {
+                    let generation = upstream - first_token;
+                    let looks_non_incremental = generation < 50
+                        || generation <= 0
+                        || first_token as f64 / upstream as f64 >= 0.8;
+                    Some(if looks_non_incremental {
+                        upstream
+                    } else {
+                        generation
+                    })
+                }
+                _ => sample.latency_upstream_ms.or(sample.latency_total_ms),
+            };
+
+            if sample.output_tokens > 0 {
+                if let Some(generation_ms) = generation_ms.filter(|value| *value > 0) {
+                    tps_total += sample.output_tokens as f64 / (generation_ms as f64 / 1000.0);
+                    tps_count += 1;
+                }
+            }
+            if let Some(first_token_ms) = sample.stream_first_chunk_ms.filter(|value| *value >= 0) {
+                first_token_total += first_token_ms as f64;
+                first_token_count += 1;
+            }
+        }
+
+        Self {
+            request_count: totals.request_count,
+            total_input_tokens: totals.total_input_tokens,
+            total_output_tokens: totals.total_output_tokens,
+            total_cache_read_tokens: totals.total_cache_read_tokens,
+            last_called_at: totals.last_called_at,
+            recent_sample_count: samples.len() as i64,
+            average_tps: (tps_count > 0).then_some(tps_total / tps_count as f64),
+            average_first_token_ms: (first_token_count > 0)
+                .then_some(first_token_total / first_token_count as f64),
+        }
+    }
+}
+
+#[cfg(test)]
+mod model_usage_stats_tests {
+    use super::*;
+
+    #[test]
+    fn averages_recent_request_performance() {
+        let totals = ModelUsageTotals {
+            request_count: 12,
+            total_input_tokens: 1_200,
+            total_output_tokens: 600,
+            total_cache_read_tokens: 300,
+            last_called_at: Some(1_700_000_000_000),
+        };
+        let samples = vec![
+            RecentModelPerformance {
+                output_tokens: 100,
+                is_stream: true,
+                stream_chunks_count: 10,
+                latency_upstream_ms: Some(2_000),
+                latency_total_ms: Some(2_100),
+                stream_first_chunk_ms: Some(500),
+            },
+            RecentModelPerformance {
+                output_tokens: 50,
+                is_stream: false,
+                stream_chunks_count: 0,
+                latency_upstream_ms: Some(1_000),
+                latency_total_ms: Some(1_100),
+                stream_first_chunk_ms: None,
+            },
+        ];
+
+        let stats = ModelUsageStats::from_samples(totals, &samples);
+
+        assert_eq!(stats.request_count, 12);
+        assert_eq!(stats.recent_sample_count, 2);
+        assert!((stats.average_tps.unwrap() - 58.333).abs() < 0.01);
+        assert_eq!(stats.average_first_token_ms, Some(500.0));
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
 pub struct ProviderStats {
     pub provider: String,
