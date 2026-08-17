@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { Clock, RefreshCw, AlertCircle } from "lucide-react";
+import { Clock, RefreshCw, AlertCircle, CirclePause } from "lucide-react";
 import { backend } from "@/lib/backend";
 import { useLocale } from "@/lib/i18n";
 import type {
@@ -270,6 +270,13 @@ export function ProviderUsageFooter({ provider }: { provider: Provider }) {
 
   const shown = usage;
   const balances = shown?.balances ?? [];
+  const quotaPaused = shown?.scheduling?.status === "quota_exhausted";
+  const quotaCountdown = countdownStr(
+    shown?.scheduling?.reset_at ?? shown?.scheduling?.next_check_at,
+  );
+  const blockedTierLabels = (shown?.scheduling?.blocking_tiers ?? [])
+    .map((name) => tierLabel(name, isZh))
+    .join(", ");
   const isBalanceView = shown?.kind.endsWith("_balance") ?? false;
   const title = isBalanceView
     ? isZh
@@ -310,6 +317,19 @@ export function ProviderUsageFooter({ provider }: { provider: Provider }) {
           </button>
         </div>
       </div>
+
+      {quotaPaused && (
+        <div className="flex items-center gap-2 border-y border-red-200 bg-red-50 px-2 py-1.5 text-xs text-red-700">
+          <CirclePause className="h-3.5 w-3.5 shrink-0" />
+          <span className="min-w-0 flex-1">
+            {isZh ? "额度已满，已暂停调度" : "Quota exhausted, routing paused"}
+            {blockedTierLabels && ` · ${blockedTierLabels}`}
+          </span>
+          {quotaCountdown && (
+            <span className="shrink-0 font-medium tabular-nums">{quotaCountdown}</span>
+          )}
+        </div>
+      )}
 
       {error && !shown ? (
         <div className="flex items-center gap-1.5 text-xs text-red-500" title={error.message}>

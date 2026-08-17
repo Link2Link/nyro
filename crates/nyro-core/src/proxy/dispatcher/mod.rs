@@ -526,8 +526,14 @@ async fn dispatch_pipeline_inner(
         return error_response(503, "no route targets configured");
     }
 
+    let target_count = ordered_targets.len();
+    let mut quota_skipped = 0_usize;
     let mut last_response: Option<Response> = None;
     for target in ordered_targets {
+        if !gw.quota_registry.is_schedulable(&target.provider_id) {
+            quota_skipped += 1;
+            continue;
+        }
         let provider = match get_provider(&access_store, &target.provider_id).await {
             Ok(p) => p,
             Err(_) => continue,
@@ -929,6 +935,9 @@ async fn dispatch_pipeline_inner(
         };
 
         let status = response.status().as_u16();
+        if status == 429 {
+            crate::admin::trigger_provider_usage_refresh(gw.clone(), target.provider_id.clone());
+        }
         let defer_native_stream_health =
             !uses_compat && is_stream && health_outcome == HealthOutcome::Success;
         let response = if defer_native_stream_health {
@@ -958,6 +967,25 @@ async fn dispatch_pipeline_inner(
             continue;
         }
         return response;
+    }
+
+    if target_count > 0 && quota_skipped == target_count {
+        LogBuilder::from_dispatch(
+            &gw,
+            &ingress_str,
+            &request_model,
+            auth_key.id.as_deref(),
+            start,
+        )
+        .stream_flag(is_stream)
+        .reasoning_effort(reasoning_effort.clone())
+        .status(503)
+        .with_req_extras(&req_extras)
+        .emit();
+        return error_response(
+            503,
+            "all route providers are temporarily unavailable due to exhausted quota",
+        );
     }
 
     last_response.unwrap_or_else(|| {
@@ -1531,11 +1559,13 @@ fn unprocessable_response(status: u16, message: &str) -> Response {
 mod tests {
     use super::{dispatch_pipeline, run_phase_hooks_slice};
     use crate::Gateway;
+    use crate::db::models::{CreateModel, CreateModelBackend, CreateProvider};
     use crate::plugin::phase::{
         HostContext, Phase, PhaseCtx, PhaseHook, PhaseHookRegistration, PhaseOutcome, ResponseView,
     };
     use crate::protocol::ids::OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1;
     use crate::protocol::ir::{AiRequest, AiResponse, RawEnvelope};
+    use crate::router::quota::QuotaTierObservation;
     use async_trait::async_trait;
     use axum::http::{HeaderMap, StatusCode};
     use axum::response::{IntoResponse, Response};
@@ -1758,6 +1788,86 @@ mod tests {
             }
             PhaseOutcome::Continue
         }
+    }
+
+    #[tokio::test]
+    async fn all_quota_exhausted_targets_return_service_unavailable() {
+        let config = crate::config::GatewayConfig {
+            data_dir: std::env::temp_dir().join(format!(
+                "nyro-quota-exhausted-dispatch-test-{}",
+                uuid::Uuid::new_v4()
+            )),
+            ..Default::default()
+        };
+        let (gw, _log_rx) = Gateway::new(config).await.expect("gateway init");
+        let provider = gw
+            .admin()
+            .create_provider(CreateProvider {
+                name: format!("quota-provider-{}", uuid::Uuid::new_v4()),
+                vendor: Some("openai".to_string()),
+                protocol: "openai-compatible".to_string(),
+                base_url: "http://127.0.0.1:9/v1".to_string(),
+                protocol_mode: "fixed".to_string(),
+                protocol_endpoints: Vec::new(),
+                preset_key: None,
+                channel: None,
+                models_source: None,
+                static_models: None,
+                api_key: "sk-test".to_string(),
+                auth_mode: "apikey".to_string(),
+                use_proxy: false,
+            })
+            .await
+            .expect("provider create");
+        let route_name = format!("quota-route-{}", uuid::Uuid::new_v4());
+        gw.admin()
+            .create_model(CreateModel {
+                name: route_name.clone(),
+                balance: Some("priority".to_string()),
+                target_provider: provider.id.clone(),
+                target_model: "upstream-model".to_string(),
+                targets: vec![CreateModelBackend {
+                    provider_id: provider.id.clone(),
+                    model: "upstream-model".to_string(),
+                    weight: Some(100),
+                    priority: Some(1),
+                }],
+                enable_auth: Some(false),
+                enable_payload: None,
+            })
+            .await
+            .expect("model create");
+        gw.quota_registry.observe(
+            &provider.id,
+            &[QuotaTierObservation {
+                name: "five_hour".to_string(),
+                used_percent: 100.0,
+                resets_at: None,
+            }],
+            None,
+        );
+
+        let envelope = RawEnvelope::new(
+            Some(serde_json::json!({"model": route_name})),
+            HashMap::new(),
+            "POST",
+            "/v1/chat/completions",
+        );
+        let request = AiRequest::new(route_name, Vec::new());
+        let response = dispatch_pipeline(
+            gw,
+            HeaderMap::new(),
+            envelope,
+            request,
+            OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1,
+            crate::proxy::context::RequestContext::new(
+                OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1,
+                std::time::Duration::from_secs(30),
+            ),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[test]

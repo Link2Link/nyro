@@ -485,10 +485,13 @@ impl AdminService {
             })
             .await?;
 
-        if provider.is_adaptive() {
+        let provider = if provider.is_adaptive() {
             let _ = self.test_provider(&provider.id).await?;
-            return self.get_provider(&provider.id).await;
-        }
+            self.get_provider(&provider.id).await?
+        } else {
+            provider
+        };
+        self.gw.quota_registry.request_refresh(&provider.id);
         Ok(provider)
     }
 
@@ -605,6 +608,11 @@ impl AdminService {
             || input.api_key.is_some()
             || input.auth_mode.is_some()
             || input.protocol_endpoints.is_some();
+        let quota_config_changed = protocol_config_changed
+            || input.vendor.is_some()
+            || input.preset_key.is_some()
+            || input.channel.is_some()
+            || input.is_enabled.is_some();
         let models_source_input = input
             .models_source
             .clone()
@@ -718,6 +726,13 @@ impl AdminService {
             provider = self.get_provider(id).await?;
         }
 
+        if quota_config_changed {
+            if provider.is_enabled {
+                self.gw.quota_registry.invalidate(id);
+            } else {
+                self.gw.quota_registry.remove(id);
+            }
+        }
         self.bump_config_epoch().await?;
         Ok(provider)
     }
@@ -727,6 +742,7 @@ impl AdminService {
         self.reload_model_cache().await?;
         self.bump_config_epoch().await?;
         self.gw.clear_ollama_capability_cache_for_provider(id).await;
+        self.gw.quota_registry.remove(id);
         Ok(())
     }
 

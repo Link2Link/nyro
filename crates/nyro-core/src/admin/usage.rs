@@ -38,7 +38,10 @@
 //! against a live key 2026-08-16 and the community scripts in cc-switch #6433 /
 //! dsh-opencode-go-usage).
 
+use futures::stream::{self, StreamExt};
 use reqwest::header::CONTENT_TYPE;
+
+use crate::router::quota::{ProviderScheduling, QuotaTierObservation};
 
 use super::*;
 
@@ -114,6 +117,8 @@ pub struct ProviderUsage {
     pub spends: Vec<ProviderUsageSpend>,
     /// Account availability flag when the upstream reports one.
     pub is_available: Option<bool>,
+    /// Runtime scheduling decision derived from this usage snapshot.
+    pub scheduling: ProviderScheduling,
     pub queried_at: String,
 }
 
@@ -171,6 +176,17 @@ impl UsageBackend {
             UsageBackend::DeepSeek => "deepseek_balance",
             UsageBackend::OpencodeGo => "opencode_go",
             UsageBackend::ArkCoding => "ark_coding_plan",
+        }
+    }
+
+    fn has_authoritative_observation(
+        &self,
+        tiers: &[ProviderUsageTier],
+        is_available: Option<bool>,
+    ) -> bool {
+        match self {
+            UsageBackend::DeepSeek => is_available.is_some(),
+            _ => !tiers.is_empty(),
         }
     }
 
@@ -750,6 +766,12 @@ async fn fetch_usage_json(
     serde_json::from_slice(&raw).map_err(|e| anyhow::anyhow!("failed to parse usage response: {e}"))
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum UsageQueryMode {
+    Full,
+    GuardOnly,
+}
+
 impl AdminService {
     /// Query the coding-plan usage (quota) of a configured provider.
     ///
@@ -763,6 +785,62 @@ impl AdminService {
     /// - Kimi For Coding: `GET https://api.kimi.com/coding/v1/usages`,
     ///   Bearer key.
     pub async fn get_provider_usage(&self, id: &str) -> anyhow::Result<ProviderUsage> {
+        self.refresh_provider_usage(id, UsageQueryMode::Full).await
+    }
+
+    async fn refresh_provider_usage(
+        &self,
+        id: &str,
+        mode: UsageQueryMode,
+    ) -> anyhow::Result<ProviderUsage> {
+        let refresh_lock = self.gw.quota_registry.refresh_lock(id);
+        let _guard = refresh_lock.lock().await;
+        self.refresh_provider_usage_locked(id, mode).await
+    }
+
+    async fn refresh_provider_usage_locked(
+        &self,
+        id: &str,
+        mode: UsageQueryMode,
+    ) -> anyhow::Result<ProviderUsage> {
+        match self.query_provider_usage(id, mode).await {
+            Ok((mut usage, true)) => {
+                let tiers = usage
+                    .tiers
+                    .iter()
+                    .map(|tier| QuotaTierObservation {
+                        name: tier.name.clone(),
+                        used_percent: tier.used_percent,
+                        resets_at: tier.resets_at.clone(),
+                    })
+                    .collect::<Vec<_>>();
+                usage.scheduling =
+                    self.gw
+                        .quota_registry
+                        .observe(&usage.provider_id, &tiers, usage.is_available);
+                Ok(usage)
+            }
+            Ok((mut usage, false)) => {
+                tracing::warn!(
+                    provider_id = %usage.provider_id,
+                    kind = %usage.kind,
+                    "provider usage response did not contain an authoritative quota observation"
+                );
+                usage.scheduling = self.gw.quota_registry.record_query_failure(id);
+                Ok(usage)
+            }
+            Err(error) => {
+                self.gw.quota_registry.record_query_failure(id);
+                Err(error)
+            }
+        }
+    }
+
+    async fn query_provider_usage(
+        &self,
+        id: &str,
+        mode: UsageQueryMode,
+    ) -> anyhow::Result<(ProviderUsage, bool)> {
         let provider = self.get_provider(id).await?;
 
         let backend = UsageBackend::detect(&provider.base_url).ok_or_else(|| {
@@ -891,18 +969,17 @@ impl AdminService {
                 // API key. Without a token (or on any failure) the spend
                 // rows are silently omitted; the balance still shows.
                 let mut spends = Vec::new();
-                if let Ok((Some(platform_token), _)) =
-                    self.get_provider_usage_credentials(&provider.id).await
-                {
-                    if let Ok(cost_body) =
+                if mode == UsageQueryMode::Full
+                    && let Ok((Some(platform_token), _)) =
+                        self.get_provider_usage_credentials(&provider.id).await
+                    && let Ok(cost_body) =
                         fetch_deepseek_platform_cost(&self.gw.http_client, &platform_token).await
-                    {
-                        let currency = balances
-                            .first()
-                            .map(|b| b.currency.clone())
-                            .unwrap_or_else(|| "CNY".to_string());
-                        spends = parse_deepseek_spends(&cost_body, &currency);
-                    }
+                {
+                    let currency = balances
+                        .first()
+                        .map(|b| b.currency.clone())
+                        .unwrap_or_else(|| "CNY".to_string());
+                    spends = parse_deepseek_spends(&cost_body, &currency);
                 }
                 (Vec::new(), balances, None, is_available, spends)
             }
@@ -987,17 +1064,22 @@ impl AdminService {
             }
         };
 
-        Ok(ProviderUsage {
-            provider_id: provider.id,
-            kind: backend.kind().to_string(),
-            site: backend.site().to_string(),
-            level,
-            tiers,
-            balances,
-            spends,
-            is_available,
-            queried_at: chrono::Utc::now().to_rfc3339(),
-        })
+        let authoritative = backend.has_authoritative_observation(&tiers, is_available);
+        Ok((
+            ProviderUsage {
+                provider_id: provider.id,
+                kind: backend.kind().to_string(),
+                site: backend.site().to_string(),
+                level,
+                tiers,
+                balances,
+                spends,
+                is_available,
+                scheduling: ProviderScheduling::default(),
+                queried_at: chrono::Utc::now().to_rfc3339(),
+            },
+            authoritative,
+        ))
     }
 
     /// Get the stored usage-query credentials for a provider. Two generic
@@ -1039,8 +1121,103 @@ impl AdminService {
         let store = self.gw.storage.settings();
         store.set(&a_key, access_key.trim()).await?;
         store.set(&b_key, secret_key.trim()).await?;
+        self.gw.quota_registry.invalidate(provider_id);
         Ok(())
     }
+}
+
+async fn provider_usage_monitorable(admin: &AdminService, provider: &Provider) -> bool {
+    if !provider.is_enabled
+        || UsageBackend::detect(&provider.base_url).is_none()
+        || usage_api_key(provider).is_none()
+    {
+        return false;
+    }
+    if UsageBackend::detect(&provider.base_url) != Some(UsageBackend::ArkCoding) {
+        return true;
+    }
+    admin
+        .get_provider_usage_credentials(&provider.id)
+        .await
+        .ok()
+        .is_some_and(|(access_key, secret_key)| access_key.is_some() && secret_key.is_some())
+}
+
+pub(crate) fn trigger_provider_usage_refresh(gw: Gateway, provider_id: String) {
+    gw.quota_registry.request_refresh(&provider_id);
+    tokio::spawn(async move {
+        let admin = gw.admin();
+        let Ok(provider) = admin.get_provider(&provider_id).await else {
+            return;
+        };
+        if !provider_usage_monitorable(&admin, &provider).await {
+            return;
+        }
+        let refresh_lock = gw.quota_registry.refresh_lock(&provider_id);
+        let Ok(_guard) = refresh_lock.try_lock_owned() else {
+            return;
+        };
+        if let Err(error) = admin
+            .refresh_provider_usage_locked(&provider_id, UsageQueryMode::GuardOnly)
+            .await
+        {
+            tracing::warn!(
+                provider_id,
+                %error,
+                "429-triggered provider usage refresh failed"
+            );
+        }
+    });
+}
+
+pub(crate) async fn run_provider_usage_monitor(gw: Gateway) {
+    loop {
+        refresh_due_provider_usage(&gw).await;
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_secs(30)) => {}
+            _ = gw.quota_registry.wait_for_refresh_request() => {}
+        }
+    }
+}
+
+async fn refresh_due_provider_usage(gw: &Gateway) {
+    let admin = gw.admin();
+    let providers = match admin.list_providers().await {
+        Ok(providers) => providers,
+        Err(error) => {
+            tracing::warn!(%error, "provider usage monitor could not list providers");
+            return;
+        }
+    };
+
+    let mut due = Vec::new();
+    for provider in providers {
+        if !provider.is_enabled
+            || !gw.quota_registry.is_due(&provider.id)
+            || !provider_usage_monitorable(&admin, &provider).await
+        {
+            continue;
+        }
+        due.push(provider.id);
+    }
+
+    stream::iter(due)
+        .for_each_concurrent(4, |provider_id| {
+            let admin = admin.clone();
+            async move {
+                if let Err(error) = admin
+                    .refresh_provider_usage(&provider_id, UsageQueryMode::GuardOnly)
+                    .await
+                {
+                    tracing::warn!(
+                        provider_id,
+                        %error,
+                        "background provider usage refresh failed"
+                    );
+                }
+            }
+        })
+        .await;
 }
 
 #[cfg(test)]
@@ -1208,6 +1385,22 @@ mod tests {
         ]));
         let tiers = parse_glm_quota_tiers(&data);
         assert_eq!(tiers, vec![tier("five_hour", 0.0, None)]);
+    }
+
+    #[test]
+    fn coding_plan_recovery_requires_at_least_one_quota_window() {
+        assert!(!UsageBackend::GlmGlobal.has_authoritative_observation(&[], None));
+        assert!(UsageBackend::GlmGlobal.has_authoritative_observation(
+            &[tier("five_hour", 0.0, None)],
+            None,
+        ));
+    }
+
+    #[test]
+    fn deepseek_recovery_requires_explicit_account_availability() {
+        assert!(!UsageBackend::DeepSeek.has_authoritative_observation(&[], None));
+        assert!(UsageBackend::DeepSeek.has_authoritative_observation(&[], Some(true)));
+        assert!(UsageBackend::DeepSeek.has_authoritative_observation(&[], Some(false)));
     }
 
     #[test]

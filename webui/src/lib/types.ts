@@ -531,6 +531,14 @@ export interface ProviderUsageBalance {
   topped_up: number;
 }
 
+export interface ProviderScheduling {
+  status: "eligible" | "quota_exhausted";
+  reason?: "usage_limit" | "account_unavailable" | null;
+  blocking_tiers: string[];
+  reset_at?: string | null;
+  next_check_at?: string | null;
+}
+
 export interface ProviderUsage {
   provider_id: string;
   /** Query backend kind, e.g. `glm_coding_plan`. */
@@ -547,5 +555,7 @@ export interface ProviderUsage {
   spends?: ProviderUsageSpend[];
   /** Account availability flag when the upstream reports one. */
   is_available?: boolean | null;
+  /** Runtime decision controlling whether this provider receives new requests. */
+  scheduling?: ProviderScheduling;
   queried_at: string;
 }

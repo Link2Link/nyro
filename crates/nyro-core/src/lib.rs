@@ -23,6 +23,7 @@ use tokio::sync::mpsc;
 
 use crate::auth::types::AuthSession;
 use crate::router::health::HealthRegistry;
+use crate::router::quota::ProviderQuotaRegistry;
 use config::{GatewayConfig, SqlStorageConfig, StorageBackendKind};
 use logging::LogEntry;
 use storage::sql::config::SqlBackendConfig;
@@ -55,6 +56,7 @@ pub struct Gateway {
     proxy_client_cache: Arc<tokio::sync::RwLock<Option<ProxyClientCache>>>,
     pub model_cache: Arc<tokio::sync::RwLock<router::ModelCache>>,
     pub health_registry: Arc<HealthRegistry>,
+    pub quota_registry: Arc<ProviderQuotaRegistry>,
     pub ollama_capability_cache: Arc<tokio::sync::RwLock<HashMap<String, CapabilityCacheEntry>>>,
     pub(crate) compat_engine: Arc<nyro_ccswitch_compat::CompatEngine>,
     pub log_tx: mpsc::Sender<LogEntry>,
@@ -178,6 +180,7 @@ impl Gateway {
             router::ModelCache::load(storage.snapshots()).await?,
         ));
         let health_registry = Arc::new(HealthRegistry::new());
+        let quota_registry = Arc::new(ProviderQuotaRegistry::new());
         let ollama_capability_cache = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
 
         let (log_tx, log_rx) = mpsc::channel(1024);
@@ -190,6 +193,7 @@ impl Gateway {
             proxy_client_cache: Arc::new(tokio::sync::RwLock::new(None)),
             model_cache,
             health_registry,
+            quota_registry,
             ollama_capability_cache,
             compat_engine: Arc::new(nyro_ccswitch_compat::CompatEngine::default()),
             log_tx,
@@ -204,6 +208,13 @@ impl Gateway {
             let http_client = gw.http_client.clone();
             tokio::spawn(async move {
                 admin::refresh_models_dev_runtime_cache_on_startup(data_dir, http_client).await;
+            });
+        }
+
+        {
+            let gw_usage = gw.clone();
+            tokio::spawn(async move {
+                admin::run_provider_usage_monitor(gw_usage).await;
             });
         }
 
@@ -257,6 +268,7 @@ impl Gateway {
 
                     if current > known_epoch {
                         known_epoch = current;
+                        gw_poll.quota_registry.request_refresh_all();
                         if let Err(error) = gw_poll
                             .model_cache
                             .write()

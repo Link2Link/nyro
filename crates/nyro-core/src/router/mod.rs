@@ -1,5 +1,6 @@
 pub mod health;
 mod matcher;
+pub mod quota;
 pub mod selector;
 
 pub use matcher::ModelCache;
