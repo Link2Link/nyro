@@ -60,6 +60,35 @@ export function formatLocalHourLabel(ts: string | null | undefined, withDate = f
   return `${mm}/${dd} ${hh}:00`;
 }
 
+/** 自适应时序桶标签:HH:mm,长时间范围附带 MM/DD。 */
+export function formatLocalBucketLabel(
+  ts: number | string | null | undefined,
+  withDate = false,
+): string {
+  const date = parseBackendTime(ts);
+  if (!date) return "";
+  const time = `${pad2(date.getHours())}:${pad2(date.getMinutes())}`;
+  if (!withDate) return time;
+  return `${pad2(date.getMonth() + 1)}/${pad2(date.getDate())} ${time}`;
+}
+
+/** Tooltip 使用的本地桶起止范围,首尾桶裁剪到实际查询窗口。 */
+export function formatLocalBucketRange(
+  ts: number | string | null | undefined,
+  bucketMinutes: number,
+  windowStart?: number,
+  windowEnd?: number,
+): string {
+  const bucketStart = parseBackendTime(ts);
+  if (!bucketStart) return "";
+  const start = Math.max(bucketStart.getTime(), windowStart ?? Number.NEGATIVE_INFINITY);
+  const end = Math.min(
+    bucketStart.getTime() + bucketMinutes * 60_000,
+    windowEnd ?? Number.POSITIVE_INFINITY,
+  );
+  return `${formatLocalBucketLabel(start, true)} – ${formatLocalBucketLabel(end, true)}`;
+}
+
 /** 日期戳 YYYYMMDD(本地时区),用于导出文件名等。 */
 export function formatLocalDateStamp(ts: number | string | null | undefined): string {
   const date = parseBackendTime(ts);

@@ -181,11 +181,34 @@ def test_stats_overview_incremented(admin_env: dict[str, str]) -> None:
     )
     assert status == 200
 
+    deadline = time.time() + 10.0
+    data: dict[str, Any] = {}
+    while time.time() < deadline:
+        status, resp = http_request(
+            "GET",
+            f"{admin_env['admin']}/api/v1/stats/overview",
+            headers=admin_env["auth"],
+        )
+        if status == 200:
+            data = resp.get("data", {})
+            if data.get("total_requests", 0) >= 1:
+                break
+        time.sleep(0.3)
+    assert data.get("total_requests", 0) >= 1
+
     status, resp = http_request(
         "GET",
-        f"{admin_env['admin']}/api/v1/stats/overview",
+        f"{admin_env['admin']}/api/v1/stats/timeseries",
         headers=admin_env["auth"],
     )
     assert status == 200
-    data = resp.get("data", {})
-    assert data.get("total_requests", 0) >= 1
+    series = resp.get("data", {})
+    assert series.get("bucket_minutes") == 15
+    assert series.get("has_data") is True
+    points = series.get("points", [])
+    assert points
+    assert sum(point.get("request_count", 0) for point in points) >= 1
+    assert all(
+        right["bucket_start"] - left["bucket_start"] == 15 * 60 * 1000
+        for left, right in zip(points, points[1:])
+    )

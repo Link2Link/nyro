@@ -13,8 +13,8 @@ use crate::db::models::{
     CreateProvider, CreateProviderProtocolEndpoint, LogPage, LogQuery, Model, ModelBackend,
     ModelStats, ModelUsageStats, ModelUsageTotals, OAuthCredential, Provider,
     ProviderProtocolEndpoint, ProviderStats, RecentModelPerformance, RequestLog, StatsHourly,
-    StatsOverview, UpdateApiKey, UpdateModel, UpdateProvider, UpsertOAuthCredential,
-    is_valid_provider_auth_mode,
+    StatsOverview, StatsTimeBucket, UpdateApiKey, UpdateModel, UpdateProvider,
+    UpsertOAuthCredential, is_valid_provider_auth_mode,
 };
 use crate::logging::LogEntry;
 use crate::storage::traits::{
@@ -1272,6 +1272,24 @@ impl LogStore for SqliteLogStore {
             "SELECT strftime('%Y-%m-%d %H:00:00', datetime(created_at/1000, 'unixepoch')) AS hour, COUNT(*) AS request_count, COALESCE(SUM(CASE WHEN client_status_code >= 400 THEN 1 ELSE 0 END), 0) AS error_count, COALESCE(SUM(input_tokens), 0) AS total_input_tokens, COALESCE(SUM(output_tokens), 0) AS total_output_tokens, COALESCE(SUM(cache_read_tokens), 0) AS total_cache_read_tokens, COALESCE(AVG(latency_total_ms), 0.0) AS avg_duration_ms FROM request_logs WHERE created_at >= CAST(strftime('%s', 'now', ?) AS INTEGER) * 1000 GROUP BY hour ORDER BY hour ASC",
         )
         .bind(format!("-{hours} hours"))
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    async fn stats_time_buckets(
+        &self,
+        start_ms: i64,
+        end_ms: i64,
+        bucket_ms: i64,
+    ) -> anyhow::Result<Vec<StatsTimeBucket>> {
+        anyhow::ensure!(bucket_ms > 0, "stats bucket must be positive");
+        Ok(sqlx::query_as::<_, StatsTimeBucket>(
+            "SELECT (created_at / ?) * ? AS bucket_start, COUNT(*) AS request_count, COALESCE(SUM(CASE WHEN client_status_code >= 400 THEN 1 ELSE 0 END), 0) AS error_count, COALESCE(SUM(input_tokens), 0) AS total_input_tokens, COALESCE(SUM(output_tokens), 0) AS total_output_tokens, COALESCE(SUM(cache_read_tokens), 0) AS total_cache_read_tokens, AVG(latency_total_ms) AS avg_duration_ms FROM request_logs WHERE created_at >= ? AND created_at <= ? GROUP BY bucket_start ORDER BY bucket_start ASC",
+        )
+        .bind(bucket_ms)
+        .bind(bucket_ms)
+        .bind(start_ms)
+        .bind(end_ms)
         .fetch_all(&self.pool)
         .await?)
     }

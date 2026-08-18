@@ -6,8 +6,8 @@ use async_trait::async_trait;
 use crate::db::models::{
     ApiKeyStats, ApiKeyWithBindings, CreateApiKey, CreateModel, CreateModelBackend, CreateProvider,
     LogPage, LogQuery, Model, ModelBackend, ModelStats, ModelUsageStats, OAuthCredential, Provider,
-    ProviderStats, RequestLog, StatsHourly, StatsOverview, UpdateApiKey, UpdateModel,
-    UpdateProvider, UpsertOAuthCredential,
+    ProviderStats, RequestLog, StatsHourly, StatsOverview, StatsTimeBucket, UpdateApiKey,
+    UpdateModel, UpdateProvider, UpsertOAuthCredential,
 };
 use crate::logging::LogEntry;
 
@@ -143,6 +143,12 @@ pub trait LogStore: Send + Sync {
     async fn clear_all(&self) -> anyhow::Result<u64>;
     async fn stats_overview(&self, hours: Option<i64>) -> anyhow::Result<StatsOverview>;
     async fn stats_hourly(&self, hours: i64) -> anyhow::Result<Vec<StatsHourly>>;
+    async fn stats_time_buckets(
+        &self,
+        start_ms: i64,
+        end_ms: i64,
+        bucket_ms: i64,
+    ) -> anyhow::Result<Vec<StatsTimeBucket>>;
     async fn stats_by_model(&self, hours: Option<i64>) -> anyhow::Result<Vec<ModelStats>>;
     async fn model_usage_stats(
         &self,

@@ -145,6 +145,24 @@ export interface StatsHourly {
   avg_duration_ms: number;
 }
 
+export interface StatsTimeBucket {
+  bucket_start: number;
+  request_count: number;
+  error_count: number;
+  total_input_tokens: number;
+  total_output_tokens: number;
+  total_cache_read_tokens: number;
+  avg_duration_ms: number | null;
+}
+
+export interface StatsTimeSeries {
+  start_at: number;
+  end_at: number;
+  bucket_minutes: number;
+  has_data: boolean;
+  points: StatsTimeBucket[];
+}
+
 export interface ModelStats {
   model: string;
   request_count: number;

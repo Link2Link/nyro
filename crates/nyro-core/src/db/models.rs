@@ -569,6 +569,26 @@ pub struct StatsHourly {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct StatsTimeBucket {
+    pub bucket_start: i64,
+    pub request_count: i64,
+    pub error_count: i64,
+    pub total_input_tokens: i64,
+    pub total_output_tokens: i64,
+    pub total_cache_read_tokens: i64,
+    pub avg_duration_ms: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StatsTimeSeries {
+    pub start_at: i64,
+    pub end_at: i64,
+    pub bucket_minutes: i32,
+    pub has_data: bool,
+    pub points: Vec<StatsTimeBucket>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
 pub struct ModelStats {
     pub model: String,
     pub request_count: i64,

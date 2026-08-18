@@ -134,6 +134,7 @@ pub fn create_router(gateway: Gateway, admin_token: Option<String>) -> Router {
         .route("/logs/:id", get(get_log_handler))
         .route("/stats/overview", get(stats_overview))
         .route("/stats/hourly", get(stats_hourly))
+        .route("/stats/timeseries", get(stats_timeseries))
         .route("/stats/models", get(stats_by_model))
         .route("/stats/providers", get(stats_by_provider))
         .route("/stats/api-keys", get(stats_by_api_key))
@@ -668,6 +669,16 @@ async fn stats_hourly(
     Query(params): Query<HourlyParams>,
 ) -> impl IntoResponse {
     match gw.admin().get_stats_hourly(params.hours).await {
+        Ok(v) => Json(serde_json::json!({ "data": v })).into_response(),
+        Err(e) => err(e),
+    }
+}
+
+async fn stats_timeseries(
+    State(gw): State<Gateway>,
+    Query(params): Query<StatsRangeParams>,
+) -> impl IntoResponse {
+    match gw.admin().get_stats_timeseries(params.hours).await {
         Ok(v) => Json(serde_json::json!({ "data": v })).into_response(),
         Err(e) => err(e),
     }

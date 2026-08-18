@@ -415,6 +415,17 @@ pub async fn get_stats_hourly(
 }
 
 #[tauri::command]
+pub async fn get_stats_timeseries(
+    gw: State<'_, Gateway>,
+    hours: Option<i32>,
+) -> Result<StatsTimeSeries, String> {
+    gw.admin()
+        .get_stats_timeseries(hours)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 pub async fn get_stats_by_model(
     gw: State<'_, Gateway>,
     hours: Option<i32>,

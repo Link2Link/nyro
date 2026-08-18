@@ -11,8 +11,8 @@ use crate::db::models::{
     CreateProvider, CreateProviderProtocolEndpoint, LogPage, LogQuery, Model, ModelBackend,
     ModelStats, ModelUsageStats, ModelUsageTotals, OAuthCredential, Provider,
     ProviderProtocolEndpoint, ProviderStats, RecentModelPerformance, RequestLog, StatsHourly,
-    StatsOverview, UpdateApiKey, UpdateModel, UpdateProvider, UpsertOAuthCredential,
-    is_valid_provider_auth_mode,
+    StatsOverview, StatsTimeBucket, UpdateApiKey, UpdateModel, UpdateProvider,
+    UpsertOAuthCredential, is_valid_provider_auth_mode,
 };
 use crate::logging::LogEntry;
 use crate::storage::sql::config::SqlBackendConfig;
@@ -1205,6 +1205,24 @@ impl LogStore for MysqlLogStore {
         Ok(sqlx::query_as::<_, StatsHourly>(&sql)
             .fetch_all(&self.pool)
             .await?)
+    }
+
+    async fn stats_time_buckets(
+        &self,
+        start_ms: i64,
+        end_ms: i64,
+        bucket_ms: i64,
+    ) -> anyhow::Result<Vec<StatsTimeBucket>> {
+        anyhow::ensure!(bucket_ms > 0, "stats bucket must be positive");
+        Ok(sqlx::query_as::<_, StatsTimeBucket>(
+            "SELECT CAST(FLOOR(created_at / ?) * ? AS SIGNED) AS bucket_start, COUNT(*) AS request_count, CAST(COALESCE(SUM(CASE WHEN client_status_code >= 400 THEN 1 ELSE 0 END), 0) AS SIGNED) AS error_count, CAST(COALESCE(SUM(input_tokens), 0) AS SIGNED) AS total_input_tokens, CAST(COALESCE(SUM(output_tokens), 0) AS SIGNED) AS total_output_tokens, CAST(COALESCE(SUM(cache_read_tokens), 0) AS SIGNED) AS total_cache_read_tokens, CAST(AVG(latency_total_ms) AS DOUBLE) AS avg_duration_ms FROM request_logs WHERE created_at >= ? AND created_at <= ? GROUP BY bucket_start ORDER BY bucket_start ASC",
+        )
+        .bind(bucket_ms)
+        .bind(bucket_ms)
+        .bind(start_ms)
+        .bind(end_ms)
+        .fetch_all(&self.pool)
+        .await?)
     }
 
     async fn stats_by_model(&self, hours: Option<i64>) -> anyhow::Result<Vec<ModelStats>> {

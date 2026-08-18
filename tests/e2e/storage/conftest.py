@@ -209,6 +209,8 @@ def build_harness(work_dir: Path) -> None:
                 vendor: None,
                 protocol: "openai".to_string(),
                 base_url: format!("{upstream}/v1"),
+                protocol_mode: "fixed".to_string(),
+                protocol_endpoints: Vec::new(),
                 preset_key: None,
                 channel: None,
                 models_source: None,
@@ -262,12 +264,21 @@ def build_harness(work_dir: Path) -> None:
             for _ in 0..20 {
                 let logs = admin.query_logs(LogQuery { limit: Some(10), offset: Some(0), ..Default::default() }).await?;
                 let stats = admin.get_stats_overview(None).await?;
+                let series = admin.get_stats_timeseries(Some(6)).await?;
                 logs_total = logs.total;
                 stats_requests = stats.total_requests;
-                if logs_total >= 1 && stats_requests >= 1 {
+                let series_requests: i64 = series.points.iter().map(|point| point.request_count).sum();
+                let series_input_tokens: i64 = series.points.iter().map(|point| point.total_input_tokens).sum();
+                let series_output_tokens: i64 = series.points.iter().map(|point| point.total_output_tokens).sum();
+                if logs_total >= 1 && stats_requests >= 1 && series.has_data && series_requests >= 1 {
+                    ensure!(series.bucket_minutes == 5, "6h series bucket size");
+                    ensure!(series_input_tokens >= 3, "series input token total");
+                    ensure!(series_output_tokens >= 1, "series output token total");
+                    ensure!(series.points.windows(2).all(|pair| pair[1].bucket_start - pair[0].bucket_start == 5 * 60 * 1000), "series bucket continuity");
                     println!("backend={backend}");
                     println!("logs_total={logs_total}");
                     println!("stats_total_requests={stats_requests}");
+                    println!("timeseries_bucket_minutes={}", series.bucket_minutes);
                     println!("proxy_status_ok=200");
                     println!("proxy_status_no_key=401");
                     return Ok(());

@@ -185,6 +185,10 @@ function resolveHTTP(cmd: string, args?: Record<string, unknown>): HTTPMapping {
       const hours = args?.hours ?? 24;
       return { method: "GET", url: `${base}/stats/hourly?hours=${hours}` };
     }
+    case "get_stats_timeseries": {
+      const hours = args?.hours ?? 24;
+      return { method: "GET", url: `${base}/stats/timeseries?hours=${hours}` };
+    }
     case "get_stats_by_model": {
       const hours = args?.hours;
       return {

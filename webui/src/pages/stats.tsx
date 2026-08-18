@@ -2,10 +2,10 @@ import { useQuery } from "@tanstack/react-query";
 import { useState } from "react";
 import { Line, LineChart, CartesianGrid, ResponsiveContainer, Tooltip, XAxis, YAxis, PieChart, Pie, Cell } from "recharts";
 import { backend } from "@/lib/backend";
-import type { StatsOverview, StatsHourly, ModelStats, ProviderStats, ApiKeyStats } from "@/lib/types";
+import type { StatsOverview, StatsTimeSeries, ModelStats, ProviderStats, ApiKeyStats } from "@/lib/types";
 import { Zap, Clock, Activity } from "lucide-react";
 import { useLocale } from "@/lib/i18n";
-import { formatLogTime, formatLocalHourLabel, formatTps } from "@/lib/format";
+import { formatLocalBucketLabel, formatLocalBucketRange, formatLogTime, formatTps } from "@/lib/format";
 import {
   Select,
   SelectContent,
@@ -46,9 +46,9 @@ export default function StatsPage() {
     refetchInterval: 10_000,
   });
 
-  const { data: hourly = [] } = useQuery<StatsHourly[]>({
-    queryKey: ["stats-hourly", hours],
-    queryFn: () => backend("get_stats_hourly", { hours }),
+  const { data: timeSeries } = useQuery<StatsTimeSeries>({
+    queryKey: ["stats-timeseries", hours],
+    queryFn: () => backend("get_stats_timeseries", { hours }),
     refetchInterval: 30_000,
   });
 
@@ -70,13 +70,12 @@ export default function StatsPage() {
     refetchInterval: 30_000,
   });
 
-  // 跨度超过 24 小时时,仅显示小时会出现重复,改为附带日期的标签。
   const showDateOnAxis = hours > 24;
-  const tokenChart = hourly.map((h) => ({
-    hour: formatLocalHourLabel(h.hour, showDateOnAxis),
-    input: h.total_input_tokens,
-    output: h.total_output_tokens,
-    cache: h.total_cache_read_tokens,
+  const tokenChart = (timeSeries?.points ?? []).map((point) => ({
+    timestamp: point.bucket_start,
+    input: point.total_input_tokens,
+    output: point.total_output_tokens,
+    cache: point.total_cache_read_tokens,
   }));
 
   const modelPie = modelStats.slice(0, 6).map((m) => ({
@@ -176,15 +175,43 @@ export default function StatsPage() {
 
       <div className="grid grid-cols-1 gap-3 xl:grid-cols-2">
         <div className="glass rounded-2xl p-6">
-          <h3 className="mb-4 text-sm font-semibold text-slate-800">{isZh ? "Token 时序" : "Token Usage Over Time"}</h3>
+          <div className="mb-4 flex items-center justify-between gap-3">
+            <h3 className="text-sm font-semibold text-slate-800">{isZh ? "Token 时序" : "Token Usage Over Time"}</h3>
+            {timeSeries && (
+              <span className="shrink-0 text-xs text-slate-400">
+                {isZh
+                  ? `${timeSeries.bucket_minutes} 分钟/点`
+                  : `${timeSeries.bucket_minutes} min / point`}
+              </span>
+            )}
+          </div>
           <div className="h-48">
-            {tokenChart.length > 0 ? (
+            {timeSeries?.has_data ? (
               <ResponsiveContainer width="100%" height="100%">
                 <LineChart data={tokenChart}>
                   <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#e2e8f0" />
-                  <XAxis dataKey="hour" tick={{ fill: "#64748b", fontSize: 11 }} axisLine={false} tickLine={false} />
+                  <XAxis
+                    dataKey="timestamp"
+                    type="number"
+                    scale="time"
+                    domain={["dataMin", "dataMax"]}
+                    interval="preserveStartEnd"
+                    minTickGap={28}
+                    tick={{ fill: "#64748b", fontSize: 11 }}
+                    tickFormatter={(value) => formatLocalBucketLabel(value, showDateOnAxis)}
+                    axisLine={false}
+                    tickLine={false}
+                  />
                   <YAxis tick={{ fill: "#64748b", fontSize: 11 }} axisLine={false} tickLine={false} width={50} tickFormatter={fmt} />
-                  <Tooltip formatter={chartTooltipFormatter} />
+                  <Tooltip
+                    formatter={chartTooltipFormatter}
+                    labelFormatter={(value) => formatLocalBucketRange(
+                      Number(value),
+                      timeSeries.bucket_minutes,
+                      timeSeries.start_at,
+                      timeSeries.end_at,
+                    )}
+                  />
                   <Line type="monotone" dataKey="input" name={isZh ? "输入" : "Input"} stroke="#3b82f6" strokeWidth={2} dot={false} />
                   <Line type="monotone" dataKey="cache" name={isZh ? "缓存命中" : "Cache"} stroke="#f59e0b" strokeWidth={2} dot={false} />
                   <Line type="monotone" dataKey="output" name={isZh ? "输出" : "Output"} stroke="#10b981" strokeWidth={2} dot={false} />
