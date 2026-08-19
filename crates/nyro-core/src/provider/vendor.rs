@@ -226,8 +226,8 @@ pub trait Vendor: Send + Sync + 'static {
     ///
     /// When `false` **and** the protocol plan resolves to
     /// [`ProtocolMode::Native`][crate::proxy::planner::ProtocolMode::Native]
-    /// (ingress == egress), the dispatcher skips the IR round-trip and forwards
-    /// the client body verbatim via
+    /// (ingress == egress), the dispatcher skips the IR round-trip and preserves
+    /// the client fields while applying native protocol defaults via
     /// [`pipeline::passthrough_run`][super::common::pipeline::passthrough_run].
     ///
     /// Defaults to `true` (conservative). Only override to `false` when

@@ -408,6 +408,33 @@ fn round_trip_function_tools_flattened_format() {
 }
 
 #[test]
+fn round_trip_function_tool_defaults_missing_strict_to_false() {
+    let parameters = json!({
+        "type": "object",
+        "properties": {
+            "required_value": {"type": "string"},
+            "optional_value": {"type": "string"}
+        },
+        "required": ["required_value"]
+    });
+    let out = round_trip_request(
+        P::OpenAiResponses,
+        json!({
+            "model": "gpt-4o",
+            "input": [{"role": "user", "content": "Call the tool"}],
+            "tools": [{
+                "type": "function",
+                "name": "strict_default",
+                "parameters": parameters
+            }]
+        }),
+    );
+
+    assert_eq!(out["tools"][0]["strict"], false);
+    assert_eq!(out["tools"][0]["parameters"], parameters);
+}
+
+#[test]
 fn round_trip_function_call_output_items() {
     let out = round_trip_request(
         P::OpenAiResponses,

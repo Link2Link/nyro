@@ -149,11 +149,11 @@ where
 ///
 /// Used when [`crate::proxy::planner::ProtocolMode::Native`] is in effect
 /// (ingress == egress) and the vendor declares no request mutations via
-/// [`Vendor::declared_request_mutations`]. Only auth headers and the egress
-/// URL are computed; the client body is forwarded verbatim. `is_stream` must
-/// come from the decoded ingress request, not just a raw body field: native
-/// Gemini expresses streaming in the URL action (`:streamGenerateContent`)
-/// rather than a JSON `stream` property.
+/// [`Vendor::declared_request_mutations`]. Authentication, URL/model
+/// resolution, and narrowly scoped protocol defaults still apply; every other
+/// client field is preserved. `is_stream` must come from the decoded ingress
+/// request, not just a raw body field: native Gemini expresses streaming in the
+/// URL action (`:streamGenerateContent`) rather than a JSON `stream` property.
 fn normalize_openai_developer_roles(body: &mut serde_json::Value) {
     if let Some(messages) = body
         .get_mut("messages")
@@ -187,8 +187,8 @@ pub async fn passthrough_run(
 
         // OpenAI chat-completions streaming only populates `usage` in the final
         // chunk when the client opts in via `stream_options.include_usage`.
-        // PassThrough forwards the client body verbatim, so it bypasses
-        // `OpenAIEncoder` — which injects this on the transcode path
+        // PassThrough bypasses `OpenAIEncoder`, which injects this on the
+        // transcode path
         // (encoder.rs "Always include_usage when streaming"). Mirror it here so
         // usage stays observable for logging/cost on the native path too. An
         // explicit client `stream_options` is preserved verbatim (same
@@ -205,6 +205,11 @@ pub async fn passthrough_run(
 
     if is_openai_chat {
         normalize_openai_developer_roles(&mut raw_body);
+    }
+    if ctx.protocol == crate::protocol::ids::OPENAI_RESPONSES_V1 {
+        crate::protocol::codec::openai::responses::normalize_function_tool_strict_defaults(
+            &mut raw_body,
+        );
     }
 
     let mut headers = if ctx.disable_default_auth {

@@ -11,7 +11,8 @@
 //! ```
 //!
 //! Diagonal (Native): `negotiate()` must return `ProtocolMode::Native`;
-//!   `passthrough_run()` must return the client body unchanged.
+//!   `passthrough_run()` must preserve client fields while applying documented
+//!   native protocol defaults.
 //!
 //! Off-diagonal (Transform): `negotiate()` must return `ProtocolMode::Transform`
 //!   or `ProtocolMode::LossyTransform`.
@@ -360,6 +361,49 @@ async fn passthrough_run_preserves_vendor_specific_fields() {
         "URL must include the egress path, got: {}",
         out.url
     );
+}
+
+#[tokio::test]
+async fn passthrough_run_defaults_missing_responses_tool_strict_to_false() {
+    let gw = build_test_gateway().await;
+    let provider = fake_provider("sk-test");
+    let vendor = BearerVendor("test");
+    let parameters = json!({
+        "type": "object",
+        "properties": {
+            "required_value": {"type": "string"},
+            "optional_value": {"type": "string"}
+        },
+        "required": ["required_value"]
+    });
+    let raw_body = json!({
+        "model": "gpt-4o",
+        "input": [{"role": "user", "content": "Call the tool"}],
+        "tools": [{
+            "type": "function",
+            "name": "strict_default",
+            "parameters": parameters
+        }]
+    });
+    let ctx = ProviderCtx {
+        provider: &provider,
+        protocol: OPENAI_RESPONSES_V1,
+        egress_base_url: "https://api.openai.com",
+        api_key: &provider.api_key,
+        auth_scheme: "auto",
+        actual_model: "gpt-4o",
+        credential: None,
+        gw: &gw,
+        disable_default_auth: false,
+    };
+
+    let out =
+        nyro_core::provider::common::pipeline::passthrough_run(&vendor, raw_body, &ctx, false)
+            .await
+            .expect("passthrough_run must succeed");
+
+    assert_eq!(out.body["tools"][0]["strict"], false);
+    assert_eq!(out.body["tools"][0]["parameters"], parameters);
 }
 
 #[tokio::test]
