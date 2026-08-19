@@ -23,7 +23,7 @@ use crate::protocol::ir::request::{
     ToolSpecKind,
 };
 
-use super::normalize_function_tool_strict_defaults;
+use super::normalize_function_tool_defaults;
 
 /// Encoder for the OpenAI Responses API (`POST /v1/responses`).
 ///
@@ -266,7 +266,7 @@ impl RequestEncoder for ResponsesEncoder {
             obj.entry(k.clone()).or_insert_with(|| v.clone());
         }
 
-        normalize_function_tool_strict_defaults(&mut body);
+        normalize_function_tool_defaults(&mut body);
         Ok((body, HeaderMap::new()))
     }
 

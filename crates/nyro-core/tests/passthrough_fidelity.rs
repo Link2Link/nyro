@@ -364,25 +364,41 @@ async fn passthrough_run_preserves_vendor_specific_fields() {
 }
 
 #[tokio::test]
-async fn passthrough_run_defaults_missing_responses_tool_strict_to_false() {
+async fn passthrough_run_defaults_missing_responses_function_tool_fields() {
     let gw = build_test_gateway().await;
     let provider = fake_provider("sk-test");
     let vendor = BearerVendor("test");
     let parameters = json!({
-        "type": "object",
-        "properties": {
-            "required_value": {"type": "string"},
-            "optional_value": {"type": "string"}
+        "$defs": {
+            "view": {
+                "type": "object",
+                "properties": {
+                    "mode": {"const": "view"},
+                    "id": {"type": "string"}
+                },
+                "required": ["mode", "id"]
+            }
         },
-        "required": ["required_value"]
+        "oneOf": [
+            {"$ref": "#/$defs/view"},
+            {
+                "type": "object",
+                "properties": {"mode": {"const": "delete"}},
+                "required": ["mode"]
+            }
+        ]
     });
     let raw_body = json!({
         "model": "gpt-4o",
         "input": [{"role": "user", "content": "Call the tool"}],
         "tools": [{
-            "type": "function",
-            "name": "strict_default",
-            "parameters": parameters
+            "type": "namespace",
+            "name": "codex_app",
+            "tools": [{
+                "type": "function",
+                "name": "automation_update",
+                "parameters": parameters.clone()
+            }]
         }]
     });
     let ctx = ProviderCtx {
@@ -402,8 +418,11 @@ async fn passthrough_run_defaults_missing_responses_tool_strict_to_false() {
             .await
             .expect("passthrough_run must succeed");
 
-    assert_eq!(out.body["tools"][0]["strict"], false);
-    assert_eq!(out.body["tools"][0]["parameters"], parameters);
+    let function_tool = &out.body["tools"][0]["tools"][0];
+    assert_eq!(function_tool["strict"], false);
+    let mut expected_parameters = parameters;
+    expected_parameters["type"] = json!("object");
+    assert_eq!(function_tool["parameters"], expected_parameters);
 }
 
 #[tokio::test]

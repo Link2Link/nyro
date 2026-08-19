@@ -207,9 +207,7 @@ pub async fn passthrough_run(
         normalize_openai_developer_roles(&mut raw_body);
     }
     if ctx.protocol == crate::protocol::ids::OPENAI_RESPONSES_V1 {
-        crate::protocol::codec::openai::responses::normalize_function_tool_strict_defaults(
-            &mut raw_body,
-        );
+        crate::protocol::codec::openai::responses::normalize_function_tool_defaults(&mut raw_body);
     }
 
     let mut headers = if ctx.disable_default_auth {
