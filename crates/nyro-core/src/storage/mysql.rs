@@ -385,7 +385,7 @@ impl ProviderStore for MysqlProviderStore {
         }
         let mut tx = self.pool.begin().await?;
         sqlx::query(
-            "INSERT INTO providers (id, name, vendor, protocol, base_url, protocol_mode, preset_key, channel, models_source, static_models, api_key, auth_mode, use_proxy) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO providers (id, name, vendor, protocol, base_url, protocol_mode, preset_key, channel, models_source, static_models, api_key, auth_mode, use_proxy, fast_mode) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&id)
         .bind(input.name.trim())
@@ -400,6 +400,7 @@ impl ProviderStore for MysqlProviderStore {
         .bind(input.api_key)
         .bind(input.auth_mode)
         .bind(input.use_proxy)
+        .bind(input.fast_mode)
         .execute(&mut *tx)
         .await?;
         for endpoint in endpoint_inputs {
@@ -450,11 +451,12 @@ impl ProviderStore for MysqlProviderStore {
             anyhow::bail!("unsupported provider auth_mode: {}", auth_mode);
         }
         let use_proxy = input.use_proxy.unwrap_or(current.use_proxy);
+        let fast_mode = input.fast_mode.unwrap_or(current.fast_mode);
         let is_enabled = input.is_enabled.unwrap_or(current.is_enabled);
 
         let mut tx = self.pool.begin().await?;
         sqlx::query(
-            "UPDATE providers SET name=?, vendor=?, protocol=?, base_url=?, protocol_mode=?, preset_key=?, channel=?, models_source=?, static_models=?, api_key=?, auth_mode=?, use_proxy=?, is_enabled=?, updated_at=NOW() WHERE id=?",
+            "UPDATE providers SET name=?, vendor=?, protocol=?, base_url=?, protocol_mode=?, preset_key=?, channel=?, models_source=?, static_models=?, api_key=?, auth_mode=?, use_proxy=?, fast_mode=?, is_enabled=?, updated_at=NOW() WHERE id=?",
         )
         .bind(name.trim())
         .bind(vendor)
@@ -468,6 +470,7 @@ impl ProviderStore for MysqlProviderStore {
         .bind(api_key)
         .bind(auth_mode)
         .bind(use_proxy)
+        .bind(fast_mode)
         .bind(is_enabled)
         .bind(id)
         .execute(&mut *tx)
@@ -1340,6 +1343,13 @@ impl StorageBootstrap for MysqlBootstrap {
         mysql_add_column_if_not_exists(
             pool,
             "providers",
+            "fast_mode",
+            "TINYINT(1) NOT NULL DEFAULT 0",
+        )
+        .await?;
+        mysql_add_column_if_not_exists(
+            pool,
+            "providers",
             "protocol_mode",
             "VARCHAR(32) NOT NULL DEFAULT 'fixed'",
         )
@@ -1790,7 +1800,7 @@ fn normalize_provider_protocol_value(
 
 fn provider_select(suffix: Option<&str>) -> String {
     let mut sql = String::from(
-        "SELECT id, name, vendor, protocol, base_url, COALESCE(protocol_mode, 'fixed') AS protocol_mode, preset_key, channel, models_source, static_models, api_key, COALESCE(auth_mode, 'apikey') AS auth_mode, COALESCE(use_proxy, 0) AS use_proxy, last_test_success, DATE_FORMAT(last_test_at, '%Y-%m-%d %H:%i:%S') AS last_test_at, COALESCE(is_enabled, 1) AS is_enabled, DATE_FORMAT(created_at, '%Y-%m-%d %H:%i:%S') AS created_at, DATE_FORMAT(updated_at, '%Y-%m-%d %H:%i:%S') AS updated_at FROM providers",
+        "SELECT id, name, vendor, protocol, base_url, COALESCE(protocol_mode, 'fixed') AS protocol_mode, preset_key, channel, models_source, static_models, api_key, COALESCE(auth_mode, 'apikey') AS auth_mode, COALESCE(use_proxy, 0) AS use_proxy, COALESCE(fast_mode, 0) AS fast_mode, last_test_success, DATE_FORMAT(last_test_at, '%Y-%m-%d %H:%i:%S') AS last_test_at, COALESCE(is_enabled, 1) AS is_enabled, DATE_FORMAT(created_at, '%Y-%m-%d %H:%i:%S') AS created_at, DATE_FORMAT(updated_at, '%Y-%m-%d %H:%i:%S') AS updated_at FROM providers",
     );
     if let Some(suffix) = suffix {
         sql.push(' ');
@@ -1906,6 +1916,7 @@ CREATE TABLE IF NOT EXISTS providers (
     refresh_token TEXT,
     expires_at DATETIME,
     use_proxy TINYINT(1) NOT NULL DEFAULT 0,
+    fast_mode TINYINT(1) NOT NULL DEFAULT 0,
     last_test_success TINYINT(1),
     last_test_at DATETIME,
     is_enabled TINYINT(1) DEFAULT 1,

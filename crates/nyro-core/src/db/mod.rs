@@ -42,6 +42,7 @@ pub async fn migrate(pool: &SqlitePool) -> anyhow::Result<()> {
     ensure_provider_column(pool, "last_test_success", "INTEGER").await?;
     ensure_provider_column(pool, "last_test_at", "TEXT").await?;
     ensure_provider_column(pool, "use_proxy", "INTEGER DEFAULT 0").await?;
+    ensure_provider_column(pool, "fast_mode", "INTEGER DEFAULT 0").await?;
     ensure_provider_column(pool, "protocol_mode", "TEXT NOT NULL DEFAULT 'fixed'").await?;
     ensure_provider_protocol_endpoints_table(pool).await?;
     migrate_collapse_provider_protocol_columns(pool).await?;
@@ -859,6 +860,7 @@ CREATE TABLE IF NOT EXISTS providers (
     refresh_token TEXT,
     expires_at  TEXT,
     use_proxy   INTEGER DEFAULT 0,
+    fast_mode   INTEGER DEFAULT 0,
     last_test_success INTEGER,
     last_test_at TEXT,
     is_enabled  INTEGER DEFAULT 1,

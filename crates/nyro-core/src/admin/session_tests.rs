@@ -208,6 +208,7 @@ fn oauth_provider_input() -> CreateProvider {
         api_key: String::new(),
         auth_mode: "oauth".to_string(),
         use_proxy: false,
+        fast_mode: false,
     }
 }
 

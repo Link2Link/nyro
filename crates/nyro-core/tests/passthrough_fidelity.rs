@@ -132,6 +132,7 @@ fn fake_provider(api_key: &str) -> Provider {
         api_key: api_key.into(),
         auth_mode: "apikey".into(),
         use_proxy: false,
+        fast_mode: false,
         last_test_success: None,
         last_test_at: None,
         is_enabled: true,

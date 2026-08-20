@@ -482,6 +482,7 @@ impl AdminService {
                 api_key: protocol.api_key,
                 auth_mode,
                 use_proxy: input.use_proxy,
+                fast_mode: input.fast_mode,
             })
             .await?;
 
@@ -533,6 +534,7 @@ impl AdminService {
                 api_key: original.api_key.clone(),
                 auth_mode: original.auth_mode.clone(),
                 use_proxy: original.use_proxy,
+                fast_mode: original.fast_mode,
             })
             .await?;
         let copied = self
@@ -689,6 +691,7 @@ impl AdminService {
             raw_endpoints,
         )?;
         let use_proxy = input.use_proxy.unwrap_or(current.use_proxy);
+        let fast_mode = input.fast_mode.unwrap_or(current.fast_mode);
         let is_enabled = input.is_enabled.unwrap_or(current.is_enabled);
         let base_url_changed = protocol.base_url != current_base_url;
 
@@ -712,6 +715,7 @@ impl AdminService {
                     api_key: Some(protocol.api_key),
                     auth_mode: Some(auth_mode),
                     use_proxy: Some(use_proxy),
+                    fast_mode: Some(fast_mode),
                     is_enabled: Some(is_enabled),
                 },
             )

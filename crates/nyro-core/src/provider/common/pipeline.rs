@@ -17,9 +17,42 @@
 //! ```
 
 use reqwest::header::HeaderMap;
+use serde_json::Value;
 
+use crate::db::models::Provider;
 use crate::error::GatewayError;
+use crate::protocol::ids::{ProtocolId, OPENAI_RESPONSES_V1};
 use crate::provider::vendor::Vendor;
+
+/// sub2api 渠道专用开关「Fast 模式」：
+///
+/// 开启后，转发到上游的 OpenAI Responses 请求如果缺少 `service_tier` 字段，
+/// 就补上 `"service_tier": "priority"`（对应 OpenAI 官方 Fast mode：
+/// 优先处理、响应更快；默认值是 `auto`）。客户端显式携带的 `service_tier`
+/// 永远优先，本函数不做覆盖。仅对 `openai` 厂商的 `sub2api` 渠道生效。
+pub(crate) fn maybe_inject_sub2api_fast_mode(
+    body: &mut Value,
+    provider: &Provider,
+    protocol: ProtocolId,
+) {
+    let is_sub2api_fast = provider.fast_mode
+        && provider
+            .channel
+            .as_deref()
+            .map(|channel| channel.eq_ignore_ascii_case("sub2api"))
+            .unwrap_or(false);
+    if !is_sub2api_fast || protocol != OPENAI_RESPONSES_V1 {
+        return;
+    }
+    if let Some(object) = body.as_object_mut()
+        && !object.contains_key("service_tier")
+    {
+        object.insert(
+            "service_tier".to_string(),
+            Value::String("priority".to_string()),
+        );
+    }
+}
 
 /// Standard `build_request` pipeline:
 /// `pre_request → normalize_tool_results → pre_encode → codec_encode →
@@ -63,6 +96,9 @@ where
         .post_encode(&vendor_ctx, &mut body, &mut extra_headers)
         .await
         .map_err(GatewayError::internal)?;
+
+    // 5b. sub2api Fast 模式：缺 service_tier 时补 priority（IR 转码路径）
+    maybe_inject_sub2api_fast_mode(&mut body, ctx.provider, ctx.protocol);
 
     // 6. auth headers
     //
@@ -208,6 +244,8 @@ pub async fn passthrough_run(
     }
     if ctx.protocol == crate::protocol::ids::OPENAI_RESPONSES_V1 {
         crate::protocol::codec::openai::responses::normalize_function_tool_defaults(&mut raw_body);
+        // sub2api Fast 模式：缺 service_tier 时补 priority（Responses 直通路径）
+        maybe_inject_sub2api_fast_mode(&mut raw_body, ctx.provider, ctx.protocol);
     }
 
     let mut headers = if ctx.disable_default_auth {
@@ -446,6 +484,7 @@ mod tests {
             api_key: api_key.into(),
             auth_mode: "apikey".into(),
             use_proxy: false,
+            fast_mode: false,
             last_test_success: None,
             last_test_at: None,
             is_enabled: true,
@@ -766,6 +805,144 @@ mod tests {
 
     /// Non-streaming requests carry `usage` in the regular response body, so
     /// there is nothing to inject — and we must not pollute the body.
+    fn provider_with_channel(api_key: &str, channel: Option<&str>, fast_mode: bool) -> Provider {
+        let mut provider = provider_with_api_key(api_key);
+        provider.channel = channel.map(str::to_string);
+        provider.fast_mode = fast_mode;
+        provider
+    }
+
+    fn responses_ctx<'a>(
+        provider: &'a Provider,
+        gw: &'a Gateway,
+    ) -> ProviderCtx<'a> {
+        ProviderCtx {
+            provider,
+            protocol: OPENAI_RESPONSES_V1,
+            egress_base_url: "https://upstream.local",
+            api_key: &provider.api_key,
+            auth_scheme: "auto",
+            actual_model: "gpt-test",
+            credential: None,
+            gw,
+            disable_default_auth: false,
+        }
+    }
+
+    /// sub2api Fast 模式的核心行为：Responses 直通请求缺 service_tier 时
+    /// 注入 "priority"（OpenAI 官方 Fast mode 语义）。
+    #[tokio::test]
+    async fn passthrough_injects_service_tier_priority_for_sub2api_fast_mode() {
+        let gw = build_test_gateway().await;
+        let provider = provider_with_channel("sk-sub2api", Some("sub2api"), true);
+        let ctx = responses_ctx(&provider, &gw);
+
+        let out = passthrough_run(
+            &FakeApiKeyVendor,
+            serde_json::json!({ "model": "o3", "input": "ping", "stream": true }),
+            &ctx,
+            true,
+        )
+        .await
+        .expect("passthrough succeeds");
+
+        assert_eq!(
+            out.body["service_tier"],
+            "priority",
+            "sub2api fast mode must inject service_tier=priority",
+        );
+    }
+
+    /// 客户端显式携带的 service_tier 拥有最终决定权，Fast 模式不得覆盖。
+    #[tokio::test]
+    async fn passthrough_preserves_explicit_client_service_tier() {
+        let gw = build_test_gateway().await;
+        let provider = provider_with_channel("sk-sub2api", Some("sub2api"), true);
+        let ctx = responses_ctx(&provider, &gw);
+
+        let out = passthrough_run(
+            &FakeApiKeyVendor,
+            serde_json::json!({
+                "model": "o3",
+                "input": "ping",
+                "service_tier": "auto",
+            }),
+            &ctx,
+            false,
+        )
+        .await
+        .expect("passthrough succeeds");
+
+        assert_eq!(
+            out.body["service_tier"],
+            "auto",
+            "explicit client service_tier must be preserved verbatim",
+        );
+    }
+
+    /// Fast 模式开关关闭时不得注入任何字段。
+    #[tokio::test]
+    async fn passthrough_skips_service_tier_when_fast_mode_disabled() {
+        let gw = build_test_gateway().await;
+        let provider = provider_with_channel("sk-sub2api", Some("sub2api"), false);
+        let ctx = responses_ctx(&provider, &gw);
+
+        let out = passthrough_run(
+            &FakeApiKeyVendor,
+            serde_json::json!({ "model": "o3", "input": "ping" }),
+            &ctx,
+            false,
+        )
+        .await
+        .expect("passthrough succeeds");
+
+        assert!(
+            out.body.get("service_tier").is_none(),
+            "fast mode off must not inject service_tier",
+        );
+    }
+
+    /// Fast 模式只属于 sub2api 渠道：其他渠道开启该标志也不会注入。
+    #[tokio::test]
+    async fn passthrough_skips_service_tier_for_other_channels() {
+        let gw = build_test_gateway().await;
+        let provider = provider_with_channel("sk-other", Some("default"), true);
+        let ctx = responses_ctx(&provider, &gw);
+
+        let out = passthrough_run(
+            &FakeApiKeyVendor,
+            serde_json::json!({ "model": "o3", "input": "ping" }),
+            &ctx,
+            false,
+        )
+        .await
+        .expect("passthrough succeeds");
+
+        assert!(
+            out.body.get("service_tier").is_none(),
+            "non-sub2api channel must not receive service_tier injection",
+        );
+    }
+
+    /// IR 转码路径（build_request）同样注入：post_encode 之后补 priority。
+    #[tokio::test]
+    async fn build_request_injects_service_tier_for_sub2api_fast_mode() {
+        let gw = build_test_gateway().await;
+        let provider = provider_with_channel("sk-sub2api", Some("sub2api"), true);
+        let ctx = responses_ctx(&provider, &gw);
+        let mut req = minimal_chat_request();
+
+        let out = build_request(&FakeApiKeyVendor, &mut req, &ctx)
+            .await
+            .expect("build_request succeeds");
+
+        assert_eq!(
+            out.body["service_tier"],
+            "priority",
+            "IR transcode path must inject service_tier=priority for sub2api fast mode",
+        );
+    }
+
     #[tokio::test]
     async fn passthrough_skips_include_usage_when_not_streaming() {
         let gw = build_test_gateway().await;

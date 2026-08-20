@@ -128,7 +128,14 @@ pub(super) fn select_compat_request(
             } else {
                 UpstreamFlavor::StandardResponses
             };
-            ConversionProfile::anthropic_to_responses(client_stream, flavor)
+            let mut profile =
+                ConversionProfile::anthropic_to_responses(client_stream, flavor);
+            // sub2api 渠道 Fast 模式：Claude Code（Anthropic ingress）接
+            // sub2api 上游时同样注入 service_tier = "priority"。
+            if provider.fast_mode && channel.eq_ignore_ascii_case("sub2api") {
+                profile.codex_fast_mode = true;
+            }
+            profile
         }
         (ANTHROPIC_MESSAGES_2023_06_01, GOOGLE_GEMINI_GENERATE_CONTENT_V1BETA) => {
             ConversionProfile::anthropic_to_gemini(client_stream)
@@ -1560,6 +1567,7 @@ mod tests {
             api_key: "secret".into(),
             auth_mode: "apikey".into(),
             use_proxy: false,
+            fast_mode: false,
             last_test_success: None,
             last_test_at: None,
             is_enabled: true,

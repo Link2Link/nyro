@@ -477,6 +477,7 @@ async fn sqlite_provider_endpoints_are_transactional_and_persist_test_status() -
         api_key: "sk-chat".to_string(),
         auth_mode: "apikey".to_string(),
         use_proxy: false,
+        fast_mode: false,
     };
 
     let provider = gw.storage.providers().create(input.clone()).await?;
@@ -557,6 +558,7 @@ fn oauth_provider_input() -> CreateProvider {
         api_key: String::new(),
         auth_mode: "oauth".to_string(),
         use_proxy: false,
+        fast_mode: false,
     }
 }
 
@@ -575,6 +577,7 @@ fn api_key_provider_input(name: &str) -> CreateProvider {
         api_key: "sk-test".to_string(),
         auth_mode: "apikey".to_string(),
         use_proxy: true,
+        fast_mode: false,
     }
 }
 

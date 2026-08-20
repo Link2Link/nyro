@@ -53,6 +53,26 @@ const METADATA: VendorMetadata = VendorMetadata {
             auth_schemes: None,
         },
         ChannelDef {
+            id: "sub2api",
+            label: Label {
+                zh: "Sub2API",
+                en: "Sub2API",
+            },
+            base_urls: &[ProtocolBaseUrl {
+                protocol: "openai-responses",
+                base_url: "https://sub2api.com/v1",
+            }],
+            api_key: None,
+            models_source: None,
+            capabilities_source: CapabilitiesSource::Auto,
+            static_models: &[],
+            auth_mode: AuthMode::ApiKey,
+            oauth: None,
+            runtime: None,
+            shared_key_protocols: false,
+            auth_schemes: None,
+        },
+        ChannelDef {
             id: "codex",
             label: Label {
                 zh: "Codex",

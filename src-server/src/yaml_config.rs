@@ -433,6 +433,7 @@ pub fn build_providers(yaml: &YamlConfig) -> Vec<Provider> {
                 api_key,
                 auth_mode: "apikey".to_string(),
                 use_proxy: yp.use_proxy,
+                fast_mode: false,
                 last_test_success: None,
                 last_test_at: None,
                 is_enabled: true,

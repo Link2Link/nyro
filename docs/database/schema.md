@@ -38,6 +38,7 @@ AI 模型供应商配置（API endpoint、密钥、认证方式等）。
 | `refresh_token` | TEXT | NULL | OAuth refresh token（迁移至 oauth 表后弃用） |
 | `expires_at` | TEXT | NULL | OAuth token 过期时间（迁移至 oauth 表后弃用） |
 | `use_proxy` | INTEGER | `0` | 是否通过代理发送请求 |
+| `fast_mode` | INTEGER | `0` | sub2api 渠道 Fast 模式：开启后 OpenAI Responses 上游请求自动附加 `service_tier=priority`（客户端显式指定时优先保留） |
 | `last_test_success` | INTEGER | NULL | 最近一次连通性测试是否成功 |
 | `last_test_at` | TEXT | NULL | 最近一次连通性测试时间 |
 | `is_enabled` | INTEGER | `1` | 是否启用 |

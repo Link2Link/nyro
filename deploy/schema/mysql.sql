@@ -25,6 +25,7 @@ CREATE TABLE IF NOT EXISTS providers (
     refresh_token TEXT,
     expires_at DATETIME,
     use_proxy TINYINT(1) NOT NULL DEFAULT 0,
+    fast_mode TINYINT(1) NOT NULL DEFAULT 0,
     last_test_success TINYINT(1),
     last_test_at DATETIME,
     is_enabled TINYINT(1) DEFAULT 1,

@@ -85,6 +85,12 @@ pub struct Provider {
     pub auth_mode: String,
     #[serde(default)]
     pub use_proxy: bool,
+    /// Channel-specific fast-mode switch (e.g. sub2api): when enabled,
+    /// outbound OpenAI Responses requests get `service_tier: "priority"`
+    /// injected unless the client already set the field.
+    #[serde(default)]
+    #[sqlx(default)]
+    pub fast_mode: bool,
     pub last_test_success: Option<bool>,
     pub last_test_at: Option<String>,
     pub is_enabled: bool,
@@ -432,6 +438,8 @@ pub struct CreateProvider {
     pub auth_mode: String,
     #[serde(default)]
     pub use_proxy: bool,
+    #[serde(default)]
+    pub fast_mode: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -450,6 +458,7 @@ pub struct UpdateProvider {
     pub api_key: Option<String>,
     pub auth_mode: Option<String>,
     pub use_proxy: Option<bool>,
+    pub fast_mode: Option<bool>,
     pub is_enabled: Option<bool>,
 }
 
@@ -816,6 +825,8 @@ pub struct ExportProvider {
     pub auth_mode: String,
     #[serde(default)]
     pub use_proxy: bool,
+    #[serde(default)]
+    pub fast_mode: bool,
     pub is_enabled: bool,
 }
 

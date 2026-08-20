@@ -25,6 +25,7 @@ CREATE TABLE IF NOT EXISTS providers (
     refresh_token TEXT,
     expires_at TIMESTAMPTZ,
     use_proxy BOOLEAN NOT NULL DEFAULT FALSE,
+    fast_mode BOOLEAN NOT NULL DEFAULT FALSE,
     last_test_success BOOLEAN,
     last_test_at TIMESTAMPTZ,
     is_enabled BOOLEAN DEFAULT TRUE,

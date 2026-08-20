@@ -69,6 +69,7 @@ impl AdminService {
                         api_key: p.api_key,
                         auth_mode: p.auth_mode,
                         use_proxy: p.use_proxy,
+                        fast_mode: p.fast_mode,
                         is_enabled: p.is_enabled,
                     }
                 })
@@ -144,6 +145,7 @@ impl AdminService {
                         api_key: p.api_key.clone(),
                         auth_mode: p.auth_mode.clone(),
                         use_proxy: p.use_proxy,
+                        fast_mode: p.fast_mode,
                     })
                     .await
                     .is_ok()

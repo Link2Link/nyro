@@ -336,6 +336,7 @@ mod tests {
             api_key: "unused".into(),
             auth_mode: "apikey".into(),
             use_proxy: false,
+            fast_mode: false,
             last_test_success: None,
             last_test_at: None,
             is_enabled: true,

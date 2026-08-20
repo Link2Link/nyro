@@ -40,6 +40,17 @@
         "authMode": "apikey"
       },
       {
+        "id": "sub2api",
+        "label": {
+          "zh": "Sub2API",
+          "en": "Sub2API"
+        },
+        "baseUrls": {
+          "openai-responses": "https://sub2api.com/v1"
+        },
+        "authMode": "apikey"
+      },
+      {
         "id": "codex",
         "label": {
           "zh": "Codex",

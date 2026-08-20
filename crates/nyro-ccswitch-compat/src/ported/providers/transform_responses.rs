@@ -287,8 +287,8 @@ pub(crate) fn sanitize_anthropic_tool_use_input_json(name: &str, raw: &str) -> S
 /// `is_codex_oauth`: 当目标后端是 ChatGPT Plus/Pro 反代 (`chatgpt.com/backend-api/codex`) 时为 true。
 /// 该后端强制要求 `store: false`，并要求 `include` 包含 `reasoning.encrypted_content`
 /// 以便在无服务端状态下保持多轮 reasoning 上下文。
-/// `codex_fast_mode`: 仅在 `is_codex_oauth` 为 true 时生效，控制是否注入
-/// `service_tier = "priority"`。
+/// `codex_fast_mode`: Fast 模式开关，独立于 `is_codex_oauth` 生效——开启时注入
+/// `service_tier = "priority"`（Codex OAuth 反代或 sub2api 等第三方中转均适用）。
 pub fn anthropic_to_responses(
     body: Value,
     cache_key: Option<&str>,
@@ -400,15 +400,19 @@ pub fn anthropic_to_responses(
     //   （codex-rs 结构体根本没有这三个字段，OpenAI 自己的客户端不发它们）
     // - instructions / tools / parallel_tool_calls: 必填字段，缺则兜底默认值
     //   （cc-switch 的 transform 当前是"条件写入"，可能产生缺失）
-    // - service_tier: 仅在 FAST mode 开启时写入 "priority"
-    //   （与 OpenAI 官方 codex-rs 当前请求结构保持一致）
+    // - service_tier: FAST mode 开启时写入 "priority"
+    //   （与 OpenAI 官方 codex-rs 当前请求结构保持一致；不限于 Codex OAuth）
     // - stream: 必须永远 true（codex-rs 硬编码 true，且 cc-switch 的
     //   SSE 解析层只处理流式响应，强制覆盖避免客户端误传 false）
+    // service_tier 注入独立于 Codex OAuth 约束：任何启用 Fast 模式的上游
+    // （Codex OAuth 反代或 sub2api 等第三方中转）都会收到 "priority"，
+    // 与 OpenAI 官方 codex-rs / Fast mode 指南的用法一致。
+    if codex_fast_mode {
+        result["service_tier"] = json!("priority");
+    }
+
     if is_codex_oauth {
         result["store"] = json!(false);
-        if codex_fast_mode {
-            result["service_tier"] = json!("priority");
-        }
 
         const REASONING_MARKER: &str = "reasoning.encrypted_content";
         let mut includes: Vec<Value> = body
@@ -2100,6 +2104,23 @@ mod tests {
             .filter(|v| v.as_str() == Some("reasoning.encrypted_content"))
             .count();
         assert_eq!(marker_count, 1, "marker 不应被重复添加（idempotent 失败）");
+    }
+
+    #[test]
+    fn test_anthropic_to_responses_fast_mode_injects_service_tier_for_standard_upstream() {
+        // sub2api 等标准 Responses 上游：Fast 模式开启时也要收到
+        // service_tier = "priority"，但不得引入 Codex OAuth 专属的 store/include。
+        let input = json!({
+            "model": "gpt-5-codex",
+            "max_tokens": 1024,
+            "messages": [{"role": "user", "content": "Hello"}]
+        });
+
+        let result = anthropic_to_responses(input, None, false, true).unwrap();
+
+        assert_eq!(result["service_tier"], json!("priority"));
+        assert!(result.get("store").is_none(), "standard upstream must not get codex store=false");
+        assert!(result.get("include").is_none(), "standard upstream must not get codex include");
     }
 
     #[test]

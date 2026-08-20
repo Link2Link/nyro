@@ -343,7 +343,7 @@ fn endpoint_inputs_or_legacy(input: &CreateProvider) -> Vec<CreateProviderProtoc
 impl ProviderStore for SqliteProviderStore {
     async fn list(&self) -> anyhow::Result<Vec<Provider>> {
         let mut providers = sqlx::query_as::<_, Provider>(
-            "SELECT id, name, vendor, protocol, base_url, COALESCE(protocol_mode, 'fixed') AS protocol_mode, preset_key, channel, models_source, static_models, api_key, COALESCE(auth_mode, 'apikey') AS auth_mode, COALESCE(use_proxy, 0) AS use_proxy, last_test_success, last_test_at, COALESCE(is_enabled, 1) AS is_enabled, created_at, updated_at FROM providers ORDER BY created_at DESC",
+            "SELECT id, name, vendor, protocol, base_url, COALESCE(protocol_mode, 'fixed') AS protocol_mode, preset_key, channel, models_source, static_models, api_key, COALESCE(auth_mode, 'apikey') AS auth_mode, COALESCE(use_proxy, 0) AS use_proxy, COALESCE(fast_mode, 0) AS fast_mode, last_test_success, last_test_at, COALESCE(is_enabled, 1) AS is_enabled, created_at, updated_at FROM providers ORDER BY created_at DESC",
         )
         .fetch_all(&self.pool)
         .await?;
@@ -362,7 +362,7 @@ impl ProviderStore for SqliteProviderStore {
 
     async fn get(&self, id: &str) -> anyhow::Result<Option<Provider>> {
         let mut provider = sqlx::query_as::<_, Provider>(
-            "SELECT id, name, vendor, protocol, base_url, COALESCE(protocol_mode, 'fixed') AS protocol_mode, preset_key, channel, models_source, static_models, api_key, COALESCE(auth_mode, 'apikey') AS auth_mode, COALESCE(use_proxy, 0) AS use_proxy, last_test_success, last_test_at, COALESCE(is_enabled, 1) AS is_enabled, created_at, updated_at FROM providers WHERE id = ?",
+            "SELECT id, name, vendor, protocol, base_url, COALESCE(protocol_mode, 'fixed') AS protocol_mode, preset_key, channel, models_source, static_models, api_key, COALESCE(auth_mode, 'apikey') AS auth_mode, COALESCE(use_proxy, 0) AS use_proxy, COALESCE(fast_mode, 0) AS fast_mode, last_test_success, last_test_at, COALESCE(is_enabled, 1) AS is_enabled, created_at, updated_at FROM providers WHERE id = ?",
         )
         .bind(id)
         .fetch_optional(&self.pool)
@@ -383,7 +383,7 @@ impl ProviderStore for SqliteProviderStore {
         }
         let mut tx = self.pool.begin().await?;
         sqlx::query(
-            "INSERT INTO providers (id, name, vendor, protocol, base_url, protocol_mode, preset_key, channel, models_source, static_models, api_key, auth_mode, use_proxy) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO providers (id, name, vendor, protocol, base_url, protocol_mode, preset_key, channel, models_source, static_models, api_key, auth_mode, use_proxy, fast_mode) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&id)
         .bind(&input.name)
@@ -398,6 +398,7 @@ impl ProviderStore for SqliteProviderStore {
         .bind(&input.api_key)
         .bind(&input.auth_mode)
         .bind(input.use_proxy)
+        .bind(input.fast_mode)
         .execute(&mut *tx)
         .await?;
         for endpoint in endpoint_inputs {
@@ -448,11 +449,12 @@ impl ProviderStore for SqliteProviderStore {
             anyhow::bail!("unsupported provider auth_mode: {}", auth_mode);
         }
         let use_proxy = input.use_proxy.unwrap_or(current.use_proxy);
+        let fast_mode = input.fast_mode.unwrap_or(current.fast_mode);
         let is_enabled = input.is_enabled.unwrap_or(current.is_enabled);
 
         let mut tx = self.pool.begin().await?;
         sqlx::query(
-            "UPDATE providers SET name=?, vendor=?, protocol=?, base_url=?, protocol_mode=?, preset_key=?, channel=?, models_source=?, static_models=?, api_key=?, auth_mode=?, use_proxy=?, is_enabled=?, updated_at=datetime('now') WHERE id=?",
+            "UPDATE providers SET name=?, vendor=?, protocol=?, base_url=?, protocol_mode=?, preset_key=?, channel=?, models_source=?, static_models=?, api_key=?, auth_mode=?, use_proxy=?, fast_mode=?, is_enabled=?, updated_at=datetime('now') WHERE id=?",
         )
         .bind(name)
         .bind(vendor)
@@ -466,6 +468,7 @@ impl ProviderStore for SqliteProviderStore {
         .bind(api_key)
         .bind(auth_mode)
         .bind(use_proxy)
+        .bind(fast_mode)
         .bind(is_enabled)
         .bind(id)
         .execute(&mut *tx)

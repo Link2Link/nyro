@@ -8,6 +8,8 @@ export interface Provider {
   protocol_endpoints?: ProviderProtocolEndpoint[];
   api_key?: string;
   use_proxy: boolean;
+  /** sub2api 渠道 Fast 模式：开启后上游请求自动附加 service_tier=priority。 */
+  fast_mode: boolean;
   auth_mode?: "apikey" | "oauth";
   oauth_status?: ProviderOAuthStatus;
   oauth_expires_at?: string | null;
@@ -352,6 +354,7 @@ export interface CreateProvider {
   protocol_mode?: ProviderProtocolMode;
   protocol_endpoints?: CreateProviderProtocolEndpoint[];
   use_proxy?: boolean;
+  fast_mode?: boolean;
   auth_mode?: "apikey" | "oauth";
   preset_key?: string;
   channel?: string;
@@ -368,6 +371,7 @@ export interface UpdateProvider {
   protocol_mode?: ProviderProtocolMode;
   protocol_endpoints?: CreateProviderProtocolEndpoint[];
   use_proxy?: boolean;
+  fast_mode?: boolean;
   auth_mode?: "apikey" | "oauth";
   preset_key?: string;
   channel?: string;
@@ -461,6 +465,7 @@ export interface ExportProvider {
   protocol: string;
   base_url: string;
   use_proxy: boolean;
+  fast_mode: boolean;
   preset_key?: string | null;
   channel?: string | null;
   models_source?: string | null;

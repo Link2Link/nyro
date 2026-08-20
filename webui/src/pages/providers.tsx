@@ -84,6 +84,7 @@ const emptyCreate: CreateProvider = {
   protocol_mode: "fixed",
   protocol_endpoints: [],
   use_proxy: false,
+  fast_mode: false,
   auth_mode: "apikey",
   preset_key: "",
   channel: "",
@@ -878,6 +879,7 @@ export default function ProvidersPage() {
     protocol_mode: "fixed",
     protocol_endpoints: [],
     use_proxy: false,
+    fast_mode: false,
     preset_key: "",
     channel: "",
     models_source: "",
@@ -1708,6 +1710,7 @@ export default function ProvidersPage() {
         protocol_mode: "adaptive",
         protocol_endpoints: endpoints,
         use_proxy: p.use_proxy,
+        fast_mode: Boolean(p.fast_mode),
         preset_key: p.preset_key || DEFAULT_PRESET_ID,
         channel,
         models_source: p.models_source ?? "",
@@ -1734,6 +1737,7 @@ export default function ProvidersPage() {
         priority: endpoint.priority,
       })),
       use_proxy: p.use_proxy,
+      fast_mode: Boolean(p.fast_mode),
       preset_key: p.preset_key || DEFAULT_PRESET_ID,
       channel,
       models_source: p.models_source ?? "",
@@ -2114,6 +2118,26 @@ export default function ProvidersPage() {
                   ))}
                 </ToggleGroup>
               </div>
+              {createChannelValue === "sub2api" && (
+                <div className="col-span-2 space-y-2">
+                  <div className="flex items-center justify-between rounded-lg border border-slate-200 bg-white px-3 py-2.5">
+                    <div>
+                      <span className="text-sm font-medium text-slate-800">
+                        {isZh ? "Fast 模式" : "Fast Mode"}
+                      </span>
+                      <p className="mt-1 text-xs text-slate-500">
+                        {isZh
+                          ? "开启后上游请求自动附加 service_tier=priority（OpenAI Fast mode，优先处理）。客户端显式指定 service_tier 时优先保留。"
+                          : "When enabled, upstream requests get service_tier=priority (OpenAI Fast mode, priority processing). An explicit client service_tier wins."}
+                      </p>
+                    </div>
+                    <Switch
+                      checked={Boolean(form.fast_mode)}
+                      onCheckedChange={(checked) => setForm({ ...form, fast_mode: checked })}
+                    />
+                  </div>
+                </div>
+              )}
 {showCreateOAuthGuide ? (
                 <div className="col-span-2 rounded-xl border border-slate-200 bg-slate-50 p-4">
                   <div className="flex items-center justify-between gap-3">
@@ -3303,6 +3327,22 @@ export default function ProvidersPage() {
                         </div>
                       </div>
                     )}
+                    {editForm.channel === "sub2api" && (
+                      <div className="space-y-2">
+                        <FieldLabel>{isZh ? "Fast 模式" : "Fast Mode"}</FieldLabel>
+                        <div className="flex items-center justify-between rounded-lg border border-slate-200 bg-white px-3 py-2.5">
+                          <span className="text-xs text-slate-600">
+                            {isZh
+                              ? "开启后上游请求自动附加 service_tier=priority（OpenAI Fast mode，优先处理）。客户端显式指定 service_tier 时优先保留。"
+                              : "When enabled, upstream requests get service_tier=priority (OpenAI Fast mode, priority processing). An explicit client service_tier wins."}
+                          </span>
+                          <Switch
+                            checked={Boolean(editForm.fast_mode)}
+                            onCheckedChange={(checked) => setEditForm({ ...editForm, fast_mode: checked })}
+                          />
+                        </div>
+                      </div>
+                    )}
                   </div>
                   <div className="flex gap-3">
                     <Button
@@ -3338,6 +3378,7 @@ export default function ProvidersPage() {
                               }))
                             : [],
                           use_proxy: Boolean(editForm.use_proxy),
+                          fast_mode: Boolean(editForm.fast_mode),
                           preset_key: editForm.preset_key || undefined,
                           channel: editForm.channel || undefined,
                           models_source: editForm.models_source ?? "",
