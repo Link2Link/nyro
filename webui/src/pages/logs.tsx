@@ -316,36 +316,42 @@ export default function LogsPage() {
         </div>
       ) : (
         <div className="glass overflow-hidden rounded-2xl">
-          <div className="overflow-x-auto">
-            <table className="w-full text-sm">
+          <div className="log-table-scroll">
+            <table className="w-max min-w-full text-sm">
               <thead className="border-b border-slate-200/80 bg-slate-50/50 text-slate-500">
                 <tr>
                   <th className="px-3 py-2.5 text-left font-medium whitespace-nowrap">
                     {isZh ? "时间" : "Time"}
                   </th>
-                  <th className="px-3 py-2.5 text-left font-medium">
+                  <th className="px-3 py-2.5 text-left font-medium whitespace-nowrap">
                     {isZh ? "状态" : "Status"}
                   </th>
                   <th className="px-3 py-2.5 text-left font-medium whitespace-nowrap">
                     {isZh ? "密钥" : "API Key"}
                   </th>
-                  <th className="px-3 py-2.5 text-left font-medium">
+                  <th className="px-3 py-2.5 text-left font-medium whitespace-nowrap">
                     {isZh ? "模型" : "Model"}
                   </th>
                   <th className="px-3 py-2.5 text-left font-medium whitespace-nowrap">
                     {isZh ? "推理强度" : "Reasoning Effort"}
                   </th>
-                  <th className="px-3 py-2.5 text-left font-medium">
+                  <th className="px-3 py-2.5 text-left font-medium whitespace-nowrap">
                     {isZh ? "协议" : "Protocol"}
                   </th>
-                  <th className="px-3 py-2.5 text-left font-medium">
+                  <th className="px-3 py-2.5 text-right font-medium whitespace-nowrap">
                     {isZh ? "耗时" : "Latency"}
                   </th>
-                  <th className="px-3 py-2.5 text-left font-medium">Token</th>
-                  <th className="px-3 py-2.5 text-left font-medium whitespace-nowrap">
+                  <th
+                    className="px-3 py-2.5 text-right font-medium whitespace-nowrap"
+                    title={isZh ? "首字延迟（首个流式 chunk）" : "Time to first token"}
+                  >
+                    {isZh ? "首字延迟" : "TTFT"}
+                  </th>
+                  <th className="px-3 py-2.5 text-left font-medium whitespace-nowrap">Token</th>
+                  <th className="px-3 py-2.5 text-right font-medium whitespace-nowrap">
                     {isZh ? "速度" : "TPS"}
                   </th>
-                  <th className="px-3 py-2.5 text-left font-medium">
+                  <th className="px-3 py-2.5 text-left font-medium whitespace-nowrap">
                     {isZh ? "类型" : "Type"}
                   </th>
                 </tr>
@@ -361,13 +367,13 @@ export default function LogsPage() {
                       onClick={() => setSelected(log)}
                       className="cursor-pointer border-t border-slate-100 text-slate-700 transition-colors hover:bg-slate-50"
                     >
-                      <td className="px-3 py-2 text-xs text-slate-500 whitespace-nowrap">
+                      <td className="px-3 py-2 text-xs text-slate-500 whitespace-nowrap tabular-nums">
                         {formatLogTime(log.created_at)}
                       </td>
-                      <td className="px-3 py-2">
+                      <td className="px-3 py-2 whitespace-nowrap">
                         <span
                           className={cn(
-                            "inline-block rounded-full px-2 py-0.5 text-xs font-medium",
+                            "inline-block rounded-full px-2 py-0.5 text-xs font-medium tabular-nums",
                             statusOk ? "bg-green-50 text-green-700" : "bg-red-50 text-red-600",
                           )}
                         >
@@ -377,7 +383,7 @@ export default function LogsPage() {
                       <td className="px-3 py-2 text-xs text-slate-600 whitespace-nowrap">
                         {log.api_key_name ?? "–"}
                       </td>
-                      <td className="px-3 py-2">
+                      <td className="px-3 py-2 whitespace-nowrap">
                         <div className="flex flex-col leading-tight">
                           <span className="text-xs font-medium text-slate-800">
                             {log.client_model ?? "–"}
@@ -391,7 +397,7 @@ export default function LogsPage() {
                       <td className="px-3 py-2 text-xs text-slate-600 whitespace-nowrap">
                         {log.reasoning_effort ?? "–"}
                       </td>
-                      <td className="px-3 py-2">
+                      <td className="px-3 py-2 whitespace-nowrap">
                         <div className="flex items-center gap-1.5 text-xs text-slate-500">
                           <ProtocolLane
                             ingress={log.client_protocol}
@@ -402,10 +408,19 @@ export default function LogsPage() {
                           ) : null}
                         </div>
                       </td>
-                      <td className="px-3 py-2 text-xs text-slate-600 whitespace-nowrap">
+                      <td
+                        className="px-3 py-2 text-right text-xs text-slate-600 whitespace-nowrap tabular-nums"
+                        title={isZh ? "端到端耗时" : "End-to-end latency"}
+                      >
                         {formatDuration(log.latency_total_ms)}
                       </td>
-                      <td className="px-3 py-2">
+                      <td
+                        className="px-3 py-2 text-right text-xs text-slate-600 whitespace-nowrap tabular-nums"
+                        title={isZh ? "首字延迟（首个流式 chunk）" : "Time to first token"}
+                      >
+                        {formatDuration(log.stream_first_chunk_ms)}
+                      </td>
+                      <td className="px-3 py-2 whitespace-nowrap">
                         <div className="flex flex-col items-start leading-tight text-[11px] tabular-nums">
                           <span className="inline-flex items-center gap-1 text-sky-600">
                             <span className="font-semibold tracking-wide">NEW</span>
@@ -434,12 +449,12 @@ export default function LogsPage() {
                         </div>
                       </td>
                       <td
-                        className="px-3 py-2 text-xs text-slate-600 whitespace-nowrap tabular-nums"
+                        className="px-3 py-2 text-right text-xs text-slate-600 whitespace-nowrap tabular-nums"
                         title={isZh ? "净生成速度" : "Net generation speed"}
                       >
                         {formatTps(computeTps(log))}
                       </td>
-                      <td className="px-3 py-2">
+                      <td className="px-3 py-2 whitespace-nowrap">
                         {isStream ? (
                           <Badge
                             variant="outline"

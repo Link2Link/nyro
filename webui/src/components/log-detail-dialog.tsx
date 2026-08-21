@@ -178,7 +178,17 @@ export function LogDetailDialog({ logId, summary, open, onOpenChange }: LogDetai
             </Badge>
           ) : null}
           {log?.latency_total_ms != null ? (
-            <span className="text-slate-500">{formatDuration(log.latency_total_ms)}</span>
+            <span className="text-slate-500" title={isZh ? "端到端耗时" : "End-to-end latency"}>
+              {formatDuration(log.latency_total_ms)}
+            </span>
+          ) : null}
+          {log?.stream_first_chunk_ms != null ? (
+            <span
+              className="text-slate-500"
+              title={isZh ? "首字延迟（首个流式 chunk）" : "Time to first token"}
+            >
+              {isZh ? "首字" : "TTFT"} {formatDuration(log.stream_first_chunk_ms)}
+            </span>
           ) : null}
           {tps != null ? (
             <span

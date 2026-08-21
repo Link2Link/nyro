@@ -206,6 +206,50 @@ body {
   height: 0;
 }
 
+.log-table-scroll {
+  overflow-x: auto;
+  overflow-y: hidden;
+  padding-bottom: 6px;
+  scrollbar-gutter: stable;
+  scrollbar-width: auto;
+  scrollbar-color: rgba(100, 116, 139, 0.7) rgba(241, 245, 249, 0.95);
+}
+
+.log-table-scroll::-webkit-scrollbar {
+  height: 12px;
+}
+
+.log-table-scroll::-webkit-scrollbar-track {
+  background: rgba(241, 245, 249, 0.95);
+  border-radius: 999px;
+  margin: 0 10px 6px;
+}
+
+.log-table-scroll::-webkit-scrollbar-thumb {
+  background: rgba(148, 163, 184, 0.72);
+  border-radius: 999px;
+}
+
+.log-table-scroll::-webkit-scrollbar-thumb:hover {
+  background: rgba(100, 116, 139, 0.92);
+}
+
+html[data-theme="dark"] .log-table-scroll {
+  scrollbar-color: rgba(148, 163, 184, 0.55) rgba(23, 25, 33, 0.9);
+}
+
+html[data-theme="dark"] .log-table-scroll::-webkit-scrollbar-track {
+  background: rgba(23, 25, 33, 0.9);
+}
+
+html[data-theme="dark"] .log-table-scroll::-webkit-scrollbar-thumb {
+  background: rgba(148, 163, 184, 0.5);
+}
+
+html[data-theme="dark"] .log-table-scroll::-webkit-scrollbar-thumb:hover {
+  background: rgba(203, 213, 225, 0.7);
+}
+
 .content-surface :is(input:not([type="checkbox"]):not([type="radio"]):not([type="file"]), select, textarea) {
   border-color: rgba(148, 163, 184, 0.32);
   background: linear-gradient(
