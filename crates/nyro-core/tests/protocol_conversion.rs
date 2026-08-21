@@ -2396,6 +2396,51 @@ fn responses_encoder_drops_max_output_tokens_for_codex_compat() {
 }
 
 #[test]
+fn responses_encoder_drops_chat_include_usage_stream_options() {
+    let ir = OpenAIDecoder
+        .decode_request(serde_json::json!({
+            "model": "gpt-5.6-sol",
+            "stream": true,
+            "stream_options": {"include_usage": true},
+            "reasoning_effort": "medium",
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .expect("decode chat request");
+
+    let (body, _) = ResponsesEncoder
+        .encode_request(&ir)
+        .expect("encode responses request");
+    assert!(
+        body.get("stream_options").is_none(),
+        "codex responses rejects Chat Completions stream_options.include_usage"
+    );
+}
+
+#[test]
+fn responses_encoder_keeps_native_stream_options_without_include_usage() {
+    let ir = ResponsesDecoder
+        .decode_request(serde_json::json!({
+            "model": "gpt-5.6-sol",
+            "stream": true,
+            "stream_options": {
+                "include_usage": true,
+                "include_obfuscation": true
+            },
+            "input": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]}]
+        }))
+        .expect("decode responses request");
+
+    let (body, _) = ResponsesEncoder
+        .encode_request(&ir)
+        .expect("encode responses request");
+    assert_eq!(
+        body.get("stream_options"),
+        Some(&serde_json::json!({"include_obfuscation": true})),
+        "native Responses stream_options must round-trip minus include_usage"
+    );
+}
+
+#[test]
 fn responses_stream_parser_extracts_text_and_usage() {
     let sse = "event: response.created\n\
 data: {\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-5.4\"}}\n\

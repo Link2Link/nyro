@@ -39,6 +39,10 @@ const SKIP_FROM_EXTRA: &[&str] = &[
     "stream",
     "model",
     "reasoning_effort",
+    // Chat Completions `stream_options.include_usage` is rejected by Codex
+    // Responses (`unknown_parameter`). Native Responses options are copied
+    // through `sanitize_responses_stream_options` instead of this bag dump.
+    "stream_options",
 ];
 
 impl RequestEncoder for ResponsesEncoder {
@@ -247,6 +251,12 @@ impl RequestEncoder for ResponsesEncoder {
             }
         }
 
+        if let Some(v) = ingress.get("stream_options")
+            && let Some(sanitized) = sanitize_responses_stream_options(v)
+        {
+            obj.insert("stream_options".into(), sanitized);
+        }
+
         if !obj.contains_key("reasoning")
             && let Some(reasoning) = reasoning_to_value(&req.reasoning, req.generation.max_tokens)
         {
@@ -328,6 +338,28 @@ fn push_tool_result_items(
         }));
     }
     true
+}
+
+/// Drop Chat Completions `include_usage` while keeping Responses-native
+/// stream options (currently `include_obfuscation`).
+///
+/// Chat clients such as DeepSeek Harness always send
+/// `stream_options.include_usage`; Codex `/backend-api/codex/responses`
+/// rejects that parameter with HTTP 400 `unknown_parameter`.
+fn sanitize_responses_stream_options(value: &Value) -> Option<Value> {
+    let Value::Object(fields) = value else {
+        return None;
+    };
+
+    let mut sanitized = serde_json::Map::new();
+    for (key, field) in fields {
+        if key == "include_usage" {
+            continue;
+        }
+        sanitized.insert(key.clone(), field.clone());
+    }
+
+    (!sanitized.is_empty()).then_some(Value::Object(sanitized))
 }
 
 fn reasoning_to_value(reasoning: &ReasoningConfig, max_tokens: Option<u32>) -> Option<Value> {
