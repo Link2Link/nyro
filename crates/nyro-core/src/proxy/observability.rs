@@ -183,6 +183,22 @@ pub(crate) fn upstream_reasoning_effort(body: &str) -> Option<String> {
         .and_then(serde_json::Value::as_str)
         .map(str::to_string)
         .or_else(|| {
+            // MiniMax Chat Completions uses this boolean as its reasoning
+            // switch. Normalize the disabled state to the same `none` label
+            // used by the cross-provider reasoning effort model.
+            value
+                .get("reasoning_split")
+                .and_then(serde_json::Value::as_bool)
+                .map(|enabled| if enabled { "enabled" } else { "none" }.to_string())
+        })
+        .or_else(|| {
+            // Qwen/SiliconFlow-style Chat Completions uses a boolean switch.
+            value
+                .get("enable_thinking")
+                .and_then(serde_json::Value::as_bool)
+                .map(|enabled| if enabled { "enabled" } else { "none" }.to_string())
+        })
+        .or_else(|| {
             value
                 .pointer("/reasoning/effort")
                 .and_then(serde_json::Value::as_str)
@@ -195,10 +211,25 @@ pub(crate) fn upstream_reasoning_effort(body: &str) -> Option<String> {
                 .map(str::to_string)
         })
         .or_else(|| {
-            value
-                .pointer("/generationConfig/thinkingConfig/thinkingLevel")
+            let thinking = value.pointer("/generationConfig/thinkingConfig")?;
+            thinking
+                .get("thinkingLevel")
+                .or_else(|| thinking.get("thinking_level"))
                 .and_then(serde_json::Value::as_str)
                 .map(str::to_string)
+                .or_else(|| {
+                    thinking
+                        .get("thinkingBudget")
+                        .or_else(|| thinking.get("thinking_budget"))
+                        .and_then(serde_json::Value::as_i64)
+                        .map(|tokens| {
+                            if tokens == 0 {
+                                "none".to_string()
+                            } else {
+                                format!("budget:{tokens}")
+                            }
+                        })
+                })
         })
         .or_else(|| {
             value.get("thinking").and_then(|thinking| {
@@ -228,6 +259,30 @@ mod tests {
     }
 
     #[test]
+    fn reads_minimax_reasoning_split_state() {
+        let disabled = r#"{"model":"MiniMax-M2.7","reasoning_split":false,"messages":[]}"#;
+        assert_eq!(upstream_reasoning_effort(disabled).as_deref(), Some("none"));
+
+        let enabled = r#"{"model":"MiniMax-M2.7","reasoning_split":true,"messages":[]}"#;
+        assert_eq!(
+            upstream_reasoning_effort(enabled).as_deref(),
+            Some("enabled")
+        );
+    }
+
+    #[test]
+    fn reads_boolean_thinking_switch() {
+        let disabled = r#"{"model":"qwen3","enable_thinking":false,"messages":[]}"#;
+        assert_eq!(upstream_reasoning_effort(disabled).as_deref(), Some("none"));
+
+        let enabled = r#"{"model":"qwen3","enable_thinking":true,"messages":[]}"#;
+        assert_eq!(
+            upstream_reasoning_effort(enabled).as_deref(),
+            Some("enabled")
+        );
+    }
+
+    #[test]
     fn reads_responses_and_openrouter_reasoning_effort() {
         let body = r#"{"model":"glm-5.3","reasoning":{"effort":"xhigh"},"input":[]}"#;
         assert_eq!(upstream_reasoning_effort(body).as_deref(), Some("xhigh"));
@@ -244,6 +299,27 @@ mod tests {
         let body =
             r#"{"contents":[],"generationConfig":{"thinkingConfig":{"thinkingLevel":"high"}}}"#;
         assert_eq!(upstream_reasoning_effort(body).as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn reads_gemini_thinking_budget_and_snake_case_aliases() {
+        let budget = r#"{"generationConfig":{"thinkingConfig":{"thinkingBudget":8192}}}"#;
+        assert_eq!(
+            upstream_reasoning_effort(budget).as_deref(),
+            Some("budget:8192")
+        );
+
+        let disabled = r#"{"generationConfig":{"thinkingConfig":{"thinking_budget":0}}}"#;
+        assert_eq!(upstream_reasoning_effort(disabled).as_deref(), Some("none"));
+
+        let level = r#"{"generationConfig":{"thinkingConfig":{"thinking_level":"high"}}}"#;
+        assert_eq!(upstream_reasoning_effort(level).as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn gemini_level_takes_precedence_over_budget() {
+        let body = r#"{"generationConfig":{"thinkingConfig":{"thinkingLevel":"medium","thinkingBudget":8192}}}"#;
+        assert_eq!(upstream_reasoning_effort(body).as_deref(), Some("medium"));
     }
 
     #[test]
