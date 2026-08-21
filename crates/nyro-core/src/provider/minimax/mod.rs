@@ -93,19 +93,38 @@ const METADATA: VendorMetadata = VendorMetadata {
 
 pub struct MinimaxVendor;
 
-/// MiniMax enables reasoning by default when the request omits a reasoning
-/// directive. Make the gateway default explicit on the upstream wire while
-/// preserving every client-supplied effort, budget, or thinking declaration.
-fn default_reasoning_to_disabled(protocol: ProtocolId, body: &mut Value) {
+/// MiniMax enables thinking by default when the request omits a thinking
+/// directive. Keep reasoning output structurally separated on Chat Completions,
+/// while preserving every client-supplied effort, budget, or thinking declaration.
+fn apply_reasoning_defaults(protocol: ProtocolId, body: &mut Value) {
     let Some(object) = body.as_object_mut() else {
         return;
     };
 
     if protocol == OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1 {
-        // MiniMax's Chat Completions switch is `reasoning_split`; unlike
-        // OpenAI's top-level effort enum, it supports an explicit false value.
-        if !object.contains_key("reasoning_effort") && !object.contains_key("reasoning_split") {
-            object.insert("reasoning_split".to_string(), Value::Bool(false));
+        // MiniMax documents `reasoning_split` as an output-format switch, not a
+        // thinking on/off switch: `true` returns reasoning separately via
+        // `reasoning_content` / `reasoning_details`; `false` embeds it in
+        // `content` as `<think>...</think>`. Default to the split shape so an
+        // OpenAI-compatible client never receives reasoning in normal content.
+        object
+            .entry("reasoning_split".to_string())
+            .or_insert(Value::Bool(true));
+
+        // MiniMax-M3 uses `thinking`, rather than `reasoning_split`, to
+        // control whether thinking is emitted. Preserve an explicit thinking
+        // block and explicit non-none effort; otherwise honor Nyro's
+        // default-off policy. M2.x accepts this field but cannot disable
+        // thinking, so `reasoning_split: true` still keeps it out of content.
+        let explicit_non_none_effort = object
+            .get("reasoning_effort")
+            .and_then(Value::as_str)
+            .is_some_and(|effort| !effort.eq_ignore_ascii_case("none"));
+        if !object.contains_key("thinking") && !explicit_non_none_effort {
+            object.insert(
+                "thinking".to_string(),
+                serde_json::json!({"type": "disabled"}),
+            );
         }
     } else if protocol == OPENAI_RESPONSES_V1 {
         match object.entry("reasoning".to_string()) {
@@ -174,7 +193,7 @@ impl Vendor for MinimaxVendor {
         body: &mut Value,
         _headers: &mut HeaderMap,
     ) -> anyhow::Result<()> {
-        default_reasoning_to_disabled(ctx.protocol_id, body);
+        apply_reasoning_defaults(ctx.protocol_id, body);
         Ok(())
     }
     fn declared_response_mutations(&self) -> bool {
@@ -206,40 +225,57 @@ mod tests {
     use super::*;
 
     #[test]
-    fn openai_chat_defaults_missing_effort_to_disabled_split() {
-        let mut body = serde_json::json!({"model": "MiniMax-M2.7", "messages": []});
+    fn openai_chat_defaults_to_split_reasoning_output() {
+        let mut body = serde_json::json!({"model": "MiniMax-M3", "messages": []});
 
-        default_reasoning_to_disabled(OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1, &mut body);
+        apply_reasoning_defaults(OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1, &mut body);
 
-        assert_eq!(body["reasoning_split"], false);
+        assert_eq!(body["reasoning_split"], true);
         assert!(body.get("reasoning_effort").is_none());
+        assert_eq!(body["thinking"]["type"], "disabled");
     }
 
     #[test]
-    fn openai_chat_preserves_explicit_effort() {
+    fn openai_chat_preserves_explicit_effort_and_splits_output() {
         let mut body = serde_json::json!({
-            "model": "MiniMax-M2.7",
+            "model": "MiniMax-M3",
             "messages": [],
             "reasoning_effort": "high"
         });
 
-        default_reasoning_to_disabled(OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1, &mut body);
+        apply_reasoning_defaults(OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1, &mut body);
 
         assert_eq!(body["reasoning_effort"], "high");
-        assert!(body.get("reasoning_split").is_none());
+        assert_eq!(body["reasoning_split"], true);
+        assert!(body.get("thinking").is_none());
     }
 
     #[test]
     fn openai_chat_preserves_explicit_reasoning_split() {
         let mut body = serde_json::json!({
-            "model": "MiniMax-M2.7",
+            "model": "MiniMax-M3",
             "messages": [],
-            "reasoning_split": true
+            "reasoning_split": false
         });
 
-        default_reasoning_to_disabled(OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1, &mut body);
+        apply_reasoning_defaults(OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1, &mut body);
+
+        assert_eq!(body["reasoning_split"], false);
+        assert_eq!(body["thinking"]["type"], "disabled");
+    }
+
+    #[test]
+    fn openai_chat_preserves_explicit_thinking_control() {
+        let mut body = serde_json::json!({
+            "model": "MiniMax-M3",
+            "messages": [],
+            "thinking": {"type": "disabled"}
+        });
+
+        apply_reasoning_defaults(OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1, &mut body);
 
         assert_eq!(body["reasoning_split"], true);
+        assert_eq!(body["thinking"]["type"], "disabled");
     }
 
     #[test]
@@ -250,7 +286,7 @@ mod tests {
             "reasoning": {"summary": "auto"}
         });
 
-        default_reasoning_to_disabled(OPENAI_RESPONSES_V1, &mut body);
+        apply_reasoning_defaults(OPENAI_RESPONSES_V1, &mut body);
 
         assert_eq!(body["reasoning"]["effort"], "none");
         assert_eq!(body["reasoning"]["summary"], "auto");
@@ -264,7 +300,7 @@ mod tests {
             "reasoning": {"effort": "max"}
         });
 
-        default_reasoning_to_disabled(OPENAI_RESPONSES_V1, &mut body);
+        apply_reasoning_defaults(OPENAI_RESPONSES_V1, &mut body);
 
         assert_eq!(body["reasoning"]["effort"], "max");
     }
@@ -277,7 +313,7 @@ mod tests {
             "max_tokens": 1024
         });
 
-        default_reasoning_to_disabled(ANTHROPIC_MESSAGES_2023_06_01, &mut body);
+        apply_reasoning_defaults(ANTHROPIC_MESSAGES_2023_06_01, &mut body);
 
         assert_eq!(body["thinking"]["type"], "disabled");
     }
@@ -293,7 +329,7 @@ mod tests {
         });
         let expected = body.clone();
 
-        default_reasoning_to_disabled(ANTHROPIC_MESSAGES_2023_06_01, &mut body);
+        apply_reasoning_defaults(ANTHROPIC_MESSAGES_2023_06_01, &mut body);
 
         assert_eq!(body, expected);
     }

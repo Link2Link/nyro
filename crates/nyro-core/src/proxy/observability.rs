@@ -183,15 +183,6 @@ pub(crate) fn upstream_reasoning_effort(body: &str) -> Option<String> {
         .and_then(serde_json::Value::as_str)
         .map(str::to_string)
         .or_else(|| {
-            // MiniMax Chat Completions uses this boolean as its reasoning
-            // switch. Normalize the disabled state to the same `none` label
-            // used by the cross-provider reasoning effort model.
-            value
-                .get("reasoning_split")
-                .and_then(serde_json::Value::as_bool)
-                .map(|enabled| if enabled { "enabled" } else { "none" }.to_string())
-        })
-        .or_else(|| {
             // Qwen/SiliconFlow-style Chat Completions uses a boolean switch.
             value
                 .get("enable_thinking")
@@ -259,15 +250,12 @@ mod tests {
     }
 
     #[test]
-    fn reads_minimax_reasoning_split_state() {
-        let disabled = r#"{"model":"MiniMax-M2.7","reasoning_split":false,"messages":[]}"#;
-        assert_eq!(upstream_reasoning_effort(disabled).as_deref(), Some("none"));
+    fn ignores_minimax_reasoning_split_for_effort() {
+        let inline = r#"{"model":"MiniMax-M3","reasoning_split":false,"messages":[]}"#;
+        assert!(upstream_reasoning_effort(inline).is_none());
 
-        let enabled = r#"{"model":"MiniMax-M2.7","reasoning_split":true,"messages":[]}"#;
-        assert_eq!(
-            upstream_reasoning_effort(enabled).as_deref(),
-            Some("enabled")
-        );
+        let split = r#"{"model":"MiniMax-M3","reasoning_split":true,"messages":[]}"#;
+        assert!(upstream_reasoning_effort(split).is_none());
     }
 
     #[test]
