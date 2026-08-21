@@ -768,18 +768,33 @@ async fn dispatch_pipeline_inner(
             }
         };
 
-        // Merge runtime-binding extra headers and safe client headers.
+        // Channel-scoped extensions own URL quirks such as ChatGPT Codex's
+        // `/backend-api/codex/responses` path. The full vendor builds the
+        // request body, then the resolved extension canonicalizes its URL.
+        if let Some(extension) = VendorRegistry::global().resolve(&provider, egress) {
+            let vendor_ctx = provider_ctx.to_vendor_ctx();
+            let egress_path = egress
+                .handler()
+                .make_request_encoder()
+                .egress_path(transport_model, is_stream);
+            outbound.url = extension.build_url(&vendor_ctx, &egress_base_url, &egress_path);
+        }
+
+        // Merge safe client headers, runtime-binding headers, and adapter
+        // headers. Provider-owned identity must override client hints: OAuth
+        // runtimes such as Codex and Claude rely on canonical User-Agent,
+        // originator/beta, and account headers that callers must not spoof.
         //
-        // Precedence: runtime binding < forwarded client hints < adapter.
+        // Precedence: forwarded client hints < adapter < runtime binding.
         // Sensitive client headers (auth keys, cookies, IP/host forwarding
         // metadata, hop-by-hop transport headers) are filtered in
-        // `forwarded_client_headers`, while adapter/provider auth remains
-        // authoritative.
+        // `forwarded_client_headers`. Runtime bindings are provider-owned and
+        // remain authoritative for both OAuth auth and identity headers.
         match runtime_binding_headers(&provider_runtime.binding) {
             Ok(binding_hdrs) => {
-                let mut merged = binding_hdrs;
-                merged.extend(forwarded_client_headers(&headers));
+                let mut merged = forwarded_client_headers(&headers);
                 merged.extend(outbound.headers);
+                merged.extend(binding_hdrs);
                 outbound.headers = merged;
             }
             Err(e) => {

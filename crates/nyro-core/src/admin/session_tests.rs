@@ -8,6 +8,7 @@ use uuid::Uuid;
 const FAR_FUTURE_RFC3339: &str = "2099-01-01T00:00:00Z";
 const PAST_RFC3339: &str = "2000-01-01T00:00:00Z";
 const CODEX_RUNTIME_URL: &str = "https://chatgpt.com/backend-api/codex";
+const GROK_RUNTIME_URL: &str = "https://cli-chat-proxy.grok.com/v1";
 
 #[tokio::test]
 async fn oauth_session_is_shared_across_admin_instances_and_cancel_deletes_it() -> anyhow::Result<()>
@@ -40,7 +41,7 @@ async fn oauth_session_is_shared_across_admin_instances_and_cancel_deletes_it() 
 }
 
 #[tokio::test]
-async fn failed_complete_deletes_session() -> anyhow::Result<()> {
+async fn failed_complete_preserves_pending_session_for_retry() -> anyhow::Result<()> {
     let gw = build_gateway().await?;
 
     let init = gw.admin().init_oauth_session("codex", false).await?;
@@ -63,12 +64,12 @@ async fn failed_complete_deletes_session() -> anyhow::Result<()> {
         err.to_string().contains("state"),
         "unexpected complete error: {err:#}"
     );
-    assert!(
-        gw.admin()
-            .get_auth_session_record(&init.session_id)
-            .await?
-            .is_none()
-    );
+    let session = gw
+        .admin()
+        .get_auth_session_record(&init.session_id)
+        .await?
+        .expect("failed exchange should preserve PKCE state for retry");
+    assert_eq!(session.status, AuthSessionStatus::Pending.as_str());
 
     Ok(())
 }
@@ -152,12 +153,22 @@ async fn ready_session_is_single_use_and_provider_status_exposes_runtime_url() -
     )
     .await?;
 
+    let mut input = oauth_provider_input();
+    input.vendor = None;
+    input.preset_key = None;
+    input.channel = None;
+    input.protocol = "openai".to_string();
+    input.base_url = "https://placeholder.invalid".to_string();
     let provider = gw
         .admin()
-        .create_provider_with_oauth_session(&init.session_id, oauth_provider_input())
+        .create_provider_with_oauth_session(&init.session_id, input)
         .await?;
 
     assert_eq!(provider.effective_auth_mode(), "oauth");
+    assert_eq!(provider.vendor.as_deref(), Some("openai"));
+    assert_eq!(provider.preset_key.as_deref(), Some("openai"));
+    assert_eq!(provider.channel.as_deref(), Some("codex"));
+    assert_eq!(provider.protocol, "openai-responses");
     assert_eq!(provider.base_url, CODEX_RUNTIME_URL);
     assert!(
         gw.admin()
@@ -176,6 +187,107 @@ async fn ready_session_is_single_use_and_provider_status_exposes_runtime_url() -
     let status = gw.admin().get_provider_oauth_status(&provider.id).await?;
     assert_eq!(status.status, AuthBindingStatus::Connected.as_str());
     assert_eq!(status.resource_url.as_deref(), Some(CODEX_RUNTIME_URL));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn incompatible_bind_restores_ready_session() -> anyhow::Result<()> {
+    let gw = build_gateway().await?;
+    let init = gw.admin().init_oauth_session("codex", false).await?;
+    seed_ready_session(
+        &gw.admin(),
+        &init.session_id,
+        CredentialBundle {
+            access_token: Some("test-access-token".to_string()),
+            refresh_token: Some("test-refresh-token".to_string()),
+            expires_at: Some(FAR_FUTURE_RFC3339.to_string()),
+            resource_url: Some(CODEX_RUNTIME_URL.to_string()),
+            subject_id: Some("acct_test".to_string()),
+            scopes: vec!["openid".to_string()],
+            raw: json!({ "chatgpt_account_id": "acct_test" }),
+        },
+    )
+    .await?;
+
+    let mut incompatible = oauth_provider_input();
+    incompatible.name = format!("api-key-provider-{}", Uuid::new_v4());
+    incompatible.preset_key = None;
+    incompatible.channel = None;
+    incompatible.vendor = Some("custom".to_string());
+    incompatible.auth_mode = "apikey".to_string();
+    incompatible.api_key = "api-key".to_string();
+    let provider = gw.admin().create_provider(incompatible).await?;
+
+    let error = gw
+        .admin()
+        .bind_provider_with_oauth_session(&provider.id, &init.session_id)
+        .await
+        .expect_err("Codex session must not bind to an API-key provider");
+    assert!(error.to_string().contains("not configured for OAuth"));
+    let restored = gw
+        .admin()
+        .get_auth_session_record(&init.session_id)
+        .await?
+        .expect("failed bind must restore the consumed session");
+    assert_eq!(restored.status, AuthSessionStatus::Ready.as_str());
+    assert!(
+        gw.storage
+            .oauth_credentials()
+            .get(&provider.id)
+            .await?
+            .is_none()
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn grok_oauth_session_creates_xai_grok_provider() -> anyhow::Result<()> {
+    let gw = build_gateway().await?;
+
+    let init = gw.admin().init_oauth_session("xai", false).await?;
+    assert!(
+        init.auth_url.contains("auth.x.ai"),
+        "unexpected grok auth url: {}",
+        init.auth_url
+    );
+    seed_ready_session(
+        &gw.admin(),
+        &init.session_id,
+        CredentialBundle {
+            access_token: Some("grok-access-token".to_string()),
+            refresh_token: Some("grok-refresh-token".to_string()),
+            expires_at: Some(FAR_FUTURE_RFC3339.to_string()),
+            resource_url: None,
+            subject_id: Some("grok_user".to_string()),
+            scopes: vec!["openid".to_string(), "offline_access".to_string()],
+            raw: json!({ "email": "user@example.com" }),
+        },
+    )
+    .await?;
+
+    let mut input = oauth_provider_input();
+    input.vendor = None;
+    input.preset_key = None;
+    input.channel = None;
+    input.protocol = "openai".to_string();
+    input.base_url = "https://placeholder.invalid".to_string();
+    let provider = gw
+        .admin()
+        .create_provider_with_oauth_session(&init.session_id, input)
+        .await?;
+
+    assert_eq!(provider.effective_auth_mode(), "oauth");
+    assert_eq!(provider.vendor.as_deref(), Some("xai"));
+    assert_eq!(provider.preset_key.as_deref(), Some("xai"));
+    assert_eq!(provider.channel.as_deref(), Some("grok"));
+    assert_eq!(provider.protocol, "openai-responses");
+    assert_eq!(provider.base_url, GROK_RUNTIME_URL);
+
+    let status = gw.admin().get_provider_oauth_status(&provider.id).await?;
+    assert_eq!(status.status, AuthBindingStatus::Connected.as_str());
+    assert_eq!(status.resource_url.as_deref(), Some(GROK_RUNTIME_URL));
 
     Ok(())
 }

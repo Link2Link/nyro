@@ -128,8 +128,7 @@ pub(super) fn select_compat_request(
             } else {
                 UpstreamFlavor::StandardResponses
             };
-            let mut profile =
-                ConversionProfile::anthropic_to_responses(client_stream, flavor);
+            let mut profile = ConversionProfile::anthropic_to_responses(client_stream, flavor);
             // sub2api 渠道 Fast 模式：Claude Code（Anthropic ingress）接
             // sub2api 上游时同样注入 service_tier = "priority"。
             if provider.fast_mode && channel.eq_ignore_ascii_case("sub2api") {

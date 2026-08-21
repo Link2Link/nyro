@@ -52,6 +52,10 @@ function countdownStr(resetsAt?: string | null): string | null {
 
 /** Window length per tier, used to place the steady-pace marker. */
 function tierWindowMs(name: string): number | null {
+  // Feature-specific Codex limits are displayed but are not equivalent to the
+  // provider's main routing quota. Do not show a misleading steady-pace marker
+  // for them even when the suffix names a known duration.
+  if (name.startsWith("feature:")) return null;
   switch (name) {
     case "five_hour":
       return 5 * 3600_000;
@@ -84,16 +88,36 @@ const TIER_LABELS_ZH: Record<string, string> = {
   five_hour: "5小时",
   weekly_limit: "每周",
   monthly: "每月",
+  primary_window: "主要窗口",
+  secondary_window: "次要窗口",
 };
 const TIER_LABELS_EN: Record<string, string> = {
   five_hour: "5h",
   weekly_limit: "Weekly",
   monthly: "Monthly",
+  primary_window: "Primary Window",
+  secondary_window: "Secondary Window",
 };
+
+function readableFeatureName(value: string): string {
+  return value
+    .replace(/[_-]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .replace(/\b\w/g, (character) => character.toUpperCase());
+}
 
 function tierLabel(name: string, isZh: boolean): string {
   const table = isZh ? TIER_LABELS_ZH : TIER_LABELS_EN;
-  return table[name] ?? name;
+  if (table[name]) return table[name];
+
+  const feature = /^feature:(.+):(five_hour|weekly_limit|monthly|primary_window|secondary_window)$/.exec(name);
+  if (feature) {
+    const featureName = readableFeatureName(feature[1]);
+    const windowLabel = table[feature[2]] ?? feature[2];
+    return `${featureName} · ${windowLabel}`;
+  }
+  return readableFeatureName(name);
 }
 
 function formatRelativeTime(timestamp: string, now: number, isZh: boolean): string {
@@ -119,7 +143,7 @@ function TierBar({
   const pace = steadyPacePercent(tier, now);
   return (
     <div className="flex items-center gap-3 text-xs">
-      <span className="w-14 shrink-0 font-medium text-slate-500">
+      <span className="min-w-14 max-w-36 shrink-0 font-medium text-slate-500" title={tier.name}>
         {tierLabel(tier.name, isZh)}
       </span>
       <div className="relative h-2 flex-1 overflow-hidden rounded-full bg-slate-100">
@@ -278,13 +302,18 @@ export function ProviderUsageFooter({ provider }: { provider: Provider }) {
     .map((name) => tierLabel(name, isZh))
     .join(", ");
   const isBalanceView = shown?.kind.endsWith("_balance") ?? false;
+  const isCodex = shown?.kind === "openai_codex";
   const title = isBalanceView
     ? isZh
       ? "账户余额"
       : "Balance"
-    : isZh
-      ? "套餐用量"
-      : "Plan Usage";
+    : isCodex
+      ? isZh
+        ? "ChatGPT Codex 用量"
+        : "ChatGPT Codex Usage"
+      : isZh
+        ? "套餐用量"
+        : "Plan Usage";
 
   return (
     <div className="mt-3 space-y-2 rounded-xl border border-slate-200/70 bg-white/40 px-3 py-2.5">

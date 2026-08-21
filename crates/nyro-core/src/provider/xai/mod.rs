@@ -1,4 +1,6 @@
-//! xAI vendor (OpenAI-compatible).
+//! xAI vendor — public API plus the Grok subscription channel (OAuth).
+
+pub mod grok;
 
 use async_trait::async_trait;
 use reqwest::header::HeaderMap;
@@ -13,7 +15,8 @@ use crate::provider::common::openai::{
 use crate::provider::common::pipeline;
 use crate::provider::inbound::InboundResponse;
 use crate::provider::metadata::{
-    AuthMode, CapabilitiesSource, ChannelDef, Label, ProtocolBaseUrl, VendorMetadata,
+    AuthMode, CapabilitiesSource, ChannelDef, Label, OAuthConfig, ProtocolBaseUrl, RuntimeConfig,
+    VendorMetadata,
 };
 use crate::provider::outbound::OutboundRequest;
 use crate::provider::registry::{VendorRegistration, VendorScope};
@@ -28,32 +31,82 @@ const METADATA: VendorMetadata = VendorMetadata {
     },
     icon: "xai",
     default_protocol: "openai-compatible",
-    channels: &[ChannelDef {
-        id: "default",
-        label: Label {
-            zh: "默认",
-            en: "Default",
+    channels: &[
+        ChannelDef {
+            id: "default",
+            label: Label {
+                zh: "默认",
+                en: "Default",
+            },
+            base_urls: &[
+                ProtocolBaseUrl {
+                    protocol: "openai-compatible",
+                    base_url: "https://api.x.ai/v1",
+                },
+                ProtocolBaseUrl {
+                    protocol: "openai-responses",
+                    base_url: "https://api.x.ai/v1",
+                },
+            ],
+            api_key: None,
+            models_source: Some("https://api.x.ai/v1/models"),
+            capabilities_source: CapabilitiesSource::ModelsDev("xai"),
+            static_models: &[],
+            auth_mode: AuthMode::ApiKey,
+            oauth: None,
+            runtime: None,
+            shared_key_protocols: false,
+            auth_schemes: None,
         },
-        base_urls: &[
-            ProtocolBaseUrl {
-                protocol: "openai-compatible",
-                base_url: "https://api.x.ai/v1",
+        ChannelDef {
+            id: "grok",
+            label: Label {
+                zh: "Grok",
+                en: "Grok",
             },
-            ProtocolBaseUrl {
-                protocol: "openai-responses",
-                base_url: "https://api.x.ai/v1",
-            },
-        ],
-        api_key: None,
-        models_source: Some("https://api.x.ai/v1/models"),
-        capabilities_source: CapabilitiesSource::ModelsDev("xai"),
-        static_models: &[],
-        auth_mode: AuthMode::ApiKey,
-        oauth: None,
-        runtime: None,
-        shared_key_protocols: false,
-        auth_schemes: None,
-    }],
+            base_urls: &[
+                ProtocolBaseUrl {
+                    protocol: "openai-responses",
+                    base_url: "https://cli-chat-proxy.grok.com/v1",
+                },
+                ProtocolBaseUrl {
+                    protocol: "openai-compatible",
+                    base_url: "https://cli-chat-proxy.grok.com/v1",
+                },
+            ],
+            api_key: None,
+            models_source: Some("https://cli-chat-proxy.grok.com/v1/models"),
+            capabilities_source: CapabilitiesSource::ModelsDev("xai"),
+            static_models: &[
+                "grok-4.6",
+                "grok-4.6-latest",
+                "grok-4.5",
+                "grok-4.5-latest",
+                "grok-4.3",
+                "grok-build-0.1",
+                "grok-composer-2.5-fast",
+                "grok-4.20-0309-reasoning",
+                "grok-4.20-0309-non-reasoning",
+                "grok-4.20-multi-agent-0309",
+            ],
+            auth_mode: AuthMode::OAuth,
+            oauth: Some(OAuthConfig {
+                auth_base_url: "https://auth.x.ai",
+                authorize_url: "https://auth.x.ai/oauth2/authorize",
+                token_url: "https://auth.x.ai/oauth2/token",
+                client_id: "b1a00492-073a-47ea-816f-4c329264a828",
+                redirect_uri: "http://127.0.0.1:56121/callback",
+                scope: "openid profile email offline_access grok-cli:access api:access",
+            }),
+            runtime: Some(RuntimeConfig {
+                api_base_url: "https://cli-chat-proxy.grok.com/v1",
+                models_url: "https://cli-chat-proxy.grok.com/v1/models",
+                models_client_version: "0.2.114",
+            }),
+            shared_key_protocols: false,
+            auth_schemes: None,
+        },
+    ],
 };
 
 pub struct XaiVendor;

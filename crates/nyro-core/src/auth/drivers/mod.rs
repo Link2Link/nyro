@@ -1,8 +1,10 @@
 mod claude;
+mod grok;
 mod openai;
 mod shared;
 
 pub use claude::ClaudeOAuthDriver;
+pub use grok::GrokOAuthDriver;
 pub use openai::OpenAIOAuthDriver;
 pub use shared::{
     PkceAuthState, build_authorize_url, encode_scopes, expires_at_after, generate_code_challenge,

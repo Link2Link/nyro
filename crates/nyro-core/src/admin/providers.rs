@@ -37,77 +37,121 @@ pub struct ProviderModelProbeOutcome {
     pub results: Vec<ProviderModelProbeResult>,
 }
 
-/// Probe one model with a minimal non-streaming "hi" request (20s timeout).
+fn build_model_probe_request(
+    suite: crate::protocol::ids::Protocol,
+    base_url: &str,
+    api_key: &str,
+    auth_scheme: &str,
+    runtime_headers: &HeaderMap,
+    model: &str,
+    is_codex_oauth: bool,
+) -> anyhow::Result<(String, HeaderMap, Value)> {
+    // Reasoning models (e.g. glm-5.3) burn the whole completion budget on
+    // thinking before emitting visible text. 1024 leaves room for both.
+    let (path, body) = match suite {
+        crate::protocol::ids::Protocol::OpenAICompatible => (
+            "/v1/chat/completions",
+            serde_json::json!({
+                "model": model,
+                "messages": [{"role": "user", "content": "hi"}],
+                "max_tokens": 1024,
+                "stream": false,
+            }),
+        ),
+        crate::protocol::ids::Protocol::OpenAIResponses => (
+            "/v1/responses",
+            if is_codex_oauth {
+                // ChatGPT's internal Codex endpoint requires canonical
+                // Responses input items and returns SSE even for admin probes.
+                serde_json::json!({
+                    "model": model,
+                    "input": [{
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "hi"}],
+                    }],
+                    "instructions": "You are a helpful assistant.",
+                    "store": false,
+                    "stream": true,
+                })
+            } else {
+                serde_json::json!({
+                    "model": model,
+                    "input": "hi",
+                    "max_output_tokens": 1024,
+                    "stream": false,
+                })
+            },
+        ),
+        crate::protocol::ids::Protocol::AnthropicMessages => (
+            "/v1/messages",
+            serde_json::json!({
+                "model": model,
+                "messages": [{"role": "user", "content": "hi"}],
+                "max_tokens": 1024,
+            }),
+        ),
+        crate::protocol::ids::Protocol::GoogleGemini => {
+            anyhow::bail!("google-gemini probe is not supported");
+        }
+    };
+
+    let path = if is_codex_oauth && path == "/v1/responses" {
+        "/responses"
+    } else {
+        path
+    };
+    let mut url = crate::provider::common::openai::openai_build_url(base_url, path);
+    let mut headers = HeaderMap::new();
+    match auth_scheme {
+        "bearer" => {
+            headers.insert(
+                AUTHORIZATION,
+                HeaderValue::from_str(&format!("Bearer {api_key}"))?,
+            );
+        }
+        "x-api-key" => {
+            headers.insert("x-api-key", HeaderValue::from_str(api_key)?);
+            if suite == crate::protocol::ids::Protocol::AnthropicMessages {
+                headers.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
+            }
+        }
+        "query" => {
+            let separator = if url.contains('?') { '&' } else { '?' };
+            url = format!("{url}{separator}key={api_key}");
+        }
+        "none" => {}
+        other => anyhow::bail!("unsupported auth scheme: {other}"),
+    }
+    // OAuth runtime identity is provider-owned and authoritative, matching
+    // the dispatcher precedence (default auth < RuntimeBinding headers).
+    headers.extend(runtime_headers.clone());
+    Ok((url, headers, body))
+}
+
+/// Probe one model with a minimal non-streaming "hi" request (30s timeout).
 async fn probe_single_model(
     client: reqwest::Client,
     suite: crate::protocol::ids::Protocol,
     base_url: &str,
     api_key: &str,
     auth_scheme: &str,
+    runtime_headers: &HeaderMap,
     model: &str,
     protocol_id: &str,
+    is_codex_oauth: bool,
 ) -> ProviderModelProbeResult {
     let start = Instant::now();
 
     let outcome = tokio::time::timeout(Duration::from_secs(30), async {
-        // Reasoning models (e.g. glm-5.3) burn the whole completion budget on
-        // thinking before emitting any visible text — a small budget truncates
-        // with an empty `content` (finish_reason=length). 1024 leaves room for
-        // a thought plus reply.
-        let (path, body) = match suite {
-            crate::protocol::ids::Protocol::OpenAICompatible => (
-                "/v1/chat/completions",
-                serde_json::json!({
-                    "model": model,
-                    "messages": [{"role": "user", "content": "hi"}],
-                    "max_tokens": 1024,
-                    "stream": false,
-                }),
-            ),
-            crate::protocol::ids::Protocol::OpenAIResponses => (
-                "/v1/responses",
-                serde_json::json!({
-                    "model": model,
-                    "input": "hi",
-                    "max_output_tokens": 1024,
-                    "stream": false,
-                }),
-            ),
-            crate::protocol::ids::Protocol::AnthropicMessages => (
-                "/v1/messages",
-                serde_json::json!({
-                    "model": model,
-                    "messages": [{"role": "user", "content": "hi"}],
-                    "max_tokens": 1024,
-                }),
-            ),
-            crate::protocol::ids::Protocol::GoogleGemini => {
-                anyhow::bail!("google-gemini probe is not supported");
-            }
-        };
-
-        let mut url = crate::provider::common::openai::openai_build_url(base_url, path);
-        let mut headers = HeaderMap::new();
-        match auth_scheme {
-            "bearer" => {
-                headers.insert(
-                    AUTHORIZATION,
-                    HeaderValue::from_str(&format!("Bearer {api_key}"))?,
-                );
-            }
-            "x-api-key" => {
-                headers.insert("x-api-key", HeaderValue::from_str(api_key)?);
-                if suite == crate::protocol::ids::Protocol::AnthropicMessages {
-                    headers.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
-                }
-            }
-            "query" => {
-                let separator = if url.contains('?') { '&' } else { '?' };
-                url = format!("{url}{separator}key={api_key}");
-            }
-            "none" => {}
-            other => anyhow::bail!("unsupported auth scheme: {other}"),
-        }
+        let (url, headers, body) = build_model_probe_request(
+            suite,
+            base_url,
+            api_key,
+            auth_scheme,
+            runtime_headers,
+            model,
+            is_codex_oauth,
+        )?;
 
         let response = client
             .post(url)
@@ -133,7 +177,7 @@ async fn probe_single_model(
     let (success, error, reply) = match outcome {
         Ok(Ok(reply)) => (true, None, Some(reply)),
         Ok(Err(error)) => (false, Some(error.to_string()), None),
-        Err(_) => (false, Some("timeout after 20s".to_string()), None),
+        Err(_) => (false, Some("timeout after 30s".to_string()), None),
     };
     ProviderModelProbeResult {
         model: model.to_string(),
@@ -153,8 +197,66 @@ async fn probe_single_model(
 /// is empty the reasoning text is used as a fallback (prefixed with a marker
 /// so the log makes clear it is a thought, not the final answer).
 fn extract_probe_reply(body: &str) -> Option<String> {
+    if let Some(reply) = extract_probe_sse_reply(body) {
+        return Some(reply);
+    }
     let json: Value = serde_json::from_str(body.trim_start()).ok()?;
-    let raw = match &json {
+    extract_probe_reply_json(&json)
+}
+
+fn extract_probe_sse_reply(body: &str) -> Option<String> {
+    let mut text = String::new();
+    let mut reasoning = String::new();
+    let mut completed = false;
+    for line in body.lines() {
+        let Some(data) = line.trim().strip_prefix("data:").map(str::trim) else {
+            continue;
+        };
+        if data.is_empty() || data == "[DONE]" {
+            continue;
+        }
+        let Ok(event) = serde_json::from_str::<Value>(data) else {
+            continue;
+        };
+        match event.get("type").and_then(Value::as_str) {
+            Some("response.output_text.delta") => {
+                if let Some(delta) = event.get("delta").and_then(Value::as_str) {
+                    text.push_str(delta);
+                }
+            }
+            Some("response.reasoning_summary_text.delta") => {
+                if let Some(delta) = event.get("delta").and_then(Value::as_str) {
+                    reasoning.push_str(delta);
+                }
+            }
+            Some("response.completed" | "response.done") => {
+                completed = true;
+                if text.trim().is_empty()
+                    && let Some(response) = event.get("response")
+                    && let Some(reply) = extract_probe_reply_json(response)
+                {
+                    text.push_str(&reply);
+                }
+            }
+            _ => {}
+        }
+    }
+    if !completed {
+        return None;
+    }
+    if !text.trim().is_empty() {
+        Some(text.trim().to_string())
+    } else if !reasoning.trim().is_empty() {
+        Some(format!("[thinking] {}", reasoning.trim()))
+    } else {
+        // A completed response proves that the model is callable even when it
+        // produced no displayable text for the tiny probe prompt.
+        Some("[completed]".to_string())
+    }
+}
+
+fn extract_probe_reply_json(json: &Value) -> Option<String> {
+    let raw = match json {
         // OpenAI chat.completions: choices[0].message.content, falling back
         // to reasoning_content for thinking-only replies.
         Value::Object(map) if map.contains_key("choices") => {
@@ -493,6 +595,7 @@ impl AdminService {
             provider
         };
         self.gw.quota_registry.request_refresh(&provider.id);
+        self.bump_config_epoch().await?;
         Ok(provider)
     }
 
@@ -1097,9 +1200,16 @@ impl AdminService {
         // endpoint matching their configured default protocol
         // (`provider.protocol`); if the default is disabled or missing, fall
         // back to the first enabled endpoint. Fixed providers probe through
-        // their single configuration.
+        // their single configuration. Fixed OAuth providers resolve the same
+        // refreshed token, base URL, and identity headers used by dispatch.
         let registry = crate::protocol::registry::ProtocolRegistry::global();
-        let (suite_raw, base_url, api_key, auth_scheme) = if provider.is_adaptive() {
+        let runtime = if provider.is_adaptive() {
+            None
+        } else {
+            Some(self.resolve_provider_runtime(&provider).await?)
+        };
+        let (suite_raw, base_url, api_key, auth_scheme, runtime_headers) = if provider.is_adaptive()
+        {
             let enabled: Vec<&ProviderProtocolEndpoint> = provider
                 .protocol_endpoints
                 .iter()
@@ -1118,13 +1228,27 @@ impl AdminService {
                 preferred.base_url.clone(),
                 preferred.api_key.clone(),
                 preferred.auth_scheme.clone(),
+                HeaderMap::new(),
             )
         } else {
+            let runtime = runtime.expect("fixed provider runtime was resolved above");
+            let base_url = runtime
+                .binding
+                .base_url_override
+                .clone()
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| provider.base_url.clone());
+            let auth_scheme = if runtime.binding.disable_default_auth {
+                "none".to_string()
+            } else {
+                "auto".to_string()
+            };
             (
                 provider.protocol.clone(),
-                provider.base_url.clone(),
-                provider.api_key.clone(),
-                "auto".to_string(),
+                base_url,
+                runtime.access_token,
+                auth_scheme,
+                runtime_binding_headers(&runtime.binding)?,
             )
         };
 
@@ -1137,7 +1261,10 @@ impl AdminService {
         if base_url.trim().is_empty() {
             anyhow::bail!("provider base URL is empty");
         }
-        if api_key.trim().is_empty() && auth_scheme.trim() != "none" {
+        if api_key.trim().is_empty()
+            && auth_scheme.trim() != "none"
+            && !runtime_headers.contains_key(AUTHORIZATION)
+        {
             anyhow::bail!("provider api key is empty");
         }
 
@@ -1149,6 +1276,15 @@ impl AdminService {
             explicit => explicit,
         };
 
+        let is_codex_oauth = provider.effective_auth_mode().trim() == "oauth"
+            && provider
+                .vendor
+                .as_deref()
+                .is_some_and(|value| value.eq_ignore_ascii_case("openai"))
+            && provider
+                .channel
+                .as_deref()
+                .is_some_and(|value| value.eq_ignore_ascii_case("codex"));
         let client = self.gw.http_client_for_provider(provider.use_proxy).await?;
         let base_url = base_url.trim().to_string();
         let api_key = api_key.trim().to_string();
@@ -1163,6 +1299,7 @@ impl AdminService {
                 let base_url = base_url.clone();
                 let api_key = api_key.clone();
                 let scheme = effective_scheme.to_string();
+                let runtime_headers = runtime_headers.clone();
                 let protocol_id = protocol_id.clone();
                 async move {
                     probe_single_model(
@@ -1171,8 +1308,10 @@ impl AdminService {
                         &base_url,
                         &api_key,
                         &scheme,
+                        &runtime_headers,
                         &model,
                         &protocol_id,
+                        is_codex_oauth,
                     )
                     .await
                 }
@@ -1547,6 +1686,101 @@ mod probe_reply_tests {
         assert_eq!(extract_probe_reply(body), None);
         let body = r#"{"content":[]}"#;
         assert_eq!(extract_probe_reply(body), None);
+    }
+
+    #[test]
+    fn oauth_runtime_headers_authoritatively_authenticate_model_probe() {
+        let runtime_headers = HeaderMap::from_iter([
+            (
+                AUTHORIZATION,
+                HeaderValue::from_static("Bearer oauth-access-token"),
+            ),
+            (
+                reqwest::header::HeaderName::from_static("chatgpt-account-id"),
+                HeaderValue::from_static("account-1"),
+            ),
+            (
+                reqwest::header::HeaderName::from_static("originator"),
+                HeaderValue::from_static("Codex Desktop"),
+            ),
+        ]);
+        let (url, headers, body) = build_model_probe_request(
+            crate::protocol::ids::Protocol::OpenAIResponses,
+            "https://chatgpt.com/backend-api/codex",
+            "",
+            "none",
+            &runtime_headers,
+            "gpt-5-codex",
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(url, "https://chatgpt.com/backend-api/codex/responses");
+        assert_eq!(
+            headers.get(AUTHORIZATION).unwrap(),
+            "Bearer oauth-access-token"
+        );
+        assert_eq!(headers.get("chatgpt-account-id").unwrap(), "account-1");
+        assert_eq!(headers.get("originator").unwrap(), "Codex Desktop");
+        assert_eq!(
+            body.get("model").and_then(Value::as_str),
+            Some("gpt-5-codex")
+        );
+        assert_eq!(body.get("stream").and_then(Value::as_bool), Some(true));
+        assert_eq!(body.get("store").and_then(Value::as_bool), Some(false));
+        assert_eq!(
+            body.pointer("/input/0/content/0/type")
+                .and_then(Value::as_str),
+            Some("input_text")
+        );
+        assert_eq!(
+            body.pointer("/input/0/content/0/text")
+                .and_then(Value::as_str),
+            Some("hi")
+        );
+    }
+
+    #[test]
+    fn codex_sse_probe_extracts_text_and_requires_completion() {
+        let completed = concat!(
+            "event: response.output_text.delta\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"he\"}\n\n",
+            "data:{\"type\":\"response.output_text.delta\",\"delta\":\"llo\"}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"output\":[]}}\n\n"
+        );
+        assert_eq!(extract_probe_reply(completed).as_deref(), Some("hello"));
+
+        let truncated = "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n\n";
+        assert_eq!(extract_probe_reply(truncated), None);
+    }
+
+    #[test]
+    fn codex_sse_completed_without_text_still_proves_model_is_callable() {
+        let body = "data: {\"type\":\"response.completed\",\"response\":{\"output\":[]}}\n\n";
+        assert_eq!(extract_probe_reply(body).as_deref(), Some("[completed]"));
+    }
+
+    #[test]
+    fn runtime_authorization_overrides_default_probe_api_key() {
+        let runtime_headers = HeaderMap::from_iter([(
+            AUTHORIZATION,
+            HeaderValue::from_static("Bearer oauth-access-token"),
+        )]);
+        let (_, headers, _) = build_model_probe_request(
+            crate::protocol::ids::Protocol::OpenAIResponses,
+            "https://example.com",
+            "legacy-api-key",
+            "bearer",
+            &runtime_headers,
+            "gpt-test",
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(
+            headers.get(AUTHORIZATION).unwrap(),
+            "Bearer oauth-access-token"
+        );
     }
 }
 

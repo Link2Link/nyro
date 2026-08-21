@@ -37,6 +37,15 @@
 //! blocked windows must remain visible at their reported utilization (verified
 //! against a live key 2026-08-16 and the community scripts in cc-switch #6433 /
 //! dsh-opencode-go-usage).
+//!
+//! OpenAI Codex (ChatGPT OAuth): `GET
+//! https://chatgpt.com/backend-api/wham/usage` with the refreshed OAuth access
+//! token, `chatgpt-account-id`, and the quota request headers mirrored from
+//! Sub2API. Detection is structural (`openai`/`codex` preset or channel)
+//! before the ChatGPT URL fallback, so an OAuth provider never needs an API key.
+//! Main and feature-specific rate limits are classified by their declared
+//! window length (not primary/secondary position); unknown metered features are
+//! retained under stable `feature:<name>:<window>` tier names.
 
 use futures::stream::{self, StreamExt};
 use reqwest::header::CONTENT_TYPE;
@@ -63,6 +72,31 @@ const DEEPSEEK_BALANCE_URL: &str = "https://api.deepseek.com/user/balance";
 
 /// OpenCode Go subscription usage endpoint.
 const OPENCODE_GO_USAGE_URL: &str = "https://opencode.ai/zen/go/v1/usage";
+
+/// ChatGPT/Codex subscription usage endpoint. This control-plane URL is fixed:
+/// a provider's inference Base URL must never redirect quota credentials.
+const OPENAI_CODEX_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
+const OPENAI_CODEX_USAGE_TIMEOUT: Duration = Duration::from_secs(20);
+const OPENAI_CODEX_BETA: &str = "codex-1";
+const OPENAI_CODEX_ORIGINATOR: &str = "Codex Desktop";
+const OPENAI_CODEX_LANGUAGE: &str = "zh-CN";
+
+/// xAI Grok subscription billing endpoints (cli-chat-proxy). Weekly credits
+/// (`?format=credits`) and monthly limit/used share the `config` shape; the
+/// weekly response additionally carries `currentPeriod` + `creditUsagePercent`.
+/// The base already includes the `/v1` prefix; paths are relative to it
+/// (mirrors Sub2API `DefaultCLIBaseURL` + `/billing`).
+const GROK_BILLING_BASE: &str = "https://cli-chat-proxy.grok.com/v1";
+const GROK_BILLING_WEEKLY_PATH: &str = "/billing?format=credits";
+const GROK_BILLING_MONTHLY_PATH: &str = "/billing";
+const GROK_BILLING_TIMEOUT: Duration = Duration::from_secs(20);
+/// Grok CLI identity stamped on billing requests (mirrors Sub2API).
+const GROK_BILLING_TOKEN_AUTH: &str = "xai-grok-cli";
+const GROK_BILLING_CLIENT_VERSION: &str = "0.2.114";
+const GROK_BILLING_CLIENT_IDENTIFIER: &str = "grok-shell";
+const GROK_BILLING_USER_AGENT: &str = "xai-grok-workspace/0.2.114";
+const GROK_BILLING_PLAN_SUPERGROK: f64 = 15_000.0;
+const GROK_BILLING_PLAN_SUPERGROK_HEAVY: f64 = 150_000.0;
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct ProviderUsageTier {
@@ -142,12 +176,62 @@ enum UsageBackend {
     /// Volcengine Ark coding plan on ark.cn-beijing.volces.com. Usage is read
     /// from the control-plane OpenAPI with IAM AK/SK signing.
     ArkCoding,
+    /// OpenAI Codex / ChatGPT subscription quota via OAuth.
+    OpenAiCodex,
+    /// xAI Grok subscription quota (cli-chat-proxy `/v1/billing`) via OAuth.
+    Grok,
 }
 
 impl UsageBackend {
-    fn detect(base_url: &str) -> Option<Self> {
+    /// Detect a backend from provider identity first, then fall back to URL
+    /// matching for imported/legacy rows that predate preset + channel fields.
+    fn detect(provider: &Provider) -> Option<Self> {
+        let is_codex_channel = provider
+            .channel
+            .as_deref()
+            .is_some_and(|value| value.trim().eq_ignore_ascii_case("codex"));
+        let identities = [provider.vendor.as_deref(), provider.preset_key.as_deref()]
+            .into_iter()
+            .flatten()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .collect::<Vec<_>>();
+        let is_codex_identity = is_codex_channel
+            && !identities.is_empty()
+            && identities.iter().all(|value| {
+                value.eq_ignore_ascii_case("openai") || value.eq_ignore_ascii_case("codex")
+            });
+        if is_codex_identity {
+            return Some(UsageBackend::OpenAiCodex);
+        }
+        let is_grok_channel = provider
+            .channel
+            .as_deref()
+            .is_some_and(|value| value.trim().eq_ignore_ascii_case("grok"));
+        let grok_identities = [provider.vendor.as_deref(), provider.preset_key.as_deref()]
+            .into_iter()
+            .flatten()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .collect::<Vec<_>>();
+        let is_grok_identity = is_grok_channel
+            && !grok_identities.is_empty()
+            && grok_identities.iter().all(|value| {
+                value.eq_ignore_ascii_case("xai") || value.eq_ignore_ascii_case("grok")
+            });
+        if is_grok_identity {
+            return Some(UsageBackend::Grok);
+        }
+        Self::detect_url(&provider.base_url)
+    }
+
+    fn detect_url(base_url: &str) -> Option<Self> {
         let url = base_url.to_lowercase();
-        if url.contains("bigmodel.cn") {
+        if url.contains("chatgpt.com/backend-api/codex") {
+            Some(UsageBackend::OpenAiCodex)
+        } else if url.contains("cli-chat-proxy.grok.com") {
+            Some(UsageBackend::Grok)
+        } else if url.contains("bigmodel.cn") {
             Some(UsageBackend::GlmCn)
         } else if url.contains("z.ai") {
             Some(UsageBackend::GlmGlobal)
@@ -176,6 +260,8 @@ impl UsageBackend {
             UsageBackend::DeepSeek => "deepseek_balance",
             UsageBackend::OpencodeGo => "opencode_go",
             UsageBackend::ArkCoding => "ark_coding_plan",
+            UsageBackend::OpenAiCodex => "openai_codex",
+            UsageBackend::Grok => "grok_plan",
         }
     }
 
@@ -186,6 +272,11 @@ impl UsageBackend {
     ) -> bool {
         match self {
             UsageBackend::DeepSeek => is_available.is_some(),
+            UsageBackend::OpenAiCodex => {
+                is_available.is_some()
+                    || tiers.iter().any(|tier| !tier.name.starts_with("feature:"))
+            }
+            UsageBackend::Grok => is_available.is_some() || !tiers.is_empty(),
             _ => !tiers.is_empty(),
         }
     }
@@ -199,7 +290,9 @@ impl UsageBackend {
             | UsageBackend::MinimaxGlobal
             | UsageBackend::KimiCode
             | UsageBackend::DeepSeek
-            | UsageBackend::OpencodeGo => "global",
+            | UsageBackend::OpencodeGo
+            | UsageBackend::OpenAiCodex
+            | UsageBackend::Grok => "global",
             UsageBackend::ArkCoding => "cn",
         }
     }
@@ -499,6 +592,161 @@ fn parse_opencode_tiers(body: &Value) -> Vec<ProviderUsageTier> {
         .collect()
 }
 
+/// Normalize an upstream feature identifier into a deterministic tier suffix.
+/// Only ASCII alphanumerics survive; separator runs collapse to one underscore.
+fn stable_codex_feature_name(raw: &str) -> String {
+    let mut out = String::new();
+    let mut pending_separator = false;
+    for ch in raw.trim().chars() {
+        if ch.is_ascii_alphanumeric() {
+            if pending_separator && !out.is_empty() {
+                out.push('_');
+            }
+            out.push(ch.to_ascii_lowercase());
+            pending_separator = false;
+        } else if !out.is_empty() {
+            pending_separator = true;
+        }
+    }
+    if out.is_empty() {
+        "unknown".to_string()
+    } else {
+        out
+    }
+}
+
+fn codex_window_tier_name(window_seconds: i64, feature: Option<&str>, slot: &str) -> String {
+    // Known windows are duration anchors, never primary/secondary slot anchors.
+    // A small tolerance admits harmless upstream rounding while avoiding a
+    // future 24h or 14d bucket being silently mislabeled as 5h/weekly.
+    const FIVE_HOURS: i64 = 5 * 60 * 60;
+    const WEEK: i64 = 7 * 24 * 60 * 60;
+    let near = |value: i64, expected: i64| (value - expected).abs() <= 60;
+    let base = if near(window_seconds, FIVE_HOURS) {
+        TIER_FIVE_HOUR
+    } else if near(window_seconds, WEEK) {
+        TIER_WEEKLY_LIMIT
+    } else if slot == "primary_window" {
+        "primary_window"
+    } else {
+        "secondary_window"
+    };
+    match feature {
+        None => base.to_string(),
+        Some(feature) => format!("feature:{}:{}", stable_codex_feature_name(feature), base),
+    }
+}
+
+fn codex_reset_at(window: &Value, now: chrono::DateTime<chrono::Utc>) -> Option<String> {
+    if let Some(value) = window.get("reset_at").and_then(parse_f64) {
+        if value.is_finite() && value > 0.0 {
+            let seconds = value.trunc() as i64;
+            return chrono::DateTime::<chrono::Utc>::from_timestamp(seconds, 0)
+                .map(|timestamp| timestamp.to_rfc3339());
+        }
+    }
+    let after = window.get("reset_after_seconds").and_then(parse_f64)?;
+    if !after.is_finite() || after < 0.0 {
+        return None;
+    }
+    now.checked_add_signed(chrono::Duration::seconds(after.ceil() as i64))
+        .map(|timestamp| timestamp.to_rfc3339())
+}
+
+fn parse_codex_rate_limit_tiers(
+    rate_limit: &Value,
+    feature: Option<&str>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Vec<ProviderUsageTier> {
+    ["primary_window", "secondary_window"]
+        .into_iter()
+        .filter_map(|key| {
+            let window = rate_limit.get(key)?;
+            let used_percent = window.get("used_percent").and_then(parse_f64)?;
+            if !used_percent.is_finite() {
+                return None;
+            }
+            let window_seconds = window
+                .get("limit_window_seconds")
+                .and_then(parse_f64)
+                .filter(|value| value.is_finite() && *value > 0.0)
+                .map(|value| value.round() as i64)
+                .unwrap_or_default();
+            Some(ProviderUsageTier {
+                name: codex_window_tier_name(window_seconds, feature, key),
+                used_percent: used_percent.clamp(0.0, 100.0),
+                resets_at: codex_reset_at(window, now),
+            })
+        })
+        .collect()
+}
+
+/// Parse ChatGPT `/backend-api/wham/usage` into the common provider quota shape.
+/// Returns plan level, tiers, and explicit account availability. Availability is
+/// authoritative even when an allowed response has no window objects yet.
+fn parse_openai_codex_usage(
+    body: &Value,
+    now: chrono::DateTime<chrono::Utc>,
+) -> (Option<String>, Vec<ProviderUsageTier>, Option<bool>) {
+    let level = body
+        .get("plan_type")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string);
+    let mut tiers = Vec::new();
+    let mut availability_signals = Vec::new();
+
+    if let Some(rate_limit) = body.get("rate_limit").filter(|value| value.is_object()) {
+        tiers.extend(parse_codex_rate_limit_tiers(rate_limit, None, now));
+        if let Some(allowed) = rate_limit.get("allowed").and_then(Value::as_bool) {
+            availability_signals.push(allowed);
+        } else if let Some(limit_reached) = rate_limit.get("limit_reached").and_then(Value::as_bool)
+        {
+            availability_signals.push(!limit_reached);
+        }
+    }
+
+    if let Some(additional) = body.get("additional_rate_limits").and_then(Value::as_array) {
+        for (index, item) in additional.iter().enumerate() {
+            let feature = item
+                .get("metered_feature")
+                .and_then(Value::as_str)
+                .or_else(|| item.get("limit_name").and_then(Value::as_str))
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToString::to_string)
+                .unwrap_or_else(|| format!("unknown_{}", index + 1));
+            let Some(rate_limit) = item.get("rate_limit").filter(|value| value.is_object()) else {
+                continue;
+            };
+            tiers.extend(parse_codex_rate_limit_tiers(
+                rate_limit,
+                Some(&feature),
+                now,
+            ));
+        }
+    }
+
+    // Stable presentation: main quota windows first, then feature windows;
+    // within each group the duration-derived 5h window precedes weekly.
+    let order = |name: &str| match name {
+        TIER_FIVE_HOUR => (0, 0),
+        TIER_WEEKLY_LIMIT => (0, 1),
+        name if name.starts_with("feature:") && name.ends_with(":five_hour") => (1, 0),
+        name if name.starts_with("feature:") && name.ends_with(":weekly_limit") => (1, 1),
+        _ => (2, 0),
+    };
+    tiers.sort_by_key(|tier| order(&tier.name));
+
+    let is_available = if availability_signals.is_empty() {
+        None
+    } else {
+        Some(availability_signals.into_iter().all(|allowed| allowed))
+    };
+    (level, tiers, is_available)
+}
+
 /// Parse the Volcengine `GetCodingPlanUsage` OpenAPI result into tiers.
 ///
 /// Each usage window carries a `Level` label (`5h` / `session` / `weekly` /
@@ -734,8 +982,242 @@ fn usage_api_key(provider: &Provider) -> Option<String> {
         .map(|endpoint| endpoint.api_key.trim().to_string())
 }
 
-/// Send a usage GET with Bearer auth (MiniMax) and hand back the parsed
-/// JSON body, after the shared status/business-error checks.
+/// Query the xAI Grok subscription billing endpoint (cli-chat-proxy) for both
+/// the weekly credits window and the monthly limit/used window. The OAuth
+/// access token plus the Grok CLI identity headers come from
+/// `GrokOAuthDriver::bind_runtime` so the probe hits the same surface the
+/// upstream inference calls do.
+async fn fetch_grok_billing(
+    client: &reqwest::Client,
+    base_url_override: &str,
+    access_token: &str,
+    extra_headers: &std::collections::HashMap<String, String>,
+) -> anyhow::Result<Value> {
+    let base = base_url_override
+        .trim()
+        .trim_end_matches('/');
+    let base = if base.is_empty() { GROK_BILLING_BASE } else { base };
+    // base_url_override is `…/v1` (cli-chat-proxy) so paths are appended
+    // directly; guard against a base that lost its `/v1` prefix.
+    let base = if base.ends_with("/v1") || base.ends_with('/') {
+        base.to_string()
+    } else {
+        format!("{base}/v1")
+    };
+    let mut combined = serde_json::Map::new();
+    for (label, path) in [
+        ("weekly", GROK_BILLING_WEEKLY_PATH),
+        ("monthly", GROK_BILLING_MONTHLY_PATH),
+    ] {
+        let url = format!("{base}{path}");
+        let mut request = client.get(&url).timeout(GROK_BILLING_TIMEOUT);
+        if !access_token.trim().is_empty() {
+            request = request.bearer_auth(access_token.trim());
+        }
+        request = request
+            .header("x-xai-token-auth", GROK_BILLING_TOKEN_AUTH)
+            .header("x-grok-client-version", GROK_BILLING_CLIENT_VERSION)
+            .header("x-grok-client-identifier", GROK_BILLING_CLIENT_IDENTIFIER)
+            .header(reqwest::header::USER_AGENT, GROK_BILLING_USER_AGENT);
+        for (key, value) in extra_headers {
+            if key.eq_ignore_ascii_case("authorization")
+                || key.eq_ignore_ascii_case("user-agent")
+            {
+                continue;
+            }
+            request = request.header(key, value);
+        }
+        let resp = request
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("Grok billing request failed ({label}): {e}"))?;
+        let status = resp.status();
+        let raw = resp
+            .bytes()
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to read Grok billing response ({label}): {e}"))?;
+        if !status.is_success() {
+            let preview: String = String::from_utf8_lossy(&raw).chars().take(240).collect();
+            match status {
+                reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN => anyhow::bail!(
+                    "Grok authentication failed (HTTP {status}); re-authorize this provider"
+                ),
+                reqwest::StatusCode::TOO_MANY_REQUESTS => {
+                    anyhow::bail!("Grok billing endpoint is rate limited (HTTP 429)")
+                }
+                _ => anyhow::bail!("Grok billing query failed (HTTP {status}): {preview}"),
+            }
+        }
+        let body: Value = serde_json::from_slice(&raw)
+            .map_err(|e| anyhow::anyhow!("failed to parse Grok billing response: {e}"))?;
+        if let Some(config) = body.get("config") {
+            combined.insert(label.to_string(), config.clone());
+        }
+    }
+    if combined.is_empty() {
+        anyhow::bail!("Grok billing response is missing 'config'");
+    }
+    Ok(Value::Object(combined))
+}
+
+/// Extract a numeric value from the `{ "val": <number|string> }` shape used by
+/// the billing money fields, falling back to a bare number.
+fn grok_billing_number(value: Option<&Value>) -> Option<f64> {
+    let value = value?;
+    if let Some(number) = value.as_f64() {
+        return Some(number);
+    }
+    if let Some(number) = value.get("val").and_then(Value::as_f64) {
+        return Some(number);
+    }
+    value
+        .get("val")
+        .and_then(Value::as_str)
+        .and_then(|s| s.trim().parse::<f64>().ok())
+}
+
+/// Parse the merged weekly + monthly Grok billing response into the common
+/// quota shape: `weekly_limit` from `creditUsagePercent` (resets at the weekly
+/// `currentPeriod.end`), `monthly` from `monthlyLimit`/`used` cents, and a plan
+/// level inferred from the monthly credit cap.
+fn parse_grok_billing(body: &Value) -> (Option<String>, Vec<ProviderUsageTier>, Option<bool>) {
+    let weekly = body.get("weekly").and_then(|value| value.as_object());
+    let monthly = body.get("monthly").and_then(|value| value.as_object());
+
+    let mut tiers = Vec::new();
+    let mut weekly_period_type = String::new();
+    if let Some(weekly) = weekly {
+        weekly_period_type = weekly
+            .get("currentPeriod")
+            .and_then(|value| value.get("type"))
+            .and_then(Value::as_str)
+            .map(|value| value.trim().to_ascii_lowercase())
+            .unwrap_or_default();
+        let used_percent = weekly
+            .get("creditUsagePercent")
+            .and_then(Value::as_f64)
+            .filter(|value| value.is_finite())
+            .map(|value| value.clamp(0.0, 100.0))
+            .unwrap_or(0.0);
+        let resets_at = weekly
+            .get("currentPeriod")
+            .and_then(|value| value.get("end"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string);
+        tiers.push(ProviderUsageTier {
+            name: TIER_WEEKLY_LIMIT.to_string(),
+            used_percent,
+            resets_at,
+        });
+    }
+
+    let monthly_limit = monthly.and_then(|monthly| grok_billing_number(monthly.get("monthlyLimit")));
+    // Mirror Sub2API: when the weekly window is primary and the monthly
+    // response carries no limit, skip the monthly bar to avoid duplicating a
+    // weekly-only view.
+    let monthly_has_limit = monthly_limit.is_some_and(|limit| limit > 0.0);
+    let weekly_is_primary =
+        weekly_period_type.contains("weekly") || (weekly.is_some() && !monthly_has_limit);
+    if let Some(monthly) = monthly.filter(|_| !(weekly_is_primary && !monthly_has_limit)) {
+        let used = grok_billing_number(monthly.get("used"));
+        let used_percent = match (monthly_limit, used) {
+            (Some(limit), Some(used)) if limit > 0.0 => (used / limit * 100.0).clamp(0.0, 100.0),
+            _ => 0.0,
+        };
+        let resets_at = monthly
+            .get("billingPeriodEnd")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string);
+        tiers.push(ProviderUsageTier {
+            name: TIER_MONTHLY.to_string(),
+            used_percent,
+            resets_at,
+        });
+    }
+
+    let level = monthly_limit
+        .map(|limit| {
+            if (limit - GROK_BILLING_PLAN_SUPERGROK_HEAVY).abs() < f64::EPSILON {
+                "SuperGrok Heavy".to_string()
+            } else if (limit - GROK_BILLING_PLAN_SUPERGROK).abs() < f64::EPSILON {
+                "SuperGrok".to_string()
+            } else {
+                "SuperGrok".to_string()
+            }
+        });
+
+    // Weekly `creditUsagePercent` (or a monthly limit) is an authoritative
+    // observation; without either the account has no billable plan.
+    let is_available = Some(
+        weekly
+            .and_then(|w| w.get("creditUsagePercent").and_then(Value::as_f64))
+            .is_some()
+            || level.is_some(),
+    );
+
+    (level, tiers, is_available)
+}
+
+/// Query ChatGPT's authoritative Codex quota endpoint with the Sub2API header
+/// profile. Nyro's shared reqwest transport preserves the configured proxy;
+/// the wire contract remains isolated here so a future fingerprint-capable
+/// transport can replace it without changing parsing or scheduling.
+async fn fetch_openai_codex_usage(
+    proxy_url: Option<&str>,
+    access_token: &str,
+    account_id: &str,
+) -> anyhow::Result<Value> {
+    let mut builder = reqwest::Client::builder().timeout(OPENAI_CODEX_USAGE_TIMEOUT);
+    if let Some(proxy_url) = proxy_url.map(str::trim).filter(|value| !value.is_empty()) {
+        builder = builder.proxy(reqwest::Proxy::all(proxy_url)?);
+    }
+    let client = builder
+        .build()
+        .map_err(|error| anyhow::anyhow!("failed to build OpenAI Codex usage client: {error}"))?;
+    let response = client
+        .get(OPENAI_CODEX_USAGE_URL)
+        .bearer_auth(access_token)
+        .header("chatgpt-account-id", account_id)
+        .header("openai-beta", OPENAI_CODEX_BETA)
+        .header("oai-language", OPENAI_CODEX_LANGUAGE)
+        .header("originator", OPENAI_CODEX_ORIGINATOR)
+        .header("Accept", "application/json")
+        .header("Sec-Fetch-Site", "none")
+        .header("Sec-Fetch-Mode", "no-cors")
+        .header("Sec-Fetch-Dest", "empty")
+        .header("Priority", "u=4, i")
+        .send()
+        .await
+        .map_err(|error| anyhow::anyhow!("OpenAI Codex usage request failed: {error}"))?;
+
+    let status = response.status();
+    let raw = response
+        .bytes()
+        .await
+        .map_err(|error| anyhow::anyhow!("failed to read OpenAI Codex usage response: {error}"))?;
+    if !status.is_success() {
+        let preview: String = String::from_utf8_lossy(&raw).chars().take(240).collect();
+        match status {
+            reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN => anyhow::bail!(
+                "OpenAI Codex authentication failed (HTTP {status}); re-authorize this provider"
+            ),
+            reqwest::StatusCode::TOO_MANY_REQUESTS => {
+                anyhow::bail!("OpenAI Codex usage endpoint is rate limited (HTTP 429)")
+            }
+            status if status.is_server_error() => anyhow::bail!(
+                "OpenAI Codex usage service is unavailable (HTTP {status}): {preview}"
+            ),
+            _ => anyhow::bail!("OpenAI Codex usage query failed (HTTP {status}): {preview}"),
+        }
+    }
+    serde_json::from_slice(&raw)
+        .map_err(|error| anyhow::anyhow!("failed to parse OpenAI Codex usage response: {error}"))
+}
+
 async fn fetch_usage_json(
     client: &reqwest::Client,
     url: &str,
@@ -805,9 +1287,16 @@ impl AdminService {
     ) -> anyhow::Result<ProviderUsage> {
         match self.query_provider_usage(id, mode).await {
             Ok((mut usage, true)) => {
+                // Feature-specific Codex limits (for example Spark) are
+                // informational. Exhausting one feature must not pause the
+                // provider's main Codex routing quota.
                 let tiers = usage
                     .tiers
                     .iter()
+                    .filter(|tier| {
+                        usage.kind != UsageBackend::OpenAiCodex.kind()
+                            || !tier.name.starts_with("feature:")
+                    })
                     .map(|tier| QuotaTierObservation {
                         name: tier.name.clone(),
                         used_percent: tier.used_percent,
@@ -843,21 +1332,82 @@ impl AdminService {
     ) -> anyhow::Result<(ProviderUsage, bool)> {
         let provider = self.get_provider(id).await?;
 
-        let backend = UsageBackend::detect(&provider.base_url).ok_or_else(|| {
+        let backend = UsageBackend::detect(&provider).ok_or_else(|| {
             anyhow::anyhow!(
-                "usage query is not supported for this provider: only GLM \
+                "usage query is not supported for this provider: only OpenAI Codex OAuth, GLM \
                  (bigmodel.cn / api.z.ai), MiniMax (api.minimaxi.com / api.minimax.io), \
                  Kimi (api.kimi.com), OpenCode Go (opencode.ai/zen), Ark \
                  (volces.com) and DeepSeek (api.deepseek.com) are supported"
             )
         })?;
 
-        let Some(api_key) = usage_api_key(&provider) else {
-            anyhow::bail!("provider api key is empty");
+        let api_key = if matches!(backend, UsageBackend::OpenAiCodex | UsageBackend::Grok) {
+            None
+        } else {
+            Some(
+                usage_api_key(&provider)
+                    .ok_or_else(|| anyhow::anyhow!("provider api key is empty"))?,
+            )
         };
 
         let (tiers, balances, level, is_available, spends) = match backend {
+            UsageBackend::OpenAiCodex => {
+                if provider.effective_auth_mode().trim() != "oauth" {
+                    anyhow::bail!("OpenAI Codex usage query requires an OAuth provider");
+                }
+                let runtime = self
+                    .resolve_provider_runtime(&provider)
+                    .await
+                    .context("resolve OpenAI Codex OAuth runtime for usage query")?;
+                let account_id = runtime
+                    .binding
+                    .extra_headers
+                    .get("chatgpt-account-id")
+                    .map(String::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "OpenAI Codex OAuth credential is missing chatgpt_account_id; re-authorize this provider"
+                        )
+                    })?;
+                let proxy_url = if provider.use_proxy {
+                    let settings = self.gw.storage.settings();
+                    let enabled =
+                        settings
+                            .get("proxy_enabled")
+                            .await?
+                            .as_deref()
+                            .is_some_and(|value| {
+                                matches!(
+                                    value.trim().to_ascii_lowercase().as_str(),
+                                    "1" | "true" | "yes" | "on"
+                                )
+                            });
+                    if enabled {
+                        settings
+                            .get("proxy_url")
+                            .await?
+                            .map(|value| value.trim().to_string())
+                            .filter(|value| !value.is_empty())
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                let body = fetch_openai_codex_usage(
+                    proxy_url.as_deref(),
+                    runtime.access_token.trim(),
+                    account_id,
+                )
+                .await?;
+                let (level, tiers, is_available) =
+                    parse_openai_codex_usage(&body, chrono::Utc::now());
+                (tiers, Vec::new(), level, is_available, Vec::new())
+            }
             UsageBackend::GlmCn | UsageBackend::GlmGlobal => {
+                let api_key = api_key.as_deref().expect("non-OAuth backend API key");
                 let site_base = match backend {
                     UsageBackend::GlmCn => "https://open.bigmodel.cn",
                     _ => "https://api.z.ai",
@@ -868,7 +1418,7 @@ impl AdminService {
                     .http_client
                     .get(&url)
                     // Zhipu expects the raw key without the Bearer prefix.
-                    .header(AUTHORIZATION, &api_key)
+                    .header(AUTHORIZATION, api_key)
                     .header(CONTENT_TYPE, "application/json")
                     .header("Accept-Language", "en-US,en")
                     .timeout(Duration::from_secs(15))
@@ -920,12 +1470,13 @@ impl AdminService {
                 )
             }
             UsageBackend::MinimaxCn | UsageBackend::MinimaxGlobal => {
+                let api_key = api_key.as_deref().expect("non-OAuth backend API key");
                 let domain = match backend {
                     UsageBackend::MinimaxCn => "api.minimaxi.com",
                     _ => "api.minimax.io",
                 };
                 let url = format!("https://{domain}{MINIMAX_QUOTA_PATH}");
-                let body = fetch_usage_json(&self.gw.http_client, &url, &api_key).await?;
+                let body = fetch_usage_json(&self.gw.http_client, &url, api_key).await?;
 
                 // MiniMax reports business errors inside a 200 body via
                 // base_resp.status_code (0 = success).
@@ -951,17 +1502,19 @@ impl AdminService {
                 )
             }
             UsageBackend::KimiCode => {
-                let body = fetch_usage_json(&self.gw.http_client, KIMI_USAGE_URL, &api_key).await?;
+                let api_key = api_key.as_deref().expect("non-OAuth backend API key");
+                let body = fetch_usage_json(&self.gw.http_client, KIMI_USAGE_URL, api_key).await?;
                 // Kimi reports failures via plain HTTP statuses; a 200 body
                 // with tiers (or an empty one) is the success shape.
                 (parse_kimi_tiers(&body), Vec::new(), None, None, Vec::new())
             }
             UsageBackend::DeepSeek => {
+                let api_key = api_key.as_deref().expect("non-OAuth backend API key");
                 // DeepSeek reports failures via plain HTTP statuses; the
                 // 200 body carries per-currency balance_infos with numeric
                 // STRING values.
                 let body =
-                    fetch_usage_json(&self.gw.http_client, DEEPSEEK_BALANCE_URL, &api_key).await?;
+                    fetch_usage_json(&self.gw.http_client, DEEPSEEK_BALANCE_URL, api_key).await?;
                 let (balances, is_available) = parse_deepseek_balances(&body);
 
                 // Optional spend detail (today/month) from the platform
@@ -984,10 +1537,11 @@ impl AdminService {
                 (Vec::new(), balances, None, is_available, spends)
             }
             UsageBackend::OpencodeGo => {
+                let api_key = api_key.as_deref().expect("non-OAuth backend API key");
                 // OpenCode Go reports failures via plain HTTP statuses; the
                 // 200 body carries three ready-made percentage windows.
                 let body =
-                    fetch_usage_json(&self.gw.http_client, OPENCODE_GO_USAGE_URL, &api_key).await?;
+                    fetch_usage_json(&self.gw.http_client, OPENCODE_GO_USAGE_URL, api_key).await?;
                 (
                     parse_opencode_tiers(&body),
                     Vec::new(),
@@ -997,6 +1551,10 @@ impl AdminService {
                 )
             }
             UsageBackend::ArkCoding => {
+                // The inference API key is still required to consider this a
+                // configured provider; the control-plane request itself uses
+                // the independently stored IAM AK/SK pair below.
+                let _api_key = api_key.as_deref().expect("non-OAuth backend API key");
                 // The Ark control-plane OpenAPI needs IAM AK/SK signing; the
                 // inference API key is not accepted there.
                 let (ak, sk) = self.get_provider_usage_credentials(&provider.id).await?;
@@ -1061,6 +1619,24 @@ impl AdminService {
                 }
                 let result = body.get("Result").cloned().unwrap_or(Value::Null);
                 (parse_ark_tiers(&result), Vec::new(), None, None, Vec::new())
+            }
+            UsageBackend::Grok => {
+                if provider.effective_auth_mode().trim() != "oauth" {
+                    anyhow::bail!("Grok usage query requires an OAuth provider");
+                }
+                let runtime = self
+                    .resolve_provider_runtime(&provider)
+                    .await
+                    .context("resolve Grok OAuth runtime for usage query")?;
+                let billing = fetch_grok_billing(
+                    &self.gw.http_client,
+                    runtime.binding.base_url_override.as_deref().unwrap_or(""),
+                    runtime.access_token.trim(),
+                    &runtime.binding.extra_headers,
+                )
+                .await?;
+                let (level, tiers, is_available) = parse_grok_billing(&billing);
+                (tiers, Vec::new(), level, is_available, Vec::new())
             }
         };
 
@@ -1127,13 +1703,19 @@ impl AdminService {
 }
 
 async fn provider_usage_monitorable(admin: &AdminService, provider: &Provider) -> bool {
-    if !provider.is_enabled
-        || UsageBackend::detect(&provider.base_url).is_none()
-        || usage_api_key(provider).is_none()
-    {
+    if !provider.is_enabled {
         return false;
     }
-    if UsageBackend::detect(&provider.base_url) != Some(UsageBackend::ArkCoding) {
+    let Some(backend) = UsageBackend::detect(provider) else {
+        return false;
+    };
+    if backend == UsageBackend::OpenAiCodex {
+        return provider.effective_auth_mode().trim() == "oauth";
+    }
+    if usage_api_key(provider).is_none() {
+        return false;
+    }
+    if backend != UsageBackend::ArkCoding {
         return true;
     }
     admin
@@ -1234,6 +1816,343 @@ mod tests {
 
     fn data_with_limits(limits: Value) -> Value {
         serde_json::json!({ "limits": limits, "level": "max" })
+    }
+
+    fn provider_for_usage(
+        vendor: Option<&str>,
+        preset_key: Option<&str>,
+        channel: Option<&str>,
+        base_url: &str,
+    ) -> Provider {
+        Provider {
+            id: "provider".to_string(),
+            name: "Provider".to_string(),
+            vendor: vendor.map(ToString::to_string),
+            protocol: "openai-responses".to_string(),
+            base_url: base_url.to_string(),
+            protocol_mode: "fixed".to_string(),
+            protocol_endpoints: Vec::new(),
+            preset_key: preset_key.map(ToString::to_string),
+            channel: channel.map(ToString::to_string),
+            models_source: None,
+            static_models: None,
+            api_key: String::new(),
+            auth_mode: "oauth".to_string(),
+            use_proxy: false,
+            fast_mode: false,
+            last_test_success: None,
+            last_test_at: None,
+            is_enabled: true,
+            created_at: String::new(),
+            updated_at: String::new(),
+        }
+    }
+
+    #[test]
+    fn codex_detection_prefers_structured_identity_and_keeps_url_fallback() {
+        use UsageBackend::*;
+        let structured = provider_for_usage(
+            Some("openai"),
+            Some("openai"),
+            Some("codex"),
+            "https://proxy.example.invalid/v1",
+        );
+        assert_eq!(UsageBackend::detect(&structured), Some(OpenAiCodex));
+
+        let channel_only = provider_for_usage(
+            None,
+            None,
+            Some("codex"),
+            "https://proxy.example.invalid/v1",
+        );
+        assert_eq!(UsageBackend::detect(&channel_only), None);
+
+        let imported =
+            provider_for_usage(None, None, None, "https://chatgpt.com/backend-api/codex");
+        assert_eq!(UsageBackend::detect(&imported), Some(OpenAiCodex));
+
+        let ordinary_openai = provider_for_usage(
+            Some("openai"),
+            Some("openai"),
+            Some("default"),
+            "https://api.openai.com/v1",
+        );
+        assert_eq!(UsageBackend::detect(&ordinary_openai), None);
+
+        let unrelated_codex_channel = provider_for_usage(
+            Some("custom"),
+            Some("custom"),
+            Some("codex"),
+            "https://example.invalid/v1",
+        );
+        assert_eq!(UsageBackend::detect(&unrelated_codex_channel), None);
+        assert_eq!(OpenAiCodex.kind(), "openai_codex");
+        assert_eq!(OpenAiCodex.site(), "global");
+    }
+
+    #[test]
+    fn grok_detection_prefers_structured_identity_and_keeps_url_fallback() {
+        use UsageBackend::*;
+        let structured = provider_for_usage(
+            Some("xai"),
+            Some("xai"),
+            Some("grok"),
+            "https://proxy.example.invalid/v1",
+        );
+        assert_eq!(UsageBackend::detect(&structured), Some(Grok));
+
+        let channel_only = provider_for_usage(None, None, Some("grok"), "https://example.invalid/v1");
+        assert_eq!(UsageBackend::detect(&channel_only), None);
+
+        let imported = provider_for_usage(
+            None,
+            None,
+            None,
+            "https://cli-chat-proxy.grok.com/v1",
+        );
+        assert_eq!(UsageBackend::detect(&imported), Some(Grok));
+
+        let ordinary_xai = provider_for_usage(
+            Some("xai"),
+            Some("xai"),
+            Some("default"),
+            "https://api.x.ai/v1",
+        );
+        assert_eq!(UsageBackend::detect(&ordinary_xai), None);
+
+        let unrelated_grok_channel = provider_for_usage(
+            Some("custom"),
+            Some("custom"),
+            Some("grok"),
+            "https://example.invalid/v1",
+        );
+        assert_eq!(UsageBackend::detect(&unrelated_grok_channel), None);
+        assert_eq!(Grok.kind(), "grok_plan");
+        assert_eq!(Grok.site(), "global");
+    }
+
+    #[test]
+    fn grok_billing_parses_weekly_and_monthly_windows() {
+        let body = serde_json::json!({
+            "weekly": {
+                "currentPeriod": { "type": "weekly", "start": "2026-08-14", "end": "2026-08-21" },
+                "creditUsagePercent": 63.5
+            },
+            "monthly": {
+                "monthlyLimit": { "val": 15000 },
+                "used": { "val": 3000 },
+                "billingPeriodEnd": "2026-08-31T23:59:59Z"
+            }
+        });
+        let (level, tiers, available) = parse_grok_billing(&body);
+        assert_eq!(level.as_deref(), Some("SuperGrok"));
+        assert_eq!(available, Some(true));
+        assert_eq!(tiers.len(), 2);
+        assert_eq!(tiers[0].name, "weekly_limit");
+        assert_eq!(tiers[0].used_percent, 63.5);
+        assert_eq!(tiers[0].resets_at.as_deref(), Some("2026-08-21"));
+        assert_eq!(tiers[1].name, "monthly");
+        assert_eq!(tiers[1].used_percent, 20.0);
+        assert_eq!(tiers[1].resets_at.as_deref(), Some("2026-08-31T23:59:59Z"));
+    }
+
+    #[test]
+    fn grok_billing_heavy_plan_and_missing_windows() {
+        let heavy = serde_json::json!({
+            "monthly": { "monthlyLimit": { "val": 150000 }, "used": 75000 }
+        });
+        let (level, tiers, available) = parse_grok_billing(&heavy);
+        assert_eq!(level.as_deref(), Some("SuperGrok Heavy"));
+        assert_eq!(available, Some(true));
+        assert_eq!(tiers.len(), 1);
+        assert_eq!(tiers[0].used_percent, 50.0);
+
+        let empty = serde_json::json!({});
+        let (level, tiers, available) = parse_grok_billing(&empty);
+        assert!(level.is_none());
+        assert_eq!(available, Some(false));
+        assert!(tiers.is_empty());
+    }
+
+    #[test]
+    fn grok_billing_credits_percent_is_authoritative_even_without_monthly() {
+        let weekly_only = serde_json::json!({
+            "weekly": { "creditUsagePercent": 5.5 }
+        });
+        let (_, tiers, available) = parse_grok_billing(&weekly_only);
+        assert_eq!(available, Some(true));
+        assert_eq!(tiers.len(), 1);
+        assert_eq!(tiers[0].name, "weekly_limit");
+        assert_eq!(tiers[0].used_percent, 5.5);
+    }
+
+    #[test]
+    fn grok_billing_weekly_primary_hides_monthly_without_limit() {
+        // Mirror Sub2API: when the weekly window is primary and the monthly
+        // response carries no limit, the monthly bar is dropped so the weekly
+        // view is not duplicated.
+        let weekly_primary_no_monthly_limit = serde_json::json!({
+            "weekly": {
+                "currentPeriod": { "type": "weekly", "start": "2026-08-14", "end": "2026-08-21" },
+                "creditUsagePercent": 42.0
+            },
+            "monthly": {
+                "used": { "val": 3000 },
+                "billingPeriodEnd": "2026-08-31T23:59:59Z"
+            }
+        });
+        let (_, tiers, _) = parse_grok_billing(&weekly_primary_no_monthly_limit);
+        assert_eq!(tiers.len(), 1);
+        assert_eq!(tiers[0].name, "weekly_limit");
+        assert_eq!(tiers[0].used_percent, 42.0);
+    }
+
+    #[test]
+    fn codex_parser_classifies_windows_by_duration_not_slot_order() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-08-20T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let body = serde_json::json!({
+            "plan_type": "pro",
+            "rate_limit": {
+                "allowed": true,
+                "limit_reached": false,
+                "primary_window": {
+                    "used_percent": 63.5,
+                    "limit_window_seconds": 604800,
+                    "reset_at": 1787788800
+                },
+                "secondary_window": {
+                    "used_percent": 12,
+                    "limit_window_seconds": 18000,
+                    "reset_after_seconds": 3600
+                }
+            }
+        });
+        let (level, tiers, available) = parse_openai_codex_usage(&body, now);
+        assert_eq!(level.as_deref(), Some("pro"));
+        assert_eq!(available, Some(true));
+        assert_eq!(tiers.len(), 2);
+        assert_eq!(
+            tiers[0],
+            tier("five_hour", 12.0, Some("2026-08-20T01:00:00+00:00"))
+        );
+        assert_eq!(tiers[1].name, "weekly_limit");
+        assert_eq!(tiers[1].used_percent, 63.5);
+        assert_eq!(
+            tiers[1].resets_at.as_deref(),
+            Some("2026-08-27T00:00:00+00:00")
+        );
+    }
+
+    #[test]
+    fn codex_parser_preserves_additional_feature_windows_with_stable_names() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-08-20T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let body = serde_json::json!({
+            "rate_limit": { "allowed": true },
+            "additional_rate_limits": [
+                {
+                    "limit_name": "Spark",
+                    "metered_feature": "codex_bengalfox",
+                    "rate_limit": {
+                        "primary_window": {
+                            "used_percent": 42.5,
+                            "limit_window_seconds": 18000,
+                            "reset_after_seconds": 60
+                        },
+                        "secondary_window": {
+                            "used_percent": 10,
+                            "limit_window_seconds": 604800,
+                            "reset_after_seconds": 120
+                        }
+                    }
+                },
+                {
+                    "limit_name": "Future / Feature ++",
+                    "rate_limit": {
+                        "primary_window": {
+                            "used_percent": 7,
+                            "limit_window_seconds": 2592000
+                        }
+                    }
+                }
+            ]
+        });
+        let (_, tiers, available) = parse_openai_codex_usage(&body, now);
+        assert_eq!(available, Some(true));
+        assert_eq!(tiers.len(), 3);
+        assert_eq!(tiers[0].name, "feature:codex_bengalfox:five_hour");
+        assert_eq!(tiers[1].name, "feature:codex_bengalfox:weekly_limit");
+        assert_eq!(tiers[2].name, "feature:future_feature:primary_window");
+        assert_eq!(
+            tiers[0].resets_at.as_deref(),
+            Some("2026-08-20T00:01:00+00:00")
+        );
+        assert_eq!(
+            tiers[1].resets_at.as_deref(),
+            Some("2026-08-20T00:02:00+00:00")
+        );
+    }
+
+    #[test]
+    fn codex_parser_availability_is_authoritative_without_windows() {
+        let now = chrono::Utc::now();
+        let (_, tiers, available) = parse_openai_codex_usage(
+            &serde_json::json!({
+                "plan_type": "plus",
+                "rate_limit": { "allowed": false, "limit_reached": true }
+            }),
+            now,
+        );
+        assert!(tiers.is_empty());
+        assert_eq!(available, Some(false));
+        assert!(UsageBackend::OpenAiCodex.has_authoritative_observation(&tiers, available));
+
+        let (_, empty, unknown) = parse_openai_codex_usage(&serde_json::json!({}), now);
+        assert!(empty.is_empty());
+        assert_eq!(unknown, None);
+        assert!(!UsageBackend::OpenAiCodex.has_authoritative_observation(&empty, unknown));
+    }
+
+    #[test]
+    fn codex_parser_clamps_percent_and_skips_malformed_windows() {
+        let now = chrono::Utc::now();
+        let body = serde_json::json!({
+            "rate_limit": {
+                "limit_reached": true,
+                "primary_window": {
+                    "used_percent": 140,
+                    "limit_window_seconds": 18000,
+                    "reset_at": -1,
+                    "reset_after_seconds": -3
+                },
+                "secondary_window": {
+                    "limit_window_seconds": 604800
+                }
+            }
+        });
+        let (_, tiers, available) = parse_openai_codex_usage(&body, now);
+        assert_eq!(available, Some(false));
+        assert_eq!(tiers, vec![tier("five_hour", 100.0, None)]);
+    }
+
+    #[test]
+    fn codex_parser_does_not_mislabel_future_window_lengths() {
+        let (_, tiers, _) = parse_openai_codex_usage(
+            &serde_json::json!({
+                "rate_limit": {
+                    "allowed": true,
+                    "primary_window": {
+                        "used_percent": 3,
+                        "limit_window_seconds": 86400
+                    }
+                }
+            }),
+            chrono::Utc::now(),
+        );
+        assert_eq!(tiers, vec![tier("primary_window", 3.0, None)]);
     }
 
     #[test]
@@ -1390,10 +2309,10 @@ mod tests {
     #[test]
     fn coding_plan_recovery_requires_at_least_one_quota_window() {
         assert!(!UsageBackend::GlmGlobal.has_authoritative_observation(&[], None));
-        assert!(UsageBackend::GlmGlobal.has_authoritative_observation(
-            &[tier("five_hour", 0.0, None)],
-            None,
-        ));
+        assert!(
+            UsageBackend::GlmGlobal
+                .has_authoritative_observation(&[tier("five_hour", 0.0, None)], None,)
+        );
     }
 
     #[test]
@@ -1406,7 +2325,7 @@ mod tests {
     #[test]
     fn usage_backend_detect_routes_by_base_url() {
         use UsageBackend::*;
-        let detect = |url: &str| UsageBackend::detect(url);
+        let detect = |url: &str| UsageBackend::detect_url(url);
         assert_eq!(
             detect("https://open.bigmodel.cn/api/coding/paas/v4"),
             Some(GlmCn)
@@ -1877,7 +2796,7 @@ mod tests {
     #[test]
     fn ark_detect_and_kind() {
         use UsageBackend::ArkCoding;
-        let detect = |url: &str| UsageBackend::detect(url);
+        let detect = |url: &str| UsageBackend::detect_url(url);
         assert_eq!(
             detect("https://ark.cn-beijing.volces.com/api/coding"),
             Some(ArkCoding)

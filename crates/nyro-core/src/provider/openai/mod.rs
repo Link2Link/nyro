@@ -98,7 +98,7 @@ const METADATA: VendorMetadata = VendorMetadata {
             runtime: Some(RuntimeConfig {
                 api_base_url: "https://chatgpt.com/backend-api/codex",
                 models_url: "https://chatgpt.com/backend-api/codex/models",
-                models_client_version: "0.99.0",
+                models_client_version: "0.146.0",
             }),
             shared_key_protocols: false,
             auth_schemes: None,

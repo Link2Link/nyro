@@ -243,10 +243,11 @@ impl OAuthCredentialStore for MysqlOAuthCredentialStore {
     async fn complete_refresh(
         &self,
         provider_id: &str,
+        expected_version: i32,
         input: UpsertOAuthCredential,
-    ) -> anyhow::Result<OAuthCredential> {
+    ) -> anyhow::Result<Option<OAuthCredential>> {
         sqlx::query(
-            "UPDATE provider_oauth_credentials SET driver_key=?, scheme=?, access_token=?, refresh_token=?, expires_at=?, resource_url=?, subject_id=?, scopes=?, meta=?, status='connected', status_version=status_version+1, last_error=NULL, last_refresh_at=NOW(), updated_at=NOW() WHERE provider_id=?",
+            "UPDATE provider_oauth_credentials SET driver_key=?, scheme=?, access_token=?, refresh_token=?, expires_at=?, resource_url=?, subject_id=?, scopes=?, meta=?, status='connected', status_version=status_version+1, last_error=NULL, last_refresh_at=NOW(), updated_at=NOW() WHERE provider_id=? AND status='refreshing' AND status_version=?",
         )
         .bind(&input.driver_key)
         .bind(&input.scheme)
@@ -258,22 +259,28 @@ impl OAuthCredentialStore for MysqlOAuthCredentialStore {
         .bind(input.scopes.as_deref().unwrap_or("[]"))
         .bind(input.meta.as_deref().unwrap_or("{}"))
         .bind(provider_id)
+        .bind(expected_version)
         .execute(&self.pool)
         .await?;
-        self.get(provider_id)
-            .await?
-            .context("credential not found after complete_refresh")
+        let current = self.get(provider_id).await?;
+        Ok(current.filter(|credential| credential.status_version == expected_version + 1))
     }
 
-    async fn fail_refresh(&self, provider_id: &str, error_message: &str) -> anyhow::Result<()> {
-        sqlx::query(
-            "UPDATE provider_oauth_credentials SET status='error', last_error=?, status_version=status_version+1, updated_at=NOW() WHERE provider_id=?",
+    async fn fail_refresh(
+        &self,
+        provider_id: &str,
+        expected_version: i32,
+        error_message: &str,
+    ) -> anyhow::Result<bool> {
+        let result = sqlx::query(
+            "UPDATE provider_oauth_credentials SET status='connected', last_error=?, status_version=status_version+1, updated_at=NOW() WHERE provider_id=? AND status='refreshing' AND status_version=?",
         )
         .bind(error_message)
         .bind(provider_id)
+        .bind(expected_version)
         .execute(&self.pool)
         .await?;
-        Ok(())
+        Ok(result.rows_affected() > 0)
     }
 
     async fn list_expiring(&self, before: Duration) -> anyhow::Result<Vec<OAuthCredential>> {
@@ -289,7 +296,7 @@ impl OAuthCredentialStore for MysqlOAuthCredentialStore {
     async fn recover_stale_refreshing(&self, timeout: Duration) -> anyhow::Result<u64> {
         let seconds = timeout.as_secs() as i64;
         let result = sqlx::query(
-            "UPDATE provider_oauth_credentials SET status='error', last_error='refresh timeout: process did not complete within timeout', status_version=status_version+1, updated_at=NOW() WHERE status='refreshing' AND updated_at + INTERVAL ? SECOND < NOW()",
+            "UPDATE provider_oauth_credentials SET status='connected', last_error='refresh timeout: process did not complete within timeout', status_version=status_version+1, updated_at=NOW() WHERE status='refreshing' AND updated_at + INTERVAL ? SECOND < NOW()",
         )
         .bind(seconds)
         .execute(&self.pool)

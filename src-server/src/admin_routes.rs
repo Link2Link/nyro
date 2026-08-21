@@ -72,8 +72,7 @@ pub fn create_router(gateway: Gateway, admin_token: Option<String>) -> Router {
         )
         .route(
             "/providers/:id/usage-credentials",
-            get(get_provider_usage_credentials_handler)
-                .put(put_provider_usage_credentials_handler),
+            get(get_provider_usage_credentials_handler).put(put_provider_usage_credentials_handler),
         )
         .route("/providers/:id/models", get(provider_models_handler))
         .route(
@@ -291,10 +290,8 @@ async fn get_provider_usage_credentials_handler(
     Path(id): Path<String>,
 ) -> impl IntoResponse {
     match gw.admin().get_provider_usage_credentials(&id).await {
-        Ok((ak, sk)) => {
-            Json(serde_json::json!({ "data": { "access_key": ak, "secret_key": sk } }))
-                .into_response()
-        }
+        Ok((ak, sk)) => Json(serde_json::json!({ "data": { "access_key": ak, "secret_key": sk } }))
+            .into_response(),
         Err(e) => err(e),
     }
 }
@@ -326,7 +323,7 @@ async fn provider_usage_handler(
 ) -> impl IntoResponse {
     match gw.admin().get_provider_usage(&id).await {
         Ok(v) => Json(serde_json::json!({ "data": v })).into_response(),
-        Err(e) => err(e),
+        Err(e) => usage_err(e),
     }
 }
 
@@ -766,6 +763,26 @@ async fn import_config_handler(
         Ok(v) => Json(serde_json::json!({ "data": v })).into_response(),
         Err(e) => err(e),
     }
+}
+
+fn usage_err(e: anyhow::Error) -> axum::response::Response {
+    let message = e.to_string();
+    let lower = message.to_ascii_lowercase();
+    let status = if lower.contains("not found") {
+        StatusCode::NOT_FOUND
+    } else if lower.contains("authentication failed")
+        || lower.contains("re-authorize")
+        || lower.contains("missing chatgpt_account_id")
+    {
+        StatusCode::UNAUTHORIZED
+    } else if lower.contains("rate limited") || lower.contains("http 429") {
+        StatusCode::TOO_MANY_REQUESTS
+    } else if lower.contains("not supported") || lower.contains("requires an oauth provider") {
+        StatusCode::BAD_REQUEST
+    } else {
+        StatusCode::BAD_GATEWAY
+    };
+    (status, Json(serde_json::json!({ "error": message }))).into_response()
 }
 
 fn err(e: anyhow::Error) -> axum::response::Response {

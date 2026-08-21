@@ -3,9 +3,9 @@ use std::collections::HashMap;
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
 use base64::Engine;
-use reqwest::header::{ACCEPT, CONTENT_TYPE};
+use reqwest::header::{ACCEPT, CONTENT_TYPE, USER_AGENT};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 use super::shared::{
     PkceAuthState, build_authorize_url, encode_scopes, expires_at_after, generate_code_challenge,
@@ -23,6 +23,10 @@ use crate::provider::{OAuthConfig, RuntimeConfig};
 
 const OPENAI_PRESET_ID: &str = "openai";
 const CODEX_CHANNEL_ID: &str = "codex";
+const CODEX_REFRESH_SCOPE: &str = "openid profile email";
+const CODEX_CLIENT_VERSION: &str = "0.146.0";
+const CODEX_ORIGINATOR: &str = "codex-tui";
+const CODEX_USER_AGENT: &str = "codex-tui/0.146.0 (Ubuntu 22.4.0; x86_64) xterm-256color";
 
 /// Resolved OAuth + runtime config for the OpenAI / Codex channel,
 /// sourced from the in-process `VendorRegistry`.
@@ -39,6 +43,8 @@ pub struct OpenAIOAuthDriver;
 struct OpenAITokenResponse {
     access_token: Option<String>,
     refresh_token: Option<String>,
+    id_token: Option<String>,
+    token_type: Option<String>,
     expires_in: Option<i64>,
     scope: Option<String>,
 }
@@ -54,6 +60,13 @@ struct OpenAIErrorResponse {
 struct OpenAIAuthState {
     #[serde(flatten)]
     pkce: PkceAuthState,
+}
+
+fn normalized_string(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
 }
 
 impl OpenAIOAuthDriver {
@@ -81,6 +94,8 @@ impl OpenAIOAuthDriver {
     fn normalize_token_response(
         body: &str,
         fallback_refresh_token: Option<&str>,
+        fallback_scopes: Option<&[String]>,
+        fallback_meta: Option<&Value>,
         runtime: &RuntimeConfig,
     ) -> Result<CredentialBundle> {
         let token: OpenAITokenResponse =
@@ -91,17 +106,55 @@ impl OpenAIOAuthDriver {
             .ok_or_else(|| anyhow!("openai oauth token response missing access_token"))?;
         let expires_in = token.expires_in.unwrap_or(3600).max(1);
 
+        // Tokens are persisted in dedicated credential columns. Keep only
+        // non-secret identity and token metadata in `meta`, merging the old
+        // values because refresh responses may omit ID-token claims.
+        let mut meta = fallback_meta
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        if let Some(token_type) = normalized_string(token.token_type.as_deref()) {
+            meta.insert("token_type".to_string(), Value::String(token_type));
+        }
+        if let Some(id_token) = normalized_string(token.id_token.as_deref())
+            && let Some(claims) = Self::decode_jwt_claims(&id_token)
+            && Self::id_token_claims_current(&claims)
+        {
+            Self::merge_identity_claims(&mut meta, &claims);
+        }
+
+        let subject_id = meta
+            .get("chatgpt_account_id")
+            .and_then(Value::as_str)
+            .map(ToString::to_string)
+            .or_else(|| {
+                meta.get("sub")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string)
+            });
+
+        let refresh_token = token
+            .refresh_token
+            .filter(|value| !value.trim().is_empty())
+            .or_else(|| fallback_refresh_token.map(ToString::to_string));
+        let scopes = if token
+            .scope
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+        {
+            encode_scopes(token.scope.as_deref())
+        } else {
+            fallback_scopes.map(ToOwned::to_owned).unwrap_or_default()
+        };
+
         Ok(CredentialBundle {
             access_token: Some(access_token),
-            refresh_token: token
-                .refresh_token
-                .filter(|value| !value.trim().is_empty())
-                .or_else(|| fallback_refresh_token.map(ToString::to_string)),
+            refresh_token,
             expires_at: Some(expires_at_after(expires_in)),
             resource_url: Some(runtime.api_base_url.to_string()),
-            subject_id: None,
-            scopes: encode_scopes(token.scope.as_deref()),
-            raw: serde_json::from_str(body).unwrap_or(serde_json::Value::Null),
+            subject_id,
+            scopes,
+            raw: Value::Object(meta),
         })
     }
 
@@ -115,36 +168,100 @@ impl OpenAIOAuthDriver {
     }
 
     fn decode_jwt_claims(token: &str) -> Option<Value> {
-        let payload = token.split('.').nth(1)?;
+        let mut parts = token.split('.');
+        parts.next()?;
+        let payload = parts.next()?;
+        parts.next()?;
+        if parts.next().is_some() {
+            return None;
+        }
         let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .decode(payload)
+            .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(payload))
             .ok()?;
         serde_json::from_slice(&decoded).ok()
     }
 
-    fn extract_account_id(credential: &StoredCredential) -> Option<String> {
-        let access_token = credential.access_token.as_deref()?.trim();
-        if access_token.is_empty() {
-            return None;
-        }
+    fn id_token_claims_current(claims: &Value) -> bool {
+        const CLOCK_SKEW_SECONDS: i64 = 120;
+        let Some(exp) = claims.get("exp").and_then(Value::as_i64) else {
+            return true;
+        };
+        chrono::Utc::now().timestamp() <= exp.saturating_add(CLOCK_SKEW_SECONDS)
+    }
 
-        let claims = Self::decode_jwt_claims(access_token)?;
-        claims
+    fn merge_identity_claims(meta: &mut Map<String, Value>, claims: &Value) {
+        let auth = claims
             .get("https://api.openai.com/auth")
-            .and_then(Value::as_object)
-            .and_then(|auth| auth.get("chatgpt_account_id"))
+            .and_then(Value::as_object);
+        let copy_string = |meta: &mut Map<String, Value>, key: &str, value: Option<&Value>| {
+            if let Some(value) = value
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                meta.insert(key.to_string(), Value::String(value.to_string()));
+            }
+        };
+        copy_string(meta, "sub", claims.get("sub"));
+        copy_string(meta, "email", claims.get("email"));
+        copy_string(
+            meta,
+            "chatgpt_account_id",
+            auth.and_then(|value| value.get("chatgpt_account_id"))
+                .or_else(|| claims.get("https://api.openai.com/auth.chatgpt_account_id")),
+        );
+        copy_string(
+            meta,
+            "chatgpt_user_id",
+            auth.and_then(|value| value.get("chatgpt_user_id")),
+        );
+        copy_string(
+            meta,
+            "chatgpt_plan_type",
+            auth.and_then(|value| value.get("chatgpt_plan_type")),
+        );
+        copy_string(
+            meta,
+            "organization_id",
+            auth.and_then(|value| value.get("poid")),
+        );
+    }
+
+    fn extract_account_id(credential: &StoredCredential) -> Option<String> {
+        credential
+            .meta
+            .get("chatgpt_account_id")
             .and_then(Value::as_str)
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(ToString::to_string)
             .or_else(|| {
+                let access_token = credential.access_token.as_deref()?.trim();
+                let claims = Self::decode_jwt_claims(access_token)?;
                 claims
-                    .get("https://api.openai.com/auth.chatgpt_account_id")
+                    .get("https://api.openai.com/auth")
+                    .and_then(Value::as_object)
+                    .and_then(|auth| auth.get("chatgpt_account_id"))
                     .and_then(Value::as_str)
                     .map(str::trim)
                     .filter(|value| !value.is_empty())
                     .map(ToString::to_string)
+                    .or_else(|| {
+                        claims
+                            .get("https://api.openai.com/auth.chatgpt_account_id")
+                            .and_then(Value::as_str)
+                            .map(str::trim)
+                            .filter(|value| !value.is_empty())
+                            .map(ToString::to_string)
+                    })
             })
+    }
+
+    fn apply_auth_identity(request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        request
+            .header(USER_AGENT, CODEX_USER_AGENT)
+            .header("originator", CODEX_ORIGINATOR)
     }
 
     fn codex_models_source(runtime: &RuntimeConfig) -> String {
@@ -235,8 +352,7 @@ impl AuthDriver for OpenAIOAuthDriver {
             .ok_or_else(|| anyhow!("missing authorization code"))?;
 
         let client = required_http_client(ctx.http_client)?;
-        let response = client
-            .post(config.oauth.token_url)
+        let response = Self::apply_auth_identity(client.post(config.oauth.token_url))
             .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
             .header(ACCEPT, "application/json")
             .form(&[
@@ -257,7 +373,7 @@ impl AuthDriver for OpenAIOAuthDriver {
             bail!("openai oauth token exchange failed: HTTP {status} {detail}");
         }
 
-        Self::normalize_token_response(&body, None, config.runtime)
+        Self::normalize_token_response(&body, None, None, None, config.runtime)
     }
 
     async fn refresh(
@@ -274,15 +390,14 @@ impl AuthDriver for OpenAIOAuthDriver {
             .ok_or_else(|| anyhow!("openai oauth refresh token is missing"))?;
         let client = required_http_client(ctx.http_client)?;
 
-        let response = client
-            .post(config.oauth.token_url)
+        let response = Self::apply_auth_identity(client.post(config.oauth.token_url))
             .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
             .header(ACCEPT, "application/json")
             .form(&[
                 ("grant_type", "refresh_token"),
                 ("client_id", config.oauth.client_id),
                 ("refresh_token", refresh_token),
-                ("scope", config.oauth.scope),
+                ("scope", CODEX_REFRESH_SCOPE),
             ])
             .send()
             .await
@@ -295,7 +410,13 @@ impl AuthDriver for OpenAIOAuthDriver {
             bail!("openai oauth token refresh failed: HTTP {status} {detail}");
         }
 
-        Self::normalize_token_response(&body, Some(refresh_token), config.runtime)
+        Self::normalize_token_response(
+            &body,
+            Some(refresh_token),
+            Some(&credential.scopes),
+            Some(&credential.meta),
+            config.runtime,
+        )
     }
 
     fn bind_runtime(
@@ -305,7 +426,21 @@ impl AuthDriver for OpenAIOAuthDriver {
     ) -> Result<RuntimeBinding> {
         let config = Self::codex_config()?;
         let account_id = Self::extract_account_id(credential);
-        let mut extra_headers = HashMap::new();
+        let access_token = credential
+            .access_token
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| anyhow!("openai oauth credential is missing access token"))?;
+        let mut extra_headers = HashMap::from([
+            (
+                "authorization".to_string(),
+                format!("Bearer {access_token}"),
+            ),
+            ("user-agent".to_string(), CODEX_USER_AGENT.to_string()),
+            ("originator".to_string(), CODEX_ORIGINATOR.to_string()),
+            ("version".to_string(), CODEX_CLIENT_VERSION.to_string()),
+        ]);
         if let Some(account_id) = account_id {
             extra_headers.insert("chatgpt-account-id".to_string(), account_id);
         }
@@ -322,8 +457,157 @@ impl AuthDriver for OpenAIOAuthDriver {
             extra_headers,
             model_aliases: HashMap::new(),
             models_source_override,
-            disable_default_auth: false,
+            // Runtime binding owns both Bearer auth and the Codex identity;
+            // suppress the generic OpenAI API-key header path.
+            disable_default_auth: true,
             static_models_override: None,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use serde_json::json;
+
+    fn jwt(payload: Value) -> String {
+        format!(
+            "header.{}.signature",
+            URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload).unwrap())
+        )
+    }
+
+    #[test]
+    fn token_response_sanitizes_secrets_and_extracts_identity() {
+        let config = OpenAIOAuthDriver::codex_config().unwrap();
+        let id_token = jwt(json!({
+            "exp": chrono::Utc::now().timestamp() + 3600,
+            "sub": "user-1",
+            "email": "user@example.com",
+            "https://api.openai.com/auth": {
+                "chatgpt_account_id": "account-1",
+                "chatgpt_user_id": "chatgpt-user-1",
+                "chatgpt_plan_type": "plus",
+                "poid": "org-1"
+            }
+        }));
+        let body = json!({
+            "access_token": "secret-access",
+            "refresh_token": "secret-refresh",
+            "id_token": id_token,
+            "token_type": "Bearer",
+            "expires_in": 3600,
+            "scope": "openid profile email offline_access"
+        })
+        .to_string();
+
+        let bundle =
+            OpenAIOAuthDriver::normalize_token_response(&body, None, None, None, config.runtime)
+                .unwrap();
+
+        assert_eq!(bundle.subject_id.as_deref(), Some("account-1"));
+        assert_eq!(bundle.raw["chatgpt_account_id"], "account-1");
+        assert_eq!(bundle.raw["email"], "user@example.com");
+        assert!(bundle.raw.get("access_token").is_none());
+        assert!(bundle.raw.get("refresh_token").is_none());
+        assert!(bundle.raw.get("id_token").is_none());
+    }
+
+    #[test]
+    fn expired_id_token_claims_are_ignored() {
+        let config = OpenAIOAuthDriver::codex_config().unwrap();
+        let id_token = jwt(json!({
+            "exp": 1,
+            "https://api.openai.com/auth": { "chatgpt_account_id": "expired-account" }
+        }));
+        let body = json!({
+            "access_token": "secret-access",
+            "refresh_token": "secret-refresh",
+            "id_token": id_token,
+            "expires_in": 3600
+        })
+        .to_string();
+        let bundle =
+            OpenAIOAuthDriver::normalize_token_response(&body, None, None, None, config.runtime)
+                .unwrap();
+
+        assert!(bundle.subject_id.is_none());
+        assert!(bundle.raw.get("chatgpt_account_id").is_none());
+    }
+
+    #[test]
+    fn refresh_response_preserves_old_identity_metadata() {
+        let config = OpenAIOAuthDriver::codex_config().unwrap();
+        let old = json!({
+            "chatgpt_account_id": "account-old",
+            "email": "old@example.com",
+            "chatgpt_plan_type": "pro"
+        });
+        let old_scopes = vec!["openid".to_string(), "profile".to_string()];
+        let bundle = OpenAIOAuthDriver::normalize_token_response(
+            r#"{"access_token":"new-access","expires_in":1800}"#,
+            Some("old-refresh"),
+            Some(&old_scopes),
+            Some(&old),
+            config.runtime,
+        )
+        .unwrap();
+
+        assert_eq!(bundle.refresh_token.as_deref(), Some("old-refresh"));
+        assert_eq!(bundle.subject_id.as_deref(), Some("account-old"));
+        assert_eq!(bundle.scopes, old_scopes);
+        assert_eq!(bundle.raw["chatgpt_plan_type"], "pro");
+    }
+
+    #[test]
+    fn runtime_uses_metadata_before_legacy_access_token_claims() {
+        let driver = OpenAIOAuthDriver;
+        let credential = StoredCredential {
+            driver_key: "codex".to_string(),
+            scheme: AuthScheme::OAuthAuthCodePkce.as_str().to_string(),
+            access_token: Some("not-a-jwt".to_string()),
+            refresh_token: None,
+            expires_at: None,
+            resource_url: None,
+            subject_id: None,
+            scopes: vec![],
+            meta: json!({ "chatgpt_account_id": "account-meta" }),
+        };
+        let provider = Provider {
+            id: "provider".to_string(),
+            name: "Codex".to_string(),
+            vendor: Some("openai".to_string()),
+            protocol: "openai-responses".to_string(),
+            base_url: "https://placeholder.invalid".to_string(),
+            protocol_mode: "fixed".to_string(),
+            protocol_endpoints: vec![],
+            preset_key: Some("openai".to_string()),
+            channel: Some("codex".to_string()),
+            models_source: None,
+            static_models: None,
+            api_key: String::new(),
+            auth_mode: "oauth".to_string(),
+            use_proxy: false,
+            fast_mode: false,
+            last_test_success: None,
+            last_test_at: None,
+            is_enabled: true,
+            created_at: String::new(),
+            updated_at: String::new(),
+        };
+
+        let binding = driver.bind_runtime(&provider, &credential).unwrap();
+        assert_eq!(
+            binding
+                .extra_headers
+                .get("chatgpt-account-id")
+                .map(String::as_str),
+            Some("account-meta")
+        );
+        assert_eq!(binding.extra_headers["authorization"], "Bearer not-a-jwt");
+        assert_eq!(binding.extra_headers["originator"], CODEX_ORIGINATOR);
+        assert_eq!(binding.extra_headers["version"], CODEX_CLIENT_VERSION);
+        assert!(binding.disable_default_auth);
     }
 }

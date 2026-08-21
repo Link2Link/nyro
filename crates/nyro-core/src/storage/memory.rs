@@ -1,6 +1,5 @@
 use std::time::Duration;
 
-use anyhow::Context;
 use async_trait::async_trait;
 use tokio::sync::RwLock;
 
@@ -369,10 +368,16 @@ impl OAuthCredentialStore for MemoryOAuthCredentialStore {
     async fn complete_refresh(
         &self,
         provider_id: &str,
+        expected_version: i32,
         input: UpsertOAuthCredential,
-    ) -> anyhow::Result<OAuthCredential> {
+    ) -> anyhow::Result<Option<OAuthCredential>> {
         let mut map = self.credentials.write().await;
-        let cred = map.get_mut(provider_id).context("credential not found")?;
+        let Some(cred) = map.get_mut(provider_id) else {
+            return Ok(None);
+        };
+        if cred.status != "refreshing" || cred.status_version != expected_version {
+            return Ok(None);
+        }
         let now = now_rfc3339();
         cred.driver_key = input.driver_key;
         cred.scheme = input.scheme;
@@ -392,18 +397,29 @@ impl OAuthCredentialStore for MemoryOAuthCredentialStore {
         cred.last_error = None;
         cred.last_refresh_at = Some(now.clone());
         cred.updated_at = now;
-        Ok(cred.clone())
+        Ok(Some(cred.clone()))
     }
 
-    async fn fail_refresh(&self, provider_id: &str, error_message: &str) -> anyhow::Result<()> {
+    async fn fail_refresh(
+        &self,
+        provider_id: &str,
+        expected_version: i32,
+        error_message: &str,
+    ) -> anyhow::Result<bool> {
         let mut map = self.credentials.write().await;
-        if let Some(cred) = map.get_mut(provider_id) {
-            cred.status = "error".to_string();
-            cred.last_error = Some(error_message.to_string());
-            cred.status_version += 1;
-            cred.updated_at = now_rfc3339();
+        let Some(cred) = map.get_mut(provider_id) else {
+            return Ok(false);
+        };
+        if cred.status != "refreshing" || cred.status_version != expected_version {
+            return Ok(false);
         }
-        Ok(())
+        // The token may still be usable and transient failures must remain
+        // retryable. Return to connected while retaining the diagnostic.
+        cred.status = "connected".to_string();
+        cred.last_error = Some(error_message.to_string());
+        cred.status_version += 1;
+        cred.updated_at = now_rfc3339();
+        Ok(true)
     }
 
     async fn list_expiring(&self, _before: Duration) -> anyhow::Result<Vec<OAuthCredential>> {
@@ -420,7 +436,7 @@ impl OAuthCredentialStore for MemoryOAuthCredentialStore {
         let mut count = 0u64;
         for cred in map.values_mut() {
             if cred.status == "refreshing" {
-                cred.status = "error".to_string();
+                cred.status = "connected".to_string();
                 cred.last_error = Some("refresh timeout".to_string());
                 cred.status_version += 1;
                 cred.updated_at = now_rfc3339();

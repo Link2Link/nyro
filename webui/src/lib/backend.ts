@@ -106,6 +106,12 @@ function resolveHTTP(cmd: string, args?: Record<string, unknown>): HTTPMapping {
       };
     case "get_provider_oauth_status":
       return { method: "GET", url: `${base}/providers/${args?.id}/oauth/status` };
+    case "bind_provider_oauth":
+      return {
+        method: "POST",
+        url: `${base}/providers/${args?.id}/oauth/bind`,
+        body: { session_id: args?.sessionId ?? args?.session_id },
+      };
     case "reconnect_provider_oauth":
       return { method: "POST", url: `${base}/providers/${args?.id}/oauth/reconnect` };
     case "logout_provider_oauth":

@@ -239,10 +239,11 @@ impl OAuthCredentialStore for PostgresOAuthCredentialStore {
     async fn complete_refresh(
         &self,
         provider_id: &str,
+        expected_version: i32,
         input: UpsertOAuthCredential,
-    ) -> anyhow::Result<OAuthCredential> {
+    ) -> anyhow::Result<Option<OAuthCredential>> {
         sqlx::query(
-            "UPDATE provider_oauth_credentials SET driver_key=$1, scheme=$2, access_token=$3, refresh_token=$4, expires_at=$5, resource_url=$6, subject_id=$7, scopes=$8, meta=$9, status='connected', status_version=status_version+1, last_error=NULL, last_refresh_at=CURRENT_TIMESTAMP, updated_at=CURRENT_TIMESTAMP WHERE provider_id=$10",
+            "UPDATE provider_oauth_credentials SET driver_key=$1, scheme=$2, access_token=$3, refresh_token=$4, expires_at=$5, resource_url=$6, subject_id=$7, scopes=$8, meta=$9, status='connected', status_version=status_version+1, last_error=NULL, last_refresh_at=CURRENT_TIMESTAMP, updated_at=CURRENT_TIMESTAMP WHERE provider_id=$10 AND status='refreshing' AND status_version=$11",
         )
         .bind(&input.driver_key)
         .bind(&input.scheme)
@@ -254,22 +255,28 @@ impl OAuthCredentialStore for PostgresOAuthCredentialStore {
         .bind(input.scopes.as_deref().unwrap_or("[]"))
         .bind(input.meta.as_deref().unwrap_or("{}"))
         .bind(provider_id)
+        .bind(expected_version)
         .execute(&self.pool)
         .await?;
-        self.get(provider_id)
-            .await?
-            .context("credential not found after complete_refresh")
+        let current = self.get(provider_id).await?;
+        Ok(current.filter(|credential| credential.status_version == expected_version + 1))
     }
 
-    async fn fail_refresh(&self, provider_id: &str, error_message: &str) -> anyhow::Result<()> {
-        sqlx::query(
-            "UPDATE provider_oauth_credentials SET status='error', last_error=$1, status_version=status_version+1, updated_at=CURRENT_TIMESTAMP WHERE provider_id=$2",
+    async fn fail_refresh(
+        &self,
+        provider_id: &str,
+        expected_version: i32,
+        error_message: &str,
+    ) -> anyhow::Result<bool> {
+        let result = sqlx::query(
+            "UPDATE provider_oauth_credentials SET status='connected', last_error=$1, status_version=status_version+1, updated_at=CURRENT_TIMESTAMP WHERE provider_id=$2 AND status='refreshing' AND status_version=$3",
         )
         .bind(error_message)
         .bind(provider_id)
+        .bind(expected_version)
         .execute(&self.pool)
         .await?;
-        Ok(())
+        Ok(result.rows_affected() > 0)
     }
 
     async fn list_expiring(&self, before: Duration) -> anyhow::Result<Vec<OAuthCredential>> {
@@ -285,7 +292,7 @@ impl OAuthCredentialStore for PostgresOAuthCredentialStore {
     async fn recover_stale_refreshing(&self, timeout: Duration) -> anyhow::Result<u64> {
         let seconds = timeout.as_secs() as i64;
         let result = sqlx::query(
-            "UPDATE provider_oauth_credentials SET status='error', last_error='refresh timeout: process did not complete within timeout', status_version=status_version+1, updated_at=CURRENT_TIMESTAMP WHERE status='refreshing' AND updated_at + ($1 * INTERVAL '1 second') < CURRENT_TIMESTAMP",
+            "UPDATE provider_oauth_credentials SET status='connected', last_error='refresh timeout: process did not complete within timeout', status_version=status_version+1, updated_at=CURRENT_TIMESTAMP WHERE status='refreshing' AND updated_at + ($1 * INTERVAL '1 second') < CURRENT_TIMESTAMP",
         )
         .bind(seconds)
         .execute(&self.pool)

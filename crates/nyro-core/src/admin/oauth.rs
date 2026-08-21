@@ -1,5 +1,80 @@
 use super::*;
 
+fn validate_oauth_session_for_provider(
+    session: &AuthSession,
+    provider: &Provider,
+) -> anyhow::Result<()> {
+    if provider.effective_auth_mode().trim() != "oauth" {
+        anyhow::bail!("target provider is not configured for OAuth");
+    }
+
+    let expected_driver = provider
+        .vendor
+        .as_deref()
+        .map(auth::normalize_driver_key)
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            provider
+                .preset_key
+                .as_deref()
+                .map(auth::normalize_driver_key)
+                .filter(|value| !value.is_empty())
+        })
+        .ok_or_else(|| anyhow::anyhow!("target provider has no OAuth vendor"))?;
+    let session_driver = auth::normalize_driver_key(&session.driver_key);
+    if session_driver != expected_driver {
+        anyhow::bail!(
+            "OAuth session driver '{}' is incompatible with provider driver '{}'",
+            session.driver_key,
+            expected_driver
+        );
+    }
+
+    let driver = auth::build_driver(&session_driver)
+        .ok_or_else(|| anyhow::anyhow!("auth vendor not implemented: {session_driver}"))?;
+    if !driver.metadata().supports_existing_provider && !provider.id.is_empty() {
+        anyhow::bail!(
+            "auth vendor does not support binding an existing provider: {session_driver}"
+        );
+    }
+    let expected_scheme = driver.metadata().scheme.as_str();
+    if session.scheme.trim() != expected_scheme {
+        anyhow::bail!(
+            "OAuth session scheme '{}' is incompatible with provider driver '{}'",
+            session.scheme,
+            session_driver
+        );
+    }
+
+    if session_driver == "codex"
+        && (provider.protocol.trim() != "openai-responses"
+            || !provider
+                .channel
+                .as_deref()
+                .is_some_and(|value| value.eq_ignore_ascii_case("codex"))
+            || !provider
+                .preset_key
+                .as_deref()
+                .is_some_and(|value| value.eq_ignore_ascii_case("openai")))
+    {
+        anyhow::bail!("Codex OAuth session can only bind to the openai/codex channel");
+    }
+    if session_driver == "grok"
+        && (provider.protocol.trim() != "openai-responses"
+            || !provider
+                .channel
+                .as_deref()
+                .is_some_and(|value| value.eq_ignore_ascii_case("grok"))
+            || !provider
+                .preset_key
+                .as_deref()
+                .is_some_and(|value| value.eq_ignore_ascii_case("xai")))
+    {
+        anyhow::bail!("Grok OAuth session can only bind to the xai/grok channel");
+    }
+    Ok(())
+}
+
 impl AdminService {
     pub async fn init_oauth_session(
         &self,
@@ -170,7 +245,9 @@ impl AdminService {
         {
             Ok(bundle) => bundle,
             Err(error) => {
-                self.delete_auth_session_record(&session.id).await?;
+                // Keep the verifier/state until the caller explicitly cancels
+                // or the short-lived session expires. This permits retry after
+                // transport, 429, and 5xx failures without restarting PKCE.
                 return Err(error);
             }
         };
@@ -334,20 +411,74 @@ impl AdminService {
     ) -> anyhow::Result<Provider> {
         let session = self.take_ready_auth_session_record(session_id).await?;
         if is_expired_at(session.expires_at.as_deref()) {
+            self.restore_auth_session_record(session).await?;
             anyhow::bail!("auth session expired");
         }
 
-        let bundle = parse_auth_session_bundle(&session)?;
-        bundle
+        let bundle = match parse_auth_session_bundle(&session) {
+            Ok(bundle) => bundle,
+            Err(error) => {
+                self.restore_auth_session_record(session).await?;
+                return Err(error);
+            }
+        };
+        if bundle
             .access_token
             .as_deref()
             .filter(|value| !value.trim().is_empty())
-            .ok_or_else(|| anyhow::anyhow!("auth session missing access token"))?;
+            .is_none()
+        {
+            self.restore_auth_session_record(session).await?;
+            anyhow::bail!("auth session missing access token");
+        }
 
+        let session_driver = auth::normalize_driver_key(&session.driver_key);
         if input.vendor.as_deref().unwrap_or("").trim().is_empty() {
-            input.vendor = Some(session.driver_key.clone());
+            input.vendor = Some(match session_driver.as_str() {
+                "codex" => "openai".to_string(),
+                "grok" => "xai".to_string(),
+                _ => session.driver_key.clone(),
+            });
+        }
+        if session_driver == "codex" {
+            input.preset_key = Some("openai".to_string());
+            input.channel = Some("codex".to_string());
+            input.protocol = "openai-responses".to_string();
+            input.base_url = "https://chatgpt.com/backend-api/codex".to_string();
+        }
+        if session_driver == "grok" {
+            input.preset_key = Some("xai".to_string());
+            input.channel = Some("grok".to_string());
+            input.protocol = "openai-responses".to_string();
+            input.base_url = "https://cli-chat-proxy.grok.com/v1".to_string();
         }
         input.auth_mode = "oauth".to_string();
+        let candidate = Provider {
+            id: String::new(),
+            name: input.name.clone(),
+            vendor: input.vendor.clone(),
+            protocol: input.protocol.clone(),
+            base_url: input.base_url.clone(),
+            protocol_mode: input.protocol_mode.clone(),
+            protocol_endpoints: Vec::new(),
+            preset_key: input.preset_key.clone(),
+            channel: input.channel.clone(),
+            models_source: input.models_source.clone(),
+            static_models: input.static_models.clone(),
+            api_key: String::new(),
+            auth_mode: "oauth".to_string(),
+            use_proxy: input.use_proxy,
+            fast_mode: input.fast_mode,
+            last_test_success: None,
+            last_test_at: None,
+            is_enabled: true,
+            created_at: String::new(),
+            updated_at: String::new(),
+        };
+        if let Err(error) = validate_oauth_session_for_provider(&session, &candidate) {
+            self.restore_auth_session_record(session).await?;
+            return Err(error);
+        }
 
         let provider = match self.create_provider(input).await {
             Ok(provider) => provider,
@@ -387,6 +518,8 @@ impl AdminService {
             }
         };
 
+        self.bump_config_epoch().await?;
+        self.gw.quota_registry.invalidate(&provider.id);
         Ok(provider)
     }
 
@@ -448,6 +581,13 @@ impl AdminService {
             .get(&provider.id)
             .await?
             .ok_or_else(|| anyhow::anyhow!("provider oauth credential not found"))?;
+        let oauth_store = self.gw.storage.oauth_credentials();
+        let Some(refresh_lock) = oauth_store
+            .try_begin_refresh(&provider.id, oauth_cred.status_version)
+            .await?
+        else {
+            anyhow::bail!("provider OAuth credential is already being refreshed");
+        };
 
         let credential = stored_credential_from_oauth(&oauth_cred, &driver_key);
         let refresh_token = credential
@@ -457,6 +597,13 @@ impl AdminService {
             .trim()
             .to_string();
         if refresh_token.is_empty() {
+            let _ = oauth_store
+                .fail_refresh(
+                    &provider.id,
+                    refresh_lock.status_version,
+                    "provider oauth refresh token is missing",
+                )
+                .await;
             anyhow::bail!("provider oauth refresh token is missing");
         }
 
@@ -474,11 +621,12 @@ impl AdminService {
         {
             Ok(bundle) => bundle,
             Err(error) => {
-                let _ = self
-                    .gw
-                    .storage
-                    .oauth_credentials()
-                    .fail_refresh(&provider.id, &error.to_string())
+                let _ = oauth_store
+                    .fail_refresh(
+                        &provider.id,
+                        refresh_lock.status_version,
+                        &error.to_string(),
+                    )
                     .await;
                 return Ok(build_provider_oauth_status(
                     &provider,
@@ -493,14 +641,17 @@ impl AdminService {
             stored_credential_from_bundle(&driver_key, driver.metadata().scheme.as_str(), &bundle);
         let credential_input =
             upsert_credential_from_bundle(&driver_key, driver.metadata().scheme.as_str(), &bundle);
-        self.gw
-            .storage
-            .oauth_credentials()
-            .upsert(&provider.id, credential_input)
+        let published = oauth_store
+            .complete_refresh(&provider.id, refresh_lock.status_version, credential_input)
             .await?;
+        if published.is_none() {
+            anyhow::bail!("OAuth reconnect result was superseded by newer credentials");
+        }
         let refreshed_provider = self
             .sync_provider_runtime_fields(&provider, &refreshed_credential)
             .await?;
+        self.bump_config_epoch().await?;
+        self.gw.quota_registry.invalidate(&provider.id);
 
         Ok(build_provider_oauth_status(
             &refreshed_provider,
@@ -541,6 +692,8 @@ impl AdminService {
                 },
             )
             .await?;
+        self.bump_config_epoch().await?;
+        self.gw.quota_registry.invalidate(&provider.id);
 
         Ok(build_provider_oauth_status(
             &updated,
@@ -558,32 +711,40 @@ impl AdminService {
         let provider = self.get_provider(provider_id).await?;
         let session = self.take_ready_auth_session_record(session_id).await?;
         if is_expired_at(session.expires_at.as_deref()) {
+            self.restore_auth_session_record(session).await?;
             anyhow::bail!("auth session expired");
         }
+        if let Err(error) = validate_oauth_session_for_provider(&session, &provider) {
+            self.restore_auth_session_record(session).await?;
+            return Err(error);
+        }
 
-        let bundle = parse_auth_session_bundle(&session)?;
-        bundle
+        let bundle = match parse_auth_session_bundle(&session) {
+            Ok(bundle) => bundle,
+            Err(error) => {
+                self.restore_auth_session_record(session).await?;
+                return Err(error);
+            }
+        };
+        if bundle
             .access_token
             .as_deref()
             .filter(|value| !value.trim().is_empty())
-            .ok_or_else(|| anyhow::anyhow!("auth session missing access token"))?;
+            .is_none()
+        {
+            self.restore_auth_session_record(session).await?;
+            anyhow::bail!("auth session missing access token");
+        }
 
         let credential =
             stored_credential_from_bundle(&session.driver_key, &session.scheme, &bundle);
         let credential_input =
             upsert_credential_from_bundle(&session.driver_key, &session.scheme, &bundle);
-        match self
-            .gw
-            .storage
-            .oauth_credentials()
-            .upsert(&provider.id, credential_input)
-            .await
-        {
-            Ok(_) => {}
-            Err(error) => {
-                self.restore_auth_session_record(session).await?;
-                return Err(error);
-            }
+        let oauth_store = self.gw.storage.oauth_credentials();
+        let previous_credential = oauth_store.get(&provider.id).await?;
+        if let Err(error) = oauth_store.upsert(&provider.id, credential_input).await {
+            self.restore_auth_session_record(session).await?;
+            return Err(error);
         }
         let provider = match self
             .sync_provider_runtime_fields(&provider, &credential)
@@ -591,17 +752,27 @@ impl AdminService {
         {
             Ok(provider) => provider,
             Err(error) => {
-                let _ = self
-                    .gw
-                    .storage
-                    .oauth_credentials()
-                    .delete(&provider.id)
-                    .await;
+                let rollback = match previous_credential {
+                    Some(previous) => oauth_store
+                        .upsert(&provider.id, upsert_credential_from_oauth(&previous))
+                        .await
+                        .map(|_| ()),
+                    None => oauth_store.delete(&provider.id).await,
+                };
+                if let Err(rollback_error) = rollback {
+                    tracing::error!(
+                        provider_id = %provider.id,
+                        error = %rollback_error,
+                        "failed to restore prior OAuth credential after bind failure"
+                    );
+                }
                 self.restore_auth_session_record(session).await?;
                 return Err(error);
             }
         };
 
+        self.bump_config_epoch().await?;
+        self.gw.quota_registry.invalidate(&provider.id);
         Ok(provider)
     }
     pub(crate) async fn resolve_provider_runtime(
@@ -694,22 +865,43 @@ impl AdminService {
         let locked = oauth_store
             .try_begin_refresh(&provider.id, oauth_cred.status_version)
             .await?;
-        if locked.is_none() {
-            // Another caller is already refreshing — re-read and use whatever is there
-            let refreshed = oauth_store.get(&provider.id).await?.ok_or_else(|| {
-                anyhow::anyhow!("provider oauth credential disappeared during refresh")
-            })?;
-            let refreshed_token = refreshed.access_token.trim().to_string();
-            if !refreshed_token.is_empty() {
-                let cred = stored_credential_from_oauth(&refreshed, &driver_key);
-                let binding = driver.bind_runtime(provider, &cred)?;
-                return Ok(ResolvedProviderRuntime {
-                    access_token: refreshed_token,
-                    binding,
-                });
+        let Some(refresh_lock) = locked else {
+            // Another caller or replica won the CAS. Wait briefly for it to
+            // publish a connected, unexpired token; never reuse the old expired
+            // value that caused this refresh attempt.
+            const ATTEMPTS: usize = 20;
+            const DELAY: std::time::Duration = std::time::Duration::from_millis(100);
+            for attempt in 0..ATTEMPTS {
+                let refreshed = oauth_store.get(&provider.id).await?.ok_or_else(|| {
+                    anyhow::anyhow!("provider oauth credential disappeared during refresh")
+                })?;
+                if refreshed.status == "connected"
+                    && !refreshed.access_token.trim().is_empty()
+                    && !is_expired_at(refreshed.expires_at.as_deref())
+                {
+                    let refreshed_token = refreshed.access_token.trim().to_string();
+                    let cred = stored_credential_from_oauth(&refreshed, &driver_key);
+                    let binding = driver.bind_runtime(provider, &cred)?;
+                    return Ok(ResolvedProviderRuntime {
+                        access_token: refreshed_token,
+                        binding,
+                    });
+                }
+                if refreshed.status == "error" {
+                    anyhow::bail!(
+                        "concurrent OAuth refresh failed: {}",
+                        refreshed
+                            .last_error
+                            .as_deref()
+                            .unwrap_or("unknown refresh error")
+                    );
+                }
+                if attempt + 1 < ATTEMPTS {
+                    tokio::time::sleep(DELAY).await;
+                }
             }
-            anyhow::bail!("concurrent refresh in progress but no valid token available");
-        }
+            anyhow::bail!("concurrent OAuth refresh did not publish a valid token in time");
+        };
 
         let client = self.gw.http_client_for_provider(provider.use_proxy).await?;
         let bundle = match driver
@@ -726,7 +918,11 @@ impl AdminService {
             Ok(bundle) => bundle,
             Err(error) => {
                 let _ = oauth_store
-                    .fail_refresh(&provider.id, &error.to_string())
+                    .fail_refresh(
+                        &provider.id,
+                        refresh_lock.status_version,
+                        &error.to_string(),
+                    )
                     .await;
                 return Err(error.context("refresh oauth access token"));
             }
@@ -736,14 +932,16 @@ impl AdminService {
             stored_credential_from_bundle(&driver_key, driver.metadata().scheme.as_str(), &bundle);
         let credential_input =
             upsert_credential_from_bundle(&driver_key, driver.metadata().scheme.as_str(), &bundle);
-        self.gw
-            .storage
-            .oauth_credentials()
-            .complete_refresh(&provider.id, credential_input)
+        let published = oauth_store
+            .complete_refresh(&provider.id, refresh_lock.status_version, credential_input)
             .await?;
+        if published.is_none() {
+            anyhow::bail!("OAuth refresh result was superseded by newer credentials");
+        }
         let refreshed_provider = self
             .sync_provider_runtime_fields(provider, &refreshed_credential)
             .await?;
+        self.bump_config_epoch().await?;
         let new_access_token = bundle
             .access_token
             .as_deref()
@@ -873,10 +1071,10 @@ impl AdminService {
         let locked = oauth_store
             .try_begin_refresh(&provider.id, cred.status_version)
             .await?;
-        if locked.is_none() {
+        let Some(refresh_lock) = locked else {
             // Another caller is already refreshing — skip
             return Ok(());
-        }
+        };
 
         let client = self.gw.http_client_for_provider(provider.use_proxy).await?;
         let bundle = match driver
@@ -893,7 +1091,11 @@ impl AdminService {
             Ok(bundle) => bundle,
             Err(error) => {
                 let _ = oauth_store
-                    .fail_refresh(&provider.id, &error.to_string())
+                    .fail_refresh(
+                        &provider.id,
+                        refresh_lock.status_version,
+                        &error.to_string(),
+                    )
                     .await;
                 return Err(error.context("proactive oauth refresh"));
             }
@@ -903,11 +1105,17 @@ impl AdminService {
             stored_credential_from_bundle(&driver_key, driver.metadata().scheme.as_str(), &bundle);
         let credential_input =
             upsert_credential_from_bundle(&driver_key, driver.metadata().scheme.as_str(), &bundle);
-        oauth_store
-            .complete_refresh(&provider.id, credential_input)
+        let published = oauth_store
+            .complete_refresh(&provider.id, refresh_lock.status_version, credential_input)
             .await?;
+        if published.is_none() {
+            // A bind or reconnect installed newer credentials while this
+            // refresh was in flight. Its result is authoritative.
+            return Ok(());
+        }
         self.sync_provider_runtime_fields(provider, &refreshed_credential)
             .await?;
+        self.bump_config_epoch().await?;
         Ok(())
     }
 }

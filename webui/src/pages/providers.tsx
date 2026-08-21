@@ -106,6 +106,62 @@ function endpointDisplayName(rawProtocol: string) {
     ?? rawProtocol;
 }
 
+/** Parse a pasted OAuth callback / Grok Build code into URL vs bare-code fields. */
+function isGrokOAuthChannel(presetId?: string | null, channelId?: string | null) {
+  return (presetId ?? "").trim().toLowerCase() === "xai"
+    && (channelId ?? "").trim().toLowerCase() === "grok";
+}
+
+function grokBuildAuthorizationCode(raw: string) {
+  const trimmed = raw.trim();
+  if (!trimmed) return "";
+  try {
+    const parsed = new URL(trimmed);
+    return (parsed.searchParams.get("code") ?? "").trim();
+  } catch {
+    const hash = trimmed.indexOf("#");
+    return (hash >= 0 ? trimmed.slice(0, hash) : trimmed).trim();
+  }
+}
+
+function parsePastedOAuthResult(
+  raw: string,
+  isZh: boolean,
+): { callbackUrl: string; code: string; error: string } {
+  const trimmed = raw.trim();
+  if (!trimmed) {
+    return { callbackUrl: "", code: "", error: "" };
+  }
+  try {
+    const parsed = new URL(trimmed);
+    const code = parsed.searchParams.get("code") ?? "";
+    if (code) {
+      return { callbackUrl: trimmed, code, error: "" };
+    }
+    if (parsed.searchParams.has("error")) {
+      const desc = parsed.searchParams.get("error_description") || parsed.searchParams.get("error") || "";
+      return {
+        callbackUrl: trimmed,
+        code: "",
+        error: isZh
+          ? `授权失败：${desc || "回调中包含 error 参数"}`
+          : `Authorization failed: ${desc || "callback contains error parameter"}`,
+      };
+    }
+    return {
+      callbackUrl: trimmed,
+      code: "",
+      error: isZh
+        ? "回调地址中没有找到 code 参数，请确认粘贴了正确的回调地址。"
+        : "No code parameter found in URL. Please confirm you pasted the correct callback URL.",
+    };
+  } catch {
+    // Grok Build shows a bare authorization code (optionally `code#state`).
+    // Treat non-URL paste as the code instead of blocking submit.
+    return { callbackUrl: "", code: trimmed, error: "" };
+  }
+}
+
 function seedAdaptiveEndpoint(
   protocol: string,
   baseUrl: string,
@@ -730,10 +786,29 @@ type TestLogEntry = {
 const PROVIDER_TEST_RESULTS_STORAGE_KEY = "nyro.provider-test-results.v1";
 
 /** Providers whose vendor has a coding-plan usage-query backend. Mirrors
- * nyro-core `admin::usage::UsageBackend::detect` (host substring match). */
-function usageSupported(provider: Pick<Provider, "base_url">): boolean {
+ * nyro-core `admin::usage::UsageBackend::detect`. */
+function usageSupported(
+  provider: Pick<Provider, "base_url" | "vendor" | "preset_key" | "channel" | "auth_mode">,
+): boolean {
   const url = provider.base_url.toLowerCase();
+  const vendor = (provider.vendor ?? provider.preset_key ?? "").toLowerCase();
+  const isCodexOAuth =
+    provider.auth_mode === "oauth" &&
+    provider.channel?.toLowerCase() === "codex" &&
+    (vendor === "openai" || vendor === "codex");
+  const isImportedCodexOAuth =
+    provider.auth_mode === "oauth" && url.includes("chatgpt.com/backend-api/codex");
+  const isGrokOAuth =
+    provider.auth_mode === "oauth" &&
+    provider.channel?.toLowerCase() === "grok" &&
+    (vendor === "xai" || vendor === "grok");
+  const isImportedGrokOAuth =
+    provider.auth_mode === "oauth" && url.includes("cli-chat-proxy.grok.com");
   return (
+    isCodexOAuth ||
+    isImportedCodexOAuth ||
+    isGrokOAuth ||
+    isImportedGrokOAuth ||
     url.includes("bigmodel.cn") ||
     url.includes("z.ai") ||
     url.includes("minimaxi.com") ||
@@ -941,6 +1016,7 @@ export default function ProvidersPage() {
     onSuccess: (status) => {
       setEditError(null);
       syncProviderOAuthStatus(status);
+      qc.removeQueries({ queryKey: ["provider-usage", status.provider_id] });
       qc.invalidateQueries({ queryKey: ["providers"], refetchType: "none" });
     },
     onError: (error: unknown) => {
@@ -953,6 +1029,7 @@ export default function ProvidersPage() {
     onSuccess: (status) => {
       setEditError(null);
       syncProviderOAuthStatus(status);
+      qc.removeQueries({ queryKey: ["provider-usage", status.provider_id] });
       qc.invalidateQueries({ queryKey: ["providers"], refetchType: "none" });
     },
     onError: (error: unknown) => {
@@ -1193,15 +1270,19 @@ export default function ProvidersPage() {
     const sessionId = createOAuthSession?.session_id;
     if (!sessionId) return;
 
-    const callbackUrl = createOAuthCallbackUrl.trim();
-    const code = createOAuthCode.trim();
+    const grokFlow = isGrokOAuthChannel(selectedPreset?.id, form.channel);
+    const parsed = grokFlow
+      ? { callbackUrl: "", code: grokBuildAuthorizationCode(createOAuthCode || createOAuthCallbackUrl), error: "" }
+      : parsePastedOAuthResult(createOAuthCallbackUrl, isZh);
+    const code = grokFlow ? parsed.code : (createOAuthCode.trim() || parsed.code);
+    const callbackUrl = grokFlow ? "" : parsed.callbackUrl;
     if (!callbackUrl && !code) {
       setCreateOAuthStatus({
         status: "error",
         code: "OAUTH_INPUT_REQUIRED",
-        message: isZh
-          ? "请粘贴完整回调地址，或单独填写授权码。"
-          : "Paste the full callback URL or enter the authorization code.",
+        message: grokFlow
+          ? (isZh ? "请粘贴 Grok Build 授权页给出的授权码。" : "Paste the authorization code shown on the Grok Build page.")
+          : (isZh ? "请粘贴完整回调地址，或单独填写授权码。" : "Paste the full callback URL or enter the authorization code."),
       });
       return;
     }
@@ -1309,9 +1390,10 @@ export default function ProvidersPage() {
             // Bind the session to the existing provider
             try {
               await backend("bind_provider_oauth", {
-                providerId,
+                id: providerId,
                 sessionId: init.session_id,
               });
+              qc.removeQueries({ queryKey: ["provider-usage", providerId] });
               qc.invalidateQueries({ queryKey: ["providers"] });
               qc.invalidateQueries({ queryKey: ["provider-oauth-status", providerId] });
               setShowEditReauth(false);
@@ -1348,15 +1430,19 @@ export default function ProvidersPage() {
     const sessionId = editOAuthSession?.session_id;
     if (!sessionId) return;
 
-    const callbackUrl = editOAuthCallbackUrl.trim();
-    const code = editOAuthCode.trim();
+    const grokFlow = isGrokOAuthChannel(editForm?.preset_key || editForm?.vendor, editForm?.channel);
+    const parsed = grokFlow
+      ? { callbackUrl: "", code: grokBuildAuthorizationCode(editOAuthCode || editOAuthCallbackUrl), error: "" }
+      : parsePastedOAuthResult(editOAuthCallbackUrl, isZh);
+    const code = grokFlow ? parsed.code : (editOAuthCode.trim() || parsed.code);
+    const callbackUrl = grokFlow ? "" : parsed.callbackUrl;
     if (!callbackUrl && !code) {
       setEditOAuthSessionStatus({
         status: "error",
         code: "OAUTH_INPUT_REQUIRED",
-        message: isZh
-          ? "请粘贴完整回调地址，或单独填写授权码。"
-          : "Paste the full callback URL or enter the authorization code.",
+        message: grokFlow
+          ? (isZh ? "请粘贴 Grok Build 授权页给出的授权码。" : "Paste the authorization code shown on the Grok Build page.")
+          : (isZh ? "请粘贴完整回调地址，或单独填写授权码。" : "Paste the full callback URL or enter the authorization code."),
       });
       return;
     }
@@ -1372,9 +1458,10 @@ export default function ProvidersPage() {
       if (status.status === "ready") {
         try {
           await backend("bind_provider_oauth", {
-            providerId,
+            id: providerId,
             sessionId,
           });
+          qc.removeQueries({ queryKey: ["provider-usage", providerId] });
           qc.invalidateQueries({ queryKey: ["providers"] });
           qc.invalidateQueries({ queryKey: ["provider-oauth-status", providerId] });
           setShowEditReauth(false);
@@ -1947,6 +2034,7 @@ export default function ProvidersPage() {
       ? createOAuthStatus.requires_manual_code
       : createOAuthSession?.requires_manual_code ?? false;
   const showCreateOAuthGuide = createResolvedAuthMode === "oauth" && !createOAuthReady;
+  const createIsGrokOAuth = isGrokOAuthChannel(selectedPreset?.id, createChannelValue);
 
   useEffect(() => {
     if (!logsContainerRef.current) return;
@@ -2228,64 +2316,62 @@ export default function ProvidersPage() {
                     <div className={`rounded-lg border p-3 ${createOAuthStatus?.status === "error" ? "border-rose-200 bg-rose-50" : createOAuthSession ? "border-sky-200 bg-sky-50" : "border-slate-200 bg-white"}`}>
                       <div className="flex items-center gap-2 text-sm font-medium text-slate-800">
                         <span className={`inline-flex h-6 w-6 items-center justify-center rounded-full text-xs ${(createOAuthStatus?.status === "pending" || createOAuthStatus?.status === "error") ? "bg-sky-600 text-white" : "bg-slate-200 text-slate-700"}`}>2</span>
-                        <span>{isZh ? "粘贴回调结果" : "Paste Callback Result"}</span>
+                        <span>{createIsGrokOAuth ? (isZh ? "粘贴 Grok Build 授权码" : "Paste Grok Build Code") : (isZh ? "粘贴回调结果" : "Paste Callback Result")}</span>
                       </div>
                       <p className="mt-2 text-xs text-slate-500">
-                        {isZh ? "浏览器授权完成后，把回调地址或授权码粘贴到这里。" : "After browser authorization, paste the callback URL or authorization code here."}
+                        {createIsGrokOAuth
+                          ? (isZh
+                            ? "授权页会显示「将下面的代码复制到 Grok Build 以完成登录」。把那串码原样贴到这里即可。"
+                            : "The page says “copy the code below into Grok Build”. Paste that code here as-is.")
+                          : (isZh
+                            ? "浏览器授权完成后，把回调地址或授权码粘贴到这里。"
+                            : "After browser authorization, paste the callback URL or authorization code here.")}
                       </p>
                       <div className="mt-3 space-y-3">
-                        <div className="space-y-2">
-                          <FieldLabel>{isZh ? "回调地址" : "Callback URL"}</FieldLabel>
-                          <Input
-                            placeholder={isZh ? "例如：http://localhost:1455/auth/callback?code=..." : "For example: http://localhost:1455/auth/callback?code=..."}
-                            value={createOAuthCallbackUrl}
-                            onChange={(e) => {
-                              const url = e.target.value;
-                              setCreateOAuthCallbackUrl(url);
-                              setCreateOAuthCallbackError("");
-                              if (!url.trim()) return;
-                              try {
-                                const parsed = new URL(url);
-                                const code = parsed.searchParams.get("code");
-                                if (code) {
-                                  setCreateOAuthCode(code);
-                                } else if (parsed.searchParams.has("error")) {
-                                  const desc = parsed.searchParams.get("error_description") || parsed.searchParams.get("error") || "";
-                                  setCreateOAuthCallbackError(
-                                    isZh
-                                      ? `授权失败：${desc || "回调中包含 error 参数"}`
-                                      : `Authorization failed: ${desc || "callback contains error parameter"}`,
-                                  );
-                                } else {
-                                  setCreateOAuthCallbackError(
-                                    isZh
-                                      ? "回调地址中没有找到 code 参数，请确认粘贴了正确的回调地址。"
-                                      : "No code parameter found in URL. Please confirm you pasted the correct callback URL.",
-                                  );
-                                }
-                              } catch {
-                                setCreateOAuthCallbackError(
-                                  isZh
-                                    ? "输入的内容不是有效的 URL，请粘贴完整的回调地址。"
-                                    : "Input is not a valid URL. Please paste the complete callback URL.",
-                                );
-                              }
-                            }}
-                            disabled={!createOAuthSession || createOAuthBusy}
-                          />
-                          {createOAuthCallbackError && (
-                            <p className="text-xs text-rose-600">{createOAuthCallbackError}</p>
-                          )}
-                        </div>
-                        <div className="space-y-2">
-                          <FieldLabel>{isZh ? "授权码" : "Authorization Code"}</FieldLabel>
-                          <Input
-                            placeholder="code..."
-                            value={createOAuthCode}
-                            onChange={(e) => setCreateOAuthCode(e.target.value)}
-                            disabled={!createOAuthSession || createOAuthBusy}
-                          />
-                        </div>
+                        {createIsGrokOAuth ? (
+                          <div className="space-y-2">
+                            <FieldLabel>{isZh ? "Grok Build 授权码" : "Grok Build authorization code"}</FieldLabel>
+                            <Input
+                              placeholder={isZh ? "粘贴授权页给出的代码" : "Paste the code from the authorization page"}
+                              value={createOAuthCode}
+                              onChange={(e) => {
+                                setCreateOAuthCallbackUrl("");
+                                setCreateOAuthCallbackError("");
+                                setCreateOAuthCode(grokBuildAuthorizationCode(e.target.value) || e.target.value);
+                              }}
+                              disabled={!createOAuthSession || createOAuthBusy}
+                            />
+                          </div>
+                        ) : (
+                          <>
+                            <div className="space-y-2">
+                              <FieldLabel>{isZh ? "回调地址" : "Callback URL"}</FieldLabel>
+                              <Input
+                                placeholder={isZh ? "例如：http://localhost:1455/auth/callback?code=..." : "For example: http://localhost:1455/auth/callback?code=..."}
+                                value={createOAuthCallbackUrl}
+                                onChange={(e) => {
+                                  const parsed = parsePastedOAuthResult(e.target.value, isZh);
+                                  setCreateOAuthCallbackUrl(e.target.value);
+                                  setCreateOAuthCallbackError(parsed.error);
+                                  if (parsed.code) setCreateOAuthCode(parsed.code);
+                                }}
+                                disabled={!createOAuthSession || createOAuthBusy}
+                              />
+                              {createOAuthCallbackError && (
+                                <p className="text-xs text-rose-600">{createOAuthCallbackError}</p>
+                              )}
+                            </div>
+                            <div className="space-y-2">
+                              <FieldLabel>{isZh ? "授权码" : "Authorization Code"}</FieldLabel>
+                              <Input
+                                placeholder="code..."
+                                value={createOAuthCode}
+                                onChange={(e) => setCreateOAuthCode(e.target.value)}
+                                disabled={!createOAuthSession || createOAuthBusy}
+                              />
+                            </div>
+                          </>
+                        )}
                         <div className="flex flex-wrap gap-2">
                           <Button
                             type="button"
@@ -2684,6 +2770,7 @@ export default function ProvidersPage() {
                 availableProtocolsForPreset(editingPreset, editingChannelValue).includes(option.value),
               );
               const editingResolvedAuthMode = presetChannelAuthMode(editingPreset, editingChannelValue);
+              const editingIsGrokOAuth = isGrokOAuthChannel(editingPreset?.id, editingChannelValue);
               const editUsesVertexServiceAccount = isVertexProviderSelection(editForm);
               const editingSharedKeyChannel = presetSharedKeyChannel(editingPreset, editingChannelValue);
               const editingIsSharedKey = editingResolvedAuthMode === "apikey"
@@ -2968,40 +3055,57 @@ export default function ProvidersPage() {
                                   <div className={`rounded-lg border p-3 ${editOAuthSession ? "border-sky-200 bg-sky-50" : "border-slate-200 bg-white"}`}>
                                     <div className="flex items-center gap-2 text-sm font-medium text-slate-800">
                                       <span className={`inline-flex h-6 w-6 items-center justify-center rounded-full text-xs ${editOAuthSession ? "bg-sky-600 text-white" : "bg-slate-200 text-slate-700"}`}>2</span>
-                                      <span>{isZh ? "粘贴回调结果" : "Paste Callback Result"}</span>
+                                      <span>{editingIsGrokOAuth ? (isZh ? "粘贴 Grok Build 授权码" : "Paste Grok Build Code") : (isZh ? "粘贴回调结果" : "Paste Callback Result")}</span>
                                     </div>
                                     <p className="mt-2 text-xs text-slate-500">
-                                      {isZh ? "浏览器授权完成后，把回调地址或授权码粘贴到这里。" : "After browser authorization, paste the callback URL or authorization code here."}
+                                      {editingIsGrokOAuth
+                                        ? (isZh
+                                          ? "授权页会显示「将下面的代码复制到 Grok Build 以完成登录」。把那串码原样贴到这里即可。"
+                                          : "The page says “copy the code below into Grok Build”. Paste that code here as-is.")
+                                        : (isZh
+                                          ? "浏览器授权完成后，把回调地址或授权码粘贴到这里。"
+                                          : "After browser authorization, paste the callback URL or authorization code here.")}
                                     </p>
                                     <div className="mt-3 space-y-3">
-                                      <div className="space-y-2">
-                                        <FieldLabel>{isZh ? "回调地址" : "Callback URL"}</FieldLabel>
-                                        <Input
-                                          placeholder={isZh ? "例如：http://localhost:1455/auth/callback?code=..." : "For example: http://localhost:1455/auth/callback?code=..."}
-                                          value={editOAuthCallbackUrl}
-                                          onChange={(e) => {
-                                            const url = e.target.value;
-                                            setEditOAuthCallbackUrl(url);
-                                            try {
-                                              const parsed = new URL(url);
-                                              const codeParam = parsed.searchParams.get("code");
-                                              if (codeParam) setEditOAuthCode(codeParam);
-                                            } catch {
-                                              // not a valid URL yet
-                                            }
-                                          }}
-                                          disabled={!editOAuthSession || editOAuthBusy}
-                                        />
-                                      </div>
-                                      <div className="space-y-2">
-                                        <FieldLabel>{isZh ? "授权码" : "Authorization Code"}</FieldLabel>
-                                        <Input
-                                          placeholder="code..."
-                                          value={editOAuthCode}
-                                          onChange={(e) => setEditOAuthCode(e.target.value)}
-                                          disabled={!editOAuthSession || editOAuthBusy}
-                                        />
-                                      </div>
+                                      {editingIsGrokOAuth ? (
+                                        <div className="space-y-2">
+                                          <FieldLabel>{isZh ? "Grok Build 授权码" : "Grok Build authorization code"}</FieldLabel>
+                                          <Input
+                                            placeholder={isZh ? "粘贴授权页给出的代码" : "Paste the code from the authorization page"}
+                                            value={editOAuthCode}
+                                            onChange={(e) => {
+                                              setEditOAuthCallbackUrl("");
+                                              setEditOAuthCode(grokBuildAuthorizationCode(e.target.value) || e.target.value);
+                                            }}
+                                            disabled={!editOAuthSession || editOAuthBusy}
+                                          />
+                                        </div>
+                                      ) : (
+                                        <>
+                                          <div className="space-y-2">
+                                            <FieldLabel>{isZh ? "回调地址" : "Callback URL"}</FieldLabel>
+                                            <Input
+                                              placeholder={isZh ? "例如：http://localhost:1455/auth/callback?code=..." : "For example: http://localhost:1455/auth/callback?code=..."}
+                                              value={editOAuthCallbackUrl}
+                                              onChange={(e) => {
+                                                const parsed = parsePastedOAuthResult(e.target.value, isZh);
+                                                setEditOAuthCallbackUrl(e.target.value);
+                                                if (parsed.code) setEditOAuthCode(parsed.code);
+                                              }}
+                                              disabled={!editOAuthSession || editOAuthBusy}
+                                            />
+                                          </div>
+                                          <div className="space-y-2">
+                                            <FieldLabel>{isZh ? "授权码" : "Authorization Code"}</FieldLabel>
+                                            <Input
+                                              placeholder="code..."
+                                              value={editOAuthCode}
+                                              onChange={(e) => setEditOAuthCode(e.target.value)}
+                                              disabled={!editOAuthSession || editOAuthBusy}
+                                            />
+                                          </div>
+                                        </>
+                                      )}
                                       <div className="flex flex-wrap gap-2">
                                         <Button
                                           type="button"

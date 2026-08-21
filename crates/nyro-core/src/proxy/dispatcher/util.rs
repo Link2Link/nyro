@@ -180,6 +180,44 @@ mod tests {
     }
 
     #[test]
+    fn runtime_identity_overrides_forwarded_client_identity() {
+        let mut client = HeaderMap::new();
+        client.insert("user-agent", HeaderValue::from_static("spoofed-client/1"));
+        client.insert("originator", HeaderValue::from_static("spoofed-origin"));
+
+        let mut runtime = crate::auth::RuntimeBinding::default();
+        runtime.extra_headers.insert(
+            "user-agent".to_string(),
+            "codex-tui/0.144.0 (Ubuntu 22.4.0; x86_64) xterm-256color".to_string(),
+        );
+        runtime
+            .extra_headers
+            .insert("originator".to_string(), "codex-tui".to_string());
+
+        let mut adapter = HeaderMap::new();
+        adapter.insert("user-agent", HeaderValue::from_static("adapter-default/1"));
+        adapter.insert(
+            "authorization",
+            HeaderValue::from_static("Bearer wrong-token"),
+        );
+        runtime.extra_headers.insert(
+            "authorization".to_string(),
+            "Bearer oauth-token".to_string(),
+        );
+
+        let mut merged = forwarded_client_headers(&client);
+        merged.extend(adapter);
+        merged.extend(runtime_binding_headers(&runtime).unwrap());
+
+        assert_eq!(
+            merged.get("user-agent").unwrap(),
+            "codex-tui/0.144.0 (Ubuntu 22.4.0; x86_64) xterm-256color"
+        );
+        assert_eq!(merged.get("originator").unwrap(), "codex-tui");
+        assert_eq!(merged.get("authorization").unwrap(), "Bearer oauth-token");
+    }
+
+    #[test]
     fn forwarded_client_headers_drop_keys_and_sensitive_network_headers() {
         let mut headers = HeaderMap::new();
         headers.insert("authorization", HeaderValue::from_static("Bearer nyro-key"));

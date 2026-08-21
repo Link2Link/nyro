@@ -74,6 +74,22 @@ fn resolve_channel_scope_takes_priority() {
 }
 
 #[test]
+fn resolve_grok_channel_scope_takes_priority() {
+    let reg = VendorRegistry::global();
+    let p = make_provider(Some("xai"), Some("grok"));
+    let ext = reg
+        .resolve(&p, OPENAI_RESPONSES_V1)
+        .expect("grok channel ext");
+    assert!(matches!(
+        ext.scope(),
+        VendorScope::Channel {
+            vendor_id: "xai",
+            channel_id: "grok",
+        }
+    ));
+}
+
+#[test]
 fn resolve_falls_back_to_vendor_when_channel_unknown() {
     let reg = VendorRegistry::global();
     let p = make_provider(Some("openai"), Some("unknown-channel"));

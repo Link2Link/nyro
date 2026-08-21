@@ -176,9 +176,15 @@ pub trait OAuthCredentialStore: Send + Sync {
     async fn complete_refresh(
         &self,
         provider_id: &str,
+        expected_version: i32,
         input: UpsertOAuthCredential,
-    ) -> anyhow::Result<OAuthCredential>;
-    async fn fail_refresh(&self, provider_id: &str, error_message: &str) -> anyhow::Result<()>;
+    ) -> anyhow::Result<Option<OAuthCredential>>;
+    async fn fail_refresh(
+        &self,
+        provider_id: &str,
+        expected_version: i32,
+        error_message: &str,
+    ) -> anyhow::Result<bool>;
     async fn list_expiring(&self, before: Duration) -> anyhow::Result<Vec<OAuthCredential>>;
     async fn recover_stale_refreshing(&self, timeout: Duration) -> anyhow::Result<u64>;
 }

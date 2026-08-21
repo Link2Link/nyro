@@ -37,7 +37,23 @@ pub(super) fn upsert_credential_from_bundle(
     bundle: &CredentialBundle,
 ) -> UpsertOAuthCredential {
     let scopes_json = serde_json::to_string(&bundle.scopes).unwrap_or_else(|_| "[]".to_string());
-    let meta_json = serde_json::to_string(&bundle.raw).unwrap_or_else(|_| "{}".to_string());
+    let mut meta = bundle.raw.clone();
+    if let Some(object) = meta.as_object_mut() {
+        // Dedicated columns are the sole persistence location for secrets.
+        // Keep this defense generic so a future driver cannot accidentally
+        // duplicate a token response into searchable/exportable metadata.
+        for key in [
+            "access_token",
+            "refresh_token",
+            "id_token",
+            "accessToken",
+            "refreshToken",
+            "idToken",
+        ] {
+            object.remove(key);
+        }
+    }
+    let meta_json = serde_json::to_string(&meta).unwrap_or_else(|_| "{}".to_string());
     UpsertOAuthCredential {
         driver_key: driver_key.to_string(),
         scheme: scheme.to_string(),
@@ -233,4 +249,40 @@ pub(super) fn normalized_optional(value: Option<&str>) -> Option<String> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToString::to_string)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn bundle_upsert_never_duplicates_tokens_in_meta() {
+        let input = upsert_credential_from_bundle(
+            "codex",
+            "oauth_auth_code_pkce",
+            &CredentialBundle {
+                access_token: Some("column-access".to_string()),
+                refresh_token: Some("column-refresh".to_string()),
+                expires_at: None,
+                resource_url: None,
+                subject_id: None,
+                scopes: vec![],
+                raw: json!({
+                    "access_token": "raw-access",
+                    "refresh_token": "raw-refresh",
+                    "id_token": "raw-id-token",
+                    "email": "user@example.com"
+                }),
+            },
+        );
+        let meta: Value = serde_json::from_str(input.meta.as_deref().unwrap()).unwrap();
+
+        assert_eq!(input.access_token, "column-access");
+        assert_eq!(input.refresh_token.as_deref(), Some("column-refresh"));
+        assert_eq!(meta["email"], "user@example.com");
+        assert!(meta.get("access_token").is_none());
+        assert!(meta.get("refresh_token").is_none());
+        assert!(meta.get("id_token").is_none());
+    }
 }
