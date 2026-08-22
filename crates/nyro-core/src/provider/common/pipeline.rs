@@ -79,7 +79,16 @@ pub(crate) fn apply_vendor_effort_policy(body: &mut Value, provider: &Provider) 
         .map(str::trim)
         .filter(|v| !v.is_empty())
         .unwrap_or_default();
-    if vendor_id.eq_ignore_ascii_case("xai") {
+    // grok 判定优先看请求体里的实际模型名：中继型 provider（如 sub2api、
+    // 国模组合）的 vendor 字段是 custom，但转发的模型仍以 grok- 开头。
+    // 模型名是跨中继最稳定的信号，比 vendor 字段可靠。
+    let body_model = body
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let is_grok = vendor_id.eq_ignore_ascii_case("xai")
+        || body_model.trim().to_ascii_lowercase().starts_with("grok-");
+    if is_grok {
         super::effort_policy::drop_grok_effort(body);
     } else if !vendor_id.is_empty() {
         super::effort_policy::normalize_enum_effort(body);
@@ -1084,6 +1093,91 @@ mod tests {
         assert_eq!(
             out.body["service_tier"], "priority",
             "IR transcode path must inject service_tier=priority for sub2api fast mode",
+        );
+    }
+
+    fn provider_with_vendor(api_key: &str, vendor: Option<&str>) -> Provider {
+        let mut provider = provider_with_api_key(api_key);
+        provider.vendor = vendor.map(str::to_string);
+        provider
+    }
+
+    /// grok 判定优先看请求体模型名：vendor=custom 的中继 provider 转发
+    /// grok-* 模型时也必须删字段（grok 拒收 none）。
+    #[tokio::test]
+    async fn passthrough_drops_effort_for_grok_model_via_relay_with_custom_vendor() {
+        let gw = build_test_gateway().await;
+        let provider = provider_with_vendor("sk-relay", Some("custom"));
+        let ctx = openai_chat_ctx(&provider, &gw, "grok-4.6-build");
+
+        let out = passthrough_run(
+            &FakeApiKeyVendor,
+            serde_json::json!({
+                "model": "grok-4.6-build",
+                "messages": [{"role":"user","content":"ping"}],
+                "reasoning_effort": "none"
+            }),
+            &ctx,
+            false,
+        )
+        .await
+        .expect("passthrough succeeds");
+
+        assert!(
+            out.body.get("reasoning_effort").is_none(),
+            "grok-* model via custom-vendor relay must have reasoning_effort dropped",
+        );
+    }
+
+    /// vendor=xai 的直连 provider 同样删字段（原有行为不回归）。
+    #[tokio::test]
+    async fn passthrough_drops_effort_for_xai_vendor_direct() {
+        let gw = build_test_gateway().await;
+        let provider = provider_with_vendor("sk-xai", Some("xai"));
+        let ctx = openai_chat_ctx(&provider, &gw, "grok-4.5");
+
+        let out = passthrough_run(
+            &FakeApiKeyVendor,
+            serde_json::json!({
+                "model": "grok-4.5",
+                "messages": [{"role":"user","content":"ping"}],
+                "reasoning_effort": "disable"
+            }),
+            &ctx,
+            false,
+        )
+        .await
+        .expect("passthrough succeeds");
+
+        assert!(
+            out.body.get("reasoning_effort").is_none(),
+            "xai vendor direct must drop every off spelling",
+        );
+    }
+
+    /// 非 grok 模型经 custom vendor 走归一路径：disable → none。
+    #[tokio::test]
+    async fn passthrough_normalizes_off_spellings_for_non_grok_models() {
+        let gw = build_test_gateway().await;
+        let provider = provider_with_vendor("sk-glm", Some("zhipuai"));
+        let ctx = openai_chat_ctx(&provider, &gw, "glm-5.3");
+
+        let out = passthrough_run(
+            &FakeApiKeyVendor,
+            serde_json::json!({
+                "model": "glm-5.3",
+                "messages": [{"role":"user","content":"ping"}],
+                "reasoning_effort": "disabled"
+            }),
+            &ctx,
+            false,
+        )
+        .await
+        .expect("passthrough succeeds");
+
+        assert_eq!(
+            out.body["reasoning_effort"], "none",
+            "non-grok model must normalize off spellings to none",
         );
     }
 
