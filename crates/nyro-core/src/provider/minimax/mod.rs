@@ -6,8 +6,8 @@ use serde_json::Value;
 
 use crate::error::GatewayError;
 use crate::protocol::ids::{
-    ProtocolId, ANTHROPIC_MESSAGES_2023_06_01, OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1,
-    OPENAI_RESPONSES_V1,
+    ANTHROPIC_MESSAGES_2023_06_01, OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1, OPENAI_RESPONSES_V1,
+    ProtocolId,
 };
 use crate::protocol::ir::{AiRequest, AiResponse};
 use crate::provider::common::openai::{

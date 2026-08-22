@@ -56,9 +56,10 @@ impl RequestEncoder for AnthropicEncoder {
             // counterpart is missing, which Anthropic rejects with a 400.
             // Native Anthropic requests (and IR built directly by callers) keep
             // their messages verbatim.
-            let needs_pairing_repair = req.meta.source_protocol.is_some_and(|p| {
-                p != crate::protocol::ids::ANTHROPIC_MESSAGES_2023_06_01
-            });
+            let needs_pairing_repair = req
+                .meta
+                .source_protocol
+                .is_some_and(|p| p != crate::protocol::ids::ANTHROPIC_MESSAGES_2023_06_01);
             Value::Array(if needs_pairing_repair {
                 prune_unpaired_tool_blocks(normalized)
             } else {
@@ -752,8 +753,8 @@ fn prune_unpaired_tool_blocks(messages: Vec<Value>) -> Vec<Value> {
         };
         let kept: Vec<Value> = blocks
             .iter()
-            .filter(|b| {
-                match b.get("type").and_then(Value::as_str).unwrap_or("") {
+            .filter(
+                |b| match b.get("type").and_then(Value::as_str).unwrap_or("") {
                     "tool_use" | "server_tool_use" => b
                         .get("id")
                         .and_then(Value::as_str)
@@ -765,8 +766,8 @@ fn prune_unpaired_tool_blocks(messages: Vec<Value>) -> Vec<Value> {
                         .map(|id| use_ids.contains(&normalize_anthropic_tool_id(id)))
                         .unwrap_or(false),
                     _ => true,
-                }
-            })
+                },
+            )
             .cloned()
             .collect();
         if kept.is_empty() {

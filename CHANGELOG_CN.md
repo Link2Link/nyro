@@ -4,6 +4,47 @@ Nyro 的所有重要变更均记录在此文件中。
 
 ---
 
+## v2.0.4
+
+> 发布于 2026-08-22
+
+#### 新功能
+
+- **cc-switch 兼容引擎**：新增 `nyro-ccswitch-compat`，机械移植 cc-switch 协议转换核心；请求接入保留原始字节，命中协议组合时 dispatcher 绕过 IR 走线级转换
+- **Claude Code 2.8 协议支持**：新增 `server_tool_use` / `redacted_thinking` 块，保留上游工具结果 id，透传 `speed` 字段以支持 Fast 模式
+- **Kimi Code 供应商**：新增共享密钥多协议通道（OpenAI 兼容 + Anthropic Messages）
+- **Opencode Go 供应商**：新增 OpenAI 兼容渠道与模型发现
+- **Ark Coding 供应商**：新增火山方舟编码套餐，含用量查询与模型探测
+- **OpenAI sub2api 渠道与 Codex Fast 模式**：新增 openai-responses 预设、Fast 模式开关，以及 `priority` 服务等级注入
+- **Grok OAuth 渠道**：接入 xAI Grok 订阅 OAuth 驱动、绑定/刷新流程，并增强用量展示
+- **xAI openai-responses 端点**：Codex 客户端可通过原生 Responses 协议直连 xAI
+- **LAN 鉴权模式**：新增 `--lan` / `--proxy-auth-key`，局域网/容器暴露时代理数据面强制 Bearer 鉴权
+- **供应商配额调度**：跳过配额耗尽的供应商，收到 429 时立即刷新用量
+- **可用模型页面**：按供应商分组展示探测结果与用量统计；原页面更名为模型映射
+- **DeepSeek 消费查询**：查询今日/本月消费，用量条增加匀速参考线
+- **日志首字延迟列**：日志表与详情页在耗时旁展示 TTFT
+
+#### 优化 / 重构
+
+- **自适应 Token 时序统计**：按时间范围分桶（6h/5min、24h/15min、3d/30min、7d/60min），空闲时段补零
+- **Responses 工具默认值**：为 function 工具补齐缺失的 `strict` 与 `parameters`（`type: object`）
+- **健康检查**：改为 `HealthPermit` 生命周期绑定，流式健康状态延迟判定
+- **本地启动文档**：新增 `start-local.sh`，并补充源码构建与手动启动命令
+- **DeepSeek / MiniMax / GLM Responses**：上述供应商扩展 OpenAI Responses 协议；GLM 更名为 Zhipu AI
+
+#### 修复
+
+- **强制压缩的上游响应**：缓冲路径在 JSON 解析前解压 gzip/deflate/zstd/br
+- **转换失败状态码**：返回真实面向客户端的状态码，不再一律 500
+- **强制上游流式**：注入 `stream: true`，上游忽略时回退到完整 JSON 解码
+- **Responses 出口的 Chat `stream_options`**：过滤聊天用量流选项，保留原生混淆选项
+- **火山引擎 glm 档位改写**：vendor 补丁之后将 glm-5.3 的 `effort` 改写为 `low` 并强制重编码
+- **火山引擎 / OpenCode 五小时用量窗口**：保留 5 小时滚动窗，不再被丢弃
+- **MiniMax 推理正文泄漏**：默认关闭推理、拆分推理输出，并正确关闭 M3 思考
+- **Anthropic 工具配对修剪**：去掉未配对的工具结果，避免上游 400
+
+---
+
 ## v2.0.3
 
 > 发布于 2026-08-12

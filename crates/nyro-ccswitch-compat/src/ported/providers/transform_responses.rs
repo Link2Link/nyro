@@ -2119,8 +2119,14 @@ mod tests {
         let result = anthropic_to_responses(input, None, false, true).unwrap();
 
         assert_eq!(result["service_tier"], json!("priority"));
-        assert!(result.get("store").is_none(), "standard upstream must not get codex store=false");
-        assert!(result.get("include").is_none(), "standard upstream must not get codex include");
+        assert!(
+            result.get("store").is_none(),
+            "standard upstream must not get codex store=false"
+        );
+        assert!(
+            result.get("include").is_none(),
+            "standard upstream must not get codex include"
+        );
     }
 
     #[test]

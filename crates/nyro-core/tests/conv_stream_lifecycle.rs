@@ -44,7 +44,8 @@ fn reasoning_start() -> StreamDelta {
 
 /// Collect the `output_index → item type` map as opened by `output_item.added`.
 fn opened_types(jsons: &[Value]) -> std::collections::HashMap<usize, String> {
-    jsons.iter()
+    jsons
+        .iter()
         .filter(|j| j.get("type").and_then(Value::as_str) == Some("response.output_item.added"))
         .filter_map(|j| {
             let idx = j.get("output_index").and_then(Value::as_u64)? as usize;
@@ -119,7 +120,9 @@ fn stream_reasoning_only_synthesizes_visible_text() {
         .find(|j| j.get("type").and_then(Value::as_str) == Some("response.incomplete"))
         .expect("max_tokens truncation must surface as response.incomplete");
     assert_eq!(
-        completed.pointer("/response/status").and_then(Value::as_str),
+        completed
+            .pointer("/response/status")
+            .and_then(Value::as_str),
         Some("incomplete")
     );
     assert_eq!(
@@ -161,7 +164,9 @@ fn stream_reasoning_only_blank_does_not_synthesize() {
         .find(|j| j.get("type").and_then(Value::as_str) == Some("response.completed"))
         .expect("response.completed");
     assert_eq!(
-        completed.pointer("/response/status").and_then(Value::as_str),
+        completed
+            .pointer("/response/status")
+            .and_then(Value::as_str),
         Some("completed")
     );
 }
@@ -324,8 +329,7 @@ fn stream_tool_call_arguments_in_first_chunk_not_doubled() {
         .filter_map(|j| j.get("delta").and_then(Value::as_str))
         .collect();
     assert_eq!(
-        accumulated,
-        "{\"cmd\":\"ls\"}",
+        accumulated, "{\"cmd\":\"ls\"}",
         "accumulated deltas must equal the final arguments exactly (no duplication): {jsons:?}"
     );
 }
@@ -349,7 +353,9 @@ fn stream_max_tokens_maps_to_incomplete() {
         .find(|j| j.get("type").and_then(Value::as_str) == Some("response.incomplete"))
         .expect("max_tokens must map to response.incomplete");
     assert_eq!(
-        incomplete.pointer("/response/status").and_then(Value::as_str),
+        incomplete
+            .pointer("/response/status")
+            .and_then(Value::as_str),
         Some("incomplete")
     );
     assert_eq!(
@@ -386,13 +392,13 @@ fn stream_end_turn_maps_to_completed() {
         .find(|j| j.get("type").and_then(Value::as_str) == Some("response.completed"))
         .expect("end_turn must map to response.completed");
     assert_eq!(
-        completed.pointer("/response/status").and_then(Value::as_str),
+        completed
+            .pointer("/response/status")
+            .and_then(Value::as_str),
         Some("completed")
     );
     assert!(
-        completed
-            .pointer("/response/incomplete_details")
-            .is_none(),
+        completed.pointer("/response/incomplete_details").is_none(),
         "completed must not carry incomplete_details: {jsons:?}"
     );
 }

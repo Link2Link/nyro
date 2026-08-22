@@ -83,7 +83,9 @@ impl GrokOAuthDriver {
             .channels
             .iter()
             .find(|c| c.id == GROK_CHANNEL_ID)
-            .ok_or_else(|| anyhow!("missing provider channel: {XAI_PRESET_ID}/{GROK_CHANNEL_ID}"))?;
+            .ok_or_else(|| {
+                anyhow!("missing provider channel: {XAI_PRESET_ID}/{GROK_CHANNEL_ID}")
+            })?;
         Ok(GrokConfig {
             oauth: channel.oauth.as_ref().ok_or_else(|| {
                 anyhow!("missing oauth config for {XAI_PRESET_ID}/{GROK_CHANNEL_ID}")
@@ -601,8 +603,14 @@ mod tests {
     fn grok_build_code_without_state_is_accepted() {
         assert!(grok_exchange_state_ok("session-state", None));
         assert!(grok_exchange_state_ok("session-state", Some("")));
-        assert!(grok_exchange_state_ok("session-state", Some("session-state")));
-        assert!(!grok_exchange_state_ok("session-state", Some("other-state")));
+        assert!(grok_exchange_state_ok(
+            "session-state",
+            Some("session-state")
+        ));
+        assert!(!grok_exchange_state_ok(
+            "session-state",
+            Some("other-state")
+        ));
     }
 
     #[test]
@@ -633,7 +641,10 @@ mod tests {
             "xai-grok-cli"
         );
         assert_eq!(
-            binding.extra_headers.get("x-grok-client-identifier").unwrap(),
+            binding
+                .extra_headers
+                .get("x-grok-client-identifier")
+                .unwrap(),
             "grok-shell"
         );
         assert_eq!(

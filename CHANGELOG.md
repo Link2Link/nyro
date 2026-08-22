@@ -4,6 +4,47 @@ All notable changes to Nyro will be documented in this file.
 
 ---
 
+## v2.0.4
+
+> Released on 2026-08-22
+
+#### Features
+
+- **cc-switch compatibility engine**: add `nyro-ccswitch-compat` with a mechanical port of the cc-switch conversion core, raw-byte intake, and dispatcher routing that bypasses IR on matched protocol pairs
+- **Claude Code 2.8 protocol support**: add `server_tool_use` / `redacted_thinking` blocks, preserve upstream tool-result ids, and pass through the `speed` field for Fast mode
+- **Kimi Code provider**: add a shared-key multi-protocol channel (OpenAI-compatible + Anthropic Messages)
+- **Opencode Go provider**: add an OpenAI-compatible channel with model discovery
+- **Ark Coding provider**: add the Volcengine Ark coding package with usage query and model probing
+- **OpenAI sub2api channel and Codex Fast mode**: add an openai-responses preset, a Fast mode switch, and `priority` service-tier injection
+- **Grok OAuth channel**: add an xAI Grok subscription OAuth driver, bind/refresh flow, and usage enhancements
+- **xAI openai-responses endpoint**: let Codex clients talk to xAI over native Responses
+- **LAN auth mode**: add `--lan` / `--proxy-auth-key` so the proxy data plane requires Bearer auth on LAN/container exposure
+- **Provider quota scheduling**: skip quota-exhausted providers and refresh usage immediately on 429
+- **Available models page**: add a provider-grouped catalog with probe results and usage stats; rename the previous page to Model Mapping
+- **DeepSeek consumption query**: query daily/monthly spend and show an even-speed usage reference line
+- **Log TTFT column**: show time-to-first-token beside duration in the log table and detail view
+
+#### Improvements / Refactoring
+
+- **Adaptive token time-series**: range-dependent buckets (6h/5min, 24h/15min, 3d/30min, 7d/60min) with zero-filled idle gaps
+- **Responses tool defaults**: fill missing `strict` and `parameters` (`type: object`) on function tools
+- **Health checks**: bind health to a `HealthPermit` lifecycle and delay streaming health judgment
+- **Local startup docs**: add `start-local.sh` and source-build / manual-start commands
+- **DeepSeek / MiniMax / GLM Responses**: extend those vendors to the OpenAI Responses protocol; rename GLM to Zhipu AI
+
+#### Fixes
+
+- **Forced-compressed upstream responses**: decompress gzip/deflate/zstd/br on the buffered path before JSON parse
+- **Conversion failure status codes**: return the real client-facing status instead of a generic 500
+- **Forced upstream streaming**: inject `stream: true` and fall back to full JSON decode when the upstream ignores it
+- **Chat `stream_options` on Responses egress**: strip Chat-only stream usage options while keeping native obfuscation options
+- **Volcengine glm effort rewrite**: rewrite `effort → low` for glm-5.3 after vendor patches and force re-encode
+- **Volcengine / OpenCode 5-hour usage window**: keep the rolling 5-hour window instead of dropping it
+- **MiniMax reasoning leakage**: default reasoning off, split reasoning from the main body, and close M3 thinking correctly
+- **Anthropic tool-pairing pruning**: drop unpaired tool results to avoid upstream 400s
+
+---
+
 ## v2.0.3
 
 > Released on 2026-08-12

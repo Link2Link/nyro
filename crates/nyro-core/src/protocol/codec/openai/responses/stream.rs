@@ -334,11 +334,7 @@ impl ResponsesStreamFormatter {
                 serde_json::json!({"reason": "max_output_tokens"}),
             )
         } else {
-            (
-                "response.completed",
-                "completed",
-                serde_json::Value::Null,
-            )
+            ("response.completed", "completed", serde_json::Value::Null)
         };
 
         let mut completed = serde_json::json!({

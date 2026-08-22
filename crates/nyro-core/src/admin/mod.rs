@@ -42,8 +42,8 @@ pub use model_catalog::{
 };
 use model_data::*;
 pub use providers::{ProviderModelProbeMeta, ProviderModelProbeOutcome, ProviderModelProbeResult};
-pub(crate) use usage::{run_provider_usage_monitor, trigger_provider_usage_refresh};
 pub use usage::{ProviderUsage, ProviderUsageBalance, ProviderUsageTier};
+pub(crate) use usage::{run_provider_usage_monitor, trigger_provider_usage_refresh};
 
 #[cfg(test)]
 mod session_tests;

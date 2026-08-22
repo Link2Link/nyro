@@ -334,7 +334,12 @@ async fn run_standalone(config_path: &str, args: &Args) -> anyhow::Result<()> {
 
     // --lan overrides the YAML server section and requires proxy auth.
     let proxy_host = if args.lan {
-        if args.proxy_auth_key.as_deref().map(str::trim).is_none_or(str::is_empty) {
+        if args
+            .proxy_auth_key
+            .as_deref()
+            .map(str::trim)
+            .is_none_or(str::is_empty)
+        {
             anyhow::bail!(
                 "--lan requires --proxy-auth-key (or NYRO_PROXY_AUTH_KEY): \
                  exposing the proxy without auth would let any LAN device call your models"
@@ -412,7 +417,12 @@ async fn run_full(args: &Args) -> anyhow::Result<()> {
 
     // ── LAN mode: bind every listener to 0.0.0.0 and refuse to run without auth ──
     let (proxy_host, admin_host) = if args.lan {
-        if args.proxy_auth_key.as_deref().map(str::trim).is_none_or(str::is_empty) {
+        if args
+            .proxy_auth_key
+            .as_deref()
+            .map(str::trim)
+            .is_none_or(str::is_empty)
+        {
             anyhow::bail!(
                 "--lan requires --proxy-auth-key (or NYRO_PROXY_AUTH_KEY): \
                  exposing the proxy without auth would let any LAN device call your models"

@@ -211,10 +211,8 @@ mod tests {
 
     async fn spawn_proxy_with_auth(auth_key: &str) -> String {
         let config = GatewayConfig {
-            data_dir: std::env::temp_dir().join(format!(
-                "nyro-proxy-auth-test-{}",
-                uuid::Uuid::new_v4()
-            )),
+            data_dir: std::env::temp_dir()
+                .join(format!("nyro-proxy-auth-test-{}", uuid::Uuid::new_v4())),
             auth_key: Some(auth_key.to_string()),
             ..Default::default()
         };

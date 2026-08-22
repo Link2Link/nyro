@@ -72,7 +72,7 @@
         "runtime": {
           "apiBaseUrl": "https://chatgpt.com/backend-api/codex",
           "modelsUrl": "https://chatgpt.com/backend-api/codex/models",
-          "modelsClientVersion": "0.99.0"
+          "modelsClientVersion": "0.146.0"
         }
       }
     ]

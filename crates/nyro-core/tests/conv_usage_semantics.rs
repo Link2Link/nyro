@@ -78,10 +78,7 @@ fn anthropic_formatter_reverses_gross_to_net_on_egress() {
     let out = format_response(P::AnthropicMessages, &resp);
     assert_eq!(field(&out, "/usage/input_tokens"), &json!(3318));
     assert_eq!(field(&out, "/usage/output_tokens"), &json!(512));
-    assert_eq!(
-        field(&out, "/usage/cache_read_input_tokens"),
-        &json!(3100)
-    );
+    assert_eq!(field(&out, "/usage/cache_read_input_tokens"), &json!(3100));
     assert_eq!(
         field(&out, "/usage/cache_creation_input_tokens"),
         &json!(96)

@@ -993,10 +993,12 @@ async fn fetch_grok_billing(
     access_token: &str,
     extra_headers: &std::collections::HashMap<String, String>,
 ) -> anyhow::Result<Value> {
-    let base = base_url_override
-        .trim()
-        .trim_end_matches('/');
-    let base = if base.is_empty() { GROK_BILLING_BASE } else { base };
+    let base = base_url_override.trim().trim_end_matches('/');
+    let base = if base.is_empty() {
+        GROK_BILLING_BASE
+    } else {
+        base
+    };
     // base_url_override is `…/v1` (cli-chat-proxy) so paths are appended
     // directly; guard against a base that lost its `/v1` prefix.
     let base = if base.ends_with("/v1") || base.ends_with('/') {
@@ -1020,9 +1022,7 @@ async fn fetch_grok_billing(
             .header("x-grok-client-identifier", GROK_BILLING_CLIENT_IDENTIFIER)
             .header(reqwest::header::USER_AGENT, GROK_BILLING_USER_AGENT);
         for (key, value) in extra_headers {
-            if key.eq_ignore_ascii_case("authorization")
-                || key.eq_ignore_ascii_case("user-agent")
-            {
+            if key.eq_ignore_ascii_case("authorization") || key.eq_ignore_ascii_case("user-agent") {
                 continue;
             }
             request = request.header(key, value);
@@ -1039,9 +1039,11 @@ async fn fetch_grok_billing(
         if !status.is_success() {
             let preview: String = String::from_utf8_lossy(&raw).chars().take(240).collect();
             match status {
-                reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN => anyhow::bail!(
-                    "Grok authentication failed (HTTP {status}); re-authorize this provider"
-                ),
+                reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN => {
+                    anyhow::bail!(
+                        "Grok authentication failed (HTTP {status}); re-authorize this provider"
+                    )
+                }
                 reqwest::StatusCode::TOO_MANY_REQUESTS => {
                     anyhow::bail!("Grok billing endpoint is rate limited (HTTP 429)")
                 }
@@ -1113,7 +1115,8 @@ fn parse_grok_billing(body: &Value) -> (Option<String>, Vec<ProviderUsageTier>, 
         });
     }
 
-    let monthly_limit = monthly.and_then(|monthly| grok_billing_number(monthly.get("monthlyLimit")));
+    let monthly_limit =
+        monthly.and_then(|monthly| grok_billing_number(monthly.get("monthlyLimit")));
     // Mirror Sub2API: when the weekly window is primary and the monthly
     // response carries no limit, skip the monthly bar to avoid duplicating a
     // weekly-only view.
@@ -1139,16 +1142,15 @@ fn parse_grok_billing(body: &Value) -> (Option<String>, Vec<ProviderUsageTier>, 
         });
     }
 
-    let level = monthly_limit
-        .map(|limit| {
-            if (limit - GROK_BILLING_PLAN_SUPERGROK_HEAVY).abs() < f64::EPSILON {
-                "SuperGrok Heavy".to_string()
-            } else if (limit - GROK_BILLING_PLAN_SUPERGROK).abs() < f64::EPSILON {
-                "SuperGrok".to_string()
-            } else {
-                "SuperGrok".to_string()
-            }
-        });
+    let level = monthly_limit.map(|limit| {
+        if (limit - GROK_BILLING_PLAN_SUPERGROK_HEAVY).abs() < f64::EPSILON {
+            "SuperGrok Heavy".to_string()
+        } else if (limit - GROK_BILLING_PLAN_SUPERGROK).abs() < f64::EPSILON {
+            "SuperGrok".to_string()
+        } else {
+            "SuperGrok".to_string()
+        }
+    });
 
     // Weekly `creditUsagePercent` (or a monthly limit) is an authoritative
     // observation; without either the account has no billable plan.
@@ -1901,15 +1903,11 @@ mod tests {
         );
         assert_eq!(UsageBackend::detect(&structured), Some(Grok));
 
-        let channel_only = provider_for_usage(None, None, Some("grok"), "https://example.invalid/v1");
+        let channel_only =
+            provider_for_usage(None, None, Some("grok"), "https://example.invalid/v1");
         assert_eq!(UsageBackend::detect(&channel_only), None);
 
-        let imported = provider_for_usage(
-            None,
-            None,
-            None,
-            "https://cli-chat-proxy.grok.com/v1",
-        );
+        let imported = provider_for_usage(None, None, None, "https://cli-chat-proxy.grok.com/v1");
         assert_eq!(UsageBackend::detect(&imported), Some(Grok));
 
         let ordinary_xai = provider_for_usage(

@@ -1348,7 +1348,10 @@ mod tests {
         });
 
         let result = anthropic_to_gemini(input).unwrap();
-        assert_eq!(result["generationConfig"]["thinkingConfig"]["thinkingLevel"], "high");
+        assert_eq!(
+            result["generationConfig"]["thinkingConfig"]["thinkingLevel"],
+            "high"
+        );
     }
 
     #[test]
@@ -1390,7 +1393,10 @@ mod tests {
         });
 
         let result = anthropic_to_gemini(input).unwrap();
-        assert_eq!(result["generationConfig"]["thinkingConfig"]["thinkingBudget"], 0);
+        assert_eq!(
+            result["generationConfig"]["thinkingConfig"]["thinkingBudget"],
+            0
+        );
     }
 
     #[test]

@@ -253,7 +253,10 @@ fn anthropic_pairing_single_call() {
 
     let messages = body.pointer("/messages").unwrap().as_array().unwrap();
     // user, assistant(tool_use), user(tool_result), assistant(text)
-    assert!(messages.len() >= 4, "expected at least 4 messages: {messages:?}");
+    assert!(
+        messages.len() >= 4,
+        "expected at least 4 messages: {messages:?}"
+    );
     assert_eq!(messages[0]["role"].as_str(), Some("user"));
     assert!(
         tool_use_ids(&blocks_of(&messages[1]))
