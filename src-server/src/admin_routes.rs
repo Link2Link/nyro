@@ -54,6 +54,7 @@ pub fn create_router(gateway: Gateway, admin_token: Option<String>) -> Router {
     let mut api = Router::new()
         .route("/system/extensions", get(list_loaded_extensions))
         .route("/providers/presets", get(list_provider_presets))
+        .route("/providers/usage", get(list_provider_usage_handler))
         .route(
             "/providers",
             get(list_providers).post(create_provider_handler),
@@ -324,6 +325,13 @@ async fn provider_usage_handler(
     match gw.admin().get_provider_usage(&id).await {
         Ok(v) => Json(serde_json::json!({ "data": v })).into_response(),
         Err(e) => usage_err(e),
+    }
+}
+
+async fn list_provider_usage_handler(State(gw): State<Gateway>) -> impl IntoResponse {
+    match gw.admin().list_provider_usage().await {
+        Ok(v) => Json(serde_json::json!({ "data": v })).into_response(),
+        Err(e) => err(e),
     }
 }
 

@@ -83,6 +83,7 @@ pub fn run() {
             commands::get_provider_models,
             commands::get_model_capabilities,
             commands::get_provider_usage,
+            commands::list_provider_usage,
             commands::init_oauth_session,
             commands::get_oauth_session_status,
             commands::cancel_oauth_session,

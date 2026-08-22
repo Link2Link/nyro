@@ -82,6 +82,8 @@ function resolveHTTP(cmd: string, args?: Record<string, unknown>): HTTPMapping {
       return { method: "GET", url: `${base}/providers/${args?.id}/test` };
     case "get_provider_usage":
       return { method: "GET", url: `${base}/providers/${args?.id}/usage` };
+    case "list_provider_usage":
+      return { method: "GET", url: `${base}/providers/usage` };
     case "get_provider_usage_credentials":
       return { method: "GET", url: `${base}/providers/${args?.id}/usage-credentials` };
     case "set_provider_usage_credentials":

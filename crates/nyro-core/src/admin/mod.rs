@@ -42,7 +42,10 @@ pub use model_catalog::{
 };
 use model_data::*;
 pub use providers::{ProviderModelProbeMeta, ProviderModelProbeOutcome, ProviderModelProbeResult};
-pub use usage::{ProviderUsage, ProviderUsageBalance, ProviderUsageTier};
+pub use usage::{
+    ProviderUsage, ProviderUsageBalance, ProviderUsageListItem, ProviderUsageQueryStatus,
+    ProviderUsageTier,
+};
 pub(crate) use usage::{run_provider_usage_monitor, trigger_provider_usage_refresh};
 
 #[cfg(test)]

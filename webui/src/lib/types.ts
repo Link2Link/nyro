@@ -576,6 +576,18 @@ export interface ProviderScheduling {
   next_check_at?: string | null;
 }
 
+export type ProviderUsageQueryStatus = "ok" | "unsupported" | "error";
+
+/** One row from `GET /api/v1/providers/usage`. */
+export interface ProviderUsageListItem {
+  provider_id: string;
+  provider_name: string;
+  is_enabled: boolean;
+  status: ProviderUsageQueryStatus;
+  error?: string | null;
+  usage?: ProviderUsage | null;
+}
+
 export interface ProviderUsage {
   provider_id: string;
   /** Query backend kind, e.g. `glm_coding_plan`. */

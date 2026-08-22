@@ -107,6 +107,16 @@ pub async fn get_provider_usage(
 }
 
 #[tauri::command]
+pub async fn list_provider_usage(
+    gw: State<'_, Gateway>,
+) -> Result<Vec<nyro_core::admin::ProviderUsageListItem>, String> {
+    gw.admin()
+        .list_provider_usage()
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 pub async fn test_provider_models(
     gw: State<'_, Gateway>,
     id: String,

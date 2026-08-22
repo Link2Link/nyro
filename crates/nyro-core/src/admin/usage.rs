@@ -77,6 +77,8 @@ const OPENCODE_GO_USAGE_URL: &str = "https://opencode.ai/zen/go/v1/usage";
 /// a provider's inference Base URL must never redirect quota credentials.
 const OPENAI_CODEX_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
 const OPENAI_CODEX_USAGE_TIMEOUT: Duration = Duration::from_secs(20);
+/// Max concurrent upstream usage queries when listing every provider.
+const LIST_USAGE_CONCURRENCY: usize = 4;
 const OPENAI_CODEX_BETA: &str = "codex-1";
 const OPENAI_CODEX_ORIGINATOR: &str = "Codex Desktop";
 const OPENAI_CODEX_LANGUAGE: &str = "zh-CN";
@@ -133,7 +135,7 @@ pub struct ProviderUsageSpend {
     pub currency: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct ProviderUsage {
     pub provider_id: String,
     /// Query backend kind: `glm_coding_plan` | `minimax_coding_plan` |
@@ -154,6 +156,65 @@ pub struct ProviderUsage {
     /// Runtime scheduling decision derived from this usage snapshot.
     pub scheduling: ProviderScheduling,
     pub queried_at: String,
+}
+
+/// Outcome of a single provider row in [`AdminService::list_provider_usage`].
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderUsageQueryStatus {
+    Ok,
+    Unsupported,
+    Error,
+}
+
+/// One provider in the bulk usage listing. Downstream display clients should
+/// treat `status` as the discriminator: `usage` is present only on `ok`,
+/// `error` only on `error`. Unsupported vendors (no coding-plan / balance
+/// backend) are included so a single call covers every configured provider.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct ProviderUsageListItem {
+    pub provider_id: String,
+    pub provider_name: String,
+    pub is_enabled: bool,
+    pub status: ProviderUsageQueryStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<ProviderUsage>,
+}
+
+impl ProviderUsageListItem {
+    fn unsupported(provider: &Provider) -> Self {
+        Self {
+            provider_id: provider.id.clone(),
+            provider_name: provider.name.clone(),
+            is_enabled: provider.is_enabled,
+            status: ProviderUsageQueryStatus::Unsupported,
+            error: None,
+            usage: None,
+        }
+    }
+
+    fn from_result(provider: &Provider, result: anyhow::Result<ProviderUsage>) -> Self {
+        match result {
+            Ok(usage) => Self {
+                provider_id: provider.id.clone(),
+                provider_name: provider.name.clone(),
+                is_enabled: provider.is_enabled,
+                status: ProviderUsageQueryStatus::Ok,
+                error: None,
+                usage: Some(usage),
+            },
+            Err(error) => Self {
+                provider_id: provider.id.clone(),
+                provider_name: provider.name.clone(),
+                is_enabled: provider.is_enabled,
+                status: ProviderUsageQueryStatus::Error,
+                error: Some(error.to_string()),
+                usage: None,
+            },
+        }
+    }
 }
 
 /// The coding-plan usage backend inferred from a provider's base URL.
@@ -1270,6 +1331,46 @@ impl AdminService {
     ///   Bearer key.
     pub async fn get_provider_usage(&self, id: &str) -> anyhow::Result<ProviderUsage> {
         self.refresh_provider_usage(id, UsageQueryMode::Full).await
+    }
+
+    /// Query usage for every configured provider.
+    ///
+    /// Providers without a usage backend are returned as `unsupported`.
+    /// Query failures are returned as `error` items so one vendor outage
+    /// cannot fail the whole list. Upstream calls run concurrently with
+    /// [`LIST_USAGE_CONCURRENCY`].
+    pub async fn list_provider_usage(&self) -> anyhow::Result<Vec<ProviderUsageListItem>> {
+        let providers = self.list_providers().await?;
+        let mut items: Vec<Option<ProviderUsageListItem>> = vec![None; providers.len()];
+        let mut jobs = Vec::new();
+        for (index, provider) in providers.into_iter().enumerate() {
+            if UsageBackend::detect(&provider).is_none() {
+                items[index] = Some(ProviderUsageListItem::unsupported(&provider));
+                continue;
+            }
+            jobs.push((index, provider));
+        }
+
+        let queried = stream::iter(jobs)
+            .map(|(index, provider)| {
+                let admin = self.clone();
+                async move {
+                    let result = admin.get_provider_usage(&provider.id).await;
+                    (index, ProviderUsageListItem::from_result(&provider, result))
+                }
+            })
+            .buffer_unordered(LIST_USAGE_CONCURRENCY)
+            .collect::<Vec<_>>()
+            .await;
+
+        for (index, item) in queried {
+            items[index] = Some(item);
+        }
+
+        Ok(items
+            .into_iter()
+            .map(|item| item.expect("every provider slot is filled"))
+            .collect())
     }
 
     async fn refresh_provider_usage(
@@ -2834,5 +2935,104 @@ mod tests {
         assert!(parse_opencode_tiers(&no_percent).is_empty());
         // No usage object at all.
         assert!(parse_opencode_tiers(&serde_json::json!({})).is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_provider_usage_empty_when_no_providers() {
+        let storage: crate::storage::DynStorage =
+            std::sync::Arc::new(crate::storage::MemoryStorage::new(vec![], vec![], vec![]));
+        let (gw, _log_rx) =
+            crate::Gateway::from_storage(crate::config::GatewayConfig::default(), storage)
+                .await
+                .unwrap();
+        let items = gw.admin().list_provider_usage().await.unwrap();
+        assert!(items.is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_provider_usage_marks_unsupported_and_local_errors() {
+        let unsupported = {
+            let mut provider = provider_for_usage(
+                Some("openai"),
+                Some("openai"),
+                Some("default"),
+                "https://api.openai.com/v1",
+            );
+            provider.id = "openai".to_string();
+            provider.name = "OpenAI".to_string();
+            provider.auth_mode = "apikey".to_string();
+            provider.api_key = "sk-test".to_string();
+            provider.protocol = "openai-compatible".to_string();
+            provider
+        };
+        let glm_missing_key = {
+            let mut provider = provider_for_usage(
+                Some("zhipuai"),
+                Some("zhipuai"),
+                Some("coding"),
+                "https://open.bigmodel.cn/api/coding/paas/v4",
+            );
+            provider.id = "glm".to_string();
+            provider.name = "GLM".to_string();
+            provider.auth_mode = "apikey".to_string();
+            provider.api_key.clear();
+            provider.protocol = "openai-compatible".to_string();
+            provider
+        };
+        let disabled_kimi = {
+            let mut provider = provider_for_usage(
+                Some("kimi-code"),
+                Some("kimi-code"),
+                Some("default"),
+                "https://api.kimi.com/coding",
+            );
+            provider.id = "kimi".to_string();
+            provider.name = "Kimi".to_string();
+            provider.auth_mode = "apikey".to_string();
+            provider.api_key.clear();
+            provider.is_enabled = false;
+            provider.protocol = "openai-compatible".to_string();
+            provider
+        };
+
+        let storage: crate::storage::DynStorage = std::sync::Arc::new(
+            crate::storage::MemoryStorage::new(
+                vec![unsupported, glm_missing_key, disabled_kimi],
+                vec![],
+                vec![],
+            ),
+        );
+        let (gw, _log_rx) =
+            crate::Gateway::from_storage(crate::config::GatewayConfig::default(), storage)
+                .await
+                .unwrap();
+        let items = gw.admin().list_provider_usage().await.unwrap();
+        assert_eq!(items.len(), 3);
+
+        assert_eq!(items[0].provider_id, "openai");
+        assert_eq!(items[0].provider_name, "OpenAI");
+        assert_eq!(items[0].status, ProviderUsageQueryStatus::Unsupported);
+        assert!(items[0].usage.is_none());
+        assert!(items[0].error.is_none());
+
+        assert_eq!(items[1].provider_id, "glm");
+        assert_eq!(items[1].status, ProviderUsageQueryStatus::Error);
+        assert!(
+            items[1]
+                .error
+                .as_deref()
+                .is_some_and(|message| message.contains("api key is empty"))
+        );
+        assert!(items[1].usage.is_none());
+
+        assert_eq!(items[2].provider_id, "kimi");
+        assert!(!items[2].is_enabled);
+        assert_eq!(items[2].status, ProviderUsageQueryStatus::Error);
+        assert!(
+            items[2]
+                .error
+                .as_deref()
+                .is_some_and(|message| message.contains("api key is empty"))
+        );
     }
 }
