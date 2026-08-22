@@ -1,7 +1,13 @@
 name: Release
-run-name: Release ${{ inputs.version }} (publish=${{ inputs.publish }}, desktop=${{ inputs.build_desktop }})
+run-name: >-
+  Release ${{ github.event_name == 'push' && github.ref_name || inputs.version }}
+  (publish=${{ github.event_name == 'push' && 'true' || inputs.publish }},
+  desktop=${{ github.event_name == 'push' && 'false' || inputs.build_desktop }})
 
 on:
+  push:
+    tags:
+      - "v*.*.*"
   workflow_dispatch:
     inputs:
       version:
@@ -14,7 +20,7 @@ on:
         default: false
         type: boolean
       publish:
-        description: "Create the tag and GitHub Release"
+        description: "Create the GitHub Release (tag already exists on a tag push)"
         required: true
         default: false
         type: boolean
@@ -23,7 +29,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: release-${{ inputs.version }}
+  group: release-${{ github.event_name == 'push' && github.ref_name || inputs.version }}
   cancel-in-progress: false
 
 jobs:
@@ -34,25 +40,41 @@ jobs:
     outputs:
       version: ${{ steps.version.outputs.version }}
       package_version: ${{ steps.version.outputs.package_version }}
+      publish: ${{ steps.version.outputs.publish }}
+      build_desktop: ${{ steps.version.outputs.build_desktop }}
 
     steps:
       - name: Checkout
         uses: actions/checkout@v7
 
-      - name: Validate version and source branch
+      - name: Validate version and source
         id: version
         shell: bash
         env:
-          VERSION: ${{ inputs.version }}
-          PUBLISH: ${{ github.event.inputs.publish }}
+          EVENT_NAME: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          REF_NAME: ${{ github.ref_name }}
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_PUBLISH: ${{ inputs.publish }}
+          INPUT_BUILD_DESKTOP: ${{ inputs.build_desktop }}
         run: |
+          if [[ "$EVENT_NAME" == "push" ]]; then
+            VERSION="$REF_NAME"
+            PUBLISH="true"
+            BUILD_DESKTOP="false"
+          else
+            VERSION="$INPUT_VERSION"
+            PUBLISH="$INPUT_PUBLISH"
+            BUILD_DESKTOP="$INPUT_BUILD_DESKTOP"
+          fi
+
           if [[ ! "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
             echo "Invalid version: $VERSION (expected vX.Y.Z)" >&2
             exit 1
           fi
 
-          if [[ "$PUBLISH" == "true" && "$GITHUB_REF" != "refs/heads/master" ]]; then
-            echo "Published releases must run from master; current ref is $GITHUB_REF" >&2
+          if [[ "$EVENT_NAME" == "workflow_dispatch" && "$PUBLISH" == "true" && "$REF" != "refs/heads/master" ]]; then
+            echo "Published manual releases must run from master; current ref is $REF" >&2
             exit 1
           fi
 
@@ -75,6 +97,8 @@ jobs:
 
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "package_version=$PACKAGE_VERSION" >> "$GITHUB_OUTPUT"
+          echo "publish=$PUBLISH" >> "$GITHUB_OUTPUT"
+          echo "build_desktop=$BUILD_DESKTOP" >> "$GITHUB_OUTPUT"
 
   build-webui:
     name: Build WebUI
@@ -166,7 +190,7 @@ jobs:
 
   build-desktop:
     name: Desktop (${{ matrix.platform }})
-    if: ${{ github.event.inputs.build_desktop == 'true' }}
+    if: ${{ needs.validate.outputs.build_desktop == 'true' }}
     needs: validate
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
@@ -285,7 +309,7 @@ jobs:
           merge-multiple: true
 
       - name: Download desktop artifacts
-        if: ${{ github.event.inputs.build_desktop == 'true' }}
+        if: ${{ needs.validate.outputs.build_desktop == 'true' }}
         uses: actions/download-artifact@v8
         with:
           pattern: release-desktop-*
@@ -305,7 +329,7 @@ jobs:
           fi
 
       - name: Generate desktop updater manifest
-        if: ${{ github.event.inputs.build_desktop == 'true' }}
+        if: ${{ needs.validate.outputs.build_desktop == 'true' }}
         env:
           VERSION: ${{ needs.validate.outputs.version }}
           REPO: ${{ github.repository }}
@@ -331,7 +355,7 @@ jobs:
     name: Publish GitHub Release
     if: >-
       ${{ always() &&
-          github.event.inputs.publish == 'true' &&
+          needs.validate.outputs.publish == 'true' &&
           needs.validate.result == 'success' &&
           needs.package.result == 'success' }}
     needs:
@@ -350,7 +374,7 @@ jobs:
           name: nyro-${{ needs.validate.outputs.version }}-release-pack
           path: release-assets
 
-      - name: Create tag and GitHub Release
+      - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           VERSION: ${{ needs.validate.outputs.version }}

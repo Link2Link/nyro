@@ -1,6 +1,6 @@
 # Release Process (Local)
 
-This document describes the **local work required to release a Nyro version**. The local part ends once the `release/vX.Y.Z` branch is pushed; **PR merge and tagging are done remotely on GitHub**.
+This document describes the **local work required to release a Nyro version**. After the release commit lands on `master`, pushing the `vX.Y.Z` tag triggers `.github/workflows/release.yml`.
 
 Versions follow semantic versioning `vX.Y.Z` (e.g. `v1.7.6`). Below, `vX.Y.Z` is the target version and `X.Y.Z` is the version without the `v` prefix.
 
@@ -12,25 +12,23 @@ flowchart TD
     cut --> bump["Step 2: Bump version (3 places) + refresh Cargo.lock"]
     bump --> changelog["Step 3: Summarize changelog from git log (EN + CN)"]
     changelog --> verify["Step 4: Local verification with make check + make test"]
-    verify --> push["Step 5: Commit and push release/vX.Y.Z"]
-    push --> remote{{"Remote (GitHub web)"}}
-    remote --> pr["Open PR release/vX.Y.Z to master and merge"]
-    pr --> tag["Create tag/Release vX.Y.Z on master"]
-    tag --> ci["Auto-triggers release-desktop.yml and release-server.yml"]
+    verify --> push["Step 5: Commit and push to master"]
+    push --> tag["Step 6: Push tag vX.Y.Z"]
+    tag --> ci["Auto-triggers .github/workflows/release.yml"]
 ```
 
-> Everything after the remote node (PR merge, tagging) is performed remotely, not locally; it is listed here only for context.
+> Pushing an annotated `vX.Y.Z` tag on `master` builds the Linux server binary and publishes the GitHub Release. Desktop installers stay opt-in via `workflow_dispatch` (`build_desktop=true`).
 
 ## Step 1: Cut the release branch from master
 
 ```bash
 git checkout master
 git pull
-git fetch --tags --prune --prune-tags  # sync tags with remote (tags are created on GitHub)
+git fetch --tags --prune --prune-tags
 git checkout -b release/vX.Y.Z
 ```
 
-> Tags are created remotely on GitHub, so always `fetch --tags` before determining the previous version. Otherwise `git describe` / `git tag -l` may report a stale tag and the changelog range will be wrong.
+> Always `fetch --tags` before determining the previous version. Otherwise `git describe` / `git tag -l` may report a stale tag and the changelog range will be wrong.
 
 ## Step 2: Bump the version
 
@@ -83,23 +81,32 @@ make test
 
 Proceed only after both pass.
 
-## Step 5: Commit and push the branch
+## Step 5: Commit and push
 
 ```bash
 git add -A
 git commit -m "chore: release vX.Y.Z"
-git push -u origin release/vX.Y.Z
+git push origin master
+# or, if using a release branch: git push -u origin release/vX.Y.Z
+# then merge that PR to master before tagging
 ```
 
-This completes the local work.
+## Step 6: Push the version tag
 
-## Remote follow-up (GitHub web, not local steps)
+The tag must point at the release commit on `master`. Pushing it starts `.github/workflows/release.yml`:
 
-1. Open a PR on GitHub: `release/vX.Y.Z` → `master`, title `chore: release vX.Y.Z`, review and merge.
-2. After merging, create the tag / Release `vX.Y.Z` on `master`.
-3. Pushing the tag automatically triggers the following workflows (both triggered by `push tags: v*`):
-   - `.github/workflows/release-desktop.yml`: builds desktop bundles, generates `latest.json` (`scripts/release/gen_latest_json.py`), creates the GitHub Release, and bumps the Homebrew Cask.
-   - `.github/workflows/release-server.yml`: builds the server binaries for each platform.
+```bash
+git tag -a vX.Y.Z -m "Nyro vX.Y.Z"
+git push origin vX.Y.Z
+```
+
+The tag-push run:
+
+- validates that `Cargo.toml`, `src-tauri/tauri.conf.json`, and `webui/package.json` all match `X.Y.Z`
+- builds the WebUI and the Linux x86_64 server binary
+- creates the GitHub Release `vX.Y.Z` with those assets (`publish=true`, `build_desktop=false`)
+
+Manual `workflow_dispatch` remains available to republish from `master` or to set `build_desktop=true` for signed desktop installers. Do not dispatch `publish=true` for a tag that already has a GitHub Release.
 
 ## Appendix: Local changed files
 

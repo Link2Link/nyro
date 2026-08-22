@@ -89,6 +89,6 @@ Local release work (cutting a `release/vX.Y.Z` branch off `master` through pushi
 3. Changelog: summarize all commits since the last tag (`git log $(git describe --tags --abbrev=0)..HEAD --no-merges --oneline`) into a new version entry, and write it to **both** `CHANGELOG.md` (English, canonical) and `CHANGELOG_CN.md` (Chinese).
 4. Verify with `make check` and `make test`, then commit (`chore: release vX.Y.Z`) and push the branch.
 
-PR merge (`release/vX.Y.Z` → `master`) and tagging `vX.Y.Z` are done remotely on GitHub; pushing the tag triggers the release workflows.
+After the release commit is on `master`, push the annotated tag `vX.Y.Z`. That tag push triggers `.github/workflows/release.yml`, which builds the Linux server binary and publishes the GitHub Release. Desktop installers stay opt-in via manual `workflow_dispatch`.
 
 > See `docs/release.md` for the full local release runbook (source of truth).
