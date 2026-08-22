@@ -9,6 +9,7 @@
 //! - For lightweight code reuse below the 3-vendor threshold, prefer a
 //!   `shared.rs` helper inside the vendor's own directory.
 
+pub mod effort_policy;
 pub mod openai_compat;
 pub mod pipeline;
 

@@ -72,6 +72,20 @@ pub(crate) fn maybe_sanitize_codex_consumer_request(body: &mut Value, provider: 
     }
 }
 
+pub(crate) fn apply_vendor_effort_policy(body: &mut Value, provider: &Provider) {
+    let vendor_id = provider
+        .vendor
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .unwrap_or_default();
+    if vendor_id.eq_ignore_ascii_case("xai") {
+        super::effort_policy::drop_grok_effort(body);
+    } else if !vendor_id.is_empty() {
+        super::effort_policy::normalize_enum_effort(body);
+    }
+}
+
 /// Standard `build_request` pipeline:
 /// `pre_request → normalize_tool_results → pre_encode → codec_encode →
 ///  post_encode → auth_headers → build_url`.
@@ -119,6 +133,7 @@ where
     maybe_inject_openai_fast_mode(&mut body, ctx.provider, ctx.protocol);
     // 5c. Codex 消费级上游：剥离其拒绝的 Responses 参数（IR 转码路径）
     maybe_sanitize_codex_consumer_request(&mut body, ctx.provider);
+    apply_vendor_effort_policy(&mut body, ctx.provider);
 
     // 6. auth headers
     //
@@ -261,6 +276,7 @@ pub async fn passthrough_run(
 
     if is_openai_chat {
         normalize_openai_developer_roles(&mut raw_body);
+        apply_vendor_effort_policy(&mut raw_body, ctx.provider);
     }
     if ctx.protocol == crate::protocol::ids::OPENAI_RESPONSES_V1 {
         crate::protocol::codec::openai::responses::normalize_function_tool_defaults(&mut raw_body);
