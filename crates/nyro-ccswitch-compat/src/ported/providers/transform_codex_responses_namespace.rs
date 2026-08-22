@@ -49,36 +49,54 @@ pub(crate) struct NamespacedName {
 /// flatten; derives names exactly as [`flatten_request_namespaces`] does.
 pub(crate) fn namespace_restore_map(request_body: &Value) -> HashMap<String, NamespacedName> {
     let mut map = HashMap::new();
-    let Some(tools) = request_body.get("tools").and_then(Value::as_array) else {
-        return map;
-    };
-    for tool in tools {
-        if tool.get("type").and_then(Value::as_str) != Some("namespace") {
-            continue;
+    // Codex Responses-Lite carries tool declarations inside an
+    // `additional_tools` input item; the promote steps lift them to top level
+    // only after this map is computed, so scan both locations.
+    fn tool_lists(body: &Value) -> Vec<&Vec<Value>> {
+        let mut lists = Vec::new();
+        if let Some(tools) = body.get("tools").and_then(Value::as_array) {
+            lists.push(tools);
         }
-        let Some(namespace) = tool.get("name").and_then(Value::as_str) else {
-            continue;
-        };
-        let namespace = namespace.trim();
-        if namespace.is_empty() {
-            continue;
+        if let Some(items) = body.get("input").and_then(Value::as_array) {
+            for item in items {
+                if item.get("type").and_then(Value::as_str) == Some("additional_tools")
+                    && let Some(tools) = item.get("tools").and_then(Value::as_array)
+                {
+                    lists.push(tools);
+                }
+            }
         }
-        for child in namespace_children(tool) {
-            if child.get("type").and_then(Value::as_str) != Some("function") {
+        lists
+    }
+    for tools in tool_lists(request_body) {
+        for tool in tools {
+            if tool.get("type").and_then(Value::as_str) != Some("namespace") {
                 continue;
             }
-            let Some(name) = child.get("name").and_then(Value::as_str) else {
+            let Some(namespace) = tool.get("name").and_then(Value::as_str) else {
                 continue;
             };
-            let name = name.trim();
-            if name.is_empty() {
+            let namespace = namespace.trim();
+            if namespace.is_empty() {
                 continue;
             }
-            let flat = flatten_namespace_tool_name(namespace, name);
-            map.entry(flat).or_insert_with(|| NamespacedName {
-                namespace: namespace.to_string(),
-                name: name.to_string(),
-            });
+            for child in namespace_children(tool) {
+                if child.get("type").and_then(Value::as_str) != Some("function") {
+                    continue;
+                }
+                let Some(name) = child.get("name").and_then(Value::as_str) else {
+                    continue;
+                };
+                let name = name.trim();
+                if name.is_empty() {
+                    continue;
+                }
+                let flat = flatten_namespace_tool_name(namespace, name);
+                map.entry(flat).or_insert_with(|| NamespacedName {
+                    namespace: namespace.to_string(),
+                    name: name.to_string(),
+                });
+            }
         }
     }
     map

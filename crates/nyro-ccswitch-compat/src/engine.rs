@@ -10,8 +10,8 @@ use crate::ported::handlers_compat::{chat_sse_to_response_value, responses_sse_t
 use crate::ported::providers::{
     streaming, streaming_codex_anthropic, streaming_codex_chat, streaming_gemini,
     streaming_responses, transform, transform_codex_anthropic, transform_codex_chat,
-    transform_codex_responses_namespace, transform_codex_responses_xai_sanitize, transform_gemini,
-    transform_responses,
+    transform_codex_responses_namespace, transform_codex_responses_thirdparty,
+    transform_codex_responses_xai_sanitize, transform_gemini, transform_responses,
 };
 use crate::ported::sse::{strip_sse_field, take_sse_block};
 use crate::profile::{ConversionProfile, Direction, UpstreamFlavor};
@@ -157,6 +157,8 @@ impl CompatEngine {
         let tool_context = transform_codex_chat::build_codex_tool_context_from_request(&ordered);
         let namespace_restore =
             transform_codex_responses_namespace::namespace_restore_map(&ordered);
+        let custom_restore =
+            transform_codex_responses_thirdparty::custom_tool_restore_names(&ordered);
         let gemini_schema_hints = transform_gemini::extract_anthropic_tool_schema_hints(&ordered);
 
         if matches!(profile.direction, Direction::CodexResponsesToChat) {
@@ -261,10 +263,19 @@ impl CompatEngine {
                 converted
             }
             Direction::XaiResponsesNative => {
-                transform_codex_responses_namespace::flatten_request_namespaces(&mut ordered)?;
-                transform_codex_responses_xai_sanitize::sanitize_xai_responses_request(
-                    &mut ordered,
-                );
+                if matches!(
+                    profile.upstream_flavor,
+                    UpstreamFlavor::ThirdPartyStrictResponses
+                ) {
+                    transform_codex_responses_thirdparty::rewrite_request_for_third_party(
+                        &mut ordered,
+                    )?;
+                } else {
+                    transform_codex_responses_namespace::flatten_request_namespaces(&mut ordered)?;
+                    transform_codex_responses_xai_sanitize::sanitize_xai_responses_request(
+                        &mut ordered,
+                    );
+                }
                 ordered
             }
         };
@@ -275,6 +286,7 @@ impl CompatEngine {
             identity,
             tool_context,
             namespace_restore,
+            custom_restore,
             gemini_schema_hints,
         );
         let body = serde_json::to_vec(&converted)
@@ -307,6 +319,10 @@ impl CompatEngine {
                     transform_codex_responses_namespace::restore_response_namespaces(
                         &mut upstream,
                         session.namespace_restore.as_ref(),
+                    );
+                    transform_codex_responses_thirdparty::restore_custom_tool_calls(
+                        &mut upstream,
+                        session.custom_restore.as_ref(),
                     );
                     serde_json::to_vec(&upstream)
                 }
@@ -377,6 +393,10 @@ impl CompatEngine {
                 transform_codex_responses_namespace::restore_response_namespaces(
                     &mut upstream,
                     session.namespace_restore.as_ref(),
+                );
+                transform_codex_responses_thirdparty::restore_custom_tool_calls(
+                    &mut upstream,
+                    session.custom_restore.as_ref(),
                 );
                 upstream
             }
@@ -474,12 +494,28 @@ impl CompatEngine {
             Direction::AnthropicToAnthropic => {
                 Box::pin(stream.map_err(|error| std::io::Error::other(error.to_string())))
             }
-            Direction::XaiResponsesNative => Box::pin(
-                transform_codex_responses_namespace::create_namespace_restore_sse_stream(
-                    stream,
-                    (*session.namespace_restore).clone(),
-                ),
-            ),
+            Direction::XaiResponsesNative => {
+                if matches!(
+                    session.profile.upstream_flavor,
+                    UpstreamFlavor::ThirdPartyStrictResponses
+                ) && !session.custom_restore.is_empty()
+                {
+                    Box::pin(
+                        transform_codex_responses_thirdparty::create_third_party_restore_sse_stream(
+                            stream,
+                            (*session.namespace_restore).clone(),
+                            (*session.custom_restore).clone(),
+                        ),
+                    )
+                } else {
+                    Box::pin(
+                        transform_codex_responses_namespace::create_namespace_restore_sse_stream(
+                            stream,
+                            (*session.namespace_restore).clone(),
+                        ),
+                    )
+                }
+            }
         };
         Ok(ConvertedResponse {
             metadata: metadata.rebuilt("text/event-stream"),
@@ -567,6 +603,10 @@ impl CompatEngine {
                 transform_codex_responses_namespace::restore_response_namespaces(
                     &mut response,
                     session.namespace_restore.as_ref(),
+                );
+                transform_codex_responses_thirdparty::restore_custom_tool_calls(
+                    &mut response,
+                    session.custom_restore.as_ref(),
                 );
                 Ok(response)
             }
@@ -1101,6 +1141,69 @@ mod tests {
                 .windows("codex_real_session_1234567890".len())
                 .any(|window| window == b"codex_real_session_1234567890")
         );
+    }
+
+    #[tokio::test]
+    async fn third_party_responses_round_trip_restores_codex_shapes() {
+        use futures::StreamExt;
+
+        let engine = CompatEngine::default();
+        let request = br#"{"model":"glm-5.3","stream":true,"input":[{"type":"additional_tools","role":"developer","tools":[{"type":"custom","name":"exec","description":"Run JS","format":{"type":"grammar"}},{"type":"function","name":"wait","parameters":{"type":"object"}},{"type":"namespace","name":"collab","tools":[{"type":"function","name":"spawn","parameters":{"type":"object"}}]}]},{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}]}"#;
+        let prepared = engine
+            .prepare_request(
+                ConversionProfile::third_party_responses_native(true),
+                Bytes::from_static(request),
+                SessionIdentity::generated("sess"),
+            )
+            .await
+            .unwrap();
+        let body = String::from_utf8(prepared.body.to_vec()).unwrap();
+        // Carrier lifted, custom converted to function, namespace flattened.
+        assert!(!body.contains("additional_tools"));
+        assert!(!body.contains("\"custom\""));
+        assert!(!body.contains("namespace"));
+        assert!(body.contains("\"exec\""));
+        assert!(body.contains("collab__spawn"));
+
+        // Upstream replies with function calls (flat names, arguments JSON).
+        let upstream_sse = concat!(
+            "event: response.output_item.added\n",
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"fc_1\",\"call_id\":\"c1\",\"name\":\"exec\"}}\n\n",
+            "event: response.function_call_arguments.delta\n",
+            "data: {\"type\":\"response.function_call_arguments.delta\",\"item_id\":\"fc_1\",\"delta\":\"{\\\"input\\\":\\\"text(1)\\\"}\"}\n\n",
+            "event: response.output_item.done\n",
+            "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"fc_1\",\"call_id\":\"c1\",\"name\":\"exec\",\"arguments\":\"{\\\"input\\\":\\\"text(1)\\\"}\"}}\n\n",
+            "event: response.output_item.added\n",
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":1,\"item\":{\"type\":\"function_call\",\"id\":\"fc_2\",\"call_id\":\"c2\",\"name\":\"collab__spawn\"}}\n\n",
+            "event: response.output_item.done\n",
+            "data: {\"type\":\"response.output_item.done\",\"output_index\":1,\"item\":{\"type\":\"function_call\",\"id\":\"fc_2\",\"call_id\":\"c2\",\"name\":\"collab__spawn\",\"arguments\":\"{}\"}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let source = futures::stream::once(async move {
+            Ok::<Bytes, std::io::Error>(Bytes::from_static(upstream_sse.as_bytes()))
+        });
+        let converted = engine
+            .convert_stream_response(&prepared.session, ResponseMetadata::new(200), source)
+            .unwrap();
+        let ResponseBody::Stream(stream) = converted.body else {
+            panic!("expected stream response");
+        };
+        futures::pin_mut!(stream);
+        let mut client_sse = String::new();
+        while let Some(chunk) = stream.next().await {
+            client_sse.push_str(std::str::from_utf8(&chunk.unwrap()).unwrap());
+        }
+        // exec restored as custom_tool_call with the Codex event sequence.
+        assert!(client_sse.contains("\"type\":\"custom_tool_call\""));
+        assert!(client_sse.contains("\"input\":\"text(1)\""));
+        assert!(client_sse.contains("response.custom_tool_call_input.delta"));
+        assert!(client_sse.contains("response.custom_tool_call_input.done"));
+        assert!(!client_sse.contains("response.function_call_arguments.delta"));
+        // Namespace call restored to {name, namespace} identity.
+        assert!(client_sse.contains("\"name\":\"spawn\""));
+        assert!(client_sse.contains("\"namespace\":\"collab\""));
+        assert!(!client_sse.contains("collab__spawn"));
+        assert!(client_sse.contains("[DONE]"));
     }
 
     #[tokio::test]

@@ -121,6 +121,12 @@ pub enum UpstreamFlavor {
     StandardResponses,
     CodexOAuthResponses,
     XaiStrictResponses,
+    /// Strict third-party Responses upstream (GLM, DeepSeek, …): same
+    /// protocol both sides, but Codex Responses-Lite artifacts (the
+    /// `additional_tools` carrier, `namespace`/`custom` tool shapes) must be
+    /// normalized to public Responses shapes on egress and restored on
+    /// ingress.
+    ThirdPartyStrictResponses,
     Anthropic,
     Gemini,
 }
@@ -257,6 +263,20 @@ impl ConversionProfile {
             WireProtocol::OpenAiResponses,
             ClientSemantics::CodexResponses,
             UpstreamFlavor::XaiStrictResponses,
+            client_stream,
+        )
+    }
+
+    /// Codex Responses → strict third-party Responses upstream (GLM,
+    /// DeepSeek, …). Same wire protocol, but Codex Responses-Lite artifacts
+    /// are normalized on egress and restored on ingress.
+    pub fn third_party_responses_native(client_stream: bool) -> Self {
+        Self::new(
+            Direction::XaiResponsesNative,
+            WireProtocol::OpenAiResponses,
+            WireProtocol::OpenAiResponses,
+            ClientSemantics::CodexResponses,
+            UpstreamFlavor::ThirdPartyStrictResponses,
             client_stream,
         )
     }

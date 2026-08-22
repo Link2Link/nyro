@@ -2995,13 +2995,12 @@ mod tests {
             provider
         };
 
-        let storage: crate::storage::DynStorage = std::sync::Arc::new(
-            crate::storage::MemoryStorage::new(
+        let storage: crate::storage::DynStorage =
+            std::sync::Arc::new(crate::storage::MemoryStorage::new(
                 vec![unsupported, glm_missing_key, disabled_kimi],
                 vec![],
                 vec![],
-            ),
-        );
+            ));
         let (gw, _log_rx) =
             crate::Gateway::from_storage(crate::config::GatewayConfig::default(), storage)
                 .await

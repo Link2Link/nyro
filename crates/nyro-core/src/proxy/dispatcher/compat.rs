@@ -61,6 +61,17 @@ pub(super) fn supports_compat_request(
         .as_deref()
         .map(str::trim)
         .unwrap_or_default();
+    let channel = provider
+        .channel
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or_default();
+    // OpenAI-official surfaces (direct or via the Codex/sub2api translator
+    // channels) understand Codex's Responses-Lite private shapes natively;
+    // every other Responses upstream is treated as strict third-party.
+    let openai_native = vendor_id.eq_ignore_ascii_case("openai")
+        || channel.eq_ignore_ascii_case("codex")
+        || channel.eq_ignore_ascii_case("sub2api");
     matches!(
         (ingress, egress),
         (
@@ -76,6 +87,10 @@ pub(super) fn supports_compat_request(
     ) || (ingress == OPENAI_RESPONSES_V1
         && egress == OPENAI_RESPONSES_V1
         && vendor_id.eq_ignore_ascii_case("xai"))
+        || (ingress == OPENAI_RESPONSES_V1
+            && egress == OPENAI_RESPONSES_V1
+            && !openai_native
+            && !vendor_id.eq_ignore_ascii_case("xai"))
         || (ingress == ANTHROPIC_MESSAGES_2023_06_01
             && egress == ANTHROPIC_MESSAGES_2023_06_01
             && nyro_ccswitch_compat::anthropic_normalization_needed(
@@ -160,6 +175,17 @@ pub(super) fn select_compat_request(
         }
         (OPENAI_RESPONSES_V1, OPENAI_RESPONSES_V1) if vendor_id.eq_ignore_ascii_case("xai") => {
             ConversionProfile::xai_responses_native(client_stream)
+        }
+        (OPENAI_RESPONSES_V1, OPENAI_RESPONSES_V1) => {
+            // Strict third-party Responses upstream (GLM, DeepSeek, …): only
+            // convert when the body actually carries Codex Responses-Lite
+            // artifacts (additional_tools carrier, namespace/custom tools,
+            // replayed custom call items). Plain requests keep the byte-level
+            // native passthrough.
+            if !nyro_ccswitch_compat::request_needs_rewrite(raw_body) {
+                return Ok(None);
+            }
+            ConversionProfile::third_party_responses_native(client_stream)
         }
         (ANTHROPIC_MESSAGES_2023_06_01, ANTHROPIC_MESSAGES_2023_06_01) => {
             ConversionProfile::anthropic_passthrough_normalized(client_stream)
@@ -2528,16 +2554,82 @@ mod tests {
             UpstreamFlavor::XaiStrictResponses
         );
 
-        // The namespace flatten gate only fires for xai; other responses
-        // natives are not compat candidates at all.
+        // Third-party responses natives are compat candidates now, but a
+        // plain body (no Responses-Lite artifacts) selects None and keeps
+        // the byte-level native passthrough.
         let plain = provider("custom", "default");
-        assert!(!supports_compat_request(
+        assert!(supports_compat_request(
             OPENAI_RESPONSES_V1,
             OPENAI_RESPONSES_V1,
             &plain,
             "https://api.x.ai/v1",
             "grok-4.5",
         ));
+        assert!(
+            select_compat_request(
+                OPENAI_RESPONSES_V1,
+                OPENAI_RESPONSES_V1,
+                &plain,
+                "https://api.example.com/v1",
+                "grok-4.5",
+                false,
+                &HeaderMap::new(),
+                br#"{"model":"grok-4.5","input":"hello"}"#,
+                &request,
+                &request,
+            )
+            .unwrap()
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn selects_third_party_responses_for_carrier_bodies() {
+        let request = request("glm-5.3", OPENAI_RESPONSES_V1);
+        let body = br#"{"model":"glm-5.3","input":[{"type":"additional_tools","tools":[{"type":"custom","name":"exec"},{"type":"function","name":"wait","parameters":{"type":"object"}}]},{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}]}"#;
+        let selected = select_compat_request(
+            OPENAI_RESPONSES_V1,
+            OPENAI_RESPONSES_V1,
+            &provider("glm", "default"),
+            "https://open.bigmodel.cn/api/paas/v4",
+            "glm-5.3",
+            true,
+            &HeaderMap::new(),
+            body,
+            &request,
+            &request,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            selected.profile.direction,
+            nyro_ccswitch_compat::Direction::XaiResponsesNative
+        );
+        assert_eq!(
+            selected.profile.upstream_flavor,
+            UpstreamFlavor::ThirdPartyStrictResponses
+        );
+    }
+
+    #[test]
+    fn openai_native_channels_stay_out_of_third_party_compat() {
+        for (vendor, channel) in [
+            ("openai", "default"),
+            ("custom", "codex"),
+            ("custom", "sub2api"),
+        ] {
+            let p = provider(vendor, channel);
+            assert!(
+                !supports_compat_request(
+                    OPENAI_RESPONSES_V1,
+                    OPENAI_RESPONSES_V1,
+                    &p,
+                    "https://example.com",
+                    "gpt-5.6",
+                ),
+                "{vendor}/{channel} must stay native"
+            );
+        }
     }
 
     fn streaming_decision_profile(

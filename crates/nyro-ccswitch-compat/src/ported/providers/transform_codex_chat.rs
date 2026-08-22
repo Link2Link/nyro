@@ -248,6 +248,23 @@ pub(crate) fn build_codex_tool_context_from_request(body: &Value) -> CodexToolCo
 
     if let Some(input) = body.get("input") {
         collect_tool_search_output_tools(input, &mut context);
+        // Codex Responses-Lite declares its tools in an `additional_tools`
+        // carrier item inside `input` (marked by the
+        // `x-openai-internal-codex-responses-lite` header) instead of the
+        // top-level `tools` field. Collect those too so chat/anthropic
+        // transcode upstreams still receive the full tool set.
+        if let Some(items) = input.as_array() {
+            for item in items {
+                if item.get("type").and_then(Value::as_str) != Some("additional_tools") {
+                    continue;
+                }
+                if let Some(tools) = item.get("tools").and_then(|v| v.as_array()) {
+                    for tool in tools {
+                        context.add_response_tool(tool);
+                    }
+                }
+            }
+        }
     }
 
     context
@@ -2420,6 +2437,50 @@ mod tests {
                 .unwrap()
                 .contains("mcp__codex_apps__gmail")
         );
+    }
+
+    #[test]
+    fn responses_request_to_chat_collects_additional_tools_carrier() {
+        // Codex Responses-Lite declares tools inside an `additional_tools`
+        // input item; the transcode must register them as chat tools.
+        let input = json!({
+            "model": "deepseek-v4-flash",
+            "input": [
+                {
+                    "type": "additional_tools",
+                    "role": "developer",
+                    "tools": [
+                        {"type": "custom", "name": "exec", "description": "Run JS code"},
+                        {"type": "function", "name": "wait", "parameters": {"type": "object"}},
+                        {
+                            "type": "namespace",
+                            "name": "collab",
+                            "tools": [{"type": "function", "name": "spawn", "parameters": {"type": "object"}}]
+                        }
+                    ]
+                },
+                {"type": "message", "role": "user", "content": "hi"},
+                {"type": "message", "role": "user", "content": "hi"}
+            ]
+        });
+
+        let result = responses_to_chat_completions(input).unwrap();
+
+        let tools = result["tools"].as_array().unwrap();
+        let names: Vec<&str> = tools
+            .iter()
+            .map(|t| t["function"]["name"].as_str().unwrap())
+            .collect();
+        assert!(names.contains(&"exec"));
+        assert!(names.contains(&"wait"));
+        assert!(names.contains(&"collab__spawn"));
+        assert!(tools.iter().all(|t| t["type"] == "function"));
+        // The custom tool became a function with the `input` string parameter.
+        let exec = tools
+            .iter()
+            .find(|t| t["function"]["name"] == "exec")
+            .unwrap();
+        assert_eq!(exec["function"]["parameters"]["required"][0], "input");
     }
 
     #[test]

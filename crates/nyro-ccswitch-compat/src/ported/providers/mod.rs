@@ -17,6 +17,7 @@ pub(crate) mod transform;
 pub(crate) mod transform_codex_anthropic;
 pub(crate) mod transform_codex_chat;
 pub(crate) mod transform_codex_responses_namespace;
+pub(crate) mod transform_codex_responses_thirdparty;
 pub(crate) mod transform_codex_responses_xai_sanitize;
 pub(crate) mod transform_gemini;
 pub(crate) mod transform_responses;

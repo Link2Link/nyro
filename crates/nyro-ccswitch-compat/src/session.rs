@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use thiserror::Error;
@@ -164,6 +164,7 @@ pub struct ConversionSession {
     pub identity: SessionIdentity,
     pub(crate) tool_context: Arc<CodexToolContext>,
     pub(crate) namespace_restore: Arc<HashMap<String, NamespacedName>>,
+    pub(crate) custom_restore: Arc<HashSet<String>>,
     pub(crate) gemini_schema_hints: Arc<AnthropicToolSchemaHints>,
 }
 
@@ -173,6 +174,7 @@ impl std::fmt::Debug for ConversionSession {
             .field("profile", &self.profile)
             .field("identity", &self.identity)
             .field("namespace_entries", &self.namespace_restore.len())
+            .field("custom_tool_entries", &self.custom_restore.len())
             .field("gemini_schema_hints", &self.gemini_schema_hints.len())
             .finish_non_exhaustive()
     }
@@ -184,6 +186,7 @@ impl ConversionSession {
         identity: SessionIdentity,
         tool_context: CodexToolContext,
         namespace_restore: HashMap<String, NamespacedName>,
+        custom_restore: HashSet<String>,
         gemini_schema_hints: AnthropicToolSchemaHints,
     ) -> Self {
         Self {
@@ -191,6 +194,7 @@ impl ConversionSession {
             identity,
             tool_context: Arc::new(tool_context),
             namespace_restore: Arc::new(namespace_restore),
+            custom_restore: Arc::new(custom_restore),
             gemini_schema_hints: Arc::new(gemini_schema_hints),
         }
     }

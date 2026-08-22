@@ -28,6 +28,9 @@ pub use ported::content_encoding::{
     is_supported_content_encoding,
 };
 pub use ported::providers::claude_compat::anthropic_normalization_needed;
+/// Codex Responses-Lite artifacts (additional_tools carrier, namespace/custom
+/// tool shapes) that require the third-party Responses rewrite.
+pub use ported::providers::transform_codex_responses_thirdparty::request_needs_rewrite;
 pub use profile::{
     ClientSemantics, ConversionProfile, Direction, UpstreamFlavor, WireProtocol,
     resolve_chat_reasoning_config,
