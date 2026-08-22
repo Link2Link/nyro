@@ -501,6 +501,44 @@ async fn passthrough_run_sets_stream_path_for_streaming_body() {
     );
 }
 
+#[tokio::test]
+async fn passthrough_contract_preserves_unknown_fields_and_applies_narrow_native_mutations() {
+    let gw = build_test_gateway().await;
+    let provider = fake_provider("sk-test");
+    let vendor = BearerVendor("test");
+    let body = json!({
+        "model": "virtual-model",
+        "messages": [{"role": "developer", "content": "system policy"}],
+        "stream": true,
+        "vendor_extension_field": {"must": "survive"}
+    });
+    let ctx = ProviderCtx {
+        provider: &provider,
+        protocol: OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1,
+        egress_base_url: "https://api.openai.com",
+        api_key: &provider.api_key,
+        auth_scheme: "auto",
+        actual_model: "gpt-5.4",
+        credential: None,
+        gw: &gw,
+        disable_default_auth: false,
+    };
+
+    let out = nyro_core::provider::common::pipeline::passthrough_run(&vendor, body, &ctx, true)
+        .await
+        .expect("passthrough contract must succeed");
+
+    // PassThrough bypasses cross-protocol IR conversion; it is deliberately
+    // semantic JSON forwarding rather than byte-identical request forwarding.
+    assert_eq!(out.body["model"], "gpt-5.4");
+    assert_eq!(out.body["messages"][0]["role"], "system");
+    assert_eq!(out.body["stream_options"]["include_usage"], true);
+    assert_eq!(
+        out.body["vendor_extension_field"],
+        json!({"must": "survive"})
+    );
+}
+
 // ── declared_mutations default for conservative vendors ───────────────────────
 
 #[test]

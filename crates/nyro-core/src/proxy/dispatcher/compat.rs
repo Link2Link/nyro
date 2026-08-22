@@ -3,25 +3,33 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
 use axum::body::Body;
-use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header};
+#[cfg(test)]
+use axum::http::HeaderMap;
+use axum::http::{HeaderName, HeaderValue, StatusCode, header};
 use axum::response::Response;
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
+#[cfg(test)]
+use nyro_ccswitch_compat::ConversionProfile;
 use nyro_ccswitch_compat::{
-    CompatEngine, CompatError, ConversionProfile, ConversionSession, ConvertedResponse,
-    DecompressError, Direction, Header, PreparedRequest, ResponseBody, ResponseMetadata,
-    SessionClient, SessionIdentity, StreamStartDecision, UpstreamFlavor,
-    decompress_body_with_limit, detect_semantic_failure, extract_session_identity,
-    get_content_encoding, resolve_chat_reasoning_config, strip_hop_by_hop_headers,
+    CompatEngine, CompatError, ConversionSession, ConvertedResponse, DecompressError, Direction,
+    Header, PreparedRequest, ResponseBody, ResponseMetadata, StreamStartDecision, UpstreamFlavor,
+    decompress_body_with_limit, detect_semantic_failure, get_content_encoding,
+    strip_hop_by_hop_headers,
 };
 use reqwest::header::HeaderMap as ReqwestHeaderMap;
-use serde_json::{Value, json};
+use serde_json::Value;
+#[cfg(test)]
+use serde_json::json;
 use tokio_stream::wrappers::ReceiverStream;
 
+use crate::conversion::{ConversionAttempt, RetryDisposition};
+#[cfg(test)]
 use crate::db::models::Provider;
+use crate::protocol::ids::{ANTHROPIC_MESSAGES_2023_06_01, OPENAI_RESPONSES_V1, ProtocolId};
+#[cfg(test)]
 use crate::protocol::ids::{
-    ANTHROPIC_MESSAGES_2023_06_01, GOOGLE_GEMINI_GENERATE_CONTENT_V1BETA,
-    OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1, OPENAI_RESPONSES_V1, ProtocolId,
+    GOOGLE_GEMINI_GENERATE_CONTENT_V1BETA, OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1,
 };
 use crate::protocol::ir::{AiRequest, Usage};
 use crate::proxy::client::{MAX_UPSTREAM_RESPONSE_BODY_BYTES, ProxyClient, RawUpstreamResponse};
@@ -32,205 +40,14 @@ use super::{
     CallCtx, HealthOutcome, LogBuilder, RequestExtras, error_response, health_outcome_from_status,
 };
 
-pub(super) struct CompatAttempt {
-    pub response: Response,
-    pub force_retry: bool,
-    pub health_outcome: HealthOutcome,
-}
+pub(super) type CompatAttempt = ConversionAttempt;
 
 type UpstreamByteStream =
     Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static>>;
 
-#[derive(Debug, Clone)]
-pub(super) struct CompatRequest {
-    pub profile: ConversionProfile,
-    pub identity: SessionIdentity,
-    pub patch: Option<Bytes>,
-    pub context_1m: bool,
-}
-
-pub(super) fn supports_compat_request(
-    ingress: ProtocolId,
-    egress: ProtocolId,
-    provider: &Provider,
-    egress_base_url: &str,
-    actual_model: &str,
-) -> bool {
-    let vendor_id = provider
-        .vendor
-        .as_deref()
-        .map(str::trim)
-        .unwrap_or_default();
-    let channel = provider
-        .channel
-        .as_deref()
-        .map(str::trim)
-        .unwrap_or_default();
-    // OpenAI-official surfaces (direct or via the Codex/sub2api translator
-    // channels) understand Codex's Responses-Lite private shapes natively;
-    // every other Responses upstream is treated as strict third-party.
-    let openai_native = vendor_id.eq_ignore_ascii_case("openai")
-        || channel.eq_ignore_ascii_case("codex")
-        || channel.eq_ignore_ascii_case("sub2api");
-    matches!(
-        (ingress, egress),
-        (
-            ANTHROPIC_MESSAGES_2023_06_01,
-            OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1
-        ) | (ANTHROPIC_MESSAGES_2023_06_01, OPENAI_RESPONSES_V1)
-            | (
-                ANTHROPIC_MESSAGES_2023_06_01,
-                GOOGLE_GEMINI_GENERATE_CONTENT_V1BETA
-            )
-            | (OPENAI_RESPONSES_V1, OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1)
-            | (OPENAI_RESPONSES_V1, ANTHROPIC_MESSAGES_2023_06_01)
-    ) || (ingress == OPENAI_RESPONSES_V1
-        && egress == OPENAI_RESPONSES_V1
-        && vendor_id.eq_ignore_ascii_case("xai"))
-        || (ingress == OPENAI_RESPONSES_V1
-            && egress == OPENAI_RESPONSES_V1
-            && !openai_native
-            && !vendor_id.eq_ignore_ascii_case("xai"))
-        || (ingress == ANTHROPIC_MESSAGES_2023_06_01
-            && egress == ANTHROPIC_MESSAGES_2023_06_01
-            && nyro_ccswitch_compat::anthropic_normalization_needed(
-                vendor_id,
-                egress_base_url,
-                actual_model,
-            ))
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(super) fn select_compat_request(
-    ingress: ProtocolId,
-    egress: ProtocolId,
-    provider: &Provider,
-    egress_base_url: &str,
-    actual_model: &str,
-    client_stream: bool,
-    headers: &HeaderMap,
-    raw_body: &[u8],
-    baseline_request: &AiRequest,
-    current_request: &AiRequest,
-) -> Result<Option<CompatRequest>, String> {
-    let vendor_id = provider
-        .vendor
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or("custom");
-    let channel = provider.channel.as_deref().unwrap_or_default().trim();
-
-    let mut context_1m = false;
-    let mut upstream_model = actual_model;
-    let mut profile = match (ingress, egress) {
-        (ANTHROPIC_MESSAGES_2023_06_01, OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1) => {
-            let haystack =
-                format!("{vendor_id} {egress_base_url} {actual_model}").to_ascii_lowercase();
-            let mut profile = ConversionProfile::anthropic_to_chat(client_stream);
-            profile.preserve_chat_reasoning_content = ["deepseek", "mimo", "xiaomimimo"]
-                .iter()
-                .any(|hint| haystack.contains(hint));
-            profile
-        }
-        (ANTHROPIC_MESSAGES_2023_06_01, OPENAI_RESPONSES_V1) => {
-            let flavor = if vendor_id.eq_ignore_ascii_case("openai")
-                && channel.eq_ignore_ascii_case("codex")
-            {
-                UpstreamFlavor::CodexOAuthResponses
-            } else if vendor_id.eq_ignore_ascii_case("xai") {
-                UpstreamFlavor::XaiStrictResponses
-            } else {
-                UpstreamFlavor::StandardResponses
-            };
-            let mut profile = ConversionProfile::anthropic_to_responses(client_stream, flavor);
-            // OpenAI Responses 渠道 Fast 模式：Claude Code（Anthropic ingress）接
-            // sub2api 或 Codex 上游时同样注入 service_tier = "priority"。
-            if provider.fast_mode
-                && (channel.eq_ignore_ascii_case("sub2api")
-                    || channel.eq_ignore_ascii_case("codex"))
-            {
-                profile.codex_fast_mode = true;
-            }
-            profile
-        }
-        (ANTHROPIC_MESSAGES_2023_06_01, GOOGLE_GEMINI_GENERATE_CONTENT_V1BETA) => {
-            ConversionProfile::anthropic_to_gemini(client_stream)
-        }
-        (OPENAI_RESPONSES_V1, OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1) => {
-            let mut profile = ConversionProfile::codex_responses_to_chat(client_stream);
-            if let Some(reasoning) =
-                resolve_chat_reasoning_config(None, &provider.name, egress_base_url, actual_model)
-            {
-                profile = profile.with_chat_reasoning(reasoning);
-            }
-            profile = profile
-                .with_prompt_cache_key_support(chat_prompt_cache_key_supported(egress_base_url));
-            profile
-        }
-        (OPENAI_RESPONSES_V1, ANTHROPIC_MESSAGES_2023_06_01) => {
-            upstream_model = strip_one_m_suffix(actual_model);
-            context_1m = upstream_model != actual_model;
-            ConversionProfile::codex_responses_to_anthropic(client_stream)
-        }
-        (OPENAI_RESPONSES_V1, OPENAI_RESPONSES_V1) if vendor_id.eq_ignore_ascii_case("xai") => {
-            ConversionProfile::xai_responses_native(client_stream)
-        }
-        (OPENAI_RESPONSES_V1, OPENAI_RESPONSES_V1) => {
-            // Strict third-party Responses upstream (GLM, DeepSeek, …): only
-            // convert when the body actually carries Codex Responses-Lite
-            // artifacts (additional_tools carrier, namespace/custom tools,
-            // replayed custom call items). Plain requests keep the byte-level
-            // native passthrough.
-            if !nyro_ccswitch_compat::request_needs_rewrite(raw_body) {
-                return Ok(None);
-            }
-            ConversionProfile::third_party_responses_native(client_stream)
-        }
-        (ANTHROPIC_MESSAGES_2023_06_01, ANTHROPIC_MESSAGES_2023_06_01) => {
-            ConversionProfile::anthropic_passthrough_normalized(client_stream)
-                .with_anthropic_normalization(actual_model, egress_base_url, vendor_id)
-        }
-        _ => return Ok(None),
-    };
-    profile = profile
-        .with_model(upstream_model)
-        .with_provider_id(provider.id.clone());
-
-    let session_client = if ingress == ANTHROPIC_MESSAGES_2023_06_01 {
-        SessionClient::Anthropic
-    } else {
-        SessionClient::CodexResponses
-    };
-    let compat_headers = headers
-        .iter()
-        .map(|(name, value)| {
-            nyro_ccswitch_compat::Header::new(
-                name.as_str(),
-                Bytes::copy_from_slice(value.as_bytes()),
-            )
-        })
-        .collect::<Vec<_>>();
-    let identity = extract_session_identity(session_client, &compat_headers, raw_body)
-        .map_err(|error| error.to_string())?;
-    if matches!(profile.direction, Direction::AnthropicToResponses)
-        && let Some(cache_key) = identity.prompt_cache_key()
-    {
-        profile = profile.with_cache_key(cache_key);
-    }
-    let patch = request_patch(baseline_request, current_request)?;
-
-    Ok(Some(CompatRequest {
-        profile,
-        identity,
-        patch,
-        context_1m,
-    }))
-}
-
 pub(super) fn normalize_compat_request_headers(
     headers: &mut ReqwestHeaderMap,
-    selection: &CompatRequest,
+    selection: &crate::conversion::RawWireCompatSelection,
     endpoint: &str,
 ) -> Result<(), String> {
     // Streaming responses cannot be re-encoded mid-flight, so requests that
@@ -342,55 +159,14 @@ fn is_codex_client_fingerprint_header(name: &str) -> bool {
         || name.starts_with("x-codex-")
 }
 
+#[cfg(test)]
 fn strip_one_m_suffix(model: &str) -> &str {
-    const MARKER: &[u8] = b"[1m]";
-
-    let trimmed = model.trim_end();
-    let bytes = trimmed.as_bytes();
-    if bytes.len() >= MARKER.len()
-        && bytes[bytes.len() - MARKER.len()..].eq_ignore_ascii_case(MARKER)
-    {
-        return trimmed[..trimmed.len() - MARKER.len()].trim_end();
-    }
-    model
+    crate::conversion::strip_one_m_suffix(model)
 }
 
+#[cfg(test)]
 fn chat_prompt_cache_key_supported(base_url: &str) -> bool {
-    let Ok(url) = reqwest::Url::parse(base_url) else {
-        return false;
-    };
-    match url.host_str() {
-        Some("api.openai.com") => true,
-        Some("api.kimi.com") => {
-            let path = url.path().trim_end_matches('/');
-            path == "/coding" || path.starts_with("/coding/")
-        }
-        _ => false,
-    }
-}
-
-pub(super) async fn prepare_compat_request(
-    engine: &CompatEngine,
-    selection: &CompatRequest,
-    raw_body: Bytes,
-    vendor_wire_before: &Value,
-    vendor_wire_after: &Value,
-) -> Result<PreparedRequest, CompatError> {
-    let mut prepared = engine
-        .prepare_request_with_patch(
-            selection.profile.clone(),
-            raw_body,
-            selection.patch.clone(),
-            selection.identity.clone(),
-        )
-        .await?;
-
-    let vendor_patch = value_patch(vendor_wire_before, vendor_wire_after)
-        .map_err(CompatError::InvalidRequestJson)?;
-    if let Some(patch) = vendor_patch {
-        prepared.body = engine.apply_json_patch(prepared.body, patch)?;
-    }
-    Ok(prepared)
+    crate::conversion::chat_prompt_cache_key_supported(base_url)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -443,8 +219,8 @@ pub(super) async fn handle_compat(
                 .emit();
             return CompatAttempt {
                 response,
-                force_retry: true,
-                health_outcome: HealthOutcome::Failure,
+                retry: RetryDisposition::ForceRetry,
+                health: HealthOutcome::Failure,
             };
         }
     };
@@ -475,8 +251,8 @@ pub(super) async fn handle_compat(
                     .emit();
                 return CompatAttempt {
                     response: error_response(502, &message),
-                    force_retry: true,
-                    health_outcome: HealthOutcome::Failure,
+                    retry: RetryDisposition::ForceRetry,
+                    health: HealthOutcome::Failure,
                 };
             }
         };
@@ -529,8 +305,8 @@ pub(super) async fn handle_compat(
                 .emit();
             return CompatAttempt {
                 response,
-                force_retry: true,
-                health_outcome: HealthOutcome::Failure,
+                retry: RetryDisposition::ForceRetry,
+                health: HealthOutcome::Failure,
             };
         }
     };
@@ -573,8 +349,8 @@ pub(super) async fn handle_compat(
                 .emit();
             return CompatAttempt {
                 response,
-                force_retry: true,
-                health_outcome: HealthOutcome::Neutral,
+                retry: RetryDisposition::ForceRetry,
+                health: HealthOutcome::Neutral,
             };
         }
     };
@@ -629,8 +405,8 @@ async fn handle_buffered_compat(
                 .emit();
             return CompatAttempt {
                 response: error_response(502, &message),
-                force_retry: true,
-                health_outcome: HealthOutcome::Failure,
+                retry: RetryDisposition::ForceRetry,
+                health: HealthOutcome::Failure,
             };
         }
     };
@@ -656,8 +432,8 @@ async fn handle_buffered_compat(
                 ResponseMetadata::new(422).rebuilt("application/json"),
                 Body::from(client_body),
             ),
-            force_retry: true,
-            health_outcome: HealthOutcome::Failure,
+            retry: RetryDisposition::ForceRetry,
+            health: HealthOutcome::Failure,
         };
     }
 
@@ -694,14 +470,14 @@ async fn handle_buffered_compat(
                     metadata.rebuilt("application/json"),
                     Body::from(client_body),
                 ),
-                force_retry: false,
-                health_outcome,
+                retry: RetryDisposition::DefaultStatusPolicy,
+                health: health_outcome,
             };
         }
         return CompatAttempt {
             response: build_compat_response(metadata, Body::from(body)),
-            force_retry: false,
-            health_outcome,
+            retry: RetryDisposition::DefaultStatusPolicy,
+            health: health_outcome,
         };
     }
 
@@ -725,8 +501,8 @@ async fn handle_buffered_compat(
                 .emit();
             return CompatAttempt {
                 response: compat_error_response(status, &message),
-                force_retry: true,
-                health_outcome: HealthOutcome::Neutral,
+                retry: RetryDisposition::ForceRetry,
+                health: HealthOutcome::Neutral,
             };
         }
     };
@@ -740,21 +516,21 @@ async fn handle_buffered_compat(
         let message = "compat buffered conversion returned a stream";
         return CompatAttempt {
             response: compat_error_response(500, message),
-            force_retry: true,
-            health_outcome: HealthOutcome::Neutral,
+            retry: RetryDisposition::ForceRetry,
+            health: HealthOutcome::Neutral,
         };
     };
 
     let (body, usage) =
-        match apply_buffered_response_hooks(call_ctx, req_ctx, req_ir, host, metadata.status, body)
+        match finalize_compat_buffered_body(call_ctx, req_ctx, req_ir, host, metadata.status, body)
             .await
         {
-            BufferedHookResult::Continue { body, usage } => (body, usage),
-            BufferedHookResult::Override(response) => {
+            BufferedWireFinalize::Continue { body, usage } => (body, usage),
+            BufferedWireFinalize::Override(response) => {
                 return CompatAttempt {
                     response,
-                    force_retry: false,
-                    health_outcome: HealthOutcome::Neutral,
+                    retry: RetryDisposition::DefaultStatusPolicy,
+                    health: HealthOutcome::Neutral,
                 };
             }
         };
@@ -774,92 +550,70 @@ async fn handle_buffered_compat(
 
     CompatAttempt {
         response: build_compat_response(metadata, Body::from(body)),
-        force_retry: false,
-        health_outcome: HealthOutcome::Success,
+        retry: RetryDisposition::DefaultStatusPolicy,
+        health: HealthOutcome::Success,
     }
 }
 
-enum BufferedHookResult {
+enum BufferedWireFinalize {
     Continue { body: Bytes, usage: Usage },
     Override(Response),
 }
 
-async fn apply_buffered_response_hooks(
+async fn finalize_compat_buffered_body(
     call_ctx: &CallCtx<'_>,
     req_ctx: &mut RequestContext,
     req_ir: &mut AiRequest,
     host: &crate::plugin::phase::HostContext<'_>,
     status: u16,
     body: Bytes,
-) -> BufferedHookResult {
+) -> BufferedWireFinalize {
     if !(200..300).contains(&status) {
-        return BufferedHookResult::Continue {
+        return BufferedWireFinalize::Continue {
             body,
             usage: Usage::default(),
         };
     }
     let Ok(value) = serde_json::from_slice::<Value>(&body) else {
-        return BufferedHookResult::Continue {
+        return BufferedWireFinalize::Continue {
             body,
             usage: Usage::default(),
         };
     };
     let parser = call_ctx.ingress.handler().make_response_decoder();
-    let Ok(mut response) = parser.parse_response(value) else {
-        return BufferedHookResult::Continue {
+    let Ok(response) = parser.parse_response(value) else {
+        return BufferedWireFinalize::Continue {
             body,
             usage: Usage::default(),
         };
     };
-    let before = serde_json::to_value(&response).ok();
 
-    let registry = crate::integrations::HookRegistry::global();
-    if registry.has_response_hooks() {
-        let hook_ctx = crate::integrations::HookContext {
-            model_id: call_ctx.model_id.to_string(),
-            provider_name: call_ctx.provider.name.clone(),
-            model: response.model.clone(),
-            api_key_id: call_ctx.api_key_id.map(str::to_string),
-        };
-        let latency_ms = call_ctx.start.elapsed().as_millis() as u64;
-        for hook in registry.response_hooks() {
-            hook.on_response(&hook_ctx, &mut response, latency_ms).await;
-        }
-    }
-
-    match super::run_phase_hooks(
-        crate::plugin::phase::Phase::OnResponse,
-        req_ctx,
-        req_ir,
-        crate::plugin::phase::ResponseView::Full(&mut response),
-        host,
+    match super::buffered::finalize_buffered_response(
+        call_ctx, req_ctx, req_ir, host, response, None,
     )
     .await
     {
-        crate::plugin::phase::PhaseOutcome::Continue => {}
-        crate::plugin::phase::PhaseOutcome::ShortCircuit(response) => {
-            return BufferedHookResult::Override(response);
+        super::buffered::BufferedFinalize::Override(response) => {
+            BufferedWireFinalize::Override(response)
         }
-        crate::plugin::phase::PhaseOutcome::Reject(error) => {
-            return BufferedHookResult::Override(error.render(None));
-        }
-    }
-
-    let usage = response.usage.clone();
-    if before == serde_json::to_value(&response).ok() {
-        return BufferedHookResult::Continue { body, usage };
-    }
-    let value = call_ctx
-        .ingress
-        .handler()
-        .make_response_encoder()
-        .format_response(&response);
-    match serde_json::to_vec(&value) {
-        Ok(body) => BufferedHookResult::Continue {
-            body: Bytes::from(body),
+        super::buffered::BufferedFinalize::Continue {
             usage,
-        },
-        Err(_) => BufferedHookResult::Continue { body, usage },
+            mutated: false,
+            ..
+        } => BufferedWireFinalize::Continue { body, usage },
+        super::buffered::BufferedFinalize::Continue {
+            response,
+            usage,
+            mutated: true,
+        } => {
+            let value = call_ctx
+                .ingress
+                .handler()
+                .make_response_encoder()
+                .format_response(&response);
+            let body = serde_json::to_vec(&value).map(Bytes::from).unwrap_or(body);
+            BufferedWireFinalize::Continue { body, usage }
+        }
     }
 }
 
@@ -962,8 +716,8 @@ fn build_streaming_compat_response(
         let message = "compat streaming conversion returned a buffered body";
         return CompatAttempt {
             response: compat_error_response(500, message),
-            force_retry: true,
-            health_outcome: HealthOutcome::Neutral,
+            retry: RetryDisposition::ForceRetry,
+            health: HealthOutcome::Neutral,
         };
     };
 
@@ -972,24 +726,10 @@ fn build_streaming_compat_response(
     let client_protocol = call_ctx.ingress;
     let actual_model = call_ctx.actual_model.to_string();
     let request_context = req_ctx.clone();
-    let gateway = call_ctx.gw.clone();
-    let on_response_hooks = crate::plugin::phase::PhaseHookRegistry::global()
-        .for_phase(crate::plugin::phase::Phase::OnResponse);
-    let (mut hook_req_ctx, mut hook_req_ir, hook_gateway) = if on_response_hooks.is_empty() {
-        (None, None, None)
-    } else {
-        (
-            Some(req_ctx.clone()),
-            Some(req_ir.clone()),
-            Some(gateway.clone()),
-        )
-    };
+    let mut hook_state = super::streaming::StreamHookState::capture(req_ctx, req_ir, &call_ctx.gw);
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, Infallible>>(64);
 
     tokio::spawn(async move {
-        let on_response_host = hook_gateway
-            .as_ref()
-            .map(crate::plugin::phase::HostContext::new);
         let mut bridge = crate::proxy::stream::StreamBridge::new(&request_context);
         bridge.on_connected();
         let mut parser = client_protocol.handler().make_stream_response_decoder();
@@ -1033,19 +773,12 @@ fn build_streaming_compat_response(
             observe_terminal(&mut terminal, &bytes, client_protocol);
             let text = String::from_utf8_lossy(&bytes);
             let outgoing = if let Ok(mut deltas) = parser.parse_chunk(&text) {
-                if on_response_hooks.is_empty() {
+                if hook_state.is_empty() {
                     accumulator.apply_all(&deltas);
                     bytes
                 } else {
                     let before = format!("{deltas:?}");
-                    apply_stream_hooks(
-                        &on_response_hooks,
-                        on_response_host.as_ref(),
-                        hook_req_ctx.as_mut(),
-                        hook_req_ir.as_mut(),
-                        &mut deltas,
-                    )
-                    .await;
+                    hook_state.apply(&mut deltas).await;
                     accumulator.apply_all(&deltas);
                     let events = formatter.format_deltas(&deltas);
                     if before == format!("{deltas:?}") {
@@ -1084,18 +817,11 @@ fn build_streaming_compat_response(
         terminal.finish(client_protocol);
         if let Ok(mut deltas) = parser.finish() {
             let before = format!("{deltas:?}");
-            if !on_response_hooks.is_empty() {
-                apply_stream_hooks(
-                    &on_response_hooks,
-                    on_response_host.as_ref(),
-                    hook_req_ctx.as_mut(),
-                    hook_req_ir.as_mut(),
-                    &mut deltas,
-                )
-                .await;
+            if !hook_state.is_empty() {
+                hook_state.apply(&mut deltas).await;
             }
             accumulator.apply_all(&deltas);
-            if !on_response_hooks.is_empty() && before != format!("{deltas:?}") {
+            if !hook_state.is_empty() && before != format!("{deltas:?}") {
                 let events = formatter.format_deltas(&deltas);
                 let outgoing = Bytes::from(
                     events
@@ -1184,8 +910,8 @@ fn build_streaming_compat_response(
             response_metadata,
             Body::from_stream(ReceiverStream::new(rx)),
         ),
-        force_retry: false,
-        health_outcome: HealthOutcome::Deferred,
+        retry: RetryDisposition::DefaultStatusPolicy,
+        health: HealthOutcome::Deferred,
     }
 }
 
@@ -1211,28 +937,6 @@ fn stream_health_outcome(
         _ if client_disconnected => StreamHealthOutcome::Neutral,
         _ if completed => StreamHealthOutcome::Success,
         _ => StreamHealthOutcome::Failure,
-    }
-}
-
-async fn apply_stream_hooks(
-    hooks: &[&std::sync::Arc<dyn crate::plugin::phase::PhaseHook>],
-    host: Option<&crate::plugin::phase::HostContext<'_>>,
-    req_ctx: Option<&mut RequestContext>,
-    req_ir: Option<&mut AiRequest>,
-    deltas: &mut [crate::protocol::ir::AiStreamDelta],
-) {
-    let (Some(host), Some(req_ctx), Some(req_ir)) = (host, req_ctx, req_ir) else {
-        return;
-    };
-    for delta in deltas.iter_mut() {
-        let _ = super::run_phase_hooks_slice(
-            hooks,
-            req_ctx,
-            req_ir,
-            crate::plugin::phase::ResponseView::Stream(delta),
-            host,
-        )
-        .await;
     }
 }
 
@@ -1464,68 +1168,9 @@ fn codex_compat_error_response(
     compat_error_response(status, message)
 }
 
+#[cfg(test)]
 fn request_patch(baseline: &AiRequest, current: &AiRequest) -> Result<Option<Bytes>, String> {
-    let source_protocol = baseline
-        .meta
-        .source_protocol
-        .ok_or_else(|| "request is missing its source protocol".to_string())?;
-    let encoder = source_protocol.handler().make_request_encoder();
-    // The patch only replays hook mutations onto the compat wire body. When
-    // either IR snapshot cannot re-encode (e.g. the ingress codec rejects a
-    // degenerate request), skip the patch entirely and let the real
-    // conversion path surface the proper client-facing error.
-    let (Ok(baseline), Ok(current)) = (
-        encoder.encode_request(baseline).map(|encoded| encoded.0),
-        encoder.encode_request(current).map(|encoded| encoded.0),
-    ) else {
-        return Ok(None);
-    };
-    value_patch(&baseline, &current)
-}
-
-fn value_patch(baseline: &Value, current: &Value) -> Result<Option<Bytes>, String> {
-    let mut operations = Vec::new();
-    diff_values(baseline, current, &mut Vec::new(), &mut operations);
-    if operations.is_empty() {
-        return Ok(None);
-    }
-    serde_json::to_vec(&operations)
-        .map(Bytes::from)
-        .map(Some)
-        .map_err(|error| error.to_string())
-}
-
-fn diff_values(
-    baseline: &Value,
-    current: &Value,
-    path: &mut Vec<String>,
-    operations: &mut Vec<Value>,
-) {
-    if baseline == current {
-        return;
-    }
-    match (baseline, current) {
-        (Value::Object(before), Value::Object(after)) => {
-            for (key, before_value) in before {
-                path.push(key.clone());
-                if let Some(after_value) = after.get(key) {
-                    diff_values(before_value, after_value, path, operations);
-                } else {
-                    operations.push(json!({"op": "remove", "path": path}));
-                }
-                path.pop();
-            }
-            for (key, after_value) in after {
-                if before.contains_key(key) {
-                    continue;
-                }
-                path.push(key.clone());
-                operations.push(json!({"op": "set", "path": path, "value": after_value}));
-                path.pop();
-            }
-        }
-        _ => operations.push(json!({"op": "set", "path": path, "value": current})),
-    }
+    crate::conversion::request_patch(baseline, current)
 }
 
 #[cfg(test)]
@@ -1579,6 +1224,33 @@ mod tests {
         );
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn select_via_resolver(
+        ingress: ProtocolId,
+        egress: ProtocolId,
+        provider: &Provider,
+        egress_base_url: &str,
+        actual_model: &str,
+        client_stream: bool,
+        headers: &HeaderMap,
+        raw_body: &[u8],
+        baseline_request: &AiRequest,
+        current_request: &AiRequest,
+    ) -> Result<Option<crate::conversion::RawWireCompatSelection>, String> {
+        crate::conversion::resolve_raw_wire_compat(crate::conversion::ResolveRawWireCompatInput {
+            ingress,
+            egress,
+            provider,
+            egress_base_url,
+            actual_model,
+            client_stream,
+            headers,
+            raw_body,
+            baseline_request,
+            current_request,
+        })
+    }
+
     fn provider(vendor: &str, channel: &str) -> Provider {
         Provider {
             id: "provider-test".into(),
@@ -1620,7 +1292,7 @@ mod tests {
     #[test]
     fn selects_codex_oauth_responses_flavor() {
         let request = request("virtual", ANTHROPIC_MESSAGES_2023_06_01);
-        let selected = select_compat_request(
+        let selected = select_via_resolver(
             ANTHROPIC_MESSAGES_2023_06_01,
             OPENAI_RESPONSES_V1,
             &provider("openai", "codex"),
@@ -1646,7 +1318,7 @@ mod tests {
         let request = request("virtual", ANTHROPIC_MESSAGES_2023_06_01);
         let mut codex = provider("openai", "codex");
         codex.fast_mode = true;
-        let selected = select_compat_request(
+        let selected = select_via_resolver(
             ANTHROPIC_MESSAGES_2023_06_01,
             OPENAI_RESPONSES_V1,
             &codex,
@@ -1666,7 +1338,7 @@ mod tests {
     #[test]
     fn selects_xai_native_only_for_responses_ingress() {
         let request = request("grok-4", OPENAI_RESPONSES_V1);
-        let selected = select_compat_request(
+        let selected = select_via_resolver(
             OPENAI_RESPONSES_V1,
             OPENAI_RESPONSES_V1,
             &provider("xai", "default"),
@@ -1940,7 +1612,7 @@ mod tests {
         )
         .await;
         assert_eq!(attempt.response.status(), StatusCode::OK);
-        assert!(!attempt.force_retry);
+        assert_eq!(attempt.retry, RetryDisposition::DefaultStatusPolicy);
         let body = response_body(attempt.response).await;
         let value: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(value["type"], "message");
@@ -2020,8 +1692,8 @@ mod tests {
         )
         .await;
         assert_eq!(attempt.response.status(), StatusCode::UNPROCESSABLE_ENTITY);
-        assert!(attempt.force_retry);
-        assert_eq!(attempt.health_outcome, HealthOutcome::Failure);
+        assert_eq!(attempt.retry, RetryDisposition::ForceRetry);
+        assert_eq!(attempt.health, HealthOutcome::Failure);
         let body = response_body(attempt.response).await;
         let value: Value = serde_json::from_slice(&body).unwrap();
         assert!(
@@ -2078,7 +1750,7 @@ mod tests {
         )
         .await;
         assert_eq!(attempt.response.status(), StatusCode::OK);
-        assert_eq!(attempt.health_outcome, HealthOutcome::Deferred);
+        assert_eq!(attempt.health, HealthOutcome::Deferred);
         assert_eq!(
             attempt
                 .response
@@ -2217,7 +1889,7 @@ mod tests {
             gw.health_registry.try_acquire(health_key).unwrap(),
         )
         .await;
-        assert_eq!(attempt.health_outcome, HealthOutcome::Deferred);
+        assert_eq!(attempt.health, HealthOutcome::Deferred);
         let body = tokio::time::timeout(
             std::time::Duration::from_secs(1),
             response_body(attempt.response),
@@ -2280,7 +1952,7 @@ mod tests {
             gw.health_registry.try_acquire(health_key).unwrap(),
         )
         .await;
-        assert_eq!(attempt.health_outcome, HealthOutcome::Deferred);
+        assert_eq!(attempt.health, HealthOutcome::Deferred);
         drop(attempt.response);
         tokio::time::timeout(std::time::Duration::from_secs(1), log_rx.recv())
             .await
@@ -2293,7 +1965,7 @@ mod tests {
     #[test]
     fn codex_anthropic_profile_uses_stripped_model() {
         let request = request("virtual", OPENAI_RESPONSES_V1);
-        let selected = select_compat_request(
+        let selected = select_via_resolver(
             OPENAI_RESPONSES_V1,
             ANTHROPIC_MESSAGES_2023_06_01,
             &provider("anthropic", "default"),
@@ -2346,7 +2018,7 @@ mod tests {
     #[test]
     fn needs_transform_matrix_matches_egress_protocol() {
         let plain = anthropic_provider("https://api.anthropic.com");
-        assert!(!supports_compat_request(
+        assert!(!crate::conversion::supports_raw_wire_compat(
             ANTHROPIC_MESSAGES_2023_06_01,
             ANTHROPIC_MESSAGES_2023_06_01,
             &plain,
@@ -2359,7 +2031,7 @@ mod tests {
             GOOGLE_GEMINI_GENERATE_CONTENT_V1BETA,
         ] {
             assert!(
-                supports_compat_request(
+                crate::conversion::supports_raw_wire_compat(
                     ANTHROPIC_MESSAGES_2023_06_01,
                     egress,
                     &plain,
@@ -2372,7 +2044,7 @@ mod tests {
         // DeepSeek-flavoured Anthropic upstream: even Anthropic→Anthropic
         // needs the ported normalizations.
         let deepseek = anthropic_provider("https://api.deepseek.com/anthropic");
-        assert!(supports_compat_request(
+        assert!(crate::conversion::supports_raw_wire_compat(
             ANTHROPIC_MESSAGES_2023_06_01,
             ANTHROPIC_MESSAGES_2023_06_01,
             &deepseek,
@@ -2382,7 +2054,7 @@ mod tests {
         // Kimi deliberately stays generic (2026-08 feedback: injecting
         // thinking placeholders corrupts its chain of thought).
         let kimi = anthropic_provider("https://api.kimi.com/coding");
-        assert!(!supports_compat_request(
+        assert!(!crate::conversion::supports_raw_wire_compat(
             ANTHROPIC_MESSAGES_2023_06_01,
             ANTHROPIC_MESSAGES_2023_06_01,
             &kimi,
@@ -2392,9 +2064,177 @@ mod tests {
     }
 
     #[test]
+    fn compat_support_matrix_covers_positive_and_negative_boundaries() {
+        let generic = provider("custom", "default");
+        let xai = provider("xai", "default");
+        let openai = provider("openai", "default");
+        let codex = provider("custom", "codex");
+        let sub2api = provider("custom", "sub2api");
+        let deepseek = anthropic_provider("https://api.deepseek.com/anthropic");
+        let kimi = anthropic_provider("https://api.kimi.com/coding");
+
+        let cases = [
+            (
+                "anthropic_to_chat",
+                ANTHROPIC_MESSAGES_2023_06_01,
+                OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1,
+                &generic,
+                "https://example.com",
+                "model",
+                true,
+            ),
+            (
+                "anthropic_to_responses",
+                ANTHROPIC_MESSAGES_2023_06_01,
+                OPENAI_RESPONSES_V1,
+                &generic,
+                "https://example.com",
+                "model",
+                true,
+            ),
+            (
+                "anthropic_to_gemini",
+                ANTHROPIC_MESSAGES_2023_06_01,
+                GOOGLE_GEMINI_GENERATE_CONTENT_V1BETA,
+                &generic,
+                "https://example.com",
+                "model",
+                true,
+            ),
+            (
+                "responses_to_chat",
+                OPENAI_RESPONSES_V1,
+                OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1,
+                &generic,
+                "https://example.com",
+                "model",
+                true,
+            ),
+            (
+                "responses_to_anthropic",
+                OPENAI_RESPONSES_V1,
+                ANTHROPIC_MESSAGES_2023_06_01,
+                &generic,
+                "https://example.com",
+                "model",
+                true,
+            ),
+            (
+                "responses_native_xai",
+                OPENAI_RESPONSES_V1,
+                OPENAI_RESPONSES_V1,
+                &xai,
+                "https://attacker.example",
+                "grok-4.5",
+                true,
+            ),
+            (
+                "responses_native_third_party_candidate",
+                OPENAI_RESPONSES_V1,
+                OPENAI_RESPONSES_V1,
+                &generic,
+                "https://example.com",
+                "model",
+                true,
+            ),
+            (
+                "anthropic_native_deepseek",
+                ANTHROPIC_MESSAGES_2023_06_01,
+                ANTHROPIC_MESSAGES_2023_06_01,
+                &deepseek,
+                "https://api.deepseek.com/anthropic",
+                "deepseek-v4-pro",
+                true,
+            ),
+            (
+                "anthropic_native_generic",
+                ANTHROPIC_MESSAGES_2023_06_01,
+                ANTHROPIC_MESSAGES_2023_06_01,
+                &generic,
+                "https://api.anthropic.com",
+                "claude-sonnet-5",
+                false,
+            ),
+            (
+                "anthropic_native_kimi",
+                ANTHROPIC_MESSAGES_2023_06_01,
+                ANTHROPIC_MESSAGES_2023_06_01,
+                &kimi,
+                "https://api.kimi.com/coding",
+                "kimi-for-coding",
+                false,
+            ),
+            (
+                "responses_native_openai",
+                OPENAI_RESPONSES_V1,
+                OPENAI_RESPONSES_V1,
+                &openai,
+                "https://api.openai.com/v1",
+                "gpt-5",
+                false,
+            ),
+            (
+                "responses_native_codex_channel",
+                OPENAI_RESPONSES_V1,
+                OPENAI_RESPONSES_V1,
+                &codex,
+                "https://chatgpt.com/backend-api/codex",
+                "gpt-5",
+                false,
+            ),
+            (
+                "responses_native_sub2api_channel",
+                OPENAI_RESPONSES_V1,
+                OPENAI_RESPONSES_V1,
+                &sub2api,
+                "https://example.com",
+                "gpt-5",
+                false,
+            ),
+            (
+                "chat_to_anthropic_uses_ir",
+                OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1,
+                ANTHROPIC_MESSAGES_2023_06_01,
+                &generic,
+                "https://example.com",
+                "model",
+                false,
+            ),
+            (
+                "gemini_to_chat_uses_ir",
+                GOOGLE_GEMINI_GENERATE_CONTENT_V1BETA,
+                OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1,
+                &generic,
+                "https://example.com",
+                "model",
+                false,
+            ),
+            (
+                "embeddings_stay_native",
+                crate::protocol::ids::OPENAI_COMPATIBLE_EMBEDDINGS_V1,
+                crate::protocol::ids::OPENAI_COMPATIBLE_EMBEDDINGS_V1,
+                &generic,
+                "https://example.com",
+                "embedding-model",
+                false,
+            ),
+        ];
+
+        for (name, ingress, egress, provider, base_url, model, expected) in cases {
+            assert_eq!(
+                crate::conversion::supports_raw_wire_compat(
+                    ingress, egress, provider, base_url, model
+                ),
+                expected,
+                "compat support mismatch for {name}"
+            );
+        }
+    }
+
+    #[test]
     fn anthropic_passthrough_profile_carries_normalization_hints() {
         let request = request("deepseek-v4-pro", ANTHROPIC_MESSAGES_2023_06_01);
-        let selected = select_compat_request(
+        let selected = select_via_resolver(
             ANTHROPIC_MESSAGES_2023_06_01,
             ANTHROPIC_MESSAGES_2023_06_01,
             &anthropic_provider("https://api.deepseek.com/anthropic"),
@@ -2426,7 +2266,7 @@ mod tests {
         let request = request("gpt-5", OPENAI_RESPONSES_V1);
         let raw = br#"{"model":"gpt-5","input":"hello"}"#;
 
-        let chat = select_compat_request(
+        let chat = select_via_resolver(
             OPENAI_RESPONSES_V1,
             OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1,
             &provider("custom", "default"),
@@ -2445,7 +2285,7 @@ mod tests {
             nyro_ccswitch_compat::Direction::CodexResponsesToChat
         );
 
-        let anthropic = select_compat_request(
+        let anthropic = select_via_resolver(
             OPENAI_RESPONSES_V1,
             ANTHROPIC_MESSAGES_2023_06_01,
             &anthropic_provider("https://claude-gateway.example.com"),
@@ -2477,7 +2317,7 @@ mod tests {
 
         // Plain responses passthrough without xai is not a compat conversion.
         assert!(
-            select_compat_request(
+            select_via_resolver(
                 OPENAI_RESPONSES_V1,
                 OPENAI_RESPONSES_V1,
                 &provider("custom", "default"),
@@ -2503,7 +2343,7 @@ mod tests {
             ("https://api.openai.com/v1", true),
             ("https://strict.example.com/v1", false),
         ] {
-            let selected = select_compat_request(
+            let selected = select_via_resolver(
                 OPENAI_RESPONSES_V1,
                 OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1,
                 &provider("custom", "default"),
@@ -2531,7 +2371,7 @@ mod tests {
         let request = request("grok-4.5", OPENAI_RESPONSES_V1);
         let mut attacker = provider("xai", "default");
         attacker.base_url = "https://attacker.example/anthropic".into();
-        let selected = select_compat_request(
+        let selected = select_via_resolver(
             OPENAI_RESPONSES_V1,
             OPENAI_RESPONSES_V1,
             &attacker,
@@ -2558,7 +2398,7 @@ mod tests {
         // plain body (no Responses-Lite artifacts) selects None and keeps
         // the byte-level native passthrough.
         let plain = provider("custom", "default");
-        assert!(supports_compat_request(
+        assert!(crate::conversion::supports_raw_wire_compat(
             OPENAI_RESPONSES_V1,
             OPENAI_RESPONSES_V1,
             &plain,
@@ -2566,7 +2406,7 @@ mod tests {
             "grok-4.5",
         ));
         assert!(
-            select_compat_request(
+            select_via_resolver(
                 OPENAI_RESPONSES_V1,
                 OPENAI_RESPONSES_V1,
                 &plain,
@@ -2583,11 +2423,168 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn xai_oauth_invariants_ignore_editable_format_and_base_url() {
+        // Nyro has no editable api_format override: the negotiated egress ID and
+        // vendor identity are authoritative even when base_url is attacker-controlled.
+        let raw = br#"{"model":"grok-4.5","max_tokens":2048,"thinking":{"type":"enabled","budget_tokens":20000},"messages":[{"role":"user","content":"hello"}]}"#;
+        let request = request("grok-4.5", ANTHROPIC_MESSAGES_2023_06_01);
+        let mut attacker = provider("xai", "default");
+        attacker.base_url = "https://attacker.example/anthropic".into();
+        let selected = select_via_resolver(
+            ANTHROPIC_MESSAGES_2023_06_01,
+            OPENAI_RESPONSES_V1,
+            &attacker,
+            "https://attacker.example/anthropic",
+            "grok-4.5",
+            false,
+            &HeaderMap::new(),
+            raw,
+            &request,
+            &request,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(selected.profile.direction, Direction::AnthropicToResponses);
+        assert_eq!(
+            selected.profile.upstream_flavor,
+            UpstreamFlavor::XaiStrictResponses
+        );
+        assert_eq!(selected.profile.model.as_deref(), Some("grok-4.5"));
+
+        let prepared = CompatEngine::default()
+            .prepare_request(
+                selected.profile,
+                Bytes::copy_from_slice(raw),
+                selected.identity,
+            )
+            .await
+            .unwrap();
+        let transformed: Value = serde_json::from_slice(&prepared.body).unwrap();
+        assert_eq!(transformed["reasoning"]["effort"], "high");
+        assert_eq!(
+            transformed["include"],
+            json!(["reasoning.encrypted_content"])
+        );
+        assert!(transformed.get("store").is_none());
+    }
+
+    #[tokio::test]
+    async fn namespace_flatten_gate_only_fires_for_xai_oauth() {
+        let body = br#"{"model":"grok-4.5","tools":[{"type":"function","name":"plain_tool","parameters":{}},{"type":"namespace","name":"mcp__files__","tools":[{"type":"function","name":"read","parameters":{}}]}],"input":[{"role":"user","content":"hello"}]}"#;
+        let request = request("grok-4.5", OPENAI_RESPONSES_V1);
+        let selected = select_via_resolver(
+            OPENAI_RESPONSES_V1,
+            OPENAI_RESPONSES_V1,
+            &provider("xai", "default"),
+            "https://attacker.example/anthropic",
+            "grok-4.5",
+            false,
+            &HeaderMap::new(),
+            body,
+            &request,
+            &request,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            selected.profile.upstream_flavor,
+            UpstreamFlavor::XaiStrictResponses
+        );
+        let prepared = CompatEngine::default()
+            .prepare_request(
+                selected.profile,
+                Bytes::copy_from_slice(body),
+                selected.identity,
+            )
+            .await
+            .unwrap();
+        let flattened: Value = serde_json::from_slice(&prepared.body).unwrap();
+        let tools = flattened["tools"].as_array().unwrap();
+        assert!(tools.iter().all(|tool| tool["type"] == "function"));
+        assert!(
+            tools
+                .iter()
+                .any(|tool| tool["name"] == "mcp__files____read")
+        );
+
+        // A base URL that merely resembles xAI cannot select the xAI profile.
+        let plain = provider("custom", "default");
+        assert!(
+            select_via_resolver(
+                OPENAI_RESPONSES_V1,
+                OPENAI_RESPONSES_V1,
+                &plain,
+                "https://api.x.ai/v1",
+                "grok-4.5",
+                false,
+                &HeaderMap::new(),
+                br#"{"model":"grok-4.5","input":"hello"}"#,
+                &request,
+                &request,
+            )
+            .unwrap()
+            .is_none()
+        );
+
+        // Responses-Lite artifacts may still select the separate third-party
+        // normalization profile, but never masquerade as xAI OAuth.
+        let third_party = select_via_resolver(
+            OPENAI_RESPONSES_V1,
+            OPENAI_RESPONSES_V1,
+            &plain,
+            "https://api.x.ai/v1",
+            "grok-4.5",
+            false,
+            &HeaderMap::new(),
+            body,
+            &request,
+            &request,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            third_party.profile.upstream_flavor,
+            UpstreamFlavor::ThirdPartyStrictResponses
+        );
+    }
+
+    #[test]
+    fn xai_oauth_pins_native_responses_catalog_profile() {
+        let request = request("grok-4.5", OPENAI_RESPONSES_V1);
+        let mut xai = provider("xai", "default");
+        xai.protocol = "anthropic-messages".into();
+        xai.base_url = "https://attacker.example/anthropic".into();
+        let selected = select_via_resolver(
+            OPENAI_RESPONSES_V1,
+            OPENAI_RESPONSES_V1,
+            &xai,
+            "https://attacker.example/anthropic",
+            "grok-4.5",
+            false,
+            &HeaderMap::new(),
+            br#"{"model":"grok-4.5","input":"hello"}"#,
+            &request,
+            &request,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(selected.profile.direction, Direction::XaiResponsesNative);
+        assert_eq!(
+            selected.profile.upstream_flavor,
+            UpstreamFlavor::XaiStrictResponses
+        );
+        assert_eq!(
+            selected.profile.upstream_protocol,
+            nyro_ccswitch_compat::WireProtocol::OpenAiResponses
+        );
+    }
+
     #[test]
     fn selects_third_party_responses_for_carrier_bodies() {
         let request = request("glm-5.3", OPENAI_RESPONSES_V1);
         let body = br#"{"model":"glm-5.3","input":[{"type":"additional_tools","tools":[{"type":"custom","name":"exec"},{"type":"function","name":"wait","parameters":{"type":"object"}}]},{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}]}"#;
-        let selected = select_compat_request(
+        let selected = select_via_resolver(
             OPENAI_RESPONSES_V1,
             OPENAI_RESPONSES_V1,
             &provider("glm", "default"),
@@ -2620,7 +2617,7 @@ mod tests {
         ] {
             let p = provider(vendor, channel);
             assert!(
-                !supports_compat_request(
+                !crate::conversion::supports_raw_wire_compat(
                     OPENAI_RESPONSES_V1,
                     OPENAI_RESPONSES_V1,
                     &p,
@@ -2736,8 +2733,8 @@ mod tests {
             gw.health_registry.try_acquire("compat-test").unwrap(),
         )
         .await;
-        assert!(attempt.force_retry);
-        assert_ne!(attempt.health_outcome, HealthOutcome::Deferred);
+        assert_eq!(attempt.retry, RetryDisposition::ForceRetry);
+        assert_ne!(attempt.health, HealthOutcome::Deferred);
         assert_ne!(attempt.response.status(), StatusCode::OK);
     }
 
@@ -2815,13 +2812,15 @@ mod tests {
         let nginx_html = b"<html>\r\n<head><title>413 Request Entity Too Large</title></head>\r\n<body>\r\n<center><h1>413 Request Entity Too Large</h1></center>\r\n<hr><center>nginx/1.29.6</center>\r\n</body>\r\n</html>".to_vec();
         let (url, _request_rx) =
             serve_once("HTTP/1.1 413 Payload Too Large", "text/html", nginx_html).await;
-        let (call_ctx, mut req_ctx, mut req_ir, req_extras) = call_context(
+        let (mut call_ctx, mut req_ctx, mut req_ir, mut req_extras) = call_context(
             &gw,
             &provider,
             OPENAI_RESPONSES_V1,
             ANTHROPIC_MESSAGES_2023_06_01,
             false,
         );
+        call_ctx.actual_model = "gpt-5.5";
+        req_extras.path = "/responses".into();
         let host = crate::plugin::phase::HostContext::new(&gw);
 
         let attempt = handle_compat(
@@ -2838,7 +2837,7 @@ mod tests {
         )
         .await;
         assert_eq!(attempt.response.status(), StatusCode::PAYLOAD_TOO_LARGE);
-        assert_eq!(attempt.health_outcome, HealthOutcome::Neutral);
+        assert_eq!(attempt.health, HealthOutcome::Neutral);
         let body = response_body(attempt.response).await;
         let value: Value = serde_json::from_slice(&body).unwrap();
         let message = value["error"]["message"].as_str().unwrap();
@@ -2850,7 +2849,8 @@ mod tests {
         assert!(!message.contains("nginx/1.29.6"));
         assert_eq!(value["error"]["upstream_status"], 413);
         assert_eq!(value["error"]["provider"], "HCAI");
-        assert_eq!(value["error"]["model"], "upstream-model");
+        assert_eq!(value["error"]["model"], "gpt-5.5");
+        assert_eq!(value["error"]["endpoint"], "/responses");
     }
 
     #[tokio::test]
@@ -2896,7 +2896,7 @@ mod tests {
         )
         .await;
         assert_eq!(attempt.response.status(), StatusCode::BAD_GATEWAY);
-        assert_eq!(attempt.health_outcome, HealthOutcome::Failure);
+        assert_eq!(attempt.health, HealthOutcome::Failure);
         let body = response_body(attempt.response).await;
         let value: Value = serde_json::from_slice(&body).unwrap();
         let message = value["error"]["message"].as_str().unwrap();
@@ -2905,6 +2905,29 @@ mod tests {
         assert!(message.contains("upstream-model"));
         assert!(message.contains("cause"));
         assert_eq!(value["error"]["provider"], "DeepSeek");
+
+        // Lock the exact source-level envelope assertions with Nyro's documented
+        // product-name/code substitution; the transport failure above remains
+        // the production-path integration coverage.
+        let direct = nyro_ccswitch_compat::codex_client_error_json(
+            "DeepSeek",
+            "deepseek-chat",
+            "/responses",
+            None,
+            None,
+            Some("连接失败: dns lookup failed"),
+        );
+        let direct: Value = serde_json::from_slice(&direct).unwrap();
+        let direct_message = direct["error"]["message"].as_str().unwrap();
+        assert!(direct_message.contains("Nyro local proxy failed"));
+        assert!(direct_message.contains("DeepSeek"));
+        assert!(direct_message.contains("deepseek-chat"));
+        assert!(direct_message.contains("/responses"));
+        assert!(direct_message.contains("dns lookup failed"));
+        assert_eq!(direct["error"]["code"], "nyro_forward_failed");
+        assert_eq!(direct["error"]["provider"], "DeepSeek");
+        assert_eq!(direct["error"]["model"], "deepseek-chat");
+        assert_eq!(direct["error"]["endpoint"], "/responses");
     }
 
     #[tokio::test]
@@ -2950,7 +2973,7 @@ mod tests {
         )
         .await;
         assert_eq!(attempt.response.status(), StatusCode::BAD_GATEWAY);
-        assert_eq!(attempt.health_outcome, HealthOutcome::Failure);
+        assert_eq!(attempt.health, HealthOutcome::Failure);
         let body = response_body(attempt.response).await;
         let value: Value = serde_json::from_slice(&body).unwrap();
         let message = value["error"]["message"].as_str().unwrap();

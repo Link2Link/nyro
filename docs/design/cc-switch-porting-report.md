@@ -33,7 +33,7 @@ cc-switch 的转换层位于 `src-tauri/src/proxy/`,约 59K 行(含测试),其�
 
 ## 4. 模块映射清单
 
-### 4.1 直接移植(`ported/`,状态 migrated,518 个测试)
+### 4.1 直接移植(`ported/`,状态 migrated,511 个测试)
 
 | cc-switch 源文件 | nyro 位置 | 职责 |
 |---|---|---|
@@ -57,9 +57,9 @@ cc-switch 的转换层位于 `src-tauri/src/proxy/`,约 59K 行(含测试),其�
 | `session.rs` | 会话身份提取(Anthropic 头/metadata.user_id、Codex/GrokBuild 头)与转换会话 |
 | `transport.rs` | Header/BodyKind/`should_force_identity_encoding`/诊断分类 |
 | `state.rs` | codex_chat_history + gemini_shadow 的进程内状态 |
-| `nyro-core:dispatcher/compat.rs`(2605 行) | 选路矩阵、首块 priming/重放、头归一化(Codex 指纹剥离、1M 上下文 beta)、usage 记账、错误封套接线 |
+| `nyro-core:dispatcher/compat.rs`(重构基线约 3200 行，含测试) | 选路矩阵、首块 priming/重放、头归一化(Codex 指纹剥离、1M 上下文 beta)、usage 记账、错误封套接线 |
 
-### 4.3 判定层映射(mapped,142 个测试)
+### 4.3 判定层映射(mapped,149 个测试)
 
 cc-switch 的 `providers/claude.rs`/`codex.rs`/`forwarder.rs`/`handlers.rs`/`response_processor.rs` 中与协议行为相关的判定,映射到 nyro 的对应测试(引擎级或 dispatcher 级),每条在清单中记录断言级说明。典型例:
 
@@ -111,18 +111,18 @@ python3 scripts/check_cc_switch_parity_inventory.py \
 - `migrated` 仅允许直接移植文件(路径锁定);`mapped` 需 target 定位符 + target SHA-256 锁定 + ≥30 字符且不含 PENDING 字样的断言级说明;`not-applicable` 需 policy 批准的排除分类与固定理由。
 - 目标测试扫描域:compat crate、`nyro-core/src/proxy/dispatcher/compat.rs`、`nyro-core/tests/cc_switch_parity.rs`。
 - 代码重排(如 fmt)后需带 `--update-targets` 重跑刷新哈希。
-- 最终结果:**Integrity: OK,Completeness: COMPLETE**——1168 = 518 migrated + 142 mapped + 508 not-applicable,发现目标测试 670 个。
+- 2026-08-22 重构基线复核结果：**Integrity: OK, Completeness: COMPLETE**——1168 = 511 migrated + 149 mapped + 508 not-applicable，发现目标测试 699 个，pending 0。
 
 ## 8. 测试与验证
 
 | 门禁 | 结果 |
 |---|---|
-| `make test`(workspace,除 desktop;exit 0) | 23 个测试二进制,**1307 通过 / 0 失败**(vendored serde_json 的上游 doctest 已在 manifest 中以 `doctest = false` 关闭——其 dev-dependencies 被裁剪后本就无法编译,且属上游文档示例而非行为) |
-| `cargo test -p nyro-ccswitch-compat --lib` | 646 通过(含全部移植测试) |
-| `cargo test -p nyro-core --lib/--tests` | 214 + 599 通过(dispatcher 兼容层 24 个端到端测试:真实 TCP mock 上游走完整生产路径) |
+| `make test`（移植完成时历史门禁） | 23 个测试二进制，**1307 通过 / 0 失败**（vendored serde_json 的上游 doctest 已关闭） |
+| `cargo test -p nyro-ccswitch-compat --lib` | **663 通过 / 0 失败**（2026-08-22 重构基线复核，含直接移植测试与 Nyro 外层扩展测试） |
+| `cargo test -p nyro-core` | **全部 lib / integration / doctest 通过**（2026-08-22 Stage 6；401 个 lib 测试，PassThrough fidelity 23 个，dispatcher compat 36 个） |
 | `cargo check --workspace --exclude nyro-desktop` | 通过 |
 | `cargo fmt --all -- --check` | 干净 |
-| `cargo clippy`(两 crate,all-targets) | 无 error;移植触碰文件 0 警告(仅余 1 处与移植无关的历史警告 router/selector.rs sort_by_key) |
+| `cargo clippy`（`nyro-core` + `nyro-ccswitch-compat`, all-targets） | **0 error**；Stage 0 修改文件无新增告警，保留 nyro-core 既有 8 个 lib + 1 个测试告警 |
 | 对齐审计 `--require-complete` | exit 0,COMPLETE |
 
 dispatcher 级测试通过真实 `reqwest` 客户端 + 本地 TCP mock 上游驱动 `handle_compat` 全链路(选路→转换→首块 priming→流式转换→usage 记账→错误封套),不是纯函数抽查。独立验证 agent 复核全部门禁并做过对抗探测(伪造 commit、篡改清单均被审计拦截),结论 PASS。

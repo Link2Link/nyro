@@ -21,10 +21,12 @@
 
 mod accumulator;
 mod auth;
+mod buffered;
 mod compat;
 mod non_stream;
 mod param_overrides;
 mod stream;
+mod streaming;
 mod util;
 use self::accumulator::*;
 use self::auth::{GatewayProxyAccessStore, authorize_model_access, get_provider};
@@ -64,13 +66,7 @@ use crate::proxy::planner::{ProtocolMode, negotiate};
 use crate::router::TargetSelector;
 use crate::router::health::HealthPermit;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum HealthOutcome {
-    Success,
-    Failure,
-    Neutral,
-    Deferred,
-}
+pub(super) type HealthOutcome = crate::conversion::HealthDisposition;
 
 pub(super) fn health_outcome_from_status(status: u16) -> HealthOutcome {
     if status < 400 {
@@ -642,7 +638,7 @@ async fn dispatch_pipeline_inner(
             }
         }
 
-        let compat_selection = if compat::supports_compat_request(
+        let compat_selection = if crate::conversion::supports_raw_wire_compat(
             ingress,
             egress,
             &provider,
@@ -653,17 +649,19 @@ async fn dispatch_pipeline_inner(
                 last_response = Some(error_response(500, "compat request is missing raw body"));
                 continue;
             };
-            match compat::select_compat_request(
-                ingress,
-                egress,
-                &provider,
-                &egress_base_url,
-                &actual_model,
-                is_stream,
-                &headers,
-                raw_body,
-                &baseline_request,
-                &request_for_target,
+            match crate::conversion::resolve_raw_wire_compat(
+                crate::conversion::ResolveRawWireCompatInput {
+                    ingress,
+                    egress,
+                    provider: &provider,
+                    egress_base_url: &egress_base_url,
+                    actual_model: &actual_model,
+                    client_stream: is_stream,
+                    headers: &headers,
+                    raw_body,
+                    baseline_request: &baseline_request,
+                    current_request: &request_for_target,
+                },
             ) {
                 Ok(selection) => selection,
                 Err(error) => {
@@ -681,7 +679,8 @@ async fn dispatch_pipeline_inner(
         let transport_model = compat_selection
             .as_ref()
             .and_then(|selection| selection.profile.model.as_deref())
-            .unwrap_or(&actual_model);
+            .map(str::to_string)
+            .unwrap_or_else(|| actual_model.clone());
         let mut upstream_request = request_for_target.clone();
         let tool_route_plan = if compat_candidate {
             ToolRoutePlan::default()
@@ -701,7 +700,7 @@ async fn dispatch_pipeline_inner(
             egress_base_url: &egress_base_url,
             api_key: &credential,
             auth_scheme: &plan.auth_scheme,
-            actual_model: transport_model,
+            actual_model: &transport_model,
             credential: None,
             gw: &gw,
             disable_default_auth: provider_runtime.binding.disable_default_auth,
@@ -739,6 +738,40 @@ async fn dispatch_pipeline_inner(
             && !adapter.declared_request_mutations()
             && !tool_route_plan.is_active()
             && !param_override_applied;
+
+        let resolved_conversion =
+            crate::conversion::resolve_conversion(crate::conversion::ResolveConversionInput {
+                ingress,
+                egress,
+                raw_wire: compat_selection,
+                protocol_is_native: plan.mode == ProtocolMode::Native,
+                request_passthrough: passthrough_req,
+                response_passthrough: passthrough_resp,
+            })
+            .expect("dispatcher mutation facts must produce a valid conversion plan");
+        let conversion_plan = resolved_conversion.plan();
+        let conversion_strategy = conversion_plan.kind().as_str();
+        let conversion_rule = conversion_plan.rule_id();
+        let conversion_request_mode = conversion_plan.request_mode().as_str();
+        let conversion_response_mode = conversion_plan.response_mode().as_str();
+
+        ctx.trace(
+            "conversion",
+            format!(
+                "strategy={conversion_strategy}; rule={conversion_rule}; request={conversion_request_mode}; response={conversion_response_mode}"
+            ),
+        );
+        tracing::debug!(
+            conversion.strategy = conversion_strategy,
+            conversion.rule = conversion_rule,
+            conversion.request_mode = conversion_request_mode,
+            conversion.response_mode = conversion_response_mode,
+            ingress = %conversion_plan.ingress(),
+            egress = %conversion_plan.egress(),
+            provider_id = %provider.id,
+            "resolved protocol conversion path"
+        );
+
         let mut outbound = if passthrough_req {
             let raw = envelope.body.clone().unwrap_or_default();
             match crate::provider::common::pipeline::passthrough_run(
@@ -776,7 +809,7 @@ async fn dispatch_pipeline_inner(
             let egress_path = egress
                 .handler()
                 .make_request_encoder()
-                .egress_path(transport_model, is_stream);
+                .egress_path(&transport_model, is_stream);
             outbound.url = extension.build_url(&vendor_ctx, &egress_base_url, &egress_path);
         }
 
@@ -806,46 +839,32 @@ async fn dispatch_pipeline_inner(
             }
         }
 
-        let prepared_compat = if let Some(selection) = compat_selection.as_ref() {
-            let (Some(raw_body), Some(vendor_wire_before)) =
-                (raw_body.clone(), vendor_wire_before.as_ref())
-            else {
-                last_response = Some(error_response(
-                    500,
-                    "compat request is missing its raw or pre-vendor wire body",
-                ));
-                continue;
-            };
-            match compat::prepare_compat_request(
-                gw.compat_engine.as_ref(),
+        if let Some(selection) = resolved_conversion.raw_wire()
+            && let Err(error) = compat::normalize_compat_request_headers(
+                &mut outbound.headers,
                 selection,
-                raw_body,
-                vendor_wire_before,
-                &outbound.body,
+                &req_extras.path,
             )
+        {
+            last_response = Some(error_response(
+                500,
+                &format!("compat request header preparation failed: {error}"),
+            ));
+            continue;
+        }
+
+        let prepared_conversion =
+            match crate::conversion::prepare_conversion(crate::conversion::PrepareConversionInput {
+                resolved: resolved_conversion,
+                engine: gw.compat_engine.as_ref(),
+                native_body: outbound.body,
+                raw_body: raw_body.clone(),
+                vendor_wire_before: vendor_wire_before.as_ref(),
+            })
             .await
             {
-                Ok(prepared) => {
-                    if let Err(error) = compat::normalize_compat_request_headers(
-                        &mut outbound.headers,
-                        selection,
-                        &req_extras.path,
-                    ) {
-                        last_response = Some(error_response(
-                            500,
-                            &format!("compat request header preparation failed: {error}"),
-                        ));
-                        continue;
-                    }
-                    Some(prepared)
-                }
-                Err(error) => {
-                    // Invalid client history fails on every provider the same
-                    // way; cc-switch classifies these NonRetryable and so do
-                    // we — return to the client instead of replaying the
-                    // broken request at each target. Other conversion errors
-                    // carry their cc-switch status (422 for transform
-                    // failures) instead of a generic 500.
+                Ok(prepared) => prepared,
+                Err(crate::conversion::PrepareConversionError::RawWire(error)) => {
                     let message = format!("compat request preparation failed: {error}");
                     let status = error.http_status();
                     if error.is_invalid_request() {
@@ -854,10 +873,24 @@ async fn dispatch_pipeline_inner(
                     last_response = Some(unprocessable_response(status, &message));
                     continue;
                 }
-            }
-        } else {
-            None
-        };
+                Err(
+                    crate::conversion::PrepareConversionError::MissingRawBody
+                    | crate::conversion::PrepareConversionError::MissingVendorWireBefore,
+                ) => {
+                    last_response = Some(error_response(
+                        500,
+                        "compat request is missing its raw or pre-vendor wire body",
+                    ));
+                    continue;
+                }
+                Err(crate::conversion::PrepareConversionError::StrategyStateMismatch) => {
+                    last_response = Some(error_response(
+                        500,
+                        "resolved conversion preparation state is inconsistent",
+                    ));
+                    continue;
+                }
+            };
 
         let client = match gw.http_client_for_provider(provider.use_proxy).await {
             Ok(http_client) => ProxyClient::new(http_client),
@@ -871,6 +904,59 @@ async fn dispatch_pipeline_inner(
         let egress_str = egress.to_string();
         let egress_caps = egress.handler().capabilities();
         let upstream_forces_stream = egress_caps.force_upstream_stream;
+        debug_assert_eq!(
+            prepared_conversion.plan().kind().as_str(),
+            conversion_strategy
+        );
+        let uses_compat = prepared_conversion.is_raw_wire();
+        let native_response_passthrough = prepared_conversion.response_mode()
+            == crate::conversion::ResponseConversionMode::PassThroughBytes;
+        let (prepared_plan, prepared_body, prepared_force_stream, prepared_session) =
+            prepared_conversion.into_parts();
+        let (prepared_compat, prepared_native_body) = match (prepared_body, prepared_session) {
+            (
+                crate::conversion::PreparedBody::Raw(body),
+                session @ crate::conversion::PreparedSession::RawWireCompat(_),
+            ) => {
+                debug_assert_eq!(
+                    prepared_plan.kind(),
+                    crate::conversion::ConversionKind::RawWireCompat
+                );
+                let request = crate::conversion::rebuild_raw_wire_request(
+                    crate::conversion::PreparedBody::Raw(body),
+                    prepared_force_stream,
+                    session,
+                )
+                .expect("prepared Raw-Wire state must rebuild its request");
+                (Some(request), None)
+            }
+            (
+                crate::conversion::PreparedBody::Json(body),
+                crate::conversion::PreparedSession::PassThrough,
+            ) => {
+                debug_assert_eq!(
+                    prepared_plan.kind(),
+                    crate::conversion::ConversionKind::PassThrough
+                );
+                (None, Some(body))
+            }
+            (
+                crate::conversion::PreparedBody::Json(body),
+                crate::conversion::PreparedSession::NativeIr {
+                    ingress: prepared_ingress,
+                    egress: prepared_egress,
+                },
+            ) => {
+                debug_assert_eq!(
+                    prepared_plan.kind(),
+                    crate::conversion::ConversionKind::NativeIr
+                );
+                debug_assert_eq!(prepared_ingress, ingress);
+                debug_assert_eq!(prepared_egress, egress);
+                (None, Some(body))
+            }
+            _ => unreachable!("PreparedConversion guarantees matching body/session variants"),
+        };
 
         // ── Build per-target context structs ─────────────────────────────────
         let call_ctx = CallCtx {
@@ -895,9 +981,8 @@ async fn dispatch_pipeline_inner(
         // `OnLog` runs once at the pipeline boundary (see `dispatch_pipeline`).
         // The handlers run the `OnResponse` phase: non-stream paths see a full
         // `AiResponse`, the streaming path is invoked per `AiStreamDelta`.
-        let uses_compat = prepared_compat.is_some();
-        let (response, compat_retryable, health_outcome) = if let Some(prepared) = prepared_compat {
-            let attempt = compat::handle_compat(
+        let attempt = if let Some(prepared) = prepared_compat {
+            compat::handle_compat(
                 client,
                 &outbound.url,
                 outbound.headers,
@@ -909,22 +994,19 @@ async fn dispatch_pipeline_inner(
                 host,
                 health_permit.clone(),
             )
-            .await;
-            (
-                attempt.response,
-                attempt.force_retry,
-                attempt.health_outcome,
-            )
+            .await
         } else {
+            let native_body =
+                prepared_native_body.expect("non-Raw-Wire prepared conversion must contain JSON");
             let response = if is_stream {
                 handle_stream(
                     client,
                     &outbound.url,
                     outbound.headers,
-                    outbound.body,
+                    native_body,
                     &call_ctx,
                     &req_extras,
-                    passthrough_resp,
+                    native_response_passthrough,
                     tool_route_plan,
                     ctx,
                     &request_for_target,
@@ -935,7 +1017,7 @@ async fn dispatch_pipeline_inner(
                     client,
                     &outbound.url,
                     outbound.headers,
-                    outbound.body,
+                    native_body,
                     &call_ctx,
                     tool_route_plan,
                     ctx,
@@ -948,12 +1030,12 @@ async fn dispatch_pipeline_inner(
                     client,
                     &outbound.url,
                     outbound.headers,
-                    outbound.body,
+                    native_body,
                     &call_ctx,
                     &req_extras,
                     adapter.as_ref(),
                     &provider_ctx,
-                    passthrough_resp,
+                    native_response_passthrough,
                     &tool_route_plan,
                     ctx,
                     &mut request_for_target,
@@ -962,8 +1044,11 @@ async fn dispatch_pipeline_inner(
                 .await
             };
             let health_outcome = health_outcome_from_response(&response);
-            (response, false, health_outcome)
+            crate::conversion::ConversionAttempt::default_policy(response, health_outcome)
         };
+        let retry = attempt.retry;
+        let health_outcome = attempt.health;
+        let response = attempt.response;
 
         let status = response.status().as_u16();
         if status == 429 {
@@ -993,7 +1078,7 @@ async fn dispatch_pipeline_inner(
             TargetSelector::record_latency(&route.balance, &target_key, elapsed_ms);
             return response;
         }
-        if compat_retryable || is_retryable(status) {
+        if retry.should_retry(is_retryable(status)) {
             last_response = Some(response);
             continue;
         }

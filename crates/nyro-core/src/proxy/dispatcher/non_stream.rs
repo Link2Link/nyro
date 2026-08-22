@@ -11,7 +11,6 @@ use futures::StreamExt;
 use reqwest::header::HeaderMap as ReqwestHeaderMap;
 use serde_json::Value;
 
-use crate::integrations::{HookContext, HookRegistry};
 use crate::plugin::phase::{HostContext, Phase, PhaseOutcome, ResponseView};
 use crate::protocol::codec::tool_bridge::ToolRoutePlan;
 use crate::protocol::ir::AiRequest;
@@ -213,46 +212,22 @@ pub(super) async fn handle_non_stream(
     };
     tool_route_plan.restore_response(&mut ai_resp);
 
-    // Ensure actual_model is set in the response.
-    if ai_resp.model.is_empty() {
-        ai_resp.model = actual_model.to_string();
-    }
-
-    // ── Response hooks ──────────────────────────────────────────────────────
-    let hook_registry = HookRegistry::global();
-    if hook_registry.has_response_hooks() {
-        let latency_ms = call_ctx.start.elapsed().as_millis() as u64;
-        let hook_ctx = HookContext {
-            model_id: call_ctx.model_id.to_string(),
-            provider_name: call_ctx.provider.name.clone(),
-            model: ai_resp.model.clone(),
-            api_key_id: call_ctx.api_key_id.map(str::to_string),
-        };
-        for hook in hook_registry.response_hooks() {
-            hook.on_response(&hook_ctx, &mut ai_resp, latency_ms).await;
-        }
-    }
-
-    // ── OnResponse phase (full body) ─────────────────────────────────────────
-    // Hooks see the buffered `AiResponse` and may reshape it before it is
-    // encoded for the client. ShortCircuit/Reject replace the response (the
-    // native success log below is then skipped; OnLog still fires at the
-    // pipeline boundary). No-op when no OnResponse hooks are registered.
-    match run_phase_hooks(
-        Phase::OnResponse,
+    let (ai_resp, usage) = match super::buffered::finalize_buffered_response(
+        call_ctx,
         req_ctx,
         req_ir,
-        ResponseView::Full(&mut ai_resp),
         host,
+        ai_resp,
+        Some(actual_model),
     )
     .await
     {
-        PhaseOutcome::Continue => {}
-        PhaseOutcome::ShortCircuit(resp) => return resp,
-        PhaseOutcome::Reject(e) => return e.render(None),
-    }
+        super::buffered::BufferedFinalize::Continue {
+            response, usage, ..
+        } => (response, usage),
+        super::buffered::BufferedFinalize::Override(response) => return response,
+    };
 
-    let usage = ai_resp.usage.clone();
     let formatter = ingress.handler().make_response_encoder();
     let output = formatter.format_response(&ai_resp);
 

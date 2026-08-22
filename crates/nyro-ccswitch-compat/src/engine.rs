@@ -154,6 +154,7 @@ impl CompatEngine {
             ordered["model"] = Value::String(model.clone());
         }
 
+        let reasoning_overrides = crate::reasoning::ReasoningOverrides::capture(&ordered);
         let tool_context = transform_codex_chat::build_codex_tool_context_from_request(&ordered);
         let namespace_restore =
             transform_codex_responses_namespace::namespace_restore_map(&ordered);
@@ -174,6 +175,7 @@ impl CompatEngine {
                     ordered,
                     profile.preserve_chat_reasoning_content,
                 )?;
+                reasoning_overrides.apply_chat(&mut converted);
                 transform::inject_openai_stream_include_usage(&mut converted);
                 // cc-switch injects prompt_cache_key on the Chat path only when
                 // the provider explicitly configured one; session-derived keys
@@ -196,6 +198,7 @@ impl CompatEngine {
                     matches!(profile.upstream_flavor, UpstreamFlavor::CodexOAuthResponses),
                     profile.codex_fast_mode,
                 )?;
+                reasoning_overrides.apply_responses(&mut converted);
                 if matches!(profile.upstream_flavor, UpstreamFlavor::XaiStrictResponses) {
                     let marker = Value::String("reasoning.encrypted_content".to_string());
                     let include = converted
@@ -211,12 +214,16 @@ impl CompatEngine {
                 }
                 converted
             }
-            Direction::AnthropicToGemini => transform_gemini::anthropic_to_gemini_with_shadow(
-                ordered,
-                Some(self.state.gemini_shadow.as_ref()),
-                profile.provider_id.as_deref(),
-                identity.client_provided.then_some(identity.value.as_str()),
-            )?,
+            Direction::AnthropicToGemini => {
+                let mut converted = transform_gemini::anthropic_to_gemini_with_shadow(
+                    ordered,
+                    Some(self.state.gemini_shadow.as_ref()),
+                    profile.provider_id.as_deref(),
+                    identity.client_provided.then_some(identity.value.as_str()),
+                )?;
+                reasoning_overrides.apply_gemini(&mut converted);
+                converted
+            }
             Direction::AnthropicToAnthropic => {
                 if let Some(hints) = profile.anthropic_normalization.as_ref() {
                     crate::ported::providers::claude_compat::normalize_anthropic_messages_for_provider(
@@ -709,7 +716,10 @@ pub fn codex_client_error_json(
     {
         error_obj.insert("type".to_string(), Value::String("proxy_error".to_string()));
     }
-    if error_obj.get("code").map(Value::is_null).unwrap_or(true) && local_cause.is_some() {
+    if local_cause.is_some() {
+        // A local transport failure is the Nyro-named equivalent of
+        // cc-switch's cc_switch_forward_failed, even though the generic
+        // fallback envelope starts with nyro_proxy_error.
         error_obj.insert(
             "code".to_string(),
             Value::String("nyro_forward_failed".to_string()),

@@ -18,6 +18,7 @@ pub mod transport;
 
 pub(crate) mod ported;
 pub(crate) mod provider;
+pub(crate) mod reasoning;
 
 pub use engine::{
     CompatEngine, CompatError, CompatStream, ConvertedResponse, PreparedRequest, ResponseBody,

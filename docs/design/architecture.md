@@ -40,7 +40,7 @@ nyro/
 ├── crates/
 │   └── nyro-core/
 │       └── src/
-│           ├── lib.rs            # 13 个顶层 pub mod + Gateway / GatewayConfig 根类型
+│           ├── lib.rs            # 14 个顶层 pub mod + Gateway / GatewayConfig 根类型
 │           ├── proxy/            # 代理面
 │           │   ├── mod.rs
 │           │   ├── auth.rs
@@ -56,6 +56,7 @@ nyro/
 │           │   │   ├── mod.rs        # dispatch_pipeline / dispatch / error_response
 │           │   │   ├── accumulator.rs
 │           │   │   ├── auth.rs       # authorize_model_access / get_provider
+│           │   │   ├── buffered.rs   # Native/Raw-Wire 成功响应的共享语义生命周期
 │           │   │   ├── non_stream.rs # handle_non_stream / handle_non_stream_via_upstream_stream
 │           │   │   ├── stream.rs     # handle_stream
 │           │   │   └── util.rs
@@ -105,6 +106,12 @@ nyro/
 │           │       │   └── messages/
 │           │       └── google/
 │           │           └── gemini/
+│           ├── conversion/       # 每 target 的统一协议转换规划
+│           │   ├── plan.rs       # PassThrough / Native IR / Raw-Wire Compat
+│           │   ├── resolver.rs   # 选路、Compat profile/session 与 ResolvedConversion
+│           │   ├── prepared.rs   # PreparedBody / PreparedSession / 三策略准备
+│           │   ├── outcome.rs    # ConversionAttempt / retry / health
+│           │   └── wire_patch.rs # IR mutation → 原始 wire body patch
 │           ├── provider/         # 厂商扩展层
 │           │   ├── mod.rs
 │           │   ├── vendor.rs     # Vendor trait / ProviderCtx / VendorRegistration
@@ -164,10 +171,10 @@ graph TD
     httpREST --> srcServer
 ```
 
-**nyro-core 顶层 `pub mod`（lib.rs，共 13 个）：**
+**nyro-core 顶层 `pub mod`（lib.rs，共 14 个）：**
 
 ```
-admin · auth · config · db · error · integrations · logging
+admin · auth · config · conversion · db · error · integrations · logging
 plugin · protocol · provider · proxy · router · storage
 ```
 
@@ -207,14 +214,14 @@ Gateway::shutdown()       → 优雅关闭
 | OpenAI Responses → Responses（xai） | xAI 原生 Responses 的 namespace 扁平化/还原与 xAI sanitize |
 | Anthropic Messages → Anthropic Messages（DeepSeek/MiMo 系） | 同协议直通 + cc-switch 的 thinking 历史回放归一化与 DeepSeek 官方 effort 剥离 |
 
-对齐程度由 `scripts/check_cc_switch_parity_inventory.py` 审计 `tests/parity_inventory.toml`（1168 个源测试：518 直接移植 + 142 断言级映射 + 508 经批准排除），要求 `--require-complete` 通过。完整的移植分析、模块映射与维护指南见 [cc-switch-porting-report.md](./cc-switch-porting-report.md)。
+对齐程度由 `scripts/check_cc_switch_parity_inventory.py` 审计 `tests/parity_inventory.toml`（1168 个源测试：511 直接移植 + 149 断言级映射 + 508 经批准排除），要求 `--require-complete` 通过。完整的移植分析、模块映射与维护指南见 [cc-switch-porting-report.md](./cc-switch-porting-report.md)。
 
 ### 3.1 核心设计原则
 
 - **统一错误 taxonomy**：`GatewayError` 覆盖 15 种错误类型，每个错误有稳定 code、HTTP status、user message、internal detail 和 retryable 标志。
 - **请求生命周期追踪**：`RequestContext` 携带 request_id、deadline、cancellation token、outcome，以及类型键扩展袋 `ContextBag`，端到端贯穿所有层（见 §4）。
 - **确定性协议协商**：`negotiate()`（`proxy/planner/negotiator.rs`）实现三级 egress 解析（Exact → Same-family → Provider Default），`ProtocolRegistry` 统一别名规范化。
-- **Pass-Through 已落地**：`ingress == egress` 且 `Vendor` 声明无请求/响应 mutation（`declared_request_mutations()` / `declared_response_mutations()` 均为 false）时，dispatcher 绕过 IR 往返，直接透传原始 body / SSE 字节，最小化延迟与 CPU 开销。
+- **Pass-Through 已落地**：`ingress == egress` 且对应 leg 无 mutation 时，dispatcher 绕过跨协议 IR 往返；请求侧保留解析后的原生 JSON 并应用窄范围默认值/安全归一化，响应侧在安全时直接转发 body / SSE 字节。
 - **完整字段映射**：每个 codec 明确处理已知字段；vendor-specific 字段走三段化路径，不隐式丢弃。
 - **Vendor 单点接口**：`dispatch_pipeline` 只通过 `Vendor` trait 与厂商层交互，一次注册覆盖请求/响应编解码与流式处理的完整生命周期。
 - **五阶段生命周期**：请求/响应全程经过 OnRequest / OnAccess / OnUpstream / OnResponse / OnLog 五个插点，通过 `PhaseHook` 做非侵入扩展（见 §4）。
@@ -850,7 +857,7 @@ CREATE TABLE provider_oauth_credentials (
 
 ### 12.1 Pass-Through 路径 ✅ 已实现
 
-当 ingress/egress 协议一致且 `Vendor` 声明无 mutation（`declared_request/response_mutations()` 均为 false）时，dispatcher 走 passthrough 路径，绕过 IR 解析直接透传 body / SSE 字节，最小化延迟。
+当 ingress/egress 协议一致且 `Vendor` 声明无 mutation 时，dispatcher 可走 PassThrough。请求侧绕过跨协议 IR 转码，但仍以解析后的 JSON 应用 actual model、协议默认值与必要的安全归一化；响应侧在无 mutation 时可直接转发上游 body / SSE 字节。因此 PassThrough 表示“不做跨协议语义转换”，不承诺请求字节逐字节不变。
 
 ### 12.2 Quota 预留与结算
 
