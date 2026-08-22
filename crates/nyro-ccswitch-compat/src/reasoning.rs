@@ -11,6 +11,9 @@ use serde_json::{Value, json};
 pub(crate) struct ReasoningOverrides {
     openai_effort: Option<String>,
     gemini_thinking_config: Option<Value>,
+    /// grok 上游拒收 reasoning.effort=none 且忽略其他值;对 grok 模型
+    /// 最安全的 off 表示是不带 effort(由模型变体名控制推理)。
+    is_grok_model: bool,
 }
 
 impl ReasoningOverrides {
@@ -22,19 +25,36 @@ impl ReasoningOverrides {
             .and_then(|_| resolve_reasoning_effort(body))
             .map(str::to_string);
 
+        let is_grok_model = body
+            .get("model")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .starts_with("grok-");
+
         Self {
             openai_effort,
             gemini_thinking_config: gemini_thinking_config(body),
+            is_grok_model,
         }
     }
 
     pub(crate) fn apply_chat(&self, converted: &mut Value) {
+        if self.is_grok_model {
+            drop_grok_effort_chat(converted);
+            return;
+        }
         if let Some(effort) = self.openai_effort.as_ref() {
             converted["reasoning_effort"] = Value::String(effort.clone());
         }
     }
 
     pub(crate) fn apply_responses(&self, converted: &mut Value) {
+        if self.is_grok_model {
+            drop_grok_effort_responses(converted);
+            return;
+        }
         let Some(effort) = self.openai_effort.as_ref() else {
             return;
         };
@@ -147,6 +167,44 @@ fn is_gemini_3_series(model: &str) -> bool {
             .is_some_and(|tail| tail.starts_with("gemini-3"))
 }
 
+fn is_off_effort(effort: &str) -> bool {
+    matches!(
+        effort.trim().to_ascii_lowercase().as_str(),
+        "none" | "disable" | "disabled" | "off"
+    )
+}
+
+/// grok chat 线格式: off 写法 → 删除顶层 reasoning_effort。
+fn drop_grok_effort_chat(converted: &mut Value) {
+    let is_off = converted
+        .get("reasoning_effort")
+        .and_then(Value::as_str)
+        .is_some_and(is_off_effort);
+    if is_off && let Some(object) = converted.as_object_mut() {
+        object.remove("reasoning_effort");
+    }
+}
+
+/// grok Responses 线格式: off 写法 → 删除嵌套 reasoning.effort
+/// (保留 reasoning 对象的其他键,如 encrypted_content include)。
+fn drop_grok_effort_responses(converted: &mut Value) {
+    let is_off = converted
+        .pointer("/reasoning/effort")
+        .and_then(Value::as_str)
+        .is_some_and(is_off_effort);
+    if is_off
+        && let Some(reasoning) = converted.get_mut("reasoning")
+        && let Some(object) = reasoning.as_object_mut()
+    {
+        object.remove("effort");
+        if object.is_empty() {
+            if let Some(top) = converted.as_object_mut() {
+                top.remove("reasoning");
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -187,6 +245,73 @@ mod tests {
         let mut converted = json!({});
         rejected.apply_chat(&mut converted);
         assert!(converted.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn grok_responses_path_drops_off_effort_but_keeps_other_reasoning_keys() {
+        let overrides = ReasoningOverrides::capture(&json!({
+            "model": "grok-4.6-build",
+            "output_config": {"effort": "none"}
+        }));
+        let mut converted = json!({
+            "model": "grok-4.6-build",
+            "reasoning": {"effort": "none", "summary": "auto"}
+        });
+        overrides.apply_responses(&mut converted);
+        assert!(
+            converted.pointer("/reasoning/effort").is_none(),
+            "grok off effort must be dropped on the Responses wire"
+        );
+        assert_eq!(
+            converted["reasoning"]["summary"], "auto",
+            "other reasoning keys must survive"
+        );
+    }
+
+    #[test]
+    fn grok_responses_path_removes_empty_reasoning_object() {
+        let overrides = ReasoningOverrides::capture(&json!({
+            "model": "grok-4.5",
+            "output_config": {"effort": "disable"}
+        }));
+        let mut converted = json!({
+            "model": "grok-4.5",
+            "reasoning": {"effort": "disable"}
+        });
+        overrides.apply_responses(&mut converted);
+        assert!(
+            converted.get("reasoning").is_none(),
+            "empty reasoning object must be removed entirely"
+        );
+    }
+
+    #[test]
+    fn grok_chat_path_drops_top_level_off_effort() {
+        let overrides = ReasoningOverrides::capture(&json!({
+            "model": "grok-4.6",
+            "reasoning": {"type": "disabled"}
+        }));
+        let mut converted = json!({
+            "model": "grok-4.6",
+            "reasoning_effort": "none"
+        });
+        overrides.apply_chat(&mut converted);
+        assert!(converted.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn grok_keeps_real_effort_levels_on_both_wire_shapes() {
+        let overrides = ReasoningOverrides::capture(&json!({
+            "model": "grok-4.6",
+            "output_config": {"effort": "high"}
+        }));
+        let mut chat = json!({"reasoning_effort": "high"});
+        overrides.apply_chat(&mut chat);
+        assert_eq!(chat["reasoning_effort"], "high");
+
+        let mut responses = json!({"reasoning": {"effort": "high"}});
+        overrides.apply_responses(&mut responses);
+        assert_eq!(responses["reasoning"]["effort"], "high");
     }
 
     #[test]
