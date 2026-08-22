@@ -85,7 +85,7 @@ pub struct Provider {
     pub auth_mode: String,
     #[serde(default)]
     pub use_proxy: bool,
-    /// Channel-specific fast-mode switch (e.g. sub2api): when enabled,
+    /// Channel-specific fast-mode switch (e.g. sub2api or Codex): when enabled,
     /// outbound OpenAI Responses requests get `service_tier: "priority"`
     /// injected unless the client already set the field.
     #[serde(default)]

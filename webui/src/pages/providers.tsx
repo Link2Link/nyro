@@ -2206,7 +2206,7 @@ export default function ProvidersPage() {
                   ))}
                 </ToggleGroup>
               </div>
-              {createChannelValue === "sub2api" && (
+              {["sub2api", "codex"].includes(createChannelValue) && (
                 <div className="col-span-2 space-y-2">
                   <div className="flex items-center justify-between rounded-lg border border-slate-200 bg-white px-3 py-2.5">
                     <div>
@@ -3431,7 +3431,7 @@ export default function ProvidersPage() {
                         </div>
                       </div>
                     )}
-                    {editForm.channel === "sub2api" && (
+                    {["sub2api", "codex"].includes(editForm.channel ?? "") && (
                       <div className="space-y-2">
                         <FieldLabel>{isZh ? "Fast 模式" : "Fast Mode"}</FieldLabel>
                         <div className="flex items-center justify-between rounded-lg border border-slate-200 bg-white px-3 py-2.5">

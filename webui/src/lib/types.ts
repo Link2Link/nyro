@@ -8,7 +8,7 @@ export interface Provider {
   protocol_endpoints?: ProviderProtocolEndpoint[];
   api_key?: string;
   use_proxy: boolean;
-  /** sub2api 渠道 Fast 模式：开启后上游请求自动附加 service_tier=priority。 */
+  /** OpenAI Responses 渠道（sub2api/Codex）Fast 模式：开启后上游请求自动附加 service_tier=priority。 */
   fast_mode: boolean;
   auth_mode?: "apikey" | "oauth";
   oauth_status?: ProviderOAuthStatus;

@@ -21,27 +21,26 @@ use serde_json::Value;
 
 use crate::db::models::Provider;
 use crate::error::GatewayError;
-use crate::protocol::ids::{ProtocolId, OPENAI_RESPONSES_V1};
+use crate::protocol::ids::{OPENAI_RESPONSES_V1, ProtocolId};
 use crate::provider::vendor::Vendor;
 
-/// sub2api 渠道专用开关「Fast 模式」：
+/// OpenAI Responses 渠道开关「Fast 模式」：
 ///
 /// 开启后，转发到上游的 OpenAI Responses 请求如果缺少 `service_tier` 字段，
 /// 就补上 `"service_tier": "priority"`（对应 OpenAI 官方 Fast mode：
 /// 优先处理、响应更快；默认值是 `auto`）。客户端显式携带的 `service_tier`
-/// 永远优先，本函数不做覆盖。仅对 `openai` 厂商的 `sub2api` 渠道生效。
-pub(crate) fn maybe_inject_sub2api_fast_mode(
+/// 永远优先，本函数不做覆盖。当前对 OpenAI 预设的 `sub2api` 与 `codex`
+/// 渠道生效。
+pub(crate) fn maybe_inject_openai_fast_mode(
     body: &mut Value,
     provider: &Provider,
     protocol: ProtocolId,
 ) {
-    let is_sub2api_fast = provider.fast_mode
-        && provider
-            .channel
-            .as_deref()
-            .map(|channel| channel.eq_ignore_ascii_case("sub2api"))
-            .unwrap_or(false);
-    if !is_sub2api_fast || protocol != OPENAI_RESPONSES_V1 {
+    let is_openai_fast = provider.fast_mode
+        && provider.channel.as_deref().is_some_and(|channel| {
+            channel.eq_ignore_ascii_case("sub2api") || channel.eq_ignore_ascii_case("codex")
+        });
+    if !is_openai_fast || protocol != OPENAI_RESPONSES_V1 {
         return;
     }
     if let Some(object) = body.as_object_mut()
@@ -51,6 +50,25 @@ pub(crate) fn maybe_inject_sub2api_fast_mode(
             "service_tier".to_string(),
             Value::String("priority".to_string()),
         );
+    }
+}
+
+/// Codex 消费级上游（`chatgpt.com/backend-api/codex`）不接受 OpenAI Responses
+/// 的 `max_output_tokens`/`temperature`/`top_p` 参数（codex-rs 协议契约里
+/// 没有这些字段，OpenAI 自己的客户端不发它们）。原生直通与 IR 转码两条路径
+/// 转发前都需要剥离，否则上游返回 400 "Unsupported parameter: max_output_tokens"。
+pub(crate) fn maybe_sanitize_codex_consumer_request(body: &mut Value, provider: &Provider) {
+    let is_codex = provider
+        .channel
+        .as_deref()
+        .is_some_and(|channel| channel.eq_ignore_ascii_case("codex"));
+    if !is_codex {
+        return;
+    }
+    if let Some(object) = body.as_object_mut() {
+        object.remove("max_output_tokens");
+        object.remove("temperature");
+        object.remove("top_p");
     }
 }
 
@@ -98,7 +116,9 @@ where
         .map_err(GatewayError::internal)?;
 
     // 5b. sub2api Fast 模式：缺 service_tier 时补 priority（IR 转码路径）
-    maybe_inject_sub2api_fast_mode(&mut body, ctx.provider, ctx.protocol);
+    maybe_inject_openai_fast_mode(&mut body, ctx.provider, ctx.protocol);
+    // 5c. Codex 消费级上游：剥离其拒绝的 Responses 参数（IR 转码路径）
+    maybe_sanitize_codex_consumer_request(&mut body, ctx.provider);
 
     // 6. auth headers
     //
@@ -245,7 +265,9 @@ pub async fn passthrough_run(
     if ctx.protocol == crate::protocol::ids::OPENAI_RESPONSES_V1 {
         crate::protocol::codec::openai::responses::normalize_function_tool_defaults(&mut raw_body);
         // sub2api Fast 模式：缺 service_tier 时补 priority（Responses 直通路径）
-        maybe_inject_sub2api_fast_mode(&mut raw_body, ctx.provider, ctx.protocol);
+        maybe_inject_openai_fast_mode(&mut raw_body, ctx.provider, ctx.protocol);
+        // Codex 消费级上游：剥离其拒绝的 Responses 参数（Responses 直通路径）
+        maybe_sanitize_codex_consumer_request(&mut raw_body, ctx.provider);
     }
 
     let mut headers = if ctx.disable_default_auth {
@@ -812,10 +834,7 @@ mod tests {
         provider
     }
 
-    fn responses_ctx<'a>(
-        provider: &'a Provider,
-        gw: &'a Gateway,
-    ) -> ProviderCtx<'a> {
+    fn responses_ctx<'a>(provider: &'a Provider, gw: &'a Gateway) -> ProviderCtx<'a> {
         ProviderCtx {
             provider,
             protocol: OPENAI_RESPONSES_V1,
@@ -847,9 +866,120 @@ mod tests {
         .expect("passthrough succeeds");
 
         assert_eq!(
-            out.body["service_tier"],
-            "priority",
+            out.body["service_tier"], "priority",
             "sub2api fast mode must inject service_tier=priority",
+        );
+    }
+
+    /// Codex OAuth 渠道复用相同 Fast 模式语义。
+    #[tokio::test]
+    async fn passthrough_injects_service_tier_priority_for_codex_fast_mode() {
+        let gw = build_test_gateway().await;
+        let provider = provider_with_channel("", Some("codex"), true);
+        let ctx = responses_ctx(&provider, &gw);
+
+        let out = passthrough_run(
+            &FakeApiKeyVendor,
+            serde_json::json!({ "model": "gpt-5-codex", "input": "ping" }),
+            &ctx,
+            false,
+        )
+        .await
+        .expect("passthrough succeeds");
+
+        assert_eq!(
+            out.body["service_tier"], "priority",
+            "codex fast mode must inject service_tier=priority",
+        );
+    }
+
+    /// Codex 消费级上游：直通路径剥离其拒绝的 max_output_tokens/temperature/top_p。
+    #[tokio::test]
+    async fn passthrough_strips_rejected_params_for_codex_channel() {
+        let gw = build_test_gateway().await;
+        let provider = provider_with_channel("", Some("codex"), false);
+        let ctx = responses_ctx(&provider, &gw);
+
+        let out = passthrough_run(
+            &FakeApiKeyVendor,
+            serde_json::json!({
+                "model": "gpt-5-codex",
+                "input": "ping",
+                "max_output_tokens": 4096,
+                "temperature": 0.7,
+                "top_p": 0.9,
+                "stream": true,
+            }),
+            &ctx,
+            true,
+        )
+        .await
+        .expect("passthrough succeeds");
+
+        assert!(
+            out.body.get("max_output_tokens").is_none(),
+            "codex consumer backend must not receive max_output_tokens",
+        );
+        assert!(
+            out.body.get("temperature").is_none(),
+            "codex consumer backend must not receive temperature",
+        );
+        assert!(
+            out.body.get("top_p").is_none(),
+            "codex consumer backend must not receive top_p",
+        );
+        assert_eq!(out.body["stream"], true, "stream must be preserved");
+    }
+
+    /// 非 codex 渠道必须保留这些参数，直通行为不受影响。
+    #[tokio::test]
+    async fn passthrough_keeps_rejected_params_for_other_channels() {
+        let gw = build_test_gateway().await;
+        let provider = provider_with_channel("sk-sub2api", Some("sub2api"), false);
+        let ctx = responses_ctx(&provider, &gw);
+
+        let out = passthrough_run(
+            &FakeApiKeyVendor,
+            serde_json::json!({
+                "model": "o3",
+                "input": "ping",
+                "max_output_tokens": 2048,
+            }),
+            &ctx,
+            false,
+        )
+        .await
+        .expect("passthrough succeeds");
+
+        assert_eq!(
+            out.body["max_output_tokens"], 2048,
+            "non-codex channel must keep max_output_tokens",
+        );
+    }
+
+    /// IR 转码路径同样剥离：codex 渠道 encode 后清掉被拒绝的参数。
+    #[tokio::test]
+    async fn build_request_strips_rejected_params_for_codex_channel() {
+        let gw = build_test_gateway().await;
+        let provider = provider_with_channel("", Some("codex"), false);
+        let ctx = responses_ctx(&provider, &gw);
+        let mut req = minimal_chat_request();
+
+        let out = build_request(&FakeApiKeyVendor, &mut req, &ctx)
+            .await
+            .expect("build_request succeeds");
+
+        assert!(
+            out.body.get("max_output_tokens").is_none(),
+            "IR transcode path must strip max_output_tokens for codex channel",
+        );
+        assert!(
+            out.body.get("temperature").is_none(),
+            "IR transcode path must strip temperature for codex channel",
+        );
+        assert!(
+            out.body.get("top_p").is_none(),
+            "IR transcode path must strip top_p for codex channel",
         );
     }
 
@@ -874,8 +1004,7 @@ mod tests {
         .expect("passthrough succeeds");
 
         assert_eq!(
-            out.body["service_tier"],
-            "auto",
+            out.body["service_tier"], "auto",
             "explicit client service_tier must be preserved verbatim",
         );
     }
@@ -937,8 +1066,7 @@ mod tests {
             .expect("build_request succeeds");
 
         assert_eq!(
-            out.body["service_tier"],
-            "priority",
+            out.body["service_tier"], "priority",
             "IR transcode path must inject service_tier=priority for sub2api fast mode",
         );
     }

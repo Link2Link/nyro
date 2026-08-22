@@ -129,9 +129,12 @@ pub(super) fn select_compat_request(
                 UpstreamFlavor::StandardResponses
             };
             let mut profile = ConversionProfile::anthropic_to_responses(client_stream, flavor);
-            // sub2api 渠道 Fast 模式：Claude Code（Anthropic ingress）接
-            // sub2api 上游时同样注入 service_tier = "priority"。
-            if provider.fast_mode && channel.eq_ignore_ascii_case("sub2api") {
+            // OpenAI Responses 渠道 Fast 模式：Claude Code（Anthropic ingress）接
+            // sub2api 或 Codex 上游时同样注入 service_tier = "priority"。
+            if provider.fast_mode
+                && (channel.eq_ignore_ascii_case("sub2api")
+                    || channel.eq_ignore_ascii_case("codex"))
+            {
                 profile.codex_fast_mode = true;
             }
             profile
@@ -1610,6 +1613,28 @@ mod tests {
             UpstreamFlavor::CodexOAuthResponses
         );
         assert!(selected.profile.force_upstream_stream());
+    }
+
+    #[test]
+    fn enables_fast_mode_for_codex_oauth_responses() {
+        let request = request("virtual", ANTHROPIC_MESSAGES_2023_06_01);
+        let mut codex = provider("openai", "codex");
+        codex.fast_mode = true;
+        let selected = select_compat_request(
+            ANTHROPIC_MESSAGES_2023_06_01,
+            OPENAI_RESPONSES_V1,
+            &codex,
+            "https://chatgpt.com/backend-api/codex",
+            "gpt-5",
+            false,
+            &HeaderMap::new(),
+            br#"{"model":"virtual","messages":[{"role":"user","content":"hello"}]}"#,
+            &request,
+            &request,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(selected.profile.codex_fast_mode);
     }
 
     #[test]
