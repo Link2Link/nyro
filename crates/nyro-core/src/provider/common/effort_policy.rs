@@ -55,6 +55,10 @@ pub(crate) fn normalize_enum_effort(body: &mut Value) {
 /// grok-4.6-build rejects `reasoning_effort: "none"` outright and silently
 /// ignores every other value. The only safe "off" representation is to remove
 /// the directive entirely and let the upstream default apply.
+///
+/// Handles both wire shapes the IR egress can produce:
+/// - chat-completions: top-level `reasoning_effort`
+/// - responses: nested `reasoning.effort` (empty `reasoning` removed)
 pub(crate) fn drop_grok_effort(body: &mut Value) {
     let Some(object) = body.as_object_mut() else {
         return;
@@ -62,15 +66,34 @@ pub(crate) fn drop_grok_effort(body: &mut Value) {
     let is_off_misspelling = object
         .get("reasoning_effort")
         .and_then(Value::as_str)
-        .is_some_and(|effort| {
-            matches!(
-                effort.trim().to_ascii_lowercase().as_str(),
-                "none" | "disable" | "disabled" | "off"
-            )
-        });
+        .is_some_and(is_off_effort);
     if is_off_misspelling {
         object.remove("reasoning_effort");
     }
+
+    // Responses wire shape: nested reasoning.effort. Preserve sibling keys
+    // (summary, etc.); remove the reasoning object entirely once empty.
+    let nested_off = object
+        .get("reasoning")
+        .and_then(|reasoning| reasoning.get("effort"))
+        .and_then(Value::as_str)
+        .is_some_and(is_off_effort);
+    if nested_off
+        && let Some(reasoning) = object.get_mut("reasoning")
+        && let Some(reasoning_obj) = reasoning.as_object_mut()
+    {
+        reasoning_obj.remove("effort");
+        if reasoning_obj.is_empty() {
+            object.remove("reasoning");
+        }
+    }
+}
+
+fn is_off_effort(effort: &str) -> bool {
+    matches!(
+        effort.trim().to_ascii_lowercase().as_str(),
+        "none" | "disable" | "disabled" | "off"
+    )
 }
 
 #[cfg(test)]
@@ -127,6 +150,30 @@ mod tests {
             drop_grok_effort(&mut body);
             assert_eq!(body["reasoning_effort"], raw);
         }
+    }
+
+    #[test]
+    fn grok_drops_nested_responses_effort_and_empty_reasoning() {
+        for raw in ["none", "disable", "disabled"] {
+            let mut body = json!({"reasoning": {"effort": raw}});
+            drop_grok_effort(&mut body);
+            assert!(body.get("reasoning").is_none(), "raw={raw}");
+        }
+    }
+
+    #[test]
+    fn grok_keeps_reasoning_siblings_when_dropping_nested_effort() {
+        let mut body = json!({"reasoning": {"effort": "none", "summary": "auto"}});
+        drop_grok_effort(&mut body);
+        assert!(body.pointer("/reasoning/effort").is_none());
+        assert_eq!(body["reasoning"]["summary"], "auto");
+    }
+
+    #[test]
+    fn grok_keeps_real_nested_effort() {
+        let mut body = json!({"reasoning": {"effort": "high"}});
+        drop_grok_effort(&mut body);
+        assert_eq!(body["reasoning"]["effort"], "high");
     }
 
     #[test]
