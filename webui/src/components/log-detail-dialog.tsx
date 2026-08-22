@@ -1,5 +1,5 @@
 import { useQuery } from "@tanstack/react-query";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Check, Copy, Download, Loader2 } from "lucide-react";
 
 import { backend } from "@/lib/backend";
@@ -7,7 +7,7 @@ import { useLocale } from "@/lib/i18n";
 import type { RequestLog } from "@/lib/types";
 import { computeTps, formatDuration, formatLogTime, formatTokenCount, formatTps, generationMsOf, tryPrettyJson } from "@/lib/format";
 import { prettyName } from "@/lib/protocol";
-import { cn } from "@/lib/utils";
+import { cn, copyToClipboard } from "@/lib/utils";
 import {
   Dialog,
   DialogContent,
@@ -40,6 +40,34 @@ export function LogDetailDialog({ logId, summary, open, onOpenChange }: LogDetai
   });
 
   const [downloaded, setDownloaded] = useState(false);
+  const [idCopied, setIdCopied] = useState(false);
+  const idCodeRef = useRef<HTMLElement | null>(null);
+
+  useEffect(() => {
+    if (!idCopied) return;
+    const t = window.setTimeout(() => setIdCopied(false), 1500);
+    return () => window.clearTimeout(t);
+  }, [idCopied]);
+
+  const handleCopyId = async () => {
+    const id = log?.id ?? logId;
+    if (!id) return;
+    setIdCopied(await copyToClipboard(id));
+  };
+
+  // Click-to-select-all on the visible ID — the manual-copy fallback that
+  // works even when every programmatic clipboard path is unavailable
+  // (insecure HTTP contexts, locked-down webviews).
+  const handleSelectId = () => {
+    const el = idCodeRef.current;
+    if (!el) return;
+    const selection = window.getSelection();
+    if (!selection) return;
+    const range = document.createRange();
+    range.selectNodeContents(el);
+    selection.removeAllRanges();
+    selection.addRange(range);
+  };
 
   const log = data ?? summary ?? null;
 
@@ -130,8 +158,34 @@ export function LogDetailDialog({ logId, summary, open, onOpenChange }: LogDetai
             <span>{isZh ? "请求详情" : "Request Detail"}</span>
             {isLoading ? <Loader2 className="h-3.5 w-3.5 animate-spin text-slate-400" /> : null}
           </DialogTitle>
-          <DialogDescription>
-            {log ? formatLogTime(log.created_at) : ""}
+          <DialogDescription className="flex flex-wrap items-center gap-2">
+            <span>{log ? formatLogTime(log.created_at) : ""}</span>
+            {(log?.id ?? logId) ? (
+              <span className="inline-flex max-w-full items-center gap-1">
+                <code
+                  ref={idCodeRef}
+                  title={isZh
+                    ? "日志 ID（唯一）。点击全选，或手动选中复制。"
+                    : "Log ID (unique). Click to select all, or select & copy manually."}
+                  onClick={handleSelectId}
+                  className="cursor-pointer select-all rounded border border-slate-200 bg-slate-50 px-1.5 py-0.5 font-mono text-[11px] text-slate-600 transition-colors hover:border-slate-300 hover:text-slate-800 break-all"
+                >
+                  {log?.id ?? logId}
+                </code>
+                <button
+                  type="button"
+                  onClick={handleCopyId}
+                  title={isZh ? "复制完整日志 ID" : "Copy the full log ID"}
+                  className="inline-flex shrink-0 items-center rounded p-0.5 text-slate-400 transition-colors hover:text-slate-600"
+                >
+                  {idCopied ? (
+                    <Check className="h-3 w-3 text-green-600" />
+                  ) : (
+                    <Copy className="h-3 w-3" />
+                  )}
+                </button>
+              </span>
+            ) : null}
           </DialogDescription>
         </DialogHeader>
 
@@ -337,12 +391,7 @@ function PayloadBlock({ title, content, isZh }: PayloadBlockProps) {
 
   const handleCopy = async () => {
     if (!hasContent) return;
-    try {
-      await navigator.clipboard.writeText(pretty);
-      setCopied(true);
-    } catch {
-      setCopied(false);
-    }
+    setCopied(await copyToClipboard(pretty));
   };
 
   return (

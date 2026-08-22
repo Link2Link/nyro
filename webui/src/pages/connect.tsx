@@ -6,6 +6,7 @@ import { backend, IS_TAURI } from "@/lib/backend";
 import { localizeBackendErrorMessage } from "@/lib/backend-error";
 import type { ApiKey, GatewayStatus, ModelCapabilities, Model as ModelType } from "@/lib/types";
 import { useLocale } from "@/lib/i18n";
+import { copyToClipboard } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { Combobox } from "@/components/ui/combobox";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
@@ -735,7 +736,8 @@ export default function ConnectPage() {
   });
 
   async function copyText(text: string, target: "code" | "cli") {
-    await navigator.clipboard.writeText(text);
+    const ok = await copyToClipboard(text);
+    if (!ok) return;
     setCopiedTarget(target);
     setTimeout(() => setCopiedTarget(null), 1200);
   }

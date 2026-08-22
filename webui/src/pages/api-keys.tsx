@@ -7,6 +7,7 @@ import { localizeBackendErrorMessage } from "@/lib/backend-error";
 import type { ApiKey, CreateApiKey, Model as ModelType, UpdateApiKey } from "@/lib/types";
 import { useLocale } from "@/lib/i18n";
 import { formatLocalDateTime } from "@/lib/format";
+import { copyToClipboard } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Badge } from "@/components/ui/badge";
@@ -240,7 +241,7 @@ export default function ApiKeysPage() {
   }
 
   async function copyKey(item: ApiKey) {
-    await navigator.clipboard.writeText(item.key);
+    await copyToClipboard(item.key);
     setCopiedId(item.id);
     setTimeout(() => setCopiedId(null), 1500);
   }
@@ -480,7 +481,7 @@ export default function ApiKeysPage() {
                             <button
                               type="button"
                               onClick={async () => {
-                                await navigator.clipboard.writeText(editForm.key);
+                                await copyToClipboard(editForm.key);
                                 setCopiedEditKey(true);
                                 setTimeout(() => setCopiedEditKey(false), 1200);
                               }}
@@ -778,7 +779,7 @@ export default function ApiKeysPage() {
             <Button
               onClick={async () => {
                 if (!createdKey) return;
-                await navigator.clipboard.writeText(createdKey);
+                await copyToClipboard(createdKey);
                 setCopiedCreatedKey(true);
               }}
             >
