@@ -386,6 +386,23 @@ fn classify_glm_window(item: &Value) -> Option<GlmWindow> {
     }
 }
 
+/// Parse a successful GLM quota response envelope. Zhipu can transiently return
+/// HTTP 200 with an empty body even for a valid personal-plan key; querying a
+/// Team Coding Plan key under the personal scope can produce the same symptom.
+/// Surface both possibilities explicitly instead of leaking serde_json's EOF.
+fn parse_glm_usage_response(raw: &[u8]) -> anyhow::Result<Value> {
+    if raw.iter().all(|byte| byte.is_ascii_whitespace()) {
+        anyhow::bail!(concat!(
+            "GLM usage endpoint returned HTTP 200 with an empty body; this may be a transient ",
+            "upstream failure, so retry later. Team Coding Plan keys additionally require ",
+            "team scope plus organization and project IDs"
+        ));
+    }
+
+    serde_json::from_slice(raw)
+        .map_err(|error| anyhow::anyhow!("failed to parse usage response: {error}"))
+}
+
 /// Parse the GLM quota `data` object into usage tiers.
 ///
 /// Classification order:
@@ -1546,8 +1563,7 @@ impl AdminService {
                     .bytes()
                     .await
                     .map_err(|e| anyhow::anyhow!("failed to read usage response: {e}"))?;
-                let body: Value = serde_json::from_slice(&raw)
-                    .map_err(|e| anyhow::anyhow!("failed to parse usage response: {e}"))?;
+                let body = parse_glm_usage_response(&raw)?;
 
                 // Business-level error: HTTP 200 with success:false + msg.
                 if body.get("success").and_then(Value::as_bool) == Some(false) {
@@ -2394,6 +2410,34 @@ mod tests {
         let data = data_with_limits(serde_json::json!([]));
         assert!(parse_glm_quota_tiers(&data).is_empty());
         assert!(parse_glm_quota_tiers(&serde_json::json!({})).is_empty());
+    }
+
+    #[test]
+    fn glm_empty_usage_response_has_team_scope_hint() {
+        for raw in [b"".as_slice(), b" \r\n\t".as_slice()] {
+            let error = parse_glm_usage_response(raw).unwrap_err().to_string();
+            assert!(error.contains("HTTP 200 with an empty body"));
+            assert!(error.contains("transient upstream failure"));
+            assert!(error.contains("Team Coding Plan"));
+            assert!(error.contains("organization and project IDs"));
+            assert!(!error.contains("EOF while parsing"));
+        }
+    }
+
+    #[test]
+    fn glm_nonempty_malformed_usage_response_keeps_parse_error() {
+        let error = parse_glm_usage_response(b"not-json")
+            .unwrap_err()
+            .to_string();
+        assert!(error.starts_with("failed to parse usage response:"));
+    }
+
+    #[test]
+    fn glm_valid_usage_response_parses_unchanged() {
+        let body = parse_glm_usage_response(br#"{"success":true,"data":{"limits":[]}}"#)
+            .expect("valid GLM usage response");
+        assert_eq!(body["success"], true);
+        assert!(body["data"]["limits"].as_array().is_some_and(Vec::is_empty));
     }
 
     #[test]
