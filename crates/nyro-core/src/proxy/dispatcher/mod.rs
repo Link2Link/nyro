@@ -1073,9 +1073,6 @@ async fn dispatch_pipeline_inner(
             HealthOutcome::Deferred => drop(health_permit),
         }
         if status < 400 {
-            let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
-            TargetSelector::record_selected(&route.balance, &target_key);
-            TargetSelector::record_latency(&route.balance, &target_key, elapsed_ms);
             return response;
         }
         if retry.should_retry(is_retryable(status)) {

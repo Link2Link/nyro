@@ -57,7 +57,6 @@ pub enum ProtocolMode {
 /// Pluggable target-ordering strategy.
 ///
 /// `OrderedStrategy` preserves the DB declaration order (current behaviour).
-/// P2-H will add `WeightedStrategy` / `LeastLatencyStrategy` etc.
 pub trait RoutingStrategy: Send + Sync {
     fn name(&self) -> &'static str;
     fn select_ordered(&self, targets: &[ModelBackend], _ctx: &RequestContext) -> Vec<ModelBackend>;

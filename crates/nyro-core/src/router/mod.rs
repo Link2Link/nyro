@@ -5,8 +5,7 @@ pub mod selector;
 
 pub use matcher::ModelCache;
 pub use selector::{
-    CooldownStrategy, LatencyStrategy, PriorityStrategy, RoutingStrategy, SelectedTarget,
-    TargetSelector, WeightedStrategy,
+    PriorityStrategy, RoutingStrategy, SelectedTarget, TargetSelector, WeightedStrategy,
 };
 
 use crate::db::models::Model;
