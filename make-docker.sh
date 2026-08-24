@@ -40,8 +40,8 @@ ensure_compose_env() {
         die "${ENV_FILE} exists but is not a regular file"
     fi
 
-    # The proxy port is published on 0.0.0.0 by compose.yaml, so the data plane
-    # must always carry a Bearer key; generate one when missing.
+    # nyro runs with host networking and binds 0.0.0.0 directly on the host,
+    # so the data plane must always carry a Bearer key; generate one when missing.
     if [[ -f "${ENV_FILE}" ]]; then
         if ! grep -Eq '^NYRO_PROXY_AUTH_KEY=.+$' "${ENV_FILE}"; then
             if grep -Eq '^NYRO_PROXY_AUTH_KEY=$' "${ENV_FILE}"; then

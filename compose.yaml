@@ -6,16 +6,18 @@ services:
     pull_policy: never
     container_name: nyro
     restart: unless-stopped
+    # Host network mode: the container shares the host network stack, so
+    # 127.0.0.1 INSIDE the container is the host itself. This makes the
+    # sub2api service (published on host 0.0.0.0:8080) reachable at
+    # http://127.0.0.1:8080 from inside the container.
+    network_mode: host
     environment:
       NYRO_ADMIN_TOKEN: ${NYRO_ADMIN_TOKEN:?Run ./make-docker.sh to generate .env}
       NYRO_PROXY_AUTH_KEY: ${NYRO_PROXY_AUTH_KEY:?Run ./make-docker.sh to generate .env}
       NYRO_STORAGE_BACKEND: ${NYRO_STORAGE_BACKEND:-sqlite}
       NYRO_LOG_LEVEL: ${NYRO_LOG_LEVEL:-info}
-    ports:
-      # Published on all interfaces (0.0.0.0) so LAN devices can reach the
-      # gateway; NYRO_PROXY_AUTH_KEY above guards the data plane.
-      - "19530:19530"
-      - "19531:19531"
+    # Host mode: no Docker port publishing needed. nyro binds 19530/19531
+    # directly on the host interface - same effective exposure as before.
     volumes:
       - nyro-data:/var/lib/nyro
 
