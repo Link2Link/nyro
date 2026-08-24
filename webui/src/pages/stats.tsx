@@ -367,6 +367,7 @@ export default function StatsPage() {
             <thead className="bg-white/70 text-slate-500">
               <tr>
                 <th className="px-4 py-2.5 text-left font-medium">{isZh ? "模型" : "Model"}</th>
+                <th className="px-4 py-2.5 text-right font-medium">{isZh ? "调用次数" : "Requests"}</th>
                 <th className="px-4 py-2.5 text-right font-medium">{isZh ? "输入 Token" : "Input Tokens"}</th>
                 <th className="px-4 py-2.5 text-right font-medium">{isZh ? "缓存命中" : "Cache Hits"}</th>
                 <th className="px-4 py-2.5 text-right font-medium">{isZh ? "输出 Token" : "Output Tokens"}</th>
@@ -377,7 +378,7 @@ export default function StatsPage() {
             </thead>
             <tbody>
               {modelStats.length === 0 && (
-                <tr><td className="px-4 py-6 text-center text-slate-400" colSpan={7}>{isZh ? "暂无数据" : "No data"}</td></tr>
+                <tr><td className="px-4 py-6 text-center text-slate-400" colSpan={8}>{isZh ? "暂无数据" : "No data"}</td></tr>
               )}
               {modelStats.slice(0, 10).map((m) => {
                 // 同上:input_tokens 已含 cache_read_tokens,直接相除。
@@ -390,6 +391,7 @@ export default function StatsPage() {
                 return (
                   <tr key={m.model} className="border-t border-white/70 text-slate-700">
                     <td className="px-4 py-2.5 font-medium">{m.model || "–"}</td>
+                    <td className="px-4 py-2.5 text-right">{fmt(m.request_count)}</td>
                     <td className="px-4 py-2.5 text-right">{fmt(m.total_input_tokens)}</td>
                     <td className="px-4 py-2.5 text-right">{fmt(m.total_cache_read_tokens)}</td>
                     <td className="px-4 py-2.5 text-right">{fmt(m.total_output_tokens)}</td>
