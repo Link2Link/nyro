@@ -1,0 +1,621 @@
+/**
+ * nyro usage panel styles. Scoped by the plugin's own data attributes so
+ * nothing leaks into the rest of the GUI; colors ride the dsh --dsw-* tokens
+ * so the panel follows the active theme (light/dark and skins). The
+ * center-column hide rules are attribute-scoped and must stay in this
+ * stylesheet (it is imported by mount.tsx, so the styles load with the
+ * plugin).
+ *
+ * Class names get the `nyu-` prefix at build time (see tsdown.config.ts).
+ */
+
+/* --- center-column takeover (global rules, attribute-scoped) ---------------- */
+
+[data-pane='conversation'],
+[class*='centerCol'] {
+  position: relative;
+}
+
+/* The panel container rides inside the conversation grid item as an extra
+   trailing child; hidden unless the panel is active. */
+[data-dsh-nyro-usage-view] {
+  position: absolute;
+  inset: 0;
+  display: none;
+  z-index: 60;
+  background: var(--dsw-alias-bg-base);
+  overflow: hidden;
+}
+
+html[data-dsh-nyro-usage-active]:not([data-dsh-taskboard-active]):not([data-dsh-ssh-active]) [data-dsh-nyro-usage-view] {
+  display: block;
+}
+
+html[data-dsh-nyro-usage-active]:not([data-dsh-taskboard-active]):not([data-dsh-ssh-active]) [data-pane='conversation'] > :not([data-dsh-nyro-usage-view]),
+html[data-dsh-nyro-usage-active]:not([data-dsh-taskboard-active]):not([data-dsh-ssh-active]) [class*='centerCol'] > :not([data-dsh-nyro-usage-view]) {
+  display: none !important;
+}
+
+/* --- sidebar entry (mirrors the shell's nav-item look) ---------------------- */
+
+.entry {
+  width: 100%;
+  height: 32px;
+  color: var(--dsw-alias-label-secondary);
+  cursor: pointer;
+  white-space: nowrap;
+  background: 0 0;
+  border: none;
+  border-radius: 8px;
+  align-items: center;
+  gap: 8px;
+  padding: 0 12px;
+  font-size: 13px;
+  display: flex;
+}
+
+.entry:hover {
+  background: var(--dsw-specific-sidebar-nav-item-hover);
+  color: var(--dsw-alias-label-primary);
+}
+
+.entry[data-active] {
+  background: var(--dsw-specific-sidebar-nav-item-active);
+  color: var(--dsw-alias-label-primary);
+  font-weight: 600;
+}
+
+.entryIcon {
+  flex: none;
+  justify-content: center;
+  align-items: center;
+  display: inline-flex;
+}
+
+.entryLabel {
+  text-overflow: ellipsis;
+  overflow: hidden;
+}
+
+[data-dsh-frame][data-sidebar-collapsed] .entry {
+  justify-content: center;
+  width: 100%;
+  padding: 0;
+}
+
+[data-dsh-frame][data-sidebar-collapsed] .entryLabel {
+  display: none;
+}
+
+/* --- panel frame ------------------------------------------------------------ */
+
+.panel {
+  background: var(--dsw-alias-bg-base);
+  min-width: 0;
+  height: 100%;
+  min-height: 0;
+  color: var(--dsw-alias-label-primary);
+  font-family: var(--dsw-font-family);
+  flex-direction: column;
+  gap: 12px;
+  padding: 14px 16px 16px;
+  display: flex;
+}
+
+.panelHeader {
+  flex: none;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+  display: flex;
+}
+
+.panelTitle {
+  color: var(--dsw-alias-label-primary);
+  white-space: nowrap;
+  flex: none;
+  margin: 0;
+  font-size: 16px;
+  font-weight: 700;
+}
+
+.baseUrlChip {
+  color: var(--dsw-alias-label-tertiary);
+  background: var(--dsw-alias-bg-layer-2);
+  border: 1px solid var(--dsw-alias-border-l1);
+  white-space: nowrap;
+  max-width: 260px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  border-radius: 999px;
+  padding: 2px 10px;
+  font-size: 11.5px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+.summary {
+  color: var(--dsw-alias-label-secondary);
+  white-space: nowrap;
+  font-size: 12px;
+}
+
+.toolbarSpacer {
+  flex: 1;
+}
+
+.autoRefreshLabel {
+  color: var(--dsw-alias-label-secondary);
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  display: inline-flex;
+}
+
+.autoRefreshSelect {
+  color: var(--dsw-alias-label-primary);
+  background: var(--dsw-specific-input-major);
+  border: 1px solid var(--dsw-alias-border-l2);
+  border-radius: 8px;
+  outline: none;
+  padding: 4px 8px;
+  font: inherit;
+  font-size: 12px;
+}
+
+.updated {
+  color: var(--dsw-alias-label-tertiary);
+  white-space: nowrap;
+  font-size: 11.5px;
+}
+
+.refreshButton {
+  color: var(--dsw-alias-label-primary-foreground);
+  background: var(--dsh-alias-button-info-fill, var(--dsw-alias-state-business-primary));
+  cursor: pointer;
+  white-space: nowrap;
+  align-items: center;
+  gap: 6px;
+  border: none;
+  border-radius: 8px;
+  padding: 6px 14px;
+  font-size: 13px;
+  font-weight: 600;
+  display: inline-flex;
+}
+
+.refreshButton:hover:not(:disabled) {
+  background: var(--dsh-alias-button-info-hover, var(--dsw-alias-state-business-primary));
+}
+
+.refreshButton:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.spinner {
+  border: 2px solid currentcolor;
+  border-top-color: transparent;
+  border-radius: 50%;
+  flex: none;
+  width: 11px;
+  height: 11px;
+  animation: 0.8s linear infinite nyu-spin;
+  display: inline-block;
+}
+
+@keyframes nyu-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.panelContent {
+  flex-direction: column;
+  flex: 1;
+  gap: 12px;
+  min-height: 0;
+  display: flex;
+  overflow-y: auto;
+}
+
+.placeholder {
+  text-align: center;
+  color: var(--dsw-alias-label-tertiary);
+  gap: 6px;
+  padding: 40px 16px;
+  font-size: 12.5px;
+  display: flex;
+  flex-direction: column;
+}
+
+.placeholderTitle {
+  color: var(--dsw-alias-label-secondary);
+  margin: 0;
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.placeholderHint {
+  margin: 0;
+  line-height: 1.6;
+}
+
+.loadError {
+  color: var(--dsw-alias-state-error-primary);
+  background: var(--dsw-alias-bg-layer-2);
+  border: 1px solid var(--dsw-alias-state-error-primary);
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  border-radius: 10px;
+  padding: 10px 14px;
+  font-size: 12.5px;
+  line-height: 1.5;
+  display: flex;
+}
+
+.retryButton {
+  color: var(--dsw-alias-label-primary);
+  border: 1px solid var(--dsw-alias-border-l2);
+  cursor: pointer;
+  white-space: nowrap;
+  background: 0 0;
+  border-radius: 8px;
+  padding: 4px 12px;
+  font: inherit;
+  font-size: 12px;
+  flex: none;
+}
+
+.retryButton:hover {
+  background: var(--dsw-alias-interactive-bg-hover);
+}
+
+/* --- provider card grid ------------------------------------------------------ */
+
+.grid {
+  grid-template-columns: repeat(auto-fill, minmax(340px, 1fr));
+  gap: 12px;
+  display: grid;
+}
+
+.card {
+  background: var(--dsw-alias-bg-layer-2);
+  border: 1px solid var(--dsw-alias-border-l1);
+  border-radius: 12px;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px 14px;
+  display: flex;
+  min-width: 0;
+}
+
+/* --- drag-to-reorder --------------------------------------------------------- */
+
+/* Grip affordance: the whole card is draggable, the grip just says so. */
+.dragHandle {
+  color: var(--dsw-alias-label-tertiary);
+  cursor: grab;
+  flex: none;
+  font-size: 14px;
+  line-height: 1;
+  opacity: 0.8;
+}
+
+.dragHandle:hover {
+  color: var(--dsw-alias-label-secondary);
+  opacity: 1;
+}
+
+/* Source card dims while a drag is in flight. */
+.cardDragging {
+  opacity: 0.4;
+}
+
+/* Insertion indicator: a business-colored bar on the target edge. */
+.cardDropBefore {
+  box-shadow: -3px 0 0 0 var(--dsw-alias-state-business-primary);
+}
+
+.cardDropAfter {
+  box-shadow: 3px 0 0 0 var(--dsw-alias-state-business-primary);
+}
+
+.resetOrderButton {
+  color: var(--dsw-alias-label-secondary);
+  background: 0 0;
+  border: 1px solid var(--dsw-alias-border-l2);
+  cursor: pointer;
+  white-space: nowrap;
+  border-radius: 8px;
+  padding: 5px 12px;
+  font: inherit;
+  font-size: 12px;
+  flex: none;
+}
+
+.resetOrderButton:hover {
+  color: var(--dsw-alias-label-primary);
+  background: var(--dsw-alias-interactive-bg-hover);
+}
+
+.cardMuted {
+  opacity: 0.55;
+}
+
+.cardExhausted {
+  border-color: var(--dsw-alias-state-error-primary);
+}
+
+.cardHeader {
+  align-items: center;
+  gap: 8px;
+  display: flex;
+}
+
+.cardTitle {
+  color: var(--dsw-alias-label-primary);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+  flex: 1;
+  overflow: hidden;
+  font-size: 13.5px;
+  font-weight: 600;
+}
+
+.cardBadges {
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  display: inline-flex;
+}
+
+.badge {
+  color: var(--dsw-alias-label-secondary);
+  background: var(--dsw-alias-bg-layer-3);
+  border: 1px solid var(--dsw-alias-border-l2);
+  white-space: nowrap;
+  border-radius: 999px;
+  padding: 1px 8px;
+  font-size: 11px;
+  line-height: 1.6;
+  display: inline-block;
+}
+
+.badgeLevel {
+  color: var(--dsw-alias-state-business-primary);
+  border-color: var(--dsw-alias-state-business-primary);
+  background: 0 0;
+}
+
+.pill {
+  white-space: nowrap;
+  border-radius: 999px;
+  padding: 1px 8px;
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1.6;
+  display: inline-block;
+}
+
+.pillEligible {
+  color: var(--dsw-alias-state-success-primary);
+  border: 1px solid var(--dsw-alias-state-success-primary);
+}
+
+.pillExhausted {
+  color: #fff;
+  background: var(--dsw-alias-state-error-primary);
+  border: 1px solid var(--dsw-alias-state-error-primary);
+}
+
+.errorBanner {
+  color: var(--dsw-alias-state-error-primary);
+  background: var(--dsw-alias-bg-layer-3);
+  border: 1px solid var(--dsw-alias-separator-primary);
+  border-left: 3px solid var(--dsw-alias-state-error-primary);
+  flex-direction: column;
+  gap: 2px;
+  border-radius: 8px;
+  padding: 8px 10px;
+  display: flex;
+}
+
+.errorTitle {
+  font-size: 11.5px;
+  font-weight: 600;
+}
+
+.errorText {
+  color: var(--dsw-alias-label-secondary);
+  overflow-wrap: anywhere;
+  font-size: 11.5px;
+  line-height: 1.5;
+}
+
+/* --- quota tier rows --------------------------------------------------------- */
+
+.tierList {
+  flex-direction: column;
+  gap: 7px;
+  display: flex;
+}
+
+.tierRow {
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  display: flex;
+}
+
+.tierLabel {
+  color: var(--dsw-alias-label-secondary);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 84px;
+  max-width: 150px;
+  overflow: hidden;
+  flex: none;
+  font-weight: 500;
+}
+
+.tierTrack {
+  background: var(--dsw-alias-interactive-bg-hover);
+  border-radius: 999px;
+  height: 8px;
+  flex: 1;
+  /* visible overflow: the steady-pace triangle renders above the track. */
+  overflow: visible;
+  position: relative;
+}
+
+.tierFill {
+  border-radius: 999px;
+  height: 100%;
+  transition: width 0.15s linear;
+  /* clip the fill itself to the track's rounded shape. */
+  overflow: hidden;
+}
+
+/* Steady-pace indicator: a small triangle hovering above the track,
+   pointing down at the position an even consumer would be at right now
+   (0% right after reset → 100% at reset time). Rendered outside the track's
+   rounded clipping via the wrapper's overflow: visible. */
+.tierPaceWrap {
+  position: absolute;
+  top: -8px;
+  left: 0;
+  right: 0;
+  height: 0;
+  pointer-events: none;
+}
+
+.tierPace {
+  position: absolute;
+  top: 0;
+  width: 0;
+  height: 0;
+  transform: translateX(-50%);
+  border-left: 4px solid transparent;
+  border-right: 4px solid transparent;
+  /* Theme-tracking ink: the token flips with body[data-ds-dark-theme] —
+     bright (neutral-50) on dark backgrounds, dark (neutral-1000) on light
+     ones. The bg-colored drop-shadow halo separates the shape from the
+     colored fill and the pale track in both themes. */
+  border-top: 5px solid var(--dsw-alias-label-primary, #334155);
+  filter: drop-shadow(0 0 1.5px var(--dsw-alias-bg-base, rgba(255, 255, 255, 0.9)));
+  cursor: help;
+  pointer-events: auto;
+}
+
+.tierFillOk {
+  background: var(--dsw-alias-state-success-primary);
+}
+
+.tierFillWarn {
+  background: var(--dsw-alias-state-warn-primary);
+}
+
+.tierFillDanger {
+  background: var(--dsw-alias-state-error-primary);
+}
+
+/* --- balances / spends ------------------------------------------------------- */
+
+.tierPercent {
+  width: 38px;
+  text-align: right;
+  flex: none;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+.tierPercentOk {
+  color: var(--dsw-alias-state-success-primary);
+}
+
+.tierPercentWarn {
+  color: var(--dsw-alias-state-warn-primary);
+}
+
+.tierPercentDanger {
+  color: var(--dsw-alias-state-error-primary);
+}
+
+.tierReset {
+  color: var(--dsw-alias-label-tertiary);
+  white-space: nowrap;
+  width: 52px;
+  text-align: right;
+  flex: none;
+  font-size: 10.5px;
+  font-variant-numeric: tabular-nums;
+}
+
+/* --- balances / spends ------------------------------------------------------- */
+
+.balanceList {
+  flex-direction: column;
+  gap: 5px;
+  display: flex;
+}
+
+.balanceRow {
+  align-items: baseline;
+  gap: 6px;
+  font-size: 12px;
+  display: flex;
+}
+
+.balanceLabel {
+  color: var(--dsw-alias-label-secondary);
+  width: 52px;
+  flex: none;
+  font-weight: 500;
+}
+
+.balanceValue {
+  color: var(--dsw-alias-label-primary);
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+.balanceDetail {
+  color: var(--dsw-alias-label-tertiary);
+  font-size: 10.5px;
+}
+
+.unavailableBadge {
+  color: var(--dsw-alias-state-error-primary);
+  font-weight: 700;
+}
+
+.spendRow {
+  color: var(--dsw-alias-label-secondary);
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px 14px;
+  font-size: 12px;
+  display: flex;
+}
+
+.spendValue {
+  color: var(--dsw-alias-label-primary);
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+.cardFooter {
+  color: var(--dsw-alias-label-tertiary);
+  font-size: 10.5px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .tierFill,
+  .spinner {
+    transition: none;
+    animation-duration: 1.6s;
+  }
+}
