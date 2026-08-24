@@ -4,6 +4,33 @@ Nyro 的所有重要变更均记录在此文件中。
 
 ---
 
+## v2.0.5
+
+> 发布于 2026-08-24
+
+#### 新功能
+
+- **全量 Provider 用量 API**：新增 `GET /api/v1/providers/usage`，最多 4 路并发查询上游，并按 Provider 独立返回 `ok` / `unsupported` / `error`，单个供应商失败不再影响整表
+- **DSH Nyro 用量面板**：新增独立的 `dsh-nyro-usage` 插件，展示配额窗口、余额、消费和调度状态，支持卡片拖动排序、Host 侧缓存，以及令牌不出浏览器的回环 Admin API 代理
+- **用量与日志可观测性**：统计页展示模型调用次数，日志详情展示完整请求 ID，并支持点击全选与复制
+
+#### 优化 / 重构
+
+- **统一协议转换子系统**：将 PassThrough、IR 转换和 Raw-Wire 兼容收敛到统一的计划、准备和尝试生命周期，共享缓冲/流式调度、Hooks、Usage、健康度与错误处理；本地转发错误码改为 `nyro_forward_failed`
+- **Anthropic 推理控制**：删除固定 `budget_tokens` 映射和模型白名单，统一使用 `output_config.effort` 的定性自适应推理
+- **供应商推理方言**：GLM、DeepSeek、OpenCode 将关闭推理写法归一为 `none`，Grok 则删除该字段，并覆盖直通、IR、中继、兼容层及 Responses 嵌套形态
+- **运维变更 — Docker 主机网络**：Compose 改用 `network_mode: host`，让容器回环地址可访问宿主机上的 sub2api 等服务；移除冗余端口映射并继续强制代理 Bearer 鉴权
+- **破坏性变更 — 后端路由策略**：仅保留 `weighted` 和 `priority`，删除有状态的 `cooldown` 与延迟 EMA 策略；Admin 创建/更新会拒绝已删除值（编辑其他字段时保留旧值也会失败），绕过该路径留存的旧数据则会在选路时回退到 `weighted`
+
+#### 修复
+
+- **Codex Responses-Lite 工具**：将 `additional_tools` 提升到第三方工具载体，桥接 custom 与 namespace 工具，并在 Responses、Chat、Anthropic 出站中恢复响应事件
+- **Grok 推理关闭写法**：识别中继的 `grok-*` 模型，删除顶层和嵌套请求中的关闭推理字段，同时保留其他 reasoning 配置
+- **GLM 用量空响应**：HTTP 200 空响应不再显示 JSON EOF，改为提示重试及 Team Coding Plan scope 配置方向
+- **HTTP/LAN 剪贴板**：在 `navigator.clipboard` 不可用的非安全 WebUI 环境中增加兼容复制方案
+
+---
+
 ## v2.0.4
 
 > 发布于 2026-08-22

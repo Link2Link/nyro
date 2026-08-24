@@ -4,6 +4,33 @@ All notable changes to Nyro will be documented in this file.
 
 ---
 
+## v2.0.5
+
+> Released on 2026-08-24
+
+#### Features
+
+- **Bulk provider usage API**: add `GET /api/v1/providers/usage` with four-way upstream concurrency and per-provider `ok` / `unsupported` / `error` results, so one failed vendor does not fail the full listing
+- **DSH Nyro usage panel**: add the independent `dsh-nyro-usage` plugin with quota windows, balances, spend, scheduling status, drag ordering, host-side caching, and a loopback-only Admin API proxy that keeps the token out of the browser
+- **Usage and log observability**: show model request counts, expose complete request-log IDs, and support click-to-select / copy from the detail dialog
+
+#### Improvements / Refactoring
+
+- **Unified protocol conversion subsystem**: consolidate PassThrough, IR conversion, and raw-wire compatibility behind a shared planning / preparation / attempt lifecycle for buffered and streaming dispatch, hooks, usage, health, and error handling; local forwarding failures now use `nyro_forward_failed`
+- **Anthropic reasoning controls**: replace fixed `budget_tokens` mapping and model allowlists with qualitative adaptive thinking through `output_config.effort`
+- **Provider-specific reasoning dialects**: normalize disabled effort values to `none` for GLM, DeepSeek, and OpenCode, while removing the field for Grok across passthrough, IR, relay, compat, and nested Responses paths
+- **Operational — Docker host networking**: run the Compose service with `network_mode: host` so container-local loopback can reach host services such as sub2api; remove redundant port publishing while retaining proxy Bearer authentication
+- **Breaking — backend routing strategies**: keep `weighted` and `priority` only, removing the stateful `cooldown` and latency-EMA strategies; Admin create/update rejects the removed values (including an unchanged legacy value during another edit), while rows already persisted outside that path fall back to `weighted` during selection
+
+#### Fixes
+
+- **Codex Responses-Lite tools**: promote `additional_tools` into third-party tool payloads, bridge custom and namespace tools, and restore their response events across Responses, Chat, and Anthropic egress
+- **Grok effort disabling**: detect relayed `grok-*` models and remove disabled effort fields from top-level and nested request shapes without discarding sibling reasoning options
+- **GLM usage empty responses**: replace the opaque JSON EOF failure for HTTP 200 empty bodies with retry guidance and Team Coding Plan scope hints
+- **Clipboard on HTTP/LAN**: add a legacy copy fallback for insecure WebUI contexts where `navigator.clipboard` is unavailable
+
+---
+
 ## v2.0.4
 
 > Released on 2026-08-22
