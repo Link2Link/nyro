@@ -73,12 +73,20 @@ pub(crate) fn maybe_sanitize_codex_consumer_request(body: &mut Value, provider: 
 }
 
 /// Codex 消费级上游（`chatgpt.com/backend-api/codex`）对 Responses 的
-/// `reasoning` 输入项做严格校验：`content` 数组最大长度为 0（合法载体是
-/// `summary` 与 `encrypted_content`）。中转或客户端回放历史时若把裸思维链
-/// 文本塞进 `reasoning.content`，上游会返回 400
-/// `array_above_max_length: Invalid 'input[N].content'`。原生直通与 IR
-/// 转码两条路径转发前都需要剥掉非空 `content`；`summary` /
-/// `encrypted_content` / 其余字段原样保留。
+/// `reasoning` 输入项执行两层防御：
+///
+/// 1. **schema 校验**：`content` 数组最大长度为 0（合法载体是 `summary`
+///    与 `encrypted_content`）。回放历史携带裸思维链文本会返回 400
+///    `array_above_max_length` -> 剥掉非空 `content`。
+/// 2. **无状态回放契约**：`store=false` 时服务端不持久化任何项，回放的
+///    reasoning 项必须携带可解密的 `encrypted_content` 才能重建。多后端
+///    路由把会话中途切到其他 provider 再切回来时，外来 reasoning 项
+///    （中转铸造的 ID、`encrypted_content: null`、纯文本 content）既无法
+///    按 ID 重建（404 `Item with id ... not found`）也过不了 schema 校验
+///    -> 整项剔除（只损失该轮思维链上下文，请求可通过）。客户端显式
+///    `store=true`（依赖服务端状态）时不剔除。
+///
+/// 原生直通与 IR 转码两条路径转发前都需要执行；非 reasoning 项永不剔除。
 pub(crate) fn sanitize_codex_reasoning_content(body: &mut Value, provider: &Provider) {
     let is_codex = provider
         .channel
@@ -87,9 +95,25 @@ pub(crate) fn sanitize_codex_reasoning_content(body: &mut Value, provider: &Prov
     if !is_codex {
         return;
     }
+    let stateless = matches!(body.get("store"), Some(Value::Bool(false)));
     let Some(items) = body.get_mut("input").and_then(Value::as_array_mut) else {
         return;
     };
+    if stateless {
+        items.retain(|item| {
+            let is_reasoning = item
+                .get("type")
+                .and_then(Value::as_str)
+                .is_some_and(|t| t.eq_ignore_ascii_case("reasoning"));
+            if !is_reasoning {
+                return true;
+            }
+            // 无 usable encrypted_content 的 reasoning 项在无状态下无法重建。
+            item.get("encrypted_content")
+                .and_then(Value::as_str)
+                .is_some_and(|s| !s.trim().is_empty())
+        });
+    }
     for item in items {
         let is_reasoning = item
             .get("type")
@@ -1064,6 +1088,79 @@ mod tests {
         assert_eq!(body["model"], "m");
     }
 
+    #[test]
+    fn sanitize_drops_unresolvable_reasoning_items_when_stateless() {
+        let provider = provider_with_channel("", Some("codex"), false);
+
+        // store=false：无 usable encrypted_content 的 reasoning 项整项剔除，
+        // 原生项（带 encrypted_content）与非 reasoning 项保留。
+        let mut body = serde_json::json!({
+            "store": false,
+            "input": [
+                {"type": "message", "role": "user", "content": [
+                    {"type": "input_text", "text": "hi"}
+                ]},
+                {"type": "reasoning", "id": "rs_resp_20260825194117052ba4e951a74c39",
+                 "summary": [], "encrypted_content": null,
+                 "content": [{"type": "reasoning_text", "text": "foreign"}]},
+                {"type": "reasoning", "id": "rs_033bf81503e4a9e",
+                 "summary": [], "encrypted_content": "enc-keep"},
+                {"type": "function_call", "id": "fc_call_x", "name": "f", "arguments": "{}"}
+            ]
+        });
+        sanitize_codex_reasoning_content(&mut body, &provider);
+        let items = body["input"].as_array().unwrap();
+        assert_eq!(items.len(), 3, "foreign reasoning item must be dropped");
+        assert_eq!(items[1]["id"], "rs_033bf81503e4a9e");
+        assert_eq!(items[1]["encrypted_content"], "enc-keep");
+        assert_eq!(
+            items[2]["type"], "function_call",
+            "non-reasoning items survive"
+        );
+
+        // store=true：客户端显式依赖服务端状态，不剔除，仅剥 content。
+        let mut body = serde_json::json!({
+            "store": true,
+            "input": [{"type": "reasoning", "id": "rs_x", "content": [{"text": "t"}]}]
+        });
+        sanitize_codex_reasoning_content(&mut body, &provider);
+        assert_eq!(
+            body["input"].as_array().unwrap().len(),
+            1,
+            "store=true keeps the item",
+        );
+        assert!(
+            body["input"][0].get("content").is_none(),
+            "content strip still applies under store=true",
+        );
+
+        // 空白 encrypted_content 字符串同样视为不可重建。
+        let mut body = serde_json::json!({
+            "store": false,
+            "input": [{"type": "reasoning", "encrypted_content": "  "}]
+        });
+        sanitize_codex_reasoning_content(&mut body, &provider);
+        assert!(
+            body["input"].as_array().unwrap().is_empty(),
+            "blank encrypted_content is not usable",
+        );
+
+        // 非 codex 渠道：store=false 也不剔除。
+        let mut body = serde_json::json!({
+            "store": false,
+            "input": [{"type": "reasoning", "content": [{"text": "x"}]}]
+        });
+        sanitize_codex_reasoning_content(
+            &mut body,
+            &provider_with_channel("", Some("sub2api"), false),
+        );
+        assert_eq!(
+            body["input"].as_array().unwrap().len(),
+            1,
+            "non-codex channels are untouched",
+        );
+    }
+
     /// Codex 消费级上游：直通路径剥离 reasoning 项的非空 content。
     /// 完整复现线上 400 现场：回放历史携带 `reasoning.content` 文本数组。
     #[tokio::test]
@@ -1115,6 +1212,59 @@ mod tests {
             Some(1),
             "agent_message item content must be untouched",
         );
+    }
+
+    /// Codex 消费级上游：store=false 时整项剔除无法无状态重建的外来
+    /// reasoning 项。完整复现线上 404 现场：多后端路由中途切换 provider，
+    /// 中转铸造的 reasoning 项（未知 ID + null encrypted_content）回放到
+    /// codex 直连后端触发 `Item with id ... not found`。
+    #[tokio::test]
+    async fn passthrough_drops_foreign_reasoning_items_for_stateless_codex() {
+        let gw = build_test_gateway().await;
+        let provider = provider_with_channel("", Some("codex"), false);
+        let ctx = responses_ctx(&provider, &gw);
+
+        let out = passthrough_run(
+            &FakeApiKeyVendor,
+            serde_json::json!({
+                "model": "gpt-5.6-sol",
+                "stream": true,
+                "store": false,
+                "include": ["reasoning.encrypted_content"],
+                "input": [
+                    {"type": "message", "role": "user", "content": [
+                        {"type": "input_text", "text": "hi"}
+                    ]},
+                    {"type": "reasoning", "id": "rs_033bf81503e4a9e",
+                     "summary": [], "encrypted_content": "enc-native"},
+                    {"type": "reasoning", "id": "rs_resp_20260825194117052ba4e951a74c39",
+                     "summary": [], "encrypted_content": null,
+                     "content": [{"type": "reasoning_text", "text": "foreign relay thought"}]},
+                    {"type": "function_call", "id": "fc_call_65b6bc94615d4438a72cf450",
+                     "name": "f", "arguments": "{}"}
+                ]
+            }),
+            &ctx,
+            true,
+        )
+        .await
+        .expect("passthrough succeeds");
+
+        let items = out.body["input"].as_array().unwrap();
+        assert_eq!(
+            items.len(),
+            3,
+            "foreign reasoning item (unknown id, null encrypted_content) must be dropped",
+        );
+        assert_eq!(
+            items[1]["encrypted_content"], "enc-native",
+            "native reasoning replay survives",
+        );
+        assert_eq!(
+            items[2]["type"], "function_call",
+            "non-reasoning items survive",
+        );
+        assert_eq!(out.body["store"], false, "store flag is untouched");
     }
 
     /// 非 codex 渠道必须保留这些参数，直通行为不受影响。
