@@ -134,6 +134,53 @@ pub(crate) fn sanitize_codex_reasoning_content(body: &mut Value, provider: &Prov
     }
 }
 
+/// Codex 消费级上游对工具调用项的 `id` 有硬前缀契约：
+/// `custom_tool_call.id` 必须以 `ctc` 开头（配对 output 为 `ctco_`），
+/// `function_call.id` 必须以 `fc` 开头。多后端路由把会话中途切到中转再
+/// 切回来时，中转轮返回的工具调用可能带它自己的 ID 体系（如
+/// `fc_call_...`），回放给 codex 会触发 400
+/// `invalid_value: Expected an ID that begins with 'ctc'`。
+///
+/// 修复方式是 ID 规范化（改写）而非剔项：工具调用链
+/// `reasoning → tool_call → tool_output` 中剔掉 tool_call 会让 output
+/// 成为孤儿（同样 400），且工具结果是硬信息不该丢。改写 `id` 不影响
+/// 配对——output 项通过 `call_id`（客户端↔模型配对键，中转轮自洽）
+/// 引用调用，不通过 `id`。`call_id` 与 output 的 id 保持原样。
+pub(crate) fn sanitize_codex_tool_call_ids(body: &mut Value, provider: &Provider) {
+    let is_codex = provider
+        .channel
+        .as_deref()
+        .is_some_and(|channel| channel.eq_ignore_ascii_case("codex"));
+    if !is_codex {
+        return;
+    }
+    let Some(items) = body.get_mut("input").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for item in items {
+        let kind = item.get("type").and_then(Value::as_str).unwrap_or("");
+        let required_prefix = if kind.eq_ignore_ascii_case("custom_tool_call") {
+            "ctc"
+        } else if kind.eq_ignore_ascii_case("function_call") {
+            "fc"
+        } else {
+            continue;
+        };
+        let id = item.get("id").and_then(Value::as_str).map(str::to_string);
+        let Some(id) = id else {
+            continue;
+        };
+        if !id.starts_with(required_prefix)
+            && let Some(object) = item.as_object_mut()
+        {
+            object.insert(
+                "id".to_string(),
+                Value::String(format!("{required_prefix}_{id}")),
+            );
+        }
+    }
+}
+
 pub(crate) fn apply_vendor_effort_policy(body: &mut Value, provider: &Provider) {
     let vendor_id = provider
         .vendor
@@ -206,6 +253,8 @@ where
     maybe_sanitize_codex_consumer_request(&mut body, ctx.provider);
     // 5d. Codex 消费级上游：剥离 reasoning 项的非空 content（IR 转码路径）
     sanitize_codex_reasoning_content(&mut body, ctx.provider);
+    // 5e. Codex 消费级上游：规范化外来工具调用 ID 前缀（IR 转码路径）
+    sanitize_codex_tool_call_ids(&mut body, ctx.provider);
     apply_vendor_effort_policy(&mut body, ctx.provider);
 
     // 6. auth headers
@@ -359,6 +408,8 @@ pub async fn passthrough_run(
         maybe_sanitize_codex_consumer_request(&mut raw_body, ctx.provider);
         // Codex 消费级上游：剥离 reasoning 项的非空 content（Responses 直通路径）
         sanitize_codex_reasoning_content(&mut raw_body, ctx.provider);
+        // Codex 消费级上游：规范化外来工具调用 ID 前缀（Responses 直通路径）
+        sanitize_codex_tool_call_ids(&mut raw_body, ctx.provider);
     }
 
     let mut headers = if ctx.disable_default_auth {
@@ -1023,6 +1074,79 @@ mod tests {
     }
 
     #[test]
+    fn sanitize_tool_call_ids_unit_cases() {
+        let provider = provider_with_channel("", Some("codex"), false);
+
+        // 外来 custom_tool_call（fc_call_ 前缀）被改写为 ctc_ 前缀；
+        // call_id 与 output 项均不受影响。
+        let mut body = serde_json::json!({
+            "input": [
+                {"type": "custom_tool_call", "id": "fc_call_71a12a780e464146864664b5",
+                 "name": "exec", "call_id": "call_71a12a780e464146864664b5"},
+                {"type": "custom_tool_call_output", "id": "ctco_01a038f6-400b",
+                 "call_id": "call_71a12a780e464146864664b5"},
+                {"type": "custom_tool_call", "id": "ctc_0031496ce5c2", "name": "exec",
+                 "call_id": "call_Wrnr"}
+            ]
+        });
+        sanitize_codex_tool_call_ids(&mut body, &provider);
+        let items = body["input"].as_array().unwrap();
+        assert_eq!(
+            items[0]["id"], "ctc_fc_call_71a12a780e464146864664b5",
+            "foreign custom_tool_call id gains the ctc prefix",
+        );
+        assert_eq!(
+            items[0]["call_id"], "call_71a12a780e464146864664b5",
+            "call_id is the pairing key and must stay untouched",
+        );
+        assert_eq!(
+            items[1]["id"], "ctco_01a038f6-400b",
+            "output item ids are already legal and untouched",
+        );
+        assert_eq!(
+            items[2]["id"], "ctc_0031496ce5c2",
+            "native ctc_ ids are left alone",
+        );
+
+        // 外来 function_call（非 fc 前缀）同理规范化。
+        let mut body = serde_json::json!({
+            "input": [
+                {"type": "function_call", "id": "call_9f8e7d", "name": "wait", "call_id": "call_9f8e7d"}
+            ]
+        });
+        sanitize_codex_tool_call_ids(&mut body, &provider);
+        assert_eq!(
+            body["input"][0]["id"], "fc_call_9f8e7d",
+            "foreign function_call id gains the fc prefix",
+        );
+
+        // 非 codex 渠道：不改写。
+        let mut body = serde_json::json!({
+            "input": [
+                {"type": "custom_tool_call", "id": "fc_call_x", "name": "exec", "call_id": "call_x"}
+            ]
+        });
+        sanitize_codex_tool_call_ids(
+            &mut body,
+            &provider_with_channel("", Some("sub2api"), false),
+        );
+        assert_eq!(
+            body["input"][0]["id"], "fc_call_x",
+            "non-codex channels are untouched",
+        );
+
+        // 缺 id 的调用项：跳过（无 id 无从校验前缀）。
+        let mut body = serde_json::json!({
+            "input": [{"type": "custom_tool_call", "name": "exec", "call_id": "call_y"}]
+        });
+        sanitize_codex_tool_call_ids(&mut body, &provider);
+        assert!(
+            body["input"][0].get("id").is_none(),
+            "missing id stays missing",
+        );
+    }
+
+    #[test]
     fn sanitize_reasoning_content_unit_cases() {
         // 非 codex 渠道：不做任何改动。
         let mut body = serde_json::json!({
@@ -1211,6 +1335,60 @@ mod tests {
             out.body["input"][2]["content"].as_array().map(Vec::len),
             Some(1),
             "agent_message item content must be untouched",
+        );
+    }
+
+    /// Codex 消费级上游：直通路径规范化外来工具调用 ID 前缀。完整复现
+    /// 线上 400 现场：多后端路由切到中转再切回，中转轮的 custom_tool_call
+    /// 带 `fc_call_` ID，回放给 codex 触发
+    /// `Expected an ID that begins with 'ctc'`。
+    #[tokio::test]
+    async fn passthrough_normalizes_foreign_tool_call_ids_for_codex() {
+        let gw = build_test_gateway().await;
+        let provider = provider_with_channel("", Some("codex"), false);
+        let ctx = responses_ctx(&provider, &gw);
+
+        let out = passthrough_run(
+            &FakeApiKeyVendor,
+            serde_json::json!({
+                "model": "gpt-5.6-sol",
+                "stream": true,
+                "store": false,
+                "input": [
+                    {"type": "reasoning", "id": "rs_resp_202608252046531fe8808638bd475f",
+                     "summary": [], "encrypted_content": null,
+                     "content": [{"type": "reasoning_text", "text": "foreign"}]},
+                    {"type": "custom_tool_call", "id": "fc_call_71a12a780e464146864664b5",
+                     "name": "exec", "call_id": "call_71a12a780e464146864664b5",
+                     "input": "ls"},
+                    {"type": "custom_tool_call_output",
+                     "id": "ctco_01a038f6-400b-7f83-b64e-fb3a8b8c7ed5",
+                     "call_id": "call_71a12a780e464146864664b5",
+                     "output": [{"type": "input_text", "text": "done"}]}
+                ]
+            }),
+            &ctx,
+            true,
+        )
+        .await
+        .expect("passthrough succeeds");
+
+        // Foreign reasoning dropped by the stateless rule; the foreign
+        // custom_tool_call survives with a normalized ctc_ id and its
+        // call_id pairing intact.
+        let items = out.body["input"].as_array().unwrap();
+        assert_eq!(items.len(), 2, "foreign reasoning is dropped");
+        assert_eq!(
+            items[0]["id"], "ctc_fc_call_71a12a780e464146864664b5",
+            "foreign tool call id is normalized to the ctc prefix",
+        );
+        assert_eq!(
+            items[0]["call_id"], "call_71a12a780e464146864664b5",
+            "pairing call_id stays untouched",
+        );
+        assert_eq!(
+            items[1]["type"], "custom_tool_call_output",
+            "the paired output survives next to its (renamed) call",
         );
     }
 
