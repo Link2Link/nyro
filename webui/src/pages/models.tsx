@@ -62,6 +62,7 @@ function FieldLabel({ children }: { children: string }) {
 
 function balanceLabel(value: ModelBalance, isZh: boolean) {
   if (value === "priority") return isZh ? "优先分级" : "Priority";
+  if (value === "latency") return isZh ? "延迟优先" : "Latency";
   return isZh ? "加权轮询" : "Weighted";
 }
 
@@ -285,7 +286,7 @@ function TargetRow({
           />
         )}
 
-        {balance === "weighted" ? (
+        {balance === "weighted" || balance === "latency" ? (
           <Input
             className="bg-white"
             type="number"
@@ -549,6 +550,7 @@ export default function ModelsPage() {
                 <SelectContent>
                   <SelectItem value="weighted">{isZh ? "加权轮询" : "Weighted"}</SelectItem>
                   <SelectItem value="priority">{isZh ? "优先分级" : "Priority"}</SelectItem>
+                  <SelectItem value="latency">{isZh ? "延迟优先" : "Latency"}</SelectItem>
                 </SelectContent>
               </Select>
             </div>
@@ -559,6 +561,13 @@ export default function ModelsPage() {
                   {createForm.balance === "priority" && (
                     <span className="text-[11px] text-slate-400">
                       {isZh ? "数字越小，优先级越高（1 最高）" : "lower number = higher priority (1 = highest)"}
+                    </span>
+                  )}
+                  {createForm.balance === "latency" && (
+                    <span className="text-[11px] text-slate-400">
+                      {isZh
+                        ? "按首字延时升序路由；权重仅在并列时生效"
+                        : "routes by lowest first-token latency; weight only breaks ties"}
                     </span>
                   )}
                 </div>
@@ -707,6 +716,7 @@ export default function ModelsPage() {
                         <SelectContent>
                           <SelectItem value="weighted">{isZh ? "加权轮询" : "Weighted"}</SelectItem>
                           <SelectItem value="priority">{isZh ? "优先分级" : "Priority"}</SelectItem>
+                          <SelectItem value="latency">{isZh ? "延迟优先" : "Latency"}</SelectItem>
                         </SelectContent>
                       </Select>
                     </div>
@@ -717,6 +727,13 @@ export default function ModelsPage() {
                           {editForm.balance === "priority" && (
                             <span className="text-[11px] text-slate-400">
                               {isZh ? "数字越小，优先级越高（1 最高）" : "lower number = higher priority (1 = highest)"}
+                            </span>
+                          )}
+                          {editForm.balance === "latency" && (
+                            <span className="text-[11px] text-slate-400">
+                              {isZh
+                                ? "按首字延时升序路由；权重仅在并列时生效"
+                                : "routes by lowest first-token latency; weight only breaks ties"}
                             </span>
                           )}
                         </div>

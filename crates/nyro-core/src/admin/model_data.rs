@@ -3,7 +3,7 @@ use super::*;
 pub(super) fn normalize_model_balance(balance: Option<&str>) -> anyhow::Result<String> {
     let normalized = balance.unwrap_or("weighted").trim().to_ascii_lowercase();
     match normalized.as_str() {
-        "weighted" | "priority" => Ok(normalized),
+        "weighted" | "priority" | "latency" => Ok(normalized),
         _ => anyhow::bail!("unsupported model balance: {normalized}"),
     }
 }

@@ -1544,6 +1544,7 @@ mod tests {
             egress_str,
             request_model: "virtual-model",
             actual_model: "upstream-model",
+            backend_model: "upstream-model",
             api_key_id: None,
             api_key_name: None,
             is_stream: stream,

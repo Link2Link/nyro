@@ -39,7 +39,7 @@ export interface Model {
   targets: ModelBackend[];
 }
 
-export type ModelBalance = "weighted" | "priority";
+export type ModelBalance = "weighted" | "priority" | "latency";
 
 export interface ModelBackend {
   id: string;

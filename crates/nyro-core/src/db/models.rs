@@ -293,6 +293,9 @@ pub enum ModelBalance {
     Weighted,
     /// Priority groups — lower priority number tried first.
     Priority,
+    /// Latency-first — lowest streaming TTFB EWMA first; targets without a
+    /// fresh sample probe optimistically ahead of the known ones.
+    Latency,
 }
 
 impl ModelBalance {
@@ -300,6 +303,7 @@ impl ModelBalance {
         match self {
             Self::Weighted => "weighted",
             Self::Priority => "priority",
+            Self::Latency => "latency",
         }
     }
 }
@@ -311,6 +315,7 @@ impl std::str::FromStr for ModelBalance {
         match s.trim().to_ascii_lowercase().as_str() {
             "weighted" => Ok(Self::Weighted),
             "priority" => Ok(Self::Priority),
+            "latency" => Ok(Self::Latency),
             other => anyhow::bail!("unsupported model balance: {other}"),
         }
     }

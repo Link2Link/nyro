@@ -24,6 +24,7 @@ use tokio::sync::mpsc;
 
 use crate::auth::types::AuthSession;
 use crate::router::health::HealthRegistry;
+use crate::router::latency::LatencyRegistry;
 use crate::router::quota::ProviderQuotaRegistry;
 use config::{GatewayConfig, SqlStorageConfig, StorageBackendKind};
 use logging::LogEntry;
@@ -57,6 +58,7 @@ pub struct Gateway {
     proxy_client_cache: Arc<tokio::sync::RwLock<Option<ProxyClientCache>>>,
     pub model_cache: Arc<tokio::sync::RwLock<router::ModelCache>>,
     pub health_registry: Arc<HealthRegistry>,
+    pub latency_registry: Arc<LatencyRegistry>,
     pub quota_registry: Arc<ProviderQuotaRegistry>,
     pub ollama_capability_cache: Arc<tokio::sync::RwLock<HashMap<String, CapabilityCacheEntry>>>,
     pub(crate) compat_engine: Arc<nyro_ccswitch_compat::CompatEngine>,
@@ -181,6 +183,7 @@ impl Gateway {
             router::ModelCache::load(storage.snapshots()).await?,
         ));
         let health_registry = Arc::new(HealthRegistry::new());
+        let latency_registry = Arc::new(LatencyRegistry::new());
         let quota_registry = Arc::new(ProviderQuotaRegistry::new());
         let ollama_capability_cache = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
 
@@ -194,6 +197,7 @@ impl Gateway {
             proxy_client_cache: Arc::new(tokio::sync::RwLock::new(None)),
             model_cache,
             health_registry,
+            latency_registry,
             quota_registry,
             ollama_capability_cache,
             compat_engine: Arc::new(nyro_ccswitch_compat::CompatEngine::default()),

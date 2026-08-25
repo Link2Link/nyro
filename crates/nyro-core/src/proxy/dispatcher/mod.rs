@@ -506,7 +506,8 @@ async fn dispatch_pipeline_inner(
         .emit();
         return error_response(503, "no route targets configured");
     }
-    let ordered_targets = TargetSelector::select_ordered(&route.balance, &targets);
+    let ordered_targets =
+        TargetSelector::select_ordered(&route.balance, &targets, &gw.latency_registry);
     if ordered_targets.is_empty() {
         LogBuilder::from_dispatch(
             &gw,
@@ -970,6 +971,7 @@ async fn dispatch_pipeline_inner(
             egress_str: &egress_str,
             request_model: &request_model,
             actual_model: &actual_model,
+            backend_model: &target.model,
             api_key_id: auth_key.id.as_deref(),
             api_key_name: auth_key.name.as_deref(),
             is_stream,
@@ -1164,6 +1166,10 @@ struct CallCtx<'a> {
     egress_str: &'a str,
     request_model: &'a str,
     actual_model: &'a str,
+    /// Declared `ModelBackend.model` for the selected target (may be empty or
+    /// `"*"` for wildcards). Feeds the latency registry with the same raw
+    /// key the selector ranks by.
+    backend_model: &'a str,
     api_key_id: Option<&'a str>,
     api_key_name: Option<&'a str>,
     is_stream: bool,
@@ -1202,6 +1208,9 @@ struct LogBuilder {
     upstream_protocol: String,
     client_model: String,
     upstream_model: String,
+    /// Declared backend model of the attempted target, when a target was
+    /// selected (`from_dispatch` pre-selection entries leave this `None`).
+    backend_model: Option<String>,
     api_key_id: Option<String>,
     api_key_name: Option<String>,
     provider_id: String,
@@ -1231,6 +1240,7 @@ impl LogBuilder {
             upstream_protocol: call_ctx.egress_str.to_string(),
             client_model: call_ctx.request_model.to_string(),
             upstream_model: call_ctx.actual_model.to_string(),
+            backend_model: Some(call_ctx.backend_model.to_string()),
             api_key_id: call_ctx.api_key_id.map(ToString::to_string),
             api_key_name: call_ctx.api_key_name.map(ToString::to_string),
             provider_id: call_ctx.provider.id.clone(),
@@ -1264,6 +1274,7 @@ impl LogBuilder {
             upstream_protocol: ingress.to_string(),
             client_model: request_model.to_string(),
             upstream_model: String::new(),
+            backend_model: None,
             api_key_id: api_key_id.map(ToString::to_string),
             api_key_name: None,
             provider_id: String::new(),
@@ -1415,6 +1426,19 @@ impl LogBuilder {
                 ttfb_ms: self.extras.stream_first_chunk_ms,
                 stream_chunks: self.extras.stream_chunks_count.max(0) as u32,
             });
+        }
+        // Latency-first routing feedback: a measured streaming TTFB for a
+        // selected backend updates the EWMA under the exact key the selector
+        // ranks by. Non-stream attempts and failures before the first chunk
+        // carry `None` here and never touch the registry; failures that lose
+        // a chunk mid-stream are the circuit breaker's domain.
+        if let (Some(ttft_ms), Some(backend_model)) = (
+            self.extras.stream_first_chunk_ms,
+            self.backend_model.clone(),
+        ) {
+            self.gw
+                .latency_registry
+                .record(&self.provider_id, &backend_model, ttft_ms);
         }
         let entry = LogEntry {
             api_key_id: self.api_key_id,

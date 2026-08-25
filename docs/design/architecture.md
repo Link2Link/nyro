@@ -622,7 +622,7 @@ inventory::submit! { ExtensionRegistration { make: || Box::new(XxxChannel) } }
 |---|---|---|
 | `id` | TEXT PK | UUID |
 | `name` | TEXT | 显示名称，同时作为模型匹配键 |
-| `balance` | TEXT | 负载策略：`weighted` / `priority` |
+| `balance` | TEXT | 负载策略：`weighted` / `priority` / `latency`（首字延时 EWMA 升序，无新鲜样本目标乐观探测在前） |
 | `target_provider` | TEXT FK | 默认目标 Provider（兜底）|
 | `target_model` | TEXT | 默认上游模型名 |
 | `enable_auth` | BOOL | API Token 访问控制，默认 false |
@@ -898,7 +898,7 @@ OnLog 阶段 + `ResponseStats` 已提供标准化的请求指标消费点（见 
 
 ### 12.8 Router 故障策略（部分已落地）
 
-已落地：多 backend 健康感知迭代（`HealthRegistry`）+ `balance` 策略（weighted / priority）+ 可重试状态码自动续跑。待补充：指数退避 + jitter、可配置重试上限、单 backend 精细化熔断（滑动窗口）。
+已落地：多 backend 健康感知迭代（`HealthRegistry`）+ `balance` 策略（weighted / priority / latency——内存 `LatencyRegistry` 按流式首字延时 EWMA 排序，5 分钟保鲜窗过期即转为未知目标由真实流量乐观探测；失败信号归熔断器，不进延迟统计）+ 可重试状态码自动续跑。待补充：指数退避 + jitter、可配置重试上限、单 backend 精细化熔断（滑动窗口）。
 
 ### 12.9 Transport 策略
 

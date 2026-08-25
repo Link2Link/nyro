@@ -82,7 +82,7 @@ Provider 的协议端点明细。固定模式保留一条兼容记录；自适�
 |---|---|---|---|
 | `id` | TEXT PK | — | 主键，UUID |
 | `name` | TEXT NOT NULL | — | 显示名称，同时作为客户端请求的模型匹配键（路由唯一键的一部分） |
-| `balance` | TEXT | `'weighted'` | 多后端负载均衡策略：`weighted`、`priority` |
+| `balance` | TEXT | `'weighted'` | 多后端负载均衡策略：`weighted`、`priority`、`latency`（按首字延时 EWMA 升序路由，无新鲜样本的目标乐观探测在前） |
 | `target_provider` | TEXT NOT NULL | — | 默认后端 provider ID（FK → providers.id） |
 | `target_model` | TEXT NOT NULL | — | 默认后端使用的上游模型名 |
 | `enable_auth` | INTEGER | `0` | 是否启用 API Key 访问控制 |

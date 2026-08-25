@@ -192,7 +192,7 @@ Nyro 不自动发现协议能力：配置的端点就是能力声明。入口请
 | `name` | — | 是 | 路由名称 |
 | `virtual_model` | `vmodel` | 是 | 客户端请求的模型 ID（精确匹配） |
 | `type` | — | 否 | 路由类型：`chat`（默认）/ `embedding` |
-| `strategy` | — | 否 | 负载策略：`weighted`（默认）/ `priority` |
+| `strategy` | — | 否 | 负载策略：`weighted`（默认）/ `priority` / `latency` |
 | `targets` | — | 是 | 目标列表（至少一个） |
 | `access_control` | — | 否 | 是否启用访问控制（默认 `false`）。别名 `enable_auth` |
 
