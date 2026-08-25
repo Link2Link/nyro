@@ -13,9 +13,10 @@
 //! | `latency`  | Lowest streaming TTFB EWMA first      |
 //!
 //! `latency` orders targets by the time-to-first-token EWMA held in
-//! [`LatencyRegistry`]. Targets without a fresh sample (never probed, or
-//! stale past the registry's freshness window) sort optimistically ahead of
-//! the known ones so real traffic re-probes them; among themselves they keep
+//! [`LatencyRegistry`]. Targets without a graduated fresh estimate (never
+//! probed, still gathering their three-sample probing round, or stale past
+//! the registry's freshness window) sort optimistically ahead of the known
+//! ones so real traffic keeps probing them; among themselves they keep
 //! `weight` descending order. Failures never enter the registry — the health
 //! circuit breaker owns availability.
 //!
@@ -99,9 +100,10 @@ impl RoutingStrategy for PriorityStrategy {
 // ── Latency ───────────────────────────────────────────────────────────────────
 
 /// Orders targets by streaming TTFB EWMA ascending (winner takes the traffic;
-/// the rest stay warm standbys). Unknown or stale targets probe optimistically
-/// first, tie-broken by `weight` descending then declaration order; known
-/// targets tie-break the same way.
+/// the rest stay warm standbys). Targets without a graduated estimate — never
+/// probed, still gathering their three-sample probing round, or stale — probe
+/// optimistically first, tie-broken by `weight` descending then declaration
+/// order; graduated targets tie-break the same way.
 pub struct LatencyStrategy;
 
 impl RoutingStrategy for LatencyStrategy {
@@ -205,9 +207,11 @@ mod tests {
     #[test]
     fn latency_orders_known_targets_by_ttft_ascending() {
         let registry = LatencyRegistry::with_config(Duration::from_secs(60), 0.4);
-        registry.record("p2", "slow", 900);
-        registry.record("p1", "fast", 100);
-        registry.record("p3", "mid", 500);
+        for _ in 0..3 {
+            registry.record("p2", "slow", 900);
+            registry.record("p1", "fast", 100);
+            registry.record("p3", "mid", 500);
+        }
         let targets = vec![
             backend("1", "p1", "fast", 10),
             backend("2", "p2", "slow", 90),
@@ -226,7 +230,9 @@ mod tests {
     #[test]
     fn latency_probes_unknown_targets_optimistically_first() {
         let registry = LatencyRegistry::with_config(Duration::from_secs(60), 0.4);
-        registry.record("p-known", "known", 100);
+        for _ in 0..3 {
+            registry.record("p-known", "known", 100);
+        }
         let targets = vec![
             backend("1", "p-known", "known", 99),
             backend("2", "p-unknown-a", "ua", 10),
@@ -258,9 +264,13 @@ mod tests {
     #[test]
     fn stale_samples_rejoin_the_optimistic_probe_group() {
         let registry = LatencyRegistry::with_config(Duration::from_millis(40), 0.4);
-        registry.record("p-fast", "fast", 900);
+        for _ in 0..3 {
+            registry.record("p-fast", "fast", 900);
+        }
         std::thread::sleep(Duration::from_millis(60));
-        registry.record("p-fresh", "fresh", 800);
+        for _ in 0..3 {
+            registry.record("p-fresh", "fresh", 800);
+        }
         let targets = vec![
             backend("1", "p-fast", "fast", 5),
             backend("2", "p-fresh", "fresh", 1),
@@ -269,8 +279,41 @@ mod tests {
         let ordered = TargetSelector::select_ordered("latency", &targets, &registry);
 
         // `fast` went stale → unknown → probes first even though its last
-        // recorded TTFB (900) was slower than the fresh `fresh` (800).
+        // graduated mean (900) was slower than the fresh `fresh` (800).
         assert_eq!(ordered_models(&ordered), vec!["fast", "fresh"]);
+    }
+
+    #[test]
+    fn collecting_targets_probe_ahead_until_the_round_completes() {
+        let registry = LatencyRegistry::with_config(Duration::from_secs(60), 0.4);
+        // p-fast has two fast samples (still collecting), p-slow graduated slow.
+        registry.record("p-fast", "fast", 100);
+        registry.record("p-fast", "fast", 100);
+        for _ in 0..3 {
+            registry.record("p-slow", "slow", 900);
+        }
+        let targets = vec![
+            backend("1", "p-fast", "fast", 1),
+            backend("2", "p-slow", "slow", 99),
+        ];
+
+        let ordered = TargetSelector::select_ordered("latency", &targets, &registry);
+
+        // 2/3 samples: still unknown → probes first despite the lower weight.
+        assert_eq!(
+            ordered_models(&ordered),
+            vec!["fast", "slow"],
+            "collecting targets stay in the probe group"
+        );
+
+        // Third sample graduates the round; its mean wins on merit.
+        registry.record("p-fast", "fast", 100);
+        let ordered = TargetSelector::select_ordered("latency", &targets, &registry);
+        assert_eq!(
+            ordered_models(&ordered),
+            vec!["fast", "slow"],
+            "graduated mean 100 beats 900"
+        );
     }
 
     #[test]

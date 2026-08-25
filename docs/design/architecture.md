@@ -898,7 +898,7 @@ OnLog 阶段 + `ResponseStats` 已提供标准化的请求指标消费点（见 
 
 ### 12.8 Router 故障策略（部分已落地）
 
-已落地：多 backend 健康感知迭代（`HealthRegistry`）+ `balance` 策略（weighted / priority / latency——内存 `LatencyRegistry` 按流式首字延时 EWMA 排序，5 分钟保鲜窗过期即转为未知目标由真实流量乐观探测；失败信号归熔断器，不进延迟统计）+ 可重试状态码自动续跑。待补充：指数退避 + jitter、可配置重试上限、单 backend 精细化熔断（滑动窗口）。
+已落地：多 backend 健康感知迭代（`HealthRegistry`）+ `balance` 策略（weighted / priority / latency——内存 `LatencyRegistry` 按流式首字延时 EWMA 排序；目标需连续 3 个流式样本、以三次均值入组比较，未满或超 5 分钟保鲜窗即转为未知目标由真实流量乐观探测；失败信号归熔断器，不进延迟统计）+ 可重试状态码自动续跑。待补充：指数退避 + jitter、可配置重试上限、单 backend 精细化熔断（滑动窗口）。
 
 ### 12.9 Transport 策略
 
