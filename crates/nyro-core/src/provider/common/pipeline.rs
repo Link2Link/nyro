@@ -72,6 +72,44 @@ pub(crate) fn maybe_sanitize_codex_consumer_request(body: &mut Value, provider: 
     }
 }
 
+/// Codex 消费级上游（`chatgpt.com/backend-api/codex`）对 Responses 的
+/// `reasoning` 输入项做严格校验：`content` 数组最大长度为 0（合法载体是
+/// `summary` 与 `encrypted_content`）。中转或客户端回放历史时若把裸思维链
+/// 文本塞进 `reasoning.content`，上游会返回 400
+/// `array_above_max_length: Invalid 'input[N].content'`。原生直通与 IR
+/// 转码两条路径转发前都需要剥掉非空 `content`；`summary` /
+/// `encrypted_content` / 其余字段原样保留。
+pub(crate) fn sanitize_codex_reasoning_content(body: &mut Value, provider: &Provider) {
+    let is_codex = provider
+        .channel
+        .as_deref()
+        .is_some_and(|channel| channel.eq_ignore_ascii_case("codex"));
+    if !is_codex {
+        return;
+    }
+    let Some(items) = body.get_mut("input").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for item in items {
+        let is_reasoning = item
+            .get("type")
+            .and_then(Value::as_str)
+            .is_some_and(|t| t.eq_ignore_ascii_case("reasoning"));
+        if !is_reasoning {
+            continue;
+        }
+        let strip = match item.get("content") {
+            Some(Value::Array(entries)) => !entries.is_empty(),
+            Some(Value::Null) | None => false,
+            // 非数组取值同样过不了上游的数组校验，一并剥掉。
+            Some(_) => true,
+        };
+        if strip && let Some(object) = item.as_object_mut() {
+            object.remove("content");
+        }
+    }
+}
+
 pub(crate) fn apply_vendor_effort_policy(body: &mut Value, provider: &Provider) {
     let vendor_id = provider
         .vendor
@@ -142,6 +180,8 @@ where
     maybe_inject_openai_fast_mode(&mut body, ctx.provider, ctx.protocol);
     // 5c. Codex 消费级上游：剥离其拒绝的 Responses 参数（IR 转码路径）
     maybe_sanitize_codex_consumer_request(&mut body, ctx.provider);
+    // 5d. Codex 消费级上游：剥离 reasoning 项的非空 content（IR 转码路径）
+    sanitize_codex_reasoning_content(&mut body, ctx.provider);
     apply_vendor_effort_policy(&mut body, ctx.provider);
 
     // 6. auth headers
@@ -293,6 +333,8 @@ pub async fn passthrough_run(
         maybe_inject_openai_fast_mode(&mut raw_body, ctx.provider, ctx.protocol);
         // Codex 消费级上游：剥离其拒绝的 Responses 参数（Responses 直通路径）
         maybe_sanitize_codex_consumer_request(&mut raw_body, ctx.provider);
+        // Codex 消费级上游：剥离 reasoning 项的非空 content（Responses 直通路径）
+        sanitize_codex_reasoning_content(&mut raw_body, ctx.provider);
     }
 
     let mut headers = if ctx.disable_default_auth {
@@ -954,6 +996,125 @@ mod tests {
             "codex consumer backend must not receive top_p",
         );
         assert_eq!(out.body["stream"], true, "stream must be preserved");
+    }
+
+    #[test]
+    fn sanitize_reasoning_content_unit_cases() {
+        // 非 codex 渠道：不做任何改动。
+        let mut body = serde_json::json!({
+            "input": [{"type": "reasoning", "content": [{"text": "x"}]}]
+        });
+        sanitize_codex_reasoning_content(
+            &mut body,
+            &provider_with_channel("", Some("sub2api"), false),
+        );
+        assert_eq!(
+            body["input"][0]["content"].as_array().map(Vec::len),
+            Some(1),
+            "non-codex channels must keep reasoning content untouched",
+        );
+
+        // codex 渠道：空数组 content 保留（上游允许长度 0），非空剥掉。
+        let mut body = serde_json::json!({
+            "input": [
+                {"type": "reasoning", "content": []},
+                {"type": "reasoning", "content": [{"text": "x"}]},
+                {"type": "reasoning", "content": "plain-text"},
+                {"type": "reasoning"},
+                {"type": "reasoning", "content": null}
+            ]
+        });
+        sanitize_codex_reasoning_content(
+            &mut body,
+            &provider_with_channel("", Some("codex"), false),
+        );
+        assert!(
+            body["input"][0].get("content").is_some(),
+            "empty array is legal (max length 0)"
+        );
+        assert!(
+            body["input"][1].get("content").is_none(),
+            "non-empty array must be stripped"
+        );
+        assert!(
+            body["input"][2].get("content").is_none(),
+            "non-array content must be stripped"
+        );
+        assert!(
+            body["input"][3].get("content").is_none(),
+            "absent stays absent"
+        );
+        assert!(
+            body["input"][4].get("content").is_some(),
+            "null content stays"
+        );
+
+        // input 为字符串简写 / 缺失：不 panic、不改写。
+        let mut body = serde_json::json!({"input": "hi"});
+        sanitize_codex_reasoning_content(
+            &mut body,
+            &provider_with_channel("", Some("codex"), false),
+        );
+        assert_eq!(body["input"], "hi");
+        let mut body = serde_json::json!({"model": "m"});
+        sanitize_codex_reasoning_content(
+            &mut body,
+            &provider_with_channel("", Some("codex"), false),
+        );
+        assert_eq!(body["model"], "m");
+    }
+
+    /// Codex 消费级上游：直通路径剥离 reasoning 项的非空 content。
+    /// 完整复现线上 400 现场：回放历史携带 `reasoning.content` 文本数组。
+    #[tokio::test]
+    async fn passthrough_strips_reasoning_content_for_codex_channel() {
+        let gw = build_test_gateway().await;
+        let provider = provider_with_channel("", Some("codex"), false);
+        let ctx = responses_ctx(&provider, &gw);
+
+        let out = passthrough_run(
+            &FakeApiKeyVendor,
+            serde_json::json!({
+                "model": "gpt-5.6-sol",
+                "stream": true,
+                "include": ["reasoning.encrypted_content"],
+                "input": [
+                    {"type": "message", "role": "user", "content": [
+                        {"type": "input_text", "text": "hi"}
+                    ]},
+                    {"type": "reasoning", "summary": [], "encrypted_content": "enc-1", "content": [
+                        {"text": "We need continue task. Need inspect files."}
+                    ]},
+                    {"type": "agent_message", "content": [
+                        {"type": "output_text", "text": "ok"}
+                    ]}
+                ]
+            }),
+            &ctx,
+            true,
+        )
+        .await
+        .expect("passthrough succeeds");
+
+        let reasoning = &out.body["input"][1];
+        assert!(
+            reasoning.get("content").is_none(),
+            "codex consumer backend must not receive non-empty reasoning.content",
+        );
+        assert_eq!(
+            reasoning["encrypted_content"], "enc-1",
+            "encrypted_content must survive the strip",
+        );
+        assert_eq!(
+            out.body["input"][0]["content"].as_array().map(Vec::len),
+            Some(1),
+            "message item content must be untouched",
+        );
+        assert_eq!(
+            out.body["input"][2]["content"].as_array().map(Vec::len),
+            Some(1),
+            "agent_message item content must be untouched",
+        );
     }
 
     /// 非 codex 渠道必须保留这些参数，直通行为不受影响。
