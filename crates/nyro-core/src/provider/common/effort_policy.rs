@@ -11,6 +11,12 @@
 //! | MiniMax             |   ✅   |     ✅ honored off     | normalize → `none`  |
 //! | Kimi coding         |   ✅   |       ✅ ignored       | normalize → `none`  |
 //! | OpenAI / sub2api    |   ✅   |       ✅ ignored       | normalize → `none`  |
+//! | OpenCode zen (go)   | ❌ 400 |       n/a (→none)      | clamp off → `low`   |
+//!
+//! OpenCode zen 的思考型模型（如 glm-5.3）拒绝 `none`：
+//! `[1210] This model always engages in thinking and cannot be disabled;
+//! please use low, high, or max`（实测 2026-08-25，Console Go 上游）。off
+//! 意图只能降级到最小合法档 `low`。
 //!
 //! Ecosystem convention (also seen in the ported cc-switch transforms) treats
 //! `disable` / `disabled` / `off` as misspellings of "turn reasoning off".
@@ -89,6 +95,22 @@ pub(crate) fn drop_grok_effort(body: &mut Value) {
     }
 }
 
+/// OpenCode zen (opencode-go)：思考型模型不接受任何 off 形态（`none` 也
+/// 400）。off 意图钳制为最小合法档 `low`，其余值原样透传。
+pub(crate) fn clamp_opencode_effort(body: &mut Value) {
+    let Some(object) = body.as_object_mut() else {
+        return;
+    };
+    if let Some(Value::String(effort)) = object.get("reasoning_effort")
+        && is_off_effort(effort)
+    {
+        object.insert(
+            "reasoning_effort".to_string(),
+            Value::String("low".to_string()),
+        );
+    }
+}
+
 fn is_off_effort(effort: &str) -> bool {
     matches!(
         effort.trim().to_ascii_lowercase().as_str(),
@@ -127,6 +149,30 @@ mod tests {
 
         let mut bare = json!({"model": "m"});
         normalize_enum_effort(&mut bare);
+        assert!(bare.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn opencode_clamps_off_values_to_low() {
+        // zen 上游 400 [1210]：思考型模型连 none 都不接受，off 降级为 low。
+        for raw in ["none", "disable", "disabled", "off", "Disable", "OFF"] {
+            let mut body = json!({"reasoning_effort": raw, "model": "glm-5.3"});
+            clamp_opencode_effort(&mut body);
+            assert_eq!(body["reasoning_effort"], "low", "raw={raw} clamps to low");
+            assert_eq!(body["model"], "glm-5.3");
+        }
+    }
+
+    #[test]
+    fn opencode_keeps_real_effort_levels() {
+        for raw in ["low", "medium", "high", "max", "future"] {
+            let mut body = json!({"reasoning_effort": raw});
+            clamp_opencode_effort(&mut body);
+            assert_eq!(body["reasoning_effort"], raw, "raw={raw} passes through");
+        }
+
+        let mut bare = json!({"model": "m"});
+        clamp_opencode_effort(&mut bare);
         assert!(bare.get("reasoning_effort").is_none());
     }
 

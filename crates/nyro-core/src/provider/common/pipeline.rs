@@ -199,6 +199,9 @@ pub(crate) fn apply_vendor_effort_policy(body: &mut Value, provider: &Provider) 
         || body_model.trim().to_ascii_lowercase().starts_with("grok-");
     if is_grok {
         super::effort_policy::drop_grok_effort(body);
+    } else if vendor_id.eq_ignore_ascii_case("opencode-go") {
+        // OpenCode zen：思考型模型连 none 都拒（400 [1210]），off 钳制为 low。
+        super::effort_policy::clamp_opencode_effort(body);
     } else if !vendor_id.is_empty() {
         super::effort_policy::normalize_enum_effort(body);
     }
