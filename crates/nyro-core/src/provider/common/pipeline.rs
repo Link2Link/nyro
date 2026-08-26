@@ -181,6 +181,52 @@ pub(crate) fn sanitize_codex_tool_call_ids(body: &mut Value, provider: &Provider
     }
 }
 
+/// 火山引擎 Ark coding 上游（ark.cn-beijing.volces.com/api/coding）。
+/// provider 的 vendor 字段可能是 preset id（ark-coding）、volcengine 或
+/// custom（用户手配）--base_url 是跨配置形态最稳定的信号。
+fn is_volcengine_ark(provider: &Provider, vendor_id: &str) -> bool {
+    vendor_id.eq_ignore_ascii_case("ark-coding")
+        || vendor_id.eq_ignore_ascii_case("volcengine")
+        || provider.base_url.contains("volces.com")
+}
+
+/// Ark 上游实测拒收 `reasoning_effort: none` 的模型（400
+/// InvalidParameter）。按线上证据逐个登记；未登记的模型维持原有方言
+/// 策略（normalize），避免误伤接受 none 的模型。
+const ARK_NONE_REJECTING_MODELS: &[&str] = &["glm-5.3"];
+
+fn is_ark_none_rejecting_model(body_model: &str) -> bool {
+    ARK_NONE_REJECTING_MODELS
+        .iter()
+        .any(|model| body_model.eq_ignore_ascii_case(model))
+}
+
+/// 思考强制开启的模型（模型级登记，跨上游生效；约束来自模型本体而非
+/// 某一上游方言）。按官方证据逐个登记，未登记的模型维持原有方言策略：
+/// - glm-5.3：官方文档明确「GLM-5.3 会始终启用思考功能」，thinking.type
+///   仅支持 enabled；reasoning_effort 枚举收窄为 low/high/max（默认
+///   max），迁移提示对旧用法 disabled 明言「否则，请求将失败」并指引改
+///   为 enabled + low（docs.bigmodel.cn/cn/guide/models/text/glm-5.3，
+///   2026-08 抓取）。据此 off 意图钳制为最小合法档 low。
+/// - glm-5.3-flash：官方文档明确 thinking.type 仅支持 enabled、不支持关
+///   闭思考，推荐 reasoning_effort: max，文本参数与 GLM-5.3 保持一致
+///   （docs.bigmodel.cn/cn/guide/models/vlm/glm-5.3-flash，2026-08 抓
+///   取）。off 意图同样钳制为 low。前缀匹配并要求边界字符非字母数字，
+///   带日期等短横线后缀的变体（glm-5.3-flash-xxxx）一并覆盖。
+const THINKING_MANDATORY_MODELS: &[&str] = &["glm-5.3", "glm-5.3-flash"];
+
+fn is_thinking_mandatory_model(body_model: &str) -> bool {
+    let model = body_model.trim();
+    THINKING_MANDATORY_MODELS.iter().any(|prefix| {
+        model.len() >= prefix.len()
+            && model[..prefix.len()].eq_ignore_ascii_case(prefix)
+            && model[prefix.len()..]
+                .chars()
+                .next()
+                .is_none_or(|c| !c.is_ascii_alphanumeric())
+    })
+}
+
 pub(crate) fn apply_vendor_effort_policy(body: &mut Value, provider: &Provider) {
     let vendor_id = provider
         .vendor
@@ -199,9 +245,19 @@ pub(crate) fn apply_vendor_effort_policy(body: &mut Value, provider: &Provider) 
         || body_model.trim().to_ascii_lowercase().starts_with("grok-");
     if is_grok {
         super::effort_policy::drop_grok_effort(body);
+    } else if is_thinking_mandatory_model(body_model) {
+        // 模型本体不支持关闭思考（如 glm-5.3-flash）：off 意图钳为 low。
+        // 必须排在 normalize 之前：misspelling disable 会先被归一成
+        // none——对这类模型恰好是致死值。
+        super::effort_policy::clamp_thinking_mandatory_effort(body);
     } else if vendor_id.eq_ignore_ascii_case("opencode-go") {
         // OpenCode zen：思考型模型连 none 都拒（400 [1210]），off 钳制为 low。
         super::effort_policy::clamp_opencode_effort(body);
+    } else if is_volcengine_ark(provider, vendor_id) && is_ark_none_rejecting_model(body_model) {
+        // 火山引擎 Ark glm-5.3 拒收 none（400 InvalidParameter，请求
+        // 58e799fa）：off 意图钳制为 low。必须排在 normalize 之前，否则
+        // misspelling disable 会先被归一成 none--恰好是致死值。
+        super::effort_policy::clamp_volcengine_ark_effort(body);
     } else if !vendor_id.is_empty() {
         super::effort_policy::normalize_enum_effort(body);
     }
@@ -413,6 +469,10 @@ pub async fn passthrough_run(
         sanitize_codex_reasoning_content(&mut raw_body, ctx.provider);
         // Codex 消费级上游：规范化外来工具调用 ID 前缀（Responses 直通路径）
         sanitize_codex_tool_call_ids(&mut raw_body, ctx.provider);
+        // 供应商 effort 方言（Responses 直通路径）：grok 对 max 是 400 硬拒
+        // （线上事故 65fffc9a），none/off 同样拒绝——此前只挂在 IR 转码与
+        // Chat 透传两路，Responses 直通漏挂。
+        apply_vendor_effort_policy(&mut raw_body, ctx.provider);
     }
 
     let mut headers = if ctx.disable_default_auth {
@@ -531,7 +591,7 @@ mod tests {
         ANTHROPIC_MESSAGES_2023_06_01, GOOGLE_GEMINI_GENERATE_CONTENT_V1BETA,
         OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1, ProtocolId,
     };
-    use crate::protocol::ir::{AiRequest, AiResponse};
+    use crate::protocol::ir::{AiRequest, AiResponse, ReasoningEffort};
     use crate::provider::inbound::InboundResponse;
     use crate::provider::outbound::OutboundRequest;
     use crate::provider::registry::VendorScope;
@@ -980,13 +1040,23 @@ mod tests {
     }
 
     fn responses_ctx<'a>(provider: &'a Provider, gw: &'a Gateway) -> ProviderCtx<'a> {
+        responses_ctx_model(provider, gw, "gpt-test")
+    }
+
+    /// Responses 直通上下文（actual_model 可指定）：passthrough_run 会用
+    /// 它覆盖请求体 model 字段，模型级策略测试需要真实模型名。
+    fn responses_ctx_model<'a>(
+        provider: &'a Provider,
+        gw: &'a Gateway,
+        actual_model: &'a str,
+    ) -> ProviderCtx<'a> {
         ProviderCtx {
             provider,
             protocol: OPENAI_RESPONSES_V1,
             egress_base_url: "https://upstream.local",
             api_key: &provider.api_key,
             auth_scheme: "auto",
-            actual_model: "gpt-test",
+            actual_model,
             credential: None,
             gw,
             disable_default_auth: false,
@@ -1594,6 +1664,12 @@ mod tests {
         provider
     }
 
+    fn ark_provider(api_key: &str, vendor: Option<&str>) -> Provider {
+        let mut provider = provider_with_vendor(api_key, vendor);
+        provider.base_url = "https://ark.cn-beijing.volces.com/api/coding/v3".into();
+        provider
+    }
+
     /// grok 判定优先看请求体模型名：vendor=custom 的中继 provider 转发
     /// grok-* 模型时也必须删字段（grok 拒收 none）。
     #[tokio::test]
@@ -1618,6 +1694,61 @@ mod tests {
         assert!(
             out.body.get("reasoning_effort").is_none(),
             "grok-* model via custom-vendor relay must have reasoning_effort dropped",
+        );
+    }
+
+    /// 线上事故复现（请求 65fffc9a，2026-08-26）：grok-4.6 经
+    /// cli-chat-proxy /v1/responses 对 reasoning.effort="max" 返回 400
+    /// {"code":"invalid-argument","error":"Invalid reasoning effort."}
+    /// （4/4 全复现）。max 必须降级为 grok 顶格档 xhigh。
+    #[tokio::test]
+    async fn passthrough_downgrades_max_effort_to_xhigh_for_grok() {
+        let gw = build_test_gateway().await;
+        let provider = provider_with_vendor("sk-grok", Some("xai"));
+        let ctx = responses_ctx(&provider, &gw);
+
+        let out = passthrough_run(
+            &FakeApiKeyVendor,
+            serde_json::json!({
+                "model": "grok-4.6",
+                "input": "ping",
+                "reasoning": {"effort": "max"}
+            }),
+            &ctx,
+            false,
+        )
+        .await
+        .expect("passthrough succeeds");
+
+        assert_eq!(
+            out.body["reasoning"]["effort"], "xhigh",
+            "grok rejects max (400 Invalid reasoning effort); must downgrade to xhigh",
+        );
+    }
+
+    /// Chat wire shape 的 max 降级：top-level reasoning_effort。
+    #[tokio::test]
+    async fn passthrough_downgrades_max_effort_to_xhigh_for_grok_chat_shape() {
+        let gw = build_test_gateway().await;
+        let provider = provider_with_vendor("sk-relay", Some("custom"));
+        let ctx = openai_chat_ctx(&provider, &gw, "grok-4.6");
+
+        let out = passthrough_run(
+            &FakeApiKeyVendor,
+            serde_json::json!({
+                "model": "grok-4.6",
+                "messages": [{"role":"user","content":"ping"}],
+                "reasoning_effort": "max"
+            }),
+            &ctx,
+            false,
+        )
+        .await
+        .expect("passthrough succeeds");
+
+        assert_eq!(
+            out.body["reasoning_effort"], "xhigh",
+            "chat-shape max must also downgrade to xhigh for grok-* models",
         );
     }
 
@@ -1648,16 +1779,17 @@ mod tests {
     }
 
     /// 非 grok 模型经 custom vendor 走归一路径：disable → none。
+    /// （glm-4.6：未登记 THINKING_MANDATORY_MODELS，历史上接受 none。）
     #[tokio::test]
     async fn passthrough_normalizes_off_spellings_for_non_grok_models() {
         let gw = build_test_gateway().await;
         let provider = provider_with_vendor("sk-glm", Some("zhipuai"));
-        let ctx = openai_chat_ctx(&provider, &gw, "glm-5.3");
+        let ctx = openai_chat_ctx(&provider, &gw, "glm-4.6");
 
         let out = passthrough_run(
             &FakeApiKeyVendor,
             serde_json::json!({
-                "model": "glm-5.3",
+                "model": "glm-4.6",
                 "messages": [{"role":"user","content":"ping"}],
                 "reasoning_effort": "disabled"
             }),
@@ -1670,6 +1802,284 @@ mod tests {
         assert_eq!(
             out.body["reasoning_effort"], "none",
             "non-grok model must normalize off spellings to none",
+        );
+    }
+
+    /// 线上事故复现（请求 58e799fa，2026-08-26）：DSH 发 misspelling
+    /// "disable"，默认 normalize 会归一成 "none"，被 ark glm-5.3 以
+    /// 400 InvalidParameter 拒收。正确拼写的 "none" 同样拒收。
+    /// 两个形态都必须在 wire 边界钳制为 low。
+    #[tokio::test]
+    async fn passthrough_clamps_off_effort_to_low_for_ark_glm() {
+        let gw = build_test_gateway().await;
+        let provider = ark_provider("sk-ark", Some("ark-coding"));
+        let ctx = openai_chat_ctx(&provider, &gw, "glm-5.3");
+
+        for raw in ["disable", "none", "off"] {
+            let out = passthrough_run(
+                &FakeApiKeyVendor,
+                serde_json::json!({
+                    "model": "glm-5.3",
+                    "messages": [{"role":"user","content":"ping"}],
+                    "reasoning_effort": raw
+                }),
+                &ctx,
+                false,
+            )
+            .await
+            .expect("passthrough succeeds");
+
+            assert_eq!(
+                out.body["reasoning_effort"], "low",
+                "raw={raw} must clamp to low for ark glm-5.3 (none is rejected upstream)",
+            );
+        }
+    }
+
+    /// vendor=custom 的手配 provider 靠 base_url（volces.com）识别为 ark。
+    #[tokio::test]
+    async fn passthrough_clamps_off_effort_for_custom_vendor_ark_base_url() {
+        let gw = build_test_gateway().await;
+        let provider = ark_provider("sk-ark", Some("custom"));
+        let ctx = openai_chat_ctx(&provider, &gw, "GLM-5.3");
+
+        let out = passthrough_run(
+            &FakeApiKeyVendor,
+            serde_json::json!({
+                "model": "GLM-5.3",
+                "messages": [{"role":"user","content":"ping"}],
+                "reasoning_effort": "disable"
+            }),
+            &ctx,
+            false,
+        )
+        .await
+        .expect("passthrough succeeds");
+
+        assert_eq!(
+            out.body["reasoning_effort"], "low",
+            "custom-vendor provider on volces.com base_url must clamp off to low",
+        );
+    }
+
+/// 思考强制开启的 GLM 模型（官方文档：thinking.type 仅支持 enabled、
+/// 不支持关闭思考，off 意图「请求将失败」）：off 全形态（含 misspelling）
+/// 在 zhipuai 直连上钳为 low，其余档位原样透传。
+#[tokio::test]
+async fn passthrough_clamps_off_effort_to_low_for_thinking_mandatory_glm() {
+    let gw = build_test_gateway().await;
+    let provider = provider_with_vendor("sk-glm", Some("zhipuai"));
+
+    for model in ["glm-5.3", "glm-5.3-flash"] {
+        let ctx = openai_chat_ctx(&provider, &gw, model);
+        for raw in ["none", "disable", "disabled", "off"] {
+            let out = passthrough_run(
+                &FakeApiKeyVendor,
+                serde_json::json!({
+                    "model": model,
+                    "messages": [{"role":"user","content":"ping"}],
+                    "reasoning_effort": raw
+                }),
+                &ctx,
+                false,
+            )
+            .await
+            .expect("passthrough succeeds");
+
+            assert_eq!(
+                out.body["reasoning_effort"], "low",
+                "model={model} raw={raw} must clamp to low (thinking cannot be disabled)",
+            );
+        }
+
+        for raw in ["low", "high", "max"] {
+            let out = passthrough_run(
+                &FakeApiKeyVendor,
+                serde_json::json!({
+                    "model": model,
+                    "messages": [{"role":"user","content":"ping"}],
+                    "reasoning_effort": raw
+                }),
+                &ctx,
+                false,
+            )
+            .await
+            .expect("passthrough succeeds");
+
+            assert_eq!(
+                out.body["reasoning_effort"], raw,
+                "model={model} raw={raw} must pass through",
+            );
+        }
+
+        // 官方三档之外的已知档位：单调向下窄化（minimal→low、medium→low、
+        // xhigh→high，等距取低控成本）。
+        for (raw, expect) in [("minimal", "low"), ("medium", "low"), ("xhigh", "high")] {
+            let out = passthrough_run(
+                &FakeApiKeyVendor,
+                serde_json::json!({
+                    "model": model,
+                    "messages": [{"role":"user","content":"ping"}],
+                    "reasoning_effort": raw
+                }),
+                &ctx,
+                false,
+            )
+            .await
+            .expect("passthrough succeeds");
+
+            assert_eq!(
+                out.body["reasoning_effort"], expect,
+                "model={model} raw={raw} must narrow down to {expect}",
+            );
+        }
+    }
+}
+
+/// Responses 直通形态：嵌套 reasoning.effort 的 off 意图同样钳为 low，
+/// 且保留 summary 等兄弟键（bigmodel 官方提供 OpenAI Responses 端点）。
+#[tokio::test]
+async fn responses_passthrough_clamps_nested_reasoning_effort_for_glm() {
+    let gw = build_test_gateway().await;
+    let provider = provider_with_vendor("sk-glm", Some("zhipuai"));
+
+    for model in ["glm-5.3", "glm-5.3-flash"] {
+        let ctx = responses_ctx_model(&provider, &gw, model);
+        let out = passthrough_run(
+            &FakeApiKeyVendor,
+            serde_json::json!({
+                "model": model,
+                "input": "ping",
+                "reasoning": {
+                    "effort": "disable",
+                    "summary": "auto"
+                }
+            }),
+            &ctx,
+            false,
+        )
+        .await
+        .expect("passthrough succeeds");
+
+        assert_eq!(
+            out.body["reasoning"]["effort"], "low",
+            "nested reasoning.effort off intent must clamp to low for {model}",
+        );
+        assert_eq!(
+            out.body["reasoning"]["summary"], "auto",
+            "sibling keys in the reasoning object must be preserved",
+        );
+    }
+}
+
+/// 模型名匹配规则：大小写不敏感；带日期等短横线后缀的变体一并覆盖；
+/// 同系已登记模型共享钳制语义，未登记的旧模型不受影响。
+#[tokio::test]
+async fn thinking_mandatory_matching_covers_variants_and_skips_unrelated() {
+    let gw = build_test_gateway().await;
+    let provider = provider_with_vendor("sk-glm", Some("zhipuai"));
+
+    for model in ["GLM-5.3-Flash", "glm-5.3-flash-0901"] {
+        let ctx = openai_chat_ctx(&provider, &gw, model);
+        let out = passthrough_run(
+            &FakeApiKeyVendor,
+            serde_json::json!({
+                "model": model,
+                "messages": [{"role":"user","content":"ping"}],
+                "reasoning_effort": "none"
+            }),
+            &ctx,
+            false,
+        )
+        .await
+        .expect("passthrough succeeds");
+
+        assert_eq!(
+            out.body["reasoning_effort"], "low",
+            "model={model} is a thinking-mandatory variant and must clamp",
+        );
+    }
+
+    // 登记表成员与未登记旧模型的边界：glm-5.3 / flash 已登记，glm-4.6 不在。
+    assert!(super::is_thinking_mandatory_model("glm-5.3"));
+    assert!(super::is_thinking_mandatory_model("GLM-5.3-FLASH"));
+    assert!(!super::is_thinking_mandatory_model("glm-4.6"));
+}
+
+    /// 未登记拒收的 ark 模型维持 normalize 方言（disable → none），
+    /// 不误伤接受 none 的模型。
+    #[tokio::test]
+    async fn passthrough_normalizes_off_spellings_for_ark_unverified_models() {
+        let gw = build_test_gateway().await;
+        let provider = ark_provider("sk-ark", Some("ark-coding"));
+        let ctx = openai_chat_ctx(&provider, &gw, "kimi-k2.7-code");
+
+        let out = passthrough_run(
+            &FakeApiKeyVendor,
+            serde_json::json!({
+                "model": "kimi-k2.7-code",
+                "messages": [{"role":"user","content":"ping"}],
+                "reasoning_effort": "disable"
+            }),
+            &ctx,
+            false,
+        )
+        .await
+        .expect("passthrough succeeds");
+
+        assert_eq!(
+            out.body["reasoning_effort"], "none",
+            "ark models without a live none-rejection finding keep the normalize dialect",
+        );
+    }
+
+    /// 官方合法三档原样透传，不受钳制影响。glm-5.3 属思考强制开启模型
+    /// （THINKING_MANDATORY_MODELS）：三档之外的 medium 在此场景按官方枚举
+    /// 收窄为 low，由 thinking-mandatory 矩阵测试覆盖。
+    #[tokio::test]
+    async fn passthrough_keeps_real_effort_levels_for_ark_glm() {
+        let gw = build_test_gateway().await;
+        let provider = ark_provider("sk-ark", Some("ark-coding"));
+        let ctx = openai_chat_ctx(&provider, &gw, "glm-5.3");
+
+        for raw in ["low", "high", "max"] {
+            let out = passthrough_run(
+                &FakeApiKeyVendor,
+                serde_json::json!({
+                    "model": "glm-5.3",
+                    "messages": [{"role":"user","content":"ping"}],
+                    "reasoning_effort": raw
+                }),
+                &ctx,
+                false,
+            )
+            .await
+            .expect("passthrough succeeds");
+
+            assert_eq!(
+                out.body["reasoning_effort"], raw,
+                "doc-tier raw={raw} passes through the ark clamp untouched",
+            );
+        }
+    }
+
+    /// IR 转码路径（build_request）同样钳制：compat 直通重建的 native_body
+    /// 经 vendor patch 携带 none→low 改写到达上游。
+    #[tokio::test]
+    async fn build_request_clamps_none_effort_to_low_for_ark_glm() {
+        let gw = build_test_gateway().await;
+        let provider = ark_provider("sk-ark", Some("ark-coding"));
+        let ctx = openai_chat_ctx(&provider, &gw, "glm-5.3");
+        let mut req = minimal_chat_request();
+        req.reasoning.effort = Some(ReasoningEffort::None);
+
+        let out = build_request(&FakeApiKeyVendor, &mut req, &ctx)
+            .await
+            .expect("build_request succeeds");
+
+        assert_eq!(
+            out.body["reasoning_effort"], "low",
+            "IR transcode path must clamp none to low for ark glm-5.3",
         );
     }
 
