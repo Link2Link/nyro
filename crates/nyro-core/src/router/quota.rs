@@ -39,7 +39,7 @@ impl Default for ProviderScheduling {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct QuotaTierObservation {
     pub name: String,
     pub used_percent: f64,
@@ -48,6 +48,9 @@ pub struct QuotaTierObservation {
 
 struct ProviderQuotaState {
     scheduling: ProviderScheduling,
+    /// Last authoritative upstream quota tiers. Query failures deliberately
+    /// preserve this snapshot so usage-based routing remains stable.
+    tiers: Vec<QuotaTierObservation>,
     next_check: Instant,
     consecutive_failures: u32,
 }
@@ -88,6 +91,17 @@ impl ProviderQuotaRegistry {
             .unwrap()
             .get(provider_id)
             .map(|state| state.scheduling.clone())
+            .unwrap_or_default()
+    }
+
+    /// Last authoritative canonical quota tiers for hot-path usage routing.
+    /// Query failures do not clear this snapshot; provider invalidation does.
+    pub(crate) fn tier_snapshot(&self, provider_id: &str) -> Vec<QuotaTierObservation> {
+        self.states
+            .read()
+            .unwrap()
+            .get(provider_id)
+            .map(|state| state.tiers.clone())
             .unwrap_or_default()
     }
 
@@ -149,6 +163,7 @@ impl ProviderQuotaRegistry {
             provider_id.to_string(),
             ProviderQuotaState {
                 scheduling: scheduling.clone(),
+                tiers: tiers.to_vec(),
                 next_check: Instant::now() + delay,
                 consecutive_failures: 0,
             },
@@ -172,6 +187,7 @@ impl ProviderQuotaRegistry {
             .entry(provider_id.to_string())
             .or_insert_with(|| ProviderQuotaState {
                 scheduling: ProviderScheduling::default(),
+                tiers: Vec::new(),
                 next_check: Instant::now(),
                 consecutive_failures: 0,
             });
@@ -198,6 +214,7 @@ impl ProviderQuotaRegistry {
             .entry(provider_id.to_string())
             .or_insert_with(|| ProviderQuotaState {
                 scheduling: ProviderScheduling::default(),
+                tiers: Vec::new(),
                 next_check: Instant::now(),
                 consecutive_failures: 0,
             });
@@ -362,6 +379,38 @@ mod tests {
     }
 
     #[test]
+    fn last_authoritative_tiers_survive_failures_and_refresh_requests() {
+        let registry = ProviderQuotaRegistry::new();
+        let first = vec![tier("weekly_limit", 35.0, Some("2030-01-07T00:00:00Z"))];
+        registry.observe("provider", &first, None);
+
+        registry.record_query_failure("provider");
+        registry.request_refresh("provider");
+        registry.request_refresh_all();
+
+        assert_eq!(registry.tier_snapshot("provider"), first);
+
+        let second = vec![tier("weekly_limit", 52.0, None)];
+        registry.observe("provider", &second, None);
+        assert_eq!(registry.tier_snapshot("provider"), second);
+    }
+
+    #[test]
+    fn authoritative_unavailability_clears_tiers_and_recovery_replaces_them() {
+        let registry = ProviderQuotaRegistry::new();
+        registry.observe("provider", &[tier("weekly_limit", 35.0, None)], Some(true));
+
+        registry.observe("provider", &[], Some(false));
+        assert!(!registry.is_schedulable("provider"));
+        assert!(registry.tier_snapshot("provider").is_empty());
+
+        let recovered = vec![tier("weekly_limit", 5.0, None)];
+        registry.observe("provider", &recovered, Some(true));
+        assert!(registry.is_schedulable("provider"));
+        assert_eq!(registry.tier_snapshot("provider"), recovered);
+    }
+
+    #[test]
     fn refresh_all_preserves_blocking_decisions() {
         let registry = ProviderQuotaRegistry::new();
         registry.observe("provider", &[tier("five_hour", 100.0, None)], None);
@@ -380,5 +429,16 @@ mod tests {
 
         assert!(registry.is_schedulable("provider"));
         assert!(registry.is_due("provider"));
+        assert!(registry.tier_snapshot("provider").is_empty());
+    }
+
+    #[test]
+    fn remove_clears_retained_tiers() {
+        let registry = ProviderQuotaRegistry::new();
+        registry.observe("provider", &[tier("monthly", 10.0, None)], None);
+
+        registry.remove("provider");
+
+        assert!(registry.tier_snapshot("provider").is_empty());
     }
 }

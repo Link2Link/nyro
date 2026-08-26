@@ -3,12 +3,13 @@ pub mod latency;
 mod matcher;
 pub mod quota;
 pub mod selector;
+pub(crate) mod usage;
 
 pub use latency::LatencyRegistry;
 pub use matcher::ModelCache;
 pub use selector::{
     LatencyStrategy, PriorityStrategy, RoutingStrategy, SelectedTarget, TargetSelector,
-    WeightedStrategy,
+    UsageStrategy, WeightedStrategy,
 };
 
 use crate::db::models::Model;

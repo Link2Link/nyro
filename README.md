@@ -91,7 +91,7 @@ Nyro ships as a **desktop app** (macOS / Windows / Linux) and a **standalone ser
 
 - Exact match routing on `virtual_model`
 - Virtual model names decouple client requests from actual backend models
-- Multi-target routing with strategy selection: weighted load balancing, priority-based failover, or latency-first ordering (lowest streaming TTFB wins; stale targets re-probe optimistically)
+- Multi-target routing with four strategies: weighted load balancing, priority-based failover, latency-first ordering, or usage-priority dynamic weighting from upstream subscription quotas
 - Health-aware failover: 3 consecutive failures mark a target unhealthy, auto-recovery after 30s
 - Per-route access control with API key authorization
 

@@ -39,7 +39,7 @@ export interface Model {
   targets: ModelBackend[];
 }
 
-export type ModelBalance = "weighted" | "priority" | "latency";
+export type ModelBalance = "weighted" | "priority" | "latency" | "usage";
 
 export interface ModelBackend {
   id: string;
@@ -618,7 +618,7 @@ export interface ProviderOAuthStatusData {
 
 /** Coding-plan usage tier (e.g. GLM 5-hour / weekly quota windows). */
 export interface ProviderUsageTier {
-  /** `five_hour` | `weekly_limit` */
+  /** Canonical main tiers: `five_hour` | `weekly_limit` | `monthly`; feature tiers may also be reported. */
   name: string;
   /** Used percentage (0-100). */
   used_percent: number;

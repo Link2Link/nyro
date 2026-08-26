@@ -90,7 +90,7 @@ Nyro 同时提供 **桌面应用**（macOS / Windows / Linux）和 **独立服�
 
 - 基于 `virtual_model` 的精确匹配路由
 - 通过虚拟模型名解耦客户端请求与真实后端模型
-- 多目标路由，支持加权负载均衡（weighted）、优先级失败转移（priority）、延迟优先（latency，按首字延时择优）三种策略
+- 多目标路由，支持加权负载均衡（weighted）、优先级失败转移（priority）、延迟优先（latency）和上游套餐用量优先动态分流（usage）四种策略
 - 健康感知：连续 3 次失败标记目标不健康，30s 后自动恢复
 - 按路由进行 API Key 访问控制
 

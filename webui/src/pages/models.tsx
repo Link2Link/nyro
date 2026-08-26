@@ -63,6 +63,7 @@ function FieldLabel({ children }: { children: string }) {
 function balanceLabel(value: ModelBalance, isZh: boolean) {
   if (value === "priority") return isZh ? "优先分级" : "Priority";
   if (value === "latency") return isZh ? "延迟优先" : "Latency";
+  if (value === "usage") return isZh ? "用量优先" : "Usage";
   return isZh ? "加权轮询" : "Weighted";
 }
 
@@ -286,7 +287,7 @@ function TargetRow({
           />
         )}
 
-        {balance === "weighted" || balance === "latency" ? (
+        {balance === "weighted" || balance === "latency" || balance === "usage" ? (
           <Input
             className="bg-white"
             type="number"
@@ -551,6 +552,7 @@ export default function ModelsPage() {
                   <SelectItem value="weighted">{isZh ? "加权轮询" : "Weighted"}</SelectItem>
                   <SelectItem value="priority">{isZh ? "优先分级" : "Priority"}</SelectItem>
                   <SelectItem value="latency">{isZh ? "延迟优先" : "Latency"}</SelectItem>
+                  <SelectItem value="usage">{isZh ? "用量优先" : "Usage"}</SelectItem>
                 </SelectContent>
               </Select>
             </div>
@@ -568,6 +570,13 @@ export default function ModelsPage() {
                       {isZh
                         ? "按首字延时升序路由；权重仅在并列时生效"
                         : "routes by lowest first-token latency; weight only breaks ties"}
+                    </span>
+                  )}
+                  {createForm.balance === "usage" && (
+                    <span className="text-[11px] text-slate-400">
+                      {isZh
+                        ? "优先消耗仅 5 小时套餐；否则按周/月用量短板分²动态分流"
+                        : "prioritizes 5h-only plans; otherwise weights by squared weekly/monthly quota score"}
                     </span>
                   )}
                 </div>
@@ -717,6 +726,7 @@ export default function ModelsPage() {
                           <SelectItem value="weighted">{isZh ? "加权轮询" : "Weighted"}</SelectItem>
                           <SelectItem value="priority">{isZh ? "优先分级" : "Priority"}</SelectItem>
                           <SelectItem value="latency">{isZh ? "延迟优先" : "Latency"}</SelectItem>
+                          <SelectItem value="usage">{isZh ? "用量优先" : "Usage"}</SelectItem>
                         </SelectContent>
                       </Select>
                     </div>
@@ -734,6 +744,13 @@ export default function ModelsPage() {
                               {isZh
                                 ? "按首字延时升序路由；权重仅在并列时生效"
                                 : "routes by lowest first-token latency; weight only breaks ties"}
+                            </span>
+                          )}
+                          {editForm.balance === "usage" && (
+                            <span className="text-[11px] text-slate-400">
+                              {isZh
+                                ? "优先消耗仅 5 小时套餐；否则按周/月用量短板分²动态分流"
+                                : "prioritizes 5h-only plans; otherwise weights by squared weekly/monthly quota score"}
                             </span>
                           )}
                         </div>

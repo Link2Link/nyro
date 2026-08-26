@@ -622,7 +622,7 @@ inventory::submit! { ExtensionRegistration { make: || Box::new(XxxChannel) } }
 |---|---|---|
 | `id` | TEXT PK | UUID |
 | `name` | TEXT | 显示名称，同时作为模型匹配键 |
-| `balance` | TEXT | 负载策略：`weighted` / `priority` / `latency`（首字延时 EWMA 升序，无新鲜样本目标乐观探测在前） |
+| `balance` | TEXT | 负载策略：`weighted` / `priority` / `latency` / `usage`（Provider 套餐用量分²动态权重） |
 | `target_provider` | TEXT FK | 默认目标 Provider（兜底）|
 | `target_model` | TEXT | 默认上游模型名 |
 | `enable_auth` | BOOL | API Token 访问控制，默认 false |
@@ -631,7 +631,7 @@ inventory::submit! { ExtensionRegistration { make: || Box::new(XxxChannel) } }
 
 > `ingress_protocol` 不在数据库中。协议在运行时由 `RequestContext` 携带，日志写入 `request_logs.client_protocol`。
 
-**后端列表（model_backends）**：一个 Model 可绑定多个 backend，每个 backend 指向 `provider_id` + `model`，带 `weight`（weighted balance）和 `priority`（priority balance）；后端健康状态在内存 `HealthRegistry` 管理，不入库。
+**后端列表（model_backends）**：一个 Model 可绑定多个 backend，每个 backend 指向 `provider_id` + `model`，带 `weight`（weighted balance；usage 下拆分同 Provider 的 target）和 `priority`（priority balance）；后端健康状态在内存 `HealthRegistry` 管理，不入库。`ProviderQuotaRegistry` 同时保留最近一次权威用量窗口快照，供 usage balance 在请求热路径同步读取。
 
 ### 8.2 API Token 模型
 
@@ -898,7 +898,7 @@ OnLog 阶段 + `ResponseStats` 已提供标准化的请求指标消费点（见 
 
 ### 12.8 Router 故障策略（部分已落地）
 
-已落地：多 backend 健康感知迭代（`HealthRegistry`）+ `balance` 策略（weighted / priority / latency——内存 `LatencyRegistry` 按流式首字延时 EWMA 排序；目标需连续 3 个流式样本、以三次均值入组比较，未满或超 5 分钟保鲜窗即转为未知目标由真实流量乐观探测；失败信号归熔断器，不进延迟统计）+ 可重试状态码自动续跑。待补充：指数退避 + jitter、可配置重试上限、单 backend 精细化熔断（滑动窗口）。
+已落地：多 backend 健康感知迭代（`HealthRegistry`）+ 四种 `balance` 策略 + 可重试状态码自动续跑。`latency` 由内存 `LatencyRegistry` 按流式首字延时 EWMA 排序，目标需连续 3 个流式样本并以三次均值入组，未满或超过 5 分钟保鲜窗时由真实流量乐观探测。`usage` 由 `ProviderQuotaRegistry` 的 last-good 窗口快照驱动：只含 5 小时窗口的 Provider 形成最高优先池；否则忽略 5 小时软评分，以周/月匀速用量最低分的平方作为 Provider 动态权重；未知用量 Provider 只作末级兜底，Provider 间等权、Provider 内按静态 target 权重排列。任何窗口达到 100% 仍触发配额硬过滤。待补充：指数退避 + jitter、可配置重试上限、单 backend 精细化熔断（滑动窗口）。
 
 ### 12.9 Transport 策略
 

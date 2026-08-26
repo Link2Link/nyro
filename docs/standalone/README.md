@@ -192,7 +192,7 @@ Nyro 不自动发现协议能力：配置的端点就是能力声明。入口请
 | `name` | — | 是 | 路由名称 |
 | `virtual_model` | `vmodel` | 是 | 客户端请求的模型 ID（精确匹配） |
 | `type` | — | 否 | 路由类型：`chat`（默认）/ `embedding` |
-| `strategy` | — | 否 | 负载策略：`weighted`（默认）/ `priority` / `latency` |
+| `strategy` | — | 否 | 负载策略：`weighted`（默认）/ `priority` / `latency` / `usage` |
 | `targets` | — | 是 | 目标列表（至少一个） |
 | `access_control` | — | 否 | 是否启用访问控制（默认 `false`）。别名 `enable_auth` |
 
@@ -202,8 +202,18 @@ Nyro 不自动发现协议能力：配置的端点就是能力声明。入口请
 |------|------|------|
 | `provider` | 是 | Provider 名称（需与 `providers[].name` 匹配） |
 | `model` | 是 | 实际模型 ID |
-| `weight` | 否 | 权重，`weighted` 策略下使用（默认 `100`） |
+| `weight` | 否 | 静态权重（默认 `100`）；`weighted` 直接使用，`usage` 用于同 Provider 多 target 的内部顺序和未知用量兜底 |
 | `priority` | 否 | 优先级，`priority` 策略下使用（默认 `1`，数字越小优先级越高） |
+
+### usage 用量优先策略
+
+`usage` 复用后台 Provider 套餐用量监控，热路径只读取内存快照：
+
+1. 只报告 5 小时窗口、没有周/月窗口的 Provider 进入最高优先池，并按 5 小时分²做加权随机分流，以优先消耗即将快速重置的额度。
+2. 没有可调度的 5h-only Provider 时，含周或月窗口的 Provider 才接管；此类 Provider 的 5 小时窗口不参与软评分，周/月窗口有几个算几个并取最低分，再按分²分流。
+3. 没有可识别百分比窗口的 Provider 排在最后，Provider 之间等权随机；同一 Provider 的多个 target 再按静态 `weight` 排列，避免重复 target 放大 Provider 份额。
+
+每个窗口使用与管理界面匀速参考线相同的 5h/7d/30d 周期。存在 reset 时间时，窗口分为 `clamp(50 + (匀速已用% - 实际已用%) / 2, 0, 100)`；缺少 reset 时使用原始剩余百分比。任何窗口（包括被长期池软评分忽略的 5 小时窗口）达到 100% 后，仍会由配额调度器立即跳过。用量正常每 5 分钟刷新，429 会触发即时刷新；查询失败时继续沿用最后成功快照。
 
 ---
 

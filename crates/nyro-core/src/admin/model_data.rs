@@ -3,7 +3,7 @@ use super::*;
 pub(super) fn normalize_model_balance(balance: Option<&str>) -> anyhow::Result<String> {
     let normalized = balance.unwrap_or("weighted").trim().to_ascii_lowercase();
     match normalized.as_str() {
-        "weighted" | "priority" | "latency" => Ok(normalized),
+        "weighted" | "priority" | "latency" | "usage" => Ok(normalized),
         _ => anyhow::bail!("unsupported model balance: {normalized}"),
     }
 }
@@ -82,4 +82,15 @@ pub(super) fn ensure_model_backends_valid(backends: &[CreateModelBackend]) -> an
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_model_balance;
+
+    #[test]
+    fn usage_balance_is_case_normalized_and_unknown_values_are_rejected() {
+        assert_eq!(normalize_model_balance(Some(" Usage ")).unwrap(), "usage");
+        assert!(normalize_model_balance(Some("quota-score")).is_err());
+    }
 }

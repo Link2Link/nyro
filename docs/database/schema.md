@@ -82,7 +82,7 @@ Provider 的协议端点明细。固定模式保留一条兼容记录；自适�
 |---|---|---|---|
 | `id` | TEXT PK | — | 主键，UUID |
 | `name` | TEXT NOT NULL | — | 显示名称，同时作为客户端请求的模型匹配键（路由唯一键的一部分） |
-| `balance` | TEXT | `'weighted'` | 多后端负载均衡策略：`weighted`、`priority`、`latency`（按首字延时 EWMA 升序路由，无新鲜样本的目标乐观探测在前） |
+| `balance` | TEXT | `'weighted'` | 多后端负载均衡策略：`weighted`、`priority`、`latency`、`usage`（5h-only 套餐优先，否则按周/月匀速用量短板分²动态加权） |
 | `target_provider` | TEXT NOT NULL | — | 默认后端 provider ID（FK → providers.id） |
 | `target_model` | TEXT NOT NULL | — | 默认后端使用的上游模型名 |
 | `enable_auth` | INTEGER | `0` | 是否启用 API Key 访问控制 |
@@ -103,7 +103,7 @@ Provider 的协议端点明细。固定模式保留一条兼容记录；自适�
 | `model_id` | TEXT NOT NULL | — | 所属模型 ID（FK → models.id, ON DELETE CASCADE） |
 | `provider_id` | TEXT NOT NULL | — | 供应商 ID（FK → providers.id） |
 | `model` | TEXT NOT NULL | — | 上游模型名（发送给 provider 的模型标识） |
-| `weight` | INTEGER | `100` | 权重（`weighted` 策略下生效） |
+| `weight` | INTEGER | `100` | 静态权重（`weighted` 使用；`usage` 中用于同 Provider 多 target 的内部顺序及未知用量兜底） |
 | `priority` | INTEGER | `1` | 优先级，数值越小越优先（`priority` 策略下生效） |
 | `created_at` | TEXT | `datetime('now')` | 创建时间 |
 

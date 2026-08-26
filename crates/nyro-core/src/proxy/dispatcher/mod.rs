@@ -506,8 +506,12 @@ async fn dispatch_pipeline_inner(
         .emit();
         return error_response(503, "no route targets configured");
     }
-    let ordered_targets =
-        TargetSelector::select_ordered(&route.balance, &targets, &gw.latency_registry);
+    let ordered_targets = TargetSelector::select_ordered(
+        &route.balance,
+        &targets,
+        &gw.latency_registry,
+        &gw.quota_registry,
+    );
     if ordered_targets.is_empty() {
         LogBuilder::from_dispatch(
             &gw,
@@ -1961,7 +1965,7 @@ mod tests {
         gw.admin()
             .create_model(CreateModel {
                 name: route_name.clone(),
-                balance: Some("priority".to_string()),
+                balance: Some("usage".to_string()),
                 target_provider: provider.id.clone(),
                 target_model: "upstream-model".to_string(),
                 targets: vec![CreateModelBackend {

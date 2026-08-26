@@ -11,6 +11,7 @@
 //! | `weighted` | Weighted reservoir sampling (default) |
 //! | `priority` | Priority groups in ascending order    |
 //! | `latency`  | Lowest streaming TTFB EWMA first      |
+//! | `usage`    | Provider quota score² dynamic weights   |
 //!
 //! `latency` orders targets by the time-to-first-token EWMA held in
 //! [`LatencyRegistry`]. Targets without a graduated fresh estimate (never
@@ -24,16 +25,22 @@
 //!
 //! ```rust,ignore
 //! // Dispatcher
-//! let ordered =
-//!     TargetSelector::select_ordered(&route.balance, &targets, &gw.latency_registry);
+//! let ordered = TargetSelector::select_ordered(
+//!     &route.balance,
+//!     &targets,
+//!     &gw.latency_registry,
+//!     &gw.quota_registry,
+//! );
 //! ```
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::str::FromStr;
 
 use rand::Rng;
 
 use super::latency::LatencyRegistry;
+use super::quota::ProviderQuotaRegistry;
+use super::usage::{UsageScorePool, dynamic_weight, score_provider};
 use crate::db::models::{ModelBackend, ModelBalance};
 
 // ── SelectedTarget ────────────────────────────────────────────────────────────
@@ -55,6 +62,7 @@ pub trait RoutingStrategy: Send + Sync {
         &self,
         targets: &[ModelBackend],
         latency: &LatencyRegistry,
+        quota: &ProviderQuotaRegistry,
     ) -> Vec<SelectedTarget>;
 }
 
@@ -67,6 +75,7 @@ impl RoutingStrategy for WeightedStrategy {
         &self,
         targets: &[ModelBackend],
         _latency: &LatencyRegistry,
+        _quota: &ProviderQuotaRegistry,
     ) -> Vec<SelectedTarget> {
         let refs: Vec<&ModelBackend> = targets.iter().filter(|t| t.weight > 0).collect();
         weighted_shuffle(&refs)
@@ -85,6 +94,7 @@ impl RoutingStrategy for PriorityStrategy {
         &self,
         targets: &[ModelBackend],
         _latency: &LatencyRegistry,
+        _quota: &ProviderQuotaRegistry,
     ) -> Vec<SelectedTarget> {
         let mut groups: BTreeMap<i32, Vec<&ModelBackend>> = BTreeMap::new();
         for t in targets {
@@ -111,6 +121,7 @@ impl RoutingStrategy for LatencyStrategy {
         &self,
         targets: &[ModelBackend],
         latency: &LatencyRegistry,
+        _quota: &ProviderQuotaRegistry,
     ) -> Vec<SelectedTarget> {
         let mut unknown: Vec<&ModelBackend> = Vec::new();
         let mut known: Vec<(&ModelBackend, f64)> = Vec::new();
@@ -136,6 +147,98 @@ impl RoutingStrategy for LatencyStrategy {
     }
 }
 
+// ── Usage ─────────────────────────────────────────────────────────────────────
+
+/// Orders provider groups from upstream quota headroom. Providers carrying only
+/// a five-hour window form the highest-priority pool. Once weekly or monthly
+/// quota exists, five-hour usage is ignored and the long-window bottleneck
+/// score is squared into the provider's dynamic randomization weight.
+pub struct UsageStrategy;
+
+struct ProviderTargetGroup<'a> {
+    provider_id: &'a str,
+    targets: Vec<&'a ModelBackend>,
+    score: Option<super::usage::ProviderUsageScore>,
+    schedulable: bool,
+}
+
+impl RoutingStrategy for UsageStrategy {
+    fn select_ordered(
+        &self,
+        targets: &[ModelBackend],
+        _latency: &LatencyRegistry,
+        quota: &ProviderQuotaRegistry,
+    ) -> Vec<SelectedTarget> {
+        let mut indexes: HashMap<&str, usize> = HashMap::new();
+        let mut groups: Vec<ProviderTargetGroup<'_>> = Vec::new();
+        // Match weighted balance semantics: zero-weight rows do not participate.
+        for target in targets.iter().filter(|target| target.weight > 0) {
+            if let Some(index) = indexes.get(target.provider_id.as_str()).copied() {
+                groups[index].targets.push(target);
+                continue;
+            }
+            let index = groups.len();
+            indexes.insert(target.provider_id.as_str(), index);
+            groups.push(ProviderTargetGroup {
+                provider_id: target.provider_id.as_str(),
+                targets: vec![target],
+                score: None,
+                schedulable: false,
+            });
+        }
+
+        let now = chrono::Utc::now();
+        for group in &mut groups {
+            group.schedulable = quota.is_schedulable(group.provider_id);
+            group.score = score_provider(&quota.tier_snapshot(group.provider_id), now);
+        }
+
+        let mut five_hour: Vec<(&ProviderTargetGroup<'_>, f64)> = Vec::new();
+        let mut long_term: Vec<(&ProviderTargetGroup<'_>, f64)> = Vec::new();
+        // Unknown and zero-score providers get one equal provider-level fallback
+        // mass; static target weights only choose within that provider. Duplicate
+        // rows therefore never amplify a provider's cross-provider probability.
+        let mut fallback: Vec<(&ProviderTargetGroup<'_>, f64)> = Vec::new();
+        let mut inactive: Vec<&ModelBackend> = Vec::new();
+
+        for group in &groups {
+            if !group.schedulable {
+                inactive.extend(group.targets.iter().copied());
+                continue;
+            }
+            match group.score {
+                Some(score) if score.score.is_finite() && score.score > 0.0 => {
+                    let weight = dynamic_weight(score.score);
+                    match score.pool {
+                        UsageScorePool::FiveHourOnly => five_hour.push((group, weight)),
+                        UsageScorePool::LongTerm => long_term.push((group, weight)),
+                    }
+                }
+                Some(_) | None => fallback.push((group, 1.0)),
+            }
+        }
+
+        let mut ordered: Vec<&ModelBackend> = Vec::new();
+        append_provider_groups(&mut ordered, weighted_shuffle_by(&five_hour));
+        append_provider_groups(&mut ordered, weighted_shuffle_by(&long_term));
+        append_provider_groups(&mut ordered, weighted_shuffle_by(&fallback));
+        // Keep quota-blocked rows in the retry list so the dispatcher preserves
+        // its precise "all providers exhausted" 503 outcome.
+        ordered.extend(inactive);
+
+        ordered.into_iter().map(to_selected).collect()
+    }
+}
+
+fn append_provider_groups<'a>(
+    ordered: &mut Vec<&'a ModelBackend>,
+    groups: Vec<&ProviderTargetGroup<'a>>,
+) {
+    for group in groups {
+        ordered.extend(weighted_shuffle(&group.targets));
+    }
+}
+
 // ── TargetSelector (public entry point) ───────────────────────────────────────
 
 pub struct TargetSelector;
@@ -147,11 +250,13 @@ impl TargetSelector {
         balance: &str,
         targets: &[ModelBackend],
         latency: &LatencyRegistry,
+        quota: &ProviderQuotaRegistry,
     ) -> Vec<SelectedTarget> {
         match ModelBalance::from_str(balance).unwrap_or_default() {
-            ModelBalance::Weighted => WeightedStrategy.select_ordered(targets, latency),
-            ModelBalance::Priority => PriorityStrategy.select_ordered(targets, latency),
-            ModelBalance::Latency => LatencyStrategy.select_ordered(targets, latency),
+            ModelBalance::Weighted => WeightedStrategy.select_ordered(targets, latency, quota),
+            ModelBalance::Priority => PriorityStrategy.select_ordered(targets, latency, quota),
+            ModelBalance::Latency => LatencyStrategy.select_ordered(targets, latency, quota),
+            ModelBalance::Usage => UsageStrategy.select_ordered(targets, latency, quota),
         }
     }
 }
@@ -167,25 +272,37 @@ fn to_selected(t: &ModelBackend) -> SelectedTarget {
 }
 
 fn weighted_shuffle<'a>(targets: &[&'a ModelBackend]) -> Vec<&'a ModelBackend> {
-    if targets.is_empty() {
-        return vec![];
-    }
-    let mut rng = rand::thread_rng();
-    let mut items: Vec<(&ModelBackend, f64)> = targets
+    let weighted = targets
         .iter()
-        .map(|t| {
-            let weight = t.weight.max(1) as f64;
-            let key = rng.r#gen::<f64>().powf(1.0 / weight);
-            (*t, key)
+        .filter(|target| target.weight > 0)
+        .map(|target| (*target, target.weight as f64))
+        .collect::<Vec<_>>();
+    weighted_shuffle_by(&weighted)
+}
+
+fn weighted_shuffle_by<T: Copy>(items: &[(T, f64)]) -> Vec<T> {
+    let mut rng = rand::thread_rng();
+    weighted_shuffle_by_rng(items, &mut rng)
+}
+
+fn weighted_shuffle_by_rng<T: Copy, R: Rng + ?Sized>(items: &[(T, f64)], rng: &mut R) -> Vec<T> {
+    let mut keyed = items
+        .iter()
+        .filter(|(_, weight)| weight.is_finite() && *weight > 0.0)
+        .map(|(item, weight)| {
+            let key = rng.r#gen::<f64>().powf(1.0 / *weight);
+            (*item, key)
         })
-        .collect();
-    items.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-    items.into_iter().map(|(t, _)| t).collect()
+        .collect::<Vec<_>>();
+    keyed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    keyed.into_iter().map(|(item, _)| item).collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::router::quota::QuotaTierObservation;
+    use rand::SeedableRng;
     use std::time::Duration;
 
     fn backend(id: &str, provider_id: &str, model: &str, weight: i32) -> ModelBackend {
@@ -218,7 +335,12 @@ mod tests {
             backend("3", "p3", "mid", 50),
         ];
 
-        let ordered = TargetSelector::select_ordered("latency", &targets, &registry);
+        let ordered = TargetSelector::select_ordered(
+            "latency",
+            &targets,
+            &registry,
+            &ProviderQuotaRegistry::new(),
+        );
 
         assert_eq!(
             ordered_models(&ordered),
@@ -239,7 +361,12 @@ mod tests {
             backend("3", "p-unknown-b", "ub", 80),
         ];
 
-        let ordered = TargetSelector::select_ordered("latency", &targets, &registry);
+        let ordered = TargetSelector::select_ordered(
+            "latency",
+            &targets,
+            &registry,
+            &ProviderQuotaRegistry::new(),
+        );
 
         assert_eq!(ordered_models(&ordered), vec!["ub", "ua", "known"]);
     }
@@ -253,7 +380,12 @@ mod tests {
             backend("3", "p", "equal-heavy", 80),
         ];
 
-        let ordered = TargetSelector::select_ordered("latency", &targets, &registry);
+        let ordered = TargetSelector::select_ordered(
+            "latency",
+            &targets,
+            &registry,
+            &ProviderQuotaRegistry::new(),
+        );
 
         assert_eq!(
             ordered_models(&ordered),
@@ -276,7 +408,12 @@ mod tests {
             backend("2", "p-fresh", "fresh", 1),
         ];
 
-        let ordered = TargetSelector::select_ordered("latency", &targets, &registry);
+        let ordered = TargetSelector::select_ordered(
+            "latency",
+            &targets,
+            &registry,
+            &ProviderQuotaRegistry::new(),
+        );
 
         // `fast` went stale → unknown → probes first even though its last
         // graduated mean (900) was slower than the fresh `fresh` (800).
@@ -297,7 +434,12 @@ mod tests {
             backend("2", "p-slow", "slow", 99),
         ];
 
-        let ordered = TargetSelector::select_ordered("latency", &targets, &registry);
+        let ordered = TargetSelector::select_ordered(
+            "latency",
+            &targets,
+            &registry,
+            &ProviderQuotaRegistry::new(),
+        );
 
         // 2/3 samples: still unknown → probes first despite the lower weight.
         assert_eq!(
@@ -308,7 +450,12 @@ mod tests {
 
         // Third sample graduates the round; its mean wins on merit.
         registry.record("p-fast", "fast", 100);
-        let ordered = TargetSelector::select_ordered("latency", &targets, &registry);
+        let ordered = TargetSelector::select_ordered(
+            "latency",
+            &targets,
+            &registry,
+            &ProviderQuotaRegistry::new(),
+        );
         assert_eq!(
             ordered_models(&ordered),
             vec!["fast", "slow"],
@@ -317,11 +464,296 @@ mod tests {
     }
 
     #[test]
+    fn squared_scores_drive_weighted_first_choice_probability() {
+        let mut rng = rand::rngs::StdRng::seed_from_u64(7);
+        let items = [("a", dynamic_weight(70.0)), ("b", dynamic_weight(50.0))];
+        let mut a_first = 0_u32;
+        let samples = 20_000_u32;
+        for _ in 0..samples {
+            let ordered = weighted_shuffle_by_rng(&items, &mut rng);
+            if ordered.first() == Some(&"a") {
+                a_first += 1;
+            }
+        }
+        let observed = f64::from(a_first) / f64::from(samples);
+        let expected = 4900.0 / (4900.0 + 2500.0);
+
+        assert!(
+            (observed - expected).abs() < 0.02,
+            "{observed} vs {expected}"
+        );
+    }
+
+    #[test]
+    fn usage_prioritizes_five_hour_only_then_long_term_then_unknown() {
+        let quota = ProviderQuotaRegistry::new();
+        quota.observe(
+            "five",
+            &[QuotaTierObservation {
+                name: "five_hour".to_string(),
+                used_percent: 30.0,
+                resets_at: None,
+            }],
+            None,
+        );
+        quota.observe(
+            "long",
+            &[QuotaTierObservation {
+                name: "weekly_limit".to_string(),
+                used_percent: 10.0,
+                resets_at: None,
+            }],
+            None,
+        );
+        let targets = vec![
+            backend("1", "long", "long", 100),
+            backend("2", "unknown", "unknown", 100),
+            backend("3", "five", "five", 100),
+        ];
+
+        let ordered =
+            TargetSelector::select_ordered("usage", &targets, &LatencyRegistry::new(), &quota);
+
+        assert_eq!(ordered_models(&ordered), vec!["five", "long", "unknown"]);
+    }
+
+    #[test]
+    fn every_eligible_five_hour_only_provider_stays_ahead_of_long_term_pool() {
+        let quota = ProviderQuotaRegistry::new();
+        for provider in ["five-a", "five-b"] {
+            quota.observe(
+                provider,
+                &[QuotaTierObservation {
+                    name: "five_hour".to_string(),
+                    used_percent: 25.0,
+                    resets_at: None,
+                }],
+                None,
+            );
+        }
+        quota.observe(
+            "long",
+            &[QuotaTierObservation {
+                name: "weekly_limit".to_string(),
+                used_percent: 1.0,
+                resets_at: None,
+            }],
+            None,
+        );
+        let targets = vec![
+            backend("1", "long", "long", 100),
+            backend("2", "five-a", "five-a", 100),
+            backend("3", "five-b", "five-b", 100),
+        ];
+
+        let ordered =
+            TargetSelector::select_ordered("usage", &targets, &LatencyRegistry::new(), &quota);
+        let first_pool = ordered[..2]
+            .iter()
+            .map(|target| target.provider_id.as_str())
+            .collect::<std::collections::HashSet<_>>();
+
+        assert_eq!(
+            first_pool,
+            std::collections::HashSet::from(["five-a", "five-b"])
+        );
+        assert_eq!(ordered[2].provider_id, "long");
+    }
+
+    #[test]
+    fn exhausted_five_hour_provider_does_not_block_long_term_pool() {
+        let quota = ProviderQuotaRegistry::new();
+        quota.observe(
+            "five",
+            &[QuotaTierObservation {
+                name: "five_hour".to_string(),
+                used_percent: 100.0,
+                resets_at: None,
+            }],
+            None,
+        );
+        quota.observe(
+            "long",
+            &[QuotaTierObservation {
+                name: "monthly".to_string(),
+                used_percent: 20.0,
+                resets_at: None,
+            }],
+            None,
+        );
+        let targets = vec![
+            backend("1", "five", "five", 100),
+            backend("2", "long", "long", 100),
+        ];
+
+        let ordered =
+            TargetSelector::select_ordered("usage", &targets, &LatencyRegistry::new(), &quota);
+
+        assert_eq!(ordered_models(&ordered), vec!["long", "five"]);
+    }
+
+    #[test]
+    fn long_term_provider_still_honors_five_hour_hard_quota_guard() {
+        let quota = ProviderQuotaRegistry::new();
+        quota.observe(
+            "blocked",
+            &[
+                QuotaTierObservation {
+                    name: "five_hour".to_string(),
+                    used_percent: 100.0,
+                    resets_at: None,
+                },
+                QuotaTierObservation {
+                    name: "weekly_limit".to_string(),
+                    used_percent: 10.0,
+                    resets_at: None,
+                },
+            ],
+            None,
+        );
+        quota.observe(
+            "eligible",
+            &[QuotaTierObservation {
+                name: "weekly_limit".to_string(),
+                used_percent: 60.0,
+                resets_at: None,
+            }],
+            None,
+        );
+        let targets = vec![
+            backend("1", "blocked", "blocked", 100),
+            backend("2", "eligible", "eligible", 100),
+        ];
+
+        let ordered =
+            TargetSelector::select_ordered("usage", &targets, &LatencyRegistry::new(), &quota);
+
+        assert_eq!(ordered_models(&ordered), vec!["eligible", "blocked"]);
+    }
+
+    #[test]
+    fn duplicate_provider_targets_stay_contiguous_and_do_not_form_extra_groups() {
+        let quota = ProviderQuotaRegistry::new();
+        for provider in ["a", "b"] {
+            quota.observe(
+                provider,
+                &[QuotaTierObservation {
+                    name: "weekly_limit".to_string(),
+                    used_percent: 40.0,
+                    resets_at: None,
+                }],
+                None,
+            );
+        }
+        let targets = vec![
+            backend("1", "a", "a1", 90),
+            backend("2", "b", "b1", 100),
+            backend("3", "a", "a2", 10),
+        ];
+
+        let samples = 10_000_u32;
+        let mut a_first = 0_u32;
+        let mut a1_first = 0_u32;
+        for _ in 0..samples {
+            let ordered =
+                TargetSelector::select_ordered("usage", &targets, &LatencyRegistry::new(), &quota);
+            if ordered
+                .first()
+                .is_some_and(|target| target.provider_id == "a")
+            {
+                a_first += 1;
+                if ordered.first().is_some_and(|target| target.model == "a1") {
+                    a1_first += 1;
+                }
+            }
+            let providers = ordered
+                .iter()
+                .map(|target| target.provider_id.as_str())
+                .collect::<Vec<_>>();
+            let a_positions = providers
+                .iter()
+                .enumerate()
+                .filter_map(|(index, provider)| (*provider == "a").then_some(index))
+                .collect::<Vec<_>>();
+            assert_eq!(a_positions.len(), 2);
+            assert_eq!(a_positions[1], a_positions[0] + 1);
+        }
+        let provider_share = f64::from(a_first) / f64::from(samples);
+        let internal_share = f64::from(a1_first) / f64::from(a_first);
+
+        assert!((provider_share - 0.5).abs() < 0.03, "{provider_share}");
+        assert!((internal_share - 0.9).abs() < 0.03, "{internal_share}");
+    }
+
+    #[test]
+    fn unknown_duplicate_rows_do_not_amplify_provider_probability() {
+        let quota = ProviderQuotaRegistry::new();
+        let targets = vec![
+            backend("1", "a", "a1", 100),
+            backend("2", "a", "a2", 100),
+            backend("3", "b", "b1", 100),
+        ];
+        let samples = 10_000_u32;
+        let mut a_first = 0_u32;
+        for _ in 0..samples {
+            let ordered =
+                TargetSelector::select_ordered("usage", &targets, &LatencyRegistry::new(), &quota);
+            if ordered
+                .first()
+                .is_some_and(|target| target.provider_id == "a")
+            {
+                a_first += 1;
+            }
+            let providers = ordered
+                .iter()
+                .map(|target| target.provider_id.as_str())
+                .collect::<Vec<_>>();
+            let a_positions = providers
+                .iter()
+                .enumerate()
+                .filter_map(|(index, provider)| (*provider == "a").then_some(index))
+                .collect::<Vec<_>>();
+            assert_eq!(a_positions[1], a_positions[0] + 1);
+        }
+        let observed = f64::from(a_first) / f64::from(samples);
+
+        assert!((observed - 0.5).abs() < 0.03, "observed={observed}");
+    }
+
+    #[test]
+    fn usage_excludes_zero_static_weight_rows() {
+        let quota = ProviderQuotaRegistry::new();
+        quota.observe(
+            "p",
+            &[QuotaTierObservation {
+                name: "weekly_limit".to_string(),
+                used_percent: 10.0,
+                resets_at: None,
+            }],
+            None,
+        );
+        let targets = vec![
+            backend("1", "p", "active", 100),
+            backend("2", "p", "disabled", 0),
+        ];
+
+        let ordered =
+            TargetSelector::select_ordered("usage", &targets, &LatencyRegistry::new(), &quota);
+
+        assert_eq!(ordered_models(&ordered), vec!["active"]);
+    }
+
+    #[test]
     fn unknown_balance_falls_back_to_weighted() {
         let registry = LatencyRegistry::new();
         let targets = vec![backend("1", "p", "only", 100)];
 
-        let ordered = TargetSelector::select_ordered("nonsense", &targets, &registry);
+        let ordered = TargetSelector::select_ordered(
+            "nonsense",
+            &targets,
+            &registry,
+            &ProviderQuotaRegistry::new(),
+        );
 
         assert_eq!(ordered_models(&ordered), vec!["only"]);
     }

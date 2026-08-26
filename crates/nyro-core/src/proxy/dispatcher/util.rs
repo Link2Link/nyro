@@ -20,7 +20,12 @@ pub(super) async fn load_model_backends(gw: &Gateway, model: &Model) -> Vec<Mode
     {
         return backends;
     }
-    // Fallback: synthesize a single backend from the legacy
+    // Standalone YAML stores its normalized backends directly on the cached
+    // model because MemoryStorage intentionally has no ModelBackendStore.
+    if !model.targets.is_empty() {
+        return model.targets.clone();
+    }
+    // Final fallback: synthesize a single backend from the legacy
     // `model.target_provider` / `model.target_model` columns.
     if model.target_provider.trim().is_empty() {
         return Vec::new();
@@ -152,6 +157,54 @@ mod tests {
     use axum::http::{HeaderMap, HeaderValue};
 
     use super::*;
+
+    #[tokio::test]
+    async fn standalone_models_load_all_cached_targets_before_legacy_fallback() {
+        let targets = vec![
+            ModelBackend {
+                id: "a".to_string(),
+                model_id: "model".to_string(),
+                provider_id: "provider-a".to_string(),
+                model: "upstream-a".to_string(),
+                weight: 80,
+                priority: 1,
+                created_at: String::new(),
+            },
+            ModelBackend {
+                id: "b".to_string(),
+                model_id: "model".to_string(),
+                provider_id: "provider-b".to_string(),
+                model: "upstream-b".to_string(),
+                weight: 20,
+                priority: 2,
+                created_at: String::new(),
+            },
+        ];
+        let model = Model {
+            id: "model".to_string(),
+            name: "virtual".to_string(),
+            balance: "usage".to_string(),
+            target_provider: "provider-a".to_string(),
+            target_model: "upstream-a".to_string(),
+            enable_auth: false,
+            enable_payload: None,
+            is_enabled: true,
+            created_at: String::new(),
+            targets: targets.clone(),
+        };
+        let storage: crate::storage::DynStorage = std::sync::Arc::new(
+            crate::storage::MemoryStorage::new(Vec::new(), vec![model.clone()], Vec::new()),
+        );
+        let (gw, _logs) = Gateway::from_storage(crate::config::GatewayConfig::default(), storage)
+            .await
+            .unwrap();
+
+        let loaded = load_model_backends(&gw, &model).await;
+
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded[0].model, "upstream-a");
+        assert_eq!(loaded[1].model, "upstream-b");
+    }
 
     #[test]
     fn health_failures_exclude_request_scoped_errors() {

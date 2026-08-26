@@ -317,6 +317,13 @@ impl YamlConfig {
             if m.name.trim().is_empty() {
                 anyhow::bail!("models[{i}]: name is required");
             }
+            if m.balance.parse::<ModelBalance>().is_err() {
+                anyhow::bail!(
+                    "models[{i}] ({}): unsupported balance '{}'",
+                    m.name,
+                    m.balance
+                );
+            }
             if m.route_type.is_some() {
                 tracing::warn!(
                     model = %m.name,
@@ -333,6 +340,18 @@ impl YamlConfig {
                         "models[{i}] ({}): backends[{j}].provider '{}' not found in providers",
                         m.name,
                         b.provider
+                    );
+                }
+                if b.weight < 0 {
+                    anyhow::bail!(
+                        "models[{i}] ({}): backends[{j}].weight must be >= 0",
+                        m.name
+                    );
+                }
+                if b.priority < 1 {
+                    anyhow::bail!(
+                        "models[{i}] ({}): backends[{j}].priority must be a positive integer",
+                        m.name
                     );
                 }
             }
@@ -361,7 +380,9 @@ fn canonical_yaml_endpoint(raw: &str, require_exact: bool) -> anyhow::Result<Str
         .ok_or_else(|| anyhow::anyhow!("protocol has no registered endpoint: {raw}"))
 }
 
-use nyro_core::db::models::{Model, ModelBackend, Provider, ProviderProtocolEndpoint};
+use nyro_core::db::models::{
+    Model, ModelBackend, ModelBalance, Provider, ProviderProtocolEndpoint,
+};
 
 pub fn build_providers(yaml: &YamlConfig) -> Vec<Provider> {
     use nyro_core::protocol::registry::ProtocolRegistry;
@@ -501,6 +522,28 @@ mod tests {
 
     fn parse_provider(yaml: &str) -> Result<YamlProvider, serde_yaml::Error> {
         serde_yaml::from_str(yaml)
+    }
+
+    fn model_validation_config(balance: &str, weight: i32, priority: i32) -> YamlConfig {
+        serde_yaml::from_str(&format!(
+            r#"
+providers:
+  - name: upstream
+    endpoints:
+      openai:
+        base_url: https://upstream.example/v1
+    apikey: sk-test
+models:
+  - name: virtual
+    balance: {balance:?}
+    backends:
+      - provider: upstream
+        model: actual
+        weight: {weight}
+        priority: {priority}
+"#
+        ))
+        .expect("parse")
     }
 
     #[test]
@@ -821,6 +864,73 @@ models:
         let providers = build_providers(&cfg);
         assert_eq!(providers.len(), 1);
         assert_eq!(providers[0].name, "openai");
+    }
+
+    #[test]
+    fn model_validation_accepts_usage_and_zero_weight() {
+        model_validation_config(" Usage ", 0, 1)
+            .validate()
+            .expect("usage should normalize like the runtime selector");
+    }
+
+    #[test]
+    fn model_validation_rejects_unknown_balance_and_invalid_limits() {
+        let balance = model_validation_config("usgae", 100, 1)
+            .validate()
+            .unwrap_err()
+            .to_string();
+        assert!(balance.contains("unsupported balance"), "{balance}");
+
+        let weight = model_validation_config("usage", -1, 1)
+            .validate()
+            .unwrap_err()
+            .to_string();
+        assert!(weight.contains("weight must be >= 0"), "{weight}");
+
+        let priority = model_validation_config("usage", 100, 0)
+            .validate()
+            .unwrap_err()
+            .to_string();
+        assert!(
+            priority.contains("priority must be a positive integer"),
+            "{priority}"
+        );
+    }
+
+    #[test]
+    fn usage_balance_preserves_all_standalone_backends() {
+        let yaml = r#"
+providers:
+  - name: first
+    endpoints:
+      openai:
+        base_url: https://first.example/v1
+    apikey: sk-first
+  - name: second
+    endpoints:
+      openai:
+        base_url: https://second.example/v1
+    apikey: sk-second
+models:
+  - name: pooled-model
+    balance: usage
+    backends:
+      - provider: first
+        model: upstream-a
+        weight: 80
+      - provider: second
+        model: upstream-b
+        weight: 20
+"#;
+        let cfg: YamlConfig = serde_yaml::from_str(yaml).expect("parse");
+        cfg.validate().expect("validate");
+        let providers = build_providers(&cfg);
+        let models = build_models(&cfg, &providers);
+
+        assert_eq!(models[0].balance, "usage");
+        assert_eq!(models[0].targets.len(), 2);
+        assert_eq!(models[0].targets[0].model, "upstream-a");
+        assert_eq!(models[0].targets[1].model, "upstream-b");
     }
 
     #[test]

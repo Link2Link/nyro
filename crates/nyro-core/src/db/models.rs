@@ -296,6 +296,8 @@ pub enum ModelBalance {
     /// Latency-first — lowest streaming TTFB EWMA first; targets without a
     /// fresh sample probe optimistically ahead of the known ones.
     Latency,
+    /// Usage-first — upstream quota scores become dynamic squared weights.
+    Usage,
 }
 
 impl ModelBalance {
@@ -304,6 +306,7 @@ impl ModelBalance {
             Self::Weighted => "weighted",
             Self::Priority => "priority",
             Self::Latency => "latency",
+            Self::Usage => "usage",
         }
     }
 }
@@ -316,6 +319,7 @@ impl std::str::FromStr for ModelBalance {
             "weighted" => Ok(Self::Weighted),
             "priority" => Ok(Self::Priority),
             "latency" => Ok(Self::Latency),
+            "usage" => Ok(Self::Usage),
             other => anyhow::bail!("unsupported model balance: {other}"),
         }
     }
