@@ -138,6 +138,7 @@ pub fn create_router(gateway: Gateway, admin_token: Option<String>) -> Router {
         .route("/stats/models", get(stats_by_model))
         .route("/stats/providers", get(stats_by_provider))
         .route("/stats/api-keys", get(stats_by_api_key))
+        .route("/stats/api-keys/:id", get(api_key_usage_detail))
         .route("/settings/:key", get(get_setting).put(set_setting))
         .route("/status", get(get_status))
         .route("/config/export", get(export_config_handler))
@@ -592,6 +593,8 @@ struct LogQueryParams {
     offset: Option<i64>,
     provider: Option<String>,
     model: Option<String>,
+    client_model: Option<String>,
+    upstream_model: Option<String>,
     status_min: Option<i32>,
     status_max: Option<i32>,
     api_key: Option<String>,
@@ -623,6 +626,8 @@ async fn query_logs_handler(
         offset: params.offset,
         provider: params.provider,
         model: params.model,
+        client_model: params.client_model,
+        upstream_model: params.upstream_model,
         status_min: params.status_min,
         status_max: params.status_max,
         api_key: params.api_key,
@@ -716,6 +721,25 @@ async fn stats_by_api_key(
     match gw.admin().get_stats_by_api_key(params.hours).await {
         Ok(v) => Json(serde_json::json!({ "data": v })).into_response(),
         Err(e) => err(e),
+    }
+}
+
+async fn api_key_usage_detail(
+    State(gw): State<Gateway>,
+    Path(id): Path<String>,
+    Query(params): Query<StatsRangeParams>,
+) -> impl IntoResponse {
+    match gw.admin().get_api_key_usage_detail(&id, params.hours).await {
+        Ok(v) => Json(serde_json::json!({ "data": v })).into_response(),
+        Err(e) => {
+            let message = e.to_string();
+            let status = if message.starts_with("hours must be one of") {
+                StatusCode::BAD_REQUEST
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            (status, Json(serde_json::json!({ "error": message }))).into_response()
+        }
     }
 }
 

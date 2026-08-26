@@ -480,6 +480,18 @@ pub async fn get_stats_by_api_key(
         .map_err(|e| e.to_string())
 }
 
+#[tauri::command]
+pub async fn get_api_key_usage_detail(
+    gw: State<'_, Gateway>,
+    id: String,
+    hours: Option<i32>,
+) -> Result<ApiKeyUsageDetail, String> {
+    gw.admin()
+        .get_api_key_usage_detail(&id, hours)
+        .await
+        .map_err(|e| e.to_string())
+}
+
 // ── Settings ──
 
 #[tauri::command]

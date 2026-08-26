@@ -3,7 +3,9 @@ import { useState } from "react";
 import { Line, LineChart, CartesianGrid, ResponsiveContainer, Tooltip, XAxis, YAxis, PieChart, Pie, Cell } from "recharts";
 import { backend } from "@/lib/backend";
 import type { StatsOverview, StatsTimeSeries, ModelStats, ProviderStats, ApiKeyStats } from "@/lib/types";
-import { Zap, Clock, Activity } from "lucide-react";
+import { Zap, Clock, Activity, BarChart3 } from "lucide-react";
+import { ApiKeyUsageDialog } from "@/components/api-key-usage-dialog";
+import { Button } from "@/components/ui/button";
 import { useLocale } from "@/lib/i18n";
 import { formatLocalBucketLabel, formatLocalBucketRange, formatLogTime, formatTps } from "@/lib/format";
 import {
@@ -39,6 +41,11 @@ export default function StatsPage() {
   const isZh = locale === "zh-CN";
 
   const [hours, setHours] = useState(24);
+  const [apiKeyDialog, setApiKeyDialog] = useState<{ open: boolean; apiKeyId: string | null }>({ open: false, apiKeyId: null });
+
+  const openApiKeyDialog = (apiKeyId: string | null = null) => {
+    setApiKeyDialog({ open: true, apiKeyId });
+  };
 
   const { data: overview } = useQuery<StatsOverview>({
     queryKey: ["stats-overview", hours],
@@ -316,7 +323,18 @@ export default function StatsPage() {
       </div>
 
       <div className="glass rounded-2xl p-6">
-        <h3 className="mb-4 text-sm font-semibold text-slate-800">{isZh ? "秘钥调用统计" : "API Key Usage"}</h3>
+        <div className="mb-4 flex items-center justify-between gap-3">
+          <h3 className="text-sm font-semibold text-slate-800">{isZh ? "密钥调用统计" : "API Key Usage"}</h3>
+          <Button
+            variant="outline"
+            size="sm"
+            className="h-8 gap-1.5"
+            onClick={() => openApiKeyDialog()}
+          >
+            <BarChart3 className="h-4 w-4" />
+            {isZh ? "查看详情" : "View Details"}
+          </Button>
+        </div>
         <div className="overflow-hidden rounded-xl border border-white/70 bg-white/50">
           <table className="w-full text-sm">
             <thead className="bg-white/70 text-slate-500">
@@ -341,7 +359,19 @@ export default function StatsPage() {
                   ? Math.round((k.cache_read_tokens / k.total_input_tokens) * 100)
                   : 0;
                 return (
-                  <tr key={k.api_key_id} className="border-t border-white/70 text-slate-700">
+                  <tr
+                    key={k.api_key_id}
+                    role="button"
+                    tabIndex={0}
+                    onClick={() => openApiKeyDialog(k.api_key_id)}
+                    onKeyDown={(event) => {
+                      if (event.key === "Enter" || event.key === " ") {
+                        event.preventDefault();
+                        openApiKeyDialog(k.api_key_id);
+                      }
+                    }}
+                    className="cursor-pointer border-t border-white/70 text-slate-700 outline-none transition-colors hover:bg-blue-50/50 focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-blue-500"
+                  >
                     <td className="px-4 py-2.5 font-medium">{k.api_key_name || k.api_key_id}</td>
                     <td className="px-4 py-2.5 text-right">{fmt(k.request_count)}</td>
                     <td className="px-4 py-2.5 text-right text-red-500">{fmt(k.error_count)}</td>
@@ -359,6 +389,13 @@ export default function StatsPage() {
           </table>
         </div>
       </div>
+
+      <ApiKeyUsageDialog
+        open={apiKeyDialog.open}
+        onOpenChange={(open) => setApiKeyDialog((current) => ({ ...current, open }))}
+        initialHours={hours}
+        initialApiKeyId={apiKeyDialog.apiKeyId}
+      />
 
       <div className="glass rounded-2xl p-6">
         <h3 className="mb-4 text-sm font-semibold text-slate-800">{isZh ? "模型 Token 统计（调用次数前 10）" : "Model Token Stats (Top 10 by Requests)"}</h3>

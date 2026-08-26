@@ -537,7 +537,10 @@ pub struct LogQuery {
     pub limit: Option<i64>,
     pub offset: Option<i64>,
     pub provider: Option<String>,
+    pub client_model: Option<String>,
+    /// Legacy alias for `upstream_model`. Ignored when `upstream_model` is set.
     pub model: Option<String>,
+    pub upstream_model: Option<String>,
     pub status_min: Option<i32>,
     pub status_max: Option<i32>,
     pub api_key: Option<String>,
@@ -738,6 +741,40 @@ pub struct ProviderStats {
     pub error_count: i64,
     pub avg_duration_ms: f64,
     pub total_output_tokens: i64,
+    pub total_upstream_ms: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApiKeyUsageDetail {
+    pub start_at: i64,
+    pub end_at: i64,
+    pub api_key_id: String,
+    pub api_key_name: String,
+    pub request_count: i64,
+    pub success_count: i64,
+    pub error_count: i64,
+    pub total_input_tokens: i64,
+    pub total_output_tokens: i64,
+    pub total_cache_read_tokens: i64,
+    pub avg_duration_ms: f64,
+    pub avg_first_token_ms: Option<f64>,
+    pub last_used_at: Option<i64>,
+    pub model_routes: Vec<ApiKeyModelRouteStats>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct ApiKeyModelRouteStats {
+    pub client_model: String,
+    pub provider_id: String,
+    pub provider_name: String,
+    pub upstream_model: String,
+    pub request_count: i64,
+    pub error_count: i64,
+    pub total_input_tokens: i64,
+    pub total_output_tokens: i64,
+    pub total_cache_read_tokens: i64,
+    pub avg_duration_ms: f64,
+    pub avg_first_token_ms: Option<f64>,
     pub total_upstream_ms: f64,
 }
 

@@ -5,6 +5,15 @@ const MAX_TIME_SERIES_HOURS: i32 = 168;
 const MILLIS_PER_MINUTE: i64 = 60_000;
 const MILLIS_PER_HOUR: i64 = 60 * MILLIS_PER_MINUTE;
 
+fn normalize_detail_hours(hours: Option<i32>) -> anyhow::Result<i32> {
+    let hours = hours.unwrap_or(24);
+    anyhow::ensure!(
+        matches!(hours, 6 | 24 | 72 | 168),
+        "hours must be one of 6, 24, 72, or 168"
+    );
+    Ok(hours)
+}
+
 fn normalize_time_series_hours(hours: Option<i32>) -> i32 {
     hours
         .unwrap_or(DEFAULT_TIME_SERIES_HOURS)
@@ -163,11 +172,63 @@ impl AdminService {
         &self,
         hours: Option<i32>,
     ) -> anyhow::Result<Vec<ApiKeyStats>> {
-        self.gw
+        let mut stats = self
+            .gw
             .storage
             .logs()
             .stats_by_api_key(Self::normalize_hours(hours).map(i64::from))
-            .await
+            .await?;
+        if let Some(store) = self.gw.storage.api_keys() {
+            let current_names: HashMap<_, _> = store
+                .list()
+                .await?
+                .into_iter()
+                .map(|key| (key.id, key.name))
+                .collect();
+            for item in &mut stats {
+                if let Some(name) = current_names.get(&item.api_key_id) {
+                    item.api_key_name.clone_from(name);
+                }
+            }
+        }
+        Ok(stats)
+    }
+
+    pub async fn get_api_key_usage_detail(
+        &self,
+        api_key_id: &str,
+        hours: Option<i32>,
+    ) -> anyhow::Result<ApiKeyUsageDetail> {
+        let hours = normalize_detail_hours(hours)?;
+        let end_at = Utc::now().timestamp_millis();
+        let start_at = end_at - i64::from(hours) * MILLIS_PER_HOUR;
+        let mut detail = self
+            .gw
+            .storage
+            .logs()
+            .api_key_usage_detail(api_key_id, start_at, end_at)
+            .await?;
+
+        if let Some(store) = self.gw.storage.api_keys() {
+            if let Some(key) = store.get(api_key_id).await? {
+                detail.api_key_name = key.name;
+            }
+        }
+        let provider_names: HashMap<_, _> = self
+            .gw
+            .storage
+            .providers()
+            .list()
+            .await?
+            .into_iter()
+            .map(|provider| (provider.id, provider.name))
+            .collect();
+        for route in &mut detail.model_routes {
+            if let Some(name) = provider_names.get(&route.provider_id) {
+                route.provider_name.clone_from(name);
+            }
+        }
+        Ok(detail)
     }
 }
 
@@ -184,6 +245,17 @@ mod tests {
             total_output_tokens: 25,
             total_cache_read_tokens: 40,
             avg_duration_ms: Some(250.0),
+        }
+    }
+
+    #[test]
+    fn detail_hours_use_default_and_reject_unsupported_values() {
+        assert_eq!(normalize_detail_hours(None).unwrap(), 24);
+        for hours in [6, 24, 72, 168] {
+            assert_eq!(normalize_detail_hours(Some(hours)).unwrap(), hours);
+        }
+        for hours in [-1, 0, 1, 12, 169] {
+            assert!(normalize_detail_hours(Some(hours)).is_err());
         }
     }
 

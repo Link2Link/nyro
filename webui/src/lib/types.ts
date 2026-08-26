@@ -206,6 +206,38 @@ export interface ApiKeyStats {
   last_used_at: number;
 }
 
+export interface ApiKeyModelRouteStats {
+  client_model: string;
+  provider_id: string;
+  provider_name: string;
+  upstream_model: string;
+  request_count: number;
+  error_count: number;
+  total_input_tokens: number;
+  total_output_tokens: number;
+  total_cache_read_tokens: number;
+  avg_duration_ms: number;
+  avg_first_token_ms?: number | null;
+  total_upstream_ms: number;
+}
+
+export interface ApiKeyUsageDetail {
+  start_at: number;
+  end_at: number;
+  api_key_id: string;
+  api_key_name: string;
+  request_count: number;
+  success_count: number;
+  error_count: number;
+  total_input_tokens: number;
+  total_output_tokens: number;
+  total_cache_read_tokens: number;
+  avg_duration_ms: number;
+  avg_first_token_ms?: number | null;
+  last_used_at?: number | null;
+  model_routes: ApiKeyModelRouteStats[];
+}
+
 export interface TestResult {
   success: boolean;
   latency_ms: number;
@@ -443,6 +475,8 @@ export interface LogQuery {
   offset?: number;
   provider?: string;
   model?: string;
+  client_model?: string;
+  upstream_model?: string;
   status_min?: number;
   status_max?: number;
   api_key?: string;

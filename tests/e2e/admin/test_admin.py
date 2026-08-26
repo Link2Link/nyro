@@ -212,3 +212,26 @@ def test_stats_overview_incremented(admin_env: dict[str, str]) -> None:
         right["bucket_start"] - left["bucket_start"] == 15 * 60 * 1000
         for left, right in zip(points, points[1:])
     )
+
+    status, resp = http_request(
+        "GET",
+        f"{admin_env['admin']}/api/v1/stats/api-keys/{api_key['id']}?hours=24",
+        headers=admin_env["auth"],
+    )
+    assert status == 200
+    detail = resp.get("data", {})
+    assert detail.get("api_key_id") == api_key["id"]
+    assert detail.get("api_key_name") == "test-key-stats"
+    assert "key" not in detail
+    assert "token" not in detail
+    assert detail.get("request_count", 0) >= 1
+    assert detail.get("success_count", 0) >= 1
+    assert detail.get("model_routes")
+
+    status, resp = http_request(
+        "GET",
+        f"{admin_env['admin']}/api/v1/stats/api-keys/{api_key['id']}?hours=12",
+        headers=admin_env["auth"],
+    )
+    assert status == 400
+    assert "hours must be one of" in resp.get("error", "")
