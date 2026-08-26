@@ -161,11 +161,51 @@ impl AdminService {
         &self,
         hours: Option<i32>,
     ) -> anyhow::Result<Vec<ProviderStats>> {
-        self.gw
+        let mut stats = self
+            .gw
             .storage
             .logs()
             .stats_by_provider(Self::normalize_hours(hours).map(i64::from))
-            .await
+            .await?;
+        let providers: HashMap<_, _> = self
+            .gw
+            .storage
+            .providers()
+            .list()
+            .await?
+            .into_iter()
+            .map(|provider| (provider.id.clone(), provider))
+            .collect();
+        for item in &mut stats {
+            if let Some(provider) = providers.get(&item.provider_id) {
+                item.provider.clone_from(&provider.name);
+                item.provider_icon = provider.preset_key.clone().or(provider.vendor.clone());
+                item.provider_protocol = Some(provider.protocol.clone());
+            }
+        }
+        Ok(stats)
+    }
+
+    pub async fn get_provider_usage_detail(
+        &self,
+        provider_id: &str,
+        hours: Option<i32>,
+    ) -> anyhow::Result<ProviderUsageDetail> {
+        let hours = normalize_detail_hours(hours)?;
+        let end_at = Utc::now().timestamp_millis();
+        let start_at = end_at - i64::from(hours) * MILLIS_PER_HOUR;
+        let mut detail = self
+            .gw
+            .storage
+            .logs()
+            .provider_usage_detail(provider_id, start_at, end_at)
+            .await?;
+        if let Some(provider) = self.gw.storage.providers().get(provider_id).await? {
+            detail.provider_name = provider.name;
+            detail.provider_icon = provider.preset_key.or(provider.vendor);
+            detail.provider_protocol = Some(provider.protocol);
+        }
+        Ok(detail)
     }
 
     pub async fn get_stats_by_api_key(

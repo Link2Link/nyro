@@ -218,6 +218,13 @@ function resolveHTTP(cmd: string, args?: Record<string, unknown>): HTTPMapping {
         url: `${base}/stats/providers${hours != null ? `?hours=${hours}` : ""}`,
       };
     }
+    case "get_provider_usage_detail": {
+      const hours = args?.hours;
+      return {
+        method: "GET",
+        url: `${base}/stats/providers/${encodeURIComponent(String(args?.id ?? ""))}${hours != null ? `?hours=${hours}` : ""}`,
+      };
+    }
     case "get_stats_by_api_key": {
       const hours = args?.hours;
       return {

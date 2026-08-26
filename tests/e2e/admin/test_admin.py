@@ -235,3 +235,41 @@ def test_stats_overview_incremented(admin_env: dict[str, str]) -> None:
     )
     assert status == 400
     assert "hours must be one of" in resp.get("error", "")
+
+    status, resp = http_request(
+        "GET",
+        f"{admin_env['admin']}/api/v1/stats/providers?hours=24",
+        headers=admin_env["auth"],
+    )
+    assert status == 200
+    provider_stats = resp.get("data", [])
+    assert any(
+        item.get("provider_id") == provider_id and item.get("request_count", 0) >= 1
+        for item in provider_stats
+    )
+
+    status, resp = http_request(
+        "GET",
+        f"{admin_env['admin']}/api/v1/stats/providers/{provider_id}?hours=24",
+        headers=admin_env["auth"],
+    )
+    assert status == 200
+    provider_detail = resp.get("data", {})
+    assert provider_detail.get("provider_id") == provider_id
+    assert provider_detail.get("provider_name") == "test-provider-stats"
+    assert provider_detail.get("request_count", 0) >= 1
+    assert provider_detail.get("success_count", 0) >= 1
+    assert any(
+        model.get("upstream_model") == "gpt-4o-mini"
+        for model in provider_detail.get("models", [])
+    )
+    for sensitive in ("api_key", "token", "access_token", "refresh_token"):
+        assert sensitive not in provider_detail
+
+    status, resp = http_request(
+        "GET",
+        f"{admin_env['admin']}/api/v1/stats/providers/{provider_id}?hours=12",
+        headers=admin_env["auth"],
+    )
+    assert status == 400
+    assert "hours must be one of" in resp.get("error", "")

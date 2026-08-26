@@ -187,12 +187,48 @@ export interface ModelUsageStats {
 }
 
 export interface ProviderStats {
+  provider_id: string;
   provider: string;
+  provider_icon?: string | null;
+  provider_protocol?: string | null;
   request_count: number;
   error_count: number;
   avg_duration_ms: number;
   total_output_tokens: number;
   total_upstream_ms: number;
+}
+
+export interface ProviderModelUsageStats {
+  upstream_model: string;
+  request_count: number;
+  error_count: number;
+  total_input_tokens: number;
+  total_output_tokens: number;
+  total_cache_read_tokens: number;
+  avg_duration_ms: number;
+  avg_first_token_ms?: number | null;
+  total_upstream_ms: number;
+  last_used_at?: number | null;
+}
+
+export interface ProviderUsageDetail {
+  start_at: number;
+  end_at: number;
+  provider_id: string;
+  provider_name: string;
+  provider_icon?: string | null;
+  provider_protocol?: string | null;
+  request_count: number;
+  success_count: number;
+  error_count: number;
+  total_input_tokens: number;
+  total_output_tokens: number;
+  total_cache_read_tokens: number;
+  avg_duration_ms: number;
+  avg_first_token_ms?: number | null;
+  total_upstream_ms: number;
+  last_used_at?: number | null;
+  models: ProviderModelUsageStats[];
 }
 
 export interface ApiKeyStats {

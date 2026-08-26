@@ -5,6 +5,8 @@ import { backend } from "@/lib/backend";
 import type { StatsOverview, StatsTimeSeries, ModelStats, ProviderStats, ApiKeyStats } from "@/lib/types";
 import { Zap, Clock, Activity, BarChart3 } from "lucide-react";
 import { ApiKeyUsageDialog } from "@/components/api-key-usage-dialog";
+import { ProviderUsageDialog } from "@/components/provider-usage-dialog";
+import { ProviderIcon } from "@/components/ui/provider-icon";
 import { Button } from "@/components/ui/button";
 import { useLocale } from "@/lib/i18n";
 import { formatLocalBucketLabel, formatLocalBucketRange, formatLogTime, formatTps } from "@/lib/format";
@@ -42,9 +44,13 @@ export default function StatsPage() {
 
   const [hours, setHours] = useState(24);
   const [apiKeyDialog, setApiKeyDialog] = useState<{ open: boolean; apiKeyId: string | null }>({ open: false, apiKeyId: null });
+  const [providerDialog, setProviderDialog] = useState<{ open: boolean; providerId: string | null }>({ open: false, providerId: null });
 
   const openApiKeyDialog = (apiKeyId: string | null = null) => {
     setApiKeyDialog({ open: true, apiKeyId });
+  };
+  const openProviderDialog = (providerId: string | null = null) => {
+    setProviderDialog({ open: true, providerId });
   };
 
   const { data: overview } = useQuery<StatsOverview>({
@@ -283,7 +289,13 @@ export default function StatsPage() {
       </div>
 
       <div className="glass rounded-2xl p-6">
-        <h3 className="mb-4 text-sm font-semibold text-slate-800">{isZh ? "提供商分布" : "Provider Breakdown"}</h3>
+        <div className="mb-4 flex items-center justify-between gap-3">
+          <h3 className="text-sm font-semibold text-slate-800">{isZh ? "提供商分布" : "Provider Breakdown"}</h3>
+          <Button variant="outline" size="sm" className="h-8 gap-1.5" onClick={() => openProviderDialog()}>
+            <BarChart3 className="h-4 w-4" />
+            {isZh ? "查看详情" : "View Details"}
+          </Button>
+        </div>
         <div className="overflow-hidden rounded-xl border border-white/70 bg-white/50">
           <table className="w-full text-sm">
             <thead className="bg-white/70 text-slate-500">
@@ -305,8 +317,25 @@ export default function StatsPage() {
                   ? p.total_output_tokens / (p.total_upstream_ms / 1000)
                   : null;
                 return (
-                  <tr key={p.provider} className="border-t border-white/70 text-slate-700">
-                    <td className="px-4 py-2.5 font-medium">{p.provider}</td>
+                  <tr
+                    key={p.provider_id}
+                    role="button"
+                    tabIndex={0}
+                    onClick={() => openProviderDialog(p.provider_id)}
+                    onKeyDown={(event) => {
+                      if (event.key === "Enter" || event.key === " ") {
+                        event.preventDefault();
+                        openProviderDialog(p.provider_id);
+                      }
+                    }}
+                    className="cursor-pointer border-t border-white/70 text-slate-700 outline-none transition-colors hover:bg-blue-50/50 focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-blue-500"
+                  >
+                    <td className="px-4 py-2.5 font-medium">
+                      <div className="flex min-w-0 items-center gap-2">
+                        <ProviderIcon iconKey={p.provider_icon ?? undefined} name={p.provider} protocol={p.provider_protocol ?? undefined} size={24} />
+                        <span className="truncate" title={p.provider}>{p.provider}</span>
+                      </div>
+                    </td>
                     <td className="px-4 py-2.5 text-right">{fmt(p.request_count)}</td>
                     <td className="px-4 py-2.5 text-right text-red-500">{p.error_count}</td>
                     <td className="px-4 py-2.5 text-right">
@@ -389,6 +418,13 @@ export default function StatsPage() {
           </table>
         </div>
       </div>
+
+      <ProviderUsageDialog
+        open={providerDialog.open}
+        onOpenChange={(open) => setProviderDialog((current) => ({ ...current, open }))}
+        initialHours={hours}
+        initialProviderId={providerDialog.providerId}
+      />
 
       <ApiKeyUsageDialog
         open={apiKeyDialog.open}

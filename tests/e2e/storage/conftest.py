@@ -260,23 +260,31 @@ def build_harness(work_dir: Path) -> None:
             let body: serde_json::Value = ok.json().await?;
             ensure!(body["choices"][0]["message"]["content"].as_str() == Some("ok"), "content mismatch");
 
-            // The detail endpoint must retain the latest logged display name even
-            // after the configured key is deleted and can no longer overlay it.
+            // Detail endpoints must retain latest logged names after configured
+            // identities are deleted and can no longer overlay those snapshots.
             admin.delete_api_key(&api_key.id).await?;
+            admin.delete_model(&route.id).await?;
+            admin.delete_provider(&provider.id).await?;
             ensure!(admin.list_api_keys().await?.is_empty(), "api key deletion");
+            ensure!(admin.list_models().await?.is_empty(), "model deletion");
+            ensure!(admin.list_providers().await?.is_empty(), "provider deletion");
 
             let mut logs_total = 0i64;
             let mut stats_requests = 0i64;
             let mut key_detail_requests = 0i64;
+            let mut provider_detail_requests = 0i64;
             for _ in 0..20 {
                 let logs = admin.query_logs(LogQuery { limit: Some(10), offset: Some(0), ..Default::default() }).await?;
                 let stats = admin.get_stats_overview(None).await?;
                 let series = admin.get_stats_timeseries(Some(6)).await?;
                 let key_stats = admin.get_stats_by_api_key(Some(6)).await?;
                 let key_detail = admin.get_api_key_usage_detail(&api_key.id, Some(6)).await?;
+                let provider_stats = admin.get_stats_by_provider(Some(6)).await?;
+                let provider_detail = admin.get_provider_usage_detail(&provider.id, Some(6)).await?;
                 logs_total = logs.total;
                 stats_requests = stats.total_requests;
                 key_detail_requests = key_detail.request_count;
+                provider_detail_requests = provider_detail.request_count;
                 let series_requests: i64 = series.points.iter().map(|point| point.request_count).sum();
                 let series_input_tokens: i64 = series.points.iter().map(|point| point.total_input_tokens).sum();
                 let series_output_tokens: i64 = series.points.iter().map(|point| point.total_output_tokens).sum();
@@ -285,6 +293,7 @@ def build_harness(work_dir: Path) -> None:
                     && series.has_data
                     && series_requests >= 1
                     && key_detail_requests >= 1
+                    && provider_detail_requests >= 1
                 {
                     ensure!(series.bucket_minutes == 5, "6h series bucket size");
                     ensure!(series_input_tokens >= 3, "series input token total");
@@ -294,10 +303,15 @@ def build_harness(work_dir: Path) -> None:
                     ensure!(key_detail.api_key_name == format!("{backend}-e2e-key"), "api-key detail name");
                     ensure!(key_detail.success_count >= 1, "api-key detail success count");
                     ensure!(!key_detail.model_routes.is_empty(), "api-key model routes");
+                    ensure!(provider_stats.iter().any(|item| item.provider_id == provider.id && item.request_count >= 1), "provider aggregate missing");
+                    ensure!(provider_detail.provider_name == format!("{backend}-e2e-provider"), "provider detail name");
+                    ensure!(provider_detail.success_count >= 1, "provider detail success count");
+                    ensure!(provider_detail.models.iter().any(|item| item.upstream_model == "gpt-4o-mini"), "provider model aggregate missing");
                     println!("backend={backend}");
                     println!("logs_total={logs_total}");
                     println!("stats_total_requests={stats_requests}");
                     println!("key_detail_requests={key_detail_requests}");
+                    println!("provider_detail_requests={provider_detail_requests}");
                     println!("timeseries_bucket_minutes={}", series.bucket_minutes);
                     println!("proxy_status_ok=200");
                     println!("proxy_status_no_key=401");
@@ -305,7 +319,7 @@ def build_harness(work_dir: Path) -> None:
                 }
                 tokio::time::sleep(Duration::from_millis(200)).await;
             }
-            anyhow::bail!("log/stat timeout: logs={logs_total} requests={stats_requests} key_detail={key_detail_requests}");
+            anyhow::bail!("log/stat timeout: logs={logs_total} requests={stats_requests} key_detail={key_detail_requests} provider_detail={provider_detail_requests}");
         }
         """
     ).strip() + "\n"

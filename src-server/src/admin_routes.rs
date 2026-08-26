@@ -137,6 +137,7 @@ pub fn create_router(gateway: Gateway, admin_token: Option<String>) -> Router {
         .route("/stats/timeseries", get(stats_timeseries))
         .route("/stats/models", get(stats_by_model))
         .route("/stats/providers", get(stats_by_provider))
+        .route("/stats/providers/:id", get(provider_usage_detail))
         .route("/stats/api-keys", get(stats_by_api_key))
         .route("/stats/api-keys/:id", get(api_key_usage_detail))
         .route("/settings/:key", get(get_setting).put(set_setting))
@@ -714,6 +715,21 @@ async fn stats_by_provider(
     }
 }
 
+async fn provider_usage_detail(
+    State(gw): State<Gateway>,
+    Path(id): Path<String>,
+    Query(params): Query<StatsRangeParams>,
+) -> impl IntoResponse {
+    match gw
+        .admin()
+        .get_provider_usage_detail(&id, params.hours)
+        .await
+    {
+        Ok(v) => Json(serde_json::json!({ "data": v })).into_response(),
+        Err(e) => stats_detail_error(e),
+    }
+}
+
 async fn stats_by_api_key(
     State(gw): State<Gateway>,
     Query(params): Query<StatsRangeParams>,
@@ -731,16 +747,18 @@ async fn api_key_usage_detail(
 ) -> impl IntoResponse {
     match gw.admin().get_api_key_usage_detail(&id, params.hours).await {
         Ok(v) => Json(serde_json::json!({ "data": v })).into_response(),
-        Err(e) => {
-            let message = e.to_string();
-            let status = if message.starts_with("hours must be one of") {
-                StatusCode::BAD_REQUEST
-            } else {
-                StatusCode::INTERNAL_SERVER_ERROR
-            };
-            (status, Json(serde_json::json!({ "error": message }))).into_response()
-        }
+        Err(e) => stats_detail_error(e),
     }
+}
+
+fn stats_detail_error(e: anyhow::Error) -> axum::response::Response {
+    let message = e.to_string();
+    let status = if message.starts_with("hours must be one of") {
+        StatusCode::BAD_REQUEST
+    } else {
+        StatusCode::INTERNAL_SERVER_ERROR
+    };
+    (status, Json(serde_json::json!({ "error": message }))).into_response()
 }
 
 // ── Settings ──

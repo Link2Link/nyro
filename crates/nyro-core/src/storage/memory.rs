@@ -5,8 +5,9 @@ use tokio::sync::RwLock;
 
 use crate::db::models::{
     ApiKeyStats, ApiKeyUsageDetail, CreateModel, CreateProvider, LogPage, LogQuery, Model,
-    ModelStats, ModelUsageStats, OAuthCredential, Provider, ProviderStats, RequestLog, StatsHourly,
-    StatsOverview, StatsTimeBucket, UpdateModel, UpdateProvider, UpsertOAuthCredential,
+    ModelStats, ModelUsageStats, OAuthCredential, Provider, ProviderStats, ProviderUsageDetail,
+    RequestLog, StatsHourly, StatsOverview, StatsTimeBucket, UpdateModel, UpdateProvider,
+    UpsertOAuthCredential,
 };
 use crate::logging::LogEntry;
 
@@ -269,6 +270,33 @@ impl LogStore for MemoryStorage {
 
     async fn stats_by_provider(&self, _hours: Option<i64>) -> anyhow::Result<Vec<ProviderStats>> {
         Ok(vec![])
+    }
+
+    async fn provider_usage_detail(
+        &self,
+        provider_id: &str,
+        start_at: i64,
+        end_at: i64,
+    ) -> anyhow::Result<ProviderUsageDetail> {
+        Ok(ProviderUsageDetail {
+            start_at,
+            end_at,
+            provider_id: provider_id.to_string(),
+            provider_name: provider_id.to_string(),
+            provider_icon: None,
+            provider_protocol: None,
+            request_count: 0,
+            success_count: 0,
+            error_count: 0,
+            total_input_tokens: 0,
+            total_output_tokens: 0,
+            total_cache_read_tokens: 0,
+            avg_duration_ms: 0.0,
+            avg_first_token_ms: None,
+            total_upstream_ms: 0.0,
+            last_used_at: None,
+            models: Vec::new(),
+        })
     }
 
     async fn stats_by_api_key(&self, _hours: Option<i64>) -> anyhow::Result<Vec<ApiKeyStats>> {

@@ -12,9 +12,10 @@ use crate::db::models::{
     ApiKey, ApiKeyModelRouteStats, ApiKeyStats, ApiKeyUsageDetail, ApiKeyWithBindings,
     CreateApiKey, CreateModel, CreateModelBackend, CreateProvider, CreateProviderProtocolEndpoint,
     LogPage, LogQuery, Model, ModelBackend, ModelStats, ModelUsageStats, ModelUsageTotals,
-    OAuthCredential, Provider, ProviderProtocolEndpoint, ProviderStats, RecentModelPerformance,
-    RequestLog, StatsHourly, StatsOverview, StatsTimeBucket, UpdateApiKey, UpdateModel,
-    UpdateProvider, UpsertOAuthCredential, is_valid_provider_auth_mode,
+    OAuthCredential, Provider, ProviderModelUsageStats, ProviderProtocolEndpoint, ProviderStats,
+    ProviderUsageDetail, RecentModelPerformance, RequestLog, StatsHourly, StatsOverview,
+    StatsTimeBucket, UpdateApiKey, UpdateModel, UpdateProvider, UpsertOAuthCredential,
+    is_valid_provider_auth_mode,
 };
 use crate::logging::LogEntry;
 use crate::storage::traits::{
@@ -1361,20 +1362,61 @@ impl LogStore for SqliteLogStore {
     }
 
     async fn stats_by_provider(&self, hours: Option<i64>) -> anyhow::Result<Vec<ProviderStats>> {
-        if let Some(hours) = hours {
-            Ok(sqlx::query_as::<_, ProviderStats>(
-                "SELECT COALESCE(provider_name, provider_id, '') AS provider, COUNT(*) AS request_count, COALESCE(SUM(CASE WHEN client_status_code >= 400 THEN 1 ELSE 0 END), 0) AS error_count, COALESCE(AVG(latency_total_ms), 0.0) AS avg_duration_ms, COALESCE(SUM(output_tokens), 0) AS total_output_tokens, CAST(COALESCE(SUM(latency_upstream_ms), 0) AS REAL) AS total_upstream_ms FROM request_logs WHERE created_at >= CAST(strftime('%s', 'now', ?) AS INTEGER) * 1000 GROUP BY COALESCE(provider_name, provider_id, '') ORDER BY request_count DESC",
-            )
-            .bind(format!("-{hours} hours"))
-            .fetch_all(&self.pool)
-            .await?)
-        } else {
-            Ok(sqlx::query_as::<_, ProviderStats>(
-                "SELECT COALESCE(provider_name, provider_id, '') AS provider, COUNT(*) AS request_count, COALESCE(SUM(CASE WHEN client_status_code >= 400 THEN 1 ELSE 0 END), 0) AS error_count, COALESCE(AVG(latency_total_ms), 0.0) AS avg_duration_ms, COALESCE(SUM(output_tokens), 0) AS total_output_tokens, CAST(COALESCE(SUM(latency_upstream_ms), 0) AS REAL) AS total_upstream_ms FROM request_logs GROUP BY COALESCE(provider_name, provider_id, '') ORDER BY request_count DESC",
-            )
-            .fetch_all(&self.pool)
-            .await?)
+        let modifier = hours.map(|hours| format!("-{hours} hours"));
+        Ok(sqlx::query_as::<_, ProviderStats>(
+            "WITH aggregated AS (SELECT provider_id, COUNT(*) AS request_count, COALESCE(SUM(CASE WHEN client_status_code >= 400 THEN 1 ELSE 0 END), 0) AS error_count, COALESCE(AVG(latency_total_ms), 0.0) AS avg_duration_ms, COALESCE(SUM(output_tokens), 0) AS total_output_tokens, CAST(COALESCE(SUM(latency_upstream_ms), 0) AS REAL) AS total_upstream_ms FROM request_logs WHERE provider_id IS NOT NULL AND TRIM(provider_id) <> '' AND (? IS NULL OR created_at >= CAST(strftime('%s', 'now', ?) AS INTEGER) * 1000) GROUP BY provider_id) SELECT a.provider_id, COALESCE((SELECT NULLIF(TRIM(r.provider_name), '') FROM request_logs r WHERE r.provider_id = a.provider_id AND NULLIF(TRIM(r.provider_name), '') IS NOT NULL ORDER BY r.created_at DESC, r.id DESC LIMIT 1), a.provider_id) AS provider, NULL AS provider_icon, NULL AS provider_protocol, a.request_count, a.error_count, a.avg_duration_ms, a.total_output_tokens, a.total_upstream_ms FROM aggregated a ORDER BY a.request_count DESC, a.provider_id ASC",
+        )
+        .bind(modifier.as_deref())
+        .bind(modifier.as_deref())
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    async fn provider_usage_detail(
+        &self,
+        provider_id: &str,
+        start_at: i64,
+        end_at: i64,
+    ) -> anyhow::Result<ProviderUsageDetail> {
+        #[derive(sqlx::FromRow)]
+        struct SummaryRow {
+            provider_name: String,
+            request_count: i64,
+            success_count: i64,
+            error_count: i64,
+            total_input_tokens: i64,
+            total_output_tokens: i64,
+            total_cache_read_tokens: i64,
+            avg_duration_ms: f64,
+            avg_first_token_ms: Option<f64>,
+            total_upstream_ms: f64,
+            last_used_at: Option<i64>,
         }
+        let summary = sqlx::query_as::<_, SummaryRow>(
+            "SELECT COALESCE((SELECT NULLIF(TRIM(r.provider_name), '') FROM request_logs r WHERE r.provider_id = ? AND NULLIF(TRIM(r.provider_name), '') IS NOT NULL ORDER BY r.created_at DESC, r.id DESC LIMIT 1), ?) AS provider_name, COUNT(*) AS request_count, COALESCE(SUM(CASE WHEN client_status_code >= 200 AND client_status_code < 300 THEN 1 ELSE 0 END), 0) AS success_count, COALESCE(SUM(CASE WHEN client_status_code >= 400 THEN 1 ELSE 0 END), 0) AS error_count, COALESCE(SUM(input_tokens), 0) AS total_input_tokens, COALESCE(SUM(output_tokens), 0) AS total_output_tokens, COALESCE(SUM(cache_read_tokens), 0) AS total_cache_read_tokens, COALESCE(AVG(latency_total_ms), 0.0) AS avg_duration_ms, AVG(CASE WHEN stream_first_chunk_ms >= 0 THEN stream_first_chunk_ms END) AS avg_first_token_ms, CAST(COALESCE(SUM(latency_upstream_ms), 0) AS REAL) AS total_upstream_ms, MAX(created_at) AS last_used_at FROM request_logs WHERE provider_id = ? AND created_at >= ? AND created_at <= ?",
+        ).bind(provider_id).bind(provider_id).bind(provider_id).bind(start_at).bind(end_at).fetch_one(&self.pool).await?;
+        let models = sqlx::query_as::<_, ProviderModelUsageStats>(
+            "SELECT COALESCE(upstream_model, '') AS upstream_model, COUNT(*) AS request_count, COALESCE(SUM(CASE WHEN client_status_code >= 400 THEN 1 ELSE 0 END), 0) AS error_count, COALESCE(SUM(input_tokens), 0) AS total_input_tokens, COALESCE(SUM(output_tokens), 0) AS total_output_tokens, COALESCE(SUM(cache_read_tokens), 0) AS total_cache_read_tokens, COALESCE(AVG(latency_total_ms), 0.0) AS avg_duration_ms, AVG(CASE WHEN stream_first_chunk_ms >= 0 THEN stream_first_chunk_ms END) AS avg_first_token_ms, CAST(COALESCE(SUM(latency_upstream_ms), 0) AS REAL) AS total_upstream_ms, MAX(created_at) AS last_used_at FROM request_logs WHERE provider_id = ? AND created_at >= ? AND created_at <= ? GROUP BY COALESCE(upstream_model, '') ORDER BY request_count DESC, upstream_model ASC",
+        ).bind(provider_id).bind(start_at).bind(end_at).fetch_all(&self.pool).await?;
+        Ok(ProviderUsageDetail {
+            start_at,
+            end_at,
+            provider_id: provider_id.to_string(),
+            provider_name: summary.provider_name,
+            provider_icon: None,
+            provider_protocol: None,
+            request_count: summary.request_count,
+            success_count: summary.success_count,
+            error_count: summary.error_count,
+            total_input_tokens: summary.total_input_tokens,
+            total_output_tokens: summary.total_output_tokens,
+            total_cache_read_tokens: summary.total_cache_read_tokens,
+            avg_duration_ms: summary.avg_duration_ms,
+            avg_first_token_ms: summary.avg_first_token_ms,
+            total_upstream_ms: summary.total_upstream_ms,
+            last_used_at: summary.last_used_at,
+            models,
+        })
     }
 
     async fn stats_by_api_key(&self, hours: Option<i64>) -> anyhow::Result<Vec<ApiKeyStats>> {

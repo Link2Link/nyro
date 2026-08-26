@@ -6,8 +6,8 @@ use async_trait::async_trait;
 use crate::db::models::{
     ApiKeyStats, ApiKeyUsageDetail, ApiKeyWithBindings, CreateApiKey, CreateModel,
     CreateModelBackend, CreateProvider, LogPage, LogQuery, Model, ModelBackend, ModelStats,
-    ModelUsageStats, OAuthCredential, Provider, ProviderStats, RequestLog, StatsHourly,
-    StatsOverview, StatsTimeBucket, UpdateApiKey, UpdateModel, UpdateProvider,
+    ModelUsageStats, OAuthCredential, Provider, ProviderStats, ProviderUsageDetail, RequestLog,
+    StatsHourly, StatsOverview, StatsTimeBucket, UpdateApiKey, UpdateModel, UpdateProvider,
     UpsertOAuthCredential,
 };
 use crate::logging::LogEntry;
@@ -157,6 +157,12 @@ pub trait LogStore: Send + Sync {
         upstream_model: &str,
     ) -> anyhow::Result<ModelUsageStats>;
     async fn stats_by_provider(&self, hours: Option<i64>) -> anyhow::Result<Vec<ProviderStats>>;
+    async fn provider_usage_detail(
+        &self,
+        provider_id: &str,
+        start_at: i64,
+        end_at: i64,
+    ) -> anyhow::Result<ProviderUsageDetail>;
     async fn stats_by_api_key(&self, hours: Option<i64>) -> anyhow::Result<Vec<ApiKeyStats>>;
     async fn api_key_usage_detail(
         &self,

@@ -30,6 +30,7 @@ def test_storage_backend_equivalence(storage_runtime: dict[str, object], backend
     assert "logs_total=" in output
     assert "stats_total_requests=" in output
     assert "key_detail_requests=" in output
+    assert "provider_detail_requests=" in output
     assert "timeseries_bucket_minutes=5" in output
     assert "proxy_status_ok=200" in output
     assert "proxy_status_no_key=401" in output

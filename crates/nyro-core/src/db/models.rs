@@ -736,12 +736,56 @@ mod model_usage_stats_tests {
 
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
 pub struct ProviderStats {
+    #[serde(default)]
+    #[sqlx(default)]
+    pub provider_id: String,
     pub provider: String,
+    #[serde(default)]
+    #[sqlx(default)]
+    pub provider_icon: Option<String>,
+    #[serde(default)]
+    #[sqlx(default)]
+    pub provider_protocol: Option<String>,
     pub request_count: i64,
     pub error_count: i64,
     pub avg_duration_ms: f64,
     pub total_output_tokens: i64,
     pub total_upstream_ms: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderUsageDetail {
+    pub start_at: i64,
+    pub end_at: i64,
+    pub provider_id: String,
+    pub provider_name: String,
+    pub provider_icon: Option<String>,
+    pub provider_protocol: Option<String>,
+    pub request_count: i64,
+    pub success_count: i64,
+    pub error_count: i64,
+    pub total_input_tokens: i64,
+    pub total_output_tokens: i64,
+    pub total_cache_read_tokens: i64,
+    pub avg_duration_ms: f64,
+    pub avg_first_token_ms: Option<f64>,
+    pub total_upstream_ms: f64,
+    pub last_used_at: Option<i64>,
+    pub models: Vec<ProviderModelUsageStats>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct ProviderModelUsageStats {
+    pub upstream_model: String,
+    pub request_count: i64,
+    pub error_count: i64,
+    pub total_input_tokens: i64,
+    pub total_output_tokens: i64,
+    pub total_cache_read_tokens: i64,
+    pub avg_duration_ms: f64,
+    pub avg_first_token_ms: Option<f64>,
+    pub total_upstream_ms: f64,
+    pub last_used_at: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
