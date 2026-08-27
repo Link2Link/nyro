@@ -308,7 +308,7 @@ pub(crate) async fn process(
             let call = caption::caption_with_failover(
                 gw,
                 &usable,
-                cfg.helper_disable_thinking,
+                cfg.helper_thinking.as_deref(),
                 &job.source,
                 &job.prompt,
                 cfg.caption_max_tokens,

@@ -382,9 +382,10 @@ async fn helper_backends_matching_route_targets_are_skipped() {
 }
 
 #[tokio::test]
-async fn glm_family_helper_gets_thinking_disabled() {
+async fn glm_family_helper_gets_low_thinking() {
     // GLM-family provider (by vendor field): the caption request must carry
-    // thinking disabled so hybrid reasoning cannot starve `content`.
+    // a bounded thinking level so hybrid reasoning cannot starve `content`,
+    // while a light reasoning pass over the image is kept.
     let (base_url, calls) = spawn_helper(Some("a blue circle")).await;
     let mut provider = provider_row("glm-p", &base_url);
     provider.vendor = Some("zhipuai".to_string());
@@ -398,7 +399,7 @@ async fn glm_family_helper_gets_thinking_disabled() {
         let calls = calls.lock().unwrap();
         calls[0]["thinking"]["type"].clone()
     };
-    assert_eq!(thinking_type, "disabled");
+    assert_eq!(thinking_type, "low");
 
     // Non-GLM provider: no thinking field injected.
     let (base2, calls2) = spawn_helper(Some("plain caption")).await;

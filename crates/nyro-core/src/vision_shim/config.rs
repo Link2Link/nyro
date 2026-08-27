@@ -63,11 +63,13 @@ pub struct VisionShimConfig {
     /// spend this budget on thinking first, so it must cover the chain of
     /// thought plus the caption itself.
     pub caption_max_tokens: u32,
-    /// Whether to request the helper with thinking disabled
-    /// (`thinking: {"type":"disabled"}`), which GLM-family models accept.
-    /// `None` (default) auto-detects: disabled for GLM-family vendors
-    /// (zhipuai / zai / bigmodel / z.ai), left alone elsewhere.
-    pub helper_disable_thinking: Option<bool>,
+    /// `thinking.type` value injected into helper caption requests.
+    /// `None` (default) auto-detects: `"low"` for GLM-family vendors
+    /// (zhipuai / zai / bigmodel / z.ai — keeps a light reasoning pass over
+    /// the image), no `thinking` field elsewhere. An explicit value (e.g.
+    /// `"disabled"`, `"low"`, `"enabled"`) is injected for every helper
+    /// provider; an empty string suppresses the field.
+    pub helper_thinking: Option<String>,
     /// Failure policy for helper errors.
     pub on_failure: VisionShimFailureMode,
     /// Optional full override of the caption prompt template. `{question}`
@@ -96,8 +98,8 @@ impl Default for VisionShimConfig {
             max_images: 8,
             max_image_bytes: 10 * 1024 * 1024,
             cache_ttl_secs: 24 * 60 * 60,
-            caption_max_tokens: 2048,
-            helper_disable_thinking: None,
+            caption_max_tokens: 64 * 1024,
+            helper_thinking: None,
             on_failure: VisionShimFailureMode::default(),
             prompt_override: None,
         }
@@ -206,7 +208,7 @@ mod tests {
         assert_eq!(cfg.max_images, 8);
         assert_eq!(cfg.max_image_bytes, 10 * 1024 * 1024);
         assert_eq!(cfg.cache_ttl_secs, 86_400);
-        assert_eq!(cfg.caption_max_tokens, 2048);
+        assert_eq!(cfg.caption_max_tokens, 64 * 1024);
         assert_eq!(cfg.on_failure, VisionShimFailureMode::Placeholder);
         assert!(cfg.is_enabled());
     }

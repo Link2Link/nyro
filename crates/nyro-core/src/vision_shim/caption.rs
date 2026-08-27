@@ -42,7 +42,7 @@ impl CaptionCall {
 pub(crate) async fn caption_with_failover(
     gw: &Gateway,
     backends: &[(HelperBackend, Provider)],
-    disable_thinking: Option<bool>,
+    thinking_override: Option<&str>,
     source: &MediaSource,
     prompt: &str,
     max_tokens: u32,
@@ -50,17 +50,21 @@ pub(crate) async fn caption_with_failover(
 ) -> CaptionCall {
     let mut errors: Vec<String> = Vec::new();
     for (helper, provider) in backends {
-        let thinking_off = disable_thinking.unwrap_or_else(|| {
+        // Explicit override applies to every backend; auto mode keeps a
+        // light thinking pass ("low") for GLM-family helpers and leaves
+        // other vendors' requests untouched.
+        let thinking = thinking_override.map(str::to_string).or_else(|| {
             super::config::provider_is_glm_family(
                 provider.vendor.as_deref().unwrap_or(""),
                 &provider.base_url,
             )
+            .then(|| "low".to_string())
         });
         let call = caption_image(
             gw,
             provider,
             &helper.model,
-            thinking_off,
+            thinking.as_deref(),
             source,
             prompt,
             max_tokens,
@@ -90,16 +94,16 @@ pub(crate) async fn caption_with_failover(
 
 /// Transcribe one image via one helper backend.
 ///
-/// `thinking_off` adds `thinking: {"type":"disabled"}` — GLM-family hybrid
-/// models accept it, and captions do not benefit from chain-of-thought:
-/// thinking only burns the output budget (starving `message.content` to
-/// empty when it exceeds `max_tokens`) and multiplies latency.
+/// `thinking` is the `thinking.type` value to inject (GLM-family hybrid
+/// models): `"low"` keeps a light reasoning pass over the image, while the
+/// budget (`max_tokens`) must still cover thinking plus the caption — an
+/// unbounded chain of thought starves `message.content` to empty.
 #[allow(clippy::too_many_arguments)]
 async fn caption_image(
     gw: &Gateway,
     provider: &Provider,
     model: &str,
-    thinking_off: bool,
+    thinking: Option<&str>,
     source: &MediaSource,
     prompt: &str,
     max_tokens: u32,
@@ -128,8 +132,8 @@ async fn caption_image(
         }]
     });
 
-    if thinking_off {
-        body["thinking"] = serde_json::json!({ "type": "disabled" });
+    if let Some(thinking) = thinking.filter(|value| !value.trim().is_empty()) {
+        body["thinking"] = serde_json::json!({ "type": thinking.trim() });
     }
 
     let mut builder = client.post(&endpoint).timeout(timeout);
