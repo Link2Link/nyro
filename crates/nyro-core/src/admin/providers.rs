@@ -1528,26 +1528,29 @@ impl AdminService {
         provider: &Provider,
         model: &str,
     ) -> anyhow::Result<ModelCapabilities> {
-        match preset_capabilities_source(provider) {
+        let mut caps = match preset_capabilities_source(provider) {
             CapabilitiesSource::ModelsDev(vendor_key) => {
                 let matched =
                     lookup_models_dev_capability(&self.gw.config.data_dir, vendor_key, model);
                 matched.ok_or_else(|| {
                     anyhow::anyhow!("no matched model capabilities found in models.dev")
-                })
+                })?
             }
             CapabilitiesSource::Http(url) => {
                 if is_ollama_show_endpoint(url) {
                     self.query_ollama_show_capability(url, model).await
                 } else {
                     self.query_http_capability(provider, url, model).await
-                }
+                }?
             }
-            CapabilitiesSource::Auto => Ok(fuzzy_match_models_dev(&self.gw.config.data_dir, model)
+            CapabilitiesSource::Auto => fuzzy_match_models_dev(&self.gw.config.data_dir, model)
                 .ok_or_else(|| {
                     anyhow::anyhow!("no matched model capabilities found in auto mode")
-                })?),
-        }
+                })?,
+        };
+        // bigmodel.cn（人民币计费站）官方牌价覆盖目录 USD 折算。
+        super::model_catalog::apply_bigmodel_cn_official_pricing(&mut caps, &provider.base_url);
+        Ok(caps)
     }
 
     async fn query_http_capability(

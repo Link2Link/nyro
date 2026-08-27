@@ -80,10 +80,11 @@ function formatTokens(value?: number | null) {
   return String(value);
 }
 
-function formatPrice(value?: number | null) {
+function formatPrice(value?: number | null, currency?: string | null) {
   if (value == null || !Number.isFinite(value)) return null;
+  const symbol = currency === "CNY" ? "¥" : "$";
   const digits = value > 0 && value < 0.01 ? 4 : value < 1 ? 3 : 2;
-  return "$" + value.toFixed(digits) + " / 1M";
+  return symbol + value.toFixed(digits) + " / 1M";
 }
 
 function formatTimestamp(value: string, locale: string) {
@@ -211,8 +212,9 @@ function CapabilityDetail({ provider, model, isZh }: { provider: Provider; model
   const stats = usage.data;
   const context = formatTokens(caps?.context_window);
   const output = formatTokens(caps?.output_max_tokens);
-  const inputPrice = formatPrice(caps?.input_cost);
-  const outputPrice = formatPrice(caps?.output_cost);
+  const inputPrice = formatPrice(caps?.input_cost, caps?.currency);
+  const outputPrice = formatPrice(caps?.output_cost, caps?.currency);
+  const cacheReadPrice = formatPrice(caps?.cache_read_cost, caps?.currency);
 
   return (
     <div>
@@ -311,6 +313,7 @@ function CapabilityDetail({ provider, model, isZh }: { provider: Provider; model
             <div className="mt-1 space-y-1 text-xs text-slate-600">
               <div>{isZh ? "输入" : "Input"}: {inputPrice ?? "–"}</div>
               <div>{isZh ? "输出" : "Output"}: {outputPrice ?? "–"}</div>
+              <div>{isZh ? "缓存命中" : "Cached input"}: {cacheReadPrice ?? "–"}</div>
             </div>
           </div>
         </div>

@@ -164,14 +164,14 @@ pub(crate) fn clamp_volcengine_ark_effort(body: &mut Value) {
     clamp_off_effort_to_low(body);
 }
 
-/// 官方三档（low/high/max）之外的档位窄化：单调向下取最近合法档
-/// （等距取低档，与 off→low 的「最小合法档」成本哲学一致）：
-/// minimal→low；medium 与 low/high 等距，取 low；xhigh 与 high/max
-/// 等距，取 high。返回 None 表示无需改写。
+/// 官方三档（low/high/max）之外的档位窄化：minimal 向下取最近合法档
+/// `low`；medium/xhigh 按「向保推理质量一侧就近、持平取高档」收拢——
+/// medium 归入 `high` 而非 `low`，xhigh 与 high/max 等距取 `high`。
+/// 返回 None 表示无需改写。
 fn narrow_to_doc_tiers(effort: &str) -> Option<&'static str> {
     match effort.trim().to_ascii_lowercase().as_str() {
-        "minimal" | "medium" => Some("low"),
-        "xhigh" => Some("high"),
+        "minimal" => Some("low"),
+        "medium" | "xhigh" => Some("high"),
         _ => None,
     }
 }
@@ -351,10 +351,10 @@ mod tests {
             assert_eq!(nested["reasoning"]["effort"], raw);
         }
 
-        // 官方三档之外的已知档位单调向下窄化：minimal→low、medium→low、
-        // xhigh→high（与 low/high、high/max 等距，等距取低控成本）。
+        // 官方三档之外的已知档位窄化：minimal→low；medium/xhigh 向保推理
+        // 质量一侧收拢——medium 归 high，xhigh 与 high/max 等距取 high。
         assert_eq!(narrow_to_doc_tiers("minimal"), Some("low"));
-        assert_eq!(narrow_to_doc_tiers("medium"), Some("low"));
+        assert_eq!(narrow_to_doc_tiers("medium"), Some("high"));
         assert_eq!(narrow_to_doc_tiers("xhigh"), Some("high"));
         let mut body = json!({"reasoning_effort": "XHIGH", "model": "glm-5.3"});
         clamp_thinking_mandatory_effort(&mut body);

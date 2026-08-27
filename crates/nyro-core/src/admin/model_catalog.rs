@@ -272,6 +272,8 @@ pub(super) fn parse_ollama_capability(json: &Value, model: &str) -> ModelCapabil
         output_modalities: vec!["text".to_string()],
         input_cost: Some(0.0),
         output_cost: Some(0.0),
+        cache_read_cost: None,
+        currency: None,
     }
 }
 
@@ -569,6 +571,11 @@ pub(super) fn parse_http_capability(json: &Value, model: &str) -> Option<ModelCa
         .and_then(Value::as_object)
         .and_then(|obj| obj.get("completion"))
         .and_then(parse_maybe_price_per_token);
+    let cache_read_cost = item
+        .get("pricing")
+        .and_then(Value::as_object)
+        .and_then(|obj| obj.get("cache"))
+        .and_then(parse_maybe_price_per_token);
     let tool_call = supported_parameters
         .iter()
         .any(|v| v.as_str() == Some("tools"));
@@ -591,7 +598,55 @@ pub(super) fn parse_http_capability(json: &Value, model: &str) -> Option<ModelCa
         output_modalities,
         input_cost,
         output_cost,
+        cache_read_cost,
+        currency: Some("USD".to_string()),
     })
+}
+
+/// bigmodel.cn（open.bigmodel.cn，人民币计费站）官方牌价，单位元/1M tokens。
+/// 来源：GLM-5.3 / GLM-5.3-Flash 发布报道（华尔街见闻/晚点，2026-08-26）——
+/// 明示 flash 输入 0.8 元、输出 2.8 元、缓存命中 0.23 元「正好为 GLM-5.3 的
+/// 十分之一」，与 z.ai 全球站 USD 牌价互证；官网定价页 bigmodel.cn/pricing
+/// 为 JS 渲染无法直接抓取。models.dev 的 USD 折算与官方人民币实价存在偏差
+/// （$1.4 ≈ ¥10 vs 官方 ¥8），故对 bigmodel.cn 计费的模型以本表原生 CNY
+/// 价覆盖目录值，避免汇率失真；z.ai（api.z.ai）全球站维持 USD 不受影响。
+const BIGMODEL_CN_OFFICIAL_PRICING_CNY: &[(&str, f64, f64, f64)] = &[
+    // (model id, 输入, 缓存命中, 输出)
+    ("glm-5.3", 8.0, 2.3, 28.0),
+    ("glm-5.3-flash", 0.8, 0.23, 2.8),
+];
+
+/// 按 base_url 域名识别 bigmodel.cn 人民币计费 provider，用官方原生 CNY
+/// 牌价覆盖目录价。前缀匹配要求边界非字母数字（glm-5.3-flash-xxxx 类日期
+/// 变体一并覆盖）；未登记的模型维持目录原值。
+pub(super) fn apply_bigmodel_cn_official_pricing(
+    caps: &mut ModelCapabilities,
+    base_url: &str,
+) {
+    if !base_url.contains("bigmodel.cn") {
+        return;
+    }
+    let needle = caps.model_id.trim().to_ascii_lowercase();
+    // 命中的候选里取最长前缀（最具体者优先）：glm-5.3 的 `-` 边界同样
+    // 放行 glm-5.3-flash，顺序遍历会错拿前缀更短的那个条目的价格。
+    let matched = BIGMODEL_CN_OFFICIAL_PRICING_CNY
+        .iter()
+        .filter(|(name, ..)| {
+            needle.len() >= name.len()
+                && needle[..name.len()].eq_ignore_ascii_case(name)
+                && needle[name.len()..]
+                    .chars()
+                    .next()
+                    .is_none_or(|c| !c.is_ascii_alphanumeric())
+        })
+        .max_by_key(|(name, ..)| name.len());
+    let Some((_, input, cache_read, output)) = matched else {
+        return;
+    };
+    caps.input_cost = Some(*input);
+    caps.cache_read_cost = Some(*cache_read);
+    caps.output_cost = Some(*output);
+    caps.currency = Some("CNY".to_string());
 }
 
 pub(super) fn parse_maybe_price_per_token(value: &Value) -> Option<f64> {
@@ -641,6 +696,7 @@ struct ModelsDevModalities {
 struct ModelsDevCost {
     input: Option<f64>,
     output: Option<f64>,
+    cache_read: Option<f64>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize, Default)]
@@ -679,5 +735,67 @@ fn to_models_dev_capability(vendor_key: &str, model: &ModelsDevModelEntry) -> Mo
         output_modalities,
         input_cost: model.cost.input,
         output_cost: model.cost.output,
+        cache_read_cost: model.cost.cache_read,
+        currency: Some("USD".to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn caps_for(model_id: &str) -> ModelCapabilities {
+        ModelCapabilities {
+            provider: "zhipuai".to_string(),
+            model_id: model_id.to_string(),
+            context_window: 131_072,
+            embedding_length: None,
+            output_max_tokens: None,
+            tool_call: true,
+            reasoning: true,
+            input_modalities: vec!["text".to_string()],
+            output_modalities: vec!["text".to_string()],
+            input_cost: Some(1.4),
+            output_cost: Some(4.4),
+            cache_read_cost: Some(0.26),
+            currency: Some("USD".to_string()),
+        }
+    }
+
+    #[test]
+    fn bigmodel_cn_base_url_overrides_with_native_cny_prices() {
+        let mut caps = caps_for("glm-5.3");
+        apply_bigmodel_cn_official_pricing(&mut caps, "https://open.bigmodel.cn/api/paas/v4");
+        assert_eq!(caps.currency.as_deref(), Some("CNY"));
+        assert_eq!(caps.input_cost, Some(8.0));
+        assert_eq!(caps.cache_read_cost, Some(2.3));
+        assert_eq!(caps.output_cost, Some(28.0));
+    }
+
+    #[test]
+    fn bigmodel_cn_overrides_cover_variant_ids_case_insensitively() {
+        for model in ["GLM-5.3-Flash", "glm-5.3-flash-0901"] {
+            let mut caps = caps_for(model);
+            apply_bigmodel_cn_official_pricing(&mut caps, "https://open.bigmodel.cn/api/v1");
+            assert_eq!(caps.input_cost, Some(0.8));
+            assert_eq!(caps.cache_read_cost, Some(0.23));
+            assert_eq!(caps.output_cost, Some(2.8));
+            assert_eq!(caps.currency.as_deref(), Some("CNY"));
+        }
+    }
+
+    #[test]
+    fn non_bigmodel_and_unregistered_models_keep_catalog_values() {
+        // z.ai 全球站：USD 目录价不受 CNY 表影响。
+        let mut zai = caps_for("glm-5.3");
+        apply_bigmodel_cn_official_pricing(&mut zai, "https://api.z.ai/api/paas/v4");
+        assert_eq!(zai.currency.as_deref(), Some("USD"));
+        assert_eq!(zai.input_cost, Some(1.4));
+
+        // bigmodel.cn 但未登记的模型：原值保留。
+        let mut other = caps_for("glm-4.6");
+        apply_bigmodel_cn_official_pricing(&mut other, "https://open.bigmodel.cn/api/paas/v4");
+        assert_eq!(other.currency.as_deref(), Some("USD"));
+        assert_eq!(other.input_cost, Some(1.4));
     }
 }

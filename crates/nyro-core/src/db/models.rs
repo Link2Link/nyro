@@ -872,6 +872,14 @@ pub struct ModelCapabilities {
     pub output_modalities: Vec<String>,
     pub input_cost: Option<f64>,
     pub output_cost: Option<f64>,
+    /// Cached-input price per 1M tokens, when the upstream catalog
+    /// publishes one (models.dev `cost.cache_read`).
+    #[serde(default)]
+    pub cache_read_cost: Option<f64>,
+    /// Native billing currency of the three price fields (`"CNY"` /
+    /// `"USD"`); `None` keeps the historical USD-only convention.
+    #[serde(default)]
+    pub currency: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

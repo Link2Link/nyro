@@ -300,6 +300,9 @@ export interface ModelCapabilities {
   output_max_tokens?: number | null;
   input_cost?: number | null;
   output_cost?: number | null;
+  cache_read_cost?: number | null;
+  /** Native billing currency of the price fields ("CNY"/"USD"); USD when absent. */
+  currency?: string | null;
   tool_call: boolean;
   reasoning: boolean;
   input_modalities: string[];

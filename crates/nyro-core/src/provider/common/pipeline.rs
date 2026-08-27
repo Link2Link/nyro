@@ -1912,9 +1912,9 @@ async fn passthrough_clamps_off_effort_to_low_for_thinking_mandatory_glm() {
             );
         }
 
-        // 官方三档之外的已知档位：单调向下窄化（minimal→low、medium→low、
-        // xhigh→high，等距取低控成本）。
-        for (raw, expect) in [("minimal", "low"), ("medium", "low"), ("xhigh", "high")] {
+        // 官方三档之外的已知档位：窄化映射（minimal→low；medium/xhigh→high，
+        // 保推理质量取向）。
+        for (raw, expect) in [("minimal", "low"), ("medium", "high"), ("xhigh", "high")] {
             let out = passthrough_run(
                 &FakeApiKeyVendor,
                 serde_json::json!({
