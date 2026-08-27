@@ -61,11 +61,18 @@ async fn spawn_helper(caption: Option<&'static str>) -> (String, Arc<Mutex<Vec<V
 }
 
 fn provider_row(id: &str, base_url: &str) -> Provider {
+    provider_row_with_protocol(id, base_url, "openai-compatible")
+}
+
+/// Production providers created from vendor presets store the canonical
+/// endpoint id ("openai-compatible/chat-completions/v1") rather than the bare
+/// suite name — the shim must accept both storage forms.
+fn provider_row_with_protocol(id: &str, base_url: &str, protocol: &str) -> Provider {
     Provider {
         id: id.to_string(),
         name: "GLM test".to_string(),
         vendor: None,
-        protocol: "openai-compatible".to_string(),
+        protocol: protocol.to_string(),
         base_url: base_url.to_string(),
         protocol_mode: "fixed".to_string(),
         protocol_endpoints: Vec::new(),
@@ -271,4 +278,29 @@ async fn unknown_model_leaves_request_untouched() {
         MessageContent::Blocks(ref blocks) if matches!(blocks[1], ContentBlock::Image { .. })
     ));
     assert!(calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn canonical_endpoint_id_protocol_is_accepted() {
+    let (base_url, calls) = spawn_helper(Some("blue square")).await;
+    let gw = gateway_with(
+        vec![provider_row_with_protocol(
+            "p6",
+            &base_url,
+            "openai-compatible/chat-completions/v1",
+        )],
+        vec![shim_model("p6")],
+    )
+    .await;
+
+    let mut request = image_request("glm-5.3", "aXNzdWU=", "what color?");
+    let stats = vision_shim::apply(&gw, &mut request).await.unwrap();
+
+    assert_eq!(stats.images, 1);
+    assert_eq!(
+        stats.captioned, 1,
+        "canonical endpoint-id protocol must resolve to the OpenAI-compatible suite"
+    );
+    assert!(user_text(&request).contains("[Image 1: blue square]"));
+    assert_eq!(calls.lock().unwrap().len(), 1);
 }

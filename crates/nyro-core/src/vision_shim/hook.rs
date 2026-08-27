@@ -171,10 +171,16 @@ pub(crate) async fn process(
         .flatten()
         .filter(|provider| provider.is_enabled)
         .filter(|provider| {
-            provider
-                .protocol
-                .trim()
-                .eq_ignore_ascii_case("openai-compatible")
+            // The protocol column stores either a bare suite name
+            // ("openai-compatible") or a canonical endpoint id
+            // ("openai-compatible/chat-completions/v1") depending on how the
+            // provider was created — resolve through the registry instead of
+            // string-comparing, so both storage forms are accepted.
+            crate::protocol::registry::ProtocolRegistry::global()
+                .parse_protocol(&provider.protocol)
+                .is_some_and(|protocol| {
+                    protocol == crate::protocol::ids::Protocol::OpenAICompatible
+                })
         });
 
     let Some(provider) = provider else {
