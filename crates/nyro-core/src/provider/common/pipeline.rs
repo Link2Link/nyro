@@ -79,14 +79,34 @@ pub(crate) fn maybe_sanitize_codex_consumer_request(body: &mut Value, provider: 
 ///    与 `encrypted_content`）。回放历史携带裸思维链文本会返回 400
 ///    `array_above_max_length` -> 剥掉非空 `content`。
 /// 2. **无状态回放契约**：`store=false` 时服务端不持久化任何项，回放的
-///    reasoning 项必须携带可解密的 `encrypted_content` 才能重建。多后端
-///    路由把会话中途切到其他 provider 再切回来时，外来 reasoning 项
-///    （中转铸造的 ID、`encrypted_content: null`、纯文本 content）既无法
-///    按 ID 重建（404 `Item with id ... not found`）也过不了 schema 校验
-///    -> 整项剔除（只损失该轮思维链上下文，请求可通过）。客户端显式
-///    `store=true`（依赖服务端状态）时不剔除。
+///    reasoning 项必须携带**本后端可解密**的 `encrypted_content` 才能重建。
+///    多后端路由把会话中途切到其他 provider 再切回来时，外来 reasoning 项
+///    既无法按 ID 重建（404 `Item with id ... not found`）、过不了 schema
+///    校验（400 `array_above_max_length`）、也过不了密文校验 -> 整项剔除
+///    （只损失该轮思维链上下文，请求可通过）。客户端显式 `store=true`
+///    （依赖服务端状态）时不剔除。
+///
+///    外来项判据（任一命中即中转铸造，密文本后端必不可解密）：
+///    - `encrypted_content` 为 null / 空白（中转不透出密文）；
+///    - `id` 非原生形态。codex 消费级后端铸造的 reasoning ID 是 `rs_` +
+///      64 位十六进制；中转方言（时间戳形态 `rs_resp_2026...`、UUID 形态
+///      `rs_a44b4856-06b6-...`）铸造的密文用中转自己的密钥，回放即 400
+///      `invalid_encrypted_content`（线上请求 06fbe5e2，2026-08-27：会话
+///      中途切到 codex 直连后，16 项 null-密文外来项已被剔除，但 13 项带
+///      密文的 UUID 形态项漏过旧判据，首个即被上游拒收）。ID 缺失的项
+///      不在此判据内，维持原有保留行为。
 ///
 /// 原生直通与 IR 转码两条路径转发前都需要执行；非 reasoning 项永不剔除。
+///
+/// codex 消费级后端铸造的 reasoning ID 形态：`rs_` + 64 位十六进制。
+/// 其余形态（时间戳 `rs_resp_2026...`、UUID `rs_<uuid>` 等）皆外来方言。
+fn is_native_codex_reasoning_id(id: &str) -> bool {
+    match id.strip_prefix("rs_") {
+        Some(hex) => hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit()),
+        None => false,
+    }
+}
+
 pub(crate) fn sanitize_codex_reasoning_content(body: &mut Value, provider: &Provider) {
     let is_codex = provider
         .channel
@@ -109,9 +129,17 @@ pub(crate) fn sanitize_codex_reasoning_content(body: &mut Value, provider: &Prov
                 return true;
             }
             // 无 usable encrypted_content 的 reasoning 项在无状态下无法重建。
-            item.get("encrypted_content")
+            let has_encrypted_content = item
+                .get("encrypted_content")
                 .and_then(Value::as_str)
-                .is_some_and(|s| !s.trim().is_empty())
+                .is_some_and(|s| !s.trim().is_empty());
+            // 密文存在但 ID 非原生形态：中转铸造的密文本后端必不可解密
+            // （400 invalid_encrypted_content），同样整项剔除。
+            let foreign_mint = item
+                .get("id")
+                .and_then(Value::as_str)
+                .is_some_and(|id| !is_native_codex_reasoning_id(id));
+            has_encrypted_content && !foreign_mint
         });
     }
     for item in items {
@@ -1300,7 +1328,7 @@ mod tests {
                 {"type": "reasoning", "id": "rs_resp_20260825194117052ba4e951a74c39",
                  "summary": [], "encrypted_content": null,
                  "content": [{"type": "reasoning_text", "text": "foreign"}]},
-                {"type": "reasoning", "id": "rs_033bf81503e4a9e",
+                {"type": "reasoning", "id": "rs_a44b485606b69e5286c89d9d0c1a5d55a44b485606b69e5286c89d9d0c1a5d55",
                  "summary": [], "encrypted_content": "enc-keep"},
                 {"type": "function_call", "id": "fc_call_x", "name": "f", "arguments": "{}"}
             ]
@@ -1308,7 +1336,10 @@ mod tests {
         sanitize_codex_reasoning_content(&mut body, &provider);
         let items = body["input"].as_array().unwrap();
         assert_eq!(items.len(), 3, "foreign reasoning item must be dropped");
-        assert_eq!(items[1]["id"], "rs_033bf81503e4a9e");
+        assert_eq!(
+            items[1]["id"],
+            "rs_a44b485606b69e5286c89d9d0c1a5d55a44b485606b69e5286c89d9d0c1a5d55"
+        );
         assert_eq!(items[1]["encrypted_content"], "enc-keep");
         assert_eq!(
             items[2]["type"], "function_call",
@@ -1356,6 +1387,77 @@ mod tests {
             1,
             "non-codex channels are untouched",
         );
+    }
+
+    /// 密文存在但 ID 非原生形态（中转铸造，UUID 方言 `rs_<uuid>`）：
+    /// codex 消费级后端无法解密，回放即 400 invalid_encrypted_content
+    /// （线上请求 06fbe5e2，2026-08-27）。无状态下同样整项剔除。
+    #[test]
+    fn sanitize_drops_foreign_minted_reasoning_even_with_encrypted_content() {
+        let provider = provider_with_channel("", Some("codex"), false);
+
+        // 线上事故原样数据：UUID 方言 + 带密文 -> 剔除；时间戳方言同理；
+        // 原生 64 位十六进制 ID 与无 ID 项保留；非 reasoning 项不动。
+        let mut body = serde_json::json!({
+            "store": false,
+            "input": [
+                {"type": "reasoning", "id": "rs_a44b4856-06b6-9e52-86c8-9d9d0c1a5d55",
+                 "summary": [{"type": "summary_text", "text": "relay thought"}],
+                 "encrypted_content": "TrvvClVDcSLW/nEEAMKLKvGP"},
+                {"type": "reasoning", "id": "rs_resp_202608272326364fc74a543d994008",
+                 "summary": [], "encrypted_content": "relay-enc"},
+                {"type": "reasoning", "id": "rs_a44b485606b69e5286c89d9d0c1a5d55a44b485606b69e5286c89d9d0c1a5d55",
+                 "summary": [], "encrypted_content": "enc-native"},
+                {"type": "reasoning", "summary": [], "encrypted_content": "enc-idless"},
+                {"type": "message", "role": "assistant",
+                 "id": "msg_a44b4856-06b6-9e52-86c8-9d9d0c1a5d55",
+                 "content": [{"type": "output_text", "text": "ok"}]}
+            ]
+        });
+        sanitize_codex_reasoning_content(&mut body, &provider);
+        let items = body["input"].as_array().unwrap();
+        assert_eq!(
+            items.len(),
+            3,
+            "foreign-minted reasoning items must be dropped even with encrypted_content",
+        );
+        assert_eq!(items[0]["encrypted_content"], "enc-native");
+        assert_eq!(items[1]["encrypted_content"], "enc-idless");
+        assert_eq!(items[2]["type"], "message", "non-reasoning items survive");
+
+        // store=true：客户端显式依赖服务端状态，ID 形态不剔除。
+        let mut body = serde_json::json!({
+            "store": true,
+            "input": [{"type": "reasoning", "id": "rs_a44b4856-06b6-9e52-86c8-9d9d0c1a5d55",
+                       "encrypted_content": "relay-enc"}]
+        });
+        sanitize_codex_reasoning_content(&mut body, &provider);
+        assert_eq!(body["input"].as_array().unwrap().len(), 1);
+
+        // 非 codex 渠道：UUID 方言原样透传（中转上游自会解自己的密文）。
+        let mut body = serde_json::json!({
+            "store": false,
+            "input": [{"type": "reasoning", "id": "rs_a44b4856-06b6-9e52-86c8-9d9d0c1a5d55",
+                       "encrypted_content": "relay-enc"}]
+        });
+        sanitize_codex_reasoning_content(
+            &mut body,
+            &provider_with_channel("", Some("sub2api"), false),
+        );
+        assert_eq!(body["input"].as_array().unwrap().len(), 1);
+
+        // 原生形态判据：64 位十六进制；短长度 / 时间戳 / 非 rs_ 前缀皆否。
+        assert!(super::is_native_codex_reasoning_id(
+            "rs_a44b485606b69e5286c89d9d0c1a5d55a44b485606b69e5286c89d9d0c1a5d55"
+        ));
+        assert!(!super::is_native_codex_reasoning_id(
+            "rs_a44b4856-06b6-9e52-86c8-9d9d0c1a5d55"
+        ));
+        assert!(!super::is_native_codex_reasoning_id("rs_033bf81503e4a9e"));
+        assert!(!super::is_native_codex_reasoning_id(
+            "rs_resp_202608272326364fc74a543d994008"
+        ));
+        assert!(!super::is_native_codex_reasoning_id("resp_033b"));
     }
 
     /// Codex 消费级上游：直通路径剥离 reasoning 项的非空 content。
@@ -1486,7 +1588,7 @@ mod tests {
                     {"type": "message", "role": "user", "content": [
                         {"type": "input_text", "text": "hi"}
                     ]},
-                    {"type": "reasoning", "id": "rs_033bf81503e4a9e",
+                    {"type": "reasoning", "id": "rs_a44b485606b69e5286c89d9d0c1a5d55a44b485606b69e5286c89d9d0c1a5d55",
                      "summary": [], "encrypted_content": "enc-native"},
                     {"type": "reasoning", "id": "rs_resp_20260825194117052ba4e951a74c39",
                      "summary": [], "encrypted_content": null,
@@ -1516,6 +1618,60 @@ mod tests {
             "non-reasoning items survive",
         );
         assert_eq!(out.body["store"], false, "store flag is untouched");
+    }
+
+    /// 完整复现线上 400 invalid_encrypted_content 现场（请求 06fbe5e2，
+    /// 2026-08-27）：会话中途从中转切到 codex 直连，回放历史携带 13 项
+    /// 中转铸造的 UUID 方言 reasoning 项（密文存在但本后端不可解密），
+    /// 首个即被上游拒收。防御后：外来密文项整项剔除，请求可通过。
+    #[tokio::test]
+    async fn passthrough_drops_foreign_minted_reasoning_for_stateless_codex() {
+        let gw = build_test_gateway().await;
+        let provider = provider_with_channel("", Some("codex"), false);
+        let ctx = responses_ctx(&provider, &gw);
+
+        let out = passthrough_run(
+            &FakeApiKeyVendor,
+            serde_json::json!({
+                "model": "gpt-5.6-sol",
+                "stream": true,
+                "store": false,
+                "include": ["reasoning.encrypted_content"],
+                "input": [
+                    {"type": "message", "role": "user", "content": [
+                        {"type": "input_text", "text": "hi"}
+                    ]},
+                    {"type": "reasoning", "id": "rs_a44b4856-06b6-9e52-86c8-9d9d0c1a5d55",
+                     "summary": [{"type": "summary_text", "text":
+                       "The user is asking what model I am."}],
+                     "encrypted_content": "TrvvClVDcSLW/nEEAMKLKvGP"},
+                    {"type": "message", "role": "assistant",
+                     "id": "msg_a44b4856-06b6-9e52-86c8-9d9d0c1a5d55",
+                     "content": [{"type": "output_text", "text": "ok"}]},
+                    {"type": "reasoning", "id": "rs_a44b485606b69e5286c89d9d0c1a5d55a44b485606b69e5286c89d9d0c1a5d55",
+                     "summary": [], "encrypted_content": "enc-native"}
+                ]
+            }),
+            &ctx,
+            true,
+        )
+        .await
+        .expect("passthrough succeeds");
+
+        let items = out.body["input"].as_array().unwrap();
+        assert_eq!(
+            items.len(),
+            3,
+            "foreign-minted reasoning (UUID dialect) must be dropped",
+        );
+        assert_eq!(
+            items[0]["type"], "message",
+            "the relay-minted reasoning item ahead of the message is gone",
+        );
+        assert_eq!(
+            items[2]["encrypted_content"], "enc-native",
+            "native reasoning replay survives",
+        );
     }
 
     /// 非 codex 渠道必须保留这些参数，直通行为不受影响。
