@@ -39,7 +39,12 @@ type ModelForm = {
   enable_auth: boolean;
   enable_payload: boolean;
   vision_shim_enabled: boolean;
-  vision_helper_model: string;
+  vision_helpers: VisionHelperForm[];
+};
+
+type VisionHelperForm = {
+  provider_id: string;
+  model: string;
 };
 
 type ModelBackendForm = {
@@ -57,18 +62,40 @@ const emptyCreate: ModelForm = {
   enable_auth: true,
   enable_payload: true,
   vision_shim_enabled: false,
-  vision_helper_model: "",
+  vision_helpers: [],
 };
 
-function parseVisionShimHelper(raw?: string | null): string | null {
-  if (!raw) return null;
+function parseVisionShimHelpers(
+  raw?: string | null,
+  fallbackProvider?: string,
+): VisionHelperForm[] {
+  if (!raw) return [];
   try {
-    const parsed = JSON.parse(raw) as { helper_model?: string };
-    const helper = parsed.helper_model?.trim();
-    return helper ? helper : null;
+    const parsed = JSON.parse(raw) as {
+      helper_model?: string;
+      helper_provider?: string;
+      helper_backends?: Array<{ provider?: string; model?: string }>;
+    };
+    const backends = (parsed.helper_backends ?? [])
+      .map((backend) => ({
+        provider_id: (backend.provider ?? "").trim(),
+        model: (backend.model ?? "").trim(),
+      }))
+      .filter((backend) => backend.provider_id && backend.model);
+    if (backends.length > 0) return backends;
+    const model = parsed.helper_model?.trim();
+    if (model) {
+      return [
+        {
+          provider_id: (parsed.helper_provider ?? fallbackProvider ?? "").trim(),
+          model,
+        },
+      ];
+    }
   } catch {
-    return null;
+    // fall through
   }
+  return []
 }
 
 function FieldLabel({ children }: { children: string }) {
@@ -151,16 +178,27 @@ function ModelToggleControl({
 function VisionFacadeControl({
   isZh,
   enabled,
-  helperModel,
+  helpers,
+  providerOptions,
+  providerMap,
   onEnabledChange,
-  onHelperModelChange,
+  onHelperUpdate,
+  onHelperRemove,
+  onHelperAdd,
 }: {
   isZh: boolean;
   enabled: boolean;
-  helperModel: string;
+  helpers: VisionHelperForm[];
+  providerOptions: Array<{ value: string; label: string; provider: Provider }>;
+  providerMap: Map<string, Provider>;
   onEnabledChange: (checked: boolean) => void;
-  onHelperModelChange: (value: string) => void;
+  onHelperUpdate: (index: number, patch: Partial<VisionHelperForm>) => void;
+  onHelperRemove: (index: number) => void;
+  onHelperAdd: () => void;
 }) {
+  const compatibleOptions = providerOptions.filter((option) =>
+    (option.provider.protocol ?? "").startsWith("openai-compatible"),
+  );
   return (
     <div className="space-y-2">
       <FieldLabel>{isZh ? "视觉垫片（多模态门面）" : "Vision Facade (Multimodal Shim)"}</FieldLabel>
@@ -181,17 +219,149 @@ function VisionFacadeControl({
           <Switch checked={enabled} onCheckedChange={onEnabledChange} />
         </div>
         {enabled && (
-          <div className="space-y-1.5">
-            <FieldLabel>{isZh ? "Helper 模型（同 provider 的多模态模型）" : "Helper model (multimodal model on the same provider)"}</FieldLabel>
-            <Input
-              value={helperModel}
-              onChange={(event) => onHelperModelChange(event.target.value)}
-              placeholder={isZh ? "例如 glm-5.3-flash" : "e.g. glm-5.3-flash"}
-              className="h-9"
-            />
+          <div className="space-y-2">
+            <FieldLabel>
+              {isZh
+                ? "Helper 模型（可选不同供应商的多模态模型，按顺序故障转移）"
+                : "Helper models (any provider, tried in order with failover)"}
+            </FieldLabel>
+            {compatibleOptions.length === 0 ? (
+              <p className="text-xs text-amber-600">
+                {isZh
+                  ? "没有 OpenAI 兼容协议的供应商可用（helper 调用需要 OpenAI 兼容端点）"
+                  : "No OpenAI-compatible provider available (helper calls need an OpenAI-compatible endpoint)"}
+              </p>
+            ) : (
+              <>
+                {helpers.map((helper, index) => (
+                  <HelperModelRow
+                    key={index}
+                    index={index}
+                    helper={helper}
+                    isZh={isZh}
+                    compatibleOptions={compatibleOptions}
+                    providerMap={providerMap}
+                    onUpdate={onHelperUpdate}
+                    onRemove={onHelperRemove}
+                    disableRemove={helpers.length <= 1}
+                  />
+                ))}
+                <Button
+                  type="button"
+                  variant="secondary"
+                  onClick={onHelperAdd}
+                  className="h-9 w-full justify-center rounded-xl border border-slate-300 bg-white text-slate-700 hover:bg-slate-50"
+                >
+                  <Plus className="mr-2 h-4 w-4" />
+                  {isZh ? "添加 Helper" : "Add helper"}
+                </Button>
+              </>
+            )}
           </div>
         )}
       </div>
+    </div>
+  );
+}
+
+function VisionShimBadge({ raw, fallbackProvider, isZh }: { raw?: string | null; fallbackProvider: string; isZh: boolean }) {
+  const helpers = parseVisionShimHelpers(raw, fallbackProvider);
+  if (helpers.length === 0) return null;
+  const label = helpers.map((helper) => helper.model).join(" / ");
+  const extra = helpers.length > 1 ? ` +${helpers.length - 1}` : "";
+  return (
+    <Badge variant="secondary" className="connect-label-badge bg-violet-50 text-violet-700">
+      {isZh ? `视觉垫片 · ${label}${extra}` : `Vision · ${label}${extra}`}
+    </Badge>
+  );
+}
+
+function HelperModelRow({
+  index,
+  helper,
+  isZh,
+  compatibleOptions,
+  providerMap,
+  onUpdate,
+  onRemove,
+  disableRemove,
+}: {
+  index: number;
+  helper: VisionHelperForm;
+  isZh: boolean;
+  compatibleOptions: Array<{ value: string; label: string; provider: Provider }>;
+  providerMap: Map<string, Provider>;
+  onUpdate: (index: number, patch: Partial<VisionHelperForm>) => void;
+  onRemove: (index: number) => void;
+  disableRemove: boolean;
+}) {
+  const provider = providerMap.get(helper.provider_id);
+  const providerHasModelDiscovery = hasProviderModelsEndpoint(provider);
+  const { data: helperModels = [] } = useQuery<string[]>({
+    queryKey: ["provider-models", "vision-helper", index, helper.provider_id],
+    queryFn: () => backend("get_provider_models", { id: helper.provider_id }),
+    enabled: !!helper.provider_id && providerHasModelDiscovery,
+    staleTime: 60_000,
+  });
+
+  return (
+    <div className="grid w-full grid-cols-[minmax(0,2.8fr)_minmax(0,5.2fr)_32px] items-center gap-2.5">
+      <Select
+        value={helper.provider_id || undefined}
+        onValueChange={(value) => onUpdate(index, { provider_id: value, model: "" })}
+      >
+        <SelectTrigger className="bg-white">
+          <SelectValue placeholder={isZh ? "选择提供商" : "Select provider"} />
+        </SelectTrigger>
+        <SelectContent>
+          {compatibleOptions.map((option) => (
+            <SelectItem key={option.value} value={option.value}>
+              <span className="flex items-center gap-2">
+                <ProviderIcon
+                  name={option.provider.name}
+                  protocol={option.provider.protocol}
+                  baseUrl={option.provider.base_url}
+                  size={16}
+                />
+                <span>{option.label}</span>
+              </span>
+            </SelectItem>
+          ))}
+        </SelectContent>
+      </Select>
+
+      {providerHasModelDiscovery ? (
+        <Combobox
+          value={helper.model}
+          className="bg-white"
+          options={withCurrentModel(helperModels, helper.model).map((model) => ({
+            value: model,
+            label: model,
+          }))}
+          allowCustom
+          placeholder={isZh ? "选择或输入多模态模型 ID" : "Select or enter a multimodal model ID"}
+          searchPlaceholder={isZh ? "搜索或输入模型 ID..." : "Search or type a model ID..."}
+          emptyText={isZh ? "列表为空，可直接输入模型 ID" : "No models listed — type a model ID instead"}
+          customCreateText={isZh ? "使用自定义模型" : "Use custom model"}
+          onValueChange={(value) => onUpdate(index, { model: value })}
+        />
+      ) : (
+        <Input
+          className="bg-white"
+          value={helper.model}
+          onChange={(event) => onUpdate(index, { model: event.target.value })}
+          placeholder={isZh ? "多模态模型 ID" : "Multimodal model ID"}
+        />
+      )}
+
+      <button
+        type="button"
+        onClick={() => onRemove(index)}
+        disabled={disableRemove}
+        className="cursor-pointer rounded-lg p-1.5 text-slate-400 transition-colors hover:bg-red-50 hover:text-red-500 disabled:cursor-not-allowed disabled:opacity-40"
+      >
+        <Trash2 className="h-4 w-4" />
+      </button>
     </div>
   );
 }
@@ -509,7 +679,7 @@ export default function ModelsPage() {
           priority: t.priority ?? 1,
         }))
       : [{ provider_id: route.target_provider, model: route.target_model, weight: 100, priority: 1 }];
-    const visionHelper = parseVisionShimHelper(route.vision_shim);
+    const visionHelpers = parseVisionShimHelpers(route.vision_shim, route.target_provider);
     setEditForm({
       id: route.id,
       name: route.name,
@@ -517,8 +687,8 @@ export default function ModelsPage() {
       targets,
       enable_auth: route.enable_auth,
       enable_payload: route.enable_payload ?? false,
-      vision_shim_enabled: Boolean(visionHelper),
-      vision_helper_model: visionHelper ?? "",
+      vision_shim_enabled: visionHelpers.length > 0,
+      vision_helpers: visionHelpers,
     });
   }
 
@@ -700,9 +870,39 @@ export default function ModelsPage() {
             <VisionFacadeControl
               isZh={isZh}
               enabled={createForm.vision_shim_enabled}
-              helperModel={createForm.vision_helper_model}
-              onEnabledChange={(checked) => setCreateForm((prev) => ({ ...prev, vision_shim_enabled: checked }))}
-              onHelperModelChange={(value) => setCreateForm((prev) => ({ ...prev, vision_helper_model: value }))}
+              helpers={createForm.vision_helpers}
+              providerOptions={providerOptions}
+              providerMap={providerMap}
+              onEnabledChange={(checked) =>
+                setCreateForm((prev) => ({
+                  ...prev,
+                  vision_shim_enabled: checked,
+                  vision_helpers:
+                    checked && prev.vision_helpers.length === 0
+                      ? [{ provider_id: prev.targets[0]?.provider_id ?? "", model: "" }]
+                      : prev.vision_helpers,
+                }))
+              }
+              onHelperUpdate={(index, patch) =>
+                setCreateForm((prev) => ({
+                  ...prev,
+                  vision_helpers: prev.vision_helpers.map((helper, idx) =>
+                    idx === index ? { ...helper, ...patch } : helper,
+                  ),
+                }))
+              }
+              onHelperRemove={(index) =>
+                setCreateForm((prev) => ({
+                  ...prev,
+                  vision_helpers: prev.vision_helpers.filter((_, idx) => idx !== index),
+                }))
+              }
+              onHelperAdd={() =>
+                setCreateForm((prev) => ({
+                  ...prev,
+                  vision_helpers: [...prev.vision_helpers, { provider_id: "", model: "" }],
+                }))
+              }
             />
           </div>
           <div className="flex gap-3">
@@ -883,12 +1083,48 @@ export default function ModelsPage() {
                     <VisionFacadeControl
                       isZh={isZh}
                       enabled={editForm.vision_shim_enabled}
-                      helperModel={editForm.vision_helper_model}
+                      helpers={editForm.vision_helpers}
+                      providerOptions={providerOptions}
+                      providerMap={providerMap}
                       onEnabledChange={(checked) =>
-                        setEditForm((prev) => (prev ? { ...prev, vision_shim_enabled: checked } : prev))
+                        setEditForm((prev) =>
+                          prev
+                            ? {
+                                ...prev,
+                                vision_shim_enabled: checked,
+                                vision_helpers:
+                                  checked && prev.vision_helpers.length === 0
+                                    ? [{ provider_id: prev.targets[0]?.provider_id ?? "", model: "" }]
+                                    : prev.vision_helpers,
+                              }
+                            : prev,
+                        )
                       }
-                      onHelperModelChange={(value) =>
-                        setEditForm((prev) => (prev ? { ...prev, vision_helper_model: value } : prev))
+                      onHelperUpdate={(index, patch) =>
+                        setEditForm((prev) =>
+                          prev
+                            ? {
+                                ...prev,
+                                vision_helpers: prev.vision_helpers.map((helper, idx) =>
+                                  idx === index ? { ...helper, ...patch } : helper,
+                                ),
+                              }
+                            : prev,
+                        )
+                      }
+                      onHelperRemove={(index) =>
+                        setEditForm((prev) =>
+                          prev
+                            ? { ...prev, vision_helpers: prev.vision_helpers.filter((_, idx) => idx !== index) }
+                            : prev,
+                        )
+                      }
+                      onHelperAdd={() =>
+                        setEditForm((prev) =>
+                          prev
+                            ? { ...prev, vision_helpers: [...prev.vision_helpers, { provider_id: "", model: "" }] }
+                            : prev,
+                        )
                       }
                     />
                   </div>
@@ -942,13 +1178,11 @@ export default function ModelsPage() {
                     >
                       {balanceLabel(route.balance ?? "weighted", isZh)}
                     </Badge>
-                    {parseVisionShimHelper(route.vision_shim) && (
-                      <Badge variant="secondary" className="connect-label-badge bg-violet-50 text-violet-700">
-                        {isZh
-                          ? `视觉垫片 · ${parseVisionShimHelper(route.vision_shim)}`
-                          : `Vision · ${parseVisionShimHelper(route.vision_shim)}`}
-                      </Badge>
-                    )}
+                    <VisionShimBadge
+                      raw={route.vision_shim}
+                      fallbackProvider={route.target_provider}
+                      isZh={isZh}
+                    />
                     {route.enable_auth && (
                       <Badge variant="success" className="connect-label-badge">
                         {isZh ? "鉴权" : "Auth"}
@@ -1071,10 +1305,7 @@ function buildCreatePayload(form: ModelForm): CreateModel {
     target_model: primary.model,
     enable_auth: form.enable_auth,
     enable_payload: form.enable_payload,
-    vision_shim:
-      form.vision_shim_enabled && form.vision_helper_model.trim()
-        ? { helper_model: form.vision_helper_model.trim() }
-        : undefined,
+    vision_shim: buildVisionShimPayload(form),
   };
 }
 
@@ -1096,9 +1327,14 @@ function buildUpdatePayload(form: ModelForm & { id: string }): UpdateModel {
     enable_auth: form.enable_auth,
     enable_payload: form.enable_payload,
     // An empty object clears the shim; absence would keep the stored value.
-    vision_shim:
-      form.vision_shim_enabled && form.vision_helper_model.trim()
-        ? { helper_model: form.vision_helper_model.trim() }
-        : {},
+    vision_shim: buildVisionShimPayload(form) ?? {},
   };
+}
+
+function buildVisionShimPayload(form: ModelForm) {
+  if (!form.vision_shim_enabled) return undefined;
+  const backends = form.vision_helpers
+    .map((helper) => ({ provider: helper.provider_id, model: helper.model.trim() }))
+    .filter((helper) => helper.provider && helper.model);
+  return backends.length > 0 ? { helper_backends: backends } : undefined;
 }

@@ -23,19 +23,35 @@ pub enum VisionShimFailureMode {
     Reject,
 }
 
+/// One helper backend: a provider row plus the upstream multimodal model
+/// on it. Helper selection mirrors target-model selection — any provider,
+/// any model — and multiple entries fail over in order.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HelperBackend {
+    /// Provider row id.
+    pub provider: String,
+    /// Upstream model name on that provider (must accept images).
+    pub model: String,
+}
+
 /// Per-model vision-shim configuration (`models.vision_shim` JSON column).
 ///
-/// Presence of a parsed configuration with a non-empty `helper_model` means
-/// the shim is enabled for that model.
+/// Presence of a parsed configuration with at least one resolvable helper
+/// means the shim is enabled for that model.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct VisionShimConfig {
-    /// Upstream model name on the helper provider that accepts images
-    /// (e.g. `"glm-5.3-flash"`).
+    /// Legacy single-helper form: upstream model name on the helper provider
+    /// (e.g. `"glm-5.3-flash"`). Superseded by `helper_backends` when that
+    /// list is non-empty.
     pub helper_model: String,
-    /// Helper provider row id. Defaults to the model route's primary
-    /// `target_provider` when absent.
+    /// Legacy single-helper form: helper provider row id. Defaults to the
+    /// model route's primary `target_provider` when absent.
     pub helper_provider: Option<String>,
+    /// Preferred helper list: provider + model pairs tried in order until one
+    /// captions successfully. Lets the helper span different vendors.
+    #[serde(default)]
+    pub helper_backends: Vec<HelperBackend>,
     /// Maximum images transcribed per request; extras become placeholders.
     pub max_images: usize,
     /// Maximum approximate decoded image size in bytes; larger images become
@@ -57,6 +73,7 @@ impl Default for VisionShimConfig {
         Self {
             helper_model: String::new(),
             helper_provider: None,
+            helper_backends: Vec::new(),
             max_images: 8,
             max_image_bytes: 10 * 1024 * 1024,
             cache_ttl_secs: 24 * 60 * 60,
@@ -68,9 +85,39 @@ impl Default for VisionShimConfig {
 }
 
 impl VisionShimConfig {
-    /// A configuration is enabled when a helper model is configured.
+    /// A configuration is enabled when any helper is configured.
     pub fn is_enabled(&self) -> bool {
-        !self.helper_model.trim().is_empty()
+        !self.helper_model.trim().is_empty() || !self.helper_backends.is_empty()
+    }
+
+    /// Resolve the ordered helper list. Explicit `helper_backends` take
+    /// priority; the legacy single form (`helper_model` + optional
+    /// `helper_provider`, defaulting to `default_provider`) is used only
+    /// when the list is empty. Empty/incomplete entries are dropped.
+    pub fn helper_list(&self, default_provider: &str) -> Vec<HelperBackend> {
+        let mut list: Vec<HelperBackend> = self
+            .helper_backends
+            .iter()
+            .map(|backend| HelperBackend {
+                provider: backend.provider.trim().to_string(),
+                model: backend.model.trim().to_string(),
+            })
+            .filter(|backend| !backend.provider.is_empty() && !backend.model.is_empty())
+            .collect();
+        if list.is_empty() && !self.helper_model.trim().is_empty() {
+            let provider = self
+                .helper_provider
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or(default_provider)
+                .to_string();
+            list.push(HelperBackend {
+                provider,
+                model: self.helper_model.trim().to_string(),
+            });
+        }
+        list
     }
 
     /// Parse the raw JSON string stored on the model row. Returns `None` for
@@ -150,6 +197,46 @@ mod tests {
         assert!(VisionShimConfig::parse("{}").is_none());
         assert!(VisionShimConfig::parse("not json").is_none());
         assert!(VisionShimConfig::parse(r#"{"max_images":4}"#).is_none());
+    }
+
+    #[test]
+    fn helper_backends_take_priority_over_legacy_single_form() {
+        let cfg = VisionShimConfig::parse(
+            r#"{"helper_model":"legacy-flash","helper_backends":[{"provider":"pB","model":"b-vl"},{"provider":"","model":"broken"},{"provider":"pC","model":""}]}"#,
+        )
+        .unwrap();
+        let list = cfg.helper_list("pDefault");
+        assert_eq!(
+            list,
+            vec![HelperBackend {
+                provider: "pB".to_string(),
+                model: "b-vl".to_string()
+            }]
+        );
+    }
+
+    #[test]
+    fn legacy_single_form_falls_back_to_route_provider() {
+        let cfg = VisionShimConfig::parse(r#"{"helper_model":"glm-5.3-flash"}"#).unwrap();
+        assert_eq!(
+            cfg.helper_list("pRoute"),
+            vec![HelperBackend {
+                provider: "pRoute".to_string(),
+                model: "glm-5.3-flash".to_string()
+            }]
+        );
+
+        let cfg =
+            VisionShimConfig::parse(r#"{"helper_model":"x","helper_provider":"pOther"}"#).unwrap();
+        assert_eq!(cfg.helper_list("pRoute")[0].provider, "pOther");
+    }
+
+    #[test]
+    fn backends_only_config_is_enabled() {
+        let cfg = VisionShimConfig::parse(r#"{"helper_backends":[{"provider":"p","model":"m"}]}"#)
+            .unwrap();
+        assert!(cfg.is_enabled());
+        assert_eq!(cfg.helper_list("p").len(), 1);
     }
 
     #[test]

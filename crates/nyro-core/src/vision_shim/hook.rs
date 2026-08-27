@@ -134,15 +134,47 @@ pub(crate) async fn process(
         // Vision shim not enabled for this model route.
         return Ok(stats);
     };
-    if cfg
-        .helper_model
-        .trim()
-        .eq_ignore_ascii_case(route.target_model.trim())
-    {
+    // Resolve the ordered helper list (explicit multi-provider backends,
+    // falling back to the legacy single-helper form).
+    let helpers = cfg.helper_list(&route.target_provider);
+    if helpers.is_empty() {
+        return Ok(stats);
+    }
+    // Never caption through the route itself (provider+model pairs it sends
+    // to): the target is text-only by definition and would just fail.
+    let self_pairs: std::collections::HashSet<(String, String)> = std::iter::once((
+        route.target_provider.trim().to_string(),
+        route.target_model.trim().to_lowercase(),
+    ))
+    .chain(route.targets.iter().map(|backend| {
+        (
+            backend.provider_id.trim().to_string(),
+            backend.model.trim().to_lowercase(),
+        )
+    }))
+    .collect();
+    let helpers: Vec<super::config::HelperBackend> = helpers
+        .into_iter()
+        .filter(|helper| {
+            let is_self = self_pairs.contains(&(
+                helper.provider.trim().to_string(),
+                helper.model.to_lowercase(),
+            ));
+            if is_self {
+                tracing::warn!(
+                    model = %route.name,
+                    helper_provider = %helper.provider,
+                    helper_model = %helper.model,
+                    "vision shim: helper backend equals a route target, skipping it"
+                );
+            }
+            !is_self
+        })
+        .collect();
+    if helpers.is_empty() {
         tracing::warn!(
             model = %route.name,
-            helper = %cfg.helper_model,
-            "vision shim disabled: helper model equals the target model"
+            "vision shim disabled: every helper backend equals the route target"
         );
         return Ok(stats);
     }
@@ -153,43 +185,60 @@ pub(crate) async fn process(
         return Ok(stats);
     }
     stats.images = images.len();
-    stats.helper_model = cfg.helper_model.clone();
+    stats.helper_model = helpers[0].model.clone();
     let question = ir_scan::latest_user_text(request);
     let started = Instant::now();
 
-    // ── Resolve the helper provider ───────────────────────────────────────
-    let helper_provider_id = cfg
-        .helper_provider
-        .clone()
-        .unwrap_or_else(|| route.target_provider.clone());
-    let provider = gw
-        .storage
-        .providers()
-        .get(&helper_provider_id)
-        .await
-        .ok()
-        .flatten()
-        .filter(|provider| provider.is_enabled)
-        .filter(|provider| {
-            // The protocol column stores either a bare suite name
-            // ("openai-compatible") or a canonical endpoint id
-            // ("openai-compatible/chat-completions/v1") depending on how the
-            // provider was created — resolve through the registry instead of
-            // string-comparing, so both storage forms are accepted.
-            crate::protocol::registry::ProtocolRegistry::global()
-                .parse_protocol(&provider.protocol)
-                .is_some_and(|protocol| {
-                    protocol == crate::protocol::ids::Protocol::OpenAICompatible
-                })
-        });
+    // ── Resolve helper providers (any vendor, cross-provider failover) ────
+    let mut providers: Vec<(
+        super::config::HelperBackend,
+        Option<crate::db::models::Provider>,
+    )> = Vec::with_capacity(helpers.len());
+    for helper in &helpers {
+        let provider = gw
+            .storage
+            .providers()
+            .get(&helper.provider)
+            .await
+            .ok()
+            .flatten()
+            .filter(|provider| provider.is_enabled)
+            .filter(|provider| {
+                // The protocol column stores either a bare suite name
+                // ("openai-compatible") or a canonical endpoint id
+                // ("openai-compatible/chat-completions/v1") depending on how
+                // the provider was created — resolve through the registry
+                // instead of string-comparing, so both storage forms are
+                // accepted.
+                crate::protocol::registry::ProtocolRegistry::global()
+                    .parse_protocol(&provider.protocol)
+                    .is_some_and(|protocol| {
+                        protocol == crate::protocol::ids::Protocol::OpenAICompatible
+                    })
+            });
+        if provider.is_none() {
+            tracing::warn!(
+                model = %route.name,
+                helper_provider = %helper.provider,
+                helper_model = %helper.model,
+                "vision shim helper backend unavailable or not openai-compatible, skipping it"
+            );
+        }
+        providers.push((helper.clone(), provider));
+    }
 
-    let Some(provider) = provider else {
-        let reason =
-            format!("helper provider unavailable or not openai-compatible: {helper_provider_id}");
+    let usable: Vec<(super::config::HelperBackend, crate::db::models::Provider)> = providers
+        .into_iter()
+        .filter_map(|(helper, provider)| provider.map(|provider| (helper, provider)))
+        .collect();
+
+    if usable.is_empty() {
+        let reason = "no usable helper backend (providers missing/disabled/not openai-compatible)"
+            .to_string();
         tracing::warn!(model = %route.name, %reason, "vision shim cannot caption images");
         return match cfg.on_failure {
             VisionShimFailureMode::Reject => {
-                Err(helper_unavailable_error(&helper_provider_id, &reason))
+                Err(helper_unavailable_error(&helpers[0].provider, &reason))
             }
             VisionShimFailureMode::Placeholder => {
                 let mut captions = HashMap::new();
@@ -202,7 +251,7 @@ pub(crate) async fn process(
                 Ok(stats)
             }
         };
-    };
+    }
 
     // ── Deduplicate by content digest and prepare caption jobs ───────────
     let mut captions: HashMap<[u8; 32], String> = HashMap::new();
@@ -252,13 +301,19 @@ pub(crate) async fn process(
         });
     }
 
-    // ── Caption cache misses concurrently through the helper model ────────
+    // ── Caption cache misses concurrently through the helper list ─────────
     let timeout = deadline.remaining().min(Duration::from_secs(60));
     if !jobs.is_empty() && !timeout.is_zero() {
         let results = join_all(jobs.iter().map(|job| async {
-            let call =
-                caption::caption_image(gw, &provider, &cfg, &job.source, &job.prompt, timeout)
-                    .await;
+            let call = caption::caption_with_failover(
+                gw,
+                &usable,
+                &job.source,
+                &job.prompt,
+                cfg.caption_max_tokens,
+                timeout,
+            )
+            .await;
             (job.cache_key, job.digest, call)
         }))
         .await;
@@ -274,19 +329,22 @@ pub(crate) async fn process(
                     captions.insert(digest, text);
                     stats.captioned += 1;
                     stats.helper_tokens += call.usage_total_tokens.unwrap_or(0);
+                    if let Some(used) = call.used_model {
+                        stats.helper_model = used;
+                    }
                 }
                 None => {
                     let error = call.error.unwrap_or_else(|| "caption failed".to_string());
                     tracing::warn!(
                         model = %route.name,
-                        helper = %cfg.helper_model,
+                        helper = %stats.helper_model,
                         error = %error,
-                        "vision shim caption failed"
+                        "vision shim caption failed on every helper backend"
                     );
                     match cfg.on_failure {
                         VisionShimFailureMode::Reject => {
                             return Err(GatewayError::UpstreamStatus {
-                                provider: helper_provider_id,
+                                provider: helpers[0].provider.clone(),
                                 status: 502,
                                 body: Some(format!("vision shim helper failed: {error}")),
                             });

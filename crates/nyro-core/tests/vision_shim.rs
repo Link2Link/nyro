@@ -304,3 +304,79 @@ async fn canonical_endpoint_id_protocol_is_accepted() {
     assert!(user_text(&request).contains("[Image 1: blue square]"));
     assert_eq!(calls.lock().unwrap().len(), 1);
 }
+
+fn shim_model_with_backends(provider_primary: &str, backends: serde_json::Value) -> Model {
+    let mut model = shim_model(provider_primary);
+    model.vision_shim = Some(serde_json::json!({ "helper_backends": backends }).to_string());
+    model
+}
+
+#[tokio::test]
+async fn helper_backends_fail_over_across_providers() {
+    // Two helper providers on different mock servers: the first fails with
+    // 500, the second captions. The shim must try them in order and succeed
+    // via the second — helper selection spans vendors like target selection.
+    let (failing_base, failing_calls) = spawn_helper(None).await;
+    let (ok_base, ok_calls) = spawn_helper(Some("green triangle")).await;
+    let failing = provider_row("helper-a", &failing_base);
+    let ok = provider_row("helper-b", &ok_base);
+    // The target provider is a third, unused-for-caption provider.
+    let target = provider_row("target-p", "http://127.0.0.1:9");
+
+    let gw = gateway_with(
+        vec![failing, ok, target],
+        vec![shim_model_with_backends(
+            "target-p",
+            serde_json::json!([
+                { "provider": "helper-a", "model": "vl-a" },
+                { "provider": "helper-b", "model": "vl-b" }
+            ]),
+        )],
+    )
+    .await;
+
+    let mut request = image_request("glm-5.3", "ZmFpbG92ZXI=", "what shape?");
+    let stats = vision_shim::apply(&gw, &mut request).await.unwrap();
+
+    assert_eq!(stats.images, 1);
+    assert_eq!(stats.captioned, 1);
+    assert_eq!(stats.placeholders, 0);
+    assert_eq!(
+        stats.helper_model, "vl-b",
+        "stats report the backend that actually captioned"
+    );
+    assert!(user_text(&request).contains("[Image 1: green triangle]"));
+
+    assert_eq!(
+        failing_calls.lock().unwrap().len(),
+        1,
+        "first backend attempted"
+    );
+    let ok_calls = ok_calls.lock().unwrap();
+    assert_eq!(ok_calls.len(), 1);
+    assert_eq!(ok_calls[0]["model"], "vl-b");
+}
+
+#[tokio::test]
+async fn helper_backends_matching_route_targets_are_skipped() {
+    let (base_url, calls) = spawn_helper(Some("unused caption")).await;
+    // Route target and sole helper backend are the same pair on purpose:
+    // captioning through the text-only target would always fail, so the
+    // shim must disable itself instead of looping the image back.
+    let provider = provider_row("p7", &base_url);
+    let mut model = shim_model_with_backends(
+        "p7",
+        serde_json::json!([{ "provider": "p7", "model": "glm-5.3" }]),
+    );
+    model.target_provider = "p7".to_string();
+    model.target_model = "glm-5.3".to_string();
+
+    let gw = gateway_with(vec![provider], vec![model]).await;
+    let mut request = image_request("glm-5.3", "c2VsZg==", "hi");
+    let before = format!("{request:?}");
+    let stats = vision_shim::apply(&gw, &mut request).await.unwrap();
+
+    assert_eq!(stats.images, 0, "self-referencing helper disables the shim");
+    assert_eq!(format!("{request:?}"), before);
+    assert!(calls.lock().unwrap().is_empty());
+}

@@ -12,8 +12,10 @@
 //! Mechanism (generic, per model route — reusable across vendors):
 //!
 //! - Configuration lives on the model row (`models.vision_shim`, JSON:
-//!   helper model, optional helper provider, limits, failure policy) — see
-//!   [`VisionShimConfig`].
+//!   `helper_backends` — provider+model pairs selected like target-model
+//!   backends, spanning vendors with in-order failover; or the legacy single
+//!   `helper_model`(+`helper_provider`) form — plus limits and failure
+//!   policy) — see [`VisionShimConfig`].
 //! - A [`PhaseHook`](crate::plugin::phase::PhaseHook) (`vision-shim`) runs in
 //!   the `OnAccess` phase: route + auth resolved, before upstream work. It
 //!   scans the unified IR for images (message blocks, tool results, nested

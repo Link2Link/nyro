@@ -1,9 +1,10 @@
 //! Helper-model caption client for the vision shim.
 //!
-//! Calls an OpenAI-compatible `/chat/completions` endpoint on the helper
-//! provider with one image plus the caption prompt, and returns the helper's
-//! description. This is a direct provider call (not a recursive dispatch), so
-//! caption traffic never re-enters the proxy pipeline.
+//! Calls an OpenAI-compatible `/chat/completions` endpoint with one image
+//! plus the caption prompt, and returns the helper's description. Helpers are
+//! selected like target models — any provider, any model — and multiple
+//! backends fail over in order. Caption traffic is a direct provider call
+//! (not a recursive dispatch), so it never re-enters the proxy pipeline.
 
 use std::time::Duration;
 
@@ -14,13 +15,15 @@ use crate::db::models::Provider;
 use crate::protocol::ir::MediaSource;
 use crate::provider::common::openai::openai_build_url;
 
-use super::config::VisionShimConfig;
+use super::config::HelperBackend;
 
-/// Outcome of one helper caption call.
+/// Outcome of one helper caption call (or a failover chain of them).
 pub(crate) struct CaptionCall {
     pub text: Option<String>,
     pub error: Option<String>,
     pub usage_total_tokens: Option<u64>,
+    /// The helper backend model that produced `text`, when successful.
+    pub used_model: Option<String>,
 }
 
 impl CaptionCall {
@@ -29,17 +32,62 @@ impl CaptionCall {
             text: None,
             error: Some(error),
             usage_total_tokens: None,
+            used_model: None,
         }
     }
 }
 
-/// Transcribe one image via the helper model.
-pub(crate) async fn caption_image(
+/// Caption one image, trying every helper backend in order until one
+/// succeeds. The returned error summarizes the whole chain on total failure.
+pub(crate) async fn caption_with_failover(
     gw: &Gateway,
-    provider: &Provider,
-    cfg: &VisionShimConfig,
+    backends: &[(HelperBackend, Provider)],
     source: &MediaSource,
     prompt: &str,
+    max_tokens: u32,
+    timeout: Duration,
+) -> CaptionCall {
+    let mut errors: Vec<String> = Vec::new();
+    for (helper, provider) in backends {
+        let call = caption_image(
+            gw,
+            provider,
+            &helper.model,
+            source,
+            prompt,
+            max_tokens,
+            timeout,
+        )
+        .await;
+        if let Some(text) = call.text {
+            return CaptionCall {
+                text: Some(text),
+                error: None,
+                usage_total_tokens: call.usage_total_tokens,
+                used_model: Some(helper.model.clone()),
+            };
+        }
+        errors.push(format!(
+            "{}@{}: {}",
+            helper.model,
+            helper.provider,
+            call.error.unwrap_or_else(|| "unknown error".to_string())
+        ));
+    }
+    CaptionCall::failed(format!(
+        "all helper backends failed — {}",
+        errors.join("; ")
+    ))
+}
+
+/// Transcribe one image via one helper backend.
+async fn caption_image(
+    gw: &Gateway,
+    provider: &Provider,
+    model: &str,
+    source: &MediaSource,
+    prompt: &str,
+    max_tokens: u32,
     timeout: Duration,
 ) -> CaptionCall {
     let image_url = match image_wire_url(source) {
@@ -53,8 +101,8 @@ pub(crate) async fn caption_image(
     };
 
     let body = serde_json::json!({
-        "model": cfg.helper_model,
-        "max_tokens": cfg.caption_max_tokens,
+        "model": model,
+        "max_tokens": max_tokens,
         "temperature": 0,
         "messages": [{
             "role": "user",
@@ -106,11 +154,13 @@ pub(crate) async fn caption_image(
             text: Some(text),
             error: None,
             usage_total_tokens,
+            used_model: None,
         },
         None => CaptionCall {
             text: None,
             error: Some("helper returned no caption text".to_string()),
             usage_total_tokens,
+            used_model: None,
         },
     }
 }
