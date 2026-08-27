@@ -42,6 +42,7 @@ impl CaptionCall {
 pub(crate) async fn caption_with_failover(
     gw: &Gateway,
     backends: &[(HelperBackend, Provider)],
+    disable_thinking: Option<bool>,
     source: &MediaSource,
     prompt: &str,
     max_tokens: u32,
@@ -49,10 +50,17 @@ pub(crate) async fn caption_with_failover(
 ) -> CaptionCall {
     let mut errors: Vec<String> = Vec::new();
     for (helper, provider) in backends {
+        let thinking_off = disable_thinking.unwrap_or_else(|| {
+            super::config::provider_is_glm_family(
+                provider.vendor.as_deref().unwrap_or(""),
+                &provider.base_url,
+            )
+        });
         let call = caption_image(
             gw,
             provider,
             &helper.model,
+            thinking_off,
             source,
             prompt,
             max_tokens,
@@ -81,10 +89,17 @@ pub(crate) async fn caption_with_failover(
 }
 
 /// Transcribe one image via one helper backend.
+///
+/// `thinking_off` adds `thinking: {"type":"disabled"}` — GLM-family hybrid
+/// models accept it, and captions do not benefit from chain-of-thought:
+/// thinking only burns the output budget (starving `message.content` to
+/// empty when it exceeds `max_tokens`) and multiplies latency.
+#[allow(clippy::too_many_arguments)]
 async fn caption_image(
     gw: &Gateway,
     provider: &Provider,
     model: &str,
+    thinking_off: bool,
     source: &MediaSource,
     prompt: &str,
     max_tokens: u32,
@@ -100,7 +115,7 @@ async fn caption_image(
         Err(err) => return CaptionCall::failed(format!("helper http client: {err}")),
     };
 
-    let body = serde_json::json!({
+    let mut body = serde_json::json!({
         "model": model,
         "max_tokens": max_tokens,
         "temperature": 0,
@@ -112,6 +127,10 @@ async fn caption_image(
             ]
         }]
     });
+
+    if thinking_off {
+        body["thinking"] = serde_json::json!({ "type": "disabled" });
+    }
 
     let mut builder = client.post(&endpoint).timeout(timeout);
     let api_key = provider.api_key.trim();
@@ -156,12 +175,23 @@ async fn caption_image(
             usage_total_tokens,
             used_model: None,
         },
-        None => CaptionCall {
-            text: None,
-            error: Some("helper returned no caption text".to_string()),
-            usage_total_tokens,
-            used_model: None,
-        },
+        None => {
+            // Hybrid-reasoning helpers can return an empty `content` when the
+            // thinking chain consumed the output budget (finish_reason
+            // "length") or put everything into `reasoning_content`.
+            let finish = parsed
+                .pointer("/choices/0/finish_reason")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            CaptionCall {
+                text: None,
+                error: Some(format!(
+                    "helper returned no caption text (finish_reason={finish}; likely thinking consumed the max_tokens budget)"
+                )),
+                usage_total_tokens,
+                used_model: None,
+            }
+        }
     }
 }
 

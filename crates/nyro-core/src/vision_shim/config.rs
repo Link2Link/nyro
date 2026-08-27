@@ -59,13 +59,32 @@ pub struct VisionShimConfig {
     pub max_image_bytes: usize,
     /// Caption cache TTL in seconds.
     pub cache_ttl_secs: u64,
-    /// `max_tokens` for the helper caption call.
+    /// `max_tokens` for the helper caption call. Hybrid-reasoning helpers
+    /// spend this budget on thinking first, so it must cover the chain of
+    /// thought plus the caption itself.
     pub caption_max_tokens: u32,
+    /// Whether to request the helper with thinking disabled
+    /// (`thinking: {"type":"disabled"}`), which GLM-family models accept.
+    /// `None` (default) auto-detects: disabled for GLM-family vendors
+    /// (zhipuai / zai / bigmodel / z.ai), left alone elsewhere.
+    pub helper_disable_thinking: Option<bool>,
     /// Failure policy for helper errors.
     pub on_failure: VisionShimFailureMode,
     /// Optional full override of the caption prompt template. `{question}`
     /// is substituted with the user's latest question when present.
     pub prompt_override: Option<String>,
+}
+
+/// Auto-detect whether a helper provider belongs to the GLM family (whose
+/// OpenAI-compatible endpoints accept `thinking` and whose hybrid models
+/// otherwise burn the caption budget on chain-of-thought).
+pub(crate) fn provider_is_glm_family(vendor: &str, base_url: &str) -> bool {
+    let vendor = vendor.trim().to_ascii_lowercase();
+    if matches!(vendor.as_str(), "zhipuai" | "zai" | "glm" | "bigmodel") {
+        return true;
+    }
+    let base = base_url.trim().to_ascii_lowercase();
+    base.contains("bigmodel.cn") || base.contains("z.ai")
 }
 
 impl Default for VisionShimConfig {
@@ -77,7 +96,8 @@ impl Default for VisionShimConfig {
             max_images: 8,
             max_image_bytes: 10 * 1024 * 1024,
             cache_ttl_secs: 24 * 60 * 60,
-            caption_max_tokens: 1024,
+            caption_max_tokens: 2048,
+            helper_disable_thinking: None,
             on_failure: VisionShimFailureMode::default(),
             prompt_override: None,
         }
@@ -186,7 +206,7 @@ mod tests {
         assert_eq!(cfg.max_images, 8);
         assert_eq!(cfg.max_image_bytes, 10 * 1024 * 1024);
         assert_eq!(cfg.cache_ttl_secs, 86_400);
-        assert_eq!(cfg.caption_max_tokens, 1024);
+        assert_eq!(cfg.caption_max_tokens, 2048);
         assert_eq!(cfg.on_failure, VisionShimFailureMode::Placeholder);
         assert!(cfg.is_enabled());
     }
@@ -229,6 +249,22 @@ mod tests {
         let cfg =
             VisionShimConfig::parse(r#"{"helper_model":"x","helper_provider":"pOther"}"#).unwrap();
         assert_eq!(cfg.helper_list("pRoute")[0].provider, "pOther");
+    }
+
+    #[test]
+    fn glm_family_detection_covers_vendor_and_base_url() {
+        assert!(provider_is_glm_family("zhipuai", "https://example.com"));
+        assert!(provider_is_glm_family("zai", "https://example.com"));
+        assert!(provider_is_glm_family(
+            "",
+            "https://open.bigmodel.cn/api/coding/paas/v4"
+        ));
+        assert!(provider_is_glm_family("", "https://api.z.ai/api/paas/v4"));
+        assert!(!provider_is_glm_family(
+            "deepseek",
+            "https://api.deepseek.com/v1"
+        ));
+        assert!(!provider_is_glm_family("", "https://api.openai.com/v1"));
     }
 
     #[test]

@@ -380,3 +380,75 @@ async fn helper_backends_matching_route_targets_are_skipped() {
     assert_eq!(format!("{request:?}"), before);
     assert!(calls.lock().unwrap().is_empty());
 }
+
+#[tokio::test]
+async fn glm_family_helper_gets_thinking_disabled() {
+    // GLM-family provider (by vendor field): the caption request must carry
+    // thinking disabled so hybrid reasoning cannot starve `content`.
+    let (base_url, calls) = spawn_helper(Some("a blue circle")).await;
+    let mut provider = provider_row("glm-p", &base_url);
+    provider.vendor = Some("zhipuai".to_string());
+    let gw = gateway_with(vec![provider], vec![shim_model("glm-p")]).await;
+
+    let mut request = image_request("glm-5.3", "aXNvbWU=", "what is it?");
+    let stats = vision_shim::apply(&gw, &mut request).await.unwrap();
+    assert_eq!(stats.captioned, 1);
+
+    let thinking_type = {
+        let calls = calls.lock().unwrap();
+        calls[0]["thinking"]["type"].clone()
+    };
+    assert_eq!(thinking_type, "disabled");
+
+    // Non-GLM provider: no thinking field injected.
+    let (base2, calls2) = spawn_helper(Some("plain caption")).await;
+    let plain = provider_row("plain-p", &base2);
+    let gw2 = gateway_with(vec![plain], vec![shim_model("plain-p")]).await;
+    let mut request2 = image_request("glm-5.3", "cGxhaW4=", "what is it?");
+    vision_shim::apply(&gw2, &mut request2).await.unwrap();
+    assert!(calls2.lock().unwrap()[0].get("thinking").is_none());
+}
+
+#[tokio::test]
+async fn empty_helper_content_degrades_to_placeholder_with_finish_reason() {
+    // Helper answers 200 but with empty content — the reasoning-starvation
+    // failure mode seen in production. The placeholder must surface the
+    // finish_reason for diagnosis.
+    let app = axum::Router::new().route(
+        "/v1/chat/completions",
+        axum::routing::post(|| async {
+            axum::Json(serde_json::json!({
+                "choices": [{
+                    "message": { "role": "assistant", "content": "" },
+                    "finish_reason": "length"
+                }],
+                "usage": { "total_tokens": 999 }
+            }))
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let gw = gateway_with(
+        vec![provider_row("starved", &format!("http://{addr}"))],
+        vec![shim_model("starved")],
+    )
+    .await;
+
+    let mut request = image_request("glm-5.3", "c3RhcnZl", "describe");
+    let stats = vision_shim::apply(&gw, &mut request).await.unwrap();
+    assert_eq!(stats.captioned, 0);
+    assert_eq!(stats.placeholders, 1);
+    let text = user_text(&request);
+    assert!(
+        text.contains("finish_reason=length"),
+        "diagnostic in placeholder: {text}"
+    );
+    assert!(
+        text.contains("thinking consumed"),
+        "root-cause hint in placeholder: {text}"
+    );
+}
