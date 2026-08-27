@@ -744,11 +744,19 @@ async fn dispatch_pipeline_inner(
         );
 
         // Build outbound request — PassThrough (Native + no mutations) or full 7-step pipeline.
+        // A hook that mutated the IR after the baseline snapshot (e.g. the
+        // vision shim replacing image blocks with caption text) must publish
+        // `RequestMutated`; the verbatim client body would otherwise leak
+        // past the rewrite via the native passthrough.
+        let ir_mutated_by_hook = ctx
+            .extensions
+            .contains::<crate::plugin::phase::RequestMutated>();
         let passthrough_req = !compat_candidate
             && plan.mode == ProtocolMode::Native
             && !adapter.declared_request_mutations()
             && !tool_route_plan.is_active()
-            && !param_override_applied;
+            && !param_override_applied
+            && !ir_mutated_by_hook;
 
         let resolved_conversion =
             crate::conversion::resolve_conversion(crate::conversion::ResolveConversionInput {
@@ -1997,6 +2005,7 @@ mod tests {
                 }],
                 enable_auth: Some(false),
                 enable_payload: None,
+                vision_shim: None,
             })
             .await
             .expect("model create");
@@ -2092,6 +2101,7 @@ mod tests {
                 }],
                 enable_auth: Some(false),
                 enable_payload: None,
+                vision_shim: None,
             })
             .await
             .expect("model create");

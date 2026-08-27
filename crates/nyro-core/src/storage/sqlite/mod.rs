@@ -608,7 +608,7 @@ struct SqliteModelStore {
 impl ModelStore for SqliteModelStore {
     async fn list(&self) -> anyhow::Result<Vec<Model>> {
         Ok(sqlx::query_as::<_, Model>(
-            "SELECT id, name, COALESCE(balance, 'weighted') AS balance, target_provider, target_model, COALESCE(enable_auth, 0) AS enable_auth, enable_payload, COALESCE(is_enabled, 1) AS is_enabled, created_at FROM models ORDER BY created_at DESC",
+            "SELECT id, name, COALESCE(balance, 'weighted') AS balance, target_provider, target_model, COALESCE(enable_auth, 0) AS enable_auth, enable_payload, vision_shim, COALESCE(is_enabled, 1) AS is_enabled, created_at FROM models ORDER BY created_at DESC",
         )
         .fetch_all(&self.pool)
         .await?)
@@ -616,7 +616,7 @@ impl ModelStore for SqliteModelStore {
 
     async fn get(&self, id: &str) -> anyhow::Result<Option<Model>> {
         Ok(sqlx::query_as::<_, Model>(
-            "SELECT id, name, COALESCE(balance, 'weighted') AS balance, target_provider, target_model, COALESCE(enable_auth, 0) AS enable_auth, enable_payload, COALESCE(is_enabled, 1) AS is_enabled, created_at FROM models WHERE id = ?",
+            "SELECT id, name, COALESCE(balance, 'weighted') AS balance, target_provider, target_model, COALESCE(enable_auth, 0) AS enable_auth, enable_payload, vision_shim, COALESCE(is_enabled, 1) AS is_enabled, created_at FROM models WHERE id = ?",
         )
         .bind(id)
         .fetch_optional(&self.pool)
@@ -627,7 +627,7 @@ impl ModelStore for SqliteModelStore {
         let id = uuid::Uuid::new_v4().to_string();
         let balance = input.balance.unwrap_or_else(|| "weighted".to_string());
         sqlx::query(
-            "INSERT INTO models (id, name, balance, target_provider, target_model, enable_auth, enable_payload) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO models (id, name, balance, target_provider, target_model, enable_auth, enable_payload, vision_shim) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&id)
         .bind(input.name.trim())
@@ -636,6 +636,9 @@ impl ModelStore for SqliteModelStore {
         .bind(input.target_model.trim())
         .bind(input.enable_auth.unwrap_or(false))
         .bind(input.enable_payload)
+        .bind(crate::db::models::vision_shim_value_to_raw(
+            input.vision_shim.as_ref().unwrap_or(&serde_json::Value::Null),
+        )?)
         .execute(&self.pool)
         .await?;
         self.get(&id).await?.context("model missing after create")
@@ -650,9 +653,13 @@ impl ModelStore for SqliteModelStore {
         let enable_auth = input.enable_auth.unwrap_or(current.enable_auth);
         let enable_payload = input.enable_payload.unwrap_or(current.enable_payload);
         let is_enabled = input.is_enabled.unwrap_or(current.is_enabled);
+        let vision_shim = match input.vision_shim.as_ref() {
+            Some(value) => crate::db::models::vision_shim_value_to_raw(value)?,
+            None => current.vision_shim.clone(),
+        };
 
         sqlx::query(
-            "UPDATE models SET name=?, balance=?, target_provider=?, target_model=?, enable_auth=?, enable_payload=?, is_enabled=? WHERE id=?",
+            "UPDATE models SET name=?, balance=?, target_provider=?, target_model=?, enable_auth=?, enable_payload=?, vision_shim=?, is_enabled=? WHERE id=?",
         )
         .bind(name.trim())
         .bind(balance.trim().to_lowercase())
@@ -660,6 +667,7 @@ impl ModelStore for SqliteModelStore {
         .bind(target_model.trim())
         .bind(enable_auth)
         .bind(enable_payload)
+        .bind(vision_shim)
         .bind(is_enabled)
         .bind(id)
         .execute(&self.pool)
@@ -707,6 +715,7 @@ impl ModelSnapshotStore for SqliteModelStore {
                 target_provider, target_model,
                 COALESCE(enable_auth, 0) AS enable_auth,
                 enable_payload,
+                vision_shim,
                 COALESCE(is_enabled, 1) AS is_enabled,
                 created_at
             FROM models

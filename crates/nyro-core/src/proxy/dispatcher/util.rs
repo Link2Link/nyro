@@ -188,6 +188,7 @@ mod tests {
             target_model: "upstream-a".to_string(),
             enable_auth: false,
             enable_payload: None,
+            vision_shim: None,
             is_enabled: true,
             created_at: String::new(),
             targets: targets.clone(),

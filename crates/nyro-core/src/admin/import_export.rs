@@ -81,6 +81,7 @@ impl AdminService {
                     target_model: m.target_model,
                     enable_auth: m.enable_auth,
                     enable_payload: m.enable_payload,
+                    vision_shim: m.vision_shim,
                     is_enabled: m.is_enabled,
                 })
                 .collect(),
@@ -181,6 +182,10 @@ impl AdminService {
                         targets: vec![],
                         enable_auth: Some(m.enable_auth),
                         enable_payload: m.enable_payload,
+                        vision_shim: m
+                            .vision_shim
+                            .as_deref()
+                            .and_then(|raw| serde_json::from_str(raw).ok()),
                     })
                     .await
                     .is_ok()

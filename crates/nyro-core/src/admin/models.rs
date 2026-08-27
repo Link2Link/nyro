@@ -19,6 +19,7 @@ impl AdminService {
         let balance = normalize_model_balance(input.balance.as_deref())?;
         let backends = normalize_create_model_backends(&input)?;
         ensure_model_backends_valid(&backends)?;
+        let vision_shim = normalize_vision_shim(&input.vision_shim)?;
         let primary_backend = backends
             .first()
             .ok_or_else(|| anyhow::anyhow!("at least one model backend is required"))?;
@@ -35,6 +36,7 @@ impl AdminService {
                 targets: vec![],
                 enable_auth: input.enable_auth,
                 enable_payload: input.enable_payload,
+                vision_shim,
             })
             .await?;
         if let Some(store) = self.gw.storage.model_backends() {
@@ -62,6 +64,7 @@ impl AdminService {
         let enable_auth = input.enable_auth.unwrap_or(current.enable_auth);
         let enable_payload = input.enable_payload.unwrap_or(current.enable_payload);
         let is_enabled = input.is_enabled.unwrap_or(current.is_enabled);
+        let vision_shim = normalize_vision_shim(&input.vision_shim)?;
 
         self.gw
             .storage
@@ -76,6 +79,7 @@ impl AdminService {
                     targets: None,
                     enable_auth: Some(enable_auth),
                     enable_payload: Some(enable_payload),
+                    vision_shim,
                     is_enabled: Some(is_enabled),
                 },
             )
@@ -138,5 +142,21 @@ impl AdminService {
             .await
             .reload(self.gw.storage.snapshots())
             .await
+    }
+}
+
+/// Validate an incoming vision-shim DTO value.
+///
+/// `None` / `null` mean "no change" (or "not configured" on create); a JSON
+/// object is passed through (an empty object clears/disables the shim);
+/// anything else is rejected so typos surface at the admin boundary.
+pub(super) fn normalize_vision_shim(
+    value: &Option<serde_json::Value>,
+) -> anyhow::Result<Option<serde_json::Value>> {
+    match value {
+        None => Ok(None),
+        Some(value) if value.is_null() => Ok(None),
+        Some(value @ serde_json::Value::Object(_)) => Ok(Some(value.clone())),
+        Some(other) => anyhow::bail!("vision_shim must be a JSON object, got: {other}"),
     }
 }

@@ -266,11 +266,43 @@ pub struct Model {
     #[serde(alias = "access_control")]
     pub enable_auth: bool,
     pub enable_payload: Option<bool>,
+    /// Vision-shim configuration JSON (see `VisionShimConfig`). Presence of a
+    /// parsed config with a helper model enables the multimodal facade for
+    /// this route.
+    #[serde(default)]
+    pub vision_shim: Option<String>,
     pub is_enabled: bool,
     pub created_at: String,
     #[serde(default)]
     #[sqlx(skip)]
     pub targets: Vec<ModelBackend>,
+}
+
+impl Model {
+    /// Parsed vision-shim configuration, when the route carries one that is
+    /// enabled (non-empty helper model).
+    pub fn vision_shim_config(&self) -> Option<crate::vision_shim::VisionShimConfig> {
+        self.vision_shim
+            .as_deref()
+            .and_then(crate::vision_shim::VisionShimConfig::parse)
+    }
+}
+
+/// Normalize a vision-shim DTO value into the raw JSON string stored on the
+/// model row. `None` / `null` keep whatever the caller means by absence
+/// (storage layers decide keep-vs-clear semantics); an empty object clears
+/// the shim; any other object is stored verbatim.
+///
+/// Returns `Err` for non-object values so admin surfaces reject typos early.
+pub fn vision_shim_value_to_raw(value: &serde_json::Value) -> anyhow::Result<Option<String>> {
+    match value {
+        serde_json::Value::Null => Ok(None),
+        serde_json::Value::Object(map) if map.is_empty() => Ok(None),
+        serde_json::Value::Object(_) => serde_json::to_string(value)
+            .map(Some)
+            .map_err(|error| anyhow::anyhow!("vision_shim serialization failed: {error}")),
+        other => anyhow::bail!("vision_shim must be a JSON object, got: {other}"),
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
@@ -481,6 +513,10 @@ pub struct UpdateModel {
     #[serde(alias = "access_control")]
     pub enable_auth: Option<bool>,
     pub enable_payload: Option<Option<bool>>,
+    /// Vision-shim config object. `None` keeps the current value; an object
+    /// (even empty — clears the shim) replaces it.
+    #[serde(default)]
+    pub vision_shim: Option<serde_json::Value>,
     pub is_enabled: Option<bool>,
 }
 
@@ -497,6 +533,9 @@ pub struct CreateModel {
     #[serde(alias = "access_control")]
     pub enable_auth: Option<bool>,
     pub enable_payload: Option<bool>,
+    /// Vision-shim config object (`{}` clears / disables the shim).
+    #[serde(default)]
+    pub vision_shim: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -934,6 +973,9 @@ pub struct ExportModel {
     pub enable_auth: bool,
     #[serde(default)]
     pub enable_payload: Option<bool>,
+    /// Raw vision-shim config JSON carried through export/import.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vision_shim: Option<String>,
     pub is_enabled: bool,
 }
 

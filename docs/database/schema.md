@@ -87,6 +87,7 @@ Provider 的协议端点明细。固定模式保留一条兼容记录；自适�
 | `target_model` | TEXT NOT NULL | — | 默认后端使用的上游模型名 |
 | `enable_auth` | INTEGER | `0` | 是否启用 API Key 访问控制 |
 | `enable_payload` | INTEGER | — | 是否记录载荷（headers/bodies）。NULL = 默认记录（受全局 `enable_payload` 开关控制） |
+| `vision_shim` | TEXT | — | 视觉垫片配置 JSON（`VisionShimConfig`）。配置了含 `helper_model` 的对象时，该路由启用多模态门面：请求中的图片先由 helper 模型转录为文字再出站。空对象 `{}` 表示清除 |
 | `is_enabled` | INTEGER | `1` | 是否启用 |
 | `priority` | INTEGER | `0` | 优先级（预留） |
 | `created_at` | TEXT | `datetime('now')` | 创建时间 |

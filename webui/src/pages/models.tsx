@@ -38,6 +38,8 @@ type ModelForm = {
   targets: ModelBackendForm[];
   enable_auth: boolean;
   enable_payload: boolean;
+  vision_shim_enabled: boolean;
+  vision_helper_model: string;
 };
 
 type ModelBackendForm = {
@@ -54,7 +56,20 @@ const emptyCreate: ModelForm = {
   targets: [{ provider_id: "", model: "", weight: 100, priority: 1 }],
   enable_auth: true,
   enable_payload: true,
+  vision_shim_enabled: false,
+  vision_helper_model: "",
 };
+
+function parseVisionShimHelper(raw?: string | null): string | null {
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw) as { helper_model?: string };
+    const helper = parsed.helper_model?.trim();
+    return helper ? helper : null;
+  } catch {
+    return null;
+  }
+}
 
 function FieldLabel({ children }: { children: string }) {
   return <label className="ml-1 text-xs leading-none font-normal text-slate-900">{children}</label>;
@@ -128,6 +143,54 @@ function ModelToggleControl({
           disabled={disabled}
           onCheckedChange={onCheckedChange}
         />
+      </div>
+    </div>
+  );
+}
+
+function VisionFacadeControl({
+  isZh,
+  enabled,
+  helperModel,
+  onEnabledChange,
+  onHelperModelChange,
+}: {
+  isZh: boolean;
+  enabled: boolean;
+  helperModel: string;
+  onEnabledChange: (checked: boolean) => void;
+  onHelperModelChange: (value: string) => void;
+}) {
+  return (
+    <div className="space-y-2">
+      <FieldLabel>{isZh ? "视觉垫片（多模态门面）" : "Vision Facade (Multimodal Shim)"}</FieldLabel>
+      <div className="space-y-2 rounded-lg border border-slate-200 bg-white px-3 py-2.5">
+        <div className="flex items-center justify-between">
+          <div className="flex items-center gap-2">
+            <ToggleStatusLabel enabled={enabled} isZh={isZh} />
+            <span className="text-xs text-slate-600">
+              {enabled
+                ? isZh
+                  ? "请求中的图片先由 helper 模型转录为文字再发给本模型"
+                  : "Images are transcribed to text by the helper model before reaching this model"
+                : isZh
+                  ? "图片请求将原样透传（纯文本模型会拒绝图片）"
+                  : "Image requests pass through unchanged (text-only models reject images)"}
+            </span>
+          </div>
+          <Switch checked={enabled} onCheckedChange={onEnabledChange} />
+        </div>
+        {enabled && (
+          <div className="space-y-1.5">
+            <FieldLabel>{isZh ? "Helper 模型（同 provider 的多模态模型）" : "Helper model (multimodal model on the same provider)"}</FieldLabel>
+            <Input
+              value={helperModel}
+              onChange={(event) => onHelperModelChange(event.target.value)}
+              placeholder={isZh ? "例如 glm-5.3-flash" : "e.g. glm-5.3-flash"}
+              className="h-9"
+            />
+          </div>
+        )}
       </div>
     </div>
   );
@@ -446,6 +509,7 @@ export default function ModelsPage() {
           priority: t.priority ?? 1,
         }))
       : [{ provider_id: route.target_provider, model: route.target_model, weight: 100, priority: 1 }];
+    const visionHelper = parseVisionShimHelper(route.vision_shim);
     setEditForm({
       id: route.id,
       name: route.name,
@@ -453,6 +517,8 @@ export default function ModelsPage() {
       targets,
       enable_auth: route.enable_auth,
       enable_payload: route.enable_payload ?? false,
+      vision_shim_enabled: Boolean(visionHelper),
+      vision_helper_model: visionHelper ?? "",
     });
   }
 
@@ -631,6 +697,13 @@ export default function ModelsPage() {
                 onCheckedChange={(checked) => setCreateForm((prev) => ({ ...prev, enable_payload: checked }))}
               />
             )}
+            <VisionFacadeControl
+              isZh={isZh}
+              enabled={createForm.vision_shim_enabled}
+              helperModel={createForm.vision_helper_model}
+              onEnabledChange={(checked) => setCreateForm((prev) => ({ ...prev, vision_shim_enabled: checked }))}
+              onHelperModelChange={(value) => setCreateForm((prev) => ({ ...prev, vision_helper_model: value }))}
+            />
           </div>
           <div className="flex gap-3">
             <Button
@@ -807,6 +880,17 @@ export default function ModelsPage() {
                         }
                       />
                     )}
+                    <VisionFacadeControl
+                      isZh={isZh}
+                      enabled={editForm.vision_shim_enabled}
+                      helperModel={editForm.vision_helper_model}
+                      onEnabledChange={(checked) =>
+                        setEditForm((prev) => (prev ? { ...prev, vision_shim_enabled: checked } : prev))
+                      }
+                      onHelperModelChange={(value) =>
+                        setEditForm((prev) => (prev ? { ...prev, vision_helper_model: value } : prev))
+                      }
+                    />
                   </div>
                   <div className="flex gap-3">
                     <Button
@@ -858,6 +942,13 @@ export default function ModelsPage() {
                     >
                       {balanceLabel(route.balance ?? "weighted", isZh)}
                     </Badge>
+                    {parseVisionShimHelper(route.vision_shim) && (
+                      <Badge variant="secondary" className="connect-label-badge bg-violet-50 text-violet-700">
+                        {isZh
+                          ? `视觉垫片 · ${parseVisionShimHelper(route.vision_shim)}`
+                          : `Vision · ${parseVisionShimHelper(route.vision_shim)}`}
+                      </Badge>
+                    )}
                     {route.enable_auth && (
                       <Badge variant="success" className="connect-label-badge">
                         {isZh ? "鉴权" : "Auth"}
@@ -980,6 +1071,10 @@ function buildCreatePayload(form: ModelForm): CreateModel {
     target_model: primary.model,
     enable_auth: form.enable_auth,
     enable_payload: form.enable_payload,
+    vision_shim:
+      form.vision_shim_enabled && form.vision_helper_model.trim()
+        ? { helper_model: form.vision_helper_model.trim() }
+        : undefined,
   };
 }
 
@@ -1000,5 +1095,10 @@ function buildUpdatePayload(form: ModelForm & { id: string }): UpdateModel {
     target_model: primary.model,
     enable_auth: form.enable_auth,
     enable_payload: form.enable_payload,
+    // An empty object clears the shim; absence would keep the stored value.
+    vision_shim:
+      form.vision_shim_enabled && form.vision_helper_model.trim()
+        ? { helper_model: form.vision_helper_model.trim() }
+        : {},
   };
 }

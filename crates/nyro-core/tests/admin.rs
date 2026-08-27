@@ -89,6 +89,7 @@ async fn copy_provider_can_copy_matching_route_targets_to_copied_provider() -> a
             ],
             enable_auth: Some(true),
             enable_payload: None,
+            vision_shim: None,
         })
         .await?;
 
@@ -160,6 +161,7 @@ async fn copy_provider_does_not_append_targets_by_default() -> anyhow::Result<()
             targets: vec![],
             enable_auth: None,
             enable_payload: None,
+            vision_shim: None,
         })
         .await?;
 
@@ -195,6 +197,7 @@ async fn delete_provider_removes_route_associations_before_provider() -> anyhow:
             targets: vec![],
             enable_auth: None,
             enable_payload: None,
+            vision_shim: None,
         })
         .await?;
     let kept_route = gw
@@ -220,6 +223,7 @@ async fn delete_provider_removes_route_associations_before_provider() -> anyhow:
             ],
             enable_auth: None,
             enable_payload: None,
+            vision_shim: None,
         })
         .await?;
 
@@ -336,6 +340,7 @@ async fn config_epoch_starts_at_zero_and_increments_on_model_create() -> anyhow:
             targets: vec![],
             enable_auth: Some(false),
             enable_payload: None,
+            vision_shim: None,
         })
         .await?;
 
@@ -372,6 +377,7 @@ async fn config_epoch_increments_on_model_update_and_delete() -> anyhow::Result<
             targets: vec![],
             enable_auth: Some(false),
             enable_payload: None,
+            vision_shim: None,
         })
         .await?;
 

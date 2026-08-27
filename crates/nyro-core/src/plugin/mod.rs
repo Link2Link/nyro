@@ -19,7 +19,7 @@ pub mod phase;
 
 pub use phase::{
     HostContext, Phase, PhaseCtx, PhaseHook, PhaseHookRegistration, PhaseHookRegistry,
-    PhaseOutcome, ResponseStats, ResponseView,
+    PhaseOutcome, RequestMutated, ResponseStats, ResponseView,
 };
 
 use std::sync::OnceLock;

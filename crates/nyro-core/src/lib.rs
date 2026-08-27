@@ -12,6 +12,7 @@ pub mod provider;
 pub mod proxy;
 pub mod router;
 pub mod storage;
+pub mod vision_shim;
 
 use std::collections::HashMap;
 use std::future::Future;

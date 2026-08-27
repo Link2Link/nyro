@@ -34,6 +34,7 @@ export interface Model {
   target_model: string;
   enable_auth: boolean;
   enable_payload?: boolean | null;
+  vision_shim?: string | null;
   is_enabled: boolean;
   created_at: string;
   targets: ModelBackend[];
@@ -463,6 +464,7 @@ export interface CreateModel {
   targets?: CreateModelBackend[];
   enable_auth?: boolean;
   enable_payload?: boolean | null;
+  vision_shim?: { helper_model?: string; [key: string]: unknown };
 }
 
 export interface UpdateModel {
@@ -473,6 +475,7 @@ export interface UpdateModel {
   targets?: UpsertModelBackend[];
   enable_auth?: boolean;
   enable_payload?: boolean | null;
+  vision_shim?: { helper_model?: string; [key: string]: unknown };
   is_enabled?: boolean;
 }
 

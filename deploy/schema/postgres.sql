@@ -63,6 +63,7 @@ CREATE TABLE IF NOT EXISTS models (
     target_model TEXT NOT NULL,
     enable_auth BOOLEAN DEFAULT FALSE,
     enable_payload BOOLEAN,
+    vision_shim TEXT,
     is_enabled BOOLEAN DEFAULT TRUE,
     priority INTEGER DEFAULT 0,
     created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP

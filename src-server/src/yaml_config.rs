@@ -161,6 +161,10 @@ pub struct YamlModel {
     pub backends: Vec<YamlModelBackend>,
     #[serde(default, alias = "access_control")]
     pub enable_auth: bool,
+    /// Vision-shim configuration object (multimodal facade over a text-only
+    /// target); see `nyro_core::vision_shim::VisionShimConfig`.
+    #[serde(default)]
+    pub vision_shim: Option<serde_json::Value>,
     // Deprecated: route_type / type was removed; captured here only to emit a warning.
     #[serde(default, alias = "type")]
     pub route_type: Option<String>,
@@ -508,6 +512,11 @@ pub fn build_models(yaml: &YamlConfig, providers: &[Provider]) -> Vec<Model> {
                 target_model: primary.map(|b| b.model.clone()).unwrap_or_default(),
                 enable_auth: ym.enable_auth,
                 enable_payload: None,
+                vision_shim: ym
+                    .vision_shim
+                    .as_ref()
+                    .and_then(|value| serde_json::to_string(value).ok())
+                    .filter(|raw| !raw.is_empty()),
                 is_enabled: true,
                 created_at: now,
                 targets: backends,

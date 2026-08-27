@@ -61,6 +61,13 @@ pub enum ResponseView<'a> {
     Stream(&'a mut AiStreamDelta),
 }
 
+/// Marker a hook inserts into `ctx.extensions` when it has mutated the IR
+/// request after the dispatcher's baseline snapshot. Its presence forces the
+/// re-encode path (the verbatim client-body passthrough is skipped), so the
+/// rewritten IR — not the original wire body — reaches the upstream.
+#[derive(Debug, Clone, Copy)]
+pub struct RequestMutated;
+
 /// Canonical response-side snapshot for one request, injected into
 /// [`RequestContext::extensions`] by the native `OnResponse` step so that
 /// `OnLog` (and `OnLogHook`) read a single consistent set of metrics rather than
