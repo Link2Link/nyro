@@ -1862,23 +1862,131 @@ mod tests {
         );
     }
 
-/// 思考强制开启的 GLM 模型（官方文档：thinking.type 仅支持 enabled、
-/// 不支持关闭思考，off 意图「请求将失败」）：off 全形态（含 misspelling）
-/// 在 zhipuai 直连上钳为 low，其余档位原样透传。
-#[tokio::test]
-async fn passthrough_clamps_off_effort_to_low_for_thinking_mandatory_glm() {
-    let gw = build_test_gateway().await;
-    let provider = provider_with_vendor("sk-glm", Some("zhipuai"));
+    /// 思考强制开启的 GLM 模型（官方文档：thinking.type 仅支持 enabled、
+    /// 不支持关闭思考，off 意图「请求将失败」）：off 全形态（含 misspelling）
+    /// 在 zhipuai 直连上钳为 low，其余档位原样透传。
+    #[tokio::test]
+    async fn passthrough_clamps_off_effort_to_low_for_thinking_mandatory_glm() {
+        let gw = build_test_gateway().await;
+        let provider = provider_with_vendor("sk-glm", Some("zhipuai"));
 
-    for model in ["glm-5.3", "glm-5.3-flash"] {
-        let ctx = openai_chat_ctx(&provider, &gw, model);
-        for raw in ["none", "disable", "disabled", "off"] {
+        for model in ["glm-5.3", "glm-5.3-flash"] {
+            let ctx = openai_chat_ctx(&provider, &gw, model);
+            for raw in ["none", "disable", "disabled", "off"] {
+                let out = passthrough_run(
+                    &FakeApiKeyVendor,
+                    serde_json::json!({
+                        "model": model,
+                        "messages": [{"role":"user","content":"ping"}],
+                        "reasoning_effort": raw
+                    }),
+                    &ctx,
+                    false,
+                )
+                .await
+                .expect("passthrough succeeds");
+
+                assert_eq!(
+                    out.body["reasoning_effort"], "low",
+                    "model={model} raw={raw} must clamp to low (thinking cannot be disabled)",
+                );
+            }
+
+            for raw in ["low", "high", "max"] {
+                let out = passthrough_run(
+                    &FakeApiKeyVendor,
+                    serde_json::json!({
+                        "model": model,
+                        "messages": [{"role":"user","content":"ping"}],
+                        "reasoning_effort": raw
+                    }),
+                    &ctx,
+                    false,
+                )
+                .await
+                .expect("passthrough succeeds");
+
+                assert_eq!(
+                    out.body["reasoning_effort"], raw,
+                    "model={model} raw={raw} must pass through",
+                );
+            }
+
+            // 官方三档之外的已知档位：窄化映射（minimal→low；medium/xhigh→high，
+            // 保推理质量取向）。
+            for (raw, expect) in [("minimal", "low"), ("medium", "high"), ("xhigh", "high")] {
+                let out = passthrough_run(
+                    &FakeApiKeyVendor,
+                    serde_json::json!({
+                        "model": model,
+                        "messages": [{"role":"user","content":"ping"}],
+                        "reasoning_effort": raw
+                    }),
+                    &ctx,
+                    false,
+                )
+                .await
+                .expect("passthrough succeeds");
+
+                assert_eq!(
+                    out.body["reasoning_effort"], expect,
+                    "model={model} raw={raw} must narrow down to {expect}",
+                );
+            }
+        }
+    }
+
+    /// Responses 直通形态：嵌套 reasoning.effort 的 off 意图同样钳为 low，
+    /// 且保留 summary 等兄弟键（bigmodel 官方提供 OpenAI Responses 端点）。
+    #[tokio::test]
+    async fn responses_passthrough_clamps_nested_reasoning_effort_for_glm() {
+        let gw = build_test_gateway().await;
+        let provider = provider_with_vendor("sk-glm", Some("zhipuai"));
+
+        for model in ["glm-5.3", "glm-5.3-flash"] {
+            let ctx = responses_ctx_model(&provider, &gw, model);
+            let out = passthrough_run(
+                &FakeApiKeyVendor,
+                serde_json::json!({
+                    "model": model,
+                    "input": "ping",
+                    "reasoning": {
+                        "effort": "disable",
+                        "summary": "auto"
+                    }
+                }),
+                &ctx,
+                false,
+            )
+            .await
+            .expect("passthrough succeeds");
+
+            assert_eq!(
+                out.body["reasoning"]["effort"], "low",
+                "nested reasoning.effort off intent must clamp to low for {model}",
+            );
+            assert_eq!(
+                out.body["reasoning"]["summary"], "auto",
+                "sibling keys in the reasoning object must be preserved",
+            );
+        }
+    }
+
+    /// 模型名匹配规则：大小写不敏感；带日期等短横线后缀的变体一并覆盖；
+    /// 同系已登记模型共享钳制语义，未登记的旧模型不受影响。
+    #[tokio::test]
+    async fn thinking_mandatory_matching_covers_variants_and_skips_unrelated() {
+        let gw = build_test_gateway().await;
+        let provider = provider_with_vendor("sk-glm", Some("zhipuai"));
+
+        for model in ["GLM-5.3-Flash", "glm-5.3-flash-0901"] {
+            let ctx = openai_chat_ctx(&provider, &gw, model);
             let out = passthrough_run(
                 &FakeApiKeyVendor,
                 serde_json::json!({
                     "model": model,
                     "messages": [{"role":"user","content":"ping"}],
-                    "reasoning_effort": raw
+                    "reasoning_effort": "none"
                 }),
                 &ctx,
                 false,
@@ -1888,123 +1996,15 @@ async fn passthrough_clamps_off_effort_to_low_for_thinking_mandatory_glm() {
 
             assert_eq!(
                 out.body["reasoning_effort"], "low",
-                "model={model} raw={raw} must clamp to low (thinking cannot be disabled)",
+                "model={model} is a thinking-mandatory variant and must clamp",
             );
         }
 
-        for raw in ["low", "high", "max"] {
-            let out = passthrough_run(
-                &FakeApiKeyVendor,
-                serde_json::json!({
-                    "model": model,
-                    "messages": [{"role":"user","content":"ping"}],
-                    "reasoning_effort": raw
-                }),
-                &ctx,
-                false,
-            )
-            .await
-            .expect("passthrough succeeds");
-
-            assert_eq!(
-                out.body["reasoning_effort"], raw,
-                "model={model} raw={raw} must pass through",
-            );
-        }
-
-        // 官方三档之外的已知档位：窄化映射（minimal→low；medium/xhigh→high，
-        // 保推理质量取向）。
-        for (raw, expect) in [("minimal", "low"), ("medium", "high"), ("xhigh", "high")] {
-            let out = passthrough_run(
-                &FakeApiKeyVendor,
-                serde_json::json!({
-                    "model": model,
-                    "messages": [{"role":"user","content":"ping"}],
-                    "reasoning_effort": raw
-                }),
-                &ctx,
-                false,
-            )
-            .await
-            .expect("passthrough succeeds");
-
-            assert_eq!(
-                out.body["reasoning_effort"], expect,
-                "model={model} raw={raw} must narrow down to {expect}",
-            );
-        }
+        // 登记表成员与未登记旧模型的边界：glm-5.3 / flash 已登记，glm-4.6 不在。
+        assert!(super::is_thinking_mandatory_model("glm-5.3"));
+        assert!(super::is_thinking_mandatory_model("GLM-5.3-FLASH"));
+        assert!(!super::is_thinking_mandatory_model("glm-4.6"));
     }
-}
-
-/// Responses 直通形态：嵌套 reasoning.effort 的 off 意图同样钳为 low，
-/// 且保留 summary 等兄弟键（bigmodel 官方提供 OpenAI Responses 端点）。
-#[tokio::test]
-async fn responses_passthrough_clamps_nested_reasoning_effort_for_glm() {
-    let gw = build_test_gateway().await;
-    let provider = provider_with_vendor("sk-glm", Some("zhipuai"));
-
-    for model in ["glm-5.3", "glm-5.3-flash"] {
-        let ctx = responses_ctx_model(&provider, &gw, model);
-        let out = passthrough_run(
-            &FakeApiKeyVendor,
-            serde_json::json!({
-                "model": model,
-                "input": "ping",
-                "reasoning": {
-                    "effort": "disable",
-                    "summary": "auto"
-                }
-            }),
-            &ctx,
-            false,
-        )
-        .await
-        .expect("passthrough succeeds");
-
-        assert_eq!(
-            out.body["reasoning"]["effort"], "low",
-            "nested reasoning.effort off intent must clamp to low for {model}",
-        );
-        assert_eq!(
-            out.body["reasoning"]["summary"], "auto",
-            "sibling keys in the reasoning object must be preserved",
-        );
-    }
-}
-
-/// 模型名匹配规则：大小写不敏感；带日期等短横线后缀的变体一并覆盖；
-/// 同系已登记模型共享钳制语义，未登记的旧模型不受影响。
-#[tokio::test]
-async fn thinking_mandatory_matching_covers_variants_and_skips_unrelated() {
-    let gw = build_test_gateway().await;
-    let provider = provider_with_vendor("sk-glm", Some("zhipuai"));
-
-    for model in ["GLM-5.3-Flash", "glm-5.3-flash-0901"] {
-        let ctx = openai_chat_ctx(&provider, &gw, model);
-        let out = passthrough_run(
-            &FakeApiKeyVendor,
-            serde_json::json!({
-                "model": model,
-                "messages": [{"role":"user","content":"ping"}],
-                "reasoning_effort": "none"
-            }),
-            &ctx,
-            false,
-        )
-        .await
-        .expect("passthrough succeeds");
-
-        assert_eq!(
-            out.body["reasoning_effort"], "low",
-            "model={model} is a thinking-mandatory variant and must clamp",
-        );
-    }
-
-    // 登记表成员与未登记旧模型的边界：glm-5.3 / flash 已登记，glm-4.6 不在。
-    assert!(super::is_thinking_mandatory_model("glm-5.3"));
-    assert!(super::is_thinking_mandatory_model("GLM-5.3-FLASH"));
-    assert!(!super::is_thinking_mandatory_model("glm-4.6"));
-}
 
     /// 未登记拒收的 ark 模型维持 normalize 方言（disable → none），
     /// 不误伤接受 none 的模型。

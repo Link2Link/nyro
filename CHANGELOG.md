@@ -4,6 +4,32 @@ All notable changes to Nyro will be documented in this file.
 
 ---
 
+## v2.0.6
+
+> Released on 2026-08-27
+
+#### Features
+
+- **Latency-first routing strategy**: new `latency` balance option that ranks targets by streaming TTFB EWMA (α = 0.4) with a 5-minute freshness window; targets without fresh samples are probed optimistically by real traffic, a probe needs three consecutive samples averaged before joining the ranking, graduated values blend into the EWMA for continuous refinement, and weight only breaks ties; dispatcher feeds `stream_first_chunk_ms` back into the registry while failure signals stay with the breaker
+- **Usage-first routing strategy**: new `usage` balance option that scores targets by remaining quota — 5h-only plans form a prioritized pool weighted by squared scores, weekly/monthly windows deliberately ignore 5-hour fluctuation — with per-provider target grouping to prevent share amplification and a last-good usage snapshot registry
+- **Routing decision snapshots**: request logs record every candidate's score and skip reason across the four balance strategies, persist decision metadata through schema migrations on all three storage backends, and render the snapshot in the log detail page
+- **Key call-detail analytics**: key-level call summaries with model routing stats, request filtering and pagination, log drill-down, and unified HTTP / Tauri IPC surfaces, with correct stat merging after key renames
+- **Provider model call details**: per-provider call statistics with upstream model usage and performance analysis, filterable and drillable into request logs over both HTTP and Tauri
+- **Cache-hit pricing with CNY support**: capability metadata gains cache-hit price and currency fields, bigmodel.cn direct connections adopt official native CNY prices, the OpenRouter catalog parses cache prices, and the WebUI price column renders currency symbols with a cache price row
+
+#### Improvements
+
+- **GLM reasoning effort dialects**: register glm-5.3/flash thinking-forced models and clamp off intents, narrow effort levels beyond the official three to legal tiers (medium maps up to high to preserve reasoning quality), and carry the Ark none clamp plus Grok max downgrade, covering both Chat top-level and Responses nested wire forms
+- **OpenCode thinking-tier clamp**: new `clamp_opencode_effort` policy for the opencode-go channel — zen upstream thinking models (glm-5.3 etc.) reject `none` with 400 "always engages in thinking", so off intents are clamped to the lowest legal tier `low`
+- **Codex defensive egress sanitization**: strip non-empty reasoning `content` arrays before forwarding (consumer Codex upstreams cap them at length 0) while preserving `summary` / `encrypted_content`, and rewrite foreign tool-call ids to the `ctc`/`fc` prefix contract instead of dropping items to keep call_id pairing intact — covering both passthrough and IR conversion paths
+
+#### Fixes
+
+- **Codex stateless reasoning replay**: drop undecryptable reasoning items during replay while keeping stateful and non-reasoning inputs, with a passthrough regression test
+- **Standalone YAML multi-target loading**: fix loading of multi-target provider definitions and validate `balance` / `weight` / `priority` fields
+
+---
+
 ## v2.0.5
 
 > Released on 2026-08-24

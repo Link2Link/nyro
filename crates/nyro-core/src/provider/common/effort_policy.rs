@@ -337,7 +337,10 @@ mod tests {
         for raw in ["none", "disable"] {
             let mut body = json!({"reasoning": {"effort": raw, "summary": "auto"}});
             clamp_thinking_mandatory_effort(&mut body);
-            assert_eq!(body["reasoning"]["effort"], "low", "nested raw={raw} clamps");
+            assert_eq!(
+                body["reasoning"]["effort"], "low",
+                "nested raw={raw} clamps"
+            );
             assert_eq!(body["reasoning"]["summary"], "auto", "siblings preserved");
         }
 
@@ -358,7 +361,10 @@ mod tests {
         assert_eq!(narrow_to_doc_tiers("xhigh"), Some("high"));
         let mut body = json!({"reasoning_effort": "XHIGH", "model": "glm-5.3"});
         clamp_thinking_mandatory_effort(&mut body);
-        assert_eq!(body["reasoning_effort"], "high", "case-insensitive narrowing");
+        assert_eq!(
+            body["reasoning_effort"], "high",
+            "case-insensitive narrowing"
+        );
 
         // 未知值不认识就不动，交由上游裁决。
         let mut unknown = json!({"reasoning_effort": "future-value"});

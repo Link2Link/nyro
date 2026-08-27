@@ -619,10 +619,7 @@ const BIGMODEL_CN_OFFICIAL_PRICING_CNY: &[(&str, f64, f64, f64)] = &[
 /// 按 base_url 域名识别 bigmodel.cn 人民币计费 provider，用官方原生 CNY
 /// 牌价覆盖目录价。前缀匹配要求边界非字母数字（glm-5.3-flash-xxxx 类日期
 /// 变体一并覆盖）；未登记的模型维持目录原值。
-pub(super) fn apply_bigmodel_cn_official_pricing(
-    caps: &mut ModelCapabilities,
-    base_url: &str,
-) {
+pub(super) fn apply_bigmodel_cn_official_pricing(caps: &mut ModelCapabilities, base_url: &str) {
     if !base_url.contains("bigmodel.cn") {
         return;
     }
