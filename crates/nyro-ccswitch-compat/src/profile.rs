@@ -67,13 +67,22 @@ pub fn resolve_chat_reasoning_config(
             "reasoning_details",
         ));
     }
-    if haystack.contains("kimi")
-        || haystack.contains("moonshot")
-        || haystack.contains("glm")
-        || haystack.contains("zhipu")
-        || haystack.contains("z.ai")
-        || haystack.contains("mimo")
-    {
+    // 智谱 GLM 系（glm / zhipu / z.ai 同源同 API）：官方 chat 端点接受
+    // `thinking: {type: "enabled"}` 与 `reasoning_effort` 组合，档位枚举
+    // low/high/max（glm-5.3 / glm-5.3-flash 迁移文档，docs.bigmodel.cn，
+    // 2026-08 抓取；旧模型 glm-4.x 亦接受 reasoning_effort 七值枚举——见
+    // nyro-core effort_policy 方言表的 GLM 行）。档位窄化走 "glm" 模式。
+    if haystack.contains("glm") || haystack.contains("zhipu") || haystack.contains("z.ai") {
+        return Some(CodexChatReasoningConfig {
+            supports_thinking: Some(true),
+            supports_effort: Some(true),
+            thinking_param: Some("thinking".to_string()),
+            effort_param: Some("reasoning_effort".to_string()),
+            effort_value_mode: Some("glm".to_string()),
+            output_format: Some("reasoning_content".to_string()),
+        });
+    }
+    if haystack.contains("kimi") || haystack.contains("moonshot") || haystack.contains("mimo") {
         return Some(thinking_config("thinking", false, "reasoning_content"));
     }
     None
@@ -437,5 +446,43 @@ mod tests {
         assert_eq!(config.thinking_param.as_deref(), Some("enable_thinking"));
         assert_eq!(config.supports_effort, Some(false));
         assert_eq!(config.output_format.as_deref(), Some("reasoning_content"));
+    }
+
+    /// GLM 系按官方文档推断为「thinking 开关 + reasoning_effort 档位」双支持
+    /// （此前与 kimi/mimo 合并在 thinking-only 分支，档位被静默丢弃）。
+    #[test]
+    fn test_resolve_codex_chat_reasoning_infers_glm_effort_support() {
+        for (provider, base_url, model) in [
+            (
+                "GLM",
+                "https://open.bigmodel.cn/api/coding/paas/v4",
+                "glm-5.3-flash",
+            ),
+            ("zhipuai", "https://open.bigmodel.cn/api/paas/v4", "glm-4.6"),
+            ("Z.ai", "https://api.z.ai/api/paas/v4", "glm-5.3"),
+        ] {
+            let config = resolve_chat_reasoning_config(None, provider, base_url, model).unwrap();
+            assert_eq!(config.supports_thinking, Some(true), "{provider}");
+            assert_eq!(config.supports_effort, Some(true), "{provider}");
+            assert_eq!(config.thinking_param.as_deref(), Some("thinking"));
+            assert_eq!(config.effort_param.as_deref(), Some("reasoning_effort"));
+            assert_eq!(config.effort_value_mode.as_deref(), Some("glm"));
+            assert_eq!(config.output_format.as_deref(), Some("reasoning_content"));
+        }
+    }
+
+    /// kimi / mimo 留在 thinking-only 分支（effort 支持未按文档核实）。
+    #[test]
+    fn test_resolve_codex_chat_reasoning_keeps_kimi_thinking_only() {
+        let config = resolve_chat_reasoning_config(
+            None,
+            "Moonshot",
+            "https://api.moonshot.cn/v1",
+            "kimi-k2.6",
+        )
+        .unwrap();
+        assert_eq!(config.thinking_param.as_deref(), Some("thinking"));
+        assert_eq!(config.supports_effort, Some(false));
+        assert_eq!(config.effort_param.as_deref(), Some("none"));
     }
 }

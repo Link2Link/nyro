@@ -398,8 +398,16 @@ fn apply_reasoning_options(
             .as_str()
         {
             "thinking" => {
+                // GLM 思考强制模型（glm-5.3 / glm-5.3-flash）：官方明确
+                // thinking.type 仅支持 enabled、关闭意图「请求将失败」，
+                // 迁移指引为保持 enabled 并改设 reasoning_effort: low
+                // （docs.bigmodel.cn，2026-08）。对这类模型把关闭意图钳为
+                // enabled，配套档位在下方 off 分支补 low。
+                let forced_on = !reasoning_enabled
+                    && config.effort_value_mode.as_deref() == Some("glm")
+                    && glm_thinking_mandatory(model);
                 result["thinking"] = json!({
-                    "type": if reasoning_enabled { "enabled" } else { "disabled" }
+                    "type": if reasoning_enabled || forced_on { "enabled" } else { "disabled" }
                 });
             }
             "enable_thinking" => {
@@ -431,6 +439,14 @@ fn apply_reasoning_options(
         if effort_param == "reasoning.effort" {
             result["reasoning"] = json!({ "effort": "none" });
         }
+        // GLM 思考强制模型：off 已被钳为 enabled，此处补官方迁移指引的
+        // 最小合法档 low（glm-4.x 等可关闭模型维持 disabled 原语义）。
+        if effort_param == "reasoning_effort"
+            && config.effort_value_mode.as_deref() == Some("glm")
+            && glm_thinking_mandatory(model)
+        {
+            result["reasoning_effort"] = json!("low");
+        }
         return;
     }
 
@@ -459,6 +475,25 @@ fn apply_reasoning_options(
         }
         _ => {}
     }
+}
+
+/// GLM 思考强制开启模型：官方文档明确「始终启用思考功能」、thinking.type
+/// 仅支持 enabled、off 意图「请求将失败」（docs.bigmodel.cn，2026-08 抓
+/// 取）。镜像 nyro-core pipeline 的 THINKING_MANDATORY_MODELS 登记表
+/// （glm-5.3 / glm-5.3-flash），前缀匹配且边界字符非字母数字，覆盖带日期
+/// 等短横线后缀的变体（glm-5.3-flash-xxxx）。
+fn glm_thinking_mandatory(model: &str) -> bool {
+    let model = model.trim().to_ascii_lowercase();
+    ["glm-5.3", "glm-5.3-flash"].iter().any(|prefix| {
+        model.len() >= prefix.len()
+            && model
+                .get(..prefix.len())
+                .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+            && model[prefix.len()..]
+                .chars()
+                .next()
+                .is_none_or(|c| !c.is_ascii_alphanumeric())
+    })
 }
 
 fn reasoning_requested(body: &Value) -> Option<bool> {
@@ -497,6 +532,16 @@ fn map_reasoning_effort(effort: &str, mode: Option<&str>) -> Option<&'static str
             "medium" => Some("medium"),
             "low" => Some("low"),
             "minimal" => Some("minimal"),
+            _ => None,
+        },
+        // 智谱 GLM 官方档位枚举 low/high/max（glm-5.3 系列迁移文档，
+        // 2026-08）：minimal 向下收 low；medium/xhigh 按保推理质量取向收
+        // high；合法三档透传；未知值丢弃以免被上游拒收。语义与 nyro-core
+        // effort_policy::narrow_to_doc_tiers 保持一致。
+        "glm" => match effort.as_str() {
+            "minimal" | "low" => Some("low"),
+            "medium" | "xhigh" | "high" => Some("high"),
+            "max" => Some("max"),
             _ => None,
         },
         _ => match effort.as_str() {
@@ -2564,6 +2609,87 @@ mod tests {
 
         assert_eq!(result["thinking"]["type"], "enabled");
         assert_eq!(result["reasoning_effort"], "max");
+    }
+
+    /// GLM 官方 chat 端点：thinking.enabled + reasoning_effort 组合出站，
+    /// 档位按 low/high/max 枚举窄化（glm-5.3 系列迁移文档，2026-08）。
+    #[test]
+    fn responses_request_to_chat_sends_glm_thinking_and_effort_tiers() {
+        let config = CodexChatReasoningConfig {
+            supports_thinking: Some(true),
+            supports_effort: Some(true),
+            thinking_param: Some("thinking".to_string()),
+            effort_param: Some("reasoning_effort".to_string()),
+            effort_value_mode: Some("glm".to_string()),
+            output_format: Some("reasoning_content".to_string()),
+        };
+
+        // 合法档透传；三档外窄化：minimal→low、medium/xhigh→high。
+        for (effort, expect) in [
+            ("low", "low"),
+            ("high", "high"),
+            ("max", "max"),
+            ("minimal", "low"),
+            ("medium", "high"),
+            ("xhigh", "high"),
+        ] {
+            let input = json!({
+                "model": "glm-5.3-flash",
+                "input": "hello",
+                "reasoning": {"effort": effort}
+            });
+            let result =
+                responses_to_chat_completions_with_reasoning(input, Some(&config)).unwrap();
+            assert_eq!(result["thinking"]["type"], "enabled", "effort={effort}");
+            assert_eq!(result["reasoning_effort"], expect, "effort={effort}");
+        }
+
+        // 未知档位丢弃（不发 reasoning_effort），thinking 仍开。
+        let input = json!({
+            "model": "glm-5.3-flash",
+            "input": "hello",
+            "reasoning": {"effort": "future-value"}
+        });
+        let result = responses_to_chat_completions_with_reasoning(input, Some(&config)).unwrap();
+        assert_eq!(result["thinking"]["type"], "enabled");
+        assert!(result.get("reasoning_effort").is_none());
+    }
+
+    /// GLM 思考强制模型（glm-5.3 / glm-5.3-flash）的 off 意图：官方明言
+    /// disabled「请求将失败」，迁移指引为 enabled + reasoning_effort: low。
+    /// 可关闭的旧模型（glm-4.6）维持 disabled 原语义。
+    #[test]
+    fn responses_request_to_chat_clamps_glm_off_intent_by_model() {
+        let config = CodexChatReasoningConfig {
+            supports_thinking: Some(true),
+            supports_effort: Some(true),
+            thinking_param: Some("thinking".to_string()),
+            effort_param: Some("reasoning_effort".to_string()),
+            effort_value_mode: Some("glm".to_string()),
+            output_format: Some("reasoning_content".to_string()),
+        };
+
+        for model in ["glm-5.3", "glm-5.3-flash", "GLM-5.3-Flash-0901"] {
+            let input = json!({
+                "model": model,
+                "input": "hello",
+                "reasoning": {"effort": "none"}
+            });
+            let result =
+                responses_to_chat_completions_with_reasoning(input, Some(&config)).unwrap();
+            assert_eq!(result["thinking"]["type"], "enabled", "model={model}");
+            assert_eq!(result["reasoning_effort"], "low", "model={model}");
+        }
+
+        // glm-4.6 未登记思考强制：off 维持关闭。
+        let input = json!({
+            "model": "glm-4.6",
+            "input": "hello",
+            "reasoning": {"effort": "none"}
+        });
+        let result = responses_to_chat_completions_with_reasoning(input, Some(&config)).unwrap();
+        assert_eq!(result["thinking"]["type"], "disabled");
+        assert!(result.get("reasoning_effort").is_none());
     }
 
     #[test]
