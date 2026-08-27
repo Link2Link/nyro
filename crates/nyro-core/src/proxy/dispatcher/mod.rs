@@ -693,13 +693,6 @@ async fn dispatch_pipeline_inner(
             .map(str::to_string)
             .unwrap_or_else(|| actual_model.clone());
         let mut upstream_request = request_for_target.clone();
-        // Route-level「max推理」覆盖（models.force_max_reasoning）：转码与
-        // compat 重编码路径在此改写 IR，使编码产物携带 max 档；原生直通路径
-        // 不走这里，由 passthrough 的 wire 级覆盖处理——此处若发布突变语义
-        // 会杀死 codex 类通道依赖的逐字直通。
-        if route.force_max_reasoning {
-            crate::provider::common::pipeline::force_max_reasoning_ir(&mut upstream_request);
-        }
         let tool_route_plan = if compat_candidate {
             ToolRoutePlan::default()
         } else {
@@ -737,6 +730,18 @@ async fn dispatch_pipeline_inner(
         } else {
             None
         };
+
+        // Route-level「max推理」覆盖（models.force_max_reasoning）：转码路径
+        // 在此改写 IR、编码产物携带 max 档。与 param_overrides 同位、置于
+        // `vendor_wire_before` 之后是刻意的：compat 路径的出站体由原始客户端
+        // 体重建、只合并 before→after 的 vendor 补丁——若在此之前注入，
+        // before/after 同值、diff 为空，max 档上不了补丁（线上 71c6c323：
+        // 强制开关开启但 compat 体仍是客户端的 high）。原生直通路径不走
+        // 这里，由 passthrough 的 wire 级覆盖处理；此处也不发布突变语义，
+        // 避免杀死 codex 类通道依赖的逐字直通。
+        if route.force_max_reasoning {
+            crate::provider::common::pipeline::force_max_reasoning_ir(&mut upstream_request);
+        }
 
         // Provider/model-specific parameter rewrites. Applied after
         // `vendor_wire_before` on purpose: the compat path rebuilds the

@@ -2187,6 +2187,167 @@ mod tests {
         );
     }
 
+    /// 转码路径全协议矩阵：dispatcher 在 build_request 之前注入 IR（见
+    /// force_max_reasoning_ir），四种 egress 协议的编码器必须各自原生表达
+    /// max 档——chat 顶层 reasoning_effort、Responses 嵌套 reasoning.effort、
+    /// Anthropic thinking.adaptive + output_config.effort、Gemini 顶格
+    /// thinkingLevel=high（google_thinking_level(Max)）。
+    #[tokio::test]
+    async fn force_max_reasoning_reaches_every_egress_protocol_on_transcode() {
+        use crate::protocol::ids::{
+            ANTHROPIC_MESSAGES_2023_06_01, GOOGLE_GEMINI_GENERATE_CONTENT_V1BETA,
+        };
+        let gw = build_test_gateway().await;
+        let provider = provider_with_api_key("apikey-abc");
+
+        let cases = [
+            (OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1, "chat"),
+            (OPENAI_RESPONSES_V1, "responses"),
+            (ANTHROPIC_MESSAGES_2023_06_01, "anthropic"),
+            (GOOGLE_GEMINI_GENERATE_CONTENT_V1BETA, "gemini"),
+        ];
+
+        for (protocol, tag) in cases {
+            let mut req = minimal_chat_request();
+            // 模拟 dispatcher 顺序：解码 → force-max 注入 → 编码。
+            force_max_reasoning_ir(&mut req);
+            let ctx = ProviderCtx {
+                provider: &provider,
+                protocol,
+                egress_base_url: "https://upstream.local",
+                api_key: &provider.api_key,
+                auth_scheme: "auto",
+                actual_model: "m-test",
+                force_max_reasoning: false,
+                credential: None,
+                gw: &gw,
+                disable_default_auth: false,
+            };
+            let out = build_request(&FakeApiKeyVendor, &mut req, &ctx)
+                .await
+                .expect("build_request succeeds");
+            match tag {
+                "chat" => assert_eq!(
+                    out.body["reasoning_effort"], "max",
+                    "chat egress must carry top-level max effort",
+                ),
+                "responses" => assert_eq!(
+                    out.body["reasoning"]["effort"], "max",
+                    "responses egress must carry nested max effort",
+                ),
+                "anthropic" => {
+                    assert_eq!(
+                        out.body["thinking"]["type"], "adaptive",
+                        "anthropic egress must enable adaptive thinking",
+                    );
+                    assert_eq!(
+                        out.body["output_config"]["effort"], "max",
+                        "anthropic egress must carry max output_config effort",
+                    );
+                }
+                _ => assert_eq!(
+                    out.body["generationConfig"]["thinkingConfig"]["thinkingLevel"], "high",
+                    "gemini egress must carry the top thinking level",
+                ),
+            }
+        }
+    }
+
+    /// 直通路径全协议矩阵（chat 形态已由上一测试覆盖）：Responses 嵌套档位、
+    /// Anthropic 关闭形态被覆盖、Gemini 顶格档，均须在保持逐字直通的前提
+    /// 下于 wire 级改写成功，兄弟键保留。
+    #[tokio::test]
+    async fn passthrough_forces_max_reasoning_for_every_native_protocol() {
+        use crate::protocol::ids::{
+            ANTHROPIC_MESSAGES_2023_06_01, GOOGLE_GEMINI_GENERATE_CONTENT_V1BETA,
+        };
+        let gw = build_test_gateway().await;
+        let provider = provider_with_api_key("apikey-abc");
+
+        // Responses：嵌套 effort 改写，summary 兄弟键保留。
+        let ctx = ProviderCtx {
+            force_max_reasoning: true,
+            ..responses_ctx(&provider, &gw)
+        };
+        let out = passthrough_run(
+            &FakeApiKeyVendor,
+            serde_json::json!({
+                "model": "gpt-test",
+                "input": "ping",
+                "reasoning": {"effort": "low", "summary": "auto"}
+            }),
+            &ctx,
+            true,
+        )
+        .await
+        .expect("passthrough succeeds");
+        assert_eq!(out.body["reasoning"]["effort"], "max");
+        assert_eq!(out.body["reasoning"]["summary"], "auto");
+
+        // Anthropic：显式 disabled 被覆盖为 adaptive + max（会话决策 ③）。
+        let ctx = ProviderCtx {
+            provider: &provider,
+            protocol: ANTHROPIC_MESSAGES_2023_06_01,
+            egress_base_url: "https://upstream.local",
+            api_key: &provider.api_key,
+            auth_scheme: "auto",
+            actual_model: "claude-test",
+            force_max_reasoning: true,
+            credential: None,
+            gw: &gw,
+            disable_default_auth: false,
+        };
+        let out = passthrough_run(
+            &FakeApiKeyVendor,
+            serde_json::json!({
+                "model": "claude-test",
+                "max_tokens": 128,
+                "thinking": {"type": "disabled"},
+                "messages": [{"role": "user", "content": "ping"}]
+            }),
+            &ctx,
+            true,
+        )
+        .await
+        .expect("passthrough succeeds");
+        assert_eq!(out.body["thinking"]["type"], "adaptive");
+        assert_eq!(out.body["output_config"]["effort"], "max");
+
+        // Gemini：thinkingConfig 顶格 high（Max 在 Gemini 无对应档）。
+        let ctx = ProviderCtx {
+            provider: &provider,
+            protocol: GOOGLE_GEMINI_GENERATE_CONTENT_V1BETA,
+            egress_base_url: "https://upstream.local",
+            api_key: &provider.api_key,
+            auth_scheme: "auto",
+            actual_model: "gemini-test",
+            force_max_reasoning: true,
+            credential: None,
+            gw: &gw,
+            disable_default_auth: false,
+        };
+        let out = passthrough_run(
+            &FakeApiKeyVendor,
+            serde_json::json!({
+                "model": "gemini-test",
+                "contents": [{"role": "user", "parts": [{"text": "ping"}]}],
+                "generationConfig": {"temperature": 0.7}
+            }),
+            &ctx,
+            true,
+        )
+        .await
+        .expect("passthrough succeeds");
+        assert_eq!(
+            out.body["generationConfig"]["thinkingConfig"]["thinkingLevel"],
+            "high",
+        );
+        assert_eq!(
+            out.body["generationConfig"]["temperature"], 0.7,
+            "sibling generationConfig keys must survive",
+        );
+    }
+
     /// 线上事故复现（请求 58e799fa，2026-08-26）：DSH 发 misspelling
     /// "disable"，默认 normalize 会归一成 "none"，被 ark glm-5.3 以
     /// 400 InvalidParameter 拒收。正确拼写的 "none" 同样拒收。

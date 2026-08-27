@@ -255,6 +255,69 @@ mod tests {
         );
     }
 
+    /// 线上回归（请求 71c6c323）：路由开启 force_max_reasoning 后，compat
+    /// 出站体必须带 max 档。dispatcher 的 IR 注入位于 `vendor_wire_before`
+    /// 捕获之后，max 改写只能经 before→after 的 vendor 补丁上车；若把注入
+    /// 点提前到捕获之前，before/after 同值、diff 为空，compat 体将保留
+    /// 客户端原始档位（high）——正是该次线上症状。
+    #[tokio::test]
+    async fn raw_wire_vendor_patch_carries_force_max_reasoning() {
+        let selection = RawWireCompatSelection {
+            ingress: OPENAI_RESPONSES_V1,
+            egress: crate::protocol::ids::OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1,
+            profile: ConversionProfile::codex_responses_to_chat(false),
+            identity: SessionIdentity::generated("test"),
+            patch: None,
+            context_1m: false,
+        };
+        let resolved = resolve_conversion(ResolveConversionInput {
+            ingress: OPENAI_RESPONSES_V1,
+            egress: crate::protocol::ids::OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1,
+            raw_wire: Some(selection),
+            protocol_is_native: false,
+            request_passthrough: false,
+            response_passthrough: false,
+        })
+        .unwrap();
+        let client_body =
+            json!({"model":"glm-5.3-flash","input":"hello","reasoning":{"effort":"high"}});
+        let raw = Bytes::from(serde_json::to_vec(&client_body).unwrap());
+        // before = 未注入 force-max 的编码体；after = 注入后的编码体。
+        // 补丁 diff 只含 reasoning_effort: high → max，正是要上车的东西。
+        let before = json!({
+            "model":"glm-5.3-flash",
+            "messages":[{"role":"user","content":"hello"}],
+            "stream":false,
+            "thinking":{"type":"enabled"},
+            "reasoning_effort":"high"
+        });
+        let after = json!({
+            "model":"glm-5.3-flash",
+            "messages":[{"role":"user","content":"hello"}],
+            "stream":false,
+            "thinking":{"type":"enabled"},
+            "reasoning_effort":"max"
+        });
+        let prepared = prepare_conversion(PrepareConversionInput {
+            resolved,
+            engine: &CompatEngine::default(),
+            native_body: after,
+            raw_body: Some(raw),
+            vendor_wire_before: Some(&before),
+        })
+        .await
+        .unwrap();
+
+        assert!(prepared.is_raw_wire());
+        let (_, body, force_stream, session) = prepared.into_parts();
+        let request = rebuild_raw_wire_request(body, force_stream, session).unwrap();
+        let value: Value = serde_json::from_slice(&request.body).unwrap();
+        assert_eq!(
+            value["reasoning_effort"], "max",
+            "force-max rewrite must ride the vendor patch onto the compat body",
+        );
+    }
+
     #[tokio::test]
     async fn raw_wire_requires_exact_raw_body() {
         let resolved = resolve_conversion(ResolveConversionInput {
