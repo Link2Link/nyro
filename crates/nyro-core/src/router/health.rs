@@ -119,6 +119,33 @@ impl HealthRegistry {
         }
     }
 
+    /// Minimum seconds until recovery across open circuits for any target key
+    /// belonging to `provider_id` (keys are `provider:egress:model`).
+    /// `None` when no circuit for the provider is currently open. Read-only;
+    /// safe to call from the routing decision snapshot path.
+    pub fn open_provider_secs(&self, provider_id: &str) -> Option<i64> {
+        let states = self.states.read().unwrap();
+        let prefix = format!("{provider_id}:");
+        states
+            .iter()
+            .filter(|(key, _)| key.starts_with(&prefix))
+            .filter_map(|(_, state)| {
+                if !matches!(state.state, CircuitState::Open) {
+                    return None;
+                }
+                state.last_failure_at.map(|failed_at| {
+                    let elapsed = failed_at.elapsed();
+                    if elapsed >= self.recovery_after {
+                        None
+                    } else {
+                        Some((self.recovery_after - elapsed).as_secs() as i64)
+                    }
+                })
+            })
+            .flatten()
+            .min()
+    }
+
     pub fn is_healthy(&self, target_key: &str) -> bool {
         let states = self.states.read().unwrap();
         match states.get(target_key) {

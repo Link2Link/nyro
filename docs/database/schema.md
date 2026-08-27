@@ -82,7 +82,7 @@ Provider 的协议端点明细。固定模式保留一条兼容记录；自适�
 |---|---|---|---|
 | `id` | TEXT PK | — | 主键，UUID |
 | `name` | TEXT NOT NULL | — | 显示名称，同时作为客户端请求的模型匹配键（路由唯一键的一部分） |
-| `balance` | TEXT | `'weighted'` | 多后端负载均衡策略：`weighted`、`priority`、`latency`、`usage`（5h-only 套餐优先，否则按周/月匀速用量短板分²动态加权） |
+| `balance` | TEXT | `'weighted'` | 多后端负载均衡策略：`weighted`、`priority`、`latency`、`usage`（按最大周期窗口剩余额度÷剩余时间比率 r³ 动态加权） |
 | `target_provider` | TEXT NOT NULL | — | 默认后端 provider ID（FK → providers.id） |
 | `target_model` | TEXT NOT NULL | — | 默认后端使用的上游模型名 |
 | `enable_auth` | INTEGER | `0` | 是否启用 API Key 访问控制 |
@@ -193,6 +193,7 @@ OAuth 凭据存储，用于需要 OAuth 认证的供应商（如 Google Vertex A
 | `client_model` | TEXT | NULL | 客户端请求中的模型名 |
 | `upstream_model` | TEXT | NULL | 实际发送给上游的模型名 |
 | `reasoning_effort` | TEXT | NULL | 客户端请求的归一化推理强度（`high` 等定性值或 `budget:<n>`；不受载荷记录开关影响） |
+| `route_decision` | TEXT | NULL | 路由决策快照 JSON（选择时点采集：全部候选的评分/权重/占比/排序与跳过原因；不受载荷记录开关影响） |
 | `method` | TEXT | NULL | HTTP 方法 |
 | `path` | TEXT | NULL | 请求路径 |
 | `client_request_headers` | TEXT | NULL | 客户端请求头（JSON，可选记录） |

@@ -1000,7 +1000,7 @@ impl LogStore for PostgresLogStore {
                 r#"INSERT INTO request_logs
                     (id, created_at, api_key_id, api_key_name,
                      client_protocol, upstream_protocol, provider_id, provider_name, model_id, model_name, upstream_url,
-                     client_model, upstream_model, reasoning_effort,
+                     client_model, upstream_model, reasoning_effort, route_decision,
                      method, path,
                      client_request_headers, client_request_body,
                      client_response_headers, client_response_body,
@@ -1010,7 +1010,7 @@ impl LogStore for PostgresLogStore {
                      latency_total_ms, latency_upstream_ms,
                      input_tokens, output_tokens, cache_read_tokens,
                      is_stream, stream_chunks_count, stream_first_chunk_ms)
-                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34)"#,
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35)"#,
             )
             .bind(&id)
             .bind(entry.created_at)
@@ -1026,6 +1026,7 @@ impl LogStore for PostgresLogStore {
             .bind(&entry.client_model)
             .bind(&entry.upstream_model)
             .bind(&entry.reasoning_effort)
+            .bind(&entry.route_decision)
             .bind(&entry.method)
             .bind(&entry.path)
             .bind(&entry.client_request_headers)
@@ -1058,7 +1059,7 @@ impl LogStore for PostgresLogStore {
         let mut data_sql = String::from(
             "SELECT id, COALESCE(created_at::BIGINT, 0) AS created_at, api_key_id, api_key_name, \
              client_protocol, upstream_protocol, provider_id, provider_name, model_id, model_name, upstream_url, \
-             client_model, upstream_model, reasoning_effort, method, path, \
+             client_model, upstream_model, reasoning_effort, route_decision, method, path, \
              NULL::text AS client_request_headers, NULL::text AS client_request_body, \
              NULL::text AS client_response_headers, NULL::text AS client_response_body, \
              NULL::text AS upstream_request_headers, NULL::text AS upstream_request_body, \
@@ -1150,7 +1151,7 @@ impl LogStore for PostgresLogStore {
         let row = sqlx::query_as::<_, RequestLog>(
             "SELECT id, COALESCE(created_at::BIGINT, 0) AS created_at, api_key_id, api_key_name, \
              client_protocol, upstream_protocol, provider_id, provider_name, model_id, model_name, upstream_url, \
-             client_model, upstream_model, reasoning_effort, method, path, \
+             client_model, upstream_model, reasoning_effort, route_decision, method, path, \
              client_request_headers, client_request_body, \
              client_response_headers, client_response_body, \
              upstream_request_headers, upstream_request_body, \
@@ -1178,6 +1179,21 @@ impl LogStore for PostgresLogStore {
 
     async fn clear_all(&self) -> anyhow::Result<u64> {
         let result = sqlx::query("DELETE FROM request_logs")
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected())
+    }
+
+    async fn delete_by_id(&self, id: &str) -> anyhow::Result<u64> {
+        let result = sqlx::query("DELETE FROM request_logs WHERE id = $1")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected())
+    }
+
+    async fn clear_errors(&self) -> anyhow::Result<u64> {
+        let result = sqlx::query("DELETE FROM request_logs WHERE client_status_code >= 400")
             .execute(&self.pool)
             .await?;
         Ok(result.rows_affected())
@@ -1552,6 +1568,9 @@ END $$;"#,
         .execute(self.adapter.pool())
         .await?;
         sqlx::query("ALTER TABLE request_logs ADD COLUMN IF NOT EXISTS reasoning_effort TEXT")
+            .execute(self.adapter.pool())
+            .await?;
+        sqlx::query("ALTER TABLE request_logs ADD COLUMN IF NOT EXISTS route_decision TEXT")
             .execute(self.adapter.pool())
             .await?;
 
@@ -2067,6 +2086,7 @@ CREATE TABLE IF NOT EXISTS request_logs (
     client_model              TEXT,
     upstream_model            TEXT,
     reasoning_effort          TEXT,
+    route_decision            TEXT,
     method                    TEXT,
     path                      TEXT,
     client_request_headers    TEXT,

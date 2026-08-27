@@ -1,6 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useMemo, useState, type KeyboardEvent } from "react";
-import { Calendar, ChevronLeft, ChevronRight, ChevronsLeft, ScrollText, Trash2, X } from "lucide-react";
+import { Calendar, ChevronLeft, ChevronRight, ChevronsLeft, CircleX, ScrollText, Trash2, X } from "lucide-react";
 
 import { backend } from "@/lib/backend";
 import type { ApiKey, LogPage, LogQuery, ModelStats, Provider, RequestLog } from "@/lib/types";
@@ -36,6 +36,8 @@ export default function LogsPage() {
   const [filter, setFilter] = useState<LogQuery>({ limit: PAGE_SIZE, offset: 0 });
   const [selected, setSelected] = useState<RequestLog | null>(null);
   const [confirmOpen, setConfirmOpen] = useState(false);
+  const [confirmErrorsOpen, setConfirmErrorsOpen] = useState(false);
+  const [deleteTarget, setDeleteTarget] = useState<string | null>(null);
 
   const clearMut = useMutation({
     mutationFn: () => backend("clear_logs"),
@@ -43,6 +45,24 @@ export default function LogsPage() {
       qc.invalidateQueries({ queryKey: ["logs"] });
       setPage(0);
       setConfirmOpen(false);
+    },
+  });
+
+  const clearErrorsMut = useMutation({
+    mutationFn: () => backend("clear_error_logs"),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["logs"] });
+      setPage(0);
+      setConfirmErrorsOpen(false);
+    },
+  });
+
+  const deleteMut = useMutation({
+    mutationFn: (id: string) => backend("delete_log", { id }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["logs"] });
+      setSelected(null);
+      setDeleteTarget(null);
     },
   });
 
@@ -297,6 +317,16 @@ export default function LogsPage() {
           <Button
             variant="outline"
             size="icon"
+            className="h-10 w-10 text-red-500 hover:text-red-600"
+            title={isZh ? "清除报错日志" : "Delete Error Logs"}
+            disabled={total === 0}
+            onClick={() => setConfirmErrorsOpen(true)}
+          >
+            <CircleX className="h-4 w-4" />
+          </Button>
+          <Button
+            variant="outline"
+            size="icon"
             className="h-10 w-10"
             title={isZh ? "清空日志" : "Clear Logs"}
             disabled={total === 0}
@@ -537,6 +567,7 @@ export default function LogsPage() {
         onOpenChange={(open) => {
           if (!open) setSelected(null);
         }}
+        onDelete={(id) => setDeleteTarget(id)}
       />
 
       <ConfirmDialog
@@ -551,6 +582,36 @@ export default function LogsPage() {
         confirmText={isZh ? "清空" : "Clear"}
         cancelText={isZh ? "取消" : "Cancel"}
         onConfirm={() => clearMut.mutate()}
+      />
+
+      <ConfirmDialog
+        open={confirmErrorsOpen}
+        onOpenChange={setConfirmErrorsOpen}
+        title={isZh ? "清除报错日志" : "Delete Error Logs"}
+        description={
+          isZh
+            ? "确认删除所有报错（状态码 ≥ 400）的请求日志？此操作不可恢复。"
+            : "All request logs with status >= 400 will be permanently deleted. This action cannot be undone."
+        }
+        confirmText={isZh ? "删除" : "Delete"}
+        cancelText={isZh ? "取消" : "Cancel"}
+        onConfirm={() => clearErrorsMut.mutate()}
+      />
+
+      <ConfirmDialog
+        open={!!deleteTarget}
+        onOpenChange={(open) => {
+          if (!open) setDeleteTarget(null);
+        }}
+        title={isZh ? "删除此日志" : "Delete This Log"}
+        description={
+          isZh
+            ? `确认删除日志 ${deleteTarget?.slice(0, 8)}…？此操作不可恢复。`
+            : `Permanently delete log ${deleteTarget?.slice(0, 8)}…? This action cannot be undone.`
+        }
+        confirmText={isZh ? "删除" : "Delete"}
+        cancelText={isZh ? "取消" : "Cancel"}
+        onConfirm={() => deleteTarget && deleteMut.mutate(deleteTarget)}
       />
     </div>
   );

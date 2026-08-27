@@ -1034,7 +1034,7 @@ impl LogStore for MysqlLogStore {
                 r#"INSERT INTO request_logs
                     (id, created_at, api_key_id, api_key_name,
                      client_protocol, upstream_protocol, provider_id, provider_name, model_id, model_name, upstream_url,
-                     client_model, upstream_model, reasoning_effort,
+                     client_model, upstream_model, reasoning_effort, route_decision,
                      method, path,
                      client_request_headers, client_request_body,
                      client_response_headers, client_response_body,
@@ -1044,7 +1044,7 @@ impl LogStore for MysqlLogStore {
                      latency_total_ms, latency_upstream_ms,
                      input_tokens, output_tokens, cache_read_tokens,
                      is_stream, stream_chunks_count, stream_first_chunk_ms)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"#,
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"#,
             )
             .bind(&id)
             .bind(entry.created_at)
@@ -1060,6 +1060,7 @@ impl LogStore for MysqlLogStore {
             .bind(&entry.client_model)
             .bind(&entry.upstream_model)
             .bind(&entry.reasoning_effort)
+            .bind(&entry.route_decision)
             .bind(&entry.method)
             .bind(&entry.path)
             .bind(&entry.client_request_headers)
@@ -1092,7 +1093,7 @@ impl LogStore for MysqlLogStore {
         let mut data_sql = String::from(
             "SELECT id, COALESCE(created_at, 0) AS created_at, api_key_id, api_key_name, \
              client_protocol, upstream_protocol, provider_id, provider_name, model_id, model_name, upstream_url, \
-             client_model, upstream_model, reasoning_effort, method, path, \
+             client_model, upstream_model, reasoning_effort, route_decision, method, path, \
              CAST(NULL AS CHAR) AS client_request_headers, CAST(NULL AS CHAR) AS client_request_body, \
              CAST(NULL AS CHAR) AS client_response_headers, CAST(NULL AS CHAR) AS client_response_body, \
              CAST(NULL AS CHAR) AS upstream_request_headers, CAST(NULL AS CHAR) AS upstream_request_body, \
@@ -1172,7 +1173,7 @@ impl LogStore for MysqlLogStore {
         let row = sqlx::query_as::<_, RequestLog>(
             "SELECT id, COALESCE(created_at, 0) AS created_at, api_key_id, api_key_name, \
              client_protocol, upstream_protocol, provider_id, provider_name, model_id, model_name, upstream_url, \
-             client_model, upstream_model, reasoning_effort, method, path, \
+             client_model, upstream_model, reasoning_effort, route_decision, method, path, \
              client_request_headers, client_request_body, \
              client_response_headers, client_response_body, \
              upstream_request_headers, upstream_request_body, \
@@ -1200,6 +1201,21 @@ impl LogStore for MysqlLogStore {
 
     async fn clear_all(&self) -> anyhow::Result<u64> {
         let result = sqlx::query("DELETE FROM request_logs")
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected())
+    }
+
+    async fn delete_by_id(&self, id: &str) -> anyhow::Result<u64> {
+        let result = sqlx::query("DELETE FROM request_logs WHERE id = ?")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected())
+    }
+
+    async fn clear_errors(&self) -> anyhow::Result<u64> {
+        let result = sqlx::query("DELETE FROM request_logs WHERE client_status_code >= 400")
             .execute(&self.pool)
             .await?;
         Ok(result.rows_affected())
@@ -1642,6 +1658,7 @@ impl StorageBootstrap for MysqlBootstrap {
         .await?;
         mysql_add_column_if_not_exists(pool, "request_logs", "reasoning_effort", "VARCHAR(64)")
             .await?;
+        mysql_add_column_if_not_exists(pool, "request_logs", "route_decision", "LONGTEXT").await?;
 
         // Rename tables: routes → models, route_targets → model_backends, api_key_routes → api_key_models
         mysql_rename_table_if_needed(pool, "routes", "models").await?;
@@ -2150,6 +2167,7 @@ CREATE TABLE IF NOT EXISTS request_logs (
     client_model              VARCHAR(255),
     upstream_model            VARCHAR(255),
     reasoning_effort          VARCHAR(64),
+    route_decision            LONGTEXT,
     method                    VARCHAR(255),
     path                      TEXT,
     client_request_headers    TEXT,

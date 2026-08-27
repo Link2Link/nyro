@@ -2308,6 +2308,119 @@ fn responses_encoder_splits_system_to_instructions_and_user_to_input_text() {
 }
 
 #[test]
+fn chat_response_format_json_schema_maps_to_responses_text_format() {
+    // Production incident (request 0d7e143a): a Chat Completions client
+    // (session title generator) sent `response_format` and the Responses
+    // upstream rejected the verbatim copy with HTTP 400
+    // `Unsupported parameter: response_format`.
+    let ir = OpenAIDecoder
+        .decode_request(serde_json::json!({
+            "model": "agent_hermes",
+            "messages": [{"role": "user", "content": "你好"}],
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "session_title",
+                    "schema": {
+                        "type": "object",
+                        "properties": {"title": {"type": "string"}},
+                        "required": ["title"],
+                        "additionalProperties": false
+                    },
+                    "strict": true
+                }
+            }
+        }))
+        .expect("decode chat request");
+
+    let (body, _) = ResponsesEncoder
+        .encode_request(&ir)
+        .expect("encode responses");
+
+    assert!(
+        body.get("response_format").is_none(),
+        "chat `response_format` must not leak verbatim into the Responses body"
+    );
+    let format = body
+        .get("text")
+        .and_then(|v| v.get("format"))
+        .expect("text.format must be synthesized from the IR response_format");
+    assert_eq!(
+        format.get("type").and_then(|v| v.as_str()),
+        Some("json_schema")
+    );
+    assert_eq!(
+        format.get("name").and_then(|v| v.as_str()),
+        Some("session_title")
+    );
+    assert_eq!(format.get("strict").and_then(|v| v.as_bool()), Some(true));
+    assert_eq!(
+        format.get("schema").and_then(|v| v.get("required")),
+        Some(&serde_json::json!(["title"]))
+    );
+}
+
+#[test]
+fn chat_response_format_json_object_maps_to_responses_text_format() {
+    let ir = OpenAIDecoder
+        .decode_request(serde_json::json!({
+            "model": "agent_hermes",
+            "messages": [{"role": "user", "content": "hello"}],
+            "response_format": {"type": "json_object"}
+        }))
+        .expect("decode chat request");
+
+    let (body, _) = ResponsesEncoder
+        .encode_request(&ir)
+        .expect("encode responses");
+
+    assert!(body.get("response_format").is_none());
+    assert_eq!(
+        body.get("text")
+            .and_then(|v| v.get("format"))
+            .and_then(|v| v.get("type"))
+            .and_then(|v| v.as_str()),
+        Some("json_object")
+    );
+}
+
+#[test]
+fn responses_native_text_passthrough_wins_over_synthesized_format() {
+    // A native Responses `text` block (kept in the ingress bag) must survive
+    // re-encoding verbatim; the synthesized IR mapping never overwrites it.
+    let ir = ResponsesDecoder
+        .decode_request(serde_json::json!({
+            "model": "gpt-5.6-sol",
+            "input": "hello",
+            "text": {
+                "format": {
+                    "type": "json_schema",
+                    "name": "native_title",
+                    "schema": {"type": "object"}
+                }
+            }
+        }))
+        .expect("decode native responses request");
+
+    let (body, _) = ResponsesEncoder
+        .encode_request(&ir)
+        .expect("encode responses");
+
+    let format = body
+        .get("text")
+        .and_then(|v| v.get("format"))
+        .expect("native text.format must round-trip");
+    assert_eq!(
+        format.get("name").and_then(|v| v.as_str()),
+        Some("native_title")
+    );
+    assert!(
+        format.get("strict").is_none(),
+        "native text must pass through untouched, not re-synthesized"
+    );
+}
+
+#[test]
 fn responses_encoder_emits_function_call_and_function_call_output_items() {
     let req = responses_request(
         vec![

@@ -1550,6 +1550,7 @@ mod tests {
             is_stream: stream,
             enable_payload: Some(true),
             reasoning_effort: None,
+            route_decision: None,
             start: std::time::Instant::now(),
             req_ext: crate::proxy::context::ContextBag::new(),
         };

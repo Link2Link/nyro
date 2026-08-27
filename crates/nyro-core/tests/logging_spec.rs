@@ -124,6 +124,8 @@ fn log_entry_timestamp_is_unix_millis() {
         client_model: "gpt-4".into(),
         upstream_model: "gpt-4".into(),
         reasoning_effort: Some("high".into()),
+
+        route_decision: None,
         method: Some("POST".into()),
         path: Some("/v1/chat/completions".into()),
         client_request_headers: None,
@@ -167,6 +169,8 @@ fn stream_indicator_via_chunks_count() {
         client_model: String::new(),
         upstream_model: String::new(),
         reasoning_effort: None,
+
+        route_decision: None,
         method: None,
         path: None,
         client_request_headers: None,
@@ -228,6 +232,7 @@ fn db_schema_sql_contains_new_columns() {
         "client_model",
         "upstream_model",
         "reasoning_effort",
+        "route_decision",
         "method",
         "path",
         "client_request_headers",
@@ -251,8 +256,8 @@ fn db_schema_sql_contains_new_columns() {
     ];
     assert_eq!(
         expected_columns.len(),
-        34,
-        "schema requires 34 columns (id + 33 data columns)"
+        35,
+        "schema requires 35 columns (id + 34 data columns)"
     );
 
     // Verify RequestLog struct has the same field names via a compile-time
@@ -346,6 +351,10 @@ async fn sqlite_round_trips_reasoning_effort_in_list_and_detail() {
             client_model: "gpt-test".into(),
             upstream_model: "gpt-test".into(),
             reasoning_effort: Some("high".into()),
+
+            route_decision: Some(
+                r#"{"balance":"weighted","candidates":[{"provider":"p1"}]}"#.into(),
+            ),
             method: Some("POST".into()),
             path: Some("/v1/chat/completions".into()),
             client_request_headers: None,
@@ -376,6 +385,12 @@ async fn sqlite_round_trips_reasoning_effort_in_list_and_detail() {
         .expect("query log list");
     assert_eq!(page.total, 1);
     assert_eq!(page.items[0].reasoning_effort.as_deref(), Some("high"));
+    assert!(
+        page.items[0]
+            .route_decision
+            .as_deref()
+            .is_some_and(|d| d.contains("\"balance\":\"weighted\""))
+    );
     assert!(page.items[0].client_request_body.is_none());
 
     let detail = storage
@@ -386,7 +401,106 @@ async fn sqlite_round_trips_reasoning_effort_in_list_and_detail() {
         .expect("log detail should exist");
     assert_eq!(detail.reasoning_effort.as_deref(), Some("high"));
     assert_eq!(
+        detail.route_decision.as_deref(),
+        Some(r#"{"balance":"weighted","candidates":[{"provider":"p1"}]}"#)
+    );
+    assert_eq!(
         detail.client_request_body.as_deref(),
         Some(r#"{"reasoning_effort":"high"}"#)
     );
+}
+
+// ── 7. Log deletion: single row by id, and error-only wipe ───────────────────
+
+#[tokio::test]
+async fn sqlite_deletes_single_log_and_clears_errors_only() {
+    use nyro_core::db;
+    use nyro_core::db::models::LogQuery;
+    use nyro_core::logging::LogEntry;
+    use nyro_core::protocol::ir::Usage;
+    use nyro_core::storage::{SqliteStorage, Storage};
+    use sqlx::sqlite::SqlitePoolOptions;
+
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .expect("connect in-memory sqlite");
+    db::migrate(&pool).await.expect("migrate sqlite schema");
+    let storage = SqliteStorage::from_pool(pool);
+
+    let entry = |client_status: i32| LogEntry {
+        api_key_id: None,
+        api_key_name: None,
+        created_at: 1,
+        client_protocol: "openai/chat/v1".into(),
+        upstream_protocol: "openai/chat/v1".into(),
+        provider_id: "provider-1".into(),
+        provider_name: "Provider".into(),
+        model_id: Some("model-1".into()),
+        model_name: Some("Model".into()),
+        upstream_url: None,
+        client_model: "gpt-test".into(),
+        upstream_model: "gpt-test".into(),
+        reasoning_effort: None,
+        route_decision: None,
+        method: Some("POST".into()),
+        path: Some("/v1/chat/completions".into()),
+        client_request_headers: None,
+        client_request_body: None,
+        client_response_headers: None,
+        client_response_body: None,
+        upstream_request_headers: None,
+        upstream_request_body: None,
+        upstream_response_headers: None,
+        upstream_response_body: None,
+        upstream_status_code: Some(client_status),
+        client_status_code: client_status,
+        latency_total_ms: 1,
+        latency_upstream_ms: Some(1),
+        usage: Usage::default(),
+        is_stream: false,
+        stream_chunks_count: 0,
+        stream_first_chunk_ms: None,
+        enable_payload: None,
+    };
+
+    storage
+        .logs()
+        .append_batch(vec![entry(200), entry(200), entry(500)])
+        .await
+        .expect("append logs");
+
+    let logs = storage.logs();
+    let page = logs.query(LogQuery::default()).await.expect("query");
+    assert_eq!(page.total, 3);
+    let ok_id = page
+        .items
+        .iter()
+        .find(|i| i.client_status_code == Some(200))
+        .expect("ok row exists")
+        .id
+        .clone();
+
+    // Single-row delete: exactly one row gone, others untouched.
+    let deleted = logs.delete_by_id(&ok_id).await.expect("delete by id");
+    assert_eq!(deleted, 1);
+    assert_eq!(
+        logs.delete_by_id("nonexistent-id")
+            .await
+            .expect("delete missing id is not an error"),
+        0
+    );
+    let page = logs.query(LogQuery::default()).await.expect("query");
+    assert_eq!(page.total, 2, "only the targeted row was deleted");
+
+    // Error wipe removes the >= 400 rows only.
+    let deleted = logs.clear_errors().await.expect("clear errors");
+    assert_eq!(deleted, 1);
+    let page = logs.query(LogQuery::default()).await.expect("query");
+    assert_eq!(page.total, 1);
+    assert_eq!(page.items[0].client_status_code, Some(200));
+
+    // Clearing again with no errors left is a no-op.
+    assert_eq!(logs.clear_errors().await.expect("clear errors again"), 0);
 }

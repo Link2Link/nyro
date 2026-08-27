@@ -96,6 +96,7 @@ CREATE TABLE IF NOT EXISTS request_logs (
     client_model              TEXT,
     upstream_model            TEXT,
     reasoning_effort          TEXT,
+    route_decision            TEXT,
     method                    TEXT,
     path                      TEXT,
     client_request_headers    TEXT,

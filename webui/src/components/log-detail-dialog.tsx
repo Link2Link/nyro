@@ -1,6 +1,6 @@
 import { useQuery } from "@tanstack/react-query";
 import { useEffect, useRef, useState } from "react";
-import { Check, Copy, Download, Loader2 } from "lucide-react";
+import { Check, Copy, Download, Loader2, Trash2 } from "lucide-react";
 
 import { backend } from "@/lib/backend";
 import { useLocale } from "@/lib/i18n";
@@ -27,9 +27,11 @@ interface LogDetailDialogProps {
   summary?: RequestLog | null;
   open: boolean;
   onOpenChange: (open: boolean) => void;
+  /** When provided, renders a per-row delete button next to Download. */
+  onDelete?: (id: string) => void;
 }
 
-export function LogDetailDialog({ logId, summary, open, onOpenChange }: LogDetailDialogProps) {
+export function LogDetailDialog({ logId, summary, open, onOpenChange, onDelete }: LogDetailDialogProps) {
   const { locale } = useLocale();
   const isZh = locale === "zh-CN";
 
@@ -281,11 +283,32 @@ export function LogDetailDialog({ logId, summary, open, onOpenChange }: LogDetai
                   <><Download className="h-3.5 w-3.5" />{isZh ? "下载" : "Download"}</>
                 )}
               </Button>
+              {onDelete && log?.id ? (
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="ghost"
+                  onClick={() => onDelete(log.id!)}
+                  className="h-7 gap-1 px-2 text-xs text-red-500 hover:bg-red-50 hover:text-red-600"
+                >
+                  <Trash2 className="h-3.5 w-3.5" />
+                  {isZh ? "删除" : "Delete"}
+                </Button>
+              ) : null}
             </span>
           ) : null}
         </div>
 
         <div className="flex-1 space-y-3 overflow-y-auto pr-1">
+          {log?.route_decision ? (
+            <>
+              <SectionHeader
+                title={isZh ? "0. 路由决策" : "0. Route Decision"}
+                hint={isZh ? "本次请求为何选择该上游" : "Why this upstream was chosen"}
+              />
+              <RouteDecisionBlock raw={log.route_decision} isZh={isZh} />
+            </>
+          ) : null}
           <SectionHeader
             title={isZh ? "1. 客户端请求" : "1. Client Request"}
             hint={isZh ? `协议：${protocolLabel(log?.client_protocol)}` : `Protocol: ${protocolLabel(log?.client_protocol)}`}
@@ -356,6 +379,98 @@ export function LogDetailDialog({ logId, summary, open, onOpenChange }: LogDetai
         </div>
       </DialogContent>
     </Dialog>
+  );
+}
+
+// ── Route decision snapshot ────────────────────────────────────────────────
+
+interface RouteDecisionData {
+  balance: string;
+  candidates: Array<{
+    provider: string;
+    target: string;
+    rank?: number;
+    weight?: number;
+    share?: number;
+    score?: Record<string, unknown>;
+    skipped?: { reason: string; window?: string; retry_in_secs?: number } | null;
+  }>;
+}
+
+function scoreText(score: Record<string, unknown> | undefined): string {
+  if (!score) return "–";
+  const parts: string[] = [];
+  if (typeof score.rate === "number") parts.push(`r=${Number(score.rate.toFixed(2))}`);
+  if (typeof score.window === "string") parts.push(score.window);
+  if (typeof score.remaining_quota_pct === "number") parts.push(`⌀${score.remaining_quota_pct}%`);
+  if (typeof score.remaining_time_pct === "number") parts.push(`t ${score.remaining_time_pct}%`);
+  if (typeof score.ttft_ms === "number") parts.push(`${score.ttft_ms}ms`);
+  if (typeof score.state === "string") parts.push(score.state);
+  if (typeof score.static_weight === "number") parts.push(`w=${score.static_weight}`);
+  if (typeof score.group === "number") parts.push(`G${score.group}`);
+  if (typeof score.in_group_rank === "number") parts.push(`#${score.in_group_rank}`);
+  return parts.length ? parts.join(" · ") : "–";
+}
+
+function RouteDecisionBlock({ raw, isZh }: { raw: string; isZh: boolean }) {
+  let dec: RouteDecisionData | null = null;
+  try {
+    dec = JSON.parse(raw) as RouteDecisionData;
+  } catch {
+    dec = null;
+  }
+  if (!dec?.candidates?.length) return null;
+
+  const balanceLabel: Record<string, string> = {
+    weighted: isZh ? "加权轮询" : "Weighted",
+    priority: isZh ? "优先分级" : "Priority",
+    latency: isZh ? "延迟优先" : "Latency",
+    usage: isZh ? "用量优先" : "Usage",
+  };
+
+  return (
+    <div className="space-y-1.5">
+      {dec.candidates.map((c, i) => {
+        const skipped = c.skipped;
+        return (
+          <div
+            key={i}
+            className={"flex items-center gap-2 rounded-lg border px-2.5 py-1.5 text-xs " + (skipped ? "border-red-100 bg-red-50/50" : "border-slate-200 bg-slate-50/60")}
+          >
+            <span
+              className={"inline-flex h-5 w-5 shrink-0 items-center justify-center rounded font-semibold " + (skipped ? "bg-red-100 text-red-500" : "bg-emerald-100 text-emerald-700")}
+              title={skipped ? (isZh ? "未参与" : "skipped") : isZh ? "尝试顺序" : "attempt order"}
+            >
+              {skipped ? "✕" : c.rank}
+            </span>
+            <span className="min-w-0 flex-1 truncate font-medium text-slate-700" title={`${c.provider} · ${c.target}`}>
+              {c.target}
+              <span className="ml-1 text-[10px] font-normal text-slate-400">{c.provider.slice(0, 8)}</span>
+            </span>
+            <span className="shrink-0 text-[10px] text-slate-500">{scoreText(c.score)}</span>
+            {typeof c.share === "number" ? (
+              <span className="shrink-0 rounded bg-sky-50 px-1.5 py-0.5 text-[10px] font-medium text-sky-600">
+                {(c.share * 100).toFixed(0)}%
+              </span>
+            ) : null}
+            {skipped ? (
+              <span
+                className="shrink-0 rounded bg-red-100 px-1.5 py-0.5 text-[10px] font-medium text-red-600"
+                title={skipped.retry_in_secs != null ? (isZh ? `约 ${skipped.retry_in_secs}s 后重试` : `retry in ~${skipped.retry_in_secs}s`) : undefined}
+              >
+                {skipped.reason}
+                {skipped.window ? `:${skipped.window}` : ""}
+              </span>
+            ) : null}
+          </div>
+        );
+      })}
+      <p className="px-1 text-[10px] text-slate-400">
+        {isZh
+          ? `策略：${balanceLabel[dec.balance] ?? dec.balance} · 采集于路由选择时点`
+          : `Strategy: ${balanceLabel[dec.balance] ?? dec.balance} · captured at selection time`}
+      </p>
+    </div>
   );
 }
 

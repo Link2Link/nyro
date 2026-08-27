@@ -622,7 +622,7 @@ inventory::submit! { ExtensionRegistration { make: || Box::new(XxxChannel) } }
 |---|---|---|
 | `id` | TEXT PK | UUID |
 | `name` | TEXT | 显示名称，同时作为模型匹配键 |
-| `balance` | TEXT | 负载策略：`weighted` / `priority` / `latency` / `usage`（Provider 套餐用量分²动态权重） |
+| `balance` | TEXT | 负载策略：`weighted` / `priority` / `latency` / `usage`（最大周期窗口剩余额度÷剩余时间比率 r³ 动态权重） |
 | `target_provider` | TEXT FK | 默认目标 Provider（兜底）|
 | `target_model` | TEXT | 默认上游模型名 |
 | `enable_auth` | BOOL | API Token 访问控制，默认 false |
@@ -898,7 +898,7 @@ OnLog 阶段 + `ResponseStats` 已提供标准化的请求指标消费点（见 
 
 ### 12.8 Router 故障策略（部分已落地）
 
-已落地：多 backend 健康感知迭代（`HealthRegistry`）+ 四种 `balance` 策略 + 可重试状态码自动续跑。`latency` 由内存 `LatencyRegistry` 按流式首字延时 EWMA 排序，目标需连续 3 个流式样本并以三次均值入组，未满或超过 5 分钟保鲜窗时由真实流量乐观探测。`usage` 由 `ProviderQuotaRegistry` 的 last-good 窗口快照驱动：只含 5 小时窗口的 Provider 形成最高优先池；否则忽略 5 小时软评分，以周/月匀速用量最低分的平方作为 Provider 动态权重；未知用量 Provider 只作末级兜底，Provider 间等权、Provider 内按静态 target 权重排列。任何窗口达到 100% 仍触发配额硬过滤。待补充：指数退避 + jitter、可配置重试上限、单 backend 精细化熔断（滑动窗口）。
+已落地：多 backend 健康感知迭代（`HealthRegistry`）+ 四种 `balance` 策略 + 可重试状态码自动续跑。`latency` 由内存 `LatencyRegistry` 按流式首字延时 EWMA 排序，目标需连续 3 个流式样本并以三次均值入组，未满或超过 5 分钟保鲜窗时由真实流量乐观探测。`usage` 由 `ProviderQuotaRegistry` 的 last-good 窗口快照驱动：每个 Provider 只按其最大主窗口（月>周>5h）计算所需加速 `r=剩余额度%÷剩余时间%`，全部可评分 Provider 在单一池内按 `r³` 加权随机（r>1 加速烧、r<1 让位、临近重置自动放大、上限 10）；未知用量 Provider 只作末级兜底，Provider 间等权、Provider 内按静态 target 权重排列。任何窗口达到 100% 仍触发配额硬过滤。待补充：指数退避 + jitter、可配置重试上限、单 backend 精细化熔断（滑动窗口）。
 
 ### 12.9 Transport 策略
 

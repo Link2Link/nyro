@@ -539,6 +539,58 @@ async fn passthrough_contract_preserves_unknown_fields_and_applies_narrow_native
     );
 }
 
+// ── Volcengine Ark glm-5.3 off-effort clamp（线上事故复现）──────────────────
+
+/// 线上事故（2026-08-26，请求 58e799fa）：客户端以 chat-completions 发
+/// `reasoning_effort: "disable"`，网关按默认方言归一成 "none"，被火山引擎
+/// Ark coding 端点的 glm-5.3 拒收：400 InvalidParameter - reasoning_effort
+/// `none` is not supported by this model。修复后，off 意图（none 及
+/// misspelling）在 wire 边界钳制为最小合法档 low，其余字段原样透传。
+#[tokio::test]
+async fn passthrough_clamps_off_effort_to_low_for_volcengine_ark_glm() {
+    let gw = build_test_gateway().await;
+    let mut provider = fake_provider("sk-ark");
+    provider.vendor = Some("ark-coding".into());
+    provider.base_url = "https://ark.cn-beijing.volces.com/api/coding/v3".into();
+    let vendor = BearerVendor("ark-coding");
+
+    // 线上原始请求体形状（日志 58e799fa 的 client_request_body）。
+    let raw_body = json!({
+        "max_completion_tokens": 64,
+        "model": "glm-5.3",
+        "messages": [{"role": "user", "content": "标题"}],
+        "reasoning_effort": "disable",
+        "store": false,
+        "stream": true,
+        "stream_options": {"include_usage": true}
+    });
+
+    let ctx = ProviderCtx {
+        provider: &provider,
+        protocol: OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1,
+        egress_base_url: &provider.base_url,
+        api_key: &provider.api_key,
+        auth_scheme: "auto",
+        actual_model: "glm-5.3",
+        credential: None,
+        gw: &gw,
+        disable_default_auth: false,
+    };
+
+    let out = nyro_core::provider::common::pipeline::passthrough_run(&vendor, raw_body, &ctx, true)
+        .await
+        .expect("passthrough_run must succeed");
+
+    assert_eq!(
+        out.body["reasoning_effort"], "low",
+        "ark glm-5.3 rejects `none` upstream; off intent must clamp to `low`",
+    );
+    // 相邻字段不受钳制影响。
+    assert_eq!(out.body["max_completion_tokens"], 64);
+    assert_eq!(out.body["store"], false);
+    assert_eq!(out.body["stream_options"]["include_usage"], true);
+}
+
 // ── declared_mutations default for conservative vendors ───────────────────────
 
 #[test]

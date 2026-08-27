@@ -32,6 +32,10 @@ pub struct LogEntry {
     /// 定性值小写（"high" 等）；仅 budget 时为 `budget:<n>`；未声明为 None。
     pub reasoning_effort: Option<String>,
 
+    /// 路由决策快照 JSON：全部候选的评分/权重/占比/排序与跳过原因，
+    /// 在 target 选择时点采集（不受载荷开关影响）。
+    pub route_decision: Option<String>,
+
     // === HTTP 元 ===
     pub method: Option<String>,
     pub path: Option<String>,
@@ -259,6 +263,7 @@ mod tests {
             client_model: String::new(),
             upstream_model: String::new(),
             reasoning_effort: Some("high".to_string()),
+            route_decision: None,
             method: None,
             path: None,
             client_request_headers: payload.clone(),

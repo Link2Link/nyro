@@ -239,6 +239,14 @@ impl LogStore for MemoryStorage {
         Ok(0)
     }
 
+    async fn delete_by_id(&self, _id: &str) -> anyhow::Result<u64> {
+        Ok(0)
+    }
+
+    async fn clear_errors(&self) -> anyhow::Result<u64> {
+        Ok(0)
+    }
+
     async fn stats_overview(&self, _hours: Option<i64>) -> anyhow::Result<StatsOverview> {
         Ok(StatsOverview::default())
     }

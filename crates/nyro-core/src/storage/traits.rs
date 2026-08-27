@@ -142,6 +142,10 @@ pub trait LogStore: Send + Sync {
     async fn find_by_id(&self, id: &str) -> anyhow::Result<Option<RequestLog>>;
     async fn cleanup_before(&self, cutoff_expression: &str) -> anyhow::Result<u64>;
     async fn clear_all(&self) -> anyhow::Result<u64>;
+    /// Delete one log row by id; 0 when the id does not exist.
+    async fn delete_by_id(&self, id: &str) -> anyhow::Result<u64>;
+    /// Delete every log row whose client status is an error (>= 400).
+    async fn clear_errors(&self) -> anyhow::Result<u64>;
     async fn stats_overview(&self, hours: Option<i64>) -> anyhow::Result<StatsOverview>;
     async fn stats_hourly(&self, hours: i64) -> anyhow::Result<Vec<StatsHourly>>;
     async fn stats_time_buckets(

@@ -1,3 +1,4 @@
+pub mod decision;
 pub mod health;
 pub mod latency;
 mod matcher;

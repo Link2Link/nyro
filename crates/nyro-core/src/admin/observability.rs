@@ -89,6 +89,16 @@ impl AdminService {
     pub async fn clear_logs(&self) -> anyhow::Result<u64> {
         self.gw.storage.logs().clear_all().await
     }
+
+    /// Delete a single request log row; 0 when the id does not exist.
+    pub async fn delete_log(&self, id: &str) -> anyhow::Result<u64> {
+        self.gw.storage.logs().delete_by_id(id).await
+    }
+
+    /// Delete every request log row whose client status is an error (>= 400).
+    pub async fn clear_error_logs(&self) -> anyhow::Result<u64> {
+        self.gw.storage.logs().clear_errors().await
+    }
     // ── Stats ──
 
     fn normalize_hours(hours: Option<i32>) -> Option<i32> {

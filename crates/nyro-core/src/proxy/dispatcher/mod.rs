@@ -506,11 +506,12 @@ async fn dispatch_pipeline_inner(
         .emit();
         return error_response(503, "no route targets configured");
     }
-    let ordered_targets = TargetSelector::select_ordered(
+    let (ordered_targets, mut route_decision) = TargetSelector::select_ordered_traced(
         &route.balance,
         &targets,
         &gw.latency_registry,
         &gw.quota_registry,
+        &gw.health_registry,
     );
     if ordered_targets.is_empty() {
         LogBuilder::from_dispatch(
@@ -538,7 +539,12 @@ async fn dispatch_pipeline_inner(
         }
         let provider = match get_provider(&access_store, &target.provider_id).await {
             Ok(p) => p,
-            Err(_) => continue,
+            Err(_) => {
+                // Provider missing or disabled: annotate the shared snapshot so
+                // later attempt rows explain why this candidate was skipped.
+                route_decision.mark_provider_disabled(&target.provider_id);
+                continue;
+            }
         };
         let actual_model = if target.model.is_empty() || target.model == "*" {
             request_model.clone()
@@ -978,6 +984,7 @@ async fn dispatch_pipeline_inner(
             backend_model: &target.model,
             api_key_id: auth_key.id.as_deref(),
             api_key_name: auth_key.name.as_deref(),
+            route_decision: Some(route_decision.to_json()),
             is_stream,
             enable_payload: route.enable_payload,
             reasoning_effort: reasoning_effort.clone(),
@@ -1098,6 +1105,7 @@ async fn dispatch_pipeline_inner(
         )
         .stream_flag(is_stream)
         .reasoning_effort(reasoning_effort.clone())
+        .route_decision(Some(route_decision.to_json()))
         .status(503)
         .with_req_extras(&req_extras)
         .emit();
@@ -1117,6 +1125,7 @@ async fn dispatch_pipeline_inner(
         )
         .stream_flag(is_stream)
         .reasoning_effort(reasoning_effort.clone())
+        .route_decision(Some(route_decision.to_json()))
         .status(502)
         .with_req_extras(&req_extras)
         .emit();
@@ -1180,6 +1189,9 @@ struct CallCtx<'a> {
     enable_payload: Option<bool>,
     /// Client-requested reasoning effort snapshot (payload-independent).
     reasoning_effort: Option<String>,
+    /// Route-decision snapshot JSON captured at target-selection time; shared
+    /// verbatim by every attempt of this request.
+    route_decision: Option<String>,
     start: Instant,
     /// Shared request-scoped extension bag (clone of `RequestContext::extensions`);
     /// handlers write the canonical `ResponseStats` snapshot here.
@@ -1226,6 +1238,8 @@ struct LogBuilder {
     /// Client-requested reasoning effort snapshot; only a fallback for `emit`,
     /// which prefers the effort actually sent on the upstream wire.
     reasoning_effort: Option<String>,
+    /// Route-decision snapshot JSON captured at target-selection time.
+    route_decision: Option<String>,
     start: Instant,
     client_status_code: i32,
     usage: Usage,
@@ -1254,6 +1268,7 @@ impl LogBuilder {
             is_stream: call_ctx.is_stream,
             enable_payload: call_ctx.enable_payload,
             reasoning_effort: call_ctx.reasoning_effort.clone(),
+            route_decision: call_ctx.route_decision.clone(),
             start: call_ctx.start,
             client_status_code: 200,
             usage: Usage::default(),
@@ -1288,6 +1303,7 @@ impl LogBuilder {
             is_stream: false,
             enable_payload: None,
             reasoning_effort: None,
+            route_decision: None,
             start,
             client_status_code: 200,
             usage: Usage::default(),
@@ -1304,6 +1320,12 @@ impl LogBuilder {
     /// Attach the client-requested reasoning effort snapshot.
     fn reasoning_effort(mut self, v: Option<String>) -> Self {
         self.reasoning_effort = v;
+        self
+    }
+
+    /// Attach the route-decision snapshot JSON (payload-independent).
+    fn route_decision(mut self, v: Option<String>) -> Self {
+        self.route_decision = v;
         self
     }
 
@@ -1446,6 +1468,7 @@ impl LogBuilder {
         }
         let entry = LogEntry {
             api_key_id: self.api_key_id,
+            route_decision: self.route_decision,
             api_key_name: self.api_key_name,
             created_at: chrono::Utc::now().timestamp_millis(),
             client_protocol: self.client_protocol,
@@ -1929,6 +1952,99 @@ mod tests {
             }
             PhaseOutcome::Continue
         }
+    }
+
+    #[tokio::test]
+    async fn quota_exhausted_log_row_carries_route_decision_snapshot() {
+        let config = crate::config::GatewayConfig {
+            data_dir: std::env::temp_dir()
+                .join(format!("nyro-route-decision-test-{}", uuid::Uuid::new_v4())),
+            ..Default::default()
+        };
+        let (gw, mut log_rx) = Gateway::new(config).await.expect("gateway init");
+        let provider = gw
+            .admin()
+            .create_provider(CreateProvider {
+                name: format!("decision-provider-{}", uuid::Uuid::new_v4()),
+                vendor: Some("openai".to_string()),
+                protocol: "openai-compatible".to_string(),
+                base_url: "http://127.0.0.1:9/v1".to_string(),
+                protocol_mode: "fixed".to_string(),
+                protocol_endpoints: Vec::new(),
+                preset_key: None,
+                channel: None,
+                models_source: None,
+                static_models: None,
+                api_key: "sk-test".to_string(),
+                auth_mode: "apikey".to_string(),
+                use_proxy: false,
+                fast_mode: false,
+            })
+            .await
+            .expect("provider create");
+        let route_name = format!("decision-route-{}", uuid::Uuid::new_v4());
+        gw.admin()
+            .create_model(CreateModel {
+                name: route_name.clone(),
+                balance: Some("usage".to_string()),
+                target_provider: provider.id.clone(),
+                target_model: "upstream-model".to_string(),
+                targets: vec![CreateModelBackend {
+                    provider_id: provider.id.clone(),
+                    model: "upstream-model".to_string(),
+                    weight: Some(100),
+                    priority: Some(1),
+                }],
+                enable_auth: Some(false),
+                enable_payload: None,
+            })
+            .await
+            .expect("model create");
+        gw.quota_registry.observe(
+            &provider.id,
+            &[QuotaTierObservation {
+                name: "weekly_limit".to_string(),
+                used_percent: 100.0,
+                resets_at: None,
+            }],
+            None,
+        );
+
+        let envelope = RawEnvelope::new(
+            Some(serde_json::json!({"model": route_name})),
+            HashMap::new(),
+            "POST",
+            "/v1/chat/completions",
+        );
+        let request = AiRequest::new(route_name.clone(), Vec::new());
+        let response = dispatch_pipeline(
+            gw,
+            HeaderMap::new(),
+            envelope,
+            request,
+            OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1,
+            crate::proxy::context::RequestContext::new(
+                OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1,
+                std::time::Duration::from_secs(30),
+            ),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let entry = tokio::time::timeout(std::time::Duration::from_secs(1), log_rx.recv())
+            .await
+            .expect("log entry should be emitted")
+            .expect("log channel should remain open");
+        let decision = entry
+            .route_decision
+            .as_deref()
+            .expect("quota-exhausted row carries the decision snapshot");
+        assert!(decision.contains("\"balance\":\"usage\""));
+        assert!(decision.contains("\"quota_exhausted\""));
+        assert!(decision.contains("weekly_limit"));
+        // Even with payloads globally enabled the snapshot is independent of
+        // that switch; here it survived the default-on path unchanged.
+        assert!(!decision.contains("client_request_body"));
     }
 
     #[tokio::test]

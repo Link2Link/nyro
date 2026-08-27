@@ -606,3 +606,82 @@ async fn seed_oauth_credential(
         .await?;
     Ok(())
 }
+
+// ── log deletion tests ──────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn admin_deletes_single_log_and_clears_error_logs() -> anyhow::Result<()> {
+    use nyro_core::logging::LogEntry;
+    use nyro_core::protocol::ir::Usage;
+
+    let gw = build_gateway().await?;
+    let entry = |client_status: i32| LogEntry {
+        api_key_id: None,
+        api_key_name: None,
+        created_at: 1,
+        client_protocol: "openai/chat/v1".into(),
+        upstream_protocol: "openai/chat/v1".into(),
+        provider_id: "provider-1".into(),
+        provider_name: "Provider".into(),
+        model_id: Some("model-1".into()),
+        model_name: Some("Model".into()),
+        upstream_url: None,
+        client_model: "gpt-test".into(),
+        upstream_model: "gpt-test".into(),
+        reasoning_effort: None,
+        route_decision: None,
+        method: Some("POST".into()),
+        path: Some("/v1/chat/completions".into()),
+        client_request_headers: None,
+        client_request_body: None,
+        client_response_headers: None,
+        client_response_body: None,
+        upstream_request_headers: None,
+        upstream_request_body: None,
+        upstream_response_headers: None,
+        upstream_response_body: None,
+        upstream_status_code: Some(client_status),
+        client_status_code: client_status,
+        latency_total_ms: 1,
+        latency_upstream_ms: Some(1),
+        usage: Usage::default(),
+        is_stream: false,
+        stream_chunks_count: 0,
+        stream_first_chunk_ms: None,
+        enable_payload: None,
+    };
+
+    gw.storage
+        .logs()
+        .append_batch(vec![entry(200), entry(429), entry(500), entry(200)])
+        .await?;
+
+    let rows = gw.admin().query_logs(LogQuery::default()).await?;
+    assert_eq!(rows.total, 4);
+    let first_ok = rows
+        .items
+        .iter()
+        .find(|i| i.client_status_code == Some(200))
+        .expect("ok row exists")
+        .id
+        .clone();
+
+    // Single-row delete; a missing id reports 0 instead of an error.
+    assert_eq!(gw.admin().delete_log(&first_ok).await?, 1);
+    assert_eq!(gw.admin().delete_log("missing-id").await?, 0);
+    let rows = gw.admin().query_logs(LogQuery::default()).await?;
+    assert_eq!(rows.total, 3);
+
+    // Error wipe removes exactly the two error rows.
+    assert_eq!(gw.admin().clear_error_logs().await?, 2);
+    let rows = gw.admin().query_logs(LogQuery::default()).await?;
+    assert_eq!(rows.total, 1);
+    assert_eq!(rows.items[0].client_status_code, Some(200));
+
+    // Full clear still works and removes the remainder.
+    assert_eq!(gw.admin().clear_logs().await?, 1);
+    let rows = gw.admin().query_logs(LogQuery::default()).await?;
+    assert_eq!(rows.total, 0);
+
+    Ok(())
+}

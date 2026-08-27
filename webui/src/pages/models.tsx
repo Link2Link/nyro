@@ -575,8 +575,8 @@ export default function ModelsPage() {
                   {createForm.balance === "usage" && (
                     <span className="text-[11px] text-slate-400">
                       {isZh
-                        ? "优先消耗仅 5 小时套餐；否则按周/月用量短板分²动态分流"
-                        : "prioritizes 5h-only plans; otherwise weights by squared weekly/monthly quota score"}
+                        ? "按最大周期窗口的剩余额度÷剩余时间比率 r³ 动态分流"
+                        : "weights by cubed remaining-quota / remaining-time ratio of the largest window"}
                     </span>
                   )}
                 </div>
@@ -749,8 +749,8 @@ export default function ModelsPage() {
                           {editForm.balance === "usage" && (
                             <span className="text-[11px] text-slate-400">
                               {isZh
-                                ? "优先消耗仅 5 小时套餐；否则按周/月用量短板分²动态分流"
-                                : "prioritizes 5h-only plans; otherwise weights by squared weekly/monthly quota score"}
+                                ? "按最大周期窗口的剩余额度÷剩余时间比率 r³ 动态分流"
+                                : "weights by cubed remaining-quota / remaining-time ratio of the largest window"}
                             </span>
                           )}
                         </div>

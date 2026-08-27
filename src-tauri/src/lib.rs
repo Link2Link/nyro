@@ -105,6 +105,8 @@ pub fn run() {
             commands::query_logs,
             commands::get_log,
             commands::clear_logs,
+            commands::delete_log,
+            commands::clear_error_logs,
             commands::get_stats_overview,
             commands::get_stats_hourly,
             commands::get_stats_timeseries,

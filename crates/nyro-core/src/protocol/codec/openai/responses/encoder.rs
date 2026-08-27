@@ -19,8 +19,8 @@ use crate::protocol::RequestEncoder;
 use crate::protocol::codec::reasoning::{effective_openai_effort, reasoning_effort_name};
 use crate::protocol::ir::AiRequest;
 use crate::protocol::ir::request::{
-    ContentBlock, MessageContent, ReasoningConfig, Role, ToolCallKind, ToolChoice, ToolSpec,
-    ToolSpecKind,
+    ContentBlock, MessageContent, ReasoningConfig, ResponseFormat, Role, ToolCallKind, ToolChoice,
+    ToolSpec, ToolSpecKind,
 };
 
 use super::normalize_function_tool_defaults;
@@ -39,6 +39,10 @@ const SKIP_FROM_EXTRA: &[&str] = &[
     "stream",
     "model",
     "reasoning_effort",
+    // Chat Completions `response_format` is not a Responses parameter (the
+    // upstream rejects it with `Unsupported parameter: response_format`);
+    // the IR value is re-encoded as `text.format` below instead.
+    "response_format",
     // Chat Completions `stream_options.include_usage` is rejected by Codex
     // Responses (`unknown_parameter`). Native Responses options are copied
     // through `sanitize_responses_stream_options` instead of this bag dump.
@@ -249,6 +253,35 @@ impl RequestEncoder for ResponsesEncoder {
             if let Some(v) = ingress.get(*key) {
                 obj.entry(key.to_string()).or_insert_with(|| v.clone());
             }
+        }
+
+        // ── Structured output: IR `response_format` → Responses `text.format` ──
+        // Chat Completions carries structured output as `response_format`,
+        // which the Responses API rejects outright; translate it to
+        // `text.format`. A native `text` passthrough (copied above) wins.
+        if !obj.contains_key("text")
+            && let Some(rf) = &req.response_format
+        {
+            let format = match rf {
+                ResponseFormat::JsonSchema {
+                    name,
+                    schema,
+                    strict,
+                } => {
+                    let mut fmt = serde_json::json!({
+                        "type": "json_schema",
+                        "name": name,
+                        "schema": schema,
+                    });
+                    if let Some(strict) = strict {
+                        fmt["strict"] = Value::Bool(*strict);
+                    }
+                    fmt
+                }
+                ResponseFormat::JsonObject => serde_json::json!({"type": "json_object"}),
+                ResponseFormat::Text => serde_json::json!({"type": "text"}),
+            };
+            obj.insert("text".into(), serde_json::json!({"format": format}));
         }
 
         if let Some(v) = ingress.get("stream_options")

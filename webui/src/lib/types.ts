@@ -86,6 +86,9 @@ export interface RequestLog {
   /** 客户端请求的归一化推理强度（"high" 等定性值或 "budget:<n>"），未声明时缺省 */
   reasoning_effort?: string | null;
 
+  /** 路由决策快照 JSON（选择时点采集：全部候选的评分/权重/占比/排序与跳过原因） */
+  route_decision?: string | null;
+
   method?: string;
   path?: string;
 

@@ -28,6 +28,8 @@ fn log_entry(
         client_model: "test-model".into(),
         upstream_model: "test-model".into(),
         reasoning_effort: None,
+
+        route_decision: None,
         method: Some("POST".into()),
         path: Some("/v1/chat/completions".into()),
         client_request_headers: None,

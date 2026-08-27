@@ -383,6 +383,11 @@ pub struct RequestLog {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
 
+    /// 路由决策快照 JSON（选择时点采集：全部候选的评分/权重/占比/排序
+    /// 与跳过原因；不受载荷记录开关影响）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route_decision: Option<String>,
+
     pub method: Option<String>,
     pub path: Option<String>,
 

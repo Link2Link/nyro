@@ -131,7 +131,7 @@ pub fn create_router(gateway: Gateway, admin_token: Option<String>) -> Router {
         )
         .route("/api-keys/:id", api_keys_item)
         .route("/logs", get(query_logs_handler).delete(clear_logs_handler))
-        .route("/logs/:id", get(get_log_handler))
+        .route("/logs/:id", get(get_log_handler).delete(delete_log_handler))
         .route("/stats/overview", get(stats_overview))
         .route("/stats/hourly", get(stats_hourly))
         .route("/stats/timeseries", get(stats_timeseries))
@@ -641,8 +641,38 @@ async fn query_logs_handler(
     }
 }
 
-async fn clear_logs_handler(State(gw): State<Gateway>) -> impl IntoResponse {
-    match gw.admin().clear_logs().await {
+async fn clear_logs_handler(
+    State(gw): State<Gateway>,
+    Query(params): Query<ClearLogsParams>,
+) -> impl IntoResponse {
+    // `?scope=errors` restricts the wipe to rows whose client status is an
+    // error (>= 400); absent scope keeps the historical clear-everything.
+    let result = if params.scope.as_deref() == Some("errors") {
+        gw.admin().clear_error_logs().await
+    } else {
+        gw.admin().clear_logs().await
+    };
+    match result {
+        Ok(deleted) => Json(serde_json::json!({ "data": { "deleted": deleted } })).into_response(),
+        Err(e) => err(e),
+    }
+}
+
+#[derive(Deserialize, Default)]
+struct ClearLogsParams {
+    scope: Option<String>,
+}
+
+async fn delete_log_handler(
+    State(gw): State<Gateway>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    match gw.admin().delete_log(&id).await {
+        Ok(0) => (
+            axum::http::StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "log not found" })),
+        )
+            .into_response(),
         Ok(deleted) => Json(serde_json::json!({ "data": { "deleted": deleted } })).into_response(),
         Err(e) => err(e),
     }

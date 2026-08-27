@@ -447,6 +447,7 @@ mod tests {
             is_stream: false,
             enable_payload: None,
             reasoning_effort: None,
+            route_decision: None,
             start: std::time::Instant::now(),
             req_ext,
         };
@@ -536,6 +537,7 @@ mod tests {
             is_stream: false,
             enable_payload: None,
             reasoning_effort: None,
+            route_decision: None,
             start: std::time::Instant::now(),
             req_ext: req_ext.clone(),
         };
@@ -744,6 +746,7 @@ mod tests {
             is_stream: false,
             enable_payload: None,
             reasoning_effort: None,
+            route_decision: None,
             start: std::time::Instant::now(),
             req_ext: crate::proxy::context::ContextBag::new(),
         };
