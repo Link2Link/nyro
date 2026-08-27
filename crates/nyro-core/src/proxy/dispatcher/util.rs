@@ -187,6 +187,7 @@ mod tests {
             target_provider: "provider-a".to_string(),
             target_model: "upstream-a".to_string(),
             enable_auth: false,
+            force_max_reasoning: false,
             enable_payload: None,
             vision_shim: None,
             is_enabled: true,

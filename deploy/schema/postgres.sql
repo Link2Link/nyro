@@ -63,6 +63,7 @@ CREATE TABLE IF NOT EXISTS models (
     target_model TEXT NOT NULL,
     enable_auth BOOLEAN DEFAULT FALSE,
     enable_payload BOOLEAN,
+    force_max_reasoning BOOLEAN NOT NULL DEFAULT FALSE,
     vision_shim TEXT,
     is_enabled BOOLEAN DEFAULT TRUE,
     priority INTEGER DEFAULT 0,

@@ -36,6 +36,7 @@ impl AdminService {
                 targets: vec![],
                 enable_auth: input.enable_auth,
                 enable_payload: input.enable_payload,
+                force_max_reasoning: input.force_max_reasoning,
                 vision_shim,
             })
             .await?;
@@ -79,6 +80,7 @@ impl AdminService {
                     targets: None,
                     enable_auth: Some(enable_auth),
                     enable_payload: Some(enable_payload),
+                    force_max_reasoning: input.force_max_reasoning,
                     vision_shim,
                     is_enabled: Some(is_enabled),
                 },

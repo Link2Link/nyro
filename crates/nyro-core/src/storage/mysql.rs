@@ -624,7 +624,7 @@ impl ModelStore for MysqlModelStore {
     async fn create(&self, input: CreateModel) -> anyhow::Result<Model> {
         let id = uuid::Uuid::new_v4().to_string();
         sqlx::query(
-            "INSERT INTO models (id, name, balance, target_provider, target_model, enable_auth, enable_payload, vision_shim) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO models (id, name, balance, target_provider, target_model, enable_auth, enable_payload, vision_shim, force_max_reasoning) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&id)
         .bind(input.name.trim())
@@ -633,6 +633,7 @@ impl ModelStore for MysqlModelStore {
         .bind(input.target_model.trim())
         .bind(input.enable_auth.unwrap_or(false))
         .bind(input.enable_payload)
+        .bind(input.force_max_reasoning.unwrap_or(false))
         .bind(crate::db::models::vision_shim_value_to_raw(
             input.vision_shim.as_ref().unwrap_or(&serde_json::Value::Null),
         )?)
@@ -649,6 +650,9 @@ impl ModelStore for MysqlModelStore {
         let target_model = input.target_model.unwrap_or(current.target_model);
         let enable_auth = input.enable_auth.unwrap_or(current.enable_auth);
         let enable_payload = input.enable_payload.unwrap_or(current.enable_payload);
+        let force_max_reasoning = input
+            .force_max_reasoning
+            .unwrap_or(current.force_max_reasoning);
         let is_enabled = input.is_enabled.unwrap_or(current.is_enabled);
         let vision_shim = match input.vision_shim.as_ref() {
             Some(value) => crate::db::models::vision_shim_value_to_raw(value)?,
@@ -656,7 +660,7 @@ impl ModelStore for MysqlModelStore {
         };
 
         sqlx::query(
-            "UPDATE models SET name=?, balance=?, target_provider=?, target_model=?, enable_auth=?, enable_payload=?, vision_shim=?, is_enabled=? WHERE id=?",
+            "UPDATE models SET name=?, balance=?, target_provider=?, target_model=?, enable_auth=?, enable_payload=?, vision_shim=?, force_max_reasoning=?, is_enabled=? WHERE id=?",
         )
         .bind(name.trim())
         .bind(balance.trim().to_lowercase())
@@ -665,6 +669,7 @@ impl ModelStore for MysqlModelStore {
         .bind(enable_auth)
         .bind(enable_payload)
         .bind(vision_shim)
+        .bind(force_max_reasoning)
         .bind(is_enabled)
         .bind(id)
         .execute(&self.pool)
@@ -1687,6 +1692,15 @@ impl StorageBootstrap for MysqlBootstrap {
         // Add vision_shim column to models table (multimodal facade config JSON)
         mysql_add_column_if_not_exists(pool, "models", "vision_shim", "TEXT").await?;
 
+        // Add force_max_reasoning column to models table (max-reasoning override)
+        mysql_add_column_if_not_exists(
+            pool,
+            "models",
+            "force_max_reasoning",
+            "BOOLEAN NOT NULL DEFAULT 0",
+        )
+        .await?;
+
         // Merge virtual_model into name and drop the column
         if mysql_column_exists(pool, "models", "virtual_model").await? {
             tracing::info!("merging virtual_model into name on models table (mysql)");
@@ -2004,7 +2018,7 @@ fn provider_select(suffix: Option<&str>) -> String {
 
 fn model_select(suffix: Option<&str>) -> String {
     let mut sql = String::from(
-        "SELECT id, name, COALESCE(balance, 'weighted') AS balance, target_provider, target_model, COALESCE(enable_auth, 0) AS enable_auth, enable_payload, vision_shim, COALESCE(is_enabled, 1) AS is_enabled, DATE_FORMAT(created_at, '%Y-%m-%d %H:%i:%S') AS created_at FROM models",
+        "SELECT id, name, COALESCE(balance, 'weighted') AS balance, target_provider, target_model, COALESCE(enable_auth, 0) AS enable_auth, enable_payload, vision_shim, COALESCE(force_max_reasoning, 0) AS force_max_reasoning, COALESCE(is_enabled, 1) AS is_enabled, DATE_FORMAT(created_at, '%Y-%m-%d %H:%i:%S') AS created_at FROM models",
     );
     if let Some(suffix) = suffix {
         sql.push(' ');
@@ -2143,6 +2157,7 @@ CREATE TABLE IF NOT EXISTS routes (
     target_model VARCHAR(255) NOT NULL,
     enable_auth TINYINT(1) DEFAULT 0,
     enable_payload TINYINT(1) DEFAULT NULL,
+    force_max_reasoning TINYINT(1) NOT NULL DEFAULT 0,
     vision_shim TEXT,
     is_enabled TINYINT(1) DEFAULT 1,
     priority INTEGER DEFAULT 0,

@@ -613,7 +613,7 @@ impl ModelStore for PostgresModelStore {
     async fn create(&self, input: CreateModel) -> anyhow::Result<Model> {
         let id = uuid::Uuid::new_v4().to_string();
         sqlx::query(
-            "INSERT INTO models (id, name, balance, target_provider, target_model, enable_auth, enable_payload, vision_shim) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+            "INSERT INTO models (id, name, balance, target_provider, target_model, enable_auth, enable_payload, vision_shim, force_max_reasoning) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
         )
         .bind(&id)
         .bind(input.name.trim())
@@ -622,6 +622,7 @@ impl ModelStore for PostgresModelStore {
         .bind(input.target_model.trim())
         .bind(input.enable_auth.unwrap_or(false))
         .bind(input.enable_payload)
+        .bind(input.force_max_reasoning.unwrap_or(false))
         .bind(crate::db::models::vision_shim_value_to_raw(
             input.vision_shim.as_ref().unwrap_or(&serde_json::Value::Null),
         )?)
@@ -638,6 +639,9 @@ impl ModelStore for PostgresModelStore {
         let target_model = input.target_model.unwrap_or(current.target_model);
         let enable_auth = input.enable_auth.unwrap_or(current.enable_auth);
         let enable_payload = input.enable_payload.unwrap_or(current.enable_payload);
+        let force_max_reasoning = input
+            .force_max_reasoning
+            .unwrap_or(current.force_max_reasoning);
         let is_enabled = input.is_enabled.unwrap_or(current.is_enabled);
         let vision_shim = match input.vision_shim.as_ref() {
             Some(value) => crate::db::models::vision_shim_value_to_raw(value)?,
@@ -645,7 +649,7 @@ impl ModelStore for PostgresModelStore {
         };
 
         sqlx::query(
-            "UPDATE models SET name=$1, balance=$2, target_provider=$3, target_model=$4, enable_auth=$5, enable_payload=$6, vision_shim=$7, is_enabled=$8 WHERE id=$9",
+            "UPDATE models SET name=$1, balance=$2, target_provider=$3, target_model=$4, enable_auth=$5, enable_payload=$6, vision_shim=$7, force_max_reasoning=$8, is_enabled=$9 WHERE id=$10",
         )
         .bind(name.trim())
         .bind(balance.trim().to_lowercase())
@@ -654,6 +658,7 @@ impl ModelStore for PostgresModelStore {
         .bind(enable_auth)
         .bind(enable_payload)
         .bind(vision_shim)
+        .bind(force_max_reasoning)
         .bind(is_enabled)
         .bind(id)
         .execute(&self.pool)
@@ -1645,6 +1650,11 @@ END $$;"#,
         sqlx::query("ALTER TABLE models ADD COLUMN IF NOT EXISTS vision_shim TEXT")
             .execute(self.adapter.pool())
             .await?;
+        sqlx::query(
+            "ALTER TABLE models ADD COLUMN IF NOT EXISTS force_max_reasoning BOOLEAN NOT NULL DEFAULT FALSE",
+        )
+        .execute(self.adapter.pool())
+        .await?;
         // Rename settings key log_record_payloads → enable_payload
         sqlx::query(
             "UPDATE settings SET name = 'enable_payload' WHERE name = 'log_record_payloads'",
@@ -1920,7 +1930,7 @@ fn provider_select(suffix: Option<&str>) -> String {
 
 fn model_select(suffix: Option<&str>) -> String {
     let mut sql = String::from(
-        "SELECT id, name, COALESCE(balance, 'weighted') AS balance, target_provider, target_model, COALESCE(enable_auth, false) AS enable_auth, enable_payload, vision_shim, COALESCE(is_enabled, TRUE) AS is_enabled, to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS') AS created_at FROM models",
+        "SELECT id, name, COALESCE(balance, 'weighted') AS balance, target_provider, target_model, COALESCE(enable_auth, false) AS enable_auth, enable_payload, vision_shim, COALESCE(force_max_reasoning, FALSE) AS force_max_reasoning, COALESCE(is_enabled, TRUE) AS is_enabled, to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS') AS created_at FROM models",
     );
     if let Some(suffix) = suffix {
         sql.push(' ');
@@ -2065,6 +2075,7 @@ CREATE TABLE IF NOT EXISTS routes (
     target_model TEXT NOT NULL,
     enable_auth BOOLEAN DEFAULT FALSE,
     enable_payload BOOLEAN,
+    force_max_reasoning BOOLEAN NOT NULL DEFAULT FALSE,
     vision_shim TEXT,
     is_enabled BOOLEAN DEFAULT TRUE,
     priority INTEGER DEFAULT 0,

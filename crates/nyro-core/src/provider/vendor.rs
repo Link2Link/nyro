@@ -92,6 +92,12 @@ pub struct ProviderCtx<'a> {
     /// Endpoint-specific auth strategy (`auto`, `bearer`, `x-api-key`, `query`, `none`).
     pub auth_scheme: &'a str,
     pub actual_model: &'a str,
+    /// Route-level `models.force_max_reasoning` override: every request for
+    /// this mapping is forced to max reasoning effort regardless of the
+    /// client directive (explicit tiers, absent directive, and off/budget
+    /// forms alike). Consumed by the passthrough wire path; the transcode and
+    /// compat paths rewrite the IR at the dispatcher instead.
+    pub force_max_reasoning: bool,
     pub credential: Option<&'a StoredCredential>,
     pub gw: &'a Gateway,
     /// When `true`, the vendor's default `auth_headers` and the Anthropic

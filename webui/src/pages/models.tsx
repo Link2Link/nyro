@@ -38,6 +38,7 @@ type ModelForm = {
   targets: ModelBackendForm[];
   enable_auth: boolean;
   enable_payload: boolean;
+  force_max_reasoning: boolean;
   vision_shim_enabled: boolean;
   vision_helpers: VisionHelperForm[];
 };
@@ -61,6 +62,7 @@ const emptyCreate: ModelForm = {
   targets: [{ provider_id: "", model: "", weight: 100, priority: 1 }],
   enable_auth: true,
   enable_payload: true,
+  force_max_reasoning: false,
   vision_shim_enabled: false,
   vision_helpers: [],
 };
@@ -687,6 +689,7 @@ export default function ModelsPage() {
       targets,
       enable_auth: route.enable_auth,
       enable_payload: route.enable_payload ?? false,
+      force_max_reasoning: route.force_max_reasoning ?? false,
       vision_shim_enabled: visionHelpers.length > 0,
       vision_helpers: visionHelpers,
     });
@@ -867,6 +870,19 @@ export default function ModelsPage() {
                 onCheckedChange={(checked) => setCreateForm((prev) => ({ ...prev, enable_payload: checked }))}
               />
             )}
+            <ModelToggleControl
+              title={isZh ? "强制 Max 推理" : "Force Max Reasoning"}
+              isZh={isZh}
+              checked={createForm.force_max_reasoning}
+              checkedMessage={
+                isZh
+                  ? "无论请求何种推理强度，一律按最大档推理（上游方言仍会裁决）"
+                  : "Always request max reasoning regardless of the client directive (vendor dialects still apply)"
+              }
+              uncheckedMessage={isZh ? "按客户端请求的推理强度透传" : "Pass through the client-requested reasoning effort"}
+              switchId="create-route-force-max-reasoning"
+              onCheckedChange={(checked) => setCreateForm((prev) => ({ ...prev, force_max_reasoning: checked }))}
+            />
             <VisionFacadeControl
               isZh={isZh}
               enabled={createForm.vision_shim_enabled}
@@ -1080,6 +1096,20 @@ export default function ModelsPage() {
                         }
                       />
                     )}
+                    <ModelToggleControl
+                      title={isZh ? "强制 Max 推理" : "Force Max Reasoning"}
+                      isZh={isZh}
+                      checked={editForm.force_max_reasoning}
+                      checkedMessage={
+                        isZh
+                          ? "无论请求何种推理强度，一律按最大档推理（上游方言仍会裁决）"
+                          : "Always request max reasoning regardless of the client directive (vendor dialects still apply)"
+                      }
+                      uncheckedMessage={isZh ? "按客户端请求的推理强度透传" : "Pass through the client-requested reasoning effort"}
+                      onCheckedChange={(checked) =>
+                        setEditForm((prev) => (prev ? { ...prev, force_max_reasoning: checked } : prev))
+                      }
+                    />
                     <VisionFacadeControl
                       isZh={isZh}
                       enabled={editForm.vision_shim_enabled}
@@ -1305,6 +1335,7 @@ function buildCreatePayload(form: ModelForm): CreateModel {
     target_model: primary.model,
     enable_auth: form.enable_auth,
     enable_payload: form.enable_payload,
+    force_max_reasoning: form.force_max_reasoning,
     vision_shim: buildVisionShimPayload(form),
   };
 }
@@ -1326,6 +1357,7 @@ function buildUpdatePayload(form: ModelForm & { id: string }): UpdateModel {
     target_model: primary.model,
     enable_auth: form.enable_auth,
     enable_payload: form.enable_payload,
+    force_max_reasoning: form.force_max_reasoning,
     // An empty object clears the shim; absence would keep the stored value.
     vision_shim: buildVisionShimPayload(form) ?? {},
   };

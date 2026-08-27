@@ -291,6 +291,81 @@ pub(crate) fn apply_vendor_effort_policy(body: &mut Value, provider: &Provider) 
     }
 }
 
+/// 模型映射级「max推理」覆盖（models.force_max_reasoning）：把 IR 的推理
+/// 指令改写为最大档。无论客户端显式给了何种档位、预算制，还是完全未携带
+/// 推理指令，都统一为 max（会话决策：①②③ 全覆盖）。`display`/summary
+/// 偏好保留。只在转码 / compat 重编码路径调用；原生直通路径走 wire 级
+/// [`apply_force_max_reasoning_body`]，两者不可混用。
+pub(crate) fn force_max_reasoning_ir(req: &mut crate::protocol::ir::AiRequest) {
+    req.reasoning.effort = Some(crate::protocol::ir::ReasoningEffort::Max);
+    req.reasoning.enabled = true;
+    req.reasoning.budget_tokens = None;
+}
+
+/// 直通路径的 wire 级 max 覆盖：直接改写出站 body，保持原生直通的逐字
+/// 保真度（IR 级改写会触发 RequestMutated 语义、杀死 codex 类通道依赖的
+/// 直通）。各协议表达与 IR 编码器一致：
+/// - chat：顶层 `reasoning_effort: "max"`；
+/// - Responses：嵌套 `reasoning.effort`（保留 summary 等兄弟键）；
+/// - Anthropic：`thinking.type=adaptive` + `output_config.effort=max`
+///   （镜像 [`crate::protocol::codec::anthropic::messages`] 编码器的
+///   effort 表达）；
+/// - Gemini：`thinkingConfig.thinkingLevel=high`（镜像
+///   `google_thinking_level(Max)`：Gemini 无 max 档，顶格即 high）。
+/// 调用方必须让 vendor effort 策略（grok max→xhigh 等）随后照常运行。
+pub(crate) fn apply_force_max_reasoning_body(
+    body: &mut Value,
+    protocol: crate::protocol::ids::Protocol,
+) {
+    let Some(object) = body.as_object_mut() else {
+        return;
+    };
+    match protocol {
+        crate::protocol::ids::Protocol::OpenAICompatible => {
+            object.insert(
+                "reasoning_effort".to_string(),
+                Value::String("max".to_string()),
+            );
+        }
+        crate::protocol::ids::Protocol::OpenAIResponses => {
+            let reasoning = object
+                .entry("reasoning")
+                .or_insert_with(|| Value::Object(Default::default()));
+            if let Some(reasoning_obj) = reasoning.as_object_mut() {
+                reasoning_obj.insert("effort".to_string(), Value::String("max".to_string()));
+            }
+        }
+        crate::protocol::ids::Protocol::AnthropicMessages => {
+            object.insert(
+                "thinking".to_string(),
+                serde_json::json!({ "type": "adaptive" }),
+            );
+            let output_config = object
+                .entry("output_config")
+                .or_insert_with(|| Value::Object(Default::default()));
+            if let Some(config_obj) = output_config.as_object_mut() {
+                config_obj.insert("effort".to_string(), Value::String("max".to_string()));
+            }
+        }
+        crate::protocol::ids::Protocol::GoogleGemini => {
+            let generation_config = object
+                .entry("generationConfig")
+                .or_insert_with(|| Value::Object(Default::default()));
+            let thinking_config = generation_config.as_object_mut().map(|config| {
+                config
+                    .entry("thinkingConfig")
+                    .or_insert_with(|| Value::Object(Default::default()))
+            });
+            if let Some(thinking_obj) = thinking_config.and_then(Value::as_object_mut) {
+                thinking_obj.insert(
+                    "thinkingLevel".to_string(),
+                    Value::String("high".to_string()),
+                );
+            }
+        }
+    }
+}
+
 /// Standard `build_request` pipeline:
 /// `pre_request → normalize_tool_results → pre_encode → codec_encode →
 ///  post_encode → auth_headers → build_url`.
@@ -481,6 +556,14 @@ pub async fn passthrough_run(
                 serde_json::json!({"include_usage": true}),
             );
         }
+    }
+
+    // 模型映射级「max推理」覆盖（models.force_max_reasoning）：wire 级直改
+    // 出站 body，保持原生直通保真（IR 改写会触发重编码、杀死 codex 类通
+    // 道依赖的逐字直通）。随后的 vendor effort 策略照常裁决——max 是意图，
+    // 出站档位仍受上游方言约束（grok max→xhigh 等）。
+    if ctx.force_max_reasoning {
+        apply_force_max_reasoning_body(&mut raw_body, ctx.protocol.protocol);
     }
 
     if is_openai_chat {
@@ -783,6 +866,7 @@ mod tests {
             api_key: &provider.api_key,
             auth_scheme: "auto",
             actual_model: "gpt-test",
+            force_max_reasoning: false,
             credential: None,
             gw: &gw,
             disable_default_auth: true,
@@ -809,6 +893,7 @@ mod tests {
             api_key: &provider.api_key,
             auth_scheme: "auto",
             actual_model: "gpt-test",
+            force_max_reasoning: false,
             credential: None,
             gw: &gw,
             disable_default_auth: false,
@@ -834,6 +919,7 @@ mod tests {
             api_key: "endpoint-specific-key",
             auth_scheme: "query",
             actual_model: "gemini-test",
+            force_max_reasoning: false,
             credential: None,
             gw: &gw,
             disable_default_auth: false,
@@ -879,6 +965,7 @@ mod tests {
             api_key: "oauth_bearer_token_should_not_become_xapikey",
             auth_scheme: "auto",
             actual_model: "claude-sonnet-4-6",
+            force_max_reasoning: false,
             credential: None,
             gw: &gw,
             disable_default_auth: true,
@@ -913,6 +1000,7 @@ mod tests {
             api_key: &provider.api_key,
             auth_scheme: "auto",
             actual_model: "claude-sonnet-4-6",
+            force_max_reasoning: false,
             credential: None,
             gw: &gw,
             disable_default_auth: false,
@@ -942,6 +1030,7 @@ mod tests {
             api_key: &provider.api_key,
             auth_scheme: "auto",
             actual_model: "gemini-2.5-flash",
+            force_max_reasoning: false,
             credential: None,
             gw: &gw,
             disable_default_auth: false,
@@ -975,9 +1064,22 @@ mod tests {
             api_key: &provider.api_key,
             auth_scheme: "auto",
             actual_model,
+            force_max_reasoning: false,
             credential: None,
             gw,
             disable_default_auth: false,
+        }
+    }
+
+    /// 模型映射开启「max推理」的 chat 上下文。
+    fn openai_chat_ctx_forced<'a>(
+        provider: &'a Provider,
+        gw: &'a Gateway,
+        actual_model: &'a str,
+    ) -> ProviderCtx<'a> {
+        ProviderCtx {
+            force_max_reasoning: true,
+            ..openai_chat_ctx(provider, gw, actual_model)
         }
     }
 
@@ -1085,6 +1187,7 @@ mod tests {
             api_key: &provider.api_key,
             auth_scheme: "auto",
             actual_model,
+            force_max_reasoning: false,
             credential: None,
             gw,
             disable_default_auth: false,
@@ -1958,6 +2061,129 @@ mod tests {
         assert_eq!(
             out.body["reasoning_effort"], "none",
             "non-grok model must normalize off spellings to none",
+        );
+    }
+
+    /// 模型映射级「max推理」（models.force_max_reasoning）单测：IR 覆盖
+    /// ①显式档位 ②未携带 ③关闭/预算制三种形态，display 偏好保留。
+    #[test]
+    fn force_max_reasoning_ir_overrides_every_client_directive() {
+        let mut req = crate::protocol::ir::AiRequest::new("m", Vec::new());
+        // ① 显式档位
+        req.reasoning.effort = Some(crate::protocol::ir::ReasoningEffort::Low);
+        force_max_reasoning_ir(&mut req);
+        assert_eq!(
+            req.reasoning.effort,
+            Some(crate::protocol::ir::ReasoningEffort::Max)
+        );
+        // ② 未携带
+        let mut req = crate::protocol::ir::AiRequest::new("m", Vec::new());
+        force_max_reasoning_ir(&mut req);
+        assert!(req.reasoning.enabled);
+        assert_eq!(
+            req.reasoning.effort,
+            Some(crate::protocol::ir::ReasoningEffort::Max)
+        );
+        // ③ 预算制被清除（budget 表达不了 max）
+        let mut req = crate::protocol::ir::AiRequest::new("m", Vec::new());
+        req.reasoning.budget_tokens = Some(8192);
+        req.reasoning.display = Some("detailed".to_string());
+        force_max_reasoning_ir(&mut req);
+        assert!(req.reasoning.budget_tokens.is_none());
+        assert_eq!(req.reasoning.display.as_deref(), Some("detailed"));
+    }
+
+    /// 直通 wire 级覆盖的四种协议形态（与各 IR 编码器的 max 表达一致）。
+    #[test]
+    fn apply_force_max_reasoning_body_covers_all_protocols() {
+        use crate::protocol::ids::Protocol;
+        // chat：顶层 reasoning_effort
+        let mut body = serde_json::json!({"model": "m"});
+        apply_force_max_reasoning_body(&mut body, Protocol::OpenAICompatible);
+        assert_eq!(body["reasoning_effort"], "max");
+
+        // Responses：嵌套 effort，兄弟键保留
+        let mut body = serde_json::json!({"reasoning": {"summary": "auto"}});
+        apply_force_max_reasoning_body(&mut body, Protocol::OpenAIResponses);
+        assert_eq!(body["reasoning"]["effort"], "max");
+        assert_eq!(body["reasoning"]["summary"], "auto");
+        let mut body = serde_json::json!({"model": "m"});
+        apply_force_max_reasoning_body(&mut body, Protocol::OpenAIResponses);
+        assert_eq!(body["reasoning"]["effort"], "max");
+
+        // Anthropic：thinking adaptive + output_config.effort（客户端显式
+        // 关闭形态被覆盖——会话决策 ③）
+        let mut body = serde_json::json!({"thinking": {"type": "disabled"}});
+        apply_force_max_reasoning_body(&mut body, Protocol::AnthropicMessages);
+        assert_eq!(body["thinking"]["type"], "adaptive");
+        assert_eq!(body["output_config"]["effort"], "max");
+
+        // Gemini：顶格档是 high（google_thinking_level(Max)）
+        let mut body = serde_json::json!({"model": "m"});
+        apply_force_max_reasoning_body(&mut body, Protocol::GoogleGemini);
+        assert_eq!(
+            body["generationConfig"]["thinkingConfig"]["thinkingLevel"],
+            "high"
+        );
+    }
+
+    /// 直通集成：force_max_reasoning 覆盖客户端显式 low 档为 max；且
+    /// vendor 安全网随后照常裁决——grok 后端 max 降级 xhigh（线上事故
+    /// 65fffc9a 的兼容性不回归）。
+    #[tokio::test]
+    async fn passthrough_forces_max_reasoning_for_route_override() {
+        let gw = build_test_gateway().await;
+        let provider = provider_with_api_key("apikey-abc");
+
+        // 显式 low → 强制 max
+        let ctx = openai_chat_ctx_forced(&provider, &gw, "glm-4.6");
+        let out = passthrough_run(
+            &FakeApiKeyVendor,
+            serde_json::json!({
+                "model": "glm-4.6",
+                "messages": [{"role":"user","content":"ping"}],
+                "reasoning_effort": "low"
+            }),
+            &ctx,
+            false,
+        )
+        .await
+        .expect("passthrough succeeds");
+        assert_eq!(
+            out.body["reasoning_effort"], "max",
+            "route-level force_max_reasoning must override the client tier",
+        );
+
+        // 未携带推理指令 → 注入 max
+        let out = passthrough_run(
+            &FakeApiKeyVendor,
+            serde_json::json!({
+                "model": "glm-4.6",
+                "messages": [{"role":"user","content":"ping"}]
+            }),
+            &ctx,
+            false,
+        )
+        .await
+        .expect("passthrough succeeds");
+        assert_eq!(out.body["reasoning_effort"], "max");
+
+        // vendor 安全网：grok 模型强制 max 后按方言降级 xhigh
+        let grok_ctx = openai_chat_ctx_forced(&provider, &gw, "grok-4.6");
+        let out = passthrough_run(
+            &FakeApiKeyVendor,
+            serde_json::json!({
+                "model": "grok-4.6",
+                "messages": [{"role":"user","content":"ping"}]
+            }),
+            &grok_ctx,
+            false,
+        )
+        .await
+        .expect("passthrough succeeds");
+        assert_eq!(
+            out.body["reasoning_effort"], "xhigh",
+            "vendor effort policy must still adjudicate after the override",
         );
     }
 

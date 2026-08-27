@@ -266,6 +266,11 @@ pub struct Model {
     #[serde(alias = "access_control")]
     pub enable_auth: bool,
     pub enable_payload: Option<bool>,
+    /// Force every request routed through this mapping to max reasoning
+    /// effort, regardless of what the client asked for (including explicit
+    /// off/budget forms). Vendor egress policies still apply afterwards.
+    #[serde(default)]
+    pub force_max_reasoning: bool,
     /// Vision-shim configuration JSON (see `VisionShimConfig`). Presence of a
     /// parsed config with a helper model enables the multimodal facade for
     /// this route.
@@ -513,6 +518,9 @@ pub struct UpdateModel {
     #[serde(alias = "access_control")]
     pub enable_auth: Option<bool>,
     pub enable_payload: Option<Option<bool>>,
+    /// `None` keeps the current value; an explicit boolean replaces it.
+    #[serde(default)]
+    pub force_max_reasoning: Option<bool>,
     /// Vision-shim config object. `None` keeps the current value; an object
     /// (even empty — clears the shim) replaces it.
     #[serde(default)]
@@ -533,6 +541,8 @@ pub struct CreateModel {
     #[serde(alias = "access_control")]
     pub enable_auth: Option<bool>,
     pub enable_payload: Option<bool>,
+    #[serde(default)]
+    pub force_max_reasoning: Option<bool>,
     /// Vision-shim config object (`{}` clears / disables the shim).
     #[serde(default)]
     pub vision_shim: Option<serde_json::Value>,
@@ -973,6 +983,8 @@ pub struct ExportModel {
     pub enable_auth: bool,
     #[serde(default)]
     pub enable_payload: Option<bool>,
+    #[serde(default)]
+    pub force_max_reasoning: bool,
     /// Raw vision-shim config JSON carried through export/import.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vision_shim: Option<String>,

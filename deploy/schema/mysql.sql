@@ -62,6 +62,7 @@ CREATE TABLE IF NOT EXISTS models (
     target_model VARCHAR(255) NOT NULL,
     enable_auth TINYINT(1) DEFAULT 0,
     enable_payload TINYINT(1) DEFAULT NULL,
+    force_max_reasoning TINYINT(1) NOT NULL DEFAULT 0,
     vision_shim TEXT,
     is_enabled TINYINT(1) DEFAULT 1,
     priority INTEGER DEFAULT 0,

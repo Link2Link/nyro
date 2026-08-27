@@ -693,6 +693,13 @@ async fn dispatch_pipeline_inner(
             .map(str::to_string)
             .unwrap_or_else(|| actual_model.clone());
         let mut upstream_request = request_for_target.clone();
+        // Route-level「max推理」覆盖（models.force_max_reasoning）：转码与
+        // compat 重编码路径在此改写 IR，使编码产物携带 max 档；原生直通路径
+        // 不走这里，由 passthrough 的 wire 级覆盖处理——此处若发布突变语义
+        // 会杀死 codex 类通道依赖的逐字直通。
+        if route.force_max_reasoning {
+            crate::provider::common::pipeline::force_max_reasoning_ir(&mut upstream_request);
+        }
         let tool_route_plan = if compat_candidate {
             ToolRoutePlan::default()
         } else {
@@ -712,6 +719,7 @@ async fn dispatch_pipeline_inner(
             api_key: &credential,
             auth_scheme: &plan.auth_scheme,
             actual_model: &transport_model,
+            force_max_reasoning: route.force_max_reasoning,
             credential: None,
             gw: &gw,
             disable_default_auth: provider_runtime.binding.disable_default_auth,
@@ -2004,6 +2012,7 @@ mod tests {
                     priority: Some(1),
                 }],
                 enable_auth: Some(false),
+                force_max_reasoning: None,
                 enable_payload: None,
                 vision_shim: None,
             })
@@ -2100,6 +2109,7 @@ mod tests {
                     priority: Some(1),
                 }],
                 enable_auth: Some(false),
+                force_max_reasoning: None,
                 enable_payload: None,
                 vision_shim: None,
             })

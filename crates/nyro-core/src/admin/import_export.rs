@@ -81,6 +81,7 @@ impl AdminService {
                     target_model: m.target_model,
                     enable_auth: m.enable_auth,
                     enable_payload: m.enable_payload,
+                    force_max_reasoning: m.force_max_reasoning,
                     vision_shim: m.vision_shim,
                     is_enabled: m.is_enabled,
                 })
@@ -182,6 +183,7 @@ impl AdminService {
                         targets: vec![],
                         enable_auth: Some(m.enable_auth),
                         enable_payload: m.enable_payload,
+                        force_max_reasoning: Some(m.force_max_reasoning),
                         vision_shim: m
                             .vision_shim
                             .as_deref()

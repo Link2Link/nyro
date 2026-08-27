@@ -161,6 +161,9 @@ pub struct YamlModel {
     pub backends: Vec<YamlModelBackend>,
     #[serde(default, alias = "access_control")]
     pub enable_auth: bool,
+    /// 模型映射级「max推理」覆盖：该路由所有请求强制按 max 推理档出站。
+    #[serde(default)]
+    pub force_max_reasoning: bool,
     /// Vision-shim configuration object (multimodal facade over a text-only
     /// target); see `nyro_core::vision_shim::VisionShimConfig`.
     #[serde(default)]
@@ -511,6 +514,7 @@ pub fn build_models(yaml: &YamlConfig, providers: &[Provider]) -> Vec<Model> {
                 target_provider: primary.map(|b| b.provider_id.clone()).unwrap_or_default(),
                 target_model: primary.map(|b| b.model.clone()).unwrap_or_default(),
                 enable_auth: ym.enable_auth,
+                force_max_reasoning: ym.force_max_reasoning,
                 enable_payload: None,
                 vision_shim: ym
                     .vision_shim

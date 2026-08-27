@@ -34,6 +34,7 @@ export interface Model {
   target_model: string;
   enable_auth: boolean;
   enable_payload?: boolean | null;
+  force_max_reasoning?: boolean | null;
   vision_shim?: string | null;
   is_enabled: boolean;
   created_at: string;
@@ -464,6 +465,7 @@ export interface CreateModel {
   targets?: CreateModelBackend[];
   enable_auth?: boolean;
   enable_payload?: boolean | null;
+  force_max_reasoning?: boolean;
   vision_shim?: {
     helper_model?: string;
     helper_backends?: Array<{ provider: string; model: string }>;
@@ -479,6 +481,7 @@ export interface UpdateModel {
   targets?: UpsertModelBackend[];
   enable_auth?: boolean;
   enable_payload?: boolean | null;
+  force_max_reasoning?: boolean;
   vision_shim?: {
     helper_model?: string;
     helper_backends?: Array<{ provider: string; model: string }>;
@@ -566,6 +569,7 @@ export interface ExportModel {
   target_model: string;
   enable_auth: boolean;
   enable_payload?: boolean | null;
+  force_max_reasoning?: boolean;
   is_enabled: boolean;
 }
 

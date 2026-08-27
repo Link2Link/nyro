@@ -120,6 +120,9 @@ pub async fn migrate(pool: &SqlitePool) -> anyhow::Result<()> {
     // Add vision_shim column to models table (multimodal facade config JSON)
     ensure_model_column(pool, "vision_shim", "TEXT").await?;
 
+    // Add force_max_reasoning column to models table (max-reasoning override)
+    ensure_model_column(pool, "force_max_reasoning", "INTEGER NOT NULL DEFAULT 0").await?;
+
     // Rename settings key log_record_payloads → enable_payload
     sqlx::query("UPDATE settings SET name = 'enable_payload' WHERE name = 'log_record_payloads'")
         .execute(pool)
@@ -901,6 +904,7 @@ CREATE TABLE IF NOT EXISTS routes (
     target_model      TEXT NOT NULL,
     enable_auth       INTEGER DEFAULT 0,
     enable_payload    INTEGER,
+    force_max_reasoning INTEGER DEFAULT 0,
     vision_shim       TEXT,
     is_enabled        INTEGER DEFAULT 1,
     priority          INTEGER DEFAULT 0,
