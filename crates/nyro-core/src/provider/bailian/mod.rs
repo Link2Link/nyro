@@ -97,7 +97,9 @@ pub struct BailianVendor;
 #[async_trait]
 impl Vendor for BailianVendor {
     fn scope(&self) -> VendorScope {
-        VendorScope::Vendor { vendor_id: "bailian" }
+        VendorScope::Vendor {
+            vendor_id: "bailian",
+        }
     }
     fn metadata(&self) -> Option<&'static VendorMetadata> {
         Some(&METADATA)

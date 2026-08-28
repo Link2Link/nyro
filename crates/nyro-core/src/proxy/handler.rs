@@ -60,7 +60,12 @@ pub async fn models_list(State(gw): State<Gateway>, headers: HeaderMap) -> Respo
     let models = cache
         .models
         .iter()
-        .filter(|model| is_master || is_privileged_key || !model.enable_auth || accessible_route_ids.contains(&model.id))
+        .filter(|model| {
+            is_master
+                || is_privileged_key
+                || !model.enable_auth
+                || accessible_route_ids.contains(&model.id)
+        })
         .map(|model| model.name.trim())
         .filter(|model| !model.is_empty())
         .map(ToString::to_string)

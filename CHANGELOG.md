@@ -4,6 +4,35 @@ All notable changes to Nyro will be documented in this file.
 
 ---
 
+## v2.0.7
+
+> Released on 2026-08-28
+
+#### Features
+
+- **Vision Shim**: multimodal facade for text-only models — images are transcribed by a helper model before egress; supports cross-provider multi-helper backends with ordered failover, legacy single-field configs, a 64K helper output budget, and GLM hybrid-reasoning tuning (thinking low)
+- **Force max reasoning**: model-mapping switch that forces max reasoning effort on every request, enforced on both the transcode path (IR rewrite) and native passthrough (wire rewrite) while vendor egress dialects still arbitrate (e.g. grok max → xhigh)
+- **Bailian vendor**: first-class Alibaba Model Studio (Bailian) vendor with dual-protocol shared-key channels covering pay-as-you-go (dashscope) and coding-plan (token-plan) endpoints
+- **Bailian token-plan usage backend**: five-hour / weekly quota windows read from the Bailian console CLI gateway, with ACS3-HMAC-SHA256-signed CLI token minting from RAM credentials, DataV2 envelope unwrapping, and correct [0, 1] ratio scaling
+- **Privileged API keys**: new is_privileged flag grants access to every auth-enabled model without bindings; /v1/models lists the full catalog for privileged keys while enable / expiry / quota gates still apply and existing bindings are preserved
+
+#### Improvements
+
+- **Dark theme polish**: softened the dark palette across backgrounds, text, borders, shadows, focus rings and badges; extended dark remaps so pale colored boxes (provider usage, available models, logs, extensions) blend into the graphite background; added missing secondary / card dark tokens
+- **Sidebar**: removed the feedback suggestions external link
+
+#### Fixes
+
+- **Model creation on SQL backends**: create() bound vision_shim and force_max_reasoning in swapped order, failing with NOT NULL constraint errors on migrated databases; fixed on SQLite / Postgres / MySQL with a regression test, and fresh SQLite schemas now match the migrated NOT NULL column
+- **GLM chat egress reasoning**: reasoning effort is no longer lost on outbound chat-completions requests
+- **Force max reasoning compat**: the compat path now honors the mapping-level force-max override instead of only the native passthrough path
+- **Codex passthrough replay**: relay-encrypted reasoning entries are no longer rejected when replaying against codex direct connections
+- **Vision shim protocol detection**: normalized protocol IDs are no longer misdetected
+
+---
+
+---
+
 ## v2.0.6
 
 > Released on 2026-08-27

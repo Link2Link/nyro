@@ -1970,7 +1970,13 @@ impl AdminService {
                     ),
                 };
                 let data = fetch_bailian_usage(&self.gw.http_client, &token).await?;
-                (parse_bailian_tiers(&data), Vec::new(), None, None, Vec::new())
+                (
+                    parse_bailian_tiers(&data),
+                    Vec::new(),
+                    None,
+                    None,
+                    Vec::new(),
+                )
             }
             UsageBackend::Grok => {
                 if provider.effective_auth_mode().trim() != "oauth" {
@@ -2175,7 +2181,10 @@ mod tests {
             Some("coding"),
             "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1",
         );
-        assert_eq!(UsageBackend::detect(&provider), Some(UsageBackend::BailianCodingPlan));
+        assert_eq!(
+            UsageBackend::detect(&provider),
+            Some(UsageBackend::BailianCodingPlan)
+        );
 
         // URL fallback for imported rows without vendor/preset fields.
         let imported = provider_for_usage(
@@ -2184,7 +2193,10 @@ mod tests {
             None,
             "https://token-plan.cn-beijing.maas.aliyuncs.com/apps/anthropic",
         );
-        assert_eq!(UsageBackend::detect(&imported), Some(UsageBackend::BailianCodingPlan));
+        assert_eq!(
+            UsageBackend::detect(&imported),
+            Some(UsageBackend::BailianCodingPlan)
+        );
 
         // The pay-as-you-go dashscope channel has no usage backend.
         let payg = provider_for_usage(

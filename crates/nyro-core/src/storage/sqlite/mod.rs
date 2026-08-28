@@ -1007,16 +1007,18 @@ impl AuthAccessStore for SqliteAuthAccessStore {
         .await?;
 
         Ok(row.map(
-            |(id, name, is_enabled, is_privileged, expires_at, rpm, rpd, tpm, tpd)| ApiKeyAccessRecord {
-                id,
-                name,
-                is_enabled,
-                is_privileged,
-                expires_at,
-                rpm,
-                rpd,
-                tpm,
-                tpd,
+            |(id, name, is_enabled, is_privileged, expires_at, rpm, rpd, tpm, tpd)| {
+                ApiKeyAccessRecord {
+                    id,
+                    name,
+                    is_enabled,
+                    is_privileged,
+                    expires_at,
+                    rpm,
+                    rpd,
+                    tpm,
+                    tpd,
+                }
             },
         ))
     }

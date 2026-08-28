@@ -20,6 +20,7 @@ use crate::provider::metadata::CapabilitiesSource;
 use crate::provider::{VendorRegistry, vertexai};
 use crate::storage::traits::{ProviderEndpointTestResult, ProviderTestResult};
 
+mod aliyun_sign;
 mod api_keys;
 mod auth_data;
 mod extensions;
@@ -31,7 +32,6 @@ mod oauth;
 mod observability;
 mod providers;
 pub mod settings;
-mod aliyun_sign;
 mod usage;
 mod volcengine_sign;
 

@@ -224,7 +224,10 @@ async fn api_key_privileged_flag_roundtrips_and_keeps_bindings() -> anyhow::Resu
     // Storage-level: the auth access record carries the flag, and the model
     // binding check is bypassed for this key.
     {
-        let auth = gw.storage.auth().expect("sqlite storage exposes auth store");
+        let auth = gw
+            .storage
+            .auth()
+            .expect("sqlite storage exposes auth store");
         let record = auth
             .find_api_key(&key.token)
             .await?

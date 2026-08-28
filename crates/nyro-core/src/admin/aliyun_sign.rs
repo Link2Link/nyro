@@ -99,8 +99,12 @@ pub(super) fn sign(
     headers.sort();
     let canonical_headers = headers
         .iter()
-        .map(|(k, v)| format!("{k}:{v}
-"))
+        .map(|(k, v)| {
+            format!(
+                "{k}:{v}
+"
+            )
+        })
         .collect::<String>();
     let signed_headers = headers
         .iter()
@@ -116,12 +120,17 @@ pub(super) fn sign(
         signed_headers.as_str(),
         payload_hash.as_str(),
     ]
-    .join("
-");
+    .join(
+        "
+",
+    );
 
     let algorithm = "ACS3-HMAC-SHA256";
-    let string_to_sign = format!("{algorithm}
-{}", sha256_hex(canonical_request.as_bytes()));
+    let string_to_sign = format!(
+        "{algorithm}
+{}",
+        sha256_hex(canonical_request.as_bytes())
+    );
     let signature = hmac_sha256_hex(sk.as_bytes(), string_to_sign.as_bytes());
 
     AcsSignedRequest {
