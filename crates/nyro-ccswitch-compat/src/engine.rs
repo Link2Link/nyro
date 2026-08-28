@@ -1217,6 +1217,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn codex_responses_to_chat_skips_additional_tools_carrier_message() {
+        // 线上请求 26b3064d-25b2-48e4-9348-8839165f4806 复现：Codex
+        // Responses-Lite 的 additional_tools 载具项若被消息化，会向严格
+        // chat 上游（阿里百炼 compatible-mode）发送
+        // {"role":"system","content":null}，触发 400 "The content
+        // field is a required field."。
+        let engine = CompatEngine::default();
+        let request = br#"{"model":"gpt-5.6-sol","stream":true,"input":[{"type":"additional_tools","role":"developer","tools":[{"type":"custom","name":"exec","description":"Run JS"},{"type":"function","name":"wait","parameters":{"type":"object"}}]},{"type":"message","role":"developer","content":[{"type":"input_text","text":"You are Codex, an agent."}]},{"type":"message","role":"user","content":[{"type":"input_text","text":"what model are you"}]}]}"#;
+        let prepared = engine
+            .prepare_request(
+                ConversionProfile::codex_responses_to_chat(true),
+                Bytes::from_static(request),
+                SessionIdentity::generated("sess"),
+            )
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&prepared.body).unwrap();
+        let msgs = body["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0]["role"], "system");
+        assert!(
+            msgs[0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("You are Codex")
+        );
+        assert_eq!(msgs[1]["role"], "user");
+        assert!(
+            msgs.iter()
+                .all(|m| m.get("content").is_some_and(|c| !c.is_null())),
+            "no null-content message may reach a strict chat upstream"
+        );
+        let names: Vec<&str> = body["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["function"]["name"].as_str().unwrap())
+            .collect();
+        assert!(names.contains(&"exec"));
+        assert!(names.contains(&"wait"));
+    }
+
+    #[tokio::test]
     async fn wire_patch_preserves_unknown_fields_and_order() {
         let engine = CompatEngine::default();
         let prepared = engine

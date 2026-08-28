@@ -573,6 +573,13 @@ fn collapse_system_messages_to_head(messages: Vec<Value>) -> Vec<Value> {
                 }
                 continue;
             }
+            // content 缺失或为 null 的 system 消息零信息量，保留下来只会
+            // 触发严格上游的 required-content 校验（阿里百炼
+            // compatible-mode 400 "The content field is a required
+            // field."）；数组等多模态 content 仍原样保留在 rest 中。
+            if msg.get("content").is_none_or(|v| v.is_null()) {
+                continue;
+            }
         }
         rest.push(msg);
     }
@@ -850,6 +857,15 @@ fn append_responses_item_as_chat_message(
                     last_assistant_index,
                 );
             }
+        }
+        Some("additional_tools") => {
+            // Codex Responses-Lite 的工具载具项：工具已由
+            // build_codex_tool_context_from_request 从 input 里单独收集，
+            // 这里绝不能再按消息处理。该项带 role（developer）但没有
+            // content 字段，落入下方兜底分支会产出
+            // {"role":"system","content":null}，严格 chat 上游（阿里百炼
+            // compatible-mode）直接拒绝：400 "The content field is a
+            // required field."。
         }
         _ => {
             if item.get("role").is_some() || item.get("content").is_some() {
@@ -2526,6 +2542,89 @@ mod tests {
             .find(|t| t["function"]["name"] == "exec")
             .unwrap();
         assert_eq!(exec["function"]["parameters"]["required"][0], "input");
+        // 回归（阿里百炼 400 "The content field is a required field."）：
+        // 载具项带 role=developer 但无 content，绝不能被消息化成
+        // {"role":"system","content":null}。
+        let msgs = result["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 2);
+        assert!(msgs.iter().all(|m| m["role"] == "user"));
+        assert!(
+            msgs.iter()
+                .all(|m| m.get("content").is_some_and(|c| !c.is_null()))
+        );
+    }
+
+    #[test]
+    fn responses_request_to_chat_skips_additional_tools_carrier_message() {
+        // 复现线上请求 26b3064d-25b2-48e4-9348-8839165f4806 现场：Codex
+        // Responses-Lite 的 input[0] 是 additional_tools 载具（带
+        // role=developer），其后跟多条 developer 指令与 user 消息，
+        // 发往阿里百炼 compatible-mode 时因 messages 里混入
+        // {"role":"system","content":null} 被 400 拒绝。
+        let input = json!({
+            "model": "gpt-5.6-sol",
+            "stream": true,
+            "input": [
+                {
+                    "type": "additional_tools",
+                    "role": "developer",
+                    "tools": [
+                        {"type": "custom", "name": "exec", "description": "Run JS"},
+                        {"type": "function", "name": "wait", "parameters": {"type": "object"}}
+                    ]
+                },
+                {"type": "message", "role": "developer", "content": [{"type": "input_text", "text": "You are Codex, an agent."}]},
+                {"type": "message", "role": "developer", "content": [{"type": "input_text", "text": "<app-context>desktop</app-context>"}]},
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "<environment_context>cwd=/tmp</environment_context>"}]},
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "你是什么模型"}]}
+            ]
+        });
+
+        let result = responses_to_chat_completions(input).unwrap();
+
+        let msgs = result["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 3, "merged system head + two user messages");
+        assert_eq!(msgs[0]["role"], "system");
+        let system_text = msgs[0]["content"].as_str().unwrap();
+        assert!(system_text.contains("You are Codex, an agent."));
+        assert!(system_text.contains("<app-context>desktop</app-context>"));
+        assert_eq!(msgs[1]["role"], "user");
+        assert_eq!(msgs[2]["role"], "user");
+        assert!(
+            msgs.iter()
+                .all(|m| m.get("content").is_some_and(|c| !c.is_null())),
+            "no null-content message may reach a strict chat upstream"
+        );
+        // 载具里的工具仍完整送达上游。
+        let names: Vec<&str> = result["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["function"]["name"].as_str().unwrap())
+            .collect();
+        assert!(names.contains(&"exec"));
+        assert!(names.contains(&"wait"));
+    }
+
+    #[test]
+    fn responses_request_to_chat_drops_role_only_system_message() {
+        // 带 role 但完全没有 content 字段的 message 项同样会产出
+        // {"role":"system","content":null}；collapse 阶段必须丢弃，
+        // 不能让它混进发给严格上游的 messages。
+        let input = json!({
+            "model": "qwen3.8-max",
+            "input": [
+                {"type": "message", "role": "developer"},
+                {"type": "message", "role": "user", "content": "hi"}
+            ]
+        });
+
+        let result = responses_to_chat_completions(input).unwrap();
+
+        let msgs = result["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0]["role"], "user");
+        assert_eq!(msgs[0]["content"], "hi");
     }
 
     #[test]

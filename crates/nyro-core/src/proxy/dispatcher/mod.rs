@@ -1450,12 +1450,24 @@ impl LogBuilder {
     /// Reasoning effort as sent on the upstream wire, derived from the encoded
     /// upstream request body; falls back to the client-requested snapshot when
     /// no upstream body was recorded (early failures, payload disabled).
+    ///
+    /// Boolean-switch dialects (qwen/SiliconFlow `enable_thinking`) express
+    /// no tier — their "enabled" label must not displace the client-
+    /// requested tier in the log (线上 05ffe381: 客户端档位被 "enabled"
+    /// 顶掉，看板显示不出请求侧推理强度). Prefer the client snapshot over
+    /// the tier-less "enabled"; keep "enabled" only when the client
+    /// declared no tier either. Definitive wire labels (real tiers, budgets,
+    /// "none", "adaptive") still win as the actually-sent value.
     fn resolve_reasoning_effort(&self) -> Option<String> {
-        self.extras
+        let upstream = self
+            .extras
             .upstream_request_body
             .as_deref()
-            .and_then(crate::proxy::observability::upstream_reasoning_effort)
-            .or_else(|| self.reasoning_effort.clone())
+            .and_then(crate::proxy::observability::upstream_reasoning_effort);
+        match upstream.as_deref() {
+            Some("enabled") => self.reasoning_effort.clone().or(upstream),
+            _ => upstream.or_else(|| self.reasoning_effort.clone()),
+        }
     }
 
     fn emit(self) {
@@ -1742,7 +1754,7 @@ fn unprocessable_response(status: u16, message: &str) -> Response {
 
 #[cfg(test)]
 mod tests {
-    use super::{dispatch_pipeline, run_phase_hooks_slice};
+    use super::{LogBuilder, dispatch_pipeline, run_phase_hooks_slice};
     use crate::Gateway;
     use crate::db::models::{CreateModel, CreateModelBackend, CreateProvider};
     use crate::plugin::phase::{
@@ -2480,5 +2492,88 @@ mod tests {
             .expect("log entry should be emitted")
             .expect("log channel should remain open");
         assert_eq!(entry.reasoning_effort, None);
+    }
+
+    /// 线上回归（请求 05ffe381）：qwen 方言出站体只带 `enable_thinking`
+    /// 布尔开关（无档位），日志的推理强度被 "enabled" 顶掉，看不到
+    /// 客户端请求侧的档位。合并策略改为：无档位的 "enabled" 标签让位
+    /// 于客户端快照；真实出站档位（含强制 max 补丁）仍然优先。
+    #[tokio::test]
+    async fn dispatch_logs_client_tier_over_enabled_switch_label() {
+        let config = crate::config::GatewayConfig {
+            data_dir: std::env::temp_dir().join(format!(
+                "nyro-reasoning-enabled-label-test-{}",
+                uuid::Uuid::new_v4()
+            )),
+            ..Default::default()
+        };
+        let (gw, mut log_rx) = Gateway::new(config).await.expect("gateway init");
+        let qwen_switch_body =
+            r#"{"model":"qwen3.8-max","enable_thinking":true,"messages":[]}"#.to_string();
+
+        // 客户端请求了 high，上游只收到布尔开关 → 显示客户端档位 high。
+        LogBuilder::from_dispatch(
+            &gw,
+            "openai-responses/responses/v1",
+            "gpt-5.6-sol",
+            None,
+            std::time::Instant::now(),
+        )
+        .reasoning_effort(Some("high".to_string()))
+        .with_upstream_request(None, Some(qwen_switch_body.clone()))
+        .emit();
+        let entry = tokio::time::timeout(std::time::Duration::from_secs(1), log_rx.recv())
+            .await
+            .expect("log entry should be emitted")
+            .expect("log channel should remain open");
+        assert_eq!(
+            entry.reasoning_effort.as_deref(),
+            Some("high"),
+            "client-requested tier must displace the tier-less enabled label"
+        );
+
+        // 客户端未声明档位 → 保留 enabled（思考开、无档位）。
+        LogBuilder::from_dispatch(
+            &gw,
+            "openai-responses/responses/v1",
+            "gpt-5.6-sol",
+            None,
+            std::time::Instant::now(),
+        )
+        .reasoning_effort(None)
+        .with_upstream_request(None, Some(qwen_switch_body))
+        .emit();
+        let entry = tokio::time::timeout(std::time::Duration::from_secs(1), log_rx.recv())
+            .await
+            .expect("log entry should be emitted")
+            .expect("log channel should remain open");
+        assert_eq!(entry.reasoning_effort.as_deref(), Some("enabled"));
+
+        // 出站体带真实档位（如强制 max 补丁）→ 实际出站值仍然优先。
+        LogBuilder::from_dispatch(
+            &gw,
+            "openai-responses/responses/v1",
+            "gpt-5.6-sol",
+            None,
+            std::time::Instant::now(),
+        )
+        .reasoning_effort(Some("high".to_string()))
+        .with_upstream_request(
+            None,
+            Some(
+                r#"{"model":"qwen3.8-max","enable_thinking":true,"reasoning_effort":"max","messages":[]}"#
+                    .to_string(),
+            ),
+        )
+        .emit();
+        let entry = tokio::time::timeout(std::time::Duration::from_secs(1), log_rx.recv())
+            .await
+            .expect("log entry should be emitted")
+            .expect("log channel should remain open");
+        assert_eq!(
+            entry.reasoning_effort.as_deref(),
+            Some("max"),
+            "the actually-sent tier must keep winning over the client snapshot"
+        );
     }
 }
