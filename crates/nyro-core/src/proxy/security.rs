@@ -151,14 +151,18 @@ pub async fn check_model_access(
         });
     }
 
-    let allowed = access_store
-        .model_binding_exists(&key_row.id, &model.id)
-        .await
-        .map_err(GatewayError::internal)?;
-    if !allowed {
-        return Err(GatewayError::Forbidden {
-            reason: AccessDenial::ModelNotAllowed,
-        });
+    // Privileged keys bypass the per-model binding check only; the
+    // enable / expiry gates above and the quota gates below still apply.
+    if !key_row.is_privileged {
+        let allowed = access_store
+            .model_binding_exists(&key_row.id, &model.id)
+            .await
+            .map_err(GatewayError::internal)?;
+        if !allowed {
+            return Err(GatewayError::Forbidden {
+                reason: AccessDenial::ModelNotAllowed,
+            });
+        }
     }
 
     // ── Quota checks ─────────────────────────────────────────────────────────
@@ -310,5 +314,160 @@ mod tests {
         headers.insert("x-goog-api-key", HeaderValue::from_static(" sk-google "));
 
         assert_eq!(extract_api_key(&headers).as_deref(), Some("sk-google"));
+    }
+    // -- check_model_access: privileged binding bypass ----------------------
+
+    use super::{Model, Provider};
+
+    struct FakeAccessStore {
+        record: Option<crate::storage::traits::ApiKeyAccessRecord>,
+        bound: bool,
+        minute_requests: i64,
+    }
+
+    impl FakeAccessStore {
+        fn key(is_privileged: bool) -> Self {
+            Self {
+                record: Some(crate::storage::traits::ApiKeyAccessRecord {
+                    id: "key-1".to_string(),
+                    name: "key".to_string(),
+                    is_enabled: true,
+                    is_privileged,
+                    expires_at: None,
+                    rpm: None,
+                    rpd: None,
+                    tpm: None,
+                    tpd: None,
+                }),
+                bound: false,
+                minute_requests: 0,
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl super::ProxyAccessStore for FakeAccessStore {
+        async fn get_active_provider(&self, _id: &str) -> anyhow::Result<Option<Provider>> {
+            Ok(None)
+        }
+        async fn find_api_key(
+            &self,
+            _raw_key: &str,
+        ) -> anyhow::Result<Option<crate::storage::traits::ApiKeyAccessRecord>> {
+            Ok(self.record.clone())
+        }
+        async fn model_binding_exists(
+            &self,
+            _api_key_id: &str,
+            _model_id: &str,
+        ) -> anyhow::Result<bool> {
+            Ok(self.bound)
+        }
+        async fn request_count_since(
+            &self,
+            _api_key_id: &str,
+            _window: crate::storage::traits::UsageWindow,
+        ) -> anyhow::Result<i64> {
+            Ok(self.minute_requests)
+        }
+        async fn token_count_since(
+            &self,
+            _api_key_id: &str,
+            _window: crate::storage::traits::UsageWindow,
+        ) -> anyhow::Result<i64> {
+            Ok(0)
+        }
+    }
+
+    fn auth_model() -> Model {
+        Model {
+            id: "model-1".to_string(),
+            name: "gated".to_string(),
+            balance: "weighted".to_string(),
+            target_provider: "p".to_string(),
+            target_model: "m".to_string(),
+            enable_auth: true,
+            force_max_reasoning: false,
+            enable_payload: None,
+            vision_shim: None,
+            is_enabled: true,
+            created_at: String::new(),
+            targets: Vec::new(),
+        }
+    }
+
+    fn request_context() -> crate::proxy::context::RequestContext {
+        crate::proxy::context::RequestContext::new(
+            crate::protocol::ids::OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1,
+            std::time::Duration::from_secs(600),
+        )
+    }
+
+    fn auth_headers() -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer sk-test"),
+        );
+        headers
+    }
+
+    #[tokio::test]
+    async fn privileged_key_bypasses_binding_check() {
+        let store = FakeAccessStore::key(true);
+        let model = auth_model();
+        let mut ctx = request_context();
+        let result = super::check_model_access(&store, &model, &auth_headers(), &mut ctx).await;
+        assert!(result.is_ok(), "privileged key must pass without binding");
+        assert_eq!(result.unwrap().id.as_deref(), Some("key-1"));
+    }
+
+    #[tokio::test]
+    async fn plain_key_without_binding_is_forbidden() {
+        let store = FakeAccessStore::key(false);
+        let model = auth_model();
+        let mut ctx = request_context();
+        let err = super::check_model_access(&store, &model, &auth_headers(), &mut ctx)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, crate::error::GatewayError::Forbidden { .. }),
+            "plain key without binding must be forbidden, got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn privileged_key_still_respects_quota() {
+        let mut store = FakeAccessStore::key(true);
+        store.minute_requests = 10;
+        let mut record = store.record.clone().unwrap();
+        record.rpm = Some(10);
+        store.record = Some(record);
+        let model = auth_model();
+        let mut ctx = request_context();
+        let err = super::check_model_access(&store, &model, &auth_headers(), &mut ctx)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, crate::error::GatewayError::QuotaExceeded { .. }),
+            "privileged key must still hit quota limits, got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn privileged_key_still_respects_expiry() {
+        let mut store = FakeAccessStore::key(true);
+        let mut record = store.record.clone().unwrap();
+        record.expires_at = Some("2000-01-01T00:00:00Z".to_string());
+        store.record = Some(record);
+        let model = auth_model();
+        let mut ctx = request_context();
+        let err = super::check_model_access(&store, &model, &auth_headers(), &mut ctx)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, crate::error::GatewayError::Unauthorized { .. }),
+            "expired privileged key must be rejected, got: {err:?}"
+        );
     }
 }

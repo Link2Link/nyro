@@ -178,6 +178,216 @@ async fn copy_provider_does_not_append_targets_by_default() -> anyhow::Result<()
 }
 
 #[tokio::test]
+async fn api_key_privileged_flag_roundtrips_and_keeps_bindings() -> anyhow::Result<()> {
+    let gw = build_gateway().await?;
+    let provider = gw
+        .admin()
+        .create_provider(api_key_provider_input("privileged-key-provider"))
+        .await?;
+    let model = gw
+        .admin()
+        .create_model(CreateModel {
+            name: "privileged-gate-model".to_string(),
+            balance: None,
+            target_provider: provider.id.clone(),
+            target_model: "gpt-test".to_string(),
+            targets: vec![CreateModelBackend {
+                provider_id: provider.id.clone(),
+                model: "gpt-test".to_string(),
+                weight: None,
+                priority: None,
+            }],
+            enable_auth: Some(true),
+            force_max_reasoning: None,
+            enable_payload: None,
+            vision_shim: None,
+        })
+        .await?;
+
+    // Create a privileged key bound to nothing; it must still pass the
+    // access check for the auth-enabled model (binding bypass).
+    let key = gw
+        .admin()
+        .create_api_key(CreateApiKey {
+            name: "priv-key".to_string(),
+            rpm: None,
+            rpd: None,
+            tpm: None,
+            tpd: None,
+            expires_at: None,
+            is_privileged: true,
+            model_ids: Vec::new(),
+        })
+        .await?;
+    assert!(key.is_privileged, "created key must echo is_privileged");
+
+    // Storage-level: the auth access record carries the flag, and the model
+    // binding check is bypassed for this key.
+    {
+        let auth = gw.storage.auth().expect("sqlite storage exposes auth store");
+        let record = auth
+            .find_api_key(&key.token)
+            .await?
+            .expect("key row must exist");
+        assert!(record.is_privileged);
+        assert!(
+            !auth.model_binding_exists(&record.id, &model.id).await?,
+            "privileged key is created without bindings by definition"
+        );
+    }
+
+    // Toggle privilege off via update; the flag flips and stays persisted.
+    let updated = gw
+        .admin()
+        .update_api_key(
+            &key.id,
+            UpdateApiKey {
+                name: None,
+                rpm: None,
+                rpd: None,
+                tpm: None,
+                tpd: None,
+                is_enabled: None,
+                is_privileged: Some(false),
+                expires_at: None,
+                model_ids: None,
+            },
+        )
+        .await?;
+    assert!(!updated.is_privileged);
+
+    // Bindings survive a privileged round-trip untouched: bind a model while
+    // privileged, toggle privilege off, and the binding is still there.
+    gw.admin()
+        .update_api_key(
+            &key.id,
+            UpdateApiKey {
+                name: None,
+                rpm: None,
+                rpd: None,
+                tpm: None,
+                tpd: None,
+                is_enabled: None,
+                is_privileged: Some(true),
+                expires_at: None,
+                model_ids: Some(vec![model.id.clone()]),
+            },
+        )
+        .await?;
+    let demoted = gw
+        .admin()
+        .update_api_key(
+            &key.id,
+            UpdateApiKey {
+                name: None,
+                rpm: None,
+                rpd: None,
+                tpm: None,
+                tpd: None,
+                is_enabled: None,
+                is_privileged: Some(false),
+                expires_at: None,
+                model_ids: None,
+            },
+        )
+        .await?;
+    assert!(!demoted.is_privileged);
+    assert_eq!(
+        demoted.model_ids,
+        vec![model.id.clone()],
+        "bindings must be preserved across privileged toggles"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn create_model_persists_force_max_reasoning_and_vision_shim() -> anyhow::Result<()> {
+    // Regression: the SQLite/Postgres/MySQL INSERT bound force_max_reasoning and
+    // vision_shim in swapped order, which failed with
+    // "NOT NULL constraint failed: models.force_max_reasoning" on databases whose
+    // force_max_reasoning column is NOT NULL (added by migration).
+    let gw = build_gateway().await?;
+    let provider = gw
+        .admin()
+        .create_provider(api_key_provider_input("model-create-roundtrip-provider"))
+        .await?;
+
+    let model = gw
+        .admin()
+        .create_model(CreateModel {
+            name: "model-create-roundtrip".to_string(),
+            balance: None,
+            target_provider: provider.id.clone(),
+            target_model: "gpt-test".to_string(),
+            targets: vec![CreateModelBackend {
+                provider_id: provider.id.clone(),
+                model: "gpt-test".to_string(),
+                weight: None,
+                priority: None,
+            }],
+            enable_auth: None,
+            force_max_reasoning: Some(true),
+            enable_payload: None,
+            vision_shim: Some(serde_json::json!({ "helper_model": "text-test" })),
+        })
+        .await?;
+
+    assert!(
+        model.force_max_reasoning,
+        "force_max_reasoning must round-trip through INSERT"
+    );
+    assert!(
+        model
+            .vision_shim
+            .as_deref()
+            .map_or(false, |raw| raw.contains("helper_model")),
+        "vision_shim config must round-trip through INSERT, got: {:?}",
+        model.vision_shim
+    );
+
+    // Re-read from storage so the assertions cover the persisted row, not an echo.
+    let reloaded = gw
+        .storage
+        .models()
+        .get(&model.id)
+        .await?
+        .expect("model row must exist after create");
+    assert!(reloaded.force_max_reasoning);
+    assert!(
+        reloaded
+            .vision_shim
+            .as_deref()
+            .map_or(false, |raw| raw.contains("helper_model"))
+    );
+
+    // Defaults path (all flags None) must insert cleanly too.
+    let plain = gw
+        .admin()
+        .create_model(CreateModel {
+            name: "model-create-defaults".to_string(),
+            balance: None,
+            target_provider: provider.id.clone(),
+            target_model: "gpt-test".to_string(),
+            targets: vec![CreateModelBackend {
+                provider_id: provider.id.clone(),
+                model: "gpt-test".to_string(),
+                weight: None,
+                priority: None,
+            }],
+            enable_auth: None,
+            force_max_reasoning: None,
+            enable_payload: None,
+            vision_shim: None,
+        })
+        .await?;
+    assert!(!plain.force_max_reasoning);
+    assert_eq!(plain.vision_shim, None);
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn delete_provider_removes_route_associations_before_provider() -> anyhow::Result<()> {
     let gw = build_gateway().await?;
     let removed_provider = gw

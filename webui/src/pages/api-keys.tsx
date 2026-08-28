@@ -104,6 +104,7 @@ type CreateForm = {
   tpm: string;
   tpd: string;
   expiresPreset: ExpirePreset;
+  isPrivileged: boolean;
   model_ids: string[];
 };
 
@@ -116,6 +117,7 @@ type EditForm = {
   rpd: string;
   tpm: string;
   tpd: string;
+  isPrivileged: boolean;
   model_ids: string[];
 };
 
@@ -126,8 +128,48 @@ const emptyCreate: CreateForm = {
   tpm: "",
   tpd: "",
   expiresPreset: "30d",
+  isPrivileged: false,
   model_ids: [],
 };
+
+function PrivilegedKeyToggle({
+  checked,
+  onCheckedChange,
+  isZh,
+}: {
+  checked: boolean;
+  onCheckedChange: (next: boolean) => void;
+  isZh: boolean;
+}) {
+  return (
+    <div className="space-y-1.5 rounded-xl border border-amber-200 bg-amber-50/60 p-3">
+      <label className="flex cursor-pointer items-center justify-between gap-2">
+        <span className="text-sm font-medium text-slate-700">
+          {isZh ? "特权秘钥" : "Privileged key"}
+        </span>
+        <input
+          type="checkbox"
+          className="h-4 w-4 accent-amber-600"
+          checked={checked}
+          onChange={(e) => onCheckedChange(e.target.checked)}
+        />
+      </label>
+      {checked ? (
+        <p className="text-xs text-amber-700">
+          {isZh
+            ? "该秘钥将可访问所有开启访问控制的模型（限流与有效期仍然生效）"
+            : "This key can access every auth-enabled model (quotas and expiry still apply)"}
+        </p>
+      ) : (
+        <p className="text-xs text-slate-500">
+          {isZh
+            ? "勾选后无需绑定即可访问所有受控模型"
+            : "When checked, this key can access all protected models without binding"}
+        </p>
+      )}
+    </div>
+  );
+}
 
 export default function ApiKeysPage() {
   const { locale } = useLocale();
@@ -236,6 +278,7 @@ export default function ApiKeysPage() {
       rpd: item.rpd ? String(item.rpd) : "",
       tpm: item.tpm ? String(item.tpm) : "",
       tpd: item.tpd ? String(item.tpd) : "",
+      isPrivileged: item.is_privileged ?? false,
       model_ids: item.model_ids ?? [],
     });
   }
@@ -315,6 +358,11 @@ export default function ApiKeysPage() {
             <div className="space-y-3">
               <p className="text-sm font-semibold text-slate-700">{isZh ? "2. 访问权限" : "2. Access Permission"}</p>
               <div className="space-y-2">
+                <PrivilegedKeyToggle
+                  checked={createForm.isPrivileged}
+                  onCheckedChange={(next) => setCreateForm((prev) => ({ ...prev, isPrivileged: next }))}
+                  isZh={isZh}
+                />
                 <div className="flex items-center justify-between gap-2">
                 <FieldLabel>
                   {isZh
@@ -411,6 +459,7 @@ export default function ApiKeysPage() {
                   tpm: createForm.tpm ? Number.parseInt(createForm.tpm, 10) : undefined,
                   tpd: createForm.tpd ? Number.parseInt(createForm.tpd, 10) : undefined,
                   expires_at: resolveExpiresAt(createForm.expiresPreset),
+                  is_privileged: createForm.isPrivileged,
                   model_ids: createForm.model_ids,
                 })
               }
@@ -503,6 +552,11 @@ export default function ApiKeysPage() {
                     <div className="space-y-3">
                       <p className="text-sm font-semibold text-slate-700">{isZh ? "2. 访问权限" : "2. Access Permission"}</p>
                       <div className="space-y-2">
+                        <PrivilegedKeyToggle
+                          checked={editForm.isPrivileged}
+                          onCheckedChange={(next) => setEditForm((prev) => (prev ? { ...prev, isPrivileged: next } : prev))}
+                          isZh={isZh}
+                        />
                         <div className="flex items-center justify-between gap-2">
                         <FieldLabel>
                           {isZh
@@ -610,6 +664,7 @@ export default function ApiKeysPage() {
                             rpd: editForm.rpd ? Number.parseInt(editForm.rpd, 10) : 0,
                             tpm: editForm.tpm ? Number.parseInt(editForm.tpm, 10) : 0,
                             tpd: editForm.tpd ? Number.parseInt(editForm.tpd, 10) : 0,
+                            is_privileged: editForm.isPrivileged,
                             model_ids: editForm.model_ids,
                           },
                         })
@@ -652,14 +707,23 @@ export default function ApiKeysPage() {
                           {isZh ? "已禁用" : "Disabled"}
                         </Badge>
                       )}
+                      {item.is_privileged && (
+                        <Badge variant="warning" className="connect-label-badge bg-amber-100 text-amber-800">
+                          {isZh ? "🔓 特权" : "🔓 Privileged"}
+                        </Badge>
+                      )}
                       <Badge variant={keyExpired ? "danger" : "success"} className="connect-label-badge">
                         {formatValidityLabel(keyExpired, isZh)}
                       </Badge>
-                      {item.model_ids.length > 0 && (
+                      {item.is_privileged ? (
+                        <Badge variant="warning" className="connect-label-badge bg-cyan-50 text-cyan-700">
+                          {isZh ? "全部模型（特权）" : "All models (privileged)"}
+                        </Badge>
+                      ) : item.model_ids.length > 0 ? (
                         <Badge variant="warning" className="connect-label-badge bg-cyan-50 text-cyan-700">
                           {isZh ? `共 ${item.model_ids.length} 个模型` : `${item.model_ids.length} Models`}
                         </Badge>
-                      )}
+                      ) : null}
                       <Badge variant="warning" className="connect-label-badge bg-indigo-50 text-indigo-700">
                         RPM {quotaText(item.rpm)}
                       </Badge>

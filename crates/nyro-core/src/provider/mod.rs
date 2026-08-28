@@ -27,6 +27,7 @@ pub mod vendor_ext;
 // ── Known vendors (each registers itself via inventory::submit!) ──────────────
 pub mod anthropic;
 pub mod ark_coding;
+pub mod bailian;
 pub mod custom;
 pub mod deepseek;
 pub mod google;

@@ -36,6 +36,9 @@ pub struct ApiKeyAccessRecord {
     pub id: String,
     pub name: String,
     pub is_enabled: bool,
+    /// When true the per-model binding check is skipped (enable, expiry and
+    /// quota gates still apply).
+    pub is_privileged: bool,
     pub expires_at: Option<String>,
     pub rpm: Option<i32>,
     pub rpd: Option<i32>,

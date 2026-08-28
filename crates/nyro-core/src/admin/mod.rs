@@ -31,6 +31,7 @@ mod oauth;
 mod observability;
 mod providers;
 pub mod settings;
+mod aliyun_sign;
 mod usage;
 mod volcengine_sign;
 

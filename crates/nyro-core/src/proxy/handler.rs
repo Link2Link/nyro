@@ -22,6 +22,7 @@ use crate::proxy::security::{extract_api_key, is_key_expired};
 
 pub async fn models_list(State(gw): State<Gateway>, headers: HeaderMap) -> Response {
     let mut accessible_route_ids = HashSet::new();
+    let mut is_privileged_key = false;
 
     if let Some(raw_key) = extract_api_key(&headers)
         && let Some(store) = gw.storage.auth()
@@ -34,7 +35,12 @@ pub async fn models_list(State(gw): State<Gateway>, headers: HeaderMap) -> Respo
                 .map(|expires| !is_key_expired(expires))
                 .unwrap_or(true);
 
-        if key_active && let Ok(bound_route_ids) = store.list_bound_model_ids(&key_row.id).await {
+        if key_active && key_row.is_privileged {
+            // Privileged keys see every model, mirroring their access scope.
+            is_privileged_key = true;
+        } else if key_active
+            && let Ok(bound_route_ids) = store.list_bound_model_ids(&key_row.id).await
+        {
             accessible_route_ids.extend(bound_route_ids);
         }
     }
@@ -54,7 +60,7 @@ pub async fn models_list(State(gw): State<Gateway>, headers: HeaderMap) -> Respo
     let models = cache
         .models
         .iter()
-        .filter(|model| is_master || !model.enable_auth || accessible_route_ids.contains(&model.id))
+        .filter(|model| is_master || is_privileged_key || !model.enable_auth || accessible_route_ids.contains(&model.id))
         .map(|model| model.name.trim())
         .filter(|model| !model.is_empty())
         .map(ToString::to_string)

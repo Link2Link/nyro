@@ -806,3 +806,48 @@ fn ark_coding_channel_is_shared_key_multi_protocol() {
         ]
     );
 }
+
+#[test]
+fn bailian_channels_are_shared_key_multi_protocol() {
+    let reg = VendorRegistry::global();
+    let meta = reg.metadata("bailian").expect("bailian vendor metadata");
+    assert_eq!(meta.label.en, "Alibaba Bailian");
+    assert_eq!(meta.icon, "bailian");
+
+    let coding = meta
+        .channels
+        .iter()
+        .find(|channel| channel.id == "coding")
+        .expect("bailian coding channel");
+    assert!(coding.shared_key_protocols, "channel must be shared-key");
+
+    let base_urls: std::collections::HashMap<&str, &str> = coding
+        .base_urls
+        .iter()
+        .map(|entry| (entry.protocol, entry.base_url))
+        .collect();
+    assert_eq!(base_urls.len(), 2);
+    assert_eq!(
+        base_urls.get("openai-compatible").copied(),
+        Some("https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1")
+    );
+    assert_eq!(
+        base_urls.get("anthropic-messages").copied(),
+        Some("https://token-plan.cn-beijing.maas.aliyuncs.com/apps/anthropic")
+    );
+    assert_eq!(
+        coding.models_source,
+        Some("https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1/models")
+    );
+
+    let default_channel = meta
+        .channels
+        .iter()
+        .find(|channel| channel.id == "default")
+        .expect("bailian default channel");
+    assert!(default_channel.shared_key_protocols);
+    assert_eq!(
+        default_channel.models_source,
+        Some("https://dashscope.aliyuncs.com/compatible-mode/v1/models")
+    );
+}

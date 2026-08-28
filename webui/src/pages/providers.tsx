@@ -816,7 +816,8 @@ function usageSupported(
     url.includes("api.kimi.com") ||
     url.includes("api.deepseek.com") ||
     url.includes("opencode.ai/zen") ||
-    url.includes("volces.com")
+    url.includes("volces.com") ||
+    url.includes("token-plan.")
   );
 }
 
@@ -2781,6 +2782,7 @@ export default function ProvidersPage() {
                 : [];
               const editingProviderIsArk = p.base_url.toLowerCase().includes("volces.com");
               const editingProviderIsDeepSeek = p.base_url.toLowerCase().includes("api.deepseek.com");
+              const editingProviderIsBailian = p.base_url.toLowerCase().includes("token-plan.");
               const currentProviderIsOAuth =
                 normalizeAuthMode(p.auth_mode) === "oauth"
                 || normalizeAuthMode(editForm.auth_mode) === "oauth";
@@ -3415,6 +3417,48 @@ export default function ProvidersPage() {
                           value={editUsageAk}
                           onChange={(e) => setEditUsageAk(e.target.value)}
                         />
+                      </div>
+                    )}
+                    {editingProviderIsBailian && (
+                      <div className="col-span-2 space-y-2 rounded-xl border border-slate-200 bg-slate-50/60 p-3">
+                        <FieldLabel
+                          info={
+                            isZh
+                              ? "用量查询走百炼控制台网关（bailian-cs.console.aliyun.com），需要阿里云账号级 RAM 密钥对或 CLI 访问令牌，与推理用的 API Key 不同。在 ram.console.aliyun.com/manage/ak 创建（需具备百炼控制台访问权限）。也可以只填 AccessKey ID 栏：粘贴 bl auth login --console 得到的 CLI 访问令牌。留空保存即清除。"
+                              : "Usage queries go through the Bailian console gateway (bailian-cs.console.aliyun.com) and require an Alibaba Cloud RAM key pair or a CLI access token — different from the inference API key. Create one at ram.console.aliyun.com/manage/ak (with Bailian console access). Alternatively fill only the AccessKey ID field with a CLI access token from 'bl auth login --console'. Save with blanks to clear."
+                          }
+                        >
+                          {isZh ? "用量查询密钥（阿里云百炼）" : "Usage Query Keys (Alibaba Bailian)"}
+                        </FieldLabel>
+                        <div className="grid gap-3 md:grid-cols-2">
+                          <div className="space-y-1.5">
+                            <span className="ml-1 text-xs text-slate-500">
+                              AccessKey ID / CLI Token
+                            </span>
+                            <Input
+                              className="bg-white"
+                              placeholder="LTAI... / CLI token..."
+                              autoComplete="off"
+                              spellCheck={false}
+                              value={editUsageAk}
+                              onChange={(e) => setEditUsageAk(e.target.value)}
+                            />
+                          </div>
+                          <div className="space-y-1.5">
+                            <span className="ml-1 text-xs text-slate-500">
+                              AccessKey Secret
+                            </span>
+                            <Input
+                              className="bg-white"
+                              type="password"
+                              placeholder="SK..."
+                              autoComplete="off"
+                              spellCheck={false}
+                              value={editUsageSk}
+                              onChange={(e) => setEditUsageSk(e.target.value)}
+                            />
+                          </div>
+                        </div>
                       </div>
                     )}
                     {isGlobalProxyEnabled && editingResolvedAuthMode !== "oauth" && (

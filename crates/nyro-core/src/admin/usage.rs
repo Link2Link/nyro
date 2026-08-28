@@ -73,6 +73,18 @@ const DEEPSEEK_BALANCE_URL: &str = "https://api.deepseek.com/user/balance";
 /// OpenCode Go subscription usage endpoint.
 const OPENCODE_GO_USAGE_URL: &str = "https://opencode.ai/zen/go/v1/usage";
 
+// Bailian token-plan usage: the console CLI gateway serves the quota
+// windows; a CLI access token (minted from RAM AK/SK via the Model Studio
+// OpenAPI, or pasted directly) authenticates it.
+const BAILIAN_CLI_TOKEN_HOST: &str = "modelstudio.cn-beijing.aliyuncs.com";
+const BAILIAN_CLI_TOKEN_PATH: &str = "/modelstudio/cli/generateAccessToken";
+const BAILIAN_CLI_TOKEN_ACTION: &str = "GenerateCLIAccessToken";
+const BAILIAN_CLI_TOKEN_VERSION: &str = "2026-02-10";
+const BAILIAN_CONSOLE_GATEWAY_URL: &str = "https://bailian-cs.console.aliyun.com/cli/api.json";
+const BAILIAN_GATEWAY_ACTION: &str = "BroadScopeAspnGateway";
+const BAILIAN_GATEWAY_PRODUCT: &str = "sfm_bailian";
+const BAILIAN_USAGE_API: &str = "zeldaHttp.apikeyMgr./tokenplan/personal/api/v2/usage";
+
 /// ChatGPT/Codex subscription usage endpoint. This control-plane URL is fixed:
 /// a provider's inference Base URL must never redirect quota credentials.
 const OPENAI_CODEX_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
@@ -237,6 +249,11 @@ enum UsageBackend {
     /// Volcengine Ark coding plan on ark.cn-beijing.volces.com. Usage is read
     /// from the control-plane OpenAPI with IAM AK/SK signing.
     ArkCoding,
+    /// Alibaba Bailian token-plan coding plan on
+    /// token-plan.cn-beijing.maas.aliyuncs.com. Usage is read from the
+    /// Bailian console CLI gateway with a CLI access token minted from RAM
+    /// AK/SK (or pasted directly) — the inference API key is not accepted.
+    BailianCodingPlan,
     /// OpenAI Codex / ChatGPT subscription quota via OAuth.
     OpenAiCodex,
     /// xAI Grok subscription quota (cli-chat-proxy `/v1/billing`) via OAuth.
@@ -308,6 +325,8 @@ impl UsageBackend {
             Some(UsageBackend::OpencodeGo)
         } else if url.contains("volces.com") {
             Some(UsageBackend::ArkCoding)
+        } else if url.contains("token-plan.") {
+            Some(UsageBackend::BailianCodingPlan)
         } else {
             None
         }
@@ -321,6 +340,7 @@ impl UsageBackend {
             UsageBackend::DeepSeek => "deepseek_balance",
             UsageBackend::OpencodeGo => "opencode_go",
             UsageBackend::ArkCoding => "ark_coding_plan",
+            UsageBackend::BailianCodingPlan => "bailian_coding_plan",
             UsageBackend::OpenAiCodex => "openai_codex",
             UsageBackend::Grok => "grok_plan",
         }
@@ -354,7 +374,7 @@ impl UsageBackend {
             | UsageBackend::OpencodeGo
             | UsageBackend::OpenAiCodex
             | UsageBackend::Grok => "global",
-            UsageBackend::ArkCoding => "cn",
+            UsageBackend::ArkCoding | UsageBackend::BailianCodingPlan => "cn",
         }
     }
 }
@@ -661,6 +681,189 @@ fn parse_opencode_tiers(body: &Value) -> Vec<ProviderUsageTier> {
                 .get("resetsAt")
                 .and_then(Value::as_str)
                 .map(str::to_string);
+            Some(ProviderUsageTier {
+                name: tier_name.to_string(),
+                used_percent,
+                resets_at,
+            })
+        })
+        .collect()
+}
+
+/// Mint a Bailian CLI access token from a RAM AccessKey pair via the Model
+/// Studio control-plane OpenAPI (ACS3-HMAC-SHA256 signed POST, empty body).
+///
+/// Shape: the OpenAPI returns a 'cliAccessToken' string; errors surface as
+/// non-2xx with Code/Message fields.
+async fn fetch_bailian_cli_token(
+    client: &reqwest::Client,
+    ak: &str,
+    sk: &str,
+) -> anyhow::Result<String> {
+    let signed = super::aliyun_sign::sign(
+        ak,
+        sk,
+        super::aliyun_sign::AcsRequest {
+            host: BAILIAN_CLI_TOKEN_HOST,
+            path: BAILIAN_CLI_TOKEN_PATH,
+            action: BAILIAN_CLI_TOKEN_ACTION,
+            version: BAILIAN_CLI_TOKEN_VERSION,
+            method: "POST",
+            body: b"",
+            query: "",
+            security_token: None,
+        },
+        chrono::Utc::now(),
+    );
+    let url = format!("https://{BAILIAN_CLI_TOKEN_HOST}{BAILIAN_CLI_TOKEN_PATH}");
+    let resp = client
+        .post(&url)
+        .header("Host", BAILIAN_CLI_TOKEN_HOST)
+        .header("Content-Type", "application/json")
+        .header("x-acs-action", BAILIAN_CLI_TOKEN_ACTION)
+        .header("x-acs-version", BAILIAN_CLI_TOKEN_VERSION)
+        .header("x-acs-date", &signed.x_acs_date)
+        .header("x-acs-signature-nonce", &signed.x_acs_signature_nonce)
+        .header("x-acs-content-sha256", &signed.x_acs_content_sha256)
+        .header("Authorization", &signed.authorization)
+        .timeout(Duration::from_secs(15))
+        .send()
+        .await
+        .map_err(|e| anyhow::anyhow!("CLI token request failed: {e}"))?;
+
+    let status = resp.status();
+    let raw = resp
+        .bytes()
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to read CLI token response: {e}"))?;
+    let body: Value = serde_json::from_slice(&raw)
+        .map_err(|e| anyhow::anyhow!("failed to parse CLI token response: {e}"))?;
+    if !status.is_success() {
+        let code = body.get("Code").and_then(Value::as_str).unwrap_or("");
+        let message = body.get("Message").and_then(Value::as_str).unwrap_or("");
+        anyhow::bail!("CLI token HTTP {status} (code {code}): {message}");
+    }
+    body.get("cliAccessToken")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| anyhow::anyhow!("CLI token response missing cliAccessToken"))
+}
+
+/// Query the Bailian console CLI gateway for token-plan usage. Returns the
+/// unwrapped 'data' object; business failures inside the 200 envelope
+/// (data.success == false) become errors.
+async fn fetch_bailian_usage(client: &reqwest::Client, token: &str) -> anyhow::Result<Value> {
+    let params = serde_json::json!({
+        "Api": BAILIAN_USAGE_API,
+        "V": "1.0",
+        "Data": {
+            "cornerstoneParam": {
+                "protocol": "V2",
+                "console": "ONE_CONSOLE",
+                "productCode": "p_efm",
+                "switchUserType": 3,
+                "consoleSite": "BAILIAN_ALIYUN"
+            }
+        }
+    });
+    let resp = client
+        .post(BAILIAN_CONSOLE_GATEWAY_URL)
+        .query(&[
+            ("action", BAILIAN_GATEWAY_ACTION),
+            ("product", BAILIAN_GATEWAY_PRODUCT),
+            ("api", BAILIAN_USAGE_API),
+        ])
+        .bearer_auth(token)
+        .form(&[
+            ("params", serde_json::to_string(&params).unwrap_or_default()),
+            ("region", "cn-beijing".to_string()),
+        ])
+        .timeout(Duration::from_secs(15))
+        .send()
+        .await
+        .map_err(|e| anyhow::anyhow!("usage query request failed: {e}"))?;
+
+    let status = resp.status();
+    let raw = resp
+        .bytes()
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to read usage response: {e}"))?;
+    let body: Value = serde_json::from_slice(&raw)
+        .map_err(|e| anyhow::anyhow!("failed to parse usage response: {e}"))?;
+    if !status.is_success() {
+        let preview: String = String::from_utf8_lossy(&raw).chars().take(200).collect();
+        anyhow::bail!("HTTP {status}: {preview}");
+    }
+    let data = body.get("data").cloned().unwrap_or(Value::Null);
+    if data.get("success").and_then(Value::as_bool) == Some(false) {
+        let code = data
+            .get("errorCode")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let message = data
+            .get("errorMsg")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown error");
+        if code.contains("NotLogined") {
+            anyhow::bail!(
+                "Bailian console session rejected (NotLogined): the CLI access token is \
+                 missing, invalid or expired — refresh the RAM AK/SK (or CLI token) in the \
+                 provider edit form"
+            );
+        }
+        anyhow::bail!("Bailian console gateway error (code {code}): {message}");
+    }
+    Ok(unwrap_bailian_gateway_data(&data))
+}
+
+/// Unwrap the console gateway's DataV2 double envelope. The token-plan
+/// payload lands at data.DataV2.data.data; data.data is the single-envelope
+/// fallback some APIs use; anything else is returned as-is.
+fn unwrap_bailian_gateway_data(data: &Value) -> Value {
+    if let Some(data_v2) = data.get("DataV2") {
+        let inner = data_v2
+            .pointer("/data/data")
+            .filter(|v| v.is_object())
+            .or_else(|| data_v2.get("data").filter(|v| v.is_object()));
+        if let Some(inner) = inner {
+            return inner.clone();
+        }
+        return data_v2.clone();
+    }
+    data.get("data")
+        .filter(|v| v.is_object())
+        .cloned()
+        .unwrap_or_else(|| data.clone())
+}
+
+/// Parse the Bailian console-gateway token-plan usage payload.
+///
+/// Shape (console API 'zeldaHttp.apikeyMgr./tokenplan/personal/api/v2/usage'):
+/// per5HourPercentage / per5HourResetTime / per1WeekPercentage /
+/// per1WeekResetTime. The percentage fields are usage ratios in [0, 1]
+/// (same as the official bl usage token-plan CLI); Nyro stores 0-100
+/// used-percent, so they are multiplied by 100 here. Reset times are epoch
+/// milliseconds. Windows without a numeric percentage are skipped;
+/// emission order is five-hour then weekly.
+fn parse_bailian_tiers(data: &Value) -> Vec<ProviderUsageTier> {
+    let windows = [
+        ("per5HourPercentage", "per5HourResetTime", TIER_FIVE_HOUR),
+        ("per1WeekPercentage", "per1WeekResetTime", TIER_WEEKLY_LIMIT),
+    ];
+    windows
+        .into_iter()
+        .filter_map(|(percent_key, reset_key, tier_name)| {
+            let ratio = data.get(percent_key).and_then(parse_f64)?;
+            if !ratio.is_finite() {
+                return None;
+            }
+            let used_percent = (ratio * 100.0).clamp(0.0, 100.0);
+            let resets_at = data
+                .get(reset_key)
+                .and_then(parse_f64)
+                .and_then(|ms| millis_to_iso8601(ms as i64));
             Some(ProviderUsageTier {
                 name: tier_name.to_string(),
                 used_percent,
@@ -1457,7 +1660,8 @@ impl AdminService {
                 "usage query is not supported for this provider: only OpenAI Codex OAuth, GLM \
                  (bigmodel.cn / api.z.ai), MiniMax (api.minimaxi.com / api.minimax.io), \
                  Kimi (api.kimi.com), OpenCode Go (opencode.ai/zen), Ark \
-                 (volces.com) and DeepSeek (api.deepseek.com) are supported"
+                 (volces.com), Bailian token-plan (token-plan.maas.aliyuncs.com) and \
+                 DeepSeek (api.deepseek.com) are supported"
             )
         })?;
 
@@ -1739,6 +1943,35 @@ impl AdminService {
                 let result = body.get("Result").cloned().unwrap_or(Value::Null);
                 (parse_ark_tiers(&result), Vec::new(), None, None, Vec::new())
             }
+            UsageBackend::BailianCodingPlan => {
+                // The inference API key is still required to consider this a
+                // configured provider; the console-gateway request below uses
+                // the independently stored credential pair.
+                let _api_key = api_key.as_deref().expect("non-OAuth backend API key");
+                // Either a RAM AK/SK pair (a CLI access token is minted via
+                // the Model Studio OpenAPI per query) or a ready-made CLI
+                // access token pasted into slot A.
+                let (access_key, secret_key) =
+                    self.get_provider_usage_credentials(&provider.id).await?;
+                let token = match (
+                    access_key.as_deref().map(str::trim),
+                    secret_key.as_deref().map(str::trim),
+                ) {
+                    (Some(ak), Some(sk)) if !ak.is_empty() && !sk.is_empty() => {
+                        fetch_bailian_cli_token(&self.gw.http_client, ak, sk).await?
+                    }
+                    (Some(token), _) if !token.is_empty() => token.to_string(),
+                    _ => anyhow::bail!(
+                        "Bailian usage query requires an Alibaba Cloud RAM AccessKey pair \
+                         (not the inference API key): configure it in the provider edit form. \
+                         Create one at https://ram.console.aliyun.com/manage/ak — or paste a \
+                         Bailian CLI access token (from 'bl auth login --console') into the \
+                         AccessKey ID field alone"
+                    ),
+                };
+                let data = fetch_bailian_usage(&self.gw.http_client, &token).await?;
+                (parse_bailian_tiers(&data), Vec::new(), None, None, Vec::new())
+            }
             UsageBackend::Grok => {
                 if provider.effective_auth_mode().trim() != "oauth" {
                     anyhow::bail!("Grok usage query requires an OAuth provider");
@@ -1834,14 +2067,23 @@ async fn provider_usage_monitorable(admin: &AdminService, provider: &Provider) -
     if usage_api_key(provider).is_none() {
         return false;
     }
-    if backend != UsageBackend::ArkCoding {
-        return true;
+    if backend == UsageBackend::ArkCoding {
+        return admin
+            .get_provider_usage_credentials(&provider.id)
+            .await
+            .ok()
+            .is_some_and(|(access_key, secret_key)| access_key.is_some() && secret_key.is_some());
     }
-    admin
-        .get_provider_usage_credentials(&provider.id)
-        .await
-        .ok()
-        .is_some_and(|(access_key, secret_key)| access_key.is_some() && secret_key.is_some())
+    if backend == UsageBackend::BailianCodingPlan {
+        // Slot A alone is enough: a pasted CLI access token works without SK.
+        return admin
+            .get_provider_usage_credentials(&provider.id)
+            .await
+            .ok()
+            .and_then(|(access_key, _)| access_key)
+            .is_some();
+    }
+    true
 }
 
 pub(crate) fn trigger_provider_usage_refresh(gw: Gateway, provider_id: String) {
@@ -1924,6 +2166,112 @@ async fn refresh_due_provider_usage(gw: &Gateway) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bailian_detection_matches_token_plan_host() {
+        let provider = provider_for_usage(
+            Some("bailian"),
+            Some("bailian"),
+            Some("coding"),
+            "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1",
+        );
+        assert_eq!(UsageBackend::detect(&provider), Some(UsageBackend::BailianCodingPlan));
+
+        // URL fallback for imported rows without vendor/preset fields.
+        let imported = provider_for_usage(
+            None,
+            None,
+            None,
+            "https://token-plan.cn-beijing.maas.aliyuncs.com/apps/anthropic",
+        );
+        assert_eq!(UsageBackend::detect(&imported), Some(UsageBackend::BailianCodingPlan));
+
+        // The pay-as-you-go dashscope channel has no usage backend.
+        let payg = provider_for_usage(
+            Some("bailian"),
+            Some("bailian"),
+            Some("default"),
+            "https://dashscope.aliyuncs.com/compatible-mode/v1",
+        );
+        assert_eq!(UsageBackend::detect(&payg), None);
+    }
+
+    #[test]
+    fn bailian_gateway_envelope_unwraps_data_v2() {
+        // Double envelope: data.DataV2.data.data carries the payload.
+        let data = serde_json::json!({
+            "success": true,
+            "DataV2": {
+                "data": {
+                    "data": { "per5HourPercentage": 0.12, "per1WeekPercentage": 0.03 }
+                }
+            }
+        });
+        let unwrapped = unwrap_bailian_gateway_data(&data);
+        let tiers = parse_bailian_tiers(&unwrapped);
+        assert_eq!(tiers.len(), 2);
+        assert_eq!(tiers[0].used_percent, 12.0);
+        assert_eq!(tiers[1].used_percent, 3.0);
+
+        // Single envelope fallback: data.data.
+        let single = serde_json::json!({
+            "success": true,
+            "data": { "per5HourPercentage": 0.05 }
+        });
+        let tiers = parse_bailian_tiers(&unwrap_bailian_gateway_data(&single));
+        assert_eq!(tiers.len(), 1);
+
+        // Flat payload is passed through unchanged.
+        let flat = serde_json::json!({ "success": true, "per1WeekPercentage": 0.09 });
+        let tiers = parse_bailian_tiers(&unwrap_bailian_gateway_data(&flat));
+        assert_eq!(tiers.len(), 1);
+    }
+
+    #[test]
+    fn parse_bailian_tiers_maps_windows_and_reset_times() {
+        let data = serde_json::json!({
+            "success": true,
+            "per5HourPercentage": 0.425,
+            "per5HourResetTime": 1770000000000i64,
+            "per1WeekPercentage": 0.07,
+            "per1WeekResetTime": 1770500000000i64
+        });
+        let tiers = parse_bailian_tiers(&data);
+        assert_eq!(tiers.len(), 2);
+        assert_eq!(tiers[0].name, TIER_FIVE_HOUR);
+        assert_eq!(tiers[0].used_percent, 42.5);
+        assert_eq!(
+            tiers[0].resets_at.as_deref(),
+            millis_to_iso8601(1_770_000_000_000).as_deref()
+        );
+        assert_eq!(tiers[1].name, TIER_WEEKLY_LIMIT);
+        assert!((tiers[1].used_percent - 7.0).abs() < 1e-9);
+
+        // Windows without a numeric percentage are skipped; numeric strings
+        // are accepted (parse_f64 handles both shapes).
+        let partial = serde_json::json!({
+            "per5HourPercentage": "0.135",
+            "per5HourResetTime": 1770000000000i64
+        });
+        let tiers = parse_bailian_tiers(&partial);
+        assert_eq!(tiers.len(), 1);
+        assert_eq!(tiers[0].name, TIER_FIVE_HOUR);
+        assert_eq!(tiers[0].used_percent, 13.5);
+    }
+
+    #[test]
+    fn parse_bailian_tiers_scales_zero_to_one_ratio_to_percent() {
+        // Live token-plan payload uses a [0, 1] ratio (0.0167 == 1.67%).
+        let data = serde_json::json!({
+            "per1WeekPercentage": 0.0167,
+            "per1WeekResetTime": 1770500000000i64
+        });
+        let tiers = parse_bailian_tiers(&data);
+        assert_eq!(tiers.len(), 1);
+        assert_eq!(tiers[0].name, TIER_WEEKLY_LIMIT);
+        let used = tiers[0].used_percent;
+        assert!((used - 1.67).abs() < 1e-9, "got {used}");
+    }
 
     fn tier(name: &str, used: f64, resets_at: Option<&str>) -> ProviderUsageTier {
         ProviderUsageTier {

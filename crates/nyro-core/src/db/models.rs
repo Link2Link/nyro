@@ -373,6 +373,10 @@ pub struct ApiKey {
     pub tpm: Option<i32>,
     pub tpd: Option<i32>,
     pub is_enabled: bool,
+    /// Privileged keys bypass per-model binding checks on auth-enabled
+    /// models (they still respect enable/disable, expiry and quotas).
+    #[serde(default)]
+    pub is_privileged: bool,
     pub expires_at: Option<String>,
     pub created_at: String,
     pub updated_at: String,
@@ -389,6 +393,9 @@ pub struct ApiKeyWithBindings {
     pub tpm: Option<i32>,
     pub tpd: Option<i32>,
     pub is_enabled: bool,
+    /// Privileged keys bypass per-model binding checks; bindings are kept.
+    #[serde(default)]
+    pub is_privileged: bool,
     pub expires_at: Option<String>,
     pub created_at: String,
     pub updated_at: String,
@@ -573,6 +580,9 @@ pub struct CreateApiKey {
     pub tpm: Option<i32>,
     pub tpd: Option<i32>,
     pub expires_at: Option<String>,
+    /// Privileged keys bypass per-model binding checks (see `ApiKey`).
+    #[serde(default)]
+    pub is_privileged: bool,
     #[serde(default, alias = "route_ids")]
     pub model_ids: Vec<String>,
 }
@@ -585,6 +595,9 @@ pub struct UpdateApiKey {
     pub tpm: Option<i32>,
     pub tpd: Option<i32>,
     pub is_enabled: Option<bool>,
+    /// `None` keeps the current value; an explicit boolean replaces it.
+    #[serde(default)]
+    pub is_privileged: Option<bool>,
     pub expires_at: Option<String>,
     #[serde(alias = "route_ids")]
     pub model_ids: Option<Vec<String>>,

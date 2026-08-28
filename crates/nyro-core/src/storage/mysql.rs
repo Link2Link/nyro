@@ -633,10 +633,10 @@ impl ModelStore for MysqlModelStore {
         .bind(input.target_model.trim())
         .bind(input.enable_auth.unwrap_or(false))
         .bind(input.enable_payload)
-        .bind(input.force_max_reasoning.unwrap_or(false))
         .bind(crate::db::models::vision_shim_value_to_raw(
             input.vision_shim.as_ref().unwrap_or(&serde_json::Value::Null),
         )?)
+        .bind(input.force_max_reasoning.unwrap_or(false))
         .execute(&self.pool)
         .await?;
         self.get(&id).await?.context("model missing after create")
@@ -853,7 +853,7 @@ impl ApiKeyStore for MysqlApiKeyStore {
         let id = uuid::Uuid::new_v4().to_string();
         let key = format!("sk-{}", uuid::Uuid::new_v4().simple());
         sqlx::query(
-            "INSERT INTO api_keys (id, token, name, rpm, rpd, tpm, tpd, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, NULLIF(?, ''))",
+            "INSERT INTO api_keys (id, token, name, rpm, rpd, tpm, tpd, is_privileged, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULLIF(?, ''))",
         )
         .bind(&id)
         .bind(&key)
@@ -862,6 +862,7 @@ impl ApiKeyStore for MysqlApiKeyStore {
         .bind(input.rpd)
         .bind(input.tpm)
         .bind(input.tpd)
+        .bind(input.is_privileged)
         .bind(input.expires_at.as_deref().map(str::trim).unwrap_or(""))
         .execute(&self.pool)
         .await?;
@@ -881,10 +882,11 @@ impl ApiKeyStore for MysqlApiKeyStore {
         let tpm = input.tpm.or(current.tpm);
         let tpd = input.tpd.or(current.tpd);
         let is_enabled = input.is_enabled.unwrap_or(current.is_enabled);
+        let is_privileged = input.is_privileged.unwrap_or(current.is_privileged);
         let expires_at = input.expires_at.or(current.expires_at);
 
         sqlx::query(
-            "UPDATE api_keys SET name=?, rpm=?, rpd=?, tpm=?, tpd=?, is_enabled=?, expires_at=NULLIF(?, ''), updated_at=NOW() WHERE id=?",
+            "UPDATE api_keys SET name=?, rpm=?, rpd=?, tpm=?, tpd=?, is_enabled=?, is_privileged=?, expires_at=NULLIF(?, ''), updated_at=NOW() WHERE id=?",
         )
         .bind(name.trim())
         .bind(rpm)
@@ -892,6 +894,7 @@ impl ApiKeyStore for MysqlApiKeyStore {
         .bind(tpm)
         .bind(tpd)
         .bind(is_enabled)
+        .bind(is_privileged)
         .bind(expires_at.as_deref().map(str::trim).unwrap_or(""))
         .bind(id)
         .execute(&self.pool)
@@ -950,6 +953,7 @@ impl AuthAccessStore for MysqlAuthAccessStore {
                 String,
                 String,
                 bool,
+                bool,
                 Option<String>,
                 Option<i32>,
                 Option<i32>,
@@ -957,17 +961,18 @@ impl AuthAccessStore for MysqlAuthAccessStore {
                 Option<i32>,
             ),
         >(
-            "SELECT id, COALESCE(name, '') AS name, COALESCE(is_enabled, 1) AS is_enabled, DATE_FORMAT(expires_at, '%Y-%m-%d %H:%i:%S') AS expires_at, rpm, rpd, tpm, tpd FROM api_keys WHERE token = ?",
+            "SELECT id, COALESCE(name, '') AS name, COALESCE(is_enabled, 1) AS is_enabled, COALESCE(is_privileged, 0) AS is_privileged, DATE_FORMAT(expires_at, '%Y-%m-%d %H:%i:%S') AS expires_at, rpm, rpd, tpm, tpd FROM api_keys WHERE token = ?",
         )
         .bind(raw_key)
         .fetch_optional(&self.pool)
         .await?;
 
         Ok(row.map(
-            |(id, name, is_enabled, expires_at, rpm, rpd, tpm, tpd)| ApiKeyAccessRecord {
+            |(id, name, is_enabled, is_privileged, expires_at, rpm, rpd, tpm, tpd)| ApiKeyAccessRecord {
                 id,
                 name,
                 is_enabled,
+                is_privileged,
                 expires_at,
                 rpm,
                 rpd,
@@ -1701,6 +1706,15 @@ impl StorageBootstrap for MysqlBootstrap {
         )
         .await?;
 
+        // Add is_privileged column to api_keys (binding-check bypass flag)
+        mysql_add_column_if_not_exists(
+            pool,
+            "api_keys",
+            "is_privileged",
+            "TINYINT(1) NOT NULL DEFAULT 0",
+        )
+        .await?;
+
         // Merge virtual_model into name and drop the column
         if mysql_column_exists(pool, "models", "virtual_model").await? {
             tracing::info!("merging virtual_model into name on models table (mysql)");
@@ -2029,7 +2043,7 @@ fn model_select(suffix: Option<&str>) -> String {
 
 fn api_key_select(suffix: Option<&str>) -> String {
     let mut sql = String::from(
-        "SELECT id, token, name, rpm, rpd, tpm, tpd, COALESCE(is_enabled, 1) AS is_enabled, DATE_FORMAT(expires_at, '%Y-%m-%d %H:%i:%S') AS expires_at, DATE_FORMAT(created_at, '%Y-%m-%d %H:%i:%S') AS created_at, DATE_FORMAT(updated_at, '%Y-%m-%d %H:%i:%S') AS updated_at FROM api_keys",
+        "SELECT id, token, name, rpm, rpd, tpm, tpd, COALESCE(is_enabled, 1) AS is_enabled, COALESCE(is_privileged, 0) AS is_privileged, DATE_FORMAT(expires_at, '%Y-%m-%d %H:%i:%S') AS expires_at, DATE_FORMAT(created_at, '%Y-%m-%d %H:%i:%S') AS created_at, DATE_FORMAT(updated_at, '%Y-%m-%d %H:%i:%S') AS updated_at FROM api_keys",
     );
     if let Some(suffix) = suffix {
         sql.push(' ');
@@ -2050,6 +2064,7 @@ fn api_key_with_bindings(row: ApiKey, model_ids: Vec<String>) -> ApiKeyWithBindi
         tpm: row.tpm,
         tpd: row.tpd,
         is_enabled: row.is_enabled,
+        is_privileged: row.is_privileged,
         expires_at: row.expires_at,
         created_at: row.created_at,
         updated_at: row.updated_at,
@@ -2238,6 +2253,7 @@ CREATE TABLE IF NOT EXISTS api_keys (
     tpm INTEGER,
     tpd INTEGER,
     is_enabled TINYINT(1) DEFAULT 1,
+    is_privileged TINYINT(1) NOT NULL DEFAULT 0,
     expires_at DATETIME,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP

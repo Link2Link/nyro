@@ -636,10 +636,10 @@ impl ModelStore for SqliteModelStore {
         .bind(input.target_model.trim())
         .bind(input.enable_auth.unwrap_or(false))
         .bind(input.enable_payload)
-        .bind(input.force_max_reasoning.unwrap_or(false))
         .bind(crate::db::models::vision_shim_value_to_raw(
             input.vision_shim.as_ref().unwrap_or(&serde_json::Value::Null),
         )?)
+        .bind(input.force_max_reasoning.unwrap_or(false))
         .execute(&self.pool)
         .await?;
         self.get(&id).await?.context("model missing after create")
@@ -831,7 +831,7 @@ struct SqliteApiKeyStore {
 impl ApiKeyStore for SqliteApiKeyStore {
     async fn list(&self) -> anyhow::Result<Vec<ApiKeyWithBindings>> {
         let rows = sqlx::query_as::<_, ApiKey>(
-            "SELECT id, token, name, rpm, rpd, tpm, tpd, COALESCE(is_enabled, 1) AS is_enabled, expires_at, created_at, updated_at FROM api_keys ORDER BY created_at DESC",
+            "SELECT id, token, name, rpm, rpd, tpm, tpd, COALESCE(is_enabled, 1) AS is_enabled, COALESCE(is_privileged, 0) AS is_privileged, expires_at, created_at, updated_at FROM api_keys ORDER BY created_at DESC",
         )
         .fetch_all(&self.pool)
         .await?;
@@ -848,6 +848,7 @@ impl ApiKeyStore for SqliteApiKeyStore {
                 tpm: row.tpm,
                 tpd: row.tpd,
                 is_enabled: row.is_enabled,
+                is_privileged: row.is_privileged,
                 expires_at: row.expires_at,
                 created_at: row.created_at,
                 updated_at: row.updated_at,
@@ -859,7 +860,7 @@ impl ApiKeyStore for SqliteApiKeyStore {
 
     async fn get(&self, id: &str) -> anyhow::Result<Option<ApiKeyWithBindings>> {
         let row = sqlx::query_as::<_, ApiKey>(
-            "SELECT id, token, name, rpm, rpd, tpm, tpd, COALESCE(is_enabled, 1) AS is_enabled, expires_at, created_at, updated_at FROM api_keys WHERE id = ?",
+            "SELECT id, token, name, rpm, rpd, tpm, tpd, COALESCE(is_enabled, 1) AS is_enabled, COALESCE(is_privileged, 0) AS is_privileged, expires_at, created_at, updated_at FROM api_keys WHERE id = ?",
         )
         .bind(id)
         .fetch_optional(&self.pool)
@@ -878,6 +879,7 @@ impl ApiKeyStore for SqliteApiKeyStore {
             tpm: row.tpm,
             tpd: row.tpd,
             is_enabled: row.is_enabled,
+            is_privileged: row.is_privileged,
             expires_at: row.expires_at,
             created_at: row.created_at,
             updated_at: row.updated_at,
@@ -889,7 +891,7 @@ impl ApiKeyStore for SqliteApiKeyStore {
         let id = uuid::Uuid::new_v4().to_string();
         let key = format!("sk-{}", uuid::Uuid::new_v4().simple());
         sqlx::query(
-            "INSERT INTO api_keys (id, token, name, rpm, rpd, tpm, tpd, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO api_keys (id, token, name, rpm, rpd, tpm, tpd, is_privileged, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&id)
         .bind(&key)
@@ -898,6 +900,7 @@ impl ApiKeyStore for SqliteApiKeyStore {
         .bind(input.rpd)
         .bind(input.tpm)
         .bind(input.tpd)
+        .bind(input.is_privileged)
         .bind(input.expires_at.as_ref().map(|v| v.trim()).filter(|v| !v.is_empty()))
         .execute(&self.pool)
         .await?;
@@ -908,7 +911,7 @@ impl ApiKeyStore for SqliteApiKeyStore {
 
     async fn update(&self, id: &str, input: UpdateApiKey) -> anyhow::Result<ApiKeyWithBindings> {
         let current = sqlx::query_as::<_, ApiKey>(
-            "SELECT id, token, name, rpm, rpd, tpm, tpd, COALESCE(is_enabled, 1) AS is_enabled, expires_at, created_at, updated_at FROM api_keys WHERE id = ?",
+            "SELECT id, token, name, rpm, rpd, tpm, tpd, COALESCE(is_enabled, 1) AS is_enabled, COALESCE(is_privileged, 0) AS is_privileged, expires_at, created_at, updated_at FROM api_keys WHERE id = ?",
         )
         .bind(id)
         .fetch_optional(&self.pool)
@@ -921,10 +924,11 @@ impl ApiKeyStore for SqliteApiKeyStore {
         let tpm = input.tpm.or(current.tpm);
         let tpd = input.tpd.or(current.tpd);
         let is_enabled = input.is_enabled.unwrap_or(current.is_enabled);
+        let is_privileged = input.is_privileged.unwrap_or(current.is_privileged);
         let expires_at = input.expires_at.or(current.expires_at);
 
         sqlx::query(
-            "UPDATE api_keys SET name=?, rpm=?, rpd=?, tpm=?, tpd=?, is_enabled=?, expires_at=?, updated_at=datetime('now') WHERE id=?",
+            "UPDATE api_keys SET name=?, rpm=?, rpd=?, tpm=?, tpd=?, is_enabled=?, is_privileged=?, expires_at=?, updated_at=datetime('now') WHERE id=?",
         )
         .bind(name.trim())
         .bind(rpm)
@@ -932,6 +936,7 @@ impl ApiKeyStore for SqliteApiKeyStore {
         .bind(tpm)
         .bind(tpd)
         .bind(is_enabled)
+        .bind(is_privileged)
         .bind(expires_at.as_ref().map(|v| v.trim()).filter(|v| !v.is_empty()))
         .bind(id)
         .execute(&self.pool)
@@ -989,22 +994,24 @@ impl AuthAccessStore for SqliteAuthAccessStore {
                 String,
                 String,
                 bool,
+                bool,
                 Option<String>,
                 Option<i32>,
                 Option<i32>,
                 Option<i32>,
                 Option<i32>,
             ),
-        >("SELECT id, COALESCE(name, '') AS name, COALESCE(is_enabled, 1) AS is_enabled, expires_at, rpm, rpd, tpm, tpd FROM api_keys WHERE token = ?")
+        >("SELECT id, COALESCE(name, '') AS name, COALESCE(is_enabled, 1) AS is_enabled, COALESCE(is_privileged, 0) AS is_privileged, expires_at, rpm, rpd, tpm, tpd FROM api_keys WHERE token = ?")
         .bind(raw_key)
         .fetch_optional(&self.pool)
         .await?;
 
         Ok(row.map(
-            |(id, name, is_enabled, expires_at, rpm, rpd, tpm, tpd)| ApiKeyAccessRecord {
+            |(id, name, is_enabled, is_privileged, expires_at, rpm, rpd, tpm, tpd)| ApiKeyAccessRecord {
                 id,
                 name,
                 is_enabled,
+                is_privileged,
                 expires_at,
                 rpm,
                 rpd,

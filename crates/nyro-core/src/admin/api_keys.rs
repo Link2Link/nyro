@@ -26,6 +26,7 @@ impl AdminService {
                 tpm: input.tpm,
                 tpd: input.tpd,
                 expires_at: input.expires_at,
+                is_privileged: input.is_privileged,
                 model_ids: input.model_ids,
             })
             .await?;
@@ -51,6 +52,7 @@ impl AdminService {
         let tpm = input.tpm.or(current.tpm);
         let tpd = input.tpd.or(current.tpd);
         let is_enabled = input.is_enabled.unwrap_or(current.is_enabled);
+        let is_privileged = input.is_privileged.unwrap_or(current.is_privileged);
         let expires_at = input.expires_at.or(current.expires_at);
 
         let result = self
@@ -64,6 +66,7 @@ impl AdminService {
                     tpm,
                     tpd,
                     is_enabled: Some(is_enabled),
+                    is_privileged: Some(is_privileged),
                     expires_at,
                     model_ids: input.model_ids,
                 },

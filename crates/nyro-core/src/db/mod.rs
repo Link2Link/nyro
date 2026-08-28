@@ -67,6 +67,8 @@ pub async fn migrate(pool: &SqlitePool) -> anyhow::Result<()> {
     // Migrate: api_keys status -> is_enabled
     ensure_api_key_column(pool, "is_enabled", "INTEGER DEFAULT 1").await?;
     migrate_api_key_status_to_is_enabled(pool).await?;
+    // Add is_privileged column to api_keys (binding-check bypass flag)
+    ensure_api_key_column(pool, "is_privileged", "INTEGER NOT NULL DEFAULT 0").await?;
     ensure_route_targets_table(pool).await?;
     ensure_provider_column(pool, "auth_mode", "TEXT NOT NULL DEFAULT 'apikey'").await?;
     sqlx::query("UPDATE providers SET auth_mode = 'apikey' WHERE auth_mode = 'api_key'")
@@ -610,6 +612,7 @@ async fn ensure_api_key_tables(pool: &SqlitePool) -> anyhow::Result<()> {
             tpm         INTEGER,
             tpd         INTEGER,
             is_enabled  INTEGER DEFAULT 1,
+            is_privileged INTEGER NOT NULL DEFAULT 0,
             expires_at  TEXT,
             created_at  TEXT DEFAULT (datetime('now')),
             updated_at  TEXT DEFAULT (datetime('now'))
@@ -904,7 +907,7 @@ CREATE TABLE IF NOT EXISTS routes (
     target_model      TEXT NOT NULL,
     enable_auth       INTEGER DEFAULT 0,
     enable_payload    INTEGER,
-    force_max_reasoning INTEGER DEFAULT 0,
+    force_max_reasoning INTEGER NOT NULL DEFAULT 0,
     vision_shim       TEXT,
     is_enabled        INTEGER DEFAULT 1,
     priority          INTEGER DEFAULT 0,

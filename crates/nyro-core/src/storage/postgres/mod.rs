@@ -622,10 +622,10 @@ impl ModelStore for PostgresModelStore {
         .bind(input.target_model.trim())
         .bind(input.enable_auth.unwrap_or(false))
         .bind(input.enable_payload)
-        .bind(input.force_max_reasoning.unwrap_or(false))
         .bind(crate::db::models::vision_shim_value_to_raw(
             input.vision_shim.as_ref().unwrap_or(&serde_json::Value::Null),
         )?)
+        .bind(input.force_max_reasoning.unwrap_or(false))
         .execute(&self.pool)
         .await?;
         self.get(&id).await?.context("model missing after create")
@@ -833,7 +833,7 @@ impl ApiKeyStore for PostgresApiKeyStore {
         let id = uuid::Uuid::new_v4().to_string();
         let key = format!("sk-{}", uuid::Uuid::new_v4().simple());
         sqlx::query(
-            "INSERT INTO api_keys (id, token, name, rpm, rpd, tpm, tpd, expires_at) VALUES ($1, $2, $3, $4, $5, $6, $7, NULLIF($8, '')::timestamptz)",
+            "INSERT INTO api_keys (id, token, name, rpm, rpd, tpm, tpd, is_privileged, expires_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NULLIF($9, '')::timestamptz)",
         )
         .bind(&id)
         .bind(&key)
@@ -842,6 +842,7 @@ impl ApiKeyStore for PostgresApiKeyStore {
         .bind(input.rpd)
         .bind(input.tpm)
         .bind(input.tpd)
+        .bind(input.is_privileged)
         .bind(input.expires_at.as_deref().map(str::trim).unwrap_or(""))
         .execute(&self.pool)
         .await?;
@@ -861,10 +862,11 @@ impl ApiKeyStore for PostgresApiKeyStore {
         let tpm = input.tpm.or(current.tpm);
         let tpd = input.tpd.or(current.tpd);
         let is_enabled = input.is_enabled.unwrap_or(current.is_enabled);
+        let is_privileged = input.is_privileged.unwrap_or(current.is_privileged);
         let expires_at = input.expires_at.or(current.expires_at);
 
         sqlx::query(
-            "UPDATE api_keys SET name=$1, rpm=$2, rpd=$3, tpm=$4, tpd=$5, is_enabled=$6, expires_at=NULLIF($7, '')::timestamptz, updated_at=CURRENT_TIMESTAMP WHERE id=$8",
+            "UPDATE api_keys SET name=$1, rpm=$2, rpd=$3, tpm=$4, tpd=$5, is_enabled=$6, is_privileged=$7, expires_at=NULLIF($8, '')::timestamptz, updated_at=CURRENT_TIMESTAMP WHERE id=$9",
         )
         .bind(name.trim())
         .bind(rpm)
@@ -872,6 +874,7 @@ impl ApiKeyStore for PostgresApiKeyStore {
         .bind(tpm)
         .bind(tpd)
         .bind(is_enabled)
+        .bind(is_privileged)
         .bind(expires_at.as_deref().map(str::trim).unwrap_or(""))
         .bind(id)
         .execute(&self.pool)
@@ -926,6 +929,7 @@ impl AuthAccessStore for PostgresAuthAccessStore {
                 String,
                 String,
                 bool,
+                bool,
                 Option<String>,
                 Option<i32>,
                 Option<i32>,
@@ -933,17 +937,18 @@ impl AuthAccessStore for PostgresAuthAccessStore {
                 Option<i32>,
             ),
         >(
-            "SELECT id, COALESCE(name, '') AS name, COALESCE(is_enabled, TRUE) AS is_enabled, to_char(expires_at AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS') AS expires_at, rpm, rpd, tpm, tpd FROM api_keys WHERE token = $1",
+            "SELECT id, COALESCE(name, '') AS name, COALESCE(is_enabled, TRUE) AS is_enabled, COALESCE(is_privileged, FALSE) AS is_privileged, to_char(expires_at AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS') AS expires_at, rpm, rpd, tpm, tpd FROM api_keys WHERE token = $1",
         )
         .bind(raw_key)
         .fetch_optional(&self.pool)
         .await?;
 
         Ok(row.map(
-            |(id, name, is_enabled, expires_at, rpm, rpd, tpm, tpd)| ApiKeyAccessRecord {
+            |(id, name, is_enabled, is_privileged, expires_at, rpm, rpd, tpm, tpd)| ApiKeyAccessRecord {
                 id,
                 name,
                 is_enabled,
+                is_privileged,
                 expires_at,
                 rpm,
                 rpd,
@@ -1655,6 +1660,11 @@ END $$;"#,
         )
         .execute(self.adapter.pool())
         .await?;
+        sqlx::query(
+            "ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS is_privileged BOOLEAN NOT NULL DEFAULT FALSE",
+        )
+        .execute(self.adapter.pool())
+        .await?;
         // Rename settings key log_record_payloads → enable_payload
         sqlx::query(
             "UPDATE settings SET name = 'enable_payload' WHERE name = 'log_record_payloads'",
@@ -1941,7 +1951,7 @@ fn model_select(suffix: Option<&str>) -> String {
 
 fn api_key_select(suffix: Option<&str>) -> String {
     let mut sql = String::from(
-        "SELECT id, token, name, rpm, rpd, tpm, tpd, COALESCE(is_enabled, TRUE) AS is_enabled, to_char(expires_at AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS') AS expires_at, to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS') AS created_at, to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS') AS updated_at FROM api_keys",
+        "SELECT id, token, name, rpm, rpd, tpm, tpd, COALESCE(is_enabled, TRUE) AS is_enabled, COALESCE(is_privileged, FALSE) AS is_privileged, to_char(expires_at AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS') AS expires_at, to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS') AS created_at, to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS') AS updated_at FROM api_keys",
     );
     if let Some(suffix) = suffix {
         sql.push(' ');
@@ -1962,6 +1972,7 @@ fn api_key_with_bindings(row: ApiKey, model_ids: Vec<String>) -> ApiKeyWithBindi
         tpm: row.tpm,
         tpd: row.tpd,
         is_enabled: row.is_enabled,
+        is_privileged: row.is_privileged,
         expires_at: row.expires_at,
         created_at: row.created_at,
         updated_at: row.updated_at,
@@ -2153,6 +2164,7 @@ CREATE TABLE IF NOT EXISTS api_keys (
     tpm INTEGER,
     tpd INTEGER,
     is_enabled BOOLEAN DEFAULT TRUE,
+    is_privileged BOOLEAN NOT NULL DEFAULT FALSE,
     expires_at TIMESTAMPTZ,
     created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP

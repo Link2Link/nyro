@@ -171,6 +171,47 @@
     ]
   },
   {
+    "id": "bailian",
+    "label": {
+      "zh": "阿里百炼",
+      "en": "Alibaba Bailian"
+    },
+    "icon": "bailian",
+    "defaultProtocol": "openai-compatible",
+    "channels": [
+      {
+        "id": "default",
+        "label": {
+          "zh": "按量付费",
+          "en": "Pay-as-you-go"
+        },
+        "baseUrls": {
+          "openai-compatible": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+          "anthropic-messages": "https://dashscope.aliyuncs.com/apps/anthropic"
+        },
+        "modelsSource": "https://dashscope.aliyuncs.com/compatible-mode/v1/models",
+        "staticModels": [],
+        "authMode": "apikey",
+        "sharedKeyProtocols": true
+      },
+      {
+        "id": "coding",
+        "label": {
+          "zh": "百炼套餐",
+          "en": "Coding Plan"
+        },
+        "baseUrls": {
+          "openai-compatible": "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1",
+          "anthropic-messages": "https://token-plan.cn-beijing.maas.aliyuncs.com/apps/anthropic"
+        },
+        "modelsSource": "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1/models",
+        "staticModels": [],
+        "authMode": "apikey",
+        "sharedKeyProtocols": true
+      }
+    ]
+  },
+  {
     "id": "google",
     "label": {
       "zh": "Google",

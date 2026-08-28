@@ -62,6 +62,7 @@ export interface ApiKey {
   tpm?: number | null;
   tpd?: number | null;
   is_enabled: boolean;
+  is_privileged?: boolean;
   expires_at?: string | null;
   created_at: string;
   updated_at: string;
@@ -512,6 +513,7 @@ export interface CreateApiKey {
   tpm?: number;
   tpd?: number;
   expires_at?: string;
+  is_privileged?: boolean;
   model_ids: string[];
 }
 
@@ -522,6 +524,7 @@ export interface UpdateApiKey {
   tpm?: number;
   tpd?: number;
   is_enabled?: boolean;
+  is_privileged?: boolean;
   expires_at?: string;
   model_ids?: string[];
 }
