@@ -1701,6 +1701,74 @@ pub(crate) fn log_decode_error(
     error_response(400, &msg)
 }
 
+/// Byte cap for the request-body prefix recorded on intake-rejection log
+/// entries. Enough to expose smuggled HTTP request lines ("POST http://..."),
+/// compression magic bytes, or early parse breaks without dumping whole
+/// payloads into the log.
+pub(crate) const INTAKE_REJECTION_BODY_PREFIX_BYTES: usize = 512;
+
+/// Best-effort ingress protocol for a raw request path. Intake rejections
+/// fire before any handler has stamped the real ingress protocol, so the
+/// log's protocol column is derived from the request path instead.
+fn ingress_from_path(path: &str) -> crate::protocol::ids::ProtocolEndpoint {
+    use crate::protocol::ids::{
+        ANTHROPIC_MESSAGES_2023_06_01, GOOGLE_GEMINI_GENERATE_CONTENT_V1BETA,
+        OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1, OPENAI_COMPATIBLE_EMBEDDINGS_V1,
+        OPENAI_RESPONSES_V1,
+    };
+    if path.starts_with("/v1/responses") {
+        OPENAI_RESPONSES_V1
+    } else if path.starts_with("/v1/messages") {
+        ANTHROPIC_MESSAGES_2023_06_01
+    } else if path.starts_with("/v1/embeddings") {
+        OPENAI_COMPATIBLE_EMBEDDINGS_V1
+    } else if path.starts_with("/v1beta/") {
+        GOOGLE_GEMINI_GENERATE_CONTENT_V1BETA
+    } else {
+        OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1
+    }
+}
+
+/// Emit a `LogEntry` for a request rejected at the JSON intake boundary -
+/// before any handler, decoder, or router ran. The body never parsed, so the
+/// wire evidence (rejection status and text, redacted request headers, and
+/// the leading body bytes) is all the log can carry. Without this, malformed
+/// intake rejections leave no `request_logs` row and are only diagnosable
+/// via packet capture.
+pub(crate) fn log_intake_rejection(
+    gw: &Gateway,
+    method: &axum::http::Method,
+    path: &str,
+    headers: &axum::http::HeaderMap,
+    body_prefix: &[u8],
+    status: axum::http::StatusCode,
+    rejection_text: &str,
+) {
+    let ingress_str = ingress_from_path(path).to_string();
+    let shown = body_prefix
+        .len()
+        .min(crate::proxy::dispatcher::INTAKE_REJECTION_BODY_PREFIX_BYTES);
+    let mut body_str = String::from_utf8_lossy(&body_prefix[..shown]).to_string();
+    if body_prefix.len() > shown {
+        body_str.push_str(&format!(
+            " ...[first {shown} of {} body bytes]",
+            body_prefix.len()
+        ));
+    }
+    LogBuilder::from_dispatch(gw, &ingress_str, "", None, Instant::now())
+        .status(status.as_u16())
+        .with_req_extras(&RequestExtras {
+            method: method.to_string(),
+            path: path.to_string(),
+            headers: crate::proxy::observability::headers_to_json(headers),
+            body: Some(body_str),
+        })
+        .resp_body(Some(
+            serde_json::json!({ "error": { "message": rejection_text } }).to_string(),
+        ))
+        .emit();
+}
+
 pub(crate) fn error_response(status: u16, message: &str) -> Response {
     let err: GatewayError = match status {
         400 => GatewayError::bad_request("bad_request", message),

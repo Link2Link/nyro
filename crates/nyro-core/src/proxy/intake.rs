@@ -33,12 +33,20 @@ pub struct JsonIntake {
 #[async_trait]
 impl<S> FromRequest<S> for JsonIntake
 where
-    S: Send + Sync,
+    S: Send + Sync + 'static,
 {
     type Rejection = JsonRejection;
 
     async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
         let (mut parts, body) = req.into_parts();
+        // Wire snapshot taken before `parts` is consumed by the inner `Json`
+        // extractor: intake-rejection logging needs the original view (the
+        // compressed path strips content headers before re-invoking `Json`).
+        let wire = WireMeta {
+            method: parts.method.clone(),
+            path: parts.uri.path().to_string(),
+            headers: parts.headers.clone(),
+        };
         let encoding = request_content_encoding(&parts.headers);
         if encoding
             .as_deref()
@@ -62,7 +70,13 @@ where
                     let decoded = Bytes::from(decompressed);
                     let decoded_for_json = decoded.clone();
                     let req = Request::from_parts(parts, Body::from(decoded_for_json));
-                    let Json(value) = Json::<Value>::from_request(req, state).await?;
+                    let Json(value) = match Json::<Value>::from_request(req, state).await {
+                        Ok(v) => v,
+                        Err(rejection) => {
+                            report_intake_rejection(state, &wire, &decoded, &rejection);
+                            return Err(rejection);
+                        }
+                    };
                     return Ok(Self {
                         value,
                         raw: decoded,
@@ -70,7 +84,13 @@ where
                 }
                 _ => {
                     let req = Request::from_parts(parts, Body::from(compressed.clone()));
-                    let Json(value) = Json::<Value>::from_request(req, state).await?;
+                    let Json(value) = match Json::<Value>::from_request(req, state).await {
+                        Ok(v) => v,
+                        Err(rejection) => {
+                            report_intake_rejection(state, &wire, &compressed, &rejection);
+                            return Err(rejection);
+                        }
+                    };
                     return Ok(Self {
                         value,
                         raw: compressed,
@@ -92,7 +112,20 @@ where
         }));
         let req = Request::from_parts(parts, body);
 
-        let Json(value) = Json::<Value>::from_request(req, state).await?;
+        let Json(value) = match Json::<Value>::from_request(req, state).await {
+            Ok(v) => v,
+            Err(rejection) => {
+                let prefix = captured
+                    .lock()
+                    .expect("request body capture mutex poisoned")
+                    .iter()
+                    .take(crate::proxy::dispatcher::INTAKE_REJECTION_BODY_PREFIX_BYTES)
+                    .copied()
+                    .collect::<Vec<u8>>();
+                report_intake_rejection(state, &wire, &prefix, &rejection);
+                return Err(rejection);
+            }
+        };
         let raw = captured
             .lock()
             .expect("request body capture mutex poisoned")
@@ -100,6 +133,39 @@ where
             .freeze();
 
         Ok(Self { value, raw })
+    }
+}
+
+/// Original wire metadata kept for intake-rejection logging.
+struct WireMeta {
+    method: axum::http::Method,
+    path: String,
+    headers: axum::http::HeaderMap,
+}
+
+/// Downcast the router state to [`crate::Gateway`] and emit an
+/// intake-rejection log entry through the dispatcher. No-op when the
+/// state is not a `Gateway` (extractor unit tests, foreign routers); the
+/// rejection itself propagates unchanged either way.
+fn report_intake_rejection<S>(
+    state: &S,
+    wire: &WireMeta,
+    body_prefix: &[u8],
+    rejection: &JsonRejection,
+) where
+    S: 'static,
+{
+    let any_state: &dyn std::any::Any = state;
+    if let Some(gw) = any_state.downcast_ref::<crate::Gateway>() {
+        crate::proxy::dispatcher::log_intake_rejection(
+            gw,
+            &wire.method,
+            &wire.path,
+            &wire.headers,
+            body_prefix,
+            rejection.status(),
+            &rejection.body_text(),
+        );
     }
 }
 
@@ -339,5 +405,182 @@ mod tests {
     #[tokio::test]
     async fn empty_body_rejection_matches_axum_json() {
         assert_rejection_matches_axum(b"", Some("application/json"), StatusCode::BAD_REQUEST).await;
+    }
+    async fn log_test_gateway() -> (
+        crate::Gateway,
+        tokio::sync::mpsc::Receiver<crate::logging::LogEntry>,
+    ) {
+        let config = crate::config::GatewayConfig {
+            data_dir: std::env::temp_dir()
+                .join(format!("nyro-intake-log-test-{}", uuid::Uuid::new_v4())),
+            ..Default::default()
+        };
+        crate::Gateway::new(config)
+            .await
+            .expect("gateway init for intake log test")
+    }
+
+    fn uri_request(body: &'static [u8], uri: &str) -> Request {
+        HttpRequest::builder()
+            .method("POST")
+            .uri(uri)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body))
+            .expect("valid test request")
+    }
+
+    async fn next_log_entry(
+        log_rx: &mut tokio::sync::mpsc::Receiver<crate::logging::LogEntry>,
+    ) -> crate::logging::LogEntry {
+        tokio::time::timeout(std::time::Duration::from_secs(1), log_rx.recv())
+            .await
+            .expect("intake rejection should be logged")
+            .expect("log channel should remain open")
+    }
+
+    #[tokio::test]
+    async fn intake_rejection_is_logged_with_wire_evidence() {
+        let (gw, mut log_rx) = log_test_gateway().await;
+
+        // The client stream-corruption class: a complete HTTP request line
+        // smuggled into the body slot of another request.
+        let body: &'static [u8] =
+            b"POST http://192.168.31.2:19530/v1/chat/completions HTTP/1.1\r\nHost: x\r\n\r\n";
+        let rejection = JsonIntake::from_request(uri_request(body, "/v1/chat/completions"), &gw)
+            .await
+            .expect_err("smuggled body must be rejected");
+        assert_eq!(rejection.status(), StatusCode::BAD_REQUEST);
+
+        let entry = next_log_entry(&mut log_rx).await;
+        assert_eq!(entry.client_status_code, 400);
+        assert_eq!(entry.method.as_deref(), Some("POST"));
+        assert_eq!(entry.path.as_deref(), Some("/v1/chat/completions"));
+        assert_eq!(
+            entry.client_protocol,
+            "openai-compatible/chat-completions/v1"
+        );
+        let body_str = entry.client_request_body.expect("body prefix recorded");
+        assert!(body_str.starts_with("POST http://192.168.31.2:19530"));
+        let resp = entry.client_response_body.expect("rejection text recorded");
+        assert!(resp.contains("expected value"), "unexpected body: {resp}");
+    }
+
+    #[tokio::test]
+    async fn intake_rejection_redacts_sensitive_headers() {
+        let (gw, mut log_rx) = log_test_gateway().await;
+        let req = HttpRequest::builder()
+            .method("POST")
+            .uri("/v1/messages")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::AUTHORIZATION, "Bearer sk-intake-secret")
+            .body(Body::from(b"not-json".as_slice()))
+            .expect("valid test request");
+        assert!(JsonIntake::from_request(req, &gw).await.is_err());
+
+        let entry = next_log_entry(&mut log_rx).await;
+        let headers = entry.client_request_headers.expect("headers recorded");
+        assert!(
+            headers.contains("\"***\""),
+            "redacted marker missing: {headers}"
+        );
+        assert!(!headers.contains("sk-intake-secret"));
+        assert_eq!(
+            entry.client_protocol,
+            "anthropic-messages/messages/2023-06-01"
+        );
+    }
+
+    #[tokio::test]
+    async fn valid_intake_with_gateway_state_emits_no_log() {
+        let (gw, mut log_rx) = log_test_gateway().await;
+        let intake = JsonIntake::from_request(
+            uri_request(br#"{"model":"gpt-test"}"#, "/v1/chat/completions"),
+            &gw,
+        )
+        .await
+        .expect("valid intake");
+        assert_eq!(intake.value["model"], "gpt-test");
+        assert!(matches!(
+            log_rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
+    async fn missing_content_type_rejection_is_logged_with_415() {
+        let (gw, mut log_rx) = log_test_gateway().await;
+        let req = HttpRequest::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .body(Body::from(br#"{"model":"gpt-test"}"#.as_slice()))
+            .expect("valid test request");
+        let rejection = JsonIntake::from_request(req, &gw)
+            .await
+            .expect_err("missing content type must be rejected");
+        assert_eq!(rejection.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+
+        let entry = next_log_entry(&mut log_rx).await;
+        assert_eq!(entry.client_status_code, 415);
+        assert_eq!(entry.client_protocol, "openai-responses/responses/v1");
+        let resp = entry.client_response_body.expect("rejection text recorded");
+        assert!(resp.contains("Expected request with"), "unexpected: {resp}");
+    }
+
+    #[tokio::test]
+    async fn compressed_rejection_logs_parsed_view_and_original_headers() {
+        let (gw, mut log_rx) = log_test_gateway().await;
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        std::io::Write::write_all(&mut encoder, b"still not json after decompression").unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        let req = HttpRequest::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::CONTENT_ENCODING, "gzip")
+            .body(Body::from(compressed))
+            .expect("valid test request");
+        assert!(JsonIntake::from_request(req, &gw).await.is_err());
+
+        let entry = next_log_entry(&mut log_rx).await;
+        // The decompression succeeded, so the logged prefix is the
+        // decompressed bytes the JSON parser actually rejected.
+        let body_str = entry.client_request_body.expect("body prefix recorded");
+        assert!(body_str.starts_with("still not json"), "got: {body_str:?}");
+        // The wire snapshot preserves the original request headers,
+        // including the content-encoding stripped before parsing.
+        let headers = entry.client_request_headers.expect("headers recorded");
+        assert!(
+            headers.contains("\"gzip\""),
+            "original content-encoding missing: {headers}"
+        );
+    }
+
+    #[tokio::test]
+    async fn unsupported_encoding_rejection_logs_wire_bytes() {
+        let (gw, mut log_rx) = log_test_gateway().await;
+        let req = HttpRequest::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::CONTENT_ENCODING, "snappy")
+            .body(Body::from(b"not-json-wire-bytes".as_slice()))
+            .expect("valid test request");
+        assert!(JsonIntake::from_request(req, &gw).await.is_err());
+
+        let entry = next_log_entry(&mut log_rx).await;
+        let body_str = entry.client_request_body.expect("body prefix recorded");
+        assert!(body_str.starts_with("not-json-wire-bytes"));
+    }
+
+    #[tokio::test]
+    async fn non_gateway_state_rejection_does_not_panic() {
+        // Extractor unit tests and foreign routers use non-Gateway states:
+        // rejection logging must be a silent no-op there.
+        let rejection =
+            JsonIntake::from_request(request(b"not json", Some("application/json")), &())
+                .await
+                .expect_err("invalid JSON must be rejected");
+        assert_eq!(rejection.status(), StatusCode::BAD_REQUEST);
     }
 }

@@ -13,6 +13,7 @@ use super::error_response;
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
+#[derive(Debug)]
 pub(super) struct AuthenticatedKey {
     pub(super) id: Option<String>,
     pub(super) name: Option<String>,
@@ -132,12 +133,16 @@ pub(super) async fn authorize_model_access<S: ProxyAccessStore + ?Sized>(
         return Err(error_response(403, "api key expired"));
     }
 
-    let allowed = access_store
-        .model_binding_exists(&key_row.id, &model.id)
-        .await
-        .map_err(|e| error_response(500, &format!("auth db error: {e}")))?;
-    if !allowed {
-        return Err(error_response(403, "api key not allowed for this model"));
+    // Privileged keys bypass the per-model binding check only; the
+    // enable / expiry gates above and the quota gates below still apply.
+    if !key_row.is_privileged {
+        let allowed = access_store
+            .model_binding_exists(&key_row.id, &model.id)
+            .await
+            .map_err(|e| error_response(500, &format!("auth db error: {e}")))?;
+        if !allowed {
+            return Err(error_response(403, "api key not allowed for this model"));
+        }
     }
 
     if let Some(limit) = key_row.rpm.filter(|v| *v > 0) {
@@ -194,4 +199,137 @@ pub(super) async fn get_provider<S: ProxyAccessStore + ?Sized>(
         .get_active_provider(id)
         .await?
         .ok_or_else(|| anyhow::anyhow!("provider not found or inactive: {id}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::{HeaderValue, header};
+
+    struct MockStore {
+        record: Option<ApiKeyAccessRecord>,
+        bound: bool,
+    }
+
+    impl MockStore {
+        fn new(is_privileged: bool, bound: bool) -> Self {
+            Self {
+                record: Some(ApiKeyAccessRecord {
+                    id: "key-123".to_string(),
+                    name: "test-key".to_string(),
+                    is_enabled: true,
+                    is_privileged,
+                    expires_at: None,
+                    rpm: None,
+                    rpd: None,
+                    tpm: None,
+                    tpd: None,
+                }),
+                bound,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ProxyAccessStore for MockStore {
+        async fn get_active_provider(&self, _id: &str) -> anyhow::Result<Option<Provider>> {
+            Ok(None)
+        }
+        async fn find_api_key(&self, _raw_key: &str) -> anyhow::Result<Option<ApiKeyAccessRecord>> {
+            Ok(self.record.clone())
+        }
+        async fn model_binding_exists(
+            &self,
+            _api_key_id: &str,
+            _model_id: &str,
+        ) -> anyhow::Result<bool> {
+            Ok(self.bound)
+        }
+        async fn request_count_since(
+            &self,
+            _api_key_id: &str,
+            _window: UsageWindow,
+        ) -> anyhow::Result<i64> {
+            Ok(0)
+        }
+        async fn token_count_since(
+            &self,
+            _api_key_id: &str,
+            _window: UsageWindow,
+        ) -> anyhow::Result<i64> {
+            Ok(0)
+        }
+    }
+
+    fn test_model() -> Model {
+        Model {
+            id: "model-xyz".to_string(),
+            name: "test-model".to_string(),
+            balance: "weighted".to_string(),
+            target_provider: "p".to_string(),
+            target_model: "m".to_string(),
+            enable_auth: true,
+            force_max_reasoning: false,
+            enable_payload: None,
+            vision_shim: None,
+            is_enabled: true,
+            created_at: String::new(),
+            targets: Vec::new(),
+        }
+    }
+
+    fn test_headers() -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer sk-test"),
+        );
+        headers
+    }
+
+    #[tokio::test]
+    async fn privileged_key_bypasses_model_binding() {
+        let store = MockStore::new(true, false);
+        let model = test_model();
+        let headers = test_headers();
+
+        let result = authorize_model_access(&store, &model, &headers, None).await;
+        assert!(
+            result.is_ok(),
+            "privileged key must be allowed even when not bound"
+        );
+        let key = result.unwrap();
+        assert_eq!(key.id.as_deref(), Some("key-123"));
+        assert_eq!(key.name.as_deref(), Some("test-key"));
+    }
+
+    #[tokio::test]
+    async fn non_privileged_key_rejected_when_not_bound() {
+        let store = MockStore::new(false, false);
+        let model = test_model();
+        let headers = test_headers();
+
+        let result = authorize_model_access(&store, &model, &headers, None).await;
+        assert!(
+            result.is_err(),
+            "non-privileged key without binding must be rejected"
+        );
+        let resp = result.unwrap_err();
+        assert_eq!(resp.status().as_u16(), 403);
+    }
+
+    #[tokio::test]
+    async fn non_privileged_key_allowed_when_bound() {
+        let store = MockStore::new(false, true);
+        let model = test_model();
+        let headers = test_headers();
+
+        let result = authorize_model_access(&store, &model, &headers, None).await;
+        assert!(
+            result.is_ok(),
+            "non-privileged key with binding must be allowed"
+        );
+        let key = result.unwrap();
+        assert_eq!(key.id.as_deref(), Some("key-123"));
+    }
 }
