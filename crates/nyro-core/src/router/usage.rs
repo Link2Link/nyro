@@ -11,7 +11,12 @@
 //! `r > 1` means the window is paced to leave quota unused at reset (waste
 //! risk -> push more traffic), `r < 1` means it will exhaust before reset
 //! (back off), and `r` grows as a reset nears with quota still unspent.
-//! All scored providers compete in a single pool weighted by `r³`.
+//! All scored providers compete in a single pool weighted by `r³` times a
+//! window-perishability boost ([`window_boost`]): shorter windows waste
+//! unspent quota far more often per year (the same leftover percentage
+//! recurs ~52x/year on weekly vs ~12x/year on monthly) and recover from
+//! early exhaustion sooner, so pushing traffic their way risks less and
+//! saves more.
 //!
 //! Window lengths mirror the steady-pace marker rendered by the WebUI:
 //! fixed 5h / 7d / 30d reconstructed backwards from the upstream reset time.
@@ -33,6 +38,15 @@ const THIRTY_DAYS_MS: f64 = 30.0 * 24.0 * 60.0 * 60.0 * 1000.0;
 /// must not monopolize routing indefinitely.
 pub(crate) const MAX_USAGE_RATE: f64 = 10.0;
 
+/// Exponent of the window-perishability boost. `0.5` turns the ~4.3x
+/// monthly/weekly reset-frequency ratio into a ~2.07x weight multiplier —
+/// an on-pace weekly provider splits ~67/33 against an on-pace monthly one.
+pub(crate) const WINDOW_BOOST_ALPHA: f64 = 0.5;
+
+/// Upper bound of the window-perishability boost so a five-hour-only
+/// provider (nominal `sqrt(30d/5h) = 12x`) cannot monopolize the pool.
+pub(crate) const WINDOW_BOOST_CAP: f64 = 4.0;
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct ProviderUsageScore {
     /// Required acceleration on the provider's largest main window.
@@ -53,6 +67,23 @@ pub(crate) fn dynamic_weight(rate: f64) -> f64 {
         rate.min(MAX_USAGE_RATE).powi(3)
     } else {
         0.0
+    }
+}
+
+/// Window-perishability multiplier for the `usage` pool.
+///
+/// Shorter windows both waste unspent quota more often per year (the same
+/// leftover percentage recurs ~52x/year on weekly vs ~12x/year on monthly)
+/// and recover from early exhaustion sooner (days vs weeks), so traffic
+/// pushed their way risks less and saves more. Monthly, the largest
+/// canonical window, is the neutral baseline (`1.0`); non-canonical window
+/// names get no boost.
+pub(crate) fn window_boost(window: &str) -> f64 {
+    match tier_window_ms(window) {
+        Some(window_ms) => (THIRTY_DAYS_MS / window_ms)
+            .powf(WINDOW_BOOST_ALPHA)
+            .min(WINDOW_BOOST_CAP),
+        None => 1.0,
     }
 }
 
@@ -406,5 +437,26 @@ mod tests {
         assert_eq!(dynamic_weight(0.0), 0.0);
         assert_eq!(dynamic_weight(f64::NAN), 0.0);
         assert_eq!(dynamic_weight(-1.0), 0.0);
+    }
+
+    #[test]
+    fn window_boost_baselines_monthly_and_caps_five_hour() {
+        assert!(approx(window_boost(TIER_MONTHLY), 1.0));
+        let weekly = window_boost(TIER_WEEKLY_LIMIT);
+        assert!(
+            (weekly - (30.0_f64 / 7.0).powf(WINDOW_BOOST_ALPHA)).abs() < 1e-9,
+            "weekly boost is (30d/7d)^alpha"
+        );
+        assert!((weekly - 2.070_196_7).abs() < 1e-6, "got {weekly}");
+        assert!(
+            approx(window_boost(TIER_FIVE_HOUR), WINDOW_BOOST_CAP),
+            "sqrt(30d/5h) = 12 is capped"
+        );
+    }
+
+    #[test]
+    fn window_boost_ignores_non_canonical_windows() {
+        assert!(approx(window_boost("feature:spark:five_hour"), 1.0));
+        assert!(approx(window_boost("primary_window"), 1.0));
     }
 }

@@ -333,7 +333,8 @@ pub enum ModelBalance {
     /// Latency-first — lowest streaming TTFB EWMA first; targets without a
     /// fresh sample probe optimistically ahead of the known ones.
     Latency,
-    /// Usage-first — upstream quota scores become dynamic squared weights.
+    /// Usage-first — upstream quota scores become cubed-rate weights
+    /// scaled by a window-length perishability boost.
     Usage,
 }
 

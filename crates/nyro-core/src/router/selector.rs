@@ -11,7 +11,7 @@
 //! | `weighted` | Weighted reservoir sampling (default) |
 //! | `priority` | Priority groups in ascending order    |
 //! | `latency`  | Lowest streaming TTFB EWMA first      |
-//! | `usage`    | Largest-window quota rate³ weights     |
+//! | `usage`    | Largest-window quota rate³ × window-perishability weights |
 //!
 //! `latency` orders targets by the time-to-first-token EWMA held in
 //! [`LatencyRegistry`]. Targets without a graduated fresh estimate (never
@@ -42,7 +42,7 @@ use super::decision::{DecisionCandidate, RouteDecision, SkipReason};
 use super::health::HealthRegistry;
 use super::latency::LatencyRegistry;
 use super::quota::ProviderQuotaRegistry;
-use super::usage::{dynamic_weight, score_provider};
+use super::usage::{dynamic_weight, score_provider, window_boost};
 use crate::db::models::{ModelBackend, ModelBalance};
 
 // ── SelectedTarget ────────────────────────────────────────────────────────────
@@ -222,7 +222,10 @@ impl RoutingStrategy for LatencyStrategy {
 /// Orders provider groups by upstream quota headroom. Every scored provider
 /// competes in a single pool whose weight is the cube of the required
 /// acceleration on its largest main window (monthly, else weekly, else
-/// five-hour): rate = remaining quota % / remaining time % of that window.
+/// five-hour) — rate = remaining quota % / remaining time % of that window —
+/// scaled by [`window_boost`]: shorter windows waste unspent quota far more
+/// often per year and recover from early exhaustion sooner, so they safely
+/// absorb a larger share of the traffic.
 /// Providers without a canonical window form an equal-weight fallback pool;
 /// quota-blocked rows stay last so the dispatcher keeps its exhausted 503.
 pub struct UsageStrategy;
@@ -294,9 +297,10 @@ impl RoutingStrategy for UsageStrategy {
                 continue;
             }
             match group.score {
-                Some(score) if score.rate.is_finite() && score.rate > 0.0 => {
-                    scored.push((group, dynamic_weight(score.rate)))
-                }
+                Some(score) if score.rate.is_finite() && score.rate > 0.0 => scored.push((
+                    group,
+                    dynamic_weight(score.rate) * window_boost(score.window),
+                )),
                 Some(_) | None => fallback.push((group, 1.0)),
             }
         }
@@ -375,6 +379,7 @@ fn usage_candidate(
         let mut value = serde_json::json!({
             "rate": (s.rate * 1000.0).round() / 1000.0,
             "window": s.window,
+            "window_boost": (window_boost(s.window) * 1000.0).round() / 1000.0,
             "remaining_quota_pct": (s.remaining_quota * 10.0).round() / 10.0,
         });
         if let Some(remaining_time) = s.remaining_time {
@@ -1110,6 +1115,168 @@ mod tests {
             .find(|c| c.provider == "mystery")
             .unwrap();
         assert_eq!(mystery.score.as_ref().unwrap()["state"], "unknown_quota");
+    }
+
+    #[test]
+    fn weekly_perishability_beats_monthly_at_equal_rate() {
+        // Two on-pace providers (rate 1.0) used to tie 50/50; the weekly one
+        // now wins by exactly the window boost: 2.0702 / 3.0702 = 0.6743.
+        let quota = ProviderQuotaRegistry::new();
+        let now = chrono::Utc::now();
+        let half_week_ahead = (now + chrono::Duration::hours(84)).to_rfc3339();
+        let half_month_ahead = (now + chrono::Duration::hours(15 * 24)).to_rfc3339();
+        quota.observe(
+            "weekly",
+            &[QuotaTierObservation {
+                name: "weekly_limit".to_string(),
+                used_percent: 50.0,
+                resets_at: Some(half_week_ahead),
+            }],
+            None,
+        );
+        quota.observe(
+            "monthly",
+            &[QuotaTierObservation {
+                name: "monthly".to_string(),
+                used_percent: 50.0,
+                resets_at: Some(half_month_ahead),
+            }],
+            None,
+        );
+        let targets = vec![
+            backend("1", "weekly", "m", 100),
+            backend("2", "monthly", "m", 100),
+        ];
+
+        let (_, decision) = TargetSelector::select_ordered_traced(
+            "usage",
+            &targets,
+            &LatencyRegistry::new(),
+            &quota,
+            &HealthRegistry::new(),
+        );
+
+        let weekly = decision
+            .candidates
+            .iter()
+            .find(|c| c.provider == "weekly")
+            .unwrap();
+        let monthly = decision
+            .candidates
+            .iter()
+            .find(|c| c.provider == "monthly")
+            .unwrap();
+        assert_eq!(weekly.score.as_ref().unwrap()["window"], "weekly_limit");
+        assert_eq!(weekly.score.as_ref().unwrap()["window_boost"], 2.07);
+        assert_eq!(monthly.score.as_ref().unwrap()["window_boost"], 1.0);
+        assert!((weekly.share.unwrap() - 0.6743).abs() < 0.005);
+        assert!((monthly.share.unwrap() - 0.3257).abs() < 0.005);
+    }
+
+    #[test]
+    fn same_window_providers_keep_pure_cubed_shares() {
+        // The boost cancels within one window class: weekly rates 1.2 vs 0.9
+        // keep the pure-cube split 1.728 : 0.729 = 0.7033 : 0.2967.
+        let quota = ProviderQuotaRegistry::new();
+        let half_week_ahead = (chrono::Utc::now() + chrono::Duration::hours(84)).to_rfc3339();
+        for (provider, used) in [("fastish", 40.0), ("slowish", 55.0)] {
+            quota.observe(
+                provider,
+                &[QuotaTierObservation {
+                    name: "weekly_limit".to_string(),
+                    used_percent: used,
+                    resets_at: Some(half_week_ahead.clone()),
+                }],
+                None,
+            );
+        }
+        let targets = vec![
+            backend("1", "fastish", "m", 100),
+            backend("2", "slowish", "m", 100),
+        ];
+
+        let (_, decision) = TargetSelector::select_ordered_traced(
+            "usage",
+            &targets,
+            &LatencyRegistry::new(),
+            &quota,
+            &HealthRegistry::new(),
+        );
+
+        let fastish = decision
+            .candidates
+            .iter()
+            .find(|c| c.provider == "fastish")
+            .unwrap();
+        let slowish = decision
+            .candidates
+            .iter()
+            .find(|c| c.provider == "slowish")
+            .unwrap();
+        // Same boost on both sides: shares equal the pure rate³ shares.
+        assert!((fastish.share.unwrap() - 0.7033).abs() < 0.002);
+        assert!((slowish.share.unwrap() - 0.2967).abs() < 0.002);
+    }
+
+    #[test]
+    fn production_fixture_weekly_surplus_takes_four_fifths() {
+        // Real route_decision from request 44262e73 (2026-08-30): GLM
+        // weekly 99.0% quota / 81.3% of the window left vs Volcano monthly
+        // 76.8% / 78.9%. Pure rate³ split was 66/34; the perishability
+        // boost moves it to ~80/20 (weights 1.8051×2.0702 vs 0.9223).
+        let quota = ProviderQuotaRegistry::new();
+        let now = chrono::Utc::now();
+        // 81.3% of the 7d window and 78.9% of the 30d window remain.
+        let weekly_reset = (now + chrono::Duration::milliseconds(491_702_400)).to_rfc3339();
+        let monthly_reset = (now + chrono::Duration::milliseconds(2_045_088_000)).to_rfc3339();
+        quota.observe(
+            "glm",
+            &[QuotaTierObservation {
+                name: "weekly_limit".to_string(),
+                used_percent: 1.0,
+                resets_at: Some(weekly_reset),
+            }],
+            None,
+        );
+        quota.observe(
+            "volcano",
+            &[QuotaTierObservation {
+                name: "monthly".to_string(),
+                used_percent: 23.2,
+                resets_at: Some(monthly_reset),
+            }],
+            None,
+        );
+        let targets = vec![
+            backend("1", "glm", "glm-5.3", 100),
+            backend("2", "volcano", "glm-5.3", 100),
+        ];
+
+        let (_, decision) = TargetSelector::select_ordered_traced(
+            "usage",
+            &targets,
+            &LatencyRegistry::new(),
+            &quota,
+            &HealthRegistry::new(),
+        );
+
+        let glm = decision
+            .candidates
+            .iter()
+            .find(|c| c.provider == "glm")
+            .unwrap();
+        let volcano = decision
+            .candidates
+            .iter()
+            .find(|c| c.provider == "volcano")
+            .unwrap();
+        assert_eq!(glm.score.as_ref().unwrap()["window"], "weekly_limit");
+        assert_eq!(glm.score.as_ref().unwrap()["window_boost"], 2.07);
+        assert_eq!(volcano.score.as_ref().unwrap()["window_boost"], 1.0);
+        assert!((glm.share.unwrap() - 0.80).abs() < 0.01);
+        assert!((volcano.share.unwrap() - 0.20).abs() < 0.01);
+        let ratio = glm.weight.unwrap() / volcano.weight.unwrap();
+        assert!((ratio - 4.05).abs() < 0.05, "weight ratio = {ratio}");
     }
 
     #[test]
