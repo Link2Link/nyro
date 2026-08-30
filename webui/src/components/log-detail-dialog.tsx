@@ -402,6 +402,7 @@ function scoreText(score: Record<string, unknown> | undefined): string {
   const parts: string[] = [];
   if (typeof score.rate === "number") parts.push(`r=${Number(score.rate.toFixed(2))}`);
   if (typeof score.window === "string") parts.push(score.window);
+  if (typeof score.window_boost === "number") parts.push(`×${score.window_boost}`);
   if (typeof score.remaining_quota_pct === "number") parts.push(`⌀${score.remaining_quota_pct}%`);
   if (typeof score.remaining_time_pct === "number") parts.push(`t ${score.remaining_time_pct}%`);
   if (typeof score.ttft_ms === "number") parts.push(`${score.ttft_ms}ms`);
