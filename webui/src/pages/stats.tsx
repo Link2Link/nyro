@@ -6,6 +6,7 @@ import type { StatsOverview, StatsTimeSeries, ModelStats, ProviderStats, ApiKeyS
 import { Zap, Clock, Activity, BarChart3 } from "lucide-react";
 import { ApiKeyUsageDialog } from "@/components/api-key-usage-dialog";
 import { ProviderUsageDialog } from "@/components/provider-usage-dialog";
+import { ModelUsageDialog } from "@/components/model-usage-dialog";
 import { ProviderIcon } from "@/components/ui/provider-icon";
 import { Button } from "@/components/ui/button";
 import { useLocale } from "@/lib/i18n";
@@ -45,12 +46,16 @@ export default function StatsPage() {
   const [hours, setHours] = useState(24);
   const [apiKeyDialog, setApiKeyDialog] = useState<{ open: boolean; apiKeyId: string | null }>({ open: false, apiKeyId: null });
   const [providerDialog, setProviderDialog] = useState<{ open: boolean; providerId: string | null }>({ open: false, providerId: null });
+  const [modelDialog, setModelDialog] = useState<{ open: boolean; model: string | null }>({ open: false, model: null });
 
   const openApiKeyDialog = (apiKeyId: string | null = null) => {
     setApiKeyDialog({ open: true, apiKeyId });
   };
   const openProviderDialog = (providerId: string | null = null) => {
     setProviderDialog({ open: true, providerId });
+  };
+  const openModelDialog = (model: string | null = null) => {
+    setModelDialog({ open: true, model });
   };
 
   const { data: overview } = useQuery<StatsOverview>({
@@ -433,8 +438,21 @@ export default function StatsPage() {
         initialApiKeyId={apiKeyDialog.apiKeyId}
       />
 
+      <ModelUsageDialog
+        open={modelDialog.open}
+        onOpenChange={(open) => setModelDialog((current) => ({ ...current, open }))}
+        initialHours={hours}
+        initialModel={modelDialog.model}
+      />
+
       <div className="glass rounded-2xl p-6">
-        <h3 className="mb-4 text-sm font-semibold text-slate-800">{isZh ? "模型 Token 统计（调用次数前 10）" : "Model Token Stats (Top 10 by Requests)"}</h3>
+        <div className="mb-4 flex items-center justify-between gap-3">
+          <h3 className="text-sm font-semibold text-slate-800">{isZh ? "模型 Token 统计（调用次数前 10）" : "Model Token Stats (Top 10 by Requests)"}</h3>
+          <Button variant="outline" size="sm" className="h-8 gap-1.5" onClick={() => openModelDialog()}>
+            <BarChart3 className="h-4 w-4" />
+            {isZh ? "查看详情" : "View Details"}
+          </Button>
+        </div>
         <div className="overflow-x-auto rounded-xl border border-white/70 bg-white/50">
           <table className="w-full text-sm">
             <thead className="bg-white/70 text-slate-500">
@@ -461,8 +479,27 @@ export default function StatsPage() {
                 const tps = m.total_upstream_ms > 0 && m.total_output_tokens > 0
                   ? m.total_output_tokens / (m.total_upstream_ms / 1000)
                   : null;
+                const clickable = m.model.length > 0;
                 return (
-                  <tr key={m.model} className="border-t border-white/70 text-slate-700">
+                  <tr
+                    key={m.model}
+                    {...(clickable
+                      ? {
+                          role: "button" as const,
+                          tabIndex: 0,
+                          onClick: () => openModelDialog(m.model),
+                          onKeyDown: (event: React.KeyboardEvent<HTMLTableRowElement>) => {
+                            if (event.key === "Enter" || event.key === " ") {
+                              event.preventDefault();
+                              openModelDialog(m.model);
+                            }
+                          },
+                        }
+                      : {})}
+                    className={clickable
+                      ? "cursor-pointer border-t border-white/70 text-slate-700 outline-none transition-colors hover:bg-blue-50/50 focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-blue-500"
+                      : "border-t border-white/70 text-slate-700"}
+                  >
                     <td className="px-4 py-2.5 font-medium">{m.model || "–"}</td>
                     <td className="px-4 py-2.5 text-right">{fmt(m.request_count)}</td>
                     <td className="px-4 py-2.5 text-right">{fmt(m.total_input_tokens)}</td>

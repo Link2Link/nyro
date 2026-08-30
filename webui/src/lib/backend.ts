@@ -243,6 +243,13 @@ function resolveHTTP(cmd: string, args?: Record<string, unknown>): HTTPMapping {
         url: `${base}/stats/api-keys/${encodeURIComponent(String(args?.id ?? ""))}${hours != null ? `?hours=${hours}` : ""}`,
       };
     }
+    case "get_model_usage_detail": {
+      const hours = args?.hours;
+      return {
+        method: "GET",
+        url: `${base}/stats/models/${encodeURIComponent(String(args?.model ?? ""))}${hours != null ? `?hours=${hours}` : ""}`,
+      };
+    }
 
     case "get_setting":
       return { method: "GET", url: `${base}/settings/${args?.key}` };

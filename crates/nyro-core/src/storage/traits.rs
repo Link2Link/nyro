@@ -6,9 +6,9 @@ use async_trait::async_trait;
 use crate::db::models::{
     ApiKeyStats, ApiKeyUsageDetail, ApiKeyWithBindings, CreateApiKey, CreateModel,
     CreateModelBackend, CreateProvider, LogPage, LogQuery, Model, ModelBackend, ModelStats,
-    ModelUsageStats, OAuthCredential, Provider, ProviderStats, ProviderUsageDetail, RequestLog,
-    StatsHourly, StatsOverview, StatsTimeBucket, UpdateApiKey, UpdateModel, UpdateProvider,
-    UpsertOAuthCredential,
+    ModelUsageDetail, ModelUsageStats, OAuthCredential, Provider, ProviderStats,
+    ProviderUsageDetail, RequestLog, StatsHourly, StatsOverview, StatsTimeBucket, UpdateApiKey,
+    UpdateModel, UpdateProvider, UpsertOAuthCredential,
 };
 use crate::logging::LogEntry;
 
@@ -177,6 +177,12 @@ pub trait LogStore: Send + Sync {
         start_at: i64,
         end_at: i64,
     ) -> anyhow::Result<ApiKeyUsageDetail>;
+    async fn model_usage_detail(
+        &self,
+        upstream_model: &str,
+        start_at: i64,
+        end_at: i64,
+    ) -> anyhow::Result<ModelUsageDetail>;
 }
 
 #[async_trait]

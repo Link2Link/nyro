@@ -907,6 +907,61 @@ pub struct ApiKeyStats {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelUsageDetail {
+    pub start_at: i64,
+    pub end_at: i64,
+    pub upstream_model: String,
+    pub request_count: i64,
+    pub success_count: i64,
+    pub error_count: i64,
+    pub total_input_tokens: i64,
+    pub total_output_tokens: i64,
+    pub total_cache_read_tokens: i64,
+    pub avg_duration_ms: f64,
+    pub avg_first_token_ms: Option<f64>,
+    pub total_upstream_ms: f64,
+    pub last_used_at: Option<i64>,
+    pub providers: Vec<ModelProviderUsageStats>,
+    pub api_keys: Vec<ModelApiKeyUsageStats>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct ModelProviderUsageStats {
+    pub provider_id: String,
+    pub provider_name: String,
+    #[serde(default)]
+    #[sqlx(default)]
+    pub provider_icon: Option<String>,
+    #[serde(default)]
+    #[sqlx(default)]
+    pub provider_protocol: Option<String>,
+    pub request_count: i64,
+    pub error_count: i64,
+    pub total_input_tokens: i64,
+    pub total_output_tokens: i64,
+    pub total_cache_read_tokens: i64,
+    pub avg_duration_ms: f64,
+    pub avg_first_token_ms: Option<f64>,
+    pub total_upstream_ms: f64,
+    pub last_used_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct ModelApiKeyUsageStats {
+    pub api_key_id: String,
+    pub api_key_name: String,
+    pub request_count: i64,
+    pub error_count: i64,
+    pub total_input_tokens: i64,
+    pub total_output_tokens: i64,
+    pub total_cache_read_tokens: i64,
+    pub avg_duration_ms: f64,
+    pub avg_first_token_ms: Option<f64>,
+    pub total_upstream_ms: f64,
+    pub last_used_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TestResult {
     pub success: bool,
     pub latency_ms: u64,

@@ -280,6 +280,54 @@ export interface ApiKeyUsageDetail {
   model_routes: ApiKeyModelRouteStats[];
 }
 
+export interface ModelProviderUsageStats {
+  provider_id: string;
+  provider_name: string;
+  provider_icon?: string | null;
+  provider_protocol?: string | null;
+  request_count: number;
+  error_count: number;
+  total_input_tokens: number;
+  total_output_tokens: number;
+  total_cache_read_tokens: number;
+  avg_duration_ms: number;
+  avg_first_token_ms?: number | null;
+  total_upstream_ms: number;
+  last_used_at?: number | null;
+}
+
+export interface ModelApiKeyUsageStats {
+  api_key_id: string;
+  api_key_name: string;
+  request_count: number;
+  error_count: number;
+  total_input_tokens: number;
+  total_output_tokens: number;
+  total_cache_read_tokens: number;
+  avg_duration_ms: number;
+  avg_first_token_ms?: number | null;
+  total_upstream_ms: number;
+  last_used_at?: number | null;
+}
+
+export interface ModelUsageDetail {
+  start_at: number;
+  end_at: number;
+  upstream_model: string;
+  request_count: number;
+  success_count: number;
+  error_count: number;
+  total_input_tokens: number;
+  total_output_tokens: number;
+  total_cache_read_tokens: number;
+  avg_duration_ms: number;
+  avg_first_token_ms?: number | null;
+  total_upstream_ms: number;
+  last_used_at?: number | null;
+  providers: ModelProviderUsageStats[];
+  api_keys: ModelApiKeyUsageStats[];
+}
+
 export interface TestResult {
   success: boolean;
   latency_ms: number;

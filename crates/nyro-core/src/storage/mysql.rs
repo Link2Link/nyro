@@ -9,11 +9,11 @@ use std::time::Duration;
 use crate::db::models::{
     ApiKey, ApiKeyModelRouteStats, ApiKeyStats, ApiKeyUsageDetail, ApiKeyWithBindings,
     CreateApiKey, CreateModel, CreateModelBackend, CreateProvider, CreateProviderProtocolEndpoint,
-    LogPage, LogQuery, Model, ModelBackend, ModelStats, ModelUsageStats, ModelUsageTotals,
-    OAuthCredential, Provider, ProviderModelUsageStats, ProviderProtocolEndpoint, ProviderStats,
-    ProviderUsageDetail, RecentModelPerformance, RequestLog, StatsHourly, StatsOverview,
-    StatsTimeBucket, UpdateApiKey, UpdateModel, UpdateProvider, UpsertOAuthCredential,
-    is_valid_provider_auth_mode,
+    LogPage, LogQuery, Model, ModelApiKeyUsageStats, ModelBackend, ModelProviderUsageStats,
+    ModelStats, ModelUsageDetail, ModelUsageStats, ModelUsageTotals, OAuthCredential, Provider,
+    ProviderModelUsageStats, ProviderProtocolEndpoint, ProviderStats, ProviderUsageDetail,
+    RecentModelPerformance, RequestLog, StatsHourly, StatsOverview, StatsTimeBucket, UpdateApiKey,
+    UpdateModel, UpdateProvider, UpsertOAuthCredential, is_valid_provider_auth_mode,
 };
 use crate::logging::LogEntry;
 use crate::storage::sql::config::SqlBackendConfig;
@@ -1493,6 +1493,68 @@ impl LogStore for MysqlLogStore {
             avg_first_token_ms: summary.avg_first_token_ms,
             last_used_at: summary.last_used_at,
             model_routes,
+        })
+    }
+
+    async fn model_usage_detail(
+        &self,
+        upstream_model: &str,
+        start_at: i64,
+        end_at: i64,
+    ) -> anyhow::Result<ModelUsageDetail> {
+        #[derive(sqlx::FromRow)]
+        struct SummaryRow {
+            request_count: i64,
+            success_count: i64,
+            error_count: i64,
+            total_input_tokens: i64,
+            total_output_tokens: i64,
+            total_cache_read_tokens: i64,
+            avg_duration_ms: f64,
+            avg_first_token_ms: Option<f64>,
+            total_upstream_ms: f64,
+            last_used_at: Option<i64>,
+        }
+        let summary = sqlx::query_as::<_, SummaryRow>(
+            "SELECT COUNT(*) AS request_count,              CAST(COALESCE(SUM(CASE WHEN client_status_code >= 200 AND client_status_code < 300 THEN 1 ELSE 0 END), 0) AS SIGNED) AS success_count,              CAST(COALESCE(SUM(CASE WHEN client_status_code >= 400 THEN 1 ELSE 0 END), 0) AS SIGNED) AS error_count,              CAST(COALESCE(SUM(input_tokens), 0) AS SIGNED) AS total_input_tokens,              CAST(COALESCE(SUM(output_tokens), 0) AS SIGNED) AS total_output_tokens,              CAST(COALESCE(SUM(cache_read_tokens), 0) AS SIGNED) AS total_cache_read_tokens,              CAST(COALESCE(AVG(latency_total_ms), 0) AS DOUBLE) AS avg_duration_ms,              CAST(AVG(CASE WHEN stream_first_chunk_ms >= 0 THEN stream_first_chunk_ms END) AS DOUBLE) AS avg_first_token_ms,              CAST(COALESCE(SUM(latency_upstream_ms), 0) AS DOUBLE) AS total_upstream_ms,              CAST(MAX(created_at) AS SIGNED) AS last_used_at              FROM request_logs WHERE upstream_model = ? AND created_at >= ? AND created_at <= ?",
+        )
+        .bind(upstream_model)
+        .bind(start_at)
+        .bind(end_at)
+        .fetch_one(&self.pool)
+        .await?;
+        let providers = sqlx::query_as::<_, ModelProviderUsageStats>(
+            "WITH aggregated AS (SELECT provider_id, COUNT(*) AS request_count,              CAST(COALESCE(SUM(CASE WHEN client_status_code >= 400 THEN 1 ELSE 0 END), 0) AS SIGNED) AS error_count,              CAST(COALESCE(SUM(input_tokens), 0) AS SIGNED) AS total_input_tokens,              CAST(COALESCE(SUM(output_tokens), 0) AS SIGNED) AS total_output_tokens,              CAST(COALESCE(SUM(cache_read_tokens), 0) AS SIGNED) AS total_cache_read_tokens,              CAST(COALESCE(AVG(latency_total_ms), 0) AS DOUBLE) AS avg_duration_ms,              CAST(AVG(CASE WHEN stream_first_chunk_ms >= 0 THEN stream_first_chunk_ms END) AS DOUBLE) AS avg_first_token_ms,              CAST(COALESCE(SUM(latency_upstream_ms), 0) AS DOUBLE) AS total_upstream_ms,              CAST(MAX(created_at) AS SIGNED) AS last_used_at              FROM request_logs WHERE upstream_model = ? AND provider_id IS NOT NULL AND TRIM(provider_id) <> ''              AND created_at >= ? AND created_at <= ? GROUP BY provider_id)              SELECT a.provider_id, COALESCE((SELECT NULLIF(TRIM(r.provider_name), '') FROM request_logs r              WHERE r.provider_id = a.provider_id AND NULLIF(TRIM(r.provider_name), '') IS NOT NULL              ORDER BY r.created_at DESC, r.id DESC LIMIT 1), a.provider_id) AS provider_name,              CAST(NULL AS CHAR) AS provider_icon, CAST(NULL AS CHAR) AS provider_protocol,              a.request_count, a.error_count, a.total_input_tokens, a.total_output_tokens,              a.total_cache_read_tokens, a.avg_duration_ms, a.avg_first_token_ms, a.total_upstream_ms,              a.last_used_at FROM aggregated a ORDER BY a.request_count DESC, a.provider_id ASC",
+        )
+        .bind(upstream_model)
+        .bind(start_at)
+        .bind(end_at)
+        .fetch_all(&self.pool)
+        .await?;
+        let api_keys = sqlx::query_as::<_, ModelApiKeyUsageStats>(
+            "WITH aggregated AS (SELECT api_key_id, COUNT(*) AS request_count,              CAST(COALESCE(SUM(CASE WHEN client_status_code >= 400 THEN 1 ELSE 0 END), 0) AS SIGNED) AS error_count,              CAST(COALESCE(SUM(input_tokens), 0) AS SIGNED) AS total_input_tokens,              CAST(COALESCE(SUM(output_tokens), 0) AS SIGNED) AS total_output_tokens,              CAST(COALESCE(SUM(cache_read_tokens), 0) AS SIGNED) AS total_cache_read_tokens,              CAST(COALESCE(AVG(latency_total_ms), 0) AS DOUBLE) AS avg_duration_ms,              CAST(AVG(CASE WHEN stream_first_chunk_ms >= 0 THEN stream_first_chunk_ms END) AS DOUBLE) AS avg_first_token_ms,              CAST(COALESCE(SUM(latency_upstream_ms), 0) AS DOUBLE) AS total_upstream_ms,              CAST(MAX(created_at) AS SIGNED) AS last_used_at              FROM request_logs WHERE upstream_model = ? AND api_key_id IS NOT NULL AND api_key_id <> ''              AND created_at >= ? AND created_at <= ? GROUP BY api_key_id)              SELECT a.api_key_id, COALESCE((SELECT NULLIF(r.api_key_name, '') FROM request_logs r              WHERE r.api_key_id = a.api_key_id ORDER BY r.created_at DESC, r.id DESC LIMIT 1),              a.api_key_id) AS api_key_name,              a.request_count, a.error_count, a.total_input_tokens, a.total_output_tokens,              a.total_cache_read_tokens, a.avg_duration_ms, a.avg_first_token_ms, a.total_upstream_ms,              a.last_used_at FROM aggregated a ORDER BY a.request_count DESC, a.api_key_id ASC",
+        )
+        .bind(upstream_model)
+        .bind(start_at)
+        .bind(end_at)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(ModelUsageDetail {
+            start_at,
+            end_at,
+            upstream_model: upstream_model.to_string(),
+            request_count: summary.request_count,
+            success_count: summary.success_count,
+            error_count: summary.error_count,
+            total_input_tokens: summary.total_input_tokens,
+            total_output_tokens: summary.total_output_tokens,
+            total_cache_read_tokens: summary.total_cache_read_tokens,
+            avg_duration_ms: summary.avg_duration_ms,
+            avg_first_token_ms: summary.avg_first_token_ms,
+            total_upstream_ms: summary.total_upstream_ms,
+            last_used_at: summary.last_used_at,
+            providers,
+            api_keys,
         })
     }
 }

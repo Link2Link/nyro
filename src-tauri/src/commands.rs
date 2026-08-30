@@ -517,6 +517,18 @@ pub async fn get_api_key_usage_detail(
         .map_err(|e| e.to_string())
 }
 
+#[tauri::command]
+pub async fn get_model_usage_detail(
+    gw: State<'_, Gateway>,
+    model: String,
+    hours: Option<i32>,
+) -> Result<ModelUsageDetail, String> {
+    gw.admin()
+        .get_model_usage_detail(&model, hours)
+        .await
+        .map_err(|e| e.to_string())
+}
+
 // ── Settings ──
 
 #[tauri::command]

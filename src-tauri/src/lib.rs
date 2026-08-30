@@ -116,6 +116,7 @@ pub fn run() {
             commands::get_provider_usage_detail,
             commands::get_stats_by_api_key,
             commands::get_api_key_usage_detail,
+            commands::get_model_usage_detail,
             commands::get_setting,
             commands::set_setting,
             commands::get_gateway_status,

@@ -280,6 +280,54 @@ impl AdminService {
         }
         Ok(detail)
     }
+
+    pub async fn get_model_usage_detail(
+        &self,
+        upstream_model: &str,
+        hours: Option<i32>,
+    ) -> anyhow::Result<ModelUsageDetail> {
+        let hours = normalize_detail_hours(hours)?;
+        let end_at = Utc::now().timestamp_millis();
+        let start_at = end_at - i64::from(hours) * MILLIS_PER_HOUR;
+        let mut detail = self
+            .gw
+            .storage
+            .logs()
+            .model_usage_detail(upstream_model, start_at, end_at)
+            .await?;
+
+        let providers: HashMap<_, _> = self
+            .gw
+            .storage
+            .providers()
+            .list()
+            .await?
+            .into_iter()
+            .map(|provider| (provider.id.clone(), provider))
+            .collect();
+        for item in &mut detail.providers {
+            if let Some(provider) = providers.get(&item.provider_id) {
+                item.provider_name.clone_from(&provider.name);
+                item.provider_icon = provider.preset_key.clone().or(provider.vendor.clone());
+                item.provider_protocol = Some(provider.protocol.clone());
+            }
+        }
+
+        if let Some(store) = self.gw.storage.api_keys() {
+            let current_names: HashMap<_, _> = store
+                .list()
+                .await?
+                .into_iter()
+                .map(|key| (key.id, key.name))
+                .collect();
+            for item in &mut detail.api_keys {
+                if let Some(name) = current_names.get(&item.api_key_id) {
+                    item.api_key_name.clone_from(name);
+                }
+            }
+        }
+        Ok(detail)
+    }
 }
 
 #[cfg(test)]

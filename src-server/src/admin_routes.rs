@@ -136,6 +136,7 @@ pub fn create_router(gateway: Gateway, admin_token: Option<String>) -> Router {
         .route("/stats/hourly", get(stats_hourly))
         .route("/stats/timeseries", get(stats_timeseries))
         .route("/stats/models", get(stats_by_model))
+        .route("/stats/models/:id", get(model_usage_detail))
         .route("/stats/providers", get(stats_by_provider))
         .route("/stats/providers/:id", get(provider_usage_detail))
         .route("/stats/api-keys", get(stats_by_api_key))
@@ -776,6 +777,17 @@ async fn api_key_usage_detail(
     Query(params): Query<StatsRangeParams>,
 ) -> impl IntoResponse {
     match gw.admin().get_api_key_usage_detail(&id, params.hours).await {
+        Ok(v) => Json(serde_json::json!({ "data": v })).into_response(),
+        Err(e) => stats_detail_error(e),
+    }
+}
+
+async fn model_usage_detail(
+    State(gw): State<Gateway>,
+    Path(id): Path<String>,
+    Query(params): Query<StatsRangeParams>,
+) -> impl IntoResponse {
+    match gw.admin().get_model_usage_detail(&id, params.hours).await {
         Ok(v) => Json(serde_json::json!({ "data": v })).into_response(),
         Err(e) => stats_detail_error(e),
     }
