@@ -123,6 +123,18 @@ pub(crate) fn resolve_conversion(
     })
 }
 
+/// ChatGPT 消费级 Responses 上游渠道：codex OAuth 直连与 sub2api 中转。
+/// sub2api 转发的仍是同一 chatgpt.com/backend-api/codex 消费级后端，
+/// 出站体改写契约（参数剥离 / store / include / 强制流式）对两者一致。
+fn is_codex_consumer_channel(channel: &str) -> bool {
+    channel.eq_ignore_ascii_case("codex") || channel.eq_ignore_ascii_case("sub2api")
+}
+
+/// 消费级契约的完整判定：vendor 须为 openai 预设（codex / sub2api 渠道）。
+fn is_codex_consumer_vendor(vendor_id: &str, channel: &str) -> bool {
+    vendor_id.eq_ignore_ascii_case("openai") && is_codex_consumer_channel(channel)
+}
+
 pub(crate) fn supports_raw_wire_compat(
     ingress: ProtocolId,
     egress: ProtocolId,
@@ -140,9 +152,8 @@ pub(crate) fn supports_raw_wire_compat(
         .as_deref()
         .map(str::trim)
         .unwrap_or_default();
-    let openai_native = vendor_id.eq_ignore_ascii_case("openai")
-        || channel.eq_ignore_ascii_case("codex")
-        || channel.eq_ignore_ascii_case("sub2api");
+    let openai_native =
+        vendor_id.eq_ignore_ascii_case("openai") || is_codex_consumer_channel(channel);
 
     matches!(
         (ingress, egress),
@@ -209,9 +220,10 @@ pub(crate) fn resolve_raw_wire_compat(
             profile
         }
         (ANTHROPIC_MESSAGES_2023_06_01, OPENAI_RESPONSES_V1) => {
-            let flavor = if vendor_id.eq_ignore_ascii_case("openai")
-                && channel.eq_ignore_ascii_case("codex")
-            {
+            // sub2api 中转与 codex 直连同契约：统一 CodexOAuthResponses
+            // （store=false / include reasoning.encrypted_content / 剥离
+            // 采样参数 / 强制流式，见 transform_responses 的契约分支）。
+            let flavor = if is_codex_consumer_vendor(vendor_id, channel) {
                 UpstreamFlavor::CodexOAuthResponses
             } else if vendor_id.eq_ignore_ascii_case("xai") {
                 UpstreamFlavor::XaiStrictResponses
@@ -219,10 +231,7 @@ pub(crate) fn resolve_raw_wire_compat(
                 UpstreamFlavor::StandardResponses
             };
             let mut profile = ConversionProfile::anthropic_to_responses(client_stream, flavor);
-            if provider.fast_mode
-                && (channel.eq_ignore_ascii_case("sub2api")
-                    || channel.eq_ignore_ascii_case("codex"))
-            {
+            if provider.fast_mode && is_codex_consumer_channel(channel) {
                 profile.codex_fast_mode = true;
             }
             profile
@@ -395,6 +404,35 @@ mod tests {
                 "gpt-5",
             ));
         }
+    }
+
+    /// sub2api 中转与 codex 直连同后端契约：Anthropic→Responses 方向
+    /// 统一选择 CodexOAuthResponses flavor（store/include/采样参数剥离/
+    /// 强制流式），rule id 一致。
+    #[test]
+    fn sub2api_channel_selects_codex_oauth_flavor() {
+        let request = request("gpt-5", ANTHROPIC_MESSAGES_2023_06_01);
+        let selection = resolve_raw_wire_compat(ResolveRawWireCompatInput {
+            ingress: ANTHROPIC_MESSAGES_2023_06_01,
+            egress: OPENAI_RESPONSES_V1,
+            provider: &provider("openai", "sub2api"),
+            egress_base_url: "https://sub2api.com/v1",
+            actual_model: "gpt-5",
+            client_stream: false,
+            headers: &HeaderMap::new(),
+            raw_body: br#"{"model":"gpt-5","messages":[{"role":"user","content":"hello"}]}"#,
+            baseline_request: &request,
+            current_request: &request,
+        })
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(
+            selection.profile.upstream_flavor,
+            UpstreamFlavor::CodexOAuthResponses
+        );
+        assert_eq!(selection.rule_id(), "anthropic-to-responses-codex-oauth");
+        assert!(selection.profile.force_upstream_stream());
     }
 
     #[test]

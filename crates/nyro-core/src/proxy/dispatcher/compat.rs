@@ -1313,6 +1313,31 @@ mod tests {
         assert!(selected.profile.force_upstream_stream());
     }
 
+    /// sub2api 中转与 codex 直连同后端契约：flavor 与强制流式行为一致。
+    #[test]
+    fn selects_codex_oauth_responses_flavor_for_sub2api_channel() {
+        let request = request("virtual", ANTHROPIC_MESSAGES_2023_06_01);
+        let selected = select_via_resolver(
+            ANTHROPIC_MESSAGES_2023_06_01,
+            OPENAI_RESPONSES_V1,
+            &provider("openai", "sub2api"),
+            "https://sub2api.com/v1",
+            "gpt-5",
+            false,
+            &HeaderMap::new(),
+            br#"{"model":"virtual","messages":[{"role":"user","content":"hello"}]}"#,
+            &request,
+            &request,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            selected.profile.upstream_flavor,
+            UpstreamFlavor::CodexOAuthResponses
+        );
+        assert!(selected.profile.force_upstream_stream());
+    }
+
     #[test]
     fn enables_fast_mode_for_codex_oauth_responses() {
         let request = request("virtual", ANTHROPIC_MESSAGES_2023_06_01);

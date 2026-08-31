@@ -24,6 +24,14 @@ use crate::error::GatewayError;
 use crate::protocol::ids::{OPENAI_RESPONSES_V1, ProtocolId};
 use crate::provider::vendor::Vendor;
 
+/// ChatGPT 消费级上游渠道（codex OAuth 直连 / sub2api 中转）。sub2api
+/// 转发的仍是同一 chatgpt.com/backend-api/codex 消费级后端，出站体
+/// 改写（采样参数剥离、reasoning 无状态回放防御、工具调用 ID 规范化、
+/// Fast 模式注入）对两个渠道一致生效。
+fn is_codex_consumer_channel(channel: &str) -> bool {
+    channel.eq_ignore_ascii_case("codex") || channel.eq_ignore_ascii_case("sub2api")
+}
+
 /// OpenAI Responses 渠道开关「Fast 模式」：
 ///
 /// 开启后，转发到上游的 OpenAI Responses 请求如果缺少 `service_tier` 字段，
@@ -37,9 +45,10 @@ pub(crate) fn maybe_inject_openai_fast_mode(
     protocol: ProtocolId,
 ) {
     let is_openai_fast = provider.fast_mode
-        && provider.channel.as_deref().is_some_and(|channel| {
-            channel.eq_ignore_ascii_case("sub2api") || channel.eq_ignore_ascii_case("codex")
-        });
+        && provider
+            .channel
+            .as_deref()
+            .is_some_and(|channel| is_codex_consumer_channel(channel));
     if !is_openai_fast || protocol != OPENAI_RESPONSES_V1 {
         return;
     }
@@ -53,7 +62,8 @@ pub(crate) fn maybe_inject_openai_fast_mode(
     }
 }
 
-/// Codex 消费级上游（`chatgpt.com/backend-api/codex`）不接受 OpenAI Responses
+/// Codex 消费级上游（`chatgpt.com/backend-api/codex`，含 sub2api 等转发同一
+/// 后端的中转渠道）不接受 OpenAI Responses
 /// 的 `max_output_tokens`/`temperature`/`top_p` 参数（codex-rs 协议契约里
 /// 没有这些字段，OpenAI 自己的客户端不发它们）。原生直通与 IR 转码两条路径
 /// 转发前都需要剥离，否则上游返回 400 "Unsupported parameter: max_output_tokens"。
@@ -61,7 +71,7 @@ pub(crate) fn maybe_sanitize_codex_consumer_request(body: &mut Value, provider: 
     let is_codex = provider
         .channel
         .as_deref()
-        .is_some_and(|channel| channel.eq_ignore_ascii_case("codex"));
+        .is_some_and(|channel| is_codex_consumer_channel(channel));
     if !is_codex {
         return;
     }
@@ -72,7 +82,8 @@ pub(crate) fn maybe_sanitize_codex_consumer_request(body: &mut Value, provider: 
     }
 }
 
-/// Codex 消费级上游（`chatgpt.com/backend-api/codex`）对 Responses 的
+/// Codex 消费级上游（`chatgpt.com/backend-api/codex`，含 sub2api 中转）对
+/// Responses 的
 /// `reasoning` 输入项执行两层防御：
 ///
 /// 1. **schema 校验**：`content` 数组最大长度为 0（合法载体是 `summary`
@@ -111,7 +122,7 @@ pub(crate) fn sanitize_codex_reasoning_content(body: &mut Value, provider: &Prov
     let is_codex = provider
         .channel
         .as_deref()
-        .is_some_and(|channel| channel.eq_ignore_ascii_case("codex"));
+        .is_some_and(|channel| is_codex_consumer_channel(channel));
     if !is_codex {
         return;
     }
@@ -162,7 +173,8 @@ pub(crate) fn sanitize_codex_reasoning_content(body: &mut Value, provider: &Prov
     }
 }
 
-/// Codex 消费级上游对工具调用项的 `id` 有硬前缀契约：
+/// Codex 消费级上游（codex 直连与 sub2api 中转）对工具调用项的 `id` 有
+/// 硬前缀契约：
 /// `custom_tool_call.id` 必须以 `ctc` 开头（配对 output 为 `ctco_`），
 /// `function_call.id` 必须以 `fc` 开头。多后端路由把会话中途切到中转再
 /// 切回来时，中转轮返回的工具调用可能带它自己的 ID 体系（如
@@ -178,7 +190,7 @@ pub(crate) fn sanitize_codex_tool_call_ids(body: &mut Value, provider: &Provider
     let is_codex = provider
         .channel
         .as_deref()
-        .is_some_and(|channel| channel.eq_ignore_ascii_case("codex"));
+        .is_some_and(|channel| is_codex_consumer_channel(channel));
     if !is_codex {
         return;
     }
@@ -1239,42 +1251,48 @@ mod tests {
         );
     }
 
-    /// Codex 消费级上游：直通路径剥离其拒绝的 max_output_tokens/temperature/top_p。
+    /// Codex 消费级上游（codex 直连 / sub2api 中转）：直通路径剥离其拒绝的
+    /// max_output_tokens/temperature/top_p。
     #[tokio::test]
-    async fn passthrough_strips_rejected_params_for_codex_channel() {
+    async fn passthrough_strips_rejected_params_for_codex_consumer_channels() {
         let gw = build_test_gateway().await;
-        let provider = provider_with_channel("", Some("codex"), false);
-        let ctx = responses_ctx(&provider, &gw);
+        for channel in ["codex", "sub2api"] {
+            let provider = provider_with_channel("", Some(channel), false);
+            let ctx = responses_ctx(&provider, &gw);
 
-        let out = passthrough_run(
-            &FakeApiKeyVendor,
-            serde_json::json!({
-                "model": "gpt-5-codex",
-                "input": "ping",
-                "max_output_tokens": 4096,
-                "temperature": 0.7,
-                "top_p": 0.9,
-                "stream": true,
-            }),
-            &ctx,
-            true,
-        )
-        .await
-        .expect("passthrough succeeds");
+            let out = passthrough_run(
+                &FakeApiKeyVendor,
+                serde_json::json!({
+                    "model": "gpt-5-codex",
+                    "input": "ping",
+                    "max_output_tokens": 4096,
+                    "temperature": 0.7,
+                    "top_p": 0.9,
+                    "stream": true,
+                }),
+                &ctx,
+                true,
+            )
+            .await
+            .expect("passthrough succeeds");
 
-        assert!(
-            out.body.get("max_output_tokens").is_none(),
-            "codex consumer backend must not receive max_output_tokens",
-        );
-        assert!(
-            out.body.get("temperature").is_none(),
-            "codex consumer backend must not receive temperature",
-        );
-        assert!(
-            out.body.get("top_p").is_none(),
-            "codex consumer backend must not receive top_p",
-        );
-        assert_eq!(out.body["stream"], true, "stream must be preserved");
+            assert!(
+                out.body.get("max_output_tokens").is_none(),
+                "channel={channel}: consumer backend must not receive max_output_tokens",
+            );
+            assert!(
+                out.body.get("temperature").is_none(),
+                "channel={channel}: consumer backend must not receive temperature",
+            );
+            assert!(
+                out.body.get("top_p").is_none(),
+                "channel={channel}: consumer backend must not receive top_p",
+            );
+            assert_eq!(
+                out.body["stream"], true,
+                "channel={channel}: stream must be preserved",
+            );
+        }
     }
 
     #[test]
@@ -1324,7 +1342,7 @@ mod tests {
             "foreign function_call id gains the fc prefix",
         );
 
-        // 非 codex 渠道：不改写。
+        // 非消费级渠道：不改写。
         let mut body = serde_json::json!({
             "input": [
                 {"type": "custom_tool_call", "id": "fc_call_x", "name": "exec", "call_id": "call_x"}
@@ -1332,11 +1350,26 @@ mod tests {
         });
         sanitize_codex_tool_call_ids(
             &mut body,
-            &provider_with_channel("", Some("sub2api"), false),
+            &provider_with_channel("", Some("default"), false),
         );
         assert_eq!(
             body["input"][0]["id"], "fc_call_x",
-            "non-codex channels are untouched",
+            "non-consumer channels are untouched",
+        );
+
+        // sub2api 中转与 codex 同契约：外来 ID 同样规范化。
+        let mut body = serde_json::json!({
+            "input": [
+                {"type": "function_call", "id": "call_9f8e7d", "name": "wait", "call_id": "call_9f8e7d"}
+            ]
+        });
+        sanitize_codex_tool_call_ids(
+            &mut body,
+            &provider_with_channel("sk-sub2api", Some("sub2api"), false),
+        );
+        assert_eq!(
+            body["input"][0]["id"], "fc_call_9f8e7d",
+            "sub2api relay shares the codex consumer contract",
         );
 
         // 缺 id 的调用项：跳过（无 id 无从校验前缀）。
@@ -1352,18 +1385,31 @@ mod tests {
 
     #[test]
     fn sanitize_reasoning_content_unit_cases() {
-        // 非 codex 渠道：不做任何改动。
+        // 非消费级渠道：不做任何改动。
         let mut body = serde_json::json!({
             "input": [{"type": "reasoning", "content": [{"text": "x"}]}]
         });
         sanitize_codex_reasoning_content(
             &mut body,
-            &provider_with_channel("", Some("sub2api"), false),
+            &provider_with_channel("", Some("default"), false),
         );
         assert_eq!(
             body["input"][0]["content"].as_array().map(Vec::len),
             Some(1),
-            "non-codex channels must keep reasoning content untouched",
+            "non-consumer channels must keep reasoning content untouched",
+        );
+
+        // sub2api 中转与 codex 同契约：非空 content 同样剥掉。
+        let mut body = serde_json::json!({
+            "input": [{"type": "reasoning", "content": [{"text": "x"}]}]
+        });
+        sanitize_codex_reasoning_content(
+            &mut body,
+            &provider_with_channel("sk-sub2api", Some("sub2api"), false),
+        );
+        assert!(
+            body["input"][0].get("content").is_none(),
+            "sub2api relay shares the codex consumer contract",
         );
 
         // codex 渠道：空数组 content 保留（上游允许长度 0），非空剥掉。
@@ -1476,19 +1522,19 @@ mod tests {
             "blank encrypted_content is not usable",
         );
 
-        // 非 codex 渠道：store=false 也不剔除。
+        // 非消费级渠道：store=false 也不剔除。
         let mut body = serde_json::json!({
             "store": false,
             "input": [{"type": "reasoning", "content": [{"text": "x"}]}]
         });
         sanitize_codex_reasoning_content(
             &mut body,
-            &provider_with_channel("", Some("sub2api"), false),
+            &provider_with_channel("", Some("default"), false),
         );
         assert_eq!(
             body["input"].as_array().unwrap().len(),
             1,
-            "non-codex channels are untouched",
+            "non-consumer channels are untouched",
         );
     }
 
@@ -1537,7 +1583,7 @@ mod tests {
         sanitize_codex_reasoning_content(&mut body, &provider);
         assert_eq!(body["input"].as_array().unwrap().len(), 1);
 
-        // 非 codex 渠道：UUID 方言原样透传（中转上游自会解自己的密文）。
+        // 非消费级渠道：UUID 方言原样透传（普通中转上游自会解自己的密文）。
         let mut body = serde_json::json!({
             "store": false,
             "input": [{"type": "reasoning", "id": "rs_a44b4856-06b6-9e52-86c8-9d9d0c1a5d55",
@@ -1545,7 +1591,7 @@ mod tests {
         });
         sanitize_codex_reasoning_content(
             &mut body,
-            &provider_with_channel("", Some("sub2api"), false),
+            &provider_with_channel("", Some("default"), false),
         );
         assert_eq!(body["input"].as_array().unwrap().len(), 1);
 
@@ -1563,225 +1609,242 @@ mod tests {
         assert!(!super::is_native_codex_reasoning_id("resp_033b"));
     }
 
-    /// Codex 消费级上游：直通路径剥离 reasoning 项的非空 content。
-    /// 完整复现线上 400 现场：回放历史携带 `reasoning.content` 文本数组。
+    /// Codex 消费级上游（codex 直连 / sub2api 中转）：直通路径剥离 reasoning
+    /// 项的非空 content。完整复现线上 400 现场：回放历史携带
+    /// `reasoning.content` 文本数组。
     #[tokio::test]
-    async fn passthrough_strips_reasoning_content_for_codex_channel() {
+    async fn passthrough_strips_reasoning_content_for_codex_consumer_channels() {
         let gw = build_test_gateway().await;
-        let provider = provider_with_channel("", Some("codex"), false);
-        let ctx = responses_ctx(&provider, &gw);
+        for channel in ["codex", "sub2api"] {
+            let provider = provider_with_channel("", Some(channel), false);
+            let ctx = responses_ctx(&provider, &gw);
 
-        let out = passthrough_run(
-            &FakeApiKeyVendor,
-            serde_json::json!({
-                "model": "gpt-5.6-sol",
-                "stream": true,
-                "include": ["reasoning.encrypted_content"],
-                "input": [
-                    {"type": "message", "role": "user", "content": [
-                        {"type": "input_text", "text": "hi"}
-                    ]},
-                    {"type": "reasoning", "summary": [], "encrypted_content": "enc-1", "content": [
-                        {"text": "We need continue task. Need inspect files."}
-                    ]},
-                    {"type": "agent_message", "content": [
-                        {"type": "output_text", "text": "ok"}
-                    ]}
-                ]
-            }),
-            &ctx,
-            true,
-        )
-        .await
-        .expect("passthrough succeeds");
+            let out = passthrough_run(
+                &FakeApiKeyVendor,
+                serde_json::json!({
+                    "model": "gpt-5.6-sol",
+                    "stream": true,
+                    "include": ["reasoning.encrypted_content"],
+                    "input": [
+                        {"type": "message", "role": "user", "content": [
+                            {"type": "input_text", "text": "hi"}
+                        ]},
+                        {"type": "reasoning", "summary": [], "encrypted_content": "enc-1", "content": [
+                            {"text": "We need continue task. Need inspect files."}
+                        ]},
+                        {"type": "agent_message", "content": [
+                            {"type": "output_text", "text": "ok"}
+                        ]}
+                    ]
+                }),
+                &ctx,
+                true,
+            )
+            .await
+            .expect("passthrough succeeds");
 
-        let reasoning = &out.body["input"][1];
-        assert!(
-            reasoning.get("content").is_none(),
-            "codex consumer backend must not receive non-empty reasoning.content",
-        );
-        assert_eq!(
-            reasoning["encrypted_content"], "enc-1",
-            "encrypted_content must survive the strip",
-        );
-        assert_eq!(
-            out.body["input"][0]["content"].as_array().map(Vec::len),
-            Some(1),
-            "message item content must be untouched",
-        );
-        assert_eq!(
-            out.body["input"][2]["content"].as_array().map(Vec::len),
-            Some(1),
-            "agent_message item content must be untouched",
-        );
+            let reasoning = &out.body["input"][1];
+            assert!(
+                reasoning.get("content").is_none(),
+                "channel={channel}: consumer backend must not receive non-empty reasoning.content",
+            );
+            assert_eq!(
+                reasoning["encrypted_content"], "enc-1",
+                "channel={channel}: encrypted_content must survive the strip",
+            );
+            assert_eq!(
+                out.body["input"][0]["content"].as_array().map(Vec::len),
+                Some(1),
+                "channel={channel}: message item content must be untouched",
+            );
+            assert_eq!(
+                out.body["input"][2]["content"].as_array().map(Vec::len),
+                Some(1),
+                "channel={channel}: agent_message item content must be untouched",
+            );
+        }
     }
 
-    /// Codex 消费级上游：直通路径规范化外来工具调用 ID 前缀。完整复现
-    /// 线上 400 现场：多后端路由切到中转再切回，中转轮的 custom_tool_call
-    /// 带 `fc_call_` ID，回放给 codex 触发
+    /// Codex 消费级上游（codex 直连 / sub2api 中转）：直通路径规范化外来
+    /// 工具调用 ID 前缀。完整复现线上 400 现场：多后端路由切到中转再切回，
+    /// 中转轮的 custom_tool_call 带 `fc_call_` ID，回放给 codex 触发
     /// `Expected an ID that begins with 'ctc'`。
     #[tokio::test]
-    async fn passthrough_normalizes_foreign_tool_call_ids_for_codex() {
+    async fn passthrough_normalizes_foreign_tool_call_ids_for_codex_consumer_channels() {
         let gw = build_test_gateway().await;
-        let provider = provider_with_channel("", Some("codex"), false);
-        let ctx = responses_ctx(&provider, &gw);
+        for channel in ["codex", "sub2api"] {
+            let provider = provider_with_channel("", Some(channel), false);
+            let ctx = responses_ctx(&provider, &gw);
 
-        let out = passthrough_run(
-            &FakeApiKeyVendor,
-            serde_json::json!({
-                "model": "gpt-5.6-sol",
-                "stream": true,
-                "store": false,
-                "input": [
-                    {"type": "reasoning", "id": "rs_resp_202608252046531fe8808638bd475f",
-                     "summary": [], "encrypted_content": null,
-                     "content": [{"type": "reasoning_text", "text": "foreign"}]},
-                    {"type": "custom_tool_call", "id": "fc_call_71a12a780e464146864664b5",
-                     "name": "exec", "call_id": "call_71a12a780e464146864664b5",
-                     "input": "ls"},
-                    {"type": "custom_tool_call_output",
-                     "id": "ctco_01a038f6-400b-7f83-b64e-fb3a8b8c7ed5",
-                     "call_id": "call_71a12a780e464146864664b5",
-                     "output": [{"type": "input_text", "text": "done"}]}
-                ]
-            }),
-            &ctx,
-            true,
-        )
-        .await
-        .expect("passthrough succeeds");
+            let out = passthrough_run(
+                &FakeApiKeyVendor,
+                serde_json::json!({
+                    "model": "gpt-5.6-sol",
+                    "stream": true,
+                    "store": false,
+                    "input": [
+                        {"type": "reasoning", "id": "rs_resp_202608252046531fe8808638bd475f",
+                         "summary": [], "encrypted_content": null,
+                         "content": [{"type": "reasoning_text", "text": "foreign"}]},
+                        {"type": "custom_tool_call", "id": "fc_call_71a12a780e464146864664b5",
+                         "name": "exec", "call_id": "call_71a12a780e464146864664b5",
+                         "input": "ls"},
+                        {"type": "custom_tool_call_output",
+                         "id": "ctco_01a038f6-400b-7f83-b64e-fb3a8b8c7ed5",
+                         "call_id": "call_71a12a780e464146864664b5",
+                         "output": [{"type": "input_text", "text": "done"}]}
+                    ]
+                }),
+                &ctx,
+                true,
+            )
+            .await
+            .expect("passthrough succeeds");
 
-        // Foreign reasoning dropped by the stateless rule; the foreign
-        // custom_tool_call survives with a normalized ctc_ id and its
-        // call_id pairing intact.
-        let items = out.body["input"].as_array().unwrap();
-        assert_eq!(items.len(), 2, "foreign reasoning is dropped");
-        assert_eq!(
-            items[0]["id"], "ctc_fc_call_71a12a780e464146864664b5",
-            "foreign tool call id is normalized to the ctc prefix",
-        );
-        assert_eq!(
-            items[0]["call_id"], "call_71a12a780e464146864664b5",
-            "pairing call_id stays untouched",
-        );
-        assert_eq!(
-            items[1]["type"], "custom_tool_call_output",
-            "the paired output survives next to its (renamed) call",
-        );
+            // Foreign reasoning dropped by the stateless rule; the foreign
+            // custom_tool_call survives with a normalized ctc_ id and its
+            // call_id pairing intact.
+            let items = out.body["input"].as_array().unwrap();
+            assert_eq!(
+                items.len(),
+                2,
+                "channel={channel}: foreign reasoning is dropped"
+            );
+            assert_eq!(
+                items[0]["id"], "ctc_fc_call_71a12a780e464146864664b5",
+                "channel={channel}: foreign tool call id is normalized to the ctc prefix",
+            );
+            assert_eq!(
+                items[0]["call_id"], "call_71a12a780e464146864664b5",
+                "channel={channel}: pairing call_id stays untouched",
+            );
+            assert_eq!(
+                items[1]["type"], "custom_tool_call_output",
+                "channel={channel}: the paired output survives next to its (renamed) call",
+            );
+        }
     }
 
-    /// Codex 消费级上游：store=false 时整项剔除无法无状态重建的外来
-    /// reasoning 项。完整复现线上 404 现场：多后端路由中途切换 provider，
-    /// 中转铸造的 reasoning 项（未知 ID + null encrypted_content）回放到
-    /// codex 直连后端触发 `Item with id ... not found`。
+    /// Codex 消费级上游（codex 直连 / sub2api 中转）：store=false 时整项剔除
+    /// 无法无状态重建的外来 reasoning 项。完整复现线上 404 现场：多后端路由
+    /// 中途切换 provider，中转铸造的 reasoning 项（未知 ID + null
+    /// encrypted_content）回放到 codex 直连后端触发 `Item with id ... not found`。
     #[tokio::test]
-    async fn passthrough_drops_foreign_reasoning_items_for_stateless_codex() {
+    async fn passthrough_drops_foreign_reasoning_items_for_stateless_consumer_channels() {
         let gw = build_test_gateway().await;
-        let provider = provider_with_channel("", Some("codex"), false);
-        let ctx = responses_ctx(&provider, &gw);
+        for channel in ["codex", "sub2api"] {
+            let provider = provider_with_channel("", Some(channel), false);
+            let ctx = responses_ctx(&provider, &gw);
 
-        let out = passthrough_run(
-            &FakeApiKeyVendor,
-            serde_json::json!({
-                "model": "gpt-5.6-sol",
-                "stream": true,
-                "store": false,
-                "include": ["reasoning.encrypted_content"],
-                "input": [
-                    {"type": "message", "role": "user", "content": [
-                        {"type": "input_text", "text": "hi"}
-                    ]},
-                    {"type": "reasoning", "id": "rs_a44b485606b69e5286c89d9d0c1a5d55a44b485606b69e5286c89d9d0c1a5d55",
-                     "summary": [], "encrypted_content": "enc-native"},
-                    {"type": "reasoning", "id": "rs_resp_20260825194117052ba4e951a74c39",
-                     "summary": [], "encrypted_content": null,
-                     "content": [{"type": "reasoning_text", "text": "foreign relay thought"}]},
-                    {"type": "function_call", "id": "fc_call_65b6bc94615d4438a72cf450",
-                     "name": "f", "arguments": "{}"}
-                ]
-            }),
-            &ctx,
-            true,
-        )
-        .await
-        .expect("passthrough succeeds");
+            let out = passthrough_run(
+                &FakeApiKeyVendor,
+                serde_json::json!({
+                    "model": "gpt-5.6-sol",
+                    "stream": true,
+                    "store": false,
+                    "include": ["reasoning.encrypted_content"],
+                    "input": [
+                        {"type": "message", "role": "user", "content": [
+                            {"type": "input_text", "text": "hi"}
+                        ]},
+                        {"type": "reasoning", "id": "rs_a44b485606b69e5286c89d9d0c1a5d55a44b485606b69e5286c89d9d0c1a5d55",
+                         "summary": [], "encrypted_content": "enc-native"},
+                        {"type": "reasoning", "id": "rs_resp_20260825194117052ba4e951a74c39",
+                         "summary": [], "encrypted_content": null,
+                         "content": [{"type": "reasoning_text", "text": "foreign relay thought"}]},
+                        {"type": "function_call", "id": "fc_call_65b6bc94615d4438a72cf450",
+                         "name": "f", "arguments": "{}"}
+                    ]
+                }),
+                &ctx,
+                true,
+            )
+            .await
+            .expect("passthrough succeeds");
 
-        let items = out.body["input"].as_array().unwrap();
-        assert_eq!(
-            items.len(),
-            3,
-            "foreign reasoning item (unknown id, null encrypted_content) must be dropped",
-        );
-        assert_eq!(
-            items[1]["encrypted_content"], "enc-native",
-            "native reasoning replay survives",
-        );
-        assert_eq!(
-            items[2]["type"], "function_call",
-            "non-reasoning items survive",
-        );
-        assert_eq!(out.body["store"], false, "store flag is untouched");
+            let items = out.body["input"].as_array().unwrap();
+            assert_eq!(
+                items.len(),
+                3,
+                "channel={channel}: foreign reasoning item (unknown id, null encrypted_content) must be dropped",
+            );
+            assert_eq!(
+                items[1]["encrypted_content"], "enc-native",
+                "channel={channel}: native reasoning replay survives",
+            );
+            assert_eq!(
+                items[2]["type"], "function_call",
+                "channel={channel}: non-reasoning items survive",
+            );
+            assert_eq!(
+                out.body["store"], false,
+                "channel={channel}: store flag is untouched",
+            );
+        }
     }
 
     /// 完整复现线上 400 invalid_encrypted_content 现场（请求 06fbe5e2，
     /// 2026-08-27）：会话中途从中转切到 codex 直连，回放历史携带 13 项
     /// 中转铸造的 UUID 方言 reasoning 项（密文存在但本后端不可解密），
     /// 首个即被上游拒收。防御后：外来密文项整项剔除，请求可通过。
+    /// sub2api 中转与 codex 直连同后端契约，同样生效。
     #[tokio::test]
-    async fn passthrough_drops_foreign_minted_reasoning_for_stateless_codex() {
+    async fn passthrough_drops_foreign_minted_reasoning_for_stateless_consumer_channels() {
         let gw = build_test_gateway().await;
-        let provider = provider_with_channel("", Some("codex"), false);
-        let ctx = responses_ctx(&provider, &gw);
+        for channel in ["codex", "sub2api"] {
+            let provider = provider_with_channel("", Some(channel), false);
+            let ctx = responses_ctx(&provider, &gw);
 
-        let out = passthrough_run(
-            &FakeApiKeyVendor,
-            serde_json::json!({
-                "model": "gpt-5.6-sol",
-                "stream": true,
-                "store": false,
-                "include": ["reasoning.encrypted_content"],
-                "input": [
-                    {"type": "message", "role": "user", "content": [
-                        {"type": "input_text", "text": "hi"}
-                    ]},
-                    {"type": "reasoning", "id": "rs_a44b4856-06b6-9e52-86c8-9d9d0c1a5d55",
-                     "summary": [{"type": "summary_text", "text":
-                       "The user is asking what model I am."}],
-                     "encrypted_content": "TrvvClVDcSLW/nEEAMKLKvGP"},
-                    {"type": "message", "role": "assistant",
-                     "id": "msg_a44b4856-06b6-9e52-86c8-9d9d0c1a5d55",
-                     "content": [{"type": "output_text", "text": "ok"}]},
-                    {"type": "reasoning", "id": "rs_a44b485606b69e5286c89d9d0c1a5d55a44b485606b69e5286c89d9d0c1a5d55",
-                     "summary": [], "encrypted_content": "enc-native"}
-                ]
-            }),
-            &ctx,
-            true,
-        )
-        .await
-        .expect("passthrough succeeds");
+            let out = passthrough_run(
+                &FakeApiKeyVendor,
+                serde_json::json!({
+                    "model": "gpt-5.6-sol",
+                    "stream": true,
+                    "store": false,
+                    "include": ["reasoning.encrypted_content"],
+                    "input": [
+                        {"type": "message", "role": "user", "content": [
+                            {"type": "input_text", "text": "hi"}
+                        ]},
+                        {"type": "reasoning", "id": "rs_a44b4856-06b6-9e52-86c8-9d9d0c1a5d55",
+                         "summary": [{"type": "summary_text", "text":
+                           "The user is asking what model I am."}],
+                         "encrypted_content": "TrvvClVDcSLW/nEEAMKLKvGP"},
+                        {"type": "message", "role": "assistant",
+                         "id": "msg_a44b4856-06b6-9e52-86c8-9d9d0c1a5d55",
+                         "content": [{"type": "output_text", "text": "ok"}]},
+                        {"type": "reasoning", "id": "rs_a44b485606b69e5286c89d9d0c1a5d55a44b485606b69e5286c89d9d0c1a5d55",
+                         "summary": [], "encrypted_content": "enc-native"}
+                    ]
+                }),
+                &ctx,
+                true,
+            )
+            .await
+            .expect("passthrough succeeds");
 
-        let items = out.body["input"].as_array().unwrap();
-        assert_eq!(
-            items.len(),
-            3,
-            "foreign-minted reasoning (UUID dialect) must be dropped",
-        );
-        assert_eq!(
-            items[0]["type"], "message",
-            "the relay-minted reasoning item ahead of the message is gone",
-        );
-        assert_eq!(
-            items[2]["encrypted_content"], "enc-native",
-            "native reasoning replay survives",
-        );
+            let items = out.body["input"].as_array().unwrap();
+            assert_eq!(
+                items.len(),
+                3,
+                "channel={channel}: foreign-minted reasoning (UUID dialect) must be dropped",
+            );
+            assert_eq!(
+                items[0]["type"], "message",
+                "channel={channel}: the relay-minted reasoning item ahead of the message is gone",
+            );
+            assert_eq!(
+                items[2]["encrypted_content"], "enc-native",
+                "channel={channel}: native reasoning replay survives",
+            );
+        }
     }
 
-    /// 非 codex 渠道必须保留这些参数，直通行为不受影响。
+    /// 非消费级渠道必须保留这些参数，直通行为不受影响。
     #[tokio::test]
     async fn passthrough_keeps_rejected_params_for_other_channels() {
         let gw = build_test_gateway().await;
-        let provider = provider_with_channel("sk-sub2api", Some("sub2api"), false);
+        let provider = provider_with_channel("sk-other", Some("default"), false);
         let ctx = responses_ctx(&provider, &gw);
 
         let out = passthrough_run(
@@ -1799,34 +1862,37 @@ mod tests {
 
         assert_eq!(
             out.body["max_output_tokens"], 2048,
-            "non-codex channel must keep max_output_tokens",
+            "non-consumer channel must keep max_output_tokens",
         );
     }
 
-    /// IR 转码路径同样剥离：codex 渠道 encode 后清掉被拒绝的参数。
+    /// IR 转码路径同样剥离：消费级渠道（codex 直连 / sub2api 中转）encode
+    /// 后清掉被拒绝的参数。
     #[tokio::test]
-    async fn build_request_strips_rejected_params_for_codex_channel() {
+    async fn build_request_strips_rejected_params_for_codex_consumer_channels() {
         let gw = build_test_gateway().await;
-        let provider = provider_with_channel("", Some("codex"), false);
-        let ctx = responses_ctx(&provider, &gw);
-        let mut req = minimal_chat_request();
+        for channel in ["codex", "sub2api"] {
+            let provider = provider_with_channel("", Some(channel), false);
+            let ctx = responses_ctx(&provider, &gw);
+            let mut req = minimal_chat_request();
 
-        let out = build_request(&FakeApiKeyVendor, &mut req, &ctx)
-            .await
-            .expect("build_request succeeds");
+            let out = build_request(&FakeApiKeyVendor, &mut req, &ctx)
+                .await
+                .expect("build_request succeeds");
 
-        assert!(
-            out.body.get("max_output_tokens").is_none(),
-            "IR transcode path must strip max_output_tokens for codex channel",
-        );
-        assert!(
-            out.body.get("temperature").is_none(),
-            "IR transcode path must strip temperature for codex channel",
-        );
-        assert!(
-            out.body.get("top_p").is_none(),
-            "IR transcode path must strip top_p for codex channel",
-        );
+            assert!(
+                out.body.get("max_output_tokens").is_none(),
+                "channel={channel}: IR transcode path must strip max_output_tokens",
+            );
+            assert!(
+                out.body.get("temperature").is_none(),
+                "channel={channel}: IR transcode path must strip temperature",
+            );
+            assert!(
+                out.body.get("top_p").is_none(),
+                "channel={channel}: IR transcode path must strip top_p",
+            );
+        }
     }
 
     /// 客户端显式携带的 service_tier 拥有最终决定权，Fast 模式不得覆盖。
@@ -1877,7 +1943,7 @@ mod tests {
         );
     }
 
-    /// Fast 模式只属于 sub2api 渠道：其他渠道开启该标志也不会注入。
+    /// Fast 模式只属于 codex/sub2api 消费级渠道：其他渠道开启该标志也不注入。
     #[tokio::test]
     async fn passthrough_skips_service_tier_for_other_channels() {
         let gw = build_test_gateway().await;
@@ -1895,7 +1961,7 @@ mod tests {
 
         assert!(
             out.body.get("service_tier").is_none(),
-            "non-sub2api channel must not receive service_tier injection",
+            "non-consumer channel must not receive service_tier injection",
         );
     }
 
