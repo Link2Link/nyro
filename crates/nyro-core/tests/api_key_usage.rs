@@ -311,3 +311,60 @@ async fn log_filters_compose_and_list_omits_payloads() {
         .unwrap();
     assert_eq!(legacy.total, 1);
 }
+
+#[tokio::test]
+async fn model_time_buckets_group_by_key_model_and_window() {
+    let storage = setup().await;
+    let minute = 60_000_i64;
+    let bucket_ms = 5 * minute;
+
+    // key-a: two models sharing bucket 0, plus rows that must be excluded.
+    insert_log(&storage, "a", minute, "key-a", "K", Some("c1"), Some("p1"), Some("P1"), Some("m1"), 200, 10, 4, 2, 100, Some(80), Some(20)).await;
+    insert_log(&storage, "b", 2 * minute, "key-a", "K", Some("c1"), Some("p1"), Some("P1"), Some("m1"), 500, 20, 6, 3, 300, Some(280), None).await;
+    insert_log(&storage, "c", minute, "key-a", "K", Some("c2"), Some("p2"), Some("P2"), Some("m2"), 200, 7, 3, 1, 90, Some(70), Some(15)).await;
+    // Different key: excluded.
+    insert_log(&storage, "d", minute, "key-b", "K", Some("c1"), Some("p1"), Some("P1"), Some("m1"), 200, 99, 99, 99, 100, Some(80), None).await;
+    // Same key but past the window end: excluded.
+    insert_log(&storage, "e", 10 * minute, "key-a", "K", Some("c1"), Some("p1"), Some("P1"), Some("m1"), 200, 50, 50, 50, 100, Some(80), None).await;
+
+    let rows = storage
+        .logs()
+        .api_key_model_time_buckets("key-a", 0, 9 * minute, bucket_ms)
+        .await
+        .unwrap();
+
+    assert_eq!(rows.len(), 2);
+    // Ordered by upstream_model: m1 first.
+    assert_eq!(rows[0].upstream_model, "m1");
+    assert_eq!(rows[0].bucket_start, 0);
+    assert_eq!(rows[0].request_count, 2);
+    assert_eq!(rows[0].error_count, 1);
+    assert_eq!(rows[0].total_input_tokens, 30);
+    assert_eq!(rows[0].total_output_tokens, 10);
+    assert_eq!(rows[0].total_cache_read_tokens, 5);
+    assert_eq!(rows[0].avg_duration_ms, Some(200.0));
+
+    assert_eq!(rows[1].upstream_model, "m2");
+    assert_eq!(rows[1].request_count, 1);
+    assert_eq!(rows[1].error_count, 0);
+    assert_eq!(rows[1].total_input_tokens, 7);
+    assert_eq!(rows[1].total_output_tokens, 3);
+    assert_eq!(rows[1].total_cache_read_tokens, 1);
+
+    // Unknown key yields no rows; invalid bucket width is rejected.
+    assert!(
+        storage
+            .logs()
+            .api_key_model_time_buckets("nope", 0, minute, bucket_ms)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        storage
+            .logs()
+            .api_key_model_time_buckets("key-a", 0, minute, 0)
+            .await
+            .is_err()
+    );
+}

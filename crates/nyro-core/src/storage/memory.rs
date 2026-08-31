@@ -5,7 +5,8 @@ use tokio::sync::RwLock;
 
 use crate::db::models::{
     ApiKeyStats, ApiKeyUsageDetail, CreateModel, CreateProvider, LogPage, LogQuery, Model,
-    ModelStats, ModelUsageDetail, ModelUsageStats, OAuthCredential, Provider, ProviderStats,
+    ModelStats, ModelTimeBucket, ModelUsageDetail, ModelUsageStats, OAuthCredential, Provider,
+    ProviderStats,
     ProviderUsageDetail, RequestLog, StatsHourly, StatsOverview, StatsTimeBucket, UpdateModel,
     UpdateProvider, UpsertOAuthCredential,
 };
@@ -260,7 +261,18 @@ impl LogStore for MemoryStorage {
         _start_ms: i64,
         _end_ms: i64,
         _bucket_ms: i64,
+        _upstream_model: Option<&str>,
     ) -> anyhow::Result<Vec<StatsTimeBucket>> {
+        Ok(vec![])
+    }
+
+    async fn api_key_model_time_buckets(
+        &self,
+        _api_key_id: &str,
+        _start_ms: i64,
+        _end_ms: i64,
+        _bucket_ms: i64,
+    ) -> anyhow::Result<Vec<ModelTimeBucket>> {
         Ok(vec![])
     }
 
@@ -332,6 +344,7 @@ impl LogStore for MemoryStorage {
             avg_first_token_ms: None,
             last_used_at: None,
             model_routes: Vec::new(),
+            model_time_series: Vec::new(),
         })
     }
 
@@ -357,6 +370,7 @@ impl LogStore for MemoryStorage {
             last_used_at: None,
             providers: Vec::new(),
             api_keys: Vec::new(),
+            time_series: None,
         })
     }
 }

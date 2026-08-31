@@ -38,6 +38,7 @@ import type {
 } from "@/lib/types";
 import { cn } from "@/lib/utils";
 import { LogDetailDialog } from "@/components/log-detail-dialog";
+import { TokenTimeSeriesChart } from "@/components/token-time-series-chart";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -356,6 +357,7 @@ export function ModelUsageDialog({
                   <Overview
                     detail={detail.data}
                     zh={zh}
+                    showDateOnAxis={hours > 24}
                     onProvider={selectProvider}
                     onApiKey={selectApiKey}
                   />
@@ -493,11 +495,13 @@ function State({
 function Overview({
   detail,
   zh,
+  showDateOnAxis,
   onProvider,
   onApiKey,
 }: {
   detail: ModelUsageDetail;
   zh: boolean;
+  showDateOnAxis: boolean;
   onProvider: (value: string) => void;
   onApiKey: (value: string) => void;
 }) {
@@ -632,6 +636,31 @@ function Overview({
           </section>
         ))}
       </div>
+
+      {detail.time_series ? (
+        <section className="rounded-xl border border-slate-200 bg-white p-4 shadow-sm">
+          <div className="mb-3 flex items-center justify-between gap-2">
+            <div className="flex items-center gap-2">
+              <Zap className="h-4 w-4 text-blue-600" />
+              <h3 className="text-sm font-semibold">
+                {zh ? "Token 时序" : "Token Usage Over Time"}
+              </h3>
+            </div>
+            <span className="shrink-0 text-xs text-slate-400">
+              {zh
+                ? `${detail.time_series.bucket_minutes} 分钟/点`
+                : `${detail.time_series.bucket_minutes} min / point`}
+            </span>
+          </div>
+          <div className="h-48">
+            <TokenTimeSeriesChart
+              series={detail.time_series}
+              zh={zh}
+              showDateOnAxis={showDateOnAxis}
+            />
+          </div>
+        </section>
+      ) : null}
 
       <section>
         <div className="mb-3 flex items-center gap-2">

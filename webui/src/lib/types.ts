@@ -278,6 +278,14 @@ export interface ApiKeyUsageDetail {
   avg_first_token_ms?: number | null;
   last_used_at?: number | null;
   model_routes: ApiKeyModelRouteStats[];
+  /** Per-model token time series over the same window; absent on older servers. */
+  model_time_series?: ApiKeyModelTimeSeries[] | null;
+}
+
+/** Per-upstream-model token time series embedded in the API key detail. */
+export interface ApiKeyModelTimeSeries {
+  upstream_model: string;
+  series: StatsTimeSeries;
 }
 
 export interface ModelProviderUsageStats {
@@ -326,6 +334,8 @@ export interface ModelUsageDetail {
   last_used_at?: number | null;
   providers: ModelProviderUsageStats[];
   api_keys: ModelApiKeyUsageStats[];
+  /** Token time series over the same window; absent on older server builds. */
+  time_series?: StatsTimeSeries | null;
 }
 
 export interface TestResult {

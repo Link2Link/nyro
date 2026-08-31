@@ -134,7 +134,7 @@ impl AdminService {
             .gw
             .storage
             .logs()
-            .stats_time_buckets(start_at, end_at, bucket_ms)
+            .stats_time_buckets(start_at, end_at, bucket_ms, None)
             .await?;
         let has_data = !buckets.is_empty();
 
@@ -278,6 +278,59 @@ impl AdminService {
                 route.provider_name.clone_from(name);
             }
         }
+
+        // Per-model token time series over the exact same window as the
+        // summary cards, so trends and totals above can never disagree.
+        let bucket_minutes = time_series_bucket_minutes(hours);
+        let bucket_ms = i64::from(bucket_minutes) * MILLIS_PER_MINUTE;
+        let rows = self
+            .gw
+            .storage
+            .logs()
+            .api_key_model_time_buckets(api_key_id, start_at, end_at, bucket_ms)
+            .await?;
+        let mut by_model: HashMap<String, Vec<StatsTimeBucket>> = HashMap::new();
+        for row in rows {
+            by_model
+                .entry(row.upstream_model.clone())
+                .or_default()
+                .push(StatsTimeBucket {
+                    bucket_start: row.bucket_start,
+                    request_count: row.request_count,
+                    error_count: row.error_count,
+                    total_input_tokens: row.total_input_tokens,
+                    total_output_tokens: row.total_output_tokens,
+                    total_cache_read_tokens: row.total_cache_read_tokens,
+                    avg_duration_ms: row.avg_duration_ms,
+                });
+        }
+        let model_tokens = |item: &ApiKeyModelTimeSeries| {
+            item.series
+                .points
+                .iter()
+                .map(|point| point.total_input_tokens + point.total_output_tokens)
+                .sum::<i64>()
+        };
+        let mut model_time_series: Vec<ApiKeyModelTimeSeries> = by_model
+            .into_iter()
+            .map(|(upstream_model, buckets)| ApiKeyModelTimeSeries {
+                upstream_model,
+                series: StatsTimeSeries {
+                    start_at,
+                    end_at,
+                    bucket_minutes,
+                    has_data: !buckets.is_empty(),
+                    points: fill_time_buckets(buckets, start_at, end_at, bucket_ms),
+                },
+            })
+            .collect();
+        model_time_series.sort_by(|a, b| {
+            model_tokens(b)
+                .cmp(&model_tokens(a))
+                .then_with(|| a.upstream_model.cmp(&b.upstream_model))
+        });
+        detail.model_time_series = model_time_series;
+
         Ok(detail)
     }
 
@@ -326,6 +379,25 @@ impl AdminService {
                 }
             }
         }
+
+        // Token time series over the exact same window as the summary cards so
+        // the chart and the totals above it can never disagree.
+        let bucket_minutes = time_series_bucket_minutes(hours);
+        let bucket_ms = i64::from(bucket_minutes) * MILLIS_PER_MINUTE;
+        let buckets = self
+            .gw
+            .storage
+            .logs()
+            .stats_time_buckets(start_at, end_at, bucket_ms, Some(upstream_model))
+            .await?;
+        detail.time_series = Some(StatsTimeSeries {
+            start_at,
+            end_at,
+            bucket_minutes,
+            has_data: !buckets.is_empty(),
+            points: fill_time_buckets(buckets, start_at, end_at, bucket_ms),
+        });
+
         Ok(detail)
     }
 }

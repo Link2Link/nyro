@@ -669,6 +669,21 @@ pub struct StatsTimeSeries {
     pub points: Vec<StatsTimeBucket>,
 }
 
+/// One aggregated time bucket scoped to a single upstream model; produced by
+/// `LogStore::api_key_model_time_buckets` and split per model by the admin
+/// service.
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct ModelTimeBucket {
+    pub upstream_model: String,
+    pub bucket_start: i64,
+    pub request_count: i64,
+    pub error_count: i64,
+    pub total_input_tokens: i64,
+    pub total_output_tokens: i64,
+    pub total_cache_read_tokens: i64,
+    pub avg_duration_ms: Option<f64>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
 pub struct ModelStats {
     pub model: String,
@@ -876,6 +891,17 @@ pub struct ApiKeyUsageDetail {
     pub avg_first_token_ms: Option<f64>,
     pub last_used_at: Option<i64>,
     pub model_routes: Vec<ApiKeyModelRouteStats>,
+    /// Per-model token time series over the same start_at/end_at window;
+    /// empty when the payload predates this field or the key has no usage.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub model_time_series: Vec<ApiKeyModelTimeSeries>,
+}
+
+/// Per-model token time series embedded in `ApiKeyUsageDetail`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApiKeyModelTimeSeries {
+    pub upstream_model: String,
+    pub series: StatsTimeSeries,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
@@ -923,6 +949,10 @@ pub struct ModelUsageDetail {
     pub last_used_at: Option<i64>,
     pub providers: Vec<ModelProviderUsageStats>,
     pub api_keys: Vec<ModelApiKeyUsageStats>,
+    /// Token time series for the same start_at/end_at window; composed by the
+    /// admin service. Absent when the payload predates this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time_series: Option<StatsTimeSeries>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]

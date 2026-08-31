@@ -10,7 +10,8 @@ use crate::db::models::{
     ApiKey, ApiKeyModelRouteStats, ApiKeyStats, ApiKeyUsageDetail, ApiKeyWithBindings,
     CreateApiKey, CreateModel, CreateModelBackend, CreateProvider, CreateProviderProtocolEndpoint,
     LogPage, LogQuery, Model, ModelApiKeyUsageStats, ModelBackend, ModelProviderUsageStats,
-    ModelStats, ModelUsageDetail, ModelUsageStats, ModelUsageTotals, OAuthCredential, Provider,
+    ModelStats, ModelTimeBucket, ModelUsageDetail, ModelUsageStats, ModelUsageTotals,
+    OAuthCredential, Provider,
     ProviderModelUsageStats, ProviderProtocolEndpoint, ProviderStats, ProviderUsageDetail,
     RecentModelPerformance, RequestLog, StatsHourly, StatsOverview, StatsTimeBucket, UpdateApiKey,
     UpdateModel, UpdateProvider, UpsertOAuthCredential, is_valid_provider_auth_mode,
@@ -1268,13 +1269,36 @@ impl LogStore for MysqlLogStore {
         start_ms: i64,
         end_ms: i64,
         bucket_ms: i64,
+        upstream_model: Option<&str>,
     ) -> anyhow::Result<Vec<StatsTimeBucket>> {
         anyhow::ensure!(bucket_ms > 0, "stats bucket must be positive");
         Ok(sqlx::query_as::<_, StatsTimeBucket>(
-            "SELECT CAST(FLOOR(created_at / ?) * ? AS SIGNED) AS bucket_start, COUNT(*) AS request_count, CAST(COALESCE(SUM(CASE WHEN client_status_code >= 400 THEN 1 ELSE 0 END), 0) AS SIGNED) AS error_count, CAST(COALESCE(SUM(input_tokens), 0) AS SIGNED) AS total_input_tokens, CAST(COALESCE(SUM(output_tokens), 0) AS SIGNED) AS total_output_tokens, CAST(COALESCE(SUM(cache_read_tokens), 0) AS SIGNED) AS total_cache_read_tokens, CAST(AVG(latency_total_ms) AS DOUBLE) AS avg_duration_ms FROM request_logs WHERE created_at >= ? AND created_at <= ? GROUP BY bucket_start ORDER BY bucket_start ASC",
+            "SELECT CAST(FLOOR(created_at / ?) * ? AS SIGNED) AS bucket_start, COUNT(*) AS request_count, CAST(COALESCE(SUM(CASE WHEN client_status_code >= 400 THEN 1 ELSE 0 END), 0) AS SIGNED) AS error_count, CAST(COALESCE(SUM(input_tokens), 0) AS SIGNED) AS total_input_tokens, CAST(COALESCE(SUM(output_tokens), 0) AS SIGNED) AS total_output_tokens, CAST(COALESCE(SUM(cache_read_tokens), 0) AS SIGNED) AS total_cache_read_tokens, CAST(AVG(latency_total_ms) AS DOUBLE) AS avg_duration_ms FROM request_logs WHERE created_at >= ? AND created_at <= ? AND (? IS NULL OR upstream_model = ?) GROUP BY bucket_start ORDER BY bucket_start ASC",
         )
         .bind(bucket_ms)
         .bind(bucket_ms)
+        .bind(start_ms)
+        .bind(end_ms)
+        .bind(upstream_model)
+        .bind(upstream_model)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    async fn api_key_model_time_buckets(
+        &self,
+        api_key_id: &str,
+        start_ms: i64,
+        end_ms: i64,
+        bucket_ms: i64,
+    ) -> anyhow::Result<Vec<ModelTimeBucket>> {
+        anyhow::ensure!(bucket_ms > 0, "stats bucket must be positive");
+        Ok(sqlx::query_as::<_, ModelTimeBucket>(
+            "SELECT COALESCE(upstream_model, '') AS upstream_model, CAST(FLOOR(created_at / ?) * ? AS SIGNED) AS bucket_start, COUNT(*) AS request_count, CAST(COALESCE(SUM(CASE WHEN client_status_code >= 400 THEN 1 ELSE 0 END), 0) AS SIGNED) AS error_count, CAST(COALESCE(SUM(input_tokens), 0) AS SIGNED) AS total_input_tokens, CAST(COALESCE(SUM(output_tokens), 0) AS SIGNED) AS total_output_tokens, CAST(COALESCE(SUM(cache_read_tokens), 0) AS SIGNED) AS total_cache_read_tokens, CAST(AVG(latency_total_ms) AS DOUBLE) AS avg_duration_ms FROM request_logs WHERE api_key_id = ? AND created_at >= ? AND created_at <= ? GROUP BY upstream_model, bucket_start ORDER BY upstream_model ASC, bucket_start ASC",
+        )
+        .bind(bucket_ms)
+        .bind(bucket_ms)
+        .bind(api_key_id)
         .bind(start_ms)
         .bind(end_ms)
         .fetch_all(&self.pool)
@@ -1493,6 +1517,7 @@ impl LogStore for MysqlLogStore {
             avg_first_token_ms: summary.avg_first_token_ms,
             last_used_at: summary.last_used_at,
             model_routes,
+            model_time_series: Vec::new(),
         })
     }
 
@@ -1555,6 +1580,7 @@ impl LogStore for MysqlLogStore {
             last_used_at: summary.last_used_at,
             providers,
             api_keys,
+            time_series: None,
         })
     }
 }

@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use crate::db::models::{
     ApiKeyStats, ApiKeyUsageDetail, ApiKeyWithBindings, CreateApiKey, CreateModel,
     CreateModelBackend, CreateProvider, LogPage, LogQuery, Model, ModelBackend, ModelStats,
-    ModelUsageDetail, ModelUsageStats, OAuthCredential, Provider, ProviderStats,
+    ModelTimeBucket, ModelUsageDetail, ModelUsageStats, OAuthCredential, Provider, ProviderStats,
     ProviderUsageDetail, RequestLog, StatsHourly, StatsOverview, StatsTimeBucket, UpdateApiKey,
     UpdateModel, UpdateProvider, UpsertOAuthCredential,
 };
@@ -156,6 +156,7 @@ pub trait LogStore: Send + Sync {
         start_ms: i64,
         end_ms: i64,
         bucket_ms: i64,
+        upstream_model: Option<&str>,
     ) -> anyhow::Result<Vec<StatsTimeBucket>>;
     async fn stats_by_model(&self, hours: Option<i64>) -> anyhow::Result<Vec<ModelStats>>;
     async fn model_usage_stats(
@@ -177,6 +178,15 @@ pub trait LogStore: Send + Sync {
         start_at: i64,
         end_at: i64,
     ) -> anyhow::Result<ApiKeyUsageDetail>;
+    /// Time buckets grouped by upstream model for one API key; the admin
+    /// service splits the rows into per-model series.
+    async fn api_key_model_time_buckets(
+        &self,
+        api_key_id: &str,
+        start_ms: i64,
+        end_ms: i64,
+        bucket_ms: i64,
+    ) -> anyhow::Result<Vec<ModelTimeBucket>>;
     async fn model_usage_detail(
         &self,
         upstream_model: &str,

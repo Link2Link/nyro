@@ -1,16 +1,17 @@
 import { useQuery } from "@tanstack/react-query";
 import { useState } from "react";
-import { Line, LineChart, CartesianGrid, ResponsiveContainer, Tooltip, XAxis, YAxis, PieChart, Pie, Cell } from "recharts";
+import { PieChart, Pie, Cell, ResponsiveContainer, Tooltip } from "recharts";
 import { backend } from "@/lib/backend";
 import type { StatsOverview, StatsTimeSeries, ModelStats, ProviderStats, ApiKeyStats } from "@/lib/types";
 import { Zap, Clock, Activity, BarChart3 } from "lucide-react";
 import { ApiKeyUsageDialog } from "@/components/api-key-usage-dialog";
+import { TokenTimeSeriesChart } from "@/components/token-time-series-chart";
 import { ProviderUsageDialog } from "@/components/provider-usage-dialog";
 import { ModelUsageDialog } from "@/components/model-usage-dialog";
 import { ProviderIcon } from "@/components/ui/provider-icon";
 import { Button } from "@/components/ui/button";
 import { useLocale } from "@/lib/i18n";
-import { formatLocalBucketLabel, formatLocalBucketRange, formatLogTime, formatTps } from "@/lib/format";
+import { formatLogTime, formatTps } from "@/lib/format";
 import {
   Select,
   SelectContent,
@@ -89,12 +90,6 @@ export default function StatsPage() {
   });
 
   const showDateOnAxis = hours > 24;
-  const tokenChart = (timeSeries?.points ?? []).map((point) => ({
-    timestamp: point.bucket_start,
-    input: point.total_input_tokens,
-    output: point.total_output_tokens,
-    cache: point.total_cache_read_tokens,
-  }));
 
   const modelPie = modelStats.slice(0, 6).map((m) => ({
     name: m.model,
@@ -204,40 +199,7 @@ export default function StatsPage() {
             )}
           </div>
           <div className="h-48">
-            {timeSeries?.has_data ? (
-              <ResponsiveContainer width="100%" height="100%">
-                <LineChart data={tokenChart}>
-                  <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#e2e8f0" />
-                  <XAxis
-                    dataKey="timestamp"
-                    type="number"
-                    scale="time"
-                    domain={["dataMin", "dataMax"]}
-                    interval="preserveStartEnd"
-                    minTickGap={28}
-                    tick={{ fill: "#64748b", fontSize: 11 }}
-                    tickFormatter={(value) => formatLocalBucketLabel(value, showDateOnAxis)}
-                    axisLine={false}
-                    tickLine={false}
-                  />
-                  <YAxis tick={{ fill: "#64748b", fontSize: 11 }} axisLine={false} tickLine={false} width={50} tickFormatter={fmt} />
-                  <Tooltip
-                    formatter={chartTooltipFormatter}
-                    labelFormatter={(value) => formatLocalBucketRange(
-                      Number(value),
-                      timeSeries.bucket_minutes,
-                      timeSeries.start_at,
-                      timeSeries.end_at,
-                    )}
-                  />
-                  <Line type="monotone" dataKey="input" name={isZh ? "输入" : "Input"} stroke="#3b82f6" strokeWidth={2} dot={false} />
-                  <Line type="monotone" dataKey="cache" name={isZh ? "缓存命中" : "Cache"} stroke="#f59e0b" strokeWidth={2} dot={false} />
-                  <Line type="monotone" dataKey="output" name={isZh ? "输出" : "Output"} stroke="#10b981" strokeWidth={2} dot={false} />
-                </LineChart>
-              </ResponsiveContainer>
-            ) : (
-              <div className="flex h-full items-center justify-center text-sm text-slate-400">{isZh ? "暂无数据" : "No data"}</div>
-            )}
+            <TokenTimeSeriesChart series={timeSeries} zh={isZh} showDateOnAxis={showDateOnAxis} />
           </div>
         </div>
 

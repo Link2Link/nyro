@@ -37,6 +37,7 @@ import type {
 } from "@/lib/types";
 import { cn } from "@/lib/utils";
 import { LogDetailDialog } from "@/components/log-detail-dialog";
+import { ModelTokenTimeSeriesChart } from "@/components/model-token-time-series-chart";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -346,6 +347,7 @@ export function ApiKeyUsageDialog({
                   <Overview
                     detail={detail.data}
                     zh={zh}
+                    showDateOnAxis={hours > 24}
                     onRoute={selectRoute}
                   />
                 )}
@@ -470,10 +472,12 @@ function State({
 function Overview({
   detail,
   zh,
+  showDateOnAxis,
   onRoute,
 }: {
   detail: ApiKeyUsageDetail;
   zh: boolean;
+  showDateOnAxis: boolean;
   onRoute: (r: ApiKeyModelRouteStats) => void;
 }) {
   const rate = detail.request_count
@@ -588,6 +592,25 @@ function Overview({
           </section>
         ))}
       </div>
+
+      {detail.model_time_series?.length ? (
+        <section className="rounded-xl border border-slate-200 bg-white p-4 shadow-sm">
+          <div className="mb-3 flex items-center gap-2">
+            <Zap className="h-4 w-4 text-blue-600" />
+            <h3 className="text-sm font-semibold">
+              {zh ? "模型 Token 时序" : "Token Trends by Model"}
+            </h3>
+          </div>
+          <div className="h-64">
+            <ModelTokenTimeSeriesChart
+              series={detail.model_time_series}
+              zh={zh}
+              showDateOnAxis={showDateOnAxis}
+            />
+          </div>
+        </section>
+      ) : null}
+
       <section>
         <div className="mb-3 flex items-center gap-2">
           <Route className="h-4 w-4 text-blue-600" />

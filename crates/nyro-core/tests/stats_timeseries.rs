@@ -13,6 +13,7 @@ fn log_entry(
     cache_read_tokens: u32,
     status: i32,
     latency_ms: i64,
+    upstream_model: &str,
 ) -> LogEntry {
     LogEntry {
         api_key_id: None,
@@ -25,8 +26,8 @@ fn log_entry(
         model_id: Some("model-1".into()),
         model_name: Some("Model".into()),
         upstream_url: None,
-        client_model: "test-model".into(),
-        upstream_model: "test-model".into(),
+        client_model: upstream_model.into(),
+        upstream_model: upstream_model.into(),
         reasoning_effort: None,
 
         route_decision: None,
@@ -71,15 +72,15 @@ async fn sqlite_aggregates_epoch_buckets_and_boundaries() -> anyhow::Result<()> 
     storage
         .logs()
         .append_batch(vec![
-            log_entry(MINUTE_MS, 10, 5, 2, 200, 100),
-            log_entry(4 * MINUTE_MS, 20, 7, 3, 500, 300),
-            log_entry(bucket_ms, 7, 3, 2, 200, 500),
+            log_entry(MINUTE_MS, 10, 5, 2, 200, 100, "test-model"),
+            log_entry(4 * MINUTE_MS, 20, 7, 3, 500, 300, "test-model"),
+            log_entry(bucket_ms, 7, 3, 2, 200, 500, "test-model"),
         ])
         .await?;
 
     let buckets = storage
         .logs()
-        .stats_time_buckets(0, 10 * MINUTE_MS, bucket_ms)
+        .stats_time_buckets(0, 10 * MINUTE_MS, bucket_ms, None)
         .await?;
 
     assert_eq!(buckets.len(), 2);
@@ -102,10 +103,57 @@ async fn sqlite_aggregates_epoch_buckets_and_boundaries() -> anyhow::Result<()> 
     assert!(
         storage
             .logs()
-            .stats_time_buckets(0, 10 * MINUTE_MS, 0)
+            .stats_time_buckets(0, 10 * MINUTE_MS, 0, None)
             .await
             .is_err()
     );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn sqlite_filters_time_buckets_by_upstream_model() -> anyhow::Result<()> {
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await?;
+    db::migrate(&pool).await?;
+    let storage = SqliteStorage::from_pool(pool);
+    let bucket_ms = 5 * MINUTE_MS;
+
+    storage
+        .logs()
+        .append_batch(vec![
+            log_entry(MINUTE_MS, 10, 5, 2, 200, 100, "model-a"),
+            log_entry(2 * MINUTE_MS, 30, 7, 4, 200, 100, "model-a"),
+            log_entry(MINUTE_MS, 20, 6, 3, 200, 100, "model-b"),
+        ])
+        .await?;
+
+    let filtered = storage
+        .logs()
+        .stats_time_buckets(0, 10 * MINUTE_MS, bucket_ms, Some("model-a"))
+        .await?;
+    assert_eq!(filtered.len(), 1);
+    assert_eq!(filtered[0].bucket_start, 0);
+    assert_eq!(filtered[0].request_count, 2);
+    assert_eq!(filtered[0].total_input_tokens, 40);
+    assert_eq!(filtered[0].total_output_tokens, 12);
+    assert_eq!(filtered[0].total_cache_read_tokens, 6);
+
+    let unfiltered = storage
+        .logs()
+        .stats_time_buckets(0, 10 * MINUTE_MS, bucket_ms, None)
+        .await?;
+    assert_eq!(unfiltered.len(), 1);
+    assert_eq!(unfiltered[0].request_count, 3);
+    assert_eq!(unfiltered[0].total_input_tokens, 60);
+
+    let missing = storage
+        .logs()
+        .stats_time_buckets(0, 10 * MINUTE_MS, bucket_ms, Some("model-missing"))
+        .await?;
+    assert!(missing.is_empty());
 
     Ok(())
 }
