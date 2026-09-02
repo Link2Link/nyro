@@ -1048,7 +1048,9 @@ models:
         fallback: true
 "#;
         let cfg: YamlConfig = serde_yaml::from_str(yaml).expect("parse");
-        let err = cfg.validate().expect_err("two fallback rows must fail validation");
+        let err = cfg
+            .validate()
+            .expect_err("two fallback rows must fail validation");
         assert!(
             err.to_string().contains("only one fallback backend"),
             "unexpected error: {err}"
@@ -1072,7 +1074,9 @@ models:
         fallback: true
 "#;
         let cfg: YamlConfig = serde_yaml::from_str(yaml).expect("parse");
-        let err = cfg.validate().expect_err("fallback-only model must fail validation");
+        let err = cfg
+            .validate()
+            .expect_err("fallback-only model must fail validation");
         assert!(
             err.to_string().contains("non-fallback"),
             "unexpected error: {err}"

@@ -6,9 +6,8 @@ use tokio::sync::RwLock;
 use crate::db::models::{
     ApiKeyStats, ApiKeyUsageDetail, CreateModel, CreateProvider, LogPage, LogQuery, Model,
     ModelStats, ModelTimeBucket, ModelUsageDetail, ModelUsageStats, OAuthCredential, Provider,
-    ProviderStats,
-    ProviderUsageDetail, RequestLog, StatsHourly, StatsOverview, StatsTimeBucket, UpdateModel,
-    UpdateProvider, UpsertOAuthCredential,
+    ProviderStats, ProviderUsageDetail, RequestLog, StatsHourly, StatsOverview, StatsTimeBucket,
+    UpdateModel, UpdateProvider, UpsertOAuthCredential,
 };
 use crate::logging::LogEntry;
 

@@ -4,6 +4,31 @@ All notable changes to Nyro will be documented in this file.
 
 ---
 
+## v2.0.8
+
+> Released on 2026-09-03
+
+#### Features
+
+- **Model degraded fallback**: each model may flag exactly one backend row as `is_fallback` — a last-resort target excluded from every balance strategy and appended after all regular targets, so it is only called when every normal target is skipped (quota / breaker / disabled) or failed retryably; at most one per model and never the only row, validated on both Admin and YAML (`fallback: true`) paths across all storage backends, with decision snapshots recording `state: "fallback"` and the trailing rank
+- **Model usage detail**: per-model usage breakdown (GET /stats/models/:id + Tauri IPC) aggregating consumption by provider and API key, rendered as a WebUI detail dialog
+- **Token time-series charts**: model detail gains an input / cache / output token time-series chart from a shared component, API-key detail gains per-model multi-line charts with metric toggling, backed by `stats_time_buckets` upstream-model filtering and a new `api_key_model_time_buckets` grouped-bucket query across four backends
+- **sub2api consumer outbound contract**: sub2api providers now ride the CodexOAuthResponses flavor — the three outbound sanitization passes (parameter stripping, reasoning defense, tool-id normalization) extend to it, fast-mode / openai_native detection converges into a shared channel helper, and codex scenarios run parameterized over both channels
+- **Clear log payloads**: new clear_log_payloads surface (HTTP + Tauri + WebUI) permanently clears recorded request / response headers and bodies from non-error logs while preserving the log rows themselves and every 4xx/5xx error payload
+
+#### Improvements
+
+- **Usage window perishability weighting**: usage balance now weights targets by rate³ × (30d/W)^0.5 — monthly windows stay at 1.0, weekly ×2.07, five-hour capped at 4.0 — since shorter quota windows are easier to waste and faster to recover; route decision snapshots gain a window_boost field and the decision card renders the multiplier
+- **Model probe parsing**: SSE probe parsing rewritten around event blocks and multi-line data with an authoritative first terminal event, layered text/reasoning extraction with dedup (tool-call fields no longer misread as probe text), and Fast-mode injection on probe requests aligned with the outbound contract, covered by 16 new unit tests
+
+#### Fixes
+
+- **Codex Responses-Lite heartbeat outputs**: tool outputs whose call_id cannot be resolved are no longer rejected by consumer upstreams — inbound decoding falls back to the item's own id, the thirdparty compat layer normalizes tool-output call_ids, orphan outputs are dropped by reference reachability, previous_response_id entries are preserved, and the rewrite gate covers outputs without call_id
+- **Carrier message-ization**: Responses conversion skips additional_tools carrier items so strict upstreams no longer see null-content system messages (400), collapse_system_messages_to_head drops contentless system messages as defense-in-depth, and the log reasoning tier yields to the client tier when the enabled label carries no tier
+- **Privileged key authz**: privileged keys bypass model-binding checks and reach every model; JSON inbound parse failures are now recorded in request logs
+
+---
+
 ## v2.0.7
 
 > Released on 2026-08-28

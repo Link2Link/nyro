@@ -4,6 +4,31 @@ Nyro 的所有重要变更均记录在此文件中。
 
 ---
 
+## v2.0.8
+
+> 发布于 2026-09-03
+
+#### 新功能
+
+- **模型降级兜底**：每个模型可将恰好一个 backend 行标记为 `is_fallback` —— 兜底行不参与任何 balance 策略，统一追加在全部正常目标之后，仅当所有正常目标被跳过（配额/熔断/禁用）或可重试失败后才调用；每模型至多一行且不可为唯一行，Admin 与 YAML（`fallback: true`）双路径校验，四存储后端同步迁移，路由决策快照记录 `state: "fallback"` 与末位 rank
+- **模型用量明细**：新增按模型维度的用量下钻（GET /stats/models/:id + Tauri IPC），按 provider 与 API Key 聚合消耗统计，WebUI 弹窗展示
+- **Token 时序曲线**：模型详情新增输入/缓存/输出三线 Token 时序图（共享组件），密钥详情新增按模型分线的多线时序图并支持口径切换；`stats_time_buckets` 支持 upstream_model 过滤，新增 `api_key_model_time_buckets` 分组桶查询（四后端实现）
+- **sub2api 消费级出站契约**：sub2api 选用 CodexOAuthResponses flavor——三道出站消毒（参数剥离/reasoning 防御/工具 ID 规范化）扩展覆盖，fast 模式与 openai_native 判定收敛为共享渠道助手，codex 场景测试参数化覆盖双渠道
+- **清除日志载荷**：新增 clear_log_payloads 全链路面（HTTP + Tauri + WebUI），永久清除非报错日志已记录的请求/响应头与体，保留日志行本身及全部 4xx/5xx 错误载荷
+
+#### 优化
+
+- **usage 窗口易损性加权**：usage 路由权重升级为 rate³ × (30d/W)^0.5——月窗基准 1.0、周窗 ×2.07、5h 封顶 4.0（短窗配额更易作废且透支恢复更快）；路由决策快照新增 window_boost 字段，决策卡片展示乘子
+- **模型探测解析强化**：SSE 探测解析按事件块与多行 data 重写，首个终止事件语义权威；分层提取文本与推理并去重（工具调用字段不再误判为探测文本）；探测请求注入 Fast mode 对齐出站契约；新增 16 个单元测试
+
+#### 修复
+
+- **Codex Responses-Lite 心跳输出**：call_id 无法解析的工具输出不再被消费级上游拒绝——入口解码回退到项自身 id，thirdparty 兼容层归一化工具输出 call_id，孤儿输出按引用可连性剔除，previous_response_id 条目保留，重写门控覆盖无 call_id 的输出项
+- **载具消息化**：Responses 转换跳过 additional_tools 载具项，严格上游不再收到 content 为 null 的 system 消息（400）；collapse_system_messages_to_head 丢弃无 content 的 system 消息作纵深防御；日志推理档位在 enabled 标签无档位时让位客户端档位
+- **特权Key鉴权**：特权 Key 绕过模型绑定检查访问全部模型；JSON 入站解析失败现在也记录请求日志
+
+---
+
 ## v2.0.7
 
 > 发布于 2026-08-28

@@ -126,18 +126,22 @@ mod tests {
 
     #[test]
     fn duplicate_fallback_backends_are_rejected() {
-        let backends = vec![
-            backend_row("a", Some(true)),
-            backend_row("z", Some(true)),
-        ];
-        let err = ensure_model_backends_valid(&backends).unwrap_err().to_string();
-        assert!(err.contains("only one fallback backend"), "unexpected: {err}");
+        let backends = vec![backend_row("a", Some(true)), backend_row("z", Some(true))];
+        let err = ensure_model_backends_valid(&backends)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("only one fallback backend"),
+            "unexpected: {err}"
+        );
     }
 
     #[test]
     fn fallback_only_backend_list_is_rejected() {
         let backends = vec![backend_row("z", Some(true))];
-        let err = ensure_model_backends_valid(&backends).unwrap_err().to_string();
+        let err = ensure_model_backends_valid(&backends)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("non-fallback"), "unexpected: {err}");
     }
 }

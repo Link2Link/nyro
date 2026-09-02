@@ -319,13 +319,103 @@ async fn model_time_buckets_group_by_key_model_and_window() {
     let bucket_ms = 5 * minute;
 
     // key-a: two models sharing bucket 0, plus rows that must be excluded.
-    insert_log(&storage, "a", minute, "key-a", "K", Some("c1"), Some("p1"), Some("P1"), Some("m1"), 200, 10, 4, 2, 100, Some(80), Some(20)).await;
-    insert_log(&storage, "b", 2 * minute, "key-a", "K", Some("c1"), Some("p1"), Some("P1"), Some("m1"), 500, 20, 6, 3, 300, Some(280), None).await;
-    insert_log(&storage, "c", minute, "key-a", "K", Some("c2"), Some("p2"), Some("P2"), Some("m2"), 200, 7, 3, 1, 90, Some(70), Some(15)).await;
+    insert_log(
+        &storage,
+        "a",
+        minute,
+        "key-a",
+        "K",
+        Some("c1"),
+        Some("p1"),
+        Some("P1"),
+        Some("m1"),
+        200,
+        10,
+        4,
+        2,
+        100,
+        Some(80),
+        Some(20),
+    )
+    .await;
+    insert_log(
+        &storage,
+        "b",
+        2 * minute,
+        "key-a",
+        "K",
+        Some("c1"),
+        Some("p1"),
+        Some("P1"),
+        Some("m1"),
+        500,
+        20,
+        6,
+        3,
+        300,
+        Some(280),
+        None,
+    )
+    .await;
+    insert_log(
+        &storage,
+        "c",
+        minute,
+        "key-a",
+        "K",
+        Some("c2"),
+        Some("p2"),
+        Some("P2"),
+        Some("m2"),
+        200,
+        7,
+        3,
+        1,
+        90,
+        Some(70),
+        Some(15),
+    )
+    .await;
     // Different key: excluded.
-    insert_log(&storage, "d", minute, "key-b", "K", Some("c1"), Some("p1"), Some("P1"), Some("m1"), 200, 99, 99, 99, 100, Some(80), None).await;
+    insert_log(
+        &storage,
+        "d",
+        minute,
+        "key-b",
+        "K",
+        Some("c1"),
+        Some("p1"),
+        Some("P1"),
+        Some("m1"),
+        200,
+        99,
+        99,
+        99,
+        100,
+        Some(80),
+        None,
+    )
+    .await;
     // Same key but past the window end: excluded.
-    insert_log(&storage, "e", 10 * minute, "key-a", "K", Some("c1"), Some("p1"), Some("P1"), Some("m1"), 200, 50, 50, 50, 100, Some(80), None).await;
+    insert_log(
+        &storage,
+        "e",
+        10 * minute,
+        "key-a",
+        "K",
+        Some("c1"),
+        Some("p1"),
+        Some("P1"),
+        Some("m1"),
+        200,
+        50,
+        50,
+        50,
+        100,
+        Some(80),
+        None,
+    )
+    .await;
 
     let rows = storage
         .logs()

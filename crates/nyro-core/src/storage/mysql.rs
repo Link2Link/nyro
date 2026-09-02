@@ -11,10 +11,10 @@ use crate::db::models::{
     CreateApiKey, CreateModel, CreateModelBackend, CreateProvider, CreateProviderProtocolEndpoint,
     LogPage, LogQuery, Model, ModelApiKeyUsageStats, ModelBackend, ModelProviderUsageStats,
     ModelStats, ModelTimeBucket, ModelUsageDetail, ModelUsageStats, ModelUsageTotals,
-    OAuthCredential, Provider,
-    ProviderModelUsageStats, ProviderProtocolEndpoint, ProviderStats, ProviderUsageDetail,
-    RecentModelPerformance, RequestLog, StatsHourly, StatsOverview, StatsTimeBucket, UpdateApiKey,
-    UpdateModel, UpdateProvider, UpsertOAuthCredential, is_valid_provider_auth_mode,
+    OAuthCredential, Provider, ProviderModelUsageStats, ProviderProtocolEndpoint, ProviderStats,
+    ProviderUsageDetail, RecentModelPerformance, RequestLog, StatsHourly, StatsOverview,
+    StatsTimeBucket, UpdateApiKey, UpdateModel, UpdateProvider, UpsertOAuthCredential,
+    is_valid_provider_auth_mode,
 };
 use crate::logging::LogEntry;
 use crate::storage::sql::config::SqlBackendConfig;
