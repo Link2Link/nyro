@@ -50,6 +50,8 @@ export interface ModelBackend {
   model: string;
   weight: number;
   priority: number;
+  /** Last-resort fallback row: only called when all other targets are unavailable. */
+  is_fallback?: boolean;
   created_at: string;
 }
 
@@ -554,6 +556,7 @@ export interface CreateModelBackend {
   model: string;
   weight?: number;
   priority?: number;
+  is_fallback?: boolean;
 }
 
 export interface UpsertModelBackend {
@@ -562,6 +565,7 @@ export interface UpsertModelBackend {
   model: string;
   weight?: number;
   priority?: number;
+  is_fallback?: boolean;
 }
 
 export interface CreateApiKey {

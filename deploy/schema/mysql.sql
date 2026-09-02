@@ -78,6 +78,7 @@ CREATE TABLE IF NOT EXISTS model_backends (
     model VARCHAR(255) NOT NULL,
     weight INTEGER DEFAULT 100,
     priority INTEGER DEFAULT 1,
+    is_fallback TINYINT(1) NOT NULL DEFAULT 0,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (model_id) REFERENCES models(id) ON DELETE CASCADE,
     FOREIGN KEY (provider_id) REFERENCES providers(id)

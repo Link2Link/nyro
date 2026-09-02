@@ -318,6 +318,11 @@ pub struct ModelBackend {
     pub model: String,
     pub weight: i32,
     pub priority: i32,
+    /// Last-resort fallback row: excluded from balance strategies and
+    /// appended after every normal target, so the dispatcher only calls it
+    /// when all regular targets are unavailable.
+    #[serde(default)]
+    pub is_fallback: bool,
     pub created_at: String,
 }
 
@@ -562,6 +567,9 @@ pub struct CreateModelBackend {
     pub model: String,
     pub weight: Option<i32>,
     pub priority: Option<i32>,
+    /// Marks this row as the single last-resort fallback target.
+    #[serde(default)]
+    pub is_fallback: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -571,6 +579,9 @@ pub struct UpsertModelBackend {
     pub model: String,
     pub weight: Option<i32>,
     pub priority: Option<i32>,
+    /// Marks this row as the single last-resort fallback target.
+    #[serde(default)]
+    pub is_fallback: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

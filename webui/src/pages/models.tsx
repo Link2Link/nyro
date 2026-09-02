@@ -54,12 +54,13 @@ type ModelBackendForm = {
   model: string;
   weight: number;
   priority: number;
+  is_fallback: boolean;
 };
 
 const emptyCreate: ModelForm = {
   name: "",
   balance: "weighted",
-  targets: [{ provider_id: "", model: "", weight: 100, priority: 1 }],
+  targets: [{ provider_id: "", model: "", weight: 100, priority: 1, is_fallback: false }],
   enable_auth: true,
   enable_payload: true,
   force_max_reasoning: false,
@@ -393,6 +394,7 @@ type TargetRowProps = {
   providerOptions: Array<{ value: string; label: string; provider: Provider }>;
   providerMap: Map<string, Provider>;
   onUpdate: (index: number, patch: Partial<ModelBackendForm>) => void;
+  onSetFallback: (index: number) => void;
   onRemove: (index: number) => void;
   disableRemove: boolean;
 };
@@ -406,6 +408,7 @@ function TargetRow({
   providerOptions,
   providerMap,
   onUpdate,
+  onSetFallback,
   onRemove,
   disableRemove,
 }: TargetRowProps) {
@@ -461,9 +464,7 @@ function TargetRow({
     staleTime: 60_000,
   });
 
-  const rowClassName = balance === "weighted"
-    ? "grid w-full grid-cols-[minmax(0,2.8fr)_minmax(0,5.2fr)_minmax(0,1.25fr)_32px] items-center gap-2.5"
-    : "grid w-full grid-cols-[minmax(0,2.8fr)_minmax(0,5.2fr)_minmax(0,1.25fr)_32px] items-center gap-2.5";
+  const rowClassName = "grid w-full grid-cols-[minmax(0,2.8fr)_minmax(0,5.2fr)_minmax(0,1.25fr)_minmax(0,2fr)_32px] items-center gap-2.5";
 
   return (
     <div className="rounded-xl border border-slate-200 bg-white px-3 py-2.5">
@@ -522,7 +523,11 @@ function TargetRow({
           />
         )}
 
-        {balance === "weighted" || balance === "latency" || balance === "usage" ? (
+        {target.is_fallback ? (
+          <Badge variant="secondary" className="connect-label-badge justify-self-start bg-amber-50 text-amber-700">
+            {isZh ? "降级兜底" : "Fallback"}
+          </Badge>
+        ) : balance === "weighted" || balance === "latency" || balance === "usage" ? (
           <Input
             className="bg-white"
             type="number"
@@ -545,6 +550,17 @@ function TargetRow({
           />
         )}
 
+        <div className="flex items-center gap-1.5">
+          <Switch
+            checked={target.is_fallback}
+            onCheckedChange={() => onSetFallback(index)}
+            title={isZh ? "降级兜底：仅当其余目标全部不可用时才调用" : "Fallback: only called when all other targets are unavailable"}
+          />
+          <span className="whitespace-nowrap text-[11px] leading-none text-slate-500">
+            {isZh ? "兜底" : "Fallback"}
+          </span>
+        </div>
+
         <button
           type="button"
           onClick={() => onRemove(index)}
@@ -556,6 +572,13 @@ function TargetRow({
       </div>
       {providerHasModelDiscovery && modelCaps && (
         <ModelCapabilitySummary caps={modelCaps} isZh={isZh} />
+      )}
+      {target.is_fallback && (
+        <p className="mt-1.5 text-[11px] leading-snug text-amber-600">
+          {isZh
+            ? "降级兜底：仅当其余目标全部不可用时才会调用此目标；权重/优先级不参与路由。"
+            : "Last resort: only called when all other targets are unavailable; weight/priority do not apply."}
+        </p>
       )}
     </div>
   );
@@ -576,7 +599,7 @@ export default function ModelsPage() {
     ? {
         ...emptyCreate,
         name: prefillModel,
-        targets: [{ provider_id: prefillProviderId, model: prefillModel, weight: 100, priority: 1 }],
+        targets: [{ provider_id: prefillProviderId, model: prefillModel, weight: 100, priority: 1, is_fallback: false }],
       }
     : emptyCreate);
   const [editForm, setEditForm] = useState<(ModelForm & { id: string }) | null>(null);
@@ -679,8 +702,9 @@ export default function ModelsPage() {
           model: t.model,
           weight: t.weight ?? 100,
           priority: t.priority ?? 1,
+          is_fallback: t.is_fallback ?? false,
         }))
-      : [{ provider_id: route.target_provider, model: route.target_model, weight: 100, priority: 1 }];
+      : [{ provider_id: route.target_provider, model: route.target_model, weight: 100, priority: 1, is_fallback: false }];
     const visionHelpers = parseVisionShimHelpers(route.vision_shim, route.target_provider);
     setEditForm({
       id: route.id,
@@ -712,17 +736,42 @@ export default function ModelsPage() {
     });
   }
 
+  // Single-select fallback designation: enabling one row clears the others;
+  // clicking the already-fallback row turns the designation off.
+  function setCreateFallback(index: number) {
+    setCreateForm((prev) => ({
+      ...prev,
+      targets: prev.targets.map((target, idx) => ({
+        ...target,
+        is_fallback: idx === index ? !target.is_fallback : false,
+      })),
+    }));
+  }
+
+  function setEditFallback(index: number) {
+    setEditForm((prev) => {
+      if (!prev) return prev;
+      return {
+        ...prev,
+        targets: prev.targets.map((target, idx) => ({
+          ...target,
+          is_fallback: idx === index ? !target.is_fallback : false,
+        })),
+      };
+    });
+  }
+
 
   function addCreateTarget() {
     setCreateForm((prev) => ({
       ...prev,
-      targets: [...prev.targets, { provider_id: "", model: "", weight: 100, priority: 1 }],
+      targets: [...prev.targets, { provider_id: "", model: "", weight: 100, priority: 1, is_fallback: false }],
     }));
   }
 
   function addEditTarget() {
     setEditForm((prev) => (prev
-      ? { ...prev, targets: [...prev.targets, { provider_id: "", model: "", weight: 100, priority: 1 }] }
+      ? { ...prev, targets: [...prev.targets, { provider_id: "", model: "", weight: 100, priority: 1, is_fallback: false }] }
       : prev));
   }
 
@@ -835,6 +884,7 @@ export default function ModelsPage() {
                     providerOptions={providerOptions}
                     providerMap={providerMap}
                     onUpdate={updateCreateTarget}
+                    onSetFallback={setCreateFallback}
                     onRemove={removeCreateTarget}
                     disableRemove={createForm.targets.length <= 1}
                   />
@@ -1059,6 +1109,7 @@ export default function ModelsPage() {
                             providerOptions={providerOptions}
                             providerMap={providerMap}
                             onUpdate={updateEditTarget}
+                            onSetFallback={setEditFallback}
                             onRemove={removeEditTarget}
                             disableRemove={editForm.targets.length <= 1}
                           />
@@ -1208,6 +1259,11 @@ export default function ModelsPage() {
                     >
                       {balanceLabel(route.balance ?? "weighted", isZh)}
                     </Badge>
+                    {route.targets?.some((t) => t.is_fallback) && (
+                      <Badge variant="secondary" className="connect-label-badge bg-amber-50 text-amber-700">
+                        {isZh ? "降级兜底" : "Fallback"}
+                      </Badge>
+                    )}
                     <VisionShimBadge
                       raw={route.vision_shim}
                       fallbackProvider={route.target_provider}
@@ -1325,6 +1381,7 @@ function buildCreatePayload(form: ModelForm): CreateModel {
     model: target.model.trim(),
     weight: target.weight,
     priority: target.priority,
+    is_fallback: target.is_fallback,
   }));
   const primary = targets[0] ?? { provider_id: "", model: "" };
   return {
@@ -1347,6 +1404,7 @@ function buildUpdatePayload(form: ModelForm & { id: string }): UpdateModel {
     model: target.model.trim(),
     weight: target.weight,
     priority: target.priority,
+    is_fallback: target.is_fallback,
   }));
   const primary = targets[0] ?? { provider_id: "", model: "" };
   return {

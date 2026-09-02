@@ -401,6 +401,14 @@ pub async fn clear_logs(gw: State<'_, Gateway>) -> Result<u64, String> {
 }
 
 #[tauri::command]
+pub async fn clear_log_payloads(gw: State<'_, Gateway>) -> Result<u64, String> {
+    gw.admin()
+        .clear_log_payloads()
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 pub async fn delete_log(gw: State<'_, Gateway>, id: String) -> Result<u64, String> {
     gw.admin().delete_log(&id).await.map_err(|e| e.to_string())
 }

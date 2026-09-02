@@ -633,6 +633,8 @@ inventory::submit! { ExtensionRegistration { make: || Box::new(XxxChannel) } }
 
 **后端列表（model_backends）**：一个 Model 可绑定多个 backend，每个 backend 指向 `provider_id` + `model`，带 `weight`（weighted balance；usage 下拆分同 Provider 的 target）和 `priority`（priority balance）；后端健康状态在内存 `HealthRegistry` 管理，不入库。`ProviderQuotaRegistry` 同时保留最近一次权威用量窗口快照，供 usage balance 在请求热路径同步读取。
 
+**降级兜底（is_fallback）**：每个 Model 可将恰好一个 backend 行标记为降级兜底（`is_fallback=1`）。该行不参与任何 balance 策略，由 `TargetSelector` 统一追加在有序目标列表末尾——只有当所有正常目标被跳过（配额耗尽/熔断打开/provider 禁用）或可重试失败（408/429/5xx/529）后才会被调用；非可重试 4xx 仍立即返回客户端。兜底行同样受配额/熔断闸门约束（配额按 provider 生效，建议兜底放在不同 provider）。路由决策快照中该行记为 `state: "fallback"`、rank 排最后，被闸门跳过时同样记录 skip 原因。
+
 ### 8.2 API Token 模型
 
 Model 与 API Token 是**独立管理、多对多绑定**的关系（经 `api_key_models` 表）：
@@ -898,7 +900,7 @@ OnLog 阶段 + `ResponseStats` 已提供标准化的请求指标消费点（见 
 
 ### 12.8 Router 故障策略（部分已落地）
 
-已落地：多 backend 健康感知迭代（`HealthRegistry`）+ 四种 `balance` 策略 + 可重试状态码自动续跑。`latency` 由内存 `LatencyRegistry` 按流式首字延时 EWMA 排序，目标需连续 3 个流式样本并以三次均值入组，未满或超过 5 分钟保鲜窗时由真实流量乐观探测。`usage` 由 `ProviderQuotaRegistry` 的 last-good 窗口快照驱动：每个 Provider 只按其最大主窗口（月>周>5h）计算所需加速 `r=剩余额度%÷剩余时间%`，全部可评分 Provider 在单一池内按 `r³` × 窗口易损性加成 `(30d/W)^0.5`（月=1、周≈2.07、5h 封顶 4；短窗配额更易作废且透支恢复更快，故安全承载更大份额）加权随机（r>1 加速烧、r<1 让位、临近重置自动放大、上限 10）；未知用量 Provider 只作末级兜底，Provider 间等权、Provider 内按静态 target 权重排列。任何窗口达到 100% 仍触发配额硬过滤。待补充：指数退避 + jitter、可配置重试上限、单 backend 精细化熔断（滑动窗口）。
+已落地：多 backend 健康感知迭代（`HealthRegistry`）+ 四种 `balance` 策略 + 可重试状态码自动续跑 + 每模型单行降级兜底（`model_backends.is_fallback`，末位追加、仅在正常目标全部不可用时调用）。`latency` 由内存 `LatencyRegistry` 按流式首字延时 EWMA 排序，目标需连续 3 个流式样本并以三次均值入组，未满或超过 5 分钟保鲜窗时由真实流量乐观探测。`usage` 由 `ProviderQuotaRegistry` 的 last-good 窗口快照驱动：每个 Provider 只按其最大主窗口（月>周>5h）计算所需加速 `r=剩余额度%÷剩余时间%`，全部可评分 Provider 在单一池内按 `r³` × 窗口易损性加成 `(30d/W)^0.5`（月=1、周≈2.07、5h 封顶 4；短窗配额更易作废且透支恢复更快，故安全承载更大份额）加权随机（r>1 加速烧、r<1 让位、临近重置自动放大、上限 10）；未知用量 Provider 只作末级兜底，Provider 间等权、Provider 内按静态 target 权重排列。任何窗口达到 100% 仍触发配额硬过滤。待补充：指数退避 + jitter、可配置重试上限、单 backend 精细化熔断（滑动窗口）。
 
 ### 12.9 Transport 策略
 

@@ -718,7 +718,7 @@ struct PostgresModelBackendStore {
 impl ModelBackendStore for PostgresModelBackendStore {
     async fn list_backends_by_model(&self, model_id: &str) -> anyhow::Result<Vec<ModelBackend>> {
         Ok(sqlx::query_as::<_, ModelBackend>(
-            "SELECT id, model_id, provider_id, model, weight, priority, to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS') AS created_at FROM model_backends WHERE model_id = $1 ORDER BY priority ASC, created_at ASC",
+            "SELECT id, model_id, provider_id, model, weight, priority, is_fallback, to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS') AS created_at FROM model_backends WHERE model_id = $1 ORDER BY priority ASC, created_at ASC",
         )
         .bind(model_id)
         .fetch_all(&self.pool)
@@ -739,7 +739,7 @@ impl ModelBackendStore for PostgresModelBackendStore {
         for backend in backends {
             let id = uuid::Uuid::new_v4().to_string();
             sqlx::query(
-                "INSERT INTO model_backends (id, model_id, provider_id, model, weight, priority) VALUES ($1, $2, $3, $4, $5, $6)",
+                "INSERT INTO model_backends (id, model_id, provider_id, model, weight, priority, is_fallback) VALUES ($1, $2, $3, $4, $5, $6, $7)",
             )
             .bind(id)
             .bind(model_id)
@@ -747,6 +747,7 @@ impl ModelBackendStore for PostgresModelBackendStore {
             .bind(backend.model.trim())
             .bind(backend.weight.unwrap_or(100).max(0))
             .bind(backend.priority.unwrap_or(1).max(1))
+            .bind(backend.is_fallback.unwrap_or(false))
             .execute(&mut *tx)
             .await?;
         }
@@ -1202,6 +1203,25 @@ impl LogStore for PostgresLogStore {
         let result = sqlx::query("DELETE FROM request_logs")
             .execute(&self.pool)
             .await?;
+        Ok(result.rows_affected())
+    }
+
+    async fn clear_payloads(&self) -> anyhow::Result<u64> {
+        let result = sqlx::query(
+            "UPDATE request_logs SET \
+             client_request_headers = NULL, client_request_body = NULL, \
+             client_response_headers = NULL, client_response_body = NULL, \
+             upstream_request_headers = NULL, upstream_request_body = NULL, \
+             upstream_response_headers = NULL, upstream_response_body = NULL \
+             WHERE (client_request_headers IS NOT NULL OR client_request_body IS NOT NULL \
+                OR client_response_headers IS NOT NULL OR client_response_body IS NOT NULL \
+                OR upstream_request_headers IS NOT NULL OR upstream_request_body IS NOT NULL \
+                OR upstream_response_headers IS NOT NULL OR upstream_response_body IS NOT NULL) \
+               AND (client_status_code IS NULL OR client_status_code < 400 OR client_status_code > 599) \
+               AND (upstream_status_code IS NULL OR upstream_status_code < 400 OR upstream_status_code > 599)",
+        )
+        .execute(&self.pool)
+        .await?;
         Ok(result.rows_affected())
     }
 
@@ -1753,6 +1773,12 @@ END $$;"#,
         )
         .execute(self.adapter.pool())
         .await?;
+        // Add is_fallback column to model_backends (last-resort degraded fallback)
+        sqlx::query(
+            "ALTER TABLE model_backends ADD COLUMN IF NOT EXISTS is_fallback BOOLEAN NOT NULL DEFAULT FALSE",
+        )
+        .execute(self.adapter.pool())
+        .await?;
         // Rename settings key log_record_payloads → enable_payload
         sqlx::query(
             "UPDATE settings SET name = 'enable_payload' WHERE name = 'log_record_payloads'",
@@ -2188,6 +2214,7 @@ CREATE TABLE IF NOT EXISTS route_targets (
     model TEXT NOT NULL,
     weight INTEGER DEFAULT 100,
     priority INTEGER DEFAULT 1,
+    is_fallback BOOLEAN NOT NULL DEFAULT FALSE,
     created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
 );
 

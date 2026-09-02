@@ -1,6 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useMemo, useState, type KeyboardEvent } from "react";
-import { Calendar, ChevronLeft, ChevronRight, ChevronsLeft, CircleX, ScrollText, Trash2, X } from "lucide-react";
+import { Calendar, ChevronLeft, ChevronRight, ChevronsLeft, CircleX, Eraser, ScrollText, Trash2, X } from "lucide-react";
 
 import { backend } from "@/lib/backend";
 import type { ApiKey, LogPage, LogQuery, ModelStats, Provider, RequestLog } from "@/lib/types";
@@ -37,6 +37,7 @@ export default function LogsPage() {
   const [selected, setSelected] = useState<RequestLog | null>(null);
   const [confirmOpen, setConfirmOpen] = useState(false);
   const [confirmErrorsOpen, setConfirmErrorsOpen] = useState(false);
+  const [confirmPayloadsOpen, setConfirmPayloadsOpen] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<string | null>(null);
 
   const clearMut = useMutation({
@@ -54,6 +55,16 @@ export default function LogsPage() {
       qc.invalidateQueries({ queryKey: ["logs"] });
       setPage(0);
       setConfirmErrorsOpen(false);
+    },
+  });
+
+  const clearPayloadsMut = useMutation({
+    mutationFn: () => backend("clear_log_payloads"),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["logs"] });
+      qc.invalidateQueries({ queryKey: ["log-detail"] });
+      setSelected(null);
+      setConfirmPayloadsOpen(false);
     },
   });
 
@@ -314,6 +325,16 @@ export default function LogsPage() {
               </div>
             </PopoverContent>
           </Popover>
+          <Button
+            variant="outline"
+            size="icon"
+            className="h-10 w-10 text-amber-600 hover:text-amber-700"
+            title={isZh ? "清除已记录载荷" : "Clear Recorded Payloads"}
+            disabled={total === 0 || clearPayloadsMut.isPending}
+            onClick={() => setConfirmPayloadsOpen(true)}
+          >
+            <Eraser className="h-4 w-4" />
+          </Button>
           <Button
             variant="outline"
             size="icon"
@@ -582,6 +603,31 @@ export default function LogsPage() {
         confirmText={isZh ? "清空" : "Clear"}
         cancelText={isZh ? "取消" : "Cancel"}
         onConfirm={() => clearMut.mutate()}
+      />
+
+      <ConfirmDialog
+        open={confirmPayloadsOpen}
+        onOpenChange={setConfirmPayloadsOpen}
+        title={isZh ? "清除已记录载荷" : "Clear Recorded Payloads"}
+        description={
+          isZh
+            ? "非报错日志中已记录的请求与响应头、请求体和响应体都将被永久清除；客户端或上游状态码为 4xx/5xx 的报错日志载荷会保留，日志记录本身也不会删除。此操作不可恢复。"
+            : "Recorded request and response headers and bodies will be permanently cleared from non-error logs. Payloads are kept for logs whose client or upstream status is 4xx/5xx, and no log records are deleted. This action cannot be undone."
+        }
+        confirmText={
+          clearPayloadsMut.isPending
+            ? isZh
+              ? "清除中..."
+              : "Clearing..."
+            : isZh
+              ? "清除载荷"
+              : "Clear Payloads"
+        }
+        cancelText={isZh ? "取消" : "Cancel"}
+        confirmClassName="bg-amber-600 text-white hover:bg-amber-500"
+        onConfirm={() => {
+          if (!clearPayloadsMut.isPending) clearPayloadsMut.mutate();
+        }}
       />
 
       <ConfirmDialog

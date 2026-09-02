@@ -240,6 +240,10 @@ impl LogStore for MemoryStorage {
         Ok(0)
     }
 
+    async fn clear_payloads(&self) -> anyhow::Result<u64> {
+        Ok(0)
+    }
+
     async fn delete_by_id(&self, _id: &str) -> anyhow::Result<u64> {
         Ok(0)
     }

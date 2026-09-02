@@ -181,6 +181,8 @@ function resolveHTTP(cmd: string, args?: Record<string, unknown>): HTTPMapping {
       return { method: "GET", url: `${base}/logs/${args?.id}` };
     case "clear_logs":
       return { method: "DELETE", url: `${base}/logs` };
+    case "clear_log_payloads":
+      return { method: "DELETE", url: `${base}/logs/payloads` };
     case "clear_error_logs":
       return { method: "DELETE", url: `${base}/logs?scope=errors` };
     case "delete_log":

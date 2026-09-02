@@ -14,7 +14,12 @@
 //! | `usage`    | Largest-window quota rate³ × window-perishability weights |
 //!
 //! `latency` orders targets by the time-to-first-token EWMA held in
-//! [`LatencyRegistry`]. Targets without a graduated fresh estimate (never
+//! [`LatencyRegistry`].
+//!
+//! Rows flagged `is_fallback` never enter the strategies: the selector
+//! appends them after the strategy ordering, so the dispatcher only reaches
+//! a fallback when every regular target has been skipped (quota / circuit /
+//! disabled) or failed with a retryable error. Targets without a graduated fresh estimate (never
 //! probed, still gathering their three-sample probing round, or stale past
 //! the registry's freshness window) sort optimistically ahead of the known
 //! ones so real traffic keeps probing them; among themselves they keep
@@ -437,20 +442,50 @@ impl TargetSelector {
         let resolved = ModelBalance::from_str(balance).unwrap_or_default();
         let balance_name = resolved.as_str();
         let mut decision = RouteDecision::new(balance_name);
-        let ordered = match resolved {
+        // Fallback rows are invisible to the balance strategies; they are
+        // appended after the strategy ordering as last-resort targets.
+        let regular: Vec<ModelBackend> = targets
+            .iter()
+            .filter(|target| !target.is_fallback)
+            .cloned()
+            .collect();
+        let fallback: Vec<ModelBackend> = targets
+            .iter()
+            .filter(|target| target.is_fallback)
+            .cloned()
+            .collect();
+        let mut ordered = match resolved {
             ModelBalance::Weighted => {
-                WeightedStrategy.select_ordered(targets, latency, quota, &mut decision)
+                WeightedStrategy.select_ordered(&regular, latency, quota, &mut decision)
             }
             ModelBalance::Priority => {
-                PriorityStrategy.select_ordered(targets, latency, quota, &mut decision)
+                PriorityStrategy.select_ordered(&regular, latency, quota, &mut decision)
             }
             ModelBalance::Latency => {
-                LatencyStrategy.select_ordered(targets, latency, quota, &mut decision)
+                LatencyStrategy.select_ordered(&regular, latency, quota, &mut decision)
             }
             ModelBalance::Usage => {
-                UsageStrategy.select_ordered(targets, latency, quota, &mut decision)
+                UsageStrategy.select_ordered(&regular, latency, quota, &mut decision)
             }
         };
+        let base_rank = decision
+            .candidates
+            .iter()
+            .filter_map(|candidate| candidate.rank)
+            .max()
+            .unwrap_or(0);
+        for (offset, target) in fallback.iter().enumerate() {
+            decision.candidates.push(DecisionCandidate {
+                provider: target.provider_id.clone(),
+                target: target.model.clone(),
+                rank: Some(base_rank + offset + 1),
+                weight: None,
+                share: None,
+                score: Some(serde_json::json!({ "state": "fallback" })),
+                skipped: None,
+            });
+            ordered.push(to_selected(target));
+        }
         for candidate in &mut decision.candidates {
             if candidate.skipped.is_some() || candidate.rank.is_none() {
                 continue;
@@ -540,7 +575,15 @@ mod tests {
             model: model.to_string(),
             weight,
             priority: 1,
+            is_fallback: false,
             created_at: String::new(),
+        }
+    }
+
+    fn fallback_backend(id: &str, provider_id: &str, model: &str) -> ModelBackend {
+        ModelBackend {
+            is_fallback: true,
+            ..backend(id, provider_id, model, 100)
         }
     }
 
@@ -985,6 +1028,94 @@ mod tests {
         assert_eq!(ranked, vec![1, 2]);
         let json = decision.to_json();
         assert!(json.contains("static_weight"));
+    }
+
+    #[test]
+    fn fallback_row_is_appended_last_for_every_balance() {
+        let fallback = fallback_backend("9", "z", "last-resort");
+        for balance in ["weighted", "priority", "latency", "usage"] {
+            let targets = vec![
+                backend("1", "a", "a1", 80),
+                backend("2", "b", "b1", 20),
+                fallback.clone(),
+            ];
+            let ordered = TargetSelector::select_ordered(
+                balance,
+                &targets,
+                &LatencyRegistry::new(),
+                &ProviderQuotaRegistry::new(),
+            );
+            assert_eq!(
+                ordered.last().map(|t| t.model.as_str()),
+                Some("last-resort"),
+                "{balance}: fallback stays last"
+            );
+            assert_eq!(ordered.len(), 3, "{balance}: fallback still dispatched");
+        }
+    }
+
+    #[test]
+    fn fallback_decision_records_state_and_contiguous_rank() {
+        let targets = vec![
+            backend("1", "a", "a1", 80),
+            backend("2", "b", "b1", 20),
+            fallback_backend("9", "z", "last-resort"),
+        ];
+
+        let (ordered, decision) = TargetSelector::select_ordered_traced(
+            "weighted",
+            &targets,
+            &LatencyRegistry::new(),
+            &ProviderQuotaRegistry::new(),
+            &HealthRegistry::new(),
+        );
+
+        let candidate = decision
+            .candidates
+            .iter()
+            .find(|c| c.target == "last-resort")
+            .expect("fallback row stays in snapshot");
+        assert_eq!(candidate.rank, Some(3));
+        assert_eq!(candidate.score.as_ref().unwrap()["state"], "fallback");
+        assert!(candidate.skipped.is_none());
+        let mut ranked: Vec<usize> = decision.candidates.iter().filter_map(|c| c.rank).collect();
+        ranked.sort_unstable();
+        assert_eq!(ranked, vec![1, 2, 3]);
+        assert_eq!(ordered.last().unwrap().model, "last-resort");
+    }
+
+    #[test]
+    fn fallback_row_keeps_quota_skip_annotation() {
+        let quota = ProviderQuotaRegistry::new();
+        quota.observe(
+            "z",
+            &[QuotaTierObservation {
+                name: "monthly".to_string(),
+                used_percent: 100.0,
+                resets_at: None,
+            }],
+            None,
+        );
+        let targets = vec![
+            backend("1", "a", "a1", 100),
+            fallback_backend("9", "z", "last-resort"),
+        ];
+
+        let (_, decision) = TargetSelector::select_ordered_traced(
+            "weighted",
+            &targets,
+            &LatencyRegistry::new(),
+            &quota,
+            &HealthRegistry::new(),
+        );
+
+        let candidate = decision
+            .candidates
+            .iter()
+            .find(|c| c.target == "last-resort")
+            .unwrap();
+        let skipped = candidate.skipped.as_ref().unwrap();
+        assert_eq!(skipped.reason, "quota_exhausted");
     }
 
     #[test]

@@ -79,12 +79,14 @@ async fn copy_provider_can_copy_matching_route_targets_to_copied_provider() -> a
                     model: "source-upstream-model".to_string(),
                     weight: Some(80),
                     priority: Some(1),
+                    is_fallback: None,
                 },
                 CreateModelBackend {
                     provider_id: fallback.id.clone(),
                     model: "fallback-upstream-model".to_string(),
                     weight: Some(20),
                     priority: Some(2),
+                    is_fallback: None,
                 },
             ],
             enable_auth: Some(true),
@@ -196,6 +198,7 @@ async fn api_key_privileged_flag_roundtrips_and_keeps_bindings() -> anyhow::Resu
                 model: "gpt-test".to_string(),
                 weight: None,
                 priority: None,
+                is_fallback: None,
             }],
             enable_auth: Some(true),
             force_max_reasoning: None,
@@ -328,6 +331,7 @@ async fn create_model_persists_force_max_reasoning_and_vision_shim() -> anyhow::
                 model: "gpt-test".to_string(),
                 weight: None,
                 priority: None,
+                is_fallback: None,
             }],
             enable_auth: None,
             force_max_reasoning: Some(true),
@@ -377,6 +381,7 @@ async fn create_model_persists_force_max_reasoning_and_vision_shim() -> anyhow::
                 model: "gpt-test".to_string(),
                 weight: None,
                 priority: None,
+                is_fallback: None,
             }],
             enable_auth: None,
             force_max_reasoning: None,
@@ -386,6 +391,123 @@ async fn create_model_persists_force_max_reasoning_and_vision_shim() -> anyhow::
         .await?;
     assert!(!plain.force_max_reasoning);
     assert_eq!(plain.vision_shim, None);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn model_backend_fallback_flag_roundtrips_through_storage() -> anyhow::Result<()> {
+    let gw = build_gateway().await?;
+    let primary = gw
+        .admin()
+        .create_provider(api_key_provider_input("fallback-primary-provider"))
+        .await?;
+    let rescue = gw
+        .admin()
+        .create_provider(api_key_provider_input("fallback-rescue-provider"))
+        .await?;
+
+    let model = gw
+        .admin()
+        .create_model(CreateModel {
+            name: "fallback-roundtrip".to_string(),
+            balance: None,
+            target_provider: primary.id.clone(),
+            target_model: "gpt-test".to_string(),
+            targets: vec![
+                CreateModelBackend {
+                    provider_id: primary.id.clone(),
+                    model: "gpt-test".to_string(),
+                    weight: Some(100),
+                    priority: Some(1),
+                    is_fallback: None,
+                },
+                CreateModelBackend {
+                    provider_id: rescue.id.clone(),
+                    model: "gpt-mini".to_string(),
+                    weight: Some(100),
+                    priority: Some(1),
+                    is_fallback: Some(true),
+                },
+            ],
+            enable_auth: None,
+            force_max_reasoning: None,
+            enable_payload: None,
+            vision_shim: None,
+        })
+        .await?;
+
+    let rescue_row = model
+        .targets
+        .iter()
+        .find(|target| target.provider_id == rescue.id)
+        .expect("rescue backend row must exist");
+    assert!(
+        rescue_row.is_fallback,
+        "fallback flag must round-trip through INSERT"
+    );
+    assert!(
+        model
+            .targets
+            .iter()
+            .any(|target| target.provider_id == primary.id && !target.is_fallback),
+        "regular rows stay non-fallback"
+    );
+
+    // Persisted rows carry the flag too, not just the echoed create response.
+    let store = gw
+        .storage
+        .model_backends()
+        .expect("sqlite storage exposes backend store");
+    let reloaded = store.list_backends_by_model(&model.id).await?;
+    assert_eq!(reloaded.len(), 2);
+    assert_eq!(
+        reloaded.iter().filter(|target| target.is_fallback).count(),
+        1,
+        "exactly one persisted fallback row"
+    );
+
+    // Validation: two fallback rows in one update must be rejected.
+    let err = gw
+        .admin()
+        .update_model(
+            &model.id,
+            UpdateModel {
+                name: None,
+                balance: None,
+                target_provider: None,
+                target_model: None,
+                targets: Some(vec![
+                    UpsertModelBackend {
+                        id: None,
+                        provider_id: primary.id.clone(),
+                        model: "gpt-test".to_string(),
+                        weight: Some(100),
+                        priority: Some(1),
+                        is_fallback: Some(true),
+                    },
+                    UpsertModelBackend {
+                        id: None,
+                        provider_id: rescue.id.clone(),
+                        model: "gpt-mini".to_string(),
+                        weight: Some(100),
+                        priority: Some(1),
+                        is_fallback: Some(true),
+                    },
+                ]),
+                enable_auth: None,
+                enable_payload: None,
+                force_max_reasoning: None,
+                vision_shim: None,
+                is_enabled: None,
+            },
+        )
+        .await
+        .expect_err("duplicate fallback rows must be rejected");
+    assert!(
+        err.to_string().contains("only one fallback backend"),
+        "unexpected error: {err}"
+    );
 
     Ok(())
 }
@@ -429,12 +551,14 @@ async fn delete_provider_removes_route_associations_before_provider() -> anyhow:
                     model: "gpt-keep".to_string(),
                     weight: Some(100),
                     priority: Some(1),
+                    is_fallback: None,
                 },
                 CreateModelBackend {
                     provider_id: removed_provider.id.clone(),
                     model: "gpt-delete-secondary".to_string(),
                     weight: Some(50),
                     priority: Some(2),
+                    is_fallback: None,
                 },
             ],
             enable_auth: None,
@@ -835,12 +959,12 @@ async fn seed_oauth_credential(
 // ── log deletion tests ──────────────────────────────────────────────────────
 
 #[tokio::test]
-async fn admin_deletes_single_log_and_clears_error_logs() -> anyhow::Result<()> {
+async fn admin_clears_payloads_deletes_single_log_and_clears_error_logs() -> anyhow::Result<()> {
     use nyro_core::logging::LogEntry;
     use nyro_core::protocol::ir::Usage;
 
     let gw = build_gateway().await?;
-    let entry = |client_status: i32| LogEntry {
+    let entry = |client_status: i32, upstream_status: Option<i32>| LogEntry {
         api_key_id: None,
         api_key_name: None,
         created_at: 1,
@@ -857,15 +981,15 @@ async fn admin_deletes_single_log_and_clears_error_logs() -> anyhow::Result<()> 
         route_decision: None,
         method: Some("POST".into()),
         path: Some("/v1/chat/completions".into()),
-        client_request_headers: None,
-        client_request_body: None,
-        client_response_headers: None,
-        client_response_body: None,
-        upstream_request_headers: None,
-        upstream_request_body: None,
-        upstream_response_headers: None,
-        upstream_response_body: None,
-        upstream_status_code: Some(client_status),
+        client_request_headers: Some(r#"{"client-request":true}"#.into()),
+        client_request_body: Some(r#"{"client-request":true}"#.into()),
+        client_response_headers: Some(r#"{"client-response":true}"#.into()),
+        client_response_body: Some(r#"{"client-response":true}"#.into()),
+        upstream_request_headers: Some(r#"{"upstream-request":true}"#.into()),
+        upstream_request_body: Some(r#"{"upstream-request":true}"#.into()),
+        upstream_response_headers: Some(r#"{"upstream-response":true}"#.into()),
+        upstream_response_body: Some(r#"{"upstream-response":true}"#.into()),
+        upstream_status_code: upstream_status,
         client_status_code: client_status,
         latency_total_ms: 1,
         latency_upstream_ms: Some(1),
@@ -878,18 +1002,69 @@ async fn admin_deletes_single_log_and_clears_error_logs() -> anyhow::Result<()> 
 
     gw.storage
         .logs()
-        .append_batch(vec![entry(200), entry(429), entry(500), entry(200)])
+        .append_batch(vec![
+            entry(200, Some(200)),
+            entry(429, Some(429)),
+            entry(200, Some(503)),
+            entry(200, Some(200)),
+        ])
         .await?;
 
+    assert_eq!(gw.admin().clear_log_payloads().await?, 2);
+    assert_eq!(gw.admin().clear_log_payloads().await?, 0);
+
     let rows = gw.admin().query_logs(LogQuery::default()).await?;
-    assert_eq!(rows.total, 4);
+    assert_eq!(rows.total, 4, "payload clearing preserves log rows");
     let first_ok = rows
         .items
         .iter()
-        .find(|i| i.client_status_code == Some(200))
-        .expect("ok row exists")
+        .find(|i| i.client_status_code == Some(200) && i.upstream_status_code == Some(200))
+        .expect("successful row exists")
         .id
         .clone();
+    let detail = gw
+        .admin()
+        .get_log(&first_ok)
+        .await?
+        .expect("log remains after payload clearing");
+    assert!(detail.client_request_headers.is_none());
+    assert!(detail.client_request_body.is_none());
+    assert!(detail.client_response_headers.is_none());
+    assert!(detail.client_response_body.is_none());
+    assert!(detail.upstream_request_headers.is_none());
+    assert!(detail.upstream_request_body.is_none());
+    assert!(detail.upstream_response_headers.is_none());
+    assert!(detail.upstream_response_body.is_none());
+
+    let client_error_id = rows
+        .items
+        .iter()
+        .find(|i| i.client_status_code == Some(429))
+        .expect("client-error row exists")
+        .id
+        .clone();
+    let client_error = gw
+        .admin()
+        .get_log(&client_error_id)
+        .await?
+        .expect("client-error log remains");
+    assert!(client_error.client_request_body.is_some());
+    assert!(client_error.upstream_response_body.is_some());
+
+    let upstream_error_id = rows
+        .items
+        .iter()
+        .find(|i| i.upstream_status_code == Some(503))
+        .expect("upstream-error row exists")
+        .id
+        .clone();
+    let upstream_error = gw
+        .admin()
+        .get_log(&upstream_error_id)
+        .await?
+        .expect("upstream-error log remains");
+    assert!(upstream_error.client_request_body.is_some());
+    assert!(upstream_error.upstream_response_body.is_some());
 
     // Single-row delete; a missing id reports 0 instead of an error.
     assert_eq!(gw.admin().delete_log(&first_ok).await?, 1);
@@ -897,14 +1072,14 @@ async fn admin_deletes_single_log_and_clears_error_logs() -> anyhow::Result<()> 
     let rows = gw.admin().query_logs(LogQuery::default()).await?;
     assert_eq!(rows.total, 3);
 
-    // Error wipe removes exactly the two error rows.
-    assert_eq!(gw.admin().clear_error_logs().await?, 2);
+    // Error wipe uses client status, so it removes only the client-error row.
+    assert_eq!(gw.admin().clear_error_logs().await?, 1);
     let rows = gw.admin().query_logs(LogQuery::default()).await?;
-    assert_eq!(rows.total, 1);
+    assert_eq!(rows.total, 2);
     assert_eq!(rows.items[0].client_status_code, Some(200));
 
     // Full clear still works and removes the remainder.
-    assert_eq!(gw.admin().clear_logs().await?, 1);
+    assert_eq!(gw.admin().clear_logs().await?, 2);
     let rows = gw.admin().query_logs(LogQuery::default()).await?;
     assert_eq!(rows.total, 0);
 

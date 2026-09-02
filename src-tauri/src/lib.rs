@@ -105,6 +105,7 @@ pub fn run() {
             commands::query_logs,
             commands::get_log,
             commands::clear_logs,
+            commands::clear_log_payloads,
             commands::delete_log,
             commands::clear_error_logs,
             commands::get_stats_overview,

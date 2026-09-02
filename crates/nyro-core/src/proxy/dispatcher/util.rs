@@ -37,6 +37,7 @@ pub(super) async fn load_model_backends(gw: &Gateway, model: &Model) -> Vec<Mode
         model: model.target_model.clone(),
         weight: 100,
         priority: 1,
+        is_fallback: false,
         created_at: String::new(),
     }]
 }
@@ -168,6 +169,7 @@ mod tests {
                 model: "upstream-a".to_string(),
                 weight: 80,
                 priority: 1,
+                is_fallback: false,
                 created_at: String::new(),
             },
             ModelBackend {
@@ -177,6 +179,7 @@ mod tests {
                 model: "upstream-b".to_string(),
                 weight: 20,
                 priority: 2,
+                is_fallback: false,
                 created_at: String::new(),
             },
         ];

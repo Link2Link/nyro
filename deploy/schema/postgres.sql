@@ -78,6 +78,7 @@ CREATE TABLE IF NOT EXISTS model_backends (
     model TEXT NOT NULL,
     weight INTEGER DEFAULT 100,
     priority INTEGER DEFAULT 1,
+    is_fallback BOOLEAN NOT NULL DEFAULT FALSE,
     created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
 );
 

@@ -1218,6 +1218,7 @@ impl AdminService {
                     model: target.model.clone(),
                     weight: Some(target.weight),
                     priority: Some(target.priority),
+                    is_fallback: Some(target.is_fallback),
                 })
                 .collect::<Vec<_>>();
 
@@ -1230,6 +1231,9 @@ impl AdminService {
                     model: target.model.clone(),
                     weight: Some(target.weight),
                     priority: Some(target.priority),
+                    // Duplicated rows become regular targets: a second
+                    // fallback row would violate the one-fallback rule.
+                    is_fallback: Some(false),
                 });
             targets.extend(copied_targets);
 
@@ -1245,6 +1249,7 @@ impl AdminService {
                                 model: target.model,
                                 weight: target.weight,
                                 priority: target.priority,
+                                is_fallback: target.is_fallback,
                             })
                             .collect(),
                     ),

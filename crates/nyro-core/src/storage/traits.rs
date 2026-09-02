@@ -145,6 +145,10 @@ pub trait LogStore: Send + Sync {
     async fn find_by_id(&self, id: &str) -> anyhow::Result<Option<RequestLog>>;
     async fn cleanup_before(&self, cutoff_expression: &str) -> anyhow::Result<u64>;
     async fn clear_all(&self) -> anyhow::Result<u64>;
+    /// Clear recorded request/response headers and bodies from non-error log rows.
+    /// Rows with a client or upstream HTTP 4xx/5xx status remain untouched.
+    /// Returns the number of rows whose recorded payload fields were cleared.
+    async fn clear_payloads(&self) -> anyhow::Result<u64>;
     /// Delete one log row by id; 0 when the id does not exist.
     async fn delete_by_id(&self, id: &str) -> anyhow::Result<u64>;
     /// Delete every log row whose client status is an error (>= 400).

@@ -107,6 +107,7 @@ Provider 的协议端点明细。固定模式保留一条兼容记录；自适�
 | `model` | TEXT NOT NULL | — | 上游模型名（发送给 provider 的模型标识） |
 | `weight` | INTEGER | `100` | 静态权重（`weighted` 使用；`usage` 中用于同 Provider 多 target 的内部顺序及未知用量兜底） |
 | `priority` | INTEGER | `1` | 优先级，数值越小越优先（`priority` 策略下生效） |
+| `is_fallback` | INTEGER NOT NULL | `0` | 降级兜底行：不参与任何 balance 策略，仅追加在有序目标列表末尾——所有正常目标被跳过（配额/熔断/禁用）或可重试失败后才会调用。每个模型至多一行，且不能是唯一一行 |
 | `created_at` | TEXT | `datetime('now')` | 创建时间 |
 
 **索引**：`idx_model_backends_model_id` on `model_id`

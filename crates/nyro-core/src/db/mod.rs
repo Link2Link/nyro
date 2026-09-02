@@ -103,6 +103,9 @@ pub async fn migrate(pool: &SqlitePool) -> anyhow::Result<()> {
     rename_column_if_needed(pool, "model_backends", "route_id", "model_id").await?;
     rename_column_if_needed(pool, "api_key_models", "route_id", "model_id").await?;
 
+    // Add is_fallback column to model_backends (last-resort degraded fallback)
+    ensure_model_backend_column(pool, "is_fallback", "INTEGER NOT NULL DEFAULT 0").await?;
+
     // Rename columns: request_logs route_id/route_name → model_id/model_name
     rename_column_if_needed(pool, "request_logs", "route_id", "model_id").await?;
     rename_column_if_needed(pool, "request_logs", "route_name", "model_name").await?;
@@ -457,6 +460,19 @@ async fn ensure_model_column(
     Ok(())
 }
 
+async fn ensure_model_backend_column(
+    pool: &SqlitePool,
+    column_name: &str,
+    definition: &str,
+) -> anyhow::Result<()> {
+    if !column_exists(pool, "model_backends", column_name).await? {
+        let sql = format!("ALTER TABLE model_backends ADD COLUMN {column_name} {definition}");
+        sqlx::query(&sql).execute(pool).await?;
+    }
+
+    Ok(())
+}
+
 /// Idempotent migration: upgrade request_logs from the legacy 21-column schema
 /// to the spec-aligned 26-column schema.
 ///
@@ -652,6 +668,7 @@ async fn ensure_route_targets_table(pool: &SqlitePool) -> anyhow::Result<()> {
             model       TEXT NOT NULL,
             weight      INTEGER DEFAULT 100,
             priority    INTEGER DEFAULT 1,
+            is_fallback INTEGER NOT NULL DEFAULT 0,
             created_at  TEXT DEFAULT (datetime('now'))
         )"#,
     )
@@ -921,6 +938,7 @@ CREATE TABLE IF NOT EXISTS route_targets (
     model       TEXT NOT NULL,
     weight      INTEGER DEFAULT 100,
     priority    INTEGER DEFAULT 1,
+    is_fallback INTEGER NOT NULL DEFAULT 0,
     created_at  TEXT DEFAULT (datetime('now'))
 );
 

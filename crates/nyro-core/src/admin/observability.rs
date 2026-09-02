@@ -90,6 +90,11 @@ impl AdminService {
         self.gw.storage.logs().clear_all().await
     }
 
+    /// Clear payloads from non-error logs while preserving rows and all error payloads.
+    pub async fn clear_log_payloads(&self) -> anyhow::Result<u64> {
+        self.gw.storage.logs().clear_payloads().await
+    }
+
     /// Delete a single request log row; 0 when the id does not exist.
     pub async fn delete_log(&self, id: &str) -> anyhow::Result<u64> {
         self.gw.storage.logs().delete_by_id(id).await

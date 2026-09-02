@@ -20,6 +20,7 @@ pub(super) fn normalize_create_model_backends(
             model: input.target_model.clone(),
             weight: Some(100),
             priority: Some(1),
+            is_fallback: None,
         }]);
     }
     anyhow::bail!("at least one model backend is required")
@@ -37,6 +38,7 @@ pub(super) fn normalize_update_model_backends(
                 model: target.model.clone(),
                 weight: target.weight,
                 priority: target.priority,
+                is_fallback: target.is_fallback,
             })
             .collect();
         return Ok(mapped);
@@ -58,6 +60,7 @@ pub(super) fn normalize_update_model_backends(
         model,
         weight: Some(100),
         priority: Some(1),
+        is_fallback: None,
     }])
 }
 
@@ -81,16 +84,60 @@ pub(super) fn ensure_model_backends_valid(backends: &[CreateModelBackend]) -> an
             anyhow::bail!("backend priority must be a positive integer");
         }
     }
+    // Last-resort fallback rows: exactly one allowed, and never the only row.
+    let fallback_count = backends
+        .iter()
+        .filter(|backend| backend.is_fallback.unwrap_or(false))
+        .count();
+    if fallback_count > 1 {
+        anyhow::bail!("only one fallback backend per model is allowed");
+    }
+    if fallback_count > 0 && backends.len() == fallback_count {
+        anyhow::bail!("at least one non-fallback backend is required");
+    }
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::normalize_model_balance;
+    use super::{ensure_model_backends_valid, normalize_model_balance};
 
     #[test]
     fn usage_balance_is_case_normalized_and_unknown_values_are_rejected() {
         assert_eq!(normalize_model_balance(Some(" Usage ")).unwrap(), "usage");
         assert!(normalize_model_balance(Some("quota-score")).is_err());
+    }
+
+    fn backend_row(provider: &str, is_fallback: Option<bool>) -> super::CreateModelBackend {
+        super::CreateModelBackend {
+            provider_id: provider.to_string(),
+            model: format!("{provider}-model"),
+            weight: Some(100),
+            priority: Some(1),
+            is_fallback,
+        }
+    }
+
+    #[test]
+    fn single_fallback_backend_is_valid() {
+        let backends = vec![backend_row("a", None), backend_row("z", Some(true))];
+        assert!(ensure_model_backends_valid(&backends).is_ok());
+    }
+
+    #[test]
+    fn duplicate_fallback_backends_are_rejected() {
+        let backends = vec![
+            backend_row("a", Some(true)),
+            backend_row("z", Some(true)),
+        ];
+        let err = ensure_model_backends_valid(&backends).unwrap_err().to_string();
+        assert!(err.contains("only one fallback backend"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn fallback_only_backend_list_is_rejected() {
+        let backends = vec![backend_row("z", Some(true))];
+        let err = ensure_model_backends_valid(&backends).unwrap_err().to_string();
+        assert!(err.contains("non-fallback"), "unexpected: {err}");
     }
 }

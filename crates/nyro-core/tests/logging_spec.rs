@@ -410,7 +410,166 @@ async fn sqlite_round_trips_reasoning_effort_in_list_and_detail() {
     );
 }
 
-// ── 7. Log deletion: single row by id, and error-only wipe ───────────────────
+// ── 7. Historical payload clearing keeps errors and log metadata ────────────
+
+#[tokio::test]
+async fn sqlite_clears_success_payloads_but_preserves_error_payloads() {
+    use nyro_core::db;
+    use nyro_core::db::models::LogQuery;
+    use nyro_core::logging::LogEntry;
+    use nyro_core::protocol::ir::Usage;
+    use nyro_core::storage::{SqliteStorage, Storage};
+    use sqlx::sqlite::SqlitePoolOptions;
+
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .expect("connect in-memory sqlite");
+    db::migrate(&pool).await.expect("migrate sqlite schema");
+    let storage = SqliteStorage::from_pool(pool);
+
+    let entry = |client_status_code: i32, upstream_status_code: Option<i32>| LogEntry {
+        api_key_id: Some("key-1".into()),
+        api_key_name: Some("Key".into()),
+        created_at: 42,
+        client_protocol: "openai/chat/v1".into(),
+        upstream_protocol: "anthropic/messages/v1".into(),
+        provider_id: "provider-1".into(),
+        provider_name: "Provider".into(),
+        model_id: Some("model-1".into()),
+        model_name: Some("Model".into()),
+        upstream_url: Some("https://example.test/v1/messages".into()),
+        client_model: "gpt-test".into(),
+        upstream_model: "claude-test".into(),
+        reasoning_effort: Some("high".into()),
+        route_decision: Some(r#"{"strategy":"weighted"}"#.into()),
+        method: Some("POST".into()),
+        path: Some("/v1/chat/completions".into()),
+        client_request_headers: Some(r#"{"x-client":"request"}"#.into()),
+        client_request_body: Some(r#"{"client":"request"}"#.into()),
+        client_response_headers: Some(r#"{"x-client":"response"}"#.into()),
+        client_response_body: Some(r#"{"client":"response"}"#.into()),
+        upstream_request_headers: Some(r#"{"x-upstream":"request"}"#.into()),
+        upstream_request_body: Some(r#"{"upstream":"request"}"#.into()),
+        upstream_response_headers: Some(r#"{"x-upstream":"response"}"#.into()),
+        upstream_response_body: Some(r#"{"upstream":"response"}"#.into()),
+        upstream_status_code,
+        client_status_code,
+        latency_total_ms: 123,
+        latency_upstream_ms: Some(100),
+        usage: Usage {
+            prompt_tokens: 11,
+            completion_tokens: 22,
+            total_tokens: 33,
+            cache_read_tokens: Some(3),
+            ..Usage::default()
+        },
+        is_stream: true,
+        stream_chunks_count: 7,
+        stream_first_chunk_ms: Some(25),
+        enable_payload: None,
+    };
+
+    storage
+        .logs()
+        .append_batch(vec![
+            entry(200, Some(201)),
+            entry(500, Some(500)),
+            entry(200, Some(429)),
+        ])
+        .await
+        .expect("append logs");
+
+    let logs = storage.logs();
+    let before = logs
+        .query(LogQuery::default())
+        .await
+        .expect("query before clearing");
+    assert_eq!(before.total, 3);
+    let success_id = before
+        .items
+        .iter()
+        .find(|row| row.client_status_code == Some(200) && row.upstream_status_code == Some(201))
+        .expect("successful log exists")
+        .id
+        .clone();
+    let client_error_id = before
+        .items
+        .iter()
+        .find(|row| row.client_status_code == Some(500))
+        .expect("client-error log exists")
+        .id
+        .clone();
+    let upstream_error_id = before
+        .items
+        .iter()
+        .find(|row| row.upstream_status_code == Some(429))
+        .expect("upstream-error log exists")
+        .id
+        .clone();
+
+    assert_eq!(logs.clear_payloads().await.expect("clear payloads"), 1);
+
+    let after = logs
+        .find_by_id(&success_id)
+        .await
+        .expect("query detail after clearing")
+        .expect("log row is preserved");
+    assert_eq!(after.id, success_id);
+    assert_eq!(after.created_at, 42);
+    assert_eq!(after.client_status_code, Some(200));
+    assert_eq!(after.upstream_status_code, Some(201));
+    assert_eq!(after.latency_total_ms, Some(123));
+    assert_eq!(after.input_tokens, 11);
+    assert_eq!(after.output_tokens, 22);
+    assert_eq!(after.cache_read_tokens, 3);
+    assert_eq!(after.reasoning_effort.as_deref(), Some("high"));
+    assert_eq!(
+        after.route_decision.as_deref(),
+        Some(r#"{"strategy":"weighted"}"#)
+    );
+    assert!(after.client_request_headers.is_none());
+    assert!(after.client_request_body.is_none());
+    assert!(after.client_response_headers.is_none());
+    assert!(after.client_response_body.is_none());
+    assert!(after.upstream_request_headers.is_none());
+    assert!(after.upstream_request_body.is_none());
+    assert!(after.upstream_response_headers.is_none());
+    assert!(after.upstream_response_body.is_none());
+
+    for error_id in [&client_error_id, &upstream_error_id] {
+        let error = logs
+            .find_by_id(error_id)
+            .await
+            .expect("query preserved error detail")
+            .expect("error log row is preserved");
+        assert!(error.client_request_headers.is_some());
+        assert!(error.client_request_body.is_some());
+        assert!(error.client_response_headers.is_some());
+        assert!(error.client_response_body.is_some());
+        assert!(error.upstream_request_headers.is_some());
+        assert!(error.upstream_request_body.is_some());
+        assert!(error.upstream_response_headers.is_some());
+        assert!(error.upstream_response_body.is_some());
+    }
+
+    assert_eq!(
+        logs.query(LogQuery::default())
+            .await
+            .expect("query after clearing")
+            .total,
+        3
+    );
+    assert_eq!(
+        logs.clear_payloads()
+            .await
+            .expect("error payloads remain excluded on repeated clearing"),
+        0
+    );
+}
+
+// ── 8. Log deletion: single row by id, and error-only wipe ───────────────────
 
 #[tokio::test]
 async fn sqlite_deletes_single_log_and_clears_errors_only() {

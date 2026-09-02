@@ -742,7 +742,7 @@ struct SqliteModelBackendStore {
 impl ModelBackendStore for SqliteModelBackendStore {
     async fn list_backends_by_model(&self, model_id: &str) -> anyhow::Result<Vec<ModelBackend>> {
         Ok(sqlx::query_as::<_, ModelBackend>(
-            "SELECT id, model_id, provider_id, model, weight, priority, created_at FROM model_backends WHERE model_id = ? ORDER BY priority ASC, created_at ASC",
+            "SELECT id, model_id, provider_id, model, weight, priority, is_fallback, created_at FROM model_backends WHERE model_id = ? ORDER BY priority ASC, created_at ASC",
         )
         .bind(model_id)
         .fetch_all(&self.pool)
@@ -763,7 +763,7 @@ impl ModelBackendStore for SqliteModelBackendStore {
         for backend in backends {
             let id = uuid::Uuid::new_v4().to_string();
             sqlx::query(
-                "INSERT INTO model_backends (id, model_id, provider_id, model, weight, priority) VALUES (?, ?, ?, ?, ?, ?)",
+                "INSERT INTO model_backends (id, model_id, provider_id, model, weight, priority, is_fallback) VALUES (?, ?, ?, ?, ?, ?, ?)",
             )
             .bind(id)
             .bind(model_id)
@@ -771,6 +771,7 @@ impl ModelBackendStore for SqliteModelBackendStore {
             .bind(backend.model.trim())
             .bind(backend.weight.unwrap_or(100).max(0))
             .bind(backend.priority.unwrap_or(1).max(1))
+            .bind(backend.is_fallback.unwrap_or(false))
             .execute(&mut *tx)
             .await?;
         }
@@ -1293,6 +1294,25 @@ impl LogStore for SqliteLogStore {
         let result = sqlx::query("DELETE FROM request_logs")
             .execute(&self.pool)
             .await?;
+        Ok(result.rows_affected())
+    }
+
+    async fn clear_payloads(&self) -> anyhow::Result<u64> {
+        let result = sqlx::query(
+            "UPDATE request_logs SET \
+             client_request_headers = NULL, client_request_body = NULL, \
+             client_response_headers = NULL, client_response_body = NULL, \
+             upstream_request_headers = NULL, upstream_request_body = NULL, \
+             upstream_response_headers = NULL, upstream_response_body = NULL \
+             WHERE (client_request_headers IS NOT NULL OR client_request_body IS NOT NULL \
+                OR client_response_headers IS NOT NULL OR client_response_body IS NOT NULL \
+                OR upstream_request_headers IS NOT NULL OR upstream_request_body IS NOT NULL \
+                OR upstream_response_headers IS NOT NULL OR upstream_response_body IS NOT NULL) \
+               AND (client_status_code IS NULL OR client_status_code < 400 OR client_status_code > 599) \
+               AND (upstream_status_code IS NULL OR upstream_status_code < 400 OR upstream_status_code > 599)",
+        )
+        .execute(&self.pool)
+        .await?;
         Ok(result.rows_affected())
     }
 

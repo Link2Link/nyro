@@ -131,6 +131,10 @@ pub fn create_router(gateway: Gateway, admin_token: Option<String>) -> Router {
         )
         .route("/api-keys/:id", api_keys_item)
         .route("/logs", get(query_logs_handler).delete(clear_logs_handler))
+        .route(
+            "/logs/payloads",
+            axum::routing::delete(clear_log_payloads_handler),
+        )
         .route("/logs/:id", get(get_log_handler).delete(delete_log_handler))
         .route("/stats/overview", get(stats_overview))
         .route("/stats/hourly", get(stats_hourly))
@@ -662,6 +666,13 @@ async fn clear_logs_handler(
 #[derive(Deserialize, Default)]
 struct ClearLogsParams {
     scope: Option<String>,
+}
+
+async fn clear_log_payloads_handler(State(gw): State<Gateway>) -> impl IntoResponse {
+    match gw.admin().clear_log_payloads().await {
+        Ok(cleared) => Json(serde_json::json!({ "data": { "cleared": cleared } })).into_response(),
+        Err(e) => err(e),
+    }
 }
 
 async fn delete_log_handler(

@@ -185,6 +185,10 @@ pub struct YamlModelBackend {
     pub weight: i32,
     #[serde(default = "default_priority")]
     pub priority: i32,
+    /// Last-resort fallback row: tried only after every regular target of
+    /// the model is unavailable. At most one per model.
+    #[serde(default)]
+    pub fallback: bool,
 }
 
 fn default_weight() -> i32 {
@@ -362,6 +366,19 @@ impl YamlConfig {
                     );
                 }
             }
+            let fallback_count = m.backends.iter().filter(|b| b.fallback).count();
+            if fallback_count > 1 {
+                anyhow::bail!(
+                    "models[{i}] ({}): only one fallback backend per model is allowed",
+                    m.name
+                );
+            }
+            if fallback_count > 0 && m.backends.len() == fallback_count {
+                anyhow::bail!(
+                    "models[{i}] ({}): at least one non-fallback backend is required",
+                    m.name
+                );
+            }
         }
         Ok(())
     }
@@ -501,6 +518,7 @@ pub fn build_models(yaml: &YamlConfig, providers: &[Provider]) -> Vec<Model> {
                         model: yb.model.clone(),
                         weight: yb.weight,
                         priority: yb.priority,
+                        is_fallback: yb.fallback,
                         created_at: now.clone(),
                     }
                 })
@@ -969,5 +987,95 @@ models:
         let models = build_models(&cfg, &providers);
         assert_eq!(providers.len(), 1);
         assert_eq!(models.len(), 1);
+    }
+
+    #[test]
+    fn fallback_backend_flag_roundtrips_into_model_targets() {
+        let yaml = r#"
+providers:
+  - name: main
+    endpoints:
+      openai:
+        base_url: https://main.example/v1
+    apikey: sk-main
+  - name: rescue
+    endpoints:
+      openai:
+        base_url: https://rescue.example/v1
+    apikey: sk-rescue
+models:
+  - name: guarded-model
+    balance: latency
+    backends:
+      - provider: main
+        model: big-model
+      - provider: rescue
+        model: small-model
+        fallback: true
+"#;
+        let cfg: YamlConfig = serde_yaml::from_str(yaml).expect("parse");
+        cfg.validate().expect("single fallback must validate");
+        let providers = build_providers(&cfg);
+        let models = build_models(&cfg, &providers);
+
+        assert_eq!(models[0].targets.len(), 2);
+        assert!(!models[0].targets[0].is_fallback);
+        assert!(models[0].targets[1].is_fallback);
+    }
+
+    #[test]
+    fn duplicate_fallback_backends_are_rejected_at_load() {
+        let yaml = r#"
+providers:
+  - name: main
+    endpoints:
+      openai:
+        base_url: https://main.example/v1
+    apikey: sk-main
+  - name: rescue
+    endpoints:
+      openai:
+        base_url: https://rescue.example/v1
+    apikey: sk-rescue
+models:
+  - name: guarded-model
+    backends:
+      - provider: main
+        model: big-model
+        fallback: true
+      - provider: rescue
+        model: small-model
+        fallback: true
+"#;
+        let cfg: YamlConfig = serde_yaml::from_str(yaml).expect("parse");
+        let err = cfg.validate().expect_err("two fallback rows must fail validation");
+        assert!(
+            err.to_string().contains("only one fallback backend"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn fallback_only_backend_list_is_rejected_at_load() {
+        let yaml = r#"
+providers:
+  - name: rescue
+    endpoints:
+      openai:
+        base_url: https://rescue.example/v1
+    apikey: sk-rescue
+models:
+  - name: guarded-model
+    backends:
+      - provider: rescue
+        model: small-model
+        fallback: true
+"#;
+        let cfg: YamlConfig = serde_yaml::from_str(yaml).expect("parse");
+        let err = cfg.validate().expect_err("fallback-only model must fail validation");
+        assert!(
+            err.to_string().contains("non-fallback"),
+            "unexpected error: {err}"
+        );
     }
 }
