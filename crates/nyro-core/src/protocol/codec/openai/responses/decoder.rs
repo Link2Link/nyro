@@ -295,9 +295,15 @@ fn decode_input_item(item: &Value) -> Result<Option<Message>> {
 
     match item_type {
         "function_call_output" | "custom_tool_call_output" => {
+            // Codex Desktop 的 Responses-Lite 方言（`x-openai-internal-codex-
+            // responses-lite: true`）里的工具输出项只带自身 `id`（`fco_*`）
+            // 与 `name`/`namespace`，不带 `call_id`（线上 400 dbc1cff5）。
+            // 与 `function_call` 分支的回退一致：缺 `call_id` 时回退到
+            // 项自身 `id`，仅当两者皆缺时才视为非法输入。
             let call_id = item
                 .get("call_id")
                 .or_else(|| item.get("tool_call_id"))
+                .or_else(|| item.get("id"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();

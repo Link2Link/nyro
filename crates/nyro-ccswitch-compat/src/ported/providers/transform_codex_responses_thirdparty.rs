@@ -84,6 +84,12 @@ pub(crate) fn request_needs_rewrite_value(body: &Value) -> bool {
     {
         return true;
     }
+    // Codex Responses-Lite tool outputs without `call_id` (e.g. automation
+    // heartbeats carrying only their own `fco_*` id) are invalid wire for a
+    // strict upstream; they need the call-id normalization pass.
+    if input_has(is_call_id_less_tool_output) {
+        return true;
+    }
     // Replay history: a prior turn produced Codex-private call items that the
     // upstream never sees as functions unless rewritten.
     input_has(|item| {
@@ -92,6 +98,24 @@ pub(crate) fn request_needs_rewrite_value(body: &Value) -> bool {
             Some("custom_tool_call") | Some("custom_tool_call_output")
         )
     })
+}
+
+/// Whether the item is a tool-call output item in the Responses wire sense.
+fn is_tool_call_output_item(item: &Value) -> bool {
+    matches!(
+        item.get("type").and_then(Value::as_str),
+        Some("function_call_output") | Some("custom_tool_call_output")
+    )
+}
+
+/// Whether a tool-call output item lacks a usable `call_id` (Codex
+/// Responses-Lite heartbeats carry only their own `id`, e.g. `fco_*`).
+fn is_call_id_less_tool_output(item: &Value) -> bool {
+    is_tool_call_output_item(item)
+        && item
+            .get("call_id")
+            .and_then(Value::as_str)
+            .is_none_or(|id| id.trim().is_empty())
 }
 
 fn needs_tool_rewrite(tool: &Value) -> bool {
@@ -142,7 +166,101 @@ pub(crate) fn rewrite_request_for_third_party(body: &mut Value) -> Result<(), Pr
     convert_custom_tools_to_functions(body);
     filter_unsupported_tool_types(body);
     rewrite_custom_history(body);
+    normalize_tool_output_call_ids(body);
     Ok(())
+}
+
+/// Normalize tool-call output items for a strict third-party upstream:
+/// backfill a missing `call_id` from the item's own `id` and drop outputs
+/// that reference no call anywhere in the current input.
+///
+/// Codex Responses-Lite automation heartbeats send `function_call_output`
+/// items carrying only their own `fco_*` id (plus `name`/`namespace`),
+/// without the matching `function_call` items being replayed. A strict
+/// upstream rejects such an output — either as invalid wire (missing
+/// `call_id`) or as an unresolvable reference. Mirrors sub2api's
+/// `filterCodexInputWithOptions` call-id backfill plus
+/// `sanitizeOpenAIResponsesOrphanToolOutputs` orphan removal.
+fn normalize_tool_output_call_ids(body: &mut Value) {
+    // With server-side state (`previous_response_id`), outputs may reference
+    // calls the upstream resolved earlier — dropping them would lose real
+    // tool results. Only backfill call ids in that mode (sub2api parity).
+    let has_previous_response_id = body
+        .get("previous_response_id")
+        .and_then(Value::as_str)
+        .is_some_and(|id| !id.trim().is_empty());
+    let Some(items) = body.get_mut("input").and_then(Value::as_array_mut) else {
+        return;
+    };
+
+    // Referenceable identifiers: tool-call items (by `call_id` or `id`) and
+    // explicit `item_reference` ids.
+    let mut referenceable: HashSet<String> = HashSet::new();
+    for item in items.iter() {
+        match item.get("type").and_then(Value::as_str) {
+            Some("function_call") | Some("custom_tool_call") => {
+                for field in ["call_id", "id"] {
+                    if let Some(id) = item.get(field).and_then(Value::as_str) {
+                        let id = id.trim();
+                        if !id.is_empty() {
+                            referenceable.insert(id.to_string());
+                        }
+                    }
+                }
+            }
+            Some("item_reference") => {
+                if let Some(id) = item.get("id").and_then(Value::as_str) {
+                    let id = id.trim();
+                    if !id.is_empty() {
+                        referenceable.insert(id.to_string());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let original = std::mem::take(items);
+    *items = original
+        .into_iter()
+        .filter_map(|mut item| {
+            if !is_tool_call_output_item(&item) {
+                return Some(item);
+            }
+            let existing_call_id = item
+                .get("call_id")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+                .map(str::to_string);
+            let own_id = item
+                .get("id")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+                .map(str::to_string);
+
+            let effective_id = existing_call_id.as_ref().or(own_id.as_ref());
+            // An output referencing no call and no item reference is an
+            // orphan: keeping it would 400 on strict upstreams, and its
+            // payload (a heartbeat notification) carries no tool result.
+            let is_orphan = !has_previous_response_id
+                && effective_id.is_none_or(|id| !referenceable.contains(id));
+            if is_orphan {
+                return None;
+            }
+
+            // Backfill `call_id` from the item's own `id` when missing so
+            // the output stays well-formed wire.
+            if existing_call_id.is_none()
+                && let Some(id) = own_id
+                && let Some(object) = item.as_object_mut()
+            {
+                object.insert("call_id".to_string(), Value::String(id));
+            }
+            Some(item)
+        })
+        .collect();
 }
 
 /// Lift `additional_tools` carrier items from `input` into top-level `tools`,
@@ -699,6 +817,102 @@ mod tests {
             "model": "glm-5.3",
             "input": [{"type": "custom_tool_call", "call_id": "c", "name": "exec", "input": "x"}]
         })));
+        // Codex Responses-Lite heartbeat outputs carry only their own id —
+        // no call_id (线上 400 dbc1cff5)。
+        assert!(request_needs_rewrite_value(&json!({
+            "model": "glm-5.3",
+            "input": [
+                {"type": "message", "role": "user", "content": "hi"},
+                {"type": "function_call_output", "id": "fco_1", "name": "automation_update", "output": "<heartbeat/>"}
+            ]
+        })));
+    }
+
+    #[test]
+    fn rewrite_drops_orphan_lite_heartbeat_outputs() {
+        // 线上 400 dbc1cff5 的形态：automation heartbeat 输出只带自身
+        // `fco_*` id，配对的 function_call 项并未回放进 input。
+        let mut body = json!({
+            "model": "glm-5.3",
+            "input": [
+                {"type": "message", "role": "user", "content": "hi"},
+                {"type": "function_call_output", "id": "fco_01a05a7d-18e8-7be3-aeee-6530b96f76ff", "name": "automation_update", "namespace": "codex_app", "output": "<heartbeat/>"},
+                {"type": "message", "role": "assistant", "content": "ok"},
+                {"type": "function_call_output", "id": "fco_01a05fa8-37e1-75a1-895b-6b0270202e01", "name": "automation_update", "namespace": "codex_app", "output": "<heartbeat/>"}
+            ]
+        });
+        rewrite_request_for_third_party(&mut body).unwrap();
+
+        let input = body["input"].as_array().unwrap();
+        assert_eq!(input.len(), 2, "both orphan heartbeats dropped: {input:?}");
+        assert!(
+            input
+                .iter()
+                .all(|i| { i.get("type").and_then(Value::as_str) != Some("function_call_output") })
+        );
+    }
+
+    #[test]
+    fn rewrite_backfills_call_id_for_outputs_matching_a_call() {
+        // 输出只带自身 id，且该 id 恰与调用项的 call_id 一致：回填后
+        // 形成合法配对，保留。
+        let mut body = json!({
+            "model": "glm-5.3",
+            "input": [
+                {"type": "message", "role": "user", "content": "hi"},
+                {"type": "function_call", "call_id": "c9", "name": "exec", "arguments": "{}"},
+                {"type": "function_call_output", "id": "c9", "output": "done"}
+            ]
+        });
+        rewrite_request_for_third_party(&mut body).unwrap();
+
+        let input = body["input"].as_array().unwrap();
+        let output = input
+            .iter()
+            .find(|i| i["type"] == "function_call_output")
+            .expect("output kept: id matches the call");
+        assert_eq!(output["call_id"], "c9", "backfilled from own id");
+    }
+
+    #[test]
+    fn rewrite_keeps_paired_output_with_explicit_call_id() {
+        let mut body = json!({
+            "model": "glm-5.3",
+            "input": [
+                {"type": "message", "role": "user", "content": "hi"},
+                {"type": "function_call", "call_id": "c9", "name": "exec", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "c9", "output": "done"}
+            ]
+        });
+        rewrite_request_for_third_party(&mut body).unwrap();
+
+        let input = body["input"].as_array().unwrap();
+        assert_eq!(input.len(), 3, "nothing dropped: {input:?}");
+        let output = input
+            .iter()
+            .find(|i| i["type"] == "function_call_output")
+            .unwrap();
+        assert_eq!(output["call_id"], "c9");
+    }
+
+    #[test]
+    fn rewrite_keeps_orphans_when_previous_response_id_present() {
+        let mut body = json!({
+            "model": "glm-5.3",
+            "previous_response_id": "resp_123",
+            "input": [
+                {"type": "message", "role": "user", "content": "hi"},
+                {"type": "function_call_output", "id": "fco_1", "output": "done"}
+            ]
+        });
+        rewrite_request_for_third_party(&mut body).unwrap();
+
+        let input = body["input"].as_array().unwrap();
+        let output = input
+            .iter()
+            .find(|i| i["type"] == "function_call_output")
+            .expect("server-side state keeps orphan");
+        assert_eq!(output["call_id"], "fco_1", "call_id still backfilled");
     }
 
     #[test]

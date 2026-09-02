@@ -137,6 +137,52 @@ fn function_call_output_becomes_tool_message() {
     );
 }
 
+#[test]
+fn lite_tool_output_without_call_id_falls_back_to_own_id() {
+    // Codex Desktop Responses-Lite automation heartbeats send outputs with
+    // only their own `fco_*` id plus name/namespace (线上 400 dbc1cff5)。
+    let req = decode_request(
+        P::OpenAiResponses,
+        json!({
+            "model": "gpt-5.6-sol",
+            "input": [
+                {"type": "message", "role": "user", "content": "hi"},
+                {
+                    "type": "function_call_output",
+                    "id": "fco_01a05a7d-18e8-7be3-aeee-6530b96f76ff",
+                    "name": "automation_update",
+                    "namespace": "codex_app",
+                    "output": "<heartbeat>\u{000a}  <automation_id>automation</automation_id>"
+                }
+            ]
+        }),
+    );
+
+    assert_roles(&req, &[Role::User, Role::Tool]);
+    assert_eq!(
+        req.messages[1].tool_call_id.as_deref(),
+        Some("fco_01a05a7d-18e8-7be3-aeee-6530b96f76ff")
+    );
+    assert!(req.messages[1].content.to_text().contains("<heartbeat>"));
+}
+
+#[test]
+fn tool_output_without_call_id_or_id_is_rejected() {
+    use nyro_core::protocol::RequestDecoder;
+    use nyro_core::protocol::codec::openai::responses::decoder::ResponsesDecoder;
+    let err = ResponsesDecoder
+        .decode_request(json!({
+            "model": "gpt-4o",
+            "input": [
+                {"role": "user", "content": "hi"},
+                {"type": "function_call_output", "output": "result"}
+            ]
+        }))
+        .expect_err("decode must fail");
+    let msg = format!("{err:#}");
+    assert!(msg.contains("missing call_id"), "got: {msg}");
+}
+
 // ── tool definitions (flattened format) ──────────────────────────────────────
 
 #[test]
