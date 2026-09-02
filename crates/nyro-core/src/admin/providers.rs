@@ -20,6 +20,7 @@ pub struct ProviderModelProbeResult {
     /// `openai-compatible/chat-completions/v1`).
     pub protocol: String,
     /// Assistant text received for the "hi" probe (success only).
+    /// The value "[completed]" means the upstream completed without displayable text.
     pub reply: Option<String>,
 }
 
@@ -44,11 +45,13 @@ fn build_model_probe_request(
     auth_scheme: &str,
     runtime_headers: &HeaderMap,
     model: &str,
+    fast_mode: bool,
+    channel: Option<&str>,
     is_codex_oauth: bool,
 ) -> anyhow::Result<(String, HeaderMap, Value)> {
     // Reasoning models (e.g. glm-5.3) burn the whole completion budget on
     // thinking before emitting visible text. 1024 leaves room for both.
-    let (path, body) = match suite {
+    let (path, mut body) = match suite {
         crate::protocol::ids::Protocol::OpenAICompatible => (
             "/v1/chat/completions",
             serde_json::json!({
@@ -95,6 +98,10 @@ fn build_model_probe_request(
         }
     };
 
+    crate::provider::common::pipeline::maybe_inject_openai_fast_mode_for_protocol(
+        &mut body, fast_mode, channel, suite,
+    );
+
     let path = if is_codex_oauth && path == "/v1/responses" {
         "/responses"
     } else {
@@ -128,7 +135,7 @@ fn build_model_probe_request(
     Ok((url, headers, body))
 }
 
-/// Probe one model with a minimal non-streaming "hi" request (30s timeout).
+/// Probe one model with a minimal "hi" request (30s timeout).
 async fn probe_single_model(
     client: reqwest::Client,
     suite: crate::protocol::ids::Protocol,
@@ -138,6 +145,8 @@ async fn probe_single_model(
     runtime_headers: &HeaderMap,
     model: &str,
     protocol_id: &str,
+    fast_mode: bool,
+    channel: Option<&str>,
     is_codex_oauth: bool,
 ) -> ProviderModelProbeResult {
     let start = Instant::now();
@@ -150,6 +159,8 @@ async fn probe_single_model(
             auth_scheme,
             runtime_headers,
             model,
+            fast_mode,
+            channel,
             is_codex_oauth,
         )?;
 
@@ -190,8 +201,9 @@ async fn probe_single_model(
 }
 
 /// Extract the assistant's text reply from a probe response body for any of
-/// the three supported wire formats. Returns `None` when no text is present
-/// (e.g. content filter, empty choices) — the probe then reports failure.
+/// the three supported wire formats. Returns `None` when the response is
+/// incomplete/failed or has no terminal event; a completed response with no
+/// displayable text returns the callability marker "[completed]".
 ///
 /// Reasoning models may spend the whole budget on thinking; when `content`
 /// is empty the reasoning text is used as a fallback (prefixed with a marker
@@ -204,142 +216,426 @@ fn extract_probe_reply(body: &str) -> Option<String> {
     extract_probe_reply_json(&json)
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ProbeTerminal {
+    Completed,
+    Failed,
+}
+
 fn extract_probe_sse_reply(body: &str) -> Option<String> {
-    let mut text = String::new();
-    let mut reasoning = String::new();
-    let mut completed = false;
-    for line in body.lines() {
-        let Some(data) = line.trim().strip_prefix("data:").map(str::trim) else {
-            continue;
-        };
-        if data.is_empty() || data == "[DONE]" {
+    // Handle CRLF, data-only events, multiline data, and an unterminated EOF
+    // block. The first terminal event is authoritative.
+    let normalized = body.replace("\r\n", "\n").replace('\r', "\n");
+    let mut text_delta = String::new();
+    let mut text_fallback = String::new();
+    let mut reasoning_delta = String::new();
+    let mut reasoning_fallback = String::new();
+    let mut terminal_response: Option<Value> = None;
+    let mut terminal = None;
+
+    for block in normalized.split("\n\n") {
+        if terminal.is_some() {
+            break;
+        }
+        let mut event_header = None;
+        let mut data_lines = Vec::new();
+        for raw_line in block.lines() {
+            let line = raw_line.trim_start().trim_start_matches('\u{feff}');
+            if let Some(event) = line.strip_prefix("event:") {
+                event_header = Some(event.trim().to_string());
+            } else if let Some(data) = line.strip_prefix("data:") {
+                // SSE removes at most one optional space after the colon.
+                data_lines.push(data.strip_prefix(' ').unwrap_or(data));
+            }
+        }
+        if data_lines.is_empty() {
             continue;
         }
-        let Ok(event) = serde_json::from_str::<Value>(data) else {
+        let data = data_lines.join("\n");
+        if data.trim() == "[DONE]" {
+            continue;
+        }
+
+        let header_name = event_header.as_deref().filter(|name| !name.is_empty());
+        let Ok(payload) = serde_json::from_str::<Value>(&data) else {
+            if header_name.is_some_and(is_probe_terminal_event) {
+                terminal = Some(ProbeTerminal::Failed);
+            }
             continue;
         };
-        match event.get("type").and_then(Value::as_str) {
-            Some("response.output_text.delta") => {
-                if let Some(delta) = event.get("delta").and_then(Value::as_str) {
-                    text.push_str(delta);
+        let Some(event_name) = header_name
+            .or_else(|| payload.get("type").and_then(Value::as_str))
+            .or_else(|| probe_status_event(&payload))
+        else {
+            continue;
+        };
+
+        match event_name {
+            "response.output_text.delta" | "response.text.delta" => {
+                append_probe_delta(&mut text_delta, payload.get("delta"));
+            }
+            "response.output_text.done" | "response.output_text" => {
+                append_probe_candidate(
+                    &mut text_fallback,
+                    payload.get("text").or_else(|| payload.get("delta")),
+                );
+            }
+            "response.reasoning_summary_text.delta"
+            | "response.reasoning_text.delta"
+            | "response.reasoning.delta" => {
+                append_probe_delta(&mut reasoning_delta, payload.get("delta"));
+            }
+            "response.reasoning_summary_text.done"
+            | "response.reasoning_text.done"
+            | "response.reasoning.done" => {
+                append_probe_candidate(
+                    &mut reasoning_fallback,
+                    payload.get("text").or_else(|| payload.get("delta")),
+                );
+            }
+            "response.output_item.done" => {
+                if let Some(item) = payload.get("item") {
+                    append_probe_candidate_text(
+                        &mut text_fallback,
+                        extract_probe_content_text(item),
+                    );
+                    append_probe_candidate_text(
+                        &mut reasoning_fallback,
+                        extract_probe_reasoning_text(item),
+                    );
                 }
             }
-            Some("response.reasoning_summary_text.delta") => {
-                if let Some(delta) = event.get("delta").and_then(Value::as_str) {
-                    reasoning.push_str(delta);
-                }
-            }
-            Some("response.completed" | "response.done") => {
-                completed = true;
-                if text.trim().is_empty()
-                    && let Some(response) = event.get("response")
-                    && let Some(reply) = extract_probe_reply_json(response)
-                {
-                    text.push_str(&reply);
+            event if is_probe_terminal_event(event) => {
+                let state = probe_terminal_state(event, &payload);
+                terminal = Some(state);
+                if state == ProbeTerminal::Completed {
+                    terminal_response = Some(
+                        payload
+                            .get("response")
+                            .cloned()
+                            .unwrap_or_else(|| payload.clone()),
+                    );
                 }
             }
             _ => {}
         }
     }
-    if !completed {
+
+    if terminal != Some(ProbeTerminal::Completed) {
         return None;
     }
-    if !text.trim().is_empty() {
-        Some(text.trim().to_string())
-    } else if !reasoning.trim().is_empty() {
-        Some(format!("[thinking] {}", reasoning.trim()))
-    } else {
-        // A completed response proves that the model is callable even when it
-        // produced no displayable text for the tiny probe prompt.
-        Some("[completed]".to_string())
+    let terminal_text = terminal_response
+        .as_ref()
+        .map(extract_probe_responses_text)
+        .unwrap_or_default();
+    let terminal_reasoning = terminal_response
+        .as_ref()
+        .map(extract_probe_reasoning_text)
+        .unwrap_or_default();
+
+    // Ordered visible deltas win; complete values from done/terminal events
+    // are fallbacks for providers that omit deltas.
+    for text in [&text_delta, &text_fallback, &terminal_text] {
+        if !text.trim().is_empty() {
+            return Some(text.trim().to_string());
+        }
+    }
+    for reasoning in [&reasoning_delta, &reasoning_fallback, &terminal_reasoning] {
+        if !reasoning.trim().is_empty() {
+            return Some(format!("[thinking] {}", reasoning.trim()));
+        }
+    }
+
+    // A completed response proves callability even when it has no display text.
+    Some("[completed]".to_string())
+}
+
+fn probe_status_event(payload: &Value) -> Option<&'static str> {
+    let status = payload
+        .pointer("/response/status")
+        .or_else(|| payload.get("status"))
+        .and_then(Value::as_str);
+    matches!(status, Some("completed" | "incomplete" | "failed")).then_some("response.done")
+}
+
+fn is_probe_terminal_event(event: &str) -> bool {
+    matches!(
+        event,
+        "response.completed"
+            | "response.done"
+            | "response.incomplete"
+            | "response.failed"
+            | "response.cancelled"
+            | "response.canceled"
+            | "response.error"
+            | "error"
+    )
+}
+
+fn probe_terminal_state(event: &str, payload: &Value) -> ProbeTerminal {
+    if matches!(
+        event,
+        "response.incomplete"
+            | "response.failed"
+            | "response.cancelled"
+            | "response.canceled"
+            | "response.error"
+            | "error"
+    ) {
+        return ProbeTerminal::Failed;
+    }
+    match payload
+        .pointer("/response/status")
+        .or_else(|| payload.get("status"))
+        .and_then(Value::as_str)
+    {
+        None | Some("completed") => ProbeTerminal::Completed,
+        Some(_) => ProbeTerminal::Failed,
     }
 }
 
-fn extract_probe_reply_json(json: &Value) -> Option<String> {
-    let raw = match json {
-        // OpenAI chat.completions: choices[0].message.content, falling back
-        // to reasoning_content for thinking-only replies.
-        Value::Object(map) if map.contains_key("choices") => {
-            let message = json.pointer("/choices/0/message")?;
-            let content = message
-                .get("content")
-                .and_then(Value::as_str)
-                .map(str::to_string);
-            match content.filter(|text| !text.trim().is_empty()) {
-                Some(text) => Some(text),
-                None => message
-                    .get("reasoning_content")
-                    .and_then(Value::as_str)
-                    .filter(|text| !text.trim().is_empty())
-                    .map(|text| format!("[thinking] {}", text)),
-            }
+fn append_probe_candidate_text(target: &mut String, text: String) {
+    if text.trim().is_empty() {
+        return;
+    }
+    // Done events may repeat a value already supplied by an item event.
+    if target.trim().is_empty() {
+        target.push_str(&text);
+    } else if target != &text && !target.ends_with(&text) {
+        if text.starts_with(target.as_str()) {
+            target.clear();
+            target.push_str(&text);
+        } else {
+            target.push_str(&text);
         }
-        // OpenAI responses: output[] text parts. Reasoning models put their
-        // thought in a `reasoning` output item — used as a fallback when no
-        // text part was produced.
-        Value::Object(map) if map.contains_key("output") => {
-            let output = json.pointer("/output")?.as_array()?;
-            let text_parts = output
-                .iter()
-                .filter_map(|item| {
-                    let text = item.pointer("/content/0/text").and_then(Value::as_str)?;
-                    Some(text.to_string())
-                })
-                .collect::<Vec<_>>()
-                .join("");
-            if !text_parts.trim().is_empty() {
-                Some(text_parts)
-            } else {
-                let reasoning = output
-                    .iter()
-                    .filter_map(|item| {
-                        let text = item
-                            .pointer("/summary/0/text")
-                            .or_else(|| item.get("text"))
-                            .and_then(Value::as_str)?;
-                        Some(text.to_string())
-                    })
-                    .collect::<Vec<_>>()
-                    .join("");
-                (!reasoning.trim().is_empty()).then(|| format!("[thinking] {reasoning}"))
+    }
+}
+
+fn append_probe_candidate(target: &mut String, value: Option<&Value>) {
+    if let Some(text) = value.and_then(probe_text_value) {
+        append_probe_candidate_text(target, text);
+    }
+}
+
+fn append_probe_delta(target: &mut String, value: Option<&Value>) {
+    if let Some(text) = value.and_then(probe_delta_value) {
+        // Delta fragments are ordered data, so preserve whitespace exactly.
+        target.push_str(&text);
+    }
+}
+
+fn probe_delta_value(value: &Value) -> Option<String> {
+    match value {
+        Value::String(text) => Some(text.to_string()),
+        Value::Array(values) => {
+            let mut text = String::new();
+            let mut found = false;
+            for value in values {
+                if let Some(part) = probe_delta_value(value) {
+                    found = true;
+                    text.push_str(&part);
+                }
             }
+            found.then_some(text)
         }
-        // Anthropic messages: content[] text blocks. Thinking models emit
-        // `thinking` blocks first — used as a fallback when no text block
-        // was produced (e.g. budget exhausted mid-thought).
-        Value::Object(map) if map.contains_key("content") => {
-            let content = json.pointer("/content")?.as_array()?;
-            let text_parts = content
-                .iter()
-                .filter_map(|item| {
-                    if item.get("type").and_then(Value::as_str) == Some("text") {
-                        item.get("text").and_then(Value::as_str).map(str::to_string)
-                    } else {
-                        None
-                    }
-                })
-                .collect::<Vec<_>>()
-                .join("");
-            if !text_parts.trim().is_empty() {
-                Some(text_parts)
-            } else {
-                let thinking = content
-                    .iter()
-                    .filter_map(|item| {
-                        if item.get("type").and_then(Value::as_str) == Some("thinking") {
-                            item.get("thinking")
-                                .and_then(Value::as_str)
-                                .map(str::to_string)
-                        } else {
-                            None
-                        }
-                    })
-                    .collect::<Vec<_>>()
-                    .join("");
-                (!thinking.trim().is_empty()).then(|| format!("[thinking] {thinking}"))
-            }
-        }
+        Value::Object(map) => map
+            .get("value")
+            .or_else(|| map.get("text"))
+            .and_then(probe_delta_value),
         _ => None,
+    }
+}
+
+/// Read a non-empty string or the occasional {value: ...} wrapper.
+fn probe_text_value(value: &Value) -> Option<String> {
+    match value {
+        Value::String(text) if !text.trim().is_empty() => Some(text.to_string()),
+        Value::Array(values) => {
+            let mut text = String::new();
+            for value in values {
+                if let Some(part) = probe_text_value(value) {
+                    text.push_str(&part);
+                }
+            }
+            (!text.trim().is_empty()).then_some(text)
+        }
+        Value::Object(map) => map
+            .get("value")
+            .or_else(|| map.get("text"))
+            .and_then(probe_text_value),
+        _ => None,
+    }
+}
+
+/// Collect only known visible message/content part types.
+fn append_probe_content_text(target: &mut String, value: &Value) {
+    match value {
+        Value::String(text) if !text.trim().is_empty() => target.push_str(text),
+        Value::Array(values) => {
+            for value in values {
+                append_probe_content_text(target, value);
+            }
+        }
+        Value::Object(map) => match map.get("type").and_then(Value::as_str) {
+            Some("message") => {
+                if let Some(content) = map.get("content") {
+                    append_probe_content_text(target, content);
+                }
+            }
+            Some("output_text" | "text" | "refusal") => {
+                let value = map
+                    .get("text")
+                    .or_else(|| map.get("value"))
+                    .or_else(|| map.get("refusal"));
+                if let Some(text) = value.and_then(probe_text_value) {
+                    target.push_str(&text);
+                }
+            }
+            // Reasoning and tool-call items are not visible probe replies.
+            Some(
+                "reasoning" | "thinking" | "summary_text" | "reasoning_text" | "function_call"
+                | "custom_tool_call",
+            ) => {}
+            _ => {}
+        },
+        _ => {}
+    }
+}
+
+fn extract_probe_content_text(value: &Value) -> String {
+    let mut text = String::new();
+    append_probe_content_text(&mut text, value);
+    text
+}
+
+fn extract_probe_responses_text(json: &Value) -> String {
+    if let Some(text) = json
+        .get("output_text")
+        .and_then(probe_text_value)
+        .filter(|text| !text.trim().is_empty())
+    {
+        return text;
+    }
+    json.get("output")
+        .map(extract_probe_content_text)
+        .unwrap_or_default()
+}
+
+/// Collect reasoning only from typed reasoning/thinking items or containers.
+fn append_probe_reasoning_text(target: &mut String, value: &Value) {
+    match value {
+        Value::String(text) if !text.trim().is_empty() => {
+            append_probe_candidate_text(target, text.to_string());
+        }
+        Value::Array(values) => {
+            for value in values {
+                append_probe_reasoning_text(target, value);
+            }
+        }
+        Value::Object(map) => match map.get("type").and_then(Value::as_str) {
+            Some("reasoning") => {
+                for field in ["summary", "content", "text", "value"] {
+                    if let Some(value) = map.get(field) {
+                        append_probe_reasoning_text(target, value);
+                    }
+                }
+            }
+            Some("thinking") => {
+                for field in ["thinking", "text", "value"] {
+                    if let Some(value) = map.get(field) {
+                        append_probe_reasoning_text(target, value);
+                    }
+                }
+            }
+            Some("summary_text" | "reasoning_text") => {
+                for field in ["text", "value"] {
+                    if let Some(value) = map.get(field) {
+                        append_probe_reasoning_text(target, value);
+                    }
+                }
+            }
+            // Tool calls and visible message parts never contribute reasoning.
+            Some(
+                "message" | "output_text" | "text" | "refusal" | "function_call"
+                | "custom_tool_call",
+            ) => {}
+            _ => {
+                for field in ["output", "reasoning", "reasoning_content", "thinking"] {
+                    if let Some(value) = map.get(field) {
+                        append_probe_reasoning_text(target, value);
+                    }
+                }
+            }
+        },
+        _ => {}
+    }
+}
+
+fn extract_probe_reasoning_text(value: &Value) -> String {
+    let mut text = String::new();
+    append_probe_reasoning_text(&mut text, value);
+    text
+}
+
+fn extract_probe_reply_json(json: &Value) -> Option<String> {
+    let raw = if json.get("choices").is_some() {
+        // OpenAI chat.completions: visible content wins over thinking-only text.
+        let message = json.pointer("/choices/0/message")?;
+        let content = message
+            .get("content")
+            .map(extract_probe_content_text)
+            .unwrap_or_default();
+        if !content.trim().is_empty() {
+            Some(content)
+        } else {
+            let reasoning = message
+                .get("reasoning_content")
+                .or_else(|| message.get("reasoning"))
+                .map(extract_probe_reasoning_text)
+                .unwrap_or_default();
+            (!reasoning.trim().is_empty()).then(|| format!("[thinking] {reasoning}"))
+        }
+    } else if json.get("output").is_some() || json.get("output_text").is_some() {
+        // Responses may expose output_text directly or nest typed content.
+        if json
+            .get("status")
+            .and_then(Value::as_str)
+            .is_some_and(|status| status != "completed")
+        {
+            return None;
+        }
+        let text = extract_probe_responses_text(json);
+        if !text.trim().is_empty() {
+            Some(text)
+        } else {
+            let reasoning = extract_probe_reasoning_text(json);
+            if !reasoning.trim().is_empty() {
+                Some(format!("[thinking] {reasoning}"))
+            } else if json.get("status").and_then(Value::as_str) == Some("completed") {
+                Some("[completed]".to_string())
+            } else {
+                None
+            }
+        }
+    } else if json.get("content").is_some() {
+        // Anthropic messages: visible text blocks win over thinking blocks.
+        let text = json
+            .get("content")
+            .map(extract_probe_content_text)
+            .unwrap_or_default();
+        if !text.trim().is_empty() {
+            Some(text)
+        } else {
+            let thinking = json
+                .get("content")
+                .map(extract_probe_reasoning_text)
+                .unwrap_or_default();
+            (!thinking.trim().is_empty()).then(|| format!("[thinking] {thinking}"))
+        }
+    } else if json.get("status").and_then(Value::as_str) == Some("completed") {
+        Some("[completed]".to_string())
+    } else {
+        None
     }?;
     let trimmed = raw.trim().to_string();
     (!trimmed.is_empty()).then_some(trimmed)
@@ -1292,6 +1588,8 @@ impl AdminService {
             .resolve_alias(&suite_raw)
             .map(|endpoint| endpoint.to_string())
             .unwrap_or_else(|| suite_raw.clone());
+        let fast_mode = provider.fast_mode;
+        let channel = provider.channel.clone();
 
         let mut results: Vec<ProviderModelProbeResult> = futures::stream::iter(models)
             .map(|model| {
@@ -1301,6 +1599,7 @@ impl AdminService {
                 let scheme = effective_scheme.to_string();
                 let runtime_headers = runtime_headers.clone();
                 let protocol_id = protocol_id.clone();
+                let channel = channel.clone();
                 async move {
                     probe_single_model(
                         client,
@@ -1311,6 +1610,8 @@ impl AdminService {
                         &runtime_headers,
                         &model,
                         &protocol_id,
+                        fast_mode,
+                        channel.as_deref(),
                         is_codex_oauth,
                     )
                     .await
@@ -1692,6 +1993,194 @@ mod probe_reply_tests {
     }
 
     #[test]
+    fn openai_responses_walks_all_content_parts_and_text_values() {
+        let body = r#"{"output":[
+            {"type":"reasoning","summary":[{"type":"summary_text","text":"internal"}]},
+            {"type":"message","content":[
+                {"type":"output_text","text":""},
+                {"type":"output_text","text":{"value":"hello from sol"}}
+            ]}
+        ]}"#;
+        assert_eq!(extract_probe_reply(body).as_deref(), Some("hello from sol"));
+    }
+
+    #[test]
+    fn codex_sse_accepts_output_text_done_without_a_delta() {
+        let body = concat!(
+            "event: response.output_text.done\n",
+            "data: {\"type\":\"response.output_text.done\",\"text\":{\"value\":\"hello from sol\"}}\n\n",
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[]}}\n\n"
+        );
+        assert_eq!(extract_probe_reply(body).as_deref(), Some("hello from sol"));
+    }
+
+    #[test]
+    fn codex_sse_uses_payload_type_and_multiline_crlf_data() {
+        let body = concat!(
+            "data: {\"type\":\"response.output_text.done\",\"text\":\"hello\"}\r\n\r\n",
+            "data: {\"response\":{\"status\":\"completed\",\r\n",
+            "data: \"output\":[]}}\r\n\r\n"
+        );
+        assert_eq!(extract_probe_reply(body).as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn codex_sse_reasoning_text_alias_is_a_fallback() {
+        let body = concat!(
+            "data: {\"type\":\"response.reasoning_text.delta\",\"delta\":\"pondering\"}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"output\":[]}}\n\n"
+        );
+        assert_eq!(
+            extract_probe_reply(body).as_deref(),
+            Some("[thinking] pondering")
+        );
+    }
+
+    #[test]
+    fn codex_sse_output_item_done_can_carry_text_after_empty_parts() {
+        let body = concat!(
+            "event: response.output_item.done\n",
+            "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"\"},{\"type\":\"output_text\",\"text\":{\"value\":\"answer\"}}]}}\n\n",
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[]}}\n\n"
+        );
+        assert_eq!(extract_probe_reply(body).as_deref(), Some("answer"));
+    }
+
+    #[test]
+    fn codex_sse_does_not_duplicate_output_text_done_and_item_done() {
+        let body = concat!(
+            "event: response.output_text.done\n",
+            "data: {\"type\":\"response.output_text.done\",\"text\":\"answer\"}\n\n",
+            "event: response.output_item.done\n",
+            "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"answer\"}]}}\n\n",
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[]}}\n\n"
+        );
+        assert_eq!(extract_probe_reply(body).as_deref(), Some("answer"));
+    }
+
+    #[test]
+    fn incomplete_terminal_event_is_not_a_success() {
+        let body = concat!(
+            "event: response.output_text.delta\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n\n",
+            "event: response.incomplete\n",
+            "data: {\"type\":\"response.incomplete\",\"response\":{\"status\":\"incomplete\"}}\n\n"
+        );
+        assert_eq!(extract_probe_reply(body), None);
+    }
+
+    #[test]
+    fn first_terminal_event_wins_over_late_failure() {
+        let body = concat!(
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[]}}\n\n",
+            "event: response.failed\n",
+            "data: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\"}}\n\n"
+        );
+        assert_eq!(extract_probe_reply(body).as_deref(), Some("[completed]"));
+    }
+
+    #[test]
+    fn failure_before_completion_is_not_a_success() {
+        let body = concat!(
+            "event: response.failed\n",
+            "data: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\"}}\n\n",
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n"
+        );
+        assert_eq!(extract_probe_reply(body), None);
+    }
+
+    #[test]
+    fn visible_deltas_beat_conflicting_terminal_text() {
+        let body = concat!(
+            "event: response.output_text.delta\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"delta answer\"}\n\n",
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output_text\":\"different answer\"}}\n\n"
+        );
+        assert_eq!(extract_probe_reply(body).as_deref(), Some("delta answer"));
+    }
+
+    #[test]
+    fn nonstream_incomplete_response_is_not_a_success() {
+        let body = r#"{"status":"incomplete","output":[
+            {"type":"message","content":[{"type":"output_text","text":"partial"}]}
+        ]}"#;
+        assert_eq!(extract_probe_reply(body), None);
+    }
+
+    #[test]
+    fn empty_output_text_falls_back_to_typed_output_parts() {
+        let body = r#"{"status":"completed","output_text":"","output":[
+            {"type":"message","content":[{"type":"output_text","text":"answer"}]}
+        ]}"#;
+        assert_eq!(extract_probe_reply(body).as_deref(), Some("answer"));
+    }
+
+    #[test]
+    fn streamed_delta_fragments_preserve_interword_whitespace() {
+        let body = concat!(
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\" \"}\n\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"world\"}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n"
+        );
+        assert_eq!(extract_probe_reply(body).as_deref(), Some("hello world"));
+    }
+
+    #[test]
+    fn tool_reasoning_fields_do_not_become_probe_text() {
+        let body = r#"{"status":"completed","output":[
+            {"type":"function_call","name":"exec","reasoning":"internal"},
+            {"type":"custom_tool_call","name":"wait","text":"internal"}
+        ]}"#;
+        assert_eq!(extract_probe_reply(body).as_deref(), Some("[completed]"));
+    }
+
+    #[test]
+    fn tool_only_responses_do_not_become_visible_text() {
+        let body = r#"{"status":"completed","output":[
+            {"type":"function_call","name":"exec","arguments":"run"},
+            {"type":"custom_tool_call","name":"wait","input":"later"}
+        ]}"#;
+        assert_eq!(extract_probe_reply(body).as_deref(), Some("[completed]"));
+    }
+
+    #[test]
+    fn whitespace_only_delta_falls_back_to_terminal_text() {
+        let body = concat!(
+            "event: response.output_text.delta\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"   \"}\n\n",
+            "event: response.output_text.done\n",
+            "data: {\"type\":\"response.output_text.done\",\"text\":\"answer\"}\n\n",
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n"
+        );
+        assert_eq!(extract_probe_reply(body).as_deref(), Some("answer"));
+    }
+
+    #[test]
+    fn unterminated_final_sse_event_is_processed() {
+        let body = concat!(
+            "event: response.output_text.done\n",
+            "data: {\"type\":\"response.output_text.done\",\"text\":\"answer\"}\n\n",
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}"
+        );
+        assert_eq!(extract_probe_reply(body).as_deref(), Some("answer"));
+    }
+
+    #[test]
+    fn malformed_terminal_payload_is_not_a_success() {
+        let body = "event: response.completed\ndata: {not-json}\n\n";
+        assert_eq!(extract_probe_reply(body), None);
+    }
+
+    #[test]
     fn oauth_runtime_headers_authoritatively_authenticate_model_probe() {
         let runtime_headers = HeaderMap::from_iter([
             (
@@ -1715,6 +2204,8 @@ mod probe_reply_tests {
             &runtime_headers,
             "gpt-5-codex",
             true,
+            Some("codex"),
+            true,
         )
         .unwrap();
 
@@ -1731,6 +2222,11 @@ mod probe_reply_tests {
         );
         assert_eq!(body.get("stream").and_then(Value::as_bool), Some(true));
         assert_eq!(body.get("store").and_then(Value::as_bool), Some(false));
+        assert_eq!(
+            body.get("service_tier").and_then(Value::as_str),
+            Some("priority"),
+            "Fast mode must be applied to Codex model probes",
+        );
         assert_eq!(
             body.pointer("/input/0/content/0/type")
                 .and_then(Value::as_str),
@@ -1764,6 +2260,63 @@ mod probe_reply_tests {
     }
 
     #[test]
+    fn model_probe_uses_fast_mode_for_sub2api_responses() {
+        let (_, _, body) = build_model_probe_request(
+            crate::protocol::ids::Protocol::OpenAIResponses,
+            "https://example.com/v1",
+            "sk-test",
+            "bearer",
+            &HeaderMap::new(),
+            "gpt-test",
+            true,
+            Some("sub2api"),
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(body["service_tier"], "priority");
+    }
+
+    #[test]
+    fn model_probe_fast_mode_stays_scoped_to_responses_consumer_channels() {
+        for (protocol, fast_mode, channel) in [
+            (
+                crate::protocol::ids::Protocol::OpenAIResponses,
+                false,
+                Some("sub2api"),
+            ),
+            (
+                crate::protocol::ids::Protocol::OpenAIResponses,
+                true,
+                Some("default"),
+            ),
+            (
+                crate::protocol::ids::Protocol::OpenAICompatible,
+                true,
+                Some("sub2api"),
+            ),
+        ] {
+            let (_, _, body) = build_model_probe_request(
+                protocol,
+                "https://example.com/v1",
+                "sk-test",
+                "bearer",
+                &HeaderMap::new(),
+                "gpt-test",
+                fast_mode,
+                channel,
+                false,
+            )
+            .unwrap();
+
+            assert!(
+                body.get("service_tier").is_none(),
+                "protocol={protocol:?} fast_mode={fast_mode} channel={channel:?}",
+            );
+        }
+    }
+
+    #[test]
     fn runtime_authorization_overrides_default_probe_api_key() {
         let runtime_headers = HeaderMap::from_iter([(
             AUTHORIZATION,
@@ -1776,6 +2329,8 @@ mod probe_reply_tests {
             "bearer",
             &runtime_headers,
             "gpt-test",
+            false,
+            None,
             false,
         )
         .unwrap();

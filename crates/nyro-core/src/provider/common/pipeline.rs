@@ -21,7 +21,7 @@ use serde_json::Value;
 
 use crate::db::models::Provider;
 use crate::error::GatewayError;
-use crate::protocol::ids::{OPENAI_RESPONSES_V1, ProtocolId};
+use crate::protocol::ids::{OPENAI_RESPONSES_V1, Protocol, ProtocolId};
 use crate::provider::vendor::Vendor;
 
 /// ChatGPT 消费级上游渠道（codex OAuth 直连 / sub2api 中转）。sub2api
@@ -44,12 +44,27 @@ pub(crate) fn maybe_inject_openai_fast_mode(
     provider: &Provider,
     protocol: ProtocolId,
 ) {
-    let is_openai_fast = provider.fast_mode
-        && provider
-            .channel
-            .as_deref()
-            .is_some_and(|channel| is_codex_consumer_channel(channel));
-    if !is_openai_fast || protocol != OPENAI_RESPONSES_V1 {
+    if protocol != OPENAI_RESPONSES_V1 {
+        return;
+    }
+    maybe_inject_openai_fast_mode_for_protocol(
+        body,
+        provider.fast_mode,
+        provider.channel.as_deref(),
+        protocol.protocol,
+    );
+}
+
+/// Apply the same Fast mode policy to requests that are built outside the
+/// provider pipeline, such as the admin model probe.
+pub(crate) fn maybe_inject_openai_fast_mode_for_protocol(
+    body: &mut Value,
+    fast_mode: bool,
+    channel: Option<&str>,
+    protocol: Protocol,
+) {
+    let is_openai_fast = fast_mode && channel.is_some_and(is_codex_consumer_channel);
+    if !is_openai_fast || protocol != Protocol::OpenAIResponses {
         return;
     }
     if let Some(object) = body.as_object_mut()
