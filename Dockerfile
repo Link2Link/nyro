@@ -9,7 +9,15 @@ LABEL org.opencontainers.image.title="Nyro AI Gateway" \
       org.opencontainers.image.version="${NYRO_VERSION}" \
       org.opencontainers.image.licenses="Apache-2.0"
 
-RUN apt-get update \
+# Mainland-China apt mirror for faster local builds. Pass an empty
+# APT_MIRROR (--build-arg APT_MIRROR=) to keep the default deb.debian.org.
+ARG APT_MIRROR=mirrors.tuna.tsinghua.edu.cn
+
+RUN if [ -n "${APT_MIRROR}" ]; then \
+        sed -i "s@//deb.debian.org/@//${APT_MIRROR}/@g; s@//security.debian.org/@//${APT_MIRROR}/@g" \
+            /etc/apt/sources.list.d/debian.sources; \
+    fi \
+    && apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl libgcc-s1 tzdata \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --system nyro \
