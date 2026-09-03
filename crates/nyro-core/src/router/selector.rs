@@ -92,6 +92,7 @@ impl RoutingStrategy for WeightedStrategy {
         for target in targets.iter().filter(|t| t.weight <= 0) {
             decision.candidates.push(DecisionCandidate {
                 provider: target.provider_id.clone(),
+                provider_name: None,
                 target: target.model.clone(),
                 rank: None,
                 weight: None,
@@ -107,6 +108,7 @@ impl RoutingStrategy for WeightedStrategy {
             let weight = target.weight as f64;
             decision.candidates.push(DecisionCandidate {
                 provider: target.provider_id.clone(),
+                provider_name: None,
                 target: target.model.clone(),
                 rank: Some(index + 1),
                 weight: Some(weight),
@@ -146,6 +148,7 @@ impl RoutingStrategy for PriorityStrategy {
                 rank += 1;
                 decision.candidates.push(DecisionCandidate {
                     provider: target.provider_id.clone(),
+                    provider_name: None,
                     target: target.model.clone(),
                     rank: Some(rank),
                     weight: None,
@@ -210,6 +213,7 @@ impl RoutingStrategy for LatencyStrategy {
             };
             decision.candidates.push(DecisionCandidate {
                 provider: target.provider_id.clone(),
+                provider_name: None,
                 target: target.model.clone(),
                 rank: Some(index + 1),
                 weight: None,
@@ -254,6 +258,7 @@ impl RoutingStrategy for UsageStrategy {
         for target in targets.iter().filter(|target| target.weight <= 0) {
             decision.candidates.push(DecisionCandidate {
                 provider: target.provider_id.clone(),
+                provider_name: None,
                 target: target.model.clone(),
                 rank: None,
                 weight: None,
@@ -338,6 +343,7 @@ impl RoutingStrategy for UsageStrategy {
                 rank += 1;
                 decision.candidates.push(DecisionCandidate {
                     provider: target.provider_id.clone(),
+                    provider_name: None,
                     target: target.model.clone(),
                     rank: Some(rank),
                     weight: Some(weight),
@@ -394,6 +400,7 @@ fn usage_candidate(
     });
     DecisionCandidate {
         provider: target.provider_id.clone(),
+        provider_name: None,
         target: target.model.clone(),
         rank,
         weight,
@@ -477,6 +484,7 @@ impl TargetSelector {
         for (offset, target) in fallback.iter().enumerate() {
             decision.candidates.push(DecisionCandidate {
                 provider: target.provider_id.clone(),
+                provider_name: None,
                 target: target.model.clone(),
                 rank: Some(base_rank + offset + 1),
                 weight: None,

@@ -513,6 +513,15 @@ async fn dispatch_pipeline_inner(
         &gw.quota_registry,
         &gw.health_registry,
     );
+    // Stamp human-readable provider names onto the snapshot right after
+    // selection: provider ids are opaque UUIDs, and the persisted
+    // route_decision should read without a provider join. Lookup failures
+    // leave the id — the WebUI maps ids back to names as a fallback.
+    for provider_id in route_decision.unnamed_provider_ids() {
+        if let Ok(Some(provider)) = gw.storage.providers().get(&provider_id).await {
+            route_decision.set_provider_name(&provider_id, &provider.name);
+        }
+    }
     if ordered_targets.is_empty() {
         LogBuilder::from_dispatch(
             &gw,

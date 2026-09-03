@@ -871,13 +871,13 @@ async fn import_config_handler(
 fn usage_err(e: anyhow::Error) -> axum::response::Response {
     let message = e.to_string();
     let lower = message.to_ascii_lowercase();
+    // Upstream credential failures ("authentication failed", "re-authorize",
+    // "missing chatgpt_account_id") describe the PROVIDER's credentials, not
+    // the caller's admin token. Mapping them to 401 made WebUI clients treat
+    // their admin session as expired and force a logout loop on the providers
+    // page. Report them as upstream (502) failures with the same message.
     let status = if lower.contains("not found") {
         StatusCode::NOT_FOUND
-    } else if lower.contains("authentication failed")
-        || lower.contains("re-authorize")
-        || lower.contains("missing chatgpt_account_id")
-    {
-        StatusCode::UNAUTHORIZED
     } else if lower.contains("rate limited") || lower.contains("http 429") {
         StatusCode::TOO_MANY_REQUESTS
     } else if lower.contains("not supported") || lower.contains("requires an oauth provider") {
@@ -890,4 +890,47 @@ fn usage_err(e: anyhow::Error) -> axum::response::Response {
 
 fn err(e: anyhow::Error) -> axum::response::Response {
     Json(serde_json::json!({ "error": e.to_string() })).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::StatusCode;
+
+    fn status_of(message: &str) -> StatusCode {
+        usage_err(anyhow::anyhow!("{message}")).status()
+    }
+
+    #[test]
+    fn upstream_auth_failures_are_not_admin_401() {
+        // A provider whose API key is rejected upstream must not surface as
+        // HTTP 401 on the admin API — that status means the admin session
+        // itself is invalid and triggers a WebUI logout.
+        assert_eq!(
+            status_of("authentication failed (HTTP 401 Unauthorized): check the provider API key"),
+            StatusCode::BAD_GATEWAY
+        );
+        assert_eq!(
+            status_of("OpenAI Codex authentication failed (HTTP 401 Unauthorized); re-authorize this provider"),
+            StatusCode::BAD_GATEWAY
+        );
+        assert_eq!(
+            status_of("missing chatgpt_account_id for codex usage query"),
+            StatusCode::BAD_GATEWAY
+        );
+    }
+
+    #[test]
+    fn usage_err_status_mapping() {
+        assert_eq!(status_of("provider not found"), StatusCode::NOT_FOUND);
+        assert_eq!(
+            status_of("OpenAI Codex usage endpoint is rate limited (HTTP 429)"),
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        assert_eq!(
+            status_of("usage query not supported for this provider"),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(status_of("HTTP 503: upstream unavailable"), StatusCode::BAD_GATEWAY);
+    }
 }

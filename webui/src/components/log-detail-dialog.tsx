@@ -1,10 +1,10 @@
 import { useQuery } from "@tanstack/react-query";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Check, Copy, Download, Loader2, Trash2 } from "lucide-react";
 
 import { backend } from "@/lib/backend";
 import { useLocale } from "@/lib/i18n";
-import type { RequestLog } from "@/lib/types";
+import type { Provider, RequestLog } from "@/lib/types";
 import { computeTps, formatDuration, formatLogTime, formatTokenCount, formatTps, generationMsOf, tryPrettyJson } from "@/lib/format";
 import { prettyName } from "@/lib/protocol";
 import { cn, copyToClipboard } from "@/lib/utils";
@@ -40,6 +40,19 @@ export function LogDetailDialog({ logId, summary, open, onOpenChange, onDelete }
     queryFn: () => backend("get_log", { id: logId! }),
     enabled: open && !!logId,
   });
+
+  // Shared ["providers"] cache with the logs page. Route-decision snapshots
+  // store opaque provider ids; older rows have no embedded name, so resolve
+  // id → display name here for readable labels.
+  const { data: providers = [] } = useQuery<Provider[]>({
+    queryKey: ["providers"],
+    queryFn: () => backend("get_providers"),
+    enabled: open,
+  });
+  const providerNameById = useMemo(
+    () => new Map(providers.map((p) => [p.id, p.name])),
+    [providers],
+  );
 
   const [downloaded, setDownloaded] = useState(false);
   const [idCopied, setIdCopied] = useState(false);
@@ -306,7 +319,7 @@ export function LogDetailDialog({ logId, summary, open, onOpenChange, onDelete }
                 title={isZh ? "0. 路由决策" : "0. Route Decision"}
                 hint={isZh ? "本次请求为何选择该上游" : "Why this upstream was chosen"}
               />
-              <RouteDecisionBlock raw={log.route_decision} isZh={isZh} />
+              <RouteDecisionBlock raw={log.route_decision} isZh={isZh} providerNameById={providerNameById} />
             </>
           ) : null}
           <SectionHeader
@@ -388,6 +401,8 @@ interface RouteDecisionData {
   balance: string;
   candidates: Array<{
     provider: string;
+    /** Embedded display name (newer snapshots); older rows resolve via providers. */
+    provider_name?: string;
     target: string;
     rank?: number;
     weight?: number;
@@ -413,7 +428,15 @@ function scoreText(score: Record<string, unknown> | undefined): string {
   return parts.length ? parts.join(" · ") : "–";
 }
 
-function RouteDecisionBlock({ raw, isZh }: { raw: string; isZh: boolean }) {
+function RouteDecisionBlock({
+  raw,
+  isZh,
+  providerNameById,
+}: {
+  raw: string;
+  isZh: boolean;
+  providerNameById: Map<string, string>;
+}) {
   let dec: RouteDecisionData | null = null;
   try {
     dec = JSON.parse(raw) as RouteDecisionData;
@@ -433,6 +456,9 @@ function RouteDecisionBlock({ raw, isZh }: { raw: string; isZh: boolean }) {
     <div className="space-y-1.5">
       {dec.candidates.map((c, i) => {
         const skipped = c.skipped;
+        // Prefer the name embedded in the snapshot, then the providers list;
+        // only fall back to the raw id when neither is available.
+        const providerLabel = c.provider_name ?? providerNameById.get(c.provider) ?? c.provider;
         return (
           <div
             key={i}
@@ -444,9 +470,14 @@ function RouteDecisionBlock({ raw, isZh }: { raw: string; isZh: boolean }) {
             >
               {skipped ? "✕" : c.rank}
             </span>
-            <span className="min-w-0 flex-1 truncate font-medium text-slate-700" title={`${c.provider} · ${c.target}`}>
+            <span
+              className="min-w-0 flex-1 truncate font-medium text-slate-700"
+              title={`${providerLabel} · ${c.target}\n${c.provider}`}
+            >
               {c.target}
-              <span className="ml-1 text-[10px] font-normal text-slate-400">{c.provider.slice(0, 8)}</span>
+              <span className="ml-1 inline-flex max-w-[7rem] items-center truncate rounded bg-slate-200/70 px-1.5 py-0.5 align-middle text-[10px] font-normal text-slate-500">
+                {providerLabel}
+              </span>
             </span>
             <span className="shrink-0 text-[10px] text-slate-500">{scoreText(c.score)}</span>
             {typeof c.share === "number" ? (

@@ -26,6 +26,12 @@ pub struct RouteDecision {
 #[derive(Debug, Clone, Serialize)]
 pub struct DecisionCandidate {
     pub provider: String,
+    /// Human-readable provider display name, resolved by the dispatcher right
+    /// after selection so the persisted snapshot reads without a provider
+    /// join. Absent when the provider row could not be loaded (the WebUI then
+    /// maps the id back to a name as a fallback for such older rows).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_name: Option<String>,
     /// Declared backend model of the target row.
     pub target: String,
     /// Position in the attempt order (1 = tried first). `None` when the
@@ -72,6 +78,28 @@ impl RouteDecision {
     pub fn to_json(&self) -> String {
         serde_json::to_string(self)
             .unwrap_or_else(|_| format!("{{\"balance\":\"{}\",\"candidates\":[]}}", self.balance))
+    }
+
+    /// Stamp the display name onto every candidate of one provider.
+    pub fn set_provider_name(&mut self, provider_id: &str, name: &str) {
+        for candidate in &mut self.candidates {
+            if candidate.provider == provider_id {
+                candidate.provider_name = Some(name.to_string());
+            }
+        }
+    }
+
+    /// Distinct provider ids whose candidates still lack a display name, in
+    /// snapshot order. Owned strings so callers can mutate the decision while
+    /// resolving each id.
+    pub fn unnamed_provider_ids(&self) -> Vec<String> {
+        let mut seen = std::collections::HashSet::new();
+        self.candidates
+            .iter()
+            .filter(|candidate| candidate.provider_name.is_none())
+            .map(|candidate| candidate.provider.clone())
+            .filter(|id| seen.insert(id.clone()))
+            .collect()
     }
 
     /// Mark every not-yet-annotated candidate of one provider as disabled.
@@ -121,5 +149,40 @@ impl SkipReason {
             window,
             retry_in_secs: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn candidate(provider: &str, target: &str, rank: Option<usize>) -> DecisionCandidate {
+        DecisionCandidate {
+            provider: provider.to_string(),
+            provider_name: None,
+            target: target.to_string(),
+            rank,
+            weight: None,
+            share: None,
+            score: None,
+            skipped: None,
+        }
+    }
+
+    #[test]
+    fn set_provider_name_stamps_every_candidate_of_that_provider() {
+        let mut decision = RouteDecision::new("weighted");
+        decision.candidates.push(candidate("p-1", "m-a", Some(1)));
+        decision.candidates.push(candidate("p-1", "m-b", Some(2)));
+        decision.candidates.push(candidate("p-2", "m-a", None));
+
+        assert_eq!(decision.unnamed_provider_ids(), vec!["p-1", "p-2"]);
+        decision.set_provider_name("p-1", "GLM Pro");
+        assert_eq!(decision.unnamed_provider_ids(), vec!["p-2"]);
+
+        let json = decision.to_json();
+        // Both p-1 rows carry the name; p-2 omits the field entirely.
+        assert_eq!(json.matches("GLM Pro").count(), 2);
+        assert!(!json.contains("\"provider_name\":null"));
     }
 }

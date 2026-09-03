@@ -27,6 +27,14 @@ async function invokeHTTP<T>(cmd: string, args?: Record<string, unknown>): Promi
   const resp = await fetch(mapping.url, init);
 
   if (resp.status === 401 && window.location.pathname !== "/login") {
+    // A 401 may mean the admin session expired, or the endpoint is
+    // reporting an upstream credential failure (e.g. a provider whose API
+    // key was rejected by its usage service). Re-validate the admin session
+    // before wiping the token so only a real session loss forces a logout.
+    if (await probeAdminSession()) {
+      const body = await resp.json().catch(() => ({}));
+      throw new Error(body.error || `HTTP 401`);
+    }
     clearAdminToken();
     window.location.replace("/login");
     throw new Error("Authentication required");
@@ -55,6 +63,31 @@ interface HTTPMapping {
   method: string;
   url: string;
   body?: Record<string, unknown>;
+}
+
+let adminSessionProbe: Promise<boolean> | null = null;
+
+/**
+ * Check whether the stored admin token still authenticates against
+ * /api/v1/status. Concurrent 401 handlers share one in-flight probe.
+ */
+function probeAdminSession(): Promise<boolean> {
+  if (!adminSessionProbe) {
+    adminSessionProbe = (async () => {
+      try {
+        const headers: Record<string, string> = {};
+        const token = getAdminToken();
+        if (token) headers["Authorization"] = `Bearer ${token}`;
+        const resp = await fetch("/api/v1/status", { headers });
+        return resp.ok;
+      } catch {
+        return false;
+      } finally {
+        adminSessionProbe = null;
+      }
+    })();
+  }
+  return adminSessionProbe;
 }
 
 function resolveHTTP(cmd: string, args?: Record<string, unknown>): HTTPMapping {
