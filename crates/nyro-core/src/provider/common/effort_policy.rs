@@ -11,6 +11,7 @@
 //! | MiniMax             |   ✅   |     ✅ honored off     | normalize → `none`  |
 //! | Kimi coding         |   ✅   |       ✅ ignored       | normalize → `none`  |
 //! | OpenAI / sub2api    |   ✅   |       ✅ ignored       | normalize → `none`  |
+//! | GPT-6 Astra         | ❌ 400 |       n/a (→none)      | clamp off → `low`   |
 //! | OpenCode zen (go)   | ❌ 400 |       n/a (→none)      | clamp off → `low`   |
 //! | Volcengine Ark glm  | ❌ 400 |       n/a (→none)      | clamp off → `low`   |
 //!
@@ -136,7 +137,9 @@ fn is_max_effort(effort: &str) -> bool {
 
 /// Off 意图（`none` 及其 misspelling）钳制为最小合法档 `low` 的共享内核。
 /// 供「思考型模型拒收一切 off 形态」的上游方言复用。
-fn clamp_off_effort_to_low(body: &mut Value) {
+/// Handles Chat and Responses without narrowing other tiers: GPT-6 Astra
+/// accepts medium/xhigh as well as low/high/max (request bcd2a3ed).
+pub(crate) fn clamp_off_effort_to_low(body: &mut Value) {
     let Some(object) = body.as_object_mut() else {
         return;
     };
@@ -147,6 +150,14 @@ fn clamp_off_effort_to_low(body: &mut Value) {
             "reasoning_effort".to_string(),
             Value::String("low".to_string()),
         );
+    }
+    if let Some(reasoning) = object.get_mut("reasoning").and_then(Value::as_object_mut)
+        && reasoning
+            .get("effort")
+            .and_then(Value::as_str)
+            .is_some_and(is_off_effort)
+    {
+        reasoning.insert("effort".to_string(), Value::String("low".to_string()));
     }
 }
 
@@ -271,6 +282,44 @@ mod tests {
         let mut bare = json!({"model": "m"});
         normalize_enum_effort(&mut bare);
         assert!(bare.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn off_clamp_handles_both_wire_shapes_without_narrowing_valid_tiers() {
+        for raw in ["none", "disable", "disabled", "off", " NONE ", "OFF"] {
+            let mut body = json!({
+                "reasoning_effort": raw,
+                "reasoning": {"effort": raw, "summary": "auto"}
+            });
+            clamp_off_effort_to_low(&mut body);
+            assert_eq!(body["reasoning_effort"], "low", "raw={raw}");
+            assert_eq!(body["reasoning"]["effort"], "low", "raw={raw}");
+            assert_eq!(body["reasoning"]["summary"], "auto");
+            let once = body.clone();
+            clamp_off_effort_to_low(&mut body);
+            assert_eq!(body, once, "clamp must be idempotent");
+        }
+        for raw in ["low", "medium", "high", "xhigh", "max", "future-value"] {
+            let mut body = json!({"reasoning_effort": raw, "reasoning": {"effort": raw}});
+            let original = body.clone();
+            clamp_off_effort_to_low(&mut body);
+            assert_eq!(body, original, "raw={raw} must pass through");
+        }
+        for mut body in [
+            json!(null),
+            json!([]),
+            json!({}),
+            json!({"reasoning": {"summary": "auto"}}),
+            json!({"reasoning_effort": null, "reasoning": {"effort": 3}}),
+            json!({"reasoning": "none"}),
+        ] {
+            let original = body.clone();
+            clamp_off_effort_to_low(&mut body);
+            assert_eq!(
+                body, original,
+                "missing/malformed directives stay untouched"
+            );
+        }
     }
 
     #[test]

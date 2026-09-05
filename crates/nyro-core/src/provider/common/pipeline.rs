@@ -300,6 +300,12 @@ pub(crate) fn apply_vendor_effort_policy(body: &mut Value, provider: &Provider) 
         || body_model.trim().to_ascii_lowercase().starts_with("grok-");
     if is_grok {
         super::effort_policy::drop_grok_effort(body);
+    } else if body_model.trim().eq_ignore_ascii_case("gpt-6-astra") {
+        // Live Codex rejection, request bcd2a3ed-af4b-44d7-8b94-3c7c29876396:
+        // none is unsupported; low/medium/high/xhigh/max are accepted. Match
+        // only the verified upstream model, including custom relay vendors.
+        // Do not use the GLM clamp: it would narrow valid medium/xhigh tiers.
+        super::effort_policy::clamp_off_effort_to_low(body);
     } else if is_thinking_mandatory_model(body_model) {
         // 模型本体不支持关闭思考（如 glm-5.3-flash）：off 意图钳为 low。
         // 必须排在 normalize 之前：misspelling disable 会先被归一成
@@ -1042,10 +1048,12 @@ mod tests {
         assert_eq!(out.body["project"], "cloudaicompanion-1");
         assert_eq!(out.body["requestType"], "agent");
         assert_eq!(out.body["userAgent"], "antigravity");
-        assert!(out.body["requestId"]
-            .as_str()
-            .unwrap()
-            .starts_with("agent-"));
+        assert!(
+            out.body["requestId"]
+                .as_str()
+                .unwrap()
+                .starts_with("agent-")
+        );
         // The standard Gemini body rides under request.contents.
         assert!(out.body["request"]["contents"].is_array());
     }
@@ -2658,6 +2666,100 @@ mod tests {
             out.body["generationConfig"]["temperature"], 0.7,
             "sibling generationConfig keys must survive",
         );
+    }
+
+    /// Sanitized reproduction of bcd2a3ed-af4b-44d7-8b94-3c7c29876396:
+    /// Codex rejected gpt-6-astra + reasoning.effort=none with unsupported_value.
+    #[tokio::test]
+    async fn astra_responses_passthrough_clamps_off_and_preserves_supported_tiers() {
+        let gw = build_test_gateway().await;
+        for channel in ["codex", "sub2api", "custom"] {
+            let provider = provider_with_channel("sk-test", Some(channel), false);
+            let ctx = responses_ctx_model(&provider, &gw, "gpt-6-astra");
+            for raw in [
+                "none", "disable", "disabled", "off", "low", "medium", "high", "xhigh", "max",
+            ] {
+                let expected = if matches!(raw, "none" | "disable" | "disabled" | "off") {
+                    "low"
+                } else {
+                    raw
+                };
+                let out = passthrough_run(
+                    &FakeApiKeyVendor,
+                    serde_json::json!({
+                        "model": "gpt-6-astra",
+                        "input": "ping",
+                        "reasoning": {"effort": raw, "summary": "auto"},
+                        "stream": true
+                    }),
+                    &ctx,
+                    true,
+                )
+                .await
+                .expect("passthrough succeeds");
+                assert_eq!(
+                    out.body["reasoning"]["effort"], expected,
+                    "{channel}: {raw}"
+                );
+                assert_eq!(out.body["reasoning"]["summary"], "auto");
+                assert_eq!(out.body["input"], "ping");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn astra_chat_and_ir_paths_clamp_using_actual_upstream_model() {
+        let gw = build_test_gateway().await;
+        let provider = provider_with_vendor("sk-test", Some("custom"));
+        let chat_ctx = openai_chat_ctx(&provider, &gw, "gpt-6-astra");
+        let out = passthrough_run(
+            &FakeApiKeyVendor,
+            serde_json::json!({
+                "model": "client-alias",
+                "messages": [{"role": "user", "content": "ping"}],
+                "reasoning_effort": "none"
+            }),
+            &chat_ctx,
+            false,
+        )
+        .await
+        .expect("passthrough succeeds");
+        assert_eq!(out.body["model"], "gpt-6-astra");
+        assert_eq!(out.body["reasoning_effort"], "low");
+
+        for ctx in [chat_ctx, responses_ctx_model(&provider, &gw, "gpt-6-astra")] {
+            let mut req = minimal_chat_request();
+            req.reasoning.effort = Some(ReasoningEffort::None);
+            let out = build_request(&FakeApiKeyVendor, &mut req, &ctx)
+                .await
+                .expect("build_request succeeds");
+            let effort = if ctx.protocol == OPENAI_RESPONSES_V1 {
+                &out.body["reasoning"]["effort"]
+            } else {
+                &out.body["reasoning_effort"]
+            };
+            assert_eq!(effort, "low");
+        }
+    }
+
+    #[test]
+    fn astra_effort_policy_only_matches_verified_model() {
+        let provider = provider_with_vendor("sk-test", Some("custom"));
+        for (model, expected) in [
+            ("gpt-6-astra", "low"),
+            (" GPT-6-ASTRA ", "low"),
+            ("gpt-6", "none"),
+            ("gpt-5", "none"),
+            ("gpt-6-astra-other", "none"),
+            ("gpt-6-astral", "none"),
+        ] {
+            let mut body = serde_json::json!({
+                "model": model, "reasoning_effort": "none", "reasoning": {"effort": "none"}
+            });
+            super::apply_vendor_effort_policy(&mut body, &provider);
+            assert_eq!(body["reasoning_effort"], expected, "{model}");
+            assert_eq!(body["reasoning"]["effort"], expected, "{model}");
+        }
     }
 
     /// 线上事故复现（请求 58e799fa，2026-08-26）：DSH 发 misspelling
