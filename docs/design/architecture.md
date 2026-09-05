@@ -581,10 +581,20 @@ inventory::submit! { ExtensionRegistration { make: || Box::new(XxxChannel) } }
 |---|---|---|
 | OpenAI | `openai` | 含 `codex` channel（OAuth） |
 | Anthropic | `anthropic` | `x-api-key` + `anthropic-version`；含 `claude-code` channel |
-| Google | `google` | URL 追加 `?key=<api_key>`；`override_model_in_body=true` |
+| Google | `google` | default channel：URL 追加 `?key=<api_key>`；含 `antigravity` channel（Google AI Pro 订阅 OAuth，见 6.5） |
 | Vertex AI | `vertexai` | Service account auth + 区域 endpoint |
 | DeepSeek / Moonshot / GLM (zhipuai) / MiniMax / xAI / ZAI / OpenRouter / Nvidia / Ollama | 各自 vendor_id | 委托 `GenericOpenAICompatibleAdapter` / openai_compat_* |
 | custom | `custom` | 用户自定义 vendor preset |
+
+### 6.5 Google AI Pro（Antigravity OAuth）通道
+
+`google/antigravity` channel 让持有 Google AI Pro / Ultra 订阅的 Google 账号经 Code Assist 内部 API（`cloudcode-pa.googleapis.com/v1internal`）使用订阅配额（对齐 CLIProxyAPI / sub2api 的 Antigravity 实现；消费级 Gemini CLI 通道已被 Google 退役）。
+
+- **认证**：`auth/drivers/google.rs`（driver key `google`）——Antigravity IDE 公共 OAuth 客户端 + PKCE，贴码回调 `http://localhost:8085/callback`；exchange 时 `loadCodeAssist`/`onboardUser` 引导出 `cloudaicompanionProject` 并存入 credential meta（`project_id`/`email`/`tier_id`，refresh 时透传）。UA 版本常量 `ANTIGRAVITY_VERSION`（≥2.9.1，Cloud Code 拒绝更低版本的新模型）需随 Google 客户端门控策略调整而 bump。
+- **线格式**（`provider/google/antigravity.rs`）：请求包成 `{model, project, requestType:"agent", userAgent:"antigravity", requestId, request:{…Gemini 体…}}`（注入 `request.sessionId`、剥离 `request.safetySettings`）；响应与每条 SSE data 行均为 `{response:{…}}` 信封，经 `pre_parse` / `on_stream_raw_chunk` 解包后走标准 google-gemini codec。
+- **管道配合**：该 channel 声明 request/response mutations（`declared_*_mutations_for` 按 channel 判定，default channel 保持字节级直通）；`conversion/resolver.rs` 将其排除出 raw-wire compat（compat 路径不经过 vendor 响应钩子）；dispatcher 把 OAuth credential 贯通进 `ProviderCtx.credential` 供 vendor 钩子读取 project_id；流式路径在 IR 解码前调用 `on_stream_raw_chunk`（`StreamRawChunkHook`）。
+- **强制上游流式**：Code Assist v1internal 的非流式 action 可能返回空体——sub2api 与 CLIProxyAPI 均以 `:streamGenerateContent` 调上游再聚合。nyro 对该 channel 无条件走流式上游（`antigravity::forces_upstream_stream` 翻转 IR stream 标志 → 聚合路径 `handle_non_stream_via_upstream_stream`，同样应用 `StreamRawChunkHook` 解包），非流式客户端收到聚合后的完整响应；admin 模型探测（probe）同样以流式 + SSE 提取实现。
+- **模型目录**：优先调用 `v1internal:fetchAvailableModels` 做**按账号动态发现**（订阅的真实目录，新模型先于此处任何静态表出现；失败时自动回退 curated 静态表 `ANTIGRAVITY_STATIC_MODELS`）；配额（remainingFraction）接入 usage 面板为后续项。
 
 ---
 

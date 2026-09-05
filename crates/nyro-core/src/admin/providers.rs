@@ -38,6 +38,7 @@ pub struct ProviderModelProbeOutcome {
     pub results: Vec<ProviderModelProbeResult>,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_model_probe_request(
     suite: crate::protocol::ids::Protocol,
     base_url: &str,
@@ -48,6 +49,7 @@ fn build_model_probe_request(
     fast_mode: bool,
     channel: Option<&str>,
     is_codex_oauth: bool,
+    antigravity_project: Option<&str>,
 ) -> anyhow::Result<(String, HeaderMap, Value)> {
     // Reasoning models (e.g. glm-5.3) burn the whole completion budget on
     // thinking before emitting visible text. 1024 leaves room for both.
@@ -94,7 +96,17 @@ fn build_model_probe_request(
             }),
         ),
         crate::protocol::ids::Protocol::GoogleGemini => {
-            anyhow::bail!("google-gemini probe is not supported");
+            // Gemini wire format is fully self-contained: return early with a
+            // complete (url, headers, body) so the generic auth-scheme logic
+            // below (bearer/x-api-key) never mis-attaches.
+            return build_gemini_model_probe_request(
+                base_url,
+                api_key,
+                runtime_headers,
+                model,
+                channel,
+                antigravity_project,
+            );
         }
     };
 
@@ -135,7 +147,66 @@ fn build_model_probe_request(
     Ok((url, headers, body))
 }
 
+/// Build a minimal "hi" probe for a google-gemini provider.
+///
+/// Both shapes stream (`streamGenerateContent?alt=sse`) and let the SSE
+/// reply extractor aggregate — mirroring sub2api's account test service,
+/// because the Code Assist surface's non-stream action can return empty
+/// bodies.
+///
+/// * `google/antigravity` (Google AI Pro OAuth): Bearer + Antigravity UA ride
+///   on `runtime_headers`; the body wraps into the v1internal envelope and
+///   the URL becomes `/v1internal:streamGenerateContent?alt=sse`.
+/// * default API-key channel (or AI-Studio-style OAuth Bearer): plain Gemini
+///   body on `/v1beta/models/{model}:streamGenerateContent?alt=sse` with
+///   `?key=` (or bare Bearer headers) auth.
+fn build_gemini_model_probe_request(
+    base_url: &str,
+    api_key: &str,
+    runtime_headers: &HeaderMap,
+    model: &str,
+    channel: Option<&str>,
+    antigravity_project: Option<&str>,
+) -> anyhow::Result<(String, HeaderMap, Value)> {
+    let base = base_url.trim_end_matches('/');
+    let mut headers = HeaderMap::new();
+    headers.extend(runtime_headers.clone());
+
+    // sub2api's account-test payload: user turn + system instruction, no
+    // generationConfig (the internal surface rejects surprises).
+    let inner_body = serde_json::json!({
+        "contents": [{"role": "user", "parts": [{"text": "hi"}]}],
+        "systemInstruction": {"parts": [{"text": "You are a helpful AI assistant."}]},
+    });
+
+    let is_antigravity = channel.is_some_and(|value| value.eq_ignore_ascii_case("antigravity"));
+    if is_antigravity {
+        let project_id = antigravity_project.ok_or_else(|| {
+            anyhow::anyhow!(
+                "google/antigravity credential is missing project_id; \
+re-login the provider to re-run onboarding"
+            )
+        })?;
+        let body = crate::provider::google::antigravity::wrap_request(inner_body, model, project_id);
+        return Ok((
+            format!("{base}/v1internal:streamGenerateContent?alt=sse"),
+            headers,
+            body,
+        ));
+    }
+
+    if api_key.trim().is_empty() && !headers.contains_key(AUTHORIZATION) {
+        anyhow::bail!("provider api key is empty");
+    }
+    let mut url = format!("{base}/v1beta/models/{model}:streamGenerateContent?alt=sse");
+    if !headers.contains_key(AUTHORIZATION) {
+        url.push_str(&format!("?key={api_key}"));
+    }
+    Ok((url, headers, inner_body))
+}
+
 /// Probe one model with a minimal "hi" request (30s timeout).
+#[allow(clippy::too_many_arguments)]
 async fn probe_single_model(
     client: reqwest::Client,
     suite: crate::protocol::ids::Protocol,
@@ -148,6 +219,7 @@ async fn probe_single_model(
     fast_mode: bool,
     channel: Option<&str>,
     is_codex_oauth: bool,
+    antigravity_project: Option<&str>,
 ) -> ProviderModelProbeResult {
     let start = Instant::now();
 
@@ -162,6 +234,7 @@ async fn probe_single_model(
             fast_mode,
             channel,
             is_codex_oauth,
+            antigravity_project,
         )?;
 
         let response = client
@@ -175,8 +248,17 @@ async fn probe_single_model(
         let status = response.status();
         if !status.is_success() {
             let body_text = response.text().await.unwrap_or_default();
-            let preview: String = body_text.chars().take(120).collect();
-            anyhow::bail!("HTTP {status}: {preview}");
+            // Keep enough of the body for Google-style errors to surface their
+            // details (links, verification hints) instead of cutting mid-word.
+            let preview: String = body_text.chars().take(300).collect();
+            let hint = if body_text.contains("Verify your account") {
+                " — Google is gating this account: open https://antigravity.google \
+                 (or gemini.google.com) in a browser with the SAME Google account \
+                 and complete the verification prompt, then retry the test."
+            } else {
+                ""
+            };
+            anyhow::bail!("HTTP {status}: {preview}{hint}");
         }
         let body_text = response.text().await.unwrap_or_default();
         let reply = extract_probe_reply(&body_text)
@@ -256,13 +338,60 @@ fn extract_probe_sse_reply(body: &str) -> Option<String> {
             continue;
         }
 
-        let header_name = event_header.as_deref().filter(|name| !name.is_empty());
         let Ok(payload) = serde_json::from_str::<Value>(&data) else {
+            let header_name = event_header.as_deref().filter(|name| !name.is_empty());
             if header_name.is_some_and(is_probe_terminal_event) {
                 terminal = Some(ProbeTerminal::Failed);
             }
             continue;
         };
+
+        // Gemini generateContent SSE chunks (plain or wrapped in the
+        // v1internal `{"response": …}` envelope) carry no event name;
+        // accumulate parts directly and treat finishReason as the terminal
+        // marker. Detection requires `candidates` so codex-style
+        // `{"type":…,"response":{…}}` events never match.
+        let is_gemini_chunk = payload.get("candidates").is_some()
+            || payload
+                .get("response")
+                .and_then(|inner| inner.get("candidates"))
+                .is_some();
+        if is_gemini_chunk {
+            let gemini = payload
+                .get("response")
+                .filter(|inner| inner.is_object())
+                .unwrap_or(&payload);
+            let candidate = gemini
+                .get("candidates")
+                .and_then(Value::as_array)
+                .and_then(|candidates| candidates.first());
+            if let Some(parts) = candidate
+                .and_then(|candidate| candidate.pointer("/content/parts"))
+                .and_then(Value::as_array)
+            {
+                for part in parts {
+                    let is_thought =
+                        part.get("thought").and_then(Value::as_bool) == Some(true);
+                    let Some(text) = part.get("text").and_then(Value::as_str) else {
+                        continue;
+                    };
+                    if is_thought {
+                        append_probe_candidate_text(&mut reasoning_delta, text.to_string());
+                    } else {
+                        append_probe_candidate_text(&mut text_delta, text.to_string());
+                    }
+                }
+            }
+            if candidate
+                .and_then(|candidate| candidate.get("finishReason"))
+                .is_some()
+            {
+                terminal = Some(ProbeTerminal::Completed);
+            }
+            continue;
+        }
+
+        let header_name = event_header.as_deref().filter(|name| !name.is_empty());
         let Some(event_name) = header_name
             .or_else(|| payload.get("type").and_then(Value::as_str))
             .or_else(|| probe_status_event(&payload))
@@ -612,6 +741,50 @@ fn extract_probe_reply_json(json: &Value) -> Option<String> {
             if !reasoning.trim().is_empty() {
                 Some(format!("[thinking] {reasoning}"))
             } else if json.get("status").and_then(Value::as_str) == Some("completed") {
+                Some("[completed]".to_string())
+            } else {
+                None
+            }
+        }
+    } else if json.get("candidates").is_some() || json.get("response").is_some() {
+        // Gemini generateContent — plain or wrapped in the v1internal
+        // `{"response": …}` envelope (google/antigravity channel).
+        let gemini = json
+            .get("response")
+            .filter(|inner| inner.is_object())
+            .unwrap_or(json);
+        let parts = gemini.pointer("/candidates/0/content/parts");
+        let join_parts = |thought_only: bool| -> String {
+            parts
+                .and_then(Value::as_array)
+                .map(|parts| {
+                    parts
+                        .iter()
+                        .filter(|part| {
+                            // `thought` is absent on ordinary text parts.
+                            let is_thought =
+                                part.get("thought").and_then(Value::as_bool) == Some(true);
+                            is_thought == thought_only
+                        })
+                        .filter_map(|part| part.get("text").and_then(Value::as_str))
+                        .collect::<Vec<_>>()
+                        .join("")
+                })
+                .unwrap_or_default()
+        };
+        let text = join_parts(false);
+        if !text.trim().is_empty() {
+            Some(text)
+        } else {
+            let thinking = join_parts(true);
+            if !thinking.trim().is_empty() {
+                Some(format!("[thinking] {thinking}"))
+            } else if gemini.pointer("/candidates/0/finishReason").is_some()
+                || gemini.get("usageMetadata").is_some()
+            {
+                // HTTP 200 with a finished/usage-bearing envelope proves the
+                // model is callable even when no text came back (the Code
+                // Assist surface occasionally returns empty non-stream bodies).
                 Some("[completed]".to_string())
             } else {
                 None
@@ -1482,6 +1655,44 @@ impl AdminService {
         }
     }
 
+    /// google/antigravity: per-account dynamic model discovery via
+    /// `v1internal:fetchAvailableModels` — the authoritative subscription
+    /// catalog (newer models appear here before any static list ships).
+    /// Returns `None` (logged, never fatal) on failure so callers fall back
+    /// to the curated static list.
+    async fn antigravity_available_models(
+        &self,
+        provider: &Provider,
+        runtime: Option<&ResolvedProviderRuntime>,
+    ) -> Option<Vec<String>> {
+        if !crate::provider::google::antigravity::is_google_antigravity(provider) {
+            return None;
+        }
+        let runtime = runtime?;
+        let credential = runtime.credential.as_ref()?;
+        let project_id =
+            crate::provider::google::antigravity::antigravity_project_id(Some(credential)).ok()?;
+        let token = runtime.access_token.trim();
+        if token.is_empty() {
+            return None;
+        }
+        let client = self.gw.http_client_for_provider(provider.use_proxy).await.ok()?;
+        match crate::provider::google::antigravity::fetch_available_models(&client, token, &project_id)
+            .await
+        {
+            Ok(models) if !models.is_empty() => Some(models),
+            Ok(_) => None,
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    provider = %provider.id,
+                    "antigravity fetchAvailableModels failed; falling back to the static model list"
+                );
+                None
+            }
+        }
+    }
+
     /// Send a minimal "hi" chat request to every model in the provider's
     /// discovered list and report which ones actually answer. The WebUI uses
     /// the results to hide non-callable models from route target pickers.
@@ -1509,6 +1720,15 @@ impl AdminService {
         } else {
             Some(self.resolve_provider_runtime(&provider).await?)
         };
+        // google/antigravity probes need the companion project id from the
+        // OAuth credential metadata; other channels leave this None. Computed
+        // before the runtime is destructured below.
+        let antigravity_project: Option<String> = runtime
+            .as_ref()
+            .and_then(|runtime| runtime.credential.as_ref())
+            .and_then(|credential| {
+                crate::provider::google::antigravity::antigravity_project_id(Some(credential)).ok()
+            });
         let (suite_raw, base_url, api_key, auth_scheme, runtime_headers) = if provider.is_adaptive()
         {
             let enabled: Vec<&ProviderProtocolEndpoint> = provider
@@ -1556,9 +1776,6 @@ impl AdminService {
         let suite = registry
             .parse_protocol(&suite_raw)
             .ok_or_else(|| anyhow::anyhow!("unsupported provider protocol: {suite_raw}"))?;
-        if suite == crate::protocol::ids::Protocol::GoogleGemini {
-            anyhow::bail!("model probe does not support google-gemini providers");
-        }
         if base_url.trim().is_empty() {
             anyhow::bail!("provider base URL is empty");
         }
@@ -1605,6 +1822,7 @@ impl AdminService {
                 let runtime_headers = runtime_headers.clone();
                 let protocol_id = protocol_id.clone();
                 let channel = channel.clone();
+                let antigravity_project = antigravity_project.clone();
                 async move {
                     probe_single_model(
                         client,
@@ -1618,6 +1836,7 @@ impl AdminService {
                         fast_mode,
                         channel.as_deref(),
                         is_codex_oauth,
+                        antigravity_project.as_deref(),
                     )
                     .await
                 }
@@ -1746,6 +1965,13 @@ impl AdminService {
             Some((protocol, api_key)) => (protocol, api_key),
             None => (provider.protocol.clone(), credential),
         };
+        // Dynamic per-account catalog first; static curated list is fallback.
+        if let Some(models) = self
+            .antigravity_available_models(&provider, Some(&runtime))
+            .await
+        {
+            return Ok(merge_model_lists(models, preset_extra_models(&provider)));
+        }
         if let Some(static_list) = runtime.binding.static_models_override.as_deref() {
             let models: Vec<String> = static_list
                 .iter()
@@ -1933,6 +2159,146 @@ impl AdminService {
 mod probe_reply_tests {
     use super::*;
 
+    #[test]
+    fn gemini_plain_reply_extracts_text() {
+        let body = r#"{"candidates":[{"content":{"role":"model","parts":[{"text":"hey from gemini"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":1}}"#;
+        assert_eq!(
+            extract_probe_reply(body).as_deref(),
+            Some("hey from gemini")
+        );
+    }
+
+    #[test]
+    fn gemini_antigravity_envelope_reply_extracts_text() {
+        let body = r#"{"response":{"candidates":[{"content":{"role":"model","parts":[{"text":"wrapped ok"}]},"finishReason":"STOP"}]},"responseId":"r1","modelVersion":"gemini-2.5-pro"}"#;
+        assert_eq!(extract_probe_reply(body).as_deref(), Some("wrapped ok"));
+    }
+
+    #[test]
+    fn gemini_reply_falls_back_to_thought_parts() {
+        let body = r#"{"candidates":[{"content":{"parts":[{"text":"deep thought","thought":true}]},"finishReason":"STOP"}]}"#;
+        assert_eq!(
+            extract_probe_reply(body).as_deref(),
+            Some("[thinking] deep thought")
+        );
+    }
+
+    #[test]
+    fn gemini_finished_but_silent_counts_as_completed() {
+        // The Code Assist non-stream surface occasionally returns a finished
+        // envelope with no text; HTTP 200 + finishReason proves callability.
+        let body = r#"{"response":{"candidates":[{"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":3}}}"#;
+        assert_eq!(extract_probe_reply(body).as_deref(), Some("[completed]"));
+    }
+
+    #[test]
+    fn antigravity_probe_request_builds_v1internal_envelope() {
+        let mut runtime_headers = HeaderMap::new();
+        runtime_headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_static("Bearer ya29.probe"),
+        );
+        let (url, headers, body) = build_gemini_model_probe_request(
+            "https://cloudcode-pa.googleapis.com",
+            "ya29.probe",
+            &runtime_headers,
+            "gemini-2.5-pro",
+            Some("antigravity"),
+            Some("cloudaicompanion-9"),
+        )
+        .unwrap();
+        assert_eq!(
+            url,
+            "https://cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse"
+        );
+        assert_eq!(
+            headers.get(AUTHORIZATION).unwrap(),
+            "Bearer ya29.probe"
+        );
+        assert_eq!(body["model"], "gemini-2.5-pro");
+        assert_eq!(body["project"], "cloudaicompanion-9");
+        assert!(body["request"]["contents"].is_array());
+        assert!(body["request"]["systemInstruction"]["parts"].is_array());
+    }
+
+    #[test]
+    fn antigravity_probe_request_without_project_fails() {
+        let error = build_gemini_model_probe_request(
+            "https://cloudcode-pa.googleapis.com",
+            "ya29.probe",
+            &HeaderMap::new(),
+            "gemini-2.5-pro",
+            Some("antigravity"),
+            None,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("project_id"));
+    }
+
+    #[test]
+    fn google_default_probe_request_uses_query_key() {
+        let (url, _headers, body) = build_gemini_model_probe_request(
+            "https://generativelanguage.googleapis.com",
+            "gem-key",
+            &HeaderMap::new(),
+            "gemini-2.5-flash",
+            Some("default"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            url,
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:streamGenerateContent?alt=sse?key=gem-key"
+        );
+        assert!(body.get("contents").is_some());
+        assert!(body.get("request").is_none());
+    }
+
+    #[test]
+    fn gemini_sse_stream_accumulates_plain_chunks() {
+        let body = concat!(
+            r#"data: {"candidates":[{"content":{"parts":[{"text":"Hel"}]}}]}"#,
+            "\n\n",
+            r#"data: {"candidates":[{"content":{"parts":[{"text":"lo"}]}}]}"#,
+            "\n\n",
+            r#"data: {"candidates":[{"content":{"parts":[{"text":"!"}]},"finishReason":"STOP"}],"usageMetadata":{"candidatesTokenCount":3}}"#,
+            "\n\n",
+        );
+        assert_eq!(extract_probe_reply(body).as_deref(), Some("Hello!"));
+    }
+
+    #[test]
+    fn gemini_sse_stream_unwraps_antigravity_envelope() {
+        let body = concat!(
+            r#"data: {"response":{"candidates":[{"content":{"parts":[{"text":"stream"}]}}]},"responseId":"r1"}"#,
+            "\n\n",
+            r#"data: {"response":{"candidates":[{"content":{"parts":[{"text":" ok"}]},"finishReason":"STOP"}]}}"#,
+            "\n\n",
+        );
+        assert_eq!(extract_probe_reply(body).as_deref(), Some("stream ok"));
+    }
+
+    #[test]
+    fn gemini_sse_stream_falls_back_to_thought_parts() {
+        let body = concat!(
+            r#"data: {"candidates":[{"content":{"parts":[{"text":"pondering","thought":true}]},"finishReason":"STOP"}]}"#,
+            "\n\n",
+        );
+        assert_eq!(
+            extract_probe_reply(body).as_deref(),
+            Some("[thinking] pondering")
+        );
+    }
+
+    #[test]
+    fn gemini_sse_stream_without_terminal_is_not_a_success() {
+        let body = concat!(
+            r#"data: {"candidates":[{"content":{"parts":[{"text":"cut off"}]}}]}"#,
+            "\n\n",
+        );
+        // Falls through to JSON extraction, which fails on an SSE body.
+        assert_eq!(extract_probe_reply(body), None);
+    }
     #[test]
     fn openai_chat_reply_prefers_content() {
         let body = r#"{"choices":[{"message":{"role":"assistant","content":"hello","reasoning_content":"thought"}}]}"#;
@@ -2211,6 +2577,7 @@ mod probe_reply_tests {
             true,
             Some("codex"),
             true,
+            None,
         )
         .unwrap();
 
@@ -2276,6 +2643,7 @@ mod probe_reply_tests {
             true,
             Some("sub2api"),
             false,
+            None,
         )
         .unwrap();
 
@@ -2311,6 +2679,7 @@ mod probe_reply_tests {
                 fast_mode,
                 channel,
                 false,
+                None,
             )
             .unwrap();
 
@@ -2337,6 +2706,7 @@ mod probe_reply_tests {
             false,
             None,
             false,
+            None,
         )
         .unwrap();
 

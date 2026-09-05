@@ -1,6 +1,8 @@
 use std::sync::Arc;
 
-use crate::auth::drivers::{ClaudeOAuthDriver, GrokOAuthDriver, OpenAIOAuthDriver};
+use crate::auth::drivers::{
+    ClaudeOAuthDriver, GoogleAntigravityDriver, GrokOAuthDriver, OpenAIOAuthDriver,
+};
 use crate::auth::types::{AuthDriver, AuthDriverMetadata};
 
 pub fn normalize_driver_key(value: &str) -> String {
@@ -11,6 +13,8 @@ pub fn normalize_driver_key(value: &str) -> String {
         "grok" | "grok-oauth" | "grok_oauth" | "xai" | "xai-oauth" | "xai_oauth" => {
             "grok".to_string()
         }
+        "google" | "google-antigravity" | "google_antigravity" | "antigravity"
+        | "google-ai-pro" | "gemini" => "google".to_string(),
         other => other.to_string(),
     }
 }
@@ -20,6 +24,7 @@ pub fn build_driver(key: &str) -> Option<Arc<dyn AuthDriver>> {
         "codex" => Some(Arc::new(OpenAIOAuthDriver)),
         "claude-code" => Some(Arc::new(ClaudeOAuthDriver)),
         "grok" => Some(Arc::new(GrokOAuthDriver)),
+        "google" => Some(Arc::new(GoogleAntigravityDriver)),
         _ => None,
     }
 }
@@ -29,6 +34,7 @@ pub fn list_driver_metadata() -> Vec<AuthDriverMetadata> {
         build_driver("codex"),
         build_driver("claude-code"),
         build_driver("grok"),
+        build_driver("google"),
     ]
     .into_iter()
     .flatten()
@@ -49,10 +55,19 @@ mod tests {
     }
 
     #[test]
+    fn google_aliases_normalize_to_google_driver() {
+        for alias in ["google", "Google", "antigravity", "google-antigravity", "gemini"] {
+            assert_eq!(normalize_driver_key(alias), "google", "alias {alias}");
+            assert_eq!(build_driver(alias).unwrap().metadata().key, "google");
+        }
+    }
+
+    #[test]
     fn list_includes_grok() {
         let keys: Vec<&str> = list_driver_metadata().into_iter().map(|m| m.key).collect();
         assert!(keys.contains(&"grok"));
         assert!(keys.contains(&"codex"));
         assert!(keys.contains(&"claude-code"));
+        assert!(keys.contains(&"google"));
     }
 }

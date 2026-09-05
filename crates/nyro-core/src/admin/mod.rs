@@ -80,6 +80,10 @@ pub struct AdminService {
 pub(crate) struct ResolvedProviderRuntime {
     pub access_token: String,
     pub binding: RuntimeBinding,
+    /// The stored OAuth credential behind this runtime, when the provider is
+    /// OAuth-backed. Threaded into `ProviderCtx` so vendor hooks can read
+    /// channel metadata (e.g. google/antigravity's companion project id).
+    pub credential: Option<crate::auth::types::StoredCredential>,
 }
 
 impl AdminService {

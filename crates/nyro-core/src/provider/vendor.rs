@@ -242,6 +242,17 @@ pub trait Vendor: Send + Sync + 'static {
         true
     }
 
+    /// Provider-aware variant of [`declared_request_mutations`]. Vendors with
+    /// multiple channels whose wire behavior differs per channel (e.g. the
+    /// google vendor's API-key default vs. the antigravity OAuth channel)
+    /// override this so byte-level passthrough stays enabled for the channels
+    /// that do not mutate the wire format. The dispatcher consults this
+    /// variant, not the bare one.
+    fn declared_request_mutations_for(&self, provider: &Provider) -> bool {
+        let _ = provider;
+        self.declared_request_mutations()
+    }
+
     /// Declares whether this vendor mutates the response via pipeline hooks
     /// (`pre_parse` / `post_parse`).
     ///
@@ -254,5 +265,13 @@ pub trait Vendor: Send + Sync + 'static {
     /// `pre_parse` and `post_parse` are both no-ops.
     fn declared_response_mutations(&self) -> bool {
         true
+    }
+
+    /// Provider-aware variant of [`declared_response_mutations`]; see
+    /// [`declared_request_mutations_for`] for why channel-scoped vendors
+    /// override it.
+    fn declared_response_mutations_for(&self, provider: &Provider) -> bool {
+        let _ = provider;
+        self.declared_response_mutations()
     }
 }

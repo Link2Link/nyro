@@ -1,9 +1,11 @@
 mod claude;
+mod google;
 mod grok;
 mod openai;
 mod shared;
 
 pub use claude::ClaudeOAuthDriver;
+pub use google::GoogleAntigravityDriver;
 pub use grok::GrokOAuthDriver;
 pub use openai::OpenAIOAuthDriver;
 pub use shared::{

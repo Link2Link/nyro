@@ -766,6 +766,7 @@ mod tests {
             serde_json::json!({"model": "mm-resp", "input": "hi"}),
             &call_ctx,
             tool_route_plan,
+            None,
             &mut req_ctx,
             &mut req_ir,
             &host,
@@ -816,6 +817,7 @@ pub(super) async fn handle_non_stream_via_upstream_stream(
     body: Value,
     call_ctx: &CallCtx<'_>,
     mut tool_route_plan: ToolRoutePlan,
+    raw_chunk_hook: Option<super::stream::StreamRawChunkHook>,
     req_ctx: &mut RequestContext,
     req_ir: &mut AiRequest,
     host: &HostContext<'_>,
@@ -830,8 +832,12 @@ pub(super) async fn handle_non_stream_via_upstream_stream(
     // streaming mode regardless of the client's `stream` flag. A passthrough
     // body carries the client's (absent) flag, so set it explicitly — an
     // upstream that never receives `stream: true` answers with plain JSON,
-    // which the SSE parser below cannot read.
-    if let Some(obj) = body.as_object_mut() {
+    // which the SSE parser below cannot read. Gemini-protocol egress conveys
+    // streaming through the URL action instead, and the v1internal envelope
+    // rejects surprise top-level fields, so skip the body flag there.
+    if egress != crate::protocol::ids::GOOGLE_GEMINI_GENERATE_CONTENT_V1BETA
+        && let Some(obj) = body.as_object_mut()
+    {
         obj.insert("stream".to_string(), Value::Bool(true));
     }
 
@@ -902,7 +908,17 @@ pub(super) async fn handle_non_stream_via_upstream_stream(
         };
         let text = String::from_utf8_lossy(&bytes);
         raw_text.push_str(&text);
-        if let Ok(ai_deltas) = stream_parser.parse_chunk(&text) {
+        // Vendor raw-chunk normalization (e.g. antigravity unwrapping the
+        // v1internal envelope from every SSE data line) runs before the
+        // decoder; raw_text keeps the verbatim upstream bytes for logs.
+        let hooked_text;
+        let parse_src: &str = if let Some(hook) = raw_chunk_hook.as_ref() {
+            hooked_text = hook.apply(&text).await;
+            hooked_text.as_str()
+        } else {
+            text.as_ref()
+        };
+        if let Ok(ai_deltas) = stream_parser.parse_chunk(parse_src) {
             let ai_deltas = tool_route_plan.restore_stream_deltas(ai_deltas);
             accumulator.apply_all(&ai_deltas);
         }

@@ -576,6 +576,18 @@ async fn dispatch_pipeline_inner(
             }
         };
         let egress = plan.egress;
+        // google/antigravity must always call upstream in streaming mode (the
+        // Code Assist v1internal non-stream action can return empty bodies —
+        // both sub2api and CLIProxyAPI stream and aggregate). Non-stream
+        // clients still get an aggregated non-stream response via
+        // handle_non_stream_via_upstream_stream. Flip the IR flag here so
+        // the encoder emits the streamGenerateContent path.
+        let antigravity_force_stream = !is_stream
+            && egress == crate::protocol::ids::GOOGLE_GEMINI_GENERATE_CONTENT_V1BETA
+            && crate::provider::google::antigravity::forces_upstream_stream(&provider);
+        if antigravity_force_stream {
+            request_for_target.stream.enabled = true;
+        }
         let target_key = format!("{}:{}:{}", target.provider_id, egress, actual_model);
         let Some(health_permit) = gw.health_registry.try_acquire(&target_key) else {
             continue;
@@ -722,14 +734,14 @@ async fn dispatch_pipeline_inner(
             auth_scheme: &plan.auth_scheme,
             actual_model: &transport_model,
             force_max_reasoning: route.force_max_reasoning,
-            credential: None,
+            credential: provider_runtime.credential.as_ref(),
             gw: &gw,
             disable_default_auth: provider_runtime.binding.disable_default_auth,
         };
 
         let passthrough_resp = !compat_candidate
             && plan.mode == ProtocolMode::Native
-            && !adapter.declared_response_mutations();
+            && !adapter.declared_response_mutations_for(&provider);
         let vendor_wire_before = if compat_candidate {
             let encoder = egress.handler().make_request_encoder();
             encoder
@@ -775,7 +787,7 @@ async fn dispatch_pipeline_inner(
             .contains::<crate::plugin::phase::RequestMutated>();
         let passthrough_req = !compat_candidate
             && plan.mode == ProtocolMode::Native
-            && !adapter.declared_request_mutations()
+            && !adapter.declared_request_mutations_for(&provider)
             && !tool_route_plan.is_active()
             && !param_override_applied
             && !ir_mutated_by_hook;
@@ -944,7 +956,8 @@ async fn dispatch_pipeline_inner(
 
         let egress_str = egress.to_string();
         let egress_caps = egress.handler().capabilities();
-        let upstream_forces_stream = egress_caps.force_upstream_stream;
+        let upstream_forces_stream =
+            egress_caps.force_upstream_stream || antigravity_force_stream;
         debug_assert_eq!(
             prepared_conversion.plan().kind().as_str(),
             conversion_strategy
@@ -1041,6 +1054,7 @@ async fn dispatch_pipeline_inner(
         } else {
             let native_body =
                 prepared_native_body.expect("non-Raw-Wire prepared conversion must contain JSON");
+            let raw_chunk_hook = stream::StreamRawChunkHook::capture(&adapter, &provider, &provider_ctx);
             let response = if is_stream {
                 handle_stream(
                     client,
@@ -1053,6 +1067,7 @@ async fn dispatch_pipeline_inner(
                     tool_route_plan,
                     ctx,
                     &request_for_target,
+                    raw_chunk_hook,
                 )
                 .await
             } else if upstream_forces_stream {
@@ -1063,6 +1078,7 @@ async fn dispatch_pipeline_inner(
                     native_body,
                     &call_ctx,
                     tool_route_plan,
+                    raw_chunk_hook.clone(),
                     ctx,
                     &mut request_for_target,
                     host,

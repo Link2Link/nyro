@@ -24,9 +24,15 @@ use crate::provider::{OAuthConfig, RuntimeConfig};
 const OPENAI_PRESET_ID: &str = "openai";
 const CODEX_CHANNEL_ID: &str = "codex";
 const CODEX_REFRESH_SCOPE: &str = "openid profile email";
-const CODEX_CLIENT_VERSION: &str = "0.146.0";
+// Codex client identity advertised to chatgpt.com/backend-api/codex.
+// The upstream content-negotiates on this version (the models manifest and
+// available model slugs depend on it) and 404s below 0.144.0. Bump manually
+// to the latest stable `rust-v*` tag of github.com/openai/codex; keep it in
+// sync with CODEX_USER_AGENT and the codex channel's `models_client_version`
+// in provider/openai/mod.rs (guarded by a unit test below).
+const CODEX_CLIENT_VERSION: &str = "0.153.4";
 const CODEX_ORIGINATOR: &str = "codex-tui";
-const CODEX_USER_AGENT: &str = "codex-tui/0.146.0 (Ubuntu 22.4.0; x86_64) xterm-256color";
+const CODEX_USER_AGENT: &str = "codex-tui/0.153.4 (Ubuntu 22.4.0; x86_64) xterm-256color";
 
 /// Resolved OAuth + runtime config for the OpenAI / Codex channel,
 /// sourced from the in-process `VendorRegistry`.
@@ -609,5 +615,26 @@ mod tests {
         assert_eq!(binding.extra_headers["originator"], CODEX_ORIGINATOR);
         assert_eq!(binding.extra_headers["version"], CODEX_CLIENT_VERSION);
         assert!(binding.disable_default_auth);
+    }
+
+    #[test]
+    fn codex_client_version_constants_stay_in_sync() {
+        // The upstream /backend-api/codex endpoint content-negotiates on the
+        // client version (manifest contents depend on it; below 0.144.0 it
+        // 404s). The UA version segment, the `version` header, and the
+        // models-source query param must all advertise the same version.
+        assert!(CODEX_USER_AGENT.starts_with(&format!("codex-tui/{CODEX_CLIENT_VERSION} ")));
+        let config = OpenAIOAuthDriver::codex_config().unwrap();
+        assert_eq!(config.runtime.models_client_version, CODEX_CLIENT_VERSION);
+
+        let min: Vec<u32> = "0.144.0"
+            .split('.')
+            .map(|part| part.parse().unwrap())
+            .collect();
+        let current: Vec<u32> = CODEX_CLIENT_VERSION
+            .split('.')
+            .map(|part| part.parse().unwrap())
+            .collect();
+        assert!(current >= min, "codex client version must stay >= 0.144.0");
     }
 }

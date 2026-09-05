@@ -72,6 +72,19 @@ fn validate_oauth_session_for_provider(
     {
         anyhow::bail!("Grok OAuth session can only bind to the xai/grok channel");
     }
+    if session_driver == "google"
+        && (provider.protocol.trim() != "google-gemini"
+            || !provider
+                .channel
+                .as_deref()
+                .is_some_and(|value| value.eq_ignore_ascii_case("antigravity"))
+            || !provider
+                .preset_key
+                .as_deref()
+                .is_some_and(|value| value.eq_ignore_ascii_case("google")))
+    {
+        anyhow::bail!("Google OAuth session can only bind to the google/antigravity channel");
+    }
     Ok(())
 }
 
@@ -452,6 +465,16 @@ impl AdminService {
             input.protocol = "openai-responses".to_string();
             input.base_url = "https://cli-chat-proxy.grok.com/v1".to_string();
         }
+        if session_driver == "google" {
+            input.vendor = Some("google".to_string());
+            input.preset_key = Some("google".to_string());
+            input.channel = Some("antigravity".to_string());
+            input.protocol = "google-gemini".to_string();
+            input.base_url = "https://cloudcode-pa.googleapis.com".to_string();
+            // The OAuth runtime binding owns auth/headers; adaptive
+            // multi-endpoint mode would reset it per request.
+            input.protocol_mode = "fixed".to_string();
+        }
         input.auth_mode = "oauth".to_string();
         let candidate = Provider {
             id: String::new(),
@@ -796,11 +819,13 @@ impl AdminService {
                 return Ok(ResolvedProviderRuntime {
                     access_token,
                     binding,
+                    credential: None,
                 });
             }
             return Ok(ResolvedProviderRuntime {
                 access_token: api_key,
                 binding: RuntimeBinding::default(),
+                credential: None,
             });
         }
 
@@ -843,6 +868,7 @@ impl AdminService {
             return Ok(ResolvedProviderRuntime {
                 access_token,
                 binding,
+                credential: Some(credential.clone()),
             });
         }
 
@@ -885,6 +911,7 @@ impl AdminService {
                     return Ok(ResolvedProviderRuntime {
                         access_token: refreshed_token,
                         binding,
+                        credential: Some(cred),
                     });
                 }
                 if refreshed.status == "error" {
@@ -954,6 +981,7 @@ impl AdminService {
         Ok(ResolvedProviderRuntime {
             access_token: new_access_token,
             binding: driver.bind_runtime(&refreshed_provider, &refreshed_credential)?,
+            credential: Some(refreshed_credential),
         })
     }
 

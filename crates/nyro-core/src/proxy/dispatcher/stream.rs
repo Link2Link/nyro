@@ -6,6 +6,7 @@
 //! - IR round-trip: parse → accumulate → format → re-emit as target-protocol SSE.
 
 use std::convert::Infallible;
+use std::sync::Arc;
 
 use axum::Json;
 use axum::body::Body;
@@ -31,6 +32,65 @@ use super::{
 
 // ── Streaming response handler ────────────────────────────────────────────────
 
+/// Owned raw-chunk hook state for the spawned streaming task: applies the
+/// vendor's `on_stream_raw_chunk` (e.g. google/antigravity unwrapping the
+/// v1internal `{"response": …}` envelope from every SSE data line) before
+/// the egress stream decoder parses the chunk.
+///
+/// Only captured when the vendor declares response mutations for the
+/// provider, so mutation-free vendors pay zero overhead.
+#[derive(Clone)]
+pub(super) struct StreamRawChunkHook {
+    vendor: Arc<dyn crate::provider::vendor::Vendor>,
+    provider: crate::db::models::Provider,
+    protocol_id: ProtocolEndpoint,
+    api_key: String,
+    actual_model: String,
+    credential: Option<crate::auth::types::StoredCredential>,
+}
+
+impl StreamRawChunkHook {
+    pub(super) fn capture(
+        adapter: &Arc<dyn crate::provider::vendor::Vendor>,
+        provider: &crate::db::models::Provider,
+        provider_ctx: &crate::provider::vendor::ProviderCtx<'_>,
+    ) -> Option<Self> {
+        if !adapter.declared_response_mutations_for(provider) {
+            return None;
+        }
+        Some(Self {
+            vendor: adapter.clone(),
+            provider: provider.clone(),
+            protocol_id: provider_ctx.protocol,
+            api_key: provider_ctx.api_key.to_string(),
+            actual_model: provider_ctx.actual_model.to_string(),
+            credential: provider_ctx.credential.cloned(),
+        })
+    }
+
+    pub(super) async fn apply(&self, chunk: &str) -> String {
+        let vendor_ctx = crate::provider::vendor_ext::VendorCtx {
+            provider: &self.provider,
+            protocol_id: self.protocol_id,
+            api_key: &self.api_key,
+            actual_model: &self.actual_model,
+            credential: self.credential.as_ref(),
+        };
+        let mut text = chunk.to_string();
+        match self.vendor.on_stream_raw_chunk(&vendor_ctx, &mut text).await {
+            Ok(()) => text,
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    vendor = self.vendor.vendor_id(),
+                    "vendor on_stream_raw_chunk failed; parsing the raw chunk instead"
+                );
+                chunk.to_string()
+            }
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn handle_stream(
     client: ProxyClient,
@@ -45,6 +105,7 @@ pub(super) async fn handle_stream(
     // spawned task outlives the borrow, so owned copies (not borrows) cross in.
     req_ctx: &RequestContext,
     req_ir: &AiRequest,
+    raw_chunk_hook: Option<StreamRawChunkHook>,
 ) -> Response {
     let egress = call_ctx.egress;
     let ingress = call_ctx.ingress;
@@ -281,7 +342,17 @@ pub(super) async fn handle_stream(
             chunks_count += 1;
             upstream_raw_buf.extend_from_slice(&bytes);
             let text = String::from_utf8_lossy(&bytes);
-            if let Ok(ai_deltas) = stream_parser.parse_chunk(&text) {
+            // Vendor raw-chunk normalization (see StreamRawChunkHook) runs
+            // before the decoder; the raw buffer keeps the verbatim upstream
+            // bytes for request logs.
+            let hooked_text;
+            let parse_src: &str = if let Some(hook) = raw_chunk_hook.as_ref() {
+                hooked_text = hook.apply(&text).await;
+                hooked_text.as_str()
+            } else {
+                text.as_ref()
+            };
+            if let Ok(ai_deltas) = stream_parser.parse_chunk(parse_src) {
                 let mut ai_deltas = tool_route_plan.restore_stream_deltas(ai_deltas);
                 hook_state.apply(&mut ai_deltas).await;
                 accumulator.apply_all(&ai_deltas);
