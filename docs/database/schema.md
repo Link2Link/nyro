@@ -1,12 +1,13 @@
 # Database Schema
 
-Nyro supports three storage backends — **SQLite** (default), **PostgreSQL**, and **MySQL** — with identical table structures.
+Nyro supports three storage backends — **SQLite** (default), **PostgreSQL**, and **MySQL** — with the same logical tables. Physical types, collations, defaults, and generated constraint/index names differ; the generated PostgreSQL/MySQL artifacts below record those differences exactly.
 
 ## Entity Relationship
 
 ```
 providers ──1:N── model_backends ──N:1── models
     ├──1:N── provider_protocol_endpoints
+    ├──1:N── provider_model_ratings
     └──1:1── provider_oauth_credentials
 
 api_keys ──M:N── models (via api_key_models)
@@ -71,6 +72,26 @@ Provider 的协议端点明细。固定模式保留一条兼容记录；自适�
 **唯一约束**：`(provider_id, protocol)`
 
 **索引**：`idx_provider_protocol_endpoints_provider` on `(provider_id, is_enabled, priority)`
+
+---
+
+## provider_model_ratings
+
+The latest manually assigned integer score for an exact **provider + upstream model** pair. This is provider metadata, not a virtual-model route, endpoint, or usage record. Only the score and its last-update timestamp are stored: no history, notes, or other rating payload. Deleting a provider deletes its ratings; deleting a route/backend does not.
+
+| Column | Type | Default | Description |
+|---|---|---|---|
+| `provider_id` | TEXT NOT NULL (MySQL: VARCHAR(36)) | — | FK → `providers.id`, **ON DELETE CASCADE** |
+| `upstream_model` | TEXT NOT NULL (MySQL: VARBINARY(1024)) | — | Exact upstream model identifier, case-sensitive and byte-exact, including trailing spaces; 1–1024 UTF-8 bytes |
+| `score` | INTEGER NOT NULL | — | Integer **0–100 inclusive**, database `CHECK` constraint; zero is a real rating, not “unrated” |
+| `updated_at` | TEXT NOT NULL | — | Application-written UTC RFC3339 timestamp with millisecond precision, e.g. `2026-09-08T02:30:45.123Z`; overwritten on each score update |
+
+**Primary key**: `(provider_id, upstream_model)`. The API/service validates the 1024-UTF-8-byte limit consistently for all backends (bytes, not character count).
+
+**Physical identity and validation**:
+- SQLite uses `TEXT COLLATE BINARY` for both key columns, a byte-length check via `length(CAST(upstream_model AS BLOB))`, and `typeof(score) = 'integer'` plus the range check (SQLite's type affinity alone is not an integer constraint).
+- PostgreSQL uses `TEXT COLLATE "C"` for both key columns, `octet_length` for the model byte-length check, and the native `INTEGER` type plus the range check.
+- MySQL uses `VARBINARY(1024)` for `upstream_model`, storing the original UTF-8 bytes rather than a case-folding or trailing-space-insensitive text collation. Its `provider_id` keeps the parent column's collation for FK compatibility. `OCTET_LENGTH` enforces a nonempty model identifier; the binary column bounds its maximum size. Score is native `INTEGER` plus the range check (requires MySQL 8.0.16+ for enforced `CHECK`s).
 
 ---
 
@@ -242,9 +263,119 @@ OAuth 凭据存储，用于需要 OAuth 认证的供应商（如 Google Vertex A
 
 ---
 
+## Regenerating reference SQL
+
+[`deploy/schema/postgres.sql`](../../deploy/schema/postgres.sql) and
+[`deploy/schema/mysql.sql`](../../deploy/schema/mysql.sql) are **derived reference
+artifacts**, generated from a real database after core storage `init()` and
+`migrate()` have both succeeded. They are not inputs to the generator and must
+not be hand-edited. The generator never constructs a `Gateway` or starts
+application listeners, seed/config loading, OAuth refresh, or background tasks.
+
+### Prerequisites and safety
+
+1. Build the current tool and storage code: `cargo build -p nyro-tools`.
+2. Provision a **new, empty, dedicated disposable database for each run** on a
+   temporary local PostgreSQL/MySQL instance (for example a temporary PostgreSQL
+   cluster or a disposable Docker container with tmpfs data). Use a role owning
+   that database with DDL and metadata-read permissions. Do not use an application,
+   production, shared, or persistent database. Ensure no other process uses the
+   scratch database during generation: the emptiness check is not a concurrency lock.
+3. PostgreSQL needs `pg_dump` on `PATH`, preferably the **same major version** as
+   the scratch server. An older `pg_dump` cannot dump a newer server. MySQL needs
+   a reachable **MySQL 8.0.16+** server (enforced `CHECK` constraints); DDL is read
+   with SQLx `SHOW CREATE TABLE`, so neither `mysql` nor `mysqldump` is needed by
+   the generator itself. MySQL 8.4 is the recommended reproducible reference.
+4. Supply `--scratch-db-url` or **only** `NYRO_SCHEMA_DATABASE_URL`. There is no
+   fallback to application database settings (`DATABASE_URL`, `NYRO_DATABASE_URL`,
+   etc.). The flag overrides the dedicated environment variable. Use a TCP URL
+   with explicit host, user, and database; database names support ASCII letters,
+   digits, `_`, and `-`. System/default databases are rejected. Port defaults are
+   pinned to 5432/3306 rather than inherited from `PGPORT`. Only TLS query
+   parameters are accepted (`sslmode`, `sslrootcert`, `sslcert`, `sslkey` for
+   PostgreSQL; `ssl-mode`, `ssl-ca`, `ssl-cert`, `ssl-key` for MySQL); connection
+   overrides such as `dbname`, `host`, `options`, or `socket` are rejected.
+   URL-encode passwords. Prefer the dedicated environment variable over putting
+   credentials in shell history or process arguments. Local temporary trust auth
+   or a temporary password is appropriate; do not supply production credentials.
+
+Example, **after creating the named empty databases on disposable local servers**
+(the ports below are examples, not discovery/default application endpoints):
+
+```bash
+cargo build -p nyro-tools
+
+NYRO_SCHEMA_DATABASE_URL='postgresql://schema_user@127.0.0.1:25439/nyro_schema_pg' \
+  target/debug/nyro-tools dump-schema --backend postgres \
+  --output deploy/schema/postgres.sql
+
+NYRO_SCHEMA_DATABASE_URL='mysql://schema_user@127.0.0.1:23306/nyro_schema_mysql' \
+  target/debug/nyro-tools dump-schema --backend mysql \
+  --output deploy/schema/mysql.sql
+```
+
+The tool rejects existing objects **before bootstrap**, including empty tables.
+It never clears, drops, or creates databases. Successful migration leaves the
+scratch database populated with schema; another run must use another new empty
+database. A failed migration may also leave partial DDL in the disposable
+scratch database; inspect it if needed, then dispose of the temporary instance
+rather than retrying against it. Database error codes/operation names are
+reported on stderr, but raw driver/dump errors and credentials are suppressed.
+
+Use **`--output`**, not `> deploy/schema/...`: the tool first captures and
+validates all SQL, then writes a temporary file beside the destination, flushes
+it, and atomically replaces the artifact. Failures before replacement leave the
+previous artifact untouched. Without `--output`, stdout contains only a complete
+successful SQL dump (no logs); shell redirection into a tracked file would still
+truncate that file *before* the tool runs and is therefore unsafe.
+
+### Fidelity, determinism, and validation
+
+- PostgreSQL uses `pg_dump --schema-only --no-owner --no-privileges`. It preserves
+  constraints, indexes, types, collations, defaults, and schema-qualified names.
+  Volatile server/client version and timestamp banner lines are omitted, random
+  `psql` restrict/unrestrict tokens are normalized (guards retained), and the
+  version-specific `transaction_timeout` session setting is omitted. No migration
+  DDL is reconstructed or renamed by the tool.
+- MySQL uses full `SHOW CREATE TABLE` output, including indexes, PKs, FKs, CHECKs,
+  binary columns/collations, and engine/table options. Tables are emitted in a
+  deterministic parent-before-child FK order with lexical tie-breaking and safe
+  identifier quoting. Cyclic or cross-database dependencies and non-table objects
+  are rejected rather than silently dropping constraints or disabling FK checks.
+- Both backends verify final tables `models`, `model_backends`,
+  `api_key_models`, and `provider_model_ratings` and reject leftover `routes`, `route_targets`, or
+  `api_key_routes`. Generated constraint/index names can still retain a legacy
+  prefix after table renames; these are the real database names and are not
+  cosmetically rewritten.
+- Determinism is for the same migrations and server/tool versions/configuration.
+  Pin those versions for byte-for-byte comparison; semantic formatting differences
+  across PostgreSQL or MySQL versions are not universally normalized. Generate
+  twice on independent fresh scratch databases and compare the files. Restore
+  reference SQL only into another disposable empty database when testing it.
+
+These are review/reference artifacts, not an assurance that importing DDL and
+then restarting any historical bootstrap version is safe. Older MySQL bootstrap
+versions used unconditional `CREATE INDEX` statements, which failed on repeated
+bootstrap. Current storage guards index creation; schema generation still runs
+bootstrap only once on an empty database and is not a migration redesign.
+
+Focused tests: `cargo test -p nyro-tools schema::tests`, followed by
+`cargo check -p nyro-tools`. The two ignored nonempty-rejection tests require
+separate **new empty disposable databases** and leave one empty sentinel table:
+
+```bash
+NYRO_SCHEMA_TEST_POSTGRES_URL='<new-empty-postgres-scratch-url>' \
+NYRO_SCHEMA_TEST_MYSQL_URL='<new-empty-mysql-scratch-url>' \
+  cargo test -p nyro-tools schema::tests:: -- --ignored
+```
+
+Missing test URLs fail explicitly; tests never fall back to production/app URLs.
+
+---
+
 ## 迁移说明
 
-Nyro 采用 idempotent 迁移策略：`INIT_SQL` 创建旧名称表（如 `routes`、`route_targets`、`api_key_routes`），`migrate()` 末尾执行 rename：
+Nyro 采用尽量幂等的增量迁移策略（不代表整个 bootstrap 支持重复执行；参见上面的 MySQL 注意事项）：`INIT_SQL` 创建旧名称表（如 `routes`、`route_targets`、`api_key_routes`），`migrate()` 末尾执行 rename：
 
 ```
 routes             → models

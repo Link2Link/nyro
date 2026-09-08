@@ -1,3 +1,8 @@
+mod provider_model_ratings;
+
+use crate::storage::ProviderModelRatingStore;
+use provider_model_ratings::MysqlProviderModelRatingStore;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -66,12 +71,14 @@ impl MysqlAdapter {
 
     pub async fn health(&self) -> MysqlHealth {
         let can_connect = self.ping().await.is_ok();
-        // schema_compatible: verify the final-state `models` table exists,
-        // which confirms migrations have completed (routes → models rename done).
+        // Missing rating storage means this database still needs migration.
         let schema_compatible = if can_connect {
             mysql_table_exists(&self.pool, "models")
                 .await
                 .unwrap_or(false)
+                && mysql_table_exists(&self.pool, "provider_model_ratings")
+                    .await
+                    .unwrap_or(false)
         } else {
             false
         };
@@ -86,6 +93,7 @@ impl MysqlAdapter {
 pub struct MysqlStorage {
     pool: Pool<MySql>,
     provider_store: Arc<MysqlProviderStore>,
+    provider_model_rating_store: Arc<MysqlProviderModelRatingStore>,
     model_store: Arc<MysqlModelStore>,
     model_backend_store: Arc<MysqlModelBackendStore>,
     settings_store: Arc<MysqlSettingsStore>,
@@ -101,6 +109,8 @@ impl MysqlStorage {
         let adapter = MysqlAdapter::connect(config).await?;
         let pool = adapter.pool().clone();
         let provider_store = Arc::new(MysqlProviderStore { pool: pool.clone() });
+        let provider_model_rating_store =
+            Arc::new(MysqlProviderModelRatingStore { pool: pool.clone() });
         let model_store = Arc::new(MysqlModelStore { pool: pool.clone() });
         let model_backend_store = Arc::new(MysqlModelBackendStore { pool: pool.clone() });
         let settings_store = Arc::new(MysqlSettingsStore { pool: pool.clone() });
@@ -112,6 +122,7 @@ impl MysqlStorage {
         Ok(Self {
             pool,
             provider_store,
+            provider_model_rating_store,
             model_store,
             model_backend_store,
             settings_store,
@@ -131,6 +142,10 @@ impl MysqlStorage {
 impl Storage for MysqlStorage {
     fn providers(&self) -> &dyn ProviderStore {
         self.provider_store.as_ref()
+    }
+
+    fn provider_model_ratings(&self) -> Option<&dyn ProviderModelRatingStore> {
+        Some(self.provider_model_rating_store.as_ref())
     }
 
     fn models(&self) -> &dyn ModelStore {
@@ -528,6 +543,11 @@ impl ProviderStore for MysqlProviderStore {
             .await?;
 
         sqlx::query("DELETE FROM provider_protocol_endpoints WHERE provider_id = ?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+
+        sqlx::query("DELETE FROM provider_model_ratings WHERE provider_id = ?")
             .bind(id)
             .execute(&mut *tx)
             .await?;
@@ -1624,6 +1644,22 @@ impl StorageBootstrap for MysqlBootstrap {
         let pool = self.adapter.pool();
 
         sqlx::raw_sql(MYSQL_INIT_SQL).execute(pool).await?;
+        // MySQL has no CREATE INDEX IF NOT EXISTS. Guard existing indexes so
+        // upgrades (including creation of the ratings table) can finish.
+        for (table, column, index) in [
+            ("route_targets", "route_id", "idx_route_targets_route_id"),
+            ("request_logs", "created_at", "idx_logs_created_at"),
+            ("request_logs", "provider_id", "idx_logs_provider_id"),
+            ("request_logs", "client_status_code", "idx_logs_client_status"),
+            ("request_logs", "upstream_model", "idx_logs_upstream_model"),
+            ("request_logs", "api_key_id", "idx_logs_api_key"),
+            ("api_keys", "token", "idx_api_keys_token"),
+            ("api_key_routes", "route_id", "idx_api_key_routes_route_id"),
+            ("provider_oauth_credentials", "status", "idx_oauth_creds_status"),
+            ("provider_oauth_credentials", "expires_at", "idx_oauth_creds_expires"),
+        ] {
+            mysql_ensure_index(pool, table, column, index).await?;
+        }
 
         // Add balance column to routes
         mysql_add_column_if_not_exists(
@@ -1907,6 +1943,28 @@ async fn mysql_table_exists(pool: &Pool<MySql>, table_name: &str) -> anyhow::Res
     .fetch_one(pool)
     .await?
     > 0)
+}
+
+async fn mysql_ensure_index(
+    pool: &Pool<MySql>,
+    table: &str,
+    column: &str,
+    index: &str,
+) -> anyhow::Result<()> {
+    let exists = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM information_schema.statistics \
+         WHERE table_schema = DATABASE() AND table_name = ? AND index_name = ?",
+    )
+    .bind(table)
+    .bind(index)
+    .fetch_one(pool)
+    .await?;
+    if exists == 0 {
+        sqlx::query(&format!("CREATE INDEX `{index}` ON `{table}` (`{column}`)"))
+            .execute(pool)
+            .await?;
+    }
+    Ok(())
 }
 
 async fn mysql_rename_table_if_needed(
@@ -2264,6 +2322,16 @@ CREATE TABLE IF NOT EXISTS providers (
     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
 ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
 
+CREATE TABLE IF NOT EXISTS provider_model_ratings (
+    provider_id VARCHAR(36) NOT NULL,
+    upstream_model VARBINARY(1024) NOT NULL
+        CHECK (OCTET_LENGTH(upstream_model) BETWEEN 1 AND 1024),
+    score INTEGER NOT NULL CHECK (score BETWEEN 0 AND 100),
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (provider_id, upstream_model),
+    FOREIGN KEY (provider_id) REFERENCES providers(id) ON DELETE CASCADE
+) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+
 CREATE TABLE IF NOT EXISTS provider_protocol_endpoints (
     id VARCHAR(36) PRIMARY KEY,
     provider_id VARCHAR(36) NOT NULL,
@@ -2312,8 +2380,6 @@ CREATE TABLE IF NOT EXISTS route_targets (
     FOREIGN KEY (provider_id) REFERENCES providers(id)
 ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
 
-CREATE INDEX idx_route_targets_route_id ON route_targets(route_id);
-
 CREATE TABLE IF NOT EXISTS request_logs (
     id                        VARCHAR(36) PRIMARY KEY,
     created_at                BIGINT NOT NULL DEFAULT 0,
@@ -2352,12 +2418,6 @@ CREATE TABLE IF NOT EXISTS request_logs (
     stream_first_chunk_ms     BIGINT
 ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
 
-CREATE INDEX idx_logs_created_at ON request_logs(created_at);
-CREATE INDEX idx_logs_provider_id ON request_logs(provider_id);
-CREATE INDEX idx_logs_client_status ON request_logs(client_status_code);
-CREATE INDEX idx_logs_upstream_model ON request_logs(upstream_model);
-CREATE INDEX idx_logs_api_key ON request_logs(api_key_id);
-
 CREATE TABLE IF NOT EXISTS settings (
     name VARCHAR(255) PRIMARY KEY,
     value TEXT NOT NULL,
@@ -2387,9 +2447,6 @@ CREATE TABLE IF NOT EXISTS api_key_routes (
     FOREIGN KEY (route_id) REFERENCES routes(id) ON DELETE CASCADE
 ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
 
-CREATE INDEX idx_api_keys_token ON api_keys(token);
-CREATE INDEX idx_api_key_routes_route_id ON api_key_routes(route_id);
-
 CREATE TABLE IF NOT EXISTS provider_oauth_credentials (
     provider_id       VARCHAR(36) PRIMARY KEY,
     driver_key        TEXT NOT NULL,
@@ -2409,7 +2466,4 @@ CREATE TABLE IF NOT EXISTS provider_oauth_credentials (
     updated_at        DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
     FOREIGN KEY (provider_id) REFERENCES providers(id) ON DELETE CASCADE
 ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
-
-CREATE INDEX idx_oauth_creds_status ON provider_oauth_credentials(status);
-CREATE INDEX idx_oauth_creds_expires ON provider_oauth_credentials(expires_at);
 "#;

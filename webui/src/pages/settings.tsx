@@ -2,6 +2,7 @@ import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useState, useRef } from "react";
 import { backend, IS_TAURI } from "@/lib/backend";
 import { localizeBackendErrorMessage } from "@/lib/backend-error";
+import { invalidateModelRatings } from "@/lib/use-model-ratings";
 import type {
   ExportData,
   GatewayStatus,
@@ -187,6 +188,9 @@ export default function SettingsPage() {
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["providers"] });
       qc.invalidateQueries({ queryKey: ["routes"] });
+      qc.invalidateQueries({ queryKey: ["provider-models"] });
+      qc.invalidateQueries({ queryKey: ["provider-model-catalog"] });
+      void invalidateModelRatings(qc);
     },
     onError: (error: unknown) => {
       showErrorDialog("导入配置失败", "Failed to import config", error);
@@ -405,7 +409,7 @@ export default function SettingsPage() {
         <h2 className="text-lg font-semibold text-slate-900">{isZh ? "配置备份" : "Config Backup"}</h2>
         <div className="flex flex-wrap items-center gap-3 rounded-xl bg-slate-50 px-4 py-3">
           <p className="text-xs text-slate-500">
-            {isZh ? "导出或导入提供商、模型和设置" : "Export or import providers, models & settings"}
+            {isZh ? "导出或导入提供商、模型、评分和设置" : "Export or import providers, models, ratings & settings"}
           </p>
           <div className="ml-auto flex items-center gap-2">
             <Button
@@ -446,8 +450,9 @@ export default function SettingsPage() {
           {importMut.isSuccess && importMut.data && (
             <p className="w-full text-xs text-green-600">
               {isZh
-                ? `已导入：${(importMut.data as ImportResult).providers_imported} 个提供商，${(importMut.data as ImportResult).models_imported} 个模型，${(importMut.data as ImportResult).settings_imported} 项设置`
-                : `Imported: ${(importMut.data as ImportResult).providers_imported} providers, ${(importMut.data as ImportResult).models_imported} models, ${(importMut.data as ImportResult).settings_imported} settings`}
+                ? `已导入：${importMut.data.providers_imported} 个提供商，${importMut.data.models_imported} 个模型，${importMut.data.settings_imported} 项设置`
+                : `Imported: ${importMut.data.providers_imported} providers, ${importMut.data.models_imported} models, ${importMut.data.settings_imported} settings`}
+              {importMut.data.ratings_imported != null && (isZh ? `，${importMut.data.ratings_imported} 个评分` : `, ${importMut.data.ratings_imported} ratings`) }
             </p>
           )}
         </div>

@@ -209,6 +209,27 @@ target/debug/nyro-tools proxy \
 Prints the `Scenario` table as JSON (anchor, stream, expected_fields
 per protocol). pytest consumes this as its single source of truth.
 
+### `nyro-tools dump-schema`
+
+Bootstraps **only** core storage (`init` + `migrate`) on a newly created,
+empty, dedicated disposable database, then inspects its actual final DDL.
+It does not start a gateway, listeners, OAuth refresh, or other application
+background work. It never reads the committed schema artifacts as input.
+
+| Flag / environment | Required | Description |
+|---|---|---|
+| `--backend postgres\|mysql` | yes | Storage backend to migrate and inspect. |
+| `--scratch-db-url <URL>` / `NYRO_SCHEMA_DATABASE_URL` | yes (one) | Explicit scratch TCP URL with user, host, and database name. Never an application/production URL. The flag takes precedence over the dedicated environment variable; application database variables are not used. |
+| `--output <PATH>` | no | Atomically replace a file only after successful migration and complete dump. Without it, emit only complete successful SQL on stdout. Diagnostics go to stderr without credentials. |
+
+PostgreSQL requires `pg_dump` on `PATH`; MySQL uses SQLx `SHOW CREATE TABLE`
+and does not require `mysqldump`. **Do not redirect stdout directly into a
+tracked SQL artifact**: shell redirection truncates it before validation.
+Use `--output` instead. Every run consumes an empty scratch database;
+nonempty databases (even empty tables) are rejected, never cleared.
+See [schema generation prerequisites and examples](../database/schema.md#regenerating-reference-sql)
+for database provisioning, safety limits, determinism, and validation.
+
 ---
 
 ## Recording a New Vendor

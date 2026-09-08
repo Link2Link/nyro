@@ -563,7 +563,7 @@ fn build_admin_app(
         let index = dir.join("index.html");
         tracing::info!("webui  serving from directory: {}", dir.display());
         admin_router
-            .fallback_service(ServeDir::new(dir).not_found_service(ServeFile::new(index)))
+            .fallback_service(ServeDir::new(dir).fallback(ServeFile::new(index)))
             .layer(build_cors_layer(cors_origins))
     } else {
         #[cfg(feature = "embed-webui")]
@@ -576,6 +576,33 @@ fn build_admin_app(
         {
             admin_router.layer(build_cors_layer(cors_origins))
         }
+    }
+}
+
+#[cfg(test)]
+mod webui_navigation_tests {
+    use super::*;
+    use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn model_rating_spa_deep_link_returns_html_with_success_status() -> anyhow::Result<()> {
+        let directory = tempfile::tempdir()?;
+        std::fs::write(
+            directory.path().join("index.html"),
+            "<!doctype html><title>Nyro</title>",
+        )?;
+        let app = build_admin_app(Router::new(), &Some(directory.path().to_path_buf()), &[]);
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/model-ratings")
+                    .body(axum::body::Body::empty())?,
+            )
+            .await?;
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 1024).await?;
+        assert_eq!(bytes.as_ref(), b"<!doctype html><title>Nyro</title>");
+        Ok(())
     }
 }
 

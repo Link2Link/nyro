@@ -6,9 +6,9 @@ use async_trait::async_trait;
 use crate::db::models::{
     ApiKeyStats, ApiKeyUsageDetail, ApiKeyWithBindings, CreateApiKey, CreateModel,
     CreateModelBackend, CreateProvider, LogPage, LogQuery, Model, ModelBackend, ModelStats,
-    ModelTimeBucket, ModelUsageDetail, ModelUsageStats, OAuthCredential, Provider, ProviderStats,
-    ProviderUsageDetail, RequestLog, StatsHourly, StatsOverview, StatsTimeBucket, UpdateApiKey,
-    UpdateModel, UpdateProvider, UpsertOAuthCredential,
+    ModelTimeBucket, ModelUsageDetail, ModelUsageStats, OAuthCredential, Provider,
+    ProviderModelRating, ProviderStats, ProviderUsageDetail, RequestLog, StatsHourly,
+    StatsOverview, StatsTimeBucket, UpdateApiKey, UpdateModel, UpdateProvider, UpsertOAuthCredential,
 };
 use crate::logging::LogEntry;
 
@@ -78,6 +78,26 @@ pub trait ProviderStore: Send + Sync {
         &self,
         endpoint_id: &str,
         result: ProviderEndpointTestResult,
+    ) -> anyhow::Result<()>;
+}
+
+/// Persistence for ratings, independent of routing and model catalogs.
+#[async_trait]
+pub trait ProviderModelRatingStore: Send + Sync {
+    async fn list(&self, provider_id: Option<&str>) -> anyhow::Result<Vec<ProviderModelRating>>;
+    async fn get(
+        &self,
+        provider_id: &str,
+        model: &str,
+    ) -> anyhow::Result<Option<ProviderModelRating>>;
+    async fn upsert(&self, rating: ProviderModelRating) -> anyhow::Result<ProviderModelRating>;
+    async fn delete(&self, provider_id: &str, model: &str) -> anyhow::Result<()>;
+    /// Atomically replace all target ratings; an empty slice clears them.
+    /// The target provider ID overrides row IDs and timestamps are preserved.
+    async fn restore(
+        &self,
+        provider_id: &str,
+        ratings: &[ProviderModelRating],
     ) -> anyhow::Result<()>;
 }
 
@@ -238,6 +258,10 @@ pub trait StorageBootstrap: Send + Sync {
 
 pub trait Storage: Send + Sync {
     fn providers(&self) -> &dyn ProviderStore;
+    /// SQL-only capability; YAML-backed memory storage and custom stores may not support ratings.
+    fn provider_model_ratings(&self) -> Option<&dyn ProviderModelRatingStore> {
+        None
+    }
     fn models(&self) -> &dyn ModelStore;
     fn snapshots(&self) -> &dyn ModelSnapshotStore;
     fn model_backends(&self) -> Option<&dyn ModelBackendStore> {

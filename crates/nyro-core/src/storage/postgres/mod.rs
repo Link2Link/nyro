@@ -1,3 +1,8 @@
+mod provider_model_ratings;
+
+use crate::storage::ProviderModelRatingStore;
+use provider_model_ratings::PostgresProviderModelRatingStore;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -68,10 +73,12 @@ impl PostgresAdapter {
 
     pub async fn health(&self) -> PostgresHealth {
         let can_connect = self.ping().await.is_ok();
-        // schema_compatible: verify the final-state `models` table exists,
-        // which confirms migrations have completed (routes → models rename done).
+        // Missing rating storage means this database still needs migration.
         let schema_compatible = if can_connect {
             pg_table_exists(&self.pool, "models").await.unwrap_or(false)
+                && pg_table_exists(&self.pool, "provider_model_ratings")
+                    .await
+                    .unwrap_or(false)
         } else {
             false
         };
@@ -86,6 +93,7 @@ impl PostgresAdapter {
 pub struct PostgresStorage {
     pool: Pool<Postgres>,
     provider_store: Arc<PostgresProviderStore>,
+    provider_model_rating_store: Arc<PostgresProviderModelRatingStore>,
     model_store: Arc<PostgresModelStore>,
     model_backend_store: Arc<PostgresModelBackendStore>,
     settings_store: Arc<PostgresSettingsStore>,
@@ -101,6 +109,8 @@ impl PostgresStorage {
         let adapter = PostgresAdapter::connect(config).await?;
         let pool = adapter.pool().clone();
         let provider_store = Arc::new(PostgresProviderStore { pool: pool.clone() });
+        let provider_model_rating_store =
+            Arc::new(PostgresProviderModelRatingStore { pool: pool.clone() });
         let model_store = Arc::new(PostgresModelStore { pool: pool.clone() });
         let model_backend_store = Arc::new(PostgresModelBackendStore { pool: pool.clone() });
         let settings_store = Arc::new(PostgresSettingsStore { pool: pool.clone() });
@@ -112,6 +122,7 @@ impl PostgresStorage {
         Ok(Self {
             pool,
             provider_store,
+            provider_model_rating_store,
             model_store,
             model_backend_store,
             settings_store,
@@ -131,6 +142,10 @@ impl PostgresStorage {
 impl Storage for PostgresStorage {
     fn providers(&self) -> &dyn ProviderStore {
         self.provider_store.as_ref()
+    }
+
+    fn provider_model_ratings(&self) -> Option<&dyn ProviderModelRatingStore> {
+        Some(self.provider_model_rating_store.as_ref())
     }
 
     fn models(&self) -> &dyn ModelStore {
@@ -521,6 +536,11 @@ impl ProviderStore for PostgresProviderStore {
             .await?;
 
         sqlx::query("DELETE FROM provider_protocol_endpoints WHERE provider_id = $1")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+
+        sqlx::query("DELETE FROM provider_model_ratings WHERE provider_id = $1")
             .bind(id)
             .execute(&mut *tx)
             .await?;
@@ -2170,6 +2190,15 @@ CREATE TABLE IF NOT EXISTS providers (
     priority INTEGER DEFAULT 0,
     created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS provider_model_ratings (
+    provider_id TEXT COLLATE "C" NOT NULL REFERENCES providers(id) ON DELETE CASCADE,
+    upstream_model TEXT COLLATE "C" NOT NULL
+        CHECK (octet_length(upstream_model) BETWEEN 1 AND 1024),
+    score INTEGER NOT NULL CHECK (score BETWEEN 0 AND 100),
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (provider_id, upstream_model)
 );
 
 CREATE TABLE IF NOT EXISTS provider_protocol_endpoints (

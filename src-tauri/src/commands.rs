@@ -1,5 +1,7 @@
 use nyro_core::Gateway;
-use nyro_core::admin::{CopyProviderOptions, ProviderOAuthStatusData};
+use nyro_core::admin::{
+    CopyProviderOptions, ProviderModelRatingState, ProviderOAuthStatusData, SetProviderModelRating,
+};
 use nyro_core::auth::{AuthExchangeInput, AuthSessionInitData, AuthSessionStatusData};
 use nyro_core::db::models::*;
 use serde::{Deserialize, Serialize};
@@ -8,6 +10,57 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::{fs, time::SystemTime};
 use tauri::{Manager, State};
+
+// ── Manual model ratings ──
+
+#[tauri::command]
+pub async fn list_provider_model_ratings(
+    gw: State<'_, Gateway>,
+    provider_id: Option<String>,
+) -> Result<Vec<ProviderModelRating>, String> {
+    gw.admin()
+        .list_provider_model_ratings(provider_id.as_deref())
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn get_provider_model_rating(
+    gw: State<'_, Gateway>,
+    provider_id: String,
+    model: String,
+) -> Result<ProviderModelRatingState, String> {
+    gw.admin()
+        .get_provider_model_rating(&provider_id, &model)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn set_provider_model_rating(
+    gw: State<'_, Gateway>,
+    provider_id: String,
+    model: String,
+    input: SetProviderModelRating,
+) -> Result<ProviderModelRating, String> {
+    gw.admin()
+        .set_provider_model_rating(&provider_id, &model, input)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn delete_provider_model_rating(
+    gw: State<'_, Gateway>,
+    provider_id: String,
+    model: String,
+) -> Result<serde_json::Value, String> {
+    gw.admin()
+        .delete_provider_model_rating(&provider_id, &model)
+        .await
+        .map(|()| serde_json::json!({ "ok": true }))
+        .map_err(|e| e.to_string())
+}
 
 // ── Providers ──
 
@@ -171,9 +224,10 @@ pub async fn set_provider_usage_credentials(
 pub async fn get_provider_models(
     gw: State<'_, Gateway>,
     id: String,
+    require_catalog: Option<bool>,
 ) -> Result<Vec<String>, String> {
     gw.admin()
-        .get_provider_models(&id)
+        .get_provider_models_with_catalog_validation(&id, require_catalog.unwrap_or(false))
         .await
         .map_err(|e| e.to_string())
 }

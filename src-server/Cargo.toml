@@ -22,6 +22,10 @@ indexmap = { version = "2", features = ["serde"] }
 chrono = { workspace = true }
 rust-embed = { version = "8", features = ["compression"], optional = true }
 
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+tempfile = "3"
+
 [features]
 default = ["embed-webui"]
 embed-webui = ["dep:rust-embed"]

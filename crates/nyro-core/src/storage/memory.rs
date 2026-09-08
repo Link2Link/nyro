@@ -13,8 +13,8 @@ use crate::logging::LogEntry;
 
 use super::traits::{
     ApiKeyStore, AuthAccessStore, LogStore, ModelBackendStore, ModelSnapshotStore, ModelStore,
-    OAuthCredentialStore, ProviderEndpointTestResult, ProviderStore, ProviderTestResult,
-    SettingsStore, Storage, StorageBackend, StorageBootstrap, StorageHealth,
+    OAuthCredentialStore, ProviderEndpointTestResult, ProviderModelRatingStore, ProviderStore,
+    ProviderTestResult, SettingsStore, Storage, StorageBackend, StorageBootstrap, StorageHealth,
 };
 
 use std::sync::Arc;
@@ -51,6 +51,10 @@ pub struct MemoryOAuthCredentialStore {
 impl Storage for MemoryStorage {
     fn providers(&self) -> &dyn ProviderStore {
         self
+    }
+    fn provider_model_ratings(&self) -> Option<&dyn ProviderModelRatingStore> {
+        // YAML configuration is read-only and has no persistent rating store.
+        None
     }
     fn models(&self) -> &dyn ModelStore {
         self

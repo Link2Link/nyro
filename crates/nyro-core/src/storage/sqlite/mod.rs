@@ -1,3 +1,8 @@
+mod provider_model_ratings;
+
+use crate::storage::ProviderModelRatingStore;
+use provider_model_ratings::SqliteProviderModelRatingStore;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -30,6 +35,7 @@ use crate::storage::traits::{
 pub struct SqliteStorage {
     pool: SqlitePool,
     provider_store: Arc<SqliteProviderStore>,
+    provider_model_rating_store: Arc<SqliteProviderModelRatingStore>,
     model_store: Arc<SqliteModelStore>,
     model_backend_store: Arc<SqliteModelBackendStore>,
     settings_store: Arc<SqliteSettingsStore>,
@@ -50,6 +56,8 @@ impl SqliteStorage {
 
     pub fn from_pool(pool: SqlitePool) -> Self {
         let provider_store = Arc::new(SqliteProviderStore { pool: pool.clone() });
+        let provider_model_rating_store =
+            Arc::new(SqliteProviderModelRatingStore { pool: pool.clone() });
         let model_store = Arc::new(SqliteModelStore { pool: pool.clone() });
         let model_backend_store = Arc::new(SqliteModelBackendStore { pool: pool.clone() });
         let settings_store = Arc::new(SqliteSettingsStore { pool: pool.clone() });
@@ -61,6 +69,7 @@ impl SqliteStorage {
         Self {
             pool,
             provider_store,
+            provider_model_rating_store,
             model_store,
             model_backend_store,
             settings_store,
@@ -80,6 +89,10 @@ impl SqliteStorage {
 impl Storage for SqliteStorage {
     fn providers(&self) -> &dyn ProviderStore {
         self.provider_store.as_ref()
+    }
+
+    fn provider_model_ratings(&self) -> Option<&dyn ProviderModelRatingStore> {
+        Some(self.provider_model_rating_store.as_ref())
     }
 
     fn models(&self) -> &dyn ModelStore {
@@ -526,6 +539,11 @@ impl ProviderStore for SqliteProviderStore {
             .await?;
 
         sqlx::query("DELETE FROM provider_protocol_endpoints WHERE provider_id = ?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+
+        sqlx::query("DELETE FROM provider_model_ratings WHERE provider_id = ?")
             .bind(id)
             .execute(&mut *tx)
             .await?;
@@ -1653,16 +1671,16 @@ impl StorageBootstrap for SqliteBootstrap {
 
     async fn health(&self) -> anyhow::Result<StorageHealth> {
         let can_connect = sqlx::query("SELECT 1").execute(&self.pool).await.is_ok();
-        // schema_compatible: verify the final-state `models` table exists,
-        // which confirms migrations have completed (routes → models rename done).
+        // Missing rating storage means this database still needs migration.
         let schema_compatible = if can_connect {
             sqlx::query_scalar::<_, i64>(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='models'",
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' \
+                 AND name IN ('models', 'provider_model_ratings')",
             )
             .fetch_one(&self.pool)
             .await
             .unwrap_or(0)
-                > 0
+                == 2
         } else {
             false
         };

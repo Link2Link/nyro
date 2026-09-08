@@ -12,6 +12,7 @@ import {
   ListChecks,
   ListFilter,
   Loader2,
+  Pencil,
   RefreshCw,
   Route as RouteIcon,
   Search,
@@ -20,6 +21,9 @@ import {
 import { backend } from "@/lib/backend";
 import { formatDuration, formatLocalDateTime, formatTokenCount, formatTps } from "@/lib/format";
 import { useLocale } from "@/lib/i18n";
+import { providerModelKey as modelKey, ratingDisplayState, uniqueModelIdentifiers, type RatingLoadState } from "@/lib/model-ratings";
+import { useModelRatings } from "@/lib/use-model-ratings";
+import { ModelRatingBadge, ModelRatingClearedNotice, ModelRatingEditor, ModelRatingsFeedback, type ModelRatingEditTarget } from "@/components/model-rating";
 import {
   loadModelProbeResults,
   saveModelProbeResults,
@@ -32,6 +36,7 @@ import type {
   ModelUsageStats,
   ModelProbeResult,
   Provider,
+  ProviderModelRating,
 } from "@/lib/types";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -56,15 +61,6 @@ const MODEL_BATCH_SIZE = 40;
 
 function normalizeSearch(value: string) {
   return value.toLocaleLowerCase().replace(/[\s._\p{Pd}/:]+/gu, "");
-}
-
-function uniqueSorted(values: string[]) {
-  return [...new Set(values.map((value) => value.trim()).filter(Boolean))]
-    .sort((a, b) => a.localeCompare(b, undefined, { sensitivity: "base" }));
-}
-
-function modelKey(providerId: string, model: string) {
-  return providerId + "\u0000" + model;
 }
 
 function formatTokens(value?: number | null) {
@@ -327,12 +323,18 @@ function ModelRow({
   model,
   mappings,
   probe,
+  rating,
+  ratingState,
+  onEditRating,
   isZh,
 }: {
   provider: Provider;
   model: string;
   mappings: string[];
   probe?: ModelProbeResult;
+  rating?: ProviderModelRating;
+  ratingState: RatingLoadState;
+  onEditRating: (target: ModelRatingEditTarget) => void;
   isZh: boolean;
 }) {
   const navigate = useNavigate();
@@ -346,7 +348,7 @@ function ModelRow({
 
   return (
     <div className="border-t border-slate-200/80 first:border-t-0">
-      <div className="grid min-h-14 items-center gap-3 px-3 py-2.5 md:grid-cols-[minmax(0,2.1fr)_minmax(7.5rem,.7fr)_minmax(0,1.35fr)_4.75rem] md:px-4">
+      <div className="grid min-h-14 items-center gap-3 px-3 py-2.5 md:grid-cols-[minmax(0,2.1fr)_minmax(7.5rem,.7fr)_minmax(5.5rem,.55fr)_minmax(0,1.35fr)_7rem] md:px-4">
         <button
           type="button"
           aria-expanded={expanded}
@@ -359,11 +361,12 @@ function ModelRow({
           ) : (
             <ChevronRight className="h-4 w-4 shrink-0 text-slate-400" />
           )}
-          <span className="min-w-0 break-all font-mono text-[13px] font-medium text-slate-800" title={model}>
+          <span className="min-w-0 whitespace-pre-wrap break-all font-mono text-[13px] font-medium text-slate-800" title={model}>
             {model}
           </span>
         </button>
         <div><ProbeBadge result={probe} isZh={isZh} /></div>
+        <div><ModelRatingBadge state={ratingDisplayState(ratingState, rating)} /></div>
         <div className="flex min-w-0 flex-wrap gap-1.5">
           {mappings.length > 0 ? mappings.map((name) => (
             <Badge key={name} variant="secondary" className="max-w-full truncate" title={name}>
@@ -374,6 +377,13 @@ function ModelRow({
           )}
         </div>
         <div className="flex items-center justify-end gap-1">
+          <IconAction
+            label={isZh ? "编辑评分" : "Edit rating"}
+            disabled={ratingState !== "ready"}
+            onClick={() => onEditRating({ providerId: provider.id, providerName: provider.name, model, rating: rating ?? null })}
+          >
+            <Pencil className="h-4 w-4" />
+          </IconAction>
           <IconAction label={isZh ? "创建映射" : "Create mapping"} onClick={createMapping}>
             <RouteIcon className="h-4 w-4" />
           </IconAction>
@@ -405,6 +415,9 @@ function ProviderSection({
   mappings,
   probes,
   probeStore,
+  ratings,
+  ratingState,
+  onEditRating,
   isZh,
   locale,
   search,
@@ -421,6 +434,9 @@ function ProviderSection({
   mappings: Map<string, string[]>;
   probes: Map<string, ModelProbeResult>;
   probeStore: ProviderModelProbeStore;
+  ratings: Map<string, ProviderModelRating>;
+  ratingState: RatingLoadState;
+  onEditRating: (target: ModelRatingEditTarget) => void;
   isZh: boolean;
   locale: string;
   search: string;
@@ -547,9 +563,10 @@ function ProviderSection({
 
           {visibleModels.length > 0 && (
             <div>
-              <div className="hidden grid-cols-[minmax(0,2.1fr)_minmax(7.5rem,.7fr)_minmax(0,1.35fr)_4.75rem] gap-3 bg-slate-50/65 px-4 py-2 text-[11px] font-medium text-slate-400 md:grid">
+              <div className="hidden grid-cols-[minmax(0,2.1fr)_minmax(7.5rem,.7fr)_minmax(5.5rem,.55fr)_minmax(0,1.35fr)_7rem] gap-3 bg-slate-50/65 px-4 py-2 text-[11px] font-medium text-slate-400 md:grid">
                 <span>{isZh ? "模型 ID" : "Model ID"}</span>
                 <span>{isZh ? "状态" : "Status"}</span>
+                <span>{isZh ? "评分" : "Score"}</span>
                 <span>{isZh ? "模型映射" : "Model Mapping"}</span>
                 <span className="text-right">{isZh ? "操作" : "Actions"}</span>
               </div>
@@ -560,6 +577,9 @@ function ProviderSection({
                   model={model}
                   mappings={mappings.get(modelKey(provider.id, model)) ?? []}
                   probe={probes.get(modelKey(provider.id, model))}
+                  rating={ratings.get(modelKey(provider.id, model))}
+                  ratingState={ratingState}
+                  onEditRating={onEditRating}
                   isZh={isZh}
                 />
               ))}
@@ -594,6 +614,9 @@ export default function AvailableModelsPage() {
   const [probeStore, setProbeStore] = useState<ProviderModelProbeStore>(loadModelProbeResults);
   const [probingId, setProbingId] = useState<string | null>(null);
   const [probeErrors, setProbeErrors] = useState<Record<string, string>>({});
+  const [editingRating, setEditingRating] = useState<ModelRatingEditTarget | null>(null);
+  const [clearedRating, setClearedRating] = useState<ModelRatingEditTarget | null>(null);
+  const ratingsQuery = useModelRatings();
 
   const providersQuery = useQuery<Provider[]>({
     queryKey: ["providers"],
@@ -616,7 +639,7 @@ export default function AvailableModelsPage() {
       enabled: provider.is_enabled,
       retry: false,
       staleTime: 60_000,
-      select: uniqueSorted,
+      select: uniqueModelIdentifiers,
     })),
   });
 
@@ -713,6 +736,14 @@ export default function AvailableModelsPage() {
           </div>
         </div>
 
+        {clearedRating && <ModelRatingClearedNotice target={clearedRating} onDismiss={() => setClearedRating(null)} />}
+        <ModelRatingsFeedback
+          state={ratingsQuery.loadState}
+          error={ratingsQuery.error}
+          fetching={ratingsQuery.isFetching}
+          onRetry={() => void ratingsQuery.refetch()}
+        />
+
         <div className="glass flex flex-col gap-3 rounded-2xl p-3 md:flex-row md:items-center">
           <div className="relative min-w-0 flex-1">
             <Search className="pointer-events-none absolute top-1/2 left-3 h-4 w-4 -translate-y-1/2 text-slate-400" />
@@ -788,6 +819,9 @@ export default function AvailableModelsPage() {
                   mappings={mappings}
                   probes={probes}
                   probeStore={probeStore}
+                  ratings={ratingsQuery.index}
+                  ratingState={ratingsQuery.loadState}
+                  onEditRating={setEditingRating}
                   isZh={isZh}
                   locale={locale}
                   search={search}
@@ -802,6 +836,7 @@ export default function AvailableModelsPage() {
             })}
           </div>
         )}
+        {editingRating && <ModelRatingEditor target={editingRating} onClose={() => setEditingRating(null)} onCleared={setClearedRating} />}
       </div>
     </TooltipProvider>
   );

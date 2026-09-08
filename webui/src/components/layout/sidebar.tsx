@@ -3,6 +3,7 @@ import { cn } from "@/lib/utils";
 import {
   LayoutDashboard,
   Boxes,
+  Star,
   Route,
   Server,
   ScrollText,
@@ -21,6 +22,7 @@ const NAV_ITEMS = [
   { label: "Dashboard", path: "/", icon: LayoutDashboard },
   { label: "Providers", path: "/providers", icon: Server },
   { label: "Available Models", path: "/available-models", icon: Boxes },
+  { label: "Model Ratings", path: "/model-ratings", icon: Star },
   { label: "Model Mapping", path: "/models", icon: Route },
   { label: "API Keys", path: "/api-keys", icon: KeyRound },
   { label: "Connect", path: "/connect", icon: Plug },
@@ -70,10 +72,17 @@ export function Sidebar({ collapsed, onToggle }: SidebarProps) {
             path: string;
             icon: LucideIcon;
           };
+          const displayLabel = isZh ? ({
+            Dashboard: "概览", Providers: "提供商", "Available Models": "可用模型",
+            "Model Ratings": "模型评分", "Model Mapping": "模型映射", "API Keys": "密钥",
+            Connect: "接入", Logs: "日志", Stats: "统计", Extensions: "扩展", Settings: "系统设置",
+          } as Record<string, string>)[label] ?? label : label;
           return (
             <NavLink
               key={path}
               to={path}
+              aria-label={displayLabel}
+              title={collapsed ? displayLabel : undefined}
               end={path === "/"}
               className={({ isActive }) =>
                 cn(
@@ -88,31 +97,7 @@ export function Sidebar({ collapsed, onToggle }: SidebarProps) {
               }
             >
               <Icon className="h-4 w-4 shrink-0" />
-              {!collapsed && (
-                <span>
-                  {isZh
-                    ? label === "Dashboard"
-                      ? "概览"
-                      : label === "Providers"
-                        ? "提供商"
-                        : label === "Available Models"
-                          ? "可用模型"
-                          : label === "Model Mapping"
-                            ? "模型映射"
-                          : label === "API Keys"
-                            ? "密钥"
-                          : label === "Connect"
-                            ? "接入"
-                          : label === "Logs"
-                            ? "日志"
-                            : label === "Stats"
-                              ? "统计"
-                              : label === "Extensions"
-                                ? "扩展"
-                                : "系统设置"
-                    : label}
-                </span>
-              )}
+              {!collapsed && <span>{displayLabel}</span>}
             </NavLink>
           );
         })}
@@ -121,6 +106,7 @@ export function Sidebar({ collapsed, onToggle }: SidebarProps) {
       {/* Collapse Toggle */}
       <button
         onClick={onToggle}
+        aria-label={collapsed ? (isZh ? "展开导航" : "Expand navigation") : (isZh ? "折叠导航" : "Collapse navigation")}
         className="sidebar-toggle flex h-11 items-center justify-center border-t border-slate-200/80 text-slate-500 transition-colors hover:text-slate-900 cursor-pointer"
       >
         <ChevronLeft

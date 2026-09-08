@@ -73,9 +73,11 @@ When modifying the database schema — including changes to `INIT_SQL`, `POSTGRE
 1. Update `docs/database/schema.md` to reflect the new table/column definitions.
 2. Regenerate `deploy/schema/postgres.sql` and `deploy/schema/mysql.sql` to match the final post-migration state:
    ```bash
-   nyro-tools dump-schema --backend postgres > deploy/schema/postgres.sql
-   nyro-tools dump-schema --backend mysql    > deploy/schema/mysql.sql
+   nyro-tools dump-schema --backend postgres --scratch-db-url "$POSTGRES_SCRATCH_URL" --output deploy/schema/postgres.sql
+   nyro-tools dump-schema --backend mysql --scratch-db-url "$MYSQL_SCRATCH_URL" --output deploy/schema/mysql.sql
    ```
+   Each URL must point to a newly created **EMPTY, dedicated disposable database**, never an application/production database. PostgreSQL also requires `pg_dump` on `PATH`. See `docs/database/schema.md` for full prerequisites. Use `--output` for safe temporary-file replacement, not truncating shell redirection.
+
    These files are the authoritative reference schema for DBAs. They represent the **final state** after all migrations have run (with final table names: `models`, `model_backends`, `api_key_models`).
 
 > The SQL files in `deploy/schema/` are derived reference artifacts — do not manually edit them except to update the header comment. Always regenerate from the migration source of truth.

@@ -358,6 +358,28 @@ export interface EndpointTestResult {
   tested_at: string;
 }
 
+/** One persisted comprehensive score for an exact provider / upstream model pair. */
+export interface ProviderModelRating {
+  provider_id: string;
+  upstream_model: string;
+  score: number;
+  updated_at: string;
+}
+
+export type ProviderModelRatingState =
+  | (ProviderModelRating & { status: "rated" })
+  | {
+      provider_id: string;
+      upstream_model: string;
+      status: "unrated";
+      score: null;
+      updated_at: null;
+    };
+
+export interface SetProviderModelRating {
+  score: number;
+}
+
 export interface ModelCapabilities {
   provider: string;
   model_id: string;
@@ -627,6 +649,7 @@ export interface ExportProvider {
   static_models?: string | null;
   api_key: string;
   is_enabled: boolean;
+  model_ratings?: Omit<ProviderModelRating, "provider_id">[];
 }
 
 export interface ExportModel {
@@ -642,6 +665,7 @@ export interface ImportResult {
   providers_imported: number;
   models_imported: number;
   settings_imported: number;
+  ratings_imported?: number;
 }
 
 

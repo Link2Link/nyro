@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Outlet, useNavigate } from "react-router-dom";
 import { Github, Languages, LogOut, Moon, Sun } from "lucide-react";
 import { Sidebar } from "./sidebar";
@@ -31,7 +31,8 @@ const NON_DRAGGABLE_SELECTOR = [
 ].join(",");
 
 export function AppLayout() {
-  const [collapsed, setCollapsed] = useState(false);
+  const [collapsed, setCollapsed] = useState(() => window.matchMedia("(max-width: 767px)").matches);
+  const desktopCollapsed = useRef(false);
   const [theme, setTheme] = useState<"light" | "dark">("light");
   const [hasToken, setHasToken] = useState(false);
   const { locale, setLocale } = useLocale();
@@ -51,6 +52,21 @@ export function AppLayout() {
       setHasToken(getAdminToken() !== null);
     }
   }, []);
+
+  useEffect(() => {
+    const media = window.matchMedia("(max-width: 767px)");
+    const handleChange = (event: MediaQueryListEvent) => {
+      setCollapsed(event.matches || desktopCollapsed.current);
+    };
+    media.addEventListener("change", handleChange);
+    return () => media.removeEventListener("change", handleChange);
+  }, []);
+
+  function toggleSidebar() {
+    const next = !collapsed;
+    if (!window.matchMedia("(max-width: 767px)").matches) desktopCollapsed.current = next;
+    setCollapsed(next);
+  }
 
   async function toggleTheme() {
     const next = theme === "dark" ? "light" : "dark";
@@ -165,7 +181,7 @@ export function AppLayout() {
         )}
       >
         <div onMouseDownCapture={handleSurfaceMouseDown} className="h-full">
-          <Sidebar collapsed={collapsed} onToggle={() => setCollapsed(!collapsed)} />
+          <Sidebar collapsed={collapsed} onToggle={toggleSidebar} />
         </div>
         <main
           onMouseDownCapture={handleSurfaceMouseDown}

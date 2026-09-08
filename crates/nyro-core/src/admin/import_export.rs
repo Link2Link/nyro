@@ -35,6 +35,23 @@ impl AdminService {
         let providers = self.list_providers().await?;
         let models = self.list_models().await?;
         let settings = self.gw.storage.settings().list_all().await?;
+        let mut ratings_by_provider: HashMap<String, Vec<ExportProviderModelRating>> =
+            HashMap::new();
+        if let Some(store) = self.gw.storage.provider_model_ratings() {
+            for rating in store.list(None).await? {
+                ratings_by_provider
+                    .entry(rating.provider_id)
+                    .or_default()
+                    .push(ExportProviderModelRating {
+                        upstream_model: rating.upstream_model,
+                        score: rating.score,
+                        updated_at: rating.updated_at,
+                    });
+            }
+        }
+        for ratings in ratings_by_provider.values_mut() {
+            ratings.sort_by(|a, b| a.upstream_model.cmp(&b.upstream_model));
+        }
 
         Ok(ExportData {
             version: 2,
@@ -54,6 +71,7 @@ impl AdminService {
                         })
                         .collect();
                     ExportProvider {
+                        model_ratings: ratings_by_provider.remove(&p.id).unwrap_or_default(),
                         name: p.name,
                         vendor: p.vendor,
                         protocol: p.protocol,
@@ -91,7 +109,19 @@ impl AdminService {
     }
 
     pub async fn import_config(&self, data: ExportData) -> anyhow::Result<ImportResult> {
+        // Validate every nested rating before any configuration is changed.
+        for provider in &data.providers {
+            super::provider_model_ratings::validate_export_ratings(&provider.model_ratings)?;
+        }
+        if data
+            .providers
+            .iter()
+            .any(|provider| !provider.model_ratings.is_empty())
+        {
+            self.rating_store()?;
+        }
         let mut providers_imported = 0u32;
+        let mut ratings_imported = 0u32;
         let mut models_imported = 0u32;
         let mut settings_imported = 0u32;
 
@@ -101,8 +131,12 @@ impl AdminService {
                 .storage
                 .providers()
                 .exists_by_name(&p.name, None)
-                .await
-                .unwrap_or(false);
+                .await?;
+            if exists {
+                // Existing-name conflicts skip the entire provider, including
+                // its ratings. Never overwrite current manual scores.
+                continue;
+            }
 
             let legacy = if p.endpoints.is_empty() {
                 crate::db::models::normalize_legacy_provider_protocol_config(
@@ -131,29 +165,68 @@ impl AdminService {
                 Vec::new()
             };
 
-            if !exists
-                && self
-                    .create_provider(CreateProvider {
-                        name: p.name.clone(),
-                        vendor: p.vendor.clone(),
-                        protocol: import_provider_protocol(p),
-                        base_url: import_provider_base_url(p),
-                        protocol_mode,
-                        protocol_endpoints,
-                        preset_key: p.preset_key.clone(),
-                        channel: p.channel.clone(),
-                        models_source: p.models_source.clone(),
-                        static_models: p.static_models.clone(),
-                        api_key: p.api_key.clone(),
-                        auth_mode: p.auth_mode.clone(),
-                        use_proxy: p.use_proxy,
-                        fast_mode: p.fast_mode,
+            let created = self
+                .create_provider(CreateProvider {
+                    name: p.name.clone(),
+                    vendor: p.vendor.clone(),
+                    protocol: import_provider_protocol(p),
+                    base_url: import_provider_base_url(p),
+                    protocol_mode,
+                    protocol_endpoints,
+                    preset_key: p.preset_key.clone(),
+                    channel: p.channel.clone(),
+                    models_source: p.models_source.clone(),
+                    static_models: p.static_models.clone(),
+                    api_key: p.api_key.clone(),
+                    auth_mode: p.auth_mode.clone(),
+                    use_proxy: p.use_proxy,
+                    fast_mode: p.fast_mode,
+                })
+                .await;
+            let created = match created {
+                Ok(provider) => provider,
+                // Preserve legacy handling of providers with no new metadata,
+                // but never silently discard requested rating restoration.
+                Err(error) if p.model_ratings.is_empty() => {
+                    tracing::warn!(provider = %p.name, error = %error, "provider import skipped");
+                    continue;
+                }
+                Err(error) => return Err(error.context(format!(
+                    "Provider import failed after {providers_imported} providers and {ratings_imported} ratings were imported"
+                ))),
+            };
+            if !p.model_ratings.is_empty() {
+                let restored: Vec<ProviderModelRating> = p
+                    .model_ratings
+                    .iter()
+                    .map(|rating| ProviderModelRating {
+                        provider_id: created.id.clone(),
+                        upstream_model: rating.upstream_model.clone(),
+                        score: rating.score,
+                        // Already validated before any mutations; retain the
+                        // original instant in the canonical UTC millisecond form.
+                        updated_at: DateTime::parse_from_rfc3339(&rating.updated_at)
+                            .expect("rating timestamp prevalidated")
+                            .with_timezone(&Utc)
+                            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
                     })
-                    .await
-                    .is_ok()
-            {
-                providers_imported += 1;
+                    .collect();
+                if let Err(error) = self.rating_store()?.restore(&created.id, &restored).await {
+                    let rollback = self.delete_provider(&created.id).await;
+                    let rollback_detail = match rollback {
+                        Ok(()) => "new provider rolled back".to_string(),
+                        Err(cleanup_error) => format!(
+                            "rollback of new provider {} also failed: {cleanup_error}",
+                            created.id
+                        ),
+                    };
+                    return Err(error.context(format!(
+                        "Rating import failed ({rollback_detail}); {providers_imported} providers and {ratings_imported} ratings were imported earlier"
+                    )));
+                }
+                ratings_imported += restored.len() as u32;
             }
+            providers_imported += 1;
         }
 
         let fallback_provider_id = self
@@ -207,6 +280,7 @@ impl AdminService {
 
         Ok(ImportResult {
             providers_imported,
+            ratings_imported,
             models_imported,
             settings_imported,
         })

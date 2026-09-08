@@ -2,6 +2,7 @@ import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { backend } from "@/lib/backend";
 import { localizeBackendErrorMessage } from "@/lib/backend-error";
+import { invalidateModelRatings } from "@/lib/use-model-ratings";
 import type {
   Provider,
   CreateProvider,
@@ -1044,6 +1045,7 @@ export default function ProvidersPage() {
     onSuccess: () => {
       setEditError(null);
       qc.invalidateQueries({ queryKey: ["providers"] });
+      qc.invalidateQueries({ queryKey: ["provider-model-catalog"] });
       setEditingId(null); editingIdRef.current = null;
     },
     onError: (err: Error) => {
@@ -1054,7 +1056,13 @@ export default function ProvidersPage() {
 
   const deleteMut = useMutation({
     mutationFn: (id: string) => backend("delete_provider", { id }),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ["providers"] }),
+    onSuccess: (_result, id) => {
+      qc.invalidateQueries({ queryKey: ["providers"] });
+      qc.invalidateQueries({ queryKey: ["routes"] });
+      qc.removeQueries({ queryKey: ["provider-models", id] });
+      qc.removeQueries({ queryKey: ["provider-model-catalog", id] });
+      void invalidateModelRatings(qc);
+    },
     onError: (error: unknown) => {
       showErrorDialog("删除提供商失败", "Failed to delete provider", error);
     },
@@ -1066,6 +1074,7 @@ export default function ProvidersPage() {
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["providers"] });
       qc.invalidateQueries({ queryKey: ["routes"] });
+      void invalidateModelRatings(qc);
     },
     onError: (error: unknown) => {
       showErrorDialog("复制提供商失败", "Failed to copy provider", error);

@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
 
+pub use super::provider_model_ratings::ProviderModelRating;
+
 use crate::provider::AuthMode;
 use crate::provider::VendorRegistry;
 
@@ -1055,9 +1057,18 @@ pub struct ExportData {
     pub settings: Vec<(String, String)>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExportProviderModelRating {
+    pub upstream_model: String,
+    pub score: i32,
+    pub updated_at: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExportProvider {
     pub name: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub model_ratings: Vec<ExportProviderModelRating>,
     pub vendor: Option<String>,
     pub protocol: String,
     pub base_url: String,
@@ -1104,6 +1115,8 @@ pub struct ExportModel {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ImportResult {
     pub providers_imported: u32,
+    #[serde(default)]
+    pub ratings_imported: u32,
     #[serde(alias = "routes_imported")]
     pub models_imported: u32,
     pub settings_imported: u32,

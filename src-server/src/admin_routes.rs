@@ -5,7 +5,7 @@ use axum::response::IntoResponse;
 use axum::routing::{get, post, put};
 use axum::{Extension, Json, Router};
 use nyro_core::Gateway;
-use nyro_core::admin::CopyProviderOptions;
+use nyro_core::admin::{CopyProviderOptions, ProviderModelRatingError, SetProviderModelRating};
 use nyro_core::auth::AuthExchangeInput;
 use nyro_core::db::models::*;
 use serde::Deserialize;
@@ -76,6 +76,16 @@ pub fn create_router(gateway: Gateway, admin_token: Option<String>) -> Router {
             get(get_provider_usage_credentials_handler).put(put_provider_usage_credentials_handler),
         )
         .route("/providers/:id/models", get(provider_models_handler))
+        .route(
+            "/provider-model-ratings",
+            get(list_provider_model_ratings_handler),
+        )
+        .route(
+            "/providers/:id/model-rating",
+            get(get_provider_model_rating_handler)
+                .put(set_provider_model_rating_handler)
+                .delete(delete_provider_model_rating_handler),
+        )
         .route(
             "/providers/:id/model-capabilities",
             get(provider_model_capabilities_handler),
@@ -342,14 +352,139 @@ async fn list_provider_usage_handler(State(gw): State<Gateway>) -> impl IntoResp
     }
 }
 
+#[derive(Default, Deserialize)]
+struct ProviderCatalogQuery {
+    #[serde(default)]
+    require_catalog: bool,
+}
+
 async fn provider_models_handler(
     State(gw): State<Gateway>,
     Path(id): Path<String>,
+    Query(query): Query<ProviderCatalogQuery>,
 ) -> impl IntoResponse {
-    match gw.admin().get_provider_models(&id).await {
+    match gw
+        .admin()
+        .get_provider_models_with_catalog_validation(&id, query.require_catalog)
+        .await
+    {
         Ok(v) => Json(serde_json::json!({ "data": v })).into_response(),
+        Err(e) if query.require_catalog => (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+            .into_response(),
         Err(e) => err(e),
     }
+}
+
+#[derive(Deserialize)]
+struct ProviderRatingListQuery {
+    provider_id: Option<String>,
+}
+
+async fn list_provider_model_ratings_handler(
+    State(gw): State<Gateway>,
+    query: Result<Query<ProviderRatingListQuery>, axum::extract::rejection::QueryRejection>,
+) -> axum::response::Response {
+    let Query(query) = match query {
+        Ok(query) => query,
+        Err(error) => return rating_bad_request(error.body_text()),
+    };
+    match gw
+        .admin()
+        .list_provider_model_ratings(query.provider_id.as_deref())
+        .await
+    {
+        Ok(ratings) => Json(serde_json::json!({ "data": ratings })).into_response(),
+        Err(error) => rating_error(error),
+    }
+}
+
+async fn get_provider_model_rating_handler(
+    State(gw): State<Gateway>,
+    Path(id): Path<String>,
+    query: Result<Query<ProviderModelQuery>, axum::extract::rejection::QueryRejection>,
+) -> axum::response::Response {
+    let Query(query) = match query {
+        Ok(query) => query,
+        Err(error) => return rating_bad_request(error.body_text()),
+    };
+    match gw
+        .admin()
+        .get_provider_model_rating(&id, &query.model)
+        .await
+    {
+        Ok(state) => Json(serde_json::json!({ "data": state })).into_response(),
+        Err(error) => rating_error(error),
+    }
+}
+
+async fn set_provider_model_rating_handler(
+    State(gw): State<Gateway>,
+    Path(id): Path<String>,
+    query: Result<Query<ProviderModelQuery>, axum::extract::rejection::QueryRejection>,
+    input: Result<Json<SetProviderModelRating>, axum::extract::rejection::JsonRejection>,
+) -> axum::response::Response {
+    let Query(query) = match query {
+        Ok(query) => query,
+        Err(error) => return rating_bad_request(error.body_text()),
+    };
+    let Json(input) = match input {
+        Ok(input) => input,
+        Err(error) => return rating_bad_request(error.body_text()),
+    };
+    match gw
+        .admin()
+        .set_provider_model_rating(&id, &query.model, input)
+        .await
+    {
+        Ok(rating) => Json(serde_json::json!({ "data": rating })).into_response(),
+        Err(error) => rating_error(error),
+    }
+}
+
+async fn delete_provider_model_rating_handler(
+    State(gw): State<Gateway>,
+    Path(id): Path<String>,
+    query: Result<Query<ProviderModelQuery>, axum::extract::rejection::QueryRejection>,
+) -> axum::response::Response {
+    let Query(query) = match query {
+        Ok(query) => query,
+        Err(error) => return rating_bad_request(error.body_text()),
+    };
+    match gw
+        .admin()
+        .delete_provider_model_rating(&id, &query.model)
+        .await
+    {
+        Ok(()) => Json(serde_json::json!({ "ok": true })).into_response(),
+        Err(error) => rating_error(error),
+    }
+}
+
+fn rating_bad_request(message: String) -> axum::response::Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(serde_json::json!({ "error": message })),
+    )
+        .into_response()
+}
+
+fn rating_error(error: anyhow::Error) -> axum::response::Response {
+    let status = match error.downcast_ref::<ProviderModelRatingError>() {
+        Some(ProviderModelRatingError::InvalidInput(_)) => StatusCode::BAD_REQUEST,
+        Some(ProviderModelRatingError::ProviderNotFound) => StatusCode::NOT_FOUND,
+        Some(ProviderModelRatingError::UnsupportedStorage) => StatusCode::NOT_IMPLEMENTED,
+        None => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    let message = if status == StatusCode::INTERNAL_SERVER_ERROR {
+        tracing::error!(error = %error, "model rating operation failed");
+        "Model rating operation failed".to_string()
+    } else {
+        error.to_string()
+    };
+    (status, Json(serde_json::json!({ "error": message }))).into_response()
 }
 
 async fn provider_model_capabilities_handler(
@@ -893,6 +1028,10 @@ fn err(e: anyhow::Error) -> axum::response::Response {
 }
 
 #[cfg(test)]
+#[path = "rating_api_tests.rs"]
+mod rating_api_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use axum::http::StatusCode;
@@ -911,7 +1050,9 @@ mod tests {
             StatusCode::BAD_GATEWAY
         );
         assert_eq!(
-            status_of("OpenAI Codex authentication failed (HTTP 401 Unauthorized); re-authorize this provider"),
+            status_of(
+                "OpenAI Codex authentication failed (HTTP 401 Unauthorized); re-authorize this provider"
+            ),
             StatusCode::BAD_GATEWAY
         );
         assert_eq!(
@@ -931,6 +1072,9 @@ mod tests {
             status_of("usage query not supported for this provider"),
             StatusCode::BAD_REQUEST
         );
-        assert_eq!(status_of("HTTP 503: upstream unavailable"), StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            status_of("HTTP 503: upstream unavailable"),
+            StatusCode::BAD_GATEWAY
+        );
     }
 }

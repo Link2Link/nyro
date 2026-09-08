@@ -13,6 +13,7 @@ import "./index.css";
 const DashboardPage = lazy(() => import("@/pages/dashboard"));
 const ProvidersPage = lazy(() => import("@/pages/providers"));
 const AvailableModelsPage = lazy(() => import("@/pages/available-models"));
+const ModelRatingsPage = lazy(() => import("@/pages/model-ratings"));
 const ModelsRoute = lazy(() => import("@/pages/models-route"));
 const ApiKeysPage = lazy(() => import("@/pages/api-keys"));
 const LogsPage = lazy(() => import("@/pages/logs"));
@@ -47,6 +48,7 @@ createRoot(document.getElementById("root")!).render(
                   <Route index element={<DashboardPage />} />
                   <Route path="providers" element={<ProvidersPage />} />
                   <Route path="available-models" element={<AvailableModelsPage />} />
+                  <Route path="model-ratings" element={<ModelRatingsPage />} />
                   <Route path="models" element={<ModelsRoute />} />
                   <Route path="api-keys" element={<ApiKeysPage />} />
                   <Route path="logs" element={<LogsPage />} />

@@ -187,7 +187,8 @@ fn build_gemini_model_probe_request(
 re-login the provider to re-run onboarding"
             )
         })?;
-        let body = crate::provider::google::antigravity::wrap_request(inner_body, model, project_id);
+        let body =
+            crate::provider::google::antigravity::wrap_request(inner_body, model, project_id);
         return Ok((
             format!("{base}/v1internal:streamGenerateContent?alt=sse"),
             headers,
@@ -370,8 +371,7 @@ fn extract_probe_sse_reply(body: &str) -> Option<String> {
                 .and_then(Value::as_array)
             {
                 for part in parts {
-                    let is_thought =
-                        part.get("thought").and_then(Value::as_bool) == Some(true);
+                    let is_thought = part.get("thought").and_then(Value::as_bool) == Some(true);
                     let Some(text) = part.get("text").and_then(Value::as_str) else {
                         continue;
                     };
@@ -1079,6 +1079,12 @@ impl AdminService {
         options: CopyProviderOptions,
     ) -> anyhow::Result<Provider> {
         let original = self.get_provider(id).await?;
+        // Snapshot all saved ratings, independently of catalog availability or
+        // append_targets. A read failure must not produce an unscored copy.
+        let rating_snapshot = match self.gw.storage.provider_model_ratings() {
+            Some(store) => Some(store.list(Some(&original.id)).await?),
+            None => None,
+        };
         let name = self.next_provider_copy_name(&original.name).await?;
         let copied = self
             .create_provider(CreateProvider {
@@ -1160,6 +1166,18 @@ impl AdminService {
         } else {
             copied
         };
+
+        if let Some(snapshot) = rating_snapshot {
+            if let Err(error) = self.rating_store()?.restore(&copied.id, &snapshot).await {
+                if let Err(cleanup_error) = self.delete_provider(&copied.id).await {
+                    return Err(error.context(format!(
+                        "Rating copy failed; rollback of provider {} also failed: {cleanup_error}",
+                        copied.id
+                    )));
+                }
+                return Err(error.context("Rating copy failed; the new provider was rolled back"));
+            }
+        }
 
         if options.append_targets {
             self.append_provider_targets(&original.id, &copied.id)
@@ -1658,37 +1676,49 @@ impl AdminService {
     /// google/antigravity: per-account dynamic model discovery via
     /// `v1internal:fetchAvailableModels` — the authoritative subscription
     /// catalog (newer models appear here before any static list ships).
-    /// Returns `None` (logged, never fatal) on failure so callers fall back
-    /// to the curated static list.
+    /// Best-effort callers retain the curated fallback; strict directory callers
+    /// must not confuse failed discovery with a successful static catalog.
     async fn antigravity_available_models(
         &self,
         provider: &Provider,
         runtime: Option<&ResolvedProviderRuntime>,
-    ) -> Option<Vec<String>> {
+        require_catalog: bool,
+    ) -> anyhow::Result<Option<Vec<String>>> {
         if !crate::provider::google::antigravity::is_google_antigravity(provider) {
-            return None;
+            return Ok(None);
         }
-        let runtime = runtime?;
-        let credential = runtime.credential.as_ref()?;
-        let project_id =
-            crate::provider::google::antigravity::antigravity_project_id(Some(credential)).ok()?;
-        let token = runtime.access_token.trim();
-        if token.is_empty() {
-            return None;
-        }
-        let client = self.gw.http_client_for_provider(provider.use_proxy).await.ok()?;
-        match crate::provider::google::antigravity::fetch_available_models(&client, token, &project_id)
+        let discovery = async {
+            let runtime = runtime.context("Antigravity runtime unavailable")?;
+            let credential = runtime
+                .credential
+                .as_ref()
+                .context("Antigravity credential unavailable")?;
+            let project_id =
+                crate::provider::google::antigravity::antigravity_project_id(Some(credential))?;
+            let token = runtime.access_token.trim();
+            anyhow::ensure!(!token.is_empty(), "Antigravity access token unavailable");
+            let client = self.gw.http_client_for_provider(provider.use_proxy).await?;
+            crate::provider::google::antigravity::fetch_available_models(
+                &client,
+                token,
+                &project_id,
+            )
             .await
-        {
-            Ok(models) if !models.is_empty() => Some(models),
-            Ok(_) => None,
+        }
+        .await;
+        match discovery {
+            Ok(models) if require_catalog || !models.is_empty() => Ok(Some(models)),
+            Ok(_) => Ok(None),
+            Err(_) if require_catalog => {
+                anyhow::bail!("Antigravity model catalog could not be loaded")
+            }
             Err(error) => {
                 tracing::warn!(
                     %error,
                     provider = %provider.id,
                     "antigravity fetchAvailableModels failed; falling back to the static model list"
                 );
-                None
+                Ok(None)
             }
         }
     }
@@ -1957,6 +1987,17 @@ impl AdminService {
         Ok(merge_model_lists(models, preset_extra_models(&provider)))
     }
     pub async fn get_provider_models(&self, id: &str) -> anyhow::Result<Vec<String>> {
+        self.get_provider_models_with_catalog_validation(id, false)
+            .await
+    }
+
+    /// Rating management needs to distinguish an empty catalog from an outage.
+    /// Existing callers retain their best-effort/static fallback behavior.
+    pub async fn get_provider_models_with_catalog_validation(
+        &self,
+        id: &str,
+        require_catalog: bool,
+    ) -> anyhow::Result<Vec<String>> {
         let provider = self.get_provider(id).await?;
         let runtime = self.resolve_provider_runtime(&provider).await?;
         let credential = runtime.access_token.clone();
@@ -1967,8 +2008,8 @@ impl AdminService {
         };
         // Dynamic per-account catalog first; static curated list is fallback.
         if let Some(models) = self
-            .antigravity_available_models(&provider, Some(&runtime))
-            .await
+            .antigravity_available_models(&provider, Some(&runtime), require_catalog)
+            .await?
         {
             return Ok(merge_model_lists(models, preset_extra_models(&provider)));
         }
@@ -2016,6 +2057,53 @@ impl AdminService {
                     .http_client
                     .get(format!("{endpoint}{separator}key={}", auth_credential))
                     .headers(headers);
+            }
+
+            if require_catalog {
+                let response = request
+                    .timeout(Duration::from_secs(15))
+                    .send()
+                    .await
+                    .map_err(|_| anyhow::anyhow!("Model catalog could not be loaded"))?;
+                if !response.status().is_success() {
+                    anyhow::bail!("Model catalog returned HTTP {}", response.status().as_u16());
+                }
+                let json: Value = response
+                    .json()
+                    .await
+                    .map_err(|_| anyhow::anyhow!("Model catalog returned invalid JSON"))?;
+                let data = json.get("data").and_then(Value::as_array);
+                let models = json.get("models").and_then(Value::as_array);
+                anyhow::ensure!(
+                    data.is_some() || models.is_some(),
+                    "Model catalog response has no model list"
+                );
+                if let Some(entries) = data {
+                    anyhow::ensure!(
+                        entries.iter().all(|entry| entry
+                            .get("id")
+                            .and_then(Value::as_str)
+                            .is_some_and(|id| !id.trim().is_empty())),
+                        "Model catalog contains an invalid model identifier"
+                    );
+                }
+                if let Some(entries) = models {
+                    anyhow::ensure!(
+                        entries
+                            .iter()
+                            .all(|entry| ["name", "slug", "id"].iter().any(|key| entry
+                                .get(key)
+                                .and_then(Value::as_str)
+                                .is_some_and(|id| !id.trim().is_empty()))),
+                        "Model catalog contains an invalid model identifier"
+                    );
+                }
+                let models = extract_models_from_response(
+                    &provider.protocol,
+                    provider.vendor.as_deref(),
+                    &json,
+                );
+                return Ok(merge_model_lists(models, preset_extra_models(&provider)));
             }
 
             if let Ok(resp) = request.send().await
@@ -2194,10 +2282,7 @@ mod probe_reply_tests {
     #[test]
     fn antigravity_probe_request_builds_v1internal_envelope() {
         let mut runtime_headers = HeaderMap::new();
-        runtime_headers.insert(
-            AUTHORIZATION,
-            HeaderValue::from_static("Bearer ya29.probe"),
-        );
+        runtime_headers.insert(AUTHORIZATION, HeaderValue::from_static("Bearer ya29.probe"));
         let (url, headers, body) = build_gemini_model_probe_request(
             "https://cloudcode-pa.googleapis.com",
             "ya29.probe",
@@ -2211,10 +2296,7 @@ mod probe_reply_tests {
             url,
             "https://cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse"
         );
-        assert_eq!(
-            headers.get(AUTHORIZATION).unwrap(),
-            "Bearer ya29.probe"
-        );
+        assert_eq!(headers.get(AUTHORIZATION).unwrap(), "Bearer ya29.probe");
         assert_eq!(body["model"], "gemini-2.5-pro");
         assert_eq!(body["project"], "cloudaicompanion-9");
         assert!(body["request"]["contents"].is_array());

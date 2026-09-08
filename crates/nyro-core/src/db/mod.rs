@@ -1,4 +1,5 @@
 pub mod models;
+pub(crate) mod provider_model_ratings;
 
 use std::path::Path;
 
@@ -894,6 +895,15 @@ CREATE TABLE IF NOT EXISTS providers (
     priority    INTEGER DEFAULT 0,
     created_at  TEXT DEFAULT (datetime('now')),
     updated_at  TEXT DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS provider_model_ratings (
+    provider_id    TEXT COLLATE BINARY NOT NULL REFERENCES providers(id) ON DELETE CASCADE,
+    upstream_model TEXT COLLATE BINARY NOT NULL
+        CHECK (length(CAST(upstream_model AS BLOB)) BETWEEN 1 AND 1024),
+    score          INTEGER NOT NULL CHECK (typeof(score) = 'integer' AND score BETWEEN 0 AND 100),
+    updated_at     TEXT NOT NULL,
+    PRIMARY KEY (provider_id, upstream_model)
 );
 
 CREATE TABLE IF NOT EXISTS provider_protocol_endpoints (
