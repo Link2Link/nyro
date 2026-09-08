@@ -228,7 +228,13 @@ tracked SQL artifact**: shell redirection truncates it before validation.
 Use `--output` instead. Every run consumes an empty scratch database;
 nonempty databases (even empty tables) are rejected, never cleared.
 See [schema generation prerequisites and examples](../database/schema.md#regenerating-reference-sql)
-for database provisioning, safety limits, determinism, and validation.
+for database provisioning, safety limits, determinism, and validation. After schema
+changes, build from the finalized migrations, generate twice against independent
+empty databases, and compare bytes. Restore into separate empty reference databases;
+when using `NYRO_TEST_RATINGS_PRECREATE_REFERENCE=1`, let the conformance test do
+that restore itself rather than preloading the same database. Keep disposable
+services alive until all storage tests finish, then clean them up. A skipped
+external backend is not a successful real-database validation.
 
 ---
 

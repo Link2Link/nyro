@@ -1,6 +1,7 @@
 use nyro_core::Gateway;
 use nyro_core::admin::{
     CopyProviderOptions, ProviderModelRatingState, ProviderOAuthStatusData, SetProviderModelRating,
+    ProviderModelRatingProfile, SetProviderModelRatingProfile, ModelPerformanceResponse,
 };
 use nyro_core::auth::{AuthExchangeInput, AuthSessionInitData, AuthSessionStatusData};
 use nyro_core::db::models::*;
@@ -60,6 +61,41 @@ pub async fn delete_provider_model_rating(
         .await
         .map(|()| serde_json::json!({ "ok": true }))
         .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn list_provider_model_rating_profiles(
+    gw: State<'_, Gateway>,
+    provider_id: Option<String>,
+) -> Result<Vec<ProviderModelRatingProfile>, String> {
+    gw.admin().list_provider_model_rating_profiles(provider_id.as_deref()).await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn get_provider_model_rating_profile(
+    gw: State<'_, Gateway>,
+    provider_id: String,
+    model: String,
+) -> Result<ProviderModelRatingProfile, String> {
+    gw.admin().get_provider_model_rating_profile(&provider_id, &model).await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn set_provider_model_rating_profile(
+    gw: State<'_, Gateway>,
+    provider_id: String,
+    model: String,
+    input: SetProviderModelRatingProfile,
+) -> Result<ProviderModelRatingProfile, String> {
+    gw.admin().set_provider_model_rating_profile(&provider_id, &model, input).await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn get_model_performance(
+    gw: State<'_, Gateway>,
+    provider_id: Option<String>,
+) -> Result<ModelPerformanceResponse, String> {
+    gw.admin().get_model_performance(provider_id.as_deref()).await.map_err(|e| e.to_string())
 }
 
 // ── Providers ──

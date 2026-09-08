@@ -77,21 +77,22 @@ Provider 的协议端点明细。固定模式保留一条兼容记录；自适�
 
 ## provider_model_ratings
 
-The latest manually assigned integer score for an exact **provider + upstream model** pair. This is provider metadata, not a virtual-model route, endpoint, or usage record. Only the score and its last-update timestamp are stored: no history, notes, or other rating payload. Deleting a provider deletes its ratings; deleting a route/backend does not.
+The latest manually assigned integer score for an exact **provider + upstream model + effort scope**. A profile has a nullable common score and five nullable overrides (`low`, `medium`, `high`, `xhigh`, `max`); only explicitly set scopes have rows. Effective scores resolve override → common → unrated. Zero and an override equal to common remain explicit values. This is provider metadata, not a virtual-model route, endpoint, or usage record. There is no history or notes. Deleting a provider deletes all scopes; deleting a route/backend does not. Profile replacement is atomic across all six scopes.
 
 | Column | Type | Default | Description |
 |---|---|---|---|
 | `provider_id` | TEXT NOT NULL (MySQL: VARCHAR(36)) | — | FK → `providers.id`, **ON DELETE CASCADE** |
 | `upstream_model` | TEXT NOT NULL (MySQL: VARBINARY(1024)) | — | Exact upstream model identifier, case-sensitive and byte-exact, including trailing spaces; 1–1024 UTF-8 bytes |
+| `effort` | TEXT NOT NULL (MySQL: VARCHAR(16), ASCII binary collation) | `'common'` | `CHECK`: one of `common`, `low`, `medium`, `high`, `xhigh`, `max`; no `minimal` rating scope (`minimal` observations map to low) |
 | `score` | INTEGER NOT NULL | — | Integer **0–100 inclusive**, database `CHECK` constraint; zero is a real rating, not “unrated” |
-| `updated_at` | TEXT NOT NULL | — | Application-written UTC RFC3339 timestamp with millisecond precision, e.g. `2026-09-08T02:30:45.123Z`; overwritten on each score update |
+| `updated_at` | TEXT NOT NULL | — | Application-written UTC RFC3339 timestamp with millisecond precision, e.g. `2026-09-08T02:30:45.123Z`; profile saves retain unchanged scopes' times, new/changed values get server time |
 
-**Primary key**: `(provider_id, upstream_model)`. The API/service validates the 1024-UTF-8-byte limit consistently for all backends (bytes, not character count).
+**Primary key**: `(provider_id, upstream_model, effort)`. The API/service validates the 1024-UTF-8-byte limit consistently for all backends (bytes, not character count). Existing pair-only rows migrate to `effort = 'common'` with scores and timestamps unchanged. Missing scopes remain absent, not auto-materialized inherited rows. Legacy rating APIs operate on common only; copy/export/import preserve every explicit scope. Version-2 backup entries without `effort` default to common.
 
 **Physical identity and validation**:
-- SQLite uses `TEXT COLLATE BINARY` for both key columns, a byte-length check via `length(CAST(upstream_model AS BLOB))`, and `typeof(score) = 'integer'` plus the range check (SQLite's type affinity alone is not an integer constraint).
-- PostgreSQL uses `TEXT COLLATE "C"` for both key columns, `octet_length` for the model byte-length check, and the native `INTEGER` type plus the range check.
-- MySQL uses `VARBINARY(1024)` for `upstream_model`, storing the original UTF-8 bytes rather than a case-folding or trailing-space-insensitive text collation. Its `provider_id` keeps the parent column's collation for FK compatibility. `OCTET_LENGTH` enforces a nonempty model identifier; the binary column bounds its maximum size. Score is native `INTEGER` plus the range check (requires MySQL 8.0.16+ for enforced `CHECK`s).
+- SQLite uses `TEXT COLLATE BINARY` for all three key columns, a byte-length check via `length(CAST(upstream_model AS BLOB))`, and `typeof(score) = 'integer'` plus the range check (SQLite's type affinity alone is not an integer constraint).
+- PostgreSQL uses `TEXT COLLATE "C"` for all three key columns, `octet_length` for the model byte-length check, and the native `INTEGER` type plus the range check.
+- MySQL uses `VARBINARY(1024)` for `upstream_model`, storing the original UTF-8 bytes rather than a case-folding or trailing-space-insensitive text collation. Its `provider_id` keeps the parent column's collation for FK compatibility. The effort check uses `BINARY effort IN (...)` as well as ASCII binary storage, rejecting noncanonical case and trailing spaces even with MySQL's padded text comparison behavior. `OCTET_LENGTH` enforces a nonempty model identifier; the binary column bounds its maximum size. Score is native `INTEGER` plus the range check (requires MySQL 8.0.16+ for enforced `CHECK`s).
 
 ---
 
@@ -238,7 +239,38 @@ OAuth 凭据存储，用于需要 OAuth 认证的供应商（如 Google Vertex A
 | `cache_read_tokens` | INTEGER | `0` | 缓存命中 token 数 |
 | `is_stream` | INTEGER | `0` | 是否为流式请求 |
 | `stream_chunks_count` | INTEGER | `0` | 流式分块数量 |
-| `stream_first_chunk_ms` | INTEGER | NULL | 首个分块延迟（毫秒） |
+| `stream_first_chunk_ms` | INTEGER | NULL | 首个分块延迟（毫秒）；旧用量统计保持原口径 |
+| `performance_metadata_version` | INTEGER NOT NULL | `0` | Performance evidence format; 0 = legacy/unprocessed, positive versions do not themselves prove completion |
+| `upstream_effort_status` | TEXT NOT NULL (MySQL: VARCHAR(16)) | `'unknown'` | `present`, `absent`, or `unknown`, based only on the final outgoing upstream request after rewrites |
+| `upstream_effort_raw` | TEXT | NULL | Outgoing effort evidence (including unclassified budget/disabled/other values); never client-effort fallback |
+| `upstream_effort_tier` | TEXT (MySQL: VARCHAR(16)) | NULL | Recognized `low`, `medium`, `high`, `xhigh`, `max`; outgoing `minimal` maps to low; other/unspecified effort has no tier |
+| `request_completion` | TEXT NOT NULL (MySQL: VARCHAR(16)) | `'unknown'` | Per-attempt completion: `completed`, `failed`, `cancelled`, `timed_out`, `incomplete`, or `unknown`; historical rows remain unknown |
+| `completion_reason` | TEXT | NULL | Observed protocol terminal reason or transport/delivery failure explanation; token-limit outcomes are incomplete, not completed |
+| `upstream_response_mode` | TEXT NOT NULL (MySQL: VARCHAR(16)) | `'unknown'` | Observed upstream mode: `stream`, `buffered`, or `unknown`; not inferred from client streaming mode |
+| `performance_upstream_ms` | INTEGER (PostgreSQL/MySQL: BIGINT) | NULL | Per-attempt upstream duration in milliseconds, independent of legacy latency fields |
+| `performance_first_chunk_ms` | INTEGER (PostgreSQL/MySQL: BIGINT) | NULL | Per-attempt time to first upstream chunk in milliseconds |
+| `performance_completed_at` | INTEGER (PostgreSQL/MySQL: BIGINT) | NULL | Unix millisecond completion time, set only for credibly completed attempts |
+
+Performance metadata is scalar evidence retained even when payload logging is off.
+A per-attempt response Body observer resolves delivery/terminal state **before log
+persistence**. Completed means gateway-observed Body EOS plus a successful original
+protocol outcome, not a client ACK. Success HTTP status or token usage alone cannot
+prove completion. Cancellation, timeout, parse/transport failure, truncation and
+length/token-limit outcomes are excluded from performance samples.
+
+**Historical migration is conservative**: every pre-feature row defaults to unknown
+completion, regardless of recorded status, usage, terminal marker, or response body.
+Bounded recovery may inspect retained final upstream request bodies from the last
+7 days to fill effort only; it cannot promote historical completion or use client
+`reasoning_effort` as fallback. New credible requests are required to populate charts.
+
+The Performance-only query uses one seven-day snapshot. For each exact pair and
+each mixed/tier group, it selects the latest ten credibly completed successful
+requests (completion time/ID descending), then averages valid per-request TPS.
+Invalid TPS does not fetch older replacements. Mixed includes unclassified effort;
+tiers use same-tier samples only. Counts/times and score resolution are documented
+in [model rating profiles](../design/model-ratings.md#performance-chart).
+Existing usage APIs and their latency/TPS semantics are unchanged.
 
 **索引**：
 - `idx_logs_created_at` on `created_at`
@@ -248,6 +280,8 @@ OAuth 凭据存储，用于需要 OAuth 认证的供应商（如 Google Vertex A
 - `idx_logs_api_key` on `api_key_id`
 - `idx_logs_client_protocol` on `client_protocol`
 - `idx_logs_upstream_protocol` on `upstream_protocol`
+- `idx_logs_performance_pair` on `(provider_id, upstream_model, request_completion, performance_completed_at, id)`; SQLite uses `upstream_model COLLATE BINARY`, PostgreSQL `COLLATE "C"`; MySQL queries explicitly compare `BINARY upstream_model` for exact identity
+- `idx_logs_performance_recovery` on `(performance_metadata_version, created_at, id)` for bounded historical effort-only recovery
 
 ---
 
@@ -370,6 +404,36 @@ NYRO_SCHEMA_TEST_MYSQL_URL='<new-empty-mysql-scratch-url>' \
 ```
 
 Missing test URLs fail explicitly; tests never fall back to production/app URLs.
+
+For storage conformance against the regenerated artifacts, provision **another new
+empty database per backend**, with a name starting `nyro_test_` or ending `_test`:
+
+```bash
+NYRO_TEST_RATINGS_DATABASES_ONLY=1 \
+NYRO_TEST_RATINGS_PRECREATE_REFERENCE=1 \
+NYRO_TEST_POSTGRES_RATINGS_URL='<new-empty-postgres-reference-test-url>' \
+NYRO_TEST_MYSQL_RATINGS_URL='<new-empty-mysql-reference-test-url>' \
+  cargo test -p nyro-core --test storage_provider_model_ratings
+```
+
+The precreate flag makes the test load the generated SQL itself before exercising
+migration/storage operations. Do **not** manually load those same databases first.
+To test databases into which you already restored the artifacts separately, omit
+`NYRO_TEST_RATINGS_PRECREATE_REFERENCE`. The tests may drop/recreate the ratings
+table and leave test data; do not share their databases with generation or other
+running tests. Missing external URLs skip that backend rather than verify it.
+The effort/performance conformance suite has separate opt-in variables and also
+simulates legacy-table migration; give it **its own** disposable test databases:
+
+```bash
+NYRO_TEST_PERFORMANCE_DATABASES_ONLY=1 \
+NYRO_TEST_POSTGRES_PERFORMANCE_URL='<dedicated-postgres-performance-test-url>' \
+NYRO_TEST_MYSQL_PERFORMANCE_URL='<dedicated-mysql-performance-test-url>' \
+  cargo test -p nyro-core --test storage_effort_performance
+```
+
+Retain temporary services until all generation, restore, and conformance runs have
+finished, then stop only those explicitly provisioned disposable services.
 
 ---
 

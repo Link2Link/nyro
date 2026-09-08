@@ -8,6 +8,7 @@ import {
   Server,
   ScrollText,
   BarChart3,
+  Activity,
   KeyRound,
   Plug,
   Puzzle,
@@ -29,6 +30,7 @@ const NAV_ITEMS = [
   { type: "divider" as const },
   { label: "Logs", path: "/logs", icon: ScrollText },
   { label: "Stats", path: "/stats", icon: BarChart3 },
+  { label: "Performance", path: "/performance", icon: Activity },
   { label: "Extensions", path: "/extensions", icon: Puzzle },
   { type: "divider" as const },
   { label: "Settings", path: "/settings", icon: Settings },
@@ -75,7 +77,7 @@ export function Sidebar({ collapsed, onToggle }: SidebarProps) {
           const displayLabel = isZh ? ({
             Dashboard: "概览", Providers: "提供商", "Available Models": "可用模型",
             "Model Ratings": "模型评分", "Model Mapping": "模型映射", "API Keys": "密钥",
-            Connect: "接入", Logs: "日志", Stats: "统计", Extensions: "扩展", Settings: "系统设置",
+            Connect: "接入", Logs: "日志", Stats: "统计", Performance: "性能", Extensions: "扩展", Settings: "系统设置",
           } as Record<string, string>)[label] ?? label : label;
           return (
             <NavLink

@@ -1,7 +1,7 @@
 import { deepEqual, equal, notEqual, throws } from "node:assert/strict";
 import { test } from "node:test";
-import { buildModelRatingRows, filterAndSortModelRatingRows, parseRatingScore, providerModelKey, ratingDisplayState, readProviderModelRatings, uniqueModelIdentifiers, type ModelRatingFilters } from "./model-ratings";
-import type { Model, Provider, ProviderModelRating } from "./types";
+import { buildModelRatingRows, filterAndSortModelRatingRows, countRatingOverrides, emptyRatingProfileInput, hasModelRating, isProviderModelRatingProfile, parseRatingProfileDraft, parseRatingScore, providerModelKey, ratingForDimension, ratingProfileDraft, ratingDisplayState, readProviderModelRatingProfiles, uniqueModelIdentifiers, type ModelRatingFilters } from "./model-ratings";
+import { EFFORT_TIERS, type Model, type Provider, type ProviderModelRatingProfile } from "./types";
 
 // No test framework needed: compile this file with tsc --module commonjs into a temporary
 // directory outside webui, then run node --test <temp>/model-ratings.test.js.
@@ -10,8 +10,11 @@ const provider = (id: string, name = id, is_enabled = true): Provider => ({
   id, name, is_enabled, protocol: "openai-compatible", base_url: "https://example.invalid",
   use_proxy: false, fast_mode: false, created_at: time, updated_at: time,
 });
-const rating = (provider_id: string, upstream_model: string, score: number, updated_at = time): ProviderModelRating => ({
-  provider_id, upstream_model, score, updated_at,
+const rating = (provider_id: string, upstream_model: string, score: number, updated_at = time): ProviderModelRatingProfile => ({
+  provider_id, upstream_model, common: { score, updated_at },
+  overrides: { low: null, medium: null, high: null, xhigh: null, max: null },
+  effective: Object.fromEntries(EFFORT_TIERS.map((tier) => [tier, { status: "rated", score, source: "common", score_updated_at: updated_at }])) as ProviderModelRatingProfile["effective"],
+  display_mode: "common",
 });
 const route = (provider_id: string, model: string): Model => ({
   id: "route", name: "alias", balance: "weighted", target_provider: provider_id,
@@ -38,20 +41,20 @@ test("provider-model identity and catalog dedup preserve raw model bytes", () =>
 });
 
 test("list payload failures never masquerade as empty ratings", () => {
-  deepEqual(readProviderModelRatings([]), []);
-  equal(readProviderModelRatings([rating("p", "m", 0)])[0].score, 0);
-  for (const value of [null, {}, { data: [] }, { error: "unsupported" }, [null], [rating("p", "m", 0.5)], [rating("p", "m", -1)], [rating("p", "m", 101)], [{ ...rating("p", "m", 0), score: "0" }], [rating("p", "m", 0, "")], [rating("p", "m", 0, "invalid")], [rating("p", "m", 0, "2026-08-01")]]) {
-    throws(() => readProviderModelRatings(value));
+  deepEqual(readProviderModelRatingProfiles([]), []);
+  equal(readProviderModelRatingProfiles([rating("p", "m", 0)])[0].common?.score, 0);
+  for (const value of [null, {}, { data: [] }, { error: "unsupported" }, [null], [rating("p", "m", 0.5)], [rating("p", "m", -1)], [rating("p", "m", 101)], [{ ...rating("p", "m", 0), common: { score: "0", updated_at: time } }], [rating("p", "m", 0, "")], [rating("p", "m", 0, "invalid")], [rating("p", "m", 0, "2026-08-01")]]) {
+    throws(() => readProviderModelRatingProfiles(value));
   }
-  throws(() => readProviderModelRatings([rating("p", "m", 0), rating("p", "m", 50)]));
-  equal(readProviderModelRatings([rating("p", "m", 0, "2026-08-01T10:20:30.123456+00:00")]).length, 1);
+  throws(() => readProviderModelRatingProfiles([rating("p", "m", 0), rating("p", "m", 50)]));
+  equal(readProviderModelRatingProfiles([rating("p", "m", 0, "2026-08-01T10:20:30.123456+00:00")]).length, 1);
 });
 
 test("display keeps unrated, zero, loading, error and unknown provider distinct", () => {
   equal(ratingDisplayState("ready").status, "unrated");
   const zero = ratingDisplayState("ready", rating("p", "m", 0));
   equal(zero.status, "rated");
-  if (zero.status === "rated") equal(zero.rating.score, 0);
+  if (zero.status === "rated") equal(zero.rating.common?.score, 0);
   equal(ratingDisplayState("loading").status, "loading");
   equal(ratingDisplayState("error", rating("p", "m", 0)).status, "error");
   equal(ratingDisplayState("ready", null, false).status, "error");
@@ -70,7 +73,7 @@ test("union includes exact catalogs, disabled route references and saved-only mi
   );
   const byKey = new Map(rows.map((row) => [row.key, row]));
   equal(rows.length, 8);
-  equal(byKey.get(providerModelKey("p", "name"))?.rating?.score, 0);
+  equal(byKey.get(providerModelKey("p", "name"))?.rating?.common?.score, 0);
   equal(byKey.get(providerModelKey("p", " name "))?.catalogStatus, "listed");
   equal(byKey.get(providerModelKey("p", "mapped"))?.catalogStatus, "missing");
   equal(byKey.get(providerModelKey("p", "saved-only"))?.catalogStatus, "missing");
@@ -106,7 +109,7 @@ test("score sort directions keep unrated last and use stable provider/name/id ti
   const sorted = filterAndSortModelRatingRows(rows, filters);
   deepEqual(sorted.map((row) => [row.providerId, row.model]), [["a", "m"], ["z", "m"], ["a", "z"], ["b", "m"], ["a", "zero"], ["a", "unrated"]]);
   const asc = filterAndSortModelRatingRows(rows, { ...filters, sort: "score-asc" });
-  equal(asc[0].rating?.score, 0);
+  equal(asc[0].rating?.common?.score, 0);
   equal(asc[asc.length - 1]?.model, "unrated");
   deepEqual(filterAndSortModelRatingRows([...rows].reverse(), filters).map((row) => row.key), sorted.map((row) => row.key));
 });
@@ -133,10 +136,71 @@ test("global filtering and sorting occur before the first 40-row page", () => {
   const saved = Array.from({ length: 80 }, (_, index) => rating("p", `model-${index}`, index));
   const rows = buildModelRatingRows([provider("p")], [], saved, []);
   const sorted = filterAndSortModelRatingRows(rows, filters);
-  equal(sorted.slice(0, 40)[0].rating?.score, 79);
+  equal(sorted.slice(0, 40)[0].rating?.common?.score, 79);
   const filtered = filterAndSortModelRatingRows(rows, { ...filters, min: 60 });
   equal(filtered.length, 20);
-  equal(filtered.slice(0, 40)[19]?.rating?.score, 60);
+  equal(filtered.slice(0, 40)[19]?.rating?.common?.score, 60);
+});
+
+test("profile drafts preserve equal overrides and independent common removal with all five keys", () => {
+  const profile = rating("p", "m", 70);
+  profile.overrides.low = { score: 70, updated_at: time };
+  profile.display_mode = "per_effort";
+  const draft = ratingProfileDraft(profile);
+  equal(draft.overrides.low.enabled, true);
+  equal(parseRatingProfileDraft(draft)?.overrides.low, 70);
+  draft.commonEnabled = false;
+  deepEqual(parseRatingProfileDraft(draft), { common: null, overrides: { low: 70, medium: null, high: null, xhigh: null, max: null } });
+  draft.overrides.max.enabled = true;
+  draft.overrides.max.score = "";
+  equal(parseRatingProfileDraft(draft), null);
+  draft.overrides.max.score = "100";
+  equal(parseRatingProfileDraft(draft)?.overrides.max, 100);
+  draft.overrides.low.enabled = false;
+  equal(parseRatingProfileDraft(draft)?.overrides.low, null);
+  deepEqual(emptyRatingProfileInput(), { common: null, overrides: { low: null, medium: null, high: null, xhigh: null, max: null } });
+  equal(parseRatingProfileDraft(ratingProfileDraft(null))?.common, null);
+});
+
+test("override-only profiles are rated badges but not common scores; effective values drive each dimension", () => {
+  const profile = rating("p", "m", 70);
+  profile.common = null;
+  profile.overrides.high = { score: 99, updated_at: time };
+  profile.display_mode = "per_effort";
+  for (const tier of EFFORT_TIERS) profile.effective[tier] = { status: "unrated", score: null, source: "unrated", score_updated_at: null };
+  profile.effective.high = { status: "rated", score: 39, source: "override", score_updated_at: time };
+  equal(isProviderModelRatingProfile(profile), true); // Backend effective is authoritative, not recomputed.
+  equal(hasModelRating(profile), true);
+  equal(countRatingOverrides(profile), 1);
+  equal(ratingDisplayState("ready", profile).status, "rated");
+  equal(ratingForDimension(profile, "common").status, "unrated");
+  equal(ratingForDimension(profile, "high").score, 39);
+  const rows = buildModelRatingRows([provider("p")], [], [profile, rating("p", "other", 50)], []);
+  equal(filterAndSortModelRatingRows(rows, { ...filters, rating: "rated" }).length, 1);
+  equal(filterAndSortModelRatingRows(rows, { ...filters, dimension: "high", min: 39, max: 39 })[0]?.model, "m");
+  equal(filterAndSortModelRatingRows(rows, { ...filters, dimension: "high", sort: "score-asc" })[0]?.model, "m");
+  equal(filterAndSortModelRatingRows(rows, { ...filters, dimension: "low", rating: "unrated" })[0]?.model, "m");
+});
+
+test("profile validation requires all five overrides/effective fields and rejects malformed domains", () => {
+  const profile = rating("p", "m", 0);
+  for (const tier of EFFORT_TIERS) {
+    const missingOverride = { ...profile.overrides } as Partial<ProviderModelRatingProfile["overrides"]>;
+    delete missingOverride[tier];
+    equal(isProviderModelRatingProfile({ ...profile, overrides: missingOverride }), false);
+    const missingEffective = { ...profile.effective } as Partial<ProviderModelRatingProfile["effective"]>;
+    delete missingEffective[tier];
+    equal(isProviderModelRatingProfile({ ...profile, effective: missingEffective }), false);
+  }
+  for (const bad of [
+    { ...profile, display_mode: "minimal" },
+    { ...profile, effective: { ...profile.effective, low: { status: "rated", score: null, source: "common", score_updated_at: time } } },
+    { ...profile, effective: { ...profile.effective, low: { status: "unrated", score: 0, source: "unrated", score_updated_at: null } } },
+    { ...profile, overrides: { ...profile.overrides, max: { score: 101, updated_at: time } } },
+  ]) equal(isProviderModelRatingProfile(bad), false);
+  const empty = { ...profile, common: null, effective: Object.fromEntries(EFFORT_TIERS.map((tier) => [tier, { status: "unrated", score: null, source: "unrated", score_updated_at: null }])) } as ProviderModelRatingProfile;
+  equal(isProviderModelRatingProfile(empty), true);
+  equal(ratingDisplayState("ready", empty).status, "unrated");
 });
 
 test("updated sort compares instants, preserves deterministic ties, and leaves unrated last", () => {

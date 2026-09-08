@@ -102,6 +102,8 @@ CREATE TABLE public.provider_model_ratings (
     upstream_model text NOT NULL COLLATE pg_catalog."C",
     score integer NOT NULL,
     updated_at text NOT NULL,
+    effort text DEFAULT 'common'::text NOT NULL COLLATE pg_catalog."C",
+    CONSTRAINT provider_model_ratings_effort_check CHECK ((effort = ANY (ARRAY['common'::text, 'low'::text, 'medium'::text, 'high'::text, 'xhigh'::text, 'max'::text]))),
     CONSTRAINT provider_model_ratings_score_check CHECK (((score >= 0) AND (score <= 100))),
     CONSTRAINT provider_model_ratings_upstream_model_check CHECK (((octet_length(upstream_model) >= 1) AND (octet_length(upstream_model) <= 1024)))
 );
@@ -223,7 +225,17 @@ CREATE TABLE public.request_logs (
     cache_read_tokens integer DEFAULT 0,
     is_stream boolean DEFAULT false,
     stream_chunks_count integer DEFAULT 0,
-    stream_first_chunk_ms bigint
+    stream_first_chunk_ms bigint,
+    performance_metadata_version integer DEFAULT 0 NOT NULL,
+    upstream_effort_status text DEFAULT 'unknown'::text NOT NULL,
+    upstream_effort_raw text,
+    upstream_effort_tier text,
+    request_completion text DEFAULT 'unknown'::text NOT NULL,
+    completion_reason text,
+    upstream_response_mode text DEFAULT 'unknown'::text NOT NULL,
+    performance_upstream_ms bigint,
+    performance_first_chunk_ms bigint,
+    performance_completed_at bigint
 );
 
 
@@ -267,7 +279,7 @@ ALTER TABLE ONLY public.api_keys
 --
 
 ALTER TABLE ONLY public.provider_model_ratings
-    ADD CONSTRAINT provider_model_ratings_pkey PRIMARY KEY (provider_id, upstream_model);
+    ADD CONSTRAINT provider_model_ratings_pkey PRIMARY KEY (provider_id, upstream_model, effort);
 
 
 --
@@ -367,6 +379,20 @@ CREATE INDEX idx_logs_client_status ON public.request_logs USING btree (client_s
 --
 
 CREATE INDEX idx_logs_created_at ON public.request_logs USING btree (created_at);
+
+
+--
+-- Name: idx_logs_performance_pair; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_logs_performance_pair ON public.request_logs USING btree (provider_id, upstream_model COLLATE "C", request_completion, performance_completed_at, id);
+
+
+--
+-- Name: idx_logs_performance_recovery; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_logs_performance_recovery ON public.request_logs USING btree (performance_metadata_version, created_at, id);
 
 
 --

@@ -358,7 +358,33 @@ export interface EndpointTestResult {
   tested_at: string;
 }
 
-/** One persisted comprehensive score for an exact provider / upstream model pair. */
+export const EFFORT_TIERS = ["low", "medium", "high", "xhigh", "max"] as const;
+export type EffortTier = typeof EFFORT_TIERS[number];
+
+export interface RatingValue {
+  score: number;
+  updated_at: string;
+}
+
+export type EffectiveModelRating =
+  | { status: "rated"; score: number; source: "override" | "common"; score_updated_at: string }
+  | { status: "unrated"; score: null; source: "unrated"; score_updated_at: null };
+
+export interface ProviderModelRatingProfile {
+  provider_id: string;
+  upstream_model: string;
+  common: RatingValue | null;
+  overrides: Record<EffortTier, RatingValue | null>;
+  effective: Record<EffortTier, EffectiveModelRating>;
+  display_mode: "common" | "per_effort";
+}
+
+export interface SetProviderModelRatingProfile {
+  common: number | null;
+  overrides: Record<EffortTier, number | null>;
+}
+
+/** Legacy comprehensive score retained for configuration compatibility. */
 export interface ProviderModelRating {
   provider_id: string;
   upstream_model: string;

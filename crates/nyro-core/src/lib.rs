@@ -6,6 +6,7 @@ pub mod db;
 pub mod error;
 pub mod integrations;
 pub mod logging;
+pub mod performance;
 pub mod plugin;
 pub mod protocol;
 pub mod provider;

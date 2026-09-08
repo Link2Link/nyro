@@ -79,6 +79,8 @@ impl MysqlAdapter {
                 && mysql_table_exists(&self.pool, "provider_model_ratings")
                     .await
                     .unwrap_or(false)
+                && sqlx::query("SELECT effort FROM provider_model_ratings LIMIT 0").execute(&self.pool).await.is_ok()
+                && sqlx::query("SELECT performance_metadata_version, upstream_effort_status, upstream_effort_raw, upstream_effort_tier, request_completion, completion_reason, upstream_response_mode, performance_upstream_ms, performance_first_chunk_ms, performance_completed_at FROM request_logs LIMIT 0").execute(&self.pool).await.is_ok()
         } else {
             false
         };
@@ -1069,6 +1071,20 @@ struct MysqlLogStore {
 
 #[async_trait]
 impl LogStore for MysqlLogStore {
+    async fn model_performance_stats(
+        &self,
+        pairs: &[(String, String)],
+        as_of: i64,
+    ) -> anyhow::Result<Vec<crate::db::PairPerformanceStats>> {
+        crate::db::model_performance::model_performance_method!(
+            self,
+            pairs,
+            as_of,
+            sqlx::MySql,
+            "BINARY upstream_model",
+            "CAST(output_tokens AS SIGNED)"
+        )
+    }
     async fn append_batch(&self, entries: Vec<LogEntry>) -> anyhow::Result<()> {
         for entry in entries {
             let id = uuid::Uuid::new_v4().to_string();
@@ -1085,8 +1101,9 @@ impl LogStore for MysqlLogStore {
                      upstream_status_code, client_status_code,
                      latency_total_ms, latency_upstream_ms,
                      input_tokens, output_tokens, cache_read_tokens,
-                     is_stream, stream_chunks_count, stream_first_chunk_ms)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"#,
+                     is_stream, stream_chunks_count, stream_first_chunk_ms,
+                     performance_metadata_version, upstream_effort_status, upstream_effort_raw, upstream_effort_tier, request_completion, completion_reason, upstream_response_mode, performance_upstream_ms, performance_first_chunk_ms, performance_completed_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"#,
             )
             .bind(&id)
             .bind(entry.created_at)
@@ -1123,6 +1140,16 @@ impl LogStore for MysqlLogStore {
             .bind(entry.is_stream)
             .bind(entry.stream_chunks_count)
             .bind(entry.stream_first_chunk_ms)
+            .bind(entry.performance.version)
+            .bind(&entry.performance.effort_status)
+            .bind(&entry.performance.effort_raw)
+            .bind(&entry.performance.effort_tier)
+            .bind(&entry.performance.completion)
+            .bind(&entry.performance.completion_reason)
+            .bind(&entry.performance.response_mode)
+            .bind(entry.performance.upstream_duration_ms)
+            .bind(entry.performance.first_chunk_ms)
+            .bind(entry.performance.completed_at)
             .execute(&self.pool)
             .await?;
         }
@@ -1143,7 +1170,8 @@ impl LogStore for MysqlLogStore {
              upstream_status_code, client_status_code, \
              latency_total_ms, latency_upstream_ms, \
              input_tokens, output_tokens, COALESCE(cache_read_tokens, 0) AS cache_read_tokens, \
-             COALESCE(is_stream, 0) AS is_stream, stream_chunks_count, stream_first_chunk_ms \
+             COALESCE(is_stream, 0) AS is_stream, stream_chunks_count, stream_first_chunk_ms, \
+             performance_metadata_version, upstream_effort_status, upstream_effort_raw, upstream_effort_tier, request_completion, completion_reason, upstream_response_mode, performance_upstream_ms, performance_first_chunk_ms, performance_completed_at \
              FROM request_logs WHERE 1=1",
         );
         let mut bind_values: Vec<String> = Vec::new();
@@ -1223,7 +1251,8 @@ impl LogStore for MysqlLogStore {
              upstream_status_code, client_status_code, \
              latency_total_ms, latency_upstream_ms, \
              input_tokens, output_tokens, COALESCE(cache_read_tokens, 0) AS cache_read_tokens, \
-             COALESCE(is_stream, 0) AS is_stream, stream_chunks_count, stream_first_chunk_ms \
+             COALESCE(is_stream, 0) AS is_stream, stream_chunks_count, stream_first_chunk_ms, \
+             performance_metadata_version, upstream_effort_status, upstream_effort_raw, upstream_effort_tier, request_completion, completion_reason, upstream_response_mode, performance_upstream_ms, performance_first_chunk_ms, performance_completed_at \
              FROM request_logs WHERE id = ?",
         )
         .bind(id)
@@ -1650,13 +1679,25 @@ impl StorageBootstrap for MysqlBootstrap {
             ("route_targets", "route_id", "idx_route_targets_route_id"),
             ("request_logs", "created_at", "idx_logs_created_at"),
             ("request_logs", "provider_id", "idx_logs_provider_id"),
-            ("request_logs", "client_status_code", "idx_logs_client_status"),
+            (
+                "request_logs",
+                "client_status_code",
+                "idx_logs_client_status",
+            ),
             ("request_logs", "upstream_model", "idx_logs_upstream_model"),
             ("request_logs", "api_key_id", "idx_logs_api_key"),
             ("api_keys", "token", "idx_api_keys_token"),
             ("api_key_routes", "route_id", "idx_api_key_routes_route_id"),
-            ("provider_oauth_credentials", "status", "idx_oauth_creds_status"),
-            ("provider_oauth_credentials", "expires_at", "idx_oauth_creds_expires"),
+            (
+                "provider_oauth_credentials",
+                "status",
+                "idx_oauth_creds_status",
+            ),
+            (
+                "provider_oauth_credentials",
+                "expires_at",
+                "idx_oauth_creds_expires",
+            ),
         ] {
             mysql_ensure_index(pool, table, column, index).await?;
         }
@@ -1901,6 +1942,13 @@ impl StorageBootstrap for MysqlBootstrap {
         // Rename columns for compat: settings.key → settings.name, api_keys.key → api_keys.token
         mysql_rename_column_if_needed(pool, "settings", "key", "name").await?;
         mysql_rename_column_if_needed(pool, "api_keys", "key", "token").await?;
+        migrate_performance_mysql(pool).await?;
+        migrate_rating_effort_mysql(pool).await?;
+        crate::db::model_performance::recover_historical_metadata!(
+            pool,
+            sqlx::MySql,
+            "OCTET_LENGTH(upstream_request_body)"
+        );
 
         Ok(())
     }
@@ -1919,6 +1967,65 @@ impl StorageBootstrap for MysqlBootstrap {
 // ---------------------------------------------------------------------------
 // Migration helpers
 // ---------------------------------------------------------------------------
+
+async fn migrate_rating_effort_mysql(pool: &Pool<MySql>) -> anyhow::Result<()> {
+    mysql_add_column_if_not_exists(pool, "provider_model_ratings", "effort",
+        "VARCHAR(16) CHARACTER SET ascii COLLATE ascii_bin NOT NULL DEFAULT 'common' CHECK (BINARY effort IN ('common','low','medium','high','xhigh','max'))").await?;
+    let has_effort: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'provider_model_ratings' AND INDEX_NAME = 'PRIMARY' AND COLUMN_NAME = 'effort'").fetch_one(pool).await?;
+    if has_effort == 0 {
+        // Retain an index supporting the provider FK while replacing its old PK.
+        mysql_create_index_if_not_exists(
+            pool,
+            "provider_model_ratings",
+            "idx_ratings_provider",
+            "provider_id",
+        )
+        .await?;
+        sqlx::query("ALTER TABLE provider_model_ratings DROP PRIMARY KEY, ADD PRIMARY KEY (provider_id, upstream_model, effort)").execute(pool).await?;
+    }
+    Ok(())
+}
+
+async fn migrate_performance_mysql(pool: &Pool<MySql>) -> anyhow::Result<()> {
+    for (column, definition) in [
+        ("performance_metadata_version", "INTEGER NOT NULL DEFAULT 0"),
+        (
+            "upstream_effort_status",
+            "VARCHAR(16) NOT NULL DEFAULT 'unknown'",
+        ),
+        ("upstream_effort_raw", "TEXT"),
+        ("upstream_effort_tier", "VARCHAR(16)"),
+        (
+            "request_completion",
+            "VARCHAR(16) NOT NULL DEFAULT 'unknown'",
+        ),
+        ("completion_reason", "TEXT"),
+        (
+            "upstream_response_mode",
+            "VARCHAR(16) NOT NULL DEFAULT 'unknown'",
+        ),
+        ("performance_upstream_ms", "BIGINT"),
+        ("performance_first_chunk_ms", "BIGINT"),
+        ("performance_completed_at", "BIGINT"),
+    ] {
+        mysql_add_column_if_not_exists(pool, "request_logs", column, definition).await?;
+    }
+    mysql_create_index_if_not_exists(
+        pool,
+        "request_logs",
+        "idx_logs_performance_pair",
+        "provider_id, upstream_model, request_completion, performance_completed_at, id",
+    )
+    .await?;
+    mysql_create_index_if_not_exists(
+        pool,
+        "request_logs",
+        "idx_logs_performance_recovery",
+        "performance_metadata_version, created_at, id",
+    )
+    .await?;
+    Ok(())
+}
 
 async fn mysql_column_exists(
     pool: &Pool<MySql>,
@@ -1943,6 +2050,22 @@ async fn mysql_table_exists(pool: &Pool<MySql>, table_name: &str) -> anyhow::Res
     .fetch_one(pool)
     .await?
     > 0)
+}
+
+async fn mysql_create_index_if_not_exists(
+    pool: &Pool<MySql>,
+    table: &str,
+    index: &str,
+    columns: &str,
+) -> anyhow::Result<()> {
+    let exists: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM information_schema.statistics WHERE table_schema = DATABASE() AND table_name = ? AND index_name = ?")
+        .bind(table).bind(index).fetch_one(pool).await?;
+    if exists == 0 {
+        sqlx::query(&format!("CREATE INDEX `{index}` ON `{table}` ({columns})"))
+            .execute(pool)
+            .await?;
+    }
+    Ok(())
 }
 
 async fn mysql_ensure_index(
@@ -2328,7 +2451,9 @@ CREATE TABLE IF NOT EXISTS provider_model_ratings (
         CHECK (OCTET_LENGTH(upstream_model) BETWEEN 1 AND 1024),
     score INTEGER NOT NULL CHECK (score BETWEEN 0 AND 100),
     updated_at TEXT NOT NULL,
-    PRIMARY KEY (provider_id, upstream_model),
+    effort VARCHAR(16) CHARACTER SET ascii COLLATE ascii_bin NOT NULL DEFAULT 'common'
+        CHECK (BINARY effort IN ('common','low','medium','high','xhigh','max')),
+    PRIMARY KEY (provider_id, upstream_model, effort),
     FOREIGN KEY (provider_id) REFERENCES providers(id) ON DELETE CASCADE
 ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
 
@@ -2415,7 +2540,17 @@ CREATE TABLE IF NOT EXISTS request_logs (
     cache_read_tokens         INTEGER DEFAULT 0,
     is_stream                 TINYINT(1) DEFAULT 0,
     stream_chunks_count       INTEGER DEFAULT 0,
-    stream_first_chunk_ms     BIGINT
+    stream_first_chunk_ms     BIGINT,
+    performance_metadata_version INTEGER NOT NULL DEFAULT 0,
+    upstream_effort_status    VARCHAR(16) NOT NULL DEFAULT 'unknown',
+    upstream_effort_raw       TEXT,
+    upstream_effort_tier      VARCHAR(16),
+    request_completion        VARCHAR(16) NOT NULL DEFAULT 'unknown',
+    completion_reason         TEXT,
+    upstream_response_mode    VARCHAR(16) NOT NULL DEFAULT 'unknown',
+    performance_upstream_ms   BIGINT,
+    performance_first_chunk_ms BIGINT,
+    performance_completed_at  BIGINT
 ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
 
 CREATE TABLE IF NOT EXISTS settings (

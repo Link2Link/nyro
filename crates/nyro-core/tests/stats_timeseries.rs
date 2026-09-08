@@ -16,6 +16,7 @@ fn log_entry(
     upstream_model: &str,
 ) -> LogEntry {
     LogEntry {
+        performance: Default::default(),
         api_key_id: None,
         api_key_name: None,
         created_at,

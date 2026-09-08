@@ -965,6 +965,7 @@ async fn admin_clears_payloads_deletes_single_log_and_clears_error_logs() -> any
 
     let gw = build_gateway().await?;
     let entry = |client_status: i32, upstream_status: Option<i32>| LogEntry {
+        performance: Default::default(),
         api_key_id: None,
         api_key_name: None,
         created_at: 1,

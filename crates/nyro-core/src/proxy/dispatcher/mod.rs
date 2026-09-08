@@ -94,6 +94,7 @@ fn defer_stream_health(
     ingress: ProtocolId,
     req_ctx: &RequestContext,
     health_permit: HealthPermit,
+    performance: Option<crate::performance::Attempt>,
 ) -> Response {
     let (parts, body) = response.into_parts();
     let mut body = body.into_data_stream();
@@ -101,6 +102,7 @@ fn defer_stream_health(
     let deadline = req_ctx.deadline.clone();
     let (tx, rx) = tokio::sync::mpsc::channel(1);
 
+    let producer = performance.as_ref().map(|p| p.producer());
     tokio::spawn(async move {
         let mut completed = false;
         let mut failed = false;
@@ -169,6 +171,14 @@ fn defer_stream_health(
         match parser.finish() {
             Ok(deltas) => update_stream_health_state(&deltas, &mut completed, &mut failed),
             Err(_) => failed = true,
+        }
+        if failed {
+            if let Some(p) = &performance {
+                p.fail("failed", "downstream health relay parser error");
+            }
+        }
+        if let Some(producer) = producer {
+            producer.finish();
         }
         if completed && !failed {
             health_permit.success();
@@ -272,7 +282,13 @@ async fn run_phase_hooks_slice(
     for hook in hooks {
         match hook.run(&mut pctx).await {
             PhaseOutcome::Continue => {}
-            outcome => return outcome,
+            outcome => {
+                if let Some(attempt) = pctx.req_ctx.extensions.get::<crate::performance::Attempt>()
+                {
+                    attempt.fail("failed", "phase hook did not continue");
+                }
+                return outcome;
+            }
         }
     }
     PhaseOutcome::Continue
@@ -956,8 +972,7 @@ async fn dispatch_pipeline_inner(
 
         let egress_str = egress.to_string();
         let egress_caps = egress.handler().capabilities();
-        let upstream_forces_stream =
-            egress_caps.force_upstream_stream || antigravity_force_stream;
+        let upstream_forces_stream = egress_caps.force_upstream_stream || antigravity_force_stream;
         debug_assert_eq!(
             prepared_conversion.plan().kind().as_str(),
             conversion_strategy
@@ -1012,8 +1027,18 @@ async fn dispatch_pipeline_inner(
             _ => unreachable!("PreparedConversion guarantees matching body/session variants"),
         };
 
+        // Strict evidence belongs to this attempt, never the request OnceLock.
+        let performance = crate::performance::Attempt::new(
+            gw.log_tx.clone(),
+            ctx.cancellation.clone(),
+            ctx.deadline.clone(),
+        );
+        let attempt_producer = performance.producer();
+        ctx.extensions.insert(performance.clone());
+        let client = client.with_performance(performance.clone());
         // ── Build per-target context structs ─────────────────────────────────
         let call_ctx = CallCtx {
+            performance: Some(performance.clone()),
             gw: gw.clone(),
             provider: &provider,
             model_id: &route.id,
@@ -1034,6 +1059,11 @@ async fn dispatch_pipeline_inner(
             start,
             req_ext: req_ctx_ext.clone(),
         };
+        // Fallback for cancellation/panic/hook early returns; richer producer logs replace it.
+        LogBuilder::from_ctx(&call_ctx)
+            .with_req_extras(&req_extras)
+            .upstream_url(&outbound.url)
+            .emit();
         // `OnLog` runs once at the pipeline boundary (see `dispatch_pipeline`).
         // The handlers run the `OnResponse` phase: non-stream paths see a full
         // `AiResponse`, the streaming path is invoked per `AiStreamDelta`.
@@ -1054,7 +1084,8 @@ async fn dispatch_pipeline_inner(
         } else {
             let native_body =
                 prepared_native_body.expect("non-Raw-Wire prepared conversion must contain JSON");
-            let raw_chunk_hook = stream::StreamRawChunkHook::capture(&adapter, &provider, &provider_ctx);
+            let raw_chunk_hook =
+                stream::StreamRawChunkHook::capture(&adapter, &provider, &provider_ctx);
             let response = if is_stream {
                 handle_stream(
                     client,
@@ -1116,10 +1147,19 @@ async fn dispatch_pipeline_inner(
         let defer_native_stream_health =
             !uses_compat && is_stream && health_outcome == HealthOutcome::Success;
         let response = if defer_native_stream_health {
-            defer_stream_health(response, ingress, ctx, health_permit.clone())
+            defer_stream_health(
+                response,
+                ingress,
+                ctx,
+                health_permit.clone(),
+                Some(performance.clone()),
+            )
         } else {
             response
         };
+        // Observe actual consumer EOS outside the health relay (enqueue is not delivery).
+        let response = performance.wrap(response);
+        attempt_producer.finish();
         let health_outcome = if defer_native_stream_health {
             HealthOutcome::Deferred
         } else {
@@ -1215,6 +1255,7 @@ pub async fn dispatch(
 /// metadata. Shared by all three HTTP-level handlers so they no longer need
 /// a long flat parameter list for the same information.
 struct CallCtx<'a> {
+    performance: Option<crate::performance::Attempt>,
     gw: Gateway,
     provider: &'a Provider,
     model_id: &'a str,
@@ -1265,6 +1306,8 @@ struct RequestExtras {
 /// methods for the per-call fields, then call `emit` to enqueue the entry.
 #[derive(Clone)]
 struct LogBuilder {
+    performance: Option<crate::performance::Attempt>,
+    producer: Option<Arc<crate::performance::ProducerGuard>>,
     gw: Gateway,
     client_protocol: String,
     upstream_protocol: String,
@@ -1299,6 +1342,8 @@ impl LogBuilder {
     /// Build from a handler-level `CallCtx`; identity fields are pre-filled.
     fn from_ctx(call_ctx: &CallCtx<'_>) -> Self {
         Self {
+            performance: call_ctx.performance.clone(),
+            producer: call_ctx.performance.as_ref().map(|p| p.producer()),
             gw: call_ctx.gw.clone(),
             client_protocol: call_ctx.ingress_str.to_string(),
             upstream_protocol: call_ctx.egress_str.to_string(),
@@ -1334,6 +1379,8 @@ impl LogBuilder {
         start: Instant,
     ) -> Self {
         Self {
+            performance: None,
+            producer: None,
             gw: gw.clone(),
             client_protocol: ingress.to_string(),
             upstream_protocol: ingress.to_string(),
@@ -1390,12 +1437,17 @@ impl LogBuilder {
         self
     }
 
-    fn error(self, _msg: impl Into<String>) -> Self {
-        // Error info is embedded in response body; kept for call-site compat.
+    fn error(self, msg: impl Into<String>) -> Self {
+        if let Some(attempt) = &self.performance {
+            attempt.fail("failed", msg);
+        }
         self
     }
 
-    fn maybe_error(self, _msg: Option<String>) -> Self {
+    fn maybe_error(self, msg: Option<String>) -> Self {
+        if let Some(msg) = msg {
+            return self.error(msg);
+        }
         self
     }
 
@@ -1525,6 +1577,7 @@ impl LogBuilder {
                 .record(&self.provider_id, &backend_model, ttft_ms);
         }
         let entry = LogEntry {
+            performance: Default::default(),
             api_key_id: self.api_key_id,
             route_decision: self.route_decision,
             api_key_name: self.api_key_name,
@@ -1559,7 +1612,15 @@ impl LogBuilder {
             stream_first_chunk_ms: self.extras.stream_first_chunk_ms,
             enable_payload: self.enable_payload,
         };
-        send_log(&self.gw, entry);
+        if let Some(attempt) = &self.performance {
+            attempt.log(entry);
+        } else {
+            send_log(&self.gw, entry);
+        }
+        if let Some(producer) = &self.producer {
+            producer.finish();
+        }
+        drop(self.producer);
     }
 }
 
@@ -2349,6 +2410,7 @@ mod tests {
             OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1,
             &ctx,
             permit,
+            None,
         );
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
@@ -2382,6 +2444,7 @@ mod tests {
             OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1,
             &ctx,
             permit,
+            None,
         );
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
@@ -2413,6 +2476,7 @@ mod tests {
             OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1,
             &ctx,
             permit,
+            None,
         );
         let body = tokio::time::timeout(
             std::time::Duration::from_secs(1),
@@ -2456,6 +2520,7 @@ mod tests {
             OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1,
             &ctx,
             permit,
+            None,
         );
         drop(response);
         tokio::time::timeout(std::time::Duration::from_secs(1), source_tx.closed())

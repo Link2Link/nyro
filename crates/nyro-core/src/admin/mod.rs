@@ -27,6 +27,7 @@ mod extensions;
 mod import_export;
 mod model_catalog;
 mod model_data;
+mod model_performance;
 mod models;
 mod oauth;
 mod observability;
@@ -43,9 +44,11 @@ pub use model_catalog::{
     refresh_models_dev_runtime_cache_if_stale, refresh_models_dev_runtime_cache_on_startup,
 };
 use model_data::*;
+pub use model_performance::{ModelPerformanceItem, ModelPerformanceResponse};
 pub use provider_model_ratings::{
     MAX_RATING_MODEL_BYTES, ProviderModelRatingError, ProviderModelRatingState,
-    SetProviderModelRating,
+    SetProviderModelRating, SetProviderModelRatingProfile, SetRatingOverrides,
+    ProviderModelRatingProfile, RatingValue, RatingOverrides, ResolvedRating, EffectiveRatings,
 };
 pub use providers::{ProviderModelProbeMeta, ProviderModelProbeOutcome, ProviderModelProbeResult};
 pub use usage::{

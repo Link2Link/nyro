@@ -17,6 +17,38 @@ pub const MAX_UPSTREAM_RESPONSE_BODY_BYTES: usize = 128 * 1024 * 1024;
 
 pub struct ProxyClient {
     pub http: reqwest::Client,
+    performance: Option<crate::performance::Attempt>,
+}
+
+pub struct ObservedResponse {
+    response: reqwest::Response,
+    performance: Option<crate::performance::Attempt>,
+}
+impl ObservedResponse {
+    pub fn status(&self) -> reqwest::StatusCode {
+        self.response.status()
+    }
+    pub fn headers(&self) -> &HeaderMap {
+        self.response.headers()
+    }
+    pub fn bytes_stream(self) -> impl futures::Stream<Item = Result<Bytes, reqwest::Error>> + Send {
+        let stream = self.response.bytes_stream();
+        match self.performance {
+            Some(attempt) => futures::future::Either::Left(attempt.observe(stream)),
+            None => futures::future::Either::Right(stream),
+        }
+    }
+    pub async fn bytes(self) -> Result<Bytes> {
+        let mut stream = Box::pin(self.bytes_stream());
+        let mut bytes = BytesMut::new();
+        while let Some(chunk) = stream.next().await {
+            bytes.extend_from_slice(&chunk?);
+        }
+        Ok(bytes.freeze())
+    }
+    pub async fn json<T: serde::de::DeserializeOwned>(self) -> Result<T> {
+        Ok(serde_json::from_slice(&self.bytes().await?)?)
+    }
 }
 
 #[derive(Debug)]
@@ -43,7 +75,15 @@ impl UpstreamResponseDecodeError {
 
 impl ProxyClient {
     pub fn new(http: reqwest::Client) -> Self {
-        Self { http }
+        Self {
+            http,
+            performance: None,
+        }
+    }
+
+    pub(crate) fn with_performance(mut self, attempt: crate::performance::Attempt) -> Self {
+        self.performance = Some(attempt);
+        self
     }
 
     pub async fn call_non_stream_raw(
@@ -53,17 +93,11 @@ impl ProxyClient {
         body: Bytes,
     ) -> Result<RawUpstreamResponse> {
         ensure_json_content_type(&mut headers);
-        let response = self
-            .http
-            .post(url)
-            .headers(headers)
-            .body(body)
-            .send()
-            .await?;
+        let response = self.call_stream_raw(url, headers, body).await?;
         Self::buffer_response(response).await
     }
 
-    pub async fn buffer_response(response: reqwest::Response) -> Result<RawUpstreamResponse> {
+    pub async fn buffer_response(response: ObservedResponse) -> Result<RawUpstreamResponse> {
         let status = response.status().as_u16();
         let headers = response.headers().clone();
         let body = read_body_with_limit(response, MAX_UPSTREAM_RESPONSE_BODY_BYTES).await?;
@@ -82,11 +116,7 @@ impl ProxyClient {
     ) -> Result<(Value, u16, HeaderMap)> {
         ensure_json_content_type(&mut headers);
         let response = self
-            .http
-            .post(url)
-            .headers(headers)
-            .json(&body)
-            .send()
+            .call_stream_raw(url, headers, serde_json::to_vec(&body)?.into())
             .await?;
         let status = response.status().as_u16();
         let mut headers = response.headers().clone();
@@ -138,15 +168,35 @@ impl ProxyClient {
         url: &str,
         mut headers: HeaderMap,
         body: Bytes,
-    ) -> Result<reqwest::Response> {
+    ) -> Result<ObservedResponse> {
         ensure_json_content_type(&mut headers);
-        Ok(self
-            .http
-            .post(url)
-            .headers(headers)
-            .body(body)
-            .send()
-            .await?)
+        if let Some(attempt) = &self.performance {
+            attempt.request(&body);
+        }
+        let response = self.http.post(url).headers(headers).body(body).send().await;
+        let response = match response {
+            Ok(response) => response,
+            Err(error) => {
+                if let Some(attempt) = &self.performance {
+                    attempt.fail(
+                        if error.is_timeout() {
+                            "timed_out"
+                        } else {
+                            "failed"
+                        },
+                        error.to_string(),
+                    );
+                }
+                return Err(error.into());
+            }
+        };
+        if let Some(attempt) = &self.performance {
+            attempt.response(response.status().as_u16(), response.headers());
+        }
+        Ok(ObservedResponse {
+            response,
+            performance: self.performance.clone(),
+        })
     }
 
     pub async fn call_stream(
@@ -154,7 +204,7 @@ impl ProxyClient {
         url: &str,
         headers: HeaderMap,
         body: Value,
-    ) -> Result<(reqwest::Response, u16)> {
+    ) -> Result<(ObservedResponse, u16)> {
         let resp = self
             .call_stream_raw(url, headers, serde_json::to_vec(&body)?.into())
             .await?;
@@ -163,7 +213,7 @@ impl ProxyClient {
     }
 }
 
-async fn read_body_with_limit(response: reqwest::Response, limit: usize) -> Result<Bytes> {
+async fn read_body_with_limit(response: ObservedResponse, limit: usize) -> Result<Bytes> {
     let mut stream = response.bytes_stream();
     let mut body = BytesMut::new();
     while let Some(chunk) = stream.next().await {

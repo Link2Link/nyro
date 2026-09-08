@@ -2962,6 +2962,7 @@ dependencies = [
  "gcp_auth",
  "hex",
  "hmac",
+ "http-body",
  "inventory",
  "nyro-ccswitch-compat",
  "rand 0.8.6",

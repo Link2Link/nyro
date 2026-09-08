@@ -1137,6 +1137,20 @@ struct SqliteLogStore {
 
 #[async_trait]
 impl LogStore for SqliteLogStore {
+    async fn model_performance_stats(
+        &self,
+        pairs: &[(String, String)],
+        as_of: i64,
+    ) -> anyhow::Result<Vec<crate::db::PairPerformanceStats>> {
+        crate::db::model_performance::model_performance_method!(
+            self,
+            pairs,
+            as_of,
+            sqlx::Sqlite,
+            "upstream_model COLLATE BINARY",
+            "CAST(output_tokens AS INTEGER)"
+        )
+    }
     async fn append_batch(&self, entries: Vec<LogEntry>) -> anyhow::Result<()> {
         for entry in entries {
             let id = uuid::Uuid::new_v4().to_string();
@@ -1153,8 +1167,9 @@ impl LogStore for SqliteLogStore {
                      upstream_status_code, client_status_code,
                      latency_total_ms, latency_upstream_ms,
                      input_tokens, output_tokens, cache_read_tokens,
-                     is_stream, stream_chunks_count, stream_first_chunk_ms)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+                     is_stream, stream_chunks_count, stream_first_chunk_ms,
+                     performance_metadata_version, upstream_effort_status, upstream_effort_raw, upstream_effort_tier, request_completion, completion_reason, upstream_response_mode, performance_upstream_ms, performance_first_chunk_ms, performance_completed_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
             )
             .bind(&id)
             .bind(entry.created_at)
@@ -1191,6 +1206,16 @@ impl LogStore for SqliteLogStore {
             .bind(entry.is_stream)
             .bind(entry.stream_chunks_count)
             .bind(entry.stream_first_chunk_ms)
+            .bind(entry.performance.version)
+            .bind(&entry.performance.effort_status)
+            .bind(&entry.performance.effort_raw)
+            .bind(&entry.performance.effort_tier)
+            .bind(&entry.performance.completion)
+            .bind(&entry.performance.completion_reason)
+            .bind(&entry.performance.response_mode)
+            .bind(entry.performance.upstream_duration_ms)
+            .bind(entry.performance.first_chunk_ms)
+            .bind(entry.performance.completed_at)
             .execute(&self.pool)
             .await?;
         }
@@ -1211,7 +1236,8 @@ impl LogStore for SqliteLogStore {
              upstream_status_code, client_status_code, \
              CAST(latency_total_ms AS INTEGER) AS latency_total_ms, latency_upstream_ms, \
              input_tokens, output_tokens, COALESCE(cache_read_tokens, 0) AS cache_read_tokens, \
-             COALESCE(is_stream, 0) AS is_stream, stream_chunks_count, stream_first_chunk_ms \
+             COALESCE(is_stream, 0) AS is_stream, stream_chunks_count, stream_first_chunk_ms, \
+             performance_metadata_version, upstream_effort_status, upstream_effort_raw, upstream_effort_tier, request_completion, completion_reason, upstream_response_mode, performance_upstream_ms, performance_first_chunk_ms, performance_completed_at \
              FROM request_logs WHERE 1=1",
         );
         let mut bind_values: Vec<String> = Vec::new();
@@ -1288,7 +1314,8 @@ impl LogStore for SqliteLogStore {
              upstream_status_code, client_status_code, \
              CAST(latency_total_ms AS INTEGER) AS latency_total_ms, latency_upstream_ms, \
              input_tokens, output_tokens, COALESCE(cache_read_tokens, 0) AS cache_read_tokens, \
-             COALESCE(is_stream, 0) AS is_stream, stream_chunks_count, stream_first_chunk_ms \
+             COALESCE(is_stream, 0) AS is_stream, stream_chunks_count, stream_first_chunk_ms, \
+             performance_metadata_version, upstream_effort_status, upstream_effort_raw, upstream_effort_tier, request_completion, completion_reason, upstream_response_mode, performance_upstream_ms, performance_first_chunk_ms, performance_completed_at \
              FROM request_logs WHERE id = ?",
         )
         .bind(id)
@@ -1681,6 +1708,8 @@ impl StorageBootstrap for SqliteBootstrap {
             .await
             .unwrap_or(0)
                 == 2
+                && sqlx::query("SELECT effort FROM provider_model_ratings LIMIT 0").execute(&self.pool).await.is_ok()
+                && sqlx::query("SELECT performance_metadata_version, upstream_effort_status, upstream_effort_raw, upstream_effort_tier, request_completion, completion_reason, upstream_response_mode, performance_upstream_ms, performance_first_chunk_ms, performance_completed_at FROM request_logs LIMIT 0").execute(&self.pool).await.is_ok()
         } else {
             false
         };

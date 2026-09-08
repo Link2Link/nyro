@@ -68,7 +68,11 @@ impl StreamRawChunkHook {
         })
     }
 
-    pub(super) async fn apply(&self, chunk: &str) -> String {
+    pub(super) async fn apply(
+        &self,
+        chunk: &str,
+        performance: Option<&crate::performance::Attempt>,
+    ) -> String {
         let vendor_ctx = crate::provider::vendor_ext::VendorCtx {
             provider: &self.provider,
             protocol_id: self.protocol_id,
@@ -77,9 +81,16 @@ impl StreamRawChunkHook {
             credential: self.credential.as_ref(),
         };
         let mut text = chunk.to_string();
-        match self.vendor.on_stream_raw_chunk(&vendor_ctx, &mut text).await {
+        match self
+            .vendor
+            .on_stream_raw_chunk(&vendor_ctx, &mut text)
+            .await
+        {
             Ok(()) => text,
             Err(error) => {
+                if let Some(performance) = performance {
+                    performance.fail("failed", format!("raw chunk hook error: {error}"));
+                }
                 tracing::warn!(
                     %error,
                     vendor = self.vendor.vendor_id(),
@@ -249,10 +260,21 @@ pub(super) async fn handle_stream(
             // Parse accumulated buffer for usage stats (best-effort).
             let mut log_parser = egress.handler().make_stream_response_decoder();
             let mut accumulator = StreamResponseAccumulator::default();
-            if let Ok(ai_deltas) = log_parser.parse_chunk(&raw_sse) {
+            if let Ok(ai_deltas) = log_parser.parse_chunk(&raw_sse).inspect_err(|e| {
+                if let Some(p) = &log_pt.performance {
+                    p.fail("failed", format!("passthrough stream parser error: {e}"));
+                }
+            }) {
                 accumulator.apply_all(&ai_deltas);
             }
-            if let Ok(ai_deltas) = log_parser.finish() {
+            if let Ok(ai_deltas) = log_parser.finish().inspect_err(|e| {
+                if let Some(p) = &log_pt.performance {
+                    p.fail(
+                        "failed",
+                        format!("passthrough stream parser finish error: {e}"),
+                    );
+                }
+            }) {
                 accumulator.apply_all(&ai_deltas);
             }
 
@@ -347,12 +369,18 @@ pub(super) async fn handle_stream(
             // bytes for request logs.
             let hooked_text;
             let parse_src: &str = if let Some(hook) = raw_chunk_hook.as_ref() {
-                hooked_text = hook.apply(&text).await;
+                hooked_text = hook.apply(&text, log_ir.performance.as_ref()).await;
                 hooked_text.as_str()
             } else {
                 text.as_ref()
             };
-            if let Ok(ai_deltas) = stream_parser.parse_chunk(parse_src) {
+            if let Ok(ai_deltas) = stream_parser.parse_chunk(parse_src).inspect_err(|e| {
+                log_ir
+                    .performance
+                    .as_ref()
+                    .unwrap()
+                    .fail("failed", format!("stream parser error: {e}"));
+            }) {
                 let mut ai_deltas = tool_route_plan.restore_stream_deltas(ai_deltas);
                 hook_state.apply(&mut ai_deltas).await;
                 accumulator.apply_all(&ai_deltas);
@@ -367,7 +395,13 @@ pub(super) async fn handle_stream(
             }
         }
 
-        if let Ok(ai_deltas) = stream_parser.finish() {
+        if let Ok(ai_deltas) = stream_parser.finish().inspect_err(|e| {
+            log_ir
+                .performance
+                .as_ref()
+                .unwrap()
+                .fail("failed", format!("stream parser finish error: {e}"));
+        }) {
             let mut ai_deltas = tool_route_plan.restore_stream_deltas(ai_deltas);
             hook_state.apply(&mut ai_deltas).await;
             accumulator.apply_all(&ai_deltas);

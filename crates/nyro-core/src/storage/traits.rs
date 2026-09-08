@@ -84,14 +84,24 @@ pub trait ProviderStore: Send + Sync {
 /// Persistence for ratings, independent of routing and model catalogs.
 #[async_trait]
 pub trait ProviderModelRatingStore: Send + Sync {
+    /// List all stored scopes, including override-only models.
     async fn list(&self, provider_id: Option<&str>) -> anyhow::Result<Vec<ProviderModelRating>>;
     async fn get(
         &self,
         provider_id: &str,
         model: &str,
     ) -> anyhow::Result<Option<ProviderModelRating>>;
+    /// Write the row's explicit scope. Legacy get/delete address common only.
     async fn upsert(&self, rating: ProviderModelRating) -> anyhow::Result<ProviderModelRating>;
     async fn delete(&self, provider_id: &str, model: &str) -> anyhow::Result<()>;
+    /// Atomically replace all six scopes of one exact model, preserving supplied timestamps.
+    /// An empty slice clears the profile, without touching any other model.
+    async fn replace_profile(
+        &self,
+        provider_id: &str,
+        upstream_model: &str,
+        ratings: &[ProviderModelRating],
+    ) -> anyhow::Result<()>;
     /// Atomically replace all target ratings; an empty slice clears them.
     /// The target provider ID overrides row IDs and timestamps are preserved.
     async fn restore(
@@ -160,6 +170,14 @@ pub trait AuthAccessStore: Send + Sync {
 
 #[async_trait]
 pub trait LogStore: Send + Sync {
+    /// Completion-aware, seven-day, independently sampled performance groups.
+    async fn model_performance_stats(
+        &self,
+        _pairs: &[(String, String)],
+        _as_of: i64,
+    ) -> anyhow::Result<Vec<crate::db::PairPerformanceStats>> {
+        anyhow::bail!("model performance statistics are unsupported by this storage")
+    }
     async fn append_batch(&self, entries: Vec<LogEntry>) -> anyhow::Result<()>;
     async fn query(&self, query: LogQuery) -> anyhow::Result<LogPage>;
     async fn find_by_id(&self, id: &str) -> anyhow::Result<Option<RequestLog>>;

@@ -626,7 +626,7 @@ struct PrimedStream {
 async fn prime_stream(
     engine: &CompatEngine,
     session: &ConversionSession,
-    response: reqwest::Response,
+    response: crate::proxy::client::ObservedResponse,
     req_ctx: &RequestContext,
     started_at: std::time::Instant,
 ) -> Result<PrimedStream, CompatError> {
@@ -772,7 +772,11 @@ fn build_streaming_compat_response(
             };
             observe_terminal(&mut terminal, &bytes, client_protocol);
             let text = String::from_utf8_lossy(&bytes);
-            let outgoing = if let Ok(mut deltas) = parser.parse_chunk(&text) {
+            let outgoing = if let Ok(mut deltas) = parser.parse_chunk(&text).inspect_err(|e| {
+                if let Some(p) = &log.performance {
+                    p.fail("failed", format!("compat downstream parser error: {e}"));
+                }
+            }) {
                 if hook_state.is_empty() {
                     accumulator.apply_all(&deltas);
                     bytes
@@ -815,7 +819,14 @@ fn build_streaming_compat_response(
         }
 
         terminal.finish(client_protocol);
-        if let Ok(mut deltas) = parser.finish() {
+        if let Ok(mut deltas) = parser.finish().inspect_err(|e| {
+            if let Some(p) = &log.performance {
+                p.fail(
+                    "failed",
+                    format!("compat downstream parser finish error: {e}"),
+                );
+            }
+        }) {
             let before = format!("{deltas:?}");
             if !hook_state.is_empty() {
                 hook_state.apply(&mut deltas).await;
@@ -1559,6 +1570,7 @@ mod tests {
         let ingress_str: &'static str = Box::leak(ingress.to_string().into_boxed_str());
         let egress_str: &'static str = Box::leak(egress.to_string().into_boxed_str());
         let call_ctx = CallCtx {
+            performance: None,
             gw: gw.clone(),
             provider,
             model_id: "model-test",

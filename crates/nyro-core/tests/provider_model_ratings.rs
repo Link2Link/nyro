@@ -298,6 +298,7 @@ async fn rating_copy_preserves_snapshot_and_time_but_changes_are_independent() -
     let old = ProviderModelRating {
         provider_id: p.id.clone(),
         upstream_model: "no-longer-listed".to_string(),
+        effort: "common".to_string(),
         score: 0,
         updated_at: "2024-01-01T00:00:00.000Z".to_string(),
     };
@@ -363,6 +364,7 @@ async fn rating_backup_roundtrip_rebinds_ids_preserves_time_and_skips_existing_n
     let old = ProviderModelRating {
         provider_id: p.id.clone(),
         upstream_model: "old/x ".to_string(),
+        effort: "common".to_string(),
         score: 0,
         updated_at: "2024-01-01T00:00:00.000Z".to_string(),
     };

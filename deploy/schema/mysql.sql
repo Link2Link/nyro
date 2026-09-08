@@ -100,10 +100,12 @@ CREATE TABLE `provider_model_ratings` (
   `upstream_model` varbinary(1024) NOT NULL,
   `score` int NOT NULL,
   `updated_at` text COLLATE utf8mb4_unicode_ci NOT NULL,
-  PRIMARY KEY (`provider_id`,`upstream_model`),
+  `effort` varchar(16) CHARACTER SET ascii COLLATE ascii_bin NOT NULL DEFAULT 'common',
+  PRIMARY KEY (`provider_id`,`upstream_model`,`effort`),
   CONSTRAINT `provider_model_ratings_ibfk_1` FOREIGN KEY (`provider_id`) REFERENCES `providers` (`id`) ON DELETE CASCADE,
   CONSTRAINT `provider_model_ratings_chk_1` CHECK ((length(`upstream_model`) between 1 and 1024)),
-  CONSTRAINT `provider_model_ratings_chk_2` CHECK ((`score` between 0 and 100))
+  CONSTRAINT `provider_model_ratings_chk_2` CHECK ((`score` between 0 and 100)),
+  CONSTRAINT `provider_model_ratings_chk_3` CHECK ((cast(`effort` as char charset binary) in (_utf8mb4'common',_utf8mb4'low',_utf8mb4'medium',_utf8mb4'high',_utf8mb4'xhigh',_utf8mb4'max')))
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE `provider_oauth_credentials` (
@@ -185,12 +187,24 @@ CREATE TABLE `request_logs` (
   `is_stream` tinyint(1) DEFAULT '0',
   `stream_chunks_count` int DEFAULT '0',
   `stream_first_chunk_ms` bigint DEFAULT NULL,
+  `performance_metadata_version` int NOT NULL DEFAULT '0',
+  `upstream_effort_status` varchar(16) COLLATE utf8mb4_unicode_ci NOT NULL DEFAULT 'unknown',
+  `upstream_effort_raw` text COLLATE utf8mb4_unicode_ci,
+  `upstream_effort_tier` varchar(16) COLLATE utf8mb4_unicode_ci DEFAULT NULL,
+  `request_completion` varchar(16) COLLATE utf8mb4_unicode_ci NOT NULL DEFAULT 'unknown',
+  `completion_reason` text COLLATE utf8mb4_unicode_ci,
+  `upstream_response_mode` varchar(16) COLLATE utf8mb4_unicode_ci NOT NULL DEFAULT 'unknown',
+  `performance_upstream_ms` bigint DEFAULT NULL,
+  `performance_first_chunk_ms` bigint DEFAULT NULL,
+  `performance_completed_at` bigint DEFAULT NULL,
   PRIMARY KEY (`id`),
   KEY `idx_logs_created_at` (`created_at`),
   KEY `idx_logs_provider_id` (`provider_id`),
   KEY `idx_logs_client_status` (`client_status_code`),
   KEY `idx_logs_upstream_model` (`upstream_model`),
-  KEY `idx_logs_api_key` (`api_key_id`)
+  KEY `idx_logs_api_key` (`api_key_id`),
+  KEY `idx_logs_performance_pair` (`provider_id`,`upstream_model`,`request_completion`,`performance_completed_at`,`id`),
+  KEY `idx_logs_performance_recovery` (`performance_metadata_version`,`created_at`,`id`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE `settings` (

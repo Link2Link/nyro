@@ -137,6 +137,116 @@ async fn rating_http_rejects_bad_input_without_coercion() -> anyhow::Result<()> 
     Ok(())
 }
 
+#[tokio::test]
+async fn rating_profile_http_atomic_input_fallback_and_legacy_common_only() -> anyhow::Result<()> {
+    let (_dir, router, id) = fixture().await?;
+    let url = format!("/api/v1/providers/{id}/model-rating-profile?model=exact%2FModel%20");
+    assert_eq!(
+        call(&router, "GET", &url, None, false).await?.0,
+        StatusCode::UNAUTHORIZED
+    );
+    let body =
+        json!({"common":80,"overrides":{"low":null,"medium":null,"high":90,"xhigh":null,"max":0}});
+    let (status, profile) = call(&router, "PUT", &url, Some(body.clone()), true).await?;
+    assert_eq!(status, StatusCode::OK);
+    let profile = &profile["data"];
+    assert_eq!(profile["upstream_model"], "exact/Model ");
+    assert_eq!(profile["display_mode"], "per_effort");
+    assert_eq!(profile["effective"]["low"]["score"], 80);
+    assert_eq!(profile["effective"]["low"]["source"], "common");
+    assert_eq!(profile["effective"]["high"]["score"], 90);
+    assert_eq!(profile["effective"]["high"]["source"], "override");
+    assert_eq!(profile["effective"]["max"]["score"], 0);
+    for invalid in [
+        json!({"common":80}),
+        json!({"overrides":body["overrides"]}),
+        json!({"common":null,"overrides":{"high":90}}),
+        json!({"common":null,"overrides":{"low":null,"medium":null,"high":101,"xhigh":null,"max":null}}),
+        json!({"common":null,"overrides":{"low":null,"minimal":50,"medium":null,"high":null,"xhigh":null,"max":null}}),
+    ] {
+        assert_eq!(
+            call(&router, "PUT", &url, Some(invalid), true).await?.0,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            &call(&router, "GET", &url, None, true).await?.1["data"],
+            profile
+        );
+    }
+    let legacy = format!("/api/v1/providers/{id}/model-rating?model=exact%2FModel%20");
+    call(&router, "DELETE", &legacy, None, true).await?;
+    let state = call(&router, "GET", &url, None, true).await?.1;
+    assert!(state["data"]["common"].is_null());
+    assert_eq!(state["data"]["effective"]["low"]["status"], "unrated");
+    assert_eq!(state["data"]["effective"]["high"]["score"], 90);
+    assert_eq!(
+        call(&router, "GET", "/api/v1/provider-model-ratings", None, true)
+            .await?
+            .1["data"],
+        json!([])
+    );
+    assert_eq!(
+        call(
+            &router,
+            "GET",
+            "/api/v1/provider-model-rating-profiles",
+            None,
+            true
+        )
+        .await?
+        .1["data"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn rating_performance_http_has_frozen_window_and_explicit_no_samples() -> anyhow::Result<()> {
+    let (_dir, router, id) = fixture().await?;
+    assert_eq!(
+        call(&router, "GET", "/api/v1/model-performance", None, false)
+            .await?
+            .0,
+        StatusCode::UNAUTHORIZED
+    );
+    let empty = call(&router, "GET", "/api/v1/model-performance", None, true)
+        .await?
+        .1;
+    assert_eq!(empty["data"]["models"], json!([]));
+    let profile_url = format!("/api/v1/providers/{id}/model-rating-profile?model=x");
+    call(&router, "PUT", &profile_url, Some(json!({"common":null,"overrides":{"low":null,"medium":null,"high":90,"xhigh":null,"max":null}})), true).await?;
+    let (status, response) = call(&router, "GET", "/api/v1/model-performance", None, true).await?;
+    assert_eq!(status, StatusCode::OK);
+    let data = &response["data"];
+    assert_eq!(
+        data["as_of"].as_i64().unwrap() - data["window_start"].as_i64().unwrap(),
+        604800000
+    );
+    assert_eq!(data["models"].as_array().unwrap().len(), 1);
+    let item = &data["models"][0];
+    assert_eq!(item["status"], "ready");
+    assert_eq!(item["profile"]["display_mode"], "per_effort");
+    assert_eq!(item["mixed"]["valid_tps_count"], 0);
+    assert!(item["tiers"]["high"]["average_tps"].is_null());
+    assert_eq!(item["tiers"]["high"]["selected_request_count"], 0);
+    assert_eq!(
+        call(
+            &router,
+            "GET",
+            "/api/v1/model-performance?provider_id=unknown",
+            None,
+            true
+        )
+        .await?
+        .0,
+        StatusCode::NOT_FOUND
+    );
+    Ok(())
+}
+
 #[test]
 fn rating_http_errors_are_typed_not_misreported_as_unrated() {
     assert_eq!(

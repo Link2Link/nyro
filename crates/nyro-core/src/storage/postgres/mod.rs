@@ -79,6 +79,8 @@ impl PostgresAdapter {
                 && pg_table_exists(&self.pool, "provider_model_ratings")
                     .await
                     .unwrap_or(false)
+                && sqlx::query("SELECT effort FROM provider_model_ratings LIMIT 0").execute(&self.pool).await.is_ok()
+                && sqlx::query("SELECT performance_metadata_version, upstream_effort_status, upstream_effort_raw, upstream_effort_tier, request_completion, completion_reason, upstream_response_mode, performance_upstream_ms, performance_first_chunk_ms, performance_completed_at FROM request_logs LIMIT 0").execute(&self.pool).await.is_ok()
         } else {
             false
         };
@@ -1035,6 +1037,20 @@ struct PostgresLogStore {
 
 #[async_trait]
 impl LogStore for PostgresLogStore {
+    async fn model_performance_stats(
+        &self,
+        pairs: &[(String, String)],
+        as_of: i64,
+    ) -> anyhow::Result<Vec<crate::db::PairPerformanceStats>> {
+        crate::db::model_performance::model_performance_method!(
+            self,
+            pairs,
+            as_of,
+            sqlx::Postgres,
+            "upstream_model COLLATE \"C\"",
+            "CAST(output_tokens AS BIGINT)"
+        )
+    }
     async fn append_batch(&self, entries: Vec<LogEntry>) -> anyhow::Result<()> {
         for entry in entries {
             let id = uuid::Uuid::new_v4().to_string();
@@ -1051,8 +1067,9 @@ impl LogStore for PostgresLogStore {
                      upstream_status_code, client_status_code,
                      latency_total_ms, latency_upstream_ms,
                      input_tokens, output_tokens, cache_read_tokens,
-                     is_stream, stream_chunks_count, stream_first_chunk_ms)
-                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35)"#,
+                     is_stream, stream_chunks_count, stream_first_chunk_ms,
+                     performance_metadata_version, upstream_effort_status, upstream_effort_raw, upstream_effort_tier, request_completion, completion_reason, upstream_response_mode, performance_upstream_ms, performance_first_chunk_ms, performance_completed_at)
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,$37,$38,$39,$40,$41,$42,$43,$44,$45)"#,
             )
             .bind(&id)
             .bind(entry.created_at)
@@ -1089,6 +1106,16 @@ impl LogStore for PostgresLogStore {
             .bind(entry.is_stream)
             .bind(entry.stream_chunks_count)
             .bind(entry.stream_first_chunk_ms)
+            .bind(entry.performance.version)
+            .bind(&entry.performance.effort_status)
+            .bind(&entry.performance.effort_raw)
+            .bind(&entry.performance.effort_tier)
+            .bind(&entry.performance.completion)
+            .bind(&entry.performance.completion_reason)
+            .bind(&entry.performance.response_mode)
+            .bind(entry.performance.upstream_duration_ms)
+            .bind(entry.performance.first_chunk_ms)
+            .bind(entry.performance.completed_at)
             .execute(&self.pool)
             .await?;
         }
@@ -1109,7 +1136,8 @@ impl LogStore for PostgresLogStore {
              upstream_status_code, client_status_code, \
              latency_total_ms, latency_upstream_ms, \
              input_tokens, output_tokens, COALESCE(cache_read_tokens, 0) AS cache_read_tokens, \
-             COALESCE(is_stream, FALSE) AS is_stream, stream_chunks_count, stream_first_chunk_ms \
+             COALESCE(is_stream, FALSE) AS is_stream, stream_chunks_count, stream_first_chunk_ms, \
+             performance_metadata_version, upstream_effort_status, upstream_effort_raw, upstream_effort_tier, request_completion, completion_reason, upstream_response_mode, performance_upstream_ms, performance_first_chunk_ms, performance_completed_at \
              FROM request_logs WHERE 1=1",
         );
         let mut idx = 1;
@@ -1201,7 +1229,8 @@ impl LogStore for PostgresLogStore {
              upstream_status_code, client_status_code, \
              latency_total_ms, latency_upstream_ms, \
              input_tokens, output_tokens, COALESCE(cache_read_tokens, 0) AS cache_read_tokens, \
-             COALESCE(is_stream, FALSE) AS is_stream, stream_chunks_count, stream_first_chunk_ms \
+             COALESCE(is_stream, FALSE) AS is_stream, stream_chunks_count, stream_first_chunk_ms, \
+             performance_metadata_version, upstream_effort_status, upstream_effort_raw, upstream_effort_tier, request_completion, completion_reason, upstream_response_mode, performance_upstream_ms, performance_first_chunk_ms, performance_completed_at \
              FROM request_logs WHERE id = $1",
         )
         .bind(id)
@@ -1810,6 +1839,13 @@ END $$;"#,
         // Rename columns for MySQL compat: settings.key → settings.name, api_keys.key → api_keys.token
         pg_rename_column_if_needed(self.adapter.pool(), "settings", "key", "name").await?;
         pg_rename_column_if_needed(self.adapter.pool(), "api_keys", "key", "token").await?;
+        migrate_performance_pg(self.adapter.pool()).await?;
+        migrate_rating_effort_pg(self.adapter.pool()).await?;
+        crate::db::model_performance::recover_historical_metadata!(
+            self.adapter.pool(),
+            sqlx::Postgres,
+            "octet_length(upstream_request_body)"
+        );
 
         Ok(())
     }
@@ -1823,6 +1859,49 @@ END $$;"#,
             writable: health.can_connect,
         })
     }
+}
+
+async fn migrate_rating_effort_pg(pool: &Pool<Postgres>) -> anyhow::Result<()> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("ALTER TABLE provider_model_ratings ADD COLUMN IF NOT EXISTS effort TEXT COLLATE \"C\" NOT NULL DEFAULT 'common' CHECK (effort IN ('common','low','medium','high','xhigh','max'))").execute(&mut *tx).await?;
+    // Inspect the actual key (not just column existence), so interrupted upgrades
+    // and repeated INIT runs are safe. DDL and key replacement are atomic in PG.
+    sqlx::query(r#"DO $$ DECLARE key_name TEXT; key_has_effort BOOLEAN; BEGIN
+        SELECT c.conname, EXISTS (SELECT 1 FROM unnest(c.conkey) AS k(attnum)
+            JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = k.attnum WHERE a.attname = 'effort')
+        INTO key_name, key_has_effort FROM pg_constraint c
+        WHERE c.conrelid = 'provider_model_ratings'::regclass AND c.contype = 'p';
+        IF NOT COALESCE(key_has_effort, FALSE) THEN
+            IF key_name IS NOT NULL THEN EXECUTE format('ALTER TABLE provider_model_ratings DROP CONSTRAINT %I', key_name); END IF;
+            ALTER TABLE provider_model_ratings ADD PRIMARY KEY (provider_id, upstream_model, effort);
+        END IF;
+    END $$;"#).execute(&mut *tx).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+async fn migrate_performance_pg(pool: &Pool<Postgres>) -> anyhow::Result<()> {
+    for (column, definition) in [
+        ("performance_metadata_version", "INTEGER NOT NULL DEFAULT 0"),
+        ("upstream_effort_status", "TEXT NOT NULL DEFAULT 'unknown'"),
+        ("upstream_effort_raw", "TEXT"),
+        ("upstream_effort_tier", "TEXT"),
+        ("request_completion", "TEXT NOT NULL DEFAULT 'unknown'"),
+        ("completion_reason", "TEXT"),
+        ("upstream_response_mode", "TEXT NOT NULL DEFAULT 'unknown'"),
+        ("performance_upstream_ms", "BIGINT"),
+        ("performance_first_chunk_ms", "BIGINT"),
+        ("performance_completed_at", "BIGINT"),
+    ] {
+        sqlx::query(&format!(
+            "ALTER TABLE request_logs ADD COLUMN IF NOT EXISTS {column} {definition}"
+        ))
+        .execute(pool)
+        .await?;
+    }
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_logs_performance_pair ON request_logs(provider_id, upstream_model COLLATE \"C\", request_completion, performance_completed_at, id)").execute(pool).await?;
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_logs_performance_recovery ON request_logs(performance_metadata_version, created_at, id)").execute(pool).await?;
+    Ok(())
 }
 
 /// Collapse removed provider protocol columns into `protocol` / `base_url`,
@@ -2198,7 +2277,9 @@ CREATE TABLE IF NOT EXISTS provider_model_ratings (
         CHECK (octet_length(upstream_model) BETWEEN 1 AND 1024),
     score INTEGER NOT NULL CHECK (score BETWEEN 0 AND 100),
     updated_at TEXT NOT NULL,
-    PRIMARY KEY (provider_id, upstream_model)
+    effort TEXT COLLATE "C" NOT NULL DEFAULT 'common'
+        CONSTRAINT provider_model_ratings_effort_check CHECK (effort IN ('common','low','medium','high','xhigh','max')),
+    PRIMARY KEY (provider_id, upstream_model, effort)
 );
 
 CREATE TABLE IF NOT EXISTS provider_protocol_endpoints (
@@ -2284,7 +2365,17 @@ CREATE TABLE IF NOT EXISTS request_logs (
     cache_read_tokens         INTEGER DEFAULT 0,
     is_stream                 BOOLEAN DEFAULT FALSE,
     stream_chunks_count       INTEGER DEFAULT 0,
-    stream_first_chunk_ms     BIGINT
+    stream_first_chunk_ms     BIGINT,
+    performance_metadata_version INTEGER NOT NULL DEFAULT 0,
+    upstream_effort_status    TEXT NOT NULL DEFAULT 'unknown',
+    upstream_effort_raw       TEXT,
+    upstream_effort_tier      TEXT,
+    request_completion        TEXT NOT NULL DEFAULT 'unknown',
+    completion_reason         TEXT,
+    upstream_response_mode    TEXT NOT NULL DEFAULT 'unknown',
+    performance_upstream_ms   BIGINT,
+    performance_first_chunk_ms BIGINT,
+    performance_completed_at  BIGINT
 );
 
 CREATE INDEX IF NOT EXISTS idx_logs_created_at ON request_logs(created_at);

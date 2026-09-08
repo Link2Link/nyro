@@ -163,6 +163,12 @@ pub(super) async fn handle_non_stream(
         {
             Ok(ai_resp) => ai_resp.usage,
             Err(error) => {
+                if let Some(p) = &call_ctx.performance {
+                    p.fail(
+                        "failed",
+                        format!("passthrough response parser error: {error}"),
+                    );
+                }
                 tracing::warn!(%error, egress = egress_str, "failed to parse passthrough usage");
                 Default::default()
             }
@@ -431,6 +437,7 @@ mod tests {
         let (gw, mut log_rx) = Gateway::new(config).await.expect("gateway init");
         let req_ext = crate::proxy::context::ContextBag::new();
         let call_ctx = CallCtx {
+            performance: None,
             gw: gw.clone(),
             provider: &provider,
             model_id: "route-anthropic",
@@ -522,6 +529,7 @@ mod tests {
 
         let req_ext = crate::proxy::context::ContextBag::new();
         let call_ctx = CallCtx {
+            performance: None,
             gw: gw.clone(),
             provider: &provider,
             model_id: "route-google",
@@ -732,6 +740,7 @@ mod tests {
         };
         let (gw, _log_rx) = Gateway::new(config).await.expect("gateway init");
         let call_ctx = CallCtx {
+            performance: None,
             gw: gw.clone(),
             provider: &provider,
             model_id: "route-resp",
@@ -913,18 +922,26 @@ pub(super) async fn handle_non_stream_via_upstream_stream(
         // decoder; raw_text keeps the verbatim upstream bytes for logs.
         let hooked_text;
         let parse_src: &str = if let Some(hook) = raw_chunk_hook.as_ref() {
-            hooked_text = hook.apply(&text).await;
+            hooked_text = hook.apply(&text, call_ctx.performance.as_ref()).await;
             hooked_text.as_str()
         } else {
             text.as_ref()
         };
-        if let Ok(ai_deltas) = stream_parser.parse_chunk(parse_src) {
+        if let Ok(ai_deltas) = stream_parser.parse_chunk(parse_src).inspect_err(|e| {
+            if let Some(p) = &call_ctx.performance {
+                p.fail("failed", format!("stream parser error: {e}"));
+            }
+        }) {
             let ai_deltas = tool_route_plan.restore_stream_deltas(ai_deltas);
             accumulator.apply_all(&ai_deltas);
         }
     }
 
-    if let Ok(ai_deltas) = stream_parser.finish() {
+    if let Ok(ai_deltas) = stream_parser.finish().inspect_err(|e| {
+        if let Some(p) = &call_ctx.performance {
+            p.fail("failed", format!("stream parser finish error: {e}"));
+        }
+    }) {
         let ai_deltas = tool_route_plan.restore_stream_deltas(ai_deltas);
         accumulator.apply_all(&ai_deltas);
     }

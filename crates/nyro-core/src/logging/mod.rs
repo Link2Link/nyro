@@ -57,6 +57,7 @@ pub struct LogEntry {
     pub client_status_code: i32,
 
     // === 性能 ===
+    pub performance: crate::performance::PerformanceMetadata,
     pub latency_total_ms: i64,
     pub latency_upstream_ms: Option<i64>,
     pub usage: Usage,
@@ -250,6 +251,10 @@ mod tests {
     fn clearing_payload_preserves_reasoning_effort_metadata() {
         let payload = Some("payload".to_string());
         let mut entry = LogEntry {
+            performance: crate::performance::recover_historical_effort(
+                r#"{"reasoning_effort":"high"}"#,
+                None,
+            ),
             api_key_id: None,
             api_key_name: None,
             created_at: 0,
@@ -296,5 +301,7 @@ mod tests {
         assert!(entry.upstream_response_headers.is_none());
         assert!(entry.upstream_response_body.is_none());
         assert_eq!(entry.reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(entry.performance.effort_tier.as_deref(), Some("high"));
+        assert_eq!(entry.performance.version, 1);
     }
 }

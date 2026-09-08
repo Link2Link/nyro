@@ -801,6 +801,7 @@ fn ark_coding_channel_is_shared_key_multi_protocol() {
             "doubao-seed-2.1-turbo",
             "glm-5.2",
             "glm-5.3",
+            "glm-5.3-flash",
             "kimi-k2.7-code",
             "minimax-m3",
         ]

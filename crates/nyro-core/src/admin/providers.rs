@@ -1079,7 +1079,7 @@ impl AdminService {
         options: CopyProviderOptions,
     ) -> anyhow::Result<Provider> {
         let original = self.get_provider(id).await?;
-        // Snapshot all saved ratings, independently of catalog availability or
+        // Snapshot all scopes and original timestamps, independently of catalog availability or
         // append_targets. A read failure must not produce an unscored copy.
         let rating_snapshot = match self.gw.storage.provider_model_ratings() {
             Some(store) => Some(store.list(Some(&original.id)).await?),

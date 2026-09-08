@@ -474,6 +474,31 @@ pub struct RequestLog {
     pub is_stream: bool,
     pub stream_chunks_count: i32,
     pub stream_first_chunk_ms: Option<i64>,
+
+    #[serde(default)]
+    pub performance_metadata_version: i32,
+    #[serde(default = "unknown_performance_value")]
+    pub upstream_effort_status: String,
+    #[serde(default)]
+    pub upstream_effort_raw: Option<String>,
+    #[serde(default)]
+    pub upstream_effort_tier: Option<String>,
+    #[serde(default = "unknown_performance_value")]
+    pub request_completion: String,
+    #[serde(default)]
+    pub completion_reason: Option<String>,
+    #[serde(default = "unknown_performance_value")]
+    pub upstream_response_mode: String,
+    #[serde(default)]
+    pub performance_upstream_ms: Option<i64>,
+    #[serde(default)]
+    pub performance_first_chunk_ms: Option<i64>,
+    #[serde(default)]
+    pub performance_completed_at: Option<i64>,
+}
+
+fn unknown_performance_value() -> String {
+    "unknown".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1060,6 +1085,8 @@ pub struct ExportData {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ExportProviderModelRating {
     pub upstream_model: String,
+    #[serde(default = "super::provider_model_ratings::common_effort")]
+    pub effort: String,
     pub score: i32,
     pub updated_at: String,
 }

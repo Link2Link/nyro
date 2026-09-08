@@ -1,4 +1,6 @@
+pub mod model_performance;
 pub mod models;
+pub use model_performance::{ModelPerformanceStats, ModelPerformanceTiers, PairPerformanceStats};
 pub(crate) mod provider_model_ratings;
 
 use std::path::Path;
@@ -94,6 +96,13 @@ pub async fn migrate(pool: &SqlitePool) -> anyhow::Result<()> {
     ensure_request_log_column(pool, "cache_read_tokens", "INTEGER DEFAULT 0").await?;
     ensure_request_log_column(pool, "reasoning_effort", "TEXT").await?;
     ensure_request_log_column(pool, "route_decision", "TEXT").await?;
+    migrate_performance_metadata(pool).await?;
+    migrate_rating_effort(pool).await?;
+    model_performance::recover_historical_metadata!(
+        pool,
+        sqlx::Sqlite,
+        "length(CAST(upstream_request_body AS BLOB))"
+    );
 
     // Rename tables: routes → models, route_targets → model_backends, api_key_routes → api_key_models
     rename_table_if_needed(pool, "routes", "models").await?;
@@ -592,6 +601,58 @@ async fn migrate_logs_v2_spec_aligned(pool: &SqlitePool) -> anyhow::Result<()> {
     Ok(())
 }
 
+async fn migrate_rating_effort(pool: &SqlitePool) -> anyhow::Result<()> {
+    if column_exists(pool, "provider_model_ratings", "effort").await? {
+        return Ok(());
+    }
+    // A transactional rebuild preserves exact model text, timestamps, constraints,
+    // and the supplier cascade without ever disabling foreign keys.
+    let mut tx = pool.begin().await?;
+    let statements = r#"
+        CREATE TABLE provider_model_ratings_effort (
+            provider_id TEXT COLLATE BINARY NOT NULL REFERENCES providers(id) ON DELETE CASCADE,
+            upstream_model TEXT COLLATE BINARY NOT NULL CHECK (length(CAST(upstream_model AS BLOB)) BETWEEN 1 AND 1024),
+            score INTEGER NOT NULL CHECK (typeof(score) = 'integer' AND score BETWEEN 0 AND 100),
+            updated_at TEXT NOT NULL,
+            effort TEXT COLLATE BINARY NOT NULL DEFAULT 'common' CHECK (effort IN ('common','low','medium','high','xhigh','max')),
+            PRIMARY KEY (provider_id, upstream_model, effort)
+        );
+        INSERT INTO provider_model_ratings_effort (provider_id, upstream_model, score, updated_at, effort)
+            SELECT provider_id, upstream_model, score, updated_at, 'common' FROM provider_model_ratings;
+        DROP TABLE provider_model_ratings;
+        ALTER TABLE provider_model_ratings_effort RENAME TO provider_model_ratings;
+    "#;
+    for statement in statements
+        .split(';')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        sqlx::query(statement).execute(&mut *tx).await?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
+async fn migrate_performance_metadata(pool: &SqlitePool) -> anyhow::Result<()> {
+    for (column, definition) in [
+        ("performance_metadata_version", "INTEGER NOT NULL DEFAULT 0"),
+        ("upstream_effort_status", "TEXT NOT NULL DEFAULT 'unknown'"),
+        ("upstream_effort_raw", "TEXT"),
+        ("upstream_effort_tier", "TEXT"),
+        ("request_completion", "TEXT NOT NULL DEFAULT 'unknown'"),
+        ("completion_reason", "TEXT"),
+        ("upstream_response_mode", "TEXT NOT NULL DEFAULT 'unknown'"),
+        ("performance_upstream_ms", "INTEGER"),
+        ("performance_first_chunk_ms", "INTEGER"),
+        ("performance_completed_at", "INTEGER"),
+    ] {
+        ensure_request_log_column(pool, column, definition).await?;
+    }
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_logs_performance_pair ON request_logs(provider_id, upstream_model COLLATE BINARY, request_completion, performance_completed_at, id)").execute(pool).await?;
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_logs_performance_recovery ON request_logs(performance_metadata_version, created_at, id)").execute(pool).await?;
+    Ok(())
+}
+
 async fn ensure_request_log_column(
     pool: &SqlitePool,
     column_name: &str,
@@ -903,7 +964,9 @@ CREATE TABLE IF NOT EXISTS provider_model_ratings (
         CHECK (length(CAST(upstream_model AS BLOB)) BETWEEN 1 AND 1024),
     score          INTEGER NOT NULL CHECK (typeof(score) = 'integer' AND score BETWEEN 0 AND 100),
     updated_at     TEXT NOT NULL,
-    PRIMARY KEY (provider_id, upstream_model)
+    effort         TEXT COLLATE BINARY NOT NULL DEFAULT 'common'
+        CHECK (effort IN ('common','low','medium','high','xhigh','max')),
+    PRIMARY KEY (provider_id, upstream_model, effort)
 );
 
 CREATE TABLE IF NOT EXISTS provider_protocol_endpoints (
@@ -989,7 +1052,17 @@ CREATE TABLE IF NOT EXISTS request_logs (
     cache_read_tokens         INTEGER DEFAULT 0,
     is_stream                 INTEGER DEFAULT 0,
     stream_chunks_count       INTEGER DEFAULT 0,
-    stream_first_chunk_ms     INTEGER
+    stream_first_chunk_ms     INTEGER,
+    performance_metadata_version INTEGER NOT NULL DEFAULT 0,
+    upstream_effort_status    TEXT NOT NULL DEFAULT 'unknown',
+    upstream_effort_raw       TEXT,
+    upstream_effort_tier      TEXT,
+    request_completion        TEXT NOT NULL DEFAULT 'unknown',
+    completion_reason         TEXT,
+    upstream_response_mode    TEXT NOT NULL DEFAULT 'unknown',
+    performance_upstream_ms   INTEGER,
+    performance_first_chunk_ms INTEGER,
+    performance_completed_at  INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS settings (

@@ -5,7 +5,10 @@ use axum::response::IntoResponse;
 use axum::routing::{get, post, put};
 use axum::{Extension, Json, Router};
 use nyro_core::Gateway;
-use nyro_core::admin::{CopyProviderOptions, ProviderModelRatingError, SetProviderModelRating};
+use nyro_core::admin::{
+    CopyProviderOptions, ProviderModelRatingError, SetProviderModelRating,
+    SetProviderModelRatingProfile,
+};
 use nyro_core::auth::AuthExchangeInput;
 use nyro_core::db::models::*;
 use serde::Deserialize;
@@ -79,6 +82,12 @@ pub fn create_router(gateway: Gateway, admin_token: Option<String>) -> Router {
         .route(
             "/provider-model-ratings",
             get(list_provider_model_ratings_handler),
+        )
+        .route("/provider-model-rating-profiles", get(list_provider_model_rating_profiles_handler))
+        .route("/model-performance", get(model_performance_handler))
+        .route(
+            "/providers/:id/model-rating-profile",
+            get(get_provider_model_rating_profile_handler).put(set_provider_model_rating_profile_handler),
         )
         .route(
             "/providers/:id/model-rating",
@@ -398,6 +407,77 @@ async fn list_provider_model_ratings_handler(
     {
         Ok(ratings) => Json(serde_json::json!({ "data": ratings })).into_response(),
         Err(error) => rating_error(error),
+    }
+}
+
+async fn list_provider_model_rating_profiles_handler(
+    State(gw): State<Gateway>,
+    query: Result<Query<ProviderRatingListQuery>, axum::extract::rejection::QueryRejection>,
+) -> axum::response::Response {
+    let Query(query) = match query {
+        Ok(query) => query,
+        Err(error) => return rating_bad_request(error.body_text()),
+    };
+    match gw.admin().list_provider_model_rating_profiles(query.provider_id.as_deref()).await {
+        Ok(profiles) => Json(serde_json::json!({ "data": profiles })).into_response(),
+        Err(error) => rating_error(error),
+    }
+}
+
+async fn get_provider_model_rating_profile_handler(
+    State(gw): State<Gateway>,
+    Path(id): Path<String>,
+    query: Result<Query<ProviderModelQuery>, axum::extract::rejection::QueryRejection>,
+) -> axum::response::Response {
+    let Query(query) = match query {
+        Ok(query) => query,
+        Err(error) => return rating_bad_request(error.body_text()),
+    };
+    match gw.admin().get_provider_model_rating_profile(&id, &query.model).await {
+        Ok(profile) => Json(serde_json::json!({ "data": profile })).into_response(),
+        Err(error) => rating_error(error),
+    }
+}
+
+async fn set_provider_model_rating_profile_handler(
+    State(gw): State<Gateway>,
+    Path(id): Path<String>,
+    query: Result<Query<ProviderModelQuery>, axum::extract::rejection::QueryRejection>,
+    input: Result<Json<SetProviderModelRatingProfile>, axum::extract::rejection::JsonRejection>,
+) -> axum::response::Response {
+    let Query(query) = match query {
+        Ok(query) => query,
+        Err(error) => return rating_bad_request(error.body_text()),
+    };
+    let Json(input) = match input {
+        Ok(input) => input,
+        Err(error) => return rating_bad_request(error.body_text()),
+    };
+    match gw.admin().set_provider_model_rating_profile(&id, &query.model, input).await {
+        Ok(profile) => Json(serde_json::json!({ "data": profile })).into_response(),
+        Err(error) => rating_error(error),
+    }
+}
+
+async fn model_performance_handler(
+    State(gw): State<Gateway>,
+    query: Result<Query<ProviderRatingListQuery>, axum::extract::rejection::QueryRejection>,
+) -> axum::response::Response {
+    let Query(query) = match query {
+        Ok(query) => query,
+        Err(error) => return rating_bad_request(error.body_text()),
+    };
+    match gw.admin().get_model_performance(query.provider_id.as_deref()).await {
+        Ok(performance) => Json(serde_json::json!({ "data": performance })).into_response(),
+        Err(error) => {
+            if error.downcast_ref::<ProviderModelRatingError>().is_some() {
+                return rating_error(error);
+            }
+            tracing::error!(error = %error, "model performance query failed");
+            (StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": "Model performance statistics could not be loaded" })))
+                .into_response()
+        }
     }
 }
 

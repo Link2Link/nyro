@@ -44,13 +44,14 @@ impl AdminService {
                     .or_default()
                     .push(ExportProviderModelRating {
                         upstream_model: rating.upstream_model,
+                        effort: rating.effort,
                         score: rating.score,
                         updated_at: rating.updated_at,
                     });
             }
         }
         for ratings in ratings_by_provider.values_mut() {
-            ratings.sort_by(|a, b| a.upstream_model.cmp(&b.upstream_model));
+            ratings.sort_by(|a, b| a.upstream_model.cmp(&b.upstream_model).then_with(|| a.effort.cmp(&b.effort)));
         }
 
         Ok(ExportData {
@@ -202,6 +203,7 @@ impl AdminService {
                     .map(|rating| ProviderModelRating {
                         provider_id: created.id.clone(),
                         upstream_model: rating.upstream_model.clone(),
+                        effort: rating.effort.clone(),
                         score: rating.score,
                         // Already validated before any mutations; retain the
                         // original instant in the canonical UTC millisecond form.
