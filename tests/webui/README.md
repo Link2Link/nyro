@@ -112,10 +112,10 @@ Coverage:
   Invalid latest samples are not refilled from older valid calls. Zero score is
   valid; missing TPS is not zero. Fewer than three valid samples are hollow points.
 - Exact SVG coordinates retain full backend precision while user-visible TPS uses
-  one decimal. X starts at 0 and rounds the highest visible plotted score up to the
-  next multiple of 10 (minimum ceiling 10, maximum 100; no points uses 100).
-  Search filtering to max 51 gives 60, provider filtering to 73 gives 80, and clearing
-  filters restores the full-data ceiling 100. Exact multiples stay unchanged.
+  one decimal. X rounds the lowest visible plotted score down and the highest up to
+  ten-point ticks (within 0–100, at least a 10-point single-score span; no points uses
+  the full range). Search filtering to scores 50–51 gives 50–60, provider filtering
+  to 73 gives 70–80, and clearing filters restores the full-data 0–100 range.
   Y defaults to 0–100 with 50-unit expansion only above 100; fixture maximum 225
   deliberately keeps the expanded ceiling at 250.
   Model names appear directly; exact overlaps list every model without jitter.
@@ -129,6 +129,50 @@ Coverage:
   HTTP 500 remain unknown/unavailable, never invented zero; refresh recovers.
 - No browser path requests per-model usage, model catalogs or benchmarks. All seed,
   API comparison, fault injection and browser work stays inside fresh local fixtures.
+
+### Visible-model convex capability–speed envelope
+
+The performance smoke also verifies the **upper-right convex envelope**, not every
+Pareto-optimal model. Its independent oracle enumerates negative-slope supporting
+lines over deterministic coordinates; it neither imports the frontend hull helper
+nor trusts the SVG membership metadata as its expected result.
+
+- The unchanged real SQLite/API fixture has a single dominating model at `(100,225)`:
+  it has a tooltip membership badge but **no envelope line**. All original latest-ten,
+  exact `/model-usage` parity, one-decimal TPS, and auto-X-domain checks still run.
+- After those baseline and failure/recovery checks, CDP substitutes geometry-only
+  `/model-performance` snapshots using the real response shape and local providers.
+  Explicit fixtures cover A `(40,200)`, B `(60,120)`, C `(90,100)` (only A/C are on the
+  envelope, even though B is nondominated), a genuine convex bend, same-score fastest
+  and same-TPS strongest ties, identical coordinates across every exact model key,
+  negative-slope collinear members, singleton/empty data, score zero, full-precision
+  TPS, and missing/error models excluded from the boundary. One/two-sample hollow
+  models remain eligible; sample-count warnings and actual scores/TPS do not change.
+- Actual SVG vertices must map through the **shared visible X minimum/maximum and Y
+  scale**, lie at real boundary coordinates, and cover all supporting corners. The
+  line is one dashed, unfilled, pointer-transparent **open polyline**, with no closing
+  polygon, axis connections, or horizontal/vertical tails. Collinear members may be
+  rendered as vertices or lie on the same straight segment, but all retain membership.
+- Every plotted model's tooltip is opened by its stable point ID and checked for the
+  exact `data-point-key` badge only when it belongs to the independent expected
+  boundary, including coincident models. EN/ZH badge text, low-sample warnings and
+  one-decimal TPS are verified. Hover/focus never moves actual points.
+- Text/provider filters recompute the boundary locally: removing C promotes B,
+  single-result/no-result filters remove the line, and clearing filters restores it.
+  Raw scores, TPS and IDs stay unchanged while X/Y rescale. Zoom and input-order
+  reversal cannot alter underlying SVG geometry or membership; no extra snapshot
+  requests are made merely for filtering.
+- Long horizontal/vertical lines are classified rather than banning SVG `line`
+  elements: only the two plot-edge **axis lines** may span the plot; short ticks,
+  numeric labels, localized axis titles and point-anchored model-label leaders remain.
+  Leaders are explicitly exempt from gridline detection.
+
+`report.json` adds `envelopeScenarios` with the injected snapshots, explicit boundary
+keys, actual SVG geometry and axes. Screenshots include convex-vs-Pareto, true bend,
+tie/duplicate, collinear, filter-recomputed and Chinese badge evidence. The smoke
+restores the real snapshot and compares all backend model statistics with the
+original response: geometry injection never changes stored scores/logs or API TPS
+semantics. All work remains inside the disposable server/browser lifecycle above.
 
 These scripts do not replace Rust lifecycle fault tests, SQL backend conformance,
 import/export tests, or Tauri IPC execution tests.

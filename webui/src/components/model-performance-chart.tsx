@@ -1,7 +1,7 @@
 import { useEffect, useId, useMemo, useRef, useState } from "react";
 import {
-  buildPerformanceHitIndex, groupPerformancePoints, layoutPerformanceLabels, PERFORMANCE_CHART,
-  performanceTpsMaximum, performanceScoreMaximum, type PerformancePoint,
+  buildPerformanceEnvelope, buildPerformanceHitIndex, groupPerformancePoints, layoutPerformanceLabels, PERFORMANCE_CHART,
+  performanceTpsMaximum, performanceScoreDomain, pointCoordinates, type PerformancePoint,
 } from "@/lib/model-performance";
 import { createPortal } from "react-dom";
 import { formatLocalDateTime, formatTps } from "@/lib/format";
@@ -17,14 +17,21 @@ export function ModelPerformanceChart({ points, isZh }: { points: PerformancePoi
   useEffect(() => () => { if (closeTimer.current) clearTimeout(closeTimer.current); }, []);
   const tooltipId = useId();
   const yMax = performanceTpsMaximum(points);
-  const xMax = performanceScoreMaximum(points);
-  const groups = useMemo(() => groupPerformancePoints(points, yMax, xMax), [points, yMax, xMax]);
+  const xDomain = useMemo(() => performanceScoreDomain(points), [points]);
+  const groups = useMemo(() => groupPerformancePoints(points, yMax, xDomain), [points, yMax, xDomain]);
+  const envelope = useMemo(() => buildPerformanceEnvelope(points), [points]);
+  const envelopePath = envelope.nodes.map((node) => {
+    const { x, y } = pointCoordinates(node, yMax, xDomain);
+    return `${x},${y}`;
+  }).join(" ");
+  const envelopeLabel = isZh ? "当前可见模型的能力–速度包络线" : "Capability–speed envelope of visible models";
+  const membershipLabel = isZh ? "位于当前可见模型的包络线" : "On the visible-model envelope";
   const labels = useMemo(() => layoutPerformanceLabels(groups), [groups]);
   const hit = useMemo(() => buildPerformanceHitIndex(groups), [groups]);
   const details = points.filter((point) => active.includes(point.key));
   const hiddenLabels = groups.filter((group) => !labels.has(group.key)).length;
   const { width, height, left, right, top, bottom } = PERFORMANCE_CHART;
-  const title = (point: PerformancePoint) => `${point.model} · ${point.providerName} · ${point.score}/100 · ${formatTps(point.tps)}`;
+  const title = (point: PerformancePoint) => `${point.model} · ${point.providerName} · ${point.score}/100 · ${formatTps(point.tps)}${envelope.memberKeys.has(point.key) ? ` · ${membershipLabel}` : ""}`;
   const show = (x: number, y: number, element: SVGGElement) => {
     cancelClose();
     const rect = element.getBoundingClientRect();
@@ -43,24 +50,36 @@ export function ModelPerformanceChart({ points, isZh }: { points: PerformancePoi
           </select>
         </label>
         <span>{isZh ? "空心：有效样本少于 3；悬停、聚焦或轻触模型查看详情，Esc 关闭" : "Hollow: fewer than 3 valid samples. Hover, focus or tap a model for details; Escape dismisses."}</span>
+        <span className="inline-flex items-center gap-2" data-testid="performance-envelope-legend">
+          <svg width="28" height="10" aria-hidden="true"><line x1="0" x2="28" y1="5" y2="5" stroke="#475569" strokeWidth="2" strokeDasharray="6 4" /></svg>
+          {envelopeLabel}
+        </span>
+        <span className="w-full text-slate-500">{isZh ? "虚线仅表示当前观测值的外边界，线段中间不代表实际模型，也不保证性能稳定性。" : "The dashed line marks the boundary of current observations. Segment interiors are not actual models or a guarantee of stable performance."}</span>
       </div>
       <div className="overflow-auto" tabIndex={0} role="region" aria-label={isZh ? "能力与速度散点图，可滚动" : "Capability and speed scatter plot, scrollable"}>
         <svg viewBox={`0 0 ${width} ${height}`} style={{ width: `${zoom * 100}%`, minWidth: 660 * zoom, height: "auto" }}
-          data-testid="performance-chart" data-x-min={0} data-x-max={xMax} data-y-max={yMax}
+          data-testid="performance-chart" data-x-min={xDomain.min} data-x-max={xDomain.max} data-y-max={yMax}
+          data-envelope-member-keys={JSON.stringify([...envelope.memberKeys])}
           data-plot-left={left} data-plot-right={right} data-plot-top={top} data-plot-bottom={bottom}
-          aria-label={isZh ? `评分 0–${xMax} 与平均 TPS，图上显示模型名称` : `Score 0–${xMax} versus average TPS, labeled by model name`}
+          aria-label={isZh ? `评分 ${xDomain.min}–${xDomain.max} 与平均 TPS，图上显示模型名称` : `Score ${xDomain.min}–${xDomain.max} versus average TPS, labeled by model name`}
           onClick={(event) => { if (!(event.target as Element).closest('[role="button"]')) setActive([]); }}>
-          <title>{isZh ? "固定实际坐标的性能图" : "Performance at actual, fixed coordinates"}</title>
-          {Array.from({ length: xMax / 10 + 1 }, (_, index) => index * 10).map((tick) => {
-            const x = left + (right - left) * tick / xMax;
-            return <g key={tick}><line x1={x} x2={x} y1={top} y2={bottom} stroke="#e2e8f0" strokeDasharray="3 3" /><text x={x} y={bottom + 23} textAnchor="middle" fontSize={11} fill="#64748b">{tick}</text></g>;
+          <title>{isZh ? "按当前可见评分自动缩放的性能图" : "Performance chart automatically scaled to visible scores"}</title>
+          <line data-testid="performance-axis" x1={left} x2={right} y1={bottom} y2={bottom} stroke="#94a3b8" vectorEffect="non-scaling-stroke" />
+          <line data-testid="performance-axis" x1={left} x2={left} y1={top} y2={bottom} stroke="#94a3b8" vectorEffect="non-scaling-stroke" />
+          {Array.from({ length: (xDomain.max - xDomain.min) / 10 + 1 }, (_, index) => xDomain.min + index * 10).map((tick) => {
+            const x = left + (right - left) * (tick - xDomain.min) / (xDomain.max - xDomain.min);
+            return <g key={tick}><line data-testid="performance-tick" x1={x} x2={x} y1={bottom} y2={bottom + 4} stroke="#94a3b8" vectorEffect="non-scaling-stroke" /><text x={x} y={bottom + 23} textAnchor="middle" fontSize={11} fill="#64748b">{tick}</text></g>;
           })}
           {Array.from({ length: 6 }, (_, index) => {
             const y = bottom - (bottom - top) * index / 5;
-            return <g key={index}><line x1={left} x2={right} y1={y} y2={y} stroke="#e2e8f0" strokeDasharray="3 3" /><text x={left - 12} y={y + 4} textAnchor="end" fontSize={11} fill="#64748b">{new Intl.NumberFormat("en", { maximumFractionDigits: 1 }).format(yMax * index / 5)}</text></g>;
+            return <g key={index}><line data-testid="performance-tick" x1={left - 4} x2={left} y1={y} y2={y} stroke="#94a3b8" vectorEffect="non-scaling-stroke" /><text x={left - 12} y={y + 4} textAnchor="end" fontSize={11} fill="#64748b">{new Intl.NumberFormat("en", { maximumFractionDigits: 1 }).format(yMax * index / 5)}</text></g>;
           })}
-          <text x={(left + right) / 2} y={height - 14} textAnchor="middle" fontSize={12} fill="#64748b">{isZh ? "能力评分（满分 100）" : "Capability score (out of 100)"}</text>
+          <text x={(left + right) / 2} y={height - 14} textAnchor="middle" fontSize={12} fill="#64748b">{isZh ? `能力评分（${xDomain.min}–${xDomain.max}，满分 100）` : `Capability score (${xDomain.min}–${xDomain.max}, out of 100)`}</text>
           <text transform={`translate(16 ${(top + bottom) / 2}) rotate(-90)`} textAnchor="middle" fontSize={12} fill="#64748b">TPS (tok/s)</text>
+          {envelope.nodes.length >= 2 && <polyline data-testid="performance-envelope" points={envelopePath}
+            data-member-keys={JSON.stringify([...envelope.memberKeys])}
+            fill="none" stroke="#475569" strokeWidth={2} strokeDasharray="6 4"
+            vectorEffect="non-scaling-stroke" pointerEvents="none" aria-label={envelopeLabel} />}
           {groups.map((group) => {
             const label = labels.get(group.key), first = group.points[0];
             const selected = group.points.some((point) => active.includes(point.key));
@@ -74,7 +93,7 @@ export function ModelPerformanceChart({ points, isZh }: { points: PerformancePoi
               onClick={(event) => show(group.x, group.y, event.currentTarget)} onKeyDown={(event) => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); show(group.x, group.y, event.currentTarget); } }}>
               <title>{group.points.map(title).join("\n")}</title>
               {label && <g data-testid="performance-label" data-point-ids={group.points.map((p) => p.pointId).join(",")}>
-                <line x1={group.x} y1={group.y} x2={label.x + label.width / 2} y2={label.y + label.height / 2} stroke={first.color} strokeOpacity={0.4} />
+                <line data-testid="performance-label-leader" x1={group.x} y1={group.y} x2={label.x + label.width / 2} y2={label.y + label.height / 2} stroke={first.color} strokeOpacity={0.4} />
                 <rect x={label.x} y={label.y} width={label.width} height={label.height} rx={3} fill="white" stroke={selected ? first.color : "#e2e8f0"} />
                 <text x={label.x + 8} y={label.y + 16} fontSize={11} fontWeight={600} fill={first.color}>
                   {label.lines.map((line, index) => <tspan key={index} x={label.x + 8} dy={index ? 15 : 0}>{line}</tspan>)}
@@ -98,6 +117,8 @@ export function ModelPerformanceChart({ points, isZh }: { points: PerformancePoi
           <strong className="block whitespace-pre-wrap break-all" style={{ color: point.color }}>{point.model}</strong>
           <span className="block break-all">{point.providerName} · {point.providerId}</span>
           <span className="block font-semibold">{point.score}/100 · {formatTps(point.tps)}</span>
+          {envelope.memberKeys.has(point.key) && <span data-testid="performance-envelope-member" data-point-key={point.key}
+            className="block font-medium text-slate-600">{membershipLabel}</span>}
           <span className="block">{isZh ? `有效 TPS ${point.validTpsCount} / 已选请求 ${point.selectedRequestCount}` : `Valid TPS ${point.validTpsCount} / selected requests ${point.selectedRequestCount}`}</span>
           {point.validTpsCount < 3 && <span className="block text-amber-700">{isZh ? "低样本量" : "Low sample count"}</span>}
           <span className="block">{isZh ? "样本起始" : "First sample"}: {formatLocalDateTime(point.firstSampleAt)}</span>

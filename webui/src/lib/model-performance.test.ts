@@ -1,9 +1,9 @@
 import { deepEqual, equal, ok, throws } from "node:assert/strict";
 import { test } from "node:test";
 import {
-  buildPerformanceRows, buildPerformanceHitIndex, filterPerformanceRows, groupPerformancePoints,
+  buildPerformanceRows, buildPerformanceHitIndex, buildPerformanceEnvelope, filterPerformanceRows, groupPerformancePoints,
   layoutPerformanceLabels, PERFORMANCE_CHART, performanceColor, performancePoints,
-  performanceTpsMaximum, performanceScoreMaximum, pointCoordinates, readPerformanceResponse, visiblePerformanceSelection,
+  performanceTpsMaximum, performanceScoreDomain, performanceScoreMaximum, pointCoordinates, readPerformanceResponse, visiblePerformanceSelection,
   type ModelPerformance, type PerformancePoint, type PerformanceResponse, type PerformanceStats,
 } from "./model-performance";
 import type { Provider, ProviderModelRating } from "./types";
@@ -96,6 +96,69 @@ test("full snapshot IDs are assigned before search/provider filters and independ
   equal(selected.length, 1); equal(selected[0].pointId, "P02");
   equal(filterPerformanceRows(rows, "P02", null).length, 0);
 });
+test("envelope handles empty, single, dominating and two trade-off points", () => {
+  deepEqual(buildPerformanceEnvelope([]).nodes, []);
+  const a = point("a", 40, 200), b = point("b", 90, 100), dominant = point("d", 100, 250);
+  deepEqual(buildPerformanceEnvelope([a]).nodes.map((n) => n.memberKeys), [["a"]]);
+  deepEqual(buildPerformanceEnvelope([a, b]).nodes.map((n) => [n.score, n.tps]), [[40, 200], [90, 100]]);
+  deepEqual([...buildPerformanceEnvelope([a, b, dominant]).memberKeys], ["d"]);
+});
+test("envelope skips Pareto dents but retains outer bends and collinear members", () => {
+  const a = point("a", 40, 200), c = point("c", 90, 100);
+  deepEqual(buildPerformanceEnvelope([a, point("dent", 60, 120), c]).nodes.map((n) => n.memberKeys), [["a"], ["c"]]);
+  deepEqual(buildPerformanceEnvelope([a, point("bend", 60, 180), c]).nodes.map((n) => n.memberKeys), [["a"], ["bend"], ["c"]]);
+  deepEqual(buildPerformanceEnvelope([a, point("on-line", 60, 160), c]).nodes.map((n) => n.memberKeys), [["a"], ["on-line"], ["c"]]);
+});
+test("envelope tie handling preserves every exact duplicate but no dominated horizontal/vertical edges", () => {
+  const points = [point("slower", 40, 180), point("a", 40, 200), point("weaker", 30, 200),
+    point("b", 90, 100), point("copy-b", 90, 100), point("slower-b", 90, 80)];
+  const result = buildPerformanceEnvelope(points);
+  deepEqual(result.nodes.map((n) => [n.score, n.tps]), [[40, 200], [90, 100]]);
+  deepEqual([...result.memberKeys].sort(), ["a", "b", "copy-b"]);
+  deepEqual([...buildPerformanceEnvelope([point("a", 40, 10), point("b", 40, 20)]).memberKeys], ["b"]);
+  deepEqual([...buildPerformanceEnvelope([point("a", 40, 20), point("b", 50, 20)]).memberKeys], ["b"]);
+});
+test("envelope uses raw TPS, includes hollow points, is deterministic and never mutates input", () => {
+  const points = [point("a", 40, 200), { ...point("b", 90, 100.01), validTpsCount: 1 }, point("slower", 90, 100)];
+  const before = JSON.stringify(points), result = buildPerformanceEnvelope(points);
+  deepEqual([...result.memberKeys], ["a", "b"]);
+  deepEqual(buildPerformanceEnvelope([...points].reverse()), result);
+  equal(JSON.stringify(points), before);
+  // This is measurably below the line, not a tolerance based on displayed decimal digits.
+  ok(!buildPerformanceEnvelope([points[0], point("dent", 60, 160 - 1e-9), point("end", 90, 100)]).memberKeys.has("dent"));
+  const decimal = buildPerformanceEnvelope([point("a", 0, 0.3), point("b", 50, 0.2), point("c", 100, 0.1)]);
+  ok(decimal.memberKeys.has("b"), "floating arithmetic must retain collinear decimal evidence");
+});
+test("envelope recomputes on visible valid data and projects with the existing adaptive axes", () => {
+  const a = point("a", 40, 200), b = point("b", 60, 120), c = point("c", 90, 100);
+  const points = [a, b, c];
+  ok(!buildPerformanceEnvelope(points).memberKeys.has("b"));
+  ok(buildPerformanceEnvelope(points.filter((p) => p !== c)).memberKeys.has("b"));
+  const invalid = [{ ...point("bad", 100, 999), status: "missing" as const, tps: null }];
+  equal(performancePoints([...points, ...invalid]).length, 3);
+  const domain = performanceScoreDomain(points), yMax = performanceTpsMaximum(points);
+  for (const node of buildPerformanceEnvelope(points).nodes) {
+    const original = points.find((p) => p.key === node.memberKeys[0])!;
+    deepEqual(pointCoordinates(node, yMax, domain), pointCoordinates(original, yMax, domain));
+  }
+});
+test("every envelope supporting segment has all input points at or below it", () => {
+  let seed = 42;
+  const next = () => { seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0; return seed; };
+  for (let sample = 0; sample < 40; sample++) {
+    const points = Array.from({ length: 50 }, (_, i) => point(String(i), next() % 101, 1 + next() % 10000));
+    const { nodes } = buildPerformanceEnvelope(points);
+    for (let i = 1; i < nodes.length; i++) {
+      const a = nodes[i - 1], b = nodes[i];
+      ok(b.score > a.score && b.tps < a.tps);
+      for (const p of points) {
+        const cross = (b.score - a.score) * (p.tps - a.tps) - (b.tps - a.tps) * (p.score - a.score);
+        ok(cross <= 1e-7, `point ${p.key} lies above supporting segment`);
+      }
+    }
+  }
+});
+
 test("Y ceiling defaults to100; above100 expand in50 multiples with headroom", () => {
   for (const max of [0, 0.01, 99.99, 100]) equal(performanceTpsMaximum([{ tps: max }]), 100);
   for (const [max, expected] of [[100.01, 150], [149, 150], [150, 200], [199, 200], [200, 250], [225, 250], [250, 300], [1000, 1050]]) equal(performanceTpsMaximum([{ tps: max }]), expected);
@@ -105,21 +168,25 @@ test("Y ceiling defaults to100; above100 expand in50 multiples with headroom", (
   const filtered = performancePoints(filterPerformanceRows(rows, "01", null));
   equal(performanceTpsMaximum(filtered), 100); equal(filtered[0].pointId, "P01");
 });
-test("X ceiling follows visible scores with ten-point ticks and a safe empty/zero domain", () => {
-  equal(performanceScoreMaximum([]), 100);
-  for (const [score, max] of [[0, 10], [1, 10], [10, 10], [11, 20], [53, 60], [60, 60], [78, 80], [99, 100], [100, 100]]) {
-    equal(performanceScoreMaximum([{ score }]), max);
-  }
+test("X domain snaps to visible minimum and maximum score ticks", () => {
+  deepEqual(performanceScoreDomain([]), { min: 0, max: 100 });
+  for (const [score, domain] of [
+    [0, { min: 0, max: 10 }], [1, { min: 0, max: 10 }], [10, { min: 10, max: 20 }],
+    [11, { min: 10, max: 20 }], [53, { min: 50, max: 60 }], [60, { min: 60, max: 70 }],
+    [78, { min: 70, max: 80 }], [99, { min: 90, max: 100 }], [100, { min: 90, max: 100 }],
+  ] as const) deepEqual(performanceScoreDomain([{ score }]), domain);
   const points = [point("01", 53, 50), point("02", 78, 80)];
+  deepEqual(performanceScoreDomain(points), { min: 50, max: 80 });
   equal(performanceScoreMaximum(points), 80);
   const filtered = performancePoints(filterPerformanceRows(points, "01", null));
-  const max = performanceScoreMaximum(filtered);
-  equal(max, 60);
-  const groups = groupPerformancePoints(filtered, 100, max);
-  equal(groups[0].x, PERFORMANCE_CHART.left + (PERFORMANCE_CHART.right - PERFORMANCE_CHART.left) * 53 / 60);
+  const domain = performanceScoreDomain(filtered);
+  deepEqual(domain, { min: 50, max: 60 });
+  const groups = groupPerformancePoints(filtered, 100, domain);
+  equal(groups[0].x, PERFORMANCE_CHART.left + (PERFORMANCE_CHART.right - PERFORMANCE_CHART.left) * 3 / 10);
   equal(groups[0].points[0].score, 53);
   equal(groups[0].points[0].pointId, "P01");
-  equal(pointCoordinates(point("03", 60, 50), 100, 60).x, PERFORMANCE_CHART.right);
+  equal(pointCoordinates(point("03", 60, 50), 100, domain).x, PERFORMANCE_CHART.right);
+  equal(pointCoordinates(point("04", 50, 50), 100, domain).x, PERFORMANCE_CHART.left);
 });
 test("scores0/100 and TPS ceiling keep full circles inside SVG viewport", () => {
   for (const p of [point("01", 0, 0.01), point("02", 100, 200)]) {

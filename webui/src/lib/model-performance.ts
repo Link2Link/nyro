@@ -116,29 +116,122 @@ export function performancePoints(rows: PerformanceRow[]): PerformancePoint[] {
     && row.score !== null && Number.isInteger(row.score) && row.score >= 0 && row.score <= 100
   )).map((row) => ({ ...row, color: performanceColor(row.providerId) }));
 }
+export interface PerformanceEnvelopeNode {
+  score: number;
+  tps: number;
+  memberKeys: string[];
+}
+export interface PerformanceEnvelope {
+  nodes: PerformanceEnvelopeNode[];
+  memberKeys: Set<string>;
+}
+
+/**
+ * Upper-right convex envelope in score/TPS space, not the full Pareto frontier.
+ * All visible valid points participate, including low-sample points. Preserve
+ * collinear boundary members and all identities at an exactly coincident point.
+ * Work on copies; neither display rounding nor the viewport changes membership.
+ */
+export function buildPerformanceEnvelope(points: PerformancePoint[]): PerformanceEnvelope {
+  const positions = new Map<string, PerformanceEnvelopeNode>();
+  for (const point of points) {
+    if (!Number.isInteger(point.score) || point.score < 0 || point.score > 100
+      || !Number.isFinite(point.tps) || point.tps <= 0 || point.status !== "ready") continue;
+    const positionKey = JSON.stringify([point.score, point.tps]);
+    const existing = positions.get(positionKey);
+    if (existing) existing.memberKeys.push(point.key);
+    else positions.set(positionKey, { score: point.score, tps: point.tps, memberKeys: [point.key] });
+  }
+  const sorted = [...positions.values()].sort((a, b) => b.score - a.score || b.tps - a.tps);
+  for (const node of sorted) node.memberKeys.sort();
+
+  // A weaker score at the same TPS (or slower TPS at the same score) is dominated.
+  const candidates: PerformanceEnvelopeNode[] = [];
+  let lastScore: number | undefined;
+  let fastest = -Infinity;
+  for (const node of sorted) {
+    if (node.score === lastScore) continue;
+    lastScore = node.score;
+    if (node.tps <= fastest) continue;
+    candidates.push(node);
+    fastest = node.tps;
+  }
+  candidates.reverse();
+
+  const nodes: PerformanceEnvelopeNode[] = [];
+  for (const node of candidates) {
+    while (nodes.length >= 2) {
+      const a = nodes[nodes.length - 2], b = nodes[nodes.length - 1];
+      // Normalize only the cross-product arithmetic to avoid overflow. This is
+      // a positive affine scaling, never rounding the underlying TPS or scores.
+      const scale = Math.max(a.tps, b.tps, node.tps);
+      const left = (b.score - a.score) * ((node.tps - a.tps) / scale);
+      const right = ((b.tps - a.tps) / scale) * (node.score - a.score);
+      const tolerance = 8 * Number.EPSILON * (Math.abs(left) + Math.abs(right));
+      // Positive turn = inward dent below the A–C supporting segment.
+      if (left - right <= tolerance) break;
+      nodes.pop();
+    }
+    nodes.push(node);
+  }
+  return { nodes, memberKeys: new Set(nodes.flatMap((node) => node.memberKeys)) };
+}
+
 export function performanceTpsMaximum(points: Pick<PerformancePoint, "tps">[]): number {
   const max = points.reduce((value, point) => Math.max(value, point.tps), 0);
   return max <= 100 ? 100 : (Math.floor(max / 50) + 1) * 50;
 }
-/** Keep a zero baseline and round the visible maximum to a readable score boundary. */
+export interface PerformanceScoreDomain {
+  min: number;
+  max: number;
+}
+
+/**
+ * Fit the horizontal score range to visible points, snapping outwards to ten-point
+ * ticks. A single score retains at least a 10-point span; an empty plot retains the
+ * full 0–100 reference scale. Scores themselves are never transformed.
+ */
+export function performanceScoreDomain(points: Pick<PerformancePoint, "score">[]): PerformanceScoreDomain {
+  if (!points.length) return { min: 0, max: 100 };
+  const minimum = points.reduce((value, point) => Math.min(value, point.score), 100);
+  const maximum = points.reduce((value, point) => Math.max(value, point.score), 0);
+  let min = Math.max(0, Math.floor(minimum / 10) * 10);
+  let max = Math.min(100, Math.ceil(maximum / 10) * 10);
+  if (max === min) {
+    if (max < 100) max = Math.min(100, max + 10);
+    else min = Math.max(0, min - 10);
+  }
+  return { min, max };
+}
+/** @deprecated Use performanceScoreDomain so lower and upper bounds move together. */
 export function performanceScoreMaximum(points: Pick<PerformancePoint, "score">[]): number {
-  if (!points.length) return 100;
-  const max = points.reduce((value, point) => Math.max(value, point.score), 0);
-  return Math.min(100, Math.max(10, Math.ceil(max / 10) * 10));
+  return performanceScoreDomain(points).max;
 }
 export const PERFORMANCE_CHART = { width: 800, height: 500, left: 66, right: 766, top: 28, bottom: 440 };
-export function pointCoordinates(point: Pick<PerformancePoint, "score" | "tps">, yMax: number, xMax = 100) {
+export function pointCoordinates(
+  point: Pick<PerformancePoint, "score" | "tps">,
+  yMax: number,
+  xDomain: PerformanceScoreDomain = { min: 0, max: 100 },
+) {
   const { left, right, top, bottom } = PERFORMANCE_CHART;
-  return { x: left + (right - left) * point.score / xMax, y: bottom - (bottom - top) * point.tps / yMax };
+  const span = xDomain.max - xDomain.min;
+  return {
+    x: left + (right - left) * (point.score - xDomain.min) / span,
+    y: bottom - (bottom - top) * point.tps / yMax,
+  };
 }
 export interface PerformanceGroup { key: string; points: PerformancePoint[]; x: number; y: number }
-export function groupPerformancePoints(points: PerformancePoint[], yMax: number, xMax = 100): PerformanceGroup[] {
+export function groupPerformancePoints(
+  points: PerformancePoint[],
+  yMax: number,
+  xDomain: PerformanceScoreDomain = { min: 0, max: 100 },
+): PerformanceGroup[] {
   const groups = new Map<string, PerformanceGroup>();
   for (const point of points) {
     const key = JSON.stringify([point.score, point.tps]);
     const group = groups.get(key);
     if (group) group.points.push(point);
-    else groups.set(key, { key, points: [point], ...pointCoordinates(point, yMax, xMax) });
+    else groups.set(key, { key, points: [point], ...pointCoordinates(point, yMax, xDomain) });
   }
   return [...groups.values()];
 }

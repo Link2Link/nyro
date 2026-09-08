@@ -80,7 +80,7 @@ assert.ok(chrome, 'Set CHROME_BIN to an executable Chromium binary');
 const scratch = await mkdtemp(join(tmpdir(), 'nyro-performance-smoke-'));
 const children = [];
 const report = { scratch, binary, webui, chrome, checks: [], screenshots: [], apiCalls: [], injected: [], upstreamCalls: [], consoleErrors: [], runtimeErrors: [], networkErrors: [], expectedNetworkErrors: [], browserWarnings: [], childLogs: {}, success: false };
-let trap, cdp, sessionId, base, faultMode = null;
+let trap, cdp, sessionId, base, faultMode = null, envelopeSnapshot = null;
 const childEnv = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('NYRO_') && !/^(http|https|all|no)_proxy$/i.test(key)));
 const trackChild = (name, command, args) => {
   const child = spawn(command, args, { cwd: root, env: childEnv, stdio: ['ignore', 'pipe', 'pipe'] });
@@ -166,7 +166,10 @@ async function chartState() {
     const attrs=el=>el ? Object.fromEntries([...el.attributes].filter(a=>a.name.startsWith('data-')).map(a=>[a.name,a.value])) : {};
     const points=[...document.querySelectorAll('[data-testid="performance-point"]')].map(el=>({ids:el.dataset.pointIds.split(','),members:Number(el.dataset.memberCount),score:Number(el.dataset.score),tps:Number(el.dataset.tps),x:el.cx.baseVal.value,y:el.cy.baseVal.value,fill:el.getAttribute('fill'),pressed:el.parentElement.getAttribute('aria-pressed'),opacity:Number(el.parentElement.style.opacity)}));
     const rows=[...document.querySelectorAll('[data-testid="performance-index-row"]')].map(el=>({id:el.dataset.pointId,text:el.innerText,pressed:el.getAttribute('aria-pressed'),opacity:Number(el.style.opacity)}));
-    return {points,rows,busy:Boolean(document.querySelector('button[aria-label="Refresh performance"],button[aria-label="刷新性能数据"]')?.disabled),counts:attrs(summary),axis:attrs(chart),summary:summary?.innerText,labels:[...document.querySelectorAll('[data-testid="performance-label"] text')].map(el=>el.textContent),body:document.body.innerText};
+    const lines=[...(chart?.querySelectorAll('line')??[])].map(el=>({testid:el.dataset.testid,leader:Boolean(el.closest('[data-testid="performance-label"]')),x1:el.x1.baseVal.value,x2:el.x2.baseVal.value,y1:el.y1.baseVal.value,y2:el.y2.baseVal.value,stroke:getComputedStyle(el).stroke}));
+    const envelopes=[...(chart?.querySelectorAll('[data-testid="performance-envelope"]')??[])].map(el=>({tag:el.tagName,points:Array.from({length:el.points?.numberOfItems??0},(_,index)=>{const p=el.points.getItem(index);return {x:p.x,y:p.y}}),fill:getComputedStyle(el).fill,stroke:getComputedStyle(el).stroke,dash:getComputedStyle(el).strokeDasharray,pointerEvents:getComputedStyle(el).pointerEvents,attrs:attrs(el)}));
+    const axisTexts=[...(chart?.querySelectorAll('text')??[])].filter(el=>!el.closest('[data-testid="performance-label"]')).map(el=>({text:el.textContent,x:Number(el.getAttribute('x')),y:Number(el.getAttribute('y'))}));
+    return {points,rows,lines,envelopes,axisTexts,polygons:chart?.querySelectorAll('polygon').length??0,busy:Boolean(document.querySelector('button[aria-label="Refresh performance"],button[aria-label="刷新性能数据"]')?.disabled),counts:attrs(summary),axis:attrs(chart),summary:summary?.innerText,labels:[...document.querySelectorAll('[data-testid="performance-label"] text')].map(el=>el.textContent),body:document.body.innerText};
   })()`);
 }
 async function ready({ plotted = 10, missing = 2, errors = 0 } = {}) {
@@ -175,23 +178,23 @@ async function ready({ plotted = 10, missing = 2, errors = 0 } = {}) {
     return state.points.reduce((n,p)=>n+p.members,0)===plotted && Number(state.counts['data-plotted-count'])===plotted && Number(state.counts['data-missing-count'])===missing && Number(state.counts['data-error-count'])===errors && !state.busy ? state : false;
   }, `settled chart: ${plotted} plotted, ${missing} missing, ${errors} errors`);
 }
-function assertAxes(state, yMax, xMax = 100) {
+function assertAxes(state, yMax, xMin, xMax) {
   const a=state.axis;
-  assert.equal(Number(a['data-x-min']),0); assert.equal(Number(a['data-x-max']),xMax); assert.equal(Number(a['data-y-max']),yMax);
+  assert.equal(Number(a['data-x-min']),xMin); assert.equal(Number(a['data-x-max']),xMax); assert.equal(Number(a['data-y-max']),yMax);
   const left=Number(a['data-plot-left']),right=Number(a['data-plot-right']),top=Number(a['data-plot-top']),bottom=Number(a['data-plot-bottom']);
   for(const point of state.points){
-    assert.ok(Math.abs(point.x-(left+point.score/xMax*(right-left)))<1e-4, 'Actual SVG X uses score and visible adaptive ceiling, never jitter/centroid');
+    assert.ok(Math.abs(point.x-(left+(point.score-xMin)/(xMax-xMin)*(right-left)))<1e-4, 'Actual SVG X uses visible minimum/maximum score ticks, never jitter/centroid');
     assert.ok(Math.abs(point.y-(bottom-point.tps/yMax*(bottom-top)))<1e-4, 'Actual SVG Y equals exact backend TPS');
   }
 }
 function expectedRows(snapshot, pairs) {
   return snapshot.models.map(model => {
     const pair=pairs.find(p=>p.provider.id===model.rating.provider_id && p.model===model.rating.upstream_model);
-    return {pair,score:model.rating.score,stats:model.mixed,key:JSON.stringify([pair.provider.id,pair.model])};
+    return {pair,score:model.rating.score,stats:model.mixed,status:model.status,key:JSON.stringify([pair.provider.id,pair.model])};
   }).sort((a,b)=>a.key<b.key?-1:a.key>b.key?1:0).map((row,i)=>({...row,id:`P${String(i+1).padStart(2,'0')}`}));
 }
 function assertPoints(state, rows) {
-  const plotted=rows.filter(row=>row.score!==null && row.stats.average_tps!==null && row.stats.valid_tps_count>0);
+  const plotted=rows.filter(row=>row.status==='ready' && row.score!==null && row.stats.average_tps!==null && row.stats.valid_tps_count>0);
   assert.equal(state.rows.length,0,'No permanent numbered index');
   assert.deepEqual(state.points.flatMap(point=>point.ids).sort(),plotted.map(row=>row.id).sort());
   for(const row of plotted){
@@ -202,6 +205,117 @@ function assertPoints(state, rows) {
   assert.ok(state.labels.length>0 && state.labels.every(label=>!/^P\d+( ×\d+)?$/.test(label)), 'SVG labels contain models, not IDs');
   assert.ok(!/\bP\d{2}\b/.test(state.body),'No visible point IDs in page or diagnostics');
   assert.ok(state.points.every(point=>point.members===point.ids.length));
+}
+
+const sameCoordinate = (a,b) => Math.abs(a.x-b.x)<1e-3 && Math.abs(a.y-b.y)<1e-3;
+const plottedRows = rows => rows.filter(row=>row.status==='ready' && Number.isInteger(row.score) && row.score>=0 && row.score<=100 && Number.isFinite(row.stats.average_tps) && row.stats.average_tps>0 && row.stats.valid_tps_count>0);
+
+/** Independent small-fixture oracle: enumerate upper supporting lines, not the UI's hull algorithm. */
+function expectedEnvelope(rows) {
+  const groups = new Map();
+  for(const row of plottedRows(rows)) {
+    const x=row.score,y=row.stats.average_tps,key=JSON.stringify([x,y]);
+    if(!groups.has(key)) groups.set(key,{x,y,keys:[]});
+    groups.get(key).keys.push(row.key);
+  }
+  const coordinates=[...groups.values()];
+  const candidates=coordinates.filter(p=>!coordinates.some(q=>(q.x>p.x || q.y>p.y) && q.x>=p.x && q.y>=p.y));
+  const supported=new Set();
+  if(candidates.length===1) supported.add(candidates[0]);
+  for(const a of candidates) for(const b of candidates) {
+    if(a.x>=b.x || a.y<=b.y) continue;
+    // For left-to-right negative-slope segments, every input lies on/below an upper supporting line.
+    const cross=p=>(b.x-a.x)*(p.y-a.y)-(b.y-a.y)*(p.x-a.x);
+    if(coordinates.every(p=>cross(p)<=1e-8)) {
+      for(const p of candidates) if(Math.abs(cross(p))<1e-8 && p.x>=a.x && p.x<=b.x) supported.add(p);
+    }
+  }
+  const nodes=[...supported].sort((a,b)=>a.x-b.x);
+  return {nodes,keys:nodes.flatMap(node=>node.keys).sort()};
+}
+function assertChartScaffolding(state, isZh=false) {
+  const a=state.axis,left=Number(a['data-plot-left']),right=Number(a['data-plot-right']),top=Number(a['data-plot-top']),bottom=Number(a['data-plot-bottom']);
+  const axes=state.lines.filter(line=>line.testid==='performance-axis');
+  assert.equal(axes.length,2,'Keep exactly the X and Y axis lines');
+  for(const [start,end] of [[{x:left,y:bottom},{x:right,y:bottom}],[{x:left,y:top},{x:left,y:bottom}]]) {
+    assert.ok(axes.some(line=>(sameCoordinate({x:line.x1,y:line.y1},start) && sameCoordinate({x:line.x2,y:line.y2},end)) || (sameCoordinate({x:line.x2,y:line.y2},start) && sameCoordinate({x:line.x1,y:line.y1},end))),'Axes span the plot edges, not interior grid positions');
+  }
+  const ticks=state.lines.filter(line=>line.testid==='performance-tick');
+  const xMin=Number(a['data-x-min']),xMax=Number(a['data-x-max']),yMax=Number(a['data-y-max']);
+  assert.ok(ticks.length>=(xMax-xMin)/10+1+6,'Both axes retain short ticks');
+  for(const line of [...axes,...ticks]) assert.ok(line.stroke && line.stroke!=='none','Axis/tick strokes are visible');
+  for(const tick of ticks) {
+    const length=Math.hypot(tick.x2-tick.x1,tick.y2-tick.y1);
+    assert.ok(length>0 && length<=12,'Ticks are short, not replacement gridlines');
+    assert.ok((tick.x1===tick.x2 && (Math.abs(tick.y1-bottom)<1e-3 || Math.abs(tick.y2-bottom)<1e-3)) || (tick.y1===tick.y2 && (Math.abs(tick.x1-left)<1e-3 || Math.abs(tick.x2-left)<1e-3)),'Ticks attach only to axes');
+  }
+  for(const line of state.lines) {
+    const longHorizontal=Math.abs(line.y2-line.y1)<1e-3 && Math.abs(line.x2-line.x1)>(right-left)/2;
+    const longVertical=Math.abs(line.x2-line.x1)<1e-3 && Math.abs(line.y2-line.y1)>(bottom-top)/2;
+    if(!line.leader && (longHorizontal || longVertical)) assert.equal(line.testid,'performance-axis','No long horizontal/vertical gridlines; model-label leaders are intentionally permitted');
+  }
+  const leaders=state.lines.filter(line=>line.leader);
+  assert.equal(leaders.length,state.labels.length,'Every placed model label retains its leader line');
+  for(const leader of leaders) assert.ok(state.points.some(p=>sameCoordinate(p,{x:leader.x1,y:leader.y1}) || sameCoordinate(p,{x:leader.x2,y:leader.y2})),'Label leaders remain anchored at actual data points');
+  for(let score=xMin;score<=xMax;score+=10) {
+    const x=left+(score-xMin)/(xMax-xMin)*(right-left);
+    assert.ok(state.axisTexts.some(t=>Number(t.text)===score && Math.abs(t.x-x)<1e-3 && t.y>bottom),'Keep X numeric tick labels at shared-scale positions');
+  }
+  for(let index=0;index<=5;index++) {
+    const value=yMax*index/5,y=bottom-(bottom-top)*index/5;
+    assert.ok(state.axisTexts.some(t=>Number(t.text)===value && t.x<left && Math.abs(t.y-y)<=8),'Keep Y numeric tick labels');
+  }
+  assert.ok(state.axisTexts.some(t=>t.text.includes(isZh?'能力评分':'Capability score')),'Keep localized X axis title');
+  assert.ok(state.axisTexts.some(t=>t.text==='TPS (tok/s)'),'Keep TPS axis title');
+  assert.equal(state.polygons,0,'The upper-right envelope must never become a closed polygon');
+}
+function assertEnvelope(state, rows, isZh=false) {
+  assertChartScaffolding(state,isZh);
+  const expected=expectedEnvelope(rows),a=state.axis;
+  const declared=a['data-envelope-member-keys'];
+  if(declared!==undefined) assert.deepEqual(JSON.parse(declared).sort(),expected.keys,'Chart membership matches independent supporting-line oracle');
+  assert.equal(state.envelopes.length,expected.nodes.length>=2?1:0,'Empty/single-coordinate boundary has membership but no line');
+  if(expected.nodes.length<2) return expected;
+  const line=state.envelopes[0];
+  assert.equal(line.tag,'polyline','Use one open SVG polyline, never a closed path/polygon');
+  assert.equal(line.fill,'none'); assert.equal(line.pointerEvents,'none');
+  assert.ok(line.stroke && line.stroke!=='none' && line.stroke!=='rgba(0, 0, 0, 0)','Envelope stroke remains visible');
+  assert.ok(line.dash!=='none' && line.dash.split(/[ ,]+/).some(n=>parseFloat(n)>0),'Envelope is dashed');
+  if(line.attrs['data-member-keys']!==undefined) assert.deepEqual(JSON.parse(line.attrs['data-member-keys']).sort(),expected.keys,'Polyline metadata includes every exact boundary key');
+  const left=Number(a['data-plot-left']),right=Number(a['data-plot-right']),top=Number(a['data-plot-top']),bottom=Number(a['data-plot-bottom']);
+  const mapped=expected.nodes.map(p=>({x:left+(p.x-Number(a['data-x-min']))/(Number(a['data-x-max'])-Number(a['data-x-min']))*(right-left),y:bottom-p.y/Number(a['data-y-max'])*(bottom-top)}));
+  assert.ok(line.points.length>=2);
+  assert.ok(sameCoordinate(line.points[0],mapped[0]) && sameCoordinate(line.points.at(-1),mapped.at(-1)),'Polyline ends at fastest/strongest boundary models, with no axis connections or closing segment');
+  for(const [index,point] of line.points.entries()) {
+    assert.ok(mapped.some(p=>sameCoordinate(p,point)),'Every polyline vertex maps a real supporting-boundary coordinate using shared X min/max and Y scale');
+    if(index) assert.ok(point.x>line.points[index-1].x && point.y>line.points[index-1].y,'Open upper-right polyline is score-increasing/TPS-decreasing, with no horizontal/vertical tails');
+  }
+  // Collinear members may be retained as vertices or lie on one unsplit straight segment.
+  for(const point of mapped) assert.ok(line.points.slice(1).some((b,i)=>{
+    const a=line.points[i],t=(point.x-a.x)/(b.x-a.x);
+    return t>=-1e-6 && t<=1+1e-6 && Math.abs(point.y-(a.y+t*(b.y-a.y)))<1e-3;
+  }),'Every supporting coordinate lies on the rendered line, including true corners and collinear members');
+  return expected;
+}
+async function assertEnvelopeTooltips(state, rows, isZh=false) {
+  const expected=expectedEnvelope(rows),seen=new Set();
+  for(const point of state.points) {
+    await evaluate(`document.activeElement?.blur(); (${circleExpression(point.ids[0])}).scrollIntoView({block:'center'}); (${circleExpression(point.ids[0])}).parentElement.focus()`);
+    await key('Enter');
+    const details=await waitFor(()=>evaluate(`(()=>{const tip=document.querySelector('[role="tooltip"]');if(!tip)return null;const rows=[...tip.querySelectorAll('[data-point-id]')].map(el=>({id:el.dataset.pointId,text:el.innerText,badges:[...el.querySelectorAll('[data-testid="performance-envelope-member"]')].map(b=>({key:b.dataset.pointKey,text:b.textContent}))}));return rows.some(r=>r.id===${literal(point.ids[0])})?rows:null})()`),'Envelope tooltip for actual point ID');
+    for(const detail of details) {
+      const row=rows.find(row=>row.id===detail.id); assert.ok(row,'Tooltip IDs refer to visible snapshot rows'); seen.add(row.key);
+      assert.ok(detail.text.includes(`${row.score}/100`) && detail.text.includes(`${row.stats.average_tps.toFixed(1)} tok/s`),'Envelope membership never changes score/TPS or one-decimal tooltip display');
+      const member=expected.keys.includes(row.key);
+      assert.equal(detail.badges.length,member?1:0,'Badge appears only within each boundary model, not all Pareto or all coincident-hit models');
+      if(member) {assert.equal(detail.badges[0].key,row.key);assert.equal(detail.badges[0].text,isZh?'位于当前可见模型的包络线':'On the visible-model envelope');}
+      if(row.stats.valid_tps_count<3) assert.ok(detail.text.includes(isZh?'低样本量':'Low sample count'),'Low-sample membership keeps the sample warning');
+    }
+    await key('Escape');
+  }
+  assert.deepEqual([...seen].sort(),plottedRows(rows).map(row=>row.key).sort(),'Every plotted model, including identical-coordinate keys, received a tooltip membership check');
+  const stable=points=>points.map(({opacity,pressed,...point})=>point);
+  assert.deepEqual(stable((await chartState()).points),stable(state.points),'Boundary hover/focus does not move any actual point or alter raw TPS');
 }
 
 // Python only opens the one existing SQLite DB discovered INSIDE this run's fresh data dir.
@@ -382,7 +496,7 @@ try {
     const fail=faultMode==='snapshot' && isTarget;
     const injected=Boolean(faultMode && isTarget);
     if(fail) expectedFailureUrls.set(params.request.url,(expectedFailureUrls.get(params.request.url)??0)+1);
-    const payload=structuredClone(snapshot);
+    const payload=structuredClone(faultMode?.startsWith('envelope:') ? envelopeSnapshot : snapshot);
     const targetModel=payload.models.find(model=>model.rating.provider_id===pairs[1].provider.id && model.rating.upstream_model===pairs[1].model);
     if(faultMode==='partial'){targetModel.status='error';targetModel.error='Injected profile statistics failure';}
     if(['negative','zero','string','null','infinity'].includes(faultMode)) targetModel.mixed.average_tps=faultMode==='negative'?-5:faultMode==='zero'?0:faultMode==='string'?'NaN':null;
@@ -402,7 +516,7 @@ try {
   let state=await ready();
   const nav=await evaluate(`[...document.querySelectorAll('aside nav a')].map(el=>el.getAttribute('href'))`);
   assert.deepEqual(nav.slice(nav.indexOf('/stats'),nav.indexOf('/stats')+3),['/stats','/performance','/extensions']);
-  assertPoints(state,expected); assertAxes(state,250);
+  assertPoints(state,expected); assertAxes(state,250,0,100);
   assert.equal(report.apiCalls.filter(call=>call.path==='/api/v1/model-performance').length,1,'One batch snapshot on initial navigation');
   assert.ok(!await evaluate(`document.querySelector('aside[aria-label="Complete numbered index"]')!==null`));
   assert.ok(!state.body.includes(unrated.model));
@@ -416,6 +530,14 @@ try {
   assert.ok(!await evaluate(`document.querySelector('[aria-label="Filter by tier"]')!==null`),'No effort selector');
   check('batch snapshot, single provider/model scores, legacy-valid mixed TPS, one-decimal display, one-sample hollow, model labels and actual coordinates');
   await screenshot('performance-en-desktop');
+  const baselineEnvelope=assertEnvelope(state,expected);
+  assert.deepEqual(baselineEnvelope.keys,[expected.find(row=>row.pair===pairs[1]).key],'Real fixture has one dominating (100,225) boundary model, not a multi-point line');
+  await assertEnvelopeTooltips(state,expected);
+  const dominant=expected.find(row=>row.pair===pairs[1]);
+  await evaluate(`(${circleExpression(dominant.id)}).parentElement.focus()`); await key('Enter');
+  await waitFor(()=>evaluate(`Boolean(document.querySelector('[data-testid="performance-envelope-member"]'))`),'Dominating point retains its boundary badge without a line');
+  await screenshot('performance-en-dominant-envelope-tooltip',{preserveFocus:true}); await key('Escape');
+  check('real-data singleton envelope membership; no gridlines, retained axes, short ticks, numeric titles and model-label leaders');
   const miniMax=expected.find(row=>row.pair===pairs[10]);
   await evaluate(`(${circleExpression(miniMax.id)}).scrollIntoView({block:'center'}); (${circleExpression(miniMax.id)}).parentElement.focus()`); await key('Enter');
   await waitFor(()=>evaluate(`document.querySelector('[role="tooltip"]')?.innerText.includes('106.6 tok/s')`),'MiniMax unknown-completion tooltip uses one decimal');
@@ -455,23 +577,27 @@ try {
   check('direct model labels, all overlapping names, complete hover/focus details, Enter/Space and Escape, no permanent index');
 
   await fill('input[aria-label="Search providers or models"]','overlap');
-  state=await ready({plotted:3,missing:0}); assertAxes(state,100,60);
+  state=await ready({plotted:3,missing:0}); assertAxes(state,100,50,60);
   assertPoints(state,expected.filter(row=>row.pair.model.includes('overlap')));
-  await fill('input[aria-label="Search providers or models"]',''); state=await ready(); assertAxes(state,250,100);
+  assertEnvelope(state,expected.filter(row=>row.pair.model.includes('overlap')));
+  await fill('input[aria-label="Search providers or models"]',''); state=await ready(); assertAxes(state,250,0,100);
   await select('Filter by provider',disabled.name);
-  state=await ready({plotted:1,missing:0}); assertPoints(state,expected.filter(row=>row.pair.provider===disabled)); assertAxes(state,100,80);
-  await select('Filter by provider','All providers'); state=await ready(); assertAxes(state,250,100);
+  state=await ready({plotted:1,missing:0}); assertPoints(state,expected.filter(row=>row.pair.provider===disabled)); assertAxes(state,100,70,80);
+  assertEnvelope(state,expected.filter(row=>row.pair.provider===disabled));
+  await select('Filter by provider','All providers'); state=await ready(); assertAxes(state,250,0,100);
   const beforeZoom=(await chartState()).points.map(({opacity,pressed,...point})=>point);
   await evaluate(`(() => {const el=document.querySelector('select');el.value='2';el.dispatchEvent(new Event('change',{bubbles:true}))})()`);
   assert.deepEqual((await chartState()).points.map(({opacity,pressed,...point})=>point),beforeZoom,'Zoom cannot change actual SVG coordinate, membership or IDs');
   await evaluate(`(() => {const el=document.querySelector('select');el.value='1';el.dispatchEvent(new Event('change',{bubbles:true}))})()`);
-  check('IDs stable across filters and zoom; X adapts to overlap max51→60 and disabled max73→80, restores100; Y default100 and225→250');
+  check('IDs stable across filters and zoom; X adapts to visible overlap 50–60 and disabled 70–80, restores0–100; Y default100 and225→250');
 
   await clickExpression(`document.querySelector('button[title="切换到中文"]')`);
   await waitFor(() => evaluate(`document.querySelector('h1')?.textContent === '性能'`), 'Chinese locale');
   const chineseState = await ready();
   assert.ok(chineseState.summary.includes('无有效 TPS'), 'Chinese omission summary');
   assert.ok(!chineseState.body.includes('不可信历史'),'No Chinese untrusted-history warning for legacy-valid samples');
+  assertEnvelope(chineseState,expected,true);
+  await assertEnvelopeTooltips(chineseState,expected,true);
   await screenshot('performance-zh-desktop');
   await send('Emulation.setDeviceMetricsOverride', { width: 390, height: 844, deviceScaleFactor: 1, mobile: true });
   await waitFor(() => evaluate(`document.querySelector('main').getBoundingClientRect().width >= 220`), 'usable mobile main content width');
@@ -512,6 +638,102 @@ try {
   state=await chartState(); assert.equal(state.points.length,0); assert.ok(state.body.includes('Unknown does not mean unrated'));
   faultMode=null; await refresh(); await ready();
   check('partial model failure preserves others; invalid batch, null TPS and warm/cold HTTP500 distinguish unknown and recover');
+
+  // Geometry-only CDP snapshots reuse the real response contract and known local providers.
+  // They never alter the persisted ratings/logs or the exact baseline API parity assertions.
+  const fixturePair=(model,score,tps,samples=1,provider=alpha,status='ready')=>({provider,model,score,tps,samples,status});
+  const convex=[fixturePair('envelope-convex/keep-A',40,200),fixturePair('envelope-convex/keep-B',60,120,2),fixturePair('envelope-convex/C',90,100,3,beta)];
+  const scenarios=[
+    {name:'convex-not-all-pareto',pairs:convex,boundary:[0,2],axes:[250,40,90]},
+    {name:'convex-bend',pairs:[...convex,fixturePair('envelope-convex/D',70,190,1,beta)],boundary:[0,3,2],axes:[250,40,90]},
+    {name:'same-x-same-y-duplicates',pairs:[
+      fixturePair('envelope-ties/fastest',50,200),fixturePair('envelope-ties/fastest-copy',50,200,3,beta),
+      fixturePair('envelope-ties/same-x-slower',50,170),fixturePair('envelope-ties/same-y-weaker',40,200),
+      fixturePair('envelope-ties/strongest',90,100),fixturePair('envelope-ties/strongest-copy',90,100,2,beta),
+      fixturePair('envelope-ties/same-y-weaker-right',70,100),fixturePair('envelope-ties/interior',70,130),
+    ],boundary:[0,1,4,5],axes:[250,40,90]},
+    {name:'collinear-all-members',pairs:[
+      fixturePair('envelope-collinear/A',40,200),fixturePair('envelope-collinear/B',60,160,2),
+      fixturePair('envelope-collinear/C',90,100,3),fixturePair('envelope-collinear/B-copy',60,160,1,beta),
+    ],boundary:[0,1,2,3],axes:[250,40,90]},
+    {name:'same-score-fastest-only',pairs:[
+      fixturePair('envelope-same-score/slower',55,10),fixturePair('envelope-same-score/fastest',55,50),fixturePair('envelope-same-score/fastest-copy',55,50,2,beta),
+    ],boundary:[1,2],axes:[100,50,60]},
+    {name:'same-tps-strongest-only',pairs:[
+      fixturePair('envelope-same-tps/weaker',40,80),fixturePair('envelope-same-tps/middle',60,80),
+      fixturePair('envelope-same-tps/strongest',90,80),fixturePair('envelope-same-tps/strongest-copy',90,80,2,beta),
+    ],boundary:[2,3],axes:[100,40,90]},
+    {name:'singleton-high-score',pairs:[fixturePair('envelope-single/only',100,125,2)],boundary:[0],axes:[150,90,100]},
+    {name:'missing-error-excluded',pairs:[...convex,fixturePair('envelope-excluded/missing-dominant',100,null,0),fixturePair('envelope-excluded/error-dominant',100,999,1,beta,'error')],boundary:[0,2],axes:[250,40,90]},
+    {name:'unrounded-coordinates',pairs:[fixturePair('envelope-precision/A',43,200.123456),fixturePair('envelope-precision/B',67,110.987654,2),fixturePair('envelope-precision/C',87,100.123456,3,beta)],boundary:[0,2],axes:[250,40,90]},
+    {name:'zero-score-valid',pairs:[fixturePair('envelope-zero/A',0,80),fixturePair('envelope-zero/B',25,25,2,beta)],boundary:[0,1],axes:[100,0,30]},
+    {name:'empty',pairs:[],boundary:[],axes:[100,0,100]},
+  ];
+  report.envelopeScenarios=[];
+  for(const scenario of scenarios) {
+    envelopeSnapshot={...structuredClone(snapshot),models:scenario.pairs.map(pair=>({
+      ...structuredClone(snapshot.models[0]),rating:{...snapshot.models[0].rating,provider_id:pair.provider.id,upstream_model:pair.model,score:pair.score},
+      mixed:{selected_request_count:pair.samples,valid_tps_count:pair.samples,average_tps:pair.tps,first_sample_at:pair.samples?snapshot.as_of-1000:null,last_sample_at:pair.samples?snapshot.as_of:null},
+      unclassified_count:0,untrusted_count:0,status:pair.status,...(pair.status==='error'?{error:'Injected geometry-only statistics failure'}:{}),
+    }))};
+    faultMode=`envelope:${scenario.name}`;
+    await reload();
+    const rows=expectedRows(envelopeSnapshot,scenario.pairs),plotted=plottedRows(rows).length;
+    const missing=rows.filter(row=>row.status==='ready' && row.stats.average_tps===null).length,errors=rows.filter(row=>row.status==='error').length;
+    state=await ready({plotted,missing,errors});
+    if(plotted) assertPoints(state,rows);
+    assertAxes(state,...scenario.axes);
+    const envelope=assertEnvelope(state,rows);
+    assert.deepEqual(envelope.keys,scenario.boundary.map(index=>JSON.stringify([scenario.pairs[index].provider.id,scenario.pairs[index].model])).sort(),'Independent supporting-line oracle also agrees with the explicit deterministic scenario membership');
+    await assertEnvelopeTooltips(state,rows);
+    const evidence={name:scenario.name,snapshot:structuredClone(envelopeSnapshot),expectedBoundaryKeys:envelope.keys,svg:state.envelopes,axes:state.axis,points:state.points};
+    report.envelopeScenarios.push(evidence);
+    if(['convex-not-all-pareto','convex-bend','same-x-same-y-duplicates','collinear-all-members','empty'].includes(scenario.name)) await screenshot(`performance-envelope-${scenario.name}`);
+    if(scenario.name==='convex-not-all-pareto') {
+      const b=rows.find(row=>row.pair===convex[1]);
+      assert.ok(!envelope.keys.includes(b.key),'B(60,120) is nondominated but below the A(40,200)–C(90,100) convex segment');
+      const values=rows=>plottedRows(rows).map(row=>({id:row.id,score:row.score,tps:row.stats.average_tps})).sort((a,b)=>a.id.localeCompare(b.id));
+      const originalValues=values(rows),beforeFilterCalls=report.apiCalls.filter(call=>call.path==='/api/v1/model-performance').length;
+      await fill('input[aria-label="Search providers or models"]','keep-');
+      const kept=rows.filter(row=>row.pair.model.includes('keep-'));
+      state=await ready({plotted:2,missing:0});assertPoints(state,kept);assertAxes(state,250,40,60);
+      assert.deepEqual(assertEnvelope(state,kept).keys,kept.map(row=>row.key).sort(),'Removing C promotes previously interior B onto the recomputed visible envelope');
+      await assertEnvelopeTooltips(state,kept);await screenshot('performance-envelope-search-recomputed');
+      await fill('input[aria-label="Search providers or models"]','keep-B');
+      state=await ready({plotted:1,missing:0});assertAxes(state,150,60,70);assertEnvelope(state,[b]);await assertEnvelopeTooltips(state,[b]);
+      await fill('input[aria-label="Search providers or models"]','no-envelope-model-matches');
+      state=await ready({plotted:0,missing:0});assertAxes(state,100,0,100);assertEnvelope(state,[]);
+      await fill('input[aria-label="Search providers or models"]','');
+      state=await ready({plotted:3,missing:0});assertAxes(state,250,40,90);assertEnvelope(state,rows);
+      await select('Filter by provider',alpha.name);
+      state=await ready({plotted:2,missing:0});assertAxes(state,250,40,60);assertEnvelope(state,kept);await assertEnvelopeTooltips(state,kept);
+      await select('Filter by provider','All providers');
+      state=await ready({plotted:3,missing:0});assertAxes(state,250,40,90);assertEnvelope(state,rows);
+      assert.deepEqual(state.points.flatMap(p=>p.ids.map(id=>({id,score:p.score,tps:p.tps}))).sort((a,b)=>a.id.localeCompare(b.id)),originalValues,'Filtering rescales axes but never changes scores, raw TPS, or stable point IDs');
+      assert.equal(report.apiCalls.filter(call=>call.path==='/api/v1/model-performance').length,beforeFilterCalls,'Text/provider envelope recomputation is local, with no extra performance API requests');
+      const beforeZoom=structuredClone(state.envelopes);
+      await evaluate(`(()=>{const el=document.querySelector('select');el.value='2';el.dispatchEvent(new Event('change',{bubbles:true}))})()`);
+      assert.deepEqual((await chartState()).envelopes,beforeZoom,'Zoom cannot move or change the underlying SVG envelope');
+      await evaluate(`(()=>{const el=document.querySelector('select');el.value='1';el.dispatchEvent(new Event('change',{bubbles:true}))})()`);
+      await clickExpression(`document.querySelector('button[title="切换到中文"]')`);
+      await waitFor(()=>evaluate(`document.querySelector('h1')?.textContent==='性能'`),'Chinese envelope locale');
+      state=await ready({plotted:3,missing:0});assertEnvelope(state,rows,true);await assertEnvelopeTooltips(state,rows,true);
+      const a=rows.find(row=>row.pair===convex[0]);
+      await evaluate(`(${circleExpression(a.id)}).parentElement.focus()`);await key('Enter');
+      await waitFor(()=>evaluate(`document.querySelector('[data-testid="performance-envelope-member"]')?.textContent==='位于当前可见模型的包络线'`),'Chinese low-sample envelope membership badge');
+      await screenshot('performance-envelope-zh-tooltip',{preserveFocus:true});await key('Escape');
+      await clickExpression(`document.querySelector('button[title="Switch to English"]')`);
+      await waitFor(()=>evaluate(`document.querySelector('h1')?.textContent==='Performance'`),'English envelope locale restored');
+      envelopeSnapshot.models.reverse();await reload();state=await ready({plotted:3,missing:0});
+      assertPoints(state,rows);assertEnvelope(state,rows);
+      assert.deepEqual(state.envelopes,beforeZoom,'Snapshot input ordering does not alter hull geometry or sorted exact-key membership');
+    }
+    check(`envelope ${scenario.name}`,`${envelope.keys.length} model members; ${state.envelopes.length} open line`);
+  }
+  faultMode=null;envelopeSnapshot=null;await reload();state=await ready();assertPoints(state,expected);assertAxes(state,250,0,100);assertEnvelope(state,expected);
+  const finalSnapshot=await api('/model-performance');
+  assert.deepEqual(finalSnapshot.models,snapshot.models,'Geometry snapshots/filters never mutate real ratings, raw logs, API membership or TPS semantics');
+  check('independent convex-support oracle, exact SVG scaling, EN/ZH per-key badges, low samples, filtered recomputation and restored real backend snapshot');
 
   assert.ok(report.apiCalls.every(call=>!call.path.endsWith('/model-usage') && !/\/providers\/[^/]+\/(models|test|benchmark)$/.test(call.path)),'No legacy usage, catalog or benchmark queries in any browser path');
   assert.deepEqual(report.upstreamCalls, [], 'Chart must never call real upstream, including model catalogs');

@@ -126,11 +126,12 @@ rolls back the new supplier rather than succeeding without scores.
 
 The **Performance** page (`/performance`) displays one point per rated exact
 provider/model pair: its comprehensive score on X and mixed average TPS on Y.
-Scores remain 0–100 values, but the X axis starts at zero and adapts its ceiling to
-only the visible plotted points: round the highest score up to a multiple of 10,
-with a minimum of 10 and maximum of 100; no points uses 100. For example, 53 → 60,
-78 → 80, and 60 → 60. Tick spacing is 10, and search/provider filters recalculate
-the scale without changing scores or point identities.
+Scores remain 0–100 values. The X axis rounds the lowest visible plotted score down
+to a multiple of 10 and the highest up to a multiple of 10, always within 0–100.
+A single point retains at least a 10-point span; no points uses the full 0–100 range.
+For example, 53–78 → 50–80, only 73 → 70–80, and only 100 → 90–100. Tick spacing
+is 10, and search/provider filters recalculate the scale without changing scores or
+point identities.
 Y defaults to 0–100; values above 100 expand its ceiling in 50-TPS steps with headroom.
 Reasoning effort is not a score dimension, filter, or point identity. The chart directly labels model names, adding supplier names when
 needed to distinguish identical models. Coincident groups list every model; labels
@@ -138,6 +139,32 @@ wrap and avoid collisions without moving actual point coordinates. Dense labels 
 cannot fit are omitted with a notice. Hover, keyboard focus, or mobile tap reveals
 score/TPS and sample details in a dismissible tooltip; no permanent side index or
 visible point IDs remain. Search and provider filters are retained.
+
+### Upper-right capability–speed envelope
+
+An open dashed line connects adjacent models on the **upper-right convex boundary**
+of the currently visible valid points. This is not the complete Pareto frontier:
+for A(40,200), B(60,120), C(90,100), the line joins A–C and skips B's inward dent.
+B remains visible as a normal model point. Search/provider filtering and refresh
+recompute the envelope; viewport scaling or display rounding never decides membership.
+
+- Include low-sample hollow points, preserving their sample warning.
+- For equal scores, retain the fastest position; for equal TPS, retain the strongest.
+  All models at exactly the same boundary coordinates share membership.
+- Preserve collinear points along the downward-sloping boundary. A model below a
+  boundary segment is not a member merely because no single model dominates it.
+- With zero points draw nothing; with one optimal position draw no line segment,
+  but show envelope membership in every corresponding model's details.
+- Uniform slate dashed strokes render below points and labels with no fill, closure,
+  axis extension, or pointer capture. Existing provider colors and hollow/solid meanings
+  stay unchanged. Details and accessible point descriptions identify envelope members.
+- Horizontal/vertical gridlines are removed. Solid left/bottom axes, short tick marks,
+  tick values, axis titles, and model-name leader lines remain.
+
+The line bounds current observations, not guaranteed performance or recommendations.
+Segment interiors do not correspond to measured models, and low-sample uncertainty
+still applies. Computation uses raw score/TPS values with machine-precision-only
+orientation tolerance, never one-decimal display values.
 
 `GET /api/v1/model-performance` (optional `provider_id`) and desktop
 `get_model_performance` return `{ as_of, window_start, models }`. Each model has
