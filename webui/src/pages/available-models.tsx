@@ -23,7 +23,7 @@ import { formatDuration, formatLocalDateTime, formatTokenCount, formatTps } from
 import { useLocale } from "@/lib/i18n";
 import { providerModelKey as modelKey, ratingDisplayState, uniqueModelIdentifiers, type RatingLoadState } from "@/lib/model-ratings";
 import { useModelRatings } from "@/lib/use-model-ratings";
-import { ModelRatingBadge, ModelRatingClearedNotice, ModelRatingEditor, ModelRatingProfileFields, ModelRatingsFeedback, type ModelRatingEditTarget } from "@/components/model-rating";
+import { ModelRatingBadge, ModelRatingClearedNotice, ModelRatingEditor, ModelRatingsFeedback, type ModelRatingEditTarget } from "@/components/model-rating";
 import {
   loadModelProbeResults,
   saveModelProbeResults,
@@ -36,7 +36,7 @@ import type {
   ModelUsageStats,
   ModelProbeResult,
   Provider,
-  ProviderModelRatingProfile,
+  ProviderModelRating,
 } from "@/lib/types";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -332,7 +332,7 @@ function ModelRow({
   model: string;
   mappings: string[];
   probe?: ModelProbeResult;
-  rating?: ProviderModelRatingProfile;
+  rating?: ProviderModelRating;
   ratingState: RatingLoadState;
   onEditRating: (target: ModelRatingEditTarget) => void;
   isZh: boolean;
@@ -399,7 +399,6 @@ function ModelRow({
       </div>
       {expanded && (
         <div id={detailId} className="border-t border-slate-200/70 bg-slate-50/70">
-          {ratingState === "ready" && rating && <div className="px-4 py-3"><ModelRatingProfileFields profile={rating} /></div>}
           <CapabilityDetail provider={provider} model={model} isZh={isZh} />
         </div>
       )}
@@ -435,7 +434,7 @@ function ProviderSection({
   mappings: Map<string, string[]>;
   probes: Map<string, ModelProbeResult>;
   probeStore: ProviderModelProbeStore;
-  ratings: Map<string, ProviderModelRatingProfile>;
+  ratings: Map<string, ProviderModelRating>;
   ratingState: RatingLoadState;
   onEditRating: (target: ModelRatingEditTarget) => void;
   isZh: boolean;

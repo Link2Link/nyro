@@ -105,19 +105,6 @@ async function api(path, method = 'GET', body) {
   return Object.hasOwn(json, 'data') ? json.data : json;
 }
 const ratingPath = (provider, model) => `/providers/${provider.id}/model-rating?model=${encodeURIComponent(model)}`;
-const profilePath = (provider, model) => `/providers/${provider.id}/model-rating-profile?model=${encodeURIComponent(model)}`;
-const tiers = ['low', 'medium', 'high', 'xhigh', 'max'];
-const profileInput = (common, overrides = {}) => ({ common, overrides: Object.fromEntries(tiers.map(tier => [tier, overrides[tier] ?? null])) });
-const commonInput = '[role="dialog"] input[type="text"]';
-async function commonEnabled(enabled) {
-  if (await evaluate(`document.querySelector('[role="dialog"] input[type="checkbox"]').checked`) !== enabled)
-    await clickExpression(`document.querySelector('[role="dialog"] input[type="checkbox"]')`);
-}
-async function override(tier, score) {
-  await clickExpression(`document.querySelector('[role="dialog"] input[id$="-${tier}"]').parentElement.querySelectorAll('input[type="radio"]')[${score === null ? 0 : 1}]`);
-  if (score !== null) await fill(`[role="dialog"] input[id$="-${tier}"]`, String(score));
-}
-const rowScore = row => Number(row[2]?.match(/(?:Common\s*)?(\d+)\s*\//)?.[1]);
 const check = (name, detail = '') => { report.checks.push({ name, detail }); console.log(`PASS ${name}${detail ? ` — ${detail}` : ''}`); };
 const send = (method, params = {}) => cdp.send(method, params, sessionId);
 async function evaluate(expression) {
@@ -205,13 +192,7 @@ try {
     const response = await fetch(`${base}/api/v1${ratingPath(alpha, 'model/zero-target')}`, { method: 'PUT', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ score: invalid }) });
     assert.ok(!response.ok, `Invalid score accepted: ${literal(invalid)}`);
   }
-  for (const invalid of [-1,101,1.5,'0']) {
-    const response=await fetch(`${base}/api/v1${profilePath(alpha,'model/zero-target')}`,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(profileInput(80,{high:invalid}))});
-    assert.ok(!response.ok,`Invalid override accepted: ${literal(invalid)}`);
-  }
-  const profiles=await api(`/provider-model-rating-profiles?provider_id=${encodeURIComponent(alpha.id)}`);
-  assert.ok(profiles.length===2 && profiles.every(profile=>profile.provider_id===alpha.id),'Provider-filtered profile list');
-  check('isolated API seed and invalid-score/profile boundaries', base);
+  check('isolated API seed and invalid-score boundaries', base);
 
   const browser = trackChild('chrome', chrome, ['--headless', '--no-sandbox', '--disable-gpu', '--disable-dev-shm-usage', '--disable-background-networking', '--no-first-run', '--no-default-browser-check', '--remote-debugging-port=0', `--user-data-dir=${join(scratch, 'chrome')}`, 'about:blank']);
   const ws = await waitFor(() => {
@@ -227,16 +208,16 @@ try {
   cdp.on('Log.entryAdded', ({ entry }) => {
     if (entry.level === 'error' && entry.source === 'network') {
       const path = entry.url ? new URL(entry.url).pathname : '';
-      const expected = faultMode === 'list' && path === '/api/v1/provider-model-rating-profiles'
-        || faultMode === 'save' && path.endsWith('/model-rating-profile')
+      const expected = faultMode === 'list' && path === '/api/v1/provider-model-ratings'
+        || faultMode === 'save' && path.endsWith('/model-rating')
         || faultMode === 'catalog' && path.includes('/providers/') && path.endsWith('/models');
       (expected ? report.expectedNetworkErrors : report.networkErrors).push(entry);
     } else if (entry.level === 'warning') report.browserWarnings.push(entry);
   });
   cdp.on('Fetch.requestPaused', (params, sid) => {
     const url = new URL(params.request.url);
-    const fail = faultMode === 'list' && url.pathname === '/api/v1/provider-model-rating-profiles'
-      || faultMode === 'save' && params.request.method === 'PUT' && url.pathname.endsWith('/model-rating-profile');
+    const fail = faultMode === 'list' && url.pathname === '/api/v1/provider-model-ratings'
+      || faultMode === 'save' && params.request.method === 'PUT' && url.pathname.endsWith('/model-rating');
     const command = fail ? cdp.send('Fetch.fulfillRequest', { requestId: params.requestId, responseCode: 503, responseHeaders: [{name:'Content-Type', value:'application/json'}], body: Buffer.from(JSON.stringify({error:'Injected smoke rating failure'})).toString('base64') }, sid)
       : cdp.send('Fetch.continueRequest', { requestId: params.requestId }, sid);
     command.catch(error => report.runtimeErrors.push({ interceptionError: error.message }));
@@ -249,24 +230,23 @@ try {
   let rows = await tableRows();
   assert.ok(rows.some(row => row[1] === 'retired/模型' && row[4].includes('Not in catalog')));
   assert.ok(rows.some(row => row[1] === 'disabled/model' && row[4].includes('Disabled')));
-  assert.deepEqual(rows.slice(0, 4).map(rowScore), [90, 85, 70, 60]);
+  assert.deepEqual(rows.slice(0, 4).map(row => Number(row[2].split('/')[0].trim())), [90, 85, 70, 60]);
   assert.ok(rows.slice(4).every(row => row[2] === 'Unrated'));
   check('flat global list, disabled/stale retention, descending sort and unrated-last');
   await screenshot('ratings-en-desktop');
 
   await openEditor(alpha.name, 'model/zero-target');
-  await commonEnabled(true);
-  await fill(commonInput, '1.5'); await button('Save');
+  await fill('[role="dialog"] input', '1.5'); await button('Save');
   await waitFor(() => evaluate(`document.querySelector('[role="dialog"] [role="alert"]')?.textContent.includes('whole number')`), 'fraction validation');
-  await fill(commonInput, '0'); await button('Save'); await waitDialogClosed();
+  await fill('[role="dialog"] input', '0'); await button('Save'); await waitDialogClosed();
   const zero = await api(ratingPath(alpha, 'model/zero-target'));
   assert.equal(zero.status, 'rated'); assert.equal(zero.score, 0);
   await send('Page.reload'); await readyRows(8);
   rows = await tableRows();
-  assert.ok(rows.some(row => row[0].startsWith(alpha.name) && row[1] === 'model/zero-target' && rowScore(row) === 0));
+  assert.ok(rows.some(row => row[0].startsWith(alpha.name) && row[1] === 'model/zero-target' && row[2].startsWith('0')));
   check('single edit, fractional validation, save zero and reload persistence');
   await select('Sort', 'Score: low to high');
-  await waitFor(async () => rowScore((await tableRows())[0] ?? []) === 0, 'ascending scores');
+  await waitFor(async () => (await tableRows())[0]?.[2].startsWith('0'), 'ascending scores');
   rows = await tableRows(); assert.ok(rows.slice(5).every(row => row[2] === 'Unrated'));
   check('ascending sort keeps unrated after zero and every scored row');
   await fill('input[placeholder="0"]', '70');
@@ -286,47 +266,18 @@ try {
   await fill('input[aria-label="Search models or providers"]', ''); await readyRows(8);
   check('range, rated/unrated, provider, and text filters');
 
-  await openEditor(alpha.name, 'model/shared'); await fill(commonInput, '91');
+  await openEditor(alpha.name, 'model/shared'); await fill('[role="dialog"] input', '91');
   faultMode = 'save'; await button('Save');
   await waitFor(() => evaluate(`document.querySelector('[role="dialog"]')?.innerText.includes('Save failed:')`), 'save failure retained in editor');
-  assert.equal(await evaluate(`document.querySelector('[role="dialog"] input[type="text"]').value`), '91');
+  assert.equal(await evaluate(`document.querySelector('[role="dialog"] input').value`), '91');
   assert.equal((await api(ratingPath(alpha, 'model/shared'))).score, 85);
   await screenshot('ratings-save-error');
   faultMode = null; await button('Save'); await waitDialogClosed();
   assert.equal((await api(ratingPath(beta, 'model/shared'))).score, 60);
   check('failed save keeps draft and persisted value; provider scores independent');
 
-  // A saved override equal to common still forces per-effort mode; zero is not null.
-  await openEditor(alpha.name, 'model/zero-target');
-  await fill(commonInput, '80'); await override('high', 80); await override('max', 0);
-  await button('Save'); await waitDialogClosed();
-  let profile = await api(profilePath(alpha, 'model/zero-target'));
-  assert.equal(profile.display_mode, 'per_effort');
-  assert.equal(profile.effective.low.score, 80); assert.equal(profile.effective.low.source, 'common');
-  assert.equal(profile.effective.high.score, 80); assert.equal(profile.effective.high.source, 'override');
-  assert.equal(profile.effective.max.score, 0);
-  await select('Score dimension', 'Max');
-  await waitFor(async()=> (await tableRows())[0]?.[1]==='model/zero-target' && (await tableRows())[0]?.[0].startsWith(alpha.name), 'max dimension sort uses override zero rather than common eighty');
-  await select('Score dimension', 'Common');
-  await openEditor(alpha.name, 'model/zero-target'); await commonEnabled(false);
-  await button('Save'); await waitDialogClosed();
-  profile = await api(profilePath(alpha, 'model/zero-target'));
-  assert.equal(profile.common, null); assert.equal(profile.effective.low.source, 'unrated');
-  assert.equal(profile.effective.high.score, 80); assert.equal(profile.effective.max.score, 0);
-  assert.equal((await api(ratingPath(alpha, 'model/zero-target'))).score, null, 'Legacy GET exposes common only');
-  await openEditor(alpha.name, 'model/zero-target');
-  await override('high', null); await override('max', null); await button('Save');
-  await waitFor(() => evaluate(`document.body.innerText.includes('Clear the whole rating profile?')`), 'all-null Save requests confirmation');
-  await button('Confirm clear'); await waitDialogClosed();
-  profile = await api(profilePath(alpha, 'model/zero-target'));
-  assert.ok(tiers.every(tier => profile.effective[tier].status === 'unrated'));
-  assert.equal(profile.common, null);
-  check('atomic effort profile, equal override mode, fallback, override zero, common-only legacy GET, all-null Save clears');
-  await api(profilePath(alpha, 'model/zero-target'), 'PUT', profileInput(80, { high: 90, max: 0 }));
-  await button('Refresh ratings');
-  await waitFor(async () => (await tableRows()).some(row=>row[1]==='model/zero-target' && row[0].startsWith(alpha.name) && row[2].includes('2 overrides')), 'refreshed profile is visible before reopening draft');
-  await openEditor(alpha.name, 'model/zero-target'); await button('Clear whole profile');
-  await waitFor(() => evaluate(`document.body.innerText.includes('Clear the whole rating profile?')`), 'clear confirmation');
+  await openEditor(alpha.name, 'model/zero-target'); await button('Clear rating');
+  await waitFor(() => evaluate(`document.body.innerText.includes('Clear this rating?')`), 'clear confirmation');
   await button('Confirm clear'); await waitDialogClosed();
   const cleared = await api(ratingPath(alpha, 'model/zero-target'));
   assert.equal(cleared.status, 'unrated'); assert.equal(cleared.score, null);
@@ -336,8 +287,8 @@ try {
   await waitFor(() => evaluate(`Boolean(document.querySelector('[aria-label="Edit rating"]'))`), 'existing catalog edit action');
   await aria('Edit rating');
   await waitFor(() => evaluate(`Boolean(document.querySelector('[role="dialog"] input'))`), 'existing-page editor');
-  assert.equal(await evaluate(`document.querySelector('[role="dialog"] input[type="text"]').value`), '91');
-  await fill(commonInput, '0'); await button('Save'); await waitDialogClosed();
+  assert.equal(await evaluate(`document.querySelector('[role="dialog"] input').value`), '91');
+  await fill('[role="dialog"] input', '0'); await button('Save'); await waitDialogClosed();
   assert.equal((await api(ratingPath(alpha, 'model/shared'))).score, 0);
   assert.equal((await api('/models')).length, 2);
   await screenshot('available-models-en-desktop');
@@ -358,7 +309,7 @@ try {
   assert.ok(await evaluate(`document.documentElement.scrollWidth <= innerWidth + 1`), 'Unexpected whole-page horizontal overflow at mobile width');
   assert.ok(await evaluate(`document.querySelector('main').getBoundingClientRect().width >= 220`), 'Mobile sidebar must leave at least 220px for main content');
   await openEditor(alpha.name, 'model/shared');
-  assert.equal(await evaluate(`document.querySelector('[role="dialog"] input[type="text"]').value`), '0');
+  assert.equal(await evaluate(`document.querySelector('[role="dialog"] input').value`), '0');
   await screenshot('ratings-en-mobile-editor');
   await button('Cancel'); await waitDialogClosed();
   await evaluate(`document.querySelector('table').scrollIntoView({block:'start'}); document.querySelector('table').parentElement.scrollLeft=340;`);

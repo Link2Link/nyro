@@ -1,15 +1,14 @@
 //! Performance-page-only aggregation. Legacy usage endpoints keep their metrics.
 
 use super::*;
-use crate::db::model_performance::{ModelPerformanceStats, ModelPerformanceTiers};
+use crate::db::model_performance::ModelPerformanceStats;
 
 const PERFORMANCE_WINDOW_MS: i64 = 7 * 24 * 60 * 60 * 1000;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ModelPerformanceItem {
-    pub profile: ProviderModelRatingProfile,
+    pub rating: ProviderModelRating,
     pub mixed: ModelPerformanceStats,
-    pub tiers: ModelPerformanceTiers,
     pub unclassified_count: i64,
     pub untrusted_count: i64,
     pub status: String,
@@ -29,15 +28,13 @@ impl AdminService {
         &self,
         provider_id: Option<&str>,
     ) -> anyhow::Result<ModelPerformanceResponse> {
-        // One frozen profile/time snapshot drives both score resolution and the
-        // grouping query. Empty saved profiles produce no performance requests.
-        let profiles = self
-            .list_provider_model_rating_profiles(provider_id)
-            .await?;
+        // Freeze the comprehensive ratings and time for a consistent snapshot.
+        // Only explicitly rated provider/model pairs need mixed TPS queries.
+        let ratings = self.list_provider_model_ratings(provider_id).await?;
         let as_of = Utc::now().timestamp_millis();
-        let pairs = profiles
+        let pairs = ratings
             .iter()
-            .map(|profile| (profile.provider_id.clone(), profile.upstream_model.clone()))
+            .map(|rating| (rating.provider_id.clone(), rating.upstream_model.clone()))
             .collect::<Vec<_>>();
         let mut by_pair = HashMap::new();
         if !pairs.is_empty() {
@@ -54,16 +51,15 @@ impl AdminService {
                 );
             }
         }
-        let models = profiles
+        let models = ratings
             .into_iter()
-            .map(|profile| {
+            .map(|rating| {
                 let stats =
-                    by_pair.remove(&(profile.provider_id.clone(), profile.upstream_model.clone()));
+                    by_pair.remove(&(rating.provider_id.clone(), rating.upstream_model.clone()));
                 match stats {
                     Some(stats) => ModelPerformanceItem {
-                        profile,
+                        rating,
                         mixed: stats.mixed,
-                        tiers: stats.tiers,
                         unclassified_count: stats.unclassified_count,
                         untrusted_count: stats.untrusted_count,
                         status: "ready".to_string(),
@@ -72,9 +68,8 @@ impl AdminService {
                     // Missing rows are a storage contract failure, not a fabricated
                     // empty successful group. Valid peers can still be displayed.
                     None => ModelPerformanceItem {
-                        profile,
+                        rating,
                         mixed: ModelPerformanceStats::default(),
-                        tiers: ModelPerformanceTiers::default(),
                         unclassified_count: 0,
                         untrusted_count: 0,
                         status: "error".to_string(),

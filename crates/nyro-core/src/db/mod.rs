@@ -1,6 +1,6 @@
 pub mod model_performance;
 pub mod models;
-pub use model_performance::{ModelPerformanceStats, ModelPerformanceTiers, PairPerformanceStats};
+pub use model_performance::{ModelPerformanceStats, PairPerformanceStats};
 pub(crate) mod provider_model_ratings;
 
 use std::path::Path;

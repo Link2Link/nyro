@@ -7,7 +7,7 @@ use axum::body::to_bytes;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::{Json, Router, routing::post};
-use nyro_core::admin::{SetProviderModelRatingProfile, SetRatingOverrides};
+use nyro_core::admin::SetProviderModelRating;
 use nyro_core::db::models::{CreateModel, CreateProvider};
 use nyro_core::protocol::ids::OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1;
 use nyro_core::protocol::ir::{AiRequest, RawEnvelope, ReasoningEffort};
@@ -34,8 +34,8 @@ async fn upstream(Json(request): Json<Value>) -> axum::response::Response {
 }
 
 #[tokio::test]
-async fn live_completed_samples_reach_profile_performance_and_incomplete_do_not()
--> anyhow::Result<()> {
+async fn live_completed_samples_reach_model_performance_and_incomplete_do_not() -> anyhow::Result<()>
+{
     let dir = tempfile::tempdir()?;
     let config = GatewayConfig {
         data_dir: dir.path().to_path_buf(),
@@ -91,20 +91,7 @@ async fn live_completed_samples_reach_profile_performance_and_incomplete_do_not(
             })
             .await?;
         gw.admin()
-            .set_provider_model_rating_profile(
-                &provider.id,
-                model,
-                SetProviderModelRatingProfile {
-                    common: Some(80),
-                    overrides: SetRatingOverrides {
-                        low: None,
-                        medium: None,
-                        high: Some(90),
-                        xhigh: None,
-                        max: None,
-                    },
-                },
-            )
+            .set_provider_model_rating(&provider.id, model, SetProviderModelRating { score: 80 })
             .await?;
         let stream = model != "buffered";
         let value = json!({"model":model,"messages":[{"role":"user","content":"hi"}],"reasoning_effort":"high","stream":stream});
@@ -156,19 +143,20 @@ async fn live_completed_samples_reach_profile_performance_and_incomplete_do_not(
     for item in stats.models {
         assert_eq!(item.status, "ready");
         let expected = i64::from(matches!(
-            item.profile.upstream_model.as_str(),
+            item.rating.upstream_model.as_str(),
             "buffered" | "streamed"
         ));
         assert_eq!(
             item.mixed.valid_tps_count, expected,
             "{}",
-            item.profile.upstream_model
+            item.rating.upstream_model
         );
-        assert_eq!(item.tiers.high.valid_tps_count, expected);
+        assert_eq!(item.rating.score, 80);
+        assert_eq!(item.mixed.selected_request_count, expected);
         if expected == 1 {
-            assert!(item.tiers.high.average_tps.unwrap() > 0.0);
+            assert!(item.mixed.average_tps.unwrap() > 0.0);
         } else {
-            assert!(item.tiers.high.average_tps.is_none());
+            assert!(item.mixed.average_tps.is_none());
         }
     }
     let count: i64 = sqlx::query_scalar(

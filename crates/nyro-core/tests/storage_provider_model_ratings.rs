@@ -20,7 +20,6 @@ fn rating(provider_id: &str, model: &str, score: i32) -> ProviderModelRating {
     ProviderModelRating {
         provider_id: provider_id.to_owned(),
         upstream_model: model.to_owned(),
-        effort: "common".to_owned(),
         score,
         updated_at: EARLIER.to_owned(),
     }

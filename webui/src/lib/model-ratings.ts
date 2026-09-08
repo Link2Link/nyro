@@ -1,4 +1,4 @@
-import { EFFORT_TIERS, type EffortTier, type EffectiveModelRating, type Model, type Provider, type ProviderModelRatingProfile, type RatingValue, type SetProviderModelRatingProfile } from "./types";
+import type { Model, Provider, ProviderModelRating } from "./types";
 import { parseBackendTime } from "./format";
 
 /** Do not normalize either part: whitespace, case, slashes, and separators are identity. */
@@ -20,127 +20,40 @@ export function parseRatingScore(draft: string): number | null {
   return Number.isInteger(score) && score >= 0 && score <= 100 ? score : null;
 }
 
-function isScore(value: unknown): value is number {
-  return typeof value === "number" && Number.isInteger(value) && value >= 0 && value <= 100;
-}
-
-function isTimestamp(value: unknown): value is string {
-  return typeof value === "string"
-    && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/i.test(value)
-    && Number.isFinite(Date.parse(value));
-}
-
-function isRatingValue(value: unknown): value is RatingValue {
+export function isProviderModelRating(value: unknown): value is ProviderModelRating {
   if (!value || typeof value !== "object") return false;
   const rating = value as Record<string, unknown>;
-  return isScore(rating.score) && isTimestamp(rating.updated_at);
+  return typeof rating.provider_id === "string"
+    && typeof rating.upstream_model === "string"
+    && typeof rating.score === "number"
+    && Number.isInteger(rating.score)
+    && rating.score >= 0 && rating.score <= 100
+    && typeof rating.updated_at === "string"
+    && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/i.test(rating.updated_at)
+    && Number.isFinite(Date.parse(rating.updated_at));
 }
 
-export function isProviderModelRatingProfile(value: unknown): value is ProviderModelRatingProfile {
-  if (!value || typeof value !== "object") return false;
-  const profile = value as ProviderModelRatingProfile;
-  if (typeof profile.provider_id !== "string" || typeof profile.upstream_model !== "string"
-    || (profile.common !== null && !isRatingValue(profile.common))
-    || !profile.overrides || typeof profile.overrides !== "object"
-    || !profile.effective || typeof profile.effective !== "object"
-    || !["common", "per_effort"].includes(profile.display_mode)) return false;
-  for (const tier of EFFORT_TIERS) {
-    const override = profile.overrides[tier];
-    if (override !== null && !isRatingValue(override)) return false;
-    const effective = profile.effective[tier];
-    if (!effective || typeof effective !== "object") return false;
-    if (effective.status === "rated") {
-      if (!isScore(effective.score) || !["override", "common"].includes(effective.source)
-        || !isTimestamp(effective.score_updated_at)) return false;
-    } else if (effective.status !== "unrated" || effective.score !== null
-      || effective.source !== "unrated" || effective.score_updated_at !== null) return false;
-  }
-  return true;
-}
-
-export function readProviderModelRatingProfiles(value: unknown): ProviderModelRatingProfile[] {
-  if (!Array.isArray(value) || !value.every(isProviderModelRatingProfile)) {
-    throw new Error("Invalid model rating profiles response. Please check backend support and retry.");
+export function readProviderModelRatings(value: unknown): ProviderModelRating[] {
+  if (!Array.isArray(value) || !value.every(isProviderModelRating)) {
+    throw new Error("Invalid model ratings response. The backend may not support model ratings.");
   }
   const keys = new Set(value.map((rating) => providerModelKey(rating.provider_id, rating.upstream_model)));
-  if (keys.size !== value.length) throw new Error("Duplicate model rating profiles in backend response.");
+  if (keys.size !== value.length) throw new Error("Duplicate model ratings in backend response.");
   return value;
-}
-
-export function countRatingOverrides(profile: ProviderModelRatingProfile): number {
-  return EFFORT_TIERS.filter((tier) => profile.overrides[tier] !== null).length;
-}
-
-export function hasModelRating(profile?: ProviderModelRatingProfile | null): boolean {
-  return Boolean(profile && (profile.common !== null || countRatingOverrides(profile) > 0));
-}
-
-export type RatingDimension = "common" | EffortTier;
-
-export function ratingDimensionLabel(dimension: RatingDimension, isZh = false): string {
-  if (dimension === "common") return isZh ? "通用" : "Common";
-  if (dimension === "low") return isZh ? "低（含 minimal）" : "Low (includes minimal)";
-  const labels = { medium: ["Medium", "中"], high: ["High", "高"], xhigh: ["Extra high", "超高"], max: ["Max", "最高"] };
-  return labels[dimension][isZh ? 1 : 0];
-}
-
-/** Effort scores and sources are authoritative backend effective values, not inferred in views. */
-export function ratingForDimension(profile: ProviderModelRatingProfile | null | undefined, dimension: RatingDimension): EffectiveModelRating {
-  if (!profile) return { status: "unrated", score: null, source: "unrated", score_updated_at: null };
-  if (dimension !== "common") return profile.effective[dimension];
-  return profile.common
-    ? { status: "rated", score: profile.common.score, source: "common", score_updated_at: profile.common.updated_at }
-    : { status: "unrated", score: null, source: "unrated", score_updated_at: null };
-}
-
-export function emptyRatingProfileInput(): SetProviderModelRatingProfile {
-  return { common: null, overrides: { low: null, medium: null, high: null, xhigh: null, max: null } };
-}
-
-export interface RatingProfileDraft {
-  commonEnabled: boolean;
-  common: string;
-  overrides: Record<EffortTier, { enabled: boolean; score: string }>;
-}
-
-export function ratingProfileDraft(profile: ProviderModelRatingProfile | null): RatingProfileDraft {
-  return {
-    commonEnabled: profile?.common != null,
-    common: profile?.common ? String(profile.common.score) : "",
-    overrides: Object.fromEntries(EFFORT_TIERS.map((tier) => [tier, {
-      enabled: profile?.overrides[tier] != null,
-      score: profile?.overrides[tier] ? String(profile.overrides[tier].score) : "",
-    }])) as RatingProfileDraft["overrides"],
-  };
-}
-
-/** Explicit equal overrides are preserved; unsetting common never alters any override. */
-export function parseRatingProfileDraft(draft: RatingProfileDraft): SetProviderModelRatingProfile | null {
-  const input = emptyRatingProfileInput();
-  if (draft.commonEnabled) {
-    input.common = parseRatingScore(draft.common);
-    if (input.common === null) return null;
-  }
-  for (const tier of EFFORT_TIERS) {
-    if (!draft.overrides[tier].enabled) continue;
-    input.overrides[tier] = parseRatingScore(draft.overrides[tier].score);
-    if (input.overrides[tier] === null) return null;
-  }
-  return input;
 }
 
 export type RatingLoadState = "loading" | "error" | "ready";
 export type RatingDisplayState =
   | { status: "loading" | "error" | "unrated" }
-  | { status: "rated"; rating: ProviderModelRatingProfile };
+  | { status: "rated"; rating: ProviderModelRating };
 
 export function ratingDisplayState(
   loadState: RatingLoadState,
-  rating?: ProviderModelRatingProfile | null,
+  rating?: ProviderModelRating | null,
   providerKnown = true,
 ): RatingDisplayState {
   if (loadState !== "ready") return { status: loadState };
-  if (rating && hasModelRating(rating)) return { status: "rated", rating };
+  if (rating) return { status: "rated", rating };
   return { status: providerKnown ? "unrated" : "error" };
 }
 
@@ -155,7 +68,7 @@ export interface ModelRatingRow {
   providerId: string;
   provider?: Provider;
   model: string;
-  rating: ProviderModelRatingProfile | null;
+  rating: ProviderModelRating | null;
   catalogStatus: "listed" | "missing" | "unknown";
 }
 
@@ -163,7 +76,7 @@ export interface ModelRatingRow {
 export function buildModelRatingRows(
   providers: Provider[],
   routes: Model[],
-  ratings: ProviderModelRatingProfile[],
+  ratings: ProviderModelRating[],
   catalogs: ModelCatalogSnapshot[],
 ): ModelRatingRow[] {
   const providerIndex = new Map(providers.map((provider) => [provider.id, provider]));
@@ -208,7 +121,6 @@ export interface ModelRatingFilters {
   max: number | null;
   sort: RatingSort;
   ratingsReady: boolean;
-  dimension?: RatingDimension;
 }
 
 function normalizeSearch(value: string): string {
@@ -239,23 +151,20 @@ export function filterAndSortModelRatingRows(rows: ModelRatingRow[], filters: Mo
       .some((value) => normalizeSearch(value).includes(search))) return false;
     // A failed score request must not turn unknown values into unrated/zero or fake empty results.
     if (!filters.ratingsReady) return true;
-    const value = ratingForDimension(row.rating, filters.dimension ?? "common");
-    if (filters.rating === "rated" && value.status !== "rated") return false;
-    if (filters.rating === "unrated" && (value.status === "rated" || !row.provider)) return false;
-    if (filters.min !== null && (value.score === null || value.score < filters.min)) return false;
-    if (filters.max !== null && (value.score === null || value.score > filters.max)) return false;
+    if (filters.rating === "rated" && !row.rating) return false;
+    if (filters.rating === "unrated" && (row.rating || !row.provider)) return false;
+    if (filters.min !== null && (!row.rating || row.rating.score < filters.min)) return false;
+    if (filters.max !== null && (!row.rating || row.rating.score > filters.max)) return false;
     return true;
   });
   return filtered.sort((a, b) => {
     if (filters.ratingsReady && (filters.sort === "score-desc" || filters.sort === "score-asc" || filters.sort === "updated")) {
       // Absence is never zero: unrated rows stay last in both score directions.
-      const av = ratingForDimension(a.rating, filters.dimension ?? "common");
-      const bv = ratingForDimension(b.rating, filters.dimension ?? "common");
-      if (av.status !== bv.status) return av.status === "rated" ? -1 : 1;
-      if (av.status === "rated" && bv.status === "rated") {
+      if (!!a.rating !== !!b.rating) return a.rating ? -1 : 1;
+      if (a.rating && b.rating) {
         const diff = filters.sort === "updated"
-          ? (parseBackendTime(bv.score_updated_at)?.getTime() ?? 0) - (parseBackendTime(av.score_updated_at)?.getTime() ?? 0)
-          : filters.sort === "score-asc" ? av.score - bv.score : bv.score - av.score;
+          ? (parseBackendTime(b.rating.updated_at)?.getTime() ?? 0) - (parseBackendTime(a.rating.updated_at)?.getTime() ?? 0)
+          : filters.sort === "score-asc" ? a.rating.score - b.rating.score : b.rating.score - a.rating.score;
         if (diff) return diff;
       }
     }

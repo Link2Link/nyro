@@ -104,9 +104,7 @@ async function api(path, method = 'GET', body) {
   assert.ok(response.ok && !json.error, `${method} ${path}: ${response.status} ${JSON.stringify(json)}`);
   return Object.hasOwn(json, 'data') ? json.data : json;
 }
-const ratingPath = pair => `/providers/${pair.provider.id}/model-rating-profile?model=${encodeURIComponent(pair.model)}`;
-const tiers = ['low', 'medium', 'high', 'xhigh', 'max'];
-const profileInput = (common, overrides = {}) => ({ common, overrides: Object.fromEntries(tiers.map(tier => [tier, overrides[tier] ?? null])) });
+const ratingPath = pair => `/providers/${pair.provider.id}/model-rating?model=${encodeURIComponent(pair.model)}`;
 const usagePath = pair => `/providers/${pair.provider.id}/model-usage?model=${encodeURIComponent(pair.model)}`;
 const check = (name, detail = '') => { report.checks.push({ name, detail }); console.log(`PASS ${name}${detail ? ` — ${detail}` : ''}`); };
 const send = (method, params = {}) => cdp.send(method, params, sessionId);
@@ -142,7 +140,6 @@ async function fill(selector, value) {
   if (value) await send('Input.insertText', { text: value });
   else await key('Backspace', 'Backspace', 8);
 }
-const indexSelector = id => `[data-testid="performance-index-row"][data-point-id="${id}"]`;
 const circleExpression = id => `[...document.querySelectorAll('[data-testid="performance-point"]')].find(el=>el.dataset.pointIds.split(',').includes(${literal(id)}))`;
 async function select(label, text) {
   await clickExpression(`document.querySelector('[aria-label="${label}"]')`);
@@ -172,39 +169,38 @@ async function chartState() {
     return {points,rows,busy:Boolean(document.querySelector('button[aria-label="Refresh performance"],button[aria-label="刷新性能数据"]')?.disabled),counts:attrs(summary),axis:attrs(chart),summary:summary?.innerText,labels:[...document.querySelectorAll('[data-testid="performance-label"] text')].map(el=>el.textContent),body:document.body.innerText};
   })()`);
 }
-async function ready({ plotted = 11, missing = 7, errors = 0 } = {}) {
+async function ready({ plotted = 8, missing = 2, errors = 0 } = {}) {
   return waitFor(async () => {
     const state=await chartState();
-    return state.rows.length===plotted && Number(state.counts['data-plotted-count'])===plotted && Number(state.counts['data-missing-count'])===missing && Number(state.counts['data-error-count'])===errors && !state.busy ? state : false;
+    return state.points.reduce((n,p)=>n+p.members,0)===plotted && Number(state.counts['data-plotted-count'])===plotted && Number(state.counts['data-missing-count'])===missing && Number(state.counts['data-error-count'])===errors && !state.busy ? state : false;
   }, `settled chart: ${plotted} plotted, ${missing} missing, ${errors} errors`);
 }
-function assertAxes(state, yMax) {
+function assertAxes(state, yMax, xMax = 100) {
   const a=state.axis;
-  assert.equal(Number(a['data-x-min']),0); assert.equal(Number(a['data-x-max']),100); assert.equal(Number(a['data-y-max']),yMax);
+  assert.equal(Number(a['data-x-min']),0); assert.equal(Number(a['data-x-max']),xMax); assert.equal(Number(a['data-y-max']),yMax);
   const left=Number(a['data-plot-left']),right=Number(a['data-plot-right']),top=Number(a['data-plot-top']),bottom=Number(a['data-plot-bottom']);
   for(const point of state.points){
-    assert.ok(Math.abs(point.x-(left+point.score/100*(right-left)))<1e-4, 'Actual SVG X equals score, never jitter/centroid');
+    assert.ok(Math.abs(point.x-(left+point.score/xMax*(right-left)))<1e-4, 'Actual SVG X uses score and visible adaptive ceiling, never jitter/centroid');
     assert.ok(Math.abs(point.y-(bottom-point.tps/yMax*(bottom-top)))<1e-4, 'Actual SVG Y equals exact backend TPS');
   }
 }
 function expectedRows(snapshot, pairs) {
-  return snapshot.models.flatMap(model => (model.profile.display_mode==='common' ? ['mixed'] : tiers).map(tier=>{
-    const pair=pairs.find(p=>p.provider.id===model.profile.provider_id && p.model===model.profile.upstream_model);
-    const score=tier==='mixed' ? model.profile.common?.score ?? null : model.profile.effective[tier].score;
-    return {pair,tier,score,source:tier==='mixed' ? 'common' : model.profile.effective[tier].source,stats:tier==='mixed' ? model.mixed : model.tiers[tier],key:JSON.stringify([pair.provider.id,pair.model,tier])};
-  })).sort((a,b)=>a.key<b.key?-1:a.key>b.key?1:0).map((row,i)=>({...row,id:`P${String(i+1).padStart(2,'0')}`}));
+  return snapshot.models.map(model => {
+    const pair=pairs.find(p=>p.provider.id===model.rating.provider_id && p.model===model.rating.upstream_model);
+    return {pair,score:model.rating.score,stats:model.mixed,key:JSON.stringify([pair.provider.id,pair.model])};
+  }).sort((a,b)=>a.key<b.key?-1:a.key>b.key?1:0).map((row,i)=>({...row,id:`P${String(i+1).padStart(2,'0')}`}));
 }
 function assertPoints(state, rows) {
   const plotted=rows.filter(row=>row.score!==null && row.stats.average_tps!==null && row.stats.valid_tps_count>0);
-  assert.deepEqual(state.rows.map(row=>row.id).sort(),plotted.map(row=>row.id).sort());
+  assert.equal(state.rows.length,0,'No permanent numbered index');
   assert.deepEqual(state.points.flatMap(point=>point.ids).sort(),plotted.map(row=>row.id).sort());
   for(const row of plotted){
-    const point=state.points.find(point=>point.ids.includes(row.id)), index=state.rows.find(item=>item.id===row.id);
+    const point=state.points.find(point=>point.ids.includes(row.id));
     assert.equal(point.score,row.score); assert.equal(point.tps,row.stats.average_tps);
-    for(const text of [row.pair.provider.name,row.pair.provider.id,row.pair.model,row.tier==='mixed'?'Mixed':row.tier,row.source==='override'?'Override':'Common',`${row.score}/100`,`${row.stats.average_tps} tok/s`,`Valid TPS ${row.stats.valid_tps_count} / selected requests ${row.stats.selected_request_count}`]) assert.ok(index.text.includes(text),`${row.id} full index identity/metrics: ${text}`);
     if(point.members===1) assert.equal(point.fill==='white',row.stats.valid_tps_count<3, 'One/two samples hollow; three or more solid');
   }
-  assert.ok(state.labels.every(label=>/^P\d+( ×\d+)?$/.test(label)), 'SVG labels are IDs only, full names in index');
+  assert.ok(state.labels.length>0 && state.labels.every(label=>!/^P\d+( ×\d+)?$/.test(label)), 'SVG labels contain models, not IDs');
+  assert.ok(!/\bP\d{2}\b/.test(state.body),'No visible point IDs in page or diagnostics');
   assert.ok(state.points.every(point=>point.members===point.ids.length));
 }
 
@@ -258,13 +254,13 @@ try {
     { provider: beta, model: 'model/overlap', score: 50 },
     { provider: disabled, model: 'retired/模型/full-unambiguous-name', score: 73 },
     { provider: alpha, model: 'model/near-overlap', score: 51 },
-    { provider: alpha, model: 'model/effort-profile', score: 80, overrides: { high: 90, max: 0 } },
+    { provider: alpha, model: 'model/effort-profile', score: 80 },
     { provider: alpha, model: 'model/no-history', score: 25 },
     { provider: beta, model: 'model/legacy-only', score: 90 },
-    { provider: beta, model: 'model/equal-override', score: 55, overrides: { high: 55 } },
+    { provider: beta, model: 'model/single-rating', score: 55 },
   ];
   const unrated = { provider: alpha, model: 'model/unrated-fast' };
-  for (const pair of pairs) await api(ratingPath(pair), 'PUT', profileInput(pair.score, pair.overrides));
+  for (const pair of pairs) await api(ratingPath(pair), 'PUT', { score: pair.score });
   const logs = [], now = Date.now();
   const log = (pair, output, upstream = 1000, extra = {}) => logs.push({
     id: `performance-smoke-${String(logs.length).padStart(4,'0')}`, created_at: now - 60_000 + logs.length * 100,
@@ -306,23 +302,22 @@ try {
   report.seed = JSON.parse(report.childLogs['sqlite-seed'].trim());
   const snapshot=await api('/model-performance'); report.snapshot=snapshot;
   assert.equal(snapshot.as_of-snapshot.window_start,7*86400000); assert.equal(snapshot.models.length,pairs.length);
-  const statsFor=pair=>snapshot.models.find(item=>item.profile.provider_id===pair.provider.id && item.profile.upstream_model===pair.model);
+  const statsFor=pair=>snapshot.models.find(item=>item.rating.provider_id===pair.provider.id && item.rating.upstream_model===pair.model);
   assert.ok(Math.abs(statsFor(pairs[0]).mixed.average_tps-175/3)<1e-10);
   assert.equal(statsFor(pairs[0]).mixed.selected_request_count,10);
   const grouped=statsFor(effort);
-  assert.equal(grouped.tiers.low.selected_request_count,10); assert.equal(grouped.tiers.low.valid_tps_count,10); assert.equal(grouped.tiers.low.average_tps,40);
-  assert.equal(grouped.tiers.medium.valid_tps_count,3); assert.equal(grouped.tiers.medium.average_tps,70);
-  assert.equal(grouped.tiers.high.selected_request_count,2); assert.equal(grouped.tiers.high.valid_tps_count,1); assert.equal(grouped.tiers.high.average_tps,100);
-  assert.equal(grouped.tiers.xhigh.average_tps,null); assert.equal(grouped.mixed.selected_request_count,10);
+  assert.equal(grouped.mixed.selected_request_count,10); assert.equal(grouped.mixed.valid_tps_count,9);
+  assert.equal(grouped.mixed.average_tps,90); assert.ok(!Object.hasOwn(grouped,'tiers'));
+  assert.equal(grouped.rating.score,80);
   assert.equal(grouped.unclassified_count,2); assert.equal(grouped.untrusted_count,1);
   assert.equal(statsFor(pairs[8]).mixed.average_tps,null); assert.equal(statsFor(pairs[8]).untrusted_count,1);
   assert.ok((await api(usagePath(pairs[8]))).average_tps>0, 'Legacy average exists but does not fill trusted unknown');
-  for(const item of snapshot.models) for(const stats of [item.mixed,...Object.values(item.tiers)]){
+  for(const item of snapshot.models) for(const stats of [item.mixed]){
     assert.ok(stats.selected_request_count<=10);
     if(stats.average_tps!==null) assert.ok(Number.isFinite(stats.first_sample_at) && stats.first_sample_at>=snapshot.window_start && stats.last_sample_at<=snapshot.as_of);
   }
   const expected=expectedRows(snapshot,pairs);
-  check('real profiles and trusted seven-day per-group ten completed requests; invalid/old/error/cancel/token-limit/legacy excluded',report.seed.database);
+  check('single ratings and trusted seven-day per-pair ten completed requests; invalid/old/error/cancel/token-limit/legacy excluded',report.seed.database);
 
   const browser = trackChild('chrome', chrome, ['--headless', '--no-sandbox', '--disable-gpu', '--disable-dev-shm-usage', '--disable-background-networking', '--no-first-run', '--no-default-browser-check', '--remote-debugging-port=0', `--user-data-dir=${join(scratch, 'chrome')}`, 'about:blank']);
   const ws = await waitFor(() => {
@@ -350,7 +345,7 @@ try {
     const injected=Boolean(faultMode && isTarget);
     if(fail) expectedFailureUrls.set(params.request.url,(expectedFailureUrls.get(params.request.url)??0)+1);
     const payload=structuredClone(snapshot);
-    const targetModel=payload.models.find(model=>model.profile.provider_id===pairs[1].provider.id && model.profile.upstream_model===pairs[1].model);
+    const targetModel=payload.models.find(model=>model.rating.provider_id===pairs[1].provider.id && model.rating.upstream_model===pairs[1].model);
     if(faultMode==='partial'){targetModel.status='error';targetModel.error='Injected profile statistics failure';}
     if(['negative','zero','string','null','infinity'].includes(faultMode)) targetModel.mixed.average_tps=faultMode==='negative'?-5:faultMode==='zero'?0:faultMode==='string'?'NaN':null;
     if(faultMode==='null') Object.assign(targetModel.mixed,{valid_tps_count:0,first_sample_at:null,last_sample_at:null});
@@ -371,51 +366,57 @@ try {
   assert.deepEqual(nav.slice(nav.indexOf('/stats'),nav.indexOf('/stats')+3),['/stats','/performance','/extensions']);
   assertPoints(state,expected); assertAxes(state,250);
   assert.equal(report.apiCalls.filter(call=>call.path==='/api/v1/model-performance').length,1,'One batch snapshot on initial navigation');
-  assert.ok(state.rows.some(row=>row.text.includes('Provider disabled')));
+  assert.ok(!await evaluate(`document.querySelector('aside[aria-label="Complete numbered index"]')!==null`));
   assert.ok(!state.body.includes(unrated.model));
-  for(const pair of [pairs[7],pairs[8]]) {const row=await detailRow(pair);assert.ok(row[2].includes('–') && row[5].includes('No valid TPS'));}
-  assert.ok(!expected.some(row=>row.pair.overrides && row.tier==='mixed'),'Any override including equal common has no mixed point');
-  check('batch snapshot, provider/model/tier identities, fallback scores, one-sample hollow, full numbered index, actual coordinates');
+  for(const pair of [pairs[7],pairs[8]]) {const row=await detailRow(pair);assert.ok(row[1].includes('–') && row[4].includes('No valid TPS'));}
+  assert.equal(expected.length,pairs.length,'Exactly one row per rated provider/model');
+  assert.ok(!await evaluate(`document.querySelector('[aria-label="Filter by tier"]')!==null`),'No effort selector');
+  check('batch snapshot, single provider/model scores, mixed TPS, one-sample hollow, full numbered index, actual coordinates');
   await screenshot('performance-en-desktop');
 
   const overlap=state.points.find(point=>point.members===2);
-  assert.ok(overlap); assert.ok(state.labels.some(label=>label.endsWith(' ×2')));
+  assert.ok(overlap);
+  const overlapNames=expected.filter(row=>overlap.ids.includes(row.id)).map(row=>row.pair.model);
+  const overlapLabel=await evaluate(`document.querySelector('[data-testid="performance-label"][data-point-ids="${overlap.ids.join(',')}"]')?.textContent`);
+  for(const name of overlapNames) assert.ok(overlapLabel?.includes(name),'Coincident label names every member');
   const nearby=expected.find(row=>row.pair===pairs[5]);
   await evaluate(`(${circleExpression(overlap.ids[0])}).parentElement.focus()`);
-  await waitFor(async()=> (await chartState()).rows.filter(row=>row.opacity===1).length===3,'focus highlights both overlap members and near point');
   await key('Enter');
-  await waitFor(()=>evaluate(`document.querySelector('section[aria-label="Selected region candidates"]')?.querySelectorAll('button').length===3`),'near/overlap candidate selection');
-  const candidateText=await evaluate(`document.querySelector('section[aria-label="Selected region candidates"]').innerText`);
-  for(const id of [...overlap.ids,nearby.id]) assert.ok(candidateText.includes(id));
-  await screenshot('performance-overlap-near-candidates');
-  await clickExpression(`[...document.querySelectorAll('section[aria-label="Selected region candidates"] button')].find(el=>el.textContent.includes(${literal(overlap.ids[1])}))`);
-  await waitFor(async()=> (await chartState()).rows.filter(row=>row.pressed==='true').length===1,'select one coincident member');
+  const tooltip=()=>evaluate(`document.querySelector('[role="tooltip"]')?.innerText`);
+  await waitFor(tooltip,'focus tooltip');
+  const text=await tooltip();
+  for(const row of expected.filter(row=>[...overlap.ids,nearby.id].includes(row.id))) {
+    for(const value of [row.pair.model,row.pair.provider.name,row.pair.provider.id,`${row.score}/100`,`${row.stats.average_tps} tok/s`,`Valid TPS ${row.stats.valid_tps_count} / selected requests ${row.stats.selected_request_count}`]) assert.ok(text.includes(value),`Tooltip full detail ${value}`);
+  }
+  await key('Escape'); await waitFor(async()=>!await tooltip(),'Escape dismisses tooltip');
+  const selected=expected.find(row=>row.pair===effort);
+  await evaluate(`(${circleExpression(selected.id)}).parentElement.focus()`); await key(' ','Space');
+  await waitFor(tooltip,'Space opens focused tooltip');
   await key('Escape');
-  await waitFor(async()=> (await chartState()).rows.every(row=>row.pressed==='false'),'Escape clears pin');
-  const selected=expected.find(row=>row.pair===effort && row.tier==='high');
-  await evaluate(`document.querySelector(${literal(indexSelector(selected.id))}).focus()`); await key(' ','Space');
-  await waitFor(async()=> (await chartState()).rows.find(row=>row.id===selected.id)?.pressed==='true','Space pins focused numbered index');
-  await send('Input.dispatchMouseEvent',{type:'mouseMoved',x:5,y:5});
-  assert.equal((await chartState()).rows.find(row=>row.id===selected.id).pressed,'true','Pin survives mouseleave');
-  await key('Escape');
-  check('focus links both views; Enter/Space pins, Escape clears; exact and near members independently selectable');
+  await evaluate(`document.activeElement?.blur(); (${circleExpression(overlap.ids[0])}).scrollIntoView({block:'center'})`);
+  const dot=await evaluate(`(()=>{const r=(${circleExpression(overlap.ids[0])}).getBoundingClientRect();return {x:r.x+r.width/2,y:r.y+r.height/2}})()`);
+  await send('Input.dispatchMouseEvent',{type:'mouseMoved',...dot}); await waitFor(tooltip,'mouse hover details');
+  const blank=await evaluate(`(()=>{const svg=document.querySelector('[data-testid="performance-chart"]');const p=new DOMPoint(70,30).matrixTransform(svg.getScreenCTM());return {x:p.x,y:p.y}})()`);
+  await send('Input.dispatchMouseEvent',{type:'mouseMoved',...blank}); await waitFor(async()=>!await tooltip(),'Moving from dot to chart blank dismisses details');
+  await send('Input.dispatchMouseEvent',{type:'mouseMoved',...dot}); await waitFor(tooltip,'hover reopens details');
+  const tip=await evaluate(`(()=>{const r=document.querySelector('[role="tooltip"]').getBoundingClientRect();return {x:r.x+10,y:r.y+10}})()`);
+  await send('Input.dispatchMouseEvent',{type:'mouseMoved',...tip}); await delay(300); assert.ok(await tooltip(),'Tooltip remains while pointer reads it');
+  await screenshot('performance-hover-details');
+  await send('Input.dispatchMouseEvent',{type:'mouseMoved',x:10,y:10}); await waitFor(async()=>!await tooltip(),'Leaving tooltip closes details');
+  check('direct model labels, all overlapping names, complete hover/focus details, Enter/Space and Escape, no permanent index');
 
-  await select('Filter by tier','low (includes minimal)');
-  state=await ready({plotted:1,missing:1}); assertAxes(state,200);
-  assertPoints(state,expected.filter(row=>row.tier==='low'));
-  await select('Filter by tier','All tiers'); await ready();
-  await fill('input[aria-label="Search IDs, providers or models"]','overlap');
-  state=await ready({plotted:3,missing:0}); assertAxes(state,200);
+  await fill('input[aria-label="Search providers or models"]','overlap');
+  state=await ready({plotted:3,missing:0}); assertAxes(state,100,60);
   assertPoints(state,expected.filter(row=>row.pair.model.includes('overlap')));
-  await fill('input[aria-label="Search IDs, providers or models"]',''); await ready();
+  await fill('input[aria-label="Search providers or models"]',''); state=await ready(); assertAxes(state,250,100);
   await select('Filter by provider',disabled.name);
-  state=await ready({plotted:1,missing:0}); assertPoints(state,expected.filter(row=>row.pair.provider===disabled));
-  await select('Filter by provider','All providers'); await ready();
+  state=await ready({plotted:1,missing:0}); assertPoints(state,expected.filter(row=>row.pair.provider===disabled)); assertAxes(state,100,80);
+  await select('Filter by provider','All providers'); state=await ready(); assertAxes(state,250,100);
   const beforeZoom=(await chartState()).points.map(({opacity,pressed,...point})=>point);
   await evaluate(`(() => {const el=document.querySelector('select');el.value='2';el.dispatchEvent(new Event('change',{bubbles:true}))})()`);
   assert.deepEqual((await chartState()).points.map(({opacity,pressed,...point})=>point),beforeZoom,'Zoom cannot change actual SVG coordinate, membership or IDs');
   await evaluate(`(() => {const el=document.querySelector('select');el.value='1';el.dispatchEvent(new Event('change',{bubbles:true}))})()`);
-  check('IDs stable across tier/provider/search filters and zoom; X fixed 100, Y default 200 and 225 expands to 250');
+  check('IDs stable across filters and zoom; X adapts to overlap max51→60 and disabled max73→80, restores100; Y default100 and225→250');
 
   await clickExpression(`document.querySelector('button[title="切换到中文"]')`);
   await waitFor(() => evaluate(`document.querySelector('h1')?.textContent === '性能'`), 'Chinese locale');
@@ -433,14 +434,16 @@ try {
   assert.ok(await evaluate(`document.documentElement.scrollWidth <= innerWidth + 1 && document.querySelector('main').getBoundingClientRect().width >= 220`), 'Mobile direct load preserves width and avoids page overflow');
   await screenshot('performance-en-mobile');
   assertPoints(await chartState(),expected);
-  assert.ok(await evaluate(`document.querySelector('aside[aria-label="Complete numbered index"]').getBoundingClientRect().top>=document.querySelector('[data-testid="performance-chart"]').getBoundingClientRect().bottom`),'Mobile full index is below chart');
-  await clickExpression(`document.querySelector(${literal(indexSelector(selected.id))})`);
-  await screenshot('performance-en-mobile-selected-index');
-  assert.equal((await chartState()).rows.find(row=>row.id===selected.id).pressed,'true');
-  check('EN/ZH desktop/mobile, direct mobile load, list below chart, full names and selected score/source/TPS/count');
+  assert.ok(!await evaluate(`document.querySelector('aside[aria-label="Complete numbered index"]')!==null`),'No mobile index');
+  await clickExpression(`(${circleExpression(selected.id)})`);
+  await waitFor(()=>evaluate(`Boolean(document.querySelector('[role="tooltip"]'))`),'Mobile tap opens tooltip');
+  assert.ok(await evaluate(`(()=>{const r=document.querySelector('[role="tooltip"]').getBoundingClientRect();return r.left>=0 && r.top>=0 && r.right<=innerWidth && r.bottom<=innerHeight})()`),'Mobile tooltip stays within viewport');
+  await screenshot('performance-en-mobile-tooltip');
+  await key('Escape');
+  check('EN/ZH desktop/mobile, no permanent index, bounded mobile tap tooltip, no page overflow');
 
   await send('Emulation.setDeviceMetricsOverride', { width: 1440, height: 1000, deviceScaleFactor: 1, mobile: false });
-  faultMode='partial'; await reload(); state=await ready({plotted:10,errors:1});
+  faultMode='partial'; await reload(); state=await ready({plotted:7,errors:1});
   assert.ok(state.body.includes('Injected profile statistics failure')); await screenshot('performance-partial-error');
   faultMode=null; await refresh(); await ready();
   for(const mode of ['negative','zero','string','infinity']){
@@ -448,7 +451,7 @@ try {
     await waitFor(()=>evaluate(`Boolean(document.querySelector('[role="alert"]'))`),`${mode} invalid snapshot warning`);
     assert.equal((await chartState()).points.length,0,'Invalid batch must not invent zero or plot stale values');
   }
-  faultMode='null'; await reload(); await ready({plotted:10,missing:8});
+  faultMode='null'; await reload(); await ready({plotted:7,missing:3});
   await screenshot('performance-null-tps');
   faultMode=null; await refresh(); await ready();
   faultMode='snapshot'; await refresh();
@@ -457,7 +460,7 @@ try {
   await reload(); await waitFor(()=>evaluate(`Boolean(document.querySelector('[role="alert"]'))`),'cold snapshot HTTP500');
   state=await chartState(); assert.equal(state.points.length,0); assert.ok(state.body.includes('Unknown does not mean unrated'));
   faultMode=null; await refresh(); await ready();
-  check('partial profile failure preserves others; invalid batch, null TPS and warm/cold HTTP500 distinguish unknown and recover');
+  check('partial model failure preserves others; invalid batch, null TPS and warm/cold HTTP500 distinguish unknown and recover');
 
   assert.ok(report.apiCalls.every(call=>!call.path.endsWith('/model-usage') && !/\/providers\/[^/]+\/(models|test|benchmark)$/.test(call.path)),'No legacy usage, catalog or benchmark queries in any browser path');
   assert.deepEqual(report.upstreamCalls, [], 'Chart must never call real upstream, including model catalogs');

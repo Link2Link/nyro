@@ -4,10 +4,10 @@ import { ChevronLeft, ChevronRight, CircleAlert, Loader2, Pencil, RefreshCw, Sea
 import { backend } from "@/lib/backend";
 import { formatLocalDateTime } from "@/lib/format";
 import { useLocale } from "@/lib/i18n";
-import { buildModelRatingRows, filterAndSortModelRatingRows, parseRatingScore, ratingDimensionLabel, ratingDisplayState, ratingForDimension, uniqueModelIdentifiers, type ModelCatalogSnapshot, type RatingDimension, type RatingFilter, type RatingSort } from "@/lib/model-ratings";
+import { buildModelRatingRows, filterAndSortModelRatingRows, parseRatingScore, ratingDisplayState, uniqueModelIdentifiers, type ModelCatalogSnapshot, type RatingFilter, type RatingSort } from "@/lib/model-ratings";
 import { useModelRatings } from "@/lib/use-model-ratings";
-import { EFFORT_TIERS, type Model, type Provider } from "@/lib/types";
-import { ModelRatingBadge, ModelRatingClearedNotice, ModelRatingEditor, ModelRatingProfileFields, ModelRatingsFeedback, type ModelRatingEditTarget } from "@/components/model-rating";
+import type { Model, Provider } from "@/lib/types";
+import { ModelRatingBadge, ModelRatingClearedNotice, ModelRatingEditor, ModelRatingsFeedback, type ModelRatingEditTarget } from "@/components/model-rating";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -22,7 +22,6 @@ export default function ModelRatingsPage() {
   const [search, setSearch] = useState("");
   const [providerFilter, setProviderFilter] = useState(ALL_PROVIDERS);
   const [ratingFilter, setRatingFilter] = useState<RatingFilter>("all");
-  const [dimension, setDimension] = useState<RatingDimension>("common");
   const [minDraft, setMinDraft] = useState("");
   const [maxDraft, setMaxDraft] = useState("");
   const [sort, setSort] = useState<RatingSort>("score-desc");
@@ -69,14 +68,13 @@ export default function ModelRatingsPage() {
     max: rangeInvalid ? null : max,
     sort,
     ratingsReady,
-    dimension,
   });
-  const pageKey = JSON.stringify([search, providerFilter, ratingFilter, dimension, minDraft, maxDraft, sort, ratings.loadState]);
+  const pageKey = JSON.stringify([search, providerFilter, ratingFilter, minDraft, maxDraft, sort, ratings.loadState]);
   const pageCount = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE));
   const page = Math.min(pagination.key === pageKey ? pagination.page : 1, pageCount);
   const visible = filtered.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE);
-  const ratingCount = rows.filter((row) => ratingForDimension(row.rating, dimension).status === "rated").length;
-  const unratedCount = rows.filter((row) => ratingForDimension(row.rating, dimension).status === "unrated" && row.provider).length;
+  const ratingCount = rows.filter((row) => row.rating !== null).length;
+  const unratedCount = rows.filter((row) => row.rating === null && row.provider).length;
   const sourceLoading = providersQuery.isPending || routesQuery.isPending || catalogs.some((catalog) => catalog.status === "loading");
   const catalogErrors = providers.filter((provider, index) => provider.is_enabled && catalogQueries[index].isError);
   const disabledCount = providers.filter((provider) => !provider.is_enabled).length;
@@ -104,7 +102,7 @@ export default function ModelRatingsPage() {
       <div className="flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
         <div>
           <h1 className="text-2xl font-bold text-slate-900">{isZh ? "模型评分" : "Model Ratings"}</h1>
-          <p className="mt-1 text-sm text-slate-500">{isZh ? "按供应商与确切模型管理可选通用评分及五档覆盖（0–100），不影响路由。" : "Optional common scores and five effort overrides (0–100) per exact provider/model. Ratings do not affect routing."}</p>
+          <p className="mt-1 text-sm text-slate-500">{isZh ? "按供应商与确切模型管理 0–100 综合评分，不影响路由。" : "Comprehensive 0–100 scores per exact provider/model pair. Ratings do not affect routing."}</p>
         </div>
         <div className="flex flex-wrap gap-2">
           <Button variant="secondary" size="sm" disabled={ratings.isFetching} onClick={() => void ratings.refetch()}>
@@ -145,13 +143,6 @@ export default function ModelRatingsPage() {
         </div>
         <div className="flex flex-wrap items-end gap-3">
           <label className="space-y-1 text-xs text-slate-500">
-            <span>{isZh ? "评分维度" : "Score dimension"}</span>
-            <Select value={dimension} onValueChange={(value) => setDimension(value as RatingDimension)}>
-              <SelectTrigger className="w-52" aria-label={isZh ? "评分维度" : "Score dimension"}><SelectValue /></SelectTrigger>
-              <SelectContent>{(["common", ...EFFORT_TIERS] as const).map((value) => <SelectItem key={value} value={value}>{ratingDimensionLabel(value, isZh)}</SelectItem>)}</SelectContent>
-            </Select>
-          </label>
-          <label className="space-y-1 text-xs text-slate-500">
             <span>{isZh ? "评分状态" : "Rating state"}</span>
             <Select value={ratingFilter} onValueChange={(value) => setRatingFilter(value as RatingFilter)} disabled={!ratingsReady}>
               <SelectTrigger className="w-36" aria-label={isZh ? "评分状态" : "Rating state"}><SelectValue /></SelectTrigger>
@@ -178,7 +169,7 @@ export default function ModelRatingsPage() {
           </label>
         </div>
         {rangeInvalid && ratingsReady && <p role="alert" className="text-xs text-red-600">{isZh ? "评分范围须为 0–100 的整数，且最低分不能高于最高分。当前未应用范围筛选。" : "Score bounds must be whole numbers from 0 to 100, with min ≤ max. Range filters are not applied."}</p>}
-        {!ratingsReady ? <p className="text-xs text-slate-500">{isZh ? "评分未知，评分筛选、排序与计数暂不可用；当前仅按文本和供应商筛选。" : "Rating filters, score sorting, and counts are unavailable until ratings load. Only text and provider filters are applied."}</p> : <p className="text-xs text-slate-500">{isZh ? "筛选、排序及计数使用所选维度；分档使用后端有效评分。未评分不是 0 分，仅覆盖的配置在通用维度中未评分。" : "Filters, sorting and counts use the selected dimension; effort tiers use backend effective scores. Unrated is not 0. Override-only profiles are unrated in the common dimension."}</p>}
+        {!ratingsReady ? <p className="text-xs text-slate-500">{isZh ? "评分未知，评分筛选、排序与计数暂不可用；当前仅按文本和供应商筛选。" : "Rating filters, score sorting, and counts are unavailable until ratings load. Only text and provider filters are applied."}</p> : <p className="text-xs text-slate-500">{isZh ? "设置分数范围时仅包含已评分模型；未评分不是 0 分。" : "Score ranges include rated models only; unrated is not a score of 0."}</p>}
       </div>
 
       <div className="glass overflow-hidden rounded-2xl">
@@ -193,8 +184,8 @@ export default function ModelRatingsPage() {
                 <tr key={row.key} className="border-t border-slate-200/80">
                   <td className="max-w-52 px-4 py-3"><p className="break-words font-medium text-slate-800">{row.provider?.name ?? row.providerId}</p><p className="mt-1 break-all text-[11px] text-slate-400">{row.providerId}</p></td>
                   <td className="max-w-80 whitespace-pre-wrap break-all px-4 py-3 font-mono text-[13px] text-slate-700">{row.model}</td>
-                  <td className="px-4 py-3"><ModelRatingBadge state={ratingDisplayState(ratings.loadState, row.rating, Boolean(row.provider))} />{ratingsReady && row.rating && <ModelRatingProfileFields profile={row.rating} />}</td>
-                  <td className="whitespace-nowrap px-4 py-3 text-xs text-slate-500"><p>{ratingDimensionLabel(dimension, isZh)}</p>{ratingsReady && ratingForDimension(row.rating, dimension).score_updated_at ? <time dateTime={ratingForDimension(row.rating, dimension).score_updated_at!}>{formatLocalDateTime(ratingForDimension(row.rating, dimension).score_updated_at!)}</time> : ratingsReady && row.provider ? "–" : isZh ? "未知" : "Unknown"}</td>
+                  <td className="whitespace-nowrap px-4 py-3"><ModelRatingBadge state={ratingDisplayState(ratings.loadState, row.rating, Boolean(row.provider))} /></td>
+                  <td className="whitespace-nowrap px-4 py-3 text-xs text-slate-500">{ratingsReady && row.rating ? <time dateTime={row.rating.updated_at}>{formatLocalDateTime(row.rating.updated_at)}</time> : ratingsReady && row.provider ? "–" : isZh ? "未知" : "Unknown"}</td>
                   <td className="px-4 py-3"><div className="flex flex-wrap gap-1.5">
                     <Badge variant={row.catalogStatus === "listed" ? "success" : row.catalogStatus === "missing" ? "warning" : "outline"}>{row.catalogStatus === "listed" ? (isZh ? "目录内" : "Listed") : row.catalogStatus === "missing" ? (isZh ? "目录缺失" : "Not in catalog") : (isZh ? "目录未知" : "Catalog unknown")}</Badge>
                     <Badge variant={!row.provider ? "warning" : row.provider.is_enabled ? "success" : "secondary"}>{!row.provider ? (isZh ? "供应商未知" : "Provider unknown") : row.provider.is_enabled ? (isZh ? "已启用" : "Enabled") : (isZh ? "已禁用" : "Disabled")}</Badge>

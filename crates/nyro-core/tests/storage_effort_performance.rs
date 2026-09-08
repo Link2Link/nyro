@@ -85,7 +85,7 @@ async fn exercise(storage: &dyn Storage) -> anyhow::Result<()> {
     }))?).await?;
     let p = &provider.id;
     let mut rows = Vec::new();
-    // Each tier has its own ten-request partition, independent from mixed.
+    // All efforts share one latest-ten sample window for the exact model.
     for (index, tier) in ["low", "medium", "high", "xhigh", "max"].iter().enumerate() {
         for n in 0..12 {
             let mut e = entry(
@@ -187,17 +187,9 @@ async fn exercise(storage: &dyn Storage) -> anyhow::Result<()> {
         .model_performance_stats(&pairs, AS_OF)
         .await?;
     assert_eq!(stats.len(), pairs.len());
-    for tier in [
-        &stats[0].tiers.low,
-        &stats[0].tiers.medium,
-        &stats[0].tiers.high,
-        &stats[0].tiers.xhigh,
-        &stats[0].tiers.max,
-    ] {
-        assert_eq!(tier.selected_request_count, 10);
-        assert_eq!(tier.valid_tps_count, 1);
-        assert_eq!(tier.average_tps, Some(100.0));
-    }
+    assert_eq!(stats[0].mixed.average_tps, Some(100.0));
+    let serialized = serde_json::to_value(&stats[0])?;
+    assert!(serialized.get("tiers").is_none());
     assert_eq!(stats[0].mixed.selected_request_count, 10);
     assert_eq!(stats[0].mixed.valid_tps_count, 1);
     assert_eq!(stats[1].mixed.selected_request_count, 10);
@@ -209,17 +201,15 @@ async fn exercise(storage: &dyn Storage) -> anyhow::Result<()> {
     assert_eq!(stats[2].mixed.first_sample_at, Some(AS_OF - WEEK));
     assert_eq!(stats[2].mixed.last_sample_at, Some(AS_OF));
     assert_eq!(stats[3].mixed.selected_request_count, 4);
-    assert_eq!(stats[3].tiers.low.selected_request_count, 1);
-    assert_eq!(stats[3].tiers.high.selected_request_count, 0);
+    assert_eq!(stats[3].mixed.valid_tps_count, 4);
     assert_eq!(stats[3].unclassified_count, 3);
     assert_eq!(stats[3].untrusted_count, 1);
     assert_eq!(stats[4].mixed.selected_request_count, 5);
     assert_eq!(stats[4].mixed.valid_tps_count, 3);
     assert!((stats[4].mixed.average_tps.unwrap() - 100.0).abs() < 1e-9);
-    assert_eq!(stats[5].tiers.low.selected_request_count, 1);
     assert_eq!(stats[5].mixed.selected_request_count, 1);
-    assert_eq!(stats[6].tiers.high.selected_request_count, 1);
-    assert_eq!(stats[7].tiers.max.selected_request_count, 1);
+    assert_eq!(stats[6].mixed.selected_request_count, 1);
+    assert_eq!(stats[7].mixed.selected_request_count, 1);
     assert_eq!(stats[8].mixed.selected_request_count, 0);
     assert_eq!(stats[8].mixed.average_tps, None);
     let page = storage
@@ -369,18 +359,20 @@ async fn verify_external_legacy(storage: &dyn Storage, provider: &str) -> anyhow
     assert!(
         ratings
             .iter()
-            .all(|r| r.effort == "common" && r.updated_at == "original" && r.score == 42)
+            .all(|r| r.updated_at == "original" && r.score == 42)
     );
     store
         .upsert(ProviderModelRating {
             provider_id: provider.into(),
             upstream_model: "Exact ".into(),
-            effort: "max".into(),
             score: 91,
             updated_at: "scoped".into(),
         })
         .await?;
-    assert_eq!(store.list(Some(provider)).await?.len(), 4);
+    assert_eq!(store.list(Some(provider)).await?.len(), 3);
+    let updated = store.get(provider, "Exact ").await?.unwrap();
+    assert_eq!(updated.score, 91);
+    assert_eq!(updated.updated_at, "scoped");
     storage.providers().delete(provider).await?;
     assert!(store.list(Some(provider)).await?.is_empty());
     Ok(())
@@ -443,7 +435,7 @@ async fn sqlite_legacy_rating_upgrade_and_historical_recovery() -> anyhow::Resul
     assert!(
         ratings
             .iter()
-            .all(|r| r.effort == "common" && r.updated_at == "original timestamp" && r.score == 42)
+            .all(|r| r.updated_at == "original timestamp" && r.score == 42)
     );
     storage
         .provider_model_ratings()
@@ -451,7 +443,6 @@ async fn sqlite_legacy_rating_upgrade_and_historical_recovery() -> anyhow::Resul
         .upsert(ProviderModelRating {
             provider_id: "p".into(),
             upstream_model: "Model".into(),
-            effort: "low".into(),
             score: 99,
             updated_at: "new".into(),
         })
@@ -463,8 +454,13 @@ async fn sqlite_legacy_rating_upgrade_and_historical_recovery() -> anyhow::Resul
             .list(Some("p"))
             .await?
             .len(),
-        5
+        4
     );
+    let common_rows: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM provider_model_ratings WHERE effort = 'common'")
+            .fetch_one(pool)
+            .await?;
+    assert_eq!(common_rows, 4);
     for id in ["recent", "missing", "oversize"] {
         let log = storage.logs().find_by_id(id).await?.unwrap();
         assert_eq!(log.performance_metadata_version, 1);

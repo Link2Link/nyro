@@ -47,8 +47,7 @@ use model_data::*;
 pub use model_performance::{ModelPerformanceItem, ModelPerformanceResponse};
 pub use provider_model_ratings::{
     MAX_RATING_MODEL_BYTES, ProviderModelRatingError, ProviderModelRatingState,
-    SetProviderModelRating, SetProviderModelRatingProfile, SetRatingOverrides,
-    ProviderModelRatingProfile, RatingValue, RatingOverrides, ResolvedRating, EffectiveRatings,
+    SetProviderModelRating,
 };
 pub use providers::{ProviderModelProbeMeta, ProviderModelProbeOutcome, ProviderModelProbeResult};
 pub use usage::{

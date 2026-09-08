@@ -8,7 +8,8 @@ use crate::db::models::{
     CreateModelBackend, CreateProvider, LogPage, LogQuery, Model, ModelBackend, ModelStats,
     ModelTimeBucket, ModelUsageDetail, ModelUsageStats, OAuthCredential, Provider,
     ProviderModelRating, ProviderStats, ProviderUsageDetail, RequestLog, StatsHourly,
-    StatsOverview, StatsTimeBucket, UpdateApiKey, UpdateModel, UpdateProvider, UpsertOAuthCredential,
+    StatsOverview, StatsTimeBucket, UpdateApiKey, UpdateModel, UpdateProvider,
+    UpsertOAuthCredential,
 };
 use crate::logging::LogEntry;
 
@@ -84,25 +85,17 @@ pub trait ProviderStore: Send + Sync {
 /// Persistence for ratings, independent of routing and model catalogs.
 #[async_trait]
 pub trait ProviderModelRatingStore: Send + Sync {
-    /// List all stored scopes, including override-only models.
+    /// List comprehensive ratings only; historical effort overrides remain hidden.
     async fn list(&self, provider_id: Option<&str>) -> anyhow::Result<Vec<ProviderModelRating>>;
     async fn get(
         &self,
         provider_id: &str,
         model: &str,
     ) -> anyhow::Result<Option<ProviderModelRating>>;
-    /// Write the row's explicit scope. Legacy get/delete address common only.
+    /// All rating operations address the physical common scope only.
     async fn upsert(&self, rating: ProviderModelRating) -> anyhow::Result<ProviderModelRating>;
     async fn delete(&self, provider_id: &str, model: &str) -> anyhow::Result<()>;
-    /// Atomically replace all six scopes of one exact model, preserving supplied timestamps.
-    /// An empty slice clears the profile, without touching any other model.
-    async fn replace_profile(
-        &self,
-        provider_id: &str,
-        upstream_model: &str,
-        ratings: &[ProviderModelRating],
-    ) -> anyhow::Result<()>;
-    /// Atomically replace all target ratings; an empty slice clears them.
+    /// Atomically replace target common ratings; preserve historical non-common rows.
     /// The target provider ID overrides row IDs and timestamps are preserved.
     async fn restore(
         &self,
@@ -170,7 +163,7 @@ pub trait AuthAccessStore: Send + Sync {
 
 #[async_trait]
 pub trait LogStore: Send + Sync {
-    /// Completion-aware, seven-day, independently sampled performance groups.
+    /// Completion-aware, seven-day mixed performance samples per provider/model pair.
     async fn model_performance_stats(
         &self,
         _pairs: &[(String, String)],

@@ -1083,12 +1083,44 @@ pub struct ExportData {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(try_from = "ImportedProviderModelRating")]
 pub struct ExportProviderModelRating {
     pub upstream_model: String,
-    #[serde(default = "super::provider_model_ratings::common_effort")]
-    pub effort: String,
     pub score: i32,
     pub updated_at: String,
+}
+
+// Accept old unscoped backups and explicit common rows, but never silently
+// reinterpret a historical effort-specific score as a comprehensive rating.
+#[derive(Deserialize)]
+struct ImportedProviderModelRating {
+    upstream_model: String,
+    score: i32,
+    updated_at: String,
+    #[serde(default)]
+    effort: Option<String>,
+}
+
+impl TryFrom<ImportedProviderModelRating> for ExportProviderModelRating {
+    type Error = String;
+
+    fn try_from(value: ImportedProviderModelRating) -> Result<Self, Self::Error> {
+        if value
+            .effort
+            .as_deref()
+            .is_some_and(|effort| effort != "common")
+        {
+            return Err(
+                "Effort-specific model ratings cannot be imported as comprehensive scores"
+                    .to_string(),
+            );
+        }
+        Ok(Self {
+            upstream_model: value.upstream_model,
+            score: value.score,
+            updated_at: value.updated_at,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

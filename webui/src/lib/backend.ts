@@ -134,19 +134,10 @@ function resolveHTTP(cmd: string, args?: Record<string, unknown>): HTTPMapping {
       return { method: "POST", url: `${base}/providers/${args?.id}/probe-models` };
     case "get_provider_models":
       return { method: "GET", url: `${base}/providers/${args?.id}/models${args?.requireCatalog === true ? "?require_catalog=true" : ""}` };
-    case "list_provider_model_rating_profiles":
     case "get_model_performance": {
       const query = args?.providerId == null ? "" : `?provider_id=${encodeURIComponent(String(args.providerId))}`;
-      const path = cmd === "get_model_performance" ? "model-performance" : "provider-model-rating-profiles";
-      return { method: "GET", url: `${base}/${path}${query}` };
+      return { method: "GET", url: `${base}/model-performance${query}` };
     }
-    case "get_provider_model_rating_profile":
-    case "set_provider_model_rating_profile":
-      return {
-        method: cmd === "get_provider_model_rating_profile" ? "GET" : "PUT",
-        url: `${base}/providers/${encodeURIComponent(String(args?.providerId ?? ""))}/model-rating-profile?model=${encodeURIComponent(String(args?.model ?? ""))}`,
-        ...(cmd === "set_provider_model_rating_profile" ? { body: args?.input as Record<string, unknown> } : {}),
-      };
     case "list_provider_model_ratings": {
       const query = args?.providerId == null
         ? ""

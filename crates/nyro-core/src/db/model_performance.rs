@@ -11,20 +11,10 @@ pub struct ModelPerformanceStats {
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
-pub struct ModelPerformanceTiers {
-    pub low: ModelPerformanceStats,
-    pub medium: ModelPerformanceStats,
-    pub high: ModelPerformanceStats,
-    pub xhigh: ModelPerformanceStats,
-    pub max: ModelPerformanceStats,
-}
-
-#[derive(Debug, Clone, Default, Serialize)]
 pub struct PairPerformanceStats {
     pub provider_id: String,
     pub upstream_model: String,
     pub mixed: ModelPerformanceStats,
-    pub tiers: ModelPerformanceTiers,
     pub unclassified_count: i64,
     pub untrusted_count: i64,
 }
@@ -45,15 +35,10 @@ impl PairPerformanceStats {
     pub(crate) fn add_sample(&mut self, row: PerformanceSample) {
         self.unclassified_count = row.unclassified_count;
         self.untrusted_count = row.untrusted_count;
-        let stats = match row.group_name.as_deref() {
-            Some("mixed") => &mut self.mixed,
-            Some("low") => &mut self.tiers.low,
-            Some("medium") => &mut self.tiers.medium,
-            Some("high") => &mut self.tiers.high,
-            Some("xhigh") => &mut self.tiers.xhigh,
-            Some("max") => &mut self.tiers.max,
-            _ => return,
-        };
+        if row.group_name.is_none() {
+            return;
+        }
+        let stats = &mut self.mixed;
         stats.selected_request_count += 1;
         let Some(tokens) = row.output_tokens.filter(|n| *n > 0) else {
             return;
@@ -108,7 +93,7 @@ macro_rules! model_performance_method {
                 sql.push_bind(provider).push(" AND ").push($model_column).push(" = ").push_bind(model);
                 sql.push(" AND performance_metadata_version > 0 AND request_completion = 'completed' AND upstream_status_code BETWEEN 200 AND 299 AND client_status_code BETWEEN 200 AND 299 AND performance_completed_at BETWEEN ");
                 sql.push_bind(start).push(" AND ").push_bind(as_of);
-                sql.push("), grouped AS (SELECT 'mixed' AS group_name, eligible.* FROM eligible UNION ALL SELECT upstream_effort_tier AS group_name, eligible.* FROM eligible WHERE upstream_effort_status = 'present' AND upstream_effort_tier IN ('low','medium','high','xhigh','max')), ranked AS (SELECT grouped.*, ROW_NUMBER() OVER (PARTITION BY group_name ORDER BY performance_completed_at DESC, id DESC) AS rn FROM grouped) SELECT r.group_name, r.output_tokens, r.upstream_response_mode, r.performance_upstream_ms, r.performance_first_chunk_ms, r.performance_completed_at, (SELECT COUNT(*) FROM eligible WHERE upstream_effort_status <> 'present' OR upstream_effort_tier IS NULL OR upstream_effort_tier NOT IN ('low','medium','high','xhigh','max')) AS unclassified_count, (SELECT COUNT(*) FROM request_logs WHERE provider_id = ");
+                sql.push("), ranked AS (SELECT 'mixed' AS group_name, eligible.*, ROW_NUMBER() OVER (ORDER BY performance_completed_at DESC, id DESC) AS rn FROM eligible) SELECT r.group_name, r.output_tokens, r.upstream_response_mode, r.performance_upstream_ms, r.performance_first_chunk_ms, r.performance_completed_at, (SELECT COUNT(*) FROM eligible WHERE upstream_effort_status <> 'present' OR upstream_effort_tier IS NULL OR upstream_effort_tier NOT IN ('low','medium','high','xhigh','max')) AS unclassified_count, (SELECT COUNT(*) FROM request_logs WHERE provider_id = ");
                 sql.push_bind(provider).push(" AND ").push($model_column).push(" = ").push_bind(model);
                 sql.push(" AND request_completion = 'unknown' AND created_at BETWEEN ").push_bind(start).push(" AND ").push_bind(as_of);
                 sql.push(") AS untrusted_count FROM (SELECT 1 AS anchor) a LEFT JOIN ranked r ON r.rn <= 10");

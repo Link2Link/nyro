@@ -77,17 +77,19 @@ Provider 的协议端点明细。固定模式保留一条兼容记录；自适�
 
 ## provider_model_ratings
 
-The latest manually assigned integer score for an exact **provider + upstream model + effort scope**. A profile has a nullable common score and five nullable overrides (`low`, `medium`, `high`, `xhigh`, `max`); only explicitly set scopes have rows. Effective scores resolve override → common → unrated. Zero and an override equal to common remain explicit values. This is provider metadata, not a virtual-model route, endpoint, or usage record. There is no history or notes. Deleting a provider deletes all scopes; deleting a route/backend does not. Profile replacement is atomic across all six scopes.
+The latest manually assigned integer comprehensive score for an exact **provider + upstream model**. Each pair has one optional score; zero is a real rating and absence means unrated. This is provider metadata, not a virtual-model route, endpoint, or usage record. There is no history or notes. Deleting a provider deletes its ratings; deleting a route/backend does not. Ratings and performance statistics do not distinguish reasoning effort.
+
+The physical `effort` column and existing migration are retained solely for compatibility with databases created by the short-lived effort-rating implementation. All current rating operations use `effort = 'common'`. Historical non-common rows remain stored but are not displayed, copied, exported, or averaged into a comprehensive score. A pair with only historical overrides is unrated until a comprehensive score is explicitly assigned.
 
 | Column | Type | Default | Description |
 |---|---|---|---|
 | `provider_id` | TEXT NOT NULL (MySQL: VARCHAR(36)) | — | FK → `providers.id`, **ON DELETE CASCADE** |
 | `upstream_model` | TEXT NOT NULL (MySQL: VARBINARY(1024)) | — | Exact upstream model identifier, case-sensitive and byte-exact, including trailing spaces; 1–1024 UTF-8 bytes |
-| `effort` | TEXT NOT NULL (MySQL: VARCHAR(16), ASCII binary collation) | `'common'` | `CHECK`: one of `common`, `low`, `medium`, `high`, `xhigh`, `max`; no `minimal` rating scope (`minimal` observations map to low) |
+| `effort` | TEXT NOT NULL (MySQL: VARCHAR(16), ASCII binary collation) | `'common'` | Compatibility column: current rating operations use `common`; historical `low`, `medium`, `high`, `xhigh`, `max` rows are retained but inactive |
 | `score` | INTEGER NOT NULL | — | Integer **0–100 inclusive**, database `CHECK` constraint; zero is a real rating, not “unrated” |
-| `updated_at` | TEXT NOT NULL | — | Application-written UTC RFC3339 timestamp with millisecond precision, e.g. `2026-09-08T02:30:45.123Z`; profile saves retain unchanged scopes' times, new/changed values get server time |
+| `updated_at` | TEXT NOT NULL | — | Application-written UTC RFC3339 timestamp with millisecond precision, e.g. `2026-09-08T02:30:45.123Z` |
 
-**Primary key**: `(provider_id, upstream_model, effort)`. The API/service validates the 1024-UTF-8-byte limit consistently for all backends (bytes, not character count). Existing pair-only rows migrate to `effort = 'common'` with scores and timestamps unchanged. Missing scopes remain absent, not auto-materialized inherited rows. Legacy rating APIs operate on common only; copy/export/import preserve every explicit scope. Version-2 backup entries without `effort` default to common.
+**Physical primary key**: `(provider_id, upstream_model, effort)`; the public identity is the provider/model pair. The API/service validates the 1024-UTF-8-byte limit consistently for all backends (bytes, not character count). Existing pair-only rows migrate to `effort = 'common'` with scores and timestamps unchanged. Rating APIs and copy/export/import operate on comprehensive scores only; public rating objects have no effort field. Existing non-common database rows are not implicitly converted. Backup entries with no `effort` field or explicit `common` are accepted; entries with a non-common effort are rejected rather than silently imported as comprehensive scores. The physical schema is unchanged by this simplification, so the generated reference SQL remains valid.
 
 **Physical identity and validation**:
 - SQLite uses `TEXT COLLATE BINARY` for all three key columns, a byte-length check via `length(CAST(upstream_model AS BLOB))`, and `typeof(score) = 'integer'` plus the range check (SQLite's type affinity alone is not an integer constraint).
@@ -264,12 +266,13 @@ Bounded recovery may inspect retained final upstream request bodies from the las
 7 days to fill effort only; it cannot promote historical completion or use client
 `reasoning_effort` as fallback. New credible requests are required to populate charts.
 
-The Performance-only query uses one seven-day snapshot. For each exact pair and
-each mixed/tier group, it selects the latest ten credibly completed successful
-requests (completion time/ID descending), then averages valid per-request TPS.
-Invalid TPS does not fetch older replacements. Mixed includes unclassified effort;
-tiers use same-tier samples only. Counts/times and score resolution are documented
-in [model rating profiles](../design/model-ratings.md#performance-chart).
+The Performance-only query uses one seven-day snapshot. For each exact provider/model
+pair, it selects the latest ten credibly completed successful requests (completion
+time/ID descending), then averages valid per-request TPS. Invalid TPS does not fetch
+older replacements. All reasoning efforts, including unspecified or unclassified
+values, contribute to the same mixed statistics; no per-effort groups are queried.
+Effort metadata remains available for request diagnostics, not rating or TPS grouping.
+Counts and sample times are documented in [model ratings](../design/model-ratings.md#performance-chart).
 Existing usage APIs and their latency/TPS semantics are unchanged.
 
 **索引**：
