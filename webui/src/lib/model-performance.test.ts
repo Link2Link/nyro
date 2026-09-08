@@ -22,7 +22,7 @@ const stats = (average_tps: number | null = 42.123456, valid_tps_count = 5): Per
 });
 const model = (p = rating()): ModelPerformance => ({ rating: p, mixed: stats(999),
   unclassified_count: 2, untrusted_count: 1, status: "ready" });
-const snapshot = (...models: ModelPerformance[]): PerformanceResponse => ({ as_of: 3000, window_start: 0, models });
+const snapshot = (...models: ModelPerformance[]): PerformanceResponse => ({ as_of: 3000, window_start: null, models });
 function point(key: string, score: number, tps: number): PerformancePoint {
   return { key, pointId: `P${key}`, providerId: key, providerName: key, model: key, providerEnabled: true,
     score, tps, status: "ready", scoreUpdatedAt: time,

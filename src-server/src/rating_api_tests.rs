@@ -170,7 +170,8 @@ async fn rating_http_single_score_rejects_effort_fields_without_mutation() -> an
 }
 
 #[tokio::test]
-async fn rating_performance_http_has_frozen_window_and_explicit_no_samples() -> anyhow::Result<()> {
+async fn rating_performance_http_uses_retained_calls_and_explicit_no_samples() -> anyhow::Result<()>
+{
     let (_dir, router, id) = fixture().await?;
     assert_eq!(
         call(&router, "GET", "/api/v1/model-performance", None, false)
@@ -187,9 +188,10 @@ async fn rating_performance_http_has_frozen_window_and_explicit_no_samples() -> 
     let (status, response) = call(&router, "GET", "/api/v1/model-performance", None, true).await?;
     assert_eq!(status, StatusCode::OK);
     let data = &response["data"];
-    assert_eq!(
-        data["as_of"].as_i64().unwrap() - data["window_start"].as_i64().unwrap(),
-        604800000
+    assert!(data["as_of"].as_i64().unwrap() > 0);
+    assert!(
+        data["window_start"].is_null(),
+        "latest retained calls have no extra time-window filter"
     );
     assert_eq!(data["models"].as_array().unwrap().len(), 1);
     let item = &data["models"][0];

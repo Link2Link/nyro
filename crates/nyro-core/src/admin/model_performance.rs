@@ -1,9 +1,7 @@
-//! Performance-page-only aggregation. Legacy usage endpoints keep their metrics.
+//! Performance-page presentation of the same recent-call TPS used by model usage.
 
 use super::*;
 use crate::db::model_performance::ModelPerformanceStats;
-
-const PERFORMANCE_WINDOW_MS: i64 = 7 * 24 * 60 * 60 * 1000;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ModelPerformanceItem {
@@ -19,7 +17,8 @@ pub struct ModelPerformanceItem {
 #[derive(Debug, Clone, Serialize)]
 pub struct ModelPerformanceResponse {
     pub as_of: i64,
-    pub window_start: i64,
+    /// No extra time window: use the latest retained calls, like model usage.
+    pub window_start: Option<i64>,
     pub models: Vec<ModelPerformanceItem>,
 }
 
@@ -28,8 +27,8 @@ impl AdminService {
         &self,
         provider_id: Option<&str>,
     ) -> anyhow::Result<ModelPerformanceResponse> {
-        // Freeze the comprehensive ratings and time for a consistent snapshot.
-        // Only explicitly rated provider/model pairs need mixed TPS queries.
+        // Only explicitly rated pairs need statistics. Reuse the model-usage
+        // sampling and TPS rules; as_of is response time, not a time filter.
         let ratings = self.list_provider_model_ratings(provider_id).await?;
         let as_of = Utc::now().timestamp_millis();
         let pairs = ratings
@@ -82,7 +81,7 @@ impl AdminService {
             .collect();
         Ok(ModelPerformanceResponse {
             as_of,
-            window_start: as_of - PERFORMANCE_WINDOW_MS,
+            window_start: None,
             models,
         })
     }

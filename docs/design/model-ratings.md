@@ -145,17 +145,25 @@ visible point IDs remain. Search and provider filters are retained.
 `unclassified_count`, and `untrusted_count`; there is no `profile` or `tiers` field.
 `mixed` contains selected/valid counts, average TPS, and first/last sample times.
 
-The server selects the latest 10 successful, complete requests per pair within
-seven days, then averages valid per-request TPS. Output-limit truncations, failed,
-cancelled, incomplete, and untrusted historical requests are excluded. Invalid TPS
-samples are not replaced with older requests. Streaming TPS normally excludes time
-to first chunk; if the remaining generation interval is under 50 ms or first-chunk
-latency is at least 80% of total upstream duration, it uses the full upstream duration
-to avoid TPS spikes. Buffered TPS uses observed upstream duration. Fewer than three valid samples
-are hollow points. Missing TPS is not zero; partial or whole-query errors remain
-explicit. No upstream benchmark or model-usage fallback is requested by this page.
-Lifecycle observation and historical metadata recovery remain enabled; effort
-metadata may be retained for diagnostics but never splits displayed statistics.
+Performance uses the **same latest-ten retained-call sampling and TPS calculation as
+model usage statistics**, not a separate completion-qualified metric. There is no
+additional seven-day, HTTP-status, completion-state, reasoning-effort, or metadata-version
+filter. `window_start` is null; `as_of` describes when the response was fetched.
+Unknown completion (including MiniMax responses whose terminal is not recognized)
+does not invalidate usable output-token and timing data. Invalid TPS samples among
+the selected ten are not replaced with older requests.
+
+The backend shares its per-request TPS helper with model usage: streaming is detected
+by the stream flag or observed chunks; generation time normally subtracts the first
+chunk wait, with the existing 50 ms / 80% non-incremental fallback. Otherwise it uses
+upstream duration, falling back to total duration when upstream timing is absent.
+Mean TPS is the arithmetic mean of valid per-call values, not total tokens divided
+by total time. Points retain full numeric precision; displayed TPS uses one decimal.
+Fewer than three valid samples remain hollow. Missing data and read failures are
+explicit; no active upstream benchmark is performed. Existing completion metadata
+and historical recovery remain diagnostic only, not an eligibility gate. Legacy
+`unclassified_count` and `untrusted_count` response fields are retained as zeros for
+compatibility and no longer shown as invalid-call counts.
 
 ### Compatibility after removing effort ratings
 

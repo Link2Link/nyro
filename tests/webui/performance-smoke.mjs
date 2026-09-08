@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /**
  * Actual isolated Nyro admin server + scratch SQLite + Chromium/CDP; no npm packages.
- * Build first: cargo build -p nyro-server --no-default-features; (cd webui && npm run build)
+ * Build first: cargo build -p nyro-server; (cd webui && npm run build)
  * Run: node tests/webui/performance-smoke.mjs (Node >=22, Python >=3.9 sqlite3, Chromium).
  * Optional absolute paths: NYRO_SMOKE_BINARY, NYRO_SMOKE_WEBUI, CHROME_BIN.
  * Never uses a running Nyro instance, production DB, or external upstream.
@@ -147,8 +147,8 @@ async function select(label, text) {
   await waitFor(() => evaluate(`Boolean(${option})`), `option ${text}`);
   await clickExpression(option);
 }
-async function screenshot(name) {
-  await evaluate(`document.activeElement?.blur(); document.fonts.ready.then(() => new Promise(resolve => setTimeout(resolve, 350)))`);
+async function screenshot(name, { preserveFocus = false } = {}) {
+  await evaluate(`${preserveFocus ? '' : 'document.activeElement?.blur();'} document.fonts.ready.then(() => new Promise(resolve => setTimeout(resolve, 350)))`);
   const { data } = await send('Page.captureScreenshot', { format: 'png', captureBeyondViewport: false });
   const path = join(scratch, `${name}.png`);
   await writeFile(path, Buffer.from(data, 'base64'));
@@ -169,7 +169,7 @@ async function chartState() {
     return {points,rows,busy:Boolean(document.querySelector('button[aria-label="Refresh performance"],button[aria-label="刷新性能数据"]')?.disabled),counts:attrs(summary),axis:attrs(chart),summary:summary?.innerText,labels:[...document.querySelectorAll('[data-testid="performance-label"] text')].map(el=>el.textContent),body:document.body.innerText};
   })()`);
 }
-async function ready({ plotted = 8, missing = 2, errors = 0 } = {}) {
+async function ready({ plotted = 10, missing = 2, errors = 0 } = {}) {
   return waitFor(async () => {
     const state=await chartState();
     return state.points.reduce((n,p)=>n+p.members,0)===plotted && Number(state.counts['data-plotted-count'])===plotted && Number(state.counts['data-missing-count'])===missing && Number(state.counts['data-error-count'])===errors && !state.busy ? state : false;
@@ -258,6 +258,8 @@ try {
     { provider: alpha, model: 'model/no-history', score: 25 },
     { provider: beta, model: 'model/legacy-only', score: 90 },
     { provider: beta, model: 'model/single-rating', score: 55 },
+    { provider: beta, model: 'MiniMax-M3', score: 68 },
+    { provider: alpha, model: 'model/invalid-tokens-or-time', score: 35 },
   ];
   const unrated = { provider: alpha, model: 'model/unrated-fast' };
   for (const pair of pairs) await api(ratingPath(pair), 'PUT', { score: pair.score });
@@ -268,40 +270,61 @@ try {
     model_name: 'unrelated-logical-route', client_model: 'unrelated-client-alias',
     client_protocol: 'openai', upstream_protocol: 'openai', method: 'POST', path: '/v1/chat/completions',
     client_status_code: 200, upstream_status_code: 200, input_tokens: 10, output_tokens: output,
-    // Legacy metric intentionally disagrees: never fill trusted values from it.
-    cache_read_tokens: 0, latency_upstream_ms: 100, latency_total_ms: 200,
+    // TPS must use these same legacy fields as logs/model-usage: 1000ms by default.
+    cache_read_tokens: 0, latency_upstream_ms: upstream, latency_total_ms: upstream === null ? null : upstream + 100,
     is_stream: 0, stream_chunks_count: 0, stream_first_chunk_ms: null,
     performance_metadata_version: 1, upstream_effort_status: 'present', upstream_effort_raw: 'high', upstream_effort_tier: 'high',
     request_completion: 'completed', completion_reason: 'stop', upstream_response_mode: 'buffered',
-    performance_upstream_ms: upstream, performance_first_chunk_ms: null, performance_completed_at: now - 60_000 + logs.length * 100,
+    // Strict timing deliberately disagrees, including an old completion timestamp.
+    // Neither strict timing, version, completion, nor HTTP status may gate legacy TPS.
+    performance_upstream_ms: 7, performance_first_chunk_ms: 3, performance_completed_at: now - 30 * 86400000,
     ...extra,
   });
-  log(pairs[0], 9000); log(pairs[0], 8000);
+  log(pairs[0],900); log(pairs[0],800); // Older raw rows are outside the latest ten.
   for (let i=0;i<5;i++) {
-    log(pairs[0],100,2000,{upstream_response_mode:'stream',performance_first_chunk_ms:500});
+    // 100 / (2s - 0.5s) and 50 / 1s average to the existing 175/3 TPS.
+    log(pairs[0],100,2000,{is_stream:1,stream_chunks_count:10,stream_first_chunk_ms:500});
     log(pairs[0],50);
   }
-  log(pairs[1],225);
+  log(pairs[1],225); // Keep the expanded chart ceiling deterministic at 250.
   for(const pair of pairs.slice(2,6)) log(pair,pair===pairs[4]?80:60);
   const effort=pairs[6];
-  log(effort,9999,1000,{upstream_effort_raw:'minimal',upstream_effort_tier:'low'});
-  for(let i=0;i<10;i++) log(effort,40,1000,{upstream_effort_raw:i%2?'low':'minimal',upstream_effort_tier:'low'});
-  for(let i=0;i<3;i++) log(effort,70,1000,{upstream_effort_raw:'medium',upstream_effort_tier:'medium'});
-  log(effort,100); log(effort,0); // selected two, valid one (no refill from older rows)
+  for(let i=0;i<3;i++) log(effort,200,1000,{upstream_effort_raw:'minimal',upstream_effort_tier:'low'});
+  // Exactly these ten raw retained rows are selected, including one invalid token sample.
+  log(effort,0);
   log(effort,120,1000,{upstream_effort_raw:'max',upstream_effort_tier:'max'});
   for(const status of ['absent','unknown']) log(effort,150,1000,{upstream_effort_status:status,upstream_effort_raw:null,upstream_effort_tier:null});
-  for(const completion of ['failed','incomplete','cancelled','unknown']) log(effort,9999,1000,{request_completion:completion,completion_reason:completion==='incomplete'?'length':completion});
-  log(effort,9999,1000,{client_status_code:500}); log(effort,9999,1000,{upstream_status_code:429});
-  log(effort,9999,1000,{performance_completed_at:now-8*86400000});
-  log(pairs[8],500,1000,{performance_metadata_version:0,request_completion:'unknown',upstream_effort_status:'unknown',upstream_effort_raw:null,upstream_effort_tier:null,performance_upstream_ms:null,performance_completed_at:null});
-  log(pairs[9],55); log(unrated,9999);
+  for(const [i,completion] of ['failed','incomplete','cancelled','unknown'].entries()) log(effort,40+i*10,1000,{
+    request_completion:completion,completion_reason:completion==='incomplete'?'length':completion,
+    performance_metadata_version:i===0?0:i===1?99:1,
+  });
+  log(effort,80,1000,{client_status_code:500}); log(effort,90,1000,{upstream_status_code:429});
+  // Retained history older than seven days remains valid, even with metadata absent.
+  log(pairs[8],100,null,{created_at:now-8*86400000,latency_total_ms:2000});
+  for(const field of ['performance_metadata_version','upstream_effort_status','upstream_effort_raw','upstream_effort_tier',
+    'request_completion','completion_reason','upstream_response_mode','performance_upstream_ms','performance_first_chunk_ms','performance_completed_at']) delete logs.at(-1)[field];
+  log(pairs[9],55);
+  // Legacy non-incremental fallbacks: <50ms generation, or TTFT >=80% of upstream.
+  log(pairs[9],55,1000,{is_stream:1,stream_first_chunk_ms:980});
+  log(pairs[9],55,1000,{stream_chunks_count:10,stream_first_chunk_ms:900});
+  // New MiniMax logs can have unknown completion despite valid legacy tokens/timing.
+  log(pairs[10],2007,20617,{is_stream:1,stream_chunks_count:200,stream_first_chunk_ms:1798,
+    performance_metadata_version:1,request_completion:'unknown',completion_reason:null});
+  log(pairs[11],200); // Must not refill from this older valid row after selecting ten invalid rows.
+  for(let i=0;i<10;i++) {
+    const invalid=[{output_tokens:0},{output_tokens:-5},{output_tokens:null},
+      {latency_upstream_ms:0},{latency_upstream_ms:-1},{latency_upstream_ms:null,latency_total_ms:null}][i%6];
+    log(pairs[11],100,1000,invalid);
+  }
+  log(unrated,220);
   const seedPath = join(scratch, 'seed-logs.json'); await writeFile(seedPath, JSON.stringify(logs, null, 2));
   const python = trackChild('sqlite-seed', 'python3', ['-c', seedPython, scratch, dataDir, seedPath]);
   const seedExit = await new Promise((resolve, reject) => { python.once('error', reject); python.once('exit', resolve); });
   assert.equal(seedExit, 0, `Scratch SQLite seed failed: ${report.childLogs['sqlite-seed']}`);
   report.seed = JSON.parse(report.childLogs['sqlite-seed'].trim());
   const snapshot=await api('/model-performance'); report.snapshot=snapshot;
-  assert.equal(snapshot.as_of-snapshot.window_start,7*86400000); assert.equal(snapshot.models.length,pairs.length);
+  assert.equal(snapshot.window_start,null,'Retained logs have no seven-day performance cutoff');
+  assert.equal(snapshot.models.length,pairs.length);
   const statsFor=pair=>snapshot.models.find(item=>item.rating.provider_id===pair.provider.id && item.rating.upstream_model===pair.model);
   assert.ok(Math.abs(statsFor(pairs[0]).mixed.average_tps-175/3)<1e-10);
   assert.equal(statsFor(pairs[0]).mixed.selected_request_count,10);
@@ -309,15 +332,30 @@ try {
   assert.equal(grouped.mixed.selected_request_count,10); assert.equal(grouped.mixed.valid_tps_count,9);
   assert.equal(grouped.mixed.average_tps,90); assert.ok(!Object.hasOwn(grouped,'tiers'));
   assert.equal(grouped.rating.score,80);
-  assert.equal(grouped.unclassified_count,2); assert.equal(grouped.untrusted_count,1);
-  assert.equal(statsFor(pairs[8]).mixed.average_tps,null); assert.equal(statsFor(pairs[8]).untrusted_count,1);
-  assert.ok((await api(usagePath(pairs[8]))).average_tps>0, 'Legacy average exists but does not fill trusted unknown');
-  for(const item of snapshot.models) for(const stats of [item.mixed]){
+  assert.equal(statsFor(pairs[8]).mixed.average_tps,50,'No metadata, total-time fallback and retained >7-day history all remain valid');
+  assert.ok(statsFor(pairs[8]).mixed.first_sample_at<snapshot.as_of-7*86400000);
+  assert.equal(statsFor(pairs[10]).mixed.average_tps,2007/((20617-1798)/1000),'MiniMax unknown version1 uses legacy generation timing');
+  assert.equal(statsFor(pairs[10]).mixed.valid_tps_count,1);
+  assert.equal(statsFor(pairs[9]).mixed.average_tps,55,'Legacy streaming fallbacks use upstream duration for non-incremental responses');
+  assert.equal(statsFor(pairs[9]).mixed.valid_tps_count,3);
+  assert.equal(statsFor(pairs[7]).mixed.selected_request_count,0);
+  assert.equal(statsFor(pairs[11]).mixed.selected_request_count,10);
+  assert.equal(statsFor(pairs[11]).mixed.valid_tps_count,0,'Invalid latest samples do not refill from older valid history');
+  assert.deepEqual(snapshot.models.filter(item=>item.mixed.average_tps===null).map(item=>item.rating.upstream_model).sort(),
+    [pairs[7].model,pairs[11].model].sort(),'Only no-history and invalid tokens/timing are missing TPS');
+  report.usageComparisons=[];
+  for(const pair of pairs){
+    const item=statsFor(pair),stats=item.mixed,usage=await api(usagePath(pair));
+    assert.equal(stats.average_tps,usage.average_tps,`Exact /model-performance vs /model-usage average_tps parity: ${pair.provider.name}/${pair.model}`);
+    assert.equal(stats.selected_request_count,usage.recent_sample_count);
     assert.ok(stats.selected_request_count<=10);
-    if(stats.average_tps!==null) assert.ok(Number.isFinite(stats.first_sample_at) && stats.first_sample_at>=snapshot.window_start && stats.last_sample_at<=snapshot.as_of);
+    assert.equal(item.untrusted_count,0,'Valid legacy logs must not be labeled untrusted');
+    assert.ok(!Object.hasOwn(item,'profile') && !Object.hasOwn(item,'tiers'));
+    if(stats.average_tps!==null) assert.ok(Number.isFinite(stats.first_sample_at) && stats.first_sample_at>=0 && stats.last_sample_at<=snapshot.as_of);
+    report.usageComparisons.push({provider_id:pair.provider.id,model:pair.model,mixed:stats,usage});
   }
   const expected=expectedRows(snapshot,pairs);
-  check('single ratings and trusted seven-day per-pair ten completed requests; invalid/old/error/cancel/token-limit/legacy excluded',report.seed.database);
+  check('exact legacy usage TPS parity for every pair; latest ten raw logs across statuses/versions/completion; retained old and MiniMax unknown logs valid',report.seed.database);
 
   const browser = trackChild('chrome', chrome, ['--headless', '--no-sandbox', '--disable-gpu', '--disable-dev-shm-usage', '--disable-background-networking', '--no-first-run', '--no-default-browser-check', '--remote-debugging-port=0', `--user-data-dir=${join(scratch, 'chrome')}`, 'about:blank']);
   const ws = await waitFor(() => {
@@ -368,11 +406,22 @@ try {
   assert.equal(report.apiCalls.filter(call=>call.path==='/api/v1/model-performance').length,1,'One batch snapshot on initial navigation');
   assert.ok(!await evaluate(`document.querySelector('aside[aria-label="Complete numbered index"]')!==null`));
   assert.ok(!state.body.includes(unrated.model));
-  for(const pair of [pairs[7],pairs[8]]) {const row=await detailRow(pair);assert.ok(row[1].includes('–') && row[4].includes('No valid TPS'));}
+  for(const pair of [pairs[7],pairs[11]]) {const row=await detailRow(pair);assert.ok(row[1].includes('–') && row[4].includes('No valid TPS'));}
+  for(const pair of [pairs[8],pairs[10]]) {
+    const row=await detailRow(pair);
+    assert.ok(row[1].includes(`${statsFor(pair).mixed.average_tps.toFixed(1)} tok/s`) && row[4].includes('Plotted'),'Retained old/unknown logs plot with one-decimal TPS');
+  }
+  assert.ok(!/untrusted|unconfirmed requests/i.test(state.body),'No untrusted-history warning for legacy-valid samples');
   assert.equal(expected.length,pairs.length,'Exactly one row per rated provider/model');
   assert.ok(!await evaluate(`document.querySelector('[aria-label="Filter by tier"]')!==null`),'No effort selector');
-  check('batch snapshot, single provider/model scores, mixed TPS, one-sample hollow, full numbered index, actual coordinates');
+  check('batch snapshot, single provider/model scores, legacy-valid mixed TPS, one-decimal display, one-sample hollow, model labels and actual coordinates');
   await screenshot('performance-en-desktop');
+  const miniMax=expected.find(row=>row.pair===pairs[10]);
+  await evaluate(`(${circleExpression(miniMax.id)}).scrollIntoView({block:'center'}); (${circleExpression(miniMax.id)}).parentElement.focus()`); await key('Enter');
+  await waitFor(()=>evaluate(`document.querySelector('[role="tooltip"]')?.innerText.includes('106.6 tok/s')`),'MiniMax unknown-completion tooltip uses one decimal');
+  await screenshot('performance-minimax-unknown-tooltip',{preserveFocus:true});
+  assert.ok(await evaluate(`document.querySelector('[role="tooltip"]')?.innerText.includes('106.6 tok/s')`),'MiniMax tooltip remains visible during evidence capture');
+  await key('Escape');
 
   const overlap=state.points.find(point=>point.members===2);
   assert.ok(overlap);
@@ -386,7 +435,7 @@ try {
   await waitFor(tooltip,'focus tooltip');
   const text=await tooltip();
   for(const row of expected.filter(row=>[...overlap.ids,nearby.id].includes(row.id))) {
-    for(const value of [row.pair.model,row.pair.provider.name,row.pair.provider.id,`${row.score}/100`,`${row.stats.average_tps} tok/s`,`Valid TPS ${row.stats.valid_tps_count} / selected requests ${row.stats.selected_request_count}`]) assert.ok(text.includes(value),`Tooltip full detail ${value}`);
+    for(const value of [row.pair.model,row.pair.provider.name,row.pair.provider.id,`${row.score}/100`,`${row.stats.average_tps.toFixed(1)} tok/s`,`Valid TPS ${row.stats.valid_tps_count} / selected requests ${row.stats.selected_request_count}`]) assert.ok(text.includes(value),`Tooltip full detail ${value}`);
   }
   await key('Escape'); await waitFor(async()=>!await tooltip(),'Escape dismisses tooltip');
   const selected=expected.find(row=>row.pair===effort);
@@ -422,6 +471,7 @@ try {
   await waitFor(() => evaluate(`document.querySelector('h1')?.textContent === '性能'`), 'Chinese locale');
   const chineseState = await ready();
   assert.ok(chineseState.summary.includes('无有效 TPS'), 'Chinese omission summary');
+  assert.ok(!chineseState.body.includes('不可信历史'),'No Chinese untrusted-history warning for legacy-valid samples');
   await screenshot('performance-zh-desktop');
   await send('Emulation.setDeviceMetricsOverride', { width: 390, height: 844, deviceScaleFactor: 1, mobile: true });
   await waitFor(() => evaluate(`document.querySelector('main').getBoundingClientRect().width >= 220`), 'usable mobile main content width');
@@ -438,12 +488,13 @@ try {
   await clickExpression(`(${circleExpression(selected.id)})`);
   await waitFor(()=>evaluate(`Boolean(document.querySelector('[role="tooltip"]'))`),'Mobile tap opens tooltip');
   assert.ok(await evaluate(`(()=>{const r=document.querySelector('[role="tooltip"]').getBoundingClientRect();return r.left>=0 && r.top>=0 && r.right<=innerWidth && r.bottom<=innerHeight})()`),'Mobile tooltip stays within viewport');
-  await screenshot('performance-en-mobile-tooltip');
+  await screenshot('performance-en-mobile-tooltip',{preserveFocus:true});
+  assert.ok(await tooltip(),'Mobile tooltip remains visible during evidence capture');
   await key('Escape');
   check('EN/ZH desktop/mobile, no permanent index, bounded mobile tap tooltip, no page overflow');
 
   await send('Emulation.setDeviceMetricsOverride', { width: 1440, height: 1000, deviceScaleFactor: 1, mobile: false });
-  faultMode='partial'; await reload(); state=await ready({plotted:7,errors:1});
+  faultMode='partial'; await reload(); state=await ready({plotted:9,errors:1});
   assert.ok(state.body.includes('Injected profile statistics failure')); await screenshot('performance-partial-error');
   faultMode=null; await refresh(); await ready();
   for(const mode of ['negative','zero','string','infinity']){
@@ -451,7 +502,7 @@ try {
     await waitFor(()=>evaluate(`Boolean(document.querySelector('[role="alert"]'))`),`${mode} invalid snapshot warning`);
     assert.equal((await chartState()).points.length,0,'Invalid batch must not invent zero or plot stale values');
   }
-  faultMode='null'; await reload(); await ready({plotted:7,missing:3});
+  faultMode='null'; await reload(); await ready({plotted:9,missing:3});
   await screenshot('performance-null-tps');
   faultMode=null; await refresh(); await ready();
   faultMode='snapshot'; await refresh();

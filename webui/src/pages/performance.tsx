@@ -48,9 +48,9 @@ export default function PerformancePage() {
         </Button>
       </div>
       <div className="space-y-2 rounded-xl border border-blue-100 bg-blue-50/50 px-4 py-3 text-xs leading-relaxed text-slate-600">
-        <p>{isZh ? "横轴从 0 开始，按当前最高分向上取整至 10 的倍数（满分 100）；纵轴为平均 TPS（输出 token/秒），默认范围 0–100，超过 100 时自动扩大上限。统计窗口为最近 7 天，每个分组取最近 10 次成功且完整结束的请求（排除输出上限截断），再平均有效 TPS；不足 3 个有效样本为空心点。不是主动测速或全历史平均。" : "X starts at 0 and rounds the visible maximum score up to a multiple of 10 (scores remain out of 100); Y is average TPS (output tokens/second), defaulting to 0–100 and expanding automatically when values exceed 100. Over the last 7 days, each group selects its latest 10 successful, complete requests (output-limit truncations excluded), then averages valid TPS samples. Fewer than 3 valid samples are hollow. This is not an active benchmark or an all-time average."}</p>
-        <p>{isZh ? "统一显示综合评分 × 混合 TPS，不区分推理强度。仅统计完整成功请求；未评分或没有有效 TPS 的模型不绘图。" : "Shows one comprehensive score × mixed TPS, without reasoning-effort breakdowns. Only successful, complete requests contribute; unrated models or models without valid TPS are not plotted."}</p>
-        {performance.data && <p>{isZh ? "服务端快照" : "Server snapshot"}: {formatLocalDateTime(performance.data.as_of)} · {isZh ? "窗口起始" : "Window starts"}: {formatLocalDateTime(performance.data.window_start)}</p>}
+        <p>{isZh ? "横轴从 0 开始，按当前最高分向上取整至 10 的倍数（满分 100）；纵轴为平均 TPS（输出 token/秒），默认范围 0–100，超过 100 时自动扩大上限。TPS 与模型调用统计保持一致：从已保留日志中取每个供应商模型最近 10 次调用，对有效的逐请求 TPS 求平均；不按完成状态、推理强度或额外的 7 天窗口筛选。不足 3 个有效样本为空心点。不是主动测速或全历史平均。" : "X starts at 0 and rounds the visible maximum score up to a multiple of 10 (scores remain out of 100); Y is average TPS (output tokens/second), defaulting to 0–100 and expanding automatically when values exceed 100. TPS uses the same rules as model usage: select each provider/model’s latest 10 calls from retained logs and average valid per-request TPS, without completion-state, reasoning-effort or additional 7-day filtering. Fewer than 3 valid samples are hollow. This is not an active benchmark or an all-time average."}</p>
+        <p>{isZh ? "统一显示综合评分 × 平均 TPS，不区分推理强度。完成状态未知不代表 TPS 无效；仅缺少有效输出 token 或耗时才无法计算。未评分或没有有效 TPS 的模型不绘图。" : "Shows one comprehensive score × average TPS, without reasoning-effort breakdowns. Unknown completion does not invalidate TPS; usable output tokens and timing determine whether it can be calculated. Unrated models or models without valid TPS are not plotted."}</p>
+        {performance.data && <p>{isZh ? "统计获取时间" : "Statistics fetched"}: {formatLocalDateTime(performance.data.as_of)}</p>}
       </div>
       {(performance.isPending || providers.isPending) && <p role="status" className="text-sm text-slate-500">{isZh ? "正在加载性能快照与供应商…" : "Loading the performance snapshot and providers…"}</p>}
       {(performance.isError || providers.isError) && <div role="alert" className="space-y-2 rounded-xl border border-red-200 bg-red-50 p-4 text-sm text-red-700">
@@ -93,7 +93,7 @@ export default function PerformancePage() {
               <td className="p-2"><p>{formatLocalDateTime(row.firstSampleAt)}</p><p>{formatLocalDateTime(row.lastSampleAt)}</p></td>
               <td className="max-w-80 p-2"><Badge variant={row.status === "error" ? "danger" : row.status === "ready" ? "success" : "outline"}>{row.status === "ready" ? (isZh ? "已绘图" : "Plotted") : row.status === "missing" ? (isZh ? "无有效 TPS" : "No valid TPS") : (isZh ? "统计失败" : "Statistics failed")}</Badge>
                 {row.error && <p role="alert" className="mt-1 whitespace-pre-wrap break-words text-red-700">{row.error}</p>}
-                <p className="mt-1 text-slate-500">{isZh ? `不可信历史或未确认完成请求：${row.untrustedCount}` : `Untrusted historical or unconfirmed requests: ${row.untrustedCount}`}</p>
+                {row.status === "missing" && <p className="mt-1 text-slate-500">{isZh ? (row.selectedRequestCount === 0 ? "暂无调用记录" : "最近调用缺少有效输出 token 或耗时") : (row.selectedRequestCount === 0 ? "No recorded calls" : "Recent calls lack usable output tokens or timing")}</p>}
               </td>
             </tr>)}</tbody>
           </table></div>

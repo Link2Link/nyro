@@ -1082,7 +1082,8 @@ impl LogStore for MysqlLogStore {
             as_of,
             sqlx::MySql,
             "BINARY upstream_model",
-            "CAST(output_tokens AS SIGNED)"
+            "CAST(created_at AS SIGNED)",
+            "0"
         )
     }
     async fn append_batch(&self, entries: Vec<LogEntry>) -> anyhow::Result<()> {
@@ -1398,17 +1399,17 @@ impl LogStore for MysqlLogStore {
              CAST(COALESCE(SUM(output_tokens), 0) AS SIGNED) AS total_output_tokens, \
              CAST(COALESCE(SUM(cache_read_tokens), 0) AS SIGNED) AS total_cache_read_tokens, \
              CAST(MAX(created_at) AS SIGNED) AS last_called_at \
-             FROM request_logs WHERE provider_id = ? AND upstream_model = ?",
+             FROM request_logs WHERE provider_id = ? AND BINARY upstream_model = ?",
         )
         .bind(provider_id)
         .bind(upstream_model)
         .fetch_one(&self.pool)
         .await?;
         let samples = sqlx::query_as::<_, RecentModelPerformance>(
-            "SELECT output_tokens, COALESCE(is_stream, 0) AS is_stream, \
-             stream_chunks_count, latency_upstream_ms, latency_total_ms, stream_first_chunk_ms \
-             FROM request_logs WHERE provider_id = ? AND upstream_model = ? \
-             ORDER BY created_at DESC LIMIT 10",
+            "SELECT COALESCE(output_tokens, 0) AS output_tokens, COALESCE(is_stream, 0) AS is_stream, \
+             COALESCE(stream_chunks_count, 0) AS stream_chunks_count, latency_upstream_ms, latency_total_ms, stream_first_chunk_ms \
+             FROM request_logs WHERE provider_id = ? AND BINARY upstream_model = ? \
+             ORDER BY created_at DESC, id DESC LIMIT 10",
         )
         .bind(provider_id)
         .bind(upstream_model)

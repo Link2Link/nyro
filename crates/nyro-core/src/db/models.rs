@@ -752,6 +752,37 @@ pub struct RecentModelPerformance {
     pub stream_first_chunk_ms: Option<i64>,
 }
 
+impl RecentModelPerformance {
+    /// The legacy request-log TPS formula, shared by usage and performance views.
+    pub fn tps(&self) -> Option<f64> {
+        let is_stream = self.is_stream || self.stream_chunks_count > 0;
+        let generation_ms = match (
+            is_stream,
+            self.latency_upstream_ms,
+            self.stream_first_chunk_ms,
+        ) {
+            (true, Some(upstream), Some(first_token)) if upstream > 0 => {
+                let generation = upstream - first_token;
+                let looks_non_incremental = generation < 50
+                    || generation <= 0
+                    || first_token as f64 / upstream as f64 >= 0.8;
+                Some(if looks_non_incremental {
+                    upstream
+                } else {
+                    generation
+                })
+            }
+            _ => self.latency_upstream_ms.or(self.latency_total_ms),
+        };
+        if self.output_tokens > 0 {
+            if let Some(generation_ms) = generation_ms.filter(|value| *value > 0) {
+                return Some(self.output_tokens as f64 / (generation_ms as f64 / 1000.0));
+            }
+        }
+        None
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ModelUsageStats {
     pub request_count: i64,
@@ -772,31 +803,9 @@ impl ModelUsageStats {
         let mut first_token_count = 0;
 
         for sample in samples {
-            let is_stream = sample.is_stream || sample.stream_chunks_count > 0;
-            let generation_ms = match (
-                is_stream,
-                sample.latency_upstream_ms,
-                sample.stream_first_chunk_ms,
-            ) {
-                (true, Some(upstream), Some(first_token)) if upstream > 0 => {
-                    let generation = upstream - first_token;
-                    let looks_non_incremental = generation < 50
-                        || generation <= 0
-                        || first_token as f64 / upstream as f64 >= 0.8;
-                    Some(if looks_non_incremental {
-                        upstream
-                    } else {
-                        generation
-                    })
-                }
-                _ => sample.latency_upstream_ms.or(sample.latency_total_ms),
-            };
-
-            if sample.output_tokens > 0 {
-                if let Some(generation_ms) = generation_ms.filter(|value| *value > 0) {
-                    tps_total += sample.output_tokens as f64 / (generation_ms as f64 / 1000.0);
-                    tps_count += 1;
-                }
+            if let Some(tps) = sample.tps() {
+                tps_total += tps;
+                tps_count += 1;
             }
             if let Some(first_token_ms) = sample.stream_first_chunk_ms.filter(|value| *value >= 0) {
                 first_token_total += first_token_ms as f64;

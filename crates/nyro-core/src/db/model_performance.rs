@@ -1,4 +1,4 @@
-//! Completion-aware performance samples, separate from the legacy usage metric.
+//! Performance samples from the same retained request logs as model usage.
 use serde::Serialize;
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -21,86 +21,54 @@ pub struct PairPerformanceStats {
 
 #[derive(sqlx::FromRow)]
 pub(crate) struct PerformanceSample {
-    pub group_name: Option<String>,
-    pub output_tokens: Option<i64>,
-    pub upstream_response_mode: Option<String>,
-    pub performance_upstream_ms: Option<i64>,
-    pub performance_first_chunk_ms: Option<i64>,
-    pub performance_completed_at: Option<i64>,
-    pub unclassified_count: i64,
-    pub untrusted_count: i64,
+    pub created_at: i64,
+    #[sqlx(flatten)]
+    pub performance: super::models::RecentModelPerformance,
 }
 
-impl PairPerformanceStats {
-    pub(crate) fn add_sample(&mut self, row: PerformanceSample) {
-        self.unclassified_count = row.unclassified_count;
-        self.untrusted_count = row.untrusted_count;
-        if row.group_name.is_none() {
-            return;
+impl ModelPerformanceStats {
+    pub(crate) fn from_samples(rows: &[PerformanceSample]) -> Self {
+        let mut stats = Self {
+            selected_request_count: rows.len() as i64,
+            ..Default::default()
+        };
+        let mut tps_total = 0.0;
+        for row in rows {
+            let Some(tps) = row.performance.tps() else {
+                continue;
+            };
+            tps_total += tps;
+            stats.valid_tps_count += 1;
+            let at = row.created_at;
+            stats.first_sample_at = Some(stats.first_sample_at.map_or(at, |old| old.min(at)));
+            stats.last_sample_at = Some(stats.last_sample_at.map_or(at, |old| old.max(at)));
         }
-        let stats = &mut self.mixed;
-        stats.selected_request_count += 1;
-        let Some(tokens) = row.output_tokens.filter(|n| *n > 0) else {
-            return;
-        };
-        let Some(upstream) = row.performance_upstream_ms.filter(|n| *n > 0) else {
-            return;
-        };
-        let duration = match row.upstream_response_mode.as_deref() {
-            Some("buffered") => upstream,
-            Some("stream") => {
-                let Some(first) = row
-                    .performance_first_chunk_ms
-                    .filter(|n| *n >= 0 && *n <= upstream)
-                else {
-                    return;
-                };
-                let generation = upstream - first;
-                if generation < 50 || first as f64 / upstream as f64 >= 0.8 {
-                    upstream
-                } else {
-                    generation
-                }
-            }
-            _ => return,
-        };
-        let tps = tokens as f64 * 1000.0 / duration as f64;
-        if !tps.is_finite() || tps <= 0.0 {
-            return;
-        }
-        let Some(at) = row.performance_completed_at else {
-            return;
-        };
-        stats.valid_tps_count += 1;
-        let n = stats.valid_tps_count as f64;
-        stats.average_tps = Some(stats.average_tps.unwrap_or(0.0) * ((n - 1.0) / n) + tps / n);
-        stats.first_sample_at = Some(stats.first_sample_at.map_or(at, |old| old.min(at)));
-        stats.last_sample_at = Some(stats.last_sample_at.map_or(at, |old| old.max(at)));
+        stats.average_tps =
+            (stats.valid_tps_count > 0).then_some(tps_total / stats.valid_tps_count as f64);
+        stats
     }
 }
 
-// Shared SQL and reduction guarantee identical backend semantics. Each pair uses
-// one narrow scalar-only window query (never request/response payload columns).
+// Keep ordering and raw scalar selection aligned with model_usage_stats. Invalid
+// rows consume the latest-ten window; completion metadata remains diagnostic only.
 macro_rules! model_performance_method {
-    ($this:expr, $pairs:expr, $as_of:expr, $database:ty, $model_column:expr, $token_cast:expr) => {{
+    ($this:expr, $pairs:expr, $as_of:expr, $database:ty, $model_column:expr, $timestamp_cast:expr, $stream_default:expr) => {{
             let pairs = $pairs;
-            let as_of = $as_of;
-            let start = as_of.saturating_sub(604_800_000);
+            let _ = $as_of; // Compatibility: usage statistics cover all retained logs.
             let mut result = Vec::with_capacity(pairs.len());
             for (provider, model) in pairs {
-                let mut sql = sqlx::QueryBuilder::<$database>::new("WITH eligible AS (SELECT id, upstream_effort_status, upstream_effort_tier, ");
-                sql.push($token_cast).push(" AS output_tokens, upstream_response_mode, performance_upstream_ms, performance_first_chunk_ms, performance_completed_at FROM request_logs WHERE provider_id = ");
+                let mut sql = sqlx::QueryBuilder::<$database>::new("SELECT ");
+                sql.push($timestamp_cast).push(" AS created_at, COALESCE(output_tokens, 0) AS output_tokens, COALESCE(is_stream, ");
+                sql.push($stream_default).push(") AS is_stream, COALESCE(stream_chunks_count, 0) AS stream_chunks_count, latency_upstream_ms, latency_total_ms, stream_first_chunk_ms FROM request_logs WHERE provider_id = ");
                 sql.push_bind(provider).push(" AND ").push($model_column).push(" = ").push_bind(model);
-                sql.push(" AND performance_metadata_version > 0 AND request_completion = 'completed' AND upstream_status_code BETWEEN 200 AND 299 AND client_status_code BETWEEN 200 AND 299 AND performance_completed_at BETWEEN ");
-                sql.push_bind(start).push(" AND ").push_bind(as_of);
-                sql.push("), ranked AS (SELECT 'mixed' AS group_name, eligible.*, ROW_NUMBER() OVER (ORDER BY performance_completed_at DESC, id DESC) AS rn FROM eligible) SELECT r.group_name, r.output_tokens, r.upstream_response_mode, r.performance_upstream_ms, r.performance_first_chunk_ms, r.performance_completed_at, (SELECT COUNT(*) FROM eligible WHERE upstream_effort_status <> 'present' OR upstream_effort_tier IS NULL OR upstream_effort_tier NOT IN ('low','medium','high','xhigh','max')) AS unclassified_count, (SELECT COUNT(*) FROM request_logs WHERE provider_id = ");
-                sql.push_bind(provider).push(" AND ").push($model_column).push(" = ").push_bind(model);
-                sql.push(" AND request_completion = 'unknown' AND created_at BETWEEN ").push_bind(start).push(" AND ").push_bind(as_of);
-                sql.push(") AS untrusted_count FROM (SELECT 1 AS anchor) a LEFT JOIN ranked r ON r.rn <= 10");
+                sql.push(" ORDER BY request_logs.created_at DESC, id DESC LIMIT 10");
                 let rows = sql.build_query_as::<crate::db::model_performance::PerformanceSample>().fetch_all(&$this.pool).await?;
-                let mut pair = crate::db::PairPerformanceStats { provider_id: provider.clone(), upstream_model: model.clone(), ..Default::default() };
-                for row in rows { pair.add_sample(row); }
-                result.push(pair);
+                result.push(crate::db::PairPerformanceStats {
+                    provider_id: provider.clone(),
+                    upstream_model: model.clone(),
+                    mixed: crate::db::ModelPerformanceStats::from_samples(&rows),
+                    ..Default::default()
+                });
             }
             Ok(result)
     }};

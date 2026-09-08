@@ -106,8 +106,7 @@ export function formatTokenCount(value: number | null | undefined): string {
 
 export function formatTps(tps: number | null | undefined): string {
   if (tps == null || !Number.isFinite(tps) || tps <= 0) return "–";
-  if (tps < 100) return `${tps.toFixed(1)} tok/s`;
-  return `${Math.round(tps)} tok/s`;
+  return `${tps.toFixed(1)} tok/s`;
 }
 
 /** 计算 TPS 所需的最小字段集(结构兼容 `RequestLog`)。 */
@@ -126,10 +125,10 @@ export interface TpsInput {
  */
 export function generationMsOf(log: TpsInput | null | undefined): number | null {
   if (!log) return null;
-  const isStream = log.is_stream ?? (log.stream_chunks_count ?? 0) > 0;
+  const isStream = log.is_stream === true || (log.stream_chunks_count ?? 0) > 0;
   const upstream = log.latency_upstream_ms ?? null;
   const ttfb = log.stream_first_chunk_ms ?? null;
-  if (isStream && upstream != null && ttfb != null) {
+  if (isStream && upstream != null && upstream > 0 && ttfb != null) {
     const gen = upstream - ttfb;
     // 净生成耗时必须真实反映增量解码阶段。当首字节延迟占上游耗时比例过高
     // (上游未真正增量流式,而是在服务端算完后一口气 flush),gen 会趋近于 0,

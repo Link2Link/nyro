@@ -4,7 +4,7 @@ import {
   performanceTpsMaximum, performanceScoreMaximum, type PerformancePoint,
 } from "@/lib/model-performance";
 import { createPortal } from "react-dom";
-import { formatLocalDateTime } from "@/lib/format";
+import { formatLocalDateTime, formatTps } from "@/lib/format";
 
 /** Labels may move, but point centers always retain their actual score/TPS coordinates. */
 export function ModelPerformanceChart({ points, isZh }: { points: PerformancePoint[]; isZh: boolean }) {
@@ -24,7 +24,7 @@ export function ModelPerformanceChart({ points, isZh }: { points: PerformancePoi
   const details = points.filter((point) => active.includes(point.key));
   const hiddenLabels = groups.filter((group) => !labels.has(group.key)).length;
   const { width, height, left, right, top, bottom } = PERFORMANCE_CHART;
-  const title = (point: PerformancePoint) => `${point.model} · ${point.providerName} · ${point.score}/100 · ${point.tps} tok/s`;
+  const title = (point: PerformancePoint) => `${point.model} · ${point.providerName} · ${point.score}/100 · ${formatTps(point.tps)}`;
   const show = (x: number, y: number, element: SVGGElement) => {
     cancelClose();
     const rect = element.getBoundingClientRect();
@@ -97,7 +97,7 @@ export function ModelPerformanceChart({ points, isZh }: { points: PerformancePoi
         {details.map((point) => <div key={point.key} data-point-id={point.pointId} className="space-y-1 border-b border-slate-100 py-2 last:border-0">
           <strong className="block whitespace-pre-wrap break-all" style={{ color: point.color }}>{point.model}</strong>
           <span className="block break-all">{point.providerName} · {point.providerId}</span>
-          <span className="block font-semibold">{point.score}/100 · {point.tps} tok/s</span>
+          <span className="block font-semibold">{point.score}/100 · {formatTps(point.tps)}</span>
           <span className="block">{isZh ? `有效 TPS ${point.validTpsCount} / 已选请求 ${point.selectedRequestCount}` : `Valid TPS ${point.validTpsCount} / selected requests ${point.selectedRequestCount}`}</span>
           {point.validTpsCount < 3 && <span className="block text-amber-700">{isZh ? "低样本量" : "Low sample count"}</span>}
           <span className="block">{isZh ? "样本起始" : "First sample"}: {formatLocalDateTime(point.firstSampleAt)}</span>

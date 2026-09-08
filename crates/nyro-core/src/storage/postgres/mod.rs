@@ -1048,7 +1048,8 @@ impl LogStore for PostgresLogStore {
             as_of,
             sqlx::Postgres,
             "upstream_model COLLATE \"C\"",
-            "CAST(output_tokens AS BIGINT)"
+            "CAST(created_at AS BIGINT)",
+            "FALSE"
         )
     }
     async fn append_batch(&self, entries: Vec<LogEntry>) -> anyhow::Result<()> {
@@ -1380,10 +1381,10 @@ impl LogStore for PostgresLogStore {
         .fetch_one(&self.pool)
         .await?;
         let samples = sqlx::query_as::<_, RecentModelPerformance>(
-            "SELECT output_tokens, COALESCE(is_stream, FALSE) AS is_stream, \
-             stream_chunks_count, latency_upstream_ms, latency_total_ms, stream_first_chunk_ms \
+            "SELECT COALESCE(output_tokens, 0) AS output_tokens, COALESCE(is_stream, FALSE) AS is_stream, \
+             COALESCE(stream_chunks_count, 0) AS stream_chunks_count, latency_upstream_ms, latency_total_ms, stream_first_chunk_ms \
              FROM request_logs WHERE provider_id = $1 AND upstream_model = $2 \
-             ORDER BY created_at DESC LIMIT 10",
+             ORDER BY created_at DESC, id DESC LIMIT 10",
         )
         .bind(provider_id)
         .bind(upstream_model)

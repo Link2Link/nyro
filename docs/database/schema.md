@@ -258,22 +258,28 @@ A per-attempt response Body observer resolves delivery/terminal state **before l
 persistence**. Completed means gateway-observed Body EOS plus a successful original
 protocol outcome, not a client ACK. Success HTTP status or token usage alone cannot
 prove completion. Cancellation, timeout, parse/transport failure, truncation and
-length/token-limit outcomes are excluded from performance samples.
+length/token-limit outcomes remain distinguishable in this diagnostic metadata,
+but completion state is no longer a TPS sampling gate.
 
 **Historical migration is conservative**: every pre-feature row defaults to unknown
 completion, regardless of recorded status, usage, terminal marker, or response body.
 Bounded recovery may inspect retained final upstream request bodies from the last
 7 days to fill effort only; it cannot promote historical completion or use client
-`reasoning_effort` as fallback. New credible requests are required to populate charts.
+`reasoning_effort` as fallback. This diagnostic recovery no longer determines whether
+existing requests can populate performance charts.
 
-The Performance-only query uses one seven-day snapshot. For each exact provider/model
-pair, it selects the latest ten credibly completed successful requests (completion
-time/ID descending), then averages valid per-request TPS. Invalid TPS does not fetch
-older replacements. All reasoning efforts, including unspecified or unclassified
-values, contribute to the same mixed statistics; no per-effort groups are queried.
-Effort metadata remains available for request diagnostics, not rating or TPS grouping.
+The Performance query now shares the model-usage TPS helper and samples the latest
+ten retained calls for each exact provider/model, ordered by `created_at DESC, id DESC`.
+There is no additional seven-day, completion, status, effort, or metadata-version filter.
+It reads the existing `output_tokens`, stream/chunk flags, `latency_upstream_ms`,
+`latency_total_ms`, and `stream_first_chunk_ms`, not the `performance_*` evidence timings.
+Valid per-call TPS values are averaged; invalid samples consume a slot without fetching
+older replacements. Sample times are the valid rows' `created_at` timestamps.
+The API returns `window_start: null`; compatibility diagnostic counters are zero.
+Existing completion/effort metadata remains available for diagnostics only.
 Counts and sample times are documented in [model ratings](../design/model-ratings.md#performance-chart).
-Existing usage APIs and their latency/TPS semantics are unchanged.
+Existing usage calculations retain their formula; usage and performance now also share
+stable ID tie-breaking, null token/chunk handling, and exact MySQL model comparisons.
 
 **索引**：
 - `idx_logs_created_at` on `created_at`

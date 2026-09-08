@@ -34,7 +34,7 @@ async fn upstream(Json(request): Json<Value>) -> axum::response::Response {
 }
 
 #[tokio::test]
-async fn live_completed_samples_reach_model_performance_and_incomplete_do_not() -> anyhow::Result<()>
+async fn live_completion_metadata_is_diagnostic_and_performance_matches_usage() -> anyhow::Result<()>
 {
     let dir = tempfile::tempdir()?;
     let config = GatewayConfig {
@@ -142,22 +142,25 @@ async fn live_completed_samples_reach_model_performance_and_incomplete_do_not() 
     assert_eq!(stats.models.len(), 4);
     for item in stats.models {
         assert_eq!(item.status, "ready");
-        let expected = i64::from(matches!(
-            item.rating.upstream_model.as_str(),
-            "buffered" | "streamed"
-        ));
+        let usage = gw
+            .storage
+            .logs()
+            .model_usage_stats(&provider.id, &item.rating.upstream_model)
+            .await?;
         assert_eq!(
-            item.mixed.valid_tps_count, expected,
+            item.mixed.average_tps, usage.average_tps,
             "{}",
             item.rating.upstream_model
         );
+        // Each model has one raw log: limited/abandoned count whenever its legacy
+        // tokens and timings are usable, independently of lifecycle completion.
+        assert_eq!(
+            item.mixed.valid_tps_count,
+            i64::from(usage.average_tps.is_some())
+        );
         assert_eq!(item.rating.score, 80);
-        assert_eq!(item.mixed.selected_request_count, expected);
-        if expected == 1 {
-            assert!(item.mixed.average_tps.unwrap() > 0.0);
-        } else {
-            assert!(item.mixed.average_tps.is_none());
-        }
+        assert_eq!(item.mixed.selected_request_count, usage.recent_sample_count);
+        assert_eq!(item.mixed.selected_request_count, 1);
     }
     let count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM request_logs WHERE request_completion = 'completed'",

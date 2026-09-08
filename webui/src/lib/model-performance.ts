@@ -16,7 +16,7 @@ export interface ModelPerformance {
   status: "ready" | "error";
   error?: string;
 }
-export interface PerformanceResponse { as_of: number; window_start: number; models: ModelPerformance[] }
+export interface PerformanceResponse { as_of: number; window_start: number | null; models: ModelPerformance[] }
 const count = (value: unknown) => typeof value === "number" && Number.isInteger(value) && value >= 0;
 const finite = (value: unknown) => typeof value === "number" && Number.isFinite(value);
 function isStats(value: unknown): value is PerformanceStats {
@@ -34,8 +34,9 @@ export function readPerformanceResponse(value: unknown): PerformanceResponse {
   const fail = () => { throw new Error("Invalid model performance response. Please check backend compatibility."); };
   if (!value || typeof value !== "object") return fail();
   const v = value as Record<string, unknown>;
-  if (!finite(v.as_of) || Number(v.as_of) < 0 || !finite(v.window_start) || Number(v.window_start) < 0
-    || Number(v.window_start) > Number(v.as_of) || !Array.isArray(v.models)) return fail();
+  if (!finite(v.as_of) || Number(v.as_of) < 0
+    || (v.window_start !== null && (!finite(v.window_start) || Number(v.window_start) < 0 || Number(v.window_start) > Number(v.as_of)))
+    || !Array.isArray(v.models)) return fail();
   const keys = new Set<string>();
   for (const model of v.models) {
     if (!model || !isProviderModelRating(model.rating)

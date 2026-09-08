@@ -71,36 +71,64 @@ recorded separately. Screenshots are evidence, not pixel-golden assertions.
 - Strict catalog HTTP 502 retaining scores and editability, not marking missing.
 - EN/ZH desktop/mobile screenshots, no page overflow, usable mobile editor.
 
-## Trusted performance
+## Performance: same TPS as logs and model usage
 
-`performance-smoke.mjs` uses `/api/v1/model-performance`, not legacy per-model usage.
-Each response item contains `rating`, `mixed`, `status`, optional `error`, and
-unclassified/untrusted diagnostic counts; `profile` and `tiers` are absent.
+Rebuild the current backend with normal features and the frontend before this smoke;
+when sharing a checkout, wait for the build owner to confirm both artifacts are ready:
+
+```bash
+cargo build -p nyro-server
+(cd webui && npm run build)
+node --check tests/webui/performance-smoke.mjs
+node tests/webui/performance-smoke.mjs
+```
+
+The browser uses one `/api/v1/model-performance` snapshot, not per-model usage calls.
+The Node fixture independently compares **every rated pair's** `mixed.average_tps`
+with `/api/v1/providers/:id/model-usage?model=...` using exact numeric equality, and
+saves both responses in `report.json`. Each snapshot item has one `rating` and
+`mixed` statistic; `profile` and `tiers` remain absent. `window_start` is `null`:
+there is no seven-day cutoff beyond whatever request logs are still retained.
 
 Coverage:
 
 - One comprehensive score and one mixed-TPS point per exact provider/model pair;
   no effort selector, tier points, score overrides, or fallback scores.
-- Seven-day window, latest ten eligible completed calls per pair, arithmetic mean
-  of valid TPS, streaming first-chunk timing, invalid samples not refilled.
-- Mixed effort metadata contributes to the same sample pool. Failed/incomplete/
-  output-limit/cancelled, non-2xx, old and untrusted legacy rows are excluded.
-- A legacy average never fills missing trusted TPS. Zero score is valid; missing
-  TPS is not zero. Fewer than three valid samples are hollow points.
-- Exact SVG coordinates: X starts at 0 and rounds the highest visible plotted score
-  up to the next multiple of 10 (minimum ceiling 10, maximum 100; no points uses 100).
+- Select the latest ten raw retained logs by request time before validating TPS.
+  The shared logs/model-usage formula uses `output_tokens`, `latency_upstream_ms`
+  (or total latency fallback), `is_stream`/chunk count and `stream_first_chunk_ms`.
+  Streaming generation timing preserves the legacy non-incremental-response fallback.
+  The seeded 100-token 2000ms/500ms-TTFT and 50-token 1000ms calls average to 175/3 TPS.
+  New `performance_*` timings intentionally disagree to prove they are not used.
+- Failed/incomplete/output-limit/cancelled/unknown completion, non-2xx statuses and
+  metadata versions 0, 1 and 99 do not disqualify valid token/timing samples. Mixed
+  reasoning-effort metadata stays in the same sample pool. Legacy-valid logs are
+  plotted without an untrusted-history warning.
+- MiniMax-M3 with version 1, unknown completion, 2007 output tokens, 20617ms upstream
+  latency and 1798ms TTFT yields `2007 / ((20617 - 1798) / 1000)` TPS, shown as
+  **106.6 tok/s**. A retained log older than seven days with no metadata fields and
+  total-latency fallback also contributes. No upstream request is made.
+- Only no history or invalid tokens/timing produce missing TPS in the real fixture.
+  Invalid latest samples are not refilled from older valid calls. Zero score is
+  valid; missing TPS is not zero. Fewer than three valid samples are hollow points.
+- Exact SVG coordinates retain full backend precision while user-visible TPS uses
+  one decimal. X starts at 0 and rounds the highest visible plotted score up to the
+  next multiple of 10 (minimum ceiling 10, maximum 100; no points uses 100).
   Search filtering to max 51 gives 60, provider filtering to 73 gives 80, and clearing
   filters restores the full-data ceiling 100. Exact multiples stay unchanged.
-  Y defaults to 0–100 with 50-unit expansion only above 100.
+  Y defaults to 0–100 with 50-unit expansion only above 100; fixture maximum 225
+  deliberately keeps the expanded ceiling at 250.
   Model names appear directly; exact overlaps list every model without jitter.
 - No permanent numbered index or visible Pxx IDs. Hover/focus/tap tooltips expose
-  full supplier/model identity, score, TPS and samples; pointer transfer into the
-  tooltip keeps it readable, leaving or Escape dismisses it. Enter/Space and zoom work.
+  full supplier/model identity, score, one-decimal TPS and samples; pointer transfer
+  into the tooltip keeps it readable, leaving or Escape dismisses it. Enter/Space
+  and zoom work.
 - Provider/model search, EN/ZH desktop/mobile, bounded mobile tooltips,
   direct loading and no whole-page overflow.
 - Partial model errors preserve peers. Invalid numeric payloads, null TPS, warm/cold
   HTTP 500 remain unknown/unavailable, never invented zero; refresh recovers.
-- No browser path requests legacy usage, model catalogs or benchmarks.
+- No browser path requests per-model usage, model catalogs or benchmarks. All seed,
+  API comparison, fault injection and browser work stays inside fresh local fixtures.
 
 These scripts do not replace Rust lifecycle fault tests, SQL backend conformance,
 import/export tests, or Tauri IPC execution tests.

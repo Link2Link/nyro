@@ -111,7 +111,7 @@ async fn exercise(storage: &dyn Storage) -> anyhow::Result<()> {
         }
         rows.push(e);
     }
-    // Eligible boundary is completion time, never start time; both ends inclusive.
+    // All retained logs count, even outside the old seven-day/as_of window.
     let mut boundary = entry(p, "boundary", Some("high"), AS_OF - WEEK);
     boundary.created_at = AS_OF - WEEK - 50_000;
     rows.push(boundary);
@@ -139,15 +139,17 @@ async fn exercise(storage: &dyn Storage) -> anyhow::Result<()> {
     let mut client_error = entry(p, "mixed", Some("high"), AS_OF - 1);
     client_error.client_status_code = 500;
     rows.push(client_error);
-    // Actual upstream mode wins, not client is_stream / legacy latency columns.
+    // Legacy stream detection and timing win, regardless of diagnostic metadata.
     for (index, first, upstream, expected_tokens) in
         [(0, 200, 1000, 80), (1, 800, 1000, 100), (2, 30, 70, 7)]
     {
         let mut e = entry(p, "timing", Some("high"), AS_OF - index);
         e.is_stream = false;
         e.performance.response_mode = "stream".into();
-        e.performance.first_chunk_ms = Some(first);
-        e.performance.upstream_duration_ms = Some(upstream);
+        e.performance.first_chunk_ms = Some(0);
+        e.performance.upstream_duration_ms = Some(1);
+        e.stream_first_chunk_ms = Some(first);
+        e.latency_upstream_ms = Some(upstream);
         e.usage.completion_tokens = expected_tokens;
         rows.push(e);
     }
@@ -169,6 +171,24 @@ async fn exercise(storage: &dyn Storage) -> anyhow::Result<()> {
     historical.performance = PerformanceMetadata::default();
     historical.upstream_request_body = Some("{\"reasoning_effort\":\"minimal\"}".into());
     rows.push(historical);
+    // Reproducer: MiniMax's unknown completion has perfectly usable legacy TPS,
+    // including with no saved payload and no diagnostic performance timings.
+    let mut minimax = entry(p, "MiniMax-M2.7", None, AS_OF - 10);
+    minimax.performance = PerformanceMetadata {
+        version: 1,
+        ..Default::default()
+    };
+    minimax.usage.completion_tokens = 2007;
+    minimax.latency_upstream_ms = Some(20_617);
+    minimax.stream_first_chunk_ms = Some(1798);
+    rows.push(minimax);
+    let mut old = entry(p, "old-only", None, AS_OF - WEEK - 1234);
+    old.performance = PerformanceMetadata::default();
+    rows.push(old);
+    let other_provider = external_legacy_provider(storage).await?;
+    let mut same_model = entry(&other_provider, "MiniMax-M2.7", None, AS_OF);
+    same_model.usage.completion_tokens = 500;
+    rows.push(same_model);
     storage.logs().append_batch(rows).await?;
     let models = [
         "partition",
@@ -180,14 +200,28 @@ async fn exercise(storage: &dyn Storage) -> anyhow::Result<()> {
         "case",
         "Case ",
         "no-history",
+        "MiniMax-M2.7",
+        "old-only",
     ];
-    let pairs: Vec<_> = models.iter().map(|m| (p.clone(), m.to_string())).collect();
+    let mut pairs: Vec<_> = models.iter().map(|m| (p.clone(), m.to_string())).collect();
+    pairs.push((other_provider.clone(), "MiniMax-M2.7".into()));
     let stats = storage
         .logs()
         .model_performance_stats(&pairs, AS_OF)
         .await?;
     assert_eq!(stats.len(), pairs.len());
-    assert_eq!(stats[0].mixed.average_tps, Some(100.0));
+    for (pair, result) in pairs.iter().zip(&stats) {
+        let usage = storage.logs().model_usage_stats(&pair.0, &pair.1).await?;
+        assert_eq!(result.mixed.average_tps, usage.average_tps, "{}", pair.1);
+        assert_eq!(
+            result.mixed.selected_request_count, usage.recent_sample_count,
+            "{}",
+            pair.1
+        );
+        assert_eq!(result.unclassified_count, 0);
+        assert_eq!(result.untrusted_count, 0);
+    }
+    assert_eq!(stats[0].mixed.average_tps, Some(10.0));
     let serialized = serde_json::to_value(&stats[0])?;
     assert!(serialized.get("tiers").is_none());
     assert_eq!(stats[0].mixed.selected_request_count, 10);
@@ -197,21 +231,30 @@ async fn exercise(storage: &dyn Storage) -> anyhow::Result<()> {
     assert_eq!(stats[1].mixed.average_tps, None);
     assert_eq!(stats[1].mixed.first_sample_at, None);
     assert_eq!(stats[1].mixed.last_sample_at, None);
-    assert_eq!(stats[2].mixed.selected_request_count, 2);
-    assert_eq!(stats[2].mixed.first_sample_at, Some(AS_OF - WEEK));
-    assert_eq!(stats[2].mixed.last_sample_at, Some(AS_OF));
-    assert_eq!(stats[3].mixed.selected_request_count, 4);
-    assert_eq!(stats[3].mixed.valid_tps_count, 4);
-    assert_eq!(stats[3].unclassified_count, 3);
-    assert_eq!(stats[3].untrusted_count, 1);
+    assert_eq!(stats[2].mixed.selected_request_count, 4);
+    assert_eq!(stats[2].mixed.valid_tps_count, 4);
+    assert_eq!(stats[2].mixed.first_sample_at, Some(AS_OF - WEEK - 50_000));
+    assert_eq!(stats[2].mixed.last_sample_at, Some(AS_OF + 1));
+    assert_eq!(stats[3].mixed.selected_request_count, 10);
+    assert_eq!(stats[3].mixed.valid_tps_count, 10);
     assert_eq!(stats[4].mixed.selected_request_count, 5);
-    assert_eq!(stats[4].mixed.valid_tps_count, 3);
-    assert!((stats[4].mixed.average_tps.unwrap() - 100.0).abs() < 1e-9);
+    assert_eq!(stats[4].mixed.valid_tps_count, 5);
+    assert!((stats[4].mixed.average_tps.unwrap() - 64.0).abs() < 1e-9);
     assert_eq!(stats[5].mixed.selected_request_count, 1);
     assert_eq!(stats[6].mixed.selected_request_count, 1);
     assert_eq!(stats[7].mixed.selected_request_count, 1);
     assert_eq!(stats[8].mixed.selected_request_count, 0);
     assert_eq!(stats[8].mixed.average_tps, None);
+    assert_eq!(
+        stats[9].mixed.average_tps,
+        Some(2007.0 / (18_819.0 / 1000.0))
+    );
+    assert_eq!(stats[9].mixed.valid_tps_count, 1);
+    assert_eq!(stats[10].mixed.selected_request_count, 1);
+    assert_eq!(stats[10].mixed.valid_tps_count, 1);
+    assert_eq!(stats[10].mixed.first_sample_at, Some(AS_OF - WEEK - 1234));
+    assert_eq!(stats[11].mixed.average_tps, Some(50.0));
+    assert_eq!(stats[11].mixed.selected_request_count, 1);
     let page = storage
         .logs()
         .query(LogQuery {
@@ -257,6 +300,7 @@ async fn exercise(storage: &dyn Storage) -> anyhow::Result<()> {
         serde_json::to_value(storage.logs().model_usage_stats(p, "timing").await?)?
     );
     storage.providers().delete(p).await?;
+    storage.providers().delete(&other_provider).await?;
     Ok(())
 }
 
@@ -266,10 +310,10 @@ async fn sqlite_performance_contract() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
-async fn sqlite_equal_completion_time_uses_id_before_validation() -> anyhow::Result<()> {
+async fn sqlite_equal_created_at_uses_id_before_validation() -> anyhow::Result<()> {
     let storage = sqlite().await?;
     for n in 0..11 {
-        sqlx::query("INSERT INTO request_logs(id,created_at,provider_id,upstream_model,performance_metadata_version,request_completion,upstream_status_code,client_status_code,performance_completed_at,upstream_response_mode,performance_upstream_ms,output_tokens) VALUES (?,?,'p','tie',1,'completed',200,200,?,'buffered',1000,?)")
+        sqlx::query("INSERT INTO request_logs(id,created_at,provider_id,upstream_model,performance_metadata_version,request_completion,upstream_status_code,client_status_code,performance_completed_at,upstream_response_mode,performance_upstream_ms,latency_upstream_ms,output_tokens) VALUES (?,?,'p','tie',1,'completed',200,200,?,'buffered',1000,1000,?)")
             .bind(format!("tie-{n:02}")).bind(AS_OF).bind(AS_OF).bind(if n == 0 {100} else {0}).execute(storage.pool()).await?;
     }
     let result = storage
@@ -278,6 +322,136 @@ async fn sqlite_equal_completion_time_uses_id_before_validation() -> anyhow::Res
         .await?;
     assert_eq!(result[0].mixed.selected_request_count, 10);
     assert_eq!(result[0].mixed.valid_tps_count, 0);
+    let usage = storage.logs().model_usage_stats("p", "tie").await?;
+    assert_eq!(result[0].mixed.average_tps, usage.average_tps);
+    assert_eq!(
+        result[0].mixed.selected_request_count,
+        usage.recent_sample_count
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn sqlite_raw_timing_and_missing_fields_match_usage() -> anyhow::Result<()> {
+    let storage = sqlite().await?;
+    // tokens, client streaming, chunks, upstream ms, total ms, first chunk ms, TPS
+    let fixtures = [
+        (
+            Some(80),
+            false,
+            Some(2),
+            Some(1000),
+            Some(9000),
+            Some(200),
+            Some(100.0),
+        ),
+        (
+            Some(80),
+            false,
+            Some(0),
+            Some(1000),
+            Some(9000),
+            Some(200),
+            Some(80.0),
+        ),
+        (
+            Some(100),
+            true,
+            Some(2),
+            Some(1000),
+            Some(9000),
+            Some(800),
+            Some(100.0),
+        ),
+        (
+            Some(7),
+            true,
+            Some(2),
+            Some(70),
+            Some(9000),
+            Some(30),
+            Some(7.0 / 0.07),
+        ),
+        (
+            Some(100),
+            true,
+            Some(2),
+            Some(1000),
+            Some(9000),
+            Some(1200),
+            Some(100.0),
+        ),
+        (
+            Some(50),
+            true,
+            None,
+            None,
+            Some(2000),
+            Some(200),
+            Some(25.0),
+        ),
+        (
+            Some(50),
+            true,
+            Some(2),
+            Some(1000),
+            Some(9000),
+            None,
+            Some(50.0),
+        ),
+        (
+            Some(50),
+            true,
+            Some(2),
+            Some(0),
+            Some(2000),
+            Some(200),
+            None,
+        ),
+        (Some(50), false, None, Some(-1), Some(2000), None, None),
+        (
+            Some(0),
+            true,
+            Some(2),
+            Some(1000),
+            Some(2000),
+            Some(200),
+            None,
+        ),
+        (None, false, None, Some(1000), Some(2000), None, None),
+        (Some(50), false, None, None, None, None, None),
+        (Some(50), false, None, None, Some(0), None, None),
+        (Some(-1), false, None, Some(1000), None, None, None),
+    ];
+    let mut pairs = Vec::new();
+    for (index, (tokens, stream, chunks, upstream, total, first, _)) in fixtures.iter().enumerate()
+    {
+        let model = format!("raw-{index}");
+        sqlx::query("INSERT INTO request_logs(id,created_at,provider_id,upstream_model,output_tokens,is_stream,stream_chunks_count,latency_upstream_ms,latency_total_ms,stream_first_chunk_ms) VALUES (?,?, 'p',?,?,?,?,?,?,?)")
+            .bind(&model).bind((AS_OF - WEEK - index as i64).to_string()).bind(&model)
+            .bind(tokens).bind(stream).bind(chunks).bind(upstream).bind(total).bind(first)
+            .execute(storage.pool()).await?;
+        pairs.push(("p".into(), model));
+    }
+    // An as_of earlier than every row must not exclude retained logs either.
+    let results = storage.logs().model_performance_stats(&pairs, 0).await?;
+    for (index, ((provider, model), result)) in pairs.iter().zip(results).enumerate() {
+        let usage = storage.logs().model_usage_stats(provider, model).await?;
+        let expected = fixtures[index].6;
+        assert_eq!(result.mixed.average_tps, expected, "{model}");
+        assert_eq!(result.mixed.average_tps, usage.average_tps, "{model}");
+        assert_eq!(
+            result.mixed.selected_request_count,
+            usage.recent_sample_count
+        );
+        assert_eq!(result.mixed.selected_request_count, 1);
+        assert_eq!(result.mixed.valid_tps_count, i64::from(expected.is_some()));
+        let at = expected.map(|_| AS_OF - WEEK - index as i64);
+        assert_eq!(result.mixed.first_sample_at, at);
+        assert_eq!(result.mixed.last_sample_at, at);
+        assert_eq!(result.unclassified_count, 0);
+        assert_eq!(result.untrusted_count, 0);
+    }
     Ok(())
 }
 
@@ -483,8 +657,15 @@ async fn sqlite_legacy_rating_upgrade_and_historical_recovery() -> anyhow::Resul
         .logs()
         .model_performance_stats(&[("p".into(), "Model".into())], now)
         .await?;
-    assert_eq!(stats[0].mixed.selected_request_count, 0);
-    assert_eq!(stats[0].untrusted_count, 3);
+    assert_eq!(stats[0].mixed.selected_request_count, 4);
+    assert_eq!(stats[0].mixed.valid_tps_count, 0);
+    assert_eq!(stats[0].untrusted_count, 0);
+    let usage = storage.logs().model_usage_stats("p", "Model").await?;
+    assert_eq!(stats[0].mixed.average_tps, usage.average_tps);
+    assert_eq!(
+        stats[0].mixed.selected_request_count,
+        usage.recent_sample_count
+    );
     sqlx::query("DELETE FROM providers WHERE id='p'")
         .execute(pool)
         .await?;
