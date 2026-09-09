@@ -21,9 +21,12 @@ import {
 import { backend } from "@/lib/backend";
 import { formatDuration, formatLocalDateTime, formatTokenCount, formatTps } from "@/lib/format";
 import { useLocale } from "@/lib/i18n";
-import { providerModelKey as modelKey, ratingDisplayState, uniqueModelIdentifiers, type RatingLoadState } from "@/lib/model-ratings";
+import { longestRatingMatch, ratingDisplayState, uniqueModelIdentifiers, type RatingLoadState } from "@/lib/model-ratings";
 import { useModelRatings } from "@/lib/use-model-ratings";
 import { ModelRatingBadge, ModelRatingClearedNotice, ModelRatingEditor, ModelRatingsFeedback, type ModelRatingEditTarget } from "@/components/model-rating";
+
+/** Probe/mapping rows stay per exact (provider, model) pair. */
+const modelKey = (providerId: string, model: string) => JSON.stringify([providerId, model]);
 import {
   loadModelProbeResults,
   saveModelProbeResults,
@@ -33,10 +36,10 @@ import type {
   Model as ModelMapping,
   ModelCapabilities,
   ModelProbeOutcome,
+  ModelRatingEntry,
   ModelUsageStats,
   ModelProbeResult,
   Provider,
-  ProviderModelRating,
 } from "@/lib/types";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -323,7 +326,7 @@ function ModelRow({
   model,
   mappings,
   probe,
-  rating,
+  entries,
   ratingState,
   onEditRating,
   isZh,
@@ -332,7 +335,7 @@ function ModelRow({
   model: string;
   mappings: string[];
   probe?: ModelProbeResult;
-  rating?: ProviderModelRating;
+  entries: ModelRatingEntry[];
   ratingState: RatingLoadState;
   onEditRating: (target: ModelRatingEditTarget) => void;
   isZh: boolean;
@@ -366,7 +369,7 @@ function ModelRow({
           </span>
         </button>
         <div><ProbeBadge result={probe} isZh={isZh} /></div>
-        <div><ModelRatingBadge state={ratingDisplayState(ratingState, rating)} /></div>
+        <div><ModelRatingBadge state={ratingDisplayState(ratingState, model, entries)} /></div>
         <div className="flex min-w-0 flex-wrap gap-1.5">
           {mappings.length > 0 ? mappings.map((name) => (
             <Badge key={name} variant="secondary" className="max-w-full truncate" title={name}>
@@ -380,7 +383,7 @@ function ModelRow({
           <IconAction
             label={isZh ? "编辑评分" : "Edit rating"}
             disabled={ratingState !== "ready"}
-            onClick={() => onEditRating({ providerId: provider.id, providerName: provider.name, model, rating: rating ?? null })}
+            onClick={() => onEditRating({ initialPrefix: model, entry: longestRatingMatch(model, entries) })}
           >
             <Pencil className="h-4 w-4" />
           </IconAction>
@@ -415,7 +418,7 @@ function ProviderSection({
   mappings,
   probes,
   probeStore,
-  ratings,
+  entries,
   ratingState,
   onEditRating,
   isZh,
@@ -434,7 +437,7 @@ function ProviderSection({
   mappings: Map<string, string[]>;
   probes: Map<string, ModelProbeResult>;
   probeStore: ProviderModelProbeStore;
-  ratings: Map<string, ProviderModelRating>;
+  entries: ModelRatingEntry[];
   ratingState: RatingLoadState;
   onEditRating: (target: ModelRatingEditTarget) => void;
   isZh: boolean;
@@ -577,7 +580,7 @@ function ProviderSection({
                   model={model}
                   mappings={mappings.get(modelKey(provider.id, model)) ?? []}
                   probe={probes.get(modelKey(provider.id, model))}
-                  rating={ratings.get(modelKey(provider.id, model))}
+                  entries={entries}
                   ratingState={ratingState}
                   onEditRating={onEditRating}
                   isZh={isZh}
@@ -819,7 +822,7 @@ export default function AvailableModelsPage() {
                   mappings={mappings}
                   probes={probes}
                   probeStore={probeStore}
-                  ratings={ratingsQuery.index}
+                  entries={ratingsQuery.data ?? []}
                   ratingState={ratingsQuery.loadState}
                   onEditRating={setEditingRating}
                   isZh={isZh}
@@ -836,7 +839,19 @@ export default function AvailableModelsPage() {
             })}
           </div>
         )}
-        {editingRating && <ModelRatingEditor target={editingRating} onClose={() => setEditingRating(null)} onCleared={setClearedRating} />}
+        {editingRating && (
+          <ModelRatingEditor
+            target={editingRating}
+            providers={providers}
+            catalogs={providers.map((provider, index) => ({
+              providerId: provider.id,
+              status: catalogQueries[index]?.isSuccess ? ("success" as const) : ("unknown" as const),
+              models: catalogQueries[index]?.data ?? [],
+            }))}
+            onClose={() => setEditingRating(null)}
+            onCleared={setClearedRating}
+          />
+        )}
       </div>
     </TooltipProvider>
   );

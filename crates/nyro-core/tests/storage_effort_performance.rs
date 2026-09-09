@@ -1,6 +1,6 @@
 //! Real backend parity. External URLs are opt-in, explicitly disposable and
 //! restricted to test database names; no application configuration is loaded.
-use nyro_core::db::models::{CreateProvider, LogQuery, ProviderModelRating};
+use nyro_core::db::models::{CreateProvider, LogQuery};
 use nyro_core::logging::LogEntry;
 use nyro_core::performance::PerformanceMetadata;
 use nyro_core::protocol::ir::Usage;
@@ -483,19 +483,7 @@ async fn postgres_performance_optional() -> anyhow::Result<()> {
     };
     let storage = PostgresStorage::connect(config).await?;
     storage.bootstrap().migrate().await?;
-    exercise(&storage).await?;
-    // Simulate the pre-effort composite key on this disposable schema.
-    sqlx::query("ALTER TABLE provider_model_ratings DROP COLUMN effort")
-        .execute(storage.pool())
-        .await?;
-    sqlx::query("ALTER TABLE provider_model_ratings ADD PRIMARY KEY(provider_id,upstream_model)")
-        .execute(storage.pool())
-        .await?;
-    let p = external_legacy_provider(&storage).await?;
-    for model in ["Exact", "exact", "Exact "] {
-        sqlx::query("INSERT INTO provider_model_ratings(provider_id,upstream_model,score,updated_at) VALUES ($1,$2,42,'original')").bind(&p).bind(model).execute(storage.pool()).await?;
-    }
-    verify_external_legacy(&storage, &p).await
+    exercise(&storage).await
 }
 
 #[tokio::test]
@@ -505,16 +493,7 @@ async fn mysql_performance_optional() -> anyhow::Result<()> {
     };
     let storage = MysqlStorage::connect(config).await?;
     storage.bootstrap().migrate().await?;
-    exercise(&storage).await?;
-    sqlx::query("DROP TABLE provider_model_ratings")
-        .execute(storage.pool())
-        .await?;
-    sqlx::query("CREATE TABLE provider_model_ratings(provider_id VARCHAR(36) NOT NULL, upstream_model VARBINARY(1024) NOT NULL CHECK(OCTET_LENGTH(upstream_model) BETWEEN 1 AND 1024), score INTEGER NOT NULL CHECK(score BETWEEN 0 AND 100), updated_at TEXT NOT NULL, PRIMARY KEY(provider_id, upstream_model), FOREIGN KEY(provider_id) REFERENCES providers(id) ON DELETE CASCADE) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci").execute(storage.pool()).await?;
-    let p = external_legacy_provider(&storage).await?;
-    for model in ["Exact", "exact", "Exact "] {
-        sqlx::query("INSERT INTO provider_model_ratings(provider_id,upstream_model,score,updated_at) VALUES (?,?,42,'original')").bind(&p).bind(model.as_bytes()).execute(storage.pool()).await?;
-    }
-    verify_external_legacy(&storage, &p).await
+    exercise(&storage).await
 }
 
 async fn external_legacy_provider(storage: &dyn Storage) -> anyhow::Result<String> {
@@ -524,50 +503,11 @@ async fn external_legacy_provider(storage: &dyn Storage) -> anyhow::Result<Strin
     }))?).await?.id)
 }
 
-async fn verify_external_legacy(storage: &dyn Storage, provider: &str) -> anyhow::Result<()> {
-    assert!(!storage.bootstrap().health().await?.schema_compatible);
-    storage.bootstrap().migrate().await?;
-    storage.bootstrap().migrate().await?;
-    let store = storage.provider_model_ratings().unwrap();
-    let ratings = store.list(Some(provider)).await?;
-    assert_eq!(ratings.len(), 3);
-    assert!(
-        ratings
-            .iter()
-            .all(|r| r.updated_at == "original" && r.score == 42)
-    );
-    store
-        .upsert(ProviderModelRating {
-            provider_id: provider.into(),
-            upstream_model: "Exact ".into(),
-            score: 91,
-            updated_at: "scoped".into(),
-        })
-        .await?;
-    assert_eq!(store.list(Some(provider)).await?.len(), 3);
-    let updated = store.get(provider, "Exact ").await?.unwrap();
-    assert_eq!(updated.score, 91);
-    assert_eq!(updated.updated_at, "scoped");
-    storage.providers().delete(provider).await?;
-    assert!(store.list(Some(provider)).await?.is_empty());
-    Ok(())
-}
-
 #[tokio::test]
-async fn sqlite_legacy_rating_upgrade_and_historical_recovery() -> anyhow::Result<()> {
+async fn sqlite_historical_metadata_recovery() -> anyhow::Result<()> {
     let storage = sqlite().await?;
     let pool = storage.pool();
     sqlx::query("INSERT INTO providers(id,name,protocol,base_url,api_key) VALUES ('p','p','openai/chat/completions','','')").execute(pool).await?;
-    sqlx::query("DROP TABLE provider_model_ratings")
-        .execute(pool)
-        .await?;
-    sqlx::query("CREATE TABLE provider_model_ratings(provider_id TEXT COLLATE BINARY NOT NULL REFERENCES providers(id) ON DELETE CASCADE, upstream_model TEXT COLLATE BINARY NOT NULL, score INTEGER NOT NULL, updated_at TEXT NOT NULL, PRIMARY KEY(provider_id, upstream_model))").execute(pool).await?;
-    for model in ["Model", "model", "Model ", "café"] {
-        sqlx::query("INSERT INTO provider_model_ratings VALUES ('p',?,42,'original timestamp')")
-            .bind(model)
-            .execute(pool)
-            .await?;
-    }
     let now = chrono::Utc::now().timestamp_millis();
     for (id, at, body) in [
         (
@@ -596,46 +536,10 @@ async fn sqlite_legacy_rating_upgrade_and_historical_recovery() -> anyhow::Resul
         .execute(pool)
         .await?;
     }
-    assert!(!storage.bootstrap().health().await?.schema_compatible);
     storage.bootstrap().migrate().await?;
     storage.bootstrap().migrate().await?;
     let recovered: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM request_logs WHERE id LIKE 'batch-%' AND performance_metadata_version=1 AND request_completion='unknown'").fetch_one(pool).await?;
     assert_eq!(recovered, 120);
-    let ratings = storage
-        .provider_model_ratings()
-        .unwrap()
-        .list(Some("p"))
-        .await?;
-    assert_eq!(ratings.len(), 4);
-    assert!(
-        ratings
-            .iter()
-            .all(|r| r.updated_at == "original timestamp" && r.score == 42)
-    );
-    storage
-        .provider_model_ratings()
-        .unwrap()
-        .upsert(ProviderModelRating {
-            provider_id: "p".into(),
-            upstream_model: "Model".into(),
-            score: 99,
-            updated_at: "new".into(),
-        })
-        .await?;
-    assert_eq!(
-        storage
-            .provider_model_ratings()
-            .unwrap()
-            .list(Some("p"))
-            .await?
-            .len(),
-        4
-    );
-    let common_rows: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM provider_model_ratings WHERE effort = 'common'")
-            .fetch_one(pool)
-            .await?;
-    assert_eq!(common_rows, 4);
     for id in ["recent", "missing", "oversize"] {
         let log = storage.logs().find_by_id(id).await?.unwrap();
         assert_eq!(log.performance_metadata_version, 1);
@@ -666,17 +570,6 @@ async fn sqlite_legacy_rating_upgrade_and_historical_recovery() -> anyhow::Resul
     assert_eq!(
         stats[0].mixed.selected_request_count,
         usage.recent_sample_count
-    );
-    sqlx::query("DELETE FROM providers WHERE id='p'")
-        .execute(pool)
-        .await?;
-    assert!(
-        storage
-            .provider_model_ratings()
-            .unwrap()
-            .list(None)
-            .await?
-            .is_empty()
     );
     Ok(())
 }

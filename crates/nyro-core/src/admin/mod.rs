@@ -28,10 +28,10 @@ mod import_export;
 mod model_catalog;
 mod model_data;
 mod model_performance;
+mod model_ratings;
 mod models;
 mod oauth;
 mod observability;
-mod provider_model_ratings;
 mod providers;
 pub mod settings;
 mod usage;
@@ -46,10 +46,7 @@ pub use model_catalog::{
 use model_data::*;
 pub use model_performance::{ModelPerformanceItem, ModelPerformanceResponse};
 pub use observability::RequestLogAttempts;
-pub use provider_model_ratings::{
-    MAX_RATING_MODEL_BYTES, ProviderModelRatingError, ProviderModelRatingState,
-    SetProviderModelRating,
-};
+pub use model_ratings::{MAX_RATING_PREFIX_BYTES, ModelRatingError, SetModelRating};
 pub use providers::{ProviderModelProbeMeta, ProviderModelProbeOutcome, ProviderModelProbeResult};
 pub use usage::{
     ProviderUsage, ProviderUsageBalance, ProviderUsageListItem, ProviderUsageQueryStatus,

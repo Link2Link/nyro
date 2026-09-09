@@ -5,11 +5,10 @@ use async_trait::async_trait;
 
 use crate::db::models::{
     ApiKeyStats, ApiKeyUsageDetail, ApiKeyWithBindings, CreateApiKey, CreateModel,
-    CreateModelBackend, CreateProvider, LogPage, LogQuery, Model, ModelBackend, ModelStats,
-    ModelTimeBucket, ModelUsageDetail, ModelUsageStats, OAuthCredential, Provider,
-    ProviderModelRating, ProviderStats, ProviderUsageDetail, RequestLog, RequestResult,
-    StatsHourly, StatsOverview, StatsTimeBucket, UpdateApiKey, UpdateModel, UpdateProvider,
-    UpsertOAuthCredential,
+    CreateModelBackend, CreateProvider, LogPage, LogQuery, Model, ModelBackend, ModelRatingEntry,
+    ModelStats, ModelTimeBucket, ModelUsageDetail, ModelUsageStats, OAuthCredential, Provider,
+    ProviderStats, ProviderUsageDetail, RequestLog, RequestResult, StatsHourly, StatsOverview,
+    StatsTimeBucket, UpdateApiKey, UpdateModel, UpdateProvider, UpsertOAuthCredential,
 };
 use crate::logging::LogEntry;
 
@@ -82,26 +81,15 @@ pub trait ProviderStore: Send + Sync {
     ) -> anyhow::Result<()>;
 }
 
-/// Persistence for ratings, independent of routing and model catalogs.
+/// Persistence for prefix-keyed ratings, independent of routing, providers,
+/// and model catalogs.
 #[async_trait]
-pub trait ProviderModelRatingStore: Send + Sync {
-    /// List comprehensive ratings only; historical effort overrides remain hidden.
-    async fn list(&self, provider_id: Option<&str>) -> anyhow::Result<Vec<ProviderModelRating>>;
-    async fn get(
-        &self,
-        provider_id: &str,
-        model: &str,
-    ) -> anyhow::Result<Option<ProviderModelRating>>;
-    /// All rating operations address the physical common scope only.
-    async fn upsert(&self, rating: ProviderModelRating) -> anyhow::Result<ProviderModelRating>;
-    async fn delete(&self, provider_id: &str, model: &str) -> anyhow::Result<()>;
-    /// Atomically replace target common ratings; preserve historical non-common rows.
-    /// The target provider ID overrides row IDs and timestamps are preserved.
-    async fn restore(
-        &self,
-        provider_id: &str,
-        ratings: &[ProviderModelRating],
-    ) -> anyhow::Result<()>;
+pub trait ModelRatingStore: Send + Sync {
+    async fn list(&self) -> anyhow::Result<Vec<ModelRatingEntry>>;
+    async fn upsert(&self, entry: ModelRatingEntry) -> anyhow::Result<ModelRatingEntry>;
+    async fn delete(&self, model_prefix: &str) -> anyhow::Result<()>;
+    /// Atomically replace all entries; row timestamps are preserved.
+    async fn restore(&self, entries: &[ModelRatingEntry]) -> anyhow::Result<()>;
 }
 
 #[async_trait]
@@ -170,6 +158,12 @@ pub trait LogStore: Send + Sync {
         _as_of: i64,
     ) -> anyhow::Result<Vec<crate::db::PairPerformanceStats>> {
         anyhow::bail!("model performance statistics are unsupported by this storage")
+    }
+    /// Distinct (provider_id, upstream_model) pairs across all retained logs;
+    /// the candidate set for prefix-matched performance statistics. Same
+    /// retention scope as model_performance_stats.
+    async fn distinct_logged_pairs(&self) -> anyhow::Result<Vec<(String, String)>> {
+        anyhow::bail!("distinct logged pairs are unsupported by this storage")
     }
     /// Persist all attempts and attached final results atomically. SQL errors,
     /// including duplicate stable log IDs, reject the entire batch without retry.
@@ -279,7 +273,7 @@ pub trait StorageBootstrap: Send + Sync {
 pub trait Storage: Send + Sync {
     fn providers(&self) -> &dyn ProviderStore;
     /// SQL-only capability; YAML-backed memory storage and custom stores may not support ratings.
-    fn provider_model_ratings(&self) -> Option<&dyn ProviderModelRatingStore> {
+    fn model_ratings(&self) -> Option<&dyn ModelRatingStore> {
         None
     }
     fn models(&self) -> &dyn ModelStore;

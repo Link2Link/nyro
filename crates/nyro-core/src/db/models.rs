@@ -1,7 +1,9 @@
 use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
 
-pub use super::provider_model_ratings::ProviderModelRating;
+pub use super::model_rating_prefixes::{
+    ModelRatingEntry, canonical_model_prefix, longest_matching_entry, model_matches_prefix,
+};
 
 use crate::provider::AuthMode;
 use crate::provider::VendorRegistry;
@@ -1149,55 +1151,23 @@ pub struct ExportData {
     pub providers: Vec<ExportProvider>,
     #[serde(alias = "routes")]
     pub models: Vec<ExportModel>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub model_ratings: Vec<ExportModelRating>,
     pub settings: Vec<(String, String)>,
 }
 
+/// One prefix rating entry in the flat export format. Provider-scoped nested
+/// ratings from old backups are ignored on import.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(try_from = "ImportedProviderModelRating")]
-pub struct ExportProviderModelRating {
-    pub upstream_model: String,
+pub struct ExportModelRating {
+    pub model_prefix: String,
     pub score: i32,
     pub updated_at: String,
-}
-
-// Accept old unscoped backups and explicit common rows, but never silently
-// reinterpret a historical effort-specific score as a comprehensive rating.
-#[derive(Deserialize)]
-struct ImportedProviderModelRating {
-    upstream_model: String,
-    score: i32,
-    updated_at: String,
-    #[serde(default)]
-    effort: Option<String>,
-}
-
-impl TryFrom<ImportedProviderModelRating> for ExportProviderModelRating {
-    type Error = String;
-
-    fn try_from(value: ImportedProviderModelRating) -> Result<Self, Self::Error> {
-        if value
-            .effort
-            .as_deref()
-            .is_some_and(|effort| effort != "common")
-        {
-            return Err(
-                "Effort-specific model ratings cannot be imported as comprehensive scores"
-                    .to_string(),
-            );
-        }
-        Ok(Self {
-            upstream_model: value.upstream_model,
-            score: value.score,
-            updated_at: value.updated_at,
-        })
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExportProvider {
     pub name: String,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub model_ratings: Vec<ExportProviderModelRating>,
     pub vendor: Option<String>,
     pub protocol: String,
     pub base_url: String,

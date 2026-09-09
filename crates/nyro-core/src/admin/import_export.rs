@@ -35,23 +35,17 @@ impl AdminService {
         let providers = self.list_providers().await?;
         let models = self.list_models().await?;
         let settings = self.gw.storage.settings().list_all().await?;
-        let mut ratings_by_provider: HashMap<String, Vec<ExportProviderModelRating>> =
-            HashMap::new();
-        if let Some(store) = self.gw.storage.provider_model_ratings() {
-            for rating in store.list(None).await? {
-                ratings_by_provider
-                    .entry(rating.provider_id)
-                    .or_default()
-                    .push(ExportProviderModelRating {
-                        upstream_model: rating.upstream_model,
-                        score: rating.score,
-                        updated_at: rating.updated_at,
-                    });
-            }
-        }
-        for ratings in ratings_by_provider.values_mut() {
-            ratings.sort_by(|a, b| a.upstream_model.cmp(&b.upstream_model));
-        }
+        let mut model_ratings = self
+            .list_model_ratings()
+            .await?
+            .into_iter()
+            .map(|entry| ExportModelRating {
+                model_prefix: entry.model_prefix,
+                score: entry.score,
+                updated_at: entry.updated_at,
+            })
+            .collect::<Vec<_>>();
+        model_ratings.sort_by(|a, b| a.model_prefix.cmp(&b.model_prefix));
 
         Ok(ExportData {
             version: 2,
@@ -71,7 +65,6 @@ impl AdminService {
                         })
                         .collect();
                     ExportProvider {
-                        model_ratings: ratings_by_provider.remove(&p.id).unwrap_or_default(),
                         name: p.name,
                         vendor: p.vendor,
                         protocol: p.protocol,
@@ -104,20 +97,15 @@ impl AdminService {
                     is_enabled: m.is_enabled,
                 })
                 .collect(),
+            model_ratings,
             settings: settings.into_iter().collect(),
         })
     }
 
     pub async fn import_config(&self, data: ExportData) -> anyhow::Result<ImportResult> {
-        // Validate every nested rating before any configuration is changed.
-        for provider in &data.providers {
-            super::provider_model_ratings::validate_export_ratings(&provider.model_ratings)?;
-        }
-        if data
-            .providers
-            .iter()
-            .any(|provider| !provider.model_ratings.is_empty())
-        {
+        // Validate every prefix rating before any configuration is changed.
+        super::model_ratings::validate_export_ratings(&data.model_ratings)?;
+        if !data.model_ratings.is_empty() {
             self.rating_store()?;
         }
         let mut providers_imported = 0u32;
@@ -133,8 +121,8 @@ impl AdminService {
                 .exists_by_name(&p.name, None)
                 .await?;
             if exists {
-                // Existing-name conflicts skip the entire provider, including
-                // its ratings. Never overwrite current manual scores.
+                // Existing-name conflicts skip the entire provider. Never
+                // overwrite current configuration.
                 continue;
             }
 
@@ -183,50 +171,37 @@ impl AdminService {
                     fast_mode: p.fast_mode,
                 })
                 .await;
-            let created = match created {
-                Ok(provider) => provider,
-                // Preserve legacy handling of providers with no new metadata,
-                // but never silently discard requested rating restoration.
-                Err(error) if p.model_ratings.is_empty() => {
+            match created {
+                Ok(_provider) => {
+                    providers_imported += 1;
+                }
+                // Preserve legacy handling of providers that cannot be created.
+                Err(error) => {
                     tracing::warn!(provider = %p.name, error = %error, "provider import skipped");
                     continue;
                 }
-                Err(error) => return Err(error.context(format!(
-                    "Provider import failed after {providers_imported} providers and {ratings_imported} ratings were imported"
-                ))),
-            };
-            if !p.model_ratings.is_empty() {
-                let restored: Vec<ProviderModelRating> = p
-                    .model_ratings
-                    .iter()
-                    .map(|rating| ProviderModelRating {
-                        provider_id: created.id.clone(),
-                        upstream_model: rating.upstream_model.clone(),
-                        score: rating.score,
-                        // Already validated before any mutations; retain the
-                        // original instant in the canonical UTC millisecond form.
-                        updated_at: DateTime::parse_from_rfc3339(&rating.updated_at)
-                            .expect("rating timestamp prevalidated")
-                            .with_timezone(&Utc)
-                            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
-                    })
-                    .collect();
-                if let Err(error) = self.rating_store()?.restore(&created.id, &restored).await {
-                    let rollback = self.delete_provider(&created.id).await;
-                    let rollback_detail = match rollback {
-                        Ok(()) => "new provider rolled back".to_string(),
-                        Err(cleanup_error) => format!(
-                            "rollback of new provider {} also failed: {cleanup_error}",
-                            created.id
-                        ),
-                    };
-                    return Err(error.context(format!(
-                        "Rating import failed ({rollback_detail}); {providers_imported} providers and {ratings_imported} ratings were imported earlier"
-                    )));
-                }
-                ratings_imported += restored.len() as u32;
             }
-            providers_imported += 1;
+        }
+
+        // Ratings replace the whole prefix table after providers land; old
+        // backups' nested per-provider ratings were already dropped by serde.
+        if !data.model_ratings.is_empty() {
+            let restored: Vec<ModelRatingEntry> = data
+                .model_ratings
+                .iter()
+                .map(|entry| ModelRatingEntry {
+                    // Canonical lowercase key; already validated pre-mutation.
+                    model_prefix: canonical_model_prefix(&entry.model_prefix),
+                    score: entry.score,
+                    // Retain the original instant in the canonical UTC millisecond form.
+                    updated_at: DateTime::parse_from_rfc3339(&entry.updated_at)
+                        .expect("rating timestamp prevalidated")
+                        .with_timezone(&Utc)
+                        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                })
+                .collect();
+            self.rating_store()?.restore(&restored).await?;
+            ratings_imported = restored.len() as u32;
         }
 
         let fallback_provider_id = self

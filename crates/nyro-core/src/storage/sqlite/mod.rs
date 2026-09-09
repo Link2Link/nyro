@@ -1,7 +1,7 @@
-mod provider_model_ratings;
+mod model_ratings;
 
-use crate::storage::ProviderModelRatingStore;
-use provider_model_ratings::SqliteProviderModelRatingStore;
+use crate::storage::ModelRatingStore;
+use model_ratings::SqliteModelRatingStore;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -36,7 +36,7 @@ use crate::storage::traits::{
 pub struct SqliteStorage {
     pool: SqlitePool,
     provider_store: Arc<SqliteProviderStore>,
-    provider_model_rating_store: Arc<SqliteProviderModelRatingStore>,
+    model_rating_store: Arc<SqliteModelRatingStore>,
     model_store: Arc<SqliteModelStore>,
     model_backend_store: Arc<SqliteModelBackendStore>,
     settings_store: Arc<SqliteSettingsStore>,
@@ -57,8 +57,7 @@ impl SqliteStorage {
 
     pub fn from_pool(pool: SqlitePool) -> Self {
         let provider_store = Arc::new(SqliteProviderStore { pool: pool.clone() });
-        let provider_model_rating_store =
-            Arc::new(SqliteProviderModelRatingStore { pool: pool.clone() });
+        let model_rating_store = Arc::new(SqliteModelRatingStore { pool: pool.clone() });
         let model_store = Arc::new(SqliteModelStore { pool: pool.clone() });
         let model_backend_store = Arc::new(SqliteModelBackendStore { pool: pool.clone() });
         let settings_store = Arc::new(SqliteSettingsStore { pool: pool.clone() });
@@ -70,7 +69,7 @@ impl SqliteStorage {
         Self {
             pool,
             provider_store,
-            provider_model_rating_store,
+            model_rating_store,
             model_store,
             model_backend_store,
             settings_store,
@@ -92,8 +91,8 @@ impl Storage for SqliteStorage {
         self.provider_store.as_ref()
     }
 
-    fn provider_model_ratings(&self) -> Option<&dyn ProviderModelRatingStore> {
-        Some(self.provider_model_rating_store.as_ref())
+    fn model_ratings(&self) -> Option<&dyn ModelRatingStore> {
+        Some(self.model_rating_store.as_ref())
     }
 
     fn models(&self) -> &dyn ModelStore {
@@ -540,11 +539,6 @@ impl ProviderStore for SqliteProviderStore {
             .await?;
 
         sqlx::query("DELETE FROM provider_protocol_endpoints WHERE provider_id = ?")
-            .bind(id)
-            .execute(&mut *tx)
-            .await?;
-
-        sqlx::query("DELETE FROM provider_model_ratings WHERE provider_id = ?")
             .bind(id)
             .execute(&mut *tx)
             .await?;
@@ -1152,6 +1146,13 @@ impl LogStore for SqliteLogStore {
             "CAST(created_at AS INTEGER)",
             "0"
         )
+    }
+    async fn distinct_logged_pairs(&self) -> anyhow::Result<Vec<(String, String)>> {
+        Ok(sqlx::query_as::<_, (String, String)>(
+            "SELECT DISTINCT provider_id, upstream_model FROM request_logs",
+        )
+        .fetch_all(&self.pool)
+        .await?)
     }
     async fn append_batch(&self, entries: Vec<LogEntry>) -> anyhow::Result<()> {
         let mut tx = self.pool.begin().await?;
@@ -1824,13 +1825,12 @@ impl StorageBootstrap for SqliteBootstrap {
         let schema_compatible = if can_connect {
             sqlx::query_scalar::<_, i64>(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type='table' \
-                 AND name IN ('models', 'provider_model_ratings')",
+                 AND name IN ('models', 'model_rating_prefixes')",
             )
             .fetch_one(&self.pool)
             .await
             .unwrap_or(0)
                 == 2
-                && sqlx::query("SELECT effort FROM provider_model_ratings LIMIT 0").execute(&self.pool).await.is_ok()
                 && sqlx::query("SELECT performance_metadata_version, upstream_effort_status, upstream_effort_raw, upstream_effort_tier, request_completion, completion_reason, upstream_response_mode, performance_upstream_ms, performance_first_chunk_ms, performance_completed_at FROM request_logs LIMIT 0").execute(&self.pool).await.is_ok()
                 && sqlx::query("SELECT client_request_id, attempt_index, outcome_version, attempt_outcome, failure_kind, failure_stage, error_message, error_causes_json, payload_metadata_json, payload_cleared_at FROM request_logs LIMIT 0").execute(&self.pool).await.is_ok()
                 && sqlx::query("SELECT client_request_id, final_outcome, final_attempt_id, attempt_count, finished_at FROM request_results LIMIT 0").execute(&self.pool).await.is_ok()

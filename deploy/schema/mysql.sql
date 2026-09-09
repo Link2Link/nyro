@@ -25,6 +25,15 @@ CREATE TABLE `api_keys` (
   KEY `idx_api_keys_token` (`token`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
+CREATE TABLE `model_rating_prefixes` (
+  `model_prefix` varbinary(1024) NOT NULL,
+  `score` int NOT NULL,
+  `updated_at` text COLLATE utf8mb4_unicode_ci NOT NULL,
+  PRIMARY KEY (`model_prefix`),
+  CONSTRAINT `model_rating_prefixes_chk_1` CHECK ((length(`model_prefix`) between 1 and 1024)),
+  CONSTRAINT `model_rating_prefixes_chk_2` CHECK ((`score` between 0 and 100))
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
 CREATE TABLE `providers` (
   `id` varchar(36) COLLATE utf8mb4_unicode_ci NOT NULL,
   `name` varchar(255) COLLATE utf8mb4_unicode_ci NOT NULL,
@@ -93,19 +102,6 @@ CREATE TABLE `model_backends` (
   KEY `idx_route_targets_route_id` (`model_id`),
   CONSTRAINT `model_backends_ibfk_1` FOREIGN KEY (`model_id`) REFERENCES `models` (`id`) ON DELETE CASCADE,
   CONSTRAINT `model_backends_ibfk_2` FOREIGN KEY (`provider_id`) REFERENCES `providers` (`id`)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-
-CREATE TABLE `provider_model_ratings` (
-  `provider_id` varchar(36) COLLATE utf8mb4_unicode_ci NOT NULL,
-  `upstream_model` varbinary(1024) NOT NULL,
-  `score` int NOT NULL,
-  `updated_at` text COLLATE utf8mb4_unicode_ci NOT NULL,
-  `effort` varchar(16) CHARACTER SET ascii COLLATE ascii_bin NOT NULL DEFAULT 'common',
-  PRIMARY KEY (`provider_id`,`upstream_model`,`effort`),
-  CONSTRAINT `provider_model_ratings_ibfk_1` FOREIGN KEY (`provider_id`) REFERENCES `providers` (`id`) ON DELETE CASCADE,
-  CONSTRAINT `provider_model_ratings_chk_1` CHECK ((length(`upstream_model`) between 1 and 1024)),
-  CONSTRAINT `provider_model_ratings_chk_2` CHECK ((`score` between 0 and 100)),
-  CONSTRAINT `provider_model_ratings_chk_3` CHECK ((cast(`effort` as char charset binary) in (_utf8mb4'common',_utf8mb4'low',_utf8mb4'medium',_utf8mb4'high',_utf8mb4'xhigh',_utf8mb4'max')))
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE `provider_oauth_credentials` (

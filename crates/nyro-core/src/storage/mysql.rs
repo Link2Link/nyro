@@ -1,7 +1,7 @@
-mod provider_model_ratings;
+mod model_ratings;
 
-use crate::storage::ProviderModelRatingStore;
-use provider_model_ratings::MysqlProviderModelRatingStore;
+use crate::storage::ModelRatingStore;
+use model_ratings::MysqlModelRatingStore;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -77,10 +77,9 @@ impl MysqlAdapter {
             mysql_table_exists(&self.pool, "models")
                 .await
                 .unwrap_or(false)
-                && mysql_table_exists(&self.pool, "provider_model_ratings")
+                && mysql_table_exists(&self.pool, "model_rating_prefixes")
                     .await
                     .unwrap_or(false)
-                && sqlx::query("SELECT effort FROM provider_model_ratings LIMIT 0").execute(&self.pool).await.is_ok()
                 && sqlx::query("SELECT performance_metadata_version, upstream_effort_status, upstream_effort_raw, upstream_effort_tier, request_completion, completion_reason, upstream_response_mode, performance_upstream_ms, performance_first_chunk_ms, performance_completed_at, client_request_id, attempt_index, outcome_version, attempt_outcome, failure_kind, failure_stage, error_message, error_causes_json, payload_metadata_json, payload_cleared_at FROM request_logs LIMIT 0").execute(&self.pool).await.is_ok()
                 && sqlx::query("SELECT client_request_id, final_outcome, final_attempt_id, attempt_count, finished_at FROM request_results LIMIT 0").execute(&self.pool).await.is_ok()
         } else {
@@ -97,7 +96,7 @@ impl MysqlAdapter {
 pub struct MysqlStorage {
     pool: Pool<MySql>,
     provider_store: Arc<MysqlProviderStore>,
-    provider_model_rating_store: Arc<MysqlProviderModelRatingStore>,
+    model_rating_store: Arc<MysqlModelRatingStore>,
     model_store: Arc<MysqlModelStore>,
     model_backend_store: Arc<MysqlModelBackendStore>,
     settings_store: Arc<MysqlSettingsStore>,
@@ -113,8 +112,7 @@ impl MysqlStorage {
         let adapter = MysqlAdapter::connect(config).await?;
         let pool = adapter.pool().clone();
         let provider_store = Arc::new(MysqlProviderStore { pool: pool.clone() });
-        let provider_model_rating_store =
-            Arc::new(MysqlProviderModelRatingStore { pool: pool.clone() });
+        let model_rating_store = Arc::new(MysqlModelRatingStore { pool: pool.clone() });
         let model_store = Arc::new(MysqlModelStore { pool: pool.clone() });
         let model_backend_store = Arc::new(MysqlModelBackendStore { pool: pool.clone() });
         let settings_store = Arc::new(MysqlSettingsStore { pool: pool.clone() });
@@ -126,7 +124,7 @@ impl MysqlStorage {
         Ok(Self {
             pool,
             provider_store,
-            provider_model_rating_store,
+            model_rating_store,
             model_store,
             model_backend_store,
             settings_store,
@@ -148,8 +146,8 @@ impl Storage for MysqlStorage {
         self.provider_store.as_ref()
     }
 
-    fn provider_model_ratings(&self) -> Option<&dyn ProviderModelRatingStore> {
-        Some(self.provider_model_rating_store.as_ref())
+    fn model_ratings(&self) -> Option<&dyn ModelRatingStore> {
+        Some(self.model_rating_store.as_ref())
     }
 
     fn models(&self) -> &dyn ModelStore {
@@ -547,11 +545,6 @@ impl ProviderStore for MysqlProviderStore {
             .await?;
 
         sqlx::query("DELETE FROM provider_protocol_endpoints WHERE provider_id = ?")
-            .bind(id)
-            .execute(&mut *tx)
-            .await?;
-
-        sqlx::query("DELETE FROM provider_model_ratings WHERE provider_id = ?")
             .bind(id)
             .execute(&mut *tx)
             .await?;
@@ -1087,6 +1080,22 @@ impl LogStore for MysqlLogStore {
             "CAST(created_at AS SIGNED)",
             "0"
         )
+    }
+    async fn distinct_logged_pairs(&self) -> anyhow::Result<Vec<(String, String)>> {
+        let rows = sqlx::query(
+            "SELECT DISTINCT provider_id, upstream_model FROM request_logs",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        let mut pairs = Vec::with_capacity(rows.len());
+        for row in rows {
+            use sqlx::Row;
+            pairs.push((
+                row.try_get::<Option<String>, _>(0)?.unwrap_or_default(),
+                row.try_get::<Option<String>, _>(1)?.unwrap_or_default(),
+            ));
+        }
+        Ok(pairs)
     }
     async fn append_batch(&self, entries: Vec<LogEntry>) -> anyhow::Result<()> {
         let mut tx = self.pool.begin().await?;
@@ -2116,7 +2125,11 @@ impl StorageBootstrap for MysqlBootstrap {
         mysql_rename_column_if_needed(pool, "api_keys", "key", "token").await?;
         migrate_performance_mysql(pool).await?;
         migrate_diagnostics_mysql(pool).await?;
-        migrate_rating_effort_mysql(pool).await?;
+        // Provider-scoped ratings were replaced by prefix ratings; old rows are
+        // deliberately dropped instead of migrated.
+        sqlx::query("DROP TABLE IF EXISTS provider_model_ratings")
+            .execute(pool)
+            .await?;
         crate::db::model_performance::recover_historical_metadata!(
             pool,
             sqlx::MySql,
@@ -2141,23 +2154,7 @@ impl StorageBootstrap for MysqlBootstrap {
 // Migration helpers
 // ---------------------------------------------------------------------------
 
-async fn migrate_rating_effort_mysql(pool: &Pool<MySql>) -> anyhow::Result<()> {
-    mysql_add_column_if_not_exists(pool, "provider_model_ratings", "effort",
-        "VARCHAR(16) CHARACTER SET ascii COLLATE ascii_bin NOT NULL DEFAULT 'common' CHECK (BINARY effort IN ('common','low','medium','high','xhigh','max'))").await?;
-    let has_effort: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'provider_model_ratings' AND INDEX_NAME = 'PRIMARY' AND COLUMN_NAME = 'effort'").fetch_one(pool).await?;
-    if has_effort == 0 {
-        // Retain an index supporting the provider FK while replacing its old PK.
-        mysql_create_index_if_not_exists(
-            pool,
-            "provider_model_ratings",
-            "idx_ratings_provider",
-            "provider_id",
-        )
-        .await?;
-        sqlx::query("ALTER TABLE provider_model_ratings DROP PRIMARY KEY, ADD PRIMARY KEY (provider_id, upstream_model, effort)").execute(pool).await?;
-    }
-    Ok(())
-}
+
 
 async fn migrate_diagnostics_mysql(pool: &Pool<MySql>) -> anyhow::Result<()> {
     // Historical rows remain version 0/unknown: performance metadata is not an outcome.
@@ -2651,16 +2648,12 @@ CREATE TABLE IF NOT EXISTS providers (
     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
 ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
 
-CREATE TABLE IF NOT EXISTS provider_model_ratings (
-    provider_id VARCHAR(36) NOT NULL,
-    upstream_model VARBINARY(1024) NOT NULL
-        CHECK (OCTET_LENGTH(upstream_model) BETWEEN 1 AND 1024),
+CREATE TABLE IF NOT EXISTS model_rating_prefixes (
+    model_prefix VARBINARY(1024) NOT NULL
+        CHECK (OCTET_LENGTH(model_prefix) BETWEEN 1 AND 1024),
     score INTEGER NOT NULL CHECK (score BETWEEN 0 AND 100),
     updated_at TEXT NOT NULL,
-    effort VARCHAR(16) CHARACTER SET ascii COLLATE ascii_bin NOT NULL DEFAULT 'common'
-        CHECK (BINARY effort IN ('common','low','medium','high','xhigh','max')),
-    PRIMARY KEY (provider_id, upstream_model, effort),
-    FOREIGN KEY (provider_id) REFERENCES providers(id) ON DELETE CASCADE
+    PRIMARY KEY (model_prefix)
 ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
 
 CREATE TABLE IF NOT EXISTS provider_protocol_endpoints (

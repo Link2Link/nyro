@@ -5,7 +5,7 @@ use axum::response::IntoResponse;
 use axum::routing::{get, post, put};
 use axum::{Extension, Json, Router};
 use nyro_core::Gateway;
-use nyro_core::admin::{CopyProviderOptions, ProviderModelRatingError, SetProviderModelRating};
+use nyro_core::admin::{CopyProviderOptions, ModelRatingError, SetModelRating};
 use nyro_core::auth::AuthExchangeInput;
 use nyro_core::db::models::*;
 use serde::Deserialize;
@@ -82,16 +82,12 @@ pub fn create_router(gateway: Gateway, admin_token: Option<String>) -> Router {
         )
         .route("/providers/:id/models", get(provider_models_handler))
         .route(
-            "/provider-model-ratings",
-            get(list_provider_model_ratings_handler),
+            "/model-ratings",
+            get(list_model_ratings_handler)
+                .put(set_model_rating_handler)
+                .delete(delete_model_rating_handler),
         )
         .route("/model-performance", get(model_performance_handler))
-        .route(
-            "/providers/:id/model-rating",
-            get(get_provider_model_rating_handler)
-                .put(set_provider_model_rating_handler)
-                .delete(delete_provider_model_rating_handler),
-        )
         .route(
             "/providers/:id/model-capabilities",
             get(provider_model_capabilities_handler),
@@ -389,19 +385,15 @@ struct ProviderRatingListQuery {
     provider_id: Option<String>,
 }
 
-async fn list_provider_model_ratings_handler(
+#[derive(Deserialize)]
+struct ModelRatingQuery {
+    prefix: String,
+}
+
+async fn list_model_ratings_handler(
     State(gw): State<Gateway>,
-    query: Result<Query<ProviderRatingListQuery>, axum::extract::rejection::QueryRejection>,
 ) -> axum::response::Response {
-    let Query(query) = match query {
-        Ok(query) => query,
-        Err(error) => return rating_bad_request(error.body_text()),
-    };
-    match gw
-        .admin()
-        .list_provider_model_ratings(query.provider_id.as_deref())
-        .await
-    {
+    match gw.admin().list_model_ratings().await {
         Ok(ratings) => Json(serde_json::json!({ "data": ratings })).into_response(),
         Err(error) => rating_error(error),
     }
@@ -422,7 +414,7 @@ async fn model_performance_handler(
     {
         Ok(performance) => Json(serde_json::json!({ "data": performance })).into_response(),
         Err(error) => {
-            if error.downcast_ref::<ProviderModelRatingError>().is_some() {
+            if error.downcast_ref::<ModelRatingError>().is_some() {
                 return rating_error(error);
             }
             tracing::error!(error = %error, "model performance query failed");
@@ -433,30 +425,10 @@ async fn model_performance_handler(
     }
 }
 
-async fn get_provider_model_rating_handler(
+async fn set_model_rating_handler(
     State(gw): State<Gateway>,
-    Path(id): Path<String>,
-    query: Result<Query<ProviderModelQuery>, axum::extract::rejection::QueryRejection>,
-) -> axum::response::Response {
-    let Query(query) = match query {
-        Ok(query) => query,
-        Err(error) => return rating_bad_request(error.body_text()),
-    };
-    match gw
-        .admin()
-        .get_provider_model_rating(&id, &query.model)
-        .await
-    {
-        Ok(state) => Json(serde_json::json!({ "data": state })).into_response(),
-        Err(error) => rating_error(error),
-    }
-}
-
-async fn set_provider_model_rating_handler(
-    State(gw): State<Gateway>,
-    Path(id): Path<String>,
-    query: Result<Query<ProviderModelQuery>, axum::extract::rejection::QueryRejection>,
-    input: Result<Json<SetProviderModelRating>, axum::extract::rejection::JsonRejection>,
+    query: Result<Query<ModelRatingQuery>, axum::extract::rejection::QueryRejection>,
+    input: Result<Json<SetModelRating>, axum::extract::rejection::JsonRejection>,
 ) -> axum::response::Response {
     let Query(query) = match query {
         Ok(query) => query,
@@ -466,30 +438,21 @@ async fn set_provider_model_rating_handler(
         Ok(input) => input,
         Err(error) => return rating_bad_request(error.body_text()),
     };
-    match gw
-        .admin()
-        .set_provider_model_rating(&id, &query.model, input)
-        .await
-    {
-        Ok(rating) => Json(serde_json::json!({ "data": rating })).into_response(),
+    match gw.admin().set_model_rating(&query.prefix, input).await {
+        Ok(entry) => Json(serde_json::json!({ "data": entry })).into_response(),
         Err(error) => rating_error(error),
     }
 }
 
-async fn delete_provider_model_rating_handler(
+async fn delete_model_rating_handler(
     State(gw): State<Gateway>,
-    Path(id): Path<String>,
-    query: Result<Query<ProviderModelQuery>, axum::extract::rejection::QueryRejection>,
+    query: Result<Query<ModelRatingQuery>, axum::extract::rejection::QueryRejection>,
 ) -> axum::response::Response {
     let Query(query) = match query {
         Ok(query) => query,
         Err(error) => return rating_bad_request(error.body_text()),
     };
-    match gw
-        .admin()
-        .delete_provider_model_rating(&id, &query.model)
-        .await
-    {
+    match gw.admin().delete_model_rating(&query.prefix).await {
         Ok(()) => Json(serde_json::json!({ "ok": true })).into_response(),
         Err(error) => rating_error(error),
     }
@@ -504,10 +467,9 @@ fn rating_bad_request(message: String) -> axum::response::Response {
 }
 
 fn rating_error(error: anyhow::Error) -> axum::response::Response {
-    let status = match error.downcast_ref::<ProviderModelRatingError>() {
-        Some(ProviderModelRatingError::InvalidInput(_)) => StatusCode::BAD_REQUEST,
-        Some(ProviderModelRatingError::ProviderNotFound) => StatusCode::NOT_FOUND,
-        Some(ProviderModelRatingError::UnsupportedStorage) => StatusCode::NOT_IMPLEMENTED,
+    let status = match error.downcast_ref::<ModelRatingError>() {
+        Some(ModelRatingError::InvalidInput(_)) => StatusCode::BAD_REQUEST,
+        Some(ModelRatingError::UnsupportedStorage) => StatusCode::NOT_IMPLEMENTED,
         None => StatusCode::INTERNAL_SERVER_ERROR,
     };
     let message = if status == StatusCode::INTERNAL_SERVER_ERROR {

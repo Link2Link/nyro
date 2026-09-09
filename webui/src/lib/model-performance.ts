@@ -1,5 +1,4 @@
-import { isProviderModelRating, providerModelKey } from "./model-ratings";
-import type { Provider, ProviderModelRating } from "./types";
+import type { Provider } from "./types";
 
 export interface PerformanceStats {
   selected_request_count: number;
@@ -8,15 +7,24 @@ export interface PerformanceStats {
   first_sample_at: number | null;
   last_sample_at: number | null;
 }
-export interface ModelPerformance {
-  rating: ProviderModelRating;
+export interface ModelPerformanceVariant {
+  upstream_model: string;
   mixed: PerformanceStats;
   unclassified_count: number;
   untrusted_count: number;
-  status: "ready" | "error";
-  error?: string;
 }
-export interface PerformanceResponse { as_of: number; window_start: number | null; models: ModelPerformance[] }
+/** One point: a rated prefix at one provider, variants merged by sample weight. */
+export interface ModelPerformanceItem {
+  model_prefix: string;
+  provider_id: string;
+  score: number;
+  score_updated_at: string;
+  mixed: PerformanceStats;
+  variants: ModelPerformanceVariant[];
+  unclassified_count: number;
+  untrusted_count: number;
+}
+export interface PerformanceResponse { as_of: number; window_start: number | null; models: ModelPerformanceItem[] }
 const count = (value: unknown) => typeof value === "number" && Number.isInteger(value) && value >= 0;
 const finite = (value: unknown) => typeof value === "number" && Number.isFinite(value);
 function isStats(value: unknown): value is PerformanceStats {
@@ -29,6 +37,12 @@ function isStats(value: unknown): value is PerformanceStats {
     && finite(v.first_sample_at) && Number(v.first_sample_at) >= 0
     && finite(v.last_sample_at) && Number(v.last_sample_at) >= Number(v.first_sample_at);
 }
+function isVariant(value: unknown): value is ModelPerformanceVariant {
+  if (!value || typeof value !== "object") return false;
+  const v = value as Record<string, unknown>;
+  return typeof v.upstream_model === "string" && v.upstream_model.length > 0
+    && isStats(v.mixed) && count(v.unclassified_count) && count(v.untrusted_count);
+}
 /** Validate the batch as a contract, not as invented zero-valued statistics. */
 export function readPerformanceResponse(value: unknown): PerformanceResponse {
   const fail = () => { throw new Error("Invalid model performance response. Please check backend compatibility."); };
@@ -38,27 +52,38 @@ export function readPerformanceResponse(value: unknown): PerformanceResponse {
     || (v.window_start !== null && (!finite(v.window_start) || Number(v.window_start) < 0 || Number(v.window_start) > Number(v.as_of)))
     || !Array.isArray(v.models)) return fail();
   const keys = new Set<string>();
-  for (const model of v.models) {
-    if (!model || !isProviderModelRating(model.rating)
-      || !["ready", "error"].includes(model.status) || !isStats(model.mixed)
-      || !count(model.unclassified_count) || !count(model.untrusted_count)
-      || (model.error !== undefined && typeof model.error !== "string")) return fail();
-    const key = providerModelKey(model.rating.provider_id, model.rating.upstream_model);
+  for (const item of v.models) {
+    if (!item || typeof item !== "object") return fail();
+    const model = item as Record<string, unknown>;
+    if (typeof model.model_prefix !== "string" || !model.model_prefix
+      || typeof model.provider_id !== "string" || !model.provider_id
+      || !Number.isInteger(model.score) || Number(model.score) < 0 || Number(model.score) > 100
+      || typeof model.score_updated_at !== "string"
+      || !isStats(model.mixed)
+      || !Array.isArray(model.variants) || !model.variants.every(isVariant)
+      || !count(model.unclassified_count) || !count(model.untrusted_count)) return fail();
+    const key = JSON.stringify([model.model_prefix, model.provider_id]);
     if (keys.has(key)) return fail();
     keys.add(key);
   }
   return value as PerformanceResponse;
 }
+export interface PerformanceRowVariant {
+  upstream_model: string;
+  stats: PerformanceStats;
+}
 export interface PerformanceRow {
   key: string;
   pointId: string;
+  modelPrefix: string;
   providerId: string;
   providerName: string;
   providerEnabled: boolean;
+  /** Display label component: the prefix plays the model-name role. */
   model: string;
   score: number;
-  scoreUpdatedAt: string | null;
-  status: "ready" | "missing" | "error";
+  scoreUpdatedAt: string;
+  status: "ready" | "missing";
   tps: number | null;
   selectedRequestCount: number;
   validTpsCount: number;
@@ -66,7 +91,7 @@ export interface PerformanceRow {
   lastSampleAt: number | null;
   unclassifiedCount: number;
   untrustedCount: number;
-  error?: string;
+  variants: PerformanceRowVariant[];
 }
 export interface PerformancePoint extends PerformanceRow { status: "ready"; score: number; tps: number; color: string }
 /** Hidden selection is retained for restoring filters but must not dim unrelated visible points. */
@@ -81,24 +106,24 @@ export function performanceColor(providerId: string): string {
   for (const code of providerId) hash = (hash * 31 + code.codePointAt(0)!) >>> 0;
   return COLORS[hash % COLORS.length];
 }
-/** One comprehensive rating and mixed statistic per exact provider/model pair. */
+/** One aggregated point per (prefix × provider); backend did the weighted merge. */
 export function buildPerformanceRows(snapshot: PerformanceResponse, providers: Provider[]): PerformanceRow[] {
   const providerIndex = new Map(providers.map((provider) => [provider.id, provider]));
   const rows: PerformanceRow[] = [];
-  for (const model of snapshot.models) {
-    const rating = model.rating;
-    const provider = providerIndex.get(rating.provider_id);
-    const stats = model.mixed;
+  for (const item of snapshot.models) {
+    const provider = providerIndex.get(item.provider_id);
+    const stats = item.mixed;
     rows.push({
-      key: providerModelKey(rating.provider_id, rating.upstream_model), pointId: "",
-      providerId: rating.provider_id, providerName: provider?.name ?? rating.provider_id,
-      providerEnabled: provider?.is_enabled ?? false, model: rating.upstream_model,
-      score: rating.score, scoreUpdatedAt: rating.updated_at,
-      status: model.status === "error" ? "error"
-        : stats.average_tps === null || stats.valid_tps_count === 0 ? "missing" : "ready",
+      key: JSON.stringify([item.model_prefix, item.provider_id]), pointId: "",
+      modelPrefix: item.model_prefix, model: item.model_prefix,
+      providerId: item.provider_id, providerName: provider?.name ?? item.provider_id,
+      providerEnabled: provider?.is_enabled ?? false,
+      score: item.score, scoreUpdatedAt: item.score_updated_at,
+      status: stats.average_tps === null || stats.valid_tps_count === 0 ? "missing" : "ready",
       tps: stats.average_tps, selectedRequestCount: stats.selected_request_count, validTpsCount: stats.valid_tps_count,
       firstSampleAt: stats.first_sample_at, lastSampleAt: stats.last_sample_at,
-      unclassifiedCount: model.unclassified_count, untrustedCount: model.untrusted_count, error: model.error,
+      unclassifiedCount: item.unclassified_count, untrustedCount: item.untrusted_count,
+      variants: item.variants.map((variant) => ({ upstream_model: variant.upstream_model, stats: variant.mixed })),
     });
   }
   // Exact identities, independent of names, input order, filters, and chart zoom.
@@ -108,12 +133,11 @@ export function buildPerformanceRows(snapshot: PerformanceResponse, providers: P
 export function filterPerformanceRows(rows: PerformanceRow[], search: string, providerId: string | null): PerformanceRow[] {
   const text = search.toLocaleLowerCase();
   return rows.filter((row) => (providerId === null || row.providerId === providerId)
-    && `${row.providerName}\n${row.providerId}\n${row.model}`.toLocaleLowerCase().includes(text));
+    && `${row.providerName}\n${row.providerId}\n${row.modelPrefix}\n${row.variants.map((variant) => variant.upstream_model).join("\n")}`.toLocaleLowerCase().includes(text));
 }
 export function performancePoints(rows: PerformanceRow[]): PerformancePoint[] {
-  return rows.filter((row): row is PerformanceRow & { status: "ready"; score: number; tps: number } => (
+  return rows.filter((row): row is PerformanceRow & { status: "ready"; tps: number } => (
     row.status === "ready" && row.tps !== null && Number.isFinite(row.tps) && row.tps > 0
-    && row.score !== null && Number.isInteger(row.score) && row.score >= 0 && row.score <= 100
   )).map((row) => ({ ...row, color: performanceColor(row.providerId) }));
 }
 export interface PerformanceEnvelopeNode {
@@ -254,12 +278,9 @@ export function buildPerformanceHitIndex(groups: PerformanceGroup[], radius = 28
   };
 }
 export interface PerformanceLabel { x: number; y: number; width: number; height: number; lines: string[] }
-/** Model names are primary; disambiguate only when suppliers share the same model. */
-export function performanceModelLabel(point: PerformancePoint, points: PerformancePoint[]): string {
-  const ambiguous = points.some((other) => other.providerId !== point.providerId
-    && other.providerName === point.providerName && other.model === point.model);
-  const sameModel = points.some((other) => other.providerId !== point.providerId && other.model === point.model);
-  return `${point.model}${sameModel ? ` · ${point.providerName}${ambiguous ? ` (${point.providerId.slice(0, 8)})` : ""}` : ""}`;
+/** The prefix is primary; the provider disambiguates every point. */
+export function performanceModelLabel(point: PerformancePoint): string {
+  return `${point.modelPrefix} · ${point.providerName}`;
 }
 const characterWidth = (char: string) => char.codePointAt(0)! > 127 ? 11 : 6.5;
 function wrapLabel(text: string, maxWidth: number): string[] {
@@ -272,14 +293,13 @@ function wrapLabel(text: string, maxWidth: number): string[] {
   if (line) lines.push(line);
   return lines;
 }
-/** Move labels only, never points. Every coincident model gets its own full wrapped text. */
+/** Move labels only, never points. Every coincident point gets its own full wrapped text. */
 export function layoutPerformanceLabels(groups: PerformanceGroup[]): Map<string, PerformanceLabel> {
   const placed: PerformanceLabel[] = [];
   const result = new Map<string, PerformanceLabel>();
-  const points = groups.flatMap((group) => group.points);
   const { left, right, top, bottom } = PERFORMANCE_CHART;
   for (const group of groups) {
-    const lines = group.points.flatMap((point) => wrapLabel(performanceModelLabel(point, points), 194));
+    const lines = group.points.flatMap((point) => wrapLabel(performanceModelLabel(point), 194));
     const width = Math.min(210, Math.max(70, ...lines.map((line) => [...line].reduce((n, char) => n + characterWidth(char), 0) + 16)));
     const height = lines.length * 15 + 10;
     const slots: { x: number; y: number }[] = [];

@@ -1,7 +1,7 @@
-mod provider_model_ratings;
+mod model_ratings;
 
-use crate::storage::ProviderModelRatingStore;
-use provider_model_ratings::PostgresProviderModelRatingStore;
+use crate::storage::ModelRatingStore;
+use model_ratings::PostgresModelRatingStore;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -77,10 +77,9 @@ impl PostgresAdapter {
         // Missing rating storage means this database still needs migration.
         let schema_compatible = if can_connect {
             pg_table_exists(&self.pool, "models").await.unwrap_or(false)
-                && pg_table_exists(&self.pool, "provider_model_ratings")
+                && pg_table_exists(&self.pool, "model_rating_prefixes")
                     .await
                     .unwrap_or(false)
-                && sqlx::query("SELECT effort FROM provider_model_ratings LIMIT 0").execute(&self.pool).await.is_ok()
                 && sqlx::query("SELECT performance_metadata_version, upstream_effort_status, upstream_effort_raw, upstream_effort_tier, request_completion, completion_reason, upstream_response_mode, performance_upstream_ms, performance_first_chunk_ms, performance_completed_at FROM request_logs LIMIT 0").execute(&self.pool).await.is_ok()
                 && sqlx::query("SELECT client_request_id, attempt_index, outcome_version, attempt_outcome, failure_kind, failure_stage, error_message, error_causes_json, payload_metadata_json, payload_cleared_at FROM request_logs LIMIT 0").execute(&self.pool).await.is_ok()
                 && sqlx::query("SELECT client_request_id, final_outcome, final_attempt_id, attempt_count, finished_at FROM request_results LIMIT 0").execute(&self.pool).await.is_ok()
@@ -98,7 +97,7 @@ impl PostgresAdapter {
 pub struct PostgresStorage {
     pool: Pool<Postgres>,
     provider_store: Arc<PostgresProviderStore>,
-    provider_model_rating_store: Arc<PostgresProviderModelRatingStore>,
+    model_rating_store: Arc<PostgresModelRatingStore>,
     model_store: Arc<PostgresModelStore>,
     model_backend_store: Arc<PostgresModelBackendStore>,
     settings_store: Arc<PostgresSettingsStore>,
@@ -114,8 +113,7 @@ impl PostgresStorage {
         let adapter = PostgresAdapter::connect(config).await?;
         let pool = adapter.pool().clone();
         let provider_store = Arc::new(PostgresProviderStore { pool: pool.clone() });
-        let provider_model_rating_store =
-            Arc::new(PostgresProviderModelRatingStore { pool: pool.clone() });
+        let model_rating_store = Arc::new(PostgresModelRatingStore { pool: pool.clone() });
         let model_store = Arc::new(PostgresModelStore { pool: pool.clone() });
         let model_backend_store = Arc::new(PostgresModelBackendStore { pool: pool.clone() });
         let settings_store = Arc::new(PostgresSettingsStore { pool: pool.clone() });
@@ -127,7 +125,7 @@ impl PostgresStorage {
         Ok(Self {
             pool,
             provider_store,
-            provider_model_rating_store,
+            model_rating_store,
             model_store,
             model_backend_store,
             settings_store,
@@ -149,8 +147,8 @@ impl Storage for PostgresStorage {
         self.provider_store.as_ref()
     }
 
-    fn provider_model_ratings(&self) -> Option<&dyn ProviderModelRatingStore> {
-        Some(self.provider_model_rating_store.as_ref())
+    fn model_ratings(&self) -> Option<&dyn ModelRatingStore> {
+        Some(self.model_rating_store.as_ref())
     }
 
     fn models(&self) -> &dyn ModelStore {
@@ -541,11 +539,6 @@ impl ProviderStore for PostgresProviderStore {
             .await?;
 
         sqlx::query("DELETE FROM provider_protocol_endpoints WHERE provider_id = $1")
-            .bind(id)
-            .execute(&mut *tx)
-            .await?;
-
-        sqlx::query("DELETE FROM provider_model_ratings WHERE provider_id = $1")
             .bind(id)
             .execute(&mut *tx)
             .await?;
@@ -1054,6 +1047,13 @@ impl LogStore for PostgresLogStore {
             "CAST(created_at AS BIGINT)",
             "FALSE"
         )
+    }
+    async fn distinct_logged_pairs(&self) -> anyhow::Result<Vec<(String, String)>> {
+        Ok(sqlx::query_as::<_, (String, String)>(
+            "SELECT DISTINCT provider_id, upstream_model FROM request_logs",
+        )
+        .fetch_all(&self.pool)
+        .await?)
     }
     async fn append_batch(&self, entries: Vec<LogEntry>) -> anyhow::Result<()> {
         let mut tx = self.pool.begin().await?;
@@ -1985,7 +1985,11 @@ END $$;"#,
         pg_rename_column_if_needed(self.adapter.pool(), "api_keys", "key", "token").await?;
         migrate_performance_pg(self.adapter.pool()).await?;
         migrate_diagnostics_pg(self.adapter.pool()).await?;
-        migrate_rating_effort_pg(self.adapter.pool()).await?;
+        // Provider-scoped ratings were replaced by prefix ratings; old rows are
+        // deliberately dropped instead of migrated.
+        sqlx::query("DROP TABLE IF EXISTS provider_model_ratings")
+            .execute(self.adapter.pool())
+            .await?;
         crate::db::model_performance::recover_historical_metadata!(
             self.adapter.pool(),
             sqlx::Postgres,
@@ -2004,25 +2008,6 @@ END $$;"#,
             writable: health.can_connect,
         })
     }
-}
-
-async fn migrate_rating_effort_pg(pool: &Pool<Postgres>) -> anyhow::Result<()> {
-    let mut tx = pool.begin().await?;
-    sqlx::query("ALTER TABLE provider_model_ratings ADD COLUMN IF NOT EXISTS effort TEXT COLLATE \"C\" NOT NULL DEFAULT 'common' CHECK (effort IN ('common','low','medium','high','xhigh','max'))").execute(&mut *tx).await?;
-    // Inspect the actual key (not just column existence), so interrupted upgrades
-    // and repeated INIT runs are safe. DDL and key replacement are atomic in PG.
-    sqlx::query(r#"DO $$ DECLARE key_name TEXT; key_has_effort BOOLEAN; BEGIN
-        SELECT c.conname, EXISTS (SELECT 1 FROM unnest(c.conkey) AS k(attnum)
-            JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = k.attnum WHERE a.attname = 'effort')
-        INTO key_name, key_has_effort FROM pg_constraint c
-        WHERE c.conrelid = 'provider_model_ratings'::regclass AND c.contype = 'p';
-        IF NOT COALESCE(key_has_effort, FALSE) THEN
-            IF key_name IS NOT NULL THEN EXECUTE format('ALTER TABLE provider_model_ratings DROP CONSTRAINT %I', key_name); END IF;
-            ALTER TABLE provider_model_ratings ADD PRIMARY KEY (provider_id, upstream_model, effort);
-        END IF;
-    END $$;"#).execute(&mut *tx).await?;
-    tx.commit().await?;
-    Ok(())
 }
 
 async fn migrate_diagnostics_pg(pool: &Pool<Postgres>) -> anyhow::Result<()> {
@@ -2449,15 +2434,12 @@ CREATE TABLE IF NOT EXISTS providers (
     updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
 );
 
-CREATE TABLE IF NOT EXISTS provider_model_ratings (
-    provider_id TEXT COLLATE "C" NOT NULL REFERENCES providers(id) ON DELETE CASCADE,
-    upstream_model TEXT COLLATE "C" NOT NULL
-        CHECK (octet_length(upstream_model) BETWEEN 1 AND 1024),
+CREATE TABLE IF NOT EXISTS model_rating_prefixes (
+    model_prefix TEXT COLLATE "C" NOT NULL
+        CHECK (octet_length(model_prefix) BETWEEN 1 AND 1024),
     score INTEGER NOT NULL CHECK (score BETWEEN 0 AND 100),
     updated_at TEXT NOT NULL,
-    effort TEXT COLLATE "C" NOT NULL DEFAULT 'common'
-        CONSTRAINT provider_model_ratings_effort_check CHECK (effort IN ('common','low','medium','high','xhigh','max')),
-    PRIMARY KEY (provider_id, upstream_model, effort)
+    PRIMARY KEY (model_prefix)
 );
 
 CREATE TABLE IF NOT EXISTS provider_protocol_endpoints (

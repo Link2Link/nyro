@@ -414,25 +414,14 @@ export interface EndpointTestResult {
   tested_at: string;
 }
 
-/** One persisted comprehensive score for an exact provider / upstream model pair. */
-export interface ProviderModelRating {
-  provider_id: string;
-  upstream_model: string;
+/** One persisted comprehensive score shared by every model matching the prefix. */
+export interface ModelRatingEntry {
+  model_prefix: string;
   score: number;
   updated_at: string;
 }
 
-export type ProviderModelRatingState =
-  | (ProviderModelRating & { status: "rated" })
-  | {
-      provider_id: string;
-      upstream_model: string;
-      status: "unrated";
-      score: null;
-      updated_at: null;
-    };
-
-export interface SetProviderModelRating {
+export interface SetModelRating {
   score: number;
 }
 
@@ -693,7 +682,15 @@ export interface ExportData {
   version: number;
   providers: ExportProvider[];
   models: ExportModel[];
+  model_ratings?: ExportModelRating[];
   settings: [string, string][];
+}
+
+/** One prefix rating entry in the flat export format. */
+export interface ExportModelRating {
+  model_prefix: string;
+  score: number;
+  updated_at: string;
 }
 
 export interface ExportProvider {
@@ -709,7 +706,6 @@ export interface ExportProvider {
   static_models?: string | null;
   api_key: string;
   is_enabled: boolean;
-  model_ratings?: Omit<ProviderModelRating, "provider_id">[];
 }
 
 export interface ExportModel {

@@ -1079,12 +1079,7 @@ impl AdminService {
         options: CopyProviderOptions,
     ) -> anyhow::Result<Provider> {
         let original = self.get_provider(id).await?;
-        // Snapshot comprehensive ratings and timestamps, independently of catalog availability or
-        // append_targets. A read failure must not produce an unscored copy.
-        let rating_snapshot = match self.gw.storage.provider_model_ratings() {
-            Some(store) => Some(store.list(Some(&original.id)).await?),
-            None => None,
-        };
+        // Prefix ratings are provider-independent: the copy shares them automatically.
         let name = self.next_provider_copy_name(&original.name).await?;
         let copied = self
             .create_provider(CreateProvider {
@@ -1166,18 +1161,6 @@ impl AdminService {
         } else {
             copied
         };
-
-        if let Some(snapshot) = rating_snapshot {
-            if let Err(error) = self.rating_store()?.restore(&copied.id, &snapshot).await {
-                if let Err(cleanup_error) = self.delete_provider(&copied.id).await {
-                    return Err(error.context(format!(
-                        "Rating copy failed; rollback of provider {} also failed: {cleanup_error}",
-                        copied.id
-                    )));
-                }
-                return Err(error.context("Rating copy failed; the new provider was rolled back"));
-            }
-        }
 
         if options.append_targets {
             self.append_provider_targets(&original.id, &copied.id)

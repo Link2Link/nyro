@@ -74,6 +74,19 @@ CREATE TABLE public.model_backends (
 
 
 --
+-- Name: model_rating_prefixes; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.model_rating_prefixes (
+    model_prefix text NOT NULL COLLATE pg_catalog."C",
+    score integer NOT NULL,
+    updated_at text NOT NULL,
+    CONSTRAINT model_rating_prefixes_model_prefix_check CHECK (((octet_length(model_prefix) >= 1) AND (octet_length(model_prefix) <= 1024))),
+    CONSTRAINT model_rating_prefixes_score_check CHECK (((score >= 0) AND (score <= 100)))
+);
+
+
+--
 -- Name: models; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -90,22 +103,6 @@ CREATE TABLE public.models (
     is_enabled boolean DEFAULT true,
     priority integer DEFAULT 0,
     created_at timestamp with time zone DEFAULT CURRENT_TIMESTAMP
-);
-
-
---
--- Name: provider_model_ratings; Type: TABLE; Schema: public; Owner: -
---
-
-CREATE TABLE public.provider_model_ratings (
-    provider_id text NOT NULL COLLATE pg_catalog."C",
-    upstream_model text NOT NULL COLLATE pg_catalog."C",
-    score integer NOT NULL,
-    updated_at text NOT NULL,
-    effort text DEFAULT 'common'::text NOT NULL COLLATE pg_catalog."C",
-    CONSTRAINT provider_model_ratings_effort_check CHECK ((effort = ANY (ARRAY['common'::text, 'low'::text, 'medium'::text, 'high'::text, 'xhigh'::text, 'max'::text]))),
-    CONSTRAINT provider_model_ratings_score_check CHECK (((score >= 0) AND (score <= 100))),
-    CONSTRAINT provider_model_ratings_upstream_model_check CHECK (((octet_length(upstream_model) >= 1) AND (octet_length(upstream_model) <= 1024)))
 );
 
 
@@ -298,11 +295,11 @@ ALTER TABLE ONLY public.api_keys
 
 
 --
--- Name: provider_model_ratings provider_model_ratings_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+-- Name: model_rating_prefixes model_rating_prefixes_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
-ALTER TABLE ONLY public.provider_model_ratings
-    ADD CONSTRAINT provider_model_ratings_pkey PRIMARY KEY (provider_id, upstream_model, effort);
+ALTER TABLE ONLY public.model_rating_prefixes
+    ADD CONSTRAINT model_rating_prefixes_pkey PRIMARY KEY (model_prefix);
 
 
 --
@@ -489,14 +486,6 @@ ALTER TABLE ONLY public.api_key_models
 
 ALTER TABLE ONLY public.api_key_models
     ADD CONSTRAINT api_key_routes_route_id_fkey FOREIGN KEY (model_id) REFERENCES public.models(id) ON DELETE CASCADE;
-
-
---
--- Name: provider_model_ratings provider_model_ratings_provider_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
---
-
-ALTER TABLE ONLY public.provider_model_ratings
-    ADD CONSTRAINT provider_model_ratings_provider_id_fkey FOREIGN KEY (provider_id) REFERENCES public.providers(id) ON DELETE CASCADE;
 
 
 --

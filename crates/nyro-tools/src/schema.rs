@@ -428,7 +428,7 @@ fn ensure_final_tables(tables: &[String]) -> Result<()> {
             "models",
             "model_backends",
             "api_key_models",
-            "provider_model_ratings"
+            "model_rating_prefixes"
         ]
         .iter()
         .all(|name| tables.iter().any(|table| table == name))
@@ -626,7 +626,7 @@ mod tests {
             ensure_final_tables(&tables).is_err(),
             "ratings table is required"
         );
-        tables.push("provider_model_ratings".into());
+        tables.push("model_rating_prefixes".into());
         assert!(ensure_final_tables(&tables).is_ok());
         tables.push("route_targets".into());
         assert!(ensure_final_tables(&tables).is_err());

@@ -1,8 +1,5 @@
 use nyro_core::Gateway;
-use nyro_core::admin::{
-    CopyProviderOptions, ModelPerformanceResponse, ProviderModelRatingState,
-    ProviderOAuthStatusData, SetProviderModelRating,
-};
+use nyro_core::admin::{CopyProviderOptions, ModelPerformanceResponse, ProviderOAuthStatusData, SetModelRating};
 use nyro_core::auth::{AuthExchangeInput, AuthSessionInitData, AuthSessionStatusData};
 use nyro_core::db::models::*;
 use serde::{Deserialize, Serialize};
@@ -15,49 +12,31 @@ use tauri::{Manager, State};
 // ── Manual model ratings ──
 
 #[tauri::command]
-pub async fn list_provider_model_ratings(
+pub async fn list_model_ratings(
     gw: State<'_, Gateway>,
-    provider_id: Option<String>,
-) -> Result<Vec<ProviderModelRating>, String> {
+) -> Result<Vec<ModelRatingEntry>, String> {
+    gw.admin().list_model_ratings().await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn set_model_rating(
+    gw: State<'_, Gateway>,
+    model_prefix: String,
+    input: SetModelRating,
+) -> Result<ModelRatingEntry, String> {
     gw.admin()
-        .list_provider_model_ratings(provider_id.as_deref())
+        .set_model_rating(&model_prefix, input)
         .await
         .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-pub async fn get_provider_model_rating(
+pub async fn delete_model_rating(
     gw: State<'_, Gateway>,
-    provider_id: String,
-    model: String,
-) -> Result<ProviderModelRatingState, String> {
-    gw.admin()
-        .get_provider_model_rating(&provider_id, &model)
-        .await
-        .map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-pub async fn set_provider_model_rating(
-    gw: State<'_, Gateway>,
-    provider_id: String,
-    model: String,
-    input: SetProviderModelRating,
-) -> Result<ProviderModelRating, String> {
-    gw.admin()
-        .set_provider_model_rating(&provider_id, &model, input)
-        .await
-        .map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-pub async fn delete_provider_model_rating(
-    gw: State<'_, Gateway>,
-    provider_id: String,
-    model: String,
+    model_prefix: String,
 ) -> Result<serde_json::Value, String> {
     gw.admin()
-        .delete_provider_model_rating(&provider_id, &model)
+        .delete_model_rating(&model_prefix)
         .await
         .map(|()| serde_json::json!({ "ok": true }))
         .map_err(|e| e.to_string())

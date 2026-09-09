@@ -11,8 +11,8 @@ pub use postgres::PostgresStorage;
 pub use sqlite::SqliteStorage;
 pub use traits::{
     ApiKeyAccessRecord, ApiKeyStore, AuthAccessStore, DynStorage, LogStore, ModelBackendStore,
-    ModelSnapshotStore, ModelStore, ProviderModelRatingStore, ProviderStore, SettingsStore,
-    Storage, StorageBootstrap, UsageWindow,
+    ModelRatingStore, ModelSnapshotStore, ModelStore, ProviderStore, SettingsStore, Storage,
+    StorageBootstrap, UsageWindow,
 };
 
 #[cfg(test)]

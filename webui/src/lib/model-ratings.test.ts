@@ -1,24 +1,32 @@
-import { deepEqual, equal, notEqual, throws } from "node:assert/strict";
+import { deepEqual, equal, notEqual, ok, throws } from "node:assert/strict";
 import { test } from "node:test";
-import { buildModelRatingRows, filterAndSortModelRatingRows, parseRatingScore, providerModelKey, ratingDisplayState, readProviderModelRatings, uniqueModelIdentifiers, type ModelRatingFilters } from "./model-ratings";
-import type { Model, Provider, ProviderModelRating } from "./types";
+import {
+  buildModelRatingRows, buildUnmatchedModels, canonicalModelPrefix, filterAndSortModelRatingRows, isValidRatingPrefix,
+  longestRatingMatch, matchingEntries, modelMatchesPrefix, parseRatingScore, prefixCoverage,
+  ratingDisplayState, readModelRatings, uniqueModelIdentifiers,
+  type ModelCatalogSnapshot, type ModelRatingFilters,
+} from "./model-ratings";
+import type { Model, ModelRatingEntry, Provider } from "./types";
 
 // No test framework needed: compile this file with tsc --module commonjs into a temporary
 // directory outside webui, then run node --test <temp>/model-ratings.test.js.
+// Boundary cases mirror crates/nyro-core/src/db/model_rating_prefixes.rs tests.
 const time = "2026-08-01T10:20:30Z";
 const provider = (id: string, name = id, is_enabled = true): Provider => ({
   id, name, is_enabled, protocol: "openai-compatible", base_url: "https://example.invalid",
   use_proxy: false, fast_mode: false, created_at: time, updated_at: time,
 });
-const rating = (provider_id: string, upstream_model: string, score: number, updated_at = time): ProviderModelRating => ({
-  provider_id, upstream_model, score, updated_at,
+const entry = (model_prefix: string, score: number, updated_at = time): ModelRatingEntry => ({
+  model_prefix, score, updated_at,
 });
 const route = (provider_id: string, model: string): Model => ({
   id: "route", name: "alias", balance: "weighted", target_provider: provider_id,
   target_model: model, enable_auth: true, is_enabled: false, created_at: time,
   targets: [{ id: "target", model_id: "route", provider_id, model, weight: 1, priority: 0, created_at: time }],
 });
-const filters: ModelRatingFilters = { search: "", providerId: null, rating: "all", min: null, max: null, sort: "score-desc", ratingsReady: true };
+const catalog = (providerId: string, status: ModelCatalogSnapshot["status"], models: string[]): ModelCatalogSnapshot =>
+  ({ providerId, status, models });
+const filters: ModelRatingFilters = { search: "", rating: "all", min: null, max: null, sort: "score-desc", ratingsReady: true, coverageReady: true };
 
 test("draft validation accepts boundaries and rejects empty, fraction, NaN, exponent, coercion and out of range", () => {
   for (const [input, expected] of [["0", 0], ["100", 100], ["7", 7], ["007", 7]] as const) equal(parseRatingScore(input), expected);
@@ -27,124 +35,130 @@ test("draft validation accepts boundaries and rejects empty, fraction, NaN, expo
   }
 });
 
-test("provider-model identity and catalog dedup preserve raw model bytes", () => {
-  const models = ["Model", "model", " model", "model ", "model/a?b#c", "model", "模型"];
-  const result = uniqueModelIdentifiers(models);
-  equal(result.length, 6);
-  for (const value of new Set(models)) equal(result.includes(value), true);
-  notEqual(providerModelKey("p", "model"), providerModelKey("p", " model"));
-  notEqual(providerModelKey("p", "model"), providerModelKey("q", "model"));
-  notEqual(providerModelKey("a\u0000b", "c"), providerModelKey("a", "b\u0000c"));
+test("prefix validation mirrors backend blank/NUL/1024-byte rules", () => {
+  equal(isValidRatingPrefix("deepseek-v4-pro"), true);
+  equal(isValidRatingPrefix("模型-é"), true);
+  equal(isValidRatingPrefix("x".repeat(1024)), true);
+  for (const bad of ["", " ", " \t\n", "a\0b", "x".repeat(1025), "🦀".repeat(257)]) {
+    equal(isValidRatingPrefix(bad), false, JSON.stringify(bad));
+  }
+});
+
+test("canonical prefix lowercases like the backend write path", () => {
+  equal(canonicalModelPrefix("DeepSeek-V4-Pro"), "deepseek-v4-pro");
+  equal(canonicalModelPrefix("already-lower"), "already-lower");
+  equal(canonicalModelPrefix("模型-É"), "模型-é");
+});
+
+test("segment-boundary matching mirrors the Rust rules exactly", () => {
+  equal(modelMatchesPrefix("deepseek-v4-pro", "deepseek-v4-pro"), true);
+  equal(modelMatchesPrefix("deepseek-v4-pro-0813", "deepseek-v4-pro"), true);
+  equal(modelMatchesPrefix("deepseek-v4-pro2", "deepseek-v4-pro"), false);
+  equal(modelMatchesPrefix("gpt-4o", "gpt-4"), false);
+  equal(modelMatchesPrefix("gpt-4-turbo", "gpt-4"), true);
+  equal(modelMatchesPrefix("deepseek-v4", "deepseek-v4-pro"), false);
+  equal(modelMatchesPrefix("", "deepseek"), false);
+  // Case differences are ignored in both directions.
+  equal(modelMatchesPrefix("DeepSeek-V4-Pro", "deepseek-v4-pro"), true);
+  equal(modelMatchesPrefix("deepseek-v4-pro-0813", "DEEPSEEK-V4-PRO"), true);
+  equal(modelMatchesPrefix("GPT-4-TURBO", "gpt-4"), true);
+  equal(modelMatchesPrefix("GPT-4O", "gpt-4"), false);
+  // Separator identity is still exact.
+  equal(modelMatchesPrefix("deepseek v4 pro", "deepseek-v4"), false);
+  equal(modelMatchesPrefix("a--b", "a-"), true);
+  equal(modelMatchesPrefix("a-b", "a-"), false);
+  equal(modelMatchesPrefix("模型-专业-0813", "模型-专业"), true);
+  equal(modelMatchesPrefix("模型-x", "模型"), true);
+});
+
+test("longest prefix wins overlaps and matchingEntries orders shortest first", () => {
+  const entries = [entry("deepseek-v4", 80), entry("deepseek-v4-pro", 92)];
+  equal(longestRatingMatch("deepseek-v4-pro-0813", entries)?.model_prefix, "deepseek-v4-pro");
+  equal(longestRatingMatch("deepseek-v4-chat", entries)?.model_prefix, "deepseek-v4");
+  equal(longestRatingMatch("DeepSeek-V4-PRO-0813", entries)?.model_prefix, "deepseek-v4-pro");
+  equal(longestRatingMatch("glm-4.5", entries), null);
+  equal(longestRatingMatch("", entries), null);
+  deepEqual(matchingEntries("deepseek-v4-pro-0813", entries).map((item) => item.model_prefix), ["deepseek-v4", "deepseek-v4-pro"]);
 });
 
 test("list payload failures never masquerade as empty ratings", () => {
-  deepEqual(readProviderModelRatings([]), []);
-  equal(readProviderModelRatings([rating("p", "m", 0)])[0].score, 0);
-  for (const value of [null, {}, { data: [] }, { error: "unsupported" }, [null], [rating("p", "m", 0.5)], [rating("p", "m", -1)], [rating("p", "m", 101)], [{ ...rating("p", "m", 0), score: "0" }], [rating("p", "m", 0, "")], [rating("p", "m", 0, "invalid")], [rating("p", "m", 0, "2026-08-01")]]) {
-    throws(() => readProviderModelRatings(value));
+  deepEqual(readModelRatings([]), []);
+  equal(readModelRatings([entry("p", 0)])[0].score, 0);
+  for (const value of [null, {}, { data: [] }, { error: "unsupported" }, [null], [entry("p", 0.5)], [entry("p", -1)], [entry("p", 101)], [{ ...entry("p", 0), score: "0" }], [entry("p", 0, "")], [entry("p", 0, "invalid")], [entry("p", 0, "2026-08-01")], [entry("", 0)]]) {
+    throws(() => readModelRatings(value));
   }
-  throws(() => readProviderModelRatings([rating("p", "m", 0), rating("p", "m", 50)]));
-  equal(readProviderModelRatings([rating("p", "m", 0, "2026-08-01T10:20:30.123456+00:00")]).length, 1);
+  throws(() => readModelRatings([entry("p", 0), entry("p", 50)]));
+  equal(readModelRatings([entry("p", 0, "2026-08-01T10:20:30.123456+00:00")]).length, 1);
 });
 
-test("display keeps unrated, zero, loading, error and unknown provider distinct", () => {
-  equal(ratingDisplayState("ready").status, "unrated");
-  const zero = ratingDisplayState("ready", rating("p", "m", 0));
+test("display keeps unrated, zero, loading and error distinct per concrete model", () => {
+  const entries = [entry("gpt-4", 0), entry("m", 55)];
+  equal(ratingDisplayState("ready", "unknown", entries).status, "unrated");
+  const zero = ratingDisplayState("ready", "gpt-4o-mini", [entry("gpt-4o", 0)]);
   equal(zero.status, "rated");
-  if (zero.status === "rated") equal(zero.rating.score, 0);
-  equal(ratingDisplayState("loading").status, "loading");
-  equal(ratingDisplayState("error", rating("p", "m", 0)).status, "error");
-  equal(ratingDisplayState("ready", null, false).status, "error");
+  if (zero.status === "rated") equal(zero.entry.score, 0);
+  equal(ratingDisplayState("loading", "m", entries).status, "loading");
+  equal(ratingDisplayState("error", "m", entries).status, "error");
+  equal(ratingDisplayState("ready", "m2", entries).status, "unrated");
 });
 
-test("union includes exact catalogs, disabled route references and saved-only missing/disabled models", () => {
-  const rows = buildModelRatingRows(
-    [provider("p"), provider("disabled", "Disabled", false), provider("failure")],
-    [route("p", "mapped"), route("p", " name "), route("disabled", "route-only"), route("failure", "not-returned"), route("unknown", "model")],
-    [rating("p", "name", 0), rating("p", "saved-only", 88), rating("disabled", "saved", 45)],
-    [
-      { providerId: "p", status: "success", models: ["name", " name ", "name"] },
-      { providerId: "disabled", status: "success", models: ["cached"] },
-      { providerId: "failure", status: "unknown", models: ["stale"] },
-    ],
+test("coverage counts models per provider at segment boundaries only", () => {
+  const providers = [provider("p", "Alpha"), provider("q", "Beta")];
+  const catalogs = [
+    catalog("p", "success", ["deepseek-v4-pro", "deepseek-v4-pro-0813", "deepseek-v4-pro2", "other"]),
+    catalog("q", "success", ["DeepSeek-V4-Pro"]),
+  ];
+  const coverage = prefixCoverage("deepseek-v4-pro", catalogs, providers);
+  equal(coverage.length, 2);
+  deepEqual(coverage[0].models, ["deepseek-v4-pro", "deepseek-v4-pro-0813"]);
+  deepEqual(coverage[1].models, ["DeepSeek-V4-Pro"]);
+  const rows = buildModelRatingRows([entry("deepseek-v4-pro", 92)], catalogs, providers);
+  equal(rows[0].modelCount, 3);
+  equal(rows[0].providerCount, 2);
+});
+
+test("unmatched union covers catalogs and route targets minus every matched model", () => {
+  const providers = [provider("p"), provider("disabled", "Disabled", false)];
+  const entries = [entry("rated", 50)];
+  const unmatched = buildUnmatchedModels(
+    providers,
+    [route("p", "mapped"), route("p", "rated-0813"), route("disabled", "hidden"), route("p", "saved-only")],
+    [catalog("p", "success", ["catalog-only", "rated"]), catalog("disabled", "success", ["ignored"])],
+    entries,
   );
-  const byKey = new Map(rows.map((row) => [row.key, row]));
-  equal(rows.length, 8);
-  equal(byKey.get(providerModelKey("p", "name"))?.rating?.score, 0);
-  equal(byKey.get(providerModelKey("p", " name "))?.catalogStatus, "listed");
-  equal(byKey.get(providerModelKey("p", "mapped"))?.catalogStatus, "missing");
-  equal(byKey.get(providerModelKey("p", "saved-only"))?.catalogStatus, "missing");
-  equal(byKey.get(providerModelKey("disabled", "saved"))?.catalogStatus, "unknown");
-  equal(byKey.get(providerModelKey("failure", "not-returned"))?.catalogStatus, "unknown");
-  equal(byKey.get(providerModelKey("unknown", "model"))?.catalogStatus, "unknown");
-  equal(byKey.has(providerModelKey("disabled", "cached")), false);
-  equal(byKey.has(providerModelKey("failure", "stale")), false);
+  deepEqual(unmatched.map((row) => [row.provider.id, row.model]), [
+    ["p", "catalog-only"], ["p", "mapped"], ["p", "saved-only"],
+  ]);
 });
 
-test("successful empty catalog means missing, failed catalog means unknown", () => {
-  for (const [status, expected] of [["success", "missing"], ["unknown", "unknown"], ["loading", "unknown"]] as const) {
-    const [row] = buildModelRatingRows([provider("p")], [], [rating("p", "saved", 50)], [{ providerId: "p", status, models: [] }]);
-    equal(row.catalogStatus, expected);
-  }
-});
-
-test("clearing saved-only records removes only the orphan union row", () => {
+test("filtering sorts by score/name/updated with global search and score bounds", () => {
   const providers = [provider("p")];
-  const routes = [route("p", "mapped")];
-  const before = buildModelRatingRows(providers, routes, [rating("p", "saved-only", 80)], []);
-  equal(before.length, 2);
-  const after = buildModelRatingRows(providers, routes, [], []);
-  deepEqual(after.map((row) => row.model), ["mapped"]);
+  const entries = [entry("b", 80), entry("a", 0), entry("c", 90, "2026-08-01T03:00:00+01:00"), entry("d", 90, "2026-08-01T02:00:00Z"), entry("old", 100, "2026-08-01T01:00:00Z")];
+  const rows = buildModelRatingRows(entries, [catalog("p", "success", ["a", "b", "c", "d"])], providers);
+  deepEqual(filterAndSortModelRatingRows(rows, filters).map((row) => row.entry.model_prefix), ["old", "c", "d", "b", "a"]);
+  // b/a share the default 10:20Z instant, c/d both parse to 02:00Z; ties fall to name.
+  deepEqual(filterAndSortModelRatingRows(rows, { ...filters, sort: "updated" }).map((row) => row.entry.model_prefix), ["a", "b", "c", "d", "old"]);
+  equal(filterAndSortModelRatingRows(rows, { ...filters, min: 80, max: 90 }).length, 3);
+  deepEqual(filterAndSortModelRatingRows(rows, { ...filters, search: "A" }).map((row) => row.entry.model_prefix), ["a"]);
+  // match-state predicates depend on ready coverage; unknown coverage disables them.
+  equal(filterAndSortModelRatingRows(rows, { ...filters, rating: "unmatched" }).length, 1);
+  equal(filterAndSortModelRatingRows(rows, { ...filters, rating: "matched" }).length, 4);
+  equal(filterAndSortModelRatingRows(rows, { ...filters, rating: "unmatched", coverageReady: false }).length, 5);
+  // Unknown scores disable predicates rather than fabricate empty results.
+  equal(filterAndSortModelRatingRows(rows, { ...filters, ratingsReady: false, min: 99 }).length, 5);
 });
 
-test("score sort directions keep unrated last and use stable provider/name/id ties", () => {
-  const rows = buildModelRatingRows(
-    [provider("z", "Alpha"), provider("a", "Alpha"), provider("b", "Beta")],
-    [route("a", "unrated")],
-    [rating("b", "m", 80), rating("z", "m", 80), rating("a", "z", 80), rating("a", "m", 80), rating("a", "zero", 0)], [],
-  );
-  const sorted = filterAndSortModelRatingRows(rows, filters);
-  deepEqual(sorted.map((row) => [row.providerId, row.model]), [["a", "m"], ["z", "m"], ["a", "z"], ["b", "m"], ["a", "zero"], ["a", "unrated"]]);
-  const asc = filterAndSortModelRatingRows(rows, { ...filters, sort: "score-asc" });
-  equal(asc[0].rating?.score, 0);
-  equal(asc[asc.length - 1]?.model, "unrated");
-  deepEqual(filterAndSortModelRatingRows([...rows].reverse(), filters).map((row) => row.key), sorted.map((row) => row.key));
+test("global sorting occurs before the first 40-row page", () => {
+  const entries = Array.from({ length: 80 }, (_, index) => entry(`model-${String(index).padStart(3, "0")}`, index));
+  const rows = buildModelRatingRows(entries, [], []);
+  equal(filterAndSortModelRatingRows(rows, filters)[0].entry.score, 79);
+  equal(filterAndSortModelRatingRows(rows, { ...filters, min: 60 }).length, 20);
 });
 
-test("rating and min/max predicates exclude unscored; text search doesn't alter exact identity", () => {
-  const rows = buildModelRatingRows([provider("p", "Alpha"), provider("q")], [route("p", "unknown")], [rating("p", " Model / 1 ", 0), rating("q", "other", 90)], []);
-  equal(filterAndSortModelRatingRows(rows, { ...filters, min: 0 }).length, 2);
-  deepEqual(filterAndSortModelRatingRows(rows, { ...filters, min: 0, max: 0 }).map((row) => row.model), [" Model / 1 "]);
-  equal(filterAndSortModelRatingRows(rows, { ...filters, rating: "unrated" }).length, 1);
-  equal(filterAndSortModelRatingRows(rows, { ...filters, rating: "rated" }).length, 2);
-  equal(filterAndSortModelRatingRows(rows, { ...filters, rating: "unrated", min: 0 }).length, 0);
-  deepEqual(filterAndSortModelRatingRows(rows, { ...filters, search: "model-1", providerId: "p" }).map((row) => row.model), [" Model / 1 "]);
-});
-
-test("unknown ratings disable score predicates and sorting rather than fabricate empty results", () => {
-  const rows = buildModelRatingRows([provider("p"), provider("q")], [route("p", "unknown")], [rating("q", "rated", 90)], []);
-  const result = filterAndSortModelRatingRows(rows, { ...filters, ratingsReady: false, rating: "rated", min: 99 });
-  equal(result.length, 2);
-  equal(result[0].model, "unknown");
-  equal(filterAndSortModelRatingRows(rows, { ...filters, ratingsReady: false, providerId: "p" }).length, 1);
-});
-
-test("global filtering and sorting occur before the first 40-row page", () => {
-  const saved = Array.from({ length: 80 }, (_, index) => rating("p", `model-${index}`, index));
-  const rows = buildModelRatingRows([provider("p")], [], saved, []);
-  const sorted = filterAndSortModelRatingRows(rows, filters);
-  equal(sorted.slice(0, 40)[0].rating?.score, 79);
-  const filtered = filterAndSortModelRatingRows(rows, { ...filters, min: 60 });
-  equal(filtered.length, 20);
-  equal(filtered.slice(0, 40)[19]?.rating?.score, 60);
-});
-
-test("updated sort compares instants, preserves deterministic ties, and leaves unrated last", () => {
-  const rows = buildModelRatingRows([provider("p")], [route("p", "unrated")], [
-    rating("p", "old", 100, "2026-08-01T01:00:00Z"),
-    rating("p", "b", 0, "2026-08-01T03:00:00+01:00"),
-    rating("p", "a", 0, "2026-08-01T02:00:00Z"),
-  ], []);
-  deepEqual(filterAndSortModelRatingRows(rows, { ...filters, sort: "updated" }).map((row) => row.model), ["a", "b", "old", "unrated"]);
-  deepEqual(filterAndSortModelRatingRows(rows, { ...filters, sort: "name" }).map((row) => row.model), ["a", "b", "old", "unrated"]);
+test("uniqueModelIdentifiers dedupes catalogs without rewriting identity", () => {
+  const models = ["Model", "model", " model", "model ", "model/a?b#c", "model", "模型"];
+  const result = uniqueModelIdentifiers(models);
+  equal(result.length, 6);
+  notEqual(result.indexOf("model "), -1);
+  ok(result.includes("模型"));
 });

@@ -12,8 +12,8 @@ use crate::db::models::{
 use crate::logging::LogEntry;
 
 use super::traits::{
-    ApiKeyStore, AuthAccessStore, LogStore, ModelBackendStore, ModelSnapshotStore, ModelStore,
-    OAuthCredentialStore, ProviderEndpointTestResult, ProviderModelRatingStore, ProviderStore,
+    ApiKeyStore, AuthAccessStore, LogStore, ModelBackendStore, ModelRatingStore,
+    ModelSnapshotStore, ModelStore, OAuthCredentialStore, ProviderEndpointTestResult, ProviderStore,
     ProviderTestResult, SettingsStore, Storage, StorageBackend, StorageBootstrap, StorageHealth,
 };
 
@@ -52,7 +52,7 @@ impl Storage for MemoryStorage {
     fn providers(&self) -> &dyn ProviderStore {
         self
     }
-    fn provider_model_ratings(&self) -> Option<&dyn ProviderModelRatingStore> {
+    fn model_ratings(&self) -> Option<&dyn ModelRatingStore> {
         // YAML configuration is read-only and has no persistent rating store.
         None
     }

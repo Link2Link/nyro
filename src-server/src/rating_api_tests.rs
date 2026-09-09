@@ -4,14 +4,14 @@ use axum::http::Request;
 use serde_json::{Value, json};
 use tower::ServiceExt;
 
-async fn fixture() -> anyhow::Result<(tempfile::TempDir, Router, String)> {
+async fn fixture() -> anyhow::Result<(tempfile::TempDir, Router)> {
     let dir = tempfile::tempdir()?;
     let (gw, _) = Gateway::new(nyro_core::config::GatewayConfig {
         data_dir: dir.path().to_path_buf(),
         ..Default::default()
     })
     .await?;
-    let p = gw
+    let _ = gw
         .admin()
         .create_provider(CreateProvider {
             name: "ratings-http".to_string(),
@@ -30,7 +30,7 @@ async fn fixture() -> anyhow::Result<(tempfile::TempDir, Router, String)> {
             fast_mode: false,
         })
         .await?;
-    Ok((dir, create_router(gw, Some("test-admin".to_string())), p.id))
+    Ok((dir, create_router(gw, Some("test-admin".to_string()))))
 }
 
 async fn call(
@@ -58,48 +58,42 @@ async fn call(
 }
 
 #[tokio::test]
-async fn rating_http_auth_encoded_identity_and_unrated_zero_contract() -> anyhow::Result<()> {
-    let (_dir, router, id) = fixture().await?;
-    let url = format!("/api/v1/providers/{id}/model-rating?model=vendor%2FModel%2Bx%23%20");
+async fn rating_http_auth_encoded_identity_and_zero_contract() -> anyhow::Result<()> {
+    let (_dir, router) = fixture().await?;
+    let url = "/api/v1/model-ratings?prefix=vendor%2FModel%2Bx%23%20";
     assert_eq!(
-        call(&router, "GET", &url, None, false).await?.0,
+        call(&router, "GET", "/api/v1/model-ratings", None, false)
+            .await?
+            .0,
         StatusCode::UNAUTHORIZED
     );
-    let (status, state) = call(&router, "GET", &url, None, true).await?;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(state["data"]["status"], "unrated");
-    assert!(state["data"]["score"].is_null());
-    assert!(state["data"]["updated_at"].is_null());
-    assert_eq!(state["data"]["upstream_model"], "vendor/Model+x# ");
     let (status, saved) = call(&router, "PUT", &url, Some(json!({"score":0})), true).await?;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(saved["data"]["score"], 0);
-    let (_, state) = call(&router, "GET", &url, None, true).await?;
-    assert_eq!(state["data"]["status"], "rated");
-    assert_eq!(state["data"]["score"], 0);
-    let (_, list) = call(&router, "GET", "/api/v1/provider-model-ratings", None, true).await?;
+    // Prefixes are stored lowercase; matching and identity ignore case.
+    assert_eq!(saved["data"]["model_prefix"], "vendor/model+x# ");
+    let (_, list) = call(&router, "GET", "/api/v1/model-ratings", None, true).await?;
     assert_eq!(list["data"].as_array().unwrap().len(), 1);
-    let trimmed = format!("/api/v1/providers/{id}/model-rating?model=vendor%2FModel%2Bx%23");
-    assert_eq!(
-        call(&router, "GET", &trimmed, None, true).await?.1["data"]["status"],
-        "unrated"
-    );
+    // Identity is exact: the trimmed prefix is a different entry.
+    let trimmed = "/api/v1/model-ratings?prefix=vendor%2FModel%2Bx%23";
+    call(&router, "PUT", trimmed, Some(json!({"score":100})), true)
+        .await?;
+    let (_, list) = call(&router, "GET", "/api/v1/model-ratings", None, true).await?;
+    assert_eq!(list["data"].as_array().unwrap().len(), 2);
     for _ in 0..2 {
         let (status, result) = call(&router, "DELETE", &url, None, true).await?;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(result, json!({"ok":true}));
     }
-    assert_eq!(
-        call(&router, "GET", &url, None, true).await?.1["data"]["status"],
-        "unrated"
-    );
+    let (_, list) = call(&router, "GET", "/api/v1/model-ratings", None, true).await?;
+    assert_eq!(list["data"].as_array().unwrap().len(), 1);
     Ok(())
 }
 
 #[tokio::test]
 async fn rating_http_rejects_bad_input_without_coercion() -> anyhow::Result<()> {
-    let (_dir, router, id) = fixture().await?;
-    let url = format!("/api/v1/providers/{id}/model-rating?model=x");
+    let (_dir, router) = fixture().await?;
+    let url = "/api/v1/model-ratings?prefix=x";
     for body in [
         json!({}),
         json!({"score":-1}),
@@ -113,66 +107,23 @@ async fn rating_http_rejects_bad_input_without_coercion() -> anyhow::Result<()> 
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert!(error["error"].is_string());
     }
-    for suffix in ["", "?model=", "?model=%00"] {
-        let bad_url = format!("/api/v1/providers/{id}/model-rating{suffix}");
+    for suffix in ["", "?prefix=", "?prefix=%00"] {
+        let bad_url = format!("/api/v1/model-ratings{suffix}");
         assert_eq!(
-            call(&router, "GET", &bad_url, None, true).await?.0,
+            call(&router, "PUT", &bad_url, Some(json!({"score":80})), true)
+                .await?
+                .0,
             StatusCode::BAD_REQUEST
         );
     }
-    assert_eq!(
-        call(
-            &router,
-            "GET",
-            "/api/v1/providers/unknown/model-rating?model=x",
-            None,
-            true
-        )
-        .await?
-        .0,
-        StatusCode::NOT_FOUND
-    );
-    let (_, list) = call(&router, "GET", "/api/v1/provider-model-ratings", None, true).await?;
+    let (_, list) = call(&router, "GET", "/api/v1/model-ratings", None, true).await?;
     assert!(list["data"].as_array().unwrap().is_empty());
     Ok(())
 }
 
 #[tokio::test]
-async fn rating_http_single_score_rejects_effort_fields_without_mutation() -> anyhow::Result<()> {
-    let (_dir, router, id) = fixture().await?;
-    let url = format!("/api/v1/providers/{id}/model-rating?model=exact%2FModel%20");
-    let (status, saved) = call(&router, "PUT", &url, Some(json!({"score":80})), true).await?;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(saved["data"]["upstream_model"], "exact/Model ");
-    assert!(saved["data"].get("effort").is_none());
-    for invalid in [
-        json!({"score":90,"effort":"high"}),
-        json!({"common":80,"overrides":{"high":90}}),
-        json!({"score":80,"overrides":{"high":90}}),
-    ] {
-        assert_eq!(
-            call(&router, "PUT", &url, Some(invalid), true).await?.0,
-            StatusCode::BAD_REQUEST
-        );
-        assert_eq!(
-            call(&router, "GET", &url, None, true).await?.1["data"]["score"],
-            80
-        );
-    }
-    call(&router, "DELETE", &url, None, true).await?;
-    assert_eq!(
-        call(&router, "GET", "/api/v1/provider-model-ratings", None, true)
-            .await?
-            .1["data"],
-        json!([])
-    );
-    Ok(())
-}
-
-#[tokio::test]
-async fn rating_performance_http_uses_retained_calls_and_explicit_no_samples() -> anyhow::Result<()>
-{
-    let (_dir, router, id) = fixture().await?;
+async fn rating_performance_http_empty_without_logged_matches() -> anyhow::Result<()> {
+    let (_dir, router) = fixture().await?;
     assert_eq!(
         call(&router, "GET", "/api/v1/model-performance", None, false)
             .await?
@@ -183,8 +134,10 @@ async fn rating_performance_http_uses_retained_calls_and_explicit_no_samples() -
         .await?
         .1;
     assert_eq!(empty["data"]["models"], json!([]));
-    let rating_url = format!("/api/v1/providers/{id}/model-rating?model=x");
-    call(&router, "PUT", &rating_url, Some(json!({"score":90})), true).await?;
+    // A rating alone is not enough: groups need logged pairs that match it.
+    let rating_url = "/api/v1/model-ratings?prefix=x";
+    call(&router, "PUT", &rating_url, Some(json!({"score":90})), true)
+        .await?;
     let (status, response) = call(&router, "GET", "/api/v1/model-performance", None, true).await?;
     assert_eq!(status, StatusCode::OK);
     let data = &response["data"];
@@ -193,45 +146,18 @@ async fn rating_performance_http_uses_retained_calls_and_explicit_no_samples() -
         data["window_start"].is_null(),
         "latest retained calls have no extra time-window filter"
     );
-    assert_eq!(data["models"].as_array().unwrap().len(), 1);
-    let item = &data["models"][0];
-    assert_eq!(item["status"], "ready");
-    assert_eq!(item["rating"]["score"], 90);
-    assert_eq!(item["rating"]["upstream_model"], "x");
-    assert_eq!(item["rating"]["provider_id"], id);
-    assert!(item.get("profile").is_none());
-    assert!(item.get("tiers").is_none());
-    assert_eq!(item["mixed"]["valid_tps_count"], 0);
-    assert!(item["mixed"]["average_tps"].is_null());
-    assert_eq!(item["mixed"]["selected_request_count"], 0);
-    assert_eq!(
-        call(
-            &router,
-            "GET",
-            "/api/v1/model-performance?provider_id=unknown",
-            None,
-            true
-        )
-        .await?
-        .0,
-        StatusCode::NOT_FOUND
-    );
+    assert_eq!(data["models"].as_array().unwrap().len(), 0);
     Ok(())
 }
 
 #[test]
-fn rating_http_errors_are_typed_not_misreported_as_unrated() {
+fn rating_http_errors_are_typed_not_misreported() {
     assert_eq!(
-        rating_error(ProviderModelRatingError::UnsupportedStorage.into()).status(),
+        rating_error(ModelRatingError::UnsupportedStorage.into()).status(),
         StatusCode::NOT_IMPLEMENTED
     );
     assert_eq!(
-        rating_error(ProviderModelRatingError::ProviderNotFound.into()).status(),
-        StatusCode::NOT_FOUND
-    );
-    assert_eq!(
-        rating_error(ProviderModelRatingError::InvalidInput("Invalid score".into()).into())
-            .status(),
+        rating_error(ModelRatingError::InvalidInput("Invalid score".into()).into()).status(),
         StatusCode::BAD_REQUEST
     );
     assert_eq!(

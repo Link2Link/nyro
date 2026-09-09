@@ -7,8 +7,9 @@ Nyro supports three storage backends — **SQLite** (default), **PostgreSQL**, a
 ```
 providers ──1:N── model_backends ──N:1── models
     ├──1:N── provider_protocol_endpoints
-    ├──1:N── provider_model_ratings
     └──1:1── provider_oauth_credentials
+
+model_rating_prefixes (prefix-keyed scores shared across providers; no FK)
 
 api_keys ──M:N── models (via api_key_models)
 request_logs (one row per attempt; explicit payload clearing/deletion supported)
@@ -76,26 +77,22 @@ Provider 的协议端点明细。固定模式保留一条兼容记录；自适�
 
 ---
 
-## provider_model_ratings
+## model_rating_prefixes
 
-The latest manually assigned integer comprehensive score for an exact **provider + upstream model**. Each pair has one optional score; zero is a real rating and absence means unrated. This is provider metadata, not a virtual-model route, endpoint, or usage record. There is no history or notes. Deleting a provider deletes its ratings; deleting a route/backend does not. Ratings and performance statistics do not distinguish reasoning effort.
-
-The physical `effort` column and existing migration are retained solely for compatibility with databases created by the short-lived effort-rating implementation. All current rating operations use `effort = 'common'`. Historical non-common rows remain stored but are not displayed, copied, exported, or averaged into a comprehensive score. A pair with only historical overrides is unrated until a comprehensive score is explicitly assigned.
+The latest manually assigned integer comprehensive score for a **model-name prefix**, shared by every provider whose upstream model equals the prefix or continues after it at a `-` segment boundary (longest matching prefix wins). Matching and identity are case-insensitive: the admin layer canonicalizes prefixes to lowercase on write, so case variants can never become two same-length entries. Zero is a real rating and absence means unrated. Entries are provider-independent administration data: deleting a provider or route never deletes them. Ratings do not affect routing and do not distinguish reasoning effort. Legacy provider-scoped `provider_model_ratings` rows were deliberately dropped during migration instead of converted.
 
 | Column | Type | Default | Description |
 |---|---|---|---|
-| `provider_id` | TEXT NOT NULL (MySQL: VARCHAR(36)) | — | FK → `providers.id`, **ON DELETE CASCADE** |
-| `upstream_model` | TEXT NOT NULL (MySQL: VARBINARY(1024)) | — | Exact upstream model identifier, case-sensitive and byte-exact, including trailing spaces; 1–1024 UTF-8 bytes |
-| `effort` | TEXT NOT NULL (MySQL: VARCHAR(16), ASCII binary collation) | `'common'` | Compatibility column: current rating operations use `common`; historical `low`, `medium`, `high`, `xhigh`, `max` rows are retained but inactive |
+| `model_prefix` | TEXT NOT NULL (MySQL: VARBINARY(1024)) | — | User-chosen model prefix, stored lowercased (case-insensitive matching); otherwise byte-exact, including trailing spaces; 1–1024 UTF-8 bytes |
 | `score` | INTEGER NOT NULL | — | Integer **0–100 inclusive**, database `CHECK` constraint; zero is a real rating, not “unrated” |
 | `updated_at` | TEXT NOT NULL | — | Application-written UTC RFC3339 timestamp with millisecond precision, e.g. `2026-09-08T02:30:45.123Z` |
 
-**Physical primary key**: `(provider_id, upstream_model, effort)`; the public identity is the provider/model pair. The API/service validates the 1024-UTF-8-byte limit consistently for all backends (bytes, not character count). Existing pair-only rows migrate to `effort = 'common'` with scores and timestamps unchanged. Rating APIs and copy/export/import operate on comprehensive scores only; public rating objects have no effort field. Existing non-common database rows are not implicitly converted. Backup entries with no `effort` field or explicit `common` are accepted; entries with a non-common effort are rejected rather than silently imported as comprehensive scores. The physical schema is unchanged by this simplification, so the generated reference SQL remains valid.
+**Physical primary key**: `(model_prefix)`. The API/service validates the 1024-UTF-8-byte limit consistently for all backends (bytes, not character count). Export/import use a flat top-level `model_ratings` array of `{model_prefix, score, updated_at}`; old backups with per-provider nested ratings import providers but ignore the nested scores.
 
 **Physical identity and validation**:
-- SQLite uses `TEXT COLLATE BINARY` for all three key columns, a byte-length check via `length(CAST(upstream_model AS BLOB))`, and `typeof(score) = 'integer'` plus the range check (SQLite's type affinity alone is not an integer constraint).
-- PostgreSQL uses `TEXT COLLATE "C"` for all three key columns, `octet_length` for the model byte-length check, and the native `INTEGER` type plus the range check.
-- MySQL uses `VARBINARY(1024)` for `upstream_model`, storing the original UTF-8 bytes rather than a case-folding or trailing-space-insensitive text collation. Its `provider_id` keeps the parent column's collation for FK compatibility. The effort check uses `BINARY effort IN (...)` as well as ASCII binary storage, rejecting noncanonical case and trailing spaces even with MySQL's padded text comparison behavior. `OCTET_LENGTH` enforces a nonempty model identifier; the binary column bounds its maximum size. Score is native `INTEGER` plus the range check (requires MySQL 8.0.16+ for enforced `CHECK`s).
+- SQLite uses `TEXT COLLATE BINARY`, a byte-length check via `length(CAST(model_prefix AS BLOB))`, and `typeof(score) = 'integer'` plus the range check (SQLite's type affinity alone is not an integer constraint).
+- PostgreSQL uses `TEXT COLLATE "C"`, `octet_length` for the prefix byte-length check, and the native `INTEGER` type plus the range check.
+- MySQL uses `VARBINARY(1024)`, storing the original UTF-8 bytes rather than a case-folding or trailing-space-insensitive text collation. `OCTET_LENGTH` enforces a nonempty prefix; the binary column bounds its maximum size. Invalid UTF-8 bytes surface as an error on read, never as replacement text. Score is native `INTEGER` plus the range check (requires MySQL 8.0.16+ for enforced `CHECK`s).
 
 ---
 
@@ -468,7 +465,7 @@ truncate that file *before* the tool runs and is therefore unsafe.
   identifier quoting. Cyclic or cross-database dependencies and non-table objects
   are rejected rather than silently dropping constraints or disabling FK checks.
 - Both backends verify final tables `models`, `model_backends`,
-  `api_key_models`, and `provider_model_ratings` and reject leftover `routes`, `route_targets`, or
+  `api_key_models`, and `model_rating_prefixes` and reject leftover `routes`, `route_targets`, or
   `api_key_routes`. Generated constraint/index names can still retain a legacy
   prefix after table renames; these are the real database names and are not
   cosmetically rewritten.
@@ -504,7 +501,7 @@ NYRO_TEST_RATINGS_DATABASES_ONLY=1 \
 NYRO_TEST_RATINGS_PRECREATE_REFERENCE=1 \
 NYRO_TEST_POSTGRES_RATINGS_URL='<new-empty-postgres-reference-test-url>' \
 NYRO_TEST_MYSQL_RATINGS_URL='<new-empty-mysql-reference-test-url>' \
-  cargo test -p nyro-core --test storage_provider_model_ratings
+  cargo test -p nyro-core --test storage_model_ratings
 ```
 
 The precreate flag makes the test load the generated SQL itself before exercising

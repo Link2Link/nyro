@@ -138,19 +138,14 @@ function resolveHTTP(cmd: string, args?: Record<string, unknown>): HTTPMapping {
       const query = args?.providerId == null ? "" : `?provider_id=${encodeURIComponent(String(args.providerId))}`;
       return { method: "GET", url: `${base}/model-performance${query}` };
     }
-    case "list_provider_model_ratings": {
-      const query = args?.providerId == null
-        ? ""
-        : `?provider_id=${encodeURIComponent(String(args.providerId))}`;
-      return { method: "GET", url: `${base}/provider-model-ratings${query}` };
-    }
-    case "get_provider_model_rating":
-    case "set_provider_model_rating":
-    case "delete_provider_model_rating":
+    case "list_model_ratings":
+      return { method: "GET", url: `${base}/model-ratings` };
+    case "set_model_rating":
+    case "delete_model_rating":
       return {
-        method: cmd === "get_provider_model_rating" ? "GET" : cmd === "set_provider_model_rating" ? "PUT" : "DELETE",
-        url: `${base}/providers/${encodeURIComponent(String(args?.providerId ?? ""))}/model-rating?model=${encodeURIComponent(String(args?.model ?? ""))}`,
-        ...(cmd === "set_provider_model_rating" ? { body: args?.input as Record<string, unknown> } : {}),
+        method: cmd === "set_model_rating" ? "PUT" : "DELETE",
+        url: `${base}/model-ratings?prefix=${encodeURIComponent(String(args?.modelPrefix ?? ""))}`,
+        ...(cmd === "set_model_rating" ? { body: args?.input as Record<string, unknown> } : {}),
       };
     case "get_model_capabilities":
       return {

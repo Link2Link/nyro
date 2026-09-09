@@ -7,7 +7,7 @@ use axum::body::to_bytes;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::{Json, Router, routing::post};
-use nyro_core::admin::SetProviderModelRating;
+use nyro_core::admin::SetModelRating;
 use nyro_core::db::models::{CreateModel, CreateProvider};
 use nyro_core::protocol::ids::OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1;
 use nyro_core::protocol::ir::{AiRequest, RawEnvelope, ReasoningEffort};
@@ -76,6 +76,20 @@ async fn live_completion_metadata_is_diagnostic_and_performance_matches_usage() 
             fast_mode: false,
         })
         .await?;
+    // One specific entry matches the exact model; a non-boundary prefix must not.
+    gw.admin()
+        .set_model_rating("", SetModelRating { score: 80 })
+        .await
+        .unwrap_err();
+    gw.admin()
+        .set_model_rating("buffered", SetModelRating { score: 95 })
+        .await?;
+    gw.admin()
+        .set_model_rating("limited", SetModelRating { score: 60 })
+        .await?;
+    gw.admin()
+        .set_model_rating("stream", SetModelRating { score: 40 })
+        .await?;
     for model in ["buffered", "streamed", "limited", "abandoned"] {
         gw.admin()
             .create_model(CreateModel {
@@ -89,9 +103,6 @@ async fn live_completion_metadata_is_diagnostic_and_performance_matches_usage() 
                 force_max_reasoning: None,
                 vision_shim: None,
             })
-            .await?;
-        gw.admin()
-            .set_provider_model_rating(&provider.id, model, SetProviderModelRating { score: 80 })
             .await?;
         let stream = model != "buffered";
         let value = json!({"model":model,"messages":[{"role":"user","content":"hi"}],"reasoning_effort":"high","stream":stream});
@@ -139,26 +150,39 @@ async fn live_completion_metadata_is_diagnostic_and_performance_matches_usage() 
         assert!(logs.try_recv().is_err(), "one finalized row per attempt");
     }
     let stats = gw.admin().get_model_performance(Some(&provider.id)).await?;
-    assert_eq!(stats.models.len(), 4);
-    for item in stats.models {
-        assert_eq!(item.status, "ready");
+    // "stream" does not match "streamed" at a segment boundary, so streamed and
+    // abandoned never appear.
+    assert_eq!(stats.models.len(), 2);
+    let by_prefix: HashMap<_, _> = stats
+        .models
+        .iter()
+        .map(|item| (item.model_prefix.as_str(), item))
+        .collect();
+    let buffered = by_prefix["buffered"];
+    assert_eq!(buffered.score, 95);
+    assert_eq!(buffered.variants.len(), 1);
+    assert_eq!(buffered.variants[0].upstream_model, "buffered");
+    let limited = by_prefix["limited"];
+    assert_eq!(limited.score, 60);
+    assert_eq!(limited.variants.len(), 1);
+    assert_eq!(limited.variants[0].upstream_model, "limited");
+    for item in &stats.models {
         let usage = gw
             .storage
             .logs()
-            .model_usage_stats(&provider.id, &item.rating.upstream_model)
+            .model_usage_stats(&provider.id, &item.variants[0].upstream_model)
             .await?;
         assert_eq!(
             item.mixed.average_tps, usage.average_tps,
             "{}",
-            item.rating.upstream_model
+            item.variants[0].upstream_model
         );
-        // Each model has one raw log: limited/abandoned count whenever its legacy
+        // Each model has one raw log: limited counts whenever its legacy
         // tokens and timings are usable, independently of lifecycle completion.
         assert_eq!(
             item.mixed.valid_tps_count,
             i64::from(usage.average_tps.is_some())
         );
-        assert_eq!(item.rating.score, 80);
         assert_eq!(item.mixed.selected_request_count, usage.recent_sample_count);
         assert_eq!(item.mixed.selected_request_count, 1);
     }

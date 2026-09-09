@@ -1,7 +1,8 @@
 pub mod model_performance;
+pub mod model_rating_prefixes;
 pub mod models;
 pub use model_performance::{ModelPerformanceStats, PairPerformanceStats};
-pub(crate) mod provider_model_ratings;
+pub use model_rating_prefixes::ModelRatingEntry;
 
 use std::path::Path;
 
@@ -98,7 +99,11 @@ pub async fn migrate(pool: &SqlitePool) -> anyhow::Result<()> {
     ensure_request_log_column(pool, "route_decision", "TEXT").await?;
     migrate_log_diagnostics(pool).await?;
     migrate_performance_metadata(pool).await?;
-    migrate_rating_effort(pool).await?;
+    // Provider-scoped ratings were replaced by prefix ratings; old rows are
+    // deliberately dropped instead of migrated.
+    sqlx::query("DROP TABLE IF EXISTS provider_model_ratings")
+        .execute(pool)
+        .await?;
     model_performance::recover_historical_metadata!(
         pool,
         sqlx::Sqlite,
@@ -623,38 +628,6 @@ async fn migrate_logs_v2_spec_aligned(pool: &SqlitePool) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn migrate_rating_effort(pool: &SqlitePool) -> anyhow::Result<()> {
-    if column_exists(pool, "provider_model_ratings", "effort").await? {
-        return Ok(());
-    }
-    // A transactional rebuild preserves exact model text, timestamps, constraints,
-    // and the supplier cascade without ever disabling foreign keys.
-    let mut tx = pool.begin().await?;
-    let statements = r#"
-        CREATE TABLE provider_model_ratings_effort (
-            provider_id TEXT COLLATE BINARY NOT NULL REFERENCES providers(id) ON DELETE CASCADE,
-            upstream_model TEXT COLLATE BINARY NOT NULL CHECK (length(CAST(upstream_model AS BLOB)) BETWEEN 1 AND 1024),
-            score INTEGER NOT NULL CHECK (typeof(score) = 'integer' AND score BETWEEN 0 AND 100),
-            updated_at TEXT NOT NULL,
-            effort TEXT COLLATE BINARY NOT NULL DEFAULT 'common' CHECK (effort IN ('common','low','medium','high','xhigh','max')),
-            PRIMARY KEY (provider_id, upstream_model, effort)
-        );
-        INSERT INTO provider_model_ratings_effort (provider_id, upstream_model, score, updated_at, effort)
-            SELECT provider_id, upstream_model, score, updated_at, 'common' FROM provider_model_ratings;
-        DROP TABLE provider_model_ratings;
-        ALTER TABLE provider_model_ratings_effort RENAME TO provider_model_ratings;
-    "#;
-    for statement in statements
-        .split(';')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
-        sqlx::query(statement).execute(&mut *tx).await?;
-    }
-    tx.commit().await?;
-    Ok(())
-}
-
 async fn migrate_performance_metadata(pool: &SqlitePool) -> anyhow::Result<()> {
     for (column, definition) in [
         ("performance_metadata_version", "INTEGER NOT NULL DEFAULT 0"),
@@ -980,15 +953,12 @@ CREATE TABLE IF NOT EXISTS providers (
     updated_at  TEXT DEFAULT (datetime('now'))
 );
 
-CREATE TABLE IF NOT EXISTS provider_model_ratings (
-    provider_id    TEXT COLLATE BINARY NOT NULL REFERENCES providers(id) ON DELETE CASCADE,
-    upstream_model TEXT COLLATE BINARY NOT NULL
-        CHECK (length(CAST(upstream_model AS BLOB)) BETWEEN 1 AND 1024),
-    score          INTEGER NOT NULL CHECK (typeof(score) = 'integer' AND score BETWEEN 0 AND 100),
-    updated_at     TEXT NOT NULL,
-    effort         TEXT COLLATE BINARY NOT NULL DEFAULT 'common'
-        CHECK (effort IN ('common','low','medium','high','xhigh','max')),
-    PRIMARY KEY (provider_id, upstream_model, effort)
+CREATE TABLE IF NOT EXISTS model_rating_prefixes (
+    model_prefix TEXT COLLATE BINARY NOT NULL
+        CHECK (length(CAST(model_prefix AS BLOB)) BETWEEN 1 AND 1024),
+    score        INTEGER NOT NULL CHECK (typeof(score) = 'integer' AND score BETWEEN 0 AND 100),
+    updated_at   TEXT NOT NULL,
+    PRIMARY KEY (model_prefix)
 );
 
 CREATE TABLE IF NOT EXISTS provider_protocol_endpoints (

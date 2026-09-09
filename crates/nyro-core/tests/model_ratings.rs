@@ -1,12 +1,10 @@
 use std::sync::Arc;
 
 use nyro_core::Gateway;
-use nyro_core::admin::{
-    ProviderModelRatingError, ProviderModelRatingState, SetProviderModelRating,
-};
+use nyro_core::admin::{ModelRatingError, SetModelRating};
 use nyro_core::config::GatewayConfig;
 use nyro_core::db::models::*;
-use nyro_core::storage::{MemoryStorage, SqliteStorage};
+use nyro_core::storage::{MemoryStorage, SqliteStorage, Storage};
 use serde_json::json;
 
 struct TestApp {
@@ -132,50 +130,30 @@ async fn rating_strict_catalog_distinguishes_outage_from_empty_directory() -> an
 }
 
 #[tokio::test]
-async fn rating_zero_unrated_and_failure_have_distinct_contracts() -> anyhow::Result<()> {
+async fn rating_zero_is_a_stored_score_and_failures_are_errors() -> anyhow::Result<()> {
     let app = app().await?;
     let admin = app.gateway.admin();
-    let p = admin.create_provider(provider("ratings")).await?;
-    let absent = serde_json::to_value(admin.get_provider_model_rating(&p.id, "absent").await?)?;
-    assert_eq!(
-        absent,
-        json!({
-            "provider_id": p.id, "upstream_model": "absent", "status": "unrated",
-            "score": null, "updated_at": null
-        })
-    );
+    admin.create_provider(provider("ratings")).await?;
+    assert!(admin.list_model_ratings().await?.is_empty());
     let zero = admin
-        .set_provider_model_rating(&p.id, "absent", SetProviderModelRating { score: 0 })
+        .set_model_rating("absent", SetModelRating { score: 0 })
         .await?;
-    let state = serde_json::to_value(admin.get_provider_model_rating(&p.id, "absent").await?)?;
-    assert_eq!(state["status"], "rated");
-    assert_eq!(state["score"], 0);
-    assert_eq!(state["updated_at"], zero.updated_at);
-    assert_eq!(admin.list_provider_model_ratings(None).await?.len(), 1);
-    admin.delete_provider_model_rating(&p.id, "absent").await?;
-    admin.delete_provider_model_rating(&p.id, "absent").await?;
-    assert!(matches!(
-        admin.get_provider_model_rating(&p.id, "absent").await?,
-        ProviderModelRatingState::Unrated { .. }
-    ));
-    assert!(matches!(
-        admin
-            .get_provider_model_rating("missing-provider", "absent")
-            .await
-            .unwrap_err()
-            .downcast_ref(),
-        Some(ProviderModelRatingError::ProviderNotFound)
-    ));
-    sqlx::query("DROP TABLE provider_model_ratings")
+    assert_eq!(zero.score, 0);
+    assert_eq!(admin.list_model_ratings().await?, vec![zero.clone()]);
+    // Upserting the same prefix replaces the row in place.
+    let renewed = admin
+        .set_model_rating("absent", SetModelRating { score: 100 })
+        .await?;
+    assert_eq!(admin.list_model_ratings().await?, vec![renewed.clone()]);
+    assert_ne!(renewed.updated_at, zero.updated_at);
+    admin.delete_model_rating("absent").await?;
+    admin.delete_model_rating("absent").await?;
+    assert!(admin.list_model_ratings().await?.is_empty());
+    sqlx::query("DROP TABLE model_rating_prefixes")
         .execute(&app.pool)
         .await?;
-    assert!(
-        admin
-            .get_provider_model_rating(&p.id, "absent")
-            .await
-            .is_err()
-    );
-    assert!(admin.list_provider_model_ratings(None).await.is_err());
+    assert!(admin.list_model_ratings().await.is_err());
+    assert!(admin.set_model_rating("x", SetModelRating { score: 1 }).await.is_err());
     assert!(
         admin.export_config().await.is_err(),
         "backup must not silently lose ratings on a DB error"
@@ -200,54 +178,54 @@ async fn rating_validation_retains_exact_identity_without_catalog_requests() -> 
     for score in [-1, 101] {
         assert!(matches!(
             admin
-                .set_provider_model_rating(&p.id, "x", SetProviderModelRating { score })
+                .set_model_rating("x", SetModelRating { score })
                 .await
                 .unwrap_err()
                 .downcast_ref(),
-            Some(ProviderModelRatingError::InvalidInput(_))
+            Some(ModelRatingError::InvalidInput(_))
         ));
     }
-    for model in ["", " \t ", "a\0b", &"a".repeat(1025)] {
+    for prefix in ["", " \t ", "a\0b", &"a".repeat(1025)] {
         assert!(
             admin
-                .set_provider_model_rating(&p.id, model, SetProviderModelRating { score: 80 })
+                .set_model_rating(prefix, SetModelRating { score: 80 })
                 .await
                 .is_err()
         );
     }
-    for model in [
+    for prefix in [
         "model-x",
         "Model-X",
         "model-x ",
         " model-x",
         "vendor/模型-é+#",
+        "deepseek-v4-pro-",
     ] {
         admin
-            .set_provider_model_rating(&p.id, model, SetProviderModelRating { score: 100 })
+            .set_model_rating(prefix, SetModelRating { score: 100 })
             .await?;
     }
-    let saved = admin.list_provider_model_ratings(Some(&p.id)).await?;
+    let saved = admin.list_model_ratings().await?;
+    // "Model-X" canonicalizes onto "model-x"; only case collapses.
     assert_eq!(saved.len(), 5);
-    assert!(saved.iter().any(|row| row.upstream_model == "model-x "));
-    let before = saved.clone();
-    admin
-        .update_provider(
-            &p.id,
-            UpdateProvider {
-                base_url: Some("http://127.0.0.1:2/v1".to_string()),
-                ..Default::default()
-            },
-        )
+    assert!(saved.iter().any(|row| row.model_prefix == "model-x "));
+    assert!(saved.iter().all(|row| row.model_prefix == row.model_prefix.to_lowercase()));
+    // Case-insensitive upsert and delete address the same canonical entry.
+    let renewed = admin
+        .set_model_rating("MODEL-X", SetModelRating { score: 42 })
         .await?;
-    assert_eq!(
-        admin.list_provider_model_ratings(Some(&p.id)).await?,
-        before
-    );
+    assert_eq!(renewed.model_prefix, "model-x");
+    assert_eq!(renewed.score, 42);
+    admin.delete_model_rating("MODEL-x").await?;
+    let after = admin.list_model_ratings().await?;
+    assert_eq!(after.len(), 4);
+    assert!(after.iter().all(|row| row.model_prefix != "model-x"));
     Ok(())
 }
 
 #[tokio::test]
-async fn rating_changes_do_not_affect_routes_or_epoch_and_outlive_mappings() -> anyhow::Result<()> {
+async fn rating_changes_do_not_affect_routes_or_epoch_and_outlive_providers()
+-> anyhow::Result<()> {
     let app = app().await?;
     let admin = app.gateway.admin();
     let p = admin.create_provider(provider("one")).await?;
@@ -261,146 +239,96 @@ async fn rating_changes_do_not_affect_routes_or_epoch_and_outlive_mappings() -> 
     let snapshot = serde_json::to_value(admin.list_models().await?)?;
     let epoch = admin.get_setting("config_epoch").await?;
     admin
-        .set_provider_model_rating(&p.id, "x", SetProviderModelRating { score: 75 })
+        .set_model_rating("x", SetModelRating { score: 75 })
         .await?;
     admin
-        .set_provider_model_rating(&p2.id, "x", SetProviderModelRating { score: 0 })
+        .set_model_rating("deepseek-v4-pro", SetModelRating { score: 0 })
         .await?;
-    admin.delete_provider_model_rating(&p.id, "x").await?;
-    admin
-        .set_provider_model_rating(&p.id, "x", SetProviderModelRating { score: 85 })
+    admin.delete_model_rating("x").await?;
+    let kept = admin
+        .set_model_rating("x", SetModelRating { score: 85 })
         .await?;
     assert_eq!(serde_json::to_value(admin.list_models().await?)?, snapshot);
     assert_eq!(admin.get_setting("config_epoch").await?, epoch);
-    assert_eq!(
-        admin.list_provider_model_ratings(Some(&p.id)).await?.len(),
-        1
-    );
     admin.delete_model(&m1.id).await?;
-    assert_eq!(
-        admin.list_provider_model_ratings(Some(&p.id)).await?.len(),
-        1
-    );
     admin.delete_provider(&p.id).await?;
-    let remaining = admin.list_provider_model_ratings(None).await?;
-    assert_eq!(remaining.len(), 1);
-    assert_eq!(remaining[0].provider_id, p2.id);
-    assert_eq!(remaining[0].score, 0);
+    admin.delete_provider(&p2.id).await?;
+    let remaining = admin.list_model_ratings().await?;
+    assert_eq!(remaining.len(), 2);
+    assert_eq!(
+        remaining
+            .iter()
+            .find(|row| row.model_prefix == "x")
+            .unwrap()
+            .score,
+        kept.score
+    );
+    assert_eq!(
+        remaining
+            .iter()
+            .find(|row| row.model_prefix == "deepseek-v4-pro")
+            .unwrap()
+            .score,
+        0
+    );
     Ok(())
 }
 
 #[tokio::test]
-async fn rating_copy_preserves_snapshot_and_time_but_changes_are_independent() -> anyhow::Result<()>
-{
+async fn rating_copy_shares_prefix_entries_without_touching_them() -> anyhow::Result<()> {
     let app = app().await?;
     let admin = app.gateway.admin();
     let p = admin.create_provider(provider("source")).await?;
-    let old = ProviderModelRating {
-        provider_id: p.id.clone(),
-        upstream_model: "no-longer-listed".to_string(),
-        score: 0,
-        updated_at: "2024-01-01T00:00:00.000Z".to_string(),
-    };
-    app.gateway
-        .storage
-        .provider_model_ratings()
-        .unwrap()
-        .upsert(old.clone())
+    let saved = admin
+        .set_model_rating("no-longer-listed", SetModelRating { score: 0 })
         .await?;
-    let copy = admin.copy_provider(&p.id).await?;
-    let copied = admin.list_provider_model_ratings(Some(&copy.id)).await?;
-    assert_eq!(copied.len(), 1);
-    assert_eq!(copied[0].score, old.score);
-    assert_eq!(copied[0].updated_at, old.updated_at);
-    assert_eq!(copied[0].upstream_model, old.upstream_model);
-    assert_ne!(copied[0].provider_id, old.provider_id);
-    let renewed = admin
-        .set_provider_model_rating(
-            &copy.id,
-            &old.upstream_model,
-            SetProviderModelRating { score: 0 },
-        )
-        .await?;
-    assert_ne!(
-        renewed.updated_at, old.updated_at,
-        "reconfirming a score updates its timestamp"
-    );
-    admin
-        .delete_provider_model_rating(&copy.id, &old.upstream_model)
-        .await?;
-    assert_eq!(
-        admin.list_provider_model_ratings(Some(&p.id)).await?,
-        vec![old]
-    );
+    let _copy = admin.copy_provider(&p.id).await?;
+    assert_eq!(admin.list_model_ratings().await?, vec![saved]);
     Ok(())
 }
 
 #[tokio::test]
-async fn rating_copy_failure_rolls_back_new_provider() -> anyhow::Result<()> {
-    let app = app().await?;
-    let admin = app.gateway.admin();
-    let p = admin.create_provider(provider("source")).await?;
-    admin
-        .set_provider_model_rating(&p.id, "x", SetProviderModelRating { score: 95 })
-        .await?;
-    sqlx::query("CREATE TRIGGER fail_rating_copy BEFORE INSERT ON provider_model_ratings WHEN (SELECT name FROM providers WHERE id = NEW.provider_id) LIKE '%_Copy%' BEGIN SELECT RAISE(ABORT, 'test rating copy failure'); END").execute(&app.pool).await?;
-    let error = admin.copy_provider(&p.id).await.unwrap_err();
-    assert!(error.to_string().contains("rolled back"));
-    assert_eq!(admin.list_providers().await?.len(), 1);
-    assert_eq!(
-        admin.list_provider_model_ratings(Some(&p.id)).await?.len(),
-        1
-    );
-    Ok(())
-}
-
-#[tokio::test]
-async fn rating_backup_roundtrip_rebinds_ids_preserves_time_and_skips_existing_names()
+async fn rating_backup_roundtrip_preserves_time_and_replaces_on_reimport()
 -> anyhow::Result<()> {
     let source = app().await?;
     let source_admin = source.gateway.admin();
-    let p = source_admin.create_provider(provider("portable")).await?;
-    let old = ProviderModelRating {
-        provider_id: p.id.clone(),
-        upstream_model: "old/x ".to_string(),
-        score: 0,
-        updated_at: "2024-01-01T00:00:00.000Z".to_string(),
-    };
-    source
-        .gateway
-        .storage
-        .provider_model_ratings()
-        .unwrap()
-        .upsert(old.clone())
+    source_admin
+        .create_provider(provider("portable"))
+        .await?;
+    let old = source_admin
+        .set_model_rating("old/x ", SetModelRating { score: 0 })
         .await?;
     let export = source_admin.export_config().await?;
-    assert_eq!(export.providers[0].model_ratings[0].score, 0);
+    assert_eq!(export.model_ratings.len(), 1);
+    assert_eq!(export.model_ratings[0].score, 0);
     let dest = app().await?;
     let admin = dest.gateway.admin();
     let result = admin.import_config(export.clone()).await?;
     assert_eq!(result.providers_imported, 1);
     assert_eq!(result.ratings_imported, 1);
-    let restored = admin.list_provider_model_ratings(None).await?;
+    let restored = admin.list_model_ratings().await?;
     assert_eq!(restored[0].updated_at, old.updated_at);
-    assert_eq!(restored[0].upstream_model, old.upstream_model);
-    assert_ne!(restored[0].provider_id, old.provider_id);
+    assert_eq!(restored[0].model_prefix, "old/x ");
     admin
-        .set_provider_model_rating(
-            &restored[0].provider_id,
-            &old.upstream_model,
-            SetProviderModelRating { score: 90 },
-        )
+        .set_model_rating("old/x ", SetModelRating { score: 90 })
         .await?;
+    // Import replaces the whole prefix table; the backup's scores win again.
     let result = admin.import_config(export.clone()).await?;
     assert_eq!(result.providers_imported, 0);
-    assert_eq!(result.ratings_imported, 0);
-    assert_eq!(admin.list_provider_model_ratings(None).await?[0].score, 90);
+    assert_eq!(result.ratings_imported, 1);
+    assert_eq!(admin.list_model_ratings().await?[0].score, 0);
+    // Old backups with per-provider nested ratings import providers but not scores.
     let legacy_dest = app().await?;
-    let mut legacy = serde_json::to_value(export)?;
-    legacy["providers"][0]
+    let mut legacy = serde_json::to_value(export.clone())?;
+    let legacy_object = legacy.as_object_mut().unwrap();
+    legacy_object.remove("model_ratings");
+    legacy_object["providers"][0]
         .as_object_mut()
         .unwrap()
-        .remove("model_ratings");
+        .insert(
+            "model_ratings".to_string(),
+            json!([{ "upstream_model": "legacy", "score": 50, "updated_at": "2024-01-01T00:00:00.000Z" }]),
+        );
     let result = legacy_dest
         .gateway
         .admin()
@@ -412,7 +340,7 @@ async fn rating_backup_roundtrip_rebinds_ids_preserves_time_and_skips_existing_n
         legacy_dest
             .gateway
             .admin()
-            .list_provider_model_ratings(None)
+            .list_model_ratings()
             .await?
             .is_empty()
     );
@@ -420,10 +348,9 @@ async fn rating_backup_roundtrip_rebinds_ids_preserves_time_and_skips_existing_n
 }
 
 #[tokio::test]
-async fn rating_import_rejects_invalid_entries_before_writes_and_rolls_back_failures()
--> anyhow::Result<()> {
+async fn rating_import_rejects_invalid_entries_before_any_writes() -> anyhow::Result<()> {
     let source = app().await?;
-    let p = source
+    source
         .gateway
         .admin()
         .create_provider(provider("portable"))
@@ -431,60 +358,44 @@ async fn rating_import_rejects_invalid_entries_before_writes_and_rolls_back_fail
     source
         .gateway
         .admin()
-        .set_provider_model_rating(&p.id, "x", SetProviderModelRating { score: 100 })
+        .set_model_rating("x", SetModelRating { score: 100 })
         .await?;
     let export = source.gateway.admin().export_config().await?;
     let dest = app().await?;
-    for kind in ["score", "duplicate", "timestamp", "model"] {
+    for kind in ["score", "duplicate", "timestamp", "prefix"] {
         let mut invalid = export.clone();
         match kind {
-            "score" => invalid.providers[0].model_ratings[0].score = 101,
+            "score" => invalid.model_ratings[0].score = 101,
             "duplicate" => {
-                let duplicate = invalid.providers[0].model_ratings[0].clone();
-                invalid.providers[0].model_ratings.push(duplicate);
+                let duplicate = invalid.model_ratings[0].clone();
+                invalid.model_ratings.push(duplicate);
             }
-            "timestamp" => {
-                invalid.providers[0].model_ratings[0].updated_at = "yesterday".to_string()
-            }
-            _ => invalid.providers[0].model_ratings[0].upstream_model = "\0".to_string(),
+            "timestamp" => invalid.model_ratings[0].updated_at = "yesterday".to_string(),
+            _ => invalid.model_ratings[0].model_prefix = "\0".to_string(),
         }
         assert!(dest.gateway.admin().import_config(invalid).await.is_err());
         assert!(dest.gateway.admin().list_providers().await?.is_empty());
+        assert!(dest.gateway.admin().list_model_ratings().await?.is_empty());
     }
-    sqlx::query("CREATE TRIGGER fail_rating_import BEFORE INSERT ON provider_model_ratings BEGIN SELECT RAISE(ABORT, 'test rating import failure'); END").execute(&dest.pool).await?;
-    let error = dest
-        .gateway
-        .admin()
-        .import_config(export)
-        .await
-        .unwrap_err();
-    assert!(error.to_string().contains("rolled back"));
-    assert!(dest.gateway.admin().list_providers().await?.is_empty());
     Ok(())
 }
 
 #[tokio::test]
 async fn rating_rows_persist_across_reopening_storage() -> anyhow::Result<()> {
     let app = app().await?;
-    let p = app
-        .gateway
+    app.gateway
         .admin()
         .create_provider(provider("durable"))
         .await?;
     let saved = app
         .gateway
         .admin()
-        .set_provider_model_rating(&p.id, "x", SetProviderModelRating { score: 80 })
+        .set_model_rating("x", SetModelRating { score: 80 })
         .await?;
     let reopened = SqliteStorage::from_config(&app.gateway.config).await?;
-    use nyro_core::storage::Storage;
     assert_eq!(
-        reopened
-            .provider_model_ratings()
-            .unwrap()
-            .get(&p.id, "x")
-            .await?,
-        Some(saved)
+        reopened.model_ratings().unwrap().list().await?,
+        vec![saved]
     );
     Ok(())
 }
@@ -500,18 +411,14 @@ async fn rating_yaml_memory_mode_is_explicitly_unsupported() -> anyhow::Result<(
         Arc::new(MemoryStorage::new(vec![], vec![], vec![])),
     )
     .await?;
-    let error = gw
-        .admin()
-        .list_provider_model_ratings(None)
-        .await
-        .unwrap_err();
+    let error = gw.admin().list_model_ratings().await.unwrap_err();
     assert!(matches!(
         error.downcast_ref(),
-        Some(ProviderModelRatingError::UnsupportedStorage)
+        Some(ModelRatingError::UnsupportedStorage)
     ));
     assert!(
         gw.admin()
-            .set_provider_model_rating("p", "x", SetProviderModelRating { score: 50 })
+            .set_model_rating("x", SetModelRating { score: 50 })
             .await
             .is_err()
     );

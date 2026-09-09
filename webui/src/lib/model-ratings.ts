@@ -1,9 +1,68 @@
-import type { Model, Provider, ProviderModelRating } from "./types";
-import { parseBackendTime } from "./format";
+import type { Model, ModelRatingEntry, Provider } from "./types";
 
-/** Do not normalize either part: whitespace, case, slashes, and separators are identity. */
-export function providerModelKey(providerId: string, model: string): string {
-  return JSON.stringify([providerId, model]);
+/**
+ * Case-insensitive segment-boundary prefix match, mirrored in Rust
+ * (db/model_rating_prefixes.rs): the model equals the prefix or continues
+ * after a "-", comparing both sides lowercased. Separators and whitespace stay
+ * exact — only case differences are ignored.
+ */
+export function modelMatchesPrefix(model: string, prefix: string): boolean {
+  const lowerModel = model.toLowerCase();
+  const lowerPrefix = prefix.toLowerCase();
+  if (lowerModel.length <= lowerPrefix.length) return lowerModel === lowerPrefix;
+  return lowerModel.startsWith(lowerPrefix) && lowerModel.charCodeAt(lowerPrefix.length) === 0x2d;
+}
+
+export interface RatingMatch {
+  entry: ModelRatingEntry;
+  model: string;
+}
+
+/** Longest matching prefix wins, comparing lengths on the lowercased form. */
+export function longestRatingMatch(
+  model: string,
+  entries: ModelRatingEntry[],
+): ModelRatingEntry | null {
+  let best: ModelRatingEntry | null = null;
+  let bestLength = -1;
+  for (const entry of entries) {
+    if (!modelMatchesPrefix(model, entry.model_prefix)) continue;
+    const length = entry.model_prefix.toLowerCase().length;
+    if (length > bestLength) {
+      best = entry;
+      bestLength = length;
+    }
+  }
+  return best;
+}
+
+/** All entries matching a model, shortest prefix first (diagnostics only). */
+export function matchingEntries(model: string, entries: ModelRatingEntry[]): ModelRatingEntry[] {
+  return entries
+    .filter((entry) => modelMatchesPrefix(model, entry.model_prefix))
+    .sort((a, b) => a.model_prefix.length - b.model_prefix.length);
+}
+
+/** Every (provider, model) a prefix entry would cover, grouped by provider. */
+export interface PrefixCoverage {
+  provider: Provider;
+  models: string[];
+}
+
+export function prefixCoverage(
+  prefix: string,
+  catalogs: { providerId: string; models: string[] }[],
+  providers: Provider[],
+): PrefixCoverage[] {
+  const providerIndex = new Map(providers.map((provider) => [provider.id, provider]));
+  const coverage: PrefixCoverage[] = [];
+  for (const catalog of catalogs) {
+    const models = catalog.models.filter((model) => modelMatchesPrefix(model, prefix));
+    if (models.length === 0) continue;
+    const provider = providerIndex.get(catalog.providerId);
+    if (provider) coverage.push({ provider, models });
+  }
+  return coverage.sort((a, b) => a.provider.name.localeCompare(b.provider.name, "en", { sensitivity: "base" }));
 }
 
 export function uniqueModelIdentifiers(values: string[]): string[] {
@@ -20,24 +79,33 @@ export function parseRatingScore(draft: string): number | null {
   return Number.isInteger(score) && score >= 0 && score <= 100 ? score : null;
 }
 
-export function isProviderModelRating(value: unknown): value is ProviderModelRating {
-  if (!value || typeof value !== "object") return false;
-  const rating = value as Record<string, unknown>;
-  return typeof rating.provider_id === "string"
-    && typeof rating.upstream_model === "string"
-    && typeof rating.score === "number"
-    && Number.isInteger(rating.score)
-    && rating.score >= 0 && rating.score <= 100
-    && typeof rating.updated_at === "string"
-    && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/i.test(rating.updated_at)
-    && Number.isFinite(Date.parse(rating.updated_at));
+export function isValidRatingPrefix(prefix: string): boolean {
+  return prefix.trim() !== "" && !prefix.includes("\0") && new Blob([prefix]).size <= 1024;
 }
 
-export function readProviderModelRatings(value: unknown): ProviderModelRating[] {
-  if (!Array.isArray(value) || !value.every(isProviderModelRating)) {
+/** Canonical storage form, mirroring the backend's lowercase canonicalization. */
+export function canonicalModelPrefix(prefix: string): string {
+  return prefix.toLowerCase();
+}
+
+export function isModelRatingEntry(value: unknown): value is ModelRatingEntry {
+  if (!value || typeof value !== "object") return false;
+  const entry = value as Record<string, unknown>;
+  return typeof entry.model_prefix === "string"
+    && isValidRatingPrefix(entry.model_prefix)
+    && typeof entry.score === "number"
+    && Number.isInteger(entry.score)
+    && entry.score >= 0 && entry.score <= 100
+    && typeof entry.updated_at === "string"
+    && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/i.test(entry.updated_at)
+    && Number.isFinite(Date.parse(entry.updated_at));
+}
+
+export function readModelRatings(value: unknown): ModelRatingEntry[] {
+  if (!Array.isArray(value) || !value.every(isModelRatingEntry)) {
     throw new Error("Invalid model ratings response. The backend may not support model ratings.");
   }
-  const keys = new Set(value.map((rating) => providerModelKey(rating.provider_id, rating.upstream_model)));
+  const keys = new Set(value.map((entry) => entry.model_prefix));
   if (keys.size !== value.length) throw new Error("Duplicate model ratings in backend response.");
   return value;
 }
@@ -45,16 +113,21 @@ export function readProviderModelRatings(value: unknown): ProviderModelRating[] 
 export type RatingLoadState = "loading" | "error" | "ready";
 export type RatingDisplayState =
   | { status: "loading" | "error" | "unrated" }
-  | { status: "rated"; rating: ProviderModelRating };
+  | { status: "rated"; entry: ModelRatingEntry };
 
+/**
+ * Resolve the display state for one concrete model: the longest matching entry
+ * is the score; no match is unrated. Loading/error states never masquerade as
+ * unrated.
+ */
 export function ratingDisplayState(
   loadState: RatingLoadState,
-  rating?: ProviderModelRating | null,
-  providerKnown = true,
+  model: string,
+  entries: ModelRatingEntry[],
 ): RatingDisplayState {
   if (loadState !== "ready") return { status: loadState };
-  if (rating) return { status: "rated", rating };
-  return { status: providerKnown ? "unrated" : "error" };
+  const matched = longestRatingMatch(model, entries);
+  return matched ? { status: "rated", entry: matched } : { status: "unrated" };
 }
 
 export interface ModelCatalogSnapshot {
@@ -63,41 +136,33 @@ export interface ModelCatalogSnapshot {
   models: string[];
 }
 
-export interface ModelRatingRow {
+export interface UnmatchedModelRow {
   key: string;
-  providerId: string;
-  provider?: Provider;
+  provider: Provider;
   model: string;
-  rating: ProviderModelRating | null;
-  catalogStatus: "listed" | "missing" | "unknown";
 }
 
-/** Union raw catalogs, route references (including disabled routes), and saved scores. */
-export function buildModelRatingRows(
+/** Concrete models known from catalogs and route targets that no entry covers. */
+export function buildUnmatchedModels(
   providers: Provider[],
   routes: Model[],
-  ratings: ProviderModelRating[],
   catalogs: ModelCatalogSnapshot[],
-): ModelRatingRow[] {
+  entries: ModelRatingEntry[],
+): UnmatchedModelRow[] {
   const providerIndex = new Map(providers.map((provider) => [provider.id, provider]));
-  const catalogIndex = new Map(catalogs.map((catalog) => [catalog.providerId, catalog]));
-  const catalogModels = new Map(catalogs.map((catalog) => [catalog.providerId, new Set(catalog.models)]));
-  const ratingIndex = new Map(ratings.map((rating) => [providerModelKey(rating.provider_id, rating.upstream_model), rating]));
-  const rows = new Map<string, ModelRatingRow>();
+  const seen = new Set<string>();
+  const rows: UnmatchedModelRow[] = [];
   function add(providerId: string, model: string) {
-    const key = providerModelKey(providerId, model);
-    if (rows.has(key)) return;
     const provider = providerIndex.get(providerId);
-    const catalog = catalogIndex.get(providerId);
-    const catalogKnown = provider?.is_enabled && catalog?.status === "success";
-    rows.set(key, {
-      key, providerId, provider, model,
-      rating: ratingIndex.get(key) ?? null,
-      catalogStatus: !catalogKnown ? "unknown" : catalogModels.get(providerId)?.has(model) ? "listed" : "missing",
-    });
+    if (!provider || provider.is_enabled === false) return;
+    const key = JSON.stringify([providerId, model]);
+    if (seen.has(key)) return;
+    seen.add(key);
+    if (longestRatingMatch(model, entries)) return;
+    rows.push({ key, provider, model });
   }
   for (const catalog of catalogs) {
-    if (catalog.status === "success" && providerIndex.get(catalog.providerId)?.is_enabled) {
+    if (catalog.status === "success") {
       for (const model of catalog.models) add(catalog.providerId, model);
     }
   }
@@ -107,71 +172,81 @@ export function buildModelRatingRows(
       : [{ provider_id: route.target_provider, model: route.target_model }];
     for (const target of targets) add(target.provider_id, target.model);
   }
-  for (const rating of ratings) add(rating.provider_id, rating.upstream_model);
-  return [...rows.values()];
+  return rows.sort((a, b) => (
+    a.model.localeCompare(b.model, "en", { sensitivity: "base" })
+    || a.provider.name.localeCompare(b.provider.name, "en", { sensitivity: "base" })
+  ));
 }
 
-export type RatingFilter = "all" | "rated" | "unrated";
+export type RatingFilter = "all" | "matched" | "unmatched";
 export type RatingSort = "score-desc" | "score-asc" | "name" | "updated";
 export interface ModelRatingFilters {
   search: string;
-  providerId: string | null;
   rating: RatingFilter;
   min: number | null;
   max: number | null;
   sort: RatingSort;
   ratingsReady: boolean;
+  coverageReady: boolean;
 }
 
 function normalizeSearch(value: string): string {
   return value.toLocaleLowerCase().replace(/[\s._\p{Pd}/:]+/gu, "");
 }
 
-function compareExact(a: string, b: string): number {
-  return a < b ? -1 : a > b ? 1 : 0;
+export interface ModelRatingRow {
+  key: string;
+  entry: ModelRatingEntry;
+  /** Known concrete (provider, model) hits; empty when coverage is unknown. */
+  coverage: PrefixCoverage[];
+  modelCount: number;
+  providerCount: number;
 }
 
-function compareName(a: string, b: string): number {
-  return a.localeCompare(b, "en", { sensitivity: "base" });
-}
-
-function compareRowIdentity(a: ModelRatingRow, b: ModelRatingRow): number {
-  return compareName(a.provider?.name ?? a.providerId, b.provider?.name ?? b.providerId)
-    || compareName(a.model, b.model)
-    || compareExact(a.providerId, b.providerId)
-    || compareExact(a.model, b.model);
+/** Rows for the prefix-entry table, with live coverage from known catalogs. */
+export function buildModelRatingRows(
+  entries: ModelRatingEntry[],
+  catalogs: ModelCatalogSnapshot[],
+  providers: Provider[],
+): ModelRatingRow[] {
+  return entries.map((entry) => {
+    const coverage = prefixCoverage(entry.model_prefix, catalogs, providers);
+    return {
+      key: entry.model_prefix,
+      entry,
+      coverage,
+      modelCount: coverage.reduce((total, group) => total + group.models.length, 0),
+      providerCount: coverage.length,
+    };
+  });
 }
 
 /** All filtering/sorting is global. Callers paginate only the returned rows. */
-export function filterAndSortModelRatingRows(rows: ModelRatingRow[], filters: ModelRatingFilters): ModelRatingRow[] {
+export function filterAndSortModelRatingRows(
+  rows: ModelRatingRow[],
+  filters: ModelRatingFilters,
+): ModelRatingRow[] {
   const search = normalizeSearch(filters.search);
   const filtered = rows.filter((row) => {
-    if (filters.providerId !== null && row.providerId !== filters.providerId) return false;
-    if (search && ![row.provider?.name ?? "", row.providerId, row.model]
+    if (search && ![row.entry.model_prefix]
       .some((value) => normalizeSearch(value).includes(search))) return false;
-    // A failed score request must not turn unknown values into unrated/zero or fake empty results.
+    // A failed score request must not turn unknown values into unmatched or zero.
     if (!filters.ratingsReady) return true;
-    if (filters.rating === "rated" && !row.rating) return false;
-    if (filters.rating === "unrated" && (row.rating || !row.provider)) return false;
-    if (filters.min !== null && (!row.rating || row.rating.score < filters.min)) return false;
-    if (filters.max !== null && (!row.rating || row.rating.score > filters.max)) return false;
+    // Unknown coverage disables match-state predicates instead of excluding rows.
+    if (filters.rating === "unmatched" && filters.coverageReady && row.modelCount > 0) return false;
+    if (filters.rating === "matched" && filters.coverageReady && row.modelCount === 0) return false;
+    if (filters.min !== null && row.entry.score < filters.min) return false;
+    if (filters.max !== null && row.entry.score > filters.max) return false;
     return true;
   });
   return filtered.sort((a, b) => {
     if (filters.ratingsReady && (filters.sort === "score-desc" || filters.sort === "score-asc" || filters.sort === "updated")) {
-      // Absence is never zero: unrated rows stay last in both score directions.
-      if (!!a.rating !== !!b.rating) return a.rating ? -1 : 1;
-      if (a.rating && b.rating) {
-        const diff = filters.sort === "updated"
-          ? (parseBackendTime(b.rating.updated_at)?.getTime() ?? 0) - (parseBackendTime(a.rating.updated_at)?.getTime() ?? 0)
-          : filters.sort === "score-asc" ? a.rating.score - b.rating.score : b.rating.score - a.rating.score;
-        if (diff) return diff;
-      }
-    }
-    if (filters.sort === "name") {
-      const diff = compareName(a.model, b.model);
+      const diff = filters.sort === "updated"
+        ? (Date.parse(b.entry.updated_at) || 0) - (Date.parse(a.entry.updated_at) || 0)
+        : filters.sort === "score-asc" ? a.entry.score - b.entry.score : b.entry.score - a.entry.score;
       if (diff) return diff;
     }
-    return compareRowIdentity(a, b);
+    const nameDiff = a.entry.model_prefix.localeCompare(b.entry.model_prefix, "en", { sensitivity: "base" });
+    return nameDiff || (a.entry.model_prefix < b.entry.model_prefix ? -1 : 1);
   });
 }

@@ -2,47 +2,58 @@ import { deepEqual, equal, ok, throws } from "node:assert/strict";
 import { test } from "node:test";
 import {
   buildPerformanceRows, buildPerformanceHitIndex, buildPerformanceEnvelope, filterPerformanceRows, groupPerformancePoints,
-  layoutPerformanceLabels, PERFORMANCE_CHART, performanceColor, performancePoints,
+  layoutPerformanceLabels, PERFORMANCE_CHART, performanceColor, performanceModelLabel, performancePoints,
   performanceTpsMaximum, performanceScoreDomain, performanceScoreMaximum, pointCoordinates, readPerformanceResponse, visiblePerformanceSelection,
-  type ModelPerformance, type PerformancePoint, type PerformanceResponse, type PerformanceStats,
+  type ModelPerformanceItem, type PerformancePoint, type PerformanceResponse, type PerformanceStats,
 } from "./model-performance";
-import type { Provider, ProviderModelRating } from "./types";
+import type { Provider } from "./types";
 
 const time = "2026-09-08T00:00:00.000Z";
 const provider = (id: string, name = id, is_enabled = true): Provider => ({
   id, name, is_enabled, protocol: "openai-compatible", base_url: "http://example.invalid",
   use_proxy: false, fast_mode: false, created_at: time, updated_at: time,
 });
-function rating(provider_id = "p", upstream_model = "model", score = 70): ProviderModelRating {
-  return { provider_id, upstream_model, score, updated_at: time };
-}
 const stats = (average_tps: number | null = 42.123456, valid_tps_count = 5): PerformanceStats => ({
   average_tps, valid_tps_count, selected_request_count: 10,
   first_sample_at: valid_tps_count ? 1000 : null, last_sample_at: valid_tps_count ? 2000 : null,
 });
-const model = (p = rating()): ModelPerformance => ({ rating: p, mixed: stats(999),
-  unclassified_count: 2, untrusted_count: 1, status: "ready" });
-const snapshot = (...models: ModelPerformance[]): PerformanceResponse => ({ as_of: 3000, window_start: null, models });
+const variant = (upstream_model = "model", mixed = stats(999)) => ({
+  upstream_model, mixed, unclassified_count: 1, untrusted_count: 1,
+});
+const item = (model_prefix = "model", provider_id = "p", score = 70): ModelPerformanceItem => ({
+  model_prefix, provider_id, score, score_updated_at: time, mixed: stats(999),
+  variants: [variant(model_prefix)], unclassified_count: 2, untrusted_count: 1,
+});
+const snapshot = (...models: ModelPerformanceItem[]): PerformanceResponse => ({ as_of: 3000, window_start: null, models });
 function point(key: string, score: number, tps: number): PerformancePoint {
-  return { key, pointId: `P${key}`, providerId: key, providerName: key, model: key, providerEnabled: true,
+  return { key, pointId: `P${key}`, providerId: key, providerName: key,
+    modelPrefix: key, model: key, providerEnabled: true,
     score, tps, status: "ready", scoreUpdatedAt: time,
     selectedRequestCount: 10, validTpsCount: 5, firstSampleAt: 1000, lastSampleAt: 2000,
-    unclassifiedCount: 0, untrustedCount: 0, color: performanceColor(key) };
+    unclassifiedCount: 0, untrustedCount: 0, variants: [], color: performanceColor(key) };
 }
-test("strict batch contract preserves server TPS, sample counts and diagnostics verbatim", () => {
-  const data = snapshot(model());
+test("strict batch contract preserves server TPS, sample counts, variants and diagnostics verbatim", () => {
+  const data = snapshot(item());
   equal(readPerformanceResponse(data), data);
   const row = buildPerformanceRows(data, [provider("p")])[0];
   equal(row.tps, 999); equal(row.validTpsCount, 5); equal(row.selectedRequestCount, 10);
   equal(row.unclassifiedCount, 2); equal(row.untrustedCount, 1);
   equal(row.firstSampleAt, 1000); equal(row.lastSampleAt, 2000);
+  equal(row.variants.length, 1); equal(row.variants[0].upstream_model, "model");
+  equal(row.status, "ready"); equal(row.score, 70);
 });
-test("malformed batches and duplicate exact pair responses are errors, never missing/zero", () => {
+test("malformed batches and duplicate prefix/provider groups are errors, never missing/zero", () => {
   for (const invalid of [null, {}, { as_of: 1, window_start: 0, models: [{}] },
-    snapshot({ ...model(), mixed: { ...stats(), average_tps: NaN } }),
-    snapshot({ ...model(), mixed: { ...stats(), valid_tps_count: 11 } }),
-    snapshot({ ...model(), mixed: { ...stats(), average_tps: 0 } }),
-    snapshot(model(), model())]) throws(() => readPerformanceResponse(invalid));
+    snapshot({ ...item(), mixed: { ...stats(), average_tps: NaN } }),
+    snapshot({ ...item(), mixed: { ...stats(), valid_tps_count: 11 } }),
+    snapshot({ ...item(), mixed: { ...stats(), average_tps: 0 } }),
+    snapshot(item(), item()),
+    snapshot({ ...item(), score: 101 }),
+    snapshot({ ...item(), model_prefix: "" }),
+    snapshot({ ...item(), variants: [{ ...variant(), upstream_model: "" }] }),
+    snapshot({ ...item(), variants: [{ ...variant(), mixed: { ...stats(), valid_tps_count: 11 } }] })]) {
+    throws(() => readPerformanceResponse(invalid));
+  }
 });
 test("statistics enforce ten-request bound and matching TPS/sample-time presence", () => {
   for (const mixed of [
@@ -50,11 +61,11 @@ test("statistics enforce ten-request bound and matching TPS/sample-time presence
     { ...stats(), first_sample_at: null }, { ...stats(), last_sample_at: null },
     { ...stats(), first_sample_at: -1 }, { ...stats(), first_sample_at: 3000 },
     { ...stats(null, 0), average_tps: 50 }, { ...stats(null, 0), first_sample_at: 1000 },
-  ]) throws(() => readPerformanceResponse(snapshot({ ...model(), mixed })));
-  const empty = snapshot({ ...model(), mixed: stats(null, 0) });
+  ]) throws(() => readPerformanceResponse(snapshot({ ...item(), mixed })));
+  const empty = snapshot({ ...item(), mixed: stats(null, 0) });
   equal(readPerformanceResponse(empty), empty);
   for (const fields of [{ as_of: -1 }, { window_start: -1 }, { window_start: 3001 }]) {
-    throws(() => readPerformanceResponse({ ...snapshot(model()), ...fields }));
+    throws(() => readPerformanceResponse({ ...snapshot(item()), ...fields }));
   }
 });
 test("hidden hover/pins never dim visible points and restored filters recover the pin", () => {
@@ -65,36 +76,42 @@ test("hidden hover/pins never dim visible points and restored filters recover th
   deepEqual(visiblePerformanceSelection([...visible, point("02", 30, 40)], [], pinned), ["02"]);
   deepEqual(pinned, ["02"]);
 });
-test("one point per exact pair uses the comprehensive score including zero", () => {
-  const rows = buildPerformanceRows(snapshot(model(rating("a", "Model ", 0)), model(rating("a", "Model", 100))), [provider("a")]);
-  equal(rows.length, 2);
-  deepEqual(performancePoints(rows).map((p) => p.score).sort((a, b) => a - b), [0, 100]);
+test("one point per prefix × provider including zero scores", () => {
+  const rows = buildPerformanceRows(
+    snapshot(item("m", "a", 0), item("m", "b", 100), item("m2", "a", 50)),
+    [provider("a"), provider("b")],
+  );
+  equal(rows.length, 3);
+  deepEqual(performancePoints(rows).map((p) => p.score).sort((a, b) => a - b), [0, 50, 100]);
   ok(rows.every((p) => p.tps === 999));
+  deepEqual(rows.map((row) => [row.modelPrefix, row.providerId]), [["m", "a"], ["m", "b"], ["m2", "a"]]);
 });
 test("missing mixed TPS stays missing and disabled suppliers retain their score", () => {
-  const m = { ...model(rating()), mixed: stats(null, 0) };
+  const m = { ...item(), mixed: stats(null, 0) };
   const rows = buildPerformanceRows(readPerformanceResponse(snapshot(m)), [provider("p", "Disabled", false)]);
   equal(rows.length, 1); equal(rows[0].status, "missing");
   equal(rows[0].score, 70); equal(rows[0].providerEnabled, false);
   equal(performancePoints(rows).length, 0);
 });
-test("legacy tier profiles cannot masquerade as a single rating", () => {
-  throws(() => readPerformanceResponse(snapshot({ ...model(), rating: null } as unknown as ModelPerformance)));
-  throws(() => readPerformanceResponse({ ...snapshot(), models: [{ profile: rating(), mixed: stats() }] }));
-});
-test("explicit backend error remains an exact-pair row and never becomes TPS 0", () => {
-  const rows = buildPerformanceRows(snapshot({ ...model(rating("absent", "Model / ", 90)), status: "error", error: "storage unavailable" }), []);
-  equal(rows[0].error, "storage unavailable"); equal(rows[0].providerId, "absent"); equal(rows[0].model, "Model / ");
-  equal(rows[0].status, "error"); equal(performancePoints(rows).length, 0);
+test("legacy rating-keyed shapes cannot masquerade as prefix groups", () => {
+  throws(() => readPerformanceResponse({ ...snapshot(), models: [{ rating: {}, mixed: stats() }] } as unknown as PerformanceResponse));
 });
 test("full snapshot IDs are assigned before search/provider filters and independent of names/input order", () => {
-  const input = snapshot(model(rating("z", "model")), model(rating("a", "model")));
+  const input = snapshot(item("model", "z"), item("model", "a"));
   const rows = buildPerformanceRows(input, [provider("z"), provider("a")]);
   const reverse = buildPerformanceRows(snapshot(...[...input.models].reverse()), [provider("a", "renamed"), provider("z")]);
   deepEqual(rows.map((r) => [r.key, r.pointId]), reverse.map((r) => [r.key, r.pointId]));
   const selected = filterPerformanceRows(rows, "model", "z");
   equal(selected.length, 1); equal(selected[0].pointId, "P02");
   equal(filterPerformanceRows(rows, "P02", null).length, 0);
+  // Search reaches concrete variant names too.
+  const variants = snapshot({ ...item("m", "z", 80), variants: [variant("deepseek-v4-pro-0813")] });
+  equal(filterPerformanceRows(buildPerformanceRows(variants, [provider("z")]), "0813", null).length, 1);
+});
+test("point labels always pair the prefix with the provider", () => {
+  equal(performanceModelLabel(point("01", 50, 60)), "01 · 01");
+  const a = { ...point("01", 50, 60), modelPrefix: "shared-prefix", providerName: "Alpha" };
+  equal(performanceModelLabel(a), "shared-prefix · Alpha");
 });
 test("envelope handles empty, single, dominating and two trade-off points", () => {
   deepEqual(buildPerformanceEnvelope([]).nodes, []);
@@ -135,7 +152,7 @@ test("envelope recomputes on visible valid data and projects with the existing a
   ok(!buildPerformanceEnvelope(points).memberKeys.has("b"));
   ok(buildPerformanceEnvelope(points.filter((p) => p !== c)).memberKeys.has("b"));
   const invalid = [{ ...point("bad", 100, 999), status: "missing" as const, tps: null }];
-  equal(performancePoints([...points, ...invalid]).length, 3);
+  equal(performancePoints([...points, ...invalid] as unknown as PerformancePoint[]).length, 3);
   const domain = performanceScoreDomain(points), yMax = performanceTpsMaximum(points);
   for (const node of buildPerformanceEnvelope(points).nodes) {
     const original = points.find((p) => p.key === node.memberKeys[0])!;
@@ -217,16 +234,16 @@ test("dense model labels never collide; unavailable slots deliberately omitted, 
   }
   equal(JSON.stringify(data), before); deepEqual(layoutPerformanceLabels(groups), labels);
 });
-test("labels list every coincident model and disambiguate same models by provider", () => {
-  const a = { ...point("01", 50, 60), model: "shared-model", providerName: "Alpha" };
-  const b = { ...point("02", 50, 60), model: "shared-model", providerName: "Beta" };
+test("labels list every coincident point and pair the prefix with each provider", () => {
+  const a = { ...point("01", 50, 60), modelPrefix: "shared-prefix", providerName: "Alpha" };
+  const b = { ...point("02", 50, 60), modelPrefix: "shared-prefix", providerName: "Beta" };
   const groups = groupPerformancePoints([a, b], 200);
   const label = layoutPerformanceLabels(groups).get(groups[0].key)!;
-  ok(label.lines.join("").includes("shared-model · Alpha"));
-  ok(label.lines.join("").includes("shared-model · Beta"));
+  ok(label.lines.join("").includes("shared-prefix · Alpha"));
+  ok(label.lines.join("").includes("shared-prefix · Beta"));
   ok(label.width <= 210); ok(label.lines.length >= 2);
-  const long = { ...point("03", 10, 100), model: "模型/very-long-".repeat(5) };
+  const long = { ...point("03", 10, 100), modelPrefix: "模型/very-long-".repeat(5) };
   const longGroups = groupPerformancePoints([long], 200);
   const wrapped = layoutPerformanceLabels(longGroups).get(longGroups[0].key)!;
-  equal(wrapped.lines.join(""), long.model); ok(wrapped.lines.length > 1);
+  equal(wrapped.lines.join(""), `${long.modelPrefix} · 03`); ok(wrapped.lines.length > 1);
 });
