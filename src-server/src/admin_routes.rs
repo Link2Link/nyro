@@ -390,9 +390,7 @@ struct ModelRatingQuery {
     prefix: String,
 }
 
-async fn list_model_ratings_handler(
-    State(gw): State<Gateway>,
-) -> axum::response::Response {
+async fn list_model_ratings_handler(State(gw): State<Gateway>) -> axum::response::Response {
     match gw.admin().list_model_ratings().await {
         Ok(ratings) => Json(serde_json::json!({ "data": ratings })).into_response(),
         Err(error) => rating_error(error),

@@ -13,8 +13,9 @@ use crate::logging::LogEntry;
 
 use super::traits::{
     ApiKeyStore, AuthAccessStore, LogStore, ModelBackendStore, ModelRatingStore,
-    ModelSnapshotStore, ModelStore, OAuthCredentialStore, ProviderEndpointTestResult, ProviderStore,
-    ProviderTestResult, SettingsStore, Storage, StorageBackend, StorageBootstrap, StorageHealth,
+    ModelSnapshotStore, ModelStore, OAuthCredentialStore, ProviderEndpointTestResult,
+    ProviderStore, ProviderTestResult, SettingsStore, Storage, StorageBackend, StorageBootstrap,
+    StorageHealth,
 };
 
 use std::sync::Arc;

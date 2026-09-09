@@ -45,8 +45,8 @@ pub use model_catalog::{
 };
 use model_data::*;
 pub use model_performance::{ModelPerformanceItem, ModelPerformanceResponse};
-pub use observability::RequestLogAttempts;
 pub use model_ratings::{MAX_RATING_PREFIX_BYTES, ModelRatingError, SetModelRating};
+pub use observability::RequestLogAttempts;
 pub use providers::{ProviderModelProbeMeta, ProviderModelProbeOutcome, ProviderModelProbeResult};
 pub use usage::{
     ProviderUsage, ProviderUsageBalance, ProviderUsageListItem, ProviderUsageQueryStatus,

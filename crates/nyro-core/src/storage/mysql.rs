@@ -1082,11 +1082,9 @@ impl LogStore for MysqlLogStore {
         )
     }
     async fn distinct_logged_pairs(&self) -> anyhow::Result<Vec<(String, String)>> {
-        let rows = sqlx::query(
-            "SELECT DISTINCT provider_id, upstream_model FROM request_logs",
-        )
-        .fetch_all(&self.pool)
-        .await?;
+        let rows = sqlx::query("SELECT DISTINCT provider_id, upstream_model FROM request_logs")
+            .fetch_all(&self.pool)
+            .await?;
         let mut pairs = Vec::with_capacity(rows.len());
         for row in rows {
             use sqlx::Row;
@@ -2153,8 +2151,6 @@ impl StorageBootstrap for MysqlBootstrap {
 // ---------------------------------------------------------------------------
 // Migration helpers
 // ---------------------------------------------------------------------------
-
-
 
 async fn migrate_diagnostics_mysql(pool: &Pool<MySql>) -> anyhow::Result<()> {
     // Historical rows remain version 0/unknown: performance metadata is not an outcome.

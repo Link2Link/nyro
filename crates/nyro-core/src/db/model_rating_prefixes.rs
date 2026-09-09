@@ -78,7 +78,10 @@ mod tests {
     #[test]
     fn matches_only_at_segment_boundaries() {
         assert!(model_matches_prefix("deepseek-v4-pro", "deepseek-v4-pro"));
-        assert!(model_matches_prefix("deepseek-v4-pro-0813", "deepseek-v4-pro"));
+        assert!(model_matches_prefix(
+            "deepseek-v4-pro-0813",
+            "deepseek-v4-pro"
+        ));
         assert!(!model_matches_prefix("deepseek-v4-pro2", "deepseek-v4-pro"));
         assert!(!model_matches_prefix("gpt-4o", "gpt-4"));
         assert!(model_matches_prefix("gpt-4-turbo", "gpt-4"));
@@ -86,7 +89,10 @@ mod tests {
         assert!(!model_matches_prefix("", "deepseek"));
         // Case differences are ignored in both directions.
         assert!(model_matches_prefix("DeepSeek-V4-Pro", "deepseek-v4-pro"));
-        assert!(model_matches_prefix("deepseek-v4-pro-0813", "DEEPSEEK-V4-PRO"));
+        assert!(model_matches_prefix(
+            "deepseek-v4-pro-0813",
+            "DEEPSEEK-V4-PRO"
+        ));
         assert!(model_matches_prefix("GPT-4-TURBO", "gpt-4"));
         assert!(!model_matches_prefix("GPT-4O", "gpt-4"));
         // Separator identity is still exact.

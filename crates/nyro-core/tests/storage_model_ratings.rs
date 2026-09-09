@@ -129,16 +129,20 @@ async fn exercise_sql_contract(storage: &dyn Storage) -> anyhow::Result<()> {
 
     store.delete("Model").await?;
     store.delete("Model").await?;
-    assert!(store
-        .list()
-        .await?
-        .iter()
-        .all(|r| r.model_prefix != "Model"));
-    assert!(store
-        .list()
-        .await?
-        .iter()
-        .any(|r| r.model_prefix == "model"));
+    assert!(
+        store
+            .list()
+            .await?
+            .iter()
+            .all(|r| r.model_prefix != "Model")
+    );
+    assert!(
+        store
+            .list()
+            .await?
+            .iter()
+            .any(|r| r.model_prefix == "model")
+    );
 
     // Restore replaces the entire prefix table and preserves timestamps.
     let restored = [
@@ -151,21 +155,19 @@ async fn exercise_sql_contract(storage: &dyn Storage) -> anyhow::Result<()> {
     store.restore(&restored).await?;
     assert_eq!(store.list().await?, restored);
     // Failure after a deletion and valid insertion must roll back the replace.
-    assert!(store
-        .restore(&[
-            entry("partial", 25),
-            entry("invalid", 101),
-        ])
-        .await
-        .is_err());
+    assert!(
+        store
+            .restore(&[entry("partial", 25), entry("invalid", 101),])
+            .await
+            .is_err()
+    );
     assert_eq!(store.list().await?, restored);
-    assert!(store
-        .restore(&[
-            entry("partial", 25),
-            entry(&"🦀".repeat(257), 25),
-        ])
-        .await
-        .is_err());
+    assert!(
+        store
+            .restore(&[entry("partial", 25), entry(&"🦀".repeat(257), 25),])
+            .await
+            .is_err()
+    );
     assert_eq!(store.list().await?, restored);
     store.restore(&[]).await?;
     assert!(store.list().await?.is_empty());
@@ -199,7 +201,13 @@ async fn sqlite_constraints() -> anyhow::Result<()> {
         let sql = format!(
             "INSERT INTO model_rating_prefixes (model_prefix, score, updated_at) VALUES ('raw', {score}, ?)"
         );
-        assert!(sqlx::query(&sql).bind(EARLIER).execute(storage.pool()).await.is_err());
+        assert!(
+            sqlx::query(&sql)
+                .bind(EARLIER)
+                .execute(storage.pool())
+                .await
+                .is_err()
+        );
     }
     for prefix in [String::new(), "x".repeat(1025), "🦀".repeat(257)] {
         assert!(sqlx::query("INSERT INTO model_rating_prefixes (model_prefix, score, updated_at) VALUES (?, 50, ?)")
@@ -274,7 +282,11 @@ async fn sqlite_missing_schema_migrates_without_backfill_and_errors_propagate() 
 
 #[test]
 fn memory_ratings_are_explicitly_unsupported() {
-    assert!(MemoryStorage::new(vec![], vec![], vec![]).model_ratings().is_none());
+    assert!(
+        MemoryStorage::new(vec![], vec![], vec![])
+            .model_ratings()
+            .is_none()
+    );
 }
 
 fn external_test_config(variable: &str) -> anyhow::Result<Option<SqlBackendConfig>> {
@@ -340,11 +352,7 @@ async fn postgres_ratings_optional_test_database() -> anyhow::Result<()> {
     storage.bootstrap().migrate().await?;
     exercise_sql_contract(&storage).await?;
     let row = entry("preserved-on-migrate", 0);
-    storage
-        .model_ratings()
-        .unwrap()
-        .upsert(row.clone())
-        .await?;
+    storage.model_ratings().unwrap().upsert(row.clone()).await?;
     storage.bootstrap().migrate().await?;
     assert_eq!(storage.model_ratings().unwrap().list().await?, vec![row]);
     sqlx::query("DROP TABLE model_rating_prefixes")
@@ -385,8 +393,13 @@ async fn mysql_ratings_optional_test_database() -> anyhow::Result<()> {
     storage.bootstrap().migrate().await?;
     assert_eq!(store.list().await?, vec![row]);
     // Invalid external bytes must surface as an error, not a lossy/absent prefix.
-    sqlx::query("INSERT INTO model_rating_prefixes (model_prefix, score, updated_at) VALUES (?, 0, ?)")
-        .bind(vec![0xffu8]).bind(EARLIER).execute(storage.pool()).await?;
+    sqlx::query(
+        "INSERT INTO model_rating_prefixes (model_prefix, score, updated_at) VALUES (?, 0, ?)",
+    )
+    .bind(vec![0xffu8])
+    .bind(EARLIER)
+    .execute(storage.pool())
+    .await?;
     assert!(store.list().await.is_err());
     sqlx::query("DROP TABLE model_rating_prefixes")
         .execute(storage.pool())

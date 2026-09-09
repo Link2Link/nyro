@@ -1,5 +1,7 @@
 use nyro_core::Gateway;
-use nyro_core::admin::{CopyProviderOptions, ModelPerformanceResponse, ProviderOAuthStatusData, SetModelRating};
+use nyro_core::admin::{
+    CopyProviderOptions, ModelPerformanceResponse, ProviderOAuthStatusData, SetModelRating,
+};
 use nyro_core::auth::{AuthExchangeInput, AuthSessionInitData, AuthSessionStatusData};
 use nyro_core::db::models::*;
 use serde::{Deserialize, Serialize};
@@ -12,10 +14,11 @@ use tauri::{Manager, State};
 // ── Manual model ratings ──
 
 #[tauri::command]
-pub async fn list_model_ratings(
-    gw: State<'_, Gateway>,
-) -> Result<Vec<ModelRatingEntry>, String> {
-    gw.admin().list_model_ratings().await.map_err(|e| e.to_string())
+pub async fn list_model_ratings(gw: State<'_, Gateway>) -> Result<Vec<ModelRatingEntry>, String> {
+    gw.admin()
+        .list_model_ratings()
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]

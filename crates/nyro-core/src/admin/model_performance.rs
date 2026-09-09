@@ -38,9 +38,7 @@ pub struct ModelPerformanceResponse {
 /// busy variants represent their share of traffic. Counts are plain sums and
 /// sample timestamps span the merged window. A group without any valid sample
 /// keeps a null average instead of a fabricated zero.
-fn aggregate_stats(
-    variants: &[ModelPerformanceVariant],
-) -> (ModelPerformanceStats, i64, i64) {
+fn aggregate_stats(variants: &[ModelPerformanceVariant]) -> (ModelPerformanceStats, i64, i64) {
     let mut stats = ModelPerformanceStats::default();
     let mut unclassified_count = 0i64;
     let mut untrusted_count = 0i64;
@@ -55,7 +53,10 @@ fn aggregate_stats(
         untrusted_count += variant.untrusted_count;
     }
     // Independent min/max passes keep first/last semantics regardless of order.
-    stats.first_sample_at = variants.iter().filter_map(|v| v.mixed.first_sample_at).min();
+    stats.first_sample_at = variants
+        .iter()
+        .filter_map(|v| v.mixed.first_sample_at)
+        .min();
     stats.last_sample_at = variants.iter().filter_map(|v| v.mixed.last_sample_at).max();
     stats.average_tps =
         (stats.valid_tps_count > 0).then_some(tps_weighted / stats.valid_tps_count as f64);
@@ -160,7 +161,13 @@ impl AdminService {
 mod tests {
     use super::*;
 
-    fn variant(model: &str, count: i64, tps: Option<f64>, first: Option<i64>, last: Option<i64>) -> ModelPerformanceVariant {
+    fn variant(
+        model: &str,
+        count: i64,
+        tps: Option<f64>,
+        first: Option<i64>,
+        last: Option<i64>,
+    ) -> ModelPerformanceVariant {
         ModelPerformanceVariant {
             upstream_model: model.to_string(),
             mixed: ModelPerformanceStats {

@@ -163,17 +163,21 @@ mod tests {
         };
         validate_export_ratings(&[entry("a", "2026-01-01T00:00:00Z")]).unwrap();
         validate_export_ratings(&[entry("A", "2026-01-01T00:00:00Z")]).unwrap();
-        assert!(validate_export_ratings(&[
-            entry("a", "2026-01-01T00:00:00Z"),
-            entry("a", "2026-01-02T00:00:00Z")
-        ])
-        .is_err());
+        assert!(
+            validate_export_ratings(&[
+                entry("a", "2026-01-01T00:00:00Z"),
+                entry("a", "2026-01-02T00:00:00Z")
+            ])
+            .is_err()
+        );
         // Case variants of one prefix are duplicates after canonicalization.
-        assert!(validate_export_ratings(&[
-            entry("Model", "2026-01-01T00:00:00Z"),
-            entry("model", "2026-01-02T00:00:00Z")
-        ])
-        .is_err());
+        assert!(
+            validate_export_ratings(&[
+                entry("Model", "2026-01-01T00:00:00Z"),
+                entry("model", "2026-01-02T00:00:00Z")
+            ])
+            .is_err()
+        );
         assert!(validate_export_ratings(&[entry("a", "not-a-timestamp")]).is_err());
     }
 }

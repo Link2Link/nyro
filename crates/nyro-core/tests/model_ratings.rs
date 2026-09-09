@@ -153,7 +153,12 @@ async fn rating_zero_is_a_stored_score_and_failures_are_errors() -> anyhow::Resu
         .execute(&app.pool)
         .await?;
     assert!(admin.list_model_ratings().await.is_err());
-    assert!(admin.set_model_rating("x", SetModelRating { score: 1 }).await.is_err());
+    assert!(
+        admin
+            .set_model_rating("x", SetModelRating { score: 1 })
+            .await
+            .is_err()
+    );
     assert!(
         admin.export_config().await.is_err(),
         "backup must not silently lose ratings on a DB error"
@@ -209,7 +214,11 @@ async fn rating_validation_retains_exact_identity_without_catalog_requests() -> 
     // "Model-X" canonicalizes onto "model-x"; only case collapses.
     assert_eq!(saved.len(), 5);
     assert!(saved.iter().any(|row| row.model_prefix == "model-x "));
-    assert!(saved.iter().all(|row| row.model_prefix == row.model_prefix.to_lowercase()));
+    assert!(
+        saved
+            .iter()
+            .all(|row| row.model_prefix == row.model_prefix.to_lowercase())
+    );
     // Case-insensitive upsert and delete address the same canonical entry.
     let renewed = admin
         .set_model_rating("MODEL-X", SetModelRating { score: 42 })
@@ -224,8 +233,8 @@ async fn rating_validation_retains_exact_identity_without_catalog_requests() -> 
 }
 
 #[tokio::test]
-async fn rating_changes_do_not_affect_routes_or_epoch_and_outlive_providers()
--> anyhow::Result<()> {
+async fn rating_changes_do_not_affect_routes_or_epoch_and_outlive_providers() -> anyhow::Result<()>
+{
     let app = app().await?;
     let admin = app.gateway.admin();
     let p = admin.create_provider(provider("one")).await?;
@@ -288,13 +297,10 @@ async fn rating_copy_shares_prefix_entries_without_touching_them() -> anyhow::Re
 }
 
 #[tokio::test]
-async fn rating_backup_roundtrip_preserves_time_and_replaces_on_reimport()
--> anyhow::Result<()> {
+async fn rating_backup_roundtrip_preserves_time_and_replaces_on_reimport() -> anyhow::Result<()> {
     let source = app().await?;
     let source_admin = source.gateway.admin();
-    source_admin
-        .create_provider(provider("portable"))
-        .await?;
+    source_admin.create_provider(provider("portable")).await?;
     let old = source_admin
         .set_model_rating("old/x ", SetModelRating { score: 0 })
         .await?;
@@ -393,10 +399,7 @@ async fn rating_rows_persist_across_reopening_storage() -> anyhow::Result<()> {
         .set_model_rating("x", SetModelRating { score: 80 })
         .await?;
     let reopened = SqliteStorage::from_config(&app.gateway.config).await?;
-    assert_eq!(
-        reopened.model_ratings().unwrap().list().await?,
-        vec![saved]
-    );
+    assert_eq!(reopened.model_ratings().unwrap().list().await?, vec![saved]);
     Ok(())
 }
 

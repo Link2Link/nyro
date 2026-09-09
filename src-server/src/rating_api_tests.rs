@@ -76,8 +76,7 @@ async fn rating_http_auth_encoded_identity_and_zero_contract() -> anyhow::Result
     assert_eq!(list["data"].as_array().unwrap().len(), 1);
     // Identity is exact: the trimmed prefix is a different entry.
     let trimmed = "/api/v1/model-ratings?prefix=vendor%2FModel%2Bx%23";
-    call(&router, "PUT", trimmed, Some(json!({"score":100})), true)
-        .await?;
+    call(&router, "PUT", trimmed, Some(json!({"score":100})), true).await?;
     let (_, list) = call(&router, "GET", "/api/v1/model-ratings", None, true).await?;
     assert_eq!(list["data"].as_array().unwrap().len(), 2);
     for _ in 0..2 {
@@ -136,8 +135,7 @@ async fn rating_performance_http_empty_without_logged_matches() -> anyhow::Resul
     assert_eq!(empty["data"]["models"], json!([]));
     // A rating alone is not enough: groups need logged pairs that match it.
     let rating_url = "/api/v1/model-ratings?prefix=x";
-    call(&router, "PUT", &rating_url, Some(json!({"score":90})), true)
-        .await?;
+    call(&router, "PUT", &rating_url, Some(json!({"score":90})), true).await?;
     let (status, response) = call(&router, "GET", "/api/v1/model-performance", None, true).await?;
     assert_eq!(status, StatusCode::OK);
     let data = &response["data"];
