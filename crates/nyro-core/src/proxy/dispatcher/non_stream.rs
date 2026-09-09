@@ -52,7 +52,7 @@ pub(super) async fn handle_non_stream(
     // Shared log builder pre-filled with identity + request-side extras.
     let log = LogBuilder::from_ctx(call_ctx).with_req_extras(req_extras);
     let upstream_req_hdrs_str = crate::proxy::observability::reqwest_headers_to_json(&headers);
-    let upstream_req_body_str = serde_json::to_string(&body).ok();
+    let upstream_req_body_str = crate::logging::payload::capture_json(&body, true).body;
 
     let upstream_start = std::time::Instant::now();
     let call_result = match client
@@ -97,7 +97,7 @@ pub(super) async fn handle_non_stream(
     let upstream_hdrs_str = headers_to_json(&upstream_headers);
 
     if status >= 400 {
-        let body_str = serde_json::to_string(&resp).ok();
+        let body_str = crate::logging::payload::capture_json(&resp, true).body;
         log.status(status)
             .upstream_url(url)
             .upstream_status(status as i32)
@@ -120,7 +120,7 @@ pub(super) async fn handle_non_stream(
     // Embeddings: passthrough response (parse_response is not implemented for codec).
     if egress.handler().capabilities().embeddings {
         let usage = crate::protocol::codec::openai::compatible::embeddings::parse_usage(&resp);
-        let resp_str = serde_json::to_string(&resp).ok();
+        let resp_str = crate::logging::payload::capture_json(&resp, true).body;
         log.status(status)
             .upstream_url(url)
             .usage(usage)
@@ -163,17 +163,11 @@ pub(super) async fn handle_non_stream(
         {
             Ok(ai_resp) => ai_resp.usage,
             Err(error) => {
-                if let Some(p) = &call_ctx.performance {
-                    p.fail(
-                        "failed",
-                        format!("passthrough response parser error: {error}"),
-                    );
-                }
                 tracing::warn!(%error, egress = egress_str, "failed to parse passthrough usage");
                 Default::default()
             }
         };
-        let resp_str = serde_json::to_string(&resp).ok();
+        let resp_str = crate::logging::payload::capture_json(&resp, true).body;
         log.status(status)
             .upstream_url(url)
             .usage(usage)
@@ -194,12 +188,13 @@ pub(super) async fn handle_non_stream(
     }
 
     // Parse response via ProviderAdapter.
-    let upstream_resp_str = serde_json::to_string(&resp).ok();
+    let upstream_resp_str = crate::logging::payload::capture_json(&resp, true).body;
     let inbound = InboundResponse { status, body: resp };
     let mut ai_resp = match adapter.parse_response(inbound, ctx).await {
         Ok(r) => r,
         Err(e) => {
-            log.status(500)
+            log.failure("conversion_error", "response_conversion", &e)
+                .status(500)
                 .upstream_url(url)
                 .with_upstream_request(upstream_req_hdrs_str, upstream_req_body_str)
                 .with_upstream_response(
@@ -237,7 +232,7 @@ pub(super) async fn handle_non_stream(
     let formatter = ingress.handler().make_response_encoder();
     let output = formatter.format_response(&ai_resp);
 
-    let response_body_full = serde_json::to_string(&output).ok();
+    let response_body_full = crate::logging::payload::capture_json(&output, true).body;
     log.status(status)
         .upstream_url(url)
         .usage(usage)
@@ -554,7 +549,10 @@ mod tests {
             method: "POST".into(),
             path: "/v1/chat/completions".into(),
             headers: None,
-            body: Some(r#"{"model":"virtual-gemini"}"#.into()),
+            body: Some(std::sync::Arc::new(crate::logging::payload::capture_bytes(
+                br#"{"model":"virtual-gemini"}"#,
+                true,
+            ))),
         };
         let provider_ctx = ProviderCtx {
             provider: &provider,
@@ -868,14 +866,14 @@ pub(super) async fn handle_non_stream_via_upstream_stream(
     let (resp, status) = call_result;
     let upstream_hdrs_str = headers_to_json(resp.headers());
     let upstream_req_hdrs_str = crate::proxy::observability::reqwest_headers_to_json(&headers);
-    let upstream_req_body_str = serde_json::to_string(&body).ok();
+    let upstream_req_body_str = crate::logging::payload::capture_json(&body, true).body;
 
     if status >= 400 {
         let err_body: Value = resp
             .json()
             .await
             .unwrap_or_else(|_| serde_json::json!({"error": {"message": "upstream error"}}));
-        let err_body_str = serde_json::to_string(&err_body).ok();
+        let err_body_str = crate::logging::payload::capture_json(&err_body, true).body;
         log.status(status)
             .upstream_url(url)
             .with_upstream_request(upstream_req_hdrs_str, upstream_req_body_str)
@@ -898,6 +896,7 @@ pub(super) async fn handle_non_stream_via_upstream_stream(
     let mut byte_stream = resp.bytes_stream();
     let mut accumulator = StreamResponseAccumulator::default();
     let mut raw_text = String::new();
+    let mut json_fallback = None;
 
     while let Some(chunk) = byte_stream.next().await {
         let bytes = match chunk {
@@ -916,7 +915,15 @@ pub(super) async fn handle_non_stream_via_upstream_stream(
             }
         };
         let text = String::from_utf8_lossy(&bytes);
-        raw_text.push_str(&text);
+        if json_fallback != Some(false) {
+            raw_text.push_str(&text);
+            if let Some(first) = raw_text.trim_start().chars().next() {
+                json_fallback = Some(first == '{');
+                if json_fallback == Some(false) {
+                    raw_text.clear();
+                }
+            }
+        }
         // Vendor raw-chunk normalization (e.g. antigravity unwrapping the
         // v1internal envelope from every SSE data line) runs before the
         // decoder; raw_text keeps the verbatim upstream bytes for logs.
@@ -929,7 +936,12 @@ pub(super) async fn handle_non_stream_via_upstream_stream(
         };
         if let Ok(ai_deltas) = stream_parser.parse_chunk(parse_src).inspect_err(|e| {
             if let Some(p) = &call_ctx.performance {
-                p.fail("failed", format!("stream parser error: {e}"));
+                p.record_failure(
+                    "failed",
+                    "conversion_parse_error",
+                    "response_conversion",
+                    e.as_ref(),
+                );
             }
         }) {
             let ai_deltas = tool_route_plan.restore_stream_deltas(ai_deltas);
@@ -939,7 +951,12 @@ pub(super) async fn handle_non_stream_via_upstream_stream(
 
     if let Ok(ai_deltas) = stream_parser.finish().inspect_err(|e| {
         if let Some(p) = &call_ctx.performance {
-            p.fail("failed", format!("stream parser finish error: {e}"));
+            p.record_failure(
+                "failed",
+                "conversion_parse_error",
+                "response_conversion",
+                e.as_ref(),
+            );
         }
     }) {
         let ai_deltas = tool_route_plan.restore_stream_deltas(ai_deltas);
@@ -996,7 +1013,7 @@ pub(super) async fn handle_non_stream_via_upstream_stream(
     let formatter = ingress.handler().make_response_encoder();
     let output = formatter.format_response(&ai_resp);
 
-    let client_resp_body_str = serde_json::to_string(&output).ok();
+    let client_resp_body_str = crate::logging::payload::capture_json(&output, true).body;
     log.status(status)
         .upstream_url(url)
         .usage(usage)

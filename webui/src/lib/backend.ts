@@ -230,6 +230,10 @@ function resolveHTTP(cmd: string, args?: Record<string, unknown>): HTTPMapping {
     }
     case "get_log":
       return { method: "GET", url: `${base}/logs/${args?.id}` };
+    case "get_request_log_attempts":
+      return { method: "GET", url: `${base}/log-requests/${encodeURIComponent(String(args?.requestId ?? ""))}` };
+    case "get_logging_status":
+      return { method: "GET", url: `${base}/logging/status` };
     case "clear_logs":
       return { method: "DELETE", url: `${base}/logs` };
     case "clear_log_payloads":

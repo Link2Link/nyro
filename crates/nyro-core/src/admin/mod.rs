@@ -45,6 +45,7 @@ pub use model_catalog::{
 };
 use model_data::*;
 pub use model_performance::{ModelPerformanceItem, ModelPerformanceResponse};
+pub use observability::RequestLogAttempts;
 pub use provider_model_ratings::{
     MAX_RATING_MODEL_BYTES, ProviderModelRatingError, ProviderModelRatingState,
     SetProviderModelRating,

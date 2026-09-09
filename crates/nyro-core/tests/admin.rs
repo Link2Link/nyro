@@ -966,6 +966,7 @@ async fn admin_clears_payloads_deletes_single_log_and_clears_error_logs() -> any
     let gw = build_gateway().await?;
     let entry = |client_status: i32, upstream_status: Option<i32>| LogEntry {
         performance: Default::default(),
+        diagnostic: Default::default(),
         api_key_id: None,
         api_key_name: None,
         created_at: 1,
@@ -1011,7 +1012,7 @@ async fn admin_clears_payloads_deletes_single_log_and_clears_error_logs() -> any
         ])
         .await?;
 
-    assert_eq!(gw.admin().clear_log_payloads().await?, 2);
+    assert_eq!(gw.admin().clear_log_payloads().await?, 4);
     assert_eq!(gw.admin().clear_log_payloads().await?, 0);
 
     let rows = gw.admin().query_logs(LogQuery::default()).await?;
@@ -1049,8 +1050,10 @@ async fn admin_clears_payloads_deletes_single_log_and_clears_error_logs() -> any
         .get_log(&client_error_id)
         .await?
         .expect("client-error log remains");
-    assert!(client_error.client_request_body.is_some());
-    assert!(client_error.upstream_response_body.is_some());
+    assert!(client_error.client_request_body.is_none());
+    assert!(client_error.upstream_response_body.is_none());
+    assert!(client_error.payload_cleared_at.is_some());
+    assert!(client_error.is_error);
 
     let upstream_error_id = rows
         .items
@@ -1064,8 +1067,13 @@ async fn admin_clears_payloads_deletes_single_log_and_clears_error_logs() -> any
         .get_log(&upstream_error_id)
         .await?
         .expect("upstream-error log remains");
-    assert!(upstream_error.client_request_body.is_some());
-    assert!(upstream_error.upstream_response_body.is_some());
+    assert!(upstream_error.client_request_body.is_none());
+    assert!(upstream_error.upstream_response_body.is_none());
+    assert!(upstream_error.payload_cleared_at.is_some());
+    assert!(
+        upstream_error.is_error,
+        "upstream HTTP errors count even with client 200"
+    );
 
     // Single-row delete; a missing id reports 0 instead of an error.
     assert_eq!(gw.admin().delete_log(&first_ok).await?, 1);
@@ -1073,14 +1081,15 @@ async fn admin_clears_payloads_deletes_single_log_and_clears_error_logs() -> any
     let rows = gw.admin().query_logs(LogQuery::default()).await?;
     assert_eq!(rows.total, 3);
 
-    // Error wipe uses client status, so it removes only the client-error row.
-    assert_eq!(gw.admin().clear_error_logs().await?, 1);
+    // Error wipe includes HTTP 400..=599 on either side, not just client errors.
+    assert_eq!(gw.admin().clear_error_logs().await?, 2);
     let rows = gw.admin().query_logs(LogQuery::default()).await?;
-    assert_eq!(rows.total, 2);
+    assert_eq!(rows.total, 1);
     assert_eq!(rows.items[0].client_status_code, Some(200));
+    assert!(!rows.items[0].is_error);
 
     // Full clear still works and removes the remainder.
-    assert_eq!(gw.admin().clear_logs().await?, 2);
+    assert_eq!(gw.admin().clear_logs().await?, 1);
     let rows = gw.admin().query_logs(LogQuery::default()).await?;
     assert_eq!(rows.total, 0);
 

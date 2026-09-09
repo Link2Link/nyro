@@ -72,6 +72,29 @@ fn fill_time_buckets(
     points
 }
 
+#[derive(Debug, Serialize)]
+pub struct RequestLogAttempts {
+    pub client_request_id: String,
+    pub result: Option<crate::logging::diagnostics::RequestResult>,
+    pub attempts: Vec<RequestLog>,
+}
+
+fn decorate_log_result(log: &mut RequestLog) {
+    log.is_error = crate::logging::diagnostics::is_error(
+        log.client_status_code,
+        log.upstream_status_code,
+        log.outcome_version,
+        &log.attempt_outcome,
+    );
+    log.effective_outcome = crate::logging::diagnostics::effective_outcome(
+        log.client_status_code,
+        log.upstream_status_code,
+        log.outcome_version,
+        &log.attempt_outcome,
+    )
+    .to_string();
+}
+
 impl AdminService {
     // ── Logs ──
 
@@ -79,18 +102,78 @@ impl AdminService {
         let mut q = q;
         q.limit = Some(q.limit.unwrap_or(50).min(500));
         q.offset = Some(q.offset.unwrap_or(0));
-        self.gw.storage.logs().query(q).await
+        if let Some(outcome) = q.outcome.as_deref() {
+            anyhow::ensure!(
+                matches!(
+                    outcome,
+                    "error" | "completed" | "cancelled" | "output_limited" | "unknown"
+                ),
+                "unsupported log outcome filter"
+            );
+        }
+        let mut page = self.gw.storage.logs().query(q).await?;
+        for log in &mut page.items {
+            decorate_log_result(log);
+        }
+        Ok(page)
     }
 
     pub async fn get_log(&self, id: &str) -> anyhow::Result<Option<RequestLog>> {
-        self.gw.storage.logs().find_by_id(id).await
+        let Some(mut log) = self.gw.storage.logs().find_by_id(id).await? else {
+            return Ok(None);
+        };
+        decorate_log_result(&mut log);
+        if let Some(request_id) = log.client_request_id.as_deref() {
+            log.request_result = self.gw.storage.logs().request_result(request_id).await?;
+        }
+        Ok(Some(log))
+    }
+
+    pub async fn get_request_log_attempts(
+        &self,
+        request_id: &str,
+    ) -> anyhow::Result<RequestLogAttempts> {
+        anyhow::ensure!(
+            !request_id.trim().is_empty() && request_id.len() <= 128,
+            "invalid client request ID"
+        );
+        let result = self.gw.storage.logs().request_result(request_id).await?;
+        // The correlated view is scalar-only; fetch individual payloads on demand.
+        let mut attempts = Vec::new();
+        let mut offset = 0;
+        loop {
+            let page = self
+                .query_logs(LogQuery {
+                    client_request_id: Some(request_id.to_string()),
+                    limit: Some(500),
+                    offset: Some(offset),
+                    ..Default::default()
+                })
+                .await?;
+            let count = page.items.len();
+            attempts.extend(page.items);
+            offset += count as i64;
+            if count == 0 || offset >= page.total {
+                break;
+            }
+        }
+        attempts.sort_by(|a, b| {
+            a.attempt_index
+                .cmp(&b.attempt_index)
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        Ok(RequestLogAttempts {
+            client_request_id: request_id.to_string(),
+            result,
+            attempts,
+        })
     }
 
     pub async fn clear_logs(&self) -> anyhow::Result<u64> {
         self.gw.storage.logs().clear_all().await
     }
 
-    /// Clear payloads from non-error logs while preserving rows and all error payloads.
+    /// Clear all recorded payloads, including failed attempts, without deleting metadata.
     pub async fn clear_log_payloads(&self) -> anyhow::Result<u64> {
         self.gw.storage.logs().clear_payloads().await
     }
@@ -100,7 +183,7 @@ impl AdminService {
         self.gw.storage.logs().delete_by_id(id).await
     }
 
-    /// Delete every request log row whose client status is an error (>= 400).
+    /// Delete actual HTTP errors or authoritative live failures/timeouts, once per attempt.
     pub async fn clear_error_logs(&self) -> anyhow::Result<u64> {
         self.gw.storage.logs().clear_errors().await
     }

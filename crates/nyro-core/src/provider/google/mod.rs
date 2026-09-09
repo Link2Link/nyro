@@ -146,11 +146,7 @@ impl Vendor for GoogleVendor {
         *body = antigravity::wrap_request(std::mem::take(body), &model, &project_id);
         Ok(())
     }
-    async fn pre_parse(
-        &self,
-        ctx: &VendorCtx<'_>,
-        resp: &mut Value,
-    ) -> anyhow::Result<()> {
+    async fn pre_parse(&self, ctx: &VendorCtx<'_>, resp: &mut Value) -> anyhow::Result<()> {
         if !antigravity::is_antigravity_channel(ctx.provider) {
             return Ok(());
         }

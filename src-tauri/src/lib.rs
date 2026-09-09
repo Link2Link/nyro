@@ -108,6 +108,8 @@ pub fn run() {
             commands::update_api_key,
             commands::delete_api_key,
             commands::query_logs,
+            commands::get_logging_status,
+            commands::get_request_log_attempts,
             commands::get_log,
             commands::clear_logs,
             commands::clear_log_payloads,

@@ -235,6 +235,13 @@ impl LogStore for MemoryStorage {
         Ok(None)
     }
 
+    async fn request_result(
+        &self,
+        _client_request_id: &str,
+    ) -> anyhow::Result<Option<crate::db::models::RequestResult>> {
+        Ok(None)
+    }
+
     async fn cleanup_before(&self, _cutoff: &str) -> anyhow::Result<u64> {
         Ok(0)
     }
@@ -315,6 +322,10 @@ impl LogStore for MemoryStorage {
             request_count: 0,
             success_count: 0,
             error_count: 0,
+            unknown_count: 0,
+            cancelled_count: 0,
+            output_limited_count: 0,
+            outcome_stats_version: 1,
             total_input_tokens: 0,
             total_output_tokens: 0,
             total_cache_read_tokens: 0,
@@ -344,6 +355,10 @@ impl LogStore for MemoryStorage {
             request_count: 0,
             success_count: 0,
             error_count: 0,
+            unknown_count: 0,
+            cancelled_count: 0,
+            output_limited_count: 0,
+            outcome_stats_version: 1,
             total_input_tokens: 0,
             total_output_tokens: 0,
             total_cache_read_tokens: 0,
@@ -368,6 +383,10 @@ impl LogStore for MemoryStorage {
             request_count: 0,
             success_count: 0,
             error_count: 0,
+            unknown_count: 0,
+            cancelled_count: 0,
+            output_limited_count: 0,
+            outcome_stats_version: 1,
             total_input_tokens: 0,
             total_output_tokens: 0,
             total_cache_read_tokens: 0,

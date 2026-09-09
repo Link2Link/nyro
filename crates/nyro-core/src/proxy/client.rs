@@ -143,7 +143,18 @@ impl ProxyClient {
                         headers.remove(reqwest::header::CONTENT_LENGTH);
                         Bytes::from(decompressed)
                     }
-                    _ => compressed,
+                    Err(error) => {
+                        if let Some(attempt) = &self.performance {
+                            attempt.record_failure(
+                                "failed",
+                                "decompression_error",
+                                "upstream_decode",
+                                &error,
+                            );
+                        }
+                        return Err(error.into());
+                    }
+                    Ok(None) => compressed,
                 }
             }
             None => response.bytes().await?,
@@ -151,6 +162,14 @@ impl ProxyClient {
         let json: Value = match serde_json::from_slice(&body) {
             Ok(json) => json,
             Err(source) => {
+                if let Some(attempt) = &self.performance {
+                    attempt.record_failure(
+                        "failed",
+                        "response_parse_error",
+                        "upstream_decode",
+                        &source,
+                    );
+                }
                 return Err(UpstreamResponseDecodeError {
                     source,
                     status,
@@ -172,19 +191,26 @@ impl ProxyClient {
         ensure_json_content_type(&mut headers);
         if let Some(attempt) = &self.performance {
             attempt.request(&body);
+            attempt.request_headers(&headers);
         }
         let response = self.http.post(url).headers(headers).body(body).send().await;
         let response = match response {
             Ok(response) => response,
             Err(error) => {
                 if let Some(attempt) = &self.performance {
-                    attempt.fail(
+                    attempt.record_failure(
                         if error.is_timeout() {
                             "timed_out"
                         } else {
                             "failed"
                         },
-                        error.to_string(),
+                        if error.is_timeout() {
+                            "timeout"
+                        } else {
+                            "upstream_connect_error"
+                        },
+                        "upstream_connect",
+                        &error,
                     );
                 }
                 return Err(error.into());
@@ -214,11 +240,20 @@ impl ProxyClient {
 }
 
 async fn read_body_with_limit(response: ObservedResponse, limit: usize) -> Result<Bytes> {
+    let performance = response.performance.clone();
     let mut stream = response.bytes_stream();
     let mut body = BytesMut::new();
     while let Some(chunk) = stream.next().await {
         let chunk = chunk?;
         if body.len().saturating_add(chunk.len()) > limit {
+            if let Some(p) = &performance {
+                p.record_message(
+                    "failed",
+                    "response_size_limit",
+                    "upstream_read",
+                    "Upstream body exceeds the processing size limit.",
+                );
+            }
             anyhow::bail!("upstream response body exceeds {limit} bytes");
         }
         body.extend_from_slice(&chunk);

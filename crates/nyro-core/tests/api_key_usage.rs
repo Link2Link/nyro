@@ -155,7 +155,22 @@ async fn aggregates_by_key_id_and_stable_route_identity() {
             detail.success_count,
             detail.error_count
         ),
-        (4, 1, 2)
+        (4, 0, 2)
+    );
+    // HTTP 200/302 alone cannot confirm success for legacy rows.
+    assert_eq!(detail.unknown_count, 2);
+    assert_eq!(
+        (detail.cancelled_count, detail.output_limited_count),
+        (0, 0)
+    );
+    assert_eq!(detail.outcome_stats_version, 1);
+    assert_eq!(
+        detail.success_count
+            + detail.error_count
+            + detail.unknown_count
+            + detail.cancelled_count
+            + detail.output_limited_count,
+        detail.request_count
     );
     assert_eq!(
         (
@@ -210,6 +225,14 @@ async fn aggregates_by_key_id_and_stable_route_identity() {
     assert_eq!(empty.request_count, 0);
     assert_eq!(empty.success_count, 0);
     assert_eq!(empty.error_count, 0);
+    assert_eq!(
+        (
+            empty.unknown_count,
+            empty.cancelled_count,
+            empty.output_limited_count
+        ),
+        (0, 0, 0)
+    );
     assert_eq!(empty.total_input_tokens, 0);
     assert_eq!(empty.total_output_tokens, 0);
     assert_eq!(empty.total_cache_read_tokens, 0);
@@ -292,6 +315,7 @@ async fn log_filters_compose_and_list_omits_payloads() {
             api_key: Some("key".into()),
             after: Some(10),
             before: Some(10),
+            ..Default::default()
         })
         .await
         .unwrap();

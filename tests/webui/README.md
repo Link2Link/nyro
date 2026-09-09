@@ -8,7 +8,8 @@ Nyro instance. They do not install packages, commit, or deploy.
 
 - Node 22+ with native `WebSocket`.
 - Chromium: set `CHROME_BIN` if none of the cached/system paths exists.
-- Performance smoke additionally needs Python 3.9+ with standard-library `sqlite3`.
+- Performance and log-outcomes smokes additionally need Python 3.9+ with
+  standard-library `sqlite3`.
 - Build the current backend and frontend before running; coordinate shared artifacts.
 
 ```bash
@@ -16,6 +17,7 @@ cargo build -p nyro-server --no-default-features
 (cd webui && npm run build)
 node tests/webui/model-ratings-smoke.mjs
 node tests/webui/performance-smoke.mjs
+node tests/webui/log-outcomes-smoke.mjs
 ```
 
 Optional absolute-path overrides: `NYRO_SMOKE_BINARY`, `NYRO_SMOKE_WEBUI`,
@@ -176,3 +178,55 @@ semantics. All work remains inside the disposable server/browser lifecycle above
 
 These scripts do not replace Rust lifecycle fault tests, SQL backend conformance,
 import/export tests, or Tauri IPC execution tests.
+
+## Log outcomes and failure observability
+
+`log-outcomes-smoke.mjs` reuses the disposable server + Python SQLite seed +
+CDP browser pattern for failure observability. The seed inserts the versioned
+outcome columns (`client_request_id`, `attempt_index`, `outcome_version`,
+`attempt_outcome`, `failure_kind/stage`, `error_message`, `error_causes_json`,
+`payload_metadata_json`, `payload_cleared_at`) plus correlated rows in
+`request_results`, so every UI assertion runs against real API responses —
+an HTTP trap fails the run on any upstream/catalog call.
+
+Node-side oracle (real admin API) and browser coverage:
+
+- A MiniMax-like HTTP 200/200 upstream read failure with `outcome_version=1`,
+  `attempt_outcome=failed` is `is_error=true` / effective outcome `error`,
+  while its response headers carry `x-nyro-request-id` and the SSE error body
+  carries the same `request_id`. A retry chain (attempt 0 → 502 failure on
+  provider A, attempt 1 → completed on provider B) yields two attempt rows
+  with one final `request_results` summary and an in-dialog cross-attempt
+  navigation. Legacy version-0 `failed` markers and future outcome versions
+  stay `unknown`, never errors.
+- The Logs page shows one outcome badge (`error|completed|cancelled|
+  output_limited|unknown`) beside the raw client HTTP number plus the upstream
+  HTTP line. The attempt-result filter `error` includes the HTTP200 read
+  failure and excludes cancelled/output-limited/unknown; the raw client-HTTP
+  filter is independent and combines with AND. Every filter combination is
+  first asserted through `/api/v1/logs`.
+- The detail dialog exposes failure kind/stage/message and the parsed cause
+  chain, correlated attempts, the final client result summary, and bounded
+  payload evidence: a >1 MiB truncated body rendered as exact 512 KiB head +
+  512 KiB tail segments with the computed missing-middle byte count,
+  base64-encoded binary bodies shown verbatim, `not_retained` (recording
+  disabled), `absent`, legacy unknown-capture rows with raw text, separate
+  header accounting (observed vs retained bytes and omitted-header counts),
+  and the `Manually cleared` marker after destructive payload clearing.
+  Cancelled and output-limited attempts retain payloads without entering any
+  error filter or count.
+- Provider / model / API-key usage dialogs count attempts (not client
+  requests): success is confirmed-completed only, error counts include the
+  HTTP200 read failure, unknown/cancelled/output-limited counts are shown,
+  and the five exclusive buckets sum to the attempt total.
+- The logging health snapshot from `/api/v1/logging/status` renders queue-full,
+  channel-closed and database-write drop counters.
+- Destructive confirmations spell out their exact scope (payload clearing
+  covers ALL logs including errors and keeps classifications; error deletion
+  removes only confirmed errors — HTTP 4xx/5xx or versioned failure/timeout —
+  and excludes cancelled/output-limited/unknown), verified in EN and ZH copy.
+  Confirming error deletion from the Logs page invalidates the logs, stats and
+  usage query families so the stats page updates after SPA navigation without
+  a reload.
+- EN/ZH desktop and mobile screenshots with no whole-page overflow, no
+  unexpected console/runtime/network errors, and zero trap hits.

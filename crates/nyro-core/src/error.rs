@@ -17,6 +17,10 @@ use axum::Json;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 
+/// Marker proving a body came from `GatewayError::render` and may be re-encoded.
+#[derive(Clone, Copy)]
+pub(crate) struct RenderedGatewayError;
+
 // ── Supporting types ──────────────────────────────────────────────────────────
 
 /// Which phase of a request an upstream timeout occurred in.
@@ -261,19 +265,71 @@ impl GatewayError {
         let status = self.http_status();
         let numeric_status = status.as_u16();
         let mut error_obj = serde_json::json!({
-            "message": self.message(),
+            "message": self.public_message(),
             "type": self.stable_code(),
             "code": numeric_status,
         });
         if let Some(id) = request_id {
             error_obj["request_id"] = serde_json::Value::String(id.to_string());
         }
-        (status, Json(serde_json::json!({ "error": error_obj }))).into_response()
+        let mut response =
+            (status, Json(serde_json::json!({ "error": error_obj }))).into_response();
+        response.extensions_mut().insert(RenderedGatewayError);
+        response
+    }
+
+    /// Machine-safe client message: never embeds upstream bodies or provider detail.
+    fn public_message(&self) -> String {
+        match self {
+            GatewayError::UpstreamStatus { status, .. } => {
+                format!("upstream returned an error status: {status}")
+            }
+            GatewayError::StreamParseError { .. } => "upstream stream could not be parsed".into(),
+            GatewayError::ProviderUnavailable { .. } => "provider is unavailable".into(),
+            GatewayError::Internal { .. } => "internal gateway error".into(),
+            _ => self.message(),
+        }
     }
 
     /// Render with a `RequestContext` — injects `request_id` automatically.
     pub fn render_with_ctx(&self, ctx: &crate::proxy::context::RequestContext) -> Response {
         self.render(Some(&ctx.request_id))
+    }
+
+    /// Replace only gateway-rendered error bodies with correlated variants.
+    /// Re-encodes JSON so the client capture sees the exact final bytes; other
+    /// responses, status codes, headers and local-health extensions pass through.
+    pub async fn correlate_response(
+        response: Response,
+        _ingress: crate::protocol::ids::ProtocolId,
+        request_id: &str,
+    ) -> Response {
+        use axum::body::Body;
+        if response
+            .extensions()
+            .get::<RenderedGatewayError>()
+            .is_none()
+        {
+            return response;
+        }
+        let (mut parts, body) = response.into_parts();
+        let Ok(bytes) = axum::body::to_bytes(body, 1 << 20).await else {
+            return Response::from_parts(parts, Body::empty());
+        };
+        let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+            return Response::from_parts(parts, Body::from(bytes));
+        };
+        if let Some(error) = value.get_mut("error").and_then(|v| v.as_object_mut()) {
+            error.insert(
+                "request_id".into(),
+                serde_json::Value::String(request_id.to_string()),
+            );
+        }
+        parts.headers.remove(axum::http::header::CONTENT_LENGTH);
+        // Keep every original extension (e.g. local-health neutrality) rather
+        // than rebuilding the response around a fresh Json part set.
+        let body = serde_json::to_vec(&value).unwrap_or_else(|_| bytes.to_vec());
+        Response::from_parts(parts, Body::from(body))
     }
 
     /// Convenience: build an `Internal` variant from any `anyhow::Error`.

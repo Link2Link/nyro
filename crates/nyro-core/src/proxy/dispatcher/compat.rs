@@ -1,6 +1,5 @@
 use std::convert::Infallible;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
 
 use axum::body::Body;
 #[cfg(test)]
@@ -186,7 +185,7 @@ pub(super) async fn handle_compat(
         .with_req_extras(req_extras)
         .upstream_url(url);
     let upstream_req_headers = crate::proxy::observability::reqwest_headers_to_json(&headers);
-    let upstream_req_body = Some(String::from_utf8_lossy(&prepared.body).into_owned());
+    let upstream_req_body = crate::logging::payload::capture_bytes(&prepared.body, true).body;
     let upstream_start = std::time::Instant::now();
 
     let response = match client
@@ -284,6 +283,7 @@ pub(super) async fn handle_compat(
     {
         Ok(primed) => primed,
         Err(error) => {
+            let log = log.failure("conversion_error", "response_conversion", &error);
             let status = error.http_status();
             let message = error.to_string();
             let response = codex_compat_error_response(
@@ -311,16 +311,8 @@ pub(super) async fn handle_compat(
         }
     };
 
-    let upstream_raw = Arc::new(Mutex::new(Vec::new()));
-    let upstream_raw_observer = upstream_raw.clone();
-    let observed = primed.stream.map(move |item| {
-        if let Ok(bytes) = &item
-            && let Ok(mut buffer) = upstream_raw_observer.lock()
-        {
-            buffer.extend_from_slice(bytes);
-        }
-        item
-    });
+    // Attempt observes original bytes once, independently of compat conversion.
+    let observed = primed.stream;
     let converted = match call_ctx.gw.compat_engine.convert_stream_response(
         &prepared.session,
         primed.metadata,
@@ -328,6 +320,7 @@ pub(super) async fn handle_compat(
     ) {
         Ok(converted) => converted,
         Err(error) => {
+            let log = log.failure("conversion_error", "response_conversion", &error);
             let status = error.http_status();
             let message = error.to_string();
             let response = codex_compat_error_response(
@@ -357,7 +350,6 @@ pub(super) async fn handle_compat(
 
     build_streaming_compat_response(
         converted,
-        upstream_raw,
         log,
         upstream_req_headers,
         upstream_req_body,
@@ -388,10 +380,11 @@ async fn handle_buffered_compat(
 ) -> CompatAttempt {
     let upstream_latency_ms = upstream_start.elapsed().as_millis() as i64;
     let upstream_headers = crate::proxy::observability::headers_to_json(&raw.headers);
-    let upstream_body = Some(String::from_utf8_lossy(&raw.body).into_owned());
+    let upstream_body = crate::logging::payload::capture_bytes(&raw.body, true).body;
     let (metadata, body) = match decode_response_body(raw.status, &raw.headers, raw.body) {
         Ok(decoded) => decoded,
         Err(error) => {
+            let log = log.failure("decompression_error", "upstream_decode", &error);
             let message = error.to_string();
             log.status(502)
                 .with_upstream_request(upstream_req_headers, upstream_req_body)
@@ -462,7 +455,7 @@ async fn handle_buffered_compat(
                 )
                 .with_client_response(
                     None,
-                    Some(String::from_utf8_lossy(&client_body).into_owned()),
+                    crate::logging::payload::capture_bytes(&client_body, true).body,
                 )
                 .emit();
             return CompatAttempt {
@@ -487,6 +480,7 @@ async fn handle_buffered_compat(
     {
         Ok(converted) => converted,
         Err(error) => {
+            let log = log.failure("conversion_error", "response_conversion", &error);
             let status = error.http_status();
             let message = error.to_string();
             log.status(status)
@@ -535,7 +529,7 @@ async fn handle_buffered_compat(
             }
         };
 
-    let client_body = Some(String::from_utf8_lossy(&body).into_owned());
+    let client_body = crate::logging::payload::capture_bytes(&body, true).body;
     log.status(metadata.status)
         .usage(usage)
         .with_upstream_request(upstream_req_headers, upstream_req_body)
@@ -695,7 +689,6 @@ async fn prime_stream(
 #[allow(clippy::too_many_arguments)]
 fn build_streaming_compat_response(
     converted: ConvertedResponse,
-    upstream_raw: Arc<Mutex<Vec<u8>>>,
     log: LogBuilder,
     upstream_req_headers: Option<String>,
     upstream_req_body: Option<String>,
@@ -734,9 +727,8 @@ fn build_streaming_compat_response(
         bridge.on_connected();
         let mut parser = client_protocol.handler().make_stream_response_decoder();
         let mut formatter = client_protocol.handler().make_stream_response_encoder();
-        let mut accumulator = super::StreamResponseAccumulator::default();
+        let mut accumulator = super::LogUsageAccumulator::default();
         let mut terminal = StreamTerminal::default();
-        let mut client_body = Vec::new();
         let mut chunks = 0_i32;
         let mut stream_error = None;
         let mut upstream_ended = false;
@@ -747,10 +739,18 @@ fn build_streaming_compat_response(
                 _ = tx.closed() => {
                     request_context.cancellation.cancel();
                     let _ = bridge.push_chunk(Ok(()));
+                    if let Some(p) = &log.performance { p.record_message("cancelled", "client_cancelled", "client_delivery", "Client disconnected."); }
                     stream_error = Some("client disconnected".to_string());
                     break;
                 }
                 _ = tokio::time::sleep(request_context.deadline.remaining()) => {
+                    if let Some(p) = &log.performance { p.record_message("timed_out", "timeout", "upstream_read", "Upstream deadline exceeded."); }
+                    let event = super::stream_error_event(client_protocol, &request_context.request_id, "timeout");
+                    if tx.try_send(Ok(Bytes::from(event))).is_ok()
+                        && let Some(p) = &log.performance
+                    {
+                        p.note_client_frame_sent();
+                    }
                     let message = "upstream stream deadline exceeded".to_string();
                     let _ = bridge.push_chunk(Err(crate::proxy::stream::StreamFailure::Timeout));
                     stream_error = Some(message);
@@ -765,6 +765,24 @@ fn build_streaming_compat_response(
             let bytes = match item {
                 Ok(bytes) => bytes,
                 Err(error) => {
+                    if let Some(p) = &log.performance {
+                        p.record_failure(
+                            "failed",
+                            "conversion_stream_error",
+                            "response_conversion",
+                            &error,
+                        );
+                    }
+                    let event = super::stream_error_event(
+                        client_protocol,
+                        &request_context.request_id,
+                        "conversion_stream_error",
+                    );
+                    if tx.send(Ok(Bytes::from(event))).await.is_ok()
+                        && let Some(p) = &log.performance
+                    {
+                        p.note_client_frame_sent();
+                    }
                     stream_error = Some(error.to_string());
                     bridge.on_read_error(error.to_string());
                     break;
@@ -774,7 +792,14 @@ fn build_streaming_compat_response(
             let text = String::from_utf8_lossy(&bytes);
             let outgoing = if let Ok(mut deltas) = parser.parse_chunk(&text).inspect_err(|e| {
                 if let Some(p) = &log.performance {
-                    p.fail("failed", format!("compat downstream parser error: {e}"));
+                    if !hook_state.is_empty() {
+                        p.record_failure(
+                            "failed",
+                            "conversion_parse_error",
+                            "response_hook",
+                            e.as_ref(),
+                        );
+                    }
                 }
             }) {
                 if hook_state.is_empty() {
@@ -799,7 +824,6 @@ fn build_streaming_compat_response(
             } else {
                 bytes
             };
-            client_body.extend_from_slice(&outgoing);
             let sent = tokio::select! {
                 biased;
                 _ = tx.closed() => false,
@@ -812,6 +836,9 @@ fn build_streaming_compat_response(
                 stream_error = Some("client disconnected".to_string());
                 break;
             }
+            if let Some(p) = &log.performance {
+                p.note_client_frame_sent();
+            }
             chunks += 1;
             if bridge.push_chunk(Ok(())).is_err() {
                 break;
@@ -821,10 +848,14 @@ fn build_streaming_compat_response(
         terminal.finish(client_protocol);
         if let Ok(mut deltas) = parser.finish().inspect_err(|e| {
             if let Some(p) = &log.performance {
-                p.fail(
-                    "failed",
-                    format!("compat downstream parser finish error: {e}"),
-                );
+                if !hook_state.is_empty() {
+                    p.record_failure(
+                        "failed",
+                        "conversion_parse_error",
+                        "response_hook",
+                        e.as_ref(),
+                    );
+                }
             }
         }) {
             let before = format!("{deltas:?}");
@@ -840,7 +871,6 @@ fn build_streaming_compat_response(
                         .map(crate::protocol::SseEvent::to_sse_string)
                         .collect::<String>(),
                 );
-                client_body.extend_from_slice(&outgoing);
                 let sent = tokio::select! {
                     biased;
                     _ = tx.closed() => false,
@@ -848,10 +878,21 @@ fn build_streaming_compat_response(
                     result = tx.send(Ok(outgoing)) => result.is_ok(),
                 };
                 if sent {
+                    if let Some(p) = &log.performance {
+                        p.note_client_frame_sent();
+                    }
                     chunks += 1;
                 } else {
                     request_context.cancellation.cancel();
                     let _ = bridge.push_chunk(Ok(()));
+                    if let Some(p) = &log.performance {
+                        p.record_message(
+                            "cancelled",
+                            "client_cancelled",
+                            "client_delivery",
+                            "Client disconnected.",
+                        );
+                    }
                     stream_error = Some("client disconnected".to_string());
                 }
             }
@@ -883,9 +924,6 @@ fn build_streaming_compat_response(
                     )));
                 }
                 health_permit.failure();
-                if stream_error.is_none() {
-                    stream_error = Some(message);
-                }
             }
         }
 
@@ -893,14 +931,10 @@ fn build_streaming_compat_response(
         if response.model.is_empty() {
             response.model = actual_model;
         }
-        let upstream_body = upstream_raw
-            .lock()
-            .ok()
-            .map(|buffer| String::from_utf8_lossy(&buffer).into_owned());
+        let upstream_body = None;
         log.status(status)
             .upstream_status(status as i32)
             .usage(response.usage)
-            .maybe_error(stream_error)
             .with_upstream_request(upstream_req_headers, upstream_req_body)
             .with_upstream_response(
                 status as i32,
@@ -908,10 +942,7 @@ fn build_streaming_compat_response(
                 upstream_body,
                 Some(upstream_start.elapsed().as_millis() as i64),
             )
-            .with_client_response(
-                None,
-                Some(String::from_utf8_lossy(&client_body).into_owned()),
-            )
+            .with_client_response(None, None)
             .stream_metrics(chunks, first_chunk_ms)
             .emit();
     });

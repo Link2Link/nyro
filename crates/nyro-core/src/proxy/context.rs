@@ -339,8 +339,24 @@ pub async fn inject_context(mut request: Request, next: Next) -> Response {
         OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1,
         Duration::from_secs(600),
     );
-    request.extensions_mut().insert(ctx);
-    next.run(request).await
+    let request_id = ctx.request_id.clone();
+    request.extensions_mut().insert(ctx.clone());
+    let response = next.run(request).await;
+    let response = if response
+        .extensions()
+        .get::<crate::performance::Attempt>()
+        .is_none()
+    {
+        crate::error::GatewayError::correlate_response(response, ctx.ingress_protocol, &request_id)
+            .await
+    } else {
+        response
+    };
+    let mut response = crate::proxy::dispatcher::finish_preflight_response(response, &ctx);
+    if let Ok(value) = request_id.parse() {
+        response.headers_mut().insert("x-nyro-request-id", value);
+    }
+    response
 }
 
 /// Helper called by each ingress handler to stamp the correct ingress protocol

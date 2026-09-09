@@ -197,7 +197,18 @@ CREATE TABLE `request_logs` (
   `performance_upstream_ms` bigint DEFAULT NULL,
   `performance_first_chunk_ms` bigint DEFAULT NULL,
   `performance_completed_at` bigint DEFAULT NULL,
+  `client_request_id` varchar(64) CHARACTER SET ascii COLLATE ascii_bin DEFAULT NULL,
+  `attempt_index` int DEFAULT NULL,
+  `outcome_version` int NOT NULL DEFAULT '0',
+  `attempt_outcome` varchar(32) CHARACTER SET ascii COLLATE ascii_bin NOT NULL DEFAULT 'unknown',
+  `failure_kind` varchar(64) COLLATE utf8mb4_unicode_ci DEFAULT NULL,
+  `failure_stage` varchar(64) COLLATE utf8mb4_unicode_ci DEFAULT NULL,
+  `error_message` text COLLATE utf8mb4_unicode_ci,
+  `error_causes_json` text COLLATE utf8mb4_unicode_ci,
+  `payload_metadata_json` text COLLATE utf8mb4_unicode_ci,
+  `payload_cleared_at` bigint DEFAULT NULL,
   PRIMARY KEY (`id`),
+  KEY `idx_logs_client_request_attempt` (`client_request_id`,`attempt_index`),
   KEY `idx_logs_created_at` (`created_at`),
   KEY `idx_logs_provider_id` (`provider_id`),
   KEY `idx_logs_client_status` (`client_status_code`),
@@ -205,6 +216,15 @@ CREATE TABLE `request_logs` (
   KEY `idx_logs_api_key` (`api_key_id`),
   KEY `idx_logs_performance_pair` (`provider_id`,`upstream_model`,`request_completion`,`performance_completed_at`,`id`),
   KEY `idx_logs_performance_recovery` (`performance_metadata_version`,`created_at`,`id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE `request_results` (
+  `client_request_id` varchar(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  `final_outcome` varchar(32) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  `final_attempt_id` varchar(36) COLLATE utf8mb4_unicode_ci DEFAULT NULL,
+  `attempt_count` int NOT NULL,
+  `finished_at` bigint NOT NULL,
+  PRIMARY KEY (`client_request_id`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE `settings` (

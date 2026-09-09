@@ -23,7 +23,7 @@ export default function DashboardPage() {
   const { locale } = useLocale();
   const isZh = locale === "zh-CN";
 
-  const { data: overview } = useQuery<StatsOverview>({
+  const { data: overview, error: overviewError, isPending: overviewPending } = useQuery<StatsOverview>({
     queryKey: ["stats-overview"],
     queryFn: () => backend("get_stats_overview"),
     refetchInterval: 10_000,
@@ -82,7 +82,7 @@ export default function DashboardPage() {
     : `${fmt(totalCacheRead)} tokens from cache (${cacheRate}% of input)`;
 
   const cards = [
-    { label: isZh ? "总请求数" : "Total Requests", value: fmt(overview?.total_requests ?? 0), icon: Activity, color: "text-blue-600" },
+    { label: isZh ? "总尝试数" : "Total Attempts", value: fmt(overview?.total_requests ?? 0), icon: Activity, color: "text-blue-600" },
     { label: isZh ? "总 Token" : "Total Tokens", value: totalTokensValue, title: totalTokensTitle, icon: Zap, color: "text-amber-600" },
     { label: isZh ? "平均延迟" : "Avg Latency", value: fmtLatency(overview?.avg_duration_ms ?? 0), icon: Clock, color: "text-green-600" },
     { label: isZh ? "错误率" : "Error Rate", value: `${errorRate}%`, icon: AlertTriangle, color: "text-red-500" },
@@ -111,7 +111,13 @@ export default function DashboardPage() {
       </div>
 
       <div className="grid grid-cols-2 gap-3 lg:grid-cols-3 xl:grid-cols-6">
-        {cards.map((c) => (
+        {overviewError || !overview ? (
+          <div className="glass col-span-full rounded-2xl p-4 text-sm text-slate-500" role={overviewError ? "alert" : "status"}>
+            {overviewError || !overviewPending
+              ? (isZh ? "统计概览不可用" : "Overview unavailable")
+              : (isZh ? "正在加载统计概览…" : "Loading overview…")}
+          </div>
+        ) : cards.map((c) => (
           <div
             key={c.label}
             title={(c as { title?: string }).title}
@@ -128,7 +134,7 @@ export default function DashboardPage() {
 
       <div className="grid grid-cols-1 gap-3 xl:grid-cols-2">
         <div className="glass rounded-2xl p-6">
-          <h3 className="mb-4 text-sm font-semibold text-slate-800">{isZh ? "请求量（24h）" : "Requests (24h)"}</h3>
+          <h3 className="mb-4 text-sm font-semibold text-slate-800">{isZh ? "尝试量（24h）" : "Attempts (24h)"}</h3>
           <div className="h-48">
             {chartHourly.length > 0 ? (
               <ResponsiveContainer width="100%" height="100%">
@@ -137,8 +143,8 @@ export default function DashboardPage() {
                   <XAxis dataKey="hour" tick={{ fill: "#64748b", fontSize: 11 }} axisLine={false} tickLine={false} />
                   <YAxis tick={{ fill: "#64748b", fontSize: 11 }} axisLine={false} tickLine={false} width={40} />
                   <Tooltip />
-                  <Bar dataKey="requests" name={isZh ? "请求" : "Requests"} radius={[4, 4, 0, 0]} fill="#3b82f6" />
-                  <Bar dataKey="errors" name={isZh ? "错误" : "Errors"} radius={[4, 4, 0, 0]} fill="#ef4444" />
+                  <Bar dataKey="requests" name={isZh ? "尝试" : "Attempts"} radius={[4, 4, 0, 0]} fill="#3b82f6" />
+                  <Bar dataKey="errors" name={isZh ? "错误尝试" : "Error Attempts"} radius={[4, 4, 0, 0]} fill="#ef4444" />
                 </BarChart>
               </ResponsiveContainer>
             ) : (
@@ -191,7 +197,7 @@ export default function DashboardPage() {
               <thead className="bg-white/70 text-slate-500">
                 <tr>
                   <th className="px-3 py-2 text-left font-medium">{isZh ? "模型" : "Model"}</th>
-                  <th className="px-3 py-2 text-right font-medium">{isZh ? "请求数" : "Requests"}</th>
+                  <th className="px-3 py-2 text-right font-medium">{isZh ? "尝试数" : "Attempts"}</th>
                   <th className="px-3 py-2 text-right font-medium">{isZh ? "Token" : "Tokens"}</th>
                   <th className="px-3 py-2 text-right font-medium">{isZh ? "延迟" : "Latency"}</th>
                 </tr>
@@ -220,8 +226,8 @@ export default function DashboardPage() {
               <thead className="bg-white/70 text-slate-500">
                 <tr>
                   <th className="px-3 py-2 text-left font-medium">{isZh ? "提供商" : "Provider"}</th>
-                  <th className="px-3 py-2 text-right font-medium">{isZh ? "请求数" : "Requests"}</th>
-                  <th className="px-3 py-2 text-right font-medium">{isZh ? "错误数" : "Errors"}</th>
+                  <th className="px-3 py-2 text-right font-medium">{isZh ? "尝试数" : "Attempts"}</th>
+                  <th className="px-3 py-2 text-right font-medium">{isZh ? "错误尝试数" : "Error Attempts"}</th>
                   <th className="px-3 py-2 text-right font-medium">{isZh ? "延迟" : "Latency"}</th>
                 </tr>
               </thead>

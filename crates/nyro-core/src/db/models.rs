@@ -411,9 +411,43 @@ pub struct ApiKeyWithBindings {
     pub model_ids: Vec<String>,
 }
 
+/// Final client-visible result, separate from the attempt rows used by usage accounting.
+pub use crate::logging::diagnostics::RequestResult;
+
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
 pub struct RequestLog {
     pub id: String,
+    #[serde(default)]
+    pub client_request_id: Option<String>,
+    #[serde(default)]
+    pub attempt_index: Option<i32>,
+    #[serde(default)]
+    pub outcome_version: i32,
+    #[serde(default = "unknown_performance_value")]
+    pub attempt_outcome: String,
+    #[serde(default)]
+    pub failure_kind: Option<String>,
+    #[serde(default)]
+    pub failure_stage: Option<String>,
+    #[serde(default)]
+    pub error_message: Option<String>,
+    /// JSON-encoded array; the wire consumer parses it once.
+    #[serde(default)]
+    pub error_causes: Option<String>,
+    /// JSON-encoded bounded metadata, never a second copy of captured payloads.
+    #[serde(default)]
+    pub payload_metadata: Option<String>,
+    #[serde(default)]
+    pub payload_cleared_at: Option<i64>,
+    #[serde(default)]
+    #[sqlx(skip)]
+    pub is_error: bool,
+    #[serde(default = "unknown_performance_value")]
+    #[sqlx(skip)]
+    pub effective_outcome: String,
+    #[serde(default)]
+    #[sqlx(skip)]
+    pub request_result: Option<RequestResult>,
     /// Unix 毫秒时间戳
     pub created_at: i64,
     pub api_key_id: Option<String>,
@@ -644,6 +678,9 @@ pub struct UpdateApiKey {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct LogQuery {
+    pub is_error: Option<bool>,
+    pub outcome: Option<String>,
+    pub client_request_id: Option<String>,
     pub limit: Option<i64>,
     pub offset: Option<i64>,
     pub provider: Option<String>,
@@ -898,6 +935,14 @@ pub struct ProviderUsageDetail {
     pub request_count: i64,
     pub success_count: i64,
     pub error_count: i64,
+    #[serde(default)]
+    pub unknown_count: i64,
+    #[serde(default)]
+    pub cancelled_count: i64,
+    #[serde(default)]
+    pub output_limited_count: i64,
+    #[serde(default)]
+    pub outcome_stats_version: i32,
     pub total_input_tokens: i64,
     pub total_output_tokens: i64,
     pub total_cache_read_tokens: i64,
@@ -931,6 +976,14 @@ pub struct ApiKeyUsageDetail {
     pub request_count: i64,
     pub success_count: i64,
     pub error_count: i64,
+    #[serde(default)]
+    pub unknown_count: i64,
+    #[serde(default)]
+    pub cancelled_count: i64,
+    #[serde(default)]
+    pub output_limited_count: i64,
+    #[serde(default)]
+    pub outcome_stats_version: i32,
     pub total_input_tokens: i64,
     pub total_output_tokens: i64,
     pub total_cache_read_tokens: i64,
@@ -987,6 +1040,14 @@ pub struct ModelUsageDetail {
     pub request_count: i64,
     pub success_count: i64,
     pub error_count: i64,
+    #[serde(default)]
+    pub unknown_count: i64,
+    #[serde(default)]
+    pub cancelled_count: i64,
+    #[serde(default)]
+    pub output_limited_count: i64,
+    #[serde(default)]
+    pub outcome_stats_version: i32,
     pub total_input_tokens: i64,
     pub total_output_tokens: i64,
     pub total_cache_read_tokens: i64,

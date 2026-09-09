@@ -72,7 +72,7 @@
         "runtime": {
           "apiBaseUrl": "https://chatgpt.com/backend-api/codex",
           "modelsUrl": "https://chatgpt.com/backend-api/codex/models",
-          "modelsClientVersion": "0.146.0"
+          "modelsClientVersion": "0.153.4"
         }
       }
     ]
@@ -233,6 +233,33 @@
         },
         "modelsSource": "https://generativelanguage.googleapis.com/v1beta/openai/models",
         "authMode": "apikey"
+      },
+      {
+        "id": "antigravity",
+        "label": {
+          "zh": "Google AI Pro（Antigravity）",
+          "en": "Google AI Pro (Antigravity)"
+        },
+        "baseUrls": {
+          "google-gemini": "https://cloudcode-pa.googleapis.com"
+        },
+        "authMode": "oauth",
+        "oauth": {
+          "authBaseUrl": "https://accounts.google.com",
+          "authorizeUrl": "https://accounts.google.com/o/oauth2/v2/auth",
+          "tokenUrl": "https://oauth2.googleapis.com/token",
+          "clientId": "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com",
+          "redirectUri": "http://localhost:8085/callback",
+          "scope": "https://www.googleapis.com/auth/cloud-platform https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/userinfo.profile https://www.googleapis.com/auth/cclog https://www.googleapis.com/auth/experimentsandconfigs"
+        },
+        "staticModels": [
+          "gemini-2.5-pro",
+          "gemini-2.5-flash",
+          "gemini-2.5-flash-image",
+          "gemini-3-pro-preview",
+          "gemini-3-flash-preview",
+          "gemini-3.1-pro-preview"
+        ]
       }
     ]
   },

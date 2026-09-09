@@ -5,19 +5,8 @@
 
 use crate::logging::LogEntry;
 
-// ── Sensitive header redaction ─────────────────────────────────────────────────
-
-/// Header names whose values are replaced with `"***"` before logging.
-const REDACT_HEADER_KEYS: &[&str] = &[
-    "authorization",
-    "x-api-key",
-    "x-goog-api-key",
-    "openai-api-key",
-    "anthropic-api-key",
-    "cookie",
-    "set-cookie",
-    "proxy-authorization",
-];
+// Header redaction and allocation limits are shared with body capture helpers.
+use crate::logging::payload::{capture_header_map, capture_headers, is_sensitive_url_key};
 
 // ── Log extras ─────────────────────────────────────────────────────────────────
 
@@ -52,73 +41,40 @@ pub struct LogExtras {
 /// Enqueue a `LogEntry` directly. The canonical write path — no handler code
 /// should call `gw.log_tx.try_send` outside of this function.
 pub fn send_log(gw: &crate::Gateway, entry: LogEntry) {
-    let _ = gw.log_tx.try_send(entry);
+    crate::logging::enqueue_log(&gw.log_tx, entry);
 }
 
 // ── headers_to_json ────────────────────────────────────────────────────────────
 
-/// Serialize an axum `HeaderMap` to a flat JSON object string for logging.
-/// Sensitive header values are replaced with `"***"`.
+/// Redacted JSON logging copy capped at 64 KiB before serialization/copying.
+/// Use `logging::payload::capture_headers` to retain omission metadata too.
 pub fn headers_to_json(headers: &axum::http::HeaderMap) -> Option<String> {
-    let mut map = serde_json::Map::with_capacity(headers.len());
-    for (name, value) in headers.iter() {
-        let key = name.as_str().to_ascii_lowercase();
-        let val = if REDACT_HEADER_KEYS.contains(&key.as_str()) {
-            serde_json::Value::String("***".to_string())
-        } else {
-            value
-                .to_str()
-                .map(|s| serde_json::Value::String(s.to_string()))
-                .unwrap_or_else(|_| {
-                    serde_json::Value::String(format!("0x{}", hex_encode(value.as_bytes())))
-                })
-        };
-        map.insert(key, val);
-    }
-    serde_json::to_string(&serde_json::Value::Object(map)).ok()
+    capture_headers(headers).headers
 }
 
-/// Serialize a reqwest `HeaderMap` to a flat JSON object string for logging.
-/// Sensitive header values are replaced with `"***"`.
 pub fn reqwest_headers_to_json(headers: &reqwest::header::HeaderMap) -> Option<String> {
-    let mut map = serde_json::Map::with_capacity(headers.len());
-    for (name, value) in headers.iter() {
-        let key = name.as_str().to_ascii_lowercase();
-        let val = if REDACT_HEADER_KEYS.contains(&key.as_str()) {
-            serde_json::Value::String("***".to_string())
-        } else {
-            value
-                .to_str()
-                .map(|s| serde_json::Value::String(s.to_string()))
-                .unwrap_or_else(|_| {
-                    serde_json::Value::String(format!("0x{}", hex_encode(value.as_bytes())))
-                })
-        };
-        map.insert(key, val);
-    }
-    serde_json::to_string(&serde_json::Value::Object(map)).ok()
+    capture_headers(headers).headers
 }
 
 pub fn header_map_to_redacted_json(
     headers: &std::collections::HashMap<String, String>,
 ) -> Option<String> {
-    let mut map = serde_json::Map::with_capacity(headers.len());
-    for (name, value) in headers {
-        let key = name.to_ascii_lowercase();
-        let val = if REDACT_HEADER_KEYS.contains(&key.as_str()) {
-            serde_json::Value::String("***".to_string())
-        } else {
-            serde_json::Value::String(value.to_string())
-        };
-        map.insert(key, val);
-    }
-    serde_json::to_string(&serde_json::Value::Object(map)).ok()
+    capture_header_map(headers).headers
 }
 
 pub fn redact_url_credentials(url: &str) -> String {
     let Ok(mut parsed) = reqwest::Url::parse(url) else {
-        return url.to_string();
+        // Malformed URLs may still contain userinfo/query credentials. Never
+        // fall back to the raw input when parsing could not prove it safe.
+        return "[redacted invalid URL]".to_string();
     };
+    if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+        return "[redacted invalid URL]".to_string();
+    }
+    // Fragments are not sent on the wire and can contain OAuth access tokens.
+    if parsed.fragment().is_some() {
+        parsed.set_fragment(Some("[redacted]"));
+    }
 
     if !parsed.username().is_empty() {
         let _ = parsed.set_username("***");
@@ -131,10 +87,7 @@ pub fn redact_url_credentials(url: &str) -> String {
     let pairs = parsed
         .query_pairs()
         .map(|(key, value)| {
-            let is_sensitive = matches!(
-                key.to_ascii_lowercase().as_str(),
-                "key" | "api_key" | "apikey" | "access_token" | "token"
-            );
+            let is_sensitive = is_sensitive_url_key(&key);
             if is_sensitive {
                 redacted = true;
                 (key.into_owned(), "***".to_string())
@@ -155,14 +108,6 @@ pub fn redact_url_credentials(url: &str) -> String {
     }
 
     parsed.to_string()
-}
-
-fn hex_encode(bytes: &[u8]) -> String {
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        s.push_str(&format!("{b:02x}"));
-    }
-    s
 }
 
 /// Derive the reasoning-effort label that was actually sent to the upstream

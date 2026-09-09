@@ -68,6 +68,26 @@ use crate::router::health::HealthPermit;
 
 pub(super) type HealthOutcome = crate::conversion::HealthDisposition;
 
+#[derive(Clone, Copy, Default)]
+struct AttemptCount(i32);
+#[derive(Clone)]
+struct PreflightAttempt(crate::performance::Attempt);
+
+pub(crate) fn finish_preflight_response(response: Response, ctx: &RequestContext) -> Response {
+    if response
+        .extensions()
+        .get::<crate::performance::Attempt>()
+        .is_some()
+    {
+        return response;
+    }
+    if let Some(PreflightAttempt(attempt)) = ctx.extensions.get::<PreflightAttempt>() {
+        attempt.select_final(0);
+        return attempt.wrap(response);
+    }
+    response
+}
+
 pub(super) fn health_outcome_from_status(status: u16) -> HealthOutcome {
     if status < 400 {
         HealthOutcome::Success
@@ -172,11 +192,8 @@ fn defer_stream_health(
             Ok(deltas) => update_stream_health_state(&deltas, &mut completed, &mut failed),
             Err(_) => failed = true,
         }
-        if failed {
-            if let Some(p) = &performance {
-                p.fail("failed", "downstream health relay parser error");
-            }
-        }
+        // Health observation remains policy-neutral for diagnostics: parser
+        // uncertainty is not an authoritative conversion failure.
         if let Some(producer) = producer {
             producer.finish();
         }
@@ -285,7 +302,23 @@ async fn run_phase_hooks_slice(
             outcome => {
                 if let Some(attempt) = pctx.req_ctx.extensions.get::<crate::performance::Attempt>()
                 {
-                    attempt.fail("failed", "phase hook did not continue");
+                    match &outcome {
+                        PhaseOutcome::Reject(error) => {
+                            attempt.record_failure("failed", "hook_error", "response_hook", error)
+                        }
+                        PhaseOutcome::ShortCircuit(response)
+                            if response.status().is_client_error()
+                                || response.status().is_server_error() =>
+                        {
+                            attempt.record_message(
+                                "failed",
+                                "hook_rejected",
+                                "response_hook",
+                                "Response hook rejected the request.",
+                            )
+                        }
+                        _ => {}
+                    }
                 }
                 return outcome;
             }
@@ -320,7 +353,7 @@ pub async fn dispatch_pipeline(
     // it after the core pipeline (which owns a clone of `gw`) returns.
     let host = HostContext::new(&gw);
     let mut request = request;
-    let response = dispatch_pipeline_inner(
+    let mut response = dispatch_pipeline_inner(
         gw.clone(),
         headers,
         envelope,
@@ -330,6 +363,24 @@ pub async fn dispatch_pipeline(
         &host,
     )
     .await;
+
+    if response
+        .extensions()
+        .get::<crate::performance::Attempt>()
+        .is_none()
+    {
+        response = GatewayError::correlate_response(response, ingress, &ctx.request_id).await;
+    }
+    response = finish_preflight_response(response, &ctx);
+    // Only the response actually selected for the caller carries a request
+    // result. Earlier retried attempts keep their independent outcomes.
+    if let Some(attempt) = response.extensions().get::<crate::performance::Attempt>() {
+        let count = ctx.extensions.get::<AttemptCount>().unwrap_or_default().0;
+        attempt.select_final(count);
+    }
+    if let Ok(value) = ctx.request_id.parse() {
+        response.headers_mut().insert("x-nyro-request-id", value);
+    }
 
     // ── OnLog phase ────────────────────────────────────────────────────────────
     // Terminal, fire-and-forget: the client response is already materialised, so
@@ -362,7 +413,7 @@ async fn dispatch_pipeline_inner(
     let request_body_str = envelope
         .body
         .as_ref()
-        .and_then(|b| serde_json::to_string(b).ok());
+        .map(|b| Arc::new(crate::logging::payload::capture_json(b, true)));
     let raw_body = envelope.raw_body.clone().or_else(|| {
         envelope
             .body
@@ -371,8 +422,9 @@ async fn dispatch_pipeline_inner(
             .map(Bytes::from)
     });
     let baseline_request = request.clone();
-    let request_headers_str =
-        crate::proxy::observability::header_map_to_redacted_json(&envelope.headers);
+    let request_headers_str = Some(Arc::new(crate::logging::payload::capture_header_map(
+        &envelope.headers,
+    )));
     // Built early so it can be used by both pre-loop log entries and the per-target handlers.
     let req_extras = RequestExtras {
         method: method_owned.clone(),
@@ -415,6 +467,7 @@ async fn dispatch_pipeline_inner(
             LogBuilder::from_dispatch(&gw, &ingress_str, &request_model, None, start)
                 .stream_flag(is_stream)
                 .reasoning_effort(reasoning_effort.clone())
+                .preflight(Some(ctx))
                 .status(404)
                 .with_req_extras(&req_extras)
                 .resp_body(Some(
@@ -442,6 +495,7 @@ async fn dispatch_pipeline_inner(
             LogBuilder::from_dispatch(&gw, &ingress_str, &request_model, None, start)
                 .stream_flag(is_stream)
                 .reasoning_effort(reasoning_effort.clone())
+                .preflight(Some(ctx))
                 .status_i32(status)
                 .with_req_extras(&req_extras)
                 .emit();
@@ -471,6 +525,7 @@ async fn dispatch_pipeline_inner(
                 )
                 .stream_flag(is_stream)
                 .reasoning_effort(reasoning_effort.clone())
+                .preflight(Some(ctx))
                 .status(500)
                 .with_req_extras(&req_extras)
                 .emit();
@@ -497,6 +552,7 @@ async fn dispatch_pipeline_inner(
             )
             .stream_flag(is_stream)
             .reasoning_effort(reasoning_effort.clone())
+            .preflight(Some(ctx))
             .status_i32(status)
             .with_req_extras(&req_extras)
             .emit();
@@ -517,6 +573,7 @@ async fn dispatch_pipeline_inner(
         )
         .stream_flag(is_stream)
         .reasoning_effort(reasoning_effort.clone())
+        .preflight(Some(ctx))
         .status(503)
         .with_req_extras(&req_extras)
         .emit();
@@ -548,6 +605,7 @@ async fn dispatch_pipeline_inner(
         )
         .stream_flag(is_stream)
         .reasoning_effort(reasoning_effort.clone())
+        .preflight(Some(ctx))
         .status(503)
         .with_req_extras(&req_extras)
         .emit();
@@ -1033,6 +1091,9 @@ async fn dispatch_pipeline_inner(
             ctx.cancellation.clone(),
             ctx.deadline.clone(),
         );
+        let attempt_index = ctx.extensions.get::<AttemptCount>().unwrap_or_default().0 + 1;
+        ctx.extensions.insert(AttemptCount(attempt_index));
+        performance.correlate(&ctx.request_id, attempt_index);
         let attempt_producer = performance.producer();
         ctx.extensions.insert(performance.clone());
         let client = client.with_performance(performance.clone());
@@ -1157,6 +1218,8 @@ async fn dispatch_pipeline_inner(
         } else {
             response
         };
+        // Correlate only gateway-generated errors, before capture/delivery observation.
+        let response = GatewayError::correlate_response(response, ingress, &ctx.request_id).await;
         // Observe actual consumer EOS outside the health relay (enqueue is not delivery).
         let response = performance.wrap(response);
         attempt_producer.finish();
@@ -1191,6 +1254,7 @@ async fn dispatch_pipeline_inner(
         )
         .stream_flag(is_stream)
         .reasoning_effort(reasoning_effort.clone())
+        .preflight(Some(ctx))
         .route_decision(Some(route_decision.to_json()))
         .status(503)
         .with_req_extras(&req_extras)
@@ -1211,6 +1275,7 @@ async fn dispatch_pipeline_inner(
         )
         .stream_flag(is_stream)
         .reasoning_effort(reasoning_effort.clone())
+        .preflight(Some(ctx))
         .route_decision(Some(route_decision.to_json()))
         .status(502)
         .with_req_extras(&req_extras)
@@ -1243,7 +1308,7 @@ pub async fn dispatch(
     let decoder = ingress.handler().make_request_decoder();
     let request = match decoder.decode_request(body) {
         Ok(r) => r,
-        Err(e) => return log_decode_error(&gw, &envelope, ingress, e),
+        Err(e) => return log_decode_error(&gw, &envelope, ingress, e, Some(ctx)),
     };
 
     dispatch_pipeline(gw, headers, envelope, request, ingress, ctx.clone()).await
@@ -1291,8 +1356,8 @@ struct CallCtx<'a> {
 struct RequestExtras {
     method: String,
     path: String,
-    headers: Option<String>,
-    body: Option<String>,
+    headers: Option<Arc<crate::logging::payload::CapturedHeaders>>,
+    body: Option<Arc<crate::logging::payload::CapturedPayload>>,
 }
 
 // ── Log builder ───────────────────────────────────────────────────────────────
@@ -1307,6 +1372,8 @@ struct RequestExtras {
 #[derive(Clone)]
 struct LogBuilder {
     performance: Option<crate::performance::Attempt>,
+    diagnostic: crate::logging::diagnostics::LogDiagnostic,
+    request_capture: Option<Arc<crate::logging::payload::CapturedPayload>>,
     producer: Option<Arc<crate::performance::ProducerGuard>>,
     gw: Gateway,
     client_protocol: String,
@@ -1343,6 +1410,12 @@ impl LogBuilder {
     fn from_ctx(call_ctx: &CallCtx<'_>) -> Self {
         Self {
             performance: call_ctx.performance.clone(),
+            diagnostic: call_ctx
+                .performance
+                .as_ref()
+                .map(|p| p.diagnostic())
+                .unwrap_or_default(),
+            request_capture: None,
             producer: call_ctx.performance.as_ref().map(|p| p.producer()),
             gw: call_ctx.gw.clone(),
             client_protocol: call_ctx.ingress_str.to_string(),
@@ -1380,6 +1453,8 @@ impl LogBuilder {
     ) -> Self {
         Self {
             performance: None,
+            diagnostic: Default::default(),
+            request_capture: None,
             producer: None,
             gw: gw.clone(),
             client_protocol: ingress.to_string(),
@@ -1403,6 +1478,31 @@ impl LogBuilder {
             extras: LogExtras::default(),
             ext: None,
         }
+    }
+
+    fn preflight(mut self, ctx: Option<&RequestContext>) -> Self {
+        if let Some(ctx) = ctx {
+            self.diagnostic.client_request_id = Some(ctx.request_id.clone());
+            self.diagnostic.attempt_index = Some(0);
+            let attempt = crate::performance::Attempt::new(
+                self.gw.log_tx.clone(),
+                ctx.cancellation.clone(),
+                ctx.deadline.clone(),
+            );
+            attempt.correlate(&ctx.request_id, 0);
+            attempt.expect_delivery();
+            ctx.extensions.insert(PreflightAttempt(attempt.clone()));
+            self.producer = Some(attempt.producer());
+            self.performance = Some(attempt);
+        }
+        self
+    }
+
+    fn failure(self, kind: &str, stage: &str, error: &(dyn std::error::Error + 'static)) -> Self {
+        if let Some(attempt) = &self.performance {
+            attempt.record_failure("failed", kind, stage, error);
+        }
+        self
     }
 
     fn stream_flag(mut self, v: bool) -> Self {
@@ -1456,8 +1556,14 @@ impl LogBuilder {
     fn with_req_extras(mut self, req: &RequestExtras) -> Self {
         self.extras.method = Some(req.method.clone());
         self.extras.path = Some(req.path.clone());
-        self.extras.client_request_headers = req.headers.clone();
-        self.extras.client_request_body = req.body.clone();
+        self.extras.client_request_headers = req.headers.as_ref().and_then(|h| h.headers.clone());
+        if let Some(headers) = &req.headers {
+            self.diagnostic.payload_metadata["client_request_headers"] = headers.metadata.clone();
+        }
+        self.request_capture = req.body.clone();
+        if let Some(capture) = &req.body {
+            self.diagnostic.payload_metadata["client_request_body"] = capture.metadata.clone();
+        }
         self
     }
 
@@ -1576,7 +1682,17 @@ impl LogBuilder {
                 .latency_registry
                 .record(&self.provider_id, &backend_model, ttft_ms);
         }
+        let mut diagnostic = self.diagnostic;
+        if self.performance.is_none() && (400..600).contains(&self.client_status_code) {
+            diagnostic.record_message(
+                "failed",
+                "http_error",
+                "preflight",
+                "Request rejected before upstream dispatch.",
+            );
+        }
         let entry = LogEntry {
+            diagnostic,
             performance: Default::default(),
             api_key_id: self.api_key_id,
             route_decision: self.route_decision,
@@ -1595,7 +1711,11 @@ impl LogBuilder {
             method: self.extras.method,
             path: self.extras.path,
             client_request_headers: self.extras.client_request_headers,
-            client_request_body: self.extras.client_request_body,
+            client_request_body: self
+                .request_capture
+                .as_ref()
+                .and_then(|p| p.body.clone())
+                .or(self.extras.client_request_body),
             client_response_headers: self.extras.client_response_headers,
             client_response_body: self.extras.client_response_body,
             upstream_request_headers: self.extras.upstream_request_headers,
@@ -1621,6 +1741,24 @@ impl LogBuilder {
             producer.finish();
         }
         drop(self.producer);
+    }
+}
+
+/// Logging-only stream statistics must not accumulate generated text/tools.
+#[derive(Default)]
+struct LogUsageAccumulator(Usage);
+impl LogUsageAccumulator {
+    fn apply_all(&mut self, deltas: &[crate::protocol::ir::AiStreamDelta]) {
+        for delta in deltas {
+            if let crate::protocol::ir::AiStreamDelta::Usage(usage) = delta {
+                self.0.merge_partial(usage);
+            }
+        }
+    }
+    fn into_ai_response(self) -> AiResponse {
+        let mut response = AiResponse::new("", "");
+        response.usage = self.0;
+        response
     }
 }
 
@@ -1755,13 +1893,16 @@ pub(crate) fn log_decode_error(
     envelope: &RawEnvelope,
     ingress: ProtocolId,
     err: impl std::fmt::Display,
+    ctx: Option<&RequestContext>,
 ) -> Response {
     let msg = format!("invalid request: {err}");
     let request_body_str = envelope
         .body
         .as_ref()
-        .and_then(|b| serde_json::to_string(b).ok());
-    let request_headers_str = serde_json::to_string(&envelope.headers).ok();
+        .map(|b| Arc::new(crate::logging::payload::capture_json(b, true)));
+    let request_headers_str = Some(Arc::new(crate::logging::payload::capture_header_map(
+        &envelope.headers,
+    )));
     let ingress_str = ingress.to_string();
     // The decoder never ran, so `request.stream.enabled` is unavailable; sniff
     // the raw body so the log's `Stream` line reflects what the client asked.
@@ -1772,6 +1913,7 @@ pub(crate) fn log_decode_error(
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
     LogBuilder::from_dispatch(gw, &ingress_str, "", None, Instant::now())
+        .preflight(ctx)
         .status(400)
         .stream_flag(is_stream)
         .with_req_extras(&RequestExtras {
@@ -1829,6 +1971,7 @@ pub(crate) fn log_intake_rejection(
     body_prefix: &[u8],
     status: axum::http::StatusCode,
     rejection_text: &str,
+    ctx: Option<&RequestContext>,
 ) {
     let ingress_str = ingress_from_path(path).to_string();
     let shown = body_prefix
@@ -1842,17 +1985,53 @@ pub(crate) fn log_intake_rejection(
         ));
     }
     LogBuilder::from_dispatch(gw, &ingress_str, "", None, Instant::now())
+        .preflight(ctx)
         .status(status.as_u16())
         .with_req_extras(&RequestExtras {
             method: method.to_string(),
             path: path.to_string(),
-            headers: crate::proxy::observability::headers_to_json(headers),
-            body: Some(body_str),
+            headers: Some(Arc::new(crate::logging::payload::capture_headers(headers))),
+            body: Some(Arc::new(crate::logging::payload::capture_bytes(
+                body_str.as_bytes(),
+                true,
+            ))),
         })
         .resp_body(Some(
             serde_json::json!({ "error": { "message": rejection_text } }).to_string(),
         ))
         .emit();
+}
+
+/// Public stream failures never contain upstream URLs, bodies or source chains.
+fn stream_error_event(ingress: ProtocolId, request_id: &str, kind: &str) -> String {
+    use crate::protocol::ids::*;
+    let message = if kind == "timeout" {
+        "The upstream response timed out."
+    } else {
+        "The upstream response could not be completed."
+    };
+    let error = serde_json::json!({"type": kind, "failure_kind": kind, "code": 502, "message": message, "request_id": request_id});
+    if ingress == GOOGLE_GEMINI_GENERATE_CONTENT_V1BETA {
+        format!(
+            "data: {}\n\n",
+            serde_json::json!({"error":{"code":502,"status":"UNAVAILABLE","message":format!("{message} Request ID: {request_id}"),"details":[{"failure_kind":kind,"request_id":request_id}]}})
+        )
+    } else if ingress == ANTHROPIC_MESSAGES_2023_06_01 {
+        format!(
+            "event: error\ndata: {}\n\n",
+            serde_json::json!({"type":"error","error":error,"request_id":request_id})
+        )
+    } else if ingress == OPENAI_RESPONSES_V1 {
+        format!(
+            "event: error\ndata: {}\n\n",
+            serde_json::json!({"type":"error","error":error,"request_id":request_id})
+        )
+    } else {
+        format!(
+            "data: {}\n\n",
+            serde_json::json!({"error":error,"request_id":request_id})
+        )
+    }
 }
 
 pub(crate) fn error_response(status: u16, message: &str) -> Response {
@@ -2031,6 +2210,9 @@ mod tests {
         .await;
 
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
         let entry = tokio::time::timeout(std::time::Duration::from_secs(1), log_rx.recv())
             .await
             .expect("log entry should be emitted")
@@ -2221,6 +2403,9 @@ mod tests {
         .await;
 
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
         let entry = tokio::time::timeout(std::time::Duration::from_secs(1), log_rx.recv())
             .await
             .expect("log entry should be emitted")
@@ -2604,6 +2789,9 @@ mod tests {
         .await;
 
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
         let entry = tokio::time::timeout(std::time::Duration::from_secs(1), log_rx.recv())
             .await
             .expect("log entry should be emitted")
@@ -2647,6 +2835,9 @@ mod tests {
         .await;
 
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
         let entry = tokio::time::timeout(std::time::Duration::from_secs(1), log_rx.recv())
             .await
             .expect("log entry should be emitted")

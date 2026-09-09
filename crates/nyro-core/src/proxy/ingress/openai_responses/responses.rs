@@ -32,7 +32,7 @@ pub async fn handler(
     let decoder = OPENAI_RESPONSES_V1.handler().make_request_decoder();
     let request = match decoder.decode_request(body) {
         Ok(r) => r,
-        Err(e) => return log_decode_error(&gw, &envelope, OPENAI_RESPONSES_V1, e),
+        Err(e) => return log_decode_error(&gw, &envelope, OPENAI_RESPONSES_V1, e, Some(&ctx)),
     };
     dispatch_pipeline(gw, headers, envelope, request, OPENAI_RESPONSES_V1, ctx.0).await
 }

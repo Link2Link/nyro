@@ -449,6 +449,22 @@ pub async fn delete_api_key(gw: State<'_, Gateway>, id: String) -> Result<(), St
 // ── Logs ──
 
 #[tauri::command]
+pub fn get_logging_status() -> nyro_core::logging::LoggingStatus {
+    nyro_core::logging::logging_status()
+}
+
+#[tauri::command]
+pub async fn get_request_log_attempts(
+    gw: State<'_, Gateway>,
+    request_id: String,
+) -> Result<nyro_core::admin::RequestLogAttempts, String> {
+    gw.admin()
+        .get_request_log_attempts(&request_id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 pub async fn query_logs(gw: State<'_, Gateway>, query: LogQuery) -> Result<LogPage, String> {
     gw.admin()
         .query_logs(query)

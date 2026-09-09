@@ -71,8 +71,49 @@ export interface ApiKey {
   model_ids: string[];
 }
 
+export type AttemptOutcome = "completed" | "failed" | "timed_out" | "cancelled" | "output_limited" | "unknown";
+export type EffectiveOutcome = "error" | "completed" | "cancelled" | "output_limited" | "unknown";
+
+export interface RequestResult {
+  client_request_id: string;
+  final_outcome: string;
+  final_attempt_id: string | null;
+  attempt_count: number;
+  finished_at: number;
+}
+
+export interface RequestLogAttempts {
+  client_request_id: string;
+  result: RequestResult | null;
+  attempts: RequestLog[];
+}
+
+export interface LoggingStatus {
+  queue_full_dropped: number;
+  channel_closed_dropped: number;
+  database_write_dropped: number;
+  counts_reset_on_restart: true;
+}
+
 export interface RequestLog {
+  /** Unique upstream attempt log UUID, not the client request ID. */
   id: string;
+  client_request_id?: string | null;
+  attempt_index?: number | null;
+  outcome_version: number;
+  attempt_outcome: AttemptOutcome;
+  failure_kind?: string | null;
+  failure_stage?: string | null;
+  error_message?: string | null;
+  /** JSON-encoded string array. Display as text, never HTML. */
+  error_causes?: string | null;
+  /** JSON map keyed by the exact body/header field names below. */
+  payload_metadata?: string | null;
+  payload_cleared_at?: number | null;
+  /** Core-derived authority: do not reconstruct from HTTP or stream heuristics. */
+  is_error: boolean;
+  effective_outcome: EffectiveOutcome;
+  request_result?: RequestResult | null;
   /** Unix 毫秒时间戳 */
   created_at: number;
   api_key_id?: string;
@@ -227,8 +268,13 @@ export interface ProviderUsageDetail {
   provider_icon?: string | null;
   provider_protocol?: string | null;
   request_count: number;
+  /** Confirmed authoritative completed attempts, never inferred from HTTP 2xx. */
   success_count: number;
   error_count: number;
+  unknown_count: number;
+  cancelled_count: number;
+  output_limited_count: number;
+  outcome_stats_version: number;
   total_input_tokens: number;
   total_output_tokens: number;
   total_cache_read_tokens: number;
@@ -271,8 +317,13 @@ export interface ApiKeyUsageDetail {
   api_key_id: string;
   api_key_name: string;
   request_count: number;
+  /** Confirmed authoritative completed attempts, never inferred from HTTP 2xx. */
   success_count: number;
   error_count: number;
+  unknown_count: number;
+  cancelled_count: number;
+  output_limited_count: number;
+  outcome_stats_version: number;
   total_input_tokens: number;
   total_output_tokens: number;
   total_cache_read_tokens: number;
@@ -325,8 +376,13 @@ export interface ModelUsageDetail {
   end_at: number;
   upstream_model: string;
   request_count: number;
+  /** Confirmed authoritative completed attempts, never inferred from HTTP 2xx. */
   success_count: number;
   error_count: number;
+  unknown_count: number;
+  cancelled_count: number;
+  output_limited_count: number;
+  outcome_stats_version: number;
   total_input_tokens: number;
   total_output_tokens: number;
   total_cache_read_tokens: number;
@@ -614,6 +670,10 @@ export interface UpdateApiKey {
 }
 
 export interface LogQuery {
+  /** Combined with raw HTTP filters using AND by the backend. */
+  is_error?: boolean;
+  outcome?: EffectiveOutcome;
+  client_request_id?: string;
   limit?: number;
   offset?: number;
   provider?: string;

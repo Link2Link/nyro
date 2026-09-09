@@ -24,6 +24,7 @@ use crate::db::models::{
     is_valid_provider_auth_mode,
 };
 use crate::logging::LogEntry;
+use crate::logging::diagnostics::{RequestResult, error_sql, outcome_sql};
 use crate::storage::traits::{
     ApiKeyAccessRecord, ApiKeyStore, AuthAccessStore, LogStore, ModelBackendStore,
     ModelSnapshotStore, ModelStore, OAuthCredentialStore, ProviderEndpointTestResult,
@@ -1153,8 +1154,9 @@ impl LogStore for SqliteLogStore {
         )
     }
     async fn append_batch(&self, entries: Vec<LogEntry>) -> anyhow::Result<()> {
+        let mut tx = self.pool.begin().await?;
         for entry in entries {
-            let id = uuid::Uuid::new_v4().to_string();
+            let id = &entry.diagnostic.log_id;
             sqlx::query(
                 r#"INSERT INTO request_logs
                     (id, created_at, api_key_id, api_key_name,
@@ -1169,8 +1171,9 @@ impl LogStore for SqliteLogStore {
                      latency_total_ms, latency_upstream_ms,
                      input_tokens, output_tokens, cache_read_tokens,
                      is_stream, stream_chunks_count, stream_first_chunk_ms,
-                     performance_metadata_version, upstream_effort_status, upstream_effort_raw, upstream_effort_tier, request_completion, completion_reason, upstream_response_mode, performance_upstream_ms, performance_first_chunk_ms, performance_completed_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+                     performance_metadata_version, upstream_effort_status, upstream_effort_raw, upstream_effort_tier, request_completion, completion_reason, upstream_response_mode, performance_upstream_ms, performance_first_chunk_ms, performance_completed_at,
+                     client_request_id, attempt_index, outcome_version, attempt_outcome, failure_kind, failure_stage, error_message, error_causes_json, payload_metadata_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
             )
             .bind(&id)
             .bind(entry.created_at)
@@ -1217,9 +1220,28 @@ impl LogStore for SqliteLogStore {
             .bind(entry.performance.upstream_duration_ms)
             .bind(entry.performance.first_chunk_ms)
             .bind(entry.performance.completed_at)
-            .execute(&self.pool)
+            .bind(&entry.diagnostic.client_request_id)
+            .bind(entry.diagnostic.attempt_index)
+            .bind(entry.diagnostic.outcome_version)
+            .bind(&entry.diagnostic.attempt_outcome)
+            .bind(&entry.diagnostic.failure_kind)
+            .bind(&entry.diagnostic.failure_stage)
+            .bind(&entry.diagnostic.error_message)
+            .bind(serde_json::to_string(&entry.diagnostic.error_causes)?)
+            .bind(serde_json::to_string(&entry.diagnostic.payload_metadata)?)
+            .execute(&mut *tx)
             .await?;
+            if let Some(result) = &entry.diagnostic.final_result {
+                sqlx::query("INSERT INTO request_results (client_request_id, final_outcome, final_attempt_id, attempt_count, finished_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(client_request_id) DO UPDATE SET final_outcome = excluded.final_outcome, final_attempt_id = excluded.final_attempt_id, attempt_count = excluded.attempt_count, finished_at = excluded.finished_at")
+                    .bind(&result.client_request_id)
+                    .bind(&result.final_outcome)
+                    .bind(&result.final_attempt_id)
+                    .bind(result.attempt_count)
+                    .bind(result.finished_at)
+                    .execute(&mut *tx).await?;
+            }
         }
+        tx.commit().await?;
         Ok(())
     }
 
@@ -1238,10 +1260,39 @@ impl LogStore for SqliteLogStore {
              CAST(latency_total_ms AS INTEGER) AS latency_total_ms, latency_upstream_ms, \
              input_tokens, output_tokens, COALESCE(cache_read_tokens, 0) AS cache_read_tokens, \
              COALESCE(is_stream, 0) AS is_stream, stream_chunks_count, stream_first_chunk_ms, \
-             performance_metadata_version, upstream_effort_status, upstream_effort_raw, upstream_effort_tier, request_completion, completion_reason, upstream_response_mode, performance_upstream_ms, performance_first_chunk_ms, performance_completed_at \
+             performance_metadata_version, upstream_effort_status, upstream_effort_raw, upstream_effort_tier, request_completion, completion_reason, upstream_response_mode, performance_upstream_ms, performance_first_chunk_ms, performance_completed_at, \
+             client_request_id, attempt_index, outcome_version, attempt_outcome, failure_kind, failure_stage, error_message, \
+             error_causes_json AS error_causes, payload_metadata_json AS payload_metadata, payload_cleared_at \
              FROM request_logs WHERE 1=1",
         );
         let mut bind_values: Vec<String> = Vec::new();
+        if let Some(is_error) = query.is_error {
+            let predicate = error_sql("");
+            let filter = if is_error {
+                format!(" AND {predicate}")
+            } else {
+                format!(" AND NOT {predicate}")
+            };
+            count_sql.push_str(&filter);
+            data_sql.push_str(&filter);
+        }
+        if let Some(outcome) = query.outcome.as_deref() {
+            anyhow::ensure!(
+                matches!(
+                    outcome,
+                    "error" | "completed" | "cancelled" | "output_limited" | "unknown"
+                ),
+                "invalid log outcome"
+            );
+            let filter = format!(" AND {}", outcome_sql("", outcome));
+            count_sql.push_str(&filter);
+            data_sql.push_str(&filter);
+        }
+        if let Some(client_request_id) = query.client_request_id {
+            count_sql.push_str(" AND client_request_id = ?");
+            data_sql.push_str(" AND client_request_id = ?");
+            bind_values.push(client_request_id);
+        }
         if let Some(provider) = query.provider.filter(|v| !v.is_empty()) {
             count_sql.push_str(" AND provider_id = ?");
             data_sql.push_str(" AND provider_id = ?");
@@ -1316,7 +1367,9 @@ impl LogStore for SqliteLogStore {
              CAST(latency_total_ms AS INTEGER) AS latency_total_ms, latency_upstream_ms, \
              input_tokens, output_tokens, COALESCE(cache_read_tokens, 0) AS cache_read_tokens, \
              COALESCE(is_stream, 0) AS is_stream, stream_chunks_count, stream_first_chunk_ms, \
-             performance_metadata_version, upstream_effort_status, upstream_effort_raw, upstream_effort_tier, request_completion, completion_reason, upstream_response_mode, performance_upstream_ms, performance_first_chunk_ms, performance_completed_at \
+             performance_metadata_version, upstream_effort_status, upstream_effort_raw, upstream_effort_tier, request_completion, completion_reason, upstream_response_mode, performance_upstream_ms, performance_first_chunk_ms, performance_completed_at, \
+             client_request_id, attempt_index, outcome_version, attempt_outcome, failure_kind, failure_stage, error_message, \
+             error_causes_json AS error_causes, payload_metadata_json AS payload_metadata, payload_cleared_at \
              FROM request_logs WHERE id = ?",
         )
         .bind(id)
@@ -1325,21 +1378,38 @@ impl LogStore for SqliteLogStore {
         Ok(row)
     }
 
+    async fn request_result(
+        &self,
+        client_request_id: &str,
+    ) -> anyhow::Result<Option<RequestResult>> {
+        Ok(sqlx::query_as::<_, RequestResult>("SELECT client_request_id, final_outcome, final_attempt_id, attempt_count, finished_at FROM request_results WHERE client_request_id = ?")
+            .bind(client_request_id).fetch_optional(&self.pool).await?)
+    }
+
     async fn cleanup_before(&self, cutoff_expression: &str) -> anyhow::Result<u64> {
+        let mut tx = self.pool.begin().await?;
         // created_at is Unix milliseconds; convert cutoff to ms via strftime.
         let result = sqlx::query(
             "DELETE FROM request_logs WHERE created_at < CAST(strftime('%s', 'now', ?) AS INTEGER) * 1000"
         )
             .bind(cutoff_expression)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
+        sqlx::query("DELETE FROM request_results WHERE NOT EXISTS (SELECT 1 FROM request_logs WHERE request_logs.client_request_id = request_results.client_request_id)")
+            .execute(&mut *tx).await?;
+        tx.commit().await?;
         Ok(result.rows_affected())
     }
 
     async fn clear_all(&self) -> anyhow::Result<u64> {
+        let mut tx = self.pool.begin().await?;
         let result = sqlx::query("DELETE FROM request_logs")
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
+        sqlx::query("DELETE FROM request_results")
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
         Ok(result.rows_affected())
     }
 
@@ -1349,45 +1419,53 @@ impl LogStore for SqliteLogStore {
              client_request_headers = NULL, client_request_body = NULL, \
              client_response_headers = NULL, client_response_body = NULL, \
              upstream_request_headers = NULL, upstream_request_body = NULL, \
-             upstream_response_headers = NULL, upstream_response_body = NULL \
+             upstream_response_headers = NULL, upstream_response_body = NULL, payload_cleared_at = ? \
              WHERE (client_request_headers IS NOT NULL OR client_request_body IS NOT NULL \
                 OR client_response_headers IS NOT NULL OR client_response_body IS NOT NULL \
                 OR upstream_request_headers IS NOT NULL OR upstream_request_body IS NOT NULL \
-                OR upstream_response_headers IS NOT NULL OR upstream_response_body IS NOT NULL) \
-               AND (client_status_code IS NULL OR client_status_code < 400 OR client_status_code > 599) \
-               AND (upstream_status_code IS NULL OR upstream_status_code < 400 OR upstream_status_code > 599)",
+                OR upstream_response_headers IS NOT NULL OR upstream_response_body IS NOT NULL)",
         )
+        .bind(chrono::Utc::now().timestamp_millis())
         .execute(&self.pool)
         .await?;
         Ok(result.rows_affected())
     }
 
     async fn delete_by_id(&self, id: &str) -> anyhow::Result<u64> {
+        let mut tx = self.pool.begin().await?;
         let result = sqlx::query("DELETE FROM request_logs WHERE id = ?")
             .bind(id)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
+        sqlx::query("DELETE FROM request_results WHERE NOT EXISTS (SELECT 1 FROM request_logs WHERE request_logs.client_request_id = request_results.client_request_id)")
+            .execute(&mut *tx).await?;
+        tx.commit().await?;
         Ok(result.rows_affected())
     }
 
     async fn clear_errors(&self) -> anyhow::Result<u64> {
-        let result = sqlx::query("DELETE FROM request_logs WHERE client_status_code >= 400")
-            .execute(&self.pool)
+        let mut tx = self.pool.begin().await?;
+        let result = sqlx::query(&format!("DELETE FROM request_logs WHERE {}", error_sql("")))
+            .execute(&mut *tx)
             .await?;
+        sqlx::query("DELETE FROM request_results WHERE NOT EXISTS (SELECT 1 FROM request_logs WHERE request_logs.client_request_id = request_results.client_request_id)")
+            .execute(&mut *tx).await?;
+        tx.commit().await?;
         Ok(result.rows_affected())
     }
 
     async fn stats_overview(&self, hours: Option<i64>) -> anyhow::Result<StatsOverview> {
+        let error = error_sql("");
         if let Some(hours) = hours {
             Ok(sqlx::query_as::<_, StatsOverview>(
-                "SELECT COUNT(*) AS total_requests, COALESCE(SUM(input_tokens), 0) AS total_input_tokens, COALESCE(SUM(output_tokens), 0) AS total_output_tokens, COALESCE(SUM(cache_read_tokens), 0) AS total_cache_read_tokens, COALESCE(AVG(latency_total_ms), 0.0) AS avg_duration_ms, COALESCE(SUM(CASE WHEN client_status_code >= 400 THEN 1 ELSE 0 END), 0) AS error_count FROM request_logs WHERE created_at >= CAST(strftime('%s', 'now', ?) AS INTEGER) * 1000",
+                &format!("SELECT COUNT(*) AS total_requests, COALESCE(SUM(input_tokens), 0) AS total_input_tokens, COALESCE(SUM(output_tokens), 0) AS total_output_tokens, COALESCE(SUM(cache_read_tokens), 0) AS total_cache_read_tokens, COALESCE(AVG(latency_total_ms), 0.0) AS avg_duration_ms, COALESCE(SUM(CASE WHEN {error} THEN 1 ELSE 0 END), 0) AS error_count FROM request_logs WHERE created_at >= CAST(strftime('%s', 'now', ?) AS INTEGER) * 1000"),
             )
             .bind(format!("-{hours} hours"))
             .fetch_one(&self.pool)
             .await?)
         } else {
             Ok(sqlx::query_as::<_, StatsOverview>(
-                "SELECT COUNT(*) AS total_requests, COALESCE(SUM(input_tokens), 0) AS total_input_tokens, COALESCE(SUM(output_tokens), 0) AS total_output_tokens, COALESCE(SUM(cache_read_tokens), 0) AS total_cache_read_tokens, COALESCE(AVG(latency_total_ms), 0.0) AS avg_duration_ms, COALESCE(SUM(CASE WHEN client_status_code >= 400 THEN 1 ELSE 0 END), 0) AS error_count FROM request_logs",
+                &format!("SELECT COUNT(*) AS total_requests, COALESCE(SUM(input_tokens), 0) AS total_input_tokens, COALESCE(SUM(output_tokens), 0) AS total_output_tokens, COALESCE(SUM(cache_read_tokens), 0) AS total_cache_read_tokens, COALESCE(AVG(latency_total_ms), 0.0) AS avg_duration_ms, COALESCE(SUM(CASE WHEN {error} THEN 1 ELSE 0 END), 0) AS error_count FROM request_logs"),
             )
             .fetch_one(&self.pool)
             .await?)
@@ -1395,8 +1473,9 @@ impl LogStore for SqliteLogStore {
     }
 
     async fn stats_hourly(&self, hours: i64) -> anyhow::Result<Vec<StatsHourly>> {
+        let error = error_sql("");
         Ok(sqlx::query_as::<_, StatsHourly>(
-            "SELECT strftime('%Y-%m-%d %H:00:00', datetime(created_at/1000, 'unixepoch')) AS hour, COUNT(*) AS request_count, COALESCE(SUM(CASE WHEN client_status_code >= 400 THEN 1 ELSE 0 END), 0) AS error_count, COALESCE(SUM(input_tokens), 0) AS total_input_tokens, COALESCE(SUM(output_tokens), 0) AS total_output_tokens, COALESCE(SUM(cache_read_tokens), 0) AS total_cache_read_tokens, COALESCE(AVG(latency_total_ms), 0.0) AS avg_duration_ms FROM request_logs WHERE created_at >= CAST(strftime('%s', 'now', ?) AS INTEGER) * 1000 GROUP BY hour ORDER BY hour ASC",
+            &format!("SELECT strftime('%Y-%m-%d %H:00:00', datetime(created_at/1000, 'unixepoch')) AS hour, COUNT(*) AS request_count, COALESCE(SUM(CASE WHEN {error} THEN 1 ELSE 0 END), 0) AS error_count, COALESCE(SUM(input_tokens), 0) AS total_input_tokens, COALESCE(SUM(output_tokens), 0) AS total_output_tokens, COALESCE(SUM(cache_read_tokens), 0) AS total_cache_read_tokens, COALESCE(AVG(latency_total_ms), 0.0) AS avg_duration_ms FROM request_logs WHERE created_at >= CAST(strftime('%s', 'now', ?) AS INTEGER) * 1000 GROUP BY hour ORDER BY hour ASC"),
         )
         .bind(format!("-{hours} hours"))
         .fetch_all(&self.pool)
@@ -1411,8 +1490,9 @@ impl LogStore for SqliteLogStore {
         upstream_model: Option<&str>,
     ) -> anyhow::Result<Vec<StatsTimeBucket>> {
         anyhow::ensure!(bucket_ms > 0, "stats bucket must be positive");
+        let error = error_sql("");
         Ok(sqlx::query_as::<_, StatsTimeBucket>(
-            "SELECT (created_at / ?) * ? AS bucket_start, COUNT(*) AS request_count, COALESCE(SUM(CASE WHEN client_status_code >= 400 THEN 1 ELSE 0 END), 0) AS error_count, COALESCE(SUM(input_tokens), 0) AS total_input_tokens, COALESCE(SUM(output_tokens), 0) AS total_output_tokens, COALESCE(SUM(cache_read_tokens), 0) AS total_cache_read_tokens, AVG(latency_total_ms) AS avg_duration_ms FROM request_logs WHERE created_at >= ? AND created_at <= ? AND (? IS NULL OR upstream_model = ?) GROUP BY bucket_start ORDER BY bucket_start ASC",
+            &format!("SELECT (created_at / ?) * ? AS bucket_start, COUNT(*) AS request_count, COALESCE(SUM(CASE WHEN {error} THEN 1 ELSE 0 END), 0) AS error_count, COALESCE(SUM(input_tokens), 0) AS total_input_tokens, COALESCE(SUM(output_tokens), 0) AS total_output_tokens, COALESCE(SUM(cache_read_tokens), 0) AS total_cache_read_tokens, AVG(latency_total_ms) AS avg_duration_ms FROM request_logs WHERE created_at >= ? AND created_at <= ? AND (? IS NULL OR upstream_model = ?) GROUP BY bucket_start ORDER BY bucket_start ASC"),
         )
         .bind(bucket_ms)
         .bind(bucket_ms)
@@ -1432,8 +1512,9 @@ impl LogStore for SqliteLogStore {
         bucket_ms: i64,
     ) -> anyhow::Result<Vec<ModelTimeBucket>> {
         anyhow::ensure!(bucket_ms > 0, "stats bucket must be positive");
+        let error = error_sql("");
         Ok(sqlx::query_as::<_, ModelTimeBucket>(
-            "SELECT COALESCE(upstream_model, '') AS upstream_model, (created_at / ?) * ? AS bucket_start, COUNT(*) AS request_count, COALESCE(SUM(CASE WHEN client_status_code >= 400 THEN 1 ELSE 0 END), 0) AS error_count, COALESCE(SUM(input_tokens), 0) AS total_input_tokens, COALESCE(SUM(output_tokens), 0) AS total_output_tokens, COALESCE(SUM(cache_read_tokens), 0) AS total_cache_read_tokens, AVG(latency_total_ms) AS avg_duration_ms FROM request_logs WHERE api_key_id = ? AND created_at >= ? AND created_at <= ? GROUP BY upstream_model, bucket_start ORDER BY upstream_model ASC, bucket_start ASC",
+            &format!("SELECT COALESCE(upstream_model, '') AS upstream_model, (created_at / ?) * ? AS bucket_start, COUNT(*) AS request_count, COALESCE(SUM(CASE WHEN {error} THEN 1 ELSE 0 END), 0) AS error_count, COALESCE(SUM(input_tokens), 0) AS total_input_tokens, COALESCE(SUM(output_tokens), 0) AS total_output_tokens, COALESCE(SUM(cache_read_tokens), 0) AS total_cache_read_tokens, AVG(latency_total_ms) AS avg_duration_ms FROM request_logs WHERE api_key_id = ? AND created_at >= ? AND created_at <= ? GROUP BY upstream_model, bucket_start ORDER BY upstream_model ASC, bucket_start ASC"),
         )
         .bind(bucket_ms)
         .bind(bucket_ms)
@@ -1493,8 +1574,9 @@ impl LogStore for SqliteLogStore {
 
     async fn stats_by_provider(&self, hours: Option<i64>) -> anyhow::Result<Vec<ProviderStats>> {
         let modifier = hours.map(|hours| format!("-{hours} hours"));
+        let error = error_sql("");
         Ok(sqlx::query_as::<_, ProviderStats>(
-            "WITH aggregated AS (SELECT provider_id, COUNT(*) AS request_count, COALESCE(SUM(CASE WHEN client_status_code >= 400 THEN 1 ELSE 0 END), 0) AS error_count, COALESCE(AVG(latency_total_ms), 0.0) AS avg_duration_ms, COALESCE(SUM(output_tokens), 0) AS total_output_tokens, CAST(COALESCE(SUM(latency_upstream_ms), 0) AS REAL) AS total_upstream_ms FROM request_logs WHERE provider_id IS NOT NULL AND TRIM(provider_id) <> '' AND (? IS NULL OR created_at >= CAST(strftime('%s', 'now', ?) AS INTEGER) * 1000) GROUP BY provider_id) SELECT a.provider_id, COALESCE((SELECT NULLIF(TRIM(r.provider_name), '') FROM request_logs r WHERE r.provider_id = a.provider_id AND NULLIF(TRIM(r.provider_name), '') IS NOT NULL ORDER BY r.created_at DESC, r.id DESC LIMIT 1), a.provider_id) AS provider, NULL AS provider_icon, NULL AS provider_protocol, a.request_count, a.error_count, a.avg_duration_ms, a.total_output_tokens, a.total_upstream_ms FROM aggregated a ORDER BY a.request_count DESC, a.provider_id ASC",
+            &format!("WITH aggregated AS (SELECT provider_id, COUNT(*) AS request_count, COALESCE(SUM(CASE WHEN {error} THEN 1 ELSE 0 END), 0) AS error_count, COALESCE(AVG(latency_total_ms), 0.0) AS avg_duration_ms, COALESCE(SUM(output_tokens), 0) AS total_output_tokens, CAST(COALESCE(SUM(latency_upstream_ms), 0) AS REAL) AS total_upstream_ms FROM request_logs WHERE provider_id IS NOT NULL AND TRIM(provider_id) <> '' AND (? IS NULL OR created_at >= CAST(strftime('%s', 'now', ?) AS INTEGER) * 1000) GROUP BY provider_id) SELECT a.provider_id, COALESCE((SELECT NULLIF(TRIM(r.provider_name), '') FROM request_logs r WHERE r.provider_id = a.provider_id AND NULLIF(TRIM(r.provider_name), '') IS NOT NULL ORDER BY r.created_at DESC, r.id DESC LIMIT 1), a.provider_id) AS provider, NULL AS provider_icon, NULL AS provider_protocol, a.request_count, a.error_count, a.avg_duration_ms, a.total_output_tokens, a.total_upstream_ms FROM aggregated a ORDER BY a.request_count DESC, a.provider_id ASC"),
         )
         .bind(modifier.as_deref())
         .bind(modifier.as_deref())
@@ -1514,6 +1596,9 @@ impl LogStore for SqliteLogStore {
             request_count: i64,
             success_count: i64,
             error_count: i64,
+            unknown_count: i64,
+            cancelled_count: i64,
+            output_limited_count: i64,
             total_input_tokens: i64,
             total_output_tokens: i64,
             total_cache_read_tokens: i64,
@@ -1522,11 +1607,16 @@ impl LogStore for SqliteLogStore {
             total_upstream_ms: f64,
             last_used_at: Option<i64>,
         }
+        let error = error_sql("");
+        let completed = outcome_sql("", "completed");
+        let unknown = outcome_sql("", "unknown");
+        let cancelled = outcome_sql("", "cancelled");
+        let output_limited = outcome_sql("", "output_limited");
         let summary = sqlx::query_as::<_, SummaryRow>(
-            "SELECT COALESCE((SELECT NULLIF(TRIM(r.provider_name), '') FROM request_logs r WHERE r.provider_id = ? AND NULLIF(TRIM(r.provider_name), '') IS NOT NULL ORDER BY r.created_at DESC, r.id DESC LIMIT 1), ?) AS provider_name, COUNT(*) AS request_count, COALESCE(SUM(CASE WHEN client_status_code >= 200 AND client_status_code < 300 THEN 1 ELSE 0 END), 0) AS success_count, COALESCE(SUM(CASE WHEN client_status_code >= 400 THEN 1 ELSE 0 END), 0) AS error_count, COALESCE(SUM(input_tokens), 0) AS total_input_tokens, COALESCE(SUM(output_tokens), 0) AS total_output_tokens, COALESCE(SUM(cache_read_tokens), 0) AS total_cache_read_tokens, COALESCE(AVG(latency_total_ms), 0.0) AS avg_duration_ms, AVG(CASE WHEN stream_first_chunk_ms >= 0 THEN stream_first_chunk_ms END) AS avg_first_token_ms, CAST(COALESCE(SUM(latency_upstream_ms), 0) AS REAL) AS total_upstream_ms, MAX(created_at) AS last_used_at FROM request_logs WHERE provider_id = ? AND created_at >= ? AND created_at <= ?",
+            &format!("SELECT COALESCE((SELECT NULLIF(TRIM(r.provider_name), '') FROM request_logs r WHERE r.provider_id = ? AND NULLIF(TRIM(r.provider_name), '') IS NOT NULL ORDER BY r.created_at DESC, r.id DESC LIMIT 1), ?) AS provider_name, COUNT(*) AS request_count, COALESCE(SUM(CASE WHEN {completed} THEN 1 ELSE 0 END), 0) AS success_count, COALESCE(SUM(CASE WHEN {error} THEN 1 ELSE 0 END), 0) AS error_count, COALESCE(SUM(CASE WHEN {unknown} THEN 1 ELSE 0 END), 0) AS unknown_count, COALESCE(SUM(CASE WHEN {cancelled} THEN 1 ELSE 0 END), 0) AS cancelled_count, COALESCE(SUM(CASE WHEN {output_limited} THEN 1 ELSE 0 END), 0) AS output_limited_count, COALESCE(SUM(input_tokens), 0) AS total_input_tokens, COALESCE(SUM(output_tokens), 0) AS total_output_tokens, COALESCE(SUM(cache_read_tokens), 0) AS total_cache_read_tokens, COALESCE(AVG(latency_total_ms), 0.0) AS avg_duration_ms, AVG(CASE WHEN stream_first_chunk_ms >= 0 THEN stream_first_chunk_ms END) AS avg_first_token_ms, CAST(COALESCE(SUM(latency_upstream_ms), 0) AS REAL) AS total_upstream_ms, MAX(created_at) AS last_used_at FROM request_logs WHERE provider_id = ? AND created_at >= ? AND created_at <= ?"),
         ).bind(provider_id).bind(provider_id).bind(provider_id).bind(start_at).bind(end_at).fetch_one(&self.pool).await?;
         let models = sqlx::query_as::<_, ProviderModelUsageStats>(
-            "SELECT COALESCE(upstream_model, '') AS upstream_model, COUNT(*) AS request_count, COALESCE(SUM(CASE WHEN client_status_code >= 400 THEN 1 ELSE 0 END), 0) AS error_count, COALESCE(SUM(input_tokens), 0) AS total_input_tokens, COALESCE(SUM(output_tokens), 0) AS total_output_tokens, COALESCE(SUM(cache_read_tokens), 0) AS total_cache_read_tokens, COALESCE(AVG(latency_total_ms), 0.0) AS avg_duration_ms, AVG(CASE WHEN stream_first_chunk_ms >= 0 THEN stream_first_chunk_ms END) AS avg_first_token_ms, CAST(COALESCE(SUM(latency_upstream_ms), 0) AS REAL) AS total_upstream_ms, MAX(created_at) AS last_used_at FROM request_logs WHERE provider_id = ? AND created_at >= ? AND created_at <= ? GROUP BY COALESCE(upstream_model, '') ORDER BY request_count DESC, upstream_model ASC",
+            &format!("SELECT COALESCE(upstream_model, '') AS upstream_model, COUNT(*) AS request_count, COALESCE(SUM(CASE WHEN {error} THEN 1 ELSE 0 END), 0) AS error_count, COALESCE(SUM(input_tokens), 0) AS total_input_tokens, COALESCE(SUM(output_tokens), 0) AS total_output_tokens, COALESCE(SUM(cache_read_tokens), 0) AS total_cache_read_tokens, COALESCE(AVG(latency_total_ms), 0.0) AS avg_duration_ms, AVG(CASE WHEN stream_first_chunk_ms >= 0 THEN stream_first_chunk_ms END) AS avg_first_token_ms, CAST(COALESCE(SUM(latency_upstream_ms), 0) AS REAL) AS total_upstream_ms, MAX(created_at) AS last_used_at FROM request_logs WHERE provider_id = ? AND created_at >= ? AND created_at <= ? GROUP BY COALESCE(upstream_model, '') ORDER BY request_count DESC, upstream_model ASC"),
         ).bind(provider_id).bind(start_at).bind(end_at).fetch_all(&self.pool).await?;
         Ok(ProviderUsageDetail {
             start_at,
@@ -1538,6 +1628,10 @@ impl LogStore for SqliteLogStore {
             request_count: summary.request_count,
             success_count: summary.success_count,
             error_count: summary.error_count,
+            unknown_count: summary.unknown_count,
+            cancelled_count: summary.cancelled_count,
+            output_limited_count: summary.output_limited_count,
+            outcome_stats_version: 1,
             total_input_tokens: summary.total_input_tokens,
             total_output_tokens: summary.total_output_tokens,
             total_cache_read_tokens: summary.total_cache_read_tokens,
@@ -1550,9 +1644,12 @@ impl LogStore for SqliteLogStore {
     }
 
     async fn stats_by_api_key(&self, hours: Option<i64>) -> anyhow::Result<Vec<ApiKeyStats>> {
-        let sql = "WITH aggregated AS (SELECT api_key_id, COUNT(*) AS request_count, COALESCE(SUM(CASE WHEN client_status_code >= 400 THEN 1 ELSE 0 END), 0) AS error_count, COALESCE(SUM(input_tokens), 0) AS total_input_tokens, COALESCE(SUM(output_tokens), 0) AS total_output_tokens, COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens, MAX(created_at) AS last_used_at FROM request_logs WHERE api_key_id IS NOT NULL AND api_key_id <> '' AND (? IS NULL OR created_at >= CAST(strftime('%s', 'now', ?) AS INTEGER) * 1000) GROUP BY api_key_id) SELECT a.api_key_id, COALESCE((SELECT COALESCE(NULLIF(r.api_key_name, ''), r.api_key_id, '') FROM request_logs r WHERE r.api_key_id = a.api_key_id ORDER BY r.created_at DESC, r.id DESC LIMIT 1), a.api_key_id, '') AS api_key_name, a.request_count, a.error_count, a.total_input_tokens, a.total_output_tokens, a.cache_read_tokens, a.last_used_at FROM aggregated a ORDER BY a.request_count DESC, a.api_key_id ASC";
+        let error = error_sql("");
+        let sql = format!(
+            "WITH aggregated AS (SELECT api_key_id, COUNT(*) AS request_count, COALESCE(SUM(CASE WHEN {error} THEN 1 ELSE 0 END), 0) AS error_count, COALESCE(SUM(input_tokens), 0) AS total_input_tokens, COALESCE(SUM(output_tokens), 0) AS total_output_tokens, COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens, MAX(created_at) AS last_used_at FROM request_logs WHERE api_key_id IS NOT NULL AND api_key_id <> '' AND (? IS NULL OR created_at >= CAST(strftime('%s', 'now', ?) AS INTEGER) * 1000) GROUP BY api_key_id) SELECT a.api_key_id, COALESCE((SELECT COALESCE(NULLIF(r.api_key_name, ''), r.api_key_id, '') FROM request_logs r WHERE r.api_key_id = a.api_key_id ORDER BY r.created_at DESC, r.id DESC LIMIT 1), a.api_key_id, '') AS api_key_name, a.request_count, a.error_count, a.total_input_tokens, a.total_output_tokens, a.cache_read_tokens, a.last_used_at FROM aggregated a ORDER BY a.request_count DESC, a.api_key_id ASC"
+        );
         let modifier = hours.map(|hours| format!("-{hours} hours"));
-        Ok(sqlx::query_as::<_, ApiKeyStats>(sql)
+        Ok(sqlx::query_as::<_, ApiKeyStats>(&sql)
             .bind(modifier.as_deref())
             .bind(modifier.as_deref())
             .fetch_all(&self.pool)
@@ -1571,6 +1668,9 @@ impl LogStore for SqliteLogStore {
             request_count: i64,
             success_count: i64,
             error_count: i64,
+            unknown_count: i64,
+            cancelled_count: i64,
+            output_limited_count: i64,
             total_input_tokens: i64,
             total_output_tokens: i64,
             total_cache_read_tokens: i64,
@@ -1579,8 +1679,13 @@ impl LogStore for SqliteLogStore {
             last_used_at: Option<i64>,
         }
 
+        let error = error_sql("");
+        let completed = outcome_sql("", "completed");
+        let unknown = outcome_sql("", "unknown");
+        let cancelled = outcome_sql("", "cancelled");
+        let output_limited = outcome_sql("", "output_limited");
         let summary = sqlx::query_as::<_, SummaryRow>(
-            "WITH latest AS (SELECT COALESCE(NULLIF(api_key_name, ''), api_key_id, '') AS api_key_name FROM request_logs WHERE api_key_id = ? ORDER BY created_at DESC, id DESC LIMIT 1) SELECT COALESCE((SELECT api_key_name FROM latest), ?) AS api_key_name, COUNT(*) AS request_count, COALESCE(SUM(CASE WHEN client_status_code >= 200 AND client_status_code < 300 THEN 1 ELSE 0 END), 0) AS success_count, COALESCE(SUM(CASE WHEN client_status_code >= 400 THEN 1 ELSE 0 END), 0) AS error_count, COALESCE(SUM(input_tokens), 0) AS total_input_tokens, COALESCE(SUM(output_tokens), 0) AS total_output_tokens, COALESCE(SUM(cache_read_tokens), 0) AS total_cache_read_tokens, COALESCE(AVG(latency_total_ms), 0.0) AS avg_duration_ms, AVG(CASE WHEN stream_first_chunk_ms >= 0 THEN stream_first_chunk_ms END) AS avg_first_token_ms, MAX(created_at) AS last_used_at FROM request_logs WHERE api_key_id = ? AND created_at >= ? AND created_at <= ?",
+            &format!("WITH latest AS (SELECT COALESCE(NULLIF(api_key_name, ''), api_key_id, '') AS api_key_name FROM request_logs WHERE api_key_id = ? ORDER BY created_at DESC, id DESC LIMIT 1) SELECT COALESCE((SELECT api_key_name FROM latest), ?) AS api_key_name, COUNT(*) AS request_count, COALESCE(SUM(CASE WHEN {completed} THEN 1 ELSE 0 END), 0) AS success_count, COALESCE(SUM(CASE WHEN {error} THEN 1 ELSE 0 END), 0) AS error_count, COALESCE(SUM(CASE WHEN {unknown} THEN 1 ELSE 0 END), 0) AS unknown_count, COALESCE(SUM(CASE WHEN {cancelled} THEN 1 ELSE 0 END), 0) AS cancelled_count, COALESCE(SUM(CASE WHEN {output_limited} THEN 1 ELSE 0 END), 0) AS output_limited_count, COALESCE(SUM(input_tokens), 0) AS total_input_tokens, COALESCE(SUM(output_tokens), 0) AS total_output_tokens, COALESCE(SUM(cache_read_tokens), 0) AS total_cache_read_tokens, COALESCE(AVG(latency_total_ms), 0.0) AS avg_duration_ms, AVG(CASE WHEN stream_first_chunk_ms >= 0 THEN stream_first_chunk_ms END) AS avg_first_token_ms, MAX(created_at) AS last_used_at FROM request_logs WHERE api_key_id = ? AND created_at >= ? AND created_at <= ?"),
         )
         .bind(api_key_id)
         .bind(api_key_id)
@@ -1591,7 +1696,7 @@ impl LogStore for SqliteLogStore {
         .await?;
 
         let model_routes = sqlx::query_as::<_, ApiKeyModelRouteStats>(
-            "WITH grouped AS (SELECT COALESCE(client_model, '') AS client_model, COALESCE(provider_id, '') AS provider_id, COALESCE(upstream_model, '') AS upstream_model, COUNT(*) AS request_count, COALESCE(SUM(CASE WHEN client_status_code >= 400 THEN 1 ELSE 0 END), 0) AS error_count, COALESCE(SUM(input_tokens), 0) AS total_input_tokens, COALESCE(SUM(output_tokens), 0) AS total_output_tokens, COALESCE(SUM(cache_read_tokens), 0) AS total_cache_read_tokens, COALESCE(AVG(latency_total_ms), 0.0) AS avg_duration_ms, AVG(CASE WHEN stream_first_chunk_ms >= 0 THEN stream_first_chunk_ms END) AS avg_first_token_ms, CAST(COALESCE(SUM(latency_upstream_ms), 0) AS REAL) AS total_upstream_ms FROM request_logs WHERE api_key_id = ? AND created_at >= ? AND created_at <= ? GROUP BY COALESCE(client_model, ''), COALESCE(provider_id, ''), COALESCE(upstream_model, '')), latest_provider AS (SELECT COALESCE(provider_id, '') AS provider_id, COALESCE(NULLIF(provider_name, ''), provider_id, '') AS provider_name, ROW_NUMBER() OVER (PARTITION BY COALESCE(provider_id, '') ORDER BY created_at DESC, id DESC) AS row_num FROM request_logs WHERE COALESCE(provider_id, '') IN (SELECT provider_id FROM grouped)) SELECT g.client_model, g.provider_id, COALESCE(p.provider_name, g.provider_id, '') AS provider_name, g.upstream_model, g.request_count, g.error_count, g.total_input_tokens, g.total_output_tokens, g.total_cache_read_tokens, g.avg_duration_ms, g.avg_first_token_ms, g.total_upstream_ms FROM grouped g LEFT JOIN latest_provider p ON p.provider_id = g.provider_id AND p.row_num = 1 ORDER BY g.request_count DESC, g.client_model ASC, g.provider_id ASC, g.upstream_model ASC",
+            &format!("WITH grouped AS (SELECT COALESCE(client_model, '') AS client_model, COALESCE(provider_id, '') AS provider_id, COALESCE(upstream_model, '') AS upstream_model, COUNT(*) AS request_count, COALESCE(SUM(CASE WHEN {error} THEN 1 ELSE 0 END), 0) AS error_count, COALESCE(SUM(input_tokens), 0) AS total_input_tokens, COALESCE(SUM(output_tokens), 0) AS total_output_tokens, COALESCE(SUM(cache_read_tokens), 0) AS total_cache_read_tokens, COALESCE(AVG(latency_total_ms), 0.0) AS avg_duration_ms, AVG(CASE WHEN stream_first_chunk_ms >= 0 THEN stream_first_chunk_ms END) AS avg_first_token_ms, CAST(COALESCE(SUM(latency_upstream_ms), 0) AS REAL) AS total_upstream_ms FROM request_logs WHERE api_key_id = ? AND created_at >= ? AND created_at <= ? GROUP BY COALESCE(client_model, ''), COALESCE(provider_id, ''), COALESCE(upstream_model, '')), latest_provider AS (SELECT COALESCE(provider_id, '') AS provider_id, COALESCE(NULLIF(provider_name, ''), provider_id, '') AS provider_name, ROW_NUMBER() OVER (PARTITION BY COALESCE(provider_id, '') ORDER BY created_at DESC, id DESC) AS row_num FROM request_logs WHERE COALESCE(provider_id, '') IN (SELECT provider_id FROM grouped)) SELECT g.client_model, g.provider_id, COALESCE(p.provider_name, g.provider_id, '') AS provider_name, g.upstream_model, g.request_count, g.error_count, g.total_input_tokens, g.total_output_tokens, g.total_cache_read_tokens, g.avg_duration_ms, g.avg_first_token_ms, g.total_upstream_ms FROM grouped g LEFT JOIN latest_provider p ON p.provider_id = g.provider_id AND p.row_num = 1 ORDER BY g.request_count DESC, g.client_model ASC, g.provider_id ASC, g.upstream_model ASC"),
         )
         .bind(api_key_id)
         .bind(start_at)
@@ -1607,6 +1712,10 @@ impl LogStore for SqliteLogStore {
             request_count: summary.request_count,
             success_count: summary.success_count,
             error_count: summary.error_count,
+            unknown_count: summary.unknown_count,
+            cancelled_count: summary.cancelled_count,
+            output_limited_count: summary.output_limited_count,
+            outcome_stats_version: 1,
             total_input_tokens: summary.total_input_tokens,
             total_output_tokens: summary.total_output_tokens,
             total_cache_read_tokens: summary.total_cache_read_tokens,
@@ -1629,6 +1738,9 @@ impl LogStore for SqliteLogStore {
             request_count: i64,
             success_count: i64,
             error_count: i64,
+            unknown_count: i64,
+            cancelled_count: i64,
+            output_limited_count: i64,
             total_input_tokens: i64,
             total_output_tokens: i64,
             total_cache_read_tokens: i64,
@@ -1637,8 +1749,13 @@ impl LogStore for SqliteLogStore {
             total_upstream_ms: f64,
             last_used_at: Option<i64>,
         }
+        let error = error_sql("");
+        let completed = outcome_sql("", "completed");
+        let unknown = outcome_sql("", "unknown");
+        let cancelled = outcome_sql("", "cancelled");
+        let output_limited = outcome_sql("", "output_limited");
         let summary = sqlx::query_as::<_, SummaryRow>(
-            "SELECT COUNT(*) AS request_count, COALESCE(SUM(CASE WHEN client_status_code >= 200 AND client_status_code < 300 THEN 1 ELSE 0 END), 0) AS success_count, COALESCE(SUM(CASE WHEN client_status_code >= 400 THEN 1 ELSE 0 END), 0) AS error_count, COALESCE(SUM(input_tokens), 0) AS total_input_tokens, COALESCE(SUM(output_tokens), 0) AS total_output_tokens, COALESCE(SUM(cache_read_tokens), 0) AS total_cache_read_tokens, COALESCE(AVG(latency_total_ms), 0.0) AS avg_duration_ms, AVG(CASE WHEN stream_first_chunk_ms >= 0 THEN stream_first_chunk_ms END) AS avg_first_token_ms, CAST(COALESCE(SUM(latency_upstream_ms), 0) AS REAL) AS total_upstream_ms, MAX(created_at) AS last_used_at FROM request_logs WHERE upstream_model = ? AND created_at >= ? AND created_at <= ?",
+            &format!("SELECT COUNT(*) AS request_count, COALESCE(SUM(CASE WHEN {completed} THEN 1 ELSE 0 END), 0) AS success_count, COALESCE(SUM(CASE WHEN {error} THEN 1 ELSE 0 END), 0) AS error_count, COALESCE(SUM(CASE WHEN {unknown} THEN 1 ELSE 0 END), 0) AS unknown_count, COALESCE(SUM(CASE WHEN {cancelled} THEN 1 ELSE 0 END), 0) AS cancelled_count, COALESCE(SUM(CASE WHEN {output_limited} THEN 1 ELSE 0 END), 0) AS output_limited_count, COALESCE(SUM(input_tokens), 0) AS total_input_tokens, COALESCE(SUM(output_tokens), 0) AS total_output_tokens, COALESCE(SUM(cache_read_tokens), 0) AS total_cache_read_tokens, COALESCE(AVG(latency_total_ms), 0.0) AS avg_duration_ms, AVG(CASE WHEN stream_first_chunk_ms >= 0 THEN stream_first_chunk_ms END) AS avg_first_token_ms, CAST(COALESCE(SUM(latency_upstream_ms), 0) AS REAL) AS total_upstream_ms, MAX(created_at) AS last_used_at FROM request_logs WHERE upstream_model = ? AND created_at >= ? AND created_at <= ?"),
         )
         .bind(upstream_model)
         .bind(start_at)
@@ -1646,7 +1763,7 @@ impl LogStore for SqliteLogStore {
         .fetch_one(&self.pool)
         .await?;
         let providers = sqlx::query_as::<_, ModelProviderUsageStats>(
-            "WITH aggregated AS (SELECT provider_id, COUNT(*) AS request_count, COALESCE(SUM(CASE WHEN client_status_code >= 400 THEN 1 ELSE 0 END), 0) AS error_count, COALESCE(SUM(input_tokens), 0) AS total_input_tokens, COALESCE(SUM(output_tokens), 0) AS total_output_tokens, COALESCE(SUM(cache_read_tokens), 0) AS total_cache_read_tokens, COALESCE(AVG(latency_total_ms), 0.0) AS avg_duration_ms, AVG(CASE WHEN stream_first_chunk_ms >= 0 THEN stream_first_chunk_ms END) AS avg_first_token_ms, CAST(COALESCE(SUM(latency_upstream_ms), 0) AS REAL) AS total_upstream_ms, MAX(created_at) AS last_used_at FROM request_logs WHERE upstream_model = ? AND provider_id IS NOT NULL AND TRIM(provider_id) <> '' AND created_at >= ? AND created_at <= ? GROUP BY provider_id) SELECT a.provider_id, COALESCE((SELECT NULLIF(TRIM(r.provider_name), '') FROM request_logs r WHERE r.provider_id = a.provider_id AND NULLIF(TRIM(r.provider_name), '') IS NOT NULL ORDER BY r.created_at DESC, r.id DESC LIMIT 1), a.provider_id) AS provider_name, NULL AS provider_icon, NULL AS provider_protocol, a.request_count, a.error_count, a.total_input_tokens, a.total_output_tokens, a.total_cache_read_tokens, a.avg_duration_ms, a.avg_first_token_ms, a.total_upstream_ms, a.last_used_at FROM aggregated a ORDER BY a.request_count DESC, a.provider_id ASC",
+            &format!("WITH aggregated AS (SELECT provider_id, COUNT(*) AS request_count, COALESCE(SUM(CASE WHEN {error} THEN 1 ELSE 0 END), 0) AS error_count, COALESCE(SUM(input_tokens), 0) AS total_input_tokens, COALESCE(SUM(output_tokens), 0) AS total_output_tokens, COALESCE(SUM(cache_read_tokens), 0) AS total_cache_read_tokens, COALESCE(AVG(latency_total_ms), 0.0) AS avg_duration_ms, AVG(CASE WHEN stream_first_chunk_ms >= 0 THEN stream_first_chunk_ms END) AS avg_first_token_ms, CAST(COALESCE(SUM(latency_upstream_ms), 0) AS REAL) AS total_upstream_ms, MAX(created_at) AS last_used_at FROM request_logs WHERE upstream_model = ? AND provider_id IS NOT NULL AND TRIM(provider_id) <> '' AND created_at >= ? AND created_at <= ? GROUP BY provider_id) SELECT a.provider_id, COALESCE((SELECT NULLIF(TRIM(r.provider_name), '') FROM request_logs r WHERE r.provider_id = a.provider_id AND NULLIF(TRIM(r.provider_name), '') IS NOT NULL ORDER BY r.created_at DESC, r.id DESC LIMIT 1), a.provider_id) AS provider_name, NULL AS provider_icon, NULL AS provider_protocol, a.request_count, a.error_count, a.total_input_tokens, a.total_output_tokens, a.total_cache_read_tokens, a.avg_duration_ms, a.avg_first_token_ms, a.total_upstream_ms, a.last_used_at FROM aggregated a ORDER BY a.request_count DESC, a.provider_id ASC"),
         )
         .bind(upstream_model)
         .bind(start_at)
@@ -1654,7 +1771,7 @@ impl LogStore for SqliteLogStore {
         .fetch_all(&self.pool)
         .await?;
         let api_keys = sqlx::query_as::<_, ModelApiKeyUsageStats>(
-            "WITH aggregated AS (SELECT api_key_id, COUNT(*) AS request_count, COALESCE(SUM(CASE WHEN client_status_code >= 400 THEN 1 ELSE 0 END), 0) AS error_count, COALESCE(SUM(input_tokens), 0) AS total_input_tokens, COALESCE(SUM(output_tokens), 0) AS total_output_tokens, COALESCE(SUM(cache_read_tokens), 0) AS total_cache_read_tokens, COALESCE(AVG(latency_total_ms), 0.0) AS avg_duration_ms, AVG(CASE WHEN stream_first_chunk_ms >= 0 THEN stream_first_chunk_ms END) AS avg_first_token_ms, CAST(COALESCE(SUM(latency_upstream_ms), 0) AS REAL) AS total_upstream_ms, MAX(created_at) AS last_used_at FROM request_logs WHERE upstream_model = ? AND api_key_id IS NOT NULL AND api_key_id <> '' AND created_at >= ? AND created_at <= ? GROUP BY api_key_id) SELECT a.api_key_id, COALESCE((SELECT COALESCE(NULLIF(r.api_key_name, ''), r.api_key_id, '') FROM request_logs r WHERE r.api_key_id = a.api_key_id ORDER BY r.created_at DESC, r.id DESC LIMIT 1), a.api_key_id, '') AS api_key_name, a.request_count, a.error_count, a.total_input_tokens, a.total_output_tokens, a.total_cache_read_tokens, a.avg_duration_ms, a.avg_first_token_ms, a.total_upstream_ms, a.last_used_at FROM aggregated a ORDER BY a.request_count DESC, a.api_key_id ASC",
+            &format!("WITH aggregated AS (SELECT api_key_id, COUNT(*) AS request_count, COALESCE(SUM(CASE WHEN {error} THEN 1 ELSE 0 END), 0) AS error_count, COALESCE(SUM(input_tokens), 0) AS total_input_tokens, COALESCE(SUM(output_tokens), 0) AS total_output_tokens, COALESCE(SUM(cache_read_tokens), 0) AS total_cache_read_tokens, COALESCE(AVG(latency_total_ms), 0.0) AS avg_duration_ms, AVG(CASE WHEN stream_first_chunk_ms >= 0 THEN stream_first_chunk_ms END) AS avg_first_token_ms, CAST(COALESCE(SUM(latency_upstream_ms), 0) AS REAL) AS total_upstream_ms, MAX(created_at) AS last_used_at FROM request_logs WHERE upstream_model = ? AND api_key_id IS NOT NULL AND api_key_id <> '' AND created_at >= ? AND created_at <= ? GROUP BY api_key_id) SELECT a.api_key_id, COALESCE((SELECT COALESCE(NULLIF(r.api_key_name, ''), r.api_key_id, '') FROM request_logs r WHERE r.api_key_id = a.api_key_id ORDER BY r.created_at DESC, r.id DESC LIMIT 1), a.api_key_id, '') AS api_key_name, a.request_count, a.error_count, a.total_input_tokens, a.total_output_tokens, a.total_cache_read_tokens, a.avg_duration_ms, a.avg_first_token_ms, a.total_upstream_ms, a.last_used_at FROM aggregated a ORDER BY a.request_count DESC, a.api_key_id ASC"),
         )
         .bind(upstream_model)
         .bind(start_at)
@@ -1668,6 +1785,10 @@ impl LogStore for SqliteLogStore {
             request_count: summary.request_count,
             success_count: summary.success_count,
             error_count: summary.error_count,
+            unknown_count: summary.unknown_count,
+            cancelled_count: summary.cancelled_count,
+            output_limited_count: summary.output_limited_count,
+            outcome_stats_version: 1,
             total_input_tokens: summary.total_input_tokens,
             total_output_tokens: summary.total_output_tokens,
             total_cache_read_tokens: summary.total_cache_read_tokens,
@@ -1711,6 +1832,8 @@ impl StorageBootstrap for SqliteBootstrap {
                 == 2
                 && sqlx::query("SELECT effort FROM provider_model_ratings LIMIT 0").execute(&self.pool).await.is_ok()
                 && sqlx::query("SELECT performance_metadata_version, upstream_effort_status, upstream_effort_raw, upstream_effort_tier, request_completion, completion_reason, upstream_response_mode, performance_upstream_ms, performance_first_chunk_ms, performance_completed_at FROM request_logs LIMIT 0").execute(&self.pool).await.is_ok()
+                && sqlx::query("SELECT client_request_id, attempt_index, outcome_version, attempt_outcome, failure_kind, failure_stage, error_message, error_causes_json, payload_metadata_json, payload_cleared_at FROM request_logs LIMIT 0").execute(&self.pool).await.is_ok()
+                && sqlx::query("SELECT client_request_id, final_outcome, final_attempt_id, attempt_count, finished_at FROM request_results LIMIT 0").execute(&self.pool).await.is_ok()
         } else {
             false
         };

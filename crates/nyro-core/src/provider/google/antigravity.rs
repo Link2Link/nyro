@@ -138,7 +138,9 @@ pub(crate) fn parse_available_models(payload: &Value) -> Vec<String> {
 }
 
 /// Read the companion project id from the OAuth credential metadata.
-pub(crate) fn antigravity_project_id(credential: Option<&crate::auth::types::StoredCredential>) -> Result<String> {
+pub(crate) fn antigravity_project_id(
+    credential: Option<&crate::auth::types::StoredCredential>,
+) -> Result<String> {
     credential
         .and_then(|cred| cred.meta.get("project_id"))
         .and_then(Value::as_str)
@@ -306,10 +308,7 @@ mod tests {
         assert_eq!(wrapped["project"], "cloudaicompanion-1");
         assert_eq!(wrapped["requestType"], "agent");
         assert_eq!(wrapped["userAgent"], "antigravity");
-        assert!(wrapped["requestId"]
-            .as_str()
-            .unwrap()
-            .starts_with("agent-"));
+        assert!(wrapped["requestId"].as_str().unwrap().starts_with("agent-"));
         assert_eq!(wrapped["request"]["generationConfig"]["temperature"], 0.5);
         // safetySettings stripped, sessionId injected.
         assert!(wrapped["request"].get("safetySettings").is_none());
@@ -405,10 +404,16 @@ mod tests {
         };
         assert!(forces_upstream_stream(&provider));
         provider.vendor = Some("custom".into());
-        assert!(!forces_upstream_stream(&provider), "channel alone must not flip a custom vendor");
+        assert!(
+            !forces_upstream_stream(&provider),
+            "channel alone must not flip a custom vendor"
+        );
         provider.vendor = Some("google".into());
         provider.channel = Some("default".into());
-        assert!(!forces_upstream_stream(&provider), "default channel keeps non-stream upstream");
+        assert!(
+            !forces_upstream_stream(&provider),
+            "default channel keeps non-stream upstream"
+        );
     }
 
     #[test]

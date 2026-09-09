@@ -59,7 +59,7 @@ export default function StatsPage() {
     setModelDialog({ open: true, model });
   };
 
-  const { data: overview } = useQuery<StatsOverview>({
+  const { data: overview, error: overviewError, isPending: overviewPending } = useQuery<StatsOverview>({
     queryKey: ["stats-overview", hours],
     queryFn: () => backend("get_stats_overview", { hours }),
     refetchInterval: 10_000,
@@ -120,8 +120,16 @@ export default function StatsPage() {
       </div>
 
       <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
+        {overviewError || !overview ? (
+          <div className="glass col-span-full rounded-2xl p-4 text-sm text-slate-500" role={overviewError ? "alert" : "status"}>
+            {overviewError || !overviewPending
+              ? (isZh ? "统计概览不可用" : "Overview unavailable")
+              : (isZh ? "正在加载统计概览…" : "Loading overview…")}
+          </div>
+        ) : (
+          <>
         {[
-          { label: isZh ? "总请求数" : "Total Requests", value: fmt(overview?.total_requests ?? 0), icon: Activity, color: "text-blue-600" },
+          { label: isZh ? "总尝试数" : "Total Attempts", value: fmt(overview?.total_requests ?? 0), icon: Activity, color: "text-blue-600" },
           { label: isZh ? "平均延迟" : "Avg Latency", value: `${(overview?.avg_duration_ms ?? 0).toFixed(0)}ms`, icon: Clock, color: "text-purple-600" },
         ].map((c) => (
           <div key={c.label} className="glass rounded-2xl p-4">
@@ -184,6 +192,8 @@ export default function StatsPage() {
             </div>
           );
         })()}
+          </>
+        )}
       </div>
 
       <div className="grid grid-cols-1 gap-3 xl:grid-cols-2">
@@ -204,7 +214,7 @@ export default function StatsPage() {
         </div>
 
         <div className="glass rounded-2xl p-6">
-          <h3 className="mb-4 text-sm font-semibold text-slate-800">{isZh ? "模型请求分布" : "Requests by Model"}</h3>
+          <h3 className="mb-4 text-sm font-semibold text-slate-800">{isZh ? "模型尝试分布" : "Attempts by Model"}</h3>
           <div className="grid grid-cols-1 gap-3 lg:grid-cols-[240px_1fr] lg:items-center">
             <div className="h-44">
             {modelPie.length > 0 ? (
@@ -268,8 +278,8 @@ export default function StatsPage() {
             <thead className="bg-white/70 text-slate-500">
               <tr>
                 <th className="px-4 py-2.5 text-left font-medium">{isZh ? "提供商" : "Provider"}</th>
-                <th className="px-4 py-2.5 text-right font-medium">{isZh ? "请求数" : "Requests"}</th>
-                <th className="px-4 py-2.5 text-right font-medium">{isZh ? "错误数" : "Errors"}</th>
+                <th className="px-4 py-2.5 text-right font-medium">{isZh ? "尝试数" : "Attempts"}</th>
+                <th className="px-4 py-2.5 text-right font-medium">{isZh ? "错误尝试数" : "Error Attempts"}</th>
                 <th className="px-4 py-2.5 text-right font-medium">{isZh ? "错误率" : "Error Rate"}</th>
                 <th className="px-4 py-2.5 text-right font-medium">{isZh ? "平均延迟" : "Avg Latency"}</th>
                 <th className="px-4 py-2.5 text-right font-medium">TPS</th>
@@ -336,8 +346,8 @@ export default function StatsPage() {
             <thead className="bg-white/70 text-slate-500">
               <tr>
                 <th className="px-4 py-2.5 text-left font-medium">{isZh ? "密钥" : "API Key"}</th>
-                <th className="px-4 py-2.5 text-right font-medium">{isZh ? "请求数" : "Requests"}</th>
-                <th className="px-4 py-2.5 text-right font-medium">{isZh ? "失败数" : "Failures"}</th>
+                <th className="px-4 py-2.5 text-right font-medium">{isZh ? "尝试数" : "Attempts"}</th>
+                <th className="px-4 py-2.5 text-right font-medium">{isZh ? "错误尝试数" : "Error Attempts"}</th>
                 <th className="px-4 py-2.5 text-right font-medium">{isZh ? "输入 Token" : "Input Tokens"}</th>
                 <th className="px-4 py-2.5 text-right font-medium">{isZh ? "缓存命中" : "Cache Hits"}</th>
                 <th className="px-4 py-2.5 text-right font-medium">{isZh ? "输出 Token" : "Output Tokens"}</th>
@@ -409,7 +419,7 @@ export default function StatsPage() {
 
       <div className="glass rounded-2xl p-6">
         <div className="mb-4 flex items-center justify-between gap-3">
-          <h3 className="text-sm font-semibold text-slate-800">{isZh ? "模型 Token 统计（调用次数前 10）" : "Model Token Stats (Top 10 by Requests)"}</h3>
+          <h3 className="text-sm font-semibold text-slate-800">{isZh ? "模型 Token 统计（尝试次数前 10）" : "Model Token Stats (Top 10 by Attempts)"}</h3>
           <Button variant="outline" size="sm" className="h-8 gap-1.5" onClick={() => openModelDialog()}>
             <BarChart3 className="h-4 w-4" />
             {isZh ? "查看详情" : "View Details"}
@@ -420,7 +430,7 @@ export default function StatsPage() {
             <thead className="bg-white/70 text-slate-500">
               <tr>
                 <th className="px-4 py-2.5 text-left font-medium">{isZh ? "模型" : "Model"}</th>
-                <th className="px-4 py-2.5 text-right font-medium">{isZh ? "调用次数" : "Requests"}</th>
+                <th className="px-4 py-2.5 text-right font-medium">{isZh ? "尝试次数" : "Attempts"}</th>
                 <th className="px-4 py-2.5 text-right font-medium">{isZh ? "输入 Token" : "Input Tokens"}</th>
                 <th className="px-4 py-2.5 text-right font-medium">{isZh ? "缓存命中" : "Cache Hits"}</th>
                 <th className="px-4 py-2.5 text-right font-medium">{isZh ? "输出 Token" : "Output Tokens"}</th>

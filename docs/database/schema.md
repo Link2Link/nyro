@@ -11,7 +11,8 @@ providers ──1:N── model_backends ──N:1── models
     └──1:1── provider_oauth_credentials
 
 api_keys ──M:N── models (via api_key_models)
-request_logs (append-only)
+request_logs (one row per attempt; explicit payload clearing/deletion supported)
+    └──N:1── request_results (logical join by client_request_id; no FK)
 settings (key-value)
 ```
 
@@ -203,11 +204,27 @@ OAuth 凭据存储，用于需要 OAuth 认证的供应商（如 Google Vertex A
 
 ## request_logs
 
-请求日志（追加写入，记录每次代理请求的完整信息）。
+One diagnostic row per gateway attempt, not necessarily one per client request.
+Captured content may be absent, partial, truncated, or explicitly cleared; the log
+is not a promise of a complete wire transcript. Final client-request results live
+separately in `request_results` and do not add to usage counts. See
+[failure observability](../design/failure-observability.md)
+([中文](../design/failure-observability_CN.md)) for classification, capture, privacy,
+and loss-accounting semantics.
 
 | Column | Type | Default | Description |
 |---|---|---|---|
-| `id` | TEXT PK | — | 日志 ID |
+| `id` | TEXT PK | — | Stable log ID allocated before persistence, preserved across fallback/builder copies |
+| `client_request_id` | TEXT (MySQL: VARCHAR(64), ASCII binary collation) | NULL | Correlation ID shared by attempts of one client request; legacy rows may lack it |
+| `attempt_index` | INTEGER | NULL | Upstream attempt index within the client request; pre-upstream diagnostics may use 0 |
+| `outcome_version` | INTEGER NOT NULL | `0` | Authority version independent of performance metadata; only version 1 is currently recognized; no historical promotion |
+| `attempt_outcome` | TEXT NOT NULL (MySQL: VARCHAR(32), ASCII binary collation) | `'unknown'` | Versioned observation: `completed`, `failed`, `timed_out`, `cancelled`, `output_limited`, or `unknown`; unknown versions/values are not authoritative |
+| `failure_kind` | TEXT (MySQL: VARCHAR(64)) | NULL | Bounded diagnostic category, such as a transport, parse, conversion, timeout, or output-limit condition |
+| `failure_stage` | TEXT (MySQL: VARCHAR(64)) | NULL | Bounded stage identifying where failure was observed |
+| `error_message` | TEXT | NULL | Bounded sanitized summary, not raw body content |
+| `error_causes_json` | TEXT | NULL | JSON-encoded bounded sanitized cause array; public `RequestLog.error_causes` is a JSON string |
+| `payload_metadata_json` | TEXT | NULL | JSON-encoded per-header/body capture metadata; public `RequestLog.payload_metadata` is a JSON string, not a second body copy |
+| `payload_cleared_at` | INTEGER (PostgreSQL/MySQL: BIGINT) | NULL | Unix millisecond timestamp when an explicit admin clear removed payloads; classification/capture metadata remains |
 | `created_at` | INTEGER | `0` | Unix 毫秒时间戳 |
 | `api_key_id` | TEXT | NULL | 认证使用的 API Key ID |
 | `api_key_name` | TEXT | NULL | API Key 名称（快照） |
@@ -246,12 +263,50 @@ OAuth 凭据存储，用于需要 OAuth 认证的供应商（如 Google Vertex A
 | `upstream_effort_status` | TEXT NOT NULL (MySQL: VARCHAR(16)) | `'unknown'` | `present`, `absent`, or `unknown`, based only on the final outgoing upstream request after rewrites |
 | `upstream_effort_raw` | TEXT | NULL | Outgoing effort evidence (including unclassified budget/disabled/other values); never client-effort fallback |
 | `upstream_effort_tier` | TEXT (MySQL: VARCHAR(16)) | NULL | Recognized `low`, `medium`, `high`, `xhigh`, `max`; outgoing `minimal` maps to low; other/unspecified effort has no tier |
-| `request_completion` | TEXT NOT NULL (MySQL: VARCHAR(16)) | `'unknown'` | Per-attempt completion: `completed`, `failed`, `cancelled`, `timed_out`, `incomplete`, or `unknown`; historical rows remain unknown |
+| `request_completion` | TEXT NOT NULL (MySQL: VARCHAR(16)) | `'unknown'` | Compatibility performance completion evidence: `completed`, `failed`, `cancelled`, `timed_out`, `incomplete`, `output_limited`, or `unknown`; not authority for outcome counts/deletion; historical rows remain unknown |
 | `completion_reason` | TEXT | NULL | Observed protocol terminal reason or transport/delivery failure explanation; token-limit outcomes are incomplete, not completed |
 | `upstream_response_mode` | TEXT NOT NULL (MySQL: VARCHAR(16)) | `'unknown'` | Observed upstream mode: `stream`, `buffered`, or `unknown`; not inferred from client streaming mode |
 | `performance_upstream_ms` | INTEGER (PostgreSQL/MySQL: BIGINT) | NULL | Per-attempt upstream duration in milliseconds, independent of legacy latency fields |
 | `performance_first_chunk_ms` | INTEGER (PostgreSQL/MySQL: BIGINT) | NULL | Per-attempt time to first upstream chunk in milliseconds |
 | `performance_completed_at` | INTEGER (PostgreSQL/MySQL: BIGINT) | NULL | Unix millisecond completion time, set only for credibly completed attempts |
+
+### Outcome classification and payloads
+
+`RequestLog.is_error`, `effective_outcome`, and optional joined `request_result`
+are derived admin fields, **not physical columns**. The shared effective error
+predicate is client **or** upstream HTTP **400–599 inclusive**, or version 1
+`attempt_outcome IN ('failed', 'timed_out')`. Upstream 4xx/5xx counts even when the
+client sees 200. NULL and 600 do not satisfy the HTTP clause. Otherwise only
+version 1 can confirm `completed`, `cancelled`, or `output_limited`; every other
+row is `unknown`, including legacy `request_completion = 'failed'` without new
+authority. HTTP errors remain errors regardless of version.
+
+Usage details expose `outcome_stats_version = 1` and five exclusive counts whose
+sum equals total retained attempts: `success_count`, `error_count`,
+`cancelled_count`, `output_limited_count`, and `unknown_count`. Success means
+confirmed completed, not HTTP 2xx. Success/unknown rates divide by **all attempts**,
+not only classified attempts. Final request results are not counted.
+
+Each of the four bodies is bounded to **1 MiB raw bytes** (512 KiB head + 512 KiB
+tail); non-UTF-8/split UTF-8 captures use Base64, whose stored string may exceed
+that raw-byte cap. Each header block is bounded to **64 KiB serialized JSON**
+after credential redaction (a shared **65,535-byte** retained limit fits MySQL
+`TEXT` at the boundary). URLs are credential-redacted; body content remains
+raw within the cap and is restricted to authorized admin inspection. Metadata
+records complete/partial, absent/empty/not-retained, truncation, byte counts,
+encoding, and head/tail or omitted-header information. Metadata is retained even
+when ordinary payload logging is off.
+
+Confirmed errors, timeouts, cancellations, and output limits force retention of
+available bounded evidence. Ordinary completed/unknown attempts use the same caps
+but obey both the global and model payload switches. Explicit **Clear payloads**
+erases all eight header/body columns for **all** payload-bearing logs, including
+errors; it preserves classification and metadata and sets `payload_cleared_at`.
+**Clear error logs** uses the same effective error predicate and leaves pure
+cancelled/output-limited/unknown rows. Capture metadata after clearing describes
+the former capture, not currently available bytes.
+
+### Existing performance evidence
 
 Performance metadata is scalar evidence retained even when payload logging is off.
 A per-attempt response Body observer resolves delivery/terminal state **before log
@@ -282,6 +337,7 @@ Existing usage calculations retain their formula; usage and performance now also
 stable ID tie-breaking, null token/chunk handling, and exact MySQL model comparisons.
 
 **索引**：
+- `idx_logs_client_request_attempt` on `(client_request_id, attempt_index)`; a non-unique correlation index, not an additional counting identity
 - `idx_logs_created_at` on `created_at`
 - `idx_logs_provider_id` on `provider_id`
 - `idx_logs_client_status` on `client_status_code`
@@ -291,6 +347,32 @@ stable ID tie-breaking, null token/chunk handling, and exact MySQL model compari
 - `idx_logs_upstream_protocol` on `upstream_protocol`
 - `idx_logs_performance_pair` on `(provider_id, upstream_model, request_completion, performance_completed_at, id)`; SQLite uses `upstream_model COLLATE BINARY`, PostgreSQL `COLLATE "C"`; MySQL queries explicitly compare `BINARY upstream_model` for exact identity
 - `idx_logs_performance_recovery` on `(performance_metadata_version, created_at, id)` for bounded historical effort-only recovery
+
+---
+
+## request_results
+
+One separately persisted final result per correlated client request. This table
+is diagnostic context, **not** an additional attempt/event for request, success,
+error, TPS, token, or quota aggregation. Logs remain per-attempt and earlier
+failures are not rewritten by eventual success.
+
+| Column | Type | Default | Description |
+|---|---|---|---|
+| `client_request_id` | TEXT PK (MySQL: VARCHAR(64), ASCII binary collation) | — | Client-request correlation key shared with `request_logs.client_request_id` |
+| `final_outcome` | TEXT NOT NULL (MySQL: VARCHAR(32), ASCII binary collation) | — | Final observed request outcome, separate from each attempt's classification |
+| `final_attempt_id` | TEXT (MySQL: VARCHAR(36)) | NULL | Stable ID of the final attempt when available; deliberately no FK |
+| `attempt_count` | INTEGER NOT NULL | — | Number of upstream attempts recorded by the request lifecycle |
+| `finished_at` | INTEGER NOT NULL (PostgreSQL/MySQL: BIGINT) | — | Unix millisecond finalization timestamp |
+
+No foreign key is imposed on the log/result relationship: deleting the final
+attempt must not discard useful final context while sibling attempts remain.
+An absent final row is not evidence of success. Admin log detail joins this row
+as optional `request_result`; historical logs without correlation stay unjoined.
+There is no migration backfill of authoritative outcomes or request results from
+historical HTTP success/performance markers. The log queue/database write path
+can lose evidence and reports explicit process-local loss counters; it has no
+retry/spool or historical outcome recovery guarantee.
 
 ---
 
@@ -441,6 +523,20 @@ NYRO_TEST_MYSQL_PERFORMANCE_URL='<dedicated-mysql-performance-test-url>' \
   cargo test -p nyro-core --test storage_effort_performance
 ```
 
+Outcome/correlation conformance has its own opt-in and may mutate schema/data to
+exercise legacy migration and write rollback. Provision **separate new empty**
+databases named `nyro_outcomes_test` on disposable servers (not the databases used
+for reference generation or other suites):
+
+```bash
+NYRO_TEST_OUTCOME_DATABASES_ONLY=1 \
+NYRO_TEST_POSTGRES_OUTCOMES_URL='<new-empty-postgres-outcomes-test-url>' \
+NYRO_TEST_MYSQL_OUTCOMES_URL='<new-empty-mysql-outcomes-test-url>' \
+  cargo test -p nyro-core --test log_outcomes_storage
+```
+
+Keep missing external URLs distinct from verified backend coverage; optional
+external cases do not prove conformance unless explicitly configured and run.
 Retain temporary services until all generation, restore, and conformance runs have
 finished, then stop only those explicitly provisioned disposable services.
 

@@ -112,6 +112,7 @@ fn log_entry_timestamp_is_unix_millis() {
     // Build a LogEntry and confirm created_at field accepts i64 ms.
     let _entry = LogEntry {
         performance: Default::default(),
+        diagnostic: Default::default(),
         api_key_id: None,
         api_key_name: None,
         created_at: ts,
@@ -158,6 +159,7 @@ fn stream_indicator_via_chunks_count() {
 
     let base = LogEntry {
         performance: Default::default(),
+        diagnostic: Default::default(),
         api_key_id: None,
         api_key_name: None,
         created_at: 0,
@@ -216,9 +218,9 @@ fn stream_indicator_via_chunks_count() {
 
 #[test]
 fn db_schema_sql_contains_new_columns() {
-    // The INIT_SQL is not directly exported, but we can verify the column list
-    // by checking that the migration function adds all expected new columns.
-    // We do a lighter check: verify the constant column names expected per spec.
+    // Keep the original base logging contract separate from additive metadata.
+    // Physical outcome migrations are covered by log_outcomes_storage; this
+    // lightweight check protects the original public fields.
     let expected_columns = [
         "id",
         "created_at",
@@ -259,7 +261,7 @@ fn db_schema_sql_contains_new_columns() {
     assert_eq!(
         expected_columns.len(),
         35,
-        "schema requires 35 columns (id + 34 data columns)"
+        "base logging contract has 35 columns, before additive diagnostic/performance metadata"
     );
 
     // Verify RequestLog struct has the same field names via a compile-time
@@ -341,6 +343,7 @@ async fn sqlite_round_trips_reasoning_effort_in_list_and_detail() {
         .logs()
         .append_batch(vec![LogEntry {
             performance: Default::default(),
+            diagnostic: Default::default(),
             api_key_id: None,
             api_key_name: None,
             created_at: 1,
@@ -413,10 +416,10 @@ async fn sqlite_round_trips_reasoning_effort_in_list_and_detail() {
     );
 }
 
-// ── 7. Historical payload clearing keeps errors and log metadata ────────────
+// ── 7. Payload clearing erases every payload but preserves log metadata ─────
 
 #[tokio::test]
-async fn sqlite_clears_success_payloads_but_preserves_error_payloads() {
+async fn sqlite_clears_all_payloads_including_errors_but_preserves_metadata() {
     use nyro_core::db;
     use nyro_core::db::models::LogQuery;
     use nyro_core::logging::LogEntry;
@@ -434,6 +437,7 @@ async fn sqlite_clears_success_payloads_but_preserves_error_payloads() {
 
     let entry = |client_status_code: i32, upstream_status_code: Option<i32>| LogEntry {
         performance: Default::default(),
+        diagnostic: Default::default(),
         api_key_id: Some("key-1".into()),
         api_key_name: Some("Key".into()),
         created_at: 42,
@@ -513,7 +517,7 @@ async fn sqlite_clears_success_payloads_but_preserves_error_payloads() {
         .id
         .clone();
 
-    assert_eq!(logs.clear_payloads().await.expect("clear payloads"), 1);
+    assert_eq!(logs.clear_payloads().await.expect("clear payloads"), 3);
 
     let after = logs
         .find_by_id(&success_id)
@@ -541,6 +545,9 @@ async fn sqlite_clears_success_payloads_but_preserves_error_payloads() {
     assert!(after.upstream_request_body.is_none());
     assert!(after.upstream_response_headers.is_none());
     assert!(after.upstream_response_body.is_none());
+    assert!(after.payload_cleared_at.is_some());
+    assert_eq!(after.outcome_version, 0);
+    assert_eq!(after.attempt_outcome, "unknown");
 
     for error_id in [&client_error_id, &upstream_error_id] {
         let error = logs
@@ -548,14 +555,24 @@ async fn sqlite_clears_success_payloads_but_preserves_error_payloads() {
             .await
             .expect("query preserved error detail")
             .expect("error log row is preserved");
-        assert!(error.client_request_headers.is_some());
-        assert!(error.client_request_body.is_some());
-        assert!(error.client_response_headers.is_some());
-        assert!(error.client_response_body.is_some());
-        assert!(error.upstream_request_headers.is_some());
-        assert!(error.upstream_request_body.is_some());
-        assert!(error.upstream_response_headers.is_some());
-        assert!(error.upstream_response_body.is_some());
+        assert!(error.client_request_headers.is_none());
+        assert!(error.client_request_body.is_none());
+        assert!(error.client_response_headers.is_none());
+        assert!(error.client_response_body.is_none());
+        assert!(error.upstream_request_headers.is_none());
+        assert!(error.upstream_request_body.is_none());
+        assert!(error.upstream_response_headers.is_none());
+        assert!(error.upstream_response_body.is_none());
+        assert!(error.payload_cleared_at.is_some());
+        assert!(
+            nyro_core::logging::diagnostics::is_error(
+                error.client_status_code,
+                error.upstream_status_code,
+                error.outcome_version,
+                &error.attempt_outcome,
+            ),
+            "clearing payloads must preserve classification"
+        );
     }
 
     assert_eq!(
@@ -568,7 +585,7 @@ async fn sqlite_clears_success_payloads_but_preserves_error_payloads() {
     assert_eq!(
         logs.clear_payloads()
             .await
-            .expect("error payloads remain excluded on repeated clearing"),
+            .expect("repeated payload clearing is a no-op"),
         0
     );
 }
@@ -594,6 +611,7 @@ async fn sqlite_deletes_single_log_and_clears_errors_only() {
 
     let entry = |client_status: i32| LogEntry {
         performance: Default::default(),
+        diagnostic: Default::default(),
         api_key_id: None,
         api_key_name: None,
         created_at: 1,
@@ -629,19 +647,33 @@ async fn sqlite_deletes_single_log_and_clears_errors_only() {
         enable_payload: None,
     };
 
+    let mut upstream_error = entry(200);
+    upstream_error.upstream_status_code = Some(429);
     storage
         .logs()
-        .append_batch(vec![entry(200), entry(200), entry(500)])
+        .append_batch(vec![
+            entry(200),
+            entry(200),
+            entry(500),
+            entry(600),
+            entry(0),
+            upstream_error,
+        ])
         .await
         .expect("append logs");
+    // Historical nullable/nonstandard status values are not HTTP errors.
+    sqlx::query("UPDATE request_logs SET client_status_code = NULL, upstream_status_code = NULL WHERE client_status_code = 0")
+        .execute(storage.pool())
+        .await
+        .expect("seed nullable legacy status");
 
     let logs = storage.logs();
     let page = logs.query(LogQuery::default()).await.expect("query");
-    assert_eq!(page.total, 3);
+    assert_eq!(page.total, 6);
     let ok_id = page
         .items
         .iter()
-        .find(|i| i.client_status_code == Some(200))
+        .find(|i| i.client_status_code == Some(200) && i.upstream_status_code == Some(200))
         .expect("ok row exists")
         .id
         .clone();
@@ -656,14 +688,38 @@ async fn sqlite_deletes_single_log_and_clears_errors_only() {
         0
     );
     let page = logs.query(LogQuery::default()).await.expect("query");
-    assert_eq!(page.total, 2, "only the targeted row was deleted");
+    assert_eq!(page.total, 5, "only the targeted row was deleted");
 
-    // Error wipe removes the >= 400 rows only.
+    // Either side's HTTP 400..=599 is an error; NULL and 600 are not.
     let deleted = logs.clear_errors().await.expect("clear errors");
-    assert_eq!(deleted, 1);
+    assert_eq!(deleted, 2);
     let page = logs.query(LogQuery::default()).await.expect("query");
-    assert_eq!(page.total, 1);
-    assert_eq!(page.items[0].client_status_code, Some(200));
+    assert_eq!(page.total, 3);
+    assert!(
+        page.items
+            .iter()
+            .all(|row| !nyro_core::logging::diagnostics::is_error(
+                row.client_status_code,
+                row.upstream_status_code,
+                row.outcome_version,
+                &row.attempt_outcome,
+            ))
+    );
+    assert!(
+        page.items
+            .iter()
+            .any(|row| row.client_status_code == Some(200))
+    );
+    assert!(
+        page.items
+            .iter()
+            .any(|row| row.client_status_code == Some(600))
+    );
+    assert!(
+        page.items
+            .iter()
+            .any(|row| row.client_status_code.is_none())
+    );
 
     // Clearing again with no errors left is a no-op.
     assert_eq!(logs.clear_errors().await.expect("clear errors again"), 0);

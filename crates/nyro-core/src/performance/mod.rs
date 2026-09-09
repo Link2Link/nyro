@@ -181,6 +181,7 @@ pub(crate) struct Terminal {
     event_data: String,
     pub completion: Option<&'static str>,
     pub reason: Option<String>,
+    pub error_message: Option<String>,
     pub(crate) sse: bool,
     invalid: bool,
     unknown_reason: bool,
@@ -192,12 +193,12 @@ pub(crate) struct Terminal {
 }
 impl Terminal {
     pub fn push(&mut self, bytes: &[u8]) {
-        self.buffer.extend_from_slice(bytes);
-        if self.buffer.len() > 1024 * 1024 {
+        if self.buffer.len().saturating_add(bytes.len()) > 1024 * 1024 {
             self.invalid = true;
             self.buffer.clear();
             return;
         }
+        self.buffer.extend_from_slice(bytes);
         if !self.sse {
             let text = String::from_utf8_lossy(&self.buffer);
             let text = text.trim_start();
@@ -248,11 +249,8 @@ impl Terminal {
     }
     fn reason(&mut self, reason: &str) {
         let state = match reason.to_ascii_lowercase().as_str() {
-            "length"
-            | "max_tokens"
-            | "max_output_tokens"
-            | "response.incomplete"
-            | "incomplete" => "incomplete",
+            "length" | "max_tokens" | "max_output_tokens" => "output_limited",
+            "response.incomplete" | "incomplete" => "unknown",
             "error" | "failed" | "response.failed" => "failed",
             "cancelled" | "canceled" => "cancelled",
             "stop" | "end_turn" | "endturn" | "tool_calls" | "tool_use" | "function_call"
@@ -262,7 +260,14 @@ impl Terminal {
                 return;
             }
         };
-        if self.completion.is_none() || self.completion == Some("completed") {
+        let rank = |s| match s {
+            "failed" => 5,
+            "cancelled" => 4,
+            "output_limited" => 3,
+            "unknown" => 2,
+            _ => 1,
+        };
+        if self.completion.is_none_or(|old| rank(state) > rank(old)) {
             self.completion = Some(state);
             self.reason = Some(reason.into());
         }
@@ -276,6 +281,16 @@ impl Terminal {
         }
         if value.get("error").is_some_and(|e| !e.is_null()) {
             self.reason("error");
+            self.error_message = value
+                .pointer("/error/message")
+                .and_then(Value::as_str)
+                .map(|s| {
+                    let mut end = s.len().min(2048);
+                    while !s.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    s[..end].to_owned()
+                });
         }
         for p in ["/finish_reason", "/stop_reason", "/delta/stop_reason"] {
             if let Some(v) = value.pointer(p).filter(|v| !v.is_null()) {
@@ -316,6 +331,10 @@ impl Terminal {
                         .and_then(Value::as_u64)
                         .unwrap_or(position as u64);
                     let key = format!("{field}:{index}");
+                    if self.branches.len() >= 256 && !self.branches.contains_key(&key) {
+                        self.invalid = true;
+                        continue;
+                    }
                     self.branches.entry(key.clone()).or_insert(false);
                     for field in ["finish_reason", "finishReason"] {
                         if let Some(v) = item.get(field).filter(|v| !v.is_null()) {
@@ -330,9 +349,23 @@ impl Terminal {
                 }
             }
         }
+        if let Some(reason) = value
+            .pointer("/incomplete_details/reason")
+            .and_then(Value::as_str)
+        {
+            self.reason(reason);
+        }
         if let Some(response) = value.get("response") {
             self.json(response);
         }
+    }
+    /// Unambiguous incremental evidence that the upstream stream reached a
+    /// completed terminal. Unlike reading `completion` directly, this stays
+    /// false when the bounded observer hit an unrecognized dialect or overflow
+    /// that `finish()` would reconcile away — such evidence alone must not
+    /// confirm completion.
+    pub fn confirmed_completed(&self) -> bool {
+        self.completion == Some("completed") && !self.invalid && !self.unknown_reason
     }
     pub fn finish(&mut self) {
         let buffer = std::mem::take(&mut self.buffer);
@@ -344,16 +377,30 @@ impl Terminal {
         } else {
             self.invalid = true;
         }
-        if self.invalid {
-            self.completion = Some("failed");
-            self.reason = Some("original response parse error".into());
-        } else if (self.unknown_reason
-            || self.branches.values().any(|done| !done)
-            || (self.sse && ((self.anthropic && !self.message_stop) || (self.chat && !self.done))))
-            && self.completion == Some("completed")
-        {
-            self.completion = None;
-            self.reason = Some("unrecognized original terminal reason".into());
+        // This is an optional observer, not the conversion parser. Unsupported
+        // encodings/dialects and bounded-parser overflow cannot prove failure.
+        // Conversely explicit upstream errors survive any later observer issue.
+        if !matches!(
+            self.completion,
+            Some("failed" | "cancelled" | "output_limited")
+        ) {
+            if self.invalid || self.unknown_reason {
+                if self.completion != Some("unknown") {
+                    self.completion = None;
+                    self.reason = Some("unrecognized original terminal evidence".into());
+                }
+            } else if self.sse && self.anthropic && !self.message_stop {
+                // Anthropic's known message framing requires message_stop.
+                self.completion = Some("failed");
+                self.reason = Some("missing_terminal".into());
+            } else if self.branches.values().any(|done| !done)
+                || (self.sse && self.chat && !self.done)
+            {
+                // Chat-compatible dialects may terminate by finish_reason OR
+                // [DONE]. Without sufficient branch evidence remain unknown.
+                self.completion = None;
+                self.reason = Some("ambiguous terminal evidence".into());
+            }
         }
     }
 }
@@ -416,7 +463,7 @@ mod tests {
                     .as_bytes(),
             );
             t.finish();
-            assert_eq!(t.completion, Some("incomplete"));
+            assert_eq!(t.completion, Some("output_limited"));
         }
         for data in [
             "data: [DONE]\n\n",

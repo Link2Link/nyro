@@ -46,6 +46,10 @@ where
             method: parts.method.clone(),
             path: parts.uri.path().to_string(),
             headers: parts.headers.clone(),
+            context: parts
+                .extensions
+                .get::<crate::proxy::context::RequestContext>()
+                .cloned(),
         };
         let encoding = request_content_encoding(&parts.headers);
         if encoding
@@ -141,6 +145,7 @@ struct WireMeta {
     method: axum::http::Method,
     path: String,
     headers: axum::http::HeaderMap,
+    context: Option<crate::proxy::context::RequestContext>,
 }
 
 /// Downcast the router state to [`crate::Gateway`] and emit an
@@ -165,6 +170,7 @@ fn report_intake_rejection<S>(
             body_prefix,
             rejection.status(),
             &rejection.body_text(),
+            wire.context.as_ref(),
         );
     }
 }

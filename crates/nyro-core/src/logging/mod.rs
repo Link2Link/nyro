@@ -1,4 +1,49 @@
+pub mod diagnostics;
+pub mod payload;
+
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::mpsc;
+
+static QUEUE_FULL_DROPPED: AtomicU64 = AtomicU64::new(0);
+static CHANNEL_CLOSED_DROPPED: AtomicU64 = AtomicU64::new(0);
+static DATABASE_WRITE_DROPPED: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Debug, serde::Serialize)]
+pub struct LoggingStatus {
+    pub queue_full_dropped: u64,
+    pub channel_closed_dropped: u64,
+    pub database_write_dropped: u64,
+    pub counts_reset_on_restart: bool,
+}
+
+pub fn logging_status() -> LoggingStatus {
+    LoggingStatus {
+        queue_full_dropped: QUEUE_FULL_DROPPED.load(Ordering::Relaxed),
+        channel_closed_dropped: CHANNEL_CLOSED_DROPPED.load(Ordering::Relaxed),
+        database_write_dropped: DATABASE_WRITE_DROPPED.load(Ordering::Relaxed),
+        counts_reset_on_restart: true,
+    }
+}
+
+/// Nonblocking bounded delivery, with explicit loss reporting and no implicit retry.
+pub fn enqueue_log(tx: &mpsc::Sender<LogEntry>, entry: LogEntry) {
+    if let Err(error) = tx.try_send(entry) {
+        let (reason, entry, total) = match error {
+            mpsc::error::TrySendError::Full(entry) => (
+                "queue_full",
+                entry,
+                QUEUE_FULL_DROPPED.fetch_add(1, Ordering::Relaxed) + 1,
+            ),
+            mpsc::error::TrySendError::Closed(entry) => (
+                "channel_closed",
+                entry,
+                CHANNEL_CLOSED_DROPPED.fetch_add(1, Ordering::Relaxed) + 1,
+            ),
+        };
+        tracing::error!(log_id = %entry.diagnostic.log_id, client_request_id = ?entry.diagnostic.client_request_id,
+            reason, dropped_count = 1, dropped_total = total, "request log could not be queued; evidence was lost");
+    }
+}
 
 use crate::protocol::ir::Usage;
 use crate::storage::DynStorage;
@@ -10,6 +55,8 @@ pub const LOG_RETENTION_DAYS_KEY: &str = "log_retention_days";
 
 #[derive(Debug, Clone)]
 pub struct LogEntry {
+    /// Versioned outcomes/correlation and bounded payload capture metadata.
+    pub diagnostic: diagnostics::LogDiagnostic,
     // === 标识 ===
     pub api_key_id: Option<String>,
     pub api_key_name: Option<String>,
@@ -97,7 +144,11 @@ pub async fn run_collector(mut rx: mpsc::Receiver<LogEntry>, storage: DynStorage
 
     loop {
         tokio::select! {
-            Some(entry) = rx.recv() => {
+            entry = rx.recv() => {
+                let Some(entry) = entry else {
+                    if !buffer.is_empty() { flush(storage.clone(), &mut buffer).await; }
+                    break;
+                };
                 buffer.push(entry);
                 if buffer.len() >= 32 {
                     flush(storage.clone(), &mut buffer).await;
@@ -162,6 +213,16 @@ fn should_record_payload(
 }
 
 fn clear_payload(entry: &mut LogEntry) {
+    if let Some(metadata) = entry.diagnostic.payload_metadata.as_object_mut() {
+        for value in metadata.values_mut() {
+            if let Some(fields) = value.as_object_mut() {
+                fields.insert("capture_state".into(), serde_json::json!("not_retained"));
+                fields.insert("retained_bytes".into(), serde_json::json!(0));
+                fields.insert("head_bytes".into(), serde_json::json!(0));
+                fields.insert("tail_bytes".into(), serde_json::json!(0));
+            }
+        }
+    }
     entry.client_request_headers = None;
     entry.client_request_body = None;
     entry.client_response_headers = None;
@@ -176,8 +237,13 @@ async fn flush(storage: DynStorage, buffer: &mut Vec<LogEntry>) {
     let mut entries = std::mem::take(buffer);
     let global_enabled = read_enable_payload(&storage).await;
     for entry in entries.iter_mut() {
-        // 全局与模型开关默认采用 AND 语义；HTTP 4xx/5xx 始终保留载荷，便于排查问题。
-        let should_record = should_record_payload(
+        // Actual HTTP errors and versioned abnormal outcomes retain bounded
+        // diagnostic evidence even when ordinary payload recording is disabled.
+        let should_record = diagnostics::force_payload(
+            Some(entry.client_status_code),
+            entry.upstream_status_code,
+            &entry.diagnostic,
+        ) || should_record_payload(
             global_enabled,
             entry.enable_payload,
             entry.client_status_code,
@@ -189,7 +255,15 @@ async fn flush(storage: DynStorage, buffer: &mut Vec<LogEntry>) {
         // Clear transient field before DB write
         entry.enable_payload = None;
     }
-    let _ = storage.logs().append_batch(entries).await;
+    let dropped_count = entries.len() as u64;
+    let first_log_id = entries.first().map(|entry| entry.diagnostic.log_id.clone());
+    if let Err(error) = storage.logs().append_batch(entries).await {
+        let total =
+            DATABASE_WRITE_DROPPED.fetch_add(dropped_count, Ordering::Relaxed) + dropped_count;
+        tracing::error!(first_log_id = ?first_log_id, dropped_count, dropped_total = total,
+            error = %diagnostics::sanitize_cause(&error.to_string()),
+            "request log batch could not be persisted; evidence was lost without retry");
+    }
 }
 
 #[cfg(test)]
@@ -251,6 +325,7 @@ mod tests {
     fn clearing_payload_preserves_reasoning_effort_metadata() {
         let payload = Some("payload".to_string());
         let mut entry = LogEntry {
+            diagnostic: Default::default(),
             performance: crate::performance::recover_historical_effort(
                 r#"{"reasoning_effort":"high"}"#,
                 None,

@@ -17,6 +17,7 @@ fn log_entry(
 ) -> LogEntry {
     LogEntry {
         performance: Default::default(),
+        diagnostic: Default::default(),
         api_key_id: None,
         api_key_name: None,
         created_at,
@@ -109,6 +110,38 @@ async fn sqlite_aggregates_epoch_buckets_and_boundaries() -> anyhow::Result<()> 
             .is_err()
     );
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn sqlite_time_bucket_errors_use_both_http_sides_and_exclude_null_and_600()
+-> anyhow::Result<()> {
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await?;
+    db::migrate(&pool).await?;
+    let storage = SqliteStorage::from_pool(pool);
+    let mut upstream_error = log_entry(MINUTE_MS, 0, 0, 0, 200, 1, "m");
+    upstream_error.upstream_status_code = Some(429);
+    storage
+        .logs()
+        .append_batch(vec![
+            log_entry(MINUTE_MS, 0, 0, 0, 500, 1, "m"),
+            log_entry(MINUTE_MS, 0, 0, 0, 600, 1, "m"),
+            log_entry(MINUTE_MS, 0, 0, 0, 0, 1, "m"),
+            upstream_error,
+        ])
+        .await?;
+    sqlx::query("UPDATE request_logs SET client_status_code = NULL, upstream_status_code = NULL WHERE client_status_code = 0")
+        .execute(storage.pool()).await?;
+
+    let buckets = storage
+        .logs()
+        .stats_time_buckets(0, 2 * MINUTE_MS, 5 * MINUTE_MS, None)
+        .await?;
+    assert_eq!(buckets.len(), 1);
+    assert_eq!((buckets[0].request_count, buckets[0].error_count), (4, 2));
     Ok(())
 }
 

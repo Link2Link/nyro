@@ -13,6 +13,7 @@ const WEEK: i64 = 604_800_000;
 
 fn entry(provider: &str, model: &str, tier: Option<&str>, at: i64) -> LogEntry {
     LogEntry {
+        diagnostic: Default::default(),
         api_key_id: None,
         api_key_name: None,
         created_at: at,

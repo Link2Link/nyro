@@ -17,11 +17,12 @@ use crate::db::models::{
     LogPage, LogQuery, Model, ModelApiKeyUsageStats, ModelBackend, ModelProviderUsageStats,
     ModelStats, ModelTimeBucket, ModelUsageDetail, ModelUsageStats, ModelUsageTotals,
     OAuthCredential, Provider, ProviderModelUsageStats, ProviderProtocolEndpoint, ProviderStats,
-    ProviderUsageDetail, RecentModelPerformance, RequestLog, StatsHourly, StatsOverview,
-    StatsTimeBucket, UpdateApiKey, UpdateModel, UpdateProvider, UpsertOAuthCredential,
-    is_valid_provider_auth_mode,
+    ProviderUsageDetail, RecentModelPerformance, RequestLog, RequestResult, StatsHourly,
+    StatsOverview, StatsTimeBucket, UpdateApiKey, UpdateModel, UpdateProvider,
+    UpsertOAuthCredential, is_valid_provider_auth_mode,
 };
 use crate::logging::LogEntry;
+use crate::logging::diagnostics::{error_sql, outcome_sql};
 use crate::storage::sql::config::SqlBackendConfig;
 use crate::storage::sql::pool::RelationalPool;
 use crate::storage::traits::{
@@ -80,7 +81,8 @@ impl MysqlAdapter {
                     .await
                     .unwrap_or(false)
                 && sqlx::query("SELECT effort FROM provider_model_ratings LIMIT 0").execute(&self.pool).await.is_ok()
-                && sqlx::query("SELECT performance_metadata_version, upstream_effort_status, upstream_effort_raw, upstream_effort_tier, request_completion, completion_reason, upstream_response_mode, performance_upstream_ms, performance_first_chunk_ms, performance_completed_at FROM request_logs LIMIT 0").execute(&self.pool).await.is_ok()
+                && sqlx::query("SELECT performance_metadata_version, upstream_effort_status, upstream_effort_raw, upstream_effort_tier, request_completion, completion_reason, upstream_response_mode, performance_upstream_ms, performance_first_chunk_ms, performance_completed_at, client_request_id, attempt_index, outcome_version, attempt_outcome, failure_kind, failure_stage, error_message, error_causes_json, payload_metadata_json, payload_cleared_at FROM request_logs LIMIT 0").execute(&self.pool).await.is_ok()
+                && sqlx::query("SELECT client_request_id, final_outcome, final_attempt_id, attempt_count, finished_at FROM request_results LIMIT 0").execute(&self.pool).await.is_ok()
         } else {
             false
         };
@@ -1087,8 +1089,10 @@ impl LogStore for MysqlLogStore {
         )
     }
     async fn append_batch(&self, entries: Vec<LogEntry>) -> anyhow::Result<()> {
+        let mut tx = self.pool.begin().await?;
         for entry in entries {
-            let id = uuid::Uuid::new_v4().to_string();
+            let error_causes = serde_json::to_string(&entry.diagnostic.error_causes)?;
+            let payload_metadata = serde_json::to_string(&entry.diagnostic.payload_metadata)?;
             sqlx::query(
                 r#"INSERT INTO request_logs
                     (id, created_at, api_key_id, api_key_name,
@@ -1103,10 +1107,12 @@ impl LogStore for MysqlLogStore {
                      latency_total_ms, latency_upstream_ms,
                      input_tokens, output_tokens, cache_read_tokens,
                      is_stream, stream_chunks_count, stream_first_chunk_ms,
-                     performance_metadata_version, upstream_effort_status, upstream_effort_raw, upstream_effort_tier, request_completion, completion_reason, upstream_response_mode, performance_upstream_ms, performance_first_chunk_ms, performance_completed_at)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"#,
+                     performance_metadata_version, upstream_effort_status, upstream_effort_raw, upstream_effort_tier, request_completion, completion_reason, upstream_response_mode, performance_upstream_ms, performance_first_chunk_ms, performance_completed_at,
+                     client_request_id, attempt_index, outcome_version, attempt_outcome,
+                     failure_kind, failure_stage, error_message, error_causes_json, payload_metadata_json)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, ?,?,?,?,?,?,?,?,?)"#,
             )
-            .bind(&id)
+            .bind(&entry.diagnostic.log_id)
             .bind(entry.created_at)
             .bind(&entry.api_key_id)
             .bind(&entry.api_key_name)
@@ -1151,9 +1157,31 @@ impl LogStore for MysqlLogStore {
             .bind(entry.performance.upstream_duration_ms)
             .bind(entry.performance.first_chunk_ms)
             .bind(entry.performance.completed_at)
-            .execute(&self.pool)
+            .bind(&entry.diagnostic.client_request_id)
+            .bind(entry.diagnostic.attempt_index)
+            .bind(entry.diagnostic.outcome_version)
+            .bind(&entry.diagnostic.attempt_outcome)
+            .bind(&entry.diagnostic.failure_kind)
+            .bind(&entry.diagnostic.failure_stage)
+            .bind(&entry.diagnostic.error_message)
+            .bind(error_causes)
+            .bind(payload_metadata)
+            .execute(&mut *tx)
             .await?;
+            if let Some(result) = &entry.diagnostic.final_result {
+                sqlx::query(
+                    "INSERT INTO request_results (client_request_id, final_outcome, final_attempt_id, attempt_count, finished_at) VALUES (?, ?, ?, ?, ?) ON DUPLICATE KEY UPDATE final_outcome = VALUES(final_outcome), final_attempt_id = VALUES(final_attempt_id), attempt_count = VALUES(attempt_count), finished_at = VALUES(finished_at)",
+                )
+                .bind(&result.client_request_id)
+                .bind(&result.final_outcome)
+                .bind(&result.final_attempt_id)
+                .bind(result.attempt_count)
+                .bind(result.finished_at)
+                .execute(&mut *tx)
+                .await?;
+            }
         }
+        tx.commit().await?;
         Ok(())
     }
 
@@ -1172,7 +1200,10 @@ impl LogStore for MysqlLogStore {
              latency_total_ms, latency_upstream_ms, \
              input_tokens, output_tokens, COALESCE(cache_read_tokens, 0) AS cache_read_tokens, \
              COALESCE(is_stream, 0) AS is_stream, stream_chunks_count, stream_first_chunk_ms, \
-             performance_metadata_version, upstream_effort_status, upstream_effort_raw, upstream_effort_tier, request_completion, completion_reason, upstream_response_mode, performance_upstream_ms, performance_first_chunk_ms, performance_completed_at \
+             performance_metadata_version, upstream_effort_status, upstream_effort_raw, upstream_effort_tier, request_completion, completion_reason, upstream_response_mode, performance_upstream_ms, performance_first_chunk_ms, performance_completed_at, \
+             CAST(client_request_id AS CHAR CHARACTER SET utf8mb4) AS client_request_id, attempt_index, outcome_version, \
+             CAST(attempt_outcome AS CHAR CHARACTER SET utf8mb4) AS attempt_outcome, failure_kind, failure_stage, error_message, \
+             error_causes_json AS error_causes, payload_metadata_json AS payload_metadata, payload_cleared_at \
              FROM request_logs WHERE 1=1",
         );
         let mut bind_values: Vec<String> = Vec::new();
@@ -1205,6 +1236,33 @@ impl LogStore for MysqlLogStore {
             count_sql.push_str(" AND client_status_code <= ?");
             data_sql.push_str(" AND client_status_code <= ?");
             bind_values.push(status_max.to_string());
+        }
+        if let Some(is_error) = query.is_error {
+            let predicate = error_sql("");
+            let filter = if is_error {
+                format!(" AND {predicate}")
+            } else {
+                format!(" AND NOT {predicate}")
+            };
+            count_sql.push_str(&filter);
+            data_sql.push_str(&filter);
+        }
+        if let Some(outcome) = query.outcome {
+            anyhow::ensure!(
+                matches!(
+                    outcome.as_str(),
+                    "error" | "completed" | "cancelled" | "output_limited" | "unknown"
+                ),
+                "unsupported log outcome: {outcome}"
+            );
+            let filter = format!(" AND {}", outcome_sql("", &outcome));
+            count_sql.push_str(&filter);
+            data_sql.push_str(&filter);
+        }
+        if let Some(client_request_id) = query.client_request_id {
+            count_sql.push_str(" AND client_request_id = ?");
+            data_sql.push_str(" AND client_request_id = ?");
+            bind_values.push(client_request_id);
         }
         if let Some(api_key) = query.api_key.filter(|v| !v.is_empty()) {
             count_sql.push_str(" AND api_key_id = ?");
@@ -1253,7 +1311,10 @@ impl LogStore for MysqlLogStore {
              latency_total_ms, latency_upstream_ms, \
              input_tokens, output_tokens, COALESCE(cache_read_tokens, 0) AS cache_read_tokens, \
              COALESCE(is_stream, 0) AS is_stream, stream_chunks_count, stream_first_chunk_ms, \
-             performance_metadata_version, upstream_effort_status, upstream_effort_raw, upstream_effort_tier, request_completion, completion_reason, upstream_response_mode, performance_upstream_ms, performance_first_chunk_ms, performance_completed_at \
+             performance_metadata_version, upstream_effort_status, upstream_effort_raw, upstream_effort_tier, request_completion, completion_reason, upstream_response_mode, performance_upstream_ms, performance_first_chunk_ms, performance_completed_at, \
+             CAST(client_request_id AS CHAR CHARACTER SET utf8mb4) AS client_request_id, attempt_index, outcome_version, \
+             CAST(attempt_outcome AS CHAR CHARACTER SET utf8mb4) AS attempt_outcome, failure_kind, failure_stage, error_message, \
+             error_causes_json AS error_causes, payload_metadata_json AS payload_metadata, payload_cleared_at \
              FROM request_logs WHERE id = ?",
         )
         .bind(id)
@@ -1262,19 +1323,64 @@ impl LogStore for MysqlLogStore {
         Ok(row)
     }
 
+    async fn request_result(
+        &self,
+        client_request_id: &str,
+    ) -> anyhow::Result<Option<RequestResult>> {
+        Ok(sqlx::query_as::<_, RequestResult>(
+            "SELECT CAST(client_request_id AS CHAR CHARACTER SET utf8mb4) AS client_request_id, \
+             CAST(final_outcome AS CHAR CHARACTER SET utf8mb4) AS final_outcome, \
+             final_attempt_id, attempt_count, finished_at FROM request_results WHERE client_request_id = ?",
+        )
+        .bind(client_request_id)
+        .fetch_optional(&self.pool)
+        .await?)
+    }
+
     async fn cleanup_before(&self, cutoff_expression: &str) -> anyhow::Result<u64> {
         let interval = cutoff_expression.trim().trim_start_matches('-').trim();
-        let sql = format!(
-            "DELETE FROM request_logs WHERE created_at < UNIX_TIMESTAMP(NOW() - INTERVAL '{interval}') * 1000"
+        let mut parts = interval.split_whitespace();
+        let amount: i64 = parts
+            .next()
+            .context("missing log retention interval")?
+            .parse()?;
+        let unit = parts
+            .next()
+            .context("missing log retention interval unit")?
+            .to_ascii_lowercase();
+        let unit = match unit.trim_end_matches('s') {
+            "second" => "SECOND",
+            "minute" => "MINUTE",
+            "hour" => "HOUR",
+            "day" => "DAY",
+            "week" => "WEEK",
+            "month" => "MONTH",
+            "year" => "YEAR",
+            _ => anyhow::bail!("unsupported log retention interval unit"),
+        };
+        anyhow::ensure!(
+            amount >= 0 && parts.next().is_none(),
+            "invalid log retention interval"
         );
-        let result = sqlx::query(&sql).execute(&self.pool).await?;
+        let sql = format!(
+            "DELETE FROM request_logs WHERE created_at < UNIX_TIMESTAMP(NOW() - INTERVAL ? {unit}) * 1000"
+        );
+        let mut tx = self.pool.begin().await?;
+        let result = sqlx::query(&sql).bind(amount).execute(&mut *tx).await?;
+        mysql_cleanup_orphan_request_results(&mut tx).await?;
+        tx.commit().await?;
         Ok(result.rows_affected())
     }
 
     async fn clear_all(&self) -> anyhow::Result<u64> {
+        let mut tx = self.pool.begin().await?;
         let result = sqlx::query("DELETE FROM request_logs")
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
+        sqlx::query("DELETE FROM request_results")
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
         Ok(result.rows_affected())
     }
 
@@ -1284,41 +1390,49 @@ impl LogStore for MysqlLogStore {
              client_request_headers = NULL, client_request_body = NULL, \
              client_response_headers = NULL, client_response_body = NULL, \
              upstream_request_headers = NULL, upstream_request_body = NULL, \
-             upstream_response_headers = NULL, upstream_response_body = NULL \
+             upstream_response_headers = NULL, upstream_response_body = NULL, payload_cleared_at = ? \
              WHERE (client_request_headers IS NOT NULL OR client_request_body IS NOT NULL \
                 OR client_response_headers IS NOT NULL OR client_response_body IS NOT NULL \
                 OR upstream_request_headers IS NOT NULL OR upstream_request_body IS NOT NULL \
-                OR upstream_response_headers IS NOT NULL OR upstream_response_body IS NOT NULL) \
-               AND (client_status_code IS NULL OR client_status_code < 400 OR client_status_code > 599) \
-               AND (upstream_status_code IS NULL OR upstream_status_code < 400 OR upstream_status_code > 599)",
+                OR upstream_response_headers IS NOT NULL OR upstream_response_body IS NOT NULL)",
         )
+        .bind(chrono::Utc::now().timestamp_millis())
         .execute(&self.pool)
         .await?;
         Ok(result.rows_affected())
     }
 
     async fn delete_by_id(&self, id: &str) -> anyhow::Result<u64> {
+        let mut tx = self.pool.begin().await?;
         let result = sqlx::query("DELETE FROM request_logs WHERE id = ?")
             .bind(id)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
+        mysql_cleanup_orphan_request_results(&mut tx).await?;
+        tx.commit().await?;
         Ok(result.rows_affected())
     }
 
     async fn clear_errors(&self) -> anyhow::Result<u64> {
-        let result = sqlx::query("DELETE FROM request_logs WHERE client_status_code >= 400")
-            .execute(&self.pool)
+        let mut tx = self.pool.begin().await?;
+        let result = sqlx::query(&format!("DELETE FROM request_logs WHERE {}", error_sql("")))
+            .execute(&mut *tx)
             .await?;
+        mysql_cleanup_orphan_request_results(&mut tx).await?;
+        tx.commit().await?;
         Ok(result.rows_affected())
     }
 
     async fn stats_overview(&self, hours: Option<i64>) -> anyhow::Result<StatsOverview> {
+        let error = error_sql("");
         let sql = if let Some(hours) = hours {
             format!(
-                "SELECT COUNT(*) AS total_requests, CAST(COALESCE(SUM(input_tokens), 0) AS SIGNED) AS total_input_tokens, CAST(COALESCE(SUM(output_tokens), 0) AS SIGNED) AS total_output_tokens, CAST(COALESCE(SUM(cache_read_tokens), 0) AS SIGNED) AS total_cache_read_tokens, CAST(COALESCE(AVG(latency_total_ms), 0) AS DOUBLE) AS avg_duration_ms, CAST(COALESCE(SUM(CASE WHEN client_status_code >= 400 THEN 1 ELSE 0 END), 0) AS SIGNED) AS error_count FROM request_logs WHERE created_at >= UNIX_TIMESTAMP(NOW() - INTERVAL {hours} HOUR) * 1000"
+                "SELECT COUNT(*) AS total_requests, CAST(COALESCE(SUM(input_tokens), 0) AS SIGNED) AS total_input_tokens, CAST(COALESCE(SUM(output_tokens), 0) AS SIGNED) AS total_output_tokens, CAST(COALESCE(SUM(cache_read_tokens), 0) AS SIGNED) AS total_cache_read_tokens, CAST(COALESCE(AVG(latency_total_ms), 0) AS DOUBLE) AS avg_duration_ms, CAST(COALESCE(SUM(CASE WHEN {error} THEN 1 ELSE 0 END), 0) AS SIGNED) AS error_count FROM request_logs WHERE created_at >= UNIX_TIMESTAMP(NOW() - INTERVAL {hours} HOUR) * 1000"
             )
         } else {
-            "SELECT COUNT(*) AS total_requests, CAST(COALESCE(SUM(input_tokens), 0) AS SIGNED) AS total_input_tokens, CAST(COALESCE(SUM(output_tokens), 0) AS SIGNED) AS total_output_tokens, CAST(COALESCE(SUM(cache_read_tokens), 0) AS SIGNED) AS total_cache_read_tokens, CAST(COALESCE(AVG(latency_total_ms), 0) AS DOUBLE) AS avg_duration_ms, CAST(COALESCE(SUM(CASE WHEN client_status_code >= 400 THEN 1 ELSE 0 END), 0) AS SIGNED) AS error_count FROM request_logs".to_string()
+            format!(
+                "SELECT COUNT(*) AS total_requests, CAST(COALESCE(SUM(input_tokens), 0) AS SIGNED) AS total_input_tokens, CAST(COALESCE(SUM(output_tokens), 0) AS SIGNED) AS total_output_tokens, CAST(COALESCE(SUM(cache_read_tokens), 0) AS SIGNED) AS total_cache_read_tokens, CAST(COALESCE(AVG(latency_total_ms), 0) AS DOUBLE) AS avg_duration_ms, CAST(COALESCE(SUM(CASE WHEN {error} THEN 1 ELSE 0 END), 0) AS SIGNED) AS error_count FROM request_logs"
+            )
         };
         Ok(sqlx::query_as::<_, StatsOverview>(&sql)
             .fetch_one(&self.pool)
@@ -1326,8 +1440,9 @@ impl LogStore for MysqlLogStore {
     }
 
     async fn stats_hourly(&self, hours: i64) -> anyhow::Result<Vec<StatsHourly>> {
+        let error = error_sql("");
         let sql = format!(
-            "SELECT DATE_FORMAT(FROM_UNIXTIME(created_at/1000), '%Y-%m-%d %H:00:00') AS hour, COUNT(*) AS request_count, CAST(COALESCE(SUM(CASE WHEN client_status_code >= 400 THEN 1 ELSE 0 END), 0) AS SIGNED) AS error_count, CAST(COALESCE(SUM(input_tokens), 0) AS SIGNED) AS total_input_tokens, CAST(COALESCE(SUM(output_tokens), 0) AS SIGNED) AS total_output_tokens, CAST(COALESCE(SUM(cache_read_tokens), 0) AS SIGNED) AS total_cache_read_tokens, CAST(COALESCE(AVG(latency_total_ms), 0) AS DOUBLE) AS avg_duration_ms FROM request_logs WHERE created_at >= UNIX_TIMESTAMP(NOW() - INTERVAL {hours} HOUR) * 1000 GROUP BY hour ORDER BY hour ASC"
+            "SELECT DATE_FORMAT(FROM_UNIXTIME(created_at/1000), '%Y-%m-%d %H:00:00') AS hour, COUNT(*) AS request_count, CAST(COALESCE(SUM(CASE WHEN {error} THEN 1 ELSE 0 END), 0) AS SIGNED) AS error_count, CAST(COALESCE(SUM(input_tokens), 0) AS SIGNED) AS total_input_tokens, CAST(COALESCE(SUM(output_tokens), 0) AS SIGNED) AS total_output_tokens, CAST(COALESCE(SUM(cache_read_tokens), 0) AS SIGNED) AS total_cache_read_tokens, CAST(COALESCE(AVG(latency_total_ms), 0) AS DOUBLE) AS avg_duration_ms FROM request_logs WHERE created_at >= UNIX_TIMESTAMP(NOW() - INTERVAL {hours} HOUR) * 1000 GROUP BY hour ORDER BY hour ASC"
         );
         Ok(sqlx::query_as::<_, StatsHourly>(&sql)
             .fetch_all(&self.pool)
@@ -1342,8 +1457,9 @@ impl LogStore for MysqlLogStore {
         upstream_model: Option<&str>,
     ) -> anyhow::Result<Vec<StatsTimeBucket>> {
         anyhow::ensure!(bucket_ms > 0, "stats bucket must be positive");
+        let error = error_sql("");
         Ok(sqlx::query_as::<_, StatsTimeBucket>(
-            "SELECT CAST(FLOOR(created_at / ?) * ? AS SIGNED) AS bucket_start, COUNT(*) AS request_count, CAST(COALESCE(SUM(CASE WHEN client_status_code >= 400 THEN 1 ELSE 0 END), 0) AS SIGNED) AS error_count, CAST(COALESCE(SUM(input_tokens), 0) AS SIGNED) AS total_input_tokens, CAST(COALESCE(SUM(output_tokens), 0) AS SIGNED) AS total_output_tokens, CAST(COALESCE(SUM(cache_read_tokens), 0) AS SIGNED) AS total_cache_read_tokens, CAST(AVG(latency_total_ms) AS DOUBLE) AS avg_duration_ms FROM request_logs WHERE created_at >= ? AND created_at <= ? AND (? IS NULL OR upstream_model = ?) GROUP BY bucket_start ORDER BY bucket_start ASC",
+            &format!("SELECT CAST(FLOOR(created_at / ?) * ? AS SIGNED) AS bucket_start, COUNT(*) AS request_count, CAST(COALESCE(SUM(CASE WHEN {error} THEN 1 ELSE 0 END), 0) AS SIGNED) AS error_count, CAST(COALESCE(SUM(input_tokens), 0) AS SIGNED) AS total_input_tokens, CAST(COALESCE(SUM(output_tokens), 0) AS SIGNED) AS total_output_tokens, CAST(COALESCE(SUM(cache_read_tokens), 0) AS SIGNED) AS total_cache_read_tokens, CAST(AVG(latency_total_ms) AS DOUBLE) AS avg_duration_ms FROM request_logs WHERE created_at >= ? AND created_at <= ? AND (? IS NULL OR upstream_model = ?) GROUP BY bucket_start ORDER BY bucket_start ASC"),
         )
         .bind(bucket_ms)
         .bind(bucket_ms)
@@ -1363,8 +1479,9 @@ impl LogStore for MysqlLogStore {
         bucket_ms: i64,
     ) -> anyhow::Result<Vec<ModelTimeBucket>> {
         anyhow::ensure!(bucket_ms > 0, "stats bucket must be positive");
+        let error = error_sql("");
         Ok(sqlx::query_as::<_, ModelTimeBucket>(
-            "SELECT COALESCE(upstream_model, '') AS upstream_model, CAST(FLOOR(created_at / ?) * ? AS SIGNED) AS bucket_start, COUNT(*) AS request_count, CAST(COALESCE(SUM(CASE WHEN client_status_code >= 400 THEN 1 ELSE 0 END), 0) AS SIGNED) AS error_count, CAST(COALESCE(SUM(input_tokens), 0) AS SIGNED) AS total_input_tokens, CAST(COALESCE(SUM(output_tokens), 0) AS SIGNED) AS total_output_tokens, CAST(COALESCE(SUM(cache_read_tokens), 0) AS SIGNED) AS total_cache_read_tokens, CAST(AVG(latency_total_ms) AS DOUBLE) AS avg_duration_ms FROM request_logs WHERE api_key_id = ? AND created_at >= ? AND created_at <= ? GROUP BY upstream_model, bucket_start ORDER BY upstream_model ASC, bucket_start ASC",
+            &format!("SELECT COALESCE(upstream_model, '') AS upstream_model, CAST(FLOOR(created_at / ?) * ? AS SIGNED) AS bucket_start, COUNT(*) AS request_count, CAST(COALESCE(SUM(CASE WHEN {error} THEN 1 ELSE 0 END), 0) AS SIGNED) AS error_count, CAST(COALESCE(SUM(input_tokens), 0) AS SIGNED) AS total_input_tokens, CAST(COALESCE(SUM(output_tokens), 0) AS SIGNED) AS total_output_tokens, CAST(COALESCE(SUM(cache_read_tokens), 0) AS SIGNED) AS total_cache_read_tokens, CAST(AVG(latency_total_ms) AS DOUBLE) AS avg_duration_ms FROM request_logs WHERE api_key_id = ? AND created_at >= ? AND created_at <= ? GROUP BY upstream_model, bucket_start ORDER BY upstream_model ASC, bucket_start ASC"),
         )
         .bind(bucket_ms)
         .bind(bucket_ms)
@@ -1418,13 +1535,14 @@ impl LogStore for MysqlLogStore {
         Ok(ModelUsageStats::from_samples(totals, &samples))
     }
     async fn stats_by_provider(&self, hours: Option<i64>) -> anyhow::Result<Vec<ProviderStats>> {
+        let error = error_sql("");
         let time_filter = hours
             .map(|hours| {
                 format!(" AND created_at >= UNIX_TIMESTAMP(NOW() - INTERVAL {hours} HOUR) * 1000")
             })
             .unwrap_or_default();
         let sql = format!(
-            "WITH aggregated AS (SELECT provider_id, COUNT(*) AS request_count, CAST(COALESCE(SUM(CASE WHEN client_status_code >= 400 THEN 1 ELSE 0 END), 0) AS SIGNED) AS error_count, CAST(COALESCE(AVG(latency_total_ms), 0) AS DOUBLE) AS avg_duration_ms, CAST(COALESCE(SUM(output_tokens), 0) AS SIGNED) AS total_output_tokens, CAST(COALESCE(SUM(latency_upstream_ms), 0) AS DOUBLE) AS total_upstream_ms FROM request_logs WHERE provider_id IS NOT NULL AND TRIM(provider_id) <> ''{time_filter} GROUP BY provider_id) SELECT a.provider_id, COALESCE((SELECT NULLIF(TRIM(r.provider_name), '') FROM request_logs r WHERE r.provider_id = a.provider_id AND NULLIF(TRIM(r.provider_name), '') IS NOT NULL ORDER BY r.created_at DESC, r.id DESC LIMIT 1), a.provider_id) AS provider, CAST(NULL AS CHAR) AS provider_icon, CAST(NULL AS CHAR) AS provider_protocol, a.request_count, a.error_count, a.avg_duration_ms, a.total_output_tokens, a.total_upstream_ms FROM aggregated a ORDER BY a.request_count DESC, a.provider_id ASC"
+            "WITH aggregated AS (SELECT provider_id, COUNT(*) AS request_count, CAST(COALESCE(SUM(CASE WHEN {error} THEN 1 ELSE 0 END), 0) AS SIGNED) AS error_count, CAST(COALESCE(AVG(latency_total_ms), 0) AS DOUBLE) AS avg_duration_ms, CAST(COALESCE(SUM(output_tokens), 0) AS SIGNED) AS total_output_tokens, CAST(COALESCE(SUM(latency_upstream_ms), 0) AS DOUBLE) AS total_upstream_ms FROM request_logs WHERE provider_id IS NOT NULL AND TRIM(provider_id) <> ''{time_filter} GROUP BY provider_id) SELECT a.provider_id, COALESCE((SELECT NULLIF(TRIM(r.provider_name), '') FROM request_logs r WHERE r.provider_id = a.provider_id AND NULLIF(TRIM(r.provider_name), '') IS NOT NULL ORDER BY r.created_at DESC, r.id DESC LIMIT 1), a.provider_id) AS provider, CAST(NULL AS CHAR) AS provider_icon, CAST(NULL AS CHAR) AS provider_protocol, a.request_count, a.error_count, a.avg_duration_ms, a.total_output_tokens, a.total_upstream_ms FROM aggregated a ORDER BY a.request_count DESC, a.provider_id ASC"
         );
         Ok(sqlx::query_as::<_, ProviderStats>(&sql)
             .fetch_all(&self.pool)
@@ -1443,6 +1561,9 @@ impl LogStore for MysqlLogStore {
             request_count: i64,
             success_count: i64,
             error_count: i64,
+            unknown_count: i64,
+            cancelled_count: i64,
+            output_limited_count: i64,
             total_input_tokens: i64,
             total_output_tokens: i64,
             total_cache_read_tokens: i64,
@@ -1451,8 +1572,10 @@ impl LogStore for MysqlLogStore {
             total_upstream_ms: f64,
             last_used_at: Option<i64>,
         }
-        let summary = sqlx::query_as::<_, SummaryRow>("SELECT COALESCE((SELECT NULLIF(TRIM(r.provider_name), '') FROM request_logs r WHERE r.provider_id = ? AND NULLIF(TRIM(r.provider_name), '') IS NOT NULL ORDER BY r.created_at DESC, r.id DESC LIMIT 1), ?) AS provider_name, COUNT(*) AS request_count, CAST(COALESCE(SUM(CASE WHEN client_status_code >= 200 AND client_status_code < 300 THEN 1 ELSE 0 END), 0) AS SIGNED) AS success_count, CAST(COALESCE(SUM(CASE WHEN client_status_code >= 400 THEN 1 ELSE 0 END), 0) AS SIGNED) AS error_count, CAST(COALESCE(SUM(input_tokens), 0) AS SIGNED) AS total_input_tokens, CAST(COALESCE(SUM(output_tokens), 0) AS SIGNED) AS total_output_tokens, CAST(COALESCE(SUM(cache_read_tokens), 0) AS SIGNED) AS total_cache_read_tokens, CAST(COALESCE(AVG(latency_total_ms), 0) AS DOUBLE) AS avg_duration_ms, CAST(AVG(CASE WHEN stream_first_chunk_ms >= 0 THEN stream_first_chunk_ms END) AS DOUBLE) AS avg_first_token_ms, CAST(COALESCE(SUM(latency_upstream_ms), 0) AS DOUBLE) AS total_upstream_ms, CAST(MAX(created_at) AS SIGNED) AS last_used_at FROM request_logs WHERE provider_id = ? AND created_at >= ? AND created_at <= ?").bind(provider_id).bind(provider_id).bind(provider_id).bind(start_at).bind(end_at).fetch_one(&self.pool).await?;
-        let models = sqlx::query_as::<_, ProviderModelUsageStats>("SELECT COALESCE(upstream_model, '') AS upstream_model, COUNT(*) AS request_count, CAST(COALESCE(SUM(CASE WHEN client_status_code >= 400 THEN 1 ELSE 0 END), 0) AS SIGNED) AS error_count, CAST(COALESCE(SUM(input_tokens), 0) AS SIGNED) AS total_input_tokens, CAST(COALESCE(SUM(output_tokens), 0) AS SIGNED) AS total_output_tokens, CAST(COALESCE(SUM(cache_read_tokens), 0) AS SIGNED) AS total_cache_read_tokens, CAST(COALESCE(AVG(latency_total_ms), 0) AS DOUBLE) AS avg_duration_ms, CAST(AVG(CASE WHEN stream_first_chunk_ms >= 0 THEN stream_first_chunk_ms END) AS DOUBLE) AS avg_first_token_ms, CAST(COALESCE(SUM(latency_upstream_ms), 0) AS DOUBLE) AS total_upstream_ms, CAST(MAX(created_at) AS SIGNED) AS last_used_at FROM request_logs WHERE provider_id = ? AND created_at >= ? AND created_at <= ? GROUP BY COALESCE(upstream_model, '') ORDER BY request_count DESC, upstream_model ASC").bind(provider_id).bind(start_at).bind(end_at).fetch_all(&self.pool).await?;
+        let outcome_counts = mysql_outcome_counts("");
+        let error = error_sql("");
+        let summary = sqlx::query_as::<_, SummaryRow>(&format!("SELECT COALESCE((SELECT NULLIF(TRIM(r.provider_name), '') FROM request_logs r WHERE r.provider_id = ? AND NULLIF(TRIM(r.provider_name), '') IS NOT NULL ORDER BY r.created_at DESC, r.id DESC LIMIT 1), ?) AS provider_name, COUNT(*) AS request_count, {outcome_counts}, CAST(COALESCE(SUM(input_tokens), 0) AS SIGNED) AS total_input_tokens, CAST(COALESCE(SUM(output_tokens), 0) AS SIGNED) AS total_output_tokens, CAST(COALESCE(SUM(cache_read_tokens), 0) AS SIGNED) AS total_cache_read_tokens, CAST(COALESCE(AVG(latency_total_ms), 0) AS DOUBLE) AS avg_duration_ms, CAST(AVG(CASE WHEN stream_first_chunk_ms >= 0 THEN stream_first_chunk_ms END) AS DOUBLE) AS avg_first_token_ms, CAST(COALESCE(SUM(latency_upstream_ms), 0) AS DOUBLE) AS total_upstream_ms, CAST(MAX(created_at) AS SIGNED) AS last_used_at FROM request_logs WHERE provider_id = ? AND created_at >= ? AND created_at <= ?")).bind(provider_id).bind(provider_id).bind(provider_id).bind(start_at).bind(end_at).fetch_one(&self.pool).await?;
+        let models = sqlx::query_as::<_, ProviderModelUsageStats>(&format!("SELECT COALESCE(upstream_model, '') AS upstream_model, COUNT(*) AS request_count, CAST(COALESCE(SUM(CASE WHEN {error} THEN 1 ELSE 0 END), 0) AS SIGNED) AS error_count, CAST(COALESCE(SUM(input_tokens), 0) AS SIGNED) AS total_input_tokens, CAST(COALESCE(SUM(output_tokens), 0) AS SIGNED) AS total_output_tokens, CAST(COALESCE(SUM(cache_read_tokens), 0) AS SIGNED) AS total_cache_read_tokens, CAST(COALESCE(AVG(latency_total_ms), 0) AS DOUBLE) AS avg_duration_ms, CAST(AVG(CASE WHEN stream_first_chunk_ms >= 0 THEN stream_first_chunk_ms END) AS DOUBLE) AS avg_first_token_ms, CAST(COALESCE(SUM(latency_upstream_ms), 0) AS DOUBLE) AS total_upstream_ms, CAST(MAX(created_at) AS SIGNED) AS last_used_at FROM request_logs WHERE provider_id = ? AND created_at >= ? AND created_at <= ? GROUP BY COALESCE(upstream_model, '') ORDER BY request_count DESC, upstream_model ASC")).bind(provider_id).bind(start_at).bind(end_at).fetch_all(&self.pool).await?;
         Ok(ProviderUsageDetail {
             start_at,
             end_at,
@@ -1463,6 +1586,10 @@ impl LogStore for MysqlLogStore {
             request_count: summary.request_count,
             success_count: summary.success_count,
             error_count: summary.error_count,
+            unknown_count: summary.unknown_count,
+            cancelled_count: summary.cancelled_count,
+            output_limited_count: summary.output_limited_count,
+            outcome_stats_version: 1,
             total_input_tokens: summary.total_input_tokens,
             total_output_tokens: summary.total_output_tokens,
             total_cache_read_tokens: summary.total_cache_read_tokens,
@@ -1475,6 +1602,7 @@ impl LogStore for MysqlLogStore {
     }
 
     async fn stats_by_api_key(&self, hours: Option<i64>) -> anyhow::Result<Vec<ApiKeyStats>> {
+        let error = error_sql("l");
         let time_filter = hours
             .map(|hours| {
                 format!(" AND created_at >= UNIX_TIMESTAMP(NOW() - INTERVAL {hours} HOUR) * 1000")
@@ -1486,7 +1614,7 @@ impl LogStore for MysqlLogStore {
                        WHERE r.api_key_id = l.api_key_id \
                        ORDER BY r.created_at DESC, r.id DESC LIMIT 1), l.api_key_id, '') AS api_key_name, \
              COUNT(*) AS request_count, \
-             CAST(COALESCE(SUM(CASE WHEN l.client_status_code >= 400 THEN 1 ELSE 0 END), 0) AS SIGNED) AS error_count, \
+             CAST(COALESCE(SUM(CASE WHEN {error} THEN 1 ELSE 0 END), 0) AS SIGNED) AS error_count, \
              CAST(COALESCE(SUM(l.input_tokens), 0) AS SIGNED) AS total_input_tokens, \
              CAST(COALESCE(SUM(l.output_tokens), 0) AS SIGNED) AS total_output_tokens, \
              CAST(COALESCE(SUM(l.cache_read_tokens), 0) AS SIGNED) AS cache_read_tokens, \
@@ -1511,6 +1639,9 @@ impl LogStore for MysqlLogStore {
             request_count: i64,
             success_count: i64,
             error_count: i64,
+            unknown_count: i64,
+            cancelled_count: i64,
+            output_limited_count: i64,
             total_input_tokens: i64,
             total_output_tokens: i64,
             total_cache_read_tokens: i64,
@@ -1519,20 +1650,21 @@ impl LogStore for MysqlLogStore {
             last_used_at: Option<i64>,
         }
 
+        let outcome_counts = mysql_outcome_counts("");
+        let error = error_sql("");
         let summary = sqlx::query_as::<_, SummaryRow>(
-            "SELECT COALESCE((SELECT NULLIF(r.api_key_name, '') FROM request_logs r \
+            &format!("SELECT COALESCE((SELECT NULLIF(r.api_key_name, '') FROM request_logs r \
                               WHERE r.api_key_id = ? \
                               ORDER BY r.created_at DESC, r.id DESC LIMIT 1), ?) AS api_key_name, \
              COUNT(*) AS request_count, \
-             CAST(COALESCE(SUM(CASE WHEN client_status_code >= 200 AND client_status_code < 300 THEN 1 ELSE 0 END), 0) AS SIGNED) AS success_count, \
-             CAST(COALESCE(SUM(CASE WHEN client_status_code >= 400 THEN 1 ELSE 0 END), 0) AS SIGNED) AS error_count, \
+             {outcome_counts}, \
              CAST(COALESCE(SUM(input_tokens), 0) AS SIGNED) AS total_input_tokens, \
              CAST(COALESCE(SUM(output_tokens), 0) AS SIGNED) AS total_output_tokens, \
              CAST(COALESCE(SUM(cache_read_tokens), 0) AS SIGNED) AS total_cache_read_tokens, \
              CAST(COALESCE(AVG(latency_total_ms), 0) AS DOUBLE) AS avg_duration_ms, \
              CAST(AVG(CASE WHEN stream_first_chunk_ms >= 0 THEN stream_first_chunk_ms END) AS DOUBLE) AS avg_first_token_ms, \
              CAST(MAX(created_at) AS SIGNED) AS last_used_at \
-             FROM request_logs WHERE api_key_id = ? AND created_at >= ? AND created_at <= ?",
+             FROM request_logs WHERE api_key_id = ? AND created_at >= ? AND created_at <= ?"),
         )
         .bind(api_key_id)
         .bind(api_key_id)
@@ -1543,11 +1675,11 @@ impl LogStore for MysqlLogStore {
         .await?;
 
         let model_routes = sqlx::query_as::<_, ApiKeyModelRouteStats>(
-            "WITH grouped AS (SELECT COALESCE(client_model, '') AS client_model, \
+            &format!("WITH grouped AS (SELECT COALESCE(client_model, '') AS client_model, \
              COALESCE(provider_id, '') AS provider_id, \
              COALESCE(upstream_model, '') AS upstream_model, \
              COUNT(*) AS request_count, \
-             CAST(COALESCE(SUM(CASE WHEN client_status_code >= 400 THEN 1 ELSE 0 END), 0) AS SIGNED) AS error_count, \
+             CAST(COALESCE(SUM(CASE WHEN {error} THEN 1 ELSE 0 END), 0) AS SIGNED) AS error_count, \
              CAST(COALESCE(SUM(input_tokens), 0) AS SIGNED) AS total_input_tokens, \
              CAST(COALESCE(SUM(output_tokens), 0) AS SIGNED) AS total_output_tokens, \
              CAST(COALESCE(SUM(cache_read_tokens), 0) AS SIGNED) AS total_cache_read_tokens, \
@@ -1564,7 +1696,7 @@ impl LogStore for MysqlLogStore {
              g.upstream_model, g.request_count, g.error_count, g.total_input_tokens, g.total_output_tokens, \
              g.total_cache_read_tokens, g.avg_duration_ms, g.avg_first_token_ms, g.total_upstream_ms \
              FROM grouped g LEFT JOIN latest_provider p ON p.provider_id = g.provider_id AND p.row_num = 1 \
-             ORDER BY g.request_count DESC, g.client_model ASC, g.provider_id ASC, g.upstream_model ASC",
+             ORDER BY g.request_count DESC, g.client_model ASC, g.provider_id ASC, g.upstream_model ASC"),
         )
         .bind(api_key_id)
         .bind(start_at)
@@ -1580,6 +1712,10 @@ impl LogStore for MysqlLogStore {
             request_count: summary.request_count,
             success_count: summary.success_count,
             error_count: summary.error_count,
+            unknown_count: summary.unknown_count,
+            cancelled_count: summary.cancelled_count,
+            output_limited_count: summary.output_limited_count,
+            outcome_stats_version: 1,
             total_input_tokens: summary.total_input_tokens,
             total_output_tokens: summary.total_output_tokens,
             total_cache_read_tokens: summary.total_cache_read_tokens,
@@ -1602,6 +1738,9 @@ impl LogStore for MysqlLogStore {
             request_count: i64,
             success_count: i64,
             error_count: i64,
+            unknown_count: i64,
+            cancelled_count: i64,
+            output_limited_count: i64,
             total_input_tokens: i64,
             total_output_tokens: i64,
             total_cache_read_tokens: i64,
@@ -1610,8 +1749,10 @@ impl LogStore for MysqlLogStore {
             total_upstream_ms: f64,
             last_used_at: Option<i64>,
         }
+        let outcome_counts = mysql_outcome_counts("");
+        let error = error_sql("");
         let summary = sqlx::query_as::<_, SummaryRow>(
-            "SELECT COUNT(*) AS request_count,              CAST(COALESCE(SUM(CASE WHEN client_status_code >= 200 AND client_status_code < 300 THEN 1 ELSE 0 END), 0) AS SIGNED) AS success_count,              CAST(COALESCE(SUM(CASE WHEN client_status_code >= 400 THEN 1 ELSE 0 END), 0) AS SIGNED) AS error_count,              CAST(COALESCE(SUM(input_tokens), 0) AS SIGNED) AS total_input_tokens,              CAST(COALESCE(SUM(output_tokens), 0) AS SIGNED) AS total_output_tokens,              CAST(COALESCE(SUM(cache_read_tokens), 0) AS SIGNED) AS total_cache_read_tokens,              CAST(COALESCE(AVG(latency_total_ms), 0) AS DOUBLE) AS avg_duration_ms,              CAST(AVG(CASE WHEN stream_first_chunk_ms >= 0 THEN stream_first_chunk_ms END) AS DOUBLE) AS avg_first_token_ms,              CAST(COALESCE(SUM(latency_upstream_ms), 0) AS DOUBLE) AS total_upstream_ms,              CAST(MAX(created_at) AS SIGNED) AS last_used_at              FROM request_logs WHERE upstream_model = ? AND created_at >= ? AND created_at <= ?",
+            &format!("SELECT COUNT(*) AS request_count, {outcome_counts},              CAST(COALESCE(SUM(input_tokens), 0) AS SIGNED) AS total_input_tokens,              CAST(COALESCE(SUM(output_tokens), 0) AS SIGNED) AS total_output_tokens,              CAST(COALESCE(SUM(cache_read_tokens), 0) AS SIGNED) AS total_cache_read_tokens,              CAST(COALESCE(AVG(latency_total_ms), 0) AS DOUBLE) AS avg_duration_ms,              CAST(AVG(CASE WHEN stream_first_chunk_ms >= 0 THEN stream_first_chunk_ms END) AS DOUBLE) AS avg_first_token_ms,              CAST(COALESCE(SUM(latency_upstream_ms), 0) AS DOUBLE) AS total_upstream_ms,              CAST(MAX(created_at) AS SIGNED) AS last_used_at              FROM request_logs WHERE upstream_model = ? AND created_at >= ? AND created_at <= ?"),
         )
         .bind(upstream_model)
         .bind(start_at)
@@ -1619,7 +1760,7 @@ impl LogStore for MysqlLogStore {
         .fetch_one(&self.pool)
         .await?;
         let providers = sqlx::query_as::<_, ModelProviderUsageStats>(
-            "WITH aggregated AS (SELECT provider_id, COUNT(*) AS request_count,              CAST(COALESCE(SUM(CASE WHEN client_status_code >= 400 THEN 1 ELSE 0 END), 0) AS SIGNED) AS error_count,              CAST(COALESCE(SUM(input_tokens), 0) AS SIGNED) AS total_input_tokens,              CAST(COALESCE(SUM(output_tokens), 0) AS SIGNED) AS total_output_tokens,              CAST(COALESCE(SUM(cache_read_tokens), 0) AS SIGNED) AS total_cache_read_tokens,              CAST(COALESCE(AVG(latency_total_ms), 0) AS DOUBLE) AS avg_duration_ms,              CAST(AVG(CASE WHEN stream_first_chunk_ms >= 0 THEN stream_first_chunk_ms END) AS DOUBLE) AS avg_first_token_ms,              CAST(COALESCE(SUM(latency_upstream_ms), 0) AS DOUBLE) AS total_upstream_ms,              CAST(MAX(created_at) AS SIGNED) AS last_used_at              FROM request_logs WHERE upstream_model = ? AND provider_id IS NOT NULL AND TRIM(provider_id) <> ''              AND created_at >= ? AND created_at <= ? GROUP BY provider_id)              SELECT a.provider_id, COALESCE((SELECT NULLIF(TRIM(r.provider_name), '') FROM request_logs r              WHERE r.provider_id = a.provider_id AND NULLIF(TRIM(r.provider_name), '') IS NOT NULL              ORDER BY r.created_at DESC, r.id DESC LIMIT 1), a.provider_id) AS provider_name,              CAST(NULL AS CHAR) AS provider_icon, CAST(NULL AS CHAR) AS provider_protocol,              a.request_count, a.error_count, a.total_input_tokens, a.total_output_tokens,              a.total_cache_read_tokens, a.avg_duration_ms, a.avg_first_token_ms, a.total_upstream_ms,              a.last_used_at FROM aggregated a ORDER BY a.request_count DESC, a.provider_id ASC",
+            &format!("WITH aggregated AS (SELECT provider_id, COUNT(*) AS request_count,              CAST(COALESCE(SUM(CASE WHEN {error} THEN 1 ELSE 0 END), 0) AS SIGNED) AS error_count,              CAST(COALESCE(SUM(input_tokens), 0) AS SIGNED) AS total_input_tokens,              CAST(COALESCE(SUM(output_tokens), 0) AS SIGNED) AS total_output_tokens,              CAST(COALESCE(SUM(cache_read_tokens), 0) AS SIGNED) AS total_cache_read_tokens,              CAST(COALESCE(AVG(latency_total_ms), 0) AS DOUBLE) AS avg_duration_ms,              CAST(AVG(CASE WHEN stream_first_chunk_ms >= 0 THEN stream_first_chunk_ms END) AS DOUBLE) AS avg_first_token_ms,              CAST(COALESCE(SUM(latency_upstream_ms), 0) AS DOUBLE) AS total_upstream_ms,              CAST(MAX(created_at) AS SIGNED) AS last_used_at              FROM request_logs WHERE upstream_model = ? AND provider_id IS NOT NULL AND TRIM(provider_id) <> ''              AND created_at >= ? AND created_at <= ? GROUP BY provider_id)              SELECT a.provider_id, COALESCE((SELECT NULLIF(TRIM(r.provider_name), '') FROM request_logs r              WHERE r.provider_id = a.provider_id AND NULLIF(TRIM(r.provider_name), '') IS NOT NULL              ORDER BY r.created_at DESC, r.id DESC LIMIT 1), a.provider_id) AS provider_name,              CAST(NULL AS CHAR) AS provider_icon, CAST(NULL AS CHAR) AS provider_protocol,              a.request_count, a.error_count, a.total_input_tokens, a.total_output_tokens,              a.total_cache_read_tokens, a.avg_duration_ms, a.avg_first_token_ms, a.total_upstream_ms,              a.last_used_at FROM aggregated a ORDER BY a.request_count DESC, a.provider_id ASC"),
         )
         .bind(upstream_model)
         .bind(start_at)
@@ -1627,7 +1768,7 @@ impl LogStore for MysqlLogStore {
         .fetch_all(&self.pool)
         .await?;
         let api_keys = sqlx::query_as::<_, ModelApiKeyUsageStats>(
-            "WITH aggregated AS (SELECT api_key_id, COUNT(*) AS request_count,              CAST(COALESCE(SUM(CASE WHEN client_status_code >= 400 THEN 1 ELSE 0 END), 0) AS SIGNED) AS error_count,              CAST(COALESCE(SUM(input_tokens), 0) AS SIGNED) AS total_input_tokens,              CAST(COALESCE(SUM(output_tokens), 0) AS SIGNED) AS total_output_tokens,              CAST(COALESCE(SUM(cache_read_tokens), 0) AS SIGNED) AS total_cache_read_tokens,              CAST(COALESCE(AVG(latency_total_ms), 0) AS DOUBLE) AS avg_duration_ms,              CAST(AVG(CASE WHEN stream_first_chunk_ms >= 0 THEN stream_first_chunk_ms END) AS DOUBLE) AS avg_first_token_ms,              CAST(COALESCE(SUM(latency_upstream_ms), 0) AS DOUBLE) AS total_upstream_ms,              CAST(MAX(created_at) AS SIGNED) AS last_used_at              FROM request_logs WHERE upstream_model = ? AND api_key_id IS NOT NULL AND api_key_id <> ''              AND created_at >= ? AND created_at <= ? GROUP BY api_key_id)              SELECT a.api_key_id, COALESCE((SELECT NULLIF(r.api_key_name, '') FROM request_logs r              WHERE r.api_key_id = a.api_key_id ORDER BY r.created_at DESC, r.id DESC LIMIT 1),              a.api_key_id) AS api_key_name,              a.request_count, a.error_count, a.total_input_tokens, a.total_output_tokens,              a.total_cache_read_tokens, a.avg_duration_ms, a.avg_first_token_ms, a.total_upstream_ms,              a.last_used_at FROM aggregated a ORDER BY a.request_count DESC, a.api_key_id ASC",
+            &format!("WITH aggregated AS (SELECT api_key_id, COUNT(*) AS request_count,              CAST(COALESCE(SUM(CASE WHEN {error} THEN 1 ELSE 0 END), 0) AS SIGNED) AS error_count,              CAST(COALESCE(SUM(input_tokens), 0) AS SIGNED) AS total_input_tokens,              CAST(COALESCE(SUM(output_tokens), 0) AS SIGNED) AS total_output_tokens,              CAST(COALESCE(SUM(cache_read_tokens), 0) AS SIGNED) AS total_cache_read_tokens,              CAST(COALESCE(AVG(latency_total_ms), 0) AS DOUBLE) AS avg_duration_ms,              CAST(AVG(CASE WHEN stream_first_chunk_ms >= 0 THEN stream_first_chunk_ms END) AS DOUBLE) AS avg_first_token_ms,              CAST(COALESCE(SUM(latency_upstream_ms), 0) AS DOUBLE) AS total_upstream_ms,              CAST(MAX(created_at) AS SIGNED) AS last_used_at              FROM request_logs WHERE upstream_model = ? AND api_key_id IS NOT NULL AND api_key_id <> ''              AND created_at >= ? AND created_at <= ? GROUP BY api_key_id)              SELECT a.api_key_id, COALESCE((SELECT NULLIF(r.api_key_name, '') FROM request_logs r              WHERE r.api_key_id = a.api_key_id ORDER BY r.created_at DESC, r.id DESC LIMIT 1),              a.api_key_id) AS api_key_name,              a.request_count, a.error_count, a.total_input_tokens, a.total_output_tokens,              a.total_cache_read_tokens, a.avg_duration_ms, a.avg_first_token_ms, a.total_upstream_ms,              a.last_used_at FROM aggregated a ORDER BY a.request_count DESC, a.api_key_id ASC"),
         )
         .bind(upstream_model)
         .bind(start_at)
@@ -1641,6 +1782,10 @@ impl LogStore for MysqlLogStore {
             request_count: summary.request_count,
             success_count: summary.success_count,
             error_count: summary.error_count,
+            unknown_count: summary.unknown_count,
+            cancelled_count: summary.cancelled_count,
+            output_limited_count: summary.output_limited_count,
+            outcome_stats_version: 1,
             total_input_tokens: summary.total_input_tokens,
             total_output_tokens: summary.total_output_tokens,
             total_cache_read_tokens: summary.total_cache_read_tokens,
@@ -1653,6 +1798,32 @@ impl LogStore for MysqlLogStore {
             time_series: None,
         })
     }
+}
+
+fn mysql_outcome_counts(alias: &str) -> String {
+    let success = outcome_sql(alias, "completed");
+    let error = error_sql(alias);
+    let unknown = outcome_sql(alias, "unknown");
+    let cancelled = outcome_sql(alias, "cancelled");
+    let output_limited = outcome_sql(alias, "output_limited");
+    format!(
+        "CAST(COALESCE(SUM(CASE WHEN {success} THEN 1 ELSE 0 END), 0) AS SIGNED) AS success_count, \
+         CAST(COALESCE(SUM(CASE WHEN {error} THEN 1 ELSE 0 END), 0) AS SIGNED) AS error_count, \
+         CAST(COALESCE(SUM(CASE WHEN {unknown} THEN 1 ELSE 0 END), 0) AS SIGNED) AS unknown_count, \
+         CAST(COALESCE(SUM(CASE WHEN {cancelled} THEN 1 ELSE 0 END), 0) AS SIGNED) AS cancelled_count, \
+         CAST(COALESCE(SUM(CASE WHEN {output_limited} THEN 1 ELSE 0 END), 0) AS SIGNED) AS output_limited_count"
+    )
+}
+
+async fn mysql_cleanup_orphan_request_results(
+    tx: &mut sqlx::Transaction<'_, MySql>,
+) -> anyhow::Result<()> {
+    sqlx::query(
+        "DELETE FROM request_results WHERE NOT EXISTS (SELECT 1 FROM request_logs WHERE request_logs.client_request_id = request_results.client_request_id)",
+    )
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1944,6 +2115,7 @@ impl StorageBootstrap for MysqlBootstrap {
         mysql_rename_column_if_needed(pool, "settings", "key", "name").await?;
         mysql_rename_column_if_needed(pool, "api_keys", "key", "token").await?;
         migrate_performance_mysql(pool).await?;
+        migrate_diagnostics_mysql(pool).await?;
         migrate_rating_effort_mysql(pool).await?;
         crate::db::model_performance::recover_historical_metadata!(
             pool,
@@ -1984,6 +2156,39 @@ async fn migrate_rating_effort_mysql(pool: &Pool<MySql>) -> anyhow::Result<()> {
         .await?;
         sqlx::query("ALTER TABLE provider_model_ratings DROP PRIMARY KEY, ADD PRIMARY KEY (provider_id, upstream_model, effort)").execute(pool).await?;
     }
+    Ok(())
+}
+
+async fn migrate_diagnostics_mysql(pool: &Pool<MySql>) -> anyhow::Result<()> {
+    // Historical rows remain version 0/unknown: performance metadata is not an outcome.
+    for (column, definition) in [
+        (
+            "client_request_id",
+            "VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin",
+        ),
+        ("attempt_index", "INTEGER"),
+        ("outcome_version", "INTEGER NOT NULL DEFAULT 0"),
+        (
+            "attempt_outcome",
+            "VARCHAR(32) CHARACTER SET ascii COLLATE ascii_bin NOT NULL DEFAULT 'unknown'",
+        ),
+        ("failure_kind", "VARCHAR(64)"),
+        ("failure_stage", "VARCHAR(64)"),
+        ("error_message", "TEXT"),
+        ("error_causes_json", "TEXT"),
+        ("payload_metadata_json", "TEXT"),
+        ("payload_cleared_at", "BIGINT"),
+    ] {
+        mysql_add_column_if_not_exists(pool, "request_logs", column, definition).await?;
+    }
+    // request_results is created by MYSQL_INIT_SQL for both fresh and existing databases.
+    mysql_create_index_if_not_exists(
+        pool,
+        "request_logs",
+        "idx_logs_client_request_attempt",
+        "client_request_id, attempt_index",
+    )
+    .await?;
     Ok(())
 }
 
@@ -2551,7 +2756,26 @@ CREATE TABLE IF NOT EXISTS request_logs (
     upstream_response_mode    VARCHAR(16) NOT NULL DEFAULT 'unknown',
     performance_upstream_ms   BIGINT,
     performance_first_chunk_ms BIGINT,
-    performance_completed_at  BIGINT
+    performance_completed_at  BIGINT,
+    client_request_id         VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin,
+    attempt_index             INTEGER,
+    outcome_version           INTEGER NOT NULL DEFAULT 0,
+    attempt_outcome           VARCHAR(32) CHARACTER SET ascii COLLATE ascii_bin NOT NULL DEFAULT 'unknown',
+    failure_kind              VARCHAR(64),
+    failure_stage             VARCHAR(64),
+    error_message             TEXT,
+    error_causes_json          TEXT,
+    payload_metadata_json     TEXT,
+    payload_cleared_at        BIGINT,
+    KEY idx_logs_client_request_attempt (client_request_id, attempt_index)
+) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS request_results (
+    client_request_id VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin PRIMARY KEY,
+    final_outcome VARCHAR(32) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+    final_attempt_id VARCHAR(36),
+    attempt_count INTEGER NOT NULL,
+    finished_at BIGINT NOT NULL
 ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
 
 CREATE TABLE IF NOT EXISTS settings (

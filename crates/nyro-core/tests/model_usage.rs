@@ -176,7 +176,19 @@ async fn detail_aggregates_summary_and_both_breakdowns() {
         .unwrap();
 
     // Summary across every model-x row in the inclusive window.
-    assert_eq!((d.request_count, d.success_count, d.error_count), (5, 2, 2));
+    // Legacy HTTP 200/302 rows remain unknown, not confirmed successes.
+    assert_eq!((d.request_count, d.success_count, d.error_count), (5, 0, 2));
+    assert_eq!(d.unknown_count, 3);
+    assert_eq!((d.cancelled_count, d.output_limited_count), (0, 0));
+    assert_eq!(d.outcome_stats_version, 1);
+    assert_eq!(
+        d.success_count
+            + d.error_count
+            + d.unknown_count
+            + d.cancelled_count
+            + d.output_limited_count,
+        d.request_count
+    );
     assert_eq!(
         (
             d.total_input_tokens,
@@ -298,6 +310,10 @@ async fn unknown_model_returns_zeroed_detail() {
     let d = s.logs().model_usage_detail("none", 0, 10).await.unwrap();
     assert_eq!(d.upstream_model, "none");
     assert_eq!((d.request_count, d.success_count, d.error_count), (0, 0, 0));
+    assert_eq!(
+        (d.unknown_count, d.cancelled_count, d.output_limited_count),
+        (0, 0, 0)
+    );
     assert_eq!(d.avg_first_token_ms, None);
     assert_eq!(d.last_used_at, None);
     assert_eq!(d.total_upstream_ms, 0.0);

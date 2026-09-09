@@ -188,9 +188,7 @@ impl GoogleAntigravityDriver {
             scopes: encode_scopes(token.scope.as_deref()),
             expires_at: Some(expires_at_after(expires_in)),
             access_token: Some(access_token),
-            refresh_token: token
-                .refresh_token
-                .filter(|value| !value.trim().is_empty()),
+            refresh_token: token.refresh_token.filter(|value| !value.trim().is_empty()),
             raw: Value::Object(meta),
         })
     }
@@ -232,7 +230,10 @@ impl GoogleAntigravityDriver {
         base_url: &str,
         access_token: &str,
     ) -> Result<(Option<String>, Value)> {
-        let endpoint = format!("{}/v1internal:loadCodeAssist", base_url.trim_end_matches('/'));
+        let endpoint = format!(
+            "{}/v1internal:loadCodeAssist",
+            base_url.trim_end_matches('/')
+        );
         let response = client
             .post(&endpoint)
             .header("Authorization", format!("Bearer {access_token}"))
@@ -296,8 +297,9 @@ impl GoogleAntigravityDriver {
             let parsed: Value =
                 serde_json::from_str(&body).context("parse antigravity onboardUser response")?;
             if parsed.get("done").and_then(Value::as_bool).unwrap_or(false) {
-                if let Some(project) =
-                    parsed.get("response").and_then(extract_project_id_from_value)
+                if let Some(project) = parsed
+                    .get("response")
+                    .and_then(extract_project_id_from_value)
                 {
                     return Ok(project);
                 }
@@ -590,7 +592,10 @@ impl AuthDriver for GoogleAntigravityDriver {
             format!("Bearer {access_token}"),
         );
         extra_headers.insert("user-agent".to_string(), antigravity_user_agent());
-        extra_headers.insert("x-goog-api-client".to_string(), X_GOOG_API_CLIENT.to_string());
+        extra_headers.insert(
+            "x-goog-api-client".to_string(),
+            X_GOOG_API_CLIENT.to_string(),
+        );
 
         // The channel's curated model list is the catalog the subscription can
         // actually run (dynamic fetchAvailableModels discovery is a
@@ -647,10 +652,12 @@ mod tests {
         assert!(config.oauth.authorize_url.contains("accounts.google.com"));
         assert!(config.oauth.token_url.contains("oauth2.googleapis.com"));
         assert_eq!(config.api_base_url, "https://cloudcode-pa.googleapis.com");
-        assert!(config
-            .oauth
-            .scope
-            .contains("https://www.googleapis.com/auth/cloud-platform"));
+        assert!(
+            config
+                .oauth
+                .scope
+                .contains("https://www.googleapis.com/auth/cloud-platform")
+        );
         assert!(!config.static_models.is_empty());
     }
 
@@ -669,8 +676,7 @@ mod tests {
             "tier_id": "tiered",
             "unrelated": true,
         });
-        let bundle =
-            GoogleAntigravityDriver::build_bundle(token, Some(&prior), &config).unwrap();
+        let bundle = GoogleAntigravityDriver::build_bundle(token, Some(&prior), &config).unwrap();
         assert_eq!(bundle.access_token.as_deref(), Some("ya29.new"));
         assert_eq!(bundle.subject_id.as_deref(), Some("user@example.com"));
         assert_eq!(
@@ -716,16 +722,20 @@ mod tests {
             meta: json!({"project_id": "cloudaicompanion-123"}),
             ..Default::default()
         };
-        let binding = GoogleAntigravityDriver.bind_runtime(&provider, &credential).unwrap();
+        let binding = GoogleAntigravityDriver
+            .bind_runtime(&provider, &credential)
+            .unwrap();
         assert_eq!(
             binding.extra_headers.get("authorization").unwrap(),
             "Bearer ya29.token"
         );
-        assert!(binding
-            .extra_headers
-            .get("user-agent")
-            .unwrap()
-            .starts_with("antigravity/2.9.1"));
+        assert!(
+            binding
+                .extra_headers
+                .get("user-agent")
+                .unwrap()
+                .starts_with("antigravity/2.9.1")
+        );
         assert_eq!(
             binding.extra_headers.get("x-goog-api-client").unwrap(),
             "gl-node/22.21.1"

@@ -56,7 +56,13 @@ mod tests {
 
     #[test]
     fn google_aliases_normalize_to_google_driver() {
-        for alias in ["google", "Google", "antigravity", "google-antigravity", "gemini"] {
+        for alias in [
+            "google",
+            "Google",
+            "antigravity",
+            "google-antigravity",
+            "gemini",
+        ] {
             assert_eq!(normalize_driver_key(alias), "google", "alias {alias}");
             assert_eq!(build_driver(alias).unwrap().metadata().key, "google");
         }

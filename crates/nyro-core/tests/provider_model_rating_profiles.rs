@@ -82,7 +82,10 @@ async fn historical_overrides_remain_hidden_and_untouched() -> anyhow::Result<()
         .set_provider_model_rating(&p.id, "same", SetProviderModelRating { score: 0 })
         .await?;
     assert!(serde_json::to_value(&saved)?.get("effort").is_none());
-    assert_eq!(admin.list_provider_model_ratings(None).await?, vec![saved.clone()]);
+    assert_eq!(
+        admin.list_provider_model_ratings(None).await?,
+        vec![saved.clone()]
+    );
     let performance = serde_json::to_value(admin.get_model_performance(None).await?)?;
     let models = performance["models"].as_array().unwrap();
     assert_eq!(models.len(), 1);

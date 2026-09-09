@@ -294,7 +294,19 @@ async fn detail_uses_inclusive_bounds_and_groups_only_upstream_model() {
         .provider_usage_detail("p", start, end)
         .await
         .unwrap();
-    assert_eq!((d.request_count, d.success_count, d.error_count), (4, 1, 2));
+    // Legacy HTTP 200/302 rows have no authoritative completion evidence.
+    assert_eq!((d.request_count, d.success_count, d.error_count), (4, 0, 2));
+    assert_eq!(d.unknown_count, 2);
+    assert_eq!((d.cancelled_count, d.output_limited_count), (0, 0));
+    assert_eq!(d.outcome_stats_version, 1);
+    assert_eq!(
+        d.success_count
+            + d.error_count
+            + d.unknown_count
+            + d.cancelled_count
+            + d.output_limited_count,
+        d.request_count
+    );
     assert_eq!(
         (
             d.total_input_tokens,
@@ -357,6 +369,10 @@ async fn zero_detail_and_tie_ordering_are_deterministic() {
     );
     let d = s.logs().provider_usage_detail("none", 0, 10).await.unwrap();
     assert_eq!((d.request_count, d.success_count, d.error_count), (0, 0, 0));
+    assert_eq!(
+        (d.unknown_count, d.cancelled_count, d.output_limited_count),
+        (0, 0, 0)
+    );
     assert!(d.models.is_empty());
     assert_eq!(d.avg_first_token_ms, None);
     assert_eq!(d.last_used_at, None);

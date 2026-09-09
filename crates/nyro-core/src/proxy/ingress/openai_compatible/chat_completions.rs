@@ -40,7 +40,13 @@ pub async fn handler(
     let request = match decoder.decode_request(body) {
         Ok(r) => r,
         Err(e) => {
-            return log_decode_error(&gw, &envelope, OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1, e);
+            return log_decode_error(
+                &gw,
+                &envelope,
+                OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1,
+                e,
+                Some(&ctx),
+            );
         }
     };
     dispatch_pipeline(

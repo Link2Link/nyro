@@ -34,7 +34,15 @@ pub async fn handler(
         .make_request_decoder();
     let request = match decoder.decode_request(body) {
         Ok(r) => r,
-        Err(e) => return log_decode_error(&gw, &envelope, OPENAI_COMPATIBLE_EMBEDDINGS_V1, e),
+        Err(e) => {
+            return log_decode_error(
+                &gw,
+                &envelope,
+                OPENAI_COMPATIBLE_EMBEDDINGS_V1,
+                e,
+                Some(&ctx),
+            );
+        }
     };
     dispatch_pipeline(
         gw,

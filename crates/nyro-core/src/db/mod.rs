@@ -96,6 +96,7 @@ pub async fn migrate(pool: &SqlitePool) -> anyhow::Result<()> {
     ensure_request_log_column(pool, "cache_read_tokens", "INTEGER DEFAULT 0").await?;
     ensure_request_log_column(pool, "reasoning_effort", "TEXT").await?;
     ensure_request_log_column(pool, "route_decision", "TEXT").await?;
+    migrate_log_diagnostics(pool).await?;
     migrate_performance_metadata(pool).await?;
     migrate_rating_effort(pool).await?;
     model_performance::recover_historical_metadata!(
@@ -144,6 +145,27 @@ pub async fn migrate(pool: &SqlitePool) -> anyhow::Result<()> {
         .await
         .ok();
 
+    Ok(())
+}
+
+/// Additive only: legacy/future performance markers never establish outcomes.
+async fn migrate_log_diagnostics(pool: &SqlitePool) -> anyhow::Result<()> {
+    for (column, definition) in [
+        ("client_request_id", "TEXT"),
+        ("attempt_index", "INTEGER"),
+        ("outcome_version", "INTEGER NOT NULL DEFAULT 0"),
+        ("attempt_outcome", "TEXT NOT NULL DEFAULT 'unknown'"),
+        ("failure_kind", "TEXT"),
+        ("failure_stage", "TEXT"),
+        ("error_message", "TEXT"),
+        ("error_causes_json", "TEXT"),
+        ("payload_metadata_json", "TEXT"),
+        ("payload_cleared_at", "INTEGER"),
+    ] {
+        ensure_request_log_column(pool, column, definition).await?;
+    }
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_logs_client_request_attempt ON request_logs(client_request_id, attempt_index)")
+        .execute(pool).await?;
     Ok(())
 }
 
@@ -1062,7 +1084,25 @@ CREATE TABLE IF NOT EXISTS request_logs (
     upstream_response_mode    TEXT NOT NULL DEFAULT 'unknown',
     performance_upstream_ms   INTEGER,
     performance_first_chunk_ms INTEGER,
-    performance_completed_at  INTEGER
+    performance_completed_at  INTEGER,
+    client_request_id         TEXT,
+    attempt_index             INTEGER,
+    outcome_version           INTEGER NOT NULL DEFAULT 0,
+    attempt_outcome           TEXT NOT NULL DEFAULT 'unknown',
+    failure_kind              TEXT,
+    failure_stage             TEXT,
+    error_message             TEXT,
+    error_causes_json          TEXT,
+    payload_metadata_json      TEXT,
+    payload_cleared_at         INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS request_results (
+    client_request_id TEXT PRIMARY KEY,
+    final_outcome    TEXT NOT NULL,
+    final_attempt_id TEXT,
+    attempt_count    INTEGER NOT NULL,
+    finished_at      INTEGER NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS settings (

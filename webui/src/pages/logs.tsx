@@ -3,7 +3,9 @@ import { useMemo, useState, type KeyboardEvent } from "react";
 import { Calendar, ChevronLeft, ChevronRight, ChevronsLeft, CircleX, Eraser, ScrollText, Trash2, X } from "lucide-react";
 
 import { backend } from "@/lib/backend";
-import type { ApiKey, LogPage, LogQuery, ModelStats, Provider, RequestLog } from "@/lib/types";
+import type { ApiKey, LoggingStatus, LogPage, LogQuery, ModelStats, Provider, RequestLog } from "@/lib/types";
+import { isLogRelatedQueryKey } from "@/lib/log-observability";
+import { OutcomeFilter, ResultBadge } from "@/components/log-outcome";
 import { getRouteType } from "@/lib/types";
 import { computeTps, formatDuration, formatLogTime, formatTokenCount, formatTps } from "@/lib/format";
 import { prettyName } from "@/lib/protocol";
@@ -43,7 +45,7 @@ export default function LogsPage() {
   const clearMut = useMutation({
     mutationFn: () => backend("clear_logs"),
     onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ["logs"] });
+      void qc.invalidateQueries({ predicate: (query) => isLogRelatedQueryKey(query.queryKey) });
       setPage(0);
       setConfirmOpen(false);
     },
@@ -52,7 +54,7 @@ export default function LogsPage() {
   const clearErrorsMut = useMutation({
     mutationFn: () => backend("clear_error_logs"),
     onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ["logs"] });
+      void qc.invalidateQueries({ predicate: (query) => isLogRelatedQueryKey(query.queryKey) });
       setPage(0);
       setConfirmErrorsOpen(false);
     },
@@ -61,8 +63,8 @@ export default function LogsPage() {
   const clearPayloadsMut = useMutation({
     mutationFn: () => backend("clear_log_payloads"),
     onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ["logs"] });
-      qc.invalidateQueries({ queryKey: ["log-detail"] });
+      void qc.invalidateQueries({ predicate: (query) => isLogRelatedQueryKey(query.queryKey) });
+
       setSelected(null);
       setConfirmPayloadsOpen(false);
     },
@@ -71,7 +73,7 @@ export default function LogsPage() {
   const deleteMut = useMutation({
     mutationFn: (id: string) => backend("delete_log", { id }),
     onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ["logs"] });
+      void qc.invalidateQueries({ predicate: (query) => isLogRelatedQueryKey(query.queryKey) });
       setSelected(null);
       setDeleteTarget(null);
     },
@@ -79,11 +81,18 @@ export default function LogsPage() {
 
   const query: LogQuery = { ...filter, limit: PAGE_SIZE, offset: page * PAGE_SIZE };
 
-  const { data, isLoading } = useQuery<LogPage>({
+  const { data, isLoading, error } = useQuery<LogPage>({
     queryKey: ["logs", query],
     queryFn: () => backend("query_logs", { query }),
     refetchInterval: 5_000,
   });
+  const health = useQuery<LoggingStatus>({
+    queryKey: ["logging-status"],
+    queryFn: () => backend("get_logging_status"),
+    refetchInterval: 15_000,
+    retry: false,
+  });
+  const lostLogs = health.data ? health.data.queue_full_dropped + health.data.channel_closed_dropped + health.data.database_write_dropped : null;
   const { data: providers = [] } = useQuery<Provider[]>({
     queryKey: ["providers"],
     queryFn: () => backend("get_providers"),
@@ -127,9 +136,10 @@ export default function LogsPage() {
   );
   const statusOptions = useMemo(
     () => [
-      { value: "", label: isZh ? "全部状态" : "All Status" },
-      { value: "ok", label: isZh ? "仅 2xx" : "2xx Only" },
-      { value: "error", label: isZh ? "4xx+ 错误" : "4xx+ Errors" },
+      { value: "", label: isZh ? "全部 HTTP 状态" : "All HTTP status" },
+      { value: "200", label: "HTTP 200" },
+      { value: "ok", label: "HTTP 2xx" },
+      { value: "error", label: "HTTP 4xx / 5xx" },
     ],
     [isZh],
   );
@@ -145,11 +155,9 @@ export default function LogsPage() {
   const apiKeyFilterValue = filter.api_key ?? ALL_OPTION;
   const modelFilterValue = filter.model ?? ALL_OPTION;
   const statusFilterValue =
-    (filter.status_min ?? null) === 200 && (filter.status_max ?? null) === 299
-      ? "ok"
-      : (filter.status_min ?? null) === 400 && (filter.status_max ?? null) == null
-        ? "error"
-        : ALL_OPTION;
+    filter.status_min === 200 && filter.status_max === 200 ? "200"
+      : filter.status_min === 200 && filter.status_max === 299 ? "ok"
+        : filter.status_min === 400 && filter.status_max === 599 ? "error" : ALL_OPTION;
 
   // 日期选择：将日期字符串转为 Unix 毫秒时间戳
   function dateToTs(dateStr: string, endOfDay: boolean): number {
@@ -169,14 +177,15 @@ export default function LogsPage() {
 
   return (
     <div className="space-y-5">
-      <div className="flex items-center justify-between">
+      <div className="flex flex-wrap items-center justify-between gap-3">
         <div>
           <h1 className="text-2xl font-bold text-slate-900">{isZh ? "请求日志" : "Request Logs"}</h1>
           <p className="mt-1 text-sm text-slate-500">
-            {isZh ? `共 ${total} 条记录` : `${total} total records`}
+            {data ? (isZh ? `共 ${total} 次尝试` : `${total} total attempts`) : (isZh ? "尝试总数不可用" : "Attempt count unavailable")}
           </p>
         </div>
-        <div className="flex gap-2">
+        <div className="flex flex-wrap items-center gap-2">
+          <OutcomeFilter value={filter} onChange={(next) => { setFilter(next); setPage(0); }} isZh={isZh} />
           <Select
             value={apiKeyFilterValue}
             onValueChange={(value) => {
@@ -235,7 +244,9 @@ export default function LogsPage() {
             value={statusFilterValue}
             onValueChange={(next) => {
               if (next === "error") {
-                setFilter({ ...filter, status_min: 400, status_max: undefined });
+                setFilter({ ...filter, status_min: 400, status_max: 599 });
+              } else if (next === "200") {
+                setFilter({ ...filter, status_min: 200, status_max: 200 });
               } else if (next === "ok") {
                 setFilter({ ...filter, status_min: 200, status_max: 299 });
               } else {
@@ -358,7 +369,21 @@ export default function LogsPage() {
         </div>
       </div>
 
-      {isLoading ? (
+      <div className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-xs text-slate-500">
+        {isZh ? "每行是一次上游尝试，并非独立的客户端请求。HTTP 状态与尝试结果独立过滤（AND）。" : "Each row is an upstream attempt, not a distinct client request. HTTP and attempt-result filters combine with AND."}
+      </div>
+      <div role={health.isError || (lostLogs ?? 0) > 0 ? "alert" : "status"} className={cn("rounded-lg border px-3 py-2 text-xs", health.isError || (lostLogs ?? 0) > 0 ? "border-amber-200 bg-amber-50 text-amber-800" : "border-slate-200 text-slate-500")}>
+        {health.data ? <>
+          <strong>{isZh ? "日志写入健康快照" : "Logging health snapshot"}</strong>
+          {health.isError && <span> · {isZh ? "刷新失败，以下为旧快照" : "Refresh failed; showing stale snapshot"}</span>}
+          {` · ${isZh ? "队列已满丢失" : "Queue full dropped"}: ${health.data.queue_full_dropped} · ${isZh ? "通道关闭丢失" : "Channel closed dropped"}: ${health.data.channel_closed_dropped} · ${isZh ? "数据库写入丢失" : "Database write dropped"}: ${health.data.database_write_dropped}`}
+          <p className="mt-1">{isZh ? "仅当前进程累计计数，重启后归零；丢失记录无法体现在日志与统计中，不保证恢复或重试。" : "Current-process counters reset on restart. Lost records are absent from logs and statistics; recovery or retry is not guaranteed."}</p>
+        </> : health.isError ? (isZh ? "日志健康状态不可用；无法确认是否丢失日志。" : "Logging health unavailable; log loss cannot be assessed.") : (isZh ? "正在加载日志健康状态…" : "Loading logging health…")}
+      </div>
+      {(clearMut.error || clearErrorsMut.error || clearPayloadsMut.error || deleteMut.error) && <p role="alert" className="text-sm text-red-600">{String(clearMut.error || clearErrorsMut.error || clearPayloadsMut.error || deleteMut.error)}</p>}
+      {error ? (
+        <p role="alert" className="py-12 text-center text-sm text-red-600">{isZh ? "日志加载失败：" : "Failed to load logs: "}{String(error)}</p>
+      ) : isLoading ? (
         <div className="text-center text-sm text-slate-500 py-12">{isZh ? "加载中..." : "Loading..."}</div>
       ) : items.length === 0 ? (
         <div className="glass rounded-2xl p-12 text-center">
@@ -375,7 +400,7 @@ export default function LogsPage() {
                     {isZh ? "时间" : "Time"}
                   </th>
                   <th className="px-3 py-2.5 text-left font-medium whitespace-nowrap">
-                    {isZh ? "状态" : "Status"}
+                    {isZh ? "HTTP / 尝试结果" : "HTTP / Attempt result"}
                   </th>
                   <th className="px-3 py-2.5 text-left font-medium whitespace-nowrap">
                     {isZh ? "密钥" : "API Key"}
@@ -410,7 +435,6 @@ export default function LogsPage() {
               <tbody>
                 {items.map((log) => {
                   const routeType = getRouteType(log);
-                  const statusOk = (log.client_status_code ?? 0) < 400;
                   const isStream = log.is_stream ?? (log.stream_chunks_count ?? 0) > 0;
                   return (
                     <tr
@@ -422,14 +446,11 @@ export default function LogsPage() {
                         {formatLogTime(log.created_at)}
                       </td>
                       <td className="px-3 py-2 whitespace-nowrap">
-                        <span
-                          className={cn(
-                            "inline-block rounded-full px-2 py-0.5 text-xs font-medium tabular-nums",
-                            statusOk ? "bg-green-50 text-green-700" : "bg-red-50 text-red-600",
-                          )}
-                        >
-                          {log.client_status_code ?? "–"}
-                        </span>
+                        <div className="flex items-center gap-1.5">
+                          <span className="text-xs tabular-nums text-slate-600" title={isZh ? "原始客户端 HTTP 状态" : "Actual client HTTP status"}>{log.client_status_code ?? "–"}</span>
+                          <ResultBadge log={log} isZh={isZh} />
+                        </div>
+                        {log.upstream_status_code != null && <div className="text-[10px] text-slate-400">{isZh ? "上游 HTTP" : "Upstream HTTP"} {log.upstream_status_code}</div>}
                       </td>
                       <td className="px-3 py-2 text-xs text-slate-600 whitespace-nowrap">
                         {log.api_key_name ?? "–"}
@@ -611,8 +632,8 @@ export default function LogsPage() {
         title={isZh ? "清除已记录载荷" : "Clear Recorded Payloads"}
         description={
           isZh
-            ? "非报错日志中已记录的请求与响应头、请求体和响应体都将被永久清除；客户端或上游状态码为 4xx/5xx 的报错日志载荷会保留，日志记录本身也不会删除。此操作不可恢复。"
-            : "Recorded request and response headers and bodies will be permanently cleared from non-error logs. Payloads are kept for logs whose client or upstream status is 4xx/5xx, and no log records are deleted. This action cannot be undone."
+            ? "所有日志（包括全部错误日志，无例外）的请求/响应头和四种请求/响应体都会永久清除，并标记为已清除。仅删除载荷，不删除日志记录，也不改变结果分类。此操作不可恢复。"
+            : "ALL recorded request/response headers and all four bodies will be permanently cleared, including ALL error logs without exceptions, and marked as cleared. Only payloads are removed; log records and result classifications are unchanged. This action cannot be undone."
         }
         confirmText={
           clearPayloadsMut.isPending
@@ -636,8 +657,8 @@ export default function LogsPage() {
         title={isZh ? "清除报错日志" : "Delete Error Logs"}
         description={
           isZh
-            ? "确认删除所有报错（状态码 ≥ 400）的请求日志？此操作不可恢复。"
-            : "All request logs with status >= 400 will be permanently deleted. This action cannot be undone."
+            ? "永久删除所有错误尝试日志：客户端或上游 HTTP 4xx/5xx，或核心确认失败/超时（即使 HTTP 200）。仅取消、输出受限或未知结果不属于错误，不会删除。此操作不可恢复。"
+            : "Permanently delete all error attempt logs: client or upstream HTTP 4xx/5xx, or core-confirmed failure/timeout (including HTTP 200). Pure cancellation, output-limited and unknown results are excluded. This action cannot be undone."
         }
         confirmText={isZh ? "删除" : "Delete"}
         cancelText={isZh ? "取消" : "Cancel"}

@@ -235,7 +235,30 @@ CREATE TABLE public.request_logs (
     upstream_response_mode text DEFAULT 'unknown'::text NOT NULL,
     performance_upstream_ms bigint,
     performance_first_chunk_ms bigint,
-    performance_completed_at bigint
+    performance_completed_at bigint,
+    client_request_id text,
+    attempt_index integer,
+    outcome_version integer DEFAULT 0 NOT NULL,
+    attempt_outcome text DEFAULT 'unknown'::text NOT NULL,
+    failure_kind text,
+    failure_stage text,
+    error_message text,
+    error_causes_json text,
+    payload_metadata_json text,
+    payload_cleared_at bigint
+);
+
+
+--
+-- Name: request_results; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.request_results (
+    client_request_id text NOT NULL,
+    final_outcome text NOT NULL,
+    final_attempt_id text,
+    attempt_count integer NOT NULL,
+    finished_at bigint NOT NULL
 );
 
 
@@ -323,6 +346,14 @@ ALTER TABLE ONLY public.request_logs
 
 
 --
+-- Name: request_results request_results_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.request_results
+    ADD CONSTRAINT request_results_pkey PRIMARY KEY (client_request_id);
+
+
+--
 -- Name: model_backends route_targets_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -365,6 +396,13 @@ CREATE INDEX idx_api_keys_token ON public.api_keys USING btree (token);
 --
 
 CREATE INDEX idx_logs_api_key ON public.request_logs USING btree (api_key_id);
+
+
+--
+-- Name: idx_logs_client_request_attempt; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_logs_client_request_attempt ON public.request_logs USING btree (client_request_id, attempt_index);
 
 
 --

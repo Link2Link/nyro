@@ -53,6 +53,11 @@ pub fn create_router(gateway: Gateway, admin_token: Option<String>) -> Router {
 
     let mut api = Router::new()
         .route("/system/extensions", get(list_loaded_extensions))
+        .route("/logging/status", get(logging_status_handler))
+        .route(
+            "/log-requests/:request_id",
+            get(request_log_attempts_handler),
+        )
         .route("/providers/presets", get(list_provider_presets))
         .route("/providers/usage", get(list_provider_usage_handler))
         .route(
@@ -755,8 +760,29 @@ async fn delete_api_key_handler(
 
 // ── Logs ──
 
+async fn logging_status_handler() -> impl IntoResponse {
+    Json(serde_json::json!({ "data": nyro_core::logging::logging_status() }))
+}
+
+async fn request_log_attempts_handler(
+    State(gw): State<Gateway>,
+    Path(request_id): Path<String>,
+) -> impl IntoResponse {
+    match gw.admin().get_request_log_attempts(&request_id).await {
+        Ok(attempts) => Json(serde_json::json!({ "data": attempts })).into_response(),
+        Err(error) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": error.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
 #[derive(Deserialize, Default)]
 struct LogQueryParams {
+    is_error: Option<bool>,
+    outcome: Option<String>,
+    client_request_id: Option<String>,
     limit: Option<i64>,
     offset: Option<i64>,
     provider: Option<String>,
@@ -790,6 +816,9 @@ async fn query_logs_handler(
     Query(params): Query<LogQueryParams>,
 ) -> impl IntoResponse {
     let q = LogQuery {
+        is_error: params.is_error,
+        outcome: params.outcome,
+        client_request_id: params.client_request_id,
         limit: params.limit,
         offset: params.offset,
         provider: params.provider,
@@ -812,8 +841,8 @@ async fn clear_logs_handler(
     State(gw): State<Gateway>,
     Query(params): Query<ClearLogsParams>,
 ) -> impl IntoResponse {
-    // `?scope=errors` restricts the wipe to rows whose client status is an
-    // error (>= 400); absent scope keeps the historical clear-everything.
+    // `?scope=errors` uses the same authoritative/HTTP error predicate as
+    // filtering and statistics; absent scope keeps explicit clear-everything.
     let result = if params.scope.as_deref() == Some("errors") {
         gw.admin().clear_error_logs().await
     } else {

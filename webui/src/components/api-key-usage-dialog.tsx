@@ -26,6 +26,12 @@ import {
   formatTps,
 } from "@/lib/format";
 import { useLocale } from "@/lib/i18n";
+import {
+  outcomeFilterValue,
+  outcomeQuery,
+  usageOutcomeRates,
+} from "@/lib/log-observability";
+import { OutcomeFilter, ResultBadge } from "@/components/log-outcome";
 import { prettyName } from "@/lib/protocol";
 import type {
   ApiKeyModelRouteStats,
@@ -57,7 +63,7 @@ import {
 } from "@/components/ui/select";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 
-type StatusFilter = "all" | "2xx" | "400+";
+type StatusFilter = "all" | "200" | "2xx" | "400+";
 type Tab = "overview" | "requests";
 export interface ApiKeyUsageDialogProps {
   open: boolean;
@@ -93,6 +99,7 @@ export function ApiKeyUsageDialog({
   );
   const [tab, setTab] = useState<Tab>("overview");
   const [status, setStatus] = useState<StatusFilter>("all");
+  const [outcome, setOutcome] = useState("all");
   const [route, setRoute] = useState<ApiKeyModelRouteStats | null>(null);
   const [page, setPage] = useState(0);
   const [selectedLog, setSelectedLog] = useState<RequestLog | null>(null);
@@ -105,6 +112,7 @@ export function ApiKeyUsageDialog({
       setSelectedId(initialApiKeyId ?? null);
       setTab("overview");
       setStatus("all");
+      setOutcome("all");
       setRoute(null);
       setPage(0);
       setSelectedLog(null);
@@ -161,7 +169,12 @@ export function ApiKeyUsageDialog({
       client_model: route?.client_model,
       provider: route?.provider_id,
       upstream_model: route?.upstream_model,
+      ...outcomeQuery(outcome),
     };
+    if (status === "200") {
+      query.status_min = 200;
+      query.status_max = 200;
+    }
     if (status === "2xx") {
       query.status_min = 200;
       query.status_max = 299;
@@ -175,6 +188,7 @@ export function ApiKeyUsageDialog({
     detail.data?.end_at,
     route,
     status,
+    outcome,
   ]);
   const logs = useQuery<LogPage>({
     queryKey: ["api-key-usage-logs", logFilter],
@@ -211,8 +225,8 @@ export function ApiKeyUsageDialog({
                 </DialogTitle>
                 <DialogDescription>
                   {zh
-                    ? "按密钥查看请求、Token 与路由表现。"
-                    : "Requests, tokens, and route performance by API key."}
+                    ? "按密钥查看尝试、Token 与路由表现。"
+                    : "Attempts, tokens, and route performance by API key."}
                 </DialogDescription>
               </div>
               <div className="flex flex-wrap gap-2">
@@ -270,14 +284,16 @@ export function ApiKeyUsageDialog({
                         <SelectItem value={selectedId}>
                           {detail.data?.api_key_name ||
                             (zh ? "未命名密钥" : "Unnamed key")}{" "}
-                          · 0
+                          · {detail.data && !detail.error
+                            ? `${formatTokenCount(detail.data.request_count)} ${zh ? "次尝试" : "attempts"}`
+                            : (detail.isLoading ? (zh ? "加载中…" : "Loading…") : (zh ? "不可用" : "Unavailable"))}
                         </SelectItem>
                       )}
                     {keys.map((key) => (
                       <SelectItem key={key.api_key_id} value={key.api_key_id}>
                         {key.api_key_name ||
                           (zh ? "未命名密钥" : "Unnamed key")}{" "}
-                        · {formatTokenCount(key.request_count)}
+                        · {formatTokenCount(key.request_count)} {zh ? "次尝试" : "attempts"}
                       </SelectItem>
                     ))}
                   </SelectContent>
@@ -321,7 +337,7 @@ export function ApiKeyUsageDialog({
                   className="h-11 gap-2 rounded-none border-b-2 border-transparent bg-transparent shadow-none data-[state=active]:border-blue-600 data-[state=active]:shadow-none"
                 >
                   <Radio className="h-4 w-4" />
-                  {zh ? "请求" : "Requests"}
+                  {zh ? "尝试" : "Attempts"}
                 </TabsTrigger>
               </TabsList>
             </div>
@@ -357,25 +373,38 @@ export function ApiKeyUsageDialog({
               value="requests"
               className="mt-0 min-h-0 flex-1 overflow-y-auto p-4 sm:p-6"
             >
-              <Requests
+              <QueryState
+                loading={list.isLoading || (!!selectedId && detail.isLoading)}
+                error={list.error ?? detail.error}
+                empty={!selectedId || !detail.data}
                 zh={zh}
-                status={status}
-                setStatus={(v) => {
-                  setStatus(v);
-                  setPage(0);
-                }}
-                route={route}
-                routes={detail.data?.model_routes ?? []}
-                setRoute={(value) => {
-                  setRoute(value);
-                  setPage(0);
-                }}
-                query={logs}
-                page={page}
-                pages={pages}
-                setPage={setPage}
-                onSelect={setSelectedLog}
-              />
+                onRetry={refresh}
+              >
+                <Attempts
+                  zh={zh}
+                  outcome={outcome}
+                  setOutcome={(value) => {
+                    setOutcome(value);
+                    setPage(0);
+                  }}
+                  status={status}
+                  setStatus={(v) => {
+                    setStatus(v);
+                    setPage(0);
+                  }}
+                  route={route}
+                  routes={detail.data?.model_routes ?? []}
+                  setRoute={(value) => {
+                    setRoute(value);
+                    setPage(0);
+                  }}
+                  query={logs}
+                  page={page}
+                  pages={pages}
+                  setPage={setPage}
+                  onSelect={setSelectedLog}
+                />
+              </QueryState>
             </TabsContent>
           </Tabs>
         </DialogContent>
@@ -480,9 +509,8 @@ function Overview({
   showDateOnAxis: boolean;
   onRoute: (r: ApiKeyModelRouteStats) => void;
 }) {
-  const rate = detail.request_count
-    ? (detail.success_count / detail.request_count) * 100
-    : 0;
+  const { completedRate, unknownRate, authoritative } = usageOutcomeRates(detail);
+  const unavailable = zh ? "不可用" : "Unavailable";
   const cachePercentage = Math.min(
     100,
     Math.max(
@@ -494,23 +522,46 @@ function Overview({
   );
   const cards = [
     {
-      label: zh ? "请求" : "Requests",
+      label: zh ? "尝试" : "Attempts",
       value: formatTokenCount(detail.request_count),
       icon: Activity,
       color: "bg-gradient-to-br from-blue-50 to-blue-100 text-blue-600",
     },
     {
-      label: zh ? "严格 2xx 成功率" : "Strict 2xx Success",
-      value: rate.toFixed(1) + "%",
-      note: formatTokenCount(detail.success_count) + " 2xx",
+      label: zh ? "完整成功率" : "Full Success Rate",
+      value: completedRate == null ? unavailable : completedRate.toFixed(1) + "%",
+      note: authoritative
+        ? (zh
+          ? `${formatTokenCount(detail.success_count)} 次确认完成 / ${formatTokenCount(detail.request_count)} 次尝试`
+          : `${formatTokenCount(detail.success_count)} confirmed completed / ${formatTokenCount(detail.request_count)} attempts`)
+        : (zh ? "结果统计元数据不可用" : "Outcome statistics unavailable"),
       icon: CheckCircle2,
       color: "bg-gradient-to-br from-emerald-50 to-emerald-100 text-emerald-600",
     },
     {
-      label: zh ? "失败" : "Failures",
-      value: formatTokenCount(detail.error_count),
+      label: zh ? "错误尝试" : "Error Attempts",
+      value: authoritative ? formatTokenCount(detail.error_count) : unavailable,
       icon: XCircle,
       color: "bg-gradient-to-br from-red-50 to-red-100 text-red-600",
+    },
+    {
+      label: zh ? "未知尝试" : "Unknown Attempts",
+      value: authoritative ? formatTokenCount(detail.unknown_count) : unavailable,
+      note: unknownRate == null ? unavailable : `${unknownRate.toFixed(1)}% ${zh ? "占总尝试" : "of all attempts"}`,
+      icon: AlertCircle,
+      color: "bg-gradient-to-br from-slate-50 to-slate-200 text-slate-600",
+    },
+    {
+      label: zh ? "已取消尝试" : "Cancelled Attempts",
+      value: authoritative ? formatTokenCount(detail.cancelled_count) : unavailable,
+      icon: XCircle,
+      color: "bg-gradient-to-br from-amber-50 to-amber-100 text-amber-600",
+    },
+    {
+      label: zh ? "输出受限尝试" : "Output-limited Attempts",
+      value: authoritative ? formatTokenCount(detail.output_limited_count) : unavailable,
+      icon: AlertCircle,
+      color: "bg-gradient-to-br from-orange-50 to-orange-100 text-orange-600",
     },
     {
       label: zh ? "输入 Token" : "Input Tokens",
@@ -631,10 +682,10 @@ function Overview({
                       : "Client model → Provider → Upstream"}
                   </th>
                   <th className="px-3 py-3">
-                    {zh ? "请求数 / 份额" : "Requests / Share"}
+                    {zh ? "尝试数 / 份额" : "Attempts / Share"}
                   </th>
                   <th className="px-3 py-3 text-right">
-                    {zh ? "失败数 / 失败率" : "Failures / Rate"}
+                    {zh ? "错误尝试 / 占比" : "Error Attempts / Rate"}
                   </th>
                   <th className="px-3 py-3 text-right">
                     {zh ? "Token (入/缓存/出)" : "Tokens (in/cache/out)"}
@@ -651,9 +702,10 @@ function Overview({
                   const share = detail.request_count
                     ? (r.request_count / detail.request_count) * 100
                     : 0;
-                  const failureRate = r.request_count
+                  const failureRate = authoritative && Number.isSafeInteger(r.error_count)
+                    && r.error_count >= 0 && r.error_count <= r.request_count && r.request_count > 0
                     ? (r.error_count / r.request_count) * 100
-                    : 0;
+                    : null;
                   const tps =
                     r.total_upstream_ms > 0
                       ? r.total_output_tokens / (r.total_upstream_ms / 1000)
@@ -709,7 +761,7 @@ function Overview({
                         </div>
                       </td>
                       <td className="px-3 py-3 text-right text-xs text-red-600">
-                        {formatTokenCount(r.error_count)} · {failureRate.toFixed(1)}%
+                        {failureRate == null ? unavailable : `${formatTokenCount(r.error_count)} · ${failureRate.toFixed(1)}%`}
                       </td>
                       <td className="px-3 py-3 text-right font-mono text-xs">
                         {formatTokenCount(r.total_input_tokens)} /{" "}
@@ -739,8 +791,10 @@ function Overview({
   );
 }
 
-function Requests({
+function Attempts({
   zh,
+  outcome,
+  setOutcome,
   status,
   setStatus,
   route,
@@ -753,6 +807,8 @@ function Requests({
   onSelect,
 }: {
   zh: boolean;
+  outcome: string;
+  setOutcome: (value: string) => void;
   status: StatusFilter;
   setStatus: (v: StatusFilter) => void;
   route: ApiKeyModelRouteStats | null;
@@ -768,23 +824,23 @@ function Requests({
     <div className="space-y-3">
       <div className="flex flex-wrap items-center justify-between gap-2">
         <div className="flex flex-wrap gap-2">
+          <OutcomeFilter
+            value={outcomeQuery(outcome)}
+            onChange={(next) => setOutcome(outcomeFilterValue(next))}
+            isZh={zh}
+          />
           <Select
             value={status}
             onValueChange={(v) => setStatus(v as StatusFilter)}
           >
-            <SelectTrigger className="h-9 w-[140px]">
+            <SelectTrigger className="h-9 w-[170px]" aria-label={zh ? "HTTP 状态" : "HTTP status"}>
               <SelectValue />
             </SelectTrigger>
             <SelectContent>
-              <SelectItem value="all">
-                {zh ? "全部状态" : "All statuses"}
-              </SelectItem>
-              <SelectItem value="2xx">
-                {zh ? "成功（2xx）" : "Success (2xx)"}
-              </SelectItem>
-              <SelectItem value="400+">
-                {zh ? "失败（4xx+）" : "Failures (4xx+)"}
-              </SelectItem>
+              <SelectItem value="all">{zh ? "全部 HTTP 状态" : "All HTTP statuses"}</SelectItem>
+              <SelectItem value="200">HTTP 200</SelectItem>
+              <SelectItem value="2xx">HTTP 2xx</SelectItem>
+              <SelectItem value="400+">HTTP 4xx / 5xx</SelectItem>
             </SelectContent>
           </Select>
           <Select
@@ -836,7 +892,7 @@ function Requests({
         <State
           icon={Loader2}
           spin
-          text={zh ? "正在加载请求…" : "Loading requests…"}
+          text={zh ? "正在加载尝试…" : "Loading attempts…"}
         />
       ) : query.error ? (
         <State
@@ -844,7 +900,7 @@ function Requests({
           danger
           text={err(
             query.error,
-            zh ? "请求加载失败" : "Failed to load requests",
+            zh ? "尝试加载失败" : "Failed to load attempts",
           )}
           action={
             <Button
@@ -860,7 +916,7 @@ function Requests({
       ) : !query.data?.items.length ? (
         <State
           icon={Radio}
-          text={zh ? "没有匹配的请求。" : "No matching requests."}
+          text={zh ? "没有匹配的尝试。" : "No matching attempts."}
         />
       ) : (
         <>
@@ -869,7 +925,7 @@ function Requests({
               <thead className="bg-slate-50 text-[11px] uppercase text-slate-500">
                 <tr>
                   <th className="px-3 py-3">{zh ? "时间" : "Time"}</th>
-                  <th className="px-3 py-3">{zh ? "状态" : "Status"}</th>
+                  <th className="px-3 py-3">{zh ? "HTTP / 结果" : "HTTP / Result"}</th>
                   <th className="px-3 py-3">{zh ? "路由" : "Route"}</th>
                   <th className="px-3 py-3">{zh ? "协议" : "Protocol"}</th>
                   <th className="px-3 py-3">{zh ? "类型" : "Type"}</th>
@@ -886,12 +942,6 @@ function Requests({
               <tbody className="divide-y divide-slate-100">
                 {query.data.items.map((log) => {
                   const code = log.client_status_code;
-                  const statusStyle =
-                    code != null && code >= 200 && code < 300
-                      ? "border-emerald-200 bg-emerald-50 text-emerald-700"
-                      : code != null && code >= 400
-                        ? "border-red-200 bg-red-50 text-red-700"
-                        : "border-amber-200 bg-amber-50 text-amber-700";
                   return (
                     <tr
                       key={log.id}
@@ -910,12 +960,12 @@ function Requests({
                         {formatLogTime(log.created_at)}
                       </td>
                       <td className="px-3 py-2.5">
-                        <Badge
-                          variant="outline"
-                          className={cn("text-[10px]", statusStyle)}
-                        >
-                          {code ?? "–"}
-                        </Badge>
+                        <div className="flex flex-wrap items-center gap-1.5">
+                          <Badge variant="outline" className="text-[10px] text-slate-600">
+                            HTTP {code ?? "–"}
+                          </Badge>
+                          <ResultBadge log={log} isZh={zh} />
+                        </div>
                       </td>
                       <td className="px-3 py-2.5">
                         <div className="flex max-w-[360px] items-center gap-1.5 text-xs">
@@ -979,14 +1029,14 @@ function Requests({
                   pages +
                   " 页，共 " +
                   query.data.total +
-                  " 条"
+                  " 次尝试"
                 : "Page " +
                   (page + 1) +
                   " of " +
                   pages +
                   " · " +
                   query.data.total +
-                  " total"}
+                  " attempts"}
             </span>
             <div className="flex gap-1">
               <Button

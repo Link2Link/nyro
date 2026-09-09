@@ -20,15 +20,12 @@ use tokio_stream::wrappers::ReceiverStream;
 
 use crate::protocol::codec::tool_bridge::ToolRoutePlan;
 use crate::protocol::ids::ProtocolEndpoint;
-use crate::protocol::ir::{AiRequest, AiStreamDelta};
+use crate::protocol::ir::AiRequest;
 use crate::proxy::client::ProxyClient;
 use crate::proxy::context::RequestContext;
 use crate::proxy::observability::headers_to_json;
 
-use super::{
-    CallCtx, LogBuilder, RequestExtras, StreamResponseAccumulator, ai_response_to_deltas,
-    error_response,
-};
+use super::{CallCtx, LogBuilder, RequestExtras, ai_response_to_deltas, error_response};
 
 // ── Streaming response handler ────────────────────────────────────────────────
 
@@ -89,7 +86,12 @@ impl StreamRawChunkHook {
             Ok(()) => text,
             Err(error) => {
                 if let Some(performance) = performance {
-                    performance.fail("failed", format!("raw chunk hook error: {error}"));
+                    performance.record_failure(
+                        "failed",
+                        "hook_error",
+                        "response_hook",
+                        error.as_ref(),
+                    );
                 }
                 tracing::warn!(
                     %error,
@@ -139,7 +141,7 @@ pub(super) async fn handle_stream(
         }
     };
     let upstream_req_hdrs_str = crate::proxy::observability::reqwest_headers_to_json(&headers);
-    let upstream_req_body_str = serde_json::to_string(&body).ok();
+    let upstream_req_body_str = crate::logging::payload::capture_json(&body, true).body;
 
     let (resp, status) = call_result;
     let upstream_hdrs_str = headers_to_json(resp.headers());
@@ -149,7 +151,7 @@ pub(super) async fn handle_stream(
             .json()
             .await
             .unwrap_or_else(|_| serde_json::json!({"error": {"message": "upstream error"}}));
-        let err_body_str = serde_json::to_string(&err_body).ok();
+        let err_body_str = crate::logging::payload::capture_json(&err_body, true).body;
         log.status(status)
             .upstream_status(status as i32)
             .with_upstream_request(upstream_req_hdrs_str, upstream_req_body_str)
@@ -181,7 +183,11 @@ pub(super) async fn handle_stream(
         let upstream_start_pt = upstream_start;
 
         tokio::spawn(async move {
-            let mut log_buf: Vec<u8> = Vec::new();
+            // Full buffering is only required when upstream returns JSON to a
+            // streaming request. SSE stats are decoded incrementally.
+            let mut json_buf: Vec<u8> = Vec::new();
+            let mut log_parser = egress.handler().make_stream_response_decoder();
+            let mut accumulator = super::LogUsageAccumulator::default();
             let mut undecided_buf: Vec<u8> = Vec::new();
             let mut byte_stream = resp.bytes_stream();
             let mut stream_error: Option<String> = None;
@@ -191,14 +197,24 @@ pub(super) async fn handle_stream(
             let mut converted_client_sse: Option<String> = None;
             let mut converted_ai_resp = None;
 
-            while let Some(result) = byte_stream.next().await {
+            loop {
+                let result = tokio::select! {
+                    biased;
+                    _ = pt_tx.closed() => break,
+                    result = byte_stream.next() => result,
+                };
+                let Some(result) = result else {
+                    break;
+                };
                 match result {
                     Ok(b) => {
                         if first_chunk_ms.is_none() {
                             first_chunk_ms = Some(upstream_start_pt.elapsed().as_millis() as i64);
                         }
                         chunks_count += 1;
-                        log_buf.extend_from_slice(&b);
+                        if let Ok(deltas) = log_parser.parse_chunk(&String::from_utf8_lossy(&b)) {
+                            accumulator.apply_all(&deltas);
+                        }
                         match passthrough_mode {
                             PassthroughBodyMode::Undecided => {
                                 undecided_buf.extend_from_slice(&b);
@@ -209,10 +225,13 @@ pub(super) async fn handle_stream(
                                         if pt_tx.send(Ok(Bytes::from(pending))).await.is_err() {
                                             break; // client disconnected
                                         }
+                                        if let Some(p) = &log_pt.performance {
+                                            p.note_client_frame_sent();
+                                        }
                                     }
                                     Some(PassthroughBodyMode::NonSseJson) => {
                                         passthrough_mode = PassthroughBodyMode::NonSseJson;
-                                        undecided_buf.clear();
+                                        json_buf = std::mem::take(&mut undecided_buf);
                                     }
                                     _ => {}
                                 }
@@ -221,30 +240,46 @@ pub(super) async fn handle_stream(
                                 if pt_tx.send(Ok(b)).await.is_err() {
                                     break; // client disconnected
                                 }
+                                if let Some(p) = &log_pt.performance {
+                                    p.note_client_frame_sent();
+                                }
                             }
                             PassthroughBodyMode::NonSseJson => {
                                 // Upstream returned a complete JSON response to a stream endpoint.
                                 // Buffer until EOF, then convert it to the downstream SSE shape.
+                                json_buf.extend_from_slice(&b);
                             }
                         }
                     }
                     Err(e) => {
                         tracing::warn!(error = %e, "upstream stream error during passthrough");
                         stream_error = Some(e.to_string());
-                        // Emit an Anthropic-protocol error event so the client
-                        // gets an explicit signal instead of a truncated stream.
-                        let msg = e.to_string().replace('"', "\\\"");
-                        let err_sse = format!(
-                            "event: error\ndata: {{\"type\":\"error\",\"error\":{{\"type\":\"stream_error\",\"message\":\"{msg}\"}}}}\n\n"
+                        let request_id = log_pt
+                            .diagnostic
+                            .client_request_id
+                            .as_deref()
+                            .unwrap_or_default();
+                        let err_sse = super::stream_error_event(
+                            ingress,
+                            request_id,
+                            if e.is_timeout() {
+                                "timeout"
+                            } else {
+                                "upstream_read_error"
+                            },
                         );
-                        let _ = pt_tx.send(Ok(Bytes::from(err_sse))).await;
+                        if pt_tx.send(Ok(Bytes::from(err_sse))).await.is_ok()
+                            && let Some(p) = &log_pt.performance
+                        {
+                            p.note_client_frame_sent();
+                        }
                         break;
                     }
                 }
             }
 
             let upstream_latency_ms = upstream_start_pt.elapsed().as_millis() as i64;
-            let raw_sse = String::from_utf8_lossy(&log_buf).into_owned();
+            let raw_sse = String::from_utf8_lossy(&json_buf).into_owned();
 
             if matches!(
                 passthrough_mode,
@@ -252,29 +287,20 @@ pub(super) async fn handle_stream(
             ) && let Some((client_sse, ai_resp)) =
                 format_non_sse_stream_response(&raw_sse, egress, ingress)
             {
-                let _ = pt_tx.send(Ok(Bytes::from(client_sse.clone()))).await;
+                if pt_tx
+                    .send(Ok(Bytes::from(client_sse.clone())))
+                    .await
+                    .is_ok()
+                    && let Some(p) = &log_pt.performance
+                {
+                    p.note_client_frame_sent();
+                }
                 converted_client_sse = Some(client_sse);
                 converted_ai_resp = Some(ai_resp);
             }
 
-            // Parse accumulated buffer for usage stats (best-effort).
-            let mut log_parser = egress.handler().make_stream_response_decoder();
-            let mut accumulator = StreamResponseAccumulator::default();
-            if let Ok(ai_deltas) = log_parser.parse_chunk(&raw_sse).inspect_err(|e| {
-                if let Some(p) = &log_pt.performance {
-                    p.fail("failed", format!("passthrough stream parser error: {e}"));
-                }
-            }) {
-                accumulator.apply_all(&ai_deltas);
-            }
-            if let Ok(ai_deltas) = log_parser.finish().inspect_err(|e| {
-                if let Some(p) = &log_pt.performance {
-                    p.fail(
-                        "failed",
-                        format!("passthrough stream parser finish error: {e}"),
-                    );
-                }
-            }) {
+            // Optional usage parsing never changes authoritative outcomes.
+            if let Ok(ai_deltas) = log_parser.finish() {
                 accumulator.apply_all(&ai_deltas);
             }
 
@@ -333,28 +359,47 @@ pub(super) async fn handle_stream(
     let mut hook_state = super::streaming::StreamHookState::capture(req_ctx, req_ir, &call_ctx.gw);
 
     tokio::spawn(async move {
-        let mut accumulator = StreamResponseAccumulator::default();
-        let mut upstream_raw_buf: Vec<u8> = Vec::new();
-        let mut client_sse_parts: Vec<String> = Vec::new();
+        let mut accumulator = super::LogUsageAccumulator::default();
+        // Wire capture is shared in Attempt; no duplicate full log buffers.
         let mut chunks_count: i32 = 0;
         let mut first_chunk_ms: Option<i64> = None;
+        let mut terminal_error_sent = false;
 
-        while let Some(chunk) = byte_stream.next().await {
+        loop {
+            let chunk = tokio::select! {
+                biased;
+                _ = tx.closed() => break,
+                chunk = byte_stream.next() => chunk,
+            };
+            let Some(chunk) = chunk else {
+                break;
+            };
             let bytes = match chunk {
                 Ok(b) => b,
                 Err(e) => {
                     // P1: emit an explicit terminal event instead of silently breaking,
                     // so the client receives a defined stop_reason and does not hang.
                     tracing::warn!(error = %e, "upstream stream error; emitting terminal event");
-                    let error_deltas =
-                        tool_route_plan.restore_stream_deltas(vec![AiStreamDelta::Done {
-                            stop_reason: "error".to_string(),
-                        }]);
-                    accumulator.apply_all(&error_deltas);
-                    let events = stream_formatter.format_deltas(&error_deltas);
-                    for ev in events {
-                        let _ = tx.send(Ok(ev.to_sse_string())).await;
+                    let request_id = log_ir
+                        .diagnostic
+                        .client_request_id
+                        .as_deref()
+                        .unwrap_or_default();
+                    let event = super::stream_error_event(
+                        ingress,
+                        request_id,
+                        if e.is_timeout() {
+                            "timeout"
+                        } else {
+                            "upstream_read_error"
+                        },
+                    );
+                    if tx.send(Ok(event)).await.is_ok()
+                        && let Some(p) = &log_ir.performance
+                    {
+                        p.note_client_frame_sent();
                     }
+                    terminal_error_sent = true;
                     break;
                 }
             };
@@ -362,7 +407,6 @@ pub(super) async fn handle_stream(
                 first_chunk_ms = Some(upstream_start.elapsed().as_millis() as i64);
             }
             chunks_count += 1;
-            upstream_raw_buf.extend_from_slice(&bytes);
             let text = String::from_utf8_lossy(&bytes);
             // Vendor raw-chunk normalization (see StreamRawChunkHook) runs
             // before the decoder; the raw buffer keeps the verbatim upstream
@@ -375,11 +419,12 @@ pub(super) async fn handle_stream(
                 text.as_ref()
             };
             if let Ok(ai_deltas) = stream_parser.parse_chunk(parse_src).inspect_err(|e| {
-                log_ir
-                    .performance
-                    .as_ref()
-                    .unwrap()
-                    .fail("failed", format!("stream parser error: {e}"));
+                log_ir.performance.as_ref().unwrap().record_failure(
+                    "failed",
+                    "conversion_parse_error",
+                    "response_conversion",
+                    e.as_ref(),
+                );
             }) {
                 let mut ai_deltas = tool_route_plan.restore_stream_deltas(ai_deltas);
                 hook_state.apply(&mut ai_deltas).await;
@@ -387,20 +432,23 @@ pub(super) async fn handle_stream(
                 let events = stream_formatter.format_deltas(&ai_deltas);
                 for ev in events {
                     let sse = ev.to_sse_string();
-                    client_sse_parts.push(sse.clone());
                     if tx.send(Ok(sse)).await.is_err() {
                         return;
+                    }
+                    if let Some(p) = &log_ir.performance {
+                        p.note_client_frame_sent();
                     }
                 }
             }
         }
 
         if let Ok(ai_deltas) = stream_parser.finish().inspect_err(|e| {
-            log_ir
-                .performance
-                .as_ref()
-                .unwrap()
-                .fail("failed", format!("stream parser finish error: {e}"));
+            log_ir.performance.as_ref().unwrap().record_failure(
+                "failed",
+                "conversion_parse_error",
+                "response_conversion",
+                e.as_ref(),
+            );
         }) {
             let mut ai_deltas = tool_route_plan.restore_stream_deltas(ai_deltas);
             hook_state.apply(&mut ai_deltas).await;
@@ -408,8 +456,11 @@ pub(super) async fn handle_stream(
             let events = stream_formatter.format_deltas(&ai_deltas);
             for ev in events {
                 let sse = ev.to_sse_string();
-                client_sse_parts.push(sse.clone());
-                let _ = tx.send(Ok(sse)).await;
+                if tx.send(Ok(sse)).await.is_ok()
+                    && let Some(p) = &log_ir.performance
+                {
+                    p.note_client_frame_sent();
+                }
             }
         }
 
@@ -419,21 +470,47 @@ pub(super) async fn handle_stream(
             accumulator.apply_all(&bridge_deltas);
             for ev in stream_formatter.format_deltas(&bridge_deltas) {
                 let sse = ev.to_sse_string();
-                client_sse_parts.push(sse.clone());
-                let _ = tx.send(Ok(sse)).await;
+                if tx.send(Ok(sse)).await.is_ok()
+                    && let Some(p) = &log_ir.performance
+                {
+                    p.note_client_frame_sent();
+                }
             }
         }
 
-        let done_events = stream_formatter.format_done();
+        if !terminal_error_sent {
+            if let Some(attempt) = &log_ir.performance {
+                let diagnostic = attempt.diagnostic();
+                if matches!(diagnostic.attempt_outcome.as_str(), "failed" | "timed_out") {
+                    let event = super::stream_error_event(
+                        ingress,
+                        diagnostic.client_request_id.as_deref().unwrap_or_default(),
+                        diagnostic.failure_kind.as_deref().unwrap_or("stream_error"),
+                    );
+                    if tx.send(Ok(event)).await.is_ok()
+                        && let Some(p) = &log_ir.performance
+                    {
+                        p.note_client_frame_sent();
+                    }
+                    terminal_error_sent = true;
+                }
+            }
+        }
+        let done_events = if terminal_error_sent {
+            Vec::new()
+        } else {
+            stream_formatter.format_done()
+        };
         for ev in done_events {
             let sse = ev.to_sse_string();
-            client_sse_parts.push(sse.clone());
-            let _ = tx.send(Ok(sse)).await;
+            if tx.send(Ok(sse)).await.is_ok()
+                && let Some(p) = &log_ir.performance
+            {
+                p.note_client_frame_sent();
+            }
         }
 
         let upstream_latency_ms = upstream_start.elapsed().as_millis() as i64;
-        let upstream_raw_str = String::from_utf8_lossy(&upstream_raw_buf).into_owned();
-        let client_sse_str = client_sse_parts.join("");
 
         let usage = stream_formatter.usage();
         let mut ai_resp = accumulator.into_ai_response();
@@ -455,13 +532,8 @@ pub(super) async fn handle_stream(
             .upstream_status(200)
             .usage(ai_resp.usage.clone())
             .with_upstream_request(upstream_req_hdrs_str, upstream_req_body_str)
-            .with_upstream_response(
-                200,
-                upstream_hdrs_owned,
-                Some(upstream_raw_str),
-                Some(upstream_latency_ms),
-            )
-            .with_client_response(None, Some(client_sse_str))
+            .with_upstream_response(200, upstream_hdrs_owned, None, Some(upstream_latency_ms))
+            .with_client_response(None, None)
             .stream_metrics(chunks_count, first_chunk_ms)
             .emit();
     });

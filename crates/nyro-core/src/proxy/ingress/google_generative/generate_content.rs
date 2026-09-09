@@ -49,6 +49,7 @@ pub async fn handler(
                 &envelope,
                 GOOGLE_GEMINI_GENERATE_CONTENT_V1BETA,
                 format!("Gemini decode error: {e}"),
+                Some(&ctx),
             );
         }
     };

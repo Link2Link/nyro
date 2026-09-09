@@ -4,10 +4,13 @@ import { Check, Copy, Download, Loader2, Trash2 } from "lucide-react";
 
 import { backend } from "@/lib/backend";
 import { useLocale } from "@/lib/i18n";
-import type { Provider, RequestLog } from "@/lib/types";
-import { computeTps, formatDuration, formatLogTime, formatTokenCount, formatTps, generationMsOf, tryPrettyJson } from "@/lib/format";
+import type { Provider, RequestLog, RequestLogAttempts } from "@/lib/types";
+import { computeTps, formatDuration, formatLogTime, formatTokenCount, formatTps, generationMsOf } from "@/lib/format";
+import { effectiveOutcome, payloadDownload } from "@/lib/log-observability";
+import { ResultBadge } from "@/components/log-outcome";
+import { AttemptResultBanner, PayloadBlock } from "@/components/log-evidence";
 import { prettyName } from "@/lib/protocol";
-import { cn, copyToClipboard } from "@/lib/utils";
+import { copyToClipboard } from "@/lib/utils";
 import {
   Dialog,
   DialogContent,
@@ -31,14 +34,28 @@ interface LogDetailDialogProps {
   onDelete?: (id: string) => void;
 }
 
-export function LogDetailDialog({ logId, summary, open, onOpenChange, onDelete }: LogDetailDialogProps) {
+export function LogDetailDialog(props: LogDetailDialogProps) {
+  // A fresh navigation scope when a different source row opens; correlation navigation stays internal.
+  return <LogDetailContent key={`${props.logId}:${props.open}`} {...props} />;
+}
+
+function LogDetailContent({ logId, summary, open, onOpenChange, onDelete }: LogDetailDialogProps) {
+  const [attemptSelection, setAttemptSelection] = useState<RequestLog | null>(null);
+  const selectedId = attemptSelection?.id ?? logId;
   const { locale } = useLocale();
   const isZh = locale === "zh-CN";
 
-  const { data, isLoading } = useQuery<RequestLog | null>({
-    queryKey: ["log-detail", logId],
-    queryFn: () => backend("get_log", { id: logId! }),
-    enabled: open && !!logId,
+  const { data, isLoading, error } = useQuery<RequestLog | null>({
+    queryKey: ["log-detail", selectedId],
+    queryFn: () => backend("get_log", { id: selectedId! }),
+    enabled: open && !!selectedId,
+  });
+  const log = data === undefined ? attemptSelection ?? summary ?? null : data;
+  const correlation = useQuery<RequestLogAttempts>({
+    queryKey: ["request-log-attempts", data?.client_request_id],
+    queryFn: () => backend("get_request_log_attempts", { requestId: data!.client_request_id }),
+    enabled: open && !!data?.client_request_id,
+    retry: false,
   });
 
   // Shared ["providers"] cache with the logs page. Route-decision snapshots
@@ -65,7 +82,7 @@ export function LogDetailDialog({ logId, summary, open, onOpenChange, onDelete }
   }, [idCopied]);
 
   const handleCopyId = async () => {
-    const id = log?.id ?? logId;
+    const id = log?.id ?? selectedId;
     if (!id) return;
     setIdCopied(await copyToClipboard(id));
   };
@@ -84,12 +101,9 @@ export function LogDetailDialog({ logId, summary, open, onOpenChange, onDelete }
     selection.addRange(range);
   };
 
-  const log = data ?? summary ?? null;
-
   const method = log?.method ?? "–";
   const path = log?.path ?? "–";
   const clientStatus = log?.client_status_code;
-  const statusOk = (clientStatus ?? 0) < 400;
   // is_stream is the canonical flag (declared by the client). Fall back to
   // stream_chunks_count for older log rows that pre-date the field.
   const isStream = log?.is_stream ?? (log?.stream_chunks_count ?? 0) > 0;
@@ -115,7 +129,13 @@ export function LogDetailDialog({ logId, summary, open, onOpenChange, onDelete }
       : (log.client_protocol ?? "–");
     const lines: string[] = [
       `# Nyro Request Log`,
-      `# ID: ${log.id}`,
+      `# Attempt log ID: ${log.id}`,
+      `# Client request ID: ${log.client_request_id ?? "unknown"}  Attempt index: ${log.attempt_index ?? "unknown"}`,
+      `# Effective result: ${effectiveOutcome(log)}  Attempt outcome: ${log.attempt_outcome ?? "unknown"}  Version: ${log.outcome_version ?? 0}`,
+      `# Failure kind: ${log.failure_kind ?? "–"}  Stage: ${log.failure_stage ?? "–"}`,
+      `# Error summary: ${log.error_message ?? "–"}`,
+      `# Error causes (raw JSON): ${log.error_causes ?? "–"}`,
+      `# Final client result (not another attempt): ${JSON.stringify(correlation.data ? correlation.data.result : log.request_result ?? null)}`,
       `# Time: ${ts}`,
       `# Method: ${method}  Path: ${path}`,
       `# Client Status: ${log.client_status_code ?? "–"}  Upstream Status: ${log.upstream_status_code ?? "–"}`,
@@ -128,29 +148,7 @@ export function LogDetailDialog({ logId, summary, open, onOpenChange, onDelete }
       `# Tokens: IN=${log.input_tokens} OUT=${log.output_tokens}`,
       isStream ? `# Stream: chunks=${log.stream_chunks_count} ttfb=${log.stream_first_chunk_ms ?? "–"}ms` : `# Stream: false`,
       "",
-      "## 1. CLIENT REQUEST HEADERS",
-      log.client_request_headers ?? "(empty)",
-      "",
-      "## 1. CLIENT REQUEST BODY",
-      log.client_request_body ?? "(empty)",
-      "",
-      "## 2. UPSTREAM REQUEST HEADERS",
-      log.upstream_request_headers ?? "(empty)",
-      "",
-      "## 2. UPSTREAM REQUEST BODY",
-      log.upstream_request_body ?? "(empty)",
-      "",
-      "## 3. UPSTREAM RESPONSE HEADERS",
-      log.upstream_response_headers ?? "(empty)",
-      "",
-      "## 3. UPSTREAM RESPONSE BODY",
-      log.upstream_response_body ?? "(empty)",
-      "",
-      "## 4. CLIENT RESPONSE HEADERS",
-      log.client_response_headers ?? "(empty)",
-      "",
-      "## 4. CLIENT RESPONSE BODY",
-      log.client_response_body ?? "(empty)",
+      payloadDownload(log),
     ];
     const blob = new Blob([lines.join("\n")], { type: "text/plain" });
     const url = URL.createObjectURL(blob);
@@ -175,7 +173,7 @@ export function LogDetailDialog({ logId, summary, open, onOpenChange, onDelete }
           </DialogTitle>
           <DialogDescription className="flex flex-wrap items-center gap-2">
             <span>{log ? formatLogTime(log.created_at) : ""}</span>
-            {(log?.id ?? logId) ? (
+            {(log?.id ?? selectedId) ? (
               <span className="inline-flex max-w-full items-center gap-1">
                 <code
                   ref={idCodeRef}
@@ -185,7 +183,7 @@ export function LogDetailDialog({ logId, summary, open, onOpenChange, onDelete }
                   onClick={handleSelectId}
                   className="cursor-pointer select-all rounded border border-slate-200 bg-slate-50 px-1.5 py-0.5 font-mono text-[11px] text-slate-600 transition-colors hover:border-slate-300 hover:text-slate-800 break-all"
                 >
-                  {log?.id ?? logId}
+                  {log?.id ?? selectedId}
                 </code>
                 <button
                   type="button"
@@ -207,14 +205,8 @@ export function LogDetailDialog({ logId, summary, open, onOpenChange, onDelete }
         <div className="flex flex-wrap items-center gap-2 text-xs">
           <Badge variant="outline" className="font-mono">{method}</Badge>
           <span className="font-mono text-slate-600 break-all">{path}</span>
-          <span
-            className={cn(
-              "inline-flex rounded-full px-2 py-0.5 font-medium",
-              statusOk ? "bg-green-50 text-green-700" : "bg-red-50 text-red-600",
-            )}
-          >
-            {clientStatus ?? "–"}
-          </span>
+          <span className="font-mono text-slate-600">HTTP {clientStatus ?? "–"}</span>
+          {log && <ResultBadge log={log} isZh={isZh} />}
           {isStream ? (
             <Badge variant="outline" className="border-green-200 bg-green-50 text-green-700">SSE</Badge>
           ) : (
@@ -288,6 +280,7 @@ export function LogDetailDialog({ logId, summary, open, onOpenChange, onDelete }
                 size="sm"
                 variant="ghost"
                 onClick={handleDownload}
+                disabled={isLoading || !!error || !data}
                 className="h-7 gap-1 px-2 text-xs"
               >
                 {downloaded ? (
@@ -313,6 +306,10 @@ export function LogDetailDialog({ logId, summary, open, onOpenChange, onDelete }
         </div>
 
         <div className="flex-1 space-y-3 overflow-y-auto pr-1">
+          {error && <p role="alert" className="text-xs text-red-700">{isZh ? "详细日志加载失败，摘要不代表完整载荷：" : "Failed to load detail; the summary does not contain complete payloads: "}{String(error)}</p>}
+          {!isLoading && data === null && <p className="text-xs text-amber-700">{isZh ? "此日志不存在或已删除。" : "This log is unavailable or has been deleted."}</p>}
+          {log && <AttemptResultBanner log={log} correlation={correlation.data} correlationLoading={correlation.isLoading} correlationError={correlation.isError} onSelect={setAttemptSelection} isZh={isZh} />}
+          <p className="rounded-lg border border-amber-200 bg-amber-50 p-2 text-xs text-amber-800">{isZh ? "仅管理员诊断：四种正文各保留最多 1 MiB（头尾），请求头各最多 64 KiB 并脱敏凭据。正文为原始数据，可能包含敏感信息，不做推测性脱敏；历史记录的采集与脱敏状态可能未知。" : "Admin diagnostics only: each of four bodies retains up to 1 MiB (head/tail); each header capture is capped at 64 KiB with credential redaction. Bodies are raw and may contain sensitive data, without guessed redaction. Historical capture/redaction state may be unknown."}</p>
           {log?.route_decision ? (
             <>
               <SectionHeader
@@ -328,12 +325,14 @@ export function LogDetailDialog({ logId, summary, open, onOpenChange, onDelete }
           />
           <PayloadBlock
             title={isZh ? "客户端请求头" : "Client Request Headers"}
-            content={log?.client_request_headers}
+            log={data ?? null}
+            field="client_request_headers"
             isZh={isZh}
           />
           <PayloadBlock
             title={isZh ? "客户端请求体" : "Client Request Body"}
-            content={log?.client_request_body}
+            log={data ?? null}
+            field="client_request_body"
             isZh={isZh}
           />
 
@@ -347,12 +346,14 @@ export function LogDetailDialog({ logId, summary, open, onOpenChange, onDelete }
           />
           <PayloadBlock
             title={isZh ? "上游请求头" : "Upstream Request Headers"}
-            content={log?.upstream_request_headers}
+            log={data ?? null}
+            field="upstream_request_headers"
             isZh={isZh}
           />
           <PayloadBlock
             title={isZh ? "上游请求体" : "Upstream Request Body"}
-            content={log?.upstream_request_body}
+            log={data ?? null}
+            field="upstream_request_body"
             isZh={isZh}
           />
 
@@ -362,12 +363,14 @@ export function LogDetailDialog({ logId, summary, open, onOpenChange, onDelete }
           />
           <PayloadBlock
             title={isZh ? "上游响应头" : "Upstream Response Headers"}
-            content={log?.upstream_response_headers}
+            log={data ?? null}
+            field="upstream_response_headers"
             isZh={isZh}
           />
           <PayloadBlock
             title={isZh ? "上游响应体" : "Upstream Response Body"}
-            content={log?.upstream_response_body}
+            log={data ?? null}
+            field="upstream_response_body"
             isZh={isZh}
           />
 
@@ -381,12 +384,14 @@ export function LogDetailDialog({ logId, summary, open, onOpenChange, onDelete }
           />
           <PayloadBlock
             title={isZh ? "客户端响应头" : "Client Response Headers"}
-            content={log?.client_response_headers}
+            log={data ?? null}
+            field="client_response_headers"
             isZh={isZh}
           />
           <PayloadBlock
             title={isZh ? "客户端响应体" : "Client Response Body"}
-            content={log?.client_response_body}
+            log={data ?? null}
+            field="client_response_body"
             isZh={isZh}
           />
         </div>
@@ -517,74 +522,3 @@ function SectionHeader({ title, hint }: { title: string; hint?: string }) {
     </div>
   );
 }
-
-interface PayloadBlockProps {
-  title: string;
-  content: string | null | undefined;
-  isZh: boolean;
-}
-
-function PayloadBlock({ title, content, isZh }: PayloadBlockProps) {
-  const [copied, setCopied] = useState(false);
-  const [collapsed, setCollapsed] = useState(true);
-  const pretty = tryPrettyJson(content);
-  const hasContent = !!(content && content.trim());
-
-  useEffect(() => {
-    if (!copied) return;
-    const t = window.setTimeout(() => setCopied(false), 1500);
-    return () => window.clearTimeout(t);
-  }, [copied]);
-
-  const handleCopy = async () => {
-    if (!hasContent) return;
-    setCopied(await copyToClipboard(pretty));
-  };
-
-  return (
-    <div className="rounded-lg border border-slate-200 bg-slate-50/60">
-      <div
-        className="flex cursor-pointer items-center justify-between border-b border-slate-200 px-3 py-1.5"
-        onClick={() => setCollapsed((v) => !v)}
-      >
-        <span className="text-xs font-medium text-slate-600">{title}</span>
-        <div className="flex items-center gap-1" onClick={(e) => e.stopPropagation()}>
-          <Button
-            type="button"
-            size="sm"
-            variant="ghost"
-            disabled={!hasContent}
-            onClick={handleCopy}
-            className="h-7 gap-1 px-2 text-xs"
-          >
-            {copied ? (
-              <>
-                <Check className="h-3.5 w-3.5" />
-                {isZh ? "已复制" : "Copied"}
-              </>
-            ) : (
-              <>
-                <Copy className="h-3.5 w-3.5" />
-                {isZh ? "复制" : "Copy"}
-              </>
-            )}
-          </Button>
-        </div>
-      </div>
-      {!collapsed && (
-        <pre className="max-h-80 overflow-auto whitespace-pre-wrap break-all px-3 py-2 font-mono text-[11px] leading-relaxed text-slate-700">
-          {hasContent ? pretty : <span className="text-slate-400">{isZh ? "（无内容）" : "(empty)"}</span>}
-        </pre>
-      )}
-      {collapsed && (
-        <div
-          className="cursor-pointer px-3 py-1.5 text-[11px] text-slate-400 hover:text-slate-600"
-          onClick={() => setCollapsed(false)}
-        >
-          {hasContent ? (isZh ? "点击展开" : "click to expand") : (isZh ? "（无内容）" : "(empty)")}
-        </div>
-      )}
-    </div>
-  );
-}
-

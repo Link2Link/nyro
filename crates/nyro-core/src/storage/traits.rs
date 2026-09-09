@@ -7,8 +7,8 @@ use crate::db::models::{
     ApiKeyStats, ApiKeyUsageDetail, ApiKeyWithBindings, CreateApiKey, CreateModel,
     CreateModelBackend, CreateProvider, LogPage, LogQuery, Model, ModelBackend, ModelStats,
     ModelTimeBucket, ModelUsageDetail, ModelUsageStats, OAuthCredential, Provider,
-    ProviderModelRating, ProviderStats, ProviderUsageDetail, RequestLog, StatsHourly,
-    StatsOverview, StatsTimeBucket, UpdateApiKey, UpdateModel, UpdateProvider,
+    ProviderModelRating, ProviderStats, ProviderUsageDetail, RequestLog, RequestResult,
+    StatsHourly, StatsOverview, StatsTimeBucket, UpdateApiKey, UpdateModel, UpdateProvider,
     UpsertOAuthCredential,
 };
 use crate::logging::LogEntry;
@@ -171,18 +171,27 @@ pub trait LogStore: Send + Sync {
     ) -> anyhow::Result<Vec<crate::db::PairPerformanceStats>> {
         anyhow::bail!("model performance statistics are unsupported by this storage")
     }
+    /// Persist all attempts and attached final results atomically. SQL errors,
+    /// including duplicate stable log IDs, reject the entire batch without retry.
     async fn append_batch(&self, entries: Vec<LogEntry>) -> anyhow::Result<()>;
     async fn query(&self, query: LogQuery) -> anyhow::Result<LogPage>;
     async fn find_by_id(&self, id: &str) -> anyhow::Result<Option<RequestLog>>;
+    /// Final client result; never counted as an extra attempt in usage statistics.
+    async fn request_result(
+        &self,
+        _client_request_id: &str,
+    ) -> anyhow::Result<Option<RequestResult>> {
+        Ok(None)
+    }
     async fn cleanup_before(&self, cutoff_expression: &str) -> anyhow::Result<u64>;
     async fn clear_all(&self) -> anyhow::Result<u64>;
-    /// Clear recorded request/response headers and bodies from non-error log rows.
-    /// Rows with a client or upstream HTTP 4xx/5xx status remain untouched.
+    /// Clear all recorded request/response headers and bodies, including errors.
+    /// Retain safe metadata and record the payload-clearing timestamp.
     /// Returns the number of rows whose recorded payload fields were cleared.
     async fn clear_payloads(&self) -> anyhow::Result<u64>;
     /// Delete one log row by id; 0 when the id does not exist.
     async fn delete_by_id(&self, id: &str) -> anyhow::Result<u64>;
-    /// Delete every log row whose client status is an error (>= 400).
+    /// Delete attempts matching the shared authoritative error predicate.
     async fn clear_errors(&self) -> anyhow::Result<u64>;
     async fn stats_overview(&self, hours: Option<i64>) -> anyhow::Result<StatsOverview>;
     async fn stats_hourly(&self, hours: i64) -> anyhow::Result<Vec<StatsHourly>>;
