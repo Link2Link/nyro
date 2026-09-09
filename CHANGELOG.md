@@ -4,6 +4,30 @@ All notable changes to Nyro will be documented in this file.
 
 ---
 
+## v2.0.9
+
+> Released on 2026-09-09
+
+#### Features
+
+- **Model intelligence ratings (prefix-shared)**: administrators assign a 0–100 comprehensive capability score per provider / upstream-model pair, now shared through longest-prefix matching on segment boundaries — `model_rating_prefixes` rows are normalized to lowercase on save, case variants are rejected as duplicates, and performance points aggregate per prefix × provider with weighting; a dedicated Model Ratings page offers a flat cross-provider table with search, filters, sorting, and pagination, Available Models gains inline score editing with explicit rated / unrated / unknown states, and provider-copy snapshots plus config export/import round-trip scores in a flat ratings format; ratings never influence routing and unrated models never receive an invented score
+- **Model performance observation**: the new Performance page plots every rated pair as capability score (X) versus mixed average TPS (Y), using the same latest-ten retained-call sampling and TPS formula as model usage statistics; the chart labels model names directly, adapts axis scaling to visible scores, and draws an upper-right convex-envelope dashed boundary (with membership annotations) that recomputes under search and provider filters; backed by request lifecycle tracking, `GET /api/v1/model-performance`, and desktop IPC, with explicit missing-data and low-sample handling
+- **Failure observability and attempt outcomes**: a versioned `attempt_outcome` authority classifies every retained attempt into five exclusive classes (error / completed / cancelled / output_limited / unknown), with one unified error predicate — shared by display, error counts, and Clear error logs — across all four storage backends; bounded payload evidence retains up to 1 MiB head+tail per body direction plus redacted 64 KiB header blocks with per-direction capture metadata, and confirmed failures, timeouts, cancellations, and output limits keep their evidence even when ordinary payload recording is disabled; codex-style clients that close on the protocol terminal are reconciled to confirmed completion via stream frame-count delivery proof instead of misjudged cancellation; a separate `request_results` table correlates retry chains with the final client outcome without polluting attempt statistics; log-queue overflow and database-write losses surface as explicit counters; WebUI gains outcome badges, a payload-evidence panel, and five-bucket success/cancel/error/unknown usage statistics
+- **google/antigravity subscription channel**: a new Google OAuth driver (PKCE authorization with Code Assist project bootstrap) powers the antigravity wire format — v1internal request wrapping, response/SSE unwrapping through StreamRawChunkHook, vendor mutations gated per channel while the default channel stays byte-passthrough; the channel forces upstream streaming to avoid empty non-stream responses, supports google-gemini model probing and SSE reply extraction, and discovers subscription models dynamically per account
+
+#### Improvements
+
+- **Route decision readability**: routing decision snapshots embed the provider display name at selection time (id fallback on lookup failure) and the WebUI decision card prefers the embedded name over its provider mapping
+- **Docker apt mirror**: the image build accepts an `APT_MIRROR` arg defaulting to the TUNA mirror, replacing both deb822 source domains before apt update; passing an empty value restores official sources
+
+#### Fixes
+
+- **Usage erroneously logging out**: upstream credential failures no longer map to HTTP 401 — they report 502 upstream errors, and genuine 401 responses probe the admin session before clearing the login state
+- **gpt-6-astra off reasoning effort**: the verified model clamps `off` intent to `low` on both Chat and Responses wire forms while leaving every other legal tier untouched
+- **MiniMax stream terminal state and output budget**: stream-terminal policy is scoped per provider, intermediate frames with empty finish reasons are ignored, unknown-outcome diagnostic payloads are retained, cancellation and timeout can no longer be misjudged as success, and the explicit output budget floor is set to 256K
+
+---
+
 ## v2.0.8
 
 > Released on 2026-09-03
