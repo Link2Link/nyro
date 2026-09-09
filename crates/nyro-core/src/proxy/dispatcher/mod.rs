@@ -1091,6 +1091,7 @@ async fn dispatch_pipeline_inner(
             ctx.cancellation.clone(),
             ctx.deadline.clone(),
         );
+        performance.configure_terminal(provider.vendor.as_deref(), egress);
         let attempt_index = ctx.extensions.get::<AttemptCount>().unwrap_or_default().0 + 1;
         ctx.extensions.insert(AttemptCount(attempt_index));
         performance.correlate(&ctx.request_id, attempt_index);

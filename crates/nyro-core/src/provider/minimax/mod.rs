@@ -93,6 +93,37 @@ const METADATA: VendorMetadata = VendorMetadata {
 
 pub struct MinimaxVendor;
 
+/// Operator-requested floor for explicitly supplied MiniMax Chat output budgets.
+/// This is an allowance, not a target length or a claim about model capacity.
+const CHAT_OUTPUT_TOKEN_FLOOR: u64 = 256 * 1024;
+
+pub(crate) fn apply_chat_output_token_floor(
+    body: &mut Value,
+    vendor: Option<&str>,
+    protocol: ProtocolId,
+) {
+    if vendor != Some("minimax") || protocol != OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1 {
+        return;
+    }
+    let Some(object) = body.as_object_mut() else {
+        return;
+    };
+    // Match the Chat decoder's precedence. Do not repair invalid values or
+    // insert a budget when the client left it unspecified.
+    let budget = object
+        .get("max_completion_tokens")
+        .filter(|value| !value.is_null())
+        .or_else(|| object.get("max_tokens"))
+        .and_then(Value::as_u64);
+    if let Some(budget) = budget {
+        object.remove("max_completion_tokens");
+        object.insert(
+            "max_tokens".into(),
+            Value::from(budget.max(CHAT_OUTPUT_TOKEN_FLOOR)),
+        );
+    }
+}
+
 /// MiniMax enables thinking by default when the request omits a thinking
 /// directive. Keep reasoning output structurally separated on Chat Completions,
 /// while preserving every client-supplied effort, budget, or thinking declaration.
@@ -223,6 +254,76 @@ inventory::submit! { VendorRegistration { make: || Box::new(MinimaxVendor) } }
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chat_output_floor_normalizes_aliases_and_preserves_larger_budgets() {
+        for field in ["max_completion_tokens", "max_tokens"] {
+            for budget in [0, 64, 262_143, 262_144, 524_288] {
+                let mut body = serde_json::json!({field: budget, "reasoning_effort": "high"});
+                apply_chat_output_token_floor(
+                    &mut body,
+                    Some("minimax"),
+                    OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1,
+                );
+                assert_eq!(body["max_tokens"], budget.max(CHAT_OUTPUT_TOKEN_FLOOR));
+                assert!(body.get("max_completion_tokens").is_none());
+                assert_eq!(body["reasoning_effort"], "high");
+                let once = body.clone();
+                apply_chat_output_token_floor(
+                    &mut body,
+                    Some("minimax"),
+                    OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1,
+                );
+                assert_eq!(body, once);
+            }
+        }
+        for (alias, legacy, expected) in [
+            (serde_json::json!(64), 524_288, 262_144),
+            (serde_json::json!(524_288), 64, 524_288),
+            (Value::Null, 64, 262_144),
+        ] {
+            let mut body = serde_json::json!({"max_completion_tokens":alias,"max_tokens":legacy});
+            apply_chat_output_token_floor(
+                &mut body,
+                Some("minimax"),
+                OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1,
+            );
+            assert_eq!(body, serde_json::json!({"max_tokens":expected}));
+        }
+    }
+
+    #[test]
+    fn chat_output_floor_leaves_missing_invalid_and_other_scopes_unchanged() {
+        for mut body in [
+            serde_json::json!({}),
+            Value::Null,
+            serde_json::json!([]),
+            serde_json::json!({"max_tokens":null}),
+            serde_json::json!({"max_completion_tokens":null}),
+            serde_json::json!({"max_completion_tokens":-1,"max_tokens":64}),
+            serde_json::json!({"max_tokens":1.5}),
+            serde_json::json!({"max_tokens":"64"}),
+        ] {
+            let expected = body.clone();
+            apply_chat_output_token_floor(
+                &mut body,
+                Some("minimax"),
+                OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1,
+            );
+            assert_eq!(body, expected);
+        }
+        for (vendor, protocol) in [
+            (None, OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1),
+            (Some("custom"), OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1),
+            (Some("minimax"), OPENAI_RESPONSES_V1),
+            (Some("minimax"), ANTHROPIC_MESSAGES_2023_06_01),
+        ] {
+            let mut body = serde_json::json!({"model":"MiniMax-M3","max_completion_tokens":64,"max_tokens":64});
+            let expected = body.clone();
+            apply_chat_output_token_floor(&mut body, vendor, protocol);
+            assert_eq!(body, expected);
+        }
+    }
 
     #[test]
     fn openai_chat_defaults_to_split_reasoning_output() {

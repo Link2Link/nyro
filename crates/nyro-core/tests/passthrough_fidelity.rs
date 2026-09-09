@@ -366,6 +366,58 @@ async fn passthrough_run_preserves_vendor_specific_fields() {
 }
 
 #[tokio::test]
+async fn minimax_output_floor_reaches_passthrough_and_ir_builders() {
+    use nyro_core::provider::{common::pipeline, minimax::MinimaxVendor};
+    let gw = build_test_gateway().await;
+    for vendor_id in ["minimax", "custom"] {
+        let mut provider = fake_provider("test");
+        provider.vendor = Some(vendor_id.into());
+        let ctx = ProviderCtx {
+            provider: &provider,
+            protocol: OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1,
+            egress_base_url: "https://upstream.local",
+            api_key: &provider.api_key,
+            auth_scheme: "auto",
+            actual_model: "MiniMax-M3",
+            force_max_reasoning: false,
+            credential: None,
+            gw: &gw,
+            disable_default_auth: false,
+        };
+        for budget in [64, 262_144, 524_288] {
+            for field in ["max_completion_tokens", "max_tokens"] {
+                let raw = json!({"model":"MiniMax-M3","messages":[{"role":"user","content":"hi"}],field:budget,"reasoning_effort":"high","stream":true});
+                let expected = if vendor_id == "minimax" {
+                    budget.max(262_144)
+                } else {
+                    budget
+                };
+                let out = pipeline::passthrough_run(&MinimaxVendor, raw.clone(), &ctx, true)
+                    .await
+                    .unwrap();
+                if vendor_id == "minimax" {
+                    assert_eq!(out.body["max_tokens"], expected);
+                    assert!(out.body.get("max_completion_tokens").is_none());
+                } else {
+                    assert_eq!(out.body[field], expected);
+                }
+                assert_eq!(out.body["reasoning_effort"], "high");
+                let mut request = OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1
+                    .handler()
+                    .make_request_decoder()
+                    .decode_request(raw)
+                    .unwrap();
+                let out = pipeline::build_request(&MinimaxVendor, &mut request, &ctx)
+                    .await
+                    .unwrap();
+                assert_eq!(out.body["max_tokens"], expected);
+                assert_eq!(out.body["reasoning_effort"], "high");
+            }
+        }
+    }
+}
+
+#[tokio::test]
 async fn passthrough_run_defaults_missing_responses_function_tool_fields() {
     let gw = build_test_gateway().await;
     let provider = fake_provider("sk-test");

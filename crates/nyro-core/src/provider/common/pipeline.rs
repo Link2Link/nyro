@@ -442,6 +442,12 @@ where
         .await
         .map_err(GatewayError::internal)?;
 
+    crate::provider::minimax::apply_chat_output_token_floor(
+        &mut body,
+        ctx.provider.vendor.as_deref(),
+        ctx.protocol,
+    );
+
     // 5b. sub2api Fast 模式：缺 service_tier 时补 priority（IR 转码路径）
     maybe_inject_openai_fast_mode(&mut body, ctx.provider, ctx.protocol);
     // 5c. Codex 消费级上游：剥离其拒绝的 Responses 参数（IR 转码路径）
@@ -598,6 +604,12 @@ pub async fn passthrough_run(
     if ctx.force_max_reasoning {
         apply_force_max_reasoning_body(&mut raw_body, ctx.protocol.protocol);
     }
+
+    crate::provider::minimax::apply_chat_output_token_floor(
+        &mut raw_body,
+        ctx.provider.vendor.as_deref(),
+        ctx.protocol,
+    );
 
     if is_openai_chat {
         normalize_openai_developer_roles(&mut raw_body);

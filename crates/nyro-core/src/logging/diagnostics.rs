@@ -72,6 +72,15 @@ pub fn effective_outcome(
         _ => "unknown",
     }
 }
+/// Force bounded payload retention even when ordinary recording is disabled.
+///
+/// A versioned `unknown` outcome is an actively classified ambiguity — the
+/// observer looked and could not determine what happened (for example a stream
+/// that ended without a confirmable terminal). The payload is then the only
+/// remaining evidence, so it is retained for debugging. The un-upgraded
+/// `version 0` default is deliberately excluded: legacy rows and paths without
+/// lifecycle observation are all version-0 `unknown`, and blanket-retaining
+/// them would defeat the payload-recording switch.
 pub fn force_payload(
     client: Option<i32>,
     upstream: Option<i32>,
@@ -85,7 +94,7 @@ pub fn force_payload(
     ) || (diagnostic.outcome_version == OUTCOME_VERSION
         && matches!(
             diagnostic.attempt_outcome.as_str(),
-            "cancelled" | "output_limited"
+            "cancelled" | "output_limited" | "unknown"
         ))
 }
 fn qualifier(alias: &str) -> String {
@@ -181,6 +190,7 @@ fn public_message(kind: &str) -> &'static str {
         "response_parse" => "Failed to parse the response",
         "conversion" => "Failed to convert the response protocol",
         "missing_terminal" => "The response ended without its required terminal event",
+        "ambiguous_terminal" => "Could not confirm the response terminal event",
         "downstream_disconnect" => "The downstream response closed before completion",
         "output_limit" => "The response reached its output token limit",
         "timeout" => "The request timed out",
@@ -254,6 +264,51 @@ mod tests {
             effective_outcome(Some(500), Some(200), 1, "completed"),
             "error"
         );
+    }
+
+    #[test]
+    fn force_payload_retains_versioned_unknown_but_not_legacy_default() {
+        let diagnostic = |version: i32, outcome: &str| LogDiagnostic {
+            outcome_version: version,
+            attempt_outcome: outcome.into(),
+            ..Default::default()
+        };
+        // Actively classified ambiguity: 200 OK but completion undeterminable.
+        assert!(force_payload(
+            Some(200),
+            Some(200),
+            &diagnostic(OUTCOME_VERSION, "unknown")
+        ));
+        // Version-0 unknown is the un-upgraded default (legacy rows, paths
+        // without lifecycle observation); retaining it would record everything.
+        assert!(!force_payload(
+            Some(200),
+            Some(200),
+            &diagnostic(0, "unknown")
+        ));
+        // Confirmed successes stay excluded, as before.
+        assert!(!force_payload(
+            Some(200),
+            Some(200),
+            &diagnostic(OUTCOME_VERSION, "completed")
+        ));
+        // Existing forced outcomes are unchanged.
+        assert!(force_payload(
+            Some(200),
+            Some(200),
+            &diagnostic(OUTCOME_VERSION, "cancelled")
+        ));
+        assert!(force_payload(
+            Some(200),
+            Some(200),
+            &diagnostic(OUTCOME_VERSION, "output_limited")
+        ));
+        // Future versions never force through the outcome channel.
+        assert!(!force_payload(
+            Some(200),
+            Some(200),
+            &diagnostic(2, "unknown")
+        ));
     }
     #[test]
     fn diagnostic_messages_are_bounded_and_credentials_are_not_reflected() {

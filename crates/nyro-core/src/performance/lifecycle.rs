@@ -78,6 +78,16 @@ impl Attempt {
             deadline,
         })))
     }
+    /// Configure original-wire terminal framing once the route's actual egress
+    /// is known. Do not infer dialects from client-selected model names.
+    pub fn configure_terminal(
+        &self,
+        vendor: Option<&str>,
+        egress: crate::protocol::ids::ProtocolId,
+    ) {
+        self.0.lock().unwrap().terminal.allow_chat_eof = vendor == Some("minimax")
+            && egress == crate::protocol::ids::OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1;
+    }
     /// Identity is allocated once at construction, before any fallback clones.
     pub fn correlate(&self, request_id: &str, attempt_index: i32) {
         self.with_diagnostic(|d| {
@@ -350,6 +360,21 @@ impl State {
                     }
                     _ => {}
                 }
+            } else {
+                // The original-wire observer ran to EOF but could not classify
+                // the terminal. This is active ambiguity, not a legacy/unobserved
+                // version-0 default: retain bounded evidence for diagnosis.
+                let reason = self
+                    .terminal
+                    .reason
+                    .clone()
+                    .unwrap_or_else(|| "No confirmable original terminal event".into());
+                self.record_message(
+                    "unknown",
+                    "ambiguous_terminal",
+                    "upstream_response",
+                    &reason,
+                );
             }
         }
         // SSE clients (codex CLI and similar) may close the connection the
@@ -363,6 +388,8 @@ impl State {
         // confirmed completion. Confirmed failures, timeouts and output
         // limits stay sticky and are never demoted.
         if self.terminal.confirmed_completed()
+            && !self.cancellation.is_cancelled()
+            && !self.deadline.is_exceeded()
             && self.client_drained()
             && !matches!(
                 self.diagnostic.attempt_outcome.as_str(),
@@ -631,6 +658,94 @@ mod tests {
     async fn frame(body: &mut Body) -> Option<Result<Frame<Bytes>, axum::Error>> {
         futures::future::poll_fn(|cx| Pin::new(&mut *body).poll_frame(cx)).await
     }
+    #[tokio::test]
+    async fn observed_ambiguity_is_versioned_and_retained_but_unobserved_is_not() {
+        for observed in [false, true] {
+            let (a, g, mut rx) = setup();
+            if observed {
+                a.chunk(b"data: {\"choices\":[{\"finish_reason\":\"\"}]}\n\n");
+                a.eof();
+            }
+            let body = a.wrap(Response::new(Body::empty()));
+            g.finish();
+            drop(g);
+            axum::body::to_bytes(body.into_body(), 100).await.unwrap();
+            let log = rx.try_recv().unwrap();
+            assert_eq!(log.diagnostic.attempt_outcome, "unknown");
+            assert_eq!(log.diagnostic.outcome_version, i32::from(observed));
+            assert_eq!(
+                crate::logging::diagnostics::force_payload(Some(200), Some(200), &log.diagnostic),
+                observed
+            );
+            if observed {
+                assert_eq!(
+                    log.diagnostic.failure_kind.as_deref(),
+                    Some("ambiguous_terminal")
+                );
+                assert!(log.upstream_response_body.is_some());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn minimax_eof_policy_never_promotes_errors_or_cancellation() {
+        use crate::protocol::ids::OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1;
+        for outcome in [
+            "completed",
+            "failed",
+            "cancelled",
+            "timed_out",
+            "output_limited",
+        ] {
+            let (a, g, mut rx) = setup();
+            a.configure_terminal(Some("minimax"), OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1);
+            a.chunk(b"data: {\"choices\":[{\"index\":0,\"finish_reason\":\"stop\"}]}\n\n");
+            a.eof();
+            a.note_client_frame_sent();
+            if outcome == "cancelled" {
+                a.0.lock().unwrap().cancellation.cancel();
+            } else if outcome == "timed_out" {
+                a.0.lock().unwrap().deadline = Deadline::from_now(std::time::Duration::ZERO);
+            } else if outcome != "completed" {
+                a.record_message(outcome, "test_failure", "upstream_read", "test");
+            }
+            let mut body = a.wrap(Response::new(Body::from("done"))).into_body();
+            frame(&mut body).await.unwrap().unwrap();
+            g.finish();
+            drop(g);
+            let log = rx.try_recv().unwrap();
+            assert_eq!(log.diagnostic.attempt_outcome, outcome);
+            assert_eq!(
+                log.performance.completed_at.is_some(),
+                outcome == "completed"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn minimax_terminal_without_eof_cannot_reconcile_client_close() {
+        let (a, g, mut rx) = setup();
+        a.configure_terminal(
+            Some("minimax"),
+            crate::protocol::ids::OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1,
+        );
+        a.chunk(b"data: {\"choices\":[{\"index\":0,\"finish_reason\":\"stop\"}]}\n\n");
+        a.note_client_frame_sent();
+        let mut body = a
+            .wrap(Response::new(Body::from_stream(futures::stream::iter(
+                vec![Ok::<_, std::io::Error>(Bytes::from_static(b"last frame"))],
+            ))))
+            .into_body();
+        g.finish();
+        drop(g);
+        frame(&mut body).await.unwrap().unwrap();
+        drop(body);
+        assert_eq!(
+            rx.try_recv().unwrap().diagnostic.attempt_outcome,
+            "cancelled"
+        );
+    }
+
     #[tokio::test]
     async fn final_frame_eos_is_delivery_without_extra_none_poll() {
         let (a, g, mut rx) = setup();

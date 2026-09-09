@@ -190,6 +190,10 @@ pub(crate) struct Terminal {
     message_stop: bool,
     chat: bool,
     done: bool,
+    // Only selected from the configured upstream vendor + egress protocol,
+    // never inferred from a model name or response body.
+    allow_chat_eof: bool,
+    finished: bool,
 }
 impl Terminal {
     pub fn push(&mut self, bytes: &[u8]) {
@@ -248,6 +252,11 @@ impl Terminal {
         }
     }
     fn reason(&mut self, reason: &str) {
+        // Chat dialects such as MiniMax use an empty string instead of null
+        // on intermediate chunks. It is absence of a terminal, not an unknown one.
+        if reason.is_empty() {
+            return;
+        }
         let state = match reason.to_ascii_lowercase().as_str() {
             "length" | "max_tokens" | "max_output_tokens" => "output_limited",
             "response.incomplete" | "incomplete" => "unknown",
@@ -339,8 +348,10 @@ impl Terminal {
                     for field in ["finish_reason", "finishReason"] {
                         if let Some(v) = item.get(field).filter(|v| !v.is_null()) {
                             if let Some(s) = v.as_str() {
-                                self.reason(s);
-                                self.branches.insert(key.clone(), true);
+                                if !s.is_empty() {
+                                    self.reason(s);
+                                    self.branches.insert(key.clone(), true);
+                                }
                             } else {
                                 self.invalid = true;
                             }
@@ -365,9 +376,20 @@ impl Terminal {
     /// that `finish()` would reconcile away — such evidence alone must not
     /// confirm completion.
     pub fn confirmed_completed(&self) -> bool {
-        self.completion == Some("completed") && !self.invalid && !self.unknown_reason
+        self.completion == Some("completed")
+            && !self.invalid
+            && !self.unknown_reason
+            && self.buffer.is_empty()
+            && self.event_data.is_empty()
+            && self.branches.values().all(|done| *done)
+            && (!self.sse || !self.anthropic || self.message_stop)
+            && self.chat_terminal_confirmed()
+    }
+    fn chat_terminal_confirmed(&self) -> bool {
+        !self.sse || !self.chat || self.done || (self.allow_chat_eof && self.finished)
     }
     pub fn finish(&mut self) {
+        self.finished = true;
         let buffer = std::mem::take(&mut self.buffer);
         if self.sse {
             self.line(&buffer);
@@ -393,11 +415,10 @@ impl Terminal {
                 // Anthropic's known message framing requires message_stop.
                 self.completion = Some("failed");
                 self.reason = Some("missing_terminal".into());
-            } else if self.branches.values().any(|done| !done)
-                || (self.sse && self.chat && !self.done)
-            {
-                // Chat-compatible dialects may terminate by finish_reason OR
-                // [DONE]. Without sufficient branch evidence remain unknown.
+            } else if self.branches.values().any(|done| !done) || !self.chat_terminal_confirmed() {
+                // Default Chat framing requires [DONE] plus branch evidence.
+                // MiniMax Chat may instead end at a clean EOF after every
+                // branch's explicit terminal; this policy is upstream-scoped.
                 self.completion = None;
                 self.reason = Some("ambiguous terminal evidence".into());
             }
@@ -453,6 +474,97 @@ mod tests {
             None
         );
     }
+    #[test]
+    fn empty_chat_reasons_are_nonterminal_not_unknown() {
+        for placeholder in ["null", "\"\""] {
+            let mut t = Terminal::default();
+            t.push(
+                format!(
+                    "data: {{\"choices\":[{{\"index\":0,\"finish_reason\":{placeholder}}}]}}\n\n"
+                )
+                .as_bytes(),
+            );
+            assert!(!t.unknown_reason);
+            assert_eq!(t.branches.get("choices:0"), Some(&false));
+            assert!(!t.confirmed_completed());
+            t.push(b"data: {\"choices\":[{\"index\":0,\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n");
+            assert!(t.confirmed_completed());
+            t.finish();
+            assert_eq!(t.completion, Some("completed"));
+        }
+    }
+
+    #[test]
+    fn minimax_chat_eof_requires_all_terminals_and_clean_observation() {
+        for allow_chat_eof in [false, true] {
+            for reason in ["stop", "tool_calls", "length"] {
+                let mut t = Terminal {
+                    allow_chat_eof,
+                    ..Default::default()
+                };
+                // Sanitized MiniMax wire shape: empty reasons on thinking chunks,
+                // then an explicit terminal without a trailing [DONE].
+                t.push(b"data: {\"choices\":[{\"index\":0,\"finish_reason\":\"\",\"delta\":{\"reasoning_content\":\"thinking\"}}]}\n\n");
+                t.push(
+                    format!(
+                        "data: {{\"choices\":[{{\"index\":0,\"finish_reason\":\"{reason}\"}}]}}\n\n"
+                    )
+                    .as_bytes(),
+                );
+                assert!(!t.confirmed_completed(), "no EOF or DONE yet");
+                t.finish();
+                let expected = if reason == "length" {
+                    Some("output_limited")
+                } else if allow_chat_eof {
+                    Some("completed")
+                } else {
+                    None
+                };
+                assert_eq!(t.completion, expected);
+                assert_eq!(t.confirmed_completed(), expected == Some("completed"));
+            }
+        }
+        for suffix in [
+            "data: {\"choices\":[{\"index\":1,\"finish_reason\":\"\"}]}\n\n",
+            "data: {\"choices\":[{\"index\":1,\"finish_reason\":\"future_reason\"}]}\n\n",
+            "data: broken\n\n",
+            "data: {\"choices\":[{\"index\":1,\"finish_reason\":42}]}\n\n",
+        ] {
+            let mut t = Terminal {
+                allow_chat_eof: true,
+                ..Default::default()
+            };
+            t.push(b"data: {\"choices\":[{\"index\":0,\"finish_reason\":\"stop\"}]}\n\n");
+            t.push(suffix.as_bytes());
+            assert!(!t.confirmed_completed());
+            t.finish();
+            assert_ne!(t.completion, Some("completed"));
+            assert!(!t.confirmed_completed());
+        }
+        let mut t = Terminal {
+            allow_chat_eof: true,
+            ..Default::default()
+        };
+        t.push(b"data: {\"choices\":[{\"index\":0,\"finish_reason\":\"stop\"}]}\n\n");
+        t.push(&vec![b'x'; 1024 * 1024 + 1]);
+        t.finish();
+        assert!(!t.confirmed_completed(), "overflow cannot prove completion");
+    }
+
+    #[test]
+    fn incremental_completion_requires_every_branch_and_complete_frames() {
+        let mut t = Terminal::default();
+        t.push(b"data: {\"choices\":[{\"index\":0,\"finish_reason\":\"stop\"},{\"index\":1,\"finish_reason\":null}]}\n\ndata: [DONE]\n\n");
+        assert!(!t.confirmed_completed());
+        t.push(b"data: {\"choices\":[{\"index\":1,\"finish_reason\":\"stop\"}]}\n\n");
+        assert!(t.confirmed_completed());
+        t.push(b"data: {\"choices\":");
+        assert!(
+            !t.confirmed_completed(),
+            "partial trailing frame is not proof"
+        );
+    }
+
     #[test]
     fn original_terminals_reject_truncation_and_synthetic_done() {
         for reason in ["length", "max_tokens", "MAX_TOKENS", "max_output_tokens"] {
