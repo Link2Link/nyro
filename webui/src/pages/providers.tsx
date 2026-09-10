@@ -3584,15 +3584,15 @@ export default function ProvidersPage() {
                   <div className="flex items-center gap-3">
                     <div className="flex h-9 w-9 items-center justify-center rounded-xl bg-slate-100">
                       <ProviderIcon
+                        iconKey={p.preset_key ?? p.vendor ?? undefined}
                         name={p.name}
-                        protocol={p.protocol}
                         baseUrl={p.base_url}
                         size={30}
                         className="provider-preset-icon provider-preset-icon-colored rounded-xl border border-slate-300/70 bg-transparent"
                       />
                       <ProviderIcon
+                        iconKey={p.preset_key ?? p.vendor ?? undefined}
                         name={p.name}
-                        protocol={p.protocol}
                         baseUrl={p.base_url}
                         size={30}
                         monochrome

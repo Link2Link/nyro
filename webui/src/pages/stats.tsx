@@ -309,7 +309,7 @@ export default function StatsPage() {
                   >
                     <td className="px-4 py-2.5 font-medium">
                       <div className="flex min-w-0 items-center gap-2">
-                        <ProviderIcon iconKey={p.provider_icon ?? undefined} name={p.provider} protocol={p.provider_protocol ?? undefined} size={24} />
+                        <ProviderIcon iconKey={p.provider_icon ?? undefined} name={p.provider} size={24} />
                         <span className="truncate" title={p.provider}>{p.provider}</span>
                       </div>
                     </td>

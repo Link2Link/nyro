@@ -975,7 +975,6 @@ function Attempts({
                           <ArrowRight className="h-3 w-3 text-slate-300" />
                           <ProviderIcon
                             name={log.provider_name}
-                            protocol={log.upstream_protocol}
                             size={21}
                           />
                           <span className="truncate">

@@ -842,7 +842,6 @@ function ProviderRow({
           <ProviderIcon
             iconKey={item.provider_icon ?? undefined}
             name={item.provider_name}
-            protocol={item.provider_protocol ?? undefined}
             size={24}
           />
           <span

@@ -80,7 +80,7 @@ assert.ok(chrome, 'Set CHROME_BIN to an executable Chromium binary');
 const scratch = await mkdtemp(join(tmpdir(), 'nyro-performance-smoke-'));
 const children = [];
 const report = { scratch, binary, webui, chrome, checks: [], screenshots: [], apiCalls: [], injected: [], upstreamCalls: [], consoleErrors: [], runtimeErrors: [], networkErrors: [], expectedNetworkErrors: [], browserWarnings: [], childLogs: {}, success: false };
-let trap, cdp, sessionId, base, faultMode = null, envelopeSnapshot = null;
+let trap, cdp, sessionId, base, faultMode = null, envelopeSnapshot = null, providerIconKeys = new Map();
 const childEnv = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('NYRO_') && !/^(http|https|all|no)_proxy$/i.test(key)));
 const trackChild = (name, command, args) => {
   const child = spawn(command, args, { cwd: root, env: childEnv, stdio: ['ignore', 'pipe', 'pipe'] });
@@ -169,24 +169,31 @@ async function chartState() {
   return evaluate(`(() => {
     const chart=document.querySelector('[data-testid="performance-chart"]'), summary=document.querySelector('[data-testid="performance-summary"]');
     const attrs=el=>el ? Object.fromEntries([...el.attributes].filter(a=>a.name.startsWith('data-')).map(a=>[a.name,a.value])) : {};
-    const points=[...document.querySelectorAll('[data-testid="performance-point"]')].map(el=>({ids:el.dataset.pointIds.split(','),members:Number(el.dataset.memberCount),score:Number(el.dataset.score),tps:Number(el.dataset.tps),x:el.cx.baseVal.value,y:el.cy.baseVal.value,fill:el.getAttribute('fill'),pressed:el.parentElement.getAttribute('aria-pressed'),opacity:Number(el.parentElement.style.opacity)}));
+    // Vendor icons are images: only chart geometry outside an icon glyph may satisfy
+    // axis/tick/envelope assertions, so icon subtrees are excluded from every query.
+    const art=selector=>[...(chart?.querySelectorAll(selector)??[])].filter(el=>!el.closest('[data-testid="performance-point-icon"]'));
+    const points=[...document.querySelectorAll('[data-testid="performance-point"]')].map(el=>({ids:el.dataset.pointIds.split(','),members:Number(el.dataset.memberCount),score:Number(el.dataset.score),tps:Number(el.dataset.tps),lowSample:el.dataset.lowSample==='true',x:el.cx.baseVal.value,y:el.cy.baseVal.value,fill:el.getAttribute('fill'),pressed:el.parentElement.getAttribute('aria-pressed'),opacity:Number(el.parentElement.style.opacity)}));
+    const chips=[...document.querySelectorAll('[data-testid="performance-point-icon"]')].map(el=>{const glyph=el.querySelector('svg'),box=el.getBoundingClientRect(),ink=glyph?.getBoundingClientRect();return {ids:el.dataset.pointIds.split(','),iconKey:el.dataset.iconKey,providerId:el.dataset.providerId,lowSample:el.dataset.lowSample==='true',x:Number(el.dataset.markerX),y:Number(el.dataset.markerY),pointX:Number(el.dataset.x),pointY:Number(el.dataset.y),glyph:Boolean(el.querySelector('svg,path,text')),paint:[ink?.width??0,ink?.height??0],box:[box.width,box.height]};});
     const rows=[...document.querySelectorAll('[data-testid="performance-index-row"]')].map(el=>({id:el.dataset.pointId,text:el.innerText,pressed:el.getAttribute('aria-pressed'),opacity:Number(el.style.opacity)}));
-    const lines=[...(chart?.querySelectorAll('line')??[])].map(el=>({testid:el.dataset.testid,leader:Boolean(el.closest('[data-testid="performance-label"]')),x1:el.x1.baseVal.value,x2:el.x2.baseVal.value,y1:el.y1.baseVal.value,y2:el.y2.baseVal.value,stroke:getComputedStyle(el).stroke}));
-    const envelopes=[...(chart?.querySelectorAll('[data-testid="performance-envelope"]')??[])].map(el=>({tag:el.tagName,points:Array.from({length:el.points?.numberOfItems??0},(_,index)=>{const p=el.points.getItem(index);return {x:p.x,y:p.y}}),fill:getComputedStyle(el).fill,stroke:getComputedStyle(el).stroke,dash:getComputedStyle(el).strokeDasharray,pointerEvents:getComputedStyle(el).pointerEvents,attrs:attrs(el)}));
-    const axisTexts=[...(chart?.querySelectorAll('text')??[])].filter(el=>!el.closest('[data-testid="performance-label"]')).map(el=>({text:el.textContent,x:Number(el.getAttribute('x')),y:Number(el.getAttribute('y'))}));
-    return {points,rows,lines,envelopes,axisTexts,polygons:chart?.querySelectorAll('polygon').length??0,busy:Boolean(document.querySelector('button[aria-label="Refresh performance"],button[aria-label="刷新性能数据"]')?.disabled),counts:attrs(summary),axis:attrs(chart),summary:summary?.innerText,labels:[...document.querySelectorAll('[data-testid="performance-label"] text')].map(el=>el.textContent),labelPointIds:[...document.querySelectorAll('[data-testid="performance-label"]')].map(el=>el.dataset.pointIds?.split(',')??[]),body:document.body.innerText};
+    const lines=art('line').map(el=>({testid:el.dataset.testid,leader:Boolean(el.closest('[data-testid="performance-label"]')),x1:el.x1.baseVal.value,x2:el.x2.baseVal.value,y1:el.y1.baseVal.value,y2:el.y2.baseVal.value,stroke:getComputedStyle(el).stroke}));
+    const envelopes=[...document.querySelectorAll('[data-testid="performance-envelope"]')].map(el=>({tag:el.tagName,points:Array.from({length:el.points?.numberOfItems??0},(_,index)=>{const p=el.points.getItem(index);return {x:p.x,y:p.y}}),fill:getComputedStyle(el).fill,stroke:getComputedStyle(el).stroke,dash:getComputedStyle(el).strokeDasharray,pointerEvents:getComputedStyle(el).pointerEvents,attrs:attrs(el)}));
+    const axisTexts=art('text').map(el=>({text:el.textContent,x:Number(el.getAttribute('x')),y:Number(el.getAttribute('y'))}));
+    return {points,chips,rows,lines,envelopes,axisTexts,polygons:art('polygon').length,busy:Boolean(document.querySelector('button[aria-label="Refresh performance"],button[aria-label="刷新性能数据"]')?.disabled),counts:attrs(summary),axis:attrs(chart),summary:summary?.innerText,labels:[...document.querySelectorAll('[data-testid="performance-label"] text')].map(el=>el.textContent),labelPointIds:[...document.querySelectorAll('[data-testid="performance-label"]')].map(el=>el.dataset.pointIds?.split(',')??[]),body:document.body.innerText};
   })()`);
 }
 async function ready({ plotted = 11, missing = 1 } = {}) {
   return waitFor(async () => {
     const state=await chartState();
-    return state.points.reduce((n,p)=>n+p.members,0)===plotted && Number(state.counts['data-plotted-count'])===plotted && Number(state.counts['data-missing-count'])===missing && !state.busy ? state : false;
+    return state.points.length===plotted && Number(state.counts['data-plotted-count'])===plotted && Number(state.counts['data-missing-count'])===missing && !state.busy ? state : false;
   }, `settled chart: ${plotted} plotted, ${missing} missing`);
 }
 function assertAxes(state, yMax, xMin, xMax) {
   const a=state.axis;
   assert.equal(Number(a['data-x-min']),xMin); assert.equal(Number(a['data-x-max']),xMax); assert.equal(Number(a['data-y-max']),yMax);
-  const left=Number(a['data-plot-left']),right=Number(a['data-plot-right']),top=Number(a['data-plot-top']),bottom=Number(a['data-plot-bottom']);
+  // data-plot-* is the axis frame; data-point-* is the inset range extreme scores map onto,
+  // which keeps the outermost marker off the axis.
+  const left=Number(a['data-point-left']),right=Number(a['data-point-right']),top=Number(a['data-plot-top']),bottom=Number(a['data-plot-bottom']);
+  assert.ok(left>Number(a['data-plot-left'])&&right<Number(a['data-plot-right']),'Extreme scores keep marker room from both axes');
   for(const point of state.points){
     assert.ok(Math.abs(point.x-(left+(point.score-xMin)/(xMax-xMin)*(right-left)))<1e-4, 'Actual SVG X uses visible minimum/maximum score ticks, never jitter/centroid');
     assert.ok(Math.abs(point.y-(bottom-point.tps/yMax*(bottom-top)))<1e-4, 'Actual SVG Y equals exact backend TPS');
@@ -200,18 +207,41 @@ function expectedRows(snapshot, rowPairs) {
     return {pair,prefix:model.model_prefix,score:model.score,stats:model.mixed,variants:model.variants,status,key:JSON.stringify([model.model_prefix,model.provider_id])};
   }).sort((a,b)=>a.key<b.key?-1:a.key>b.key?1:0).map((row,i)=>({...row,id:`P${String(i+1).padStart(2,'0')}`}));
 }
-function assertPoints(state, rows) {
+function assertPoints(state, rows, { expectedIconKeys = providerIconKeys } = {}) {
   const plotted=rows.filter(row=>row.status==='ready' && row.score!==null && row.stats.average_tps!==null && row.stats.valid_tps_count>0);
   assert.equal(state.rows.length,0,'No permanent numbered index');
   assert.deepEqual(state.points.flatMap(point=>point.ids).sort(),plotted.map(row=>row.id).sort());
   for(const row of plotted){
     const point=state.points.find(point=>point.ids.includes(row.id));
     assert.equal(point.score,row.score); assert.equal(point.tps,row.stats.average_tps);
-    if(point.members===1) assert.equal(point.fill==='white',row.stats.valid_tps_count<3, 'One/two samples hollow; three or more solid');
+    assert.equal(point.fill,'none','Markers are vendor icons; no painted dot survives on the geometry carrier');
+    // Each plotted point draws exactly one provider icon at its own exact coordinate.
+    const chips=state.chips.filter(chip=>chip.ids.includes(row.id));
+    assert.equal(chips.length,1,`Exactly one icon marker per plotted point (${row.id})`);
+    const chip=chips[0];
+    assert.ok(chip.glyph,`Vendor icon markup is rendered for ${row.id}`);
+    // An icon file that declares its own intrinsic size must still fill, never overflow,
+    // the marker box: a 240x300 asset once painted a black block across the whole plot.
+    assert.ok(chip.paint[0]<=chip.box[0]+0.5&&chip.paint[1]<=chip.box[1]+0.5,`Vendor icon stays inside its marker box for ${row.id} (${chip.paint} in ${chip.box})`);
+    if(expectedIconKeys) assert.equal(chip.iconKey,expectedIconKeys.get(chip.providerId),`Vendor icon key for ${row.id}`);
+    assert.ok(sameCoordinate({x:chip.pointX,y:chip.pointY},{x:point.x,y:point.y}),`Icon marker reports the exact score/TPS coordinate (${row.id})`);
+    assert.equal(chip.lowSample,row.stats.valid_tps_count<3,'Fewer than three valid samples switch the marker to a dashed border');
+    const peers=state.chips.filter(peer=>sameCoordinate({x:peer.pointX,y:peer.pointY},{x:point.x,y:point.y}));
+    if(point.members===1){
+      assert.ok(sameCoordinate({x:chip.x,y:chip.y},{x:point.x,y:point.y}),'A single member draws its icon exactly on its point');
+    } else {
+      // Coincident providers keep one icon each, spread around the untouched coordinate.
+      assert.equal(peers.length,point.members,`Every coincident member keeps its own icon marker (${row.id})`);
+      assert.equal(new Set(peers.map(peer=>Math.round(peer.x))).size,peers.length,'Coincident icons never stack on one center');
+      assert.ok(Math.abs(peers.reduce((sum,peer)=>sum+peer.x,0)/peers.length-point.x)<1e-3,'Coincident icons stay symmetric around the exact coordinate');
+      for(const peer of peers) assert.ok(Math.abs(peer.y-point.y)<1e-3,'Coincident icons keep the exact TPS row');
+    }
   }
+  assert.equal(state.chips.length,plotted.length,'Every plotted point and no other element carries a provider icon marker');
+  if(plotted.some(row=>row.stats.valid_tps_count<3)) assert.ok(/dashed border|虚线边框/.test(state.body),'Low-sample legend explains the dashed marker border');
   assert.ok(state.labels.length>0 && state.labels.every(label=>!/^P\d+( ×\d+)?$/.test(label)), 'SVG labels contain models, not IDs');
   assert.ok(!/\bP\d{2}\b/.test(state.body),'No visible point IDs in page or diagnostics');
-  assert.ok(state.points.every(point=>point.members===point.ids.length));
+  assert.ok(state.points.every(point=>point.ids.length===1 && point.members>=1),'One geometry carrier per plotted point, group size kept as member count');
 }
 
 const sameCoordinate = (a,b) => Math.abs(a.x-b.x)<1e-3 && Math.abs(a.y-b.y)<1e-3;
@@ -242,6 +272,7 @@ function expectedEnvelope(rows) {
 }
 function assertChartScaffolding(state, isZh=false) {
   const a=state.axis,left=Number(a['data-plot-left']),right=Number(a['data-plot-right']),top=Number(a['data-plot-top']),bottom=Number(a['data-plot-bottom']);
+  const spanLeft=Number(a['data-point-left']),spanRight=Number(a['data-point-right']);
   const axes=state.lines.filter(line=>line.testid==='performance-axis');
   assert.equal(axes.length,2,'Keep exactly the X and Y axis lines');
   for(const [start,end] of [[{x:left,y:bottom},{x:right,y:bottom}],[{x:left,y:top},{x:left,y:bottom}]]) {
@@ -265,7 +296,7 @@ function assertChartScaffolding(state, isZh=false) {
   assert.equal(leaders.length,state.labels.length,'Every placed model label retains its leader line');
   for(const leader of leaders) assert.ok(state.points.some(p=>sameCoordinate(p,{x:leader.x1,y:leader.y1}) || sameCoordinate(p,{x:leader.x2,y:leader.y2})),'Label leaders remain anchored at actual data points');
   for(let score=xMin;score<=xMax;score+=10) {
-    const x=left+(score-xMin)/(xMax-xMin)*(right-left);
+    const x=spanLeft+(score-xMin)/(xMax-xMin)*(spanRight-spanLeft);
     assert.ok(state.axisTexts.some(t=>Number(t.text)===score && Math.abs(t.x-x)<1e-3 && t.y>bottom),'Keep X numeric tick labels at shared-scale positions');
   }
   for(let index=0;index<=5;index++) {
@@ -306,7 +337,7 @@ function assertEnvelope(state, rows, isZh=false) {
   assert.ok(line.stroke && line.stroke!=='none' && line.stroke!=='rgba(0, 0, 0, 0)','Envelope stroke remains visible');
   assert.ok(line.dash!=='none' && line.dash.split(/[ ,]+/).some(n=>parseFloat(n)>0),'Envelope is dashed');
   if(line.attrs['data-member-keys']!==undefined) assert.deepEqual(JSON.parse(line.attrs['data-member-keys']).sort(),expected.keys,'Polyline metadata includes every exact boundary key');
-  const left=Number(a['data-plot-left']),right=Number(a['data-plot-right']),top=Number(a['data-plot-top']),bottom=Number(a['data-plot-bottom']);
+  const left=Number(a['data-point-left']),right=Number(a['data-point-right']),top=Number(a['data-plot-top']),bottom=Number(a['data-plot-bottom']);
   const mapped=expected.nodes.map(p=>({x:left+(p.x-Number(a['data-x-min']))/(Number(a['data-x-max'])-Number(a['data-x-min']))*(right-left),y:bottom-p.y/Number(a['data-y-max'])*(bottom-top)}));
   assert.ok(line.points.length>=2);
   assert.ok(sameCoordinate(line.points[0],mapped[0]) && sameCoordinate(line.points.at(-1),mapped.at(-1)),'Polyline ends at fastest/strongest boundary models, with no axis connections or closing segment');
@@ -324,7 +355,14 @@ function assertEnvelope(state, rows, isZh=false) {
 async function assertEnvelopeTooltips(state, rows, isZh=false) {
   const expected=expectedEnvelope(rows),seen=new Set();
   for(const point of state.points) {
-    await evaluate(`document.activeElement?.blur(); (${circleExpression(point.ids[0])}).scrollIntoView({block:'center'}); (${circleExpression(point.ids[0])}).parentElement.focus()`);
+    // A closing Radix Select returns focus to its trigger, which can land after the
+    // chart point was focused. Claim focus for real before pressing Enter instead of
+    // racing that restore.
+    const focusTarget=`(${circleExpression(point.ids[0])}).parentElement`;
+    await waitFor(async()=>{
+      await evaluate(`document.activeElement?.blur(); (${circleExpression(point.ids[0])}).scrollIntoView({block:'center'}); ${focusTarget}.focus()`);
+      return evaluate(`document.activeElement===${focusTarget}`);
+    },'chart point holds focus for its Enter gesture');
     await key('Enter');
     const details=await waitFor(()=>evaluate(`(()=>{const tip=document.querySelector('[role="tooltip"]');if(!tip)return null;const rows=[...tip.querySelectorAll('[data-point-id]')].map(el=>({id:el.dataset.pointId,text:el.innerText,badges:[...el.querySelectorAll('[data-testid="performance-envelope-member"]')].map(b=>({key:b.dataset.pointKey,text:b.textContent}))}));return rows.some(r=>r.id===${literal(point.ids[0])})?rows:null})()`),'Envelope tooltip for actual point ID');
     for(const detail of details) {
@@ -383,8 +421,10 @@ try {
     return (await fetch(`${base}/healthz`, { signal: AbortSignal.timeout(1000) })).ok;
   }, 'isolated Nyro admin-only server', 30_000);
   const createProvider = name => api('/providers', 'POST', { name, protocol: 'openai', base_url: `${trapBase}/v1`, api_key: 'smoke-only-not-a-secret', models_source: `${trapBase}/v1/models`, static_models: '', use_proxy: false, fast_mode: false });
-  const alpha = await createProvider('Alpha Smoke'), beta = await createProvider('Beta Smoke'), disabled = await createProvider('Disabled Smoke');
+  const alpha = await createProvider('Alpha DeepSeek'), beta = await createProvider('Beta Gemini'), disabled = await createProvider('Disabled Kimi');
   await api(`/providers/${disabled.id}`, 'PUT', { is_enabled: false });
+  // Point markers are provider icons, so every fixture provider resolves a distinct key.
+  providerIconKeys = new Map([[alpha.id, 'deepseek'], [beta.id, 'gemini'], [disabled.id, 'kimi']]);
   const pairs = [
     { provider: alpha, model: 'model/shared', score: 0 },
     // Prefix-shared ratings mean one score per prefix, so two different scores cannot
@@ -609,7 +649,7 @@ try {
   assert.ok(!/untrusted|unconfirmed requests/i.test(state.body),'No untrusted-history warning for legacy-valid samples');
   assert.equal(expected.length,rowPairs.length,'Exactly one row per matched prefix × provider');
   assert.ok(!await evaluate(`document.querySelector('[aria-label="Filter by tier"]')!==null`),'No effort selector');
-  check('batch snapshot, prefix-shared scores, legacy-valid mixed TPS, merged two-variant group, one-decimal display, one-sample hollow, model labels and actual coordinates');
+  check('batch snapshot, prefix-shared scores, legacy-valid mixed TPS, merged two-variant group, one-decimal display, provider-icon markers with dashed low-sample borders, model labels and actual coordinates');
   await screenshot('performance-en-desktop');
   const baselineEnvelope=assertEnvelope(state,expected);
   assert.deepEqual(baselineEnvelope.keys,[expected.find(row=>row.pair===pairs[1]).key],'Real fixture has one dominating (100,225) boundary model, not a multi-point line');

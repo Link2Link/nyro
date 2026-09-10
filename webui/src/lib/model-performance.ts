@@ -83,6 +83,9 @@ export interface PerformanceRow {
   providerId: string;
   providerName: string;
   providerEnabled: boolean;
+  /** Provider identity behind the vendor icon marker; empty when the provider is unknown. */
+  providerIcon: string;
+  providerBaseUrl: string;
   /** Display label component: the prefix plays the model-name role. */
   model: string;
   score: number;
@@ -122,6 +125,8 @@ export function buildPerformanceRows(snapshot: PerformanceResponse, providers: P
       modelPrefix: item.model_prefix, model: item.model_prefix,
       providerId: item.provider_id, providerName: provider?.name ?? item.provider_id,
       providerEnabled: provider?.is_enabled ?? false,
+      providerIcon: provider?.preset_key ?? provider?.vendor ?? "",
+      providerBaseUrl: provider?.base_url ?? "",
       score: item.score, scoreUpdatedAt: item.score_updated_at,
       status: stats.average_tps === null || stats.valid_tps_count === 0 ? "missing" : "ready",
       tps: stats.average_tps, selectedRequestCount: stats.selected_request_count, validTpsCount: stats.valid_tps_count,
@@ -236,15 +241,39 @@ export function performanceScoreMaximum(points: Pick<PerformancePoint, "score">[
   return performanceScoreDomain(points).max;
 }
 export const PERFORMANCE_CHART = { width: 800, height: 500, left: 66, right: 766, top: 28, bottom: 440 };
+/** Marker geometry, shared by the chart and by the room it reserves at the score extremes. */
+export const PERFORMANCE_MARKER_SIZE = 24;
+export const PERFORMANCE_COINCIDENT_MARKER_SIZE = 20;
+/**
+ * Horizontal room kept between the extreme visible score and the Y axis, so the
+ * leftmost/rightmost marker sits inside the plot instead of straddling the axis:
+ * half a marker plus air. Scores, ticks and the envelope all share this mapping.
+ */
+export const PERFORMANCE_SCORE_MARGIN = PERFORMANCE_MARKER_SIZE / 2 + 6;
+export interface PerformanceXSpan {
+  left: number;
+  right: number;
+}
+/** The X positions the visible score range maps onto: the axis frame minus the margin. */
+export function performanceXSpan(): PerformanceXSpan {
+  return {
+    left: PERFORMANCE_CHART.left + PERFORMANCE_SCORE_MARGIN,
+    right: PERFORMANCE_CHART.right - PERFORMANCE_SCORE_MARGIN,
+  };
+}
+/** Single source of truth for score → X, shared by points, ticks and their labels. */
+export function scoreX(score: number, xDomain: PerformanceScoreDomain = { min: 0, max: 100 }): number {
+  const { left, right } = performanceXSpan();
+  return left + (right - left) * (score - xDomain.min) / (xDomain.max - xDomain.min);
+}
 export function pointCoordinates(
   point: Pick<PerformancePoint, "score" | "tps">,
   yMax: number,
   xDomain: PerformanceScoreDomain = { min: 0, max: 100 },
 ) {
-  const { left, right, top, bottom } = PERFORMANCE_CHART;
-  const span = xDomain.max - xDomain.min;
+  const { top, bottom } = PERFORMANCE_CHART;
   return {
-    x: left + (right - left) * (point.score - xDomain.min) / span,
+    x: scoreX(point.score, xDomain),
     y: bottom - (bottom - top) * point.tps / yMax,
   };
 }

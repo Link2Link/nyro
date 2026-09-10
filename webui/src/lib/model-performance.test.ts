@@ -3,17 +3,18 @@ import { test } from "node:test";
 import {
   buildPerformanceRows, buildPerformanceHitIndex, buildPerformanceEnvelope, envelopeLabelGroups, filterPerformanceRows, groupPerformancePoints,
   layoutPerformanceLabels, PERFORMANCE_CHART, performanceColor, performanceModelLabel, performancePoints,
-  performanceTpsMaximum, performanceScoreDomain, performanceScoreMaximum, pointCoordinates, readPerformanceResponse, visiblePerformanceSelection,
+  PERFORMANCE_MARKER_SIZE, performanceTpsMaximum, performanceScoreDomain, performanceScoreMaximum, performanceXSpan,
+  pointCoordinates, readPerformanceResponse, scoreX, visiblePerformanceSelection,
   type ModelPerformanceItem, type PerformancePoint, type PerformanceResponse, type PerformanceStats,
 } from "./model-performance";
 import type { Provider } from "./types";
+import { resolveProviderIconKey } from "./provider-icon-resolve";
 
 const time = "2026-09-08T00:00:00.000Z";
-const provider = (id: string, name = id, is_enabled = true): Provider => ({
+const provider = (id: string, name = id, is_enabled = true, identity: Partial<Provider> = {}): Provider => ({
   id, name, is_enabled, protocol: "openai-compatible", base_url: "http://example.invalid",
-  use_proxy: false, fast_mode: false, created_at: time, updated_at: time,
-});
-const stats = (average_tps: number | null = 42.123456, valid_tps_count = 5): PerformanceStats => ({
+  use_proxy: false, fast_mode: false, created_at: time, updated_at: time, ...identity,
+});const stats = (average_tps: number | null = 42.123456, valid_tps_count = 5): PerformanceStats => ({
   average_tps, valid_tps_count, selected_request_count: 10,
   first_sample_at: valid_tps_count ? 1000 : null, last_sample_at: valid_tps_count ? 2000 : null,
 });
@@ -27,6 +28,7 @@ const item = (model_prefix = "model", provider_id = "p", score = 70): ModelPerfo
 const snapshot = (...models: ModelPerformanceItem[]): PerformanceResponse => ({ as_of: 3000, window_start: null, models });
 function point(key: string, score: number, tps: number): PerformancePoint {
   return { key, pointId: `P${key}`, providerId: key, providerName: key,
+    providerIcon: "", providerBaseUrl: "http://example.invalid",
     modelPrefix: key, model: key, providerEnabled: true,
     score, tps, status: "ready", scoreUpdatedAt: time,
     selectedRequestCount: 10, validTpsCount: 5, firstSampleAt: 1000, lastSampleAt: 2000,
@@ -41,6 +43,38 @@ test("strict batch contract preserves server TPS, sample counts, variants and di
   equal(row.firstSampleAt, 1000); equal(row.lastSampleAt, 2000);
   equal(row.variants.length, 1); equal(row.variants[0].upstream_model, "model");
   equal(row.status, "ready"); equal(row.score, 70);
+});
+test("rows carry the provider identity the icon marker resolves, and stay empty when unknown", () => {
+  const known = buildPerformanceRows(snapshot(item()), [provider("p", "DeepSeek Relay", false)])[0];
+  equal(known.providerName, "DeepSeek Relay"); equal(known.providerEnabled, false);
+  equal(known.providerIcon, ""); equal(known.providerBaseUrl, "http://example.invalid");
+  const unknown = buildPerformanceRows(snapshot(item()), [])[0];
+  equal(unknown.providerName, "p"); equal(unknown.providerEnabled, false);
+  equal(unknown.providerIcon, ""); equal(unknown.providerBaseUrl, "");
+});
+test("marker identity is the preset key, then the vendor, and never the wire protocol", () => {
+  // Shipped-icon predicate over the real catalog subset these cases touch.
+  const shipped = new Set(["nyro", "bailian", "doubao", "gemini", "openai", "deepseek", "kimi"]);
+  const icon = (name: string, identity: Partial<Provider> = {}) => {
+    const row = buildPerformanceRows(snapshot(item()), [provider("p", name, true, identity)])[0];
+    return resolveProviderIconKey(
+      { iconKey: row.providerIcon || undefined, name: row.providerName, baseUrl: row.providerBaseUrl },
+      (key) => shipped.has(key),
+    );
+  };
+  // The canonical identity wins, through the aliases the vendor metadata declares.
+  equal(icon("阿里百炼", { vendor: "bailian" }), "bailian");
+  equal(icon("火山引擎", { preset_key: "ark-coding" }), "doubao");
+  // Without a preset the name still identifies a branded provider.
+  equal(icon("Beta Gemini"), "gemini");
+  // A relay with no identity must never inherit the OpenAI mark from its request
+  // format: the wire protocol is not a brand.
+  equal(icon("Some Relay"), null);
+  equal(icon("apinebula"), null);
+  // A relay the app marks as `custom` has no shipped vector mark, so its own name and
+  // host decide, and an unidentified one stays unresolved rather than borrowing a brand.
+  equal(icon("apinebula", { preset_key: "custom", vendor: "custom" }), null);
+  equal(icon("UUAPI gemini", { preset_key: "custom", vendor: "custom" }), "gemini");
 });
 test("malformed batches and duplicate prefix/provider groups are errors, never missing/zero", () => {
   for (const invalid of [null, {}, { as_of: 1, window_start: 0, models: [{}] },
@@ -225,11 +259,29 @@ test("X domain snaps to visible minimum and maximum score ticks", () => {
   const domain = performanceScoreDomain(filtered);
   deepEqual(domain, { min: 50, max: 60 });
   const groups = groupPerformancePoints(filtered, 100, domain);
-  equal(groups[0].x, PERFORMANCE_CHART.left + (PERFORMANCE_CHART.right - PERFORMANCE_CHART.left) * 3 / 10);
+  const span = performanceXSpan();
+  equal(groups[0].x, span.left + (span.right - span.left) * 3 / 10);
   equal(groups[0].points[0].score, 53);
   equal(groups[0].points[0].pointId, "P01");
-  equal(pointCoordinates(point("03", 60, 50), 100, domain).x, PERFORMANCE_CHART.right);
-  equal(pointCoordinates(point("04", 50, 50), 100, domain).x, PERFORMANCE_CHART.left);
+  equal(pointCoordinates(point("03", 60, 50), 100, domain).x, span.right);
+  equal(pointCoordinates(point("04", 50, 50), 100, domain).x, span.left);
+});
+test("extreme scores keep marker room from the axes instead of straddling them", () => {
+  // The margin covers half a marker plus air, so the box of the leftmost/rightmost
+  // visible score never reaches the Y axis or the right frame.
+  const domain = { min: 30, max: 60 };
+  const span = performanceXSpan();
+  const half = PERFORMANCE_MARKER_SIZE / 2;
+  for (const score of [30, 60]) {
+    const x = scoreX(score, domain);
+    ok(x - half >= PERFORMANCE_CHART.left, `score ${score} marker stays right of the axis`);
+    ok(x + half <= PERFORMANCE_CHART.right, `score ${score} marker stays left of the frame`);
+  }
+  ok(span.left - PERFORMANCE_CHART.left > half, "Margin exceeds the marker half-width");
+  // Ticks, points and the envelope share one mapping, so nothing drifts off the ticks.
+  equal(scoreX(45, domain), pointCoordinates(point("05", 45, 10), 100, domain).x);
+  equal(scoreX(domain.min, domain), span.left);
+  equal(scoreX(domain.max, domain), span.right);
 });
 test("scores0/100 and TPS ceiling keep full circles inside SVG viewport", () => {
   for (const p of [point("01", 0, 0.01), point("02", 100, 200)]) {

@@ -321,8 +321,8 @@ function HelperModelRow({
             <SelectItem key={option.value} value={option.value}>
               <span className="flex items-center gap-2">
                 <ProviderIcon
+                  iconKey={option.provider.preset_key ?? option.provider.vendor ?? undefined}
                   name={option.provider.name}
-                  protocol={option.provider.protocol}
                   baseUrl={option.provider.base_url}
                   size={16}
                 />
@@ -484,8 +484,8 @@ function TargetRow({
               <SelectItem key={option.value} value={option.value}>
                 <span className="flex items-center gap-2">
                   <ProviderIcon
+                    iconKey={option.provider.preset_key ?? option.provider.vendor ?? undefined}
                     name={option.provider.name}
-                    protocol={option.provider.protocol}
                     baseUrl={option.provider.base_url}
                     size={16}
                   />

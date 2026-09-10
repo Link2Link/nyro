@@ -131,7 +131,9 @@ to a multiple of 10 and the highest up to a multiple of 10, always within 0–10
 A single point retains at least a 10-point span; no points uses the full 0–100 range.
 For example, 53–78 → 50–80, only 73 → 70–80, and only 100 → 90–100. Tick spacing
 is 10, and search/provider filters recalculate the scale without changing scores or
-point identities.
+point identities. Extreme scores map one marker margin inside the axis frame (half a
+marker plus air), so the leftmost and rightmost markers never straddle an axis; points,
+their tick labels and the envelope all share that one mapping.
 Y defaults to 0–100; values above 100 expand its ceiling in 50-TPS steps with headroom.
 Reasoning effort is not a score dimension, filter, or point identity. Only points on
 the visible upper-right convex envelope label model names directly, adding supplier names
@@ -151,7 +153,7 @@ for A(40,200), B(60,120), C(90,100), the line joins A–C and skips B's inward d
 B remains visible as a normal model point. Search/provider filtering and refresh
 recompute the envelope; viewport scaling or display rounding never decides membership.
 
-- Include low-sample hollow points, preserving their sample warning.
+- Include low-sample points, preserving their sample warning and dashed icon border.
 - For equal scores, retain the fastest position; for equal TPS, retain the strongest.
   All models at exactly the same boundary coordinates share membership.
 - Preserve collinear points along the downward-sloping boundary. A model below a
@@ -159,7 +161,7 @@ recompute the envelope; viewport scaling or display rounding never decides membe
 - With zero points draw nothing; with one optimal position draw no line segment,
   but show envelope membership in every corresponding model's details.
 - Uniform slate dashed strokes render below points and labels with no fill, closure,
-  axis extension, or pointer capture. Existing provider colors and hollow/solid meanings
+  axis extension, or pointer capture. Provider colors and the low-sample marker meaning
   stay unchanged. Details and accessible point descriptions identify envelope members.
 - Only boundary members are labeled directly; an interior or dominated point gets no
   direct label, and a coincident boundary position keeps every model in one label.
@@ -198,7 +200,16 @@ chunk wait, with the existing 50 ms / 80% non-incremental fallback. Otherwise it
 upstream duration, falling back to total duration when upstream timing is absent.
 Mean TPS is the arithmetic mean of valid per-call values, not total tokens divided
 by total time. Points retain full numeric precision; displayed TPS uses one decimal.
-Fewer than three valid samples remain hollow. Missing data and read failures are
+Each point is drawn as its provider's vendor icon, never as a plain dot, and always
+inside its own marker box: an icon file that declares another intrinsic size is
+normalized to fill that box instead of painting over the plot. Identity comes from the
+provider's canonical preset/vendor key, the same value the admin surface reports as
+`provider_icon` (aliased to the shipped icon, e.g. `ark-coding` → doubao), then from
+its display name and API host, then from the provider initial. The wire protocol never
+participates: `openai-compatible` and `openai-responses` describe a request format, so
+matching them branded every relay as OpenAI. The `custom` preset ships no usable vector
+mark, so such a provider keeps whatever its name and host identify. Fewer than three valid samples
+switch that marker to a dashed border at reduced opacity; missing data and read failures are
 explicit; no active upstream benchmark is performed. Existing completion metadata
 and historical recovery remain diagnostic only, not an eligibility gate. Legacy
 `unclassified_count` and `untrusted_count` response fields are retained as zeros for

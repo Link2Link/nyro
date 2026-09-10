@@ -29,9 +29,11 @@ Lightweight helper tests need no extra framework:
 cd webui
 test_dir=$(mktemp -d /tmp/nyro-ui-tests.XXXXXX)
 ./node_modules/.bin/tsc src/lib/model-ratings.test.ts src/lib/model-performance.test.ts \
+  src/lib/provider-icon-resolve.test.ts \
   --outDir "$test_dir" --module commonjs --moduleResolution node --target es2020 \
   --esModuleInterop --skipLibCheck
-node --test "$test_dir/model-ratings.test.js" "$test_dir/model-performance.test.js"
+node --test "$test_dir/model-ratings.test.js" "$test_dir/model-performance.test.js" \
+  "$test_dir/provider-icon-resolve.test.js"
 ```
 
 ## Isolation and evidence
@@ -126,7 +128,15 @@ Coverage:
   variants can hold is rejected outright rather than plotted.
 - Only invalid tokens/timing produces missing TPS in the real fixture.
   Invalid latest samples are not refilled from older valid calls. Zero score is
-  valid; missing TPS is not zero. Fewer than three valid samples are hollow points.
+  valid; missing TPS is not zero. Fewer than three valid samples switch that marker's
+  border to dashed.
+- Every plotted point is drawn as its provider's vendor icon (resolved from provider
+  name, host and protocol) inside a provider-colored rounded marker, never as a plain
+  dot: the geometry carrier stays invisible at the exact coordinate, the icon key is
+  asserted per provider, coincident providers keep one spread icon each around the
+  untouched coordinate, and a dashed border plus reduced opacity marks fewer than three
+  valid samples. Vendor icon subtrees are excluded from axis/tick/envelope geometry
+  queries so logo paths can never satisfy chart scaffolding assertions.
 - Exact SVG coordinates retain full backend precision while user-visible TPS uses
   one decimal. X rounds the lowest visible plotted score down and the highest up to
   ten-point ticks (within 0–100, at least a 10-point single-score span; no points uses
@@ -164,7 +174,7 @@ nor trusts the SVG membership metadata as its expected result.
   envelope, even though B is nondominated), a genuine convex bend, same-score fastest
   and same-TPS strongest ties, identical coordinates across every exact model key,
   negative-slope collinear members, singleton/empty data, score zero, full-precision
-  TPS, and missing models excluded from the boundary. One/two-sample hollow
+  TPS, and missing models excluded from the boundary. One/two-sample low-sample markers
   models remain eligible; sample-count warnings and actual scores/TPS do not change.
 - Actual SVG vertices must map through the **shared visible X minimum/maximum and Y
   scale**, lie at real boundary coordinates, and cover all supporting corners. The

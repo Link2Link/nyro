@@ -490,8 +490,8 @@ function ProviderSection({
             <ChevronDown className="h-4 w-4 shrink-0 text-slate-400" />
           )}
           <ProviderIcon
+            iconKey={provider.preset_key ?? provider.vendor ?? undefined}
             name={provider.name}
-            protocol={provider.protocol}
             baseUrl={provider.base_url}
             size={34}
           />

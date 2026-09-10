@@ -791,14 +791,12 @@ export default function ConnectPage() {
                           <ProviderIcon
                             iconKey={tool.iconKey}
                             name={tool.name}
-                            protocol={tool.protocol}
                             size={30}
                             className="provider-preset-icon provider-preset-icon-colored rounded-none border-0 bg-transparent"
                           />
                           <ProviderIcon
                             iconKey={tool.iconKey}
                             name={tool.name}
-                            protocol={tool.protocol}
                             size={30}
                             monochrome
                             className="provider-preset-icon provider-preset-icon-mono rounded-none border-0 bg-transparent"
@@ -1032,14 +1030,12 @@ export default function ConnectPage() {
                           <ProviderIcon
                             iconKey={protocol.iconKey}
                             name={protocol.name}
-                            protocol={protocol.id}
                             size={30}
                             className="provider-preset-icon provider-preset-icon-colored rounded-none border-0 bg-transparent"
                           />
                           <ProviderIcon
                             iconKey={protocol.iconKey}
                             name={protocol.name}
-                            protocol={protocol.id}
                             size={30}
                             monochrome
                             className="provider-preset-icon provider-preset-icon-mono rounded-none border-0 bg-transparent"

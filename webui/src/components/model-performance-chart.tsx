@@ -1,10 +1,40 @@
 import { useEffect, useId, useMemo, useRef, useState } from "react";
 import {
   buildPerformanceEnvelope, buildPerformanceHitIndex, envelopeLabelGroups, groupPerformancePoints, layoutPerformanceLabels, PERFORMANCE_CHART,
-  performanceTpsMaximum, performanceScoreDomain, pointCoordinates, type PerformancePoint,
+  PERFORMANCE_COINCIDENT_MARKER_SIZE, PERFORMANCE_MARKER_SIZE, performanceTpsMaximum, performanceScoreDomain, performanceXSpan,
+  pointCoordinates, scoreX, type PerformancePoint,
 } from "@/lib/model-performance";
 import { createPortal } from "react-dom";
 import { formatLocalDateTime, formatTps } from "@/lib/format";
+import { useProviderIconMarkup } from "@/lib/provider-icon";
+
+/** A point is drawn as its provider's icon, never as a plain dot. */
+function PerformancePointMarker({ point, x, y, offsetX, size, lowSample, selected }: {
+  point: PerformancePoint; x: number; y: number; offsetX: number; size: number; lowSample: boolean; selected: boolean;
+}) {
+  const { iconKey, iconMarkup } = useProviderIconMarkup({
+    iconKey: point.providerIcon || undefined, name: point.providerName, baseUrl: point.providerBaseUrl,
+  });
+  const glyph = size * 0.7;
+  const markerX = x + offsetX;
+  return (
+    <g data-testid="performance-point-icon" data-point-ids={point.pointId} data-provider-id={point.providerId}
+      data-icon-key={iconKey ?? ""} data-low-sample={lowSample ? "true" : "false"}
+      data-x={x} data-y={y} data-marker-x={markerX} data-marker-y={y}
+      style={{ color: point.color }}>
+      <rect x={markerX - size / 2} y={y - size / 2} width={size} height={size} rx={size * 0.28}
+        fill={point.color} fillOpacity={selected ? 0.24 : 0.1} stroke={point.color}
+        strokeWidth={selected ? 2.4 : 1.4} strokeDasharray={lowSample ? "3 2" : undefined} />
+      {iconMarkup
+        ? <svg x={markerX - glyph / 2} y={y - glyph / 2} width={glyph} height={glyph} overflow="hidden"
+          opacity={lowSample ? 0.75 : 1} aria-hidden="true" dangerouslySetInnerHTML={{ __html: iconMarkup }} />
+        : <text x={markerX} y={y + size * 0.23} textAnchor="middle" fontSize={size * 0.52} fontWeight={700}
+          fill={point.color} opacity={lowSample ? 0.75 : 1}>
+          {(point.providerName || "?").slice(0, 1).toUpperCase()}
+        </text>}
+    </g>
+  );
+}
 
 /** Labels may move, but point centers always retain their actual score/TPS coordinates. */
 export function ModelPerformanceChart({ points, isZh }: { points: PerformancePoint[]; isZh: boolean }) {
@@ -17,6 +47,7 @@ export function ModelPerformanceChart({ points, isZh }: { points: PerformancePoi
   useEffect(() => () => { if (closeTimer.current) clearTimeout(closeTimer.current); }, []);
   const tooltipId = useId();
   const yMax = performanceTpsMaximum(points);
+  const xSpan = performanceXSpan();
   const xDomain = useMemo(() => performanceScoreDomain(points), [points]);
   const groups = useMemo(() => groupPerformancePoints(points, yMax, xDomain), [points, yMax, xDomain]);
   const envelope = useMemo(() => buildPerformanceEnvelope(points), [points]);
@@ -50,7 +81,7 @@ export function ModelPerformanceChart({ points, isZh }: { points: PerformancePoi
             <option value={1}>100%</option><option value={1.5}>150%</option><option value={2}>200%</option>
           </select>
         </label>
-        <span>{isZh ? "空心：有效样本少于 3；悬停、聚焦或轻触模型查看详情，Esc 关闭。仅包络线上的点直接显示名称，其余点悬停、聚焦或轻触查看。" : "Hollow: fewer than 3 valid samples. Hover, focus or tap a model for details; Escape dismisses. Only envelope points are labeled directly; hover, focus or tap any other dot for its name."}</span>
+        <span>{isZh ? "每个点显示该供应商的图标；虚线边框表示有效样本少于 3。悬停、聚焦或轻触模型查看详情，Esc 关闭。仅包络线上的点直接显示名称，其余点悬停、聚焦或轻触查看。" : "Each point shows its provider's icon; a dashed border means fewer than 3 valid samples. Hover, focus or tap a model for details; Escape dismisses. Only envelope points are labeled directly; hover, focus or tap any other icon for its name."}</span>
         <span className="inline-flex items-center gap-2" data-testid="performance-envelope-legend">
           <svg width="28" height="10" aria-hidden="true"><line x1="0" x2="28" y1="5" y2="5" stroke="#475569" strokeWidth="2" strokeDasharray="6 4" /></svg>
           {envelopeLabel}
@@ -60,6 +91,7 @@ export function ModelPerformanceChart({ points, isZh }: { points: PerformancePoi
       <div className="overflow-auto" tabIndex={0} role="region" aria-label={isZh ? "能力与速度散点图，可滚动" : "Capability and speed scatter plot, scrollable"}>
         <svg viewBox={`0 0 ${width} ${height}`} style={{ width: `${zoom * 100}%`, minWidth: 660 * zoom, height: "auto" }}
           data-testid="performance-chart" data-x-min={xDomain.min} data-x-max={xDomain.max} data-y-max={yMax}
+          data-point-left={xSpan.left} data-point-right={xSpan.right}
           data-envelope-member-keys={JSON.stringify([...envelope.memberKeys])}
           data-plot-left={left} data-plot-right={right} data-plot-top={top} data-plot-bottom={bottom}
           aria-label={isZh ? `评分 ${xDomain.min}–${xDomain.max} 与平均 TPS，仅包络线上的点显示模型名称` : `Score ${xDomain.min}–${xDomain.max} versus average TPS, envelope points labeled by model name`}
@@ -68,7 +100,7 @@ export function ModelPerformanceChart({ points, isZh }: { points: PerformancePoi
           <line data-testid="performance-axis" x1={left} x2={right} y1={bottom} y2={bottom} stroke="#94a3b8" vectorEffect="non-scaling-stroke" />
           <line data-testid="performance-axis" x1={left} x2={left} y1={top} y2={bottom} stroke="#94a3b8" vectorEffect="non-scaling-stroke" />
           {Array.from({ length: (xDomain.max - xDomain.min) / 10 + 1 }, (_, index) => xDomain.min + index * 10).map((tick) => {
-            const x = left + (right - left) * (tick - xDomain.min) / (xDomain.max - xDomain.min);
+            const x = scoreX(tick, xDomain);
             return <g key={tick}><line data-testid="performance-tick" x1={x} x2={x} y1={bottom} y2={bottom + 4} stroke="#94a3b8" vectorEffect="non-scaling-stroke" /><text x={x} y={bottom + 23} textAnchor="middle" fontSize={11} fill="#64748b">{tick}</text></g>;
           })}
           {Array.from({ length: 6 }, (_, index) => {
@@ -83,17 +115,18 @@ export function ModelPerformanceChart({ points, isZh }: { points: PerformancePoi
             vectorEffect="non-scaling-stroke" pointerEvents="none" aria-label={envelopeLabel} />}
           {groups.map((group) => {
             const label = labels.get(group.key), first = group.points[0];
-            const selected = group.points.some((point) => active.includes(point.key));
-            const low = group.points.some((point) => point.validTpsCount < 3);
-            const mixedSamples = low && group.points.some((point) => point.validTpsCount >= 3);
-            return <g key={group.key} role="button" tabIndex={0} aria-label={group.points.map(title).join("; ")}
+            const members = group.points;
+            const selected = members.some((point) => active.includes(point.key));
+            const size = members.length > 1 ? PERFORMANCE_COINCIDENT_MARKER_SIZE : PERFORMANCE_MARKER_SIZE;
+            const step = size + 2;
+            return <g key={group.key} role="button" tabIndex={0} aria-label={members.map(title).join("; ")}
               aria-describedby={selected && details.length ? tooltipId : undefined}
               style={{ cursor: "pointer", opacity: details.length && !selected ? 0.35 : 1 }}
               onPointerEnter={(event) => show(group.x, group.y, event.currentTarget)} onPointerLeave={closeSoon}
               onFocus={(event) => show(group.x, group.y, event.currentTarget)} onBlur={closeSoon}
               onClick={(event) => show(group.x, group.y, event.currentTarget)} onKeyDown={(event) => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); show(group.x, group.y, event.currentTarget); } }}>
-              <title>{group.points.map(title).join("\n")}</title>
-              {label && <g data-testid="performance-label" data-point-ids={group.points.map((p) => p.pointId).join(",")}>
+              <title>{members.map(title).join("\n")}</title>
+              {label && <g data-testid="performance-label" data-point-ids={members.map((p) => p.pointId).join(",")}>
                 <line data-testid="performance-label-leader" x1={group.x} y1={group.y} x2={label.x + label.width / 2} y2={label.y + label.height / 2} stroke={first.color} strokeOpacity={0.4} />
                 <rect x={label.x} y={label.y} width={label.width} height={label.height} rx={3} fill="white" stroke={selected ? first.color : "#e2e8f0"} />
                 <text x={label.x + 8} y={label.y + 16} fontSize={11} fontWeight={600} fill={first.color}>
@@ -101,15 +134,19 @@ export function ModelPerformanceChart({ points, isZh }: { points: PerformancePoi
                 </text>
               </g>}
               <circle cx={group.x} cy={group.y} r={14} fill="transparent" />
-              <circle data-testid="performance-point" data-point-ids={group.points.map((p) => p.pointId).join(",")} data-member-count={group.points.length}
-                data-score={first.score} data-tps={first.tps} cx={group.x} cy={group.y} r={selected ? 7 : 5.5}
-                fill={low ? "white" : first.color} stroke={first.color} strokeWidth={selected ? 3 : 2} />
-              {mixedSamples && <circle cx={group.x} cy={group.y} r={2.5} fill={first.color} />}
+              {/* Invisible geometry carrier per point: exact coordinates, no painted dot. */}
+              {members.map((point) => <circle key={point.key} data-testid="performance-point" data-point-ids={point.pointId}
+                data-member-count={members.length} data-score={point.score} data-tps={point.tps}
+                data-low-sample={point.validTpsCount < 3 ? "true" : "false"} cx={group.x} cy={group.y} r={size / 2}
+                fill="none" stroke="none" pointerEvents="none" />)}
+              {members.map((point, index) => <PerformancePointMarker key={point.pointId} point={point}
+                x={group.x} y={group.y} offsetX={(index - (members.length - 1) / 2) * step} size={size}
+                lowSample={point.validTpsCount < 3} selected={active.includes(point.key)} />)}
             </g>;
           })}
         </svg>
       </div>
-      {!!hiddenLabels && <p className="p-3 text-xs text-amber-700" role="status">{isZh ? `${hiddenLabels} 个包络线位置无法容纳完整标签；悬停或聚焦点查看。` : `${hiddenLabels} envelope positions cannot fit full labels; hover or focus their dots.`}</p>}
+      {!!hiddenLabels && <p className="p-3 text-xs text-amber-700" role="status">{isZh ? `${hiddenLabels} 个包络线位置无法容纳完整标签；悬停或聚焦图标查看。` : `${hiddenLabels} envelope positions cannot fit full labels; hover or focus their icons.`}</p>}
       {!!details.length && createPortal(<div id={tooltipId} role="tooltip" tabIndex={0} data-testid="performance-tooltip"
         onPointerEnter={cancelClose} onPointerLeave={closeSoon} onFocus={cancelClose}
         onBlur={() => setActive([])} onKeyDown={(event) => { if (event.key === "Escape") setActive([]); }}

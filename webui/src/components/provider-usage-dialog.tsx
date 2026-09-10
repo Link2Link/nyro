@@ -227,7 +227,6 @@ export function ProviderUsageDialog({
                     <ProviderIcon
                       iconKey={identityIcon ?? undefined}
                       name={identityName}
-                      protocol={identityProtocol ?? undefined}
                       size={32}
                     />
                   ) : null}
@@ -295,7 +294,6 @@ export function ProviderUsageDialog({
                           <ProviderIcon
                             iconKey={detail.data?.provider_icon ?? undefined}
                             name={detail.data?.provider_name}
-                            protocol={detail.data?.provider_protocol ?? undefined}
                             size={20}
                           />
                           <span className="truncate">
@@ -316,7 +314,6 @@ export function ProviderUsageDialog({
                           <ProviderIcon
                             iconKey={provider.provider_icon ?? undefined}
                             name={provider.provider}
-                            protocol={provider.provider_protocol ?? undefined}
                             size={20}
                           />
                           <span className="truncate" title={provider.provider}>
