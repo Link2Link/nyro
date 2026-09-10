@@ -1,6 +1,6 @@
 import { useEffect, useId, useMemo, useRef, useState } from "react";
 import {
-  buildPerformanceEnvelope, buildPerformanceHitIndex, groupPerformancePoints, layoutPerformanceLabels, PERFORMANCE_CHART,
+  buildPerformanceEnvelope, buildPerformanceHitIndex, envelopeLabelGroups, groupPerformancePoints, layoutPerformanceLabels, PERFORMANCE_CHART,
   performanceTpsMaximum, performanceScoreDomain, pointCoordinates, type PerformancePoint,
 } from "@/lib/model-performance";
 import { createPortal } from "react-dom";
@@ -26,10 +26,11 @@ export function ModelPerformanceChart({ points, isZh }: { points: PerformancePoi
   }).join(" ");
   const envelopeLabel = isZh ? "当前可见模型的能力–速度包络线" : "Capability–speed envelope of visible models";
   const membershipLabel = isZh ? "位于当前可见模型的包络线" : "On the visible-model envelope";
-  const labels = useMemo(() => layoutPerformanceLabels(groups), [groups]);
+  const envelopeGroups = useMemo(() => envelopeLabelGroups(groups, envelope), [groups, envelope]);
+  const labels = useMemo(() => layoutPerformanceLabels(envelopeGroups), [envelopeGroups]);
   const hit = useMemo(() => buildPerformanceHitIndex(groups), [groups]);
   const details = points.filter((point) => active.includes(point.key));
-  const hiddenLabels = groups.filter((group) => !labels.has(group.key)).length;
+  const hiddenLabels = envelopeGroups.filter((group) => !labels.has(group.key)).length;
   const { width, height, left, right, top, bottom } = PERFORMANCE_CHART;
   const title = (point: PerformancePoint) => `${point.model} · ${point.providerName} · ${point.score}/100 · ${formatTps(point.tps)}${envelope.memberKeys.has(point.key) ? ` · ${membershipLabel}` : ""}`;
   const show = (x: number, y: number, element: SVGGElement) => {
@@ -49,7 +50,7 @@ export function ModelPerformanceChart({ points, isZh }: { points: PerformancePoi
             <option value={1}>100%</option><option value={1.5}>150%</option><option value={2}>200%</option>
           </select>
         </label>
-        <span>{isZh ? "空心：有效样本少于 3；悬停、聚焦或轻触模型查看详情，Esc 关闭" : "Hollow: fewer than 3 valid samples. Hover, focus or tap a model for details; Escape dismisses."}</span>
+        <span>{isZh ? "空心：有效样本少于 3；悬停、聚焦或轻触模型查看详情，Esc 关闭。仅包络线上的点直接显示名称，其余点悬停、聚焦或轻触查看。" : "Hollow: fewer than 3 valid samples. Hover, focus or tap a model for details; Escape dismisses. Only envelope points are labeled directly; hover, focus or tap any other dot for its name."}</span>
         <span className="inline-flex items-center gap-2" data-testid="performance-envelope-legend">
           <svg width="28" height="10" aria-hidden="true"><line x1="0" x2="28" y1="5" y2="5" stroke="#475569" strokeWidth="2" strokeDasharray="6 4" /></svg>
           {envelopeLabel}
@@ -61,7 +62,7 @@ export function ModelPerformanceChart({ points, isZh }: { points: PerformancePoi
           data-testid="performance-chart" data-x-min={xDomain.min} data-x-max={xDomain.max} data-y-max={yMax}
           data-envelope-member-keys={JSON.stringify([...envelope.memberKeys])}
           data-plot-left={left} data-plot-right={right} data-plot-top={top} data-plot-bottom={bottom}
-          aria-label={isZh ? `评分 ${xDomain.min}–${xDomain.max} 与平均 TPS，图上显示模型名称` : `Score ${xDomain.min}–${xDomain.max} versus average TPS, labeled by model name`}
+          aria-label={isZh ? `评分 ${xDomain.min}–${xDomain.max} 与平均 TPS，仅包络线上的点显示模型名称` : `Score ${xDomain.min}–${xDomain.max} versus average TPS, envelope points labeled by model name`}
           onClick={(event) => { if (!(event.target as Element).closest('[role="button"]')) setActive([]); }}>
           <title>{isZh ? "按当前可见评分自动缩放的性能图" : "Performance chart automatically scaled to visible scores"}</title>
           <line data-testid="performance-axis" x1={left} x2={right} y1={bottom} y2={bottom} stroke="#94a3b8" vectorEffect="non-scaling-stroke" />
@@ -108,7 +109,7 @@ export function ModelPerformanceChart({ points, isZh }: { points: PerformancePoi
           })}
         </svg>
       </div>
-      {!!hiddenLabels && <p className="p-3 text-xs text-amber-700" role="status">{isZh ? `${hiddenLabels} 个密集位置无法容纳完整标签；悬停或聚焦点查看全部模型。` : `${hiddenLabels} dense positions cannot fit full labels; hover or focus their dots to see every model.`}</p>}
+      {!!hiddenLabels && <p className="p-3 text-xs text-amber-700" role="status">{isZh ? `${hiddenLabels} 个包络线位置无法容纳完整标签；悬停或聚焦点查看。` : `${hiddenLabels} envelope positions cannot fit full labels; hover or focus their dots.`}</p>}
       {!!details.length && createPortal(<div id={tooltipId} role="tooltip" tabIndex={0} data-testid="performance-tooltip"
         onPointerEnter={cancelClose} onPointerLeave={closeSoon} onFocus={cancelClose}
         onBlur={() => setActive([])} onKeyDown={(event) => { if (event.key === "Escape") setActive([]); }}

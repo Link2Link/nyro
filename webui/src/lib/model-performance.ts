@@ -25,12 +25,15 @@ export interface ModelPerformanceItem {
   untrusted_count: number;
 }
 export interface PerformanceResponse { as_of: number; window_start: number | null; models: ModelPerformanceItem[] }
+/** The backend retains at most ten calls per upstream variant. */
+const PERFORMANCE_SAMPLE_LIMIT = 10;
 const count = (value: unknown) => typeof value === "number" && Number.isInteger(value) && value >= 0;
 const finite = (value: unknown) => typeof value === "number" && Number.isFinite(value);
-function isStats(value: unknown): value is PerformanceStats {
+/** A group's merged statistics sum its variants, so their bound is not the per-variant one. */
+function isStats(value: unknown, maxSelected: number): value is PerformanceStats {
   if (!value || typeof value !== "object") return false;
   const v = value as Record<string, unknown>;
-  if (!count(v.selected_request_count) || Number(v.selected_request_count) > 10
+  if (!count(v.selected_request_count) || Number(v.selected_request_count) > maxSelected
     || !count(v.valid_tps_count) || Number(v.valid_tps_count) > Number(v.selected_request_count)) return false;
   if (v.valid_tps_count === 0) return v.average_tps === null && v.first_sample_at === null && v.last_sample_at === null;
   return finite(v.average_tps) && Number(v.average_tps) > 0
@@ -41,7 +44,7 @@ function isVariant(value: unknown): value is ModelPerformanceVariant {
   if (!value || typeof value !== "object") return false;
   const v = value as Record<string, unknown>;
   return typeof v.upstream_model === "string" && v.upstream_model.length > 0
-    && isStats(v.mixed) && count(v.unclassified_count) && count(v.untrusted_count);
+    && isStats(v.mixed, PERFORMANCE_SAMPLE_LIMIT) && count(v.unclassified_count) && count(v.untrusted_count);
 }
 /** Validate the batch as a contract, not as invented zero-valued statistics. */
 export function readPerformanceResponse(value: unknown): PerformanceResponse {
@@ -59,9 +62,10 @@ export function readPerformanceResponse(value: unknown): PerformanceResponse {
       || typeof model.provider_id !== "string" || !model.provider_id
       || !Number.isInteger(model.score) || Number(model.score) < 0 || Number(model.score) > 100
       || typeof model.score_updated_at !== "string"
-      || !isStats(model.mixed)
       || !Array.isArray(model.variants) || !model.variants.every(isVariant)
       || !count(model.unclassified_count) || !count(model.untrusted_count)) return fail();
+    // Merged counts are the sum over this group's variants, so the bound scales with them.
+    if (!isStats(model.mixed, PERFORMANCE_SAMPLE_LIMIT * model.variants.length)) return fail();
     const key = JSON.stringify([model.model_prefix, model.provider_id]);
     if (keys.has(key)) return fail();
     keys.add(key);
@@ -292,6 +296,14 @@ function wrapLabel(text: string, maxWidth: number): string[] {
   }
   if (line) lines.push(line);
   return lines;
+}
+/**
+ * Only groups sitting on the visible convex envelope get direct labels;
+ * interior and dominated groups surface their names on hover/focus instead.
+ * A boundary position keeps every coincident model in one labeled group.
+ */
+export function envelopeLabelGroups(groups: PerformanceGroup[], envelope: PerformanceEnvelope): PerformanceGroup[] {
+  return groups.filter((group) => group.points.some((point) => envelope.memberKeys.has(point.key)));
 }
 /** Move labels only, never points. Every coincident point gets its own full wrapped text. */
 export function layoutPerformanceLabels(groups: PerformanceGroup[]): Map<string, PerformanceLabel> {

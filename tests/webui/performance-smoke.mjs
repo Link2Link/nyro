@@ -104,7 +104,11 @@ async function api(path, method = 'GET', body) {
   assert.ok(response.ok && !json.error, `${method} ${path}: ${response.status} ${JSON.stringify(json)}`);
   return Object.hasOwn(json, 'data') ? json.data : json;
 }
-const ratingPath = pair => `/providers/${pair.provider.id}/model-rating?model=${encodeURIComponent(pair.model)}`;
+// Ratings are prefix-shared, so one score is written per matched prefix, not per
+// provider/model. A stream flagged sharesRowWith is a second upstream variant inside
+// the same prefix×provider group and never produces a page row of its own.
+const prefixOf = pair => pair.sharesRowWith ?? pair.model;
+const ratingPath = pair => `/model-ratings?prefix=${encodeURIComponent(prefixOf(pair))}`;
 const usagePath = pair => `/providers/${pair.provider.id}/model-usage?model=${encodeURIComponent(pair.model)}`;
 const check = (name, detail = '') => { report.checks.push({ name, detail }); console.log(`PASS ${name}${detail ? ` — ${detail}` : ''}`); };
 const send = (method, params = {}) => cdp.send(method, params, sessionId);
@@ -155,8 +159,9 @@ async function screenshot(name, { preserveFocus = false } = {}) {
   report.screenshots.push(path); console.log(`SCREENSHOT ${path}`);
 }
 async function detailRow(pair) {
+  // Rows are keyed by the matched prefix (stored lowercased), never by the logged variant name.
   return evaluate(`(() => {
-    const row=[...document.querySelectorAll('tbody tr')].find(row=>row.cells[0]?.innerText.includes(${literal(pair.provider.name)}) && row.cells[0]?.innerText.includes(${literal(pair.model)}));
+    const row=[...document.querySelectorAll('tbody tr')].find(row=>row.cells[0]?.innerText.includes(${literal(pair.provider.name)}) && row.cells[0]?.innerText.includes(${literal(prefixOf(pair).toLowerCase())}));
     return row ? [...row.cells].map(cell=>cell.innerText) : null;
   })()`);
 }
@@ -169,14 +174,14 @@ async function chartState() {
     const lines=[...(chart?.querySelectorAll('line')??[])].map(el=>({testid:el.dataset.testid,leader:Boolean(el.closest('[data-testid="performance-label"]')),x1:el.x1.baseVal.value,x2:el.x2.baseVal.value,y1:el.y1.baseVal.value,y2:el.y2.baseVal.value,stroke:getComputedStyle(el).stroke}));
     const envelopes=[...(chart?.querySelectorAll('[data-testid="performance-envelope"]')??[])].map(el=>({tag:el.tagName,points:Array.from({length:el.points?.numberOfItems??0},(_,index)=>{const p=el.points.getItem(index);return {x:p.x,y:p.y}}),fill:getComputedStyle(el).fill,stroke:getComputedStyle(el).stroke,dash:getComputedStyle(el).strokeDasharray,pointerEvents:getComputedStyle(el).pointerEvents,attrs:attrs(el)}));
     const axisTexts=[...(chart?.querySelectorAll('text')??[])].filter(el=>!el.closest('[data-testid="performance-label"]')).map(el=>({text:el.textContent,x:Number(el.getAttribute('x')),y:Number(el.getAttribute('y'))}));
-    return {points,rows,lines,envelopes,axisTexts,polygons:chart?.querySelectorAll('polygon').length??0,busy:Boolean(document.querySelector('button[aria-label="Refresh performance"],button[aria-label="刷新性能数据"]')?.disabled),counts:attrs(summary),axis:attrs(chart),summary:summary?.innerText,labels:[...document.querySelectorAll('[data-testid="performance-label"] text')].map(el=>el.textContent),body:document.body.innerText};
+    return {points,rows,lines,envelopes,axisTexts,polygons:chart?.querySelectorAll('polygon').length??0,busy:Boolean(document.querySelector('button[aria-label="Refresh performance"],button[aria-label="刷新性能数据"]')?.disabled),counts:attrs(summary),axis:attrs(chart),summary:summary?.innerText,labels:[...document.querySelectorAll('[data-testid="performance-label"] text')].map(el=>el.textContent),labelPointIds:[...document.querySelectorAll('[data-testid="performance-label"]')].map(el=>el.dataset.pointIds?.split(',')??[]),body:document.body.innerText};
   })()`);
 }
-async function ready({ plotted = 10, missing = 2, errors = 0 } = {}) {
+async function ready({ plotted = 11, missing = 1 } = {}) {
   return waitFor(async () => {
     const state=await chartState();
-    return state.points.reduce((n,p)=>n+p.members,0)===plotted && Number(state.counts['data-plotted-count'])===plotted && Number(state.counts['data-missing-count'])===missing && Number(state.counts['data-error-count'])===errors && !state.busy ? state : false;
-  }, `settled chart: ${plotted} plotted, ${missing} missing, ${errors} errors`);
+    return state.points.reduce((n,p)=>n+p.members,0)===plotted && Number(state.counts['data-plotted-count'])===plotted && Number(state.counts['data-missing-count'])===missing && !state.busy ? state : false;
+  }, `settled chart: ${plotted} plotted, ${missing} missing`);
 }
 function assertAxes(state, yMax, xMin, xMax) {
   const a=state.axis;
@@ -187,10 +192,12 @@ function assertAxes(state, yMax, xMin, xMax) {
     assert.ok(Math.abs(point.y-(bottom-point.tps/yMax*(bottom-top)))<1e-4, 'Actual SVG Y equals exact backend TPS');
   }
 }
-function expectedRows(snapshot, pairs) {
+// One page row per matched prefix × provider; the row key and order mirror the page exactly.
+function expectedRows(snapshot, rowPairs) {
   return snapshot.models.map(model => {
-    const pair=pairs.find(p=>p.provider.id===model.rating.provider_id && p.model===model.rating.upstream_model);
-    return {pair,score:model.rating.score,stats:model.mixed,status:model.status,key:JSON.stringify([pair.provider.id,pair.model])};
+    const pair=rowPairs.find(p=>p.provider.id===model.provider_id && prefixOf(p).toLowerCase()===model.model_prefix.toLowerCase());
+    const status=model.mixed.average_tps===null||model.mixed.valid_tps_count===0?'missing':'ready';
+    return {pair,prefix:model.model_prefix,score:model.score,stats:model.mixed,variants:model.variants,status,key:JSON.stringify([model.model_prefix,model.provider_id])};
   }).sort((a,b)=>a.key<b.key?-1:a.key>b.key?1:0).map((row,i)=>({...row,id:`P${String(i+1).padStart(2,'0')}`}));
 }
 function assertPoints(state, rows) {
@@ -269,7 +276,24 @@ function assertChartScaffolding(state, isZh=false) {
   assert.ok(state.axisTexts.some(t=>t.text==='TPS (tok/s)'),'Keep TPS axis title');
   assert.equal(state.polygons,0,'The upper-right envelope must never become a closed polygon');
 }
+function assertEnvelopeOnlyLabels(state, rows) {
+  // DOM labels carry point IDs; the oracle speaks in exact coordinate keys.
+  const byId=new Map(rows.map(row=>[row.id,row]));
+  const expected=new Set(expectedEnvelope(rows).keys);
+  const labeled=new Set();
+  for(const ids of state.labelPointIds) for(const id of ids) {
+    const row=byId.get(id);
+    assert.ok(row,`Every direct label carries a visible snapshot point ID (${id})`);
+    labeled.add(row.key);
+    assert.ok(expected.has(row.key),`Direct labels appear only on envelope members, never interior/dominated points (label carries ${id})`);
+  }
+  const crowded=/cannot fit full labels|无法容纳完整标签/i.test(state.body);
+  for(const key of expected) {
+    assert.ok(crowded || labeled.has(key),`Envelope member ${key} receives a direct label unless positions are too dense`);
+  }
+}
 function assertEnvelope(state, rows, isZh=false) {
+  assertEnvelopeOnlyLabels(state,rows);
   assertChartScaffolding(state,isZh);
   const expected=expectedEnvelope(rows),a=state.axis;
   const declared=a['data-envelope-member-keys'];
@@ -363,20 +387,39 @@ try {
   await api(`/providers/${disabled.id}`, 'PUT', { is_enabled: false });
   const pairs = [
     { provider: alpha, model: 'model/shared', score: 0 },
-    { provider: beta, model: 'model/shared', score: 100 },
+    // Prefix-shared ratings mean one score per prefix, so two different scores cannot
+    // share a model name: beta's 100 is its own prefix (and longest match wins for it).
+    { provider: beta, model: 'model/shared-top', score: 100 },
     { provider: alpha, model: 'model/overlap', score: 50 },
     { provider: beta, model: 'model/overlap', score: 50 },
     { provider: disabled, model: 'retired/模型/full-unambiguous-name', score: 73 },
     { provider: alpha, model: 'model/near-overlap', score: 51 },
     { provider: alpha, model: 'model/effort-profile', score: 80 },
-    { provider: alpha, model: 'model/no-history', score: 25 },
+    // Rated but never called: the contract has no row at all, not a zero-TPS row.
+    { provider: alpha, model: 'model/no-history', score: 25, unlogged: true },
     { provider: beta, model: 'model/legacy-only', score: 90 },
     { provider: beta, model: 'model/single-rating', score: 55 },
     { provider: beta, model: 'MiniMax-M3', score: 68 },
     { provider: alpha, model: 'model/invalid-tokens-or-time', score: 35 },
+    // One rated prefix served by two upstream variants: the group merges ten retained
+    // calls per variant into twenty selected/valid samples, which is exactly the
+    // client contract this fixture must keep exercising.
+    { provider: alpha, model: 'model/dual', score: 62 },
+    { provider: alpha, model: 'model/dual-0813', score: 62, sharesRowWith: 'model/dual' },
   ];
+  const unlogged = pairs.find(pair => pair.unlogged);
+  const rowPairs = pairs.filter(pair => !pair.sharesRowWith && !pair.unlogged);
   const unrated = { provider: alpha, model: 'model/unrated-fast' };
-  for (const pair of pairs) await api(ratingPath(pair), 'PUT', { score: pair.score });
+  const writtenPrefixes = new Set();
+  for (const pair of pairs) {
+    const prefix = prefixOf(pair);
+    if (writtenPrefixes.has(prefix)) {
+      assert.equal(pair.score, pairs.find(other => prefixOf(other) === prefix).score, `One prefix carries one shared score: ${prefix}`);
+      continue;
+    }
+    writtenPrefixes.add(prefix);
+    await api(ratingPath(pair), 'PUT', { score: pair.score });
+  }
   const logs = [], now = Date.now();
   const log = (pair, output, upstream = 1000, extra = {}) => logs.push({
     id: `performance-smoke-${String(logs.length).padStart(4,'0')}`, created_at: now - 60_000 + logs.length * 100,
@@ -430,6 +473,10 @@ try {
       {latency_upstream_ms:0},{latency_upstream_ms:-1},{latency_upstream_ms:null,latency_total_ms:null}][i%6];
     log(pairs[11],100,1000,invalid);
   }
+  // Two upstream variants collide on one rated prefix: ten retained calls each merge
+  // into twenty samples, weighted 100/60 TPS → (100×10 + 60×10) / 20 = 80 TPS.
+  const dualA=pairs[12],dualB=pairs[13];
+  for(let i=0;i<10;i++){ log(dualA,100); log(dualB,60); }
   log(unrated,220);
   const seedPath = join(scratch, 'seed-logs.json'); await writeFile(seedPath, JSON.stringify(logs, null, 2));
   const python = trackChild('sqlite-seed', 'python3', ['-c', seedPython, scratch, dataDir, seedPath]);
@@ -438,38 +485,63 @@ try {
   report.seed = JSON.parse(report.childLogs['sqlite-seed'].trim());
   const snapshot=await api('/model-performance'); report.snapshot=snapshot;
   assert.equal(snapshot.window_start,null,'Retained logs have no seven-day performance cutoff');
-  assert.equal(snapshot.models.length,pairs.length);
-  const statsFor=pair=>snapshot.models.find(item=>item.rating.provider_id===pair.provider.id && item.rating.upstream_model===pair.model);
-  assert.ok(Math.abs(statsFor(pairs[0]).mixed.average_tps-175/3)<1e-10);
-  assert.equal(statsFor(pairs[0]).mixed.selected_request_count,10);
-  const grouped=statsFor(effort);
+  assert.equal(snapshot.models.length,rowPairs.length,'One row per matched prefix × provider, never one per logged variant');
+  const groupFor=pair=>snapshot.models.find(item=>item.provider_id===pair.provider.id && item.model_prefix.toLowerCase()===prefixOf(pair).toLowerCase());
+  const variantStats=(item,pair)=>item.variants.find(variant=>variant.upstream_model.toLowerCase()===pair.model.toLowerCase());
+  // A stream without sharesRowWith owns its row; a sibling stream reads its own variant.
+  const statsFor=pair=>pair.sharesRowWith?variantStats(groupFor(pair),pair).mixed:groupFor(pair).mixed;
+  assert.ok(Math.abs(statsFor(pairs[0]).average_tps-175/3)<1e-10);
+  assert.equal(statsFor(pairs[0]).selected_request_count,10);
+  const grouped=groupFor(effort);
   assert.equal(grouped.mixed.selected_request_count,10); assert.equal(grouped.mixed.valid_tps_count,9);
   assert.equal(grouped.mixed.average_tps,90); assert.ok(!Object.hasOwn(grouped,'tiers'));
-  assert.equal(grouped.rating.score,80);
-  assert.equal(statsFor(pairs[8]).mixed.average_tps,50,'No metadata, total-time fallback and retained >7-day history all remain valid');
-  assert.ok(statsFor(pairs[8]).mixed.first_sample_at<snapshot.as_of-7*86400000);
-  assert.equal(statsFor(pairs[10]).mixed.average_tps,2007/((20617-1798)/1000),'MiniMax unknown version1 uses legacy generation timing');
-  assert.equal(statsFor(pairs[10]).mixed.valid_tps_count,1);
-  assert.equal(statsFor(pairs[9]).mixed.average_tps,55,'Legacy streaming fallbacks use upstream duration for non-incremental responses');
-  assert.equal(statsFor(pairs[9]).mixed.valid_tps_count,3);
-  assert.equal(statsFor(pairs[7]).mixed.selected_request_count,0);
-  assert.equal(statsFor(pairs[11]).mixed.selected_request_count,10);
-  assert.equal(statsFor(pairs[11]).mixed.valid_tps_count,0,'Invalid latest samples do not refill from older valid history');
-  assert.deepEqual(snapshot.models.filter(item=>item.mixed.average_tps===null).map(item=>item.rating.upstream_model).sort(),
-    [pairs[7].model,pairs[11].model].sort(),'Only no-history and invalid tokens/timing are missing TPS');
+  assert.equal(grouped.score,80);
+  assert.equal(statsFor(pairs[8]).average_tps,50,'No metadata, total-time fallback and retained >7-day history all remain valid');
+  assert.ok(statsFor(pairs[8]).first_sample_at<snapshot.as_of-7*86400000);
+  assert.equal(statsFor(pairs[10]).average_tps,2007/((20617-1798)/1000),'MiniMax unknown version1 uses legacy generation timing');
+  assert.equal(statsFor(pairs[10]).valid_tps_count,1);
+  assert.equal(statsFor(pairs[9]).average_tps,55,'Legacy streaming fallbacks use upstream duration for non-incremental responses');
+  assert.equal(statsFor(pairs[9]).valid_tps_count,3);
+  assert.equal(groupFor(unlogged),undefined,'A rated prefix with no retained call produces no row, never a zero-TPS row');
+  assert.equal(statsFor(pairs[11]).selected_request_count,10);
+  assert.equal(statsFor(pairs[11]).valid_tps_count,0,'Invalid latest samples do not refill from older valid history');
+  assert.deepEqual(snapshot.models.filter(item=>item.mixed.average_tps===null).map(item=>item.model_prefix).sort(),
+    [prefixOf(pairs[11]).toLowerCase()].sort(),'Only invalid tokens/timing is missing TPS');
+  // The multi-variant group is the contract the client must accept: merged counts are
+  // the sum over declared variants, so twenty selected/valid samples are legitimate.
+  const dual=rowPairs.find(pair=>pair.model==='model/dual'),dualItem=groupFor(dual);
+  assert.equal(dualItem.variants.length,2,'Two upstream variants of one prefix share a single row');
+  assert.deepEqual(dualItem.variants.map(variant=>variant.upstream_model).sort(),['model/dual','model/dual-0813']);
+  assert.equal(dualItem.mixed.selected_request_count,20,'Merged selected samples sum ten retained calls per variant');
+  assert.equal(dualItem.mixed.valid_tps_count,20);
+  assert.ok(Math.abs(dualItem.mixed.average_tps-80)<1e-10,'Merged TPS is weighted by valid samples, not by variant count');
+  assert.deepEqual(dualItem.variants.map(variant=>variant.mixed.selected_request_count),[10,10]);
+  assert.equal(dualItem.score,62,'Both variants inherit the prefix-shared score');
   report.usageComparisons=[];
   for(const pair of pairs){
-    const item=statsFor(pair),stats=item.mixed,usage=await api(usagePath(pair));
-    assert.equal(stats.average_tps,usage.average_tps,`Exact /model-performance vs /model-usage average_tps parity: ${pair.provider.name}/${pair.model}`);
-    assert.equal(stats.selected_request_count,usage.recent_sample_count);
-    assert.ok(stats.selected_request_count<=10);
+    const usage=await api(usagePath(pair));
+    if(pair.unlogged){
+      // The empty window is still reported by usage, and stays out of the chart entirely.
+      assert.equal(usage.recent_sample_count,0,'Uncalled prefix retains an empty usage window');
+      assert.equal(usage.average_tps,null);
+      report.usageComparisons.push({provider_id:pair.provider.id,model:pair.model,mixed:null,usage});
+      continue;
+    }
+    const item=groupFor(pair),variant=variantStats(item,pair);
+    assert.ok(variant,`Every logged stream keeps its own variant entry: ${pair.provider.name}/${pair.model}`);
+    // Variant statistics stay on the exact legacy per-call window shared with model usage.
+    assert.equal(variant.mixed.average_tps,usage.average_tps,`Exact /model-performance variant vs /model-usage average_tps parity: ${pair.provider.name}/${pair.model}`);
+    assert.equal(variant.mixed.selected_request_count,usage.recent_sample_count);
+    assert.ok(variant.mixed.selected_request_count<=10,'Per-variant sampling keeps the latest-ten window');
+    assert.equal(item.mixed.selected_request_count,item.variants.reduce((n,entry)=>n+entry.mixed.selected_request_count,0),'Merged selected samples are the plain sum over declared variants');
+    assert.equal(item.mixed.valid_tps_count,item.variants.reduce((n,entry)=>n+entry.mixed.valid_tps_count,0),'Merged valid samples are the plain sum over declared variants');
     assert.equal(item.untrusted_count,0,'Valid legacy logs must not be labeled untrusted');
     assert.ok(!Object.hasOwn(item,'profile') && !Object.hasOwn(item,'tiers'));
-    if(stats.average_tps!==null) assert.ok(Number.isFinite(stats.first_sample_at) && stats.first_sample_at>=0 && stats.last_sample_at<=snapshot.as_of);
-    report.usageComparisons.push({provider_id:pair.provider.id,model:pair.model,mixed:stats,usage});
+    if(variant.mixed.average_tps!==null) assert.ok(Number.isFinite(variant.mixed.first_sample_at) && variant.mixed.first_sample_at>=0 && variant.mixed.last_sample_at<=snapshot.as_of);
+    report.usageComparisons.push({provider_id:pair.provider.id,model:pair.model,mixed:variant.mixed,merged:item.variants.length>1?item.mixed:undefined,usage});
   }
-  const expected=expectedRows(snapshot,pairs);
-  check('exact legacy usage TPS parity for every pair; latest ten raw logs across statuses/versions/completion; retained old and MiniMax unknown logs valid',report.seed.database);
+  const expected=expectedRows(snapshot,rowPairs);
+  check('exact legacy usage TPS parity for every pair; latest ten raw logs across statuses/versions/completion; retained old and MiniMax unknown logs valid; two variants merge into twenty samples',report.seed.database);
 
   const browser = trackChild('chrome', chrome, ['--headless', '--no-sandbox', '--disable-gpu', '--disable-dev-shm-usage', '--disable-background-networking', '--no-first-run', '--no-default-browser-check', '--remote-debugging-port=0', `--user-data-dir=${join(scratch, 'chrome')}`, 'about:blank']);
   const ws = await waitFor(() => {
@@ -497,8 +569,10 @@ try {
     const injected=Boolean(faultMode && isTarget);
     if(fail) expectedFailureUrls.set(params.request.url,(expectedFailureUrls.get(params.request.url)??0)+1);
     const payload=structuredClone(faultMode?.startsWith('envelope:') ? envelopeSnapshot : snapshot);
-    const targetModel=payload.models.find(model=>model.rating.provider_id===pairs[1].provider.id && model.rating.upstream_model===pairs[1].model);
-    if(faultMode==='partial'){targetModel.status='error';targetModel.error='Injected profile statistics failure';}
+    const targetModel=payload.models.find(model=>model.provider_id===pairs[1].provider.id && model.model_prefix===prefixOf(pairs[1]).toLowerCase());
+    // 'overcount' fabricates more samples than the declared variants can hold: the
+    // batch contract must still reject it, so the relaxed merged bound stays honest.
+    if(faultMode==='overcount') targetModel.mixed.selected_request_count=targetModel.variants.length*10+1;
     if(['negative','zero','string','null','infinity'].includes(faultMode)) targetModel.mixed.average_tps=faultMode==='negative'?-5:faultMode==='zero'?0:faultMode==='string'?'NaN':null;
     if(faultMode==='null') Object.assign(targetModel.mixed,{valid_tps_count:0,first_sample_at:null,last_sample_at:null});
     const body=fail?{error:'Injected performance snapshot failure'}:{data:payload};
@@ -520,15 +594,22 @@ try {
   assert.equal(report.apiCalls.filter(call=>call.path==='/api/v1/model-performance').length,1,'One batch snapshot on initial navigation');
   assert.ok(!await evaluate(`document.querySelector('aside[aria-label="Complete numbered index"]')!==null`));
   assert.ok(!state.body.includes(unrated.model));
-  for(const pair of [pairs[7],pairs[11]]) {const row=await detailRow(pair);assert.ok(row[1].includes('–') && row[4].includes('No valid TPS'));}
+  assert.equal(Number(state.counts['data-profile-count']),rowPairs.length,'Every rated prefix × provider pair is profiled, including the merged group');
+  {const row=await detailRow(pairs[11]);assert.ok(row[1].includes('–') && row[4].includes('No valid TPS'));}
   for(const pair of [pairs[8],pairs[10]]) {
     const row=await detailRow(pair);
-    assert.ok(row[1].includes(`${statsFor(pair).mixed.average_tps.toFixed(1)} tok/s`) && row[4].includes('Plotted'),'Retained old/unknown logs plot with one-decimal TPS');
+    assert.ok(row[1].includes(`${statsFor(pair).average_tps.toFixed(1)} tok/s`) && row[4].includes('Plotted'),'Retained old/unknown logs plot with one-decimal TPS');
   }
+  // The merged row renders its summed samples and every variant, not a ten-sample cap.
+  const dualDetail=await detailRow(dual);
+  assert.ok(dualDetail[2].includes('20 / 20'),'Merged group shows twenty valid / twenty selected samples');
+  assert.ok(dualDetail[1].includes('62/100') && dualDetail[1].includes('80.0 tok/s'),'Merged group keeps the shared score and weighted TPS');
+  assert.ok(dualDetail[4].includes('Plotted') && dualDetail[4].includes('model/dual') && dualDetail[4].includes('model/dual-0813'),'Merged row lists both upstream variants');
+  assert.equal((await evaluate(`[...document.querySelectorAll('[data-testid="performance-point"]')].some(el=>el.dataset.pointIds.includes(${literal(expected.find(row=>row.pair===dual).id)}))`)),true,'The merged group is plotted');
   assert.ok(!/untrusted|unconfirmed requests/i.test(state.body),'No untrusted-history warning for legacy-valid samples');
-  assert.equal(expected.length,pairs.length,'Exactly one row per rated provider/model');
+  assert.equal(expected.length,rowPairs.length,'Exactly one row per matched prefix × provider');
   assert.ok(!await evaluate(`document.querySelector('[aria-label="Filter by tier"]')!==null`),'No effort selector');
-  check('batch snapshot, single provider/model scores, legacy-valid mixed TPS, one-decimal display, one-sample hollow, model labels and actual coordinates');
+  check('batch snapshot, prefix-shared scores, legacy-valid mixed TPS, merged two-variant group, one-decimal display, one-sample hollow, model labels and actual coordinates');
   await screenshot('performance-en-desktop');
   const baselineEnvelope=assertEnvelope(state,expected);
   assert.deepEqual(baselineEnvelope.keys,[expected.find(row=>row.pair===pairs[1]).key],'Real fixture has one dominating (100,225) boundary model, not a multi-point line');
@@ -548,8 +629,8 @@ try {
   const overlap=state.points.find(point=>point.members===2);
   assert.ok(overlap);
   const overlapNames=expected.filter(row=>overlap.ids.includes(row.id)).map(row=>row.pair.model);
-  const overlapLabel=await evaluate(`document.querySelector('[data-testid="performance-label"][data-point-ids="${overlap.ids.join(',')}"]')?.textContent`);
-  for(const name of overlapNames) assert.ok(overlapLabel?.includes(name),'Coincident label names every member');
+  const overlapLabel=await evaluate(`document.querySelector('[data-testid="performance-label"][data-point-ids="${overlap.ids.join(',')}"]')?.textContent ?? null`);
+  assert.equal(overlapLabel,null,'Interior coincident points no longer label directly; names appear in hover/focus details');
   const nearby=expected.find(row=>row.pair===pairs[5]);
   await evaluate(`(${circleExpression(overlap.ids[0])}).parentElement.focus()`);
   await key('Enter');
@@ -574,13 +655,13 @@ try {
   await send('Input.dispatchMouseEvent',{type:'mouseMoved',...tip}); await delay(300); assert.ok(await tooltip(),'Tooltip remains while pointer reads it');
   await screenshot('performance-hover-details');
   await send('Input.dispatchMouseEvent',{type:'mouseMoved',x:10,y:10}); await waitFor(async()=>!await tooltip(),'Leaving tooltip closes details');
-  check('direct model labels, all overlapping names, complete hover/focus details, Enter/Space and Escape, no permanent index');
+  check('envelope-only direct labels, interior overlap names via hover details, complete hover/focus details, Enter/Space and Escape, no permanent index');
 
-  await fill('input[aria-label="Search providers or models"]','overlap');
+  await fill('input[aria-label="Search prefixes, providers or models"]','overlap');
   state=await ready({plotted:3,missing:0}); assertAxes(state,100,50,60);
   assertPoints(state,expected.filter(row=>row.pair.model.includes('overlap')));
   assertEnvelope(state,expected.filter(row=>row.pair.model.includes('overlap')));
-  await fill('input[aria-label="Search providers or models"]',''); state=await ready(); assertAxes(state,250,0,100);
+  await fill('input[aria-label="Search prefixes, providers or models"]',''); state=await ready(); assertAxes(state,250,0,100);
   await select('Filter by provider',disabled.name);
   state=await ready({plotted:1,missing:0}); assertPoints(state,expected.filter(row=>row.pair.provider===disabled)); assertAxes(state,100,70,80);
   assertEnvelope(state,expected.filter(row=>row.pair.provider===disabled));
@@ -620,15 +701,15 @@ try {
   check('EN/ZH desktop/mobile, no permanent index, bounded mobile tap tooltip, no page overflow');
 
   await send('Emulation.setDeviceMetricsOverride', { width: 1440, height: 1000, deviceScaleFactor: 1, mobile: false });
-  faultMode='partial'; await reload(); state=await ready({plotted:9,errors:1});
-  assert.ok(state.body.includes('Injected profile statistics failure')); await screenshot('performance-partial-error');
-  faultMode=null; await refresh(); await ready();
-  for(const mode of ['negative','zero','string','infinity']){
+  // A group may never claim more samples than its declared variants can hold, so the
+  // relaxed merged bound is not a free pass: fabricated counts still fail closed.
+  for(const mode of ['overcount','negative','zero','string','infinity']){
     faultMode=mode; await reload();
     await waitFor(()=>evaluate(`Boolean(document.querySelector('[role="alert"]'))`),`${mode} invalid snapshot warning`);
     assert.equal((await chartState()).points.length,0,'Invalid batch must not invent zero or plot stale values');
   }
-  faultMode='null'; await reload(); await ready({plotted:9,missing:3});
+  await screenshot('performance-overcount-error');
+  faultMode='null'; await reload(); await ready({plotted:10,missing:2});
   await screenshot('performance-null-tps');
   faultMode=null; await refresh(); await ready();
   faultMode='snapshot'; await refresh();
@@ -637,11 +718,11 @@ try {
   await reload(); await waitFor(()=>evaluate(`Boolean(document.querySelector('[role="alert"]'))`),'cold snapshot HTTP500');
   state=await chartState(); assert.equal(state.points.length,0); assert.ok(state.body.includes('Unknown does not mean unrated'));
   faultMode=null; await refresh(); await ready();
-  check('partial model failure preserves others; invalid batch, null TPS and warm/cold HTTP500 distinguish unknown and recover');
+  check('invalid batch by value and by merged over-count, null TPS and warm/cold HTTP500 distinguish unknown and recover');
 
   // Geometry-only CDP snapshots reuse the real response contract and known local providers.
   // They never alter the persisted ratings/logs or the exact baseline API parity assertions.
-  const fixturePair=(model,score,tps,samples=1,provider=alpha,status='ready')=>({provider,model,score,tps,samples,status});
+  const fixturePair=(model,score,tps,samples=1,provider=alpha)=>({provider,model,score,tps,samples});
   const convex=[fixturePair('envelope-convex/keep-A',40,200),fixturePair('envelope-convex/keep-B',60,120,2),fixturePair('envelope-convex/C',90,100,3,beta)];
   const scenarios=[
     {name:'convex-not-all-pareto',pairs:convex,boundary:[0,2],axes:[250,40,90]},
@@ -664,27 +745,30 @@ try {
       fixturePair('envelope-same-tps/strongest',90,80),fixturePair('envelope-same-tps/strongest-copy',90,80,2,beta),
     ],boundary:[2,3],axes:[100,40,90]},
     {name:'singleton-high-score',pairs:[fixturePair('envelope-single/only',100,125,2)],boundary:[0],axes:[150,90,100]},
-    {name:'missing-error-excluded',pairs:[...convex,fixturePair('envelope-excluded/missing-dominant',100,null,0),fixturePair('envelope-excluded/error-dominant',100,999,1,beta,'error')],boundary:[0,2],axes:[250,40,90]},
+    {name:'missing-excluded',pairs:[...convex,fixturePair('envelope-excluded/missing-dominant',100,null,0)],boundary:[0,2],axes:[250,40,90]},
     {name:'unrounded-coordinates',pairs:[fixturePair('envelope-precision/A',43,200.123456),fixturePair('envelope-precision/B',67,110.987654,2),fixturePair('envelope-precision/C',87,100.123456,3,beta)],boundary:[0,2],axes:[250,40,90]},
     {name:'zero-score-valid',pairs:[fixturePair('envelope-zero/A',0,80),fixturePair('envelope-zero/B',25,25,2,beta)],boundary:[0,1],axes:[100,0,30]},
     {name:'empty',pairs:[],boundary:[],axes:[100,0,100]},
   ];
   report.envelopeScenarios=[];
   for(const scenario of scenarios) {
-    envelopeSnapshot={...structuredClone(snapshot),models:scenario.pairs.map(pair=>({
-      ...structuredClone(snapshot.models[0]),rating:{...snapshot.models[0].rating,provider_id:pair.provider.id,upstream_model:pair.model,score:pair.score},
-      mixed:{selected_request_count:pair.samples,valid_tps_count:pair.samples,average_tps:pair.tps,first_sample_at:pair.samples?snapshot.as_of-1000:null,last_sample_at:pair.samples?snapshot.as_of:null},
-      unclassified_count:0,untrusted_count:0,status:pair.status,...(pair.status==='error'?{error:'Injected geometry-only statistics failure'}:{}),
-    }))};
+    // Real response contract: a group carries its own merged mixed plus one entry per
+    // upstream variant; there is no per-row status or error field to inject any more.
+    envelopeSnapshot={...structuredClone(snapshot),models:scenario.pairs.map(pair=>{
+      const mixed={selected_request_count:pair.samples,valid_tps_count:pair.samples,average_tps:pair.tps,first_sample_at:pair.samples?snapshot.as_of-1000:null,last_sample_at:pair.samples?snapshot.as_of:null};
+      return {model_prefix:pair.model,provider_id:pair.provider.id,score:pair.score,score_updated_at:'1970-01-01T00:00:00.000Z',
+        mixed:structuredClone(mixed),variants:[{upstream_model:pair.model,mixed:structuredClone(mixed),unclassified_count:0,untrusted_count:0}],
+        unclassified_count:0,untrusted_count:0};
+    })};
     faultMode=`envelope:${scenario.name}`;
     await reload();
     const rows=expectedRows(envelopeSnapshot,scenario.pairs),plotted=plottedRows(rows).length;
-    const missing=rows.filter(row=>row.status==='ready' && row.stats.average_tps===null).length,errors=rows.filter(row=>row.status==='error').length;
-    state=await ready({plotted,missing,errors});
+    const missing=rows.filter(row=>row.status==='missing').length;
+    state=await ready({plotted,missing});
     if(plotted) assertPoints(state,rows);
     assertAxes(state,...scenario.axes);
     const envelope=assertEnvelope(state,rows);
-    assert.deepEqual(envelope.keys,scenario.boundary.map(index=>JSON.stringify([scenario.pairs[index].provider.id,scenario.pairs[index].model])).sort(),'Independent supporting-line oracle also agrees with the explicit deterministic scenario membership');
+    assert.deepEqual(envelope.keys,scenario.boundary.map(index=>JSON.stringify([scenario.pairs[index].model,scenario.pairs[index].provider.id])).sort(),'Independent supporting-line oracle also agrees with the explicit deterministic scenario membership');
     await assertEnvelopeTooltips(state,rows);
     const evidence={name:scenario.name,snapshot:structuredClone(envelopeSnapshot),expectedBoundaryKeys:envelope.keys,svg:state.envelopes,axes:state.axis,points:state.points};
     report.envelopeScenarios.push(evidence);
@@ -694,16 +778,16 @@ try {
       assert.ok(!envelope.keys.includes(b.key),'B(60,120) is nondominated but below the A(40,200)–C(90,100) convex segment');
       const values=rows=>plottedRows(rows).map(row=>({id:row.id,score:row.score,tps:row.stats.average_tps})).sort((a,b)=>a.id.localeCompare(b.id));
       const originalValues=values(rows),beforeFilterCalls=report.apiCalls.filter(call=>call.path==='/api/v1/model-performance').length;
-      await fill('input[aria-label="Search providers or models"]','keep-');
+      await fill('input[aria-label="Search prefixes, providers or models"]','keep-');
       const kept=rows.filter(row=>row.pair.model.includes('keep-'));
       state=await ready({plotted:2,missing:0});assertPoints(state,kept);assertAxes(state,250,40,60);
       assert.deepEqual(assertEnvelope(state,kept).keys,kept.map(row=>row.key).sort(),'Removing C promotes previously interior B onto the recomputed visible envelope');
       await assertEnvelopeTooltips(state,kept);await screenshot('performance-envelope-search-recomputed');
-      await fill('input[aria-label="Search providers or models"]','keep-B');
+      await fill('input[aria-label="Search prefixes, providers or models"]','keep-B');
       state=await ready({plotted:1,missing:0});assertAxes(state,150,60,70);assertEnvelope(state,[b]);await assertEnvelopeTooltips(state,[b]);
-      await fill('input[aria-label="Search providers or models"]','no-envelope-model-matches');
+      await fill('input[aria-label="Search prefixes, providers or models"]','no-envelope-model-matches');
       state=await ready({plotted:0,missing:0});assertAxes(state,100,0,100);assertEnvelope(state,[]);
-      await fill('input[aria-label="Search providers or models"]','');
+      await fill('input[aria-label="Search prefixes, providers or models"]','');
       state=await ready({plotted:3,missing:0});assertAxes(state,250,40,90);assertEnvelope(state,rows);
       await select('Filter by provider',alpha.name);
       state=await ready({plotted:2,missing:0});assertAxes(state,250,40,60);assertEnvelope(state,kept);await assertEnvelopeTooltips(state,kept);
@@ -740,7 +824,7 @@ try {
   assert.deepEqual(report.consoleErrors, [], 'Unexpected browser console.error');
   assert.deepEqual(report.runtimeErrors, [], 'Unexpected browser runtime errors');
   assert.deepEqual(report.networkErrors, [], 'Unexpected browser network errors');
-  assert.ok(report.injected.some(item => item.mode === 'partial') && report.injected.some(item => item.mode === 'snapshot'), 'Both intentional HTTP500 failure paths actually exercised');
+  assert.ok(report.injected.some(item => item.mode === 'overcount') && report.injected.some(item => item.mode === 'snapshot'), 'Both intentional failure paths (merged over-count and HTTP500) actually exercised');
   check('no upstream calls or unexpected browser errors', `${report.expectedNetworkErrors.length} deliberate HTTP500 network errors recorded separately`);
   report.success = true;
 } catch (error) {

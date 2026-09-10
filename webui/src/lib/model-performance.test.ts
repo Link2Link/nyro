@@ -1,7 +1,7 @@
 import { deepEqual, equal, ok, throws } from "node:assert/strict";
 import { test } from "node:test";
 import {
-  buildPerformanceRows, buildPerformanceHitIndex, buildPerformanceEnvelope, filterPerformanceRows, groupPerformancePoints,
+  buildPerformanceRows, buildPerformanceHitIndex, buildPerformanceEnvelope, envelopeLabelGroups, filterPerformanceRows, groupPerformancePoints,
   layoutPerformanceLabels, PERFORMANCE_CHART, performanceColor, performanceModelLabel, performancePoints,
   performanceTpsMaximum, performanceScoreDomain, performanceScoreMaximum, pointCoordinates, readPerformanceResponse, visiblePerformanceSelection,
   type ModelPerformanceItem, type PerformancePoint, type PerformanceResponse, type PerformanceStats,
@@ -55,7 +55,7 @@ test("malformed batches and duplicate prefix/provider groups are errors, never m
     throws(() => readPerformanceResponse(invalid));
   }
 });
-test("statistics enforce ten-request bound and matching TPS/sample-time presence", () => {
+test("variant statistics enforce the ten-request window and matching TPS/sample-time presence", () => {
   for (const mixed of [
     { ...stats(), selected_request_count: 11 }, { ...stats(), average_tps: null },
     { ...stats(), first_sample_at: null }, { ...stats(), last_sample_at: null },
@@ -67,6 +67,32 @@ test("statistics enforce ten-request bound and matching TPS/sample-time presence
   for (const fields of [{ as_of: -1 }, { window_start: -1 }, { window_start: 3001 }]) {
     throws(() => readPerformanceResponse({ ...snapshot(item()), ...fields }));
   }
+});
+test("merged group statistics are bounded by their variant count, not by one variant window", () => {
+  const merged = (selected_request_count: number, valid_tps_count: number): PerformanceStats => ({
+    selected_request_count, valid_tps_count, average_tps: valid_tps_count ? 53.0750848124811 : null,
+    first_sample_at: valid_tps_count ? 1000 : null, last_sample_at: valid_tps_count ? 2000 : null,
+  });
+  const group = (mixed: PerformanceStats) => ({ ...item(),
+    variants: [variant("model"), variant("model-0813")], mixed });
+  // Two variants, each retaining a full ten-call window, merge into twenty samples.
+  const live = snapshot(group(merged(20, 20)));
+  equal(readPerformanceResponse(live), live);
+  // A group without any usable TPS still merges its selected samples.
+  const unrated = snapshot(group(merged(20, 0)));
+  equal(readPerformanceResponse(unrated), unrated);
+  // Merging is a sum: counts above ten are valid, counts above ten per variant are not.
+  for (const mixed of [merged(21, 20), merged(20, 21), merged(21, 21)]) {
+    throws(() => readPerformanceResponse(snapshot(group(mixed))));
+  }
+  const partial = snapshot(group(merged(20, 10)));
+  equal(readPerformanceResponse(partial), partial);
+  // A group with no variants was merged from nothing, so it may carry no samples at all.
+  const none = snapshot({ ...item(), variants: [], mixed: merged(0, 0) });
+  equal(readPerformanceResponse(none), none);
+  throws(() => readPerformanceResponse(snapshot({ ...item(), variants: [], mixed: merged(1, 0) })));
+  // The bound follows the declared variants, so a single-variant group keeps the ten-call window.
+  throws(() => readPerformanceResponse(snapshot({ ...item(), mixed: merged(11, 11) })));
 });
 test("hidden hover/pins never dim visible points and restored filters recover the pin", () => {
   const visible = [point("01", 20, 30)], pinned = ["02"];
@@ -222,6 +248,29 @@ test("coincident groups preserve all members and near-hit index returns actual c
   // Centers 21px apart have overlapping 14px hit targets; choosing either exposes both.
   const overlapping = groupPerformancePoints([point("05", 50, 60), point("06", 53, 60)], 200);
   equal(buildPerformanceHitIndex(overlapping)(overlapping[0].x, overlapping[0].y).length, 2);
+});
+test("only envelope positions receive direct labels; interior and dominated groups stay hover-only", () => {
+  const a = point("a", 40, 200), bend = point("bend", 60, 180), c = point("c", 90, 100), dent = point("dent", 60, 120);
+  const envelope = buildPerformanceEnvelope([a, bend, c, dent]);
+  deepEqual([...envelope.memberKeys].sort(), ["a", "bend", "c"]);
+  const labeled = envelopeLabelGroups(groupPerformancePoints([a, bend, c, dent], 200), envelope);
+  deepEqual(labeled.map((group) => group.key).sort(),
+    [a, bend, c].map((p) => JSON.stringify([p.score, p.tps])).sort(),
+    "only boundary positions get direct labels, the Pareto dent none");
+  // Coincident boundary models share one position and one labeled group.
+  const copy = point("copy-c", 90, 100);
+  const groups = groupPerformancePoints([a, dent, c, copy], 200);
+  const envelope2 = buildPerformanceEnvelope([a, dent, c, copy]);
+  const labeled2 = envelopeLabelGroups(groups, envelope2);
+  deepEqual(labeled2.map((group) => group.key).sort(), [a, c, copy].map((p) => JSON.stringify([p.score, p.tps])).filter((key, index, keys) => keys.indexOf(key) === index).sort());
+  ok(labeled2.every((group) => group.points.every((p) => envelope2.memberKeys.has(p.key))));
+  const coincident = labeled2.find((group) => group.key === JSON.stringify([90, 100]))!;
+  deepEqual(coincident.points.map((p) => p.key).sort(), ["c", "copy-c"]);
+  // A singleton boundary (no dashed line is drawn) still labels its point: it is the outer boundary.
+  const single = envelopeLabelGroups(groupPerformancePoints([dent], 200), buildPerformanceEnvelope([dent]));
+  equal(single.length, 1); deepEqual(single[0].points, [dent]);
+  // Empty data labels nothing.
+  deepEqual(envelopeLabelGroups([], buildPerformanceEnvelope([])), []);
 });
 test("dense model labels never collide; unavailable slots deliberately omitted, point coordinates stationary", () => {
   const data = Array.from({ length: 90 }, (_, i) => point(String(i + 1).padStart(2, "0"), 50 + i / 100, 60 + i / 100));

@@ -86,16 +86,24 @@ node tests/webui/performance-smoke.mjs
 ```
 
 The browser uses one `/api/v1/model-performance` snapshot, not per-model usage calls.
-The Node fixture independently compares **every rated pair's** `mixed.average_tps`
-with `/api/v1/providers/:id/model-usage?model=...` using exact numeric equality, and
-saves both responses in `report.json`. Each snapshot item has one `rating` and
-`mixed` statistic; `profile` and `tiers` remain absent. `window_start` is `null`:
-there is no seven-day cutoff beyond whatever request logs are still retained.
+Ratings are prefix-shared (`PUT /api/v1/model-ratings?prefix=...`), and one page row is
+one matched **prefix × provider group**. Each group carries `model_prefix`,
+`provider_id`, `score`, `score_updated_at`, a merged `mixed`, and one `variants[]` entry
+per distinct upstream model name; `profile` and `tiers` remain absent. The Node fixture
+independently compares **every logged stream's variant** `mixed.average_tps` with
+`/api/v1/providers/:id/model-usage?model=...` using exact numeric equality, saves both
+responses in `report.json`, and asserts the group's `mixed` is the plain per-variant sum
+with sample-weighted TPS. `window_start` is `null`: there is no seven-day cutoff beyond
+whatever request logs are still retained.
 
 Coverage:
 
-- One comprehensive score and one mixed-TPS point per exact provider/model pair;
-  no effort selector, tier points, score overrides, or fallback scores.
+- One comprehensive score per matched prefix and one merged mixed-TPS point per
+  prefix × provider group; no effort selector, tier points, score overrides, or
+  fallback scores. Each variant samples its own latest ten retained calls, so a group
+  served by two upstream variants legitimately reports twenty selected/valid samples.
+- A rated prefix with no retained call produces **no row at all** — never a zero-TPS
+  row — while `/model-usage` still reports its empty window.
 - Select the latest ten raw retained logs by request time before validating TPS.
   The shared logs/model-usage formula uses `output_tokens`, `latency_upstream_ms`
   (or total latency fallback), `is_stream`/chunk count and `stream_first_chunk_ms`.
@@ -110,7 +118,13 @@ Coverage:
   latency and 1798ms TTFT yields `2007 / ((20617 - 1798) / 1000)` TPS, shown as
   **106.6 tok/s**. A retained log older than seven days with no metadata fields and
   total-latency fallback also contributes. No upstream request is made.
-- Only no history or invalid tokens/timing produce missing TPS in the real fixture.
+- Two upstream variants (`model/dual`, `model/dual-0813`) share one prefix and one row:
+  the group must keep both variants, report `10 + 10 = 20` selected and valid samples,
+  merge TPS sample-weighted (100 and 60 → **80.0 tok/s**), inherit the shared score, and
+  still be plotted with `20 / 20` in the diagnostics table. The same client contract is
+  enforced negatively by CDP injection: a group claiming more samples than its declared
+  variants can hold is rejected outright rather than plotted.
+- Only invalid tokens/timing produces missing TPS in the real fixture.
   Invalid latest samples are not refilled from older valid calls. Zero score is
   valid; missing TPS is not zero. Fewer than three valid samples are hollow points.
 - Exact SVG coordinates retain full backend precision while user-visible TPS uses
@@ -120,14 +134,16 @@ Coverage:
   to 73 gives 70–80, and clearing filters restores the full-data 0–100 range.
   Y defaults to 0–100 with 50-unit expansion only above 100; fixture maximum 225
   deliberately keeps the expanded ceiling at 250.
-  Model names appear directly; exact overlaps list every model without jitter.
+  Only envelope boundary points label model names directly; exact coincident boundary
+  positions list every model without jitter. Interior and dominated points never label
+  directly — their names surface only in hover/focus/tap details.
 - No permanent numbered index or visible Pxx IDs. Hover/focus/tap tooltips expose
   full supplier/model identity, score, one-decimal TPS and samples; pointer transfer
   into the tooltip keeps it readable, leaving or Escape dismisses it. Enter/Space
   and zoom work.
 - Provider/model search, EN/ZH desktop/mobile, bounded mobile tooltips,
   direct loading and no whole-page overflow.
-- Partial model errors preserve peers. Invalid numeric payloads, null TPS, warm/cold
+- Invalid numeric payloads, fabricated merged over-counts, null TPS, warm/cold
   HTTP 500 remain unknown/unavailable, never invented zero; refresh recovers.
 - No browser path requests per-model usage, model catalogs or benchmarks. All seed,
   API comparison, fault injection and browser work stays inside fresh local fixtures.
@@ -148,13 +164,19 @@ nor trusts the SVG membership metadata as its expected result.
   envelope, even though B is nondominated), a genuine convex bend, same-score fastest
   and same-TPS strongest ties, identical coordinates across every exact model key,
   negative-slope collinear members, singleton/empty data, score zero, full-precision
-  TPS, and missing/error models excluded from the boundary. One/two-sample hollow
+  TPS, and missing models excluded from the boundary. One/two-sample hollow
   models remain eligible; sample-count warnings and actual scores/TPS do not change.
 - Actual SVG vertices must map through the **shared visible X minimum/maximum and Y
   scale**, lie at real boundary coordinates, and cover all supporting corners. The
   line is one dashed, unfilled, pointer-transparent **open polyline**, with no closing
   polygon, axis connections, or horizontal/vertical tails. Collinear members may be
   rendered as vertices or lie on the same straight segment, but all retain membership.
+- Only boundary members are labeled directly, checked against the independent oracle
+  in every scenario and the real fixture: no direct label may list an interior or
+  dominated point, and every boundary key gets its label (coincident boundary models
+  share one position label) unless the too-dense notice appears. The real fixture's
+  interior coincident "overlap" pair is verified to have **no** direct label while its
+  hover details still name every member.
 - Every plotted model's tooltip is opened by its stable point ID and checked for the
   exact `data-point-key` badge only when it belongs to the independent expected
   boundary, including coincident models. EN/ZH badge text, low-sample warnings and

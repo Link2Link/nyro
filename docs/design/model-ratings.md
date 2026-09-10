@@ -133,12 +133,15 @@ For example, 53–78 → 50–80, only 73 → 70–80, and only 100 → 90–100
 is 10, and search/provider filters recalculate the scale without changing scores or
 point identities.
 Y defaults to 0–100; values above 100 expand its ceiling in 50-TPS steps with headroom.
-Reasoning effort is not a score dimension, filter, or point identity. The chart directly labels model names, adding supplier names when
-needed to distinguish identical models. Coincident groups list every model; labels
-wrap and avoid collisions without moving actual point coordinates. Dense labels that
-cannot fit are omitted with a notice. Hover, keyboard focus, or mobile tap reveals
-score/TPS and sample details in a dismissible tooltip; no permanent side index or
-visible point IDs remain. Search and provider filters are retained.
+Reasoning effort is not a score dimension, filter, or point identity. Only points on
+the visible upper-right convex envelope label model names directly, adding supplier names
+when needed to distinguish identical models; coincident boundary groups list every model
+at that spot. Interior and dominated points never label directly — their names appear on
+hover, keyboard focus, or mobile tap. Labels wrap and avoid collisions without moving
+actual point coordinates; envelope positions too dense to fit are omitted with a notice.
+Hover, keyboard focus, or mobile tap reveals score/TPS and sample details in a dismissible
+tooltip; no permanent side index or visible point IDs remain. Search and provider filters
+are retained.
 
 ### Upper-right capability–speed envelope
 
@@ -158,6 +161,9 @@ recompute the envelope; viewport scaling or display rounding never decides membe
 - Uniform slate dashed strokes render below points and labels with no fill, closure,
   axis extension, or pointer capture. Existing provider colors and hollow/solid meanings
   stay unchanged. Details and accessible point descriptions identify envelope members.
+- Only boundary members are labeled directly; an interior or dominated point gets no
+  direct label, and a coincident boundary position keeps every model in one label.
+  Hover, focus, or tap surfaces any non-boundary name.
 - Horizontal/vertical gridlines are removed. Solid left/bottom axes, short tick marks,
   tick values, axis titles, and model-name leader lines remain.
 
@@ -171,6 +177,12 @@ orientation tolerance, never one-decimal display values.
 `rating: ProviderModelRating`, `mixed`, `status`, optional `error`,
 `unclassified_count`, and `untrusted_count`; there is no `profile` or `tiers` field.
 `mixed` contains selected/valid counts, average TPS, and first/last sample times.
+
+A group is one rated prefix at one provider. `variants` lists the distinct upstream
+model names that matched the prefix, each with its own `mixed` sampled from that
+variant's latest ten retained calls. The group's `mixed` is the sample-weighted merge
+of its variants: counts are sums that legitimately exceed ten (up to ten per variant),
+timestamps span the merged window, and a group with no usable TPS keeps a null average.
 
 Performance uses the **same latest-ten retained-call sampling and TPS calculation as
 model usage statistics**, not a separate completion-qualified metric. There is no
