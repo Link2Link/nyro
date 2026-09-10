@@ -638,10 +638,16 @@
           "en": "Default"
         },
         "baseUrls": {
-          "openai-compatible": "https://opencode.ai/zen/go"
+          "openai-compatible": "https://opencode.ai/zen/go",
+          "openai-responses": "https://opencode.ai/zen/go",
+          "anthropic-messages": "https://opencode.ai/zen/go"
         },
         "modelsSource": "https://opencode.ai/zen/go/v1/models",
-        "authMode": "apikey"
+        "authMode": "apikey",
+        "authSchemes": {
+          "anthropic-messages": "x-api-key"
+        },
+        "sharedKeyProtocols": true
       }
     ]
   },

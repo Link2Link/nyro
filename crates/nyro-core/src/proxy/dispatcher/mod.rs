@@ -641,8 +641,20 @@ async fn dispatch_pipeline_inner(
         // The request-scoped `ctx` is threaded end-to-end from the ingress
         // middleware (no per-target throwaway context); negotiate records its
         // trace/egress decision onto it.
+        //
+        // Vendor-scoped egress preference: OpenCode Go serves different models
+        // on different endpoints and the client's protocol wins whenever the
+        // model is served there (openai-go `routing`). `None` keeps the default
+        // ingress-driven resolution; an unsupported preference falls through
+        // negotiate's own tiers, so providers that do not declare the endpoint
+        // are unaffected.
         let provider_protocols = ProviderProtocols::from_provider(&provider);
-        let plan = match negotiate(ingress, None, Some(&provider_protocols), ctx) {
+        let egress_preference = crate::provider::opencode_go::routing::preferred_egress(
+            &provider,
+            &actual_model,
+            ingress,
+        );
+        let plan = match negotiate(ingress, egress_preference, Some(&provider_protocols), ctx) {
             Ok(p) => p,
             Err(e) => {
                 last_response = Some(e.render(None));
@@ -979,6 +991,19 @@ async fn dispatch_pipeline_inner(
             ));
             continue;
         }
+
+        // Channel-scoped routing identity. OpenCode Go rejects every request
+        // that does not carry a per-conversation `x-opencode-session` (HTTP 400
+        // MissingSessionID, see `opencode_go::session`). Applied at this single
+        // choke point — after passthrough, IR encode and raw-wire compat have
+        // each produced their final headers, and after forwarded client hints
+        // are merged — so all three request-build paths carry it, and a client
+        // that already sends its own value keeps it.
+        crate::provider::opencode_go::session::apply_egress_headers(
+            &mut outbound.headers,
+            &provider,
+            &upstream_request,
+        );
 
         let prepared_conversion =
             match crate::conversion::prepare_conversion(crate::conversion::PrepareConversionInput {

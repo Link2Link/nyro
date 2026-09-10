@@ -141,6 +141,19 @@ async fn caption_image(
     if !api_key.is_empty() {
         builder = builder.bearer_auth(api_key);
     }
+    // This is a direct provider call (no dispatcher), so the channel-scoped
+    // egress headers have to be added here: OpenCode Go rejects requests
+    // without its routing identity, seeded per helper model because a caption
+    // body carries no conversation to fingerprint.
+    if let Some(session_id) = crate::provider::opencode_go::session::seeded_egress_session_id(
+        provider,
+        &format!("vision-shim:{model}"),
+    ) {
+        builder = builder.header(
+            crate::provider::opencode_go::session::SESSION_HEADER,
+            session_id,
+        );
+    }
     let response = match builder.json(&body).send().await {
         Ok(response) => response,
         Err(err) => return CaptionCall::failed(format!("helper request failed: {err}")),

@@ -711,7 +711,7 @@ fn kimi_code_channel_is_shared_key_multi_protocol() {
 // ── 9. Opencode Go single-protocol channel ─────────────────────────────────
 
 #[test]
-fn opencode_go_channel_is_openai_compatible() {
+fn opencode_go_channel_is_shared_key_multi_protocol() {
     let reg = VendorRegistry::global();
     let meta = reg
         .metadata("opencode-go")
@@ -724,10 +724,28 @@ fn opencode_go_channel_is_openai_compatible() {
         .iter()
         .find(|channel| channel.id == "default")
         .expect("opencode-go default channel");
-    assert!(!channel.shared_key_protocols);
-    assert_eq!(channel.base_urls.len(), 1);
-    assert_eq!(channel.base_urls[0].protocol, "openai-compatible");
-    assert_eq!(channel.base_urls[0].base_url, "https://opencode.ai/zen/go");
+    // The Go plan serves different models on different endpoints, so the
+    // preset declares all three (one subscription key covers them all).
+    assert!(channel.shared_key_protocols, "channel must be shared-key");
+    let base_urls: Vec<(&str, &str)> = channel
+        .base_urls
+        .iter()
+        .map(|entry| (entry.protocol, entry.base_url))
+        .collect();
+    assert_eq!(
+        base_urls,
+        vec![
+            ("openai-compatible", "https://opencode.ai/zen/go"),
+            ("openai-responses", "https://opencode.ai/zen/go"),
+            ("anthropic-messages", "https://opencode.ai/zen/go"),
+        ]
+    );
+    // `/v1/messages` authenticates with x-api-key; the OpenAI-family endpoints
+    // take Bearer.
+    let auth_schemes = channel.auth_schemes.expect("auth scheme overrides");
+    assert_eq!(auth_schemes.len(), 1);
+    assert_eq!(auth_schemes[0].protocol, "anthropic-messages");
+    assert_eq!(auth_schemes[0].auth_scheme, "x-api-key");
     assert_eq!(
         channel.models_source,
         Some("https://opencode.ai/zen/go/v1/models")

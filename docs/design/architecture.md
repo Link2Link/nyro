@@ -584,6 +584,7 @@ inventory::submit! { ExtensionRegistration { make: || Box::new(XxxChannel) } }
 | Google | `google` | default channel：URL 追加 `?key=<api_key>`；含 `antigravity` channel（Google AI Pro 订阅 OAuth，见 6.5） |
 | Vertex AI | `vertexai` | Service account auth + 区域 endpoint |
 | DeepSeek / Moonshot / GLM (zhipuai) / MiniMax / xAI / ZAI / OpenRouter / Nvidia / Ollama | 各自 vendor_id | 委托 `GenericOpenAICompatibleAdapter` / openai_compat_* |
+| OpenCode Go | `opencode-go` | 三端点自适应（chat/responses/messages，共享 Key）+ 按模型的硬编码端点路由；每个请求必须携带会话标识 `x-opencode-session`（见 6.6） |
 | custom | `custom` | 用户自定义 vendor preset |
 
 ### 6.5 Google AI Pro（Antigravity OAuth）通道
@@ -595,6 +596,23 @@ inventory::submit! { ExtensionRegistration { make: || Box::new(XxxChannel) } }
 - **管道配合**：该 channel 声明 request/response mutations（`declared_*_mutations_for` 按 channel 判定，default channel 保持字节级直通）；`conversion/resolver.rs` 将其排除出 raw-wire compat（compat 路径不经过 vendor 响应钩子）；dispatcher 把 OAuth credential 贯通进 `ProviderCtx.credential` 供 vendor 钩子读取 project_id；流式路径在 IR 解码前调用 `on_stream_raw_chunk`（`StreamRawChunkHook`）。
 - **强制上游流式**：Code Assist v1internal 的非流式 action 可能返回空体——sub2api 与 CLIProxyAPI 均以 `:streamGenerateContent` 调上游再聚合。nyro 对该 channel 无条件走流式上游（`antigravity::forces_upstream_stream` 翻转 IR stream 标志 → 聚合路径 `handle_non_stream_via_upstream_stream`，同样应用 `StreamRawChunkHook` 解包），非流式客户端收到聚合后的完整响应；admin 模型探测（probe）同样以流式 + SSE 提取实现。
 - **模型目录**：优先调用 `v1internal:fetchAvailableModels` 做**按账号动态发现**（订阅的真实目录，新模型先于此处任何静态表出现；失败时自动回退 curated 静态表 `ANTIGRAVITY_STATIC_MODELS`）；配额（remainingFraction）接入 usage 面板为后续项。
+
+### 6.6 OpenCode Go（opencode.ai/zen/go）通道
+
+`opencode-go` 是 Go 订阅（$10/月）的**三端点自适应**通道：上游把不同模型分发在 `/v1/chat/completions`、`/v1/responses`、`/v1/messages` 三个端点上，且对"该端点不服务此模型"的请求回**不透明的 500**（`Internal server error`）而非明确的 not-supported，因此端点归属无法从错误码推断——由硬编码表决定（`provider/opencode_go/routing.rs`）。
+
+- **会话标识**（`provider/opencode_go/session.rs`）：上游对**每个请求**强制要求会话标识，缺失即 400 `{"type":"error","error":{"type":"MissingSessionID",…}}`（官方要求「为每个会话发送稳定的 `x-opencode-session`，以便优化路由与提示缓存」，opencode.ai/docs/go#where-can-i-use-it）。id 由会话首轮指纹（`system` + 首条 user 文本）派生成 `nyro-<16 字节 hex>`——会话增长时首轮不变，故同一会话各轮共享同一 id；无 user 文本（如仅工具结果的续轮）时回退随机 id。客户端自带 `x-opencode-session` 时**永不覆盖**。
+- **会话标识注入点**：dispatcher 出站 header 汇合处（`proxy/dispatcher/mod.rs`，位于 passthrough / IR 编码 / raw-wire compat 三条构建路径之后、forwarded client headers 合并之后）——Claude Code（anthropic ingress 的 compat 路径）、Responses/OpenAI 客户端（passthrough）与转码路径全部覆盖。admin 模型探测（`admin/providers.rs`）按模型播种确定性 id；vision shim 直连 helper 的调用（`vision_shim/caption.rs`，不经 dispatcher）单独注入。
+- **预设**：channel 声明三端点（同一 host `https://opencode.ai/zen/go`）+ `sharedKeyProtocols`（一个订阅 key 覆盖三端点，UI 因此按共享 Key 语义播种并锁定为自适应模式）+ `authSchemes` 里 `anthropic-messages → x-api-key`（`/v1/messages` 不吃 Bearer）。历史遗留的固定模式 provider 行不受影响，在 UI 打开→保存一次即升级为三端点自适应。
+- **模型 → 端点硬编码表**（`routing.rs`，2026-09 实测 37 个 `/v1/models` 条目 × 3 端点）：
+  - 三端点全可用：`deepseek-flash`、`deepseek-v4-flash`、`deepseek-v4-flash-vision-exp`、`deepseek-v4-pro`、`deepseek-v4.1-flash`；
+  - chat + messages：`kimi-k3`、`minimax-m2.5`、`minimax-m3`、`qwen3.6-plus`、`qwen3.7-max`、`qwen3.7-plus`、`qwen3.8-flash`、`qwen3.8-max`；
+  - 仅 responses：`gpt-5.6-luna`、`grok-4.6`、`muse-spark-1.2-contributor`、`muse-spark-1.3-contributor`；
+  - 仅 messages：`minimax-m2.7`；
+  - 其余（含未收录的新模型）**默认仅 chat**；精确匹配（trim + 大小写不敏感），按目标模型（`actual_model`）判定。
+- **裁决规则**（`routing::preferred_egress` → `negotiate()` 的 route_pref）：**客户端协议优先**——模型支持客户端协议就原生直通（Claude Code 问 `kimi-k3` 走 `/v1/messages`，Codex 问 `deepseek-*` 走 `/v1/responses`）；不支持才改道到该模型的端点（chat 客户端问 `grok-4.6` → `/v1/responses` 转码；Claude Code 问 `glm-5.3` → `/v1/chat/completions` 转码，否则自适应协商会选中 messages 端点并 500）。偏好只在 provider 真的声明了该端点时生效，固定 provider 优雅退化为原有行为；不做端点级失败回退（端点选定即定，上游错误照原样透出）。
+- **已知不可用黑名单**（`routing.rs::UNAVAILABLE_MODELS`）：`glm-5`、`grok-4.5`、`hy3-preview`、`kimi-k2.5`、`mimo-v2-omni`、`mimo-v2-pro`、`qwen3.5-plus` 仍出现在上游 `/v1/models` 里，但订阅内每个端点都不可用。它们被**从 provider 模型列表中过滤**（选择器/探测/路由目标都看不到），手填模型名仍可绕过，因此上游若恢复服务不会被代码堵死。
+- **模型探测**（`admin/providers.rs::resolve_probe_target`）：与转发共用同一决策——每个模型探它实际会被路由到的端点（`grok-4.6` → responses、`minimax-m2.7` → messages、其余 chat），因此"探测绿"等价于"经网关可调用"；逐模型的实际端点回填到 `ProviderModelProbeResult.protocol`，前端按模型显示 `[协议]`。
 
 ---
 

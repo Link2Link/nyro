@@ -144,6 +144,15 @@ fn build_model_probe_request(
     // OAuth runtime identity is provider-owned and authoritative, matching
     // the dispatcher precedence (default auth < RuntimeBinding headers).
     headers.extend(runtime_headers.clone());
+    // OpenCode Go rejects requests without its per-conversation routing
+    // identity (HTTP 400 MissingSessionID); the probe seeds a deterministic id
+    // per model so repeated runs stay stable. Mirrors the dispatcher's egress
+    // header pass in `proxy::dispatcher`.
+    crate::provider::opencode_go::session::apply_probe_session_header(
+        &mut headers,
+        base_url,
+        model,
+    );
     Ok((url, headers, body))
 }
 
@@ -989,6 +998,70 @@ fn ensure_adaptive_provider_supported(
     Ok(())
 }
 
+/// One concrete endpoint a model probe can be sent to.
+///
+/// Adaptive providers declare several endpoints and the vendor may route a
+/// given model to a specific one (OpenCode Go serves `/v1/responses`-only and
+/// `/v1/messages`-only models), so each model resolves its own target; see
+/// [`resolve_probe_target`].
+#[derive(Debug, Clone)]
+struct ProbeTarget {
+    /// Protocol suite handed to `probe_single_model`.
+    suite: crate::protocol::ids::Protocol,
+    /// Canonical endpoint id reported back to the WebUI.
+    protocol_id: String,
+    base_url: String,
+    api_key: String,
+    auth_scheme: String,
+}
+
+/// Resolve the endpoint a model probe must use — the same decision the
+/// dispatcher's negotiation makes, so "green in the probe" implies "callable
+/// through the proxy".
+///
+/// Only adaptive OpenCode Go providers get per-model routing (the vendor table
+/// is consulted when the provider declares the model's endpoint); every other
+/// provider, and any model whose endpoint is not declared, stays on the
+/// provider's default probe endpoint.
+fn resolve_probe_target(
+    provider: &Provider,
+    model: &str,
+    default: &ProbeTarget,
+    declared: &[(crate::protocol::ids::Protocol, &ProviderProtocolEndpoint)],
+) -> ProbeTarget {
+    use crate::protocol::ids::Protocol;
+
+    if !provider.is_adaptive() || !crate::provider::opencode_go::session::is_opencode_go(provider) {
+        return default.clone();
+    }
+    let wanted = crate::provider::opencode_go::routing::primary_protocol(model);
+    let Some((suite, endpoint)) = declared
+        .iter()
+        .find(|(protocol, _)| *protocol == wanted.protocol)
+        .copied()
+    else {
+        return default.clone();
+    };
+    let registry = crate::protocol::registry::ProtocolRegistry::global();
+    let auth_scheme = match endpoint.auth_scheme.trim() {
+        "" | "auto" => match suite {
+            Protocol::AnthropicMessages => "x-api-key",
+            _ => "bearer",
+        },
+        explicit => explicit,
+    };
+    ProbeTarget {
+        suite,
+        protocol_id: registry
+            .resolve_alias(&endpoint.protocol)
+            .map(|resolved| resolved.to_string())
+            .unwrap_or_else(|| endpoint.protocol.clone()),
+        base_url: endpoint.base_url.trim().trim_end_matches('/').to_string(),
+        api_key: endpoint.api_key.trim().to_string(),
+        auth_scheme: auth_scheme.to_string(),
+    }
+}
+
 impl AdminService {
     // ── Providers ──
 
@@ -1826,34 +1899,57 @@ impl AdminService {
         let fast_mode = provider.fast_mode;
         let channel = provider.channel.clone();
 
-        let mut results: Vec<ProviderModelProbeResult> = futures::stream::iter(models)
-            .map(|model| {
-                let client = client.clone();
-                let base_url = base_url.clone();
-                let api_key = api_key.clone();
-                let scheme = effective_scheme.to_string();
-                let runtime_headers = runtime_headers.clone();
-                let protocol_id = protocol_id.clone();
-                let channel = channel.clone();
-                let antigravity_project = antigravity_project.clone();
-                async move {
-                    probe_single_model(
-                        client,
-                        suite,
-                        &base_url,
-                        &api_key,
-                        &scheme,
-                        &runtime_headers,
-                        &model,
-                        &protocol_id,
-                        fast_mode,
-                        channel.as_deref(),
-                        is_codex_oauth,
-                        antigravity_project.as_deref(),
-                    )
-                    .await
-                }
-            })
+        // Endpoints an adaptive provider could route a model to; empty for
+        // fixed providers, which keep probing their single configuration.
+        let declared_endpoints: Vec<(crate::protocol::ids::Protocol, &ProviderProtocolEndpoint)> =
+            if provider.is_adaptive() {
+                provider
+                    .protocol_endpoints
+                    .iter()
+                    .filter(|endpoint| endpoint.is_enabled)
+                    .filter_map(|endpoint| {
+                        registry
+                            .parse_protocol(&endpoint.protocol)
+                            .map(|protocol| (protocol, endpoint))
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+        let default_target = ProbeTarget {
+            suite,
+            protocol_id: protocol_id.clone(),
+            base_url: base_url.clone(),
+            api_key: api_key.clone(),
+            auth_scheme: effective_scheme.to_string(),
+        };
+
+        let probes = models.into_iter().map(|model| {
+            let client = client.clone();
+            let runtime_headers = runtime_headers.clone();
+            let channel = channel.clone();
+            let antigravity_project = antigravity_project.clone();
+            let target =
+                resolve_probe_target(&provider, &model, &default_target, &declared_endpoints);
+            async move {
+                probe_single_model(
+                    client,
+                    target.suite,
+                    &target.base_url,
+                    &target.api_key,
+                    &target.auth_scheme,
+                    &runtime_headers,
+                    &model,
+                    &target.protocol_id,
+                    fast_mode,
+                    channel.as_deref(),
+                    is_codex_oauth,
+                    antigravity_project.as_deref(),
+                )
+                .await
+            }
+        });
+        let mut results: Vec<ProviderModelProbeResult> = futures::stream::iter(probes)
             .buffer_unordered(4)
             .collect()
             .await;
@@ -1887,13 +1983,22 @@ impl AdminService {
 
     pub async fn test_provider_models(&self, id: &str) -> anyhow::Result<Vec<String>> {
         let provider = self.get_provider(id).await?;
-        let runtime = self.resolve_provider_runtime(&provider).await?;
+        let models = self.fetch_provider_models(&provider).await?;
+        Ok(crate::provider::opencode_go::routing::visible_models(
+            &provider, models,
+        ))
+    }
+
+    /// Fetch the provider's model list from its discovery source, before
+    /// vendor-scoped visibility filtering.
+    async fn fetch_provider_models(&self, provider: &Provider) -> anyhow::Result<Vec<String>> {
+        let runtime = self.resolve_provider_runtime(provider).await?;
         let credential = runtime.access_token.clone();
         // Adaptive providers: the discovery endpoint is OpenAI-style even when
         // the default protocol is not — authenticate with an enabled
         // OpenAI-family endpoint's Bearer key instead of the default
         // protocol's scheme (e.g. Anthropic `x-api-key`).
-        let (auth_protocol, auth_credential) = match adaptive_model_fetch_auth(&provider) {
+        let (auth_protocol, auth_credential) = match adaptive_model_fetch_auth(provider) {
             Some((protocol, api_key)) => (protocol, api_key),
             None => (provider.protocol.clone(), credential),
         };
@@ -1967,7 +2072,7 @@ impl AdminService {
             anyhow::bail!("Model list format is invalid or empty");
         }
 
-        Ok(merge_model_lists(models, preset_extra_models(&provider)))
+        Ok(merge_model_lists(models, preset_extra_models(provider)))
     }
     pub async fn get_provider_models(&self, id: &str) -> anyhow::Result<Vec<String>> {
         self.get_provider_models_with_catalog_validation(id, false)
@@ -1982,19 +2087,33 @@ impl AdminService {
         require_catalog: bool,
     ) -> anyhow::Result<Vec<String>> {
         let provider = self.get_provider(id).await?;
-        let runtime = self.resolve_provider_runtime(&provider).await?;
+        let models = self
+            .discover_provider_models(&provider, require_catalog)
+            .await?;
+        Ok(crate::provider::opencode_go::routing::visible_models(
+            &provider, models,
+        ))
+    }
+
+    /// Discovered model list, before vendor-scoped visibility filtering.
+    async fn discover_provider_models(
+        &self,
+        provider: &Provider,
+        require_catalog: bool,
+    ) -> anyhow::Result<Vec<String>> {
+        let runtime = self.resolve_provider_runtime(provider).await?;
         let credential = runtime.access_token.clone();
         // Same adaptive-auth rationale as `test_provider_models` above.
-        let (auth_protocol, auth_credential) = match adaptive_model_fetch_auth(&provider) {
+        let (auth_protocol, auth_credential) = match adaptive_model_fetch_auth(provider) {
             Some((protocol, api_key)) => (protocol, api_key),
             None => (provider.protocol.clone(), credential),
         };
         // Dynamic per-account catalog first; static curated list is fallback.
         if let Some(models) = self
-            .antigravity_available_models(&provider, Some(&runtime), require_catalog)
+            .antigravity_available_models(provider, Some(&runtime), require_catalog)
             .await?
         {
-            return Ok(merge_model_lists(models, preset_extra_models(&provider)));
+            return Ok(merge_model_lists(models, preset_extra_models(provider)));
         }
         if let Some(static_list) = runtime.binding.static_models_override.as_deref() {
             let models: Vec<String> = static_list
@@ -2011,7 +2130,7 @@ impl AdminService {
             .binding
             .models_source_override
             .clone()
-            .or_else(|| resolve_models_endpoint(&provider))
+            .or_else(|| resolve_models_endpoint(provider))
         {
             if let Some(models) = lookup_models_dev_models(&self.gw.config.data_dir, &endpoint)?
                 && !models.is_empty()
@@ -2086,7 +2205,7 @@ impl AdminService {
                     provider.vendor.as_deref(),
                     &json,
                 );
-                return Ok(merge_model_lists(models, preset_extra_models(&provider)));
+                return Ok(merge_model_lists(models, preset_extra_models(provider)));
             }
 
             if let Ok(resp) = request.send().await
@@ -2099,13 +2218,13 @@ impl AdminService {
                     &json,
                 );
                 if !models.is_empty() {
-                    return Ok(merge_model_lists(models, preset_extra_models(&provider)));
+                    return Ok(merge_model_lists(models, preset_extra_models(provider)));
                 }
             }
         }
 
         let static_list = parse_static_models(provider.static_models.as_deref());
-        let extra = preset_extra_models(&provider);
+        let extra = preset_extra_models(provider);
         if !extra.is_empty() {
             return Ok(merge_model_lists(static_list, extra));
         }
