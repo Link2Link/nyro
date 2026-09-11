@@ -399,9 +399,7 @@ pub(crate) fn is_unavailable_subscription_model(model: &str) -> bool {
 /// them as noise.
 fn is_tab_preview_noise(model: &str) -> bool {
     let model = model.trim().to_ascii_lowercase();
-    model.starts_with("tab_")
-        && model.ends_with("_preview")
-        && model.len() > "tab__preview".len()
+    model.starts_with("tab_") && model.ends_with("_preview") && model.len() > "tab__preview".len()
 }
 
 /// True for catalog entries that carry quota yet cannot serve agent requests,

@@ -447,6 +447,7 @@ where
         ctx.provider.vendor.as_deref(),
         ctx.protocol,
     );
+    crate::provider::google::apply_output_token_floor(&mut body, ctx.provider.vendor.as_deref());
 
     // 5b. sub2api Fast 模式：缺 service_tier 时补 priority（IR 转码路径）
     maybe_inject_openai_fast_mode(&mut body, ctx.provider, ctx.protocol);
@@ -620,6 +621,10 @@ pub async fn passthrough_run(
         &mut raw_body,
         ctx.provider.vendor.as_deref(),
         ctx.protocol,
+    );
+    crate::provider::google::apply_output_token_floor(
+        &mut raw_body,
+        ctx.provider.vendor.as_deref(),
     );
 
     if is_openai_chat {

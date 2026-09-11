@@ -693,6 +693,97 @@ fn universal_tools_to_google_function_declarations() {
     );
 }
 
+/// Regression for production request `ebf53944-0168-4473-b6a2-e86c7475f36c`:
+/// a DSH session routed to the Google AI Pro (antigravity `v1internal`)
+/// surface 400'd with `INVALID_ARGUMENT "Request contains an invalid
+/// argument."` because the `mcp__web-reader__webReader` tool schema carried
+/// the OpenAPI `"format": "int32"` keyword through to the Gemini endpoint.
+/// The schema sanitizer must strip unsupported keywords from IR tool specs
+/// before they are emitted as `functionDeclarations`.
+#[test]
+fn universal_tools_strip_unsupported_schema_keywords_for_gemini() {
+    // Verbatim parameter schema of mcp__web-reader__webReader from the
+    // failing request's upstream body.
+    let web_reader_parameters = json!({
+        "properties": {
+            "keep_img_data_url": {
+                "description": "Keep image data URL (true/false), default is false",
+                "type": "boolean"
+            },
+            "no_cache": {
+                "description": "Disable cache(true/false), default is false",
+                "type": "boolean"
+            },
+            "no_gfm": {
+                "description": "Disable GitHub Flavored Markdown (true/false), default is false",
+                "type": "boolean"
+            },
+            "retain_images": {
+                "description": "Retain images (true/false), default is true",
+                "type": "boolean"
+            },
+            "return_format": {
+                "description": "Reader response content type (markdown or text), default is markdown",
+                "type": "string"
+            },
+            "timeout": {
+                "description": "Request timeout(unit is second), default is 20",
+                "format": "int32",
+                "type": "integer"
+            },
+            "url": {
+                "description": "The URL of the website to fetch and read",
+                "type": "string"
+            },
+            "with_images_summary": {
+                "description": "Include images summary (true/false), default is false",
+                "type": "boolean"
+            },
+            "with_links_summary": {
+                "description": "Include links summary (true/false), default is false",
+                "type": "boolean"
+            }
+        },
+        "required": ["url"],
+        "type": "object"
+    });
+
+    let mut req = request("gemini-3.8-flash", vec![user_msg("/auto-commit")]);
+    req.tools = Some(vec![ToolSpec {
+        name: "mcp__web-reader__webReader".to_string(),
+        description: Some("Fetch and Convert URL to Large Model Friendly Input.".to_string()),
+        kind: Default::default(),
+        namespace: None,
+        parameters: web_reader_parameters,
+        strict: None,
+        cache_control: None,
+        meta: None,
+    }]);
+
+    let out = encode_request(P::GoogleGemini, &req);
+    let decl = &field(&out, "/tools/0/functionDeclarations/0");
+    let text = decl.to_string();
+    assert!(
+        text.find("\"format\"").is_none(),
+        "OpenAPI `format` keyword must not reach the Gemini upstream: {decl}"
+    );
+    // The offending property itself and the rest of the schema stay intact.
+    assert_eq!(
+        decl["parameters"]["properties"]["timeout"]["type"],
+        "integer"
+    );
+    assert_eq!(
+        decl["parameters"]["properties"]["timeout"]["description"],
+        "Request timeout(unit is second), default is 20"
+    );
+    assert_eq!(
+        decl["parameters"]["properties"]["return_format"]["type"],
+        "string"
+    );
+    assert_eq!(decl["parameters"]["required"], json!(["url"]));
+    assert_eq!(decl["name"], "mcp__web-reader__webReader");
+}
+
 #[test]
 fn universal_thinking_config_written_back() {
     // KNOWN GAP: `google_reasoning_config` returns only `thinkingBudget` when
@@ -1057,8 +1148,13 @@ fn default_model_is_gemini_2_flash() {
 fn schema_unsupported_fields_stripped_for_gemini() {
     // fix-verification "recursive schema stripping": Nyro strips
     // `$schema`/`additionalProperties`/`$ref`/`definitions`/`$defs`
-    // recursively. llm-bridge additionally strips `default`/`examples`/
-    // `deprecated`/`readOnly`/`$comment`; Nyro passes those through.
+    // recursively. The strip list was widened after production request
+    // ebf53944-0168-4473-b6a2-e86c7475f36c (400 INVALID_ARGUMENT on the
+    // Google subscription surface from an MCP tool's OpenAPI `format`
+    // keyword): annotation/metadata keys with no `google.genai.Schema`
+    // counterpart (`$comment`/`examples`/`deprecated`/`readOnly`) are now
+    // stripped too. `default` is a documented Schema field and passes
+    // through, as do `pattern`/`minimum`/`maximum`.
     let mut req = request("gemini-pro", vec![user_msg("Hello")]);
     req.tools = Some(vec![ToolSpec {
         name: "search".to_string(),
@@ -1097,8 +1193,17 @@ fn schema_unsupported_fields_stripped_for_gemini() {
     let query = &params["properties"]["query"];
     assert!(query.get("additionalProperties").is_none());
     assert!(query.get("$schema").is_none());
-    assert!(query.get("$comment").is_some(), "passes through: {query}");
-    assert!(query.get("default").is_some(), "passes through: {query}");
+    assert!(query.get("$comment").is_none(), "must be stripped: {query}");
+    assert!(query.get("examples").is_none(), "must be stripped: {query}");
+    assert!(
+        query.get("deprecated").is_none(),
+        "must be stripped: {query}"
+    );
+    assert!(query.get("readOnly").is_none(), "must be stripped: {query}");
+    assert!(
+        query.get("default").is_some(),
+        "documented field, passes through: {query}"
+    );
     assert!(
         params["properties"]["nested"]
             .get("additionalProperties")

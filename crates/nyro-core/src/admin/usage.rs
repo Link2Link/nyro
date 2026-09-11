@@ -3719,7 +3719,10 @@ mod tests {
         };
         // No first-party Gemini id at all: report the remaining pools instead
         // of an empty snapshot that scheduling would read as "no data".
-        let models = vec![model("claude-sonnet-4-6", 0.9), model("gpt-oss-120b-medium", 0.25)];
+        let models = vec![
+            model("claude-sonnet-4-6", 0.9),
+            model("gpt-oss-120b-medium", 0.25),
+        ];
         let pairs: Vec<(String, f64)> = google_subscription_tiers(&models)
             .iter()
             .map(|tier| (tier.name.clone(), tier.used_percent))

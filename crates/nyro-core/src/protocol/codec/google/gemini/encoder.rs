@@ -99,7 +99,10 @@ impl RequestEncoder for GoogleEncoder {
 
         // ── Tools ─────────────────────────────────────────────────────────────
         if let Some(raw) = ingress.get("__google_raw_tools") {
-            obj.insert("tools".into(), raw.clone());
+            // Same-protocol passthrough still crosses the schema boundary:
+            // sanitize declarations exactly like the IR path below so a
+            // client-side converter's OpenAPI-isms cannot 400 the upstream.
+            obj.insert("tools".into(), sanitize_gemini_schema(raw));
         } else if let Some(ref tools) = req.tools {
             let mut fn_decls: Vec<Value> = Vec::new();
             let mut builtin_entries: Vec<Value> = Vec::new();
@@ -220,22 +223,106 @@ fn google_reasoning_config(reasoning: &ReasoningConfig) -> Option<Value> {
 
 // ── Schema sanitisation ───────────────────────────────────────────────────────
 
+/// Schema keywords the Gemini `Schema` proto rejects (unknown fields surface as
+/// `400 INVALID_ARGUMENT "Request contains an invalid argument."` on the
+/// subscription/`v1internal` surface). Sourced from OpenAPI-style tool schemas
+/// (MCP servers are the main producer) plus cross-checked against the cleanup
+/// lists maintained by CLIProxyAPI (`util.CleanJSONSchemaForGemini`) and
+/// gcli2api (`antigravity_fix._clean_parameters_json_schema`).
+///
+/// Kept (supported by the `google.genai.Schema` subset): `type`, `description`,
+/// `nullable`, `enum`, `items`, `required`, `properties`, `minimum`, `maximum`,
+/// `minItems`, `maxItems`, `minProperties`, `maxProperties`, `pattern`,
+/// `default`, `title`, `anyOf`, `propertyOrdering`.
+const GEMINI_UNSUPPORTED_SCHEMA_KEYS: &[&str] = &[
+    // JSON-Schema dialect furniture.
+    "$schema",
+    "$id",
+    "$comment",
+    "$ref",
+    "ref",
+    "definitions",
+    "$defs",
+    "additionalProperties",
+    "additionalItems",
+    "patternProperties",
+    "propertyNames",
+    "dependentSchemas",
+    "dependentRequired",
+    "unevaluatedProperties",
+    "unevaluatedItems",
+    // Validation constraints with no Gemini counterpart.
+    "format",
+    "exclusiveMinimum",
+    "exclusiveMaximum",
+    "multipleOf",
+    "minLength",
+    "maxLength",
+    "uniqueItems",
+    "contains",
+    "minContains",
+    "maxContains",
+    // Composition/conditionals the endpoint cannot evaluate.
+    "allOf",
+    "oneOf",
+    "not",
+    "if",
+    "then",
+    "else",
+    // Metadata/examples.
+    "examples",
+    "example",
+    "deprecated",
+    "contentEncoding",
+    "contentMediaType",
+    "discriminator",
+    "readOnly",
+    "writeOnly",
+    "xml",
+    "externalDocs",
+];
+
+/// Keys whose value is a *name map* (property name → sub-schema). Keys inside
+/// such a map are chosen by the tool author, so a property literally named
+/// `format` must survive even though the same word is a stripped keyword.
+const SCHEMA_NAME_MAP_KEYS: &[&str] = &["properties", "patternProperties", "definitions", "$defs"];
+
+/// Strip Gemini-unsupported schema keywords anywhere in the tree, recursing
+/// through objects/arrays and the values of name maps, while preserving keys
+/// that only *look* like keywords because a tool author named a property that
+/// way.
 fn sanitize_gemini_schema(value: &Value) -> Value {
+    sanitize_schema_node(value, false)
+}
+
+fn sanitize_schema_node(value: &Value, in_name_map: bool) -> Value {
     match value {
         Value::Object(map) => {
             let mut out = serde_json::Map::new();
             for (k, v) in map {
-                if matches!(
-                    k.as_str(),
-                    "$schema" | "additionalProperties" | "$ref" | "ref" | "definitions" | "$defs"
-                ) {
+                if in_name_map {
+                    // Property name, never a keyword: keep and recurse into
+                    // its schema value.
+                    out.insert(k.clone(), sanitize_schema_node(v, false));
                     continue;
                 }
-                out.insert(k.clone(), sanitize_gemini_schema(v));
+                if GEMINI_UNSUPPORTED_SCHEMA_KEYS.contains(&k.as_str()) || k.starts_with("x-") {
+                    continue;
+                }
+                let child_is_name_map = SCHEMA_NAME_MAP_KEYS.contains(&k.as_str()) && v.is_object();
+                out.insert(k.clone(), sanitize_schema_node(v, child_is_name_map));
             }
             Value::Object(out)
         }
-        Value::Array(arr) => Value::Array(arr.iter().map(sanitize_gemini_schema).collect()),
+        // Array elements (e.g. `items`, `anyOf` branches, `required` names)
+        // inherit the surrounding name-map context only positionally; entries
+        // themselves are plain schema nodes, so the flag does not apply to the
+        // array's own keys — only nested objects matter.
+        Value::Array(arr) => Value::Array(
+            arr.iter()
+                .map(|v| sanitize_schema_node(v, in_name_map))
+                .collect(),
+        ),
         _ => value.clone(),
     }
 }
@@ -354,5 +441,178 @@ fn encode_content_block_for_gemini(b: &ContentBlock) -> Value {
         ContentBlock::Thinking { thinking, .. } => serde_json::json!({"text": thinking}),
         ContentBlock::Unknown { raw } => raw.clone(),
         other => serde_json::to_value(other).unwrap_or(Value::Null),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression for the production 400 INVALID_ARGUMENT on the Google
+    /// subscription (`v1internal`) surface: an MCP tool schema carrying the
+    /// OpenAPI `"format": "int32"` keyword reached the upstream verbatim and
+    /// the endpoint rejected the unknown field.
+    #[test]
+    fn sanitizes_openapi_format_keyword() {
+        // Verbatim shape from the failing request log (request
+        // ebf53944-0168-4473-b6a2-e86c7475f36c): mcp__web-reader__webReader.
+        let schema = serde_json::json!({
+            "properties": {
+                "timeout": {
+                    "description": "Request timeout(unit is second), default is 20",
+                    "format": "int32",
+                    "type": "integer"
+                },
+                "url": {
+                    "description": "The URL of the website to fetch and read",
+                    "type": "string"
+                }
+            },
+            "required": ["url"],
+            "type": "object"
+        });
+
+        let out = sanitize_gemini_schema(&schema);
+        assert!(
+            out.to_string().find("\"format\"").is_none(),
+            "format keyword must be stripped, got {out}"
+        );
+        assert_eq!(out["properties"]["timeout"]["type"], "integer");
+        assert_eq!(out["properties"]["url"]["type"], "string");
+        assert_eq!(out["required"], serde_json::json!(["url"]));
+    }
+
+    #[test]
+    fn property_named_like_a_keyword_survives() {
+        // A tool author may legitimately name a parameter `format`; only the
+        // schema keyword layer may be stripped, never the property itself.
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "format": {"type": "string", "description": "output format"},
+                "example": {"type": "string"},
+                "default": {"type": "boolean"}
+            },
+            "required": ["format", "default"]
+        });
+
+        let out = sanitize_gemini_schema(&schema);
+        assert_eq!(out["properties"]["format"]["type"], "string");
+        assert_eq!(out["properties"]["example"]["type"], "string");
+        assert_eq!(out["properties"]["default"]["type"], "boolean");
+        assert_eq!(out["required"].as_array().map(Vec::len), Some(2));
+    }
+
+    #[test]
+    fn strips_unsupported_keywords_at_every_depth() {
+        let schema = serde_json::json!({
+            "$schema": "http://json-schema.org/draft-07/schema#",
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "items": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "count": {
+                                "type": "integer",
+                                "minimum": 1,
+                                "maximum": 99,
+                                "exclusiveMinimum": 0,
+                                "pattern": "^[0-9]+$",
+                                "default": 1,
+                                "x-google-hint": "keep me out"
+                            }
+                        }
+                    }
+                },
+                "mode": {
+                    "anyOf": [
+                        {"type": "string", "enum": ["fast", "slow"]},
+                        {"type": "null"}
+                    ]
+                }
+            }
+        });
+
+        let out = sanitize_gemini_schema(&schema);
+        let text = out.to_string();
+        for absent in [
+            "$schema",
+            "additionalProperties",
+            "exclusiveMinimum",
+            "x-google-hint",
+        ] {
+            assert!(
+                text.find(absent).is_none(),
+                "`{absent}` must be stripped: {text}"
+            );
+        }
+        // Supported constraints and unions survive.
+        let count = &out["properties"]["items"]["items"]["properties"]["count"];
+        assert_eq!(count["minimum"], 1);
+        assert_eq!(count["maximum"], 99);
+        assert_eq!(count["pattern"], "^[0-9]+$");
+        assert_eq!(count["default"], 1);
+        assert_eq!(
+            out["properties"]["mode"]["anyOf"].as_array().map(Vec::len),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn required_and_enum_values_are_untouched() {
+        // Array members are values (names, enum members), not keyword maps —
+        // a member that happens to spell a keyword must never be dropped.
+        let schema = serde_json::json!({
+            "type": "string",
+            "enum": ["format", "default", "pattern"],
+            "examples": ["format"]
+        });
+
+        let out = sanitize_gemini_schema(&schema);
+        assert_eq!(
+            out["enum"],
+            serde_json::json!(["format", "default", "pattern"])
+        );
+        assert!(out.get("examples").is_none());
+    }
+
+    #[test]
+    fn raw_tools_envelope_survives_sanitization() {
+        // The same-protocol passthrough runs the whole tools array through the
+        // sanitizer; the Gemini envelope (builtin tools included) must pass
+        // through structurally intact.
+        let tools = serde_json::json!([
+            {
+                "functionDeclarations": [
+                    {
+                        "name": "mcp__web-reader__webReader",
+                        "description": "Fetch and Convert URL",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "timeout": {"type": "integer", "format": "int32"}
+                            }
+                        }
+                    }
+                ]
+            },
+            {"googleSearch": {}}
+        ]);
+
+        let out = sanitize_gemini_schema(&tools);
+        let text = out.to_string();
+        assert!(text.find("\"format\"").is_none(), "format leaked: {text}");
+        assert_eq!(
+            out[0]["functionDeclarations"][0]["name"],
+            "mcp__web-reader__webReader"
+        );
+        assert_eq!(
+            out[0]["functionDeclarations"][0]["parameters"]["properties"]["timeout"]["type"],
+            "integer"
+        );
+        assert_eq!(out[1]["googleSearch"], serde_json::json!({}));
     }
 }

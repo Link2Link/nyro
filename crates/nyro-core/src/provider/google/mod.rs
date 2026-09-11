@@ -120,6 +120,75 @@ const METADATA: VendorMetadata = VendorMetadata {
 
 pub struct GoogleVendor;
 
+/// Operator-requested floor for explicitly supplied Google output budgets.
+/// Prevents reasoning tokens from consuming small client budgets (e.g. 64) and
+/// starving completion text before emission starts.
+/// This is an allowance, not a target length or a claim about model capacity.
+///
+/// Value must stay at or below the per-model output cap enforced by the
+/// upstream: the subscription `v1internal` surface rejects
+/// `maxOutputTokens=524288` with a generic `400 INVALID_ARGUMENT`
+/// (production incident 2026-09-11, request 235a9460-17d2-470f-932f-9dcd9cc08e63:
+/// every Google AI Pro request failed after the floor was deployed). 64_000 is
+/// proven accepted (hours of successful gemini-3.8-flash traffic sent exactly
+/// this value before the incident), while 512*1024 is proven rejected.
+const GOOGLE_OUTPUT_TOKEN_FLOOR: u64 = 64_000;
+
+pub(crate) fn apply_output_token_floor(body: &mut Value, vendor: Option<&str>) {
+    if vendor != Some("google") {
+        return;
+    }
+    let Some(object) = body.as_object_mut() else {
+        return;
+    };
+
+    // Case 1: Wire OpenAI-compatible chat completions format (e.g. generative language OpenAI endpoint or passthrough)
+    let chat_budget = object
+        .get("max_completion_tokens")
+        .filter(|value| !value.is_null())
+        .or_else(|| object.get("max_tokens"))
+        .and_then(Value::as_u64);
+    if let Some(budget) = chat_budget {
+        if object.contains_key("max_completion_tokens") {
+            object.insert(
+                "max_completion_tokens".into(),
+                Value::from(budget.max(GOOGLE_OUTPUT_TOKEN_FLOOR)),
+            );
+        }
+        if object.contains_key("max_tokens") {
+            object.insert(
+                "max_tokens".into(),
+                Value::from(budget.max(GOOGLE_OUTPUT_TOKEN_FLOOR)),
+            );
+        }
+    }
+
+    // Case 2: Wire Gemini generateContent format (`generationConfig.maxOutputTokens`)
+    // Both direct Gemini (`generationConfig`) and subscription envelope (`request.generationConfig`)
+    if let Some(config) = object
+        .get_mut("generationConfig")
+        .and_then(Value::as_object_mut)
+    {
+        if let Some(budget) = config.get("maxOutputTokens").and_then(Value::as_u64) {
+            config.insert(
+                "maxOutputTokens".into(),
+                Value::from(budget.max(GOOGLE_OUTPUT_TOKEN_FLOOR)),
+            );
+        }
+    } else if let Some(config) = object
+        .get_mut("request")
+        .and_then(|r| r.get_mut("generationConfig"))
+        .and_then(Value::as_object_mut)
+    {
+        if let Some(budget) = config.get("maxOutputTokens").and_then(Value::as_u64) {
+            config.insert(
+                "maxOutputTokens".into(),
+                Value::from(budget.max(GOOGLE_OUTPUT_TOKEN_FLOOR)),
+            );
+        }
+    }
+}
+
 #[async_trait]
 impl Vendor for GoogleVendor {
     fn scope(&self) -> VendorScope {
@@ -298,4 +367,104 @@ inventory::submit! { ExtensionRegistration { make: || Box::new(GoogleGeminiCliEx
 /// or gemini-cli) on the Code Assist v1internal surface.
 fn is_subscription_channel(provider: &crate::db::models::Provider) -> bool {
     antigravity::is_google_antigravity(provider) || gemini_cli::is_google_gemini_cli(provider)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn test_apply_output_token_floor_chat_format() {
+        let mut body = json!({
+            "model": "gemini-2.5-pro",
+            "max_completion_tokens": 64,
+            "max_tokens": 64
+        });
+        apply_output_token_floor(&mut body, Some("google"));
+        assert_eq!(body["max_completion_tokens"], 64_000);
+        assert_eq!(body["max_tokens"], 64_000);
+
+        // Budgets at the floor stay verbatim (proven-accepted upstream value)
+        let mut body2 = json!({
+            "max_completion_tokens": 64_000
+        });
+        apply_output_token_floor(&mut body2, Some("google"));
+        assert_eq!(body2["max_completion_tokens"], 64_000);
+
+        // Larger than floor is preserved
+        let mut body2 = json!({
+            "max_tokens": 1024 * 1024
+        });
+        apply_output_token_floor(&mut body2, Some("google"));
+        assert_eq!(body2["max_tokens"], 1024 * 1024);
+
+        // Missing tokens are untouched
+        let mut body3 = json!({
+            "model": "gemini-2.5-pro"
+        });
+        apply_output_token_floor(&mut body3, Some("google"));
+        assert!(body3.get("max_tokens").is_none());
+        assert!(body3.get("max_completion_tokens").is_none());
+    }
+
+    #[test]
+    fn test_apply_output_token_floor_gemini_format() {
+        // Direct Gemini generationConfig
+        let mut body = json!({
+            "contents": [{"parts": [{"text": "hi"}]}],
+            "generationConfig": {
+                "maxOutputTokens": 64
+            }
+        });
+        apply_output_token_floor(&mut body, Some("google"));
+        assert_eq!(body["generationConfig"]["maxOutputTokens"], 64_000);
+
+        // Antigravity wrapped request
+        let mut wrapped = json!({
+            "model": "gemini-3.8-flash-tiered",
+            "request": {
+                "contents": [{"parts": [{"text": "hi"}]}],
+                "generationConfig": {
+                    "maxOutputTokens": 64
+                }
+            }
+        });
+        apply_output_token_floor(&mut wrapped, Some("google"));
+        assert_eq!(
+            wrapped["request"]["generationConfig"]["maxOutputTokens"],
+            64_000
+        );
+
+        // Regression for the 2026-09-11 outage: a large explicit budget
+        // (DSH sends 64000) must never be raised past the upstream cap to
+        // 524288 — that produced a blanket 400 INVALID_ARGUMENT on the
+        // v1internal surface (request 235a9460-17d2-470f-932f-9dcd9cc08e63).
+        let mut production = json!({
+            "request": {
+                "contents": [{"parts": [{"text": "hi"}], "role": "user"}],
+                "generationConfig": {
+                    "maxOutputTokens": 64_000
+                }
+            }
+        });
+        apply_output_token_floor(&mut production, Some("google"));
+        assert_eq!(
+            production["request"]["generationConfig"]["maxOutputTokens"],
+            64_000
+        );
+        assert_ne!(
+            production["request"]["generationConfig"]["maxOutputTokens"],
+            512 * 1024
+        );
+
+        // Non-google vendor untouched
+        let mut other = json!({
+            "generationConfig": {
+                "maxOutputTokens": 64
+            }
+        });
+        apply_output_token_floor(&mut other, Some("openai"));
+        assert_eq!(other["generationConfig"]["maxOutputTokens"], 64);
+    }
 }
