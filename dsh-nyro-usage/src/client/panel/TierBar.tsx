@@ -7,11 +7,15 @@ import type { NyroTier } from '../../nyro.ts'
 import { countdownLabel, tt } from '../tt.ts'
 import css from './panel.module.css'
 
-/** Pretty-print a tier name: known windows localized, `feature:<f>:<w>`
- * rendered as "<Feature> · <window>", anything else humanized. */
+/** Pretty-print a tier name: known windows localized, the collapsed Google
+ * Gemini bucket labeled explicitly, `feature:<f>:<w>` rendered as
+ * "<Feature> · <window>", anything else humanized. */
 export function tierLabel(name: string): string {
   const known = ['five_hour', 'weekly_limit', 'monthly', 'primary_window', 'secondary_window'] as const
   type TierKey = `tier.${(typeof known)[number]}`
+  // Google folds every first-party Gemini family into one shared-bucket row
+  // named `gemini`; label it as the pool it stands for.
+  if (name === 'gemini') return tt('tier.gemini')
   const feature = /^feature:(.+):(five_hour|weekly_limit|monthly|primary_window|secondary_window)$/.exec(name)
   if (feature !== null) {
     const featureName = feature[1].replace(/[_-]+/g, ' ').replace(/\s+/g, ' ').trim()

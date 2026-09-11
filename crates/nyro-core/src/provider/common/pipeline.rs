@@ -457,6 +457,17 @@ where
     // 5e. Codex 消费级上游：规范化外来工具调用 ID 前缀（IR 转码路径）
     sanitize_codex_tool_call_ids(&mut body, ctx.provider);
     apply_vendor_effort_policy(&mut body, ctx.provider);
+    // 5f. google/antigravity 订阅表面：按客户端推理强度把基础模型 ID 改写为
+    // 目录中真实存在的档位变体（gemini-3.8-flash + high → gemini-3.8-flash-high）
+    crate::provider::google::antigravity::apply_tier_model_rewrite(
+        ctx.provider,
+        ctx.credential,
+        &req.reasoning,
+        &mut body,
+    );
+    // 5g. google 订阅表面（Gemini 3+）：functionCall 历史缺 thoughtSignature
+    // 会被上游 400 拒绝；按 CLIProxyAPI 策略补旁路哨兵。
+    crate::provider::google::antigravity::apply_thought_signature_policy(ctx.provider, &mut body);
 
     // 6. auth headers
     //
@@ -961,7 +972,7 @@ mod tests {
             name: "p-antigravity".into(),
             vendor: Some("google".into()),
             protocol: "google-gemini".into(),
-            base_url: "https://cloudcode-pa.googleapis.com".into(),
+            base_url: crate::provider::google::antigravity::ANTIGRAVITY_INFERENCE_BASE_URL.into(),
             protocol_mode: "fixed".into(),
             protocol_endpoints: Vec::new(),
             preset_key: Some("google".into()),
@@ -1027,7 +1038,7 @@ mod tests {
         ProviderCtx {
             provider,
             protocol: GOOGLE_GEMINI_GENERATE_CONTENT_V1BETA,
-            egress_base_url: "https://cloudcode-pa.googleapis.com",
+            egress_base_url: crate::provider::google::antigravity::ANTIGRAVITY_INFERENCE_BASE_URL,
             api_key: "ya29.access",
             auth_scheme: "auto",
             actual_model: "gemini-2.5-pro",
@@ -1053,7 +1064,10 @@ mod tests {
         // v1internal action path, no ?key= leak.
         assert_eq!(
             out.url,
-            "https://cloudcode-pa.googleapis.com/v1internal:generateContent"
+            format!(
+                "{}/v1internal:generateContent",
+                crate::provider::google::antigravity::ANTIGRAVITY_INFERENCE_BASE_URL
+            )
         );
         // Envelope fields.
         assert_eq!(out.body["model"], "gemini-2.5-pro");
@@ -1084,8 +1098,135 @@ mod tests {
             .expect("build_request succeeds");
         assert_eq!(
             out.url,
-            "https://cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse"
+            format!(
+                "{}/v1internal:streamGenerateContent?alt=sse",
+                crate::provider::google::antigravity::ANTIGRAVITY_INFERENCE_BASE_URL
+            )
         );
+    }
+
+    #[tokio::test]
+    async fn antigravity_channel_effort_rewrites_base_model_to_tier_variant() {
+        let gw = build_test_gateway().await;
+        let provider = antigravity_provider();
+        // Account catalog snapshot in the credential meta powers the
+        // catalog-gated effort → tier-id rewrite.
+        let credential = crate::auth::types::StoredCredential {
+            access_token: Some("ya29.access".into()),
+            refresh_token: Some("1//refresh".into()),
+            meta: serde_json::json!({
+                "project_id": "cloudaicompanion-1",
+                "email": "u@example.com",
+                "subscription_models": [
+                    "gemini-3.8-flash-low", "gemini-3.8-flash-medium",
+                    "gemini-3.8-flash-high", "gemini-3.8-flash-tiered",
+                ],
+            }),
+            ..Default::default()
+        };
+        let mut req = minimal_chat_request();
+        req.meta.source_protocol = Some(GOOGLE_GEMINI_GENERATE_CONTENT_V1BETA);
+        req.reasoning = crate::protocol::ir::ReasoningConfig {
+            enabled: true,
+            budget_tokens: None,
+            effort: Some(crate::protocol::ir::ReasoningEffort::High),
+            display: None,
+        };
+        let ctx = ProviderCtx {
+            provider: &provider,
+            protocol: GOOGLE_GEMINI_GENERATE_CONTENT_V1BETA,
+            egress_base_url: crate::provider::google::antigravity::ANTIGRAVITY_INFERENCE_BASE_URL,
+            api_key: "ya29.access",
+            auth_scheme: "auto",
+            actual_model: "gemini-3.8-flash",
+            force_max_reasoning: false,
+            credential: Some(&credential),
+            gw: &gw,
+            disable_default_auth: true,
+        };
+        let out = build_request(&crate::provider::google::GoogleVendor, &mut req, &ctx)
+            .await
+            .expect("build_request succeeds");
+        // Base id + effort=high → the tier variant the account serves.
+        assert_eq!(out.body["model"], "gemini-3.8-flash-high");
+        assert_eq!(out.body["project"], "cloudaicompanion-1");
+        // The tier id carries the effort; the inner thinkingConfig is gone.
+        assert!(
+            out.body["request"]["generationConfig"]
+                .get("thinkingConfig")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn antigravity_channel_fills_thought_signature_on_tool_history() {
+        use crate::protocol::ir::request::ToolCallKind;
+        use crate::protocol::ir::{Message, MessageContent, Role};
+        let gw = build_test_gateway().await;
+        let provider = antigravity_provider();
+        let credential = antigravity_credential();
+        // OpenAI-protocol history: assistant tool call + tool result. The
+        // signature cannot ride the client protocol, so nyro must replay the
+        // Gemini bypass sentinel or upstream rejects the turn with
+        // `Function call is missing a thought_signature in functionCall parts`.
+        let mut req = minimal_chat_request();
+        req.messages.push(Message {
+            role: Role::Assistant,
+            content: MessageContent::Text(String::new()),
+            tool_calls: Some(vec![crate::protocol::ir::request::ToolCall {
+                id: "call_1".into(),
+                name: "bash".into(),
+                namespace: None,
+                kind: ToolCallKind::Function,
+                arguments: "{\"cmd\":\"ls\"}".into(),
+            }]),
+            tool_call_id: None,
+            meta: None,
+        });
+        req.messages.push(Message {
+            role: Role::Tool,
+            content: MessageContent::Text("a.txt".into()),
+            tool_calls: None,
+            tool_call_id: Some("call_1".into()),
+            meta: None,
+        });
+        req.meta.source_protocol = Some(OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1);
+        let ctx = ProviderCtx {
+            provider: &provider,
+            protocol: GOOGLE_GEMINI_GENERATE_CONTENT_V1BETA,
+            egress_base_url: crate::provider::google::antigravity::ANTIGRAVITY_INFERENCE_BASE_URL,
+            api_key: "ya29.access",
+            auth_scheme: "auto",
+            actual_model: "gemini-3.8-flash-tiered",
+            force_max_reasoning: false,
+            credential: Some(&credential),
+            gw: &gw,
+            disable_default_auth: true,
+        };
+        let out = build_request(&crate::provider::google::GoogleVendor, &mut req, &ctx)
+            .await
+            .expect("build_request succeeds");
+
+        let contents = out.body["request"]["contents"]
+            .as_array()
+            .expect("gemini contents");
+        let call_part = contents
+            .iter()
+            .filter(|content| content["role"] == "model")
+            .flat_map(|content| content["parts"].as_array().cloned().unwrap_or_default())
+            .find(|part| part.get("functionCall").is_some())
+            .expect("history keeps the functionCall part");
+        assert_eq!(
+            call_part["thoughtSignature"],
+            crate::provider::google::antigravity::GEMINI_SKIP_THOUGHT_SIGNATURE_VALIDATOR
+        );
+        // The matching functionResponse never carries a signature.
+        let response_part = contents
+            .iter()
+            .flat_map(|content| content["parts"].as_array().cloned().unwrap_or_default())
+            .find(|part| part.get("functionResponse").is_some())
+            .expect("history keeps the functionResponse part");
+        assert!(response_part.get("thoughtSignature").is_none());
     }
 
     #[tokio::test]
@@ -1142,6 +1283,136 @@ mod tests {
             ai.content
         );
         assert_eq!(ai.usage.completion_tokens, 5);
+    }
+
+    // ── google/gemini-cli (Code Assist) channel ────────────────────────────────
+
+    fn gemini_cli_provider() -> Provider {
+        Provider {
+            id: "p-gemini-cli".into(),
+            name: "p-gemini-cli".into(),
+            vendor: Some("google".into()),
+            protocol: "google-gemini".into(),
+            base_url: "https://cloudcode-pa.googleapis.com".into(),
+            protocol_mode: "fixed".into(),
+            protocol_endpoints: Vec::new(),
+            preset_key: Some("google".into()),
+            channel: Some("gemini-cli".into()),
+            models_source: None,
+            static_models: None,
+            api_key: String::new(),
+            auth_mode: "oauth".into(),
+            use_proxy: false,
+            fast_mode: false,
+            last_test_success: None,
+            last_test_at: None,
+            is_enabled: true,
+            created_at: String::new(),
+            updated_at: String::new(),
+        }
+    }
+
+    fn gemini_cli_ctx<'a>(
+        provider: &'a Provider,
+        credential: Option<&'a crate::auth::types::StoredCredential>,
+        gw: &'a Gateway,
+    ) -> ProviderCtx<'a> {
+        ProviderCtx {
+            provider,
+            protocol: GOOGLE_GEMINI_GENERATE_CONTENT_V1BETA,
+            egress_base_url: "https://cloudcode-pa.googleapis.com",
+            api_key: "ya29.access",
+            auth_scheme: "auto",
+            actual_model: "gemini-3.6-flash",
+            force_max_reasoning: false,
+            credential,
+            gw,
+            disable_default_auth: true,
+        }
+    }
+
+    #[tokio::test]
+    async fn gemini_cli_channel_build_request_wraps_slim_envelope() {
+        let gw = build_test_gateway().await;
+        let provider = gemini_cli_provider();
+        let credential = antigravity_credential();
+        let mut req = minimal_chat_request();
+        req.meta.source_protocol = Some(GOOGLE_GEMINI_GENERATE_CONTENT_V1BETA);
+        let ctx = gemini_cli_ctx(&provider, Some(&credential), &gw);
+        let out = build_request(&crate::provider::google::GoogleVendor, &mut req, &ctx)
+            .await
+            .expect("build_request succeeds");
+
+        // Same v1internal action path as antigravity, but the gemini-cli
+        // channel (GCP Code Assist) keeps the prod inference host.
+        assert_eq!(
+            out.url,
+            "https://cloudcode-pa.googleapis.com/v1internal:generateContent"
+        );
+        // Slim envelope: model + project + request only.
+        assert_eq!(out.body["model"], "gemini-3.6-flash");
+        assert_eq!(out.body["project"], "cloudaicompanion-1");
+        assert!(out.body["request"]["contents"].is_array());
+        for key in ["requestType", "userAgent", "requestId"] {
+            assert!(out.body.get(key).is_none(), "unexpected {key} in envelope");
+        }
+        // No sessionId injection on this dialect.
+        assert!(out.body["request"].get("sessionId").is_none());
+    }
+
+    #[tokio::test]
+    async fn gemini_cli_channel_missing_project_id_fails_loudly() {
+        let gw = build_test_gateway().await;
+        let provider = gemini_cli_provider();
+        let credential = crate::auth::types::StoredCredential {
+            access_token: Some("ya29.access".into()),
+            ..Default::default()
+        };
+        let mut req = minimal_chat_request();
+        req.meta.source_protocol = Some(GOOGLE_GEMINI_GENERATE_CONTENT_V1BETA);
+        let ctx = gemini_cli_ctx(&provider, Some(&credential), &gw);
+        let error = build_request(&crate::provider::google::GoogleVendor, &mut req, &ctx)
+            .await
+            .expect_err("missing project_id must fail the build");
+        assert!(
+            error.to_string().contains("project_id"),
+            "error should mention project_id: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn gemini_cli_channel_parse_response_unwraps_envelope() {
+        let gw = build_test_gateway().await;
+        let provider = gemini_cli_provider();
+        let credential = antigravity_credential();
+        let mut req = minimal_chat_request();
+        req.meta.source_protocol = Some(GOOGLE_GEMINI_GENERATE_CONTENT_V1BETA);
+        let ctx = gemini_cli_ctx(&provider, Some(&credential), &gw);
+        let body = serde_json::json!({
+            "response": {
+                "candidates": [{
+                    "content": {"role": "model", "parts": [{"text": "hi from code assist"}]},
+                    "finishReason": "STOP",
+                }],
+                "usageMetadata": {
+                    "promptTokenCount": 3,
+                    "candidatesTokenCount": 4,
+                },
+            },
+        });
+        let ai = parse_response(
+            &crate::provider::google::GoogleVendor,
+            InboundResponse { status: 200, body },
+            &ctx,
+        )
+        .await
+        .expect("parse_response succeeds");
+        assert!(
+            ai.content.contains("hi from code assist"),
+            "content: {:?}",
+            ai.content
+        );
+        assert_eq!(ai.usage.completion_tokens, 4);
     }
 
     #[tokio::test]

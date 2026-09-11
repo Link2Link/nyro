@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use crate::auth::drivers::{
-    ClaudeOAuthDriver, GoogleAntigravityDriver, GrokOAuthDriver, OpenAIOAuthDriver,
+    ClaudeOAuthDriver, GoogleSubscriptionDriver, GrokOAuthDriver, OpenAIOAuthDriver,
 };
 use crate::auth::types::{AuthDriver, AuthDriverMetadata};
 
@@ -14,7 +14,11 @@ pub fn normalize_driver_key(value: &str) -> String {
             "grok".to_string()
         }
         "google" | "google-antigravity" | "google_antigravity" | "antigravity"
-        | "google-ai-pro" | "gemini" => "google".to_string(),
+        | "google-ai-pro" => "google".to_string(),
+        "google-gemini-cli" | "google_gemini_cli" | "gemini-cli" | "gemini_cli" | "gemini"
+        | "gemini-cli-oauth" | "gemini_cli_oauth" | "code-assist" | "codeassist" => {
+            "google-gemini-cli".to_string()
+        }
         other => other.to_string(),
     }
 }
@@ -24,7 +28,8 @@ pub fn build_driver(key: &str) -> Option<Arc<dyn AuthDriver>> {
         "codex" => Some(Arc::new(OpenAIOAuthDriver)),
         "claude-code" => Some(Arc::new(ClaudeOAuthDriver)),
         "grok" => Some(Arc::new(GrokOAuthDriver)),
-        "google" => Some(Arc::new(GoogleAntigravityDriver)),
+        "google" => Some(Arc::new(GoogleSubscriptionDriver::ANTIGRAVITY)),
+        "google-gemini-cli" => Some(Arc::new(GoogleSubscriptionDriver::GEMINI_CLI)),
         _ => None,
     }
 }
@@ -35,6 +40,7 @@ pub fn list_driver_metadata() -> Vec<AuthDriverMetadata> {
         build_driver("claude-code"),
         build_driver("grok"),
         build_driver("google"),
+        build_driver("google-gemini-cli"),
     ]
     .into_iter()
     .flatten()
@@ -61,10 +67,32 @@ mod tests {
             "Google",
             "antigravity",
             "google-antigravity",
-            "gemini",
+            "google-ai-pro",
         ] {
             assert_eq!(normalize_driver_key(alias), "google", "alias {alias}");
             assert_eq!(build_driver(alias).unwrap().metadata().key, "google");
+        }
+    }
+
+    #[test]
+    fn gemini_cli_aliases_normalize_to_gemini_cli_driver() {
+        for alias in [
+            "gemini",
+            "Gemini",
+            "gemini-cli",
+            "gemini_cli",
+            "google-gemini-cli",
+            "code-assist",
+        ] {
+            assert_eq!(
+                normalize_driver_key(alias),
+                "google-gemini-cli",
+                "alias {alias}"
+            );
+            assert_eq!(
+                build_driver(alias).unwrap().metadata().key,
+                "google-gemini-cli"
+            );
         }
     }
 
@@ -75,5 +103,6 @@ mod tests {
         assert!(keys.contains(&"codex"));
         assert!(keys.contains(&"claude-code"));
         assert!(keys.contains(&"google"));
+        assert!(keys.contains(&"google-gemini-cli"));
     }
 }

@@ -90,6 +90,7 @@ const TIER_LABELS_ZH: Record<string, string> = {
   monthly: "每月",
   primary_window: "主要窗口",
   secondary_window: "次要窗口",
+  gemini: "Gemini 共享池",
 };
 const TIER_LABELS_EN: Record<string, string> = {
   five_hour: "5h",
@@ -97,6 +98,7 @@ const TIER_LABELS_EN: Record<string, string> = {
   monthly: "Monthly",
   primary_window: "Primary Window",
   secondary_window: "Secondary Window",
+  gemini: "Gemini Shared Pool",
 };
 
 function readableFeatureName(value: string): string {
@@ -303,6 +305,9 @@ export function ProviderUsageFooter({ provider }: { provider: Provider }) {
     .join(", ");
   const isBalanceView = shown?.kind.endsWith("_balance") ?? false;
   const isCodex = shown?.kind === "openai_codex";
+  // The Google subscription backend reports the shared Gemini bucket alone, so
+  // this card carries a single "Gemini shared pool" row.
+  const isGoogleSubscription = shown?.kind === "google_subscription";
   const title = isBalanceView
     ? isZh
       ? "账户余额"
@@ -311,9 +316,13 @@ export function ProviderUsageFooter({ provider }: { provider: Provider }) {
       ? isZh
         ? "ChatGPT Codex 用量"
         : "ChatGPT Codex Usage"
-      : isZh
-        ? "套餐用量"
-        : "Plan Usage";
+      : isGoogleSubscription
+        ? isZh
+          ? "Google AI Pro 配额"
+          : "Google AI Pro Quota"
+        : isZh
+          ? "套餐用量"
+          : "Plan Usage";
 
   return (
     <div className="mt-3 space-y-2 rounded-xl border border-slate-200/70 bg-white/40 px-3 py-2.5">

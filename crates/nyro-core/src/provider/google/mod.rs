@@ -1,6 +1,7 @@
-//! Google vendor (Gemini direct API + Antigravity subscription channel).
+//! Google vendor (Gemini direct API + Google subscription channels).
 
 pub(crate) mod antigravity;
+pub(crate) mod gemini_cli;
 
 use async_trait::async_trait;
 use reqwest::header::HeaderMap;
@@ -65,8 +66,9 @@ const METADATA: VendorMetadata = VendorMetadata {
                 base_url: "https://cloudcode-pa.googleapis.com",
             }],
             api_key: None,
-            // The v1internal surface has no public /models endpoint; the
-            // curated static list is the catalog (see antigravity module).
+            // The v1internal surface has no public /models endpoint; models
+            // are discovered per-account via `fetchAvailableModels` with the
+            // curated static list as fallback (see antigravity module).
             models_source: None,
             capabilities_source: CapabilitiesSource::ModelsDev("google"),
             static_models: antigravity::ANTIGRAVITY_STATIC_MODELS,
@@ -78,6 +80,36 @@ const METADATA: VendorMetadata = VendorMetadata {
                 client_id: antigravity::ANTIGRAVITY_OAUTH_CLIENT_ID,
                 redirect_uri: antigravity::ANTIGRAVITY_REDIRECT_URI,
                 scope: antigravity::ANTIGRAVITY_OAUTH_SCOPES,
+            }),
+            runtime: None,
+            shared_key_protocols: false,
+            auth_schemes: None,
+        },
+        ChannelDef {
+            id: "gemini-cli",
+            label: Label {
+                zh: "Gemini CLI（Code Assist）",
+                en: "Gemini CLI (Code Assist)",
+            },
+            base_urls: &[ProtocolBaseUrl {
+                protocol: "google-gemini",
+                base_url: "https://cloudcode-pa.googleapis.com",
+            }],
+            api_key: None,
+            // Same v1internal surface as antigravity: per-account
+            // `fetchAvailableModels` discovery with a curated fallback (see
+            // gemini_cli module).
+            models_source: None,
+            capabilities_source: CapabilitiesSource::ModelsDev("google"),
+            static_models: gemini_cli::GEMINI_CLI_STATIC_MODELS,
+            auth_mode: AuthMode::OAuth,
+            oauth: Some(OAuthConfig {
+                auth_base_url: "https://accounts.google.com",
+                authorize_url: "https://accounts.google.com/o/oauth2/v2/auth",
+                token_url: "https://oauth2.googleapis.com/token",
+                client_id: gemini_cli::GEMINI_CLI_OAUTH_CLIENT_ID,
+                redirect_uri: gemini_cli::GEMINI_CLI_REDIRECT_URI,
+                scope: gemini_cli::GEMINI_CLI_OAUTH_SCOPES,
             }),
             runtime: None,
             shared_key_protocols: false,
@@ -99,8 +131,8 @@ impl Vendor for GoogleVendor {
         Some(&METADATA)
     }
     fn build_url(&self, ctx: &VendorCtx<'_>, base_url: &str, path: &str) -> String {
-        if antigravity::is_antigravity_channel(ctx.provider) {
-            // Canonicalized again by the channel-scoped GoogleAntigravityExt;
+        if is_subscription_channel(ctx.provider) {
+            // Canonicalized again by the channel-scoped v1internal exts;
             // kept here so direct calls produce the right path too.
             return antigravity::build_v1internal_url(base_url, path);
         }
@@ -122,13 +154,13 @@ impl Vendor for GoogleVendor {
         false
     }
     fn declared_request_mutations_for(&self, provider: &crate::db::models::Provider) -> bool {
-        antigravity::is_antigravity_channel(provider)
+        is_subscription_channel(provider)
     }
     fn declared_response_mutations(&self) -> bool {
         false
     }
     fn declared_response_mutations_for(&self, provider: &crate::db::models::Provider) -> bool {
-        antigravity::is_antigravity_channel(provider)
+        is_subscription_channel(provider)
     }
     async fn post_encode(
         &self,
@@ -136,18 +168,24 @@ impl Vendor for GoogleVendor {
         body: &mut Value,
         _headers: &mut HeaderMap,
     ) -> anyhow::Result<()> {
-        if !antigravity::is_antigravity_channel(ctx.provider) {
-            return Ok(());
-        }
         // Wrap the standard Gemini body into the v1internal envelope the
-        // Antigravity (Google AI Pro subscription) surface expects.
-        let project_id = antigravity::antigravity_project_id(ctx.credential)?;
-        let model = ctx.actual_model.to_string();
-        *body = antigravity::wrap_request(std::mem::take(body), &model, &project_id);
+        // subscription surface expects. The antigravity channel uses the
+        // full IDE fingerprint envelope; gemini-cli uses the slim Code
+        // Assist dialect. (Effort-aware tier model selection lives in the
+        // pipeline, see apply_tier_model_rewrite.)
+        if antigravity::is_google_antigravity(ctx.provider) {
+            let project_id = antigravity::code_assist_project_id(ctx.credential)?;
+            let model = ctx.actual_model.to_string();
+            *body = antigravity::wrap_request(std::mem::take(body), &model, &project_id);
+        } else if gemini_cli::is_google_gemini_cli(ctx.provider) {
+            let project_id = antigravity::code_assist_project_id(ctx.credential)?;
+            let model = ctx.actual_model.to_string();
+            *body = gemini_cli::wrap_request(std::mem::take(body), &model, &project_id);
+        }
         Ok(())
     }
     async fn pre_parse(&self, ctx: &VendorCtx<'_>, resp: &mut Value) -> anyhow::Result<()> {
-        if !antigravity::is_antigravity_channel(ctx.provider) {
+        if !is_subscription_channel(ctx.provider) {
             return Ok(());
         }
         antigravity::unwrap_response(resp);
@@ -158,7 +196,7 @@ impl Vendor for GoogleVendor {
         ctx: &VendorCtx<'_>,
         chunk: &mut String,
     ) -> anyhow::Result<()> {
-        if !antigravity::is_antigravity_channel(ctx.provider) {
+        if !is_subscription_channel(ctx.provider) {
             return Ok(());
         }
         // Every SSE data line carries the v1internal {"response": …} envelope;
@@ -236,3 +274,28 @@ impl VendorExtension for GoogleAntigravityExt {
 }
 
 inventory::submit! { ExtensionRegistration { make: || Box::new(GoogleAntigravityExt) } }
+
+/// Channel-scoped URL canonicalizer for google/gemini-cli: same v1internal
+/// rewrite as the antigravity channel — both subscription channels share the
+/// Code Assist host and action paths.
+pub struct GoogleGeminiCliExt;
+
+impl VendorExtension for GoogleGeminiCliExt {
+    fn scope(&self) -> VendorScope {
+        VendorScope::Channel {
+            vendor_id: "google",
+            channel_id: "gemini-cli",
+        }
+    }
+    fn build_url(&self, _ctx: &VendorCtx<'_>, base_url: &str, path: &str) -> String {
+        antigravity::build_v1internal_url(base_url, path)
+    }
+}
+
+inventory::submit! { ExtensionRegistration { make: || Box::new(GoogleGeminiCliExt) } }
+
+/// True when the provider rides a Google subscription channel (antigravity
+/// or gemini-cli) on the Code Assist v1internal surface.
+fn is_subscription_channel(provider: &crate::db::models::Provider) -> bool {
+    antigravity::is_google_antigravity(provider) || gemini_cli::is_google_gemini_cli(provider)
+}

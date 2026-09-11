@@ -59,3 +59,6 @@ venv/
 .antigravitycli
 .claude
 .cursor
+dsh-nyro-usage/node_modules/
+dsh-nyro-usage/lib/tsconfig.tsbuildinfo
+dsh-nyro-usage/lib/types/

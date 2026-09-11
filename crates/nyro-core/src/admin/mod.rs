@@ -72,6 +72,14 @@ pub struct ProviderOAuthStatusData {
     pub expires_at: Option<String>,
     pub resource_url: Option<String>,
     pub subject_id: Option<String>,
+    /// Subscription tier recorded at login (Google subscription channels,
+    /// e.g. `free-tier` / `g1-pro-tier` / `g1-ultra-tier`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tier_id: Option<String>,
+    /// Companion project id the requests ride on (Google subscription
+    /// channels; consumer-tier accounts get a shared `aicode-consumers`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
     pub last_error: Option<String>,
     pub updated_at: Option<String>,
     pub has_refresh_token: bool,

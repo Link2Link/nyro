@@ -21,6 +21,18 @@ fn validate_oauth_session_for_provider(
                 .filter(|value| !value.is_empty())
         })
         .ok_or_else(|| anyhow::anyhow!("target provider has no OAuth vendor"))?;
+    // The google vendor carries two subscription channels with distinct
+    // OAuth clients; the channel picks the driver.
+    let expected_driver = if expected_driver == "google"
+        && provider
+            .channel
+            .as_deref()
+            .is_some_and(|value| value.eq_ignore_ascii_case("gemini-cli"))
+    {
+        "google-gemini-cli".to_string()
+    } else {
+        expected_driver
+    };
     let session_driver = auth::normalize_driver_key(&session.driver_key);
     if session_driver != expected_driver {
         anyhow::bail!(
@@ -84,6 +96,19 @@ fn validate_oauth_session_for_provider(
                 .is_some_and(|value| value.eq_ignore_ascii_case("google")))
     {
         anyhow::bail!("Google OAuth session can only bind to the google/antigravity channel");
+    }
+    if session_driver == "google-gemini-cli"
+        && (provider.protocol.trim() != "google-gemini"
+            || !provider
+                .channel
+                .as_deref()
+                .is_some_and(|value| value.eq_ignore_ascii_case("gemini-cli"))
+            || !provider
+                .preset_key
+                .as_deref()
+                .is_some_and(|value| value.eq_ignore_ascii_case("google")))
+    {
+        anyhow::bail!("Gemini CLI OAuth session can only bind to the google/gemini-cli channel");
     }
     Ok(())
 }
@@ -473,6 +498,14 @@ impl AdminService {
             input.base_url = "https://cloudcode-pa.googleapis.com".to_string();
             // The OAuth runtime binding owns auth/headers; adaptive
             // multi-endpoint mode would reset it per request.
+            input.protocol_mode = "fixed".to_string();
+        }
+        if session_driver == "google-gemini-cli" {
+            input.vendor = Some("google".to_string());
+            input.preset_key = Some("google".to_string());
+            input.channel = Some("gemini-cli".to_string());
+            input.protocol = "google-gemini".to_string();
+            input.base_url = "https://cloudcode-pa.googleapis.com".to_string();
             input.protocol_mode = "fixed".to_string();
         }
         input.auth_mode = "oauth".to_string();

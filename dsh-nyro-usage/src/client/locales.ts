@@ -36,6 +36,7 @@ export const zh = {
   'tier.monthly': '每月',
   'tier.primary_window': '主要窗口',
   'tier.secondary_window': '次要窗口',
+  'tier.gemini': 'Gemini 共享池',
   'tier.feature': '{feature} · {window}',
   'tier.pace': '匀速参考线：{percent}%（按整窗匀速使用推进）',
   // settings card
@@ -106,6 +107,7 @@ export const en: Record<NyroUsageKey, string> = {
   'tier.monthly': 'Monthly',
   'tier.primary_window': 'Primary window',
   'tier.secondary_window': 'Secondary window',
+  'tier.gemini': 'Gemini shared pool',
   'tier.feature': '{feature} · {window}',
   'tier.pace': 'Steady pace: {percent}% (even consumption over the window)',
   'settings.title': 'Nyro Usage',

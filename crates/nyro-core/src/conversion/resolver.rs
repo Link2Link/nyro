@@ -152,11 +152,15 @@ pub(crate) fn supports_raw_wire_compat(
         .as_deref()
         .map(str::trim)
         .unwrap_or_default();
-    // google/antigravity (Code Assist v1internal) rewraps the wire envelope
-    // through vendor hooks and unwraps every SSE line on the way back; the
-    // raw-wire compat path bypasses those response hooks, so force the
-    // channel onto the IR pipeline which applies them.
-    if vendor_id.eq_ignore_ascii_case("google") && channel.eq_ignore_ascii_case("antigravity") {
+    // google subscription channels (antigravity + gemini-cli, Code Assist
+    // v1internal) rewrap the wire envelope through vendor hooks and unwrap
+    // every SSE line on the way back; the raw-wire compat path bypasses
+    // those response hooks, so force the channel onto the IR pipeline which
+    // applies them.
+    if vendor_id.eq_ignore_ascii_case("google")
+        && (channel.eq_ignore_ascii_case("antigravity")
+            || channel.eq_ignore_ascii_case("gemini-cli"))
+    {
         return false;
     }
     let openai_native =

@@ -22,6 +22,13 @@ pub struct ProviderModelProbeResult {
     /// Assistant text received for the "hi" probe (success only).
     /// The value "[completed]" means the upstream completed without displayable text.
     pub reply: Option<String>,
+    /// Remaining quota fraction (0.0–1.0) reported by the subscription
+    /// catalog, when available (Google subscription channels).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quota_remaining: Option<f64>,
+    /// When the model's quota window resets (ISO-8601), when reported.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quota_resets_at: Option<String>,
 }
 
 /// Which protocol/base_url the probe ran through (reported once per run).
@@ -189,15 +196,19 @@ fn build_gemini_model_probe_request(
     });
 
     let is_antigravity = channel.is_some_and(|value| value.eq_ignore_ascii_case("antigravity"));
-    if is_antigravity {
+    let is_gemini_cli = channel.is_some_and(|value| value.eq_ignore_ascii_case("gemini-cli"));
+    if is_antigravity || is_gemini_cli {
         let project_id = antigravity_project.ok_or_else(|| {
             anyhow::anyhow!(
-                "google/antigravity credential is missing project_id; \
+                "google subscription credential is missing project_id; \
 re-login the provider to re-run onboarding"
             )
         })?;
-        let body =
-            crate::provider::google::antigravity::wrap_request(inner_body, model, project_id);
+        let body = if is_antigravity {
+            crate::provider::google::antigravity::wrap_request(inner_body, model, project_id)
+        } else {
+            crate::provider::google::gemini_cli::wrap_request(inner_body, model, project_id)
+        };
         return Ok((
             format!("{base}/v1internal:streamGenerateContent?alt=sse"),
             headers,
@@ -265,6 +276,12 @@ async fn probe_single_model(
                 " — Google is gating this account: open https://antigravity.google \
                  (or gemini.google.com) in a browser with the SAME Google account \
                  and complete the verification prompt, then retry the test."
+            } else if status.as_u16() == 429 {
+                " — quota/entitlement gate: if the quota readout shows plenty \
+                 remaining, this account's subscription tier does not include \
+                 the model (Google returns RESOURCE_EXHAUSTED for tier-gated \
+                 models too); otherwise the per-model quota window is spent \
+                 and resets automatically."
             } else {
                 ""
             };
@@ -289,6 +306,9 @@ async fn probe_single_model(
         latency_ms: start.elapsed().as_millis() as u64,
         protocol: protocol_id.to_string(),
         reply,
+        // Overridden by the caller with catalog state when available.
+        quota_remaining: None,
+        quota_resets_at: None,
     }
 }
 
@@ -1734,48 +1754,160 @@ impl AdminService {
     /// catalog (newer models appear here before any static list ships).
     /// Best-effort callers retain the curated fallback; strict directory callers
     /// must not confuse failed discovery with a successful static catalog.
-    async fn antigravity_available_models(
+    async fn google_subscription_available_models(
         &self,
         provider: &Provider,
         runtime: Option<&ResolvedProviderRuntime>,
         require_catalog: bool,
     ) -> anyhow::Result<Option<Vec<String>>> {
-        if !crate::provider::google::antigravity::is_google_antigravity(provider) {
+        Ok(self
+            .google_subscription_catalog(provider, runtime, require_catalog)
+            .await?
+            .map(|catalog| catalog.into_iter().map(|model| model.id).collect()))
+    }
+
+    /// Raw per-account catalog (ids + per-model quota state) for the Google
+    /// subscription channels. Shared by discovery (ids) and the model probe
+    /// (quota annotation). `None` for non-subscription providers or a
+    /// best-effort failure; `require_catalog` turns failure into an error.
+    async fn google_subscription_catalog(
+        &self,
+        provider: &Provider,
+        runtime: Option<&ResolvedProviderRuntime>,
+        require_catalog: bool,
+    ) -> anyhow::Result<Option<Vec<crate::provider::google::antigravity::AvailableModel>>> {
+        // Per-account discovery applies to both Google subscription channels
+        // (antigravity + gemini-cli); the client fingerprint differs.
+        let is_antigravity = crate::provider::google::antigravity::is_google_antigravity(provider);
+        let is_gemini_cli = crate::provider::google::gemini_cli::is_google_gemini_cli(provider);
+        if !is_antigravity && !is_gemini_cli {
             return Ok(None);
         }
+        let channel_label = if is_antigravity {
+            "antigravity"
+        } else {
+            "gemini-cli"
+        };
+        let user_agent = if is_antigravity {
+            crate::provider::google::antigravity::antigravity_user_agent()
+        } else {
+            crate::provider::google::gemini_cli::GEMINI_CLI_USER_AGENT.to_string()
+        };
         let discovery = async {
-            let runtime = runtime.context("Antigravity runtime unavailable")?;
+            let runtime = runtime.context("Google subscription runtime unavailable")?;
             let credential = runtime
                 .credential
                 .as_ref()
-                .context("Antigravity credential unavailable")?;
+                .context("Google subscription credential unavailable")?;
             let project_id =
-                crate::provider::google::antigravity::antigravity_project_id(Some(credential))?;
+                crate::provider::google::antigravity::code_assist_project_id(Some(credential))?;
             let token = runtime.access_token.trim();
-            anyhow::ensure!(!token.is_empty(), "Antigravity access token unavailable");
+            anyhow::ensure!(
+                !token.is_empty(),
+                "Google subscription access token unavailable"
+            );
             let client = self.gw.http_client_for_provider(provider.use_proxy).await?;
             crate::provider::google::antigravity::fetch_available_models(
                 &client,
                 token,
                 &project_id,
+                &user_agent,
             )
             .await
         }
         .await;
         match discovery {
-            Ok(models) if require_catalog || !models.is_empty() => Ok(Some(models)),
+            Ok(models) if require_catalog || !models.is_empty() => {
+                // Self-heal the dispatch-side catalog snapshot: the effort→tier
+                // rewrite reads `subscription_models` from the credential meta,
+                // and that snapshot otherwise only lands on a token refresh.
+                let ids: Vec<String> = models.iter().map(|model| model.id.clone()).collect();
+                self.persist_subscription_catalog_snapshot(provider, &ids)
+                    .await;
+                Ok(Some(models))
+            }
             Ok(_) => Ok(None),
             Err(_) if require_catalog => {
-                anyhow::bail!("Antigravity model catalog could not be loaded")
+                anyhow::bail!("Google subscription model catalog could not be loaded")
             }
             Err(error) => {
                 tracing::warn!(
                     %error,
                     provider = %provider.id,
-                    "antigravity fetchAvailableModels failed; falling back to the static model list"
+                    "{channel_label} fetchAvailableModels failed; falling back to the static model list"
                 );
                 Ok(None)
             }
+        }
+    }
+
+    /// Best-effort write of the discovered antigravity catalog into the
+    /// credential meta (`subscription_models`) so the pipeline effort→tier
+    /// rewrite is armed without waiting for the next token refresh.
+    /// Skips unchanged snapshots and never disturbs an in-flight refresh.
+    async fn persist_subscription_catalog_snapshot(&self, provider: &Provider, ids: &[String]) {
+        if !crate::provider::google::antigravity::is_google_antigravity(provider) {
+            return;
+        }
+        let mut snapshot: Vec<String> = ids
+            .iter()
+            .map(|id| id.trim().to_string())
+            .filter(|id| !id.is_empty())
+            .collect();
+        snapshot.sort();
+        snapshot.dedup();
+        if snapshot.is_empty() {
+            return;
+        }
+        let store = self.gw.storage.oauth_credentials();
+        let Ok(Some(existing)) = store.get(&provider.id).await else {
+            return;
+        };
+        // Never race an in-flight refresh (its CAS would be invalidated).
+        if existing.status != "connected" {
+            return;
+        }
+        let mut meta: serde_json::Map<String, Value> =
+            serde_json::from_str(&existing.meta).unwrap_or_default();
+        let current: Vec<String> = meta
+            .get("subscription_models")
+            .and_then(Value::as_array)
+            .map(|entries| {
+                entries
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+        if current == snapshot {
+            return;
+        }
+        meta.insert(
+            "subscription_models".to_string(),
+            Value::Array(snapshot.into_iter().map(Value::String).collect()),
+        );
+        let input = crate::db::models::UpsertOAuthCredential {
+            driver_key: existing.driver_key.clone(),
+            scheme: existing.scheme.clone(),
+            access_token: existing.access_token.clone(),
+            refresh_token: existing.refresh_token.clone(),
+            expires_at: existing.expires_at.clone(),
+            resource_url: existing.resource_url.clone(),
+            subject_id: existing.subject_id.clone(),
+            scopes: Some(existing.scopes.clone()),
+            meta: Some(Value::Object(meta).to_string()),
+        };
+        match store.upsert(&provider.id, input).await {
+            Ok(_) => tracing::debug!(
+                provider = %provider.id,
+                "antigravity catalog snapshot persisted for tier rewrites"
+            ),
+            Err(error) => tracing::warn!(
+                %error,
+                provider = %provider.id,
+                "failed to persist antigravity catalog snapshot"
+            ),
         }
     }
 
@@ -1813,8 +1945,17 @@ impl AdminService {
             .as_ref()
             .and_then(|runtime| runtime.credential.as_ref())
             .and_then(|credential| {
-                crate::provider::google::antigravity::antigravity_project_id(Some(credential)).ok()
+                crate::provider::google::antigravity::code_assist_project_id(Some(credential)).ok()
             });
+        // Per-model quota state from the subscription catalog (best-effort,
+        // fetched before `runtime` is consumed by probe-target resolution):
+        // on Google subscription channels a 429 almost always means that
+        // model's quota window is exhausted, and the catalog says exactly
+        // how much is left and when it resets.
+        let subscription_quotas = self
+            .google_subscription_catalog(&provider, runtime.as_ref(), false)
+            .await?
+            .unwrap_or_default();
         let (suite_raw, base_url, api_key, auth_scheme, runtime_headers) = if provider.is_adaptive()
         {
             let enabled: Vec<&ProviderProtocolEndpoint> = provider
@@ -1954,6 +2095,18 @@ impl AdminService {
             .collect()
             .await;
         results.sort_by(|a, b| a.model.cmp(&b.model));
+        if !subscription_quotas.is_empty() {
+            for result in &mut results {
+                if let Some(entry) = subscription_quotas
+                    .iter()
+                    .find(|entry| entry.id == result.model)
+                {
+                    result.quota_remaining = entry.quota_remaining;
+                    result.quota_resets_at = entry.quota_resets_at.clone();
+                }
+            }
+        }
+
         Ok(ProviderModelProbeOutcome {
             meta: ProviderModelProbeMeta {
                 protocol: protocol_id,
@@ -1984,9 +2137,12 @@ impl AdminService {
     pub async fn test_provider_models(&self, id: &str) -> anyhow::Result<Vec<String>> {
         let provider = self.get_provider(id).await?;
         let models = self.fetch_provider_models(&provider).await?;
-        Ok(crate::provider::opencode_go::routing::visible_models(
-            &provider, models,
-        ))
+        Ok(
+            crate::provider::google::antigravity::filter_subscription_unavailable(
+                &provider,
+                crate::provider::opencode_go::routing::visible_models(&provider, models),
+            ),
+        )
     }
 
     /// Fetch the provider's model list from its discovery source, before
@@ -2002,6 +2158,14 @@ impl AdminService {
             Some((protocol, api_key)) => (protocol, api_key),
             None => (provider.protocol.clone(), credential),
         };
+        // google/antigravity: per-account dynamic catalog first (new models
+        // surface here before any static list ships); curated fallback below.
+        if let Some(models) = self
+            .google_subscription_available_models(provider, Some(&runtime), false)
+            .await?
+        {
+            return Ok(merge_model_lists(models, preset_extra_models(provider)));
+        }
         if let Some(static_list) = runtime.binding.static_models_override.as_deref() {
             let models: Vec<String> = static_list
                 .iter()
@@ -2090,9 +2254,12 @@ impl AdminService {
         let models = self
             .discover_provider_models(&provider, require_catalog)
             .await?;
-        Ok(crate::provider::opencode_go::routing::visible_models(
-            &provider, models,
-        ))
+        Ok(
+            crate::provider::google::antigravity::filter_subscription_unavailable(
+                &provider,
+                crate::provider::opencode_go::routing::visible_models(&provider, models),
+            ),
+        )
     }
 
     /// Discovered model list, before vendor-scoped visibility filtering.
@@ -2110,7 +2277,7 @@ impl AdminService {
         };
         // Dynamic per-account catalog first; static curated list is fallback.
         if let Some(models) = self
-            .antigravity_available_models(provider, Some(&runtime), require_catalog)
+            .google_subscription_available_models(provider, Some(&runtime), require_catalog)
             .await?
         {
             return Ok(merge_model_lists(models, preset_extra_models(provider)));

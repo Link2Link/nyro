@@ -121,6 +121,17 @@ impl ResponseEncoder for OpenAIResponseFormatter {
                 .insert("tool_calls".into(), Value::Array(tcs));
         }
 
+        let mut usage_val = serde_json::json!({
+            "prompt_tokens": resp.usage.prompt_tokens,
+            "completion_tokens": resp.usage.completion_tokens,
+            "total_tokens": resp.usage.prompt_tokens + resp.usage.completion_tokens,
+        });
+        if let Some(cached) = resp.usage.cache_read_tokens {
+            usage_val["prompt_tokens_details"] = serde_json::json!({
+                "cached_tokens": cached,
+            });
+        }
+
         serde_json::json!({
             "id": resp.id,
             "object": "chat.completion",
@@ -130,11 +141,7 @@ impl ResponseEncoder for OpenAIResponseFormatter {
                 "message": message,
                 "finish_reason": finish_reason,
             }],
-            "usage": {
-                "prompt_tokens": resp.usage.prompt_tokens,
-                "completion_tokens": resp.usage.completion_tokens,
-                "total_tokens": resp.usage.prompt_tokens + resp.usage.completion_tokens,
-            }
+            "usage": usage_val,
         })
     }
 }
@@ -467,16 +474,22 @@ impl StreamResponseEncoder for OpenAIStreamFormatter {
                     } else {
                         stop_reason.clone()
                     };
+                    let mut usage_val = serde_json::json!({
+                        "prompt_tokens": self.usage.prompt_tokens,
+                        "completion_tokens": self.usage.completion_tokens,
+                        "total_tokens": self.usage.prompt_tokens + self.usage.completion_tokens,
+                    });
+                    if let Some(cached) = self.usage.cache_read_tokens {
+                        usage_val["prompt_tokens_details"] = serde_json::json!({
+                            "cached_tokens": cached,
+                        });
+                    }
                     let chunk = serde_json::json!({
                         "id": self.id,
                         "object": "chat.completion.chunk",
                         "model": self.model,
                         "choices": [{"index": 0, "delta": {}, "finish_reason": final_reason}],
-                        "usage": {
-                            "prompt_tokens": self.usage.prompt_tokens,
-                            "completion_tokens": self.usage.completion_tokens,
-                            "total_tokens": self.usage.prompt_tokens + self.usage.completion_tokens,
-                        }
+                        "usage": usage_val,
                     });
                     events.push(SseEvent::new(None, chunk.to_string()));
                     events.push(SseEvent::new(None, "[DONE]"));
@@ -530,7 +543,7 @@ fn extract_usage(v: &Value) -> Usage {
     //
     // - DeepSeek native:  `usage.prompt_cache_hit_tokens`
     // - OpenAI newer fmt: `usage.prompt_tokens_details.cached_tokens`
-    // - Gemini-compat:    `usage.cached_content_token_count`
+    // - Gemini-compat:    `usage.cached_content_token_count` / `usage.cachedContentTokenCount`
     let cache_read = u
         .get("prompt_cache_hit_tokens")
         .and_then(Value::as_u64)
@@ -539,7 +552,8 @@ fn extract_usage(v: &Value) -> Usage {
                 .and_then(|d| d.get("cached_tokens"))
                 .and_then(Value::as_u64)
         })
-        .or_else(|| u.get("cached_content_token_count").and_then(Value::as_u64));
+        .or_else(|| u.get("cached_content_token_count").and_then(Value::as_u64))
+        .or_else(|| u.get("cachedContentTokenCount").and_then(Value::as_u64));
 
     Usage {
         prompt_tokens: input as u32,
@@ -638,6 +652,16 @@ mod tests {
         });
         let u = extract_usage(&resp);
         assert_eq!(u.cache_read_tokens, Some(1700));
+
+        let resp_camel = serde_json::json!({
+            "usage": {
+                "prompt_tokens": 2000,
+                "completion_tokens": 200,
+                "cachedContentTokenCount": 1800
+            }
+        });
+        let u2 = extract_usage(&resp_camel);
+        assert_eq!(u2.cache_read_tokens, Some(1800));
     }
 
     #[test]
@@ -857,6 +881,7 @@ mod tests {
         internal.usage = Usage {
             prompt_tokens: 10,
             completion_tokens: 5,
+            cache_read_tokens: Some(8),
             ..Usage::default()
         };
         let formatted = OpenAIResponseFormatter.format_response(&internal);
@@ -866,6 +891,10 @@ mod tests {
             msg["reasoning_content"].as_str(),
             Some("hidden chain of thought"),
             "format_response must include reasoning_content in the message"
+        );
+        assert_eq!(
+            formatted["usage"]["prompt_tokens_details"]["cached_tokens"],
+            8
         );
     }
 

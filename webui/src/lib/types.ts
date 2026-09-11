@@ -509,6 +509,10 @@ export interface ModelProbeResult {
   protocol: string;
   /** Assistant text received for the "hi" probe (success only). */
   reply?: string | null;
+  /** Remaining quota fraction (0-1) reported by the subscription catalog, when available. */
+  quota_remaining?: number | null;
+  /** When the model's quota window resets (ISO-8601), when reported. */
+  quota_resets_at?: string | null;
 }
 
 /** Which protocol/base_url a model probe ran through. */
@@ -777,6 +781,10 @@ export interface ProviderOAuthStatusData {
   expires_at?: string | null;
   resource_url?: string | null;
   subject_id?: string | null;
+  /** Subscription tier (Google subscription channels, e.g. free-tier / g1-pro-tier). */
+  tier_id?: string | null;
+  /** Companion project id (Google subscription channels). */
+  project_id?: string | null;
   last_error?: string | null;
   updated_at?: string | null;
   has_refresh_token: boolean;

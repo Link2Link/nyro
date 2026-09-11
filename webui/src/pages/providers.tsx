@@ -113,6 +113,20 @@ function isGrokOAuthChannel(presetId?: string | null, channelId?: string | null)
     && (channelId ?? "").trim().toLowerCase() === "grok";
 }
 
+/**
+ * The google vendor exposes two subscription OAuth channels with distinct
+ * clients; the auth-session vendor key must name the channel so the backend
+ * picks the right driver (antigravity vs gemini-cli).
+ */
+function oauthVendorForChannel(presetId?: string | null, channelId?: string | null) {
+  const preset = (presetId ?? "").trim();
+  const channel = (channelId ?? "").trim().toLowerCase();
+  if (preset.toLowerCase() === "google" && channel === "gemini-cli") {
+    return "google-gemini-cli";
+  }
+  return preset;
+}
+
 function grokBuildAuthorizationCode(raw: string) {
   const trimmed = raw.trim();
   if (!trimmed) return "";
@@ -805,11 +819,20 @@ function usageSupported(
     (vendor === "xai" || vendor === "grok");
   const isImportedGrokOAuth =
     provider.auth_mode === "oauth" && url.includes("cli-chat-proxy.grok.com");
+  const isGoogleOAuth =
+    provider.auth_mode === "oauth" &&
+    vendor === "google" &&
+    (provider.channel?.toLowerCase() === "antigravity" ||
+      provider.channel?.toLowerCase() === "gemini-cli");
+  const isImportedGoogleOAuth =
+    provider.auth_mode === "oauth" && url.includes("cloudcode-pa.googleapis.com");
   return (
     isCodexOAuth ||
     isImportedCodexOAuth ||
     isGrokOAuth ||
     isImportedGrokOAuth ||
+    isGoogleOAuth ||
+    isImportedGoogleOAuth ||
     url.includes("bigmodel.cn") ||
     url.includes("z.ai") ||
     url.includes("minimaxi.com") ||
@@ -1141,7 +1164,7 @@ export default function ProvidersPage() {
   }
 
   async function startCreateOAuth() {
-    const vendor = selectedPreset?.id || form.vendor;
+    const vendor = oauthVendorForChannel(selectedPreset?.id, form.channel) || form.vendor;
     if (!vendor) {
       setErrorDialog({
         title: isZh ? "无法发起 OAuth" : "Cannot start OAuth",
@@ -1707,15 +1730,31 @@ export default function ProvidersPage() {
           ? (endpointDisplayName(result.protocol) ?? result.protocol)
           : "";
         const replyPreview = (result.reply ?? "").replace(/\s+/g, " ").trim().slice(0, 80);
+        // Google subscription channels: catalog-reported per-model quota.
+        const quotaLabel = (() => {
+          if (result.quota_remaining == null) return "";
+          const pct = Math.round(result.quota_remaining * 100);
+          let label = isZh ? `（配额剩 ${pct}%` : ` (quota ${pct}% left`;
+          if (result.quota_resets_at) {
+            const reset = new Date(result.quota_resets_at);
+            const resetLabel = Number.isNaN(reset.getTime())
+              ? result.quota_resets_at
+              : reset.toLocaleTimeString();
+            label += isZh ? `，${resetLabel} 重置）` : `, resets ${resetLabel})`;
+          } else {
+            label += "）";
+          }
+          return label;
+        })();
         if (result.success) {
           appendTestLog(
             "success",
-            `✓ ${result.model} [${protocolLabel}] (${result.latency_ms}ms)${replyPreview ? ` → "${replyPreview}"` : ""}`,
+            `✓ ${result.model} [${protocolLabel}] (${result.latency_ms}ms)${quotaLabel}${replyPreview ? ` → "${replyPreview}"` : ""}`,
           );
         } else {
           appendTestLog(
             "error",
-            `✗ ${result.model} [${protocolLabel}]: ${result.error ?? (isZh ? "调用失败" : "call failed")}`,
+            `✗ ${result.model} [${protocolLabel}]${quotaLabel}: ${result.error ?? (isZh ? "调用失败" : "call failed")}`,
           );
         }
       }
@@ -3003,6 +3042,20 @@ export default function ProvidersPage() {
                                   ? (isZh ? "Access Token 已过期，请点击续期。" : "Access token has expired. Please renew.")
                                   : (isZh ? "授权有效，可正常使用当前 Provider。" : "Authorization is valid. The provider is ready to use.")}
                               </div>
+                              {(editOAuthStatus?.tier_id || editOAuthStatus?.project_id) && (
+                                <div className="mt-1 text-xs text-slate-400">
+                                  {editOAuthStatus?.tier_id && (
+                                    <span className="mr-3">
+                                      {isZh ? "订阅层级" : "Tier"}: <span className="font-medium text-slate-600">{editOAuthStatus.tier_id}</span>
+                                    </span>
+                                  )}
+                                  {editOAuthStatus?.project_id && (
+                                    <span>
+                                      {isZh ? "项目" : "Project"}: <span className="font-medium text-slate-600">{editOAuthStatus.project_id}</span>
+                                    </span>
+                                  )}
+                                </div>
+                              )}
                             </div>
                             <div className="flex flex-wrap gap-2">
                               <Button
@@ -3041,7 +3094,7 @@ export default function ProvidersPage() {
                             {!showEditReauth ? (
                               <Button
                                 type="button"
-                                onClick={() => startEditReauth(p.id, p.vendor || p.preset_key || "", p.use_proxy)}
+                                onClick={() => startEditReauth(p.id, oauthVendorForChannel(p.vendor || p.preset_key || "", p.channel), p.use_proxy)}
                               >
                                 {isZh ? "开始授权" : "Start Authorization"}
                               </Button>

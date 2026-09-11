@@ -116,6 +116,8 @@ pub(super) fn build_provider_oauth_status(
         expires_at: None,
         resource_url: normalized_optional(Some(provider.base_url.as_str())),
         subject_id: None,
+        tier_id: None,
+        project_id: None,
         last_error: fallback_error.filter(|value| !value.trim().is_empty()),
         updated_at: Some(provider.updated_at.clone()),
         has_refresh_token: false,
@@ -138,6 +140,17 @@ pub(super) fn build_provider_oauth_status_from_credential(
         .as_deref()
         .map(str::trim)
         .is_some_and(|value| !value.is_empty());
+    // Identity metadata stashed by the driver at login (Google subscription
+    // channels: tier_id + project_id explain what the account can run).
+    let meta = serde_json::from_str::<serde_json::Value>(&oauth.meta).ok();
+    let meta_str = |key: &str| {
+        meta.as_ref()
+            .and_then(|meta| meta.get(key))
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string)
+    };
     ProviderOAuthStatusData {
         provider_id: provider.id.clone(),
         provider_name: provider.name.clone(),
@@ -147,6 +160,8 @@ pub(super) fn build_provider_oauth_status_from_credential(
         resource_url: normalized_optional(oauth.resource_url.as_deref())
             .or_else(|| normalized_optional(Some(provider.base_url.as_str()))),
         subject_id: normalized_optional(oauth.subject_id.as_deref()),
+        tier_id: meta_str("tier_id"),
+        project_id: meta_str("project_id"),
         last_error: oauth.last_error.clone(),
         updated_at: Some(oauth.updated_at.clone()),
         has_refresh_token,

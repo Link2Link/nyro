@@ -243,3 +243,26 @@ fn responses_stream_cache_usage_round_trips() {
     assert_eq!(usage.cache_read_tokens, Some(100));
     assert_eq!(usage.cache_creation_tokens, Some(4800));
 }
+
+#[test]
+fn google_gemini_usage_surfaces_cached_content_tokens() {
+    let resp = parse_response(
+        P::GoogleGemini,
+        json!({
+            "candidates": [{
+                "content": {"role": "model", "parts": [{"text": "hi"}]},
+                "finishReason": "STOP"
+            }],
+            "usageMetadata": {
+                "promptTokenCount": 91328,
+                "cachedContentTokenCount": 75000,
+                "candidatesTokenCount": 42,
+                "totalTokenCount": 91370
+            }
+        }),
+    );
+
+    assert_eq!(resp.usage.prompt_tokens, 91328);
+    assert_eq!(resp.usage.completion_tokens, 42);
+    assert_eq!(resp.usage.cache_read_tokens, Some(75000));
+}

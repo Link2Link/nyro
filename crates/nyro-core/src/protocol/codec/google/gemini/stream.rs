@@ -30,15 +30,31 @@ impl ResponseDecoder for GoogleResponseParser {
             .and_then(|p| p.as_array())
         {
             for part in parts {
+                if part.get("text").is_some() && !is_known_text_part(part) {
+                    // Unknown extra fields: keep the verbatim part so Gemini →
+                    // Gemini round-trips stay lossless.
+                    items.push(ResponseItem::Unknown { raw: part.clone() });
+                    continue;
+                }
                 if let Some(t) = part.get("text").and_then(|t| t.as_str()) {
-                    text.push_str(t);
-                    if is_plain_text_part(part) {
-                        items.push(ResponseItem::OutputText {
+                    let is_thought = part
+                        .get("thought")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    if is_thought {
+                        // Extended thinking: keep the thought out of the
+                        // visible text collapse below.
+                        items.push(ResponseItem::Thinking {
                             text: t.to_string(),
                         });
-                    } else {
-                        items.push(ResponseItem::Unknown { raw: part.clone() });
+                        continue;
                     }
+                    text.push_str(t);
+                    // Signature-bearing text parts (Gemini 3 thinking mode)
+                    // are still visible output.
+                    items.push(ResponseItem::OutputText {
+                        text: t.to_string(),
+                    });
                     continue;
                 }
 
@@ -61,7 +77,9 @@ impl ResponseDecoder for GoogleResponseParser {
                         kind: ToolCallKind::Function,
                         arguments: arguments.clone(),
                     });
-                    if is_plain_function_call_part(part) {
+                    if is_known_function_call_part(part) {
+                        // `functionCall` parts may carry a `thoughtSignature`
+                        // (Gemini 3 thinking mode) — still a real tool call.
                         items.push(ResponseItem::FunctionCall {
                             call_id,
                             name,
@@ -223,46 +241,85 @@ fn parse_gemini_chunk(chunk: &Value, deltas: &mut Vec<AiStreamDelta>, first: &mu
         .and_then(|p| p.as_array())
     {
         for part in parts {
+            // Classify by which payload key is present, never by "object has
+            // exactly one key": Gemini 3 thinking mode attaches
+            // `thoughtSignature` to thought, text and functionCall parts, and
+            // the old single-key test reclassified every such part as
+            // `Unknown`, which the egress formatters drop — an agentic turn
+            // (thought + functionCall) reached the client as a completed
+            // response with no content at all.
+            let is_thought = part
+                .get("thought")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let signature = part
+                .get("thoughtSignature")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToString::to_string);
+
+            if part.get("text").is_some() && !is_known_text_part(part) {
+                // Unknown extra fields: keep the verbatim passthrough.
+                deltas.push(AiStreamDelta::Unknown {
+                    raw: part.to_string(),
+                });
+                continue;
+            }
+
             if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
-                if is_plain_text_part(part) {
+                if is_thought {
+                    // Extended thinking: reasoning text, not visible output.
                     if !text.is_empty() {
-                        deltas.push(AiStreamDelta::TextDelta(text.to_string()));
+                        deltas.push(AiStreamDelta::ThinkingDelta(text.to_string()));
                     }
-                } else {
-                    deltas.push(AiStreamDelta::Unknown {
-                        raw: part.to_string(),
-                    });
+                } else if !text.is_empty() {
+                    deltas.push(AiStreamDelta::TextDelta(text.to_string()));
+                }
+                if let Some(signature) = signature {
+                    deltas.push(AiStreamDelta::ThinkingSignature(signature));
                 }
                 continue;
             }
 
+            if part.get("functionCall").is_some() && !is_known_function_call_part(part) {
+                deltas.push(AiStreamDelta::Unknown {
+                    raw: part.to_string(),
+                });
+                continue;
+            }
+
             if let Some(fc) = part.get("functionCall") {
-                if is_plain_function_call_part(part) {
-                    let name = fc
-                        .get("name")
-                        .and_then(|n| n.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    let id = format!("call_{}", uuid::Uuid::new_v4().simple());
-                    deltas.push(AiStreamDelta::ToolCallStart {
+                let name = fc
+                    .get("name")
+                    .and_then(|n| n.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let id = format!("call_{}", uuid::Uuid::new_v4().simple());
+                deltas.push(AiStreamDelta::ToolCallStart {
+                    index: 0,
+                    id,
+                    name: name.clone(),
+                    namespace: None,
+                    kind: ToolCallKind::Function,
+                });
+                let args = fc.get("args").map(|a| a.to_string()).unwrap_or_default();
+                if !args.is_empty() && args != "{}" {
+                    deltas.push(AiStreamDelta::ToolCallDelta {
                         index: 0,
-                        id,
-                        name: name.clone(),
-                        namespace: None,
-                        kind: ToolCallKind::Function,
-                    });
-                    let args = fc.get("args").map(|a| a.to_string()).unwrap_or_default();
-                    if !args.is_empty() && args != "{}" {
-                        deltas.push(AiStreamDelta::ToolCallDelta {
-                            index: 0,
-                            arguments: args,
-                        });
-                    }
-                } else {
-                    deltas.push(AiStreamDelta::Unknown {
-                        raw: part.to_string(),
+                        arguments: args,
                     });
                 }
+                if let Some(signature) = signature {
+                    // Preserve the signature for multi-turn passback.
+                    deltas.push(AiStreamDelta::ThinkingSignature(signature));
+                }
+                continue;
+            }
+
+            if let Some(signature) = signature {
+                // Signature-only part: keep it, drop nothing silently.
+                deltas.push(AiStreamDelta::ThinkingSignature(signature));
                 continue;
             }
 
@@ -486,14 +543,24 @@ fn google_parts_from_response(resp: &AiResponse) -> Vec<Value> {
     parts
 }
 
-fn is_plain_text_part(part: &Value) -> bool {
-    part.as_object()
-        .is_some_and(|obj| obj.len() == 1 && obj.get("text").is_some_and(Value::is_string))
+/// True when a `text` part carries only Gemini-known keys (`text`, `thought`,
+/// `thoughtSignature`). Parts with any other extra field keep the verbatim
+/// `Unknown` round-trip path so unknown upstream shapes are never rewritten.
+fn is_known_text_part(part: &Value) -> bool {
+    part.as_object().is_some_and(|obj| {
+        obj.keys()
+            .all(|key| matches!(key.as_str(), "text" | "thought" | "thoughtSignature"))
+            && obj.get("text").is_some_and(Value::is_string)
+    })
 }
 
-fn is_plain_function_call_part(part: &Value) -> bool {
-    part.as_object()
-        .is_some_and(|obj| obj.len() == 1 && obj.contains_key("functionCall"))
+/// Same for `functionCall` parts (the only known extra is `thoughtSignature`).
+fn is_known_function_call_part(part: &Value) -> bool {
+    part.as_object().is_some_and(|obj| {
+        obj.keys()
+            .all(|key| matches!(key.as_str(), "functionCall" | "thoughtSignature"))
+            && obj.contains_key("functionCall")
+    })
 }
 
 fn preserve_google_response_metadata(resp: &mut AiResponse, raw: &Value) {
@@ -614,11 +681,7 @@ fn google_usage_metadata(resp: &AiResponse) -> Value {
         return merge_usage_counts(usage.clone(), resp);
     }
 
-    serde_json::json!({
-        "promptTokenCount": resp.usage.prompt_tokens,
-        "candidatesTokenCount": resp.usage.completion_tokens,
-        "totalTokenCount": resp.usage.prompt_tokens + resp.usage.completion_tokens,
-    })
+    google_usage_from_counts(&resp.usage)
 }
 
 fn merge_usage_counts(mut usage: Value, resp: &AiResponse) -> Value {
@@ -632,6 +695,10 @@ fn merge_usage_counts(mut usage: Value, resp: &AiResponse) -> Value {
     obj.entry("totalTokenCount".to_string()).or_insert_with(|| {
         serde_json::json!(resp.usage.prompt_tokens + resp.usage.completion_tokens)
     });
+    if let Some(cached) = resp.usage.cache_read_tokens {
+        obj.entry("cachedContentTokenCount".to_string())
+            .or_insert_with(|| serde_json::json!(cached));
+    }
     usage
 }
 
@@ -640,11 +707,15 @@ fn google_usage_metadata_fallback(resp: &AiResponse) -> Value {
 }
 
 fn google_usage_from_counts(usage: &Usage) -> Value {
-    serde_json::json!({
+    let mut out = serde_json::json!({
         "promptTokenCount": usage.prompt_tokens,
         "candidatesTokenCount": usage.completion_tokens,
         "totalTokenCount": usage.prompt_tokens + usage.completion_tokens,
-    })
+    });
+    if let Some(cached) = usage.cache_read_tokens {
+        out["cachedContentTokenCount"] = serde_json::json!(cached);
+    }
+    out
 }
 
 fn merge_json_object(
@@ -723,10 +794,16 @@ fn extract_gemini_usage(v: &Value) -> Usage {
         .or_else(|| candidate_output.map(|output| output.saturating_add(thoughts)))
         .unwrap_or(0);
 
+    let cache_read = first_u64(
+        u,
+        &["cachedContentTokenCount", "cached_content_token_count"],
+    );
+
     Usage {
         prompt_tokens: input as u32,
         completion_tokens: output as u32,
         total_tokens: total.unwrap_or(input.saturating_add(output)) as u32,
+        cache_read_tokens: cache_read.map(|v| v as u32),
         ..Usage::default()
     }
 }
@@ -998,6 +1075,130 @@ mod tests {
     }
 
     #[test]
+    fn stream_parser_keeps_signature_bearing_parts() {
+        // Gemini 3 thinking mode attaches `thoughtSignature` to thought, text
+        // and functionCall parts. The old single-key "plain part" test
+        // reclassified all of them as Unknown, and the egress formatters drop
+        // Unknown — an agentic turn reached the client as a completed
+        // response with no content.
+        let chunk = serde_json::json!({
+            "candidates": [{
+                "content": {
+                    "role": "model",
+                    "parts": [
+                        {"text": "let me think", "thought": true, "thoughtSignature": "SIG-THOUGHT"},
+                        {"text": "Here is the answer", "thoughtSignature": "SIG-TEXT"},
+                        {"functionCall": {"name": "read_file", "args": {"path": "/tmp/x"}}, "thoughtSignature": "SIG-CALL"}
+                    ]
+                },
+                "finishReason": "STOP",
+                "index": 0
+            }],
+            "modelVersion": "gemini-3.8-flash-high"
+        });
+        let raw = format!("data: {chunk}\n\n");
+
+        let mut parser = GoogleStreamParser::new();
+        let deltas = parser.parse_chunk(&raw).unwrap();
+
+        let thinking: Vec<&str> = deltas
+            .iter()
+            .filter_map(|delta| match delta {
+                AiStreamDelta::ThinkingDelta(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(thinking, vec!["let me think"]);
+
+        let texts: Vec<&str> = deltas
+            .iter()
+            .filter_map(|delta| match delta {
+                AiStreamDelta::TextDelta(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts, vec!["Here is the answer"]);
+
+        let tools: Vec<&str> = deltas
+            .iter()
+            .filter_map(|delta| match delta {
+                AiStreamDelta::ToolCallStart { name, .. } => Some(name.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(tools, vec!["read_file"]);
+
+        let signatures: Vec<&str> = deltas
+            .iter()
+            .filter_map(|delta| match delta {
+                AiStreamDelta::ThinkingSignature(signature) => Some(signature.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(signatures, vec!["SIG-THOUGHT", "SIG-TEXT", "SIG-CALL"]);
+
+        // No *part* may fall through to Unknown; the only Unknown left is the
+        // deliberate `__google_response_metadata` smuggling delta.
+        let stray_unknowns: Vec<&String> = deltas
+            .iter()
+            .filter_map(|delta| match delta {
+                AiStreamDelta::Unknown { raw } if !raw.contains("__google_response_metadata") => {
+                    Some(raw)
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(
+            stray_unknowns.is_empty(),
+            "signature-bearing parts must not fall through to Unknown: {stray_unknowns:?}"
+        );
+    }
+
+    #[test]
+    fn nonstream_parser_marks_thought_and_signed_function_call_items() {
+        let upstream = serde_json::json!({
+            "candidates": [{
+                "content": {
+                    "role": "model",
+                    "parts": [
+                        {"text": "reasoning here", "thought": true, "thoughtSignature": "SIG-1"},
+                        {"text": "visible answer", "thoughtSignature": "SIG-2"},
+                        {"functionCall": {"name": "read_file", "args": {"path": "/tmp/y"}}, "thoughtSignature": "SIG-3"}
+                    ]
+                },
+                "finishReason": "STOP"
+            }],
+            "modelVersion": "gemini-3.8-flash-high"
+        });
+        let parsed = GoogleResponseParser.parse_response(upstream).unwrap();
+        let items = parsed.items.as_deref().unwrap_or_default();
+        assert!(
+            items.iter().any(
+                |item| matches!(item, ResponseItem::Thinking { text } if text == "reasoning here")
+            ),
+            "thought part must become a Thinking item: {items:?}"
+        );
+        assert!(
+            items.iter().any(
+                |item| matches!(item, ResponseItem::OutputText { text } if text == "visible answer")
+            ),
+            "signed text part must stay visible output: {items:?}"
+        );
+        assert!(
+            items
+                .iter()
+                .any(|item| matches!(item, ResponseItem::FunctionCall { name, .. } if name == "read_file")),
+            "signed functionCall must stay a tool call: {items:?}"
+        );
+        assert!(
+            !items
+                .iter()
+                .any(|item| matches!(item, ResponseItem::Unknown { .. })),
+            "no part should be left Unknown: {items:?}"
+        );
+    }
+
+    #[test]
     fn stream_parser_extracts_usage_from_non_sse_generate_content_response() {
         let raw = serde_json::json!({
             "candidates": [{
@@ -1050,5 +1251,25 @@ mod tests {
             delta,
             AiStreamDelta::Done { stop_reason } if stop_reason == "stop"
         )));
+    }
+
+    #[test]
+    fn extract_gemini_usage_surfaces_cached_content_tokens() {
+        let chunk = serde_json::json!({
+            "usageMetadata": {
+                "promptTokenCount": 91328,
+                "cachedContentTokenCount": 75000,
+                "candidatesTokenCount": 42,
+                "totalTokenCount": 91370
+            }
+        });
+        let usage = extract_gemini_usage(&chunk);
+        assert_eq!(usage.prompt_tokens, 91328);
+        assert_eq!(usage.completion_tokens, 42);
+        assert_eq!(usage.total_tokens, 91370);
+        assert_eq!(usage.cache_read_tokens, Some(75000));
+
+        let formatted = google_usage_from_counts(&usage);
+        assert_eq!(formatted["cachedContentTokenCount"], 75000);
     }
 }

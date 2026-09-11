@@ -5,7 +5,7 @@ mod openai;
 mod shared;
 
 pub use claude::ClaudeOAuthDriver;
-pub use google::GoogleAntigravityDriver;
+pub use google::{GoogleSubscriptionChannel, GoogleSubscriptionDriver};
 pub use grok::GrokOAuthDriver;
 pub use openai::OpenAIOAuthDriver;
 pub use shared::{

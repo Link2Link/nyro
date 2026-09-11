@@ -1,19 +1,27 @@
-//! Google AI Pro (Antigravity) OAuth driver.
+//! Google subscription OAuth drivers (Code Assist v1internal surface).
 //!
-//! Authenticates a Google account that carries a Google AI Pro / Ultra
-//! subscription through the Antigravity IDE public OAuth client, then talks
-//! to the Code Assist internal API (cloudcode-pa.googleapis.com/v1internal).
+//! Two channels authenticate a Google account against
+//! `cloudcode-pa.googleapis.com/v1internal`:
 //!
-//! Wire behavior mirrors what the Antigravity IDE does (and what
-//! CLIProxyAPI / sub2api reverse-engineered):
+//! * **Antigravity** (`google` driver key): Google AI Pro / Ultra
+//!   subscription via the Antigravity IDE public OAuth client.
+//! * **Gemini CLI** (`google-gemini-cli` driver key): Code Assist
+//!   subscription (Standard/Enterprise/legacy free) via the public Gemini
+//!   CLI OAuth client — same host, slimmer request envelope, clean model
+//!   ids (see `provider::google::gemini_cli`).
+//!
+//! Wire behavior mirrors what the native clients do (and what CLIProxyAPI /
+//! sub2api reverse-engineered):
 //!
 //! * authorize: accounts.google.com/o/oauth2/v2/auth, PKCE S256,
 //!   access_type=offline + prompt=consent so a refresh token is issued.
+//!   The antigravity client redirects to a loopback URL (state-carrying);
+//!   the Gemini CLI client redirects to codeassist.google.com/authcode,
+//!   which shows a bare copy/paste code without state.
 //! * token: standard oauth2.googleapis.com/token (form encoded, includes
-//!   the Antigravity client secret).
+//!   the channel's published client secret).
 //! * project bootstrap: loadCodeAssist returns the cloudaicompanionProject;
-//!   brand-new accounts need onboardUser (on the daily- control-plane host)
-//!   before the project exists.
+//!   brand-new accounts need onboardUser before the project exists.
 //!
 //! The project_id is stashed in the credential metadata (not a secret) and
 //! must survive token refreshes — Google's refresh response does not echo it.
@@ -36,14 +44,13 @@ use crate::auth::types::{
     StoredCredential,
 };
 use crate::db::models::Provider;
-use crate::provider::OAuthConfig;
-use crate::provider::VendorRegistry;
-use crate::provider::google::antigravity::{
-    ANTIGRAVITY_VERSION, X_GOOG_API_CLIENT, antigravity_user_agent,
-};
+use crate::provider::google::antigravity::{ANTIGRAVITY_VERSION, X_GOOG_API_CLIENT};
+use crate::provider::google::gemini_cli::GEMINI_CLI_USER_AGENT;
+use crate::provider::{OAuthConfig, VendorRegistry};
 
 const GOOGLE_PRESET_ID: &str = "google";
 const ANTIGRAVITY_CHANNEL_ID: &str = "antigravity";
+const GEMINI_CLI_CHANNEL_ID: &str = "gemini-cli";
 const GOOGLE_GEMINI_PROTOCOL_ID: &str = "google-gemini";
 
 /// Antigravity IDE public OAuth client secret (identical to the value shipped
@@ -51,21 +58,84 @@ const GOOGLE_GEMINI_PROTOCOL_ID: &str = "google-gemini";
 /// credential, not a private secret of Nyro.
 const ANTIGRAVITY_CLIENT_SECRET: &str = "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";
 
+/// Gemini CLI public OAuth client secret (published "installed app"
+/// credential, identical to the value shipped by sub2api).
+const GEMINI_CLI_CLIENT_SECRET: &str = "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";
+
 /// Google identity endpoint (email → subject_id).
 const GOOGLE_USERINFO_URL: &str = "https://www.googleapis.com/oauth2/v2/userinfo";
 
-/// Code Assist control-plane host for onboarding. Inference always hits prod;
-/// onboardUser uses the daily- host (matching the Antigravity IDE fingerprint).
+/// Code Assist control-plane host for antigravity onboarding. Inference
+/// always hits prod; the Antigravity IDE onboardUser uses the daily- host.
+/// The Gemini CLI onboardUser stays on the prod host (sub2api behavior).
 const ANTIGRAVITY_DAILY_API_BASE_URL: &str = "https://daily-cloudcode-pa.googleapis.com";
 
 /// How long a pending login session stays valid.
 const SESSION_TTL_SECONDS: i64 = 10 * 60;
-/// onboardUser polling: attempts × delay (mirrors CLIProxyAPI).
+/// onboardUser polling: attempts × delay (mirrors CLIProxyAPI / sub2api).
 const ONBOARD_MAX_ATTEMPTS: usize = 5;
 const ONBOARD_POLL_DELAY_MS: u64 = 2_000;
 
-#[derive(Debug, Default)]
-pub struct GoogleAntigravityDriver;
+/// Which Google subscription surface a driver instance talks to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GoogleSubscriptionChannel {
+    Antigravity,
+    GeminiCli,
+}
+
+/// Driver for the Google subscription OAuth channels. A single
+/// implementation; the channel selects the OAuth client, client secret,
+/// user agent, onboarding host, and runtime headers.
+pub struct GoogleSubscriptionDriver {
+    channel: GoogleSubscriptionChannel,
+}
+
+impl GoogleSubscriptionDriver {
+    pub const ANTIGRAVITY: Self = Self {
+        channel: GoogleSubscriptionChannel::Antigravity,
+    };
+    pub const GEMINI_CLI: Self = Self {
+        channel: GoogleSubscriptionChannel::GeminiCli,
+    };
+
+    fn channel_id(&self) -> &'static str {
+        match self.channel {
+            GoogleSubscriptionChannel::Antigravity => ANTIGRAVITY_CHANNEL_ID,
+            GoogleSubscriptionChannel::GeminiCli => GEMINI_CLI_CHANNEL_ID,
+        }
+    }
+
+    fn client_secret(&self) -> &'static str {
+        match self.channel {
+            GoogleSubscriptionChannel::Antigravity => ANTIGRAVITY_CLIENT_SECRET,
+            GoogleSubscriptionChannel::GeminiCli => GEMINI_CLI_CLIENT_SECRET,
+        }
+    }
+
+    /// Control-plane + inference User-Agent for this channel's client.
+    fn user_agent(&self) -> String {
+        match self.channel {
+            GoogleSubscriptionChannel::Antigravity => {
+                format!("antigravity/{ANTIGRAVITY_VERSION} windows/amd64")
+            }
+            GoogleSubscriptionChannel::GeminiCli => GEMINI_CLI_USER_AGENT.to_string(),
+        }
+    }
+
+    fn metadata_label(&self) -> &'static str {
+        match self.channel {
+            GoogleSubscriptionChannel::Antigravity => "Google AI Pro (Antigravity)",
+            GoogleSubscriptionChannel::GeminiCli => "Gemini CLI (Code Assist)",
+        }
+    }
+
+    fn metadata_key(&self) -> &'static str {
+        match self.channel {
+            GoogleSubscriptionChannel::Antigravity => "google",
+            GoogleSubscriptionChannel::GeminiCli => "google-gemini-cli",
+        }
+    }
+}
 
 #[derive(Debug, Deserialize)]
 struct GoogleTokenResponse {
@@ -83,24 +153,23 @@ struct GoogleErrorResponse {
 
 /// Channel-level config resolved from the vendor registry (mirrors the
 /// Claude Code driver's claude_code_config).
-struct AntigravityConfig {
+struct SubscriptionConfig {
     oauth: &'static OAuthConfig,
     api_base_url: &'static str,
     static_models: &'static [&'static str],
 }
 
-impl GoogleAntigravityDriver {
-    fn channel_config() -> Result<AntigravityConfig> {
+impl GoogleSubscriptionDriver {
+    fn channel_config(&self) -> Result<SubscriptionConfig> {
         let metadata = VendorRegistry::global()
             .metadata(GOOGLE_PRESET_ID)
             .ok_or_else(|| anyhow!("missing provider preset: {GOOGLE_PRESET_ID}"))?;
+        let channel_id = self.channel_id();
         let channel = metadata
             .channels
             .iter()
-            .find(|c| c.id == ANTIGRAVITY_CHANNEL_ID)
-            .ok_or_else(|| {
-                anyhow!("missing provider channel: {GOOGLE_PRESET_ID}/{ANTIGRAVITY_CHANNEL_ID}")
-            })?;
+            .find(|c| c.id == channel_id)
+            .ok_or_else(|| anyhow!("missing provider channel: {GOOGLE_PRESET_ID}/{channel_id}"))?;
         let api_base_url = channel
             .base_urls
             .iter()
@@ -108,12 +177,12 @@ impl GoogleAntigravityDriver {
             .map(|entry| entry.base_url)
             .ok_or_else(|| {
                 anyhow!(
-                    "missing base url for protocol {GOOGLE_GEMINI_PROTOCOL_ID} in                      {GOOGLE_PRESET_ID}/{ANTIGRAVITY_CHANNEL_ID}"
+                    "missing base url for protocol {GOOGLE_GEMINI_PROTOCOL_ID} in                      {GOOGLE_PRESET_ID}/{channel_id}"
                 )
             })?;
-        Ok(AntigravityConfig {
+        Ok(SubscriptionConfig {
             oauth: channel.oauth.as_ref().ok_or_else(|| {
-                anyhow!("missing oauth config for {GOOGLE_PRESET_ID}/{ANTIGRAVITY_CHANNEL_ID}")
+                anyhow!("missing oauth config for {GOOGLE_PRESET_ID}/{channel_id}")
             })?,
             api_base_url,
             static_models: channel.static_models,
@@ -136,23 +205,24 @@ impl GoogleAntigravityDriver {
         token_url: &str,
         params: &[(&str, &str)],
     ) -> Result<GoogleTokenResponse> {
+        let driver_label = self.metadata_key();
         let response = client
             .post(token_url)
             .header("Content-Type", "application/x-www-form-urlencoded")
             .header("Accept", "application/json")
-            .header("User-Agent", antigravity_user_agent())
+            .header("User-Agent", self.user_agent())
             .form(params)
             .send()
             .await
-            .context("antigravity oauth token request")?;
+            .with_context(|| format!("{driver_label} oauth token request"))?;
 
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
         if !status.is_success() {
             let detail = Self::parse_error(&body).unwrap_or(body);
-            bail!("antigravity token endpoint failed: HTTP {status} {detail}");
+            bail!("{driver_label} token endpoint failed: HTTP {status} {detail}");
         }
-        serde_json::from_str(&body).context("parse antigravity token response")
+        serde_json::from_str(&body).with_context(|| format!("parse {driver_label} token response"))
     }
 
     /// Build the credential bundle from a token response, carrying identity
@@ -161,18 +231,18 @@ impl GoogleAntigravityDriver {
     fn build_bundle(
         token: GoogleTokenResponse,
         prior_meta: Option<&Value>,
-        config: &AntigravityConfig,
+        config: &SubscriptionConfig,
     ) -> Result<CredentialBundle> {
         let access_token = token
             .access_token
             .filter(|value| !value.trim().is_empty())
-            .ok_or_else(|| anyhow!("antigravity token response missing access_token"))?;
+            .ok_or_else(|| anyhow!("token response missing access_token"))?;
         let expires_in = token.expires_in.unwrap_or(3600).max(1);
 
         let mut meta = serde_json::Map::new();
         if let Some(prior) = prior_meta.and_then(Value::as_object) {
             // Survive refreshes: Google does not echo these back.
-            for key in ["project_id", "email", "tier_id"] {
+            for key in ["project_id", "email", "tier_id", "subscription_models"] {
                 if let Some(value) = prior.get(key).filter(|v| !v.is_null()) {
                     meta.insert(key.to_string(), value.clone());
                 }
@@ -198,38 +268,42 @@ impl GoogleAntigravityDriver {
         client: &reqwest::Client,
         access_token: &str,
     ) -> Result<String> {
+        let driver_label = self.metadata_key();
         let response = client
             .get(GOOGLE_USERINFO_URL)
             .header("Authorization", format!("Bearer {access_token}"))
-            .header("User-Agent", antigravity_user_agent())
+            .header("User-Agent", self.user_agent())
             .send()
             .await
-            .context("antigravity userinfo request")?;
+            .with_context(|| format!("{driver_label} userinfo request"))?;
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
         if !status.is_success() {
             let detail = Self::parse_error(&body).unwrap_or(body);
-            bail!("antigravity userinfo failed: HTTP {status} {detail}");
+            bail!("{driver_label} userinfo failed: HTTP {status} {detail}");
         }
-        let parsed: Value =
-            serde_json::from_str(&body).context("parse antigravity userinfo response")?;
+        let parsed: Value = serde_json::from_str(&body)
+            .with_context(|| format!("parse {driver_label} userinfo response"))?;
         parsed
             .get("email")
             .and_then(Value::as_str)
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(ToString::to_string)
-            .ok_or_else(|| anyhow!("antigravity userinfo response missing email"))
+            .ok_or_else(|| anyhow!("{driver_label} userinfo response missing email"))
     }
 
     /// loadCodeAssist → cloudaicompanionProject + tier summary. Returns
-    /// (project_id_opt, tier_summary_json).
+    /// (project_id_opt, tier_summary_json). Both channels send the same
+    /// ANTIGRAVITY ideType metadata (sub2api does the same for its gemini
+    /// accounts).
     async fn load_code_assist(
         &self,
         client: &reqwest::Client,
         base_url: &str,
         access_token: &str,
     ) -> Result<(Option<String>, Value)> {
+        let driver_label = self.metadata_key();
         let endpoint = format!(
             "{}/v1internal:loadCodeAssist",
             base_url.trim_end_matches('/')
@@ -239,19 +313,19 @@ impl GoogleAntigravityDriver {
             .header("Authorization", format!("Bearer {access_token}"))
             .header("Content-Type", "application/json")
             .header("Accept", "*/*")
-            .header("User-Agent", antigravity_user_agent())
+            .header("User-Agent", self.user_agent())
             .json(&json!({ "metadata": { "ideType": "ANTIGRAVITY" } }))
             .send()
             .await
-            .context("antigravity loadCodeAssist request")?;
+            .with_context(|| format!("{driver_label} loadCodeAssist request"))?;
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
         if !status.is_success() {
             let detail = Self::parse_error(&body).unwrap_or(body);
-            bail!("antigravity loadCodeAssist failed: HTTP {status} {detail}");
+            bail!("{driver_label} loadCodeAssist failed: HTTP {status} {detail}");
         }
-        let parsed: Value =
-            serde_json::from_str(&body).context("parse antigravity loadCodeAssist response")?;
+        let parsed: Value = serde_json::from_str(&body)
+            .with_context(|| format!("parse {driver_label} loadCodeAssist response"))?;
         let tier_summary = json!({
             "currentTier": parsed.get("currentTier").cloned().unwrap_or(Value::Null),
             "allowedTiers": parsed.get("allowedTiers").cloned().unwrap_or(Value::Null),
@@ -260,42 +334,67 @@ impl GoogleAntigravityDriver {
     }
 
     /// onboardUser polling until done (bounded attempts). Only needed for
-    /// accounts whose loadCodeAssist has no companion project yet.
+    /// accounts whose loadCodeAssist has no companion project yet. The
+    /// request body/host differs per channel:
+    /// * antigravity — daily- host, IDE fingerprint metadata
+    ///   (validated by CLIProxyAPI).
+    /// * gemini-cli — prod host, `tierId` + {ideType, platform,
+    ///   pluginType: GEMINI} metadata (validated by sub2api).
     async fn onboard_user(
         &self,
         client: &reqwest::Client,
         access_token: &str,
         tier_id: &str,
     ) -> Result<String> {
-        let endpoint = format!("{ANTIGRAVITY_DAILY_API_BASE_URL}/v1internal:onboardUser");
-        let user_agent = antigravity_user_agent();
-        for attempt in 1..=ONBOARD_MAX_ATTEMPTS {
-            let response = client
-                .post(&endpoint)
-                .header("Authorization", format!("Bearer {access_token}"))
-                .header("Content-Type", "application/json")
-                .header("Accept", "*/*")
-                .header("User-Agent", &user_agent)
-                .header("X-Goog-Api-Client", X_GOOG_API_CLIENT)
-                .json(&json!({
+        let driver_label = self.metadata_key();
+        let (endpoint, body) = match self.channel {
+            GoogleSubscriptionChannel::Antigravity => (
+                format!("{ANTIGRAVITY_DAILY_API_BASE_URL}/v1internal:onboardUser"),
+                json!({
                     "tier_id": tier_id,
                     "metadata": {
                         "ide_type": "ANTIGRAVITY",
                         "ide_version": ANTIGRAVITY_VERSION,
                         "ide_name": "antigravity",
                     },
-                }))
+                }),
+            ),
+            GoogleSubscriptionChannel::GeminiCli => (
+                "https://cloudcode-pa.googleapis.com/v1internal:onboardUser".to_string(),
+                json!({
+                    "tierId": tier_id,
+                    "metadata": {
+                        "ideType": "ANTIGRAVITY",
+                        "platform": "PLATFORM_UNSPECIFIED",
+                        "pluginType": "GEMINI",
+                    },
+                }),
+            ),
+        };
+        let user_agent = self.user_agent();
+        for attempt in 1..=ONBOARD_MAX_ATTEMPTS {
+            let mut request = client
+                .post(&endpoint)
+                .header("Authorization", format!("Bearer {access_token}"))
+                .header("Content-Type", "application/json")
+                .header("Accept", "*/*")
+                .header("User-Agent", &user_agent)
+                .json(&body);
+            if self.channel == GoogleSubscriptionChannel::Antigravity {
+                request = request.header("X-Goog-Api-Client", X_GOOG_API_CLIENT);
+            }
+            let response = request
                 .send()
                 .await
-                .with_context(|| format!("antigravity onboardUser attempt {attempt}"))?;
+                .with_context(|| format!("{driver_label} onboardUser attempt {attempt}"))?;
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
             if !status.is_success() {
                 let detail = Self::parse_error(&body).unwrap_or(body);
-                bail!("antigravity onboardUser failed: HTTP {status} {detail}");
+                bail!("{driver_label} onboardUser failed: HTTP {status} {detail}");
             }
-            let parsed: Value =
-                serde_json::from_str(&body).context("parse antigravity onboardUser response")?;
+            let parsed: Value = serde_json::from_str(&body)
+                .with_context(|| format!("parse {driver_label} onboardUser response"))?;
             if parsed.get("done").and_then(Value::as_bool).unwrap_or(false) {
                 if let Some(project) = parsed
                     .get("response")
@@ -303,18 +402,18 @@ impl GoogleAntigravityDriver {
                 {
                     return Ok(project);
                 }
-                bail!("antigravity onboardUser completed without a project id");
+                bail!("{driver_label} onboardUser completed without a project id");
             }
             tokio::time::sleep(std::time::Duration::from_millis(ONBOARD_POLL_DELAY_MS)).await;
         }
-        bail!("antigravity onboardUser did not complete after {ONBOARD_MAX_ATTEMPTS} attempts")
+        bail!("{driver_label} onboardUser did not complete after {ONBOARD_MAX_ATTEMPTS} attempts")
     }
 
     /// Resolve (and persist on first login) the companion project id.
     async fn resolve_project_id(
         &self,
         client: &reqwest::Client,
-        config: &AntigravityConfig,
+        config: &SubscriptionConfig,
         access_token: &str,
         prior_meta: Option<&Value>,
     ) -> Result<(String, Value)> {
@@ -330,7 +429,7 @@ impl GoogleAntigravityDriver {
                 .load_code_assist(client, config.api_base_url, access_token)
                 .await
                 .unwrap_or_else(|error| {
-                    tracing::warn!(%error, "antigravity loadCodeAssist failed during refresh");
+                    tracing::warn!(%error, "{} loadCodeAssist failed during refresh", self.metadata_key());
                     (None, Value::Null)
                 });
             return Ok((project.to_string(), tier_summary));
@@ -347,6 +446,38 @@ impl GoogleAntigravityDriver {
         let tier_id = default_tier_id(&tier_summary);
         let project = self.onboard_user(client, access_token, &tier_id).await?;
         Ok((project, tier_summary))
+    }
+
+    /// Best-effort account catalog snapshot into the credential meta; powers
+    /// the antigravity effort→tier model rewrite (`subscription_models`).
+    /// Never fails the calling flow; keeps the prior snapshot on error.
+    async fn attach_catalog_snapshot(
+        &self,
+        client: &reqwest::Client,
+        access_token: &str,
+        project_id: &str,
+        meta: &mut serde_json::Map<String, Value>,
+    ) {
+        if self.channel != GoogleSubscriptionChannel::Antigravity {
+            return;
+        }
+        let Ok(models) = crate::provider::google::antigravity::fetch_available_models(
+            client,
+            access_token,
+            project_id,
+            &self.user_agent(),
+        )
+        .await
+        else {
+            return;
+        };
+        let ids: Vec<Value> = models
+            .into_iter()
+            .map(|model| Value::String(model.id))
+            .collect();
+        if !ids.is_empty() {
+            meta.insert("subscription_models".to_string(), Value::Array(ids));
+        }
     }
 }
 
@@ -391,11 +522,11 @@ fn default_tier_id(tier_summary: &Value) -> String {
 }
 
 #[async_trait]
-impl AuthDriver for GoogleAntigravityDriver {
+impl AuthDriver for GoogleSubscriptionDriver {
     fn metadata(&self) -> AuthDriverMetadata {
         AuthDriverMetadata {
-            key: "google",
-            label: "Google AI Pro (Antigravity)",
+            key: self.metadata_key(),
+            label: self.metadata_label(),
             scheme: AuthScheme::OAuthAuthCodePkce,
             supports_new_provider: true,
             supports_existing_provider: true,
@@ -403,7 +534,7 @@ impl AuthDriver for GoogleAntigravityDriver {
     }
 
     async fn start(&self, ctx: StartAuthContext) -> Result<CreateAuthSession> {
-        let config = Self::channel_config()?;
+        let config = self.channel_config()?;
         let code_verifier = generate_code_verifier();
         let code_challenge = generate_code_challenge(&code_verifier);
         let state = generate_state();
@@ -457,10 +588,29 @@ impl AuthDriver for GoogleAntigravityDriver {
         input: AuthExchangeInput,
         ctx: ExchangeAuthContext,
     ) -> Result<CredentialBundle> {
-        let config = Self::channel_config()?;
+        let config = self.channel_config()?;
         let state: PkceAuthState = parse_session_state(session)?;
         let callback = parse_oauth_callback(&input)?;
-        validate_callback_state(&state.state, callback.state.as_deref(), "google")?;
+        // The antigravity loopback redirect always carries state. The Gemini
+        // CLI client redirects to codeassist.google.com/authcode, where
+        // Google renders a bare copy/paste code with no state; PKCE binds
+        // that code to this session's verifier, so a missing state is
+        // acceptable there (validated whenever the paste includes one).
+        match self.channel {
+            GoogleSubscriptionChannel::Antigravity => {
+                validate_callback_state(&state.state, callback.state.as_deref(), "google")?
+            }
+            GoogleSubscriptionChannel::GeminiCli => {
+                if callback
+                    .state
+                    .as_deref()
+                    .map(str::trim)
+                    .is_some_and(|value| !value.is_empty())
+                {
+                    validate_callback_state(&state.state, callback.state.as_deref(), "google")?;
+                }
+            }
+        }
         let code = callback
             .code
             .as_deref()
@@ -477,7 +627,7 @@ impl AuthDriver for GoogleAntigravityDriver {
                     ("grant_type", "authorization_code"),
                     ("code", code),
                     ("client_id", config.oauth.client_id),
-                    ("client_secret", ANTIGRAVITY_CLIENT_SECRET),
+                    ("client_secret", self.client_secret()),
                     ("redirect_uri", &state.redirect_uri),
                     ("code_verifier", &state.code_verifier),
                 ],
@@ -495,7 +645,7 @@ impl AuthDriver for GoogleAntigravityDriver {
             .await?;
         if let Some(meta) = bundle.raw.as_object_mut() {
             meta.insert("email".to_string(), Value::String(email));
-            meta.insert("project_id".to_string(), Value::String(project_id));
+            meta.insert("project_id".to_string(), Value::String(project_id.clone()));
             if let Some(tier) = tier_summary
                 .get("currentTier")
                 .and_then(|t| t.get("id"))
@@ -503,12 +653,9 @@ impl AuthDriver for GoogleAntigravityDriver {
             {
                 meta.insert("tier_id".to_string(), Value::String(tier.to_string()));
             }
+            self.attach_catalog_snapshot(&client, &access_token, &project_id, meta)
+                .await;
         }
-        bundle.subject_id = bundle
-            .raw
-            .get("email")
-            .and_then(Value::as_str)
-            .map(ToString::to_string);
 
         Ok(bundle)
     }
@@ -518,13 +665,14 @@ impl AuthDriver for GoogleAntigravityDriver {
         credential: &StoredCredential,
         ctx: RefreshAuthContext,
     ) -> Result<CredentialBundle> {
-        let config = Self::channel_config()?;
+        let config = self.channel_config()?;
+        let driver_label = self.metadata_key();
         let refresh_token = credential
             .refresh_token
             .as_deref()
             .map(str::trim)
             .filter(|value| !value.is_empty())
-            .ok_or_else(|| anyhow!("antigravity refresh token is missing"))?;
+            .ok_or_else(|| anyhow!("{driver_label} refresh token is missing"))?;
         let client = required_http_client(ctx.http_client)?;
 
         let token = self
@@ -535,7 +683,7 @@ impl AuthDriver for GoogleAntigravityDriver {
                     ("grant_type", "refresh_token"),
                     ("refresh_token", refresh_token),
                     ("client_id", config.oauth.client_id),
-                    ("client_secret", ANTIGRAVITY_CLIENT_SECRET),
+                    ("client_secret", self.client_secret()),
                 ],
             )
             .await?;
@@ -570,6 +718,23 @@ impl AuthDriver for GoogleAntigravityDriver {
             }
         }
 
+        // Refresh the account catalog snapshot (powers effort→tier model
+        // rewrites); best-effort — the prior snapshot survives on failure.
+        if let Some(project_id) = bundle
+            .raw
+            .get("project_id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string)
+        {
+            let token = bundle.access_token.clone().unwrap_or_default();
+            if let Some(meta) = bundle.raw.as_object_mut() {
+                self.attach_catalog_snapshot(&client, &token, &project_id, meta)
+                    .await;
+            }
+        }
+
         Ok(bundle)
     }
 
@@ -578,39 +743,65 @@ impl AuthDriver for GoogleAntigravityDriver {
         _provider: &Provider,
         credential: &StoredCredential,
     ) -> Result<RuntimeBinding> {
-        let config = Self::channel_config()?;
+        let config = self.channel_config()?;
         let access_token = credential
             .access_token
             .as_deref()
             .map(str::trim)
             .filter(|value| !value.is_empty())
-            .ok_or_else(|| anyhow!("antigravity access token is empty in bind_runtime"))?;
+            .ok_or_else(|| {
+                anyhow!(
+                    "{} access token is empty in bind_runtime",
+                    self.metadata_key()
+                )
+            })?;
 
         let mut extra_headers = HashMap::new();
         extra_headers.insert(
             "authorization".to_string(),
             format!("Bearer {access_token}"),
         );
-        extra_headers.insert("user-agent".to_string(), antigravity_user_agent());
-        extra_headers.insert(
-            "x-goog-api-client".to_string(),
-            X_GOOG_API_CLIENT.to_string(),
-        );
+        extra_headers.insert("user-agent".to_string(), self.user_agent());
+        if self.channel == GoogleSubscriptionChannel::Antigravity {
+            // Antigravity control-plane fingerprint header; the Gemini CLI
+            // client does not send it.
+            extra_headers.insert(
+                "x-goog-api-client".to_string(),
+                X_GOOG_API_CLIENT.to_string(),
+            );
+        }
 
-        // The channel's curated model list is the catalog the subscription can
-        // actually run (dynamic fetchAvailableModels discovery is a
-        // follow-up).
+        // The channel's curated model list is the fallback catalog for when
+        // dynamic `fetchAvailableModels` discovery is unavailable; the admin
+        // discovery paths query the per-account catalog first.
         let static_models_override: Option<Vec<String>> = if config.static_models.is_empty() {
             None
         } else {
             Some(config.static_models.iter().map(|s| s.to_string()).collect())
         };
+        // Both channels pin models.dev as the labeled discovery source so the
+        // WebUI test flow proceeds to the model-list step; the per-account
+        // dynamic catalog and the static list take priority over it.
+        let models_source_override = Some("ai://models.dev/google".to_string());
+
+        // Inference host: consumer (Google AI Pro/Ultra) credentials on the
+        // antigravity channel MUST hit the daily host — the prod host parks
+        // them in the free consumer pool where mainline models are
+        // tier-gated to 429. Control-plane calls in this driver
+        // (`load_code_assist`) keep using the channel's prod api_base_url.
+        // The gemini-cli channel (GCP Code Assist) stays on prod.
+        let inference_base_url = match self.channel {
+            GoogleSubscriptionChannel::Antigravity => {
+                crate::provider::google::antigravity::ANTIGRAVITY_INFERENCE_BASE_URL
+            }
+            GoogleSubscriptionChannel::GeminiCli => config.api_base_url,
+        };
 
         Ok(RuntimeBinding {
-            base_url_override: Some(config.api_base_url.to_string()),
+            base_url_override: Some(inference_base_url.to_string()),
             extra_headers,
             model_aliases: HashMap::new(),
-            models_source_override: Some("ai://models.dev/google".to_string()),
+            models_source_override,
             disable_default_auth: true,
             static_models_override,
         })
@@ -621,7 +812,7 @@ impl AuthDriver for GoogleAntigravityDriver {
 mod tests {
     use super::*;
 
-    fn test_provider() -> Provider {
+    fn test_provider(channel: &str) -> Provider {
         Provider {
             id: "test".into(),
             name: "test".into(),
@@ -631,7 +822,7 @@ mod tests {
             protocol_mode: "fixed".into(),
             protocol_endpoints: Vec::new(),
             preset_key: Some("google".into()),
-            channel: Some("antigravity".into()),
+            channel: Some(channel.into()),
             models_source: None,
             static_models: None,
             api_key: String::new(),
@@ -646,9 +837,19 @@ mod tests {
         }
     }
 
+    fn stored_credential() -> StoredCredential {
+        StoredCredential {
+            access_token: Some("ya29.token".into()),
+            meta: json!({"project_id": "cloudaicompanion-123"}),
+            ..Default::default()
+        }
+    }
+
     #[test]
-    fn config_loads_from_vendor_registry() {
-        let config = GoogleAntigravityDriver::channel_config().unwrap();
+    fn antigravity_config_loads_from_vendor_registry() {
+        let config = GoogleSubscriptionDriver::ANTIGRAVITY
+            .channel_config()
+            .unwrap();
         assert!(config.oauth.authorize_url.contains("accounts.google.com"));
         assert!(config.oauth.token_url.contains("oauth2.googleapis.com"));
         assert_eq!(config.api_base_url, "https://cloudcode-pa.googleapis.com");
@@ -662,8 +863,52 @@ mod tests {
     }
 
     #[test]
+    fn gemini_cli_config_loads_from_vendor_registry() {
+        let config = GoogleSubscriptionDriver::GEMINI_CLI
+            .channel_config()
+            .unwrap();
+        assert_eq!(
+            config.oauth.client_id,
+            "681255809395-oo8ft2oprdrnp9e3aqf6av3hmdib135j.apps.googleusercontent.com"
+        );
+        // Copy/paste code page, not a loopback callback.
+        assert_eq!(
+            config.oauth.redirect_uri,
+            "https://codeassist.google.com/authcode"
+        );
+        // Built-in client rejects generative-language / drive scopes.
+        assert!(!config.oauth.scope.contains("generative-language"));
+        assert!(!config.oauth.scope.contains("drive"));
+        assert_eq!(config.api_base_url, "https://cloudcode-pa.googleapis.com");
+        assert!(
+            config
+                .static_models
+                .iter()
+                .any(|m| *m == "gemini-3.6-flash")
+        );
+    }
+
+    #[test]
+    fn metadata_keys_distinguish_channels() {
+        assert_eq!(
+            GoogleSubscriptionDriver::ANTIGRAVITY.metadata().key,
+            "google"
+        );
+        assert_eq!(
+            GoogleSubscriptionDriver::GEMINI_CLI.metadata().key,
+            "google-gemini-cli"
+        );
+        assert_eq!(
+            GoogleSubscriptionDriver::GEMINI_CLI.metadata().label,
+            "Gemini CLI (Code Assist)"
+        );
+    }
+
+    #[test]
     fn build_bundle_carries_prior_meta_into_refresh() {
-        let config = GoogleAntigravityDriver::channel_config().unwrap();
+        let config = GoogleSubscriptionDriver::ANTIGRAVITY
+            .channel_config()
+            .unwrap();
         let token = GoogleTokenResponse {
             access_token: Some("ya29.new".into()),
             refresh_token: None,
@@ -676,7 +921,7 @@ mod tests {
             "tier_id": "tiered",
             "unrelated": true,
         });
-        let bundle = GoogleAntigravityDriver::build_bundle(token, Some(&prior), &config).unwrap();
+        let bundle = GoogleSubscriptionDriver::build_bundle(token, Some(&prior), &config).unwrap();
         assert_eq!(bundle.access_token.as_deref(), Some("ya29.new"));
         assert_eq!(bundle.subject_id.as_deref(), Some("user@example.com"));
         assert_eq!(
@@ -716,13 +961,9 @@ mod tests {
 
     #[test]
     fn bind_runtime_sets_antigravity_headers_and_models() {
-        let provider = test_provider();
-        let credential = StoredCredential {
-            access_token: Some("ya29.token".into()),
-            meta: json!({"project_id": "cloudaicompanion-123"}),
-            ..Default::default()
-        };
-        let binding = GoogleAntigravityDriver
+        let provider = test_provider("antigravity");
+        let credential = stored_credential();
+        let binding = GoogleSubscriptionDriver::ANTIGRAVITY
             .bind_runtime(&provider, &credential)
             .unwrap();
         assert_eq!(
@@ -743,9 +984,50 @@ mod tests {
         assert!(binding.disable_default_auth);
         assert_eq!(
             binding.base_url_override.as_deref(),
-            Some("https://cloudcode-pa.googleapis.com")
+            Some("https://daily-cloudcode-pa.googleapis.com"),
+            "antigravity inference must ride the daily host (consumer tier gating)"
+        );
+        assert_eq!(
+            binding.models_source_override.as_deref(),
+            Some("ai://models.dev/google")
         );
         let models = binding.static_models_override.unwrap();
         assert!(models.iter().any(|m| m == "gemini-2.5-pro"));
+        // Current-generation flash entries from the subscription catalog.
+        assert!(models.iter().any(|m| m == "gemini-3.6-flash-high"));
+        assert!(models.iter().any(|m| m == "gemini-3.7-flash-high"));
+    }
+
+    #[test]
+    fn bind_runtime_sets_gemini_cli_headers_and_models() {
+        let provider = test_provider("gemini-cli");
+        let credential = stored_credential();
+        let binding = GoogleSubscriptionDriver::GEMINI_CLI
+            .bind_runtime(&provider, &credential)
+            .unwrap();
+        assert_eq!(
+            binding.extra_headers.get("authorization").unwrap(),
+            "Bearer ya29.token"
+        );
+        assert_eq!(
+            binding.extra_headers.get("user-agent").unwrap(),
+            "GeminiCLI/0.1.5 (Windows; AMD64)"
+        );
+        // The Gemini CLI client does not send the antigravity fingerprint.
+        assert!(binding.extra_headers.get("x-goog-api-client").is_none());
+        assert!(binding.disable_default_auth);
+        assert_eq!(
+            binding.base_url_override.as_deref(),
+            Some("https://cloudcode-pa.googleapis.com")
+        );
+        assert_eq!(
+            binding.models_source_override.as_deref(),
+            Some("ai://models.dev/google")
+        );
+        let models = binding.static_models_override.unwrap();
+        assert!(models.iter().any(|m| m == "gemini-3.6-flash"));
+        assert!(models.iter().any(|m| m == "gemini-3.7-flash"));
+        // Antigravity-only tier-suffixed ids must not leak into this channel.
+        assert!(!models.iter().any(|m| m == "gemini-3.6-flash-high"));
     }
 }

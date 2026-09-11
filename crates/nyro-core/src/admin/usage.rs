@@ -258,6 +258,10 @@ enum UsageBackend {
     OpenAiCodex,
     /// xAI Grok subscription quota (cli-chat-proxy `/v1/billing`) via OAuth.
     Grok,
+    /// Google subscription quota (Google AI Pro / Code Assist) via OAuth:
+    /// per-model pools read from the Code Assist `fetchAvailableModels`
+    /// catalog (`quotaInfo.remainingFraction` / `resetTime`).
+    GoogleSubscription,
 }
 
 impl UsageBackend {
@@ -300,6 +304,19 @@ impl UsageBackend {
         if is_grok_identity {
             return Some(UsageBackend::Grok);
         }
+        // Google subscription channels (antigravity = Google AI Pro,
+        // gemini-cli = Code Assist) share the Code Assist quota backend.
+        let is_google_identity = identities
+            .iter()
+            .any(|value| value.eq_ignore_ascii_case("google"))
+            && provider.channel.as_deref().is_some_and(|channel| {
+                let channel = channel.trim();
+                channel.eq_ignore_ascii_case("antigravity")
+                    || channel.eq_ignore_ascii_case("gemini-cli")
+            });
+        if is_google_identity {
+            return Some(UsageBackend::GoogleSubscription);
+        }
         Self::detect_url(&provider.base_url)
     }
 
@@ -307,6 +324,8 @@ impl UsageBackend {
         let url = base_url.to_lowercase();
         if url.contains("chatgpt.com/backend-api/codex") {
             Some(UsageBackend::OpenAiCodex)
+        } else if url.contains("cloudcode-pa.googleapis.com") {
+            Some(UsageBackend::GoogleSubscription)
         } else if url.contains("cli-chat-proxy.grok.com") {
             Some(UsageBackend::Grok)
         } else if url.contains("bigmodel.cn") {
@@ -343,6 +362,7 @@ impl UsageBackend {
             UsageBackend::BailianCodingPlan => "bailian_coding_plan",
             UsageBackend::OpenAiCodex => "openai_codex",
             UsageBackend::Grok => "grok_plan",
+            UsageBackend::GoogleSubscription => "google_subscription",
         }
     }
 
@@ -373,10 +393,167 @@ impl UsageBackend {
             | UsageBackend::DeepSeek
             | UsageBackend::OpencodeGo
             | UsageBackend::OpenAiCodex
-            | UsageBackend::Grok => "global",
+            | UsageBackend::Grok
+            | UsageBackend::GoogleSubscription => "global",
             UsageBackend::ArkCoding | UsageBackend::BailianCodingPlan => "cn",
         }
     }
+}
+
+/// Strip the antigravity thinking-tier suffix so the variants of one model
+/// family collapse into a single pool row (`gemini-3.8-flash-high` and
+/// `-low` share the `gemini-3.8-flash` pool entry).
+fn google_model_family(model: &str) -> &str {
+    // Only gemini ids carry antigravity thinking tiers: `gpt-oss-120b-medium`
+    // ends in `-medium` as part of its own name and must stay intact.
+    if !model.starts_with("gemini-") {
+        return model;
+    }
+    for suffix in ["-extra-low", "-tiered", "-medium", "-high", "-low"] {
+        if let Some(base) = model.strip_suffix(suffix) {
+            return base;
+        }
+    }
+    model
+}
+
+/// Tier name of the collapsed first-party Gemini row. Every `gemini-*` family
+/// draws from one shared subscription bucket, so a single row stands for the
+/// provider-level usage instead of a dozen lockstep duplicates.
+const GEMINI_BUCKET_TIER: &str = "gemini";
+
+/// Usage value and reset time of one pool row.
+type GooglePool = (f64, Option<String>);
+
+/// True for the first-party families that share Google's subscription bucket.
+fn is_gemini_family(family: &str) -> bool {
+    family.starts_with("gemini")
+}
+
+/// Modal usage across the Gemini family rows — the shared bucket's value —
+/// with a reset time taken from a family that reports one.
+///
+/// The mode, not the maximum, is what identifies the shared bucket: a Gemini
+/// family holding its own separate quota must not masquerade as the bucket.
+/// Ties resolve to the higher usage, the conservative reading.
+fn google_gemini_bucket(
+    families: &std::collections::BTreeMap<String, GooglePool>,
+) -> Option<GooglePool> {
+    let mut counts: std::collections::BTreeMap<u64, (usize, Option<String>)> =
+        std::collections::BTreeMap::new();
+    for (family, (used_percent, resets_at)) in families {
+        if !is_gemini_family(family) {
+            continue;
+        }
+        // Keying on the rounded hundredth is sound: the value is already
+        // rounded to two decimals, so lockstep members share a bit-identical key.
+        let entry = counts
+            .entry((used_percent * 100.0).round() as u64)
+            .or_insert((0, None));
+        entry.0 += 1;
+        if entry.1.is_none() {
+            entry.1 = resets_at.clone();
+        }
+    }
+    counts
+        .into_iter()
+        .max_by_key(|(percent, (count, _))| (*count, *percent))
+        .map(|(percent, (_, resets_at))| (percent as f64 / 100.0, resets_at))
+}
+
+/// Build the provider's usage tiers from the Code Assist per-model quota
+/// catalog: the shared Gemini bucket alone stands for the provider.
+///
+/// Two folds run first:
+/// 1. Thinking-tier variants collapse onto their model family (the tightest
+///    variant wins — a family is only as usable as its most-spent pool).
+/// 2. First-party `gemini-*` families collapse onto one [`GEMINI_BUCKET_TIER`]
+///    row carrying the bucket's *modal* value: they draw from a single shared
+///    bucket and move in lockstep, so one row states the provider's usage. The
+///    mode (not the maximum) keeps a Gemini family with its own separate quota
+///    from masquerading as the shared bucket — and, because this row also
+///    feeds scheduling, from pausing the provider on its own.
+///
+/// Ancillary pools (third-party `claude-*` / `gpt-oss-*`, side Gemini quotas)
+/// are deliberately not surfaced: this backend is used for Gemini traffic.
+/// Internal noise entries (`chat_<digits>`, `tab_*_preview`) and models
+/// without `quotaInfo` are dropped.
+fn google_subscription_tiers(
+    models: &[crate::provider::google::antigravity::AvailableModel],
+) -> Vec<ProviderUsageTier> {
+    let mut families: std::collections::BTreeMap<String, GooglePool> =
+        std::collections::BTreeMap::new();
+    for model in models {
+        // These entries do report quota, but they cannot serve agent requests:
+        // a row for them would misrepresent routable capacity.
+        if crate::provider::google::antigravity::is_subscription_usage_noise(&model.id) {
+            continue;
+        }
+        let Some(remaining) = model.quota_remaining else {
+            continue;
+        };
+        // Two-decimal rounding keeps float artifacts (0.9 → 9.999…) out of
+        // the displayed percentages.
+        let used_percent = (((1.0 - remaining) * 10_000.0).round() / 100.0).clamp(0.0, 100.0);
+        let family = google_model_family(&model.id).to_string();
+        families
+            .entry(family)
+            .and_modify(|entry| {
+                if used_percent > entry.0 {
+                    entry.0 = used_percent;
+                    entry.1 = model.quota_resets_at.clone();
+                }
+            })
+            .or_insert((used_percent, model.quota_resets_at.clone()));
+    }
+
+    let bucket = google_gemini_bucket(&families);
+    let mut pools: Vec<ProviderUsageTier> = families
+        .into_iter()
+        .map(|(name, (used_percent, resets_at))| ProviderUsageTier {
+            name,
+            used_percent,
+            resets_at,
+        })
+        .collect();
+    pools.sort_by(|a, b| {
+        b.used_percent
+            .partial_cmp(&a.used_percent)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    match bucket {
+        Some((used_percent, resets_at)) => vec![ProviderUsageTier {
+            name: GEMINI_BUCKET_TIER.to_string(),
+            used_percent,
+            resets_at,
+        }],
+        // No first-party Gemini entry in the catalog (unexpected for a
+        // subscription account): report the remaining pools rather than an
+        // empty snapshot, which scheduling would read as "no data".
+        None => pools,
+    }
+}
+
+/// Provider-level scheduling observation for the Google subscription
+/// backend. Each tier is an independent per-model pool, so a single spent
+/// pool must never pause the whole provider: the observation carries the
+/// pool with the most headroom, i.e. routing only pauses when every pool is
+/// exhausted.
+fn google_scheduling_observation(tiers: &[ProviderUsageTier]) -> Vec<QuotaTierObservation> {
+    let best = tiers.iter().min_by(|a, b| {
+        a.used_percent
+            .partial_cmp(&b.used_percent)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    best.map(|tier| {
+        vec![QuotaTierObservation {
+            name: "subscription_pool".to_string(),
+            used_percent: tier.used_percent,
+            resets_at: tier.resets_at.clone(),
+        }]
+    })
+    .unwrap_or_default()
 }
 
 fn millis_to_iso8601(ms: i64) -> Option<String> {
@@ -1626,6 +1803,11 @@ impl AdminService {
                         resets_at: tier.resets_at.clone(),
                     })
                     .collect::<Vec<_>>();
+                let tiers = if usage.kind == UsageBackend::GoogleSubscription.kind() {
+                    google_scheduling_observation(&usage.tiers)
+                } else {
+                    tiers
+                };
                 usage.scheduling =
                     self.gw
                         .quota_registry
@@ -1660,12 +1842,16 @@ impl AdminService {
                 "usage query is not supported for this provider: only OpenAI Codex OAuth, GLM \
                  (bigmodel.cn / api.z.ai), MiniMax (api.minimaxi.com / api.minimax.io), \
                  Kimi (api.kimi.com), OpenCode Go (opencode.ai/zen), Ark \
-                 (volces.com), Bailian token-plan (token-plan.maas.aliyuncs.com) and \
-                 DeepSeek (api.deepseek.com) are supported"
+                 (volces.com), Bailian token-plan (token-plan.maas.aliyuncs.com), \
+                 DeepSeek (api.deepseek.com) and Google subscription OAuth \
+                 (Google AI Pro / Code Assist) are supported"
             )
         })?;
 
-        let api_key = if matches!(backend, UsageBackend::OpenAiCodex | UsageBackend::Grok) {
+        let api_key = if matches!(
+            backend,
+            UsageBackend::OpenAiCodex | UsageBackend::Grok | UsageBackend::GoogleSubscription
+        ) {
             None
         } else {
             Some(
@@ -1996,6 +2182,44 @@ impl AdminService {
                 let (level, tiers, is_available) = parse_grok_billing(&billing);
                 (tiers, Vec::new(), level, is_available, Vec::new())
             }
+            UsageBackend::GoogleSubscription => {
+                if provider.effective_auth_mode().trim() != "oauth" {
+                    anyhow::bail!("Google subscription usage query requires an OAuth provider");
+                }
+                let runtime = self
+                    .resolve_provider_runtime(&provider)
+                    .await
+                    .context("resolve Google subscription OAuth runtime for usage query")?;
+                let credential = runtime.credential.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!("Google subscription credential unavailable for usage query")
+                })?;
+                let project_id =
+                    crate::provider::google::antigravity::code_assist_project_id(Some(credential))?;
+                let user_agent =
+                    if crate::provider::google::gemini_cli::is_google_gemini_cli(&provider) {
+                        crate::provider::google::gemini_cli::GEMINI_CLI_USER_AGENT.to_string()
+                    } else {
+                        crate::provider::google::antigravity::antigravity_user_agent()
+                    };
+                let client = self.gw.http_client_for_provider(provider.use_proxy).await?;
+                let models = crate::provider::google::antigravity::fetch_available_models(
+                    &client,
+                    runtime.access_token.trim(),
+                    &project_id,
+                    &user_agent,
+                )
+                .await
+                .context("fetch Google subscription model catalog for usage query")?;
+                let tiers = google_subscription_tiers(&models);
+                let level = credential
+                    .meta
+                    .get("tier_id")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(ToString::to_string);
+                (tiers, Vec::new(), level, Some(true), Vec::new())
+            }
         };
 
         let authoritative = backend.has_authoritative_observation(&tiers, is_available);
@@ -2067,7 +2291,12 @@ async fn provider_usage_monitorable(admin: &AdminService, provider: &Provider) -
     let Some(backend) = UsageBackend::detect(provider) else {
         return false;
     };
-    if backend == UsageBackend::OpenAiCodex {
+    // OAuth backends carry no API key; they are monitorable whenever the
+    // provider is in OAuth mode.
+    if matches!(
+        backend,
+        UsageBackend::OpenAiCodex | UsageBackend::Grok | UsageBackend::GoogleSubscription
+    ) {
         return provider.effective_auth_mode().trim() == "oauth";
     }
     if usage_api_key(provider).is_none() {
@@ -3339,6 +3568,263 @@ mod tests {
         assert!(parse_opencode_tiers(&no_percent).is_empty());
         // No usage object at all.
         assert!(parse_opencode_tiers(&serde_json::json!({})).is_empty());
+    }
+
+    #[test]
+    fn google_subscription_detection_matches_channels_and_host() {
+        let antigravity = provider_for_usage(
+            Some("google"),
+            Some("google"),
+            Some("antigravity"),
+            "https://daily-cloudcode-pa.googleapis.com",
+        );
+        assert_eq!(
+            UsageBackend::detect(&antigravity),
+            Some(UsageBackend::GoogleSubscription)
+        );
+
+        let gemini_cli = provider_for_usage(
+            Some("google"),
+            Some("google"),
+            Some("gemini-cli"),
+            "https://cloudcode-pa.googleapis.com",
+        );
+        assert_eq!(
+            UsageBackend::detect(&gemini_cli),
+            Some(UsageBackend::GoogleSubscription)
+        );
+
+        // API-key channel keeps no usage backend.
+        let api_key = provider_for_usage(
+            Some("google"),
+            Some("google"),
+            Some("default"),
+            "https://generativelanguage.googleapis.com",
+        );
+        assert_eq!(UsageBackend::detect(&api_key), None);
+
+        // Imported row without vendor fields falls back to host matching.
+        let imported = provider_for_usage(None, None, None, "https://cloudcode-pa.googleapis.com");
+        assert_eq!(
+            UsageBackend::detect(&imported),
+            Some(UsageBackend::GoogleSubscription)
+        );
+    }
+
+    #[test]
+    fn google_subscription_tiers_collapse_variants_and_hide_other_pools() {
+        use crate::provider::google::antigravity::AvailableModel;
+        let models = vec![
+            AvailableModel {
+                id: "gemini-3.8-flash-high".into(),
+                quota_remaining: Some(0.0),
+                quota_resets_at: Some("2026-09-11T08:54:27Z".into()),
+            },
+            AvailableModel {
+                id: "gemini-3.8-flash-low".into(),
+                quota_remaining: Some(0.5),
+                quota_resets_at: None,
+            },
+            AvailableModel {
+                id: "gemini-3.8-flash-tiered".into(),
+                quota_remaining: Some(1.0),
+                quota_resets_at: None,
+            },
+            // Non-family ids stay their own pool; gpt-oss keeps its -medium.
+            AvailableModel {
+                id: "gpt-oss-120b-medium".into(),
+                quota_remaining: Some(0.25),
+                quota_resets_at: None,
+            },
+            AvailableModel {
+                id: "claude-sonnet-4-6".into(),
+                quota_remaining: Some(0.9),
+                quota_resets_at: None,
+            },
+            // Internal noise drops before the quota check: chat_20706 reports a
+            // full quota and must still not produce a row.
+            AvailableModel {
+                id: "chat_20706".into(),
+                quota_remaining: Some(1.0),
+                quota_resets_at: None,
+            },
+            AvailableModel {
+                id: "tab_flash_lite_preview".into(),
+                quota_remaining: Some(1.0),
+                quota_resets_at: None,
+            },
+            AvailableModel {
+                id: "tab_jump_flash_lite_preview".into(),
+                quota_remaining: Some(1.0),
+                quota_resets_at: None,
+            },
+            // No quotaInfo → skipped.
+            AvailableModel {
+                id: "chat_23310".into(),
+                quota_remaining: None,
+                quota_resets_at: None,
+            },
+        ];
+        let tiers = google_subscription_tiers(&models);
+        let pairs: Vec<(String, f64)> = tiers
+            .iter()
+            .map(|tier| (tier.name.clone(), tier.used_percent))
+            .collect();
+        // The provider reports as the shared Gemini bucket alone: the family's
+        // variants collapse into it, carrying the tightest variant's usage and
+        // reset; third-party pools get no row.
+        assert_eq!(pairs, vec![("gemini".to_string(), 100.0)]);
+        // Internal noise never surfaces, even when it reports quota.
+        assert!(
+            tiers
+                .iter()
+                .all(|tier| !tier.name.starts_with("chat_") && !tier.name.starts_with("tab_")),
+            "noise leaked into usage tiers: {pairs:?}"
+        );
+        assert_eq!(tiers[0].resets_at.as_deref(), Some("2026-09-11T08:54:27Z"));
+    }
+
+    #[test]
+    fn google_subscription_tiers_use_the_modal_shared_bucket() {
+        use crate::provider::google::antigravity::AvailableModel;
+        let model = |id: &str, remaining: f64| AvailableModel {
+            id: id.into(),
+            quota_remaining: Some(remaining),
+            quota_resets_at: Some("2026-09-11T08:54:27Z".into()),
+        };
+        let models = vec![
+            // Three families in lockstep: one shared bucket, reported once.
+            model("gemini-2.5-flash", 0.85),
+            model("gemini-3.8-flash-high", 0.85),
+            model("gemini-2.5-pro", 0.85),
+            // A spent side pool with its own quota must not speak for the
+            // bucket — and gets no row of its own either.
+            model("gemini-3.1-flash-image", 0.0),
+            model("claude-sonnet-4-6", 0.99),
+        ];
+        let pairs: Vec<(String, f64)> = google_subscription_tiers(&models)
+            .iter()
+            .map(|tier| (tier.name.clone(), tier.used_percent))
+            .collect();
+        assert_eq!(pairs, vec![("gemini".to_string(), 15.0)]);
+    }
+
+    #[test]
+    fn google_subscription_tiers_fall_back_without_gemini_entries() {
+        use crate::provider::google::antigravity::AvailableModel;
+        let model = |id: &str, remaining: f64| AvailableModel {
+            id: id.into(),
+            quota_remaining: Some(remaining),
+            quota_resets_at: None,
+        };
+        // No first-party Gemini id at all: report the remaining pools instead
+        // of an empty snapshot that scheduling would read as "no data".
+        let models = vec![model("claude-sonnet-4-6", 0.9), model("gpt-oss-120b-medium", 0.25)];
+        let pairs: Vec<(String, f64)> = google_subscription_tiers(&models)
+            .iter()
+            .map(|tier| (tier.name.clone(), tier.used_percent))
+            .collect();
+        assert_eq!(
+            pairs,
+            vec![
+                ("gpt-oss-120b-medium".to_string(), 75.0),
+                ("claude-sonnet-4-6".to_string(), 10.0),
+            ]
+        );
+    }
+
+    #[test]
+    fn google_subscription_tiers_fold_the_live_catalog_shape() {
+        use crate::provider::google::antigravity::AvailableModel;
+        let model = |id: &str, remaining: f64| AvailableModel {
+            id: id.into(),
+            quota_remaining: Some(remaining),
+            quota_resets_at: Some("2026-09-11T08:54:27Z".into()),
+        };
+        // Catalog shape observed on the production account: fifteen first-party
+        // Gemini families in lockstep, three third-party pools, four noise
+        // entries. The whole provider must render as the single Gemini row.
+        let mut models: Vec<AvailableModel> = [
+            "gemini-2.5-flash",
+            "gemini-2.5-flash-lite",
+            "gemini-2.5-flash-thinking",
+            "gemini-2.5-pro",
+            "gemini-3-flash",
+            "gemini-3-flash-agent",
+            "gemini-3.1-flash-image",
+            "gemini-3.1-flash-lite",
+            "gemini-3.1-pro",
+            "gemini-3.5-flash",
+            "gemini-3.5-flash-lite",
+            "gemini-3.6-flash",
+            "gemini-3.7-flash",
+            "gemini-3.8-flash",
+            "gemini-pro-agent",
+        ]
+        .iter()
+        .map(|id| model(id, 0.8756))
+        .collect();
+        models.extend(
+            [
+                "claude-opus-4-6-thinking",
+                "claude-sonnet-4-6",
+                "gpt-oss-120b-medium",
+            ]
+            .iter()
+            .map(|id| model(id, 0.9948)),
+        );
+        models.extend(
+            [
+                "chat_20706",
+                "chat_23310",
+                "tab_flash_lite_preview",
+                "tab_jump_flash_lite_preview",
+            ]
+            .iter()
+            .map(|id| model(id, 1.0)),
+        );
+
+        let pairs: Vec<(String, f64)> = google_subscription_tiers(&models)
+            .iter()
+            .map(|tier| (tier.name.clone(), tier.used_percent))
+            .collect();
+        // One row for the whole provider: the shared bucket the fifteen Gemini
+        // families draw from. Third-party pools and internal noise are hidden.
+        assert_eq!(pairs, vec![("gemini".to_string(), 12.44)]);
+    }
+
+    #[test]
+    fn google_scheduling_observation_keeps_provider_eligible_while_a_pool_has_room() {
+        let tiers = vec![
+            ProviderUsageTier {
+                name: "gemini-2.5-pro".into(),
+                used_percent: 100.0,
+                resets_at: Some("2026-09-11T08:00:00Z".into()),
+            },
+            ProviderUsageTier {
+                name: "gemini-3.8-flash".into(),
+                used_percent: 35.0,
+                resets_at: Some("2026-09-11T09:00:00Z".into()),
+            },
+        ];
+        let observations = google_scheduling_observation(&tiers);
+        assert_eq!(observations.len(), 1);
+        // One spent pool must not pause the provider: the observation is the
+        // pool with the most headroom.
+        assert_eq!(observations[0].name, "subscription_pool");
+        assert_eq!(observations[0].used_percent, 35.0);
+
+        // Every pool spent → provider-level pause is correct.
+        let all_spent = vec![ProviderUsageTier {
+            name: "gemini-2.5-pro".into(),
+            used_percent: 100.0,
+            resets_at: None,
+        }];
+        assert_eq!(
+            google_scheduling_observation(&all_spent)[0].used_percent,
+            100.0
+        );
+        assert!(google_scheduling_observation(&[]).is_empty());
     }
 
     #[tokio::test]
