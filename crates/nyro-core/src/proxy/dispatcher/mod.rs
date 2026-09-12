@@ -26,6 +26,7 @@ mod compat;
 mod non_stream;
 mod param_overrides;
 mod stream;
+mod stream_probe;
 mod streaming;
 mod util;
 use self::accumulator::*;

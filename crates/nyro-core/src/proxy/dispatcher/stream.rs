@@ -25,6 +25,7 @@ use crate::proxy::client::ProxyClient;
 use crate::proxy::context::RequestContext;
 use crate::proxy::observability::headers_to_json;
 
+use super::stream_probe::{ProbeOutcome, probe_stream};
 use super::{CallCtx, LogBuilder, RequestExtras, ai_response_to_deltas, error_response};
 
 // ── Streaming response handler ────────────────────────────────────────────────
@@ -342,9 +343,77 @@ pub(super) async fn handle_stream(
     }
 
     // ── IR round-trip path ────────────────────────────────────────────────────
+    // Pre-commit probe (see stream_probe): decode upstream chunks without
+    // consuming any downstream conversion state (tool route plan, OnResponse
+    // hooks, ingress formatter) until the stream is committable, so a
+    // transient zero-payload terminal — the Gemini MALFORMED_FUNCTION_CALL
+    // sampling glitch — fails the attempt before anything reaches the client
+    // and the dispatcher can fail over to the next target.
     let mut stream_parser = egress.handler().make_stream_response_decoder();
-    let mut stream_formatter = ingress.handler().make_stream_response_encoder();
     let mut byte_stream = resp.bytes_stream();
+    let probe_request_id = log.diagnostic.client_request_id.clone().unwrap_or_default();
+    let probe = probe_stream(
+        &mut byte_stream,
+        stream_parser.as_mut(),
+        raw_chunk_hook.as_ref(),
+        log.performance.as_ref(),
+        ingress,
+        &probe_request_id,
+        upstream_start,
+    )
+    .await;
+
+    if let ProbeOutcome::TransientZeroPayload(failure) = probe {
+        // The attempt has terminally failed and nothing has reached the
+        // client yet: record the failure on this attempt, emit its
+        // request-log row (upstream 200 + finishReason/finishMessage + usage
+        // preserved), and answer with the health-neutral synthetic 502. The
+        // dispatcher's ordinary retry policy then advances to the next
+        // target of the same model's ordered candidates — selector-appended
+        // fallback rows included — never a same-target replay and never a
+        // hop into another route.
+        //
+        // Known limitation (accepted): the original-wire Terminal observer is
+        // one-shot per upstream connection and MALFORMED_FUNCTION_CALL is not
+        // in its reason whitelist, so confirmed_completed stays false for
+        // these attempts. The explicit record_failure below is what keeps the
+        // row classified failed/upstream_error instead of ambiguous_terminal;
+        // extending that whitelist would change classification for every
+        // Google upstream — out of scope.
+        tracing::warn!(
+            stop_reason = %failure.stop_reason,
+            "transient zero-payload stream terminal; failing the attempt for dispatcher failover"
+        );
+        if let Some(attempt) = &log.performance {
+            let error = anyhow::anyhow!(super::stream_probe::transient_failure_reason(&failure));
+            attempt.record_failure(
+                "failed",
+                "upstream_error",
+                "upstream_response",
+                error.as_ref(),
+            );
+        }
+        super::stream_probe::emit_transient_failure(
+            &log,
+            &failure,
+            upstream_req_hdrs_str,
+            upstream_req_body_str,
+            upstream_hdrs_str,
+        );
+        return super::stream_probe::transient_terminal_error_response(&failure);
+    }
+
+    let ProbeOutcome::Commit {
+        buffered: probe_buffered,
+        terminal_error: probe_terminal_error,
+        chunks_count: probe_chunks_count,
+        first_chunk_ms: probe_first_chunk_ms,
+    } = probe
+    else {
+        unreachable!("transient probe outcomes return in the failure branch above")
+    };
+
+    let mut stream_formatter = ingress.handler().make_stream_response_encoder();
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<String, Infallible>>(64);
 
     // Move the log builder into the spawn.  Extract the fields we need AFTER
@@ -361,11 +430,41 @@ pub(super) async fn handle_stream(
     tokio::spawn(async move {
         let mut accumulator = super::LogUsageAccumulator::default();
         // Wire capture is shared in Attempt; no duplicate full log buffers.
-        let mut chunks_count: i32 = 0;
-        let mut first_chunk_ms: Option<i64> = None;
+        // Upstream-side counters start from the pre-commit probe so stream
+        // metrics keep covering the whole upstream exchange.
+        let mut chunks_count: i32 = probe_chunks_count;
+        let mut first_chunk_ms: Option<i64> = probe_first_chunk_ms;
         let mut terminal_error_sent = false;
 
-        loop {
+        // Pre-commit replay: the probe buffered pre-restore deltas without
+        // touching the tool route plan / OnResponse hooks / formatter, so the
+        // identical per-batch pipeline runs here, in order, before the live
+        // upstream loop continues.
+        {
+            let mut ai_deltas = tool_route_plan.restore_stream_deltas(probe_buffered);
+            hook_state.apply(&mut ai_deltas).await;
+            accumulator.apply_all(&ai_deltas);
+            let events = stream_formatter.format_deltas(&ai_deltas);
+            for ev in events {
+                let sse = ev.to_sse_string();
+                if tx.send(Ok(sse)).await.is_err() {
+                    return;
+                }
+                if let Some(p) = &log_ir.performance {
+                    p.note_client_frame_sent();
+                }
+            }
+        }
+        if let Some(event) = probe_terminal_error {
+            if tx.send(Ok(event)).await.is_ok()
+                && let Some(p) = &log_ir.performance
+            {
+                p.note_client_frame_sent();
+            }
+            terminal_error_sent = true;
+        }
+
+        while !terminal_error_sent {
             let chunk = tokio::select! {
                 biased;
                 _ = tx.closed() => break,

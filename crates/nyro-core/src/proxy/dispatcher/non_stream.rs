@@ -938,6 +938,276 @@ mod tests {
         .expect("upstream request json");
         assert_eq!(sent["stream"], true, "force-stream must set stream:true");
     }
+
+    /// Serve a scripted sequence of SSE replies, one per upstream call; extra
+    /// calls repeat the last reply. Returns the URL and the call counter.
+    async fn serve_scripted_streams(
+        replies: Vec<String>,
+    ) -> (
+        String,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind scripted upstream");
+        let addr = listener.local_addr().expect("scripted upstream addr");
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = calls.clone();
+        let job = tokio::spawn(async move {
+            let replies = std::sync::Arc::new(replies);
+            async fn handler(
+                axum::extract::State((replies, calls)): axum::extract::State<(
+                    std::sync::Arc<Vec<String>>,
+                    std::sync::Arc<std::sync::atomic::AtomicUsize>,
+                )>,
+            ) -> axum::response::Response {
+                let index = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let reply = replies
+                    .get(index.min(replies.len().saturating_sub(1)))
+                    .cloned()
+                    .unwrap_or_default();
+                ([("content-type", "text/event-stream")], reply).into_response()
+            }
+            let app = axum::Router::new()
+                .route("/", axum::routing::post(handler))
+                .route("/*path", axum::routing::post(handler))
+                .with_state((replies, counter));
+            axum::serve(listener, app)
+                .await
+                .expect("scripted upstream serve");
+        });
+        (format!("http://{addr}"), calls, job)
+    }
+
+    async fn force_stream_call_ctx(gw: &Gateway, url: &str) -> CallCtx<'static> {
+        let provider = Provider {
+            id: "provider-gemini-force".into(),
+            name: "Gemini force-stream".into(),
+            vendor: Some("google".into()),
+            protocol: GOOGLE_GEMINI_GENERATE_CONTENT_V1BETA.to_string(),
+            base_url: url.into(),
+            protocol_mode: "fixed".into(),
+            protocol_endpoints: Vec::new(),
+            preset_key: None,
+            channel: Some("default".into()),
+            models_source: None,
+            static_models: None,
+            api_key: "local-fake-token".into(),
+            auth_mode: "apikey".into(),
+            use_proxy: false,
+            fast_mode: false,
+            last_test_success: None,
+            last_test_at: None,
+            is_enabled: true,
+            created_at: String::new(),
+            updated_at: String::new(),
+        };
+        // Leak-free: the provider lives on the caller's stack via Box::leak
+        // scoped to the test; tests are single-shot so this is acceptable.
+        let provider: &'static Provider = Box::leak(Box::new(provider));
+        CallCtx {
+            performance: None,
+            gw: gw.clone(),
+            provider,
+            model_id: "route-gemini-force",
+            model_name: "Gemini force route",
+            egress: GOOGLE_GEMINI_GENERATE_CONTENT_V1BETA,
+            ingress: OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1,
+            ingress_str: "openai/chat/v1",
+            egress_str: "google/gemini/generateContent/v1beta",
+            request_model: "virtual-gemini",
+            actual_model: "gemini-3.8-flash",
+            backend_model: "gemini-3.8-flash",
+            api_key_id: None,
+            api_key_name: None,
+            is_stream: false,
+            enable_payload: None,
+            reasoning_effort: None,
+            route_decision: None,
+            start: std::time::Instant::now(),
+            req_ext: crate::proxy::context::ContextBag::new(),
+        }
+    }
+
+    /// Case: malformed zero-payload terminal on the force-stream aggregation
+    /// path fails the single attempt — exactly one upstream call, synthetic
+    /// 502 naming the finish reason, and a failed request-log row that keeps
+    /// the upstream 200. The healthy second scripted reply must never be
+    /// fetched: the identical call is never replayed on the same target.
+    #[tokio::test]
+    async fn malformed_zero_payload_force_stream_fails_attempt_without_replay() {
+        let config = GatewayConfig {
+            data_dir: std::env::temp_dir()
+                .join(format!("nyro-malformed-retry-{}", uuid::Uuid::new_v4())),
+            ..Default::default()
+        };
+        let (gw, mut log_rx) = Gateway::new(config).await.expect("gateway init");
+        let malformed = "data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"thoughtSignature\":\"EsMLCsALARFNMg9yaNHgdF2cRMl8ynZFpcf9EyEeMi63fPN1tymx\",\"text\":\"\"}]},\"finishReason\":\"MALFORMED_FUNCTION_CALL\",\"finishMessage\":\"Malformed function call: Failed to parse function call: Function call is empty - no input to parse.\"}],\"usageMetadata\":{\"promptTokenCount\":148075,\"totalTokenCount\":148414,\"cachedContentTokenCount\":142963,\"thoughtsTokenCount\":339},\"modelVersion\":\"gemini-3.8-flash\",\"responseId\":\"Ab-kaueRGtasg8UPl7yc8A8\"}
+
+";
+        let healthy = "data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"recovered answer\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":5,\"candidatesTokenCount\":2,\"totalTokenCount\":7},\"modelVersion\":\"gemini-3.8-flash\",\"responseId\":\"ok-1\"}
+
+";
+        let (url, calls, job) =
+            serve_scripted_streams(vec![malformed.to_string(), healthy.to_string()]).await;
+        let call_ctx = force_stream_call_ctx(&gw, &url).await;
+        let mut req_ctx = RequestContext::new(
+            OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1,
+            std::time::Duration::from_secs(10),
+        );
+        let mut req_ir = AiRequest::new("virtual-gemini", Vec::new());
+        let host = HostContext::new(&gw);
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            handle_non_stream_via_upstream_stream(
+                ProxyClient::new(
+                    reqwest::Client::builder()
+                        .no_proxy()
+                        .build()
+                        .expect("client"),
+                ),
+                &url,
+                ReqwestHeaderMap::new(),
+                serde_json::json!({"contents": []}),
+                &call_ctx,
+                ToolRoutePlan::default(),
+                None,
+                &mut req_ctx,
+                &mut req_ir,
+                &host,
+            ),
+        )
+        .await
+        .expect("handler must terminate");
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let value: Value = serde_json::from_slice(&bytes).expect("json body");
+        let message = value["error"]["message"].as_str().expect("error message");
+        assert!(
+            message.contains("finish_reason=malformed_function_call"),
+            "message must name the finish reason: {message}"
+        );
+        assert!(
+            message.contains("Function call is empty"),
+            "message should carry the upstream finish text: {message}"
+        );
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "no same-target replay: the second scripted reply stays unfetched"
+        );
+        let mut rows = Vec::new();
+        for _ in 0..1 {
+            rows.push(
+                tokio::time::timeout(std::time::Duration::from_secs(3), log_rx.recv())
+                    .await
+                    .expect("log row")
+                    .expect("log channel"),
+            );
+        }
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].client_status_code, 502, "attempt row is failed");
+        assert_eq!(rows[0].upstream_status_code, Some(200));
+        assert!(log_rx.try_recv().is_err());
+        job.abort();
+    }
+
+    /// Case: a lone malformed force-stream reply → synthetic 502 plus one
+    /// failure row whose diagnostic carries the upstream finish reason,
+    /// upstream_error classification, and the upstream usage metadata.
+    #[tokio::test]
+    async fn malformed_zero_payload_force_stream_row_keeps_details() {
+        let config = GatewayConfig {
+            data_dir: std::env::temp_dir()
+                .join(format!("nyro-malformed-exhaust-{}", uuid::Uuid::new_v4())),
+            ..Default::default()
+        };
+        let (gw, mut log_rx) = Gateway::new(config).await.expect("gateway init");
+        let malformed = "data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"thoughtSignature\":\"EsMLCsALARFNMg9yaNHgdF2cRMl8ynZFpcf9EyEeMi63fPN1tymx\",\"text\":\"\"}]},\"finishReason\":\"MALFORMED_FUNCTION_CALL\",\"finishMessage\":\"Malformed function call: Failed to parse function call: Function call is empty - no input to parse.\"}],\"usageMetadata\":{\"promptTokenCount\":148075,\"totalTokenCount\":148414,\"cachedContentTokenCount\":142963,\"thoughtsTokenCount\":339},\"modelVersion\":\"gemini-3.8-flash\",\"responseId\":\"Ab-kaueRGtasg8UPl7yc8A8\"}
+
+";
+        let (url, calls, job) = serve_scripted_streams(vec![malformed.to_string()]).await;
+        let call_ctx = force_stream_call_ctx(&gw, &url).await;
+        let mut req_ctx = RequestContext::new(
+            OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1,
+            std::time::Duration::from_secs(10),
+        );
+        let mut req_ir = AiRequest::new("virtual-gemini", Vec::new());
+        let host = HostContext::new(&gw);
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            handle_non_stream_via_upstream_stream(
+                ProxyClient::new(
+                    reqwest::Client::builder()
+                        .no_proxy()
+                        .build()
+                        .expect("client"),
+                ),
+                &url,
+                ReqwestHeaderMap::new(),
+                serde_json::json!({"contents": []}),
+                &call_ctx,
+                ToolRoutePlan::default(),
+                None,
+                &mut req_ctx,
+                &mut req_ir,
+                &host,
+            ),
+        )
+        .await
+        .expect("handler must terminate");
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let value: Value = serde_json::from_slice(&bytes).expect("json body");
+        let message = value["error"]["message"].as_str().expect("error message");
+        assert!(
+            message.contains("finish_reason=malformed_function_call"),
+            "message must name the finish reason: {message}"
+        );
+        assert!(
+            message.contains("Function call is empty"),
+            "message should carry the upstream finish text: {message}"
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let mut rows = Vec::new();
+        for _ in 0..1 {
+            rows.push(
+                tokio::time::timeout(std::time::Duration::from_secs(3), log_rx.recv())
+                    .await
+                    .expect("log row")
+                    .expect("log channel"),
+            );
+        }
+        let row = &rows[0];
+        assert_eq!(row.client_status_code, 502);
+        assert_eq!(row.upstream_status_code, Some(200), "upstream was a 200");
+        assert_eq!(row.diagnostic.attempt_outcome, "failed");
+        assert_eq!(
+            row.diagnostic.failure_kind.as_deref(),
+            Some("upstream_error")
+        );
+        let causes = row.diagnostic.error_causes.join(" | ");
+        assert!(
+            causes.contains("finish_reason=malformed_function_call"),
+            "diagnostic must name the finish reason: {causes}"
+        );
+        assert!(
+            causes.contains("Function call is empty"),
+            "diagnostic should carry the upstream finish text: {causes}"
+        );
+        assert_eq!(
+            row.usage.prompt_tokens, 148075,
+            "upstream usage metadata must be preserved on the failure row"
+        );
+        assert_eq!(row.usage.total_tokens, 148414);
+        assert!(log_rx.try_recv().is_err());
+        job.abort();
+    }
 }
 
 // ── Force-stream non-stream handler ──────────────────────────────────────────
@@ -977,7 +1247,15 @@ pub(super) async fn handle_non_stream_via_upstream_stream(
         obj.insert("stream".to_string(), Value::Bool(true));
     }
 
-    let upstream_start = std::time::Instant::now();
+    let upstream_req_hdrs_str = crate::proxy::observability::reqwest_headers_to_json(&headers);
+    let upstream_req_body_str = crate::logging::payload::capture_json(&body, true).body;
+
+    // One upstream call: a transient zero-payload terminal — the Gemini
+    // MALFORMED_FUNCTION_CALL sampling glitch — fails the attempt directly
+    // with a health-neutral synthetic 502 so the dispatcher's ordinary
+    // retry policy advances to the next target (see stream_probe). The
+    // identical call is never replayed on the same target.
+    let attempt_start = std::time::Instant::now();
     let call_result = match client.call_stream(url, headers.clone(), body.clone()).await {
         Ok(r) => r,
         Err(e) => {
@@ -990,12 +1268,10 @@ pub(super) async fn handle_non_stream_via_upstream_stream(
             return error_response(502, &format!("upstream error: {e:#}"));
         }
     };
-    let upstream_latency_ms = upstream_start.elapsed().as_millis() as i64;
+    let upstream_latency_ms = attempt_start.elapsed().as_millis() as i64;
 
     let (resp, status) = call_result;
     let upstream_hdrs_str = headers_to_json(resp.headers());
-    let upstream_req_hdrs_str = crate::proxy::observability::reqwest_headers_to_json(&headers);
-    let upstream_req_body_str = crate::logging::payload::capture_json(&body, true).body;
 
     if status >= 400 {
         let err_body: Value = resp
@@ -1005,7 +1281,7 @@ pub(super) async fn handle_non_stream_via_upstream_stream(
         let err_body_str = crate::logging::payload::capture_json(&err_body, true).body;
         log.status(status)
             .upstream_url(url)
-            .with_upstream_request(upstream_req_hdrs_str, upstream_req_body_str)
+            .with_upstream_request(upstream_req_hdrs_str.clone(), upstream_req_body_str.clone())
             .with_upstream_response(
                 status as i32,
                 upstream_hdrs_str,
@@ -1025,25 +1301,31 @@ pub(super) async fn handle_non_stream_via_upstream_stream(
     let mut byte_stream = resp.bytes_stream();
     let mut accumulator = StreamResponseAccumulator::default();
     let mut raw_text = String::new();
+    // Verbatim upstream text (bounded), retained for transient-failure
+    // log rows; `raw_text` above follows the JSON-fallback semantics.
+    let mut attempt_raw = String::new();
     let mut json_fallback = None;
+    let mut chunks_count: i32 = 0;
 
     while let Some(chunk) = byte_stream.next().await {
         let bytes = match chunk {
             Ok(b) => b,
             Err(e) => {
                 log.status(502)
-                    .error(format!("stream read error: {e}"))
-                    .with_upstream_request(upstream_req_hdrs_str, upstream_req_body_str)
-                    .upstream_resp_headers(upstream_hdrs_str)
-                    .resp_body(Some(
-                        serde_json::json!({ "error": { "message": format!("upstream stream error: {e}") } })
-                            .to_string(),
-                    ))
-                    .emit();
+                        .error(format!("stream read error: {e}"))
+                        .with_upstream_request(upstream_req_hdrs_str.clone(), upstream_req_body_str.clone())
+                        .upstream_resp_headers(upstream_hdrs_str.clone())
+                        .resp_body(Some(
+                            serde_json::json!({ "error": { "message": format!("upstream stream error: {e}") } })
+                                .to_string(),
+                        ))
+                        .emit();
                 return error_response(502, &format!("upstream stream error: {e}"));
             }
         };
+        chunks_count += 1;
         let text = String::from_utf8_lossy(&bytes);
+        super::stream_probe::append_capped(&mut attempt_raw, &text);
         if json_fallback != Some(false) {
             raw_text.push_str(&text);
             if let Some(first) = raw_text.trim_start().chars().next() {
@@ -1078,10 +1360,13 @@ pub(super) async fn handle_non_stream_via_upstream_stream(
                     log.status(502)
                         .error(format!("upstream stream conversion error: {error:#}"))
                         .upstream_url(url)
-                        .with_upstream_request(upstream_req_hdrs_str, upstream_req_body_str)
+                        .with_upstream_request(
+                            upstream_req_hdrs_str.clone(),
+                            upstream_req_body_str.clone(),
+                        )
                         .with_upstream_response(
                             status as i32,
-                            upstream_hdrs_str,
+                            upstream_hdrs_str.clone(),
                             None,
                             Some(upstream_latency_ms),
                         )
@@ -1107,10 +1392,10 @@ pub(super) async fn handle_non_stream_via_upstream_stream(
             log.status(502)
                 .error(format!("upstream stream conversion error: {error:#}"))
                 .upstream_url(url)
-                .with_upstream_request(upstream_req_hdrs_str, upstream_req_body_str)
+                .with_upstream_request(upstream_req_hdrs_str.clone(), upstream_req_body_str.clone())
                 .with_upstream_response(
                     status as i32,
-                    upstream_hdrs_str,
+                    upstream_hdrs_str.clone(),
                     None,
                     Some(upstream_latency_ms),
                 )
@@ -1147,6 +1432,57 @@ pub(super) async fn handle_non_stream_via_upstream_stream(
     }
     if ai_resp.stop_reason.is_none() {
         ai_resp.stop_reason = Some("stop".to_string());
+    }
+
+    // Transient zero-payload terminal (Gemini MALFORMED_FUNCTION_CALL):
+    // the attempt has terminally failed — record it on this attempt,
+    // emit its request-log row (upstream 200 + finishReason/finishMessage
+    // + usage preserved), and answer with the health-neutral synthetic
+    // 502 so the dispatcher's ordinary retry policy advances to the next
+    // target of the same model's ordered candidates. Never a same-target
+    // replay.
+    // Zero payload = no text, no thinking text, no tool calls. Opaque
+    // `items` (vendor metadata passthrough) and usage do not count.
+    let transient = ai_resp
+        .stop_reason
+        .as_deref()
+        .is_some_and(super::stream_probe::is_transient_stream_terminal)
+        && ai_resp.content.is_empty()
+        && ai_resp.tool_calls.is_empty()
+        && ai_resp
+            .reasoning_content
+            .as_deref()
+            .is_none_or(str::is_empty);
+    if transient {
+        let failure = super::stream_probe::TransientStreamFailure {
+            stop_reason: ai_resp.stop_reason.clone().unwrap_or_default(),
+            finish_message: super::stream_probe::extract_finish_message(&attempt_raw),
+            usage: ai_resp.usage.clone(),
+            chunks_count,
+            raw_text: attempt_raw,
+            latency_ms: attempt_start.elapsed().as_millis() as i64,
+        };
+        tracing::warn!(
+            stop_reason = %failure.stop_reason,
+            "transient zero-payload aggregation terminal; failing the attempt for dispatcher failover"
+        );
+        if let Some(attempt) = &call_ctx.performance {
+            let error = anyhow::anyhow!(super::stream_probe::transient_failure_reason(&failure));
+            attempt.record_failure(
+                "failed",
+                "upstream_error",
+                "upstream_response",
+                error.as_ref(),
+            );
+        }
+        super::stream_probe::emit_transient_failure(
+            &log,
+            &failure,
+            upstream_req_hdrs_str,
+            upstream_req_body_str,
+            upstream_hdrs_str,
+        );
+        return super::stream_probe::transient_terminal_error_response(&failure);
     }
 
     // ── OnResponse phase (full body) ─────────────────────────────────────────
