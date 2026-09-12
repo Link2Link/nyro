@@ -2181,7 +2181,7 @@ fn gemini_encoder_sanitizes_unsupported_json_schema_fields() {
                     "type": "array",
                     "items": {
                         "$ref": "#/$defs/entry",
-                        "ref": "legacy"
+                        "ref": "#/$defs/entry"
                     }
                 }
             },
@@ -2219,6 +2219,7 @@ fn gemini_encoder_sanitizes_unsupported_json_schema_fields() {
     assert!(!rendered.contains("$ref"));
     assert!(!rendered.contains("\"ref\""));
     assert!(!rendered.contains("$defs"));
+    assert_eq!(params["properties"]["items"]["items"]["type"], "string");
 }
 
 fn responses_request(messages: Vec<Message>, stream: bool) -> AiRequest {

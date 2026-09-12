@@ -749,11 +749,10 @@ fn anthropic_tool_call_to_google() {
         call_part["functionCall"]["args"],
         json!({"location": "NYC"})
     );
-    // Nyro writes the tool message's `tool_call_id` as the functionResponse
-    // name and wraps the string result in `{"result": ...}` (llm-bridge
-    // resolves the tool name from the earlier call and wraps in `{output: ...}`).
+    // IDs pair the result; name must be the identified function's actual name.
     let result_part = contents[2]["parts"][0].clone();
-    assert_eq!(result_part["functionResponse"]["name"], "toolu_abc123");
+    assert_eq!(result_part["functionResponse"]["name"], "get_weather");
+    assert_eq!(result_part["functionResponse"]["id"], "toolu_abc123");
     assert_eq!(
         result_part["functionResponse"]["response"],
         json!({"result": "Sunny, 72F"})

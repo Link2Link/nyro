@@ -399,6 +399,15 @@ pub(crate) fn apply_force_max_reasoning_body(
     }
 }
 
+/// Preserve typed codec validation failures; unexpected codec failures remain
+/// internal. Never classify arbitrary anyhow errors as client errors.
+fn request_encoding_error(error: anyhow::Error) -> GatewayError {
+    match error.downcast::<GatewayError>() {
+        Ok(error) => error,
+        Err(error) => GatewayError::internal(error),
+    }
+}
+
 /// Standard `build_request` pipeline:
 /// `pre_request → normalize_tool_results → pre_encode → codec_encode →
 ///  post_encode → auth_headers → build_url`.
@@ -434,7 +443,7 @@ where
     let encoder = egress_handler.make_request_encoder();
     let (mut body, mut extra_headers) = encoder
         .encode_request(req)
-        .map_err(GatewayError::internal)?;
+        .map_err(request_encoding_error)?;
 
     // 5. post_encode hook
     vendor
@@ -913,6 +922,60 @@ mod tests {
         };
         let (gw, _log_rx) = Gateway::new(config).await.expect("gateway init");
         gw
+    }
+
+    #[tokio::test]
+    async fn selected_compat_preview_does_not_apply_native_gemini_schema_rejection() {
+        use crate::protocol::ids::GOOGLE_GEMINI_GENERATE_CONTENT_V1BETA;
+        let gw = build_test_gateway().await;
+        let provider = provider_with_api_key("local-test-only");
+        let mut req = minimal_chat_request();
+        req.tools = Some(vec![crate::protocol::ir::ToolSpec {
+            namespace: None,
+            name: "lookup".into(),
+            kind: Default::default(),
+            description: None,
+            parameters: serde_json::json!({"type":"object","properties":{"value":{"oneOf":[{"type":"string"},{"type":"integer"}]}}}),
+            strict: None,
+            cache_control: None,
+            meta: None,
+        }]);
+        let ctx = ProviderCtx {
+            provider: &provider,
+            protocol: GOOGLE_GEMINI_GENERATE_CONTENT_V1BETA,
+            egress_base_url: "https://upstream.local",
+            api_key: &provider.api_key,
+            auth_scheme: "none",
+            actual_model: "gemini-test",
+            force_max_reasoning: false,
+            credential: None,
+            gw: &gw,
+            disable_default_auth: true,
+        };
+        let error = build_request(&FakeApiKeyVendor, &mut req, &ctx)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, GatewayError::ProtocolLossyRejected { .. }));
+        assert_eq!(error.http_status().as_u16(), 422);
+        req.meta.raw_wire_preview = true;
+        let preview = build_request(&FakeApiKeyVendor, &mut req, &ctx)
+            .await
+            .unwrap();
+        assert!(preview.body["tools"][0]["functionDeclarations"][0]["parameters"]["properties"]["value"]["oneOf"].is_array());
+    }
+
+    #[test]
+    fn typed_request_encoding_errors_preserve_status_without_reclassifying_internal_errors() {
+        let typed = request_encoding_error(
+            GatewayError::BadRequest {
+                code: "test",
+                msg: "bad schema".into(),
+            }
+            .into(),
+        );
+        assert_eq!(typed.http_status().as_u16(), 400);
+        let internal = request_encoding_error(anyhow::anyhow!("unexpected encoder bug"));
+        assert!(matches!(internal, GatewayError::Internal { .. }));
     }
 
     #[tokio::test]

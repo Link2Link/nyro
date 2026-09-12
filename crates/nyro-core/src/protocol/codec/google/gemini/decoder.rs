@@ -46,6 +46,13 @@ impl GoogleDecoder {
                 t.google_search.is_some()
                     || t.code_execution.is_some()
                     || t.google_search_retrieval.is_some()
+                    || t.function_declarations
+                        .as_ref()
+                        .is_some_and(|declarations| {
+                            declarations
+                                .iter()
+                                .any(|d| d.parameters_json_schema.is_some())
+                        })
             })
         });
         let raw_tools: Option<Value> = if has_builtin_tools {
@@ -99,6 +106,7 @@ impl GoogleDecoder {
                             parameters: fd
                                 .parameters
                                 .clone()
+                                .or_else(|| fd.parameters_json_schema.clone())
                                 .unwrap_or(Value::Object(Default::default())),
                             strict: None,
                             cache_control: None,
@@ -324,7 +332,10 @@ fn decode_content(content: GoogleContent) -> Result<Message> {
                 }
             }
             GooglePart::FunctionCall { function_call } => {
-                let id = format!("call_{}", uuid::Uuid::new_v4().simple());
+                let id = function_call
+                    .id
+                    .filter(|id| !id.trim().is_empty())
+                    .unwrap_or_else(|| format!("call_{}", uuid::Uuid::new_v4().simple()));
                 tool_calls.push(ToolCall {
                     id: id.clone(),
                     name: function_call.name.clone(),
@@ -342,7 +353,10 @@ fn decode_content(content: GoogleContent) -> Result<Message> {
             GooglePart::FunctionResponse { function_response } => {
                 has_function_response = true;
                 blocks.push(ContentBlock::ToolResult {
-                    tool_use_id: function_response.name,
+                    tool_use_id: function_response
+                        .id
+                        .filter(|id| !id.trim().is_empty())
+                        .unwrap_or(function_response.name),
                     content: function_response.response,
                     is_error: None,
                     cache_control: None,

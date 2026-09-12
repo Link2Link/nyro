@@ -418,14 +418,38 @@ pub(super) async fn handle_stream(
             } else {
                 text.as_ref()
             };
-            if let Ok(ai_deltas) = stream_parser.parse_chunk(parse_src).inspect_err(|e| {
-                log_ir.performance.as_ref().unwrap().record_failure(
-                    "failed",
-                    "conversion_parse_error",
-                    "response_conversion",
-                    e.as_ref(),
-                );
-            }) {
+            let ai_deltas = match super::streaming::validate_decoded_batch(
+                stream_parser.parse_chunk(parse_src),
+            ) {
+                Ok(deltas) => deltas,
+                Err(error) => {
+                    if let Some(attempt) = &log_ir.performance {
+                        attempt.record_failure(
+                            "failed",
+                            "conversion_parse_error",
+                            "response_conversion",
+                            error.as_ref(),
+                        );
+                    }
+                    let event = super::stream_error_event(
+                        ingress,
+                        log_ir
+                            .diagnostic
+                            .client_request_id
+                            .as_deref()
+                            .unwrap_or_default(),
+                        "conversion_parse_error",
+                    );
+                    if tx.send(Ok(event)).await.is_ok()
+                        && let Some(attempt) = &log_ir.performance
+                    {
+                        attempt.note_client_frame_sent();
+                    }
+                    terminal_error_sent = true;
+                    break;
+                }
+            };
+            {
                 let mut ai_deltas = tool_route_plan.restore_stream_deltas(ai_deltas);
                 hook_state.apply(&mut ai_deltas).await;
                 accumulator.apply_all(&ai_deltas);
@@ -442,29 +466,57 @@ pub(super) async fn handle_stream(
             }
         }
 
-        if let Ok(ai_deltas) = stream_parser.finish().inspect_err(|e| {
-            log_ir.performance.as_ref().unwrap().record_failure(
-                "failed",
-                "conversion_parse_error",
-                "response_conversion",
-                e.as_ref(),
-            );
-        }) {
-            let mut ai_deltas = tool_route_plan.restore_stream_deltas(ai_deltas);
-            hook_state.apply(&mut ai_deltas).await;
-            accumulator.apply_all(&ai_deltas);
-            let events = stream_formatter.format_deltas(&ai_deltas);
-            for ev in events {
-                let sse = ev.to_sse_string();
-                if tx.send(Ok(sse)).await.is_ok()
-                    && let Some(p) = &log_ir.performance
-                {
-                    p.note_client_frame_sent();
+        if !terminal_error_sent {
+            match super::streaming::validate_decoded_batch(stream_parser.finish()) {
+                Ok(ai_deltas) => {
+                    let mut ai_deltas = tool_route_plan.restore_stream_deltas(ai_deltas);
+                    hook_state.apply(&mut ai_deltas).await;
+                    accumulator.apply_all(&ai_deltas);
+                    let events = stream_formatter.format_deltas(&ai_deltas);
+                    for ev in events {
+                        let sse = ev.to_sse_string();
+                        if tx.send(Ok(sse)).await.is_ok()
+                            && let Some(p) = &log_ir.performance
+                        {
+                            p.note_client_frame_sent();
+                        }
+                    }
+                }
+                Err(error) => {
+                    if let Some(attempt) = &log_ir.performance {
+                        attempt.record_failure(
+                            "failed",
+                            "conversion_parse_error",
+                            "response_conversion",
+                            error.as_ref(),
+                        );
+                    }
+                    let event = super::stream_error_event(
+                        ingress,
+                        log_ir
+                            .diagnostic
+                            .client_request_id
+                            .as_deref()
+                            .unwrap_or_default(),
+                        "conversion_parse_error",
+                    );
+                    if tx.send(Ok(event)).await.is_ok()
+                        && let Some(attempt) = &log_ir.performance
+                    {
+                        attempt.note_client_frame_sent();
+                    }
+                    terminal_error_sent = true;
                 }
             }
         }
 
-        let mut bridge_deltas = tool_route_plan.finish_stream();
+        // Never flush buffered custom inputs after a decoder failure; that would
+        // expose incomplete arguments or manufacture a successful final item.
+        let mut bridge_deltas = if terminal_error_sent {
+            Vec::new()
+        } else {
+            tool_route_plan.finish_stream()
+        };
         if !bridge_deltas.is_empty() {
             hook_state.apply(&mut bridge_deltas).await;
             accumulator.apply_all(&bridge_deltas);

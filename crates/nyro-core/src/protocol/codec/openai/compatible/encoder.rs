@@ -554,6 +554,9 @@ fn encode_message(msg: &Message) -> Result<Value> {
     // Pass through any extra fields (reasoning_content, etc.)
     if let Some(Value::Object(extra)) = &msg.meta {
         for (k, v) in extra {
+            if k == "__nyro_synthetic_tool_call" {
+                continue;
+            }
             map.entry(k.clone()).or_insert_with(|| v.clone());
         }
     }

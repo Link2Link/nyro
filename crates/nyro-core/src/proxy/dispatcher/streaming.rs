@@ -15,6 +15,30 @@ use crate::plugin::phase::{HostContext, Phase, PhaseHook, PhaseHookRegistry, Res
 use crate::protocol::ir::{AiRequest, AiStreamDelta};
 use crate::proxy::context::RequestContext;
 
+/// Reject failed decoder batches before any call in them reaches a client or
+/// custom-tool buffer. A decoder can return Ok(StreamError) rather than Err;
+/// formatters do not necessarily understand that IR event. Treat the whole batch
+/// atomically so a valid call preceding an invalid part is not executed as success.
+pub(super) fn validate_decoded_batch(
+    decoded: anyhow::Result<Vec<AiStreamDelta>>,
+) -> anyhow::Result<Vec<AiStreamDelta>> {
+    let deltas = decoded?;
+    for delta in &deltas {
+        match delta {
+            AiStreamDelta::StreamError { error } => return Err(error.clone().into()),
+            AiStreamDelta::UnexpectedEof => {
+                return Err(crate::protocol::ir::error::AiError::new(
+                    crate::protocol::ir::error::AiErrorKind::UnexpectedEof,
+                    "Upstream stream ended before a complete response",
+                )
+                .into());
+            }
+            _ => {}
+        }
+    }
+    Ok(deltas)
+}
+
 /// Owned `OnResponse` hook state for a spawned streaming task.
 ///
 /// The spawned task outlives the handler borrow, so the request context, IR,
@@ -94,6 +118,51 @@ impl StreamHookState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn invalid_call_discards_the_whole_decoded_batch() {
+        use crate::protocol::StreamResponseDecoder;
+        use crate::protocol::codec::google::gemini::stream::GoogleStreamParser;
+        let mut parser = GoogleStreamParser::new();
+        let raw = format!(
+            "data: {}\n\n",
+            serde_json::json!({"candidates":[{
+                "content":{"parts":[
+                    {"functionCall":{"name":"valid","args":{"x":1}}},
+                    {"functionCall":{"name":"invalid"}}
+                ]}, "finishReason":"STOP"
+            }]})
+        );
+        let decoded = parser.parse_chunk(&raw).unwrap();
+        assert!(
+            decoded
+                .iter()
+                .any(|d| matches!(d, AiStreamDelta::ToolCallStart { .. }))
+        );
+        assert!(validate_decoded_batch(Ok(decoded)).is_err());
+    }
+
+    #[test]
+    fn finish_time_decoder_error_cannot_become_successful_completion() {
+        use crate::protocol::StreamResponseDecoder;
+        use crate::protocol::codec::google::gemini::stream::GoogleStreamParser;
+        let mut parser = GoogleStreamParser::new();
+        assert!(
+            validate_decoded_batch(parser.parse_chunk("data: {\"candidates\":["))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(validate_decoded_batch(parser.finish()).is_err());
+    }
+
+    #[test]
+    fn valid_deltas_survive_and_both_error_representations_are_rejected() {
+        let deltas =
+            validate_decoded_batch(Ok(vec![AiStreamDelta::TextDelta("hi".into())])).unwrap();
+        assert!(matches!(&deltas[0], AiStreamDelta::TextDelta(text) if text == "hi"));
+        assert!(validate_decoded_batch(Ok(vec![AiStreamDelta::UnexpectedEof])).is_err());
+        assert!(validate_decoded_batch(Err(anyhow::anyhow!("parse failure"))).is_err());
+    }
 
     #[tokio::test]
     async fn hook_state_without_hooks_is_a_no_op() {

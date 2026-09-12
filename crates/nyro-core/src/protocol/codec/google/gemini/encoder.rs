@@ -36,11 +36,37 @@ impl RequestEncoder for GoogleEncoder {
 
         // ── Contents ─────────────────────────────────────────────────────────
         let mut contents: Vec<Value> = Vec::new();
-        for msg in &req.messages {
+        let mut tool_names = super::tool_names::ToolNames::default();
+        for (position, msg) in req.messages.iter().enumerate() {
             if msg.role == Role::System {
                 continue;
             }
-            contents.push(encode_content(msg)?);
+            if req.meta.raw_wire_preview {
+                // Only the selected raw-wire engine may reject its request.
+                let _ = tool_names.observe(msg, position);
+            } else {
+                if msg
+                    .meta
+                    .as_ref()
+                    .and_then(|m| m.get("__nyro_synthetic_tool_call"))
+                    .and_then(Value::as_bool)
+                    == Some(true)
+                {
+                    return Err(crate::error::GatewayError::BadRequest {
+                        code: "gemini_unmatched_tool_result",
+                        msg: format!("messages[{position}]: cannot recover a real function name for an orphan tool result"),
+                    }.into());
+                }
+                tool_names.observe(msg, position)?;
+            }
+            contents.push(encode_content(
+                msg,
+                &mut tool_names,
+                position,
+                req.meta.raw_wire_preview,
+                req.meta.source_protocol
+                    == Some(crate::protocol::ids::GOOGLE_GEMINI_GENERATE_CONTENT_V1BETA),
+            )?);
         }
 
         let mut body = serde_json::json!({ "contents": contents });
@@ -102,7 +128,10 @@ impl RequestEncoder for GoogleEncoder {
             // Same-protocol passthrough still crosses the schema boundary:
             // sanitize declarations exactly like the IR path below so a
             // client-side converter's OpenAPI-isms cannot 400 the upstream.
-            obj.insert("tools".into(), sanitize_gemini_schema(raw));
+            obj.insert(
+                "tools".into(),
+                prepare_raw_tools(raw, req.meta.raw_wire_preview)?,
+            );
         } else if let Some(ref tools) = req.tools {
             let mut fn_decls: Vec<Value> = Vec::new();
             let mut builtin_entries: Vec<Value> = Vec::new();
@@ -124,7 +153,10 @@ impl RequestEncoder for GoogleEncoder {
                         if let Some(ref desc) = t.description {
                             d.insert("description".into(), Value::String(desc.clone()));
                         }
-                        d.insert("parameters".into(), sanitize_gemini_schema(&t.parameters));
+                        d.insert(
+                            "parameters".into(),
+                            prepare_parameters(&t.parameters, req.meta.raw_wire_preview)?,
+                        );
                         fn_decls.push(decl);
                     }
                 }
@@ -295,6 +327,52 @@ fn sanitize_gemini_schema(value: &Value) -> Value {
     sanitize_schema_node(value, false)
 }
 
+fn prepare_parameters(value: &Value, preview: bool) -> Result<Value> {
+    if preview {
+        // Diagnostic/vendor-diff material only, never the selected native wire.
+        return Ok(value.clone());
+    }
+    let lowered = super::schema::lower_parameters(value).map_err(|error| {
+        crate::error::GatewayError::ProtocolLossyRejected {
+            lost: vec![format!("tools.parameters{}: {}", error.path, error.reason)],
+        }
+    })?;
+    Ok(sanitize_gemini_schema(&lowered))
+}
+
+fn prepare_raw_tools(value: &Value, preview: bool) -> Result<Value> {
+    let mut tools = value.clone();
+    if let Some(entries) = tools.as_array_mut() {
+        for tool in entries {
+            if let Some(declarations) = tool
+                .get_mut("functionDeclarations")
+                .and_then(Value::as_array_mut)
+            {
+                for declaration in declarations {
+                    if let Some(fields) = declaration.as_object_mut() {
+                        if fields.contains_key("parameters")
+                            && fields.contains_key("parametersJsonSchema")
+                            && !preview
+                        {
+                            return Err(crate::error::GatewayError::BadRequest {
+                                code: "gemini_schema_channel_conflict",
+                                msg: "Tool declaration cannot contain both parameters and parametersJsonSchema".into(),
+                            }.into());
+                        }
+                        // An explicitly supplied rich schema is already a
+                        // native wire choice. Don't apply Schema-proto cleanup
+                        // to its definitions, defaults, or property names.
+                        if let Some(parameters) = fields.get_mut("parameters") {
+                            *parameters = prepare_parameters(parameters, preview)?;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(tools)
+}
+
 fn sanitize_schema_node(value: &Value, in_name_map: bool) -> Value {
     match value {
         Value::Object(map) => {
@@ -310,7 +388,16 @@ fn sanitize_schema_node(value: &Value, in_name_map: bool) -> Value {
                     continue;
                 }
                 let child_is_name_map = SCHEMA_NAME_MAP_KEYS.contains(&k.as_str()) && v.is_object();
-                out.insert(k.clone(), sanitize_schema_node(v, child_is_name_map));
+                let schema_child = child_is_name_map || matches!(k.as_str(), "items" | "anyOf");
+                out.insert(
+                    k.clone(),
+                    if schema_child {
+                        sanitize_schema_node(v, child_is_name_map)
+                    } else {
+                        // enum/default values are literal data, not schema nodes.
+                        v.clone()
+                    },
+                );
             }
             Value::Object(out)
         }
@@ -329,7 +416,13 @@ fn sanitize_schema_node(value: &Value, in_name_map: bool) -> Value {
 
 // ── Content encoding ──────────────────────────────────────────────────────────
 
-fn encode_content(msg: &Message) -> Result<Value> {
+fn encode_content(
+    msg: &Message,
+    names: &mut super::tool_names::ToolNames,
+    position: usize,
+    preview: bool,
+    name_only: bool,
+) -> Result<Value> {
     let role = match msg.role {
         Role::User | Role::Tool => "user",
         Role::Assistant => "model",
@@ -338,10 +431,12 @@ fn encode_content(msg: &Message) -> Result<Value> {
 
     let parts = match &msg.content {
         MessageContent::Text(t) => {
-            if msg.tool_call_id.is_some() {
+            if let Some(id) = msg.tool_call_id.as_deref() {
+                let (id, name) = names.resolve(id, position, preview, name_only)?;
                 vec![serde_json::json!({
                     "functionResponse": {
-                        "name": msg.tool_call_id,
+                        "id": id,
+                        "name": name,
                         "response": {"result": t}
                     }
                 })]
@@ -354,7 +449,7 @@ fn encode_content(msg: &Message) -> Result<Value> {
                     let args: Value = serde_json::from_str(&tc.arguments)
                         .unwrap_or(Value::Object(Default::default()));
                     parts
-                        .push(serde_json::json!({"functionCall": {"name": tc.name, "args": args}}));
+                        .push(serde_json::json!({"functionCall": {"id": tc.id, "name": tc.name, "args": args}}));
                 }
                 parts
             } else {
@@ -362,7 +457,31 @@ fn encode_content(msg: &Message) -> Result<Value> {
             }
         }
         MessageContent::Blocks(blocks) => {
-            blocks.iter().map(encode_content_block_for_gemini).collect()
+            blocks
+                .iter()
+                .map(|block| {
+                    if let ContentBlock::ToolResult {
+                        tool_use_id,
+                        content,
+                        ..
+                    } = block
+                    {
+                        // The normalizer may have correlated a name-only Gemini
+                        // result to its real ID; prefer that message-level ID for
+                        // a single-result message, but not for multiple blocks.
+                        let id = if blocks.len() == 1 {
+                            msg.tool_call_id.as_deref().unwrap_or(tool_use_id)
+                        } else {
+                            tool_use_id
+                        };
+                        let (id, name) = names.resolve(id, position, preview, name_only)?;
+                        return Ok(serde_json::json!({"functionResponse": {
+                            "id": id, "name": name, "response": content
+                        }}));
+                    }
+                    Ok(encode_content_block_for_gemini(block))
+                })
+                .collect::<Result<Vec<_>>>()?
         }
     };
 
@@ -423,20 +542,13 @@ fn encode_content_block_for_gemini(b: &ContentBlock) -> Value {
                 fd
             }
         },
-        ContentBlock::ToolUse { name, input, .. } => {
-            serde_json::json!({"functionCall": {"name": name, "args": input}})
+        ContentBlock::ToolUse {
+            id, name, input, ..
         }
-        ContentBlock::ServerToolUse { name, input, .. } => {
-            serde_json::json!({"functionCall": {"name": name, "args": input}})
-        }
-        ContentBlock::ToolResult {
-            tool_use_id,
-            content,
-            ..
+        | ContentBlock::ServerToolUse {
+            id, name, input, ..
         } => {
-            serde_json::json!({
-                "functionResponse": {"name": tool_use_id, "response": content}
-            })
+            serde_json::json!({"functionCall": {"id": id, "name": name, "args": input}})
         }
         ContentBlock::Thinking { thinking, .. } => serde_json::json!({"text": thinking}),
         ContentBlock::Unknown { raw } => raw.clone(),
@@ -602,7 +714,7 @@ mod tests {
             {"googleSearch": {}}
         ]);
 
-        let out = sanitize_gemini_schema(&tools);
+        let out = prepare_raw_tools(&tools, false).expect("raw tool schemas");
         let text = out.to_string();
         assert!(text.find("\"format\"").is_none(), "format leaked: {text}");
         assert_eq!(

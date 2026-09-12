@@ -800,6 +800,10 @@ async fn dispatch_pipeline_inner(
             .map(str::to_string)
             .unwrap_or_else(|| actual_model.clone());
         let mut upstream_request = request_for_target.clone();
+        // Native before/after encoding is only a vendor-patch preview here.
+        // The selected compat engine validates and constructs the real wire
+        // body, including schemas the native Gemini subset cannot represent.
+        upstream_request.meta.raw_wire_preview = compat_candidate;
         let tool_route_plan = if compat_candidate {
             ToolRoutePlan::default()
         } else {

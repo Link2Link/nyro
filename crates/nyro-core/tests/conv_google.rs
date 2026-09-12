@@ -605,23 +605,27 @@ fn universal_tool_call_to_google_function_call() {
 fn universal_tool_result_to_google_function_response() {
     let req = request(
         "gemini-pro",
-        vec![Message {
-            role: Role::Tool,
-            content: MessageContent::Blocks(vec![ContentBlock::ToolResult {
-                tool_use_id: "call_123".to_string(),
-                content: json!({"temperature": 25}),
-                is_error: None,
-                cache_control: None,
-            }]),
-            tool_calls: None,
-            tool_call_id: None,
-            meta: None,
-        }],
+        vec![
+            assistant_tool_call_msg("call_123", "get_weather", "{}"),
+            Message {
+                role: Role::Tool,
+                content: MessageContent::Blocks(vec![ContentBlock::ToolResult {
+                    tool_use_id: "call_123".to_string(),
+                    content: json!({"temperature": 25}),
+                    is_error: None,
+                    cache_control: None,
+                }]),
+                tool_calls: None,
+                tool_call_id: None,
+                meta: None,
+            },
+        ],
     );
 
     let out = encode_request(P::GoogleGemini, &req);
-    let part = field(&out, "/contents/0/parts/0");
-    assert_eq!(part["functionResponse"]["name"], "call_123");
+    let part = field(&out, "/contents/1/parts/0");
+    assert_eq!(part["functionResponse"]["name"], "get_weather");
+    assert_eq!(part["functionResponse"]["id"], "call_123");
     assert_eq!(
         part["functionResponse"]["response"],
         json!({"temperature": 25})
@@ -1064,7 +1068,8 @@ fn tool_result_string_wraps_in_result_object() {
 
     let out = encode_request(P::GoogleGemini, &req);
     let part = field(&out, "/contents/1/parts/0");
-    assert_eq!(part["functionResponse"]["name"], "call_1");
+    assert_eq!(part["functionResponse"]["name"], "search");
+    assert_eq!(part["functionResponse"]["id"], "call_1");
     assert_eq!(
         part["functionResponse"]["response"],
         json!({"result": "Found 5 results"})

@@ -2,6 +2,7 @@ use anyhow::Result;
 use serde_json::Value;
 use std::collections::HashMap;
 
+use crate::protocol::ir::error::{AiError, AiErrorKind};
 use crate::protocol::ir::request::{ToolCall, ToolCallKind};
 use crate::protocol::ir::response::ResponseItem;
 use crate::protocol::ir::usage::Usage;
@@ -68,7 +69,9 @@ impl ResponseDecoder for GoogleResponseParser {
                         .get("args")
                         .cloned()
                         .unwrap_or(Value::Object(Default::default()));
-                    let call_id = format!("call_{}", uuid::Uuid::new_v4().simple());
+                    let call_id = function_call_id(fc)
+                        .map(str::to_string)
+                        .unwrap_or_else(|| format!("call_{}", uuid::Uuid::new_v4().simple()));
                     let arguments = args.to_string();
                     tool_calls.push(ToolCall {
                         id: call_id.clone(),
@@ -161,6 +164,17 @@ impl ResponseEncoder for GoogleResponseFormatter {
 pub struct GoogleStreamParser {
     buffer: String,
     first: bool,
+    function_calls: CompleteFunctionCalls,
+    failed: bool,
+}
+
+/// Native Gemini complete-call events only: no inferred identity by name, part
+/// position, or argument prefix. An explicit ID can replay an identical complete
+/// functionCall, but cannot start a different call or append argument fragments.
+#[derive(Default)]
+struct CompleteFunctionCalls {
+    next_index: usize,
+    snapshots_by_id: HashMap<String, Value>,
 }
 
 impl Default for GoogleStreamParser {
@@ -174,12 +188,44 @@ impl GoogleStreamParser {
         Self {
             buffer: String::new(),
             first: true,
+            function_calls: CompleteFunctionCalls::default(),
+            failed: false,
+        }
+    }
+
+    fn parse_data(&mut self, data: &str, deltas: &mut Vec<AiStreamDelta>) {
+        if data.is_empty() || data == "[DONE]" {
+            return;
+        }
+        let result = match serde_json::from_str::<Value>(data) {
+            Ok(chunk) => {
+                parse_gemini_chunk(&chunk, deltas, &mut self.first, &mut self.function_calls)
+            }
+            Err(error) => Err(AiError::new(
+                if error.is_eof() {
+                    AiErrorKind::UnexpectedEof
+                } else {
+                    AiErrorKind::StreamMidError
+                },
+                format!("Invalid Gemini stream JSON: {error}"),
+            )),
+        };
+        if let Err(error) = result {
+            // Dispatcher consumers may only inspect successful decoder results.
+            // Emit an explicit IR error, and never let subsequent STOP/EOF turn
+            // a conflicting or incomplete functionCall into a successful call.
+            deltas.push(AiStreamDelta::StreamError { error });
+            self.failed = true;
+            self.buffer.clear();
         }
     }
 }
 
 impl StreamResponseDecoder for GoogleStreamParser {
     fn parse_chunk(&mut self, raw: &str) -> Result<Vec<AiStreamDelta>> {
+        if self.failed {
+            return Ok(vec![]);
+        }
         self.buffer.push_str(raw);
         let mut deltas = Vec::new();
 
@@ -192,15 +238,20 @@ impl StreamResponseDecoder for GoogleStreamParser {
                 // Tolerate both "data: x" and compact "data:x" forms.
                 if let Some(data) = line.strip_prefix("data:") {
                     saw_sse_data = true;
-                    let data = data.trim();
-                    if let Ok(chunk) = serde_json::from_str::<Value>(data) {
-                        parse_gemini_chunk(&chunk, &mut deltas, &mut self.first);
+                    self.parse_data(data.trim(), &mut deltas);
+                    if self.failed {
+                        return Ok(deltas);
                     }
                 }
             }
 
-            if !saw_sse_data && let Ok(chunk) = serde_json::from_str::<Value>(block.trim()) {
-                parse_gemini_chunk(&chunk, &mut deltas, &mut self.first);
+            // Retain the existing bare-JSON fallback, but don't interpret SSE
+            // comments or event-only blocks as malformed JSON payloads.
+            if !saw_sse_data && block.trim_start().starts_with(['{', '[']) {
+                self.parse_data(block.trim(), &mut deltas);
+                if self.failed {
+                    return Ok(deltas);
+                }
             }
         }
 
@@ -216,7 +267,18 @@ impl StreamResponseDecoder for GoogleStreamParser {
     }
 }
 
-fn parse_gemini_chunk(chunk: &Value, deltas: &mut Vec<AiStreamDelta>, first: &mut bool) {
+fn function_call_id(fc: &Value) -> Option<&str> {
+    fc.get("id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+}
+
+fn parse_gemini_chunk(
+    chunk: &Value,
+    deltas: &mut Vec<AiStreamDelta>,
+    first: &mut bool,
+    function_calls: &mut CompleteFunctionCalls,
+) -> std::result::Result<(), AiError> {
     if *first {
         *first = false;
         let model = chunk
@@ -292,24 +354,62 @@ fn parse_gemini_chunk(chunk: &Value, deltas: &mut Vec<AiStreamDelta>, first: &mu
             if let Some(fc) = part.get("functionCall") {
                 let name = fc
                     .get("name")
-                    .and_then(|n| n.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let id = format!("call_{}", uuid::Uuid::new_v4().simple());
+                    .and_then(Value::as_str)
+                    .filter(|name| !name.is_empty())
+                    .ok_or_else(|| {
+                        AiError::new(
+                            AiErrorKind::StreamMidError,
+                            "Gemini functionCall.name must be a nonempty string",
+                        )
+                    })?;
+                // Only an explicit, complete object (including {}) is usable.
+                // Missing args and string fragments are not zero-argument calls.
+                let args = fc.get("args").filter(|args| args.is_object()).ok_or_else(|| {
+                    AiError::new(
+                        AiErrorKind::StreamMidError,
+                        "Gemini functionCall.args must be an explicit complete JSON object; partial arguments are unsupported",
+                    )
+                })?;
+                let upstream_id = function_call_id(fc);
+                if let Some(id) = upstream_id
+                    && let Some(previous) = function_calls.snapshots_by_id.get(id)
+                {
+                    if previous != fc {
+                        return Err(AiError::new(
+                            AiErrorKind::StreamMidError,
+                            format!(
+                                "Conflicting complete Gemini functionCall payload for id {id:?}"
+                            ),
+                        ));
+                    }
+                    // Replaying this complete call is idempotent, not another
+                    // argument delta. Keep signed metadata on its existing path.
+                    if let Some(signature) = signature {
+                        deltas.push(AiStreamDelta::ThinkingSignature(signature));
+                    }
+                    continue;
+                }
+                let id = upstream_id
+                    .map(str::to_string)
+                    .unwrap_or_else(|| format!("call_{}", uuid::Uuid::new_v4().simple()));
+                if upstream_id.is_some() {
+                    function_calls
+                        .snapshots_by_id
+                        .insert(id.clone(), fc.clone());
+                }
+                let index = function_calls.next_index;
+                function_calls.next_index += 1;
                 deltas.push(AiStreamDelta::ToolCallStart {
-                    index: 0,
+                    index,
                     id,
-                    name: name.clone(),
+                    name: name.to_string(),
                     namespace: None,
                     kind: ToolCallKind::Function,
                 });
-                let args = fc.get("args").map(|a| a.to_string()).unwrap_or_default();
-                if !args.is_empty() && args != "{}" {
-                    deltas.push(AiStreamDelta::ToolCallDelta {
-                        index: 0,
-                        arguments: args,
-                    });
-                }
+                deltas.push(AiStreamDelta::ToolCallDelta {
+                    index,
+                    arguments: args.to_string(),
+                });
                 if let Some(signature) = signature {
                     // Preserve the signature for multi-turn passback.
                     deltas.push(AiStreamDelta::ThinkingSignature(signature));
@@ -352,6 +452,7 @@ fn parse_gemini_chunk(chunk: &Value, deltas: &mut Vec<AiStreamDelta>, first: &mu
             stop_reason: normalized.to_string(),
         });
     }
+    Ok(())
 }
 
 // ── Stream formatter (deltas → Gemini SSE) ──

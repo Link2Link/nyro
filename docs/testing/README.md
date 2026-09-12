@@ -181,3 +181,4 @@ artifacts produced by the `build` job to avoid redundant compilation.
 
 - [recording.md](./recording.md) — step-by-step recording SOP
 - [coverage-matrix.md](./coverage-matrix.md) — vendor × protocol × scenario progress table
+- [gemini-conversion-regressions.md](./gemini-conversion-regressions.md) — native Gemini conversion repairs, regression evidence, and route-level verification ([简体中文](./gemini-conversion-regressions_CN.md))

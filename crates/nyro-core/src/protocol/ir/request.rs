@@ -500,6 +500,10 @@ pub struct RequestMetadata {
     pub raw: Option<RawEnvelope>,
     /// Three-segment vendor extension bag.
     pub vendor: VendorExtensions,
+    /// Dispatcher-owned vendor-patch preview for a selected raw-wire converter.
+    /// Never read from client JSON: the selected compat engine owns validation
+    /// and supplies the actual upstream body, not this native preview.
+    pub(crate) raw_wire_preview: bool,
 }
 
 // ── AiRequest ─────────────────────────────────────────────────────────────────

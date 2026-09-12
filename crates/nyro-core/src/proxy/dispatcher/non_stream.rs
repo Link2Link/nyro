@@ -642,6 +642,135 @@ mod tests {
         assert_eq!(stats.stream_chunks, 0);
     }
 
+    #[tokio::test]
+    async fn forced_gemini_stream_error_returns_502_without_partial_tool_success() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind local upstream");
+        let addr = listener.local_addr().unwrap();
+        // One valid complete call followed by a conflicting replay of its ID.
+        // Both may arrive in one transport batch; neither can become a successful
+        // buffered response after the parser rejects the conflicting snapshot.
+        let event = |value, terminal| {
+            let mut candidate = serde_json::json!({"content":{"parts":[{"functionCall":{
+                "id":"same-call", "name":"exec", "args":{"input":value}
+            }}]}});
+            if terminal {
+                candidate["finishReason"] = serde_json::json!("STOP");
+            }
+            format!(
+                "data: {}\n\n",
+                serde_json::json!({"candidates":[candidate]})
+            )
+        };
+        let body = format!("{}{}", event("first", false), event("conflict", true));
+        let upstream = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buf = [0_u8; 4096];
+            loop {
+                let n = socket.read(&mut buf).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buf[..n]);
+                if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let length = String::from_utf8_lossy(&request[..end])
+                        .lines()
+                        .find_map(|line| {
+                            line.split_once(':')
+                                .filter(|(key, _)| key.eq_ignore_ascii_case("content-length"))
+                                .map(|(_, v)| v.trim().parse::<usize>().unwrap())
+                        })
+                        .unwrap_or(0);
+                    if request.len() >= end + 4 + length {
+                        break;
+                    }
+                }
+            }
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+        let url = format!("http://{addr}/v1beta/models/gemini:streamGenerateContent?alt=sse");
+        let provider = fake_provider(format!("http://{addr}"));
+        let config = GatewayConfig {
+            data_dir: std::env::temp_dir()
+                .join(format!("nyro-forced-error-test-{}", uuid::Uuid::new_v4())),
+            ..Default::default()
+        };
+        let (gw, mut log_rx) = Gateway::new(config).await.unwrap();
+        let req_ext = crate::proxy::context::ContextBag::new();
+        let call_ctx = CallCtx {
+            performance: None,
+            gw: gw.clone(),
+            provider: &provider,
+            model_id: "route-google",
+            model_name: "Google route",
+            egress: GOOGLE_GEMINI_GENERATE_CONTENT_V1BETA,
+            ingress: OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1,
+            ingress_str: "openai/chat/v1",
+            egress_str: "google/gemini/generateContent/v1beta",
+            request_model: "virtual-gemini",
+            actual_model: "gemini-test",
+            backend_model: "gemini-test",
+            api_key_id: None,
+            api_key_name: None,
+            is_stream: false,
+            enable_payload: None,
+            reasoning_effort: None,
+            route_decision: None,
+            start: std::time::Instant::now(),
+            req_ext: req_ext.clone(),
+        };
+        let mut req_ctx = RequestContext::new(
+            OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1,
+            std::time::Duration::from_secs(10),
+        );
+        let mut req_ir = AiRequest::new("virtual-gemini", Vec::new());
+        let host = HostContext::new(&gw);
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            handle_non_stream_via_upstream_stream(
+                ProxyClient::new(reqwest::Client::builder().no_proxy().build().unwrap()),
+                &url,
+                ReqwestHeaderMap::new(),
+                serde_json::json!({"contents":[]}),
+                &call_ctx,
+                ToolRoutePlan::default(),
+                None,
+                &mut req_ctx,
+                &mut req_ir,
+                &host,
+            ),
+        )
+        .await
+        .expect("handler must terminate");
+        upstream.await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(body.get("error").is_some(), "{body}");
+        assert!(
+            body.get("choices").is_none(),
+            "no partial tool success: {body}"
+        );
+        let entry = tokio::time::timeout(std::time::Duration::from_secs(1), log_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(entry.upstream_status_code, Some(200));
+        let stats = req_ext
+            .get::<crate::plugin::phase::ResponseStats>()
+            .unwrap();
+        assert_eq!(stats.client_status, 502);
+    }
+
     /// Regression (live MiniMax finding): a passthrough body carries no
     /// `stream` flag, but the force-upstream-stream handler must request SSE
     /// explicitly; and when the upstream ignores the flag and answers with a
@@ -934,34 +1063,63 @@ pub(super) async fn handle_non_stream_via_upstream_stream(
         } else {
             text.as_ref()
         };
-        if let Ok(ai_deltas) = stream_parser.parse_chunk(parse_src).inspect_err(|e| {
-            if let Some(p) = &call_ctx.performance {
-                p.record_failure(
-                    "failed",
-                    "conversion_parse_error",
-                    "response_conversion",
-                    e.as_ref(),
-                );
-            }
-        }) {
-            let ai_deltas = tool_route_plan.restore_stream_deltas(ai_deltas);
-            accumulator.apply_all(&ai_deltas);
-        }
-    }
-
-    if let Ok(ai_deltas) = stream_parser.finish().inspect_err(|e| {
-        if let Some(p) = &call_ctx.performance {
-            p.record_failure(
-                "failed",
-                "conversion_parse_error",
-                "response_conversion",
-                e.as_ref(),
-            );
-        }
-    }) {
+        let ai_deltas =
+            match super::streaming::validate_decoded_batch(stream_parser.parse_chunk(parse_src)) {
+                Ok(deltas) => deltas,
+                Err(error) => {
+                    if let Some(attempt) = &call_ctx.performance {
+                        attempt.record_failure(
+                            "failed",
+                            "conversion_parse_error",
+                            "response_conversion",
+                            error.as_ref(),
+                        );
+                    }
+                    log.status(502)
+                        .error(format!("upstream stream conversion error: {error:#}"))
+                        .upstream_url(url)
+                        .with_upstream_request(upstream_req_hdrs_str, upstream_req_body_str)
+                        .with_upstream_response(
+                            status as i32,
+                            upstream_hdrs_str,
+                            None,
+                            Some(upstream_latency_ms),
+                        )
+                        .emit();
+                    return error_response(502, "upstream stream conversion failed");
+                }
+            };
         let ai_deltas = tool_route_plan.restore_stream_deltas(ai_deltas);
         accumulator.apply_all(&ai_deltas);
     }
+
+    let ai_deltas = match super::streaming::validate_decoded_batch(stream_parser.finish()) {
+        Ok(deltas) => deltas,
+        Err(error) => {
+            if let Some(attempt) = &call_ctx.performance {
+                attempt.record_failure(
+                    "failed",
+                    "conversion_parse_error",
+                    "response_conversion",
+                    error.as_ref(),
+                );
+            }
+            log.status(502)
+                .error(format!("upstream stream conversion error: {error:#}"))
+                .upstream_url(url)
+                .with_upstream_request(upstream_req_hdrs_str, upstream_req_body_str)
+                .with_upstream_response(
+                    status as i32,
+                    upstream_hdrs_str,
+                    None,
+                    Some(upstream_latency_ms),
+                )
+                .emit();
+            return error_response(502, "upstream stream conversion failed");
+        }
+    };
+    let ai_deltas = tool_route_plan.restore_stream_deltas(ai_deltas);
+    accumulator.apply_all(&ai_deltas);
     accumulator.apply_all(&tool_route_plan.finish_stream());
 
     let mut ai_resp = accumulator.into_ai_response();

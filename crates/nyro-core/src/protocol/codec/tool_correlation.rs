@@ -102,7 +102,10 @@ pub fn normalize_request_tool_results(req: &mut AiRequest) {
                     arguments: "{}".to_string(),
                 }]),
                 tool_call_id: None,
-                meta: None,
+                // Internal provenance, not a client hint: a protocol requiring
+                // the real function name must not treat this repair as proof
+                // of an actual preceding invocation.
+                meta: Some(serde_json::json!({"__nyro_synthetic_tool_call": true})),
             });
         }
 
