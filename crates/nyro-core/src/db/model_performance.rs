@@ -6,6 +6,9 @@ pub struct ModelPerformanceStats {
     pub selected_request_count: i64,
     pub valid_tps_count: i64,
     pub average_tps: Option<f64>,
+    pub overall_tps: Option<f64>,
+    pub total_output_tokens: i64,
+    pub total_latency_ms: i64,
     pub first_sample_at: Option<i64>,
     pub last_sample_at: Option<i64>,
 }
@@ -42,9 +45,21 @@ impl ModelPerformanceStats {
             let at = row.created_at;
             stats.first_sample_at = Some(stats.first_sample_at.map_or(at, |old| old.min(at)));
             stats.last_sample_at = Some(stats.last_sample_at.map_or(at, |old| old.max(at)));
+            if let Some(latency) = row
+                .performance
+                .latency_upstream_ms
+                .or(row.performance.latency_total_ms)
+            {
+                if latency > 0 && row.performance.output_tokens > 0 {
+                    stats.total_output_tokens += row.performance.output_tokens as i64;
+                    stats.total_latency_ms += latency;
+                }
+            }
         }
         stats.average_tps =
             (stats.valid_tps_count > 0).then_some(tps_total / stats.valid_tps_count as f64);
+        stats.overall_tps = (stats.total_latency_ms > 0 && stats.total_output_tokens > 0)
+            .then(|| stats.total_output_tokens as f64 / (stats.total_latency_ms as f64 / 1000.0));
         stats
     }
 }

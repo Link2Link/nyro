@@ -4,6 +4,9 @@ export interface PerformanceStats {
   selected_request_count: number;
   valid_tps_count: number;
   average_tps: number | null;
+  overall_tps?: number | null;
+  total_output_tokens?: number;
+  total_latency_ms?: number;
   first_sample_at: number | null;
   last_sample_at: number | null;
 }
@@ -35,6 +38,9 @@ function isStats(value: unknown, maxSelected: number): value is PerformanceStats
   const v = value as Record<string, unknown>;
   if (!count(v.selected_request_count) || Number(v.selected_request_count) > maxSelected
     || !count(v.valid_tps_count) || Number(v.valid_tps_count) > Number(v.selected_request_count)) return false;
+  if (v.overall_tps !== undefined && v.overall_tps !== null && (!finite(v.overall_tps) || Number(v.overall_tps) <= 0)) {
+    return false;
+  }
   if (v.valid_tps_count === 0) return v.average_tps === null && v.first_sample_at === null && v.last_sample_at === null;
   return finite(v.average_tps) && Number(v.average_tps) > 0
     && finite(v.first_sample_at) && Number(v.first_sample_at) >= 0
@@ -92,6 +98,7 @@ export interface PerformanceRow {
   scoreUpdatedAt: string;
   status: "ready" | "missing";
   tps: number | null;
+  overallTps: number | null;
   selectedRequestCount: number;
   validTpsCount: number;
   firstSampleAt: number | null;
@@ -100,7 +107,14 @@ export interface PerformanceRow {
   untrustedCount: number;
   variants: PerformanceRowVariant[];
 }
-export interface PerformancePoint extends PerformanceRow { status: "ready"; score: number; tps: number; color: string }
+export interface PerformancePoint extends PerformanceRow {
+  status: "ready";
+  score: number;
+  tps: number;
+  netTps?: number | null;
+  metric?: "net" | "overall";
+  color: string;
+}
 /** Hidden selection is retained for restoring filters but must not dim unrelated visible points. */
 export function visiblePerformanceSelection(points: Pick<PerformancePoint, "key">[], hover: string[], pinned: string[]): string[] {
   const visible = new Set(points.map((point) => point.key));
@@ -129,7 +143,8 @@ export function buildPerformanceRows(snapshot: PerformanceResponse, providers: P
       providerBaseUrl: provider?.base_url ?? "",
       score: item.score, scoreUpdatedAt: item.score_updated_at,
       status: stats.average_tps === null || stats.valid_tps_count === 0 ? "missing" : "ready",
-      tps: stats.average_tps, selectedRequestCount: stats.selected_request_count, validTpsCount: stats.valid_tps_count,
+      tps: stats.average_tps, overallTps: stats.overall_tps ?? null,
+      selectedRequestCount: stats.selected_request_count, validTpsCount: stats.valid_tps_count,
       firstSampleAt: stats.first_sample_at, lastSampleAt: stats.last_sample_at,
       unclassifiedCount: item.unclassified_count, untrustedCount: item.untrusted_count,
       variants: item.variants.map((variant) => ({ upstream_model: variant.upstream_model, stats: variant.mixed })),
@@ -144,10 +159,26 @@ export function filterPerformanceRows(rows: PerformanceRow[], search: string, pr
   return rows.filter((row) => (providerId === null || row.providerId === providerId)
     && `${row.providerName}\n${row.providerId}\n${row.modelPrefix}\n${row.variants.map((variant) => variant.upstream_model).join("\n")}`.toLocaleLowerCase().includes(text));
 }
-export function performancePoints(rows: PerformanceRow[]): PerformancePoint[] {
+export function performancePoints(rows: PerformanceRow[], metric: "net" | "overall" = "net"): PerformancePoint[] {
+  if (metric === "overall") {
+    return rows.filter((row): row is PerformanceRow & { status: "ready"; overallTps: number } => (
+      row.status === "ready" && row.overallTps !== null && Number.isFinite(row.overallTps) && row.overallTps > 0
+    )).map((row) => ({
+      ...row,
+      tps: row.overallTps,
+      netTps: row.tps,
+      metric: "overall",
+      color: performanceColor(row.providerId),
+    }));
+  }
   return rows.filter((row): row is PerformanceRow & { status: "ready"; tps: number } => (
     row.status === "ready" && row.tps !== null && Number.isFinite(row.tps) && row.tps > 0
-  )).map((row) => ({ ...row, color: performanceColor(row.providerId) }));
+  )).map((row) => ({
+    ...row,
+    netTps: row.tps,
+    metric: "net",
+    color: performanceColor(row.providerId),
+  }));
 }
 export interface PerformanceEnvelopeNode {
   score: number;

@@ -49,6 +49,8 @@ fn aggregate_stats(variants: &[ModelPerformanceVariant]) -> (ModelPerformanceSta
         if let Some(tps) = variant.mixed.average_tps {
             tps_weighted += tps * variant.mixed.valid_tps_count as f64;
         }
+        stats.total_output_tokens += variant.mixed.total_output_tokens;
+        stats.total_latency_ms += variant.mixed.total_latency_ms;
         unclassified_count += variant.unclassified_count;
         untrusted_count += variant.untrusted_count;
     }
@@ -60,6 +62,8 @@ fn aggregate_stats(variants: &[ModelPerformanceVariant]) -> (ModelPerformanceSta
     stats.last_sample_at = variants.iter().filter_map(|v| v.mixed.last_sample_at).max();
     stats.average_tps =
         (stats.valid_tps_count > 0).then_some(tps_weighted / stats.valid_tps_count as f64);
+    stats.overall_tps = (stats.total_latency_ms > 0 && stats.total_output_tokens > 0)
+        .then(|| stats.total_output_tokens as f64 / (stats.total_latency_ms as f64 / 1000.0));
     (stats, unclassified_count, untrusted_count)
 }
 
@@ -174,6 +178,15 @@ mod tests {
                 selected_request_count: count,
                 valid_tps_count: tps.map_or(0, |_| count),
                 average_tps: tps,
+                overall_tps: tps,
+                total_output_tokens: tps.map_or(0, |_| count * 100),
+                total_latency_ms: tps.map_or(0, |v| {
+                    if v > 0.0 {
+                        (count as f64 * 100.0 / v * 1000.0) as i64
+                    } else {
+                        0
+                    }
+                }),
                 first_sample_at: first,
                 last_sample_at: last,
             },

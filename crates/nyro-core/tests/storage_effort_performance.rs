@@ -250,6 +250,10 @@ async fn exercise(storage: &dyn Storage) -> anyhow::Result<()> {
         stats[9].mixed.average_tps,
         Some(2007.0 / (18_819.0 / 1000.0))
     );
+    assert_eq!(
+        stats[9].mixed.overall_tps,
+        Some(2007.0 / (20_617.0 / 1000.0))
+    );
     assert_eq!(stats[9].mixed.valid_tps_count, 1);
     assert_eq!(stats[10].mixed.selected_request_count, 1);
     assert_eq!(stats[10].mixed.valid_tps_count, 1);

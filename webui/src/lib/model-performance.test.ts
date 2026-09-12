@@ -30,7 +30,7 @@ function point(key: string, score: number, tps: number): PerformancePoint {
   return { key, pointId: `P${key}`, providerId: key, providerName: key,
     providerIcon: "", providerBaseUrl: "http://example.invalid",
     modelPrefix: key, model: key, providerEnabled: true,
-    score, tps, status: "ready", scoreUpdatedAt: time,
+    score, tps, overallTps: tps, netTps: tps, status: "ready", scoreUpdatedAt: time,
     selectedRequestCount: 10, validTpsCount: 5, firstSampleAt: 1000, lastSampleAt: 2000,
     unclassifiedCount: 0, untrustedCount: 0, variants: [], color: performanceColor(key) };
 }
@@ -348,3 +348,39 @@ test("labels list every coincident point and pair the prefix with each provider"
   const wrapped = layoutPerformanceLabels(longGroups).get(longGroups[0].key)!;
   equal(wrapped.lines.join(""), `${long.modelPrefix} · 03`); ok(wrapped.lines.length > 1);
 });
+
+test("overall_tps contract preserves aggregate values and supports overall metric points", () => {
+  const customStats: PerformanceStats = {
+    average_tps: 80.0,
+    overall_tps: 45.0,
+    total_output_tokens: 450,
+    total_latency_ms: 10000,
+    selected_request_count: 10,
+    valid_tps_count: 5,
+    first_sample_at: 1000,
+    last_sample_at: 2000,
+  };
+  const testItem: ModelPerformanceItem = {
+    ...item("test-model", "p", 85),
+    mixed: customStats,
+    variants: [{ upstream_model: "test-model", mixed: customStats, unclassified_count: 0, untrusted_count: 0 }],
+  };
+  const data = snapshot(testItem);
+  equal(readPerformanceResponse(data), data);
+  const rows = buildPerformanceRows(data, [provider("p")]);
+  equal(rows[0].tps, 80.0);
+  equal(rows[0].overallTps, 45.0);
+
+  // Net points
+  const netPoints = performancePoints(rows, "net");
+  equal(netPoints.length, 1);
+  equal(netPoints[0].tps, 80.0);
+  equal(netPoints[0].metric, "net");
+
+  // Overall points
+  const overallPoints = performancePoints(rows, "overall");
+  equal(overallPoints.length, 1);
+  equal(overallPoints[0].tps, 45.0);
+  equal(overallPoints[0].metric, "overall");
+});
+
