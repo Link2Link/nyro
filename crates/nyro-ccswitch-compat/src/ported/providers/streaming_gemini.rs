@@ -269,7 +269,7 @@ pub fn create_anthropic_sse_stream_from_gemini<E: std::error::Error + Send + 'st
         // the sentinel yields an empty block) and this is a no-op; on a
         // genuinely truncated wire the flushed block fails the JSON parse and
         // surfaces the truncation error.
-        let mut flushed = stream.chain(futures::stream::once(async {
+        let flushed = stream.chain(futures::stream::once(async {
             Ok::<Bytes, E>(Bytes::from_static(b"\n\n"))
         }));
         tokio::pin!(flushed);
