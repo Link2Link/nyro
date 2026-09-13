@@ -677,7 +677,7 @@ impl AnthropicStreamFormatter {
     }
 }
 
-fn extract_anthropic_usage(v: &Value) -> Usage {
+pub(crate) fn extract_anthropic_usage(v: &Value) -> Usage {
     let Some(u) = v.get("usage") else {
         return Usage::default();
     };

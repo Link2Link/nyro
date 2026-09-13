@@ -28,12 +28,12 @@ Lightweight helper tests need no extra framework:
 ```bash
 cd webui
 test_dir=$(mktemp -d /tmp/nyro-ui-tests.XXXXXX)
-./node_modules/.bin/tsc src/lib/model-ratings.test.ts src/lib/model-performance.test.ts \
-  src/lib/provider-icon-resolve.test.ts \
+./node_modules/.bin/tsc src/lib/format.test.ts src/lib/model-ratings.test.ts \
+  src/lib/model-performance.test.ts src/lib/provider-icon-resolve.test.ts \
   --outDir "$test_dir" --module commonjs --moduleResolution node --target es2020 \
   --esModuleInterop --skipLibCheck
-node --test "$test_dir/model-ratings.test.js" "$test_dir/model-performance.test.js" \
-  "$test_dir/provider-icon-resolve.test.js"
+node --test "$test_dir/format.test.js" "$test_dir/model-ratings.test.js" \
+  "$test_dir/model-performance.test.js" "$test_dir/provider-icon-resolve.test.js"
 ```
 
 ## Isolation and evidence
@@ -94,9 +94,10 @@ one matched **prefix × provider group**. Each group carries `model_prefix`,
 per distinct upstream model name; `profile` and `tiers` remain absent. The Node fixture
 independently compares **every logged stream's variant** `mixed.average_tps` with
 `/api/v1/providers/:id/model-usage?model=...` using exact numeric equality, saves both
-responses in `report.json`, and asserts the group's `mixed` is the plain per-variant sum
-with sample-weighted TPS. `window_start` is `null`: there is no seven-day cutoff beyond
-whatever request logs are still retained.
+responses in `report.json`, and asserts the group's `mixed` merges its variants by
+summing valid-sample tokens and durations (TPS = Σtokens ÷ Σduration, never an
+arithmetic mean of per-call rates). `window_start` is `null`: there is no seven-day
+cutoff beyond whatever request logs are still retained.
 
 Coverage:
 
@@ -106,34 +107,50 @@ Coverage:
   served by two upstream variants legitimately reports one hundred selected/valid samples.
 - A rated prefix with no retained call produces **no row at all** — never a zero-TPS
   row — while `/model-usage` still reports its empty window.
-- Select the latest fifty raw retained logs by request time before validating TPS.
-  The shared logs/model-usage formula uses `output_tokens`, `latency_upstream_ms`
-  (or total latency fallback), `is_stream`/chunk count and `stream_first_chunk_ms`.
-  Streaming generation timing preserves the legacy non-incremental-response fallback.
-  The seeded twenty-five 100-token 2000ms/500ms-TTFT streams and twenty-five 50-token
-  1000ms calls average to 175/3 TPS, while two older 900/800-token rows stay outside
-  the fifty-sample window.
+- Select the latest fifty raw retained logs by request time before validating TPS
+  (first select, then validate: invalid samples consume the window without refilling
+  older rows). The shared logs/model-usage formula computes content =
+  `output_tokens − max(reasoning_tokens, 0)` clamped at zero over
+  `latency_upstream_ms`, falling back to `latency_total_ms` only when upstream is
+  null/undefined; TTFT and `is_stream` never change the duration, and `output ≤ 0`
+  counts as no usage. Pure-reasoning calls with output > 0 are valid samples worth
+  zero content tokens. The seeded twenty-five 100-token 2000ms/500ms-TTFT streams and
+  twenty-five 50-token 1000ms calls sum to Σcontent 3750 ÷ Σduration 75 s = **50 TPS**,
+  while two older 900/800-token rows stay outside the fifty-sample window.
   New `performance_*` timings intentionally disagree to prove they are not used.
+- A reasoning pair (`model/reasoning`: eight 100/80 output/reasoning rows, two
+  pure-reasoning rows and one no-usage row) reports 10 valid of 11 selected samples,
+  content TPS **16.0** (Σ160 tok ÷ 10 s) and gross TPS 100 (Σoutput ÷ the same
+  duration). A pure-reasoning pair (`model/pure-reasoning`) reports a **valid zero**:
+  average_tps `0`, valid_tps_count 3, plotted at (20, 0) with a `0.0 tok/s` tooltip,
+  the gross auxiliary figure and the missing-reasoning caveat — never a missing row and
+  never a gross fallback.
 - Failed/incomplete/output-limit/cancelled/unknown completion, non-2xx statuses and
   metadata versions 0, 1 and 99 do not disqualify valid token/timing samples. Mixed
   reasoning-effort metadata stays in the same sample pool: three older minimal-effort
-  rows join the ten newer ones as twelve valid of thirteen selected samples averaging
-  117.5 TPS. Legacy-valid logs are plotted without an untrusted-history warning.
+  rows join the ten newer ones as twelve valid of thirteen selected samples summing to
+  Σcontent 1410 ÷ Σduration 12 s = 117.5 TPS. Legacy-valid logs are plotted without an
+  untrusted-history warning.
 - MiniMax-M3 with version 1, unknown completion, 2007 output tokens, 20617ms upstream
-  latency and 1798ms TTFT yields `2007 / ((20617 - 1798) / 1000)` TPS, shown as
-  **106.6 tok/s**. A retained log older than seven days with no metadata fields and
-  total-latency fallback also contributes. No upstream request is made.
+  latency and 1798ms TTFT yields `2007 / (20617 / 1000)` TPS — the TTFT is never
+  subtracted — shown as **97.3 tok/s**. A retained log older than seven days with no
+  metadata fields and total-latency fallback also contributes. No upstream request is
+  made.
 - Two upstream variants (`model/dual`, `model/dual-0813`) share one prefix and one row:
   the group must keep both variants, report `50 + 50 = 100` selected and valid samples,
-  merge TPS sample-weighted (100 and 60 → **80.0 tok/s**), inherit the shared score, and
-  still be plotted with `100 / 100` in the diagnostics table. The same client contract is
-  enforced negatively by CDP injection: a group claiming more samples than its declared
-  variants can hold is rejected outright rather than plotted.
+  merge by summed tokens and durations (Σcontent 8000 ÷ Σduration 100 s →
+  **80.0 tok/s**), inherit the shared score, and still be plotted with `100 / 100` in
+  the diagnostics table. The same client contract is enforced negatively by CDP
+  injection: a group claiming more samples than its declared variants can hold is
+  rejected outright rather than plotted, and so is an alias contradiction where
+  `average_tps` is changed while a stale `overall_tps` disagrees (a legal null row
+  instead nulls every alias together and stays a plotted-or-missing contract).
 - Only invalid tokens/timing produces missing TPS in the real fixture.
   Fifty invalid latest samples consume the whole window and are not refilled from the
-  one older valid call. Zero score is
-  valid; missing TPS is not zero. Fewer than three valid samples switch that marker's
-  border to dashed.
+  one older valid call. Zero score is valid; a zero **TPS** (all-reasoning samples) is
+  also valid plotted data at the axis baseline — missing TPS (`–`) is neither zero nor
+  a gross fallback. Fewer than three valid samples switch that marker's border to
+  dashed.
 - Every plotted point is drawn as its provider's vendor icon (resolved from provider
   name, host and protocol) inside a provider-colored rounded marker, never as a plain
   dot: the geometry carrier stays invisible at the exact coordinate, the icon key is
@@ -155,6 +172,10 @@ Coverage:
   full supplier/model identity, score, one-decimal TPS and samples; pointer transfer
   into the tooltip keeps it readable, leaving or Escape dismisses it. Enter/Space
   and zoom work.
+- The Y axis title is the unified **Content TPS (tok/s)**; tooltips label the main
+  metric as end-to-end content TPS with the gross figure and the missing-reasoning
+  caveat. A `zero-tps-plotted` geometry scenario plots two zero-TPS models at the
+  baseline and keeps only the stronger one on the envelope.
 - Provider/model search, EN/ZH desktop/mobile, bounded mobile tooltips,
   direct loading and no whole-page overflow.
 - Invalid numeric payloads, fabricated merged over-counts, null TPS, warm/cold

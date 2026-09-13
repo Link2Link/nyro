@@ -34,28 +34,20 @@ pub struct ModelPerformanceResponse {
     pub models: Vec<ModelPerformanceItem>,
 }
 
-/// Weighted mean over variants with valid TPS samples; sample-count weighted so
-/// busy variants represent their share of traffic. Counts are plain sums and
-/// sample timestamps span the merged window. A group without any valid sample
-/// keeps a null average instead of a fabricated zero.
+/// Merge variants through the shared valid-sample sums: content/gross rates
+/// are sum(tokens)/sum(elapsed) across the whole group, never an average of
+/// per-variant rates. Counts are plain sums and sample timestamps span the
+/// merged window. A group without any valid sample keeps a null rate instead
+/// of a fabricated zero; a group of only pure-reasoning samples keeps 0.
 fn aggregate_stats(variants: &[ModelPerformanceVariant]) -> (ModelPerformanceStats, i64, i64) {
     let mut stats = ModelPerformanceStats::default();
     let mut unclassified_count = 0i64;
     let mut untrusted_count = 0i64;
-    let mut tps_weighted = 0.0;
-    let mut gross_tps_weighted = 0.0;
+    let mut totals = crate::db::tps::TpsTotals::default();
     for variant in variants {
         stats.selected_request_count += variant.mixed.selected_request_count;
         stats.valid_tps_count += variant.mixed.valid_tps_count;
-        if let Some(tps) = variant.mixed.average_tps {
-            tps_weighted += tps * variant.mixed.valid_tps_count as f64;
-        }
-        if let Some(gross) = variant.mixed.average_gross_tps {
-            gross_tps_weighted += gross * variant.mixed.valid_tps_count as f64;
-        }
-        stats.total_output_tokens += variant.mixed.total_output_tokens;
-        stats.total_content_tokens += variant.mixed.total_content_tokens;
-        stats.total_latency_ms += variant.mixed.total_latency_ms;
+        totals.absorb(&variant.mixed.tps_totals());
         unclassified_count += variant.unclassified_count;
         untrusted_count += variant.untrusted_count;
     }
@@ -65,14 +57,7 @@ fn aggregate_stats(variants: &[ModelPerformanceVariant]) -> (ModelPerformanceSta
         .filter_map(|v| v.mixed.first_sample_at)
         .min();
     stats.last_sample_at = variants.iter().filter_map(|v| v.mixed.last_sample_at).max();
-    stats.average_tps =
-        (stats.valid_tps_count > 0).then_some(tps_weighted / stats.valid_tps_count as f64);
-    stats.average_gross_tps =
-        (stats.valid_tps_count > 0).then_some(gross_tps_weighted / stats.valid_tps_count as f64);
-    stats.overall_tps = (stats.total_latency_ms > 0 && stats.total_content_tokens > 0)
-        .then(|| stats.total_content_tokens as f64 / (stats.total_latency_ms as f64 / 1000.0));
-    stats.overall_gross_tps = (stats.total_latency_ms > 0 && stats.total_output_tokens > 0)
-        .then(|| stats.total_output_tokens as f64 / (stats.total_latency_ms as f64 / 1000.0));
+    stats.apply_totals(&totals);
     (stats, unclassified_count, untrusted_count)
 }
 
@@ -174,60 +159,151 @@ impl AdminService {
 mod tests {
     use super::*;
 
-    fn variant(
+    /// Build a variant from explicit shared-pool sums so merged expectations
+    /// stay exact.
+    fn variant_from_sums(
         model: &str,
-        count: i64,
-        tps: Option<f64>,
+        selected: i64,
+        valid: i64,
+        totals: crate::db::tps::TpsTotals,
         first: Option<i64>,
         last: Option<i64>,
     ) -> ModelPerformanceVariant {
+        let mut mixed = ModelPerformanceStats {
+            selected_request_count: selected,
+            valid_tps_count: valid,
+            ..Default::default()
+        };
+        mixed.apply_totals(&totals);
+        mixed.first_sample_at = first;
+        mixed.last_sample_at = last;
         ModelPerformanceVariant {
             upstream_model: model.to_string(),
-            mixed: ModelPerformanceStats {
-                selected_request_count: count,
-                valid_tps_count: tps.map_or(0, |_| count),
-                average_tps: tps,
-                average_gross_tps: tps,
-                overall_tps: tps,
-                overall_gross_tps: tps,
-                total_output_tokens: tps.map_or(0, |_| count * 100),
-                total_content_tokens: tps.map_or(0, |_| count * 100),
-                total_latency_ms: tps.map_or(0, |v| {
-                    if v > 0.0 {
-                        (count as f64 * 100.0 / v * 1000.0) as i64
-                    } else {
-                        0
-                    }
-                }),
-                first_sample_at: first,
-                last_sample_at: last,
-            },
+            mixed,
             unclassified_count: 0,
             untrusted_count: 0,
         }
     }
 
     #[test]
-    fn aggregates_weight_by_valid_samples() {
+    fn merges_variants_through_shared_sums() {
+        // variant A: 2000 content / 3000 output over 20 s; B: 1000 / 1000
+        // over 10 s. Merged: 3000 / 4000 over 30 s — sum ratios, not a mean
+        // of per-variant rates (which would weight 100 and 100 equally).
         let variants = [
-            variant("m", 30, Some(41.0), Some(10), Some(90)),
-            variant("m-0813", 10, Some(63.0), Some(20), Some(80)),
+            variant_from_sums(
+                "m",
+                30,
+                30,
+                crate::db::tps::TpsTotals {
+                    tps_content_tokens: 2_000,
+                    tps_output_tokens: 3_000,
+                    tps_elapsed_ms: 20_000,
+                },
+                Some(10),
+                Some(90),
+            ),
+            variant_from_sums(
+                "m-0813",
+                10,
+                10,
+                crate::db::tps::TpsTotals {
+                    tps_content_tokens: 1_000,
+                    tps_output_tokens: 1_000,
+                    tps_elapsed_ms: 10_000,
+                },
+                Some(20),
+                Some(80),
+            ),
         ];
         let (stats, _, _) = aggregate_stats(&variants);
         assert_eq!(stats.selected_request_count, 40);
         assert_eq!(stats.valid_tps_count, 40);
-        assert!((stats.average_tps.unwrap() - 46.5).abs() < 1e-9);
+        assert_eq!(stats.total_content_tokens, 3_000);
+        assert_eq!(stats.total_output_tokens, 4_000);
+        assert_eq!(stats.total_latency_ms, 30_000);
+        assert_eq!(stats.average_tps, Some(100.0));
+        assert_eq!(stats.overall_tps, stats.average_tps);
+        assert!((stats.average_gross_tps.unwrap() - (4_000.0 / 30.0)).abs() < 1e-9);
+        assert_eq!(stats.overall_gross_tps, stats.average_gross_tps);
         assert_eq!(stats.first_sample_at, Some(10));
         assert_eq!(stats.last_sample_at, Some(90));
     }
 
     #[test]
+    fn latency_weighting_beats_rate_averaging() {
+        // One fast variant (100 tok / 0.1 s) and one slow variant (1000 tok /
+        // 10 s): merged content TPS is 1100 / 10.1 s, not (1000 + 100) / 2.
+        let variants = [
+            variant_from_sums(
+                "fast",
+                1,
+                1,
+                crate::db::tps::TpsTotals {
+                    tps_content_tokens: 100,
+                    tps_output_tokens: 100,
+                    tps_elapsed_ms: 100,
+                },
+                None,
+                None,
+            ),
+            variant_from_sums(
+                "slow",
+                1,
+                1,
+                crate::db::tps::TpsTotals {
+                    tps_content_tokens: 1_000,
+                    tps_output_tokens: 1_000,
+                    tps_elapsed_ms: 10_000,
+                },
+                None,
+                None,
+            ),
+        ];
+        let (stats, _, _) = aggregate_stats(&variants);
+        assert!((stats.average_tps.unwrap() - (1_100.0 / 10.1)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn pure_reasoning_group_keeps_zero_content_rate() {
+        let variants = [variant_from_sums(
+            "thinker",
+            5,
+            5,
+            crate::db::tps::TpsTotals {
+                tps_content_tokens: 0,
+                tps_output_tokens: 500,
+                tps_elapsed_ms: 5_000,
+            },
+            Some(1),
+            Some(9),
+        )];
+        let (stats, _, _) = aggregate_stats(&variants);
+        assert_eq!(stats.valid_tps_count, 5);
+        assert_eq!(stats.average_tps, Some(0.0));
+        assert_eq!(stats.overall_tps, Some(0.0));
+        assert_eq!(stats.average_gross_tps, Some(100.0));
+        assert_eq!(stats.first_sample_at, Some(1));
+        assert_eq!(stats.last_sample_at, Some(9));
+    }
+
+    #[test]
     fn no_valid_samples_keeps_null_average() {
-        let variants = [variant("m", 5, None, None, None)];
+        let variants = [variant_from_sums(
+            "m",
+            5,
+            0,
+            crate::db::tps::TpsTotals::default(),
+            None,
+            None,
+        )];
         let (stats, _, _) = aggregate_stats(&variants);
         assert_eq!(stats.selected_request_count, 5);
         assert_eq!(stats.valid_tps_count, 0);
         assert_eq!(stats.average_tps, None);
+        assert_eq!(stats.average_gross_tps, None);
+        assert_eq!(stats.overall_tps, None);
+        assert_eq!(stats.overall_gross_tps, None);
         assert_eq!(stats.first_sample_at, None);
         assert_eq!(stats.last_sample_at, None);
     }

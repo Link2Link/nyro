@@ -125,7 +125,8 @@ rolls back the new supplier rather than succeeding without scores.
 ## Performance chart
 
 The **Performance** page (`/performance`) displays one point per rated exact
-provider/model pair: its comprehensive score on X and mixed average TPS on Y.
+provider/model pair: its comprehensive score on X and the unified main TPS on Y — the
+end-to-end content throughput (content tokens ÷ request duration).
 Scores remain 0–100 values. The X axis rounds the lowest visible plotted score down
 to a multiple of 10 and the highest up to a multiple of 10, always within 0–100.
 A single point retains at least a 10-point span; no points uses the full 0–100 range.
@@ -135,6 +136,8 @@ point identities. Extreme scores map one marker margin inside the axis frame (ha
 marker plus air), so the leftmost and rightmost markers never straddle an axis; points,
 their tick labels and the envelope all share that one mapping.
 Y defaults to 0–100; values above 100 expand its ceiling in 50-TPS steps with headroom.
+A valid zero TPS (all retained samples are pure reasoning) plots as a real data point
+at the baseline — 0 is data, not missing; only null (no valid sample) is missing.
 Reasoning effort is not a score dimension, filter, or point identity. Only points on
 the visible upper-right convex envelope label model names directly, adding supplier names
 when needed to distinguish identical models; coincident boundary groups list every model
@@ -178,13 +181,18 @@ orientation tolerance, never one-decimal display values.
 `get_model_performance` return `{ as_of, window_start, models }`. Each model has
 `rating: ProviderModelRating`, `mixed`, `status`, optional `error`,
 `unclassified_count`, and `untrusted_count`; there is no `profile` or `tiers` field.
-`mixed` contains selected/valid counts, average TPS, and first/last sample times.
+`mixed` contains selected/valid counts, `average_tps` (the main content TPS, aliased
+equal to `overall_tps`), `average_gross_tps`/`overall_gross_tps` (total output tokens
+over the same duration, auxiliary only), and first/last sample times. When both names
+of an alias pair are present they must agree; a stale mismatched pair is rejected.
 
 A group is one rated prefix at one provider. `variants` lists the distinct upstream
 model names that matched the prefix, each with its own `mixed` sampled from that
-variant's latest fifty retained calls. The group's `mixed` is the sample-weighted merge
-of its variants: counts are sums that legitimately exceed fifty (up to fifty per variant),
-timestamps span the merged window, and a group with no usable TPS keeps a null average.
+variant's latest fifty retained calls. The group's `mixed` merges its variants by
+summing valid-sample content tokens, output tokens and durations — never an arithmetic
+mean of per-call rates: counts are sums that legitimately exceed fifty (up to fifty per
+variant), timestamps span the merged window, and a group with no usable TPS keeps a
+null average.
 
 Performance uses the **same latest-fifty retained-call sampling and TPS calculation as
 model usage statistics**, not a separate completion-qualified metric. There is no
@@ -194,12 +202,18 @@ Unknown completion (including MiniMax responses whose terminal is not recognized
 does not invalidate usable output-token and timing data. Invalid TPS samples among
 the selected fifty are not replaced with older requests.
 
-The backend shares its per-request TPS helper with model usage: streaming is detected
-by the stream flag or observed chunks; generation time normally subtracts the first
-chunk wait, with the existing 50 ms / 80% non-incremental fallback. Otherwise it uses
-upstream duration, falling back to total duration when upstream timing is absent.
-Mean TPS is the arithmetic mean of valid per-call values, not total tokens divided
-by total time. Points retain full numeric precision; displayed TPS uses one decimal.
+The backend shares its per-request TPS contract with model usage and the logs page:
+content tokens = `max(output_tokens − max(reasoning_tokens, 0), 0)`; duration =
+`latency_upstream_ms`, falling back to `latency_total_ms` only when upstream is
+null/undefined (zero, negative or non-finite values are invalid, and TTFT is never
+subtracted); `output ≤ 0` counts as no usage, while a pure-reasoning call with
+output > 0 is a valid sample worth zero content tokens. Main TPS is
+Σcontent ÷ Σvalid-request duration; gross TPS (auxiliary) is Σoutput ÷ the same
+duration, and the main metric never falls back to gross. When reasoning details are
+absent — not reported by the API or not recorded historically — content equals the
+reported output, so the reasoning deduction cannot be guaranteed to be exact. Points
+retain full numeric precision; displayed TPS uses one decimal, 0 renders as `0.0`
+and only null renders as `–`.
 Each point is drawn as its provider's vendor icon, never as a plain dot, and always
 inside its own marker box: an icon file that declares another intrinsic size is
 normalized to fill that box instead of painting over the plot. Identity comes from the

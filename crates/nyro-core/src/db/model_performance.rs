@@ -1,6 +1,8 @@
 //! Performance samples from the same retained request logs as model usage.
 use serde::Serialize;
 
+use super::tps::TpsTotals;
+
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct ModelPerformanceStats {
     pub selected_request_count: i64,
@@ -38,43 +40,46 @@ impl ModelPerformanceStats {
             selected_request_count: rows.len() as i64,
             ..Default::default()
         };
-        let mut tps_total = 0.0;
-        let mut gross_tps_total = 0.0;
-        let mut gross_tps_count = 0;
+        // One shared valid-sample pool (see db::tps): pure-reasoning rows
+        // count as valid zero-content samples, invalid rows stay excluded
+        // without consuming aggregates.
+        let mut totals = TpsTotals::default();
         for row in rows {
-            let Some(tps) = row.performance.tps() else {
+            if !totals.push(&row.performance) {
                 continue;
-            };
-            tps_total += tps;
-            stats.valid_tps_count += 1;
-            if let Some(gross) = row.performance.gross_tps() {
-                gross_tps_total += gross;
-                gross_tps_count += 1;
             }
+            stats.valid_tps_count += 1;
             let at = row.created_at;
             stats.first_sample_at = Some(stats.first_sample_at.map_or(at, |old| old.min(at)));
             stats.last_sample_at = Some(stats.last_sample_at.map_or(at, |old| old.max(at)));
-            if let Some(latency) = row
-                .performance
-                .latency_upstream_ms
-                .or(row.performance.latency_total_ms)
-            {
-                if latency > 0 && row.performance.output_tokens > 0 {
-                    stats.total_output_tokens += row.performance.output_tokens as i64;
-                    stats.total_content_tokens += row.performance.content_tokens() as i64;
-                    stats.total_latency_ms += latency;
-                }
-            }
         }
-        stats.average_tps =
-            (stats.valid_tps_count > 0).then_some(tps_total / stats.valid_tps_count as f64);
-        stats.average_gross_tps =
-            (gross_tps_count > 0).then_some(gross_tps_total / gross_tps_count as f64);
-        stats.overall_tps = (stats.total_latency_ms > 0 && stats.total_content_tokens > 0)
-            .then(|| stats.total_content_tokens as f64 / (stats.total_latency_ms as f64 / 1000.0));
-        stats.overall_gross_tps = (stats.total_latency_ms > 0 && stats.total_output_tokens > 0)
-            .then(|| stats.total_output_tokens as f64 / (stats.total_latency_ms as f64 / 1000.0));
+        stats.apply_totals(&totals);
         stats
+    }
+
+    /// Fill the four rate fields and the token/latency sums from the shared
+    /// pool sums. The average_* and overall_* fields are compatibility
+    /// aliases of the same latency-weighted value.
+    pub(crate) fn apply_totals(&mut self, totals: &TpsTotals) {
+        self.total_output_tokens = totals.tps_output_tokens;
+        self.total_content_tokens = totals.tps_content_tokens;
+        self.total_latency_ms = totals.tps_elapsed_ms;
+        let content = totals.content_tps();
+        let gross = totals.gross_tps();
+        self.average_tps = content;
+        self.average_gross_tps = gross;
+        self.overall_tps = content;
+        self.overall_gross_tps = gross;
+    }
+
+    /// The shared valid-pool sums behind this variant, for cross-variant
+    /// merging (admin aggregates fold these instead of re-averaging rates).
+    pub(crate) fn tps_totals(&self) -> TpsTotals {
+        TpsTotals {
+            tps_content_tokens: self.total_content_tokens,
+            tps_output_tokens: self.total_output_tokens,
+            tps_elapsed_ms: self.total_latency_ms,
+        }
     }
 }
 

@@ -151,7 +151,9 @@ pub trait AuthAccessStore: Send + Sync {
 
 #[async_trait]
 pub trait LogStore: Send + Sync {
-    /// Completion-aware, seven-day mixed performance samples per provider/model pair.
+    /// Mixed end-to-end TPS samples over the latest retained calls per
+    /// provider/model pair (latest-fifty window, no time filter; see db::tps
+    /// for the shared validity pool).
     async fn model_performance_stats(
         &self,
         _pairs: &[(String, String)],

@@ -5,7 +5,7 @@ import { Check, Copy, Download, Loader2, Trash2 } from "lucide-react";
 import { backend } from "@/lib/backend";
 import { useLocale } from "@/lib/i18n";
 import type { Provider, RequestLog, RequestLogAttempts } from "@/lib/types";
-import { computeGrossTps, computeTps, contentTokensOf, formatDuration, formatLogTime, formatTokenCount, formatTps, generationMsOf } from "@/lib/format";
+import { computeGrossTps, computeTps, contentTokensOf, formatDuration, formatLogTime, formatTokenCount, formatTps, tpsGrossTitle, tpsMetricTitle, tpsReasoningCaveat } from "@/lib/format";
 import { effectiveOutcome, payloadDownload } from "@/lib/log-observability";
 import { ResultBadge } from "@/components/log-outcome";
 import { AttemptResultBanner, PayloadBlock } from "@/components/log-evidence";
@@ -108,7 +108,6 @@ function LogDetailContent({ logId, summary, open, onOpenChange, onDelete }: LogD
   // stream_chunks_count for older log rows that pre-date the field.
   const isStream = log?.is_stream ?? (log?.stream_chunks_count ?? 0) > 0;
 
-  const generationMs = generationMsOf(log);
   const tps = computeTps(log);
   const grossTps = computeGrossTps(log);
   const isCrossProtocol =
@@ -141,7 +140,7 @@ function LogDetailContent({ logId, summary, open, onOpenChange, onDelete }: LogD
       `# Method: ${method}  Path: ${path}`,
       `# Client Status: ${log.client_status_code ?? "–"}  Upstream Status: ${log.upstream_status_code ?? "–"}`,
       `# Latency Total: ${formatDuration(log.latency_total_ms)}  Upstream: ${formatDuration(log.latency_upstream_ms)}`,
-      `# TPS: ${tps != null ? formatTps(tps) : "–"}  (gen ${formatDuration(generationMs)})`,
+      `# Content TPS: ${formatTps(tps)}  Gross TPS: ${formatTps(grossTps)}  (${tpsReasoningCaveat(false)})`,
       `# Provider: ${log.provider_name ?? log.provider_id ?? "–"}  Model: ${log.model_name ?? log.model_id ?? "–"}  ApiKey: ${log.api_key_name ?? log.api_key_id ?? "–"}`,
       `# Client Model: ${log.client_model ?? "–"}  Upstream Model: ${log.upstream_model ?? "–"}`,
       `# Reasoning Effort: ${log.reasoning_effort ?? "–"}`,
@@ -252,21 +251,25 @@ function LogDetailContent({ logId, summary, open, onOpenChange, onDelete }: LogD
               {isZh ? "首字" : "TTFT"} {formatDuration(log.stream_first_chunk_ms)}
             </span>
           ) : null}
-          {tps != null || grossTps != null ? (
+          {tps != null ? (
             <span
               className="text-slate-500"
-              title={
+              title={[
+                tpsMetricTitle(isZh),
+                `${isZh ? "正文 TPS" : "Content TPS"}: ${formatTps(tps)}`,
+                `${tpsGrossTitle(isZh)}: ${formatTps(grossTps)}`,
                 log?.reasoning_tokens && log.reasoning_tokens > 0
                   ? (isZh
-                      ? `正文有效速率: ${formatTps(tps)} (物理总速: ${formatTps(grossTps)}，思考 ${log.reasoning_tokens} tok / 正文 ${contentTokensOf(log)} tok)`
-                      : `Effective TPS: ${formatTps(tps)} (Gross TPS: ${formatTps(grossTps)}, reasoning: ${log.reasoning_tokens} tok, content: ${contentTokensOf(log)} tok)`)
-                  : (isZh ? "净生成速度(剥离首字节前等待)" : "Net generation speed (excludes prefill wait)")
-              }
+                      ? `思考 ${log.reasoning_tokens} tok / 正文 ${contentTokensOf(log)} tok`
+                      : `reasoning: ${log.reasoning_tokens} tok, content: ${contentTokensOf(log)} tok`)
+                  : "",
+                tpsReasoningCaveat(isZh),
+              ].filter(Boolean).join("\n")}
             >
-              {formatTps(tps ?? grossTps)}
+              {isZh ? "正文" : "content"} {formatTps(tps)}
               {log?.reasoning_tokens && log.reasoning_tokens > 0 ? (
-                <span className="ml-1 text-xs text-amber-600 font-medium" title={isZh ? "含思考过程" : "Includes reasoning"}>
-                  ({isZh ? "正文" : "content"})
+                <span className="ml-1 text-xs text-amber-600 font-medium" title={isZh ? "该请求报告了推理 Token，正文 = 输出 − 推理" : "Reasoning tokens reported; content = output − reasoning"}>
+                  *
                 </span>
               ) : null}
             </span>

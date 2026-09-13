@@ -149,7 +149,8 @@ async fn exercise(storage: &dyn Storage) -> anyhow::Result<()> {
     let mut client_error = entry(p, "mixed", Some("high"), AS_OF - 1);
     client_error.client_status_code = 500;
     rows.push(client_error);
-    // Legacy stream detection and timing win, regardless of diagnostic metadata.
+    // End-to-end default TPS ignores TTFT entirely; legacy stream markers and
+    // diagnostic timings no longer change the rate.
     for (index, first, upstream, expected_tokens) in
         [(0, 200, 1000, 80), (1, 800, 1000, 100), (2, 30, 70, 7)]
     {
@@ -250,15 +251,23 @@ async fn exercise(storage: &dyn Storage) -> anyhow::Result<()> {
     assert_eq!(stats[3].mixed.valid_tps_count, 11);
     assert_eq!(stats[4].mixed.selected_request_count, 5);
     assert_eq!(stats[4].mixed.valid_tps_count, 5);
-    assert!((stats[4].mixed.average_tps.unwrap() - 64.0).abs() < 1e-9);
+    // Latency-weighted pool over the full upstream windows: 387 content
+    // tokens across 22 070 ms (two 10 s default-timing rows dominate), not
+    // the arithmetic mean of the five per-request rates.
+    assert_eq!(
+        stats[4].mixed.average_tps,
+        Some(387.0 / (22_070.0 / 1000.0))
+    );
     assert_eq!(stats[5].mixed.selected_request_count, 1);
     assert_eq!(stats[6].mixed.selected_request_count, 1);
     assert_eq!(stats[7].mixed.selected_request_count, 1);
     assert_eq!(stats[8].mixed.selected_request_count, 0);
     assert_eq!(stats[8].mixed.average_tps, None);
+    // End-to-end default TPS: average and overall are the same value now
+    // (TTFT is no longer subtracted from the single-rate pool).
     assert_eq!(
         stats[9].mixed.average_tps,
-        Some(2007.0 / (18_819.0 / 1000.0))
+        Some(2007.0 / (20_617.0 / 1000.0))
     );
     assert_eq!(
         stats[9].mixed.overall_tps,
@@ -365,7 +374,7 @@ async fn sqlite_raw_timing_and_missing_fields_match_usage() -> anyhow::Result<()
             Some(1000),
             Some(9000),
             Some(200),
-            Some(100.0),
+            Some(80.0),
         ),
         (
             Some(80),

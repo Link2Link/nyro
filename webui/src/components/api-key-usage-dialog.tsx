@@ -19,11 +19,16 @@ import {
 } from "lucide-react";
 import { backend } from "@/lib/backend";
 import {
+  computeAggregateTps,
   computeTps,
   formatDuration,
   formatLogTime,
   formatTokenCount,
   formatTps,
+  tpsAggregateStatusTitle,
+  tpsAggregateWindowTitle,
+  tpsMetricTitle,
+  tpsReasoningCaveat,
 } from "@/lib/format";
 import { useLocale } from "@/lib/i18n";
 import {
@@ -694,7 +699,12 @@ function Overview({
                     {zh ? "延迟" : "Latency"}
                   </th>
                   <th className="px-3 py-3 text-right">TTFT</th>
-                  <th className="px-4 py-3 text-right">TPS</th>
+                  <th
+                    className="px-4 py-3 text-right"
+                    title={`${tpsMetricTitle(zh)}\n${tpsAggregateWindowTitle(zh)}\n${tpsReasoningCaveat(zh)}`}
+                  >
+                    {zh ? "正文 TPS" : "Content TPS"}
+                  </th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-100">
@@ -706,10 +716,7 @@ function Overview({
                     && r.error_count >= 0 && r.error_count <= r.request_count && r.request_count > 0
                     ? (r.error_count / r.request_count) * 100
                     : null;
-                  const tps =
-                    r.total_upstream_ms > 0
-                      ? r.total_output_tokens / (r.total_upstream_ms / 1000)
-                      : null;
+                  const tps = computeAggregateTps(r);
                   return (
                     <tr
                       key={routeKey(r)}
@@ -776,7 +783,10 @@ function Overview({
                           ? "–"
                           : formatDuration(r.avg_first_token_ms)}
                       </td>
-                      <td className="px-4 py-3 text-right text-xs">
+                      <td
+                        className="px-4 py-3 text-right text-xs"
+                        title={tpsAggregateStatusTitle(r, zh)}
+                      >
                         {formatTps(tps)}
                       </td>
                     </tr>
@@ -936,7 +946,12 @@ function Attempts({
                     {zh ? "延迟" : "Latency"}
                   </th>
                   <th className="px-3 py-3 text-right">TTFT</th>
-                  <th className="px-3 py-3 text-right">TPS</th>
+                  <th
+                    className="px-3 py-3 text-right"
+                    title={`${tpsMetricTitle(zh)}\n${tpsReasoningCaveat(zh)}`}
+                  >
+                    {zh ? "正文 TPS" : "Content TPS"}
+                  </th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-100">
@@ -1010,7 +1025,10 @@ function Attempts({
                           ? "–"
                           : formatDuration(log.stream_first_chunk_ms)}
                       </td>
-                      <td className="px-3 py-2.5 text-right text-xs">
+                      <td
+                        className="px-3 py-2.5 text-right text-xs"
+                        title={`${tpsMetricTitle(zh)}\n${tpsReasoningCaveat(zh)}`}
+                      >
                         {formatTps(computeTps(log))}
                       </td>
                     </tr>

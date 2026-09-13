@@ -1,6 +1,7 @@
 pub mod model_performance;
 pub mod model_rating_prefixes;
 pub mod models;
+pub mod tps;
 pub use model_performance::{ModelPerformanceStats, PairPerformanceStats};
 pub use model_rating_prefixes::ModelRatingEntry;
 

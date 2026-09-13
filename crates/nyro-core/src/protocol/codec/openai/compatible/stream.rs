@@ -509,7 +509,7 @@ impl StreamResponseEncoder for OpenAIStreamFormatter {
     }
 }
 
-fn extract_usage(v: &Value) -> Usage {
+pub(crate) fn extract_usage(v: &Value) -> Usage {
     let usage = v.get("usage").or_else(|| v.get("usageMetadata"));
     let Some(u) = usage else {
         return Usage::default();

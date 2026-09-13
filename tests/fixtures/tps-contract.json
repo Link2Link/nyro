@@ -1,0 +1,257 @@
+[
+  {
+    "name": "stream_with_reasoning",
+    "log": {
+      "output_tokens": 100,
+      "reasoning_tokens": 80,
+      "is_stream": true,
+      "stream_chunks_count": 10,
+      "latency_upstream_ms": 2000,
+      "latency_total_ms": 2100,
+      "stream_first_chunk_ms": 500
+    },
+    "content_tokens": 20,
+    "tps": 10,
+    "gross_tps": 50
+  },
+  {
+    "name": "pure_reasoning_valid_zero_tps",
+    "log": {
+      "output_tokens": 100,
+      "reasoning_tokens": 100,
+      "is_stream": true,
+      "stream_chunks_count": 5,
+      "latency_upstream_ms": 1000,
+      "latency_total_ms": 1100,
+      "stream_first_chunk_ms": 200
+    },
+    "content_tokens": 0,
+    "tps": 0,
+    "gross_tps": 100
+  },
+  {
+    "name": "stream_no_reasoning_ignores_ttft",
+    "log": {
+      "output_tokens": 100,
+      "reasoning_tokens": 0,
+      "is_stream": true,
+      "stream_chunks_count": 8,
+      "latency_upstream_ms": 1000,
+      "latency_total_ms": 1200,
+      "stream_first_chunk_ms": 800
+    },
+    "content_tokens": 100,
+    "tps": 100,
+    "gross_tps": 100
+  },
+  {
+    "name": "non_stream_mixed_reasoning",
+    "log": {
+      "output_tokens": 300,
+      "reasoning_tokens": 100,
+      "is_stream": false,
+      "stream_chunks_count": 0,
+      "latency_upstream_ms": 2000,
+      "latency_total_ms": 2100,
+      "stream_first_chunk_ms": null
+    },
+    "content_tokens": 200,
+    "tps": 100,
+    "gross_tps": 150
+  },
+  {
+    "name": "first_chunk_after_upstream_not_subtracted",
+    "log": {
+      "output_tokens": 100,
+      "reasoning_tokens": 0,
+      "is_stream": true,
+      "stream_chunks_count": 3,
+      "latency_upstream_ms": 1000,
+      "latency_total_ms": 9000,
+      "stream_first_chunk_ms": 1200
+    },
+    "content_tokens": 100,
+    "tps": 100,
+    "gross_tps": 100
+  },
+  {
+    "name": "upstream_missing_falls_back_to_total",
+    "log": {
+      "output_tokens": 50,
+      "reasoning_tokens": 10,
+      "is_stream": true,
+      "stream_chunks_count": 4,
+      "latency_upstream_ms": null,
+      "latency_total_ms": 2000,
+      "stream_first_chunk_ms": 100
+    },
+    "content_tokens": 40,
+    "tps": 20,
+    "gross_tps": 25
+  },
+  {
+    "name": "total_missing_upstream_used",
+    "log": {
+      "output_tokens": 100,
+      "reasoning_tokens": 0,
+      "is_stream": false,
+      "stream_chunks_count": 0,
+      "latency_upstream_ms": 1000,
+      "latency_total_ms": null,
+      "stream_first_chunk_ms": null
+    },
+    "content_tokens": 100,
+    "tps": 100,
+    "gross_tps": 100
+  },
+  {
+    "name": "missing_reasoning_treated_as_zero",
+    "log": {
+      "output_tokens": 100,
+      "reasoning_tokens": null,
+      "is_stream": true,
+      "stream_chunks_count": 6,
+      "latency_upstream_ms": 1000,
+      "latency_total_ms": 1200,
+      "stream_first_chunk_ms": 300
+    },
+    "content_tokens": 100,
+    "tps": 100,
+    "gross_tps": 100
+  },
+  {
+    "name": "negative_reasoning_clamped_to_zero",
+    "log": {
+      "output_tokens": 100,
+      "reasoning_tokens": -30,
+      "is_stream": true,
+      "stream_chunks_count": 2,
+      "latency_upstream_ms": 1000,
+      "latency_total_ms": 1100,
+      "stream_first_chunk_ms": 100
+    },
+    "content_tokens": 100,
+    "tps": 100,
+    "gross_tps": 100
+  },
+  {
+    "name": "reasoning_exceeds_output_clamped",
+    "log": {
+      "output_tokens": 50,
+      "reasoning_tokens": 80,
+      "is_stream": true,
+      "stream_chunks_count": 2,
+      "latency_upstream_ms": 500,
+      "latency_total_ms": 600,
+      "stream_first_chunk_ms": 50
+    },
+    "content_tokens": 0,
+    "tps": 0,
+    "gross_tps": 100
+  },
+  {
+    "name": "zero_upstream_does_not_fall_back_to_total",
+    "log": {
+      "output_tokens": 100,
+      "reasoning_tokens": 0,
+      "is_stream": true,
+      "stream_chunks_count": 2,
+      "latency_upstream_ms": 0,
+      "latency_total_ms": 5000,
+      "stream_first_chunk_ms": 200
+    },
+    "content_tokens": 100,
+    "tps": null,
+    "gross_tps": null
+  },
+  {
+    "name": "negative_upstream_invalid",
+    "log": {
+      "output_tokens": 100,
+      "reasoning_tokens": 0,
+      "is_stream": false,
+      "stream_chunks_count": 0,
+      "latency_upstream_ms": -100,
+      "latency_total_ms": 2000,
+      "stream_first_chunk_ms": null
+    },
+    "content_tokens": 100,
+    "tps": null,
+    "gross_tps": null
+  },
+  {
+    "name": "zero_total_fallback_invalid",
+    "log": {
+      "output_tokens": 100,
+      "reasoning_tokens": 0,
+      "is_stream": true,
+      "stream_chunks_count": 2,
+      "latency_upstream_ms": null,
+      "latency_total_ms": 0,
+      "stream_first_chunk_ms": 100
+    },
+    "content_tokens": 100,
+    "tps": null,
+    "gross_tps": null
+  },
+  {
+    "name": "both_latencies_missing_invalid",
+    "log": {
+      "output_tokens": 100,
+      "reasoning_tokens": 0,
+      "is_stream": true,
+      "stream_chunks_count": 2,
+      "latency_upstream_ms": null,
+      "latency_total_ms": null,
+      "stream_first_chunk_ms": 100
+    },
+    "content_tokens": 100,
+    "tps": null,
+    "gross_tps": null
+  },
+  {
+    "name": "zero_output_invalid",
+    "log": {
+      "output_tokens": 0,
+      "reasoning_tokens": 0,
+      "is_stream": true,
+      "stream_chunks_count": 2,
+      "latency_upstream_ms": 1000,
+      "latency_total_ms": 1100,
+      "stream_first_chunk_ms": 100
+    },
+    "content_tokens": 0,
+    "tps": null,
+    "gross_tps": null
+  },
+  {
+    "name": "missing_output_treated_as_zero_invalid",
+    "log": {
+      "output_tokens": null,
+      "reasoning_tokens": 0,
+      "is_stream": false,
+      "stream_chunks_count": 0,
+      "latency_upstream_ms": 1000,
+      "latency_total_ms": null,
+      "stream_first_chunk_ms": null
+    },
+    "content_tokens": 0,
+    "tps": null,
+    "gross_tps": null
+  },
+  {
+    "name": "negative_output_invalid",
+    "log": {
+      "output_tokens": -5,
+      "reasoning_tokens": -10,
+      "is_stream": false,
+      "stream_chunks_count": 0,
+      "latency_upstream_ms": 1000,
+      "latency_total_ms": null,
+      "stream_first_chunk_ms": null
+    },
+    "content_tokens": 0,
+    "tps": null,
+    "gross_tps": null
+  }
+]

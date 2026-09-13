@@ -321,18 +321,37 @@ Bounded recovery may inspect retained final upstream request bodies from the las
 `reasoning_effort` as fallback. This diagnostic recovery no longer determines whether
 existing requests can populate performance charts.
 
-The Performance query now shares the model-usage TPS helper and samples the latest
-fifty retained calls for each exact provider/model, ordered by `created_at DESC, id DESC`.
-There is no additional seven-day, completion, status, effort, or metadata-version filter.
-It reads the existing `output_tokens`, stream/chunk flags, `latency_upstream_ms`,
-`latency_total_ms`, and `stream_first_chunk_ms`, not the `performance_*` evidence timings.
-Valid per-call TPS values are averaged; invalid samples consume a slot without fetching
-older replacements. Sample times are the valid rows' `created_at` timestamps.
+The Performance query now shares the model-usage TPS contract and samples the latest
+fifty retained calls for each exact provider/model, ordered by `created_at DESC, id DESC`
+(first select, then validate; invalid samples consume a slot without fetching older
+replacements). There is no additional seven-day, completion, status, effort, or
+metadata-version filter. It reads the existing `output_tokens`, `reasoning_tokens`,
+`latency_upstream_ms`, and `latency_total_ms`; stream/chunk flags and
+`stream_first_chunk_ms` may still be selected for other columns but are not used in the
+TPS formula, nor are the `performance_*` evidence timings: content tokens are
+`max(output_tokens − max(reasoning_tokens, 0), 0)`, duration is `latency_upstream_ms`
+falling back to `latency_total_ms` only when upstream is null/undefined (zero, negative
+or non-finite invalid; TTFT is never subtracted), and `output ≤ 0` counts as no usage
+while a pure-reasoning call with output > 0 is a valid zero-content sample.
+Main TPS is Σcontent ÷ Σvalid duration (`average_tps`, aliased equal to `overall_tps`);
+gross TPS (`average_gross_tps`/`overall_gross_tps`) is Σoutput over the same duration.
+Rows without recorded reasoning details use zero, so their content equals the reported
+output and the deduction cannot be guaranteed exact. Sample times are the valid rows'
+`created_at` timestamps.
 The API returns `window_start: null`; compatibility diagnostic counters are zero.
 Existing completion/effort metadata remains available for diagnostics only.
 Counts and sample times are documented in [model ratings](../design/model-ratings.md#performance-chart).
-Existing usage calculations retain their formula; usage and performance now also share
-stable ID tie-breaking, null token/chunk handling, and exact MySQL model comparisons.
+Whole-history token totals (`total_output_tokens`, `total_upstream_ms` and friends)
+keep their existing semantics; only TPS is unified on the content formula above.
+Aggregate usage DTOs (`ModelStats`, `ProviderStats`, `ProviderUsageDetail`,
+`ProviderModelUsageStats`, `ModelUsageDetail`, `ModelProviderUsageStats`,
+`ModelApiKeyUsageStats`, `ApiKeyModelRouteStats`) additionally return flat valid-sample
+sums `tps_content_tokens`, `tps_output_tokens` and `tps_elapsed_ms` — the same strict
+pool (output > 0, valid duration; pure-reasoning samples included with content 0)
+applied within each surface's own time filter, unlike the performance page's
+latest-fifty retained-call window. `total_output_tokens ÷ total_upstream_ms` is no
+longer a TPS source anywhere. Usage and performance also share stable ID tie-breaking,
+null token/chunk handling, and exact MySQL model comparisons.
 
 **索引**：
 - `idx_logs_client_request_attempt` on `(client_request_id, attempt_index)`; a non-unique correlation index, not an additional counting identity

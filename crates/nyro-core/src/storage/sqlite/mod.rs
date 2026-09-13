@@ -1528,16 +1528,17 @@ impl LogStore for SqliteLogStore {
     }
 
     async fn stats_by_model(&self, hours: Option<i64>) -> anyhow::Result<Vec<ModelStats>> {
+        let tps = crate::db::tps::tps_totals_columns(crate::db::tps::TpsSqlDialect::Sqlite);
         if let Some(hours) = hours {
             Ok(sqlx::query_as::<_, ModelStats>(
-                "SELECT upstream_model AS model, COUNT(*) AS request_count, COALESCE(SUM(input_tokens), 0) AS total_input_tokens, COALESCE(SUM(output_tokens), 0) AS total_output_tokens, COALESCE(SUM(cache_read_tokens), 0) AS total_cache_read_tokens, COALESCE(AVG(latency_total_ms), 0.0) AS avg_duration_ms, CAST(COALESCE(SUM(latency_upstream_ms), 0) AS REAL) AS total_upstream_ms FROM request_logs WHERE created_at >= CAST(strftime('%s', 'now', ?) AS INTEGER) * 1000 GROUP BY upstream_model ORDER BY request_count DESC",
+                &format!("SELECT upstream_model AS model, COUNT(*) AS request_count, COALESCE(SUM(input_tokens), 0) AS total_input_tokens, COALESCE(SUM(output_tokens), 0) AS total_output_tokens, COALESCE(SUM(cache_read_tokens), 0) AS total_cache_read_tokens, COALESCE(AVG(latency_total_ms), 0.0) AS avg_duration_ms, CAST(COALESCE(SUM(latency_upstream_ms), 0) AS REAL) AS total_upstream_ms, {tps} FROM request_logs WHERE created_at >= CAST(strftime('%s', 'now', ?) AS INTEGER) * 1000 GROUP BY upstream_model ORDER BY request_count DESC"),
             )
             .bind(format!("-{hours} hours"))
             .fetch_all(&self.pool)
             .await?)
         } else {
             Ok(sqlx::query_as::<_, ModelStats>(
-                "SELECT upstream_model AS model, COUNT(*) AS request_count, COALESCE(SUM(input_tokens), 0) AS total_input_tokens, COALESCE(SUM(output_tokens), 0) AS total_output_tokens, COALESCE(SUM(cache_read_tokens), 0) AS total_cache_read_tokens, COALESCE(AVG(latency_total_ms), 0.0) AS avg_duration_ms, CAST(COALESCE(SUM(latency_upstream_ms), 0) AS REAL) AS total_upstream_ms FROM request_logs GROUP BY upstream_model ORDER BY request_count DESC",
+                &format!("SELECT upstream_model AS model, COUNT(*) AS request_count, COALESCE(SUM(input_tokens), 0) AS total_input_tokens, COALESCE(SUM(output_tokens), 0) AS total_output_tokens, COALESCE(SUM(cache_read_tokens), 0) AS total_cache_read_tokens, COALESCE(AVG(latency_total_ms), 0.0) AS avg_duration_ms, CAST(COALESCE(SUM(latency_upstream_ms), 0) AS REAL) AS total_upstream_ms, {tps} FROM request_logs GROUP BY upstream_model ORDER BY request_count DESC"),
             )
             .fetch_all(&self.pool)
             .await?)
@@ -1562,7 +1563,7 @@ impl LogStore for SqliteLogStore {
         .fetch_one(&self.pool)
         .await?;
         let samples = sqlx::query_as::<_, RecentModelPerformance>(
-            &format!("SELECT COALESCE(output_tokens, 0) AS output_tokens, COALESCE(is_stream, 0) AS is_stream, \
+            &format!("SELECT COALESCE(output_tokens, 0) AS output_tokens, COALESCE(reasoning_tokens, 0) AS reasoning_tokens, COALESCE(is_stream, 0) AS is_stream, \
              COALESCE(stream_chunks_count, 0) AS stream_chunks_count, latency_upstream_ms, latency_total_ms, stream_first_chunk_ms \
              FROM request_logs WHERE provider_id = ? AND upstream_model = ? \
              ORDER BY created_at DESC, id DESC LIMIT {}",
@@ -1578,8 +1579,9 @@ impl LogStore for SqliteLogStore {
     async fn stats_by_provider(&self, hours: Option<i64>) -> anyhow::Result<Vec<ProviderStats>> {
         let modifier = hours.map(|hours| format!("-{hours} hours"));
         let error = error_sql("");
+        let tps = crate::db::tps::tps_totals_columns(crate::db::tps::TpsSqlDialect::Sqlite);
         Ok(sqlx::query_as::<_, ProviderStats>(
-            &format!("WITH aggregated AS (SELECT provider_id, COUNT(*) AS request_count, COALESCE(SUM(CASE WHEN {error} THEN 1 ELSE 0 END), 0) AS error_count, COALESCE(AVG(latency_total_ms), 0.0) AS avg_duration_ms, COALESCE(SUM(output_tokens), 0) AS total_output_tokens, CAST(COALESCE(SUM(latency_upstream_ms), 0) AS REAL) AS total_upstream_ms FROM request_logs WHERE provider_id IS NOT NULL AND TRIM(provider_id) <> '' AND (? IS NULL OR created_at >= CAST(strftime('%s', 'now', ?) AS INTEGER) * 1000) GROUP BY provider_id) SELECT a.provider_id, COALESCE((SELECT NULLIF(TRIM(r.provider_name), '') FROM request_logs r WHERE r.provider_id = a.provider_id AND NULLIF(TRIM(r.provider_name), '') IS NOT NULL ORDER BY r.created_at DESC, r.id DESC LIMIT 1), a.provider_id) AS provider, NULL AS provider_icon, NULL AS provider_protocol, a.request_count, a.error_count, a.avg_duration_ms, a.total_output_tokens, a.total_upstream_ms FROM aggregated a ORDER BY a.request_count DESC, a.provider_id ASC"),
+            &format!("WITH aggregated AS (SELECT provider_id, COUNT(*) AS request_count, COALESCE(SUM(CASE WHEN {error} THEN 1 ELSE 0 END), 0) AS error_count, COALESCE(AVG(latency_total_ms), 0.0) AS avg_duration_ms, COALESCE(SUM(output_tokens), 0) AS total_output_tokens, CAST(COALESCE(SUM(latency_upstream_ms), 0) AS REAL) AS total_upstream_ms, {tps} FROM request_logs WHERE provider_id IS NOT NULL AND TRIM(provider_id) <> '' AND (? IS NULL OR created_at >= CAST(strftime('%s', 'now', ?) AS INTEGER) * 1000) GROUP BY provider_id) SELECT a.provider_id, COALESCE((SELECT NULLIF(TRIM(r.provider_name), '') FROM request_logs r WHERE r.provider_id = a.provider_id AND NULLIF(TRIM(r.provider_name), '') IS NOT NULL ORDER BY r.created_at DESC, r.id DESC LIMIT 1), a.provider_id) AS provider, NULL AS provider_icon, NULL AS provider_protocol, a.request_count, a.error_count, a.avg_duration_ms, a.total_output_tokens, a.total_upstream_ms, a.tps_content_tokens, a.tps_output_tokens, a.tps_elapsed_ms FROM aggregated a ORDER BY a.request_count DESC, a.provider_id ASC"),
         )
         .bind(modifier.as_deref())
         .bind(modifier.as_deref())
@@ -1609,17 +1611,20 @@ impl LogStore for SqliteLogStore {
             avg_first_token_ms: Option<f64>,
             total_upstream_ms: f64,
             last_used_at: Option<i64>,
+            #[sqlx(flatten)]
+            tps_totals: crate::db::tps::TpsTotals,
         }
         let error = error_sql("");
         let completed = outcome_sql("", "completed");
         let unknown = outcome_sql("", "unknown");
         let cancelled = outcome_sql("", "cancelled");
         let output_limited = outcome_sql("", "output_limited");
+        let tps = crate::db::tps::tps_totals_columns(crate::db::tps::TpsSqlDialect::Sqlite);
         let summary = sqlx::query_as::<_, SummaryRow>(
-            &format!("SELECT COALESCE((SELECT NULLIF(TRIM(r.provider_name), '') FROM request_logs r WHERE r.provider_id = ? AND NULLIF(TRIM(r.provider_name), '') IS NOT NULL ORDER BY r.created_at DESC, r.id DESC LIMIT 1), ?) AS provider_name, COUNT(*) AS request_count, COALESCE(SUM(CASE WHEN {completed} THEN 1 ELSE 0 END), 0) AS success_count, COALESCE(SUM(CASE WHEN {error} THEN 1 ELSE 0 END), 0) AS error_count, COALESCE(SUM(CASE WHEN {unknown} THEN 1 ELSE 0 END), 0) AS unknown_count, COALESCE(SUM(CASE WHEN {cancelled} THEN 1 ELSE 0 END), 0) AS cancelled_count, COALESCE(SUM(CASE WHEN {output_limited} THEN 1 ELSE 0 END), 0) AS output_limited_count, COALESCE(SUM(input_tokens), 0) AS total_input_tokens, COALESCE(SUM(output_tokens), 0) AS total_output_tokens, COALESCE(SUM(cache_read_tokens), 0) AS total_cache_read_tokens, COALESCE(AVG(latency_total_ms), 0.0) AS avg_duration_ms, AVG(CASE WHEN stream_first_chunk_ms >= 0 THEN stream_first_chunk_ms END) AS avg_first_token_ms, CAST(COALESCE(SUM(latency_upstream_ms), 0) AS REAL) AS total_upstream_ms, MAX(created_at) AS last_used_at FROM request_logs WHERE provider_id = ? AND created_at >= ? AND created_at <= ?"),
+            &format!("SELECT COALESCE((SELECT NULLIF(TRIM(r.provider_name), '') FROM request_logs r WHERE r.provider_id = ? AND NULLIF(TRIM(r.provider_name), '') IS NOT NULL ORDER BY r.created_at DESC, r.id DESC LIMIT 1), ?) AS provider_name, COUNT(*) AS request_count, COALESCE(SUM(CASE WHEN {completed} THEN 1 ELSE 0 END), 0) AS success_count, COALESCE(SUM(CASE WHEN {error} THEN 1 ELSE 0 END), 0) AS error_count, COALESCE(SUM(CASE WHEN {unknown} THEN 1 ELSE 0 END), 0) AS unknown_count, COALESCE(SUM(CASE WHEN {cancelled} THEN 1 ELSE 0 END), 0) AS cancelled_count, COALESCE(SUM(CASE WHEN {output_limited} THEN 1 ELSE 0 END), 0) AS output_limited_count, COALESCE(SUM(input_tokens), 0) AS total_input_tokens, COALESCE(SUM(output_tokens), 0) AS total_output_tokens, COALESCE(SUM(cache_read_tokens), 0) AS total_cache_read_tokens, COALESCE(AVG(latency_total_ms), 0.0) AS avg_duration_ms, AVG(CASE WHEN stream_first_chunk_ms >= 0 THEN stream_first_chunk_ms END) AS avg_first_token_ms, CAST(COALESCE(SUM(latency_upstream_ms), 0) AS REAL) AS total_upstream_ms, MAX(created_at) AS last_used_at, {tps} FROM request_logs WHERE provider_id = ? AND created_at >= ? AND created_at <= ?"),
         ).bind(provider_id).bind(provider_id).bind(provider_id).bind(start_at).bind(end_at).fetch_one(&self.pool).await?;
         let models = sqlx::query_as::<_, ProviderModelUsageStats>(
-            &format!("SELECT COALESCE(upstream_model, '') AS upstream_model, COUNT(*) AS request_count, COALESCE(SUM(CASE WHEN {error} THEN 1 ELSE 0 END), 0) AS error_count, COALESCE(SUM(input_tokens), 0) AS total_input_tokens, COALESCE(SUM(output_tokens), 0) AS total_output_tokens, COALESCE(SUM(cache_read_tokens), 0) AS total_cache_read_tokens, COALESCE(AVG(latency_total_ms), 0.0) AS avg_duration_ms, AVG(CASE WHEN stream_first_chunk_ms >= 0 THEN stream_first_chunk_ms END) AS avg_first_token_ms, CAST(COALESCE(SUM(latency_upstream_ms), 0) AS REAL) AS total_upstream_ms, MAX(created_at) AS last_used_at FROM request_logs WHERE provider_id = ? AND created_at >= ? AND created_at <= ? GROUP BY COALESCE(upstream_model, '') ORDER BY request_count DESC, upstream_model ASC"),
+            &format!("SELECT COALESCE(upstream_model, '') AS upstream_model, COUNT(*) AS request_count, COALESCE(SUM(CASE WHEN {error} THEN 1 ELSE 0 END), 0) AS error_count, COALESCE(SUM(input_tokens), 0) AS total_input_tokens, COALESCE(SUM(output_tokens), 0) AS total_output_tokens, COALESCE(SUM(cache_read_tokens), 0) AS total_cache_read_tokens, COALESCE(AVG(latency_total_ms), 0.0) AS avg_duration_ms, AVG(CASE WHEN stream_first_chunk_ms >= 0 THEN stream_first_chunk_ms END) AS avg_first_token_ms, CAST(COALESCE(SUM(latency_upstream_ms), 0) AS REAL) AS total_upstream_ms, MAX(created_at) AS last_used_at, {tps} FROM request_logs WHERE provider_id = ? AND created_at >= ? AND created_at <= ? GROUP BY COALESCE(upstream_model, '') ORDER BY request_count DESC, upstream_model ASC"),
         ).bind(provider_id).bind(start_at).bind(end_at).fetch_all(&self.pool).await?;
         Ok(ProviderUsageDetail {
             start_at,
@@ -1642,6 +1647,7 @@ impl LogStore for SqliteLogStore {
             avg_first_token_ms: summary.avg_first_token_ms,
             total_upstream_ms: summary.total_upstream_ms,
             last_used_at: summary.last_used_at,
+            tps_totals: summary.tps_totals,
             models,
         })
     }
@@ -1698,8 +1704,9 @@ impl LogStore for SqliteLogStore {
         .fetch_one(&self.pool)
         .await?;
 
+        let tps = crate::db::tps::tps_totals_columns(crate::db::tps::TpsSqlDialect::Sqlite);
         let model_routes = sqlx::query_as::<_, ApiKeyModelRouteStats>(
-            &format!("WITH grouped AS (SELECT COALESCE(client_model, '') AS client_model, COALESCE(provider_id, '') AS provider_id, COALESCE(upstream_model, '') AS upstream_model, COUNT(*) AS request_count, COALESCE(SUM(CASE WHEN {error} THEN 1 ELSE 0 END), 0) AS error_count, COALESCE(SUM(input_tokens), 0) AS total_input_tokens, COALESCE(SUM(output_tokens), 0) AS total_output_tokens, COALESCE(SUM(cache_read_tokens), 0) AS total_cache_read_tokens, COALESCE(AVG(latency_total_ms), 0.0) AS avg_duration_ms, AVG(CASE WHEN stream_first_chunk_ms >= 0 THEN stream_first_chunk_ms END) AS avg_first_token_ms, CAST(COALESCE(SUM(latency_upstream_ms), 0) AS REAL) AS total_upstream_ms FROM request_logs WHERE api_key_id = ? AND created_at >= ? AND created_at <= ? GROUP BY COALESCE(client_model, ''), COALESCE(provider_id, ''), COALESCE(upstream_model, '')), latest_provider AS (SELECT COALESCE(provider_id, '') AS provider_id, COALESCE(NULLIF(provider_name, ''), provider_id, '') AS provider_name, ROW_NUMBER() OVER (PARTITION BY COALESCE(provider_id, '') ORDER BY created_at DESC, id DESC) AS row_num FROM request_logs WHERE COALESCE(provider_id, '') IN (SELECT provider_id FROM grouped)) SELECT g.client_model, g.provider_id, COALESCE(p.provider_name, g.provider_id, '') AS provider_name, g.upstream_model, g.request_count, g.error_count, g.total_input_tokens, g.total_output_tokens, g.total_cache_read_tokens, g.avg_duration_ms, g.avg_first_token_ms, g.total_upstream_ms FROM grouped g LEFT JOIN latest_provider p ON p.provider_id = g.provider_id AND p.row_num = 1 ORDER BY g.request_count DESC, g.client_model ASC, g.provider_id ASC, g.upstream_model ASC"),
+            &format!("WITH grouped AS (SELECT COALESCE(client_model, '') AS client_model, COALESCE(provider_id, '') AS provider_id, COALESCE(upstream_model, '') AS upstream_model, COUNT(*) AS request_count, COALESCE(SUM(CASE WHEN {error} THEN 1 ELSE 0 END), 0) AS error_count, COALESCE(SUM(input_tokens), 0) AS total_input_tokens, COALESCE(SUM(output_tokens), 0) AS total_output_tokens, COALESCE(SUM(cache_read_tokens), 0) AS total_cache_read_tokens, COALESCE(AVG(latency_total_ms), 0.0) AS avg_duration_ms, AVG(CASE WHEN stream_first_chunk_ms >= 0 THEN stream_first_chunk_ms END) AS avg_first_token_ms, CAST(COALESCE(SUM(latency_upstream_ms), 0) AS REAL) AS total_upstream_ms, {tps} FROM request_logs WHERE api_key_id = ? AND created_at >= ? AND created_at <= ? GROUP BY COALESCE(client_model, ''), COALESCE(provider_id, ''), COALESCE(upstream_model, '')), latest_provider AS (SELECT COALESCE(provider_id, '') AS provider_id, COALESCE(NULLIF(provider_name, ''), provider_id, '') AS provider_name, ROW_NUMBER() OVER (PARTITION BY COALESCE(provider_id, '') ORDER BY created_at DESC, id DESC) AS row_num FROM request_logs WHERE COALESCE(provider_id, '') IN (SELECT provider_id FROM grouped)) SELECT g.client_model, g.provider_id, COALESCE(p.provider_name, g.provider_id, '') AS provider_name, g.upstream_model, g.request_count, g.error_count, g.total_input_tokens, g.total_output_tokens, g.total_cache_read_tokens, g.avg_duration_ms, g.avg_first_token_ms, g.total_upstream_ms, g.tps_content_tokens, g.tps_output_tokens, g.tps_elapsed_ms FROM grouped g LEFT JOIN latest_provider p ON p.provider_id = g.provider_id AND p.row_num = 1 ORDER BY g.request_count DESC, g.client_model ASC, g.provider_id ASC, g.upstream_model ASC"),
         )
         .bind(api_key_id)
         .bind(start_at)
@@ -1751,14 +1758,17 @@ impl LogStore for SqliteLogStore {
             avg_first_token_ms: Option<f64>,
             total_upstream_ms: f64,
             last_used_at: Option<i64>,
+            #[sqlx(flatten)]
+            tps_totals: crate::db::tps::TpsTotals,
         }
         let error = error_sql("");
         let completed = outcome_sql("", "completed");
         let unknown = outcome_sql("", "unknown");
         let cancelled = outcome_sql("", "cancelled");
         let output_limited = outcome_sql("", "output_limited");
+        let tps = crate::db::tps::tps_totals_columns(crate::db::tps::TpsSqlDialect::Sqlite);
         let summary = sqlx::query_as::<_, SummaryRow>(
-            &format!("SELECT COUNT(*) AS request_count, COALESCE(SUM(CASE WHEN {completed} THEN 1 ELSE 0 END), 0) AS success_count, COALESCE(SUM(CASE WHEN {error} THEN 1 ELSE 0 END), 0) AS error_count, COALESCE(SUM(CASE WHEN {unknown} THEN 1 ELSE 0 END), 0) AS unknown_count, COALESCE(SUM(CASE WHEN {cancelled} THEN 1 ELSE 0 END), 0) AS cancelled_count, COALESCE(SUM(CASE WHEN {output_limited} THEN 1 ELSE 0 END), 0) AS output_limited_count, COALESCE(SUM(input_tokens), 0) AS total_input_tokens, COALESCE(SUM(output_tokens), 0) AS total_output_tokens, COALESCE(SUM(cache_read_tokens), 0) AS total_cache_read_tokens, COALESCE(AVG(latency_total_ms), 0.0) AS avg_duration_ms, AVG(CASE WHEN stream_first_chunk_ms >= 0 THEN stream_first_chunk_ms END) AS avg_first_token_ms, CAST(COALESCE(SUM(latency_upstream_ms), 0) AS REAL) AS total_upstream_ms, MAX(created_at) AS last_used_at FROM request_logs WHERE upstream_model = ? AND created_at >= ? AND created_at <= ?"),
+            &format!("SELECT COUNT(*) AS request_count, COALESCE(SUM(CASE WHEN {completed} THEN 1 ELSE 0 END), 0) AS success_count, COALESCE(SUM(CASE WHEN {error} THEN 1 ELSE 0 END), 0) AS error_count, COALESCE(SUM(CASE WHEN {unknown} THEN 1 ELSE 0 END), 0) AS unknown_count, COALESCE(SUM(CASE WHEN {cancelled} THEN 1 ELSE 0 END), 0) AS cancelled_count, COALESCE(SUM(CASE WHEN {output_limited} THEN 1 ELSE 0 END), 0) AS output_limited_count, COALESCE(SUM(input_tokens), 0) AS total_input_tokens, COALESCE(SUM(output_tokens), 0) AS total_output_tokens, COALESCE(SUM(cache_read_tokens), 0) AS total_cache_read_tokens, COALESCE(AVG(latency_total_ms), 0.0) AS avg_duration_ms, AVG(CASE WHEN stream_first_chunk_ms >= 0 THEN stream_first_chunk_ms END) AS avg_first_token_ms, CAST(COALESCE(SUM(latency_upstream_ms), 0) AS REAL) AS total_upstream_ms, MAX(created_at) AS last_used_at, {tps} FROM request_logs WHERE upstream_model = ? AND created_at >= ? AND created_at <= ?"),
         )
         .bind(upstream_model)
         .bind(start_at)
@@ -1766,7 +1776,7 @@ impl LogStore for SqliteLogStore {
         .fetch_one(&self.pool)
         .await?;
         let providers = sqlx::query_as::<_, ModelProviderUsageStats>(
-            &format!("WITH aggregated AS (SELECT provider_id, COUNT(*) AS request_count, COALESCE(SUM(CASE WHEN {error} THEN 1 ELSE 0 END), 0) AS error_count, COALESCE(SUM(input_tokens), 0) AS total_input_tokens, COALESCE(SUM(output_tokens), 0) AS total_output_tokens, COALESCE(SUM(cache_read_tokens), 0) AS total_cache_read_tokens, COALESCE(AVG(latency_total_ms), 0.0) AS avg_duration_ms, AVG(CASE WHEN stream_first_chunk_ms >= 0 THEN stream_first_chunk_ms END) AS avg_first_token_ms, CAST(COALESCE(SUM(latency_upstream_ms), 0) AS REAL) AS total_upstream_ms, MAX(created_at) AS last_used_at FROM request_logs WHERE upstream_model = ? AND provider_id IS NOT NULL AND TRIM(provider_id) <> '' AND created_at >= ? AND created_at <= ? GROUP BY provider_id) SELECT a.provider_id, COALESCE((SELECT NULLIF(TRIM(r.provider_name), '') FROM request_logs r WHERE r.provider_id = a.provider_id AND NULLIF(TRIM(r.provider_name), '') IS NOT NULL ORDER BY r.created_at DESC, r.id DESC LIMIT 1), a.provider_id) AS provider_name, NULL AS provider_icon, NULL AS provider_protocol, a.request_count, a.error_count, a.total_input_tokens, a.total_output_tokens, a.total_cache_read_tokens, a.avg_duration_ms, a.avg_first_token_ms, a.total_upstream_ms, a.last_used_at FROM aggregated a ORDER BY a.request_count DESC, a.provider_id ASC"),
+            &format!("WITH aggregated AS (SELECT provider_id, COUNT(*) AS request_count, COALESCE(SUM(CASE WHEN {error} THEN 1 ELSE 0 END), 0) AS error_count, COALESCE(SUM(input_tokens), 0) AS total_input_tokens, COALESCE(SUM(output_tokens), 0) AS total_output_tokens, COALESCE(SUM(cache_read_tokens), 0) AS total_cache_read_tokens, COALESCE(AVG(latency_total_ms), 0.0) AS avg_duration_ms, AVG(CASE WHEN stream_first_chunk_ms >= 0 THEN stream_first_chunk_ms END) AS avg_first_token_ms, CAST(COALESCE(SUM(latency_upstream_ms), 0) AS REAL) AS total_upstream_ms, MAX(created_at) AS last_used_at, {tps} FROM request_logs WHERE upstream_model = ? AND provider_id IS NOT NULL AND TRIM(provider_id) <> '' AND created_at >= ? AND created_at <= ? GROUP BY provider_id) SELECT a.provider_id, COALESCE((SELECT NULLIF(TRIM(r.provider_name), '') FROM request_logs r WHERE r.provider_id = a.provider_id AND NULLIF(TRIM(r.provider_name), '') IS NOT NULL ORDER BY r.created_at DESC, r.id DESC LIMIT 1), a.provider_id) AS provider_name, NULL AS provider_icon, NULL AS provider_protocol, a.request_count, a.error_count, a.total_input_tokens, a.total_output_tokens, a.total_cache_read_tokens, a.avg_duration_ms, a.avg_first_token_ms, a.total_upstream_ms, a.last_used_at, a.tps_content_tokens, a.tps_output_tokens, a.tps_elapsed_ms FROM aggregated a ORDER BY a.request_count DESC, a.provider_id ASC"),
         )
         .bind(upstream_model)
         .bind(start_at)
@@ -1774,7 +1784,7 @@ impl LogStore for SqliteLogStore {
         .fetch_all(&self.pool)
         .await?;
         let api_keys = sqlx::query_as::<_, ModelApiKeyUsageStats>(
-            &format!("WITH aggregated AS (SELECT api_key_id, COUNT(*) AS request_count, COALESCE(SUM(CASE WHEN {error} THEN 1 ELSE 0 END), 0) AS error_count, COALESCE(SUM(input_tokens), 0) AS total_input_tokens, COALESCE(SUM(output_tokens), 0) AS total_output_tokens, COALESCE(SUM(cache_read_tokens), 0) AS total_cache_read_tokens, COALESCE(AVG(latency_total_ms), 0.0) AS avg_duration_ms, AVG(CASE WHEN stream_first_chunk_ms >= 0 THEN stream_first_chunk_ms END) AS avg_first_token_ms, CAST(COALESCE(SUM(latency_upstream_ms), 0) AS REAL) AS total_upstream_ms, MAX(created_at) AS last_used_at FROM request_logs WHERE upstream_model = ? AND api_key_id IS NOT NULL AND api_key_id <> '' AND created_at >= ? AND created_at <= ? GROUP BY api_key_id) SELECT a.api_key_id, COALESCE((SELECT COALESCE(NULLIF(r.api_key_name, ''), r.api_key_id, '') FROM request_logs r WHERE r.api_key_id = a.api_key_id ORDER BY r.created_at DESC, r.id DESC LIMIT 1), a.api_key_id, '') AS api_key_name, a.request_count, a.error_count, a.total_input_tokens, a.total_output_tokens, a.total_cache_read_tokens, a.avg_duration_ms, a.avg_first_token_ms, a.total_upstream_ms, a.last_used_at FROM aggregated a ORDER BY a.request_count DESC, a.api_key_id ASC"),
+            &format!("WITH aggregated AS (SELECT api_key_id, COUNT(*) AS request_count, COALESCE(SUM(CASE WHEN {error} THEN 1 ELSE 0 END), 0) AS error_count, COALESCE(SUM(input_tokens), 0) AS total_input_tokens, COALESCE(SUM(output_tokens), 0) AS total_output_tokens, COALESCE(SUM(cache_read_tokens), 0) AS total_cache_read_tokens, COALESCE(AVG(latency_total_ms), 0.0) AS avg_duration_ms, AVG(CASE WHEN stream_first_chunk_ms >= 0 THEN stream_first_chunk_ms END) AS avg_first_token_ms, CAST(COALESCE(SUM(latency_upstream_ms), 0) AS REAL) AS total_upstream_ms, MAX(created_at) AS last_used_at, {tps} FROM request_logs WHERE upstream_model = ? AND api_key_id IS NOT NULL AND api_key_id <> '' AND created_at >= ? AND created_at <= ? GROUP BY api_key_id) SELECT a.api_key_id, COALESCE((SELECT COALESCE(NULLIF(r.api_key_name, ''), r.api_key_id, '') FROM request_logs r WHERE r.api_key_id = a.api_key_id ORDER BY r.created_at DESC, r.id DESC LIMIT 1), a.api_key_id, '') AS api_key_name, a.request_count, a.error_count, a.total_input_tokens, a.total_output_tokens, a.total_cache_read_tokens, a.avg_duration_ms, a.avg_first_token_ms, a.total_upstream_ms, a.last_used_at, a.tps_content_tokens, a.tps_output_tokens, a.tps_elapsed_ms FROM aggregated a ORDER BY a.request_count DESC, a.api_key_id ASC"),
         )
         .bind(upstream_model)
         .bind(start_at)
@@ -1802,6 +1812,7 @@ impl LogStore for SqliteLogStore {
             providers,
             api_keys,
             time_series: None,
+            tps_totals: summary.tps_totals,
         })
     }
 }

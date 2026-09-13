@@ -215,7 +215,17 @@ export interface StatsTimeSeries {
   points: StatsTimeBucket[];
 }
 
-export interface ModelStats {
+/**
+ * 聚合 DTO 携带的有效样本汇总(与全历史总量字段独立):
+ * 同一请求池(output > 0 且耗时有效,纯推理样本以正文 0 计入),按页面时间筛选。
+ */
+export interface TpsSampleSums {
+  tps_content_tokens?: number | null;
+  tps_output_tokens?: number | null;
+  tps_elapsed_ms?: number | null;
+}
+
+export interface ModelStats extends TpsSampleSums {
   model: string;
   request_count: number;
   total_input_tokens: number;
@@ -232,12 +242,20 @@ export interface ModelUsageStats {
   total_cache_read_tokens: number;
   last_called_at?: number | null;
   recent_sample_count: number;
+  /** 主 TPS:Σ正文 Token ÷ Σ有效请求耗时;与 overall_tps 同值别名。 */
   average_tps?: number | null;
   average_gross_tps?: number | null;
+  /** average_tps 的兼容别名,后端保证与 average_tps 同值。 */
+  overall_tps?: number | null;
+  /** average_gross_tps 的兼容别名,后端保证同值。 */
+  overall_gross_tps?: number | null;
+  valid_tps_count?: number | null;
+  recent_content_tokens?: number | null;
+  recent_latency_ms?: number | null;
   average_first_token_ms?: number | null;
 }
 
-export interface ProviderStats {
+export interface ProviderStats extends TpsSampleSums {
   provider_id: string;
   provider: string;
   provider_icon?: string | null;
@@ -249,7 +267,7 @@ export interface ProviderStats {
   total_upstream_ms: number;
 }
 
-export interface ProviderModelUsageStats {
+export interface ProviderModelUsageStats extends TpsSampleSums {
   upstream_model: string;
   request_count: number;
   error_count: number;
@@ -262,7 +280,7 @@ export interface ProviderModelUsageStats {
   last_used_at?: number | null;
 }
 
-export interface ProviderUsageDetail {
+export interface ProviderUsageDetail extends TpsSampleSums {
   start_at: number;
   end_at: number;
   provider_id: string;
@@ -298,7 +316,7 @@ export interface ApiKeyStats {
   last_used_at: number;
 }
 
-export interface ApiKeyModelRouteStats {
+export interface ApiKeyModelRouteStats extends TpsSampleSums {
   client_model: string;
   provider_id: string;
   provider_name: string;
@@ -343,7 +361,7 @@ export interface ApiKeyModelTimeSeries {
   series: StatsTimeSeries;
 }
 
-export interface ModelProviderUsageStats {
+export interface ModelProviderUsageStats extends TpsSampleSums {
   provider_id: string;
   provider_name: string;
   provider_icon?: string | null;
@@ -359,7 +377,7 @@ export interface ModelProviderUsageStats {
   last_used_at?: number | null;
 }
 
-export interface ModelApiKeyUsageStats {
+export interface ModelApiKeyUsageStats extends TpsSampleSums {
   api_key_id: string;
   api_key_name: string;
   request_count: number;
@@ -373,7 +391,7 @@ export interface ModelApiKeyUsageStats {
   last_used_at?: number | null;
 }
 
-export interface ModelUsageDetail {
+export interface ModelUsageDetail extends TpsSampleSums {
   start_at: number;
   end_at: number;
   upstream_model: string;

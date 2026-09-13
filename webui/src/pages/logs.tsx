@@ -7,7 +7,7 @@ import type { ApiKey, LoggingStatus, LogPage, LogQuery, ModelStats, Provider, Re
 import { isLogRelatedQueryKey } from "@/lib/log-observability";
 import { OutcomeFilter, ResultBadge } from "@/components/log-outcome";
 import { getRouteType } from "@/lib/types";
-import { computeGrossTps, computeTps, contentTokensOf, formatDuration, formatLogTime, formatTokenCount, formatTps } from "@/lib/format";
+import { computeGrossTps, computeTps, contentTokensOf, formatDuration, formatLogTime, formatTokenCount, formatTps, tpsGrossTitle, tpsMetricTitle, tpsReasoningCaveat } from "@/lib/format";
 import { prettyName } from "@/lib/protocol";
 import { cn } from "@/lib/utils";
 import { useLocale } from "@/lib/i18n";
@@ -424,8 +424,11 @@ export default function LogsPage() {
                     {isZh ? "首字延迟" : "TTFT"}
                   </th>
                   <th className="px-3 py-2.5 text-left font-medium whitespace-nowrap">Token</th>
-                  <th className="px-3 py-2.5 text-right font-medium whitespace-nowrap">
-                    {isZh ? "速度" : "TPS"}
+                  <th
+                    className="px-3 py-2.5 text-right font-medium whitespace-nowrap"
+                    title={`${tpsMetricTitle(isZh)}\n${tpsReasoningCaveat(isZh)}`}
+                  >
+                    {isZh ? "正文 TPS" : "Content TPS"}
                   </th>
                   <th className="px-3 py-2.5 text-left font-medium whitespace-nowrap">
                     {isZh ? "类型" : "Type"}
@@ -522,17 +525,24 @@ export default function LogsPage() {
                       </td>
                       <td
                         className="px-3 py-2 text-right text-xs text-slate-600 whitespace-nowrap tabular-nums"
-                        title={
+                        title={[
+                          tpsMetricTitle(isZh),
+                          `${isZh ? "正文 TPS" : "Content TPS"}: ${formatTps(computeTps(log))}`,
+                          `${tpsGrossTitle(isZh)}: ${formatTps(computeGrossTps(log))}`,
                           log.reasoning_tokens && log.reasoning_tokens > 0
                             ? (isZh
-                                ? `正文有效速率: ${formatTps(computeTps(log))} (物理总速: ${formatTps(computeGrossTps(log))}，思考 ${log.reasoning_tokens} tok / 正文 ${contentTokensOf(log)} tok)`
-                                : `Effective: ${formatTps(computeTps(log))} (Gross: ${formatTps(computeGrossTps(log))}, reasoning: ${log.reasoning_tokens} tok)`)
-                            : (isZh ? "净生成速度" : "Net generation speed")
-                        }
+                                ? `思考 ${log.reasoning_tokens} tok / 正文 ${contentTokensOf(log)} tok`
+                                : `reasoning: ${log.reasoning_tokens} tok, content: ${contentTokensOf(log)} tok`)
+                            : "",
+                          tpsReasoningCaveat(isZh),
+                        ].filter(Boolean).join("\n")}
                       >
-                        {formatTps(computeTps(log) ?? computeGrossTps(log))}
+                        {formatTps(computeTps(log))}
                         {log.reasoning_tokens && log.reasoning_tokens > 0 ? (
-                          <span className="ml-1 text-[10px] text-amber-600 font-medium cursor-help" title={isZh ? "已扣除思考耗费，显示正文有效TPS" : "Excludes reasoning tokens"}>
+                          <span
+                            className="ml-1 text-[10px] text-amber-600 font-medium cursor-help"
+                            title={isZh ? "该请求报告了推理 Token，正文 = 输出 − 推理" : "Reasoning tokens reported; content = output − reasoning"}
+                          >
                             *
                           </span>
                         ) : null}

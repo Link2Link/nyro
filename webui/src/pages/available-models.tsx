@@ -19,7 +19,7 @@ import {
 } from "lucide-react";
 
 import { backend } from "@/lib/backend";
-import { formatDuration, formatLocalDateTime, formatTokenCount, formatTps } from "@/lib/format";
+import { formatDuration, formatLocalDateTime, formatTokenCount, formatTps, readAverageTpsField, tpsGrossTitle, tpsLegacyServerTitle, tpsMetricTitle, tpsReasoningCaveat } from "@/lib/format";
 import { useLocale } from "@/lib/i18n";
 import { longestRatingMatch, ratingDisplayState, uniqueModelIdentifiers, type RatingLoadState } from "@/lib/model-ratings";
 import { useModelRatings } from "@/lib/use-model-ratings";
@@ -221,10 +221,14 @@ function CapabilityDetail({ provider, model, isZh }: { provider: Provider; model
         <div className="flex flex-wrap items-baseline justify-between gap-2">
           <div className="text-xs font-semibold text-slate-700">{isZh ? "调用统计" : "Usage"}</div>
           {stats && stats.recent_sample_count > 0 && (
-            <div className="text-[11px] text-slate-400">
-              {isZh
-                ? "性能取最近 " + stats.recent_sample_count + " 次调用平均值"
-                : "Performance averages from the last " + stats.recent_sample_count + " calls"}
+            <div className="text-[11px] text-slate-400" title={tpsMetricTitle(isZh)}>
+              {stats.valid_tps_count != null
+                ? (isZh
+                  ? "性能按最近 " + stats.recent_sample_count + " 次调用中 " + stats.valid_tps_count + " 条有效样本汇总（ΣToken ÷ Σ耗时）"
+                  : "Performance sums the " + stats.valid_tps_count + " valid of the last " + stats.recent_sample_count + " calls (Σtokens ÷ Σduration)")
+                : (isZh
+                  ? "性能取最近 " + stats.recent_sample_count + " 次调用（有效样本数未知）"
+                  : "Performance covers the last " + stats.recent_sample_count + " calls (valid sample count unknown)")}
             </div>
           )}
         </div>
@@ -259,9 +263,18 @@ function CapabilityDetail({ provider, model, isZh }: { provider: Provider; model
               <div className="text-[11px] font-medium text-slate-400">{isZh ? "最后调用" : "Last Called"}</div>
               <div className="mt-1 text-sm font-medium text-slate-700">{formatLocalDateTime(stats.last_called_at)}</div>
             </div>
-            <div>
-              <div className="text-[11px] font-medium text-slate-400">{isZh ? "平均 TPS" : "Average TPS"}</div>
-              <div className="mt-1 text-base font-semibold text-slate-800">{formatTps(stats.average_tps)}</div>
+            <div
+              title={[
+                tpsMetricTitle(isZh),
+                stats.average_gross_tps != null && (stats.overall_tps !== undefined || stats.valid_tps_count !== undefined)
+                  ? `${tpsGrossTitle(isZh)}: ${formatTps(stats.average_gross_tps)}`
+                  : "",
+                readAverageTpsField(stats) == null && stats.average_tps != null ? tpsLegacyServerTitle(isZh) : "",
+                tpsReasoningCaveat(isZh),
+              ].filter(Boolean).join("\n")}
+            >
+              <div className="text-[11px] font-medium text-slate-400">{isZh ? "正文 TPS" : "Content TPS"}</div>
+              <div className="mt-1 text-base font-semibold text-slate-800">{formatTps(readAverageTpsField(stats))}</div>
             </div>
             <div>
               <div className="text-[11px] font-medium text-slate-400">{isZh ? "平均首字延迟" : "Average First Token"}</div>

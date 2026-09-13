@@ -11,7 +11,7 @@ import { ModelUsageDialog } from "@/components/model-usage-dialog";
 import { ProviderIcon } from "@/components/ui/provider-icon";
 import { Button } from "@/components/ui/button";
 import { useLocale } from "@/lib/i18n";
-import { formatLogTime, formatTps } from "@/lib/format";
+import { computeAggregateTps, formatLogTime, formatTps, tpsAggregateStatusTitle, tpsAggregateWindowTitle, tpsMetricTitle, tpsReasoningCaveat } from "@/lib/format";
 import {
   Select,
   SelectContent,
@@ -282,7 +282,12 @@ export default function StatsPage() {
                 <th className="px-4 py-2.5 text-right font-medium">{isZh ? "错误尝试数" : "Error Attempts"}</th>
                 <th className="px-4 py-2.5 text-right font-medium">{isZh ? "错误率" : "Error Rate"}</th>
                 <th className="px-4 py-2.5 text-right font-medium">{isZh ? "平均延迟" : "Avg Latency"}</th>
-                <th className="px-4 py-2.5 text-right font-medium">TPS</th>
+                <th
+                  className="px-4 py-2.5 text-right font-medium"
+                  title={`${tpsMetricTitle(isZh)}\n${tpsAggregateWindowTitle(isZh)}\n${tpsReasoningCaveat(isZh)}`}
+                >
+                  {isZh ? "正文 TPS" : "Content TPS"}
+                </th>
               </tr>
             </thead>
             <tbody>
@@ -290,9 +295,7 @@ export default function StatsPage() {
                 <tr><td className="px-4 py-6 text-center text-slate-400" colSpan={6}>{isZh ? "暂无数据" : "No data"}</td></tr>
               )}
               {providerStats.slice(0, 8).map((p) => {
-                const tps = p.total_upstream_ms > 0 && p.total_output_tokens > 0
-                  ? p.total_output_tokens / (p.total_upstream_ms / 1000)
-                  : null;
+                const tps = computeAggregateTps(p);
                 return (
                   <tr
                     key={p.provider_id}
@@ -319,7 +322,12 @@ export default function StatsPage() {
                       {p.request_count > 0 ? ((p.error_count / p.request_count) * 100).toFixed(1) : "0"}%
                     </td>
                     <td className="px-4 py-2.5 text-right">{fmtLatency(p.avg_duration_ms)}</td>
-                    <td className="px-4 py-2.5 text-right">{formatTps(tps)}</td>
+                    <td
+                      className="px-4 py-2.5 text-right"
+                      title={tpsAggregateStatusTitle(p, isZh)}
+                    >
+                      {formatTps(tps)}
+                    </td>
                   </tr>
                 );
               })}
@@ -436,7 +444,12 @@ export default function StatsPage() {
                 <th className="px-4 py-2.5 text-right font-medium">{isZh ? "输出 Token" : "Output Tokens"}</th>
                 <th className="px-4 py-2.5 text-right font-medium">{isZh ? "缓存命中率" : "Cache Rate"}</th>
                 <th className="px-4 py-2.5 text-right font-medium">{isZh ? "平均延迟" : "Avg Latency"}</th>
-                <th className="px-4 py-2.5 text-right font-medium">TPS</th>
+                <th
+                  className="px-4 py-2.5 text-right font-medium"
+                  title={`${tpsMetricTitle(isZh)}\n${tpsAggregateWindowTitle(isZh)}\n${tpsReasoningCaveat(isZh)}`}
+                >
+                  {isZh ? "正文 TPS" : "Content TPS"}
+                </th>
               </tr>
             </thead>
             <tbody>
@@ -448,9 +461,7 @@ export default function StatsPage() {
                 const cacheRate = m.total_input_tokens > 0
                   ? Math.round((m.total_cache_read_tokens / m.total_input_tokens) * 100)
                   : 0;
-                const tps = m.total_upstream_ms > 0 && m.total_output_tokens > 0
-                  ? m.total_output_tokens / (m.total_upstream_ms / 1000)
-                  : null;
+                const tps = computeAggregateTps(m);
                 const clickable = m.model.length > 0;
                 return (
                   <tr
@@ -479,7 +490,12 @@ export default function StatsPage() {
                     <td className="px-4 py-2.5 text-right">{fmt(m.total_output_tokens)}</td>
                     <td className="px-4 py-2.5 text-right">{cacheRate}%</td>
                     <td className="px-4 py-2.5 text-right">{fmtLatency(m.avg_duration_ms)}</td>
-                    <td className="px-4 py-2.5 text-right">{formatTps(tps)}</td>
+                    <td
+                      className="px-4 py-2.5 text-right"
+                      title={tpsAggregateStatusTitle(m, isZh)}
+                    >
+                      {formatTps(tps)}
+                    </td>
                   </tr>
                 );
               })}

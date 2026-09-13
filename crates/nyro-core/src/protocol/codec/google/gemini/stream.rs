@@ -856,7 +856,7 @@ fn add_stream_response_metadata(out: &mut Value, metadata: &serde_json::Map<Stri
     }
 }
 
-fn extract_gemini_usage(v: &Value) -> Usage {
+pub(crate) fn extract_gemini_usage(v: &Value) -> Usage {
     let usage = v
         .get("usageMetadata")
         .or_else(|| v.get("usage_metadata"))

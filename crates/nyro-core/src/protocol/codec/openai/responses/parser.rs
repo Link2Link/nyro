@@ -110,43 +110,7 @@ impl ResponseDecoder for ResponsesResponseParser {
             }
         }
 
-        // Cache stats live under `usage.input_tokens_details` in the Responses
-        // API (both `cached_tokens` and `cache_write_tokens`). Surface them
-        // on the IR Usage so downstream cost / cache-hit analytics see them
-        // instead of treating the whole prompt as full-price input. Mirrors
-        // the extraction done for the OpenAI-compatible chat codec.
-        let usage_obj = resp.get("usage");
-        let input_details = usage_obj.and_then(|v| v.get("input_tokens_details"));
-        let cache_read = input_details
-            .and_then(|d| d.get("cached_tokens"))
-            .and_then(Value::as_u64)
-            .filter(|&v| v > 0)
-            .map(|v| v as u32);
-        let cache_creation = input_details
-            .and_then(|d| d.get("cache_write_tokens"))
-            .and_then(Value::as_u64)
-            .filter(|&v| v > 0)
-            .map(|v| v as u32);
-        let output_details = usage_obj.and_then(|v| v.get("output_tokens_details"));
-        let reasoning = output_details
-            .and_then(|d| d.get("reasoning_tokens"))
-            .and_then(Value::as_u64)
-            .filter(|&v| v > 0)
-            .map(|v| v as u32);
-        let usage = Usage {
-            prompt_tokens: usage_obj
-                .and_then(|v| v.get("input_tokens"))
-                .and_then(Value::as_u64)
-                .unwrap_or(0) as u32,
-            completion_tokens: usage_obj
-                .and_then(|v| v.get("output_tokens"))
-                .and_then(Value::as_u64)
-                .unwrap_or(0) as u32,
-            cache_read_tokens: cache_read,
-            cache_creation_tokens: cache_creation,
-            reasoning_tokens: reasoning,
-            ..Usage::default()
-        };
+        let usage = extract_responses_usage(resp.get("usage"));
 
         let mut ai_resp = AiResponse::new(id, model);
         ai_resp.content = content;
@@ -362,33 +326,7 @@ impl ResponsesStreamParser {
             }
             "response.completed" | "response.incomplete" => {
                 let response = payload.get("response").unwrap_or(payload);
-                // See note above: surface cache stats from
-                // `usage.input_tokens_details` on the IR Usage.
-                let usage_obj = response.get("usage");
-                let input_details = usage_obj.and_then(|v| v.get("input_tokens_details"));
-                let cache_read = input_details
-                    .and_then(|d| d.get("cached_tokens"))
-                    .and_then(Value::as_u64)
-                    .filter(|&v| v > 0)
-                    .map(|v| v as u32);
-                let cache_creation = input_details
-                    .and_then(|d| d.get("cache_write_tokens"))
-                    .and_then(Value::as_u64)
-                    .filter(|&v| v > 0)
-                    .map(|v| v as u32);
-                let usage = Usage {
-                    prompt_tokens: usage_obj
-                        .and_then(|v| v.get("input_tokens"))
-                        .and_then(Value::as_u64)
-                        .unwrap_or(0) as u32,
-                    completion_tokens: usage_obj
-                        .and_then(|v| v.get("output_tokens"))
-                        .and_then(Value::as_u64)
-                        .unwrap_or(0) as u32,
-                    cache_read_tokens: cache_read,
-                    cache_creation_tokens: cache_creation,
-                    ..Usage::default()
-                };
+                let usage = extract_responses_usage(response.get("usage"));
                 if usage.prompt_tokens > 0 || usage.completion_tokens > 0 {
                     deltas.push(AiStreamDelta::Usage(usage));
                 }
@@ -404,6 +342,49 @@ impl ResponsesStreamParser {
             }
             _ => {}
         }
+    }
+}
+
+/// Extract IR usage from a Responses-API `usage` object.
+///
+/// Single source of truth shared by the non-stream parser and the stream
+/// terminal events (`response.completed` / `response.incomplete`) so the two
+/// paths cannot drift. Cache stats live under `usage.input_tokens_details`
+/// (both `cached_tokens` and `cache_write_tokens`); reasoning lives under
+/// `usage.output_tokens_details.reasoning_tokens`. Zero-valued optional
+/// counters stay `None` so analytics are not polluted with meaningless
+/// zeros.
+pub(crate) fn extract_responses_usage(usage_obj: Option<&Value>) -> Usage {
+    let input_details = usage_obj.and_then(|v| v.get("input_tokens_details"));
+    let cache_read = input_details
+        .and_then(|d| d.get("cached_tokens"))
+        .and_then(Value::as_u64)
+        .filter(|&v| v > 0)
+        .map(|v| v as u32);
+    let cache_creation = input_details
+        .and_then(|d| d.get("cache_write_tokens"))
+        .and_then(Value::as_u64)
+        .filter(|&v| v > 0)
+        .map(|v| v as u32);
+    let output_details = usage_obj.and_then(|v| v.get("output_tokens_details"));
+    let reasoning = output_details
+        .and_then(|d| d.get("reasoning_tokens"))
+        .and_then(Value::as_u64)
+        .filter(|&v| v > 0)
+        .map(|v| v as u32);
+    Usage {
+        prompt_tokens: usage_obj
+            .and_then(|v| v.get("input_tokens"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0) as u32,
+        completion_tokens: usage_obj
+            .and_then(|v| v.get("output_tokens"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0) as u32,
+        cache_read_tokens: cache_read,
+        cache_creation_tokens: cache_creation,
+        reasoning_tokens: reasoning,
+        ..Usage::default()
     }
 }
 
@@ -855,5 +836,109 @@ mod tests {
             }),
             "expected ToolCallDelta with completed arguments, got: {deltas:?}"
         );
+    }
+
+    #[test]
+    fn test_stream_completed_extracts_reasoning_tokens() {
+        // Regression: `response.completed` used to decode usage inline and
+        // silently dropped `output_tokens_details.reasoning_tokens`, so
+        // reasoning-heavy Responses upstreams under-reported reasoning usage.
+        let sse = sse_data(
+            r#"{"type":"response.completed","response":{"id":"resp_reason","model":"gpt-5","status":"completed","output":[],"usage":{"input_tokens":100,"output_tokens":80,"total_tokens":180,"output_tokens_details":{"reasoning_tokens":60}}}}"#,
+        );
+        let mut parser = ResponsesStreamParser::new();
+        let deltas = parser.parse_chunk(&sse).unwrap();
+        let usage = deltas
+            .iter()
+            .find_map(|d| {
+                if let AiStreamDelta::Usage(u) = d {
+                    Some(u)
+                } else {
+                    None
+                }
+            })
+            .expect("response.completed must emit a Usage delta");
+        assert_eq!(usage.prompt_tokens, 100);
+        assert_eq!(usage.completion_tokens, 80);
+        assert_eq!(usage.reasoning_tokens, Some(60));
+    }
+
+    #[test]
+    fn test_stream_incomplete_extracts_reasoning_tokens() {
+        let sse = sse_data(
+            r#"{"type":"response.incomplete","response":{"id":"resp_inc","model":"gpt-5","status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"output":[],"usage":{"input_tokens":70,"output_tokens":50,"output_tokens_details":{"reasoning_tokens":40}}}}"#,
+        );
+        let mut parser = ResponsesStreamParser::new();
+        let deltas = parser.parse_chunk(&sse).unwrap();
+        let usage = deltas
+            .iter()
+            .find_map(|d| {
+                if let AiStreamDelta::Usage(u) = d {
+                    Some(u)
+                } else {
+                    None
+                }
+            })
+            .expect("response.incomplete must emit a Usage delta");
+        assert_eq!(usage.prompt_tokens, 70);
+        assert_eq!(usage.completion_tokens, 50);
+        assert_eq!(usage.reasoning_tokens, Some(40));
+    }
+
+    #[test]
+    fn test_stream_and_nonstream_usage_extraction_cannot_drift() {
+        // The same `usage` object must yield identical IR Usage through the
+        // stream terminal event and the non-stream parser.
+        let usage_json = serde_json::json!({
+            "input_tokens": 13582,
+            "input_tokens_details": {"cached_tokens": 13056, "cache_write_tokens": 0},
+            "output_tokens": 692,
+            "output_tokens_details": {"reasoning_tokens": 512},
+            "total_tokens": 14274
+        });
+        let expected = Usage {
+            prompt_tokens: 13582,
+            completion_tokens: 692,
+            total_tokens: 0,
+            cache_read_tokens: Some(13056),
+            cache_creation_tokens: None,
+            reasoning_tokens: Some(512),
+            server_tool_use: None,
+        };
+
+        let mut response = serde_json::json!({
+            "id": "resp_parity",
+            "model": "gpt-5",
+            "status": "completed",
+            "output": [],
+        });
+        response["usage"] = usage_json.clone();
+        let nonstream = ResponsesResponseParser
+            .parse_response(response)
+            .unwrap()
+            .usage;
+
+        let mut stream_event = serde_json::json!({
+            "type": "response.completed",
+            "response": {"id": "resp_parity", "status": "completed", "output": []},
+        });
+        stream_event["response"]["usage"] = usage_json;
+        let mut parser = ResponsesStreamParser::new();
+        let deltas = parser
+            .parse_chunk(&sse_data(&stream_event.to_string()))
+            .unwrap();
+        let streamed = deltas
+            .iter()
+            .find_map(|d| {
+                if let AiStreamDelta::Usage(u) = d {
+                    Some(u.clone())
+                } else {
+                    None
+                }
+            })
+            .expect("stream terminal event must emit a Usage delta");
+
+        assert_eq!(format!("{nonstream:?}"), format!("{expected:?}"));
+        assert_eq!(format!("{streamed:?}"), format!("{expected:?}"));
     }
 }

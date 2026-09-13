@@ -3,9 +3,12 @@ import type { Provider } from "./types";
 export interface PerformanceStats {
   selected_request_count: number;
   valid_tps_count: number;
+  /** 主 TPS:Σ正文 Token ÷ Σ有效请求耗时;0 表示纯推理样本也计入。 */
   average_tps: number | null;
   average_gross_tps?: number | null;
+  /** average_tps 的兼容别名,后端保证同值。 */
   overall_tps?: number | null;
+  /** average_gross_tps 的兼容别名,后端保证同值。 */
   overall_gross_tps?: number | null;
   total_output_tokens?: number;
   total_content_tokens?: number;
@@ -13,13 +16,19 @@ export interface PerformanceStats {
   first_sample_at: number | null;
   last_sample_at: number | null;
 }
+/** 主 TPS = average_tps,缺失时读同值别名 overall_tps。 */
+export const resolveMainTps = (stats: PerformanceStats): number | null =>
+  stats.average_tps ?? stats.overall_tps ?? null;
+/** 总输出 TPS = average_gross_tps,缺失时读同值别名 overall_gross_tps。 */
+export const resolveGrossTps = (stats: PerformanceStats): number | null =>
+  stats.average_gross_tps ?? stats.overall_gross_tps ?? null;
 export interface ModelPerformanceVariant {
   upstream_model: string;
   mixed: PerformanceStats;
   unclassified_count: number;
   untrusted_count: number;
 }
-/** One point: a rated prefix at one provider, variants merged by sample weight. */
+/** One point: a rated prefix at one provider; variants merge by summing valid-sample tokens and durations, then TPS = Σtokens ÷ Σduration. */
 export interface ModelPerformanceItem {
   model_prefix: string;
   provider_id: string;
@@ -36,16 +45,31 @@ const PERFORMANCE_SAMPLE_LIMIT = 50;
 const count = (value: unknown) => typeof value === "number" && Number.isInteger(value) && value >= 0;
 const finite = (value: unknown) => typeof value === "number" && Number.isFinite(value);
 /** A group's merged statistics sum its variants, so their bound is not the per-variant one. */
+/**
+ * 兼容别名必须同值:双方都提供时按小 epsilon 判等;只有一方提供(如仅
+ * average_tps 的几何 fixture)不强制。防止旧值未同步的 average/overall 混排。
+ */
+function aliasPairConsistent(a: unknown, b: unknown): boolean {
+  if (a === undefined || a === null || b === undefined || b === null) return true;
+  if (!finite(a) || !finite(b)) return false;
+  return Math.abs(Number(a) - Number(b)) <= 1e-9 * Math.max(1, Math.abs(Number(a)), Math.abs(Number(b)));
+}
 function isStats(value: unknown, maxSelected: number): value is PerformanceStats {
   if (!value || typeof value !== "object") return false;
   const v = value as Record<string, unknown>;
   if (!count(v.selected_request_count) || Number(v.selected_request_count) > maxSelected
     || !count(v.valid_tps_count) || Number(v.valid_tps_count) > Number(v.selected_request_count)) return false;
-  if (v.overall_tps !== undefined && v.overall_tps !== null && (!finite(v.overall_tps) || Number(v.overall_tps) <= 0)) {
-    return false;
+  // 0 是有效值:纯推理样本(valid_tps_count 计入)可以合法地得到 0 tok/s。
+  for (const rate of [v.overall_tps, v.average_gross_tps, v.overall_gross_tps]) {
+    if (rate !== undefined && rate !== null && (!finite(rate) || Number(rate) < 0)) return false;
   }
-  if (v.valid_tps_count === 0) return v.average_tps === null && v.first_sample_at === null && v.last_sample_at === null;
-  return finite(v.average_tps) && Number(v.average_tps) > 0
+  if (!aliasPairConsistent(v.average_tps, v.overall_tps)
+    || !aliasPairConsistent(v.average_gross_tps, v.overall_gross_tps)) return false;
+  if (v.valid_tps_count === 0) {
+    return v.average_tps === null && v.overall_tps == null
+      && v.first_sample_at === null && v.last_sample_at === null;
+  }
+  return finite(v.average_tps) && Number(v.average_tps) >= 0
     && finite(v.first_sample_at) && Number(v.first_sample_at) >= 0
     && finite(v.last_sample_at) && Number(v.last_sample_at) >= Number(v.first_sample_at);
 }
@@ -100,8 +124,10 @@ export interface PerformanceRow {
   score: number;
   scoreUpdatedAt: string;
   status: "ready" | "missing";
+  /** 主 TPS(正文端到端吞吐);0 有效,null 表示不可用。 */
   tps: number | null;
-  overallTps: number | null;
+  /** 总输出 TPS(gross,含推理),辅助展示。 */
+  grossTps: number | null;
   selectedRequestCount: number;
   validTpsCount: number;
   firstSampleAt: number | null;
@@ -113,9 +139,9 @@ export interface PerformanceRow {
 export interface PerformancePoint extends PerformanceRow {
   status: "ready";
   score: number;
+  /** 主 TPS(正文端到端吞吐);0 参与绘图,不当 missing。 */
   tps: number;
-  netTps?: number | null;
-  metric?: "net" | "overall";
+  grossTps: number | null;
   color: string;
 }
 /** Hidden selection is retained for restoring filters but must not dim unrelated visible points. */
@@ -145,8 +171,8 @@ export function buildPerformanceRows(snapshot: PerformanceResponse, providers: P
       providerIcon: provider?.preset_key ?? provider?.vendor ?? "",
       providerBaseUrl: provider?.base_url ?? "",
       score: item.score, scoreUpdatedAt: item.score_updated_at,
-      status: stats.average_tps === null || stats.valid_tps_count === 0 ? "missing" : "ready",
-      tps: stats.average_tps, overallTps: stats.overall_tps ?? null,
+      status: resolveMainTps(stats) === null || stats.valid_tps_count === 0 ? "missing" : "ready",
+      tps: resolveMainTps(stats), grossTps: resolveGrossTps(stats),
       selectedRequestCount: stats.selected_request_count, validTpsCount: stats.valid_tps_count,
       firstSampleAt: stats.first_sample_at, lastSampleAt: stats.last_sample_at,
       unclassifiedCount: item.unclassified_count, untrustedCount: item.untrusted_count,
@@ -162,24 +188,15 @@ export function filterPerformanceRows(rows: PerformanceRow[], search: string, pr
   return rows.filter((row) => (providerId === null || row.providerId === providerId)
     && `${row.providerName}\n${row.providerId}\n${row.modelPrefix}\n${row.variants.map((variant) => variant.upstream_model).join("\n")}`.toLocaleLowerCase().includes(text));
 }
-export function performancePoints(rows: PerformanceRow[], metric: "net" | "overall" = "net"): PerformancePoint[] {
-  if (metric === "overall") {
-    return rows.filter((row): row is PerformanceRow & { status: "ready"; overallTps: number } => (
-      row.status === "ready" && row.overallTps !== null && Number.isFinite(row.overallTps) && row.overallTps > 0
-    )).map((row) => ({
-      ...row,
-      tps: row.overallTps,
-      netTps: row.tps,
-      metric: "overall",
-      color: performanceColor(row.providerId),
-    }));
-  }
+/**
+ * 可绘图点 = 状态 ready 且主 TPS 为非负有限值。0 tok/s(纯推理)是有效
+ * 数据点,参与绘图与包络线;负值/非有限值才是 missing。
+ */
+export function performancePoints(rows: PerformanceRow[]): PerformancePoint[] {
   return rows.filter((row): row is PerformanceRow & { status: "ready"; tps: number } => (
-    row.status === "ready" && row.tps !== null && Number.isFinite(row.tps) && row.tps > 0
+    row.status === "ready" && row.tps !== null && Number.isFinite(row.tps) && row.tps >= 0
   )).map((row) => ({
     ...row,
-    netTps: row.tps,
-    metric: "net",
     color: performanceColor(row.providerId),
   }));
 }
@@ -203,7 +220,7 @@ export function buildPerformanceEnvelope(points: PerformancePoint[]): Performanc
   const positions = new Map<string, PerformanceEnvelopeNode>();
   for (const point of points) {
     if (!Number.isInteger(point.score) || point.score < 0 || point.score > 100
-      || !Number.isFinite(point.tps) || point.tps <= 0 || point.status !== "ready") continue;
+      || !Number.isFinite(point.tps) || point.tps < 0 || point.status !== "ready") continue;
     const positionKey = JSON.stringify([point.score, point.tps]);
     const existing = positions.get(positionKey);
     if (existing) existing.memberKeys.push(point.key);

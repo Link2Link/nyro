@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
 
+use super::tps::TpsTotals;
+
 pub use super::model_rating_prefixes::{
     ModelRatingEntry, canonical_model_prefix, longest_matching_entry, model_matches_prefix,
 };
@@ -775,6 +777,10 @@ pub struct ModelStats {
     pub total_cache_read_tokens: i64,
     pub avg_duration_ms: f64,
     pub total_upstream_ms: f64,
+    /// Shared valid-sample TPS sums over the same window as the totals above.
+    #[sqlx(flatten)]
+    #[serde(flatten)]
+    pub tps_totals: TpsTotals,
 }
 
 #[derive(Debug, Clone, Default, FromRow)]
@@ -789,7 +795,6 @@ pub struct ModelUsageTotals {
 #[derive(Debug, Clone, FromRow)]
 pub struct RecentModelPerformance {
     pub output_tokens: i32,
-    #[sqlx(default)]
     pub reasoning_tokens: i32,
     pub is_stream: bool,
     pub stream_chunks_count: i32,
@@ -799,11 +804,33 @@ pub struct RecentModelPerformance {
 }
 
 impl RecentModelPerformance {
-    /// Net content tokens excluding reasoning / thinking tokens.
-    pub fn content_tokens(&self) -> i32 {
-        self.output_tokens.saturating_sub(self.reasoning_tokens).max(0)
+    /// Whether this row carries generation usage at all. Rows without output
+    /// tokens never join the shared TPS pool, regardless of timing.
+    pub fn has_tps_usage(&self) -> bool {
+        self.output_tokens > 0
     }
 
+    /// End-to-end generation window in milliseconds: upstream latency when
+    /// present, otherwise the total. Only a NULL upstream value falls back to
+    /// the total; a present-but-nonpositive upstream value invalidates the
+    /// row. TTFT is never subtracted.
+    pub fn e2e_latency_ms(&self) -> Option<i64> {
+        self.latency_upstream_ms
+            .or(self.latency_total_ms)
+            .filter(|ms| *ms > 0)
+    }
+
+    /// Net content tokens: `output - reasoning` with reasoning clamped into
+    /// `[0, output]` (negative reasoning counts as 0; reasoning above output
+    /// yields zero content).
+    pub fn content_tokens(&self) -> i32 {
+        let output = self.output_tokens.max(0);
+        output - self.reasoning_tokens.clamp(0, output)
+    }
+
+    /// Legacy TTFT-aware generation window. Diagnostic only: it is kept for
+    /// call sites that inspect per-request pacing, and it never participates
+    /// in the default TPS contract (`tps` / `gross_tps` are end-to-end).
     pub fn generation_ms(&self) -> Option<i64> {
         let is_stream = self.is_stream || self.stream_chunks_count > 0;
         match (
@@ -826,25 +853,24 @@ impl RecentModelPerformance {
         }
     }
 
-    /// Effective content TPS (primary metric): content tokens / generation time.
+    /// Default content TPS (primary metric): clamped content tokens over the
+    /// end-to-end window. Pure-reasoning rows stay valid and report 0.
     pub fn tps(&self) -> Option<f64> {
-        let content = self.content_tokens();
-        if content > 0 {
-            if let Some(gen_ms) = self.generation_ms().filter(|v| *v > 0) {
-                return Some(content as f64 / (gen_ms as f64 / 1000.0));
-            }
+        let elapsed = self.e2e_latency_ms()?;
+        if !self.has_tps_usage() {
+            return None;
         }
-        None
+        Some(self.content_tokens() as f64 / (elapsed as f64 / 1000.0))
     }
 
-    /// Gross TPS (secondary metric): total output tokens (incl. reasoning) / generation time.
+    /// Gross TPS (secondary metric): total output tokens (incl. reasoning)
+    /// over the same end-to-end window and the same validity pool as `tps`.
     pub fn gross_tps(&self) -> Option<f64> {
-        if self.output_tokens > 0 {
-            if let Some(gen_ms) = self.generation_ms().filter(|v| *v > 0) {
-                return Some(self.output_tokens as f64 / (gen_ms as f64 / 1000.0));
-            }
+        let elapsed = self.e2e_latency_ms()?;
+        if !self.has_tps_usage() {
+            return None;
         }
-        None
+        Some(self.output_tokens as f64 / (elapsed as f64 / 1000.0))
     }
 }
 
@@ -856,34 +882,50 @@ pub struct ModelUsageStats {
     pub total_cache_read_tokens: i64,
     pub last_called_at: Option<i64>,
     pub recent_sample_count: i64,
+    /// Compatibility alias of `overall_tps`: sum(content) / sum(elapsed)
+    /// over the latest-fifty valid samples (latency weighted, not an
+    /// arithmetic mean of per-request rates).
     pub average_tps: Option<f64>,
+    /// Compatibility alias of `overall_gross_tps` over the same pool.
     pub average_gross_tps: Option<f64>,
     pub average_first_token_ms: Option<f64>,
+    /// Valid samples inside the latest-fifty window (includes pure-reasoning
+    /// rows that contribute a 0 content rate).
+    #[serde(default)]
+    pub valid_tps_count: i64,
+    /// Same value as `average_tps`; the end-to-end content throughput.
+    #[serde(default)]
+    pub overall_tps: Option<f64>,
+    /// Same value as `average_gross_tps`; the end-to-end gross throughput.
+    #[serde(default)]
+    pub overall_gross_tps: Option<f64>,
+    /// Sum of clamped content tokens across the valid recent samples. Named
+    /// `recent_*` because `total_output_tokens` above is all-history.
+    #[serde(default)]
+    pub recent_content_tokens: i64,
+    /// Sum of end-to-end latency across the valid recent samples.
+    #[serde(default)]
+    pub recent_latency_ms: i64,
 }
 
 impl ModelUsageStats {
     pub fn from_samples(totals: ModelUsageTotals, samples: &[RecentModelPerformance]) -> Self {
-        let mut tps_total = 0.0;
-        let mut tps_count = 0;
-        let mut gross_tps_total = 0.0;
-        let mut gross_tps_count = 0;
+        let mut tps = super::tps::TpsTotals::default();
+        let mut valid_tps_count = 0i64;
         let mut first_token_total = 0.0;
         let mut first_token_count = 0;
 
         for sample in samples {
-            if let Some(tps) = sample.tps() {
-                tps_total += tps;
-                tps_count += 1;
-            }
-            if let Some(gross) = sample.gross_tps() {
-                gross_tps_total += gross;
-                gross_tps_count += 1;
+            if tps.push(sample) {
+                valid_tps_count += 1;
             }
             if let Some(first_token_ms) = sample.stream_first_chunk_ms.filter(|value| *value >= 0) {
                 first_token_total += first_token_ms as f64;
                 first_token_count += 1;
             }
         }
+        let average_tps = tps.content_tps();
+        let average_gross_tps = tps.gross_tps();
 
         Self {
             request_count: totals.request_count,
@@ -892,10 +934,15 @@ impl ModelUsageStats {
             total_cache_read_tokens: totals.total_cache_read_tokens,
             last_called_at: totals.last_called_at,
             recent_sample_count: samples.len() as i64,
-            average_tps: (tps_count > 0).then_some(tps_total / tps_count as f64),
-            average_gross_tps: (gross_tps_count > 0).then_some(gross_tps_total / gross_tps_count as f64),
+            average_tps,
+            average_gross_tps,
             average_first_token_ms: (first_token_count > 0)
                 .then_some(first_token_total / first_token_count as f64),
+            valid_tps_count,
+            overall_tps: average_tps,
+            overall_gross_tps: average_gross_tps,
+            recent_content_tokens: tps.tps_content_tokens,
+            recent_latency_ms: tps.tps_elapsed_ms,
         }
     }
 }
@@ -938,8 +985,14 @@ mod model_usage_stats_tests {
 
         assert_eq!(stats.request_count, 12);
         assert_eq!(stats.recent_sample_count, 2);
-        assert!((stats.average_tps.unwrap() - 58.333).abs() < 0.01);
-        assert!((stats.average_gross_tps.unwrap() - 58.333).abs() < 0.01);
+        // End-to-end, latency weighted: (100 + 50) content / (2.0 + 1.0) s.
+        assert_eq!(stats.average_tps, Some(50.0));
+        assert_eq!(stats.average_gross_tps, Some(50.0));
+        assert_eq!(stats.overall_tps, stats.average_tps);
+        assert_eq!(stats.overall_gross_tps, stats.average_gross_tps);
+        assert_eq!(stats.valid_tps_count, 2);
+        assert_eq!(stats.recent_content_tokens, 150);
+        assert_eq!(stats.recent_latency_ms, 3_000);
         assert_eq!(stats.average_first_token_ms, Some(500.0));
     }
 
@@ -954,11 +1007,143 @@ mod model_usage_stats_tests {
             latency_total_ms: Some(1_600),
             stream_first_chunk_ms: Some(500),
         };
-        // generation_ms = 1500 - 500 = 1000ms = 1.0s
-        // content_tokens = 100 - 80 = 20
+        // End-to-end: content 20 over the full 1.5 s upstream window; the
+        // 500 ms TTFT is no longer subtracted.
         assert_eq!(sample.content_tokens(), 20);
-        assert_eq!(sample.tps(), Some(20.0));
+        assert_eq!(sample.tps(), Some(20.0 / 1.5));
+        assert_eq!(sample.gross_tps(), Some(100.0 / 1.5));
+    }
+
+    #[test]
+    fn pure_reasoning_sample_is_valid_zero_content_rate() {
+        let sample = RecentModelPerformance {
+            output_tokens: 100,
+            reasoning_tokens: 100,
+            is_stream: true,
+            stream_chunks_count: 4,
+            latency_upstream_ms: Some(1_000),
+            latency_total_ms: Some(1_200),
+            stream_first_chunk_ms: Some(100),
+        };
+        assert_eq!(sample.content_tokens(), 0);
+        assert_eq!(sample.tps(), Some(0.0));
         assert_eq!(sample.gross_tps(), Some(100.0));
+
+        let stats = ModelUsageStats::from_samples(ModelUsageTotals::default(), &[sample]);
+        assert_eq!(stats.valid_tps_count, 1);
+        assert_eq!(stats.average_tps, Some(0.0));
+        assert_eq!(stats.average_gross_tps, Some(100.0));
+        assert_eq!(stats.recent_content_tokens, 0);
+        assert_eq!(stats.recent_latency_ms, 1_000);
+    }
+
+    #[test]
+    fn reasoning_clamps_into_output_range() {
+        let negative = RecentModelPerformance {
+            output_tokens: 100,
+            reasoning_tokens: -30,
+            is_stream: false,
+            stream_chunks_count: 0,
+            latency_upstream_ms: Some(1_000),
+            latency_total_ms: None,
+            stream_first_chunk_ms: None,
+        };
+        assert_eq!(negative.content_tokens(), 100);
+        assert_eq!(negative.tps(), Some(100.0));
+
+        let overflow = RecentModelPerformance {
+            output_tokens: 50,
+            reasoning_tokens: 80,
+            is_stream: false,
+            stream_chunks_count: 0,
+            latency_upstream_ms: Some(500),
+            latency_total_ms: None,
+            stream_first_chunk_ms: None,
+        };
+        assert_eq!(overflow.content_tokens(), 0);
+        assert_eq!(overflow.tps(), Some(0.0));
+        assert_eq!(overflow.gross_tps(), Some(100.0));
+    }
+
+    #[test]
+    fn latency_weighted_pool_is_not_arithmetic_mean() {
+        // One fast short call (50 tok / 0.1 s = 500 TPS) and one slow long
+        // call (1000 tok / 10 s = 100 TPS): latency weighting gives 1050 tok
+        // over 10.1 s, not (500 + 100) / 2.
+        let samples = vec![
+            RecentModelPerformance {
+                output_tokens: 50,
+                reasoning_tokens: 0,
+                is_stream: false,
+                stream_chunks_count: 0,
+                latency_upstream_ms: Some(100),
+                latency_total_ms: None,
+                stream_first_chunk_ms: None,
+            },
+            RecentModelPerformance {
+                output_tokens: 1000,
+                reasoning_tokens: 0,
+                is_stream: false,
+                stream_chunks_count: 0,
+                latency_upstream_ms: Some(10_000),
+                latency_total_ms: None,
+                stream_first_chunk_ms: None,
+            },
+        ];
+        let stats = ModelUsageStats::from_samples(ModelUsageTotals::default(), &samples);
+        assert!((stats.average_tps.unwrap() - (1050.0 / 10.1)).abs() < 1e-9);
+        assert!((stats.average_gross_tps.unwrap() - (1050.0 / 10.1)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn invalid_latency_never_falls_back_to_total() {
+        let zero_upstream = RecentModelPerformance {
+            output_tokens: 100,
+            reasoning_tokens: 0,
+            is_stream: true,
+            stream_chunks_count: 2,
+            latency_upstream_ms: Some(0),
+            latency_total_ms: Some(5_000),
+            stream_first_chunk_ms: Some(100),
+        };
+        assert_eq!(zero_upstream.tps(), None);
+        assert_eq!(zero_upstream.gross_tps(), None);
+
+        let negative_upstream = RecentModelPerformance {
+            output_tokens: 100,
+            reasoning_tokens: 0,
+            is_stream: false,
+            stream_chunks_count: 0,
+            latency_upstream_ms: Some(-100),
+            latency_total_ms: Some(2_000),
+            stream_first_chunk_ms: None,
+        };
+        assert_eq!(negative_upstream.tps(), None);
+
+        let missing = RecentModelPerformance {
+            output_tokens: 100,
+            reasoning_tokens: 0,
+            is_stream: false,
+            stream_chunks_count: 0,
+            latency_upstream_ms: None,
+            latency_total_ms: None,
+            stream_first_chunk_ms: None,
+        };
+        assert_eq!(missing.tps(), None);
+        assert_eq!(missing.gross_tps(), None);
+
+        let no_usage = RecentModelPerformance {
+            output_tokens: 0,
+            reasoning_tokens: 0,
+            is_stream: true,
+            stream_chunks_count: 2,
+            latency_upstream_ms: Some(1_000),
+            latency_total_ms: Some(1_100),
+            stream_first_chunk_ms: Some(100),
+        };
+        assert_eq!(no_usage.tps(), None);
+        assert_eq!(no_usage.gross_tps(), None);
+        assert!(!no_usage.has_tps_usage());
     }
 }
 
@@ -979,6 +1164,10 @@ pub struct ProviderStats {
     pub avg_duration_ms: f64,
     pub total_output_tokens: i64,
     pub total_upstream_ms: f64,
+    /// Shared valid-sample TPS sums over the same window as the totals above.
+    #[sqlx(flatten)]
+    #[serde(flatten)]
+    pub tps_totals: TpsTotals,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1007,6 +1196,9 @@ pub struct ProviderUsageDetail {
     pub avg_first_token_ms: Option<f64>,
     pub total_upstream_ms: f64,
     pub last_used_at: Option<i64>,
+    /// Shared valid-sample TPS sums over the same window as the totals above.
+    #[serde(flatten)]
+    pub tps_totals: TpsTotals,
     pub models: Vec<ProviderModelUsageStats>,
 }
 
@@ -1022,6 +1214,10 @@ pub struct ProviderModelUsageStats {
     pub avg_first_token_ms: Option<f64>,
     pub total_upstream_ms: f64,
     pub last_used_at: Option<i64>,
+    /// Shared valid-sample TPS sums over the same window as the totals above.
+    #[sqlx(flatten)]
+    #[serde(flatten)]
+    pub tps_totals: TpsTotals,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1075,6 +1271,10 @@ pub struct ApiKeyModelRouteStats {
     pub avg_duration_ms: f64,
     pub avg_first_token_ms: Option<f64>,
     pub total_upstream_ms: f64,
+    /// Shared valid-sample TPS sums over the same window as the totals above.
+    #[sqlx(flatten)]
+    #[serde(flatten)]
+    pub tps_totals: TpsTotals,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
@@ -1118,6 +1318,9 @@ pub struct ModelUsageDetail {
     /// admin service. Absent when the payload predates this field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub time_series: Option<StatsTimeSeries>,
+    /// Shared valid-sample TPS sums over the same window as the totals above.
+    #[serde(flatten)]
+    pub tps_totals: TpsTotals,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
@@ -1139,6 +1342,10 @@ pub struct ModelProviderUsageStats {
     pub avg_first_token_ms: Option<f64>,
     pub total_upstream_ms: f64,
     pub last_used_at: Option<i64>,
+    /// Shared valid-sample TPS sums over the same window as the totals above.
+    #[sqlx(flatten)]
+    #[serde(flatten)]
+    pub tps_totals: TpsTotals,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
@@ -1154,6 +1361,10 @@ pub struct ModelApiKeyUsageStats {
     pub avg_first_token_ms: Option<f64>,
     pub total_upstream_ms: f64,
     pub last_used_at: Option<i64>,
+    /// Shared valid-sample TPS sums over the same window as the totals above.
+    #[sqlx(flatten)]
+    #[serde(flatten)]
+    pub tps_totals: TpsTotals,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

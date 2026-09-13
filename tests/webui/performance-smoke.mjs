@@ -181,7 +181,7 @@ async function chartState() {
     return {points,chips,rows,lines,envelopes,axisTexts,polygons:art('polygon').length,busy:Boolean(document.querySelector('button[aria-label="Refresh performance"],button[aria-label="刷新性能数据"]')?.disabled),counts:attrs(summary),axis:attrs(chart),summary:summary?.innerText,labels:[...document.querySelectorAll('[data-testid="performance-label"] text')].map(el=>el.textContent),labelPointIds:[...document.querySelectorAll('[data-testid="performance-label"]')].map(el=>el.dataset.pointIds?.split(',')??[]),body:document.body.innerText};
   })()`);
 }
-async function ready({ plotted = 11, missing = 1 } = {}) {
+async function ready({ plotted = 13, missing = 1 } = {}) {
   return waitFor(async () => {
     const state=await chartState();
     return state.points.length===plotted && Number(state.counts['data-plotted-count'])===plotted && Number(state.counts['data-missing-count'])===missing && !state.busy ? state : false;
@@ -245,7 +245,8 @@ function assertPoints(state, rows, { expectedIconKeys = providerIconKeys } = {})
 }
 
 const sameCoordinate = (a,b) => Math.abs(a.x-b.x)<1e-3 && Math.abs(a.y-b.y)<1e-3;
-const plottedRows = rows => rows.filter(row=>row.status==='ready' && Number.isInteger(row.score) && row.score>=0 && row.score<=100 && Number.isFinite(row.stats.average_tps) && row.stats.average_tps>0 && row.stats.valid_tps_count>0);
+// A valid zero (pure-reasoning samples) is plotted data and joins the envelope oracle.
+const plottedRows = rows => rows.filter(row=>row.status==='ready' && Number.isInteger(row.score) && row.score>=0 && row.score<=100 && Number.isFinite(row.stats.average_tps) && row.stats.average_tps>=0 && row.stats.valid_tps_count>0);
 
 /** Independent small-fixture oracle: enumerate upper supporting lines, not the UI's hull algorithm. */
 function expectedEnvelope(rows) {
@@ -304,7 +305,7 @@ function assertChartScaffolding(state, isZh=false) {
     assert.ok(state.axisTexts.some(t=>Number(t.text)===value && t.x<left && Math.abs(t.y-y)<=8),'Keep Y numeric tick labels');
   }
   assert.ok(state.axisTexts.some(t=>t.text.includes(isZh?'能力评分':'Capability score')),'Keep localized X axis title');
-  assert.ok(state.axisTexts.some(t=>t.text==='TPS (tok/s)'),'Keep TPS axis title');
+  assert.ok(state.axisTexts.some(t=>t.text===(isZh?'正文 TPS (tok/s)':'Content TPS (tok/s)')),'Keep the unified content-TPS axis title in the active locale');
   assert.equal(state.polygons,0,'The upper-right envelope must never become a closed polygon');
 }
 function assertEnvelopeOnlyLabels(state, rows) {
@@ -446,6 +447,10 @@ try {
     // client contract this fixture must keep exercising.
     { provider: alpha, model: 'model/dual', score: 62 },
     { provider: alpha, model: 'model/dual-0813', score: 62, sharesRowWith: 'model/dual' },
+    // Reasoning content parity: mixed reasoning rows plus one invalid no-usage row.
+    { provider: beta, model: 'model/reasoning', score: 45 },
+    // Pure reasoning only: a valid plotted zero, never a missing or gross-fallback row.
+    { provider: alpha, model: 'model/pure-reasoning', score: 20 },
   ];
   const unlogged = pairs.find(pair => pair.unlogged);
   const rowPairs = pairs.filter(pair => !pair.sharesRowWith && !pair.unlogged);
@@ -467,7 +472,7 @@ try {
     model_name: 'unrelated-logical-route', client_model: 'unrelated-client-alias',
     client_protocol: 'openai', upstream_protocol: 'openai', method: 'POST', path: '/v1/chat/completions',
     client_status_code: 200, upstream_status_code: 200, input_tokens: 10, output_tokens: output,
-    // TPS must use these same legacy fields as logs/model-usage: 1000ms by default.
+    // TPS uses output_tokens − reasoning_tokens over latency_upstream_ms (total fallback).
     cache_read_tokens: 0, latency_upstream_ms: upstream, latency_total_ms: upstream === null ? null : upstream + 100,
     is_stream: 0, stream_chunks_count: 0, stream_first_chunk_ms: null,
     performance_metadata_version: 1, upstream_effort_status: 'present', upstream_effort_raw: 'high', upstream_effort_tier: 'high',
@@ -479,7 +484,7 @@ try {
   });
   log(pairs[0],900); log(pairs[0],800); // Older raw rows are outside the latest fifty.
   for (let i=0;i<25;i++) {
-    // 100 / (2s - 0.5s) and 50 / 1s average to the existing 175/3 TPS.
+    // Σcontent 3750 tok ÷ Σelapsed 75 s = 50 TPS end-to-end; TTFT is never subtracted.
     log(pairs[0],100,2000,{is_stream:1,stream_chunks_count:10,stream_first_chunk_ms:500});
     log(pairs[0],50);
   }
@@ -503,7 +508,7 @@ try {
   for(const field of ['performance_metadata_version','upstream_effort_status','upstream_effort_raw','upstream_effort_tier',
     'request_completion','completion_reason','upstream_response_mode','performance_upstream_ms','performance_first_chunk_ms','performance_completed_at']) delete logs.at(-1)[field];
   log(pairs[9],55);
-  // Legacy non-incremental fallbacks: <50ms generation, or TTFT >=80% of upstream.
+  // TTFT no longer gates timing: streaming rows keep the full upstream duration.
   log(pairs[9],55,1000,{is_stream:1,stream_first_chunk_ms:980});
   log(pairs[9],55,1000,{stream_chunks_count:10,stream_first_chunk_ms:900});
   // New MiniMax logs can have unknown completion despite valid legacy tokens/timing.
@@ -516,9 +521,16 @@ try {
     log(pairs[11],100,1000,invalid);
   }
   // Two upstream variants collide on one rated prefix: fifty retained calls each merge
-  // into one hundred samples, weighted 100/60 TPS → (100×50 + 60×50) / 100 = 80 TPS.
+  // by summed tokens and durations → (100×50 + 60×50) tok ÷ (100 × 1 s) = 80 TPS.
   const dualA=pairs[12],dualB=pairs[13];
   for(let i=0;i<50;i++){ log(dualA,100); log(dualB,60); }
+  // Reasoning content: 8×(100−80) + 2 pure-reasoning zeros (valid) + 1 no-usage row →
+  // Σcontent 160 tok ÷ Σelapsed 10 s = 16 TPS, gross Σoutput 1000 ÷ 10 s = 100.
+  for(let i=0;i<8;i++) log(pairs[14],100,1000,{reasoning_tokens:80});
+  for(let i=0;i<2;i++) log(pairs[14],100,1000,{reasoning_tokens:100});
+  log(pairs[14],0);
+  // Pure reasoning only: Σcontent 0 ÷ Σelapsed 3 s = a valid plotted zero at (20, 0).
+  for(let i=0;i<3;i++) log(pairs[15],100,1000,{reasoning_tokens:100});
   log(unrated,220);
   const seedPath = join(scratch, 'seed-logs.json'); await writeFile(seedPath, JSON.stringify(logs, null, 2));
   const python = trackChild('sqlite-seed', 'python3', ['-c', seedPython, scratch, dataDir, seedPath]);
@@ -532,7 +544,7 @@ try {
   const variantStats=(item,pair)=>item.variants.find(variant=>variant.upstream_model.toLowerCase()===pair.model.toLowerCase());
   // A stream without sharesRowWith owns its row; a sibling stream reads its own variant.
   const statsFor=pair=>pair.sharesRowWith?variantStats(groupFor(pair),pair).mixed:groupFor(pair).mixed;
-  assert.ok(Math.abs(statsFor(pairs[0]).average_tps-175/3)<1e-10);
+  assert.ok(Math.abs(statsFor(pairs[0]).average_tps-50)<1e-9,'Σcontent 3750 ÷ Σelapsed 75 s end-to-end, not a TTFT-excluded mean');
   assert.equal(statsFor(pairs[0]).selected_request_count,50,'The two older 900/800-token rows fall outside the latest-fifty window');
   const grouped=groupFor(effort);
   assert.equal(grouped.mixed.selected_request_count,13); assert.equal(grouped.mixed.valid_tps_count,12);
@@ -540,7 +552,7 @@ try {
   assert.equal(grouped.score,80);
   assert.equal(statsFor(pairs[8]).average_tps,50,'No metadata, total-time fallback and retained >7-day history all remain valid');
   assert.ok(statsFor(pairs[8]).first_sample_at<snapshot.as_of-7*86400000);
-  assert.equal(statsFor(pairs[10]).average_tps,2007/((20617-1798)/1000),'MiniMax unknown version1 uses legacy generation timing');
+  assert.ok(Math.abs(statsFor(pairs[10]).average_tps-2007/(20617/1000))<1e-9,'MiniMax unknown version1 uses the full end-to-end upstream duration');
   assert.equal(statsFor(pairs[10]).valid_tps_count,1);
   assert.equal(statsFor(pairs[9]).average_tps,55,'Legacy streaming fallbacks use upstream duration for non-incremental responses');
   assert.equal(statsFor(pairs[9]).valid_tps_count,3);
@@ -559,6 +571,16 @@ try {
   assert.ok(Math.abs(dualItem.mixed.average_tps-80)<1e-10,'Merged TPS is weighted by valid samples, not by variant count');
   assert.deepEqual(dualItem.variants.map(variant=>variant.mixed.selected_request_count),[50,50]);
   assert.equal(dualItem.score,62,'Both variants inherit the prefix-shared score');
+  // Non-zero reasoning and pure-reasoning rows verify the unified content metric end to end.
+  const reasoningStats=statsFor(pairs[14]);
+  assert.equal(reasoningStats.selected_request_count,11);
+  assert.equal(reasoningStats.valid_tps_count,10,'Pure-reasoning samples with output > 0 count as valid');
+  assert.ok(Math.abs(reasoningStats.average_tps-16)<1e-9,'Content TPS = Σ(output−reasoning) ÷ Σduration = 160 tok / 10 s');
+  assert.ok(Math.abs(reasoningStats.average_gross_tps-100)<1e-9,'Gross keeps Σoutput over the same duration');
+  const pureStats=statsFor(pairs[15]);
+  assert.equal(pureStats.valid_tps_count,3);
+  assert.equal(pureStats.average_tps,0,'An all-reasoning group reports a valid zero, never null');
+  assert.ok(Math.abs(pureStats.average_gross_tps-100)<1e-9);
   report.usageComparisons=[];
   for(const pair of pairs){
     const usage=await api(usagePath(pair));
@@ -583,7 +605,7 @@ try {
     report.usageComparisons.push({provider_id:pair.provider.id,model:pair.model,mixed:variant.mixed,merged:item.variants.length>1?item.mixed:undefined,usage});
   }
   const expected=expectedRows(snapshot,rowPairs);
-  check('exact legacy usage TPS parity for every pair; latest fifty raw logs across statuses/versions/completion; retained old and MiniMax unknown logs valid; two variants merge into one hundred samples',report.seed.database);
+  check('exact unified content-TPS parity for every pair (reasoning and pure-reasoning included); latest fifty raw logs across statuses/versions/completion; retained old and MiniMax unknown logs valid; two variants merge into one hundred samples',report.seed.database);
 
   const browser = trackChild('chrome', chrome, ['--headless', '--no-sandbox', '--disable-gpu', '--disable-dev-shm-usage', '--disable-background-networking', '--no-first-run', '--no-default-browser-check', '--remote-debugging-port=0', `--user-data-dir=${join(scratch, 'chrome')}`, 'about:blank']);
   const ws = await waitFor(() => {
@@ -615,8 +637,10 @@ try {
     // 'overcount' fabricates more samples than the declared variants can hold: the
     // batch contract must still reject it, so the relaxed merged bound stays honest.
     if(faultMode==='overcount') targetModel.mixed.selected_request_count=targetModel.variants.length*50+1;
-    if(['negative','zero','string','null','infinity'].includes(faultMode)) targetModel.mixed.average_tps=faultMode==='negative'?-5:faultMode==='zero'?0:faultMode==='string'?'NaN':null;
-    if(faultMode==='null') Object.assign(targetModel.mixed,{valid_tps_count:0,first_sample_at:null,last_sample_at:null});
+    if(['negative','zero','string','null','infinity','alias'].includes(faultMode)) targetModel.mixed.average_tps=faultMode==='negative'?-5:faultMode==='zero'?0:faultMode==='string'?'NaN':faultMode==='alias'?45:null;
+    // A legal null row must keep every alias null together; a stale overall_tps beside a
+    // changed average_tps is an alias contradiction the batch contract rejects.
+    if(faultMode==='null') Object.assign(targetModel.mixed,{valid_tps_count:0,first_sample_at:null,last_sample_at:null,overall_tps:null,average_gross_tps:null,overall_gross_tps:null});
     const body=fail?{error:'Injected performance snapshot failure'}:{data:payload};
     const jsonBody=faultMode==='infinity'?JSON.stringify(body).replace('"average_tps":null','"average_tps":1e400'):JSON.stringify(body);
     if(injected) report.injected.push({url:params.request.url,mode:faultMode,status:fail?500:200});
@@ -663,10 +687,24 @@ try {
   check('real-data singleton envelope membership; no gridlines, retained axes, short ticks, numeric titles and model-label leaders');
   const miniMax=expected.find(row=>row.pair===pairs[10]);
   await evaluate(`(${circleExpression(miniMax.id)}).scrollIntoView({block:'center'}); (${circleExpression(miniMax.id)}).parentElement.focus()`); await key('Enter');
-  await waitFor(()=>evaluate(`document.querySelector('[role="tooltip"]')?.innerText.includes('106.6 tok/s')`),'MiniMax unknown-completion tooltip uses one decimal');
+  await waitFor(()=>evaluate(`document.querySelector('[role="tooltip"]')?.innerText.includes('97.3 tok/s')`),'MiniMax unknown-completion tooltip uses one decimal over the full duration');
   await screenshot('performance-minimax-unknown-tooltip',{preserveFocus:true});
-  assert.ok(await evaluate(`document.querySelector('[role="tooltip"]')?.innerText.includes('106.6 tok/s')`),'MiniMax tooltip remains visible during evidence capture');
+  assert.ok(await evaluate(`document.querySelector('[role="tooltip"]')?.innerText.includes('97.3 tok/s')`),'MiniMax tooltip remains visible during evidence capture');
   await key('Escape');
+
+  // A pure-reasoning model plots a genuine zero with the gross auxiliary and the caveat.
+  const pure=expected.find(row=>row.pair===pairs[15]);
+  await evaluate(`(${circleExpression(pure.id)}).scrollIntoView({block:'center'}); (${circleExpression(pure.id)}).parentElement.focus()`); await key('Enter');
+  await waitFor(()=>evaluate(`document.querySelector('[role="tooltip"]')?.innerText.includes('0.0 tok/s')`),'Pure-reasoning point plots a real zero with one decimal');
+  const zeroTip=await evaluate(`document.querySelector('[role="tooltip"]')?.innerText`);
+  assert.ok(zeroTip.includes('Gross output TPS (reasoning included): 100.0 tok/s'),'Zero tooltip keeps the gross auxiliary figure');
+  assert.ok(zeroTip.includes('reasoning deduction cannot be guaranteed'),'Zero tooltip carries the missing-reasoning caveat');
+  await screenshot('performance-pure-reasoning-zero-tooltip',{preserveFocus:true}); await key('Escape');
+  const reasoningDetail=await detailRow(pairs[14]);
+  assert.ok(reasoningDetail[1].includes('45/100') && reasoningDetail[1].includes('16.0 tok/s') && reasoningDetail[1].includes('100.0 tok/s'),'Reasoning row shows content TPS with the gross auxiliary');
+  assert.ok(reasoningDetail[2].includes('10 / 11'),'Pure-reasoning samples stay valid while the no-usage row does not');
+  const pureDetail=await detailRow(pairs[15]);
+  assert.ok(pureDetail[1].includes('0.0 tok/s') && pureDetail[4].includes('Plotted'),'A valid zero is plotted, never relabeled missing');
 
   const overlap=state.points.find(point=>point.members===2);
   assert.ok(overlap);
@@ -745,13 +783,13 @@ try {
   await send('Emulation.setDeviceMetricsOverride', { width: 1440, height: 1000, deviceScaleFactor: 1, mobile: false });
   // A group may never claim more samples than its declared variants can hold, so the
   // relaxed merged bound is not a free pass: fabricated counts still fail closed.
-  for(const mode of ['overcount','negative','zero','string','infinity']){
+  for(const mode of ['overcount','negative','zero','string','infinity','alias']){
     faultMode=mode; await reload();
     await waitFor(()=>evaluate(`Boolean(document.querySelector('[role="alert"]'))`),`${mode} invalid snapshot warning`);
     assert.equal((await chartState()).points.length,0,'Invalid batch must not invent zero or plot stale values');
   }
   await screenshot('performance-overcount-error');
-  faultMode='null'; await reload(); await ready({plotted:10,missing:2});
+  faultMode='null'; await reload(); await ready({plotted:12,missing:2});
   await screenshot('performance-null-tps');
   faultMode=null; await refresh(); await ready();
   faultMode='snapshot'; await refresh();
@@ -790,6 +828,7 @@ try {
     {name:'missing-excluded',pairs:[...convex,fixturePair('envelope-excluded/missing-dominant',100,null,0)],boundary:[0,2],axes:[250,40,90]},
     {name:'unrounded-coordinates',pairs:[fixturePair('envelope-precision/A',43,200.123456),fixturePair('envelope-precision/B',67,110.987654,2),fixturePair('envelope-precision/C',87,100.123456,3,beta)],boundary:[0,2],axes:[250,40,90]},
     {name:'zero-score-valid',pairs:[fixturePair('envelope-zero/A',0,80),fixturePair('envelope-zero/B',25,25,2,beta)],boundary:[0,1],axes:[100,0,30]},
+    {name:'zero-tps-plotted',pairs:[fixturePair('envelope-zero-tps/high',100,0,2),fixturePair('envelope-zero-tps/low',40,0,1,beta)],boundary:[0],axes:[100,40,100]},
     {name:'empty',pairs:[],boundary:[],axes:[100,0,100]},
   ];
   report.envelopeScenarios=[];

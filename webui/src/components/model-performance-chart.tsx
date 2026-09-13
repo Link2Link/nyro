@@ -5,7 +5,7 @@ import {
   pointCoordinates, scoreX, type PerformancePoint,
 } from "@/lib/model-performance";
 import { createPortal } from "react-dom";
-import { formatLocalDateTime, formatTps } from "@/lib/format";
+import { formatLocalDateTime, formatTps, tpsGrossTitle, tpsMetricTitle, tpsReasoningCaveat } from "@/lib/format";
 import { useProviderIconMarkup } from "@/lib/provider-icon";
 
 /** A point is drawn as its provider's icon, never as a plain dot. */
@@ -37,9 +37,8 @@ function PerformancePointMarker({ point, x, y, offsetX, size, lowSample, selecte
 }
 
 /** Labels may move, but point centers always retain their actual score/TPS coordinates. */
-export function ModelPerformanceChart({ points, metric = "net", isZh }: {
+export function ModelPerformanceChart({ points, isZh }: {
   points: PerformancePoint[];
-  metric?: "net" | "overall";
   isZh: boolean;
 }) {
   const [active, setActive] = useState<string[]>([]);
@@ -59,9 +58,9 @@ export function ModelPerformanceChart({ points, metric = "net", isZh }: {
     const { x, y } = pointCoordinates(node, yMax, xDomain);
     return `${x},${y}`;
   }).join(" ");
-  const envelopeLabel = metric === "overall"
-    ? (isZh ? "当前可见模型的能力–综合速度包络线" : "Capability–overall speed envelope of visible models")
-    : (isZh ? "当前可见模型的能力–速度包络线" : "Capability–speed envelope of visible models");
+  const envelopeLabel = isZh
+    ? "当前可见模型的能力–正文速度包络线"
+    : "Capability–content speed envelope of visible models";
   const membershipLabel = isZh ? "位于当前可见模型的包络线" : "On the visible-model envelope";
   const envelopeGroups = useMemo(() => envelopeLabelGroups(groups, envelope), [groups, envelope]);
   const labels = useMemo(() => layoutPerformanceLabels(envelopeGroups), [envelopeGroups]);
@@ -100,7 +99,7 @@ export function ModelPerformanceChart({ points, metric = "net", isZh }: {
           data-point-left={xSpan.left} data-point-right={xSpan.right}
           data-envelope-member-keys={JSON.stringify([...envelope.memberKeys])}
           data-plot-left={left} data-plot-right={right} data-plot-top={top} data-plot-bottom={bottom}
-          aria-label={isZh ? `评分 ${xDomain.min}–${xDomain.max} 与平均 TPS，仅包络线上的点显示模型名称` : `Score ${xDomain.min}–${xDomain.max} versus average TPS, envelope points labeled by model name`}
+          aria-label={isZh ? `评分 ${xDomain.min}–${xDomain.max} 与正文 TPS，仅包络线上的点显示模型名称` : `Score ${xDomain.min}–${xDomain.max} versus content TPS, envelope points labeled by model name`}
           onClick={(event) => { if (!(event.target as Element).closest('[role="button"]')) setActive([]); }}>
           <title>{isZh ? "按当前可见评分自动缩放的性能图" : "Performance chart automatically scaled to visible scores"}</title>
           <line data-testid="performance-axis" x1={left} x2={right} y1={bottom} y2={bottom} stroke="#94a3b8" vectorEffect="non-scaling-stroke" />
@@ -114,7 +113,7 @@ export function ModelPerformanceChart({ points, metric = "net", isZh }: {
             return <g key={index}><line data-testid="performance-tick" x1={left - 4} x2={left} y1={y} y2={y} stroke="#94a3b8" vectorEffect="non-scaling-stroke" /><text x={left - 12} y={y + 4} textAnchor="end" fontSize={11} fill="#64748b">{new Intl.NumberFormat("en", { maximumFractionDigits: 1 }).format(yMax * index / 5)}</text></g>;
           })}
           <text x={(left + right) / 2} y={height - 14} textAnchor="middle" fontSize={12} fill="#64748b">{isZh ? `能力评分（${xDomain.min}–${xDomain.max}，满分 100）` : `Capability score (${xDomain.min}–${xDomain.max}, out of 100)`}</text>
-          <text transform={`translate(16 ${(top + bottom) / 2}) rotate(-90)`} textAnchor="middle" fontSize={12} fill="#64748b">{metric === "overall" ? (isZh ? "综合 TPS (tok/s)" : "Overall TPS (tok/s)") : "TPS (tok/s)"}</text>
+          <text transform={`translate(16 ${(top + bottom) / 2}) rotate(-90)`} textAnchor="middle" fontSize={12} fill="#64748b">{isZh ? "正文 TPS (tok/s)" : "Content TPS (tok/s)"}</text>
           {envelope.nodes.length >= 2 && <polyline data-testid="performance-envelope" points={envelopePath}
             data-member-keys={JSON.stringify([...envelope.memberKeys])}
             fill="none" stroke="#475569" strokeWidth={2} strokeDasharray="6 4"
@@ -160,19 +159,15 @@ export function ModelPerformanceChart({ points, metric = "net", isZh }: {
         {details.map((point) => <div key={point.key} data-point-id={point.pointId} className="space-y-1 border-b border-slate-100 py-2 last:border-0">
           <strong className="block whitespace-pre-wrap break-all" style={{ color: point.color }}>{point.model}</strong>
           <span className="block break-all">{point.providerName} · {point.providerId}</span>
-          <span className="block font-semibold">
-            {point.score}/100 · {formatTps(point.tps)} {metric === "overall" ? (isZh ? "(综合总体)" : "(overall)") : (isZh ? "(净生成)" : "(net)")}
+          <span className="block font-semibold" title={`${tpsMetricTitle(isZh)}\n${tpsReasoningCaveat(isZh)}`}>
+            {point.score}/100 · {formatTps(point.tps)} {isZh ? "正文 TPS（端到端）" : "content TPS (end-to-end)"}
           </span>
-          {metric === "overall" && point.netTps != null && (
-            <span className="block text-slate-500">
-              {isZh ? "净生成速度 (纯吐字)" : "Net generation speed"}: {formatTps(point.netTps)}
+          {point.grossTps !== null && (
+            <span className="block text-slate-500" title={tpsGrossTitle(isZh)}>
+              {isZh ? "总输出 TPS（含推理）" : "Gross output TPS (reasoning included)"}: {formatTps(point.grossTps)}
             </span>
           )}
-          {metric === "net" && point.overallTps !== null && (
-            <span className="block text-slate-500">
-              {isZh ? "综合总体速度 (含首字延时)" : "Overall speed (incl. TTFT)"}: {formatTps(point.overallTps)}
-            </span>
-          )}
+          <span className="block text-slate-400">{tpsReasoningCaveat(isZh)}</span>
           {envelope.memberKeys.has(point.key) && <span data-testid="performance-envelope-member" data-point-key={point.key}
             className="block font-medium text-slate-600">{membershipLabel}</span>}
           <span className="block">{isZh ? `有效 TPS ${point.validTpsCount} / 已选请求 ${point.selectedRequestCount}` : `Valid TPS ${point.validTpsCount} / selected requests ${point.selectedRequestCount}`}</span>

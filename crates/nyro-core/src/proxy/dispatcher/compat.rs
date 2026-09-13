@@ -39,6 +39,12 @@ use super::{
     CallCtx, HealthOutcome, LogBuilder, RequestExtras, error_response, health_outcome_from_status,
 };
 
+mod raw_usage;
+use raw_usage::{
+    RawUsageHandle, RawUsageObservation, RawUsageTee, observe_buffered_usage,
+    reconcile_logged_usage, upstream_wire_protocol,
+};
+
 pub(super) type CompatAttempt = ConversionAttempt;
 
 type UpstreamByteStream =
@@ -312,7 +318,11 @@ pub(super) async fn handle_compat(
     };
 
     // Attempt observes original bytes once, independently of compat conversion.
-    let observed = primed.stream;
+    // The raw-usage tee feeds the ORIGINAL upstream bytes (selected by the
+    // session's egress wire protocol, never the client protocol) into a
+    // log-only usage observer while passing every chunk through unchanged.
+    let raw_usage = RawUsageHandle::new(upstream_wire_protocol(&prepared.session));
+    let observed: UpstreamByteStream = Box::pin(RawUsageTee::new(primed.stream, raw_usage.clone()));
     let converted = match call_ctx.gw.compat_engine.convert_stream_response(
         &prepared.session,
         primed.metadata,
@@ -360,6 +370,7 @@ pub(super) async fn handle_compat(
         req_ctx,
         req_ir,
         health_permit,
+        raw_usage,
     )
 }
 
@@ -474,6 +485,17 @@ async fn handle_buffered_compat(
         };
     }
 
+    // Log-only raw usage bypass: decode usage from the ORIGINAL upstream
+    // body before conversion rewires it into the client's wire format (which
+    // drops reasoning counts for several directions). Buffered bodies may be
+    // JSON, or an upstream SSE stream the dispatcher buffered whole (e.g.
+    // forced-stream Responses upstreams with a non-stream client).
+    let raw_usage = if (200..300).contains(&metadata.status) {
+        observe_buffered_usage(upstream_wire_protocol(session), &body)
+    } else {
+        RawUsageObservation::default()
+    };
+
     let converted = match engine
         .convert_buffered_response(session, metadata, body)
         .await
@@ -515,11 +537,15 @@ async fn handle_buffered_compat(
         };
     };
 
-    let (body, usage) =
+    let (body, usage, pre_hook_usage) =
         match finalize_compat_buffered_body(call_ctx, req_ctx, req_ir, host, metadata.status, body)
             .await
         {
-            BufferedWireFinalize::Continue { body, usage } => (body, usage),
+            BufferedWireFinalize::Continue {
+                body,
+                usage,
+                pre_hook_usage,
+            } => (body, usage, pre_hook_usage),
             BufferedWireFinalize::Override(response) => {
                 return CompatAttempt {
                     response,
@@ -531,7 +557,7 @@ async fn handle_buffered_compat(
 
     let client_body = crate::logging::payload::capture_bytes(&body, true).body;
     log.status(metadata.status)
-        .usage(usage)
+        .usage(reconcile_logged_usage(&raw_usage, &usage, &pre_hook_usage))
         .with_upstream_request(upstream_req_headers, upstream_req_body)
         .with_upstream_response(
             raw.status as i32,
@@ -550,7 +576,13 @@ async fn handle_buffered_compat(
 }
 
 enum BufferedWireFinalize {
-    Continue { body: Bytes, usage: Usage },
+    Continue {
+        body: Bytes,
+        usage: Usage,
+        /// Usage decoded from the converted wire BEFORE response hooks ran;
+        /// lets the log layer tell hook adjustments apart from conversion.
+        pre_hook_usage: Usage,
+    },
     Override(Response),
 }
 
@@ -562,16 +594,19 @@ async fn finalize_compat_buffered_body(
     status: u16,
     body: Bytes,
 ) -> BufferedWireFinalize {
+    let mut pre_hook_usage = Usage::default();
     if !(200..300).contains(&status) {
         return BufferedWireFinalize::Continue {
             body,
             usage: Usage::default(),
+            pre_hook_usage,
         };
     }
     let Ok(value) = serde_json::from_slice::<Value>(&body) else {
         return BufferedWireFinalize::Continue {
             body,
             usage: Usage::default(),
+            pre_hook_usage,
         };
     };
     let parser = call_ctx.ingress.handler().make_response_decoder();
@@ -579,8 +614,10 @@ async fn finalize_compat_buffered_body(
         return BufferedWireFinalize::Continue {
             body,
             usage: Usage::default(),
+            pre_hook_usage,
         };
     };
+    pre_hook_usage = response.usage.clone();
 
     match super::buffered::finalize_buffered_response(
         call_ctx, req_ctx, req_ir, host, response, None,
@@ -594,7 +631,11 @@ async fn finalize_compat_buffered_body(
             usage,
             mutated: false,
             ..
-        } => BufferedWireFinalize::Continue { body, usage },
+        } => BufferedWireFinalize::Continue {
+            body,
+            usage,
+            pre_hook_usage,
+        },
         super::buffered::BufferedFinalize::Continue {
             response,
             usage,
@@ -606,7 +647,11 @@ async fn finalize_compat_buffered_body(
                 .make_response_encoder()
                 .format_response(&response);
             let body = serde_json::to_vec(&value).map(Bytes::from).unwrap_or(body);
-            BufferedWireFinalize::Continue { body, usage }
+            BufferedWireFinalize::Continue {
+                body,
+                usage,
+                pre_hook_usage,
+            }
         }
     }
 }
@@ -699,6 +744,7 @@ fn build_streaming_compat_response(
     req_ctx: &RequestContext,
     req_ir: &AiRequest,
     health_permit: HealthPermit,
+    raw_usage: RawUsageHandle,
 ) -> CompatAttempt {
     let ConvertedResponse {
         metadata,
@@ -728,6 +774,9 @@ fn build_streaming_compat_response(
         let mut parser = client_protocol.handler().make_stream_response_decoder();
         let mut formatter = client_protocol.handler().make_stream_response_encoder();
         let mut accumulator = super::LogUsageAccumulator::default();
+        // Usage as the converted wire reported it BEFORE response hooks ran;
+        // lets the log layer tell hook adjustments apart from conversion loss.
+        let mut pre_hook_accumulator = super::LogUsageAccumulator::default();
         let mut terminal = StreamTerminal::default();
         let mut chunks = 0_i32;
         let mut stream_error = None;
@@ -803,10 +852,12 @@ fn build_streaming_compat_response(
                 }
             }) {
                 if hook_state.is_empty() {
+                    pre_hook_accumulator.apply_all(&deltas);
                     accumulator.apply_all(&deltas);
                     bytes
                 } else {
                     let before = format!("{deltas:?}");
+                    pre_hook_accumulator.apply_all(&deltas);
                     hook_state.apply(&mut deltas).await;
                     accumulator.apply_all(&deltas);
                     let events = formatter.format_deltas(&deltas);
@@ -859,6 +910,7 @@ fn build_streaming_compat_response(
             }
         }) {
             let before = format!("{deltas:?}");
+            pre_hook_accumulator.apply_all(&deltas);
             if !hook_state.is_empty() {
                 hook_state.apply(&mut deltas).await;
             }
@@ -931,10 +983,16 @@ fn build_streaming_compat_response(
         if response.model.is_empty() {
             response.model = actual_model;
         }
+        let pre_hook_usage = pre_hook_accumulator.into_ai_response().usage;
+        // Log-only raw usage bypass: prefer the ORIGINAL upstream usage
+        // (same accounting for completion and reasoning) unless a response
+        // hook adjusted the converted-wire usage.
+        let logged_usage =
+            reconcile_logged_usage(&raw_usage.observation(), &response.usage, &pre_hook_usage);
         let upstream_body = None;
         log.status(status)
             .upstream_status(status as i32)
-            .usage(response.usage)
+            .usage(logged_usage)
             .with_upstream_request(upstream_req_headers, upstream_req_body)
             .with_upstream_response(
                 status as i32,
@@ -1719,6 +1777,265 @@ mod tests {
         assert_eq!(entry.upstream_status_code, Some(200));
         assert_eq!(entry.input_tokens(), 10);
         assert_eq!(entry.output_tokens(), 2);
+    }
+
+    #[tokio::test]
+    async fn compat_buffered_chat_log_preserves_raw_reasoning_tokens() {
+        // Anthropic→Chat: the chat→anthropic conversion drops
+        // completion_tokens_details.reasoning_tokens on the client wire, but
+        // the raw-upstream bypass must still log it (same 100/80 accounting,
+        // reasoning re-attached from the ORIGINAL payload).
+        let (gw, mut log_rx) = test_gateway().await;
+        let provider = provider("custom", "default");
+        let raw = br#"{ "model": "virtual-model", "max_tokens": 128, "messages": [{"role":"user","content":"hello"}] }"#;
+        let prepared = gw
+            .compat_engine
+            .prepare_request(
+                ConversionProfile::anthropic_to_chat(false).with_model("upstream-model"),
+                Bytes::copy_from_slice(raw),
+                nyro_ccswitch_compat::SessionIdentity::generated("test"),
+            )
+            .await
+            .unwrap();
+        let chat_response = br#"{"id":"chatcmpl_r","model":"upstream-model","choices":[{"message":{"role":"assistant","content":"hello"},"finish_reason":"stop"}],"usage":{"prompt_tokens":100,"completion_tokens":80,"total_tokens":180,"completion_tokens_details":{"reasoning_tokens":40}}}"#;
+        let (url, _request_rx) = serve_once(
+            "HTTP/1.1 200 OK",
+            "application/json",
+            chat_response.to_vec(),
+        )
+        .await;
+        let (call_ctx, mut req_ctx, mut req_ir, req_extras) = call_context(
+            &gw,
+            &provider,
+            ANTHROPIC_MESSAGES_2023_06_01,
+            OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1,
+            false,
+        );
+        let host = crate::plugin::phase::HostContext::new(&gw);
+
+        let attempt = handle_compat(
+            ProxyClient::new(reqwest::Client::new()),
+            &url,
+            ReqwestHeaderMap::new(),
+            prepared,
+            &call_ctx,
+            &req_extras,
+            &mut req_ctx,
+            &mut req_ir,
+            &host,
+            gw.health_registry.try_acquire("compat-test").unwrap(),
+        )
+        .await;
+        assert_eq!(attempt.response.status(), StatusCode::OK);
+        let body = response_body(attempt.response).await;
+        // Client wire keeps the standard Anthropic usage shape: the bypass
+        // adds nothing to the response the client sees.
+        assert!(!String::from_utf8_lossy(&body).contains("reasoning_tokens"));
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["usage"]["input_tokens"], 100);
+        assert_eq!(value["usage"]["output_tokens"], 80);
+
+        let entry = tokio::time::timeout(std::time::Duration::from_secs(1), log_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(entry.client_status_code, 200);
+        assert_eq!(entry.input_tokens(), 100);
+        assert_eq!(entry.output_tokens(), 80);
+        assert_eq!(entry.reasoning_tokens(), 40);
+    }
+
+    #[tokio::test]
+    async fn compat_buffered_chat_raw_usage_bypass_ignores_payload_capture_setting() {
+        // The bypass observes upstream bytes directly: payload capture being
+        // disabled must not change the logged usage.
+        let (gw, mut log_rx) = test_gateway().await;
+        let provider = provider("custom", "default");
+        let raw = br#"{ "model": "virtual-model", "max_tokens": 128, "messages": [{"role":"user","content":"hello"}] }"#;
+        let prepared = gw
+            .compat_engine
+            .prepare_request(
+                ConversionProfile::anthropic_to_chat(false).with_model("upstream-model"),
+                Bytes::copy_from_slice(raw),
+                nyro_ccswitch_compat::SessionIdentity::generated("test"),
+            )
+            .await
+            .unwrap();
+        let chat_response = br#"{"id":"chatcmpl_p","model":"upstream-model","choices":[{"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}],"usage":{"prompt_tokens":100,"completion_tokens":80,"completion_tokens_details":{"reasoning_tokens":22}}}"#;
+        let (url, _request_rx) = serve_once(
+            "HTTP/1.1 200 OK",
+            "application/json",
+            chat_response.to_vec(),
+        )
+        .await;
+        let (mut call_ctx, mut req_ctx, mut req_ir, req_extras) = call_context(
+            &gw,
+            &provider,
+            ANTHROPIC_MESSAGES_2023_06_01,
+            OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1,
+            false,
+        );
+        call_ctx.enable_payload = Some(false);
+        let host = crate::plugin::phase::HostContext::new(&gw);
+
+        let attempt = handle_compat(
+            ProxyClient::new(reqwest::Client::new()),
+            &url,
+            ReqwestHeaderMap::new(),
+            prepared,
+            &call_ctx,
+            &req_extras,
+            &mut req_ctx,
+            &mut req_ir,
+            &host,
+            gw.health_registry.try_acquire("compat-test").unwrap(),
+        )
+        .await;
+        assert_eq!(attempt.response.status(), StatusCode::OK);
+        let _ = response_body(attempt.response).await;
+
+        let entry = tokio::time::timeout(std::time::Duration::from_secs(1), log_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(entry.input_tokens(), 100);
+        assert_eq!(entry.output_tokens(), 80);
+        assert_eq!(entry.reasoning_tokens(), 22);
+    }
+
+    #[tokio::test]
+    async fn compat_buffered_responses_sse_upstream_log_preserves_raw_usage() {
+        // Anthropic→Responses with a forced-stream Codex-oauth upstream and a
+        // non-stream client: the dispatcher buffers the upstream SSE whole.
+        // The raw bypass must decode usage (incl. reasoning) from that SSE
+        // body even though the aggregated client response is Anthropic JSON.
+        let (gw, mut log_rx) = test_gateway().await;
+        let provider = provider("custom", "codex");
+        let raw = br#"{"model":"virtual-model","max_tokens":128,"messages":[{"role":"user","content":"hello"}]}"#;
+        let prepared = gw
+            .compat_engine
+            .prepare_request(
+                ConversionProfile::anthropic_to_responses(
+                    false,
+                    UpstreamFlavor::CodexOAuthResponses,
+                )
+                .with_model("upstream-model"),
+                Bytes::copy_from_slice(raw),
+                nyro_ccswitch_compat::SessionIdentity::generated("test"),
+            )
+            .await
+            .unwrap();
+        let sse = concat!(
+            "event: response.output_text.delta\n",
+            "data: {\"type\":\"response.output_text.delta\",\"item_id\":\"msg_1\",\"output_index\":0,\"content_index\":0,\"delta\":\"hello\"}\n\n",
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_sse\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":100,\"output_tokens\":80,\"output_tokens_details\":{\"reasoning_tokens\":50}}}}\n\n",
+        )
+        .as_bytes()
+        .to_vec();
+        let (url, _request_rx) = serve_once("HTTP/1.1 200 OK", "text/event-stream", sse).await;
+        let (call_ctx, mut req_ctx, mut req_ir, req_extras) = call_context(
+            &gw,
+            &provider,
+            ANTHROPIC_MESSAGES_2023_06_01,
+            OPENAI_RESPONSES_V1,
+            false,
+        );
+        let host = crate::plugin::phase::HostContext::new(&gw);
+
+        let attempt = handle_compat(
+            ProxyClient::new(reqwest::Client::new()),
+            &url,
+            ReqwestHeaderMap::new(),
+            prepared,
+            &call_ctx,
+            &req_extras,
+            &mut req_ctx,
+            &mut req_ir,
+            &host,
+            gw.health_registry.try_acquire("compat-test").unwrap(),
+        )
+        .await;
+        assert_eq!(attempt.response.status(), StatusCode::OK);
+        let body = response_body(attempt.response).await;
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["type"], "message");
+        assert_eq!(value["usage"]["output_tokens"], 80);
+
+        let entry = tokio::time::timeout(std::time::Duration::from_secs(1), log_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(entry.client_status_code, 200);
+        assert_eq!(entry.input_tokens(), 100);
+        assert_eq!(entry.output_tokens(), 80);
+        assert_eq!(entry.reasoning_tokens(), 50);
+    }
+
+    #[tokio::test]
+    async fn compat_stream_gemini_log_preserves_raw_reasoning_tokens() {
+        // Anthropic→Gemini streaming: the gemini→anthropic wire conversion
+        // drops thoughtsTokenCount, so without the bypass the log would
+        // report reasoning 0. The tee observes the ORIGINAL SSE and the log
+        // keeps the upstream 100/80 accounting with reasoning re-attached.
+        let (gw, mut log_rx) = test_gateway().await;
+        let provider = provider("custom", "default");
+        let raw = br#"{"model":"virtual-model","max_tokens":128,"stream":true,"messages":[{"role":"user","content":"hello"}]}"#;
+        let prepared = gw
+            .compat_engine
+            .prepare_request(
+                ConversionProfile::anthropic_to_gemini(true).with_model("upstream-model"),
+                Bytes::copy_from_slice(raw),
+                nyro_ccswitch_compat::SessionIdentity::generated("test"),
+            )
+            .await
+            .unwrap();
+        let sse = concat!(
+            "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"hel\"}],\"role\":\"model\"}}],\"usageMetadata\":{\"promptTokenCount\":100,\"candidatesTokenCount\":1,\"totalTokenCount\":101},\"modelVersion\":\"gemini-test\"}\n\n",
+            "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"lo\"}],\"role\":\"model\"},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":100,\"candidatesTokenCount\":20,\"thoughtsTokenCount\":60,\"totalTokenCount\":180,\"cachedContentTokenCount\":0},\"modelVersion\":\"gemini-test\"}\n\n",
+        )
+        .as_bytes()
+        .to_vec();
+        let (url, _request_rx) = serve_once("HTTP/1.1 200 OK", "text/event-stream", sse).await;
+        let (call_ctx, mut req_ctx, mut req_ir, req_extras) = call_context(
+            &gw,
+            &provider,
+            ANTHROPIC_MESSAGES_2023_06_01,
+            GOOGLE_GEMINI_GENERATE_CONTENT_V1BETA,
+            true,
+        );
+        let host = crate::plugin::phase::HostContext::new(&gw);
+
+        let attempt = handle_compat(
+            ProxyClient::new(reqwest::Client::new()),
+            &url,
+            ReqwestHeaderMap::new(),
+            prepared,
+            &call_ctx,
+            &req_extras,
+            &mut req_ctx,
+            &mut req_ir,
+            &host,
+            gw.health_registry.try_acquire("compat-test").unwrap(),
+        )
+        .await;
+        assert_eq!(attempt.response.status(), StatusCode::OK);
+        let body = response_body(attempt.response).await;
+        let text = String::from_utf8_lossy(&body);
+        assert!(text.contains("event: message_stop"));
+        // Client wire stays standard Anthropic SSE — no private fields.
+        assert!(!text.contains("reasoning_tokens"));
+        assert!(!text.contains("thoughtsTokenCount"));
+
+        let entry = tokio::time::timeout(std::time::Duration::from_secs(1), log_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(entry.client_status_code, 200);
+        assert!(entry.is_stream);
+        assert_eq!(entry.input_tokens(), 100);
+        assert_eq!(entry.output_tokens(), 80);
+        assert_eq!(entry.reasoning_tokens(), 60);
     }
 
     #[tokio::test]

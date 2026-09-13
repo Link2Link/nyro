@@ -334,6 +334,7 @@ impl LogStore for MemoryStorage {
             avg_first_token_ms: None,
             total_upstream_ms: 0.0,
             last_used_at: None,
+            tps_totals: Default::default(),
             models: Vec::new(),
         })
     }
@@ -398,6 +399,7 @@ impl LogStore for MemoryStorage {
             providers: Vec::new(),
             api_keys: Vec::new(),
             time_series: None,
+            tps_totals: Default::default(),
         })
     }
 }

@@ -30,7 +30,7 @@ function point(key: string, score: number, tps: number): PerformancePoint {
   return { key, pointId: `P${key}`, providerId: key, providerName: key,
     providerIcon: "", providerBaseUrl: "http://example.invalid",
     modelPrefix: key, model: key, providerEnabled: true,
-    score, tps, overallTps: tps, netTps: tps, status: "ready", scoreUpdatedAt: time,
+    score, tps, grossTps: tps, status: "ready", scoreUpdatedAt: time,
     selectedRequestCount: 10, validTpsCount: 5, firstSampleAt: 1000, lastSampleAt: 2000,
     unclassifiedCount: 0, untrustedCount: 0, variants: [], color: performanceColor(key) };
 }
@@ -80,7 +80,7 @@ test("malformed batches and duplicate prefix/provider groups are errors, never m
   for (const invalid of [null, {}, { as_of: 1, window_start: 0, models: [{}] },
     snapshot({ ...item(), mixed: { ...stats(), average_tps: NaN } }),
     snapshot({ ...item(), mixed: { ...stats(), valid_tps_count: 11 } }),
-    snapshot({ ...item(), mixed: { ...stats(), average_tps: 0 } }),
+    snapshot({ ...item(), mixed: { ...stats(), average_tps: -1 } }),
     snapshot(item(), item()),
     snapshot({ ...item(), score: 101 }),
     snapshot({ ...item(), model_prefix: "" }),
@@ -349,38 +349,51 @@ test("labels list every coincident point and pair the prefix with each provider"
   equal(wrapped.lines.join(""), `${long.modelPrefix} · 03`); ok(wrapped.lines.length > 1);
 });
 
-test("overall_tps contract preserves aggregate values and supports overall metric points", () => {
-  const customStats: PerformanceStats = {
-    average_tps: 80.0,
-    overall_tps: 45.0,
-    total_output_tokens: 450,
-    total_latency_ms: 10000,
-    selected_request_count: 10,
-    valid_tps_count: 5,
-    first_sample_at: 1000,
-    last_sample_at: 2000,
+test("average_tps and overall_tps are one unified content metric with compatible aliases", () => {
+  // Aliases must be equal when both are provided; geometry-style fixtures may send only average_tps.
+  const averageOnly: PerformanceStats = {
+    average_tps: 80, valid_tps_count: 5, selected_request_count: 10,
+    first_sample_at: 1000, last_sample_at: 2000,
   };
-  const testItem: ModelPerformanceItem = {
-    ...item("test-model", "p", 85),
-    mixed: customStats,
-    variants: [{ upstream_model: "test-model", mixed: customStats, unclassified_count: 0, untrusted_count: 0 }],
-  };
-  const data = snapshot(testItem);
-  equal(readPerformanceResponse(data), data);
-  const rows = buildPerformanceRows(data, [provider("p")]);
-  equal(rows[0].tps, 80.0);
-  equal(rows[0].overallTps, 45.0);
-
-  // Net points
-  const netPoints = performancePoints(rows, "net");
-  equal(netPoints.length, 1);
-  equal(netPoints[0].tps, 80.0);
-  equal(netPoints[0].metric, "net");
-
-  // Overall points
-  const overallPoints = performancePoints(rows, "overall");
-  equal(overallPoints.length, 1);
-  equal(overallPoints[0].tps, 45.0);
-  equal(overallPoints[0].metric, "overall");
+  const aliased: PerformanceStats = { ...averageOnly, overall_tps: 80, average_gross_tps: 95, overall_gross_tps: 95 };
+  const solo = snapshot({
+    ...item("m", "p", 85), mixed: averageOnly,
+    variants: [{ ...variant("m", averageOnly), unclassified_count: 0, untrusted_count: 0 }],
+  });
+  equal(readPerformanceResponse(solo), solo);
+  const both = snapshot({ ...item("m", "p", 85), mixed: aliased });
+  equal(readPerformanceResponse(both), both);
+  const rows = buildPerformanceRows(snapshot({ ...item("m", "p", 85), mixed: aliased }), [provider("p")]);
+  equal(rows[0].tps, 80); equal(rows[0].grossTps, 95);
+  const points = performancePoints(rows);
+  equal(points.length, 1); equal(points[0].tps, 80); equal(points[0].grossTps, 95);
+  // A stale overall value from an older formula is a contradiction, never a second metric.
+  for (const mixed of [
+    { ...averageOnly, overall_tps: 45 },
+    { ...averageOnly, average_gross_tps: 95, overall_gross_tps: 96 },
+    { ...averageOnly, average_gross_tps: -1 },
+    { ...stats(null, 0), overall_tps: 10 },
+  ] as PerformanceStats[]) throws(() => readPerformanceResponse(snapshot({ ...item(), mixed })));
 });
 
+test("zero content TPS is valid data: accepted, plotted at 0.0 and never treated as missing", () => {
+  const pureReasoning: PerformanceStats = {
+    ...stats(0, 5), overall_tps: 0, average_gross_tps: 40, overall_gross_tps: 40,
+  };
+  const data = snapshot({ ...item("pure", "p", 60), mixed: pureReasoning });
+  equal(readPerformanceResponse(data), data);
+  const rows = buildPerformanceRows(data, [provider("p")]);
+  equal(rows[0].status, "ready"); equal(rows[0].tps, 0); equal(rows[0].grossTps, 40);
+  const points = performancePoints(rows);
+  equal(points.length, 1); equal(points[0].tps, 0);
+  // A zero-TPS point joins the envelope when nothing dominates it (highest score),
+  // and a dominated zero stays off the boundary while still being plotted.
+  const dominated = buildPerformanceRows(snapshot(
+    { ...item("zero-low", "p", 40), mixed: pureReasoning },
+    { ...item("fast", "p", 90), mixed: pureReasoning },
+  ), [provider("p")]);
+  const all = performancePoints(dominated);
+  equal(all.length, 2);
+  const envelope = buildPerformanceEnvelope(all);
+  deepEqual([...envelope.memberKeys], dominated.filter((row) => row.modelPrefix === "fast").map((row) => row.key));
+});
