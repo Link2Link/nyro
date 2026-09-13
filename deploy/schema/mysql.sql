@@ -179,6 +179,7 @@ CREATE TABLE `request_logs` (
   `latency_upstream_ms` bigint DEFAULT NULL,
   `input_tokens` int DEFAULT '0',
   `output_tokens` int DEFAULT '0',
+  `reasoning_tokens` int DEFAULT '0',
   `cache_read_tokens` int DEFAULT '0',
   `is_stream` tinyint(1) DEFAULT '0',
   `stream_chunks_count` int DEFAULT '0',

@@ -219,6 +219,7 @@ CREATE TABLE public.request_logs (
     latency_upstream_ms bigint,
     input_tokens integer DEFAULT 0,
     output_tokens integer DEFAULT 0,
+    reasoning_tokens integer DEFAULT 0,
     cache_read_tokens integer DEFAULT 0,
     is_stream boolean DEFAULT false,
     stream_chunks_count integer DEFAULT 0,

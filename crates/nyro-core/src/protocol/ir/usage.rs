@@ -21,6 +21,7 @@ pub struct ServerToolUsage {
 /// - `total_tokens`       — prompt + completion (may be 0 if not supplied by provider)
 /// - `cache_read_tokens`  — tokens served from the prompt cache (Anthropic / compatible)
 /// - `cache_creation_tokens` — tokens written to the prompt cache
+/// - `reasoning_tokens`     — tokens spent on reasoning/thinking (subset of completion_tokens)
 /// - `server_tool_use`    — server-side tool call counts (web search, web fetch)
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Usage {
@@ -31,6 +32,8 @@ pub struct Usage {
     pub cache_read_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_creation_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub server_tool_use: Option<ServerToolUsage>,
 }
@@ -53,6 +56,9 @@ impl Usage {
         }
         if next.cache_creation_tokens.is_some() {
             self.cache_creation_tokens = next.cache_creation_tokens;
+        }
+        if next.reasoning_tokens.is_some() {
+            self.reasoning_tokens = next.reasoning_tokens;
         }
         if next.server_tool_use.is_some() {
             self.server_tool_use = next.server_tool_use.clone();

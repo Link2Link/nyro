@@ -112,6 +112,7 @@ export function formatTps(tps: number | null | undefined): string {
 /** 计算 TPS 所需的最小字段集(结构兼容 `RequestLog`)。 */
 export interface TpsInput {
   output_tokens?: number | null;
+  reasoning_tokens?: number | null;
   is_stream?: boolean | null;
   stream_chunks_count?: number | null;
   latency_upstream_ms?: number | null;
@@ -144,8 +145,23 @@ export function generationMsOf(log: TpsInput | null | undefined): number | null 
   return upstream ?? log.latency_total_ms ?? null;
 }
 
-/** 净生成速度(tok/s);output ≤ 0 或净生成耗时无效时返回 null。 */
+/** 正文有效 Token 数 (扣除思考 Token)。 */
+export function contentTokensOf(log: TpsInput | null | undefined): number {
+  const out = Math.max(0, log?.output_tokens ?? 0);
+  const reasoning = Math.max(0, log?.reasoning_tokens ?? 0);
+  return Math.max(0, out - reasoning);
+}
+
+/** 有效正文生成速度 (tok/s);正文 Token ≤ 0 或净生成耗时无效时返回 null。 */
 export function computeTps(log: TpsInput | null | undefined): number | null {
+  const gen = generationMsOf(log);
+  const content = contentTokensOf(log);
+  if (content > 0 && gen && gen > 0) return content / (gen / 1000);
+  return null;
+}
+
+/** 物理总生成速度 (tok/s，含思考 Token);output ≤ 0 或净生成耗时无效时返回 null。 */
+export function computeGrossTps(log: TpsInput | null | undefined): number | null {
   const gen = generationMsOf(log);
   const out = log?.output_tokens ?? 0;
   if (out > 0 && gen && gen > 0) return out / (gen / 1000);

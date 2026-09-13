@@ -89,9 +89,9 @@ test("malformed batches and duplicate prefix/provider groups are errors, never m
     throws(() => readPerformanceResponse(invalid));
   }
 });
-test("variant statistics enforce the ten-request window and matching TPS/sample-time presence", () => {
+test("variant statistics enforce the fifty-request window and matching TPS/sample-time presence", () => {
   for (const mixed of [
-    { ...stats(), selected_request_count: 11 }, { ...stats(), average_tps: null },
+    { ...stats(), selected_request_count: 51 }, { ...stats(), average_tps: null },
     { ...stats(), first_sample_at: null }, { ...stats(), last_sample_at: null },
     { ...stats(), first_sample_at: -1 }, { ...stats(), first_sample_at: 3000 },
     { ...stats(null, 0), average_tps: 50 }, { ...stats(null, 0), first_sample_at: 1000 },
@@ -109,24 +109,24 @@ test("merged group statistics are bounded by their variant count, not by one var
   });
   const group = (mixed: PerformanceStats) => ({ ...item(),
     variants: [variant("model"), variant("model-0813")], mixed });
-  // Two variants, each retaining a full ten-call window, merge into twenty samples.
-  const live = snapshot(group(merged(20, 20)));
+  // Two variants, each retaining a full fifty-call window, merge into a hundred samples.
+  const live = snapshot(group(merged(100, 100)));
   equal(readPerformanceResponse(live), live);
   // A group without any usable TPS still merges its selected samples.
-  const unrated = snapshot(group(merged(20, 0)));
+  const unrated = snapshot(group(merged(100, 0)));
   equal(readPerformanceResponse(unrated), unrated);
-  // Merging is a sum: counts above ten are valid, counts above ten per variant are not.
-  for (const mixed of [merged(21, 20), merged(20, 21), merged(21, 21)]) {
+  // Merging is a sum: counts above fifty are valid, counts above fifty per variant are not.
+  for (const mixed of [merged(101, 100), merged(100, 101), merged(101, 101)]) {
     throws(() => readPerformanceResponse(snapshot(group(mixed))));
   }
-  const partial = snapshot(group(merged(20, 10)));
+  const partial = snapshot(group(merged(100, 50)));
   equal(readPerformanceResponse(partial), partial);
   // A group with no variants was merged from nothing, so it may carry no samples at all.
   const none = snapshot({ ...item(), variants: [], mixed: merged(0, 0) });
   equal(readPerformanceResponse(none), none);
   throws(() => readPerformanceResponse(snapshot({ ...item(), variants: [], mixed: merged(1, 0) })));
-  // The bound follows the declared variants, so a single-variant group keeps the ten-call window.
-  throws(() => readPerformanceResponse(snapshot({ ...item(), mixed: merged(11, 11) })));
+  // The bound follows the declared variants, so a single-variant group keeps the fifty-call window.
+  throws(() => readPerformanceResponse(snapshot({ ...item(), mixed: merged(51, 51) })));
 });
 test("hidden hover/pins never dim visible points and restored filters recover the pin", () => {
   const visible = [point("01", 20, 30)], pinned = ["02"];

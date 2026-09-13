@@ -7,7 +7,7 @@ import type { ApiKey, LoggingStatus, LogPage, LogQuery, ModelStats, Provider, Re
 import { isLogRelatedQueryKey } from "@/lib/log-observability";
 import { OutcomeFilter, ResultBadge } from "@/components/log-outcome";
 import { getRouteType } from "@/lib/types";
-import { computeTps, formatDuration, formatLogTime, formatTokenCount, formatTps } from "@/lib/format";
+import { computeGrossTps, computeTps, contentTokensOf, formatDuration, formatLogTime, formatTokenCount, formatTps } from "@/lib/format";
 import { prettyName } from "@/lib/protocol";
 import { cn } from "@/lib/utils";
 import { useLocale } from "@/lib/i18n";
@@ -522,9 +522,20 @@ export default function LogsPage() {
                       </td>
                       <td
                         className="px-3 py-2 text-right text-xs text-slate-600 whitespace-nowrap tabular-nums"
-                        title={isZh ? "净生成速度" : "Net generation speed"}
+                        title={
+                          log.reasoning_tokens && log.reasoning_tokens > 0
+                            ? (isZh
+                                ? `正文有效速率: ${formatTps(computeTps(log))} (物理总速: ${formatTps(computeGrossTps(log))}，思考 ${log.reasoning_tokens} tok / 正文 ${contentTokensOf(log)} tok)`
+                                : `Effective: ${formatTps(computeTps(log))} (Gross: ${formatTps(computeGrossTps(log))}, reasoning: ${log.reasoning_tokens} tok)`)
+                            : (isZh ? "净生成速度" : "Net generation speed")
+                        }
                       >
-                        {formatTps(computeTps(log))}
+                        {formatTps(computeTps(log) ?? computeGrossTps(log))}
+                        {log.reasoning_tokens && log.reasoning_tokens > 0 ? (
+                          <span className="ml-1 text-[10px] text-amber-600 font-medium cursor-help" title={isZh ? "已扣除思考耗费，显示正文有效TPS" : "Excludes reasoning tokens"}>
+                            *
+                          </span>
+                        ) : null}
                       </td>
                       <td className="px-3 py-2 whitespace-nowrap">
                         {isStream ? (

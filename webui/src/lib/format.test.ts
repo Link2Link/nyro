@@ -1,6 +1,6 @@
 import { equal } from "node:assert/strict";
 import { test } from "node:test";
-import { computeTps, formatTps, generationMsOf } from "./format";
+import { computeGrossTps, computeTps, contentTokensOf, formatTps, generationMsOf } from "./format";
 
 test("TPS display consistently uses one decimal, including values above 100", () => {
   for (const [value, expected] of [
@@ -21,6 +21,21 @@ test("log TPS follows model-statistics stream detection and duration fallback", 
   equal(generationMsOf({ is_stream: true, latency_upstream_ms: 0, stream_first_chunk_ms: -100 }), 0);
   equal(computeTps({ output_tokens: 100, is_stream: true, latency_upstream_ms: 0, stream_first_chunk_ms: -100 }), null);
   equal(formatTps(computeTps({ output_tokens: 2007, is_stream: true, latency_upstream_ms: 20617, stream_first_chunk_ms: 1798 })), "106.6 tok/s");
+});
+
+test("effective TPS excludes reasoning tokens while gross TPS preserves total", () => {
+  const log = {
+    output_tokens: 100,
+    reasoning_tokens: 80,
+    is_stream: true,
+    stream_chunks_count: 5,
+    latency_upstream_ms: 2000,
+    stream_first_chunk_ms: 1000,
+  };
+  // generationMs = 2000 - 1000 = 1000ms = 1s
+  equal(contentTokensOf(log), 20);
+  equal(computeTps(log), 20);
+  equal(computeGrossTps(log), 100);
 });
 
 test("unavailable and invalid TPS retain the missing-value marker", () => {

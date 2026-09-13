@@ -1170,11 +1170,11 @@ impl LogStore for SqliteLogStore {
                      upstream_response_headers, upstream_response_body,
                      upstream_status_code, client_status_code,
                      latency_total_ms, latency_upstream_ms,
-                     input_tokens, output_tokens, cache_read_tokens,
+                     input_tokens, output_tokens, reasoning_tokens, cache_read_tokens,
                      is_stream, stream_chunks_count, stream_first_chunk_ms,
                      performance_metadata_version, upstream_effort_status, upstream_effort_raw, upstream_effort_tier, request_completion, completion_reason, upstream_response_mode, performance_upstream_ms, performance_first_chunk_ms, performance_completed_at,
                      client_request_id, attempt_index, outcome_version, attempt_outcome, failure_kind, failure_stage, error_message, error_causes_json, payload_metadata_json)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
             )
             .bind(&id)
             .bind(entry.created_at)
@@ -1207,6 +1207,7 @@ impl LogStore for SqliteLogStore {
             .bind(entry.latency_upstream_ms)
             .bind(entry.input_tokens())
             .bind(entry.output_tokens())
+            .bind(entry.reasoning_tokens())
             .bind(entry.cache_read_tokens())
             .bind(entry.is_stream)
             .bind(entry.stream_chunks_count)
@@ -1259,7 +1260,7 @@ impl LogStore for SqliteLogStore {
              NULL AS upstream_response_headers, NULL AS upstream_response_body, \
              upstream_status_code, client_status_code, \
              CAST(latency_total_ms AS INTEGER) AS latency_total_ms, latency_upstream_ms, \
-             input_tokens, output_tokens, COALESCE(cache_read_tokens, 0) AS cache_read_tokens, \
+             input_tokens, output_tokens, COALESCE(cache_read_tokens, 0) AS cache_read_tokens, COALESCE(reasoning_tokens, 0) AS reasoning_tokens, \
              COALESCE(is_stream, 0) AS is_stream, stream_chunks_count, stream_first_chunk_ms, \
              performance_metadata_version, upstream_effort_status, upstream_effort_raw, upstream_effort_tier, request_completion, completion_reason, upstream_response_mode, performance_upstream_ms, performance_first_chunk_ms, performance_completed_at, \
              client_request_id, attempt_index, outcome_version, attempt_outcome, failure_kind, failure_stage, error_message, \
@@ -1366,7 +1367,7 @@ impl LogStore for SqliteLogStore {
              upstream_response_headers, upstream_response_body, \
              upstream_status_code, client_status_code, \
              CAST(latency_total_ms AS INTEGER) AS latency_total_ms, latency_upstream_ms, \
-             input_tokens, output_tokens, COALESCE(cache_read_tokens, 0) AS cache_read_tokens, \
+             input_tokens, output_tokens, COALESCE(cache_read_tokens, 0) AS cache_read_tokens, COALESCE(reasoning_tokens, 0) AS reasoning_tokens, \
              COALESCE(is_stream, 0) AS is_stream, stream_chunks_count, stream_first_chunk_ms, \
              performance_metadata_version, upstream_effort_status, upstream_effort_raw, upstream_effort_tier, request_completion, completion_reason, upstream_response_mode, performance_upstream_ms, performance_first_chunk_ms, performance_completed_at, \
              client_request_id, attempt_index, outcome_version, attempt_outcome, failure_kind, failure_stage, error_message, \
@@ -1561,10 +1562,11 @@ impl LogStore for SqliteLogStore {
         .fetch_one(&self.pool)
         .await?;
         let samples = sqlx::query_as::<_, RecentModelPerformance>(
-            "SELECT COALESCE(output_tokens, 0) AS output_tokens, COALESCE(is_stream, 0) AS is_stream, \
+            &format!("SELECT COALESCE(output_tokens, 0) AS output_tokens, COALESCE(is_stream, 0) AS is_stream, \
              COALESCE(stream_chunks_count, 0) AS stream_chunks_count, latency_upstream_ms, latency_total_ms, stream_first_chunk_ms \
              FROM request_logs WHERE provider_id = ? AND upstream_model = ? \
-             ORDER BY created_at DESC, id DESC LIMIT 10",
+             ORDER BY created_at DESC, id DESC LIMIT {}",
+             crate::db::models::RECENT_SAMPLE_LIMIT),
         )
         .bind(provider_id)
         .bind(upstream_model)

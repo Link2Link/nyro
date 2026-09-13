@@ -5,7 +5,7 @@ import { Check, Copy, Download, Loader2, Trash2 } from "lucide-react";
 import { backend } from "@/lib/backend";
 import { useLocale } from "@/lib/i18n";
 import type { Provider, RequestLog, RequestLogAttempts } from "@/lib/types";
-import { computeTps, formatDuration, formatLogTime, formatTokenCount, formatTps, generationMsOf } from "@/lib/format";
+import { computeGrossTps, computeTps, contentTokensOf, formatDuration, formatLogTime, formatTokenCount, formatTps, generationMsOf } from "@/lib/format";
 import { effectiveOutcome, payloadDownload } from "@/lib/log-observability";
 import { ResultBadge } from "@/components/log-outcome";
 import { AttemptResultBanner, PayloadBlock } from "@/components/log-evidence";
@@ -110,6 +110,7 @@ function LogDetailContent({ logId, summary, open, onOpenChange, onDelete }: LogD
 
   const generationMs = generationMsOf(log);
   const tps = computeTps(log);
+  const grossTps = computeGrossTps(log);
   const isCrossProtocol =
     log?.client_protocol &&
     log?.upstream_protocol &&
@@ -251,12 +252,23 @@ function LogDetailContent({ logId, summary, open, onOpenChange, onDelete }: LogD
               {isZh ? "首字" : "TTFT"} {formatDuration(log.stream_first_chunk_ms)}
             </span>
           ) : null}
-          {tps != null ? (
+          {tps != null || grossTps != null ? (
             <span
               className="text-slate-500"
-              title={isZh ? "净生成速度(剥离首字节前等待)" : "Net generation speed (excludes prefill wait)"}
+              title={
+                log?.reasoning_tokens && log.reasoning_tokens > 0
+                  ? (isZh
+                      ? `正文有效速率: ${formatTps(tps)} (物理总速: ${formatTps(grossTps)}，思考 ${log.reasoning_tokens} tok / 正文 ${contentTokensOf(log)} tok)`
+                      : `Effective TPS: ${formatTps(tps)} (Gross TPS: ${formatTps(grossTps)}, reasoning: ${log.reasoning_tokens} tok, content: ${contentTokensOf(log)} tok)`)
+                  : (isZh ? "净生成速度(剥离首字节前等待)" : "Net generation speed (excludes prefill wait)")
+              }
             >
-              {formatTps(tps)}
+              {formatTps(tps ?? grossTps)}
+              {log?.reasoning_tokens && log.reasoning_tokens > 0 ? (
+                <span className="ml-1 text-xs text-amber-600 font-medium" title={isZh ? "含思考过程" : "Includes reasoning"}>
+                  ({isZh ? "正文" : "content"})
+                </span>
+              ) : null}
             </span>
           ) : null}
           {log ? (

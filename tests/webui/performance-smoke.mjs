@@ -441,8 +441,8 @@ try {
     { provider: beta, model: 'model/single-rating', score: 55 },
     { provider: beta, model: 'MiniMax-M3', score: 68 },
     { provider: alpha, model: 'model/invalid-tokens-or-time', score: 35 },
-    // One rated prefix served by two upstream variants: the group merges ten retained
-    // calls per variant into twenty selected/valid samples, which is exactly the
+    // One rated prefix served by two upstream variants: the group merges fifty retained
+    // calls per variant into one hundred selected/valid samples, which is exactly the
     // client contract this fixture must keep exercising.
     { provider: alpha, model: 'model/dual', score: 62 },
     { provider: alpha, model: 'model/dual-0813', score: 62, sharesRowWith: 'model/dual' },
@@ -477,8 +477,8 @@ try {
     performance_upstream_ms: 7, performance_first_chunk_ms: 3, performance_completed_at: now - 30 * 86400000,
     ...extra,
   });
-  log(pairs[0],900); log(pairs[0],800); // Older raw rows are outside the latest ten.
-  for (let i=0;i<5;i++) {
+  log(pairs[0],900); log(pairs[0],800); // Older raw rows are outside the latest fifty.
+  for (let i=0;i<25;i++) {
     // 100 / (2s - 0.5s) and 50 / 1s average to the existing 175/3 TPS.
     log(pairs[0],100,2000,{is_stream:1,stream_chunks_count:10,stream_first_chunk_ms:500});
     log(pairs[0],50);
@@ -487,7 +487,9 @@ try {
   for(const pair of pairs.slice(2,6)) log(pair,pair===pairs[4]?80:60);
   const effort=pairs[6];
   for(let i=0;i<3;i++) log(effort,200,1000,{upstream_effort_raw:'minimal',upstream_effort_tier:'low'});
-  // Exactly these ten raw retained rows are selected, including one invalid token sample.
+  // These ten rows plus the three minimal-effort rows above stay inside the
+  // latest-fifty window: thirteen raw retained rows are selected, including one
+  // invalid token sample.
   log(effort,0);
   log(effort,120,1000,{upstream_effort_raw:'max',upstream_effort_tier:'max'});
   for(const status of ['absent','unknown']) log(effort,150,1000,{upstream_effort_status:status,upstream_effort_raw:null,upstream_effort_tier:null});
@@ -507,16 +509,16 @@ try {
   // New MiniMax logs can have unknown completion despite valid legacy tokens/timing.
   log(pairs[10],2007,20617,{is_stream:1,stream_chunks_count:200,stream_first_chunk_ms:1798,
     performance_metadata_version:1,request_completion:'unknown',completion_reason:null});
-  log(pairs[11],200); // Must not refill from this older valid row after selecting ten invalid rows.
-  for(let i=0;i<10;i++) {
+  log(pairs[11],200); // Must not refill from this older valid row after selecting fifty invalid rows.
+  for(let i=0;i<50;i++) {
     const invalid=[{output_tokens:0},{output_tokens:-5},{output_tokens:null},
       {latency_upstream_ms:0},{latency_upstream_ms:-1},{latency_upstream_ms:null,latency_total_ms:null}][i%6];
     log(pairs[11],100,1000,invalid);
   }
-  // Two upstream variants collide on one rated prefix: ten retained calls each merge
-  // into twenty samples, weighted 100/60 TPS → (100×10 + 60×10) / 20 = 80 TPS.
+  // Two upstream variants collide on one rated prefix: fifty retained calls each merge
+  // into one hundred samples, weighted 100/60 TPS → (100×50 + 60×50) / 100 = 80 TPS.
   const dualA=pairs[12],dualB=pairs[13];
-  for(let i=0;i<10;i++){ log(dualA,100); log(dualB,60); }
+  for(let i=0;i<50;i++){ log(dualA,100); log(dualB,60); }
   log(unrated,220);
   const seedPath = join(scratch, 'seed-logs.json'); await writeFile(seedPath, JSON.stringify(logs, null, 2));
   const python = trackChild('sqlite-seed', 'python3', ['-c', seedPython, scratch, dataDir, seedPath]);
@@ -531,10 +533,10 @@ try {
   // A stream without sharesRowWith owns its row; a sibling stream reads its own variant.
   const statsFor=pair=>pair.sharesRowWith?variantStats(groupFor(pair),pair).mixed:groupFor(pair).mixed;
   assert.ok(Math.abs(statsFor(pairs[0]).average_tps-175/3)<1e-10);
-  assert.equal(statsFor(pairs[0]).selected_request_count,10);
+  assert.equal(statsFor(pairs[0]).selected_request_count,50,'The two older 900/800-token rows fall outside the latest-fifty window');
   const grouped=groupFor(effort);
-  assert.equal(grouped.mixed.selected_request_count,10); assert.equal(grouped.mixed.valid_tps_count,9);
-  assert.equal(grouped.mixed.average_tps,90); assert.ok(!Object.hasOwn(grouped,'tiers'));
+  assert.equal(grouped.mixed.selected_request_count,13); assert.equal(grouped.mixed.valid_tps_count,12);
+  assert.equal(grouped.mixed.average_tps,117.5); assert.ok(!Object.hasOwn(grouped,'tiers'));
   assert.equal(grouped.score,80);
   assert.equal(statsFor(pairs[8]).average_tps,50,'No metadata, total-time fallback and retained >7-day history all remain valid');
   assert.ok(statsFor(pairs[8]).first_sample_at<snapshot.as_of-7*86400000);
@@ -543,19 +545,19 @@ try {
   assert.equal(statsFor(pairs[9]).average_tps,55,'Legacy streaming fallbacks use upstream duration for non-incremental responses');
   assert.equal(statsFor(pairs[9]).valid_tps_count,3);
   assert.equal(groupFor(unlogged),undefined,'A rated prefix with no retained call produces no row, never a zero-TPS row');
-  assert.equal(statsFor(pairs[11]).selected_request_count,10);
+  assert.equal(statsFor(pairs[11]).selected_request_count,50);
   assert.equal(statsFor(pairs[11]).valid_tps_count,0,'Invalid latest samples do not refill from older valid history');
   assert.deepEqual(snapshot.models.filter(item=>item.mixed.average_tps===null).map(item=>item.model_prefix).sort(),
     [prefixOf(pairs[11]).toLowerCase()].sort(),'Only invalid tokens/timing is missing TPS');
   // The multi-variant group is the contract the client must accept: merged counts are
-  // the sum over declared variants, so twenty selected/valid samples are legitimate.
+  // the sum over declared variants, so one hundred selected/valid samples are legitimate.
   const dual=rowPairs.find(pair=>pair.model==='model/dual'),dualItem=groupFor(dual);
   assert.equal(dualItem.variants.length,2,'Two upstream variants of one prefix share a single row');
   assert.deepEqual(dualItem.variants.map(variant=>variant.upstream_model).sort(),['model/dual','model/dual-0813']);
-  assert.equal(dualItem.mixed.selected_request_count,20,'Merged selected samples sum ten retained calls per variant');
-  assert.equal(dualItem.mixed.valid_tps_count,20);
+  assert.equal(dualItem.mixed.selected_request_count,100,'Merged selected samples sum fifty retained calls per variant');
+  assert.equal(dualItem.mixed.valid_tps_count,100);
   assert.ok(Math.abs(dualItem.mixed.average_tps-80)<1e-10,'Merged TPS is weighted by valid samples, not by variant count');
-  assert.deepEqual(dualItem.variants.map(variant=>variant.mixed.selected_request_count),[10,10]);
+  assert.deepEqual(dualItem.variants.map(variant=>variant.mixed.selected_request_count),[50,50]);
   assert.equal(dualItem.score,62,'Both variants inherit the prefix-shared score');
   report.usageComparisons=[];
   for(const pair of pairs){
@@ -572,7 +574,7 @@ try {
     // Variant statistics stay on the exact legacy per-call window shared with model usage.
     assert.equal(variant.mixed.average_tps,usage.average_tps,`Exact /model-performance variant vs /model-usage average_tps parity: ${pair.provider.name}/${pair.model}`);
     assert.equal(variant.mixed.selected_request_count,usage.recent_sample_count);
-    assert.ok(variant.mixed.selected_request_count<=10,'Per-variant sampling keeps the latest-ten window');
+    assert.ok(variant.mixed.selected_request_count<=50,'Per-variant sampling keeps the latest-fifty window');
     assert.equal(item.mixed.selected_request_count,item.variants.reduce((n,entry)=>n+entry.mixed.selected_request_count,0),'Merged selected samples are the plain sum over declared variants');
     assert.equal(item.mixed.valid_tps_count,item.variants.reduce((n,entry)=>n+entry.mixed.valid_tps_count,0),'Merged valid samples are the plain sum over declared variants');
     assert.equal(item.untrusted_count,0,'Valid legacy logs must not be labeled untrusted');
@@ -581,7 +583,7 @@ try {
     report.usageComparisons.push({provider_id:pair.provider.id,model:pair.model,mixed:variant.mixed,merged:item.variants.length>1?item.mixed:undefined,usage});
   }
   const expected=expectedRows(snapshot,rowPairs);
-  check('exact legacy usage TPS parity for every pair; latest ten raw logs across statuses/versions/completion; retained old and MiniMax unknown logs valid; two variants merge into twenty samples',report.seed.database);
+  check('exact legacy usage TPS parity for every pair; latest fifty raw logs across statuses/versions/completion; retained old and MiniMax unknown logs valid; two variants merge into one hundred samples',report.seed.database);
 
   const browser = trackChild('chrome', chrome, ['--headless', '--no-sandbox', '--disable-gpu', '--disable-dev-shm-usage', '--disable-background-networking', '--no-first-run', '--no-default-browser-check', '--remote-debugging-port=0', `--user-data-dir=${join(scratch, 'chrome')}`, 'about:blank']);
   const ws = await waitFor(() => {
@@ -612,7 +614,7 @@ try {
     const targetModel=payload.models.find(model=>model.provider_id===pairs[1].provider.id && model.model_prefix===prefixOf(pairs[1]).toLowerCase());
     // 'overcount' fabricates more samples than the declared variants can hold: the
     // batch contract must still reject it, so the relaxed merged bound stays honest.
-    if(faultMode==='overcount') targetModel.mixed.selected_request_count=targetModel.variants.length*10+1;
+    if(faultMode==='overcount') targetModel.mixed.selected_request_count=targetModel.variants.length*50+1;
     if(['negative','zero','string','null','infinity'].includes(faultMode)) targetModel.mixed.average_tps=faultMode==='negative'?-5:faultMode==='zero'?0:faultMode==='string'?'NaN':null;
     if(faultMode==='null') Object.assign(targetModel.mixed,{valid_tps_count:0,first_sample_at:null,last_sample_at:null});
     const body=fail?{error:'Injected performance snapshot failure'}:{data:payload};
@@ -640,9 +642,9 @@ try {
     const row=await detailRow(pair);
     assert.ok(row[1].includes(`${statsFor(pair).average_tps.toFixed(1)} tok/s`) && row[4].includes('Plotted'),'Retained old/unknown logs plot with one-decimal TPS');
   }
-  // The merged row renders its summed samples and every variant, not a ten-sample cap.
+  // The merged row renders its summed samples and every variant, not a fifty-sample cap.
   const dualDetail=await detailRow(dual);
-  assert.ok(dualDetail[2].includes('20 / 20'),'Merged group shows twenty valid / twenty selected samples');
+  assert.ok(dualDetail[2].includes('100 / 100'),'Merged group shows one hundred valid / one hundred selected samples');
   assert.ok(dualDetail[1].includes('62/100') && dualDetail[1].includes('80.0 tok/s'),'Merged group keeps the shared score and weighted TPS');
   assert.ok(dualDetail[4].includes('Plotted') && dualDetail[4].includes('model/dual') && dualDetail[4].includes('model/dual-0813'),'Merged row lists both upstream variants');
   assert.equal((await evaluate(`[...document.querySelectorAll('[data-testid="performance-point"]')].some(el=>el.dataset.pointIds.includes(${literal(expected.find(row=>row.pair===dual).id)}))`)),true,'The merged group is plotted');

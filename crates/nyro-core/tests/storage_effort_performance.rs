@@ -86,7 +86,7 @@ async fn exercise(storage: &dyn Storage) -> anyhow::Result<()> {
     }))?).await?;
     let p = &provider.id;
     let mut rows = Vec::new();
-    // All efforts share one latest-ten sample window for the exact model.
+    // All efforts share one latest-fifty sample window for the exact model.
     for (index, tier) in ["low", "medium", "high", "xhigh", "max"].iter().enumerate() {
         for n in 0..12 {
             let mut e = entry(
@@ -104,7 +104,16 @@ async fn exercise(storage: &dyn Storage) -> anyhow::Result<()> {
             rows.push(e);
         }
     }
-    // Invalid samples consume latest10, and have null mean/ranges when all invalid.
+    // Window truncation: 55 valid rows sample only the latest fifty, so the five
+    // oldest (5000-token) calls must be evicted and the mean must stay 10 TPS.
+    for n in 0..55 {
+        let mut e = entry(p, "truncate", Some("high"), AS_OF - 200_000 + n);
+        if n < 5 {
+            e.usage.completion_tokens = 5000;
+        }
+        rows.push(e);
+    }
+    // Invalid samples consume latest-fifty slots too; only n=0 stays valid here.
     for n in 0..11 {
         let mut e = entry(p, "invalid", Some("low"), AS_OF - 100 + n);
         if n > 0 {
@@ -203,6 +212,7 @@ async fn exercise(storage: &dyn Storage) -> anyhow::Result<()> {
         "no-history",
         "MiniMax-M2.7",
         "old-only",
+        "truncate",
     ];
     let mut pairs: Vec<_> = models.iter().map(|m| (p.clone(), m.to_string())).collect();
     pairs.push((other_provider.clone(), "MiniMax-M2.7".into()));
@@ -225,19 +235,19 @@ async fn exercise(storage: &dyn Storage) -> anyhow::Result<()> {
     assert_eq!(stats[0].mixed.average_tps, Some(10.0));
     let serialized = serde_json::to_value(&stats[0])?;
     assert!(serialized.get("tiers").is_none());
-    assert_eq!(stats[0].mixed.selected_request_count, 10);
-    assert_eq!(stats[0].mixed.valid_tps_count, 1);
-    assert_eq!(stats[1].mixed.selected_request_count, 10);
-    assert_eq!(stats[1].mixed.valid_tps_count, 0);
-    assert_eq!(stats[1].mixed.average_tps, None);
-    assert_eq!(stats[1].mixed.first_sample_at, None);
-    assert_eq!(stats[1].mixed.last_sample_at, None);
+    assert_eq!(stats[0].mixed.selected_request_count, 50);
+    assert_eq!(stats[0].mixed.valid_tps_count, 12);
+    assert_eq!(stats[1].mixed.selected_request_count, 11);
+    assert_eq!(stats[1].mixed.valid_tps_count, 1);
+    assert_eq!(stats[1].mixed.average_tps, Some(10.0));
+    assert_eq!(stats[1].mixed.first_sample_at, Some(AS_OF - 100));
+    assert_eq!(stats[1].mixed.last_sample_at, Some(AS_OF - 100));
     assert_eq!(stats[2].mixed.selected_request_count, 4);
     assert_eq!(stats[2].mixed.valid_tps_count, 4);
     assert_eq!(stats[2].mixed.first_sample_at, Some(AS_OF - WEEK - 50_000));
     assert_eq!(stats[2].mixed.last_sample_at, Some(AS_OF + 1));
-    assert_eq!(stats[3].mixed.selected_request_count, 10);
-    assert_eq!(stats[3].mixed.valid_tps_count, 10);
+    assert_eq!(stats[3].mixed.selected_request_count, 11);
+    assert_eq!(stats[3].mixed.valid_tps_count, 11);
     assert_eq!(stats[4].mixed.selected_request_count, 5);
     assert_eq!(stats[4].mixed.valid_tps_count, 5);
     assert!((stats[4].mixed.average_tps.unwrap() - 64.0).abs() < 1e-9);
@@ -258,8 +268,15 @@ async fn exercise(storage: &dyn Storage) -> anyhow::Result<()> {
     assert_eq!(stats[10].mixed.selected_request_count, 1);
     assert_eq!(stats[10].mixed.valid_tps_count, 1);
     assert_eq!(stats[10].mixed.first_sample_at, Some(AS_OF - WEEK - 1234));
-    assert_eq!(stats[11].mixed.average_tps, Some(50.0));
-    assert_eq!(stats[11].mixed.selected_request_count, 1);
+    // Fifty-five retained calls truncate to the latest fifty: the five oldest
+    // 5000-token rows drop out, so the mean stays 10 TPS and the window starts at n=5.
+    assert_eq!(stats[11].mixed.selected_request_count, 50);
+    assert_eq!(stats[11].mixed.valid_tps_count, 50);
+    assert_eq!(stats[11].mixed.average_tps, Some(10.0));
+    assert_eq!(stats[11].mixed.first_sample_at, Some(AS_OF - 200_000 + 5));
+    assert_eq!(stats[11].mixed.last_sample_at, Some(AS_OF - 200_000 + 54));
+    assert_eq!(stats[12].mixed.average_tps, Some(50.0));
+    assert_eq!(stats[12].mixed.selected_request_count, 1);
     let page = storage
         .logs()
         .query(LogQuery {
@@ -317,7 +334,7 @@ async fn sqlite_performance_contract() -> anyhow::Result<()> {
 #[tokio::test]
 async fn sqlite_equal_created_at_uses_id_before_validation() -> anyhow::Result<()> {
     let storage = sqlite().await?;
-    for n in 0..11 {
+    for n in 0..55 {
         sqlx::query("INSERT INTO request_logs(id,created_at,provider_id,upstream_model,performance_metadata_version,request_completion,upstream_status_code,client_status_code,performance_completed_at,upstream_response_mode,performance_upstream_ms,latency_upstream_ms,output_tokens) VALUES (?,?,'p','tie',1,'completed',200,200,?,'buffered',1000,1000,?)")
             .bind(format!("tie-{n:02}")).bind(AS_OF).bind(AS_OF).bind(if n == 0 {100} else {0}).execute(storage.pool()).await?;
     }
@@ -325,7 +342,7 @@ async fn sqlite_equal_created_at_uses_id_before_validation() -> anyhow::Result<(
         .logs()
         .model_performance_stats(&[("p".into(), "tie".into())], AS_OF)
         .await?;
-    assert_eq!(result[0].mixed.selected_request_count, 10);
+    assert_eq!(result[0].mixed.selected_request_count, 50);
     assert_eq!(result[0].mixed.valid_tps_count, 0);
     let usage = storage.logs().model_usage_stats("p", "tie").await?;
     assert_eq!(result[0].mixed.average_tps, usage.average_tps);

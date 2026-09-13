@@ -155,6 +155,7 @@ export interface RequestLog {
   latency_upstream_ms?: number;
   input_tokens: number;
   output_tokens: number;
+  reasoning_tokens?: number;
   cache_read_tokens?: number;
 
   is_stream: boolean;
@@ -232,6 +233,7 @@ export interface ModelUsageStats {
   last_called_at?: number | null;
   recent_sample_count: number;
   average_tps?: number | null;
+  average_gross_tps?: number | null;
   average_first_token_ms?: number | null;
 }
 

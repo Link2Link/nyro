@@ -127,6 +127,12 @@ impl ResponseDecoder for ResponsesResponseParser {
             .and_then(Value::as_u64)
             .filter(|&v| v > 0)
             .map(|v| v as u32);
+        let output_details = usage_obj.and_then(|v| v.get("output_tokens_details"));
+        let reasoning = output_details
+            .and_then(|d| d.get("reasoning_tokens"))
+            .and_then(Value::as_u64)
+            .filter(|&v| v > 0)
+            .map(|v| v as u32);
         let usage = Usage {
             prompt_tokens: usage_obj
                 .and_then(|v| v.get("input_tokens"))
@@ -138,6 +144,7 @@ impl ResponseDecoder for ResponsesResponseParser {
                 .unwrap_or(0) as u32,
             cache_read_tokens: cache_read,
             cache_creation_tokens: cache_creation,
+            reasoning_tokens: reasoning,
             ..Usage::default()
         };
 

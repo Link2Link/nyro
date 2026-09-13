@@ -555,10 +555,22 @@ fn extract_usage(v: &Value) -> Usage {
         .or_else(|| u.get("cached_content_token_count").and_then(Value::as_u64))
         .or_else(|| u.get("cachedContentTokenCount").and_then(Value::as_u64));
 
+    let reasoning = u
+        .get("completion_tokens_details")
+        .and_then(|d| d.get("reasoning_tokens"))
+        .and_then(Value::as_u64)
+        .or_else(|| {
+            u.get("output_tokens_details")
+                .and_then(|d| d.get("reasoning_tokens"))
+                .and_then(Value::as_u64)
+        })
+        .or_else(|| u.get("reasoning_tokens").and_then(Value::as_u64));
+
     Usage {
         prompt_tokens: input as u32,
         completion_tokens: output as u32,
         cache_read_tokens: cache_read.map(|v| v as u32),
+        reasoning_tokens: reasoning.map(|v| v as u32),
         ..Usage::default()
     }
 }

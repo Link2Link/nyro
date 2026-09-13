@@ -43,13 +43,18 @@ fn aggregate_stats(variants: &[ModelPerformanceVariant]) -> (ModelPerformanceSta
     let mut unclassified_count = 0i64;
     let mut untrusted_count = 0i64;
     let mut tps_weighted = 0.0;
+    let mut gross_tps_weighted = 0.0;
     for variant in variants {
         stats.selected_request_count += variant.mixed.selected_request_count;
         stats.valid_tps_count += variant.mixed.valid_tps_count;
         if let Some(tps) = variant.mixed.average_tps {
             tps_weighted += tps * variant.mixed.valid_tps_count as f64;
         }
+        if let Some(gross) = variant.mixed.average_gross_tps {
+            gross_tps_weighted += gross * variant.mixed.valid_tps_count as f64;
+        }
         stats.total_output_tokens += variant.mixed.total_output_tokens;
+        stats.total_content_tokens += variant.mixed.total_content_tokens;
         stats.total_latency_ms += variant.mixed.total_latency_ms;
         unclassified_count += variant.unclassified_count;
         untrusted_count += variant.untrusted_count;
@@ -62,7 +67,11 @@ fn aggregate_stats(variants: &[ModelPerformanceVariant]) -> (ModelPerformanceSta
     stats.last_sample_at = variants.iter().filter_map(|v| v.mixed.last_sample_at).max();
     stats.average_tps =
         (stats.valid_tps_count > 0).then_some(tps_weighted / stats.valid_tps_count as f64);
-    stats.overall_tps = (stats.total_latency_ms > 0 && stats.total_output_tokens > 0)
+    stats.average_gross_tps =
+        (stats.valid_tps_count > 0).then_some(gross_tps_weighted / stats.valid_tps_count as f64);
+    stats.overall_tps = (stats.total_latency_ms > 0 && stats.total_content_tokens > 0)
+        .then(|| stats.total_content_tokens as f64 / (stats.total_latency_ms as f64 / 1000.0));
+    stats.overall_gross_tps = (stats.total_latency_ms > 0 && stats.total_output_tokens > 0)
         .then(|| stats.total_output_tokens as f64 / (stats.total_latency_ms as f64 / 1000.0));
     (stats, unclassified_count, untrusted_count)
 }
@@ -178,8 +187,11 @@ mod tests {
                 selected_request_count: count,
                 valid_tps_count: tps.map_or(0, |_| count),
                 average_tps: tps,
+                average_gross_tps: tps,
                 overall_tps: tps,
+                overall_gross_tps: tps,
                 total_output_tokens: tps.map_or(0, |_| count * 100),
+                total_content_tokens: tps.map_or(0, |_| count * 100),
                 total_latency_ms: tps.map_or(0, |v| {
                     if v > 0.0 {
                         (count as f64 * 100.0 / v * 1000.0) as i64

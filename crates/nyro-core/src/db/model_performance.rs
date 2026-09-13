@@ -6,8 +6,11 @@ pub struct ModelPerformanceStats {
     pub selected_request_count: i64,
     pub valid_tps_count: i64,
     pub average_tps: Option<f64>,
+    pub average_gross_tps: Option<f64>,
     pub overall_tps: Option<f64>,
+    pub overall_gross_tps: Option<f64>,
     pub total_output_tokens: i64,
+    pub total_content_tokens: i64,
     pub total_latency_ms: i64,
     pub first_sample_at: Option<i64>,
     pub last_sample_at: Option<i64>,
@@ -36,12 +39,18 @@ impl ModelPerformanceStats {
             ..Default::default()
         };
         let mut tps_total = 0.0;
+        let mut gross_tps_total = 0.0;
+        let mut gross_tps_count = 0;
         for row in rows {
             let Some(tps) = row.performance.tps() else {
                 continue;
             };
             tps_total += tps;
             stats.valid_tps_count += 1;
+            if let Some(gross) = row.performance.gross_tps() {
+                gross_tps_total += gross;
+                gross_tps_count += 1;
+            }
             let at = row.created_at;
             stats.first_sample_at = Some(stats.first_sample_at.map_or(at, |old| old.min(at)));
             stats.last_sample_at = Some(stats.last_sample_at.map_or(at, |old| old.max(at)));
@@ -52,20 +61,25 @@ impl ModelPerformanceStats {
             {
                 if latency > 0 && row.performance.output_tokens > 0 {
                     stats.total_output_tokens += row.performance.output_tokens as i64;
+                    stats.total_content_tokens += row.performance.content_tokens() as i64;
                     stats.total_latency_ms += latency;
                 }
             }
         }
         stats.average_tps =
             (stats.valid_tps_count > 0).then_some(tps_total / stats.valid_tps_count as f64);
-        stats.overall_tps = (stats.total_latency_ms > 0 && stats.total_output_tokens > 0)
+        stats.average_gross_tps =
+            (gross_tps_count > 0).then_some(gross_tps_total / gross_tps_count as f64);
+        stats.overall_tps = (stats.total_latency_ms > 0 && stats.total_content_tokens > 0)
+            .then(|| stats.total_content_tokens as f64 / (stats.total_latency_ms as f64 / 1000.0));
+        stats.overall_gross_tps = (stats.total_latency_ms > 0 && stats.total_output_tokens > 0)
             .then(|| stats.total_output_tokens as f64 / (stats.total_latency_ms as f64 / 1000.0));
         stats
     }
 }
 
 // Keep ordering and raw scalar selection aligned with model_usage_stats. Invalid
-// rows consume the latest-ten window; completion metadata remains diagnostic only.
+// rows consume the latest-fifty window; completion metadata remains diagnostic only.
 macro_rules! model_performance_method {
     ($this:expr, $pairs:expr, $as_of:expr, $database:ty, $model_column:expr, $timestamp_cast:expr, $stream_default:expr) => {{
             let pairs = $pairs;
@@ -73,10 +87,11 @@ macro_rules! model_performance_method {
             let mut result = Vec::with_capacity(pairs.len());
             for (provider, model) in pairs {
                 let mut sql = sqlx::QueryBuilder::<$database>::new("SELECT ");
-                sql.push($timestamp_cast).push(" AS created_at, COALESCE(output_tokens, 0) AS output_tokens, COALESCE(is_stream, ");
+                sql.push($timestamp_cast).push(" AS created_at, COALESCE(output_tokens, 0) AS output_tokens, COALESCE(reasoning_tokens, 0) AS reasoning_tokens, COALESCE(is_stream, ");
                 sql.push($stream_default).push(") AS is_stream, COALESCE(stream_chunks_count, 0) AS stream_chunks_count, latency_upstream_ms, latency_total_ms, stream_first_chunk_ms FROM request_logs WHERE provider_id = ");
                 sql.push_bind(provider).push(" AND ").push($model_column).push(" = ").push_bind(model);
-                sql.push(" ORDER BY request_logs.created_at DESC, id DESC LIMIT 10");
+                sql.push(" ORDER BY request_logs.created_at DESC, id DESC LIMIT ");
+                sql.push_bind(crate::db::models::RECENT_SAMPLE_LIMIT);
                 let rows = sql.build_query_as::<crate::db::model_performance::PerformanceSample>().fetch_all(&$this.pool).await?;
                 result.push(crate::db::PairPerformanceStats {
                     provider_id: provider.clone(),

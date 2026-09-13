@@ -251,7 +251,8 @@ and loss-accounting semantics.
 | `latency_total_ms` | INTEGER | NULL | 总延迟（毫秒） |
 | `latency_upstream_ms` | INTEGER | NULL | 上游延迟（毫秒） |
 | `input_tokens` | INTEGER | `0` | 输入 token 数 |
-| `output_tokens` | INTEGER | `0` | 输出 token 数 |
+| `output_tokens` | INTEGER | `0` | 输出 token 数（含思考 token） |
+| `reasoning_tokens` | INTEGER | `0` | 思考/推理 token 数（output_tokens 的子集） |
 | `cache_read_tokens` | INTEGER | `0` | 缓存命中 token 数 |
 | `is_stream` | INTEGER | `0` | 是否为流式请求 |
 | `stream_chunks_count` | INTEGER | `0` | 流式分块数量 |
@@ -321,7 +322,7 @@ Bounded recovery may inspect retained final upstream request bodies from the las
 existing requests can populate performance charts.
 
 The Performance query now shares the model-usage TPS helper and samples the latest
-ten retained calls for each exact provider/model, ordered by `created_at DESC, id DESC`.
+fifty retained calls for each exact provider/model, ordered by `created_at DESC, id DESC`.
 There is no additional seven-day, completion, status, effort, or metadata-version filter.
 It reads the existing `output_tokens`, stream/chunk flags, `latency_upstream_ms`,
 `latency_total_ms`, and `stream_first_chunk_ms`, not the `performance_*` evidence timings.

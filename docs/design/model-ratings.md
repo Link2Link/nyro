@@ -182,17 +182,17 @@ orientation tolerance, never one-decimal display values.
 
 A group is one rated prefix at one provider. `variants` lists the distinct upstream
 model names that matched the prefix, each with its own `mixed` sampled from that
-variant's latest ten retained calls. The group's `mixed` is the sample-weighted merge
-of its variants: counts are sums that legitimately exceed ten (up to ten per variant),
+variant's latest fifty retained calls. The group's `mixed` is the sample-weighted merge
+of its variants: counts are sums that legitimately exceed fifty (up to fifty per variant),
 timestamps span the merged window, and a group with no usable TPS keeps a null average.
 
-Performance uses the **same latest-ten retained-call sampling and TPS calculation as
+Performance uses the **same latest-fifty retained-call sampling and TPS calculation as
 model usage statistics**, not a separate completion-qualified metric. There is no
 additional seven-day, HTTP-status, completion-state, reasoning-effort, or metadata-version
 filter. `window_start` is null; `as_of` describes when the response was fetched.
 Unknown completion (including MiniMax responses whose terminal is not recognized)
 does not invalidate usable output-token and timing data. Invalid TPS samples among
-the selected ten are not replaced with older requests.
+the selected fifty are not replaced with older requests.
 
 The backend shares its per-request TPS helper with model usage: streaming is detected
 by the stream flag or observed chunks; generation time normally subtracts the first

@@ -4,8 +4,11 @@ export interface PerformanceStats {
   selected_request_count: number;
   valid_tps_count: number;
   average_tps: number | null;
+  average_gross_tps?: number | null;
   overall_tps?: number | null;
+  overall_gross_tps?: number | null;
   total_output_tokens?: number;
+  total_content_tokens?: number;
   total_latency_ms?: number;
   first_sample_at: number | null;
   last_sample_at: number | null;
@@ -28,8 +31,8 @@ export interface ModelPerformanceItem {
   untrusted_count: number;
 }
 export interface PerformanceResponse { as_of: number; window_start: number | null; models: ModelPerformanceItem[] }
-/** The backend retains at most ten calls per upstream variant. */
-const PERFORMANCE_SAMPLE_LIMIT = 10;
+/** The backend retains at most fifty calls per upstream variant. */
+const PERFORMANCE_SAMPLE_LIMIT = 50;
 const count = (value: unknown) => typeof value === "number" && Number.isInteger(value) && value >= 0;
 const finite = (value: unknown) => typeof value === "number" && Number.isFinite(value);
 /** A group's merged statistics sum its variants, so their bound is not the per-variant one. */

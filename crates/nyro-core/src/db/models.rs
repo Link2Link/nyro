@@ -12,6 +12,9 @@ pub fn default_provider_auth_mode() -> String {
     "apikey".to_string()
 }
 
+/// Per-variant retained-log sample window shared by performance and usage statistics.
+pub const RECENT_SAMPLE_LIMIT: i32 = 50;
+
 pub const PROVIDER_PROTOCOL_MODE_FIXED: &str = "fixed";
 pub const PROVIDER_PROTOCOL_MODE_ADAPTIVE: &str = "adaptive";
 
@@ -506,6 +509,8 @@ pub struct RequestLog {
     pub output_tokens: i32,
     #[serde(default)]
     pub cache_read_tokens: i32,
+    #[serde(default)]
+    pub reasoning_tokens: i32,
 
     pub is_stream: bool,
     pub stream_chunks_count: i32,
@@ -784,6 +789,8 @@ pub struct ModelUsageTotals {
 #[derive(Debug, Clone, FromRow)]
 pub struct RecentModelPerformance {
     pub output_tokens: i32,
+    #[sqlx(default)]
+    pub reasoning_tokens: i32,
     pub is_stream: bool,
     pub stream_chunks_count: i32,
     pub latency_upstream_ms: Option<i64>,
@@ -792,10 +799,14 @@ pub struct RecentModelPerformance {
 }
 
 impl RecentModelPerformance {
-    /// The legacy request-log TPS formula, shared by usage and performance views.
-    pub fn tps(&self) -> Option<f64> {
+    /// Net content tokens excluding reasoning / thinking tokens.
+    pub fn content_tokens(&self) -> i32 {
+        self.output_tokens.saturating_sub(self.reasoning_tokens).max(0)
+    }
+
+    pub fn generation_ms(&self) -> Option<i64> {
         let is_stream = self.is_stream || self.stream_chunks_count > 0;
-        let generation_ms = match (
+        match (
             is_stream,
             self.latency_upstream_ms,
             self.stream_first_chunk_ms,
@@ -812,10 +823,25 @@ impl RecentModelPerformance {
                 })
             }
             _ => self.latency_upstream_ms.or(self.latency_total_ms),
-        };
+        }
+    }
+
+    /// Effective content TPS (primary metric): content tokens / generation time.
+    pub fn tps(&self) -> Option<f64> {
+        let content = self.content_tokens();
+        if content > 0 {
+            if let Some(gen_ms) = self.generation_ms().filter(|v| *v > 0) {
+                return Some(content as f64 / (gen_ms as f64 / 1000.0));
+            }
+        }
+        None
+    }
+
+    /// Gross TPS (secondary metric): total output tokens (incl. reasoning) / generation time.
+    pub fn gross_tps(&self) -> Option<f64> {
         if self.output_tokens > 0 {
-            if let Some(generation_ms) = generation_ms.filter(|value| *value > 0) {
-                return Some(self.output_tokens as f64 / (generation_ms as f64 / 1000.0));
+            if let Some(gen_ms) = self.generation_ms().filter(|v| *v > 0) {
+                return Some(self.output_tokens as f64 / (gen_ms as f64 / 1000.0));
             }
         }
         None
@@ -831,6 +857,7 @@ pub struct ModelUsageStats {
     pub last_called_at: Option<i64>,
     pub recent_sample_count: i64,
     pub average_tps: Option<f64>,
+    pub average_gross_tps: Option<f64>,
     pub average_first_token_ms: Option<f64>,
 }
 
@@ -838,6 +865,8 @@ impl ModelUsageStats {
     pub fn from_samples(totals: ModelUsageTotals, samples: &[RecentModelPerformance]) -> Self {
         let mut tps_total = 0.0;
         let mut tps_count = 0;
+        let mut gross_tps_total = 0.0;
+        let mut gross_tps_count = 0;
         let mut first_token_total = 0.0;
         let mut first_token_count = 0;
 
@@ -845,6 +874,10 @@ impl ModelUsageStats {
             if let Some(tps) = sample.tps() {
                 tps_total += tps;
                 tps_count += 1;
+            }
+            if let Some(gross) = sample.gross_tps() {
+                gross_tps_total += gross;
+                gross_tps_count += 1;
             }
             if let Some(first_token_ms) = sample.stream_first_chunk_ms.filter(|value| *value >= 0) {
                 first_token_total += first_token_ms as f64;
@@ -860,6 +893,7 @@ impl ModelUsageStats {
             last_called_at: totals.last_called_at,
             recent_sample_count: samples.len() as i64,
             average_tps: (tps_count > 0).then_some(tps_total / tps_count as f64),
+            average_gross_tps: (gross_tps_count > 0).then_some(gross_tps_total / gross_tps_count as f64),
             average_first_token_ms: (first_token_count > 0)
                 .then_some(first_token_total / first_token_count as f64),
         }
@@ -882,6 +916,7 @@ mod model_usage_stats_tests {
         let samples = vec![
             RecentModelPerformance {
                 output_tokens: 100,
+                reasoning_tokens: 0,
                 is_stream: true,
                 stream_chunks_count: 10,
                 latency_upstream_ms: Some(2_000),
@@ -890,6 +925,7 @@ mod model_usage_stats_tests {
             },
             RecentModelPerformance {
                 output_tokens: 50,
+                reasoning_tokens: 0,
                 is_stream: false,
                 stream_chunks_count: 0,
                 latency_upstream_ms: Some(1_000),
@@ -903,7 +939,26 @@ mod model_usage_stats_tests {
         assert_eq!(stats.request_count, 12);
         assert_eq!(stats.recent_sample_count, 2);
         assert!((stats.average_tps.unwrap() - 58.333).abs() < 0.01);
+        assert!((stats.average_gross_tps.unwrap() - 58.333).abs() < 0.01);
         assert_eq!(stats.average_first_token_ms, Some(500.0));
+    }
+
+    #[test]
+    fn effective_tps_excludes_reasoning_tokens() {
+        let sample = RecentModelPerformance {
+            output_tokens: 100,
+            reasoning_tokens: 80,
+            is_stream: true,
+            stream_chunks_count: 10,
+            latency_upstream_ms: Some(1_500),
+            latency_total_ms: Some(1_600),
+            stream_first_chunk_ms: Some(500),
+        };
+        // generation_ms = 1500 - 500 = 1000ms = 1.0s
+        // content_tokens = 100 - 80 = 20
+        assert_eq!(sample.content_tokens(), 20);
+        assert_eq!(sample.tps(), Some(20.0));
+        assert_eq!(sample.gross_tps(), Some(100.0));
     }
 }
 

@@ -905,6 +905,7 @@ fn extract_gemini_usage(v: &Value) -> Usage {
         completion_tokens: output as u32,
         total_tokens: total.unwrap_or(input.saturating_add(output)) as u32,
         cache_read_tokens: cache_read.map(|v| v as u32),
+        reasoning_tokens: (thoughts > 0).then_some(thoughts as u32),
         ..Usage::default()
     }
 }

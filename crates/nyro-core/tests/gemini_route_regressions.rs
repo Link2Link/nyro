@@ -15,7 +15,7 @@ use std::{
 use axum::{
     Json, Router,
     extract::State,
-    http::{HeaderMap, StatusCode, Uri},
+    http::{HeaderMap, HeaderValue, StatusCode, Uri},
     response::{IntoResponse, Response},
     routing::post,
 };
@@ -46,6 +46,7 @@ enum Reply {
     ParallelCalls,
     InvalidCall,
     ConflictingCall,
+    SignedSameName,
 }
 
 #[derive(Debug, Clone)]
@@ -59,6 +60,21 @@ struct Seen {
 struct Upstream {
     seen: Arc<Mutex<Vec<Seen>>>,
     reply: Reply,
+    /// Scripted per-request replies: each upstream hit pops the front; the
+    /// base `reply` keeps serving any request beyond the script. Existing
+    /// single-reply fixtures are unaffected.
+    script: Arc<Mutex<Vec<Reply>>>,
+}
+
+impl Upstream {
+    fn next_reply(&self) -> Reply {
+        let mut script = self.script.lock().unwrap();
+        if script.is_empty() {
+            self.reply
+        } else {
+            script.remove(0)
+        }
+    }
 }
 
 fn text_reply() -> Value {
@@ -85,7 +101,8 @@ async fn upstream_handler(
         .lock()
         .unwrap()
         .push(Seen { uri, headers, body });
-    match upstream.reply {
+    let reply = upstream.next_reply();
+    match reply {
         Reply::Text => Json(text_reply()).into_response(),
         Reply::ParallelCalls => {
             // Neither call has a provider ID. Both occupy candidate 0 but need
@@ -114,7 +131,7 @@ async fn upstream_handler(
                     {"functionCall": {"id": "upstream-call-1", "name": "lookup_weather", "args": {"city": "Paris"}}}
                 ]}}]
             });
-            let invalid_call = match upstream.reply {
+            let invalid_call = match reply {
                 // Syntactically valid JSON, but args is a fragment string rather
                 // than a complete argument object; the native parser rejects it.
                 Reply::InvalidCall => json!({"name": "lookup_weather", "args": "{\"city\":"}),
@@ -130,12 +147,34 @@ async fn upstream_handler(
                 ]}}]
             });
             let terminal = json!({"candidates": [{"index": 0, "finishReason": "STOP"}]});
-            let prefix = if matches!(upstream.reply, Reply::ConflictingCall) {
+            let prefix = if matches!(reply, Reply::ConflictingCall) {
                 format!("data: {valid}\n\n")
             } else {
                 String::new()
             };
             let wire = format!("{prefix}data: {invalid}\n\ndata: {terminal}\n\n");
+            ([("content-type", "text/event-stream")], wire).into_response()
+        }
+        Reply::SignedSameName => {
+            // Two calls to the SAME function with different args and distinct
+            // thought signatures; neither carries a provider id.
+            let calls = json!({
+                "responseId": "gemini-signed-same-name",
+                "modelVersion": UPSTREAM_MODEL,
+                "candidates": [{
+                    "index": 0,
+                    "content": {"role": "model", "parts": [
+                        {"functionCall": {"name": "lookup_weather", "args": {"city": "Paris"}}, "thoughtSignature": "sig-paris"},
+                        {"functionCall": {"name": "lookup_weather", "args": {"city": "Tokyo"}}, "thoughtSignature": "sig-tokyo"}
+                    ]}
+                }],
+                "usageMetadata": {"promptTokenCount": 3, "candidatesTokenCount": 4, "totalTokenCount": 7}
+            });
+            let terminal = json!({
+                "candidates": [{"index": 0, "finishReason": "STOP"}],
+                "usageMetadata": {"promptTokenCount": 3, "candidatesTokenCount": 6, "totalTokenCount": 9}
+            });
+            let wire = format!("data: {calls}\n\ndata: {terminal}\n\n");
             ([("content-type", "text/event-stream")], wire).into_response()
         }
     }
@@ -258,6 +297,7 @@ impl Fixture {
             upstream: Upstream {
                 seen: Arc::new(Mutex::new(Vec::new())),
                 reply,
+                script: Arc::new(Mutex::new(Vec::new())),
             },
             _dir: dir,
         })
@@ -281,6 +321,26 @@ impl Fixture {
             "expected exactly one local upstream attempt: {seen:?}"
         );
         seen[0].clone()
+    }
+
+    /// Queue per-request upstream replies (each hit pops the front; the base
+    /// reply serves any extra request).
+    fn with_script(self, script: Vec<Reply>) -> Self {
+        *self.upstream.script.lock().unwrap() = script;
+        self
+    }
+
+    fn request_count(&self) -> usize {
+        self.upstream.seen.lock().unwrap().len()
+    }
+
+    fn request_at(&self, index: usize) -> Seen {
+        let seen = self.upstream.seen.lock().unwrap();
+        assert!(
+            index < seen.len(),
+            "missing local upstream request {index}: {seen:?}"
+        );
+        seen[index].clone()
     }
 }
 
@@ -332,6 +392,199 @@ async fn dispatch_outcome(
     .await??;
     let wire = String::from_utf8(bytes.to_vec())?;
     Ok((status, wire))
+}
+
+/// Real client-provided session identity header recognized by compat session
+/// extraction, so both rounds share one Gemini shadow session through the
+/// gateway's long-lived compat engine.
+fn session_headers(session: &str) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        "x-claude-code-session-id",
+        HeaderValue::from_str(session).unwrap(),
+    );
+    headers
+}
+
+/// dispatch_pipeline with caller-supplied headers: the ingress HeaderMap the
+/// compat resolver reads the session identity from.
+async fn dispatch_with_headers(
+    gateway: &Gateway,
+    body: Value,
+    headers: HeaderMap,
+) -> anyhow::Result<String> {
+    let request = ANTHROPIC_MESSAGES_2023_06_01
+        .handler()
+        .make_request_decoder()
+        .decode_request(body.clone())?;
+    let response = tokio::time::timeout(
+        TIMEOUT,
+        dispatch_pipeline(
+            gateway.clone(),
+            headers,
+            RawEnvelope::new(Some(body), HashMap::new(), "POST", "/v1/messages"),
+            request,
+            ANTHROPIC_MESSAGES_2023_06_01,
+            RequestContext::new(ANTHROPIC_MESSAGES_2023_06_01, TIMEOUT),
+        ),
+    )
+    .await?;
+    let status = response.status();
+    let bytes = tokio::time::timeout(
+        TIMEOUT,
+        axum::body::to_bytes(response.into_body(), 1024 * 1024),
+    )
+    .await??;
+    let wire = String::from_utf8(bytes.to_vec())?;
+    assert_eq!(status, StatusCode::OK, "dispatch failed: {wire}");
+    Ok(wire)
+}
+
+fn weather_tools() -> Value {
+    json!([
+        {"name": "lookup_weather", "description": "Weather", "input_schema": {
+            "type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]
+        }},
+        {"name": "lookup_time", "description": "Time", "input_schema": {
+            "type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]
+        }}
+    ])
+}
+
+/// Round-1 request, `stream` parameterized (streaming is the recommended and
+/// exercised path).
+fn anthropic_first_round(stream: bool) -> Value {
+    json!({
+        "model": CLIENT_MODEL,
+        "max_tokens": 64,
+        "stream": stream,
+        "messages": [{"role": "user", "content": "Check the weather in Paris and Tokyo."}],
+        "tools": weather_tools()
+    })
+}
+
+/// A tool_use block the client echoes back, exactly as round 1 delivered it
+/// (id parsed from the real client SSE, never fabricated by the test).
+fn tool_use_block(id: &str, name: &str, input: Value) -> Value {
+    json!({"type": "tool_use", "id": id, "name": name, "input": input})
+}
+
+fn tool_result_block(id: &str, content: &str) -> Value {
+    json!({"type": "tool_result", "tool_use_id": id, "content": content})
+}
+
+/// Structured summary of the Anthropic SSE the client received in round 1.
+struct RoundOneSummary {
+    /// (id, name, parsed input) per tool_use block, in content-block order.
+    calls: Vec<(String, String, Value)>,
+    stop_reason: Option<String>,
+    message_stop_count: usize,
+    error_events: Vec<String>,
+}
+
+fn summarize_round_one(wire: &str) -> anyhow::Result<RoundOneSummary> {
+    let mut indexed: BTreeMap<u64, (String, String, String)> = BTreeMap::new();
+    let mut stop_reason = None;
+    let mut message_stop_count = 0usize;
+    let mut error_events = Vec::new();
+    for data in wire.lines().filter_map(|line| line.strip_prefix("data: ")) {
+        let event: Value = serde_json::from_str(data)?;
+        match event["type"].as_str().unwrap_or_default() {
+            "content_block_start" => {
+                if event["content_block"]["type"] == "tool_use" {
+                    let index = event["index"].as_u64().expect("tool_use index");
+                    let entry = (
+                        event["content_block"]["id"]
+                            .as_str()
+                            .expect("tool_use id")
+                            .to_string(),
+                        event["content_block"]["name"]
+                            .as_str()
+                            .expect("tool_use name")
+                            .to_string(),
+                        String::new(),
+                    );
+                    let previous = indexed.insert(index, entry);
+                    assert!(
+                        previous.is_none(),
+                        "duplicate tool_use content_block_start for index {index}: {wire}"
+                    );
+                }
+            }
+            "content_block_delta" => {
+                if event["delta"]["type"] == "input_json_delta" {
+                    let index = event["index"].as_u64().expect("delta index");
+                    let (_, _, arguments) = indexed
+                        .get_mut(&index)
+                        .expect("input_json_delta without a tool_use start");
+                    arguments.push_str(
+                        event["delta"]["partial_json"]
+                            .as_str()
+                            .expect("partial_json string"),
+                    );
+                }
+            }
+            "message_delta" => {
+                stop_reason = event["delta"]["stop_reason"].as_str().map(str::to_string);
+            }
+            "message_stop" => message_stop_count += 1,
+            "error" => error_events.push(event.to_string()),
+            _ => {}
+        }
+    }
+    let calls = indexed
+        .into_iter()
+        .map(|(index, (id, name, arguments))| {
+            let input: Value = serde_json::from_str(&arguments).unwrap_or_else(|_| {
+                panic!("round-1 tool_use[{index}] args are not JSON: {arguments}")
+            });
+            (id, name, input)
+        })
+        .collect();
+    Ok(RoundOneSummary {
+        calls,
+        stop_reason,
+        message_stop_count,
+        error_events,
+    })
+}
+
+/// All parts carrying a `functionCall` inside model-role contents of an
+/// upstream body, in wire order. Returns the whole part (the shadow replay
+/// keeps `thoughtSignature` as a sibling of `functionCall`), never just the
+/// `functionCall` object.
+fn upstream_function_call_parts(body: &Value) -> Vec<&Value> {
+    body["contents"]
+        .as_array()
+        .expect("Gemini contents")
+        .iter()
+        .filter(|content| content["role"] == "model")
+        .flat_map(|content| content["parts"].as_array().expect("Gemini parts"))
+        .filter(|part| part.get("functionCall").is_some())
+        .collect()
+}
+
+/// All `functionResponse` parts inside user-role contents, in wire order.
+fn upstream_function_responses(body: &Value) -> Vec<&Value> {
+    body["contents"]
+        .as_array()
+        .expect("Gemini contents")
+        .iter()
+        .filter(|content| content["role"] == "user")
+        .flat_map(|content| content["parts"].as_array().expect("Gemini parts"))
+        .filter_map(|part| part.get("functionResponse"))
+        .collect()
+}
+
+/// Neither client-facing (synthesized) id may appear anywhere upstream.
+fn assert_no_client_ids_leak(body: &Value, ids: &[&str]) {
+    let raw = serde_json::to_string(body).expect("serialize upstream body");
+    for id in ids {
+        assert!(
+            !raw.contains(id),
+            "client-facing id `{id}` leaked upstream: {raw}"
+        );
+    }
 }
 
 fn local_ref_schema() -> Value {
@@ -745,6 +998,235 @@ fn chat_to_vertex_native_uses_fake_bearer_and_shared_gemini_name_schema_encoding
         let response: Value = serde_json::from_str(&wire)?;
         assert_eq!(response["choices"][0]["message"]["content"], "local reply");
         assert_eq!(response["choices"][0]["finish_reason"], "stop");
+        Ok(())
+    })
+}
+#[test]
+fn anthropic_to_gemini_same_name_signed_replay_full_history_two_rounds() -> anyhow::Result<()> {
+    // Round 1 streams two SAME-name no-id calls with distinct thought
+    // signatures; round 2 replays the full history non-streaming with results
+    // in call order, through the same gateway engine and session header.
+    let mut fixture =
+        Fixture::new("google", Reply::Text)?.with_script(vec![Reply::SignedSameName, Reply::Text]);
+    runtime()?.block_on(async {
+        let _server = fixture.start()?;
+        let headers = session_headers("route-same-name-session");
+        let wire = dispatch_with_headers(
+            &fixture.gateway,
+            anthropic_first_round(true),
+            headers.clone(),
+        )
+        .await?;
+        let seen = fixture.request_at(0);
+        assert_eq!(
+            seen.uri.path(),
+            format!("/v1beta/models/{UPSTREAM_MODEL}:streamGenerateContent")
+        );
+        assert!(seen.uri.query().unwrap_or_default().contains("alt=sse"));
+
+        let summary = summarize_round_one(&wire)?;
+        assert!(summary.error_events.is_empty(), "round 1 errored: {wire}");
+        assert_eq!(
+            summary.message_stop_count, 1,
+            "round 1 must end once: {wire}"
+        );
+        assert_eq!(
+            summary.stop_reason.as_deref(),
+            Some("tool_use"),
+            "round 1 stop: {wire}"
+        );
+        assert_eq!(summary.calls.len(), 2, "two parallel calls: {wire}");
+        let (paris_id, paris_name, paris_args) = &summary.calls[0];
+        let (tokyo_id, tokyo_name, tokyo_args) = &summary.calls[1];
+        // Same name, different args, independently synthesized non-empty ids.
+        assert_eq!(paris_name, "lookup_weather");
+        assert_eq!(tokyo_name, "lookup_weather");
+        assert_eq!(paris_args, &json!({"city": "Paris"}));
+        assert_eq!(tokyo_args, &json!({"city": "Tokyo"}));
+        assert!(
+            !paris_id.is_empty() && !tokyo_id.is_empty() && paris_id != tokyo_id,
+            "ids must be distinct and non-empty: {wire}"
+        );
+
+        let body = json!({
+            "model": CLIENT_MODEL,
+            "max_tokens": 64,
+            "stream": false,
+            "messages": [
+                {"role": "user", "content": "Check the weather in Paris and Tokyo."},
+                {"role": "assistant", "content": [
+                    tool_use_block(paris_id, paris_name, paris_args.clone()),
+                    tool_use_block(tokyo_id, tokyo_name, tokyo_args.clone())
+                ]},
+                {"role": "user", "content": [
+                    tool_result_block(paris_id, "sunny"),
+                    tool_result_block(tokyo_id, "09:00")
+                ]}
+            ],
+            "tools": weather_tools()
+        });
+        let response = dispatch_with_headers(&fixture.gateway, body, headers).await?;
+        assert_eq!(fixture.request_count(), 2);
+
+        let seen = fixture.request_at(1);
+        assert_eq!(
+            seen.uri.path(),
+            format!("/v1beta/models/{UPSTREAM_MODEL}:generateContent")
+        );
+        // Full history is forwarded as-is: user / model / user, with the
+        // original user text surviving verbatim.
+        let contents = seen.body["contents"].as_array().expect("Gemini contents");
+        assert_eq!(
+            contents.len(),
+            3,
+            "full history must keep 3 turns: {}",
+            seen.body
+        );
+        assert_eq!(contents[0]["role"], "user");
+        assert_eq!(contents[1]["role"], "model");
+        assert_eq!(contents[2]["role"], "user");
+        assert_eq!(
+            contents[0]["parts"][0]["text"], "Check the weather in Paris and Tokyo.",
+            "original user text must survive verbatim: {}",
+            seen.body
+        );
+        // The assistant turn is replayed from shadow state, parts verbatim:
+        // original args and per-call thought signatures (part-level, sibling
+        // of functionCall) survive, while ids are stripped upstream.
+        let calls = upstream_function_call_parts(&seen.body);
+        assert_eq!(calls.len(), 2, "assistant calls lost: {}", seen.body);
+        assert_eq!(calls[0]["functionCall"]["name"], "lookup_weather");
+        assert_eq!(calls[0]["functionCall"]["args"], json!({"city": "Paris"}));
+        assert_eq!(calls[0]["thoughtSignature"], "sig-paris");
+        assert_eq!(calls[1]["functionCall"]["args"], json!({"city": "Tokyo"}));
+        assert_eq!(calls[1]["thoughtSignature"], "sig-tokyo");
+        for part in &calls {
+            assert!(
+                part["functionCall"].get("id").is_none(),
+                "id must be stripped: {}",
+                seen.body
+            );
+        }
+        let responses = upstream_function_responses(&seen.body);
+        assert_eq!(responses.len(), 2, "tool results lost: {}", seen.body);
+        assert_eq!(responses[0]["name"], "lookup_weather");
+        assert_eq!(responses[0]["response"]["content"], "sunny");
+        assert_eq!(responses[1]["name"], "lookup_weather");
+        assert_eq!(responses[1]["response"]["content"], "09:00");
+        for response in &responses {
+            assert!(
+                response.get("id").is_none(),
+                "id must be stripped: {}",
+                seen.body
+            );
+        }
+        assert_no_client_ids_leak(&seen.body, &[paris_id, tokyo_id]);
+
+        let message: Value = serde_json::from_str(&response)?;
+        assert_eq!(message["type"], "message");
+        assert_eq!(message["content"][0]["text"], "local reply");
+        assert_eq!(message["stop_reason"], "end_turn");
+        Ok(())
+    })
+}
+#[test]
+fn anthropic_to_gemini_different_name_out_of_order_trimmed_keeps_assistant() -> anyhow::Result<()> {
+    // Round 1 streams two DIFFERENT-name no-id calls; round 2 sends a trimmed
+    // history (the original user prefix is dropped, the current assistant
+    // tool_use round is kept) with deliberately reversed tool_results. The
+    // verifiable correlation contract for this case is name/result pairing:
+    // each functionResponse must carry the name of the tool its tool_use_id
+    // resolved to, with the matching result content, while client-facing ids
+    // are stripped. (Positional alignment upstream is not asserted: with ids
+    // stripped it is not observable.)
+    let mut fixture =
+        Fixture::new("google", Reply::Text)?.with_script(vec![Reply::ParallelCalls, Reply::Text]);
+    runtime()?.block_on(async {
+        let _server = fixture.start()?;
+        let headers = session_headers("route-out-of-order-session");
+        let wire = dispatch_with_headers(
+            &fixture.gateway,
+            anthropic_first_round(true),
+            headers.clone(),
+        )
+        .await?;
+        let summary = summarize_round_one(&wire)?;
+        assert!(summary.error_events.is_empty(), "round 1 errored: {wire}");
+        assert_eq!(summary.calls.len(), 2, "two parallel calls: {wire}");
+        let (weather_id, weather_name, weather_args) = &summary.calls[0];
+        let (time_id, time_name, time_args) = &summary.calls[1];
+        assert_eq!(weather_name, "lookup_weather");
+        assert_eq!(time_name, "lookup_time");
+        assert_eq!(weather_args, &json!({"city": "Paris"}));
+        assert_eq!(time_args, &json!({"city": "Tokyo"}));
+        assert_ne!(weather_id, time_id, "ids must be distinct: {wire}");
+
+        let body = json!({
+            "model": CLIENT_MODEL,
+            "max_tokens": 64,
+            "stream": false,
+            "messages": [
+                {"role": "assistant", "content": [
+                    tool_use_block(weather_id, weather_name, weather_args.clone()),
+                    tool_use_block(time_id, time_name, time_args.clone())
+                ]},
+                {"role": "user", "content": [
+                    tool_result_block(time_id, "09:00"),
+                    tool_result_block(weather_id, "sunny")
+                ]}
+            ],
+            "tools": weather_tools()
+        });
+        let response = dispatch_with_headers(&fixture.gateway, body, headers).await?;
+        assert_eq!(fixture.request_count(), 2);
+
+        let seen = fixture.request_at(1);
+        let contents = seen.body["contents"].as_array().expect("Gemini contents");
+        assert_eq!(
+            contents.len(),
+            2,
+            "trimmed history must stay trimmed: {}",
+            seen.body
+        );
+        assert_eq!(contents[0]["role"], "model");
+        assert_eq!(contents[1]["role"], "user");
+
+        let calls = upstream_function_call_parts(&seen.body);
+        assert_eq!(calls.len(), 2, "assistant calls lost: {}", seen.body);
+        assert_eq!(calls[0]["functionCall"]["name"], "lookup_weather");
+        assert_eq!(calls[0]["functionCall"]["args"], json!({"city": "Paris"}));
+        assert_eq!(calls[1]["functionCall"]["name"], "lookup_time");
+        assert_eq!(calls[1]["functionCall"]["args"], json!({"city": "Tokyo"}));
+        for part in &calls {
+            assert!(
+                part["functionCall"].get("id").is_none(),
+                "id must be stripped: {}",
+                seen.body
+            );
+        }
+
+        // These assertions pin what leaves the proxy: the client's result
+        // order is preserved and each functionResponse stays paired with its
+        // tool by name and content. They deliberately do NOT claim the Gemini
+        // server accepts or positionally disambiguates this order.
+        let responses = upstream_function_responses(&seen.body);
+        assert_eq!(responses.len(), 2, "tool results lost: {}", seen.body);
+        assert_eq!(responses[0]["name"], "lookup_time");
+        assert_eq!(responses[0]["response"]["content"], "09:00");
+        assert_eq!(responses[1]["name"], "lookup_weather");
+        assert_eq!(responses[1]["response"]["content"], "sunny");
+        for response in &responses {
+            assert!(
+                response.get("id").is_none(),
+                "id must be stripped: {}",
+                seen.body
+            );
+        }
+        assert_no_client_ids_leak(&seen.body, &[weather_id, time_id]);
+
+        let message: Value = serde_json::from_str(&response)?;
+        assert_eq!(message["type"], "message");
+        assert_eq!(message["content"][0]["text"], "local reply");
         Ok(())
     })
 }

@@ -702,6 +702,17 @@ fn extract_anthropic_usage(v: &Value) -> Usage {
     // Anthropic clients so the wire format stays spec-compliant.
     let cache_read = get_opt_u32("cache_read_input_tokens");
     let cache_creation = get_opt_u32("cache_creation_input_tokens");
+    let reasoning = u
+        .get("output_tokens_details")
+        .and_then(|d| d.get("reasoning_tokens"))
+        .and_then(|v| v.as_u64())
+        .or_else(|| {
+            u.get("completion_tokens_details")
+                .and_then(|d| d.get("reasoning_tokens"))
+                .and_then(|v| v.as_u64())
+        })
+        .or_else(|| u.get("reasoning_tokens").and_then(|v| v.as_u64()))
+        .map(|n| n as u32);
     let net_input = get_u32("input_tokens");
     let gross_input = net_input
         .saturating_add(cache_read.unwrap_or(0))
@@ -711,6 +722,7 @@ fn extract_anthropic_usage(v: &Value) -> Usage {
         completion_tokens: get_u32("output_tokens"),
         cache_read_tokens: cache_read,
         cache_creation_tokens: cache_creation,
+        reasoning_tokens: reasoning,
         server_tool_use,
         ..Usage::default()
     }

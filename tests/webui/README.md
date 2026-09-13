@@ -102,32 +102,36 @@ Coverage:
 
 - One comprehensive score per matched prefix and one merged mixed-TPS point per
   prefix × provider group; no effort selector, tier points, score overrides, or
-  fallback scores. Each variant samples its own latest ten retained calls, so a group
-  served by two upstream variants legitimately reports twenty selected/valid samples.
+  fallback scores. Each variant samples its own latest fifty retained calls, so a group
+  served by two upstream variants legitimately reports one hundred selected/valid samples.
 - A rated prefix with no retained call produces **no row at all** — never a zero-TPS
   row — while `/model-usage` still reports its empty window.
-- Select the latest ten raw retained logs by request time before validating TPS.
+- Select the latest fifty raw retained logs by request time before validating TPS.
   The shared logs/model-usage formula uses `output_tokens`, `latency_upstream_ms`
   (or total latency fallback), `is_stream`/chunk count and `stream_first_chunk_ms`.
   Streaming generation timing preserves the legacy non-incremental-response fallback.
-  The seeded 100-token 2000ms/500ms-TTFT and 50-token 1000ms calls average to 175/3 TPS.
+  The seeded twenty-five 100-token 2000ms/500ms-TTFT streams and twenty-five 50-token
+  1000ms calls average to 175/3 TPS, while two older 900/800-token rows stay outside
+  the fifty-sample window.
   New `performance_*` timings intentionally disagree to prove they are not used.
 - Failed/incomplete/output-limit/cancelled/unknown completion, non-2xx statuses and
   metadata versions 0, 1 and 99 do not disqualify valid token/timing samples. Mixed
-  reasoning-effort metadata stays in the same sample pool. Legacy-valid logs are
-  plotted without an untrusted-history warning.
+  reasoning-effort metadata stays in the same sample pool: three older minimal-effort
+  rows join the ten newer ones as twelve valid of thirteen selected samples averaging
+  117.5 TPS. Legacy-valid logs are plotted without an untrusted-history warning.
 - MiniMax-M3 with version 1, unknown completion, 2007 output tokens, 20617ms upstream
   latency and 1798ms TTFT yields `2007 / ((20617 - 1798) / 1000)` TPS, shown as
   **106.6 tok/s**. A retained log older than seven days with no metadata fields and
   total-latency fallback also contributes. No upstream request is made.
 - Two upstream variants (`model/dual`, `model/dual-0813`) share one prefix and one row:
-  the group must keep both variants, report `10 + 10 = 20` selected and valid samples,
+  the group must keep both variants, report `50 + 50 = 100` selected and valid samples,
   merge TPS sample-weighted (100 and 60 → **80.0 tok/s**), inherit the shared score, and
-  still be plotted with `20 / 20` in the diagnostics table. The same client contract is
+  still be plotted with `100 / 100` in the diagnostics table. The same client contract is
   enforced negatively by CDP injection: a group claiming more samples than its declared
   variants can hold is rejected outright rather than plotted.
 - Only invalid tokens/timing produces missing TPS in the real fixture.
-  Invalid latest samples are not refilled from older valid calls. Zero score is
+  Fifty invalid latest samples consume the whole window and are not refilled from the
+  one older valid call. Zero score is
   valid; missing TPS is not zero. Fewer than three valid samples switch that marker's
   border to dashed.
 - Every plotted point is drawn as its provider's vendor icon (resolved from provider
@@ -166,7 +170,7 @@ lines over deterministic coordinates; it neither imports the frontend hull helpe
 nor trusts the SVG membership metadata as its expected result.
 
 - The unchanged real SQLite/API fixture has a single dominating model at `(100,225)`:
-  it has a tooltip membership badge but **no envelope line**. All original latest-ten,
+  it has a tooltip membership badge but **no envelope line**. All original latest-fifty,
   exact `/model-usage` parity, one-decimal TPS, and auto-X-domain checks still run.
 - After those baseline and failure/recovery checks, CDP substitutes geometry-only
   `/model-performance` snapshots using the real response shape and local providers.
