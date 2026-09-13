@@ -256,9 +256,25 @@ pub fn create_anthropic_sse_stream_from_gemini<E: std::error::Error + Send + 'st
         let mut latest_usage: Option<Value> = None;
         let mut latest_finish_reason: Option<String> = None;
         let mut blocked_text: Option<String> = None;
-        tokio::pin!(stream);
+        // Termination-evidence bookkeeping: Gemini's wire contract always ends
+        // a stream with a finishReason chunk, a promptFeedback block, or (from
+        // OpenAI-style relays) the [DONE] sentinel. An EOF with none of these
+        // is a truncated upstream and must be surfaced as an error.
+        let mut saw_done = false;
+        let mut parsed_chunks: usize = 0;
+        // Flush sentinel: chain one synthetic blank-line delimiter after the
+        // upstream EOF so a final SSE block that arrived without its trailing
+        // "\n\n" is still parsed exactly once — mirroring the native Gemini
+        // parser's finish() path. On a clean stream the buffer is empty (or
+        // the sentinel yields an empty block) and this is a no-op; on a
+        // genuinely truncated wire the flushed block fails the JSON parse and
+        // surfaces the truncation error.
+        let mut flushed = stream.chain(futures::stream::once(async {
+            Ok::<Bytes, E>(Bytes::from_static(b"\n\n"))
+        }));
+        tokio::pin!(flushed);
 
-        while let Some(chunk) = stream.next().await {
+        while let Some(chunk) = flushed.next().await {
             match chunk {
                 Ok(bytes) => {
                     append_utf8_safe(&mut buffer, &mut utf8_remainder, &bytes);
@@ -281,12 +297,52 @@ pub fn create_anthropic_sse_stream_from_gemini<E: std::error::Error + Send + 'st
 
                         let data = data_lines.join("\n");
                         if data.trim() == "[DONE]" {
+                            // OpenAI-style relays fronting Gemini may terminate
+                            // with only the sentinel and no finishReason chunk;
+                            // the sentinel itself is termination evidence.
+                            // Trade-off: `break` only leaves the block loop, so
+                            // malformed data bytes AFTER the sentinel still
+                            // fail the JSON parse below (and the flush sentinel
+                            // reaches them) — deliberate strictness; garbage
+                            // after a terminal is treated as wire corruption.
+                            saw_done = true;
                             break;
+                        }
+                        // Empty/whitespace-only data frames are heartbeat
+                        // traffic (some relays emit `data:` with no payload;
+                        // strip_sse_field yields Some("")). The native Gemini
+                        // parser treats them as no-ops — skip them instead of
+                        // failing the JSON parse below and killing a healthy
+                        // stream.
+                        if data.trim().is_empty() {
+                            continue;
                         }
 
                         let chunk_json: Value = match serde_json::from_str(&data) {
-                            Ok(value) => value,
-                            Err(_) => continue,
+                            Ok(value) => {
+                                parsed_chunks += 1;
+                                value
+                            }
+                            Err(error) => {
+                                // A syntactically broken data line means the
+                                // wire is corrupt. Surface the failure instead
+                                // of silently dropping the chunk and later
+                                // synthesizing a normal completion over the
+                                // missing content (and committing the partial
+                                // turn to the shared shadow session).
+                                // Keep upstream bytes OUT of the message:
+                                // logging's sanitize_cause replaces a whole
+                                // cause with "Sensitive diagnostic text
+                                // omitted" when it merely sees keywords like
+                                // "token" inside quoted content. The serde
+                                // error already pinpoints line/column without
+                                // embedding the payload.
+                                yield Err(std::io::Error::other(format!(
+                                    "gemini sse data line is not valid JSON: {error}; data_bytes={}, parsed_chunks={parsed_chunks}",
+                                    data.len()
+                                )));
+                                return;
+                            }
                         };
 
                         if message_id.is_none() {
@@ -407,6 +463,22 @@ pub fn create_anthropic_sse_stream_from_gemini<E: std::error::Error + Send + 'st
                     return;
                 }
             }
+        }
+
+        // Termination-evidence guard: Gemini's `streamGenerateContent?alt=sse`
+        // wire contract always ends a stream with a finishReason chunk, a
+        // promptFeedback block, or (from OpenAI-style relays) the [DONE]
+        // sentinel. An EOF with none of these means the stream was truncated
+        // upstream; fabricating a normal end_turn completion would hide the
+        // failure from the client and commit a partial turn to the shared
+        // shadow session. Surface the error and stop, mirroring the transport
+        // error path above.
+        if !(latest_finish_reason.is_some() || saw_done || blocked_text.is_some()) {
+            yield Err(std::io::Error::other(format!(
+                "gemini stream ended without termination evidence (no finishReason/[DONE]/blockReason); parsed_chunks={parsed_chunks}, accumulated_text_bytes={}",
+                accumulated_text.len()
+            )));
+            return;
         }
 
         if !has_sent_message_start {

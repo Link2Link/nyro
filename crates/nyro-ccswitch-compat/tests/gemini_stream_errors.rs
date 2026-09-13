@@ -308,3 +308,164 @@ fn gemini_stream_transport_error_propagates_without_shadow_pollution() {
         outcome.diagnostics("mid-stream transport error")
     );
 }
+
+// ---------------------------------------------------------------------------
+// Termination-evidence boundaries pinned by the truncation guard: the three
+// outcomes that must still count as a completed stream even without a
+// finishReason chunk, plus the strict empty-stream contract.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn gemini_stream_done_sentinel_without_finish_reason_succeeds() {
+    let harness = harness();
+    let outcome = run_stream(
+        &harness,
+        vec![
+            Ok(text_chunk("Hel", false)),
+            // OpenAI-style relay terminal: sentinel only, no finishReason.
+            Ok("data: [DONE]\n\n".to_string()),
+        ],
+    );
+    // The sentinel alone is termination evidence: the delivered text stands,
+    // exactly one terminal is emitted, and the shadow store records the turn.
+    assert!(
+        !outcome.has_error()
+            && outcome.text() == "Hel"
+            && outcome.message_stop_count == 1
+            && outcome.shadow_sessions == 1,
+        "[DONE] sentinel must count as termination evidence: {}",
+        outcome.diagnostics("sentinel-only terminal")
+    );
+}
+
+#[test]
+fn gemini_stream_prompt_block_without_finish_reason_is_refusal_not_truncation() {
+    let harness = harness();
+    let blocked = json!({
+        "responseId": "gemini-stream-contract-blocked",
+        "promptFeedback": {"blockReason": "SAFETY"},
+    });
+    let outcome = run_stream(
+        &harness,
+        vec![Ok(format!(
+            "data: {}\n\n",
+            serde_json_ordered::to_string(&blocked).expect("serialize chunk")
+        ))],
+    );
+    // A prompt-level block is itself a terminal outcome (refusal), never a
+    // truncation error.
+    assert!(
+        !outcome.has_error()
+            && outcome.message_stop_count == 1
+            && outcome.stop_reason() == Some("refusal"),
+        "prompt blockReason must complete as a refusal, not an error: {}",
+        outcome.diagnostics("prompt-level block")
+    );
+}
+
+#[test]
+fn gemini_stream_comments_only_without_evidence_surfaces_error() {
+    let harness = harness();
+    let outcome = run_stream(
+        &harness,
+        vec![
+            Ok(": keepalive\n\n".to_string()),
+            Ok(": heartbeat\n\n".to_string()),
+        ],
+    );
+    // A 200 stream that never delivered a single data block carries no
+    // termination evidence either: fabricating an empty end_turn completion
+    // would hide an upstream failure, so it must surface as an error.
+    assert!(
+        outcome.has_error() && outcome.message_stop_count == 0 && outcome.shadow_sessions == 0,
+        "comments-only stream without evidence must error, not fabricate success: {}",
+        outcome.diagnostics("comments-only EOF")
+    );
+}
+
+#[test]
+fn gemini_stream_empty_data_frames_are_heartbeat_not_corruption() {
+    let harness = harness();
+    let outcome = run_stream(
+        &harness,
+        vec![
+            // `data:` with no payload is legal SSE heartbeat traffic
+            // (strip_sse_field yields Some("")): skip like a comment, never
+            // fail the JSON parse and kill an otherwise healthy stream.
+            Ok("data:\n\n".to_string()),
+            Ok(text_chunk("Hel", false)),
+            Ok("data: \n\n".to_string()),
+            Ok(text_chunk("Hello", true)),
+        ],
+    );
+    assert!(
+        !outcome.has_error()
+            && outcome.text() == "Hello"
+            && outcome.message_stop_count == 1
+            && outcome.shadow_sessions == 1,
+        "empty data frames must be treated as heartbeat traffic: {}",
+        outcome.diagnostics("empty payload frames")
+    );
+}
+
+#[test]
+fn gemini_stream_final_block_without_trailing_delimiter_is_flushed_not_truncated() {
+    let harness = harness();
+    // A last SSE block whose closing blank line never arrived (EOF right
+    // after the JSON) still carries finishReason: the flush sentinel must
+    // parse it and complete normally instead of reporting truncation —
+    // mirroring the native parser's finish() path.
+    let unterminated = text_chunk("Hello", true).trim_end_matches('\n').to_string();
+    let outcome = run_stream(
+        &harness,
+        vec![Ok(text_chunk("Hel", false)), Ok(unterminated)],
+    );
+    assert!(
+        !outcome.has_error()
+            && outcome.text() == "Hello"
+            && outcome.stop_reason() == Some("end_turn")
+            && outcome.message_stop_count == 1
+            && outcome.shadow_sessions == 1,
+        "unterminated final block with finishReason must be flushed, not judged truncated: {}",
+        outcome.diagnostics("missing trailing delimiter")
+    );
+}
+
+#[test]
+fn gemini_stream_truncated_json_tail_without_delimiter_surfaces_error() {
+    let harness = harness();
+    let outcome = run_stream(
+        &harness,
+        vec![
+            Ok(text_chunk("Hel", false)),
+            // A wire cut mid-JSON with no closing delimiter: the flush
+            // sentinel parses the remnant and it must fail as invalid JSON —
+            // exactly the truncation semantics we want surfaced.
+            Ok("data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"LO".to_string()),
+        ],
+    );
+    assert!(
+        outcome.has_error() && outcome.message_stop_count == 0 && outcome.shadow_sessions == 0,
+        "truncated JSON tail must surface as an error after the flush: {}",
+        outcome.diagnostics("truncated JSON tail")
+    );
+}
+
+#[test]
+fn gemini_stream_done_sentinel_only_zero_data_blocks_is_explicit_success() {
+    let harness = harness();
+    let outcome = run_stream(&harness, vec![Ok("data: [DONE]\n\n".to_string())]);
+    // Explicit trade-off pinned by the contract: [DONE] alone IS termination
+    // evidence (a relay may legitimately answer an empty generation this
+    // way), so the stream completes with an empty message rather than an
+    // error. No content was produced, so the shadow store stays untouched.
+    assert!(
+        !outcome.has_error()
+            && outcome.text().is_empty()
+            && outcome.stop_reason() == Some("end_turn")
+            && outcome.message_stop_count == 1
+            && outcome.shadow_sessions == 0,
+        "[DONE]-only stream is the documented empty-success trade-off: {}",
+        outcome.diagnostics("sentinel-only stream")
+    );
+}
