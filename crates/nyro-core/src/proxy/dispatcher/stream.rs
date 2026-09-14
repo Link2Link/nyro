@@ -406,6 +406,7 @@ pub(super) async fn handle_stream(
     let ProbeOutcome::Commit {
         buffered: probe_buffered,
         terminal_error: probe_terminal_error,
+        parser_finished: probe_parser_finished,
         chunks_count: probe_chunks_count,
         first_chunk_ms: probe_first_chunk_ms,
     } = probe
@@ -464,7 +465,7 @@ pub(super) async fn handle_stream(
             terminal_error_sent = true;
         }
 
-        while !terminal_error_sent {
+        while !terminal_error_sent && !probe_parser_finished {
             let chunk = tokio::select! {
                 biased;
                 _ = tx.closed() => break,
@@ -565,7 +566,7 @@ pub(super) async fn handle_stream(
             }
         }
 
-        if !terminal_error_sent {
+        if !terminal_error_sent && !probe_parser_finished {
             match super::streaming::validate_decoded_batch(stream_parser.finish()) {
                 Ok(ai_deltas) => {
                     let mut ai_deltas = tool_route_plan.restore_stream_deltas(ai_deltas);

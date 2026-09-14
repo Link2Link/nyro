@@ -1,8 +1,8 @@
 //! Gemini MALFORMED_FUNCTION_CALL zero-payload terminal: pre-commit probe
 //! and per-target failover through the real dispatcher and local HTTP.
 //!
-//! Production incident replay (de-enveloped pure Gemini SSE; the parsed
-//! path is identical to the v1internal envelope form): the upstream answers
+//! Production incident replay (plain Gemini and v1internal envelope SSE,
+//! including CRLF framing and unterminated events at EOF): the upstream answers
 //! HTTP 200 with a single SSE event whose only candidate carries
 //! `finishReason: "MALFORMED_FUNCTION_CALL"` and no text/tool-call output.
 //! The gateway must fail that attempt exactly once — no same-target replay —
@@ -130,15 +130,60 @@ fn sse_fixtures_are_valid_single_json_documents() {
     }
 }
 
-type UpstreamState = (Arc<Vec<Reply>>, Arc<std::sync::atomic::AtomicUsize>);
+/// An EOF fixture has no blank event separator. Keep a single line ending
+/// to exercise LF/CRLF/CR independently; BareEof also omits that line ending.
+#[derive(Clone, Copy, Debug)]
+enum Framing {
+    Lf,
+    Crlf,
+    Cr,
+    EofLf,
+    EofCrlf,
+    EofCr,
+    BareEof,
+}
 
-async fn scripted_upstream(State((script, calls)): State<UpstreamState>) -> Response {
+impl Framing {
+    fn apply(self, sse: String) -> String {
+        let ending = match self {
+            Self::Lf => "\n\n",
+            Self::Crlf => "\r\n\r\n",
+            Self::Cr => "\r\r",
+            Self::EofLf => "\n",
+            Self::EofCrlf => "\r\n",
+            Self::EofCr => "\r",
+            Self::BareEof => "",
+        };
+        format!("{}{ending}", sse.trim_end_matches(['\r', '\n']))
+    }
+}
+
+const REGRESSION_FRAMINGS: [Framing; 6] = [
+    Framing::Crlf,
+    Framing::Cr,
+    Framing::EofLf,
+    Framing::EofCrlf,
+    Framing::EofCr,
+    Framing::BareEof,
+];
+
+type UpstreamState = (
+    Arc<Vec<Reply>>,
+    Arc<std::sync::atomic::AtomicUsize>,
+    Framing,
+);
+
+async fn scripted_upstream(State((script, calls, framing)): State<UpstreamState>) -> Response {
     let index = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let reply = script
         .get(index.min(script.len().saturating_sub(1)))
         .copied()
         .unwrap_or(Reply::Healthy);
-    ([("content-type", "text/event-stream")], reply.sse()).into_response()
+    (
+        [("content-type", "text/event-stream")],
+        framing.apply(reply.sse()),
+    )
+        .into_response()
 }
 
 struct Upstream {
@@ -154,10 +199,17 @@ impl Upstream {
 }
 
 async fn start_upstream(script: Vec<Reply>) -> anyhow::Result<Upstream> {
+    start_upstream_with_framing(script, Framing::Lf).await
+}
+
+async fn start_upstream_with_framing(
+    script: Vec<Reply>,
+    framing: Framing,
+) -> anyhow::Result<Upstream> {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let url = format!("http://{}", listener.local_addr()?);
     let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let state = (Arc::new(script), calls.clone());
+    let state = (Arc::new(script), calls.clone(), framing);
     let job = tokio::spawn(async move {
         let app = Router::new()
             .route("/*path", post(scripted_upstream))
@@ -403,17 +455,35 @@ async fn recv_logs(
 
 #[tokio::test]
 async fn malformed_single_backend_fails_once_with_502() -> anyhow::Result<()> {
+    assert_malformed_single_backend(Reply::Malformed, Framing::Lf).await
+}
+
+#[tokio::test]
+async fn malformed_crlf_and_eof_single_backend_returns_502_not_empty_200() -> anyhow::Result<()> {
+    for reply in [Reply::Malformed, Reply::EnvelopedMalformed] {
+        for framing in REGRESSION_FRAMINGS {
+            assert_malformed_single_backend(reply, framing).await?;
+        }
+    }
+    Ok(())
+}
+
+async fn assert_malformed_single_backend(reply: Reply, framing: Framing) -> anyhow::Result<()> {
     let (_dir, gw, mut logs) = setup().await?;
     // The healthy second reply exists only to prove it is never fetched.
-    let upstream = start_upstream(vec![Reply::Malformed, Reply::Healthy]).await?;
-    let provider = gemini_provider(&gw, &upstream.url).await?;
+    let upstream = start_upstream_with_framing(vec![reply, Reply::Healthy], framing).await?;
+    let provider = if reply == Reply::EnvelopedMalformed {
+        antigravity_provider(&gw, &upstream.url).await?
+    } else {
+        gemini_provider(&gw, &upstream.url).await?
+    };
     route(&gw, "malformed-single", provider, vec![]).await?;
 
     let (_id, status, wire) = dispatch_stream(&gw, "malformed-single").await?;
     assert_eq!(
         status,
         StatusCode::BAD_GATEWAY,
-        "single backend must surface the explicit 502: {wire}"
+        "{reply:?}/{framing:?}: single backend must surface the explicit 502: {wire}"
     );
     let value: Value = serde_json::from_str(&wire)?;
     let message = value["error"]["message"].as_str().expect("error message");
@@ -601,9 +671,27 @@ async fn malformed_backend_fails_over_to_next_target() -> anyhow::Result<()> {
 // once and fail over to the different-model fallback target B.
 #[tokio::test]
 async fn enveloped_malformed_nonstream_fails_over_via_upstream_stream() -> anyhow::Result<()> {
+    assert_enveloped_malformed_failover(Framing::Lf, false).await
+}
+
+#[tokio::test]
+async fn enveloped_crlf_and_eof_malformed_fails_over_before_commit() -> anyhow::Result<()> {
+    for framing in REGRESSION_FRAMINGS {
+        for stream in [true, false] {
+            assert_enveloped_malformed_failover(framing, stream).await?;
+        }
+    }
+    Ok(())
+}
+
+async fn assert_enveloped_malformed_failover(framing: Framing, stream: bool) -> anyhow::Result<()> {
     let (_dir, gw, mut logs) = setup().await?;
-    let broken = start_upstream(vec![Reply::EnvelopedMalformed, Reply::EnvelopedMalformed]).await?;
-    let healthy = start_upstream(vec![Reply::EnvelopedHealthy]).await?;
+    let broken = start_upstream_with_framing(
+        vec![Reply::EnvelopedMalformed, Reply::EnvelopedMalformed],
+        framing,
+    )
+    .await?;
+    let healthy = start_upstream_with_framing(vec![Reply::EnvelopedHealthy], framing).await?;
     let provider_a = antigravity_provider(&gw, &broken.url).await?;
     let provider_b = antigravity_provider(&gw, &healthy.url).await?;
     let targets = vec![
@@ -624,19 +712,29 @@ async fn enveloped_malformed_nonstream_fails_over_via_upstream_stream() -> anyho
     ];
     route(&gw, "enveloped-failover", provider_a.clone(), targets).await?;
 
-    let (_id, status, wire) =
-        dispatch_request(&gw, chat_non_stream_request("enveloped-failover")).await?;
+    let request = if stream {
+        chat_stream_request("enveloped-failover")
+    } else {
+        chat_non_stream_request("enveloped-failover")
+    };
+    let (_id, status, wire) = dispatch_request(&gw, request).await?;
     assert_eq!(
         status,
         StatusCode::OK,
-        "aggregated non-stream response must come from target B: {wire}"
+        "{framing:?}/stream={stream}: response must come from target B: {wire}"
     );
-    let value: Value = serde_json::from_str(&wire)?;
-    assert_eq!(
-        value["choices"][0]["message"]["content"], "recovered answer",
-        "target B content: {wire}"
-    );
-    assert_eq!(value["choices"][0]["finish_reason"], "stop");
+    if stream {
+        assert_healthy_stream_once(&wire);
+    } else {
+        let value: Value = serde_json::from_str(&wire)?;
+        assert_eq!(
+            value["choices"][0]["message"]["content"], "recovered answer",
+            "target B content: {wire}"
+        );
+        assert_eq!(value["choices"][0]["finish_reason"], "stop");
+        assert_eq!(value["usage"]["prompt_tokens"], 5);
+        assert_eq!(value["usage"]["total_tokens"], 7);
+    }
     assert!(
         !wire.contains("MALFORMED_FUNCTION_CALL") && !wire.contains("test-signature"),
         "enveloped failure must not leak into the client response: {wire}"
@@ -677,6 +775,7 @@ async fn enveloped_malformed_nonstream_fails_over_via_upstream_stream() -> anyho
         failed.usage.prompt_tokens, 65036,
         "enveloped usage metadata preserved: {failed:?}"
     );
+    assert_eq!(failed.usage.total_tokens, 65322);
     let completed = completed[0];
     assert_eq!(completed.client_status_code, 200);
     assert_eq!(completed.provider_id, provider_b);
@@ -691,22 +790,61 @@ async fn enveloped_malformed_nonstream_fails_over_via_upstream_stream() -> anyho
 
 // ── 4. Healthy stream unchanged ──────────────────────────────────────────────
 
+fn assert_healthy_stream_once(wire: &str) {
+    for marker in [
+        "recovered answer",
+        "\"finish_reason\":\"stop\"",
+        "data: [DONE]",
+    ] {
+        assert_eq!(
+            wire.matches(marker).count(),
+            1,
+            "healthy output must not be lost or duplicated ({marker}): {wire}"
+        );
+    }
+    assert!(
+        !wire.contains("\"error\""),
+        "unexpected stream error: {wire}"
+    );
+}
+
 #[tokio::test]
 async fn healthy_first_chunk_stream_is_unchanged() -> anyhow::Result<()> {
+    assert_healthy_stream(Reply::Healthy, Framing::Lf).await
+}
+
+#[tokio::test]
+async fn healthy_crlf_and_eof_stream_is_not_lost_or_duplicated() -> anyhow::Result<()> {
+    for reply in [Reply::Healthy, Reply::EnvelopedHealthy] {
+        for framing in REGRESSION_FRAMINGS {
+            assert_healthy_stream(reply, framing).await?;
+        }
+    }
+    Ok(())
+}
+
+async fn assert_healthy_stream(reply: Reply, framing: Framing) -> anyhow::Result<()> {
     let (_dir, gw, mut logs) = setup().await?;
-    let upstream = start_upstream(vec![Reply::Healthy]).await?;
-    let provider = gemini_provider(&gw, &upstream.url).await?;
+    let upstream = start_upstream_with_framing(vec![reply], framing).await?;
+    let provider = if reply == Reply::EnvelopedHealthy {
+        antigravity_provider(&gw, &upstream.url).await?
+    } else {
+        gemini_provider(&gw, &upstream.url).await?
+    };
     route(&gw, "healthy-stream", provider, vec![]).await?;
 
     let (_id, status, wire) = dispatch_stream(&gw, "healthy-stream").await?;
-    assert_eq!(status, StatusCode::OK);
-    assert!(wire.contains("recovered answer"), "{wire}");
-    assert!(wire.contains("\"finish_reason\":\"stop\""), "{wire}");
+    assert_eq!(status, StatusCode::OK, "{reply:?}/{framing:?}: {wire}");
+    assert_healthy_stream_once(&wire);
     assert_eq!(upstream.calls(), 1, "no retries on healthy streams");
 
     let rows = recv_logs(&mut logs, 1).await;
     assert_eq!(rows[0].diagnostic.attempt_outcome, "completed");
+    assert_eq!(rows[0].diagnostic.attempt_index, Some(1));
     assert_eq!(rows[0].client_status_code, 200);
+    assert_eq!(rows[0].upstream_status_code, Some(200));
+    assert_eq!(rows[0].usage.prompt_tokens, 5);
+    assert_eq!(rows[0].usage.total_tokens, 7);
     assert!(logs.try_recv().is_err(), "exactly one row");
     Ok(())
 }

@@ -97,6 +97,8 @@ pub(super) enum ProbeOutcome {
     Commit {
         buffered: Vec<AiStreamDelta>,
         terminal_error: Option<String>,
+        /// EOF was decoded during the probe; consumers must not finish twice.
+        parser_finished: bool,
         chunks_count: i32,
         first_chunk_ms: Option<i64>,
     },
@@ -135,19 +137,11 @@ where
     let mut saw_payload = false;
 
     loop {
-        let Some(chunk) = byte_stream.next().await else {
-            // Upstream EOF: the forwarding task runs the parser finish()
-            // path exactly as before.
-            return ProbeOutcome::Commit {
-                buffered,
-                terminal_error: None,
-                chunks_count,
-                first_chunk_ms,
-            };
-        };
-        let bytes = match chunk {
-            Ok(bytes) => bytes,
-            Err(error) => {
+        // EOF can release a terminal event buffered without a final SSE blank
+        // line. Classify it before committing, exactly like a regular batch.
+        let (decoded, parser_finished) = match byte_stream.next().await {
+            None => (parser.finish(), true),
+            Some(Err(error)) => {
                 tracing::warn!(error = %error, "upstream stream error during pre-commit probe");
                 let event = stream_error_event(
                     ingress,
@@ -161,47 +155,50 @@ where
                 return ProbeOutcome::Commit {
                     buffered,
                     terminal_error: Some(event),
+                    parser_finished: false,
+                    chunks_count,
+                    first_chunk_ms,
+                };
+            }
+            Some(Ok(bytes)) => {
+                if first_chunk_ms.is_none() {
+                    first_chunk_ms = Some(started_at.elapsed().as_millis() as i64);
+                }
+                chunks_count += 1;
+                let text = String::from_utf8_lossy(&bytes);
+                append_capped(&mut raw_text, &text);
+                // Normalize vendor envelopes before decoding, as in the live loop.
+                let hooked_text;
+                let parse_src = if let Some(hook) = raw_chunk_hook {
+                    hooked_text = hook.apply(&text, performance).await;
+                    hooked_text.as_str()
+                } else {
+                    text.as_ref()
+                };
+                (parser.parse_chunk(parse_src), false)
+            }
+        };
+        let ai_deltas = match super::streaming::validate_decoded_batch(decoded) {
+            Ok(deltas) => deltas,
+            Err(error) => {
+                if let Some(attempt) = performance {
+                    attempt.record_failure(
+                        "failed",
+                        "conversion_parse_error",
+                        "response_conversion",
+                        error.as_ref(),
+                    );
+                }
+                let event = stream_error_event(ingress, request_id, "conversion_parse_error");
+                return ProbeOutcome::Commit {
+                    buffered,
+                    terminal_error: Some(event),
+                    parser_finished,
                     chunks_count,
                     first_chunk_ms,
                 };
             }
         };
-        if first_chunk_ms.is_none() {
-            first_chunk_ms = Some(started_at.elapsed().as_millis() as i64);
-        }
-        chunks_count += 1;
-        let text = String::from_utf8_lossy(&bytes);
-        append_capped(&mut raw_text, &text);
-        // Vendor raw-chunk normalization (e.g. v1internal envelope unwrapping)
-        // runs before the decoder, exactly like the spawned loop.
-        let hooked_text;
-        let parse_src: &str = if let Some(hook) = raw_chunk_hook {
-            hooked_text = hook.apply(&text, performance).await;
-            hooked_text.as_str()
-        } else {
-            text.as_ref()
-        };
-        let ai_deltas =
-            match super::streaming::validate_decoded_batch(parser.parse_chunk(parse_src)) {
-                Ok(deltas) => deltas,
-                Err(error) => {
-                    if let Some(attempt) = performance {
-                        attempt.record_failure(
-                            "failed",
-                            "conversion_parse_error",
-                            "response_conversion",
-                            error.as_ref(),
-                        );
-                    }
-                    let event = stream_error_event(ingress, request_id, "conversion_parse_error");
-                    return ProbeOutcome::Commit {
-                        buffered,
-                        terminal_error: Some(event),
-                        chunks_count,
-                        first_chunk_ms,
-                    };
-                }
-            };
         usage_accumulator.apply_all(&ai_deltas);
         let batch_has_payload = ai_deltas.iter().any(stream_delta_is_payload);
         let transient_reason = if saw_payload || batch_has_payload {
@@ -225,7 +222,9 @@ where
         if let Some(stop_reason) = transient_reason {
             // The attempt has terminally failed; capture bounded evidence
             // from the remaining bytes for the request-log row.
-            drain_capped(byte_stream, &mut raw_text, &mut chunks_count).await;
+            if !parser_finished {
+                drain_capped(byte_stream, &mut raw_text, &mut chunks_count).await;
+            }
             return ProbeOutcome::TransientZeroPayload(Box::new(TransientStreamFailure {
                 stop_reason,
                 finish_message: extract_finish_message(&raw_text),
@@ -235,10 +234,15 @@ where
                 latency_ms: started_at.elapsed().as_millis() as i64,
             }));
         }
-        if saw_payload || done_reason.is_some() || buffered.len() >= MAX_BUFFERED_DELTAS {
+        if parser_finished
+            || saw_payload
+            || done_reason.is_some()
+            || buffered.len() >= MAX_BUFFERED_DELTAS
+        {
             return ProbeOutcome::Commit {
                 buffered,
                 terminal_error: None,
+                parser_finished,
                 chunks_count,
                 first_chunk_ms,
             };
@@ -310,8 +314,8 @@ where
 /// v1internal `{"response": …}` envelope. Purely diagnostic — never feeds
 /// the IR.
 pub(super) fn extract_finish_message(raw: &str) -> Option<String> {
-    for line in raw.lines() {
-        let Some(data) = line.strip_prefix("data: ") else {
+    for line in raw.split(['\r', '\n']) {
+        let Some(data) = line.strip_prefix("data:") else {
             continue;
         };
         let data = data.trim();
@@ -441,6 +445,123 @@ mod tests {
         }
     }
 
+    /// Model a decoder whose final batch is available only at transport EOF.
+    struct EofDecoder {
+        final_batch: Option<anyhow::Result<Vec<AiStreamDelta>>>,
+        finish_calls: usize,
+    }
+
+    impl StreamResponseDecoder for EofDecoder {
+        fn parse_chunk(&mut self, _raw: &str) -> anyhow::Result<Vec<AiStreamDelta>> {
+            Ok(vec![])
+        }
+
+        fn finish(&mut self) -> anyhow::Result<Vec<AiStreamDelta>> {
+            self.finish_calls += 1;
+            self.final_batch
+                .take()
+                .expect("decoder must only finish once")
+        }
+    }
+
+    async fn probe_eof(batch: anyhow::Result<Vec<AiStreamDelta>>) -> ProbeOutcome {
+        let mut parser = EofDecoder {
+            final_batch: Some(batch),
+            finish_calls: 0,
+        };
+        // An EOF stream need not be fused. Reading again after None is a bug.
+        let mut ended = false;
+        let mut stream = futures::stream::poll_fn(move |_| {
+            assert!(!ended, "probe must not drain an already exhausted stream");
+            ended = true;
+            std::task::Poll::Ready(None::<Result<Bytes, reqwest::Error>>)
+        });
+        let outcome = probe_stream(
+            &mut stream,
+            &mut parser,
+            None,
+            None,
+            crate::protocol::ids::OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1,
+            "eof-test",
+            Instant::now(),
+        )
+        .await;
+        assert_eq!(parser.finish_calls, 1);
+        outcome
+    }
+
+    #[tokio::test]
+    async fn eof_only_malformed_terminal_is_rejected_before_commit() {
+        let result = probe_eof(Ok(vec![
+            AiStreamDelta::ThinkingSignature("signature-only".into()),
+            AiStreamDelta::Usage(Usage {
+                prompt_tokens: 10,
+                completion_tokens: 3,
+                ..Usage::default()
+            }),
+            done("MALFORMED_FUNCTION_CALL"),
+        ]))
+        .await;
+        let ProbeOutcome::TransientZeroPayload(failure) = result else {
+            panic!("EOF terminal must fail before committing");
+        };
+        assert_eq!(failure.stop_reason, "MALFORMED_FUNCTION_CALL");
+        assert_eq!(failure.usage.prompt_tokens, 10);
+        assert_eq!(failure.usage.completion_tokens, 3);
+    }
+
+    #[tokio::test]
+    async fn eof_payload_and_normal_terminals_are_replayed_once() {
+        for reason in ["stop", "SAFETY", "MALFORMED_FUNCTION_CALL"] {
+            let result = probe_eof(Ok(vec![
+                AiStreamDelta::TextDelta("answer".into()),
+                done(reason),
+            ]))
+            .await;
+            let ProbeOutcome::Commit {
+                buffered,
+                parser_finished,
+                terminal_error,
+                ..
+            } = result
+            else {
+                panic!("an actual payload must not be retried");
+            };
+            assert!(parser_finished);
+            assert!(terminal_error.is_none());
+            assert_eq!(buffered.len(), 2);
+            assert!(matches!(&buffered[0], AiStreamDelta::TextDelta(text) if text == "answer"));
+            assert!(
+                matches!(&buffered[1], AiStreamDelta::Done { stop_reason } if stop_reason == reason)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn eof_decode_error_is_an_explicit_terminal_error() {
+        let result = probe_eof(Err(anyhow::anyhow!("invalid final event"))).await;
+        let ProbeOutcome::Commit {
+            buffered,
+            parser_finished,
+            terminal_error,
+            ..
+        } = result
+        else {
+            panic!("decode error must retain the explicit error-event path");
+        };
+        assert!(parser_finished);
+        assert!(buffered.is_empty());
+        assert!(terminal_error.unwrap().contains("conversion_parse_error"));
+    }
+
+    #[tokio::test]
+    async fn empty_eof_finishes_without_inventing_a_transient_failure() {
+        let result = probe_eof(Ok(vec![])).await;
+        assert!(matches!(result, ProbeOutcome::Commit {
+            parser_finished: true, terminal_error: None, buffered, ..
+        } if buffered.is_empty()));
+    }
+
     #[test]
     fn transient_terminal_whitelist_is_exact_and_case_insensitive() {
         assert!(is_transient_stream_terminal("malformed_function_call"));
@@ -516,6 +637,22 @@ mod tests {
         }));
         assert!(!stream_delta_is_payload(&AiStreamDelta::UnexpectedEof));
         assert!(!stream_delta_is_payload(&done("MALFORMED_FUNCTION_CALL")));
+    }
+
+    #[test]
+    fn finish_message_accepts_all_sse_line_endings_and_compact_data() {
+        for newline in ["\n", "\r\n", "\r"] {
+            for prefix in ["data: ", "data:"] {
+                let wire = format!(
+                    ": keepalive{newline}{newline}{prefix}{}{newline}{newline}",
+                    serde_json::json!({"response": {"candidates": [{"finishMessage": "empty function call"}]}}),
+                );
+                assert_eq!(
+                    extract_finish_message(&wire).as_deref(),
+                    Some("empty function call")
+                );
+            }
+        }
     }
 
     #[test]

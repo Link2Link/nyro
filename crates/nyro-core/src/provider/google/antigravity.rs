@@ -602,10 +602,12 @@ pub(crate) fn unwrap_response(body: &mut Value) {
 
 /// Unwrap every SSE `data:` line of a v1internal stream chunk. Lines that
 /// are not `data:` payloads or do not carry a `response` object are kept
-/// verbatim.
+/// verbatim. This is stateless: incomplete JSON fragments pass through for
+/// downstream buffering; do not normalize CRLF independently per chunk.
 pub(crate) fn unwrap_stream_chunk(chunk: &str) -> String {
     let mut out = String::with_capacity(chunk.len());
-    for line in chunk.split_inclusive('\n') {
+    // Splitting a CRLF pair here is safe because each terminator is preserved.
+    for line in chunk.split_inclusive(['\r', '\n']) {
         out.push_str(&unwrap_stream_line(line));
     }
     out
@@ -634,10 +636,8 @@ fn unwrap_stream_line(line: &str) -> String {
     rewritten.push_str(": ");
     rewritten.push_str(&inner.to_string());
     // Preserve the original line terminator.
-    let newline_len = line.chars().rev().take_while(|c| *c == '\n').count();
-    for _ in 0..newline_len {
-        rewritten.push('\n');
-    }
+    let content_len = line.trim_end_matches(['\r', '\n']).len();
+    rewritten.push_str(&line[content_len..]);
     rewritten
 }
 
@@ -757,6 +757,46 @@ mod tests {
         assert!(!out.contains("responseId"), "envelope keys dropped");
         assert!(out.contains(": keep-alive comment\n"));
         assert!(out.contains("data: [DONE]\n"));
+    }
+
+    #[test]
+    fn unwrap_stream_preserves_all_line_endings_and_eof() {
+        for newline in ["\n", "\r\n", "\r"] {
+            let chunk = format!(
+                "event: message{newline}data: {{\"response\":{{\"candidates\":[]}},\"responseId\":\"r1\"}}{newline}{newline}: keep-alive{newline}data: {{\"error\":{{\"message\":\"nope\"}}}}{newline}{newline}data: [DONE]{newline}data: {{\"response\":{{\"modelVersion\":\"gemini\"}}}}"
+            );
+            let expected = format!(
+                "event: message{newline}data: {{\"candidates\":[]}}{newline}{newline}: keep-alive{newline}data: {{\"error\":{{\"message\":\"nope\"}}}}{newline}{newline}data: [DONE]{newline}data: {{\"modelVersion\":\"gemini\"}}"
+            );
+            assert_eq!(unwrap_stream_chunk(&chunk), expected);
+            // Also exercise the line helper with an intact CRLF pair.
+            assert_eq!(
+                unwrap_stream_line(&format!("data: {{\"response\":{{}}}}{newline}")),
+                format!("data: {{}}{newline}")
+            );
+        }
+    }
+
+    #[test]
+    fn unwrap_stream_preserves_split_terminators_and_partial_json() {
+        let payload = "data: {\"response\":{\"candidates\":[]}}";
+        for newline in ["\n", "\r\n", "\r"] {
+            let chunk = format!("{payload}{newline}{newline}");
+            for split in payload.len()..=chunk.len() {
+                assert_eq!(
+                    unwrap_stream_chunk(&chunk[..split]) + &unwrap_stream_chunk(&chunk[split..]),
+                    format!("data: {{\"candidates\":[]}}{newline}{newline}")
+                );
+            }
+            // The adapter is intentionally stateless. Fragments must remain
+            // byte-for-byte intact, not gain terminators or lose CR bytes.
+            for split in 1..payload.len() {
+                assert_eq!(
+                    unwrap_stream_chunk(&chunk[..split]) + &unwrap_stream_chunk(&chunk[split..]),
+                    chunk
+                );
+            }
+        }
     }
 
     #[test]

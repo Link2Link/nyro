@@ -163,6 +163,7 @@ impl ResponseEncoder for GoogleResponseFormatter {
 
 pub struct GoogleStreamParser {
     buffer: String,
+    previous_was_cr: bool,
     first: bool,
     function_calls: CompleteFunctionCalls,
     failed: bool,
@@ -187,6 +188,7 @@ impl GoogleStreamParser {
     pub fn new() -> Self {
         Self {
             buffer: String::new(),
+            previous_was_cr: false,
             first: true,
             function_calls: CompleteFunctionCalls::default(),
             failed: false,
@@ -226,7 +228,17 @@ impl StreamResponseDecoder for GoogleStreamParser {
         if self.failed {
             return Ok(vec![]);
         }
-        self.buffer.push_str(raw);
+        // SSE accepts LF, CRLF, and CR line endings. Normalize incrementally:
+        // a CR already ends the line, but its optional LF may arrive in the
+        // next transport chunk and must not manufacture an empty SSE line.
+        for ch in raw.chars() {
+            if ch == '\n' && self.previous_was_cr {
+                self.previous_was_cr = false;
+                continue;
+            }
+            self.previous_was_cr = ch == '\r';
+            self.buffer.push(if ch == '\r' { '\n' } else { ch });
+        }
         let mut deltas = Vec::new();
 
         while let Some(pos) = self.buffer.find("\n\n") {
@@ -263,6 +275,8 @@ impl StreamResponseDecoder for GoogleStreamParser {
             return Ok(vec![]);
         }
         let remaining = std::mem::take(&mut self.buffer);
+        // `remaining` is already normalized, not a continuation of the wire.
+        self.previous_was_cr = false;
         self.parse_chunk(&format!("{remaining}\n\n"))
     }
 }
@@ -1174,6 +1188,167 @@ mod tests {
             "IMAGE"
         );
         assert_eq!(usage_event["responseId"], "stream-future");
+    }
+
+    #[test]
+    fn stream_parser_sse_line_endings_and_every_chunk_split() {
+        let text = serde_json::json!({"candidates": [{"content": {"parts": [{"text": "你好"}]}}]});
+        let terminal =
+            serde_json::json!({"candidates": [{"finishReason": "MALFORMED_FUNCTION_CALL"}]});
+        for newline in ["\n", "\r\n", "\r"] {
+            let raw = format!(
+                ": keepalive{newline}{newline}event: message{newline}data:{text}{newline}{newline}data: {terminal}{newline}{newline}"
+            );
+            for split in (0..=raw.len()).filter(|index| raw.is_char_boundary(*index)) {
+                let mut parser = GoogleStreamParser::new();
+                let mut deltas = parser.parse_chunk(&raw[..split]).unwrap();
+                deltas.extend(parser.parse_chunk("").unwrap());
+                deltas.extend(parser.parse_chunk(&raw[split..]).unwrap());
+                assert!(parser.finish().unwrap().is_empty());
+                assert_eq!(
+                    deltas
+                        .iter()
+                        .filter(|d| matches!(d, AiStreamDelta::MessageStart { .. }))
+                        .count(),
+                    1
+                );
+                assert_eq!(
+                    deltas
+                        .iter()
+                        .filter(|d| matches!(d, AiStreamDelta::TextDelta(text) if text == "你好"))
+                        .count(),
+                    1
+                );
+                assert_eq!(deltas.iter().filter(|d| matches!(d, AiStreamDelta::Done { stop_reason } if stop_reason == "MALFORMED_FUNCTION_CALL")).count(), 1);
+                assert!(
+                    !deltas
+                        .iter()
+                        .any(|d| matches!(d, AiStreamDelta::StreamError { .. })),
+                    "{newline:?}, split {split}: {deltas:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn stream_parser_preserves_multiple_complete_data_lines_per_event() {
+        // Keep Gemini's existing per-data-line JSON behavior; framing must not
+        // merge independent payloads or treat comments/event names as JSON.
+        for newline in ["\n", "\r\n", "\r"] {
+            let mut parser = GoogleStreamParser::new();
+            let raw = format!(
+                "event: message{newline}data: {{}}{newline}: comment{newline}data: {{\"candidates\":[{{\"finishReason\":\"STOP\"}}]}}{newline}{newline}"
+            );
+            let deltas = parser.parse_chunk(&raw).unwrap();
+            assert_eq!(
+                deltas
+                    .iter()
+                    .filter(|d| matches!(d, AiStreamDelta::MessageStart { .. }))
+                    .count(),
+                1
+            );
+            assert_eq!(deltas.iter().filter(|d| matches!(d, AiStreamDelta::Done { stop_reason } if stop_reason == "stop")).count(), 1);
+            assert!(
+                !deltas
+                    .iter()
+                    .any(|d| matches!(d, AiStreamDelta::StreamError { .. }))
+            );
+            assert!(parser.finish().unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn stream_parser_split_crlf_is_not_an_event_boundary() {
+        let mut parser = GoogleStreamParser::new();
+        assert!(parser.parse_chunk("data: {}\r").unwrap().is_empty());
+        assert!(parser.parse_chunk("").unwrap().is_empty());
+        assert!(parser.parse_chunk("\n").unwrap().is_empty());
+        let deltas = parser.parse_chunk("\r").unwrap();
+        assert!(matches!(
+            deltas.as_slice(),
+            [AiStreamDelta::MessageStart { .. }]
+        ));
+        assert!(parser.parse_chunk("\n").unwrap().is_empty());
+        assert!(parser.finish().unwrap().is_empty());
+    }
+
+    #[test]
+    fn stream_parser_mixed_endings_preserve_signed_calls_bytewise() {
+        let call = serde_json::json!({"candidates": [{"content": {"parts": [{
+            "functionCall": {"id": "call-1", "name": "read_file", "args": {"path": "x"}},
+            "thoughtSignature": "SIG-CALL"
+        }]}}]});
+        let raw = format!(
+            "event: message\rdata: {call}\n\r\ndata: {call}\r\rdata: {{\"candidates\":[{{\"finishReason\":\"STOP\"}}]}}\n\n"
+        );
+        let mut parser = GoogleStreamParser::new();
+        let mut deltas = Vec::new();
+        for byte in raw.as_bytes() {
+            deltas.extend(
+                parser
+                    .parse_chunk(std::str::from_utf8(std::slice::from_ref(byte)).unwrap())
+                    .unwrap(),
+            );
+        }
+        assert!(parser.finish().unwrap().is_empty());
+        assert_eq!(deltas.iter().filter(|d| matches!(d, AiStreamDelta::ToolCallStart { id, name, .. } if id == "call-1" && name == "read_file")).count(), 1);
+        assert_eq!(
+            deltas
+                .iter()
+                .filter(|d| matches!(d, AiStreamDelta::ToolCallDelta { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            deltas
+                .iter()
+                .filter(|d| matches!(d, AiStreamDelta::ThinkingSignature(sig) if sig == "SIG-CALL"))
+                .count(),
+            2
+        );
+        assert!(
+            deltas
+                .iter()
+                .any(|d| matches!(d, AiStreamDelta::Done { stop_reason } if stop_reason == "stop"))
+        );
+        assert!(
+            !deltas
+                .iter()
+                .any(|d| matches!(d, AiStreamDelta::StreamError { .. }))
+        );
+    }
+
+    #[test]
+    fn stream_parser_eof_and_json_errors_keep_existing_semantics() {
+        for ending in ["", "\n", "\r\n", "\r"] {
+            for prefix in ["", "data: "] {
+                let mut parser = GoogleStreamParser::new();
+                let raw = format!(
+                    "{prefix}{{\"candidates\":[{{\"finishReason\":\"MALFORMED_FUNCTION_CALL\"}}]}}{ending}"
+                );
+                assert!(parser.parse_chunk(&raw).unwrap().is_empty());
+                let deltas = parser.finish().unwrap();
+                assert!(deltas.iter().any(|d| matches!(d, AiStreamDelta::Done { stop_reason } if stop_reason == "MALFORMED_FUNCTION_CALL")));
+                assert!(parser.finish().unwrap().is_empty());
+            }
+        }
+        for newline in ["\n", "\r\n", "\r"] {
+            for (json, kind) in [
+                ("{", AiErrorKind::UnexpectedEof),
+                ("{oops}", AiErrorKind::StreamMidError),
+            ] {
+                let mut parser = GoogleStreamParser::new();
+                let raw = format!(
+                    "data: {json}{newline}{newline}data: {{\"candidates\":[{{\"finishReason\":\"STOP\"}}]}}{newline}{newline}"
+                );
+                let deltas = parser.parse_chunk(&raw).unwrap();
+                assert!(
+                    matches!(deltas.as_slice(), [AiStreamDelta::StreamError { error }] if error.kind == kind)
+                );
+                assert!(parser.parse_chunk("data: {}\n\n").unwrap().is_empty());
+                assert!(parser.finish().unwrap().is_empty());
+            }
+        }
     }
 
     #[test]
