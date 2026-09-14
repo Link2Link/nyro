@@ -1452,7 +1452,9 @@ impl LogStore for PostgresLogStore {
                 "SELECT upstream_model AS model, COUNT(*) AS request_count, COALESCE(SUM(input_tokens), 0) AS total_input_tokens, COALESCE(SUM(output_tokens), 0) AS total_output_tokens, COALESCE(SUM(cache_read_tokens), 0) AS total_cache_read_tokens, COALESCE(AVG(latency_total_ms)::FLOAT8, 0) AS avg_duration_ms, COALESCE(SUM(latency_upstream_ms), 0)::FLOAT8 AS total_upstream_ms, {tps} FROM request_logs WHERE created_at >= EXTRACT(EPOCH FROM CURRENT_TIMESTAMP - INTERVAL '{hours} hours') * 1000 GROUP BY upstream_model ORDER BY request_count DESC"
             )
         } else {
-            format!("SELECT upstream_model AS model, COUNT(*) AS request_count, COALESCE(SUM(input_tokens), 0) AS total_input_tokens, COALESCE(SUM(output_tokens), 0) AS total_output_tokens, COALESCE(SUM(cache_read_tokens), 0) AS total_cache_read_tokens, COALESCE(AVG(latency_total_ms)::FLOAT8, 0) AS avg_duration_ms, COALESCE(SUM(latency_upstream_ms), 0)::FLOAT8 AS total_upstream_ms, {tps} FROM request_logs GROUP BY upstream_model ORDER BY request_count DESC")
+            format!(
+                "SELECT upstream_model AS model, COUNT(*) AS request_count, COALESCE(SUM(input_tokens), 0) AS total_input_tokens, COALESCE(SUM(output_tokens), 0) AS total_output_tokens, COALESCE(SUM(cache_read_tokens), 0) AS total_cache_read_tokens, COALESCE(AVG(latency_total_ms)::FLOAT8, 0) AS avg_duration_ms, COALESCE(SUM(latency_upstream_ms), 0)::FLOAT8 AS total_upstream_ms, {tps} FROM request_logs GROUP BY upstream_model ORDER BY request_count DESC"
+            )
         };
         Ok(sqlx::query_as::<_, ModelStats>(&sql)
             .fetch_all(&self.pool)

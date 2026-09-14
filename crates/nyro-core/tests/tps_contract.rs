@@ -5,12 +5,15 @@
 //! valid: content 760 / output 1100 / elapsed 12500 ms) so the tests never
 //! re-implement the helper under test.
 
-use nyro_core::db::models::{ModelUsageTotals, ModelUsageStats, RecentModelPerformance};
+use nyro_core::db::models::{ModelUsageStats, ModelUsageTotals, RecentModelPerformance};
 use nyro_core::storage::{SqliteStorage, Storage};
 use serde::Deserialize;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 
-const FIXTURE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/fixtures/tps-contract.json");
+const FIXTURE: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../tests/fixtures/tps-contract.json"
+);
 const AS_OF: i64 = 1_700_000_000_000;
 
 #[derive(Debug, Deserialize)]
@@ -58,9 +61,19 @@ fn fixture_matches_single_sample_semantics() {
     assert_eq!(cases.len(), 17);
     for case in &cases {
         let sample = to_sample(&case.log);
-        assert_eq!(sample.content_tokens(), case.content_tokens, "{}: content_tokens", case.name);
+        assert_eq!(
+            sample.content_tokens(),
+            case.content_tokens,
+            "{}: content_tokens",
+            case.name
+        );
         assert_eq!(sample.tps(), case.tps, "{}: tps", case.name);
-        assert_eq!(sample.gross_tps(), case.gross_tps, "{}: gross_tps", case.name);
+        assert_eq!(
+            sample.gross_tps(),
+            case.gross_tps,
+            "{}: gross_tps",
+            case.name
+        );
         assert_eq!(
             sample.tps().is_some(),
             sample.gross_tps().is_some(),
@@ -91,7 +104,11 @@ fn fixture_aggregates_are_latency_weighted_not_averaged() {
 async fn sqlite() -> anyhow::Result<SqliteStorage> {
     let pool = SqlitePoolOptions::new()
         .max_connections(1)
-        .connect_with(SqliteConnectOptions::new().in_memory(true).foreign_keys(true))
+        .connect_with(
+            SqliteConnectOptions::new()
+                .in_memory(true)
+                .foreign_keys(true),
+        )
         .await?;
     let storage = SqliteStorage::from_pool(pool);
     storage.bootstrap().migrate().await?;
@@ -119,7 +136,10 @@ async fn sqlite_readback_matches_fixture_contract() -> anyhow::Result<()> {
         .await?;
     }
 
-    let usage = storage.logs().model_usage_stats("tpsp", "tps-model").await?;
+    let usage = storage
+        .logs()
+        .model_usage_stats("tpsp", "tps-model")
+        .await?;
     assert_eq!(usage.recent_sample_count, 17);
     assert_eq!(usage.valid_tps_count, 10);
     assert_eq!(usage.recent_content_tokens, 760);

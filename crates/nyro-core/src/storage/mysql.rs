@@ -1507,7 +1507,9 @@ impl LogStore for MysqlLogStore {
                 "SELECT upstream_model AS model, COUNT(*) AS request_count, CAST(COALESCE(SUM(input_tokens), 0) AS SIGNED) AS total_input_tokens, CAST(COALESCE(SUM(output_tokens), 0) AS SIGNED) AS total_output_tokens, CAST(COALESCE(SUM(cache_read_tokens), 0) AS SIGNED) AS total_cache_read_tokens, CAST(COALESCE(AVG(latency_total_ms), 0) AS DOUBLE) AS avg_duration_ms, CAST(COALESCE(SUM(latency_upstream_ms), 0) AS DOUBLE) AS total_upstream_ms, {tps} FROM request_logs WHERE created_at >= UNIX_TIMESTAMP(NOW() - INTERVAL {hours} HOUR) * 1000 GROUP BY upstream_model ORDER BY request_count DESC"
             )
         } else {
-            format!("SELECT upstream_model AS model, COUNT(*) AS request_count, CAST(COALESCE(SUM(input_tokens), 0) AS SIGNED) AS total_input_tokens, CAST(COALESCE(SUM(output_tokens), 0) AS SIGNED) AS total_output_tokens, CAST(COALESCE(SUM(cache_read_tokens), 0) AS SIGNED) AS total_cache_read_tokens, CAST(COALESCE(AVG(latency_total_ms), 0) AS DOUBLE) AS avg_duration_ms, CAST(COALESCE(SUM(latency_upstream_ms), 0) AS DOUBLE) AS total_upstream_ms, {tps} FROM request_logs GROUP BY upstream_model ORDER BY request_count DESC")
+            format!(
+                "SELECT upstream_model AS model, COUNT(*) AS request_count, CAST(COALESCE(SUM(input_tokens), 0) AS SIGNED) AS total_input_tokens, CAST(COALESCE(SUM(output_tokens), 0) AS SIGNED) AS total_output_tokens, CAST(COALESCE(SUM(cache_read_tokens), 0) AS SIGNED) AS total_cache_read_tokens, CAST(COALESCE(AVG(latency_total_ms), 0) AS DOUBLE) AS avg_duration_ms, CAST(COALESCE(SUM(latency_upstream_ms), 0) AS DOUBLE) AS total_upstream_ms, {tps} FROM request_logs GROUP BY upstream_model ORDER BY request_count DESC"
+            )
         };
         Ok(sqlx::query_as::<_, ModelStats>(&sql)
             .fetch_all(&self.pool)

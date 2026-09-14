@@ -37,8 +37,7 @@ impl TpsTotals {
     }
 
     fn ratio(&self, tokens: i64) -> Option<f64> {
-        (self.tps_elapsed_ms > 0)
-            .then(|| tokens as f64 / (self.tps_elapsed_ms as f64 / 1000.0))
+        (self.tps_elapsed_ms > 0).then(|| tokens as f64 / (self.tps_elapsed_ms as f64 / 1000.0))
     }
 
     /// Fold one retained-log sample into the sums. Returns whether the sample

@@ -14,7 +14,10 @@ use nyro_core::storage::{MysqlStorage, PostgresStorage, SqliteStorage, Storage};
 use serde::Deserialize;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 
-const FIXTURE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/fixtures/tps-contract.json");
+const FIXTURE: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../tests/fixtures/tps-contract.json"
+);
 const START: i64 = 1_700_000_000_000;
 const END: i64 = 1_700_000_020_000;
 
@@ -51,10 +54,9 @@ struct Row {
 }
 
 fn rows() -> Vec<Row> {
-    let cases: Vec<Case> = serde_json::from_str(
-        &std::fs::read_to_string(FIXTURE).expect("shared fixture readable"),
-    )
-    .expect("shared fixture parses");
+    let cases: Vec<Case> =
+        serde_json::from_str(&std::fs::read_to_string(FIXTURE).expect("shared fixture readable"))
+            .expect("shared fixture parses");
     let mut rows: Vec<Row> = cases
         .iter()
         .enumerate()
@@ -155,7 +157,10 @@ async fn exercise(storage: &dyn Storage) -> anyhow::Result<()> {
     assert_eq!(provider_detail.models.len(), 1);
     assert_eq!(provider_detail.models[0].upstream_model, "tps-model");
     assert_eq!(provider_detail.models[0].tps_totals.tps_content_tokens, 760);
-    assert_eq!(provider_detail.models[0].tps_totals.tps_output_tokens, 1_100);
+    assert_eq!(
+        provider_detail.models[0].tps_totals.tps_output_tokens,
+        1_100
+    );
     assert_eq!(provider_detail.models[0].tps_totals.tps_elapsed_ms, 12_500);
 
     let model_detail = storage
@@ -179,8 +184,14 @@ async fn exercise(storage: &dyn Storage) -> anyhow::Result<()> {
         .await?;
     assert_eq!(key_detail.request_count, 17);
     assert_eq!(key_detail.model_routes.len(), 1);
-    assert_eq!(key_detail.model_routes[0].tps_totals.tps_content_tokens, 760);
-    assert_eq!(key_detail.model_routes[0].tps_totals.tps_output_tokens, 1_100);
+    assert_eq!(
+        key_detail.model_routes[0].tps_totals.tps_content_tokens,
+        760
+    );
+    assert_eq!(
+        key_detail.model_routes[0].tps_totals.tps_output_tokens,
+        1_100
+    );
     assert_eq!(key_detail.model_routes[0].tps_totals.tps_elapsed_ms, 12_500);
 
     // ---- unfiltered stats_by_* views: fixture + out-of-window rows ----
@@ -248,7 +259,11 @@ const COLS: &str = "(id, created_at, provider_id, provider_name, api_key_id, api
 async fn sqlite_aggregate_tps_totals() -> anyhow::Result<()> {
     let pool = SqlitePoolOptions::new()
         .max_connections(1)
-        .connect_with(SqliteConnectOptions::new().in_memory(true).foreign_keys(true))
+        .connect_with(
+            SqliteConnectOptions::new()
+                .in_memory(true)
+                .foreign_keys(true),
+        )
         .await?;
     let storage = SqliteStorage::from_pool(pool);
     storage.bootstrap().migrate().await?;
