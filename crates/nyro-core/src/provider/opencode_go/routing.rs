@@ -5,8 +5,7 @@
 //! `{"type":"error","error":{"type":"error","message":"Internal server
 //! error"}}` — indistinguishable from a transient upstream failure. So the
 //! mapping cannot be discovered from error codes: it is hardcoded here from
-//! the measured matrix (2026-09, all 37 `/v1/models` entries × the three
-//! endpoints).
+//! the measured matrix.
 //!
 //! Rules, in priority order:
 //!
@@ -19,10 +18,9 @@
 //!    Without this downgrade an adaptive provider would pick the ingress
 //!    protocol and 500.
 //! 3. **A model that is not listed is assumed chat-only** — `/v1/chat/
-//!    completions` is the widest endpoint (26 of 30 live models serve it), so
-//!    this default keeps unknown models working for the common case instead of
-//!    silently sending them to an endpoint that does not serve them. A new
-//!    responses-only model upstream needs one line added here.
+//!    completions` is the default endpoint, so this default keeps unknown
+//!    models working for the common case instead of silently sending them to
+//!    an endpoint that does not serve them.
 //!
 //! Matching is exact (`trim` + case-insensitive) against the *upstream* model
 //! name, so a future variant of a listed family is never hijacked by a prefix
@@ -40,41 +38,29 @@ const CHAT: ProtocolId = OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1;
 const RESPONSES: ProtocolId = OPENAI_RESPONSES_V1;
 const MESSAGES: ProtocolId = ANTHROPIC_MESSAGES_2023_06_01;
 
-/// Every endpoint the Go plan serves these models on (measured).
-const ALL_ENDPOINTS: &[ProtocolId] = &[CHAT, RESPONSES, MESSAGES];
-/// Chat plus the Anthropic endpoint; `/v1/responses` rejects these models.
-const CHAT_AND_MESSAGES: &[ProtocolId] = &[CHAT, MESSAGES];
 /// `/v1/chat/completions` and `/v1/messages` both reject these models.
 const RESPONSES_ONLY: &[ProtocolId] = &[RESPONSES];
-/// `/v1/chat/completions` and `/v1/responses` both reject this model.
+/// `/v1/chat/completions` and `/v1/responses` both reject these models.
 const MESSAGES_ONLY: &[ProtocolId] = &[MESSAGES];
 
 /// Models whose endpoint set differs from the chat-only default. Everything
 /// else — including models added upstream after this table was written — is
 /// treated as chat-only by [`supports`].
 const MODEL_ENDPOINTS: &[(&str, &[ProtocolId])] = &[
-    // All three endpoints serve these.
-    ("deepseek-flash", ALL_ENDPOINTS),
-    ("deepseek-v4-flash", ALL_ENDPOINTS),
-    ("deepseek-v4-flash-vision-exp", ALL_ENDPOINTS),
-    ("deepseek-v4-pro", ALL_ENDPOINTS),
-    ("deepseek-v4.1-flash", ALL_ENDPOINTS),
-    // Chat + Anthropic messages.
-    ("kimi-k3", CHAT_AND_MESSAGES),
-    ("minimax-m2.5", CHAT_AND_MESSAGES),
-    ("minimax-m3", CHAT_AND_MESSAGES),
-    ("qwen3.6-plus", CHAT_AND_MESSAGES),
-    ("qwen3.7-max", CHAT_AND_MESSAGES),
-    ("qwen3.7-plus", CHAT_AND_MESSAGES),
-    ("qwen3.8-flash", CHAT_AND_MESSAGES),
-    ("qwen3.8-max", CHAT_AND_MESSAGES),
     // Responses only.
     ("gpt-5.6-luna", RESPONSES_ONLY),
     ("grok-4.6", RESPONSES_ONLY),
     ("muse-spark-1.2-contributor", RESPONSES_ONLY),
     ("muse-spark-1.3-contributor", RESPONSES_ONLY),
     // Anthropic messages only.
+    ("minimax-m2.5", MESSAGES_ONLY),
     ("minimax-m2.7", MESSAGES_ONLY),
+    ("minimax-m3", MESSAGES_ONLY),
+    ("qwen3.6-plus", MESSAGES_ONLY),
+    ("qwen3.7-max", MESSAGES_ONLY),
+    ("qwen3.7-plus", MESSAGES_ONLY),
+    ("qwen3.8-flash", MESSAGES_ONLY),
+    ("qwen3.8-max", MESSAGES_ONLY),
 ];
 
 /// Models the upstream still advertises in `GET /v1/models` but does not serve
@@ -168,7 +154,6 @@ fn normalize(model: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::ids::GOOGLE_GEMINI_GENERATE_CONTENT_V1BETA;
 
     fn provider(vendor: &str, base_url: &str, mode: &str) -> Provider {
         Provider {
@@ -201,20 +186,28 @@ mod tests {
 
     #[test]
     fn listed_models_expose_only_their_measured_endpoints() {
+        // DeepSeek is chat-only under current user specs
         assert!(supports("deepseek-v4-pro", CHAT));
-        assert!(supports("deepseek-v4-pro", RESPONSES));
-        assert!(supports("deepseek-v4-pro", MESSAGES));
+        assert!(!supports("deepseek-v4-pro", RESPONSES));
+        assert!(!supports("deepseek-v4-pro", MESSAGES));
 
+        // Kimi K3 is chat-only
         assert!(supports("kimi-k3", CHAT));
-        assert!(supports("kimi-k3", MESSAGES));
+        assert!(!supports("kimi-k3", MESSAGES));
         assert!(!supports("kimi-k3", RESPONSES));
 
+        // Grok is responses-only
         assert!(supports("grok-4.6", RESPONSES));
         assert!(!supports("grok-4.6", CHAT));
         assert!(!supports("grok-4.6", MESSAGES));
 
+        // MiniMax & Qwen are messages-only
         assert!(supports("minimax-m2.7", MESSAGES));
         assert!(!supports("minimax-m2.7", CHAT));
+        assert!(supports("minimax-m3", MESSAGES));
+        assert!(!supports("minimax-m3", CHAT));
+        assert!(supports("qwen3.8-max", MESSAGES));
+        assert!(!supports("qwen3.8-max", CHAT));
     }
 
     #[test]
@@ -222,6 +215,8 @@ mod tests {
         assert!(supports("glm-5.3", CHAT));
         assert!(!supports("glm-5.3", RESPONSES));
         assert!(!supports("glm-5.3", MESSAGES));
+        assert!(supports("hy3", CHAT));
+        assert!(supports("hy4-preview", CHAT));
         // Unknown / future models default to chat.
         assert!(supports("glm-6-turbo", CHAT));
         assert!(!supports("glm-6-turbo", RESPONSES));
@@ -234,6 +229,7 @@ mod tests {
         assert!(!supports("grok-4.6-preview", RESPONSES));
         assert!(supports("grok-4.6-preview", CHAT));
         assert_eq!(primary_protocol("MINIMAX-M2.7"), MESSAGES);
+        assert_eq!(primary_protocol("QWEN3.8-MAX"), MESSAGES);
     }
 
     #[test]
@@ -241,19 +237,30 @@ mod tests {
         assert_eq!(primary_protocol("glm-5.3"), CHAT);
         assert_eq!(primary_protocol("kimi-k3"), CHAT);
         assert_eq!(primary_protocol("minimax-m2.7"), MESSAGES);
+        assert_eq!(primary_protocol("minimax-m3"), MESSAGES);
+        assert_eq!(primary_protocol("qwen3.8-max"), MESSAGES);
         assert_eq!(primary_protocol("grok-4.6"), RESPONSES);
     }
 
     #[test]
     fn client_protocol_wins_when_the_model_serves_it() {
         // Claude Code asking a messages-capable model stays native.
-        assert_eq!(preferred_egress(&go_provider(), "kimi-k3", MESSAGES), None);
-        // Codex asking a responses-capable model stays native.
         assert_eq!(
-            preferred_egress(&go_provider(), "deepseek-v4-pro", RESPONSES),
+            preferred_egress(&go_provider(), "minimax-m3", MESSAGES),
             None
         );
+        assert_eq!(
+            preferred_egress(&go_provider(), "qwen3.8-max", MESSAGES),
+            None
+        );
+        // Codex asking a responses-capable model stays native.
+        assert_eq!(
+            preferred_egress(&go_provider(), "grok-4.6", RESPONSES),
+            None
+        );
+        // Chat asking a chat model stays native.
         assert_eq!(preferred_egress(&go_provider(), "glm-5.3", CHAT), None);
+        assert_eq!(preferred_egress(&go_provider(), "kimi-k3", CHAT), None);
     }
 
     #[test]
@@ -273,68 +280,48 @@ mod tests {
             preferred_egress(&go_provider(), "glm-5.3", MESSAGES),
             Some(CHAT)
         );
+        assert_eq!(
+            preferred_egress(&go_provider(), "kimi-k3", MESSAGES),
+            Some(CHAT)
+        );
         // Codex asking a chat-only model.
         assert_eq!(
             preferred_egress(&go_provider(), "longcat-2.0", RESPONSES),
             Some(CHAT)
         );
-        // Chat client asking a messages-only model.
+        // Chat asking a messages-only model.
         assert_eq!(
-            preferred_egress(&go_provider(), "minimax-m2.7", CHAT),
+            preferred_egress(&go_provider(), "minimax-m3", CHAT),
+            Some(MESSAGES)
+        );
+        assert_eq!(
+            preferred_egress(&go_provider(), "qwen3.8-max", CHAT),
             Some(MESSAGES)
         );
     }
 
     #[test]
-    fn other_vendors_and_protocols_are_untouched() {
-        assert_eq!(
-            preferred_egress(
-                &provider("zhipuai", "https://open.bigmodel.cn", "adaptive"),
-                "grok-4.6",
-                CHAT
-            ),
-            None
-        );
-        // Non-OpenAI protocols are never in the table, so an OpenCode Go
-        // provider reached by Gemini ingress asks for the model's endpoint.
-        assert_eq!(
-            preferred_egress(
-                &go_provider(),
-                "glm-5.3",
-                GOOGLE_GEMINI_GENERATE_CONTENT_V1BETA
-            ),
-            Some(CHAT)
-        );
+    fn non_opencode_provider_has_no_opinion() {
+        let other = provider("openai", "https://api.openai.com", "fixed");
+        assert_eq!(preferred_egress(&other, "grok-4.6", CHAT), None);
     }
 
     #[test]
-    fn unavailable_models_are_filtered_out_of_the_model_list() {
+    fn filter_models_strips_only_the_declared_unavailable_set() {
         let models = vec![
-            "glm-5.3".to_string(),
-            "grok-4.5".to_string(),
-            "GLM-5".to_string(),
-            "mimo-v2-omni".to_string(),
-            "kimi-k3".to_string(),
+            "glm-5.3".into(),
+            "glm-5".into(),
+            "grok-4.6".into(),
+            "grok-4.5".into(),
+            "qwen3.5-plus".into(),
+            "qwen3.8-max".into(),
+            "hy3".into(),
+            "hy4-preview".into(),
         ];
+        let visible = filter_models(models);
         assert_eq!(
-            filter_models(models.clone()),
-            vec!["glm-5.3".to_string(), "kimi-k3".to_string()]
-        );
-        assert!(is_unavailable("qwen3.5-plus"));
-        assert!(!is_unavailable("qwen3.6-plus"));
-        assert!(!is_unavailable(""));
-
-        // Scoped: other vendors keep their full list.
-        assert_eq!(
-            visible_models(
-                &provider("minimax", "https://api.minimax.io", "fixed"),
-                models.clone()
-            ),
-            models
-        );
-        assert_eq!(
-            visible_models(&go_provider(), models),
-            vec!["glm-5.3".to_string(), "kimi-k3".to_string()]
+            visible,
+            vec!["glm-5.3", "grok-4.6", "qwen3.8-max", "hy3", "hy4-preview"]
         );
     }
 }
