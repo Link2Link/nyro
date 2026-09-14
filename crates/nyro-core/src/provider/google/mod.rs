@@ -125,14 +125,19 @@ pub struct GoogleVendor;
 /// starving completion text before emission starts.
 /// This is an allowance, not a target length or a claim about model capacity.
 ///
-/// Value must stay at or below the per-model output cap enforced by the
-/// upstream: the subscription `v1internal` surface rejects
-/// `maxOutputTokens=524288` with a generic `400 INVALID_ARGUMENT`
-/// (production incident 2026-09-11, request 235a9460-17d2-470f-932f-9dcd9cc08e63:
-/// every Google AI Pro request failed after the floor was deployed). 64_000 is
-/// proven accepted (hours of successful gemini-3.8-flash traffic sent exactly
-/// this value before the incident), while 512*1024 is proven rejected.
+/// 64_000 is the proven-accepted production value (hours of successful
+/// gemini-3.8-flash traffic on the subscription `v1internal` surface sent
+/// exactly this value), so smaller budgets are raised to it.
 const GOOGLE_OUTPUT_TOKEN_FLOOR: u64 = 64_000;
+
+/// Per-model output cap enforced by the upstream: budgets above it are
+/// rejected with a generic `400 INVALID_ARGUMENT`. Probed 2026-09-14 on
+/// gemini-3.8-flash-high (Google AI Pro subscription, streaming): 65_536 is
+/// the last accepted value, 65_537 and up fail — 524288 was the budget that
+/// produced the blanket 400 outage on 2026-09-11 (request
+/// 235a9460-17d2-470f-932f-9dcd9cc08e63). Over-limit budgets are clamped
+/// down to the cap instead of being forwarded to a guaranteed 400.
+const GOOGLE_OUTPUT_TOKEN_CEILING: u64 = 65_536;
 
 pub(crate) fn apply_output_token_floor(body: &mut Value, vendor: Option<&str>) {
     if vendor != Some("google") {
@@ -152,13 +157,13 @@ pub(crate) fn apply_output_token_floor(body: &mut Value, vendor: Option<&str>) {
         if object.contains_key("max_completion_tokens") {
             object.insert(
                 "max_completion_tokens".into(),
-                Value::from(budget.max(GOOGLE_OUTPUT_TOKEN_FLOOR)),
+                Value::from(budget.clamp(GOOGLE_OUTPUT_TOKEN_FLOOR, GOOGLE_OUTPUT_TOKEN_CEILING)),
             );
         }
         if object.contains_key("max_tokens") {
             object.insert(
                 "max_tokens".into(),
-                Value::from(budget.max(GOOGLE_OUTPUT_TOKEN_FLOOR)),
+                Value::from(budget.clamp(GOOGLE_OUTPUT_TOKEN_FLOOR, GOOGLE_OUTPUT_TOKEN_CEILING)),
             );
         }
     }
@@ -172,7 +177,7 @@ pub(crate) fn apply_output_token_floor(body: &mut Value, vendor: Option<&str>) {
         if let Some(budget) = config.get("maxOutputTokens").and_then(Value::as_u64) {
             config.insert(
                 "maxOutputTokens".into(),
-                Value::from(budget.max(GOOGLE_OUTPUT_TOKEN_FLOOR)),
+                Value::from(budget.clamp(GOOGLE_OUTPUT_TOKEN_FLOOR, GOOGLE_OUTPUT_TOKEN_CEILING)),
             );
         }
     } else if let Some(config) = object
@@ -183,7 +188,7 @@ pub(crate) fn apply_output_token_floor(body: &mut Value, vendor: Option<&str>) {
         if let Some(budget) = config.get("maxOutputTokens").and_then(Value::as_u64) {
             config.insert(
                 "maxOutputTokens".into(),
-                Value::from(budget.max(GOOGLE_OUTPUT_TOKEN_FLOOR)),
+                Value::from(budget.clamp(GOOGLE_OUTPUT_TOKEN_FLOOR, GOOGLE_OUTPUT_TOKEN_CEILING)),
             );
         }
     }
@@ -392,12 +397,26 @@ mod tests {
         apply_output_token_floor(&mut body2, Some("google"));
         assert_eq!(body2["max_completion_tokens"], 64_000);
 
-        // Larger than floor is preserved
+        // In-range budgets (floor..=ceiling) are preserved verbatim
+        let mut mid = json!({
+            "max_tokens": 65_000
+        });
+        apply_output_token_floor(&mut mid, Some("google"));
+        assert_eq!(mid["max_tokens"], 65_000);
+
+        // Over-limit budgets are clamped down to the upstream cap
+        // (65_536 accepted / 65_537 rejected, probed 2026-09-14)
         let mut body2 = json!({
             "max_tokens": 1024 * 1024
         });
         apply_output_token_floor(&mut body2, Some("google"));
-        assert_eq!(body2["max_tokens"], 1024 * 1024);
+        assert_eq!(body2["max_tokens"], 65_536);
+
+        let mut just_over = json!({
+            "max_tokens": 65_537
+        });
+        apply_output_token_floor(&mut just_over, Some("google"));
+        assert_eq!(just_over["max_tokens"], 65_536);
 
         // Missing tokens are untouched
         let mut body3 = json!({
@@ -456,6 +475,33 @@ mod tests {
         assert_ne!(
             production["request"]["generationConfig"]["maxOutputTokens"],
             512 * 1024
+        );
+
+        // Over-limit budgets are clamped down to the upstream cap instead of
+        // being forwarded to a guaranteed 400 (both wire shapes)
+        let mut overflow = json!({
+            "request": {
+                "contents": [{"parts": [{"text": "hi"}], "role": "user"}],
+                "generationConfig": {
+                    "maxOutputTokens": 512 * 1024
+                }
+            }
+        });
+        apply_output_token_floor(&mut overflow, Some("google"));
+        assert_eq!(
+            overflow["request"]["generationConfig"]["maxOutputTokens"],
+            65_536
+        );
+
+        let mut overflow_direct = json!({
+            "generationConfig": {
+                "maxOutputTokens": 65_537
+            }
+        });
+        apply_output_token_floor(&mut overflow_direct, Some("google"));
+        assert_eq!(
+            overflow_direct["generationConfig"]["maxOutputTokens"],
+            65_536
         );
 
         // Non-google vendor untouched
