@@ -242,7 +242,13 @@ impl GoogleSubscriptionDriver {
         let mut meta = serde_json::Map::new();
         if let Some(prior) = prior_meta.and_then(Value::as_object) {
             // Survive refreshes: Google does not echo these back.
-            for key in ["project_id", "email", "tier_id", "subscription_models"] {
+            for key in [
+                "project_id",
+                "email",
+                "tier_id",
+                "tier_ineligible",
+                "subscription_models",
+            ] {
                 if let Some(value) = prior.get(key).filter(|v| !v.is_null()) {
                     meta.insert(key.to_string(), value.clone());
                 }
@@ -329,6 +335,8 @@ impl GoogleSubscriptionDriver {
         let tier_summary = json!({
             "currentTier": parsed.get("currentTier").cloned().unwrap_or(Value::Null),
             "allowedTiers": parsed.get("allowedTiers").cloned().unwrap_or(Value::Null),
+            "paidTier": parsed.get("paidTier").cloned().unwrap_or(Value::Null),
+            "ineligibleTiers": parsed.get("ineligibleTiers").cloned().unwrap_or(Value::Null),
         });
         Ok((extract_project_id(&parsed), tier_summary))
     }
@@ -521,6 +529,69 @@ fn default_tier_id(tier_summary: &Value) -> String {
     "free-tier".to_string()
 }
 
+/// Tier id a tier field may carry either as a bare string (legacy) or as an
+/// object with an `id` member - sub2api's TierInfo/PaidTierInfo decoding
+/// accepts both shapes, so this driver does too.
+fn tier_id_from_value(value: &Value) -> Option<String> {
+    let id = match value {
+        Value::String(id) => Some(id.clone()),
+        Value::Object(_) => value
+            .get("id")
+            .and_then(Value::as_str)
+            .map(ToString::to_string),
+        _ => None,
+    }?;
+    (!id.trim().is_empty()).then_some(id)
+}
+
+/// Effective subscription tier for the credential: prefer `paidTier` (the
+/// subscription entitlement) over `currentTier` (the operating tier).
+/// Google reports both for consumer accounts - an active Google One AI
+/// Pro/Ultra subscription carries `paidTier: g1-pro-tier`/`g1-ultra-tier`
+/// while `currentTier` can remain `free-tier`, so displaying `currentTier`
+/// alone mislabels paid accounts as free. sub2api's `GetTier()` applies the
+/// same precedence.
+fn effective_tier_id(tier_summary: &Value) -> Option<String> {
+    let paid = tier_summary
+        .get("paidTier")
+        .filter(|value| !value.is_null())
+        .and_then(tier_id_from_value);
+    if paid.is_some() {
+        return paid;
+    }
+    tier_summary
+        .get("currentTier")
+        .filter(|value| !value.is_null())
+        .and_then(tier_id_from_value)
+}
+
+/// Compact record of tiers the account is barred from, with Google's reason
+/// codes - the diagnostic for the "paid subscription not recognized" case
+/// (`paidTier` absent while `ineligibleTiers` explains why, e.g.
+/// `INELIGIBLE_ACCOUNT`). Format: `id:reasonCode` entries joined by `, `.
+fn ineligible_tier_note(tier_summary: &Value) -> Option<String> {
+    let tiers = tier_summary
+        .get("ineligibleTiers")
+        .and_then(Value::as_array)?;
+    let entries: Vec<String> = tiers
+        .iter()
+        .filter_map(|tier| {
+            let id = tier.get("id").and_then(Value::as_str)?.trim().to_string();
+            if id.is_empty() {
+                return None;
+            }
+            let reason = tier
+                .get("reasonCode")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map_or_else(|| "UNKNOWN".to_string(), ToString::to_string);
+            Some(format!("{id}:{reason}"))
+        })
+        .collect();
+    (!entries.is_empty()).then(|| entries.join(", "))
+}
+
 #[async_trait]
 impl AuthDriver for GoogleSubscriptionDriver {
     fn metadata(&self) -> AuthDriverMetadata {
@@ -646,12 +717,11 @@ impl AuthDriver for GoogleSubscriptionDriver {
         if let Some(meta) = bundle.raw.as_object_mut() {
             meta.insert("email".to_string(), Value::String(email));
             meta.insert("project_id".to_string(), Value::String(project_id.clone()));
-            if let Some(tier) = tier_summary
-                .get("currentTier")
-                .and_then(|t| t.get("id"))
-                .and_then(Value::as_str)
-            {
-                meta.insert("tier_id".to_string(), Value::String(tier.to_string()));
+            if let Some(tier) = effective_tier_id(&tier_summary) {
+                meta.insert("tier_id".to_string(), Value::String(tier));
+            }
+            if let Some(note) = ineligible_tier_note(&tier_summary) {
+                meta.insert("tier_ineligible".to_string(), Value::String(note));
             }
             self.attach_catalog_snapshot(&client, &access_token, &project_id, meta)
                 .await;
@@ -708,12 +778,11 @@ impl AuthDriver for GoogleSubscriptionDriver {
                 .await?;
             if let Some(meta) = bundle.raw.as_object_mut() {
                 meta.insert("project_id".to_string(), Value::String(project_id));
-                if let Some(tier) = tier_summary
-                    .get("currentTier")
-                    .and_then(|t| t.get("id"))
-                    .and_then(Value::as_str)
-                {
-                    meta.insert("tier_id".to_string(), Value::String(tier.to_string()));
+                if let Some(tier) = effective_tier_id(&tier_summary) {
+                    meta.insert("tier_id".to_string(), Value::String(tier));
+                }
+                if let Some(note) = ineligible_tier_note(&tier_summary) {
+                    meta.insert("tier_ineligible".to_string(), Value::String(note));
                 }
             }
         }
@@ -957,6 +1026,62 @@ mod tests {
         });
         assert_eq!(default_tier_id(&summary), "tiered");
         assert_eq!(default_tier_id(&json!({})), "free-tier");
+    }
+
+    #[test]
+    fn effective_tier_id_prefers_paid_tier_over_current() {
+        let summary = json!({
+            "currentTier": {"id": "free-tier"},
+            "paidTier": {"id": "g1-pro-tier"},
+        });
+        assert_eq!(effective_tier_id(&summary).as_deref(), Some("g1-pro-tier"));
+    }
+
+    #[test]
+    fn effective_tier_id_accepts_string_and_object_forms() {
+        let string_paid = json!({
+            "paidTier": "g1-ultra-tier",
+            "currentTier": {"id": "free-tier"},
+        });
+        assert_eq!(
+            effective_tier_id(&string_paid).as_deref(),
+            Some("g1-ultra-tier")
+        );
+        let legacy_current = json!({"currentTier": "individual"});
+        assert_eq!(
+            effective_tier_id(&legacy_current).as_deref(),
+            Some("individual")
+        );
+    }
+
+    #[test]
+    fn effective_tier_id_falls_back_to_current_then_none() {
+        let current_only = json!({"currentTier": {"id": "free-tier"}});
+        assert_eq!(
+            effective_tier_id(&current_only).as_deref(),
+            Some("free-tier")
+        );
+        assert_eq!(effective_tier_id(&json!({})), None);
+        // Null tiers (loadCodeAssist unavailable during refresh) resolve to none
+        // so the prior meta tier_id survives instead of being overwritten.
+        let null_summary = json!({"currentTier": null, "paidTier": null});
+        assert_eq!(effective_tier_id(&null_summary), None);
+    }
+
+    #[test]
+    fn ineligible_tier_note_collects_reason_codes() {
+        let summary = json!({
+            "ineligibleTiers": [
+                {"id": "g1-pro-tier", "reasonCode": "INELIGIBLE_ACCOUNT"},
+                {"id": "g1-ultra-tier"},
+            ]
+        });
+        assert_eq!(
+            ineligible_tier_note(&summary).as_deref(),
+            Some("g1-pro-tier:INELIGIBLE_ACCOUNT, g1-ultra-tier:UNKNOWN")
+        );
+        assert_eq!(ineligible_tier_note(&json!({"ineligibleTiers": []})), None);
+        assert_eq!(ineligible_tier_note(&json!({})), None);
     }
 
     #[test]

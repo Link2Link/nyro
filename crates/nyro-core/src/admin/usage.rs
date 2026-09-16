@@ -535,6 +535,68 @@ fn google_subscription_tiers(
     }
 }
 
+/// Canonical window names the WebUI translates (`five_hour` -> "5小时",
+/// `weekly_limit` -> "每周") and feeds the steady-pace marker; unknown
+/// windows fall back to a lowercased copy.
+fn quota_window_tag(window: Option<&str>) -> String {
+    let window = window.unwrap_or_default().trim();
+    let upper = window.to_uppercase();
+    if upper.contains("WEEK") {
+        "weekly_limit".to_string()
+    } else if upper.contains("FIVE") || upper.contains("5H") {
+        "five_hour".to_string()
+    } else if upper.contains("DAY") {
+        "daily".to_string()
+    } else if window.is_empty() {
+        "window".to_string()
+    } else {
+        window.to_lowercase()
+    }
+}
+
+/// Build usage tiers from the enforced quota buckets
+/// (`v1internal:retrieveUserQuotaSummary`): Google reports one bucket per
+/// model family × window with identical generic labels, so the tiers
+/// collapse to **one row per window** (canonical names the WebUI translates
+/// — `five_hour` / `weekly_limit`, matching every other coding-plan
+/// backend) carrying each window's tightest bucket: the most spent fraction
+/// and its reset time, i.e. the constraint actually binding the account.
+/// This is the enforcement-grade readout - the model-catalog fold above
+/// stays as the fallback when the quota summary surface is unavailable or
+/// empty.
+fn quota_summary_tiers(
+    buckets: &[crate::provider::google::antigravity::QuotaSummaryBucket],
+) -> Vec<ProviderUsageTier> {
+    let mut windows: std::collections::BTreeMap<String, ProviderUsageTier> =
+        std::collections::BTreeMap::new();
+    for bucket in buckets {
+        let name = quota_window_tag(bucket.window.as_deref());
+        let used_percent = ((1.0 - bucket.remaining_fraction) * 10_000.0).round() / 100.0;
+        let entry = windows.entry(name).or_insert(ProviderUsageTier {
+            used_percent,
+            resets_at: bucket.resets_at.clone(),
+            name: String::new(),
+        });
+        if used_percent > entry.used_percent {
+            entry.used_percent = used_percent;
+            entry.resets_at = bucket.resets_at.clone();
+        }
+    }
+    let mut tiers: Vec<ProviderUsageTier> = windows
+        .into_iter()
+        .map(|(name, mut tier)| {
+            tier.name = name;
+            tier
+        })
+        .collect();
+    tiers.sort_by(|a, b| {
+        b.used_percent
+            .partial_cmp(&a.used_percent)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    tiers
+}
+
 /// Provider-level scheduling observation for the Google subscription
 /// backend. Each tier is an independent per-model pool, so a single spent
 /// pool must never pause the whole provider: the observation carries the
@@ -2210,7 +2272,36 @@ impl AdminService {
                 )
                 .await
                 .context("fetch Google subscription model catalog for usage query")?;
-                let tiers = google_subscription_tiers(&models);
+                // Enforcement-grade quota first: the official quota surface
+                // (`retrieveUserQuotaSummary`) reports the budget windows the
+                // gate actually enforces; the model-catalog quotaInfo fold is
+                // a request-dimension readout that can show 100% while
+                // requests 429, so it only serves as the fallback.
+                let tiers = match crate::provider::google::antigravity::retrieve_user_quota_summary(
+                    &client,
+                    runtime.access_token.trim(),
+                    &project_id,
+                    &user_agent,
+                )
+                .await
+                {
+                    Ok(buckets) if !buckets.is_empty() => quota_summary_tiers(&buckets),
+                    Ok(_) => {
+                        tracing::warn!(
+                            "Google subscription quota summary returned no buckets; \
+                             falling back to catalog quotaInfo"
+                        );
+                        google_subscription_tiers(&models)
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            %error,
+                            "Google subscription quota summary query failed; \
+                             falling back to catalog quotaInfo"
+                        );
+                        google_subscription_tiers(&models)
+                    }
+                };
                 let level = credential
                     .meta
                     .get("tier_id")
@@ -3568,6 +3659,56 @@ mod tests {
         assert!(parse_opencode_tiers(&no_percent).is_empty());
         // No usage object at all.
         assert!(parse_opencode_tiers(&serde_json::json!({})).is_empty());
+    }
+
+    #[test]
+    fn quota_summary_tiers_name_windows_and_percent() {
+        use crate::provider::google::antigravity::QuotaSummaryBucket;
+        let buckets = vec![
+            QuotaSummaryBucket {
+                group: Some("Gemini".into()),
+                display_name: Some("Five Hour Limit Remaining".into()),
+                bucket_id: Some("b1".into()),
+                window: Some("FIVE_HOURS".into()),
+                remaining_fraction: 0.0,
+                resets_at: Some("2026-09-16T10:35:34Z".into()),
+            },
+            QuotaSummaryBucket {
+                group: Some("Gemini".into()),
+                display_name: Some("Weekly Limit Remaining".into()),
+                bucket_id: Some("b2".into()),
+                window: Some("WEEKLY".into()),
+                remaining_fraction: 0.5,
+                resets_at: Some("2026-09-23T05:35:34Z".into()),
+            },
+            QuotaSummaryBucket {
+                group: Some("Claude".into()),
+                display_name: Some("Five Hour Limit Remaining".into()),
+                bucket_id: Some("b3".into()),
+                window: Some("FIVE_HOURS".into()),
+                remaining_fraction: 0.9,
+                resets_at: Some("2026-09-16T12:59:59Z".into()),
+            },
+            QuotaSummaryBucket {
+                group: Some("Claude".into()),
+                display_name: Some("Weekly Limit Remaining".into()),
+                bucket_id: Some("b4".into()),
+                window: Some("WEEKLY".into()),
+                remaining_fraction: 0.998,
+                resets_at: Some("2026-09-18T03:54:28Z".into()),
+            },
+        ];
+        let tiers = quota_summary_tiers(&buckets);
+        // One row per window under canonical names the WebUI translates
+        // ("5小时" / "每周"), each carrying the window's binding constraint:
+        // the most spent bucket and its reset time.
+        assert_eq!(tiers.len(), 2);
+        assert_eq!(tiers[0].name, "five_hour");
+        assert_eq!(tiers[0].used_percent, 100.0);
+        assert_eq!(tiers[0].resets_at.as_deref(), Some("2026-09-16T10:35:34Z"));
+        assert_eq!(tiers[1].name, "weekly_limit");
+        assert_eq!(tiers[1].used_percent, 50.0);
+        assert_eq!(tiers[1].resets_at.as_deref(), Some("2026-09-23T05:35:34Z"));
     }
 
     #[test]

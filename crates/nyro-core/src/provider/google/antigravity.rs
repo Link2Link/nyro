@@ -201,6 +201,111 @@ pub(crate) fn parse_available_models_detailed(payload: &Value) -> Vec<AvailableM
     entries
 }
 
+/// One enforced quota bucket from `v1internal:retrieveUserQuotaSummary`:
+/// the account's real budget windows (family x window). Unlike the
+/// model-catalog `quotaInfo` (a per-model request dimension that can read
+/// "100% remaining" while enforcement 429s), these buckets are what the
+/// quota gate actually enforces.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct QuotaSummaryBucket {
+    /// Owning group's display name, when reported (e.g. a model family).
+    pub group: Option<String>,
+    /// Bucket display name, when reported (takes naming priority).
+    pub display_name: Option<String>,
+    /// Stable bucket identifier, when reported.
+    pub bucket_id: Option<String>,
+    /// Window name (e.g. `FIVE_HOURS`, `WEEKLY`), when reported.
+    pub window: Option<String>,
+    /// Remaining quota fraction (0.0-1.0).
+    pub remaining_fraction: f64,
+    /// Reset timestamp of the window, when reported.
+    pub resets_at: Option<String>,
+}
+
+/// Fetch the account's enforced quota buckets via
+/// `v1internal:retrieveUserQuotaSummary` - the quota surface the official
+/// `agy` client reads (`RetrieveUserQuotaResponse` -> groups -> buckets
+/// with `remainingFraction` / `resetTime`; surfaced by the CLIProxyAPI
+/// #5209 binary disassembly). Consumer surface first (daily), prod as
+/// fallback - endpoint order per Antigravity-Manager.
+pub(crate) async fn retrieve_user_quota_summary(
+    client: &reqwest::Client,
+    access_token: &str,
+    project_id: &str,
+    user_agent: &str,
+) -> anyhow::Result<Vec<QuotaSummaryBucket>> {
+    let mut last_error: Option<anyhow::Error> = None;
+    for endpoint in [
+        "https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary",
+        "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary",
+    ] {
+        let response = client
+            .post(endpoint)
+            .header("Authorization", format!("Bearer {access_token}"))
+            .header("Content-Type", "application/json")
+            .header("Accept", "*/*")
+            .header("User-Agent", user_agent)
+            .json(&json!({ "project": project_id }))
+            .send()
+            .await;
+        let response = match response {
+            Ok(response) => response,
+            Err(error) => {
+                last_error = Some(error.into());
+                continue;
+            }
+        };
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        if !status.is_success() {
+            last_error = Some(anyhow::anyhow!(
+                "retrieveUserQuotaSummary failed: HTTP {status}: {body}"
+            ));
+            continue;
+        }
+        let parsed: Value = serde_json::from_str(&body)?;
+        return Ok(parse_quota_summary_buckets(&parsed));
+    }
+    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("retrieveUserQuotaSummary failed")))
+}
+
+/// Response shape: `{ groups: [ { displayName, buckets: [ { bucketId,
+/// window, remainingFraction, resetTime, displayName } ] } ] }` (validated
+/// against Antigravity-Manager's deserialization). Buckets without a
+/// remaining fraction carry no signal and are dropped.
+pub(crate) fn parse_quota_summary_buckets(payload: &Value) -> Vec<QuotaSummaryBucket> {
+    let Some(groups) = payload.get("groups").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let non_empty = |value: Option<&str>| {
+        value
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string)
+    };
+    groups
+        .iter()
+        .flat_map(|group| {
+            let group_name = non_empty(group.get("displayName").and_then(Value::as_str));
+            let buckets = group.get("buckets").and_then(Value::as_array);
+            buckets.into_iter().flatten().filter_map(move |bucket| {
+                let remaining = bucket
+                    .get("remainingFraction")
+                    .and_then(Value::as_f64)?
+                    .clamp(0.0, 1.0);
+                Some(QuotaSummaryBucket {
+                    group: group_name.clone(),
+                    display_name: non_empty(bucket.get("displayName").and_then(Value::as_str)),
+                    bucket_id: non_empty(bucket.get("bucketId").and_then(Value::as_str)),
+                    window: non_empty(bucket.get("window").and_then(Value::as_str)),
+                    remaining_fraction: remaining,
+                    resets_at: non_empty(bucket.get("resetTime").and_then(Value::as_str)),
+                })
+            })
+        })
+        .collect()
+}
+
 /// Tier suffixes the antigravity surface bakes into model ids.
 const TIER_SUFFIXES: &[&str] = &["-extra-low", "-tiered", "-medium", "-high", "-low"];
 
@@ -908,6 +1013,53 @@ mod tests {
         assert_eq!(detailed[2].id, "tab_flash_lite_preview");
         assert_eq!(detailed[2].quota_remaining, Some(0.87));
         assert!(detailed[2].quota_resets_at.is_none());
+    }
+
+    #[test]
+    fn parse_quota_summary_buckets_extracts_enforced_windows() {
+        let payload = json!({
+            "groups": [
+                {
+                    "displayName": "Gemini",
+                    "buckets": [
+                        {
+                            "bucketId": "gemini-5h",
+                            "window": "FIVE_HOURS",
+                            "remainingFraction": 0.0,
+                            "resetTime": "2026-09-16T10:35:34Z"
+                        },
+                        {"bucketId": "gemini-weekly", "window": "WEEKLY", "remainingFraction": 0.42}
+                    ]
+                },
+                {
+                    "displayName": "Claude",
+                    "buckets": [
+                        {"displayName": "Claude weekly", "remainingFraction": 0.9},
+                        {"window": "WEEKLY"}
+                    ]
+                }
+            ]
+        });
+        let buckets = parse_quota_summary_buckets(&payload);
+        assert_eq!(buckets.len(), 3);
+        assert_eq!(buckets[0].group.as_deref(), Some("Gemini"));
+        assert_eq!(buckets[0].window.as_deref(), Some("FIVE_HOURS"));
+        assert_eq!(buckets[0].remaining_fraction, 0.0);
+        assert_eq!(
+            buckets[0].resets_at.as_deref(),
+            Some("2026-09-16T10:35:34Z")
+        );
+        assert_eq!(buckets[1].window.as_deref(), Some("WEEKLY"));
+        assert_eq!(buckets[1].remaining_fraction, 0.42);
+        assert_eq!(buckets[2].display_name.as_deref(), Some("Claude weekly"));
+        // Buckets without remainingFraction carry no signal and are dropped.
+        assert!(
+            !buckets
+                .iter()
+                .any(|b| b.window.is_some() && b.remaining_fraction >= 1.0)
+        );
+        assert!(parse_quota_summary_buckets(&json!({})).is_empty());
+        assert!(parse_quota_summary_buckets(&json!({"groups": []})).is_empty());
     }
 
     #[test]

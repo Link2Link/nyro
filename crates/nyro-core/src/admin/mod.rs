@@ -76,6 +76,10 @@ pub struct ProviderOAuthStatusData {
     /// e.g. `free-tier` / `g1-pro-tier` / `g1-ultra-tier`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tier_id: Option<String>,
+    /// Tiers the account is barred from with Google's reason codes
+    /// (Google subscription channels; `id:reasonCode` entries).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tier_ineligible: Option<String>,
     /// Companion project id the requests ride on (Google subscription
     /// channels; consumer-tier accounts get a shared `aicode-consumers`).
     #[serde(skip_serializing_if = "Option::is_none")]
