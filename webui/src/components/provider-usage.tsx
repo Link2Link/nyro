@@ -376,7 +376,20 @@ export function ProviderUsageFooter({ provider }: { provider: Provider }) {
         </div>
       ) : shown && shown.tiers.length > 0 ? (
         <div className="flex flex-col gap-1.5">
-          {shown.tiers.map((tier) => (
+          {[...shown.tiers]
+            .sort((a, b) => {
+              const ORDER: Record<string, number> = {
+                five_hour: 0,
+                weekly_limit: 1,
+                monthly: 2,
+                primary_window: 3,
+                secondary_window: 4,
+              };
+              const oa = ORDER[a.name] ?? 99;
+              const ob = ORDER[b.name] ?? 99;
+              return oa - ob;
+            })
+            .map((tier) => (
             <TierBar key={tier.name} tier={tier} isZh={isZh} now={now} />
           ))}
         </div>
