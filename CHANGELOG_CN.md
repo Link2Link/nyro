@@ -4,6 +4,37 @@ Nyro 的所有重要变更均记录在此文件中。
 
 ---
 
+## v2.1.0
+
+> 发布于 2026-09-16
+
+#### 新功能
+
+- **Google 订阅配额可观测**：档位识别改为优先订阅档——`loadCodeAssist` 同时返回 `currentTier` 与 `paidTier`，付费（g1-pro / g1-ultra）账号不再被误标为免费档，不合格档位的原因码随凭证持久化并经 OAuth 状态接口（`tier_ineligible`）透出；用量查询接入执行级配额面（`v1internal:retrieveUserQuotaSummary`），按家族 × 窗口的真实预算桶（剩余比例 + 重置时间）成为用量行——按窗口折叠为规范名（`five_hour` / `weekly_limit`），驱动 WebUI 与 DSH 面板的本地化标签与匀速标记——模型目录 quotaInfo 折叠保留为兜底，claude / gpt / tab 等附属池被过滤并带回退全量的安全网
+- **订阅通道 Gemini 3 系列兼容**：Google Antigravity 与 Gemini CLI 通道完成 Code Assist v1internal 推理与 daily/prod 域名路由，保留 Gemini 3 思考签名并自动回放，按账号动态发现模型，effort 档位自动改写为订阅模型变体
+- **OpenCode Go 三端点自适应路由**：预设声明 chat / responses / messages 三端点共享 Key，`/v1/messages` 认证改用 `x-api-key`，按模型的端点路由表以客户端协议优先、不支持时改道模型自身端点，dispatcher 出站统一注入派生的 `x-opencode-session` 会话头，模型探测按实际路由端点逐模型下发，并过滤订阅内全端点不可用的模型
+- **推理用量统计**：持久化推理令牌用量并区分正文与总吞吐指标，采样窗口扩大至五十条，补充多轮工具重放回归测试
+- **性能看板综合 TPS**：模型性能统计新增综合 TPS（总输出 token ÷ 上游总往返延时），性能页以综合速度图表为唯一主视图，诊断表对比综合 TPS 与纯吐字生成速度
+
+#### 改进
+
+- **统一端到端正文 TPS 计算口径**：各统计面的 TPS 定义收敛
+- **重构供应商图标解析**：图标解析重构并接入性能图
+- **全仓 rustfmt 格式统一与编译警告清理**
+
+#### 修复
+
+- **Gemini 流式换行规范化与 EOF 终端重试**
+- **Gemini 流式转换伪成功与影子污染**
+- **Gemini 空载畸变重试与流探测**
+- **Gemini 转码缺陷并补充回归测试**
+- **Google 输出 token 超限被上游拒绝**
+- **Google 订阅通道 Schema 兼容与输出限制**
+- **性能页多变体统计并收敛包络标签**
+- **OpenCode Go 模型端点路由表调整**
+
+---
+
 ## v2.0.9
 
 > 发布于 2026-09-09

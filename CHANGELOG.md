@@ -4,6 +4,37 @@ All notable changes to Nyro will be documented in this file.
 
 ---
 
+## v2.1.0
+
+> Released on 2026-09-16
+
+#### Features
+
+- **Google subscription quota observability**: tier identity now prefers the subscription entitlement — `loadCodeAssist` carries both `currentTier` and `paidTier`, so paid (g1-pro / g1-ultra) accounts are no longer mislabeled as free, and ineligible-tier reason codes persist into the credential and surface through the OAuth status payload (`tier_ineligible`); the usage query adopts the enforcement-grade quota surface (`v1internal:retrieveUserQuotaSummary`), turning per-family × per-window buckets (remaining fraction + reset time) into the provider's usage rows — collapsed to one row per window under canonical names (`five_hour` / `weekly_limit`) that drive localized labels and steady-pace markers in the WebUI and DSH panel — with the model-catalog quotaInfo fold kept as fallback and ancillary non-Gemini pools (claude / gpt / tab) filtered out behind a safe show-everything fallback
+- **Gemini 3 series on the subscription channel**: the Google Antigravity and Gemini CLI channels handle Code Assist v1internal inference with daily/prod host routing, preserve Gemini 3 thinking signatures with automatic replay, discover models per account, and rewrite effort tiers onto subscription model variants
+- **OpenCode Go tri-endpoint adaptive routing**: the preset declares chat / responses / messages endpoints sharing one key, authenticates `/v1/messages` with `x-api-key`, routes each model through a per-model endpoint table (client protocol first, diverting to the model's own endpoint when unsupported), injects a derived `x-opencode-session` header across dispatch, probes models against their routed endpoint, and filters models with no usable endpoint in the subscription
+- **Reasoning usage statistics**: reasoning-token usage is persisted and separated from plain throughput, the sampling window widens to fifty retained calls, and multi-round tool-replay regression tests cover the accounting
+- **Performance dashboard composite TPS**: model performance statistics gain an overall-TPS metric (total output tokens over total upstream round-trip), the performance page adopts the composite-speed chart as its single main view, and the diagnostics table contrasts composite TPS with raw generation speed
+
+#### Improvements
+
+- **Unified end-to-end body-TPS accounting**: the TPS definition converges across stats surfaces
+- **Provider icon resolution refactor**: icon parsing reworked and wired into the performance chart
+- **Workspace-wide rustfmt pass and warning cleanup**
+
+#### Fixes
+
+- **Gemini streaming newline normalization and EOF-terminal retry**
+- **Gemini stream pseudo-success and shadow pollution**
+- **Gemini idle-distortion retry and stream probing**
+- **Gemini transcoding defects, covered by regression tests**
+- **Google output-token over-limit rejected upstream**
+- **Google subscription channel schema compatibility and output limits**
+- **Performance page multi-variant statistics and envelope-label convergence**
+- **OpenCode Go model endpoint routing table adjustment**
+
+---
+
 ## v2.0.9
 
 > Released on 2026-09-09
