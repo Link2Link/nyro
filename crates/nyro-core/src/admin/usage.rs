@@ -554,6 +554,37 @@ fn quota_window_tag(window: Option<&str>) -> String {
     }
 }
 
+/// Gemini-only quota buckets: this backend serves Gemini traffic, and
+/// ancillary pools (third-party claude-* / gpt-oss-* families, tab
+/// previews) are deliberately dropped — the same convention as the catalog
+/// fold above. Falls back to every bucket when no group names itself
+/// Gemini, so an upstream naming change never blanks the readout.
+fn gemini_quota_buckets(
+    buckets: &[crate::provider::google::antigravity::QuotaSummaryBucket],
+) -> Vec<crate::provider::google::antigravity::QuotaSummaryBucket> {
+    const ANCILLARY: [&str; 4] = ["claude", "gpt", "oss", "tab"];
+    let is_gemini = |bucket: &crate::provider::google::antigravity::QuotaSummaryBucket| {
+        let name = format!(
+            "{} {} {}",
+            bucket.group.as_deref().unwrap_or(""),
+            bucket.display_name.as_deref().unwrap_or(""),
+            bucket.bucket_id.as_deref().unwrap_or("")
+        )
+        .to_lowercase();
+        name.contains("gemini") && !ANCILLARY.iter().any(|needle| name.contains(needle))
+    };
+    let filtered: Vec<_> = buckets
+        .iter()
+        .filter(|bucket| is_gemini(bucket))
+        .cloned()
+        .collect();
+    if filtered.is_empty() {
+        buckets.to_vec()
+    } else {
+        filtered
+    }
+}
+
 /// Build usage tiers from the enforced quota buckets
 /// (`v1internal:retrieveUserQuotaSummary`): Google reports one bucket per
 /// model family × window with identical generic labels, so the tiers
@@ -561,12 +592,14 @@ fn quota_window_tag(window: Option<&str>) -> String {
 /// — `five_hour` / `weekly_limit`, matching every other coding-plan
 /// backend) carrying each window's tightest bucket: the most spent fraction
 /// and its reset time, i.e. the constraint actually binding the account.
-/// This is the enforcement-grade readout - the model-catalog fold above
-/// stays as the fallback when the quota summary surface is unavailable or
-/// empty.
+/// Ancillary (non-Gemini) pools are filtered out first — this backend
+/// surfaces Gemini traffic. This is the enforcement-grade readout - the
+/// model-catalog fold above stays as the fallback when the quota summary
+/// surface is unavailable or empty.
 fn quota_summary_tiers(
     buckets: &[crate::provider::google::antigravity::QuotaSummaryBucket],
 ) -> Vec<ProviderUsageTier> {
+    let buckets = gemini_quota_buckets(buckets);
     let mut windows: std::collections::BTreeMap<String, ProviderUsageTier> =
         std::collections::BTreeMap::new();
     for bucket in buckets {
@@ -3699,9 +3732,8 @@ mod tests {
             },
         ];
         let tiers = quota_summary_tiers(&buckets);
-        // One row per window under canonical names the WebUI translates
-        // ("5小时" / "每周"), each carrying the window's binding constraint:
-        // the most spent bucket and its reset time.
+        // Ancillary pools (Claude here) are dropped before the per-window
+        // collapse, so the rows always state the Gemini family's budgets.
         assert_eq!(tiers.len(), 2);
         assert_eq!(tiers[0].name, "five_hour");
         assert_eq!(tiers[0].used_percent, 100.0);
@@ -3709,6 +3741,36 @@ mod tests {
         assert_eq!(tiers[1].name, "weekly_limit");
         assert_eq!(tiers[1].used_percent, 50.0);
         assert_eq!(tiers[1].resets_at.as_deref(), Some("2026-09-23T05:35:34Z"));
+    }
+
+    #[test]
+    fn quota_summary_tiers_fall_back_when_no_gemini_named_group() {
+        use crate::provider::google::antigravity::QuotaSummaryBucket;
+        // No group names itself Gemini (upstream naming change): the filter
+        // falls back to every bucket rather than blanking the readout.
+        let buckets = vec![
+            QuotaSummaryBucket {
+                group: Some("Mainline".into()),
+                display_name: None,
+                bucket_id: Some("m1".into()),
+                window: Some("FIVE_HOURS".into()),
+                remaining_fraction: 0.2,
+                resets_at: None,
+            },
+            QuotaSummaryBucket {
+                group: Some("Companion".into()),
+                display_name: None,
+                bucket_id: Some("c1".into()),
+                window: Some("FIVE_HOURS".into()),
+                remaining_fraction: 0.9,
+                resets_at: None,
+            },
+        ];
+        let tiers = quota_summary_tiers(&buckets);
+        assert_eq!(tiers.len(), 1);
+        // Collapse keeps the tightest bucket across the surviving pools.
+        assert_eq!(tiers[0].name, "five_hour");
+        assert_eq!(tiers[0].used_percent, 80.0);
     }
 
     #[test]
