@@ -643,12 +643,12 @@ async fn dispatch_pipeline_inner(
         // middleware (no per-target throwaway context); negotiate records its
         // trace/egress decision onto it.
         //
-        // Vendor-scoped egress preference: OpenCode Go serves different models
-        // on different endpoints and the client's protocol wins whenever the
-        // model is served there (openai-go `routing`). `None` keeps the default
-        // ingress-driven resolution; an unsupported preference falls through
-        // negotiate's own tiers, so providers that do not declare the endpoint
-        // are unaffected.
+        // Vendor-scoped egress preference: OpenCode Go pins each model to one
+        // endpoint (`opencode_go::routing`). The preference is always the pin,
+        // even when it already matches ingress (negotiate stays Native). `None`
+        // keeps the default ingress-driven resolution; an unsupported
+        // preference falls through negotiate's own tiers, so providers that do
+        // not declare the endpoint are unaffected.
         let provider_protocols = ProviderProtocols::from_provider(&provider);
         let egress_preference = crate::provider::opencode_go::routing::preferred_egress(
             &provider,

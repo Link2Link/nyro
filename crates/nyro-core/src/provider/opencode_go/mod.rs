@@ -3,8 +3,9 @@
 //! Adaptively routed channel: the Go plan serves different models on
 //! `/v1/chat/completions`, `/v1/responses` and `/v1/messages`, so the preset
 //! declares all three endpoints (one shared API key) and
-//! [`routing`] hardcodes which model is served where. Every request also
-//! carries the per-conversation routing identity [`session`] derives.
+//! [`routing`] pins each known model to exactly one of those endpoints.
+//! Every request also carries the per-conversation routing identity
+//! [`session`] derives.
 
 pub(crate) mod routing;
 pub(crate) mod session;

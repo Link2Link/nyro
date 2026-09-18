@@ -5,10 +5,10 @@
 //! The Go plan does not serve every model on every endpoint, and an endpoint
 //! that does not serve a model answers with an opaque HTTP 500 — so the mapping
 //! is hardcoded in `provider::opencode_go::routing`. These tests pin the
-//! resulting wire behaviour: native when the model serves the client's
-//! protocol, transcoded onto the model's own endpoint otherwise, with the
-//! Anthropic endpoint authenticated by `x-api-key` and every request carrying
-//! the conversation's `x-opencode-session`.
+//! resulting wire behaviour: each model is pinned to one endpoint (matching
+//! ingress stays native; otherwise the request is transcoded onto the pin),
+//! with the Anthropic endpoint authenticated by `x-api-key` and every request
+//! carrying the conversation's `x-opencode-session`.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -336,12 +336,12 @@ async fn routes_each_model_to_the_endpoint_that_serves_it() -> anyhow::Result<()
     dispatch(&gw, "oc-grok", ANTHROPIC_MESSAGES_2023_06_01, "hello").await;
     assert_eq!(upstream.last().endpoint, "responses");
 
-    // Chat-only model from Claude Code: downgraded to /v1/chat/completions,
+    // Chat-only model from Claude Code: pinned to /v1/chat/completions,
     // otherwise the adaptive provider would pick the messages endpoint and 500.
     dispatch(&gw, "oc-glm", ANTHROPIC_MESSAGES_2023_06_01, "hello").await;
     assert_eq!(upstream.last().endpoint, "chat");
 
-    // Chat-only model from a Codex client: downgraded to chat as well.
+    // Chat-only model from a Codex client: pinned to chat as well.
     dispatch(&gw, "oc-glm", OPENAI_RESPONSES_V1, "hello").await;
     assert_eq!(upstream.last().endpoint, "chat");
 
@@ -363,6 +363,36 @@ async fn routes_each_model_to_the_endpoint_that_serves_it() -> anyhow::Result<()
         seen.authorization, None,
         "the Go messages endpoint takes x-api-key, not Bearer",
     );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn pinned_chat_model_does_not_follow_client_protocol() -> anyhow::Result<()> {
+    // Regression: adaptive negotiation used to keep the client's protocol when
+    // the model "supported" it. kimi-k3 is chat-only on Go, so Claude Code and
+    // Codex must be transcoded onto /v1/chat/completions rather than staying
+    // native on messages/responses.
+    let (_dir, gw, upstream, base_url) = setup().await?;
+    let provider = adaptive_opencode_provider(&gw, &base_url).await?;
+    route(&gw, "oc-kimi", provider.clone(), "kimi-k3").await?;
+    route(&gw, "oc-ds", provider, "deepseek-v4-pro").await?;
+
+    dispatch(&gw, "oc-kimi", ANTHROPIC_MESSAGES_2023_06_01, "hello").await;
+    let seen = upstream.last();
+    assert_eq!(
+        seen.endpoint, "chat",
+        "kimi-k3 is pinned to /v1/chat/completions even from Claude Code"
+    );
+    assert_eq!(seen.model, "kimi-k3");
+
+    dispatch(&gw, "oc-ds", OPENAI_RESPONSES_V1, "hello").await;
+    let seen = upstream.last();
+    assert_eq!(
+        seen.endpoint, "chat",
+        "deepseek-v4-pro is pinned to /v1/chat/completions even from Codex"
+    );
+    assert_eq!(seen.model, "deepseek-v4-pro");
 
     Ok(())
 }

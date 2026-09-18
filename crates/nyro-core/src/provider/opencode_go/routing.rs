@@ -5,22 +5,26 @@
 //! `{"type":"error","error":{"type":"error","message":"Internal server
 //! error"}}` — indistinguishable from a transient upstream failure. So the
 //! mapping cannot be discovered from error codes: it is hardcoded here from
-//! the measured matrix.
+//! OpenCode's own per-model SDK binding (`@ai-sdk/openai` → `/v1/responses`,
+//! `@ai-sdk/openai-compatible` → `/v1/chat/completions`, `@ai-sdk/anthropic`
+//! → `/v1/messages`).
 //!
 //! Rules, in priority order:
 //!
-//! 1. **The client's protocol wins when the model supports it** — a Claude
-//!    Code (anthropic) or Codex (responses) caller keeps its native wire
-//!    format, so prompt caching and thinking signatures stay intact.
-//! 2. **Otherwise the model's own endpoint wins** — a chat-only caller asking
-//!    for `grok-4.6` is transcoded onto `/v1/responses`, and a Claude Code
-//!    caller asking for `glm-5.3` is transcoded onto `/v1/chat/completions`.
-//!    Without this downgrade an adaptive provider would pick the ingress
-//!    protocol and 500.
-//! 3. **A model that is not listed is assumed chat-only** — `/v1/chat/
+//! 1. **The model's pinned protocol always wins** — a Claude Code (anthropic)
+//!    or Codex (responses) caller asking for `kimi-k3` is transcoded onto
+//!    `/v1/chat/completions`, and a chat caller asking for `grok-4.6` is
+//!    transcoded onto `/v1/responses`. Matching ingress stays native inside
+//!    `negotiate()`; this module still returns the pin so adaptive providers
+//!    never fall through to "use the client's protocol".
+//! 2. **A model that is not listed is assumed chat-only** — `/v1/chat/
 //!    completions` is the default endpoint, so this default keeps unknown
 //!    models working for the common case instead of silently sending them to
 //!    an endpoint that does not serve them.
+//! 3. **The preference is only honoured when the provider declares the
+//!    endpoint** — a provider still configured as fixed chat-only degrades to
+//!    today's behaviour. There is no endpoint-level fallback: once chosen,
+//!    upstream errors surface as-is.
 //!
 //! Matching is exact (`trim` + case-insensitive) against the *upstream* model
 //! name, so a future variant of a listed family is never hijacked by a prefix
@@ -38,29 +42,41 @@ const CHAT: ProtocolId = OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1;
 const RESPONSES: ProtocolId = OPENAI_RESPONSES_V1;
 const MESSAGES: ProtocolId = ANTHROPIC_MESSAGES_2023_06_01;
 
-/// `/v1/chat/completions` and `/v1/messages` both reject these models.
-const RESPONSES_ONLY: &[ProtocolId] = &[RESPONSES];
-/// `/v1/chat/completions` and `/v1/responses` both reject these models.
-const MESSAGES_ONLY: &[ProtocolId] = &[MESSAGES];
-
-/// Models whose endpoint set differs from the chat-only default. Everything
-/// else — including models added upstream after this table was written — is
-/// treated as chat-only by [`supports`].
-const MODEL_ENDPOINTS: &[(&str, &[ProtocolId])] = &[
-    // Responses only.
-    ("gpt-5.6-luna", RESPONSES_ONLY),
-    ("grok-4.6", RESPONSES_ONLY),
-    ("muse-spark-1.2-contributor", RESPONSES_ONLY),
-    ("muse-spark-1.3-contributor", RESPONSES_ONLY),
-    // Anthropic messages only.
-    ("minimax-m2.5", MESSAGES_ONLY),
-    ("minimax-m2.7", MESSAGES_ONLY),
-    ("minimax-m3", MESSAGES_ONLY),
-    ("qwen3.6-plus", MESSAGES_ONLY),
-    ("qwen3.7-max", MESSAGES_ONLY),
-    ("qwen3.7-plus", MESSAGES_ONLY),
-    ("qwen3.8-flash", MESSAGES_ONLY),
-    ("qwen3.8-max", MESSAGES_ONLY),
+/// OpenCode Go catalog: each listed model is served on exactly one endpoint.
+/// Everything else — including models added upstream after this table was
+/// written — is treated as chat-only by [`primary_protocol`].
+const MODEL_PROTOCOL: &[(&str, ProtocolId)] = &[
+    // Responses only (`@ai-sdk/openai` → `/v1/responses`).
+    ("gpt-5.6-luna", RESPONSES),
+    ("grok-4.6", RESPONSES),
+    ("muse-spark-1.2-contributor", RESPONSES),
+    ("muse-spark-1.3-contributor", RESPONSES),
+    // Anthropic messages only (`@ai-sdk/anthropic` → `/v1/messages`).
+    ("minimax-m2.5", MESSAGES),
+    ("minimax-m2.7", MESSAGES),
+    ("minimax-m3", MESSAGES),
+    ("qwen3.6-plus", MESSAGES),
+    ("qwen3.7-max", MESSAGES),
+    ("qwen3.7-plus", MESSAGES),
+    ("qwen3.8-flash", MESSAGES),
+    ("qwen3.8-max", MESSAGES),
+    // Chat only (`@ai-sdk/openai-compatible` → `/v1/chat/completions`).
+    ("deepseek-v4-flash", CHAT),
+    ("deepseek-v4-flash-vision-exp", CHAT),
+    ("deepseek-v4-pro", CHAT),
+    ("deepseek-v4.1-flash", CHAT),
+    ("glm-5.1", CHAT),
+    ("glm-5.2", CHAT),
+    ("glm-5.3", CHAT),
+    ("glm-5.3-flash", CHAT),
+    ("hy3", CHAT),
+    ("hy4-preview", CHAT),
+    ("kimi-k2.6", CHAT),
+    ("kimi-k2.7-code", CHAT),
+    ("kimi-k3", CHAT),
+    ("longcat-2.0", CHAT),
+    ("mimo-v2.5", CHAT),
+    ("mimo-v2.5-pro", CHAT),
 ];
 
 /// Models the upstream still advertises in `GET /v1/models` but does not serve
@@ -81,44 +97,45 @@ const UNAVAILABLE_MODELS: &[&str] = &[
     "qwen3.5-plus",
 ];
 
+fn listed_protocol(model: &str) -> Option<ProtocolId> {
+    let model = normalize(model);
+    MODEL_PROTOCOL
+        .iter()
+        .find(|(listed, _)| *listed == model)
+        .map(|(_, protocol)| *protocol)
+}
+
 /// True when the Go plan serves `model` on `protocol`.
 ///
 /// Unlisted models are chat-only (see the module docs).
+#[cfg(test)]
 pub(crate) fn supports(model: &str, protocol: ProtocolId) -> bool {
-    let model = normalize(model);
-    if model.is_empty() {
+    if normalize(model).is_empty() {
         return false;
     }
-    match MODEL_ENDPOINTS.iter().find(|(listed, _)| *listed == model) {
-        Some((_, protocols)) => protocols.contains(&protocol),
-        None => protocol == CHAT,
-    }
+    listed_protocol(model).unwrap_or(CHAT) == protocol
 }
 
-/// The endpoint a request for `model` should be transcoded onto when the
-/// client's own protocol is not served: chat when the model serves it,
-/// otherwise the first of its declared endpoints in table order.
+/// The endpoint a request for `model` must be transcoded onto: the catalog
+/// pin when listed, otherwise chat.
 pub(crate) fn primary_protocol(model: &str) -> ProtocolId {
-    MODEL_ENDPOINTS
-        .iter()
-        .find(|(listed, _)| *listed == normalize(model))
-        .and_then(|(_, protocols)| protocols.first().copied())
-        .unwrap_or(CHAT)
+    listed_protocol(model).unwrap_or(CHAT)
 }
 
 /// Egress-protocol preference for an OpenCode Go request.
 ///
-/// `None` means "no opinion": the caller is not an OpenCode Go provider, or
-/// the model already serves the client's protocol and must stay native.
-/// `Some(protocol)` asks `negotiate()` for that endpoint; the preference is
-/// only honoured when the provider actually declares the endpoint, so a
-/// provider still configured as fixed chat-only degrades to today's behaviour.
+/// `None` means "no opinion": the caller is not an OpenCode Go provider.
+/// `Some(protocol)` asks `negotiate()` for that endpoint even when it already
+/// matches the client's protocol, so adaptive providers never fall through to
+/// ingress-driven resolution. The preference is only honoured when the
+/// provider actually declares the endpoint, so a provider still configured as
+/// fixed chat-only degrades to today's behaviour.
 pub(crate) fn preferred_egress(
     provider: &Provider,
     actual_model: &str,
-    ingress: ProtocolId,
+    _ingress: ProtocolId,
 ) -> Option<ProtocolId> {
-    if !is_opencode_go(provider) || supports(actual_model, ingress) {
+    if !is_opencode_go(provider) {
         return None;
     }
     Some(primary_protocol(actual_model))
@@ -185,8 +202,37 @@ mod tests {
     }
 
     #[test]
+    fn catalog_pins_each_listed_model_to_exactly_one_protocol() {
+        for (model, pinned) in MODEL_PROTOCOL {
+            assert_eq!(
+                primary_protocol(model),
+                *pinned,
+                "{model} must pin to {pinned}"
+            );
+            assert!(
+                supports(model, *pinned),
+                "{model} must support its pinned protocol {pinned}"
+            );
+            for other in [CHAT, RESPONSES, MESSAGES] {
+                if other == *pinned {
+                    continue;
+                }
+                assert!(
+                    !supports(model, other),
+                    "{model} must not also support {other}"
+                );
+            }
+        }
+        assert_eq!(
+            MODEL_PROTOCOL.len(),
+            28,
+            "keep the OpenCode Go catalog exhaustive"
+        );
+    }
+
+    #[test]
     fn listed_models_expose_only_their_measured_endpoints() {
-        // DeepSeek is chat-only under current user specs
+        // DeepSeek is chat-only
         assert!(supports("deepseek-v4-pro", CHAT));
         assert!(!supports("deepseek-v4-pro", RESPONSES));
         assert!(!supports("deepseek-v4-pro", MESSAGES));
@@ -212,14 +258,11 @@ mod tests {
 
     #[test]
     fn unlisted_models_are_chat_only() {
-        assert!(supports("glm-5.3", CHAT));
-        assert!(!supports("glm-5.3", RESPONSES));
-        assert!(!supports("glm-5.3", MESSAGES));
-        assert!(supports("hy3", CHAT));
-        assert!(supports("hy4-preview", CHAT));
-        // Unknown / future models default to chat.
         assert!(supports("glm-6-turbo", CHAT));
         assert!(!supports("glm-6-turbo", RESPONSES));
+        assert!(!supports("glm-6-turbo", MESSAGES));
+        assert!(supports("grok-4.6-preview", CHAT));
+        assert!(!supports("grok-4.6-preview", RESPONSES));
         assert!(!supports("", CHAT));
     }
 
@@ -230,74 +273,57 @@ mod tests {
         assert!(supports("grok-4.6-preview", CHAT));
         assert_eq!(primary_protocol("MINIMAX-M2.7"), MESSAGES);
         assert_eq!(primary_protocol("QWEN3.8-MAX"), MESSAGES);
+        assert_eq!(primary_protocol("  Kimi-K3  "), CHAT);
     }
 
     #[test]
-    fn primary_endpoint_prefers_chat_then_table_order() {
+    fn primary_endpoint_follows_the_catalog_pin() {
         assert_eq!(primary_protocol("glm-5.3"), CHAT);
+        assert_eq!(primary_protocol("glm-5.3-flash"), CHAT);
         assert_eq!(primary_protocol("kimi-k3"), CHAT);
+        assert_eq!(primary_protocol("deepseek-v4-pro"), CHAT);
         assert_eq!(primary_protocol("minimax-m2.7"), MESSAGES);
         assert_eq!(primary_protocol("minimax-m3"), MESSAGES);
         assert_eq!(primary_protocol("qwen3.8-max"), MESSAGES);
         assert_eq!(primary_protocol("grok-4.6"), RESPONSES);
+        assert_eq!(primary_protocol("gpt-5.6-luna"), RESPONSES);
+        assert_eq!(primary_protocol("muse-spark-1.3-contributor"), RESPONSES);
     }
 
     #[test]
-    fn client_protocol_wins_when_the_model_serves_it() {
-        // Claude Code asking a messages-capable model stays native.
+    fn preferred_egress_always_returns_the_pin_on_opencode_go() {
+        let go = go_provider();
+        // Matching ingress still returns the pin (negotiate stays Native).
+        assert_eq!(preferred_egress(&go, "kimi-k3", CHAT), Some(CHAT));
         assert_eq!(
-            preferred_egress(&go_provider(), "minimax-m3", MESSAGES),
-            None
-        );
-        assert_eq!(
-            preferred_egress(&go_provider(), "qwen3.8-max", MESSAGES),
-            None
-        );
-        // Codex asking a responses-capable model stays native.
-        assert_eq!(
-            preferred_egress(&go_provider(), "grok-4.6", RESPONSES),
-            None
-        );
-        // Chat asking a chat model stays native.
-        assert_eq!(preferred_egress(&go_provider(), "glm-5.3", CHAT), None);
-        assert_eq!(preferred_egress(&go_provider(), "kimi-k3", CHAT), None);
-    }
-
-    #[test]
-    fn table_endpoint_takes_over_when_the_ingress_protocol_is_not_served() {
-        // Chat client asking a responses-only model.
-        assert_eq!(
-            preferred_egress(&go_provider(), "grok-4.6", CHAT),
+            preferred_egress(&go, "grok-4.6", RESPONSES),
             Some(RESPONSES)
         );
-        // Claude Code asking a responses-only model.
         assert_eq!(
-            preferred_egress(&go_provider(), "gpt-5.6-luna", MESSAGES),
-            Some(RESPONSES)
-        );
-        // Claude Code asking a chat-only model must not go native.
-        assert_eq!(
-            preferred_egress(&go_provider(), "glm-5.3", MESSAGES),
-            Some(CHAT)
-        );
-        assert_eq!(
-            preferred_egress(&go_provider(), "kimi-k3", MESSAGES),
-            Some(CHAT)
-        );
-        // Codex asking a chat-only model.
-        assert_eq!(
-            preferred_egress(&go_provider(), "longcat-2.0", RESPONSES),
-            Some(CHAT)
-        );
-        // Chat asking a messages-only model.
-        assert_eq!(
-            preferred_egress(&go_provider(), "minimax-m3", CHAT),
+            preferred_egress(&go, "minimax-m3", MESSAGES),
             Some(MESSAGES)
         );
         assert_eq!(
-            preferred_egress(&go_provider(), "qwen3.8-max", CHAT),
+            preferred_egress(&go, "qwen3.8-max", MESSAGES),
             Some(MESSAGES)
         );
+        // Cross-protocol callers are forced onto the pin, not the client wire.
+        assert_eq!(preferred_egress(&go, "kimi-k3", MESSAGES), Some(CHAT));
+        assert_eq!(
+            preferred_egress(&go, "deepseek-v4-pro", RESPONSES),
+            Some(CHAT)
+        );
+        assert_eq!(preferred_egress(&go, "glm-5.3", MESSAGES), Some(CHAT));
+        assert_eq!(preferred_egress(&go, "longcat-2.0", RESPONSES), Some(CHAT));
+        assert_eq!(preferred_egress(&go, "grok-4.6", CHAT), Some(RESPONSES));
+        assert_eq!(
+            preferred_egress(&go, "gpt-5.6-luna", MESSAGES),
+            Some(RESPONSES)
+        );
+        assert_eq!(preferred_egress(&go, "minimax-m3", CHAT), Some(MESSAGES));
+        assert_eq!(preferred_egress(&go, "qwen3.8-max", CHAT), Some(MESSAGES));
+        // Unlisted still default to chat.
+        assert_eq!(preferred_egress(&go, "glm-6-turbo", MESSAGES), Some(CHAT));
     }
 
     #[test]
