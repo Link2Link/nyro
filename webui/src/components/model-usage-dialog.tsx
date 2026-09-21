@@ -79,7 +79,7 @@ export interface ModelUsageDialogProps {
   initialModel?: string | null;
 }
 
-const RANGES = [6, 24, 72, 168] as const;
+const RANGES = [6, 24, 72, 168, 720] as const;
 const PAGE_SIZE = 10;
 const ALL_PROVIDERS_VALUE = "__all_providers__";
 const ALL_KEYS_VALUE = "__all_keys__";
@@ -280,6 +280,7 @@ export function ModelUsageDialog({
                     <SelectItem value="24">{zh ? "最近 24 小时" : "Last 24h"}</SelectItem>
                     <SelectItem value="72">{zh ? "最近 3 天" : "Last 3d"}</SelectItem>
                     <SelectItem value="168">{zh ? "最近 7 天" : "Last 7d"}</SelectItem>
+                    <SelectItem value="720">{zh ? "最近 30 天" : "Last 30d"}</SelectItem>
                   </SelectContent>
                 </Select>
                 <Select

@@ -76,7 +76,7 @@ export interface ApiKeyUsageDialogProps {
   initialHours?: number;
   initialApiKeyId?: string | null;
 }
-const RANGES = [6, 24, 72, 168] as const;
+const RANGES = [6, 24, 72, 168, 720] as const;
 const PAGE_SIZE = 10;
 const safeHours = (value?: number) =>
   RANGES.includes(value as (typeof RANGES)[number]) ? value! : 24;
@@ -263,6 +263,9 @@ export function ApiKeyUsageDialog({
                     </SelectItem>
                     <SelectItem value="168">
                       {zh ? "最近 7 天" : "Last 7d"}
+                    </SelectItem>
+                    <SelectItem value="720">
+                      {zh ? "最近 30 天" : "Last 30d"}
                     </SelectItem>
                   </SelectContent>
                 </Select>

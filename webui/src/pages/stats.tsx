@@ -115,6 +115,7 @@ export default function StatsPage() {
             <SelectItem value="24">{isZh ? "最近 24 小时" : "Last 24h"}</SelectItem>
             <SelectItem value="72">{isZh ? "最近 3 天" : "Last 3d"}</SelectItem>
             <SelectItem value="168">{isZh ? "最近 7 天" : "Last 7d"}</SelectItem>
+            <SelectItem value="720">{isZh ? "最近 30 天" : "Last 30d"}</SelectItem>
           </SelectContent>
         </Select>
       </div>
