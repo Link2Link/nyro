@@ -29,9 +29,12 @@ import { ModelRatingBadge, ModelRatingClearedNotice, ModelRatingEditor, ModelRat
 const modelKey = (providerId: string, model: string) => JSON.stringify([providerId, model]);
 import {
   loadModelProbeResults,
+  mergeProbeResults,
   saveModelProbeResults,
   type ProviderModelProbeStore,
 } from "@/lib/model-probe";
+import { saveProbeSelection } from "@/lib/model-probe-selection";
+import { ModelProbePicker } from "@/components/model-probe-picker";
 import type {
   Model as ModelMapping,
   ModelCapabilities,
@@ -630,6 +633,7 @@ export default function AvailableModelsPage() {
   const [probeStore, setProbeStore] = useState<ProviderModelProbeStore>(loadModelProbeResults);
   const [probingId, setProbingId] = useState<string | null>(null);
   const [probeErrors, setProbeErrors] = useState<Record<string, string>>({});
+  const [probePickerTarget, setProbePickerTarget] = useState<Provider | null>(null);
   const [editingRating, setEditingRating] = useState<ModelRatingEditTarget | null>(null);
   const [clearedRating, setClearedRating] = useState<ModelRatingEditTarget | null>(null);
   const ratingsQuery = useModelRatings();
@@ -687,18 +691,26 @@ export default function AvailableModelsPage() {
     )));
   }
 
-  async function probeProvider(provider: Provider) {
+  async function runProbe(provider: Provider, models: string[]) {
     setProbingId(provider.id);
     setProbeErrors((current) => {
       const next = { ...current };
       delete next[provider.id];
       return next;
     });
+    const runAt = new Date().toISOString();
     try {
-      const outcome = await backend<ModelProbeOutcome>("probe_provider_models", { id: provider.id });
-      const nextRecord = { results: outcome.results, tested_at: new Date().toISOString() };
+      const outcome = await backend<ModelProbeOutcome>("probe_provider_models", {
+        id: provider.id,
+        models,
+      });
       setProbeStore((current) => {
-        const next = { ...current, [provider.id]: nextRecord };
+        // Merge per model (newest run wins): a subset run must not wipe the
+        // state of models it did not probe.
+        const next = {
+          ...current,
+          [provider.id]: mergeProbeResults(current[provider.id], outcome.results, runAt),
+        };
         saveModelProbeResults(next);
         return next;
       });
@@ -846,12 +858,26 @@ export default function AvailableModelsPage() {
                   probing={probingId === provider.id}
                   probeError={probeErrors[provider.id]}
                   onToggle={() => toggleProvider(provider.id)}
-                  onProbe={() => void probeProvider(provider)}
+                  onProbe={() => setProbePickerTarget(provider)}
                 />
               );
             })}
           </div>
         )}
+        <ModelProbePicker
+          open={Boolean(probePickerTarget)}
+          provider={probePickerTarget}
+          isZh={isZh}
+          lastResults={probePickerTarget ? probeStore[probePickerTarget.id]?.results : undefined}
+          onCancel={() => setProbePickerTarget(null)}
+          onConfirm={(models) => {
+            const target = probePickerTarget;
+            setProbePickerTarget(null);
+            if (!target) return;
+            saveProbeSelection(target.id, models);
+            void runProbe(target, models);
+          }}
+        />
         {editingRating && (
           <ModelRatingEditor
             target={editingRating}

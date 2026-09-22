@@ -425,11 +425,49 @@ async fn every_routed_request_carries_the_conversation_identity() -> anyhow::Res
 }
 
 #[tokio::test]
+async fn probe_subset_probes_only_the_selected_models() -> anyhow::Result<()> {
+    let (_dir, gw, _upstream, base_url) = setup().await?;
+    let provider = adaptive_opencode_provider(&gw, &base_url).await?;
+
+    let outcome = gw
+        .admin()
+        .probe_provider_models(
+            &provider,
+            Some(vec![
+                "glm-5.3".to_string(),
+                "glm-5.3".to_string(),
+                "ghost-model".to_string(),
+            ]),
+        )
+        .await?;
+    let mut probed: Vec<String> = outcome
+        .results
+        .iter()
+        .map(|result| result.model.clone())
+        .collect();
+    probed.sort();
+    assert_eq!(
+        probed,
+        vec!["ghost-model".to_string(), "glm-5.3".to_string()],
+        "a subset probes exactly the named models (deduped, catalog-independent)"
+    );
+
+    assert!(
+        gw.admin()
+            .probe_provider_models(&provider, Some(Vec::new()))
+            .await
+            .is_err(),
+        "an empty selection is rejected instead of silently probing everything"
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn probe_follows_the_same_per_model_endpoints() -> anyhow::Result<()> {
     let (_dir, gw, _upstream, base_url) = setup().await?;
     let provider = adaptive_opencode_provider(&gw, &base_url).await?;
 
-    let outcome = gw.admin().probe_provider_models(&provider).await?;
+    let outcome = gw.admin().probe_provider_models(&provider, None).await?;
     let by_model: HashMap<String, (bool, String)> = outcome
         .results
         .iter()

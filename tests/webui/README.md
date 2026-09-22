@@ -29,11 +29,13 @@ Lightweight helper tests need no extra framework:
 cd webui
 test_dir=$(mktemp -d /tmp/nyro-ui-tests.XXXXXX)
 ./node_modules/.bin/tsc src/lib/format.test.ts src/lib/model-ratings.test.ts \
-  src/lib/model-performance.test.ts src/lib/provider-icon-resolve.test.ts \
+  src/lib/model-performance.test.ts src/lib/model-probe-selection.test.ts \
+  src/lib/provider-icon-resolve.test.ts \
   --outDir "$test_dir" --module commonjs --moduleResolution node --target es2020 \
   --esModuleInterop --skipLibCheck
 node --test "$test_dir/format.test.js" "$test_dir/model-ratings.test.js" \
-  "$test_dir/model-performance.test.js" "$test_dir/provider-icon-resolve.test.js"
+  "$test_dir/model-performance.test.js" "$test_dir/model-probe-selection.test.js" \
+  "$test_dir/provider-icon-resolve.test.js"
 ```
 
 ## Isolation and evidence

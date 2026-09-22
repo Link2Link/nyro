@@ -131,7 +131,13 @@ function resolveHTTP(cmd: string, args?: Record<string, unknown>): HTTPMapping {
     case "test_provider_models":
       return { method: "GET", url: `${base}/providers/${args?.id}/test-models` };
     case "probe_provider_models":
-      return { method: "POST", url: `${base}/providers/${args?.id}/probe-models` };
+      return {
+        method: "POST",
+        url: `${base}/providers/${args?.id}/probe-models`,
+        // Omit the body entirely for legacy full runs; an explicit empty list
+        // is rejected server-side, so only send real selections.
+        ...(Array.isArray(args?.models) ? { body: { models: args.models } } : {}),
+      };
     case "get_provider_models":
       return { method: "GET", url: `${base}/providers/${args?.id}/models${args?.requireCatalog === true ? "?require_catalog=true" : ""}` };
     case "get_model_performance": {

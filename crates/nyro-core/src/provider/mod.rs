@@ -41,6 +41,7 @@ pub mod opencode_go;
 pub mod openrouter;
 pub mod vertexai;
 pub mod xai;
+pub mod xiaomimimo;
 pub mod zai;
 pub mod zhipuai;
 

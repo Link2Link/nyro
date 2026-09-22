@@ -827,6 +827,70 @@ fn ark_coding_channel_is_shared_key_multi_protocol() {
 }
 
 #[test]
+fn xiaomimimo_channels_are_shared_key_multi_protocol() {
+    let reg = VendorRegistry::global();
+    let meta = reg
+        .metadata("xiaomimimo")
+        .expect("xiaomimimo vendor metadata");
+    assert_eq!(meta.label.en, "Xiaomi MiMo");
+    assert_eq!(meta.icon, "xiaomimimo");
+
+    let cn = meta
+        .channels
+        .iter()
+        .find(|channel| channel.id == "token-plan-cn")
+        .expect("xiaomimimo token-plan-cn channel");
+    assert!(cn.shared_key_protocols, "channel must be shared-key");
+
+    let base_urls: std::collections::HashMap<&str, &str> = cn
+        .base_urls
+        .iter()
+        .map(|entry| (entry.protocol, entry.base_url))
+        .collect();
+    assert_eq!(base_urls.len(), 3);
+    assert_eq!(
+        base_urls.get("openai-compatible").copied(),
+        Some("https://token-plan-cn.xiaomimimo.com/v1")
+    );
+    assert_eq!(
+        base_urls.get("openai-responses").copied(),
+        Some("https://token-plan-cn.xiaomimimo.com/v1")
+    );
+    assert_eq!(
+        base_urls.get("anthropic-messages").copied(),
+        Some("https://token-plan-cn.xiaomimimo.com/anthropic")
+    );
+
+    // MiMo documents `api-key` / `Authorization: Bearer` only, so the
+    // Anthropic endpoint is pinned to Bearer (never `x-api-key`).
+    let auth_schemes: std::collections::HashMap<&str, &str> = cn
+        .auth_schemes
+        .unwrap_or_default()
+        .iter()
+        .map(|entry| (entry.protocol, entry.auth_scheme))
+        .collect();
+    assert_eq!(
+        auth_schemes.get("anthropic-messages").copied(),
+        Some("bearer")
+    );
+    assert_eq!(auth_schemes.len(), 1);
+
+    let mut declared: Vec<&str> = cn.static_models.iter().copied().collect();
+    declared.sort();
+    assert_eq!(declared, vec!["mimo-v2.5", "mimo-v2.5-pro"]);
+
+    let default_channel = meta
+        .channels
+        .iter()
+        .find(|channel| channel.id == "default")
+        .expect("xiaomimimo pay-as-you-go channel");
+    assert_eq!(
+        default_channel.models_source,
+        Some("https://api.xiaomimimo.com/v1/models")
+    );
+}
+
+#[test]
 fn bailian_channels_are_shared_key_multi_protocol() {
     let reg = VendorRegistry::global();
     let meta = reg.metadata("bailian").expect("bailian vendor metadata");

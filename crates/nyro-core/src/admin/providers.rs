@@ -1082,6 +1082,61 @@ fn resolve_probe_target(
     }
 }
 
+/// Normalize an explicit probe selection: trim entries, drop empty ones and
+/// exact duplicates (first-seen order wins). `None` means "probe every
+/// discovered model"; a selection that normalizes to nothing is rejected up
+/// front so a caller can never fall through to a full run (or an empty one)
+/// by accident.
+pub fn normalize_probe_selection(
+    models: Option<Vec<String>>,
+) -> anyhow::Result<Option<Vec<String>>> {
+    let Some(models) = models else {
+        return Ok(None);
+    };
+    let mut seen = std::collections::HashSet::new();
+    let selection: Vec<String> = models
+        .iter()
+        .map(|model| model.trim().to_string())
+        .filter(|model| !model.is_empty())
+        .filter(|model| seen.insert(model.clone()))
+        .collect();
+    if selection.is_empty() {
+        anyhow::bail!("model selection is empty");
+    }
+    Ok(Some(selection))
+}
+
+#[cfg(test)]
+mod probe_selection_tests {
+    use super::*;
+
+    #[test]
+    fn absent_selection_means_probe_every_discovered_model() {
+        assert_eq!(normalize_probe_selection(None).unwrap(), None);
+    }
+
+    #[test]
+    fn empty_and_blank_selections_are_rejected() {
+        assert!(normalize_probe_selection(Some(Vec::new())).is_err());
+        assert!(normalize_probe_selection(Some(vec!["".into(), "   ".into()])).is_err());
+    }
+
+    #[test]
+    fn selection_trims_drops_blanks_and_dedupes_in_order() {
+        let selection = normalize_probe_selection(Some(vec![
+            " b ".into(),
+            "a".into(),
+            "b".into(),
+            "  ".into(),
+            "c".into(),
+            "a".into(),
+        ]))
+        .unwrap()
+        .unwrap();
+        assert_eq!(selection, vec!["b", "a", "c"]);
+    }
+}
+
 impl AdminService {
     // ── Providers ──
 
@@ -1911,20 +1966,33 @@ impl AdminService {
         }
     }
 
-    /// Send a minimal "hi" chat request to every model in the provider's
-    /// discovered list and report which ones actually answer. The WebUI uses
-    /// the results to hide non-callable models from route target pickers.
+    /// Send a minimal "hi" chat request to each selected model and report
+    /// which ones actually answer. The WebUI uses the results to hide
+    /// non-callable models from route target pickers.
+    ///
+    /// `models: None` probes every model in the provider's discovered list;
+    /// `models: Some(list)` probes exactly the named models (after
+    /// normalization) — including names outside the discovered catalog, which
+    /// resolve against the provider's default probe endpoint.
     pub async fn probe_provider_models(
         &self,
         id: &str,
+        models: Option<Vec<String>>,
     ) -> anyhow::Result<ProviderModelProbeOutcome> {
         use futures::StreamExt;
 
+        let selection = normalize_probe_selection(models)?;
         let provider = self.get_provider(id).await?;
-        let models = self.get_provider_models(id).await?;
-        if models.is_empty() {
-            anyhow::bail!("provider model list is empty");
-        }
+        let models = match selection {
+            Some(models) => models,
+            None => {
+                let models = self.get_provider_models(id).await?;
+                if models.is_empty() {
+                    anyhow::bail!("provider model list is empty");
+                }
+                models
+            }
+        };
 
         // Pick the probe endpoint: adaptive providers probe through the
         // endpoint matching their configured default protocol

@@ -42,7 +42,8 @@ Claude Code · Codex CLI · Gemini CLI · OpenCode
             (localhost:19530)
                       ↓
     OpenAI · Anthropic · Google · DeepSeek
-    MiniMax · xAI · GLM · Ollama · ...
+    MiniMax · xAI · GLM · Xiaomi MiMo
+       Kimi · Ollama · ...
 ```
 
 Nyro ships as a **desktop app** (macOS / Windows / Linux) and a **standalone server binary** for headless and self-hosted deployments.

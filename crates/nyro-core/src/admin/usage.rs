@@ -38,6 +38,18 @@
 //! against a live key 2026-08-16 and the community scripts in cc-switch #6433 /
 //! dsh-opencode-go-usage).
 //!
+//! Xiaomi MiMo (platform.xiaomimimo.com): the console quota surface
+//! (`/api/v1/balance`, `/api/v1/tokenPlan/usage`) authenticates with the
+//! Xiaomi account web-session Cookie stored in usage-credential slot A — the
+//! inference API key is not accepted there. Shapes follow cc-toolkit
+//! `custom/Xiaomi-MiMo/{index,token-plan}.js`: balance values are numeric
+//! strings (`balance` / `giftBalance` / `cashBalance`), and Token Plan packs
+//! arrive as `usage.items[]` with `{ name, used, limit, percent }` where
+//! `plan_total_token` is the binding subscription window and every other pack
+//! (e.g. `compensation_total_token`) is dropped from the API — the service
+//! stops when the plan pack is exhausted and never spills into
+//! compensation/balance, so bonus packs carry no scheduling or display value.
+//!
 //! OpenAI Codex (ChatGPT OAuth): `GET
 //! https://chatgpt.com/backend-api/wham/usage` with the refreshed OAuth access
 //! token, `chatgpt-account-id`, and the quota request headers mirrored from
@@ -72,6 +84,15 @@ const DEEPSEEK_BALANCE_URL: &str = "https://api.deepseek.com/user/balance";
 
 /// OpenCode Go subscription usage endpoint.
 const OPENCODE_GO_USAGE_URL: &str = "https://opencode.ai/zen/go/v1/usage";
+
+/// Xiaomi MiMo console quota endpoints. All authenticate with the Xiaomi
+/// account web-session Cookie (usage-credential slot A), never the inference
+/// API key — the same console surfaces behind platform.xiaomimimo.com's
+/// balance / plan-manage pages. `tokenPlan/detail` supplies the subscription
+/// period end (the reset anchor for steady-pace display).
+const MIMO_BALANCE_URL: &str = "https://platform.xiaomimimo.com/api/v1/balance";
+const MIMO_TOKEN_PLAN_USAGE_URL: &str = "https://platform.xiaomimimo.com/api/v1/tokenPlan/usage";
+const MIMO_TOKEN_PLAN_DETAIL_URL: &str = "https://platform.xiaomimimo.com/api/v1/tokenPlan/detail";
 
 // Bailian token-plan usage: the console CLI gateway serves the quota
 // windows; a CLI access token (minted from RAM AK/SK via the Model Studio
@@ -262,6 +283,15 @@ enum UsageBackend {
     /// per-model pools read from the Code Assist `fetchAvailableModels`
     /// catalog (`quotaInfo.remainingFraction` / `resetTime`).
     GoogleSubscription,
+    /// Xiaomi MiMo pay-as-you-go balance on platform.xiaomimimo.com. Read
+    /// from the console `/api/v1/balance` endpoint with the Xiaomi account
+    /// web-session Cookie (usage-credential slot A) — the inference API key
+    /// is not accepted.
+    MimoBalance,
+    /// Xiaomi MiMo Token Plan subscription packs on
+    /// `token-plan-*.xiaomimimo.com`, read from the console
+    /// `/api/v1/tokenPlan/usage` endpoint with the same Cookie credential.
+    MimoTokenPlan,
 }
 
 impl UsageBackend {
@@ -317,6 +347,25 @@ impl UsageBackend {
         if is_google_identity {
             return Some(UsageBackend::GoogleSubscription);
         }
+        // Xiaomi MiMo: the vendor preset identifies the provider; the Base URL
+        // separates the Token Plan clusters from pay-as-you-go. Quota is read
+        // from the Xiaomi console either way.
+        let is_mimo_identity = identities.iter().any(|value| {
+            value.eq_ignore_ascii_case("xiaomimimo") || value.eq_ignore_ascii_case("xiaomi-mimo")
+        });
+        if is_mimo_identity {
+            return Some(
+                if provider
+                    .base_url
+                    .to_ascii_lowercase()
+                    .contains("token-plan")
+                {
+                    UsageBackend::MimoTokenPlan
+                } else {
+                    UsageBackend::MimoBalance
+                },
+            );
+        }
         Self::detect_url(&provider.base_url)
     }
 
@@ -344,6 +393,16 @@ impl UsageBackend {
             Some(UsageBackend::OpencodeGo)
         } else if url.contains("volces.com") {
             Some(UsageBackend::ArkCoding)
+        } else if url.contains("xiaomimimo.com") {
+            // Xiaomi MiMo console quota (Cookie-authenticated); the host
+            // separates the Token Plan clusters from pay-as-you-go. Must run
+            // before Bailian's `token-plan.` match — the MiMo cluster hosts are
+            // `token-plan-<cluster>.xiaomimimo.com`.
+            Some(if url.contains("token-plan") {
+                UsageBackend::MimoTokenPlan
+            } else {
+                UsageBackend::MimoBalance
+            })
         } else if url.contains("token-plan.") {
             Some(UsageBackend::BailianCodingPlan)
         } else {
@@ -363,6 +422,8 @@ impl UsageBackend {
             UsageBackend::OpenAiCodex => "openai_codex",
             UsageBackend::Grok => "grok_plan",
             UsageBackend::GoogleSubscription => "google_subscription",
+            UsageBackend::MimoBalance => "mimo_balance",
+            UsageBackend::MimoTokenPlan => "mimo_token_plan",
         }
     }
 
@@ -372,7 +433,7 @@ impl UsageBackend {
         is_available: Option<bool>,
     ) -> bool {
         match self {
-            UsageBackend::DeepSeek => is_available.is_some(),
+            UsageBackend::DeepSeek | UsageBackend::MimoBalance => is_available.is_some(),
             UsageBackend::OpenAiCodex => {
                 is_available.is_some()
                     || tiers.iter().any(|tier| !tier.name.starts_with("feature:"))
@@ -396,6 +457,26 @@ impl UsageBackend {
             | UsageBackend::Grok
             | UsageBackend::GoogleSubscription => "global",
             UsageBackend::ArkCoding | UsageBackend::BailianCodingPlan => "cn",
+            // The MiMo console quota surface is account-scoped; the
+            // cluster-specific label comes from `site_of` below.
+            UsageBackend::MimoBalance | UsageBackend::MimoTokenPlan => "global",
+        }
+    }
+
+    /// Site label for one provider row. Most backends are pinned to one site;
+    /// MiMo's cluster is chosen per provider (`token-plan-cn` is the China
+    /// cluster, while `token-plan-sgp` / `token-plan-ams` and the
+    /// pay-as-you-go endpoint are global).
+    fn site_of(&self, base_url: &str) -> &'static str {
+        match self {
+            UsageBackend::MimoBalance | UsageBackend::MimoTokenPlan => {
+                if base_url.to_ascii_lowercase().contains("token-plan-cn") {
+                    "cn"
+                } else {
+                    "global"
+                }
+            }
+            _ => self.site(),
         }
     }
 }
@@ -554,6 +635,49 @@ fn quota_window_tag(window: Option<&str>) -> String {
     }
 }
 
+/// Duration rank of one quota-window label: `five_hour` -> `weekly_limit` ->
+/// `monthly` -> `primary_window` -> `secondary_window`; unknown labels sort
+/// last within their group.
+fn window_duration_rank(window: &str) -> u8 {
+    match window {
+        TIER_FIVE_HOUR => 0,
+        TIER_WEEKLY_LIMIT => 1,
+        TIER_MONTHLY => 2,
+        "primary_window" => 3,
+        "secondary_window" => 4,
+        _ => 5,
+    }
+}
+
+/// Canonical display rank of a tier name as `(group, window rank)`: main
+/// quota windows first (duration order), then `feature:<name>:<window>`
+/// windows in the same duration order, then any other name.
+fn tier_display_rank(name: &str) -> (u8, u8) {
+    if let Some((_, window)) = name
+        .strip_prefix("feature:")
+        .and_then(|rest| rest.rsplit_once(':'))
+    {
+        return (1, window_duration_rank(window));
+    }
+    match name {
+        TIER_FIVE_HOUR | TIER_WEEKLY_LIMIT | TIER_MONTHLY | "primary_window"
+        | "secondary_window" => (0, window_duration_rank(name)),
+        // Unknown names keep their arrival order — the sort is stable.
+        _ => (2, 0),
+    }
+}
+
+/// Sort tiers into the API's canonical presentation order. The ordering is
+/// owned by the API rather than each UI, so every consumer — the WebUI
+/// provider footer, the dsh usage panel, external Admin API clients — reads
+/// one identical sequence: 5-hour window first, then weekly, then monthly,
+/// then the remaining known windows, then feature windows, then anything
+/// else in arrival order. Deliberately *not* usage order: a row's position
+/// must not flip just because another window got more spent.
+fn sort_tiers_for_display(tiers: &mut [ProviderUsageTier]) {
+    tiers.sort_by_key(|tier| tier_display_rank(&tier.name));
+}
+
 /// Gemini-only quota buckets: this backend serves Gemini traffic, and
 /// ancillary pools (third-party claude-* / gpt-oss-* families, tab
 /// previews) are deliberately dropped — the same convention as the catalog
@@ -622,11 +746,9 @@ fn quota_summary_tiers(
             tier
         })
         .collect();
-    tiers.sort_by(|a, b| {
-        b.used_percent
-            .partial_cmp(&a.used_percent)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    // Canonical window order (5h before weekly), not usage order: a row's
+    // position must not flip just because another window got more spent.
+    sort_tiers_for_display(&mut tiers);
     tiers
 }
 
@@ -1281,16 +1403,10 @@ fn parse_openai_codex_usage(
         }
     }
 
-    // Stable presentation: main quota windows first, then feature windows;
-    // within each group the duration-derived 5h window precedes weekly.
-    let order = |name: &str| match name {
-        TIER_FIVE_HOUR => (0, 0),
-        TIER_WEEKLY_LIMIT => (0, 1),
-        name if name.starts_with("feature:") && name.ends_with(":five_hour") => (1, 0),
-        name if name.starts_with("feature:") && name.ends_with(":weekly_limit") => (1, 1),
-        _ => (2, 0),
-    };
-    tiers.sort_by_key(|tier| order(&tier.name));
+    // Stable presentation: the canonical order shared with every other
+    // backend — main quota windows first (duration-derived 5h window before
+    // weekly), then feature windows.
+    sort_tiers_for_display(&mut tiers);
 
     let is_available = if availability_signals.is_empty() {
         None
@@ -1364,13 +1480,169 @@ fn parse_ark_tiers(result: &Value) -> Vec<ProviderUsageTier> {
 
     let mut tiers = Vec::new();
     visit(result, &mut tiers);
-    // Stable emission order: five-hour, weekly, monthly.
-    let order = |name: &str| match name {
-        TIER_FIVE_HOUR => 0,
-        TIER_WEEKLY_LIMIT => 1,
-        _ => 2,
-    };
-    tiers.sort_by_key(|tier| order(&tier.name));
+    // Stable emission order: five-hour, weekly, monthly (canonical).
+    sort_tiers_for_display(&mut tiers);
+    tiers
+}
+
+/// Fetch one Xiaomi MiMo console quota endpoint. Auth is the Xiaomi account
+/// web-session Cookie (platform.xiaomimimo.com), NOT the inference API key.
+/// Envelope: `{ code, message, data }` with `code == 0` on success (cc-toolkit
+/// Xiaomi-MiMo scripts); the `data` object is returned unwrapped.
+async fn fetch_mimo_console_json(
+    client: &reqwest::Client,
+    url: &str,
+    cookie: &str,
+) -> anyhow::Result<Value> {
+    let resp = client
+        .get(url)
+        .header("Cookie", cookie)
+        .header("Accept", "application/json")
+        .timeout(Duration::from_secs(15))
+        .send()
+        .await
+        .map_err(|e| anyhow::anyhow!("usage query request failed: {e}"))?;
+    let status = resp.status();
+    let raw = resp
+        .bytes()
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to read usage response: {e}"))?;
+    if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+        anyhow::bail!(
+            "MiMo console session rejected (HTTP {status}): re-login platform.xiaomimimo.com \
+             and refresh the usage-query cookie"
+        );
+    }
+    if !status.is_success() {
+        let preview: String = String::from_utf8_lossy(&raw).chars().take(200).collect();
+        anyhow::bail!("HTTP {status}: {preview}");
+    }
+    let body: Value = serde_json::from_slice(&raw)
+        .map_err(|e| anyhow::anyhow!("failed to parse usage response: {e}"))?;
+    if body.get("code").and_then(Value::as_i64) != Some(0) {
+        let code = body.get("code").and_then(Value::as_i64).unwrap_or(-1);
+        let message = body
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown error");
+        anyhow::bail!("MiMo console API error (code {code}): {message}");
+    }
+    Ok(body.get("data").cloned().unwrap_or(Value::Null))
+}
+
+/// Parse the MiMo console `/api/v1/balance` payload (`data` object).
+///
+/// Shape (cc-toolkit Xiaomi-MiMo/index.js): `{ currency, balance, giftBalance,
+/// cashBalance, frozenBalance, ... }` with numeric STRING values. `balance` is
+/// the total (gift + cash), mirroring the DeepSeek balance rows; the account is
+/// available while the total is positive ("余额不足" below zero).
+fn parse_mimo_balances(data: &Value) -> (Vec<ProviderUsageBalance>, Option<bool>) {
+    let currency = data
+        .get("currency")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("CNY")
+        .to_string();
+    let total = data.get("balance").and_then(parse_f64).unwrap_or(0.0);
+    let balances = vec![ProviderUsageBalance {
+        currency,
+        total,
+        granted: data.get("giftBalance").and_then(parse_f64).unwrap_or(0.0),
+        topped_up: data.get("cashBalance").and_then(parse_f64).unwrap_or(0.0),
+    }];
+    (balances, Some(total > 0.0))
+}
+
+/// Parse the MiMo `tokenPlan/detail` `currentPeriodEnd` ("2026-10-21
+/// 23:59:59") into an RFC3339 value for `resets_at`. The console reports
+/// China wall-clock time (the platform is CN-only), so the value is anchored
+/// at UTC+08:00 rather than left naive — the WebUI's `new Date()` would
+/// otherwise read it in the viewer's timezone.
+fn parse_mimo_period_end(detail: &Value) -> Option<String> {
+    let raw = detail
+        .get("currentPeriodEnd")
+        .and_then(Value::as_str)?
+        .trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let stamped = format!("{raw} +0800");
+    let end = chrono::DateTime::parse_from_str(&stamped, "%Y-%m-%d %H:%M:%S %z").ok()?;
+    Some(end.to_rfc3339())
+}
+
+/// Parse the MiMo console `tokenPlan/usage` payload (`data` object) into
+/// usage tiers.
+///
+/// Shape (cc-toolkit Xiaomi-MiMo/token-plan.js): `usage.items[]` carries one
+/// credit pack per entry (`{ name, used, limit, percent }`; `percent` is a
+/// used FRACTION 0-1 — 0.03 means 3% — rounded to two decimals, so the exact
+/// `used / limit` ratio takes precedence and the fraction is only scaled up
+/// as a fallback). Only `plan_total_token` — the binding 30-day subscription
+/// window — is exposed (as `monthly`); every other pack
+/// (`compensation_total_token`, …) is dropped from the API entirely: the
+/// service stops when the plan pack is exhausted and does NOT spill into
+/// compensation/balance, so bonus packs carry no scheduling or display value.
+/// `monthUsage` restates the same consumption on a calendar-month angle and is
+/// deliberately not duplicated into tiers.
+fn parse_mimo_token_plan_tiers(data: &Value) -> Vec<ProviderUsageTier> {
+    let mut tiers = Vec::new();
+    let usage = data.get("usage");
+    if let Some(items) = usage
+        .and_then(|value| value.get("items"))
+        .and_then(Value::as_array)
+    {
+        for item in items {
+            let name = item
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim();
+            // Only the binding plan pack is exposed; bonus packs
+            // (`compensation_total_token`, …) are dropped entirely — they
+            // carry no scheduling or display value.
+            if !name.eq_ignore_ascii_case("plan_total_token") {
+                continue;
+            }
+            // Upstream `percent` is a used FRACTION (0.03 = 3%) rounded to
+            // two decimals — the exact `used / limit` ratio wins when usable,
+            // and the fraction is scaled to a percentage otherwise.
+            let used_percent = {
+                let ratio = match (
+                    item.get("used").and_then(parse_f64),
+                    item.get("limit").and_then(parse_f64).filter(|l| *l > 0.0),
+                ) {
+                    (Some(used), Some(limit)) => used / limit * 100.0,
+                    _ => item
+                        .get("percent")
+                        .and_then(parse_f64)
+                        .map(|percent| percent * 100.0)
+                        .unwrap_or(0.0),
+                };
+                ratio.clamp(0.0, 100.0)
+            };
+            tiers.push(ProviderUsageTier {
+                name: TIER_MONTHLY.to_string(),
+                used_percent,
+                resets_at: None,
+            });
+        }
+    }
+    // Without a `plan_total_token` row (upstream rename), the aggregate
+    // `usage.percent` still states the subscription window.
+    if tiers.is_empty()
+        && let Some(used_percent) = usage
+            .and_then(|value| value.get("percent"))
+            .and_then(parse_f64)
+            .map(|percent| percent * 100.0)
+    {
+        tiers.push(ProviderUsageTier {
+            name: TIER_MONTHLY.to_string(),
+            used_percent: used_percent.clamp(0.0, 100.0),
+            resets_at: None,
+        });
+    }
     tiers
 }
 
@@ -1882,16 +2154,13 @@ impl AdminService {
     ) -> anyhow::Result<ProviderUsage> {
         match self.query_provider_usage(id, mode).await {
             Ok((mut usage, true)) => {
-                // Feature-specific Codex limits (for example Spark) are
-                // informational. Exhausting one feature must not pause the
-                // provider's main Codex routing quota.
+                // Feature-specific windows (Codex metered features such as
+                // Spark) are informational. Exhausting one feature must not
+                // pause the provider's main routing quota.
                 let tiers = usage
                     .tiers
                     .iter()
-                    .filter(|tier| {
-                        usage.kind != UsageBackend::OpenAiCodex.kind()
-                            || !tier.name.starts_with("feature:")
-                    })
+                    .filter(|tier| !tier.name.starts_with("feature:"))
                     .map(|tier| QuotaTierObservation {
                         name: tier.name.clone(),
                         used_percent: tier.used_percent,
@@ -1938,7 +2207,8 @@ impl AdminService {
                  (bigmodel.cn / api.z.ai), MiniMax (api.minimaxi.com / api.minimax.io), \
                  Kimi (api.kimi.com), OpenCode Go (opencode.ai/zen), Ark \
                  (volces.com), Bailian token-plan (token-plan.maas.aliyuncs.com), \
-                 DeepSeek (api.deepseek.com) and Google subscription OAuth \
+                 DeepSeek (api.deepseek.com), Xiaomi MiMo (platform.xiaomimimo.com,
+                 Cookie-authenticated console quota) and Google subscription OAuth \
                  (Google AI Pro / Code Assist) are supported"
             )
         })?;
@@ -1955,7 +2225,7 @@ impl AdminService {
             )
         };
 
-        let (tiers, balances, level, is_available, spends) = match backend {
+        let (mut tiers, balances, level, is_available, spends) = match backend {
             UsageBackend::OpenAiCodex => {
                 if provider.effective_auth_mode().trim() != "oauth" {
                     anyhow::bail!("OpenAI Codex usage query requires an OAuth provider");
@@ -2259,6 +2529,58 @@ impl AdminService {
                     Vec::new(),
                 )
             }
+            UsageBackend::MimoBalance | UsageBackend::MimoTokenPlan => {
+                // The inference API key is still required to consider this a
+                // configured provider; the console quota request below
+                // authenticates with the Xiaomi account web-session Cookie.
+                let _api_key = api_key.as_deref().expect("non-OAuth backend API key");
+                let (cookie, _) = self.get_provider_usage_credentials(&provider.id).await?;
+                let cookie = cookie
+                    .map(|value| value.trim().to_string())
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "MiMo usage query requires the Xiaomi account web-session Cookie (the \
+                             inference API key is not accepted): log in to platform.xiaomimimo.com, \
+                             open DevTools -> Network, copy the Cookie request header of any console \
+                             /api/v1 call (e.g. the plan-manage usage request), and paste it into \
+                             this provider's usage-query credential field"
+                        )
+                    })?;
+                let url = match backend {
+                    UsageBackend::MimoTokenPlan => MIMO_TOKEN_PLAN_USAGE_URL,
+                    _ => MIMO_BALANCE_URL,
+                };
+                let data = fetch_mimo_console_json(&self.gw.http_client, url, &cookie).await?;
+                match backend {
+                    UsageBackend::MimoTokenPlan => {
+                        // The usage payload carries no reset time; the
+                        // subscription period end from `tokenPlan/detail`
+                        // anchors the steady-pace needle. A failing detail
+                        // lookup degrades to no reset time, never an error.
+                        let detail = fetch_mimo_console_json(
+                            &self.gw.http_client,
+                            MIMO_TOKEN_PLAN_DETAIL_URL,
+                            &cookie,
+                        )
+                        .await
+                        .unwrap_or(Value::Null);
+                        let mut tiers = parse_mimo_token_plan_tiers(&data);
+                        if let Some(resets_at) = parse_mimo_period_end(&detail) {
+                            for tier in &mut tiers {
+                                if tier.name == TIER_MONTHLY {
+                                    tier.resets_at = Some(resets_at.clone());
+                                }
+                            }
+                        }
+                        (tiers, Vec::new(), None, None, Vec::new())
+                    }
+                    _ => {
+                        let (balances, is_available) = parse_mimo_balances(&data);
+                        (Vec::new(), balances, None, is_available, Vec::new())
+                    }
+                }
+            }
             UsageBackend::Grok => {
                 if provider.effective_auth_mode().trim() != "oauth" {
                     anyhow::bail!("Grok usage query requires an OAuth provider");
@@ -2346,12 +2668,18 @@ impl AdminService {
             }
         };
 
+        // Presentation order is owned by the API so every consumer (WebUI,
+        // the dsh usage panel, external Admin API clients) reads the same
+        // canonical window sequence.
+        sort_tiers_for_display(&mut tiers);
+
         let authoritative = backend.has_authoritative_observation(&tiers, is_available);
+        let site = backend.site_of(&provider.base_url).to_string();
         Ok((
             ProviderUsage {
                 provider_id: provider.id,
                 kind: backend.kind().to_string(),
-                site: backend.site().to_string(),
+                site,
                 level,
                 tiers,
                 balances,
@@ -2435,6 +2763,18 @@ async fn provider_usage_monitorable(admin: &AdminService, provider: &Provider) -
     }
     if backend == UsageBackend::BailianCodingPlan {
         // Slot A alone is enough: a pasted CLI access token works without SK.
+        return admin
+            .get_provider_usage_credentials(&provider.id)
+            .await
+            .ok()
+            .and_then(|(access_key, _)| access_key)
+            .is_some();
+    }
+    if matches!(
+        backend,
+        UsageBackend::MimoBalance | UsageBackend::MimoTokenPlan
+    ) {
+        // Slot A holds the Xiaomi account web-session Cookie.
         return admin
             .get_provider_usage_credentials(&provider.id)
             .await
@@ -2559,6 +2899,179 @@ mod tests {
             "https://dashscope.aliyuncs.com/compatible-mode/v1",
         );
         assert_eq!(UsageBackend::detect(&payg), None);
+    }
+
+    #[test]
+    fn mimo_detection_splits_token_plan_and_balance() {
+        let token_plan = provider_for_usage(
+            Some("xiaomimimo"),
+            Some("xiaomimimo"),
+            Some("token-plan-cn"),
+            "https://token-plan-cn.xiaomimimo.com/v1",
+        );
+        assert_eq!(
+            UsageBackend::detect(&token_plan),
+            Some(UsageBackend::MimoTokenPlan)
+        );
+
+        // URL fallback for imported rows without vendor/preset fields; the
+        // MiMo cluster hosts must not fall into Bailian's `token-plan.` match.
+        let imported = provider_for_usage(
+            None,
+            None,
+            None,
+            "https://token-plan-sgp.xiaomimimo.com/anthropic",
+        );
+        assert_eq!(
+            UsageBackend::detect(&imported),
+            Some(UsageBackend::MimoTokenPlan)
+        );
+
+        let payg = provider_for_usage(
+            Some("xiaomimimo"),
+            Some("xiaomimimo"),
+            Some("default"),
+            "https://api.xiaomimimo.com/v1",
+        );
+        assert_eq!(UsageBackend::detect(&payg), Some(UsageBackend::MimoBalance));
+
+        // Cluster-aware site labels.
+        assert_eq!(
+            UsageBackend::MimoTokenPlan.site_of("https://token-plan-cn.xiaomimimo.com/v1"),
+            "cn"
+        );
+        assert_eq!(
+            UsageBackend::MimoTokenPlan.site_of("https://token-plan-ams.xiaomimimo.com/v1"),
+            "global"
+        );
+    }
+
+    #[test]
+    fn parse_mimo_balances_maps_total_gift_and_cash() {
+        let data = serde_json::json!({
+            "balance": "74.62",
+            "frozenBalance": "0.00",
+            "currency": "CNY",
+            "overdraftLimit": "0.00",
+            "remainingOverdraftLimit": "0.00",
+            "giftBalance": "74.62",
+            "cashBalance": "0.00"
+        });
+        let (balances, is_available) = parse_mimo_balances(&data);
+        assert_eq!(is_available, Some(true));
+        assert_eq!(
+            balances,
+            vec![ProviderUsageBalance {
+                currency: "CNY".to_string(),
+                total: 74.62,
+                granted: 74.62,
+                topped_up: 0.0,
+            }]
+        );
+
+        // Numeric strings and numbers both parse; zero balance is unavailable.
+        let drained = serde_json::json!({
+            "balance": 0.0,
+            "currency": "USD",
+            "giftBalance": "0.00",
+            "cashBalance": "0.00"
+        });
+        let (balances, is_available) = parse_mimo_balances(&drained);
+        assert_eq!(is_available, Some(false));
+        assert_eq!(balances[0].currency, "USD");
+    }
+
+    #[test]
+    fn parse_mimo_token_plan_tiers_exposes_only_the_plan_pack() {
+        // Live upstream shape (2026-09-22, token-plan-cn): `percent` is a
+        // used FRACTION (0.03 = 3%) rounded to two decimals, while the exact
+        // used/limit ratio is 2.5434% — the ratio must win for precision.
+        let data = serde_json::json!({
+            "monthUsage": {
+                "percent": 0.0254,
+                "items": [{ "name": "month_total_token", "used": 279773584i64, "limit": 11000000000i64, "percent": 0.0254 }]
+            },
+            "usage": {
+                "percent": 0.03,
+                "items": [
+                    { "name": "plan_total_token", "used": 279773584i64, "limit": 11000000000i64, "percent": 0.03 },
+                    { "name": "compensation_total_token", "used": 0, "limit": 0, "percent": 0 }
+                ]
+            }
+        });
+        let tiers = parse_mimo_token_plan_tiers(&data);
+        assert_eq!(
+            tiers.len(),
+            1,
+            "only the binding plan pack is exposed: {tiers:?}"
+        );
+        assert_eq!(tiers[0].name, TIER_MONTHLY);
+        let expected = 279773584.0 / 11000000000.0 * 100.0;
+        assert!(
+            (tiers[0].used_percent - expected).abs() < 1e-9,
+            "{} != {expected}",
+            tiers[0].used_percent
+        );
+
+        // No usable ratio (limit 0): the `percent` fraction is scaled to a
+        // percentage instead of being trusted as one (0.25 = 25%, not 0.25%).
+        let fallback = serde_json::json!({
+            "usage": {
+                "items": [{ "name": "plan_total_token", "used": 0, "limit": 0, "percent": 0.25 }]
+            }
+        });
+        let tiers = parse_mimo_token_plan_tiers(&fallback);
+        assert_eq!(tiers[0].used_percent, 25.0);
+
+        // Absolute values fill in when the percent field is missing.
+        let absolute = serde_json::json!({
+            "usage": {
+                "items": [
+                    { "name": "plan_total_token", "used": 50, "limit": 200 }
+                ]
+            }
+        });
+        let tiers = parse_mimo_token_plan_tiers(&absolute);
+        assert_eq!(tiers[0].name, TIER_MONTHLY);
+        assert_eq!(tiers[0].used_percent, 25.0);
+
+        // Missing plan row (upstream rename): the aggregate `usage.percent`
+        // fraction stands in for the binding subscription window (0.6 = 60%);
+        // the renamed pack is still dropped on its own.
+        let renamed = serde_json::json!({
+            "usage": {
+                "percent": 0.6,
+                "items": [{ "name": "plan_credits", "used": 6, "limit": 10, "percent": 0.6 }]
+            }
+        });
+        let tiers = parse_mimo_token_plan_tiers(&renamed);
+        assert_eq!(tiers.len(), 1, "renamed packs are dropped: {tiers:?}");
+        assert_eq!(tiers[0].name, TIER_MONTHLY);
+        assert_eq!(tiers[0].used_percent, 60.0);
+    }
+
+    #[test]
+    fn parse_mimo_period_end_anchors_china_wall_clock() {
+        let detail = serde_json::json!({
+            "planCode": "standard",
+            "currentPeriodEnd": "2026-10-21 23:59:59",
+            "expired": false
+        });
+        assert_eq!(
+            parse_mimo_period_end(&detail).as_deref(),
+            Some("2026-10-21T23:59:59+08:00")
+        );
+
+        // Missing or malformed period ends degrade to no reset time.
+        assert_eq!(parse_mimo_period_end(&serde_json::json!({})), None);
+        assert_eq!(
+            parse_mimo_period_end(&serde_json::json!({ "currentPeriodEnd": "" })),
+            None
+        );
+        assert_eq!(
+            parse_mimo_period_end(&serde_json::json!({ "currentPeriodEnd": "not-a-date" })),
+            None
+        );
     }
 
     #[test]
@@ -3771,6 +4284,63 @@ mod tests {
         // Collapse keeps the tightest bucket across the surviving pools.
         assert_eq!(tiers[0].name, "five_hour");
         assert_eq!(tiers[0].used_percent, 80.0);
+    }
+
+    #[test]
+    fn quota_summary_tiers_order_windows_by_duration_not_usage() {
+        use crate::provider::google::antigravity::QuotaSummaryBucket;
+        // Regression: with the weekly window more spent than the 5-hour one,
+        // the rows used to come back weekly-first (usage order), so the WebUI
+        // and the dsh usage panel showed the same quota in opposite row
+        // orders. Window rows are ordered by duration, never by usage.
+        let buckets = vec![
+            QuotaSummaryBucket {
+                group: Some("Gemini".into()),
+                display_name: Some("Weekly Limit Remaining".into()),
+                bucket_id: Some("b1".into()),
+                window: Some("WEEKLY".into()),
+                remaining_fraction: 0.58,
+                resets_at: Some("2026-09-23T05:35:34Z".into()),
+            },
+            QuotaSummaryBucket {
+                group: Some("Gemini".into()),
+                display_name: Some("Five Hour Limit Remaining".into()),
+                bucket_id: Some("b2".into()),
+                window: Some("FIVE_HOURS".into()),
+                remaining_fraction: 0.98,
+                resets_at: Some("2026-09-16T10:35:34Z".into()),
+            },
+        ];
+        let tiers = quota_summary_tiers(&buckets);
+        let names: Vec<&str> = tiers.iter().map(|tier| tier.name.as_str()).collect();
+        assert_eq!(names, vec!["five_hour", "weekly_limit"]);
+    }
+
+    #[test]
+    fn sort_tiers_for_display_uses_canonical_window_order() {
+        // Main windows by duration first, then feature windows, then unknown
+        // names in arrival order — regardless of how spent each row is.
+        let mut tiers = vec![
+            tier("weekly_limit", 42.0, None),
+            tier("feature:spark:weekly_limit", 5.0, None),
+            tier("gemini", 10.0, None),
+            tier("five_hour", 2.0, None),
+            tier("feature:spark:five_hour", 1.0, None),
+            tier("monthly", 7.0, None),
+        ];
+        sort_tiers_for_display(&mut tiers);
+        let names: Vec<&str> = tiers.iter().map(|tier| tier.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "five_hour",
+                "weekly_limit",
+                "monthly",
+                "feature:spark:five_hour",
+                "feature:spark:weekly_limit",
+                "gemini",
+            ]
+        );
     }
 
     #[test]

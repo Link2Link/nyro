@@ -21,9 +21,12 @@ import type {
 } from "@/lib/types";
 import {
   loadModelProbeResults,
+  mergeProbeResults,
   saveModelProbeResults,
   type ProviderModelProbeRecord,
 } from "@/lib/model-probe";
+import { saveProbeSelection } from "@/lib/model-probe-selection";
+import { ModelProbePicker } from "@/components/model-probe-picker";
 import {
   Server,
   Plus,
@@ -841,6 +844,11 @@ function usageSupported(
     url.includes("api.deepseek.com") ||
     url.includes("opencode.ai/zen") ||
     url.includes("volces.com") ||
+    // MiMo cluster hosts (`token-plan-<cluster>.xiaomimimo.com`) end in
+    // `-cn.`/`-sgp.` rather than Bailian's `token-plan.`, so the vendor
+    // domain must be matched explicitly (mirrors `UsageBackend::detect`,
+    // which checks xiaomimimo before the `token-plan.` fallback).
+    url.includes("xiaomimimo.com") ||
     url.includes("token-plan.")
   );
 }
@@ -898,6 +906,7 @@ export default function ProvidersPage() {
   const editingIdRef = useRef<string | null>(null);
   const [testingId, setTestingId] = useState<string | null>(null);
   const [probingId, setProbingId] = useState<string | null>(null);
+  const [probePickerTarget, setProbePickerTarget] = useState<Provider | null>(null);
   const [modelProbeResults, setModelProbeResults] =
     useState<Record<string, ProviderModelProbeRecord>>(loadModelProbeResults);
   const [testResult, setTestResult] = useState<Record<string, TestResult>>(loadProviderTestResults);
@@ -1665,10 +1674,13 @@ export default function ProvidersPage() {
     }
   }
 
-  async function handleModelProbe(provider: Provider) {
+  async function runModelProbe(provider: Provider, models: string[]) {
     const runId = activeTestRunRef.current + 1;
     activeTestRunRef.current = runId;
     const isCanceled = () => activeTestRunRef.current !== runId;
+    // Stamp the whole run before the request: merge ordering must know which
+    // run every result came from, even for a late, superseded response.
+    const runAt = new Date().toISOString();
 
     setProbingId(provider.id);
     setTestTarget(provider);
@@ -1687,17 +1699,27 @@ export default function ProvidersPage() {
       appendTestLog(
         "info",
         isZh
-          ? `开始模型测试 ${provider.name}（向每个模型发送 "hi"）...`
-          : `Start model probing ${provider.name} (sending "hi" to every model)...`,
+          ? `开始模型测试 ${provider.name}（向 ${models.length} 个模型发送 "hi"）...`
+          : `Start model probing ${provider.name} (sending "hi" to ${models.length} models)...`,
       );
-      appendTestLog("info", isZh ? "▶ 获取模型列表" : "▶ Fetch model list");
+      appendTestLog(
+        "info",
+        isZh ? `▶ 探测 ${models.length} 个指定模型` : `▶ Probing ${models.length} selected models`,
+      );
 
       const outcome = await backend<ModelProbeOutcome>("probe_provider_models", {
         id: provider.id,
+        models,
       });
-      if (isCanceled()) return;
-
       const results = outcome.results;
+      // Persist first and unconditionally: closing the dialog stops the log
+      // feed but must never throw paid-for results away. The per-model merge
+      // keeps a late superseded run from overwriting a newer retry.
+      setModelProbeResults((prev) => ({
+        ...prev,
+        [provider.id]: mergeProbeResults(prev[provider.id], results, runAt),
+      }));
+      if (isCanceled()) return;
       const probeProtocol = outcome.meta?.protocol
         ? (endpointDisplayName(outcome.meta.protocol) ?? outcome.meta.protocol)
         : "";
@@ -1716,14 +1738,6 @@ export default function ProvidersPage() {
           ? `✓ 模型测试完成：${ok.length} 个可用，${failed.length} 个不可用（共 ${results.length} 个）`
           : `✓ Model probing finished: ${ok.length} reachable, ${failed.length} unreachable (of ${results.length})`,
       );
-
-      setModelProbeResults((prev) => ({
-        ...prev,
-        [provider.id]: {
-          results,
-          tested_at: new Date().toISOString(),
-        },
-      }));
 
       for (const result of results) {
         const protocolLabel = result.protocol
@@ -2831,6 +2845,7 @@ export default function ProvidersPage() {
               const editingProviderIsArk = p.base_url.toLowerCase().includes("volces.com");
               const editingProviderIsDeepSeek = p.base_url.toLowerCase().includes("api.deepseek.com");
               const editingProviderIsBailian = p.base_url.toLowerCase().includes("token-plan.");
+              const editingProviderIsMimo = p.base_url.toLowerCase().includes("xiaomimimo.com");
               const currentProviderIsOAuth =
                 normalizeAuthMode(p.auth_mode) === "oauth"
                 || normalizeAuthMode(editForm.auth_mode) === "oauth";
@@ -3481,6 +3496,28 @@ export default function ProvidersPage() {
                         />
                       </div>
                     )}
+                    {editingProviderIsMimo && (
+                      <div className="col-span-2 space-y-2 rounded-xl border border-slate-200 bg-slate-50/60 p-3">
+                        <FieldLabel
+                          info={
+                            isZh
+                              ? "用于查询余额 / Token Plan 套餐用量。用量查询走小米控制台接口（platform.xiaomimimo.com），需要小米账号网页登录态 Cookie，与推理用的 API Key 不同。登录 platform.xiaomimimo.com 后，从浏览器开发者工具 → Network 中复制任意控制台 /api/v1 请求（如 plan-manage 用量请求）的 Cookie 请求头。留空保存即清除。"
+                              : "Used to query balance / Token Plan usage. Usage queries go through the Xiaomi console API (platform.xiaomimimo.com) and require the Xiaomi account web-session Cookie — different from the inference API key. Sign in to platform.xiaomimimo.com, then copy the Cookie request header of any console /api/v1 call (e.g. the plan-manage usage request) from DevTools → Network. Save with blanks to clear."
+                          }
+                        >
+                          {isZh ? "用量查询 Cookie（小米 MiMo）" : "Usage Query Cookie (Xiaomi MiMo)"}
+                        </FieldLabel>
+                        <Input
+                          className="bg-white"
+                          type="password"
+                          placeholder="cookie..."
+                          autoComplete="off"
+                          spellCheck={false}
+                          value={editUsageAk}
+                          onChange={(e) => setEditUsageAk(e.target.value)}
+                        />
+                      </div>
+                    )}
                     {editingProviderIsBailian && (
                       <div className="col-span-2 space-y-2 rounded-xl border border-slate-200 bg-slate-50/60 p-3">
                         <FieldLabel
@@ -3748,7 +3785,7 @@ export default function ProvidersPage() {
                       )}
                     </button>
                     <button
-                      onClick={() => handleModelProbe(p)}
+                      onClick={() => setProbePickerTarget(p)}
                       disabled={Boolean(testingId) || Boolean(probingId)}
                       title={isZh ? "模型测试" : "Test Models"}
                       className="rounded-lg p-2 text-slate-400 transition-colors hover:bg-violet-50 hover:text-violet-500 cursor-pointer disabled:opacity-50"
@@ -3796,6 +3833,21 @@ export default function ProvidersPage() {
           })}
         </div>
       )}
+
+      <ModelProbePicker
+        open={Boolean(probePickerTarget)}
+        provider={probePickerTarget}
+        isZh={isZh}
+        lastResults={probePickerTarget ? modelProbeResults[probePickerTarget.id]?.results : undefined}
+        onCancel={() => setProbePickerTarget(null)}
+        onConfirm={(models) => {
+          const target = probePickerTarget;
+          setProbePickerTarget(null);
+          if (!target) return;
+          saveProbeSelection(target.id, models);
+          void runModelProbe(target, models);
+        }}
+      />
 
       <Dialog
         open={testDialogOpen}
