@@ -1,4 +1,5 @@
 mod claude;
+pub(crate) mod codex_version;
 mod google;
 mod grok;
 mod openai;

@@ -2216,6 +2216,12 @@ impl AdminService {
     /// Fetch the provider's model list from its discovery source, before
     /// vendor-scoped visibility filtering.
     async fn fetch_provider_models(&self, provider: &Provider) -> anyhow::Result<Vec<String>> {
+        // Codex: resolve the advertised client version before runtime binding
+        // so the models-source URL carries the freshly probed one —
+        // bind_runtime only reads the already-cached value.
+        if is_codex_oauth_provider(provider) {
+            crate::auth::drivers::codex_version::resolve(Some(&self.gw.http_client)).await;
+        }
         let runtime = self.resolve_provider_runtime(provider).await?;
         let credential = runtime.access_token.clone();
         // Adaptive providers: the discovery endpoint is OpenAI-style even when
@@ -2336,6 +2342,11 @@ impl AdminService {
         provider: &Provider,
         require_catalog: bool,
     ) -> anyhow::Result<Vec<String>> {
+        // Same codex rationale as `fetch_provider_models`: probe the latest
+        // client version before binding so discovery sees the newest models.
+        if is_codex_oauth_provider(provider) {
+            crate::auth::drivers::codex_version::resolve(Some(&self.gw.http_client)).await;
+        }
         let runtime = self.resolve_provider_runtime(provider).await?;
         let credential = runtime.access_token.clone();
         // Same adaptive-auth rationale as `test_provider_models` above.

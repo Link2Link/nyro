@@ -7,6 +7,7 @@ use reqwest::header::{ACCEPT, CONTENT_TYPE, USER_AGENT};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
+use super::codex_version;
 use super::shared::{
     PkceAuthState, build_authorize_url, encode_scopes, expires_at_after, generate_code_challenge,
     generate_code_verifier, generate_state, parse_oauth_callback, parse_session_state,
@@ -26,13 +27,22 @@ const CODEX_CHANNEL_ID: &str = "codex";
 const CODEX_REFRESH_SCOPE: &str = "openid profile email";
 // Codex client identity advertised to chatgpt.com/backend-api/codex.
 // The upstream content-negotiates on this version (the models manifest and
-// available model slugs depend on it) and 404s below 0.144.0. Bump manually
-// to the latest stable `rust-v*` tag of github.com/openai/codex; keep it in
+// available model slugs depend on it) and 404s below 0.144.0. At runtime the
+// gateway probes npm's `@openai/codex` dist-tags for the latest stable
+// release (see `codex_version`) and falls back to this compile-time constant
+// whenever the probe fails or has not answered yet. Keep the fallback in
 // sync with CODEX_USER_AGENT and the codex channel's `models_client_version`
 // in provider/openai/mod.rs (guarded by a unit test below).
-const CODEX_CLIENT_VERSION: &str = "0.153.4";
 const CODEX_ORIGINATOR: &str = "codex-tui";
-const CODEX_USER_AGENT: &str = "codex-tui/0.153.4 (Ubuntu 22.4.0; x86_64) xterm-256color";
+const CODEX_USER_AGENT: &str = "codex-tui/0.156.0 (Ubuntu 22.4.0; x86_64) xterm-256color";
+
+/// User-Agent for chatgpt.com data-plane requests, built from the version
+/// actually advertised (probed at runtime, fallback otherwise) so the UA,
+/// the `version` header, and the models-source `client_version` query
+/// parameter always stay consistent with each other.
+fn codex_user_agent(version: &str) -> String {
+    format!("codex-tui/{version} (Ubuntu 22.4.0; x86_64) xterm-256color")
+}
 
 /// Resolved OAuth + runtime config for the OpenAI / Codex channel,
 /// sourced from the in-process `VendorRegistry`.
@@ -270,11 +280,8 @@ impl OpenAIOAuthDriver {
             .header("originator", CODEX_ORIGINATOR)
     }
 
-    fn codex_models_source(runtime: &RuntimeConfig) -> String {
-        format!(
-            "{}?client_version={}",
-            runtime.models_url, runtime.models_client_version
-        )
+    fn codex_models_source(runtime: &RuntimeConfig, client_version: &str) -> String {
+        format!("{}?client_version={}", runtime.models_url, client_version)
     }
 }
 
@@ -438,14 +445,20 @@ impl AuthDriver for OpenAIOAuthDriver {
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .ok_or_else(|| anyhow!("openai oauth credential is missing access token"))?;
+        // Advertise the probed codex CLI version (the compile-time fallback
+        // while the first probe is still in flight) so the `version` header,
+        // the User-Agent, and the models-source `client_version` query stay
+        // consistent. The refresh spawn never blocks this hot path.
+        let client_version = codex_version::cached_or_fallback();
+        codex_version::spawn_refresh_if_stale(None);
         let mut extra_headers = HashMap::from([
             (
                 "authorization".to_string(),
                 format!("Bearer {access_token}"),
             ),
-            ("user-agent".to_string(), CODEX_USER_AGENT.to_string()),
+            ("user-agent".to_string(), codex_user_agent(&client_version)),
             ("originator".to_string(), CODEX_ORIGINATOR.to_string()),
-            ("version".to_string(), CODEX_CLIENT_VERSION.to_string()),
+            ("version".to_string(), client_version.clone()),
         ]);
         if let Some(account_id) = account_id {
             extra_headers.insert("chatgpt-account-id".to_string(), account_id);
@@ -456,7 +469,8 @@ impl AuthDriver for OpenAIOAuthDriver {
             .filter(|value| !value.trim().is_empty())
             .or_else(|| Some(config.runtime.api_base_url.to_string()));
 
-        let models_source_override = Some(Self::codex_models_source(config.runtime));
+        let models_source_override =
+            Some(Self::codex_models_source(config.runtime, &client_version));
 
         Ok(RuntimeBinding {
             base_url_override,
@@ -613,7 +627,10 @@ mod tests {
         );
         assert_eq!(binding.extra_headers["authorization"], "Bearer not-a-jwt");
         assert_eq!(binding.extra_headers["originator"], CODEX_ORIGINATOR);
-        assert_eq!(binding.extra_headers["version"], CODEX_CLIENT_VERSION);
+        assert_eq!(
+            binding.extra_headers["version"],
+            codex_version::FALLBACK_CODEX_CLIENT_VERSION
+        );
         assert!(binding.disable_default_auth);
     }
 
@@ -623,15 +640,21 @@ mod tests {
         // client version (manifest contents depend on it; below 0.144.0 it
         // 404s). The UA version segment, the `version` header, and the
         // models-source query param must all advertise the same version.
-        assert!(CODEX_USER_AGENT.starts_with(&format!("codex-tui/{CODEX_CLIENT_VERSION} ")));
+        assert_eq!(
+            CODEX_USER_AGENT,
+            codex_user_agent(codex_version::FALLBACK_CODEX_CLIENT_VERSION)
+        );
         let config = OpenAIOAuthDriver::codex_config().unwrap();
-        assert_eq!(config.runtime.models_client_version, CODEX_CLIENT_VERSION);
+        assert_eq!(
+            config.runtime.models_client_version,
+            codex_version::FALLBACK_CODEX_CLIENT_VERSION
+        );
 
         let min: Vec<u32> = "0.144.0"
             .split('.')
             .map(|part| part.parse().unwrap())
             .collect();
-        let current: Vec<u32> = CODEX_CLIENT_VERSION
+        let current: Vec<u32> = codex_version::FALLBACK_CODEX_CLIENT_VERSION
             .split('.')
             .map(|part| part.parse().unwrap())
             .collect();
