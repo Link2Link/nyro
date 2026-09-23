@@ -101,7 +101,8 @@ export function formatTokenCount(value: number | null | undefined): string {
   const n = Math.max(0, Math.floor(value));
   if (n < 1000) return String(n);
   if (n < 1_000_000) return `${(n / 1000).toFixed(1)}K`;
-  return `${(n / 1_000_000).toFixed(2)}M`;
+  if (n < 1_000_000_000) return `${(n / 1_000_000).toFixed(2)}M`;
+  return `${(n / 1_000_000_000).toFixed(2)}B`;
 }
 
 /**

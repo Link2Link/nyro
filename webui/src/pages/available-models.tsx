@@ -71,6 +71,10 @@ function normalizeSearch(value: string) {
 
 function formatTokens(value?: number | null) {
   if (!value || value <= 0) return null;
+  if (value >= 1_000_000_000) {
+    const amount = value / 1_000_000_000;
+    return (Number.isInteger(amount) ? amount : amount.toFixed(1)) + "B";
+  }
   if (value >= 1_000_000) {
     const amount = value / 1_000_000;
     return (Number.isInteger(amount) ? amount : amount.toFixed(1)) + "M";
