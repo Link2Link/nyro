@@ -1235,16 +1235,18 @@ fn unwrap_bailian_gateway_data(data: &Value) -> Value {
 /// Parse the Bailian console-gateway token-plan usage payload.
 ///
 /// Shape (console API 'zeldaHttp.apikeyMgr./tokenplan/personal/api/v2/usage'):
-/// per5HourPercentage / per5HourResetTime / per1WeekPercentage /
-/// per1WeekResetTime. The percentage fields are usage ratios in [0, 1]
-/// (same as the official bl usage token-plan CLI); Nyro stores 0-100
-/// used-percent, so they are multiplied by 100 here. Reset times are epoch
-/// milliseconds. Windows without a numeric percentage are skipped;
-/// emission order is five-hour then weekly.
+/// per5HourPercentage / per5HourResetTime, per1WeekPercentage /
+/// per1WeekResetTime, and per1MonthPercentage / per1MonthResetTime.
+/// Some plans only report the monthly window. The percentage fields are usage
+/// ratios in [0, 1] (same as the official bl usage token-plan CLI); Nyro
+/// stores 0-100 used-percent, so they are multiplied by 100 here. Reset times
+/// are epoch milliseconds. Windows without a numeric percentage are skipped;
+/// emission order is five-hour, weekly, then monthly.
 fn parse_bailian_tiers(data: &Value) -> Vec<ProviderUsageTier> {
     let windows = [
         ("per5HourPercentage", "per5HourResetTime", TIER_FIVE_HOUR),
         ("per1WeekPercentage", "per1WeekResetTime", TIER_WEEKLY_LIMIT),
+        ("per1MonthPercentage", "per1MonthResetTime", TIER_MONTHLY),
     ];
     windows
         .into_iter()
@@ -3149,6 +3151,48 @@ mod tests {
         assert_eq!(tiers[0].name, TIER_WEEKLY_LIMIT);
         let used = tiers[0].used_percent;
         assert!((used - 1.67).abs() < 1e-9, "got {used}");
+    }
+
+    #[test]
+    fn bailian_monthly_only_gateway_response_is_authoritative() {
+        // Observed live 2026-09-22: this subscription exposes a monthly window
+        // instead of the five-hour and weekly windows used by other plans.
+        let response = serde_json::json!({
+            "success": true,
+            "DataV2": {
+                "data": {
+                    "success": true,
+                    "data": {
+                        "per1MonthPercentage": 0.135,
+                        "per1MonthResetTime": 1770500000000i64
+                    }
+                }
+            }
+        });
+        let tiers = parse_bailian_tiers(&unwrap_bailian_gateway_data(&response));
+        assert_eq!(tiers.len(), 1);
+        assert_eq!(tiers[0].name, TIER_MONTHLY);
+        assert!((tiers[0].used_percent - 13.5).abs() < 1e-9);
+        assert_eq!(
+            tiers[0].resets_at.as_deref(),
+            millis_to_iso8601(1_770_500_000_000).as_deref()
+        );
+        assert!(UsageBackend::BailianCodingPlan.has_authoritative_observation(&tiers, None));
+
+        // Plans with all three windows retain the canonical display order.
+        let all = serde_json::json!({
+            "per1MonthPercentage": 0.2,
+            "per1WeekPercentage": 0.1,
+            "per5HourPercentage": 0.05
+        });
+        let tiers = parse_bailian_tiers(&all);
+        assert_eq!(
+            tiers
+                .iter()
+                .map(|tier| tier.name.as_str())
+                .collect::<Vec<_>>(),
+            vec![TIER_FIVE_HOUR, TIER_WEEKLY_LIMIT, TIER_MONTHLY]
+        );
     }
 
     fn tier(name: &str, used: f64, resets_at: Option<&str>) -> ProviderUsageTier {
