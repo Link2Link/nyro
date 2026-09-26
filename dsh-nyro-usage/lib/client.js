@@ -83,6 +83,7 @@ const zh = {
 	"tier.monthly": "每月",
 	"tier.primary_window": "主要窗口",
 	"tier.secondary_window": "次要窗口",
+	"tier.gemini": "Gemini 共享池",
 	"tier.feature": "{feature} · {window}",
 	"tier.pace": "匀速参考线：{percent}%（按整窗匀速使用推进）",
 	"settings.title": "Nyro 用量",
@@ -148,6 +149,7 @@ const en = {
 	"tier.monthly": "Monthly",
 	"tier.primary_window": "Primary window",
 	"tier.secondary_window": "Secondary window",
+	"tier.gemini": "Gemini shared pool",
 	"tier.feature": "{feature} · {window}",
 	"tier.pace": "Steady pace: {percent}% (even consumption over the window)",
 	"settings.title": "Nyro Usage",
@@ -383,8 +385,9 @@ var panel_module_css_default = {
 };
 //#endregion
 //#region src/client/panel/TierBar.tsx
-/** Pretty-print a tier name: known windows localized, `feature:<f>:<w>`
-* rendered as "<Feature> · <window>", anything else humanized. */
+/** Pretty-print a tier name: known windows localized, the collapsed Google
+* Gemini bucket labeled explicitly, `feature:<f>:<w>` rendered as
+* "<Feature> · <window>", anything else humanized. */
 function tierLabel(name) {
 	const known = [
 		"five_hour",
@@ -393,6 +396,7 @@ function tierLabel(name) {
 		"primary_window",
 		"secondary_window"
 	];
+	if (name === "gemini") return tt("tier.gemini");
 	const feature = /^feature:(.+):(five_hour|weekly_limit|monthly|primary_window|secondary_window)$/.exec(name);
 	if (feature !== null) return tt("tier.feature", {
 		feature: feature[1].replace(/[_-]+/g, " ").replace(/\s+/g, " ").trim().replace(/\b\w/g, (character) => character.toUpperCase()),
@@ -1868,8 +1872,7 @@ const inject = [
 	"slots",
 	"locale",
 	"connection",
-	"settingsScope",
-	"remote"
+	"configForms"
 ];
 /**
 * Mount the nyro usage surfaces.
@@ -1892,7 +1895,7 @@ function apply(ctx) {
 	ctx.effect(() => () => {
 		for (const dispose of disposers.splice(0)) dispose();
 	}, "nyro-usage: surfaces");
-	const settings = new NyroUsageSettingsCardController((ctx.get("webUiSettings") ?? ctx.settingsScope).bind({ namespace: NYRO_USAGE_NS }));
+	const settings = new NyroUsageSettingsCardController(ctx.configForms.get(NYRO_USAGE_NS));
 	ctx.slots.inject("web-ui.plugin.item", () => ctx.slots.register({
 		name: "web-ui.plugin.item",
 		id: "nyro-usage",

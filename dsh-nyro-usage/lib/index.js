@@ -1,5 +1,22 @@
-import { installSettingsSection, settingsNamespace } from "@deepseek-ai/dsh-settings";
 import z from "schemastery";
+//#region src/volatile.ts
+/**
+* Read a config field that may arrive as a plain scalar (plain
+* `schemastery` resolution — what this package depends on) or as a
+* volatile reference (the `@deepseek-ai/schemastery` fork used inside the
+* dsh host). Kept tolerant so either resolution feeds the routes.
+*/
+function isVolatileRef(value) {
+	return typeof value === "object" && value !== null && typeof value.get === "function";
+}
+function derefVolatile(value, fallback) {
+	if (isVolatileRef(value)) {
+		const inner = value.get();
+		return inner === void 0 || inner === null ? fallback : inner;
+	}
+	return value === void 0 || value === null ? fallback : value;
+}
+//#endregion
 //#region src/nyro.ts
 /**
 * Normalize a configured base URL: trims whitespace, drops trailing slashes
@@ -298,17 +315,25 @@ const name = "nyro-usage";
 /** Services required before the proxy routes can mount. */
 const inject = ["webServer"];
 /**
-* Settings namespace of the nyro-usage capability — the section the web
-* settings surface edits. Spelled here rather than imported: the browser
-* half spells the same value and must not depend on a Host package.
+* Settings namespace of the nyro-usage capability — the profile entry id
+* (the dsh ≥ 0.1.7 settings key). Spelled here rather than derived: the
+* browser half spells the same value and must not depend on a Host package.
 */
-const NYRO_USAGE_SETTINGS_NAMESPACE = settingsNamespace("nyro-usage");
+const NYRO_USAGE_SETTINGS_NAMESPACE = "nyro-usage";
+/**
+* Module-level Config: dsh ≥ 0.1.7 derives the settings section from this
+* export (namespace = entry id). Fields are marked volatile through
+* `.extra('volatile', true)` so they stay live-editable; because plain
+* `schemastery` does not resolve volatile fields to references, values
+* arrive as plain scalars and `derefVolatile` below keeps reads correct
+* under both plain and forked schema resolutions.
+*/
 const Config = z.object({
-	enabled: z.boolean().default(true),
-	baseUrl: z.string().default(""),
-	adminToken: z.string().role("secret").default(""),
-	refreshSeconds: z.number().min(15).default(300),
-	cacheSeconds: z.number().min(0).default(30)
+	enabled: z.boolean().default(true).extra("volatile", true),
+	baseUrl: z.string().default("").extra("volatile", true),
+	adminToken: z.string().role("secret").default("").extra("volatile", true),
+	refreshSeconds: z.number().min(15).default(300).extra("volatile", true),
+	cacheSeconds: z.number().min(0).default(30).extra("volatile", true)
 });
 /**
 * Mount the nyro usage proxy routes.
@@ -316,37 +341,24 @@ const Config = z.object({
 * @param config - resolved plugin config (schema defaults applied by the loader).
 */
 function apply(ctx, config = {}) {
-	let current = () => config ?? {};
+	const current = () => config ?? {};
 	const resolve = () => {
 		const value = current();
 		return {
-			baseUrl: normalizeBaseUrl(value.baseUrl),
-			adminToken: value.adminToken ?? "",
-			refreshSeconds: value.refreshSeconds ?? 300,
-			cacheSeconds: value.cacheSeconds ?? 30
+			baseUrl: normalizeBaseUrl(derefVolatile(value.baseUrl, "")),
+			adminToken: derefVolatile(value.adminToken, ""),
+			refreshSeconds: derefVolatile(value.refreshSeconds, 300),
+			cacheSeconds: derefVolatile(value.cacheSeconds, 30)
 		};
 	};
-	let disposeRoutes;
 	const sync = () => {
-		if (disposeRoutes !== void 0) {
-			disposeRoutes();
-			disposeRoutes = void 0;
-		}
-		if ((current().enabled ?? true) === false) return;
+		if (ctx.webServer === void 0) return;
+		if (derefVolatile(current().enabled, true) === false) return;
 		const disposers = makeRoutes({ config: resolve }).map((route) => ctx.webServer.register(route));
-		disposeRoutes = () => {
-			for (const dispose of disposers) dispose();
-		};
 		ctx.effect(() => () => {
-			disposeRoutes?.();
+			for (const dispose of disposers) dispose();
 		}, "nyro-usage: routes");
 	};
-	installSettingsSection(ctx, NYRO_USAGE_SETTINGS_NAMESPACE, Config, config ?? {}, {
-		setSource: (source) => {
-			current = source;
-		},
-		onChange: sync
-	});
 	sync();
 }
 //#endregion

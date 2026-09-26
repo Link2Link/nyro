@@ -1,14 +1,17 @@
 /**
  * dsh-nyro-usage — host half. Registers the loopback-fenced
  * /api/nyro-usage route family that proxies the configured nyro gateway's
- * admin plane (bulk provider usage / status / connection test) and installs
- * the `nyro-usage` settings section the web settings card edits. The
- * browser half (./client) renders the sidebar entry and the usage panel.
- * Everything rides official NPM SDK packages — no dsh source changes.
+ * admin plane (bulk provider usage / status / connection test); the
+ * `nyro-usage` settings section is served by the module-level `Config`
+ * export (dsh ≥ 0.1.7: namespace = profile entry id, volatile fields are
+ * live-editable without remounting this fiber). The browser half
+ * (./client) renders the sidebar entry and the usage panel. Everything
+ * rides official NPM SDK packages — no dsh source changes.
  */
 
 import type { Context } from '@deepseek-ai/cordis'
-import { installSettingsSection, settingsNamespace } from '@deepseek-ai/dsh-settings'
+import './schemastery-volatile.d.ts'
+import { derefVolatile } from './volatile.ts'
 import z from 'schemastery'
 import type {} from '@deepseek-ai/dsh-host-webserver'
 import { makeRoutes, type NyroUsageRouteConfig } from './routes.ts'
@@ -21,11 +24,11 @@ export const name = 'nyro-usage'
 export const inject = ['webServer']
 
 /**
- * Settings namespace of the nyro-usage capability — the section the web
- * settings surface edits. Spelled here rather than imported: the browser
- * half spells the same value and must not depend on a Host package.
+ * Settings namespace of the nyro-usage capability — the profile entry id
+ * (the dsh ≥ 0.1.7 settings key). Spelled here rather than derived: the
+ * browser half spells the same value and must not depend on a Host package.
  */
-export const NYRO_USAGE_SETTINGS_NAMESPACE = settingsNamespace('nyro-usage')
+export const NYRO_USAGE_SETTINGS_NAMESPACE = 'nyro-usage'
 
 /** Plugin config, validated by the same-named schemastery schema. */
 export interface Config {
@@ -45,12 +48,20 @@ export interface Config {
   cacheSeconds?: number
 }
 
+/**
+ * Module-level Config: dsh ≥ 0.1.7 derives the settings section from this
+ * export (namespace = entry id). Fields are marked volatile through
+ * `.extra('volatile', true)` so they stay live-editable; because plain
+ * `schemastery` does not resolve volatile fields to references, values
+ * arrive as plain scalars and `derefVolatile` below keeps reads correct
+ * under both plain and forked schema resolutions.
+ */
 export const Config: z<Config> = z.object({
-  enabled: z.boolean().default(true),
-  baseUrl: z.string().default(''),
-  adminToken: z.string().role('secret').default(''),
-  refreshSeconds: z.number().min(15).default(300),
-  cacheSeconds: z.number().min(0).default(30),
+  enabled: z.boolean().default(true).extra('volatile', true),
+  baseUrl: z.string().default('').extra('volatile', true),
+  adminToken: z.string().role('secret').default('').extra('volatile', true),
+  refreshSeconds: z.number().min(15).default(300).extra('volatile', true),
+  cacheSeconds: z.number().min(0).default(30).extra('volatile', true),
 })
 
 /**
@@ -59,39 +70,25 @@ export const Config: z<Config> = z.object({
  * @param config - resolved plugin config (schema defaults applied by the loader).
  */
 export function apply(ctx: Context, config: Config = {}): void {
-  // The live source the surfaces read: the settings section once the web
-  // settings surface is served, the composition entry otherwise.
-  let current: () => Config = () => config ?? {}
+  // The live source the surfaces read: the composition entry (settings
+  // writes land through the config editor's volatile-update path).
+  const current: () => Config = () => config ?? {}
   const resolve = (): NyroUsageRouteConfig => {
     const value = current()
     return {
-      baseUrl: normalizeBaseUrl(value.baseUrl),
-      adminToken: value.adminToken ?? '',
-      refreshSeconds: value.refreshSeconds ?? 300,
-      cacheSeconds: value.cacheSeconds ?? 30,
+      baseUrl: normalizeBaseUrl(derefVolatile(value.baseUrl, '')),
+      adminToken: derefVolatile(value.adminToken, ''),
+      refreshSeconds: derefVolatile(value.refreshSeconds, 300),
+      cacheSeconds: derefVolatile(value.cacheSeconds, 30),
     }
   }
 
-  let disposeRoutes: (() => void) | undefined
-
-  // Register (or drop) the routes to match the current source; one disposer
-  // for the whole family so re-registering never trips the webserver's
-  // duplicate-route guard.
   const sync = (): void => {
-    if (disposeRoutes !== undefined) {
-      disposeRoutes()
-      disposeRoutes = undefined
-    }
-    if ((current().enabled ?? true) === false) return
+    if (ctx.webServer === undefined) return
+    if (derefVolatile<boolean>(current().enabled, true) === false) return
     const routes = makeRoutes({ config: resolve })
     const disposers = routes.map(route => ctx.webServer.register(route))
-    disposeRoutes = () => { for (const dispose of disposers) dispose() }
-    ctx.effect(() => () => { disposeRoutes?.() }, 'nyro-usage: routes')
+    ctx.effect(() => () => { for (const dispose of disposers) dispose() }, 'nyro-usage: routes')
   }
-
-  installSettingsSection(ctx, NYRO_USAGE_SETTINGS_NAMESPACE, Config, config ?? {}, {
-    setSource: (source) => { current = source },
-    onChange: sync,
-  })
   sync()
 }

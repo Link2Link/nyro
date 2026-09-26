@@ -12,7 +12,7 @@
  * Export discipline: the /client surface carries what cordis loading needs
  * plus types only — all value exports stay internal.
  */
-import type { ClientContext, SettingsScope, SettingsScopeSpec } from '@deepseek-ai/dsh-client-runtime/client'
+import type { ClientContext, SettingsScope } from '@deepseek-ai/dsh-client-runtime/client'
 // Type-only: pulls the locale plugin's Context merge (ctx.locale).
 import type {} from '@deepseek-ai/dsh-client-locale/client'
 // Type-only: pulls the LocaleNamespaceMap merge table.
@@ -59,16 +59,16 @@ export interface NyroUsagePluginItemOwnerProps {
 declare module '@deepseek-ai/cordis' {
   interface Context {
     /**
-     * Optional rc.6 compatibility binder provided by dsh-web-ui-settings;
-     * absent when that group plugin is not installed, so callers fall back to
-     * the official settings scope.
+     * Official settings forms service provided by
+     * `@deepseek-ai/dsh-client-ui-settings` (dsh ≥ 0.1.7): one controller per
+     * Host plugin entry id, matching the retired SettingsScope face.
      */
-    webUiSettings?: { bind<S>(spec: SettingsScopeSpec<S>): SettingsScope<S> }
+    configForms?: { get<T>(entryId: string): SettingsScope<T> }
   }
 }
 
 /** Required services (fiber inject waiting — the runtime must be up first). */
-export const inject = ['slots', 'locale', 'connection', 'settingsScope', 'remote']
+export const inject = ['slots', 'locale', 'connection', 'configForms']
 
 /** Type-only surface (export discipline: no value exports beyond the plugin contract). */
 export type { PanelControllerSnapshot } from './controller.ts'
@@ -100,9 +100,11 @@ export function apply(ctx: ClientContext): void {
 
   // Plugin configuration card: one staged form over the `nyro-usage`
   // settings namespace, contributed to the plugin-configuration section.
-  const binder = ctx.get('webUiSettings') ?? ctx.settingsScope
+  // dsh ≥ 0.1.7 serves the namespace through the configForms service
+  // (ctx.configForms.get(ns)); its controller matches the old SettingsScope
+  // face (getSnapshot/subscribe/set/unset).
   const settings = new NyroUsageSettingsCardController(
-    binder.bind<NyroUsageSettings>({ namespace: NYRO_USAGE_NS }),
+    ctx.configForms!.get<NyroUsageSettings>(NYRO_USAGE_NS),
   )
   ctx.slots.inject('web-ui.plugin.item', () => ctx.slots.register({
     name: 'web-ui.plugin.item',
