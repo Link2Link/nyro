@@ -41,7 +41,13 @@
 //! Xiaomi MiMo (platform.xiaomimimo.com): the console quota surface
 //! (`/api/v1/balance`, `/api/v1/tokenPlan/usage`) authenticates with the
 //! Xiaomi account web-session Cookie stored in usage-credential slot A — the
-//! inference API key is not accepted there. Shapes follow cc-toolkit
+//! inference API key is not accepted there. That Cookie's
+//! `api-platform_serviceToken` lives ~24h, so slot A alternatively accepts
+//! the account-level passToken (with the userId in slot B): the
+//! `provider::xiaomimimo::passport` module then mints a fresh serviceToken
+//! via Xiaomi passport serviceLogin (sid `api-platform`) per query window
+//! and re-mints once on session rejection — long-term unattended operation
+//! (flow ported from MiForge/migate). Shapes follow cc-toolkit
 //! `custom/Xiaomi-MiMo/{index,token-plan}.js`: balance values are numeric
 //! strings (`balance` / `giftBalance` / `cashBalance`), and Token Plan packs
 //! arrive as `usage.items[]` with `{ name, used, limit, percent }` where
@@ -62,6 +68,9 @@
 use futures::stream::{self, StreamExt};
 use reqwest::header::CONTENT_TYPE;
 
+use crate::provider::xiaomimimo::passport::{
+    classify_usage_credential, MimoSessionRejected, MimoUsageCredential,
+};
 use crate::router::quota::{ProviderScheduling, QuotaTierObservation};
 
 use super::*;
@@ -1491,6 +1500,12 @@ fn parse_ark_tiers(result: &Value) -> Vec<ProviderUsageTier> {
 /// web-session Cookie (platform.xiaomimimo.com), NOT the inference API key.
 /// Envelope: `{ code, message, data }` with `code == 0` on success (cc-toolkit
 /// Xiaomi-MiMo scripts); the `data` object is returned unwrapped.
+///
+/// Session rejections — HTTP 401/403, console-level `code` 401/403, or a
+/// redirect away from the platform host (expired sessions bounce into the
+/// login flow, and the JSON parse then fails) — surface as the
+/// [`MimoSessionRejected`] marker so passToken-mode callers can re-mint and
+/// retry once.
 async fn fetch_mimo_console_json(
     client: &reqwest::Client,
     url: &str,
@@ -1505,28 +1520,47 @@ async fn fetch_mimo_console_json(
         .await
         .map_err(|e| anyhow::anyhow!("usage query request failed: {e}"))?;
     let status = resp.status();
+    // Where the redirect chain actually landed: an expired console session
+    // is bounced into the Xiaomi login flow on another host.
+    let final_host = resp.url().host_str().unwrap_or_default().to_string();
     let raw = resp
         .bytes()
         .await
         .map_err(|e| anyhow::anyhow!("failed to read usage response: {e}"))?;
     if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
-        anyhow::bail!(
-            "MiMo console session rejected (HTTP {status}): re-login platform.xiaomimimo.com \
-             and refresh the usage-query cookie"
-        );
+        return Err(anyhow::Error::new(MimoSessionRejected::new(format!(
+            "HTTP {status}"
+        ))));
     }
     if !status.is_success() {
         let preview: String = String::from_utf8_lossy(&raw).chars().take(200).collect();
         anyhow::bail!("HTTP {status}: {preview}");
     }
-    let body: Value = serde_json::from_slice(&raw)
-        .map_err(|e| anyhow::anyhow!("failed to parse usage response: {e}"))?;
-    if body.get("code").and_then(Value::as_i64) != Some(0) {
-        let code = body.get("code").and_then(Value::as_i64).unwrap_or(-1);
+    let body: Value = match serde_json::from_slice(&raw) {
+        Ok(body) => body,
+        Err(e) => {
+            if final_host != "platform.xiaomimimo.com" {
+                // Redirected into the login flow — the session is gone.
+                return Err(anyhow::Error::new(MimoSessionRejected::new(format!(
+                    "redirected to {final_host}"
+                ))));
+            }
+            return Err(anyhow::anyhow!("failed to parse usage response: {e}"));
+        }
+    };
+    let code = body.get("code").and_then(Value::as_i64).unwrap_or(-1);
+    if code != 0 {
         let message = body
             .get("message")
             .and_then(Value::as_str)
             .unwrap_or("unknown error");
+        if code == 401 || code == 403 {
+            // Console-level session rejection (the same codes CodexBar maps
+            // to login-required / invalid-credentials).
+            return Err(anyhow::Error::new(MimoSessionRejected::new(format!(
+                "code {code}: {message}"
+            ))));
+        }
         anyhow::bail!("MiMo console API error (code {code}): {message}");
     }
     Ok(body.get("data").cloned().unwrap_or(Value::Null))
@@ -1650,8 +1684,11 @@ fn parse_mimo_token_plan_tiers(data: &Value) -> Vec<ProviderUsageTier> {
 
 /// Settings keys for the per-provider usage-query credentials (distinct from
 /// the inference API key). Two generic slots: Volcengine Ark stores its IAM
-/// AK/SK pair; DeepSeek stores the platform userToken in slot A. Reads fall
-/// back to the legacy `usage.ark.*` keys so existing Ark setups keep working.
+/// AK/SK pair; DeepSeek stores the platform userToken in slot A; Xiaomi MiMo
+/// stores either the console Cookie header (slot A, legacy) or the account
+/// passToken (slot A) + userId (slot B) for automatic session renewal.
+/// Reads fall back to the legacy `usage.ark.*` keys so existing Ark setups
+/// keep working.
 fn usage_credential_keys(provider_id: &str) -> ((String, String), (String, String)) {
     (
         (
@@ -2534,26 +2571,83 @@ impl AdminService {
             UsageBackend::MimoBalance | UsageBackend::MimoTokenPlan => {
                 // The inference API key is still required to consider this a
                 // configured provider; the console quota request below
-                // authenticates with the Xiaomi account web-session Cookie.
+                // authenticates with either the raw console Cookie (legacy,
+                // slot A) or the Xiaomi account passToken + userId (slots
+                // A/B) that mints a fresh serviceToken per query window.
                 let _api_key = api_key.as_deref().expect("non-OAuth backend API key");
-                let (cookie, _) = self.get_provider_usage_credentials(&provider.id).await?;
-                let cookie = cookie
-                    .map(|value| value.trim().to_string())
-                    .filter(|value| !value.is_empty())
-                    .ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "MiMo usage query requires the Xiaomi account web-session Cookie (the \
-                             inference API key is not accepted): log in to platform.xiaomimimo.com, \
-                             open DevTools -> Network, copy the Cookie request header of any console \
-                             /api/v1 call (e.g. the plan-manage usage request), and paste it into \
-                             this provider's usage-query credential field"
-                        )
-                    })?;
+                let (slot_a, slot_b) = self.get_provider_usage_credentials(&provider.id).await?;
                 let url = match backend {
                     UsageBackend::MimoTokenPlan => MIMO_TOKEN_PLAN_USAGE_URL,
                     _ => MIMO_BALANCE_URL,
                 };
-                let data = fetch_mimo_console_json(&self.gw.http_client, url, &cookie).await?;
+                let (cookie, data) = match classify_usage_credential(
+                    slot_a.as_deref().unwrap_or(""),
+                    slot_b.as_deref().unwrap_or(""),
+                ) {
+                    MimoUsageCredential::Passport(credential) => {
+                        // passToken mode: mint/reuse the console session and
+                        // retry once on session rejection (the minted
+                        // serviceToken fades between windows).
+                        let cookie = self
+                            .gw
+                            .mimo_sessions
+                            .get_or_mint(&provider.id, &credential)
+                            .await?;
+                        match fetch_mimo_console_json(&self.gw.http_client, url, &cookie).await {
+                            Ok(data) => (cookie, data),
+                            Err(error)
+                                if error.downcast_ref::<MimoSessionRejected>().is_some() =>
+                            {
+                                tracing::info!(
+                                    provider_id = %provider.id,
+                                    "MiMo console session rejected; re-minting serviceToken"
+                                );
+                                self.gw.mimo_sessions.invalidate(&provider.id).await;
+                                let cookie = self
+                                    .gw
+                                    .mimo_sessions
+                                    .get_or_mint(&provider.id, &credential)
+                                    .await?;
+                                let data =
+                                    fetch_mimo_console_json(&self.gw.http_client, url, &cookie)
+                                        .await?;
+                                (cookie, data)
+                            }
+                            Err(error) => return Err(error),
+                        }
+                    }
+                    MimoUsageCredential::MissingUserId { pass_token } => {
+                        anyhow::bail!(
+                            "MiMo passToken mode needs the userId: the usage-query credential \
+                             looks like a passToken ({prefix}…) but the userId field is empty — \
+                             fill the numeric Xiaomi account id (DevTools → Application → \
+                             Cookies → userId) alongside it, or paste the full console Cookie \
+                             header instead",
+                            prefix = pass_token.chars().take(8).collect::<String>()
+                        );
+                    }
+                    MimoUsageCredential::Cookie(raw) => {
+                        // Legacy raw-Cookie mode (the platform console
+                        // Cookie header pasted verbatim into slot A).
+                        let cookie = raw.trim().to_string();
+                        if cookie.is_empty() {
+                            anyhow::bail!(
+                                "MiMo usage query requires either the Xiaomi account \
+                                 passToken + userId (recommended — auto-renews the session) \
+                                 or the console web-session Cookie (neither is the inference \
+                                 API key): log in to platform.xiaomimimo.com, open DevTools \
+                                 -> Network, copy the Cookie request header of any console \
+                                 /api/v1 call (e.g. the plan-manage usage request) — or \
+                                 grab the long-lived passToken from account.xiaomi.com \
+                                 cookies — and paste it into this provider's usage-query \
+                                 credential field"
+                            );
+                        }
+                        let data =
+                            fetch_mimo_console_json(&self.gw.http_client, url, &cookie).await?;
+                        (cookie, data)
+                    }
+                };
                 match backend {
                     UsageBackend::MimoTokenPlan => {
                         // The usage payload carries no reset time; the
@@ -2734,6 +2828,8 @@ impl AdminService {
         store.set(&a_key, access_key.trim()).await?;
         store.set(&b_key, secret_key.trim()).await?;
         self.gw.quota_registry.invalidate(provider_id);
+        // A changed MiMo credential invalidates any minted console session.
+        self.gw.mimo_sessions.invalidate(provider_id).await;
         Ok(())
     }
 }
@@ -2776,7 +2872,8 @@ async fn provider_usage_monitorable(admin: &AdminService, provider: &Provider) -
         backend,
         UsageBackend::MimoBalance | UsageBackend::MimoTokenPlan
     ) {
-        // Slot A holds the Xiaomi account web-session Cookie.
+        // Slot A holds either the console Cookie (legacy) or the account
+        // passToken (userId then lives in slot B).
         return admin
             .get_provider_usage_credentials(&provider.id)
             .await
@@ -3074,6 +3171,118 @@ mod tests {
             parse_mimo_period_end(&serde_json::json!({ "currentPeriodEnd": "not-a-date" })),
             None
         );
+    }
+
+    #[tokio::test]
+    async fn mimo_console_fetch_classifies_session_rejections() {
+        use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
+        use axum::routing::get as route_get;
+
+        // Three rejection shapes: HTTP 401, console-level code 401, and the
+        // login-flow redirect (request follows it, lands off-platform, and
+        // the body stops being JSON).
+        let app = axum::Router::new()
+            .route(
+                "/http401",
+                route_get(|| async move {
+                    (StatusCode::UNAUTHORIZED, "nope")
+                }),
+            )
+            .route(
+                "/code401",
+                route_get(|| async move {
+                    (StatusCode::OK, r#"{"code":401,"message":"not logged in"}"#)
+                }),
+            )
+            .route(
+                "/redirect",
+                route_get(|| async move {
+                    let mut headers = HeaderMap::new();
+                    headers.insert(
+                        header::LOCATION,
+                        HeaderValue::from_static("https://account.xiaomi.com/pass/serviceLogin"),
+                    );
+                    (StatusCode::FOUND, headers, String::new())
+                }),
+            )
+            .route(
+                "/ok",
+                route_get(|| async move {
+                    (StatusCode::OK, r#"{"code":0,"message":"","data":{"balance":"1.00"}}"#)
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        // The real client follows redirects — mirrors the gateway client.
+        let client = reqwest::Client::new();
+        let base = format!("http://{addr}");
+
+        for path in ["/http401", "/code401", "/redirect"] {
+            let url = format!("{base}{path}");
+            let error = fetch_mimo_console_json(&client, &url, "userId=1; api-platform_serviceToken=t")
+                .await
+                .unwrap_err();
+            assert!(
+                error.downcast_ref::<MimoSessionRejected>().is_some(),
+                "{path} must classify as session rejection, got: {error}"
+            );
+        }
+
+        // A successful call unwraps the data object.
+        let data = fetch_mimo_console_json(
+            &client,
+            &format!("{base}/ok"),
+            "userId=1; api-platform_serviceToken=t",
+        )
+        .await
+        .unwrap();
+        assert_eq!(data.get("balance").and_then(Value::as_str), Some("1.00"));
+        server.abort();
+    }
+
+    #[test]
+    fn mimo_passport_credential_modes_parse_from_slots() {
+        use crate::provider::xiaomimimo::passport::{
+            classify_usage_credential, MimoPassportCredential, MimoUsageCredential,
+        };
+
+        // passToken + userId slots (the WebUI form shape).
+        assert_eq!(
+            classify_usage_credential("pt-token", "42"),
+            MimoUsageCredential::Passport(MimoPassportCredential {
+                pass_token: "pt-token".to_string(),
+                user_id: "42".to_string(),
+                device_id: None
+            })
+        );
+        // Modern `V1:` + base64 passToken (production shape): `=` padding
+        // must not push it into Cookie mode.
+        assert!(matches!(
+            classify_usage_credential("V1:dox9yZLw/7I8=", "616928585"),
+            MimoUsageCredential::Passport(_)
+        ));
+        // Account Cookie header paste (passToken inside).
+        let header = "userId=42; passToken=\"pt-token\"; deviceId=wb_dev";
+        let cred = match classify_usage_credential(header, "") {
+            MimoUsageCredential::Passport(cred) => cred,
+            other => panic!("expected Passport, got {other:?}"),
+        };
+        assert_eq!(cred.pass_token, "pt-token");
+        assert_eq!(cred.user_id, "42");
+        assert_eq!(cred.device_id.as_deref(), Some("wb_dev"));
+        // Legacy console Cookie stays Cookie.
+        assert!(matches!(
+            classify_usage_credential("userId=42; api-platform_serviceToken=\"tok\"", ""),
+            MimoUsageCredential::Cookie(_)
+        ));
+        // passToken without userId is the precise MissingUserId error.
+        assert!(matches!(
+            classify_usage_credential("V1:abc=", ""),
+            MimoUsageCredential::MissingUserId { .. }
+        ));
     }
 
     #[test]

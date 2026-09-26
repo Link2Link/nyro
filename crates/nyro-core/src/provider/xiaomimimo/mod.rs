@@ -27,6 +27,8 @@ use async_trait::async_trait;
 use reqwest::header::HeaderMap;
 use serde_json::Value;
 
+pub(crate) mod passport;
+
 use crate::error::GatewayError;
 use crate::protocol::ids::ProtocolId;
 use crate::protocol::ir::{AiRequest, AiResponse};

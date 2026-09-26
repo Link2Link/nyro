@@ -584,6 +584,7 @@ inventory::submit! { ExtensionRegistration { make: || Box::new(XxxChannel) } }
 | Google | `google` | default channel：URL 追加 `?key=<api_key>`；含 `antigravity` channel（Google AI Pro 订阅 OAuth，见 6.5）与 `gemini-cli` channel（Gemini CLI / Code Assist 订阅 OAuth，见 6.5） |
 | Vertex AI | `vertexai` | Service account auth + 区域 endpoint |
 | DeepSeek / Moonshot / GLM (zhipuai) / MiniMax / xAI / ZAI / OpenRouter / Nvidia / Ollama | 各自 vendor_id | 委托 `GenericOpenAICompatibleAdapter` / openai_compat_* |
+| 小米 MiMo | `xiaomimimo` | OpenAI+Anthropic 双协议（`api-key`/Bearer，推理侧）；用量查询后端 `mimo_balance` / `mimo_token_plan`（admin/usage.rs）凭控制台 Cookie（旧版，~24h 过期）或**小米账号 passToken + userId**（推荐）——`provider/xiaomimimo/passport.rs` 用 passToken 走 account.xiaomi.com serviceLogin（sid=`api-platform`，`clientSign` = sha1 签名经 base64+urlencode）→ STS 跳转链收集 `Set-Cookie` 换取 `api-platform_serviceToken`，结果按 provider 缓存 30 分钟、会话拒绝（HTTP 401/403、console code 401/403、登录重定向）时自动重签重试一次；凭据更新即失效缓存 |
 | OpenCode Go | `opencode-go` | 三端点自适应（chat/responses/messages，共享 Key）+ 按模型的硬编码端点路由；每个请求必须携带会话标识 `x-opencode-session`（见 6.6） |
 | custom | `custom` | 用户自定义 vendor preset |
 

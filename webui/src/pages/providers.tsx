@@ -3501,21 +3501,41 @@ export default function ProvidersPage() {
                         <FieldLabel
                           info={
                             isZh
-                              ? "用于查询余额 / Token Plan 套餐用量。用量查询走小米控制台接口（platform.xiaomimimo.com），需要小米账号网页登录态 Cookie，与推理用的 API Key 不同。登录 platform.xiaomimimo.com 后，从浏览器开发者工具 → Network 中复制任意控制台 /api/v1 请求（如 plan-manage 用量请求）的 Cookie 请求头。留空保存即清除。"
-                              : "Used to query balance / Token Plan usage. Usage queries go through the Xiaomi console API (platform.xiaomimimo.com) and require the Xiaomi account web-session Cookie — different from the inference API key. Sign in to platform.xiaomimimo.com, then copy the Cookie request header of any console /api/v1 call (e.g. the plan-manage usage request) from DevTools → Network. Save with blanks to clear."
+                              ? "推荐：小米账号长期凭证 passToken（数月有效），网关每次查询自动向小米护照换取新的控制台会话，无需反复手动更新。登录 account.xiaomi.com（或任意小米网站）后，从浏览器开发者工具 → Application → Cookies 复制 passToken 的值，连同账号 userId 一起填入；直接粘贴整段含 passToken= 的 Cookie 头也可以（自动解析 userId/deviceId）。旧版控制台 Cookie（约 24 小时过期）仍可单独粘贴，不推荐。留空保存即清除。"
+                              : "Recommended: the long-lived Xiaomi account passToken (months-scale) — the gateway exchanges it for a fresh console session on every query, so no manual refresh. Sign in to account.xiaomi.com (or any Xiaomi site), copy the passToken value from DevTools → Application → Cookies and fill it in together with your account userId; pasting a full Cookie header containing passToken= also works (userId/deviceId are parsed automatically). The legacy console Cookie (~24h expiry) still works when pasted alone, but is not recommended. Save with blanks to clear."
                           }
                         >
-                          {isZh ? "用量查询 Cookie（小米 MiMo）" : "Usage Query Cookie (Xiaomi MiMo)"}
+                          {isZh ? "用量查询 passToken（小米 MiMo）" : "Usage Query passToken (Xiaomi MiMo)"}
                         </FieldLabel>
-                        <Input
-                          className="bg-white"
-                          type="password"
-                          placeholder="cookie..."
-                          autoComplete="off"
-                          spellCheck={false}
-                          value={editUsageAk}
-                          onChange={(e) => setEditUsageAk(e.target.value)}
-                        />
+                        <div className="grid gap-3 md:grid-cols-2">
+                          <div className="space-y-1.5">
+                            <span className="ml-1 text-xs text-slate-500">
+                              {isZh ? "passToken / 控制台 Cookie" : "passToken / console Cookie"}
+                            </span>
+                            <Input
+                              className="bg-white"
+                              type="password"
+                              placeholder="passToken... / cookie..."
+                              autoComplete="off"
+                              spellCheck={false}
+                              value={editUsageAk}
+                              onChange={(e) => setEditUsageAk(e.target.value)}
+                            />
+                          </div>
+                          <div className="space-y-1.5">
+                            <span className="ml-1 text-xs text-slate-500">
+                              {isZh ? "小米账号 userId" : "Xiaomi account userId"}
+                            </span>
+                            <Input
+                              className="bg-white"
+                              placeholder="123456789"
+                              autoComplete="off"
+                              spellCheck={false}
+                              value={editUsageSk}
+                              onChange={(e) => setEditUsageSk(e.target.value)}
+                            />
+                          </div>
+                        </div>
                       </div>
                     )}
                     {editingProviderIsBailian && (
