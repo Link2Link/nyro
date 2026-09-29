@@ -60,6 +60,7 @@ mod tests {
 
     fn provider(vendor: Option<&str>, base_url: &str) -> Provider {
         Provider {
+            keys: Vec::new(),
             id: "provider-1".to_string(),
             name: "Volcengine".to_string(),
             vendor: vendor.map(str::to_string),

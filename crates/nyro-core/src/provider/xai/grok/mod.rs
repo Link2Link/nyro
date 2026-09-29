@@ -46,6 +46,7 @@ mod tests {
 
     fn provider() -> Provider {
         Provider {
+            keys: Vec::new(),
             id: "provider-1".to_string(),
             name: "Grok".to_string(),
             vendor: Some("xai".to_string()),

@@ -45,6 +45,7 @@ mod tests {
 
     fn provider() -> Provider {
         Provider {
+            keys: Vec::new(),
             id: "provider-1".to_string(),
             name: "Codex".to_string(),
             vendor: Some("openai".to_string()),

@@ -18,6 +18,7 @@
 
 pub mod common;
 pub mod inbound;
+pub mod key_pool;
 pub mod metadata;
 pub mod outbound;
 pub mod registry;

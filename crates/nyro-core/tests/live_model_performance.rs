@@ -60,6 +60,7 @@ async fn live_completion_metadata_is_diagnostic_and_performance_matches_usage() 
     let provider = gw
         .admin()
         .create_provider(CreateProvider {
+            keys: Vec::new(),
             name: "live-performance".to_string(),
             vendor: None,
             protocol: "openai-compatible".to_string(),

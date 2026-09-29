@@ -138,6 +138,7 @@ mod tests {
 
     fn provider(vendor: &str, base_url: &str) -> Provider {
         Provider {
+            keys: Vec::new(),
             id: "p".into(),
             name: "p".into(),
             vendor: Some(vendor.into()),

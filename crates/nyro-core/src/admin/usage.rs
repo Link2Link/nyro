@@ -69,7 +69,7 @@ use futures::stream::{self, StreamExt};
 use reqwest::header::CONTENT_TYPE;
 
 use crate::provider::xiaomimimo::passport::{
-    classify_usage_credential, MimoSessionRejected, MimoUsageCredential,
+    MimoSessionRejected, MimoUsageCredential, classify_usage_credential,
 };
 use crate::router::quota::{ProviderScheduling, QuotaTierObservation};
 
@@ -2595,9 +2595,7 @@ impl AdminService {
                             .await?;
                         match fetch_mimo_console_json(&self.gw.http_client, url, &cookie).await {
                             Ok(data) => (cookie, data),
-                            Err(error)
-                                if error.downcast_ref::<MimoSessionRejected>().is_some() =>
-                            {
+                            Err(error) if error.downcast_ref::<MimoSessionRejected>().is_some() => {
                                 tracing::info!(
                                     provider_id = %provider.id,
                                     "MiMo console session rejected; re-minting serviceToken"
@@ -3175,7 +3173,7 @@ mod tests {
 
     #[tokio::test]
     async fn mimo_console_fetch_classifies_session_rejections() {
-        use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
+        use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
         use axum::routing::get as route_get;
 
         // Three rejection shapes: HTTP 401, console-level code 401, and the
@@ -3184,9 +3182,7 @@ mod tests {
         let app = axum::Router::new()
             .route(
                 "/http401",
-                route_get(|| async move {
-                    (StatusCode::UNAUTHORIZED, "nope")
-                }),
+                route_get(|| async move { (StatusCode::UNAUTHORIZED, "nope") }),
             )
             .route(
                 "/code401",
@@ -3208,7 +3204,10 @@ mod tests {
             .route(
                 "/ok",
                 route_get(|| async move {
-                    (StatusCode::OK, r#"{"code":0,"message":"","data":{"balance":"1.00"}}"#)
+                    (
+                        StatusCode::OK,
+                        r#"{"code":0,"message":"","data":{"balance":"1.00"}}"#,
+                    )
                 }),
             );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -3222,9 +3221,10 @@ mod tests {
 
         for path in ["/http401", "/code401", "/redirect"] {
             let url = format!("{base}{path}");
-            let error = fetch_mimo_console_json(&client, &url, "userId=1; api-platform_serviceToken=t")
-                .await
-                .unwrap_err();
+            let error =
+                fetch_mimo_console_json(&client, &url, "userId=1; api-platform_serviceToken=t")
+                    .await
+                    .unwrap_err();
             assert!(
                 error.downcast_ref::<MimoSessionRejected>().is_some(),
                 "{path} must classify as session rejection, got: {error}"
@@ -3246,7 +3246,7 @@ mod tests {
     #[test]
     fn mimo_passport_credential_modes_parse_from_slots() {
         use crate::provider::xiaomimimo::passport::{
-            classify_usage_credential, MimoPassportCredential, MimoUsageCredential,
+            MimoPassportCredential, MimoUsageCredential, classify_usage_credential,
         };
 
         // passToken + userId slots (the WebUI form shape).
@@ -3423,6 +3423,7 @@ mod tests {
         base_url: &str,
     ) -> Provider {
         Provider {
+            keys: Vec::new(),
             id: "provider".to_string(),
             name: "Provider".to_string(),
             vendor: vendor.map(ToString::to_string),

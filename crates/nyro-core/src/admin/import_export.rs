@@ -64,6 +64,26 @@ impl AdminService {
                             priority: endpoint.priority,
                         })
                         .collect();
+                    let keys = p
+                        .keys
+                        .iter()
+                        .map(|key| {
+                            let effective = key.effective_models();
+                            UpsertProviderKey {
+                                id: None,
+                                name: key.name.clone(),
+                                api_key: key.api_key.clone(),
+                                is_enabled: key.is_enabled,
+                                priority: key.priority,
+                                manual_models: Some(match effective {
+                                    Some(models) => crate::db::models::encode_model_list(&models),
+                                    None => key.manual_models.clone().unwrap_or_else(|| {
+                                        crate::db::models::encode_model_list(&[])
+                                    }),
+                                }),
+                            }
+                        })
+                        .collect();
                     ExportProvider {
                         name: p.name,
                         vendor: p.vendor,
@@ -71,6 +91,7 @@ impl AdminService {
                         base_url: p.base_url,
                         protocol_mode: p.protocol_mode,
                         endpoints,
+                        keys,
                         default_protocol: String::new(),
                         protocol_endpoints: String::new(),
                         preset_key: p.preset_key,
@@ -161,6 +182,18 @@ impl AdminService {
                     base_url: import_provider_base_url(p),
                     protocol_mode,
                     protocol_endpoints,
+                    keys: p
+                        .keys
+                        .iter()
+                        .map(|key| UpsertProviderKey {
+                            id: None,
+                            name: key.name.clone(),
+                            api_key: key.api_key.clone(),
+                            is_enabled: key.is_enabled,
+                            priority: key.priority,
+                            manual_models: key.manual_models.clone(),
+                        })
+                        .collect(),
                     preset_key: p.preset_key.clone(),
                     channel: p.channel.clone(),
                     models_source: p.models_source.clone(),

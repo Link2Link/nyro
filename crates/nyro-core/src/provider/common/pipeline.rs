@@ -878,6 +878,7 @@ mod tests {
 
     fn provider_with_api_key(api_key: &str) -> Provider {
         Provider {
+            keys: Vec::new(),
             id: "p".into(),
             name: "p".into(),
             vendor: Some("fake-test".into()),
@@ -1036,6 +1037,7 @@ mod tests {
 
     fn antigravity_provider() -> Provider {
         Provider {
+            keys: Vec::new(),
             id: "p-antigravity".into(),
             name: "p-antigravity".into(),
             vendor: Some("google".into()),
@@ -1061,6 +1063,7 @@ mod tests {
 
     fn google_default_provider(api_key: &str) -> Provider {
         Provider {
+            keys: Vec::new(),
             id: "p-google".into(),
             name: "p-google".into(),
             vendor: Some("google".into()),
@@ -1357,6 +1360,7 @@ mod tests {
 
     fn gemini_cli_provider() -> Provider {
         Provider {
+            keys: Vec::new(),
             id: "p-gemini-cli".into(),
             name: "p-gemini-cli".into(),
             vendor: Some("google".into()),

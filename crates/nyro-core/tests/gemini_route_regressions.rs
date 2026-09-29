@@ -261,6 +261,7 @@ impl Fixture {
             base
         };
         let provider = Provider {
+            keys: Vec::new(),
             id: "local-provider".into(),
             name: format!("local-{vendor}"),
             vendor: Some(vendor.into()),

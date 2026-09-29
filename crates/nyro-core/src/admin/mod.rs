@@ -48,8 +48,8 @@ pub use model_performance::{ModelPerformanceItem, ModelPerformanceResponse};
 pub use model_ratings::{MAX_RATING_PREFIX_BYTES, ModelRatingError, SetModelRating};
 pub use observability::RequestLogAttempts;
 pub use providers::{
-    ProviderModelProbeMeta, ProviderModelProbeOutcome, ProviderModelProbeResult,
-    normalize_probe_selection,
+    ProviderKeyProbeStatus, ProviderModelProbeMeta, ProviderModelProbeOutcome,
+    ProviderModelProbeResult, normalize_probe_selection,
 };
 pub use usage::{
     ProviderUsage, ProviderUsageBalance, ProviderUsageListItem, ProviderUsageQueryStatus,

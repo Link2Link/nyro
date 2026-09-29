@@ -600,6 +600,7 @@ mod tests {
     use super::*;
     fn entry() -> LogEntry {
         LogEntry {
+            provider_key_name: None,
             diagnostic: Default::default(),
             performance: Default::default(),
             api_key_id: None,

@@ -7,6 +7,7 @@ Nyro supports three storage backends — **SQLite** (default), **PostgreSQL**, a
 ```
 providers ──1:N── model_backends ──N:1── models
     ├──1:N── provider_protocol_endpoints
+    ├──1:N── provider_keys
     └──1:1── provider_oauth_credentials
 
 model_rating_prefixes (prefix-keyed scores shared across providers; no FK)
@@ -74,6 +75,29 @@ Provider 的协议端点明细。固定模式保留一条兼容记录；自适�
 **唯一约束**：`(provider_id, protocol)`
 
 **索引**：`idx_provider_protocol_endpoints_provider` on `(provider_id, is_enabled, priority)`
+
+---
+
+## provider_keys
+
+供应商级 API Key 池（三方中转多 Key 供应商，如 UUAPI / linkai / apinebula 类）。池非空时它是该 Provider 的唯一凭据来源：调度按目标模型在各 Key 的有效模型集（`manual_models` 优先，否则 `models_snapshot`；两者皆空视为可服务任何模型）中选 Key，401/403/404/429 时切换下一个合格 Key。
+
+| Column | Type | Default | Description |
+|---|---|---|---|
+| `id` | TEXT PK | — | 主键，UUID |
+| `provider_id` | TEXT NOT NULL | — | 所属 Provider（FK → providers.id, ON DELETE CASCADE） |
+| `name` | TEXT NOT NULL | — | Key 显示名称（写入 request_logs.provider_key_name） |
+| `api_key` | TEXT NOT NULL | — | 该 Key 的 API 凭据（覆盖所有协议端点） |
+| `is_enabled` | INTEGER NOT NULL | `1` | 是否参与调度 |
+| `priority` | INTEGER NOT NULL | `0` | 优先级，小者先 |
+| `models_snapshot` | TEXT | NULL | JSON 数组：用该 Key 探测 `/models` 得到的模型快照 |
+| `manual_models` | TEXT | NULL | JSON 数组：手工修正的模型清单，非空时覆盖快照 |
+| `last_probe_at` | TEXT | NULL | 最近一次探测时间 |
+| `probe_error` | TEXT | NULL | 最近一次探测错误 |
+| `created_at` | TEXT | `datetime('now')` | 创建时间 |
+| `updated_at` | TEXT | `datetime('now')` | 更新时间 |
+
+**索引**：`idx_provider_keys_provider` on `(provider_id, is_enabled, priority)`
 
 ---
 
@@ -229,6 +253,7 @@ and loss-accounting semantics.
 | `upstream_protocol` | TEXT | NULL | 上游协议 |
 | `provider_id` | TEXT | NULL | 供应商 ID |
 | `provider_name` | TEXT | NULL | 供应商名称（快照） |
+| `provider_key_name` | TEXT | NULL | 本次上游调用使用的密钥池 Key 名称（多密钥供应商；单 Key 供应商为 NULL） |
 | `model_id` | TEXT | NULL | 匹配到的模型 ID |
 | `model_name` | TEXT | NULL | 模型名称（快照） |
 | `upstream_url` | TEXT | NULL | 上游请求 URL |

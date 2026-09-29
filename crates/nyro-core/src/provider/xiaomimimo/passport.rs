@@ -27,9 +27,9 @@ use std::collections::HashMap;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
-use anyhow::{anyhow, Context};
-use base64::engine::general_purpose::STANDARD as BASE64;
+use anyhow::{Context, anyhow};
 use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use serde_json::Value;
 use sha1::{Digest, Sha1};
 
@@ -161,7 +161,9 @@ pub(crate) fn classify_usage_credential(slot_a: &str, slot_b: &str) -> MimoUsage
         return MimoUsageCredential::Passport(MimoPassportCredential {
             pass_token,
             user_id,
-            device_id: cookies.get("deviceId").map(|value| value.trim().to_string()),
+            device_id: cookies
+                .get("deviceId")
+                .map(|value| value.trim().to_string()),
         });
     }
     // Cookie-syntax markers: the legacy console header. Console headers
@@ -190,7 +192,10 @@ fn parse_cookie_pairs(header: &str) -> HashMap<String, String> {
         .split(';')
         .filter_map(|piece| {
             let (name, value) = piece.trim().split_once('=')?;
-            Some((name.trim().to_string(), value.trim().trim_matches('"').to_string()))
+            Some((
+                name.trim().to_string(),
+                value.trim().trim_matches('"').to_string(),
+            ))
         })
         .collect()
 }
@@ -247,8 +252,9 @@ fn parse_service_login_session(body: &str) -> anyhow::Result<ServiceLoginSession
             // migate's Python f-string renders it as decimal digits, so the
             // clientSign input uses the stringified number.
             Some(Value::Number(number)) => Some(number.to_string()),
-            Some(Value::String(text)) => Some(text.trim().to_string())
-                .filter(|item| !item.is_empty()),
+            Some(Value::String(text)) => {
+                Some(text.trim().to_string()).filter(|item| !item.is_empty())
+            }
             _ => None,
         }
     };
@@ -328,7 +334,10 @@ pub(crate) async fn mint_service_cookie_with(
     credential: &MimoPassportCredential,
 ) -> anyhow::Result<MintedMimoCookie> {
     // Step 1: signed-in serviceLogin with the passToken cookies.
-    let mut account_cookies = format!("userId={}; passToken={}", credential.user_id, credential.pass_token);
+    let mut account_cookies = format!(
+        "userId={}; passToken={}",
+        credential.user_id, credential.pass_token
+    );
     if let Some(device_id) = credential
         .device_id
         .as_deref()
@@ -384,8 +393,7 @@ pub(crate) async fn mint_service_cookie_with(
                 // parent domain — a browser jar keeps both (different
                 // domains), a name-keyed jar must drop the deletion.
                 let attrs_lower = attrs.to_ascii_lowercase();
-                let is_deletion =
-                    cookie_value.is_empty() || attrs_lower.contains("max-age=0");
+                let is_deletion = cookie_value.is_empty() || attrs_lower.contains("max-age=0");
                 if name.is_empty() || is_deletion {
                     continue;
                 }
@@ -548,7 +556,8 @@ mod tests {
 
     #[test]
     fn parses_account_cookie_header() {
-        let header = "userId=123456789; passToken=\"pt-quoted\"; deviceId=wb_dev; serviceToken=short";
+        let header =
+            "userId=123456789; passToken=\"pt-quoted\"; deviceId=wb_dev; serviceToken=short";
         let MimoUsageCredential::Passport(cred) = classify_usage_credential(header, "") else {
             panic!("expected Passport mode");
         };
@@ -645,7 +654,7 @@ mod tests {
 
     #[tokio::test]
     async fn mint_flow_collects_sts_cookies_across_redirects() {
-        use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
+        use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
         use axum::routing::get as route_get;
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -663,7 +672,10 @@ mod tests {
                 header::SET_COOKIE,
                 HeaderValue::from_static("api-platform_serviceToken=\"tok1\"; Path=/"),
             );
-            headers.append(header::SET_COOKIE, HeaderValue::from_static("userId=123; Path=/"));
+            headers.append(
+                header::SET_COOKIE,
+                HeaderValue::from_static("userId=123; Path=/"),
+            );
             // The live STS pairs a real slh with a same-name Max-Age=0
             // deletion on the parent domain — the deletion must not win.
             headers.append(

@@ -883,6 +883,7 @@ mod tests {
 
     fn test_provider(channel: &str) -> Provider {
         Provider {
+            keys: Vec::new(),
             id: "test".into(),
             name: "test".into(),
             vendor: Some("google".into()),

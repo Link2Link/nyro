@@ -107,6 +107,26 @@ CREATE TABLE public.models (
 
 
 --
+-- Name: provider_keys; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.provider_keys (
+    id text NOT NULL,
+    provider_id text NOT NULL,
+    name text NOT NULL,
+    api_key text NOT NULL,
+    is_enabled boolean DEFAULT true NOT NULL,
+    priority integer DEFAULT 0 NOT NULL,
+    models_snapshot text,
+    manual_models text,
+    last_probe_at timestamp with time zone,
+    probe_error text,
+    created_at timestamp with time zone DEFAULT CURRENT_TIMESTAMP,
+    updated_at timestamp with time zone DEFAULT CURRENT_TIMESTAMP
+);
+
+
+--
 -- Name: provider_oauth_credentials; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -196,6 +216,7 @@ CREATE TABLE public.request_logs (
     upstream_protocol text,
     provider_id text,
     provider_name text,
+    provider_key_name text,
     model_id text,
     model_name text,
     upstream_url text,
@@ -301,6 +322,14 @@ ALTER TABLE ONLY public.api_keys
 
 ALTER TABLE ONLY public.model_rating_prefixes
     ADD CONSTRAINT model_rating_prefixes_pkey PRIMARY KEY (model_prefix);
+
+
+--
+-- Name: provider_keys provider_keys_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.provider_keys
+    ADD CONSTRAINT provider_keys_pkey PRIMARY KEY (id);
 
 
 --
@@ -460,6 +489,13 @@ CREATE INDEX idx_oauth_creds_status ON public.provider_oauth_credentials USING b
 
 
 --
+-- Name: idx_provider_keys_provider; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_provider_keys_provider ON public.provider_keys USING btree (provider_id, is_enabled, priority);
+
+
+--
 -- Name: idx_provider_protocol_endpoints_provider; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -487,6 +523,14 @@ ALTER TABLE ONLY public.api_key_models
 
 ALTER TABLE ONLY public.api_key_models
     ADD CONSTRAINT api_key_routes_route_id_fkey FOREIGN KEY (model_id) REFERENCES public.models(id) ON DELETE CASCADE;
+
+
+--
+-- Name: provider_keys provider_keys_provider_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.provider_keys
+    ADD CONSTRAINT provider_keys_provider_id_fkey FOREIGN KEY (provider_id) REFERENCES public.providers(id) ON DELETE CASCADE;
 
 
 --

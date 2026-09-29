@@ -111,6 +111,7 @@ fn log_entry_timestamp_is_unix_millis() {
 
     // Build a LogEntry and confirm created_at field accepts i64 ms.
     let _entry = LogEntry {
+        provider_key_name: None,
         performance: Default::default(),
         diagnostic: Default::default(),
         api_key_id: None,
@@ -158,6 +159,7 @@ fn stream_indicator_via_chunks_count() {
     use nyro_core::protocol::ir::Usage;
 
     let base = LogEntry {
+        provider_key_name: None,
         performance: Default::default(),
         diagnostic: Default::default(),
         api_key_id: None,
@@ -342,6 +344,7 @@ async fn sqlite_round_trips_reasoning_effort_in_list_and_detail() {
     storage
         .logs()
         .append_batch(vec![LogEntry {
+            provider_key_name: None,
             performance: Default::default(),
             diagnostic: Default::default(),
             api_key_id: None,
@@ -436,6 +439,7 @@ async fn sqlite_clears_all_payloads_including_errors_but_preserves_metadata() {
     let storage = SqliteStorage::from_pool(pool);
 
     let entry = |client_status_code: i32, upstream_status_code: Option<i32>| LogEntry {
+        provider_key_name: None,
         performance: Default::default(),
         diagnostic: Default::default(),
         api_key_id: Some("key-1".into()),
@@ -610,6 +614,7 @@ async fn sqlite_deletes_single_log_and_clears_errors_only() {
     let storage = SqliteStorage::from_pool(pool);
 
     let entry = |client_status: i32| LogEntry {
+        provider_key_name: None,
         performance: Default::default(),
         diagnostic: Default::default(),
         api_key_id: None,

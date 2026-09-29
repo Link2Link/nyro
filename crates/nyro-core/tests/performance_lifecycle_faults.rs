@@ -93,6 +93,7 @@ async fn converted_and_forced_stream_attempts_wait_for_body_eos() -> anyhow::Res
         let provider = gw
             .admin()
             .create_provider(CreateProvider {
+                keys: Vec::new(),
                 name: name.into(),
                 vendor: None,
                 protocol: protocol.into(),

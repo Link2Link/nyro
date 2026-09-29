@@ -78,6 +78,10 @@ pub fn create_router(gateway: Gateway, admin_token: Option<String>) -> Router {
             post(probe_provider_models_handler),
         )
         .route(
+            "/providers/:id/probe-keys",
+            post(probe_provider_keys_handler),
+        )
+        .route(
             "/providers/:id/usage-credentials",
             get(get_provider_usage_credentials_handler).put(put_provider_usage_credentials_handler),
         )
@@ -313,6 +317,16 @@ fn parse_probe_selection(body: &Bytes) -> Result<Option<Vec<String>>, String> {
     let request: ProbeModelsRequest =
         serde_json::from_slice(body).map_err(|e| format!("invalid JSON body: {e}"))?;
     nyro_core::admin::normalize_probe_selection(request.models).map_err(|e| e.to_string())
+}
+
+async fn probe_provider_keys_handler(
+    State(gw): State<Gateway>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    match gw.admin().probe_provider_keys(&id).await {
+        Ok(v) => Json(serde_json::json!({ "data": v })).into_response(),
+        Err(e) => err(e),
+    }
 }
 
 async fn probe_provider_models_handler(

@@ -209,6 +209,7 @@ async fn adaptive_opencode_provider(gw: &Gateway, base_url: &str) -> anyhow::Res
     Ok(gw
         .admin()
         .create_provider(CreateProvider {
+            keys: Vec::new(),
             name: "opencode-go-adaptive".into(),
             vendor: Some("opencode-go".into()),
             protocol: "openai-compatible".into(),
@@ -523,6 +524,7 @@ async fn fixed_providers_keep_their_single_endpoint_behaviour() -> anyhow::Resul
     let provider = gw
         .admin()
         .create_provider(CreateProvider {
+            keys: Vec::new(),
             name: "opencode-go-fixed".into(),
             vendor: Some("opencode-go".into()),
             protocol: "openai-compatible".into(),

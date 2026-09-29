@@ -9,6 +9,18 @@ struct NormalizedProtocolConfig {
     endpoints: Vec<CreateProviderProtocolEndpoint>,
 }
 
+/// Per-key result of the key-pool probe (`probe_provider_keys`).
+#[derive(Debug, Clone, Serialize)]
+pub struct ProviderKeyProbeStatus {
+    pub key_id: String,
+    pub name: String,
+    pub success: bool,
+    pub error: Option<String>,
+    /// Models discovered with this key (empty on failure).
+    pub models: Vec<String>,
+    pub tested_at: String,
+}
+
 /// Per-model result of the "send hi" probe over a provider's model list.
 #[derive(Debug, Clone, Serialize)]
 pub struct ProviderModelProbeResult {
@@ -1194,6 +1206,11 @@ impl AdminService {
                 base_url: protocol.base_url,
                 protocol_mode: protocol.mode,
                 protocol_endpoints: protocol.endpoints,
+                keys: if auth_mode == "oauth" {
+                    Vec::new()
+                } else {
+                    input.keys
+                },
                 preset_key: input.preset_key,
                 channel: input.channel,
                 models_source: input.models_source,
@@ -1246,6 +1263,18 @@ impl AdminService {
                         auth_scheme: endpoint.auth_scheme.clone(),
                         is_enabled: endpoint.is_enabled,
                         priority: endpoint.priority,
+                    })
+                    .collect(),
+                keys: original
+                    .keys
+                    .iter()
+                    .map(|key| UpsertProviderKey {
+                        id: None,
+                        name: key.name.clone(),
+                        api_key: key.api_key.clone(),
+                        is_enabled: key.is_enabled,
+                        priority: key.priority,
+                        manual_models: key.manual_models.clone(),
                     })
                     .collect(),
                 preset_key: original.preset_key.clone(),
@@ -1429,6 +1458,11 @@ impl AdminService {
                     base_url: Some(protocol.base_url),
                     protocol_mode: Some(protocol.mode),
                     protocol_endpoints: protocol_config_changed.then_some(protocol.endpoints),
+                    keys: if auth_mode == "oauth" {
+                        Some(Vec::new())
+                    } else {
+                        input.keys
+                    },
                     preset_key,
                     channel,
                     models_source,
@@ -2074,9 +2108,14 @@ impl AdminService {
         if base_url.trim().is_empty() {
             anyhow::bail!("provider base URL is empty");
         }
+        let has_pool = provider.has_key_pool() && provider.effective_auth_mode() != "oauth";
+        if has_pool && provider.enabled_keys().is_empty() {
+            anyhow::bail!("provider key pool has no enabled keys");
+        }
         if api_key.trim().is_empty()
             && auth_scheme.trim() != "none"
             && !runtime_headers.contains_key(AUTHORIZATION)
+            && !has_pool
         {
             anyhow::bail!("provider api key is empty");
         }
@@ -2133,13 +2172,31 @@ impl AdminService {
             auth_scheme: effective_scheme.to_string(),
         };
 
+        // Key-pool providers: the "send hi" probe must use the key whose
+        // snapshot actually holds the model, mirroring dispatch selection.
+        let pool_key_for: std::collections::HashMap<String, String> = if has_pool {
+            let enabled = provider.enabled_keys();
+            models
+                .iter()
+                .filter_map(|model| {
+                    crate::provider::key_pool::eligible_keys(&enabled, model)
+                        .first()
+                        .map(|key| (model.clone(), key.api_key.clone()))
+                })
+                .collect()
+        } else {
+            Default::default()
+        };
         let probes = models.into_iter().map(|model| {
             let client = client.clone();
             let runtime_headers = runtime_headers.clone();
             let channel = channel.clone();
             let antigravity_project = antigravity_project.clone();
-            let target =
+            let mut target =
                 resolve_probe_target(&provider, &model, &default_target, &declared_endpoints);
+            if let Some(key) = pool_key_for.get(&model) {
+                target.api_key = key.clone();
+            }
             async move {
                 probe_single_model(
                     client,
@@ -2215,7 +2272,139 @@ impl AdminService {
 
     /// Fetch the provider's model list from its discovery source, before
     /// vendor-scoped visibility filtering.
+    /// Auth protocol for key-pool model fetches: relays expose an OpenAI-style
+    /// `/models` discovery endpoint, so prefer Bearer via any enabled
+    /// OpenAI-family endpoint (mirrors `adaptive_model_fetch_auth`); fall
+    /// back to the provider default protocol's scheme.
+    fn pool_model_fetch_protocol(provider: &Provider) -> String {
+        let registry = crate::protocol::registry::ProtocolRegistry::global();
+        let openai_family = provider
+            .protocol_endpoints
+            .iter()
+            .filter(|endpoint| endpoint.is_enabled)
+            .any(|endpoint| {
+                registry
+                    .resolve_alias(&endpoint.protocol)
+                    .is_some_and(|id| {
+                        matches!(
+                            id.protocol,
+                            crate::protocol::ids::Protocol::OpenAICompatible
+                                | crate::protocol::ids::Protocol::OpenAIResponses
+                        )
+                    })
+            });
+        if openai_family {
+            "openai-compatible".to_string()
+        } else {
+            provider.protocol.clone()
+        }
+    }
+
+    /// Live `/models` discovery with an explicit credential (one pool key).
+    /// Skips static overrides and the models.dev catalog on purpose: those
+    /// are provider-level and would erase the per-key distinction the pool
+    /// exists for.
+    async fn fetch_provider_models_with_key(
+        &self,
+        provider: &Provider,
+        api_key: &str,
+    ) -> anyhow::Result<Vec<String>> {
+        let endpoint = resolve_models_endpoint(provider)
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("Model Discovery URL is empty"))?;
+        let auth_protocol = Self::pool_model_fetch_protocol(provider);
+        let headers = build_model_headers(&auth_protocol, provider.vendor.as_deref(), api_key)?;
+        let response = self
+            .gw
+            .http_client
+            .get(&endpoint)
+            .headers(headers)
+            .timeout(Duration::from_secs(10))
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!(format_connectivity_error(&e)))?;
+        if !response.status().is_success() {
+            let status = response.status().as_u16();
+            let body = response.text().await.unwrap_or_default();
+            let preview = body.chars().take(200).collect::<String>();
+            anyhow::bail!("HTTP {status}: {preview}");
+        }
+        let json: Value = response.json().await.unwrap_or_default();
+        let models =
+            extract_models_from_response(&provider.protocol, provider.vendor.as_deref(), &json);
+        if models.is_empty() {
+            anyhow::bail!("Model list format is invalid or empty");
+        }
+        Ok(models)
+    }
+
+    /// Probe every key of a provider's key pool in parallel: per-key
+    /// `/models` discovery whose outcome doubles as that key's connectivity
+    /// test. Results are persisted onto the key rows (snapshot / error /
+    /// timestamp) and returned for immediate UI display.
+    pub async fn probe_provider_keys(
+        &self,
+        id: &str,
+    ) -> anyhow::Result<Vec<ProviderKeyProbeStatus>> {
+        let provider = self.get_provider(id).await?;
+        if !provider.has_key_pool() {
+            anyhow::bail!("provider has no key pool configured");
+        }
+        // Fail fast on a missing discovery URL: every key would fail for the
+        // same reason otherwise.
+        if resolve_models_endpoint(&provider)
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .is_none()
+        {
+            anyhow::bail!("Model Discovery URL is empty");
+        }
+        let tested_at = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+        let mut outcomes = Vec::with_capacity(provider.keys.len());
+        let mut probes = Vec::with_capacity(provider.keys.len());
+        for key in &provider.keys {
+            probes.push(self.fetch_provider_models_with_key(&provider, &key.api_key));
+        }
+        let results = futures::future::join_all(probes).await;
+        for (key, result) in provider.keys.iter().zip(results) {
+            let (success, error, models) = match result {
+                Ok(models) => (true, None, Some(models)),
+                Err(error) => (false, Some(error.to_string()), None),
+            };
+            self.gw
+                .storage
+                .providers()
+                .record_key_probe_result(
+                    &key.id,
+                    crate::db::models::ProviderKeyProbeResult {
+                        success,
+                        error: error.clone(),
+                        tested_at: tested_at.clone(),
+                        models: models.clone(),
+                    },
+                )
+                .await?;
+            outcomes.push(ProviderKeyProbeStatus {
+                key_id: key.id.clone(),
+                name: key.name.clone(),
+                success,
+                error,
+                models: models.unwrap_or_default(),
+                tested_at: tested_at.clone(),
+            });
+        }
+        self.bump_config_epoch().await?;
+        Ok(outcomes)
+    }
+
     async fn fetch_provider_models(&self, provider: &Provider) -> anyhow::Result<Vec<String>> {
+        // Key-pool providers route discovery through the pool snapshots (see
+        // discover_provider_models); the runtime credential below is the
+        // provider-level key, which an active pool deliberately ignores.
+        if provider.has_key_pool() && provider.effective_auth_mode() != "oauth" {
+            return self.discover_provider_models(provider, false).await;
+        }
         // Codex: resolve the advertised client version before runtime binding
         // so the models-source URL carries the freshly probed one —
         // bind_runtime only reads the already-cached value.
@@ -2342,6 +2531,37 @@ impl AdminService {
         provider: &Provider,
         require_catalog: bool,
     ) -> anyhow::Result<Vec<String>> {
+        // Key-pool providers: the per-key snapshots are the catalog. Union
+        // every informed key's effective model set; when no key has ever been
+        // probed, fall back to a single-key live discovery with the
+        // highest-priority enabled key so the available-models view works
+        // before the first probe.
+        if provider.has_key_pool() && provider.effective_auth_mode() != "oauth" {
+            let enabled = provider.enabled_keys();
+            if !enabled.is_empty() {
+                let mut union: Vec<String> = Vec::new();
+                let mut any_info = false;
+                for key in &enabled {
+                    if let Some(models) = key.effective_models() {
+                        any_info = true;
+                        for model in models {
+                            if !union.contains(&model) {
+                                union.push(model);
+                            }
+                        }
+                    }
+                }
+                if any_info && !union.is_empty() {
+                    union.sort();
+                    return Ok(merge_model_lists(union, preset_extra_models(provider)));
+                }
+                let probe_credential = enabled[0].api_key.clone();
+                let models = self
+                    .fetch_provider_models_with_key(provider, &probe_credential)
+                    .await?;
+                return Ok(merge_model_lists(models, preset_extra_models(provider)));
+            }
+        }
         // Same codex rationale as `fetch_provider_models`: probe the latest
         // client version before binding so discovery sees the newest models.
         if is_codex_oauth_provider(provider) {

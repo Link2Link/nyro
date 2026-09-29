@@ -118,6 +118,7 @@ impl Vendor for BearerVendor {
 
 fn fake_provider(api_key: &str) -> Provider {
     Provider {
+        keys: Vec::new(),
         id: "p".into(),
         name: "p".into(),
         vendor: Some("test".into()),

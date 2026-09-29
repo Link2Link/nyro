@@ -925,6 +925,7 @@ mod tests {
     #[test]
     fn forces_upstream_stream_requires_google_vendor_and_channel() {
         let mut provider = crate::db::models::Provider {
+            keys: Vec::new(),
             id: "p".into(),
             name: "p".into(),
             vendor: Some("google".into()),
@@ -1272,6 +1273,7 @@ mod tests {
     #[test]
     fn apply_tier_model_rewrite_patches_envelope_and_strips_thinking_config() {
         let provider = crate::db::models::Provider {
+            keys: Vec::new(),
             id: "p".into(),
             name: "p".into(),
             vendor: Some("google".into()),
@@ -1346,6 +1348,7 @@ mod tests {
 
     fn google_provider(channel: &str, model: &str) -> (crate::db::models::Provider, Value) {
         let provider = crate::db::models::Provider {
+            keys: Vec::new(),
             id: "p".into(),
             name: "p".into(),
             vendor: Some("google".into()),
@@ -1461,6 +1464,7 @@ mod tests {
             "gemini-3.8-flash-high".to_string(),
         ];
         let mut provider = crate::db::models::Provider {
+            keys: Vec::new(),
             id: "p".into(),
             name: "p".into(),
             vendor: Some("google".into()),

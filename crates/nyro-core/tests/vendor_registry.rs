@@ -16,6 +16,7 @@ use serde_json::Value;
 
 fn make_provider(vendor: Option<&str>, channel: Option<&str>) -> Provider {
     Provider {
+        keys: Vec::new(),
         id: "test".into(),
         name: "test".into(),
         vendor: vendor.map(str::to_string),

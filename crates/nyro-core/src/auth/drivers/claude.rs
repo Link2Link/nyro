@@ -364,6 +364,7 @@ mod tests {
 
     fn test_provider() -> Provider {
         Provider {
+            keys: Vec::new(),
             id: "test".into(),
             name: "test".into(),
             vendor: Some("anthropic".into()),

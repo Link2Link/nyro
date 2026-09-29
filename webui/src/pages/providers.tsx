@@ -18,6 +18,9 @@ import type {
   ProviderOAuthStatusData,
   ModelProbeOutcome,
   ProviderUsageCredentials,
+  ProviderKey,
+  ProviderKeyProbeStatus,
+  UpsertProviderKey,
 } from "@/lib/types";
 import {
   loadModelProbeResults,
@@ -996,6 +999,10 @@ export default function ProvidersPage() {
     api_key: "",
     auth_mode: "apikey",
   });
+  const [editKeys, setEditKeys] = useState<UpsertProviderKey[]>([]);
+  const [keyPoolEnabled, setKeyPoolEnabled] = useState(false);
+  const [probeKeysLoading, setProbeKeysLoading] = useState(false);
+  const [probeKeysError, setProbeKeysError] = useState<string | null>(null);
   const isEditingOAuthProvider = Boolean(
     editingProvider
       && (
@@ -1792,11 +1799,67 @@ export default function ProvidersPage() {
     }
   }
 
+  async function handleProbeProviderKeys() {
+    if (!editingProvider) return;
+    setProbeKeysLoading(true);
+    setProbeKeysError(null);
+    try {
+      await backend<ProviderKeyProbeStatus[]>("probe_provider_keys", { id: editingProvider.id });
+      await qc.invalidateQueries({ queryKey: ["providers"] });
+    } catch (error) {
+      setProbeKeysError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setProbeKeysLoading(false);
+    }
+  }
+
+  function parseModelsJson(raw: string | null | undefined): string[] {
+    if (!raw) return [];
+    try {
+      const parsed = JSON.parse(raw);
+      return Array.isArray(parsed) ? parsed.map(String) : [];
+    } catch {
+      return [];
+    }
+  }
+
+  function modelsToEditorText(key: UpsertProviderKey, providerKeys: ProviderKey[] | undefined): string {
+    const stored = providerKeys?.find((k) => k.id === key.id);
+    const source = key.manual_models ?? stored?.models_snapshot ?? null;
+    return parseModelsJson(source).join("\n");
+  }
+
+  function updateEditKey(index: number, patch: Partial<UpsertProviderKey>) {
+    setEditKeys((prev) => prev.map((key, i) => (i === index ? { ...key, ...patch } : key)));
+  }
+
+  function setKeyManualModels(index: number, text: string) {
+    const lines = text
+      .split("\n")
+      .map((line) => line.trim())
+      .filter((line) => line.length > 0);
+    updateEditKey(index, {
+      manual_models: lines.length > 0 ? JSON.stringify(lines) : null,
+    });
+  }
+
   function startEdit(p: Provider) {
     setEditingId(p.id);
     editingIdRef.current = p.id;
     setEditError(null);
     setShowEditApiKey(false);
+    setEditKeys(
+      (p.keys ?? []).map((key) => ({
+        id: key.id,
+        name: key.name,
+        api_key: key.api_key,
+        is_enabled: key.is_enabled,
+        priority: key.priority,
+        manual_models: key.manual_models ?? null,
+      })),
+    );
+    setKeyPoolEnabled((p.keys ?? []).length > 0);
+    setProbeKeysError(null);
     setEditUsageAk("");
     setEditUsageSk("");
     if (usageSupported(p)) {
@@ -3330,6 +3393,155 @@ export default function ProvidersPage() {
                         )}
                       </div>
                     ) : null}
+                    {editingResolvedAuthMode !== "oauth" ? (
+                      <div className="col-span-2 space-y-3 rounded-md border border-border bg-muted/30 p-3">
+                        <div className="flex items-center justify-between gap-2">
+                          <div className="flex items-center gap-2">
+                            <Switch
+                              checked={keyPoolEnabled}
+                              onCheckedChange={(checked) => {
+                                setKeyPoolEnabled(checked);
+                                if (checked && editKeys.length === 0) {
+                                  setEditKeys([
+                                    { id: null, name: "", api_key: "", is_enabled: true, priority: 0, manual_models: null },
+                                  ]);
+                                }
+                              }}
+                            />
+                            <span className="text-sm font-medium">
+                              {isZh ? "多密钥（三方中转 Key 池）" : "Multi-Key Pool (relay vendors)"}
+                            </span>
+                          </div>
+                          {keyPoolEnabled ? (
+                            <Button
+                              type="button"
+                              variant="outline"
+                              size="sm"
+                              disabled={probeKeysLoading || !editingProvider}
+                              onClick={() => void handleProbeProviderKeys()}
+                            >
+                              {probeKeysLoading
+                                ? (isZh ? "探测中..." : "Probing...")
+                                : (isZh ? "探测全部 Key" : "Probe All Keys")}
+                            </Button>
+                          ) : null}
+                        </div>
+                        <p className="text-xs text-muted-foreground">
+                          {isZh
+                            ? "开启后，密钥池是唯一凭据来源：每个 Key 单独探测可用模型，路由按目标模型自动选 Key，401/403/404/429 时自动切换下一个 Key。上方单个 API Key 字段将被忽略。"
+                            : "When enabled the pool is the sole credential source: each key is probed for its model list, routing picks the key that holds the target model, and 401/403/404/429 fail over to the next key. The single API key field above is ignored."}
+                        </p>
+                        {probeKeysError ? (
+                          <p className="text-xs text-red-600">{probeKeysError}</p>
+                        ) : null}
+                        {keyPoolEnabled ? (
+                          <div className="space-y-2">
+                            {editKeys.map((key, index) => {
+                              const stored = editingProvider?.keys?.find((k) => k.id === key.id);
+                              const effective = parseModelsJson(
+                                key.manual_models ?? stored?.models_snapshot ?? null,
+                              );
+                              return (
+                                <div key={key.id ?? `new-${index}`} className="space-y-2 rounded-md border border-border bg-background p-2">
+                                  <div className="grid grid-cols-12 items-center gap-2">
+                                    <Input
+                                      className="col-span-3"
+                                      placeholder={isZh ? "名称" : "Name"}
+                                      value={key.name}
+                                      onChange={(e) => updateEditKey(index, { name: e.target.value })}
+                                    />
+                                    <Input
+                                      className="col-span-5"
+                                      placeholder="sk-..."
+                                      type="password"
+                                      value={key.api_key}
+                                      onChange={(e) => updateEditKey(index, { api_key: e.target.value })}
+                                    />
+                                    <Input
+                                      className="col-span-1"
+                                      type="number"
+                                      title={isZh ? "优先级（小者先）" : "Priority (lower first)"}
+                                      value={key.priority ?? index}
+                                      onChange={(e) => updateEditKey(index, { priority: Number(e.target.value) })}
+                                    />
+                                    <label className="col-span-1 flex items-center justify-center gap-1 text-xs text-muted-foreground">
+                                      <Checkbox
+                                        checked={key.is_enabled !== false}
+                                        onCheckedChange={(checked) =>
+                                          updateEditKey(index, { is_enabled: checked === true })}
+                                      />
+                                    </label>
+                                    <Button
+                                      type="button"
+                                      variant="ghost"
+                                      size="sm"
+                                      className="col-span-2 justify-self-end text-red-600 hover:text-red-700"
+                                      onClick={() => setEditKeys((prev) => prev.filter((_, i) => i !== index))}
+                                    >
+                                      {isZh ? "删除" : "Delete"}
+                                    </Button>
+                                  </div>
+                                  <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
+                                    {stored?.probe_error ? (
+                                      <span className="text-red-600">
+                                        {isZh ? "探测失败：" : "Probe failed: "}
+                                        {stored.probe_error}
+                                      </span>
+                                    ) : stored?.last_probe_at ? (
+                                      <span>
+                                        {isZh ? "已探测" : "Probed"} · {effective.length}
+                                        {isZh ? " 个模型" : " models"} · {stored.last_probe_at}
+                                      </span>
+                                    ) : (
+                                      <span>{isZh ? "未探测（视为可服务任何模型）" : "Not probed (eligible for any model)"}</span>
+                                    )}
+                                    {key.manual_models ? (
+                                      <Badge variant="secondary">{isZh ? "手工清单" : "Manual list"}</Badge>
+                                    ) : null}
+                                  </div>
+                                  <textarea
+                                    className="min-h-16 w-full resize-y rounded-md border border-border bg-background px-2 py-1 font-mono text-xs text-foreground outline-none focus-visible:ring-2 focus-visible:ring-slate-300"
+                                    placeholder={
+                                      isZh
+                                        ? "手工修正模型清单（每行一个，留空使用探测快照）"
+                                        : "Manual model list (one per line; empty = use probe snapshot)"
+                                    }
+                                    value={modelsToEditorText(key, editingProvider?.keys)}
+                                    onChange={(e) => setKeyManualModels(index, e.target.value)}
+                                  />
+                                </div>
+                              );
+                            })}
+                            <Button
+                              type="button"
+                              variant="outline"
+                              size="sm"
+                              onClick={() =>
+                                setEditKeys((prev) => [
+                                  ...prev,
+                                  {
+                                    id: null,
+                                    name: "",
+                                    api_key: "",
+                                    is_enabled: true,
+                                    priority: prev.length,
+                                    manual_models: null,
+                                  },
+                                ])}
+                            >
+                              {isZh ? "添加 Key" : "Add Key"}
+                            </Button>
+                            {!(editForm.models_source ?? "").trim() ? (
+                              <p className="text-xs text-amber-600">
+                                {isZh
+                                  ? "提示：探测需要在“模型发现地址”填写中转的 /v1/models 地址。"
+                                  : "Hint: probing needs the relay's /v1/models URL in the Model Discovery URL field."}
+                              </p>
+                            ) : null}
+                          </div>
+                        ) : null}
+                      </div>
+                    ) : null}
                     {editingResolvedAuthMode !== "oauth" && editForm.protocol_mode !== "adaptive" && !editingIsSharedKey ? (
                     <div className="space-y-2">
                       <FieldLabel>{isZh ? "协议" : "Protocol"}</FieldLabel>
@@ -3631,12 +3843,39 @@ export default function ProvidersPage() {
                           setEditError(validation);
                           return;
                         }
+                        if (keyPoolEnabled) {
+                          const invalidKey = editKeys.find(
+                            (key) => !key.name.trim() || !key.api_key.trim(),
+                          );
+                          if (invalidKey) {
+                            setEditError(
+                              isZh
+                                ? "密钥池中每个 Key 都需要名称和 API Key。"
+                                : "Every key in the pool needs a name and an API key.",
+                            );
+                            return;
+                          }
+                          if (editKeys.length === 0) {
+                            setEditError(
+                              isZh
+                                ? "密钥池开启后至少需要一个 Key，或关闭多密钥开关。"
+                                : "The key pool needs at least one key, or turn multi-key off.",
+                            );
+                            return;
+                          }
+                        }
                         const input: UpdateProvider = {
                           name: editForm.name || undefined,
                           vendor: editForm.vendor || undefined,
                           protocol,
                           base_url: baseUrl,
                           protocol_mode: adaptive ? "adaptive" : "fixed",
+                          keys: keyPoolEnabled
+                            ? editKeys.map((key, index) => ({
+                                ...key,
+                                priority: Number.isFinite(key.priority) ? key.priority : index,
+                              }))
+                            : [],
                           protocol_endpoints: adaptive
                             ? protocolEndpoints.map((endpoint, index) => ({
                                 ...endpoint,

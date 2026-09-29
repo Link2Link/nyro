@@ -68,6 +68,9 @@ pub struct LogEntry {
     pub upstream_protocol: String,
     pub provider_id: String,
     pub provider_name: String,
+    /// Provider key-pool entry used for this attempt (multi-key relay
+    /// providers); `None` for single-key providers.
+    pub provider_key_name: Option<String>,
     pub model_id: Option<String>,
     pub model_name: Option<String>,
     pub upstream_url: Option<String>,
@@ -341,6 +344,7 @@ mod tests {
             upstream_protocol: String::new(),
             provider_id: String::new(),
             provider_name: String::new(),
+            provider_key_name: None,
             model_id: None,
             model_name: None,
             upstream_url: None,

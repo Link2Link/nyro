@@ -16,10 +16,11 @@ use crate::db::models::{
     CreateApiKey, CreateModel, CreateModelBackend, CreateProvider, CreateProviderProtocolEndpoint,
     LogPage, LogQuery, Model, ModelApiKeyUsageStats, ModelBackend, ModelProviderUsageStats,
     ModelStats, ModelTimeBucket, ModelUsageDetail, ModelUsageStats, ModelUsageTotals,
-    OAuthCredential, Provider, ProviderModelUsageStats, ProviderProtocolEndpoint, ProviderStats,
-    ProviderUsageDetail, RecentModelPerformance, RequestLog, RequestResult, StatsHourly,
-    StatsOverview, StatsTimeBucket, UpdateApiKey, UpdateModel, UpdateProvider,
-    UpsertOAuthCredential, is_valid_provider_auth_mode,
+    OAuthCredential, Provider, ProviderKey, ProviderKeyProbeResult, ProviderModelUsageStats,
+    ProviderProtocolEndpoint, ProviderStats, ProviderUsageDetail, RecentModelPerformance,
+    RequestLog, RequestResult, StatsHourly, StatsOverview, StatsTimeBucket, UpdateApiKey,
+    UpdateModel, UpdateProvider, UpsertOAuthCredential, UpsertProviderKey,
+    is_valid_provider_auth_mode,
 };
 use crate::logging::LogEntry;
 use crate::logging::diagnostics::{error_sql, outcome_sql};
@@ -348,6 +349,72 @@ impl PostgresProviderStore {
         };
         Ok(endpoints)
     }
+
+    async fn load_keys(&self, provider_id: Option<&str>) -> anyhow::Result<Vec<ProviderKey>> {
+        let base = "SELECT id, provider_id, name, api_key, COALESCE(is_enabled, TRUE) AS is_enabled, COALESCE(priority, 0) AS priority, models_snapshot, manual_models, last_probe_at, probe_error, to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS') AS created_at, to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS') AS updated_at FROM provider_keys";
+        let keys = if let Some(provider_id) = provider_id {
+            sqlx::query_as::<_, ProviderKey>(&format!(
+                "{base} WHERE provider_id = $1 ORDER BY priority, created_at, id"
+            ))
+            .bind(provider_id)
+            .fetch_all(&self.pool)
+            .await?
+        } else {
+            sqlx::query_as::<_, ProviderKey>(&format!(
+                "{base} ORDER BY provider_id, priority, created_at, id"
+            ))
+            .fetch_all(&self.pool)
+            .await?
+        };
+        Ok(keys)
+    }
+
+    /// Replace a provider's key pool, preserving probe fields for rows whose
+    /// `id` matches an existing key (see the sqlite twin for semantics).
+    async fn replace_keys(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        provider_id: &str,
+        inputs: &[UpsertProviderKey],
+    ) -> anyhow::Result<()> {
+        let existing: HashMap<String, ProviderKey> =
+            sqlx::query_as::<_, ProviderKey>(
+                "SELECT id, provider_id, name, api_key, COALESCE(is_enabled, TRUE) AS is_enabled, COALESCE(priority, 0) AS priority, models_snapshot, manual_models, last_probe_at, probe_error, to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS') AS created_at, to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS') AS updated_at FROM provider_keys WHERE provider_id = $1",
+            )
+            .bind(provider_id)
+            .fetch_all(&mut **tx)
+            .await?
+            .into_iter()
+            .map(|key| (key.id.clone(), key))
+            .collect();
+        sqlx::query("DELETE FROM provider_keys WHERE provider_id = $1")
+            .bind(provider_id)
+            .execute(&mut **tx)
+            .await?;
+        for input in inputs {
+            let id = input
+                .id
+                .clone()
+                .filter(|id| existing.contains_key(id))
+                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+            let preserved = existing.get(&id);
+            sqlx::query(
+                "INSERT INTO provider_keys (id, provider_id, name, api_key, is_enabled, priority, models_snapshot, manual_models, last_probe_at, probe_error) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+            )
+            .bind(&id)
+            .bind(provider_id)
+            .bind(input.name.trim())
+            .bind(&input.api_key)
+            .bind(input.is_enabled)
+            .bind(input.priority)
+            .bind(preserved.and_then(|k| k.models_snapshot.clone()))
+            .bind(&input.manual_models)
+            .bind(preserved.and_then(|k| k.last_probe_at.clone()))
+            .bind(preserved.and_then(|k| k.probe_error.clone()))
+            .execute(&mut **tx)
+            .await?;
+        }
+        Ok(())
+    }
 }
 
 fn postgres_endpoint_inputs_or_legacy(
@@ -379,8 +446,16 @@ impl ProviderStore for PostgresProviderStore {
                 .or_default()
                 .push(endpoint);
         }
+        let mut keys_by_provider: HashMap<String, Vec<ProviderKey>> = HashMap::new();
+        for key in self.load_keys(None).await? {
+            keys_by_provider
+                .entry(key.provider_id.clone())
+                .or_default()
+                .push(key);
+        }
         for provider in &mut providers {
             provider.protocol_endpoints = by_provider.remove(&provider.id).unwrap_or_default();
+            provider.keys = keys_by_provider.remove(&provider.id).unwrap_or_default();
         }
         Ok(providers)
     }
@@ -392,6 +467,7 @@ impl ProviderStore for PostgresProviderStore {
             .await?;
         if let Some(provider) = &mut provider {
             provider.protocol_endpoints = self.load_endpoints(Some(id)).await?;
+            provider.keys = self.load_keys(Some(id)).await?;
         }
         Ok(provider)
     }
@@ -439,6 +515,7 @@ impl ProviderStore for PostgresProviderStore {
             .execute(&mut *tx)
             .await?;
         }
+        Self::replace_keys(&mut tx, &id, &input.keys).await?;
         tx.commit().await?;
         self.get(&id)
             .await?
@@ -452,6 +529,8 @@ impl ProviderStore for PostgresProviderStore {
             .context("provider not found for update")?;
         let replace_endpoints = input.protocol_endpoints.is_some();
         let endpoint_inputs = input.protocol_endpoints.clone();
+        let replace_keys = input.keys.is_some();
+        let key_inputs = input.keys.clone().unwrap_or_default();
         let models_source_input = input.models_source.map(|value| value.trim().to_string());
         let name = input.name.unwrap_or(current.name);
         let vendor = if input.vendor.is_some() {
@@ -517,6 +596,9 @@ impl ProviderStore for PostgresProviderStore {
                 .await?;
             }
         }
+        if replace_keys {
+            Self::replace_keys(&mut tx, id, &key_inputs).await?;
+        }
         tx.commit().await?;
         self.get(id).await?.context("provider missing after update")
     }
@@ -539,6 +621,11 @@ impl ProviderStore for PostgresProviderStore {
             .await?;
 
         sqlx::query("DELETE FROM provider_protocol_endpoints WHERE provider_id = $1")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+
+        sqlx::query("DELETE FROM provider_keys WHERE provider_id = $1")
             .bind(id)
             .execute(&mut *tx)
             .await?;
@@ -600,6 +687,23 @@ impl ProviderStore for PostgresProviderStore {
         .bind(result.error)
         .bind(result.tested_at)
         .bind(endpoint_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn record_key_probe_result(
+        &self,
+        key_id: &str,
+        result: ProviderKeyProbeResult,
+    ) -> anyhow::Result<()> {
+        sqlx::query(
+            "UPDATE provider_keys SET models_snapshot = $1, probe_error = $2, last_probe_at = $3::timestamptz, updated_at = CURRENT_TIMESTAMP WHERE id = $4",
+        )
+        .bind(result.models.as_deref().map(crate::db::models::encode_model_list))
+        .bind(&result.error)
+        .bind(&result.tested_at)
+        .bind(key_id)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -1064,7 +1168,7 @@ impl LogStore for PostgresLogStore {
             sqlx::query(
                 r#"INSERT INTO request_logs
                     (id, created_at, api_key_id, api_key_name,
-                     client_protocol, upstream_protocol, provider_id, provider_name, model_id, model_name, upstream_url,
+                     client_protocol, upstream_protocol, provider_id, provider_name, provider_key_name, model_id, model_name, upstream_url,
                      client_model, upstream_model, reasoning_effort, route_decision,
                      method, path,
                      client_request_headers, client_request_body,
@@ -1077,7 +1181,7 @@ impl LogStore for PostgresLogStore {
                      is_stream, stream_chunks_count, stream_first_chunk_ms,
                      performance_metadata_version, upstream_effort_status, upstream_effort_raw, upstream_effort_tier, request_completion, completion_reason, upstream_response_mode, performance_upstream_ms, performance_first_chunk_ms, performance_completed_at,
                      client_request_id, attempt_index, outcome_version, attempt_outcome, failure_kind, failure_stage, error_message, error_causes_json, payload_metadata_json, payload_cleared_at)
-                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,$37,$38,$39,$40,$41,$42,$43,$44,$45,$46,$47,$48,$49,$50,$51,$52,$53,$54,$55,NULL)"#,
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,$37,$38,$39,$40,$41,$42,$43,$44,$45,$46,$47,$48,$49,$50,$51,$52,$53,$54,$55,$56,NULL)"#,
             )
             .bind(&diagnostic.log_id)
             .bind(entry.created_at)
@@ -1087,6 +1191,7 @@ impl LogStore for PostgresLogStore {
             .bind(&entry.upstream_protocol)
             .bind(&entry.provider_id)
             .bind(&entry.provider_name)
+            .bind(&entry.provider_key_name)
             .bind(&entry.model_id)
             .bind(&entry.model_name)
             .bind(&entry.upstream_url)
@@ -1159,7 +1264,7 @@ impl LogStore for PostgresLogStore {
         // List query skips heavy body/header columns (NULL placeholders preserve struct layout).
         let mut data_sql = String::from(
             "SELECT id, COALESCE(created_at::BIGINT, 0) AS created_at, api_key_id, api_key_name, \
-             client_protocol, upstream_protocol, provider_id, provider_name, model_id, model_name, upstream_url, \
+             client_protocol, upstream_protocol, provider_id, provider_name, provider_key_name, model_id, model_name, upstream_url, \
              client_model, upstream_model, reasoning_effort, route_decision, method, path, \
              NULL::text AS client_request_headers, NULL::text AS client_request_body, \
              NULL::text AS client_response_headers, NULL::text AS client_response_body, \
@@ -1283,7 +1388,7 @@ impl LogStore for PostgresLogStore {
     async fn find_by_id(&self, id: &str) -> anyhow::Result<Option<RequestLog>> {
         let row = sqlx::query_as::<_, RequestLog>(
             "SELECT id, COALESCE(created_at::BIGINT, 0) AS created_at, api_key_id, api_key_name, \
-             client_protocol, upstream_protocol, provider_id, provider_name, model_id, model_name, upstream_url, \
+             client_protocol, upstream_protocol, provider_id, provider_name, provider_key_name, model_id, model_name, upstream_url, \
              client_model, upstream_model, reasoning_effort, route_decision, method, path, \
              client_request_headers, client_request_body, \
              client_response_headers, client_response_body, \
@@ -1912,6 +2017,9 @@ END $$;"#,
         sqlx::query("ALTER TABLE request_logs ADD COLUMN IF NOT EXISTS route_decision TEXT")
             .execute(self.adapter.pool())
             .await?;
+        sqlx::query("ALTER TABLE request_logs ADD COLUMN IF NOT EXISTS provider_key_name TEXT")
+            .execute(self.adapter.pool())
+            .await?;
 
         // Rename tables: routes → models, route_targets → model_backends, api_key_routes → api_key_models
         pg_rename_table_if_needed(self.adapter.pool(), "routes", "models").await?;
@@ -2482,6 +2590,24 @@ CREATE TABLE IF NOT EXISTS provider_protocol_endpoints (
 CREATE INDEX IF NOT EXISTS idx_provider_protocol_endpoints_provider
     ON provider_protocol_endpoints(provider_id, is_enabled, priority);
 
+CREATE TABLE IF NOT EXISTS provider_keys (
+    id TEXT PRIMARY KEY,
+    provider_id TEXT NOT NULL REFERENCES providers(id) ON DELETE CASCADE,
+    name TEXT NOT NULL,
+    api_key TEXT NOT NULL,
+    is_enabled BOOLEAN NOT NULL DEFAULT TRUE,
+    priority INTEGER NOT NULL DEFAULT 0,
+    models_snapshot TEXT,
+    manual_models TEXT,
+    last_probe_at TIMESTAMPTZ,
+    probe_error TEXT,
+    created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_provider_keys_provider
+    ON provider_keys(provider_id, is_enabled, priority);
+
 CREATE TABLE IF NOT EXISTS routes (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
@@ -2519,6 +2645,7 @@ CREATE TABLE IF NOT EXISTS request_logs (
     upstream_protocol         TEXT,
     provider_id               TEXT,
     provider_name             TEXT,
+    provider_key_name         TEXT,
     model_id                  TEXT,
     model_name                TEXT,
     upstream_url              TEXT,

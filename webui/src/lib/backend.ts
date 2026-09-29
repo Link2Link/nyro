@@ -130,6 +130,8 @@ function resolveHTTP(cmd: string, args?: Record<string, unknown>): HTTPMapping {
       };
     case "test_provider_models":
       return { method: "GET", url: `${base}/providers/${args?.id}/test-models` };
+    case "probe_provider_keys":
+      return { method: "POST", url: `${base}/providers/${args?.id}/probe-keys` };
     case "probe_provider_models":
       return {
         method: "POST",

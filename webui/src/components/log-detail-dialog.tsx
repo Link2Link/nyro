@@ -218,7 +218,12 @@ function LogDetailContent({ logId, summary, open, onOpenChange, onDelete }: LogD
             </Badge>
           ) : null}
           {(log?.provider_name ?? log?.provider_id) ? (
-            <Badge variant="outline">{log.provider_name ?? log.provider_id}</Badge>
+            <Badge variant="outline">
+              {log.provider_name ?? log.provider_id}
+              {log?.provider_key_name ? (
+                <span className="ml-1 font-mono text-[10px] text-slate-500">·{log.provider_key_name}</span>
+              ) : null}
+            </Badge>
           ) : null}
           {log?.model_name ? (
             <Badge variant="outline" className="border-slate-200 bg-slate-50 text-slate-500">{log.model_name}</Badge>

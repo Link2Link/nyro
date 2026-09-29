@@ -796,6 +796,7 @@ async fn sqlite_provider_endpoints_are_transactional_and_persist_test_status() -
 {
     let gw = build_gateway().await?;
     let input = CreateProvider {
+        keys: Vec::new(),
         name: "adaptive-storage-provider".to_string(),
         vendor: None,
         protocol: "openai-compatible/chat-completions/v1".to_string(),
@@ -894,6 +895,7 @@ fn test_data_dir() -> PathBuf {
 
 fn oauth_provider_input() -> CreateProvider {
     CreateProvider {
+        keys: Vec::new(),
         name: format!("oauth-provider-{}", Uuid::new_v4()),
         vendor: Some("openai".to_string()),
         protocol: "openai".to_string(),
@@ -913,6 +915,7 @@ fn oauth_provider_input() -> CreateProvider {
 
 fn api_key_provider_input(name: &str) -> CreateProvider {
     CreateProvider {
+        keys: Vec::new(),
         name: name.to_string(),
         vendor: Some("openai".to_string()),
         protocol: "openai-compatible".to_string(),
@@ -965,6 +968,7 @@ async fn admin_clears_payloads_deletes_single_log_and_clears_error_logs() -> any
 
     let gw = build_gateway().await?;
     let entry = |client_status: i32, upstream_status: Option<i32>| LogEntry {
+        provider_key_name: None,
         performance: Default::default(),
         diagnostic: Default::default(),
         api_key_id: None,

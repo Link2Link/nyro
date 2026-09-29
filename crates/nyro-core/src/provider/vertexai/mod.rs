@@ -322,6 +322,7 @@ mod tests {
     #[test]
     fn emits_bearer_header_for_resolved_access_token() {
         let provider = crate::db::models::Provider {
+            keys: Vec::new(),
             id: "test".into(),
             name: "test".into(),
             vendor: Some("vertexai".into()),

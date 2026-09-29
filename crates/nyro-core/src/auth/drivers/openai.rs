@@ -595,6 +595,7 @@ mod tests {
             meta: json!({ "chatgpt_account_id": "account-meta" }),
         };
         let provider = Provider {
+            keys: Vec::new(),
             id: "provider".to_string(),
             name: "Codex".to_string(),
             vendor: Some("openai".to_string()),

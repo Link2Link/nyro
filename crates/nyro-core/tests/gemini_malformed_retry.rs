@@ -243,6 +243,7 @@ async fn gemini_provider(gw: &Gateway, url: &str) -> anyhow::Result<String> {
     Ok(gw
         .admin()
         .create_provider(CreateProvider {
+            keys: Vec::new(),
             name: uuid::Uuid::new_v4().to_string(),
             vendor: Some("google".into()),
             protocol: GOOGLE_GEMINI_GENERATE_CONTENT_V1BETA.to_string(),
@@ -274,6 +275,7 @@ async fn antigravity_provider(gw: &Gateway, url: &str) -> anyhow::Result<String>
     let id = gw
         .admin()
         .create_provider(CreateProvider {
+            keys: Vec::new(),
             name: uuid::Uuid::new_v4().to_string(),
             vendor: Some("google".into()),
             protocol: GOOGLE_GEMINI_GENERATE_CONTENT_V1BETA.to_string(),

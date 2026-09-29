@@ -15,6 +15,7 @@ use tokio::sync::mpsc;
 fn entry(diagnostic: LogDiagnostic) -> LogEntry {
     let payload = Some("{\"evidence\":\"kept-or-cleared\"}".to_string());
     LogEntry {
+        provider_key_name: None,
         diagnostic,
         api_key_id: None,
         api_key_name: None,

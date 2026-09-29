@@ -1353,6 +1353,7 @@ mod tests {
 
     fn provider(vendor: &str, channel: &str) -> Provider {
         Provider {
+            keys: Vec::new(),
             id: "provider-test".into(),
             name: vendor.into(),
             vendor: Some(vendor.into()),
@@ -1659,6 +1660,7 @@ mod tests {
         let ingress_str: &'static str = Box::leak(ingress.to_string().into_boxed_str());
         let egress_str: &'static str = Box::leak(egress.to_string().into_boxed_str());
         let call_ctx = CallCtx {
+            provider_key_name: None,
             performance: None,
             gw: gw.clone(),
             provider,

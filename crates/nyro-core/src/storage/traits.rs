@@ -7,8 +7,9 @@ use crate::db::models::{
     ApiKeyStats, ApiKeyUsageDetail, ApiKeyWithBindings, CreateApiKey, CreateModel,
     CreateModelBackend, CreateProvider, LogPage, LogQuery, Model, ModelBackend, ModelRatingEntry,
     ModelStats, ModelTimeBucket, ModelUsageDetail, ModelUsageStats, OAuthCredential, Provider,
-    ProviderStats, ProviderUsageDetail, RequestLog, RequestResult, StatsHourly, StatsOverview,
-    StatsTimeBucket, UpdateApiKey, UpdateModel, UpdateProvider, UpsertOAuthCredential,
+    ProviderKeyProbeResult, ProviderStats, ProviderUsageDetail, RequestLog, RequestResult,
+    StatsHourly, StatsOverview, StatsTimeBucket, UpdateApiKey, UpdateModel, UpdateProvider,
+    UpsertOAuthCredential,
 };
 use crate::logging::LogEntry;
 
@@ -78,6 +79,14 @@ pub trait ProviderStore: Send + Sync {
         &self,
         endpoint_id: &str,
         result: ProviderEndpointTestResult,
+    ) -> anyhow::Result<()>;
+    /// Persist a per-key probe outcome: on success the discovered model
+    /// snapshot replaces `models_snapshot` and `probe_error` clears; on
+    /// failure the snapshot is left untouched and the error is recorded.
+    async fn record_key_probe_result(
+        &self,
+        key_id: &str,
+        result: ProviderKeyProbeResult,
     ) -> anyhow::Result<()>;
 }
 

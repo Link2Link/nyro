@@ -69,6 +69,7 @@ fn provider_row(id: &str, base_url: &str) -> Provider {
 /// suite name — the shim must accept both storage forms.
 fn provider_row_with_protocol(id: &str, base_url: &str, protocol: &str) -> Provider {
     Provider {
+        keys: Vec::new(),
         id: id.to_string(),
         name: "GLM test".to_string(),
         vendor: None,

@@ -517,6 +517,7 @@ impl AdminService {
             base_url: input.base_url.clone(),
             protocol_mode: input.protocol_mode.clone(),
             protocol_endpoints: Vec::new(),
+            keys: Vec::new(),
             preset_key: input.preset_key.clone(),
             channel: input.channel.clone(),
             models_source: input.models_source.clone(),
