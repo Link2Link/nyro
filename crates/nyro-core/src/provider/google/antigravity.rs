@@ -51,6 +51,17 @@ pub(crate) const ANTIGRAVITY_STATIC_MODELS: &[&str] = &[
     "gemini-pro-agent",
     "gemini-3.6-flash-high",
     "gemini-3.7-flash-high",
+    // Claude 5.5 reasoning tiers (verified 2026-10-04 by direct probes):
+    // callable on the inference surface but NOT yet listed by the per-account
+    // `fetchAvailableModels` catalog, so the curated list must carry them or
+    // they stay invisible to discovery. Same `-high/-medium/-low` tier
+    // suffix convention as the Gemini line (bare and `-thinking` ids 404).
+    "claude-sonnet-5-5-high",
+    "claude-sonnet-5-5-medium",
+    "claude-sonnet-5-5-low",
+    "claude-opus-5-5-high",
+    "claude-opus-5-5-medium",
+    "claude-opus-5-5-low",
 ];
 
 /// Antigravity IDE public OAuth client (published "installed app" client;
