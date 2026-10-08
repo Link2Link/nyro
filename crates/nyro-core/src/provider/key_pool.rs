@@ -7,7 +7,72 @@
 //! pool never silently blocks traffic. Selection is priority-ordered with
 //! transparent failover to the next eligible key (see `eligible_keys`).
 
-use crate::db::models::ProviderKey;
+use crate::db::models::{Provider, ProviderKey};
+use crate::error::GatewayError;
+use crate::protocol::{ProviderProtocolTarget, ProviderProtocols};
+
+/// Resolve a hard per-candidate protocol pin, retaining vendor model
+/// constraints. A pool row without a pin (`protocol` unset) preserves the
+/// provider's existing fixed/adaptive negotiation untouched.
+///
+/// - Vendor-required endpoints (OpenCode Go catalog) always win; a pin that
+///   conflicts with the required protocol is an error so the next candidate
+///   can take over.
+/// - Adaptive pins must match an enabled configured endpoint to reuse its
+///   base URL and auth scheme.
+/// - Fixed providers reuse the provider base URL with the protocol's default
+///   auth scheme.
+///
+/// The candidate's own `base_url` override is NOT applied here; the
+/// dispatcher applies it to the final plan uniformly for pinned and
+/// inherited candidates alike.
+pub(crate) fn resolve_endpoint(
+    provider: &Provider,
+    key: Option<&ProviderKey>,
+    model: &str,
+) -> Result<Option<ProviderProtocolTarget>, GatewayError> {
+    let required = crate::provider::opencode_go::routing::resolve_endpoint(provider, model)?;
+    let Some(raw) = key
+        .and_then(|key| key.protocol.as_deref())
+        .map(str::trim)
+        .filter(|raw| !raw.is_empty())
+    else {
+        return Ok(required);
+    };
+    let protocol = ProviderProtocols::parse_protocol_key(raw).ok_or_else(|| {
+        GatewayError::provider_unavailable(&provider.id, format!("unsupported key protocol: {raw}"))
+    })?;
+    if let Some(required) = required {
+        if required.protocol != protocol {
+            return Err(GatewayError::provider_unavailable(
+                &provider.id,
+                format!(
+                    "key protocol {protocol} conflicts with model '{model}' required protocol {}",
+                    required.protocol
+                ),
+            ));
+        }
+        return Ok(Some(required));
+    }
+    if provider.is_adaptive() {
+        let endpoint = ProviderProtocols::from_provider(provider)
+            .get(protocol)
+            .cloned()
+            .ok_or_else(|| {
+                GatewayError::provider_unavailable(
+                    &provider.id,
+                    format!("key protocol {protocol} has no enabled provider endpoint"),
+                )
+            })?;
+        return Ok(Some(endpoint));
+    }
+    Ok(Some(ProviderProtocolTarget {
+        record_id: None,
+        protocol,
+        base_url: provider.base_url.trim().to_string(),
+        auth_scheme: "auto".to_string(),
+    }))
+}
 
 /// Keys eligible for `model`, in dispatch order (input must already be
 /// ordered by priority — the storage layer guarantees this).
@@ -59,7 +124,7 @@ mod tests {
     use super::*;
 
     fn key(id: &str, priority: i32, enabled: bool, models: Option<&[&str]>) -> ProviderKey {
-        let (models_snapshot, manual_models): (Option<String>, Option<String>) = match models {
+        let (models_snapshot, _manual_models): (Option<String>, Option<String>) = match models {
             Some(list) => (
                 Some(crate::db::models::encode_model_list(
                     &list.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
@@ -73,12 +138,44 @@ mod tests {
             provider_id: "p".to_string(),
             name: format!("key-{id}"),
             api_key: "secret".to_string(),
+            protocol: None,
+            base_url: None,
             is_enabled: enabled,
             priority,
             models_snapshot,
             manual_models: None,
             last_probe_at: None,
             probe_error: None,
+            created_at: String::new(),
+            updated_at: String::new(),
+        }
+    }
+
+    fn provider(protocol: &str, base_url: &str, adaptive: bool) -> Provider {
+        Provider {
+            id: "p".to_string(),
+            name: "pool-provider".to_string(),
+            vendor: None,
+            protocol: protocol.to_string(),
+            base_url: base_url.to_string(),
+            protocol_mode: if adaptive {
+                crate::db::models::PROVIDER_PROTOCOL_MODE_ADAPTIVE.to_string()
+            } else {
+                "fixed".to_string()
+            },
+            protocol_endpoints: vec![],
+            keys: vec![],
+            api_key: String::new(),
+            use_proxy: false,
+            fast_mode: false,
+            auth_mode: "apikey".to_string(),
+            preset_key: None,
+            channel: None,
+            models_source: None,
+            static_models: None,
+            last_test_success: None,
+            last_test_at: None,
+            is_enabled: true,
             created_at: String::new(),
             updated_at: String::new(),
         }
@@ -142,5 +239,79 @@ mod tests {
         }
         assert!(!key_failover_status(500));
         assert!(!key_failover_status(200));
+    }
+
+    #[test]
+    fn resolve_endpoint_without_pin_keeps_provider_negotiation() {
+        let provider = provider("openai-compatible", "https://relay.test/v1", false);
+        let k = key("a", 0, true, None);
+        assert!(
+            resolve_endpoint(&provider, Some(&k), "m")
+                .unwrap()
+                .is_none()
+        );
+        assert!(resolve_endpoint(&provider, None, "m").unwrap().is_none());
+    }
+
+    #[test]
+    fn resolve_endpoint_fixed_provider_pin_uses_provider_base() {
+        let provider = provider("openai-compatible", "https://relay.test/v1", false);
+        let mut k = key("a", 0, true, None);
+        k.protocol = Some("anthropic-messages".to_string());
+        let endpoint = resolve_endpoint(&provider, Some(&k), "m")
+            .unwrap()
+            .expect("pinned protocol resolves");
+        assert_eq!(
+            endpoint.protocol,
+            crate::protocol::ids::ANTHROPIC_MESSAGES_2023_06_01
+        );
+        assert_eq!(endpoint.base_url, "https://relay.test/v1");
+        assert_eq!(endpoint.auth_scheme, "auto");
+        assert!(endpoint.record_id.is_none());
+    }
+
+    #[test]
+    fn resolve_endpoint_adaptive_pin_requires_configured_endpoint() {
+        let mut provider = provider("openai-compatible", "https://relay.test", true);
+        provider.protocol_endpoints = vec![crate::db::models::ProviderProtocolEndpoint {
+            id: "ep-1".to_string(),
+            provider_id: "p".to_string(),
+            protocol: "anthropic-messages/messages/2023-06-01".to_string(),
+            base_url: "https://relay.test".to_string(),
+            api_key: "ignored".to_string(),
+            auth_scheme: "x-api-key".to_string(),
+            is_enabled: true,
+            priority: 0,
+            test_status: "unknown".to_string(),
+            test_error: None,
+            tested_at: None,
+            created_at: String::new(),
+            updated_at: String::new(),
+        }];
+        let mut k = key("a", 0, true, None);
+        k.protocol = Some("anthropic-messages".to_string());
+        let endpoint = resolve_endpoint(&provider, Some(&k), "m")
+            .unwrap()
+            .expect("adaptive pin matches configured endpoint");
+        assert_eq!(
+            endpoint.protocol,
+            crate::protocol::ids::ANTHROPIC_MESSAGES_2023_06_01
+        );
+        assert_eq!(endpoint.base_url, "https://relay.test");
+        assert_eq!(endpoint.auth_scheme, "x-api-key");
+        assert_eq!(endpoint.record_id.as_deref(), Some("ep-1"));
+
+        // A pin with no matching enabled endpoint is a hard error so the
+        // next candidate (or the caller) sees the misconfiguration.
+        k.protocol = Some("google-gemini".to_string());
+        assert!(resolve_endpoint(&provider, Some(&k), "m").is_err());
+    }
+
+    #[test]
+    fn resolve_endpoint_rejects_unsupported_pin() {
+        let provider = provider("openai-compatible", "https://relay.test/v1", false);
+        let mut k = key("a", 0, true, None);
+        k.protocol = Some("not-a-protocol".to_string());
+        assert!(resolve_endpoint(&provider, Some(&k), "m").is_err());
     }
 }

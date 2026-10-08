@@ -80,17 +80,19 @@ Provider 的协议端点明细。固定模式保留一条兼容记录；自适�
 
 ## provider_keys
 
-供应商级 API Key 池（三方中转多 Key 供应商，如 UUAPI / linkai / apinebula 类）。池非空时它是该 Provider 的唯一凭据来源：调度按目标模型在各 Key 的有效模型集（`manual_models` 优先，否则 `models_snapshot`；两者皆空视为可服务任何模型）中选 Key，401/403/404/429 时切换下一个合格 Key。
+供应商级候选池（三方中转多 Key 供应商，如 UUAPI / linkai / apinebula 类）。每行是一个完整的调度候选：密钥 + 可选访问协议 + 可选 API 地址，未填字段继承供应商默认。池非空时它是该 Provider 的唯一凭据来源：调度按目标模型在各候选的有效模型集（`manual_models` 优先，否则 `models_snapshot`；两者皆空视为可服务任何模型）中选候选，401/403/404/429 时切换下一个合格候选。
 
 | Column | Type | Default | Description |
 |---|---|---|---|
 | `id` | TEXT PK | — | 主键，UUID |
 | `provider_id` | TEXT NOT NULL | — | 所属 Provider（FK → providers.id, ON DELETE CASCADE） |
-| `name` | TEXT NOT NULL | — | Key 显示名称（写入 request_logs.provider_key_name） |
-| `api_key` | TEXT NOT NULL | — | 该 Key 的 API 凭据（覆盖所有协议端点） |
+| `name` | TEXT NOT NULL | — | 候选显示名称（写入 request_logs.provider_key_name） |
+| `api_key` | TEXT NOT NULL | — | 该候选的 API 凭据 |
+| `protocol` | TEXT (MySQL: VARCHAR(255)) | NULL | Canonical protocol endpoint ID; NULL inherits the provider's fixed/adaptive protocol. Blank input normalizes to NULL; suite names and aliases resolve like provider-level parsing (`openai-compatible` → `openai-compatible/chat-completions/v1`). |
+| `base_url` | TEXT (MySQL: VARCHAR(512)) | NULL | Per-candidate upstream API address; NULL inherits the provider base URL (or the matched adaptive endpoint's). Blank input normalizes to NULL. |
 | `is_enabled` | INTEGER NOT NULL | `1` | 是否参与调度 |
 | `priority` | INTEGER NOT NULL | `0` | 优先级，小者先 |
-| `models_snapshot` | TEXT | NULL | JSON 数组：用该 Key 探测 `/models` 得到的模型快照 |
+| `models_snapshot` | TEXT | NULL | JSON 数组：用该候选探测 `/models` 得到的模型快照 |
 | `manual_models` | TEXT | NULL | JSON 数组：手工修正的模型清单，非空时覆盖快照 |
 | `last_probe_at` | TEXT | NULL | 最近一次探测时间 |
 | `probe_error` | TEXT | NULL | 最近一次探测错误 |
@@ -98,6 +100,13 @@ Provider 的协议端点明细。固定模式保留一条兼容记录；自适�
 | `updated_at` | TEXT | `datetime('now')` | 更新时间 |
 
 **索引**：`idx_provider_keys_provider` on `(provider_id, is_enabled, priority)`
+
+Existing rows migrate with `protocol`/`base_url` = NULL; older JSON payloads that
+omit these fields retain provider-level behavior. Updating a candidate's API
+credential, normalized protocol, or base URL clears `models_snapshot`,
+`last_probe_at`, and `probe_error` (the probe no longer describes the same
+endpoint); the independent `manual_models` list is kept. Unchanged candidates
+retain their probe state.
 
 ---
 

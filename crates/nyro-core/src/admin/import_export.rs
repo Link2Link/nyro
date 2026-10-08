@@ -73,6 +73,8 @@ impl AdminService {
                                 id: None,
                                 name: key.name.clone(),
                                 api_key: key.api_key.clone(),
+                                protocol: key.protocol.clone(),
+                                base_url: key.base_url.clone(),
                                 is_enabled: key.is_enabled,
                                 priority: key.priority,
                                 manual_models: Some(match effective {
@@ -189,6 +191,8 @@ impl AdminService {
                             id: None,
                             name: key.name.clone(),
                             api_key: key.api_key.clone(),
+                            protocol: key.protocol.clone(),
+                            base_url: key.base_url.clone(),
                             is_enabled: key.is_enabled,
                             priority: key.priority,
                             manual_models: key.manual_models.clone(),

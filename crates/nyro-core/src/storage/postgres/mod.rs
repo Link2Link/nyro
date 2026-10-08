@@ -351,7 +351,7 @@ impl PostgresProviderStore {
     }
 
     async fn load_keys(&self, provider_id: Option<&str>) -> anyhow::Result<Vec<ProviderKey>> {
-        let base = "SELECT id, provider_id, name, api_key, COALESCE(is_enabled, TRUE) AS is_enabled, COALESCE(priority, 0) AS priority, models_snapshot, manual_models, last_probe_at, probe_error, to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS') AS created_at, to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS') AS updated_at FROM provider_keys";
+        let base = "SELECT id, provider_id, name, api_key, protocol, base_url, COALESCE(is_enabled, TRUE) AS is_enabled, COALESCE(priority, 0) AS priority, models_snapshot, manual_models, last_probe_at::text AS last_probe_at, probe_error, to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS') AS created_at, to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS') AS updated_at FROM provider_keys";
         let keys = if let Some(provider_id) = provider_id {
             sqlx::query_as::<_, ProviderKey>(&format!(
                 "{base} WHERE provider_id = $1 ORDER BY priority, created_at, id"
@@ -370,7 +370,7 @@ impl PostgresProviderStore {
     }
 
     /// Replace a provider's key pool, preserving probe fields for rows whose
-    /// `id` matches an existing key (see the sqlite twin for semantics).
+    /// `id`, API key, protocol, and base URL match an existing key.
     async fn replace_keys(
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
         provider_id: &str,
@@ -378,7 +378,7 @@ impl PostgresProviderStore {
     ) -> anyhow::Result<()> {
         let existing: HashMap<String, ProviderKey> =
             sqlx::query_as::<_, ProviderKey>(
-                "SELECT id, provider_id, name, api_key, COALESCE(is_enabled, TRUE) AS is_enabled, COALESCE(priority, 0) AS priority, models_snapshot, manual_models, last_probe_at, probe_error, to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS') AS created_at, to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS') AS updated_at FROM provider_keys WHERE provider_id = $1",
+                "SELECT id, provider_id, name, api_key, protocol, base_url, COALESCE(is_enabled, TRUE) AS is_enabled, COALESCE(priority, 0) AS priority, models_snapshot, manual_models, last_probe_at::text AS last_probe_at, probe_error, to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS') AS created_at, to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS') AS updated_at FROM provider_keys WHERE provider_id = $1",
             )
             .bind(provider_id)
             .fetch_all(&mut **tx)
@@ -391,19 +391,27 @@ impl PostgresProviderStore {
             .execute(&mut **tx)
             .await?;
         for input in inputs {
+            let protocol =
+                crate::db::models::normalize_provider_key_protocol(input.protocol.as_deref())?;
+            let base_url =
+                crate::db::models::normalize_provider_key_base_url(input.base_url.as_deref());
             let id = input
                 .id
                 .clone()
                 .filter(|id| existing.contains_key(id))
                 .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-            let preserved = existing.get(&id);
+            let preserved = existing.get(&id).filter(|key| {
+                key.api_key == input.api_key && key.protocol == protocol && key.base_url == base_url
+            });
             sqlx::query(
-                "INSERT INTO provider_keys (id, provider_id, name, api_key, is_enabled, priority, models_snapshot, manual_models, last_probe_at, probe_error) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+                "INSERT INTO provider_keys (id, provider_id, name, api_key, protocol, base_url, is_enabled, priority, models_snapshot, manual_models, last_probe_at, probe_error) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::timestamptz, $11)",
             )
             .bind(&id)
             .bind(provider_id)
             .bind(input.name.trim())
             .bind(&input.api_key)
+            .bind(&protocol)
+            .bind(&base_url)
             .bind(input.is_enabled)
             .bind(input.priority)
             .bind(preserved.and_then(|k| k.models_snapshot.clone()))
@@ -1858,6 +1866,12 @@ impl StorageBootstrap for PostgresBootstrap {
         sqlx::raw_sql(POSTGRES_INIT_SQL)
             .execute(self.adapter.pool())
             .await?;
+        sqlx::query("ALTER TABLE provider_keys ADD COLUMN IF NOT EXISTS protocol TEXT")
+            .execute(self.adapter.pool())
+            .await?;
+        sqlx::query("ALTER TABLE provider_keys ADD COLUMN IF NOT EXISTS base_url TEXT")
+            .execute(self.adapter.pool())
+            .await?;
         sqlx::query("ALTER TABLE routes ADD COLUMN IF NOT EXISTS balance TEXT DEFAULT 'weighted'")
             .execute(self.adapter.pool())
             .await?;
@@ -2595,6 +2609,8 @@ CREATE TABLE IF NOT EXISTS provider_keys (
     provider_id TEXT NOT NULL REFERENCES providers(id) ON DELETE CASCADE,
     name TEXT NOT NULL,
     api_key TEXT NOT NULL,
+    protocol TEXT,
+    base_url TEXT,
     is_enabled BOOLEAN NOT NULL DEFAULT TRUE,
     priority INTEGER NOT NULL DEFAULT 0,
     models_snapshot TEXT,

@@ -104,6 +104,26 @@ CREATE TABLE `model_backends` (
   CONSTRAINT `model_backends_ibfk_2` FOREIGN KEY (`provider_id`) REFERENCES `providers` (`id`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
+CREATE TABLE `provider_keys` (
+  `id` varchar(36) COLLATE utf8mb4_unicode_ci NOT NULL,
+  `provider_id` varchar(36) COLLATE utf8mb4_unicode_ci NOT NULL,
+  `name` varchar(255) COLLATE utf8mb4_unicode_ci NOT NULL,
+  `api_key` text COLLATE utf8mb4_unicode_ci NOT NULL,
+  `protocol` varchar(255) COLLATE utf8mb4_unicode_ci DEFAULT NULL,
+  `base_url` varchar(512) COLLATE utf8mb4_unicode_ci DEFAULT NULL,
+  `is_enabled` tinyint(1) NOT NULL DEFAULT '1',
+  `priority` int NOT NULL DEFAULT '0',
+  `models_snapshot` longtext COLLATE utf8mb4_unicode_ci,
+  `manual_models` longtext COLLATE utf8mb4_unicode_ci,
+  `last_probe_at` datetime DEFAULT NULL,
+  `probe_error` text COLLATE utf8mb4_unicode_ci,
+  `created_at` datetime DEFAULT CURRENT_TIMESTAMP,
+  `updated_at` datetime DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (`id`),
+  KEY `idx_provider_keys_provider` (`provider_id`,`is_enabled`,`priority`),
+  CONSTRAINT `provider_keys_ibfk_1` FOREIGN KEY (`provider_id`) REFERENCES `providers` (`id`) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
 CREATE TABLE `provider_oauth_credentials` (
   `provider_id` varchar(36) COLLATE utf8mb4_unicode_ci NOT NULL,
   `driver_key` text COLLATE utf8mb4_unicode_ci NOT NULL,
@@ -156,6 +176,7 @@ CREATE TABLE `request_logs` (
   `upstream_protocol` varchar(255) COLLATE utf8mb4_unicode_ci DEFAULT NULL,
   `provider_id` varchar(36) COLLATE utf8mb4_unicode_ci DEFAULT NULL,
   `provider_name` varchar(255) COLLATE utf8mb4_unicode_ci DEFAULT NULL,
+  `provider_key_name` varchar(255) COLLATE utf8mb4_unicode_ci DEFAULT NULL,
   `model_id` varchar(36) COLLATE utf8mb4_unicode_ci DEFAULT NULL,
   `model_name` varchar(255) COLLATE utf8mb4_unicode_ci DEFAULT NULL,
   `upstream_url` text COLLATE utf8mb4_unicode_ci,

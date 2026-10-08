@@ -435,6 +435,8 @@ async fn ensure_provider_keys_table(pool: &SqlitePool) -> anyhow::Result<()> {
             provider_id TEXT NOT NULL REFERENCES providers(id) ON DELETE CASCADE,
             name        TEXT NOT NULL,
             api_key     TEXT NOT NULL,
+            protocol    TEXT,
+            base_url    TEXT,
             is_enabled  INTEGER NOT NULL DEFAULT 1,
             priority    INTEGER NOT NULL DEFAULT 0,
             models_snapshot TEXT,
@@ -450,6 +452,16 @@ async fn ensure_provider_keys_table(pool: &SqlitePool) -> anyhow::Result<()> {
     )
     .execute(pool)
     .await?;
+    if !column_exists(pool, "provider_keys", "protocol").await? {
+        sqlx::query("ALTER TABLE provider_keys ADD COLUMN protocol TEXT")
+            .execute(pool)
+            .await?;
+    }
+    if !column_exists(pool, "provider_keys", "base_url").await? {
+        sqlx::query("ALTER TABLE provider_keys ADD COLUMN base_url TEXT")
+            .execute(pool)
+            .await?;
+    }
     Ok(())
 }
 
@@ -1016,6 +1028,8 @@ CREATE TABLE IF NOT EXISTS provider_keys (
     provider_id TEXT NOT NULL REFERENCES providers(id) ON DELETE CASCADE,
     name        TEXT NOT NULL,
     api_key     TEXT NOT NULL,
+    protocol    TEXT,
+    base_url    TEXT,
     is_enabled  INTEGER NOT NULL DEFAULT 1,
     priority    INTEGER NOT NULL DEFAULT 0,
     models_snapshot TEXT,

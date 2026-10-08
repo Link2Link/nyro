@@ -717,27 +717,28 @@ async fn dispatch_pipeline_inner(
         // OpenCode Go models REQUIRE their exact endpoint. Resolve it through
         // the same function as probes; never downgrade a missing pin to ingress
         // or the provider default. Other vendors retain normal negotiation.
-        let resolved_plan =
-            crate::provider::opencode_go::routing::resolve_endpoint(&provider, &actual_model)
-                .and_then(|required| match required {
-                    Some(endpoint) => {
-                        ctx.trace(
-                            "model_route",
-                            format!(
-                                "provider={} model={} source=opencode-go-catalog protocol={}",
-                                provider.id, actual_model, endpoint.protocol,
-                            ),
-                        );
-                        crate::proxy::planner::negotiator::negotiate_required(
-                            ingress, endpoint, ctx,
-                        )
-                    }
-                    None => {
-                        let provider_protocols = ProviderProtocols::from_provider(&provider);
-                        negotiate(ingress, None, Some(&provider_protocols), ctx)
-                    }
-                });
-        let plan = match resolved_plan {
+        let resolved_plan = crate::provider::key_pool::resolve_endpoint(
+            &provider,
+            pool_key.as_ref(),
+            &actual_model,
+        )
+        .and_then(|required| match required {
+            Some(endpoint) => {
+                ctx.trace(
+                    "model_route",
+                    format!(
+                        "provider={} model={} source=required-endpoint protocol={}",
+                        provider.id, actual_model, endpoint.protocol,
+                    ),
+                );
+                crate::proxy::planner::negotiator::negotiate_required(ingress, endpoint, ctx)
+            }
+            None => {
+                let provider_protocols = ProviderProtocols::from_provider(&provider);
+                negotiate(ingress, None, Some(&provider_protocols), ctx)
+            }
+        });
+        let mut plan = match resolved_plan {
             Ok(p) => p,
             Err(e) => {
                 ctx.trace(
@@ -748,10 +749,26 @@ async fn dispatch_pipeline_inner(
                     ),
                 );
                 last_response = Some(e.render(None));
-                skip_key_siblings!();
+                // A protocol pin can fail for this key alone; the next key
+                // must be allowed to resolve its own endpoint.
                 continue;
             }
         };
+        // Per-candidate API address override: a pool row with its own
+        // `base_url` retargets the negotiated plan regardless of whether the
+        // protocol was pinned or inherited from the provider.
+        if let Some(base_url) = pool_key
+            .as_ref()
+            .and_then(|key| key.base_url.as_deref())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            ctx.trace(
+                "model_route",
+                format!("provider={} key_base_url_override={base_url}", provider.id),
+            );
+            plan.base_url = base_url.to_string();
+        }
         let egress = plan.egress;
         // google/antigravity must always call upstream in streaming mode (the
         // Code Assist v1internal non-stream action can return empty bodies —

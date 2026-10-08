@@ -115,6 +115,8 @@ CREATE TABLE public.provider_keys (
     provider_id text NOT NULL,
     name text NOT NULL,
     api_key text NOT NULL,
+    protocol text,
+    base_url text,
     is_enabled boolean DEFAULT true NOT NULL,
     priority integer DEFAULT 0 NOT NULL,
     models_snapshot text,

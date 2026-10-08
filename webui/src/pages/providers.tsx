@@ -1853,6 +1853,8 @@ export default function ProvidersPage() {
         id: key.id,
         name: key.name,
         api_key: key.api_key,
+        protocol: key.protocol ?? null,
+        base_url: key.base_url ?? null,
         is_enabled: key.is_enabled,
         priority: key.priority,
         manual_models: key.manual_models ?? null,
@@ -3403,7 +3405,7 @@ export default function ProvidersPage() {
                                 setKeyPoolEnabled(checked);
                                 if (checked && editKeys.length === 0) {
                                   setEditKeys([
-                                    { id: null, name: "", api_key: "", is_enabled: true, priority: 0, manual_models: null },
+                                    { id: null, name: "", api_key: "", protocol: null, base_url: null, is_enabled: true, priority: 0, manual_models: null },
                                   ]);
                                 }
                               }}
@@ -3436,6 +3438,11 @@ export default function ProvidersPage() {
                         ) : null}
                         {keyPoolEnabled ? (
                           <div className="space-y-2">
+                            <p className="text-xs text-muted-foreground">
+                              {isZh
+                                ? "开启后，密钥池是唯一凭据来源：每个候选 = 密钥 + 访问协议 + API 地址，均可单独指定；未填写的字段继承供应商默认。路由按目标模型自动选候选，401/403/404/429 时自动切换下一个候选。上方单个 API Key 字段将被忽略。"
+                                : "When enabled the pool is the sole credential source: each candidate = secret + access protocol + API base URL, each individually configurable; unset fields inherit the provider defaults. Routing picks the candidate that holds the target model, and 401/403/404/429 fail over to the next candidate. The single API key field above is ignored."}
+                            </p>
                             {editKeys.map((key, index) => {
                               const stored = editingProvider?.keys?.find((k) => k.id === key.id);
                               const effective = parseModelsJson(
@@ -3481,6 +3488,57 @@ export default function ProvidersPage() {
                                       {isZh ? "删除" : "Delete"}
                                     </Button>
                                   </div>
+                                  <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+                                    <div className="space-y-1">
+                                      <label
+                                        htmlFor={`key-protocol-${editingProvider?.id ?? "new"}-${index}`}
+                                        className="text-xs font-medium text-muted-foreground"
+                                      >
+                                        {isZh ? "访问协议" : "Access protocol"}
+                                      </label>
+                                      <Select
+                                        value={key.protocol ?? "inherit"}
+                                        onValueChange={(value) => updateEditKey(index, {
+                                          protocol: value === "inherit" ? null : value,
+                                        })}
+                                      >
+                                        <SelectTrigger
+                                          id={`key-protocol-${editingProvider?.id ?? "new"}-${index}`}
+                                          className="w-full"
+                                        >
+                                          <SelectValue />
+                                        </SelectTrigger>
+                                        <SelectContent>
+                                          <SelectItem value="inherit">
+                                            {isZh ? "继承供应商协议" : "Inherit provider protocol"}
+                                          </SelectItem>
+                                          {protocolOptions.map((option) => (
+                                            <SelectItem key={option.value} value={option.value}>
+                                              {option.label}
+                                            </SelectItem>
+                                          ))}
+                                        </SelectContent>
+                                      </Select>
+                                    </div>
+                                    <div className="space-y-1">
+                                      <label
+                                        htmlFor={`key-base-url-${editingProvider?.id ?? "new"}-${index}`}
+                                        className="text-xs font-medium text-muted-foreground"
+                                      >
+                                        {isZh ? "API 地址（可选）" : "API base URL (optional)"}
+                                      </label>
+                                      <Input
+                                        id={`key-base-url-${editingProvider?.id ?? "new"}-${index}`}
+                                        placeholder={
+                                          isZh
+                                            ? "继承供应商地址，如 https://relay.example.com/v1"
+                                            : "Inherit provider base URL, e.g. https://relay.example.com/v1"
+                                        }
+                                        value={key.base_url ?? ""}
+                                        onChange={(e) => updateEditKey(index, { base_url: e.target.value })}
+                                      />
+                                    </div>
+                                  </div>
                                   <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
                                     {stored?.probe_error ? (
                                       <span className="text-red-600">
@@ -3523,6 +3581,8 @@ export default function ProvidersPage() {
                                     id: null,
                                     name: "",
                                     api_key: "",
+                                    protocol: null,
+                                    base_url: null,
                                     is_enabled: true,
                                     priority: prev.length,
                                     manual_models: null,
@@ -3873,6 +3933,8 @@ export default function ProvidersPage() {
                           keys: keyPoolEnabled
                             ? editKeys.map((key, index) => ({
                                 ...key,
+                                protocol: key.protocol ?? null,
+                                base_url: (key.base_url ?? "").trim() || null,
                                 priority: Number.isFinite(key.priority) ? key.priority : index,
                               }))
                             : [],

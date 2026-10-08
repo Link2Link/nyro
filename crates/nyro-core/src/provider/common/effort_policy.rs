@@ -39,6 +39,15 @@
 //! `ReasoningEffort::None` would emit `"none"`, which grok rejects. The
 //! normalization therefore happens per-vendor at the wire boundary, keeping
 //! each vendor's dialect explicit.
+//!
+//! Claude 5.5 系列把经典思考形态逐出了契约：`thinking.type=enabled`（含
+//! `budget_tokens`）被 400 拒绝，仅接受省略 `thinking`（自适应思考）、
+//! `thinking.type=adaptive` 或 `thinking.type=between_tools`（实测
+//! 2026-12-28，请求 b0500316，UUAPI claude-sonnet-5-5：
+//! `claude-sonnet-5-5 requires adaptive thinking or thinking.type=
+//! between_tools; omit thinking or use one of those modes`）。防御按
+//! CLIProxyAPI 的自动转换语义改写：`enabled`+budget → `adaptive`+
+//! `output_config.effort`（预算阈值换算档位），`display` 兄弟键保留。
 
 use serde_json::Value;
 
@@ -248,6 +257,61 @@ fn is_off_effort(effort: &str) -> bool {
         effort.trim().to_ascii_lowercase().as_str(),
         "none" | "disable" | "disabled" | "off"
     )
+}
+
+/// Claude 5.5 系列：把经典 `thinking.type=enabled` 形态改写为自适应代
+/// 契约（换算语义参考 CLIProxyAPI `internal/thinking`，档位按网关运营
+/// 决策整体上提一档）：
+///
+/// - `budget_tokens` 按阈值表换算为 `output_config.effort` 档位：
+///   `≤1024→medium, ≤8192→high, >8192→xhigh`。相比 CPA 原表
+///   （≤1024→low, ≤8192→medium, ≤24576→high, >24576→xhigh）每档上提
+///   一级：Claude Code 的预算语义偏保守（16384 常用档只换来 medium/
+///   high），映射到 5.5 档位时按高一档还原思考强度（16384 → xhigh）。
+///   `-1`（CPA 的 auto 兼容值）与缺失/非正预算 → adaptive 不带 effort。
+/// - `display` 等兄弟键保留（adaptive 接受 display，Claude Code 的
+///   思考摘要显示不受影响）。
+/// - `budget_tokens` 换算值覆盖已存在的 `output_config.effort`（CPA
+///   extract 优先级：enabled 时 budget 优先于 effort）。
+/// - `between_tools` 与显式 `adaptive` 是 5.5 契约合法形态，原样放行；
+///   无 `thinking` 字段或非对象 body 为 no-op。仅在模型命中登记表时由
+///   调用方触发（见 pipeline 模块的 5.5 门控）。
+pub(crate) fn rewrite_legacy_claude55_thinking(body: &mut Value) {
+    /// 预算 → 档位（CPA `ConvertBudgetToLevel` 阈值表整体上提一档；
+    /// xhigh 为顶格，原 xhigh 区间保持不变）。
+    fn budget_to_level(budget: i64) -> Option<&'static str> {
+        match budget {
+            b if b > 8192 => Some("xhigh"),
+            b if b > 1024 => Some("high"),
+            b if b > 0 => Some("medium"),
+            _ => None,
+        }
+    }
+
+    let Some(object) = body.as_object_mut() else {
+        return;
+    };
+    let Some(thinking) = object.get_mut("thinking").and_then(Value::as_object_mut) else {
+        return;
+    };
+    let is_legacy_enabled = thinking
+        .get("type")
+        .and_then(Value::as_str)
+        .is_some_and(|kind| kind.trim().eq_ignore_ascii_case("enabled"));
+    if !is_legacy_enabled {
+        return;
+    }
+    let budget = thinking.get("budget_tokens").and_then(Value::as_i64);
+    thinking.remove("budget_tokens");
+    thinking.insert("type".to_string(), Value::String("adaptive".to_string()));
+    if let Some(level) = budget.and_then(budget_to_level) {
+        let entry = object
+            .entry("output_config".to_string())
+            .or_insert_with(|| Value::Object(serde_json::Map::new()));
+        if let Some(output_config) = entry.as_object_mut() {
+            output_config.insert("effort".to_string(), Value::String(level.to_string()));
+        }
+    }
 }
 
 #[cfg(test)]
@@ -499,5 +563,78 @@ mod tests {
         let mut body = json!({"model": "grok-4.6"});
         drop_grok_effort(&mut body);
         assert_eq!(body["model"], "grok-4.6");
+    }
+
+    #[test]
+    fn claude55_rewrite_converts_budget_to_bumped_level() {
+        // 档位换算整体上提一档：16384（线上 b0500316 的 Claude Code 常用
+        // 预算）→ xhigh。
+        let mut body = json!({
+            "model": "claude-sonnet-5-5",
+            "thinking": {"type": "enabled", "budget_tokens": 16384, "display": "summarized"}
+        });
+        rewrite_legacy_claude55_thinking(&mut body);
+        assert_eq!(body["thinking"]["type"], "adaptive");
+        assert!(body["thinking"].get("budget_tokens").is_none());
+        assert_eq!(body["thinking"]["display"], "summarized");
+        assert_eq!(body["output_config"]["effort"], "xhigh");
+
+        // 区间边界：≤1024 → medium，1025..=8192 → high，>8192 → xhigh。
+        for (budget, level) in [
+            (1024, "medium"),
+            (1025, "high"),
+            (8192, "high"),
+            (8193, "xhigh"),
+        ] {
+            let mut body = json!({"thinking": {"type": "enabled", "budget_tokens": budget}});
+            rewrite_legacy_claude55_thinking(&mut body);
+            assert_eq!(body["output_config"]["effort"], level, "budget {budget}");
+        }
+    }
+
+    #[test]
+    fn claude55_rewrite_handles_non_positive_budget_and_missing() {
+        // budget=-1（CPA auto 兼容值）与缺失预算 → adaptive 不带 effort。
+        for body in [
+            json!({"thinking": {"type": "enabled", "budget_tokens": -1, "display": "summarized"}}),
+            json!({"thinking": {"type": "enabled"}}),
+        ] {
+            let mut body = body;
+            rewrite_legacy_claude55_thinking(&mut body);
+            assert_eq!(body["thinking"]["type"], "adaptive");
+            assert!(body["thinking"].get("budget_tokens").is_none());
+            assert!(body.get("output_config").is_none());
+        }
+    }
+
+    #[test]
+    fn claude55_rewrite_preserves_valid_shapes_and_siblings() {
+        // between_tools / adaptive / disabled 为合法或非目标形态，原样放行。
+        for kind in ["between_tools", "adaptive", "disabled"] {
+            let mut body = json!({"thinking": {"type": kind, "budget_tokens": 16384}});
+            rewrite_legacy_claude55_thinking(&mut body);
+            assert_eq!(body["thinking"]["type"], kind);
+            assert_eq!(body["thinking"]["budget_tokens"], 16384);
+        }
+        // 无 thinking / 非对象 body：no-op。
+        let mut body = json!({"model": "claude-sonnet-5-5"});
+        rewrite_legacy_claude55_thinking(&mut body);
+        assert!(body.get("thinking").is_none());
+        let mut body = json!("not an object");
+        rewrite_legacy_claude55_thinking(&mut body);
+        assert_eq!(body, json!("not an object"));
+    }
+
+    #[test]
+    fn claude55_rewrite_budget_wins_and_merges_output_config() {
+        // budget 换算值覆盖已有 effort（CPA 优先级：enabled 时 budget 优先），
+        // output_config 的兄弟键保留。
+        let mut body = json!({
+            "thinking": {"type": "enabled", "budget_tokens": 16384},
+            "output_config": {"effort": "low", "metadata": "keep"}
+        });
+        rewrite_legacy_claude55_thinking(&mut body);
+        assert_eq!(body["output_config"]["effort"], "xhigh");
+        assert_eq!(body["output_config"]["metadata"], "keep");
     }
 }

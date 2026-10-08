@@ -121,6 +121,28 @@ fn key(name: &str, secret: &str, priority: i32, models: &[&str]) -> UpsertProvid
         id: None,
         name: name.into(),
         api_key: secret.into(),
+        protocol: None,
+        base_url: None,
+        is_enabled: true,
+        priority,
+        manual_models: Some(serde_json::to_string(&models).unwrap()),
+    }
+}
+
+fn key_pinned(
+    name: &str,
+    secret: &str,
+    priority: i32,
+    models: &[&str],
+    protocol: Option<&str>,
+    base_url: Option<&str>,
+) -> UpsertProviderKey {
+    UpsertProviderKey {
+        id: None,
+        name: name.into(),
+        api_key: secret.into(),
+        protocol: protocol.map(str::to_string),
+        base_url: base_url.map(str::to_string),
         is_enabled: true,
         priority,
         manual_models: Some(serde_json::to_string(&models).unwrap()),
@@ -245,6 +267,8 @@ async fn unprobed_key_is_eligible_and_pool_overrides_provider_key() -> anyhow::R
             id: None,
             name: "unprobed".into(),
             api_key: "key-b".into(),
+            protocol: None,
+            base_url: None,
             is_enabled: true,
             priority: 0,
             manual_models: None,
@@ -358,6 +382,8 @@ async fn probe_snapshots_survive_provider_update() -> anyhow::Result<()> {
                         id: Some(stored_key.id.clone()),
                         name: "renamed".into(),
                         api_key: "key-a".into(),
+                        protocol: None,
+                        base_url: None,
                         is_enabled: true,
                         priority: 5,
                         manual_models: None,
@@ -366,6 +392,8 @@ async fn probe_snapshots_survive_provider_update() -> anyhow::Result<()> {
                         id: None,
                         name: "fresh".into(),
                         api_key: "key-c".into(),
+                        protocol: None,
+                        base_url: None,
                         is_enabled: true,
                         priority: 6,
                         manual_models: None,
@@ -395,5 +423,231 @@ async fn probe_snapshots_survive_provider_update() -> anyhow::Result<()> {
         .find(|k| k.name == "fresh")
         .expect("new key added");
     assert!(fresh.models_snapshot.is_none());
+    Ok(())
+}
+
+/// A candidate pinned to Anthropic Messages on an OpenAI-compatible provider
+/// must egress via /v1/messages with the x-api-key scheme and its own
+/// credential, converting the OpenAI-ingress request and response.
+#[tokio::test]
+async fn pinned_candidate_routes_anthropic_egress_with_own_credential() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let config = GatewayConfig {
+        data_dir: dir.path().into(),
+        config_poll_interval: Duration::ZERO,
+        ..Default::default()
+    };
+    let storage = Arc::new(SqliteStorage::from_config(&config).await?);
+    let (gw, mut logs) = Gateway::from_storage(config, storage).await?;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let base = format!("http://{}", listener.local_addr()?);
+    let seen_paths = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let seen_creds = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    {
+        let seen_paths = seen_paths.clone();
+        let seen_creds = seen_creds.clone();
+        tokio::spawn(async move {
+            let app = Router::new().route(
+                "/v1/messages",
+                post(move |uri: axum::http::Uri, headers: HeaderMap| {
+                    let seen_paths = seen_paths.clone();
+                    let seen_creds = seen_creds.clone();
+                    async move {
+                        let credential = headers
+                            .get("x-api-key")
+                            .and_then(|v| v.to_str().ok())
+                            .map(str::to_string)
+                            .unwrap_or_default();
+                        seen_paths.lock().unwrap().push(uri.path().to_string());
+                        seen_creds.lock().unwrap().push(credential);
+                        (
+                            StatusCode::OK,
+                            Json(json!({"id":"msg_1","type":"message","role":"assistant","content":[{"type":"text","text":"hi"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}})),
+                        )
+                    }
+                }),
+            );
+            let _ = axum::serve(listener, app).await;
+        });
+    }
+
+    let provider = pool_provider(
+        &gw,
+        &base,
+        vec![key_pinned(
+            "pinned",
+            "anthro-key",
+            0,
+            &["pool-model"],
+            Some("anthropic-messages"),
+            None,
+        )],
+    )
+    .await?;
+    route(&gw, "km5", &provider, "pool-model").await?;
+
+    let (_id, response) = dispatch(&gw, "km5", OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), 1024 * 1024).await?;
+    assert!(
+        String::from_utf8_lossy(&body).contains("hi"),
+        "body: {body:?}"
+    );
+    assert_eq!(
+        seen_paths.lock().unwrap().as_slice(),
+        ["/v1/messages"],
+        "pinned candidate must egress through the Anthropic endpoint"
+    );
+    assert_eq!(
+        seen_creds.lock().unwrap().as_slice(),
+        ["anthro-key"],
+        "pinned candidate must authenticate with its own secret via x-api-key"
+    );
+    let row = tokio::time::timeout(Duration::from_secs(3), logs.recv())
+        .await
+        .expect("log entry")
+        .unwrap();
+    assert_eq!(row.provider_key_name.as_deref(), Some("pinned"));
+    Ok(())
+}
+
+/// A candidate carrying its own API address retargets the upstream call,
+/// even while inheriting the provider's protocol.
+#[tokio::test]
+async fn candidate_base_url_override_retargets_upstream() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let config = GatewayConfig {
+        data_dir: dir.path().into(),
+        config_poll_interval: Duration::ZERO,
+        ..Default::default()
+    };
+    let storage = Arc::new(SqliteStorage::from_config(&config).await?);
+    let (gw, _logs) = Gateway::from_storage(config, storage).await?;
+
+    async fn chat_from(marker: &'static str) -> Response {
+        (
+            StatusCode::OK,
+            Json(json!({"id":"1","choices":[{"index":0,"message":{"role":"assistant","content":marker},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}})),
+        )
+            .into_response()
+    }
+    let listener_a = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let base_a = format!("http://{}/v1", listener_a.local_addr()?);
+    let listener_b = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let base_b = format!("http://{}/v1", listener_b.local_addr()?);
+    let app_a = Router::new().route("/v1/chat/completions", post(|| chat_from("from-a")));
+    let app_b = Router::new().route("/v1/chat/completions", post(|| chat_from("from-b")));
+    tokio::spawn(async move {
+        let _ = axum::serve(listener_a, app_a).await;
+    });
+    tokio::spawn(async move {
+        let _ = axum::serve(listener_b, app_b).await;
+    });
+
+    let provider = pool_provider(
+        &gw,
+        &base_a,
+        vec![key_pinned(
+            "relocated",
+            "key-b",
+            0,
+            &["pool-model"],
+            None,
+            Some(&base_b),
+        )],
+    )
+    .await?;
+    route(&gw, "km6", &provider, "pool-model").await?;
+
+    let (_id, response) = dispatch(&gw, "km6", OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), 1024 * 1024).await?;
+    assert!(
+        String::from_utf8_lossy(&body).contains("from-b"),
+        "candidate base URL must win over the provider base: {body:?}"
+    );
+    Ok(())
+}
+
+/// Changing a candidate's protocol or API address invalidates its probe
+/// snapshot; a rename-only update keeps it.
+#[tokio::test]
+async fn snapshot_resets_when_candidate_endpoint_changes() -> anyhow::Result<()> {
+    let (_dir, gw, _logs, url, _job) = setup().await?;
+    let provider_id = pool_provider(&gw, &url, vec![key("key-a", "key-a", 0, &["m1"])]).await?;
+
+    let record_probe = |gw: &Gateway, key_id: String| {
+        let gw = gw.clone();
+        async move {
+            gw.storage
+                .providers()
+                .record_key_probe_result(
+                    &key_id,
+                    ProviderKeyProbeResult {
+                        success: true,
+                        error: None,
+                        tested_at: "2026-01-01 00:00:00".into(),
+                        models: Some(vec!["m1".into(), "m2".into()]),
+                    },
+                )
+                .await
+        }
+    };
+
+    let stored = gw.admin().get_provider(&provider_id).await?;
+    let key_id = stored.keys[0].id.clone();
+    record_probe(&gw, key_id.clone()).await?;
+
+    // Protocol change on the same row id → probe fields reset.
+    gw.admin()
+        .update_provider(
+            &provider_id,
+            nyro_core::db::models::UpdateProvider {
+                keys: Some(vec![key_pinned(
+                    "key-a",
+                    "key-a",
+                    0,
+                    &["m1"],
+                    Some("anthropic-messages"),
+                    None,
+                )]),
+                ..Default::default()
+            },
+        )
+        .await?;
+    let updated = gw.admin().get_provider(&provider_id).await?;
+    assert!(updated.keys[0].models_snapshot.is_none());
+    assert!(updated.keys[0].last_probe_at.is_none());
+    assert!(updated.keys[0].probe_error.is_none());
+    assert_eq!(
+        updated.keys[0].protocol.as_deref(),
+        Some("anthropic-messages/messages/2023-06-01"),
+        "protocol must be stored in canonical endpoint form"
+    );
+
+    // Re-probe, then change only the base URL → reset again.
+    record_probe(&gw, updated.keys[0].id.clone()).await?;
+    gw.admin()
+        .update_provider(
+            &provider_id,
+            nyro_core::db::models::UpdateProvider {
+                keys: Some(vec![key_pinned(
+                    "key-a",
+                    "key-a",
+                    0,
+                    &["m1"],
+                    Some("anthropic-messages"),
+                    Some("https://other-relay.test"),
+                )]),
+                ..Default::default()
+            },
+        )
+        .await?;
+    let updated = gw.admin().get_provider(&provider_id).await?;
+    assert!(updated.keys[0].models_snapshot.is_none());
+    assert_eq!(
+        updated.keys[0].base_url.as_deref(),
+        Some("https://other-relay.test")
+    );
     Ok(())
 }

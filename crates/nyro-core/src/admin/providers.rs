@@ -1051,20 +1051,26 @@ struct ProbeTarget {
 /// basic connectivity on that endpoint, not every request/conversion feature.
 ///
 /// OpenCode Go uses the dispatcher's strict exact-endpoint resolver, including
-/// for fixed providers. Non-Go providers retain their default probe target.
-/// Fixed providers keep their resolved runtime credential and binding overrides.
+/// for fixed providers. Pool candidates resolve through the same key-aware
+/// resolver as dispatch, so a pinned protocol is probed on its own endpoint.
+/// Non-Go providers without pins retain their default probe target. Fixed
+/// providers keep their resolved runtime credential and binding overrides.
 fn resolve_probe_target(
     provider: &Provider,
     model: &str,
     default: &ProbeTarget,
+    pool_key: Option<&crate::db::models::ProviderKey>,
 ) -> Result<ProbeTarget, crate::error::GatewayError> {
     use crate::protocol::ids::Protocol;
 
-    let Some(endpoint) = crate::provider::opencode_go::routing::resolve_endpoint(provider, model)?
+    let Some(endpoint) = crate::provider::key_pool::resolve_endpoint(provider, pool_key, model)?
     else {
         return Ok(default.clone());
     };
     if !provider.is_adaptive() {
+        // Fixed providers keep their runtime-resolved base URL and binding
+        // overrides; the resolved endpoint only validates/retargets the
+        // protocol (runtime binding base URLs win over catalog endpoints).
         return Ok(ProbeTarget {
             suite: endpoint.protocol.protocol,
             protocol_id: endpoint.protocol.to_string(),
@@ -1231,7 +1237,8 @@ mod probe_routing_tests {
             0,
             endpoint("other-messages", ANTHROPIC_MESSAGES_2023_06_01, 9),
         );
-        let messages = resolve_probe_target(&provider, "minimax-m3", &default_target()).unwrap();
+        let messages =
+            resolve_probe_target(&provider, "minimax-m3", &default_target(), None).unwrap();
         assert_eq!(messages.suite, Protocol::AnthropicMessages);
         assert_eq!(
             messages.protocol_id,
@@ -1241,7 +1248,8 @@ mod probe_routing_tests {
         assert_eq!(messages.api_key, "key-messages");
         assert_eq!(messages.auth_scheme, "x-api-key");
 
-        let responses = resolve_probe_target(&provider, "grok-4.6", &default_target()).unwrap();
+        let responses =
+            resolve_probe_target(&provider, "grok-4.6", &default_target(), None).unwrap();
         assert_eq!(responses.protocol_id, OPENAI_RESPONSES_V1.to_string());
         assert_eq!(responses.api_key, "key-responses");
         assert_eq!(responses.auth_scheme, "bearer");
@@ -1251,15 +1259,15 @@ mod probe_routing_tests {
     fn go_probe_rejects_unknown_missing_and_disabled_routes() {
         let mut provider = provider();
         assert!(matches!(
-            resolve_probe_target(&provider, "unknown-model", &default_target()),
+            resolve_probe_target(&provider, "unknown-model", &default_target(), None),
             Err(GatewayError::ProviderUnavailable { .. })
         ));
         provider.protocol_endpoints[1].is_enabled = false;
-        assert!(resolve_probe_target(&provider, "grok-4.6", &default_target()).is_err());
+        assert!(resolve_probe_target(&provider, "grok-4.6", &default_target(), None).is_err());
         provider.protocol_endpoints.pop();
-        assert!(resolve_probe_target(&provider, "minimax-m3", &default_target()).is_err());
+        assert!(resolve_probe_target(&provider, "minimax-m3", &default_target(), None).is_err());
         provider.protocol_endpoints.clear();
-        assert!(resolve_probe_target(&provider, "kimi-k3", &default_target()).is_err());
+        assert!(resolve_probe_target(&provider, "kimi-k3", &default_target(), None).is_err());
     }
 
     #[test]
@@ -1271,7 +1279,7 @@ mod probe_routing_tests {
             0,
         )];
         assert!(matches!(
-            resolve_probe_target(&provider, "kimi-k3", &default_target()),
+            resolve_probe_target(&provider, "kimi-k3", &default_target(), None),
             Err(GatewayError::ProviderUnavailable { .. })
         ));
     }
@@ -1281,7 +1289,7 @@ mod probe_routing_tests {
         let mut provider = provider();
         provider.protocol_mode = "fixed".into();
         provider.protocol_endpoints.clear();
-        let target = resolve_probe_target(&provider, "kimi-k3", &default_target()).unwrap();
+        let target = resolve_probe_target(&provider, "kimi-k3", &default_target(), None).unwrap();
         assert_eq!(target.api_key, "runtime-token");
         assert_eq!(target.base_url, "https://runtime.example");
         assert_eq!(target.auth_scheme, "none");
@@ -1289,15 +1297,16 @@ mod probe_routing_tests {
             target.protocol_id,
             OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1.to_string()
         );
-        assert!(resolve_probe_target(&provider, "minimax-m3", &default_target()).is_err());
-        assert!(resolve_probe_target(&provider, "unknown-model", &default_target()).is_err());
+        assert!(resolve_probe_target(&provider, "minimax-m3", &default_target(), None).is_err());
+        assert!(resolve_probe_target(&provider, "unknown-model", &default_target(), None).is_err());
     }
 
     #[test]
     fn non_go_probe_keeps_default_for_unknown_models() {
         let mut provider = provider();
         provider.vendor = Some("custom".into());
-        let target = resolve_probe_target(&provider, "unknown-model", &default_target()).unwrap();
+        let target =
+            resolve_probe_target(&provider, "unknown-model", &default_target(), None).unwrap();
         assert_eq!(target.api_key, "runtime-token");
         assert_eq!(target.base_url, "https://runtime.example");
         assert_eq!(target.auth_scheme, "none");
@@ -1308,7 +1317,7 @@ mod probe_routing_tests {
     fn model_local_failure_does_not_prevent_the_next_resolution() {
         let provider = provider();
         let mut outcomes = ["unknown-model", "kimi-k3"].into_iter().map(|model| {
-            resolve_probe_target(&provider, model, &default_target())
+            resolve_probe_target(&provider, model, &default_target(), None)
                 .map_err(|error| model_probe_routing_failure(model.into(), error))
         });
         let failure = outcomes.next().unwrap().unwrap_err();
@@ -1511,6 +1520,8 @@ impl AdminService {
                         id: None,
                         name: key.name.clone(),
                         api_key: key.api_key.clone(),
+                        protocol: key.protocol.clone(),
+                        base_url: key.base_url.clone(),
                         is_enabled: key.is_enabled,
                         priority: key.priority,
                         manual_models: key.manual_models.clone(),
@@ -2413,19 +2424,22 @@ impl AdminService {
 
         // Key-pool providers: the "send hi" probe must use the key whose
         // snapshot actually holds the model, mirroring dispatch selection.
-        let pool_key_for: std::collections::HashMap<String, String> = if has_pool {
-            let enabled = provider.enabled_keys();
-            models
-                .iter()
-                .filter_map(|model| {
-                    crate::provider::key_pool::eligible_keys(&enabled, model)
-                        .first()
-                        .map(|key| (model.clone(), key.api_key.clone()))
-                })
-                .collect()
-        } else {
-            Default::default()
-        };
+        // The full candidate row (not just its secret) flows into the probe so
+        // a pinned protocol or per-key API address is exercised as well.
+        let pool_key_for: std::collections::HashMap<String, &crate::db::models::ProviderKey> =
+            if has_pool {
+                let enabled = provider.enabled_keys();
+                models
+                    .iter()
+                    .filter_map(|model| {
+                        crate::provider::key_pool::eligible_keys(&enabled, model)
+                            .first()
+                            .map(|key| (model.clone(), *key))
+                    })
+                    .collect()
+            } else {
+                Default::default()
+            };
         let probes = models.into_iter().map(|model| {
             let client = client.clone();
             let mut runtime_headers = runtime_headers.clone();
@@ -2436,18 +2450,31 @@ impl AdminService {
             );
             let channel = channel.clone();
             let antigravity_project = antigravity_project.clone();
-            let target =
-                resolve_probe_target(&provider, &model, &default_target).and_then(|mut target| {
-                    if let Some(key) = pool_key_for.get(&model) {
-                        target.api_key = key.clone();
-                    } else if is_go && has_pool {
-                        return Err(crate::error::GatewayError::provider_unavailable(
-                            &provider.id,
-                            format!("no enabled provider key is eligible for model '{model}'"),
-                        ));
+            let target = resolve_probe_target(
+                &provider,
+                &model,
+                &default_target,
+                pool_key_for.get(&model).copied(),
+            )
+            .and_then(|mut target| {
+                if let Some(key) = pool_key_for.get(&model) {
+                    target.api_key = key.api_key.clone();
+                    if let Some(base_url) = key
+                        .base_url
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                    {
+                        target.base_url = base_url.trim_end_matches('/').to_string();
                     }
-                    Ok(target)
-                });
+                } else if is_go && has_pool {
+                    return Err(crate::error::GatewayError::provider_unavailable(
+                        &provider.id,
+                        format!("no enabled provider key is eligible for model '{model}'"),
+                    ));
+                }
+                Ok(target)
+            });
             async move {
                 let target = match target {
                     Ok(target) => target,
@@ -2555,21 +2582,46 @@ impl AdminService {
         }
     }
 
-    /// Live `/models` discovery with an explicit credential (one pool key).
-    /// Skips static overrides and the models.dev catalog on purpose: those
-    /// are provider-level and would erase the per-key distinction the pool
-    /// exists for.
+    /// Live `/models` discovery with an explicit pool candidate. Skips static
+    /// overrides and the models.dev catalog on purpose: those are
+    /// provider-level and would erase the per-key distinction the pool
+    /// exists for. The candidate's protocol pin drives the auth headers, and
+    /// its API address rebases the discovery URL when the configured source
+    /// is a plain extension of the provider base URL.
     async fn fetch_provider_models_with_key(
         &self,
         provider: &Provider,
-        api_key: &str,
+        key: &crate::db::models::ProviderKey,
     ) -> anyhow::Result<Vec<String>> {
         let endpoint = resolve_models_endpoint(provider)
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty())
             .ok_or_else(|| anyhow::anyhow!("Model Discovery URL is empty"))?;
-        let auth_protocol = Self::pool_model_fetch_protocol(provider);
-        let headers = build_model_headers(&auth_protocol, provider.vendor.as_deref(), api_key)?;
+        // Rebase the discovery URL onto the candidate's own API address when
+        // it was derived from the provider base (e.g. `…/v1/models`); a
+        // custom absolute source is kept verbatim.
+        let endpoint = match key
+            .base_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|base| base.trim_end_matches('/').to_string())
+        {
+            Some(key_base) => match endpoint
+                .strip_prefix(provider.base_url.trim_end_matches('/'))
+                .filter(|suffix| suffix.starts_with('/'))
+            {
+                Some(suffix) => format!("{key_base}{suffix}"),
+                None => endpoint,
+            },
+            None => endpoint,
+        };
+        let auth_protocol = key
+            .protocol
+            .clone()
+            .unwrap_or_else(|| Self::pool_model_fetch_protocol(provider));
+        let headers =
+            build_model_headers(&auth_protocol, provider.vendor.as_deref(), &key.api_key)?;
         let response = self
             .gw
             .http_client
@@ -2619,7 +2671,7 @@ impl AdminService {
         let mut outcomes = Vec::with_capacity(provider.keys.len());
         let mut probes = Vec::with_capacity(provider.keys.len());
         for key in &provider.keys {
-            probes.push(self.fetch_provider_models_with_key(&provider, &key.api_key));
+            probes.push(self.fetch_provider_models_with_key(&provider, key));
         }
         let results = futures::future::join_all(probes).await;
         for (key, result) in provider.keys.iter().zip(results) {
@@ -2810,9 +2862,8 @@ impl AdminService {
                     union.sort();
                     return Ok(merge_model_lists(union, preset_extra_models(provider)));
                 }
-                let probe_credential = enabled[0].api_key.clone();
                 let models = self
-                    .fetch_provider_models_with_key(provider, &probe_credential)
+                    .fetch_provider_models_with_key(provider, enabled[0])
                     .await?;
                 return Ok(merge_model_lists(models, preset_extra_models(provider)));
             }

@@ -358,7 +358,7 @@ impl MysqlProviderStore {
     }
 
     async fn load_keys(&self, provider_id: Option<&str>) -> anyhow::Result<Vec<ProviderKey>> {
-        let base = "SELECT id, provider_id, name, api_key, COALESCE(is_enabled, 1) AS is_enabled, COALESCE(priority, 0) AS priority, models_snapshot, manual_models, DATE_FORMAT(last_probe_at, '%Y-%m-%d %H:%i:%S') AS last_probe_at, probe_error, DATE_FORMAT(created_at, '%Y-%m-%d %H:%i:%S') AS created_at, DATE_FORMAT(updated_at, '%Y-%m-%d %H:%i:%S') AS updated_at FROM provider_keys";
+        let base = "SELECT id, provider_id, name, api_key, protocol, base_url, COALESCE(is_enabled, 1) AS is_enabled, COALESCE(priority, 0) AS priority, models_snapshot, manual_models, DATE_FORMAT(last_probe_at, '%Y-%m-%d %H:%i:%S') AS last_probe_at, probe_error, DATE_FORMAT(created_at, '%Y-%m-%d %H:%i:%S') AS created_at, DATE_FORMAT(updated_at, '%Y-%m-%d %H:%i:%S') AS updated_at FROM provider_keys";
         let keys = if let Some(provider_id) = provider_id {
             sqlx::query_as::<_, ProviderKey>(&format!(
                 "{base} WHERE provider_id = ? ORDER BY priority, created_at, id"
@@ -377,7 +377,7 @@ impl MysqlProviderStore {
     }
 
     /// Replace a provider's key pool, preserving probe fields for rows whose
-    /// `id` matches an existing key (see the sqlite twin for semantics).
+    /// `id`, API key, protocol, and base URL match an existing key.
     async fn replace_keys(
         tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
         provider_id: &str,
@@ -385,7 +385,7 @@ impl MysqlProviderStore {
     ) -> anyhow::Result<()> {
         let existing: HashMap<String, ProviderKey> =
             sqlx::query_as::<_, ProviderKey>(
-                "SELECT id, provider_id, name, api_key, COALESCE(is_enabled, 1) AS is_enabled, COALESCE(priority, 0) AS priority, models_snapshot, manual_models, DATE_FORMAT(last_probe_at, '%Y-%m-%d %H:%i:%S') AS last_probe_at, probe_error, DATE_FORMAT(created_at, '%Y-%m-%d %H:%i:%S') AS created_at, DATE_FORMAT(updated_at, '%Y-%m-%d %H:%i:%S') AS updated_at FROM provider_keys WHERE provider_id = ?",
+                "SELECT id, provider_id, name, api_key, protocol, base_url, COALESCE(is_enabled, 1) AS is_enabled, COALESCE(priority, 0) AS priority, models_snapshot, manual_models, DATE_FORMAT(last_probe_at, '%Y-%m-%d %H:%i:%S') AS last_probe_at, probe_error, DATE_FORMAT(created_at, '%Y-%m-%d %H:%i:%S') AS created_at, DATE_FORMAT(updated_at, '%Y-%m-%d %H:%i:%S') AS updated_at FROM provider_keys WHERE provider_id = ?",
             )
             .bind(provider_id)
             .fetch_all(&mut **tx)
@@ -398,19 +398,27 @@ impl MysqlProviderStore {
             .execute(&mut **tx)
             .await?;
         for input in inputs {
+            let protocol =
+                crate::db::models::normalize_provider_key_protocol(input.protocol.as_deref())?;
+            let base_url =
+                crate::db::models::normalize_provider_key_base_url(input.base_url.as_deref());
             let id = input
                 .id
                 .clone()
                 .filter(|id| existing.contains_key(id))
                 .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-            let preserved = existing.get(&id);
+            let preserved = existing.get(&id).filter(|key| {
+                key.api_key == input.api_key && key.protocol == protocol && key.base_url == base_url
+            });
             sqlx::query(
-                "INSERT INTO provider_keys (id, provider_id, name, api_key, is_enabled, priority, models_snapshot, manual_models, last_probe_at, probe_error) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO provider_keys (id, provider_id, name, api_key, protocol, base_url, is_enabled, priority, models_snapshot, manual_models, last_probe_at, probe_error) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             )
             .bind(&id)
             .bind(provider_id)
             .bind(input.name.trim())
             .bind(&input.api_key)
+            .bind(&protocol)
+            .bind(&base_url)
             .bind(input.is_enabled)
             .bind(input.priority)
             .bind(preserved.and_then(|k| k.models_snapshot.clone()))
@@ -1972,6 +1980,8 @@ impl StorageBootstrap for MysqlBootstrap {
         let pool = self.adapter.pool();
 
         sqlx::raw_sql(MYSQL_INIT_SQL).execute(pool).await?;
+        mysql_add_column_if_not_exists(pool, "provider_keys", "protocol", "VARCHAR(255)").await?;
+        mysql_add_column_if_not_exists(pool, "provider_keys", "base_url", "VARCHAR(512)").await?;
         // MySQL has no CREATE INDEX IF NOT EXISTS. Guard existing indexes so
         // upgrades (including creation of the ratings table) can finish.
         for (table, column, index) in [
@@ -2804,6 +2814,8 @@ CREATE TABLE IF NOT EXISTS provider_keys (
     provider_id VARCHAR(36) NOT NULL,
     name VARCHAR(255) NOT NULL,
     api_key TEXT NOT NULL,
+    protocol VARCHAR(255),
+    base_url VARCHAR(512),
     is_enabled TINYINT(1) NOT NULL DEFAULT 1,
     priority INTEGER NOT NULL DEFAULT 0,
     models_snapshot LONGTEXT,

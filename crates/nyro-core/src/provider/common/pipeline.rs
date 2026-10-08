@@ -270,9 +270,19 @@ fn is_ark_none_rejecting_model(body_model: &str) -> bool {
 ///   带日期等短横线后缀的变体（glm-5.3-flash-xxxx）一并覆盖。
 const THINKING_MANDATORY_MODELS: &[&str] = &["glm-5.3", "glm-5.3-flash"];
 
-fn is_thinking_mandatory_model(body_model: &str) -> bool {
-    let model = body_model.trim();
-    THINKING_MANDATORY_MODELS.iter().any(|prefix| {
+/// Claude 5.5 系列登记表：模型契约移除了经典 `thinking.type=enabled`
+/// 形态，仅接受省略 thinking（自适应）或 `between_tools`。sonnet 为实测
+/// 拒绝（请求 b0500316，UUAPI claude-sonnet-5-5，400 invalid_request_error：
+/// "requires adaptive thinking or thinking.type=between_tools"）；opus /
+/// haiku 按同代家族对称登记。边界规则同 THINKING_MANDATORY_MODELS：
+/// 前缀匹配且后续字符非字母数字，`claude-sonnet-5-5-high` 命中、
+/// `claude-sonnet-5-55` 不命中。
+const CLAUDE_55_ADAPTIVE_ONLY_MODELS: &[&str] =
+    &["claude-sonnet-5-5", "claude-opus-5-5", "claude-haiku-5-5"];
+
+fn matches_registered_model(model: &str, prefixes: &[&str]) -> bool {
+    let model = model.trim();
+    prefixes.iter().any(|prefix| {
         model.len() >= prefix.len()
             && model[..prefix.len()].eq_ignore_ascii_case(prefix)
             && model[prefix.len()..]
@@ -280,6 +290,14 @@ fn is_thinking_mandatory_model(body_model: &str) -> bool {
                 .next()
                 .is_none_or(|c| !c.is_ascii_alphanumeric())
     })
+}
+
+fn is_thinking_mandatory_model(body_model: &str) -> bool {
+    matches_registered_model(body_model, THINKING_MANDATORY_MODELS)
+}
+
+fn is_claude_55_model(body_model: &str) -> bool {
+    matches_registered_model(body_model, CLAUDE_55_ADAPTIVE_ONLY_MODELS)
 }
 
 pub(crate) fn apply_vendor_effort_policy(body: &mut Value, provider: &Provider) {
@@ -295,7 +313,15 @@ pub(crate) fn apply_vendor_effort_policy(body: &mut Value, provider: &Provider) 
     let body_model = body
         .get("model")
         .and_then(Value::as_str)
-        .unwrap_or_default();
+        .unwrap_or_default()
+        .to_string();
+    // Claude 5.5 系列：经典 thinking.type=enabled 被模型契约拒绝，按
+    // CLIProxyAPI 语义改写为 adaptive + output_config.effort（预算阈值
+    // 换算档位，display 保留）。模型级约束，与下方 vendor 方言链正交，
+    // 先于链执行以免被任何分支短路。
+    if is_claude_55_model(&body_model) {
+        super::effort_policy::rewrite_legacy_claude55_thinking(body);
+    }
     let is_grok = vendor_id.eq_ignore_ascii_case("xai")
         || body_model.trim().to_ascii_lowercase().starts_with("grok-");
     if is_grok {
@@ -306,7 +332,7 @@ pub(crate) fn apply_vendor_effort_policy(body: &mut Value, provider: &Provider) 
         // only the verified upstream model, including custom relay vendors.
         // Do not use the GLM clamp: it would narrow valid medium/xhigh tiers.
         super::effort_policy::clamp_off_effort_to_low(body);
-    } else if is_thinking_mandatory_model(body_model) {
+    } else if is_thinking_mandatory_model(&body_model) {
         // 模型本体不支持关闭思考（如 glm-5.3-flash）：off 意图钳为 low。
         // 必须排在 normalize 之前：misspelling disable 会先被归一成
         // none——对这类模型恰好是致死值。
@@ -314,7 +340,7 @@ pub(crate) fn apply_vendor_effort_policy(body: &mut Value, provider: &Provider) 
     } else if vendor_id.eq_ignore_ascii_case("opencode-go") {
         // OpenCode zen：思考型模型连 none 都拒（400 [1210]），off 钳制为 low。
         super::effort_policy::clamp_opencode_effort(body);
-    } else if is_volcengine_ark(provider, vendor_id) && is_ark_none_rejecting_model(body_model) {
+    } else if is_volcengine_ark(provider, vendor_id) && is_ark_none_rejecting_model(&body_model) {
         // 火山引擎 Ark glm-5.3 拒收 none（400 InvalidParameter，请求
         // 58e799fa）：off 意图钳制为 low。必须排在 normalize 之前，否则
         // misspelling disable 会先被归一成 none--恰好是致死值。
@@ -653,6 +679,14 @@ pub async fn passthrough_run(
         // 供应商 effort 方言（Responses 直通路径）：grok 对 max 是 400 硬拒
         // （线上事故 65fffc9a），none/off 同样拒绝——此前只挂在 IR 转码与
         // Chat 透传两路，Responses 直通漏挂。
+        apply_vendor_effort_policy(&mut raw_body, ctx.provider);
+    }
+    if ctx.protocol == crate::protocol::ids::ANTHROPIC_MESSAGES_2023_06_01 {
+        // Anthropic 直通路径：Claude 5.5 系列把经典 thinking.type=enabled
+        // 逐出契约（线上 400，请求 b0500316，UUAPI claude-sonnet-5-5），
+        // 剥除整字段退回自适应思考。模型已在上方改写为 actual_model，
+        // 门控按上游真实模型名判定；其余 vendor 方言分支对 Anthropic
+        // wire 形态（无 reasoning_effort 键）均为 no-op。
         apply_vendor_effort_policy(&mut raw_body, ctx.provider);
     }
 

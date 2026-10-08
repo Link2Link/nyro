@@ -347,7 +347,7 @@ impl SqliteProviderStore {
     }
 
     async fn load_keys(&self, provider_id: Option<&str>) -> anyhow::Result<Vec<ProviderKey>> {
-        let base = "SELECT id, provider_id, name, api_key, COALESCE(is_enabled, 1) AS is_enabled, COALESCE(priority, 0) AS priority, models_snapshot, manual_models, last_probe_at, probe_error, created_at, updated_at FROM provider_keys";
+        let base = "SELECT id, provider_id, name, api_key, protocol, base_url, COALESCE(is_enabled, 1) AS is_enabled, COALESCE(priority, 0) AS priority, models_snapshot, manual_models, last_probe_at, probe_error, created_at, updated_at FROM provider_keys";
         let keys = if let Some(provider_id) = provider_id {
             sqlx::query_as::<_, ProviderKey>(&format!(
                 "{base} WHERE provider_id = ? ORDER BY priority, created_at, id"
@@ -366,8 +366,8 @@ impl SqliteProviderStore {
     }
 
     /// Replace a provider's key pool. Rows whose `id` matches an existing key
-    /// keep their probe fields (snapshot/error/timestamps); the rest are
-    /// recreated fresh.
+    /// keep their probe fields only while their API key, protocol, and base
+    /// URL are unchanged.
     async fn replace_keys(
         tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
         provider_id: &str,
@@ -375,7 +375,7 @@ impl SqliteProviderStore {
     ) -> anyhow::Result<()> {
         let existing: HashMap<String, ProviderKey> =
             sqlx::query_as::<_, ProviderKey>(
-                "SELECT id, provider_id, name, api_key, COALESCE(is_enabled, 1) AS is_enabled, COALESCE(priority, 0) AS priority, models_snapshot, manual_models, last_probe_at, probe_error, created_at, updated_at FROM provider_keys WHERE provider_id = ?",
+                "SELECT id, provider_id, name, api_key, protocol, base_url, COALESCE(is_enabled, 1) AS is_enabled, COALESCE(priority, 0) AS priority, models_snapshot, manual_models, last_probe_at, probe_error, created_at, updated_at FROM provider_keys WHERE provider_id = ?",
             )
             .bind(provider_id)
             .fetch_all(&mut **tx)
@@ -388,19 +388,27 @@ impl SqliteProviderStore {
             .execute(&mut **tx)
             .await?;
         for input in inputs {
+            let protocol =
+                crate::db::models::normalize_provider_key_protocol(input.protocol.as_deref())?;
+            let base_url =
+                crate::db::models::normalize_provider_key_base_url(input.base_url.as_deref());
             let id = input
                 .id
                 .clone()
                 .filter(|id| existing.contains_key(id))
                 .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-            let preserved = existing.get(&id);
+            let preserved = existing.get(&id).filter(|key| {
+                key.api_key == input.api_key && key.protocol == protocol && key.base_url == base_url
+            });
             sqlx::query(
-                "INSERT INTO provider_keys (id, provider_id, name, api_key, is_enabled, priority, models_snapshot, manual_models, last_probe_at, probe_error) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO provider_keys (id, provider_id, name, api_key, protocol, base_url, is_enabled, priority, models_snapshot, manual_models, last_probe_at, probe_error) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             )
             .bind(&id)
             .bind(provider_id)
             .bind(input.name.trim())
             .bind(&input.api_key)
+            .bind(&protocol)
+            .bind(&base_url)
             .bind(input.is_enabled)
             .bind(input.priority)
             .bind(preserved.and_then(|k| k.models_snapshot.clone()))

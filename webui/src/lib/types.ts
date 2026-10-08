@@ -510,6 +510,10 @@ export interface ProviderKey {
   provider_id: string;
   name: string;
   api_key: string;
+  /** Canonical ProviderProtocol; null/omitted inherits the provider's default/adaptive protocol. */
+  protocol?: string | null;
+  /** Per-candidate upstream API address; null/omitted inherits the provider's base URL. */
+  base_url?: string | null;
   is_enabled: boolean;
   priority: number;
   /** JSON 数组字符串：探测发现的模型快照。 */
@@ -526,6 +530,10 @@ export interface UpsertProviderKey {
   id?: string | null;
   name: string;
   api_key: string;
+  /** Canonical ProviderProtocol; null/omitted inherits the provider's default/adaptive protocol. */
+  protocol?: string | null;
+  /** Per-candidate upstream API address; null/omitted inherits the provider's base URL. */
+  base_url?: string | null;
   is_enabled?: boolean;
   priority?: number;
   manual_models?: string | null;
