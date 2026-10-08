@@ -36,11 +36,10 @@ const SESSION_DOMAIN: &[u8] = b"nyro-opencode-session-v1";
 
 /// True when the target is the OpenCode Go surface.
 ///
-/// `vendor` is optional because callers that sit below provider identity (the
-/// admin model probe builds its requests from a resolved base URL) can only
-/// match on the URL; the base URL is the most stable cross-configuration
-/// signal either way, mirroring the Volcengine Ark detection in the shared
-/// pipeline.
+/// `vendor` is optional for callers that sit below provider identity and can
+/// only match on the URL. Provider-aware callers must pass the vendor (or use
+/// [`is_opencode_go`]) so custom proxy domains retain the Go identity. The URL
+/// check remains available for existing URL-only callers.
 pub(crate) fn is_opencode_go_target(vendor: Option<&str>, base_url: &str) -> bool {
     let vendor = vendor.map(str::trim).unwrap_or_default();
     vendor.eq_ignore_ascii_case("opencode-go") || base_url.contains("opencode.ai/zen/go")
@@ -108,7 +107,20 @@ pub(crate) fn apply_egress_headers(headers: &mut HeaderMap, provider: &Provider,
     insert_session_header(headers, conversation_session_id(req));
 }
 
-/// Probe variant: match on the resolved base URL and seed on `model`.
+/// Provider-aware probe variant: vendor identity also covers custom proxy URLs.
+/// Apply this to runtime headers before request building; supplied values win.
+pub(crate) fn apply_provider_probe_session_header(
+    headers: &mut HeaderMap,
+    provider: &Provider,
+    model: &str,
+) {
+    if !is_opencode_go(provider) || headers.contains_key(SESSION_HEADER) {
+        return;
+    }
+    insert_session_header(headers, seeded_session_id(&format!("admin-probe:{model}")));
+}
+
+/// URL-only variant retained for callers without provider identity.
 pub(crate) fn apply_probe_session_header(headers: &mut HeaderMap, base_url: &str, model: &str) {
     if !is_opencode_go_target(None, base_url) || headers.contains_key(SESSION_HEADER) {
         return;
@@ -278,6 +290,33 @@ mod tests {
 
         let mut unrelated = HeaderMap::new();
         apply_probe_session_header(&mut unrelated, "https://api.openai.com/v1", "gpt-5");
+        assert!(unrelated.is_empty());
+    }
+
+    #[test]
+    fn provider_probe_session_supports_custom_urls_and_preserves_supplied_values() {
+        let go = provider("opencode-go", "https://custom-proxy.example");
+        let mut headers = HeaderMap::new();
+        apply_provider_probe_session_header(&mut headers, &go, "kimi-k3");
+        assert_eq!(
+            session_of(&headers),
+            seeded_session_id("admin-probe:kimi-k3")
+        );
+
+        let mut url_headers = HeaderMap::new();
+        apply_probe_session_header(&mut url_headers, "https://opencode.ai/zen/go", "kimi-k3");
+        assert_eq!(session_of(&headers), session_of(&url_headers));
+
+        headers.insert(SESSION_HEADER, "runtime-owned".parse().unwrap());
+        apply_provider_probe_session_header(&mut headers, &go, "kimi-k3");
+        assert_eq!(session_of(&headers), "runtime-owned");
+
+        let mut unrelated = HeaderMap::new();
+        apply_provider_probe_session_header(
+            &mut unrelated,
+            &provider("custom", "https://custom-proxy.example"),
+            "kimi-k3",
+        );
         assert!(unrelated.is_empty());
     }
 

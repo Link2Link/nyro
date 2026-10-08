@@ -209,6 +209,39 @@ pub fn negotiate(
     })
 }
 
+/// Build a plan for a model-required endpoint already validated by the vendor
+/// resolver. Unlike `negotiate`'s soft route preference, this never falls back.
+/// Keeping the selected endpoint intact makes dispatch and probes agree on the
+/// exact endpoint, URL and authentication scheme.
+pub(crate) fn negotiate_required(
+    ingress: ProtocolId,
+    endpoint: crate::protocol::ProviderProtocolTarget,
+    ctx: &mut RequestContext,
+) -> Result<ProtocolPlan, GatewayError> {
+    let egress = endpoint.protocol;
+    if ingress != egress && (ingress.name == "embeddings" || egress.name == "embeddings") {
+        return Err(GatewayError::ProtocolUnsupported {
+            ingress: ingress.to_string(),
+            egress: egress.to_string(),
+        });
+    }
+    ctx.egress_protocol = Some(egress);
+    ctx.trace("negotiate", format!("model_required exact: {egress}"));
+    Ok(ProtocolPlan {
+        ingress,
+        egress,
+        mode: if ingress == egress {
+            ProtocolMode::Native
+        } else {
+            ProtocolMode::Transform
+        },
+        base_url: endpoint.base_url,
+        endpoint_id: endpoint.record_id,
+        auth_scheme: endpoint.auth_scheme,
+        needs_conversion: ingress != egress,
+    })
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -296,6 +329,32 @@ mod tests {
         assert_eq!(plan.base_url, "https://embeddings.example/v1");
         assert_eq!(plan.endpoint_id.as_deref(), Some("embeddings-endpoint"));
         assert_eq!(plan.auth_scheme, "bearer");
+    }
+
+    #[test]
+    fn required_plan_preserves_endpoint_and_rejects_embeddings_conversion() {
+        let endpoint = crate::protocol::ProviderProtocolTarget {
+            record_id: Some("messages".into()),
+            protocol: ANTHROPIC_MESSAGES_2023_06_01,
+            base_url: "https://example.test/go".into(),
+            auth_scheme: "x-api-key".into(),
+        };
+        let mut c = ctx();
+        for (ingress, mode) in [
+            (ANTHROPIC_MESSAGES_2023_06_01, ProtocolMode::Native),
+            (
+                OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1,
+                ProtocolMode::Transform,
+            ),
+        ] {
+            let plan = negotiate_required(ingress, endpoint.clone(), &mut c).unwrap();
+            assert_eq!(plan.egress, endpoint.protocol);
+            assert_eq!(plan.mode, mode);
+            assert_eq!(plan.endpoint_id, endpoint.record_id);
+            assert_eq!(plan.auth_scheme, "x-api-key");
+            assert_eq!(plan.base_url, endpoint.base_url);
+        }
+        assert!(negotiate_required(OPENAI_COMPATIBLE_EMBEDDINGS_V1, endpoint, &mut c).is_err());
     }
 
     #[test]

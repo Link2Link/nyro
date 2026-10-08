@@ -9,32 +9,18 @@
 //! `@ai-sdk/openai-compatible` → `/v1/chat/completions`, `@ai-sdk/anthropic`
 //! → `/v1/messages`).
 //!
-//! Rules, in priority order:
-//!
-//! 1. **The model's pinned protocol always wins** — a Claude Code (anthropic)
-//!    or Codex (responses) caller asking for `kimi-k3` is transcoded onto
-//!    `/v1/chat/completions`, and a chat caller asking for `grok-4.6` is
-//!    transcoded onto `/v1/responses`. Matching ingress stays native inside
-//!    `negotiate()`; this module still returns the pin so adaptive providers
-//!    never fall through to "use the client's protocol".
-//! 2. **A model that is not listed is assumed chat-only** — `/v1/chat/
-//!    completions` is the default endpoint, so this default keeps unknown
-//!    models working for the common case instead of silently sending them to
-//!    an endpoint that does not serve them.
-//! 3. **The preference is only honoured when the provider declares the
-//!    endpoint** — a provider still configured as fixed chat-only degrades to
-//!    today's behaviour. There is no endpoint-level fallback: once chosen,
-//!    upstream errors surface as-is.
-//!
-//! Matching is exact (`trim` + case-insensitive) against the *upstream* model
-//! name, so a future variant of a listed family is never hijacked by a prefix
-//! rule; add it explicitly when it appears.
+//! Known upstream model IDs require their exact protocol. Unknown models and
+//! missing/disabled endpoints fail locally rather than falling back to ingress
+//! or chat. Dispatch, probes and direct helpers share [`resolve_endpoint`].
+//! Matching is trimmed, case-insensitive and exact; never infer a family prefix.
 
 use crate::db::models::Provider;
+use crate::error::GatewayError;
 use crate::protocol::ids::{
     ANTHROPIC_MESSAGES_2023_06_01, OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1, OPENAI_RESPONSES_V1,
     ProtocolId,
 };
+use crate::protocol::{ProviderProtocolTarget, ProviderProtocols};
 
 use super::session::is_opencode_go;
 
@@ -43,20 +29,19 @@ const RESPONSES: ProtocolId = OPENAI_RESPONSES_V1;
 const MESSAGES: ProtocolId = ANTHROPIC_MESSAGES_2023_06_01;
 
 /// OpenCode Go catalog: each listed model is served on exactly one endpoint.
-/// Everything else — including models added upstream after this table was
-/// written — is treated as chat-only by [`primary_protocol`].
+/// Current 31-model catalog. Unknown IDs require a catalog update; no guessing.
 const MODEL_PROTOCOL: &[(&str, ProtocolId)] = &[
     // Responses only (`@ai-sdk/openai` → `/v1/responses`).
+    ("gpt-6-luna", RESPONSES),
     ("gpt-5.6-luna", RESPONSES),
+    ("grok-4.7", RESPONSES),
     ("grok-4.6", RESPONSES),
     ("muse-spark-1.2-contributor", RESPONSES),
     ("muse-spark-1.3-contributor", RESPONSES),
     // Anthropic messages only (`@ai-sdk/anthropic` → `/v1/messages`).
-    ("minimax-m2.5", MESSAGES),
+    ("claude-haiku-5-5", MESSAGES),
     ("minimax-m2.7", MESSAGES),
     ("minimax-m3", MESSAGES),
-    ("qwen3.6-plus", MESSAGES),
-    ("qwen3.7-max", MESSAGES),
     ("qwen3.7-plus", MESSAGES),
     ("qwen3.8-flash", MESSAGES),
     ("qwen3.8-max", MESSAGES),
@@ -65,7 +50,6 @@ const MODEL_PROTOCOL: &[(&str, ProtocolId)] = &[
     ("deepseek-v4-flash-vision-exp", CHAT),
     ("deepseek-v4-pro", CHAT),
     ("deepseek-v4.1-flash", CHAT),
-    ("glm-5.1", CHAT),
     ("glm-5.2", CHAT),
     ("glm-5.3", CHAT),
     ("glm-5.3-flash", CHAT),
@@ -77,13 +61,26 @@ const MODEL_PROTOCOL: &[(&str, ProtocolId)] = &[
     ("longcat-2.0", CHAT),
     ("mimo-v2.5", CHAT),
     ("mimo-v2.5-pro", CHAT),
+    ("mimo-v2.6-flash", CHAT),
+    ("mimo-v2.6-pro", CHAT),
+    ("space-bunny", CHAT),
+    ("longcat-2.5-preview-free", CHAT),
+];
+
+/// Previously supported IDs absent from the current catalog are not assumed
+/// unavailable. Keep their known wire protocols for existing configurations.
+const LEGACY_MODEL_PROTOCOL: &[(&str, ProtocolId)] = &[
+    ("glm-5.1", CHAT),
+    ("minimax-m2.5", MESSAGES),
+    ("qwen3.6-plus", MESSAGES),
+    ("qwen3.7-max", MESSAGES),
 ];
 
 /// Models the upstream still advertises in `GET /v1/models` but does not serve
 /// on this plan: every endpoint answers `Model is unavailable` (HTTP 400) or
 /// errors out. They are filtered out of the provider's model list so the route
-/// target pickers never offer them; typing the name by hand still reaches the
-/// upstream, so a model that comes back to life is not blocked by stale code.
+/// target pickers never offer them. Availability filtering is independent of
+/// protocol resolution: manual requests still need a known protocol mapping.
 ///
 /// Revisit when Go re-enables any of them (`glm-5`, `hy3-preview`, `qwen3.5-plus`
 /// and `kimi-k2.5` are plausible returnees as newer siblings ship).
@@ -97,48 +94,64 @@ const UNAVAILABLE_MODELS: &[&str] = &[
     "qwen3.5-plus",
 ];
 
-fn listed_protocol(model: &str) -> Option<ProtocolId> {
+/// Exact protocol lookup, independent of availability filtering.
+pub(crate) fn primary_protocol(model: &str) -> Option<ProtocolId> {
     let model = normalize(model);
     MODEL_PROTOCOL
         .iter()
+        .chain(LEGACY_MODEL_PROTOCOL)
         .find(|(listed, _)| *listed == model)
         .map(|(_, protocol)| *protocol)
 }
 
-/// True when the Go plan serves `model` on `protocol`.
-///
-/// Unlisted models are chat-only (see the module docs).
-#[cfg(test)]
-pub(crate) fn supports(model: &str, protocol: ProtocolId) -> bool {
-    if normalize(model).is_empty() {
-        return false;
-    }
-    listed_protocol(model).unwrap_or(CHAT) == protocol
-}
-
-/// The endpoint a request for `model` must be transcoded onto: the catalog
-/// pin when listed, otherwise chat.
-pub(crate) fn primary_protocol(model: &str) -> ProtocolId {
-    listed_protocol(model).unwrap_or(CHAT)
-}
-
-/// Egress-protocol preference for an OpenCode Go request.
-///
-/// `None` means "no opinion": the caller is not an OpenCode Go provider.
-/// `Some(protocol)` asks `negotiate()` for that endpoint even when it already
-/// matches the client's protocol, so adaptive providers never fall through to
-/// ingress-driven resolution. The preference is only honoured when the
-/// provider actually declares the endpoint, so a provider still configured as
-/// fixed chat-only degrades to today's behaviour.
-pub(crate) fn preferred_egress(
+/// Resolve the required endpoint once for every OpenCode Go caller.
+/// `None` is reserved for other vendors, whose existing negotiation is unchanged.
+/// No credentials are copied into the routing result; callers resolve them via
+/// `record_id` and their normal runtime/key-pool policy.
+pub(crate) fn resolve_endpoint(
     provider: &Provider,
     actual_model: &str,
-    _ingress: ProtocolId,
-) -> Option<ProtocolId> {
+) -> Result<Option<ProviderProtocolTarget>, GatewayError> {
     if !is_opencode_go(provider) {
-        return None;
+        return Ok(None);
     }
-    Some(primary_protocol(actual_model))
+    let unavailable = |reason| GatewayError::ProviderUnavailable {
+        provider: provider.id.clone(),
+        reason,
+    };
+    let required = primary_protocol(actual_model).ok_or_else(|| unavailable(format!(
+        "OpenCode Go protocol is not configured for model '{actual_model}'; update the model catalog"
+    )))?;
+    let declarations = ProviderProtocols::from_provider(provider);
+    // Fixed providers enumerate operations in their suite internally, but a
+    // fixed embeddings endpoint is not a declaration of Chat support.
+    if !provider.is_adaptive() && declarations.default != required {
+        return Err(unavailable(format!(
+            "OpenCode Go model '{actual_model}' requires {required}; configure and enable that protocol endpoint"
+        )));
+    }
+    let mut endpoint = declarations.get(required).cloned().ok_or_else(|| unavailable(format!(
+        "OpenCode Go model '{actual_model}' requires {required}; configure and enable that protocol endpoint"
+    )))?;
+    if endpoint.base_url.trim().is_empty() {
+        return Err(unavailable(format!(
+            "OpenCode Go endpoint {required} has an empty base URL"
+        )));
+    }
+    if matches!(endpoint.auth_scheme.trim(), "" | "auto") {
+        endpoint.auth_scheme = if required == MESSAGES {
+            "x-api-key"
+        } else {
+            "bearer"
+        }
+        .into();
+    }
+    Ok(Some(endpoint))
+}
+
+#[cfg(test)]
+fn supports(model: &str, protocol: ProtocolId) -> bool {
+    primary_protocol(model) == Some(protocol)
 }
 
 /// Drop models the Go plan does not serve from a discovered model list.
@@ -207,7 +220,7 @@ mod tests {
         for (model, pinned) in MODEL_PROTOCOL {
             assert_eq!(
                 primary_protocol(model),
-                *pinned,
+                Some(*pinned),
                 "{model} must pin to {pinned}"
             );
             assert!(
@@ -226,7 +239,7 @@ mod tests {
         }
         assert_eq!(
             MODEL_PROTOCOL.len(),
-            28,
+            31,
             "keep the OpenCode Go catalog exhaustive"
         );
     }
@@ -258,11 +271,11 @@ mod tests {
     }
 
     #[test]
-    fn unlisted_models_are_chat_only() {
-        assert!(supports("glm-6-turbo", CHAT));
+    fn unlisted_models_have_no_assumed_protocol() {
+        assert!(!supports("glm-6-turbo", CHAT));
         assert!(!supports("glm-6-turbo", RESPONSES));
         assert!(!supports("glm-6-turbo", MESSAGES));
-        assert!(supports("grok-4.6-preview", CHAT));
+        assert!(!supports("grok-4.6-preview", CHAT));
         assert!(!supports("grok-4.6-preview", RESPONSES));
         assert!(!supports("", CHAT));
     }
@@ -271,66 +284,88 @@ mod tests {
     fn matching_is_trimmed_case_insensitive_and_exact() {
         assert!(supports("  Grok-4.6 ", RESPONSES));
         assert!(!supports("grok-4.6-preview", RESPONSES));
-        assert!(supports("grok-4.6-preview", CHAT));
-        assert_eq!(primary_protocol("MINIMAX-M2.7"), MESSAGES);
-        assert_eq!(primary_protocol("QWEN3.8-MAX"), MESSAGES);
-        assert_eq!(primary_protocol("  Kimi-K3  "), CHAT);
+        assert!(!supports("grok-4.6-preview", CHAT));
+        assert_eq!(primary_protocol("MINIMAX-M2.7"), Some(MESSAGES));
+        assert_eq!(primary_protocol("QWEN3.8-MAX"), Some(MESSAGES));
+        assert_eq!(primary_protocol("  Kimi-K3  "), Some(CHAT));
     }
 
     #[test]
     fn primary_endpoint_follows_the_catalog_pin() {
-        assert_eq!(primary_protocol("glm-5.3"), CHAT);
-        assert_eq!(primary_protocol("glm-5.3-flash"), CHAT);
-        assert_eq!(primary_protocol("kimi-k3"), CHAT);
-        assert_eq!(primary_protocol("deepseek-v4-pro"), CHAT);
-        assert_eq!(primary_protocol("minimax-m2.7"), MESSAGES);
-        assert_eq!(primary_protocol("minimax-m3"), MESSAGES);
-        assert_eq!(primary_protocol("qwen3.8-max"), MESSAGES);
-        assert_eq!(primary_protocol("grok-4.6"), RESPONSES);
-        assert_eq!(primary_protocol("gpt-5.6-luna"), RESPONSES);
-        assert_eq!(primary_protocol("muse-spark-1.3-contributor"), RESPONSES);
+        assert_eq!(primary_protocol("glm-5.3"), Some(CHAT));
+        assert_eq!(primary_protocol("glm-5.3-flash"), Some(CHAT));
+        assert_eq!(primary_protocol("kimi-k3"), Some(CHAT));
+        assert_eq!(primary_protocol("deepseek-v4-pro"), Some(CHAT));
+        assert_eq!(primary_protocol("minimax-m2.7"), Some(MESSAGES));
+        assert_eq!(primary_protocol("minimax-m3"), Some(MESSAGES));
+        assert_eq!(primary_protocol("qwen3.8-max"), Some(MESSAGES));
+        assert_eq!(primary_protocol("grok-4.6"), Some(RESPONSES));
+        assert_eq!(primary_protocol("gpt-5.6-luna"), Some(RESPONSES));
+        assert_eq!(
+            primary_protocol("muse-spark-1.3-contributor"),
+            Some(RESPONSES)
+        );
     }
 
     #[test]
-    fn preferred_egress_always_returns_the_pin_on_opencode_go() {
+    fn required_endpoint_rejects_missing_and_unknown_models() {
         let go = go_provider();
-        // Matching ingress still returns the pin (negotiate stays Native).
-        assert_eq!(preferred_egress(&go, "kimi-k3", CHAT), Some(CHAT));
+        for model in ["grok-4.7", "claude-haiku-5-5", "kimi-k3", "unknown"] {
+            assert!(resolve_endpoint(&go, model).is_err(), "{model}");
+        }
+        let fixed = provider("opencode-go", "https://opencode.ai/zen/go", "fixed");
         assert_eq!(
-            preferred_egress(&go, "grok-4.6", RESPONSES),
-            Some(RESPONSES)
+            resolve_endpoint(&fixed, "kimi-k3")
+                .unwrap()
+                .unwrap()
+                .protocol,
+            CHAT
         );
-        assert_eq!(
-            preferred_egress(&go, "minimax-m3", MESSAGES),
-            Some(MESSAGES)
-        );
-        assert_eq!(
-            preferred_egress(&go, "qwen3.8-max", MESSAGES),
-            Some(MESSAGES)
-        );
-        // Cross-protocol callers are forced onto the pin, not the client wire.
-        assert_eq!(preferred_egress(&go, "kimi-k3", MESSAGES), Some(CHAT));
-        assert_eq!(
-            preferred_egress(&go, "deepseek-v4-pro", RESPONSES),
-            Some(CHAT)
-        );
-        assert_eq!(preferred_egress(&go, "glm-5.3", MESSAGES), Some(CHAT));
-        assert_eq!(preferred_egress(&go, "longcat-2.0", RESPONSES), Some(CHAT));
-        assert_eq!(preferred_egress(&go, "grok-4.6", CHAT), Some(RESPONSES));
-        assert_eq!(
-            preferred_egress(&go, "gpt-5.6-luna", MESSAGES),
-            Some(RESPONSES)
-        );
-        assert_eq!(preferred_egress(&go, "minimax-m3", CHAT), Some(MESSAGES));
-        assert_eq!(preferred_egress(&go, "qwen3.8-max", CHAT), Some(MESSAGES));
-        // Unlisted still default to chat.
-        assert_eq!(preferred_egress(&go, "glm-6-turbo", MESSAGES), Some(CHAT));
+        assert!(resolve_endpoint(&fixed, "grok-4.7").is_err());
+        assert!(resolve_endpoint(&fixed, "space-bunny-free").is_err());
+    }
+
+    #[test]
+    fn fixed_embeddings_is_not_a_chat_declaration() {
+        let mut go = provider("opencode-go", "https://opencode.ai/zen/go", "fixed");
+        go.protocol = crate::protocol::ids::OPENAI_COMPATIBLE_EMBEDDINGS_V1.to_string();
+        assert!(resolve_endpoint(&go, "kimi-k3").is_err());
     }
 
     #[test]
     fn non_opencode_provider_has_no_opinion() {
         let other = provider("openai", "https://api.openai.com", "fixed");
-        assert_eq!(preferred_egress(&other, "grok-4.6", CHAT), None);
+        assert!(resolve_endpoint(&other, "unknown").unwrap().is_none());
+    }
+
+    #[test]
+    fn current_catalog_is_unique_and_legacy_rules_are_separate() {
+        let ids: std::collections::HashSet<_> = MODEL_PROTOCOL.iter().map(|(id, _)| id).collect();
+        assert_eq!(ids.len(), 31);
+        for (protocol, count) in [(RESPONSES, 6), (MESSAGES, 6), (CHAT, 19)] {
+            assert_eq!(
+                MODEL_PROTOCOL
+                    .iter()
+                    .filter(|(_, p)| *p == protocol)
+                    .count(),
+                count
+            );
+        }
+        for (id, protocol) in LEGACY_MODEL_PROTOCOL {
+            assert!(!ids.contains(id));
+            assert_eq!(primary_protocol(id), Some(*protocol));
+        }
+        assert_eq!(primary_protocol("gpt-6-luna"), Some(RESPONSES));
+        assert_eq!(primary_protocol("grok-4.7"), Some(RESPONSES));
+        assert_eq!(primary_protocol("claude-haiku-5-5"), Some(MESSAGES));
+        for id in [
+            "mimo-v2.6-flash",
+            "mimo-v2.6-pro",
+            "space-bunny",
+            "longcat-2.5-preview-free",
+        ] {
+            assert_eq!(primary_protocol(id), Some(CHAT));
+        }
     }
 
     #[test]

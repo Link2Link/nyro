@@ -714,26 +714,39 @@ async fn dispatch_pipeline_inner(
 
         let mut request_for_target = request.clone();
 
-        // Resolve egress protocol + base URL via negotiate().
-        // The request-scoped `ctx` is threaded end-to-end from the ingress
-        // middleware (no per-target throwaway context); negotiate records its
-        // trace/egress decision onto it.
-        //
-        // Vendor-scoped egress preference: OpenCode Go pins each model to one
-        // endpoint (`opencode_go::routing`). The preference is always the pin,
-        // even when it already matches ingress (negotiate stays Native). `None`
-        // keeps the default ingress-driven resolution; an unsupported
-        // preference falls through negotiate's own tiers, so providers that do
-        // not declare the endpoint are unaffected.
-        let provider_protocols = ProviderProtocols::from_provider(&provider);
-        let egress_preference = crate::provider::opencode_go::routing::preferred_egress(
-            &provider,
-            &actual_model,
-            ingress,
-        );
-        let plan = match negotiate(ingress, egress_preference, Some(&provider_protocols), ctx) {
+        // OpenCode Go models REQUIRE their exact endpoint. Resolve it through
+        // the same function as probes; never downgrade a missing pin to ingress
+        // or the provider default. Other vendors retain normal negotiation.
+        let resolved_plan =
+            crate::provider::opencode_go::routing::resolve_endpoint(&provider, &actual_model)
+                .and_then(|required| match required {
+                    Some(endpoint) => {
+                        ctx.trace(
+                            "model_route",
+                            format!(
+                                "provider={} model={} source=opencode-go-catalog protocol={}",
+                                provider.id, actual_model, endpoint.protocol,
+                            ),
+                        );
+                        crate::proxy::planner::negotiator::negotiate_required(
+                            ingress, endpoint, ctx,
+                        )
+                    }
+                    None => {
+                        let provider_protocols = ProviderProtocols::from_provider(&provider);
+                        negotiate(ingress, None, Some(&provider_protocols), ctx)
+                    }
+                });
+        let plan = match resolved_plan {
             Ok(p) => p,
             Err(e) => {
+                ctx.trace(
+                    "model_route",
+                    format!(
+                        "provider={} model={} rejected: {}",
+                        provider.id, actual_model, e
+                    ),
+                );
                 last_response = Some(e.render(None));
                 skip_key_siblings!();
                 continue;

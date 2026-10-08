@@ -29,26 +29,38 @@ async fn spawn_helper(caption: Option<&'static str>) -> (String, Arc<Mutex<Vec<V
     let captured = calls.clone();
     let app = Router::new().route(
         "/v1/chat/completions",
-        post(move |Json(body): Json<Value>| {
-            let captured = captured.clone();
-            async move {
-                captured.lock().unwrap().push(body);
-                match caption {
-                    Some(caption) => Json(json!({
-                        "choices": [{
-                            "message": { "role": "assistant", "content": caption }
-                        }],
-                        "usage": { "total_tokens": 42 }
-                    }))
-                    .into_response(),
-                    None => (
-                        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(json!({ "error": { "message": "helper exploded" } })),
-                    )
+        post(
+            move |headers: axum::http::HeaderMap,
+                  uri: axum::http::Uri,
+                  Json(mut body): Json<Value>| {
+                let captured = captured.clone();
+                async move {
+                    body["_captured_query"] = json!(uri.query());
+                    body["_captured_authorization"] =
+                        json!(headers.get("authorization").and_then(|v| v.to_str().ok()));
+                    body["_captured_session"] = json!(
+                        headers
+                            .get("x-opencode-session")
+                            .and_then(|v| v.to_str().ok())
+                    );
+                    captured.lock().unwrap().push(body);
+                    match caption {
+                        Some(caption) => Json(json!({
+                            "choices": [{
+                                "message": { "role": "assistant", "content": caption }
+                            }],
+                            "usage": { "total_tokens": 42 }
+                        }))
                         .into_response(),
+                        None => (
+                            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(json!({ "error": { "message": "helper exploded" } })),
+                        )
+                            .into_response(),
+                    }
                 }
-            }
-        }),
+            },
+        ),
     );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -207,6 +219,76 @@ async fn helper_captions_and_replaces_image_blocks() {
     let prompt = call["messages"][0]["content"][1]["text"].as_str().unwrap();
     assert!(prompt.contains("what is in the picture?"));
     assert!(prompt.contains("visual information extractor"));
+}
+
+#[tokio::test]
+async fn opencode_helper_never_sends_unknown_or_non_chat_models_to_chat() {
+    let (base_url, calls) = spawn_helper(Some("must not be called")).await;
+    for helper in ["grok-4.7", "claude-haiku-5-5", "unknown-model"] {
+        let mut provider = provider_row("go", &base_url);
+        provider.vendor = Some("opencode-go".into());
+        let mut model = shim_model("go");
+        model.vision_shim = Some(json!({"helper_model": helper}).to_string());
+        let gw = gateway_with(vec![provider], vec![model]).await;
+        let mut request = image_request("glm-5.3", "aGVsbG8=", "describe");
+        let stats = vision_shim::apply(&gw, &mut request).await.unwrap();
+        assert_eq!(stats.captioned, 0, "{helper}");
+    }
+    assert!(calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn opencode_chat_helper_uses_resolved_endpoint_url_and_key() {
+    for scheme in ["bearer", "query"] {
+        let (base_url, calls) = spawn_helper(Some("resolved endpoint caption")).await;
+        let mut provider = provider_row("go", "http://127.0.0.1:1");
+        provider.vendor = Some("opencode-go".into());
+        provider.protocol_mode = "adaptive".into();
+        // The provider default must not hide a Chat-capable helper endpoint.
+        provider.protocol = "anthropic-messages".into();
+        provider.protocol_endpoints = vec![nyro_core::db::models::ProviderProtocolEndpoint {
+            id: "chat".into(),
+            provider_id: "go".into(),
+            protocol: nyro_core::protocol::ids::OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1.to_string(),
+            base_url,
+            api_key: "endpoint-key".into(),
+            auth_scheme: scheme.into(),
+            is_enabled: true,
+            priority: 0,
+            test_status: "untested".into(),
+            test_error: None,
+            tested_at: None,
+            created_at: String::new(),
+            updated_at: String::new(),
+        }];
+        let gw = gateway_with(vec![provider], vec![shim_model("go")]).await;
+        // Separate image digests avoid the process-wide caption cache hiding
+        // the second authentication request.
+        let data = if scheme == "query" {
+            "cXVlcnk="
+        } else {
+            "YmVhcmVy"
+        };
+        let mut request = image_request("glm-5.3", data, "describe");
+        let stats = vision_shim::apply(&gw, &mut request).await.unwrap();
+        assert_eq!(stats.captioned, 1, "{}", user_text(&request));
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        if scheme == "query" {
+            assert_eq!(calls[0]["_captured_query"], "key=endpoint-key");
+            assert!(calls[0]["_captured_authorization"].is_null());
+        } else {
+            assert_eq!(calls[0]["_captured_authorization"], "Bearer endpoint-key");
+            assert!(calls[0]["_captured_query"].is_null());
+        }
+        assert!(
+            calls[0]["_captured_session"]
+                .as_str()
+                .unwrap()
+                .starts_with("nyro-")
+        );
+        assert!(user_text(&request).contains("resolved endpoint caption"));
+    }
 }
 
 #[tokio::test]

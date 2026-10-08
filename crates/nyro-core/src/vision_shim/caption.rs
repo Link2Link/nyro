@@ -113,7 +113,27 @@ async fn caption_image(
         Ok(url) => url,
         Err(err) => return CaptionCall::failed(err),
     };
-    let endpoint = openai_build_url(&provider.base_url, "/v1/chat/completions");
+    // This helper only has a Chat codec. Do not silently send a Responses- or
+    // Messages-only Go model to Chat; fail this helper before network I/O so
+    // the configured helper failover can try a compatible backend.
+    let go_endpoint = match crate::provider::opencode_go::routing::resolve_endpoint(provider, model)
+    {
+        Ok(endpoint) => endpoint,
+        Err(error) => return CaptionCall::failed(error.to_string()),
+    };
+    if let Some(endpoint) = &go_endpoint {
+        if endpoint.protocol != crate::protocol::ids::OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1 {
+            return CaptionCall::failed(format!(
+                "vision helper supports Chat Completions only; model '{model}' requires {}",
+                endpoint.protocol,
+            ));
+        }
+    }
+    let base_url = go_endpoint
+        .as_ref()
+        .map(|endpoint| endpoint.base_url.as_str())
+        .unwrap_or(&provider.base_url);
+    let endpoint = openai_build_url(base_url, "/v1/chat/completions");
     let client = match gw.http_client_for_provider(provider.use_proxy).await {
         Ok(client) => client,
         Err(err) => return CaptionCall::failed(format!("helper http client: {err}")),
@@ -137,9 +157,39 @@ async fn caption_image(
     }
 
     let mut builder = client.post(&endpoint).timeout(timeout);
-    let api_key = provider.api_key.trim();
-    if !api_key.is_empty() {
-        builder = builder.bearer_auth(api_key);
+    let mut api_key = provider.api_key.as_str();
+    if let Some(endpoint) = &go_endpoint {
+        if let Some(id) = &endpoint.record_id {
+            api_key = provider
+                .protocol_endpoints
+                .iter()
+                .find(|row| row.id == *id)
+                .map(|row| row.api_key.as_str())
+                .unwrap_or_default();
+        }
+        if provider.has_key_pool() && provider.effective_auth_mode() != "oauth" {
+            let enabled = provider.enabled_keys();
+            let eligible = crate::provider::key_pool::eligible_keys(&enabled, model);
+            let Some(key) = eligible.first() else {
+                return CaptionCall::failed(format!(
+                    "no provider key in pool serves model '{model}'"
+                ));
+            };
+            api_key = &key.api_key;
+        }
+        match endpoint.auth_scheme.as_str() {
+            "none" => {}
+            "x-api-key" => builder = builder.header("x-api-key", api_key.trim()),
+            "query" => builder = builder.query(&[("key", api_key.trim())]),
+            "bearer" | "auto" | "" => builder = builder.bearer_auth(api_key.trim()),
+            other => {
+                return CaptionCall::failed(format!(
+                    "unsupported vision helper auth scheme: {other}"
+                ));
+            }
+        }
+    } else if !api_key.trim().is_empty() {
+        builder = builder.bearer_auth(api_key.trim());
     }
     // This is a direct provider call (no dispatcher), so the channel-scoped
     // egress headers have to be added here: OpenCode Go rejects requests

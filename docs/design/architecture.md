@@ -614,15 +614,17 @@ Google 订阅共两条 channel，均经 Code Assist 内部 API（`cloudcode-pa.g
 
 - **会话标识**（`provider/opencode_go/session.rs`）：上游对**每个请求**强制要求会话标识，缺失即 400 `{"type":"error","error":{"type":"MissingSessionID",…}}`（官方要求「为每个会话发送稳定的 `x-opencode-session`，以便优化路由与提示缓存」，opencode.ai/docs/go#where-can-i-use-it）。id 由会话首轮指纹（`system` + 首条 user 文本）派生成 `nyro-<16 字节 hex>`——会话增长时首轮不变，故同一会话各轮共享同一 id；无 user 文本（如仅工具结果的续轮）时回退随机 id。客户端自带 `x-opencode-session` 时**永不覆盖**。
 - **会话标识注入点**：dispatcher 出站 header 汇合处（`proxy/dispatcher/mod.rs`，位于 passthrough / IR 编码 / raw-wire compat 三条构建路径之后、forwarded client headers 合并之后）——Claude Code（anthropic ingress 的 compat 路径）、Responses/OpenAI 客户端（passthrough）与转码路径全部覆盖。admin 模型探测（`admin/providers.rs`）按模型播种确定性 id；vision shim 直连 helper 的调用（`vision_shim/caption.rs`，不经 dispatcher）单独注入。
-- **预设**：channel 声明三端点（同一 host `https://opencode.ai/zen/go`）+ `sharedKeyProtocols`（一个订阅 key 覆盖三端点，UI 因此按共享 Key 语义播种并锁定为自适应模式）+ `authSchemes` 里 `anthropic-messages → x-api-key`（`/v1/messages` 不吃 Bearer）。历史遗留的固定模式 provider 行不受影响，在 UI 打开→保存一次即升级为三端点自适应。
-- **模型 → 端点硬编码表**（`routing.rs`）：对齐 OpenCode 官方 SDK 绑定（`@ai-sdk/openai` → `/v1/responses`、`@ai-sdk/openai-compatible` → `/v1/chat/completions`、`@ai-sdk/anthropic` → `/v1/messages`），每个已知模型钉死唯一协议；精确匹配（trim + 大小写不敏感），按目标模型（`actual_model`）判定：
-  - 仅 responses：`grok-4.6`、`gpt-5.6-luna`、`muse-spark-1.3-contributor`、`muse-spark-1.2-contributor`；
-  - 仅 messages：`minimax-m3`、`minimax-m2.7`、`minimax-m2.5`、`qwen3.8-max`、`qwen3.8-flash`、`qwen3.7-max`、`qwen3.7-plus`、`qwen3.6-plus`；
-  - 仅 chat：`glm-5.3-flash`、`glm-5.3`、`glm-5.2`、`glm-5.1`、`kimi-k3`、`kimi-k2.7-code`、`kimi-k2.6`、`longcat-2.0`、`deepseek-v4.1-flash`、`deepseek-v4-pro`、`deepseek-v4-flash`、`deepseek-v4-flash-vision-exp`、`mimo-v2.5`、`mimo-v2.5-pro`、`hy4-preview`、`hy3`；
-  - 未收录的新模型 **默认仅 chat**（`/v1/chat/completions`）。
-- **裁决规则**（`routing::preferred_egress` → `negotiate()` 的 route_pref）：**模型协议钉死**——`preferred_egress` 对 OpenCode Go **永远返回该模型的钉死协议**（即使已与客户端协议相同，`negotiate` 仍走 Native）。Claude Code 问 `kimi-k3` / Codex 问 `deepseek-v4-pro` 都转码到 `/v1/chat/completions`；chat 客户端问 `grok-4.6` → `/v1/responses`；chat 客户端问 `minimax-m3` → `/v1/messages`。偏好只在 provider 真的声明了该端点时生效，固定 provider 优雅退化为原有行为；不做端点级失败回退（端点选定即定，上游错误照原样透出）。
-- **已知不可用黑名单**（`routing.rs::UNAVAILABLE_MODELS`）：`glm-5`、`grok-4.5`、`hy3-preview`、`kimi-k2.5`、`mimo-v2-omni`、`mimo-v2-pro`、`qwen3.5-plus` 仍出现在上游 `/v1/models` 里，但订阅内每个端点都不可用。它们被**从 provider 模型列表中过滤**（选择器/探测/路由目标都看不到），手填模型名仍可绕过，因此上游若恢复服务不会被代码堵死。
-- **模型探测**（`admin/providers.rs::resolve_probe_target`）：与转发共用同一决策——每个模型探它实际会被路由到的端点（`grok-4.6` → responses、`minimax-m2.7` → messages、其余 chat），因此"探测绿"等价于"经网关可调用"；逐模型的实际端点回填到 `ProviderModelProbeResult.protocol`，前端按模型显示 `[协议]`。
+- **预设与升级**：channel 声明三端点（同一 host `https://opencode.ai/zen/go`）+ `sharedKeyProtocols`（一个订阅 key 覆盖三端点）+ `anthropic-messages → x-api-key`。历史 fixed 配置仅在模型要求的协议与固定协议一致时继续工作；不一致时在本地返回 503 `NYRO_SERVICE_UNAVAILABLE`，提示配置并启用所需端点，不再静默退回 chat。通过 UI 保存为三端点自适应配置后生效；运行时不自动补写端点或覆盖自定义 URL。
+- **当前 31 模型精确目录**（`provider/opencode_go/routing.rs::MODEL_PROTOCOL`）：按 `actual_model`（后端别名解析后的上游模型名）匹配，trim + 大小写不敏感；不使用家族前缀。协议是供应商渠道下的模型属性，不是全局模型属性。
+  - responses（6）：`grok-4.7`、`grok-4.6`、`gpt-6-luna`、`gpt-5.6-luna`、`muse-spark-1.3-contributor`、`muse-spark-1.2-contributor`；
+  - messages（6）：`claude-haiku-5-5`、`minimax-m3`、`minimax-m2.7`、`qwen3.8-max`、`qwen3.8-flash`、`qwen3.7-plus`；
+  - chat（19）：`glm-5.3-flash`、`glm-5.3`、`glm-5.2`、`kimi-k3`、`kimi-k2.7-code`、`kimi-k2.6`、`longcat-2.0`、`longcat-2.5-preview-free`、`deepseek-v4.1-flash`、`deepseek-v4-pro`、`deepseek-v4-flash`、`deepseek-v4-flash-vision-exp`、`mimo-v2.6-flash`、`mimo-v2.6-pro`、`mimo-v2.5`、`mimo-v2.5-pro`、`hy4-preview`、`hy3`、`space-bunny`。
+- **历史兼容规则**（`LEGACY_MODEL_PROTOCOL`）：保留 `glm-5.1 → chat`、`minimax-m2.5 / qwen3.6-plus / qwen3.7-max → messages`。当前目录未出现不代表不可用。`space-bunny` 不自动重写为 `space-bunny-free`。
+- **严格裁决**：`routing::resolve_endpoint` 统一查表并匹配启用的完整 `ProtocolId`，返回端点 ID、URL 和认证方案；未知模型、缺失/禁用端点或空 URL 在本地失败。dispatcher 通过 `negotiate_required` 保留已解析端点，入口相同走 Native，不同走转换；普通供应商仍使用原有软偏好协商。不做端点级试错回退，500 不触发换协议；切换另一个后端时重新解析模型规则。日志 trace 记录模型、规则来源、所需协议或拒绝原因。
+- **未知模型策略**：不再默认 chat，返回明确错误要求更新模型目录；本阶段不提供数据库覆盖规则或在线自动更新，也不改变模型发现接口，未知模型仍可被发现但探测标记失败。
+- **可用性与协议分离**：保留原 `UNAVAILABLE_MODELS` 发现列表过滤，过滤规则不会推导协议。手填可绕过列表过滤，但仍必须通过已知模型协议校验。
+- **模型探测**：`admin/providers.rs::resolve_probe_target` 和真实转发复用同一严格端点解析器，使用完整协议 ID 而非协议族匹配（不会混淆 chat/embeddings）。配置错误作为该模型失败结果返回，不发上游请求、不阻断其他模型。认证从选定端点/Key pool 获取；会话头按 provider 身份或 URL 判断，自定义代理域名同样注入且保留已有值。探测成功验证该端点的基本调用，不代表所有请求特性均已验证。
+- **图片描述辅助调用**：vision shim 的直接 helper 调用也先解析模型端点；目前 helper 只有 Chat 编码器，非 Chat 模型本地拒绝并进入既有 helper 后端回退，而不错误发送 Chat 请求。Chat 模型使用选定端点地址、凭证和认证方案。
 
 ---
 
