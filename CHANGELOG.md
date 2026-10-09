@@ -6,10 +6,18 @@ All notable changes to Nyro will be documented in this file.
 
 ## v2.1.0
 
-> Released on 2026-09-16
+> Released on 2026-10-09
 
 #### Features
 
+- **Provider-level multi-key pool**: providers gain an optional key_pool array — each entry binds one protocol (or all) to a distinct credential set, enabling third-party proxies to route different models through different keys while preserving single-key usability; protocol-routing rewrites the active credential before dispatch, and model probing respects the per-protocol pool
+- **Key pool protocol-independent configuration with Claude 5.5 thinking-mode defense**: thinking-enabled requests are rewritten for Claude 5.5 upstreams (legacy budget_tokens → adaptive effort tiers, max effort floor for high-budget requests, and automatic max_tokens lift to 128K to prevent truncation); Responses codex-consumer sanitization strips reasoning parameters that consumer upstreams reject
+- **Thinking-model output-budget auto-lift to 128K**: all protocols (OpenAI Chat/Responses, Anthropic Messages, Google Gemini) now automatically raise max_tokens below 128K to 131072 for thinking-enabled requests, ensuring thinking + final output both have sufficient space; applies on both IR-transcode and passthrough paths with per-protocol field mapping (max_completion_tokens priority, reasoning.output_tokens, generationConfig.maxOutputTokens)
+- **XiaoMi MiMo provider**: first-class Xiaomi AI provider with passport-token auto-renewal — usage query exchanges the stored credential for a short-lived passToken via SSO bootstrap, then polls the billing API for model-family token consumption
+- **Codex version dynamic probing**: the Codex OAuth driver now probes `/backend-api/models` to detect Code-Assist-Pro availability and sets the channel variant (code_assist_pro vs codex_responses) accordingly, avoiding unnecessary 404 failures and enabling automatic channel discovery per account
+- **30-day statistics window**: usage statistics now support a 30-day aggregation window in addition to the existing hour/day/week windows
+- **Billion-scale token display**: token counts ≥ 1B are now formatted with the B suffix (e.g., "1.2B") in the WebUI and DSH panel for readability
+- **Antigravity channel Claude 5.5 model scanning**: Google Antigravity channel now discovers Claude 5.5 variants available per subscription account
 - **Google subscription quota observability**: tier identity now prefers the subscription entitlement — `loadCodeAssist` carries both `currentTier` and `paidTier`, so paid (g1-pro / g1-ultra) accounts are no longer mislabeled as free, and ineligible-tier reason codes persist into the credential and surface through the OAuth status payload (`tier_ineligible`); the usage query adopts the enforcement-grade quota surface (`v1internal:retrieveUserQuotaSummary`), turning per-family × per-window buckets (remaining fraction + reset time) into the provider's usage rows — collapsed to one row per window under canonical names (`five_hour` / `weekly_limit`) that drive localized labels and steady-pace markers in the WebUI and DSH panel — with the model-catalog quotaInfo fold kept as fallback and ancillary non-Gemini pools (claude / gpt / tab) filtered out behind a safe show-everything fallback
 - **Gemini 3 series on the subscription channel**: the Google Antigravity and Gemini CLI channels handle Code Assist v1internal inference with daily/prod host routing, preserve Gemini 3 thinking signatures with automatic replay, discover models per account, and rewrite effort tiers onto subscription model variants
 - **OpenCode Go tri-endpoint adaptive routing**: the preset declares chat / responses / messages endpoints sharing one key, authenticates `/v1/messages` with `x-api-key`, routes each model through a per-model endpoint table (client protocol first, diverting to the model's own endpoint when unsupported), injects a derived `x-opencode-session` header across dispatch, probes models against their routed endpoint, and filters models with no usable endpoint in the subscription
@@ -20,10 +28,14 @@ All notable changes to Nyro will be documented in this file.
 
 - **Unified end-to-end body-TPS accounting**: the TPS definition converges across stats surfaces
 - **Provider icon resolution refactor**: icon parsing reworked and wired into the performance chart
+- **DSH usage panel plugin settings registration refactor**: cleaner volatile-settings registration for the nyro-usage DSH plugin
+- **Gemini usage display order adjustment**: five-hour quota now appears above weekly limit in usage displays
+- **Bailian usage parsing**: monthly quota window support added for Alibaba Bailian usage
 - **Workspace-wide rustfmt pass and warning cleanup**
 
 #### Fixes
 
+- **OpenCode Go model protocol routing**: corrected endpoint routing table for OpenCode Go models
 - **Gemini streaming newline normalization and EOF-terminal retry**
 - **Gemini stream pseudo-success and shadow pollution**
 - **Gemini idle-distortion retry and stream probing**
@@ -31,7 +43,7 @@ All notable changes to Nyro will be documented in this file.
 - **Google output-token over-limit rejected upstream**
 - **Google subscription channel schema compatibility and output limits**
 - **Performance page multi-variant statistics and envelope-label convergence**
-- **OpenCode Go model endpoint routing table adjustment**
+- **Stream fix-induced redundant mut compilation warnings**
 
 ---
 
