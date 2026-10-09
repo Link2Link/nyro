@@ -18,6 +18,7 @@
 
 pub mod common;
 pub mod inbound;
+pub mod key_pool;
 pub mod metadata;
 pub mod outbound;
 pub mod registry;
@@ -41,6 +42,7 @@ pub mod opencode_go;
 pub mod openrouter;
 pub mod vertexai;
 pub mod xai;
+pub mod xiaomimimo;
 pub mod zai;
 pub mod zhipuai;
 

@@ -470,6 +470,7 @@ pub fn build_providers(yaml: &YamlConfig) -> Vec<Provider> {
                 protocol: resolved_protocol,
                 base_url,
                 protocol_mode: if adaptive { "adaptive" } else { "fixed" }.to_string(),
+                keys: Vec::new(),
                 protocol_endpoints,
                 preset_key: None,
                 channel: None,

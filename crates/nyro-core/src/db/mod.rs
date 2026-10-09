@@ -52,6 +52,7 @@ pub async fn migrate(pool: &SqlitePool) -> anyhow::Result<()> {
     ensure_provider_protocol_endpoints_table(pool).await?;
     migrate_collapse_provider_protocol_columns(pool).await?;
     backfill_provider_protocol_endpoints(pool).await?;
+    ensure_provider_keys_table(pool).await?;
     ensure_route_column(pool, "virtual_model", "TEXT").await?;
     ensure_route_column(pool, "balance", "TEXT DEFAULT 'weighted'").await?;
     ensure_route_column(pool, "access_control", "INTEGER DEFAULT 0").await?;
@@ -99,6 +100,7 @@ pub async fn migrate(pool: &SqlitePool) -> anyhow::Result<()> {
     ensure_request_log_column(pool, "reasoning_tokens", "INTEGER DEFAULT 0").await?;
     ensure_request_log_column(pool, "reasoning_effort", "TEXT").await?;
     ensure_request_log_column(pool, "route_decision", "TEXT").await?;
+    ensure_request_log_column(pool, "provider_key_name", "TEXT").await?;
     migrate_log_diagnostics(pool).await?;
     migrate_performance_metadata(pool).await?;
     // Provider-scoped ratings were replaced by prefix ratings; old rows are
@@ -422,6 +424,44 @@ async fn ensure_provider_protocol_endpoints_table(pool: &SqlitePool) -> anyhow::
     )
     .execute(pool)
     .await?;
+    Ok(())
+}
+
+async fn ensure_provider_keys_table(pool: &SqlitePool) -> anyhow::Result<()> {
+    sqlx::raw_sql(
+        r#"
+        CREATE TABLE IF NOT EXISTS provider_keys (
+            id          TEXT PRIMARY KEY,
+            provider_id TEXT NOT NULL REFERENCES providers(id) ON DELETE CASCADE,
+            name        TEXT NOT NULL,
+            api_key     TEXT NOT NULL,
+            protocol    TEXT,
+            base_url    TEXT,
+            is_enabled  INTEGER NOT NULL DEFAULT 1,
+            priority    INTEGER NOT NULL DEFAULT 0,
+            models_snapshot TEXT,
+            manual_models   TEXT,
+            last_probe_at   TEXT,
+            probe_error     TEXT,
+            created_at  TEXT DEFAULT (datetime('now')),
+            updated_at  TEXT DEFAULT (datetime('now'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_provider_keys_provider
+            ON provider_keys(provider_id, is_enabled, priority);
+        "#,
+    )
+    .execute(pool)
+    .await?;
+    if !column_exists(pool, "provider_keys", "protocol").await? {
+        sqlx::query("ALTER TABLE provider_keys ADD COLUMN protocol TEXT")
+            .execute(pool)
+            .await?;
+    }
+    if !column_exists(pool, "provider_keys", "base_url").await? {
+        sqlx::query("ALTER TABLE provider_keys ADD COLUMN base_url TEXT")
+            .execute(pool)
+            .await?;
+    }
     Ok(())
 }
 
@@ -983,6 +1023,26 @@ CREATE TABLE IF NOT EXISTS provider_protocol_endpoints (
 CREATE INDEX IF NOT EXISTS idx_provider_protocol_endpoints_provider
     ON provider_protocol_endpoints(provider_id, is_enabled, priority);
 
+CREATE TABLE IF NOT EXISTS provider_keys (
+    id          TEXT PRIMARY KEY,
+    provider_id TEXT NOT NULL REFERENCES providers(id) ON DELETE CASCADE,
+    name        TEXT NOT NULL,
+    api_key     TEXT NOT NULL,
+    protocol    TEXT,
+    base_url    TEXT,
+    is_enabled  INTEGER NOT NULL DEFAULT 1,
+    priority    INTEGER NOT NULL DEFAULT 0,
+    models_snapshot TEXT,
+    manual_models   TEXT,
+    last_probe_at   TEXT,
+    probe_error     TEXT,
+    created_at  TEXT DEFAULT (datetime('now')),
+    updated_at  TEXT DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_provider_keys_provider
+    ON provider_keys(provider_id, is_enabled, priority);
+
 CREATE TABLE IF NOT EXISTS routes (
     id                TEXT PRIMARY KEY,
     name              TEXT NOT NULL,
@@ -1060,6 +1120,7 @@ CREATE TABLE IF NOT EXISTS request_logs (
     performance_completed_at  INTEGER,
     client_request_id         TEXT,
     attempt_index             INTEGER,
+    provider_key_name         TEXT,
     outcome_version           INTEGER NOT NULL DEFAULT 0,
     attempt_outcome           TEXT NOT NULL DEFAULT 'unknown',
     failure_kind              TEXT,

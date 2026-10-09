@@ -376,6 +376,9 @@ export function ProviderUsageFooter({ provider }: { provider: Provider }) {
         </div>
       ) : shown && shown.tiers.length > 0 ? (
         <div className="flex flex-col gap-1.5">
+          {/* Tier order is owned by the gateway API (canonical window order:
+              5h → weekly → monthly → …), so every consumer shows the same
+              sequence. Do not re-sort here. */}
           {shown.tiers.map((tier) => (
             <TierBar key={tier.name} tier={tier} isZh={isZh} now={now} />
           ))}

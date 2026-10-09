@@ -210,11 +210,15 @@ pub(crate) async fn process(
                 // the provider was created — resolve through the registry
                 // instead of string-comparing, so both storage forms are
                 // accepted.
-                crate::protocol::registry::ProtocolRegistry::global()
-                    .parse_protocol(&provider.protocol)
-                    .is_some_and(|protocol| {
-                        protocol == crate::protocol::ids::Protocol::OpenAICompatible
-                    })
+                // Go helper eligibility is model-specific, not determined by
+                // the provider's default protocol. caption_image validates its
+                // required endpoint and rejects non-Chat models locally.
+                crate::provider::opencode_go::session::is_opencode_go(provider)
+                    || crate::protocol::registry::ProtocolRegistry::global()
+                        .parse_protocol(&provider.protocol)
+                        .is_some_and(|protocol| {
+                            protocol == crate::protocol::ids::Protocol::OpenAICompatible
+                        })
             });
         if provider.is_none() {
             tracing::warn!(

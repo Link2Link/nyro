@@ -319,6 +319,7 @@ mod tests {
 
     fn fake_provider(base_url: String) -> Provider {
         Provider {
+            keys: Vec::new(),
             id: "provider-google".into(),
             name: "Google".into(),
             vendor: Some("google".into()),
@@ -401,6 +402,7 @@ mod tests {
     async fn logs_usage_for_non_stream_native_passthrough_response() {
         let url = serve_anthropic_response_once().await;
         let provider = Provider {
+            keys: Vec::new(),
             id: "provider-anthropic".into(),
             name: "Anthropic-compatible".into(),
             vendor: Some("anthropic".into()),
@@ -432,6 +434,7 @@ mod tests {
         let (gw, mut log_rx) = Gateway::new(config).await.expect("gateway init");
         let req_ext = crate::proxy::context::ContextBag::new();
         let call_ctx = CallCtx {
+            provider_key_name: None,
             performance: None,
             gw: gw.clone(),
             provider: &provider,
@@ -524,6 +527,7 @@ mod tests {
 
         let req_ext = crate::proxy::context::ContextBag::new();
         let call_ctx = CallCtx {
+            provider_key_name: None,
             performance: None,
             gw: gw.clone(),
             provider: &provider,
@@ -705,6 +709,7 @@ mod tests {
         let (gw, mut log_rx) = Gateway::new(config).await.unwrap();
         let req_ext = crate::proxy::context::ContextBag::new();
         let call_ctx = CallCtx {
+            provider_key_name: None,
             performance: None,
             gw: gw.clone(),
             provider: &provider,
@@ -839,6 +844,7 @@ mod tests {
         let url = format!("http://{addr}/v1/responses");
 
         let provider = Provider {
+            keys: Vec::new(),
             id: "provider-resp".into(),
             name: "Responses-compatible".into(),
             vendor: Some("custom".into()),
@@ -867,6 +873,7 @@ mod tests {
         };
         let (gw, _log_rx) = Gateway::new(config).await.expect("gateway init");
         let call_ctx = CallCtx {
+            provider_key_name: None,
             performance: None,
             gw: gw.clone(),
             provider: &provider,
@@ -982,6 +989,7 @@ mod tests {
 
     async fn force_stream_call_ctx(gw: &Gateway, url: &str) -> CallCtx<'static> {
         let provider = Provider {
+            keys: Vec::new(),
             id: "provider-gemini-force".into(),
             name: "Gemini force-stream".into(),
             vendor: Some("google".into()),
@@ -1007,6 +1015,7 @@ mod tests {
         // scoped to the test; tests are single-shot so this is acceptable.
         let provider: &'static Provider = Box::leak(Box::new(provider));
         CallCtx {
+            provider_key_name: None,
             performance: None,
             gw: gw.clone(),
             provider,

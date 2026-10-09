@@ -510,6 +510,7 @@ mod tests {
 
     fn test_provider() -> Provider {
         Provider {
+            keys: Vec::new(),
             id: "test".into(),
             name: "Grok".into(),
             vendor: Some("xai".into()),

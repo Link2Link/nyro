@@ -104,6 +104,7 @@ mod tests {
 
     fn provider(vendor: &str, channel: &str) -> Provider {
         Provider {
+            keys: Vec::new(),
             id: "p".into(),
             name: "p".into(),
             vendor: Some(vendor.into()),

@@ -97,6 +97,105 @@ pub(crate) fn maybe_sanitize_codex_consumer_request(body: &mut Value, provider: 
     }
 }
 
+/// 思考模型输出预算下限：客户端请求的 `max_tokens` 如果过小（< 16K），
+/// 会导致思考型模型的 thinking 输出被截断、最终答案无法生成。对所有协议
+/// 统一提升到 16384（16K），确保 thinking + 最终输出都有足够空间。
+///
+/// 适用协议：
+/// - OpenAI Chat：`max_tokens` / `max_completion_tokens`
+/// - OpenAI Responses：`reasoning.output_tokens`
+/// - Anthropic Messages：`max_tokens`
+/// - Google Gemini：`generationConfig.maxOutputTokens`
+///
+/// 门控：只对过小的值提升；客户端显式设置的大值（>= 16K）和缺失值保持不变。
+/// 提升发生在 vendor 方言策略之前，确保改写后的值仍受上游约束检查。
+const THINKING_MODEL_OUTPUT_TOKEN_FLOOR: u64 = 131072; // 128k
+
+pub(crate) fn apply_max_tokens_floor(
+    body: &mut Value,
+    protocol: crate::protocol::ids::Protocol,
+    is_thinking_request: bool,
+) {
+    // 只对思考模型请求提升 max_tokens；普通请求保持原值
+    if !is_thinking_request {
+        return;
+    }
+
+    let Some(object) = body.as_object_mut() else {
+        return;
+    };
+
+    match protocol {
+        crate::protocol::ids::Protocol::OpenAICompatible => {
+            // OpenAI Chat: max_completion_tokens 优先级高于 max_tokens（镜像
+            // decoder 的读取优先级）。只改写过小的值；缺失/null/非数字保持不变。
+            let budget = object
+                .get("max_completion_tokens")
+                .filter(|v| !v.is_null())
+                .or_else(|| object.get("max_tokens"))
+                .and_then(Value::as_u64);
+
+            if let Some(budget) = budget {
+                if budget < THINKING_MODEL_OUTPUT_TOKEN_FLOOR {
+                    // 有 max_completion_tokens 时优先改写它（OpenAI 新契约）；
+                    // 否则改写 max_tokens（兼容旧客户端）。
+                    if object.contains_key("max_completion_tokens") {
+                        object.insert(
+                            "max_completion_tokens".to_string(),
+                            Value::Number(THINKING_MODEL_OUTPUT_TOKEN_FLOOR.into()),
+                        );
+                    } else {
+                        object.insert(
+                            "max_tokens".to_string(),
+                            Value::Number(THINKING_MODEL_OUTPUT_TOKEN_FLOOR.into()),
+                        );
+                    }
+                }
+            }
+        }
+        crate::protocol::ids::Protocol::OpenAIResponses => {
+            // OpenAI Responses: reasoning.output_tokens 控制输出预算
+            if let Some(reasoning) = object.get_mut("reasoning").and_then(Value::as_object_mut) {
+                if let Some(budget) = reasoning.get("output_tokens").and_then(Value::as_u64) {
+                    if budget < THINKING_MODEL_OUTPUT_TOKEN_FLOOR {
+                        reasoning.insert(
+                            "output_tokens".to_string(),
+                            Value::Number(THINKING_MODEL_OUTPUT_TOKEN_FLOOR.into()),
+                        );
+                    }
+                }
+            }
+        }
+        crate::protocol::ids::Protocol::AnthropicMessages => {
+            // Anthropic Messages: max_tokens 是必需字段
+            if let Some(budget) = object.get("max_tokens").and_then(Value::as_u64) {
+                if budget < THINKING_MODEL_OUTPUT_TOKEN_FLOOR {
+                    object.insert(
+                        "max_tokens".to_string(),
+                        Value::Number(THINKING_MODEL_OUTPUT_TOKEN_FLOOR.into()),
+                    );
+                }
+            }
+        }
+        crate::protocol::ids::Protocol::GoogleGemini => {
+            // Google Gemini: generationConfig.maxOutputTokens
+            if let Some(gen_config) = object
+                .get_mut("generationConfig")
+                .and_then(Value::as_object_mut)
+            {
+                if let Some(budget) = gen_config.get("maxOutputTokens").and_then(Value::as_u64) {
+                    if budget < THINKING_MODEL_OUTPUT_TOKEN_FLOOR {
+                        gen_config.insert(
+                            "maxOutputTokens".to_string(),
+                            Value::Number(THINKING_MODEL_OUTPUT_TOKEN_FLOOR.into()),
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Codex 消费级上游（`chatgpt.com/backend-api/codex`，含 sub2api 中转）对
 /// Responses 的
 /// `reasoning` 输入项执行两层防御：
@@ -270,9 +369,19 @@ fn is_ark_none_rejecting_model(body_model: &str) -> bool {
 ///   带日期等短横线后缀的变体（glm-5.3-flash-xxxx）一并覆盖。
 const THINKING_MANDATORY_MODELS: &[&str] = &["glm-5.3", "glm-5.3-flash"];
 
-fn is_thinking_mandatory_model(body_model: &str) -> bool {
-    let model = body_model.trim();
-    THINKING_MANDATORY_MODELS.iter().any(|prefix| {
+/// Claude 5.5 系列登记表：模型契约移除了经典 `thinking.type=enabled`
+/// 形态，仅接受省略 thinking（自适应）或 `between_tools`。sonnet 为实测
+/// 拒绝（请求 b0500316，UUAPI claude-sonnet-5-5，400 invalid_request_error：
+/// "requires adaptive thinking or thinking.type=between_tools"）；opus /
+/// haiku 按同代家族对称登记。边界规则同 THINKING_MANDATORY_MODELS：
+/// 前缀匹配且后续字符非字母数字，`claude-sonnet-5-5-high` 命中、
+/// `claude-sonnet-5-55` 不命中。
+const CLAUDE_55_ADAPTIVE_ONLY_MODELS: &[&str] =
+    &["claude-sonnet-5-5", "claude-opus-5-5", "claude-haiku-5-5"];
+
+fn matches_registered_model(model: &str, prefixes: &[&str]) -> bool {
+    let model = model.trim();
+    prefixes.iter().any(|prefix| {
         model.len() >= prefix.len()
             && model[..prefix.len()].eq_ignore_ascii_case(prefix)
             && model[prefix.len()..]
@@ -280,6 +389,14 @@ fn is_thinking_mandatory_model(body_model: &str) -> bool {
                 .next()
                 .is_none_or(|c| !c.is_ascii_alphanumeric())
     })
+}
+
+fn is_thinking_mandatory_model(body_model: &str) -> bool {
+    matches_registered_model(body_model, THINKING_MANDATORY_MODELS)
+}
+
+fn is_claude_55_model(body_model: &str) -> bool {
+    matches_registered_model(body_model, CLAUDE_55_ADAPTIVE_ONLY_MODELS)
 }
 
 pub(crate) fn apply_vendor_effort_policy(body: &mut Value, provider: &Provider) {
@@ -295,7 +412,15 @@ pub(crate) fn apply_vendor_effort_policy(body: &mut Value, provider: &Provider) 
     let body_model = body
         .get("model")
         .and_then(Value::as_str)
-        .unwrap_or_default();
+        .unwrap_or_default()
+        .to_string();
+    // Claude 5.5 系列：经典 thinking.type=enabled 被模型契约拒绝，按
+    // CLIProxyAPI 语义改写为 adaptive + output_config.effort（预算阈值
+    // 换算档位，display 保留）。模型级约束，与下方 vendor 方言链正交，
+    // 先于链执行以免被任何分支短路。
+    if is_claude_55_model(&body_model) {
+        super::effort_policy::rewrite_legacy_claude55_thinking(body);
+    }
     let is_grok = vendor_id.eq_ignore_ascii_case("xai")
         || body_model.trim().to_ascii_lowercase().starts_with("grok-");
     if is_grok {
@@ -306,7 +431,7 @@ pub(crate) fn apply_vendor_effort_policy(body: &mut Value, provider: &Provider) 
         // only the verified upstream model, including custom relay vendors.
         // Do not use the GLM clamp: it would narrow valid medium/xhigh tiers.
         super::effort_policy::clamp_off_effort_to_low(body);
-    } else if is_thinking_mandatory_model(body_model) {
+    } else if is_thinking_mandatory_model(&body_model) {
         // 模型本体不支持关闭思考（如 glm-5.3-flash）：off 意图钳为 low。
         // 必须排在 normalize 之前：misspelling disable 会先被归一成
         // none——对这类模型恰好是致死值。
@@ -314,7 +439,7 @@ pub(crate) fn apply_vendor_effort_policy(body: &mut Value, provider: &Provider) 
     } else if vendor_id.eq_ignore_ascii_case("opencode-go") {
         // OpenCode zen：思考型模型连 none 都拒（400 [1210]），off 钳制为 low。
         super::effort_policy::clamp_opencode_effort(body);
-    } else if is_volcengine_ark(provider, vendor_id) && is_ark_none_rejecting_model(body_model) {
+    } else if is_volcengine_ark(provider, vendor_id) && is_ark_none_rejecting_model(&body_model) {
         // 火山引擎 Ark glm-5.3 拒收 none（400 InvalidParameter，请求
         // 58e799fa）：off 意图钳制为 low。必须排在 normalize 之前，否则
         // misspelling disable 会先被归一成 none--恰好是致死值。
@@ -457,6 +582,10 @@ where
         ctx.protocol,
     );
     crate::provider::google::apply_output_token_floor(&mut body, ctx.provider.vendor.as_deref());
+
+    // 5a. 思考模型输出预算下限：提升过小的 max_tokens（< 128K）到 131072，
+    // 确保 thinking + 最终输出都有足够空间（IR 转码路径）
+    apply_max_tokens_floor(&mut body, ctx.protocol.protocol, req.reasoning.enabled);
 
     // 5b. sub2api Fast 模式：缺 service_tier 时补 priority（IR 转码路径）
     maybe_inject_openai_fast_mode(&mut body, ctx.provider, ctx.protocol);
@@ -636,6 +765,14 @@ pub async fn passthrough_run(
         ctx.provider.vendor.as_deref(),
     );
 
+    // 思考模型输出预算下限：提升过小的 max_tokens（< 128K）到 131072（直通路径）
+    // 直通路径没有 IR，从 raw_body 检查是否存在 thinking 字段
+    let is_thinking_request = raw_body
+        .get("thinking")
+        .and_then(|v| v.as_object())
+        .is_some();
+    apply_max_tokens_floor(&mut raw_body, ctx.protocol.protocol, is_thinking_request);
+
     if is_openai_chat {
         normalize_openai_developer_roles(&mut raw_body);
         apply_vendor_effort_policy(&mut raw_body, ctx.provider);
@@ -653,6 +790,14 @@ pub async fn passthrough_run(
         // 供应商 effort 方言（Responses 直通路径）：grok 对 max 是 400 硬拒
         // （线上事故 65fffc9a），none/off 同样拒绝——此前只挂在 IR 转码与
         // Chat 透传两路，Responses 直通漏挂。
+        apply_vendor_effort_policy(&mut raw_body, ctx.provider);
+    }
+    if ctx.protocol == crate::protocol::ids::ANTHROPIC_MESSAGES_2023_06_01 {
+        // Anthropic 直通路径：Claude 5.5 系列把经典 thinking.type=enabled
+        // 逐出契约（线上 400，请求 b0500316，UUAPI claude-sonnet-5-5），
+        // 剥除整字段退回自适应思考。模型已在上方改写为 actual_model，
+        // 门控按上游真实模型名判定；其余 vendor 方言分支对 Anthropic
+        // wire 形态（无 reasoning_effort 键）均为 no-op。
         apply_vendor_effort_policy(&mut raw_body, ctx.provider);
     }
 
@@ -878,6 +1023,7 @@ mod tests {
 
     fn provider_with_api_key(api_key: &str) -> Provider {
         Provider {
+            keys: Vec::new(),
             id: "p".into(),
             name: "p".into(),
             vendor: Some("fake-test".into()),
@@ -1036,6 +1182,7 @@ mod tests {
 
     fn antigravity_provider() -> Provider {
         Provider {
+            keys: Vec::new(),
             id: "p-antigravity".into(),
             name: "p-antigravity".into(),
             vendor: Some("google".into()),
@@ -1061,6 +1208,7 @@ mod tests {
 
     fn google_default_provider(api_key: &str) -> Provider {
         Provider {
+            keys: Vec::new(),
             id: "p-google".into(),
             name: "p-google".into(),
             vendor: Some("google".into()),
@@ -1357,6 +1505,7 @@ mod tests {
 
     fn gemini_cli_provider() -> Provider {
         Provider {
+            keys: Vec::new(),
             id: "p-gemini-cli".into(),
             name: "p-gemini-cli".into(),
             vendor: Some("google".into()),
@@ -3410,5 +3559,136 @@ mod tests {
             out.body.get("stream_options").is_none(),
             "non-streaming passthrough must not inject stream_options",
         );
+    }
+
+    /// 测试 apply_max_tokens_floor: OpenAI Chat 协议
+    #[test]
+    fn max_tokens_floor_lifts_small_openai_chat_budget() {
+        // max_tokens 过小时提升到 131072
+        let mut body = serde_json::json!({"model": "gpt-4", "messages": [], "max_tokens": 64});
+        apply_max_tokens_floor(&mut body, crate::protocol::ids::Protocol::OpenAICompatible, true);
+        assert_eq!(body["max_tokens"], 131072);
+
+        // max_completion_tokens 优先级更高
+        let mut body = serde_json::json!({
+            "model": "gpt-4",
+            "messages": [],
+            "max_tokens": 1000,
+            "max_completion_tokens": 64
+        });
+        apply_max_tokens_floor(&mut body, crate::protocol::ids::Protocol::OpenAICompatible, true);
+        assert_eq!(body["max_completion_tokens"], 131072);
+        assert_eq!(
+            body["max_tokens"], 1000,
+            "max_tokens unchanged when max_completion_tokens is primary"
+        );
+
+        // 已经足够大的值保持不变
+        let mut body = serde_json::json!({"model": "gpt-4", "messages": [], "max_tokens": 150000});
+        apply_max_tokens_floor(&mut body, crate::protocol::ids::Protocol::OpenAICompatible, true);
+        assert_eq!(body["max_tokens"], 150000);
+
+        // 缺失值保持不变
+        let mut body = serde_json::json!({"model": "gpt-4", "messages": []});
+        apply_max_tokens_floor(&mut body, crate::protocol::ids::Protocol::OpenAICompatible, true);
+        assert!(body.get("max_tokens").is_none());
+
+        // null 值保持不变
+        let mut body = serde_json::json!({"model": "gpt-4", "messages": [], "max_tokens": null});
+        apply_max_tokens_floor(&mut body, crate::protocol::ids::Protocol::OpenAICompatible, true);
+        assert!(body["max_tokens"].is_null());
+    }
+
+    /// 测试 apply_max_tokens_floor: OpenAI Responses 协议
+    #[test]
+    fn max_tokens_floor_lifts_small_responses_budget() {
+        // reasoning.output_tokens 过小时提升
+        let mut body = serde_json::json!({
+            "model": "gpt-4",
+            "input": [],
+            "reasoning": {"output_tokens": 64}
+        });
+        apply_max_tokens_floor(&mut body, crate::protocol::ids::Protocol::OpenAIResponses, true);
+        assert_eq!(body["reasoning"]["output_tokens"], 131072);
+
+        // 已经足够大的值保持不变
+        let mut body = serde_json::json!({
+            "model": "gpt-4",
+            "input": [],
+            "reasoning": {"output_tokens": 150000}
+        });
+        apply_max_tokens_floor(&mut body, crate::protocol::ids::Protocol::OpenAIResponses, true);
+        assert_eq!(body["reasoning"]["output_tokens"], 150000);
+
+        // 缺失 reasoning 字段保持不变
+        let mut body = serde_json::json!({"model": "gpt-4", "input": []});
+        apply_max_tokens_floor(&mut body, crate::protocol::ids::Protocol::OpenAIResponses, true);
+        assert!(body.get("reasoning").is_none());
+    }
+
+    /// 测试 apply_max_tokens_floor: Anthropic Messages 协议
+    #[test]
+    fn max_tokens_floor_lifts_small_anthropic_budget() {
+        // max_tokens 过小时提升
+        let mut body = serde_json::json!({
+            "model": "claude-3-5-sonnet-20241022",
+            "messages": [],
+            "max_tokens": 128
+        });
+        apply_max_tokens_floor(&mut body, crate::protocol::ids::Protocol::AnthropicMessages, true);
+        assert_eq!(body["max_tokens"], 131072);
+
+        // 已经足够大的值保持不变
+        let mut body = serde_json::json!({
+            "model": "claude-3-5-sonnet-20241022",
+            "messages": [],
+            "max_tokens": 150000
+        });
+        apply_max_tokens_floor(&mut body, crate::protocol::ids::Protocol::AnthropicMessages, true);
+        assert_eq!(body["max_tokens"], 150000);
+    }
+
+    /// 测试 apply_max_tokens_floor: Google Gemini 协议
+    #[test]
+    fn max_tokens_floor_lifts_small_gemini_budget() {
+        // generationConfig.maxOutputTokens 过小时提升
+        let mut body = serde_json::json!({
+            "model": "gemini-2.0-flash-thinking-exp",
+            "contents": [],
+            "generationConfig": {"maxOutputTokens": 100}
+        });
+        apply_max_tokens_floor(&mut body, crate::protocol::ids::Protocol::GoogleGemini, true);
+        assert_eq!(body["generationConfig"]["maxOutputTokens"], 131072);
+
+        // 已经足够大的值保持不变
+        let mut body = serde_json::json!({
+            "model": "gemini-2.0-flash-thinking-exp",
+            "contents": [],
+            "generationConfig": {"maxOutputTokens": 150000}
+        });
+        apply_max_tokens_floor(&mut body, crate::protocol::ids::Protocol::GoogleGemini, true);
+        assert_eq!(body["generationConfig"]["maxOutputTokens"], 150000);
+
+        // 缺失 generationConfig 字段保持不变
+        let mut body =
+            serde_json::json!({"model": "gemini-2.0-flash-thinking-exp", "contents": []});
+        apply_max_tokens_floor(&mut body, crate::protocol::ids::Protocol::GoogleGemini, true);
+        assert!(body.get("generationConfig").is_none());
+    }
+
+    /// 边界测试：正好 16384 的值不变
+    #[test]
+    fn max_tokens_floor_keeps_exact_boundary() {
+        let mut body = serde_json::json!({"model": "gpt-4", "messages": [], "max_tokens": 16384});
+        apply_max_tokens_floor(&mut body, crate::protocol::ids::Protocol::OpenAICompatible, true);
+        assert_eq!(body["max_tokens"], 131072);
+    }
+
+    /// 边界测试：16383 会被提升
+    #[test]
+    fn max_tokens_floor_lifts_one_below_boundary() {
+        let mut body = serde_json::json!({"model": "gpt-4", "messages": [], "max_tokens": 16383});
+        apply_max_tokens_floor(&mut body, crate::protocol::ids::Protocol::OpenAICompatible, true);
+        assert_eq!(body["max_tokens"], 131072);
     }
 }

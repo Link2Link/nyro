@@ -10,6 +10,7 @@ use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 
 fn entry() -> LogEntry {
     LogEntry {
+        provider_key_name: None,
         diagnostic: LogDiagnostic::default(),
         api_key_id: Some("key".into()),
         api_key_name: Some("test key".into()),

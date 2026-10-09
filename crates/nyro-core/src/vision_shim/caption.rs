@@ -113,7 +113,53 @@ async fn caption_image(
         Ok(url) => url,
         Err(err) => return CaptionCall::failed(err),
     };
-    let endpoint = openai_build_url(&provider.base_url, "/v1/chat/completions");
+    // Candidate resolution mirrors dispatch: an active pool contributes the
+    // credential first, then the same key-aware endpoint resolver decides the
+    // protocol and API address (a pinned protocol or per-key base URL wins).
+    let pool_candidate: Option<&crate::db::models::ProviderKey> =
+        if provider.has_key_pool() && provider.effective_auth_mode() != "oauth" {
+            let enabled = provider.enabled_keys();
+            let eligible = crate::provider::key_pool::eligible_keys(&enabled, model);
+            match eligible.first() {
+                Some(key) => Some(key),
+                None => {
+                    return CaptionCall::failed(format!(
+                        "no provider key in pool serves model '{model}'"
+                    ));
+                }
+            }
+        } else {
+            None
+        };
+    // This helper only has a Chat codec. Do not silently send a Responses- or
+    // Messages-only Go model to Chat; fail this helper before network I/O so
+    // the configured helper failover can try a compatible backend.
+    let resolved_endpoint =
+        match crate::provider::key_pool::resolve_endpoint(provider, pool_candidate, model) {
+            Ok(endpoint) => endpoint,
+            Err(error) => return CaptionCall::failed(error.to_string()),
+        };
+    if let Some(endpoint) = &resolved_endpoint {
+        if endpoint.protocol != crate::protocol::ids::OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1 {
+            return CaptionCall::failed(format!(
+                "vision helper supports Chat Completions only; model '{model}' requires {}",
+                endpoint.protocol,
+            ));
+        }
+    }
+    let key_base_url = pool_candidate
+        .and_then(|key| key.base_url.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let base_url = key_base_url
+        .or_else(|| {
+            resolved_endpoint
+                .as_ref()
+                .map(|endpoint| endpoint.base_url.trim())
+                .filter(|value| !value.is_empty())
+        })
+        .unwrap_or(provider.base_url.as_str());
+    let endpoint = openai_build_url(base_url, "/v1/chat/completions");
     let client = match gw.http_client_for_provider(provider.use_proxy).await {
         Ok(client) => client,
         Err(err) => return CaptionCall::failed(format!("helper http client: {err}")),
@@ -137,9 +183,34 @@ async fn caption_image(
     }
 
     let mut builder = client.post(&endpoint).timeout(timeout);
-    let api_key = provider.api_key.trim();
-    if !api_key.is_empty() {
-        builder = builder.bearer_auth(api_key);
+    let mut api_key = provider.api_key.as_str();
+    if let Some(candidate) = pool_candidate {
+        // Active pool: the candidate is the sole credential source.
+        api_key = candidate.api_key.as_str();
+    } else if let Some(endpoint) = &resolved_endpoint {
+        if let Some(id) = &endpoint.record_id {
+            api_key = provider
+                .protocol_endpoints
+                .iter()
+                .find(|row| row.id == *id)
+                .map(|row| row.api_key.as_str())
+                .unwrap_or_default();
+        }
+    }
+    if let Some(endpoint) = &resolved_endpoint {
+        match endpoint.auth_scheme.as_str() {
+            "none" => {}
+            "x-api-key" => builder = builder.header("x-api-key", api_key.trim()),
+            "query" => builder = builder.query(&[("key", api_key.trim())]),
+            "bearer" | "auto" | "" => builder = builder.bearer_auth(api_key.trim()),
+            other => {
+                return CaptionCall::failed(format!(
+                    "unsupported vision helper auth scheme: {other}"
+                ));
+            }
+        }
+    } else if !api_key.trim().is_empty() {
+        builder = builder.bearer_auth(api_key.trim());
     }
     // This is a direct provider call (no dispatcher), so the channel-scoped
     // egress headers have to be added here: OpenCode Go rejects requests

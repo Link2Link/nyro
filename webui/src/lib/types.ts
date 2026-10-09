@@ -6,6 +6,8 @@ export interface Provider {
   base_url: string;
   protocol_mode?: ProviderProtocolMode;
   protocol_endpoints?: ProviderProtocolEndpoint[];
+  /** 供应商级密钥池（三方中转多 key）。非空时路由只从池里选凭据。 */
+  keys?: ProviderKey[];
   api_key?: string;
   use_proxy: boolean;
   /** OpenAI Responses 渠道（sub2api/Codex）Fast 模式：开启后上游请求自动附加 service_tier=priority。 */
@@ -123,6 +125,8 @@ export interface RequestLog {
   upstream_protocol?: string;
   provider_id?: string;
   provider_name?: string;
+  /** 本次上游调用使用的密钥池条目名称（多密钥中转供应商）。 */
+  provider_key_name?: string | null;
   model_id?: string;
   model_name?: string;
   upstream_url?: string;
@@ -501,6 +505,49 @@ export interface ProviderProtocolEndpoint extends CreateProviderProtocolEndpoint
   updated_at: string;
 }
 
+export interface ProviderKey {
+  id: string;
+  provider_id: string;
+  name: string;
+  api_key: string;
+  /** Canonical ProviderProtocol; null/omitted inherits the provider's default/adaptive protocol. */
+  protocol?: string | null;
+  /** Per-candidate upstream API address; null/omitted inherits the provider's base URL. */
+  base_url?: string | null;
+  is_enabled: boolean;
+  priority: number;
+  /** JSON 数组字符串：探测发现的模型快照。 */
+  models_snapshot?: string | null;
+  /** JSON 数组字符串：手工修正的模型清单，设置后覆盖快照。 */
+  manual_models?: string | null;
+  last_probe_at?: string | null;
+  probe_error?: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface UpsertProviderKey {
+  id?: string | null;
+  name: string;
+  api_key: string;
+  /** Canonical ProviderProtocol; null/omitted inherits the provider's default/adaptive protocol. */
+  protocol?: string | null;
+  /** Per-candidate upstream API address; null/omitted inherits the provider's base URL. */
+  base_url?: string | null;
+  is_enabled?: boolean;
+  priority?: number;
+  manual_models?: string | null;
+}
+
+export interface ProviderKeyProbeStatus {
+  key_id: string;
+  name: string;
+  success: boolean;
+  error?: string | null;
+  models: string[];
+  tested_at: string;
+}
+
 export interface ProviderChannelPreset {
   id: string;
   label: {
@@ -581,6 +628,7 @@ export interface CreateProvider {
   base_url: string;
   protocol_mode?: ProviderProtocolMode;
   protocol_endpoints?: CreateProviderProtocolEndpoint[];
+  keys?: UpsertProviderKey[];
   use_proxy?: boolean;
   fast_mode?: boolean;
   auth_mode?: "apikey" | "oauth";
@@ -598,6 +646,7 @@ export interface UpdateProvider {
   base_url?: string;
   protocol_mode?: ProviderProtocolMode;
   protocol_endpoints?: CreateProviderProtocolEndpoint[];
+  keys?: UpsertProviderKey[];
   use_proxy?: boolean;
   fast_mode?: boolean;
   auth_mode?: "apikey" | "oauth";

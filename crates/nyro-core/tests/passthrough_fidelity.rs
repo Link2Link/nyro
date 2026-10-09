@@ -118,6 +118,7 @@ impl Vendor for BearerVendor {
 
 fn fake_provider(api_key: &str) -> Provider {
     Provider {
+        keys: Vec::new(),
         id: "p".into(),
         name: "p".into(),
         vendor: Some("test".into()),
@@ -716,5 +717,90 @@ fn each_protocol_provider_selects_own_native() {
             proto
         );
         assert_eq!(plan.egress, proto);
+    }
+}
+
+// ── Claude 5.5 legacy thinking 契约（线上请求 b0500316 复现） ────────────────
+
+/// 线上现场：UUAPI claude-sonnet-5-5 拒绝经典 thinking.type=enabled，400
+/// `claude-sonnet-5-5 requires adaptive thinking or thinking.type=
+/// between_tools; omit thinking or use one of those modes`。Anthropic 原生
+/// 直通必须改写：enabled+budget → adaptive+output_config.effort
+/// （16384 → xhigh，档位换算整体上提一档），display 保留；非 5.5 模型
+/// 保持逐字直通。
+#[tokio::test]
+async fn passthrough_rewrites_legacy_thinking_for_claude_55() {
+    let gw = build_test_gateway().await;
+    let provider = fake_provider("sk-test");
+
+    // 真实请求体形态（请求 b0500316 的客户端原文，messages 裁剪为最小代表）。
+    let raw_body = json!({
+        "model": "claude-sonnet",
+        "max_tokens": 128000,
+        "stream": true,
+        "thinking": {"type": "enabled", "budget_tokens": 16384, "display": "summarized"},
+        "messages": [{"role": "user", "content": "hello"}]
+    });
+
+    // (actual_model, 期望改写后 effort；None 表示 thinking 应逐字保留)
+    for (actual_model, expected_effort) in [
+        ("claude-sonnet-5-5", Some("xhigh")),
+        ("claude-sonnet-5-5-high", Some("xhigh")),
+        ("claude-sonnet-4-6", None),
+        ("claude-sonnet-5-55", None),
+    ] {
+        let ctx = ProviderCtx {
+            provider: &provider,
+            protocol: ANTHROPIC_MESSAGES_2023_06_01,
+            egress_base_url: "https://uuapi.net",
+            api_key: &provider.api_key,
+            auth_scheme: "auto",
+            actual_model,
+            force_max_reasoning: false,
+            credential: None,
+            gw: &gw,
+            disable_default_auth: false,
+        };
+        let out = nyro_core::provider::common::pipeline::passthrough_run(
+            &BearerVendor("custom"),
+            raw_body.clone(),
+            &ctx,
+            true,
+        )
+        .await
+        .expect("passthrough_run must succeed");
+
+        assert_eq!(out.body["model"], actual_model, "model must be rewritten");
+        match expected_effort {
+            Some(effort) => {
+                // 5.5：adaptive + 换算档位，预算移除，display 保留。
+                assert_eq!(
+                    out.body["thinking"]["type"], "adaptive",
+                    "model {actual_model}: legacy enabled must become adaptive"
+                );
+                assert!(
+                    out.body["thinking"].get("budget_tokens").is_none(),
+                    "model {actual_model}: budget_tokens must be converted, not forwarded"
+                );
+                assert_eq!(
+                    out.body["thinking"]["display"], "summarized",
+                    "model {actual_model}: display summary intent must survive"
+                );
+                assert_eq!(
+                    out.body["output_config"]["effort"], effort,
+                    "model {actual_model}: budget 16384 must map to {effort}"
+                );
+            }
+            None => {
+                // 非 5.5 模型：客户端 thinking 对象逐字保留（含 display 兄弟键）。
+                assert_eq!(out.body["thinking"]["type"], "enabled");
+                assert_eq!(out.body["thinking"]["budget_tokens"], 16384);
+                assert_eq!(out.body["thinking"]["display"], "summarized");
+                assert!(out.body.get("output_config").is_none());
+            }
+        }
+        // 其余字段不受影响。
+        assert_eq!(out.body["max_tokens"], 128000);
+        assert_eq!(out.body["stream"], true);
     }
 }

@@ -18,10 +18,10 @@ use crate::db::models::{
     CreateApiKey, CreateModel, CreateModelBackend, CreateProvider, CreateProviderProtocolEndpoint,
     LogPage, LogQuery, Model, ModelApiKeyUsageStats, ModelBackend, ModelProviderUsageStats,
     ModelStats, ModelTimeBucket, ModelUsageDetail, ModelUsageStats, ModelUsageTotals,
-    OAuthCredential, Provider, ProviderModelUsageStats, ProviderProtocolEndpoint, ProviderStats,
-    ProviderUsageDetail, RecentModelPerformance, RequestLog, StatsHourly, StatsOverview,
-    StatsTimeBucket, UpdateApiKey, UpdateModel, UpdateProvider, UpsertOAuthCredential,
-    is_valid_provider_auth_mode,
+    OAuthCredential, Provider, ProviderKey, ProviderKeyProbeResult, ProviderModelUsageStats,
+    ProviderProtocolEndpoint, ProviderStats, ProviderUsageDetail, RecentModelPerformance,
+    RequestLog, StatsHourly, StatsOverview, StatsTimeBucket, UpdateApiKey, UpdateModel,
+    UpdateProvider, UpsertOAuthCredential, UpsertProviderKey, is_valid_provider_auth_mode,
 };
 use crate::logging::LogEntry;
 use crate::logging::diagnostics::{RequestResult, error_sql, outcome_sql};
@@ -345,6 +345,81 @@ impl SqliteProviderStore {
         };
         Ok(endpoints)
     }
+
+    async fn load_keys(&self, provider_id: Option<&str>) -> anyhow::Result<Vec<ProviderKey>> {
+        let base = "SELECT id, provider_id, name, api_key, protocol, base_url, COALESCE(is_enabled, 1) AS is_enabled, COALESCE(priority, 0) AS priority, models_snapshot, manual_models, last_probe_at, probe_error, created_at, updated_at FROM provider_keys";
+        let keys = if let Some(provider_id) = provider_id {
+            sqlx::query_as::<_, ProviderKey>(&format!(
+                "{base} WHERE provider_id = ? ORDER BY priority, created_at, id"
+            ))
+            .bind(provider_id)
+            .fetch_all(&self.pool)
+            .await?
+        } else {
+            sqlx::query_as::<_, ProviderKey>(&format!(
+                "{base} ORDER BY provider_id, priority, created_at, id"
+            ))
+            .fetch_all(&self.pool)
+            .await?
+        };
+        Ok(keys)
+    }
+
+    /// Replace a provider's key pool. Rows whose `id` matches an existing key
+    /// keep their probe fields only while their API key, protocol, and base
+    /// URL are unchanged.
+    async fn replace_keys(
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        provider_id: &str,
+        inputs: &[UpsertProviderKey],
+    ) -> anyhow::Result<()> {
+        let existing: HashMap<String, ProviderKey> =
+            sqlx::query_as::<_, ProviderKey>(
+                "SELECT id, provider_id, name, api_key, protocol, base_url, COALESCE(is_enabled, 1) AS is_enabled, COALESCE(priority, 0) AS priority, models_snapshot, manual_models, last_probe_at, probe_error, created_at, updated_at FROM provider_keys WHERE provider_id = ?",
+            )
+            .bind(provider_id)
+            .fetch_all(&mut **tx)
+            .await?
+            .into_iter()
+            .map(|key| (key.id.clone(), key))
+            .collect();
+        sqlx::query("DELETE FROM provider_keys WHERE provider_id = ?")
+            .bind(provider_id)
+            .execute(&mut **tx)
+            .await?;
+        for input in inputs {
+            let protocol =
+                crate::db::models::normalize_provider_key_protocol(input.protocol.as_deref())?;
+            let base_url =
+                crate::db::models::normalize_provider_key_base_url(input.base_url.as_deref());
+            let id = input
+                .id
+                .clone()
+                .filter(|id| existing.contains_key(id))
+                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+            let preserved = existing.get(&id).filter(|key| {
+                key.api_key == input.api_key && key.protocol == protocol && key.base_url == base_url
+            });
+            sqlx::query(
+                "INSERT INTO provider_keys (id, provider_id, name, api_key, protocol, base_url, is_enabled, priority, models_snapshot, manual_models, last_probe_at, probe_error) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&id)
+            .bind(provider_id)
+            .bind(input.name.trim())
+            .bind(&input.api_key)
+            .bind(&protocol)
+            .bind(&base_url)
+            .bind(input.is_enabled)
+            .bind(input.priority)
+            .bind(preserved.and_then(|k| k.models_snapshot.clone()))
+            .bind(&input.manual_models)
+            .bind(preserved.and_then(|k| k.last_probe_at.clone()))
+            .bind(preserved.and_then(|k| k.probe_error.clone()))
+            .execute(&mut **tx)
+            .await?;
+        }
+        Ok(())
+    }
 }
 
 fn endpoint_inputs_or_legacy(input: &CreateProvider) -> Vec<CreateProviderProtocolEndpoint> {
@@ -376,8 +451,16 @@ impl ProviderStore for SqliteProviderStore {
                 .or_default()
                 .push(endpoint);
         }
+        let mut keys_by_provider: HashMap<String, Vec<ProviderKey>> = HashMap::new();
+        for key in self.load_keys(None).await? {
+            keys_by_provider
+                .entry(key.provider_id.clone())
+                .or_default()
+                .push(key);
+        }
         for provider in &mut providers {
             provider.protocol_endpoints = by_provider.remove(&provider.id).unwrap_or_default();
+            provider.keys = keys_by_provider.remove(&provider.id).unwrap_or_default();
         }
         Ok(providers)
     }
@@ -391,6 +474,7 @@ impl ProviderStore for SqliteProviderStore {
         .await?;
         if let Some(provider) = &mut provider {
             provider.protocol_endpoints = self.load_endpoints(Some(id)).await?;
+            provider.keys = self.load_keys(Some(id)).await?;
         }
         Ok(provider)
     }
@@ -438,6 +522,7 @@ impl ProviderStore for SqliteProviderStore {
             .execute(&mut *tx)
             .await?;
         }
+        Self::replace_keys(&mut tx, &id, &input.keys).await?;
         tx.commit().await?;
         self.get(&id)
             .await?
@@ -451,6 +536,8 @@ impl ProviderStore for SqliteProviderStore {
             .context("provider not found for update")?;
         let replace_endpoints = input.protocol_endpoints.is_some();
         let endpoint_inputs = input.protocol_endpoints.clone();
+        let replace_keys = input.keys.is_some();
+        let key_inputs = input.keys.clone().unwrap_or_default();
         let models_source_input = input.models_source.map(|value| value.trim().to_string());
         let name = input.name.unwrap_or(current.name);
         let vendor = if input.vendor.is_some() {
@@ -516,6 +603,9 @@ impl ProviderStore for SqliteProviderStore {
                 .await?;
             }
         }
+        if replace_keys {
+            Self::replace_keys(&mut tx, id, &key_inputs).await?;
+        }
         tx.commit().await?;
         self.get(id).await?.context("provider missing after update")
     }
@@ -539,6 +629,11 @@ impl ProviderStore for SqliteProviderStore {
             .await?;
 
         sqlx::query("DELETE FROM provider_protocol_endpoints WHERE provider_id = ?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+
+        sqlx::query("DELETE FROM provider_keys WHERE provider_id = ?")
             .bind(id)
             .execute(&mut *tx)
             .await?;
@@ -600,6 +695,23 @@ impl ProviderStore for SqliteProviderStore {
         .bind(result.error)
         .bind(result.tested_at)
         .bind(endpoint_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn record_key_probe_result(
+        &self,
+        key_id: &str,
+        result: ProviderKeyProbeResult,
+    ) -> anyhow::Result<()> {
+        sqlx::query(
+            "UPDATE provider_keys SET models_snapshot = ?, probe_error = ?, last_probe_at = ?, updated_at = datetime('now') WHERE id = ?",
+        )
+        .bind(result.models.as_deref().map(crate::db::models::encode_model_list))
+        .bind(&result.error)
+        .bind(&result.tested_at)
+        .bind(key_id)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -1161,7 +1273,7 @@ impl LogStore for SqliteLogStore {
             sqlx::query(
                 r#"INSERT INTO request_logs
                     (id, created_at, api_key_id, api_key_name,
-                     client_protocol, upstream_protocol, provider_id, provider_name, model_id, model_name, upstream_url,
+                     client_protocol, upstream_protocol, provider_id, provider_name, provider_key_name, model_id, model_name, upstream_url,
                      client_model, upstream_model, reasoning_effort, route_decision,
                      method, path,
                      client_request_headers, client_request_body,
@@ -1174,7 +1286,7 @@ impl LogStore for SqliteLogStore {
                      is_stream, stream_chunks_count, stream_first_chunk_ms,
                      performance_metadata_version, upstream_effort_status, upstream_effort_raw, upstream_effort_tier, request_completion, completion_reason, upstream_response_mode, performance_upstream_ms, performance_first_chunk_ms, performance_completed_at,
                      client_request_id, attempt_index, outcome_version, attempt_outcome, failure_kind, failure_stage, error_message, error_causes_json, payload_metadata_json)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
             )
             .bind(&id)
             .bind(entry.created_at)
@@ -1184,6 +1296,7 @@ impl LogStore for SqliteLogStore {
             .bind(&entry.upstream_protocol)
             .bind(&entry.provider_id)
             .bind(&entry.provider_name)
+            .bind(&entry.provider_key_name)
             .bind(&entry.model_id)
             .bind(&entry.model_name)
             .bind(&entry.upstream_url)
@@ -1252,7 +1365,7 @@ impl LogStore for SqliteLogStore {
         // List query skips the heavy body/header columns (NULL placeholders preserve struct layout).
         let mut data_sql = String::from(
             "SELECT id, COALESCE(CAST(created_at AS INTEGER), 0) AS created_at, api_key_id, api_key_name, \
-             client_protocol, upstream_protocol, provider_id, provider_name, model_id, model_name, upstream_url, \
+             client_protocol, upstream_protocol, provider_id, provider_name, provider_key_name, model_id, model_name, upstream_url, \
              client_model, upstream_model, reasoning_effort, route_decision, method, path, \
              NULL AS client_request_headers, NULL AS client_request_body, \
              NULL AS client_response_headers, NULL AS client_response_body, \
@@ -1359,7 +1472,7 @@ impl LogStore for SqliteLogStore {
     async fn find_by_id(&self, id: &str) -> anyhow::Result<Option<RequestLog>> {
         let row = sqlx::query_as::<_, RequestLog>(
             "SELECT id, COALESCE(CAST(created_at AS INTEGER), 0) AS created_at, api_key_id, api_key_name, \
-             client_protocol, upstream_protocol, provider_id, provider_name, model_id, model_name, upstream_url, \
+             client_protocol, upstream_protocol, provider_id, provider_name, provider_key_name, model_id, model_name, upstream_url, \
              client_model, upstream_model, reasoning_effort, route_decision, method, path, \
              client_request_headers, client_request_body, \
              client_response_headers, client_response_body, \

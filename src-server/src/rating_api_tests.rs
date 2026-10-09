@@ -14,6 +14,7 @@ async fn fixture() -> anyhow::Result<(tempfile::TempDir, Router)> {
     let _ = gw
         .admin()
         .create_provider(CreateProvider {
+            keys: Vec::new(),
             name: "ratings-http".to_string(),
             vendor: None,
             protocol: "openai-compatible".to_string(),

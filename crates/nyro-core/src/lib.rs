@@ -25,6 +25,7 @@ use sqlx::{MySql, Pool, Postgres, SqlitePool};
 use tokio::sync::mpsc;
 
 use crate::auth::types::AuthSession;
+use crate::provider::xiaomimimo::passport::MimoSessionCache;
 use crate::router::health::HealthRegistry;
 use crate::router::latency::LatencyRegistry;
 use crate::router::quota::ProviderQuotaRegistry;
@@ -62,6 +63,9 @@ pub struct Gateway {
     pub health_registry: Arc<HealthRegistry>,
     pub latency_registry: Arc<LatencyRegistry>,
     pub quota_registry: Arc<ProviderQuotaRegistry>,
+    /// Minted MiMo console sessions (passToken → serviceToken renewal);
+    /// one entry per provider id, invalidated on credential changes.
+    pub(crate) mimo_sessions: Arc<MimoSessionCache>,
     pub ollama_capability_cache: Arc<tokio::sync::RwLock<HashMap<String, CapabilityCacheEntry>>>,
     pub(crate) compat_engine: Arc<nyro_ccswitch_compat::CompatEngine>,
     pub log_tx: mpsc::Sender<LogEntry>,
@@ -187,6 +191,7 @@ impl Gateway {
         let health_registry = Arc::new(HealthRegistry::new());
         let latency_registry = Arc::new(LatencyRegistry::new());
         let quota_registry = Arc::new(ProviderQuotaRegistry::new());
+        let mimo_sessions = Arc::new(MimoSessionCache::new());
         let ollama_capability_cache = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
 
         let (log_tx, log_rx) = mpsc::channel(1024);
@@ -201,6 +206,7 @@ impl Gateway {
             health_registry,
             latency_registry,
             quota_registry,
+            mimo_sessions,
             ollama_capability_cache,
             compat_engine: Arc::new(nyro_ccswitch_compat::CompatEngine::default()),
             log_tx,

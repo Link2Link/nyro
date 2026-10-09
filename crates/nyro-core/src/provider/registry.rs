@@ -233,6 +233,7 @@ impl VendorRegistry {
             "deepseek",
             "moonshotai",
             "kimi-code",
+            "xiaomimimo",
             "minimax",
             "zhipuai",
             "zai",

@@ -1,15 +1,15 @@
 use super::*;
 
 const DEFAULT_TIME_SERIES_HOURS: i32 = 24;
-const MAX_TIME_SERIES_HOURS: i32 = 168;
+const MAX_TIME_SERIES_HOURS: i32 = 720;
 const MILLIS_PER_MINUTE: i64 = 60_000;
 const MILLIS_PER_HOUR: i64 = 60 * MILLIS_PER_MINUTE;
 
 fn normalize_detail_hours(hours: Option<i32>) -> anyhow::Result<i32> {
     let hours = hours.unwrap_or(24);
     anyhow::ensure!(
-        matches!(hours, 6 | 24 | 72 | 168),
-        "hours must be one of 6, 24, 72, or 168"
+        matches!(hours, 6 | 24 | 72 | 168 | 720),
+        "hours must be one of 6, 24, 72, 168, or 720"
     );
     Ok(hours)
 }
@@ -25,7 +25,8 @@ fn time_series_bucket_minutes(hours: i32) -> i32 {
         ..=6 => 5,
         ..=24 => 15,
         ..=72 => 30,
-        _ => 60,
+        ..=168 => 60,
+        _ => 240,
     }
 }
 
@@ -509,10 +510,10 @@ mod tests {
     #[test]
     fn detail_hours_use_default_and_reject_unsupported_values() {
         assert_eq!(normalize_detail_hours(None).unwrap(), 24);
-        for hours in [6, 24, 72, 168] {
+        for hours in [6, 24, 72, 168, 720] {
             assert_eq!(normalize_detail_hours(Some(hours)).unwrap(), hours);
         }
-        for hours in [-1, 0, 1, 12, 169] {
+        for hours in [-1, 0, 1, 12, 169, 721] {
             assert!(normalize_detail_hours(Some(hours)).is_err());
         }
     }
@@ -527,6 +528,8 @@ mod tests {
         assert_eq!(time_series_bucket_minutes(72), 30);
         assert_eq!(time_series_bucket_minutes(73), 60);
         assert_eq!(time_series_bucket_minutes(168), 60);
+        assert_eq!(time_series_bucket_minutes(169), 240);
+        assert_eq!(time_series_bucket_minutes(720), 240);
     }
 
     #[test]
@@ -534,7 +537,7 @@ mod tests {
         assert_eq!(normalize_time_series_hours(None), 24);
         assert_eq!(normalize_time_series_hours(Some(0)), 1);
         assert_eq!(normalize_time_series_hours(Some(6)), 6);
-        assert_eq!(normalize_time_series_hours(Some(999)), 168);
+        assert_eq!(normalize_time_series_hours(Some(999)), 720);
     }
 
     #[test]

@@ -84,6 +84,12 @@ pub struct Provider {
     #[serde(default)]
     #[sqlx(skip)]
     pub protocol_endpoints: Vec<ProviderProtocolEndpoint>,
+    /// Provider-level API-key pool (relay vendors). Empty for single-key
+    /// providers; when non-empty the pool is the sole credential source for
+    /// dispatch and per-key model snapshots drive key selection.
+    #[serde(default)]
+    #[sqlx(skip)]
+    pub keys: Vec<ProviderKey>,
     pub preset_key: Option<String>,
     pub channel: Option<String>,
     #[serde(alias = "modelsEndpoint")]
@@ -123,6 +129,133 @@ pub struct ProviderProtocolEndpoint {
     pub tested_at: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+}
+
+/// One candidate credential in a provider's key pool. Each row fully
+/// describes one dispatch candidate: secret (`api_key`), optional protocol
+/// pin, and optional upstream API address (`base_url`); unset fields inherit
+/// the provider's own protocol / base URL. Relay vendors (UUAPI / linkai /
+/// apinebula style) also expose different model sets per key;
+/// `models_snapshot` caches the per-key discovery result and `manual_models`
+/// lets the user override it when the relay's `/models` does not discriminate
+/// per key.
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow, PartialEq, Eq)]
+pub struct ProviderKey {
+    pub id: String,
+    pub provider_id: String,
+    pub name: String,
+    pub api_key: String,
+    /// Canonical protocol endpoint id; `None` inherits the provider's
+    /// fixed/adaptive protocol.
+    #[serde(default)]
+    pub protocol: Option<String>,
+    /// Upstream API address override; `None` inherits the provider's base
+    /// URL (or the adaptive endpoint's, for a pinned protocol).
+    #[serde(default)]
+    pub base_url: Option<String>,
+    pub is_enabled: bool,
+    pub priority: i32,
+    /// JSON-encoded array of models discovered by probing with this key.
+    #[serde(default)]
+    pub models_snapshot: Option<String>,
+    /// JSON-encoded array of manually curated models; when present it
+    /// overrides `models_snapshot` for eligibility checks.
+    #[serde(default)]
+    pub manual_models: Option<String>,
+    pub last_probe_at: Option<String>,
+    pub probe_error: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+impl ProviderKey {
+    /// Effective model set for routing eligibility. `None` means "no
+    /// information" (never probed, no manual list): the key is treated as
+    /// eligible for any model so an unprobed pool never silently blocks
+    /// traffic. `Some(empty)` means probed/curated to nothing: never eligible.
+    pub fn effective_models(&self) -> Option<Vec<String>> {
+        if let Some(manual) = parse_model_list(self.manual_models.as_deref()) {
+            return Some(manual);
+        }
+        parse_model_list(self.models_snapshot.as_deref())
+    }
+}
+
+/// Parse a JSON-encoded model list column (`null`/absent → `None`, present →
+/// `Some(list)` even when empty).
+pub fn parse_model_list(raw: Option<&str>) -> Option<Vec<String>> {
+    let raw = raw?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    match serde_json::from_str::<Vec<String>>(raw) {
+        Ok(list) => Some(list),
+        Err(_) => None,
+    }
+}
+
+/// Serialize a model list for storage in a snapshot/manual column.
+pub fn encode_model_list(models: &[String]) -> String {
+    serde_json::to_string(models).unwrap_or_else(|_| "[]".to_string())
+}
+
+/// Upsert input for a provider key pool entry (one dispatch candidate).
+/// `id: Some` keeps the stored row's probe fields only while its API key,
+/// normalized protocol, and base URL are unchanged; `id: None` creates a
+/// fresh row. Manual models are independent of probe fields.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpsertProviderKey {
+    pub id: Option<String>,
+    pub name: String,
+    pub api_key: String,
+    /// Optional protocol override; absent, null, or blank inherits the
+    /// provider's fixed/adaptive protocol.
+    #[serde(default)]
+    pub protocol: Option<String>,
+    /// Optional upstream API address override; blank inherits the provider.
+    #[serde(default)]
+    pub base_url: Option<String>,
+    #[serde(default = "default_provider_endpoint_enabled")]
+    pub is_enabled: bool,
+    #[serde(default)]
+    pub priority: i32,
+    /// JSON-encoded array; replaces the manual model list when present.
+    #[serde(default)]
+    pub manual_models: Option<String>,
+}
+
+/// Normalize a key's optional protocol to a canonical endpoint id. Blank
+/// values inherit the provider. Resolution mirrors provider-level parsing
+/// (`ProviderProtocols::parse_protocol_key`): canonical endpoint ids and
+/// aliases resolve directly; suite names map to the suite's first endpoint
+/// (e.g. `openai-compatible` → chat-completions), so the WebUI's suite-level
+/// selector keeps working.
+pub fn normalize_provider_key_protocol(raw: Option<&str>) -> anyhow::Result<Option<String>> {
+    let Some(raw) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    let endpoint = crate::protocol::ProviderProtocols::parse_protocol_key(raw)
+        .ok_or_else(|| anyhow::anyhow!("unsupported provider key protocol: {raw}"))?;
+    Ok(Some(endpoint.to_string()))
+}
+
+/// Normalize a key's optional upstream API address; blank inherits the
+/// provider (`None`).
+pub fn normalize_provider_key_base_url(raw: Option<&str>) -> Option<String> {
+    raw.map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+/// Probe outcome for a single provider-key row, written back by the admin
+/// probe workflow (probe doubles as per-key connectivity test).
+#[derive(Debug, Clone)]
+pub struct ProviderKeyProbeResult {
+    pub success: bool,
+    pub error: Option<String>,
+    pub tested_at: String,
+    /// `Some(models)` on success (may be empty); `None` on failure.
+    pub models: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -464,6 +597,10 @@ pub struct RequestLog {
     pub upstream_protocol: Option<String>,
     pub provider_id: Option<String>,
     pub provider_name: Option<String>,
+    /// Provider key-pool entry used for the upstream call (multi-key relay
+    /// providers); NULL for single-key providers.
+    #[serde(default)]
+    pub provider_key_name: Option<String>,
     #[serde(alias = "route_id")]
     pub model_id: Option<String>,
     #[serde(alias = "route_name")]
@@ -554,6 +691,8 @@ pub struct CreateProvider {
     pub protocol_mode: String,
     #[serde(default)]
     pub protocol_endpoints: Vec<CreateProviderProtocolEndpoint>,
+    #[serde(default)]
+    pub keys: Vec<UpsertProviderKey>,
     pub preset_key: Option<String>,
     pub channel: Option<String>,
     #[serde(alias = "modelsSource")]
@@ -576,6 +715,9 @@ pub struct UpdateProvider {
     pub base_url: Option<String>,
     pub protocol_mode: Option<String>,
     pub protocol_endpoints: Option<Vec<CreateProviderProtocolEndpoint>>,
+    /// Replace-all semantics for the key pool; rows whose `id` matches an
+    /// existing key keep their probe fields (snapshot/error/timestamps).
+    pub keys: Option<Vec<UpsertProviderKey>>,
     pub preset_key: Option<String>,
     pub channel: Option<String>,
     #[serde(alias = "modelsSource")]
@@ -1441,6 +1583,11 @@ pub struct ExportProvider {
     pub protocol_mode: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub endpoints: Vec<CreateProviderProtocolEndpoint>,
+    /// Key-pool entries (multi-key relay providers). Auto-probed model
+    /// snapshots are exported as `manual_models` so a re-import keeps the
+    /// key→model mapping without requiring an immediate re-probe.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub keys: Vec<UpsertProviderKey>,
     #[serde(default, skip_serializing)]
     pub default_protocol: String,
     #[serde(default, skip_serializing)]
@@ -1509,6 +1656,19 @@ impl Provider {
             .as_deref()
             .filter(|v| !v.trim().is_empty())
     }
+
+    /// True when the provider's key pool is active (at least one key row
+    /// exists). An active pool is the sole credential source for dispatch;
+    /// `provider.api_key` is ignored. Only meaningful for `apikey` auth mode.
+    pub fn has_key_pool(&self) -> bool {
+        !self.keys.is_empty()
+    }
+
+    /// Enabled keys in dispatch order (priority, then insertion order — the
+    /// storage layer already returns them sorted).
+    pub fn enabled_keys(&self) -> Vec<&ProviderKey> {
+        self.keys.iter().filter(|key| key.is_enabled).collect()
+    }
 }
 
 impl CreateProvider {
@@ -1524,5 +1684,43 @@ impl UpdateProvider {
         self.models_source
             .as_deref()
             .filter(|v| !v.trim().is_empty())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn key_protocol_normalizes_suite_alias_and_blank() {
+        // Suite name maps to the suite's first endpoint, mirroring
+        // provider-level parsing (openai-compatible → chat-completions).
+        assert_eq!(
+            normalize_provider_key_protocol(Some("openai-compatible")).unwrap(),
+            Some("openai-compatible/chat-completions/v1".to_string())
+        );
+        // Canonical endpoint ids and aliases pass through normalized.
+        assert_eq!(
+            normalize_provider_key_protocol(Some("anthropic-messages")).unwrap(),
+            Some("anthropic-messages/messages/2023-06-01".to_string())
+        );
+        assert_eq!(
+            normalize_provider_key_protocol(Some("openai-responses/responses/v1")).unwrap(),
+            Some("openai-responses/responses/v1".to_string())
+        );
+        // Blank / missing inherits the provider.
+        assert_eq!(normalize_provider_key_protocol(None).unwrap(), None);
+        assert_eq!(normalize_provider_key_protocol(Some("  ")).unwrap(), None);
+        assert!(normalize_provider_key_protocol(Some("nope")).is_err());
+    }
+
+    #[test]
+    fn key_base_url_blank_inherits() {
+        assert_eq!(normalize_provider_key_base_url(None), None);
+        assert_eq!(normalize_provider_key_base_url(Some("  ")), None);
+        assert_eq!(
+            normalize_provider_key_base_url(Some("  https://k.test/v1 ")),
+            Some("https://k.test/v1".to_string())
+        );
     }
 }

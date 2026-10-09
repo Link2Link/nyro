@@ -78,6 +78,7 @@ pub fn run() {
             commands::test_provider,
             commands::test_provider_models,
             commands::probe_provider_models,
+            commands::probe_provider_keys,
             commands::get_provider_usage_credentials,
             commands::set_provider_usage_credentials,
             commands::get_provider_models,

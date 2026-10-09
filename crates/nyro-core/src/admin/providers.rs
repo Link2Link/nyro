@@ -9,6 +9,18 @@ struct NormalizedProtocolConfig {
     endpoints: Vec<CreateProviderProtocolEndpoint>,
 }
 
+/// Per-key result of the key-pool probe (`probe_provider_keys`).
+#[derive(Debug, Clone, Serialize)]
+pub struct ProviderKeyProbeStatus {
+    pub key_id: String,
+    pub name: String,
+    pub success: bool,
+    pub error: Option<String>,
+    /// Models discovered with this key (empty on failure).
+    pub models: Vec<String>,
+    pub tested_at: String,
+}
+
 /// Per-model result of the "send hi" probe over a provider's model list.
 #[derive(Debug, Clone, Serialize)]
 pub struct ProviderModelProbeResult {
@@ -17,7 +29,7 @@ pub struct ProviderModelProbeResult {
     pub error: Option<String>,
     pub latency_ms: u64,
     /// Canonical protocol endpoint id used for the probe (e.g.
-    /// `openai-compatible/chat-completions/v1`).
+    /// `openai-compatible/chat-completions/v1`); empty on local routing failure.
     pub protocol: String,
     /// Assistant text received for the "hi" probe (success only).
     /// The value "[completed]" means the upstream completed without displayable text.
@@ -1035,34 +1047,62 @@ struct ProbeTarget {
     auth_scheme: String,
 }
 
-/// Resolve the endpoint a model probe must use — the same decision the
-/// dispatcher's negotiation makes, so "green in the probe" implies "callable
-/// through the proxy".
+/// Resolve the same model endpoint as dispatch. A successful probe validates
+/// basic connectivity on that endpoint, not every request/conversion feature.
 ///
-/// Only adaptive OpenCode Go providers get per-model routing (the vendor table
-/// is consulted when the provider declares the model's endpoint); every other
-/// provider, and any model whose endpoint is not declared, stays on the
-/// provider's default probe endpoint.
+/// OpenCode Go uses the dispatcher's strict exact-endpoint resolver, including
+/// for fixed providers. Pool candidates resolve through the same key-aware
+/// resolver as dispatch, so a pinned protocol is probed on its own endpoint.
+/// Non-Go providers without pins retain their default probe target. Fixed
+/// providers keep their resolved runtime credential and binding overrides.
 fn resolve_probe_target(
     provider: &Provider,
     model: &str,
     default: &ProbeTarget,
-    declared: &[(crate::protocol::ids::Protocol, &ProviderProtocolEndpoint)],
-) -> ProbeTarget {
+    pool_key: Option<&crate::db::models::ProviderKey>,
+) -> Result<ProbeTarget, crate::error::GatewayError> {
     use crate::protocol::ids::Protocol;
 
-    if !provider.is_adaptive() || !crate::provider::opencode_go::session::is_opencode_go(provider) {
-        return default.clone();
-    }
-    let wanted = crate::provider::opencode_go::routing::primary_protocol(model);
-    let Some((suite, endpoint)) = declared
-        .iter()
-        .find(|(protocol, _)| *protocol == wanted.protocol)
-        .copied()
+    let Some(endpoint) = crate::provider::key_pool::resolve_endpoint(provider, pool_key, model)?
     else {
-        return default.clone();
+        return Ok(default.clone());
     };
-    let registry = crate::protocol::registry::ProtocolRegistry::global();
+    if !provider.is_adaptive() {
+        // Fixed providers keep their runtime-resolved base URL and binding
+        // overrides; the resolved endpoint only validates/retargets the
+        // protocol (runtime binding base URLs win over catalog endpoints).
+        return Ok(ProbeTarget {
+            suite: endpoint.protocol.protocol,
+            protocol_id: endpoint.protocol.to_string(),
+            ..default.clone()
+        });
+    }
+    let credential = endpoint
+        .record_id
+        .as_deref()
+        .and_then(|id| {
+            provider
+                .protocol_endpoints
+                .iter()
+                .find(|record| record.id == id)
+        })
+        .ok_or_else(|| {
+            crate::error::GatewayError::provider_unavailable(
+                &provider.name,
+                "resolved probe endpoint has no credential record",
+            )
+        })?;
+    if endpoint.base_url.trim().is_empty()
+        || (credential.api_key.trim().is_empty()
+            && endpoint.auth_scheme.trim() != "none"
+            && !provider.has_key_pool())
+    {
+        return Err(crate::error::GatewayError::provider_unavailable(
+            &provider.name,
+            "resolved probe endpoint has an empty base URL or API key",
+        ));
+    }
+    let suite = endpoint.protocol.protocol;
     let auth_scheme = match endpoint.auth_scheme.trim() {
         "" | "auto" => match suite {
             Protocol::AnthropicMessages => "x-api-key",
@@ -1070,15 +1110,290 @@ fn resolve_probe_target(
         },
         explicit => explicit,
     };
-    ProbeTarget {
+    Ok(ProbeTarget {
         suite,
-        protocol_id: registry
-            .resolve_alias(&endpoint.protocol)
-            .map(|resolved| resolved.to_string())
-            .unwrap_or_else(|| endpoint.protocol.clone()),
+        protocol_id: endpoint.protocol.to_string(),
         base_url: endpoint.base_url.trim().trim_end_matches('/').to_string(),
-        api_key: endpoint.api_key.trim().to_string(),
+        api_key: credential.api_key.trim().to_string(),
         auth_scheme: auth_scheme.to_string(),
+    })
+}
+
+/// A routing failure is local to one model and must never become a request to
+/// the default endpoint. An empty protocol means no endpoint was selected.
+fn model_probe_routing_failure(
+    model: String,
+    error: crate::error::GatewayError,
+) -> ProviderModelProbeResult {
+    ProviderModelProbeResult {
+        model,
+        success: false,
+        error: Some(error.to_string()),
+        latency_ms: 0,
+        protocol: String::new(),
+        reply: None,
+        quota_remaining: None,
+        quota_resets_at: None,
+    }
+}
+
+/// Normalize an explicit probe selection: trim entries, drop empty ones and
+/// exact duplicates (first-seen order wins). `None` means "probe every
+/// discovered model"; a selection that normalizes to nothing is rejected up
+/// front so a caller can never fall through to a full run (or an empty one)
+/// by accident.
+pub fn normalize_probe_selection(
+    models: Option<Vec<String>>,
+) -> anyhow::Result<Option<Vec<String>>> {
+    let Some(models) = models else {
+        return Ok(None);
+    };
+    let mut seen = std::collections::HashSet::new();
+    let selection: Vec<String> = models
+        .iter()
+        .map(|model| model.trim().to_string())
+        .filter(|model| !model.is_empty())
+        .filter(|model| seen.insert(model.clone()))
+        .collect();
+    if selection.is_empty() {
+        anyhow::bail!("model selection is empty");
+    }
+    Ok(Some(selection))
+}
+
+#[cfg(test)]
+mod probe_routing_tests {
+    use super::*;
+    use crate::error::GatewayError;
+    use crate::protocol::ids::{
+        ANTHROPIC_MESSAGES_2023_06_01, OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1, OPENAI_RESPONSES_V1,
+        Protocol, ProtocolId,
+    };
+
+    fn endpoint(id: &str, protocol: ProtocolId, priority: i32) -> ProviderProtocolEndpoint {
+        ProviderProtocolEndpoint {
+            id: id.into(),
+            provider_id: "go".into(),
+            protocol: protocol.to_string(),
+            base_url: format!("https://{id}.example/v1"),
+            api_key: format!("key-{id}"),
+            auth_scheme: "auto".into(),
+            is_enabled: true,
+            priority,
+            test_status: "untested".into(),
+            test_error: None,
+            tested_at: None,
+            created_at: String::new(),
+            updated_at: String::new(),
+        }
+    }
+
+    fn provider() -> Provider {
+        Provider {
+            id: "go".into(),
+            name: "Go".into(),
+            vendor: Some("opencode-go".into()),
+            protocol: OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1.to_string(),
+            base_url: "https://custom-go.example".into(),
+            protocol_mode: "adaptive".into(),
+            protocol_endpoints: vec![
+                endpoint("chat", OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1, 0),
+                endpoint("responses", OPENAI_RESPONSES_V1, 1),
+                endpoint("messages", ANTHROPIC_MESSAGES_2023_06_01, 2),
+            ],
+            keys: Vec::new(),
+            preset_key: None,
+            channel: None,
+            models_source: None,
+            static_models: None,
+            api_key: "provider-key".into(),
+            auth_mode: "apikey".into(),
+            use_proxy: false,
+            fast_mode: false,
+            last_test_success: None,
+            last_test_at: None,
+            is_enabled: true,
+            created_at: String::new(),
+            updated_at: String::new(),
+        }
+    }
+
+    fn default_target() -> ProbeTarget {
+        ProbeTarget {
+            suite: Protocol::OpenAICompatible,
+            protocol_id: OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1.to_string(),
+            base_url: "https://runtime.example".into(),
+            api_key: "runtime-token".into(),
+            auth_scheme: "none".into(),
+        }
+    }
+
+    #[test]
+    fn go_probe_uses_catalog_endpoint_and_its_credential_record() {
+        let mut provider = provider();
+        // A second record for the same protocol must not steal credentials
+        // from the exact record selected by the shared resolver's priority.
+        provider.protocol_endpoints.insert(
+            0,
+            endpoint("other-messages", ANTHROPIC_MESSAGES_2023_06_01, 9),
+        );
+        let messages =
+            resolve_probe_target(&provider, "minimax-m3", &default_target(), None).unwrap();
+        assert_eq!(messages.suite, Protocol::AnthropicMessages);
+        assert_eq!(
+            messages.protocol_id,
+            ANTHROPIC_MESSAGES_2023_06_01.to_string()
+        );
+        assert_eq!(messages.base_url, "https://messages.example/v1");
+        assert_eq!(messages.api_key, "key-messages");
+        assert_eq!(messages.auth_scheme, "x-api-key");
+
+        let responses =
+            resolve_probe_target(&provider, "grok-4.6", &default_target(), None).unwrap();
+        assert_eq!(responses.protocol_id, OPENAI_RESPONSES_V1.to_string());
+        assert_eq!(responses.api_key, "key-responses");
+        assert_eq!(responses.auth_scheme, "bearer");
+    }
+
+    #[test]
+    fn go_probe_rejects_unknown_missing_and_disabled_routes() {
+        let mut provider = provider();
+        assert!(matches!(
+            resolve_probe_target(&provider, "unknown-model", &default_target(), None),
+            Err(GatewayError::ProviderUnavailable { .. })
+        ));
+        provider.protocol_endpoints[1].is_enabled = false;
+        assert!(resolve_probe_target(&provider, "grok-4.6", &default_target(), None).is_err());
+        provider.protocol_endpoints.pop();
+        assert!(resolve_probe_target(&provider, "minimax-m3", &default_target(), None).is_err());
+        provider.protocol_endpoints.clear();
+        assert!(resolve_probe_target(&provider, "kimi-k3", &default_target(), None).is_err());
+    }
+
+    #[test]
+    fn go_probe_does_not_match_another_endpoint_in_the_same_suite() {
+        let mut provider = provider();
+        provider.protocol_endpoints = vec![endpoint(
+            "embeddings",
+            crate::protocol::ids::OPENAI_COMPATIBLE_EMBEDDINGS_V1,
+            0,
+        )];
+        assert!(matches!(
+            resolve_probe_target(&provider, "kimi-k3", &default_target(), None),
+            Err(GatewayError::ProviderUnavailable { .. })
+        ));
+    }
+
+    #[test]
+    fn fixed_go_probe_validates_route_but_preserves_runtime_binding() {
+        let mut provider = provider();
+        provider.protocol_mode = "fixed".into();
+        provider.protocol_endpoints.clear();
+        let target = resolve_probe_target(&provider, "kimi-k3", &default_target(), None).unwrap();
+        assert_eq!(target.api_key, "runtime-token");
+        assert_eq!(target.base_url, "https://runtime.example");
+        assert_eq!(target.auth_scheme, "none");
+        assert_eq!(
+            target.protocol_id,
+            OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1.to_string()
+        );
+        assert!(resolve_probe_target(&provider, "minimax-m3", &default_target(), None).is_err());
+        assert!(resolve_probe_target(&provider, "unknown-model", &default_target(), None).is_err());
+    }
+
+    #[test]
+    fn non_go_probe_keeps_default_for_unknown_models() {
+        let mut provider = provider();
+        provider.vendor = Some("custom".into());
+        let target =
+            resolve_probe_target(&provider, "unknown-model", &default_target(), None).unwrap();
+        assert_eq!(target.api_key, "runtime-token");
+        assert_eq!(target.base_url, "https://runtime.example");
+        assert_eq!(target.auth_scheme, "none");
+        assert_eq!(target.protocol_id, default_target().protocol_id);
+    }
+
+    #[test]
+    fn model_local_failure_does_not_prevent_the_next_resolution() {
+        let provider = provider();
+        let mut outcomes = ["unknown-model", "kimi-k3"].into_iter().map(|model| {
+            resolve_probe_target(&provider, model, &default_target(), None)
+                .map_err(|error| model_probe_routing_failure(model.into(), error))
+        });
+        let failure = outcomes.next().unwrap().unwrap_err();
+        assert!(!failure.success);
+        assert!(failure.error.is_some());
+        assert_eq!(failure.model, "unknown-model");
+        assert_eq!(failure.latency_ms, 0);
+        assert!(failure.protocol.is_empty());
+        assert!(failure.reply.is_none());
+        assert!(outcomes.next().unwrap().is_ok());
+    }
+
+    #[test]
+    fn custom_go_probe_request_carries_provider_session_and_preserves_override() {
+        let provider = provider();
+        let mut runtime_headers = HeaderMap::new();
+        crate::provider::opencode_go::session::apply_provider_probe_session_header(
+            &mut runtime_headers,
+            &provider,
+            "kimi-k3",
+        );
+        let (_, headers, _) = build_model_probe_request(
+            Protocol::OpenAICompatible,
+            &provider.base_url,
+            "key",
+            "bearer",
+            &runtime_headers,
+            "kimi-k3",
+            false,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            headers["x-opencode-session"],
+            runtime_headers["x-opencode-session"]
+        );
+        runtime_headers.insert("x-opencode-session", HeaderValue::from_static("provided"));
+        crate::provider::opencode_go::session::apply_provider_probe_session_header(
+            &mut runtime_headers,
+            &provider,
+            "kimi-k3",
+        );
+        assert_eq!(runtime_headers["x-opencode-session"], "provided");
+    }
+}
+
+#[cfg(test)]
+mod probe_selection_tests {
+    use super::*;
+
+    #[test]
+    fn absent_selection_means_probe_every_discovered_model() {
+        assert_eq!(normalize_probe_selection(None).unwrap(), None);
+    }
+
+    #[test]
+    fn empty_and_blank_selections_are_rejected() {
+        assert!(normalize_probe_selection(Some(Vec::new())).is_err());
+        assert!(normalize_probe_selection(Some(vec!["".into(), "   ".into()])).is_err());
+    }
+
+    #[test]
+    fn selection_trims_drops_blanks_and_dedupes_in_order() {
+        let selection = normalize_probe_selection(Some(vec![
+            " b ".into(),
+            "a".into(),
+            "b".into(),
+            "  ".into(),
+            "c".into(),
+            "a".into(),
+        ]))
+        .unwrap()
+        .unwrap();
+        assert_eq!(selection, vec!["b", "a", "c"]);
     }
 }
 
@@ -1139,6 +1454,11 @@ impl AdminService {
                 base_url: protocol.base_url,
                 protocol_mode: protocol.mode,
                 protocol_endpoints: protocol.endpoints,
+                keys: if auth_mode == "oauth" {
+                    Vec::new()
+                } else {
+                    input.keys
+                },
                 preset_key: input.preset_key,
                 channel: input.channel,
                 models_source: input.models_source,
@@ -1191,6 +1511,20 @@ impl AdminService {
                         auth_scheme: endpoint.auth_scheme.clone(),
                         is_enabled: endpoint.is_enabled,
                         priority: endpoint.priority,
+                    })
+                    .collect(),
+                keys: original
+                    .keys
+                    .iter()
+                    .map(|key| UpsertProviderKey {
+                        id: None,
+                        name: key.name.clone(),
+                        api_key: key.api_key.clone(),
+                        protocol: key.protocol.clone(),
+                        base_url: key.base_url.clone(),
+                        is_enabled: key.is_enabled,
+                        priority: key.priority,
+                        manual_models: key.manual_models.clone(),
                     })
                     .collect(),
                 preset_key: original.preset_key.clone(),
@@ -1374,6 +1708,11 @@ impl AdminService {
                     base_url: Some(protocol.base_url),
                     protocol_mode: Some(protocol.mode),
                     protocol_endpoints: protocol_config_changed.then_some(protocol.endpoints),
+                    keys: if auth_mode == "oauth" {
+                        Some(Vec::new())
+                    } else {
+                        input.keys
+                    },
                     preset_key,
                     channel,
                     models_source,
@@ -1911,20 +2250,34 @@ impl AdminService {
         }
     }
 
-    /// Send a minimal "hi" chat request to every model in the provider's
-    /// discovered list and report which ones actually answer. The WebUI uses
-    /// the results to hide non-callable models from route target pickers.
+    /// Send a minimal "hi" chat request to each selected model and report
+    /// which ones actually answer. The WebUI uses the results to hide
+    /// non-callable models from route target pickers.
+    ///
+    /// `models: None` probes every model in the provider's discovered list;
+    /// `models: Some(list)` probes exactly the named models (after
+    /// normalization) — including names outside the discovered catalog. OpenCode
+    /// Go validates every name against its strict routing catalog; other providers
+    /// resolve against the default probe endpoint.
     pub async fn probe_provider_models(
         &self,
         id: &str,
+        models: Option<Vec<String>>,
     ) -> anyhow::Result<ProviderModelProbeOutcome> {
         use futures::StreamExt;
 
+        let selection = normalize_probe_selection(models)?;
         let provider = self.get_provider(id).await?;
-        let models = self.get_provider_models(id).await?;
-        if models.is_empty() {
-            anyhow::bail!("provider model list is empty");
-        }
+        let models = match selection {
+            Some(models) => models,
+            None => {
+                let models = self.get_provider_models(id).await?;
+                if models.is_empty() {
+                    anyhow::bail!("provider model list is empty");
+                }
+                models
+            }
+        };
 
         // Pick the probe endpoint: adaptive providers probe through the
         // endpoint matching their configured default protocol
@@ -1933,6 +2286,7 @@ impl AdminService {
         // their single configuration. Fixed OAuth providers resolve the same
         // refreshed token, base URL, and identity headers used by dispatch.
         let registry = crate::protocol::registry::ProtocolRegistry::global();
+        let is_go = crate::provider::opencode_go::session::is_opencode_go(&provider);
         let runtime = if provider.is_adaptive() {
             None
         } else {
@@ -1963,21 +2317,32 @@ impl AdminService {
                 .iter()
                 .filter(|endpoint| endpoint.is_enabled)
                 .collect();
-            if enabled.is_empty() {
+            if enabled.is_empty() && !is_go {
                 anyhow::bail!("provider has no enabled protocol endpoints");
             }
             let preferred = enabled
                 .iter()
                 .find(|endpoint| endpoint.protocol == provider.protocol)
-                .or_else(|| enabled.first())
-                .expect("enabled endpoints is non-empty");
-            (
-                preferred.protocol.clone(),
-                preferred.base_url.clone(),
-                preferred.api_key.clone(),
-                preferred.auth_scheme.clone(),
-                HeaderMap::new(),
-            )
+                .or_else(|| enabled.first());
+            if let Some(preferred) = preferred {
+                (
+                    preferred.protocol.clone(),
+                    preferred.base_url.clone(),
+                    preferred.api_key.clone(),
+                    preferred.auth_scheme.clone(),
+                    HeaderMap::new(),
+                )
+            } else {
+                // Go resolves every model independently below. This is only
+                // run metadata, never a fallback request target.
+                (
+                    provider.protocol.clone(),
+                    provider.base_url.clone(),
+                    provider.api_key.clone(),
+                    "auto".to_string(),
+                    HeaderMap::new(),
+                )
+            }
         } else {
             let runtime = runtime.expect("fixed provider runtime was resolved above");
             let base_url = runtime
@@ -2002,13 +2367,22 @@ impl AdminService {
 
         let suite = registry
             .parse_protocol(&suite_raw)
+            // Go's default is metadata only; strict per-model resolution below
+            // must report invalid/missing endpoints without aborting the run.
+            .or_else(|| is_go.then_some(crate::protocol::ids::Protocol::OpenAICompatible))
             .ok_or_else(|| anyhow::anyhow!("unsupported provider protocol: {suite_raw}"))?;
-        if base_url.trim().is_empty() {
+        if base_url.trim().is_empty() && !(is_go && provider.is_adaptive()) {
             anyhow::bail!("provider base URL is empty");
+        }
+        let has_pool = provider.has_key_pool() && provider.effective_auth_mode() != "oauth";
+        if has_pool && provider.enabled_keys().is_empty() {
+            anyhow::bail!("provider key pool has no enabled keys");
         }
         if api_key.trim().is_empty()
             && auth_scheme.trim() != "none"
             && !runtime_headers.contains_key(AUTHORIZATION)
+            && !has_pool
+            && !(is_go && provider.is_adaptive())
         {
             anyhow::bail!("provider api key is empty");
         }
@@ -2040,23 +2414,6 @@ impl AdminService {
         let fast_mode = provider.fast_mode;
         let channel = provider.channel.clone();
 
-        // Endpoints an adaptive provider could route a model to; empty for
-        // fixed providers, which keep probing their single configuration.
-        let declared_endpoints: Vec<(crate::protocol::ids::Protocol, &ProviderProtocolEndpoint)> =
-            if provider.is_adaptive() {
-                provider
-                    .protocol_endpoints
-                    .iter()
-                    .filter(|endpoint| endpoint.is_enabled)
-                    .filter_map(|endpoint| {
-                        registry
-                            .parse_protocol(&endpoint.protocol)
-                            .map(|protocol| (protocol, endpoint))
-                    })
-                    .collect()
-            } else {
-                Vec::new()
-            };
         let default_target = ProbeTarget {
             suite,
             protocol_id: protocol_id.clone(),
@@ -2065,14 +2422,64 @@ impl AdminService {
             auth_scheme: effective_scheme.to_string(),
         };
 
+        // Key-pool providers: the "send hi" probe must use the key whose
+        // snapshot actually holds the model, mirroring dispatch selection.
+        // The full candidate row (not just its secret) flows into the probe so
+        // a pinned protocol or per-key API address is exercised as well.
+        let pool_key_for: std::collections::HashMap<String, &crate::db::models::ProviderKey> =
+            if has_pool {
+                let enabled = provider.enabled_keys();
+                models
+                    .iter()
+                    .filter_map(|model| {
+                        crate::provider::key_pool::eligible_keys(&enabled, model)
+                            .first()
+                            .map(|key| (model.clone(), *key))
+                    })
+                    .collect()
+            } else {
+                Default::default()
+            };
         let probes = models.into_iter().map(|model| {
             let client = client.clone();
-            let runtime_headers = runtime_headers.clone();
+            let mut runtime_headers = runtime_headers.clone();
+            crate::provider::opencode_go::session::apply_provider_probe_session_header(
+                &mut runtime_headers,
+                &provider,
+                &model,
+            );
             let channel = channel.clone();
             let antigravity_project = antigravity_project.clone();
-            let target =
-                resolve_probe_target(&provider, &model, &default_target, &declared_endpoints);
+            let target = resolve_probe_target(
+                &provider,
+                &model,
+                &default_target,
+                pool_key_for.get(&model).copied(),
+            )
+            .and_then(|mut target| {
+                if let Some(key) = pool_key_for.get(&model) {
+                    target.api_key = key.api_key.clone();
+                    if let Some(base_url) = key
+                        .base_url
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                    {
+                        target.base_url = base_url.trim_end_matches('/').to_string();
+                    }
+                } else if is_go && has_pool {
+                    return Err(crate::error::GatewayError::provider_unavailable(
+                        &provider.id,
+                        format!("no enabled provider key is eligible for model '{model}'"),
+                    ));
+                }
+                Ok(target)
+            });
             async move {
+                let target = match target {
+                    Ok(target) => target,
+                    Err(error) => return model_probe_routing_failure(model, error),
+                };
                 probe_single_model(
                     client,
                     target.suite,
@@ -2147,7 +2554,170 @@ impl AdminService {
 
     /// Fetch the provider's model list from its discovery source, before
     /// vendor-scoped visibility filtering.
+    /// Auth protocol for key-pool model fetches: relays expose an OpenAI-style
+    /// `/models` discovery endpoint, so prefer Bearer via any enabled
+    /// OpenAI-family endpoint (mirrors `adaptive_model_fetch_auth`); fall
+    /// back to the provider default protocol's scheme.
+    fn pool_model_fetch_protocol(provider: &Provider) -> String {
+        let registry = crate::protocol::registry::ProtocolRegistry::global();
+        let openai_family = provider
+            .protocol_endpoints
+            .iter()
+            .filter(|endpoint| endpoint.is_enabled)
+            .any(|endpoint| {
+                registry
+                    .resolve_alias(&endpoint.protocol)
+                    .is_some_and(|id| {
+                        matches!(
+                            id.protocol,
+                            crate::protocol::ids::Protocol::OpenAICompatible
+                                | crate::protocol::ids::Protocol::OpenAIResponses
+                        )
+                    })
+            });
+        if openai_family {
+            "openai-compatible".to_string()
+        } else {
+            provider.protocol.clone()
+        }
+    }
+
+    /// Live `/models` discovery with an explicit pool candidate. Skips static
+    /// overrides and the models.dev catalog on purpose: those are
+    /// provider-level and would erase the per-key distinction the pool
+    /// exists for. The candidate's protocol pin drives the auth headers, and
+    /// its API address rebases the discovery URL when the configured source
+    /// is a plain extension of the provider base URL.
+    async fn fetch_provider_models_with_key(
+        &self,
+        provider: &Provider,
+        key: &crate::db::models::ProviderKey,
+    ) -> anyhow::Result<Vec<String>> {
+        let endpoint = resolve_models_endpoint(provider)
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("Model Discovery URL is empty"))?;
+        // Rebase the discovery URL onto the candidate's own API address when
+        // it was derived from the provider base (e.g. `…/v1/models`); a
+        // custom absolute source is kept verbatim.
+        let endpoint = match key
+            .base_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|base| base.trim_end_matches('/').to_string())
+        {
+            Some(key_base) => match endpoint
+                .strip_prefix(provider.base_url.trim_end_matches('/'))
+                .filter(|suffix| suffix.starts_with('/'))
+            {
+                Some(suffix) => format!("{key_base}{suffix}"),
+                None => endpoint,
+            },
+            None => endpoint,
+        };
+        let auth_protocol = key
+            .protocol
+            .clone()
+            .unwrap_or_else(|| Self::pool_model_fetch_protocol(provider));
+        let headers =
+            build_model_headers(&auth_protocol, provider.vendor.as_deref(), &key.api_key)?;
+        let response = self
+            .gw
+            .http_client
+            .get(&endpoint)
+            .headers(headers)
+            .timeout(Duration::from_secs(10))
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!(format_connectivity_error(&e)))?;
+        if !response.status().is_success() {
+            let status = response.status().as_u16();
+            let body = response.text().await.unwrap_or_default();
+            let preview = body.chars().take(200).collect::<String>();
+            anyhow::bail!("HTTP {status}: {preview}");
+        }
+        let json: Value = response.json().await.unwrap_or_default();
+        let models =
+            extract_models_from_response(&provider.protocol, provider.vendor.as_deref(), &json);
+        if models.is_empty() {
+            anyhow::bail!("Model list format is invalid or empty");
+        }
+        Ok(models)
+    }
+
+    /// Probe every key of a provider's key pool in parallel: per-key
+    /// `/models` discovery whose outcome doubles as that key's connectivity
+    /// test. Results are persisted onto the key rows (snapshot / error /
+    /// timestamp) and returned for immediate UI display.
+    pub async fn probe_provider_keys(
+        &self,
+        id: &str,
+    ) -> anyhow::Result<Vec<ProviderKeyProbeStatus>> {
+        let provider = self.get_provider(id).await?;
+        if !provider.has_key_pool() {
+            anyhow::bail!("provider has no key pool configured");
+        }
+        // Fail fast on a missing discovery URL: every key would fail for the
+        // same reason otherwise.
+        if resolve_models_endpoint(&provider)
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .is_none()
+        {
+            anyhow::bail!("Model Discovery URL is empty");
+        }
+        let tested_at = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+        let mut outcomes = Vec::with_capacity(provider.keys.len());
+        let mut probes = Vec::with_capacity(provider.keys.len());
+        for key in &provider.keys {
+            probes.push(self.fetch_provider_models_with_key(&provider, key));
+        }
+        let results = futures::future::join_all(probes).await;
+        for (key, result) in provider.keys.iter().zip(results) {
+            let (success, error, models) = match result {
+                Ok(models) => (true, None, Some(models)),
+                Err(error) => (false, Some(error.to_string()), None),
+            };
+            self.gw
+                .storage
+                .providers()
+                .record_key_probe_result(
+                    &key.id,
+                    crate::db::models::ProviderKeyProbeResult {
+                        success,
+                        error: error.clone(),
+                        tested_at: tested_at.clone(),
+                        models: models.clone(),
+                    },
+                )
+                .await?;
+            outcomes.push(ProviderKeyProbeStatus {
+                key_id: key.id.clone(),
+                name: key.name.clone(),
+                success,
+                error,
+                models: models.unwrap_or_default(),
+                tested_at: tested_at.clone(),
+            });
+        }
+        self.bump_config_epoch().await?;
+        Ok(outcomes)
+    }
+
     async fn fetch_provider_models(&self, provider: &Provider) -> anyhow::Result<Vec<String>> {
+        // Key-pool providers route discovery through the pool snapshots (see
+        // discover_provider_models); the runtime credential below is the
+        // provider-level key, which an active pool deliberately ignores.
+        if provider.has_key_pool() && provider.effective_auth_mode() != "oauth" {
+            return self.discover_provider_models(provider, false).await;
+        }
+        // Codex: resolve the advertised client version before runtime binding
+        // so the models-source URL carries the freshly probed one —
+        // bind_runtime only reads the already-cached value.
+        if is_codex_oauth_provider(provider) {
+            crate::auth::drivers::codex_version::resolve(Some(&self.gw.http_client)).await;
+        }
         let runtime = self.resolve_provider_runtime(provider).await?;
         let credential = runtime.access_token.clone();
         // Adaptive providers: the discovery endpoint is OpenAI-style even when
@@ -2268,6 +2838,41 @@ impl AdminService {
         provider: &Provider,
         require_catalog: bool,
     ) -> anyhow::Result<Vec<String>> {
+        // Key-pool providers: the per-key snapshots are the catalog. Union
+        // every informed key's effective model set; when no key has ever been
+        // probed, fall back to a single-key live discovery with the
+        // highest-priority enabled key so the available-models view works
+        // before the first probe.
+        if provider.has_key_pool() && provider.effective_auth_mode() != "oauth" {
+            let enabled = provider.enabled_keys();
+            if !enabled.is_empty() {
+                let mut union: Vec<String> = Vec::new();
+                let mut any_info = false;
+                for key in &enabled {
+                    if let Some(models) = key.effective_models() {
+                        any_info = true;
+                        for model in models {
+                            if !union.contains(&model) {
+                                union.push(model);
+                            }
+                        }
+                    }
+                }
+                if any_info && !union.is_empty() {
+                    union.sort();
+                    return Ok(merge_model_lists(union, preset_extra_models(provider)));
+                }
+                let models = self
+                    .fetch_provider_models_with_key(provider, enabled[0])
+                    .await?;
+                return Ok(merge_model_lists(models, preset_extra_models(provider)));
+            }
+        }
+        // Same codex rationale as `fetch_provider_models`: probe the latest
+        // client version before binding so discovery sees the newest models.
+        if is_codex_oauth_provider(provider) {
+            crate::auth::drivers::codex_version::resolve(Some(&self.gw.http_client)).await;
+        }
         let runtime = self.resolve_provider_runtime(provider).await?;
         let credential = runtime.access_token.clone();
         // Same adaptive-auth rationale as `test_provider_models` above.

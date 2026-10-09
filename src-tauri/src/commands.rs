@@ -175,12 +175,24 @@ pub async fn test_provider_models(
 }
 
 #[tauri::command]
+pub async fn probe_provider_keys(
+    gw: State<'_, Gateway>,
+    id: String,
+) -> Result<Vec<nyro_core::admin::ProviderKeyProbeStatus>, String> {
+    gw.admin()
+        .probe_provider_keys(&id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 pub async fn probe_provider_models(
     gw: State<'_, Gateway>,
     id: String,
+    models: Option<Vec<String>>,
 ) -> Result<nyro_core::admin::ProviderModelProbeOutcome, String> {
     gw.admin()
-        .probe_provider_models(&id)
+        .probe_provider_models(&id, models)
         .await
         .map_err(|e| e.to_string())
 }

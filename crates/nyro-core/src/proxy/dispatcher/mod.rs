@@ -330,6 +330,13 @@ async fn run_phase_hooks_slice(
 
 // ── Public entry points ───────────────────────────────────────────────────────
 
+/// Work-queue entry: one route target plus (for multi-key providers) the
+/// pool key this attempt must use.
+struct TargetWithKey {
+    target: crate::router::selector::SelectedTarget,
+    key: Option<crate::db::models::ProviderKey>,
+}
+
 /// Full pipeline entry point.
 ///
 /// Each ingress shell captures the raw body in a `RawEnvelope` and decodes
@@ -616,9 +623,37 @@ async fn dispatch_pipeline_inner(
     let target_count = ordered_targets.len();
     let mut quota_skipped = 0_usize;
     let mut last_response: Option<Response> = None;
-    for target in ordered_targets {
+    // Key-pool fan-out: a multi-key provider contributes one queue entry per
+    // eligible key (priority order). Each entry is one dispatch attempt, so
+    // key failover consumes the same attempt budget as target retries.
+    // `pending_key_siblings` counts queued entries of the SAME provider pool
+    // directly behind the head; a non-key-failover abort drains them so the
+    // next attempt moves on to a different target instead of retrying keys.
+    let mut queue: std::collections::VecDeque<TargetWithKey> = ordered_targets
+        .into_iter()
+        .map(|target| TargetWithKey { target, key: None })
+        .collect();
+    let mut pending_key_siblings: usize = 0;
+    while let Some(entry) = queue.pop_front() {
+        let target = entry.target;
+        let explicit_key = entry.key;
+        if explicit_key.is_some() {
+            pending_key_siblings = pending_key_siblings.saturating_sub(1);
+        }
+
+        // Skip remaining sibling keys of the current provider pool (used when
+        // aborting a target for reasons that apply to every key equally).
+        macro_rules! skip_key_siblings {
+            () => {{
+                while pending_key_siblings > 0 {
+                    pending_key_siblings -= 1;
+                    let _ = queue.pop_front();
+                }
+            }};
+        }
         if !gw.quota_registry.is_schedulable(&target.provider_id) {
             quota_skipped += 1;
+            skip_key_siblings!();
             continue;
         }
         let provider = match get_provider(&access_store, &target.provider_id).await {
@@ -627,6 +662,7 @@ async fn dispatch_pipeline_inner(
                 // Provider missing or disabled: annotate the shared snapshot so
                 // later attempt rows explain why this candidate was skipped.
                 route_decision.mark_provider_disabled(&target.provider_id);
+                skip_key_siblings!();
                 continue;
             }
         };
@@ -636,32 +672,103 @@ async fn dispatch_pipeline_inner(
             target.model.clone()
         };
 
+        // Key-pool resolution: an active pool is the provider's sole
+        // credential source. The first eligible key serves this attempt; the
+        // remaining eligible keys are queued as sibling entries right behind
+        // the head so the regular retry path fails over to them.
+        let pool_key: Option<crate::db::models::ProviderKey> = if let Some(key) = explicit_key {
+            // Sibling entry queued by an earlier attempt: key already chosen.
+            Some(key)
+        } else if provider.has_key_pool() && provider.effective_auth_mode() != "oauth" {
+            {
+                let enabled = provider.enabled_keys();
+                if enabled.is_empty() {
+                    last_response = Some(pool_error_response(
+                        503,
+                        "provider key pool has no enabled keys",
+                    ));
+                    skip_key_siblings!();
+                    continue;
+                }
+                let eligible = crate::provider::key_pool::eligible_keys(&enabled, &actual_model);
+                if eligible.is_empty() {
+                    last_response = Some(pool_error_response(
+                        503,
+                        &format!("no provider key in pool serves model '{actual_model}'"),
+                    ));
+                    skip_key_siblings!();
+                    continue;
+                }
+                for sibling in eligible[1..].iter().rev() {
+                    queue.push_front(TargetWithKey {
+                        target: target.clone(),
+                        key: Some((*sibling).clone()),
+                    });
+                }
+                pending_key_siblings = eligible.len() - 1;
+                Some(eligible[0].clone())
+            }
+        } else {
+            None
+        };
+
         let mut request_for_target = request.clone();
 
-        // Resolve egress protocol + base URL via negotiate().
-        // The request-scoped `ctx` is threaded end-to-end from the ingress
-        // middleware (no per-target throwaway context); negotiate records its
-        // trace/egress decision onto it.
-        //
-        // Vendor-scoped egress preference: OpenCode Go serves different models
-        // on different endpoints and the client's protocol wins whenever the
-        // model is served there (openai-go `routing`). `None` keeps the default
-        // ingress-driven resolution; an unsupported preference falls through
-        // negotiate's own tiers, so providers that do not declare the endpoint
-        // are unaffected.
-        let provider_protocols = ProviderProtocols::from_provider(&provider);
-        let egress_preference = crate::provider::opencode_go::routing::preferred_egress(
+        // OpenCode Go models REQUIRE their exact endpoint. Resolve it through
+        // the same function as probes; never downgrade a missing pin to ingress
+        // or the provider default. Other vendors retain normal negotiation.
+        let resolved_plan = crate::provider::key_pool::resolve_endpoint(
             &provider,
+            pool_key.as_ref(),
             &actual_model,
-            ingress,
-        );
-        let plan = match negotiate(ingress, egress_preference, Some(&provider_protocols), ctx) {
+        )
+        .and_then(|required| match required {
+            Some(endpoint) => {
+                ctx.trace(
+                    "model_route",
+                    format!(
+                        "provider={} model={} source=required-endpoint protocol={}",
+                        provider.id, actual_model, endpoint.protocol,
+                    ),
+                );
+                crate::proxy::planner::negotiator::negotiate_required(ingress, endpoint, ctx)
+            }
+            None => {
+                let provider_protocols = ProviderProtocols::from_provider(&provider);
+                negotiate(ingress, None, Some(&provider_protocols), ctx)
+            }
+        });
+        let mut plan = match resolved_plan {
             Ok(p) => p,
             Err(e) => {
+                ctx.trace(
+                    "model_route",
+                    format!(
+                        "provider={} model={} rejected: {}",
+                        provider.id, actual_model, e
+                    ),
+                );
                 last_response = Some(e.render(None));
+                // A protocol pin can fail for this key alone; the next key
+                // must be allowed to resolve its own endpoint.
                 continue;
             }
         };
+        // Per-candidate API address override: a pool row with its own
+        // `base_url` retargets the negotiated plan regardless of whether the
+        // protocol was pinned or inherited from the provider.
+        if let Some(base_url) = pool_key
+            .as_ref()
+            .and_then(|key| key.base_url.as_deref())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            ctx.trace(
+                "model_route",
+                format!("provider={} key_base_url_override={base_url}", provider.id),
+            );
+            plan.base_url = base_url.to_string();
+        }
         let egress = plan.egress;
         // google/antigravity must always call upstream in streaming mode (the
         // Code Assist v1internal non-stream action can return empty bodies —
@@ -675,8 +782,14 @@ async fn dispatch_pipeline_inner(
         if antigravity_force_stream {
             request_for_target.stream.enabled = true;
         }
-        let target_key = format!("{}:{}:{}", target.provider_id, egress, actual_model);
+        let target_key = crate::provider::key_pool::health_key(
+            &target.provider_id,
+            pool_key.as_ref().map(|key| key.id.as_str()),
+            &egress.to_string(),
+            &actual_model,
+        );
         let Some(health_permit) = gw.health_registry.try_acquire(&target_key) else {
+            skip_key_siblings!();
             continue;
         };
 
@@ -687,6 +800,7 @@ async fn dispatch_pipeline_inner(
                     502,
                     &format!("provider credential error: {e}"),
                 ));
+                skip_key_siblings!();
                 continue;
             }
         };
@@ -700,9 +814,17 @@ async fn dispatch_pipeline_inner(
                     503,
                     "adaptive provider endpoint is missing or disabled",
                 ));
+                skip_key_siblings!();
                 continue;
             };
             provider_runtime.access_token = endpoint.api_key.clone();
+            provider_runtime.binding = crate::auth::types::RuntimeBinding::default();
+        }
+        // Active key pool: the selected key is the sole credential source and
+        // covers every protocol endpoint (relay vendors share one key across
+        // Bearer and x-api-key auth schemes).
+        if let Some(key) = &pool_key {
+            provider_runtime.access_token = key.api_key.clone();
             provider_runtime.binding = crate::auth::types::RuntimeBinding::default();
         }
         let egress_base_url = if let Some(base_url_override) = provider_runtime
@@ -732,6 +854,7 @@ async fn dispatch_pipeline_inner(
                     503,
                     &format!("no vendor registered for '{vendor_id}'"),
                 ));
+                skip_key_siblings!();
                 continue;
             }
         };
@@ -753,6 +876,7 @@ async fn dispatch_pipeline_inner(
             PhaseOutcome::ShortCircuit(resp) => return resp,
             PhaseOutcome::Reject(e) => {
                 last_response = Some(e.render(None));
+                skip_key_siblings!();
                 continue;
             }
         }
@@ -766,6 +890,7 @@ async fn dispatch_pipeline_inner(
         ) {
             let Some(raw_body) = raw_body.as_deref() else {
                 last_response = Some(error_response(500, "compat request is missing raw body"));
+                skip_key_siblings!();
                 continue;
             };
             match crate::conversion::resolve_raw_wire_compat(
@@ -788,6 +913,7 @@ async fn dispatch_pipeline_inner(
                         500,
                         &format!("compat request preparation failed: {error}"),
                     ));
+                    skip_key_siblings!();
                     continue;
                 }
             }
@@ -929,6 +1055,7 @@ async fn dispatch_pipeline_inner(
                 Ok(o) => o,
                 Err(e) => {
                     last_response = Some(e.render(None));
+                    skip_key_siblings!();
                     continue;
                 }
             }
@@ -940,6 +1067,7 @@ async fn dispatch_pipeline_inner(
                 Ok(o) => o,
                 Err(e) => {
                     last_response = Some(e.render(None));
+                    skip_key_siblings!();
                     continue;
                 }
             }
@@ -979,6 +1107,7 @@ async fn dispatch_pipeline_inner(
                     502,
                     &format!("provider runtime binding error: {e}"),
                 ));
+                skip_key_siblings!();
                 continue;
             }
         }
@@ -994,6 +1123,7 @@ async fn dispatch_pipeline_inner(
                 500,
                 &format!("compat request header preparation failed: {error}"),
             ));
+            skip_key_siblings!();
             continue;
         }
 
@@ -1028,6 +1158,7 @@ async fn dispatch_pipeline_inner(
                         return error_response(status, &message);
                     }
                     last_response = Some(unprocessable_response(status, &message));
+                    skip_key_siblings!();
                     continue;
                 }
                 Err(
@@ -1038,6 +1169,7 @@ async fn dispatch_pipeline_inner(
                         500,
                         "compat request is missing its raw or pre-vendor wire body",
                     ));
+                    skip_key_siblings!();
                     continue;
                 }
                 Err(crate::conversion::PrepareConversionError::StrategyStateMismatch) => {
@@ -1045,6 +1177,7 @@ async fn dispatch_pipeline_inner(
                         500,
                         "resolved conversion preparation state is inconsistent",
                     ));
+                    skip_key_siblings!();
                     continue;
                 }
             };
@@ -1054,6 +1187,7 @@ async fn dispatch_pipeline_inner(
             Err(e) => {
                 let msg = format!("provider transport error: {e}");
                 last_response = Some(error_response(502, &msg));
+                skip_key_siblings!();
                 continue;
             }
         };
@@ -1144,6 +1278,7 @@ async fn dispatch_pipeline_inner(
             backend_model: &target.model,
             api_key_id: auth_key.id.as_deref(),
             api_key_name: auth_key.name.as_deref(),
+            provider_key_name: pool_key.as_ref().map(|key| key.name.as_str()),
             route_decision: Some(route_decision.to_json()),
             is_stream,
             enable_payload: route.enable_payload,
@@ -1268,6 +1403,15 @@ async fn dispatch_pipeline_inner(
         if status < 400 {
             return response;
         }
+        // Key-level failure (auth rejected, model missing on this key, key
+        // throttled): fail over to the next eligible key of the same pool
+        // before touching other route targets. 5xx stays on the target-level
+        // path — those errors belong to the model, not the key.
+        if crate::provider::key_pool::key_failover_status(status) && pending_key_siblings > 0 {
+            last_response = Some(response);
+            continue;
+        }
+        skip_key_siblings!();
         if retry.should_retry(is_retryable(status)) {
             last_response = Some(response);
             continue;
@@ -1368,6 +1512,8 @@ struct CallCtx<'a> {
     backend_model: &'a str,
     api_key_id: Option<&'a str>,
     api_key_name: Option<&'a str>,
+    /// Provider key-pool entry name used for this attempt, when any.
+    provider_key_name: Option<&'a str>,
     is_stream: bool,
     enable_payload: Option<bool>,
     /// Client-requested reasoning effort snapshot (payload-independent).
@@ -1416,6 +1562,7 @@ struct LogBuilder {
     backend_model: Option<String>,
     api_key_id: Option<String>,
     api_key_name: Option<String>,
+    provider_key_name: Option<String>,
     provider_id: String,
     provider_name: String,
     model_id: Option<String>,
@@ -1456,6 +1603,7 @@ impl LogBuilder {
             backend_model: Some(call_ctx.backend_model.to_string()),
             api_key_id: call_ctx.api_key_id.map(ToString::to_string),
             api_key_name: call_ctx.api_key_name.map(ToString::to_string),
+            provider_key_name: call_ctx.provider_key_name.map(ToString::to_string),
             provider_id: call_ctx.provider.id.clone(),
             provider_name: call_ctx.provider.name.clone(),
             model_id: Some(call_ctx.model_id.to_string()),
@@ -1495,6 +1643,7 @@ impl LogBuilder {
             backend_model: None,
             api_key_id: api_key_id.map(ToString::to_string),
             api_key_name: None,
+            provider_key_name: None,
             provider_id: String::new(),
             provider_name: String::new(),
             model_id: None,
@@ -1733,6 +1882,7 @@ impl LogBuilder {
             upstream_protocol: self.upstream_protocol,
             provider_id: self.provider_id,
             provider_name: self.provider_name,
+            provider_key_name: self.provider_key_name,
             model_id: self.model_id,
             model_name: self.model_name,
             upstream_url: self.extras.upstream_url,
@@ -2065,6 +2215,19 @@ fn stream_error_event(ingress: ProtocolId, request_id: &str, kind: &str) -> Stri
     }
 }
 
+/// Plain JSON error for key-pool failures. `error_response`'s 503 arm maps
+/// to `ProviderUnavailable`, whose wire envelope drops the detailed reason —
+/// the pool errors must say WHICH model/key situation failed.
+fn pool_error_response(status: u16, message: &str) -> Response {
+    Response::builder()
+        .status(axum::http::StatusCode::from_u16(status).unwrap_or(axum::http::StatusCode::SERVICE_UNAVAILABLE))
+        .header(axum::http::header::CONTENT_TYPE, "application/json")
+        .body(axum::body::Body::from(
+            serde_json::json!({"error": {"code": status, "message": message, "type": "NYRO_PROVIDER_KEY_POOL"}}).to_string(),
+        ))
+        .expect("static response build")
+}
+
 pub(crate) fn error_response(status: u16, message: &str) -> Response {
     let err: GatewayError = match status {
         400 => GatewayError::bad_request("bad_request", message),
@@ -2365,6 +2528,7 @@ mod tests {
         let provider = gw
             .admin()
             .create_provider(CreateProvider {
+                keys: Vec::new(),
                 name: format!("decision-provider-{}", uuid::Uuid::new_v4()),
                 vendor: Some("openai".to_string()),
                 protocol: "openai-compatible".to_string(),
@@ -2466,6 +2630,7 @@ mod tests {
         let provider = gw
             .admin()
             .create_provider(CreateProvider {
+                keys: Vec::new(),
                 name: format!("quota-provider-{}", uuid::Uuid::new_v4()),
                 vendor: Some("openai".to_string()),
                 protocol: "openai-compatible".to_string(),

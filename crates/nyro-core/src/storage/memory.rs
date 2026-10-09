@@ -6,8 +6,8 @@ use tokio::sync::RwLock;
 use crate::db::models::{
     ApiKeyStats, ApiKeyUsageDetail, CreateModel, CreateProvider, LogPage, LogQuery, Model,
     ModelStats, ModelTimeBucket, ModelUsageDetail, ModelUsageStats, OAuthCredential, Provider,
-    ProviderStats, ProviderUsageDetail, RequestLog, StatsHourly, StatsOverview, StatsTimeBucket,
-    UpdateModel, UpdateProvider, UpsertOAuthCredential,
+    ProviderKeyProbeResult, ProviderStats, ProviderUsageDetail, RequestLog, StatsHourly,
+    StatsOverview, StatsTimeBucket, UpdateModel, UpdateProvider, UpsertOAuthCredential,
 };
 use crate::logging::LogEntry;
 
@@ -143,6 +143,28 @@ impl ProviderStore for MemoryStorage {
                 endpoint.test_status = if result.success { "success" } else { "failed" }.into();
                 endpoint.test_error = result.error;
                 endpoint.tested_at = Some(result.tested_at);
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    async fn record_key_probe_result(
+        &self,
+        key_id: &str,
+        result: ProviderKeyProbeResult,
+    ) -> anyhow::Result<()> {
+        let mut providers = self.providers.write().await;
+        for key in providers
+            .iter_mut()
+            .flat_map(|provider| provider.keys.iter_mut())
+        {
+            if key.id == key_id {
+                if let Some(models) = result.models {
+                    key.models_snapshot = Some(crate::db::models::encode_model_list(&models));
+                }
+                key.probe_error = result.error;
+                key.last_probe_at = Some(result.tested_at);
                 break;
             }
         }

@@ -89,6 +89,7 @@ async fn opencode_provider(gw: &Gateway, url: &str) -> anyhow::Result<String> {
     Ok(gw
         .admin()
         .create_provider(CreateProvider {
+            keys: Vec::new(),
             name: "opencode-go-test".into(),
             vendor: Some("opencode-go".into()),
             protocol: "openai-compatible".into(),
@@ -307,6 +308,7 @@ async fn other_vendors_do_not_gain_the_opencode_header() -> anyhow::Result<()> {
     let provider = gw
         .admin()
         .create_provider(CreateProvider {
+            keys: Vec::new(),
             name: "zhipu-test".into(),
             vendor: Some("zhipuai".into()),
             protocol: "openai-compatible".into(),

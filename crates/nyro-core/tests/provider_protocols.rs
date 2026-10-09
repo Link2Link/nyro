@@ -19,6 +19,7 @@ use nyro_core::protocol::registry::ProtocolRegistry;
 
 fn provider_with_protocol(protocol: &str, base_url: &str) -> Provider {
     Provider {
+        keys: Vec::new(),
         id: "p".to_string(),
         name: "p".to_string(),
         vendor: None,

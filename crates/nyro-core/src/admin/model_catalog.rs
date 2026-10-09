@@ -80,6 +80,26 @@ pub(super) fn adaptive_model_fetch_auth(provider: &Provider) -> Option<(String, 
     Some(("openai-compatible".to_string(), endpoint.api_key.clone()))
 }
 
+/// True for OAuth providers whose model discovery goes through the Codex
+/// backend (openai/codex and its sub2api flavor). The upstream manifest
+/// content-negotiates on the advertised `client_version`, so discovery
+/// resolves the latest `@openai/codex` CLI version (npm dist-tags probe
+/// with compile-time fallback) before runtime binding — see
+/// `auth::drivers::codex_version`.
+pub(super) fn is_codex_oauth_provider(provider: &Provider) -> bool {
+    provider
+        .effective_auth_mode()
+        .trim()
+        .eq_ignore_ascii_case("oauth")
+        && provider
+            .vendor
+            .as_deref()
+            .is_some_and(|vendor| vendor.eq_ignore_ascii_case("openai"))
+        && provider.channel.as_deref().is_some_and(|channel| {
+            matches!(channel.to_ascii_lowercase().as_str(), "codex" | "sub2api")
+        })
+}
+
 pub(super) fn build_model_headers(
     protocol: &str,
     vendor: Option<&str>,

@@ -31,6 +31,7 @@ async fn app() -> anyhow::Result<TestApp> {
 
 fn provider(name: &str) -> CreateProvider {
     CreateProvider {
+        keys: Vec::new(),
         name: name.to_string(),
         vendor: None,
         protocol: "openai-compatible".to_string(),

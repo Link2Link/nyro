@@ -18,12 +18,18 @@ import type {
   ProviderOAuthStatusData,
   ModelProbeOutcome,
   ProviderUsageCredentials,
+  ProviderKey,
+  ProviderKeyProbeStatus,
+  UpsertProviderKey,
 } from "@/lib/types";
 import {
   loadModelProbeResults,
+  mergeProbeResults,
   saveModelProbeResults,
   type ProviderModelProbeRecord,
 } from "@/lib/model-probe";
+import { saveProbeSelection } from "@/lib/model-probe-selection";
+import { ModelProbePicker } from "@/components/model-probe-picker";
 import {
   Server,
   Plus,
@@ -841,6 +847,11 @@ function usageSupported(
     url.includes("api.deepseek.com") ||
     url.includes("opencode.ai/zen") ||
     url.includes("volces.com") ||
+    // MiMo cluster hosts (`token-plan-<cluster>.xiaomimimo.com`) end in
+    // `-cn.`/`-sgp.` rather than Bailian's `token-plan.`, so the vendor
+    // domain must be matched explicitly (mirrors `UsageBackend::detect`,
+    // which checks xiaomimimo before the `token-plan.` fallback).
+    url.includes("xiaomimimo.com") ||
     url.includes("token-plan.")
   );
 }
@@ -898,6 +909,7 @@ export default function ProvidersPage() {
   const editingIdRef = useRef<string | null>(null);
   const [testingId, setTestingId] = useState<string | null>(null);
   const [probingId, setProbingId] = useState<string | null>(null);
+  const [probePickerTarget, setProbePickerTarget] = useState<Provider | null>(null);
   const [modelProbeResults, setModelProbeResults] =
     useState<Record<string, ProviderModelProbeRecord>>(loadModelProbeResults);
   const [testResult, setTestResult] = useState<Record<string, TestResult>>(loadProviderTestResults);
@@ -987,6 +999,10 @@ export default function ProvidersPage() {
     api_key: "",
     auth_mode: "apikey",
   });
+  const [editKeys, setEditKeys] = useState<UpsertProviderKey[]>([]);
+  const [keyPoolEnabled, setKeyPoolEnabled] = useState(false);
+  const [probeKeysLoading, setProbeKeysLoading] = useState(false);
+  const [probeKeysError, setProbeKeysError] = useState<string | null>(null);
   const isEditingOAuthProvider = Boolean(
     editingProvider
       && (
@@ -1665,10 +1681,13 @@ export default function ProvidersPage() {
     }
   }
 
-  async function handleModelProbe(provider: Provider) {
+  async function runModelProbe(provider: Provider, models: string[]) {
     const runId = activeTestRunRef.current + 1;
     activeTestRunRef.current = runId;
     const isCanceled = () => activeTestRunRef.current !== runId;
+    // Stamp the whole run before the request: merge ordering must know which
+    // run every result came from, even for a late, superseded response.
+    const runAt = new Date().toISOString();
 
     setProbingId(provider.id);
     setTestTarget(provider);
@@ -1687,17 +1706,27 @@ export default function ProvidersPage() {
       appendTestLog(
         "info",
         isZh
-          ? `开始模型测试 ${provider.name}（向每个模型发送 "hi"）...`
-          : `Start model probing ${provider.name} (sending "hi" to every model)...`,
+          ? `开始模型测试 ${provider.name}（向 ${models.length} 个模型发送 "hi"）...`
+          : `Start model probing ${provider.name} (sending "hi" to ${models.length} models)...`,
       );
-      appendTestLog("info", isZh ? "▶ 获取模型列表" : "▶ Fetch model list");
+      appendTestLog(
+        "info",
+        isZh ? `▶ 探测 ${models.length} 个指定模型` : `▶ Probing ${models.length} selected models`,
+      );
 
       const outcome = await backend<ModelProbeOutcome>("probe_provider_models", {
         id: provider.id,
+        models,
       });
-      if (isCanceled()) return;
-
       const results = outcome.results;
+      // Persist first and unconditionally: closing the dialog stops the log
+      // feed but must never throw paid-for results away. The per-model merge
+      // keeps a late superseded run from overwriting a newer retry.
+      setModelProbeResults((prev) => ({
+        ...prev,
+        [provider.id]: mergeProbeResults(prev[provider.id], results, runAt),
+      }));
+      if (isCanceled()) return;
       const probeProtocol = outcome.meta?.protocol
         ? (endpointDisplayName(outcome.meta.protocol) ?? outcome.meta.protocol)
         : "";
@@ -1716,14 +1745,6 @@ export default function ProvidersPage() {
           ? `✓ 模型测试完成：${ok.length} 个可用，${failed.length} 个不可用（共 ${results.length} 个）`
           : `✓ Model probing finished: ${ok.length} reachable, ${failed.length} unreachable (of ${results.length})`,
       );
-
-      setModelProbeResults((prev) => ({
-        ...prev,
-        [provider.id]: {
-          results,
-          tested_at: new Date().toISOString(),
-        },
-      }));
 
       for (const result of results) {
         const protocolLabel = result.protocol
@@ -1778,11 +1799,69 @@ export default function ProvidersPage() {
     }
   }
 
+  async function handleProbeProviderKeys() {
+    if (!editingProvider) return;
+    setProbeKeysLoading(true);
+    setProbeKeysError(null);
+    try {
+      await backend<ProviderKeyProbeStatus[]>("probe_provider_keys", { id: editingProvider.id });
+      await qc.invalidateQueries({ queryKey: ["providers"] });
+    } catch (error) {
+      setProbeKeysError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setProbeKeysLoading(false);
+    }
+  }
+
+  function parseModelsJson(raw: string | null | undefined): string[] {
+    if (!raw) return [];
+    try {
+      const parsed = JSON.parse(raw);
+      return Array.isArray(parsed) ? parsed.map(String) : [];
+    } catch {
+      return [];
+    }
+  }
+
+  function modelsToEditorText(key: UpsertProviderKey, providerKeys: ProviderKey[] | undefined): string {
+    const stored = providerKeys?.find((k) => k.id === key.id);
+    const source = key.manual_models ?? stored?.models_snapshot ?? null;
+    return parseModelsJson(source).join("\n");
+  }
+
+  function updateEditKey(index: number, patch: Partial<UpsertProviderKey>) {
+    setEditKeys((prev) => prev.map((key, i) => (i === index ? { ...key, ...patch } : key)));
+  }
+
+  function setKeyManualModels(index: number, text: string) {
+    const lines = text
+      .split("\n")
+      .map((line) => line.trim())
+      .filter((line) => line.length > 0);
+    updateEditKey(index, {
+      manual_models: lines.length > 0 ? JSON.stringify(lines) : null,
+    });
+  }
+
   function startEdit(p: Provider) {
     setEditingId(p.id);
     editingIdRef.current = p.id;
     setEditError(null);
     setShowEditApiKey(false);
+    setEditKeys(
+      (p.keys ?? []).map((key) => ({
+        id: key.id,
+        name: key.name,
+        api_key: key.api_key,
+        protocol: key.protocol ?? null,
+        base_url: key.base_url ?? null,
+        is_enabled: key.is_enabled,
+        priority: key.priority,
+        manual_models: key.manual_models ?? null,
+      })),
+    );
+    setKeyPoolEnabled((p.keys ?? []).length > 0);
+    setProbeKeysError(null);
     setEditUsageAk("");
     setEditUsageSk("");
     if (usageSupported(p)) {
@@ -2831,6 +2910,7 @@ export default function ProvidersPage() {
               const editingProviderIsArk = p.base_url.toLowerCase().includes("volces.com");
               const editingProviderIsDeepSeek = p.base_url.toLowerCase().includes("api.deepseek.com");
               const editingProviderIsBailian = p.base_url.toLowerCase().includes("token-plan.");
+              const editingProviderIsMimo = p.base_url.toLowerCase().includes("xiaomimimo.com");
               const currentProviderIsOAuth =
                 normalizeAuthMode(p.auth_mode) === "oauth"
                 || normalizeAuthMode(editForm.auth_mode) === "oauth";
@@ -3315,6 +3395,213 @@ export default function ProvidersPage() {
                         )}
                       </div>
                     ) : null}
+                    {editingResolvedAuthMode !== "oauth" ? (
+                      <div className="col-span-2 space-y-3 rounded-md border border-border bg-muted/30 p-3">
+                        <div className="flex items-center justify-between gap-2">
+                          <div className="flex items-center gap-2">
+                            <Switch
+                              checked={keyPoolEnabled}
+                              onCheckedChange={(checked) => {
+                                setKeyPoolEnabled(checked);
+                                if (checked && editKeys.length === 0) {
+                                  setEditKeys([
+                                    { id: null, name: "", api_key: "", protocol: null, base_url: null, is_enabled: true, priority: 0, manual_models: null },
+                                  ]);
+                                }
+                              }}
+                            />
+                            <span className="text-sm font-medium">
+                              {isZh ? "多密钥（三方中转 Key 池）" : "Multi-Key Pool (relay vendors)"}
+                            </span>
+                          </div>
+                          {keyPoolEnabled ? (
+                            <Button
+                              type="button"
+                              variant="outline"
+                              size="sm"
+                              disabled={probeKeysLoading || !editingProvider}
+                              onClick={() => void handleProbeProviderKeys()}
+                            >
+                              {probeKeysLoading
+                                ? (isZh ? "探测中..." : "Probing...")
+                                : (isZh ? "探测全部 Key" : "Probe All Keys")}
+                            </Button>
+                          ) : null}
+                        </div>
+                        <p className="text-xs text-muted-foreground">
+                          {isZh
+                            ? "开启后，密钥池是唯一凭据来源：每个 Key 单独探测可用模型，路由按目标模型自动选 Key，401/403/404/429 时自动切换下一个 Key。上方单个 API Key 字段将被忽略。"
+                            : "When enabled the pool is the sole credential source: each key is probed for its model list, routing picks the key that holds the target model, and 401/403/404/429 fail over to the next key. The single API key field above is ignored."}
+                        </p>
+                        {probeKeysError ? (
+                          <p className="text-xs text-red-600">{probeKeysError}</p>
+                        ) : null}
+                        {keyPoolEnabled ? (
+                          <div className="space-y-2">
+                            <p className="text-xs text-muted-foreground">
+                              {isZh
+                                ? "开启后，密钥池是唯一凭据来源：每个候选 = 密钥 + 访问协议 + API 地址，均可单独指定；未填写的字段继承供应商默认。路由按目标模型自动选候选，401/403/404/429 时自动切换下一个候选。上方单个 API Key 字段将被忽略。"
+                                : "When enabled the pool is the sole credential source: each candidate = secret + access protocol + API base URL, each individually configurable; unset fields inherit the provider defaults. Routing picks the candidate that holds the target model, and 401/403/404/429 fail over to the next candidate. The single API key field above is ignored."}
+                            </p>
+                            {editKeys.map((key, index) => {
+                              const stored = editingProvider?.keys?.find((k) => k.id === key.id);
+                              const effective = parseModelsJson(
+                                key.manual_models ?? stored?.models_snapshot ?? null,
+                              );
+                              return (
+                                <div key={key.id ?? `new-${index}`} className="space-y-2 rounded-md border border-border bg-background p-2">
+                                  <div className="grid grid-cols-12 items-center gap-2">
+                                    <Input
+                                      className="col-span-3"
+                                      placeholder={isZh ? "名称" : "Name"}
+                                      value={key.name}
+                                      onChange={(e) => updateEditKey(index, { name: e.target.value })}
+                                    />
+                                    <Input
+                                      className="col-span-5"
+                                      placeholder="sk-..."
+                                      type="password"
+                                      value={key.api_key}
+                                      onChange={(e) => updateEditKey(index, { api_key: e.target.value })}
+                                    />
+                                    <Input
+                                      className="col-span-1"
+                                      type="number"
+                                      title={isZh ? "优先级（小者先）" : "Priority (lower first)"}
+                                      value={key.priority ?? index}
+                                      onChange={(e) => updateEditKey(index, { priority: Number(e.target.value) })}
+                                    />
+                                    <label className="col-span-1 flex items-center justify-center gap-1 text-xs text-muted-foreground">
+                                      <Checkbox
+                                        checked={key.is_enabled !== false}
+                                        onCheckedChange={(checked) =>
+                                          updateEditKey(index, { is_enabled: checked === true })}
+                                      />
+                                    </label>
+                                    <Button
+                                      type="button"
+                                      variant="ghost"
+                                      size="sm"
+                                      className="col-span-2 justify-self-end text-red-600 hover:text-red-700"
+                                      onClick={() => setEditKeys((prev) => prev.filter((_, i) => i !== index))}
+                                    >
+                                      {isZh ? "删除" : "Delete"}
+                                    </Button>
+                                  </div>
+                                  <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+                                    <div className="space-y-1">
+                                      <label
+                                        htmlFor={`key-protocol-${editingProvider?.id ?? "new"}-${index}`}
+                                        className="text-xs font-medium text-muted-foreground"
+                                      >
+                                        {isZh ? "访问协议" : "Access protocol"}
+                                      </label>
+                                      <Select
+                                        value={key.protocol ?? "inherit"}
+                                        onValueChange={(value) => updateEditKey(index, {
+                                          protocol: value === "inherit" ? null : value,
+                                        })}
+                                      >
+                                        <SelectTrigger
+                                          id={`key-protocol-${editingProvider?.id ?? "new"}-${index}`}
+                                          className="w-full"
+                                        >
+                                          <SelectValue />
+                                        </SelectTrigger>
+                                        <SelectContent>
+                                          <SelectItem value="inherit">
+                                            {isZh ? "继承供应商协议" : "Inherit provider protocol"}
+                                          </SelectItem>
+                                          {protocolOptions.map((option) => (
+                                            <SelectItem key={option.value} value={option.value}>
+                                              {option.label}
+                                            </SelectItem>
+                                          ))}
+                                        </SelectContent>
+                                      </Select>
+                                    </div>
+                                    <div className="space-y-1">
+                                      <label
+                                        htmlFor={`key-base-url-${editingProvider?.id ?? "new"}-${index}`}
+                                        className="text-xs font-medium text-muted-foreground"
+                                      >
+                                        {isZh ? "API 地址（可选）" : "API base URL (optional)"}
+                                      </label>
+                                      <Input
+                                        id={`key-base-url-${editingProvider?.id ?? "new"}-${index}`}
+                                        placeholder={
+                                          isZh
+                                            ? "继承供应商地址，如 https://relay.example.com/v1"
+                                            : "Inherit provider base URL, e.g. https://relay.example.com/v1"
+                                        }
+                                        value={key.base_url ?? ""}
+                                        onChange={(e) => updateEditKey(index, { base_url: e.target.value })}
+                                      />
+                                    </div>
+                                  </div>
+                                  <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
+                                    {stored?.probe_error ? (
+                                      <span className="text-red-600">
+                                        {isZh ? "探测失败：" : "Probe failed: "}
+                                        {stored.probe_error}
+                                      </span>
+                                    ) : stored?.last_probe_at ? (
+                                      <span>
+                                        {isZh ? "已探测" : "Probed"} · {effective.length}
+                                        {isZh ? " 个模型" : " models"} · {stored.last_probe_at}
+                                      </span>
+                                    ) : (
+                                      <span>{isZh ? "未探测（视为可服务任何模型）" : "Not probed (eligible for any model)"}</span>
+                                    )}
+                                    {key.manual_models ? (
+                                      <Badge variant="secondary">{isZh ? "手工清单" : "Manual list"}</Badge>
+                                    ) : null}
+                                  </div>
+                                  <textarea
+                                    className="min-h-16 w-full resize-y rounded-md border border-border bg-background px-2 py-1 font-mono text-xs text-foreground outline-none focus-visible:ring-2 focus-visible:ring-slate-300"
+                                    placeholder={
+                                      isZh
+                                        ? "手工修正模型清单（每行一个，留空使用探测快照）"
+                                        : "Manual model list (one per line; empty = use probe snapshot)"
+                                    }
+                                    value={modelsToEditorText(key, editingProvider?.keys)}
+                                    onChange={(e) => setKeyManualModels(index, e.target.value)}
+                                  />
+                                </div>
+                              );
+                            })}
+                            <Button
+                              type="button"
+                              variant="outline"
+                              size="sm"
+                              onClick={() =>
+                                setEditKeys((prev) => [
+                                  ...prev,
+                                  {
+                                    id: null,
+                                    name: "",
+                                    api_key: "",
+                                    protocol: null,
+                                    base_url: null,
+                                    is_enabled: true,
+                                    priority: prev.length,
+                                    manual_models: null,
+                                  },
+                                ])}
+                            >
+                              {isZh ? "添加 Key" : "Add Key"}
+                            </Button>
+                            {!(editForm.models_source ?? "").trim() ? (
+                              <p className="text-xs text-amber-600">
+                                {isZh
+                                  ? "提示：探测需要在“模型发现地址”填写中转的 /v1/models 地址。"
+                                  : "Hint: probing needs the relay's /v1/models URL in the Model Discovery URL field."}
+                              </p>
+                            ) : null}
+                          </div>
+                        ) : null}
+                      </div>
+                    ) : null}
                     {editingResolvedAuthMode !== "oauth" && editForm.protocol_mode !== "adaptive" && !editingIsSharedKey ? (
                     <div className="space-y-2">
                       <FieldLabel>{isZh ? "协议" : "Protocol"}</FieldLabel>
@@ -3481,6 +3768,48 @@ export default function ProvidersPage() {
                         />
                       </div>
                     )}
+                    {editingProviderIsMimo && (
+                      <div className="col-span-2 space-y-2 rounded-xl border border-slate-200 bg-slate-50/60 p-3">
+                        <FieldLabel
+                          info={
+                            isZh
+                              ? "推荐：小米账号长期凭证 passToken（数月有效），网关每次查询自动向小米护照换取新的控制台会话，无需反复手动更新。登录 account.xiaomi.com（或任意小米网站）后，从浏览器开发者工具 → Application → Cookies 复制 passToken 的值，连同账号 userId 一起填入；直接粘贴整段含 passToken= 的 Cookie 头也可以（自动解析 userId/deviceId）。旧版控制台 Cookie（约 24 小时过期）仍可单独粘贴，不推荐。留空保存即清除。"
+                              : "Recommended: the long-lived Xiaomi account passToken (months-scale) — the gateway exchanges it for a fresh console session on every query, so no manual refresh. Sign in to account.xiaomi.com (or any Xiaomi site), copy the passToken value from DevTools → Application → Cookies and fill it in together with your account userId; pasting a full Cookie header containing passToken= also works (userId/deviceId are parsed automatically). The legacy console Cookie (~24h expiry) still works when pasted alone, but is not recommended. Save with blanks to clear."
+                          }
+                        >
+                          {isZh ? "用量查询 passToken（小米 MiMo）" : "Usage Query passToken (Xiaomi MiMo)"}
+                        </FieldLabel>
+                        <div className="grid gap-3 md:grid-cols-2">
+                          <div className="space-y-1.5">
+                            <span className="ml-1 text-xs text-slate-500">
+                              {isZh ? "passToken / 控制台 Cookie" : "passToken / console Cookie"}
+                            </span>
+                            <Input
+                              className="bg-white"
+                              type="password"
+                              placeholder="passToken... / cookie..."
+                              autoComplete="off"
+                              spellCheck={false}
+                              value={editUsageAk}
+                              onChange={(e) => setEditUsageAk(e.target.value)}
+                            />
+                          </div>
+                          <div className="space-y-1.5">
+                            <span className="ml-1 text-xs text-slate-500">
+                              {isZh ? "小米账号 userId" : "Xiaomi account userId"}
+                            </span>
+                            <Input
+                              className="bg-white"
+                              placeholder="123456789"
+                              autoComplete="off"
+                              spellCheck={false}
+                              value={editUsageSk}
+                              onChange={(e) => setEditUsageSk(e.target.value)}
+                            />
+                          </div>
+                        </div>
+                      </div>
+                    )}
                     {editingProviderIsBailian && (
                       <div className="col-span-2 space-y-2 rounded-xl border border-slate-200 bg-slate-50/60 p-3">
                         <FieldLabel
@@ -3574,12 +3903,41 @@ export default function ProvidersPage() {
                           setEditError(validation);
                           return;
                         }
+                        if (keyPoolEnabled) {
+                          const invalidKey = editKeys.find(
+                            (key) => !key.name.trim() || !key.api_key.trim(),
+                          );
+                          if (invalidKey) {
+                            setEditError(
+                              isZh
+                                ? "密钥池中每个 Key 都需要名称和 API Key。"
+                                : "Every key in the pool needs a name and an API key.",
+                            );
+                            return;
+                          }
+                          if (editKeys.length === 0) {
+                            setEditError(
+                              isZh
+                                ? "密钥池开启后至少需要一个 Key，或关闭多密钥开关。"
+                                : "The key pool needs at least one key, or turn multi-key off.",
+                            );
+                            return;
+                          }
+                        }
                         const input: UpdateProvider = {
                           name: editForm.name || undefined,
                           vendor: editForm.vendor || undefined,
                           protocol,
                           base_url: baseUrl,
                           protocol_mode: adaptive ? "adaptive" : "fixed",
+                          keys: keyPoolEnabled
+                            ? editKeys.map((key, index) => ({
+                                ...key,
+                                protocol: key.protocol ?? null,
+                                base_url: (key.base_url ?? "").trim() || null,
+                                priority: Number.isFinite(key.priority) ? key.priority : index,
+                              }))
+                            : [],
                           protocol_endpoints: adaptive
                             ? protocolEndpoints.map((endpoint, index) => ({
                                 ...endpoint,
@@ -3748,7 +4106,7 @@ export default function ProvidersPage() {
                       )}
                     </button>
                     <button
-                      onClick={() => handleModelProbe(p)}
+                      onClick={() => setProbePickerTarget(p)}
                       disabled={Boolean(testingId) || Boolean(probingId)}
                       title={isZh ? "模型测试" : "Test Models"}
                       className="rounded-lg p-2 text-slate-400 transition-colors hover:bg-violet-50 hover:text-violet-500 cursor-pointer disabled:opacity-50"
@@ -3796,6 +4154,21 @@ export default function ProvidersPage() {
           })}
         </div>
       )}
+
+      <ModelProbePicker
+        open={Boolean(probePickerTarget)}
+        provider={probePickerTarget}
+        isZh={isZh}
+        lastResults={probePickerTarget ? modelProbeResults[probePickerTarget.id]?.results : undefined}
+        onCancel={() => setProbePickerTarget(null)}
+        onConfirm={(models) => {
+          const target = probePickerTarget;
+          setProbePickerTarget(null);
+          if (!target) return;
+          saveProbeSelection(target.id, models);
+          void runModelProbe(target, models);
+        }}
+      />
 
       <Dialog
         open={testDialogOpen}

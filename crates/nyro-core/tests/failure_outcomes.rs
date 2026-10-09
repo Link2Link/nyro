@@ -252,6 +252,7 @@ async fn forced_stream_incomplete_reason_is_not_automatically_token_limited() ->
     let p = gw
         .admin()
         .create_provider(CreateProvider {
+            keys: Vec::new(),
             name: "forced".into(),
             vendor: None,
             protocol: "openai-responses".into(),
@@ -359,6 +360,7 @@ async fn provider(gw: &Gateway, url: &str) -> anyhow::Result<String> {
     Ok(gw
         .admin()
         .create_provider(CreateProvider {
+            keys: Vec::new(),
             name: uuid::Uuid::new_v4().to_string(),
             vendor: None,
             protocol: "openai-compatible".into(),

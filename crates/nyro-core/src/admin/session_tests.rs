@@ -307,6 +307,7 @@ fn test_data_dir() -> PathBuf {
 
 fn oauth_provider_input() -> CreateProvider {
     CreateProvider {
+        keys: Vec::new(),
         name: format!("oauth-provider-{}", Uuid::new_v4()),
         vendor: None,
         protocol: "openai".to_string(),

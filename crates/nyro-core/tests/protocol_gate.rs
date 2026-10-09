@@ -19,6 +19,7 @@ use nyro_core::protocol::ids::{
 
 fn provider(protocol: &str) -> Provider {
     Provider {
+        keys: Vec::new(),
         id: "p".to_string(),
         name: "p".to_string(),
         vendor: None,

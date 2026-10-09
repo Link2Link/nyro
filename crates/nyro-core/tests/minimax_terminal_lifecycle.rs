@@ -131,6 +131,7 @@ impl Fixture {
             .gw
             .admin()
             .create_provider(CreateProvider {
+                keys: Vec::new(),
                 name: name.into(),
                 vendor: Some(vendor.into()),
                 protocol: protocol.into(),

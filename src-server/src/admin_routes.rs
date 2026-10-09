@@ -1,3 +1,4 @@
+use axum::body::Bytes;
 use axum::extract::{Path, Query, Request, State};
 use axum::http::StatusCode;
 use axum::middleware::{self, Next};
@@ -75,6 +76,10 @@ pub fn create_router(gateway: Gateway, admin_token: Option<String>) -> Router {
         .route(
             "/providers/:id/probe-models",
             post(probe_provider_models_handler),
+        )
+        .route(
+            "/providers/:id/probe-keys",
+            post(probe_provider_keys_handler),
         )
         .route(
             "/providers/:id/usage-credentials",
@@ -295,11 +300,51 @@ async fn test_provider_models_handler(
     }
 }
 
-async fn probe_provider_models_handler(
+#[derive(Deserialize)]
+struct ProbeModelsRequest {
+    /// Explicit probe selection; absent/null keeps the legacy full run.
+    #[serde(default)]
+    models: Option<Vec<String>>,
+}
+
+/// Parse the optional probe-selection body. An empty body keeps the legacy
+/// "probe every model" behavior; a body that is present must parse and hold
+/// up under normalization — garbage input never falls back to a full run.
+fn parse_probe_selection(body: &Bytes) -> Result<Option<Vec<String>>, String> {
+    if body.iter().all(|byte| byte.is_ascii_whitespace()) {
+        return Ok(None);
+    }
+    let request: ProbeModelsRequest =
+        serde_json::from_slice(body).map_err(|e| format!("invalid JSON body: {e}"))?;
+    nyro_core::admin::normalize_probe_selection(request.models).map_err(|e| e.to_string())
+}
+
+async fn probe_provider_keys_handler(
     State(gw): State<Gateway>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    match gw.admin().probe_provider_models(&id).await {
+    match gw.admin().probe_provider_keys(&id).await {
+        Ok(v) => Json(serde_json::json!({ "data": v })).into_response(),
+        Err(e) => err(e),
+    }
+}
+
+async fn probe_provider_models_handler(
+    State(gw): State<Gateway>,
+    Path(id): Path<String>,
+    body: Bytes,
+) -> impl IntoResponse {
+    let selection = match parse_probe_selection(&body) {
+        Ok(selection) => selection,
+        Err(message) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": message })),
+            )
+                .into_response();
+        }
+    };
+    match gw.admin().probe_provider_models(&id, selection).await {
         Ok(v) => Json(serde_json::json!({ "data": v })).into_response(),
         Err(e) => err(e),
     }

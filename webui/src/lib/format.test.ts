@@ -9,6 +9,7 @@ import {
   computeTps,
   contentTokensOf,
   endToEndMsOf,
+  formatTokenCount,
   formatTps,
   readAverageTpsField,
   tpsAggregateStatusTitle,
@@ -29,6 +30,25 @@ function loadTpsContract(): { name: string; log: TpsInput; content_tokens: numbe
   }
   throw new Error("tests/fixtures/tps-contract.json not found; run from the webui or repo root");
 }
+
+test("token count formatting scales across K, M, and B thresholds with proper decimals", () => {
+  equal(formatTokenCount(null), "0");
+  equal(formatTokenCount(undefined), "0");
+  equal(formatTokenCount(NaN), "0");
+  equal(formatTokenCount(-10), "0");
+  equal(formatTokenCount(0), "0");
+  equal(formatTokenCount(42), "42");
+  equal(formatTokenCount(999), "999");
+  equal(formatTokenCount(1000), "1.0K");
+  equal(formatTokenCount(1500), "1.5K");
+  equal(formatTokenCount(999_999), "1000.0K");
+  equal(formatTokenCount(1_000_000), "1.00M");
+  equal(formatTokenCount(12_340_000), "12.34M");
+  equal(formatTokenCount(999_999_999), "1000.00M");
+  equal(formatTokenCount(1_000_000_000), "1.00B");
+  equal(formatTokenCount(1_500_000_000), "1.50B");
+  equal(formatTokenCount(12_345_678_901), "12.35B");
+});
 
 test("TPS display uses one decimal; zero is valid, only null/non-finite/negative go missing", () => {
   for (const [value, expected] of [
