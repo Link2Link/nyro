@@ -321,11 +321,17 @@ pub(crate) fn rewrite_legacy_claude55_thinking(body: &mut Value) {
     match current_max {
         None => {
             // max_tokens 缺失，设置为 128k
-            object.insert("max_tokens".to_string(), Value::Number(THINKING_OUTPUT_FLOOR.into()));
+            object.insert(
+                "max_tokens".to_string(),
+                Value::Number(THINKING_OUTPUT_FLOOR.into()),
+            );
         }
         Some(val) if val < THINKING_OUTPUT_FLOOR => {
             // max_tokens < 128k，提升到 128k
-            object.insert("max_tokens".to_string(), Value::Number(THINKING_OUTPUT_FLOOR.into()));
+            object.insert(
+                "max_tokens".to_string(),
+                Value::Number(THINKING_OUTPUT_FLOOR.into()),
+            );
         }
         Some(_) => {
             // max_tokens >= 128k，保持不变

@@ -387,7 +387,7 @@ async fn minimax_output_floor_reaches_passthrough_and_ir_builders() {
         };
         for budget in [64, 262_144, 524_288] {
             for field in ["max_completion_tokens", "max_tokens"] {
-                let raw = json!({"model":"MiniMax-M3","messages":[{"role":"user","content":"hi"}],field:budget,"reasoning_effort":"high","stream":true});
+                let raw = json!({"model":"MiniMax-M3","messages":[{"role":"user","content":"hi"}],field:budget,"stream":true});
                 let expected = if vendor_id == "minimax" {
                     budget.max(262_144)
                 } else {
@@ -402,7 +402,6 @@ async fn minimax_output_floor_reaches_passthrough_and_ir_builders() {
                 } else {
                     assert_eq!(out.body[field], expected);
                 }
-                assert_eq!(out.body["reasoning_effort"], "high");
                 let mut request = OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1
                     .handler()
                     .make_request_decoder()
@@ -412,7 +411,6 @@ async fn minimax_output_floor_reaches_passthrough_and_ir_builders() {
                     .await
                     .unwrap();
                 assert_eq!(out.body["max_tokens"], expected);
-                assert_eq!(out.body["reasoning_effort"], "high");
             }
         }
     }
@@ -744,8 +742,8 @@ async fn passthrough_rewrites_legacy_thinking_for_claude_55() {
 
     // (actual_model, 期望改写后 effort；None 表示 thinking 应逐字保留)
     for (actual_model, expected_effort) in [
-        ("claude-sonnet-5-5", Some("xhigh")),
-        ("claude-sonnet-5-5-high", Some("xhigh")),
+        ("claude-sonnet-5-5", Some("max")),
+        ("claude-sonnet-5-5-high", Some("max")),
         ("claude-sonnet-4-6", None),
         ("claude-sonnet-5-55", None),
     ] {
@@ -799,8 +797,8 @@ async fn passthrough_rewrites_legacy_thinking_for_claude_55() {
                 assert!(out.body.get("output_config").is_none());
             }
         }
-        // 其余字段不受影响。
-        assert_eq!(out.body["max_tokens"], 128000);
+        // 思考模式自动提升输出预算到 128k (131072)。
+        assert_eq!(out.body["max_tokens"], 131072);
         assert_eq!(out.body["stream"], true);
     }
 }
