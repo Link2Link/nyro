@@ -97,9 +97,9 @@ pub(crate) fn maybe_sanitize_codex_consumer_request(body: &mut Value, provider: 
     }
 }
 
-/// 思考模型输出预算下限：客户端请求的 `max_tokens` 如果过小（< 16K），
+/// 思考模型输出预算下限：客户端请求的 `max_tokens` 如果过小，
 /// 会导致思考型模型的 thinking 输出被截断、最终答案无法生成。对所有协议
-/// 统一提升到 16384（16K），确保 thinking + 最终输出都有足够空间。
+/// 统一提升到 128000（十进制 128k），与 Claude 方言策略的兼容值保持一致。
 ///
 /// 适用协议：
 /// - OpenAI Chat：`max_tokens` / `max_completion_tokens`
@@ -107,9 +107,9 @@ pub(crate) fn maybe_sanitize_codex_consumer_request(body: &mut Value, provider: 
 /// - Anthropic Messages：`max_tokens`
 /// - Google Gemini：`generationConfig.maxOutputTokens`
 ///
-/// 门控：只对过小的值提升；客户端显式设置的大值（>= 16K）和缺失值保持不变。
+/// 门控：只对过小的值提升；客户端显式设置的大值（>= 128000）和缺失值保持不变。
 /// 提升发生在 vendor 方言策略之前，确保改写后的值仍受上游约束检查。
-const THINKING_MODEL_OUTPUT_TOKEN_FLOOR: u64 = 131072; // 128k
+const THINKING_MODEL_OUTPUT_TOKEN_FLOOR: u64 = 128000; // 128k
 
 pub(crate) fn apply_max_tokens_floor(
     body: &mut Value,
@@ -399,6 +399,13 @@ fn is_claude_55_model(body_model: &str) -> bool {
     matches_registered_model(body_model, CLAUDE_55_ADAPTIVE_ONLY_MODELS)
 }
 
+/// 判断模型名是否为思考模型：Claude 5.5 系列或 GLM 5.3 系列等。
+/// 用于 max_tokens 防御下限：即使客户端请求未携带 `thinking` 字段，
+/// 思考模型仍会自动执行推理（自适应思考），消耗大量 tokens。
+fn is_thinking_model(body_model: &str) -> bool {
+    is_claude_55_model(body_model) || is_thinking_mandatory_model(body_model)
+}
+
 pub(crate) fn apply_vendor_effort_policy(body: &mut Value, provider: &Provider) {
     let vendor_id = provider
         .vendor
@@ -583,7 +590,7 @@ where
     );
     crate::provider::google::apply_output_token_floor(&mut body, ctx.provider.vendor.as_deref());
 
-    // 5a. 思考模型输出预算下限：提升过小的 max_tokens（< 128K）到 131072，
+    // 5a. 思考模型输出预算下限：提升过小的 max_tokens（< 128K）到 128000，
     // 确保 thinking + 最终输出都有足够空间（IR 转码路径）
     apply_max_tokens_floor(&mut body, ctx.protocol.protocol, req.reasoning.enabled);
 
@@ -765,12 +772,17 @@ pub async fn passthrough_run(
         ctx.provider.vendor.as_deref(),
     );
 
-    // 思考模型输出预算下限：提升过小的 max_tokens（< 128K）到 131072（直通路径）
-    // 直通路径没有 IR，从 raw_body 检查是否存在 thinking 字段
-    let is_thinking_request = raw_body
+    // 思考模型输出预算下限：提升过小的 max_tokens（< 128K）到 128000（直通路径）
+    // 直通路径没有 IR，从 raw_body 检查是否存在 thinking 字段，或模型本身是否为思考模型
+    let has_thinking_field = raw_body
         .get("thinking")
         .and_then(|v| v.as_object())
         .is_some();
+    let model_name = raw_body
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let is_thinking_request = has_thinking_field || is_thinking_model(model_name);
     apply_max_tokens_floor(&mut raw_body, ctx.protocol.protocol, is_thinking_request);
 
     if is_openai_chat {
@@ -3564,14 +3576,14 @@ mod tests {
     /// 测试 apply_max_tokens_floor: OpenAI Chat 协议
     #[test]
     fn max_tokens_floor_lifts_small_openai_chat_budget() {
-        // max_tokens 过小时提升到 131072
+        // max_tokens 过小时提升到 128000
         let mut body = serde_json::json!({"model": "gpt-4", "messages": [], "max_tokens": 64});
         apply_max_tokens_floor(
             &mut body,
             crate::protocol::ids::Protocol::OpenAICompatible,
             true,
         );
-        assert_eq!(body["max_tokens"], 131072);
+        assert_eq!(body["max_tokens"], 128000);
 
         // max_completion_tokens 优先级更高
         let mut body = serde_json::json!({
@@ -3585,7 +3597,7 @@ mod tests {
             crate::protocol::ids::Protocol::OpenAICompatible,
             true,
         );
-        assert_eq!(body["max_completion_tokens"], 131072);
+        assert_eq!(body["max_completion_tokens"], 128000);
         assert_eq!(
             body["max_tokens"], 1000,
             "max_tokens unchanged when max_completion_tokens is primary"
@@ -3633,7 +3645,7 @@ mod tests {
             crate::protocol::ids::Protocol::OpenAIResponses,
             true,
         );
-        assert_eq!(body["reasoning"]["output_tokens"], 131072);
+        assert_eq!(body["reasoning"]["output_tokens"], 128000);
 
         // 已经足够大的值保持不变
         let mut body = serde_json::json!({
@@ -3672,7 +3684,7 @@ mod tests {
             crate::protocol::ids::Protocol::AnthropicMessages,
             true,
         );
-        assert_eq!(body["max_tokens"], 131072);
+        assert_eq!(body["max_tokens"], 128000);
 
         // 已经足够大的值保持不变
         let mut body = serde_json::json!({
@@ -3686,6 +3698,107 @@ mod tests {
             true,
         );
         assert_eq!(body["max_tokens"], 150000);
+    }
+
+    /// 测试思考模型识别：Claude 5.5 系列和 GLM 5.3 系列
+    #[test]
+    fn is_thinking_model_recognizes_claude55_and_glm53() {
+        // Claude 5.5 系列（自适应思考）
+        assert!(is_thinking_model("claude-sonnet-5-5"));
+        assert!(is_thinking_model("claude-opus-5-5"));
+        assert!(is_thinking_model("claude-haiku-5-5"));
+        assert!(is_thinking_model("claude-sonnet-5-5-high"));
+        assert!(is_thinking_model("claude-opus-5-5-medium"));
+        assert!(is_thinking_model("Claude-Sonnet-5-5")); // 大小写不敏感
+
+        // GLM 5.3 系列（必须思考）
+        assert!(is_thinking_model("glm-5.3"));
+        assert!(is_thinking_model("glm-5.3-flash"));
+        assert!(is_thinking_model("GLM-5.3")); // 大小写不敏感
+
+        // 非思考模型
+        assert!(!is_thinking_model("claude-3-5-sonnet-20241022"));
+        assert!(!is_thinking_model("claude-sonnet-5-55")); // 不匹配：后续是数字
+        assert!(!is_thinking_model("gpt-4"));
+        assert!(!is_thinking_model("gemini-2.0-flash-thinking-exp"));
+        assert!(!is_thinking_model(""));
+    }
+
+    /// 测试 Anthropic Messages 协议：思考模型无 thinking 字段时也提升 max_tokens
+    ///
+    /// 回归测试 - 请求 ID fb026305-68d0-4c16-840d-a5e40f9edbaa：
+    /// 客户端发送 claude-sonnet-5-5 + max_tokens=64，但未携带 thinking 字段。
+    /// 模型自适应思考消耗全部 64 tokens，无输出空间，stop_reason=max_tokens。
+    /// 修复后：按模型名识别为思考请求，自动提升 max_tokens 到 128000。
+    #[test]
+    fn max_tokens_floor_recognizes_thinking_model_without_thinking_field() {
+        // claude-sonnet-5-5，无 thinking 字段，max_tokens 过小 → 应提升
+        let mut body = serde_json::json!({
+            "model": "claude-sonnet-5-5",
+            "messages": [{"role": "user", "content": "Hello"}],
+            "max_tokens": 64
+        });
+
+        // 模拟直通路径的判断逻辑
+        let has_thinking_field = body.get("thinking").and_then(|v| v.as_object()).is_some();
+        let model_name = body
+            .get("model")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        let is_thinking_request = has_thinking_field || is_thinking_model(model_name);
+
+        assert!(!has_thinking_field, "请求不应包含 thinking 字段");
+        assert!(is_thinking_request, "应识别为思考请求");
+
+        apply_max_tokens_floor(
+            &mut body,
+            crate::protocol::ids::Protocol::AnthropicMessages,
+            is_thinking_request,
+        );
+
+        assert_eq!(body["max_tokens"], 128000, "max_tokens 应提升到 128000");
+
+        // claude-opus-5-5 同理
+        let mut body = serde_json::json!({
+            "model": "claude-opus-5-5-high",
+            "messages": [],
+            "max_tokens": 100
+        });
+
+        let model_name = body
+            .get("model")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        let is_thinking_request = is_thinking_model(model_name);
+
+        apply_max_tokens_floor(
+            &mut body,
+            crate::protocol::ids::Protocol::AnthropicMessages,
+            is_thinking_request,
+        );
+
+        assert_eq!(body["max_tokens"], 128000);
+
+        // 非思考模型，max_tokens 小但 is_thinking_request=false → 不提升
+        let mut body = serde_json::json!({
+            "model": "claude-3-5-sonnet-20241022",
+            "messages": [],
+            "max_tokens": 64
+        });
+
+        let model_name = body
+            .get("model")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        let is_thinking_request = is_thinking_model(model_name);
+
+        apply_max_tokens_floor(
+            &mut body,
+            crate::protocol::ids::Protocol::AnthropicMessages,
+            is_thinking_request,
+        );
+
+        assert_eq!(body["max_tokens"], 64, "非思考模型不应提升");
     }
 
     /// 测试 apply_max_tokens_floor: Google Gemini 协议
@@ -3702,7 +3815,7 @@ mod tests {
             crate::protocol::ids::Protocol::GoogleGemini,
             true,
         );
-        assert_eq!(body["generationConfig"]["maxOutputTokens"], 131072);
+        assert_eq!(body["generationConfig"]["maxOutputTokens"], 128000);
 
         // 已经足够大的值保持不变
         let mut body = serde_json::json!({
@@ -3728,16 +3841,16 @@ mod tests {
         assert!(body.get("generationConfig").is_none());
     }
 
-    /// 边界测试：正好 16384 的值不变
+    /// 边界测试：正好 128000 的值不变
     #[test]
     fn max_tokens_floor_keeps_exact_boundary() {
-        let mut body = serde_json::json!({"model": "gpt-4", "messages": [], "max_tokens": 16384});
+        let mut body = serde_json::json!({"model": "gpt-4", "messages": [], "max_tokens": 128000});
         apply_max_tokens_floor(
             &mut body,
             crate::protocol::ids::Protocol::OpenAICompatible,
             true,
         );
-        assert_eq!(body["max_tokens"], 131072);
+        assert_eq!(body["max_tokens"], 128000);
     }
 
     /// 边界测试：16383 会被提升
@@ -3749,6 +3862,6 @@ mod tests {
             crate::protocol::ids::Protocol::OpenAICompatible,
             true,
         );
-        assert_eq!(body["max_tokens"], 131072);
+        assert_eq!(body["max_tokens"], 128000);
     }
 }
