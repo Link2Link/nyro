@@ -314,9 +314,10 @@ pub(crate) fn rewrite_legacy_claude55_thinking(body: &mut Value) {
         }
     }
 
-    // 思考模型输出预算提升：当 max_tokens < 128k 时，自动提升到 128k（131072）
-    // 避免思考被截断。缺失时也设置为 128k。
-    const THINKING_OUTPUT_FLOOR: u64 = 131072; // 128k
+    // 思考模型输出预算提升：当 max_tokens < 128k 时，自动提升到 128k（128000）
+    // 避免思考被截断。缺失时也设置为 128k。使用 128000 而非 131072 以兼容
+    // OpenCode Go 等第三方供应商的实际上限（请求 c4656ef3 线上故障）。
+    const THINKING_OUTPUT_FLOOR: u64 = 128000; // 128k (保守上限)
     let current_max = object.get("max_tokens").and_then(Value::as_u64);
     match current_max {
         None => {
@@ -667,13 +668,13 @@ mod tests {
 
     #[test]
     fn claude55_rewrite_auto_lifts_max_tokens_to_128k() {
-        // 当 max_tokens < 128k 时，自动提升到 128k（131072）避免思考被截断。
+        // 当 max_tokens < 128k 时，自动提升到 128k（128000）避免思考被截断。
         let mut body = json!({
             "thinking": {"type": "enabled", "budget_tokens": 16384},
             "max_tokens": 4096
         });
         rewrite_legacy_claude55_thinking(&mut body);
-        assert_eq!(body["max_tokens"], 131072);
+        assert_eq!(body["max_tokens"], 128000);
         assert_eq!(body["output_config"]["effort"], "max");
 
         // 当 max_tokens 缺失时，自动设置为 128k。
@@ -681,7 +682,7 @@ mod tests {
             "thinking": {"type": "enabled", "budget_tokens": 8193}
         });
         rewrite_legacy_claude55_thinking(&mut body);
-        assert_eq!(body["max_tokens"], 131072);
+        assert_eq!(body["max_tokens"], 128000);
 
         // 当 max_tokens >= 128k 时，保持原值不变。
         let mut body = json!({
