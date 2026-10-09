@@ -3566,7 +3566,11 @@ mod tests {
     fn max_tokens_floor_lifts_small_openai_chat_budget() {
         // max_tokens 过小时提升到 131072
         let mut body = serde_json::json!({"model": "gpt-4", "messages": [], "max_tokens": 64});
-        apply_max_tokens_floor(&mut body, crate::protocol::ids::Protocol::OpenAICompatible, true);
+        apply_max_tokens_floor(
+            &mut body,
+            crate::protocol::ids::Protocol::OpenAICompatible,
+            true,
+        );
         assert_eq!(body["max_tokens"], 131072);
 
         // max_completion_tokens 优先级更高
@@ -3576,7 +3580,11 @@ mod tests {
             "max_tokens": 1000,
             "max_completion_tokens": 64
         });
-        apply_max_tokens_floor(&mut body, crate::protocol::ids::Protocol::OpenAICompatible, true);
+        apply_max_tokens_floor(
+            &mut body,
+            crate::protocol::ids::Protocol::OpenAICompatible,
+            true,
+        );
         assert_eq!(body["max_completion_tokens"], 131072);
         assert_eq!(
             body["max_tokens"], 1000,
@@ -3585,17 +3593,29 @@ mod tests {
 
         // 已经足够大的值保持不变
         let mut body = serde_json::json!({"model": "gpt-4", "messages": [], "max_tokens": 150000});
-        apply_max_tokens_floor(&mut body, crate::protocol::ids::Protocol::OpenAICompatible, true);
+        apply_max_tokens_floor(
+            &mut body,
+            crate::protocol::ids::Protocol::OpenAICompatible,
+            true,
+        );
         assert_eq!(body["max_tokens"], 150000);
 
         // 缺失值保持不变
         let mut body = serde_json::json!({"model": "gpt-4", "messages": []});
-        apply_max_tokens_floor(&mut body, crate::protocol::ids::Protocol::OpenAICompatible, true);
+        apply_max_tokens_floor(
+            &mut body,
+            crate::protocol::ids::Protocol::OpenAICompatible,
+            true,
+        );
         assert!(body.get("max_tokens").is_none());
 
         // null 值保持不变
         let mut body = serde_json::json!({"model": "gpt-4", "messages": [], "max_tokens": null});
-        apply_max_tokens_floor(&mut body, crate::protocol::ids::Protocol::OpenAICompatible, true);
+        apply_max_tokens_floor(
+            &mut body,
+            crate::protocol::ids::Protocol::OpenAICompatible,
+            true,
+        );
         assert!(body["max_tokens"].is_null());
     }
 
@@ -3608,7 +3628,11 @@ mod tests {
             "input": [],
             "reasoning": {"output_tokens": 64}
         });
-        apply_max_tokens_floor(&mut body, crate::protocol::ids::Protocol::OpenAIResponses, true);
+        apply_max_tokens_floor(
+            &mut body,
+            crate::protocol::ids::Protocol::OpenAIResponses,
+            true,
+        );
         assert_eq!(body["reasoning"]["output_tokens"], 131072);
 
         // 已经足够大的值保持不变
@@ -3617,12 +3641,20 @@ mod tests {
             "input": [],
             "reasoning": {"output_tokens": 150000}
         });
-        apply_max_tokens_floor(&mut body, crate::protocol::ids::Protocol::OpenAIResponses, true);
+        apply_max_tokens_floor(
+            &mut body,
+            crate::protocol::ids::Protocol::OpenAIResponses,
+            true,
+        );
         assert_eq!(body["reasoning"]["output_tokens"], 150000);
 
         // 缺失 reasoning 字段保持不变
         let mut body = serde_json::json!({"model": "gpt-4", "input": []});
-        apply_max_tokens_floor(&mut body, crate::protocol::ids::Protocol::OpenAIResponses, true);
+        apply_max_tokens_floor(
+            &mut body,
+            crate::protocol::ids::Protocol::OpenAIResponses,
+            true,
+        );
         assert!(body.get("reasoning").is_none());
     }
 
@@ -3635,7 +3667,11 @@ mod tests {
             "messages": [],
             "max_tokens": 128
         });
-        apply_max_tokens_floor(&mut body, crate::protocol::ids::Protocol::AnthropicMessages, true);
+        apply_max_tokens_floor(
+            &mut body,
+            crate::protocol::ids::Protocol::AnthropicMessages,
+            true,
+        );
         assert_eq!(body["max_tokens"], 131072);
 
         // 已经足够大的值保持不变
@@ -3644,7 +3680,11 @@ mod tests {
             "messages": [],
             "max_tokens": 150000
         });
-        apply_max_tokens_floor(&mut body, crate::protocol::ids::Protocol::AnthropicMessages, true);
+        apply_max_tokens_floor(
+            &mut body,
+            crate::protocol::ids::Protocol::AnthropicMessages,
+            true,
+        );
         assert_eq!(body["max_tokens"], 150000);
     }
 
@@ -3657,7 +3697,11 @@ mod tests {
             "contents": [],
             "generationConfig": {"maxOutputTokens": 100}
         });
-        apply_max_tokens_floor(&mut body, crate::protocol::ids::Protocol::GoogleGemini, true);
+        apply_max_tokens_floor(
+            &mut body,
+            crate::protocol::ids::Protocol::GoogleGemini,
+            true,
+        );
         assert_eq!(body["generationConfig"]["maxOutputTokens"], 131072);
 
         // 已经足够大的值保持不变
@@ -3666,13 +3710,21 @@ mod tests {
             "contents": [],
             "generationConfig": {"maxOutputTokens": 150000}
         });
-        apply_max_tokens_floor(&mut body, crate::protocol::ids::Protocol::GoogleGemini, true);
+        apply_max_tokens_floor(
+            &mut body,
+            crate::protocol::ids::Protocol::GoogleGemini,
+            true,
+        );
         assert_eq!(body["generationConfig"]["maxOutputTokens"], 150000);
 
         // 缺失 generationConfig 字段保持不变
         let mut body =
             serde_json::json!({"model": "gemini-2.0-flash-thinking-exp", "contents": []});
-        apply_max_tokens_floor(&mut body, crate::protocol::ids::Protocol::GoogleGemini, true);
+        apply_max_tokens_floor(
+            &mut body,
+            crate::protocol::ids::Protocol::GoogleGemini,
+            true,
+        );
         assert!(body.get("generationConfig").is_none());
     }
 
@@ -3680,7 +3732,11 @@ mod tests {
     #[test]
     fn max_tokens_floor_keeps_exact_boundary() {
         let mut body = serde_json::json!({"model": "gpt-4", "messages": [], "max_tokens": 16384});
-        apply_max_tokens_floor(&mut body, crate::protocol::ids::Protocol::OpenAICompatible, true);
+        apply_max_tokens_floor(
+            &mut body,
+            crate::protocol::ids::Protocol::OpenAICompatible,
+            true,
+        );
         assert_eq!(body["max_tokens"], 131072);
     }
 
@@ -3688,7 +3744,11 @@ mod tests {
     #[test]
     fn max_tokens_floor_lifts_one_below_boundary() {
         let mut body = serde_json::json!({"model": "gpt-4", "messages": [], "max_tokens": 16383});
-        apply_max_tokens_floor(&mut body, crate::protocol::ids::Protocol::OpenAICompatible, true);
+        apply_max_tokens_floor(
+            &mut body,
+            crate::protocol::ids::Protocol::OpenAICompatible,
+            true,
+        );
         assert_eq!(body["max_tokens"], 131072);
     }
 }

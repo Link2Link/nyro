@@ -4,6 +4,49 @@ Nyro 的所有重要变更均记录在此文件中。
 
 ---
 
+## v2.1.0
+
+> 发布于 2026-10-09
+
+#### 新功能
+
+- **供应商级多密钥池**：供应商新增可选 key_pool 数组——每条绑定一个协议（或全部）到不同凭证集，使三方中转代理能按模型路由不同 Key 的同时保留单 Key 可用性；协议路由在出站前改写活跃凭证，模型探测尊重按协议密钥池
+- **密钥池协议独立配置与 Claude 5.5 思考模式防御**：思考开启的请求针对 Claude 5.5 上游改写（旧式 budget_tokens → 自适应 effort 档位，高预算请求下限 max effort，max_tokens 自动提升至 128K 防截断）；Responses codex 消费级消毒剥离消费级上游拒绝的 reasoning 参数
+- **思考模型输出预算自动提升至 128K**：所有协议（OpenAI Chat/Responses、Anthropic Messages、Google Gemini）现对思考开启的请求自动将 max_tokens < 128K 提升至 131072，确保思考与最终输出均有足够空间；IR 转码与直通路径双路生效，按协议字段映射（max_completion_tokens 优先、reasoning.output_tokens、generationConfig.maxOutputTokens）
+- **小米 MiMo 供应商**：小米 AI 成为一等供应商，支持 passport 令牌自动续签——用量查询用存储凭证经 SSO 引导换取短期 passToken，再轮询计费 API 获取模型家族 token 消耗
+- **Codex 版本动态探测**：Codex OAuth driver 现探测 `/backend-api/models` 判定 Code-Assist-Pro 可用性并设置渠道变体（code_assist_pro vs codex_responses），避免不必要的 404 失败并实现按账号自动通道发现
+- **统计近 30 天时间范围**：用量统计新增 30 天聚合窗口，补充现有的小时/天/周窗口
+- **十亿级 Token 数量以 B 单位显示**：Token 计数 ≥ 1B 时在 WebUI 与 DSH 面板以 B 后缀格式化显示（如 "1.2B"）提升可读性
+- **Antigravity 通道 Claude 5.5 模型扫描**：Google Antigravity 通道现按订阅账号动态发现 Claude 5.5 变体
+- **Google 订阅配额可观测**：档位识别改为优先订阅档——`loadCodeAssist` 同时返回 `currentTier` 与 `paidTier`，付费（g1-pro / g1-ultra）账号不再被误标为免费档，不合格档位的原因码随凭证持久化并经 OAuth 状态接口（`tier_ineligible`）透出；用量查询接入执行级配额面（`v1internal:retrieveUserQuotaSummary`），按家族 × 窗口的真实预算桶（剩余比例 + 重置时间）成为用量行——按窗口折叠为规范名（`five_hour` / `weekly_limit`），驱动 WebUI 与 DSH 面板的本地化标签与匀速标记——模型目录 quotaInfo 折叠保留为兜底，claude / gpt / tab 等附属池被过滤并带回退全量的安全网
+- **订阅通道 Gemini 3 系列兼容**：Google Antigravity 与 Gemini CLI 通道完成 Code Assist v1internal 推理与 daily/prod 域名路由，保留 Gemini 3 思考签名并自动回放，按账号动态发现模型，effort 档位自动改写为订阅模型变体
+- **OpenCode Go 三端点自适应路由**：预设声明 chat / responses / messages 三端点共享 Key，`/v1/messages` 认证改用 `x-api-key`，按模型的端点路由表以客户端协议优先、不支持时改道模型自身端点，dispatcher 出站统一注入派生的 `x-opencode-session` 会话头，模型探测按实际路由端点逐模型下发，并过滤订阅内全端点不可用的模型
+- **推理用量统计**：持久化推理令牌用量并区分正文与总吞吐指标，采样窗口扩大至五十条，补充多轮工具重放回归测试
+- **性能看板综合 TPS**：模型性能统计新增综合 TPS（总输出 token ÷ 上游总往返延时），性能页以综合速度图表为唯一主视图，诊断表对比综合 TPS 与纯吐字生成速度
+
+#### 改进
+
+- **统一端到端正文 TPS 计算口径**：各统计面的 TPS 定义收敛
+- **重构供应商图标解析**：图标解析重构并接入性能图
+- **DSH 用量面板插件设置注册重构**：nyro-usage DSH 插件的 volatile 设置注册更清晰
+- **Gemini 用量展示顺序调整**：5 小时配额现在显示在周限额上方
+- **百炼用量解析**：新增阿里百炼月度配额窗口支持
+- **全仓 rustfmt 格式统一与编译警告清理**
+
+#### 修复
+
+- **OpenCode Go 模型协议路由**：修正 OpenCode Go 模型端点路由表
+- **Gemini 流式换行规范化与 EOF 终端重试**
+- **Gemini 流式转换伪成功与影子污染**
+- **Gemini 空载畸变重试与流探测**
+- **Gemini 转码缺陷并补充回归测试**
+- **Google 输出 token 超限被上游拒绝**
+- **Google 订阅通道 Schema 兼容与输出限制**
+- **性能页多变体统计并收敛包络标签**
+- **流修复引入的多余 mut 编译警告**
+
+---
+
 ## v2.0.9
 
 > 发布于 2026-09-09
