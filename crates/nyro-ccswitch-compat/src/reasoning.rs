@@ -197,10 +197,10 @@ fn drop_grok_effort_responses(converted: &mut Value) {
         && let Some(object) = reasoning.as_object_mut()
     {
         object.remove("effort");
-        if object.is_empty() {
-            if let Some(top) = converted.as_object_mut() {
-                top.remove("reasoning");
-            }
+        if object.is_empty()
+            && let Some(top) = converted.as_object_mut()
+        {
+            top.remove("reasoning");
         }
     }
 }

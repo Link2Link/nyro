@@ -278,9 +278,10 @@ fn is_off_effort(effort: &str) -> bool {
 ///   调用方触发（见 pipeline 模块的 5.5 门控）。
 pub(crate) fn rewrite_legacy_claude55_thinking(body: &mut Value) {
     /// 预算 → 档位（CPA `ConvertBudgetToLevel` 阈值表整体上提一档；
-    /// xhigh 为顶格，原 xhigh 区间保持不变）。
+    /// max 为顶格，budget > 10240 映射为 max）。
     fn budget_to_level(budget: i64) -> Option<&'static str> {
         match budget {
+            b if b > 10240 => Some("max"),
             b if b > 8192 => Some("xhigh"),
             b if b > 1024 => Some("high"),
             b if b > 0 => Some("medium"),
@@ -310,6 +311,24 @@ pub(crate) fn rewrite_legacy_claude55_thinking(body: &mut Value) {
             .or_insert_with(|| Value::Object(serde_json::Map::new()));
         if let Some(output_config) = entry.as_object_mut() {
             output_config.insert("effort".to_string(), Value::String(level.to_string()));
+        }
+    }
+
+    // 思考模型输出预算提升：当 max_tokens < 128k 时，自动提升到 128k（131072）
+    // 避免思考被截断。缺失时也设置为 128k。
+    const THINKING_OUTPUT_FLOOR: u64 = 131072; // 128k
+    let current_max = object.get("max_tokens").and_then(Value::as_u64);
+    match current_max {
+        None => {
+            // max_tokens 缺失，设置为 128k
+            object.insert("max_tokens".to_string(), Value::Number(THINKING_OUTPUT_FLOOR.into()));
+        }
+        Some(val) if val < THINKING_OUTPUT_FLOOR => {
+            // max_tokens < 128k，提升到 128k
+            object.insert("max_tokens".to_string(), Value::Number(THINKING_OUTPUT_FLOOR.into()));
+        }
+        Some(_) => {
+            // max_tokens >= 128k，保持不变
         }
     }
 }
@@ -568,7 +587,7 @@ mod tests {
     #[test]
     fn claude55_rewrite_converts_budget_to_bumped_level() {
         // 档位换算整体上提一档：16384（线上 b0500316 的 Claude Code 常用
-        // 预算）→ xhigh。
+        // 预算）→ max。
         let mut body = json!({
             "model": "claude-sonnet-5-5",
             "thinking": {"type": "enabled", "budget_tokens": 16384, "display": "summarized"}
@@ -577,14 +596,16 @@ mod tests {
         assert_eq!(body["thinking"]["type"], "adaptive");
         assert!(body["thinking"].get("budget_tokens").is_none());
         assert_eq!(body["thinking"]["display"], "summarized");
-        assert_eq!(body["output_config"]["effort"], "xhigh");
+        assert_eq!(body["output_config"]["effort"], "max");
 
-        // 区间边界：≤1024 → medium，1025..=8192 → high，>8192 → xhigh。
+        // 区间边界：≤1024 → medium，1025..=8192 → high，8193..=10240 → xhigh，>10240 → max。
         for (budget, level) in [
             (1024, "medium"),
             (1025, "high"),
             (8192, "high"),
             (8193, "xhigh"),
+            (10240, "xhigh"),
+            (10241, "max"),
         ] {
             let mut body = json!({"thinking": {"type": "enabled", "budget_tokens": budget}});
             rewrite_legacy_claude55_thinking(&mut body);
@@ -634,7 +655,42 @@ mod tests {
             "output_config": {"effort": "low", "metadata": "keep"}
         });
         rewrite_legacy_claude55_thinking(&mut body);
-        assert_eq!(body["output_config"]["effort"], "xhigh");
+        assert_eq!(body["output_config"]["effort"], "max");
         assert_eq!(body["output_config"]["metadata"], "keep");
+    }
+
+    #[test]
+    fn claude55_rewrite_auto_lifts_max_tokens_to_128k() {
+        // 当 max_tokens < 128k 时，自动提升到 128k（131072）避免思考被截断。
+        let mut body = json!({
+            "thinking": {"type": "enabled", "budget_tokens": 16384},
+            "max_tokens": 4096
+        });
+        rewrite_legacy_claude55_thinking(&mut body);
+        assert_eq!(body["max_tokens"], 131072);
+        assert_eq!(body["output_config"]["effort"], "max");
+
+        // 当 max_tokens 缺失时，自动设置为 128k。
+        let mut body = json!({
+            "thinking": {"type": "enabled", "budget_tokens": 8193}
+        });
+        rewrite_legacy_claude55_thinking(&mut body);
+        assert_eq!(body["max_tokens"], 131072);
+
+        // 当 max_tokens >= 128k 时，保持原值不变。
+        let mut body = json!({
+            "thinking": {"type": "enabled", "budget_tokens": 16384},
+            "max_tokens": 200000
+        });
+        rewrite_legacy_claude55_thinking(&mut body);
+        assert_eq!(body["max_tokens"], 200000);
+
+        // 当 thinking.type 不是 enabled 时，不修改 max_tokens。
+        let mut body = json!({
+            "thinking": {"type": "adaptive"},
+            "max_tokens": 4096
+        });
+        rewrite_legacy_claude55_thinking(&mut body);
+        assert_eq!(body["max_tokens"], 4096);
     }
 }
