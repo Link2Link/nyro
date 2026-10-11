@@ -716,10 +716,10 @@ pub(crate) fn unwrap_response(body: &mut Value) {
     }
 }
 
-/// Unwrap every SSE `data:` line of a v1internal stream chunk. Lines that
+/// Unwrap complete SSE `data:` lines of a v1internal stream. Lines that
 /// are not `data:` payloads or do not carry a `response` object are kept
-/// verbatim. This is stateless: incomplete JSON fragments pass through for
-/// downstream buffering; do not normalize CRLF independently per chunk.
+/// verbatim. The dispatcher's StreamInput buffers transport fragments before
+/// this stateless hook runs, including the unterminated final line at EOF.
 pub(crate) fn unwrap_stream_chunk(chunk: &str) -> String {
     let mut out = String::with_capacity(chunk.len());
     // Splitting a CRLF pair here is safe because each terminator is preserved.

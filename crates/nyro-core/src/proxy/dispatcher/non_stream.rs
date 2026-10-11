@@ -1307,11 +1307,12 @@ pub(super) async fn handle_non_stream_via_upstream_stream(
     }
 
     let mut stream_parser = egress.handler().make_stream_response_decoder();
+    let mut stream_input = super::stream::StreamInput::default();
     let mut byte_stream = resp.bytes_stream();
     let mut accumulator = StreamResponseAccumulator::default();
-    let mut raw_text = String::new();
+    let mut raw_bytes = Vec::new();
     // Verbatim upstream text (bounded), retained for transient-failure
-    // log rows; `raw_text` above follows the JSON-fallback semantics.
+    // log rows; `raw_bytes` above follows the JSON-fallback semantics.
     let mut attempt_raw = String::new();
     let mut json_fallback = None;
     let mut chunks_count: i32 = 0;
@@ -1336,58 +1337,62 @@ pub(super) async fn handle_non_stream_via_upstream_stream(
         let text = String::from_utf8_lossy(&bytes);
         super::stream_probe::append_capped(&mut attempt_raw, &text);
         if json_fallback != Some(false) {
-            raw_text.push_str(&text);
-            if let Some(first) = raw_text.trim_start().chars().next() {
-                json_fallback = Some(first == '{');
+            raw_bytes.extend_from_slice(&bytes);
+            if let Some(first) = raw_bytes.iter().find(|byte| !byte.is_ascii_whitespace()) {
+                json_fallback = Some(*first == b'{');
                 if json_fallback == Some(false) {
-                    raw_text.clear();
+                    raw_bytes.clear();
                 }
             }
         }
-        // Vendor raw-chunk normalization (e.g. antigravity unwrapping the
-        // v1internal envelope from every SSE data line) runs before the
-        // decoder; raw_text keeps the verbatim upstream bytes for logs.
-        let hooked_text;
-        let parse_src: &str = if let Some(hook) = raw_chunk_hook.as_ref() {
-            hooked_text = hook.apply(&text, call_ctx.performance.as_ref()).await;
-            hooked_text.as_str()
-        } else {
-            text.as_ref()
-        };
-        let ai_deltas =
-            match super::streaming::validate_decoded_batch(stream_parser.parse_chunk(parse_src)) {
-                Ok(deltas) => deltas,
-                Err(error) => {
-                    if let Some(attempt) = &call_ctx.performance {
-                        attempt.record_failure(
-                            "failed",
-                            "conversion_parse_error",
-                            "response_conversion",
-                            error.as_ref(),
-                        );
-                    }
-                    log.status(502)
-                        .error(format!("upstream stream conversion error: {error:#}"))
-                        .upstream_url(url)
-                        .with_upstream_request(
-                            upstream_req_hdrs_str.clone(),
-                            upstream_req_body_str.clone(),
-                        )
-                        .with_upstream_response(
-                            status as i32,
-                            upstream_hdrs_str.clone(),
-                            None,
-                            Some(upstream_latency_ms),
-                        )
-                        .emit();
-                    return error_response(502, "upstream stream conversion failed");
+        let decoded = stream_input
+            .decode_chunk(
+                &bytes,
+                stream_parser.as_mut(),
+                raw_chunk_hook.as_ref(),
+                call_ctx.performance.as_ref(),
+            )
+            .await;
+        let ai_deltas = match super::streaming::validate_decoded_batch(decoded) {
+            Ok(deltas) => deltas,
+            Err(error) => {
+                if let Some(attempt) = &call_ctx.performance {
+                    attempt.record_failure(
+                        "failed",
+                        "conversion_parse_error",
+                        "response_conversion",
+                        error.as_ref(),
+                    );
                 }
-            };
+                log.status(502)
+                    .error(format!("upstream stream conversion error: {error:#}"))
+                    .upstream_url(url)
+                    .with_upstream_request(
+                        upstream_req_hdrs_str.clone(),
+                        upstream_req_body_str.clone(),
+                    )
+                    .with_upstream_response(
+                        status as i32,
+                        upstream_hdrs_str.clone(),
+                        None,
+                        Some(upstream_latency_ms),
+                    )
+                    .emit();
+                return error_response(502, "upstream stream conversion failed");
+            }
+        };
         let ai_deltas = tool_route_plan.restore_stream_deltas(ai_deltas);
         accumulator.apply_all(&ai_deltas);
     }
 
-    let ai_deltas = match super::streaming::validate_decoded_batch(stream_parser.finish()) {
+    let decoded = stream_input
+        .finish(
+            stream_parser.as_mut(),
+            raw_chunk_hook.as_ref(),
+            call_ctx.performance.as_ref(),
+        )
+        .await;
+    let ai_deltas = match super::streaming::validate_decoded_batch(decoded) {
         Ok(deltas) => deltas,
         Err(error) => {
             if let Some(attempt) = &call_ctx.performance {
@@ -1424,8 +1429,8 @@ pub(super) async fn handle_non_stream_via_upstream_stream(
     let parsed_nothing =
         ai_resp.id.is_empty() && ai_resp.content.is_empty() && ai_resp.items.is_none();
     if parsed_nothing
-        && raw_text.trim_start().starts_with('{')
-        && let Ok(full) = serde_json::from_str::<Value>(&raw_text)
+        && json_fallback == Some(true)
+        && let Ok(full) = serde_json::from_slice::<Value>(&raw_bytes)
         && let Ok(parsed) = egress
             .handler()
             .make_response_decoder()

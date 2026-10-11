@@ -19,7 +19,14 @@ use nyro_core::{
     storage::SqliteStorage,
 };
 use serde_json::json;
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Duration,
+};
 
 /// Upstream that answers 401 for `Bearer key-a` and a normal completion for
 /// anything else. Records which credentials were seen.
@@ -69,6 +76,23 @@ async fn setup() -> anyhow::Result<(
     String,
     tokio::task::JoinHandle<()>,
 )> {
+    setup_with_upstream(
+        Router::new()
+            .route("/v1/chat/completions", post(auth_aware_upstream))
+            .route("/v1/messages", post(auth_aware_upstream)),
+    )
+    .await
+}
+
+async fn setup_with_upstream(
+    app: Router,
+) -> anyhow::Result<(
+    tempfile::TempDir,
+    Gateway,
+    tokio::sync::mpsc::Receiver<nyro_core::logging::LogEntry>,
+    String,
+    tokio::task::JoinHandle<()>,
+)> {
     let dir = tempfile::tempdir()?;
     let config = GatewayConfig {
         data_dir: dir.path().into(),
@@ -80,9 +104,6 @@ async fn setup() -> anyhow::Result<(
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let url = format!("http://{}/v1", listener.local_addr()?);
     let job = tokio::spawn(async move {
-        let app = Router::new()
-            .route("/v1/chat/completions", post(auth_aware_upstream))
-            .route("/v1/messages", post(auth_aware_upstream));
         let _ = axum::serve(listener, app).await;
     });
     Ok((dir, gw, logs, url, job))
@@ -236,6 +257,139 @@ async fn key_pool_fails_over_on_401_and_attributes_log() -> anyhow::Result<()> {
         }
     }
     assert!(saw_key_a && saw_key_b, "expected both keys in logs");
+    Ok(())
+}
+
+#[tokio::test]
+async fn key_pool_keeps_healthy_sibling_after_first_key_circuit_opens() -> anyhow::Result<()> {
+    let hits_a = Arc::new(AtomicUsize::new(0));
+    let hits_b = Arc::new(AtomicUsize::new(0));
+    let app = Router::new().route(
+        "/v1/chat/completions",
+        post({
+            let hits_a = hits_a.clone();
+            let hits_b = hits_b.clone();
+            move |headers: HeaderMap| {
+                let hits_a = hits_a.clone();
+                let hits_b = hits_b.clone();
+                async move {
+                    match headers.get("authorization").and_then(|v| v.to_str().ok()) {
+                        Some("Bearer key-a") => {
+                            hits_a.fetch_add(1, Ordering::SeqCst);
+                            (
+                                StatusCode::TOO_MANY_REQUESTS,
+                                Json(json!({"error":{"message":"key-a rate limited"}})),
+                            )
+                                .into_response()
+                        }
+                        Some("Bearer key-b") => {
+                            hits_b.fetch_add(1, Ordering::SeqCst);
+                            Json(json!({"id":"1","choices":[{"index":0,"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}))
+                                .into_response()
+                        }
+                        _ => StatusCode::UNAUTHORIZED.into_response(),
+                    }
+                }
+            }
+        }),
+    );
+    let (_dir, gw, _logs, url, _job) = setup_with_upstream(app).await?;
+    let provider = pool_provider(
+        &gw,
+        &url,
+        vec![
+            key("key-a", "key-a", 0, &["pool-model"]),
+            key("key-b", "key-b", 1, &["pool-model"]),
+        ],
+    )
+    .await?;
+    route(&gw, "circuit-pool", &provider, "pool-model").await?;
+    let stored = gw.admin().get_provider(&provider).await?;
+    let key_a = stored.keys.iter().find(|key| key.name == "key-a").unwrap();
+    let health_a = nyro_core::provider::key_pool::health_key(
+        &provider,
+        Some(&key_a.id),
+        &OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1.to_string(),
+        "pool-model",
+    );
+
+    // The first three completed requests open only key-a's circuit. No
+    // sleep is needed: dispatch settles health before returning a response.
+    for request_number in 1..=4 {
+        let (_id, response) =
+            dispatch(&gw, "circuit-pool", OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1).await;
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024).await?;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "request {request_number}: {}",
+            String::from_utf8_lossy(&body),
+        );
+        assert!(String::from_utf8_lossy(&body).contains("hi"));
+        assert_eq!(
+            hits_a.load(Ordering::SeqCst),
+            request_number.min(3),
+            "request {request_number}: an open circuit must not call key-a",
+        );
+        assert_eq!(
+            hits_b.load(Ordering::SeqCst),
+            request_number,
+            "request {request_number}: the healthy sibling must still be tried",
+        );
+        if request_number == 3 {
+            assert!(
+                gw.health_registry.try_acquire(&health_a).is_none(),
+                "three 429 responses must open key-a's circuit before request 4",
+            );
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn provider_without_key_pool_still_skips_an_open_circuit() -> anyhow::Result<()> {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let app = Router::new().route(
+        "/v1/chat/completions",
+        post({
+            let hits = hits.clone();
+            move || {
+                let hits = hits.clone();
+                async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    (
+                        StatusCode::TOO_MANY_REQUESTS,
+                        Json(json!({"error":{"message":"provider rate limited"}})),
+                    )
+                }
+            }
+        }),
+    );
+    let (_dir, gw, _logs, url, _job) = setup_with_upstream(app).await?;
+    let provider = pool_provider(&gw, &url, vec![]).await?;
+    assert!(!gw.admin().get_provider(&provider).await?.has_key_pool());
+    route(&gw, "circuit-no-pool", &provider, "pool-model").await?;
+
+    for request_number in 1..=4 {
+        let (_id, response) = dispatch(
+            &gw,
+            "circuit-no-pool",
+            OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1,
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            if request_number <= 3 {
+                StatusCode::TOO_MANY_REQUESTS
+            } else {
+                StatusCode::BAD_GATEWAY
+            },
+            "request {request_number}",
+        );
+        let _ = axum::body::to_bytes(response.into_body(), 1024 * 1024).await?;
+        assert_eq!(hits.load(Ordering::SeqCst), request_number.min(3));
+    }
     Ok(())
 }
 

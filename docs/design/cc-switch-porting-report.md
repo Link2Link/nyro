@@ -133,6 +133,10 @@ dispatcher 级测试通过真实 `reqwest` 客户端 + 本地 TCP mock 上游驱
 2. **错误封套产品名**:`"Nyro local proxy failed"` / `nyro_*` 错误码,替代源串的 CC Switch 命名;结构、字段与行为保持一致。
 3. **机械移植的代码风格**:`ported/` 保持与源逐行可比的展开形态(模块级 `#![allow(clippy::collapsible_if, dead_code)]` 并注释缘由);部分为完整性而移植的助手暂未被门面引用。
 4. **smoke 脚本**:Makefile 的 `smoke` 目标引用的 `scripts/smoke/server_smoke.py` 在本检出中不存在(仓库既有状态),E2E 覆盖由上述 dispatcher 级真实链路测试承担。
+5. **普通 Gemini SSE 工具调用安全分叉（问题 2）**：`ported/providers/streaming_gemini.rs` 不再把独立 SSE 事件的 `functionCall` 按事件内位置当作累计快照。公开 `CompatEngine::prepare_request(anthropic_to_gemini(true))` + `convert_stream_response` 的合成回归输入 `read({file:a})`、`read({file:b})`、STOP 原先只输出后一个调用；现在两个完整调用均保留。无 ID（含空字符串）每次都是独立调用，同名、完全相同参数、参数超集、相同 `responseId` 或位置都不是重放证据；后到的真实 ID 也不猜测为之前无 ID 调用的升级。只有相同非空显式 ID **且 name/完整 args 相同**才去重；冲突的 name/args 或 thoughtSignature、缺失或非对象 args、带 `partialArgs`/`willContinue` 的参数延续方言均明确报错，不生成可执行工具块、不发成功结束、不提交失败回合的 shadow。签名仅在已确认同一调用的重放中保留或后补；独立调用不串用。参数比较在 schema 修正之前完成，避免修正掩盖冲突。
+   - 固定上游的 `no_id_tool_call_reuses_synthesized_id_across_cumulative_chunks`、`upgraded_real_id_merges_into_existing_synthesized_snapshot` 确实要求累计/位置升级，但它们的 wire fixture 没有可区分累计快照与独立调用的证据；保留原输入，明确将期望改为保留两个调用。`thought_signature_preserved_when_later_chunk_omits_it` 原 fixture 还同时改变 args；新测试只在相同完整 payload 重放时保留签名，另有公开入口冲突拒绝测试。不宣称与这三项源断言等价。
+   - `tests/parity_inventory.toml` 保持源 commit/hash 不变，将上述三项改为带 **Intentional safety divergence / NOT assertion-equivalent** 说明的 `mapped` 并锁定新目标 hash；因此相对 §7 历史基线为 **508 migrated + 152 mapped + 508 not-applicable**（152 中含 3 项明确分叉）。现有审计 schema 没有 divergence 状态：`COMPLETE` 只表示清单定位、哈希与说明完整，**不表示这三项仍有行为 parity**。公共回归位于 `tests/gemini_stream_tools.rs`，覆盖事件内并行、跨事件调用、显式 ID 重放/冲突、签名历史回放和任意传输切分。
+   - 限制：这是普通 Gemini 完整调用契约，不自动识别无 ID 累计 relay，也不实现参数增量方言；这种 relay 必须提供可靠身份及明确协商的方言后才能安全支持。当前缺少真实 provider 录制验证，回归均为合成 wire fixture。同文件文本累计猜测、文本/工具交错排序和其他协议路径未在本修复中改变。
 
 ## 10. 许可与归属
 

@@ -601,7 +601,8 @@ async fn passthrough_contract_preserves_unknown_fields_and_applies_narrow_native
 /// `reasoning_effort: "disable"`，网关按默认方言归一成 "none"，被火山引擎
 /// Ark coding 端点的 glm-5.3 拒收：400 InvalidParameter - reasoning_effort
 /// `none` is not supported by this model。修复后，off 意图（none 及
-/// misspelling）在 wire 边界钳制为最小合法档 low，其余字段原样透传。
+/// misspelling）在 wire 边界钳制为最小合法档 low；输出预算另受思考模型
+/// 的 128000 下限约束，其余字段原样透传。
 #[tokio::test]
 async fn passthrough_clamps_off_effort_to_low_for_volcengine_ark_glm() {
     let gw = build_test_gateway().await;
@@ -642,8 +643,9 @@ async fn passthrough_clamps_off_effort_to_low_for_volcengine_ark_glm() {
         out.body["reasoning_effort"], "low",
         "ark glm-5.3 rejects `none` upstream; off intent must clamp to `low`",
     );
-    // 相邻字段不受钳制影响。
-    assert_eq!(out.body["max_completion_tokens"], 64);
+    // GLM-5.3 即使未携带 thinking 字段，也适用思考模型输出预算下限。
+    assert_eq!(out.body["max_completion_tokens"], 128000);
+    // 其余相邻字段保持不变。
     assert_eq!(out.body["store"], false);
     assert_eq!(out.body["stream_options"]["include_usage"], true);
 }
@@ -797,8 +799,8 @@ async fn passthrough_rewrites_legacy_thinking_for_claude_55() {
                 assert!(out.body.get("output_config").is_none());
             }
         }
-        // 思考模式自动提升输出预算到 128k (131072)。
-        assert_eq!(out.body["max_tokens"], 131072);
+        // 请求已达到思考模式的 128000 下限，保持不变，不再提升到 131072。
+        assert_eq!(out.body["max_tokens"], 128000);
         assert_eq!(out.body["stream"], true);
     }
 }

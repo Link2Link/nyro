@@ -5,6 +5,9 @@
 //!   SSE bytes; side-channel parser accumulates stats for logging.
 //! - IR round-trip: parse → accumulate → format → re-emit as target-protocol SSE.
 
+mod input;
+pub(super) use input::StreamInput;
+
 use std::convert::Infallible;
 use std::sync::Arc;
 
@@ -33,7 +36,9 @@ use super::{CallCtx, LogBuilder, RequestExtras, ai_response_to_deltas, error_res
 /// Owned raw-chunk hook state for the spawned streaming task: applies the
 /// vendor's `on_stream_raw_chunk` (e.g. google/antigravity unwrapping the
 /// v1internal `{"response": …}` envelope from every SSE data line) before
-/// the egress stream decoder parses the chunk.
+/// the egress stream decoder parses it. StreamInput supplies complete UTF-8
+/// lines, not arbitrary HTTP chunks; the final unterminated line is flushed
+/// through the same hook at EOF.
 ///
 /// Only captured when the vendor declares response mutations for the
 /// provider, so mutation-free vendors pay zero overhead.
@@ -350,11 +355,13 @@ pub(super) async fn handle_stream(
     // sampling glitch — fails the attempt before anything reaches the client
     // and the dispatcher can fail over to the next target.
     let mut stream_parser = egress.handler().make_stream_response_decoder();
+    let mut stream_input = StreamInput::default();
     let mut byte_stream = resp.bytes_stream();
     let probe_request_id = log.diagnostic.client_request_id.clone().unwrap_or_default();
     let probe = probe_stream(
         &mut byte_stream,
         stream_parser.as_mut(),
+        &mut stream_input,
         raw_chunk_hook.as_ref(),
         log.performance.as_ref(),
         ingress,
@@ -468,7 +475,9 @@ pub(super) async fn handle_stream(
         while !terminal_error_sent && !probe_parser_finished {
             let chunk = tokio::select! {
                 biased;
-                _ = tx.closed() => break,
+                // Downstream cancellation is not upstream EOF. In particular,
+                // a buffered UTF-8 prefix must not be flushed as malformed input.
+                _ = tx.closed() => return,
                 chunk = byte_stream.next() => chunk,
             };
             let Some(chunk) = chunk else {
@@ -507,20 +516,15 @@ pub(super) async fn handle_stream(
                 first_chunk_ms = Some(upstream_start.elapsed().as_millis() as i64);
             }
             chunks_count += 1;
-            let text = String::from_utf8_lossy(&bytes);
-            // Vendor raw-chunk normalization (see StreamRawChunkHook) runs
-            // before the decoder; the raw buffer keeps the verbatim upstream
-            // bytes for request logs.
-            let hooked_text;
-            let parse_src: &str = if let Some(hook) = raw_chunk_hook.as_ref() {
-                hooked_text = hook.apply(&text, log_ir.performance.as_ref()).await;
-                hooked_text.as_str()
-            } else {
-                text.as_ref()
-            };
-            let ai_deltas = match super::streaming::validate_decoded_batch(
-                stream_parser.parse_chunk(parse_src),
-            ) {
+            let decoded = stream_input
+                .decode_chunk(
+                    &bytes,
+                    stream_parser.as_mut(),
+                    raw_chunk_hook.as_ref(),
+                    log_ir.performance.as_ref(),
+                )
+                .await;
+            let ai_deltas = match super::streaming::validate_decoded_batch(decoded) {
                 Ok(deltas) => deltas,
                 Err(error) => {
                     if let Some(attempt) = &log_ir.performance {
@@ -567,7 +571,14 @@ pub(super) async fn handle_stream(
         }
 
         if !terminal_error_sent && !probe_parser_finished {
-            match super::streaming::validate_decoded_batch(stream_parser.finish()) {
+            let decoded = stream_input
+                .finish(
+                    stream_parser.as_mut(),
+                    raw_chunk_hook.as_ref(),
+                    log_ir.performance.as_ref(),
+                )
+                .await;
+            match super::streaming::validate_decoded_batch(decoded) {
                 Ok(ai_deltas) => {
                     let mut ai_deltas = tool_route_plan.restore_stream_deltas(ai_deltas);
                     hook_state.apply(&mut ai_deltas).await;
@@ -753,6 +764,9 @@ fn format_non_sse_stream_response(
 
     Some((client_sse_parts.join(""), ai_resp))
 }
+
+#[cfg(test)]
+mod cancellation_tests;
 
 #[cfg(test)]
 mod tests {

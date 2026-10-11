@@ -789,7 +789,11 @@ async fn dispatch_pipeline_inner(
             &actual_model,
         );
         let Some(health_permit) = gw.health_registry.try_acquire(&target_key) else {
-            skip_key_siblings!();
+            // Pool health is per key: a denied permit must not discard
+            // healthy siblings. Without a pool, keep target-level skipping.
+            if pool_key.is_none() {
+                skip_key_siblings!();
+            }
             continue;
         };
 

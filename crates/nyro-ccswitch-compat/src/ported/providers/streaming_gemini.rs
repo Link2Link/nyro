@@ -2,11 +2,20 @@
 //!
 //! Converts Gemini `streamGenerateContent?alt=sse` chunks into Anthropic-style
 //! SSE events for Claude-compatible clients.
+//!
+//! Intentional safety divergence from cc-switch eb69e492: ordinary Gemini SSE
+//! functionCall parts are complete calls, not cumulative array slots. Missing
+//! IDs never establish replay identity (even for identical/growing arguments).
+//! A repeated explicit ID may replay identical name/args and supply a missing
+//! thoughtSignature; conflicting payloads/signatures and partial-args dialects
+//! fail the stream without committing shadow state. Positional ID upgrades are
+//! not inferred. See tests/gemini_stream_tools.rs and the three explicitly
+//! divergent parity inventory mappings. Text accumulation remains unchanged.
 
 use super::gemini_shadow::{GeminiShadowStore, GeminiToolCallMeta};
 use super::transform_gemini::{
-    AnthropicToolSchemaHints, build_anthropic_usage, is_synthesized_tool_call_id,
-    rectify_tool_call_parts, synthesize_tool_call_id,
+    AnthropicToolSchemaHints, build_anthropic_usage, rectify_tool_call_args,
+    synthesize_tool_call_id,
 };
 use crate::ported::sse::{append_utf8_safe, strip_sse_field, take_sse_block};
 use bytes::Bytes;
@@ -40,41 +49,55 @@ fn extract_visible_text(parts: &[Value]) -> String {
         .collect::<String>()
 }
 
-fn extract_tool_calls(
-    parts: &[Value],
-    tool_schema_hints: Option<&AnthropicToolSchemaHints>,
-) -> Vec<GeminiToolCallMeta> {
-    let mut rectified_parts = parts.to_vec();
-    rectify_tool_call_parts(&mut rectified_parts, tool_schema_hints);
-
-    rectified_parts
+fn extract_tool_calls(parts: &[Value]) -> Result<Vec<GeminiToolCallMeta>, std::io::Error> {
+    parts
         .iter()
-        .filter_map(|part| {
-            let function_call = part.get("functionCall")?;
-            // Treat an explicit empty-string id as equivalent to a missing
-            // one. Some Gemini relays serialize absent ids as `"id": ""`;
-            // without this filter the `Some("")` value would flow into
-            // `merge_tool_call_snapshots`, match itself across chunks, and
-            // collapse parallel no-id calls into a single snapshot with an
-            // empty-string tool_use id.
+        .filter_map(|part| part.get("functionCall").map(|call| (part, call)))
+        .map(|(part, function_call)| {
+            // These fields signal a different, partial-argument dialect. Do
+            // not turn an unfinished call (including a final fragment) into
+            // an executable empty/partial argument object.
+            if [
+                "partialArgs",
+                "willContinue",
+                "partial_args",
+                "will_continue",
+            ]
+            .iter()
+            .any(|key| function_call.get(key).is_some())
+            {
+                return Err(std::io::Error::other(
+                    "unsupported partial Gemini functionCall; expected a complete name/args object",
+                ));
+            }
+            let name = function_call
+                .get("name")
+                .and_then(Value::as_str)
+                .filter(|name| !name.is_empty())
+                .ok_or_else(|| std::io::Error::other("invalid Gemini functionCall.name"))?;
+            let args = function_call
+                .get("args")
+                .filter(|args| args.is_object())
+                .ok_or_else(|| {
+                    std::io::Error::other(
+                        "invalid Gemini functionCall.args; expected a complete object",
+                    )
+                })?;
+            // Empty IDs are absent IDs, never a shared identity. Keep absent
+            // IDs absent until stream completion, so a generated client ID
+            // cannot be mistaken for evidence supplied by Gemini.
             let id = function_call
                 .get("id")
-                .and_then(|value| value.as_str())
-                .filter(|s| !s.is_empty())
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty())
                 .map(ToString::to_string);
-            Some(GeminiToolCallMeta::new(
+            Ok(GeminiToolCallMeta::new(
                 id,
-                function_call
-                    .get("name")
-                    .and_then(|value| value.as_str())
-                    .unwrap_or(""),
-                function_call
-                    .get("args")
-                    .cloned()
-                    .unwrap_or_else(|| json!({})),
+                name,
+                args.clone(),
                 part.get("thoughtSignature")
                     .or_else(|| part.get("thought_signature"))
-                    .and_then(|value| value.as_str()),
+                    .and_then(Value::as_str),
             ))
         })
         .collect()
@@ -96,99 +119,40 @@ fn extract_text_thought_signature(parts: &[Value]) -> Option<String> {
 fn merge_tool_call_snapshots(
     tool_call_snapshots: &mut Vec<GeminiToolCallMeta>,
     incoming: Vec<GeminiToolCallMeta>,
-) {
-    // Gemini's `streamGenerateContent?alt=sse` delivers each chunk as the
-    // cumulative snapshot of `content.parts`. For the same tool call across
-    // chunks we therefore need to map an incoming entry back to whichever
-    // snapshot entry it describes:
-    //
-    // 1. If both sides carry a genuine Gemini id, match by id.
-    // 2. Otherwise match by position in the cumulative `parts` array — this
-    //    is how parallel no-id calls stay distinguishable.
-    //
-    // A previous implementation fell back to matching by `name`, which silently
-    // merged two parallel calls to the same function into one entry (losing
-    // the first call's args). That fallback is removed here.
-    for (position, mut tool_call) in incoming.into_iter().enumerate() {
-        // Treat an empty-string id as "missing" throughout this function.
-        // `extract_tool_calls` already filters `""` at the source, but upstream
-        // callers that build `GeminiToolCallMeta` by hand (tests, future code)
-        // could still send `Some("")` — collapsing it here keeps the invariant
-        // local to this merge step.
+) -> Result<(), std::io::Error> {
+    // SSE event-local position, responseId, name and even identical args do
+    // not identify a call. Only a nonempty upstream ID permits replay dedup.
+    // Keep raw args until replay validation completes: schema rectification
+    // must not hide conflicting upstream payloads under the same ID.
+    for mut tool_call in incoming {
         if tool_call.id.as_deref() == Some("") {
             tool_call.id = None;
         }
-
-        let existing_index = match tool_call.id.as_deref() {
-            Some(incoming_id) => tool_call_snapshots
-                .iter()
-                .position(|existing| existing.id.as_deref() == Some(incoming_id))
-                .or_else(|| {
-                    // Fallback for the "synth -> real id upgrade" case:
-                    // Gemini's cumulative stream may deliver the first chunk
-                    // of a tool call without an id (we synthesize one) and
-                    // then upgrade it to a genuine id on a later chunk. A
-                    // pure id-match would miss the existing synthesized
-                    // snapshot and push a second entry, yielding duplicate
-                    // `tool_use` content blocks at stream end. If the
-                    // same-position slot currently holds a synthesized id,
-                    // merge into it — `or(preserved_id)` below will keep
-                    // the real id, dropping the synthesized one.
-                    tool_call_snapshots
-                        .get(position)
-                        .filter(|existing| {
-                            matches!(
-                                existing.id.as_deref(),
-                                Some(id) if is_synthesized_tool_call_id(id)
-                            )
-                        })
-                        .map(|_| position)
-                }),
-            None => tool_call_snapshots
-                .get(position)
-                .filter(|existing| match existing.id.as_deref() {
-                    // Only merge into a positional match when the prior
-                    // snapshot was itself id-less (or we synthesized one).
-                    // A snapshot with a genuine Gemini id at this index is
-                    // treated as a different call — the incoming entry gets
-                    // its own synthesized id below.
-                    Some(id) => is_synthesized_tool_call_id(id),
-                    None => true,
-                })
-                .map(|_| position),
-        };
-
-        if let Some(index) = existing_index {
-            // Preserve any synthesized id assigned on a previous chunk so the
-            // Anthropic-visible id stays stable across the whole stream.
-            // When incoming carries a real Gemini id and the slot holds a
-            // synthesized one, `Some(real).or(Some(synth)) == Some(real)`
-            // so the upgrade wins naturally.
-            let preserved_id = tool_call_snapshots[index].id.clone();
-            tool_call.id = tool_call.id.or(preserved_id);
-
-            // Preserve `thought_signature` across chunks. Gemini's cumulative
-            // stream may include `thoughtSignature` on one chunk and omit it
-            // on a subsequent cumulative snapshot of the same part, even
-            // though the signature still belongs to the call. A blind
-            // overwrite would drop it, so the shadow turn we record (and
-            // later replay) would be missing `thoughtSignature` and the
-            // upstream would reject the follow-up for invalid signature.
-            if tool_call.thought_signature.is_none() {
-                tool_call
-                    .thought_signature
-                    .clone_from(&tool_call_snapshots[index].thought_signature);
+        let existing = tool_call.id.as_deref().and_then(|incoming_id| {
+            tool_call_snapshots
+                .iter_mut()
+                .find(|existing| existing.id.as_deref() == Some(incoming_id))
+        });
+        if let Some(existing) = existing {
+            if existing.name != tool_call.name || existing.args != tool_call.args {
+                return Err(std::io::Error::other(
+                    "conflicting complete Gemini functionCall for repeated explicit id; argument continuation is unsupported",
+                ));
             }
-        }
-        if tool_call.id.is_none() {
-            tool_call.id = Some(synthesize_tool_call_id());
-        }
-
-        match existing_index {
-            Some(index) => tool_call_snapshots[index] = tool_call,
-            None => tool_call_snapshots.push(tool_call),
+            match (&existing.thought_signature, &tool_call.thought_signature) {
+                (Some(prior), Some(incoming)) if prior != incoming => {
+                    return Err(std::io::Error::other(
+                        "conflicting Gemini functionCall thoughtSignature for repeated explicit id",
+                    ));
+                }
+                (None, Some(_)) => existing.thought_signature = tool_call.thought_signature,
+                _ => {}
+            }
+        } else {
+            tool_call_snapshots.push(tool_call);
         }
     }
+    Ok(())
 }
 
 fn build_shadow_assistant_parts(
@@ -400,16 +364,17 @@ pub fn create_anthropic_sse_stream_from_gemini<E: std::error::Error + Send + 'st
                                 .and_then(|value| value.get("parts"))
                                 .and_then(|value| value.as_array())
                             {
-                                let mut rectified_parts = parts.clone();
-                                rectify_tool_call_parts(&mut rectified_parts, tool_schema_hints.as_ref());
+                                let result = extract_tool_calls(parts).and_then(|incoming| {
+                                    merge_tool_call_snapshots(&mut tool_call_snapshots, incoming)
+                                });
+                                if let Err(error) = result {
+                                    yield Err(error);
+                                    return;
+                                }
                                 if let Some(signature) = extract_text_thought_signature(parts) {
                                     text_thought_signature = Some(signature);
                                 }
-                                merge_tool_call_snapshots(
-                                    &mut tool_call_snapshots,
-                                    extract_tool_calls(&rectified_parts, tool_schema_hints.as_ref()),
-                                );
-                                let visible_text = extract_visible_text(&rectified_parts);
+                                let visible_text = extract_visible_text(parts);
                                 if !visible_text.is_empty() {
                                     let is_cumulative = visible_text.starts_with(&accumulated_text);
                                     let delta = if is_cumulative {
@@ -538,6 +503,24 @@ pub fn create_anthropic_sse_stream_from_gemini<E: std::error::Error + Send + 'st
             }
         }
 
+        // Assign client-only IDs after all upstream identities are known. No
+        // synthetic ID participates in replay detection, and no generated ID
+        // may collide with another call's explicit ID.
+        let mut used_ids: HashSet<String> = tool_call_snapshots.iter()
+            .filter_map(|call| call.id.clone()).collect();
+        for call in &mut tool_call_snapshots {
+            if call.id.is_none() {
+                loop {
+                    let id = synthesize_tool_call_id();
+                    if used_ids.insert(id.clone()) {
+                        call.id = Some(id);
+                        break;
+                    }
+                }
+            }
+            rectify_tool_call_args(&call.name, &mut call.args, tool_schema_hints.as_ref());
+        }
+
         if let (Some(store), Some(provider_id), Some(session_id)) = (
             shadow_store.as_ref(),
             provider_id.as_deref(),
@@ -575,12 +558,9 @@ pub fn create_anthropic_sse_stream_from_gemini<E: std::error::Error + Send + 'st
         // (non-streaming) preserves the original part order.
         //
         // This is intentional given the current design:
-        //   1. Gemini `streamGenerateContent?alt=sse` delivers each chunk as
-        //      a *cumulative* snapshot of `content.parts`. Emitting a
-        //      `tool_use` content block on first observation would require
-        //      closing the still-accumulating text block, then re-opening a
-        //      new text block when more text arrives — producing many
-        //      fragmented content blocks per message.
+        //   1. We buffer complete calls until termination so that explicit-ID
+        //      replay conflicts fail before any tool becomes executable, and
+        //      one-shot signatures can be stored before the client acts.
         //   2. Anthropic clients we target (claude-code and similar) consume
         //      a message's tool calls by scanning for `tool_use` blocks and
         //      do not depend on strict text ↔ tool interleaving for
@@ -990,18 +970,19 @@ mod tests {
         assert_eq!(synth_count, 2);
     }
 
-    /// When Gemini keeps sending the same no-id functionCall across cumulative
-    /// chunks, the synthesized id must stay stable so the Anthropic client
-    /// sees a single tool_use block with consistent args updates rather than
-    /// duplicates.
+    /// Intentional divergence: the pinned upstream fixture calls this a
+    /// cumulative update, but neither responseId nor a superset of args proves
+    /// identity. Preserve both complete calls instead of silently losing one.
     #[test]
-    fn no_id_tool_call_reuses_synthesized_id_across_cumulative_chunks() {
+    fn no_id_calls_with_growing_args_are_not_assumed_cumulative() {
         let output = collect_stream_output(vec![
             "data: {\"responseId\":\"r2\",\"modelVersion\":\"gemini-2.5-pro\",\"candidates\":[{\"content\":{\"parts\":[{\"functionCall\":{\"name\":\"get_weather\",\"args\":{\"city\":\"Tokyo\"}}}]}}],\"usageMetadata\":{\"promptTokenCount\":4,\"totalTokenCount\":6}}\n\n",
             "data: {\"responseId\":\"r2\",\"modelVersion\":\"gemini-2.5-pro\",\"candidates\":[{\"finishReason\":\"STOP\",\"content\":{\"parts\":[{\"functionCall\":{\"name\":\"get_weather\",\"args\":{\"city\":\"Tokyo\",\"units\":\"c\"}}}]}}],\"usageMetadata\":{\"promptTokenCount\":4,\"totalTokenCount\":9}}\n\n",
         ]);
 
-        assert_eq!(output.matches("\"type\":\"tool_use\"").count(), 1);
+        assert_eq!(output.matches("\"type\":\"tool_use\"").count(), 2);
+        assert_eq!(output.matches("\"id\":\"gemini_synth_").count(), 2);
+        assert!(output.contains("\"partial_json\":\"{\\\"city\\\":\\\"Tokyo\\\"}\""));
         assert!(output.contains("\"units\\\":\\\"c\\\""));
     }
 
@@ -1051,63 +1032,37 @@ mod tests {
         assert_eq!(output.matches("\"id\":\"gemini_synth_").count(), 1);
     }
 
-    /// Regression for Codex P1: Gemini's cumulative stream may deliver a
-    /// `functionCall` without an id (we synthesize one) and then upgrade
-    /// to a genuine id on a later chunk. Without a positional fallback in
-    /// the `Some(incoming_id)` branch of `merge_tool_call_snapshots`, the
-    /// real id would fail to match the existing synthesized snapshot and
-    /// push a second entry — yielding duplicate `tool_use` blocks at
-    /// stream end (one synthesized, one real) and breaking tool_result
-    /// correlation.
+    /// Intentional divergence: this upstream fixture supplies no correlation
+    /// between its no-ID call and the later real ID. A positional upgrade
+    /// would lose an independent complete call and transfer its signature.
     #[test]
-    fn upgraded_real_id_merges_into_existing_synthesized_snapshot() {
+    fn later_real_id_does_not_replace_an_unidentified_call() {
         let output = collect_stream_output(vec![
-            // Chunk 1: no id -> a `gemini_synth_*` id is assigned.
+            // Chunk 1: complete call without an upstream identity.
             "data: {\"responseId\":\"rupg\",\"modelVersion\":\"gemini-2.5-pro\",\"candidates\":[{\"content\":{\"parts\":[{\"functionCall\":{\"name\":\"get_weather\",\"args\":{\"city\":\"Tokyo\"}}}]}}],\"usageMetadata\":{\"promptTokenCount\":4,\"totalTokenCount\":6}}\n\n",
-            // Chunk 2: cumulative snapshot upgrades the same call to a
-            // real Gemini id. Must merge into the existing slot, not
-            // spawn a second snapshot.
+            // Chunk 2: a new real ID cannot identify the earlier no-ID call.
             "data: {\"responseId\":\"rupg\",\"modelVersion\":\"gemini-2.5-pro\",\"candidates\":[{\"finishReason\":\"STOP\",\"content\":{\"parts\":[{\"functionCall\":{\"id\":\"real_id_abc\",\"name\":\"get_weather\",\"args\":{\"city\":\"Tokyo\",\"units\":\"c\"}}}]}}],\"usageMetadata\":{\"promptTokenCount\":4,\"totalTokenCount\":9}}\n\n",
         ]);
 
-        // Exactly one tool_use block (not two).
-        assert_eq!(
-            output.matches("\"type\":\"tool_use\"").count(),
-            1,
-            "id upgrade must merge into the synthesized snapshot, not duplicate it: {output}"
-        );
-        // The emitted tool_use id is the real Gemini id, not the synthesized one.
-        assert!(
-            output.contains("\"id\":\"real_id_abc\""),
-            "expected real id to win after upgrade: {output}"
-        );
-        assert!(
-            !output.contains("\"id\":\"gemini_synth_"),
-            "synthesized id must be dropped when a real id arrives: {output}"
-        );
-        // Args from the final cumulative snapshot are emitted.
+        assert_eq!(output.matches("\"type\":\"tool_use\"").count(), 2);
+        assert!(output.contains("\"id\":\"real_id_abc\""));
+        assert_eq!(output.matches("\"id\":\"gemini_synth_").count(), 1);
+        assert!(output.contains("\"partial_json\":\"{\\\"city\\\":\\\"Tokyo\\\"}\""));
         assert!(output.contains("units"));
     }
 
-    /// Regression for Codex P2: Gemini's cumulative stream may include
-    /// `thoughtSignature` on one chunk and omit it on a later cumulative
-    /// snapshot of the same call. A blind `tool_call_snapshots[index] =
-    /// tool_call` overwrite would drop the signature, so the shadow turn
-    /// recorded (and later replayed to Gemini) would miss
-    /// `thoughtSignature` and the upstream would reject the follow-up.
-    /// `merge_tool_call_snapshots` must retain the prior signature when
-    /// the incoming chunk does not carry one.
+    /// Preserve the upstream signature assertion for an identical explicit-ID
+    /// replay. Intentional fixture divergence: the original also changed args,
+    /// which now fails (public same_explicit_id_conflicting_name_or_args_errors_without_shadow_commit).
     #[test]
-    fn thought_signature_preserved_when_later_chunk_omits_it() {
+    fn thought_signature_preserved_when_identical_replay_omits_it() {
         let store = Arc::new(GeminiShadowStore::with_limits(8, 4));
         collect_stream_output_with_shadow(
             vec![
                 // Chunk 1: carries thoughtSignature "sig-keep".
                 "data: {\"responseId\":\"rsig\",\"modelVersion\":\"gemini-2.5-pro\",\"candidates\":[{\"content\":{\"parts\":[{\"functionCall\":{\"id\":\"call_1\",\"name\":\"get_weather\",\"args\":{\"city\":\"Tokyo\"}},\"thoughtSignature\":\"sig-keep\"}]}}],\"usageMetadata\":{\"promptTokenCount\":4,\"totalTokenCount\":6}}\n\n",
-                // Chunk 2: cumulative update for the same call, but
-                // thoughtSignature is omitted — common for Gemini's
-                // one-shot signature fields.
-                "data: {\"responseId\":\"rsig\",\"modelVersion\":\"gemini-2.5-pro\",\"candidates\":[{\"finishReason\":\"STOP\",\"content\":{\"parts\":[{\"functionCall\":{\"id\":\"call_1\",\"name\":\"get_weather\",\"args\":{\"city\":\"Tokyo\",\"units\":\"c\"}}}]}}],\"usageMetadata\":{\"promptTokenCount\":4,\"totalTokenCount\":9}}\n\n",
+                // Chunk 2: identical explicit-ID replay, signature omitted.
+                "data: {\"responseId\":\"rsig\",\"modelVersion\":\"gemini-2.5-pro\",\"candidates\":[{\"finishReason\":\"STOP\",\"content\":{\"parts\":[{\"functionCall\":{\"id\":\"call_1\",\"name\":\"get_weather\",\"args\":{\"city\":\"Tokyo\"}}}]}}],\"usageMetadata\":{\"promptTokenCount\":4,\"totalTokenCount\":9}}\n\n",
             ],
             store.clone(),
             "provider-sig",

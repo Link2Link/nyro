@@ -30,7 +30,7 @@ use crate::protocol::StreamResponseDecoder;
 use crate::protocol::ids::ProtocolId;
 use crate::protocol::ir::{AiStreamDelta, Usage};
 
-use super::stream::StreamRawChunkHook;
+use super::stream::{StreamInput, StreamRawChunkHook};
 use super::{LogBuilder, LogUsageAccumulator, stream_error_event};
 
 /// Upper bound on the upstream bytes retained for diagnostics (mirrors the
@@ -120,6 +120,7 @@ pub(super) enum ProbeOutcome {
 pub(super) async fn probe_stream<S>(
     byte_stream: &mut S,
     parser: &mut dyn StreamResponseDecoder,
+    stream_input: &mut StreamInput,
     raw_chunk_hook: Option<&StreamRawChunkHook>,
     performance: Option<&crate::performance::Attempt>,
     ingress: ProtocolId,
@@ -140,7 +141,12 @@ where
         // EOF can release a terminal event buffered without a final SSE blank
         // line. Classify it before committing, exactly like a regular batch.
         let (decoded, parser_finished) = match byte_stream.next().await {
-            None => (parser.finish(), true),
+            None => (
+                stream_input
+                    .finish(parser, raw_chunk_hook, performance)
+                    .await,
+                true,
+            ),
             Some(Err(error)) => {
                 tracing::warn!(error = %error, "upstream stream error during pre-commit probe");
                 let event = stream_error_event(
@@ -167,15 +173,14 @@ where
                 chunks_count += 1;
                 let text = String::from_utf8_lossy(&bytes);
                 append_capped(&mut raw_text, &text);
-                // Normalize vendor envelopes before decoding, as in the live loop.
-                let hooked_text;
-                let parse_src = if let Some(hook) = raw_chunk_hook {
-                    hooked_text = hook.apply(&text, performance).await;
-                    hooked_text.as_str()
-                } else {
-                    text.as_ref()
-                };
-                (parser.parse_chunk(parse_src), false)
+                // Only the diagnostic capture is lossy. Conversion buffers bytes
+                // into complete UTF-8 lines before vendor normalization.
+                (
+                    stream_input
+                        .decode_chunk(&bytes, parser, raw_chunk_hook, performance)
+                        .await,
+                    false,
+                )
             }
         };
         let ai_deltas = match super::streaming::validate_decoded_batch(decoded) {
@@ -479,6 +484,7 @@ mod tests {
         let outcome = probe_stream(
             &mut stream,
             &mut parser,
+            &mut StreamInput::default(),
             None,
             None,
             crate::protocol::ids::OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1,
