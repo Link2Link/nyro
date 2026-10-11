@@ -478,7 +478,7 @@ impl RawUsageTee {
 }
 
 impl Stream for RawUsageTee {
-    type Item = Result<Bytes, reqwest::Error>;
+    type Item = Result<Bytes, crate::proxy::client::UpstreamReadError>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         match self.inner.as_mut().poll_next(cx) {

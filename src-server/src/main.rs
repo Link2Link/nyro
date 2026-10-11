@@ -13,7 +13,9 @@ use axum::response::Response;
 use clap::Parser;
 use nyro_core::{
     Gateway,
-    config::{GatewayConfig, GatewayStorageConfig, SqlStorageConfig, StorageBackendKind},
+    config::{
+        GatewayConfig, GatewayStorageConfig, SqlStorageConfig, StorageBackendKind, UpstreamTimeouts,
+    },
     logging,
     storage::MemoryStorage,
 };
@@ -127,6 +129,47 @@ struct Args {
         help_heading = "Server"
     )]
     log_level: String,
+
+    // ── Upstream inference timeouts ───────────────────────────────────────────
+    #[arg(
+        long,
+        default_value_t = UpstreamTimeouts::default().connect.as_secs(),
+        env = "NYRO_UPSTREAM_CONNECT_TIMEOUT_SECS",
+        value_parser = clap::value_parser!(u64).range(1..=86400),
+        help = "Upstream inference connection timeout in seconds (1-86400)",
+        help_heading = "Upstream timeouts"
+    )]
+    upstream_connect_timeout_secs: u64,
+
+    #[arg(
+        long,
+        default_value_t = UpstreamTimeouts::default().response_headers.as_secs(),
+        env = "NYRO_UPSTREAM_RESPONSE_HEADERS_TIMEOUT_SECS",
+        value_parser = clap::value_parser!(u64).range(1..=86400),
+        help = "Upstream inference response-header wait timeout in seconds (1-86400)",
+        help_heading = "Upstream timeouts"
+    )]
+    upstream_response_headers_timeout_secs: u64,
+
+    #[arg(
+        long,
+        default_value_t = UpstreamTimeouts::default().first_byte.as_secs(),
+        env = "NYRO_UPSTREAM_FIRST_BYTE_TIMEOUT_SECS",
+        value_parser = clap::value_parser!(u64).range(1..=86400),
+        help = "Upstream inference first non-empty body byte timeout after headers in seconds (1-86400)",
+        help_heading = "Upstream timeouts"
+    )]
+    upstream_first_byte_timeout_secs: u64,
+
+    #[arg(
+        long,
+        default_value_t = UpstreamTimeouts::default().stream_idle.as_secs(),
+        env = "NYRO_UPSTREAM_STREAM_IDLE_TIMEOUT_SECS",
+        value_parser = clap::value_parser!(u64).range(1..=86400),
+        help = "Upstream inference raw-body idle timeout in seconds (1-86400) (excludes downstream backpressure)",
+        help_heading = "Upstream timeouts"
+    )]
+    upstream_stream_idle_timeout_secs: u64,
 
     // ── Advanced (CORS) ───────────────────────────────────────────────────────
     #[arg(
@@ -268,6 +311,110 @@ struct Args {
     config_file: Option<String>,
 }
 
+fn build_upstream_timeouts(args: &Args) -> UpstreamTimeouts {
+    UpstreamTimeouts {
+        connect: Duration::from_secs(args.upstream_connect_timeout_secs),
+        response_headers: Duration::from_secs(args.upstream_response_headers_timeout_secs),
+        first_byte: Duration::from_secs(args.upstream_first_byte_timeout_secs),
+        stream_idle: Duration::from_secs(args.upstream_stream_idle_timeout_secs),
+    }
+}
+
+#[cfg(test)]
+mod timeout_config_tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    const TIMEOUT_ARGS: [(&str, &str, u64); 4] = [
+        (
+            "upstream_connect_timeout_secs",
+            "NYRO_UPSTREAM_CONNECT_TIMEOUT_SECS",
+            30,
+        ),
+        (
+            "upstream_response_headers_timeout_secs",
+            "NYRO_UPSTREAM_RESPONSE_HEADERS_TIMEOUT_SECS",
+            600,
+        ),
+        (
+            "upstream_first_byte_timeout_secs",
+            "NYRO_UPSTREAM_FIRST_BYTE_TIMEOUT_SECS",
+            600,
+        ),
+        (
+            "upstream_stream_idle_timeout_secs",
+            "NYRO_UPSTREAM_STREAM_IDLE_TIMEOUT_SECS",
+            120,
+        ),
+    ];
+
+    #[test]
+    fn timeout_defaults_and_environment_names_match_core_config() {
+        let command = Args::command();
+        for (id, env, seconds) in TIMEOUT_ARGS {
+            let arg = command
+                .get_arguments()
+                .find(|arg| arg.get_id() == id)
+                .unwrap();
+            assert_eq!(arg.get_env(), Some(std::ffi::OsStr::new(env)));
+            assert_eq!(arg.get_default_values().len(), 1);
+            assert_eq!(arg.get_default_values()[0], seconds.to_string().as_str());
+        }
+        assert_eq!(
+            GatewayConfig::default().upstream_timeouts,
+            UpstreamTimeouts {
+                connect: Duration::from_secs(30),
+                response_headers: Duration::from_secs(600),
+                first_byte: Duration::from_secs(600),
+                stream_idle: Duration::from_secs(120),
+            }
+        );
+    }
+
+    #[test]
+    fn timeout_overrides_apply_in_database_and_yaml_modes() {
+        for standalone in [false, true] {
+            let mut argv = vec![
+                "nyro-server",
+                "--upstream-connect-timeout-secs",
+                "11",
+                "--upstream-response-headers-timeout-secs",
+                "22",
+                "--upstream-first-byte-timeout-secs",
+                "33",
+                "--upstream-stream-idle-timeout-secs",
+                "44",
+            ];
+            if standalone {
+                argv.extend(["--config", "fixture.yaml"]);
+            }
+            let args = Args::try_parse_from(argv).expect("positive timeout options should parse");
+            assert_eq!(
+                build_upstream_timeouts(&args),
+                UpstreamTimeouts {
+                    connect: Duration::from_secs(11),
+                    response_headers: Duration::from_secs(22),
+                    first_byte: Duration::from_secs(33),
+                    stream_idle: Duration::from_secs(44),
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn timeout_options_reject_zero_negative_and_non_integer_values() {
+        for (id, _, _) in TIMEOUT_ARGS {
+            let flag = format!("--{}", id.replace('_', "-"));
+            for invalid in ["0", "-1", "1.5", "invalid", "86401", "18446744073709551615"] {
+                assert!(
+                    Args::try_parse_from(["nyro-server", flag.as_str(), invalid]).is_err(),
+                    "{flag} must reject {invalid}"
+                );
+            }
+        }
+    }
+}
+
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 #[tokio::main]
@@ -380,6 +527,7 @@ async fn run_standalone(config_path: &str, args: &Args) -> anyhow::Result<()> {
         proxy_port,
         proxy_cors_origins,
         auth_key: args.proxy_auth_key.clone().filter(|k| !k.trim().is_empty()),
+        upstream_timeouts: build_upstream_timeouts(args),
         data_dir: PathBuf::from(data_dir),
         storage: GatewayStorageConfig::default(),
         ..Default::default()
@@ -471,6 +619,7 @@ async fn run_full(args: &Args) -> anyhow::Result<()> {
         proxy_port: args.proxy_port,
         proxy_cors_origins,
         auth_key: args.proxy_auth_key.clone().filter(|k| !k.trim().is_empty()),
+        upstream_timeouts: build_upstream_timeouts(args),
         data_dir: PathBuf::from(data_dir),
         storage: build_storage_config(args)?,
         config_poll_interval: Duration::from_secs(args.config_poll_interval),

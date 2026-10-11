@@ -47,8 +47,9 @@ use raw_usage::{
 
 pub(super) type CompatAttempt = ConversionAttempt;
 
-type UpstreamByteStream =
-    Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static>>;
+type UpstreamByteStream = Pin<
+    Box<dyn Stream<Item = Result<Bytes, crate::proxy::client::UpstreamReadError>> + Send + 'static>,
+>;
 
 pub(super) fn normalize_compat_request_headers(
     headers: &mut ReqwestHeaderMap,
@@ -289,6 +290,16 @@ pub(super) async fn handle_compat(
     {
         Ok(primed) => primed,
         Err(error) => {
+            if req_ctx.deadline.is_exceeded()
+                && let Some(p) = &log.performance
+            {
+                p.record_message(
+                    "timed_out",
+                    "timeout",
+                    "request_deadline",
+                    "Request total deadline exceeded during stream priming.",
+                );
+            }
             let log = log.failure("conversion_error", "response_conversion", &error);
             let status = error.http_status();
             let message = error.to_string();
@@ -807,6 +818,28 @@ fn build_streaming_compat_response(
                 }
                 item = stream.next() => item,
             };
+            // Some compat converters turn input errors into ordinary SSE bytes
+            // (or synthesize completion on EOF). The original-wire observer is
+            // authoritative: never let that hide a transport phase timeout.
+            if log.performance.as_ref().is_some_and(|p| p.is_timed_out()) {
+                let event = super::stream_error_event(
+                    client_protocol,
+                    &request_context.request_id,
+                    "timeout",
+                );
+                let sent = tokio::select! {
+                    biased;
+                    _ = tx.closed() => false,
+                    _ = tokio::time::sleep(request_context.deadline.remaining()) => false,
+                    result = tx.send(Ok(Bytes::from(event))) => result.is_ok(),
+                };
+                if sent && let Some(p) = &log.performance {
+                    p.note_client_frame_sent();
+                }
+                let _ = bridge.push_chunk(Err(crate::proxy::stream::StreamFailure::Timeout));
+                stream_error = Some("upstream phase timeout".to_string());
+                break;
+            }
             let Some(item) = item else {
                 upstream_ended = true;
                 break;

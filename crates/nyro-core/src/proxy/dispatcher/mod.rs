@@ -121,6 +121,7 @@ fn defer_stream_health(
     let mut body = body.into_data_stream();
     let mut parser = ingress.handler().make_stream_response_decoder();
     let deadline = req_ctx.deadline.clone();
+    let request_id = req_ctx.request_id.clone();
     let (tx, rx) = tokio::sync::mpsc::channel(1);
 
     let producer = performance.as_ref().map(|p| p.producer());
@@ -139,6 +140,15 @@ fn defer_stream_health(
                     return;
                 }
                 _ = tokio::time::sleep(deadline.remaining()) => {
+                    if let Some(p) = &performance {
+                        p.record_message("timed_out", "timeout", "request_deadline", "Request total deadline exceeded.");
+                    }
+                    let event = stream_error_event(ingress, &request_id, "timeout");
+                    if tx.try_send(Ok(Bytes::from(event))).is_ok()
+                        && let Some(p) = &performance
+                    {
+                        p.note_client_frame_sent();
+                    }
                     health_permit.failure();
                     return;
                 }
@@ -1186,8 +1196,10 @@ async fn dispatch_pipeline_inner(
                 }
             };
 
-        let client = match gw.http_client_for_provider(provider.use_proxy).await {
-            Ok(http_client) => ProxyClient::new(http_client),
+        let client = match gw.inference_client_for_provider(provider.use_proxy).await {
+            Ok(http_client) => ProxyClient::new(http_client)
+                .with_timeouts(gw.config.upstream_timeouts)
+                .with_deadline(ctx.deadline.clone()),
             Err(e) => {
                 let msg = format!("provider transport error: {e}");
                 last_response = Some(error_response(502, &msg));
@@ -1277,8 +1289,7 @@ async fn dispatch_pipeline_inner(
             performance.correlate(&ctx.request_id, attempt_index);
             let attempt_producer = performance.producer();
             ctx.extensions.insert(performance.clone());
-            let client =
-                ProxyClient::new(client.http.clone()).with_performance(performance.clone());
+            let client = client.clone().with_performance(performance.clone());
             // ── Build per-target context structs ─────────────────────────────────
             let call_ctx = CallCtx {
                 performance: Some(performance.clone()),
@@ -1387,6 +1398,21 @@ async fn dispatch_pipeline_inner(
             let retry = attempt.retry;
             let health_outcome = attempt.health;
             let response = attempt.response;
+            // Before committing a response, expose transport phase timeouts as
+            // timeouts, not generic 502s or compat conversion-validation 422s.
+            // Live 200 streams report the failure in-band in their own relay.
+            let response = if response.status().as_u16() >= 400 && performance.is_timed_out() {
+                let phase = match performance.diagnostic().failure_stage.as_deref() {
+                    Some("upstream_connect") => crate::error::TimeoutPhase::Connect,
+                    Some("upstream_headers") => crate::error::TimeoutPhase::ResponseHeaders,
+                    Some("upstream_first_byte") => crate::error::TimeoutPhase::FirstByte,
+                    Some("upstream_idle") => crate::error::TimeoutPhase::Streaming,
+                    _ => crate::error::TimeoutPhase::Total,
+                };
+                GatewayError::UpstreamTimeout { phase }.render_with_ctx(ctx)
+            } else {
+                response
+            };
 
             saw_zero_payload_malformed |=
                 replay_candidate && stream_probe::is_zero_payload_malformed(&response);
@@ -2928,7 +2954,12 @@ mod tests {
         .await
         .expect("response body should close at the request deadline")
         .unwrap();
-        assert!(body.is_empty());
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(
+            text.contains("timeout"),
+            "deadline must emit an explicit error: {text}"
+        );
+        assert!(text.contains(&ctx.request_id));
         assert!(!registry.is_healthy(health_key));
         assert!(registry.try_acquire(health_key).is_none());
     }

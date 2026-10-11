@@ -296,6 +296,15 @@ impl RequestContext {
         }
     }
 
+    /// Data-plane default: bound stalled upstream phases instead of killing
+    /// active long-running inference at a fixed wall-clock deadline. Embedders
+    /// may still opt into a hard total cap through `new`.
+    pub fn without_total_timeout(ingress_protocol: ProtocolId) -> Self {
+        let mut ctx = Self::new(ingress_protocol, Duration::ZERO);
+        ctx.deadline = Deadline::never();
+        ctx
+    }
+
     /// Elapsed milliseconds since request entry.
     pub fn elapsed_ms(&self) -> f64 {
         self.started_at.elapsed().as_secs_f64() * 1000.0
@@ -327,18 +336,14 @@ use axum::response::Response;
 /// Axum middleware that creates a `RequestContext` and stores it as an
 /// `Extension`.  Mount this as the outermost layer on the proxy router.
 ///
-/// The timeout used is 600 s (matching the existing reqwest client timeout).
-/// P2 can thread per-route timeouts through here once `RequestContext` carries
-/// a configurable timeout.
+/// Normal inference has no fixed total duration. ProxyClient enforces the
+/// configured connection, response-header, first-byte and read-idle budgets.
 pub async fn inject_context(mut request: Request, next: Next) -> Response {
     // We don't know the ingress protocol at middleware time; it will be
     // overwritten by the ingress handler via `inject_context_with_protocol`.
     // Use a sentinel until then.
     use crate::protocol::ids::OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1;
-    let ctx = RequestContext::new(
-        OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1,
-        Duration::from_secs(600),
-    );
+    let ctx = RequestContext::without_total_timeout(OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1);
     let request_id = ctx.request_id.clone();
     request.extensions_mut().insert(ctx.clone());
     let response = next.run(request).await;
@@ -371,6 +376,33 @@ pub fn stamp_ingress_protocol(ctx: &mut RequestContext, protocol: ProtocolId) {
 mod tests {
     use super::*;
     use crate::protocol::ids::OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1;
+
+    #[tokio::test]
+    async fn middleware_does_not_install_the_old_600_second_deadline() {
+        use axum::{Extension, Router, middleware, routing::get};
+        let app = Router::new()
+            .route(
+                "/",
+                get(|Extension(ctx): Extension<RequestContext>| async move {
+                    assert!(ctx.deadline.remaining() > Duration::from_secs(86400));
+                    "ok"
+                }),
+            )
+            .layer(middleware::from_fn(inject_context));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let result = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
+            .get(format!("http://{address}/"))
+            .timeout(Duration::from_secs(2))
+            .send()
+            .await;
+        server.abort();
+        assert!(result.unwrap().status().is_success());
+    }
 
     #[test]
     fn request_id_is_unique() {

@@ -59,6 +59,8 @@ pub struct Gateway {
     pub storage_kind: RuntimeStorageKind,
     pub http_client: reqwest::Client,
     proxy_client_cache: Arc<tokio::sync::RwLock<Option<ProxyClientCache>>>,
+    inference_http_client: reqwest::Client,
+    inference_proxy_client_cache: Arc<tokio::sync::RwLock<Option<ProxyClientCache>>>,
     pub model_cache: Arc<tokio::sync::RwLock<router::ModelCache>>,
     pub health_registry: Arc<HealthRegistry>,
     pub latency_registry: Arc<LatencyRegistry>,
@@ -184,6 +186,11 @@ impl Gateway {
         let http_client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(600))
             .build()?;
+        // Inference streams are bounded by connection / response / idle phases,
+        // not a wall-clock total. Admin and OAuth retain their existing client.
+        let inference_http_client = reqwest::Client::builder()
+            .connect_timeout(config.upstream_timeouts.connect)
+            .build()?;
 
         let model_cache = Arc::new(tokio::sync::RwLock::new(
             router::ModelCache::load(storage.snapshots()).await?,
@@ -202,6 +209,8 @@ impl Gateway {
             storage_kind,
             http_client,
             proxy_client_cache: Arc::new(tokio::sync::RwLock::new(None)),
+            inference_http_client,
+            inference_proxy_client_cache: Arc::new(tokio::sync::RwLock::new(None)),
             model_cache,
             health_registry,
             latency_registry,
@@ -327,8 +336,33 @@ impl Gateway {
         &self,
         use_proxy: bool,
     ) -> anyhow::Result<reqwest::Client> {
+        self.provider_http_client(use_proxy, false).await
+    }
+
+    /// Inference-only transport: no total/read timeout in reqwest. ProxyClient
+    /// applies header, first-byte and read-idle budgets around the original wire.
+    pub async fn inference_client_for_provider(
+        &self,
+        use_proxy: bool,
+    ) -> anyhow::Result<reqwest::Client> {
+        self.provider_http_client(use_proxy, true).await
+    }
+
+    async fn provider_http_client(
+        &self,
+        use_proxy: bool,
+        inference: bool,
+    ) -> anyhow::Result<reqwest::Client> {
+        let (direct, cache) = if inference {
+            (
+                &self.inference_http_client,
+                &self.inference_proxy_client_cache,
+            )
+        } else {
+            (&self.http_client, &self.proxy_client_cache)
+        };
         if !use_proxy {
-            return Ok(self.http_client.clone());
+            return Ok(direct.clone());
         }
 
         let enabled = self
@@ -340,7 +374,7 @@ impl Gateway {
             .map(parse_bool_setting)
             .unwrap_or(false);
         if !enabled {
-            return Ok(self.http_client.clone());
+            return Ok(direct.clone());
         }
 
         let proxy_url = self
@@ -365,19 +399,24 @@ impl Gateway {
             .unwrap_or(false);
 
         let cache_key = format!("{proxy_url}|{force_http1}");
-        if let Some(cached) = self.proxy_client_cache.read().await.clone()
+        if let Some(cached) = cache.read().await.clone()
             && cached.cache_key == cache_key
         {
             return Ok(cached.client);
         }
 
-        let mut builder = reqwest::Client::builder().timeout(std::time::Duration::from_secs(600));
+        let mut builder = reqwest::Client::builder();
+        if inference {
+            builder = builder.connect_timeout(self.config.upstream_timeouts.connect);
+        } else {
+            builder = builder.timeout(std::time::Duration::from_secs(600));
+        }
         if force_http1 {
             builder = builder.http1_only();
         }
         let client = builder.proxy(reqwest::Proxy::all(&proxy_url)?).build()?;
 
-        *self.proxy_client_cache.write().await = Some(ProxyClientCache {
+        *cache.write().await = Some(ProxyClientCache {
             cache_key,
             client: client.clone(),
         });

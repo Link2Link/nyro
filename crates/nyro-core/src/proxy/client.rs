@@ -13,16 +13,28 @@ use futures::StreamExt;
 use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderValue};
 use serde_json::Value;
 
+mod timeouts;
+use crate::config::UpstreamTimeouts;
+use crate::proxy::context::Deadline;
+use timeouts::{TimedReadStream, bounded_timeout};
+pub use timeouts::{UpstreamReadError, UpstreamTimeoutPhase};
+
 pub const MAX_UPSTREAM_RESPONSE_BODY_BYTES: usize = 128 * 1024 * 1024;
 
+#[derive(Clone)]
 pub struct ProxyClient {
     pub http: reqwest::Client,
     performance: Option<crate::performance::Attempt>,
+    timeouts: UpstreamTimeouts,
+    deadline: Deadline,
 }
 
 pub struct ObservedResponse {
     response: reqwest::Response,
     performance: Option<crate::performance::Attempt>,
+    timeouts: UpstreamTimeouts,
+    deadline: Deadline,
+    headers_at: tokio::time::Instant,
 }
 impl ObservedResponse {
     pub fn status(&self) -> reqwest::StatusCode {
@@ -31,8 +43,15 @@ impl ObservedResponse {
     pub fn headers(&self) -> &HeaderMap {
         self.response.headers()
     }
-    pub fn bytes_stream(self) -> impl futures::Stream<Item = Result<Bytes, reqwest::Error>> + Send {
-        let stream = self.response.bytes_stream();
+    pub fn bytes_stream(
+        self,
+    ) -> impl futures::Stream<Item = Result<Bytes, UpstreamReadError>> + Send + Unpin {
+        let stream = TimedReadStream::new(
+            self.response.bytes_stream(),
+            self.timeouts,
+            self.deadline,
+            self.headers_at,
+        );
         match self.performance {
             Some(attempt) => futures::future::Either::Left(attempt.observe(stream)),
             None => futures::future::Either::Right(stream),
@@ -78,7 +97,19 @@ impl ProxyClient {
         Self {
             http,
             performance: None,
+            timeouts: UpstreamTimeouts::default(),
+            deadline: Deadline::never(),
         }
+    }
+
+    pub fn with_timeouts(mut self, timeouts: UpstreamTimeouts) -> Self {
+        self.timeouts = timeouts;
+        self
+    }
+
+    pub fn with_deadline(mut self, deadline: Deadline) -> Self {
+        self.deadline = deadline;
+        self
     }
 
     pub(crate) fn with_performance(mut self, attempt: crate::performance::Attempt) -> Self {
@@ -193,7 +224,24 @@ impl ProxyClient {
             attempt.request(&body);
             attempt.request_headers(&headers);
         }
-        let response = self.http.post(url).headers(headers).body(body).send().await;
+        let (until, phase) = bounded_timeout(
+            tokio::time::Instant::now() + self.timeouts.response_headers,
+            UpstreamTimeoutPhase::ResponseHeaders,
+            &self.deadline,
+        );
+        let response = if until <= tokio::time::Instant::now() {
+            Err(UpstreamReadError::Timeout { phase })
+        } else {
+            match tokio::time::timeout_at(
+                until,
+                self.http.post(url).headers(headers).body(body).send(),
+            )
+            .await
+            {
+                Ok(result) => result.map_err(UpstreamReadError::from),
+                Err(_) => Err(UpstreamReadError::Timeout { phase }),
+            }
+        };
         let response = match response {
             Ok(response) => response,
             Err(error) => {
@@ -209,7 +257,11 @@ impl ProxyClient {
                         } else {
                             "upstream_connect_error"
                         },
-                        "upstream_connect",
+                        if error.is_timeout() {
+                            error.stage()
+                        } else {
+                            "upstream_connect"
+                        },
                         &error,
                     );
                 }
@@ -222,6 +274,9 @@ impl ProxyClient {
         Ok(ObservedResponse {
             response,
             performance: self.performance.clone(),
+            timeouts: self.timeouts,
+            deadline: self.deadline.clone(),
+            headers_at: tokio::time::Instant::now(),
         })
     }
 

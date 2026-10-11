@@ -160,6 +160,17 @@ Nyro 不自动发现协议能力：配置的端点就是能力声明。入口请
 
 > `--proxy-host` / `--proxy-port` CLI 参数不覆盖 YAML 值，Standalone 模式代理地址完全由 YAML 控制。
 
+**Upstream inference timeouts** use the same CLI options and `NYRO_UPSTREAM_*_TIMEOUT_SECS`
+environment variables as database-backed mode, not YAML fields. CLI overrides
+environment variables; all values must be integer seconds from 1 to 86400. Defaults are
+30 seconds for connect, 600 for response headers, 600 for the first non-empty
+body bytes, and 120 for subsequent raw-body idle. Active inference has no default
+hard total deadline, including fully buffered responses. See
+[Upstream inference timeouts](../server/README.md#upstream-inference-timeouts)
+for all options and heartbeat/backpressure semantics.
+
+中文说明：上游推理超时使用与数据库模式相同的命令行参数及环境变量，不在 YAML 中配置；命令行优先，数值必须是 1–86400 的整数秒。连接/响应头/首字节/后续原始字节空闲默认分别为 30/600/600/120 秒，活跃推理没有默认硬总时限，完整缓冲响应同样受保护。详见上述链接。
+
 ### providers[]
 
 | 字段 | 别名 | 必填 | 说明 |

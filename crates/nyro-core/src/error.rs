@@ -27,6 +27,7 @@ pub(crate) struct RenderedGatewayError;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TimeoutPhase {
     Connect,
+    ResponseHeaders,
     FirstByte,
     Streaming,
     Total,
@@ -36,6 +37,7 @@ impl TimeoutPhase {
     pub fn as_str(&self) -> &'static str {
         match self {
             TimeoutPhase::Connect => "connect",
+            TimeoutPhase::ResponseHeaders => "response_headers",
             TimeoutPhase::FirstByte => "first_byte",
             TimeoutPhase::Streaming => "streaming",
             TimeoutPhase::Total => "total",

@@ -60,6 +60,30 @@ impl Default for GatewayStorageConfig {
     }
 }
 
+/// Phase-specific timeouts for upstream inference requests.
+///
+/// Inference has no hard total deadline. The idle budget measures gaps between
+/// non-empty upstream raw body chunks (including heartbeats), not formatted
+/// downstream output, and excludes downstream backpressure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UpstreamTimeouts {
+    pub connect: Duration,
+    pub response_headers: Duration,
+    pub first_byte: Duration,
+    pub stream_idle: Duration,
+}
+
+impl Default for UpstreamTimeouts {
+    fn default() -> Self {
+        Self {
+            connect: Duration::from_secs(30),
+            response_headers: Duration::from_secs(600),
+            first_byte: Duration::from_secs(600),
+            stream_idle: Duration::from_secs(120),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct GatewayConfig {
     pub proxy_host: String,
@@ -67,6 +91,7 @@ pub struct GatewayConfig {
     pub proxy_cors_origins: Vec<String>,
     pub data_dir: PathBuf,
     pub auth_key: Option<String>,
+    pub upstream_timeouts: UpstreamTimeouts,
     pub storage: GatewayStorageConfig,
     /// How often to poll the shared DB for a config epoch change and reload
     /// `model_cache` when a change is detected. Set to `Duration::ZERO` to
@@ -82,6 +107,7 @@ impl Default for GatewayConfig {
             proxy_cors_origins: Vec::new(),
             data_dir: default_data_dir(),
             auth_key: None,
+            upstream_timeouts: UpstreamTimeouts::default(),
             storage: GatewayStorageConfig::default(),
             config_poll_interval: Duration::ZERO,
         }

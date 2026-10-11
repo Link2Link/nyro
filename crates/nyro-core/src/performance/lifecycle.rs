@@ -101,6 +101,9 @@ impl Attempt {
     pub fn diagnostic(&self) -> LogDiagnostic {
         self.0.lock().unwrap().diagnostic.clone()
     }
+    pub fn is_timed_out(&self) -> bool {
+        self.0.lock().unwrap().diagnostic.attempt_outcome == "timed_out"
+    }
     /// Called only after retry selection. Emission still waits for outer Body EOS.
     pub fn select_final(&self, attempt_count: i32) {
         self.0.lock().unwrap().final_attempt_count = Some(attempt_count);
@@ -554,9 +557,14 @@ pub(crate) struct ObservedStream<S> {
     attempt: Attempt,
     ended: bool,
 }
-impl<S: Stream<Item = Result<Bytes, reqwest::Error>>> Stream for ObservedStream<S> {
-    type Item = Result<Bytes, reqwest::Error>;
+impl<S: Stream<Item = Result<Bytes, crate::proxy::client::UpstreamReadError>>> Stream
+    for ObservedStream<S>
+{
+    type Item = Result<Bytes, crate::proxy::client::UpstreamReadError>;
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        if self.ended {
+            return Poll::Ready(None);
+        }
         let result = self.inner.as_mut().poll_next(cx);
         match &result {
             Poll::Ready(Some(Ok(bytes))) => self.attempt.chunk(bytes),
@@ -572,7 +580,7 @@ impl<S: Stream<Item = Result<Bytes, reqwest::Error>>> Stream for ObservedStream<
                     } else {
                         "upstream_read_error"
                     },
-                    "upstream_read",
+                    error.stage(),
                     error,
                 );
                 self.ended = true;

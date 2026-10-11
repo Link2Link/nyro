@@ -55,6 +55,43 @@ curl http://127.0.0.1:19531/healthz         # 管理面健康检查
 | `--lan` | `NYRO_LAN` | `false` | 局域网模式：代理与 Admin 监听均绑定 `0.0.0.0`。要求同时设置 `--proxy-auth-key` 与 `--admin-token`，否则拒绝启动 |
 | `--log-level` | `NYRO_LOG_LEVEL` | `info` | 日志级别：`error` / `warn` / `info` / `debug` / `trace` |
 
+### Upstream inference timeouts
+
+These startup options apply to both database-backed server mode and standalone
+`--config` mode. Values are **integer seconds from 1 to 86400**; `0` is rejected,
+not a request to disable a timeout. Precedence is CLI option > environment variable >
+core default. Restart the process after changing them. There are no corresponding
+YAML fields, database settings, or WebUI controls; the desktop app uses the core
+defaults.
+
+| Option | Environment variable | Default (seconds) | Scope |
+|--------|----------------------|-------------------|-------|
+| `--upstream-connect-timeout-secs` | `NYRO_UPSTREAM_CONNECT_TIMEOUT_SECS` | `30` | Establishing the upstream connection |
+| `--upstream-response-headers-timeout-secs` | `NYRO_UPSTREAM_RESPONSE_HEADERS_TIMEOUT_SECS` | `600` | Sending the request through receipt of upstream response headers (includes connection and upload) |
+| `--upstream-first-byte-timeout-secs` | `NYRO_UPSTREAM_FIRST_BYTE_TIMEOUT_SECS` | `600` | Waiting for the first non-empty upstream body bytes after headers |
+| `--upstream-stream-idle-timeout-secs` | `NYRO_UPSTREAM_STREAM_IDLE_TIMEOUT_SECS` | `120` | Waiting for subsequent non-empty upstream body bytes |
+
+Inference has **no default hard total deadline**: an active response is not cut off
+merely because it has lasted 600 seconds. These phase budgets apply to streaming
+and fully buffered inference responses alike. Idle is measured from non-empty
+**upstream raw bytes**, including SSE comments/heartbeats, not from downstream
+formatter output or completed model tokens. Time spent waiting for a slow
+consumer (downstream backpressure) does not count toward upstream idle. An empty
+body chunk does not reset the idle budget. Admin/OAuth clients retain their
+existing 600-second default total timeout and any existing per-operation
+shorter limits; these options only configure inference traffic.
+
+```bash
+# Database-backed mode
+nyro-server --upstream-connect-timeout-secs 15 --upstream-stream-idle-timeout-secs 180
+
+# Standalone YAML mode: the same options and environment variables apply
+NYRO_UPSTREAM_FIRST_BYTE_TIMEOUT_SECS=900 \
+  nyro-server --config config.yaml --upstream-stream-idle-timeout-secs 180
+```
+
+中文说明：以上选项在数据库模式及 `--config` 模式均生效，仅接受 1–86400 的整数秒，`0` 或超出范围会拒绝启动；优先级为命令行 > 环境变量 > 默认值，修改后需重启。推理请求没有默认的 600 秒硬总时限，流式与完整缓冲响应均受分阶段保护。空闲计时依据非空上游原始字节（包含心跳），不依赖下游格式化结果；慢消费者造成的下游背压不计入上游空闲。桌面端继承默认值，未新增 YAML 字段、数据库设置或 UI 控件；Admin/OAuth 超时保持原行为。
+
 ### Storage
 
 | 参数 | 环境变量 | 默认值 | 说明 |

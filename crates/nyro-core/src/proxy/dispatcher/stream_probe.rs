@@ -127,7 +127,7 @@ pub(super) async fn probe_stream<S>(
     started_at: Instant,
 ) -> ProbeOutcome
 where
-    S: Stream<Item = Result<Bytes, reqwest::Error>> + Unpin,
+    S: Stream<Item = Result<Bytes, crate::proxy::client::UpstreamReadError>> + Unpin,
 {
     let mut buffered: Vec<AiStreamDelta> = Vec::new();
     let mut usage_accumulator = LogUsageAccumulator::default();
@@ -291,7 +291,7 @@ const DRAIN_WINDOW: std::time::Duration = std::time::Duration::from_secs(3);
 /// Clean EOF after the terminal frame is the norm.
 async fn drain_capped<S>(byte_stream: &mut S, raw_text: &mut String, chunks_count: &mut i32)
 where
-    S: Stream<Item = Result<Bytes, reqwest::Error>> + Unpin,
+    S: Stream<Item = Result<Bytes, crate::proxy::client::UpstreamReadError>> + Unpin,
 {
     let mut drained_chunks = 0_usize;
     let drain = async {
@@ -543,7 +543,7 @@ mod tests {
         let mut stream = futures::stream::poll_fn(move |_| {
             assert!(!ended, "probe must not drain an already exhausted stream");
             ended = true;
-            std::task::Poll::Ready(None::<Result<Bytes, reqwest::Error>>)
+            std::task::Poll::Ready(None::<Result<Bytes, crate::proxy::client::UpstreamReadError>>)
         });
         let outcome = probe_stream(
             &mut stream,

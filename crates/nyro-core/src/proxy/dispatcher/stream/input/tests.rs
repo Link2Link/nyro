@@ -203,7 +203,7 @@ async fn probe_handoff_keeps_pending_envelope_and_utf8_tail() {
     let mut chunk = first.to_vec();
     chunk.extend_from_slice(&second.as_bytes()[..split]);
     let mut stream = futures::stream::iter(vec![
-        Ok::<_, reqwest::Error>(bytes::Bytes::from(chunk)),
+        Ok::<_, crate::proxy::client::UpstreamReadError>(bytes::Bytes::from(chunk)),
         Ok(bytes::Bytes::copy_from_slice(&second.as_bytes()[split..])),
     ]);
     let mut parser = GOOGLE_GEMINI_GENERATE_CONTENT_V1BETA

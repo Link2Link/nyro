@@ -37,5 +37,6 @@ inventory = "0.3"
 gcp_auth = "0.12.6"
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
 tempfile = "3"
 flate2 = "1"
