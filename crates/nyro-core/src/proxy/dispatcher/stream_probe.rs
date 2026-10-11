@@ -13,11 +13,10 @@
 //! are decoded without consuming any downstream conversion state (tool route
 //! plan, OnResponse hooks, ingress formatter), so a transient zero-payload
 //! terminal fails the current attempt before anything reaches the client.
-//! The failure surfaces as a synthetic health-neutral 502 that the
-//! dispatcher's ordinary retry policy takes over — the next target of the
-//! same model's ordered candidates (selector-appended fallback rows
-//! included), never a replay on the same target and never a hop into
-//! another route — while staying neutral to provider health scoring.
+//! The failure surfaces as a typed, health-neutral 502. Before committing
+//! output, the dispatcher may replay the same prepared target once while the
+//! request is active; a second failure resumes ordinary target failover.
+//! Sampling failures remain neutral to provider health scoring.
 
 use std::time::Instant;
 
@@ -46,8 +45,8 @@ const MAX_CAPTURE_BYTES: usize = 256 * 1024;
 const MAX_BUFFERED_DELTAS: usize = 2048;
 
 /// Whitelist of terminations that are known transient sampling glitches when
-/// they arrive with zero payload: re-dispatching the request on a different
-/// target usually recovers. Deliberately narrow — SAFETY, RECITATION and
+/// they arrive with zero payload: one replay may recover before target
+/// failover. Deliberately narrow — SAFETY, RECITATION and
 /// every other finish reason keep today's pass-through behavior.
 pub(super) fn is_transient_stream_terminal(stop_reason: &str) -> bool {
     stop_reason.eq_ignore_ascii_case("malformed_function_call")
@@ -420,11 +419,32 @@ pub(super) fn emit_transient_failure(
     row.emit();
 }
 
+/// Local-only proof that the upstream terminated with no usable payload and
+/// nothing was committed to the client. Never inferred from a status or body.
+#[derive(Clone, Copy)]
+struct MalformedZeroPayload;
+
+pub(super) fn is_zero_payload_malformed(response: &Response) -> bool {
+    response
+        .extensions()
+        .get::<MalformedZeroPayload>()
+        .is_some()
+}
+
+pub(super) fn should_retry_same_target(
+    response: &Response,
+    already_retried: bool,
+    ctx: &crate::proxy::context::RequestContext,
+) -> bool {
+    !already_retried
+        && !ctx.cancellation.is_cancelled()
+        && !ctx.deadline.remaining().is_zero()
+        && is_zero_payload_malformed(response)
+}
+
 /// Synthetic 502 for a target whose stream terminated transiently with zero
-/// payload. The `LocalHealthNeutral` extension keeps the dispatcher's health
-/// accounting neutral (the provider itself is fine — HTTP 200, valid SSE),
-/// while the retryable 502 status lets the ordinary policy move on to the
-/// next target of the same route.
+/// payload. The marker permits one same-target replay before normal failover;
+/// LocalHealthNeutral keeps sampling failures out of provider health scoring.
 pub(super) fn transient_terminal_error_response(failure: &TransientStreamFailure) -> Response {
     let mut message = format!(
         "upstream stream produced no payload and terminated with finish_reason={}",
@@ -437,6 +457,9 @@ pub(super) fn transient_terminal_error_response(failure: &TransientStreamFailure
     let body = serde_json::json!({ "error": { "message": message } });
     let mut response = (axum::http::StatusCode::BAD_GATEWAY, axum::Json(body)).into_response();
     response.extensions_mut().insert(super::LocalHealthNeutral);
+    if is_transient_stream_terminal(&failure.stop_reason) {
+        response.extensions_mut().insert(MalformedZeroPayload);
+    }
     response
 }
 
@@ -448,6 +471,47 @@ mod tests {
         AiStreamDelta::Done {
             stop_reason: reason.to_string(),
         }
+    }
+
+    #[test]
+    fn same_target_retry_requires_local_marker_and_live_request_budget() {
+        use crate::protocol::ids::OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1;
+        use crate::proxy::context::{Deadline, RequestContext};
+        use std::time::Duration;
+
+        let mut ctx = RequestContext::new(
+            OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1,
+            Duration::from_secs(30),
+        );
+        let mut failure = TransientStreamFailure {
+            stop_reason: "MALFORMED_FUNCTION_CALL".into(),
+            finish_message: None,
+            usage: Usage::default(),
+            chunks_count: 1,
+            raw_text: String::new(),
+            latency_ms: 0,
+        };
+        let response = transient_terminal_error_response(&failure);
+        assert!(should_retry_same_target(&response, false, &ctx));
+        assert!(!should_retry_same_target(&response, true, &ctx));
+        // An upstream 502 or another local health-neutral error cannot spoof
+        // the pre-commit zero-payload proof with a matching message string.
+        let mut ordinary = super::super::error_response(502, "MALFORMED_FUNCTION_CALL");
+        ordinary
+            .extensions_mut()
+            .insert(super::super::LocalHealthNeutral);
+        assert!(!should_retry_same_target(&ordinary, false, &ctx));
+        failure.stop_reason = "SAFETY".into();
+        assert!(!should_retry_same_target(
+            &transient_terminal_error_response(&failure),
+            false,
+            &ctx
+        ));
+        ctx.deadline = Deadline::from_now(Duration::ZERO);
+        assert!(!should_retry_same_target(&response, false, &ctx));
+        ctx.deadline = Deadline::never();
+        ctx.cancellation.cancel();
+        assert!(!should_retry_same_target(&response, false, &ctx));
     }
 
     /// Model a decoder whose final batch is available only at transport EOF.

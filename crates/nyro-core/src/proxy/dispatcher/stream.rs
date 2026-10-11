@@ -353,7 +353,7 @@ pub(super) async fn handle_stream(
     // hooks, ingress formatter) until the stream is committable, so a
     // transient zero-payload terminal — the Gemini MALFORMED_FUNCTION_CALL
     // sampling glitch — fails the attempt before anything reaches the client
-    // and the dispatcher can fail over to the next target.
+    // and the dispatcher can replay once before failing over to the next target.
     let mut stream_parser = egress.handler().make_stream_response_decoder();
     let mut stream_input = StreamInput::default();
     let mut byte_stream = resp.bytes_stream();
@@ -375,10 +375,8 @@ pub(super) async fn handle_stream(
         // client yet: record the failure on this attempt, emit its
         // request-log row (upstream 200 + finishReason/finishMessage + usage
         // preserved), and answer with the health-neutral synthetic 502. The
-        // dispatcher's ordinary retry policy then advances to the next
-        // target of the same model's ordered candidates — selector-appended
-        // fallback rows included — never a same-target replay and never a
-        // hop into another route.
+        // dispatcher may replay the same prepared target once while the request
+        // is active, then resume this route's ordinary ordered failover policy.
         //
         // Known limitation (accepted): the original-wire Terminal observer is
         // one-shot per upstream connection and MALFORMED_FUNCTION_CALL is not
@@ -389,7 +387,7 @@ pub(super) async fn handle_stream(
         // Google upstream — out of scope.
         tracing::warn!(
             stop_reason = %failure.stop_reason,
-            "transient zero-payload stream terminal; failing the attempt for dispatcher failover"
+            "transient zero-payload stream terminal; failing the attempt for dispatcher retry policy"
         );
         if let Some(attempt) = &log.performance {
             let error = anyhow::anyhow!(super::stream_probe::transient_failure_reason(&failure));

@@ -1253,146 +1253,201 @@ async fn dispatch_pipeline_inner(
             _ => unreachable!("PreparedConversion guarantees matching body/session variants"),
         };
 
-        // Strict evidence belongs to this attempt, never the request OnceLock.
-        let performance = crate::performance::Attempt::new(
-            gw.log_tx.clone(),
-            ctx.cancellation.clone(),
-            ctx.deadline.clone(),
-        );
-        performance.configure_terminal(provider.vendor.as_deref(), egress);
-        let attempt_index = ctx.extensions.get::<AttemptCount>().unwrap_or_default().0 + 1;
-        ctx.extensions.insert(AttemptCount(attempt_index));
-        performance.correlate(&ctx.request_id, attempt_index);
-        let attempt_producer = performance.producer();
-        ctx.extensions.insert(performance.clone());
-        let client = client.with_performance(performance.clone());
-        // ── Build per-target context structs ─────────────────────────────────
-        let call_ctx = CallCtx {
-            performance: Some(performance.clone()),
-            gw: gw.clone(),
-            provider: &provider,
-            model_id: &route.id,
-            model_name: &route.name,
-            egress,
-            ingress,
-            ingress_str: &ingress_str,
-            egress_str: &egress_str,
-            request_model: &request_model,
-            actual_model: &actual_model,
-            backend_model: &target.model,
-            api_key_id: auth_key.id.as_deref(),
-            api_key_name: auth_key.name.as_deref(),
-            provider_key_name: pool_key.as_ref().map(|key| key.name.as_str()),
-            route_decision: Some(route_decision.to_json()),
-            is_stream,
-            enable_payload: route.enable_payload,
-            reasoning_effort: reasoning_effort.clone(),
-            start,
-            req_ext: req_ctx_ext.clone(),
-        };
-        // Fallback for cancellation/panic/hook early returns; richer producer logs replace it.
-        LogBuilder::from_ctx(&call_ctx)
-            .with_req_extras(&req_extras)
-            .upstream_url(&outbound.url)
-            .emit();
-        // `OnLog` runs once at the pipeline boundary (see `dispatch_pipeline`).
-        // The handlers run the `OnResponse` phase: non-stream paths see a full
-        // `AiResponse`, the streaming path is invoked per `AiStreamDelta`.
-        let attempt = if let Some(prepared) = prepared_compat {
-            compat::handle_compat(
-                client,
-                &outbound.url,
-                outbound.headers,
-                prepared,
-                &call_ctx,
-                &req_extras,
-                ctx,
-                &mut request_for_target,
-                host,
-                health_permit.clone(),
-            )
-            .await
-        } else {
-            let native_body =
-                prepared_native_body.expect("non-Raw-Wire prepared conversion must contain JSON");
-            let raw_chunk_hook =
-                stream::StreamRawChunkHook::capture(&adapter, &provider, &provider_ctx);
-            let response = if is_stream {
-                handle_stream(
+        // Replay only typed zero-output sampling failures, at most once per
+        // selected target/key. Do not rerun routing, hooks or request mutation:
+        // every attempt uses the same prepared business payload and identity,
+        // but receives independent decoder state, diagnostics and usage logs.
+        let mut prepared_compat = prepared_compat;
+        let mut prepared_native_body = prepared_native_body;
+        let replay_candidate = !uses_compat
+            && ((is_stream && !native_response_passthrough)
+                || (!is_stream && upstream_forces_stream));
+        let mut same_target_retried = false;
+        let mut saw_zero_payload_malformed = false;
+        let (response, status, retry, health_outcome, defer_native_stream_health) = loop {
+            // Strict evidence belongs to this attempt, never the request OnceLock.
+            let performance = crate::performance::Attempt::new(
+                gw.log_tx.clone(),
+                ctx.cancellation.clone(),
+                ctx.deadline.clone(),
+            );
+            performance.configure_terminal(provider.vendor.as_deref(), egress);
+            let attempt_index = ctx.extensions.get::<AttemptCount>().unwrap_or_default().0 + 1;
+            ctx.extensions.insert(AttemptCount(attempt_index));
+            performance.correlate(&ctx.request_id, attempt_index);
+            let attempt_producer = performance.producer();
+            ctx.extensions.insert(performance.clone());
+            let client =
+                ProxyClient::new(client.http.clone()).with_performance(performance.clone());
+            // ── Build per-target context structs ─────────────────────────────────
+            let call_ctx = CallCtx {
+                performance: Some(performance.clone()),
+                gw: gw.clone(),
+                provider: &provider,
+                model_id: &route.id,
+                model_name: &route.name,
+                egress,
+                ingress,
+                ingress_str: &ingress_str,
+                egress_str: &egress_str,
+                request_model: &request_model,
+                actual_model: &actual_model,
+                backend_model: &target.model,
+                api_key_id: auth_key.id.as_deref(),
+                api_key_name: auth_key.name.as_deref(),
+                provider_key_name: pool_key.as_ref().map(|key| key.name.as_str()),
+                route_decision: Some(route_decision.to_json()),
+                is_stream,
+                enable_payload: route.enable_payload,
+                reasoning_effort: reasoning_effort.clone(),
+                start,
+                req_ext: req_ctx_ext.clone(),
+            };
+            // Fallback for cancellation/panic/hook early returns; richer producer logs replace it.
+            LogBuilder::from_ctx(&call_ctx)
+                .with_req_extras(&req_extras)
+                .upstream_url(&outbound.url)
+                .emit();
+            // `OnLog` runs once at the pipeline boundary (see `dispatch_pipeline`).
+            // The handlers run the `OnResponse` phase: non-stream paths see a full
+            // `AiResponse`, the streaming path is invoked per `AiStreamDelta`.
+            let attempt = if let Some(prepared) = prepared_compat.take() {
+                compat::handle_compat(
                     client,
                     &outbound.url,
-                    outbound.headers,
-                    native_body,
+                    outbound.headers.clone(),
+                    prepared,
                     &call_ctx,
                     &req_extras,
-                    native_response_passthrough,
-                    tool_route_plan,
-                    ctx,
-                    &request_for_target,
-                    raw_chunk_hook,
-                )
-                .await
-            } else if upstream_forces_stream {
-                handle_non_stream_via_upstream_stream(
-                    client,
-                    &outbound.url,
-                    outbound.headers,
-                    native_body,
-                    &call_ctx,
-                    tool_route_plan,
-                    raw_chunk_hook.clone(),
                     ctx,
                     &mut request_for_target,
                     host,
+                    health_permit.clone(),
                 )
                 .await
             } else {
-                handle_non_stream(
-                    client,
-                    &outbound.url,
-                    outbound.headers,
-                    native_body,
-                    &call_ctx,
-                    &req_extras,
-                    adapter.as_ref(),
-                    &provider_ctx,
-                    native_response_passthrough,
-                    &tool_route_plan,
-                    ctx,
-                    &mut request_for_target,
-                    host,
-                )
-                .await
+                let native_body = if replay_candidate && !same_target_retried {
+                    prepared_native_body.as_ref().cloned()
+                } else {
+                    prepared_native_body.take()
+                }
+                .expect("non-Raw-Wire prepared conversion must contain JSON");
+                let raw_chunk_hook =
+                    stream::StreamRawChunkHook::capture(&adapter, &provider, &provider_ctx);
+                let response = if is_stream {
+                    handle_stream(
+                        client,
+                        &outbound.url,
+                        outbound.headers.clone(),
+                        native_body,
+                        &call_ctx,
+                        &req_extras,
+                        native_response_passthrough,
+                        tool_route_plan.clone(),
+                        ctx,
+                        &request_for_target,
+                        raw_chunk_hook,
+                    )
+                    .await
+                } else if upstream_forces_stream {
+                    handle_non_stream_via_upstream_stream(
+                        client,
+                        &outbound.url,
+                        outbound.headers.clone(),
+                        native_body,
+                        &call_ctx,
+                        tool_route_plan.clone(),
+                        raw_chunk_hook.clone(),
+                        ctx,
+                        &mut request_for_target,
+                        host,
+                    )
+                    .await
+                } else {
+                    handle_non_stream(
+                        client,
+                        &outbound.url,
+                        outbound.headers.clone(),
+                        native_body,
+                        &call_ctx,
+                        &req_extras,
+                        adapter.as_ref(),
+                        &provider_ctx,
+                        native_response_passthrough,
+                        &tool_route_plan,
+                        ctx,
+                        &mut request_for_target,
+                        host,
+                    )
+                    .await
+                };
+                let health_outcome = health_outcome_from_response(&response);
+                crate::conversion::ConversionAttempt::default_policy(response, health_outcome)
             };
-            let health_outcome = health_outcome_from_response(&response);
-            crate::conversion::ConversionAttempt::default_policy(response, health_outcome)
-        };
-        let retry = attempt.retry;
-        let health_outcome = attempt.health;
-        let response = attempt.response;
+            let retry = attempt.retry;
+            let health_outcome = attempt.health;
+            let response = attempt.response;
 
-        let status = response.status().as_u16();
-        if status == 429 {
-            crate::admin::trigger_provider_usage_refresh(gw.clone(), target.provider_id.clone());
-        }
-        let defer_native_stream_health =
-            !uses_compat && is_stream && health_outcome == HealthOutcome::Success;
-        let response = if defer_native_stream_health {
-            defer_stream_health(
+            saw_zero_payload_malformed |=
+                replay_candidate && stream_probe::is_zero_payload_malformed(&response);
+            let replay = replay_candidate
+                && stream_probe::should_retry_same_target(&response, same_target_retried, ctx);
+            let status = response.status().as_u16();
+            if status == 429 {
+                crate::admin::trigger_provider_usage_refresh(
+                    gw.clone(),
+                    target.provider_id.clone(),
+                );
+            }
+            let defer_native_stream_health =
+                !uses_compat && is_stream && health_outcome == HealthOutcome::Success;
+            let response = if defer_native_stream_health {
+                defer_stream_health(
+                    response,
+                    ingress,
+                    ctx,
+                    health_permit.clone(),
+                    Some(performance.clone()),
+                )
+            } else {
+                response
+            };
+            // Correlate only gateway-generated errors, before capture/delivery observation.
+            let response =
+                GatewayError::correlate_response(response, ingress, &ctx.request_id).await;
+            // Observe actual consumer EOS outside the health relay (enqueue is not delivery).
+            let response = performance.wrap(response);
+            attempt_producer.finish();
+            if replay && !ctx.cancellation.is_cancelled() && !ctx.deadline.remaining().is_zero() {
+                // Keep the selected credential, wire request and health permit.
+                // In particular, settling a half-open permit as neutral here would
+                // reopen its circuit and prevent this one permitted replay.
+                same_target_retried = true;
+                ctx.trace(
+                    "retry",
+                    "MALFORMED_FUNCTION_CALL without output; replaying the same target once",
+                );
+                tracing::info!(
+                    request_id = %ctx.request_id,
+                    attempt_index,
+                    provider_id = %provider.id,
+                    provider_key_id = pool_key.as_ref().map(|key| key.id.as_str()),
+                    model = %actual_model,
+                    retry = 1,
+                    reason = "malformed_function_call",
+                    "retrying same target before any output"
+                );
+                drop(response);
+                continue;
+            }
+            break (
                 response,
-                ingress,
-                ctx,
-                health_permit.clone(),
-                Some(performance.clone()),
-            )
-        } else {
-            response
+                status,
+                retry,
+                health_outcome,
+                defer_native_stream_health,
+            );
         };
-        // Correlate only gateway-generated errors, before capture/delivery observation.
-        let response = GatewayError::correlate_response(response, ingress, &ctx.request_id).await;
-        // Observe actual consumer EOS outside the health relay (enqueue is not delivery).
-        let response = performance.wrap(response);
-        attempt_producer.finish();
         let health_outcome = if defer_native_stream_health {
             HealthOutcome::Deferred
         } else {
@@ -1404,7 +1459,10 @@ async fn dispatch_pipeline_inner(
             HealthOutcome::Neutral => health_permit.neutral(),
             HealthOutcome::Deferred => drop(health_permit),
         }
-        if status < 400 {
+        if status < 400
+            || (saw_zero_payload_malformed
+                && (ctx.cancellation.is_cancelled() || ctx.deadline.remaining().is_zero()))
+        {
             return response;
         }
         // Key-level failure (auth rejected, model missing on this key, key

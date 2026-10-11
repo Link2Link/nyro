@@ -1043,7 +1043,7 @@ mod tests {
     /// path fails the single attempt — exactly one upstream call, synthetic
     /// 502 naming the finish reason, and a failed request-log row that keeps
     /// the upstream 200. The healthy second scripted reply must never be
-    /// fetched: the identical call is never replayed on the same target.
+    /// fetched by this single-attempt handler; replay belongs to the dispatcher.
     #[tokio::test]
     async fn malformed_zero_payload_force_stream_fails_attempt_without_replay() {
         let config = GatewayConfig {
@@ -1106,7 +1106,7 @@ mod tests {
         assert_eq!(
             calls.load(std::sync::atomic::Ordering::SeqCst),
             1,
-            "no same-target replay: the second scripted reply stays unfetched"
+            "a single handler call must leave retry orchestration to the dispatcher"
         );
         let mut rows = Vec::new();
         for _ in 0..1 {
@@ -1259,11 +1259,9 @@ pub(super) async fn handle_non_stream_via_upstream_stream(
     let upstream_req_hdrs_str = crate::proxy::observability::reqwest_headers_to_json(&headers);
     let upstream_req_body_str = crate::logging::payload::capture_json(&body, true).body;
 
-    // One upstream call: a transient zero-payload terminal — the Gemini
-    // MALFORMED_FUNCTION_CALL sampling glitch — fails the attempt directly
-    // with a health-neutral synthetic 502 so the dispatcher's ordinary
-    // retry policy advances to the next target (see stream_probe). The
-    // identical call is never replayed on the same target.
+    // One upstream call per handler: a transient zero-payload terminal fails
+    // this attempt with a typed health-neutral 502. The dispatcher owns the
+    // single same-target replay and subsequent ordinary failover policy.
     let attempt_start = std::time::Instant::now();
     let call_result = match client.call_stream(url, headers.clone(), body.clone()).await {
         Ok(r) => r,
@@ -1452,9 +1450,8 @@ pub(super) async fn handle_non_stream_via_upstream_stream(
     // the attempt has terminally failed — record it on this attempt,
     // emit its request-log row (upstream 200 + finishReason/finishMessage
     // + usage preserved), and answer with the health-neutral synthetic
-    // 502 so the dispatcher's ordinary retry policy advances to the next
-    // target of the same model's ordered candidates. Never a same-target
-    // replay.
+    // 502 so the dispatcher can replay this prepared target once before
+    // advancing to the next ordered candidate of the same route.
     // Zero payload = no text, no thinking text, no tool calls. Opaque
     // `items` (vendor metadata passthrough) and usage do not count.
     let transient = ai_resp
@@ -1478,7 +1475,7 @@ pub(super) async fn handle_non_stream_via_upstream_stream(
         };
         tracing::warn!(
             stop_reason = %failure.stop_reason,
-            "transient zero-payload aggregation terminal; failing the attempt for dispatcher failover"
+            "transient zero-payload aggregation terminal; failing the attempt for dispatcher retry policy"
         );
         if let Some(attempt) = &call_ctx.performance {
             let error = anyhow::anyhow!(super::stream_probe::transient_failure_reason(&failure));

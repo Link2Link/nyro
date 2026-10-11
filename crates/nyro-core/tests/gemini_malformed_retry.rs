@@ -5,19 +5,20 @@
 //! including CRLF framing and unterminated events at EOF): the upstream answers
 //! HTTP 200 with a single SSE event whose only candidate carries
 //! `finishReason: "MALFORMED_FUNCTION_CALL"` and no text/tool-call output.
-//! The gateway must fail that attempt exactly once — no same-target replay —
-//! and fail over to the next target of the same model's ordered candidates
-//! (selector-appended fallback rows included), surfacing an explicit 502
-//! that preserves the upstream 200, finishReason/finishMessage and usage
-//! when every candidate is exhausted, without regressing healthy streams or
-//! other finish reasons.
+//! The gateway may retry that zero-output terminal once on the same prepared
+//! target (at most two attempts per provider/model), then resume ordinary
+//! failover through the model's ordered candidates. Each attempt has its own
+//! performance/log identity. Exhaustion surfaces an explicit 502 preserving
+//! upstream 200, finishReason/finishMessage and usage, without retrying ordinary
+//! HTTP errors, committed output, cancellation or an exceeded deadline.
 
 use std::{sync::Arc, time::Duration};
 
 use axum::{
     Router,
+    body::Bytes,
     extract::State,
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, StatusCode, Uri},
     response::{IntoResponse, Response},
     routing::post,
 };
@@ -27,9 +28,12 @@ use nyro_core::{
     db::models::{
         CreateModel, CreateModelBackend, CreateProvider, LogQuery, UpsertOAuthCredential,
     },
-    logging::{logging_status, run_collector},
+    logging::{LogEntry, logging_status, run_collector},
     protocol::{ids::*, ir::RawEnvelope},
-    proxy::{context::RequestContext, dispatcher::dispatch_pipeline},
+    proxy::{
+        context::{CancellationToken, RequestContext},
+        dispatcher::dispatch_pipeline,
+    },
     storage::SqliteStorage,
 };
 use serde_json::{Value, json};
@@ -82,6 +86,12 @@ enum Reply {
     TextThenMalformed,
     EnvelopedMalformed,
     EnvelopedHealthy,
+    ThinkingThenMalformed,
+    ToolThenMalformed,
+    EnvelopedTextThenMalformed,
+    EnvelopedThinkingThenMalformed,
+    EnvelopedToolThenMalformed,
+    Http502,
 }
 
 impl Reply {
@@ -93,8 +103,33 @@ impl Reply {
             Reply::TextThenMalformed => TEXT_THEN_MALFORMED_SSE.to_string(),
             Reply::EnvelopedMalformed => enveloped(MALFORMED_SSE),
             Reply::EnvelopedHealthy => enveloped(HEALTHY_SSE),
+            Reply::ThinkingThenMalformed => payload_then_malformed(json!({
+                "thought": true, "text": "partial thinking"
+            })),
+            Reply::ToolThenMalformed => payload_then_malformed(json!({
+                "functionCall": {"name": "lookup_weather", "args": {"city": "Paris"}}
+            })),
+            Reply::EnvelopedTextThenMalformed => enveloped(TEXT_THEN_MALFORMED_SSE),
+            Reply::EnvelopedThinkingThenMalformed => enveloped(&Reply::ThinkingThenMalformed.sse()),
+            Reply::EnvelopedToolThenMalformed => enveloped(&Reply::ToolThenMalformed.sse()),
+            Reply::Http502 => unreachable!("HTTP errors are not SSE fixtures"),
         }
     }
+}
+
+fn payload_then_malformed(part: Value) -> String {
+    format!(
+        "data: {}\n\n",
+        json!({
+            "candidates": [{
+                "content": {"role": "model", "parts": [part]},
+                "finishReason": "MALFORMED_FUNCTION_CALL"
+            }],
+            "usageMetadata": {"promptTokenCount": 5, "totalTokenCount": 7},
+            "modelVersion": "gemini-3.8-flash",
+            "responseId": "partial-1"
+        })
+    )
 }
 
 /// Every fixture's data payload must be a single valid JSON document — a
@@ -167,21 +202,55 @@ const REGRESSION_FRAMINGS: [Framing; 6] = [
     Framing::BareEof,
 ];
 
-type UpstreamState = (
-    Arc<Vec<Reply>>,
-    Arc<std::sync::atomic::AtomicUsize>,
-    Framing,
-);
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CapturedRequest {
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+}
 
-async fn scripted_upstream(State((script, calls, framing)): State<UpstreamState>) -> Response {
-    let index = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    let reply = script
-        .get(index.min(script.len().saturating_sub(1)))
+#[derive(Clone)]
+struct UpstreamState {
+    script: Arc<Vec<Reply>>,
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+    requests: Arc<std::sync::Mutex<Vec<CapturedRequest>>>,
+    framing: Framing,
+    cancel_on_reply: Option<CancellationToken>,
+}
+
+async fn scripted_upstream(
+    State(state): State<UpstreamState>,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    state
+        .requests
+        .lock()
+        .unwrap()
+        .push(CapturedRequest { uri, headers, body });
+    let index = state
+        .calls
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let reply = state
+        .script
+        .get(index.min(state.script.len().saturating_sub(1)))
         .copied()
         .unwrap_or(Reply::Healthy);
+    if let Some(token) = &state.cancel_on_reply {
+        token.cancel();
+    }
+    if reply == Reply::Http502 {
+        // Even a body naming the finish reason cannot forge the local marker.
+        return (
+            StatusCode::BAD_GATEWAY,
+            axum::Json(json!({"error": {"message": "MALFORMED_FUNCTION_CALL: ordinary HTTP 502"}})),
+        )
+            .into_response();
+    }
     (
         [("content-type", "text/event-stream")],
-        framing.apply(reply.sse()),
+        state.framing.apply(reply.sse()),
     )
         .into_response()
 }
@@ -189,12 +258,23 @@ async fn scripted_upstream(State((script, calls, framing)): State<UpstreamState>
 struct Upstream {
     url: String,
     calls: Arc<std::sync::atomic::AtomicUsize>,
-    _job: tokio::task::JoinHandle<()>,
+    requests: Arc<std::sync::Mutex<Vec<CapturedRequest>>>,
+    job: tokio::task::JoinHandle<()>,
 }
 
 impl Upstream {
     fn calls(&self) -> usize {
         self.calls.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn requests(&self) -> Vec<CapturedRequest> {
+        self.requests.lock().unwrap().clone()
+    }
+}
+
+impl Drop for Upstream {
+    fn drop(&mut self) {
+        self.job.abort();
     }
 }
 
@@ -206,10 +286,25 @@ async fn start_upstream_with_framing(
     script: Vec<Reply>,
     framing: Framing,
 ) -> anyhow::Result<Upstream> {
+    start_upstream_controlled(script, framing, None).await
+}
+
+async fn start_upstream_controlled(
+    script: Vec<Reply>,
+    framing: Framing,
+    cancel_on_reply: Option<CancellationToken>,
+) -> anyhow::Result<Upstream> {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let url = format!("http://{}", listener.local_addr()?);
     let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let state = (Arc::new(script), calls.clone(), framing);
+    let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let state = UpstreamState {
+        script: Arc::new(script),
+        calls: calls.clone(),
+        requests: requests.clone(),
+        framing,
+        cancel_on_reply,
+    };
     let job = tokio::spawn(async move {
         let app = Router::new()
             .route("/*path", post(scripted_upstream))
@@ -219,7 +314,8 @@ async fn start_upstream_with_framing(
     Ok(Upstream {
         url,
         calls,
-        _job: job,
+        requests,
+        job,
     })
 }
 
@@ -368,11 +464,19 @@ async fn dispatch_request(
     gw: &Gateway,
     body: Value,
 ) -> anyhow::Result<(String, StatusCode, String)> {
+    let ctx = RequestContext::new(OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1, TIMEOUT);
+    dispatch_with_context(gw, body, ctx).await
+}
+
+async fn dispatch_with_context(
+    gw: &Gateway,
+    body: Value,
+    ctx: RequestContext,
+) -> anyhow::Result<(String, StatusCode, String)> {
     let request = OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1
         .handler()
         .make_request_decoder()
         .decode_request(body.clone())?;
-    let ctx = RequestContext::new(OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1, TIMEOUT);
     let request_id = ctx.request_id.clone();
     let response = tokio::time::timeout(
         TIMEOUT,
@@ -404,37 +508,7 @@ async fn dispatch_stream(
     gw: &Gateway,
     model: &str,
 ) -> anyhow::Result<(String, StatusCode, String)> {
-    let body = chat_stream_request(model);
-    let request = OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1
-        .handler()
-        .make_request_decoder()
-        .decode_request(body.clone())?;
-    let ctx = RequestContext::new(OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1, TIMEOUT);
-    let request_id = ctx.request_id.clone();
-    let response = tokio::time::timeout(
-        TIMEOUT,
-        dispatch_pipeline(
-            gw.clone(),
-            HeaderMap::new(),
-            RawEnvelope::new(
-                Some(body),
-                Default::default(),
-                "POST",
-                "/v1/chat/completions",
-            ),
-            request,
-            OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1,
-            ctx,
-        ),
-    )
-    .await?;
-    let status = response.status();
-    let bytes = tokio::time::timeout(
-        TIMEOUT,
-        axum::body::to_bytes(response.into_body(), 4 * 1024 * 1024),
-    )
-    .await??;
-    Ok((request_id, status, String::from_utf8(bytes.to_vec())?))
+    dispatch_request(gw, chat_stream_request(model)).await
 }
 
 async fn recv_logs(
@@ -453,10 +527,97 @@ async fn recv_logs(
     rows
 }
 
-// ── 1. Single backend: one call, explicit 502 ────────────────────────────────
+/// Distinct performance attempts share only the client request identity;
+/// only the last row owns the final result and its total attempt count.
+fn assert_attempt_sequence(rows: &mut [LogEntry], request_id: &str) {
+    rows.sort_by_key(|row| row.diagnostic.attempt_index);
+    let mut ids = std::collections::HashSet::new();
+    for (index, row) in rows.iter().enumerate() {
+        assert_eq!(row.diagnostic.attempt_index, Some(index as i32 + 1));
+        assert_eq!(
+            row.diagnostic.client_request_id.as_deref(),
+            Some(request_id)
+        );
+        assert!(
+            ids.insert(&row.diagnostic.log_id),
+            "attempt log IDs must differ"
+        );
+        if index + 1 != rows.len() {
+            assert!(
+                row.diagnostic.final_result.is_none(),
+                "intermediate row: {row:?}"
+            );
+        }
+    }
+    let last = rows.last().expect("at least one attempt");
+    let result = last.diagnostic.final_result.as_ref().expect("final result");
+    assert_eq!(result.attempt_count, rows.len() as i32);
+    assert_eq!(result.client_request_id, request_id);
+    assert_eq!(
+        result.final_attempt_id.as_deref(),
+        Some(last.diagnostic.log_id.as_str())
+    );
+    assert_eq!(result.final_outcome, last.diagnostic.attempt_outcome);
+}
+
+fn assert_malformed_attempt(row: &LogEntry) {
+    assert_eq!(row.client_status_code, 502);
+    assert_eq!(row.upstream_status_code, Some(200), "upstream was a 200");
+    assert_eq!(row.diagnostic.attempt_outcome, "failed");
+    assert_eq!(row.performance.completion, "failed");
+    assert_eq!(
+        row.diagnostic.failure_kind.as_deref(),
+        Some("upstream_error")
+    );
+    let causes = row.diagnostic.error_causes.join(" | ");
+    assert!(
+        causes.contains("finish_reason=malformed_function_call")
+            && causes.contains("Function call is empty"),
+        "upstream failure evidence: {causes}"
+    );
+    assert_eq!(row.usage.prompt_tokens, 65036, "usage preserved: {row:?}");
+    assert_eq!(row.usage.total_tokens, 65322);
+}
+
+fn assert_no_failed_response_leak(wire: &str) {
+    for marker in [
+        "MALFORMED_FUNCTION_CALL",
+        "malformed_function_call",
+        "test-signature",
+        "malformed-1",
+        "Function call is empty",
+        "65036",
+    ] {
+        assert!(
+            !wire.contains(marker),
+            "failed response leaked ({marker}): {wire}"
+        );
+    }
+}
+
+fn fallback_targets(primary: &str, fallback: &str) -> Vec<CreateModelBackend> {
+    vec![
+        CreateModelBackend {
+            provider_id: primary.into(),
+            model: "gemini-3.8-flash".into(),
+            weight: Some(100),
+            priority: Some(1),
+            is_fallback: Some(false),
+        },
+        CreateModelBackend {
+            provider_id: fallback.into(),
+            model: "gemini-3.5-pro".into(),
+            weight: Some(100),
+            priority: Some(2),
+            is_fallback: Some(true),
+        },
+    ]
+}
+
+// ── 1. Single backend: at most two attempts, explicit 502 ────────────────────
 
 #[tokio::test]
-async fn malformed_single_backend_fails_once_with_502() -> anyhow::Result<()> {
+async fn malformed_single_backend_stops_after_two_attempts_with_502() -> anyhow::Result<()> {
     assert_malformed_single_backend(Reply::Malformed, Framing::Lf).await
 }
 
@@ -472,8 +633,13 @@ async fn malformed_crlf_and_eof_single_backend_returns_502_not_empty_200() -> an
 
 async fn assert_malformed_single_backend(reply: Reply, framing: Framing) -> anyhow::Result<()> {
     let (_dir, gw, mut logs) = setup().await?;
-    // The healthy second reply exists only to prove it is never fetched.
-    let upstream = start_upstream_with_framing(vec![reply, Reply::Healthy], framing).await?;
+    // The healthy third reply proves the same-target budget is exactly two.
+    let healthy = if reply == Reply::EnvelopedMalformed {
+        Reply::EnvelopedHealthy
+    } else {
+        Reply::Healthy
+    };
+    let upstream = start_upstream_with_framing(vec![reply, reply, healthy], framing).await?;
     let provider = if reply == Reply::EnvelopedMalformed {
         antigravity_provider(&gw, &upstream.url).await?
     } else {
@@ -481,7 +647,7 @@ async fn assert_malformed_single_backend(reply: Reply, framing: Framing) -> anyh
     };
     route(&gw, "malformed-single", provider, vec![]).await?;
 
-    let (_id, status, wire) = dispatch_stream(&gw, "malformed-single").await?;
+    let (id, status, wire) = dispatch_stream(&gw, "malformed-single").await?;
     assert_eq!(
         status,
         StatusCode::BAD_GATEWAY,
@@ -493,29 +659,19 @@ async fn assert_malformed_single_backend(reply: Reply, framing: Framing) -> anyh
     assert!(message.contains("Function call is empty"));
     assert_eq!(
         upstream.calls(),
-        1,
-        "no same-target replay; the healthy second reply stays unfetched"
+        2,
+        "one same-target retry only; the healthy third reply stays unfetched"
+    );
+    assert!(
+        !wire.contains("recovered answer"),
+        "third reply was fetched: {wire}"
     );
 
-    let rows = recv_logs(&mut logs, 1).await;
-    let row = &rows[0];
-    assert_eq!(row.client_status_code, 502);
-    assert_eq!(row.upstream_status_code, Some(200), "upstream was a 200");
-    assert_eq!(row.diagnostic.attempt_index, Some(1));
-    assert_eq!(row.diagnostic.attempt_outcome, "failed");
-    assert_eq!(
-        row.diagnostic.failure_kind.as_deref(),
-        Some("upstream_error"),
-        "explicit record_failure must outrank ambiguous_terminal: {row:?}"
-    );
-    let causes = row.diagnostic.error_causes.join(" | ");
-    assert!(
-        causes.contains("finish_reason=malformed_function_call")
-            && causes.contains("Function call is empty"),
-        "diagnostic must carry the upstream finish reason verbatim: {causes}"
-    );
-    assert_eq!(row.usage.prompt_tokens, 65036, "usage preserved: {row:?}");
-    assert_eq!(row.usage.total_tokens, 65322);
+    let mut rows = recv_logs(&mut logs, 2).await;
+    assert_attempt_sequence(&mut rows, &id);
+    for row in &rows {
+        assert_malformed_attempt(row);
+    }
     assert!(logs.try_recv().is_err(), "no extra rows");
     Ok(())
 }
@@ -547,7 +703,7 @@ async fn malformed_all_backends_exhausted_returns_502_with_details() -> anyhow::
     ];
     route(&gw, "malformed-exhaust", provider_a, targets).await?;
 
-    let (_id, status, wire) = dispatch_stream(&gw, "malformed-exhaust").await?;
+    let (id, status, wire) = dispatch_stream(&gw, "malformed-exhaust").await?;
     assert_eq!(
         status,
         StatusCode::BAD_GATEWAY,
@@ -557,22 +713,14 @@ async fn malformed_all_backends_exhausted_returns_502_with_details() -> anyhow::
     let message = value["error"]["message"].as_str().expect("error message");
     assert!(message.contains("finish_reason=malformed_function_call"));
     assert!(message.contains("Function call is empty"));
-    assert_eq!(broken_a.calls(), 1, "backend A called exactly once");
-    assert_eq!(broken_b.calls(), 1, "backend B called exactly once");
+    assert_eq!(broken_a.calls(), 2, "backend A gets one retry");
+    assert_eq!(broken_b.calls(), 2, "backend B gets its own retry");
 
-    let rows = recv_logs(&mut logs, 2).await;
-    assert!(rows.iter().all(|row| row.client_status_code == 502));
-    assert!(rows.iter().all(|row| row.upstream_status_code == Some(200)));
-    let mut indexes = rows
-        .iter()
-        .map(|row| row.diagnostic.attempt_index)
-        .collect::<Vec<_>>();
-    indexes.sort();
-    assert_eq!(indexes, vec![Some(1), Some(2)], "rows: {rows:?}");
-    assert!(
-        rows.iter()
-            .all(|row| row.diagnostic.failure_kind.as_deref() == Some("upstream_error"))
-    );
+    let mut rows = recv_logs(&mut logs, 4).await;
+    assert_attempt_sequence(&mut rows, &id);
+    for row in &rows {
+        assert_malformed_attempt(row);
+    }
     assert!(logs.try_recv().is_err(), "no extra rows");
     Ok(())
 }
@@ -582,7 +730,7 @@ async fn malformed_all_backends_exhausted_returns_502_with_details() -> anyhow::
 #[tokio::test]
 async fn malformed_backend_fails_over_to_next_target() -> anyhow::Result<()> {
     let (_dir, gw, mut logs) = setup().await?;
-    let broken = start_upstream(vec![Reply::Malformed, Reply::Malformed]).await?;
+    let broken = start_upstream(vec![Reply::Malformed, Reply::Malformed, Reply::Healthy]).await?;
     let healthy = start_upstream(vec![Reply::Healthy]).await?;
     let provider_a = gemini_provider(&gw, &broken.url).await?;
     let provider_b = gemini_provider(&gw, &healthy.url).await?;
@@ -604,7 +752,7 @@ async fn malformed_backend_fails_over_to_next_target() -> anyhow::Result<()> {
     ];
     route(&gw, "malformed-failover", provider_a.clone(), targets).await?;
 
-    let (_id, status, wire) = dispatch_stream(&gw, "malformed-failover").await?;
+    let (id, status, wire) = dispatch_stream(&gw, "malformed-failover").await?;
     assert_eq!(status, StatusCode::OK, "target B must answer: {wire}");
     assert!(
         wire.contains("recovered answer"),
@@ -621,40 +769,23 @@ async fn malformed_backend_fails_over_to_next_target() -> anyhow::Result<()> {
     );
     assert_eq!(
         broken.calls(),
-        1,
-        "backend A failed once; no same-target replay"
+        2,
+        "target A's healthy third reply stays unfetched"
     );
     assert_eq!(healthy.calls(), 1, "backend B called once");
+    assert_no_failed_response_leak(&wire);
 
-    let rows = recv_logs(&mut logs, 2).await;
-    let failed: Vec<_> = rows
-        .iter()
-        .filter(|row| row.diagnostic.attempt_outcome == "failed")
-        .collect();
-    let completed: Vec<_> = rows
-        .iter()
-        .filter(|row| row.diagnostic.attempt_outcome == "completed")
-        .collect();
-    assert_eq!((failed.len(), completed.len()), (1, 1), "rows: {rows:?}");
-    let failed = failed[0];
-    assert_eq!(failed.client_status_code, 502);
-    assert_eq!(failed.upstream_status_code, Some(200));
-    assert_eq!(failed.provider_id, provider_a, "failed row is target A");
-    assert_eq!(failed.diagnostic.attempt_index, Some(1));
-    assert_eq!(
-        failed.diagnostic.failure_kind.as_deref(),
-        Some("upstream_error")
-    );
-    let causes = failed.diagnostic.error_causes.join(" | ");
-    assert!(
-        causes.contains("finish_reason=malformed_function_call")
-            && causes.contains("Function call is empty"),
-        "diagnostic must carry the upstream finish reason: {causes}"
-    );
-    let completed = completed[0];
+    let mut rows = recv_logs(&mut logs, 3).await;
+    assert_attempt_sequence(&mut rows, &id);
+    for failed in &rows[..2] {
+        assert_malformed_attempt(failed);
+        assert_eq!(failed.provider_id, provider_a, "failed row is target A");
+    }
+    let completed = &rows[2];
+    assert_eq!(completed.diagnostic.attempt_outcome, "completed");
     assert_eq!(completed.client_status_code, 200);
     assert_eq!(completed.provider_id, provider_b, "answered by target B");
-    assert_eq!(completed.diagnostic.attempt_index, Some(2));
+    assert_eq!(completed.diagnostic.attempt_index, Some(3));
     assert_eq!(
         completed.upstream_model, "gemini-3.5-pro",
         "target B serves a different backend model"
@@ -669,8 +800,8 @@ async fn malformed_backend_fails_over_to_next_target() -> anyhow::Result<()> {
 // {"response": …} SSE shape from the production incident, the client asks
 // for a non-stream response (so the dispatcher routes through
 // handle_non_stream_via_upstream_stream with the vendor raw-chunk hook), and
-// the malformed zero-payload terminal on target A must fail that attempt
-// once and fail over to the different-model fallback target B.
+// the malformed zero-payload terminal on target A gets one same-target retry
+// before failing over to the different-model fallback target B.
 #[tokio::test]
 async fn enveloped_malformed_nonstream_fails_over_via_upstream_stream() -> anyhow::Result<()> {
     assert_enveloped_malformed_failover(Framing::Lf, false).await
@@ -689,7 +820,11 @@ async fn enveloped_crlf_and_eof_malformed_fails_over_before_commit() -> anyhow::
 async fn assert_enveloped_malformed_failover(framing: Framing, stream: bool) -> anyhow::Result<()> {
     let (_dir, gw, mut logs) = setup().await?;
     let broken = start_upstream_with_framing(
-        vec![Reply::EnvelopedMalformed, Reply::EnvelopedMalformed],
+        vec![
+            Reply::EnvelopedMalformed,
+            Reply::EnvelopedMalformed,
+            Reply::EnvelopedHealthy,
+        ],
         framing,
     )
     .await?;
@@ -719,7 +854,7 @@ async fn assert_enveloped_malformed_failover(framing: Framing, stream: bool) -> 
     } else {
         chat_non_stream_request("enveloped-failover")
     };
-    let (_id, status, wire) = dispatch_request(&gw, request).await?;
+    let (id, status, wire) = dispatch_request(&gw, request).await?;
     assert_eq!(
         status,
         StatusCode::OK,
@@ -743,50 +878,308 @@ async fn assert_enveloped_malformed_failover(framing: Framing, stream: bool) -> 
     );
     assert_eq!(
         broken.calls(),
-        1,
-        "target A failed once; no same-target replay"
+        2,
+        "target A's healthy third reply stays unfetched"
     );
     assert_eq!(healthy.calls(), 1, "target B called once");
+    assert_no_failed_response_leak(&wire);
 
-    let rows = recv_logs(&mut logs, 2).await;
-    let failed: Vec<_> = rows
-        .iter()
-        .filter(|row| row.diagnostic.attempt_outcome == "failed")
-        .collect();
-    let completed: Vec<_> = rows
-        .iter()
-        .filter(|row| row.diagnostic.attempt_outcome == "completed")
-        .collect();
-    assert_eq!((failed.len(), completed.len()), (1, 1), "rows: {rows:?}");
-    let failed = failed[0];
-    assert_eq!(failed.client_status_code, 502);
-    assert_eq!(failed.upstream_status_code, Some(200));
-    assert_eq!(failed.provider_id, provider_a);
-    assert_eq!(failed.diagnostic.attempt_index, Some(1));
-    assert_eq!(
-        failed.diagnostic.failure_kind.as_deref(),
-        Some("upstream_error")
-    );
-    let causes = failed.diagnostic.error_causes.join(" | ");
-    assert!(
-        causes.contains("finish_reason=malformed_function_call")
-            && causes.contains("Function call is empty"),
-        "diagnostic must carry the enveloped finish reason: {causes}"
-    );
-    assert_eq!(
-        failed.usage.prompt_tokens, 65036,
-        "enveloped usage metadata preserved: {failed:?}"
-    );
-    assert_eq!(failed.usage.total_tokens, 65322);
-    let completed = completed[0];
+    let mut rows = recv_logs(&mut logs, 3).await;
+    assert_attempt_sequence(&mut rows, &id);
+    for failed in &rows[..2] {
+        assert_malformed_attempt(failed);
+        assert_eq!(failed.provider_id, provider_a);
+    }
+    let completed = &rows[2];
+    assert_eq!(completed.diagnostic.attempt_outcome, "completed");
     assert_eq!(completed.client_status_code, 200);
     assert_eq!(completed.provider_id, provider_b);
-    assert_eq!(completed.diagnostic.attempt_index, Some(2));
+    assert_eq!(completed.diagnostic.attempt_index, Some(3));
     assert_eq!(
         completed.upstream_model, "gemini-3.5-pro",
         "fallback target serves a different backend model"
     );
     assert!(logs.try_recv().is_err(), "no extra rows");
+    Ok(())
+}
+
+// ── Same-target recovery: plain stream + subscription stream/aggregation ───
+
+#[tokio::test]
+async fn malformed_recovers_in_place_without_touching_fallback() -> anyhow::Result<()> {
+    for (subscription, stream) in [(false, true), (true, true), (true, false)] {
+        let (_dir, gw, mut logs) = setup().await?;
+        let (malformed, healthy) = if subscription {
+            (Reply::EnvelopedMalformed, Reply::EnvelopedHealthy)
+        } else {
+            (Reply::Malformed, Reply::Healthy)
+        };
+        let upstream = start_upstream(vec![malformed, healthy]).await?;
+        let fallback = start_upstream(vec![healthy]).await?;
+        let provider = if subscription {
+            antigravity_provider(&gw, &upstream.url).await?
+        } else {
+            gemini_provider(&gw, &upstream.url).await?
+        };
+        let fallback_provider = if subscription {
+            antigravity_provider(&gw, &fallback.url).await?
+        } else {
+            gemini_provider(&gw, &fallback.url).await?
+        };
+        route(
+            &gw,
+            "in-place-recovery",
+            provider.clone(),
+            fallback_targets(&provider, &fallback_provider),
+        )
+        .await?;
+        let body = if stream {
+            chat_stream_request("in-place-recovery")
+        } else {
+            chat_non_stream_request("in-place-recovery")
+        };
+        let ctx = RequestContext::new(OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1, TIMEOUT);
+        let cancellation = ctx.cancellation.clone();
+        let (id, status, wire) = dispatch_with_context(&gw, body, ctx).await?;
+        assert!(
+            !cancellation.is_cancelled(),
+            "dropping the failed attempt must not cancel recovery"
+        );
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "subscription={subscription}/stream={stream}: {wire}"
+        );
+        if stream {
+            assert_healthy_stream_once(&wire);
+        } else {
+            let value: Value = serde_json::from_str(&wire)?;
+            assert_eq!(
+                value["choices"][0]["message"]["content"],
+                "recovered answer"
+            );
+            assert_eq!(value["choices"][0]["finish_reason"], "stop");
+            assert_eq!(value["usage"]["prompt_tokens"], 5);
+            assert_eq!(value["usage"]["total_tokens"], 7);
+        }
+        assert_no_failed_response_leak(&wire);
+        assert_eq!(upstream.calls(), 2, "one retry on the selected target");
+        assert_eq!(fallback.calls(), 0, "recovery must not reroute");
+
+        let requests = upstream.requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            requests[0], requests[1],
+            "retry must reuse URI, body and all headers"
+        );
+        let request_body: Value = serde_json::from_slice(&requests[0].body)?;
+        let request_url = reqwest::Url::parse(&format!("{}{}", upstream.url, requests[0].uri))?;
+        let query_keys = request_url
+            .query_pairs()
+            .filter(|(name, _)| name == "key")
+            .map(|(_, value)| value.into_owned())
+            .collect::<Vec<_>>();
+        if subscription {
+            assert_eq!(request_body["model"], "gemini-3.8-flash");
+            // This local fixture intentionally bypasses the Google auth driver
+            // to retain its loopback URL. It has no runtime Bearer binding and
+            // does not test Bearer generation; the entire prepared header/URI
+            // set must still be identical on retry (asserted above).
+            assert!(!requests[0].headers.contains_key("authorization"));
+            assert!(query_keys.is_empty());
+        } else {
+            assert!(requests[0].uri.path().contains("gemini-3.8-flash"));
+            assert_eq!(
+                query_keys,
+                ["local-fake-token"],
+                "same configured API credential"
+            );
+        }
+
+        let mut rows = recv_logs(&mut logs, 2).await;
+        assert_attempt_sequence(&mut rows, &id);
+        assert_malformed_attempt(&rows[0]);
+        assert_eq!(rows[1].diagnostic.attempt_outcome, "completed");
+        assert_eq!(rows[1].performance.completion, "completed");
+        assert_eq!(rows[1].client_status_code, 200);
+        assert_eq!(rows[1].upstream_status_code, Some(200));
+        assert_eq!(
+            rows[1].usage.total_tokens, 7,
+            "failed usage must not accumulate"
+        );
+        for row in &rows {
+            assert_eq!(row.provider_id, provider);
+            assert_eq!(row.upstream_model, "gemini-3.8-flash");
+        }
+        assert_eq!(rows[0].provider_key_name, rows[1].provider_key_name);
+        assert!(logs.try_recv().is_err(), "exactly two attempt rows");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn same_provider_different_models_have_independent_retry_budgets() -> anyhow::Result<()> {
+    for stream in [true, false] {
+        let (_dir, gw, mut logs) = setup().await?;
+        let upstream = start_upstream(vec![
+            Reply::EnvelopedMalformed,
+            Reply::EnvelopedMalformed,
+            Reply::EnvelopedMalformed,
+            Reply::EnvelopedHealthy,
+        ])
+        .await?;
+        let provider = antigravity_provider(&gw, &upstream.url).await?;
+        route(
+            &gw,
+            "model-budgets",
+            provider.clone(),
+            fallback_targets(&provider, &provider),
+        )
+        .await?;
+        let body = if stream {
+            chat_stream_request("model-budgets")
+        } else {
+            chat_non_stream_request("model-budgets")
+        };
+        let (id, status, wire) = dispatch_request(&gw, body).await?;
+        assert_eq!(status, StatusCode::OK, "stream={stream}: {wire}");
+        assert!(wire.contains("recovered answer"), "{wire}");
+        assert_no_failed_response_leak(&wire);
+        assert_eq!(
+            upstream.calls(),
+            4,
+            "each model target owns a two-attempt budget"
+        );
+        let requests = upstream.requests();
+        assert_eq!(requests[0], requests[1]);
+        assert_eq!(requests[2], requests[3]);
+        let models = requests
+            .iter()
+            .map(|request| {
+                serde_json::from_slice::<Value>(&request.body).unwrap()["model"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            models,
+            [
+                "gemini-3.8-flash",
+                "gemini-3.8-flash",
+                "gemini-3.5-pro",
+                "gemini-3.5-pro"
+            ]
+        );
+        let mut rows = recv_logs(&mut logs, 4).await;
+        assert_attempt_sequence(&mut rows, &id);
+        for row in &rows[..3] {
+            assert_malformed_attempt(row);
+        }
+        assert_eq!(rows[3].diagnostic.attempt_outcome, "completed");
+        for (row, model) in rows.iter().zip(models) {
+            assert_eq!(row.provider_id, provider);
+            assert_eq!(row.upstream_model, model);
+        }
+        assert!(logs.try_recv().is_err());
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn ordinary_http502_does_not_retry_the_same_target() -> anyhow::Result<()> {
+    for (subscription, stream) in [(false, true), (true, true), (true, false)] {
+        let (_dir, gw, mut logs) = setup().await?;
+        let healthy_reply = if subscription {
+            Reply::EnvelopedHealthy
+        } else {
+            Reply::Healthy
+        };
+        let upstream = start_upstream(vec![Reply::Http502, healthy_reply]).await?;
+        let fallback = start_upstream(vec![healthy_reply]).await?;
+        let provider = if subscription {
+            antigravity_provider(&gw, &upstream.url).await?
+        } else {
+            gemini_provider(&gw, &upstream.url).await?
+        };
+        let fallback_provider = if subscription {
+            antigravity_provider(&gw, &fallback.url).await?
+        } else {
+            gemini_provider(&gw, &fallback.url).await?
+        };
+        route(
+            &gw,
+            "http502",
+            provider.clone(),
+            fallback_targets(&provider, &fallback_provider),
+        )
+        .await?;
+        let body = if stream {
+            chat_stream_request("http502")
+        } else {
+            chat_non_stream_request("http502")
+        };
+        let (id, status, wire) = dispatch_request(&gw, body).await?;
+        assert_eq!(status, StatusCode::OK, "{wire}");
+        assert!(wire.contains("recovered answer"), "{wire}");
+        assert_no_failed_response_leak(&wire);
+        assert_eq!(
+            upstream.calls(),
+            1,
+            "ordinary HTTP 502 must not use same-target retry"
+        );
+        assert_eq!(fallback.calls(), 1, "ordinary fallback policy is unchanged");
+        let mut rows = recv_logs(&mut logs, 2).await;
+        assert_attempt_sequence(&mut rows, &id);
+        assert_eq!(rows[0].provider_id, provider);
+        assert_eq!(rows[0].upstream_status_code, Some(502));
+        assert_eq!(rows[0].diagnostic.attempt_outcome, "failed");
+        assert_eq!(rows[1].provider_id, fallback_provider);
+        assert_eq!(rows[1].diagnostic.attempt_outcome, "completed");
+        assert!(logs.try_recv().is_err());
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn cancellation_before_malformed_reply_prevents_same_target_retry() -> anyhow::Result<()> {
+    for stream in [true, false] {
+        let (_dir, gw, mut logs) = setup().await?;
+        let ctx = RequestContext::new(OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1, TIMEOUT);
+        let cancellation = ctx.cancellation.clone();
+        let upstream = start_upstream_controlled(
+            vec![Reply::EnvelopedMalformed, Reply::EnvelopedHealthy],
+            Framing::Lf,
+            Some(cancellation.clone()),
+        )
+        .await?;
+        let provider = antigravity_provider(&gw, &upstream.url).await?;
+        route(&gw, "cancelled-malformed", provider, vec![]).await?;
+        let body = if stream {
+            chat_stream_request("cancelled-malformed")
+        } else {
+            chat_non_stream_request("cancelled-malformed")
+        };
+        let (id, status, wire) = dispatch_with_context(&gw, body, ctx).await?;
+        assert!(
+            cancellation.is_cancelled(),
+            "fixture cancels while the first call is in flight"
+        );
+        assert_ne!(
+            status,
+            StatusCode::OK,
+            "cancelled attempt cannot recover: {wire}"
+        );
+        assert_eq!(
+            upstream.calls(),
+            1,
+            "cancelled request must not be replayed"
+        );
+        assert!(!wire.contains("recovered answer"));
+        let mut rows = recv_logs(&mut logs, 1).await;
+        assert_attempt_sequence(&mut rows, &id);
+        assert!(logs.try_recv().is_err());
+    }
     Ok(())
 }
 
@@ -881,38 +1274,101 @@ async fn safety_zero_payload_is_not_retried() -> anyhow::Result<()> {
 // ── 6. Payload before MALFORMED commits ──────────────────────────────────────
 
 #[tokio::test]
-async fn text_then_malformed_is_not_retried() -> anyhow::Result<()> {
-    let (_dir, gw, mut logs) = setup().await?;
-    let upstream = start_upstream(vec![Reply::TextThenMalformed]).await?;
-    let provider = gemini_provider(&gw, &upstream.url).await?;
-    route(&gw, "partial-stream", provider, vec![]).await?;
-
-    let (_id, status, wire) = dispatch_stream(&gw, "partial-stream").await?;
-    assert_eq!(
-        status,
-        StatusCode::OK,
-        "committed stream stays committed: {wire}"
-    );
-    assert!(
-        wire.contains("partial output"),
-        "payload must reach the client: {wire}"
-    );
-    assert_eq!(upstream.calls(), 1, "payload already delivered; no retry");
-    assert!(
-        wire.contains("\"finish_reason\":\"MALFORMED_FUNCTION_CALL\""),
-        "{wire}"
-    );
-
-    let rows = recv_logs(&mut logs, 1).await;
-    assert_eq!(rows[0].client_status_code, 200);
-    assert!(logs.try_recv().is_err(), "exactly one row");
+async fn text_thinking_or_tool_then_malformed_is_not_retried() -> anyhow::Result<()> {
+    for (subscription, stream) in [(false, true), (true, true), (true, false)] {
+        for (plain, wrapped, payload) in [
+            (
+                Reply::TextThenMalformed,
+                Reply::EnvelopedTextThenMalformed,
+                "partial output",
+            ),
+            (
+                Reply::ThinkingThenMalformed,
+                Reply::EnvelopedThinkingThenMalformed,
+                "partial thinking",
+            ),
+            (
+                Reply::ToolThenMalformed,
+                Reply::EnvelopedToolThenMalformed,
+                "lookup_weather",
+            ),
+        ] {
+            let (_dir, gw, mut logs) = setup().await?;
+            let reply = if subscription { wrapped } else { plain };
+            let healthy = if subscription {
+                Reply::EnvelopedHealthy
+            } else {
+                Reply::Healthy
+            };
+            let upstream = start_upstream(vec![reply, healthy]).await?;
+            let fallback = start_upstream(vec![healthy]).await?;
+            let provider = if subscription {
+                antigravity_provider(&gw, &upstream.url).await?
+            } else {
+                gemini_provider(&gw, &upstream.url).await?
+            };
+            let fallback_provider = if subscription {
+                antigravity_provider(&gw, &fallback.url).await?
+            } else {
+                gemini_provider(&gw, &fallback.url).await?
+            };
+            route(
+                &gw,
+                "partial-output",
+                provider.clone(),
+                fallback_targets(&provider, &fallback_provider),
+            )
+            .await?;
+            let body = if stream {
+                chat_stream_request("partial-output")
+            } else {
+                chat_non_stream_request("partial-output")
+            };
+            let (id, status, wire) = dispatch_request(&gw, body).await?;
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "{reply:?}/stream={stream}: existing behavior stays committed: {wire}"
+            );
+            assert!(
+                wire.contains(payload),
+                "payload must reach the client: {wire}"
+            );
+            assert!(
+                !wire.contains("recovered answer"),
+                "no healthy replay/fallback: {wire}"
+            );
+            assert_eq!(upstream.calls(), 1, "output exists; no same-target retry");
+            assert_eq!(fallback.calls(), 0, "output exists; no fallback");
+            if !stream {
+                let value: Value = serde_json::from_str(&wire)?;
+                // OpenAI's formatter normalizes any nonempty tool_calls to
+                // tool_calls; text/thinking preserve the upstream finish reason.
+                let reason = if plain == Reply::ToolThenMalformed {
+                    "tool_calls"
+                } else {
+                    "MALFORMED_FUNCTION_CALL"
+                };
+                assert_eq!(value["choices"][0]["finish_reason"], reason);
+            } else if plain != Reply::ToolThenMalformed {
+                assert!(
+                    wire.contains("\"finish_reason\":\"MALFORMED_FUNCTION_CALL\""),
+                    "{wire}"
+                );
+            }
+            let mut rows = recv_logs(&mut logs, 1).await;
+            assert_attempt_sequence(&mut rows, &id);
+            assert_eq!(rows[0].client_status_code, 200);
+            assert!(logs.try_recv().is_err(), "exactly one row");
+        }
+    }
     Ok(())
 }
 
 // ── 7. Failover rows persist with distinct primary keys ──────────────────────
 
-// The failed attempt's row and the answering target's row ride different
-// performance Attempts (one per dispatcher target iteration), each with its
+// Both failed attempt rows and the answering target's row ride different
+// performance Attempts (including the same-target replay), each with its
 // own log id. This test runs the real logging collector against the sqlite
 // database and reads the rows back from the table, guarding against any
 // primary-key collision rejecting the append batch.
@@ -953,14 +1409,14 @@ async fn malformed_failover_rows_persist_with_distinct_ids() -> anyhow::Result<(
 
     let (request_id, status, wire) = dispatch_stream(&gw, "malformed-persist").await?;
     assert_eq!(status, StatusCode::OK, "{wire}");
-    assert_eq!(broken.calls(), 1, "backend A called once");
+    assert_eq!(broken.calls(), 2, "backend A gets one retry");
     assert_eq!(healthy.calls(), 1, "backend B called once");
 
-    // The collector flushes on its 2s tick; poll the table until both the
-    // failed 502 row and the final 200 row are visible.
+    // The collector flushes on its 2s tick; poll the table until both failed
+    // 502 attempts and the final 200 attempt are visible.
     let mut rows = Vec::new();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
-    while rows.len() < 2 && tokio::time::Instant::now() < deadline {
+    while rows.len() < 3 && tokio::time::Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(200)).await;
         rows = storage
             .logs()
@@ -972,17 +1428,27 @@ async fn malformed_failover_rows_persist_with_distinct_ids() -> anyhow::Result<(
             .await?
             .items;
     }
-    assert_eq!(rows.len(), 2, "both failover rows must persist: {rows:?}");
-    assert_ne!(
-        rows[0].id, rows[1].id,
-        "rows must not share the primary key"
+    assert_eq!(
+        rows.len(),
+        3,
+        "retry and failover rows must persist: {rows:?}"
     );
+    let ids: std::collections::HashSet<_> = rows.iter().map(|row| &row.id).collect();
+    assert_eq!(ids.len(), 3, "rows must not share the primary key");
     let statuses: Vec<i32> = rows
         .iter()
         .filter_map(|row| row.client_status_code)
         .collect();
-    assert!(statuses.contains(&502), "failed attempt row: {statuses:?}");
-    assert!(statuses.contains(&200), "final success row: {statuses:?}");
+    assert_eq!(
+        statuses.iter().filter(|&&status| status == 502).count(),
+        2,
+        "failed attempts: {statuses:?}"
+    );
+    assert_eq!(
+        statuses.iter().filter(|&&status| status == 200).count(),
+        1,
+        "final success: {statuses:?}"
+    );
     for row in &rows {
         assert_eq!(row.client_request_id.as_deref(), Some(request_id.as_str()));
     }
