@@ -11,6 +11,7 @@ use crate::protocol::ids::{
     OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1, OPENAI_RESPONSES_V1, ProtocolId,
 };
 use crate::protocol::ir::AiRequest;
+use crate::protocol::{ExecutionKind, registry::ProtocolRegistry};
 
 use super::wire_patch::request_patch;
 use super::{ConversionPlan, ConversionPlanError, RequestConversionMode, ResponseConversionMode};
@@ -135,6 +136,17 @@ fn is_codex_consumer_vendor(vendor_id: &str, channel: &str) -> bool {
     vendor_id.eq_ignore_ascii_case("openai") && is_codex_consumer_channel(channel)
 }
 
+/// Raw-wire compatibility only understands registered JSON/HTTP codecs.
+/// Vendor-owned binary streams must be dispatched by their executor instead.
+fn json_http_pair(ingress: ProtocolId, egress: ProtocolId) -> bool {
+    let registry = ProtocolRegistry::global();
+    [ingress, egress].into_iter().all(|id| {
+        registry
+            .describe(&id)
+            .is_some_and(|descriptor| descriptor.execution == ExecutionKind::JsonHttp)
+    })
+}
+
 pub(crate) fn supports_raw_wire_compat(
     ingress: ProtocolId,
     egress: ProtocolId,
@@ -142,6 +154,9 @@ pub(crate) fn supports_raw_wire_compat(
     egress_base_url: &str,
     actual_model: &str,
 ) -> bool {
+    if !json_http_pair(ingress, egress) {
+        return false;
+    }
     let vendor_id = provider
         .vendor
         .as_deref()
@@ -209,6 +224,10 @@ pub(crate) fn resolve_raw_wire_compat(
         baseline_request,
         current_request,
     } = input;
+
+    if !json_http_pair(ingress, egress) {
+        return Ok(None);
+    }
 
     let vendor_id = provider
         .vendor
@@ -399,6 +418,43 @@ mod tests {
         let mut request = AiRequest::new(model, Vec::new());
         request.meta.source_protocol = Some(source);
         request
+    }
+
+    #[test]
+    fn vendor_streams_are_never_raw_wire_compat_candidates() {
+        use crate::protocol::ids::CURSOR_AGENT_RUN_V1;
+        let p = provider("cursor", "agent");
+        let baseline = request("model", ANTHROPIC_MESSAGES_2023_06_01);
+        for (ingress, egress) in [
+            (ANTHROPIC_MESSAGES_2023_06_01, CURSOR_AGENT_RUN_V1),
+            (CURSOR_AGENT_RUN_V1, OPENAI_RESPONSES_V1),
+            (CURSOR_AGENT_RUN_V1, CURSOR_AGENT_RUN_V1),
+        ] {
+            assert!(!json_http_pair(ingress, egress));
+            assert!(!supports_raw_wire_compat(
+                ingress,
+                egress,
+                &p,
+                &p.base_url,
+                "model"
+            ));
+            assert!(
+                resolve_raw_wire_compat(ResolveRawWireCompatInput {
+                    ingress,
+                    egress,
+                    provider: &p,
+                    egress_base_url: &p.base_url,
+                    actual_model: "model",
+                    client_stream: true,
+                    headers: &HeaderMap::new(),
+                    raw_body: b"not-json",
+                    baseline_request: &baseline,
+                    current_request: &baseline,
+                })
+                .unwrap()
+                .is_none()
+            );
+        }
     }
 
     #[test]

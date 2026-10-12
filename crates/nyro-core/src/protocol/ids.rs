@@ -2,7 +2,7 @@
 //!
 //! Canonical string form: `{protocol}/{name}/{version}`.
 //!
-//! - `protocol`: closed enum of protocol suites (`openai-compatible` / `openai-responses` / `anthropic-messages` / `google-gemini`).
+//! - `protocol`: closed enum of protocol suites (JSON/HTTP families plus egress-only `cursor-agent`).
 //! - `name`: wire-format endpoint name (`chat-completions` / `responses` / `messages` / `generate-content` / `embeddings`).
 //! - `version`: schema version as the vendor labels it (`v1`, `2023-06-01`, `v1beta`).
 //!
@@ -28,6 +28,8 @@ pub enum Protocol {
     AnthropicMessages,
     /// Google Generative AI (Gemini) protocol.
     GoogleGemini,
+    /// Cursor Agent Run protocol (egress-only, vendor-owned binary stream).
+    CursorAgent,
 }
 
 impl Protocol {
@@ -37,6 +39,7 @@ impl Protocol {
             Self::OpenAIResponses => "openai-responses",
             Self::AnthropicMessages => "anthropic-messages",
             Self::GoogleGemini => "google-gemini",
+            Self::CursorAgent => "cursor-agent",
         }
     }
 
@@ -46,6 +49,7 @@ impl Protocol {
             Self::OpenAIResponses => "OpenAI Responses",
             Self::AnthropicMessages => "Anthropic Messages",
             Self::GoogleGemini => "Google Gemini",
+            Self::CursorAgent => "Cursor Agent",
         }
     }
 }
@@ -69,6 +73,7 @@ impl FromStr for Protocol {
             "google-gemini" | "google-genai" | "google-generative-ai" | "gemini" | "google" => {
                 Ok(Self::GoogleGemini)
             }
+            "cursor-agent" => Ok(Self::CursorAgent),
             other => anyhow::bail!("unknown protocol: {other}"),
         }
     }
@@ -80,7 +85,7 @@ impl FromStr for Protocol {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ProtocolEndpoint {
     pub protocol: Protocol,
-    /// Endpoint name (kebab-case, matches the final path segment of the ingress route).
+    /// Endpoint name (kebab-case); egress-only endpoints need not have an ingress route.
     pub name: &'static str,
     /// Wire-format version string as the vendor labels it.
     pub version: &'static str,
@@ -97,8 +102,9 @@ impl ProtocolEndpoint {
 
     /// Look up the registered handler for this endpoint.
     ///
-    /// Panics only if no `inventory::submit!` registration exists — a
-    /// build-time invariant covered by `tests/protocol_registry.rs`.
+    /// Only JSON/HTTP endpoints have handlers. For capabilities or execution
+    /// selection use `ProtocolRegistry::describe` instead: egress-only vendor
+    /// endpoints deliberately have no handler and calling this on one panics.
     pub fn handler(self) -> &'static std::sync::Arc<dyn super::traits::EndpointHandler> {
         super::registry::ProtocolRegistry::global()
             .get(&self)
@@ -128,6 +134,13 @@ pub const ANTHROPIC_MESSAGES_2023_06_01: ProtocolEndpoint =
 
 pub const GOOGLE_GEMINI_GENERATE_CONTENT_V1BETA: ProtocolEndpoint =
     ProtocolEndpoint::new(Protocol::GoogleGemini, "generate-content", "v1beta");
+
+/// Cursor's native Agent Run endpoint. It is not an OpenAI-compatible API.
+pub const CURSOR_AGENT_RUN_V1: ProtocolEndpoint =
+    ProtocolEndpoint::new(Protocol::CursorAgent, "run", "v1");
+
+/// Cursor Agent uses a fixed service origin, not a configurable relay URL.
+pub const CURSOR_AGENT_BASE_URL: &str = "https://api2.cursor.sh";
 
 // ── Backward-compat type alias ────────────────────────────────────────────────
 
@@ -167,7 +180,7 @@ impl StreamCaps {
     };
 }
 
-/// Extended static capabilities of an `EndpointHandler`.
+/// Static semantic and transport capabilities of a registered endpoint.
 ///
 /// Describes what a specific `ProtocolEndpoint` can do.  The `lossy_default_reject`
 /// flag is consumed by `negotiator::negotiate` to decide whether to reject or
@@ -180,7 +193,7 @@ pub struct EndpointCapabilities {
     pub reasoning: bool,
     pub embeddings: bool,
     /// Force the upstream call to be made in streaming mode regardless of the
-    /// client's `stream` flag. Currently only true for OpenAI Responses API.
+    /// client's `stream` flag (e.g. OpenAI Responses and Cursor Agent Run).
     pub force_upstream_stream: bool,
     /// The encoder writes the actual model name into the request body rather
     /// than the URL path. Currently only true for Google Generate.
@@ -261,6 +274,25 @@ impl EndpointCapabilities {
     };
 }
 
+/// Initial Cursor adapter contract: text, client function tools, and reasoning
+/// are translated through IR. Images, structured output, deterministic sampling,
+/// and parallel tool calls are not promised by this adapter. Streaming is a
+/// vendor-owned framed binary transport, never upstream SSE or a JSON stream flag.
+pub const CURSOR_AGENT_CAPABILITIES: EndpointCapabilities = EndpointCapabilities {
+    streaming: true,
+    tools: true,
+    reasoning: true,
+    force_upstream_stream: true,
+    function_calling: true,
+    extended_reasoning: true,
+    stream: StreamCaps {
+        server_sent_events: false,
+        usage_in_stream: false,
+        requires_stream_flag: false,
+    },
+    ..EndpointCapabilities::EMPTY
+};
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -287,6 +319,7 @@ mod tests {
             OPENAI_COMPATIBLE_EMBEDDINGS_V1.to_string(),
             "openai-compatible/embeddings/v1"
         );
+        assert_eq!(CURSOR_AGENT_RUN_V1.to_string(), "cursor-agent/run/v1");
     }
 
     #[test]
@@ -296,6 +329,7 @@ mod tests {
             Protocol::OpenAIResponses,
             Protocol::AnthropicMessages,
             Protocol::GoogleGemini,
+            Protocol::CursorAgent,
         ] {
             assert_eq!(p.as_str().parse::<Protocol>().unwrap(), p);
         }

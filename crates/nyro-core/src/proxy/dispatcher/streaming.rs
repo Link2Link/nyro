@@ -39,6 +39,77 @@ pub(super) fn validate_decoded_batch(
     Ok(deltas)
 }
 
+/// Native sources emit `Done` only after wire verification, but the worker may
+/// still report a trailing transport failure. Hold the terminal out of the
+/// formatter/tool bridge until source EOF; otherwise those consumers can emit a
+/// successful terminal or flush partial custom input before the failure arrives.
+/// This is conversion state, NOT performance evidence (only the wire worker may
+/// establish that evidence).
+#[derive(Default)]
+pub(super) struct IrTerminalState {
+    done: Option<AiStreamDelta>,
+    failed: bool,
+}
+
+impl IrTerminalState {
+    pub(super) fn has_done(&self) -> bool {
+        self.done.is_some()
+    }
+
+    pub(super) fn accept(
+        &mut self,
+        deltas: Vec<AiStreamDelta>,
+    ) -> anyhow::Result<Vec<AiStreamDelta>> {
+        if self.failed {
+            anyhow::bail!("Native IR stream has already failed");
+        }
+        let result = (|| {
+            // Validate the entire batch before admitting any payload or terminal.
+            let deltas = validate_decoded_batch(Ok(deltas))?;
+            let mut seen_done = self.has_done();
+            for delta in &deltas {
+                match delta {
+                    AiStreamDelta::Done { stop_reason } => {
+                        if seen_done || stop_reason.eq_ignore_ascii_case("error") {
+                            anyhow::bail!("Invalid native IR terminal");
+                        }
+                        seen_done = true;
+                    }
+                    AiStreamDelta::Usage(_) => {}
+                    _ if seen_done => anyhow::bail!("Native IR payload after terminal"),
+                    _ => {}
+                }
+            }
+            let mut output = Vec::with_capacity(deltas.len());
+            for delta in deltas {
+                if matches!(delta, AiStreamDelta::Done { .. }) {
+                    self.done = Some(delta);
+                } else {
+                    output.push(delta);
+                }
+            }
+            Ok(output)
+        })();
+        if result.is_err() {
+            self.failed = true;
+        }
+        result
+    }
+
+    pub(super) fn finish(&mut self) -> anyhow::Result<Vec<AiStreamDelta>> {
+        if self.failed {
+            anyhow::bail!("Native IR stream has already failed");
+        }
+        match self.done.take() {
+            Some(done) => Ok(vec![done]),
+            None => {
+                self.failed = true;
+                anyhow::bail!("Native IR stream ended without a verified Done");
+            }
+        }
+    }
+}
+
 /// Owned `OnResponse` hook state for a spawned streaming task.
 ///
 /// The spawned task outlives the handler borrow, so the request context, IR,
@@ -118,6 +189,99 @@ impl StreamHookState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_terminal_requires_done_and_rejects_error_atomically() {
+        let mut terminal = IrTerminalState::default();
+        assert!(
+            terminal
+                .accept(vec![AiStreamDelta::TextDelta("hi".into())])
+                .is_ok()
+        );
+        assert!(
+            terminal.finish().is_err(),
+            "EOF alone must not become success"
+        );
+        assert!(
+            terminal
+                .accept(vec![AiStreamDelta::Done {
+                    stop_reason: "stop".into()
+                }])
+                .is_err(),
+            "failure is sticky"
+        );
+
+        let mut terminal = IrTerminalState::default();
+        assert!(
+            terminal
+                .accept(vec![
+                    AiStreamDelta::TextDelta("do not expose".into()),
+                    AiStreamDelta::Done {
+                        stop_reason: "stop".into()
+                    },
+                    AiStreamDelta::UnexpectedEof,
+                ])
+                .is_err()
+        );
+        assert!(!terminal.has_done());
+        assert!(terminal.finish().is_err());
+    }
+
+    #[test]
+    fn native_done_is_held_until_eof_and_trailing_usage_survives() {
+        let mut terminal = IrTerminalState::default();
+        let deltas = terminal
+            .accept(vec![
+                AiStreamDelta::TextDelta("hi".into()),
+                AiStreamDelta::Done {
+                    stop_reason: "tool_calls".into(),
+                },
+            ])
+            .unwrap();
+        assert_eq!(deltas.len(), 1);
+        assert!(terminal.has_done());
+        assert_eq!(
+            terminal
+                .accept(vec![AiStreamDelta::Usage(Default::default())])
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            matches!(terminal.finish().unwrap().as_slice(), [AiStreamDelta::Done { stop_reason }] if stop_reason == "tool_calls")
+        );
+        assert!(
+            terminal.finish().is_err(),
+            "terminal can only be consumed once"
+        );
+    }
+
+    #[test]
+    fn native_error_terminal_and_post_terminal_payload_are_not_success() {
+        for deltas in [
+            vec![AiStreamDelta::Done {
+                stop_reason: "ERROR".into(),
+            }],
+            vec![
+                AiStreamDelta::Done {
+                    stop_reason: "stop".into(),
+                },
+                AiStreamDelta::TextDelta("late".into()),
+            ],
+            vec![
+                AiStreamDelta::Done {
+                    stop_reason: "stop".into(),
+                },
+                AiStreamDelta::Done {
+                    stop_reason: "stop".into(),
+                },
+            ],
+        ] {
+            let mut terminal = IrTerminalState::default();
+            assert!(terminal.accept(deltas).is_err());
+            assert!(terminal.finish().is_err());
+        }
+    }
 
     #[test]
     fn invalid_call_discards_the_whole_decoded_batch() {

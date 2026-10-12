@@ -306,6 +306,8 @@ NYRO_WEBUI_DIR=/path/to/dist       # 从外部目录提供 WebUI（不填则使�
 
 进入 **Providers → New**，填写 Provider 的 Base URL 和 API Key。Nyro 会根据 URL 自动识别协议。
 
+**Cursor（实验性）：**选择 Cursor 预设，打开授权链接并使用自己的 Cursor 账号确认。Nyro 会轮询授权结果，无需粘贴回调码、安装 Cursor CLI 或运行额外代理。在页面显示的授权有效期内保存 provider，发现该账号的可用模型后创建路由。同一 Cursor 账号只绑定一个 provider；复制项不含凭据且默认禁用，须重新授权。这是非官方适配，当前支持文本与串行函数工具交接；system 仅尽力保留，用量可能未知，不支持图片，也不强制执行 `max_tokens`。离线测试不代表真实账号已验证可用，启用前请阅读[实现与限制](<docs/design/cursor-provider.CN.md>)。
+
 **2. 创建路由**
 
 进入 **Routes → New**，设置虚拟模型名（例如 `gpt-4o`），选择 Provider 与目标模型。需要时可开启访问控制。

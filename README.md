@@ -307,6 +307,8 @@ NYRO_WEBUI_DIR=/path/to/dist       # Serve WebUI from external directory instead
 
 Go to **Providers → New**. Enter your provider's Base URL and API key. Nyro auto-detects the protocol from the URL.
 
+**Cursor (Experimental):** select the Cursor preset instead, open its authorization link, and confirm with your own Cursor account. Nyro polls for approval; no callback code, Cursor CLI, or secondary proxy is required. Save the provider within the displayed authorization window, discover its account-specific models, then configure a route. One Cursor account binds to one provider; copies contain no credentials and remain disabled until authorized. This non-official adapter currently supports text and serial function-tool handoffs, with best-effort system instructions and potentially unknown usage. It does not support images or enforce `max_tokens`. Offline tests do not establish live-account compatibility. See the [implementation and limitations](<docs/design/cursor-provider.md>) before enabling it.
+
 **2. Create a Route**
 
 Go to **Routes → New**. Set a virtual model name (e.g. `gpt-4o`), select your provider and target model. Enable access control if needed.

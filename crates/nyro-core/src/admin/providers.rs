@@ -73,6 +73,9 @@ fn build_model_probe_request(
     // Reasoning models (e.g. glm-5.3) burn the whole completion budget on
     // thinking before emitting visible text. 1024 leaves room for both.
     let (path, mut body) = match suite {
+        crate::protocol::ids::Protocol::CursorAgent => {
+            anyhow::bail!("Cursor probes require native AgentService execution")
+        }
         crate::protocol::ids::Protocol::OpenAICompatible => (
             "/v1/chat/completions",
             serde_json::json!({
@@ -870,6 +873,31 @@ fn normalize_protocol_config(
     };
     let registry = crate::protocol::registry::ProtocolRegistry::global();
 
+    if registry.parse_protocol(default_protocol)
+        == Some(crate::protocol::ids::Protocol::CursorAgent)
+    {
+        anyhow::ensure!(
+            mode == PROVIDER_PROTOCOL_MODE_FIXED,
+            "Cursor does not support adaptive protocol mode"
+        );
+        anyhow::ensure!(
+            endpoints.is_empty(),
+            "Cursor does not support protocol endpoints"
+        );
+        anyhow::ensure!(auth_mode == "oauth", "Cursor requires OAuth authentication");
+        anyhow::ensure!(
+            api_key.trim().is_empty(),
+            "Cursor does not support API keys"
+        );
+        return Ok(NormalizedProtocolConfig {
+            mode: mode.to_string(),
+            default_protocol: crate::protocol::ids::CURSOR_AGENT_RUN_V1.to_string(),
+            base_url: normalize_endpoint_url(base_url)?,
+            api_key: String::new(),
+            endpoints: Vec::new(),
+        });
+    }
+
     if mode == PROVIDER_PROTOCOL_MODE_FIXED {
         let protocol = registry
             .parse_protocol(default_protocol)
@@ -1397,6 +1425,97 @@ mod probe_selection_tests {
     }
 }
 
+/// Validate the unredacted input before OAuth normalization can silently discard
+/// forbidden keys/endpoints. This also rejects Cursor protocols on other vendors.
+fn validate_provider_input(input: &CreateProvider) -> anyhow::Result<()> {
+    let provider = Provider {
+        id: String::new(),
+        name: input.name.clone(),
+        vendor: input.vendor.clone(),
+        protocol: input.protocol.clone(),
+        base_url: input.base_url.clone(),
+        protocol_mode: input.protocol_mode.clone(),
+        protocol_endpoints: input
+            .protocol_endpoints
+            .iter()
+            .map(|endpoint| ProviderProtocolEndpoint {
+                id: String::new(),
+                provider_id: String::new(),
+                protocol: endpoint.protocol.clone(),
+                base_url: endpoint.base_url.clone(),
+                api_key: endpoint.api_key.clone(),
+                auth_scheme: endpoint.auth_scheme.clone(),
+                is_enabled: endpoint.is_enabled,
+                priority: endpoint.priority,
+                test_status: String::new(),
+                test_error: None,
+                tested_at: None,
+                created_at: String::new(),
+                updated_at: String::new(),
+            })
+            .collect(),
+        keys: input
+            .keys
+            .iter()
+            .map(|key| ProviderKey {
+                id: String::new(),
+                provider_id: String::new(),
+                name: key.name.clone(),
+                api_key: key.api_key.clone(),
+                protocol: key.protocol.clone(),
+                base_url: key.base_url.clone(),
+                is_enabled: key.is_enabled,
+                priority: key.priority,
+                manual_models: key.manual_models.clone(),
+                models_snapshot: None,
+                last_probe_at: None,
+                probe_error: None,
+                created_at: String::new(),
+                updated_at: String::new(),
+            })
+            .collect(),
+        preset_key: input.preset_key.clone(),
+        channel: input.channel.clone(),
+        models_source: input.models_source.clone(),
+        static_models: input.static_models.clone(),
+        api_key: input.api_key.clone(),
+        auth_mode: input.auth_mode.clone(),
+        use_proxy: input.use_proxy,
+        fast_mode: input.fast_mode,
+        last_test_success: None,
+        last_test_at: None,
+        is_enabled: false,
+        created_at: String::new(),
+        updated_at: String::new(),
+    };
+    validate_admin_provider(&provider)
+}
+
+fn validate_admin_provider(provider: &Provider) -> anyhow::Result<()> {
+    crate::protocol::ProviderProtocols::validate_provider(provider)?;
+    if is_cursor_provider(provider) {
+        anyhow::ensure!(
+            provider
+                .vendor
+                .as_deref()
+                .is_some_and(|v| v.trim().eq_ignore_ascii_case("cursor")),
+            "Cursor requires vendor=cursor"
+        );
+        anyhow::ensure!(
+            provider
+                .preset_key
+                .as_deref()
+                .is_some_and(|v| v.trim().eq_ignore_ascii_case("cursor")),
+            "Cursor requires preset=cursor"
+        );
+        anyhow::ensure!(
+            provider.api_key.trim().is_empty(),
+            "Cursor does not support API keys"
+        );
+    }
+    Ok(())
+}
+
 impl AdminService {
     // ── Providers ──
 
@@ -1417,6 +1536,7 @@ impl AdminService {
             .ok_or_else(|| anyhow::anyhow!("provider not found: {id}"))
     }
     pub async fn create_provider(&self, input: CreateProvider) -> anyhow::Result<Provider> {
+        validate_provider_input(&input)?;
         let name = normalize_name(&input.name, "provider name")?;
         self.ensure_provider_name_unique(None, &name).await?;
         let vendor = normalize_vendor(input.vendor.as_deref());
@@ -1492,6 +1612,7 @@ impl AdminService {
         options: CopyProviderOptions,
     ) -> anyhow::Result<Provider> {
         let original = self.get_provider(id).await?;
+        let cursor = is_cursor_provider(&original);
         // Prefix ratings are provider-independent: the copy shares them automatically.
         let name = self.next_provider_copy_name(&original.name).await?;
         let copied = self
@@ -1501,37 +1622,49 @@ impl AdminService {
                 protocol: original.protocol.clone(),
                 base_url: original.base_url.clone(),
                 protocol_mode: original.protocol_mode.clone(),
-                protocol_endpoints: original
-                    .protocol_endpoints
-                    .iter()
-                    .map(|endpoint| CreateProviderProtocolEndpoint {
-                        protocol: endpoint.protocol.clone(),
-                        base_url: endpoint.base_url.clone(),
-                        api_key: endpoint.api_key.clone(),
-                        auth_scheme: endpoint.auth_scheme.clone(),
-                        is_enabled: endpoint.is_enabled,
-                        priority: endpoint.priority,
-                    })
-                    .collect(),
-                keys: original
-                    .keys
-                    .iter()
-                    .map(|key| UpsertProviderKey {
-                        id: None,
-                        name: key.name.clone(),
-                        api_key: key.api_key.clone(),
-                        protocol: key.protocol.clone(),
-                        base_url: key.base_url.clone(),
-                        is_enabled: key.is_enabled,
-                        priority: key.priority,
-                        manual_models: key.manual_models.clone(),
-                    })
-                    .collect(),
+                protocol_endpoints: if cursor {
+                    Vec::new()
+                } else {
+                    original
+                        .protocol_endpoints
+                        .iter()
+                        .map(|endpoint| CreateProviderProtocolEndpoint {
+                            protocol: endpoint.protocol.clone(),
+                            base_url: endpoint.base_url.clone(),
+                            api_key: endpoint.api_key.clone(),
+                            auth_scheme: endpoint.auth_scheme.clone(),
+                            is_enabled: endpoint.is_enabled,
+                            priority: endpoint.priority,
+                        })
+                        .collect()
+                },
+                keys: if cursor {
+                    Vec::new()
+                } else {
+                    original
+                        .keys
+                        .iter()
+                        .map(|key| UpsertProviderKey {
+                            id: None,
+                            name: key.name.clone(),
+                            api_key: key.api_key.clone(),
+                            protocol: key.protocol.clone(),
+                            base_url: key.base_url.clone(),
+                            is_enabled: key.is_enabled,
+                            priority: key.priority,
+                            manual_models: key.manual_models.clone(),
+                        })
+                        .collect()
+                },
                 preset_key: original.preset_key.clone(),
                 channel: original.channel.clone(),
                 models_source: original.models_source.clone(),
                 static_models: original.static_models.clone(),
-                api_key: original.api_key.clone(),
+                api_key: if cursor {
+                    String::new()
+                } else {
+                    original.api_key.clone()
+                },
                 auth_mode: original.auth_mode.clone(),
                 use_proxy: original.use_proxy,
                 fast_mode: original.fast_mode,
@@ -1547,7 +1680,9 @@ impl AdminService {
             )
             .await?;
 
-        let copied = if original.effective_auth_mode() == "oauth" {
+        // A Cursor account belongs to exactly one provider. A copy must be
+        // explicitly connected to a different account, never clone its tokens.
+        let copied = if !cursor && original.effective_auth_mode() == "oauth" {
             match self
                 .gw
                 .storage
@@ -1682,6 +1817,44 @@ impl AdminService {
                 })
                 .collect()
         });
+        validate_provider_input(&CreateProvider {
+            name: name.clone(),
+            vendor: vendor.clone(),
+            protocol: raw_protocol.clone(),
+            base_url: raw_base_url.clone(),
+            protocol_mode: protocol_mode.to_string(),
+            protocol_endpoints: raw_endpoints.clone(),
+            keys: input.keys.clone().unwrap_or_else(|| {
+                current
+                    .keys
+                    .iter()
+                    .map(|key| UpsertProviderKey {
+                        id: Some(key.id.clone()),
+                        name: key.name.clone(),
+                        api_key: key.api_key.clone(),
+                        protocol: key.protocol.clone(),
+                        base_url: key.base_url.clone(),
+                        is_enabled: key.is_enabled,
+                        priority: key.priority,
+                        manual_models: key.manual_models.clone(),
+                    })
+                    .collect()
+            }),
+            preset_key: preset_key.clone(),
+            channel: channel.clone(),
+            models_source: models_source.clone(),
+            static_models: static_models.clone(),
+            api_key: input
+                .api_key
+                .clone()
+                .unwrap_or_else(|| current.api_key.clone()),
+            auth_mode: input
+                .auth_mode
+                .clone()
+                .unwrap_or_else(|| current.auth_mode.clone()),
+            use_proxy: input.use_proxy.unwrap_or(current.use_proxy),
+            fast_mode: input.fast_mode.unwrap_or(current.fast_mode),
+        })?;
         let protocol = normalize_protocol_config(
             protocol_mode,
             &raw_protocol,
@@ -1868,6 +2041,23 @@ impl AdminService {
     }
     pub async fn test_provider(&self, id: &str) -> anyhow::Result<TestResult> {
         let provider = self.get_provider(id).await?;
+        if is_cursor_provider(&provider) {
+            let start = Instant::now();
+            // Force a fresh authenticated unary call; a cached directory or a
+            // successful GET of the host says nothing about account access.
+            let outcome = self.cursor_provider_models(&provider, true).await;
+            let result = TestResult {
+                success: outcome.is_ok(),
+                latency_ms: start.elapsed().as_millis() as u64,
+                model: None,
+                error: outcome.err().map(|error| error.to_string()),
+                endpoints: Vec::new(),
+            };
+            self.record_provider_test_result(&provider.id, &result)
+                .await?;
+            return Ok(result);
+        }
+        validate_admin_provider(&provider)?;
         self.gw
             .clear_ollama_capability_cache_for_provider(&provider.id)
             .await;
@@ -2268,6 +2458,7 @@ impl AdminService {
 
         let selection = normalize_probe_selection(models)?;
         let provider = self.get_provider(id).await?;
+        validate_admin_provider(&provider)?;
         let models = match selection {
             Some(models) => models,
             None => {
@@ -2278,6 +2469,10 @@ impl AdminService {
                 models
             }
         };
+
+        if is_cursor_provider(&provider) {
+            return self.probe_cursor_models(&provider, models).await;
+        }
 
         // Pick the probe endpoint: adaptive providers probe through the
         // endpoint matching their configured default protocol
@@ -2523,6 +2718,51 @@ impl AdminService {
         })
     }
 
+    /// Paid runs are only initiated by the explicit model-test API, never by
+    /// connection tests or model/capability discovery. Bound both count and
+    /// concurrency; runtime::probe supplies the per-run 30-second deadline.
+    async fn probe_cursor_models(
+        &self,
+        provider: &Provider,
+        models: Vec<String>,
+    ) -> anyhow::Result<ProviderModelProbeOutcome> {
+        anyhow::ensure!(
+            models.len() <= 16,
+            "Cursor model probes are limited to 16 models per request; select a smaller batch"
+        );
+        let runtime = self.resolve_provider_runtime(provider).await?;
+        let credential = runtime
+            .credential
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Cursor OAuth credential is missing"))?;
+        let protocol = crate::protocol::ids::CURSOR_AGENT_RUN_V1.to_string();
+        let mut results = Vec::with_capacity(models.len());
+        for model in models {
+            let start = Instant::now();
+            let outcome =
+                crate::provider::cursor::probe(&self.gw, provider, credential, &model).await;
+            let success = outcome.is_ok();
+            results.push(ProviderModelProbeResult {
+                model,
+                success,
+                error: outcome.err().map(|error| error.to_string()),
+                latency_ms: start.elapsed().as_millis() as u64,
+                protocol: protocol.clone(),
+                reply: success.then(|| "[completed]".to_string()),
+                quota_remaining: None,
+                quota_resets_at: None,
+            });
+        }
+        results.sort_by(|a, b| a.model.cmp(&b.model));
+        Ok(ProviderModelProbeOutcome {
+            meta: ProviderModelProbeMeta {
+                protocol,
+                base_url: provider.base_url.clone(),
+            },
+            results,
+        })
+    }
+
     async fn record_provider_test_result(
         &self,
         provider_id: &str,
@@ -2655,6 +2895,7 @@ impl AdminService {
         id: &str,
     ) -> anyhow::Result<Vec<ProviderKeyProbeStatus>> {
         let provider = self.get_provider(id).await?;
+        validate_admin_provider(&provider)?;
         if !provider.has_key_pool() {
             anyhow::bail!("provider has no key pool configured");
         }
@@ -2705,7 +2946,29 @@ impl AdminService {
         Ok(outcomes)
     }
 
+    async fn cursor_provider_models(
+        &self,
+        provider: &Provider,
+        force: bool,
+    ) -> anyhow::Result<Vec<String>> {
+        validate_admin_provider(provider)?;
+        let runtime = self.resolve_provider_runtime(provider).await?;
+        let credential = runtime
+            .credential
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Cursor OAuth credential is missing"))?;
+        // Both directory entry points share the exact same native catalog used
+        // by dispatch; no HTTP GET, static fallback, aliases, or guessed IDs.
+        let models =
+            crate::provider::cursor::discover_models(&self.gw, provider, credential, force).await?;
+        Ok(models.into_iter().map(|model| model.id).collect())
+    }
+
     async fn fetch_provider_models(&self, provider: &Provider) -> anyhow::Result<Vec<String>> {
+        validate_admin_provider(provider)?;
+        if is_cursor_provider(provider) {
+            return self.cursor_provider_models(provider, true).await;
+        }
         // Key-pool providers route discovery through the pool snapshots (see
         // discover_provider_models); the runtime credential below is the
         // provider-level key, which an active pool deliberately ignores.
@@ -2838,6 +3101,10 @@ impl AdminService {
         provider: &Provider,
         require_catalog: bool,
     ) -> anyhow::Result<Vec<String>> {
+        validate_admin_provider(provider)?;
+        if is_cursor_provider(provider) {
+            return self.cursor_provider_models(provider, require_catalog).await;
+        }
         // Key-pool providers: the per-key snapshots are the catalog. Union
         // every informed key's effective model set; when no key has ever been
         // probed, fall back to a single-key live discovery with the
@@ -3022,6 +3289,10 @@ impl AdminService {
         provider: &Provider,
         model: &str,
     ) -> anyhow::Result<ModelCapabilities> {
+        validate_admin_provider(provider)?;
+        if is_cursor_provider(provider) {
+            return Ok(cursor_model_capabilities(&self.gw.config.data_dir, model));
+        }
         let mut caps = match preset_capabilities_source(provider) {
             CapabilitiesSource::ModelsDev(vendor_key) => {
                 let matched =
@@ -3743,5 +4014,337 @@ mod adaptive_protocol_tests {
         let error =
             ensure_adaptive_provider_supported("adaptive", Some("vertexai"), None).unwrap_err();
         assert!(error.to_string().contains("does not support Vertex AI"));
+    }
+}
+
+#[cfg(test)]
+mod cursor_admin_tests {
+    use super::*;
+
+    fn input() -> CreateProvider {
+        CreateProvider {
+            name: "Cursor".into(),
+            vendor: Some("cursor".into()),
+            preset_key: Some("cursor".into()),
+            channel: Some("agent".into()),
+            protocol: "cursor-agent/run/v1".into(),
+            protocol_mode: "fixed".into(),
+            base_url: "https://api2.cursor.sh".into(),
+            auth_mode: "oauth".into(),
+            api_key: String::new(),
+            keys: vec![],
+            protocol_endpoints: vec![],
+            models_source: None,
+            static_models: None,
+            use_proxy: false,
+            fast_mode: false,
+        }
+    }
+
+    #[test]
+    fn cursor_config_preserves_canonical_native_endpoint_without_json_handlers() {
+        let input = input();
+        validate_provider_input(&input).unwrap();
+        let normalized = normalize_protocol_config(
+            &input.protocol_mode,
+            &input.protocol,
+            &input.base_url,
+            &input.api_key,
+            &input.auth_mode,
+            input.protocol_endpoints,
+        )
+        .unwrap();
+        assert_eq!(normalized.default_protocol, "cursor-agent/run/v1");
+        assert!(normalized.endpoints.is_empty());
+        assert!(
+            crate::protocol::registry::ProtocolRegistry::global()
+                .get(&crate::protocol::ids::CURSOR_AGENT_RUN_V1)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn cursor_validation_rejects_invalid_identity_transport_and_auth_before_storage() {
+        let changes: Vec<(&str, Box<dyn Fn(&mut CreateProvider)>)> = vec![
+            ("vendor", Box::new(|p| p.vendor = Some("openai".into()))),
+            ("preset", Box::new(|p| p.preset_key = Some("openai".into()))),
+            ("channel", Box::new(|p| p.channel = Some("default".into()))),
+            (
+                "protocol",
+                Box::new(|p| p.protocol = "openai-compatible".into()),
+            ),
+            (
+                "adaptive",
+                Box::new(|p| p.protocol_mode = "adaptive".into()),
+            ),
+            (
+                "origin",
+                Box::new(|p| p.base_url = "https://example.invalid".into()),
+            ),
+            ("oauth", Box::new(|p| p.auth_mode = "apikey".into())),
+            ("api key", Box::new(|p| p.api_key = "forbidden".into())),
+            (
+                "key pool",
+                Box::new(|p| {
+                    p.keys.push(UpsertProviderKey {
+                        id: None,
+                        name: "forbidden".into(),
+                        api_key: "secret".into(),
+                        protocol: None,
+                        base_url: None,
+                        is_enabled: false,
+                        priority: 0,
+                        manual_models: None,
+                    })
+                }),
+            ),
+            (
+                "endpoints",
+                Box::new(|p| {
+                    p.protocol_endpoints.push(CreateProviderProtocolEndpoint {
+                        protocol: "openai-compatible/chat-completions/v1".into(),
+                        base_url: "https://example.invalid".into(),
+                        api_key: "secret".into(),
+                        auth_scheme: "bearer".into(),
+                        is_enabled: false,
+                        priority: 0,
+                    })
+                }),
+            ),
+        ];
+        for (label, change) in changes {
+            let mut candidate = input();
+            change(&mut candidate);
+            assert!(
+                validate_provider_input(&candidate).is_err(),
+                "accepted {label}"
+            );
+        }
+    }
+
+    #[test]
+    fn cursor_cannot_hide_in_other_vendors_endpoints_or_key_pins() {
+        let mut candidate = input();
+        candidate.vendor = Some("openai".into());
+        candidate.preset_key = Some("openai".into());
+        candidate.protocol = "openai-compatible".into();
+        candidate.auth_mode = "apikey".into();
+        candidate.api_key = "normal-key".into();
+        validate_provider_input(&candidate).unwrap();
+        candidate.keys.push(UpsertProviderKey {
+            id: None,
+            name: "native".into(),
+            api_key: "secret".into(),
+            protocol: Some("cursor-agent/run/v1".into()),
+            base_url: None,
+            is_enabled: false,
+            priority: 0,
+            manual_models: None,
+        });
+        assert!(validate_provider_input(&candidate).is_err());
+        candidate.keys.clear();
+        candidate
+            .protocol_endpoints
+            .push(CreateProviderProtocolEndpoint {
+                protocol: "cursor-agent/run/v1".into(),
+                base_url: "https://api2.cursor.sh".into(),
+                api_key: String::new(),
+                auth_scheme: "none".into(),
+                is_enabled: false,
+                priority: 0,
+            });
+        assert!(validate_provider_input(&candidate).is_err());
+    }
+
+    async fn admin() -> AdminService {
+        // The standalone memory store intentionally rejects provider writes.
+        // Use a unique disposable SQLite database for these mutation tests.
+        let (gw, _) = Gateway::new(crate::config::GatewayConfig {
+            data_dir: std::env::temp_dir()
+                .join(format!("nyro-cursor-admin-{}", uuid::Uuid::new_v4())),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        gw.admin()
+    }
+
+    #[tokio::test]
+    async fn cursor_admin_update_rejects_invalid_config_without_changing_storage() {
+        let admin = admin().await;
+        let provider = admin.create_provider(input()).await.unwrap();
+        assert!(provider.protocol_endpoints.is_empty());
+        for update in [
+            UpdateProvider {
+                vendor: Some("openai".into()),
+                ..Default::default()
+            },
+            UpdateProvider {
+                channel: Some("default".into()),
+                ..Default::default()
+            },
+            UpdateProvider {
+                auth_mode: Some("apikey".into()),
+                ..Default::default()
+            },
+            UpdateProvider {
+                api_key: Some("forbidden".into()),
+                ..Default::default()
+            },
+            UpdateProvider {
+                protocol_mode: Some("adaptive".into()),
+                ..Default::default()
+            },
+            UpdateProvider {
+                base_url: Some("http://127.0.0.1:1".into()),
+                ..Default::default()
+            },
+        ] {
+            assert!(admin.update_provider(&provider.id, update).await.is_err());
+        }
+        let stored = admin.get_provider(&provider.id).await.unwrap();
+        validate_admin_provider(&stored).unwrap();
+        assert_eq!(stored.protocol, "cursor-agent/run/v1");
+        assert!(stored.protocol_endpoints.is_empty());
+    }
+
+    #[tokio::test]
+    async fn cursor_missing_credentials_fail_connection_and_both_catalog_paths_without_fallback() {
+        let admin = admin().await;
+        let mut candidate = input();
+        candidate.static_models = Some("fake-model".into());
+        candidate.models_source = Some("http://127.0.0.1:1/models".into());
+        let provider = admin.create_provider(candidate).await.unwrap();
+        assert!(resolve_models_endpoint(&provider).is_none());
+        for result in [
+            admin.fetch_provider_models(&provider).await,
+            admin.discover_provider_models(&provider, false).await,
+            admin.discover_provider_models(&provider, true).await,
+        ] {
+            assert!(result.unwrap_err().to_string().contains("credential"));
+        }
+        let connection = admin.test_provider(&provider.id).await.unwrap();
+        assert!(!connection.success);
+        assert!(connection.error.unwrap().contains("credential"));
+        assert_eq!(
+            admin
+                .get_provider(&provider.id)
+                .await
+                .unwrap()
+                .last_test_success,
+            Some(false)
+        );
+        // Even unauthenticated callers cannot trigger an unbounded paid batch.
+        let error = admin
+            .probe_provider_models(
+                &provider.id,
+                Some((0..17).map(|i| format!("model-{i}")).collect()),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("limited to 16"));
+    }
+
+    #[tokio::test]
+    async fn cursor_copy_is_disabled_configuration_only_even_with_legacy_secrets() {
+        let admin = admin().await;
+        let provider = admin.create_provider(input()).await.unwrap();
+        admin
+            .gw
+            .storage
+            .oauth_credentials()
+            .upsert(
+                &provider.id,
+                UpsertOAuthCredential {
+                    driver_key: "cursor".into(),
+                    scheme: "oauth2".into(),
+                    access_token: "never-use-original-access-token".into(),
+                    refresh_token: Some("never-copy-refresh-token".into()),
+                    expires_at: Some("2999-01-01T00:00:00Z".into()),
+                    subject_id: Some("cursor-account".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        // Simulate old/imported secret fields without going through the strict admin API.
+        admin
+            .gw
+            .storage
+            .providers()
+            .update(
+                &provider.id,
+                UpdateProvider {
+                    api_key: Some("legacy-api-secret".into()),
+                    protocol_endpoints: Some(vec![CreateProviderProtocolEndpoint {
+                        protocol: "cursor-agent/run/v1".into(),
+                        base_url: "https://api2.cursor.sh".into(),
+                        api_key: "legacy-endpoint-secret".into(),
+                        auth_scheme: "auto".into(),
+                        is_enabled: false,
+                        priority: 0,
+                    }]),
+                    keys: Some(vec![UpsertProviderKey {
+                        id: None,
+                        name: "legacy-key".into(),
+                        api_key: "legacy-pool-secret".into(),
+                        protocol: None,
+                        base_url: None,
+                        is_enabled: false,
+                        priority: 0,
+                        manual_models: None,
+                    }]),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let copy = admin.copy_provider(&provider.id).await.unwrap();
+        assert!(!copy.is_enabled);
+        assert!(copy.api_key.is_empty());
+        assert!(copy.keys.is_empty());
+        assert!(copy.protocol_endpoints.is_empty());
+        validate_admin_provider(&copy).unwrap();
+        assert!(
+            admin
+                .gw
+                .storage
+                .oauth_credentials()
+                .get(&copy.id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            admin
+                .gw
+                .storage
+                .oauth_credentials()
+                .get(&provider.id)
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn cursor_never_builds_a_generic_json_model_probe() {
+        assert!(
+            build_model_probe_request(
+                crate::protocol::ids::Protocol::CursorAgent,
+                "https://api2.cursor.sh",
+                "",
+                "none",
+                &HeaderMap::new(),
+                "exact-model",
+                false,
+                Some("agent"),
+                false,
+                None,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("native AgentService")
+        );
     }
 }

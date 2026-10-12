@@ -137,49 +137,51 @@ struct SqliteOAuthCredentialStore {
     pool: SqlitePool,
 }
 
-#[async_trait]
-impl OAuthCredentialStore for SqliteOAuthCredentialStore {
-    async fn get(&self, provider_id: &str) -> anyhow::Result<Option<OAuthCredential>> {
-        let row = sqlx::query_as::<_, OAuthCredential>(
-            r#"SELECT provider_id, driver_key, scheme, access_token, refresh_token,
-                      expires_at, resource_url, subject_id, scopes, meta,
-                      status, status_version, last_error, last_refresh_at,
-                      created_at, updated_at
-               FROM provider_oauth_credentials WHERE provider_id = ?"#,
-        )
-        .bind(provider_id)
-        .fetch_optional(&self.pool)
-        .await?;
-        Ok(row)
-    }
+// Keep projections identical for SELECT and RETURNING snapshots.
+const OAUTH_COLUMNS: &str = "provider_id, driver_key, scheme, access_token, refresh_token, expires_at, resource_url, subject_id, scopes, meta, status, status_version, last_error, last_refresh_at, created_at, updated_at";
 
-    async fn upsert(
+impl SqliteOAuthCredentialStore {
+    async fn upsert_once(
         &self,
         provider_id: &str,
-        input: UpsertOAuthCredential,
-    ) -> anyhow::Result<OAuthCredential> {
-        sqlx::query(
-            r#"INSERT INTO provider_oauth_credentials
-                   (provider_id, driver_key, scheme, access_token, refresh_token,
-                    expires_at, resource_url, subject_id, scopes, meta,
-                    status, status_version, last_error, created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'connected', 0, NULL, datetime('now'), datetime('now'))
-               ON CONFLICT(provider_id) DO UPDATE SET
-                   driver_key = excluded.driver_key,
-                   scheme = excluded.scheme,
-                   access_token = excluded.access_token,
-                   refresh_token = excluded.refresh_token,
-                   expires_at = excluded.expires_at,
-                   resource_url = excluded.resource_url,
-                   subject_id = excluded.subject_id,
-                   scopes = excluded.scopes,
-                   meta = excluded.meta,
-                   status = 'connected',
-                   status_version = status_version + 1,
-                   last_error = NULL,
-                   updated_at = datetime('now')
-            "#,
-        )
+        input: &UpsertOAuthCredential,
+        expected_version: Option<i32>,
+    ) -> anyhow::Result<Option<OAuthCredential>> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        if let Some(expected_version) = expected_version {
+            // Hold the published generation through subject validation and write.
+            let current: Option<(String, i32)> = sqlx::query_as(
+                "SELECT status, status_version FROM provider_oauth_credentials WHERE provider_id = ?",
+            )
+            .bind(provider_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+            if current.as_ref().is_none_or(|(status, version)| {
+                status != "connected" || *version != expected_version
+            }) {
+                tx.commit().await?;
+                return Ok(None);
+            }
+        }
+        if input.driver_key == "cursor"
+            && let Some(subject) = input.subject_id.as_deref().filter(|id| !id.is_empty())
+        {
+            // The predicate and write share the serializable/write transaction.
+            // Excluding this provider permits rebind/refresh of the same account.
+            let duplicate = sqlx::query_scalar::<_, String>(
+                "SELECT provider_id FROM provider_oauth_credentials WHERE driver_key = 'cursor' AND subject_id = ?1 AND provider_id <> ?2 AND status <> 'disconnected'",
+            )
+            .bind(subject)
+            .bind(provider_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+            if duplicate.is_some() {
+                anyhow::bail!("cursor_account_already_bound");
+            }
+        }
+        let credential = sqlx::query_as::<_, OAuthCredential>(&format!(
+            "INSERT INTO provider_oauth_credentials (provider_id, driver_key, scheme, access_token, refresh_token, expires_at, resource_url, subject_id, scopes, meta, status, status_version, last_error, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'connected', 0, NULL, datetime('now'), datetime('now')) ON CONFLICT(provider_id) DO UPDATE SET driver_key=excluded.driver_key, scheme=excluded.scheme, access_token=excluded.access_token, refresh_token=excluded.refresh_token, expires_at=excluded.expires_at, resource_url=excluded.resource_url, subject_id=excluded.subject_id, scopes=excluded.scopes, meta=excluded.meta, status='connected', status_version=provider_oauth_credentials.status_version+1, last_error=NULL, updated_at=datetime('now') RETURNING {OAUTH_COLUMNS}"
+        ))
         .bind(provider_id)
         .bind(&input.driver_key)
         .bind(&input.scheme)
@@ -190,18 +192,84 @@ impl OAuthCredentialStore for SqliteOAuthCredentialStore {
         .bind(&input.subject_id)
         .bind(input.scopes.as_deref().unwrap_or("[]"))
         .bind(input.meta.as_deref().unwrap_or("{}"))
-        .execute(&self.pool)
+        .fetch_one(&mut *tx)
         .await?;
-        self.get(provider_id)
-            .await?
-            .context("credential not found after upsert")
+        tx.commit().await?;
+        Ok(Some(credential))
+    }
+}
+
+#[async_trait]
+impl OAuthCredentialStore for SqliteOAuthCredentialStore {
+    async fn get(&self, provider_id: &str) -> anyhow::Result<Option<OAuthCredential>> {
+        Ok(sqlx::query_as::<_, OAuthCredential>(&format!(
+            "SELECT {OAUTH_COLUMNS} FROM provider_oauth_credentials WHERE provider_id = ?1 AND status <> 'disconnected'"
+        ))
+        .bind(provider_id)
+        .fetch_optional(&self.pool)
+        .await?)
+    }
+
+    async fn upsert(
+        &self,
+        provider_id: &str,
+        input: UpsertOAuthCredential,
+    ) -> anyhow::Result<OAuthCredential> {
+        for attempt in 0..crate::storage::oauth::BIND_ATTEMPTS {
+            match self.upsert_once(provider_id, &input, None).await {
+                Err(error)
+                    if attempt + 1 < crate::storage::oauth::BIND_ATTEMPTS
+                        && crate::storage::oauth::retryable_bind_error(&error) =>
+                {
+                    tokio::time::sleep(Duration::from_millis(10 * (attempt as u64 + 1))).await;
+                }
+                result => return result?.context("credential not found after upsert"),
+            }
+        }
+        unreachable!("bounded retry always returns on the last attempt")
+    }
+
+    async fn restore_if_version(
+        &self,
+        provider_id: &str,
+        expected_version: i32,
+        previous: Option<UpsertOAuthCredential>,
+    ) -> anyhow::Result<bool> {
+        let Some(previous) = previous else {
+            let result = sqlx::query(
+                "UPDATE provider_oauth_credentials SET driver_key='', scheme='', access_token='', refresh_token=NULL, expires_at=NULL, resource_url=NULL, subject_id=NULL, scopes='[]', meta='{}', status='disconnected', status_version=status_version+1, last_error=NULL, last_refresh_at=NULL, updated_at=datetime('now') WHERE provider_id=?1 AND status='connected' AND status_version=?2",
+            )
+            .bind(provider_id)
+            .bind(expected_version)
+            .execute(&self.pool)
+            .await?;
+            return Ok(result.rows_affected() > 0);
+        };
+        for attempt in 0..crate::storage::oauth::BIND_ATTEMPTS {
+            match self
+                .upsert_once(provider_id, &previous, Some(expected_version))
+                .await
+            {
+                Err(error)
+                    if attempt + 1 < crate::storage::oauth::BIND_ATTEMPTS
+                        && crate::storage::oauth::retryable_bind_error(&error) =>
+                {
+                    tokio::time::sleep(Duration::from_millis(10 * (attempt as u64 + 1))).await;
+                }
+                result => return Ok(result?.is_some()),
+            }
+        }
+        unreachable!("bounded retry always returns on the last attempt")
     }
 
     async fn delete(&self, provider_id: &str) -> anyhow::Result<()> {
-        sqlx::query("DELETE FROM provider_oauth_credentials WHERE provider_id = ?")
-            .bind(provider_id)
-            .execute(&self.pool)
-            .await?;
+        // A scrubbed tombstone fences late completions across logout and rebind.
+        sqlx::query(
+            "UPDATE provider_oauth_credentials SET driver_key='', scheme='', access_token='', refresh_token=NULL, expires_at=NULL, resource_url=NULL, subject_id=NULL, scopes='[]', meta='{}', status='disconnected', status_version=status_version+1, last_error=NULL, last_refresh_at=NULL, updated_at=datetime('now') WHERE provider_id=?1"
+        )
+        .bind(provider_id)
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
@@ -210,21 +278,14 @@ impl OAuthCredentialStore for SqliteOAuthCredentialStore {
         provider_id: &str,
         expected_version: i32,
     ) -> anyhow::Result<Option<OAuthCredential>> {
-        let result = sqlx::query(
-            r#"UPDATE provider_oauth_credentials
-               SET status = 'refreshing', status_version = status_version + 1,
-                   updated_at = datetime('now')
-               WHERE provider_id = ? AND status = 'connected' AND status_version = ?"#,
-        )
+        let credential = sqlx::query_as::<_, OAuthCredential>(&format!(
+            "UPDATE provider_oauth_credentials SET status='refreshing', status_version=status_version+1, updated_at=datetime('now') WHERE provider_id=?1 AND status='connected' AND status_version=?2 RETURNING {OAUTH_COLUMNS}"
+        ))
         .bind(provider_id)
         .bind(expected_version)
-        .execute(&self.pool)
+        .fetch_optional(&self.pool)
         .await?;
-        if result.rows_affected() > 0 {
-            Ok(self.get(provider_id).await?)
-        } else {
-            Ok(None)
-        }
+        Ok(credential)
     }
 
     async fn complete_refresh(
@@ -233,17 +294,9 @@ impl OAuthCredentialStore for SqliteOAuthCredentialStore {
         expected_version: i32,
         input: UpsertOAuthCredential,
     ) -> anyhow::Result<Option<OAuthCredential>> {
-        sqlx::query(
-            r#"UPDATE provider_oauth_credentials SET
-                   driver_key = ?, scheme = ?,
-                   access_token = ?, refresh_token = ?, expires_at = ?,
-                   resource_url = ?, subject_id = ?,
-                   scopes = ?, meta = ?,
-                   status = 'connected', status_version = status_version + 1,
-                   last_error = NULL, last_refresh_at = datetime('now'),
-                   updated_at = datetime('now')
-               WHERE provider_id = ? AND status = 'refreshing' AND status_version = ?"#,
-        )
+        let credential = sqlx::query_as::<_, OAuthCredential>(&format!(
+            "UPDATE provider_oauth_credentials SET driver_key=?1, scheme=?2, access_token=?3, refresh_token=?4, expires_at=?5, resource_url=?6, subject_id=?7, scopes=COALESCE(?8, scopes), meta=COALESCE(?9, meta), status='connected', status_version=status_version+1, last_error=NULL, last_refresh_at=datetime('now'), updated_at=datetime('now') WHERE provider_id=?10 AND status='refreshing' AND status_version=?11 AND ((driver_key <> 'cursor' AND ?1 <> 'cursor') OR (driver_key = ?1 AND subject_id IS ?7)) RETURNING {OAUTH_COLUMNS}"
+        ))
         .bind(&input.driver_key)
         .bind(&input.scheme)
         .bind(&input.access_token)
@@ -251,30 +304,29 @@ impl OAuthCredentialStore for SqliteOAuthCredentialStore {
         .bind(&input.expires_at)
         .bind(&input.resource_url)
         .bind(&input.subject_id)
-        .bind(input.scopes.as_deref().unwrap_or("[]"))
-        .bind(input.meta.as_deref().unwrap_or("{}"))
+        .bind(input.scopes.as_deref())
+        .bind(input.meta.as_deref())
         .bind(provider_id)
         .bind(expected_version)
-        .execute(&self.pool)
+        .fetch_optional(&self.pool)
         .await?;
-        let current = self.get(provider_id).await?;
-        Ok(current.filter(|credential| credential.status_version == expected_version + 1))
+        Ok(credential)
     }
 
-    async fn fail_refresh(
+    async fn fail_refresh_with_policy(
         &self,
         provider_id: &str,
         expected_version: i32,
         error_message: &str,
+        terminal: bool,
+        meta: Option<String>,
     ) -> anyhow::Result<bool> {
         let result = sqlx::query(
-            r#"UPDATE provider_oauth_credentials SET
-                   status = 'connected', last_error = ?,
-                   status_version = status_version + 1,
-                   updated_at = datetime('now')
-               WHERE provider_id = ? AND status = 'refreshing' AND status_version = ?"#,
+            "UPDATE provider_oauth_credentials SET status=?1, last_error=?2, meta=COALESCE(?3, meta), status_version=status_version+1, updated_at=datetime('now') WHERE provider_id=?4 AND status='refreshing' AND status_version=?5",
         )
+        .bind(if terminal { "error" } else { "connected" })
         .bind(error_message)
+        .bind(meta)
         .bind(provider_id)
         .bind(expected_version)
         .execute(&self.pool)
@@ -283,34 +335,22 @@ impl OAuthCredentialStore for SqliteOAuthCredentialStore {
     }
 
     async fn list_expiring(&self, before: Duration) -> anyhow::Result<Vec<OAuthCredential>> {
-        let seconds = before.as_secs() as i64;
-        let rows = sqlx::query_as::<_, OAuthCredential>(
-            r#"SELECT provider_id, driver_key, scheme, access_token, refresh_token,
-                      expires_at, resource_url, subject_id, scopes, meta,
-                      status, status_version, last_error, last_refresh_at,
-                      created_at, updated_at
-               FROM provider_oauth_credentials
-               WHERE status = 'connected'
-                 AND expires_at IS NOT NULL
-                 AND datetime(expires_at) <= datetime('now', '+' || ? || ' seconds')"#,
-        )
+        let seconds = i64::try_from(before.as_secs()).unwrap_or(i64::MAX);
+        Ok(sqlx::query_as::<_, OAuthCredential>(&format!(
+            "SELECT {OAUTH_COLUMNS} FROM provider_oauth_credentials WHERE status='connected' AND expires_at IS NOT NULL AND datetime(expires_at) <= datetime('now', '+' || ?1 || ' seconds')"
+        ))
         .bind(seconds)
         .fetch_all(&self.pool)
-        .await?;
-        Ok(rows)
+        .await?)
     }
 
     async fn recover_stale_refreshing(&self, timeout: Duration) -> anyhow::Result<u64> {
-        let seconds = timeout.as_secs() as i64;
+        let seconds = i64::try_from(timeout.as_secs()).unwrap_or(i64::MAX);
         let result = sqlx::query(
-            r#"UPDATE provider_oauth_credentials SET
-                   status = 'connected',
-                   last_error = 'refresh timeout: process did not complete within timeout',
-                   status_version = status_version + 1,
-                   updated_at = datetime('now')
-               WHERE status = 'refreshing'
-                 AND datetime(updated_at, '+' || ? || ' seconds') < datetime('now')"#,
+            "UPDATE provider_oauth_credentials SET status=CASE WHEN driver_key='cursor' THEN 'error' ELSE 'connected' END, last_error=CASE WHEN driver_key='cursor' THEN ?1 ELSE ?2 END, status_version=status_version+1, updated_at=datetime('now') WHERE status='refreshing' AND datetime(updated_at, '+' || ?3 || ' seconds') < datetime('now')",
         )
+        .bind(crate::storage::oauth::CURSOR_STALE_REFRESH_ERROR)
+        .bind(crate::storage::oauth::STALE_REFRESH_ERROR)
         .bind(seconds)
         .execute(&self.pool)
         .await?;
@@ -423,7 +463,11 @@ impl SqliteProviderStore {
 }
 
 fn endpoint_inputs_or_legacy(input: &CreateProvider) -> Vec<CreateProviderProtocolEndpoint> {
-    if !input.protocol_endpoints.is_empty() {
+    // Cursor's native transport has no compatibility endpoint to synthesize.
+    if !input.protocol_endpoints.is_empty()
+        || (normalize_provider_vendor(input.vendor.as_deref()).as_deref() == Some("cursor")
+            && input.protocol.trim() == "cursor-agent/run/v1")
+    {
         return input.protocol_endpoints.clone();
     }
     vec![CreateProviderProtocolEndpoint {

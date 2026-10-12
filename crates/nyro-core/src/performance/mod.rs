@@ -2,6 +2,49 @@
 mod lifecycle;
 pub(crate) use lifecycle::{Attempt, ProducerGuard};
 
+/// Evidence verified by the native upstream wire parser, never by an IR Done
+/// event, converted SSE, or an OnResponse hook. This deliberately stays crate
+/// private: native dispatch owns verification before calling Attempt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NativeTerminalEvidence {
+    /// The parser verified the upstream turn-ended terminal.
+    Completed,
+    /// The API tool round ended; the upstream conversation turn has NOT ended.
+    ToolHandoff,
+}
+impl NativeTerminalEvidence {
+    fn reason(self) -> &'static str {
+        match self {
+            Self::Completed => "cursor_turn_ended",
+            Self::ToolHandoff => "cursor_tool_handoff",
+        }
+    }
+}
+
+/// Provenance is independent of the legacy numeric Usage fields, whose zero
+/// defaults cannot distinguish unreported tokens from a genuinely zero count.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum NativeUsageProvenance {
+    #[default]
+    Unknown,
+    Partial,
+    Reported,
+}
+impl NativeUsageProvenance {
+    fn metadata(self) -> Value {
+        serde_json::json!({
+            "source": "cursor_native",
+            "status": match self {
+                Self::Unknown => "unknown",
+                Self::Partial => "partial",
+                Self::Reported => "reported",
+            },
+            // Token evidence never establishes billing or a free request.
+            "known_free": false,
+        })
+    }
+}
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 

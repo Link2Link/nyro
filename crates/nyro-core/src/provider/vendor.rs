@@ -225,6 +225,22 @@ pub trait Vendor: Send + Sync + 'static {
         Ok(())
     }
 
+    /// Start a provider-owned binary/duplex session. This does not build a
+    /// synthetic JSON request and is unavailable to ordinary codec vendors.
+    #[allow(private_interfaces)]
+    async fn start_ir(
+        &self,
+        _request: AiRequest,
+        _ctx: &ProviderCtx<'_>,
+        _transport: crate::proxy::client::ProxyClient,
+        _control: crate::provider::native::AttemptControl,
+    ) -> Result<crate::provider::native::IrUpstream, GatewayError> {
+        Err(GatewayError::ProviderUnavailable {
+            provider: self.vendor_id().to_string(),
+            reason: "native stream execution is not supported".to_string(),
+        })
+    }
+
     // ── PassThrough declarations ───────────────────────────────────────────────
 
     /// Declares whether this vendor mutates the request body via pipeline hooks

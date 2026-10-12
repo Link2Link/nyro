@@ -16,7 +16,6 @@
 
 use std::any::{Any, TypeId};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -68,21 +67,26 @@ impl Deadline {
 
 /// A shareable cancellation signal.  Any holder can cancel; all holders see it.
 #[derive(Clone, Debug)]
-pub struct CancellationToken(Arc<AtomicBool>);
+pub struct CancellationToken(tokio_util::sync::CancellationToken);
 
 impl CancellationToken {
     pub fn new() -> Self {
-        Self(Arc::new(AtomicBool::new(false)))
+        Self(tokio_util::sync::CancellationToken::new())
     }
 
-    /// Signal cancellation.
+    /// Signal cancellation and wake any pending upstream I/O.
     pub fn cancel(&self) {
-        self.0.store(true, Ordering::Release);
+        self.0.cancel();
     }
 
     /// Returns `true` if cancellation has been signalled.
     pub fn is_cancelled(&self) -> bool {
-        self.0.load(Ordering::Acquire)
+        self.0.is_cancelled()
+    }
+
+    /// Wait without polling; safe when cancellation happened before subscription.
+    pub async fn cancelled(&self) {
+        self.0.cancelled().await;
     }
 }
 

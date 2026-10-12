@@ -4,7 +4,7 @@
 //!
 //! Canonical form: `{protocol}/{name}/{version}`.
 //!
-//! - `protocol`: closed `Protocol` enum (`openai-compatible` / `openai-responses` / `anthropic-messages` / `google-gemini`).
+//! - `protocol`: closed `Protocol` enum (JSON/HTTP families plus egress-only `cursor-agent`).
 //! - `name`: wire-format endpoint name (`chat-completions`, `responses`, `messages`, `generate-content`).
 //! - `version`: schema version as the vendor labels it (`v1`, `2023-06-01`, `v1beta`).
 //!
@@ -38,8 +38,13 @@ pub mod traits;
 
 use reqwest::header::HeaderMap;
 
-use crate::db::models::Provider;
-use crate::protocol::ids::{OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1, ProtocolEndpoint};
+use crate::db::models::{PROVIDER_PROTOCOL_MODE_FIXED, Provider};
+use crate::error::GatewayError;
+use crate::protocol::ids::{
+    CURSOR_AGENT_BASE_URL, CURSOR_AGENT_RUN_V1, OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1,
+    ProtocolEndpoint,
+};
+pub use registry::{EndpointDescriptor, ExecutionKind};
 
 // ── Client → Gateway ──
 
@@ -142,14 +147,113 @@ impl ProviderProtocols {
         let reg = registry::ProtocolRegistry::global();
         reg.resolve_alias(s).or_else(|| {
             let protocol = reg.parse_protocol(s)?;
-            reg.list_by_protocol(protocol)
-                .first()
-                .map(|handler| handler.id())
+            reg.list_endpoints()
+                .into_iter()
+                .find(|endpoint| endpoint.id.protocol == protocol)
+                .map(|endpoint| endpoint.id)
         })
     }
 
-    /// Build from a provider DB row.
+    /// Validate vendor-only protocol invariants before dispatch, probing or
+    /// persisting provider configuration. Legacy JSON/HTTP provider semantics
+    /// are unchanged; Cursor never inherits a generic provider/key fallback.
+    pub fn validate_provider(provider: &Provider) -> Result<(), GatewayError> {
+        let is_cursor = provider
+            .vendor
+            .as_deref()
+            .unwrap_or_default()
+            .trim()
+            .eq_ignore_ascii_case("cursor");
+        let declares_cursor = |raw: &str| {
+            raw.trim()
+                .split('/')
+                .next()
+                .is_some_and(|suite| suite.eq_ignore_ascii_case("cursor-agent"))
+        };
+        if !is_cursor {
+            if declares_cursor(&provider.protocol)
+                || provider
+                    .protocol_endpoints
+                    .iter()
+                    .any(|ep| declares_cursor(&ep.protocol))
+                || provider
+                    .keys
+                    .iter()
+                    .any(|key| key.protocol.as_deref().is_some_and(declares_cursor))
+            {
+                return Err(GatewayError::provider_unavailable(
+                    &provider.id,
+                    "cursor-agent is restricted to vendor=cursor, channel=agent",
+                ));
+            }
+            return Ok(());
+        }
+
+        let invalid = if Self::parse_protocol_key(&provider.protocol) != Some(CURSOR_AGENT_RUN_V1) {
+            Some("Cursor requires the cursor-agent/run/v1 protocol")
+        } else if !provider
+            .channel
+            .as_deref()
+            .unwrap_or_default()
+            .trim()
+            .eq_ignore_ascii_case("agent")
+        {
+            Some("Cursor requires channel=agent")
+        } else if provider.auth_mode.trim() != "oauth" {
+            Some("Cursor requires OAuth authentication")
+        } else if provider.protocol_mode.trim() != PROVIDER_PROTOCOL_MODE_FIXED
+            || !provider.protocol_endpoints.is_empty()
+        {
+            Some("Cursor requires fixed protocol mode without adaptive endpoints")
+        } else if provider.base_url.trim().trim_end_matches('/') != CURSOR_AGENT_BASE_URL {
+            Some("Cursor requires the fixed https://api2.cursor.sh service origin")
+        } else if !provider.keys.is_empty() {
+            Some("Cursor does not support API-key pools or per-key overrides")
+        } else {
+            None
+        };
+        match invalid {
+            Some(message) => Err(GatewayError::provider_unavailable(&provider.id, message)),
+            None => Ok(()),
+        }
+    }
+
+    /// Checked construction for dispatch/admin callers that need an explicit
+    /// configuration error rather than the fail-closed compatibility result.
+    pub fn try_from_provider(provider: &Provider) -> Result<Self, GatewayError> {
+        Self::validate_provider(provider)?;
+        Ok(Self::from_provider(provider))
+    }
+
+    /// Build from a provider DB row. Invalid Cursor declarations fail closed
+    /// with no usable endpoints, never silently falling back to OpenAI.
+    /// Call `try_from_provider` when the configuration error should be surfaced.
     pub fn from_provider(provider: &Provider) -> Self {
+        if Self::validate_provider(provider).is_err() {
+            return Self {
+                default: CURSOR_AGENT_RUN_V1,
+                endpoints: Vec::new(),
+                adaptive: false,
+            };
+        }
+        if provider
+            .vendor
+            .as_deref()
+            .unwrap_or_default()
+            .trim()
+            .eq_ignore_ascii_case("cursor")
+        {
+            return Self {
+                default: CURSOR_AGENT_RUN_V1,
+                endpoints: vec![ProviderProtocolTarget {
+                    record_id: None,
+                    protocol: CURSOR_AGENT_RUN_V1,
+                    base_url: CURSOR_AGENT_BASE_URL.to_string(),
+                    auth_scheme: "oauth".to_string(),
+                }],
+                adaptive: false,
+            };
+        }
         let registry = registry::ProtocolRegistry::global();
         if provider.is_adaptive() {
             let mut configured = provider
@@ -240,6 +344,11 @@ impl ProviderProtocols {
     /// 1. **Exact endpoint** — use the endpoint configured for the ingress.
     /// 2. **Provider default** — last resort with conversion.
     pub fn resolve_egress(&self, ingress: ProtocolEndpoint) -> Option<ResolvedEgress> {
+        let registry = registry::ProtocolRegistry::global();
+        let ingress_descriptor = registry.describe(&ingress)?;
+        if ingress_descriptor.execution != ExecutionKind::JsonHttp {
+            return None;
+        }
         if let Some(endpoint) = self.get(ingress) {
             return Some(ResolvedEgress {
                 protocol: ingress,
@@ -250,7 +359,9 @@ impl ProviderProtocols {
             });
         }
 
-        if ingress.name == "embeddings" || self.default.name == "embeddings" {
+        if ingress_descriptor.capabilities.embeddings
+            || registry.describe(&self.default)?.capabilities.embeddings
+        {
             return None;
         }
 
@@ -262,5 +373,159 @@ impl ProviderProtocols {
             auth_scheme: endpoint.auth_scheme.clone(),
             needs_conversion: true,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::models::{ProviderKey, ProviderProtocolEndpoint};
+    use crate::protocol::ids::OPENAI_COMPATIBLE_EMBEDDINGS_V1;
+
+    fn cursor_provider() -> Provider {
+        Provider {
+            id: "cursor-test".into(),
+            name: "Cursor".into(),
+            vendor: Some("cursor".into()),
+            protocol: "cursor-agent/run/v1".into(),
+            base_url: CURSOR_AGENT_BASE_URL.into(),
+            protocol_mode: PROVIDER_PROTOCOL_MODE_FIXED.into(),
+            protocol_endpoints: Vec::new(),
+            keys: Vec::new(),
+            preset_key: None,
+            channel: Some("agent".into()),
+            models_source: None,
+            static_models: None,
+            api_key: String::new(),
+            auth_mode: "oauth".into(),
+            use_proxy: false,
+            fast_mode: false,
+            last_test_success: None,
+            last_test_at: None,
+            is_enabled: true,
+            created_at: String::new(),
+            updated_at: String::new(),
+        }
+    }
+
+    fn endpoint(protocol: &str) -> ProviderProtocolEndpoint {
+        ProviderProtocolEndpoint {
+            id: "ep".into(),
+            provider_id: "cursor-test".into(),
+            protocol: protocol.into(),
+            base_url: CURSOR_AGENT_BASE_URL.into(),
+            api_key: String::new(),
+            auth_scheme: "oauth".into(),
+            is_enabled: true,
+            priority: 0,
+            test_status: "unknown".into(),
+            test_error: None,
+            tested_at: None,
+            created_at: String::new(),
+            updated_at: String::new(),
+        }
+    }
+
+    fn key(protocol: Option<&str>) -> ProviderKey {
+        ProviderKey {
+            id: "key".into(),
+            provider_id: "cursor-test".into(),
+            name: "key".into(),
+            api_key: "secret".into(),
+            protocol: protocol.map(str::to_string),
+            base_url: None,
+            is_enabled: true,
+            priority: 0,
+            models_snapshot: None,
+            manual_models: None,
+            last_probe_at: None,
+            probe_error: None,
+            created_at: String::new(),
+            updated_at: String::new(),
+        }
+    }
+
+    fn assert_rejected(provider: &Provider) {
+        assert!(ProviderProtocols::validate_provider(provider).is_err());
+        assert!(ProviderProtocols::try_from_provider(provider).is_err());
+        let declaration = ProviderProtocols::from_provider(provider);
+        assert_eq!(declaration.default, CURSOR_AGENT_RUN_V1);
+        assert!(declaration.endpoints.is_empty());
+        assert!(
+            declaration
+                .resolve_egress(OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn cursor_declaration_is_exact_fixed_and_oauth() {
+        let mut provider = cursor_provider();
+        for protocol in ["cursor-agent", "cursor-agent/run/v1"] {
+            provider.protocol = protocol.into();
+            provider.base_url = format!("{CURSOR_AGENT_BASE_URL}/");
+            let declaration = ProviderProtocols::try_from_provider(&provider).unwrap();
+            assert_eq!(declaration.default, CURSOR_AGENT_RUN_V1);
+            assert_eq!(declaration.endpoints.len(), 1);
+            assert!(!declaration.adaptive);
+            let target = declaration.get(CURSOR_AGENT_RUN_V1).unwrap();
+            assert_eq!(target.base_url, CURSOR_AGENT_BASE_URL);
+            assert_eq!(target.auth_scheme, "oauth");
+            assert!(target.record_id.is_none());
+            let resolved = declaration
+                .resolve_egress(OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1)
+                .unwrap();
+            assert_eq!(resolved.protocol, CURSOR_AGENT_RUN_V1);
+            assert!(resolved.needs_conversion);
+            assert!(declaration.resolve_egress(CURSOR_AGENT_RUN_V1).is_none());
+            assert!(
+                declaration
+                    .resolve_egress(OPENAI_COMPATIBLE_EMBEDDINGS_V1)
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_cursor_configuration_never_falls_back_to_openai() {
+        for mutate in [
+            |p: &mut Provider| p.protocol = "openai".into(),
+            |p: &mut Provider| p.protocol = "cursor-agent/run/v2".into(),
+            |p: &mut Provider| p.protocol = String::new(),
+            |p: &mut Provider| p.channel = Some("default".into()),
+            |p: &mut Provider| p.channel = None,
+            |p: &mut Provider| p.auth_mode = "apikey".into(),
+            |p: &mut Provider| p.protocol_mode = "adaptive".into(),
+            |p: &mut Provider| p.protocol_mode = String::new(),
+            |p: &mut Provider| p.base_url = "https://relay.example".into(),
+            |p: &mut Provider| p.base_url = "https://api2.cursor.sh/evil".into(),
+            |p: &mut Provider| p.base_url = String::new(),
+            |p: &mut Provider| p.protocol_endpoints.push(endpoint("cursor-agent")),
+            |p: &mut Provider| p.keys.push(key(None)),
+            |p: &mut Provider| p.keys.push(key(Some("openai"))),
+        ] {
+            let mut provider = cursor_provider();
+            mutate(&mut provider);
+            assert_rejected(&provider);
+        }
+    }
+
+    #[test]
+    fn non_cursor_providers_cannot_declare_or_pin_cursor() {
+        let mut provider = cursor_provider();
+        provider.vendor = Some("custom".into());
+        assert_rejected(&provider);
+        provider.vendor = None;
+        assert_rejected(&provider);
+        provider.protocol = "openai".into();
+        provider
+            .protocol_endpoints
+            .push(endpoint("cursor-agent/run/v1"));
+        assert_rejected(&provider);
+        provider.protocol_endpoints[0].is_enabled = false;
+        assert_rejected(&provider);
+        provider.protocol_endpoints.clear();
+        provider.keys.push(key(Some("cursor-agent")));
+        assert_rejected(&provider);
     }
 }

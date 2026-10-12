@@ -54,7 +54,18 @@ AI 模型供应商配置（API endpoint、密钥、认证方式等）。
 
 ## provider_protocol_endpoints
 
-Provider 的协议端点明细。固定模式保留一条兼容记录；自适应模式可配置多个精确协议端点，每个端点独立保存 Base URL、凭据和认证方式。
+Provider 的协议端点明细。普通固定模式保留一条兼容记录；自适应模式可配置多个精确协议端点，每个端点独立保存 Base URL、凭据和认证方式。
+
+**Native Cursor exception:** a provider with normalized `vendor = 'cursor'` and
+`protocol = 'cursor-agent/run/v1'` uses the native transport and intentionally has
+no compatibility endpoints. Creating it with an empty endpoint list must not
+synthesize a legacy endpoint. Omitting endpoints on update preserves the list;
+an explicit empty list stays empty. The startup migration's missing-endpoint
+backfill excludes this exact vendor/protocol pair, including on repeated runs.
+Protocol normalization preserves the canonical `cursor-agent/run/v1` execution
+endpoint even in fixed mode instead of collapsing it to a protocol-suite name.
+Other providers retain their existing fallback/backfill behavior. This is a DML
+selection change, not a new table, column, index, or constraint.
 
 | Column | Type | Default | Description |
 |---|---|---|---|
@@ -223,12 +234,60 @@ OAuth 凭据存储，用于需要 OAuth 认证的供应商（如 Google Vertex A
 | `subject_id` | TEXT | NULL | 认证主体 ID |
 | `scopes` | TEXT | `'[]'` | OAuth 权限范围（JSON 数组） |
 | `meta` | TEXT | `'{}'` | 扩展元数据（JSON） |
-| `status` | TEXT | `'connected'` | 连接状态 |
-| `status_version` | INTEGER | `0` | 状态版本号（乐观锁） |
+| `status` | TEXT | `'connected'` | `connected`, `refreshing`, `error`, or internal scrubbed `disconnected` tombstone |
+| `status_version` | INTEGER | `0` | Monotonically advancing generation used by refresh CAS; retained across logout/rebind |
 | `last_error` | TEXT | NULL | 最近一次错误信息 |
 | `last_refresh_at` | TEXT | NULL | 最近一次 token 刷新时间 |
 | `created_at` | TEXT | `datetime('now')` | 创建时间 |
 | `updated_at` | TEXT | `datetime('now')` | 更新时间 |
+
+### OAuth credential storage invariants
+
+These rules are enforced consistently by Memory, SQLite, PostgreSQL, and MySQL
+stores without additional DDL:
+
+- **One Cursor account per provider binding:** a nonempty `subject_id` with
+  `driver_key = 'cursor'` may belong to only one provider. Rebinding the same
+  provider is allowed; `error` rows still reserve their account until logout.
+  Empty/missing subjects and other drivers retain their previous behavior.
+  This is a transactional application invariant, **not a database unique
+  constraint**: Memory checks/writes under one write lock, SQLite uses a write
+  transaction, and PostgreSQL/MySQL use serializable transactions with bounded
+  conflict retries. Direct SQL writes bypass this invariant. A Cursor refresh
+  cannot change the bound driver or subject.
+- **Refresh generation fencing:** begin, completion, and failure compare both
+  state and `status_version`, then advance the version atomically. A successful
+  begin/completion returns the exact changed row snapshot, not a later bind
+  observed by a separate unlocked read. Late or repeated completions/failures
+  must not mutate a newer binding.
+- **Failed-bind compensation is also fenced:** `restore_if_version` restores a
+  previous credential (or scrubs a tombstone if none existed) only while the
+  connected row still has that bind's published version. It advances the version
+  rather than restoring an old generation and rechecks Cursor subject uniqueness
+  in the same write/serializable transaction. A concurrent logout, rebind, or
+  refresh prevents compensation from resurrecting or overwriting credentials.
+- **Logout is a scrubbed tombstone, not physical credential-row deletion:**
+  clear `driver_key`, `scheme`, and `access_token` to empty strings; set
+  `refresh_token`, `expires_at`, `resource_url`, `subject_id`, `last_error`, and
+  `last_refresh_at` to NULL; reset `scopes` to `[]` and `meta` to `{}`; set
+  `status = 'disconnected'` and advance `status_version`. The provider identity,
+  version fence, and row timestamps remain. Public credential lookup returns no
+  credential for this row, and scheduling excludes it. A subsequent bind advances
+  the retained generation instead of resetting it, preventing logout/rebind ABA
+  races with an old refresh. Deleting the provider itself removes the tombstone
+  through the existing foreign-key cascade.
+- **Failure policy:** terminal failure enters `error`; transient failure returns
+  to `connected`. The compatibility `fail_refresh` path remains transient.
+  Optional sanitized metadata is replaced atomically with the state transition;
+  absence preserves it. Cursor retry metadata uses `cursor_refresh_retry_at`
+  (Unix seconds) and `cursor_refresh_failures`, populated by the auth layer rather
+  than storing raw upstream errors or responses.
+- **Time-based scheduling and recovery:** only connected rows with a known expiry
+  at or before the requested horizon are refresh candidates. Recovery affects
+  only refreshing rows older than the timeout and advances their generation.
+  A stale Cursor refresh has an unknown remote token-rotation outcome, so it
+  enters `error` with a `reauth_required` diagnostic instead of blindly replaying
+  its refresh token. Other drivers retain retryable `connected` recovery.
 
 ---
 

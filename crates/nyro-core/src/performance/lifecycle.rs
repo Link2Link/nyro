@@ -1,4 +1,7 @@
-use super::{PerformanceMetadata, Terminal, recover_historical_effort};
+use super::{
+    NativeTerminalEvidence, NativeUsageProvenance, PerformanceMetadata, Terminal,
+    recover_historical_effort,
+};
 use crate::logging::LogEntry;
 use crate::logging::diagnostics::{LogDiagnostic, RequestResult};
 use crate::logging::payload::{
@@ -10,12 +13,87 @@ use axum::response::Response;
 use bytes::Bytes;
 use futures::Stream;
 use http_body::{Body as HttpBody, Frame, SizeHint};
+use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::{
     pin::Pin,
     sync::{Arc, Mutex},
     task::{Context, Poll},
     time::Instant,
 };
+
+/// Native bodies are never decoded or retained, including for failed requests.
+/// Hash every exact upstream byte in constant memory, independently of framing.
+#[derive(Default)]
+struct NativeCapture {
+    hash: Sha256,
+    bytes: u64,
+    chunks: u64,
+    observed: bool,
+}
+impl NativeCapture {
+    fn push(&mut self, bytes: &[u8]) {
+        self.observed = true;
+        self.bytes = self.bytes.saturating_add(bytes.len() as u64);
+        self.chunks = self.chunks.saturating_add(u64::from(!bytes.is_empty()));
+        self.hash.update(bytes);
+    }
+    fn finish(self, complete: bool) -> CapturedPayload {
+        CapturedPayload {
+            body: None,
+            metadata: json!({
+                "total_observed_bytes": self.bytes,
+                "retained_bytes": 0,
+                "head_bytes": 0,
+                "tail_bytes": 0,
+                "truncated": false,
+                "complete": complete,
+                "encoding": "binary",
+                "capture_state": if self.observed { "digest_only" } else { "absent" },
+                "sha256": self.observed.then(|| hex::encode(self.hash.finalize())),
+                "chunks": self.chunks,
+            }),
+        }
+    }
+}
+#[derive(Default)]
+struct NativeObservation {
+    response: NativeCapture,
+    terminal: Option<NativeTerminalEvidence>,
+    usage: NativeUsageProvenance,
+}
+
+/// Accept only bounded, content-free semantic facts. Never trust arbitrary JSON
+/// summaries to have removed history, credentials, text, model or tool arguments.
+fn native_request_summary(summary: &Value) -> Value {
+    let mut safe = serde_json::Map::new();
+    for name in [
+        "message_count",
+        "history_count",
+        "tool_count",
+        "tool_result_count",
+        "image_count",
+        "system_bytes",
+        "history_bytes",
+        "tool_argument_bytes",
+    ] {
+        if let Some(value) = summary.get(name).and_then(Value::as_u64) {
+            safe.insert(name.into(), json!(value));
+        }
+    }
+    for name in [
+        "stream",
+        "has_system",
+        "has_tools",
+        "has_images",
+        "has_tool_results",
+    ] {
+        if let Some(value) = summary.get(name).and_then(Value::as_bool) {
+            safe.insert(name.into(), json!(value));
+        }
+    }
+    Value::Object(safe)
+}
 
 #[derive(Clone)]
 pub(crate) struct Attempt(Arc<Mutex<State>>);
@@ -33,6 +111,7 @@ struct State {
     client_response_headers: Option<String>,
     started: Option<Instant>,
     terminal: Terminal,
+    native: Option<NativeObservation>,
     upstream_eof: bool,
     client_frames_sent: u64,
     client_frames_polled: u64,
@@ -65,6 +144,7 @@ impl Attempt {
             client_response_headers: None,
             started: None,
             terminal: Default::default(),
+            native: None,
             upstream_eof: false,
             client_frames_sent: 0,
             client_frames_polled: 0,
@@ -87,6 +167,57 @@ impl Attempt {
     ) {
         self.0.lock().unwrap().terminal.allow_chat_eof = vendor == Some("minimax")
             && egress == crate::protocol::ids::OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1;
+    }
+    /// Select native binary observation before sending any upstream bytes.
+    /// Idempotent, and intentionally not inferred from response payloads/IR.
+    pub fn configure_native_stream(&self) {
+        let mut s = self.0.lock().unwrap();
+        if s.native.is_none() {
+            s.native = Some(NativeObservation::default());
+            s.terminal = Terminal::default();
+            s.upstream_capture = BoundedPayloadCapture::default();
+            s.request_capture = Some(Arc::new(NativeCapture::default().finish(false)));
+            s.metadata.version = 1;
+            s.metadata.effort_status = "unknown".into();
+            s.metadata.effort_raw = None;
+            s.metadata.effort_tier = None;
+            s.metadata.response_mode = "stream".into();
+            s.sync_native_metadata();
+        }
+    }
+    /// Capture the exact encoded native request once, with redacted headers and
+    /// allowlisted content-free counts/flags. Never persist full binary history.
+    pub fn note_native_request(
+        &self,
+        headers: &reqwest::header::HeaderMap,
+        data: &[u8],
+        semantic_summary: &Value,
+    ) {
+        self.configure_native_stream();
+        self.request_headers(headers);
+        let mut s = self.0.lock().unwrap();
+        s.native_request(data, semantic_summary);
+    }
+    /// ONLY native dispatch after the original wire parser verified evidence.
+    /// Converted Done/SSE and OnResponse hooks are not terminal evidence. This
+    /// records no delivery success; wrap/ProducerGuard still gate finalization.
+    pub fn observe_native_terminal(&self, evidence: NativeTerminalEvidence) {
+        let mut s = self.0.lock().unwrap();
+        if let Some(native) = s.native.as_mut() {
+            if native.terminal.is_none() || evidence == NativeTerminalEvidence::Completed {
+                native.terminal = Some(evidence);
+            }
+            s.sync_native_metadata();
+        }
+    }
+    /// Called only for original-wire usage, never synthesized IR/hook defaults.
+    /// This does not modify legacy Usage counts or imply billing is known/free.
+    pub fn note_native_usage_provenance(&self, provenance: NativeUsageProvenance) {
+        let mut s = self.0.lock().unwrap();
+        if let Some(native) = s.native.as_mut() {
+            native.usage = provenance;
+            s.sync_native_metadata();
+        }
     }
     /// Identity is allocated once at construction, before any fallback clones.
     pub fn correlate(&self, request_id: &str, attempt_index: i32) {
@@ -147,6 +278,10 @@ impl Attempt {
     }
     pub fn request(&self, bytes: &[u8]) {
         let mut s = self.0.lock().unwrap();
+        if s.native.is_some() {
+            s.native_request(bytes, &Value::Null);
+            return;
+        }
         s.request_capture = Some(Arc::new(capture_bytes(bytes, true)));
         s.metadata = if bytes.len() <= 1024 * 1024 {
             recover_historical_effort(&String::from_utf8_lossy(bytes), None)
@@ -167,11 +302,17 @@ impl Attempt {
         let captured = capture_headers(headers);
         s.diagnostic.payload_metadata["upstream_response_headers"] = captured.metadata;
         s.upstream_response_headers = captured.headers;
-        s.metadata.response_mode = if headers
-            .get("content-type")
-            .and_then(|h| h.to_str().ok())
-            .is_some_and(|h| h.contains("text/event-stream"))
-        {
+        s.metadata.response_mode = if s.native.is_some()
+            || headers
+                .get("content-type")
+                .and_then(|h| h.to_str().ok())
+                .is_some_and(|h| {
+                    h.contains("text/event-stream")
+                        || h.split(';').next().is_some_and(|mime| {
+                            mime.trim()
+                                .eq_ignore_ascii_case("application/connect+proto")
+                        })
+                }) {
             "stream"
         } else {
             "buffered"
@@ -183,8 +324,12 @@ impl Attempt {
     }
     pub fn chunk(&self, bytes: &[u8]) {
         let mut s = self.0.lock().unwrap();
-        if s.metadata.first_chunk_ms.is_none() {
+        if s.metadata.first_chunk_ms.is_none() && (s.native.is_none() || !bytes.is_empty()) {
             s.metadata.first_chunk_ms = s.started.map(|t| t.elapsed().as_millis() as i64);
+        }
+        if let Some(native) = s.native.as_mut() {
+            native.response.push(bytes);
+            return;
         }
         s.upstream_capture.push(bytes);
         s.terminal.push(bytes);
@@ -206,9 +351,13 @@ impl Attempt {
         let mut s = self.0.lock().unwrap();
         if !s.upstream_eof {
             s.upstream_eof = true;
-            s.upstream_capture.push(&[]);
             s.metadata.upstream_duration_ms = s.started.map(|t| t.elapsed().as_millis() as i64);
-            s.terminal.finish();
+            if let Some(native) = s.native.as_mut() {
+                native.response.push(&[]);
+            } else {
+                s.upstream_capture.push(&[]);
+                s.terminal.finish();
+            }
         }
     }
     pub fn fail(&self, state: &str, reason: impl Into<String>) {
@@ -283,6 +432,43 @@ impl Attempt {
     }
 }
 impl State {
+    fn native_request(&mut self, data: &[u8], summary: &Value) {
+        let mut capture = NativeCapture::default();
+        capture.push(data);
+        let mut capture = capture.finish(true);
+        capture.metadata["semantic_summary"] = native_request_summary(summary);
+        self.request_capture = Some(Arc::new(capture));
+        self.started = Some(Instant::now());
+    }
+    fn sync_native_metadata(&mut self) {
+        if let Some(native) = &self.native {
+            self.diagnostic.payload_metadata["native_stream"] = json!({
+                "format": "application/connect+proto",
+                "terminal": native.terminal.map(NativeTerminalEvidence::reason),
+                "upstream_turn_ended": native.terminal.map(|e| e == NativeTerminalEvidence::Completed),
+                "api_round_complete": native.terminal.is_some(),
+            });
+            self.diagnostic.payload_metadata["usage_provenance"] = native.usage.metadata();
+        }
+    }
+    fn terminal_completion(&self) -> Option<&'static str> {
+        match &self.native {
+            Some(native) => native.terminal.map(|_| "completed"),
+            None => self.terminal.completion,
+        }
+    }
+    fn terminal_reason(&self) -> Option<String> {
+        match &self.native {
+            Some(native) => native.terminal.map(|e| e.reason().into()),
+            None => self.terminal.reason.clone(),
+        }
+    }
+    fn confirmed_completed(&self) -> bool {
+        match &self.native {
+            Some(native) => native.terminal.is_some(),
+            None => self.terminal.confirmed_completed(),
+        }
+    }
     /// Every frame the relay produced for the client body was consumed by the
     /// HTTP layer. Frames flow one-to-one through the response-body channel,
     /// so `polled >= sent > 0` means the client received the complete stream
@@ -336,9 +522,9 @@ impl State {
         if self.cancellation.is_cancelled() {
             self.fail("cancelled", "request cancelled".into());
         }
-        if self.upstream_eof {
-            if let Some(completion) = self.terminal.completion {
-                let reason = self.terminal.reason.clone().unwrap_or_default();
+        if self.upstream_eof || self.native.as_ref().is_some_and(|n| n.terminal.is_some()) {
+            if let Some(completion) = self.terminal_completion() {
+                let reason = self.terminal_reason().unwrap_or_default();
                 match completion {
                     "failed" | "cancelled" | "output_limited" => {
                         let kind = match completion {
@@ -368,9 +554,7 @@ impl State {
                 // the terminal. This is active ambiguity, not a legacy/unobserved
                 // version-0 default: retain bounded evidence for diagnosis.
                 let reason = self
-                    .terminal
-                    .reason
-                    .clone()
+                    .terminal_reason()
                     .unwrap_or_else(|| "No confirmable original terminal event".into());
                 self.record_message(
                     "unknown",
@@ -390,7 +574,7 @@ impl State {
         // every produced client frame reconciles those drop artifacts into
         // confirmed completion. Confirmed failures, timeouts and output
         // limits stay sticky and are never demoted.
-        if self.terminal.confirmed_completed()
+        if self.confirmed_completed()
             && !self.cancellation.is_cancelled()
             && !self.deadline.is_exceeded()
             && self.client_drained()
@@ -406,7 +590,7 @@ impl State {
             self.diagnostic.error_message = None;
             self.diagnostic.error_causes = Vec::new();
             self.metadata.completion = "completed".into();
-            self.metadata.completion_reason = self.terminal.reason.clone();
+            self.metadata.completion_reason = self.terminal_reason();
         }
         let finished_at = chrono::Utc::now().timestamp_millis();
         if self.metadata.completion == "completed"
@@ -427,7 +611,19 @@ impl State {
             });
         }
         let mut entry = self.entry.take().unwrap();
-        let upstream = std::mem::take(&mut self.upstream_capture).finish(self.upstream_eof);
+        // Entry/OnResponse metadata cannot replace original-wire provenance.
+        self.sync_native_metadata();
+        let upstream = if let Some(native) = self.native.as_mut() {
+            entry.stream_chunks_count = native.response.chunks.min(i32::MAX as u64) as i32;
+            entry.stream_first_chunk_ms = self.metadata.first_chunk_ms;
+            entry.latency_upstream_ms = self
+                .metadata
+                .upstream_duration_ms
+                .or(entry.latency_upstream_ms);
+            std::mem::take(&mut native.response).finish(self.upstream_eof)
+        } else {
+            std::mem::take(&mut self.upstream_capture).finish(self.upstream_eof)
+        };
         let client = std::mem::take(&mut self.client_capture)
             .finish(self.delivery == Some(true) || self.client_drained());
         entry.upstream_response_body = upstream.body;
@@ -667,6 +863,301 @@ mod tests {
     async fn frame(body: &mut Body) -> Option<Result<Frame<Bytes>, axum::Error>> {
         futures::future::poll_fn(|cx| Pin::new(&mut *body).poll_frame(cx)).await
     }
+    #[test]
+    fn native_capture_hashes_exact_binary_in_constant_space() {
+        let data: Vec<u8> = (0..=255).cycle().take(2 * 1024 * 1024 + 7).collect();
+        let mut capture = NativeCapture::default();
+        for chunk in data.chunks(4093) {
+            capture.push(chunk);
+        }
+        let capture = capture.finish(true);
+        assert!(capture.body.is_none());
+        assert_eq!(capture.metadata["total_observed_bytes"], data.len());
+        assert_eq!(capture.metadata["retained_bytes"], 0);
+        assert_eq!(
+            capture.metadata["sha256"],
+            hex::encode(Sha256::digest(&data))
+        );
+        assert_eq!(capture.metadata["encoding"], "binary");
+        assert_eq!(capture.metadata["capture_state"], "digest_only");
+        assert!(capture.metadata.to_string().len() < 512);
+    }
+
+    #[tokio::test]
+    async fn native_request_redacts_headers_and_never_retains_history() {
+        let (a, g, mut rx) = setup();
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            "authorization",
+            "Bearer private-credential".parse().unwrap(),
+        );
+        headers.insert("x-cursor-token", "private-token".parse().unwrap());
+        headers.insert("cookie", "private-cookie".parse().unwrap());
+        headers.insert("content-type", "application/connect+proto".parse().unwrap());
+        let binary = b"\xff\x00private-history";
+        a.note_native_request(
+            &headers,
+            binary,
+            &json!({
+                "message_count": 3,
+                "tool_count": "private-history",
+                "has_tools": true,
+                "history": ["private-history"],
+                "authorization": "private-credential",
+                "nested": {"history_bytes": 25},
+            }),
+        );
+        a.response(200, &headers);
+        a.chunk(b"\xfe\x00response-history");
+        a.eof();
+        let body = a.wrap(Response::new(Body::empty()));
+        g.finish();
+        drop(g);
+        axum::body::to_bytes(body.into_body(), 100).await.unwrap();
+        let log = rx.try_recv().unwrap();
+        assert!(log.upstream_request_body.is_none());
+        assert!(log.upstream_response_body.is_none());
+        assert_eq!(log.performance.response_mode, "stream");
+        assert_eq!(log.performance.effort_status, "unknown");
+        let headers = log.upstream_request_headers.unwrap();
+        assert!(headers.contains("***"));
+        assert!(!headers.contains("private-"));
+        let metadata = log.diagnostic.payload_metadata;
+        assert_eq!(
+            metadata["upstream_request_body"]["total_observed_bytes"],
+            binary.len()
+        );
+        assert_eq!(
+            metadata["upstream_request_body"]["sha256"],
+            hex::encode(Sha256::digest(binary))
+        );
+        assert_eq!(
+            metadata["upstream_request_body"]["semantic_summary"],
+            json!({
+                "message_count": 3, "has_tools": true,
+            })
+        );
+        assert!(!metadata.to_string().contains("private-"));
+        assert_eq!(metadata["upstream_response_body"]["retained_bytes"], 0);
+    }
+
+    #[tokio::test]
+    async fn native_synthetic_sse_and_ir_done_never_prove_completion() {
+        for bytes in [
+            b"data: {\"choices\":[{\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n".as_slice(),
+            br#"{"type":"response.completed","status":"completed"}"#.as_slice(),
+        ] {
+            let (a, g, mut rx) = setup();
+            a.configure_native_stream();
+            a.request(br#"{"reasoning_effort":"high","history":"private"}"#);
+            a.chunk(bytes);
+            a.eof();
+            let mut forged = entry();
+            forged.performance.completion = "completed".into();
+            forged.diagnostic.attempt_outcome = "completed".into();
+            forged.diagnostic.outcome_version = 1;
+            forged.diagnostic.payload_metadata["native_stream"] =
+                json!({"upstream_turn_ended": true});
+            a.log(forged);
+            let body = a.wrap(Response::new(Body::from("synthetic Done")));
+            g.finish();
+            drop(g);
+            axum::body::to_bytes(body.into_body(), 100).await.unwrap();
+            let log = rx.try_recv().unwrap();
+            assert_eq!(log.diagnostic.attempt_outcome, "unknown");
+            assert_eq!(
+                log.diagnostic.failure_kind.as_deref(),
+                Some("ambiguous_terminal")
+            );
+            assert!(log.performance.completed_at.is_none());
+            assert_eq!(log.performance.effort_status, "unknown");
+            assert!(log.upstream_request_body.is_none());
+            assert_eq!(
+                log.diagnostic.payload_metadata["native_stream"]["api_round_complete"],
+                false
+            );
+            assert!(a.0.lock().unwrap().terminal.buffer.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn native_terminal_distinguishes_tool_round_from_upstream_turn() {
+        for evidence in [
+            NativeTerminalEvidence::Completed,
+            NativeTerminalEvidence::ToolHandoff,
+        ] {
+            for eof in [false, true] {
+                let (a, g, mut rx) = setup();
+                a.note_native_request(
+                    &reqwest::header::HeaderMap::new(),
+                    b"\x00request",
+                    &json!({}),
+                );
+                a.chunk(&[]);
+                assert!(a.0.lock().unwrap().metadata.first_chunk_ms.is_none());
+                a.chunk(b"\xfffirst");
+                a.chunk(b"\xfesecond");
+                a.observe_native_terminal(evidence);
+                if eof {
+                    a.eof();
+                }
+                a.correlate("native-request", 1);
+                a.select_final(1);
+                let body = a.wrap(Response::new(Body::from("converted terminal")));
+                axum::body::to_bytes(body.into_body(), 100).await.unwrap();
+                assert!(rx.try_recv().is_err(), "producer must still gate logging");
+                g.finish();
+                drop(g);
+                let log = rx.try_recv().unwrap();
+                assert_eq!(log.performance.completion, "completed");
+                assert_eq!(
+                    log.performance.completion_reason.as_deref(),
+                    Some(evidence.reason())
+                );
+                assert!(log.performance.completed_at.is_some());
+                assert_eq!(
+                    log.diagnostic.final_result.unwrap().final_outcome,
+                    "completed"
+                );
+                assert_eq!(log.stream_chunks_count, 2);
+                assert!(log.stream_first_chunk_ms.is_some());
+                let metadata = log.diagnostic.payload_metadata;
+                assert_eq!(
+                    metadata["native_stream"]["upstream_turn_ended"],
+                    evidence == NativeTerminalEvidence::Completed
+                );
+                assert_eq!(metadata["native_stream"]["api_round_complete"], true);
+                assert_eq!(metadata["upstream_response_body"]["complete"], eof);
+                assert_eq!(metadata["upstream_response_body"]["chunks"], 2);
+                assert_eq!(
+                    metadata["upstream_response_body"]["total_observed_bytes"],
+                    13
+                );
+                assert!(rx.try_recv().is_err(), "exactly once");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn native_completion_retains_failure_timeout_and_cancellation_priority() {
+        for evidence in [
+            NativeTerminalEvidence::Completed,
+            NativeTerminalEvidence::ToolHandoff,
+        ] {
+            for outcome in ["failed", "timed_out", "cancelled", "output_limited"] {
+                let (a, g, mut rx) = setup();
+                a.configure_native_stream();
+                a.chunk(b"\x00original");
+                a.observe_native_terminal(evidence);
+                if outcome == "cancelled" {
+                    a.0.lock().unwrap().cancellation.cancel();
+                } else if outcome == "timed_out" {
+                    a.0.lock().unwrap().deadline = Deadline::from_now(std::time::Duration::ZERO);
+                } else {
+                    a.record_message(
+                        outcome,
+                        "native_wire_error",
+                        "upstream_response",
+                        "verified failure",
+                    );
+                }
+                a.note_client_frame_sent();
+                let body = a.wrap(Response::new(Body::from("done")));
+                g.finish();
+                drop(g);
+                axum::body::to_bytes(body.into_body(), 100).await.unwrap();
+                let log = rx.try_recv().unwrap();
+                assert_eq!(log.performance.completion, outcome);
+                assert!(log.performance.completed_at.is_none());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn native_drain_reconciles_drop_only_after_all_client_frames() {
+        for evidence in [
+            NativeTerminalEvidence::Completed,
+            NativeTerminalEvidence::ToolHandoff,
+        ] {
+            for drained in [false, true] {
+                let (a, g, mut rx) = setup();
+                a.configure_native_stream();
+                a.chunk(b"\x00original");
+                a.observe_native_terminal(evidence);
+                a.note_client_frame_sent();
+                if !drained {
+                    a.note_client_frame_sent();
+                }
+                let mut body = a
+                    .wrap(Response::new(Body::from_stream(futures::stream::iter(
+                        vec![Ok::<_, std::io::Error>(Bytes::from_static(
+                            b"client terminal",
+                        ))],
+                    ))))
+                    .into_body();
+                g.finish();
+                drop(g);
+                frame(&mut body).await.unwrap().unwrap();
+                drop(body);
+                let log = rx.try_recv().unwrap();
+                assert_eq!(
+                    log.performance.completion,
+                    if drained { "completed" } else { "cancelled" }
+                );
+                assert_eq!(log.performance.completed_at.is_some(), drained);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn native_usage_unknown_partial_and_reported_are_not_known_free() {
+        for provenance in [
+            NativeUsageProvenance::Unknown,
+            NativeUsageProvenance::Partial,
+            NativeUsageProvenance::Reported,
+        ] {
+            let (a, g, mut rx) = setup();
+            a.configure_native_stream();
+            // Unknown is the default; merely seeing bytes/Done never upgrades it.
+            if provenance != NativeUsageProvenance::Unknown {
+                a.note_native_usage_provenance(provenance);
+            }
+            a.chunk(b"\x00wire");
+            a.observe_native_terminal(NativeTerminalEvidence::Completed);
+            let mut log = entry();
+            log.usage.prompt_tokens = 12;
+            log.diagnostic.payload_metadata["usage_provenance"] =
+                json!({"status": "reported", "known_free": true});
+            a.log(log);
+            let body = a.wrap(Response::new(Body::empty()));
+            g.finish();
+            drop(g);
+            axum::body::to_bytes(body.into_body(), 100).await.unwrap();
+            let log = rx.try_recv().unwrap();
+            assert_eq!(log.usage.prompt_tokens, 12);
+            assert_eq!(
+                log.diagnostic.payload_metadata["usage_provenance"],
+                provenance.metadata()
+            );
+            assert_eq!(
+                log.diagnostic.payload_metadata["usage_provenance"]["known_free"],
+                false
+            );
+        }
+    }
+
+    #[test]
+    fn connect_proto_is_streaming_even_without_native_configuration() {
+        let (a, _g, _rx) = setup();
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            "content-type",
+            "application/connect+proto; charset=binary".parse().unwrap(),
+        );
+        a.response(200, &headers);
+        assert_eq!(a.0.lock().unwrap().metadata.response_mode, "stream");
+    }
+
     #[tokio::test]
     async fn observed_ambiguity_is_versioned_and_retained_but_unobserved_is_not() {
         for observed in [false, true] {

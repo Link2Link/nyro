@@ -4,6 +4,8 @@ use axum::response::Response;
 pub(crate) enum RetryDisposition {
     DefaultStatusPolicy,
     ForceRetry,
+    /// The upstream may already have acted; never automatically replay.
+    Never,
 }
 
 impl RetryDisposition {
@@ -11,6 +13,7 @@ impl RetryDisposition {
         match self {
             Self::DefaultStatusPolicy => status_retryable,
             Self::ForceRetry => true,
+            Self::Never => false,
         }
     }
 }

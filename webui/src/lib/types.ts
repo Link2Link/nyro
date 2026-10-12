@@ -470,7 +470,8 @@ export type ProviderProtocol =
   | "openai-compatible"
   | "openai-responses"
   | "anthropic-messages"
-  | "google-gemini";
+  | "google-gemini"
+  | "cursor-agent/run/v1";
 
 export type ProviderProtocolMode = "fixed" | "adaptive";
 
@@ -804,6 +805,7 @@ export interface OAuthSessionInitData {
   scheme: string;
   auth_url: string;
   requires_manual_code: boolean;
+  completion_mode?: "manual_exchange" | "poll";
   user_code: string;
   verification_uri: string;
   verification_uri_complete: string;
@@ -817,6 +819,7 @@ export type OAuthSessionStatusData =
       scheme: string;
       auth_url: string;
       requires_manual_code: boolean;
+      completion_mode?: "manual_exchange" | "poll";
       expires_in: number;
       interval: number;
       user_code: string;

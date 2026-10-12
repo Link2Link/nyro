@@ -222,7 +222,12 @@ fn should_record_payload(
 fn clear_payload(entry: &mut LogEntry) {
     if let Some(metadata) = entry.diagnostic.payload_metadata.as_object_mut() {
         for value in metadata.values_mut() {
-            if let Some(fields) = value.as_object_mut() {
+            if let Some(fields) = value
+                .as_object_mut()
+                .filter(|f| f.contains_key("capture_state"))
+            {
+                // Provenance/terminal facts share this JSON envelope but are not
+                // payload captures. Keep them intact when body recording is off.
                 fields.insert("capture_state".into(), serde_json::json!("not_retained"));
                 fields.insert("retained_bytes".into(), serde_json::json!(0));
                 fields.insert("head_bytes".into(), serde_json::json!(0));
@@ -373,8 +378,39 @@ mod tests {
             enable_payload: Some(false),
         };
 
+        let provenance = serde_json::json!({
+            "source": "cursor_native", "status": "partial", "known_free": false,
+        });
+        let terminal = serde_json::json!({
+            "terminal": "cursor_tool_handoff", "upstream_turn_ended": false,
+        });
+        entry.diagnostic.payload_metadata = serde_json::json!({
+            "usage_provenance": provenance,
+            "native_stream": terminal,
+            "upstream_response_body": {
+                "capture_state": "digest_only", "retained_bytes": 0,
+                "total_observed_bytes": 314, "sha256": "binary-digest",
+            },
+        });
         clear_payload(&mut entry);
 
+        assert_eq!(
+            entry.diagnostic.payload_metadata["usage_provenance"],
+            provenance
+        );
+        assert_eq!(entry.diagnostic.payload_metadata["native_stream"], terminal);
+        assert_eq!(
+            entry.diagnostic.payload_metadata["upstream_response_body"]["capture_state"],
+            "not_retained"
+        );
+        assert_eq!(
+            entry.diagnostic.payload_metadata["upstream_response_body"]["sha256"],
+            "binary-digest"
+        );
+        assert_eq!(
+            entry.diagnostic.payload_metadata["upstream_response_body"]["total_observed_bytes"],
+            314
+        );
         assert!(entry.client_request_headers.is_none());
         assert!(entry.client_request_body.is_none());
         assert!(entry.client_response_headers.is_none());

@@ -344,3 +344,194 @@ async fn seed_ready_session(
         .await?;
     Ok(())
 }
+
+#[tokio::test]
+async fn cursor_completion_mode_is_poll_and_never_exposes_verifier() -> anyhow::Result<()> {
+    let gw = build_gateway().await?;
+    let init = gw.admin().init_oauth_session("cursor", false).await?;
+    assert_eq!(init.completion_mode, Some(auth::AuthCompletionMode::Poll));
+    assert!(!init.requires_manual_code);
+    assert!((295..=300).contains(&init.expires_in));
+    let session = gw
+        .admin()
+        .get_auth_session_record(&init.session_id)
+        .await?
+        .unwrap();
+    let state: Value = serde_json::from_str(session.state_json.as_deref().unwrap())?;
+    let verifier = state["verifier"].as_str().unwrap();
+    assert!(!serde_json::to_string(&init)?.contains(verifier));
+    // Make the offline test independent of slow CI clock time: force the
+    // server-side throttle so this test can never contact the real upstream.
+    gw.auth_session_controls
+        .lock()
+        .await
+        .get_mut(&init.session_id)
+        .unwrap()
+        .next_poll_at = Some(tokio::time::Instant::now() + std::time::Duration::from_secs(300));
+    let pending = gw
+        .admin()
+        .get_oauth_session_status(&init.session_id)
+        .await?;
+    assert!(!serde_json::to_string(&pending)?.contains(verifier));
+    assert!(matches!(
+        pending,
+        AuthSessionStatusData::Pending {
+            completion_mode: Some(auth::AuthCompletionMode::Poll),
+            requires_manual_code: false,
+            ..
+        }
+    ));
+    assert!(
+        gw.admin()
+            .complete_oauth_session(&init.session_id, AuthExchangeInput::default())
+            .await
+            .is_err()
+    );
+    // Removing mode mimics a legacy PKCE session; scheme fallback remains manual.
+    gw.admin()
+        .update_auth_session_record(
+            &init.session_id,
+            UpdateAuthSession {
+                context_json: Some("{}".into()),
+                ..Default::default()
+            },
+        )
+        .await?;
+    assert!(matches!(
+        gw.admin()
+            .get_oauth_session_status(&init.session_id)
+            .await?,
+        AuthSessionStatusData::Pending {
+            completion_mode: Some(auth::AuthCompletionMode::ManualExchange),
+            requires_manual_code: true,
+            ..
+        }
+    ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn cancelled_taken_session_cannot_be_restored() -> anyhow::Result<()> {
+    let gw = build_gateway().await?;
+    let init = gw.admin().init_oauth_session("codex", false).await?;
+    seed_ready_session(
+        &gw.admin(),
+        &init.session_id,
+        CredentialBundle {
+            access_token: Some("fake".into()),
+            expires_at: Some(FAR_FUTURE_RFC3339.into()),
+            ..Default::default()
+        },
+    )
+    .await?;
+    let taken = gw
+        .admin()
+        .take_ready_auth_session_record(&init.session_id)
+        .await?;
+    gw.admin().cancel_oauth_session(&init.session_id).await?;
+    gw.admin().restore_auth_session_record(taken).await?;
+    assert!(
+        gw.admin()
+            .get_auth_session_record(&init.session_id)
+            .await?
+            .is_none()
+    );
+    Ok(())
+}
+
+fn cursor_test_bundle(refresh: bool) -> CredentialBundle {
+    use base64::Engine;
+    let expires = Utc::now().timestamp() + 3600;
+    let access = format!(
+        "e30.{}.test-signature",
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
+            serde_json::to_vec(&json!({"sub":"auth0|test-cursor-user","exp":expires})).unwrap()
+        )
+    );
+    CredentialBundle {
+        access_token: Some(access),
+        refresh_token: refresh.then(|| "fixture-refresh".into()),
+        expires_at: Some(
+            DateTime::<Utc>::from_timestamp(expires, 0)
+                .unwrap()
+                .to_rfc3339(),
+        ),
+        subject_id: Some("test-cursor-user".into()),
+        resource_url: Some("https://api2.cursor.sh".into()),
+        raw: json!({"label":"fixture"}),
+        ..Default::default()
+    }
+}
+
+#[tokio::test]
+async fn cursor_session_canonical_provider_and_terminal_token_policy() -> anyhow::Result<()> {
+    let gw = build_gateway().await?;
+    let admin = gw.admin();
+    let init = admin.init_oauth_session("cursor", false).await?;
+    seed_ready_session(&admin, &init.session_id, cursor_test_bundle(true)).await?;
+    let provider = admin
+        .create_provider_with_oauth_session(&init.session_id, oauth_provider_input())
+        .await?;
+    assert_eq!(provider.vendor.as_deref(), Some("cursor"));
+    assert_eq!(provider.channel.as_deref(), Some("agent"));
+    assert_eq!(provider.protocol, "cursor-agent/run/v1");
+    assert_eq!(provider.base_url, "https://api2.cursor.sh");
+    let store = gw.storage.oauth_credentials();
+    let credential = store.get(&provider.id).await?.unwrap();
+    let lease = store
+        .try_begin_refresh(&provider.id, credential.status_version)
+        .await?
+        .unwrap();
+    store
+        .fail_refresh_with_policy(
+            &provider.id,
+            lease.status_version,
+            "transient",
+            false,
+            Some(json!({"cursor_refresh_retry_at":Utc::now().timestamp()+300}).to_string()),
+        )
+        .await?;
+    // Only typed transient failures leave connected state and permit old token.
+    assert!(admin.resolve_provider_runtime(&provider).await.is_ok());
+    let current = store.get(&provider.id).await?.unwrap();
+    let lease = store
+        .try_begin_refresh(&provider.id, current.status_version)
+        .await?
+        .unwrap();
+    store
+        .fail_refresh_with_policy(
+            &provider.id,
+            lease.status_version,
+            "reauthentication required",
+            true,
+            None,
+        )
+        .await?;
+    let error = admin
+        .resolve_provider_runtime(&provider)
+        .await
+        .err()
+        .expect("terminal Cursor credential must fail");
+    assert!(error.to_string().contains("reauthentication"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn cursor_missing_refresh_terminalizes_without_contacting_upstream() -> anyhow::Result<()> {
+    let gw = build_gateway().await?;
+    let admin = gw.admin();
+    let init = admin.init_oauth_session("cursor", false).await?;
+    seed_ready_session(&admin, &init.session_id, cursor_test_bundle(false)).await?;
+    let provider = admin
+        .create_provider_with_oauth_session(&init.session_id, oauth_provider_input())
+        .await?;
+    let error = admin
+        .reconnect_provider_oauth(&provider.id)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("reauthentication"));
+    let status = admin.get_provider_oauth_status(&provider.id).await?;
+    assert_eq!(status.status, "error");
+    assert!(!status.has_refresh_token);
+    Ok(())
+}

@@ -1,12 +1,14 @@
 use std::sync::Arc;
 
 use crate::auth::drivers::{
-    ClaudeOAuthDriver, GoogleSubscriptionDriver, GrokOAuthDriver, OpenAIOAuthDriver,
+    ClaudeOAuthDriver, CursorAuthDriver, GoogleSubscriptionDriver, GrokOAuthDriver,
+    OpenAIOAuthDriver,
 };
 use crate::auth::types::{AuthDriver, AuthDriverMetadata};
 
 pub fn normalize_driver_key(value: &str) -> String {
     match value.trim().to_ascii_lowercase().as_str() {
+        "cursor" | "cursor-agent" | "cursor-cli" => "cursor".to_string(),
         "openai-oauth" | "openai_oauth" | "openai" | "codex-cli" | "codex" => "codex".to_string(),
         "claude-code" | "claude_code" | "claude-oauth" | "claude_oauth" | "claude"
         | "anthropic" => "claude-code".to_string(),
@@ -25,6 +27,7 @@ pub fn normalize_driver_key(value: &str) -> String {
 
 pub fn build_driver(key: &str) -> Option<Arc<dyn AuthDriver>> {
     match normalize_driver_key(key).as_str() {
+        "cursor" => Some(Arc::new(CursorAuthDriver)),
         "codex" => Some(Arc::new(OpenAIOAuthDriver)),
         "claude-code" => Some(Arc::new(ClaudeOAuthDriver)),
         "grok" => Some(Arc::new(GrokOAuthDriver)),
@@ -36,6 +39,7 @@ pub fn build_driver(key: &str) -> Option<Arc<dyn AuthDriver>> {
 
 pub fn list_driver_metadata() -> Vec<AuthDriverMetadata> {
     [
+        build_driver("cursor"),
         build_driver("codex"),
         build_driver("claude-code"),
         build_driver("grok"),
@@ -97,8 +101,32 @@ mod tests {
     }
 
     #[test]
+    fn cursor_is_pkce_with_poll_completion_and_legacy_drivers_stay_manual() {
+        use crate::auth::{AuthCompletionMode, AuthScheme};
+        for alias in ["cursor", "CURSOR", "cursor-agent", "cursor-cli"] {
+            let driver = build_driver(alias).unwrap();
+            assert_eq!(driver.metadata().key, "cursor");
+            assert_eq!(driver.metadata().scheme, AuthScheme::OAuthAuthCodePkce);
+            assert_eq!(driver.completion_mode(), AuthCompletionMode::Poll);
+        }
+        for key in [
+            "codex",
+            "grok",
+            "claude-code",
+            "google",
+            "google-gemini-cli",
+        ] {
+            assert_eq!(
+                build_driver(key).unwrap().completion_mode(),
+                AuthCompletionMode::ManualExchange
+            );
+        }
+    }
+
+    #[test]
     fn list_includes_grok() {
         let keys: Vec<&str> = list_driver_metadata().into_iter().map(|m| m.key).collect();
+        assert!(keys.contains(&"cursor"));
         assert!(keys.contains(&"grok"));
         assert!(keys.contains(&"codex"));
         assert!(keys.contains(&"claude-code"));

@@ -72,6 +72,8 @@ pub struct Gateway {
     pub(crate) compat_engine: Arc<nyro_ccswitch_compat::CompatEngine>,
     pub log_tx: mpsc::Sender<LogEntry>,
     pub(crate) auth_sessions: Arc<tokio::sync::RwLock<HashMap<String, AuthSession>>>,
+    pub(crate) auth_session_controls:
+        Arc<tokio::sync::Mutex<HashMap<String, crate::auth::types::AuthSessionControl>>>,
     #[allow(dead_code)]
     sqlite_pool: Option<SqlitePool>,
     #[allow(dead_code)]
@@ -220,6 +222,7 @@ impl Gateway {
             compat_engine: Arc::new(nyro_ccswitch_compat::CompatEngine::default()),
             log_tx,
             auth_sessions: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            auth_session_controls: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             sqlite_pool,
             postgres_pool,
             mysql_pool,
@@ -346,6 +349,105 @@ impl Gateway {
         use_proxy: bool,
     ) -> anyhow::Result<reqwest::Client> {
         self.provider_http_client(use_proxy, true).await
+    }
+
+    /// Cursor's bidirectional Connect transport requires HTTP/2. Preserve the
+    /// configured proxy path and reject explicit HTTP/1-only configuration.
+    pub(crate) async fn required_http2_client(
+        &self,
+        use_proxy: bool,
+    ) -> anyhow::Result<reqwest::Client> {
+        if use_proxy {
+            let enabled = self
+                .storage
+                .settings()
+                .get("proxy_enabled")
+                .await?
+                .as_deref()
+                .map(parse_bool_setting)
+                .unwrap_or(false);
+            let force_http1 = self
+                .storage
+                .settings()
+                .get("proxy_force_http1")
+                .await?
+                .as_deref()
+                .map(parse_bool_setting)
+                .unwrap_or(false);
+            if enabled && force_http1 {
+                anyhow::bail!(
+                    "Cursor requires HTTP/2; disable proxy_force_http1 for this provider"
+                );
+            }
+        }
+        self.cursor_client_builder(use_proxy, true)
+            .await?
+            .build()
+            .map_err(Into::into)
+    }
+
+    /// Cursor auth carries the PKCE verifier in a query parameter. Never follow
+    /// redirects, including same-origin redirects to a different API surface.
+    pub(crate) async fn cursor_auth_http_client(
+        &self,
+        use_proxy: bool,
+    ) -> anyhow::Result<reqwest::Client> {
+        self.cursor_client_builder(use_proxy, false)
+            .await?
+            .build()
+            .map_err(Into::into)
+    }
+
+    async fn cursor_client_builder(
+        &self,
+        use_proxy: bool,
+        inference: bool,
+    ) -> anyhow::Result<reqwest::ClientBuilder> {
+        let mut builder = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(if inference {
+                self.config.upstream_timeouts.connect
+            } else {
+                std::time::Duration::from_secs(15)
+            });
+        if !inference {
+            builder = builder.timeout(std::time::Duration::from_secs(30));
+        }
+        // Match the existing per-provider proxy policy, including environment
+        // proxy behavior when no explicit configured proxy applies.
+        if use_proxy
+            && self
+                .storage
+                .settings()
+                .get("proxy_enabled")
+                .await?
+                .as_deref()
+                .map(parse_bool_setting)
+                .unwrap_or(false)
+        {
+            let url = self
+                .storage
+                .settings()
+                .get("proxy_url")
+                .await?
+                .unwrap_or_default();
+            let url = url.trim();
+            anyhow::ensure!(!url.is_empty(), "proxy_url is empty");
+            builder = builder.proxy(reqwest::Proxy::all(url)?);
+            if !inference
+                && self
+                    .storage
+                    .settings()
+                    .get("proxy_force_http1")
+                    .await?
+                    .as_deref()
+                    .map(parse_bool_setting)
+                    .unwrap_or(false)
+            {
+                builder = builder.http1_only();
+            }
+        }
+        Ok(builder)
     }
 
     async fn provider_http_client(

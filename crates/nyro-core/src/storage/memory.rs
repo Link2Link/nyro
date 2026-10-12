@@ -450,10 +450,80 @@ fn now_rfc3339() -> String {
     chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string()
 }
 
+fn write_memory_credential(
+    map: &mut std::collections::HashMap<String, OAuthCredential>,
+    provider_id: &str,
+    input: UpsertOAuthCredential,
+) -> anyhow::Result<OAuthCredential> {
+    let now = now_rfc3339();
+    if input.driver_key == "cursor"
+        && let Some(subject) = input.subject_id.as_deref().filter(|id| !id.is_empty())
+        && map.values().any(|credential| {
+            credential.provider_id != provider_id
+                && credential.driver_key == "cursor"
+                && credential.subject_id.as_deref() == Some(subject)
+                && credential.status != "disconnected"
+        })
+    {
+        anyhow::bail!("cursor_account_already_bound");
+    }
+    let version = map
+        .get(provider_id)
+        .map(|c| c.status_version + 1)
+        .unwrap_or(0);
+    let cred = OAuthCredential {
+        provider_id: provider_id.to_string(),
+        driver_key: input.driver_key,
+        scheme: input.scheme,
+        access_token: input.access_token,
+        refresh_token: input.refresh_token,
+        expires_at: input.expires_at,
+        resource_url: input.resource_url,
+        subject_id: input.subject_id,
+        scopes: input.scopes.unwrap_or_else(|| "[]".to_string()),
+        meta: input.meta.unwrap_or_else(|| "{}".to_string()),
+        status: "connected".to_string(),
+        status_version: version,
+        last_error: None,
+        last_refresh_at: map.get(provider_id).and_then(|c| c.last_refresh_at.clone()),
+        created_at: map
+            .get(provider_id)
+            .map(|c| c.created_at.clone())
+            .unwrap_or_else(|| now.clone()),
+        updated_at: now,
+    };
+    map.insert(provider_id.to_string(), cred.clone());
+    Ok(cred)
+}
+
+fn scrub_memory_credential(credential: &mut OAuthCredential) {
+    // Preserve only the generation fence, not the logged-out account.
+    credential.driver_key.clear();
+    credential.scheme.clear();
+    credential.access_token.clear();
+    credential.refresh_token = None;
+    credential.expires_at = None;
+    credential.resource_url = None;
+    credential.subject_id = None;
+    credential.scopes = "[]".to_string();
+    credential.meta = "{}".to_string();
+    credential.status = "disconnected".to_string();
+    credential.status_version += 1;
+    credential.last_error = None;
+    credential.last_refresh_at = None;
+    credential.updated_at = now_rfc3339();
+}
+
 #[async_trait]
 impl OAuthCredentialStore for MemoryOAuthCredentialStore {
     async fn get(&self, provider_id: &str) -> anyhow::Result<Option<OAuthCredential>> {
-        Ok(self.credentials.read().await.get(provider_id).cloned())
+        Ok(self
+            .credentials
+            .read()
+            .await
+            .get(provider_id)
+            .filter(|credential| credential.status != "disconnected")
+            .cloned())
     }
 
     async fn upsert(
@@ -461,39 +531,35 @@ impl OAuthCredentialStore for MemoryOAuthCredentialStore {
         provider_id: &str,
         input: UpsertOAuthCredential,
     ) -> anyhow::Result<OAuthCredential> {
-        let now = now_rfc3339();
         let mut map = self.credentials.write().await;
-        let version = map
-            .get(provider_id)
-            .map(|c| c.status_version + 1)
-            .unwrap_or(0);
-        let cred = OAuthCredential {
-            provider_id: provider_id.to_string(),
-            driver_key: input.driver_key,
-            scheme: input.scheme,
-            access_token: input.access_token,
-            refresh_token: input.refresh_token,
-            expires_at: input.expires_at,
-            resource_url: input.resource_url,
-            subject_id: input.subject_id,
-            scopes: input.scopes.unwrap_or_else(|| "[]".to_string()),
-            meta: input.meta.unwrap_or_else(|| "{}".to_string()),
-            status: "connected".to_string(),
-            status_version: version,
-            last_error: None,
-            last_refresh_at: map.get(provider_id).and_then(|c| c.last_refresh_at.clone()),
-            created_at: map
-                .get(provider_id)
-                .map(|c| c.created_at.clone())
-                .unwrap_or_else(|| now.clone()),
-            updated_at: now,
-        };
-        map.insert(provider_id.to_string(), cred.clone());
-        Ok(cred)
+        write_memory_credential(&mut map, provider_id, input)
+    }
+
+    async fn restore_if_version(
+        &self,
+        provider_id: &str,
+        expected_version: i32,
+        previous: Option<UpsertOAuthCredential>,
+    ) -> anyhow::Result<bool> {
+        let mut map = self.credentials.write().await;
+        if map.get(provider_id).is_none_or(|credential| {
+            credential.status != "connected" || credential.status_version != expected_version
+        }) {
+            return Ok(false);
+        }
+        if let Some(previous) = previous {
+            write_memory_credential(&mut map, provider_id, previous)?;
+        } else {
+            scrub_memory_credential(map.get_mut(provider_id).expect("checked under write lock"));
+        }
+        Ok(true)
     }
 
     async fn delete(&self, provider_id: &str) -> anyhow::Result<()> {
-        self.credentials.write().await.remove(provider_id);
+        let mut map = self.credentials.write().await;
+        if let Some(credential) = map.get_mut(provider_id) {
+            scrub_memory_credential(credential);
+        }
         Ok(())
     }
 
@@ -528,6 +594,12 @@ impl OAuthCredentialStore for MemoryOAuthCredentialStore {
         if cred.status != "refreshing" || cred.status_version != expected_version {
             return Ok(None);
         }
+        if (cred.driver_key == "cursor" || input.driver_key == "cursor")
+            && (cred.driver_key != input.driver_key || cred.subject_id != input.subject_id)
+        {
+            // A refresh cannot transfer an account or bypass bind uniqueness.
+            return Ok(None);
+        }
         let now = now_rfc3339();
         cred.driver_key = input.driver_key;
         cred.scheme = input.scheme;
@@ -550,11 +622,13 @@ impl OAuthCredentialStore for MemoryOAuthCredentialStore {
         Ok(Some(cred.clone()))
     }
 
-    async fn fail_refresh(
+    async fn fail_refresh_with_policy(
         &self,
         provider_id: &str,
         expected_version: i32,
         error_message: &str,
+        terminal: bool,
+        meta: Option<String>,
     ) -> anyhow::Result<bool> {
         let mut map = self.credentials.write().await;
         let Some(cred) = map.get_mut(provider_id) else {
@@ -563,36 +637,157 @@ impl OAuthCredentialStore for MemoryOAuthCredentialStore {
         if cred.status != "refreshing" || cred.status_version != expected_version {
             return Ok(false);
         }
-        // The token may still be usable and transient failures must remain
-        // retryable. Return to connected while retaining the diagnostic.
-        cred.status = "connected".to_string();
+        cred.status = if terminal { "error" } else { "connected" }.to_string();
+        if let Some(meta) = meta {
+            cred.meta = meta;
+        }
         cred.last_error = Some(error_message.to_string());
         cred.status_version += 1;
         cred.updated_at = now_rfc3339();
         Ok(true)
     }
 
-    async fn list_expiring(&self, _before: Duration) -> anyhow::Result<Vec<OAuthCredential>> {
+    async fn list_expiring(&self, before: Duration) -> anyhow::Result<Vec<OAuthCredential>> {
+        let cutoff = i128::from(chrono::Utc::now().timestamp()) + i128::from(before.as_secs());
         let map = self.credentials.read().await;
         Ok(map
             .values()
-            .filter(|c| c.status == "connected")
+            .filter(|credential| {
+                credential.status == "connected"
+                    && credential
+                        .expires_at
+                        .as_deref()
+                        .and_then(super::oauth::parse_timestamp)
+                        .is_some_and(|expiry| i128::from(expiry.timestamp()) <= cutoff)
+            })
             .cloned()
             .collect())
     }
 
-    async fn recover_stale_refreshing(&self, _timeout: Duration) -> anyhow::Result<u64> {
+    async fn recover_stale_refreshing(&self, timeout: Duration) -> anyhow::Result<u64> {
         let mut map = self.credentials.write().await;
+        let now = chrono::Utc::now();
+        let cutoff = i128::from(now.timestamp()) - i128::from(timeout.as_secs());
         let mut count = 0u64;
         for cred in map.values_mut() {
-            if cred.status == "refreshing" {
-                cred.status = "connected".to_string();
-                cred.last_error = Some("refresh timeout".to_string());
+            if cred.status == "refreshing"
+                && super::oauth::parse_timestamp(&cred.updated_at)
+                    .is_some_and(|updated| i128::from(updated.timestamp()) < cutoff)
+            {
+                let cursor = cred.driver_key == "cursor";
+                cred.status = if cursor { "error" } else { "connected" }.to_string();
+                cred.last_error = Some(if cursor {
+                    super::oauth::CURSOR_STALE_REFRESH_ERROR.to_string()
+                } else {
+                    super::oauth::STALE_REFRESH_ERROR.to_string()
+                });
                 cred.status_version += 1;
-                cred.updated_at = now_rfc3339();
+                cred.updated_at = now.format("%Y-%m-%d %H:%M:%S").to_string();
                 count += 1;
             }
         }
         Ok(count)
+    }
+}
+
+#[cfg(test)]
+mod oauth_time_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn stale_recovery_respects_age_and_cursor_rotation_uncertainty() -> anyhow::Result<()> {
+        let store = MemoryOAuthCredentialStore {
+            credentials: RwLock::new(std::collections::HashMap::new()),
+        };
+        for (provider, driver) in [
+            ("old-cursor", "cursor"),
+            ("old-codex", "codex"),
+            ("fresh", "cursor"),
+        ] {
+            let initial = store
+                .upsert(
+                    provider,
+                    UpsertOAuthCredential {
+                        driver_key: driver.to_string(),
+                        access_token: "secret".to_string(),
+                        subject_id: Some(provider.to_string()),
+                        ..Default::default()
+                    },
+                )
+                .await?;
+            store
+                .try_begin_refresh(provider, initial.status_version)
+                .await?
+                .unwrap();
+        }
+        {
+            let mut rows = store.credentials.write().await;
+            rows.get_mut("old-cursor").unwrap().updated_at =
+                "2000-01-01T01:00:00+01:00".to_string();
+            rows.get_mut("old-codex").unwrap().updated_at = "2000-01-01 00:00:00".to_string();
+        }
+        assert_eq!(
+            store
+                .recover_stale_refreshing(Duration::from_secs(60))
+                .await?,
+            2
+        );
+        assert_eq!(
+            store
+                .recover_stale_refreshing(Duration::from_secs(60))
+                .await?,
+            0
+        );
+        let cursor = store.get("old-cursor").await?.unwrap();
+        assert_eq!(cursor.status, "error");
+        assert_eq!(
+            cursor.last_error.as_deref(),
+            Some(super::super::oauth::CURSOR_STALE_REFRESH_ERROR)
+        );
+        assert_eq!(cursor.status_version, 2);
+        assert_eq!(store.get("old-codex").await?.unwrap().status, "connected");
+        assert_eq!(store.get("fresh").await?.unwrap().status, "refreshing");
+        assert!(!store.fail_refresh("old-cursor", 1, "late").await?);
+        assert!(
+            store
+                .complete_refresh("old-cursor", 1, UpsertOAuthCredential::default())
+                .await?
+                .is_none()
+        );
+        store.delete("old-cursor").await?;
+        assert!(store.get("old-cursor").await?.is_none());
+        let rows = store.credentials.read().await;
+        let tombstone = rows.get("old-cursor").unwrap();
+        assert_eq!(tombstone.status, "disconnected");
+        assert_eq!(tombstone.access_token, "");
+        assert_eq!(tombstone.meta, "{}");
+        assert_eq!(tombstone.subject_id, None);
+        assert_eq!(tombstone.refresh_token, None);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn invalid_or_absent_expiry_is_not_scheduled() -> anyhow::Result<()> {
+        let store = MemoryOAuthCredentialStore {
+            credentials: RwLock::new(std::collections::HashMap::new()),
+        };
+        for expiry in [None, Some("not-a-time".to_string())] {
+            store
+                .upsert(
+                    "provider",
+                    UpsertOAuthCredential {
+                        expires_at: expiry,
+                        ..Default::default()
+                    },
+                )
+                .await?;
+            assert!(
+                store
+                    .list_expiring(Duration::from_secs(60))
+                    .await?
+                    .is_empty()
+            );
+        }
+        Ok(())
     }
 }

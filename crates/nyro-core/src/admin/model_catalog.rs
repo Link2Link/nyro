@@ -4,7 +4,25 @@ pub(super) const MODELS_DEV_SNAPSHOT: &str = include_str!("../../assets/models.d
 pub(super) const MODELS_DEV_RUNTIME_FILE: &str = "models.dev.json";
 pub(super) const MODELS_DEV_SOURCE_URL: &str = "https://models.dev/api.json";
 pub(super) const MODELS_DEV_RUNTIME_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+/// Includes malformed Cursor declarations so they fail validation instead of
+/// ever falling through to a generic JSON/HTTP or static-model path.
+pub(super) fn is_cursor_provider(provider: &Provider) -> bool {
+    [provider.vendor.as_deref(), provider.preset_key.as_deref()]
+        .into_iter()
+        .flatten()
+        .any(|v| v.trim().eq_ignore_ascii_case("cursor"))
+        || provider
+            .protocol
+            .trim()
+            .split('/')
+            .next()
+            .is_some_and(|v| v.eq_ignore_ascii_case("cursor-agent"))
+}
+
 pub(super) fn resolve_models_endpoint(provider: &Provider) -> Option<String> {
+    if is_cursor_provider(provider) {
+        return None;
+    }
     if let Some(endpoint) = provider.effective_models_source() {
         let trimmed = endpoint.trim();
         if !trimmed.is_empty() {
@@ -466,6 +484,55 @@ pub(super) fn lookup_models_dev_capability(
     match_models_dev_capability(&data, vendor_key, model)
 }
 
+/// Entitlements only prove a model is routable. Do not infer Cursor features
+/// from another vendor's similarly named model (or from display names).
+pub(super) fn cursor_model_capabilities(data_dir: &Path, model: &str) -> ModelCapabilities {
+    let known = parse_models_dev_data(data_dir).ok().and_then(|data| {
+        data.get("cursor")?
+            .models
+            .get(model)
+            .map(|entry| to_models_dev_capability("cursor", entry))
+    });
+    constrain_cursor_capabilities(model, known)
+}
+
+fn constrain_cursor_capabilities(
+    model: &str,
+    known: Option<ModelCapabilities>,
+) -> ModelCapabilities {
+    let local = crate::protocol::ids::CURSOR_AGENT_CAPABILITIES;
+    // Zero/None means unknown, not an invented context or billing allowance.
+    let mut caps = known.unwrap_or_else(|| ModelCapabilities {
+        provider: "cursor".into(),
+        model_id: model.into(),
+        context_window: 0,
+        embedding_length: None,
+        output_max_tokens: None,
+        tool_call: false,
+        reasoning: false,
+        input_modalities: vec!["text".into()],
+        output_modalities: vec!["text".into()],
+        input_cost: None,
+        output_cost: None,
+        cache_read_cost: None,
+        currency: None,
+    });
+    caps.provider = "cursor".into();
+    caps.model_id = model.into();
+    caps.tool_call &= local.tools && local.function_calling;
+    caps.reasoning &= local.reasoning;
+    caps.embedding_length = None;
+    caps.input_modalities.retain(|modality| modality == "text");
+    caps.output_modalities.retain(|modality| modality == "text");
+    // API-token prices from the underlying model vendor do not describe a
+    // Cursor subscription, even for a model whose feature record is known.
+    caps.input_cost = None;
+    caps.output_cost = None;
+    caps.cache_read_cost = None;
+    caps.currency = None;
+    caps
+}
+
 pub(super) fn fuzzy_match_models_dev(data_dir: &Path, model: &str) -> Option<ModelCapabilities> {
     let data = parse_models_dev_data(data_dir).ok()?;
     match_models_dev_capability(&data, "", model)
@@ -777,6 +844,39 @@ mod tests {
             cache_read_cost: Some(0.26),
             currency: Some("USD".to_string()),
         }
+    }
+
+    #[test]
+    fn cursor_unknown_capabilities_are_safe_and_do_not_guess_model_families() {
+        let caps =
+            cursor_model_capabilities(Path::new("/nonexistent-nyro-cursor-catalog"), "gpt-4o");
+        assert_eq!(caps.provider, "cursor");
+        assert_eq!(caps.model_id, "gpt-4o");
+        assert_eq!(caps.context_window, 0);
+        assert!(!caps.tool_call);
+        assert!(!caps.reasoning);
+        assert_eq!(caps.input_modalities, vec!["text"]);
+        assert_eq!(caps.output_modalities, vec!["text"]);
+        assert!(caps.input_cost.is_none());
+        assert!(caps.output_max_tokens.is_none());
+    }
+
+    #[test]
+    fn cursor_known_capabilities_are_intersected_with_local_native_contract() {
+        let mut advertised = caps_for("exact-native-id");
+        advertised.input_modalities = vec!["text".into(), "image".into(), "audio".into()];
+        advertised.output_modalities = vec!["text".into(), "image".into()];
+        advertised.embedding_length = Some(4096);
+        let caps = constrain_cursor_capabilities("exact-native-id", Some(advertised));
+        assert!(caps.tool_call);
+        assert!(caps.reasoning);
+        assert_eq!(caps.input_modalities, vec!["text"]);
+        assert_eq!(caps.output_modalities, vec!["text"]);
+        assert!(caps.embedding_length.is_none());
+        assert!(caps.input_cost.is_none());
+        assert!(caps.output_cost.is_none());
+        assert!(caps.cache_read_cost.is_none());
+        assert!(caps.currency.is_none());
     }
 
     #[test]

@@ -1,5 +1,6 @@
 pub mod memory;
 pub mod mysql;
+mod oauth;
 pub mod postgres;
 pub mod sql;
 pub mod sqlite;
@@ -17,3 +18,5 @@ pub use traits::{
 
 #[cfg(test)]
 mod oauth_refresh_tests;
+#[cfg(test)]
+mod provider_endpoint_tests;

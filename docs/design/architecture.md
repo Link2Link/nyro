@@ -628,6 +628,14 @@ Google 订阅共两条 channel，均经 Code Assist 内部 API（`cloudcode-pa.g
 
 ---
 
+### 6.7 Cursor AgentService（实验性原生出站）
+
+Cursor 使用独立出站协议 `cursor-agent/run/v1` 和 `VendorStream` execution descriptor，不注册客户端 ingress 或假 JSON codec；普通 provider 保持 `JsonHttp`。调度器在 JSON 构建和 raw-wire compat 前分支，原生 `Vendor::start_ir` 返回 IR 事件流，经统一工具还原、hooks、响应编码与日志链路消费。HTTP/2 duplex 保留 Data 与 Trailers，Cursor 内部处理 Protobuf、KV 与 RequestContext，不启动 CLI/Node，也不执行宿主工具。
+
+OAuth 使用 PKCE deep-link + 上游轮询，完成方式与认证 scheme 独立；现有 DTO 追加 `completion_mode` 并兼容 `requires_manual_code`。凭据与 provider 一对一，Cursor subject 原子防重复绑定，复制不含凭据。工具调用交接后关闭 Run，下一次 HTTP 请求带完整历史重建；不提供跨请求活会话。原生终结证据与合成客户端 SSE 分离，未知用量不得被当成已知免费。
+
+详细边界、固定协议来源、资源限制和验证状态见[英文设计](<cursor-provider.md>)及[中文设计](<cursor-provider.CN.md>)。当前只完成离线验证，真实账号授权、刷新与工具闭环仍需用户授权验收。
+
 ## 7. 错误处理
 
 `GatewayError` 统一 taxonomy：

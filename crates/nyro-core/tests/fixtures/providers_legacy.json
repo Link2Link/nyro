@@ -824,5 +824,27 @@
         "authMode": "apikey"
       }
     ]
+  },
+  {
+    "id": "cursor",
+    "label": { "zh": "Cursor（实验性）", "en": "Cursor (Experimental)" },
+    "icon": "cursor",
+    "defaultProtocol": "cursor-agent/run/v1",
+    "channels": [
+      {
+        "id": "agent",
+        "label": { "zh": "AgentService 订阅", "en": "AgentService subscription" },
+        "baseUrls": { "cursor-agent/run/v1": "https://api2.cursor.sh" },
+        "authMode": "oauth",
+        "oauth": {
+          "authBaseUrl": "https://cursor.com",
+          "authorizeUrl": "https://cursor.com/loginDeepControl",
+          "tokenUrl": "https://api2.cursor.sh/auth/exchange_user_api_key",
+          "clientId": "",
+          "redirectUri": "",
+          "scope": ""
+        }
+      }
+    ]
   }
 ]

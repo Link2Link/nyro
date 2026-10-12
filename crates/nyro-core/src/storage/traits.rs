@@ -246,31 +246,71 @@ pub trait LogStore: Send + Sync {
 
 #[async_trait]
 pub trait OAuthCredentialStore: Send + Sync {
+    /// Disconnected version fences are never returned as credentials.
     async fn get(&self, provider_id: &str) -> anyhow::Result<Option<OAuthCredential>>;
+    /// Atomically bind and advance the generation. A nonempty Cursor subject may
+    /// belong to only one provider, including rows requiring reauthentication.
     async fn upsert(
         &self,
         provider_id: &str,
         input: UpsertOAuthCredential,
     ) -> anyhow::Result<OAuthCredential>;
+    /// Compensate a failed bind only while its published connected generation
+    /// still owns the row. Some restores prior credentials with a new generation
+    /// and the same account uniqueness guard as bind; None scrubs a tombstone.
+    /// A newer bind, refresh, or logout returns false without mutation.
+    async fn restore_if_version(
+        &self,
+        provider_id: &str,
+        expected_version: i32,
+        previous: Option<UpsertOAuthCredential>,
+    ) -> anyhow::Result<bool>;
+    /// Remove credentials from the public view and scrub all secret/account data.
+    /// Stores retain a disconnected version fence until the provider is deleted,
+    /// so logout followed by rebind cannot reuse a previous refresh generation.
     async fn delete(&self, provider_id: &str) -> anyhow::Result<()>;
+    /// Atomically acquire the expected connected generation and return that exact
+    /// snapshot, never a later bind or another refresher's row.
     async fn try_begin_refresh(
         &self,
         provider_id: &str,
         expected_version: i32,
     ) -> anyhow::Result<Option<OAuthCredential>>;
+    /// Return only the snapshot actually updated by this refreshing-generation
+    /// CAS. Cursor refreshes must preserve the bound driver and subject identity.
     async fn complete_refresh(
         &self,
         provider_id: &str,
         expected_version: i32,
         input: UpsertOAuthCredential,
     ) -> anyhow::Result<Option<OAuthCredential>>;
+    /// Compatibility path: existing drivers' failures remain retryable.
     async fn fail_refresh(
         &self,
         provider_id: &str,
         expected_version: i32,
         error_message: &str,
+    ) -> anyhow::Result<bool> {
+        self.fail_refresh_with_policy(provider_id, expected_version, error_message, false, None)
+            .await
+    }
+    /// CAS the refreshing generation to error (terminal) or connected (retryable).
+    /// `meta`, when supplied, replaces metadata atomically with the state change;
+    /// the caller must pass sanitized, allowlisted metadata (never raw errors).
+    /// None preserves metadata. A stale version returns false without mutation.
+    async fn fail_refresh_with_policy(
+        &self,
+        provider_id: &str,
+        expected_version: i32,
+        error_message: &str,
+        terminal: bool,
+        meta: Option<String>,
     ) -> anyhow::Result<bool>;
+    /// Connected credentials with a known expiry at or before now + before.
     async fn list_expiring(&self, before: Duration) -> anyhow::Result<Vec<OAuthCredential>>;
+    /// Fence refreshes older than timeout. Cursor token rotation may have
+    /// completed remotely: require reauthentication rather than replaying an old
+    /// refresh token. Other drivers retain their retryable recovery behavior.
     async fn recover_stale_refreshing(&self, timeout: Duration) -> anyhow::Result<u64>;
 }
 

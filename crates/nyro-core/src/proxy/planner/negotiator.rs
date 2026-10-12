@@ -10,8 +10,9 @@
 
 use crate::db::models::ModelBackend;
 use crate::error::GatewayError;
-use crate::protocol::ProviderProtocols;
 use crate::protocol::ids::ProtocolId;
+use crate::protocol::registry::ProtocolRegistry;
+use crate::protocol::{EndpointDescriptor, ExecutionKind, ProviderProtocols};
 use crate::proxy::context::RequestContext;
 
 // ── ProtocolPlan ──────────────────────────────────────────────────────────────
@@ -23,6 +24,8 @@ pub struct ProtocolPlan {
     pub ingress: ProtocolId,
     /// The protocol to use when talking to the upstream provider.
     pub egress: ProtocolId,
+    /// Transport executor; vendor streams must not enter JSON codec dispatch.
+    pub execution: ExecutionKind,
     /// The operational mode.
     pub mode: ProtocolMode,
     /// The base URL for the upstream call (may be overridden by the provider
@@ -94,6 +97,27 @@ pub fn get_routing_strategy(name: &str) -> Box<dyn RoutingStrategy> {
 
 // ── negotiate() ───────────────────────────────────────────────────────────────
 
+/// Resolve metadata without assuming an egress endpoint owns JSON codecs.
+/// Vendor streams are egress-only and cannot service embeddings requests.
+fn describe_egress(
+    ingress: ProtocolId,
+    egress: ProtocolId,
+) -> Result<&'static EndpointDescriptor, GatewayError> {
+    let registry = ProtocolRegistry::global();
+    let unsupported = || GatewayError::ProtocolUnsupported {
+        ingress: ingress.to_string(),
+        egress: egress.to_string(),
+    };
+    let input = registry.describe(&ingress).ok_or_else(unsupported)?;
+    let output = registry.describe(&egress).ok_or_else(unsupported)?;
+    if input.execution != ExecutionKind::JsonHttp
+        || (output.execution == ExecutionKind::VendorStream && input.capabilities.embeddings)
+    {
+        return Err(unsupported());
+    }
+    Ok(output)
+}
+
 /// Determine the egress protocol and operational mode for a single request.
 ///
 /// Priority order:
@@ -113,9 +137,11 @@ pub fn negotiate(
 ) -> Result<ProtocolPlan, GatewayError> {
     // If no provider declarations, pass-through on ingress protocol.
     let Some(decl) = provider_decl else {
+        let descriptor = describe_egress(ingress, ingress)?;
         let plan = ProtocolPlan {
             ingress,
             egress: ingress,
+            execution: descriptor.execution,
             mode: ProtocolMode::Native,
             base_url: String::new(),
             endpoint_id: None,
@@ -129,6 +155,7 @@ pub fn negotiate(
     // Tier 1: route-level preference.
     if let Some(pref) = route_pref {
         if decl.supports(pref) {
+            let descriptor = describe_egress(ingress, pref)?;
             let endpoint = decl
                 .get(pref)
                 .expect("supported provider endpoint must be retrievable");
@@ -142,6 +169,7 @@ pub fn negotiate(
             return Ok(ProtocolPlan {
                 ingress,
                 egress: pref,
+                execution: descriptor.execution,
                 mode,
                 base_url: endpoint.base_url.clone(),
                 endpoint_id: endpoint.record_id.clone(),
@@ -164,7 +192,8 @@ pub fn negotiate(
             })?;
 
     // Check lossy-reject policy from the egress endpoint's capability matrix.
-    let egress_caps = resolved.protocol.handler().capabilities();
+    let descriptor = describe_egress(ingress, resolved.protocol)?;
+    let egress_caps = descriptor.capabilities;
 
     if resolved.needs_conversion && egress_caps.lossy_default_reject {
         // Lossy transform — rejected by default unless the route explicitly
@@ -201,6 +230,7 @@ pub fn negotiate(
     Ok(ProtocolPlan {
         ingress,
         egress: resolved.protocol,
+        execution: descriptor.execution,
         mode,
         base_url: resolved.base_url,
         endpoint_id: resolved.endpoint_id,
@@ -219,7 +249,12 @@ pub(crate) fn negotiate_required(
     ctx: &mut RequestContext,
 ) -> Result<ProtocolPlan, GatewayError> {
     let egress = endpoint.protocol;
-    if ingress != egress && (ingress.name == "embeddings" || egress.name == "embeddings") {
+    let descriptor = describe_egress(ingress, egress)?;
+    let ingress_caps = ProtocolRegistry::global()
+        .describe(&ingress)
+        .expect("ingress descriptor validated above")
+        .capabilities;
+    if ingress != egress && (ingress_caps.embeddings || descriptor.capabilities.embeddings) {
         return Err(GatewayError::ProtocolUnsupported {
             ingress: ingress.to_string(),
             egress: egress.to_string(),
@@ -230,6 +265,7 @@ pub(crate) fn negotiate_required(
     Ok(ProtocolPlan {
         ingress,
         egress,
+        execution: descriptor.execution,
         mode: if ingress == egress {
             ProtocolMode::Native
         } else {
@@ -363,6 +399,74 @@ mod tests {
         let plan = negotiate(OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1, None, None, &mut c).unwrap();
         assert_eq!(plan.mode, ProtocolMode::Native);
         assert_eq!(plan.egress, OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1);
+    }
+
+    #[test]
+    fn cursor_default_preferred_and_required_plans_use_vendor_execution() {
+        use crate::protocol::ids::{CURSOR_AGENT_BASE_URL, CURSOR_AGENT_RUN_V1};
+        let decl = make_decl(CURSOR_AGENT_RUN_V1, CURSOR_AGENT_BASE_URL);
+        let mut c = ctx();
+        for pref in [None, Some(CURSOR_AGENT_RUN_V1)] {
+            let plan = negotiate(ANTHROPIC_MESSAGES_2023_06_01, pref, Some(&decl), &mut c).unwrap();
+            assert_eq!(plan.egress, CURSOR_AGENT_RUN_V1);
+            assert_eq!(plan.execution, ExecutionKind::VendorStream);
+            assert_eq!(plan.mode, ProtocolMode::Transform);
+            assert!(plan.needs_conversion);
+        }
+        let plan = negotiate_required(
+            OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1,
+            decl.endpoints[0].clone(),
+            &mut c,
+        )
+        .unwrap();
+        assert_eq!(plan.execution, ExecutionKind::VendorStream);
+        for pref in [None, Some(CURSOR_AGENT_RUN_V1)] {
+            assert!(negotiate(OPENAI_COMPATIBLE_EMBEDDINGS_V1, pref, Some(&decl), &mut c).is_err());
+            assert!(negotiate(CURSOR_AGENT_RUN_V1, pref, Some(&decl), &mut c).is_err());
+        }
+        assert!(negotiate(CURSOR_AGENT_RUN_V1, None, None, &mut c).is_err());
+        assert!(
+            negotiate_required(CURSOR_AGENT_RUN_V1, decl.endpoints[0].clone(), &mut c).is_err()
+        );
+        assert!(
+            negotiate_required(
+                OPENAI_COMPATIBLE_EMBEDDINGS_V1,
+                decl.endpoints[0].clone(),
+                &mut c
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn all_legacy_protocols_keep_json_http_execution() {
+        use crate::protocol::ids::{GOOGLE_GEMINI_GENERATE_CONTENT_V1BETA, OPENAI_RESPONSES_V1};
+        let mut c = ctx();
+        for id in [
+            OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1,
+            ANTHROPIC_MESSAGES_2023_06_01,
+            OPENAI_RESPONSES_V1,
+            GOOGLE_GEMINI_GENERATE_CONTENT_V1BETA,
+            OPENAI_COMPATIBLE_EMBEDDINGS_V1,
+        ] {
+            let decl = make_decl(id, "https://example.test");
+            for pref in [None, Some(id)] {
+                assert_eq!(
+                    negotiate(id, pref, Some(&decl), &mut c).unwrap().execution,
+                    ExecutionKind::JsonHttp
+                );
+            }
+            assert_eq!(
+                negotiate(id, None, None, &mut c).unwrap().execution,
+                ExecutionKind::JsonHttp
+            );
+            assert_eq!(
+                negotiate_required(id, decl.endpoints[0].clone(), &mut c)
+                    .unwrap()
+                    .execution,
+                ExecutionKind::JsonHttp
+            );
+        }
     }
 
     #[test]

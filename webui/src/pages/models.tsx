@@ -113,7 +113,9 @@ function balanceLabel(value: ModelBalance, isZh: boolean) {
 }
 
 function hasProviderModelsEndpoint(provider?: Provider) {
-  return Boolean(provider?.models_source?.trim());
+  // Cursor has no HTTP models URL: its catalog comes from the native
+  // AgentService GetUsableModels discovery exposed via get_provider_models.
+  return Boolean(provider?.models_source?.trim()) || provider?.vendor === "cursor";
 }
 
 function withCurrentModel(options: string[], current?: string) {

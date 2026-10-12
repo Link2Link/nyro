@@ -3,13 +3,16 @@
 //! Each `protocol/codec/<protocol>/<endpoint>.rs` module emits one
 //! `inventory::submit!` block. `ProtocolRegistry::global()` walks the
 //! collected registrations once, indexes them by `ProtocolEndpoint` and ingress
-//! route, and exposes alias resolution for human-friendly inputs.
+//! route, and exposes alias resolution for human-friendly inputs. Every handler
+//! projects a JSON/HTTP descriptor; vendor-only egress endpoints can instead
+//! register metadata without claiming a handler or ingress route.
 
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 
 use crate::protocol::ids::{
-    ANTHROPIC_MESSAGES_2023_06_01, GOOGLE_GEMINI_GENERATE_CONTENT_V1BETA,
+    ANTHROPIC_MESSAGES_2023_06_01, CURSOR_AGENT_CAPABILITIES, CURSOR_AGENT_RUN_V1,
+    EndpointCapabilities, GOOGLE_GEMINI_GENERATE_CONTENT_V1BETA,
     OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1, OPENAI_COMPATIBLE_EMBEDDINGS_V1, OPENAI_RESPONSES_V1,
     Protocol, ProtocolEndpoint,
 };
@@ -25,9 +28,27 @@ pub type ProtocolRegistration = EndpointRegistration;
 
 inventory::collect!(EndpointRegistration);
 
-/// Global registry of protocol handlers, alias table, and ingress route index.
+/// Selects the transport executor independently of protocol conversion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ExecutionKind {
+    /// The endpoint has the six JSON/HTTP codec factories on `EndpointHandler`.
+    JsonHttp,
+    /// The vendor owns the transport and yields IR; no JSON codec is registered.
+    VendorStream,
+}
+
+/// Endpoint identity and capability metadata, independent of codec availability.
+#[derive(Debug, Clone, Copy)]
+pub struct EndpointDescriptor {
+    pub id: ProtocolEndpoint,
+    pub capabilities: EndpointCapabilities,
+    pub execution: ExecutionKind,
+}
+
+/// Global registry of endpoint descriptions, optional handlers, aliases and routes.
 pub struct ProtocolRegistry {
     by_id: HashMap<ProtocolEndpoint, Arc<dyn EndpointHandler>>,
+    descriptors: HashMap<ProtocolEndpoint, EndpointDescriptor>,
     endpoint_aliases: HashMap<&'static str, ProtocolEndpoint>,
     protocol_aliases: HashMap<&'static str, Protocol>,
     routes: Vec<RouteEntry>,
@@ -47,13 +68,23 @@ impl ProtocolRegistry {
 
     fn build() -> Self {
         let mut by_id: HashMap<ProtocolEndpoint, Arc<dyn EndpointHandler>> = HashMap::new();
+        let mut descriptors = HashMap::new();
         let mut routes: Vec<RouteEntry> = Vec::new();
 
         for reg in inventory::iter::<EndpointRegistration> {
             let handler: Arc<dyn EndpointHandler> = Arc::from((reg.make)());
             let id = handler.id();
+            let capabilities = *handler.capabilities();
+            descriptors.insert(
+                id,
+                EndpointDescriptor {
+                    id,
+                    capabilities,
+                    execution: ExecutionKind::JsonHttp,
+                },
+            );
 
-            for (method, path) in handler.capabilities().ingress_routes {
+            for (method, path) in capabilities.ingress_routes {
                 routes.push(RouteEntry { method, path, id });
             }
 
@@ -65,8 +96,20 @@ impl ProtocolRegistry {
             }
         }
 
+        // Cursor is deliberately descriptor-only: no ingress route and no
+        // placeholder EndpointHandler / JSON codecs.
+        descriptors.insert(
+            CURSOR_AGENT_RUN_V1,
+            EndpointDescriptor {
+                id: CURSOR_AGENT_RUN_V1,
+                capabilities: CURSOR_AGENT_CAPABILITIES,
+                execution: ExecutionKind::VendorStream,
+            },
+        );
+
         Self {
             by_id,
+            descriptors,
             endpoint_aliases: default_endpoint_aliases(),
             protocol_aliases: default_protocol_aliases(),
             routes,
@@ -78,6 +121,18 @@ impl ProtocolRegistry {
         self.by_id.get(id)
     }
 
+    /// Describe any endpoint, including egress-only vendor transports.
+    pub fn describe(&self, id: &ProtocolEndpoint) -> Option<&EndpointDescriptor> {
+        self.descriptors.get(id)
+    }
+
+    /// All registered endpoints, sorted by id, independently of handler presence.
+    pub fn list_endpoints(&self) -> Vec<&EndpointDescriptor> {
+        let mut endpoints: Vec<_> = self.descriptors.values().collect();
+        endpoints.sort_by_key(|endpoint| endpoint.id);
+        endpoints
+    }
+
     /// Resolve a string into a registered `ProtocolEndpoint`.
     ///
     /// Accepts (in priority order):
@@ -86,7 +141,7 @@ impl ProtocolRegistry {
     /// 3. Short alias from the alias table (e.g. `openai-chat-completions`)
     /// 4. Legacy enum string (e.g. `openai`, `gemini`, `openai_responses`)
     ///
-    /// Returns `None` if no registered handler matches.
+    /// Returns `None` if no registered endpoint descriptor matches.
     pub fn resolve_alias(&self, raw: &str) -> Option<ProtocolEndpoint> {
         let key = raw.trim();
         if key.is_empty() {
@@ -111,7 +166,7 @@ impl ProtocolRegistry {
             return None;
         }
         let protocol = parts[0].parse::<Protocol>().ok()?;
-        self.by_id
+        self.descriptors
             .keys()
             .find(|id| id.protocol == protocol && id.name == parts[1] && id.version == parts[2])
             .copied()
@@ -153,7 +208,7 @@ impl ProtocolRegistry {
 
     /// Returns the `Protocol` for a registered `ProtocolEndpoint`, or `None` if not found.
     pub fn protocol_of(&self, id: &ProtocolEndpoint) -> Option<Protocol> {
-        if self.by_id.contains_key(id) {
+        if self.descriptors.contains_key(id) {
             Some(id.protocol)
         } else {
             None
@@ -240,6 +295,7 @@ fn default_endpoint_aliases() -> HashMap<&'static str, ProtocolEndpoint> {
         "openai-chat-completions",
         OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1,
     );
+    m.insert("cursor-agent", CURSOR_AGENT_RUN_V1);
     m.insert("openai-responses", OPENAI_RESPONSES_V1);
     m.insert("openai-embeddings", OPENAI_COMPATIBLE_EMBEDDINGS_V1);
     m.insert("anthropic-messages", ANTHROPIC_MESSAGES_2023_06_01);
@@ -270,6 +326,7 @@ fn default_protocol_aliases() -> HashMap<&'static str, Protocol> {
     m.insert("openai-responses", Protocol::OpenAIResponses);
     m.insert("anthropic-messages", Protocol::AnthropicMessages);
     m.insert("google-gemini", Protocol::GoogleGemini);
+    m.insert("cursor-agent", Protocol::CursorAgent);
 
     // Short names
     m.insert("openai", Protocol::OpenAICompatible);
@@ -301,6 +358,70 @@ mod tests {
         assert!(reg.get(&ANTHROPIC_MESSAGES_2023_06_01).is_some());
         assert!(reg.get(&GOOGLE_GEMINI_GENERATE_CONTENT_V1BETA).is_some());
         assert_eq!(reg.list().len(), 5);
+    }
+
+    #[test]
+    fn cursor_is_descriptor_only_and_has_no_ingress_route() {
+        let reg = ProtocolRegistry::global();
+        let cursor = reg.describe(&CURSOR_AGENT_RUN_V1).unwrap();
+        assert_eq!(cursor.id, CURSOR_AGENT_RUN_V1);
+        assert_eq!(cursor.execution, ExecutionKind::VendorStream);
+        assert!(cursor.capabilities.streaming);
+        assert!(cursor.capabilities.tools);
+        assert!(cursor.capabilities.reasoning);
+        assert!(cursor.capabilities.function_calling);
+        assert!(cursor.capabilities.force_upstream_stream);
+        assert!(!cursor.capabilities.stream.server_sent_events);
+        assert!(!cursor.capabilities.stream.requires_stream_flag);
+        assert!(!cursor.capabilities.multimodal);
+        assert!(!cursor.capabilities.structured_output);
+        assert!(!cursor.capabilities.parallel_tool_calls);
+        assert!(!cursor.capabilities.embeddings);
+        assert!(cursor.capabilities.ingress_routes.is_empty());
+        assert!(reg.get(&CURSOR_AGENT_RUN_V1).is_none());
+        assert!(reg.list_by_protocol(Protocol::CursorAgent).is_empty());
+        assert_eq!(reg.list_endpoints().len(), reg.list().len() + 1);
+        assert!(
+            reg.routes
+                .iter()
+                .all(|route| route.id != CURSOR_AGENT_RUN_V1)
+        );
+        assert!(reg.find_by_ingress_route("POST", "/v1/run").is_none());
+        assert_eq!(
+            reg.protocol_of(&CURSOR_AGENT_RUN_V1),
+            Some(Protocol::CursorAgent)
+        );
+        for alias in ["cursor-agent", "cursor-agent/run/v1", " CURSOR-AGENT "] {
+            assert_eq!(reg.resolve_alias(alias), Some(CURSOR_AGENT_RUN_V1));
+            assert_eq!(reg.normalize_string(alias), "cursor-agent/run/v1");
+        }
+        assert_eq!(
+            reg.parse_protocol("cursor-agent"),
+            Some(Protocol::CursorAgent)
+        );
+        assert_eq!(reg.resolve_alias("cursor-agent/run/v2"), None);
+    }
+
+    #[test]
+    fn legacy_handlers_project_json_http_descriptors() {
+        let reg = ProtocolRegistry::global();
+        for handler in reg.list() {
+            let descriptor = reg.describe(&handler.id()).unwrap();
+            assert_eq!(descriptor.id, handler.id());
+            assert_eq!(descriptor.execution, ExecutionKind::JsonHttp);
+            assert_eq!(
+                descriptor.capabilities.ingress_routes,
+                handler.capabilities().ingress_routes
+            );
+            assert_eq!(
+                descriptor.capabilities.force_upstream_stream,
+                handler.capabilities().force_upstream_stream
+            );
+            assert_eq!(
+                descriptor.capabilities.embeddings,
+                handler.capabilities().embeddings
+            );
+        }
     }
 
     #[test]

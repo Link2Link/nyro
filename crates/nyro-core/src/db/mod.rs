@@ -224,6 +224,9 @@ fn normalize_provider_protocol_value(reg: &ProtocolRegistry, raw: &str, adaptive
     if trimmed.is_empty() {
         return String::new();
     }
+    if reg.resolve_alias(trimmed) == Some(crate::protocol::ids::CURSOR_AGENT_RUN_V1) {
+        return crate::protocol::ids::CURSOR_AGENT_RUN_V1.to_string();
+    }
     if adaptive {
         return reg
             .resolve_alias(trimmed)
@@ -471,7 +474,9 @@ async fn backfill_provider_protocol_endpoints(pool: &SqlitePool) -> anyhow::Resu
          (id, provider_id, protocol, base_url, api_key, auth_scheme, is_enabled, priority) \
          SELECT id || '-default-endpoint', id, protocol, base_url, api_key, 'auto', 1, 0 \
          FROM providers p \
-         WHERE NOT EXISTS (\
+         WHERE NOT (COALESCE(lower(trim(p.vendor)), '') = 'cursor' \
+                    AND p.protocol = 'cursor-agent/run/v1') \
+           AND NOT EXISTS (\
              SELECT 1 FROM provider_protocol_endpoints e WHERE e.provider_id = p.id\
          )",
     )

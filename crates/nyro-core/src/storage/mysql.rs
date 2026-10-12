@@ -197,12 +197,85 @@ struct MysqlOAuthCredentialStore {
     pool: Pool<MySql>,
 }
 
+// Keep projections identical for SELECT and RETURNING snapshots.
+const OAUTH_COLUMNS: &str = "provider_id, driver_key, scheme, access_token, refresh_token, DATE_FORMAT(expires_at, '%Y-%m-%d %H:%i:%S') AS expires_at, resource_url, subject_id, scopes, meta, status, status_version, last_error, DATE_FORMAT(last_refresh_at, '%Y-%m-%d %H:%i:%S') AS last_refresh_at, DATE_FORMAT(created_at, '%Y-%m-%d %H:%i:%S') AS created_at, DATE_FORMAT(updated_at, '%Y-%m-%d %H:%i:%S') AS updated_at";
+
+impl MysqlOAuthCredentialStore {
+    async fn upsert_once(
+        &self,
+        provider_id: &str,
+        input: &UpsertOAuthCredential,
+        expected_version: Option<i32>,
+    ) -> anyhow::Result<Option<OAuthCredential>> {
+        let mut connection = self.pool.acquire().await?;
+        // Applies only to the next transaction, not subsequent pool borrowers.
+        sqlx::query("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE")
+            .execute(&mut *connection)
+            .await?;
+        let mut tx = sqlx::Connection::begin(&mut *connection).await?;
+        if let Some(expected_version) = expected_version {
+            // Hold the published generation through subject validation and write.
+            let current: Option<(String, i32)> = sqlx::query_as(
+                "SELECT status, status_version FROM provider_oauth_credentials WHERE provider_id = ? FOR UPDATE",
+            )
+            .bind(provider_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+            if current.as_ref().is_none_or(|(status, version)| {
+                status != "connected" || *version != expected_version
+            }) {
+                tx.commit().await?;
+                return Ok(None);
+            }
+        }
+        if input.driver_key == "cursor"
+            && let Some(subject) = input.subject_id.as_deref().filter(|id| !id.is_empty())
+        {
+            // The predicate and write share the serializable/write transaction.
+            // Excluding this provider permits rebind/refresh of the same account.
+            let duplicate = sqlx::query_scalar::<_, String>(
+                "SELECT provider_id FROM provider_oauth_credentials WHERE BINARY driver_key = BINARY 'cursor' AND BINARY subject_id = BINARY ? AND provider_id <> ? AND status <> 'disconnected' FOR UPDATE",
+            )
+            .bind(subject)
+            .bind(provider_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+            if duplicate.is_some() {
+                anyhow::bail!("cursor_account_already_bound");
+            }
+        }
+        sqlx::query(
+            "INSERT INTO provider_oauth_credentials (provider_id, driver_key, scheme, access_token, refresh_token, expires_at, resource_url, subject_id, scopes, meta, status, status_version, last_error, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'connected', 0, NULL, NOW(), NOW()) ON DUPLICATE KEY UPDATE driver_key=VALUES(driver_key), scheme=VALUES(scheme), access_token=VALUES(access_token), refresh_token=VALUES(refresh_token), expires_at=VALUES(expires_at), resource_url=VALUES(resource_url), subject_id=VALUES(subject_id), scopes=VALUES(scopes), meta=VALUES(meta), status='connected', status_version=status_version+1, last_error=NULL, updated_at=NOW()"
+        )
+        .bind(provider_id)
+        .bind(&input.driver_key)
+        .bind(&input.scheme)
+        .bind(&input.access_token)
+        .bind(&input.refresh_token)
+        .bind(crate::storage::oauth::mysql_expiry(input.expires_at.as_deref())?)
+        .bind(&input.resource_url)
+        .bind(&input.subject_id)
+        .bind(input.scopes.as_deref().unwrap_or("[]"))
+        .bind(input.meta.as_deref().unwrap_or("{}"))
+        .execute(&mut *tx)
+        .await?;
+        let credential = sqlx::query_as::<_, OAuthCredential>(&format!(
+            "SELECT {OAUTH_COLUMNS} FROM provider_oauth_credentials WHERE provider_id = ? FOR UPDATE"
+        ))
+        .bind(provider_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(Some(credential))
+    }
+}
+
 #[async_trait]
 impl OAuthCredentialStore for MysqlOAuthCredentialStore {
     async fn get(&self, provider_id: &str) -> anyhow::Result<Option<OAuthCredential>> {
-        Ok(sqlx::query_as::<_, OAuthCredential>(
-            "SELECT provider_id, driver_key, scheme, access_token, refresh_token, DATE_FORMAT(expires_at, '%Y-%m-%d %H:%i:%S') AS expires_at, resource_url, subject_id, scopes, meta, status, status_version, last_error, DATE_FORMAT(last_refresh_at, '%Y-%m-%d %H:%i:%S') AS last_refresh_at, DATE_FORMAT(created_at, '%Y-%m-%d %H:%i:%S') AS created_at, DATE_FORMAT(updated_at, '%Y-%m-%d %H:%i:%S') AS updated_at FROM provider_oauth_credentials WHERE provider_id = ?",
-        )
+        Ok(sqlx::query_as::<_, OAuthCredential>(&format!(
+            "SELECT {OAUTH_COLUMNS} FROM provider_oauth_credentials WHERE provider_id = ? AND status <> 'disconnected'"
+        ))
         .bind(provider_id)
         .fetch_optional(&self.pool)
         .await?)
@@ -213,31 +286,61 @@ impl OAuthCredentialStore for MysqlOAuthCredentialStore {
         provider_id: &str,
         input: UpsertOAuthCredential,
     ) -> anyhow::Result<OAuthCredential> {
-        sqlx::query(
-            "INSERT INTO provider_oauth_credentials (provider_id, driver_key, scheme, access_token, refresh_token, expires_at, resource_url, subject_id, scopes, meta, status, status_version, last_error) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'connected', 0, NULL) ON DUPLICATE KEY UPDATE driver_key=VALUES(driver_key), scheme=VALUES(scheme), access_token=VALUES(access_token), refresh_token=VALUES(refresh_token), expires_at=VALUES(expires_at), resource_url=VALUES(resource_url), subject_id=VALUES(subject_id), scopes=VALUES(scopes), meta=VALUES(meta), status='connected', status_version=status_version+1, last_error=NULL, updated_at=NOW()",
-        )
-        .bind(provider_id)
-        .bind(&input.driver_key)
-        .bind(&input.scheme)
-        .bind(&input.access_token)
-        .bind(&input.refresh_token)
-        .bind(&input.expires_at)
-        .bind(&input.resource_url)
-        .bind(&input.subject_id)
-        .bind(input.scopes.as_deref().unwrap_or("[]"))
-        .bind(input.meta.as_deref().unwrap_or("{}"))
-        .execute(&self.pool)
-        .await?;
-        self.get(provider_id)
-            .await?
-            .context("credential not found after upsert")
+        for attempt in 0..crate::storage::oauth::BIND_ATTEMPTS {
+            match self.upsert_once(provider_id, &input, None).await {
+                Err(error)
+                    if attempt + 1 < crate::storage::oauth::BIND_ATTEMPTS
+                        && crate::storage::oauth::retryable_bind_error(&error) =>
+                {
+                    tokio::time::sleep(Duration::from_millis(10 * (attempt as u64 + 1))).await;
+                }
+                result => return result?.context("credential not found after upsert"),
+            }
+        }
+        unreachable!("bounded retry always returns on the last attempt")
+    }
+
+    async fn restore_if_version(
+        &self,
+        provider_id: &str,
+        expected_version: i32,
+        previous: Option<UpsertOAuthCredential>,
+    ) -> anyhow::Result<bool> {
+        let Some(previous) = previous else {
+            let result = sqlx::query(
+                "UPDATE provider_oauth_credentials SET driver_key='', scheme='', access_token='', refresh_token=NULL, expires_at=NULL, resource_url=NULL, subject_id=NULL, scopes='[]', meta='{}', status='disconnected', status_version=status_version+1, last_error=NULL, last_refresh_at=NULL, updated_at=NOW() WHERE provider_id=? AND status='connected' AND status_version=?",
+            )
+            .bind(provider_id)
+            .bind(expected_version)
+            .execute(&self.pool)
+            .await?;
+            return Ok(result.rows_affected() > 0);
+        };
+        for attempt in 0..crate::storage::oauth::BIND_ATTEMPTS {
+            match self
+                .upsert_once(provider_id, &previous, Some(expected_version))
+                .await
+            {
+                Err(error)
+                    if attempt + 1 < crate::storage::oauth::BIND_ATTEMPTS
+                        && crate::storage::oauth::retryable_bind_error(&error) =>
+                {
+                    tokio::time::sleep(Duration::from_millis(10 * (attempt as u64 + 1))).await;
+                }
+                result => return Ok(result?.is_some()),
+            }
+        }
+        unreachable!("bounded retry always returns on the last attempt")
     }
 
     async fn delete(&self, provider_id: &str) -> anyhow::Result<()> {
-        sqlx::query("DELETE FROM provider_oauth_credentials WHERE provider_id = ?")
-            .bind(provider_id)
-            .execute(&self.pool)
-            .await?;
+        // A scrubbed tombstone fences late completions across logout and rebind.
+        sqlx::query(
+            "UPDATE provider_oauth_credentials SET driver_key='', scheme='', access_token='', refresh_token=NULL, expires_at=NULL, resource_url=NULL, subject_id=NULL, scopes='[]', meta='{}', status='disconnected', status_version=status_version+1, last_error=NULL, last_refresh_at=NULL, updated_at=NOW() WHERE provider_id=?"
+        )
+        .bind(provider_id)
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
@@ -246,18 +349,27 @@ impl OAuthCredentialStore for MysqlOAuthCredentialStore {
         provider_id: &str,
         expected_version: i32,
     ) -> anyhow::Result<Option<OAuthCredential>> {
+        let mut tx = self.pool.begin().await?;
         let result = sqlx::query(
-            "UPDATE provider_oauth_credentials SET status='refreshing', status_version=status_version+1, updated_at=NOW() WHERE provider_id=? AND status='connected' AND status_version=?",
+            "UPDATE provider_oauth_credentials SET status='refreshing', status_version=status_version+1, updated_at=NOW() WHERE provider_id=? AND status='connected' AND status_version=?"
         )
         .bind(provider_id)
         .bind(expected_version)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
-        if result.rows_affected() > 0 {
-            Ok(self.get(provider_id).await?)
-        } else {
-            Ok(None)
+        // Do not infer success from a later row with a coincidentally matching version.
+        if result.rows_affected() == 0 {
+            tx.commit().await?;
+            return Ok(None);
         }
+        let credential = sqlx::query_as::<_, OAuthCredential>(&format!(
+            "SELECT {OAUTH_COLUMNS} FROM provider_oauth_credentials WHERE provider_id = ? FOR UPDATE"
+        ))
+        .bind(provider_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(Some(credential))
     }
 
     async fn complete_refresh(
@@ -266,36 +378,55 @@ impl OAuthCredentialStore for MysqlOAuthCredentialStore {
         expected_version: i32,
         input: UpsertOAuthCredential,
     ) -> anyhow::Result<Option<OAuthCredential>> {
-        sqlx::query(
-            "UPDATE provider_oauth_credentials SET driver_key=?, scheme=?, access_token=?, refresh_token=?, expires_at=?, resource_url=?, subject_id=?, scopes=?, meta=?, status='connected', status_version=status_version+1, last_error=NULL, last_refresh_at=NOW(), updated_at=NOW() WHERE provider_id=? AND status='refreshing' AND status_version=?",
+        let mut tx = self.pool.begin().await?;
+        let result = sqlx::query(
+            "UPDATE provider_oauth_credentials SET driver_key=?, scheme=?, access_token=?, refresh_token=?, expires_at=?, resource_url=?, subject_id=?, scopes=COALESCE(?, scopes), meta=COALESCE(?, meta), status='connected', status_version=status_version+1, last_error=NULL, last_refresh_at=NOW(), updated_at=NOW() WHERE provider_id=? AND status='refreshing' AND status_version=? AND ((BINARY driver_key <> BINARY 'cursor' AND BINARY ? <> BINARY 'cursor') OR (BINARY driver_key = BINARY ? AND BINARY subject_id <=> BINARY ?))"
         )
         .bind(&input.driver_key)
         .bind(&input.scheme)
         .bind(&input.access_token)
         .bind(&input.refresh_token)
-        .bind(&input.expires_at)
+        .bind(crate::storage::oauth::mysql_expiry(input.expires_at.as_deref())?)
         .bind(&input.resource_url)
         .bind(&input.subject_id)
-        .bind(input.scopes.as_deref().unwrap_or("[]"))
-        .bind(input.meta.as_deref().unwrap_or("{}"))
+        .bind(input.scopes.as_deref())
+        .bind(input.meta.as_deref())
         .bind(provider_id)
         .bind(expected_version)
-        .execute(&self.pool)
+        .bind(&input.driver_key)
+        .bind(&input.driver_key)
+        .bind(&input.subject_id)
+        .execute(&mut *tx)
         .await?;
-        let current = self.get(provider_id).await?;
-        Ok(current.filter(|credential| credential.status_version == expected_version + 1))
+        // Do not infer success from a later row with a coincidentally matching version.
+        if result.rows_affected() == 0 {
+            tx.commit().await?;
+            return Ok(None);
+        }
+        let credential = sqlx::query_as::<_, OAuthCredential>(&format!(
+            "SELECT {OAUTH_COLUMNS} FROM provider_oauth_credentials WHERE provider_id = ? FOR UPDATE"
+        ))
+        .bind(provider_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(Some(credential))
     }
 
-    async fn fail_refresh(
+    async fn fail_refresh_with_policy(
         &self,
         provider_id: &str,
         expected_version: i32,
         error_message: &str,
+        terminal: bool,
+        meta: Option<String>,
     ) -> anyhow::Result<bool> {
         let result = sqlx::query(
-            "UPDATE provider_oauth_credentials SET status='connected', last_error=?, status_version=status_version+1, updated_at=NOW() WHERE provider_id=? AND status='refreshing' AND status_version=?",
+            "UPDATE provider_oauth_credentials SET status=?, last_error=?, meta=COALESCE(?, meta), status_version=status_version+1, updated_at=NOW() WHERE provider_id=? AND status='refreshing' AND status_version=?",
         )
+        .bind(if terminal { "error" } else { "connected" })
         .bind(error_message)
+        .bind(meta)
         .bind(provider_id)
         .bind(expected_version)
         .execute(&self.pool)
@@ -304,20 +435,22 @@ impl OAuthCredentialStore for MysqlOAuthCredentialStore {
     }
 
     async fn list_expiring(&self, before: Duration) -> anyhow::Result<Vec<OAuthCredential>> {
-        let seconds = before.as_secs() as i64;
-        Ok(sqlx::query_as::<_, OAuthCredential>(
-            "SELECT provider_id, driver_key, scheme, access_token, refresh_token, DATE_FORMAT(expires_at, '%Y-%m-%d %H:%i:%S') AS expires_at, resource_url, subject_id, scopes, meta, status, status_version, last_error, DATE_FORMAT(last_refresh_at, '%Y-%m-%d %H:%i:%S') AS last_refresh_at, DATE_FORMAT(created_at, '%Y-%m-%d %H:%i:%S') AS created_at, DATE_FORMAT(updated_at, '%Y-%m-%d %H:%i:%S') AS updated_at FROM provider_oauth_credentials WHERE status='connected' AND expires_at IS NOT NULL AND expires_at <= NOW() + INTERVAL ? SECOND",
-        )
+        let seconds = i64::try_from(before.as_secs()).unwrap_or(i64::MAX);
+        Ok(sqlx::query_as::<_, OAuthCredential>(&format!(
+            "SELECT {OAUTH_COLUMNS} FROM provider_oauth_credentials WHERE status='connected' AND expires_at IS NOT NULL AND expires_at <= NOW() + INTERVAL ? SECOND"
+        ))
         .bind(seconds)
         .fetch_all(&self.pool)
         .await?)
     }
 
     async fn recover_stale_refreshing(&self, timeout: Duration) -> anyhow::Result<u64> {
-        let seconds = timeout.as_secs() as i64;
+        let seconds = i64::try_from(timeout.as_secs()).unwrap_or(i64::MAX);
         let result = sqlx::query(
-            "UPDATE provider_oauth_credentials SET status='connected', last_error='refresh timeout: process did not complete within timeout', status_version=status_version+1, updated_at=NOW() WHERE status='refreshing' AND updated_at + INTERVAL ? SECOND < NOW()",
+            "UPDATE provider_oauth_credentials SET status=CASE WHEN BINARY driver_key = BINARY 'cursor' THEN 'error' ELSE 'connected' END, last_error=CASE WHEN BINARY driver_key = BINARY 'cursor' THEN ? ELSE ? END, status_version=status_version+1, updated_at=NOW() WHERE status='refreshing' AND updated_at + INTERVAL ? SECOND < NOW()",
         )
+        .bind(crate::storage::oauth::CURSOR_STALE_REFRESH_ERROR)
+        .bind(crate::storage::oauth::STALE_REFRESH_ERROR)
         .bind(seconds)
         .execute(&self.pool)
         .await?;
@@ -433,7 +566,11 @@ impl MysqlProviderStore {
 }
 
 fn mysql_endpoint_inputs_or_legacy(input: &CreateProvider) -> Vec<CreateProviderProtocolEndpoint> {
-    if !input.protocol_endpoints.is_empty() {
+    // Cursor's native transport has no compatibility endpoint to synthesize.
+    if !input.protocol_endpoints.is_empty()
+        || (normalize_provider_vendor(input.vendor.as_deref()).as_deref() == Some("cursor")
+            && input.protocol.trim() == "cursor-agent/run/v1")
+    {
         return input.protocol_endpoints.clone();
     }
     vec![CreateProviderProtocolEndpoint {
@@ -2074,7 +2211,9 @@ impl StorageBootstrap for MysqlBootstrap {
              (id, provider_id, protocol, base_url, api_key, auth_scheme, is_enabled, priority) \
              SELECT UUID(), p.id, p.protocol, p.base_url, p.api_key, 'auto', 1, 0 \
              FROM providers p \
-             WHERE NOT EXISTS (\
+             WHERE NOT (COALESCE(lower(trim(p.vendor)), '') = 'cursor' \
+                 AND trim(p.protocol) = 'cursor-agent/run/v1') \
+               AND NOT EXISTS (\
                  SELECT 1 FROM provider_protocol_endpoints e WHERE e.provider_id = p.id\
              )",
         )
@@ -2625,6 +2764,12 @@ fn normalize_provider_protocol_value(
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return String::new();
+    }
+    // Native Cursor is selected by an exact execution endpoint even in fixed
+    // mode; collapsing it to the suite makes the next startup backfill a legacy
+    // endpoint and loses the native provider identity.
+    if reg.resolve_alias(trimmed) == Some(crate::protocol::ids::CURSOR_AGENT_RUN_V1) {
+        return crate::protocol::ids::CURSOR_AGENT_RUN_V1.to_string();
     }
     if adaptive {
         return reg

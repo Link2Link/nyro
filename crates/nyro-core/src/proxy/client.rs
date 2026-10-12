@@ -13,6 +13,7 @@ use futures::StreamExt;
 use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderValue};
 use serde_json::Value;
 
+pub(crate) mod duplex;
 mod timeouts;
 use crate::config::UpstreamTimeouts;
 use crate::proxy::context::Deadline;

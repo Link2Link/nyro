@@ -50,6 +50,50 @@ impl std::str::FromStr for AuthScheme {
     }
 }
 
+/// Completion transport is independent of the OAuth grant scheme.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthCompletionMode {
+    ManualExchange,
+    Poll,
+}
+
+impl AuthCompletionMode {
+    pub fn legacy_scheme(scheme: &str) -> Self {
+        if scheme == AuthScheme::OAuthAuthCodePkce.as_str()
+            || scheme == AuthScheme::SetupToken.as_str()
+        {
+            Self::ManualExchange
+        } else {
+            Self::Poll
+        }
+    }
+}
+
+/// Process-local controls never enter an admin DTO or persisted credential.
+#[derive(Debug)]
+pub struct AuthSessionControl {
+    pub generation: u64,
+    pub in_flight: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    pub cancelled: bool,
+    pub cancellation: tokio_util::sync::CancellationToken,
+    pub next_poll_at: Option<tokio::time::Instant>,
+    pub retain_until: tokio::time::Instant,
+}
+
+impl Default for AuthSessionControl {
+    fn default() -> Self {
+        Self {
+            generation: 0,
+            in_flight: Default::default(),
+            cancelled: false,
+            cancellation: tokio_util::sync::CancellationToken::new(),
+            next_poll_at: None,
+            retain_until: tokio::time::Instant::now() + std::time::Duration::from_secs(300),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AuthSessionStatus {
@@ -191,6 +235,8 @@ pub struct AuthSessionInitData {
     pub scheme: String,
     pub auth_url: String,
     pub requires_manual_code: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion_mode: Option<AuthCompletionMode>,
     pub user_code: String,
     pub verification_uri: String,
     pub verification_uri_complete: String,
@@ -205,6 +251,8 @@ pub enum AuthSessionStatusData {
         scheme: String,
         auth_url: String,
         requires_manual_code: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        completion_mode: Option<AuthCompletionMode>,
         expires_in: i64,
         interval: i32,
         user_code: String,
@@ -230,6 +278,8 @@ pub enum AuthPollState {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuthSession {
+    #[serde(skip)]
+    pub generation: u64,
     pub id: String,
     pub provider_id: Option<String>,
     pub driver_key: String,
@@ -284,6 +334,10 @@ pub struct UpdateAuthSession {
 #[async_trait]
 pub trait AuthDriver: Send + Sync {
     fn metadata(&self) -> AuthDriverMetadata;
+
+    fn completion_mode(&self) -> AuthCompletionMode {
+        AuthCompletionMode::legacy_scheme(self.metadata().scheme.as_str())
+    }
 
     async fn start(&self, _ctx: StartAuthContext) -> anyhow::Result<CreateAuthSession> {
         bail!("{} start flow is not implemented yet", self.metadata().key)

@@ -31,6 +31,35 @@ pub(super) fn stored_credential_from_oauth(
     }
 }
 
+pub(super) fn strip_auth_secrets(value: &mut Value) {
+    match value {
+        Value::Object(object) => {
+            for key in [
+                "access_token",
+                "refresh_token",
+                "id_token",
+                "accessToken",
+                "refreshToken",
+                "idToken",
+                "verifier",
+                "code_verifier",
+                "authorization",
+            ] {
+                object.remove(key);
+            }
+            for child in object.values_mut() {
+                strip_auth_secrets(child);
+            }
+        }
+        Value::Array(values) => {
+            for value in values {
+                strip_auth_secrets(value);
+            }
+        }
+        _ => {}
+    }
+}
+
 pub(super) fn upsert_credential_from_bundle(
     driver_key: &str,
     scheme: &str,
@@ -38,21 +67,7 @@ pub(super) fn upsert_credential_from_bundle(
 ) -> UpsertOAuthCredential {
     let scopes_json = serde_json::to_string(&bundle.scopes).unwrap_or_else(|_| "[]".to_string());
     let mut meta = bundle.raw.clone();
-    if let Some(object) = meta.as_object_mut() {
-        // Dedicated columns are the sole persistence location for secrets.
-        // Keep this defense generic so a future driver cannot accidentally
-        // duplicate a token response into searchable/exportable metadata.
-        for key in [
-            "access_token",
-            "refresh_token",
-            "id_token",
-            "accessToken",
-            "refreshToken",
-            "idToken",
-        ] {
-            object.remove(key);
-        }
-    }
+    strip_auth_secrets(&mut meta);
     let meta_json = serde_json::to_string(&meta).unwrap_or_else(|_| "{}".to_string());
     UpsertOAuthCredential {
         driver_key: driver_key.to_string(),
@@ -170,6 +185,18 @@ pub(super) fn build_provider_oauth_status_from_credential(
     }
 }
 
+pub(super) fn session_completion_mode(session: &AuthSession) -> auth::AuthCompletionMode {
+    // New sessions explicitly record the completion transport. Legacy sessions
+    // must retain their old scheme-derived behavior, even if a driver changes.
+    session
+        .context_json
+        .as_deref()
+        .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+        .and_then(|context| context.get("completion_mode").cloned())
+        .and_then(|value| serde_json::from_value(value).ok())
+        .unwrap_or_else(|| auth::AuthCompletionMode::legacy_scheme(&session.scheme))
+}
+
 pub(super) fn build_auth_session_init_data(
     session: &AuthSession,
 ) -> anyhow::Result<AuthSessionInitData> {
@@ -181,8 +208,9 @@ pub(super) fn build_auth_session_init_data(
             .verification_uri_complete
             .clone()
             .unwrap_or_default(),
-        requires_manual_code: session.scheme == AuthScheme::OAuthAuthCodePkce.as_str()
-            || session.scheme == AuthScheme::SetupToken.as_str(),
+        requires_manual_code: session_completion_mode(session)
+            == auth::AuthCompletionMode::ManualExchange,
+        completion_mode: Some(session_completion_mode(session)),
         user_code: session.user_code.clone().unwrap_or_default(),
         verification_uri: session.verification_uri.clone().unwrap_or_default(),
         verification_uri_complete: session
@@ -201,8 +229,9 @@ pub(super) fn build_auth_session_pending_data(session: &AuthSession) -> AuthSess
             .verification_uri_complete
             .clone()
             .unwrap_or_default(),
-        requires_manual_code: session.scheme == AuthScheme::OAuthAuthCodePkce.as_str()
-            || session.scheme == AuthScheme::SetupToken.as_str(),
+        requires_manual_code: session_completion_mode(session)
+            == auth::AuthCompletionMode::ManualExchange,
+        completion_mode: Some(session_completion_mode(session)),
         expires_in: remaining_seconds_until(session.expires_at.as_deref()),
         interval: session.poll_interval_seconds.unwrap_or(2),
         user_code: session.user_code.clone().unwrap_or_default(),
@@ -218,12 +247,7 @@ pub(super) fn build_auth_session_ready_data(
     bundle: &CredentialBundle,
 ) -> AuthSessionStatusData {
     AuthSessionStatusData::Ready {
-        expires_in: remaining_seconds_until(
-            bundle
-                .expires_at
-                .as_deref()
-                .or(session.expires_at.as_deref()),
-        ),
+        expires_in: remaining_seconds_until(session.expires_at.as_deref()),
         resource_url: bundle.resource_url.clone(),
     }
 }

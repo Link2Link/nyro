@@ -23,6 +23,7 @@ mod accumulator;
 mod auth;
 mod buffered;
 mod compat;
+mod ir_response;
 mod non_stream;
 mod param_overrides;
 mod stream;
@@ -644,6 +645,7 @@ async fn dispatch_pipeline_inner(
         .map(|target| TargetWithKey { target, key: None })
         .collect();
     let mut pending_key_siblings: usize = 0;
+    let mut cursor_auth_refreshed = std::collections::HashSet::new();
     while let Some(entry) = queue.pop_front() {
         let target = entry.target;
         let explicit_key = entry.key;
@@ -676,6 +678,11 @@ async fn dispatch_pipeline_inner(
                 continue;
             }
         };
+        if let Err(error) = ProviderProtocols::validate_provider(&provider) {
+            last_response = Some(error.render(None));
+            skip_key_siblings!();
+            continue;
+        }
         let actual_model = if target.model.is_empty() || target.model == "*" {
             request_model.clone()
         } else {
@@ -1007,6 +1014,183 @@ async fn dispatch_pipeline_inner(
             &provider,
             &actual_model,
         );
+
+        // Native binary/session upstreams consume IR directly. Keep them out of
+        // JSON encoders, protocol-default URL rewriting and raw-wire compat.
+        if plan.execution == crate::protocol::ExecutionKind::VendorStream {
+            ctx.trace("conversion", "strategy=native_ir; rule=cursor-agent-ir");
+            let performance = crate::performance::Attempt::new(
+                gw.log_tx.clone(),
+                ctx.cancellation.clone(),
+                ctx.deadline.clone(),
+            );
+            performance.configure_native_stream();
+            let attempt_index = ctx.extensions.get::<AttemptCount>().unwrap_or_default().0 + 1;
+            ctx.extensions.insert(AttemptCount(attempt_index));
+            performance.correlate(&ctx.request_id, attempt_index);
+            let producer = performance.producer();
+            ctx.extensions.insert(performance.clone());
+            let client = match gw.required_http2_client(provider.use_proxy).await {
+                Ok(client) => ProxyClient::new(client)
+                    .with_timeouts(gw.config.upstream_timeouts)
+                    .with_deadline(ctx.deadline.clone())
+                    .with_performance(performance.clone()),
+                Err(error) => {
+                    producer.finish();
+                    health_permit.neutral();
+                    last_response = Some(error_response(
+                        502,
+                        &format!("Cursor transport configuration: {error}"),
+                    ));
+                    skip_key_siblings!();
+                    continue;
+                }
+            };
+            let control = crate::provider::native::AttemptControl {
+                deadline: ctx.deadline.clone(),
+                cancellation: ctx.cancellation.clone(),
+                performance: performance.clone(),
+                run_submitted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                local_failure: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                rejected: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            };
+            let call_ctx = CallCtx {
+                performance: Some(performance.clone()),
+                gw: gw.clone(),
+                provider: &provider,
+                model_id: &route.id,
+                model_name: &route.name,
+                egress,
+                ingress,
+                ingress_str: &ingress_str,
+                egress_str: &egress.to_string(),
+                request_model: &request_model,
+                actual_model: &actual_model,
+                backend_model: &target.model,
+                api_key_id: auth_key.id.as_deref(),
+                api_key_name: auth_key.name.as_deref(),
+                provider_key_name: None,
+                route_decision: Some(route_decision.to_json()),
+                is_stream,
+                enable_payload: route.enable_payload,
+                reasoning_effort: reasoning_effort.clone(),
+                start,
+                req_ext: req_ctx_ext.clone(),
+            };
+            let upstream = adapter
+                .start_ir(
+                    upstream_request.clone(),
+                    &provider_ctx,
+                    client,
+                    control.clone(),
+                )
+                .await;
+            if matches!(
+                &upstream,
+                Err(GatewayError::UpstreamStatus { status: 401, .. })
+            ) && control.rejected.load(std::sync::atomic::Ordering::Acquire)
+                && cursor_auth_refreshed.insert(provider.id.clone())
+                && !ctx.cancellation.is_cancelled()
+            {
+                performance.record_message(
+                    "failed",
+                    "upstream_auth_rejected",
+                    "upstream_headers",
+                    "Cursor rejected the credential before execution",
+                );
+                LogBuilder::from_ctx(&call_ctx)
+                    .status(401)
+                    .upstream_status(401)
+                    .emit();
+                producer.finish();
+                let admin = gw.admin();
+                let refreshed = tokio::select! {
+                    _ = ctx.cancellation.cancelled() => false,
+                    result = tokio::time::timeout(std::time::Duration::from_secs(30), admin.reconnect_provider_oauth(&provider.id)) => matches!(result, Ok(Ok(_))),
+                };
+                if refreshed {
+                    health_permit.neutral();
+                    queue.push_front(TargetWithKey {
+                        target: target.clone(),
+                        key: None,
+                    });
+                    continue;
+                }
+            }
+            let attempt = match upstream {
+                Ok(upstream) => {
+                    ir_response::handle_ir_response(
+                        upstream,
+                        &call_ctx,
+                        tool_route_plan,
+                        ctx,
+                        &mut upstream_request,
+                        host,
+                    )
+                    .await
+                }
+                Err(error) => {
+                    let local = control
+                        .local_failure
+                        .load(std::sync::atomic::Ordering::Acquire);
+                    let (outcome, kind) = match &error {
+                        GatewayError::ClientCancelled => ("cancelled", "client_cancelled"),
+                        GatewayError::UpstreamTimeout { .. } => ("timed_out", "timeout"),
+                        _ if local => ("failed", "local_capacity"),
+                        _ => ("failed", "cursor_upstream_error"),
+                    };
+                    performance.record_failure(outcome, kind, "upstream_request", &error);
+                    LogBuilder::from_ctx(&call_ctx)
+                        .status(error.http_status().as_u16())
+                        .error(error.to_string())
+                        .emit();
+                    // Explicit rejection is different from an ambiguous accepted
+                    // Run. Never let an unknown post-submit failure replay.
+                    let retry = if !control.is_submitted()
+                        || control.rejected.load(std::sync::atomic::Ordering::Acquire)
+                    {
+                        crate::conversion::RetryDisposition::DefaultStatusPolicy
+                    } else {
+                        crate::conversion::RetryDisposition::Never
+                    };
+                    let status = error.http_status().as_u16();
+                    let health = if local || matches!(error, GatewayError::ClientCancelled) {
+                        HealthOutcome::Neutral
+                    } else {
+                        health_outcome_from_status(status)
+                    };
+                    crate::conversion::ConversionAttempt::new(error.render(None), retry, health)
+                }
+            };
+            let status = attempt.response.status().as_u16();
+            let response = if attempt.health == HealthOutcome::Deferred {
+                defer_stream_health(
+                    attempt.response,
+                    ingress,
+                    ctx,
+                    health_permit.clone(),
+                    Some(performance.clone()),
+                )
+            } else {
+                attempt.response
+            };
+            match attempt.health {
+                HealthOutcome::Success => health_permit.success(),
+                HealthOutcome::Failure => health_permit.failure(),
+                HealthOutcome::Neutral => health_permit.neutral(),
+                HealthOutcome::Deferred => drop(health_permit),
+            }
+            let response =
+                GatewayError::correlate_response(response, ingress, &ctx.request_id).await;
+            let response = performance.wrap(response);
+            producer.finish();
+            if status < 400 || !attempt.retry.should_retry(is_retryable(status)) {
+                return response;
+            }
+            last_response = Some(response);
+            skip_key_siblings!();
+            continue;
+        }
 
         // Build outbound request — PassThrough (Native + no mutations) or full 7-step pipeline.
         // A hook that mutated the IR after the baseline snapshot (e.g. the

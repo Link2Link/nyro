@@ -2,14 +2,30 @@ import { getAdminToken, clearAdminToken } from "./auth";
 
 const IS_TAURI = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 
-async function invokeIPC<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
-  const { invoke } = await import("@tauri-apps/api/core");
-  return invoke<T>(cmd, args);
+interface BackendOptions {
+  signal?: AbortSignal;
 }
 
-async function invokeHTTP<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
+export class BackendHTTPError extends Error {
+  constructor(message: string, readonly status: number) {
+    super(message);
+    this.name = "BackendHTTPError";
+  }
+}
+
+async function invokeIPC<T>(cmd: string, args?: Record<string, unknown>, options?: BackendOptions): Promise<T> {
+  options?.signal?.throwIfAborted();
+  const { invoke } = await import("@tauri-apps/api/core");
+  options?.signal?.throwIfAborted();
+  const result = await invoke<T>(cmd, args);
+  // IPC itself cannot be aborted; never return a stale result to the caller.
+  options?.signal?.throwIfAborted();
+  return result;
+}
+
+async function invokeHTTP<T>(cmd: string, args?: Record<string, unknown>, options?: BackendOptions): Promise<T> {
   const mapping = resolveHTTP(cmd, args);
-  const init: RequestInit = { method: mapping.method };
+  const init: RequestInit = { method: mapping.method, signal: options?.signal };
 
   const headers: Record<string, string> = {};
   const token = getAdminToken();
@@ -31,9 +47,11 @@ async function invokeHTTP<T>(cmd: string, args?: Record<string, unknown>): Promi
     // reporting an upstream credential failure (e.g. a provider whose API
     // key was rejected by its usage service). Re-validate the admin session
     // before wiping the token so only a real session loss forces a logout.
-    if (await probeAdminSession()) {
+    const adminSessionValid = await probeAdminSession();
+    options?.signal?.throwIfAborted();
+    if (adminSessionValid) {
       const body = await resp.json().catch(() => ({}));
-      throw new Error(body.error || `HTTP 401`);
+      throw new BackendHTTPError(body.error || "HTTP 401", 401);
     }
     clearAdminToken();
     window.location.replace("/login");
@@ -42,7 +60,7 @@ async function invokeHTTP<T>(cmd: string, args?: Record<string, unknown>): Promi
 
   if (!resp.ok) {
     const body = await resp.json().catch(() => ({}));
-    throw new Error(body.error || `HTTP ${resp.status}`);
+    throw new BackendHTTPError(body.error || `HTTP ${resp.status}`, resp.status);
   }
   const text = await resp.text();
   if (!text) return {} as T;

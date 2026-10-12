@@ -1,4 +1,19 @@
 use super::*;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
+
+struct SessionFlight {
+    generation: u64,
+    busy: Arc<AtomicBool>,
+    cancellation: tokio_util::sync::CancellationToken,
+}
+impl Drop for SessionFlight {
+    fn drop(&mut self) {
+        self.busy.store(false, Ordering::Release);
+    }
+}
 
 fn validate_oauth_session_for_provider(
     session: &AuthSession,
@@ -58,6 +73,15 @@ fn validate_oauth_session_for_provider(
         );
     }
 
+    if session_driver == "cursor"
+        && (provider.protocol != "cursor-agent/run/v1"
+            || provider.channel.as_deref() != Some("agent")
+            || provider.preset_key.as_deref() != Some("cursor")
+            || provider.protocol_mode != "fixed"
+            || provider.base_url.trim_end_matches('/') != "https://api2.cursor.sh")
+    {
+        anyhow::bail!("Cursor OAuth session can only bind to the official cursor/agent channel");
+    }
     if session_driver == "codex"
         && (provider.protocol.trim() != "openai-responses"
             || !provider
@@ -125,14 +149,31 @@ impl AdminService {
         }
         let driver = auth::build_driver(&driver_key)
             .ok_or_else(|| anyhow::anyhow!("auth vendor not implemented: {driver_key}"))?;
-        let client = self.gw.http_client_for_provider(use_proxy).await?;
-        let created = driver
+        let client = if driver_key == "cursor" {
+            self.gw.cursor_auth_http_client(use_proxy).await?
+        } else {
+            self.gw.http_client_for_provider(use_proxy).await?
+        };
+        let mut created = driver
             .start(StartAuthContext {
                 use_proxy,
                 http_client: Some(client),
                 ..Default::default()
             })
             .await?;
+        let mut context = created
+            .context_json
+            .as_deref()
+            .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+            .and_then(|value| value.as_object().cloned())
+            .unwrap_or_default();
+        context.insert(
+            "completion_mode".into(),
+            serde_json::to_value(driver.completion_mode())?,
+        );
+        created.context_json = Some(serde_json::to_string(&context)?);
+        // A login session is not a credential: never inherit token lifetime.
+        created.expires_at = Some(auth::drivers::expires_at_after(300));
         let session = self.create_auth_session_record(created).await?;
         build_auth_session_init_data(&session)
     }
@@ -180,37 +221,48 @@ impl AdminService {
             _ => {}
         }
 
-        if session.scheme == AuthScheme::OAuthAuthCodePkce.as_str()
-            || session.scheme == AuthScheme::SetupToken.as_str()
-        {
+        if session_completion_mode(&session) == auth::AuthCompletionMode::ManualExchange {
             return Ok(build_auth_session_pending_data(&session));
         }
 
         let driver = auth::build_driver(&session.driver_key).ok_or_else(|| {
             anyhow::anyhow!("auth vendor not implemented: {}", session.driver_key)
         })?;
-        let client = self.gw.http_client_for_provider(session.use_proxy).await?;
-
-        match driver
-            .poll(
-                &session,
-                RefreshAuthContext {
-                    use_proxy: session.use_proxy,
-                    http_client: Some(client),
-                    ..Default::default()
-                },
-            )
-            .await?
-        {
-            AuthPollState::Pending(progress) => {
+        let Some(flight) = self.begin_session_flight(&session.id, true).await? else {
+            return Ok(build_auth_session_pending_data(&session));
+        };
+        let operation = async {
+            let client = if session.driver_key == "cursor" {
+                self.gw.cursor_auth_http_client(session.use_proxy).await?
+            } else {
+                self.gw.http_client_for_provider(session.use_proxy).await?
+            };
+            driver
+                .poll(
+                    &session,
+                    RefreshAuthContext {
+                        use_proxy: session.use_proxy,
+                        http_client: Some(client),
+                        ..Default::default()
+                    },
+                )
+                .await
+        };
+        let result = tokio::select! {
+            _ = flight.cancellation.cancelled() => anyhow::bail!("auth session cancelled"),
+            result = operation => result,
+        };
+        match result {
+            Ok(AuthPollState::Pending(progress)) => {
                 let updated = self
-                    .update_auth_session_record(
+                    .publish_session_progress(
                         &session.id,
+                        &flight,
                         UpdateAuthSession {
                             user_code: progress.user_code,
                             verification_uri: progress.verification_uri,
                             verification_uri_complete: progress.verification_uri_complete,
-                            expires_at: progress.expires_at,
+                            // A driver may not extend the login deadline.
                             poll_interval_seconds: progress.poll_interval_seconds,
                             ..Default::default()
                         },
@@ -218,14 +270,18 @@ impl AdminService {
                     .await?;
                 Ok(build_auth_session_pending_data(&updated))
             }
-            AuthPollState::Ready(bundle) => {
+            Ok(AuthPollState::Ready(bundle)) => {
+                if session.driver_key == "cursor" {
+                    auth::drivers::cursor::validate_cursor_bundle(&bundle, None)?;
+                }
                 let updated = self
-                    .update_auth_session_record(
+                    .publish_session_progress(
                         &session.id,
+                        &flight,
                         UpdateAuthSession {
-                            status: Some(AuthSessionStatus::Ready.as_str().to_string()),
+                            status: Some("ready".into()),
                             result_json: Some(serde_json::to_string(&bundle)?),
-                            expires_at: bundle.expires_at.clone(),
+                            expires_at: Some(auth::drivers::expires_at_after(120)),
                             last_error: Some(String::new()),
                             ..Default::default()
                         },
@@ -233,9 +289,16 @@ impl AdminService {
                     .await?;
                 Ok(build_auth_session_ready_data(&updated, &bundle))
             }
-            AuthPollState::Error { code, message } => {
+            Ok(AuthPollState::Error { code, message }) => {
                 self.delete_auth_session_record(&session.id).await?;
                 Ok(AuthSessionStatusData::Error { code, message })
+            }
+            Err(error) => {
+                if session.driver_key == "cursor" {
+                    self.delete_auth_session_record(&session.id).await?;
+                    return Err(auth::drivers::cursor::CursorAuthError::Reauthenticate.into());
+                }
+                Err(error)
             }
         }
     }
@@ -268,41 +331,118 @@ impl AdminService {
             anyhow::anyhow!("auth vendor not implemented: {}", session.driver_key)
         })?;
 
-        let client = self.gw.http_client_for_provider(session.use_proxy).await?;
-        let bundle = match driver
-            .exchange(
-                &session,
-                input,
-                ExchangeAuthContext {
-                    use_proxy: session.use_proxy,
-                    http_client: Some(client),
-                    ..Default::default()
-                },
-            )
-            .await
-        {
-            Ok(bundle) => bundle,
-            Err(error) => {
-                // Keep the verifier/state until the caller explicitly cancels
-                // or the short-lived session expires. This permits retry after
-                // transport, 429, and 5xx failures without restarting PKCE.
-                return Err(error);
-            }
+        if session_completion_mode(&session) != auth::AuthCompletionMode::ManualExchange {
+            anyhow::bail!("auth session requires polling, not manual exchange");
+        }
+        let flight = self
+            .begin_session_flight(&session.id, false)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("auth session completion already in progress"))?;
+        let operation = async {
+            let client = if session.driver_key == "cursor" {
+                self.gw.cursor_auth_http_client(session.use_proxy).await?
+            } else {
+                self.gw.http_client_for_provider(session.use_proxy).await?
+            };
+            driver
+                .exchange(
+                    &session,
+                    input,
+                    ExchangeAuthContext {
+                        use_proxy: session.use_proxy,
+                        http_client: Some(client),
+                        ..Default::default()
+                    },
+                )
+                .await
+        };
+        let bundle = tokio::select! {
+            _ = flight.cancellation.cancelled() => anyhow::bail!("auth session cancelled"),
+            result = operation => result?,
         };
         let updated = self
-            .update_auth_session_record(
+            .publish_session_progress(
                 &session.id,
+                &flight,
                 UpdateAuthSession {
-                    status: Some(AuthSessionStatus::Ready.as_str().to_string()),
+                    status: Some("ready".into()),
                     result_json: Some(serde_json::to_string(&bundle)?),
-                    expires_at: bundle.expires_at.clone(),
+                    expires_at: Some(auth::drivers::expires_at_after(120)),
                     last_error: Some(String::new()),
                     ..Default::default()
                 },
             )
             .await?;
-
         Ok(build_auth_session_ready_data(&updated, &bundle))
+    }
+
+    async fn begin_session_flight(
+        &self,
+        id: &str,
+        poll: bool,
+    ) -> anyhow::Result<Option<SessionFlight>> {
+        let mut controls = self.gw.auth_session_controls.lock().await;
+        let mut sessions = self.gw.auth_sessions.write().await;
+        let session = sessions
+            .get_mut(id)
+            .ok_or_else(|| anyhow::anyhow!("auth session not found"))?;
+        if session.status != "pending" || is_expired_at(session.expires_at.as_deref()) {
+            anyhow::bail!("auth session is not pending or expired");
+        }
+        let control = controls.entry(id.to_string()).or_default();
+        if control.cancelled {
+            anyhow::bail!("auth session cancelled");
+        }
+        if control.in_flight.load(Ordering::Acquire)
+            || (poll
+                && control
+                    .next_poll_at
+                    .is_some_and(|at| at > tokio::time::Instant::now()))
+        {
+            return Ok(None);
+        }
+        control.in_flight.store(true, Ordering::Release);
+        control.generation += 1;
+        session.generation = control.generation;
+        Ok(Some(SessionFlight {
+            generation: control.generation,
+            busy: control.in_flight.clone(),
+            cancellation: control.cancellation.clone(),
+        }))
+    }
+
+    async fn publish_session_progress(
+        &self,
+        id: &str,
+        flight: &SessionFlight,
+        input: UpdateAuthSession,
+    ) -> anyhow::Result<AuthSession> {
+        let mut controls = self.gw.auth_session_controls.lock().await;
+        let control = controls
+            .get_mut(id)
+            .filter(|c| !c.cancelled && c.generation == flight.generation)
+            .ok_or_else(|| {
+                anyhow::anyhow!("auth session completion was cancelled or superseded")
+            })?;
+        let current = self
+            .get_auth_session_record(id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("auth session not found"))?;
+        if is_expired_at(current.expires_at.as_deref()) {
+            anyhow::bail!("auth session expired");
+        }
+        let interval = input
+            .poll_interval_seconds
+            .unwrap_or(current.poll_interval_seconds.unwrap_or(2))
+            .max(0);
+        control.next_poll_at =
+            Some(tokio::time::Instant::now() + std::time::Duration::from_secs(interval as u64));
+        let updated = self.update_auth_session_record(id, input).await?;
+        if updated.status == "ready" {
+            control.retain_until =
+                tokio::time::Instant::now() + std::time::Duration::from_secs(120);
+        }
+        Ok(updated)
     }
 
     async fn create_auth_session_record(
@@ -322,6 +462,7 @@ impl AdminService {
         }
         let now = now_rfc3339();
         let session = AuthSession {
+            generation: 0,
             id: uuid::Uuid::new_v4().to_string(),
             provider_id: input.provider_id,
             driver_key: input.driver_key,
@@ -340,6 +481,14 @@ impl AdminService {
             created_at: now.clone(),
             updated_at: now,
         };
+        let mut controls = self.gw.auth_session_controls.lock().await;
+        controls.insert(
+            session.id.clone(),
+            auth::AuthSessionControl {
+                next_poll_at: Some(tokio::time::Instant::now() + std::time::Duration::from_secs(2)),
+                ..Default::default()
+            },
+        );
         self.gw
             .auth_sessions
             .write()
@@ -359,8 +508,12 @@ impl AdminService {
         &self,
         id: &str,
     ) -> anyhow::Result<AuthSession> {
+        let mut controls = self.gw.auth_session_controls.lock().await;
+        if controls.get(id).is_some_and(|control| control.cancelled) {
+            anyhow::bail!("auth session cancelled");
+        }
         let mut sessions = self.gw.auth_sessions.write().await;
-        let session = sessions
+        let mut session = sessions
             .remove(id)
             .ok_or_else(|| anyhow::anyhow!("auth session not found: {id}"))?;
         if !session
@@ -370,6 +523,9 @@ impl AdminService {
             sessions.insert(id.to_string(), session);
             anyhow::bail!("auth session is not ready");
         }
+        let control = controls.entry(id.to_string()).or_default();
+        control.generation += 1;
+        session.generation = control.generation;
         Ok(session)
     }
 
@@ -417,6 +573,12 @@ impl AdminService {
     }
 
     async fn delete_auth_session_record(&self, id: &str) -> anyhow::Result<()> {
+        let mut controls = self.gw.auth_session_controls.lock().await;
+        if let Some(control) = controls.get_mut(id) {
+            control.cancelled = true;
+            control.generation += 1;
+            control.cancellation.cancel();
+        }
         self.gw.auth_sessions.write().await.remove(id);
         Ok(())
     }
@@ -425,20 +587,40 @@ impl AdminService {
         &self,
         mut session: AuthSession,
     ) -> anyhow::Result<()> {
+        let controls = self.gw.auth_session_controls.lock().await;
+        if is_expired_at(session.expires_at.as_deref())
+            || !controls.get(&session.id).is_some_and(|control| {
+                !control.cancelled && control.generation == session.generation
+            })
+        {
+            return Ok(());
+        }
         session.updated_at = now_rfc3339();
         self.gw
             .auth_sessions
             .write()
             .await
-            .insert(session.id.clone(), session);
+            .entry(session.id.clone())
+            .or_insert(session);
         Ok(())
     }
+
     pub(crate) async fn cleanup_auth_sessions(&self) -> anyhow::Result<usize> {
+        let mut controls = self.gw.auth_session_controls.lock().await;
         let mut sessions = self.gw.auth_sessions.write().await;
         let before = sessions.len();
-        sessions.retain(|_, session| {
-            let terminal = matches!(session.status.as_str(), "error" | "cancelled");
-            !terminal && !is_expired_at(session.expires_at.as_deref())
+        sessions.retain(|id, session| {
+            let keep = !matches!(session.status.as_str(), "error" | "cancelled")
+                && !is_expired_at(session.expires_at.as_deref());
+            if !keep && let Some(control) = controls.get_mut(id) {
+                control.cancelled = true;
+                control.generation += 1;
+                control.cancellation.cancel();
+            }
+            keep
+        });
+        controls.retain(|id, control| {
+            sessions.contains_key(id) || control.retain_until > tokio::time::Instant::now()
         });
         Ok(before.saturating_sub(sessions.len()))
     }
@@ -477,6 +659,14 @@ impl AdminService {
                 "grok" => "xai".to_string(),
                 _ => session.driver_key.clone(),
             });
+        }
+        if session_driver == "cursor" {
+            input.vendor = Some("cursor".into());
+            input.preset_key = Some("cursor".into());
+            input.channel = Some("agent".into());
+            input.protocol = "cursor-agent/run/v1".into();
+            input.protocol_mode = "fixed".into();
+            input.base_url = "https://api2.cursor.sh".into();
         }
         if session_driver == "codex" {
             input.preset_key = Some("openai".to_string());
@@ -548,6 +738,16 @@ impl AdminService {
         let credential_input =
             upsert_credential_from_bundle(&session.driver_key, &session.scheme, &bundle);
         let provisioned = async {
+            let controls = self.gw.auth_session_controls.lock().await;
+            if !controls
+                .get(&session.id)
+                .is_some_and(|c| !c.cancelled && c.generation == session.generation)
+            {
+                anyhow::bail!("auth session was cancelled or superseded");
+            }
+            if session.driver_key == "cursor" {
+                auth::drivers::cursor::validate_cursor_bundle(&bundle, None)?;
+            }
             self.gw
                 .storage
                 .oauth_credentials()
@@ -638,6 +838,7 @@ impl AdminService {
             .get(&provider.id)
             .await?
             .ok_or_else(|| anyhow::anyhow!("provider oauth credential not found"))?;
+        ensure_cursor_refresh_allowed(&oauth_cred)?;
         let oauth_store = self.gw.storage.oauth_credentials();
         let Some(refresh_lock) = oauth_store
             .try_begin_refresh(&provider.id, oauth_cred.status_version)
@@ -647,63 +848,11 @@ impl AdminService {
         };
 
         let credential = stored_credential_from_oauth(&oauth_cred, &driver_key);
-        let refresh_token = credential
-            .refresh_token
-            .as_deref()
-            .unwrap_or("")
-            .trim()
-            .to_string();
-        if refresh_token.is_empty() {
-            let _ = oauth_store
-                .fail_refresh(
-                    &provider.id,
-                    refresh_lock.status_version,
-                    "provider oauth refresh token is missing",
-                )
-                .await;
-            anyhow::bail!("provider oauth refresh token is missing");
-        }
-
-        let client = self.gw.http_client_for_provider(provider.use_proxy).await?;
-        let bundle = match driver
-            .refresh(
-                &credential,
-                RefreshAuthContext {
-                    use_proxy: provider.use_proxy,
-                    http_client: Some(client),
-                    ..Default::default()
-                },
-            )
-            .await
-        {
-            Ok(bundle) => bundle,
-            Err(error) => {
-                let _ = oauth_store
-                    .fail_refresh(
-                        &provider.id,
-                        refresh_lock.status_version,
-                        &error.to_string(),
-                    )
-                    .await;
-                return Ok(build_provider_oauth_status(
-                    &provider,
-                    &driver_key,
-                    Some(AuthBindingStatus::Error.as_str().to_string()),
-                    Some(error.to_string()),
-                ));
-            }
-        };
-
+        let bundle = self
+            .refresh_locked_credential(&provider, &credential, &refresh_lock, driver.as_ref())
+            .await?;
         let refreshed_credential =
             stored_credential_from_bundle(&driver_key, driver.metadata().scheme.as_str(), &bundle);
-        let credential_input =
-            upsert_credential_from_bundle(&driver_key, driver.metadata().scheme.as_str(), &bundle);
-        let published = oauth_store
-            .complete_refresh(&provider.id, refresh_lock.status_version, credential_input)
-            .await?;
-        if published.is_none() {
-            anyhow::bail!("OAuth reconnect result was superseded by newer credentials");
-        }
         let refreshed_provider = self
             .sync_provider_runtime_fields(&provider, &refreshed_credential)
             .await?;
@@ -799,23 +948,44 @@ impl AdminService {
             upsert_credential_from_bundle(&session.driver_key, &session.scheme, &bundle);
         let oauth_store = self.gw.storage.oauth_credentials();
         let previous_credential = oauth_store.get(&provider.id).await?;
-        if let Err(error) = oauth_store.upsert(&provider.id, credential_input).await {
-            self.restore_auth_session_record(session).await?;
-            return Err(error);
+        let published = async {
+            let controls = self.gw.auth_session_controls.lock().await;
+            if !controls
+                .get(&session.id)
+                .is_some_and(|c| !c.cancelled && c.generation == session.generation)
+            {
+                anyhow::bail!("auth session was cancelled or superseded");
+            }
+            if session.driver_key == "cursor" {
+                auth::drivers::cursor::validate_cursor_bundle(&bundle, None)?;
+            }
+            oauth_store.upsert(&provider.id, credential_input).await
         }
+        .await;
+        let published = match published {
+            Ok(published) => published,
+            Err(error) => {
+                self.restore_auth_session_record(session).await?;
+                return Err(error);
+            }
+        };
         let provider = match self
             .sync_provider_runtime_fields(&provider, &credential)
             .await
         {
             Ok(provider) => provider,
             Err(error) => {
-                let rollback = match previous_credential {
-                    Some(previous) => oauth_store
-                        .upsert(&provider.id, upsert_credential_from_oauth(&previous))
-                        .await
-                        .map(|_| ()),
-                    None => oauth_store.delete(&provider.id).await,
-                };
+                // A logout/rebind after our publish is authoritative. Never
+                // resurrect the snapshot using an unconditional upsert/delete.
+                let rollback = oauth_store
+                    .restore_if_version(
+                        &provider.id,
+                        published.status_version,
+                        previous_credential
+                            .as_ref()
+                            .map(upsert_credential_from_oauth),
+                    )
+                    .await;
                 if let Err(rollback_error) = rollback {
                     tracing::error!(
                         provider_id = %provider.id,
@@ -885,6 +1055,9 @@ impl AdminService {
             oauth_cred.driver_key.clone()
         };
 
+        if driver_key == "cursor" && oauth_cred.status == "error" {
+            anyhow::bail!("Cursor reauthentication required");
+        }
         let credential = stored_credential_from_oauth(&oauth_cred, &driver_key);
         let access_token = credential
             .access_token
@@ -893,7 +1066,10 @@ impl AdminService {
             .trim()
             .to_string();
 
-        if !access_token.is_empty() && !is_expired_at(credential.expires_at.as_deref()) {
+        if !access_token.is_empty()
+            && !is_expired_at(credential.expires_at.as_deref())
+            && (driver_key != "cursor" || oauth_cred.status == "connected")
+        {
             let binding = if let Some(driver) = auth::build_driver(&driver_key) {
                 driver.bind_runtime(provider, &credential)?
             } else {
@@ -906,14 +1082,15 @@ impl AdminService {
             });
         }
 
+        ensure_cursor_refresh_allowed(&oauth_cred)?;
         let refresh_token = credential
             .refresh_token
             .as_deref()
             .unwrap_or("")
             .trim()
             .to_string();
-        if refresh_token.is_empty() {
-            anyhow::bail!("provider oauth refresh token is missing");
+        if refresh_token.is_empty() && driver_key != "cursor" {
+            anyhow::bail!("provider oauth refresh token is missing; reauthentication required");
         }
 
         let Some(driver) = auth::build_driver(&driver_key) else {
@@ -964,41 +1141,11 @@ impl AdminService {
             anyhow::bail!("concurrent OAuth refresh did not publish a valid token in time");
         };
 
-        let client = self.gw.http_client_for_provider(provider.use_proxy).await?;
-        let bundle = match driver
-            .refresh(
-                &credential,
-                RefreshAuthContext {
-                    use_proxy: provider.use_proxy,
-                    http_client: Some(client),
-                    ..Default::default()
-                },
-            )
-            .await
-        {
-            Ok(bundle) => bundle,
-            Err(error) => {
-                let _ = oauth_store
-                    .fail_refresh(
-                        &provider.id,
-                        refresh_lock.status_version,
-                        &error.to_string(),
-                    )
-                    .await;
-                return Err(error.context("refresh oauth access token"));
-            }
-        };
-
+        let bundle = self
+            .refresh_locked_credential(provider, &credential, &refresh_lock, driver.as_ref())
+            .await?;
         let refreshed_credential =
             stored_credential_from_bundle(&driver_key, driver.metadata().scheme.as_str(), &bundle);
-        let credential_input =
-            upsert_credential_from_bundle(&driver_key, driver.metadata().scheme.as_str(), &bundle);
-        let published = oauth_store
-            .complete_refresh(&provider.id, refresh_lock.status_version, credential_input)
-            .await?;
-        if published.is_none() {
-            anyhow::bail!("OAuth refresh result was superseded by newer credentials");
-        }
         let refreshed_provider = self
             .sync_provider_runtime_fields(provider, &refreshed_credential)
             .await?;
@@ -1081,7 +1228,10 @@ impl AdminService {
                 .as_deref()
                 .map(str::trim)
                 .is_some_and(|value| !value.is_empty());
-            if !has_refresh {
+            if !has_refresh && cred.driver_key != "cursor" {
+                continue;
+            }
+            if ensure_cursor_refresh_allowed(&cred).is_err() {
                 continue;
             }
 
@@ -1104,6 +1254,188 @@ impl AdminService {
         Ok(refreshed)
     }
 
+    /// All refresh entry points share validation, total network deadline,
+    /// failure classification, and versioned publication. Runtime fields are
+    /// changed only after this succeeds, never before the token CAS.
+    async fn refresh_locked_credential(
+        &self,
+        provider: &Provider,
+        credential: &StoredCredential,
+        lease: &OAuthCredential,
+        driver: &dyn auth::AuthDriver,
+    ) -> anyhow::Result<CredentialBundle> {
+        // Include error persistence in the hard 30-second budget. Reserve five
+        // seconds inside it for fencing an ambiguous commit. If storage itself
+        // remains unavailable, the refreshing row stays unusable for Cursor and
+        // the existing 60-second stale-lease recovery requires reauthentication.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            self.refresh_locked_credential_inner(provider, credential, lease, driver),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            Err(if driver.metadata().key == "cursor" {
+                auth::drivers::cursor::CursorAuthError::Reauthenticate.into()
+            } else {
+                anyhow::anyhow!("OAuth refresh deadline exceeded")
+            })
+        })
+    }
+
+    async fn refresh_locked_credential_inner(
+        &self,
+        provider: &Provider,
+        credential: &StoredCredential,
+        lease: &OAuthCredential,
+        driver: &dyn auth::AuthDriver,
+    ) -> anyhow::Result<CredentialBundle> {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(25);
+        let cursor = driver.metadata().key == "cursor";
+        let store = self.gw.storage.oauth_credentials();
+        let operation = async {
+            if credential
+                .refresh_token
+                .as_deref()
+                .is_none_or(|value| value.trim().is_empty())
+            {
+                if cursor {
+                    return Err(auth::drivers::cursor::CursorAuthError::Reauthenticate.into());
+                }
+                anyhow::bail!("provider oauth refresh token is missing; reauthentication required");
+            }
+            let client = if cursor {
+                self.gw.cursor_auth_http_client(provider.use_proxy).await?
+            } else {
+                self.gw.http_client_for_provider(provider.use_proxy).await?
+            };
+            let mut bundle = driver
+                .refresh(
+                    credential,
+                    RefreshAuthContext {
+                        use_proxy: provider.use_proxy,
+                        http_client: Some(client),
+                        ..Default::default()
+                    },
+                )
+                .await?;
+            // Drivers may omit an unchanged refresh token, never erase it.
+            if bundle
+                .refresh_token
+                .as_deref()
+                .is_none_or(|value| value.trim().is_empty())
+            {
+                bundle.refresh_token = credential.refresh_token.clone();
+            }
+            if bundle
+                .access_token
+                .as_deref()
+                .is_none_or(|token| token.trim().is_empty())
+                || is_expired_at(bundle.expires_at.as_deref())
+            {
+                anyhow::bail!("OAuth refresh returned an invalid credential");
+            }
+            if cursor {
+                auth::drivers::cursor::validate_cursor_bundle(
+                    &bundle,
+                    credential.subject_id.as_deref(),
+                )?;
+            }
+            let candidate = stored_credential_from_bundle(
+                driver.metadata().key,
+                driver.metadata().scheme.as_str(),
+                &bundle,
+            );
+            // Validate binding before persisting or making the new token visible.
+            driver.bind_runtime(provider, &candidate)?;
+            Ok(bundle)
+        };
+        let result = tokio::time::timeout_at(deadline, operation)
+            .await
+            .unwrap_or_else(|_| {
+                Err(if cursor {
+                    auth::drivers::cursor::CursorAuthError::Reauthenticate.into()
+                } else {
+                    anyhow::anyhow!("OAuth refresh deadline exceeded")
+                })
+            });
+        let bundle = match result {
+            Ok(bundle) => bundle,
+            Err(error) => {
+                let (terminal, meta, message) = refresh_failure_policy(credential, &error);
+                store
+                    .fail_refresh_with_policy(
+                        &provider.id,
+                        lease.status_version,
+                        &message,
+                        terminal,
+                        meta,
+                    )
+                    .await?;
+                // Never expose arbitrary upstream text/URLs for Cursor.
+                if cursor {
+                    anyhow::bail!("{message}");
+                }
+                return Err(error);
+            }
+        };
+        let input = upsert_credential_from_bundle(
+            driver.metadata().key,
+            driver.metadata().scheme.as_str(),
+            &bundle,
+        );
+        match tokio::time::timeout_at(
+            deadline,
+            store.complete_refresh(&provider.id, lease.status_version, input),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            Err(anyhow::anyhow!(
+                "OAuth refresh publication deadline exceeded"
+            ))
+        }) {
+            Ok(Some(_)) => Ok(bundle),
+            Ok(None) => anyhow::bail!("OAuth refresh result was superseded by newer credentials"),
+            Err(error) => {
+                if cursor {
+                    // A failed commit acknowledgement is not a transient failure:
+                    // upstream may have rotated the refresh token already.
+                    let message =
+                        "Cursor refresh commit outcome is unknown; reauthentication required";
+                    let changed = store
+                        .fail_refresh_with_policy(
+                            &provider.id,
+                            lease.status_version,
+                            message,
+                            true,
+                            None,
+                        )
+                        .await
+                        .unwrap_or(false);
+                    if !changed
+                        && let Ok(Some(current)) = store.get(&provider.id).await
+                        && current.status_version == lease.status_version + 1
+                        && current.access_token == bundle.access_token.as_deref().unwrap_or("")
+                        && let Ok(Some(relock)) = store
+                            .try_begin_refresh(&provider.id, current.status_version)
+                            .await
+                    {
+                        let _ = store
+                            .fail_refresh_with_policy(
+                                &provider.id,
+                                relock.status_version,
+                                message,
+                                true,
+                                None,
+                            )
+                            .await;
+                    }
+                    anyhow::bail!("{message}");
+                }
+                Err(error)
+            }
+        }
+    }
+
     /// Proactively refresh an OAuth credential that is approaching expiry.
     /// Unlike `resolve_provider_runtime` (which skips refresh if the token is
     /// still valid), this always attempts to obtain a new token.
@@ -1122,6 +1454,7 @@ impl AdminService {
             cred.driver_key.clone()
         };
 
+        ensure_cursor_refresh_allowed(cred)?;
         let credential = stored_credential_from_oauth(cred, &driver_key);
 
         let Some(driver) = auth::build_driver(&driver_key) else {
@@ -1138,46 +1471,212 @@ impl AdminService {
             return Ok(());
         };
 
-        let client = self.gw.http_client_for_provider(provider.use_proxy).await?;
-        let bundle = match driver
-            .refresh(
-                &credential,
-                RefreshAuthContext {
-                    use_proxy: provider.use_proxy,
-                    http_client: Some(client),
-                    ..Default::default()
-                },
-            )
-            .await
-        {
-            Ok(bundle) => bundle,
-            Err(error) => {
-                let _ = oauth_store
-                    .fail_refresh(
-                        &provider.id,
-                        refresh_lock.status_version,
-                        &error.to_string(),
-                    )
-                    .await;
-                return Err(error.context("proactive oauth refresh"));
-            }
-        };
-
+        let bundle = self
+            .refresh_locked_credential(provider, &credential, &refresh_lock, driver.as_ref())
+            .await?;
         let refreshed_credential =
             stored_credential_from_bundle(&driver_key, driver.metadata().scheme.as_str(), &bundle);
-        let credential_input =
-            upsert_credential_from_bundle(&driver_key, driver.metadata().scheme.as_str(), &bundle);
-        let published = oauth_store
-            .complete_refresh(&provider.id, refresh_lock.status_version, credential_input)
-            .await?;
-        if published.is_none() {
-            // A bind or reconnect installed newer credentials while this
-            // refresh was in flight. Its result is authoritative.
-            return Ok(());
-        }
         self.sync_provider_runtime_fields(provider, &refreshed_credential)
             .await?;
         self.bump_config_epoch().await?;
         Ok(())
+    }
+}
+
+fn ensure_cursor_refresh_allowed(credential: &OAuthCredential) -> anyhow::Result<()> {
+    if credential.driver_key != "cursor" {
+        return Ok(());
+    }
+    if credential.status == "error" {
+        anyhow::bail!("Cursor reauthentication required");
+    }
+    let meta: Value = serde_json::from_str(&credential.meta).unwrap_or_default();
+    if meta
+        .get("cursor_refresh_retry_at")
+        .and_then(Value::as_i64)
+        .is_some_and(|retry| retry > Utc::now().timestamp())
+    {
+        anyhow::bail!("Cursor refresh is temporarily backed off; retry later");
+    }
+    Ok(())
+}
+
+fn refresh_failure_policy(
+    credential: &StoredCredential,
+    error: &anyhow::Error,
+) -> (bool, Option<String>, String) {
+    if credential.driver_key != "cursor" {
+        return (false, None, error.to_string());
+    }
+    let transient = error.downcast_ref::<auth::drivers::cursor::CursorAuthError>();
+    let Some(auth::drivers::cursor::CursorAuthError::Transient { retry_after }) = transient else {
+        return (
+            true,
+            None,
+            "Cursor credential is invalid or refresh outcome is unknown; reauthentication required"
+                .into(),
+        );
+    };
+    let mut meta = credential.meta.as_object().cloned().unwrap_or_default();
+    let failures = meta
+        .get("cursor_refresh_failures")
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+        .saturating_add(1)
+        .min(32);
+    let delay = 30u64
+        .saturating_mul(1u64 << (failures - 1).min(4))
+        .max(retry_after.unwrap_or(0))
+        .clamp(30, 300);
+    meta.insert(
+        "cursor_refresh_failures".into(),
+        serde_json::json!(failures),
+    );
+    meta.insert(
+        "cursor_refresh_retry_at".into(),
+        serde_json::json!(Utc::now().timestamp() + delay as i64),
+    );
+    let mut meta = Value::Object(meta);
+    strip_auth_secrets(&mut meta);
+    (
+        false,
+        Some(meta.to_string()),
+        "Cursor authentication temporarily unavailable; retry later".into(),
+    )
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+    async fn gateway() -> anyhow::Result<Gateway> {
+        let (gateway, _) = Gateway::new(crate::config::GatewayConfig {
+            data_dir: std::env::temp_dir()
+                .join(format!("nyro-cursor-lifecycle-{}", uuid::Uuid::new_v4())),
+            ..Default::default()
+        })
+        .await?;
+        Ok(gateway)
+    }
+    #[tokio::test]
+    async fn session_flight_excludes_overlap_and_cancel_rejects_late_publish() -> anyhow::Result<()>
+    {
+        let gw = gateway().await?;
+        let admin = gw.admin();
+        let init = admin.init_oauth_session("cursor", false).await?;
+        gw.auth_session_controls
+            .lock()
+            .await
+            .get_mut(&init.session_id)
+            .unwrap()
+            .next_poll_at = None;
+        let flight = admin
+            .begin_session_flight(&init.session_id, true)
+            .await?
+            .unwrap();
+        assert!(
+            admin
+                .begin_session_flight(&init.session_id, true)
+                .await?
+                .is_none()
+        );
+        admin.cancel_oauth_session(&init.session_id).await?;
+        assert!(flight.cancellation.is_cancelled());
+        assert!(
+            admin
+                .publish_session_progress(
+                    &init.session_id,
+                    &flight,
+                    UpdateAuthSession {
+                        status: Some("ready".into()),
+                        ..Default::default()
+                    }
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            admin
+                .get_auth_session_record(&init.session_id)
+                .await?
+                .is_none()
+        );
+        Ok(())
+    }
+    #[tokio::test]
+    async fn dropped_flight_releases_busy_and_ready_ttl_is_not_token_ttl() -> anyhow::Result<()> {
+        let gw = gateway().await?;
+        let admin = gw.admin();
+        let init = admin.init_oauth_session("cursor", false).await?;
+        gw.auth_session_controls
+            .lock()
+            .await
+            .get_mut(&init.session_id)
+            .unwrap()
+            .next_poll_at = None;
+        let old = admin
+            .begin_session_flight(&init.session_id, true)
+            .await?
+            .unwrap();
+        let old_generation = old.generation;
+        drop(old);
+        let next = admin
+            .begin_session_flight(&init.session_id, true)
+            .await?
+            .unwrap();
+        assert!(next.generation > old_generation);
+        let bundle = CredentialBundle {
+            access_token: Some("test".into()),
+            expires_at: Some("2099-01-01T00:00:00Z".into()),
+            ..Default::default()
+        };
+        let session = admin
+            .publish_session_progress(
+                &init.session_id,
+                &next,
+                UpdateAuthSession {
+                    status: Some("ready".into()),
+                    result_json: Some(serde_json::to_string(&bundle)?),
+                    expires_at: Some(auth::drivers::expires_at_after(120)),
+                    ..Default::default()
+                },
+            )
+            .await?;
+        assert!((115..=120).contains(&remaining_seconds_until(session.expires_at.as_deref())));
+        assert!(matches!(
+            build_auth_session_ready_data(&session, &bundle),
+            AuthSessionStatusData::Ready {
+                expires_in: 115..=120,
+                ..
+            }
+        ));
+        Ok(())
+    }
+    #[test]
+    fn cursor_transient_backoff_is_bounded_and_terminal_error_is_redacted() {
+        let mut credential = StoredCredential {
+            driver_key: "cursor".into(),
+            meta: serde_json::json!({"account_label":"keep"}),
+            ..Default::default()
+        };
+        for expected in [30, 60, 120, 240, 300, 300] {
+            let before = Utc::now().timestamp();
+            let error = anyhow::anyhow!(auth::drivers::cursor::CursorAuthError::Transient {
+                retry_after: None
+            });
+            let (terminal, meta, _) = refresh_failure_policy(&credential, &error);
+            assert!(!terminal);
+            credential.meta = serde_json::from_str(meta.as_deref().unwrap()).unwrap();
+            assert_eq!(credential.meta["account_label"], "keep");
+            assert!((expected..=expected + 1).contains(
+                &(credential.meta["cursor_refresh_retry_at"].as_i64().unwrap() - before)
+            ));
+        }
+        let (terminal, _, message) = refresh_failure_policy(
+            &credential,
+            &anyhow::anyhow!("secret-token https://bad/?verifier=secret"),
+        );
+        assert!(terminal);
+        assert!(!message.contains("secret"));
+        assert!(message.contains("reauthentication"));
     }
 }
