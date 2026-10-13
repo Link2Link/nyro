@@ -30,11 +30,12 @@ pub use ported::content_encoding::{
 };
 pub use ported::providers::claude_compat::anthropic_normalization_needed;
 /// Codex Responses-Lite artifacts (additional_tools carrier, namespace/custom
-/// tool shapes) that require the third-party Responses rewrite.
+/// tool shapes), or eligible stateless opaque reasoning, requiring third-party
+/// Responses normalization. The conversion profile controls replay policy.
 pub use ported::providers::transform_codex_responses_thirdparty::request_needs_rewrite;
 pub use profile::{
-    ClientSemantics, ConversionProfile, Direction, UpstreamFlavor, WireProtocol,
-    resolve_chat_reasoning_config,
+    ClientSemantics, ConversionProfile, Direction, ResponsesReplayPolicy, UpstreamFlavor,
+    WireProtocol, resolve_chat_reasoning_config,
 };
 pub use provider::CodexChatReasoningConfig;
 pub use session::{

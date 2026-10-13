@@ -22,6 +22,12 @@
 //!   `custom_tool_call`/`custom_tool_call_output` history items into
 //!   `function_call`/`function_call_output`, and neutralize a `custom`
 //!   `tool_choice`.
+//! - **Portable replay** (explicit profile policy): only for `store=false`,
+//!   reference-free inline history with complete, explicit call-id pairs, omit
+//!   optional ids on converted items and discard opaque encrypted reasoning
+//!   with unknown provenance. Resolve eligibility before any legacy repairs.
+//!   Reasoning-only normalization does not filter public tools or tool choice;
+//!   stateful/ambiguous histories retain legacy behavior, not state migration.
 //! - **Response**: convert `function_call` items whose name belongs to a
 //!   converted custom tool back into `custom_tool_call` items (buffered JSON
 //!   and streaming SSE), emitting the `response.custom_tool_call_input`
@@ -42,6 +48,7 @@ use super::transform_codex_responses_namespace::{
 };
 use crate::ported::error::ProxyError;
 use crate::ported::sse::{append_utf8_safe, strip_sse_field, take_sse_block};
+use crate::profile::ResponsesReplayPolicy;
 
 /// Tool types allowed on the third-party wire after rewriting. Everything
 /// else (e.g. Codex's private `tool_search`) is dropped rather than risking
@@ -69,6 +76,15 @@ pub fn request_needs_rewrite(body: &[u8]) -> bool {
 /// Whether the request body carries Codex Responses-Lite artifacts that a
 /// strict third-party upstream cannot consume as-is.
 pub(crate) fn request_needs_rewrite_value(body: &Value) -> bool {
+    request_needs_tool_rewrite(body)
+        || (supports_portable_inline_replay(body)
+            && body
+                .get("input")
+                .and_then(Value::as_array)
+                .is_some_and(|items| items.iter().any(is_opaque_reasoning)))
+}
+
+fn request_needs_tool_rewrite(body: &Value) -> bool {
     let input_has = |pred: fn(&Value) -> bool| {
         body.get("input")
             .and_then(Value::as_array)
@@ -158,15 +174,136 @@ pub(crate) fn custom_tool_restore_names(body: &Value) -> HashSet<String> {
 // Request rewrite
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Only full inline histories have no dependencies on old server-side item
+/// identities. Inspect the ORIGINAL body, before call-id backfill or orphan
+/// removal: those repairs must not accidentally authorize lossy replay.
+fn supports_portable_inline_replay(body: &Value) -> bool {
+    if body.get("store") != Some(&Value::Bool(false)) {
+        return false;
+    }
+    // Public Responses may also attach input to a stored conversation. Its
+    // remote history cannot be established from this inline body alone.
+    if body
+        .get("conversation")
+        .is_some_and(|value| !value.is_null())
+    {
+        return false;
+    }
+    match body.get("previous_response_id") {
+        None | Some(Value::Null) => {}
+        Some(Value::String(id)) if id.trim().is_empty() => {}
+        _ => return false,
+    }
+    let Some(items) = body.get("input").and_then(Value::as_array) else {
+        return false;
+    };
+    let mut calls = HashMap::new();
+    for item in items {
+        let kind = item.get("type").and_then(Value::as_str);
+        match kind {
+            Some("function_call" | "custom_tool_call") => {
+                let Some(id) = explicit_call_id(item) else {
+                    return false;
+                };
+                if calls.insert(id, kind == Some("custom_tool_call")).is_some() {
+                    return false;
+                }
+            }
+            Some("function_call_output" | "custom_tool_call_output") => {
+                if explicit_call_id(item).is_none() {
+                    return false;
+                }
+            }
+            Some("message" | "reasoning" | "additional_tools") => {}
+            // EasyInputMessage omits `type`. References, built-in/server tools
+            // and unknown items are deliberately not treated as self-contained.
+            None if item.get("role").and_then(Value::as_str).is_some()
+                && item.get("content").is_some() => {}
+            _ => return false,
+        }
+    }
+    let mut outputs = HashSet::new();
+    for item in items.iter().filter(|item| is_tool_call_output_item(item)) {
+        let id = explicit_call_id(item).expect("checked above");
+        let custom = item.get("type").and_then(Value::as_str) == Some("custom_tool_call_output");
+        if calls.get(id) != Some(&custom) || !outputs.insert(id) {
+            return false;
+        }
+    }
+    outputs.len() == calls.len()
+}
+
+fn explicit_call_id(item: &Value) -> Option<&str> {
+    item.get("call_id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.trim().is_empty())
+}
+
+fn is_opaque_reasoning(item: &Value) -> bool {
+    item.get("type").and_then(Value::as_str) == Some("reasoning")
+        && item
+            .get("encrypted_content")
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.trim().is_empty())
+}
+
+/// Request-local decision resolved once from the original, patched ingress.
+/// Never infer eligibility again from repaired call ids or stripped orphans.
+/// Keep this outside the business JSON and outside the reusable profile.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ReplayRewritePlan {
+    normalize_tool_shapes: bool,
+    portable_inline: bool,
+}
+
+impl ReplayRewritePlan {
+    pub(crate) fn from_request(body: &Value, policy: ResponsesReplayPolicy) -> Self {
+        Self {
+            normalize_tool_shapes: request_needs_tool_rewrite(body),
+            portable_inline: policy == ResponsesReplayPolicy::PortableInline
+                && supports_portable_inline_replay(body),
+        }
+    }
+}
+
 /// Rewrite a Codex Responses request body for a strict third-party upstream.
-/// See the module docs for the exact steps.
-pub(crate) fn rewrite_request_for_third_party(body: &mut Value) -> Result<(), ProxyError> {
-    promote_additional_tools(body);
-    flatten_request_namespaces(body)?;
-    convert_custom_tools_to_functions(body);
-    filter_unsupported_tool_types(body);
-    rewrite_custom_history(body);
-    normalize_tool_output_call_ids(body);
+/// PortableInline is intentionally lossy for opaque reasoning with unverified
+/// provenance, never for messages or paired tool results. Stateful/ambiguous
+/// requests keep the legacy conversion behavior; this is not a state migrator.
+pub(crate) fn rewrite_request_for_third_party(
+    body: &mut Value,
+    plan: ReplayRewritePlan,
+) -> Result<(), ProxyError> {
+    let portable = plan.portable_inline;
+    let stripped_item_ids = if plan.normalize_tool_shapes {
+        promote_additional_tools(body);
+        flatten_request_namespaces(body)?;
+        convert_custom_tools_to_functions(body);
+        filter_unsupported_tool_types(body);
+        rewrite_custom_history(body, portable)
+    } else {
+        // Reasoning-only replay must not enroll ordinary public tool
+        // declarations (web_search/file_search/etc.) in the Codex whitelist.
+        0
+    };
+    let mut stripped_reasoning_items = 0;
+    if portable && let Some(items) = body.get_mut("input").and_then(Value::as_array_mut) {
+        let before = items.len();
+        items.retain(|item| !is_opaque_reasoning(item));
+        stripped_reasoning_items = before - items.len();
+    }
+    if plan.normalize_tool_shapes {
+        normalize_tool_output_call_ids(body);
+    }
+    if stripped_item_ids > 0 || stripped_reasoning_items > 0 {
+        // Never log opaque credentials, conversation content or item ids.
+        tracing::debug!(
+            replay_policy = "portable_inline",
+            stripped_item_ids,
+            stripped_reasoning_items,
+            "Normalized stateless third-party Responses replay"
+        );
+    }
     Ok(())
 }
 
@@ -419,10 +556,11 @@ fn filter_unsupported_tool_types(body: &mut Value) {
 /// Rewrite replayed Codex-private history items into public shapes:
 /// `custom_tool_call` → `function_call` (arguments `{"input": …}`) and
 /// `custom_tool_call_output` → `function_call_output`.
-fn rewrite_custom_history(body: &mut Value) {
+fn rewrite_custom_history(body: &mut Value, portable: bool) -> usize {
     let Some(input) = body.get_mut("input").and_then(Value::as_array_mut) else {
-        return;
+        return 0;
     };
+    let mut stripped_ids = 0;
     for item in input.iter_mut() {
         match item.get("type").and_then(Value::as_str) {
             Some("custom_tool_call") => {
@@ -436,7 +574,14 @@ fn rewrite_custom_history(body: &mut Value) {
                     .to_string(),
                 });
                 if let Some(id) = item.get("id") {
-                    converted["id"] = id.clone();
+                    if portable {
+                        // The item changed type; its old ctc/ctco identity is
+                        // not valid public function wire. Explicit call_id
+                        // preserves pairing without inventing another id.
+                        stripped_ids += 1;
+                    } else {
+                        converted["id"] = id.clone();
+                    }
                 }
                 if let Some(obj) = converted.as_object_mut() {
                     obj.retain(|_, v| !v.is_null());
@@ -450,7 +595,14 @@ fn rewrite_custom_history(body: &mut Value) {
                     "output": item.get("output").cloned().unwrap_or_else(|| json!("")),
                 });
                 if let Some(id) = item.get("id") {
-                    converted["id"] = id.clone();
+                    if portable {
+                        // The item changed type; its old ctc/ctco identity is
+                        // not valid public function wire. Explicit call_id
+                        // preserves pairing without inventing another id.
+                        stripped_ids += 1;
+                    } else {
+                        converted["id"] = id.clone();
+                    }
                 }
                 if let Some(obj) = converted.as_object_mut() {
                     obj.retain(|_, v| !v.is_null());
@@ -460,6 +612,7 @@ fn rewrite_custom_history(body: &mut Value) {
             _ => {}
         }
     }
+    stripped_ids
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -760,6 +913,12 @@ mod tests {
     use futures::stream;
     use serde_json::json;
 
+    fn rewrite_with_policy(body: &mut Value, policy: ResponsesReplayPolicy) -> ReplayRewritePlan {
+        let plan = ReplayRewritePlan::from_request(body, policy);
+        rewrite_request_for_third_party(body, plan).unwrap();
+        plan
+    }
+
     fn codex_lite_request() -> Value {
         json!({
             "model": "glm-5.3",
@@ -798,6 +957,326 @@ mod tests {
                 }
             ]
         })
+    }
+
+    // Synthetic incident shape only: never store real conversation payloads or
+    // encrypted credentials in regression fixtures.
+    fn portable_history() -> Value {
+        let mut body = codex_lite_request();
+        body["store"] = json!(false);
+        body["input"][2]["id"] = json!("ctc_origin");
+        body["input"][3]["id"] = json!("ctco_result");
+        body["input"][3]["output"] = json!([
+            {"type": "input_text", "text": "tool output with id ctco_payload"},
+            {"type": "input_text", "text": "{\"id\":\"ctco_nested\"}"}
+        ]);
+        body["input"].as_array_mut().unwrap().extend([
+            json!({"type": "function_call", "id": "fc_native", "call_id": "c2",
+                "name": "wait", "arguments": "{}"}),
+            json!({"type": "function_call_output", "id": "fco_native", "call_id": "c2",
+                "output": "done"}),
+            json!({"type": "reasoning", "id": "rs_unverified", "summary": [],
+                "encrypted_content": "synthetic-opaque-token"}),
+            json!({"type": "reasoning", "id": "rs_plain", "summary": [],
+                "content": [{"type": "reasoning_text", "text": "plain context"}]}),
+        ]);
+        body
+    }
+
+    #[test]
+    fn portable_inline_preserves_pairing_and_payload_without_foreign_item_ids() {
+        let mut body = portable_history();
+        let original = body.clone();
+        assert!(supports_portable_inline_replay(&body));
+        let plan = rewrite_with_policy(&mut body, ResponsesReplayPolicy::PortableInline);
+        let input = body["input"].as_array().unwrap();
+        let call = input
+            .iter()
+            .find(|i| i["type"] == "function_call" && i["call_id"] == "c1")
+            .unwrap();
+        let output = input
+            .iter()
+            .find(|i| i["type"] == "function_call_output" && i["call_id"] == "c1")
+            .unwrap();
+        assert!(call.get("id").is_none());
+        assert!(output.get("id").is_none());
+        assert_eq!(
+            serde_json::from_str::<Value>(call["arguments"].as_str().unwrap()).unwrap()["input"],
+            original["input"][2]["input"]
+        );
+        assert_eq!(output["output"], original["input"][3]["output"]);
+        for index in [4, 5, 7] {
+            assert!(
+                input.contains(&original["input"][index]),
+                "ordinary items stay intact"
+            );
+        }
+        assert!(!input.iter().any(is_opaque_reasoning));
+        assert!(
+            input.contains(&original["input"][1]),
+            "user message stays intact"
+        );
+        let once = body.clone();
+        rewrite_request_for_third_party(&mut body, plan).unwrap();
+        assert_eq!(body, once, "normalization is idempotent");
+    }
+
+    #[test]
+    fn portable_replay_covers_incident_shaped_mixed_history() {
+        let mut items = vec![
+            json!({"type": "additional_tools", "tools": [
+                {"type": "custom", "name": "exec"},
+                {"type": "namespace", "name": "helpers", "tools": [
+                    {"type": "function", "name": "wait", "parameters": {"type": "object"}}
+                ]}
+            ]}),
+            json!({"role": "user", "content": "synthetic replay"}),
+        ];
+        let mut expected_outputs = HashMap::new();
+        for i in 0..13 {
+            let custom_id = format!("call_custom_{i}");
+            let plain_id = format!("call_plain_{i}");
+            let output = if i % 2 == 0 {
+                json!([{"type": "input_text", "text": format!("synthetic output {i}")}])
+            } else {
+                json!(format!("synthetic output {i}"))
+            };
+            expected_outputs.insert(custom_id.clone(), output.clone());
+            expected_outputs.insert(plain_id.clone(), json!("done"));
+            items.extend([
+                json!({"type": "custom_tool_call", "id": format!("ctc_synthetic_{i}"),
+                    "call_id": custom_id, "name": "exec", "input": "run()"}),
+                json!({"type": "custom_tool_call_output", "id": format!("ctco_synthetic_{i}"),
+                    "call_id": custom_id, "output": output}),
+                json!({"type": "function_call", "id": format!("fc_synthetic_{i}"),
+                    "call_id": plain_id, "namespace": "helpers", "name": "wait", "arguments": "{}"}),
+                json!({"type": "function_call_output", "id": format!("fco_synthetic_{i}"),
+                    "call_id": plain_id, "output": "done"}),
+            ]);
+        }
+        for i in 0..18 {
+            items.push(
+                json!({"type": "reasoning", "id": format!("rs_synthetic_{i}"),
+                "summary": [], "encrypted_content": "synthetic-opaque-value"}),
+            );
+        }
+        let mut body = json!({"store": false, "stream": true, "input": items});
+        let plan = rewrite_with_policy(&mut body, ResponsesReplayPolicy::PortableInline);
+        let items = body["input"].as_array().unwrap();
+        assert_eq!(items.len(), 1 + 26 * 2);
+        assert_eq!(
+            items
+                .iter()
+                .filter(|i| i["type"] == "function_call")
+                .count(),
+            26
+        );
+        assert_eq!(
+            items
+                .iter()
+                .filter(|i| i["type"] == "function_call_output")
+                .count(),
+            26
+        );
+        for item in items {
+            if let Some(id) = item.get("call_id").and_then(Value::as_str) {
+                assert_eq!(item.get("id").is_none(), id.starts_with("call_custom_"));
+                if item["type"] == "function_call_output" {
+                    assert_eq!(&item["output"], expected_outputs.get(id).unwrap());
+                } else if id.starts_with("call_plain_") {
+                    assert_eq!(item["name"], "helpers__wait");
+                }
+            }
+        }
+        assert!(!items.iter().any(is_opaque_reasoning));
+        let once = body.clone();
+        rewrite_request_for_third_party(&mut body, plan).unwrap();
+        assert_eq!(body, once);
+    }
+
+    #[test]
+    fn preserve_policy_keeps_item_ids_and_opaque_reasoning() {
+        let mut body = portable_history();
+        let original = body.clone();
+        rewrite_with_policy(&mut body, ResponsesReplayPolicy::Preserve);
+        let input = body["input"].as_array().unwrap();
+        assert!(input.iter().any(|i| i["id"] == "ctc_origin"));
+        assert!(input.iter().any(|i| i["id"] == "ctco_result"));
+        assert!(input.contains(&original["input"][6]));
+    }
+
+    #[test]
+    fn portable_policy_does_not_authorize_stateful_or_ambiguous_history() {
+        let mut cases = Vec::new();
+        for value in [Value::Null, json!(true), json!("false")] {
+            let mut b = portable_history();
+            b["store"] = value;
+            cases.push(b);
+        }
+        let mut absent_store = portable_history();
+        absent_store.as_object_mut().unwrap().remove("store");
+        cases.push(absent_store);
+        for value in [json!("resp_remote"), json!(23)] {
+            let mut b = portable_history();
+            b["previous_response_id"] = value;
+            cases.push(b);
+        }
+        for value in [json!("conv_remote"), json!({"id": "conv_remote"})] {
+            let mut b = portable_history();
+            b["conversation"] = value;
+            cases.push(b);
+        }
+        for item in [
+            json!({"type": "item_reference", "id": "ctc_origin"}),
+            json!({"id": "ctc_origin"}),
+            json!({"type": "unknown_future_item", "id": "future"}),
+            json!({"type": "web_search_call", "id": "ws_remote"}),
+            json!({"type": "function_call", "call_id": "c1", "name": "other", "arguments": "{}"}),
+            json!({"type": "custom_tool_call_output", "call_id": "c1", "output": "duplicate"}),
+            json!({"type": "function_call_output", "call_id": "orphan", "output": "orphan"}),
+        ] {
+            let mut b = portable_history();
+            b["input"].as_array_mut().unwrap().push(item);
+            cases.push(b);
+        }
+        for index in [3, 5] {
+            let mut b = portable_history();
+            b["input"].as_array_mut().unwrap().remove(index);
+            cases.push(b); // A call without its output is not a completed pair.
+        }
+        for index in [2, 3, 4, 5] {
+            let mut b = portable_history();
+            b["input"][index].as_object_mut().unwrap().remove("call_id");
+            cases.push(b);
+            for id in [Value::Null, json!(""), json!("  "), json!(123)] {
+                let mut b = portable_history();
+                b["input"][index]["call_id"] = id;
+                cases.push(b);
+            }
+        }
+        let mut wrong_family = portable_history();
+        wrong_family["input"][3]["type"] = json!("function_call_output");
+        cases.push(wrong_family);
+        for (index, body) in cases.into_iter().enumerate() {
+            assert!(!supports_portable_inline_replay(&body), "case {index}");
+            let mut preserve = body.clone();
+            let mut portable = body;
+            let preserve_plan = rewrite_with_policy(&mut preserve, ResponsesReplayPolicy::Preserve);
+            let portable_plan =
+                rewrite_with_policy(&mut portable, ResponsesReplayPolicy::PortableInline);
+            assert_eq!(
+                portable, preserve,
+                "case {index}: fallback to legacy conversion, not lossy migration"
+            );
+            let once = portable.clone();
+            rewrite_request_for_third_party(&mut portable, portable_plan).unwrap();
+            rewrite_request_for_third_party(&mut preserve, preserve_plan).unwrap();
+            assert_eq!(
+                portable, once,
+                "case {index}: fixed plan cannot upgrade repaired history"
+            );
+            assert_eq!(portable, preserve);
+        }
+    }
+
+    #[test]
+    fn id_backfill_cannot_accidentally_enable_portable_policy() {
+        let mut body = portable_history();
+        // Existing normalization can backfill this output from its own id,
+        // but that must not authorize dropping that id or encrypted reasoning.
+        body["input"][3].as_object_mut().unwrap().remove("call_id");
+        body["input"][3]["id"] = json!("c1");
+        let plan = rewrite_with_policy(&mut body, ResponsesReplayPolicy::PortableInline);
+        let input = body["input"].as_array().unwrap();
+        assert!(input.iter().any(|i| i["id"] == "ctc_origin"));
+        let output = input
+            .iter()
+            .find(|i| i["type"] == "function_call_output" && i["call_id"] == "c1")
+            .unwrap();
+        assert_eq!(output["id"], "c1");
+        assert!(input.iter().any(is_opaque_reasoning));
+        let once = body.clone();
+        rewrite_request_for_third_party(&mut body, plan).unwrap();
+        assert_eq!(
+            body, once,
+            "backfilled ids cannot upgrade the original plan"
+        );
+    }
+
+    #[test]
+    fn portable_reasoning_gate_covers_later_function_only_turns_without_guessing_ids() {
+        for id in ["rs_foreign", "rs_0123456789", "arbitrary", ""] {
+            let mut body = json!({"store": false, "input": [
+                {"role": "user", "content": "hello"},
+                {"type": "reasoning", "id": id, "encrypted_content": "synthetic-token"}
+            ]});
+            assert!(request_needs_rewrite_value(&body));
+            rewrite_with_policy(&mut body, ResponsesReplayPolicy::PortableInline);
+            assert_eq!(body["input"].as_array().unwrap().len(), 1);
+            assert!(!request_needs_rewrite_value(&body));
+        }
+        for encrypted in [Value::Null, json!(""), json!("   ")] {
+            let body = json!({"store": false, "input": [
+                {"type": "reasoning", "encrypted_content": encrypted, "summary": []}
+            ]});
+            assert!(
+                !request_needs_rewrite_value(&body),
+                "plaintext/null reasoning is not evidence of opaque credentials"
+            );
+        }
+    }
+
+    #[test]
+    fn reasoning_only_replay_never_filters_public_tools_or_tool_choice() {
+        for tool_type in ["web_search", "file_search"] {
+            for policy in [
+                ResponsesReplayPolicy::Preserve,
+                ResponsesReplayPolicy::PortableInline,
+            ] {
+                let mut body = json!({"store": false, "tools": [{"type": tool_type}],
+                "tool_choice": {"type": tool_type}, "input": [
+                    {"role": "user", "content": "synthetic question"},
+                    {"type": "reasoning", "encrypted_content": "synthetic-token"}
+                ]});
+                let original = body.clone();
+                assert!(request_needs_rewrite_value(&body));
+                let plan = rewrite_with_policy(&mut body, policy);
+                assert!(!plan.normalize_tool_shapes);
+                assert_eq!(body["tools"], original["tools"]);
+                assert_eq!(body["tool_choice"], original["tool_choice"]);
+                if policy == ResponsesReplayPolicy::Preserve {
+                    assert_eq!(body, original);
+                } else {
+                    assert_eq!(body["input"], json!([original["input"][0]]));
+                }
+                let once = body.clone();
+                rewrite_request_for_third_party(&mut body, plan).unwrap();
+                assert_eq!(body, once);
+            }
+        }
+    }
+
+    #[test]
+    fn portable_history_without_optional_item_ids_remains_valid() {
+        let mut body = portable_history();
+        for item in body["input"].as_array_mut().unwrap() {
+            if matches!(
+                item["type"].as_str(),
+                Some("custom_tool_call" | "custom_tool_call_output")
+            ) {
+                item.as_object_mut().unwrap().remove("id");
+            }
+        }
+        rewrite_with_policy(&mut body, ResponsesReplayPolicy::PortableInline);
+        assert_eq!(
+            body["input"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|i| i["call_id"] == "c1")
+                .count(),
+            2
+        );
     }
 
     #[test]
@@ -841,7 +1320,7 @@ mod tests {
                 {"type": "function_call_output", "id": "fco_01a05fa8-37e1-75a1-895b-6b0270202e01", "name": "automation_update", "namespace": "codex_app", "output": "<heartbeat/>"}
             ]
         });
-        rewrite_request_for_third_party(&mut body).unwrap();
+        rewrite_with_policy(&mut body, ResponsesReplayPolicy::Preserve);
 
         let input = body["input"].as_array().unwrap();
         assert_eq!(input.len(), 2, "both orphan heartbeats dropped: {input:?}");
@@ -864,7 +1343,7 @@ mod tests {
                 {"type": "function_call_output", "id": "c9", "output": "done"}
             ]
         });
-        rewrite_request_for_third_party(&mut body).unwrap();
+        rewrite_with_policy(&mut body, ResponsesReplayPolicy::Preserve);
 
         let input = body["input"].as_array().unwrap();
         let output = input
@@ -884,7 +1363,7 @@ mod tests {
                 {"type": "function_call_output", "call_id": "c9", "output": "done"}
             ]
         });
-        rewrite_request_for_third_party(&mut body).unwrap();
+        rewrite_with_policy(&mut body, ResponsesReplayPolicy::Preserve);
 
         let input = body["input"].as_array().unwrap();
         assert_eq!(input.len(), 3, "nothing dropped: {input:?}");
@@ -905,7 +1384,7 @@ mod tests {
                 {"type": "function_call_output", "id": "fco_1", "output": "done"}
             ]
         });
-        rewrite_request_for_third_party(&mut body).unwrap();
+        rewrite_with_policy(&mut body, ResponsesReplayPolicy::Preserve);
 
         let input = body["input"].as_array().unwrap();
         let output = input
@@ -925,7 +1404,7 @@ mod tests {
     #[test]
     fn rewrite_promotes_carrier_and_converts_custom() {
         let mut body = codex_lite_request();
-        rewrite_request_for_third_party(&mut body).unwrap();
+        rewrite_with_policy(&mut body, ResponsesReplayPolicy::Preserve);
 
         // Carrier removed from input; tools promoted to top level.
         let input = body["input"].as_array().unwrap();
@@ -969,7 +1448,7 @@ mod tests {
             ],
             "tool_choice": {"type": "custom", "name": "exec"}
         });
-        rewrite_request_for_third_party(&mut body).unwrap();
+        rewrite_with_policy(&mut body, ResponsesReplayPolicy::Preserve);
         let tools = body["tools"].as_array().unwrap();
         assert_eq!(tools.len(), 2);
         assert!(tools.iter().all(|t| t["type"] == "function"));
@@ -985,7 +1464,7 @@ mod tests {
             "tools": [{"type": "tool_search", "name": "ts"}],
             "tool_choice": {"type": "function", "name": "ts"}
         });
-        rewrite_request_for_third_party(&mut body).unwrap();
+        rewrite_with_policy(&mut body, ResponsesReplayPolicy::Preserve);
         assert!(body.get("tools").is_none());
         assert!(body.get("tool_choice").is_none());
     }

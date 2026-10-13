@@ -290,7 +290,14 @@ pub(crate) fn resolve_raw_wire_compat(
             if !nyro_ccswitch_compat::request_needs_rewrite(raw_body) {
                 return Ok(None);
             }
+            // Third-party Responses cannot establish the provenance of Codex
+            // replay ids or encrypted reasoning. The policy only activates on
+            // explicitly stateless, self-contained inline histories; native
+            // Codex/sub2api and server-side references remain untouched.
             ConversionProfile::third_party_responses_native(client_stream)
+                .with_responses_replay_policy(
+                    nyro_ccswitch_compat::ResponsesReplayPolicy::PortableInline,
+                )
         }
         (ANTHROPIC_MESSAGES_2023_06_01, ANTHROPIC_MESSAGES_2023_06_01) => {
             ConversionProfile::anthropic_passthrough_normalized(client_stream)

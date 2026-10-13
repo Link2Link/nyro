@@ -274,8 +274,14 @@ impl CompatEngine {
                     profile.upstream_flavor,
                     UpstreamFlavor::ThirdPartyStrictResponses
                 ) {
+                    let replay_plan =
+                        transform_codex_responses_thirdparty::ReplayRewritePlan::from_request(
+                            &ordered,
+                            profile.responses_replay_policy,
+                        );
                     transform_codex_responses_thirdparty::rewrite_request_for_third_party(
                         &mut ordered,
+                        replay_plan,
                     )?;
                 } else {
                     transform_codex_responses_namespace::flatten_request_namespaces(&mut ordered)?;

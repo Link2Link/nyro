@@ -162,6 +162,21 @@ pub struct AnthropicNormalizationHints {
     pub vendor: String,
 }
 
+/// Replay policy for Codex history sent to strict third-party Responses.
+/// This is a wire-compatibility policy, not evidence of a shared account or
+/// encryption domain. Native Codex and other conversion paths do not use it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ResponsesReplayPolicy {
+    /// Preserve item identities and reasoning while converting tool shapes.
+    #[default]
+    Preserve,
+    /// For explicitly stateless, fully inline, paired history only: omit
+    /// converted tool items' optional ids and discard opaque encrypted
+    /// reasoning whose provenance cannot be verified. Other bodies retain
+    /// their existing behavior; this does not migrate server-side references.
+    PortableInline,
+}
+
 /// Deterministic request/response conversion configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConversionProfile {
@@ -170,6 +185,7 @@ pub struct ConversionProfile {
     pub upstream_protocol: WireProtocol,
     pub client_semantics: ClientSemantics,
     pub upstream_flavor: UpstreamFlavor,
+    pub responses_replay_policy: ResponsesReplayPolicy,
     pub client_stream: bool,
     pub model: Option<String>,
     pub provider_id: Option<String>,
@@ -304,6 +320,7 @@ impl ConversionProfile {
             upstream_protocol,
             client_semantics,
             upstream_flavor,
+            responses_replay_policy: ResponsesReplayPolicy::Preserve,
             client_stream,
             model: None,
             provider_id: None,
@@ -316,6 +333,11 @@ impl ConversionProfile {
             anthropic_normalization: None,
             impersonate_claude_code: false,
         }
+    }
+
+    pub fn with_responses_replay_policy(mut self, policy: ResponsesReplayPolicy) -> Self {
+        self.responses_replay_policy = policy;
+        self
     }
 
     pub fn with_model(mut self, model: impl Into<String>) -> Self {
@@ -370,6 +392,26 @@ impl ConversionProfile {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn portable_responses_replay_is_explicit_and_defaults_to_preserve() {
+        for profile in [
+            ConversionProfile::third_party_responses_native(true),
+            ConversionProfile::xai_responses_native(true),
+            ConversionProfile::codex_responses_to_chat(true),
+        ] {
+            assert_eq!(
+                profile.responses_replay_policy,
+                ResponsesReplayPolicy::Preserve
+            );
+        }
+        let profile = ConversionProfile::third_party_responses_native(true)
+            .with_responses_replay_policy(ResponsesReplayPolicy::PortableInline);
+        assert_eq!(
+            profile.responses_replay_policy,
+            ResponsesReplayPolicy::PortableInline
+        );
+    }
 
     #[test]
     fn codex_oauth_always_forces_upstream_stream() {

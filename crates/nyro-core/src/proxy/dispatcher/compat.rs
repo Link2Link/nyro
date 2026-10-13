@@ -3030,6 +3030,44 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn third_party_responses_selects_portable_replay_for_encrypted_inline_history() {
+        let request = request("gpt-test", OPENAI_RESPONSES_V1);
+        let body = br#"{"model":"gpt-test","store":false,"input":[{"role":"user","content":"hi"},{"type":"reasoning","id":"rs_unverified","encrypted_content":"synthetic-token"}]}"#;
+        let selected = select_via_resolver(
+            OPENAI_RESPONSES_V1,
+            OPENAI_RESPONSES_V1,
+            &provider("custom", "default"),
+            "https://relay.example/v1",
+            "gpt-test",
+            true,
+            &HeaderMap::new(),
+            body,
+            &request,
+            &request,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            selected.profile.upstream_flavor,
+            UpstreamFlavor::ThirdPartyStrictResponses
+        );
+        assert_eq!(
+            selected.profile.responses_replay_policy,
+            nyro_ccswitch_compat::ResponsesReplayPolicy::PortableInline
+        );
+        let prepared = CompatEngine::default()
+            .prepare_request(
+                selected.profile,
+                Bytes::copy_from_slice(body),
+                selected.identity,
+            )
+            .await
+            .unwrap();
+        let upstream: Value = serde_json::from_slice(&prepared.body).unwrap();
+        assert_eq!(upstream["input"], json!([{"role":"user","content":"hi"}]));
+    }
+
     #[test]
     fn openai_native_channels_stay_out_of_third_party_compat() {
         for (vendor, channel) in [
