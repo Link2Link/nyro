@@ -68,6 +68,9 @@
 use futures::stream::{self, StreamExt};
 use reqwest::header::CONTENT_TYPE;
 
+use crate::provider::xai::grok::{
+    GROK_CLI_IDENTIFIER, GROK_CLI_TOKEN_AUTH, GROK_CLI_VERSION, grok_cli_user_agent,
+};
 use crate::provider::xiaomimimo::passport::{
     MimoSessionRejected, MimoUsageCredential, classify_usage_credential,
 };
@@ -134,11 +137,6 @@ const GROK_BILLING_BASE: &str = "https://cli-chat-proxy.grok.com/v1";
 const GROK_BILLING_WEEKLY_PATH: &str = "/billing?format=credits";
 const GROK_BILLING_MONTHLY_PATH: &str = "/billing";
 const GROK_BILLING_TIMEOUT: Duration = Duration::from_secs(20);
-/// Grok CLI identity stamped on billing requests (mirrors Sub2API).
-const GROK_BILLING_TOKEN_AUTH: &str = "xai-grok-cli";
-const GROK_BILLING_CLIENT_VERSION: &str = "0.2.114";
-const GROK_BILLING_CLIENT_IDENTIFIER: &str = "grok-shell";
-const GROK_BILLING_USER_AGENT: &str = "xai-grok-workspace/0.2.114";
 const GROK_BILLING_PLAN_SUPERGROK: f64 = 15_000.0;
 const GROK_BILLING_PLAN_SUPERGROK_HEAVY: f64 = 150_000.0;
 
@@ -1881,10 +1879,10 @@ async fn fetch_grok_billing(
             request = request.bearer_auth(access_token.trim());
         }
         request = request
-            .header("x-xai-token-auth", GROK_BILLING_TOKEN_AUTH)
-            .header("x-grok-client-version", GROK_BILLING_CLIENT_VERSION)
-            .header("x-grok-client-identifier", GROK_BILLING_CLIENT_IDENTIFIER)
-            .header(reqwest::header::USER_AGENT, GROK_BILLING_USER_AGENT);
+            .header("x-xai-token-auth", GROK_CLI_TOKEN_AUTH)
+            .header("x-grok-client-version", GROK_CLI_VERSION)
+            .header("x-grok-client-identifier", GROK_CLI_IDENTIFIER)
+            .header(reqwest::header::USER_AGENT, grok_cli_user_agent());
         for (key, value) in extra_headers {
             if key.eq_ignore_ascii_case("authorization") || key.eq_ignore_ascii_case("user-agent") {
                 continue;
@@ -3524,6 +3522,46 @@ mod tests {
         assert_eq!(UsageBackend::detect(&unrelated_grok_channel), None);
         assert_eq!(Grok.kind(), "grok_plan");
         assert_eq!(Grok.site(), "global");
+    }
+
+    #[tokio::test]
+    async fn grok_billing_sends_current_cli_identity() {
+        let app = axum::Router::new().route(
+            "/v1/billing",
+            axum::routing::get(|headers: axum::http::HeaderMap| async move {
+                axum::Json(serde_json::json!({
+                    "config": {
+                        "version": headers["x-grok-client-version"].to_str().unwrap(),
+                        "userAgent": headers["user-agent"].to_str().unwrap(),
+                        "tokenAuth": headers["x-xai-token-auth"].to_str().unwrap(),
+                        "identifier": headers["x-grok-client-identifier"].to_str().unwrap(),
+                        "authorization": headers["authorization"].to_str().unwrap(),
+                    }
+                }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let result = fetch_grok_billing(
+            &reqwest::Client::builder().no_proxy().build().unwrap(),
+            &format!("http://{addr}/v1"),
+            "test-token",
+            &std::collections::HashMap::new(),
+        )
+        .await;
+        server.abort();
+
+        let billing = result.unwrap();
+        for window in ["weekly", "monthly"] {
+            assert_eq!(billing[window]["version"], "1.0.13");
+            assert_eq!(billing[window]["userAgent"], "xai-grok-workspace/1.0.13");
+            assert_eq!(billing[window]["tokenAuth"], "xai-grok-cli");
+            assert_eq!(billing[window]["identifier"], "grok-shell");
+            assert_eq!(billing[window]["authorization"], "Bearer test-token");
+        }
     }
 
     #[test]

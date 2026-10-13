@@ -415,7 +415,7 @@
         "runtime": {
           "apiBaseUrl": "https://cli-chat-proxy.grok.com/v1",
           "modelsUrl": "https://cli-chat-proxy.grok.com/v1/models",
-          "modelsClientVersion": "0.2.114"
+          "modelsClientVersion": "1.0.13"
         }
       }
     ]

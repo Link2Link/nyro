@@ -12,6 +12,16 @@ use crate::provider::common::openai::openai_build_url;
 use crate::provider::registry::{ExtensionRegistration, VendorScope};
 use crate::provider::vendor_ext::{VendorCtx, VendorExtension};
 
+// Shared by inference/model discovery, provider metadata, and billing requests.
+// The CLI proxy rejects versions below 1.0.13 with HTTP 426.
+pub(crate) const GROK_CLI_VERSION: &str = "1.0.13";
+pub(crate) const GROK_CLI_TOKEN_AUTH: &str = "xai-grok-cli";
+pub(crate) const GROK_CLI_IDENTIFIER: &str = "grok-shell";
+
+pub(crate) fn grok_cli_user_agent() -> String {
+    format!("xai-grok-workspace/{GROK_CLI_VERSION}")
+}
+
 pub struct XaiGrokChannel;
 
 impl VendorExtension for XaiGrokChannel {

@@ -101,7 +101,7 @@ const METADATA: VendorMetadata = VendorMetadata {
             runtime: Some(RuntimeConfig {
                 api_base_url: "https://cli-chat-proxy.grok.com/v1",
                 models_url: "https://cli-chat-proxy.grok.com/v1/models",
-                models_client_version: "0.2.114",
+                models_client_version: grok::GROK_CLI_VERSION,
             }),
             shared_key_protocols: false,
             auth_schemes: None,

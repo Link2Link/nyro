@@ -20,14 +20,14 @@ use crate::auth::types::{
 };
 use crate::db::models::Provider;
 use crate::provider::VendorRegistry;
+use crate::provider::xai::grok::{
+    GROK_CLI_IDENTIFIER, GROK_CLI_TOKEN_AUTH, GROK_CLI_VERSION, grok_cli_user_agent,
+};
 use crate::provider::{OAuthConfig, RuntimeConfig};
 
 const XAI_PRESET_ID: &str = "xai";
 const GROK_CHANNEL_ID: &str = "grok";
 const GROK_DEFAULT_ACCESS_TOKEN_TTL: i64 = 6 * 60 * 60;
-const GROK_CLI_VERSION: &str = "0.2.114";
-const GROK_CLI_TOKEN_AUTH: &str = "xai-grok-cli";
-const GROK_CLI_IDENTIFIER: &str = "grok-shell";
 const GROK_OAUTH_USER_AGENT: &str = "nyro-grok-oauth/1.0";
 
 /// Resolved OAuth + runtime config for the xAI / Grok channel.
@@ -68,10 +68,6 @@ fn generate_nonce() -> String {
     let mut bytes = [0u8; 16];
     rand::thread_rng().fill_bytes(&mut bytes);
     hex::encode(bytes)
-}
-
-fn grok_cli_user_agent() -> String {
-    format!("xai-grok-workspace/{GROK_CLI_VERSION}")
 }
 
 impl GrokOAuthDriver {
@@ -649,8 +645,19 @@ mod tests {
             "grok-shell"
         );
         assert_eq!(
+            binding.extra_headers.get("x-grok-client-version").unwrap(),
+            "1.0.13"
+        );
+        assert_eq!(
+            binding.extra_headers.get("x-grok-client-version").unwrap(),
+            GrokOAuthDriver::grok_config()
+                .unwrap()
+                .runtime
+                .models_client_version
+        );
+        assert_eq!(
             binding.extra_headers.get("user-agent").unwrap(),
-            "xai-grok-workspace/0.2.114"
+            "xai-grok-workspace/1.0.13"
         );
         assert!(binding.disable_default_auth);
         assert_eq!(
