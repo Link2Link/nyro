@@ -40,8 +40,8 @@ impl ModelPerformanceStats {
             selected_request_count: rows.len() as i64,
             ..Default::default()
         };
-        // One shared valid-sample pool (see db::tps): pure-reasoning rows
-        // count as valid zero-content samples, invalid rows stay excluded
+        // One shared valid-sample pool (see db::tps): pure-reasoning rows stay
+        // valid and contribute their full output, invalid rows stay excluded
         // without consuming aggregates.
         let mut totals = TpsTotals::default();
         for row in rows {
@@ -64,12 +64,11 @@ impl ModelPerformanceStats {
         self.total_output_tokens = totals.tps_output_tokens;
         self.total_content_tokens = totals.tps_content_tokens;
         self.total_latency_ms = totals.tps_elapsed_ms;
-        let content = totals.content_tps();
-        let gross = totals.gross_tps();
-        self.average_tps = content;
-        self.average_gross_tps = gross;
-        self.overall_tps = content;
-        self.overall_gross_tps = gross;
+        let output = totals.gross_tps();
+        self.average_tps = output;
+        self.average_gross_tps = output;
+        self.overall_tps = output;
+        self.overall_gross_tps = output;
     }
 
     /// The shared valid-pool sums behind this variant, for cross-variant

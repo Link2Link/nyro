@@ -28,7 +28,6 @@ import {
   tpsAggregateStatusTitle,
   tpsAggregateWindowTitle,
   tpsMetricTitle,
-  tpsReasoningCaveat,
 } from "@/lib/format";
 import { useLocale } from "@/lib/i18n";
 import {
@@ -704,9 +703,9 @@ function Overview({
                   <th className="px-3 py-3 text-right">TTFT</th>
                   <th
                     className="px-4 py-3 text-right"
-                    title={`${tpsMetricTitle(zh)}\n${tpsAggregateWindowTitle(zh)}\n${tpsReasoningCaveat(zh)}`}
+                    title={`${tpsMetricTitle(zh)}\n${tpsAggregateWindowTitle(zh)}`}
                   >
-                    {zh ? "正文 TPS" : "Content TPS"}
+                    {zh ? "输出 TPS" : "Output TPS"}
                   </th>
                 </tr>
               </thead>
@@ -951,9 +950,9 @@ function Attempts({
                   <th className="px-3 py-3 text-right">TTFT</th>
                   <th
                     className="px-3 py-3 text-right"
-                    title={`${tpsMetricTitle(zh)}\n${tpsReasoningCaveat(zh)}`}
+                    title={tpsMetricTitle(zh)}
                   >
-                    {zh ? "正文 TPS" : "Content TPS"}
+                    {zh ? "输出 TPS" : "Output TPS"}
                   </th>
                 </tr>
               </thead>
@@ -1030,7 +1029,7 @@ function Attempts({
                       </td>
                       <td
                         className="px-3 py-2.5 text-right text-xs"
-                        title={`${tpsMetricTitle(zh)}\n${tpsReasoningCaveat(zh)}`}
+                        title={tpsMetricTitle(zh)}
                       >
                         {formatTps(computeTps(log))}
                       </td>

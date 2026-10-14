@@ -28,7 +28,6 @@ import {
   tpsAggregateStatusTitle,
   tpsAggregateWindowTitle,
   tpsMetricTitle,
-  tpsReasoningCaveat,
 } from "@/lib/format";
 import { useLocale } from "@/lib/i18n";
 import {
@@ -631,9 +630,8 @@ function Overview({
       color: "from-fuchsia-50 to-fuchsia-100 text-fuchsia-600",
     },
     {
-      label: zh ? "正文 TPS" : "Content TPS",
+      label: zh ? "输出 TPS" : "Output TPS",
       value: formatTps(tps),
-      note: tpsReasoningCaveat(zh),
       title: tpsAggregateStatusTitle(detail, zh),
       icon: Gauge,
       color: "from-cyan-50 to-cyan-100 text-cyan-600",
@@ -741,9 +739,9 @@ function Overview({
                   <th className="px-3 py-3 text-right">TTFT</th>
                   <th
                     className="px-3 py-3 text-right"
-                    title={`${tpsMetricTitle(zh)}\n${tpsAggregateWindowTitle(zh)}\n${tpsReasoningCaveat(zh)}`}
+                    title={`${tpsMetricTitle(zh)}\n${tpsAggregateWindowTitle(zh)}`}
                   >
-                    {zh ? "正文 TPS" : "Content TPS"}
+                    {zh ? "输出 TPS" : "Output TPS"}
                   </th>
                   <th className="px-4 py-3 text-right">{zh ? "最后调用" : "Last Called"}</th>
                 </tr>
@@ -788,9 +786,9 @@ function Overview({
                   <th className="px-3 py-3 text-right">TTFT</th>
                   <th
                     className="px-3 py-3 text-right"
-                    title={`${tpsMetricTitle(zh)}\n${tpsAggregateWindowTitle(zh)}\n${tpsReasoningCaveat(zh)}`}
+                    title={`${tpsMetricTitle(zh)}\n${tpsAggregateWindowTitle(zh)}`}
                   >
-                    {zh ? "正文 TPS" : "Content TPS"}
+                    {zh ? "输出 TPS" : "Output TPS"}
                   </th>
                   <th className="px-4 py-3 text-right">{zh ? "最后调用" : "Last Called"}</th>
                 </tr>
@@ -1151,9 +1149,9 @@ function Attempts({
                   <th className="px-3 py-3 text-right">TTFT</th>
                   <th
                     className="px-3 py-3 text-right"
-                    title={`${tpsMetricTitle(zh)}\n${tpsReasoningCaveat(zh)}`}
+                    title={tpsMetricTitle(zh)}
                   >
-                    {zh ? "正文 TPS" : "Content TPS"}
+                    {zh ? "输出 TPS" : "Output TPS"}
                   </th>
                 </tr>
               </thead>
@@ -1219,7 +1217,7 @@ function Attempts({
                       </td>
                       <td
                         className="px-3 py-2.5 text-right text-xs"
-                        title={`${tpsMetricTitle(zh)}\n${tpsReasoningCaveat(zh)}`}
+                        title={tpsMetricTitle(zh)}
                       >
                         {formatTps(computeTps(log))}
                       </td>

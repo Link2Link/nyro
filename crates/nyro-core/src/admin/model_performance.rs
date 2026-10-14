@@ -34,11 +34,11 @@ pub struct ModelPerformanceResponse {
     pub models: Vec<ModelPerformanceItem>,
 }
 
-/// Merge variants through the shared valid-sample sums: content/gross rates
-/// are sum(tokens)/sum(elapsed) across the whole group, never an average of
+/// Merge variants through the shared valid-sample sums: the output rate is
+/// sum(output tokens)/sum(elapsed) across the whole group, never an average of
 /// per-variant rates. Counts are plain sums and sample timestamps span the
 /// merged window. A group without any valid sample keeps a null rate instead
-/// of a fabricated zero; a group of only pure-reasoning samples keeps 0.
+/// of a fabricated zero.
 fn aggregate_stats(variants: &[ModelPerformanceVariant]) -> (ModelPerformanceStats, i64, i64) {
     let mut stats = ModelPerformanceStats::default();
     let mut unclassified_count = 0i64;
@@ -188,8 +188,8 @@ mod tests {
     #[test]
     fn merges_variants_through_shared_sums() {
         // variant A: 2000 content / 3000 output over 20 s; B: 1000 / 1000
-        // over 10 s. Merged: 3000 / 4000 over 30 s — sum ratios, not a mean
-        // of per-variant rates (which would weight 100 and 100 equally).
+        // over 10 s. Merged output TPS is 4000 / 30 s — sum ratios, not a mean
+        // of per-variant rates (which would weight 150 and 100 equally).
         let variants = [
             variant_from_sums(
                 "m",
@@ -222,9 +222,9 @@ mod tests {
         assert_eq!(stats.total_content_tokens, 3_000);
         assert_eq!(stats.total_output_tokens, 4_000);
         assert_eq!(stats.total_latency_ms, 30_000);
-        assert_eq!(stats.average_tps, Some(100.0));
+        assert!((stats.average_tps.unwrap() - (4_000.0 / 30.0)).abs() < 1e-9);
         assert_eq!(stats.overall_tps, stats.average_tps);
-        assert!((stats.average_gross_tps.unwrap() - (4_000.0 / 30.0)).abs() < 1e-9);
+        assert_eq!(stats.average_gross_tps, stats.average_tps);
         assert_eq!(stats.overall_gross_tps, stats.average_gross_tps);
         assert_eq!(stats.first_sample_at, Some(10));
         assert_eq!(stats.last_sample_at, Some(90));
@@ -233,7 +233,7 @@ mod tests {
     #[test]
     fn latency_weighting_beats_rate_averaging() {
         // One fast variant (100 tok / 0.1 s) and one slow variant (1000 tok /
-        // 10 s): merged content TPS is 1100 / 10.1 s, not (1000 + 100) / 2.
+        // 10 s): merged TPS is 1100 / 10.1 s, not (1000 + 100) / 2.
         let variants = [
             variant_from_sums(
                 "fast",
@@ -265,7 +265,7 @@ mod tests {
     }
 
     #[test]
-    fn pure_reasoning_group_keeps_zero_content_rate() {
+    fn pure_reasoning_group_counts_full_output() {
         let variants = [variant_from_sums(
             "thinker",
             5,
@@ -280,8 +280,8 @@ mod tests {
         )];
         let (stats, _, _) = aggregate_stats(&variants);
         assert_eq!(stats.valid_tps_count, 5);
-        assert_eq!(stats.average_tps, Some(0.0));
-        assert_eq!(stats.overall_tps, Some(0.0));
+        assert_eq!(stats.average_tps, Some(100.0));
+        assert_eq!(stats.overall_tps, Some(100.0));
         assert_eq!(stats.average_gross_tps, Some(100.0));
         assert_eq!(stats.first_sample_at, Some(1));
         assert_eq!(stats.last_sample_at, Some(9));

@@ -3,7 +3,7 @@ import type { Provider } from "./types";
 export interface PerformanceStats {
   selected_request_count: number;
   valid_tps_count: number;
-  /** 主 TPS:Σ正文 Token ÷ Σ有效请求耗时;0 表示纯推理样本也计入。 */
+  /** 输出 TPS:Σ输出 Token ÷ Σ有效请求耗时（含推理 Token 与首字延迟）。 */
   average_tps: number | null;
   average_gross_tps?: number | null;
   /** average_tps 的兼容别名,后端保证同值。 */
@@ -16,10 +16,10 @@ export interface PerformanceStats {
   first_sample_at: number | null;
   last_sample_at: number | null;
 }
-/** 主 TPS = average_tps,缺失时读同值别名 overall_tps。 */
+/** 输出 TPS = average_tps,缺失时读同值别名 overall_tps。 */
 export const resolveMainTps = (stats: PerformanceStats): number | null =>
   stats.average_tps ?? stats.overall_tps ?? null;
-/** 总输出 TPS = average_gross_tps,缺失时读同值别名 overall_gross_tps。 */
+/** 兼容别名:当前服务端与 average_tps 同值。 */
 export const resolveGrossTps = (stats: PerformanceStats): number | null =>
   stats.average_gross_tps ?? stats.overall_gross_tps ?? null;
 export interface ModelPerformanceVariant {
@@ -59,7 +59,7 @@ function isStats(value: unknown, maxSelected: number): value is PerformanceStats
   const v = value as Record<string, unknown>;
   if (!count(v.selected_request_count) || Number(v.selected_request_count) > maxSelected
     || !count(v.valid_tps_count) || Number(v.valid_tps_count) > Number(v.selected_request_count)) return false;
-  // 0 是有效值:纯推理样本(valid_tps_count 计入)可以合法地得到 0 tok/s。
+  // 0 仍是可绘制值,不当缺失。
   for (const rate of [v.overall_tps, v.average_gross_tps, v.overall_gross_tps]) {
     if (rate !== undefined && rate !== null && (!finite(rate) || Number(rate) < 0)) return false;
   }
@@ -124,9 +124,9 @@ export interface PerformanceRow {
   score: number;
   scoreUpdatedAt: string;
   status: "ready" | "missing";
-  /** 主 TPS(正文端到端吞吐);0 有效,null 表示不可用。 */
+  /** 输出 TPS(总输出 Token 的端到端吞吐);null 表示不可用。 */
   tps: number | null;
-  /** 总输出 TPS(gross,含推理),辅助展示。 */
+  /** 与 tps 同口径的兼容字段;当前服务端与 tps 同值。 */
   grossTps: number | null;
   selectedRequestCount: number;
   validTpsCount: number;
@@ -139,7 +139,7 @@ export interface PerformanceRow {
 export interface PerformancePoint extends PerformanceRow {
   status: "ready";
   score: number;
-  /** 主 TPS(正文端到端吞吐);0 参与绘图,不当 missing。 */
+  /** 输出 TPS;0 参与绘图,不当 missing。 */
   tps: number;
   grossTps: number | null;
   color: string;
@@ -189,7 +189,7 @@ export function filterPerformanceRows(rows: PerformanceRow[], search: string, pr
     && `${row.providerName}\n${row.providerId}\n${row.modelPrefix}\n${row.variants.map((variant) => variant.upstream_model).join("\n")}`.toLocaleLowerCase().includes(text));
 }
 /**
- * 可绘图点 = 状态 ready 且主 TPS 为非负有限值。0 tok/s(纯推理)是有效
+ * 可绘图点 = 状态 ready 且输出 TPS 为非负有限值。0 tok/s 仍是有效
  * 数据点,参与绘图与包络线;负值/非有限值才是 missing。
  */
 export function performancePoints(rows: PerformanceRow[]): PerformancePoint[] {

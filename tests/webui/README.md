@@ -111,27 +111,26 @@ Coverage:
   row — while `/model-usage` still reports its empty window.
 - Select the latest fifty raw retained logs by request time before validating TPS
   (first select, then validate: invalid samples consume the window without refilling
-  older rows). The shared logs/model-usage formula computes content =
-  `output_tokens − max(reasoning_tokens, 0)` clamped at zero over
-  `latency_upstream_ms`, falling back to `latency_total_ms` only when upstream is
-  null/undefined; TTFT and `is_stream` never change the duration, and `output ≤ 0`
-  counts as no usage. Pure-reasoning calls with output > 0 are valid samples worth
-  zero content tokens. The seeded twenty-five 100-token 2000ms/500ms-TTFT streams and
-  twenty-five 50-token 1000ms calls sum to Σcontent 3750 ÷ Σduration 75 s = **50 TPS**,
+  older rows). The shared logs/model-usage formula divides total `output_tokens`
+  (reasoning included) by `latency_upstream_ms`, falling back to `latency_total_ms`
+  only when upstream is null/undefined; first-token latency stays inside that duration
+  and `is_stream` never changes it, and `output ≤ 0` counts as no usage.
+  Pure-reasoning calls with output > 0 are valid samples at their full output rate.
+  The seeded twenty-five 100-token 2000ms/500ms-TTFT streams and
+  twenty-five 50-token 1000ms calls sum to Σoutput 3750 ÷ Σduration 75 s = **50 TPS**,
   while two older 900/800-token rows stay outside the fifty-sample window.
   New `performance_*` timings intentionally disagree to prove they are not used.
 - A reasoning pair (`model/reasoning`: eight 100/80 output/reasoning rows, two
   pure-reasoning rows and one no-usage row) reports 10 valid of 11 selected samples,
-  content TPS **16.0** (Σ160 tok ÷ 10 s) and gross TPS 100 (Σoutput ÷ the same
-  duration). A pure-reasoning pair (`model/pure-reasoning`) reports a **valid zero**:
-  average_tps `0`, valid_tps_count 3, plotted at (20, 0) with a `0.0 tok/s` tooltip,
-  the gross auxiliary figure and the missing-reasoning caveat — never a missing row and
-  never a gross fallback.
+  output TPS **100.0** (Σoutput 1000 tok ÷ 10 s). A pure-reasoning pair
+  (`model/pure-reasoning`) reports the same full output rate: average_tps `100`,
+  valid_tps_count 3, plotted at (20, 100) with a `100.0 tok/s` tooltip — never a
+  missing row and never a zero invented by subtracting reasoning tokens.
 - Failed/incomplete/output-limit/cancelled/unknown completion, non-2xx statuses and
   metadata versions 0, 1 and 99 do not disqualify valid token/timing samples. Mixed
   reasoning-effort metadata stays in the same sample pool: three older minimal-effort
   rows join the ten newer ones as twelve valid of thirteen selected samples summing to
-  Σcontent 1410 ÷ Σduration 12 s = 117.5 TPS. Legacy-valid logs are plotted without an
+  Σoutput 1410 ÷ Σduration 12 s = 117.5 TPS. Legacy-valid logs are plotted without an
   untrusted-history warning.
 - MiniMax-M3 with version 1, unknown completion, 2007 output tokens, 20617ms upstream
   latency and 1798ms TTFT yields `2007 / (20617 / 1000)` TPS — the TTFT is never
@@ -140,7 +139,7 @@ Coverage:
   made.
 - Two upstream variants (`model/dual`, `model/dual-0813`) share one prefix and one row:
   the group must keep both variants, report `50 + 50 = 100` selected and valid samples,
-  merge by summed tokens and durations (Σcontent 8000 ÷ Σduration 100 s →
+  merge by summed tokens and durations (Σoutput 8000 ÷ Σduration 100 s →
   **80.0 tok/s**), inherit the shared score, and still be plotted with `100 / 100` in
   the diagnostics table. The same client contract is enforced negatively by CDP
   injection: a group claiming more samples than its declared variants can hold is
@@ -149,10 +148,9 @@ Coverage:
   instead nulls every alias together and stays a plotted-or-missing contract).
 - Only invalid tokens/timing produces missing TPS in the real fixture.
   Fifty invalid latest samples consume the whole window and are not refilled from the
-  one older valid call. Zero score is valid; a zero **TPS** (all-reasoning samples) is
-  also valid plotted data at the axis baseline — missing TPS (`–`) is neither zero nor
-  a gross fallback. Fewer than three valid samples switch that marker's border to
-  dashed.
+  one older valid call. Zero score is valid; a reported zero **TPS** is also valid
+  plotted data at the axis baseline — missing TPS (`–`) is not zero. Fewer than three
+  valid samples switch that marker's border to dashed.
 - Every plotted point is drawn as its provider's vendor icon (resolved from provider
   name, host and protocol) inside a provider-colored rounded marker, never as a plain
   dot: the geometry carrier stays invisible at the exact coordinate, the icon key is
@@ -174,10 +172,10 @@ Coverage:
   full supplier/model identity, score, one-decimal TPS and samples; pointer transfer
   into the tooltip keeps it readable, leaving or Escape dismisses it. Enter/Space
   and zoom work.
-- The Y axis title is the unified **Content TPS (tok/s)**; tooltips label the main
-  metric as end-to-end content TPS with the gross figure and the missing-reasoning
-  caveat. A `zero-tps-plotted` geometry scenario plots two zero-TPS models at the
-  baseline and keeps only the stronger one on the envelope.
+- The Y axis title is the unified **Output TPS (tok/s)**; tooltips label that single
+  end-to-end output rate. A `zero-tps-plotted` geometry scenario still plots two
+  injected zero-TPS models at the baseline and keeps only the stronger one on the
+  envelope.
 - Provider/model search, EN/ZH desktop/mobile, bounded mobile tooltips,
   direct loading and no whole-page overflow.
 - Invalid numeric payloads, fabricated merged over-counts, null TPS, warm/cold

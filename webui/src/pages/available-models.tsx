@@ -19,7 +19,7 @@ import {
 } from "lucide-react";
 
 import { backend } from "@/lib/backend";
-import { formatDuration, formatLocalDateTime, formatTokenCount, formatTps, readAverageTpsField, tpsGrossTitle, tpsLegacyServerTitle, tpsMetricTitle, tpsReasoningCaveat } from "@/lib/format";
+import { formatDuration, formatLocalDateTime, formatTokenCount, formatTps, readAverageTpsField, tpsLegacyServerTitle, tpsMetricTitle } from "@/lib/format";
 import { useLocale } from "@/lib/i18n";
 import { longestRatingMatch, ratingDisplayState, uniqueModelIdentifiers, type RatingLoadState } from "@/lib/model-ratings";
 import { useModelRatings } from "@/lib/use-model-ratings";
@@ -273,14 +273,10 @@ function CapabilityDetail({ provider, model, isZh }: { provider: Provider; model
             <div
               title={[
                 tpsMetricTitle(isZh),
-                stats.average_gross_tps != null && (stats.overall_tps !== undefined || stats.valid_tps_count !== undefined)
-                  ? `${tpsGrossTitle(isZh)}: ${formatTps(stats.average_gross_tps)}`
-                  : "",
                 readAverageTpsField(stats) == null && stats.average_tps != null ? tpsLegacyServerTitle(isZh) : "",
-                tpsReasoningCaveat(isZh),
               ].filter(Boolean).join("\n")}
             >
-              <div className="text-[11px] font-medium text-slate-400">{isZh ? "正文 TPS" : "Content TPS"}</div>
+              <div className="text-[11px] font-medium text-slate-400">{isZh ? "输出 TPS" : "Output TPS"}</div>
               <div className="mt-1 text-base font-semibold text-slate-800">{formatTps(readAverageTpsField(stats))}</div>
             </div>
             <div>

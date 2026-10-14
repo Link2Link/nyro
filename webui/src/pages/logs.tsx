@@ -7,7 +7,7 @@ import type { ApiKey, LoggingStatus, LogPage, LogQuery, ModelStats, Provider, Re
 import { isLogRelatedQueryKey } from "@/lib/log-observability";
 import { OutcomeFilter, ResultBadge } from "@/components/log-outcome";
 import { getRouteType } from "@/lib/types";
-import { computeGrossTps, computeTps, contentTokensOf, formatDuration, formatLogTime, formatTokenCount, formatTps, tpsGrossTitle, tpsMetricTitle, tpsReasoningCaveat } from "@/lib/format";
+import { computeTps, formatDuration, formatLogTime, formatTokenCount, formatTps, tpsMetricTitle } from "@/lib/format";
 import { prettyName } from "@/lib/protocol";
 import { cn } from "@/lib/utils";
 import { useLocale } from "@/lib/i18n";
@@ -426,9 +426,9 @@ export default function LogsPage() {
                   <th className="px-3 py-2.5 text-left font-medium whitespace-nowrap">Token</th>
                   <th
                     className="px-3 py-2.5 text-right font-medium whitespace-nowrap"
-                    title={`${tpsMetricTitle(isZh)}\n${tpsReasoningCaveat(isZh)}`}
+                    title={tpsMetricTitle(isZh)}
                   >
-                    {isZh ? "正文 TPS" : "Content TPS"}
+                    {isZh ? "输出 TPS" : "Output TPS"}
                   </th>
                   <th className="px-3 py-2.5 text-left font-medium whitespace-nowrap">
                     {isZh ? "类型" : "Type"}
@@ -525,27 +525,9 @@ export default function LogsPage() {
                       </td>
                       <td
                         className="px-3 py-2 text-right text-xs text-slate-600 whitespace-nowrap tabular-nums"
-                        title={[
-                          tpsMetricTitle(isZh),
-                          `${isZh ? "正文 TPS" : "Content TPS"}: ${formatTps(computeTps(log))}`,
-                          `${tpsGrossTitle(isZh)}: ${formatTps(computeGrossTps(log))}`,
-                          log.reasoning_tokens && log.reasoning_tokens > 0
-                            ? (isZh
-                                ? `思考 ${log.reasoning_tokens} tok / 正文 ${contentTokensOf(log)} tok`
-                                : `reasoning: ${log.reasoning_tokens} tok, content: ${contentTokensOf(log)} tok`)
-                            : "",
-                          tpsReasoningCaveat(isZh),
-                        ].filter(Boolean).join("\n")}
+                        title={`${tpsMetricTitle(isZh)}\n${isZh ? "输出 TPS" : "Output TPS"}: ${formatTps(computeTps(log))}`}
                       >
                         {formatTps(computeTps(log))}
-                        {log.reasoning_tokens && log.reasoning_tokens > 0 ? (
-                          <span
-                            className="ml-1 text-[10px] text-amber-600 font-medium cursor-help"
-                            title={isZh ? "该请求报告了推理 Token，正文 = 输出 − 推理" : "Reasoning tokens reported; content = output − reasoning"}
-                          >
-                            *
-                          </span>
-                        ) : null}
                       </td>
                       <td className="px-3 py-2 whitespace-nowrap">
                         {isStream ? (

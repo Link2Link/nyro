@@ -93,9 +93,10 @@ fn fixture_aggregates_are_latency_weighted_not_averaged() {
     assert_eq!(stats.valid_tps_count, 10);
     assert_eq!(stats.recent_content_tokens, 760);
     assert_eq!(stats.recent_latency_ms, 12_500);
-    // 760 content tokens / 12.5 s and 1100 output tokens / 12.5 s; an
+    // Primary rate is total output: 1100 / 12.5 s = 88.0. Content sums stay
+    // tracked separately (760 / 12.5 s) and are not the displayed TPS. An
     // arithmetic mean of per-request rates would give a different number.
-    assert_eq!(stats.average_tps, Some(60.8));
+    assert_eq!(stats.average_tps, Some(88.0));
     assert_eq!(stats.average_gross_tps, Some(88.0));
     assert_eq!(stats.overall_tps, stats.average_tps);
     assert_eq!(stats.overall_gross_tps, stats.average_gross_tps);
@@ -144,7 +145,7 @@ async fn sqlite_readback_matches_fixture_contract() -> anyhow::Result<()> {
     assert_eq!(usage.valid_tps_count, 10);
     assert_eq!(usage.recent_content_tokens, 760);
     assert_eq!(usage.recent_latency_ms, 12_500);
-    assert_eq!(usage.average_tps, Some(60.8));
+    assert_eq!(usage.average_tps, Some(88.0));
     assert_eq!(usage.average_gross_tps, Some(88.0));
     assert_eq!(usage.overall_tps, usage.average_tps);
     assert_eq!(usage.overall_gross_tps, usage.average_gross_tps);
@@ -159,7 +160,7 @@ async fn sqlite_readback_matches_fixture_contract() -> anyhow::Result<()> {
     assert_eq!(mixed.total_content_tokens, 760);
     assert_eq!(mixed.total_output_tokens, 1_100);
     assert_eq!(mixed.total_latency_ms, 12_500);
-    assert_eq!(mixed.average_tps, Some(60.8));
+    assert_eq!(mixed.average_tps, Some(88.0));
     assert_eq!(mixed.average_gross_tps, Some(88.0));
     assert_eq!(mixed.overall_tps, mixed.average_tps);
     assert_eq!(mixed.overall_gross_tps, mixed.average_gross_tps);

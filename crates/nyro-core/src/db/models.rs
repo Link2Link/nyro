@@ -995,24 +995,21 @@ impl RecentModelPerformance {
         }
     }
 
-    /// Default content TPS (primary metric): clamped content tokens over the
-    /// end-to-end window. Pure-reasoning rows stay valid and report 0.
+    /// Default TPS (primary metric): total output tokens, reasoning included,
+    /// over the end-to-end window. TTFT is never subtracted. Pure-reasoning
+    /// rows stay valid and report their full output rate.
     pub fn tps(&self) -> Option<f64> {
         let elapsed = self.e2e_latency_ms()?;
         if !self.has_tps_usage() {
             return None;
         }
-        Some(self.content_tokens() as f64 / (elapsed as f64 / 1000.0))
+        Some(self.output_tokens as f64 / (elapsed as f64 / 1000.0))
     }
 
-    /// Gross TPS (secondary metric): total output tokens (incl. reasoning)
-    /// over the same end-to-end window and the same validity pool as `tps`.
+    /// Compatibility alias of [`Self::tps`]: the same total-output rate over
+    /// the same end-to-end window and validity pool.
     pub fn gross_tps(&self) -> Option<f64> {
-        let elapsed = self.e2e_latency_ms()?;
-        if !self.has_tps_usage() {
-            return None;
-        }
-        Some(self.output_tokens as f64 / (elapsed as f64 / 1000.0))
+        self.tps()
     }
 }
 
@@ -1024,21 +1021,20 @@ pub struct ModelUsageStats {
     pub total_cache_read_tokens: i64,
     pub last_called_at: Option<i64>,
     pub recent_sample_count: i64,
-    /// Compatibility alias of `overall_tps`: sum(content) / sum(elapsed)
+    /// Compatibility alias of `overall_tps`: sum(output) / sum(elapsed)
     /// over the latest-fifty valid samples (latency weighted, not an
-    /// arithmetic mean of per-request rates).
+    /// arithmetic mean of per-request rates). Reasoning tokens stay included.
     pub average_tps: Option<f64>,
-    /// Compatibility alias of `overall_gross_tps` over the same pool.
+    /// Same value as `average_tps`.
     pub average_gross_tps: Option<f64>,
     pub average_first_token_ms: Option<f64>,
-    /// Valid samples inside the latest-fifty window (includes pure-reasoning
-    /// rows that contribute a 0 content rate).
+    /// Valid samples inside the latest-fifty window.
     #[serde(default)]
     pub valid_tps_count: i64,
-    /// Same value as `average_tps`; the end-to-end content throughput.
+    /// Same value as `average_tps`; the end-to-end output throughput.
     #[serde(default)]
     pub overall_tps: Option<f64>,
-    /// Same value as `average_gross_tps`; the end-to-end gross throughput.
+    /// Same value as `average_tps`.
     #[serde(default)]
     pub overall_gross_tps: Option<f64>,
     /// Sum of clamped content tokens across the valid recent samples. Named
@@ -1066,8 +1062,8 @@ impl ModelUsageStats {
                 first_token_count += 1;
             }
         }
-        let average_tps = tps.content_tps();
-        let average_gross_tps = tps.gross_tps();
+        let average_tps = tps.gross_tps();
+        let average_gross_tps = average_tps;
 
         Self {
             request_count: totals.request_count,
@@ -1127,7 +1123,7 @@ mod model_usage_stats_tests {
 
         assert_eq!(stats.request_count, 12);
         assert_eq!(stats.recent_sample_count, 2);
-        // End-to-end, latency weighted: (100 + 50) content / (2.0 + 1.0) s.
+        // End-to-end, latency weighted: (100 + 50) output / (2.0 + 1.0) s.
         assert_eq!(stats.average_tps, Some(50.0));
         assert_eq!(stats.average_gross_tps, Some(50.0));
         assert_eq!(stats.overall_tps, stats.average_tps);
@@ -1139,7 +1135,7 @@ mod model_usage_stats_tests {
     }
 
     #[test]
-    fn effective_tps_excludes_reasoning_tokens() {
+    fn tps_counts_full_output_including_reasoning() {
         let sample = RecentModelPerformance {
             output_tokens: 100,
             reasoning_tokens: 80,
@@ -1149,15 +1145,16 @@ mod model_usage_stats_tests {
             latency_total_ms: Some(1_600),
             stream_first_chunk_ms: Some(500),
         };
-        // End-to-end: content 20 over the full 1.5 s upstream window; the
-        // 500 ms TTFT is no longer subtracted.
+        // End-to-end perceived rate: all 100 output tokens over the full 1.5 s
+        // upstream window. The 500 ms TTFT is not subtracted, and reasoning
+        // stays inside the output count. Content tokens remain diagnostic only.
         assert_eq!(sample.content_tokens(), 20);
-        assert_eq!(sample.tps(), Some(20.0 / 1.5));
+        assert_eq!(sample.tps(), Some(100.0 / 1.5));
         assert_eq!(sample.gross_tps(), Some(100.0 / 1.5));
     }
 
     #[test]
-    fn pure_reasoning_sample_is_valid_zero_content_rate() {
+    fn pure_reasoning_sample_counts_full_output() {
         let sample = RecentModelPerformance {
             output_tokens: 100,
             reasoning_tokens: 100,
@@ -1168,12 +1165,12 @@ mod model_usage_stats_tests {
             stream_first_chunk_ms: Some(100),
         };
         assert_eq!(sample.content_tokens(), 0);
-        assert_eq!(sample.tps(), Some(0.0));
+        assert_eq!(sample.tps(), Some(100.0));
         assert_eq!(sample.gross_tps(), Some(100.0));
 
         let stats = ModelUsageStats::from_samples(ModelUsageTotals::default(), &[sample]);
         assert_eq!(stats.valid_tps_count, 1);
-        assert_eq!(stats.average_tps, Some(0.0));
+        assert_eq!(stats.average_tps, Some(100.0));
         assert_eq!(stats.average_gross_tps, Some(100.0));
         assert_eq!(stats.recent_content_tokens, 0);
         assert_eq!(stats.recent_latency_ms, 1_000);
@@ -1203,7 +1200,7 @@ mod model_usage_stats_tests {
             stream_first_chunk_ms: None,
         };
         assert_eq!(overflow.content_tokens(), 0);
-        assert_eq!(overflow.tps(), Some(0.0));
+        assert_eq!(overflow.tps(), Some(100.0));
         assert_eq!(overflow.gross_tps(), Some(100.0));
     }
 

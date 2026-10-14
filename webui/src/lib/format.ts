@@ -106,7 +106,7 @@ export function formatTokenCount(value: number | null | undefined): string {
 }
 
 /**
- * TPS 展示:0 是有效的“纯推理 0 吞吐”,显示 0.0 tok/s;
+ * TPS 展示:0 仍显示 0.0 tok/s;
  * null/非有限/负值才表示不可用,显示 "–"。
  */
 export function formatTps(tps: number | null | undefined): string {
@@ -145,29 +145,12 @@ export function contentTokensOf(log: TpsInput | null | undefined): number {
 const hasUsage = (log: TpsInput | null | undefined): log is TpsInput =>
   typeof log?.output_tokens === "number" && Number.isFinite(log.output_tokens) && log.output_tokens > 0;
 
-/** 非空推理明细必须是有限数(负数允许并按 0 截断);NaN/Infinity 视为无效数据。 */
-const hasFiniteReasoning = (log: TpsInput): boolean =>
-  log.reasoning_tokens == null
-  || (typeof log.reasoning_tokens === "number" && Number.isFinite(log.reasoning_tokens));
-
 /**
- * 主 TPS:正文端到端吞吐 (tok/s) = 正文 Token ÷ 端到端耗时。
- * output ≤ 0(含缺失)视为无用量 → null;output > 0 的纯推理请求正文为 0,
- * 返回有效的 0。耗时无效 → null。绝不回退到总输出 TPS。
+ * 体感 TPS (tok/s) = 总输出 Token ÷ 端到端耗时。
+ * 推理 Token 计入输出,首字延迟计入耗时(耗时本身就是端到端,不扣 TTFT)。
+ * output ≤ 0(含缺失)视为无用量 → null。耗时无效 → null。
  */
 export function computeTps(log: TpsInput | null | undefined): number | null {
-  if (!hasUsage(log) || !hasFiniteReasoning(log)) return null;
-  const ms = endToEndMsOf(log);
-  if (ms == null) return null;
-  const tps = contentTokensOf(log) / (ms / 1000);
-  return Number.isFinite(tps) ? tps : null;
-}
-
-/**
- * 总输出 TPS (gross,含推理 Token) = 总输出 Token ÷ 同一端到端耗时。
- * output ≤ 0(含缺失)或耗时无效 → null。仅作辅助展示,不替代主 TPS。
- */
-export function computeGrossTps(log: TpsInput | null | undefined): number | null {
   if (!hasUsage(log)) return null;
   const ms = endToEndMsOf(log);
   if (ms == null) return null;
@@ -186,18 +169,10 @@ const validSum = (value: number | null | undefined, allowZero: boolean): value i
   typeof value === "number" && Number.isFinite(value) && (allowZero ? value >= 0 : value > 0);
 
 /**
- * 聚合主 TPS = Σ正文 Token ÷ Σ有效请求耗时。汇总字段缺失或非法时返回
- * null(显示 "–" 与兼容提示),绝不回退用全历史总量凑出 gross 值。
- * 纯推理样本计入汇总(正文为 0),因此结果可以为有效的 0。
+ * 聚合 TPS = Σ输出 Token ÷ Σ有效请求耗时。汇总字段缺失或非法时返回
+ * null(显示 "–"),绝不回退用全历史总量凑值。推理 Token 已含在输出里。
  */
 export function computeAggregateTps(sums: AggregateTpsSums | null | undefined): number | null {
-  if (!sums || !validSum(sums.tps_content_tokens, true) || !validSum(sums.tps_elapsed_ms, false)) return null;
-  const tps = sums.tps_content_tokens / (sums.tps_elapsed_ms / 1000);
-  return Number.isFinite(tps) ? tps : null;
-}
-
-/** 聚合总输出 TPS = Σ输出 Token ÷ 同一 Σ有效请求耗时;字段缺失/非法 → null。 */
-export function computeAggregateGrossTps(sums: AggregateTpsSums | null | undefined): number | null {
   if (!sums || !validSum(sums.tps_output_tokens, true) || !validSum(sums.tps_elapsed_ms, false)) return null;
   const tps = sums.tps_output_tokens / (sums.tps_elapsed_ms / 1000);
   return Number.isFinite(tps) ? tps : null;
@@ -207,7 +182,7 @@ export function computeAggregateGrossTps(sums: AggregateTpsSums | null | undefin
  * 字段在场门控:新契约服务器在返回 average_tps 的同时必然携带伴生字段
  * (overall_tps 别名或 valid_tps_count)。只有旧 average 字段的响应不能按新
  * 口径展示——返回 null 由调用方显示 "–" 与旧服务器提示,而不是把旧口径
- * 数值(如历史扣除 TTFT 的算法结果)误标为正文端到端 TPS。
+ * 数值(如历史扣除 TTFT 或推理 Token 的算法结果)误标为当前输出 TPS。
  */
 export interface AverageTpsContractFields {
   average_tps?: number | null;
@@ -229,25 +204,11 @@ export function tpsLegacyServerTitle(zh: boolean): string {
     : "This server only reports the legacy TPS field without the new-contract companions (valid_tps_count/overall_tps); it is shown as unavailable rather than relabeled as the new metric.";
 }
 
-/** 主 TPS 口径说明:正文端到端吞吐。 */
+/** 输出 TPS 口径说明:总输出 Token 的端到端体感吞吐,含首字延迟与推理 Token。 */
 export function tpsMetricTitle(zh: boolean): string {
   return zh
-    ? "正文 TPS =（输出 − 推理）Token ÷ 请求耗时（上游耗时，仅未记录时回退总耗时，不扣首字延迟）。输出 ≤ 0 视为无用量，不计入。"
-    : "Content TPS = (output − reasoning) tokens ÷ request duration (upstream latency, falling back to total latency only when unrecorded; TTFT is never subtracted). Output ≤ 0 counts as no usage.";
-}
-
-/** 总输出 TPS(gross,含推理)辅助口径说明。 */
-export function tpsGrossTitle(zh: boolean): string {
-  return zh
-    ? "总输出 TPS = 总输出 Token ÷ 同一耗时（含推理 Token）。"
-    : "Gross TPS = total output tokens ÷ the same duration (reasoning included).";
-}
-
-/** 推理明细缺失时的全局说明,所有正文 TPS 表面都必须可见或可及。 */
-export function tpsReasoningCaveat(zh: boolean): string {
-  return zh
-    ? "未提供或历史未记录推理明细时，正文按已报告输出计算，不能保证精确扣除推理 Token。"
-    : "When reasoning details are absent (not reported or not recorded historically), content is computed from the reported output, so the reasoning deduction cannot be guaranteed to be exact.";
+    ? "输出 TPS = 总输出 Token ÷ 请求耗时（上游耗时，仅未记录时回退总耗时；含首字延迟，推理 Token 计入输出）。输出 ≤ 0 视为无用量，不计入。"
+    : "Output TPS = total output tokens ÷ request duration (upstream latency, falling back to total latency only when unrecorded; first-token latency included, reasoning tokens counted in the output). Output ≤ 0 counts as no usage.";
 }
 
 /** 聚合 TPS 的时间窗口说明:按页面时间筛选汇总,区别于性能页最近 50 次采样。 */
@@ -260,15 +221,15 @@ export function tpsAggregateWindowTitle(zh: boolean): string {
 /** 后端尚未提供聚合汇总字段时的兼容提示。 */
 export function tpsSumsUnavailableTitle(zh: boolean): string {
   return zh
-    ? "此服务器版本尚未提供正文 TPS 所需的有效样本汇总字段，暂不可用（不会回退为总输出 TPS）。"
-    : "This server version does not yet report the valid-sample sums required for content TPS, so it is unavailable (it never falls back to gross output TPS).";
+    ? "此服务器版本尚未提供输出 TPS 所需的有效样本汇总字段，暂不可用。"
+    : "This server version does not yet report the valid-sample sums required for output TPS, so it is unavailable.";
 }
 
 /**
  * 聚合 TPS 单元格的完整悬浮说明,区分三种状态:
- *  - 汇总字段缺失/非法 → 兼容提示(旧服务器,绝不回退 gross);
+ *  - 汇总字段缺失/非法 → 兼容提示(旧服务器);
  *  - 字段齐全但 Σ耗时 = 0 → 所选时间范围内没有可计入的有效请求(有输出且耗时有效);
- *  - 正常 → 主 TPS 与总输出 TPS 数值 + 时间窗口 + 推理明细说明。
+ *  - 正常 → 输出 TPS 数值 + 时间窗口。
  */
 export function tpsAggregateStatusTitle(sums: AggregateTpsSums | null | undefined, zh: boolean): string {
   const content = sums?.tps_content_tokens;
@@ -278,16 +239,13 @@ export function tpsAggregateStatusTitle(sums: AggregateTpsSums | null | undefine
   if (!present) return tpsSumsUnavailableTitle(zh);
   const lines = [tpsMetricTitle(zh)];
   if (elapsed! > 0) {
-    const tps = computeAggregateTps(sums);
-    const gross = computeAggregateGrossTps(sums);
-    lines.push(`${zh ? "正文 TPS" : "Content TPS"}: ${formatTps(tps)}`);
-    if (gross != null) lines.push(`${zh ? "总输出 TPS" : "Gross TPS"}: ${formatTps(gross)}\n${tpsGrossTitle(zh)}`);
+    lines.push(`${zh ? "输出 TPS" : "Output TPS"}: ${formatTps(computeAggregateTps(sums))}`);
   } else {
     lines.push(zh
       ? "所选时间范围内没有可计入 TPS 的有效请求（需要输出 > 0 且耗时有效）。"
       : "No valid requests count toward TPS in the selected time range (output > 0 and usable timing required).");
   }
-  lines.push(tpsAggregateWindowTitle(zh), tpsReasoningCaveat(zh));
+  lines.push(tpsAggregateWindowTitle(zh));
   return lines.join("\n");
 }
 

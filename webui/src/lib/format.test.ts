@@ -3,9 +3,7 @@ import { test } from "node:test";
 import { readFileSync } from "node:fs";
 import path from "node:path";
 import {
-  computeAggregateGrossTps,
   computeAggregateTps,
-  computeGrossTps,
   computeTps,
   contentTokensOf,
   endToEndMsOf,
@@ -65,13 +63,13 @@ test("TPS display uses one decimal; zero is valid, only null/non-finite/negative
   }
 });
 
-test("shared tps-contract fixture: content, main TPS and gross TPS all match the backend oracle", () => {
+test("shared tps-contract fixture: content tokens and output TPS match the backend oracle", () => {
   const cases = loadTpsContract();
   equal(cases.length, 17);
   for (const item of cases) {
     equal(contentTokensOf(item.log), item.content_tokens, `${item.name}: content tokens`);
-    equal(computeTps(item.log), item.tps, `${item.name}: main TPS`);
-    equal(computeGrossTps(item.log), item.gross_tps, `${item.name}: gross TPS`);
+    equal(computeTps(item.log), item.tps, `${item.name}: output TPS`);
+    equal(computeTps(item.log), item.gross_tps, `${item.name}: gross alias`);
     if (item.tps !== null) equal(formatTps(item.tps), `${item.tps.toFixed(1)} tok/s`, `${item.name}: display`);
   }
 });
@@ -81,7 +79,7 @@ test("duration uses upstream latency and only falls back on null/undefined, neve
   equal(endToEndMsOf({ output_tokens: 100, latency_upstream_ms: 1000, latency_total_ms: 9000 }), 1000);
   equal(computeTps({ output_tokens: 100, latency_upstream_ms: 1000, stream_first_chunk_ms: 800 } as TpsInput), 100);
   // Only null/undefined upstream falls back to total latency.
-  equal(computeTps({ output_tokens: 50, reasoning_tokens: 10, latency_upstream_ms: null, latency_total_ms: 2000 }), 20);
+  equal(computeTps({ output_tokens: 50, reasoning_tokens: 10, latency_upstream_ms: null, latency_total_ms: 2000 }), 25);
   equal(computeTps({ output_tokens: 100, latency_total_ms: 2000 }), 50);
   // Zero/negative/non-finite upstream or fallback values are invalid, no second fallback.
   equal(computeTps({ output_tokens: 100, latency_upstream_ms: 0, latency_total_ms: 5000 }), null);
@@ -90,37 +88,36 @@ test("duration uses upstream latency and only falls back on null/undefined, neve
   equal(computeTps({ output_tokens: 100 }), null);
 });
 
-test("no-usage rows are invalid; pure reasoning with output > 0 is a valid zero", () => {
+test("no-usage rows are invalid; reasoning tokens stay inside the output rate", () => {
   equal(computeTps({ output_tokens: 0, reasoning_tokens: 0, latency_upstream_ms: 1000 }), null);
   equal(computeTps({ output_tokens: null, latency_upstream_ms: 1000 }), null);
   equal(computeTps({ output_tokens: -5, reasoning_tokens: -10, latency_upstream_ms: 1000 }), null);
-  equal(computeGrossTps({ output_tokens: 0, latency_upstream_ms: 1000 }), null);
-  // output > 0 with all reasoning: content 0 counts as a valid sample with 0 tok/s.
-  equal(computeTps({ output_tokens: 100, reasoning_tokens: 100, latency_upstream_ms: 1000 }), 0);
-  equal(formatTps(computeTps({ output_tokens: 100, reasoning_tokens: 120, latency_upstream_ms: 500 })), "0.0 tok/s");
-  equal(computeGrossTps({ output_tokens: 50, reasoning_tokens: 80, latency_upstream_ms: 500 }), 100);
+  // output > 0 counts in full, even when every token is reasoning.
+  equal(computeTps({ output_tokens: 100, reasoning_tokens: 100, latency_upstream_ms: 1000 }), 100);
+  equal(formatTps(computeTps({ output_tokens: 100, reasoning_tokens: 120, latency_upstream_ms: 500 })), "200.0 tok/s");
+  equal(computeTps({ output_tokens: 50, reasoning_tokens: 80, latency_upstream_ms: 500 }), 100);
 });
 
-test("reasoning details must be finite when present; NaN/Infinity never fabricate zero throughput", () => {
-  equal(computeTps({ output_tokens: 100, reasoning_tokens: NaN, latency_upstream_ms: 1000 }), null);
-  equal(computeTps({ output_tokens: 100, reasoning_tokens: Infinity, latency_upstream_ms: 1000 }), null);
+test("reasoning token details do not change output TPS", () => {
+  equal(computeTps({ output_tokens: 100, reasoning_tokens: NaN, latency_upstream_ms: 1000 }), 100);
+  equal(computeTps({ output_tokens: 100, reasoning_tokens: Infinity, latency_upstream_ms: 1000 }), 100);
   equal(computeTps({ output_tokens: 100, reasoning_tokens: -30, latency_upstream_ms: 1000 }), 100);
 });
 
-test("aggregate TPS uses backend valid-sample sums and never falls back to whole-history totals", () => {
-  // Missing or partial sums stay unavailable; no gross fallback from old total fields.
+test("aggregate TPS uses backend output-token sums and never falls back to whole-history totals", () => {
+  // Missing or partial sums stay unavailable; content-only sums are not a TPS source.
   equal(computeAggregateTps(null), null);
   equal(computeAggregateTps({}), null);
   equal(computeAggregateTps({ tps_content_tokens: 100 }), null);
-  equal(computeAggregateTps({ tps_content_tokens: 100, tps_elapsed_ms: 0 }), null);
-  equal(computeAggregateTps({ tps_content_tokens: 100, tps_elapsed_ms: -5 }), null);
-  equal(computeAggregateGrossTps({ tps_output_tokens: 100, tps_elapsed_ms: 0 }), null);
-  // Same pool division: pure-reasoning-only aggregate is a valid zero.
-  equal(computeAggregateTps({ tps_content_tokens: 0, tps_elapsed_ms: 2000 }), 0);
-  equal(computeAggregateGrossTps({ tps_output_tokens: 1100, tps_elapsed_ms: 12500 }), 88);
+  equal(computeAggregateTps({ tps_output_tokens: 100, tps_elapsed_ms: 0 }), null);
+  equal(computeAggregateTps({ tps_output_tokens: 100, tps_elapsed_ms: -5 }), null);
+  equal(computeAggregateTps({ tps_content_tokens: 0, tps_elapsed_ms: 2000 }), null);
+  // Output tokens over the same elapsed pool, reasoning included.
+  equal(computeAggregateTps({ tps_content_tokens: 0, tps_output_tokens: 200, tps_elapsed_ms: 2000 }), 100);
+  equal(computeAggregateTps({ tps_output_tokens: 1100, tps_elapsed_ms: 12500 }), 88);
 });
 
-test("aggregating the shared fixture reproduces the fixed Σcontent/Σoutput/Σelapsed oracle", () => {
+test("aggregating the shared fixture reproduces the fixed Σoutput/Σelapsed oracle", () => {
   const sums = loadTpsContract().reduce((acc, item) => {
     const output = item.log.output_tokens;
     if (typeof output !== "number" || !(output > 0)) return acc;
@@ -134,8 +131,7 @@ test("aggregating the shared fixture reproduces the fixed Σcontent/Σoutput/Σe
   equal(sums.tps_content_tokens, 760);
   equal(sums.tps_output_tokens, 1100);
   equal(sums.tps_elapsed_ms, 12500);
-  equal(computeAggregateTps(sums), 60.8);
-  equal(computeAggregateGrossTps(sums), 88);
+  equal(computeAggregateTps(sums), 88);
 });
 
 test("aggregate status title distinguishes unsupported backends from empty pools", () => {
@@ -147,15 +143,15 @@ test("aggregate status title distinguishes unsupported backends from empty pools
   const empty = tpsAggregateStatusTitle({ tps_content_tokens: 0, tps_output_tokens: 0, tps_elapsed_ms: 0 }, false);
   ok(empty.includes("No valid requests"));
   ok(!empty.includes("does not yet report"));
-  // Live sums render the content value and the gross auxiliary figure.
+  // Live sums render the output-token rate only.
   const live = tpsAggregateStatusTitle({ tps_content_tokens: 760, tps_output_tokens: 1100, tps_elapsed_ms: 12500 }, false);
-  ok(live.includes("Content TPS: 60.8 tok/s"));
-  ok(live.includes("Gross TPS: 88.0 tok/s"));
+  ok(live.includes("Output TPS: 88.0 tok/s"));
+  ok(!live.includes("Gross TPS"));
 });
 
 test("average_tps field gate refuses legacy-only payloads instead of relabeling them", () => {
   // Legacy servers send only average_tps; without a new-contract companion the value
-  // must not be displayed as the unified content metric.
+  // must not be displayed as the unified output metric.
   equal(readAverageTpsField({ average_tps: 58.3 }), null);
   equal(readAverageTpsField(null), null);
   // Either companion field proves the new contract; zero stays a valid value.
@@ -168,7 +164,7 @@ test("average_tps field gate refuses legacy-only payloads instead of relabeling 
   equal(readAverageTpsField({ average_tps: NaN, overall_tps: NaN }), null);
 });
 
-test("effective TPS excludes reasoning tokens while gross TPS preserves total", () => {
+test("output TPS counts reasoning tokens over the full request duration", () => {
   const log: TpsInput = {
     output_tokens: 100,
     reasoning_tokens: 80,
@@ -176,13 +172,12 @@ test("effective TPS excludes reasoning tokens while gross TPS preserves total", 
     latency_total_ms: 2100,
   };
   equal(contentTokensOf(log), 20);
-  equal(computeTps(log), 10);
-  equal(computeGrossTps(log), 50);
+  equal(computeTps(log), 50);
 });
 
 test("legacy formula expectations are replaced by the end-to-end contract", () => {
   // Old net-generation timing subtracted TTFT (2007 tokens / (20617-1798) ms = 106.6).
-  // The unified main metric divides by the full upstream duration instead.
+  // Output TPS divides total output tokens by the full upstream duration instead.
   equal(computeTps({ output_tokens: 2007, reasoning_tokens: 0, latency_upstream_ms: 20617, latency_total_ms: 21000 }), 2007 / 20.617);
   equal(formatTps(computeTps({ output_tokens: 2007, reasoning_tokens: 0, latency_upstream_ms: 20617, latency_total_ms: 21000 })), "97.3 tok/s");
 });

@@ -4,9 +4,10 @@
 //! windowed SQL aggregates): `output_tokens > 0` and an end-to-end latency
 //! `COALESCE(latency_upstream_ms, latency_total_ms) > 0`. Upstream latency
 //! only falls back to the total when it is NULL; a present-but-nonpositive
-//! upstream value makes the row invalid. Content tokens clamp reasoning into
-//! `[0, output_tokens]` (negative reasoning -> 0, reasoning above output ->
-//! zero content). TTFT is never subtracted.
+//! upstream value makes the row invalid. The primary rate is total output
+//! tokens over that duration: reasoning stays included and TTFT is never
+//! subtracted. Content-token sums are still tracked for diagnostics and clamp
+//! reasoning into `[0, output_tokens]`.
 
 use serde::{Deserialize, Serialize};
 

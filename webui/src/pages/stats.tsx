@@ -11,7 +11,7 @@ import { ModelUsageDialog } from "@/components/model-usage-dialog";
 import { ProviderIcon } from "@/components/ui/provider-icon";
 import { Button } from "@/components/ui/button";
 import { useLocale } from "@/lib/i18n";
-import { computeAggregateTps, formatLogTime, formatTps, tpsAggregateStatusTitle, tpsAggregateWindowTitle, tpsMetricTitle, tpsReasoningCaveat } from "@/lib/format";
+import { computeAggregateTps, formatLogTime, formatTps, tpsAggregateStatusTitle, tpsAggregateWindowTitle, tpsMetricTitle } from "@/lib/format";
 import {
   Select,
   SelectContent,
@@ -286,9 +286,9 @@ export default function StatsPage() {
                 <th className="px-4 py-2.5 text-right font-medium">{isZh ? "平均延迟" : "Avg Latency"}</th>
                 <th
                   className="px-4 py-2.5 text-right font-medium"
-                  title={`${tpsMetricTitle(isZh)}\n${tpsAggregateWindowTitle(isZh)}\n${tpsReasoningCaveat(isZh)}`}
+                  title={`${tpsMetricTitle(isZh)}\n${tpsAggregateWindowTitle(isZh)}`}
                 >
-                  {isZh ? "正文 TPS" : "Content TPS"}
+                  {isZh ? "输出 TPS" : "Output TPS"}
                 </th>
               </tr>
             </thead>
@@ -448,9 +448,9 @@ export default function StatsPage() {
                 <th className="px-4 py-2.5 text-right font-medium">{isZh ? "平均延迟" : "Avg Latency"}</th>
                 <th
                   className="px-4 py-2.5 text-right font-medium"
-                  title={`${tpsMetricTitle(isZh)}\n${tpsAggregateWindowTitle(isZh)}\n${tpsReasoningCaveat(isZh)}`}
+                  title={`${tpsMetricTitle(isZh)}\n${tpsAggregateWindowTitle(isZh)}`}
                 >
-                  {isZh ? "正文 TPS" : "Content TPS"}
+                  {isZh ? "输出 TPS" : "Output TPS"}
                 </th>
               </tr>
             </thead>

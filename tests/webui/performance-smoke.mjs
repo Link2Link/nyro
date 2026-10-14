@@ -245,7 +245,7 @@ function assertPoints(state, rows, { expectedIconKeys = providerIconKeys } = {})
 }
 
 const sameCoordinate = (a,b) => Math.abs(a.x-b.x)<1e-3 && Math.abs(a.y-b.y)<1e-3;
-// A valid zero (pure-reasoning samples) is plotted data and joins the envelope oracle.
+// A reported zero TPS is plotted data and joins the envelope oracle.
 const plottedRows = rows => rows.filter(row=>row.status==='ready' && Number.isInteger(row.score) && row.score>=0 && row.score<=100 && Number.isFinite(row.stats.average_tps) && row.stats.average_tps>=0 && row.stats.valid_tps_count>0);
 
 /** Independent small-fixture oracle: enumerate upper supporting lines, not the UI's hull algorithm. */
@@ -305,7 +305,7 @@ function assertChartScaffolding(state, isZh=false) {
     assert.ok(state.axisTexts.some(t=>Number(t.text)===value && t.x<left && Math.abs(t.y-y)<=8),'Keep Y numeric tick labels');
   }
   assert.ok(state.axisTexts.some(t=>t.text.includes(isZh?'能力评分':'Capability score')),'Keep localized X axis title');
-  assert.ok(state.axisTexts.some(t=>t.text===(isZh?'正文 TPS (tok/s)':'Content TPS (tok/s)')),'Keep the unified content-TPS axis title in the active locale');
+  assert.ok(state.axisTexts.some(t=>t.text===(isZh?'输出 TPS (tok/s)':'Output TPS (tok/s)')),'Keep the unified output-TPS axis title in the active locale');
   assert.equal(state.polygons,0,'The upper-right envelope must never become a closed polygon');
 }
 function assertEnvelopeOnlyLabels(state, rows) {
@@ -449,7 +449,7 @@ try {
     { provider: alpha, model: 'model/dual-0813', score: 62, sharesRowWith: 'model/dual' },
     // Reasoning content parity: mixed reasoning rows plus one invalid no-usage row.
     { provider: beta, model: 'model/reasoning', score: 45 },
-    // Pure reasoning only: a valid plotted zero, never a missing or gross-fallback row.
+    // Pure reasoning only: full output tokens over the end-to-end duration.
     { provider: alpha, model: 'model/pure-reasoning', score: 20 },
   ];
   const unlogged = pairs.find(pair => pair.unlogged);
@@ -472,7 +472,7 @@ try {
     model_name: 'unrelated-logical-route', client_model: 'unrelated-client-alias',
     client_protocol: 'openai', upstream_protocol: 'openai', method: 'POST', path: '/v1/chat/completions',
     client_status_code: 200, upstream_status_code: 200, input_tokens: 10, output_tokens: output,
-    // TPS uses output_tokens − reasoning_tokens over latency_upstream_ms (total fallback).
+    // TPS uses total output_tokens over latency_upstream_ms (total fallback); reasoning stays included.
     cache_read_tokens: 0, latency_upstream_ms: upstream, latency_total_ms: upstream === null ? null : upstream + 100,
     is_stream: 0, stream_chunks_count: 0, stream_first_chunk_ms: null,
     performance_metadata_version: 1, upstream_effort_status: 'present', upstream_effort_raw: 'high', upstream_effort_tier: 'high',
@@ -484,7 +484,7 @@ try {
   });
   log(pairs[0],900); log(pairs[0],800); // Older raw rows are outside the latest fifty.
   for (let i=0;i<25;i++) {
-    // Σcontent 3750 tok ÷ Σelapsed 75 s = 50 TPS end-to-end; TTFT is never subtracted.
+    // Σoutput 3750 tok ÷ Σelapsed 75 s = 50 TPS end-to-end; TTFT is included, never subtracted.
     log(pairs[0],100,2000,{is_stream:1,stream_chunks_count:10,stream_first_chunk_ms:500});
     log(pairs[0],50);
   }
@@ -524,12 +524,12 @@ try {
   // by summed tokens and durations → (100×50 + 60×50) tok ÷ (100 × 1 s) = 80 TPS.
   const dualA=pairs[12],dualB=pairs[13];
   for(let i=0;i<50;i++){ log(dualA,100); log(dualB,60); }
-  // Reasoning content: 8×(100−80) + 2 pure-reasoning zeros (valid) + 1 no-usage row →
-  // Σcontent 160 tok ÷ Σelapsed 10 s = 16 TPS, gross Σoutput 1000 ÷ 10 s = 100.
+  // Reasoning included: 8×100 + 2 pure-reasoning rows (valid) + 1 no-usage row →
+  // Σoutput 1000 tok ÷ Σelapsed 10 s = 100 TPS.
   for(let i=0;i<8;i++) log(pairs[14],100,1000,{reasoning_tokens:80});
   for(let i=0;i<2;i++) log(pairs[14],100,1000,{reasoning_tokens:100});
   log(pairs[14],0);
-  // Pure reasoning only: Σcontent 0 ÷ Σelapsed 3 s = a valid plotted zero at (20, 0).
+  // Pure reasoning only: Σoutput 300 tok ÷ Σelapsed 3 s = 100 TPS.
   for(let i=0;i<3;i++) log(pairs[15],100,1000,{reasoning_tokens:100});
   log(unrated,220);
   const seedPath = join(scratch, 'seed-logs.json'); await writeFile(seedPath, JSON.stringify(logs, null, 2));
@@ -544,7 +544,7 @@ try {
   const variantStats=(item,pair)=>item.variants.find(variant=>variant.upstream_model.toLowerCase()===pair.model.toLowerCase());
   // A stream without sharesRowWith owns its row; a sibling stream reads its own variant.
   const statsFor=pair=>pair.sharesRowWith?variantStats(groupFor(pair),pair).mixed:groupFor(pair).mixed;
-  assert.ok(Math.abs(statsFor(pairs[0]).average_tps-50)<1e-9,'Σcontent 3750 ÷ Σelapsed 75 s end-to-end, not a TTFT-excluded mean');
+  assert.ok(Math.abs(statsFor(pairs[0]).average_tps-50)<1e-9,'Σoutput 3750 ÷ Σelapsed 75 s end-to-end, not a TTFT-excluded mean');
   assert.equal(statsFor(pairs[0]).selected_request_count,50,'The two older 900/800-token rows fall outside the latest-fifty window');
   const grouped=groupFor(effort);
   assert.equal(grouped.mixed.selected_request_count,13); assert.equal(grouped.mixed.valid_tps_count,12);
@@ -571,15 +571,15 @@ try {
   assert.ok(Math.abs(dualItem.mixed.average_tps-80)<1e-10,'Merged TPS is weighted by valid samples, not by variant count');
   assert.deepEqual(dualItem.variants.map(variant=>variant.mixed.selected_request_count),[50,50]);
   assert.equal(dualItem.score,62,'Both variants inherit the prefix-shared score');
-  // Non-zero reasoning and pure-reasoning rows verify the unified content metric end to end.
+  // Non-zero reasoning and pure-reasoning rows verify output TPS includes reasoning.
   const reasoningStats=statsFor(pairs[14]);
   assert.equal(reasoningStats.selected_request_count,11);
   assert.equal(reasoningStats.valid_tps_count,10,'Pure-reasoning samples with output > 0 count as valid');
-  assert.ok(Math.abs(reasoningStats.average_tps-16)<1e-9,'Content TPS = Σ(output−reasoning) ÷ Σduration = 160 tok / 10 s');
-  assert.ok(Math.abs(reasoningStats.average_gross_tps-100)<1e-9,'Gross keeps Σoutput over the same duration');
+  assert.ok(Math.abs(reasoningStats.average_tps-100)<1e-9,'Output TPS = Σoutput ÷ Σduration = 1000 tok / 10 s');
+  assert.ok(Math.abs(reasoningStats.average_gross_tps-100)<1e-9,'Gross alias matches the same output rate');
   const pureStats=statsFor(pairs[15]);
   assert.equal(pureStats.valid_tps_count,3);
-  assert.equal(pureStats.average_tps,0,'An all-reasoning group reports a valid zero, never null');
+  assert.equal(pureStats.average_tps,100,'An all-reasoning group reports the full output rate, not zero');
   assert.ok(Math.abs(pureStats.average_gross_tps-100)<1e-9);
   report.usageComparisons=[];
   for(const pair of pairs){
@@ -605,7 +605,7 @@ try {
     report.usageComparisons.push({provider_id:pair.provider.id,model:pair.model,mixed:variant.mixed,merged:item.variants.length>1?item.mixed:undefined,usage});
   }
   const expected=expectedRows(snapshot,rowPairs);
-  check('exact unified content-TPS parity for every pair (reasoning and pure-reasoning included); latest fifty raw logs across statuses/versions/completion; retained old and MiniMax unknown logs valid; two variants merge into one hundred samples',report.seed.database);
+  check('exact unified output-TPS parity for every pair (reasoning and pure-reasoning included); latest fifty raw logs across statuses/versions/completion; retained old and MiniMax unknown logs valid; two variants merge into one hundred samples',report.seed.database);
 
   const browser = trackChild('chrome', chrome, ['--headless', '--no-sandbox', '--disable-gpu', '--disable-dev-shm-usage', '--disable-background-networking', '--no-first-run', '--no-default-browser-check', '--remote-debugging-port=0', `--user-data-dir=${join(scratch, 'chrome')}`, 'about:blank']);
   const ws = await waitFor(() => {
@@ -692,19 +692,20 @@ try {
   assert.ok(await evaluate(`document.querySelector('[role="tooltip"]')?.innerText.includes('97.3 tok/s')`),'MiniMax tooltip remains visible during evidence capture');
   await key('Escape');
 
-  // A pure-reasoning model plots a genuine zero with the gross auxiliary and the caveat.
+  // A pure-reasoning model plots its full output rate; first-token latency stays inside the duration.
   const pure=expected.find(row=>row.pair===pairs[15]);
   await evaluate(`(${circleExpression(pure.id)}).scrollIntoView({block:'center'}); (${circleExpression(pure.id)}).parentElement.focus()`); await key('Enter');
-  await waitFor(()=>evaluate(`document.querySelector('[role="tooltip"]')?.innerText.includes('0.0 tok/s')`),'Pure-reasoning point plots a real zero with one decimal');
-  const zeroTip=await evaluate(`document.querySelector('[role="tooltip"]')?.innerText`);
-  assert.ok(zeroTip.includes('Gross output TPS (reasoning included): 100.0 tok/s'),'Zero tooltip keeps the gross auxiliary figure');
-  assert.ok(zeroTip.includes('reasoning deduction cannot be guaranteed'),'Zero tooltip carries the missing-reasoning caveat');
+  await waitFor(()=>evaluate(`document.querySelector('[role="tooltip"]')?.innerText.includes('100.0 tok/s')`),'Pure-reasoning point plots full output TPS with one decimal');
+  const pureTip=await evaluate(`document.querySelector('[role="tooltip"]')?.innerText`);
+  assert.ok(pureTip.includes('100.0 tok/s'),'Pure-reasoning tooltip shows output TPS');
+  assert.ok(!pureTip.includes('Gross output TPS'),'Tooltip no longer shows a second gross figure');
   await screenshot('performance-pure-reasoning-zero-tooltip',{preserveFocus:true}); await key('Escape');
   const reasoningDetail=await detailRow(pairs[14]);
-  assert.ok(reasoningDetail[1].includes('45/100') && reasoningDetail[1].includes('16.0 tok/s') && reasoningDetail[1].includes('100.0 tok/s'),'Reasoning row shows content TPS with the gross auxiliary');
+  assert.ok(reasoningDetail[1].includes('45/100') && reasoningDetail[1].includes('100.0 tok/s'),'Reasoning row shows output TPS');
+  assert.ok(!reasoningDetail[1].includes('16.0 tok/s'),'Reasoning tokens are not subtracted from TPS');
   assert.ok(reasoningDetail[2].includes('10 / 11'),'Pure-reasoning samples stay valid while the no-usage row does not');
   const pureDetail=await detailRow(pairs[15]);
-  assert.ok(pureDetail[1].includes('0.0 tok/s') && pureDetail[4].includes('Plotted'),'A valid zero is plotted, never relabeled missing');
+  assert.ok(pureDetail[1].includes('100.0 tok/s') && pureDetail[4].includes('Plotted'),'Pure-reasoning output TPS is plotted, never relabeled missing');
 
   const overlap=state.points.find(point=>point.members===2);
   assert.ok(overlap);

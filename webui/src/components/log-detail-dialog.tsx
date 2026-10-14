@@ -5,7 +5,7 @@ import { Check, Copy, Download, Loader2, Trash2 } from "lucide-react";
 import { backend } from "@/lib/backend";
 import { useLocale } from "@/lib/i18n";
 import type { Provider, RequestLog, RequestLogAttempts } from "@/lib/types";
-import { computeGrossTps, computeTps, contentTokensOf, formatDuration, formatLogTime, formatTokenCount, formatTps, tpsGrossTitle, tpsMetricTitle, tpsReasoningCaveat } from "@/lib/format";
+import { computeTps, formatDuration, formatLogTime, formatTokenCount, formatTps, tpsMetricTitle } from "@/lib/format";
 import { effectiveOutcome, payloadDownload } from "@/lib/log-observability";
 import { ResultBadge } from "@/components/log-outcome";
 import { AttemptResultBanner, PayloadBlock } from "@/components/log-evidence";
@@ -109,7 +109,6 @@ function LogDetailContent({ logId, summary, open, onOpenChange, onDelete }: LogD
   const isStream = log?.is_stream ?? (log?.stream_chunks_count ?? 0) > 0;
 
   const tps = computeTps(log);
-  const grossTps = computeGrossTps(log);
   const isCrossProtocol =
     log?.client_protocol &&
     log?.upstream_protocol &&
@@ -140,7 +139,7 @@ function LogDetailContent({ logId, summary, open, onOpenChange, onDelete }: LogD
       `# Method: ${method}  Path: ${path}`,
       `# Client Status: ${log.client_status_code ?? "–"}  Upstream Status: ${log.upstream_status_code ?? "–"}`,
       `# Latency Total: ${formatDuration(log.latency_total_ms)}  Upstream: ${formatDuration(log.latency_upstream_ms)}`,
-      `# Content TPS: ${formatTps(tps)}  Gross TPS: ${formatTps(grossTps)}  (${tpsReasoningCaveat(false)})`,
+      `# Output TPS: ${formatTps(tps)}`,
       `# Provider: ${log.provider_name ?? log.provider_id ?? "–"}  Model: ${log.model_name ?? log.model_id ?? "–"}  ApiKey: ${log.api_key_name ?? log.api_key_id ?? "–"}`,
       `# Client Model: ${log.client_model ?? "–"}  Upstream Model: ${log.upstream_model ?? "–"}`,
       `# Reasoning Effort: ${log.reasoning_effort ?? "–"}`,
@@ -259,24 +258,9 @@ function LogDetailContent({ logId, summary, open, onOpenChange, onDelete }: LogD
           {tps != null ? (
             <span
               className="text-slate-500"
-              title={[
-                tpsMetricTitle(isZh),
-                `${isZh ? "正文 TPS" : "Content TPS"}: ${formatTps(tps)}`,
-                `${tpsGrossTitle(isZh)}: ${formatTps(grossTps)}`,
-                log?.reasoning_tokens && log.reasoning_tokens > 0
-                  ? (isZh
-                      ? `思考 ${log.reasoning_tokens} tok / 正文 ${contentTokensOf(log)} tok`
-                      : `reasoning: ${log.reasoning_tokens} tok, content: ${contentTokensOf(log)} tok`)
-                  : "",
-                tpsReasoningCaveat(isZh),
-              ].filter(Boolean).join("\n")}
+              title={`${tpsMetricTitle(isZh)}\n${isZh ? "输出 TPS" : "Output TPS"}: ${formatTps(tps)}`}
             >
-              {isZh ? "正文" : "content"} {formatTps(tps)}
-              {log?.reasoning_tokens && log.reasoning_tokens > 0 ? (
-                <span className="ml-1 text-xs text-amber-600 font-medium" title={isZh ? "该请求报告了推理 Token，正文 = 输出 − 推理" : "Reasoning tokens reported; content = output − reasoning"}>
-                  *
-                </span>
-              ) : null}
+              {isZh ? "输出" : "output"} {formatTps(tps)}
             </span>
           ) : null}
           {log ? (

@@ -3,10 +3,10 @@ import { useQuery } from "@tanstack/react-query";
 import { Activity, RefreshCw, Search } from "lucide-react";
 import { Link } from "react-router-dom";
 import { backend } from "@/lib/backend";
-import { formatLocalDateTime, formatTps, tpsGrossTitle, tpsMetricTitle, tpsReasoningCaveat } from "@/lib/format";
+import { formatLocalDateTime, formatTps, tpsMetricTitle } from "@/lib/format";
 import { useLocale } from "@/lib/i18n";
 import {
-  buildPerformanceRows, filterPerformanceRows, performancePoints, readPerformanceResponse, resolveGrossTps, resolveMainTps,
+  buildPerformanceRows, filterPerformanceRows, performancePoints, readPerformanceResponse, resolveMainTps,
 } from "@/lib/model-performance";
 import type { Provider } from "@/lib/types";
 import { ModelPerformanceChart } from "@/components/model-performance-chart";
@@ -15,9 +15,9 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 
-/** 统一主 TPS 口径说明（正文端到端吞吐）。 */
-const TPS_INFO_ZH = "横轴按当前可见点的最低分向下、最高分向上取整至 10 的倍数自动缩放（满分 100），并在左右两端留出标记边距，极值点不会压在坐标轴上；纵轴为主 TPS：正文端到端吞吐 = Σ正文 Token ÷ Σ有效请求耗时（正文 = 输出 − 推理；耗时取上游耗时，仅未记录时回退总耗时，不扣首字延迟）。输出 > 0 的纯推理样本计入统计并以 0.0 参与绘图；总输出 TPS（含推理）在悬停详情中辅助展示。未提供或历史未记录推理明细时，正文按已报告输出计算，不能保证精确扣除推理 Token。每个变体先取已保留日志中最近 50 次调用、再校验有效性，无效样本占位不回填更早记录。每个点显示该供应商的图标，虚线边框表示不足 3 个有效样本。不是主动测速或全历史平均。";
-const TPS_INFO_EN = "X automatically rounds the visible minimum score down and maximum up to multiples of 10 (scores remain out of 100) and keeps marker room at both ends, so extremes never straddle the axes; Y is the main TPS: end-to-end content throughput = Σcontent tokens ÷ Σvalid-request duration (content = output − reasoning; duration uses upstream latency, falling back to total latency only when unrecorded, never subtracting TTFT). Pure-reasoning calls with output > 0 join the pool and plot at 0.0; gross output TPS (reasoning included) appears as an auxiliary figure in hover details. When reasoning details are absent (not reported or not recorded historically), content is computed from the reported output, so the reasoning deduction cannot be guaranteed to be exact. Each variant selects its latest 50 retained calls first, then validates them: invalid samples consume the window without refilling older records. Every point shows its provider's icon; a dashed border marks fewer than 3 valid samples. This is not an active benchmark or an all-time average.";
+/** 统一输出 TPS 口径说明（总输出 Token 的端到端体感吞吐）。 */
+const TPS_INFO_ZH = "横轴按当前可见点的最低分向下、最高分向上取整至 10 的倍数自动缩放（满分 100），并在左右两端留出标记边距，极值点不会压在坐标轴上；纵轴为输出 TPS：总输出 Token ÷ Σ有效请求耗时（推理 Token 计入输出；耗时取上游耗时，仅未记录时回退总耗时，含首字延迟）。输出 ≤ 0 不计入。每个变体先取已保留日志中最近 50 次调用、再校验有效性，无效样本占位不回填更早记录。每个点显示该供应商的图标，虚线边框表示不足 3 个有效样本。不是主动测速或全历史平均。";
+const TPS_INFO_EN = "X automatically rounds the visible minimum score down and maximum up to multiples of 10 (scores remain out of 100) and keeps marker room at both ends, so extremes never straddle the axes; Y is output TPS: total output tokens ÷ Σvalid-request duration (reasoning tokens stay in the output; duration uses upstream latency, falling back to total latency only when unrecorded, and includes first-token latency). Output ≤ 0 is excluded. Each variant selects its latest 50 retained calls first, then validates them: invalid samples consume the window without refilling older records. Every point shows its provider's icon; a dashed border marks fewer than 3 valid samples. This is not an active benchmark or an all-time average.";
 
 export default function PerformancePage() {
   const { locale } = useLocale();
@@ -78,11 +78,11 @@ export default function PerformancePage() {
         </div>
         <section className="glass min-w-0 rounded-2xl border border-slate-200">
           <div className="border-b border-slate-200/70 px-4 py-3">
-            <h2 className="text-sm font-semibold text-slate-800">{isZh ? "能力 × 正文速度（端到端 TPS）" : "Capability × content speed (end-to-end TPS)"}</h2>
+            <h2 className="text-sm font-semibold text-slate-800">{isZh ? "能力 × 速度（端到端 TPS）" : "Capability × speed (end-to-end TPS)"}</h2>
             <p className="mt-1 text-xs text-slate-500">
               {isZh
-                ? "主 TPS 按最近 50 次采样内有效请求的 Σ正文 Token ÷ Σ耗时 计算（端到端，含首字延迟，不扣 Prefill）。仅包络线上的点直接显示前缀与供应商名称；虚线连接速度维度的右上凸包边界。"
-                : "The main TPS is Σcontent tokens ÷ Σduration over valid requests inside the latest-50 sample window (end-to-end, TTFT and prefill included). Only envelope points are labeled directly; the dashed line follows the upper-right convex boundary."}
+                ? "输出 TPS 按最近 50 次采样内有效请求的 Σ输出 Token ÷ Σ耗时 计算（端到端，含首字延迟与推理 Token）。仅包络线上的点直接显示前缀与供应商名称；虚线连接速度维度的右上凸包边界。"
+                : "Output TPS is Σoutput tokens ÷ Σduration over valid requests inside the latest-50 sample window (end-to-end, including first-token latency and reasoning tokens). Only envelope points are labeled directly; the dashed line follows the upper-right convex boundary."}
             </p>
           </div>
           <ModelPerformanceChart points={points} isZh={isZh} />
@@ -92,19 +92,14 @@ export default function PerformancePage() {
         <details className="glass rounded-2xl p-4" open={missing.length > 0}>
           <summary className="cursor-pointer text-sm font-semibold">{isZh ? "所有分组状态与诊断" : "All group statuses & diagnostics"} ({visible.length})</summary>
           <div className="mt-3 overflow-x-auto"><table className="w-full min-w-[900px] text-left text-xs">
-            <thead className="text-slate-500"><tr>{(isZh ? ["前缀 / 供应商", "评分 · 正文 / 总输出 TPS", "有效 / 已选请求", "样本时间", "状态 / 变体"] : ["Prefix / provider", "Score · Content / Gross TPS", "Valid / selected requests", "Sample times", "Status / variants"]).map((label) => <th key={label} className="p-2">{label}</th>)}</tr></thead>
+            <thead className="text-slate-500"><tr>{(isZh ? ["前缀 / 供应商", "评分 · 输出 TPS", "有效 / 已选请求", "样本时间", "状态 / 变体"] : ["Prefix / provider", "Score · Output TPS", "Valid / selected requests", "Sample times", "Status / variants"]).map((label) => <th key={label} className="p-2">{label}</th>)}</tr></thead>
             <tbody>{visible.map((row) => <tr key={row.key} className="border-t border-slate-200/70 align-top">
               <td className="max-w-72 p-2"><strong className="font-mono">{row.modelPrefix}</strong><p className="mt-1"><strong>{row.providerName}</strong></p><p className="break-all text-slate-500">{row.providerId}</p>{!row.providerEnabled && <p className="text-amber-700">{isZh ? "供应商已禁用" : "Provider disabled"}</p>}</td>
               <td className="p-2 tabular-nums">
                 {row.score}/100
-                <p className="font-medium text-slate-800" title={`${tpsMetricTitle(isZh)}\n${tpsReasoningCaveat(isZh)}`}>
+                <p className="font-medium text-slate-800" title={tpsMetricTitle(isZh)}>
                   {formatTps(row.tps)}
                 </p>
-                {row.grossTps !== null && (
-                  <p className="text-[11px] text-slate-400" title={tpsGrossTitle(isZh)}>
-                    {formatTps(row.grossTps)} {isZh ? "(总输出)" : "(gross)"}
-                  </p>
-                )}
               </td>
               <td className="p-2 tabular-nums">{`${row.validTpsCount} / ${row.selectedRequestCount}`}{row.status === "ready" && row.validTpsCount < 3 && <p className="text-amber-700">○ {isZh ? "低样本量" : "Low sample count"}</p>}</td>
               <td className="p-2"><p>{formatLocalDateTime(row.firstSampleAt)}</p><p>{formatLocalDateTime(row.lastSampleAt)}</p></td>
@@ -112,7 +107,7 @@ export default function PerformancePage() {
                 {row.status === "missing" && <p className="mt-1 text-slate-500">{isZh ? (row.selectedRequestCount === 0 ? "暂无调用记录" : "最近调用缺少有效输出 token 或耗时") : (row.selectedRequestCount === 0 ? "No recorded calls" : "Recent calls lack usable output tokens or timing")}</p>}
                 {row.variants.length > 0 && <ul className="mt-1 space-y-0.5">{row.variants.map((variant) => (
                   <li key={variant.upstream_model} className="break-all font-mono text-[11px] text-slate-600">
-                    {variant.upstream_model} · {formatTps(resolveMainTps(variant.stats))}{resolveGrossTps(variant.stats) != null ? ` (${isZh ? "总输出" : "gross"} ${formatTps(resolveGrossTps(variant.stats)!)})` : ""} · {variant.stats.valid_tps_count}/{variant.stats.selected_request_count}
+                    {variant.upstream_model} · {formatTps(resolveMainTps(variant.stats))} · {variant.stats.valid_tps_count}/{variant.stats.selected_request_count}
                   </li>
                 ))}</ul>}
               </td>

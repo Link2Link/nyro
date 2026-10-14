@@ -349,7 +349,7 @@ test("labels list every coincident point and pair the prefix with each provider"
   equal(wrapped.lines.join(""), `${long.modelPrefix} · 03`); ok(wrapped.lines.length > 1);
 });
 
-test("average_tps and overall_tps are one unified content metric with compatible aliases", () => {
+test("average_tps and overall_tps are one unified output metric with compatible aliases", () => {
   // Aliases must be equal when both are provided; geometry-style fixtures may send only average_tps.
   const averageOnly: PerformanceStats = {
     average_tps: 80, valid_tps_count: 5, selected_request_count: 10,
@@ -376,7 +376,7 @@ test("average_tps and overall_tps are one unified content metric with compatible
   ] as PerformanceStats[]) throws(() => readPerformanceResponse(snapshot({ ...item(), mixed })));
 });
 
-test("zero content TPS is valid data: accepted, plotted at 0.0 and never treated as missing", () => {
+test("zero output TPS is valid data: accepted, plotted at 0.0 and never treated as missing", () => {
   const pureReasoning: PerformanceStats = {
     ...stats(0, 5), overall_tps: 0, average_gross_tps: 40, overall_gross_tps: 40,
   };
