@@ -1383,7 +1383,10 @@ async fn dispatch_pipeline_inner(
         let client = match gw.inference_client_for_provider(provider.use_proxy).await {
             Ok(http_client) => ProxyClient::new(http_client)
                 .with_timeouts(gw.config.upstream_timeouts)
-                .with_deadline(ctx.deadline.clone()),
+                .with_deadline(ctx.deadline.clone())
+                .with_connect_retries(crate::provider::xai::grok::transient_connect_retries(
+                    &provider,
+                )),
             Err(e) => {
                 let msg = format!("provider transport error: {e}");
                 last_response = Some(error_response(502, &msg));

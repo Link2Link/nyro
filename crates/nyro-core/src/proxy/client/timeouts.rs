@@ -48,6 +48,15 @@ impl UpstreamReadError {
         }
     }
 
+    /// Connect failed before the HTTP request was written. A timeout is not
+    /// replayed: the budget was already spent, and a second wait would stack.
+    pub fn is_transient_connect(&self) -> bool {
+        match self {
+            Self::Transport(error) => error.is_connect() && !error.is_timeout(),
+            Self::Timeout { .. } => false,
+        }
+    }
+
     pub fn stage(&self) -> &'static str {
         match self {
             Self::Timeout { phase } => phase.stage(),

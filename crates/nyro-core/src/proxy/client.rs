@@ -28,6 +28,9 @@ pub struct ProxyClient {
     performance: Option<crate::performance::Attempt>,
     timeouts: UpstreamTimeouts,
     deadline: Deadline,
+    /// Extra attempts after a connect failure that happened before the request
+    /// was written. Zero preserves the historical single-attempt behavior.
+    connect_retries: u8,
 }
 
 pub struct ObservedResponse {
@@ -100,11 +103,17 @@ impl ProxyClient {
             performance: None,
             timeouts: UpstreamTimeouts::default(),
             deadline: Deadline::never(),
+            connect_retries: 0,
         }
     }
 
     pub fn with_timeouts(mut self, timeouts: UpstreamTimeouts) -> Self {
         self.timeouts = timeouts;
+        self
+    }
+
+    pub fn with_connect_retries(mut self, retries: u8) -> Self {
+        self.connect_retries = retries;
         self
     }
 
@@ -225,48 +234,69 @@ impl ProxyClient {
             attempt.request(&body);
             attempt.request_headers(&headers);
         }
-        let (until, phase) = bounded_timeout(
-            tokio::time::Instant::now() + self.timeouts.response_headers,
-            UpstreamTimeoutPhase::ResponseHeaders,
-            &self.deadline,
-        );
-        let response = if until <= tokio::time::Instant::now() {
-            Err(UpstreamReadError::Timeout { phase })
-        } else {
-            match tokio::time::timeout_at(
-                until,
-                self.http.post(url).headers(headers).body(body).send(),
-            )
-            .await
-            {
-                Ok(result) => result.map_err(UpstreamReadError::from),
-                Err(_) => Err(UpstreamReadError::Timeout { phase }),
-            }
-        };
-        let response = match response {
-            Ok(response) => response,
-            Err(error) => {
-                if let Some(attempt) = &self.performance {
-                    attempt.record_failure(
-                        if error.is_timeout() {
-                            "timed_out"
-                        } else {
-                            "failed"
-                        },
-                        if error.is_timeout() {
-                            "timeout"
-                        } else {
-                            "upstream_connect_error"
-                        },
-                        if error.is_timeout() {
-                            error.stage()
-                        } else {
-                            "upstream_connect"
-                        },
-                        &error,
-                    );
+        let mut retries_left = self.connect_retries;
+        let response = loop {
+            let (until, phase) = bounded_timeout(
+                tokio::time::Instant::now() + self.timeouts.response_headers,
+                UpstreamTimeoutPhase::ResponseHeaders,
+                &self.deadline,
+            );
+            let response = if until <= tokio::time::Instant::now() {
+                Err(UpstreamReadError::Timeout { phase })
+            } else {
+                match tokio::time::timeout_at(
+                    until,
+                    self.http
+                        .post(url)
+                        .headers(headers.clone())
+                        .body(body.clone())
+                        .send(),
+                )
+                .await
+                {
+                    Ok(result) => result.map_err(UpstreamReadError::from),
+                    Err(_) => Err(UpstreamReadError::Timeout { phase }),
                 }
-                return Err(error.into());
+            };
+            match response {
+                Ok(response) => break response,
+                Err(error)
+                    if retries_left > 0
+                        && error.is_transient_connect()
+                        && self.deadline.remaining() >= std::time::Duration::from_secs(1) =>
+                {
+                    retries_left -= 1;
+                    // The handshake died before HTTP, so the upstream did not
+                    // see this body. One short pause lets a fresh connection
+                    // through a proxy that just dropped the previous one.
+                    tracing::info!(
+                        "transient upstream connect failure before the request was sent; retrying"
+                    );
+                    tokio::time::sleep(TRANSIENT_CONNECT_RETRY_BACKOFF).await;
+                }
+                Err(error) => {
+                    if let Some(attempt) = &self.performance {
+                        attempt.record_failure(
+                            if error.is_timeout() {
+                                "timed_out"
+                            } else {
+                                "failed"
+                            },
+                            if error.is_timeout() {
+                                "timeout"
+                            } else {
+                                "upstream_connect_error"
+                            },
+                            if error.is_timeout() {
+                                error.stage()
+                            } else {
+                                "upstream_connect"
+                            },
+                            &error,
+                        );
+                    }
+                    return Err(error.into());
+                }
             }
         };
         if let Some(attempt) = &self.performance {
@@ -316,6 +346,10 @@ async fn read_body_with_limit(response: ObservedResponse, limit: usize) -> Resul
     }
     Ok(body.freeze())
 }
+
+/// Pause before replaying a connect failure. Long enough to leave a proxy
+/// that just reset the handshake, short enough to stay inside one user turn.
+const TRANSIENT_CONNECT_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_millis(250);
 
 fn ensure_json_content_type(headers: &mut HeaderMap) {
     if !headers.contains_key(CONTENT_TYPE) {
@@ -535,5 +569,97 @@ mod tests {
             Some("upstream-123")
         );
         assert_eq!(decode.body_text(), "not valid json!!");
+    }
+
+    #[tokio::test]
+    async fn http_status_is_not_replayed_as_a_connect_failure() {
+        let (url, captured_request) = serve_once(
+            b"HTTP/1.1 502 Bad Gateway\r\ncontent-type: application/json\r\ncontent-length: 2\r\n\r\n{}",
+        )
+        .await;
+        let client = ProxyClient::new(reqwest::Client::new()).with_connect_retries(1);
+
+        let response = client
+            .call_stream_raw(&url, HeaderMap::new(), Bytes::from_static(b"{}"))
+            .await
+            .expect("an HTTP response is not a connect failure");
+
+        assert_eq!(response.status().as_u16(), 502);
+        captured_request
+            .await
+            .expect("exactly one request was sent");
+    }
+
+    #[tokio::test]
+    async fn refused_connect_is_not_replayed_without_a_budget() {
+        let client = ProxyClient::new(
+            reqwest::Client::builder()
+                .connect_timeout(std::time::Duration::from_secs(1))
+                .build()
+                .expect("client"),
+        );
+        let started = std::time::Instant::now();
+
+        let error = client
+            .call_stream_raw(
+                "http://127.0.0.1:1/v1/responses",
+                HeaderMap::new(),
+                Bytes::from_static(b"{}"),
+            )
+            .await
+            .map(|_| ())
+            .expect_err("closed port must fail");
+
+        let connect = error
+            .downcast_ref::<UpstreamReadError>()
+            .expect("connect failure stays an upstream read error");
+        assert!(connect.is_transient_connect());
+        assert!(
+            started.elapsed() < TRANSIENT_CONNECT_RETRY_BACKOFF,
+            "a zero budget must not wait for a replay"
+        );
+    }
+
+    #[tokio::test]
+    async fn refused_connect_is_replayed_once_when_the_port_comes_up() {
+        let reserved = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("reserve port");
+        let addr = reserved.local_addr().expect("reserved addr");
+        drop(reserved);
+
+        let url = format!("http://{addr}/v1/responses");
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+            let listener = tokio::net::TcpListener::bind(addr).await.expect("rebind");
+            let (mut socket, _) = listener.accept().await.expect("accept replay");
+            let _ = read_request(&mut socket).await;
+            let body = b"{}";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n",
+                body.len()
+            );
+            socket
+                .write_all(response.as_bytes())
+                .await
+                .expect("write status");
+            socket.write_all(body).await.expect("write body");
+            socket.shutdown().await.expect("shutdown");
+        });
+
+        let client = ProxyClient::new(
+            reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(5))
+                .build()
+                .expect("client"),
+        )
+        .with_connect_retries(1);
+
+        let response = client
+            .call_stream_raw(&url, HeaderMap::new(), Bytes::from_static(b"{}"))
+            .await
+            .expect("the second connect reaches the listener");
+        assert_eq!(response.status().as_u16(), 200);
+        assert_eq!(response.bytes().await.expect("body"), "{}");
     }
 }

@@ -6,8 +6,7 @@ use serde_json::Value;
 
 use crate::error::GatewayError;
 use crate::protocol::ids::{
-    ANTHROPIC_MESSAGES_2023_06_01, OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1, OPENAI_RESPONSES_V1,
-    ProtocolId,
+    OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1, OPENAI_RESPONSES_V1, ProtocolId,
 };
 use crate::protocol::ir::{AiRequest, AiResponse};
 use crate::provider::common::openai::{
@@ -124,9 +123,14 @@ pub(crate) fn apply_chat_output_token_floor(
     }
 }
 
-/// MiniMax enables thinking by default when the request omits a thinking
-/// directive. Keep reasoning output structurally separated on Chat Completions,
-/// while preserving every client-supplied effort, budget, or thinking declaration.
+/// Keep Chat reasoning output structurally separated, without inventing a
+/// thinking switch the client did not send.
+///
+/// MiniMax-M3.1-Flash-Preview rejects an omitted-thinking request once Nyro
+/// injects `thinking.type="disabled"` (`requires adaptive thinking`, HTTP 400,
+/// error 2013; live request 0751e77c). Omitting `thinking` is the upstream
+/// default. A client-supplied `thinking` block, including an explicit
+/// `disabled`, is preserved verbatim.
 fn apply_reasoning_defaults(protocol: ProtocolId, body: &mut Value) {
     let Some(object) = body.as_object_mut() else {
         return;
@@ -138,25 +142,10 @@ fn apply_reasoning_defaults(protocol: ProtocolId, body: &mut Value) {
         // `reasoning_content` / `reasoning_details`; `false` embeds it in
         // `content` as `<think>...</think>`. Default to the split shape so an
         // OpenAI-compatible client never receives reasoning in normal content.
+        // M3.1-Flash-Preview rejects `reasoning_split: false`; `true` is accepted.
         object
             .entry("reasoning_split".to_string())
             .or_insert(Value::Bool(true));
-
-        // MiniMax-M3 uses `thinking`, rather than `reasoning_split`, to
-        // control whether thinking is emitted. Preserve an explicit thinking
-        // block and explicit non-none effort; otherwise honor Nyro's
-        // default-off policy. M2.x accepts this field but cannot disable
-        // thinking, so `reasoning_split: true` still keeps it out of content.
-        let explicit_non_none_effort = object
-            .get("reasoning_effort")
-            .and_then(Value::as_str)
-            .is_some_and(|effort| !effort.eq_ignore_ascii_case("none"));
-        if !object.contains_key("thinking") && !explicit_non_none_effort {
-            object.insert(
-                "thinking".to_string(),
-                serde_json::json!({"type": "disabled"}),
-            );
-        }
     } else if protocol == OPENAI_RESPONSES_V1 {
         match object.entry("reasoning".to_string()) {
             serde_json::map::Entry::Vacant(entry) => {
@@ -170,17 +159,6 @@ fn apply_reasoning_defaults(protocol: ProtocolId, body: &mut Value) {
                 }
             }
         }
-    } else if protocol == ANTHROPIC_MESSAGES_2023_06_01
-        && !object.contains_key("thinking")
-        && object
-            .get("output_config")
-            .and_then(Value::as_object)
-            .is_none_or(|config| !config.contains_key("effort"))
-    {
-        object.insert(
-            "thinking".to_string(),
-            serde_json::json!({"type": "disabled"}),
-        );
     }
 }
 
@@ -254,6 +232,7 @@ inventory::submit! { VendorRegistration { make: || Box::new(MinimaxVendor) } }
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::ids::ANTHROPIC_MESSAGES_2023_06_01;
 
     #[test]
     fn chat_output_floor_normalizes_aliases_and_preserves_larger_budgets() {
@@ -333,7 +312,25 @@ mod tests {
 
         assert_eq!(body["reasoning_split"], true);
         assert!(body.get("reasoning_effort").is_none());
-        assert_eq!(body["thinking"]["type"], "disabled");
+        assert!(body.get("thinking").is_none());
+    }
+
+    #[test]
+    fn openai_chat_does_not_inject_disabled_thinking_for_m31_or_effort_none() {
+        for model in ["MiniMax-M3.1-Flash-Preview", "MiniMax-M3", "MiniMax-M2.7"] {
+            let mut omitted = serde_json::json!({"model": model, "messages": []});
+            apply_reasoning_defaults(OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1, &mut omitted);
+            assert!(omitted.get("thinking").is_none(), "{model}");
+
+            let mut effort_none = serde_json::json!({
+                "model": model,
+                "messages": [],
+                "reasoning_effort": "none"
+            });
+            apply_reasoning_defaults(OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1, &mut effort_none);
+            assert_eq!(effort_none["reasoning_effort"], "none");
+            assert!(effort_none.get("thinking").is_none(), "{model}");
+        }
     }
 
     #[test]
@@ -362,7 +359,7 @@ mod tests {
         apply_reasoning_defaults(OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1, &mut body);
 
         assert_eq!(body["reasoning_split"], false);
-        assert_eq!(body["thinking"]["type"], "disabled");
+        assert!(body.get("thinking").is_none());
     }
 
     #[test]
@@ -407,16 +404,17 @@ mod tests {
     }
 
     #[test]
-    fn anthropic_defaults_missing_thinking_to_disabled() {
+    fn anthropic_leaves_missing_thinking_unset() {
         let mut body = serde_json::json!({
-            "model": "MiniMax-M2.7",
+            "model": "MiniMax-M3.1-Flash-Preview",
             "messages": [],
             "max_tokens": 1024
         });
+        let expected = body.clone();
 
         apply_reasoning_defaults(ANTHROPIC_MESSAGES_2023_06_01, &mut body);
 
-        assert_eq!(body["thinking"]["type"], "disabled");
+        assert_eq!(body, expected);
     }
 
     #[test]
