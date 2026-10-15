@@ -533,6 +533,17 @@ pub async fn get_stats_timeseries(
 }
 
 #[tauri::command]
+pub async fn get_token_usage_stats(
+    gw: State<'_, Gateway>,
+    year: i32,
+) -> Result<TokenUsageStats, String> {
+    gw.admin()
+        .get_token_usage_stats(year)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 pub async fn get_stats_by_model(
     gw: State<'_, Gateway>,
     hours: Option<i32>,

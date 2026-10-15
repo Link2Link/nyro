@@ -1658,6 +1658,29 @@ impl LogStore for PostgresLogStore {
         .await?)
     }
 
+    async fn token_usage_days(
+        &self,
+        start_at: i64,
+        end_at: i64,
+    ) -> anyhow::Result<Vec<crate::db::models::TokenUsageDay>> {
+        Ok(sqlx::query_as(
+            "SELECT to_char(DATE '1970-01-01' + (created_at / 86400000)::INTEGER, 'YYYY-MM-DD') AS date, \
+             COALESCE(provider_id, '') COLLATE \"C\" AS provider_id, COALESCE(provider_id, '') COLLATE \"C\" AS provider_name, \
+             COALESCE(upstream_model, '') COLLATE \"C\" AS model, COUNT(*) AS request_count, \
+             COALESCE(SUM(input_tokens), 0)::BIGINT AS input_tokens, \
+             COALESCE(SUM(output_tokens), 0)::BIGINT AS output_tokens, \
+             COALESCE(SUM(cache_read_tokens), 0)::BIGINT AS cache_read_tokens, \
+             SUM(CASE WHEN input_tokens IS NULL OR output_tokens IS NULL THEN 1 ELSE 0 END)::BIGINT AS missing_usage_count, \
+             COUNT(cache_read_tokens) AS cache_read_reported_count \
+             FROM request_logs WHERE created_at >= $1 AND created_at < $2 \
+             GROUP BY 1, 2, 3, 4 ORDER BY 1, 2, 4",
+        )
+        .bind(start_at)
+        .bind(end_at)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
     async fn stats_by_model(&self, hours: Option<i64>) -> anyhow::Result<Vec<ModelStats>> {
         let tps = crate::db::tps::tps_totals_columns(crate::db::tps::TpsSqlDialect::Postgres);
         let sql = if let Some(hours) = hours {

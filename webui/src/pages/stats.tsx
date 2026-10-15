@@ -6,6 +6,7 @@ import type { StatsOverview, StatsTimeSeries, ModelStats, ProviderStats, ApiKeyS
 import { Zap, Clock, Activity, BarChart3 } from "lucide-react";
 import { ApiKeyUsageDialog } from "@/components/api-key-usage-dialog";
 import { TokenTimeSeriesChart } from "@/components/token-time-series-chart";
+import { TokenUsagePanel } from "@/components/token-usage-panel";
 import { ProviderUsageDialog } from "@/components/provider-usage-dialog";
 import { ModelUsageDialog } from "@/components/model-usage-dialog";
 import { ProviderIcon } from "@/components/ui/provider-icon";
@@ -100,12 +101,19 @@ export default function StatsPage() {
 
   return (
     <div className="space-y-4">
-      <div className="flex items-center justify-between">
+      <div>
+        <h1 className="text-2xl font-bold text-slate-900">{isZh ? "统计" : "Statistics"}</h1>
+        <p className="mt-1 text-sm text-slate-500">
+          {isZh ? "Token 使用、延迟与错误分析" : "Token usage, latency, and error analytics"}
+        </p>
+      </div>
+
+      <TokenUsagePanel />
+
+      <div className="flex flex-wrap items-center justify-between gap-3 pt-3">
         <div>
-          <h1 className="text-2xl font-bold text-slate-900">{isZh ? "统计" : "Statistics"}</h1>
-          <p className="mt-1 text-sm text-slate-500">
-            {isZh ? "Token 使用、延迟与错误分析" : "Token usage, latency, and error analytics"}
-          </p>
+          <h2 className="text-base font-semibold text-slate-900">{isZh ? "请求分析" : "Request analytics"}</h2>
+          <p className="mt-1 text-xs text-slate-500">{isZh ? "观察近期调用、延迟、错误与 Token 时序" : "Recent attempts, latency, errors, and token time series"}</p>
         </div>
         <Select value={String(hours)} onValueChange={(value) => setHours(Number(value))}>
           <SelectTrigger className="w-40">

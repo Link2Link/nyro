@@ -182,6 +182,27 @@ export interface GatewayStatus {
   proxy_port: number;
 }
 
+export interface TokenUsageDay {
+  date: string;
+  provider_id: string;
+  provider_name: string;
+  model: string;
+  request_count: number;
+  input_tokens: number;
+  output_tokens: number;
+  cache_read_tokens: number;
+  cache_read_reported_count: number;
+  /** Attempts missing either input or output usage; totals remain a known lower bound. */
+  missing_usage_count: number;
+}
+
+export interface TokenUsageStats {
+  year: number;
+  time_zone: string;
+  generated_at: number;
+  rows: TokenUsageDay[];
+}
+
 export interface StatsOverview {
   total_requests: number;
   total_input_tokens: number;

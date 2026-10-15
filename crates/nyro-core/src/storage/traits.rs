@@ -207,6 +207,13 @@ pub trait LogStore: Send + Sync {
         bucket_ms: i64,
         upstream_model: Option<&str>,
     ) -> anyhow::Result<Vec<StatsTimeBucket>>;
+    /// Sparse UTC days grouped by provider ID and upstream model over the half-open
+    /// millisecond range [start_at, end_at). Includes all retained attempts, not final results.
+    async fn token_usage_days(
+        &self,
+        start_at: i64,
+        end_at: i64,
+    ) -> anyhow::Result<Vec<crate::db::models::TokenUsageDay>>;
     async fn stats_by_model(&self, hours: Option<i64>) -> anyhow::Result<Vec<ModelStats>>;
     async fn model_usage_stats(
         &self,

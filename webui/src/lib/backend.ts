@@ -264,6 +264,10 @@ function resolveHTTP(cmd: string, args?: Record<string, unknown>): HTTPMapping {
     case "delete_log":
       return { method: "DELETE", url: `${base}/logs/${args?.id}` };
 
+    case "get_token_usage_stats": {
+      const params = new URLSearchParams({ year: String(args?.year ?? new Date().getUTCFullYear()) });
+      return { method: "GET", url: `${base}/stats/token-usage?${params.toString()}` };
+    }
     case "get_stats_overview": {
       const hours = args?.hours;
       return {

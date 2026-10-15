@@ -1750,6 +1750,34 @@ impl LogStore for MysqlLogStore {
         .await?)
     }
 
+    async fn token_usage_days(
+        &self,
+        start_at: i64,
+        end_at: i64,
+    ) -> anyhow::Result<Vec<crate::db::models::TokenUsageDay>> {
+        // Date arithmetic avoids session time zones and FROM_UNIXTIME's platform range.
+        // Binary keys preserve case/trailing spaces; MIN returns text for SQLx decoding
+        // and satisfies ONLY_FULL_GROUP_BY (each binary group has one exact text value).
+        Ok(sqlx::query_as(
+            "SELECT DATE_FORMAT(DATE_ADD('1970-01-01', INTERVAL (created_at DIV 86400000) DAY), '%Y-%m-%d') AS date, \
+             MIN(COALESCE(provider_id, '')) AS provider_id, \
+             MIN(COALESCE(provider_id, '')) AS provider_name, \
+             MIN(COALESCE(upstream_model, '')) AS model, CAST(COUNT(*) AS SIGNED) AS request_count, \
+             CAST(COALESCE(SUM(input_tokens), 0) AS SIGNED) AS input_tokens, \
+             CAST(COALESCE(SUM(output_tokens), 0) AS SIGNED) AS output_tokens, \
+             CAST(COALESCE(SUM(cache_read_tokens), 0) AS SIGNED) AS cache_read_tokens, \
+             CAST(SUM(CASE WHEN input_tokens IS NULL OR output_tokens IS NULL THEN 1 ELSE 0 END) AS SIGNED) AS missing_usage_count, \
+             CAST(COUNT(cache_read_tokens) AS SIGNED) AS cache_read_reported_count \
+             FROM request_logs WHERE created_at >= ? AND created_at < ? \
+             GROUP BY date, BINARY COALESCE(provider_id, ''), BINARY COALESCE(upstream_model, '') \
+             ORDER BY date, BINARY provider_id, BINARY model",
+        )
+        .bind(start_at)
+        .bind(end_at)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
     async fn stats_by_model(&self, hours: Option<i64>) -> anyhow::Result<Vec<ModelStats>> {
         let tps = crate::db::tps::tps_totals_columns(crate::db::tps::TpsSqlDialect::Mysql);
         let sql = if let Some(hours) = hours {

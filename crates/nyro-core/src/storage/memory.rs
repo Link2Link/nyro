@@ -313,6 +313,15 @@ impl LogStore for MemoryStorage {
         Ok(vec![])
     }
 
+    async fn token_usage_days(
+        &self,
+        _start_at: i64,
+        _end_at: i64,
+    ) -> anyhow::Result<Vec<crate::db::models::TokenUsageDay>> {
+        // YAML-only memory storage does not retain request logs.
+        Ok(vec![])
+    }
+
     async fn stats_by_model(&self, _hours: Option<i64>) -> anyhow::Result<Vec<ModelStats>> {
         Ok(vec![])
     }

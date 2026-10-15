@@ -1684,6 +1684,30 @@ impl LogStore for SqliteLogStore {
         .await?)
     }
 
+    async fn token_usage_days(
+        &self,
+        start_at: i64,
+        end_at: i64,
+    ) -> anyhow::Result<Vec<crate::db::models::TokenUsageDay>> {
+        Ok(sqlx::query_as(
+            "SELECT strftime('%Y-%m-%d', created_at / 1000, 'unixepoch') AS date, \
+             COALESCE(provider_id, '') AS provider_id, COALESCE(provider_id, '') AS provider_name, \
+             COALESCE(upstream_model, '') AS model, COUNT(*) AS request_count, \
+             COALESCE(SUM(input_tokens), 0) AS input_tokens, \
+             COALESCE(SUM(output_tokens), 0) AS output_tokens, \
+             COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens, \
+             SUM(CASE WHEN input_tokens IS NULL OR output_tokens IS NULL THEN 1 ELSE 0 END) AS missing_usage_count, \
+             COUNT(cache_read_tokens) AS cache_read_reported_count \
+             FROM request_logs WHERE created_at >= ? AND created_at < ? \
+             GROUP BY date, COALESCE(provider_id, '') COLLATE BINARY, COALESCE(upstream_model, '') COLLATE BINARY \
+             ORDER BY date, provider_id COLLATE BINARY, model COLLATE BINARY",
+        )
+        .bind(start_at)
+        .bind(end_at)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
     async fn stats_by_model(&self, hours: Option<i64>) -> anyhow::Result<Vec<ModelStats>> {
         let tps = crate::db::tps::tps_totals_columns(crate::db::tps::TpsSqlDialect::Sqlite);
         if let Some(hours) = hours {

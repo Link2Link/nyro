@@ -895,6 +895,36 @@ pub struct StatsTimeSeries {
     pub points: Vec<StatsTimeBucket>,
 }
 
+/// Sparse UTC calendar-day totals over retained upstream attempts, including errors.
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct TokenUsageDay {
+    pub date: String,
+    pub provider_id: String,
+    /// Resolved from the current provider catalog by the admin service; otherwise the ID.
+    pub provider_name: String,
+    /// The upstream model, not the client-facing model alias.
+    pub model: String,
+    pub request_count: i64,
+    /// Stored gross input tokens; cache reads are already included and must not be added.
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub cache_read_tokens: i64,
+    /// Attempts with either input or output SQL NULL. Known partial values are still summed.
+    /// Historical/live log writers can normalize absent usage to zero; this cannot recover it.
+    pub missing_usage_count: i64,
+    /// Attempts with non-NULL stored cache reads (not proof of upstream reporting when
+    /// a log writer has normalized absent cache usage to zero).
+    pub cache_read_reported_count: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TokenUsageStats {
+    pub year: i32,
+    pub time_zone: String,
+    pub generated_at: i64,
+    pub rows: Vec<TokenUsageDay>,
+}
+
 /// One aggregated time bucket scoped to a single upstream model; produced by
 /// `LogStore::api_key_model_time_buckets` and split per model by the admin
 /// service.

@@ -236,6 +236,49 @@ impl AdminService {
         })
     }
 
+    pub async fn get_token_usage_stats(&self, year: i32) -> anyhow::Result<TokenUsageStats> {
+        anyhow::ensure!(
+            (1970..=9998).contains(&year),
+            "year must be between 1970 and 9998"
+        );
+        // Both dates are representable after validation; use UTC regardless of host/DB time zone.
+        let year_start = |year| {
+            chrono::NaiveDate::from_ymd_opt(year, 1, 1)
+                .unwrap()
+                .and_hms_opt(0, 0, 0)
+                .unwrap()
+                .and_utc()
+                .timestamp_millis()
+        };
+        let mut rows = self
+            .gw
+            .storage
+            .logs()
+            .token_usage_days(year_start(year), year_start(year + 1))
+            .await?;
+        let names: HashMap<_, _> = self
+            .gw
+            .storage
+            .providers()
+            .list()
+            .await?
+            .into_iter()
+            .map(|provider| (provider.id, provider.name))
+            .collect();
+        for row in &mut rows {
+            row.provider_name = names
+                .get(&row.provider_id)
+                .cloned()
+                .unwrap_or_else(|| row.provider_id.clone());
+        }
+        Ok(TokenUsageStats {
+            year,
+            time_zone: "UTC".into(),
+            generated_at: Utc::now().timestamp_millis(),
+            rows,
+        })
+    }
+
     pub async fn get_stats_by_model(&self, hours: Option<i32>) -> anyhow::Result<Vec<ModelStats>> {
         self.gw
             .storage

@@ -156,6 +156,7 @@ pub fn create_router(gateway: Gateway, admin_token: Option<String>) -> Router {
         .route("/stats/overview", get(stats_overview))
         .route("/stats/hourly", get(stats_hourly))
         .route("/stats/timeseries", get(stats_timeseries))
+        .route("/stats/token-usage", get(token_usage_stats))
         .route("/stats/models", get(stats_by_model))
         .route("/stats/models/:id", get(model_usage_detail))
         .route("/stats/providers", get(stats_by_provider))
@@ -933,6 +934,26 @@ async fn stats_timeseries(
     }
 }
 
+#[derive(Deserialize)]
+struct TokenUsageParams {
+    year: i32,
+}
+
+async fn token_usage_stats(
+    State(gw): State<Gateway>,
+    Query(params): Query<TokenUsageParams>,
+) -> impl IntoResponse {
+    match gw.admin().get_token_usage_stats(params.year).await {
+        Ok(v) => Json(serde_json::json!({ "data": v })).into_response(),
+        Err(e) if !(1970..=9998).contains(&params.year) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+            .into_response(),
+        Err(e) => err(e),
+    }
+}
+
 async fn stats_by_model(
     State(gw): State<Gateway>,
     Query(params): Query<StatsRangeParams>,
@@ -1091,6 +1112,10 @@ fn err(e: anyhow::Error) -> axum::response::Response {
 #[cfg(test)]
 #[path = "rating_api_tests.rs"]
 mod rating_api_tests;
+
+#[cfg(test)]
+#[path = "token_usage_api_tests.rs"]
+mod token_usage_api_tests;
 
 #[cfg(test)]
 mod tests {
