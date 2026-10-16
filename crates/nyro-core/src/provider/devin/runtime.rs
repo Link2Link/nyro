@@ -10,7 +10,7 @@ use std::sync::{
 use std::time::Duration;
 use tokio_stream::wrappers::ReceiverStream;
 
-use super::{BASE_URL, CHAT_PATH, STATUS_PATH, catalog, request, stream, unavailable};
+use super::{BASE_URL, CHAT_PATH, STATUS_PATH, catalog, request, stream, unavailable, usage};
 use crate::protocol::{
     ids::DEVIN_CHAT_V1,
     ir::{AiRequest, AiStreamDelta},
@@ -240,19 +240,65 @@ async fn execute(
     })
 }
 
-#[derive(Clone, PartialEq, Message)]
-struct StatusResponse {
-    #[prost(message, optional, tag = "1")]
-    user: Option<UserStatus>,
+/// Largest accepted `GetUserStatus` body. The real response carries the whole
+/// model catalogue (~150 KiB), so this leaves generous headroom while still
+/// bounding a hostile or broken upstream.
+const MAX_STATUS_BYTES: usize = 1024 * 1024;
+
+/// One authenticated, non-generating `GetUserStatus` round trip against `url`,
+/// decoded into the shared status shape. Does not spend a chat request.
+async fn request_status(
+    gw: &Gateway,
+    provider: &Provider,
+    token: &str,
+    url: &str,
+) -> anyhow::Result<usage::StatusResponse> {
+    super::validate(provider)?;
+    let client = ProxyClient::new(gw.devin_http_client(provider.use_proxy, false).await?)
+        .with_timeouts(gw.config.upstream_timeouts)
+        .with_deadline(Deadline::from_now(Duration::from_secs(15)));
+    request_status_with(&client, token, url).await
 }
-#[derive(Clone, PartialEq, Message)]
-struct UserStatus {
-    #[prost(string, tag = "3")]
-    name: String,
-    #[prost(string, tag = "7")]
-    email: String,
-    #[prost(string, tag = "36")]
-    id: String,
+
+async fn request_status_with(
+    client: &ProxyClient,
+    token: &str,
+    url: &str,
+) -> anyhow::Result<usage::StatusResponse> {
+    let response = client
+        .call_stream_raw(
+            url,
+            headers(token, false)?,
+            request::user_status_request(token).into(),
+        )
+        .await
+        .map_err(network)?;
+    let status = response.status();
+    // Wording matters: the admin usage route maps these phrases to a
+    // provider-credential failure instead of an admin-session expiry.
+    if matches!(status.as_u16(), 401 | 403) {
+        anyhow::bail!(
+            "Devin authentication failed (HTTP {}); re-authorize this provider",
+            status.as_u16()
+        );
+    }
+    anyhow::ensure!(
+        status.is_success(),
+        "Devin status check returned HTTP {}",
+        status.as_u16()
+    );
+    let mut bytes = Vec::new();
+    let mut stream = Box::pin(response.bytes_stream());
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|error| network(error.into()))?;
+        anyhow::ensure!(
+            bytes.len() + chunk.len() <= MAX_STATUS_BYTES,
+            "Devin status response is too large"
+        );
+        bytes.extend_from_slice(&chunk);
+    }
+    usage::StatusResponse::decode(bytes.as_slice())
+        .map_err(|_| anyhow::anyhow!("Invalid Devin status response"))
 }
 
 /// Authenticated, non-generating health check. Does not spend a chat request.
@@ -261,40 +307,22 @@ pub(crate) async fn check_connection(
     provider: &Provider,
     token: &str,
 ) -> anyhow::Result<()> {
-    super::validate(provider)?;
-    let client = ProxyClient::new(gw.devin_http_client(provider.use_proxy, false).await?)
-        .with_timeouts(gw.config.upstream_timeouts)
-        .with_deadline(Deadline::from_now(Duration::from_secs(15)));
-    let response = client
-        .call_stream_raw(
-            &format!("{BASE_URL}{STATUS_PATH}"),
-            headers(token, false)?,
-            request::user_status_request(token).into(),
-        )
-        .await
-        .map_err(network)?;
-    anyhow::ensure!(
-        response.status().is_success(),
-        "Devin status check returned HTTP {}",
-        response.status().as_u16()
-    );
-    let mut bytes = Vec::new();
-    let mut stream = Box::pin(response.bytes_stream());
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|error| network(error.into()))?;
-        anyhow::ensure!(
-            bytes.len() + chunk.len() <= 1024 * 1024,
-            "Devin status response is too large"
-        );
-        bytes.extend_from_slice(&chunk);
-    }
-    let status = StatusResponse::decode(bytes.as_slice())
-        .map_err(|_| anyhow::anyhow!("Invalid Devin status response"))?;
+    let status = request_status(gw, provider, token, &format!("{BASE_URL}{STATUS_PATH}")).await?;
     anyhow::ensure!(
         status.user.is_some(),
         "Devin status response contains no user status"
     );
     Ok(())
+}
+
+/// Plan, daily/weekly quota windows and extra-usage balance of the account,
+/// read from the same `GetUserStatus` call as the health check.
+pub(crate) async fn fetch_usage(
+    gw: &Gateway,
+    provider: &Provider,
+    token: &str,
+) -> anyhow::Result<usage::DevinUsage> {
+    usage::snapshot(request_status(gw, provider, token, &format!("{BASE_URL}{STATUS_PATH}")).await?)
 }
 
 /// Explicit per-model probes share the same transport and completion checks.

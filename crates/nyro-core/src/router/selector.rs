@@ -236,6 +236,9 @@ impl RoutingStrategy for LatencyStrategy {
 /// often per year and recover from early exhaustion sooner, so they safely
 /// absorb a larger share of the traffic.
 /// Providers without a canonical window form an equal-weight fallback pool;
+/// providers whose exhausted included window is covered by a prepaid reserve
+/// (Devin's extra-usage balance) come after both pools — traffic there costs
+/// real money, so they are a last resort regardless of the remaining windows;
 /// quota-blocked rows stay last so the dispatcher keeps its exhausted 503.
 pub struct UsageStrategy;
 
@@ -244,6 +247,7 @@ struct ProviderTargetGroup<'a> {
     targets: Vec<&'a ModelBackend>,
     score: Option<super::usage::ProviderUsageScore>,
     schedulable: bool,
+    on_reserve: bool,
 }
 
 impl RoutingStrategy for UsageStrategy {
@@ -282,12 +286,14 @@ impl RoutingStrategy for UsageStrategy {
                 targets: vec![target],
                 score: None,
                 schedulable: false,
+                on_reserve: false,
             });
         }
 
         let now = chrono::Utc::now();
         for group in &mut groups {
             group.schedulable = quota.is_schedulable(group.provider_id);
+            group.on_reserve = quota.is_on_reserve(group.provider_id);
             group.score = score_provider(&quota.tier_snapshot(group.provider_id), now);
         }
 
@@ -296,6 +302,10 @@ impl RoutingStrategy for UsageStrategy {
         // mass; static target weights only choose within that provider. Duplicate
         // rows therefore never amplify a provider's cross-provider probability.
         let mut fallback: Vec<(&ProviderTargetGroup<'_>, f64)> = Vec::new();
+        // Exhausted included windows covered by a prepaid reserve: ranked after
+        // every pool that still has included quota or unknown (possibly free)
+        // capacity, whatever the other windows still hold.
+        let mut reserve: Vec<(&ProviderTargetGroup<'_>, f64)> = Vec::new();
         let mut inactive: Vec<(
             &ProviderTargetGroup<'_>,
             Option<super::usage::ProviderUsageScore>,
@@ -304,6 +314,10 @@ impl RoutingStrategy for UsageStrategy {
         for group in &groups {
             if !group.schedulable {
                 inactive.push((group, group.score));
+                continue;
+            }
+            if group.on_reserve {
+                reserve.push((group, 1.0));
                 continue;
             }
             match group.score {
@@ -317,6 +331,7 @@ impl RoutingStrategy for UsageStrategy {
 
         let scored_total: f64 = scored.iter().map(|(_, w)| *w).sum();
         let fallback_total: f64 = fallback.iter().map(|(_, w)| *w).sum();
+        let reserve_total: f64 = reserve.iter().map(|(_, w)| *w).sum();
 
         let mut ordered: Vec<&ModelBackend> = Vec::new();
         let mut rank = 0_usize;
@@ -349,6 +364,24 @@ impl RoutingStrategy for UsageStrategy {
                     weight: Some(weight),
                     share: share_of(weight, fallback_total),
                     score: Some(serde_json::json!({ "state": "unknown_quota" })),
+                    skipped: None,
+                });
+                ordered.push(target);
+            }
+        }
+        // Prepaid-reserve pool: still schedulable, but only after everything
+        // that has included quota or unknown capacity.
+        for (group, weight) in weighted_shuffle_pairs_by(&reserve) {
+            for target in weighted_shuffle(&group.targets) {
+                rank += 1;
+                decision.candidates.push(DecisionCandidate {
+                    provider: target.provider_id.clone(),
+                    provider_name: None,
+                    target: target.model.clone(),
+                    rank: Some(rank),
+                    weight: Some(weight),
+                    share: share_of(weight, reserve_total),
+                    score: Some(serde_json::json!({ "state": "reserve" })),
                     skipped: None,
                 });
                 ordered.push(target);
@@ -1254,6 +1287,117 @@ mod tests {
             .find(|c| c.provider == "mystery")
             .unwrap();
         assert_eq!(mystery.score.as_ref().unwrap()["state"], "unknown_quota");
+    }
+
+    /// An exhausted `daily` window covered by a prepaid reserve, while the
+    /// weekly window (the one scoring would normally govern by) is nearly
+    /// untouched — the shape that would otherwise rank the provider FIRST.
+    fn observe_reserve(quota: &ProviderQuotaRegistry, provider: &str) {
+        let half_week_ahead = (chrono::Utc::now() + chrono::Duration::hours(84)).to_rfc3339();
+        quota.observe_with_reserve(
+            provider,
+            &[
+                QuotaTierObservation {
+                    name: "daily".to_string(),
+                    used_percent: 100.0,
+                    resets_at: None,
+                },
+                QuotaTierObservation {
+                    name: "weekly_limit".to_string(),
+                    used_percent: 9.0,
+                    resets_at: Some(half_week_ahead),
+                },
+            ],
+            Some(true),
+            true,
+        );
+    }
+
+    #[test]
+    fn usage_ranks_prepaid_reserve_after_included_quota_and_unknown_pools() {
+        let quota = ProviderQuotaRegistry::new();
+        let half_week_ahead = (chrono::Utc::now() + chrono::Duration::hours(84)).to_rfc3339();
+        quota.observe(
+            "included",
+            &[QuotaTierObservation {
+                name: "weekly_limit".to_string(),
+                used_percent: 95.0,
+                resets_at: Some(half_week_ahead),
+            }],
+            None,
+        );
+        observe_reserve(&quota, "reserve");
+        quota.observe(
+            "blocked",
+            &[QuotaTierObservation {
+                name: "monthly".to_string(),
+                used_percent: 100.0,
+                resets_at: None,
+            }],
+            None,
+        );
+        let targets = vec![
+            backend("1", "blocked", "blocked", 100),
+            backend("2", "reserve", "reserve", 100),
+            backend("3", "unknown", "unknown", 100),
+            backend("4", "included", "included", 100),
+        ];
+
+        // Even an almost-spent included provider and an unknown-quota one beat
+        // the reserve provider, whatever the shuffle draws; blocked stays last.
+        for _ in 0..200 {
+            let ordered =
+                TargetSelector::select_ordered("usage", &targets, &LatencyRegistry::new(), &quota);
+
+            assert_eq!(ordered[0].provider_id, "included");
+            assert_eq!(ordered[1].provider_id, "unknown");
+            assert_eq!(ordered[2].provider_id, "reserve");
+            assert_eq!(ordered[3].provider_id, "blocked");
+        }
+    }
+
+    #[test]
+    fn usage_decision_labels_the_reserve_pool_and_keeps_the_provider_schedulable() {
+        let quota = ProviderQuotaRegistry::new();
+        observe_reserve(&quota, "reserve");
+        let targets = vec![backend("1", "reserve", "reserve-model", 100)];
+
+        let (ordered, decision) = TargetSelector::select_ordered_traced(
+            "usage",
+            &targets,
+            &LatencyRegistry::new(),
+            &quota,
+            &HealthRegistry::new(),
+        );
+
+        // Reserve coverage never removes the provider from the candidate list.
+        assert_eq!(ordered.len(), 1);
+        let candidate = decision
+            .candidates
+            .iter()
+            .find(|c| c.provider == "reserve")
+            .unwrap();
+        assert_eq!(candidate.rank, Some(1));
+        assert!(candidate.skipped.is_none());
+        assert_eq!(candidate.score.as_ref().unwrap()["state"], "reserve");
+    }
+
+    #[test]
+    fn reserve_does_not_change_non_usage_strategies() {
+        let quota = ProviderQuotaRegistry::new();
+        observe_reserve(&quota, "reserve");
+        let targets = vec![
+            backend("1", "reserve", "reserve", 100),
+            backend("2", "other", "other", 100),
+        ];
+
+        // Priority/weighted/latency ignore quota scores: a schedulable reserve
+        // provider keeps its configured position.
+        let ordered =
+            TargetSelector::select_ordered("priority", &targets, &LatencyRegistry::new(), &quota);
+
+        assert_eq!(ordered.len(), 2);
+        assert!(ordered.iter().any(|t| t.provider_id == "reserve"));
     }
 
     #[test]

@@ -64,6 +64,14 @@
 //! Main and feature-specific rate limits are classified by their declared
 //! window length (not primary/secondary position); unknown metered features are
 //! retained under stable `feature:<name>:<window>` tier names.
+//!
+//! Devin (CLI subscription, OAuth session token): the same authenticated
+//! `GetUserStatus` Connect call that backs the connection test carries the plan
+//! name, the `daily` / `weekly_limit` quota windows (remaining % inverted to
+//! used) and the extra-usage balance. The balance is what keeps the account
+//! usable once a window is spent, so it is part of the availability decision:
+//! an exhausted window only pauses scheduling when no extra balance is left
+//! (see [`devin_reserve_available`]).
 
 use futures::stream::{self, StreamExt};
 use reqwest::header::CONTENT_TYPE;
@@ -79,6 +87,7 @@ use crate::router::quota::{ProviderScheduling, QuotaTierObservation};
 use super::*;
 
 const TIER_FIVE_HOUR: &str = "five_hour";
+const TIER_DAILY: &str = "daily";
 const TIER_WEEKLY_LIMIT: &str = "weekly_limit";
 const TIER_MONTHLY: &str = "monthly";
 
@@ -299,6 +308,9 @@ enum UsageBackend {
     /// `token-plan-*.xiaomimimo.com`, read from the console
     /// `/api/v1/tokenPlan/usage` endpoint with the same Cookie credential.
     MimoTokenPlan,
+    /// Devin CLI subscription quota (plan, daily/weekly windows, extra-usage
+    /// balance) via OAuth, read from `GetUserStatus`.
+    Devin,
 }
 
 impl UsageBackend {
@@ -340,6 +352,12 @@ impl UsageBackend {
             });
         if is_grok_identity {
             return Some(UsageBackend::Grok);
+        }
+        // Devin is a fixed-origin native provider with no legacy imports, so it
+        // is recognised by identity alone: the Codeium host is not exclusive to
+        // it and must never route a lookalike provider here.
+        if crate::provider::devin::is_devin(provider) {
+            return Some(UsageBackend::Devin);
         }
         // Google subscription channels (antigravity = Google AI Pro,
         // gemini-cli = Code Assist) share the Code Assist quota backend.
@@ -431,6 +449,7 @@ impl UsageBackend {
             UsageBackend::GoogleSubscription => "google_subscription",
             UsageBackend::MimoBalance => "mimo_balance",
             UsageBackend::MimoTokenPlan => "mimo_token_plan",
+            UsageBackend::Devin => "devin_plan",
         }
     }
 
@@ -445,7 +464,7 @@ impl UsageBackend {
                 is_available.is_some()
                     || tiers.iter().any(|tier| !tier.name.starts_with("feature:"))
             }
-            UsageBackend::Grok => is_available.is_some() || !tiers.is_empty(),
+            UsageBackend::Grok | UsageBackend::Devin => is_available.is_some() || !tiers.is_empty(),
             _ => !tiers.is_empty(),
         }
     }
@@ -462,6 +481,7 @@ impl UsageBackend {
             | UsageBackend::OpencodeGo
             | UsageBackend::OpenAiCodex
             | UsageBackend::Grok
+            | UsageBackend::Devin
             | UsageBackend::GoogleSubscription => "global",
             UsageBackend::ArkCoding | UsageBackend::BailianCodingPlan => "cn",
             // The MiMo console quota surface is account-scoped; the
@@ -642,17 +662,18 @@ fn quota_window_tag(window: Option<&str>) -> String {
     }
 }
 
-/// Duration rank of one quota-window label: `five_hour` -> `weekly_limit` ->
-/// `monthly` -> `primary_window` -> `secondary_window`; unknown labels sort
-/// last within their group.
+/// Duration rank of one quota-window label: `five_hour` -> `daily` ->
+/// `weekly_limit` -> `monthly` -> `primary_window` -> `secondary_window`;
+/// unknown labels sort last within their group.
 fn window_duration_rank(window: &str) -> u8 {
     match window {
         TIER_FIVE_HOUR => 0,
-        TIER_WEEKLY_LIMIT => 1,
-        TIER_MONTHLY => 2,
-        "primary_window" => 3,
-        "secondary_window" => 4,
-        _ => 5,
+        TIER_DAILY => 1,
+        TIER_WEEKLY_LIMIT => 2,
+        TIER_MONTHLY => 3,
+        "primary_window" => 4,
+        "secondary_window" => 5,
+        _ => 6,
     }
 }
 
@@ -667,11 +688,72 @@ fn tier_display_rank(name: &str) -> (u8, u8) {
         return (1, window_duration_rank(window));
     }
     match name {
-        TIER_FIVE_HOUR | TIER_WEEKLY_LIMIT | TIER_MONTHLY | "primary_window"
+        TIER_FIVE_HOUR | TIER_DAILY | TIER_WEEKLY_LIMIT | TIER_MONTHLY | "primary_window"
         | "secondary_window" => (0, window_duration_rank(name)),
         // Unknown names keep their arrival order — the sort is stable.
         _ => (2, 0),
     }
+}
+
+/// Currency of Devin's extra-usage balance.
+const DEVIN_BALANCE_CURRENCY: &str = "USD";
+
+fn devin_tier(name: &str, quota: &crate::provider::devin::DevinQuota) -> ProviderUsageTier {
+    ProviderUsageTier {
+        name: name.to_string(),
+        // The upstream reports what is LEFT; the API contract is what is USED.
+        used_percent: f64::from(100 - quota.remaining_percent.min(100)),
+        resets_at: quota
+            .resets_at_unix
+            .and_then(|secs| chrono::DateTime::<chrono::Utc>::from_timestamp(secs, 0))
+            .map(|reset| reset.to_rfc3339()),
+    }
+}
+
+/// Map a Devin status snapshot into the common usage shape: plan name as the
+/// level, the daily/weekly windows as tiers and the extra-usage balance as the
+/// single USD balance.
+///
+/// `is_available` is always `Some(true)`: Devin exposes no account-level
+/// availability flag, and exhaustion is expressed by the tiers together with
+/// the extra balance (see [`devin_reserve_available`]). Reporting `Some(false)`
+/// would pause the provider even while extra usage can still serve traffic.
+fn devin_usage_parts(
+    usage: &crate::provider::devin::DevinUsage,
+) -> (
+    Option<String>,
+    Vec<ProviderUsageTier>,
+    Vec<ProviderUsageBalance>,
+    Option<bool>,
+) {
+    let tiers = [
+        (TIER_DAILY, usage.daily.as_ref()),
+        (TIER_WEEKLY_LIMIT, usage.weekly.as_ref()),
+    ]
+    .into_iter()
+    .filter_map(|(name, quota)| quota.map(|quota| devin_tier(name, quota)))
+    .collect();
+    let balances = usage
+        .overage_usd
+        .map(|total| ProviderUsageBalance {
+            currency: DEVIN_BALANCE_CURRENCY.to_string(),
+            total,
+            // Extra usage is a prepaid balance; nothing marks any of it as a
+            // grant, so it is reported entirely as topped up.
+            granted: 0.0,
+            topped_up: total,
+        })
+        .into_iter()
+        .collect();
+    (usage.plan_name.clone(), tiers, balances, Some(true))
+}
+
+/// True when an exhausted included window is still backed by a positive
+/// extra-usage balance, i.e. the provider keeps serving traffic (at extra-usage
+/// prices) instead of pausing until the window resets. Only meaningful for the
+/// Devin backend; every other backend has no such reserve.
+fn devin_reserve_available(kind: &str, balances: &[ProviderUsageBalance]) -> bool {
+    kind == UsageBackend::Devin.kind() && balances.iter().any(|balance| balance.total > 0.0)
 }
 
 /// Sort tiers into the API's canonical presentation order. The ordering is
@@ -2209,10 +2291,15 @@ impl AdminService {
                 } else {
                     tiers
                 };
-                usage.scheduling =
-                    self.gw
-                        .quota_registry
-                        .observe(&usage.provider_id, &tiers, usage.is_available);
+                // An exhausted window only pauses the provider when no prepaid
+                // extra-usage balance is left to carry the traffic.
+                let reserve_available = devin_reserve_available(&usage.kind, &usage.balances);
+                usage.scheduling = self.gw.quota_registry.observe_with_reserve(
+                    &usage.provider_id,
+                    &tiers,
+                    usage.is_available,
+                    reserve_available,
+                );
                 Ok(usage)
             }
             Ok((mut usage, false)) => {
@@ -2245,14 +2332,17 @@ impl AdminService {
                  Kimi (api.kimi.com), OpenCode Go (opencode.ai/zen), Ark \
                  (volces.com), Bailian token-plan (token-plan.maas.aliyuncs.com), \
                  DeepSeek (api.deepseek.com), Xiaomi MiMo (platform.xiaomimimo.com,
-                 Cookie-authenticated console quota) and Google subscription OAuth \
-                 (Google AI Pro / Code Assist) are supported"
+                 Cookie-authenticated console quota), Devin CLI OAuth and Google \
+                 subscription OAuth (Google AI Pro / Code Assist) are supported"
             )
         })?;
 
         let api_key = if matches!(
             backend,
-            UsageBackend::OpenAiCodex | UsageBackend::Grok | UsageBackend::GoogleSubscription
+            UsageBackend::OpenAiCodex
+                | UsageBackend::Grok
+                | UsageBackend::Devin
+                | UsageBackend::GoogleSubscription
         ) {
             None
         } else {
@@ -2691,6 +2781,23 @@ impl AdminService {
                 let (level, tiers, is_available) = parse_grok_billing(&billing);
                 (tiers, Vec::new(), level, is_available, Vec::new())
             }
+            UsageBackend::Devin => {
+                if provider.effective_auth_mode().trim() != "oauth" {
+                    anyhow::bail!("Devin usage query requires an OAuth provider");
+                }
+                let runtime = self
+                    .resolve_provider_runtime(&provider)
+                    .await
+                    .context("resolve Devin OAuth runtime for usage query")?;
+                let usage = crate::provider::devin::fetch_usage(
+                    &self.gw,
+                    &provider,
+                    runtime.access_token.trim(),
+                )
+                .await?;
+                let (level, tiers, balances, is_available) = devin_usage_parts(&usage);
+                (tiers, balances, level, is_available, Vec::new())
+            }
             UsageBackend::GoogleSubscription => {
                 if provider.effective_auth_mode().trim() != "oauth" {
                     anyhow::bail!("Google subscription usage query requires an OAuth provider");
@@ -2841,7 +2948,10 @@ async fn provider_usage_monitorable(admin: &AdminService, provider: &Provider) -
     // provider is in OAuth mode.
     if matches!(
         backend,
-        UsageBackend::OpenAiCodex | UsageBackend::Grok | UsageBackend::GoogleSubscription
+        UsageBackend::OpenAiCodex
+            | UsageBackend::Grok
+            | UsageBackend::Devin
+            | UsageBackend::GoogleSubscription
     ) {
         return provider.effective_auth_mode().trim() == "oauth";
     }
@@ -3443,6 +3553,523 @@ mod tests {
             created_at: String::new(),
             updated_at: String::new(),
         }
+    }
+
+    use crate::provider::devin::{DevinQuota, DevinUsage};
+
+    fn devin_provider() -> Provider {
+        provider_for_usage(
+            Some("devin"),
+            Some("devin"),
+            Some("cli"),
+            "https://server.codeium.com",
+        )
+    }
+
+    fn quota(remaining_percent: u8, resets_at_unix: Option<i64>) -> DevinQuota {
+        DevinQuota {
+            remaining_percent,
+            resets_at_unix,
+        }
+    }
+
+    /// A window with `remaining_percent` left that resets `resets_in` from now.
+    fn quota_window(remaining_percent: u8, resets_in: chrono::Duration) -> DevinQuota {
+        quota(remaining_percent, Some(unix_in(resets_in)))
+    }
+
+    fn devin_usage(
+        daily: Option<DevinQuota>,
+        weekly: Option<DevinQuota>,
+        overage_usd: Option<f64>,
+    ) -> DevinUsage {
+        DevinUsage {
+            plan_name: Some("Pro".to_string()),
+            daily,
+            weekly,
+            overage_usd,
+        }
+    }
+
+    #[test]
+    fn devin_detection_is_identity_only_with_no_url_fallback() {
+        use UsageBackend::*;
+        assert_eq!(UsageBackend::detect(&devin_provider()), Some(Devin));
+        // Case/whitespace tolerant, like every other identity check.
+        let mut shouty = devin_provider();
+        shouty.vendor = Some(" DEVIN ".to_string());
+        assert_eq!(UsageBackend::detect(&shouty), Some(Devin));
+
+        // The Codeium host alone must never claim a provider.
+        assert_eq!(UsageBackend::detect_url("https://server.codeium.com"), None);
+        let lookalike = provider_for_usage(
+            Some("custom"),
+            Some("custom"),
+            Some("default"),
+            "https://server.codeium.com",
+        );
+        assert_eq!(UsageBackend::detect(&lookalike), None);
+
+        assert_eq!(Devin.kind(), "devin_plan");
+        assert_eq!(Devin.site(), "global");
+        assert_eq!(Devin.site_of("https://server.codeium.com"), "global");
+    }
+
+    #[test]
+    fn devin_is_an_oauth_backend_without_an_api_key() {
+        // No API key is needed or consulted: usage_api_key stays empty.
+        assert!(usage_api_key(&devin_provider()).is_none());
+        // Observations count with or without tiers (credit plans have none).
+        assert!(UsageBackend::Devin.has_authoritative_observation(&[], Some(true)));
+        assert!(
+            UsageBackend::Devin.has_authoritative_observation(&[tier("daily", 17.0, None)], None)
+        );
+        assert!(!UsageBackend::Devin.has_authoritative_observation(&[], None));
+    }
+
+    #[test]
+    fn devin_maps_plan_windows_and_extra_balance() {
+        let usage = devin_usage(
+            Some(quota(83, Some(1_792_137_600))),
+            Some(quota(91, Some(1_792_310_400))),
+            Some(10.0),
+        );
+
+        let (level, tiers, balances, is_available) = devin_usage_parts(&usage);
+
+        assert_eq!(level.as_deref(), Some("Pro"));
+        assert_eq!(
+            tiers,
+            vec![
+                ProviderUsageTier {
+                    name: "daily".to_string(),
+                    used_percent: 17.0,
+                    resets_at: Some("2026-10-16T08:00:00+00:00".to_string()),
+                },
+                ProviderUsageTier {
+                    name: "weekly_limit".to_string(),
+                    used_percent: 9.0,
+                    resets_at: Some("2026-10-18T08:00:00+00:00".to_string()),
+                },
+            ]
+        );
+        assert_eq!(
+            balances,
+            vec![ProviderUsageBalance {
+                currency: "USD".to_string(),
+                total: 10.0,
+                granted: 0.0,
+                topped_up: 10.0,
+            }]
+        );
+        // Devin has no account-availability flag; exhaustion is tiers + balance.
+        assert_eq!(is_available, Some(true));
+    }
+
+    #[test]
+    fn devin_exhausted_window_maps_to_full_usage_and_keeps_unknown_resets_open() {
+        let usage = devin_usage(Some(quota(0, None)), None, Some(0.0));
+
+        let (_, tiers, balances, _) = devin_usage_parts(&usage);
+
+        assert_eq!(tiers.len(), 1);
+        assert_eq!(tiers[0].name, "daily");
+        assert_eq!(tiers[0].used_percent, 100.0);
+        assert_eq!(tiers[0].resets_at, None);
+        // A quota plan with no extra balance still shows an explicit $0.00.
+        assert_eq!(balances[0].total, 0.0);
+    }
+
+    #[test]
+    fn devin_without_windows_or_balance_maps_to_an_empty_readout() {
+        let usage = DevinUsage {
+            plan_name: None,
+            daily: None,
+            weekly: None,
+            overage_usd: None,
+        };
+
+        let (level, tiers, balances, is_available) = devin_usage_parts(&usage);
+
+        assert_eq!(level, None);
+        assert!(tiers.is_empty());
+        assert!(balances.is_empty());
+        assert_eq!(is_available, Some(true));
+    }
+
+    fn balance(total: f64) -> ProviderUsageBalance {
+        ProviderUsageBalance {
+            currency: "USD".to_string(),
+            total,
+            granted: 0.0,
+            topped_up: total,
+        }
+    }
+
+    #[test]
+    fn extra_balance_is_a_reserve_only_for_devin_and_only_when_positive() {
+        let devin = UsageBackend::Devin.kind();
+        assert!(devin_reserve_available(devin, &[balance(0.01)]));
+        assert!(!devin_reserve_available(devin, &[balance(0.0)]));
+        assert!(!devin_reserve_available(devin, &[]));
+        // DeepSeek/MiMo balances are availability signals of their own and
+        // must never turn an exhausted window into a covered one.
+        assert!(!devin_reserve_available(
+            UsageBackend::DeepSeek.kind(),
+            &[balance(50.0)]
+        ));
+        assert!(!devin_reserve_available(
+            UsageBackend::MimoTokenPlan.kind(),
+            &[balance(50.0)]
+        ));
+    }
+
+    /// Run a Devin snapshot through the same decision the refresh path makes.
+    fn devin_scheduling(
+        usage: &DevinUsage,
+    ) -> (
+        crate::router::quota::ProviderScheduling,
+        crate::router::quota::ProviderQuotaRegistry,
+    ) {
+        let (_, tiers, balances, is_available) = devin_usage_parts(usage);
+        let observations = tiers
+            .iter()
+            .map(|tier| QuotaTierObservation {
+                name: tier.name.clone(),
+                used_percent: tier.used_percent,
+                resets_at: tier.resets_at.clone(),
+            })
+            .collect::<Vec<_>>();
+        let registry = crate::router::quota::ProviderQuotaRegistry::new();
+        let scheduling = registry.observe_with_reserve(
+            "devin",
+            &observations,
+            is_available,
+            devin_reserve_available(UsageBackend::Devin.kind(), &balances),
+        );
+        (scheduling, registry)
+    }
+
+    #[test]
+    fn spent_daily_window_with_extra_balance_keeps_devin_schedulable() {
+        // Daily spent, weekly healthy, $10 extra balance: the account is usable.
+        let usage = devin_usage(
+            Some(quota(0, Some(1_792_137_600))),
+            Some(quota(91, Some(1_792_310_400))),
+            Some(10.0),
+        );
+
+        let (scheduling, registry) = devin_scheduling(&usage);
+
+        assert_eq!(
+            scheduling.status,
+            crate::router::quota::ProviderSchedulingStatus::Eligible
+        );
+        assert!(registry.is_schedulable("devin"));
+        assert!(registry.is_on_reserve("devin"));
+    }
+
+    #[test]
+    fn spent_weekly_window_with_extra_balance_keeps_devin_schedulable() {
+        let usage = devin_usage(
+            Some(quota(60, Some(1_792_137_600))),
+            Some(quota(0, Some(1_792_310_400))),
+            Some(0.5),
+        );
+
+        let (scheduling, registry) = devin_scheduling(&usage);
+
+        assert_eq!(
+            scheduling.status,
+            crate::router::quota::ProviderSchedulingStatus::Eligible
+        );
+        assert!(registry.is_on_reserve("devin"));
+    }
+
+    #[test]
+    fn spent_window_without_extra_balance_pauses_devin_until_the_latest_reset() {
+        let usage = devin_usage(
+            Some(quota(0, Some(1_792_137_600))),
+            Some(quota(0, Some(1_792_310_400))),
+            Some(0.0),
+        );
+
+        let (scheduling, registry) = devin_scheduling(&usage);
+
+        assert_eq!(
+            scheduling.status,
+            crate::router::quota::ProviderSchedulingStatus::QuotaExhausted
+        );
+        assert_eq!(scheduling.reason.as_deref(), Some("usage_limit"));
+        assert_eq!(scheduling.blocking_tiers, vec!["daily", "weekly_limit"]);
+        assert_eq!(
+            scheduling.reset_at.as_deref(),
+            Some("2026-10-18T08:00:00+00:00")
+        );
+        assert!(!registry.is_schedulable("devin"));
+        assert!(!registry.is_on_reserve("devin"));
+    }
+
+    #[test]
+    fn healthy_windows_stay_schedulable_regardless_of_extra_balance() {
+        for overage in [Some(0.0), Some(10.0), None] {
+            let usage = devin_usage(Some(quota(83, None)), Some(quota(91, None)), overage);
+
+            let (scheduling, registry) = devin_scheduling(&usage);
+
+            assert_eq!(
+                scheduling.status,
+                crate::router::quota::ProviderSchedulingStatus::Eligible
+            );
+            // A funded balance alone is not reserve traffic.
+            assert!(!registry.is_on_reserve("devin"));
+        }
+    }
+
+    // ---- cross-provider scheduling: Devin next to other usage backends ----
+
+    fn observations(tiers: &[ProviderUsageTier]) -> Vec<QuotaTierObservation> {
+        tiers
+            .iter()
+            .map(|tier| QuotaTierObservation {
+                name: tier.name.clone(),
+                used_percent: tier.used_percent,
+                resets_at: tier.resets_at.clone(),
+            })
+            .collect()
+    }
+
+    /// Feed one Devin snapshot through the same mapping + registry decision the
+    /// background monitor makes, under `provider`.
+    fn observe_devin(
+        registry: &crate::router::quota::ProviderQuotaRegistry,
+        provider: &str,
+        usage: &DevinUsage,
+    ) {
+        let (_, tiers, balances, is_available) = devin_usage_parts(usage);
+        registry.observe_with_reserve(
+            provider,
+            &observations(&tiers),
+            is_available,
+            devin_reserve_available(UsageBackend::Devin.kind(), &balances),
+        );
+    }
+
+    fn rfc3339_in(duration: chrono::Duration) -> String {
+        (chrono::Utc::now() + duration).to_rfc3339()
+    }
+
+    fn unix_in(duration: chrono::Duration) -> i64 {
+        (chrono::Utc::now() + duration).timestamp()
+    }
+
+    fn model_backend(provider: &str) -> crate::db::models::ModelBackend {
+        crate::db::models::ModelBackend {
+            id: provider.to_string(),
+            model_id: "m".to_string(),
+            provider_id: provider.to_string(),
+            model: format!("{provider}-model"),
+            weight: 100,
+            priority: 1,
+            is_fallback: false,
+            created_at: String::new(),
+        }
+    }
+
+    fn usage_order(
+        quota: &crate::router::quota::ProviderQuotaRegistry,
+        providers: &[&str],
+    ) -> Vec<String> {
+        let targets = providers
+            .iter()
+            .map(|provider| model_backend(provider))
+            .collect::<Vec<_>>();
+        crate::router::selector::TargetSelector::select_ordered(
+            "usage",
+            &targets,
+            &crate::router::latency::LatencyRegistry::new(),
+            quota,
+        )
+        .into_iter()
+        .map(|target| target.provider_id)
+        .collect()
+    }
+
+    #[test]
+    fn devin_competes_with_other_backends_on_its_weekly_window() {
+        // Devin and a Codex-style weekly provider are both on pace (rate ~1):
+        // their usage readouts must be comparable, so both land in one scored
+        // pool and neither is treated as an unknown-quota fallback.
+        let quota = crate::router::quota::ProviderQuotaRegistry::new();
+        let half_week = chrono::Duration::hours(84);
+        observe_devin(
+            &quota,
+            "devin",
+            &devin_usage(
+                Some(quota_window(50, chrono::Duration::hours(12))),
+                Some(quota_window(50, half_week)),
+                Some(10.0),
+            ),
+        );
+        quota.observe(
+            "codex",
+            &[QuotaTierObservation {
+                name: TIER_WEEKLY_LIMIT.to_string(),
+                used_percent: 50.0,
+                resets_at: Some(rfc3339_in(half_week)),
+            }],
+            None,
+        );
+        let snapshot = quota.tier_snapshot("devin");
+        let score = crate::router::usage::score_provider(&snapshot, chrono::Utc::now())
+            .expect("a weekly-reporting Devin account is scorable");
+        assert_eq!(score.window, TIER_WEEKLY_LIMIT);
+        assert!((score.rate - 1.0).abs() < 0.01, "rate {}", score.rate);
+        assert!(quota.is_schedulable("devin") && !quota.is_on_reserve("devin"));
+
+        // Both stay in the scored pool: an unknown-quota provider sorts after.
+        for _ in 0..100 {
+            let order = usage_order(&quota, &["unknown", "devin", "codex"]);
+            assert_eq!(order[2], "unknown", "{order:?}");
+        }
+    }
+
+    #[test]
+    fn devin_with_more_headroom_is_preferred_over_a_nearly_spent_backend() {
+        let quota = crate::router::quota::ProviderQuotaRegistry::new();
+        let half_week = chrono::Duration::hours(84);
+        observe_devin(
+            &quota,
+            "devin",
+            &devin_usage(
+                Some(quota_window(90, chrono::Duration::hours(12))),
+                Some(quota_window(90, half_week)),
+                None,
+            ),
+        );
+        quota.observe(
+            "spent",
+            &[QuotaTierObservation {
+                name: TIER_WEEKLY_LIMIT.to_string(),
+                used_percent: 95.0,
+                resets_at: Some(rfc3339_in(half_week)),
+            }],
+            None,
+        );
+
+        // rate 1.8 vs 0.1 -> cubed weights differ by ~5800x: stable ordering.
+        for _ in 0..200 {
+            assert_eq!(usage_order(&quota, &["spent", "devin"])[0], "devin");
+        }
+    }
+
+    #[test]
+    fn devin_on_extra_balance_ranks_after_every_included_quota_backend() {
+        let quota = crate::router::quota::ProviderQuotaRegistry::new();
+        let half_week = chrono::Duration::hours(84);
+        // Daily spent, weekly nearly untouched, $10 extra: schedulable, but the
+        // healthy weekly window must not make it the first choice.
+        observe_devin(
+            &quota,
+            "devin",
+            &devin_usage(
+                Some(quota_window(0, chrono::Duration::hours(6))),
+                Some(quota_window(91, half_week)),
+                Some(10.0),
+            ),
+        );
+        quota.observe(
+            "codex",
+            &[QuotaTierObservation {
+                name: TIER_WEEKLY_LIMIT.to_string(),
+                used_percent: 97.0,
+                resets_at: Some(rfc3339_in(half_week)),
+            }],
+            None,
+        );
+        assert!(quota.is_schedulable("devin") && quota.is_on_reserve("devin"));
+
+        for _ in 0..200 {
+            assert_eq!(usage_order(&quota, &["devin", "codex"]), ["codex", "devin"]);
+        }
+    }
+
+    #[test]
+    fn devin_without_extra_balance_is_skipped_until_its_window_resets() {
+        let quota = crate::router::quota::ProviderQuotaRegistry::new();
+        observe_devin(
+            &quota,
+            "devin",
+            &devin_usage(
+                Some(quota_window(0, chrono::Duration::hours(6))),
+                Some(quota_window(91, chrono::Duration::hours(84))),
+                Some(0.0),
+            ),
+        );
+        quota.observe(
+            "codex",
+            &[QuotaTierObservation {
+                name: TIER_WEEKLY_LIMIT.to_string(),
+                used_percent: 97.0,
+                resets_at: None,
+            }],
+            None,
+        );
+
+        assert!(!quota.is_schedulable("devin"));
+        // Still listed (the dispatcher keeps its precise exhausted outcome),
+        // but behind every schedulable backend.
+        assert_eq!(usage_order(&quota, &["devin", "codex"]), ["codex", "devin"]);
+    }
+
+    #[test]
+    fn daily_only_devin_plan_is_scored_like_any_other_single_window_backend() {
+        // A plan that hides its weekly window still competes: the daily window
+        // governs instead of dropping the provider into the unknown pool.
+        let quota = crate::router::quota::ProviderQuotaRegistry::new();
+        observe_devin(
+            &quota,
+            "devin",
+            &devin_usage(
+                Some(quota_window(75, chrono::Duration::hours(6))),
+                None,
+                Some(0.0),
+            ),
+        );
+        let score =
+            crate::router::usage::score_provider(&quota.tier_snapshot("devin"), chrono::Utc::now())
+                .expect("a daily-only Devin account is scorable");
+
+        assert_eq!(score.window, TIER_DAILY);
+        assert_eq!(score.remaining_quota, 75.0);
+    }
+
+    #[test]
+    fn daily_sorts_between_five_hour_and_weekly() {
+        let mut tiers = vec![
+            tier("monthly", 1.0, None),
+            tier("weekly_limit", 1.0, None),
+            tier("feature:spark:five_hour", 1.0, None),
+            tier("daily", 1.0, None),
+            tier("five_hour", 1.0, None),
+        ];
+
+        sort_tiers_for_display(&mut tiers);
+
+        let names = tiers
+            .iter()
+            .map(|tier| tier.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            vec![
+                "five_hour",
+                "daily",
+                "weekly_limit",
+                "monthly",
+                "feature:spark:five_hour"
+            ]
+        );
     }
 
     #[test]

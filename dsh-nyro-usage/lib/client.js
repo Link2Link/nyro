@@ -79,6 +79,7 @@ const zh = {
 	"card.queriedAt": "查询于 {ago}",
 	"card.dragHandle": "按住拖动可调整卡片顺序",
 	"tier.five_hour": "5小时",
+	"tier.daily": "每日",
 	"tier.weekly_limit": "每周",
 	"tier.monthly": "每月",
 	"tier.primary_window": "主要窗口",
@@ -145,6 +146,7 @@ const en = {
 	"card.queriedAt": "Queried {ago}",
 	"card.dragHandle": "Hold and drag to reorder cards",
 	"tier.five_hour": "5h",
+	"tier.daily": "Daily",
 	"tier.weekly_limit": "Weekly",
 	"tier.monthly": "Monthly",
 	"tier.primary_window": "Primary window",
@@ -391,13 +393,14 @@ var panel_module_css_default = {
 function tierLabel(name) {
 	const known = [
 		"five_hour",
+		"daily",
 		"weekly_limit",
 		"monthly",
 		"primary_window",
 		"secondary_window"
 	];
 	if (name === "gemini") return tt("tier.gemini");
-	const feature = /^feature:(.+):(five_hour|weekly_limit|monthly|primary_window|secondary_window)$/.exec(name);
+	const feature = /^feature:(.+):(five_hour|daily|weekly_limit|monthly|primary_window|secondary_window)$/.exec(name);
 	if (feature !== null) return tt("tier.feature", {
 		feature: feature[1].replace(/[_-]+/g, " ").replace(/\s+/g, " ").trim().replace(/\b\w/g, (character) => character.toUpperCase()),
 		window: tt(`tier.${feature[2]}`)
@@ -417,6 +420,7 @@ function tierWindowMs(name) {
 	if (name.startsWith("feature:")) return null;
 	switch (name) {
 		case "five_hour": return 18e6;
+		case "daily": return 864e5;
 		case "weekly_limit": return 6048e5;
 		case "monthly": return 2592e6;
 		default: return null;

@@ -8,6 +8,11 @@ use tokio::sync::{Mutex, Notify};
 
 const NORMAL_REFRESH_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const EXHAUSTED_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
+/// Recheck cadence while exhausted included windows are being covered by a
+/// prepaid reserve. Real money is being spent and the reserve can run dry
+/// within minutes under agent traffic, so the depletion edge must be caught
+/// as quickly as a plain exhaustion's recovery edge.
+const RESERVE_REFRESH_INTERVAL: Duration = EXHAUSTED_REFRESH_INTERVAL;
 const RESET_GRACE_PERIOD: Duration = Duration::from_secs(5);
 const MAX_FAILURE_BACKOFF: Duration = Duration::from_secs(5 * 60);
 
@@ -51,6 +56,9 @@ struct ProviderQuotaState {
     /// Last authoritative upstream quota tiers. Query failures deliberately
     /// preserve this snapshot so usage-based routing remains stable.
     tiers: Vec<QuotaTierObservation>,
+    /// At least one included window is exhausted but a prepaid reserve still
+    /// covers traffic, so the provider stays schedulable — as a last resort.
+    on_reserve: bool,
     next_check: Instant,
     consecutive_failures: u32,
 }
@@ -94,6 +102,16 @@ impl ProviderQuotaRegistry {
             .unwrap_or_default()
     }
 
+    /// True while exhausted included windows are being covered by a prepaid
+    /// reserve (the provider is schedulable, but only as a last resort).
+    pub(crate) fn is_on_reserve(&self, provider_id: &str) -> bool {
+        self.states
+            .read()
+            .unwrap()
+            .get(provider_id)
+            .is_some_and(|state| state.on_reserve)
+    }
+
     /// Last authoritative canonical quota tiers for hot-path usage routing.
     /// Query failures do not clear this snapshot; provider invalidation does.
     pub(crate) fn tier_snapshot(&self, provider_id: &str) -> Vec<QuotaTierObservation> {
@@ -111,13 +129,39 @@ impl ProviderQuotaRegistry {
         tiers: &[QuotaTierObservation],
         is_available: Option<bool>,
     ) -> ProviderScheduling {
+        self.observe_with_reserve(provider_id, tiers, is_available, false)
+    }
+
+    /// [`observe`](Self::observe) for backends whose included windows are
+    /// backed by a prepaid pay-as-you-go reserve (Devin's extra-usage
+    /// balance): once a window is spent, traffic continues against the
+    /// reserve until it runs dry.
+    ///
+    /// With `reserve_available`, exhausted windows no longer block scheduling
+    /// — the real tiers are still retained so the readout stays honest — and
+    /// the provider is flagged [`is_on_reserve`](Self::is_on_reserve) so
+    /// usage-based routing ranks it last. An unavailable account still blocks:
+    /// the reserve only covers exhausted windows. The caller decides when the
+    /// reserve is gone by passing `false`, which restores the normal
+    /// pause-until-reset behavior.
+    pub fn observe_with_reserve(
+        &self,
+        provider_id: &str,
+        tiers: &[QuotaTierObservation],
+        is_available: Option<bool>,
+        reserve_available: bool,
+    ) -> ProviderScheduling {
         let now = Utc::now();
         let blocking = tiers
             .iter()
             .filter(|tier| tier.used_percent >= 100.0)
             .collect::<Vec<_>>();
         let account_unavailable = is_available == Some(false);
-        let exhausted = account_unavailable || !blocking.is_empty();
+        let on_reserve = reserve_available && !account_unavailable && !blocking.is_empty();
+        let exhausted = account_unavailable || (!blocking.is_empty() && !on_reserve);
+        // A covered window blocks nothing: report the blocking set only when
+        // it actually pauses the provider.
+        let blocking = if on_reserve { Vec::new() } else { blocking };
 
         let reset_at = blocking
             .iter()
@@ -126,7 +170,9 @@ impl ProviderQuotaRegistry {
             .and_then(|resets| resets.into_iter().max())
             .map(|reset| reset.to_rfc3339());
 
-        let delay = if !exhausted {
+        let delay = if on_reserve {
+            RESERVE_REFRESH_INTERVAL
+        } else if !exhausted {
             NORMAL_REFRESH_INTERVAL
         } else if let Some(reset) = reset_at.as_deref().and_then(parse_reset_at) {
             reset
@@ -159,11 +205,15 @@ impl ProviderQuotaRegistry {
 
         let mut states = self.states.write().unwrap();
         let previous = states.get(provider_id).map(|state| state.scheduling.status);
+        let previous_reserve = states
+            .get(provider_id)
+            .is_some_and(|state| state.on_reserve);
         states.insert(
             provider_id.to_string(),
             ProviderQuotaState {
                 scheduling: scheduling.clone(),
                 tiers: tiers.to_vec(),
+                on_reserve,
                 next_check: Instant::now() + delay,
                 consecutive_failures: 0,
             },
@@ -178,6 +228,13 @@ impl ProviderQuotaRegistry {
                 "provider quota scheduling status changed"
             );
         }
+        if previous_reserve != on_reserve {
+            tracing::info!(
+                provider_id,
+                on_reserve,
+                "provider prepaid reserve coverage changed"
+            );
+        }
         scheduling
     }
 
@@ -188,6 +245,7 @@ impl ProviderQuotaRegistry {
             .or_insert_with(|| ProviderQuotaState {
                 scheduling: ProviderScheduling::default(),
                 tiers: Vec::new(),
+                on_reserve: false,
                 next_check: Instant::now(),
                 consecutive_failures: 0,
             });
@@ -215,6 +273,7 @@ impl ProviderQuotaRegistry {
             .or_insert_with(|| ProviderQuotaState {
                 scheduling: ProviderScheduling::default(),
                 tiers: Vec::new(),
+                on_reserve: false,
                 next_check: Instant::now(),
                 consecutive_failures: 0,
             });
@@ -440,5 +499,127 @@ mod tests {
         registry.remove("provider");
 
         assert!(registry.tier_snapshot("provider").is_empty());
+    }
+
+    fn exhausted_daily_with_healthy_weekly() -> Vec<QuotaTierObservation> {
+        vec![
+            tier("daily", 100.0, Some("2030-01-01T08:00:00Z")),
+            tier("weekly_limit", 9.0, Some("2030-01-05T08:00:00Z")),
+        ]
+    }
+
+    #[test]
+    fn reserve_keeps_an_exhausted_window_schedulable_and_flags_it() {
+        let registry = ProviderQuotaRegistry::new();
+        let tiers = exhausted_daily_with_healthy_weekly();
+        let scheduling = registry.observe_with_reserve("provider", &tiers, Some(true), true);
+
+        assert_eq!(scheduling.status, ProviderSchedulingStatus::Eligible);
+        assert_eq!(scheduling.reason, None);
+        assert!(scheduling.blocking_tiers.is_empty());
+        assert_eq!(scheduling.reset_at, None);
+        assert!(registry.is_schedulable("provider"));
+        assert!(registry.is_on_reserve("provider"));
+        // The honest readout survives: the exhausted window is still recorded.
+        assert_eq!(registry.tier_snapshot("provider"), tiers);
+    }
+
+    #[test]
+    fn reserve_is_rechecked_at_the_fast_cadence() {
+        let registry = ProviderQuotaRegistry::new();
+        let before = Utc::now();
+        let scheduling = registry.observe_with_reserve(
+            "provider",
+            &exhausted_daily_with_healthy_weekly(),
+            Some(true),
+            true,
+        );
+        let next = parse_reset_at(scheduling.next_check_at.as_deref().unwrap()).unwrap();
+        let wait = next.signed_duration_since(before).num_seconds();
+        let expected = RESERVE_REFRESH_INTERVAL.as_secs() as i64;
+
+        assert!(
+            (expected - 2..=expected + 2).contains(&wait),
+            "reserve recheck must use the fast cadence, got {wait}s"
+        );
+    }
+
+    #[test]
+    fn exhausted_reserve_restores_the_normal_pause() {
+        let registry = ProviderQuotaRegistry::new();
+        let tiers = exhausted_daily_with_healthy_weekly();
+        registry.observe_with_reserve("provider", &tiers, Some(true), true);
+        assert!(registry.is_schedulable("provider"));
+
+        let scheduling = registry.observe_with_reserve("provider", &tiers, Some(true), false);
+
+        assert_eq!(scheduling.status, ProviderSchedulingStatus::QuotaExhausted);
+        assert_eq!(scheduling.reason.as_deref(), Some("usage_limit"));
+        assert_eq!(scheduling.blocking_tiers, vec!["daily"]);
+        assert_eq!(
+            scheduling.reset_at.as_deref(),
+            Some("2030-01-01T08:00:00+00:00")
+        );
+        assert!(!registry.is_schedulable("provider"));
+        assert!(!registry.is_on_reserve("provider"));
+    }
+
+    #[test]
+    fn reserve_never_overrides_an_unavailable_account() {
+        let registry = ProviderQuotaRegistry::new();
+        let scheduling = registry.observe_with_reserve(
+            "provider",
+            &exhausted_daily_with_healthy_weekly(),
+            Some(false),
+            true,
+        );
+
+        assert_eq!(scheduling.reason.as_deref(), Some("account_unavailable"));
+        assert!(!registry.is_schedulable("provider"));
+        assert!(!registry.is_on_reserve("provider"));
+    }
+
+    #[test]
+    fn reserve_without_an_exhausted_window_is_not_reserve_traffic() {
+        let registry = ProviderQuotaRegistry::new();
+        // A positive reserve balance alone must not demote a healthy provider.
+        let scheduling = registry.observe_with_reserve(
+            "provider",
+            &[tier("daily", 17.0, None), tier("weekly_limit", 9.0, None)],
+            Some(true),
+            true,
+        );
+
+        assert_eq!(scheduling.status, ProviderSchedulingStatus::Eligible);
+        assert!(!registry.is_on_reserve("provider"));
+    }
+
+    #[test]
+    fn plain_observe_never_enters_reserve_and_keeps_its_blocking_behavior() {
+        let registry = ProviderQuotaRegistry::new();
+        let scheduling = registry.observe("provider", &exhausted_daily_with_healthy_weekly(), None);
+
+        assert_eq!(scheduling.status, ProviderSchedulingStatus::QuotaExhausted);
+        assert!(!registry.is_on_reserve("provider"));
+    }
+
+    #[test]
+    fn reserve_state_survives_failures_and_clears_on_invalidation() {
+        let registry = ProviderQuotaRegistry::new();
+        registry.observe_with_reserve(
+            "provider",
+            &exhausted_daily_with_healthy_weekly(),
+            Some(true),
+            true,
+        );
+
+        registry.record_query_failure("provider");
+        registry.request_refresh("provider");
+        assert!(registry.is_on_reserve("provider"));
+        assert!(registry.is_schedulable("provider"));
+
+        registry.invalidate("provider");
+        assert!(!registry.is_on_reserve("provider"));
+        assert!(registry.is_schedulable("provider"));
     }
 }

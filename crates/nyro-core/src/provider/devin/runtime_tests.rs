@@ -269,3 +269,178 @@ async fn precancelled_transport_does_not_connect() {
     server.abort();
     let _ = server.await;
 }
+
+// ---- GetUserStatus (unary): shared by the connection test and usage ----
+
+async fn status_mock(
+    status: u16,
+    body: Vec<u8>,
+) -> (
+    String,
+    oneshot::Receiver<Captured>,
+    tokio::task::JoinHandle<()>,
+) {
+    let (tx, rx) = oneshot::channel();
+    let capture = Arc::new(std::sync::Mutex::new(Some(tx)));
+    let app = Router::new().route(
+        STATUS_PATH,
+        post(move |request: Request<Body>| {
+            let capture = capture.clone();
+            let response = body.clone();
+            async move {
+                let headers = request.headers().clone();
+                let request_body = axum::body::to_bytes(request.into_body(), wire::MAX_FRAME)
+                    .await
+                    .unwrap();
+                if let Some(tx) = capture.lock().unwrap().take() {
+                    let _ = tx.send((headers, request_body.to_vec()));
+                }
+                Response::builder()
+                    .status(status)
+                    .header("content-type", "application/proto")
+                    .body(Body::from(response))
+                    .unwrap()
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (format!("http://{address}{STATUS_PATH}"), rx, server)
+}
+
+fn status_client() -> ProxyClient {
+    ProxyClient::new(reqwest::Client::builder().no_proxy().build().unwrap())
+        .with_deadline(Deadline::from_now(Duration::from_secs(5)))
+}
+
+/// The shape observed from a live quota-billed Pro account.
+fn live_status_body() -> Vec<u8> {
+    use usage::{PlanInfo, PlanStatus, StatusResponse, UserStatus};
+    StatusResponse {
+        user: Some(UserStatus {
+            plan_status: Some(PlanStatus {
+                daily_remaining_percent: Some(83),
+                weekly_remaining_percent: Some(91),
+                overage_balance_micros: 10_000_000,
+                daily_reset_unix: 1_792_137_600,
+                weekly_reset_unix: 1_792_310_400,
+                ..Default::default()
+            }),
+        }),
+        plan: Some(PlanInfo {
+            name: "Pro".into(),
+            billing_strategy: 2,
+            ..Default::default()
+        }),
+    }
+    .encode_to_vec()
+}
+
+#[tokio::test]
+async fn mocked_status_request_sends_the_unary_identity_and_decodes_usage() {
+    let (url, captured, server) = status_mock(200, live_status_body()).await;
+
+    let status = request_status_with(&status_client(), "mock-token", &url)
+        .await
+        .unwrap();
+    let usage = usage::snapshot(status).unwrap();
+
+    let (headers, body) = captured.await.unwrap();
+    // Unary protobuf, not a Connect envelope, with the literal Basic scheme.
+    assert_eq!(headers["authorization"], "Basic mock-token-mock-token");
+    assert_eq!(headers["content-type"], "application/proto");
+    assert_eq!(headers["connect-protocol-version"], "1");
+    assert!(!headers.contains_key("sentry-trace"));
+    assert!(!headers.contains_key("user-agent"));
+    assert_eq!(
+        wire::ChatRequest::decode(body.as_slice())
+            .unwrap()
+            .metadata
+            .unwrap()
+            .token,
+        "mock-token"
+    );
+    assert_eq!(usage.plan_name.as_deref(), Some("Pro"));
+    assert_eq!(usage.daily.as_ref().unwrap().remaining_percent, 83);
+    assert_eq!(usage.weekly.as_ref().unwrap().remaining_percent, 91);
+    assert_eq!(usage.overage_usd, Some(10.0));
+    server.abort();
+    let _ = server.await;
+}
+
+#[tokio::test]
+async fn mocked_status_auth_failures_tell_the_user_to_reauthorize_without_leaking() {
+    for code in [401, 403] {
+        let (url, _captured, server) = status_mock(code, b"secret-token".to_vec()).await;
+
+        let error = request_status_with(&status_client(), "mock-token", &url)
+            .await
+            .unwrap_err()
+            .to_string();
+
+        // The admin route classifies these phrases as a PROVIDER credential
+        // failure (502), never as an expired admin session (401).
+        assert!(error.contains("authentication failed"), "{error}");
+        assert!(error.contains("re-authorize"), "{error}");
+        assert!(!error.contains("secret-token"));
+        server.abort();
+        let _ = server.await;
+    }
+}
+
+#[tokio::test]
+async fn mocked_status_other_http_errors_and_bad_bodies_fail_closed() {
+    let (url, _c, server) = status_mock(500, b"secret-token".to_vec()).await;
+    let error = request_status_with(&status_client(), "mock-token", &url)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("HTTP 500"), "{error}");
+    assert!(!error.contains("secret-token"));
+    server.abort();
+    let _ = server.await;
+
+    let (url, _c, server) = status_mock(200, b"\xff\xff\xffsecret-token".to_vec()).await;
+    let error = request_status_with(&status_client(), "mock-token", &url)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert_eq!(error, "Invalid Devin status response");
+    server.abort();
+    let _ = server.await;
+}
+
+#[tokio::test]
+async fn mocked_status_response_is_size_bounded() {
+    let (url, _c, server) = status_mock(200, vec![0; MAX_STATUS_BYTES + 1]).await;
+
+    let error = request_status_with(&status_client(), "mock-token", &url)
+        .await
+        .unwrap_err()
+        .to_string();
+
+    assert_eq!(error, "Devin status response is too large");
+    server.abort();
+    let _ = server.await;
+}
+
+#[tokio::test]
+async fn mocked_status_reply_without_a_user_is_not_an_unlimited_account() {
+    let body = usage::StatusResponse {
+        user: None,
+        plan: None,
+    }
+    .encode_to_vec();
+    let (url, _c, server) = status_mock(200, body).await;
+
+    let status = request_status_with(&status_client(), "mock-token", &url)
+        .await
+        .unwrap();
+
+    assert!(usage::snapshot(status).is_err());
+    server.abort();
+    let _ = server.await;
+}

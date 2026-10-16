@@ -585,6 +585,7 @@ inventory::submit! { ExtensionRegistration { make: || Box::new(XxxChannel) } }
 | Vertex AI | `vertexai` | Service account auth + 区域 endpoint |
 | DeepSeek / Moonshot / GLM (zhipuai) / MiniMax / xAI / ZAI / OpenRouter / Nvidia / Ollama | 各自 vendor_id | 委托 `GenericOpenAICompatibleAdapter` / openai_compat_* |
 | 小米 MiMo | `xiaomimimo` | OpenAI+Anthropic 双协议（`api-key`/Bearer，推理侧）；用量查询后端 `mimo_balance` / `mimo_token_plan`（admin/usage.rs）凭控制台 Cookie（旧版，~24h 过期）或**小米账号 passToken + userId**（推荐）——`provider/xiaomimimo/passport.rs` 用 passToken 走 account.xiaomi.com serviceLogin（sid=`api-platform`，`clientSign` = sha1 签名经 base64+urlencode）→ STS 跳转链收集 `Set-Cookie` 换取 `api-platform_serviceToken`，结果按 provider 缓存 30 分钟、会话拒绝（HTTP 401/403、console code 401/403、登录重定向）时自动重签重试一次；凭据更新即失效缓存 |
+| Devin（实验性） | `devin` | 原生 Connect/protobuf 出站（`devin-chat/get-chat-message/v1`，固定上游 `https://server.codeium.com`），不走 OpenAI 兼容适配器；OAuth session token（`devin-session-token$…`）不可刷新。**用量查询后端** `devin_plan`（`admin/usage.rs`，仅按 `vendor=devin` 身份识别、无 URL 兜底）复用连接测试的同一个 `GetUserStatus` 一元调用（`provider/devin/usage.rs` 宽容解码：未知字段跳过，已声明字段 wire type 不符则整体失败，避免把 schema 漂移误读成「额度用完」）：`level` 取套餐名（如 `Pro`）；`daily` / `weekly_limit` 两个窗口（上游给**剩余**百分比，映射时取反为已用；重置时间为 Unix 秒）；**超额余额**（微美元）映射为唯一一条 USD `balances`。proto3 省略 0 值，故「剩余 0%」与「无数据」在 wire 上无法区分：窗口仅当「未被套餐隐藏，且（有重置时间 或 计费策略为 QUOTA）」时才成立，成立而百分比缺失即视为已用 100%；负百分比是「不限」哨兵、整窗跳过；积分计费套餐不产出窗口。**可用性 = 窗口有余量 或 超额余额>0**：窗口用完时，仅当超额余额为 $0 才暂停调度（到该窗口重置时刻）；余额>0 则经 `ProviderQuotaRegistry::observe_with_reserve` 保持可调度并标记 `on_reserve`（真实窗口快照仍保留，复查周期缩短为 60s 以便尽快发现余额耗尽）。`usage` 均衡策略下 `on_reserve` 的 Provider 排在已评分池与未知池之后、已暂停项之前（超额按真钱计费，只作最后备选，且不受另一窗口余量影响）；`priority` / `weighted` / `latency` 不感知该状态。`is_available` 恒为 `Some(true)`（Devin 无账号级可用性标志，耗尽由 tiers + 超额余额表达，与 Grok/Google 一致）。OAuth 后端，在用量监控白名单内（无需 API key）。 |
 | OpenCode Go | `opencode-go` | 三端点自适应（chat/responses/messages，共享 Key）+ 按模型的硬编码端点路由；每个请求必须携带会话标识 `x-opencode-session`（见 6.6） |
 | custom | `custom` | 用户自定义 vendor preset |
 
@@ -670,7 +671,7 @@ OAuth 使用 PKCE deep-link + 上游轮询，完成方式与认证 scheme 独立
 |---|---|---|
 | `id` | TEXT PK | UUID |
 | `name` | TEXT | 显示名称，同时作为模型匹配键 |
-| `balance` | TEXT | 负载策略：`weighted` / `priority` / `latency` / `usage`（最大周期窗口剩余额度÷剩余时间比率 r³ × 窗口易损性加成 `(30d/W)^0.5`，月=1、周≈2.07、5h 封顶 4） |
+| `balance` | TEXT | 负载策略：`weighted` / `priority` / `latency` / `usage`（最大周期窗口剩余额度÷剩余时间比率 r³ × 窗口易损性加成 `(30d/W)^0.5`，月=1、周≈2.07、日与 5h 封顶 4） |
 | `target_provider` | TEXT FK | 默认目标 Provider（兜底）|
 | `target_model` | TEXT | 默认上游模型名 |
 | `enable_auth` | BOOL | API Token 访问控制，默认 false |
@@ -948,7 +949,7 @@ OnLog 阶段 + `ResponseStats` 已提供标准化的请求指标消费点（见 
 
 ### 12.8 Router 故障策略（部分已落地）
 
-已落地：多 backend 健康感知迭代（`HealthRegistry`）+ 四种 `balance` 策略 + 可重试状态码自动续跑 + 每模型单行降级兜底（`model_backends.is_fallback`，末位追加、仅在正常目标全部不可用时调用）。`latency` 由内存 `LatencyRegistry` 按流式首字延时 EWMA 排序，目标需连续 3 个流式样本并以三次均值入组，未满或超过 5 分钟保鲜窗时由真实流量乐观探测。`usage` 由 `ProviderQuotaRegistry` 的 last-good 窗口快照驱动：每个 Provider 只按其最大主窗口（月>周>5h）计算所需加速 `r=剩余额度%÷剩余时间%`，全部可评分 Provider 在单一池内按 `r³` × 窗口易损性加成 `(30d/W)^0.5`（月=1、周≈2.07、5h 封顶 4；短窗配额更易作废且透支恢复更快，故安全承载更大份额）加权随机（r>1 加速烧、r<1 让位、临近重置自动放大、上限 10）；未知用量 Provider 只作末级兜底，Provider 间等权、Provider 内按静态 target 权重排列。任何窗口达到 100% 仍触发配额硬过滤。待补充：指数退避 + jitter、可配置重试上限、单 backend 精细化熔断（滑动窗口）。
+已落地：多 backend 健康感知迭代（`HealthRegistry`）+ 四种 `balance` 策略 + 可重试状态码自动续跑 + 每模型单行降级兜底（`model_backends.is_fallback`，末位追加、仅在正常目标全部不可用时调用）。`latency` 由内存 `LatencyRegistry` 按流式首字延时 EWMA 排序，目标需连续 3 个流式样本并以三次均值入组，未满或超过 5 分钟保鲜窗时由真实流量乐观探测。`usage` 由 `ProviderQuotaRegistry` 的 last-good 窗口快照驱动：每个 Provider 只按其最大主窗口（月>周>日>5h）计算所需加速 `r=剩余额度%÷剩余时间%`，全部可评分 Provider 在单一池内按 `r³` × 窗口易损性加成 `(30d/W)^0.5`（月=1、周≈2.07、日与 5h 封顶 4；短窗配额更易作废且透支恢复更快，故安全承载更大份额）加权随机（r>1 加速烧、r<1 让位、临近重置自动放大、上限 10）；未知用量 Provider 只作末级兜底，Provider 间等权、Provider 内按静态 target 权重排列。任何窗口达到 100% 仍触发配额硬过滤；唯一例外是有**预付储备**兜底的 Provider（Devin 的超额余额）：窗口用完而余额>0 时不暂停，但排在已评分池与未知池之后（仍先于已暂停项），与剩余窗口无关——这类流量按超额计费，只作最后备选。待补充：指数退避 + jitter、可配置重试上限、单 backend 精细化熔断（滑动窗口）。
 
 ### 12.9 Transport 策略
 

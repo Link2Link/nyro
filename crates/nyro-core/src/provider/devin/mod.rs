@@ -5,6 +5,7 @@ mod catalog;
 mod request;
 mod runtime;
 mod stream;
+mod usage;
 mod wire;
 
 use async_trait::async_trait;
@@ -23,7 +24,8 @@ use crate::provider::vendor::{ProviderCtx, Vendor};
 use crate::provider::{InboundResponse, OutboundRequest};
 use crate::proxy::client::ProxyClient;
 
-pub(crate) use runtime::{check_connection, probe};
+pub(crate) use runtime::{check_connection, fetch_usage, probe};
+pub(crate) use usage::{DevinQuota, DevinUsage};
 pub(crate) const BASE_URL: &str = DEVIN_BASE_URL;
 const CHAT_PATH: &str = "/exa.api_server_pb.ApiServerService/GetChatMessage";
 const STATUS_PATH: &str = "/exa.seat_management_pb.SeatManagementService/GetUserStatus";

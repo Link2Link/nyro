@@ -842,6 +842,9 @@ function usageSupported(
       provider.channel?.toLowerCase() === "gemini-cli");
   const isImportedGoogleOAuth =
     provider.auth_mode === "oauth" && url.includes("cloudcode-pa.googleapis.com");
+  // Devin is recognised by identity alone (mirrors `UsageBackend::detect`): the
+  // Codeium host is not exclusive to it, so there is no URL fallback.
+  const isDevinOAuth = provider.auth_mode === "oauth" && isDevinProvider(provider);
   return (
     isCodexOAuth ||
     isImportedCodexOAuth ||
@@ -849,6 +852,7 @@ function usageSupported(
     isImportedGrokOAuth ||
     isGoogleOAuth ||
     isImportedGoogleOAuth ||
+    isDevinOAuth ||
     url.includes("bigmodel.cn") ||
     url.includes("z.ai") ||
     url.includes("minimaxi.com") ||

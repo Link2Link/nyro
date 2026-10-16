@@ -1,7 +1,7 @@
 //! Provider quota scoring for the `usage` model-balance strategy.
 //!
 //! Each provider is characterized by its **largest** reported main quota
-//! window (monthly, else weekly, else five-hour). The routing value is the
+//! window (monthly, else weekly, else daily, else five-hour). The routing value is the
 //! required acceleration needed to finish exactly that window at its reset:
 //!
 //! ```text
@@ -19,17 +19,20 @@
 //! saves more.
 //!
 //! Window lengths mirror the steady-pace marker rendered by the WebUI:
-//! fixed 5h / 7d / 30d reconstructed backwards from the upstream reset time.
+//! fixed 5h / 24h / 7d / 30d reconstructed backwards from the upstream reset
+//! time.
 
 use chrono::{DateTime, NaiveDate, Utc};
 
 use super::quota::QuotaTierObservation;
 
 pub(crate) const TIER_FIVE_HOUR: &str = "five_hour";
+pub(crate) const TIER_DAILY: &str = "daily";
 pub(crate) const TIER_WEEKLY_LIMIT: &str = "weekly_limit";
 pub(crate) const TIER_MONTHLY: &str = "monthly";
 
 const FIVE_HOURS_MS: f64 = 5.0 * 60.0 * 60.0 * 1000.0;
+const ONE_DAY_MS: f64 = 24.0 * 60.0 * 60.0 * 1000.0;
 const SEVEN_DAYS_MS: f64 = 7.0 * 24.0 * 60.0 * 60.0 * 1000.0;
 const THIRTY_DAYS_MS: f64 = 30.0 * 24.0 * 60.0 * 60.0 * 1000.0;
 
@@ -51,7 +54,7 @@ pub(crate) const WINDOW_BOOST_CAP: f64 = 4.0;
 pub(crate) struct ProviderUsageScore {
     /// Required acceleration on the provider's largest main window.
     pub rate: f64,
-    /// Name of the governing window (`monthly` / `weekly_limit` /
+    /// Name of the governing window (`monthly` / `weekly_limit` / `daily` /
     /// `five_hour`) — surfaced in route-decision snapshots.
     pub window: &'static str,
     /// Remaining quota of the governing window, in percent.
@@ -90,14 +93,14 @@ pub(crate) fn window_boost(window: &str) -> f64 {
 /// Score one provider from its canonical main quota tiers.
 ///
 /// Only the largest reported main window participates (monthly, else
-/// weekly, else five-hour); smaller windows are deliberately ignored for
-/// routing. Providers without any canonical window stay unscored and fall
+/// weekly, else daily, else five-hour); smaller windows are deliberately
+/// ignored for routing. Providers without any canonical window stay unscored and fall
 /// back to the equal-weight unknown pool.
 pub(crate) fn score_provider(
     tiers: &[QuotaTierObservation],
     now: DateTime<Utc>,
 ) -> Option<ProviderUsageScore> {
-    for window in [TIER_MONTHLY, TIER_WEEKLY_LIMIT, TIER_FIVE_HOUR] {
+    for window in [TIER_MONTHLY, TIER_WEEKLY_LIMIT, TIER_DAILY, TIER_FIVE_HOUR] {
         let rates = tiers
             .iter()
             .filter(|tier| tier.name == window)
@@ -186,6 +189,7 @@ pub(crate) struct WindowRate {
 fn tier_window_ms(name: &str) -> Option<f64> {
     match name {
         TIER_FIVE_HOUR => Some(FIVE_HOURS_MS),
+        TIER_DAILY => Some(ONE_DAY_MS),
         TIER_WEEKLY_LIMIT => Some(SEVEN_DAYS_MS),
         TIER_MONTHLY => Some(THIRTY_DAYS_MS),
         _ => None,
@@ -372,6 +376,51 @@ mod tests {
     }
 
     #[test]
+    fn daily_window_uses_a_twenty_four_hour_length() {
+        // 40% spent with a quarter of the 24h window left -> r = 60/25 = 2.4.
+        let rate = tier_rate(&tier(TIER_DAILY, 40.0, Some("2026-01-01T06:00:00Z")), now()).unwrap();
+
+        assert!(approx(rate.rate, 2.4));
+    }
+
+    #[test]
+    fn daily_only_provider_is_scored_instead_of_falling_to_the_unknown_pool() {
+        assert_eq!(
+            score_provider(
+                &[tier(TIER_DAILY, 40.0, Some("2026-01-01T06:00:00Z"))],
+                now(),
+            ),
+            Some(ProviderUsageScore {
+                rate: 2.4,
+                window: TIER_DAILY,
+                remaining_quota: 60.0,
+                remaining_time: Some(25.0),
+            })
+        );
+    }
+
+    #[test]
+    fn weekly_governs_over_daily_and_daily_governs_over_five_hour() {
+        let weekly_and_daily = vec![
+            tier(TIER_DAILY, 0.0, Some("2026-01-01T06:00:00Z")), // r = 4.0
+            tier(TIER_WEEKLY_LIMIT, 50.0, Some("2026-01-04T12:00:00Z")), // r = 1.0
+        ];
+        assert_eq!(
+            score_provider(&weekly_and_daily, now()).unwrap().window,
+            TIER_WEEKLY_LIMIT
+        );
+
+        let daily_and_five_hour = vec![
+            tier(TIER_FIVE_HOUR, 0.0, Some("2026-01-01T02:30:00Z")), // r = 2.0
+            tier(TIER_DAILY, 50.0, Some("2026-01-01T12:00:00Z")),    // r = 1.0
+        ];
+        assert_eq!(
+            score_provider(&daily_and_five_hour, now()).unwrap().window,
+            TIER_DAILY
+        );
+    }
+
+    #[test]
     fn duplicate_same_name_windows_keep_least_urgent() {
         let tiers = vec![
             tier(TIER_WEEKLY_LIMIT, 20.0, Some("2026-01-04T12:00:00Z")), // r = 1.6
@@ -451,6 +500,10 @@ mod tests {
         assert!(
             approx(window_boost(TIER_FIVE_HOUR), WINDOW_BOOST_CAP),
             "sqrt(30d/5h) = 12 is capped"
+        );
+        assert!(
+            approx(window_boost(TIER_DAILY), WINDOW_BOOST_CAP),
+            "sqrt(30d/24h) = 5.48 is capped"
         );
     }
 

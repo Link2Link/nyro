@@ -59,6 +59,8 @@ function tierWindowMs(name: string): number | null {
   switch (name) {
     case "five_hour":
       return 5 * 3600_000;
+    case "daily":
+      return 24 * 3600_000;
     case "weekly_limit":
       return 7 * 24 * 3600_000;
     case "monthly":
@@ -86,6 +88,7 @@ function steadyPacePercent(tier: ProviderUsageTier, now: number): number | null 
 
 const TIER_LABELS_ZH: Record<string, string> = {
   five_hour: "5小时",
+  daily: "每日",
   weekly_limit: "每周",
   monthly: "每月",
   primary_window: "主要窗口",
@@ -94,6 +97,7 @@ const TIER_LABELS_ZH: Record<string, string> = {
 };
 const TIER_LABELS_EN: Record<string, string> = {
   five_hour: "5h",
+  daily: "Daily",
   weekly_limit: "Weekly",
   monthly: "Monthly",
   primary_window: "Primary Window",
@@ -113,7 +117,7 @@ function tierLabel(name: string, isZh: boolean): string {
   const table = isZh ? TIER_LABELS_ZH : TIER_LABELS_EN;
   if (table[name]) return table[name];
 
-  const feature = /^feature:(.+):(five_hour|weekly_limit|monthly|primary_window|secondary_window)$/.exec(name);
+  const feature = /^feature:(.+):(five_hour|daily|weekly_limit|monthly|primary_window|secondary_window)$/.exec(name);
   if (feature) {
     const featureName = readableFeatureName(feature[1]);
     const windowLabel = table[feature[2]] ?? feature[2];
@@ -215,20 +219,26 @@ function BalanceRow({
   balance,
   isAvailable,
   isZh,
+  label,
 }: {
   balance: ProviderUsageBalance;
   isAvailable: boolean;
   isZh: boolean;
+  /** Overrides the generic "Balance" label (e.g. Devin's extra usage). */
+  label?: string;
 }) {
   const symbol = balance.currency === "CNY" ? "¥" : balance.currency === "USD" ? "$" : "";
   const fmt = (value: number) => value.toFixed(2);
-  // cc-switch colors balance rows by availability; keep low-balance red at
-  // the same 70/90 thresholds when a rough floor of 10 is assumed absent.
-  const color = isAvailable ? "text-emerald-600" : "text-red-500";
+  // cc-switch colors balance rows by availability; an empty balance is never
+  // painted as "available" green.
+  const color = !isAvailable ? "text-red-500" : balance.total > 0 ? "text-emerald-600" : "text-slate-400";
   return (
     <div className="flex items-center justify-between gap-3 text-xs">
-      <span className="w-14 shrink-0 font-medium text-slate-500">
-        {isZh ? "余额" : "Balance"}
+      <span
+        className={`shrink-0 font-medium text-slate-500 ${label ? "min-w-14 max-w-36" : "w-14"}`}
+        title={label}
+      >
+        {label ?? (isZh ? "余额" : "Balance")}
       </span>
       <div className="flex flex-1 flex-wrap items-center gap-x-2">
         <span className={`font-semibold tabular-nums ${color}`}>
@@ -305,6 +315,17 @@ export function ProviderUsageFooter({ provider }: { provider: Provider }) {
     .join(", ");
   const isBalanceView = shown?.kind.endsWith("_balance") ?? false;
   const isCodex = shown?.kind === "openai_codex";
+  // Devin reports an extra-usage balance next to its included windows: it is
+  // what keeps the account usable once a window is spent.
+  const isDevin = shown?.kind === "devin_plan";
+  const extraBalanceLabel = isDevin ? (isZh ? "超额余额" : "Extra balance") : undefined;
+  // Included quota spent, yet traffic still flows on the extra balance: the
+  // bars read 100% but the provider is NOT paused, so say so explicitly.
+  const onExtraBalance =
+    isDevin &&
+    !quotaPaused &&
+    (shown?.tiers ?? []).some((tier) => tier.used_percent >= 100) &&
+    balances.some((balance) => balance.total > 0);
   // The Google subscription backend reports the shared Gemini bucket alone, so
   // this card carries a single "Gemini shared pool" row.
   const isGoogleSubscription = shown?.kind === "google_subscription";
@@ -316,13 +337,17 @@ export function ProviderUsageFooter({ provider }: { provider: Provider }) {
       ? isZh
         ? "ChatGPT Codex 用量"
         : "ChatGPT Codex Usage"
-      : isGoogleSubscription
+      : isDevin
         ? isZh
-          ? "Google AI Pro 配额"
-          : "Google AI Pro Quota"
-        : isZh
-          ? "套餐用量"
-          : "Plan Usage";
+          ? "Devin 用量"
+          : "Devin Usage"
+        : isGoogleSubscription
+          ? isZh
+            ? "Google AI Pro 配额"
+            : "Google AI Pro Quota"
+          : isZh
+            ? "套餐用量"
+            : "Plan Usage";
 
   return (
     <div className="mt-3 space-y-2 rounded-xl border border-slate-200/70 bg-white/40 px-3 py-2.5">
@@ -369,28 +394,40 @@ export function ProviderUsageFooter({ provider }: { provider: Provider }) {
         </div>
       )}
 
+      {onExtraBalance && (
+        <div className="flex items-center gap-2 border-y border-amber-200 bg-amber-50 px-2 py-1.5 text-xs text-amber-700">
+          <AlertCircle className="h-3.5 w-3.5 shrink-0" />
+          <span className="min-w-0 flex-1">
+            {isZh
+              ? "套餐额度已用完，正按超额余额计费，调度已降为最后备选"
+              : "Included quota is spent; traffic now draws on the extra balance and is ranked last"}
+          </span>
+        </div>
+      )}
+
       {error && !shown ? (
         <div className="flex items-center gap-1.5 text-xs text-red-500" title={error.message}>
           <AlertCircle className="h-3.5 w-3.5 shrink-0" />
           <span className="truncate">{error.message}</span>
         </div>
-      ) : shown && shown.tiers.length > 0 ? (
+      ) : shown && (shown.tiers.length > 0 || balances.length > 0) ? (
         <div className="flex flex-col gap-1.5">
           {/* Tier order is owned by the gateway API (canonical window order:
-              5h → weekly → monthly → …), so every consumer shows the same
-              sequence. Do not re-sort here. */}
+              5h → daily → weekly → monthly → …), so every consumer shows the
+              same sequence. Do not re-sort here. */}
           {shown.tiers.map((tier) => (
             <TierBar key={tier.name} tier={tier} isZh={isZh} now={now} />
           ))}
-        </div>
-      ) : balances.length > 0 ? (
-        <div className="flex flex-col gap-1.5">
+          {/* Windows and balances render together: Devin's extra balance sits
+              under its daily/weekly bars and decides whether a spent window
+              pauses routing at all. */}
           {balances.map((balance) => (
             <BalanceRow
               key={balance.currency}
               balance={balance}
               isAvailable={shown?.is_available !== false}
               isZh={isZh}
+              label={extraBalanceLabel}
             />
           ))}
           {(shown?.spends ?? []).map((spend) => (

@@ -32,6 +32,7 @@ export const zh = {
   'card.dragHandle': '按住拖动可调整卡片顺序',
   // tier labels
   'tier.five_hour': '5小时',
+  'tier.daily': '每日',
   'tier.weekly_limit': '每周',
   'tier.monthly': '每月',
   'tier.primary_window': '主要窗口',
@@ -103,6 +104,7 @@ export const en: Record<NyroUsageKey, string> = {
   'card.queriedAt': 'Queried {ago}',
   'card.dragHandle': 'Hold and drag to reorder cards',
   'tier.five_hour': '5h',
+  'tier.daily': 'Daily',
   'tier.weekly_limit': 'Weekly',
   'tier.monthly': 'Monthly',
   'tier.primary_window': 'Primary window',

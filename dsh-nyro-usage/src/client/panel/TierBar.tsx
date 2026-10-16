@@ -11,12 +11,12 @@ import css from './panel.module.css'
  * Gemini bucket labeled explicitly, `feature:<f>:<w>` rendered as
  * "<Feature> · <window>", anything else humanized. */
 export function tierLabel(name: string): string {
-  const known = ['five_hour', 'weekly_limit', 'monthly', 'primary_window', 'secondary_window'] as const
+  const known = ['five_hour', 'daily', 'weekly_limit', 'monthly', 'primary_window', 'secondary_window'] as const
   type TierKey = `tier.${(typeof known)[number]}`
   // Google folds every first-party Gemini family into one shared-bucket row
   // named `gemini`; label it as the pool it stands for.
   if (name === 'gemini') return tt('tier.gemini')
-  const feature = /^feature:(.+):(five_hour|weekly_limit|monthly|primary_window|secondary_window)$/.exec(name)
+  const feature = /^feature:(.+):(five_hour|daily|weekly_limit|monthly|primary_window|secondary_window)$/.exec(name)
   if (feature !== null) {
     const featureName = feature[1].replace(/[_-]+/g, ' ').replace(/\s+/g, ' ').trim()
       .replace(/\b\w/g, character => character.toUpperCase())
@@ -43,6 +43,8 @@ export function tierWindowMs(name: string): number | null {
   switch (name) {
     case 'five_hour':
       return 5 * 3_600_000
+    case 'daily':
+      return 24 * 3_600_000
     case 'weekly_limit':
       return 7 * 24 * 3_600_000
     case 'monthly':
