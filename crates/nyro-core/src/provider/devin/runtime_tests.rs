@@ -179,6 +179,60 @@ async fn mocked_transport_headers_payload_and_text_tool_usage_in_both_modes() {
 }
 
 #[tokio::test]
+async fn bare_family_name_sends_the_variant_matching_the_requested_effort() {
+    use crate::protocol::ir::ReasoningEffort;
+    // One route name ("claude-opus-5-5") serves every tier: the request's own
+    // reasoning effort picks the upstream UID that goes on the wire.
+    for (effort, wire_uid) in [
+        (None, "claude-opus-5-5-medium"),
+        (Some(ReasoningEffort::Low), "claude-opus-5-5-low"),
+        (Some(ReasoningEffort::High), "claude-opus-5-5-high"),
+        (Some(ReasoningEffort::Xhigh), "claude-opus-5-5-xhigh"),
+        (Some(ReasoningEffort::Max), "claude-opus-5-5-max"),
+        // Thinking off has no variant of its own: it lands on the lowest tier.
+        (Some(ReasoningEffort::None), "claude-opus-5-5-low"),
+    ] {
+        let mut bytes = frame(wire::ChatResponse {
+            text: b"ok".into(),
+            ..Default::default()
+        });
+        bytes.extend(frame(wire::ChatResponse {
+            stop_reason: 1,
+            ..Default::default()
+        }));
+        bytes.extend(end(b"{}"));
+        let (url, captured, server) = mock(200, bytes).await;
+        let control = control();
+        let mut request = input(true);
+        request.model = "claude-opus-5-5".into();
+        request.reasoning.effort = effort.clone();
+        let mut upstream = execute(
+            request,
+            "claude-opus-5-5",
+            "mock-token",
+            url,
+            client(&control),
+            control.clone(),
+        )
+        .await
+        .unwrap();
+        while upstream.events.next().await.is_some() {}
+        let (_, body) = captured.await.unwrap();
+        let decoded = wire::ChatRequest::decode(&body[5..]).unwrap();
+        assert_eq!(decoded.model, wire_uid, "effort {effort:?}");
+        // The log keeps both sides: what the client asked for and what was sent.
+        assert_eq!(upstream.actual_model, wire_uid);
+        assert_eq!(
+            upstream.model_metadata,
+            serde_json::json!({"requested_model": "claude-opus-5-5", "upstream_model": wire_uid})
+        );
+        drop(upstream);
+        server.abort();
+        let _ = server.await;
+    }
+}
+
+#[tokio::test]
 async fn mocked_transport_rejects_truncation_and_error_trailers_without_done() {
     for bytes in [
         frame(wire::ChatResponse {

@@ -7,12 +7,68 @@ pub(super) const MODELS: &[&str] = &[
     "swe-1-7",
     "swe-1-6",
     "swe-1-6-slow",
+    "claude-opus-5-5",
+    "claude-sonnet-5-5",
+    "claude-fable-5-1",
     "claude-opus-4-6",
     "claude-sonnet-4-6",
     "claude-haiku-4-5",
+    "gpt-6-astra",
     "gpt-5-2",
+    "gemini-4-argon",
     "gemini-3-8-flash",
     "glm-5-2",
+];
+
+/// A model family whose upstream UIDs are `<family>-<effort>`.
+///
+/// A bare family name (what a client or route asks for) resolves to the variant
+/// matching the request's reasoning effort, clamped to the tiers the family
+/// really offers, so one route can serve every tier. An exact UID such as
+/// `claude-opus-5-5-high` never reaches this table: `resolve` sends it as-is.
+struct TieredFamily {
+    /// Lower-case, dash-separated family name (`.` is normalised to `-`).
+    family: &'static str,
+    /// Offered tiers, lowest to highest. No family has a thinking-off variant.
+    tiers: &'static [&'static str],
+    /// Tier used when the request carries no reasoning directive at all. It
+    /// follows CLIProxyAPI's default selection: Gemini lines prefer `high`,
+    /// other thinking families `medium`.
+    default: &'static str,
+}
+
+const LOW_TO_MAX: &[&str] = &["low", "medium", "high", "xhigh", "max"];
+const LOW_TO_HIGH: &[&str] = &["low", "medium", "high"];
+
+/// Families resolved by table lookup. `swe-2`, `gpt-5-2` and `gemini-3-8-flash`
+/// predate it and keep their own arms in `resolve`; a new `<family>-<effort>`
+/// model line only needs an entry here (plus one in `MODELS` for suggestions).
+const TIERED: &[TieredFamily] = &[
+    TieredFamily {
+        family: "claude-opus-5-5",
+        tiers: LOW_TO_MAX,
+        default: "medium",
+    },
+    TieredFamily {
+        family: "claude-sonnet-5-5",
+        tiers: LOW_TO_MAX,
+        default: "medium",
+    },
+    TieredFamily {
+        family: "claude-fable-5-1",
+        tiers: LOW_TO_MAX,
+        default: "medium",
+    },
+    TieredFamily {
+        family: "gpt-6-astra",
+        tiers: LOW_TO_MAX,
+        default: "medium",
+    },
+    TieredFamily {
+        family: "gemini-4-argon",
+        tiers: LOW_TO_HIGH,
+        default: "high",
+    },
 ];
 
 fn effort(reasoning: &ReasoningConfig) -> Option<&'static str> {
@@ -155,7 +211,14 @@ pub(super) fn resolve(raw: &str, reasoning: &ReasoningConfig) -> String {
             "gemini-3-8-flash-{}",
             clamp(requested, &["low", "medium", "high"], "high")
         ),
-        _ => model.into(),
+        _ => match TIERED.iter().find(|tiered| tiered.family == canonical) {
+            Some(tiered) => format!(
+                "{}-{}",
+                tiered.family,
+                clamp(requested, tiered.tiers, tiered.default)
+            ),
+            None => model.into(),
+        },
     }
 }
 
@@ -184,5 +247,222 @@ mod tests {
             resolve("claude-opus-4-6-1m", &config),
             "claude-opus-4-6-thinking-1m"
         );
+    }
+
+    fn effort_config(effort: ReasoningEffort) -> ReasoningConfig {
+        ReasoningConfig {
+            effort: Some(effort),
+            ..Default::default()
+        }
+    }
+
+    /// Every effort a client can express, in ascending order.
+    fn every_effort() -> Vec<ReasoningEffort> {
+        vec![
+            ReasoningEffort::None,
+            ReasoningEffort::Minimal,
+            ReasoningEffort::Low,
+            ReasoningEffort::Medium,
+            ReasoningEffort::High,
+            ReasoningEffort::Xhigh,
+            ReasoningEffort::Max,
+        ]
+    }
+
+    #[test]
+    fn tiered_family_maps_each_effort_to_its_own_variant() {
+        // Five-tier families: legal tiers map 1:1, "off"/minimal clamp up to the
+        // lowest tier because no family has a thinking-off variant.
+        let expected = [
+            (ReasoningEffort::None, "low"),
+            (ReasoningEffort::Minimal, "low"),
+            (ReasoningEffort::Low, "low"),
+            (ReasoningEffort::Medium, "medium"),
+            (ReasoningEffort::High, "high"),
+            (ReasoningEffort::Xhigh, "xhigh"),
+            (ReasoningEffort::Max, "max"),
+        ];
+        for family in [
+            "claude-opus-5-5",
+            "claude-sonnet-5-5",
+            "claude-fable-5-1",
+            "gpt-6-astra",
+        ] {
+            for (effort, tier) in &expected {
+                assert_eq!(
+                    resolve(family, &effort_config(effort.clone())),
+                    format!("{family}-{tier}"),
+                    "{family} with {effort:?}"
+                );
+            }
+        }
+        // Three-tier family: xhigh/max clamp down to its top tier.
+        let expected = [
+            (ReasoningEffort::None, "low"),
+            (ReasoningEffort::Minimal, "low"),
+            (ReasoningEffort::Low, "low"),
+            (ReasoningEffort::Medium, "medium"),
+            (ReasoningEffort::High, "high"),
+            (ReasoningEffort::Xhigh, "high"),
+            (ReasoningEffort::Max, "high"),
+        ];
+        for (effort, tier) in &expected {
+            assert_eq!(
+                resolve("gemini-4-argon", &effort_config(effort.clone())),
+                format!("gemini-4-argon-{tier}"),
+                "gemini-4-argon with {effort:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn tiered_families_reach_every_published_variant_and_nothing_else() {
+        // Independent of TIERED: the upstream UIDs each family really publishes.
+        let published: [(&str, &[&str]); 5] = [
+            (
+                "claude-opus-5-5",
+                &["low", "medium", "high", "xhigh", "max"],
+            ),
+            (
+                "claude-sonnet-5-5",
+                &["low", "medium", "high", "xhigh", "max"],
+            ),
+            (
+                "claude-fable-5-1",
+                &["low", "medium", "high", "xhigh", "max"],
+            ),
+            ("gpt-6-astra", &["low", "medium", "high", "xhigh", "max"]),
+            ("gemini-4-argon", &["low", "medium", "high"]),
+        ];
+        for (family, tiers) in published {
+            let reached: std::collections::BTreeSet<String> = every_effort()
+                .into_iter()
+                .map(|effort| resolve(family, &effort_config(effort)))
+                .collect();
+            let wanted: std::collections::BTreeSet<String> = tiers
+                .iter()
+                .map(|tier| format!("{family}-{tier}"))
+                .collect();
+            // Every variant is reachable and no phantom UID (e.g. "-none") leaks out.
+            assert_eq!(reached, wanted, "{family}");
+        }
+    }
+
+    #[test]
+    fn tiered_family_uses_budget_enabled_and_default_when_effort_is_absent() {
+        let budget = |tokens| ReasoningConfig {
+            budget_tokens: Some(tokens),
+            ..Default::default()
+        };
+        // Same absolute thresholds the other Devin families already use.
+        assert_eq!(
+            resolve("claude-opus-5-5", &budget(2048)),
+            "claude-opus-5-5-low"
+        );
+        assert_eq!(
+            resolve("claude-opus-5-5", &budget(10_000)),
+            "claude-opus-5-5-medium"
+        );
+        assert_eq!(
+            resolve("claude-opus-5-5", &budget(31_999)),
+            "claude-opus-5-5-high"
+        );
+        assert_eq!(
+            resolve("claude-opus-5-5", &budget(64_000)),
+            "claude-opus-5-5-max"
+        );
+        // An explicit Budget effort behaves like budget_tokens.
+        assert_eq!(
+            resolve(
+                "claude-opus-5-5",
+                &effort_config(ReasoningEffort::Budget(10_000))
+            ),
+            "claude-opus-5-5-medium"
+        );
+        // Thinking on without a level means "high"; no directive uses the family default.
+        let enabled = ReasoningConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve("claude-sonnet-5-5", &enabled),
+            "claude-sonnet-5-5-high"
+        );
+        let none = ReasoningConfig::default();
+        assert_eq!(
+            resolve("claude-sonnet-5-5", &none),
+            "claude-sonnet-5-5-medium"
+        );
+        assert_eq!(resolve("gpt-6-astra", &none), "gpt-6-astra-medium");
+        assert_eq!(resolve("gemini-4-argon", &none), "gemini-4-argon-high");
+        // Budget maps past a three-tier family's ceiling onto its top tier.
+        assert_eq!(
+            resolve("gemini-4-argon", &budget(64_000)),
+            "gemini-4-argon-high"
+        );
+    }
+
+    #[test]
+    fn tiered_family_keeps_exact_uids_and_normalises_names() {
+        let max = effort_config(ReasoningEffort::Max);
+        // An explicit tier is a per-variant route and always wins over the body.
+        for uid in [
+            "claude-opus-5-5-low",
+            "claude-opus-5-5-medium",
+            "claude-opus-5-5-high",
+            "claude-opus-5-5-xhigh",
+            "claude-opus-5-5-max",
+            "gemini-4-argon-medium",
+            "gpt-6-astra-low",
+        ] {
+            assert_eq!(resolve(uid, &max), uid);
+        }
+        // Prefix, case and dotted spellings reach the same family.
+        assert_eq!(
+            resolve("devin/claude-opus-5-5", &max),
+            "claude-opus-5-5-max"
+        );
+        assert_eq!(resolve("Claude-Opus-5.5", &max), "claude-opus-5-5-max");
+        assert_eq!(resolve("  gpt-6-astra  ", &max), "gpt-6-astra-max");
+        // Lookalikes are not families and pass through untouched.
+        for other in ["claude-opus-5-55", "claude-opus-5", "gpt-6-astral"] {
+            assert_eq!(resolve(other, &max), other);
+        }
+    }
+
+    #[test]
+    fn tiered_table_is_consistent_with_suggestions() {
+        for tiered in TIERED {
+            assert!(
+                MODELS.contains(&tiered.family),
+                "{} is missing from MODELS",
+                tiered.family
+            );
+            assert!(
+                tiered.tiers.contains(&tiered.default),
+                "{} default is not one of its tiers",
+                tiered.family
+            );
+            assert!(
+                tiered.tiers.windows(2).all(|pair| {
+                    let order = ["none", "minimal", "low", "medium", "high", "xhigh", "max"];
+                    let rank = |tier: &str| order.iter().position(|entry| *entry == tier);
+                    rank(pair[0]) < rank(pair[1])
+                }),
+                "{} tiers must ascend",
+                tiered.family
+            );
+            // The table must not shadow a family with a hand-written arm.
+            let config = ReasoningConfig::default();
+            assert!(
+                resolve(tiered.family, &config).starts_with(tiered.family),
+                "{} must resolve into its own family",
+                tiered.family
+            );
+        }
+        let mut names: Vec<_> = TIERED.iter().map(|tiered| tiered.family).collect();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), TIERED.len(), "duplicate family in TIERED");
     }
 }
