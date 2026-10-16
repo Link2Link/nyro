@@ -44,7 +44,9 @@ use crate::auth::types::{
     StoredCredential,
 };
 use crate::db::models::Provider;
-use crate::provider::google::antigravity::{ANTIGRAVITY_VERSION, X_GOOG_API_CLIENT};
+use crate::provider::google::antigravity::{
+    X_GOOG_API_CLIENT, antigravity_user_agent, antigravity_version,
+};
 use crate::provider::google::gemini_cli::GEMINI_CLI_USER_AGENT;
 use crate::provider::{OAuthConfig, VendorRegistry};
 
@@ -115,9 +117,7 @@ impl GoogleSubscriptionDriver {
     /// Control-plane + inference User-Agent for this channel's client.
     fn user_agent(&self) -> String {
         match self.channel {
-            GoogleSubscriptionChannel::Antigravity => {
-                format!("antigravity/{ANTIGRAVITY_VERSION} windows/amd64")
-            }
+            GoogleSubscriptionChannel::Antigravity => antigravity_user_agent(),
             GoogleSubscriptionChannel::GeminiCli => GEMINI_CLI_USER_AGENT.to_string(),
         }
     }
@@ -362,7 +362,7 @@ impl GoogleSubscriptionDriver {
                     "tier_id": tier_id,
                     "metadata": {
                         "ide_type": "ANTIGRAVITY",
-                        "ide_version": ANTIGRAVITY_VERSION,
+                        "ide_version": antigravity_version(),
                         "ide_name": "antigravity",
                     },
                 }),
@@ -1096,12 +1096,14 @@ mod tests {
             binding.extra_headers.get("authorization").unwrap(),
             "Bearer ya29.token"
         );
-        assert!(
-            binding
-                .extra_headers
-                .get("user-agent")
-                .unwrap()
-                .starts_with("antigravity/2.9.1")
+        // Tests never run the manifest refresh, so the version is exactly
+        // the fallback constant (live refresh would only raise it).
+        assert_eq!(
+            binding.extra_headers.get("user-agent").unwrap(),
+            &format!(
+                "antigravity/{} windows/amd64",
+                crate::provider::google::antigravity::ANTIGRAVITY_FALLBACK_VERSION
+            )
         );
         assert_eq!(
             binding.extra_headers.get("x-goog-api-client").unwrap(),
@@ -1122,6 +1124,9 @@ mod tests {
         // Current-generation flash entries from the subscription catalog.
         assert!(models.iter().any(|m| m == "gemini-3.6-flash-high"));
         assert!(models.iter().any(|m| m == "gemini-3.7-flash-high"));
+        // Gemini 4 Argon rides the subscription surface as of 2026-10.
+        assert!(models.iter().any(|m| m == "gemini-4-argon"));
+        assert!(models.iter().any(|m| m == "gemini-4-argon-high"));
     }
 
     #[test]

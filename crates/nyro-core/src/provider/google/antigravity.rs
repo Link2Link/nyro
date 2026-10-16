@@ -21,6 +21,9 @@
 //! `request.sessionId` derived from the user turn, no
 //! `request.safetySettings`, and the agent-style `requestId`.
 
+use std::sync::{LazyLock, RwLock};
+use std::time::{Duration, Instant};
+
 use anyhow::Result;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -58,6 +61,13 @@ pub(crate) const ANTIGRAVITY_STATIC_MODELS: &[&str] = &[
     "gemini-3.8-flash-medium",
     "gemini-3.8-flash-low",
     "gemini-3.8-flash-tiered",
+    // Gemini 4 Argon (rolled out 2026-10-13 to AI Pro/Ultra subscribers).
+    // The bare id is served as-is; `-high` is the only tier variant the
+    // account catalog advertises so far (mirrors the fetched CLIProxyAPI
+    // registry). Google gates Argon behind a current-generation client —
+    // the versioned User-Agent above must stay fresh for these to route.
+    "gemini-4-argon",
+    "gemini-4-argon-high",
     // Claude 5.5 reasoning tiers (verified 2026-10-04 by direct probes):
     // callable on the inference surface but NOT yet listed by the per-account
     // `fetchAvailableModels` catalog, so the curated list must carry them or
@@ -86,18 +96,140 @@ pub(crate) const ANTIGRAVITY_OAUTH_SCOPES: &str = concat!(
     "https://www.googleapis.com/auth/experimentsandconfigs",
 );
 
-/// Antigravity client version reported in the User-Agent. Cloud Code rejects
-/// newer models for clients below 2.9.0, so keep this at or above 2.9.1.
-/// **Bump this** when Google tightens client gating.
-pub(crate) const ANTIGRAVITY_VERSION: &str = "2.9.1";
+/// Antigravity client version reported in the User-Agent. Cloud Code gates
+/// model access by a client-version floor — sub-2.9.0 clients were rejected
+/// outright, and the Gemini 4 Argon rollout required current-generation
+/// clients. The live version is refreshed from the official hub auto-updater
+/// manifest (see [`refresh_antigravity_version`]); this constant is the
+/// fallback while the manifest has not been fetched (first start) or is
+/// unreachable. **Bump the fallback** when Google tightens client gating.
+pub(crate) const ANTIGRAVITY_FALLBACK_VERSION: &str = "2.24.0";
 const ANTIGRAVITY_PLATFORM: &str = "windows/amd64";
+
+/// Official Antigravity hub auto-updater manifest — the same electron-builder
+/// feed the real IDE polls; carries `version: x.y.z` as its first key.
+/// Surfaced by the CLIProxyAPI `antigravity_version.go` upstream tracker.
+const ANTIGRAVITY_HUB_MANIFEST_URL: &str =
+    "https://antigravity-hub-auto-updater-974169037036.us-central1.run.app/manifest/latest-arm64-mac.yml";
+/// How long a successfully fetched version stays authoritative.
+const ANTIGRAVITY_VERSION_TTL: Duration = Duration::from_secs(6 * 60 * 60);
+/// Cooldown after a failed manifest fetch so offline hosts do not retry
+/// every catalog call (each attempt costs the manifest timeout).
+const ANTIGRAVITY_VERSION_RETRY_AFTER: Duration = Duration::from_secs(10 * 60);
+const ANTIGRAVITY_MANIFEST_TIMEOUT: Duration = Duration::from_secs(10);
+
+#[derive(Debug, Clone)]
+struct AntigravityVersionState {
+    /// Live manifest version, or the fallback before the first success.
+    version: String,
+    /// When `version` was confirmed against the manifest.
+    refreshed_at: Option<Instant>,
+    /// When a refresh was last attempted (success or failure) — drives the
+    /// retry cooldown so the fallback serves without per-call network cost.
+    last_attempt: Option<Instant>,
+}
+
+static ANTIGRAVITY_VERSION_STATE: LazyLock<RwLock<AntigravityVersionState>> =
+    LazyLock::new(|| {
+        RwLock::new(AntigravityVersionState {
+            version: ANTIGRAVITY_FALLBACK_VERSION.to_string(),
+            refreshed_at: None,
+            last_attempt: None,
+        })
+    });
+
+/// Strict `major.minor.patch` (dot-separated numeric triples only) — the
+/// shape the hub manifest guarantees; anything else keeps the fallback.
+fn is_semver_triple(version: &str) -> bool {
+    let mut parts = version.split('.');
+    let mut count = 0;
+    loop {
+        match parts.next() {
+            Some(part) => {
+                count += 1;
+                if count > 3 || part.is_empty() || !part.bytes().all(|b| b.is_ascii_digit()) {
+                    return false;
+                }
+            }
+            None => return count == 3,
+        }
+    }
+}
+
+/// Extract the `version:` value from a hub auto-updater manifest body.
+/// Pure parser, testable without network.
+pub(crate) fn parse_hub_manifest_version(body: &str) -> Option<String> {
+    body.lines().find_map(|line| {
+        let (key, value) = line.split_once(':')?;
+        (key.trim() == "version")
+            .then(|| value.trim().to_string())
+            .filter(|version| is_semver_triple(version))
+    })
+}
+
+/// Current Antigravity client version: the live manifest value while fresh,
+/// else the fallback constant. Synchronous fast path — never blocks, never
+/// dials the network; freshness is advanced by [`refresh_antigravity_version`]
+/// from the periodic catalog/quota flows.
+pub(crate) fn antigravity_version() -> String {
+    ANTIGRAVITY_VERSION_STATE
+        .read()
+        .expect("antigravity version state lock poisoned")
+        .version
+        .clone()
+}
+
+/// Best-effort refresh of the client version from the hub auto-updater
+/// manifest. TTL-gated with a failure cooldown; errors are silently ignored
+/// (the fallback keeps serving). The refreshed version applies to every
+/// User-Agent constructed after this call.
+async fn refresh_antigravity_version(client: &reqwest::Client) {
+    {
+        let state = ANTIGRAVITY_VERSION_STATE
+            .read()
+            .expect("antigravity version state lock poisoned");
+        let now = Instant::now();
+        let fresh = state
+            .refreshed_at
+            .is_some_and(|at| now.duration_since(at) < ANTIGRAVITY_VERSION_TTL);
+        let cooling = state
+            .last_attempt
+            .is_some_and(|at| now.duration_since(at) < ANTIGRAVITY_VERSION_RETRY_AFTER);
+        if fresh || cooling {
+            return;
+        }
+    }
+    let fetched = async {
+        let body = client
+            .get(ANTIGRAVITY_HUB_MANIFEST_URL)
+            .header("User-Agent", "electron-builder")
+            .header("Cache-Control", "no-cache")
+            .timeout(ANTIGRAVITY_MANIFEST_TIMEOUT)
+            .send()
+            .await?
+            .error_for_status()?
+            .text()
+            .await?;
+        Ok::<String, reqwest::Error>(body)
+    }
+    .await;
+    let mut state = ANTIGRAVITY_VERSION_STATE
+        .write()
+        .expect("antigravity version state lock poisoned");
+    state.last_attempt = Some(Instant::now());
+    if let Some(version) = fetched.ok().as_deref().and_then(parse_hub_manifest_version) {
+        tracing::debug!(%version, "antigravity client version refreshed from hub manifest");
+        state.version = version;
+        state.refreshed_at = state.last_attempt;
+    }
+}
 
 /// X-Goog-Api-Client header the Antigravity node client sends on
 /// control-plane calls.
 pub(crate) const X_GOOG_API_CLIENT: &str = "gl-node/22.21.1";
 
 pub(crate) fn antigravity_user_agent() -> String {
-    format!("antigravity/{ANTIGRAVITY_VERSION} {ANTIGRAVITY_PLATFORM}")
+    format!("antigravity/{} {}", antigravity_version(), ANTIGRAVITY_PLATFORM)
 }
 
 /// Inference base URL for the antigravity channel. Consumer (Google AI
@@ -158,6 +290,12 @@ pub(crate) async fn fetch_available_models(
     project_id: &str,
     user_agent: &str,
 ) -> Result<Vec<AvailableModel>> {
+    // Catalog calls are the natural heartbeat of the subscription channels
+    // (token exchange/refresh, model probing, usage polling) — piggyback the
+    // client-version refresh on them. The refreshed version applies to every
+    // User-Agent constructed after this call; `user_agent` was already built
+    // by the caller and keeps the pre-refresh version for this one request.
+    refresh_antigravity_version(client).await;
     let endpoint = "https://cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels";
     let response = client
         .post(endpoint)
@@ -838,6 +976,98 @@ pub(crate) fn build_v1internal_url(base_url: &str, codec_path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hub_manifest_version_parses_semver_from_updater_feed() {
+        let feed = concat!(
+            "version: 2.24.0\n",
+            "files:\n",
+            "  - url: https://storage.googleapis.com/antigravity-public/x.zip\n",
+            "sha512: base64==\n",
+        );
+        assert_eq!(
+            parse_hub_manifest_version(feed).as_deref(),
+            Some("2.24.0")
+        );
+        // Whitespace-tolerant, first match wins.
+        assert_eq!(
+            parse_hub_manifest_version("  version:   9.9.9  \nversion: 1.0.0").as_deref(),
+            Some("9.9.9")
+        );
+        // Non-semver values keep the fallback (never served live).
+        for rejected in ["", "2.24", "2.24.0.1", "2.24.0-beta", "v2.24.0", "x.y.z"] {
+            let body = format!("version: {rejected}\n");
+            assert_eq!(parse_hub_manifest_version(&body), None, "{rejected:?}");
+        }
+        // Unrelated keys / empty bodies.
+        assert_eq!(parse_hub_manifest_version("path: Antigravity.zip"), None);
+        assert_eq!(parse_hub_manifest_version(""), None);
+    }
+
+    #[test]
+    fn antigravity_user_agent_carries_current_version_shape() {
+        // Tests never run the manifest refresh, so the version is exactly
+        // the fallback constant; live refresh can only raise it, and the
+        // shape (id + semver + platform) is what Cloud Code gates on.
+        assert_eq!(
+            antigravity_user_agent(),
+            format!("antigravity/{ANTIGRAVITY_FALLBACK_VERSION} windows/amd64")
+        );
+        assert!(is_semver_triple(&antigravity_version()));
+    }
+
+    #[test]
+    fn static_models_carry_gemini_4_argon() {
+        // Argon rides the subscription surface (rolled out 2026-10-13 to
+        // AI Pro/Ultra); the bare id plus the one advertised tier variant
+        // must survive discovery even when the dynamic catalog is stale.
+        assert!(ANTIGRAVITY_STATIC_MODELS.contains(&"gemini-4-argon"));
+        assert!(ANTIGRAVITY_STATIC_MODELS.contains(&"gemini-4-argon-high"));
+        // And it is not filtered as unavailable/usage noise anywhere.
+        assert!(!is_unavailable_subscription_model("gemini-4-argon"));
+        assert!(!is_unavailable_subscription_model("gemini-4-argon-high"));
+    }
+
+    #[test]
+    fn argon_respects_catalog_gated_tier_rewrite() {
+        // Bare id served as-is (mirrors the fetched CLIProxyAPI registry)
+        // → never rewritten, whatever the effort.
+        let served: Vec<String> = ["gemini-4-argon", "gemini-4-argon-high"]
+            .iter()
+            .map(|id| id.to_string())
+            .collect();
+        assert_eq!(
+            resolve_tiered_model("gemini-4-argon", &reasoning(Some(crate::protocol::ir::ReasoningEffort::High)), &served),
+            None
+        );
+        // Explicit tier id → caller's choice, never rewritten either.
+        assert_eq!(
+            resolve_tiered_model("gemini-4-argon-high", &reasoning(None), &served),
+            None
+        );
+        // If the account catalog only exposes `-high` while the bare id is
+        // absent (early rollout accounts), a high-effort request lands on
+        // it via the HIGH ladder.
+        let high_only: Vec<String> = ["gemini-4-argon-high"]
+            .iter()
+            .map(|id| id.to_string())
+            .collect();
+        assert_eq!(
+            resolve_tiered_model("gemini-4-argon", &reasoning(Some(crate::protocol::ir::ReasoningEffort::High)), &high_only).as_deref(),
+            Some("gemini-4-argon-high")
+        );
+        // Lower efforts never get force-upgraded to a higher tier: their
+        // ladders do not include `-high`, so the rewrite fails safe and the
+        // bare id is sent as-is for upstream to answer honestly.
+        assert_eq!(
+            resolve_tiered_model("gemini-4-argon", &reasoning(Some(crate::protocol::ir::ReasoningEffort::Low)), &high_only),
+            None
+        );
+        assert_eq!(
+            resolve_tiered_model("gemini-4-argon", &reasoning(None), &high_only),
+            None
+        );
+    }
 
     #[test]
     fn wrap_request_builds_v1internal_envelope() {
