@@ -1120,13 +1120,17 @@ mod tests {
             Some("ai://models.dev/google")
         );
         let models = binding.static_models_override.unwrap();
-        assert!(models.iter().any(|m| m == "gemini-2.5-pro"));
-        // Current-generation flash entries from the subscription catalog.
-        assert!(models.iter().any(|m| m == "gemini-3.6-flash-high"));
-        assert!(models.iter().any(|m| m == "gemini-3.7-flash-high"));
+        // Active catalog generations only: 3.8 flash tiers and Argon.
+        assert!(models.iter().any(|m| m == "gemini-3.8-flash-high"));
+        assert!(models.iter().any(|m| m == "gemini-3.8-flash-tiered"));
         // Gemini 4 Argon rides the subscription surface as of 2026-10.
         assert!(models.iter().any(|m| m == "gemini-4-argon"));
         assert!(models.iter().any(|m| m == "gemini-4-argon-high"));
+        // Retired lines stay out of the fallback list — dynamic discovery
+        // resurfaces them per-account when still served.
+        assert!(!models.iter().any(|m| *m == "gemini-2.5-pro"));
+        assert!(!models.iter().any(|m| m == "gemini-3.6-flash-high"));
+        assert!(!models.iter().any(|m| m == "gemini-3.7-flash-high"));
     }
 
     #[test]

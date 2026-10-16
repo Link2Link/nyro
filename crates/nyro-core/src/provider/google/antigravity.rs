@@ -35,25 +35,10 @@ use crate::db::models::Provider;
 /// per-account list is fetched at runtime via
 /// `v1internal:fetchAvailableModels` (see `fetch_available_models`); this
 /// static list only backs discovery when that call is unavailable and
-/// mirrors the catalog the references currently ship (CLIProxyAPI
-/// antigravity registry). New upstream models land through dynamic
-/// discovery long before this list needs a bump.
+/// carries the active catalog generations only — retired lines
+/// (Gemini 2.5/3.0/3.1/3.6/3.7) resurface through dynamic discovery when an
+/// account still serves them, so they are deliberately absent here.
 pub(crate) const ANTIGRAVITY_STATIC_MODELS: &[&str] = &[
-    "gemini-2.5-pro",
-    "gemini-2.5-flash",
-    "gemini-2.5-flash-image",
-    "gemini-3-pro-preview",
-    "gemini-3-flash-preview",
-    "gemini-3.1-pro-preview",
-    // Current subscription catalog: reasoning-tier suffixes are part of the
-    // upstream model id (`-high` / `-low` select the thinking level).
-    "gemini-3-flash",
-    "gemini-3.1-flash-lite",
-    "gemini-3.1-flash-image",
-    "gemini-3.1-pro-low",
-    "gemini-pro-agent",
-    "gemini-3.6-flash-high",
-    "gemini-3.7-flash-high",
     // gemini-3.8-flash is served only through its reasoning-tier variants on
     // this surface; the bare family id stays routable as a virtual alias
     // (see `apply_tier_model_rewrite`).
