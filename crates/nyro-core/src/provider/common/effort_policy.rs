@@ -264,10 +264,10 @@ fn is_off_effort(effort: &str) -> bool {
 /// 决策整体上提一档）：
 ///
 /// - `budget_tokens` 按阈值表换算为 `output_config.effort` 档位：
-///   `≤1024→medium, ≤8192→high, >8192→xhigh`。相比 CPA 原表
+///   `≤1024→medium, ≤8192→high, ≤10240→xhigh, >10240→max`。相比 CPA 原表
 ///   （≤1024→low, ≤8192→medium, ≤24576→high, >24576→xhigh）每档上提
-///   一级：Claude Code 的预算语义偏保守（16384 常用档只换来 medium/
-///   high），映射到 5.5 档位时按高一档还原思考强度（16384 → xhigh）。
+///   一级并新增顶格 max：Claude Code 的预算语义偏保守（16384 常用档只换
+///   来 medium/high），映射到 5.5 档位时按高一档还原思考强度（16384 → max）。
 ///   `-1`（CPA 的 auto 兼容值）与缺失/非正预算 → adaptive 不带 effort。
 /// - `display` 等兄弟键保留（adaptive 接受 display，Claude Code 的
 ///   思考摘要显示不受影响）。

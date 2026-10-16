@@ -726,7 +726,7 @@ fn each_protocol_provider_selects_own_native() {
 /// `claude-sonnet-5-5 requires adaptive thinking or thinking.type=
 /// between_tools; omit thinking or use one of those modes`。Anthropic 原生
 /// 直通必须改写：enabled+budget → adaptive+output_config.effort
-/// （16384 → xhigh，档位换算整体上提一档），display 保留；非 5.5 模型
+/// （16384 → max，档位换算整体上提一档），display 保留；非 5.5 模型
 /// 保持逐字直通。
 #[tokio::test]
 async fn passthrough_rewrites_legacy_thinking_for_claude_55() {
