@@ -321,6 +321,13 @@ export interface ModelUsageStats {
   average_first_token_ms?: number | null;
 }
 
+/** API-equivalent value in one native currency (current rates, not an invoice). */
+export interface EquivalentCostTotal {
+  currency: string;
+  total_cost: number;
+  priced_request_count: number;
+}
+
 export interface ProviderStats extends TpsSampleSums {
   provider_id: string;
   provider: string;
@@ -331,6 +338,9 @@ export interface ProviderStats extends TpsSampleSums {
   avg_duration_ms: number;
   total_output_tokens: number;
   total_upstream_ms: number;
+  /** Missing on older servers. */
+  equivalent_costs?: EquivalentCostTotal[];
+  unpriced_request_count?: number;
 }
 
 export interface ProviderModelUsageStats extends TpsSampleSums {
@@ -344,6 +354,8 @@ export interface ProviderModelUsageStats extends TpsSampleSums {
   avg_first_token_ms?: number | null;
   total_upstream_ms: number;
   last_used_at?: number | null;
+  equivalent_costs?: EquivalentCostTotal[];
+  unpriced_request_count?: number;
 }
 
 export interface ProviderUsageDetail extends TpsSampleSums {
@@ -369,6 +381,8 @@ export interface ProviderUsageDetail extends TpsSampleSums {
   total_upstream_ms: number;
   last_used_at?: number | null;
   models: ProviderModelUsageStats[];
+  equivalent_costs?: EquivalentCostTotal[];
+  unpriced_request_count?: number;
 }
 
 export interface ApiKeyStats {

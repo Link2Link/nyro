@@ -1809,6 +1809,8 @@ impl LogStore for SqliteLogStore {
             last_used_at: summary.last_used_at,
             tps_totals: summary.tps_totals,
             models,
+            equivalent_costs: Vec::new(),
+            unpriced_request_count: 0,
         })
     }
 

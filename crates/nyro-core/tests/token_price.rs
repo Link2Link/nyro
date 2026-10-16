@@ -879,3 +879,88 @@ fn token_price_old_cost_json_defaults_to_automatic() -> anyhow::Result<()> {
     assert!(!cost.is_manual);
     Ok(())
 }
+
+/// Insert a completed attempt at `age_hours` ago (rolling-window tests).
+async fn recent_log(
+    storage: &SqliteStorage,
+    provider: &str,
+    model: &str,
+    age_hours: i64,
+) -> anyhow::Result<()> {
+    let at = chrono::Utc::now().timestamp_millis() - age_hours * 3_600_000 - 60_000;
+    sqlx::query("INSERT INTO request_logs (id, created_at, provider_id, upstream_model, input_tokens, output_tokens, cache_read_tokens, upstream_status_code, client_status_code, outcome_version, attempt_outcome) VALUES (?, ?, ?, ?, 1000000, 500000, 250000, 200, 200, 1, 'completed')")
+        .bind(uuid::Uuid::new_v4().to_string()).bind(at)
+        .bind(provider).bind(model).execute(storage.pool()).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn provider_stats_and_detail_carry_equivalent_api_price() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let (gw, storage) = open(dir.path()).await?;
+    let id = provider(&storage, "BigModel", "https://open.bigmodel.cn/api/paas/v4").await?;
+    let admin = gw.admin();
+    // Two priced attempts in the 24h window, one priced attempt outside it, and
+    // one model with no reference price.
+    recent_log(&storage, &id, "glm-5.3", 1).await?;
+    recent_log(&storage, &id, "glm-5.3", 2).await?;
+    recent_log(&storage, &id, "glm-5.3", 100).await?;
+    recent_log(&storage, &id, "unpriced-model", 3).await?;
+
+    let stats = admin.get_stats_by_provider(Some(24)).await?;
+    let item = stats.iter().find(|s| s.provider_id == id).unwrap();
+    assert_eq!(item.request_count, 3, "window excludes the 100h-old attempt");
+    assert_eq!(item.unpriced_request_count, 1);
+    assert_eq!(item.equivalent_costs.len(), 1);
+    let total = &item.equivalent_costs[0];
+    assert_eq!(total.currency, "CNY");
+    assert_eq!(total.priced_request_count, 2);
+    // 1M gross input (250k cached) + 500k output, per attempt, at the registered
+    // native CNY rates for glm-5.3: input 8.0, cache hit 2.3, output 28.0.
+    let one = 750_000.0 / 1e6 * 8.0 + 250_000.0 / 1e6 * 2.3 + 500_000.0 / 1e6 * 28.0;
+    assert!((total.total_cost - 2.0 * one).abs() < 1e-9, "{}", total.total_cost);
+    // A wider window picks up the older attempt as well.
+    let wide = admin.get_stats_by_provider(Some(720)).await?;
+    let wide = wide.iter().find(|s| s.provider_id == id).unwrap();
+    assert_eq!(wide.equivalent_costs[0].priced_request_count, 3);
+    assert_eq!(wide.unpriced_request_count, 1);
+
+    let detail = admin.get_provider_usage_detail(&id, Some(24)).await?;
+    assert_eq!(detail.request_count, 3);
+    assert_eq!(detail.unpriced_request_count, 1);
+    assert_eq!(detail.equivalent_costs, item.equivalent_costs);
+    let glm = detail.models.iter().find(|m| m.upstream_model == "glm-5.3").unwrap();
+    assert_eq!(glm.equivalent_costs, item.equivalent_costs);
+    assert_eq!(glm.unpriced_request_count, 0);
+    let unpriced = detail
+        .models
+        .iter()
+        .find(|m| m.upstream_model == "unpriced-model")
+        .unwrap();
+    assert!(unpriced.equivalent_costs.is_empty());
+    assert_eq!(unpriced.unpriced_request_count, 1);
+    // Per-model totals add up to the provider total.
+    let by_model: f64 = detail
+        .models
+        .iter()
+        .flat_map(|m| &m.equivalent_costs)
+        .map(|c| c.total_cost)
+        .sum();
+    assert!((by_model - detail.equivalent_costs[0].total_cost).abs() < 1e-9);
+
+    // A manual price takes precedence and flows through to both views.
+    admin
+        .set_token_price(input(&id, "glm-5.3", Some(rates(2.0, 8.0, Some(1.0)))))
+        .await?;
+    let manual = admin.get_provider_usage_detail(&id, Some(24)).await?;
+    assert_eq!(manual.equivalent_costs[0].currency, "USD");
+    let manual_one = 750_000.0 / 1e6 * 2.0 + 250_000.0 / 1e6 * 1.0 + 500_000.0 / 1e6 * 8.0;
+    assert!((manual.equivalent_costs[0].total_cost - 2.0 * manual_one).abs() < 1e-9);
+
+    // Wire format: the UI reads these exact field names.
+    let json = serde_json::to_value(&manual)?;
+    assert!(json["equivalent_costs"][0]["total_cost"].is_number());
+    assert_eq!(json["unpriced_request_count"], 1);
+    assert!(json["models"][0].get("equivalent_costs").is_some());
+    Ok(())
+}

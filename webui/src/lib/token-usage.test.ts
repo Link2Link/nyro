@@ -1,6 +1,6 @@
 import { deepEqual, equal } from "node:assert/strict";
 import { test } from "node:test";
-import { compactUsageCost, formatUsageCost, groupTokenModels, groupUsageModelFamilies, sumTokenUsage, sumUsageCost, tokenCalendar, tokenDays, tokenHeat, tokenModelKey, usageBaseModel, usageCurrencies, usageCurrencyFactor } from "./token-usage";
+import { compactUsageCost, equivalentCostDisplay, formatUsageCost, groupTokenModels, groupUsageModelFamilies, sumTokenUsage, sumUsageCost, tokenCalendar, tokenDays, tokenHeat, tokenModelKey, usageBaseModel, usageCurrencies, usageCurrencyFactor } from "./token-usage";
 import type { TokenUsageCost, TokenUsageDay } from "./types";
 
 const cost = (overrides: Partial<TokenUsageCost> = {}): TokenUsageCost => ({
@@ -336,4 +336,36 @@ test("heat scale distinguishes empty days and stays within the legend", () => {
   equal(tokenHeat(1, 100), 1);
   equal(tokenHeat(100, 100), 5);
   equal(tokenHeat(200, 100), 5);
+});
+
+test("equivalent cost display keeps one currency native and merges several into USD", () => {
+  const none = equivalentCostDisplay([], 0, false);
+  equal(none.text, "—");
+  equal(none.priced, false);
+  equal(equivalentCostDisplay(undefined, undefined, true).text, "—");
+
+  const usd = equivalentCostDisplay([{ currency: "USD", total_cost: 12.5, priced_request_count: 3 }], 0, false);
+  equal(usd.text, "$12.50");
+  equal(usd.priced, true);
+
+  const cny = equivalentCostDisplay([{ currency: "CNY", total_cost: 70, priced_request_count: 1 }], 0, false);
+  equal(cny.text, "¥70.00");
+
+  const mixed = equivalentCostDisplay([
+    { currency: "CNY", total_cost: 70, priced_request_count: 1 },
+    { currency: "USD", total_cost: 5, priced_request_count: 2 },
+  ], 0, false);
+  equal(mixed.text, "$15.00");
+  equal(mixed.title.includes("¥70.00 CNY + $5.00 USD"), true);
+
+  // Unpriced attempts are flagged, never silently counted as free.
+  const partial = equivalentCostDisplay([{ currency: "USD", total_cost: 1, priced_request_count: 1 }], 4, true);
+  equal(partial.text, "$1.00 *");
+  equal(partial.title.includes("4 次尝试未计价"), true);
+  equal(equivalentCostDisplay([], 4, false).title.includes("4 attempts unpriced"), true);
+
+  // Tiny nonzero values are preserved rather than shown as free.
+  equal(equivalentCostDisplay([{ currency: "USD", total_cost: 0.001, priced_request_count: 1 }], 0, false).text, "<$0.01");
+  // A priced zero is a real price, distinct from "no price".
+  equal(equivalentCostDisplay([{ currency: "USD", total_cost: 0, priced_request_count: 1 }], 0, false).text, "$0.00");
 });

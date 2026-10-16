@@ -4,7 +4,9 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use crate::db::models::{ModelCapabilities, Provider, TokenUsageCost, TokenUsageDay};
+use crate::db::models::{
+    EquivalentCostTotal, ModelCapabilities, Provider, TokenUsageCost, TokenUsageDay,
+};
 use crate::provider::metadata::CapabilitiesSource;
 
 use super::model_catalog::{
@@ -176,6 +178,19 @@ pub(super) fn resolve_pricing(
         return None;
     }
     let catalog = catalog?;
+    // Same-named models share one price across providers: the official API
+    // price wins over whatever a reseller/proxy catalogue lists. Only when the
+    // official vendor's catalogue has no such model do we fall back to the
+    // provider's own entry below. An ambiguous or invalid official match is
+    // left unpriced rather than silently falling to a reseller's rate.
+    let official = official_model(model);
+    if let Some((vendor, official_id)) = official {
+        match catalog.resolve(official_id, Some(vendor)) {
+            Err(()) => return None,
+            Ok(Some(cap)) => return Pricing::from_capability(cap),
+            Ok(None) => {}
+        }
+    }
     let preset_vendor = match preset_capabilities_source(provider) {
         CapabilitiesSource::ModelsDev(vendor) if !vendor.is_empty() => Some(vendor),
         _ => None,
@@ -197,11 +212,10 @@ pub(super) fn resolve_pricing(
             return Pricing::from_capability(cap);
         }
     }
-    if let Some((vendor, official_id)) = official_model(model) {
-        return catalog
-            .resolve(official_id, Some(vendor))
-            .ok()?
-            .and_then(Pricing::from_capability);
+    if official.is_some() {
+        // Family-hinted model absent from both the official and the
+        // provider's catalogue: never guess from an unrelated vendor.
+        return None;
     }
     catalog
         .resolve(model, None)
@@ -239,6 +253,35 @@ pub(super) fn enrich_token_costs(
         // totals, the estimate includes only known partial values in that row.
         row.cost = pricing.as_ref().and_then(|pricing| pricing.cost(row));
     }
+}
+
+/// Sum already-enriched rows per native currency (never converting between
+/// currencies) and count attempts that have no reliable price. Sorted by currency
+/// so the output is deterministic.
+pub(super) fn summarize_costs<'a>(
+    rows: impl IntoIterator<Item = &'a TokenUsageDay>,
+) -> (Vec<EquivalentCostTotal>, i64) {
+    let mut by_currency: std::collections::BTreeMap<&str, (f64, i64)> = Default::default();
+    let mut unpriced = 0;
+    for row in rows {
+        match &row.cost {
+            Some(cost) => {
+                let entry = by_currency.entry(cost.currency.as_str()).or_default();
+                entry.0 += cost.total_cost;
+                entry.1 += row.request_count;
+            }
+            None => unpriced += row.request_count,
+        }
+    }
+    let totals = by_currency
+        .into_iter()
+        .map(|(currency, (total_cost, priced_request_count))| EquivalentCostTotal {
+            currency: currency.to_string(),
+            total_cost,
+            priced_request_count,
+        })
+        .collect();
+    (totals, unpriced)
 }
 
 #[cfg(test)]

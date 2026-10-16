@@ -1368,6 +1368,23 @@ pub struct ProviderStats {
     #[sqlx(flatten)]
     #[serde(flatten)]
     pub tps_totals: TpsTotals,
+    /// API-equivalent value of this window's known tokens, one entry per native
+    /// currency (never merged here). Filled by the admin service, not SQL.
+    #[serde(default)]
+    #[sqlx(skip)]
+    pub equivalent_costs: Vec<EquivalentCostTotal>,
+    /// Attempts in the window without a reliable price (excluded from the totals above).
+    #[serde(default)]
+    #[sqlx(skip)]
+    pub unpriced_request_count: i64,
+}
+
+/// Summed API-equivalent value in one native currency, not an invoice.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EquivalentCostTotal {
+    pub currency: String,
+    pub total_cost: f64,
+    pub priced_request_count: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1400,6 +1417,13 @@ pub struct ProviderUsageDetail {
     #[serde(flatten)]
     pub tps_totals: TpsTotals,
     pub models: Vec<ProviderModelUsageStats>,
+    /// API-equivalent value of this window's known tokens per native currency;
+    /// filled by the admin service. Not an invoice.
+    #[serde(default)]
+    pub equivalent_costs: Vec<EquivalentCostTotal>,
+    /// Attempts in the window without a reliable price (not in `equivalent_costs`).
+    #[serde(default)]
+    pub unpriced_request_count: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
@@ -1418,6 +1442,13 @@ pub struct ProviderModelUsageStats {
     #[sqlx(flatten)]
     #[serde(flatten)]
     pub tps_totals: TpsTotals,
+    /// API-equivalent value per native currency; filled by the admin service.
+    #[serde(default)]
+    #[sqlx(skip)]
+    pub equivalent_costs: Vec<EquivalentCostTotal>,
+    #[serde(default)]
+    #[sqlx(skip)]
+    pub unpriced_request_count: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

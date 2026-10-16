@@ -333,7 +333,52 @@ impl AdminService {
                 item.provider_protocol = Some(provider.protocol.clone());
             }
         }
+        // Price the same window the SQL above used; a pricing failure must not
+        // take down the rest of the provider statistics.
+        let now = Utc::now().timestamp_millis();
+        let start_at = Self::normalize_hours(hours)
+            .map_or(0, |hours| now - i64::from(hours) * MILLIS_PER_HOUR);
+        match self
+            .priced_usage_rows(start_at, now.saturating_add(1), &providers)
+            .await
+        {
+            Ok(rows) => {
+                for item in &mut stats {
+                    let (costs, unpriced) = super::token_cost::summarize_costs(
+                        rows.iter().filter(|row| row.provider_id == item.provider_id),
+                    );
+                    item.equivalent_costs = costs;
+                    item.unpriced_request_count = unpriced;
+                }
+            }
+            Err(error) => tracing::warn!(%error, "equivalent API price unavailable for provider stats"),
+        }
         Ok(stats)
+    }
+
+    /// Per provider/upstream-model/UTC-day usage over [start_at, end_at) with
+    /// API-equivalent costs attached (manual overrides first, then catalogue).
+    async fn priced_usage_rows(
+        &self,
+        start_at: i64,
+        end_at: i64,
+        providers: &HashMap<String, Provider>,
+    ) -> anyhow::Result<Vec<TokenUsageDay>> {
+        let mut rows = self
+            .gw
+            .storage
+            .logs()
+            .token_usage_days(start_at, end_at)
+            .await?;
+        let overrides =
+            super::token_price::parse_overrides(self.gw.storage.settings().list_all().await?)?;
+        super::token_cost::enrich_token_costs(
+            &mut rows,
+            providers,
+            &self.gw.config.data_dir,
+            &overrides,
+        );
+        Ok(rows)
     }
 
     pub async fn get_provider_usage_detail(
@@ -354,6 +399,39 @@ impl AdminService {
             detail.provider_name = provider.name;
             detail.provider_icon = provider.preset_key.or(provider.vendor);
             detail.provider_protocol = Some(provider.protocol);
+        }
+        // Only this provider's rows matter; price them against its current record.
+        let providers: HashMap<String, Provider> = self
+            .gw
+            .storage
+            .providers()
+            .list()
+            .await?
+            .into_iter()
+            .filter(|provider| provider.id == provider_id)
+            .map(|provider| (provider.id.clone(), provider))
+            .collect();
+        match self
+            .priced_usage_rows(start_at, end_at.saturating_add(1), &providers)
+            .await
+        {
+            Ok(rows) => {
+                let rows: Vec<_> = rows
+                    .into_iter()
+                    .filter(|row| row.provider_id == provider_id)
+                    .collect();
+                let (costs, unpriced) = super::token_cost::summarize_costs(&rows);
+                detail.equivalent_costs = costs;
+                detail.unpriced_request_count = unpriced;
+                for model in &mut detail.models {
+                    let (costs, unpriced) = super::token_cost::summarize_costs(
+                        rows.iter().filter(|row| row.model == model.upstream_model),
+                    );
+                    model.equivalent_costs = costs;
+                    model.unpriced_request_count = unpriced;
+                }
+            }
+            Err(error) => tracing::warn!(%error, "equivalent API price unavailable for provider detail"),
         }
         Ok(detail)
     }

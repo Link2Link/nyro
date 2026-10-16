@@ -7,6 +7,7 @@ import {
   ChevronLeft,
   ChevronRight,
   Clock3,
+  Coins,
   Gauge,
   Loader2,
   Radio,
@@ -29,6 +30,7 @@ import {
   tpsMetricTitle,
 } from "@/lib/format";
 import { useLocale } from "@/lib/i18n";
+import { equivalentCostDisplay } from "@/lib/token-usage";
 import {
   outcomeFilterValue,
   outcomeQuery,
@@ -547,6 +549,7 @@ function Overview({
     ),
   );
   const tps = computeAggregateTps(detail);
+  const totalPrice = equivalentCostDisplay(detail.equivalent_costs, detail.unpriced_request_count, zh);
   const cards = [
     {
       label: zh ? "尝试" : "Attempts",
@@ -609,6 +612,14 @@ function Overview({
       value: formatTokenCount(detail.total_output_tokens),
       icon: Zap,
       color: "from-teal-50 to-emerald-100 text-emerald-600",
+    },
+    {
+      label: zh ? "等额 API 价格" : "Equivalent API Price",
+      value: totalPrice.text,
+      title: totalPrice.title,
+      note: zh ? "官方 API 定价折算，非实际账单" : "At official API prices, not a bill",
+      icon: Coins,
+      color: "from-yellow-50 to-amber-100 text-amber-600",
     },
     {
       label: zh ? "平均延迟" : "Avg Latency",
@@ -690,13 +701,14 @@ function Overview({
           <State icon={Route} text={zh ? "暂无模型数据。" : "No model data."} />
         ) : (
           <div className="max-h-[360px] overflow-auto rounded-xl border border-slate-200">
-            <table className="w-full min-w-[1050px] text-left">
+            <table className="w-full min-w-[1180px] text-left">
               <thead className="sticky top-0 z-10 bg-slate-50 text-[11px] uppercase text-slate-500">
                 <tr>
                   <th className="px-4 py-3">{zh ? "上游模型" : "Upstream Model"}</th>
                   <th className="px-3 py-3">{zh ? "尝试数 / 份额" : "Attempts / Share"}</th>
                   <th className="px-3 py-3 text-right">{zh ? "错误尝试 / 占比" : "Error Attempts / Rate"}</th>
                   <th className="px-3 py-3 text-right">{zh ? "Token (入/缓存/出)" : "Tokens (in/cache/out)"}</th>
+                  <th className="px-3 py-3 text-right">{zh ? "等额 API 价格" : "Equivalent API Price"}</th>
                   <th className="px-3 py-3 text-right">{zh ? "延迟" : "Latency"}</th>
                   <th className="px-3 py-3 text-right">TTFT</th>
                   <th
@@ -718,6 +730,7 @@ function Overview({
                     ? (item.error_count / item.request_count) * 100
                     : null;
                   const modelTps = computeAggregateTps(item);
+                  const modelPrice = equivalentCostDisplay(item.equivalent_costs, item.unpriced_request_count, zh);
                   const filterable = item.upstream_model.length > 0;
                   const interactionProps = filterable
                     ? {
@@ -770,6 +783,9 @@ function Overview({
                         {formatTokenCount(item.total_input_tokens)} /{" "}
                         {formatTokenCount(item.total_cache_read_tokens)} /{" "}
                         {formatTokenCount(item.total_output_tokens)}
+                      </td>
+                      <td className="px-3 py-3 text-right text-xs tabular-nums" title={modelPrice.title}>
+                        {modelPrice.text}
                       </td>
                       <td className="px-3 py-3 text-right text-xs">
                         {formatDuration(item.avg_duration_ms)}

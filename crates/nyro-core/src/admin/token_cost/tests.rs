@@ -236,13 +236,19 @@ fn popular_models_through_proxies_and_oauth_require_official_base_match() {
             .provider,
         "openai"
     );
-    // Explicit reseller preference takes precedence over family hints.
+    // Same-named models share the official API price on every provider; a
+    // reseller's own catalogue rate never overrides it.
     p = provider(Some("reseller"));
+    for model in ["gpt-known", "claude-known"] {
+        let price = resolve_pricing(Some(&catalog), &p, model).unwrap();
+        assert_ne!(price.input, 99.0, "{model}");
+        assert_ne!(price.provider, "reseller", "{model}");
+    }
     assert_eq!(
         resolve_pricing(Some(&catalog), &p, "gpt-known")
             .unwrap()
             .input,
-        99.0
+        2.0
     );
 }
 
@@ -313,12 +319,40 @@ fn subscription_zero_placeholders_use_api_base_references_or_remain_unpriced() {
 }
 
 #[test]
-fn invalid_preferred_rates_do_not_fall_through_to_another_provider() {
+fn invalid_reseller_rates_are_ignored_in_favor_of_official_price() {
     let (_dir, catalog) = catalog(json!({
         "openai": {"models": {"gpt-known": {"id": "gpt-known", "cost": {"input": 2, "output": 8}}}},
         "reseller": {"models": {"gpt-known": {"id": "gpt-known", "cost": {"input": -1, "output": 4}}}}
     }));
+    let price = resolve_pricing(Some(&catalog), &provider(Some("reseller")), "gpt-known").unwrap();
+    assert_eq!((price.provider.as_str(), price.input), ("openai", 2.0));
+}
+
+#[test]
+fn invalid_official_rates_do_not_fall_through_to_reseller() {
+    let (_dir, catalog) = catalog(json!({
+        "openai": {"models": {"gpt-known": {"id": "gpt-known", "cost": {"input": -1, "output": 8}}}},
+        "reseller": {"models": {"gpt-known": {"id": "gpt-known", "cost": {"input": 3, "output": 4}}}}
+    }));
     assert!(resolve_pricing(Some(&catalog), &provider(Some("reseller")), "gpt-known").is_none());
+}
+
+#[test]
+fn reseller_only_model_with_official_family_hint_stays_unpriced_even_for_that_reseller() {
+    let (_dir, catalog) = catalog(json!({
+        "openai": {"models": {"gpt-known": {"id": "gpt-known", "cost": {"input": 2, "output": 8}}}},
+        "reseller": {"models": {"gpt-reseller-only": {"id": "gpt-reseller-only", "cost": {"input": 3, "output": 4}}}}
+    }));
+    // Not in the official catalogue: fall back to the provider's own entry.
+    let price = resolve_pricing(
+        Some(&catalog),
+        &provider(Some("reseller")),
+        "gpt-reseller-only",
+    )
+    .unwrap();
+    assert_eq!((price.provider.as_str(), price.input), ("reseller", 3.0));
+    // But a provider without that vendor still cannot guess a reseller rate.
+    assert!(resolve_pricing(Some(&catalog), &provider(None), "gpt-reseller-only").is_none());
 }
 
 #[test]
@@ -343,7 +377,7 @@ fn case_collisions_and_inconsistent_catalog_ids_are_unpriced() {
 }
 
 #[test]
-fn ambiguous_preferred_vendor_does_not_fall_through_to_official_price() {
+fn ambiguous_reseller_entries_do_not_affect_official_price() {
     let (_dir, catalog) = catalog(json!({
         "reseller": {"models": {
             "gpt-known": {"id": "gpt-known", "cost": {"input": 1, "output": 2}},
@@ -351,7 +385,8 @@ fn ambiguous_preferred_vendor_does_not_fall_through_to_official_price() {
         }},
         "openai": {"models": {"gpt-known": {"id": "gpt-known", "cost": {"input": 5, "output": 6}}}}
     }));
-    assert!(resolve_pricing(Some(&catalog), &provider(Some("reseller")), "gpt-known").is_none());
+    let price = resolve_pricing(Some(&catalog), &provider(Some("reseller")), "gpt-known").unwrap();
+    assert_eq!((price.provider.as_str(), price.input), ("openai", 5.0));
 }
 
 #[test]
@@ -396,9 +431,12 @@ fn native_bigmodel_is_cny_exact_then_longest_and_does_not_leak_to_zai_or_spoof_u
         "not a URL bigmodel.cn",
     ] {
         p.base_url = url.into();
+        // Not a real bigmodel.cn base: no native CNY table. The glm family
+        // maps to its official vendor (zai), regardless of provider vendor.
         let price = resolve_pricing(Some(&catalog), &p, "glm-5.3").unwrap();
         assert_eq!(price.currency, "USD", "{url}");
-        assert_eq!(price.input, 1.4);
+        assert_eq!(price.provider, "zai", "{url}");
+        assert_eq!(price.input, 1.5);
     }
     p.vendor = Some("zai".into());
     p.base_url = "https://api.z.ai/api/paas/v4".into();
@@ -626,4 +664,36 @@ fn serde_contract_defaults_absent_cost_and_keeps_null_distinct_from_zero() {
             "total_cost"
         ]
     );
+}
+
+#[test]
+fn summarize_costs_sums_per_native_currency_and_counts_unpriced() {
+    let priced = |currency: &str, input: f64, count: i64| {
+        let mut r = row(1_000_000, 0, 0);
+        r.request_count = count;
+        let mut p = Pricing::from_capability(&capability()).unwrap();
+        p.currency = currency.into();
+        p.input = input;
+        r.cost = p.cost(&r);
+        r
+    };
+    let mut unpriced = row(5, 0, 5);
+    unpriced.request_count = 4;
+    let rows = vec![
+        priced("USD", 2.0, 1),
+        priced("CNY", 20.0, 2),
+        priced("USD", 3.0, 3),
+        unpriced,
+    ];
+    let (totals, unpriced_count) = summarize_costs(&rows);
+    assert_eq!(unpriced_count, 4);
+    assert_eq!(
+        totals.iter().map(|t| t.currency.as_str()).collect::<Vec<_>>(),
+        ["CNY", "USD"]
+    );
+    assert_close(totals[0].total_cost, 20.0);
+    assert_eq!(totals[0].priced_request_count, 2);
+    assert_close(totals[1].total_cost, 5.0);
+    assert_eq!(totals[1].priced_request_count, 4);
+    assert!(summarize_costs(&[]).0.is_empty());
 }

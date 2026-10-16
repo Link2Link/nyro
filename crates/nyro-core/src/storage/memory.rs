@@ -367,6 +367,8 @@ impl LogStore for MemoryStorage {
             last_used_at: None,
             tps_totals: Default::default(),
             models: Vec::new(),
+            equivalent_costs: Vec::new(),
+            unpriced_request_count: 0,
         })
     }
 

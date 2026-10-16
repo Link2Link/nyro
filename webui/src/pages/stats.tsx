@@ -12,6 +12,7 @@ import { ModelUsageDialog } from "@/components/model-usage-dialog";
 import { ProviderIcon } from "@/components/ui/provider-icon";
 import { Button } from "@/components/ui/button";
 import { useLocale } from "@/lib/i18n";
+import { equivalentCostDisplay } from "@/lib/token-usage";
 import { computeAggregateTps, formatLogTime, formatTps, tpsAggregateStatusTitle, tpsAggregateWindowTitle, tpsMetricTitle } from "@/lib/format";
 import {
   Select,
@@ -298,14 +299,21 @@ export default function StatsPage() {
                 >
                   {isZh ? "输出 TPS" : "Output TPS"}
                 </th>
+                <th
+                  className="px-4 py-2.5 text-right font-medium"
+                  title={isZh ? "按官方 API 定价折算的等额价格（当前参考价估算，非实际账单）" : "Equivalent value at official API prices (current rates, not a bill)"}
+                >
+                  {isZh ? "等额 API 价格" : "Equivalent API Price"}
+                </th>
               </tr>
             </thead>
             <tbody>
               {providerStats.length === 0 && (
-                <tr><td className="px-4 py-6 text-center text-slate-400" colSpan={6}>{isZh ? "暂无数据" : "No data"}</td></tr>
+                <tr><td className="px-4 py-6 text-center text-slate-400" colSpan={7}>{isZh ? "暂无数据" : "No data"}</td></tr>
               )}
               {providerStats.slice(0, 8).map((p) => {
                 const tps = computeAggregateTps(p);
+                const price = equivalentCostDisplay(p.equivalent_costs, p.unpriced_request_count, isZh, locale);
                 return (
                   <tr
                     key={p.provider_id}
@@ -337,6 +345,9 @@ export default function StatsPage() {
                       title={tpsAggregateStatusTitle(p, isZh)}
                     >
                       {formatTps(tps)}
+                    </td>
+                    <td className="px-4 py-2.5 text-right tabular-nums" title={price.title}>
+                      {price.text}
                     </td>
                   </tr>
                 );

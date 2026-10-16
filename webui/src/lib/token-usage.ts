@@ -1,4 +1,4 @@
-import type { TokenUsageDay } from "./types";
+import type { EquivalentCostTotal, TokenUsageDay } from "./types";
 
 export type TokenUsageTotals = Pick<TokenUsageDay,
   "request_count" | "input_tokens" | "output_tokens" | "cache_read_tokens" |
@@ -179,4 +179,41 @@ export function tokenCalendar(year: number, month: number): (string | null)[] {
 
 export function tokenHeat(total: number, peak: number): number {
   return total > 0 && peak > 0 ? Math.min(5, Math.max(1, Math.ceil(Math.sqrt(total / peak) * 5))) : 0;
+}
+
+export interface EquivalentCostDisplay {
+  /** "—" when nothing could be priced; trailing "*" when some attempts are unpriced. */
+  text: string;
+  title: string;
+  priced: boolean;
+}
+
+/**
+ * Display for server-summed per-currency equivalent cost. One currency stays native;
+ * several are merged into USD at the fixed display rate (native amounts in the title).
+ */
+export function equivalentCostDisplay(
+  costs: EquivalentCostTotal[] | undefined,
+  unpriced: number | undefined,
+  zh: boolean,
+  locale = "en-US",
+): EquivalentCostDisplay {
+  const list = (costs ?? []).filter((item) => Number.isFinite(item.total_cost) && item.priced_request_count > 0);
+  const missing = unpriced ?? 0;
+  const note = missing > 0 ? (zh ? `${missing} 次尝试未计价，未计入` : `${missing} attempts unpriced and excluded`) : "";
+  if (!list.length) {
+    return { text: "—", title: [zh ? "无可用参考价" : "No reference price", note].filter(Boolean).join("\n"), priced: false };
+  }
+  const native = list.map((item) => `${formatUsageCost(item.total_cost, item.currency, locale)} ${item.currency}`).join(" + ");
+  const merged = list.length > 1;
+  const usd = list.reduce((sum, item) => sum + item.total_cost * (usageCurrencyFactor(item.currency, "USD") ?? 0), 0);
+  const convertible = list.every((item) => usageCurrencyFactor(item.currency, "USD") !== null);
+  const text = merged && convertible ? formatUsageCost(usd, "USD", locale) : merged ? native : formatUsageCost(list[0].total_cost, list[0].currency, locale);
+  const lines = [
+    zh ? "等额 API 价格（当前参考价估算，非实际账单）" : "Equivalent API price (current rates, not a bill)",
+    merged ? native : "",
+    merged && convertible ? (zh ? `按 1 USD = ${USD_CNY_RATE.toFixed(1)} CNY 折合为 USD` : `Converted to USD at 1 USD = ${USD_CNY_RATE.toFixed(1)} CNY`) : "",
+    note,
+  ].filter(Boolean);
+  return { text: missing > 0 ? `${text} *` : text, title: lines.join("\n"), priced: true };
 }
