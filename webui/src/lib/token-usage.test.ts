@@ -156,6 +156,54 @@ test("numbered Claude effort families normalize case without collapsing versions
   equal(usageBaseModel(" Unknown-Model "), "unknown-model");
 });
 
+test("Grok build-fast and Gemini effort variants collapse without losing product identities", () => {
+  for (const version of ["4.7", "4.70", "4-7"]) {
+    equal(usageBaseModel(` GROK-${version}-BUILD-FAST `), `grok-${version}`);
+  }
+  for (const product of ["flash", "pro", "flash-lite", "flash-image", "pro-preview", "flash-preview"]) {
+    for (const effort of ["high", "medium", "low", "max", "xhigh", "minimal", "none", "tiered"]) {
+      const base = `gemini-3.8-${product}`;
+      equal(usageBaseModel(`${base}-${effort}`.toUpperCase()), base);
+      equal(usageBaseModel(`${base}-reasoning-${effort}`), base);
+    }
+  }
+  for (const model of [
+    "grok-4.7-fast", "grok-4.7-mini", "grok-4.7-build", "grok-4.7-build-fast-preview",
+    "grok-4.7-fast-build-fast", "grok-code-fast-1", "grok-build-fast",
+    "gemini-3.8-flash", "gemini-3.8-pro", "gemini-3.80-flash", "gemini-3.8-flash-lite",
+    "gemini-3.8-flash-image", "gemini-3.8-flash-high-preview", "gemini-pro-agent-high",
+    "gemini-3.8-flash-unknown", "custom-build-fast", "custom-high",
+    "google/gemini-3.8-flash-high", "xai/grok-4.7-build-fast",
+  ]) equal(usageBaseModel(model), model);
+});
+
+test("reported Grok and Gemini pairs merge across providers with original pricing and FX intact", () => {
+  for (const [base, variant] of [["grok-4.7", "grok-4.7-build-fast"], ["gemini-3.8-flash", "gemini-3.8-flash-high"]]) {
+    const rows = [
+      row({ model: base, cost: cost({ pricing_model: base }), request_count: 2 }),
+      row({ model: variant, provider_id: "b", cost: cost({ currency: "CNY", is_manual: true, pricing_model: variant, input_cost: 14, cache_read_cost: 7, output_cost: 21, total_cost: 42 }), request_count: 3 }),
+      row({ date: "2024-02-02", model: variant, cost: null, missing_usage_count: 1 }),
+    ];
+    const snapshot = JSON.stringify(rows);
+    for (const currency of ["USD", "CNY"]) {
+      const families = groupUsageModelFamilies(rows, currency, "cost");
+      equal(families.length, 1);
+      const [family] = families;
+      equal(family.model, base);
+      equal(family.variant_count, 2);
+      equal(family.provider_count, 2);
+      equal(family.cost.total_cost, currency === "USD" ? 12 : 84);
+      equal(family.cost.unpriced_request_count, 1);
+      equal(family.missing_usage_count, 1);
+      deepEqual(family.variants, groupTokenModels(rows, currency, "cost"));
+      deepEqual(family.cost, sumUsageCost(rows, currency));
+    }
+    equal(groupUsageModelFamilies([rows[1]])[0].model, base, "No base row needed to identify family");
+    equal(groupUsageModelFamilies(rows.filter((item) => item.date === "2024-02-02"))[0].model, base);
+    equal(JSON.stringify(rows), snapshot);
+  }
+});
+
 test("base and max form one total while preserving exact names and differently priced manual variants", () => {
   const rows = [
     row({ model: "claude-sonnet-5-5", cost: cost({ pricing_model: "claude-sonnet-5-5", is_manual: true, input_rate: 2 }) }),

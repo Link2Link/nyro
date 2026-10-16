@@ -27,6 +27,14 @@ const fixture = { year, time_zone: 'UTC', generated_at: Date.now(), rows: [
   row({ date: `${month}-20`, provider_id: 'anthropic', provider_name: 'Anthropic', model: 'claude-sonnet-5-5', cost: null }),
   row({ date: `${month}-20`, provider_id: 'anthropic', provider_name: 'Anthropic', model: 'claude-sonnet-5-5-max', cost: null }),
 ] };
+const familyRows = [
+  row({ provider_id: 'xai', provider_name: 'xAI', model: 'grok-4.7', cost: price({ pricing_model: 'grok-4.7' }) }),
+  row({ provider_id: 'relay', provider_name: 'Relay', model: 'grok-4.7-build-fast', cost: price({ currency: 'CNY', input_cost: 14, cache_read_cost: 7, output_cost: 21, total_cost: 42, pricing_model: 'grok-4.7-build-fast', is_manual: true }) }),
+  row({ provider_id: 'google', provider_name: 'Google', model: 'gemini-3.8-flash', cost: price({ pricing_model: 'gemini-3.8-flash' }) }),
+  row({ provider_id: 'google', provider_name: 'Google', model: 'gemini-3.8-flash-high', cost: price({ pricing_model: 'gemini-3.8-flash-high', is_manual: true }) }),
+  row({ provider_id: 'google', provider_name: 'Google', model: 'gemini-3.8-flash-tiered', cost: null }),
+  row({ provider_id: 'google', provider_name: 'Google', model: 'gemini-3.8-pro-high', cost: price({ pricing_model: 'gemini-3.8-pro' }) }),
+];
 /** Same bounded-prefix enumeration as the backend: exact identity, then longest first. */
 const prefixBases = model => {
   const bases = [model];
@@ -102,7 +110,7 @@ const prefixBases = model => {
             }
           } else if (url.pathname.endsWith('/stats/token-usage')) {
             if (apiMode === 'error') return route.fulfill({ status: 503, json: { error: 'Fixture unavailable' } });
-            data = apiMode === 'empty' ? { ...fixture, rows: [] } : apiMode === 'legacy' ? { ...fixture, rows: fixture.rows.map(({ cost, ...item }) => item) } : effectiveFixture();
+            data = apiMode === 'families' ? { ...fixture, rows: familyRows } : apiMode === 'empty' ? { ...fixture, rows: [] } : apiMode === 'legacy' ? { ...fixture, rows: fixture.rows.map(({ cost, ...item }) => item) } : effectiveFixture();
           } else if (url.pathname.endsWith('/stats/overview')) data = { total_requests: 170, total_input_tokens: 51000000, total_output_tokens: 8500000, total_cache_read_tokens: 34000000, avg_duration_ms: 1287, error_count: 1 };
           else if (url.pathname.endsWith('/stats/timeseries')) data = { has_data: false, points: [], bucket_minutes: 60, start_at: 0, end_at: 0 };
           else if (url.pathname.endsWith('/status')) data = {};
@@ -292,6 +300,28 @@ const prefixBases = model => {
       // Start again to reset the presentation currency before legacy/empty checks.
       await page.reload();
       await panel.locator('.token-day').first().waitFor();
+      apiMode = 'families';
+      await panel.getByRole('button', { name: zh ? '刷新统计' : 'Refresh', exact: true }).click();
+      await panel.locator('.token-family[data-family="grok-4.7"]').waitFor();
+      assert.equal(await panel.locator('.token-family').count(), 3, 'Grok and Gemini variants merge while Gemini pro stays separate');
+      const grokFamily = panel.locator('.token-family[data-family="grok-4.7"]');
+      const flashFamily = panel.locator('.token-family[data-family="gemini-3.8-flash"]');
+      assert.equal(await panel.locator('.token-family[data-family="grok-4.7-build-fast"]').count(), 0);
+      assert.equal(await panel.locator('.token-family[data-family="gemini-3.8-flash-high"]').count(), 0);
+      assert.match(await grokFamily.locator(':scope > summary').innerText(), /\$12\.00/);
+      assert.match(await flashFamily.locator(':scope > summary').innerText(), /\$12\.00\s*\*/);
+      assert.equal(await panel.locator('.token-kpi p').first().innerText(), '$30.00');
+      await grokFamily.locator(':scope > summary').click();
+      assert.equal(await grokFamily.locator('.token-family-variant').count(), 2);
+      assert.equal(await grokFamily.getByRole('button', { name: 'Set prices: grok-4.7-build-fast · Relay'.replace('Set prices', zh ? '设置价格' : 'Set prices'), exact: true }).count(), 1, 'Editing retains the exact upstream identity');
+      await grokFamily.locator(':scope > summary').click();
+      await panel.getByRole('combobox', { name: zh ? '显示币种' : 'Display currency' }).click();
+      await page.getByRole('option', { name: '¥ CNY', exact: true }).click();
+      assert.match(await grokFamily.locator(':scope > summary').innerText(), /¥84\.00/);
+      assert.match(await flashFamily.locator(':scope > summary').innerText(), /¥84\.00/);
+      await panel.locator('.token-family-list').screenshot({ path: path.join(screenshots, `grok-gemini-families-${scenario.theme}-${scenario.width}.png`) });
+      await panel.getByRole('combobox', { name: zh ? '显示币种' : 'Display currency' }).click();
+      await page.getByRole('option', { name: '$ USD', exact: true }).click();
       apiMode = 'legacy';
       await panel.getByRole('button', { name: zh ? '刷新统计' : 'Refresh', exact: true }).click();
       await page.waitForFunction(() => document.querySelector('.token-kpi p')?.textContent === '—');

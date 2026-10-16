@@ -112,16 +112,24 @@ export function groupTokenModels(rows: TokenUsageDay[], currency = "USD", metric
 }
 
 /**
- * Display identity only: numbered Claude families have known effort variants.
+ * Display identity only: known Claude/Gemini effort and Grok build variants.
  * Keep versions, product suffixes and namespaces intact; never infer identity from
  * mutable pricing_model metadata or from whichever rows happen to be visible.
  */
 export function usageBaseModel(model: string): string {
   const normalized = model.trim().toLowerCase();
-  return normalized.replace(
+  // Apply only terminal execution/effort suffixes to recognized model families.
+  // Product names (flash, pro, lite, image, mini, fast) stay part of the base.
+  const patterns = [
     /^(claude-(?:sonnet|opus|haiku|fable)-\d+(?:[.-]\d+)*)(?:-reasoning)?-(?:max|medium|high|low|xhigh|minimal|none)$/,
-    "$1",
-  );
+    /^(gemini-\d+(?:[.-]\d+)*-(?:flash(?:-lite|-image)?|pro)(?:-preview)?)(?:-reasoning)?-(?:max|medium|high|low|xhigh|minimal|none|tiered)$/,
+    /^(grok-\d+(?:[.-]\d+)*)(?:-build-fast)$/,
+  ];
+  for (const pattern of patterns) {
+    const match = pattern.exec(normalized);
+    if (match) return match[1];
+  }
+  return normalized;
 }
 
 /** Cross-provider display families; exact variants still own prices and edit actions. */
