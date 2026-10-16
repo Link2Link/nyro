@@ -10,6 +10,7 @@ pub(super) const MODELS: &[&str] = &[
     "claude-opus-5-5",
     "claude-sonnet-5-5",
     "claude-fable-5-1",
+    "claude-haiku-5-5",
     "claude-opus-4-6",
     "claude-sonnet-4-6",
     "claude-haiku-4-5",
@@ -57,6 +58,11 @@ const TIERED: &[TieredFamily] = &[
     TieredFamily {
         family: "claude-fable-5-1",
         tiers: LOW_TO_MAX,
+        default: "medium",
+    },
+    TieredFamily {
+        family: "claude-haiku-5-5",
+        tiers: LOW_TO_HIGH,
         default: "medium",
     },
     TieredFamily {
@@ -296,7 +302,7 @@ mod tests {
                 );
             }
         }
-        // Three-tier family: xhigh/max clamp down to its top tier.
+        // Three-tier families: xhigh/max clamp down to their top tier.
         let expected = [
             (ReasoningEffort::None, "low"),
             (ReasoningEffort::Minimal, "low"),
@@ -306,19 +312,21 @@ mod tests {
             (ReasoningEffort::Xhigh, "high"),
             (ReasoningEffort::Max, "high"),
         ];
-        for (effort, tier) in &expected {
-            assert_eq!(
-                resolve("gemini-4-argon", &effort_config(effort.clone())),
-                format!("gemini-4-argon-{tier}"),
-                "gemini-4-argon with {effort:?}"
-            );
+        for family in ["claude-haiku-5-5", "gemini-4-argon"] {
+            for (effort, tier) in &expected {
+                assert_eq!(
+                    resolve(family, &effort_config(effort.clone())),
+                    format!("{family}-{tier}"),
+                    "{family} with {effort:?}"
+                );
+            }
         }
     }
 
     #[test]
     fn tiered_families_reach_every_published_variant_and_nothing_else() {
         // Independent of TIERED: the upstream UIDs each family really publishes.
-        let published: [(&str, &[&str]); 5] = [
+        let published: [(&str, &[&str]); 6] = [
             (
                 "claude-opus-5-5",
                 &["low", "medium", "high", "xhigh", "max"],
@@ -331,6 +339,7 @@ mod tests {
                 "claude-fable-5-1",
                 &["low", "medium", "high", "xhigh", "max"],
             ),
+            ("claude-haiku-5-5", &["low", "medium", "high"]),
             ("gpt-6-astra", &["low", "medium", "high", "xhigh", "max"]),
             ("gemini-4-argon", &["low", "medium", "high"]),
         ];

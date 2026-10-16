@@ -233,6 +233,58 @@ async fn bare_family_name_sends_the_variant_matching_the_requested_effort() {
 }
 
 #[tokio::test]
+async fn bare_haiku_name_resolves_into_a_published_variant() {
+    use crate::protocol::ir::ReasoningEffort;
+    // Regression for request 4d01f363: Devin's catalog publishes only
+    // `-low/-medium/-high` variants for the haiku 5.5 line, so the bare
+    // family name must never reach the wire (upstream answers 403
+    // permission_denied). No directive lands on the family default.
+    for (effort, wire_uid) in [
+        (None, "claude-haiku-5-5-medium"),
+        (Some(ReasoningEffort::Low), "claude-haiku-5-5-low"),
+        (Some(ReasoningEffort::High), "claude-haiku-5-5-high"),
+        // The line has no xhigh/max variant: requests clamp down to high.
+        (Some(ReasoningEffort::Xhigh), "claude-haiku-5-5-high"),
+        // Thinking off has no variant of its own: it lands on the lowest tier.
+        (Some(ReasoningEffort::None), "claude-haiku-5-5-low"),
+    ] {
+        let mut bytes = frame(wire::ChatResponse {
+            text: b"ok".into(),
+            ..Default::default()
+        });
+        bytes.extend(frame(wire::ChatResponse {
+            stop_reason: 1,
+            ..Default::default()
+        }));
+        bytes.extend(end(b"{}"));
+        let (url, captured, server) = mock(200, bytes).await;
+        let control = control();
+        let mut request = input(true);
+        request.model = "claude-haiku-5-5".into();
+        request.reasoning.effort = effort.clone();
+        let mut upstream = execute(
+            request,
+            "claude-haiku-5-5",
+            "mock-token",
+            url,
+            client(&control),
+            control.clone(),
+        )
+        .await
+        .unwrap();
+        while upstream.events.next().await.is_some() {}
+        let (_, body) = captured.await.unwrap();
+        let decoded = wire::ChatRequest::decode(&body[5..]).unwrap();
+        assert_ne!(decoded.model, "claude-haiku-5-5", "effort {effort:?}");
+        assert_eq!(decoded.model, wire_uid, "effort {effort:?}");
+        assert_eq!(upstream.actual_model, wire_uid);
+        drop(upstream);
+        server.abort();
+        let _ = server.await;
+    }
+}
+
+#[tokio::test]
 async fn mocked_transport_rejects_truncation_and_error_trailers_without_done() {
     for bytes in [
         frame(wire::ChatResponse {
