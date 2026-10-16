@@ -35,6 +35,7 @@ pub mod deepseek;
 pub mod devin;
 pub mod google;
 pub mod kimi_code;
+pub mod kiro;
 pub mod minimax;
 pub mod moonshotai;
 pub mod nvidia;

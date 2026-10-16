@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { backend, BackendHTTPError } from "./backend";
-import type { OAuthSessionInitData, OAuthSessionStatusData } from "./types";
+import type { KiroLoginOptions, OAuthSessionInitData, OAuthSessionStatusData } from "./types";
 
 type Ready = Extract<OAuthSessionStatusData, { status: "ready" }>;
 
@@ -17,6 +17,7 @@ export interface OAuthSessionContext {
 interface StartOptions {
   vendor: string;
   useProxy: boolean;
+  kiro?: KiroLoginOptions;
   onInit?: (session: OAuthSessionInitData) => void;
   onReady?: (status: Ready, context: OAuthSessionContext) => Promise<void> | void;
 }
@@ -190,7 +191,11 @@ export function useOAuthSession() {
     try {
       // Do not abort init: it may allocate a remote session before cancellation.
       // Receive its ID even when superseded so that session can be cancelled too.
-      const init = await backend<OAuthSessionInitData>("init_oauth_session", { vendor: options.vendor, useProxy: options.useProxy });
+      const init = await backend<OAuthSessionInitData>("init_oauth_session", {
+        vendor: options.vendor,
+        useProxy: options.useProxy,
+        ...(options.kiro ? { kiro: options.kiro } : {}),
+      });
       if (!isCurrent(run)) {
         cancelRemote(init.session_id);
         return;

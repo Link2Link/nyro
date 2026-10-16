@@ -33,8 +33,8 @@ const STATUS_PATH: &str = "/exa.seat_management_pb.SeatManagementService/GetUser
 const METADATA: VendorMetadata = VendorMetadata {
     id: "devin",
     label: Label {
-        en: "Devin (Experimental)",
-        zh: "Devin（实验性）",
+        en: "Devin",
+        zh: "Devin",
     },
     icon: "devin",
     default_protocol: "devin-chat/get-chat-message/v1",

@@ -53,6 +53,20 @@ export function OAuthSessionError({ status, isZh }: { status: OAuthSessionStatus
   return <p role="alert" className="text-xs text-rose-600">{status.code}: {message}</p>;
 }
 
+export function KiroLoginNotice({ isZh }: { isZh: boolean }) {
+  return (
+    <div className="col-span-2 space-y-1 rounded-lg border border-sky-200 bg-sky-50 px-3 py-2 text-xs text-sky-800">
+      <p className="font-semibold">{isZh ? "Kiro 原生接入" : "Kiro native provider"}</p>
+      <p>{isZh
+        ? "使用 Google、GitHub、AWS Builder ID 或 IAM Identity Center 在浏览器登录，自动检查授权结果，无需本地回调。也可导入 IDE / CLI 已有凭证、refresh token 或 ksk_ 静态 API Key；Builder ID / IAM Identity Center 导入需附带客户端注册 JSON。"
+        : "Sign in with Google, GitHub, AWS Builder ID or IAM Identity Center in your browser; authorization is checked automatically without a local callback. You can also import an existing IDE / CLI credential, refresh token or ksk_ static API key. Builder ID / IAM Identity Center imports need the client-registration JSON."}</p>
+      <p>{isZh
+        ? "仅使用固定原生协议 kiro-chat/generate-assistant-response/v1，不是 OpenAI 兼容接口；不支持自适应协议或 API Key 密钥池。"
+        : "Uses only the fixed native kiro-chat/generate-assistant-response/v1 protocol, not an OpenAI-compatible endpoint. Adaptive protocols and API-key pools are not supported."}</p>
+    </div>
+  );
+}
+
 export function DevinLoginNotice({ isZh }: { isZh: boolean }) {
   return (
     <div className="col-span-2 space-y-1 rounded-lg border border-sky-200 bg-sky-50 px-3 py-2 text-xs text-sky-800">

@@ -76,6 +76,9 @@ fn build_model_probe_request(
         crate::protocol::ids::Protocol::DevinChat => {
             anyhow::bail!("Devin probes require native Connect/protobuf execution")
         }
+        crate::protocol::ids::Protocol::KiroChat => {
+            anyhow::bail!("Kiro probes require native event-stream execution")
+        }
         crate::protocol::ids::Protocol::OpenAICompatible => (
             "/v1/chat/completions",
             serde_json::json!({
@@ -900,6 +903,36 @@ fn normalize_protocol_config(
         });
     }
 
+    if registry.parse_protocol(default_protocol) == Some(crate::protocol::ids::Protocol::KiroChat) {
+        let origin = base_url.trim().trim_end_matches('/');
+        anyhow::ensure!(
+            mode == PROVIDER_PROTOCOL_MODE_FIXED
+                && endpoints.iter().all(|endpoint| {
+                    registry.resolve_alias(&endpoint.protocol)
+                        == Some(crate::protocol::ids::KIRO_CHAT_V1)
+                        && endpoint.base_url.trim().trim_end_matches('/') == origin
+                        && endpoint.api_key.trim().is_empty()
+                        && matches!(endpoint.auth_scheme.as_str(), "auto" | "oauth")
+                }),
+            "Kiro requires fixed protocol mode without adaptive endpoints"
+        );
+        anyhow::ensure!(
+            auth_mode == "oauth" && api_key.trim().is_empty(),
+            "Kiro requires OAuth authentication without API keys"
+        );
+        anyhow::ensure!(
+            crate::provider::kiro::credential::region_from_origin(origin).is_some(),
+            "Kiro requires an https://q.<region>.amazonaws.com base URL"
+        );
+        return Ok(NormalizedProtocolConfig {
+            mode: mode.to_string(),
+            default_protocol: crate::protocol::ids::KIRO_CHAT_V1.to_string(),
+            base_url: normalize_endpoint_url(base_url)?,
+            api_key: String::new(),
+            endpoints: Vec::new(),
+        });
+    }
+
     if mode == PROVIDER_PROTOCOL_MODE_FIXED {
         let protocol = registry
             .parse_protocol(default_protocol)
@@ -1505,6 +1538,16 @@ fn validate_admin_provider(provider: &Provider) -> anyhow::Result<()> {
             "Devin preset requires vendor=devin"
         );
     }
+    if provider
+        .preset_key
+        .as_deref()
+        .is_some_and(|preset| preset.eq_ignore_ascii_case("kiro"))
+    {
+        anyhow::ensure!(
+            crate::provider::kiro::is_kiro(provider),
+            "Kiro preset requires vendor=kiro"
+        );
+    }
     Ok(())
 }
 
@@ -2038,6 +2081,35 @@ impl AdminService {
                 .await?;
             return Ok(result);
         }
+        if crate::provider::kiro::is_kiro(&provider) {
+            let start = Instant::now();
+            let outcome = async {
+                validate_admin_provider(&provider)?;
+                let runtime = self.resolve_provider_runtime(&provider).await?;
+                let credential = runtime
+                    .credential
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("Kiro OAuth credential is missing"))?;
+                crate::provider::kiro::check_connection(
+                    &self.gw,
+                    &provider,
+                    credential,
+                    &runtime.access_token,
+                )
+                .await
+            }
+            .await;
+            let result = TestResult {
+                success: outcome.is_ok(),
+                latency_ms: start.elapsed().as_millis() as u64,
+                model: None,
+                error: outcome.err().map(|error| error.to_string()),
+                endpoints: Vec::new(),
+            };
+            self.record_provider_test_result(&provider.id, &result)
+                .await?;
+            return Ok(result);
+        }
         validate_admin_provider(&provider)?;
         self.gw
             .clear_ollama_capability_cache_for_provider(&provider.id)
@@ -2458,6 +2530,9 @@ impl AdminService {
         if crate::provider::devin::is_devin(&provider) {
             return self.probe_devin_models(&provider, models).await;
         }
+        if crate::provider::kiro::is_kiro(&provider) {
+            return self.probe_kiro_models(&provider, models).await;
+        }
 
         // Pick the probe endpoint: adaptive providers probe through the
         // endpoint matching their configured default protocol
@@ -2747,6 +2822,60 @@ impl AdminService {
         })
     }
 
+    async fn probe_kiro_models(
+        &self,
+        provider: &Provider,
+        models: Vec<String>,
+    ) -> anyhow::Result<ProviderModelProbeOutcome> {
+        anyhow::ensure!(
+            models.len() <= 16,
+            "Kiro model probes are limited to 16 models per request"
+        );
+        let runtime = self.resolve_provider_runtime(provider).await?;
+        let credential = runtime
+            .credential
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Kiro OAuth credential is missing"))?;
+        let protocol = crate::protocol::ids::KIRO_CHAT_V1.to_string();
+        let mut results = Vec::new();
+        for model in models {
+            let start = Instant::now();
+            let outcome =
+                crate::provider::kiro::probe(&self.gw, provider, credential, &model).await;
+            let (reply, error) = match outcome {
+                Ok(reply) => (Some(reply), None),
+                Err(error) => (None, Some(error.to_string())),
+            };
+            results.push(ProviderModelProbeResult {
+                model,
+                success: error.is_none(),
+                error,
+                latency_ms: start.elapsed().as_millis() as u64,
+                protocol: protocol.clone(),
+                reply,
+                quota_remaining: None,
+                quota_resets_at: None,
+            });
+        }
+        Ok(ProviderModelProbeOutcome {
+            meta: ProviderModelProbeMeta {
+                protocol,
+                base_url: provider.base_url.clone(),
+            },
+            results,
+        })
+    }
+
+    async fn kiro_provider_models(&self, provider: &Provider) -> anyhow::Result<Vec<String>> {
+        validate_admin_provider(provider)?;
+        let runtime = self.resolve_provider_runtime(provider).await?;
+        anyhow::ensure!(
+            !runtime.access_token.trim().is_empty(),
+            "Kiro OAuth credential is missing"
+        );
+        Ok(crate::provider::kiro::models(provider))
+    }
+
     async fn devin_provider_models(&self, provider: &Provider) -> anyhow::Result<Vec<String>> {
         validate_admin_provider(provider)?;
         let runtime = self.resolve_provider_runtime(provider).await?;
@@ -2945,6 +3074,9 @@ impl AdminService {
         if crate::provider::devin::is_devin(provider) {
             return self.devin_provider_models(provider).await;
         }
+        if crate::provider::kiro::is_kiro(provider) {
+            return self.kiro_provider_models(provider).await;
+        }
         // Key-pool providers route discovery through the pool snapshots (see
         // discover_provider_models); the runtime credential below is the
         // provider-level key, which an active pool deliberately ignores.
@@ -3080,6 +3212,9 @@ impl AdminService {
         validate_admin_provider(provider)?;
         if crate::provider::devin::is_devin(provider) {
             return self.devin_provider_models(provider).await;
+        }
+        if crate::provider::kiro::is_kiro(provider) {
+            return self.kiro_provider_models(provider).await;
         }
         // Key-pool providers: the per-key snapshots are the catalog. Union
         // every informed key's effective model set; when no key has ever been

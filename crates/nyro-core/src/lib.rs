@@ -351,14 +351,17 @@ impl Gateway {
         self.provider_http_client(use_proxy, true).await
     }
 
-    /// Devin embeds credentials in protobuf bodies: never replay them to a
-    /// redirect target. Server-streaming works over HTTP/1.
+    /// Transport for provider-owned native protocols (Devin, Kiro). Their
+    /// credentials travel in request bodies or sensitive headers: never replay
+    /// them to a redirect target. Server-streaming works over HTTP/1.
     pub(crate) async fn devin_http_client(
         &self,
         use_proxy: bool,
         inference: bool,
     ) -> anyhow::Result<reqwest::Client> {
-        let mut builder = self.redirectless_client_builder(use_proxy, inference).await?;
+        let mut builder = self
+            .redirectless_client_builder(use_proxy, inference)
+            .await?;
         if use_proxy
             && self
                 .storage

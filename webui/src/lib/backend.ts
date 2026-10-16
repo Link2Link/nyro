@@ -197,6 +197,7 @@ function resolveHTTP(cmd: string, args?: Record<string, unknown>): HTTPMapping {
         body: {
           vendor: args?.vendor,
           use_proxy: args?.useProxy ?? args?.use_proxy,
+          kiro: args?.kiro,
         },
       };
     case "get_oauth_session_status":

@@ -2,6 +2,8 @@ import { useEffect, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { Clock, RefreshCw, AlertCircle, CirclePause } from "lucide-react";
 import { backend } from "@/lib/backend";
+import { localizeBackendErrorMessage } from "@/lib/backend-error";
+import { isKiroOverage, providerUsageTitle, tierLabel } from "@/lib/provider-usage";
 import { useLocale } from "@/lib/i18n";
 import type {
   Provider,
@@ -86,45 +88,6 @@ function steadyPacePercent(tier: ProviderUsageTier, now: number): number | null 
   return ((windowMs - remaining) / windowMs) * 100;
 }
 
-const TIER_LABELS_ZH: Record<string, string> = {
-  five_hour: "5小时",
-  daily: "每日",
-  weekly_limit: "每周",
-  monthly: "每月",
-  primary_window: "主要窗口",
-  secondary_window: "次要窗口",
-  gemini: "Gemini 共享池",
-};
-const TIER_LABELS_EN: Record<string, string> = {
-  five_hour: "5h",
-  daily: "Daily",
-  weekly_limit: "Weekly",
-  monthly: "Monthly",
-  primary_window: "Primary Window",
-  secondary_window: "Secondary Window",
-  gemini: "Gemini Shared Pool",
-};
-
-function readableFeatureName(value: string): string {
-  return value
-    .replace(/[_-]+/g, " ")
-    .replace(/\s+/g, " ")
-    .trim()
-    .replace(/\b\w/g, (character) => character.toUpperCase());
-}
-
-function tierLabel(name: string, isZh: boolean): string {
-  const table = isZh ? TIER_LABELS_ZH : TIER_LABELS_EN;
-  if (table[name]) return table[name];
-
-  const feature = /^feature:(.+):(five_hour|daily|weekly_limit|monthly|primary_window|secondary_window)$/.exec(name);
-  if (feature) {
-    const featureName = readableFeatureName(feature[1]);
-    const windowLabel = table[feature[2]] ?? feature[2];
-    return `${featureName} · ${windowLabel}`;
-  }
-  return readableFeatureName(name);
-}
 
 function formatRelativeTime(timestamp: string, now: number, isZh: boolean): string {
   const diff = Math.floor((now - new Date(timestamp).getTime()) / 1000);
@@ -313,8 +276,6 @@ export function ProviderUsageFooter({ provider }: { provider: Provider }) {
   const blockedTierLabels = (shown?.scheduling?.blocking_tiers ?? [])
     .map((name) => tierLabel(name, isZh))
     .join(", ");
-  const isBalanceView = shown?.kind.endsWith("_balance") ?? false;
-  const isCodex = shown?.kind === "openai_codex";
   // Devin reports an extra-usage balance next to its included windows: it is
   // what keeps the account usable once a window is spent.
   const isDevin = shown?.kind === "devin_plan";
@@ -326,28 +287,8 @@ export function ProviderUsageFooter({ provider }: { provider: Provider }) {
     !quotaPaused &&
     (shown?.tiers ?? []).some((tier) => tier.used_percent >= 100) &&
     balances.some((balance) => balance.total > 0);
-  // The Google subscription backend reports the shared Gemini bucket alone, so
-  // this card carries a single "Gemini shared pool" row.
-  const isGoogleSubscription = shown?.kind === "google_subscription";
-  const title = isBalanceView
-    ? isZh
-      ? "账户余额"
-      : "Balance"
-    : isCodex
-      ? isZh
-        ? "ChatGPT Codex 用量"
-        : "ChatGPT Codex Usage"
-      : isDevin
-        ? isZh
-          ? "Devin 用量"
-          : "Devin Usage"
-        : isGoogleSubscription
-          ? isZh
-            ? "Google AI Pro 配额"
-            : "Google AI Pro Quota"
-          : isZh
-            ? "套餐用量"
-            : "Plan Usage";
+  const title = providerUsageTitle(shown?.kind, isZh);
+  const errorMessage = error ? localizeBackendErrorMessage(error, isZh) : "";
 
   return (
     <div className="mt-3 space-y-2 rounded-xl border border-slate-200/70 bg-white/40 px-3 py-2.5">
@@ -405,10 +346,21 @@ export function ProviderUsageFooter({ provider }: { provider: Provider }) {
         </div>
       )}
 
-      {error && !shown ? (
-        <div className="flex items-center gap-1.5 text-xs text-red-500" title={error.message}>
+      {isKiroOverage(shown) && (
+        <div className="flex items-center gap-2 border-y border-amber-200 bg-amber-50 px-2 py-1.5 text-xs text-amber-700">
           <AlertCircle className="h-3.5 w-3.5 shrink-0" />
-          <span className="truncate">{error.message}</span>
+          <span className="min-w-0 flex-1">
+            {isZh
+              ? "套餐额度已用完，上游已启用超额计费，调度已降为最后备选。Nyro 不会主动开启付费功能。"
+              : "Included quota is spent; upstream-enabled overage is billed and routing is ranked last. Nyro does not enable paid features."}
+          </span>
+        </div>
+      )}
+
+      {error && !shown ? (
+        <div className="flex items-center gap-1.5 text-xs text-red-500" title={errorMessage}>
+          <AlertCircle className="h-3.5 w-3.5 shrink-0" />
+          <span className="truncate">{errorMessage}</span>
         </div>
       ) : shown && (shown.tiers.length > 0 || balances.length > 0) ? (
         <div className="flex flex-col gap-1.5">

@@ -87,7 +87,7 @@ Nyro 同时提供 **桌面应用**（macOS / Windows / Linux）和 **独立服�
 - **工具调用**：跨协议 tool call 与结果格式归一化
 - **路由类型**：支持 chat 和 embedding 两种路由类型
 
-### Devin CLI（实验性）
+### Devin CLI
 
 新增 Provider 时选择 **Devin → Devin CLI 订阅**，打开登录页面后将授权码粘贴回 Nyro；也可在同一个掩码输入框中导入已有的 `devin-session-token$…`。此接入使用 Devin CLI 的 PKCE 登录和 Codeium 原生 Connect/protobuf 聊天接口，**不是** Devin 公开的 sessions API，也不依赖 OpenAI 兼容中转；不会启动本地 Devin CLI 或执行本地工具。
 
@@ -99,7 +99,20 @@ Nyro 同时提供 **桌面应用**（macOS / Windows / Linux）和 **独立服�
 - **用量查询**复用同一个鉴权后的 `GetUserStatus` 调用：返回套餐名、**每日**与**每周**额度窗口（上游给出剩余值，界面按已用显示）以及**超额余额**。超额余额只在窗口用完后才生效，因此它决定可用性：窗口用完时，**仅当超额余额为 $0** 才会暂停调度并等待重置；余额大于 0 时该 Provider 仍可调度，并显示“正在使用超额余额”提示，在 `usage` 均衡策略下排在所有仍有套餐内额度或用量未知的 Provider 之后（超额按量计费，仅作最后备选）。按积分计费的套餐不返回额度窗口。未返回周窗口时，`usage` 策略按每日窗口给它评分，与其他单窗口 Provider 一致。
 - **连接测试**仅调用鉴权后的 `GetUserStatus`，不生成聊天；**模型测试**会发送短聊天，可能消耗额度，单次最多测试 16 个模型。Session Token 没有刷新授权，失效后请使用**重新授权**。
 
-这是参考 CLIProxyAPI 已观察到的 Devin 协议实现的实验性接入；可用性及模型权限取决于 Devin 账户，上游协议变化可能需要更新适配器。鉴权和协议行为由本地模拟测试覆盖，订阅的端到端可用性仍需使用真实账户验证。
+Devin 是 Nyro 正式支持的供应商，接入参考 CLIProxyAPI 已观察到的 Devin 协议实现；可用性及模型权限取决于 Devin 账户，上游协议变化可能需要更新适配器。鉴权和协议行为由本地模拟测试覆盖，订阅的端到端可用性仍需使用真实账户验证。
+
+### Kiro IDE / CLI
+
+新增 Provider 时选择 **Kiro → Kiro IDE / CLI 订阅**，选择登录方式并启动授权。**Google**（默认）、**GitHub**、**AWS Builder ID** 和 **IAM Identity Center** 均使用浏览器设备授权：打开显示的链接，核对或输入一次性用户码，完成登录确认。Nyro 自动轮询获取结果；授权后保存新 Provider，已有 Provider 重新授权成功后自动绑定新凭证。无需本地 Kiro 进程、回调端口或端口转发，Nyro 部署在远程服务器也可使用；浏览器未自动打开时可手动打开或复制链接。
+
+- **IAM Identity Center** 需填写管理员提供的 HTTPS AWS 访问门户 Start URL 和 **OIDC 区域**；**生成区域**单独配置（默认 `us-east-1`），发现的 Profile ARN 决定实际归属区。登录会话最多五分钟，上游设备码更早到期时按更短时间；取消或切换方式会丢弃旧会话，超时后重新开始。设备密钥和客户端注册 Secret 仅留在服务端，不进入公共会话响应。此处支持 AWS IdC，不是任意外部身份提供商的 OAuth 地址。
+- **导入凭证**继续作为备用方式：导入 `kiro-auth-token.json` 的内容。**AWS Builder ID / IAM Identity Center** 需同时粘贴 Token JSON 和含 `clientId`、`clientSecret` 的客户端注册 JSON（支持连续两个 JSON 对象）。也支持裸 Social Refresh Token 或 `ksk_` 静态 API Key。凭证属于敏感信息，请勿放入模型名称、日志或截图；失效 Token 或静态 Key 可通过**重新导入凭证**替换。
+- 固定原生协议为 `kiro-chat/generate-assistant-response/v1`，发送 JSON、接收带 CRC 校验的 AWS EventStream，**不是 OpenAI 兼容上游**。`https://q.<region>.amazonaws.com` 随凭证区域确定，缺省为 `us-east-1`；无 Profile 的 Builder ID 使用对应区域的 CodeWhisperer 生成接口。`idcRegion` 可单独指定 OIDC 刷新区域。Social/OIDC 凭证自动刷新并保存轮换后的 Token；即使模型/Profile 在欧洲，Social Token 仍通过官方 US-East 认证服务刷新。`ksk_` 静态 Key 没有刷新授权。不支持自适应端点和 API Key 密钥池。
+- 创建模型路由时可选择原生模型建议或输入精确上游 ID，例如 `claude-sonnet-4-5` 映射为 `claude-sonnet-4.5`。建议列表**不代表账号实时权限目录**。客户端仍使用 Nyro 的 OpenAI Chat/Responses、Anthropic 或 Gemini 入口，支持流式和非流式；支持函数工具续轮、内联 base64 图片和思考内容，工具参数可能缓冲至完成后返回。
+- 远程图片 URL、embedding、强制工具选择、结构化输出和不支持的有状态/生成选项会明确拒绝。原生接口无对应控制项，因此不转发采样参数（`temperature`、`top_p`、正数 `max_tokens`）。Token 用量由上游上下文占比或本地文本大小估算，不是权威计费数据。
+- **连接测试**和**用量查询**通过 `getUsageLimits` 获取数据，不生成聊天。显示套餐、合并额度池及基础/赠送/试用明细；同一资源的有效额度相加，单项耗尽但总池仍有余量时不会停用。总池耗尽后暂停调度，只有上游明确返回**已开启超额计费**时才继续作为 `usage` 路由策略的付费最后备选，Nyro 不会替用户开启超额计费。已过期赠送额度不计入总池；未知配额形状不会覆盖已知调度状态。**模型测试**会生成短回复，可能消耗额度，单次最多 16 个模型。
+
+Kiro 是 Nyro 正式支持的供应商，适配器基于已观察到的 Kiro 协议行为实现。网页登录使用 Kiro Social 设备接口和 [AWS SSO OIDC API](https://docs.aws.amazon.com/singlesignon/latest/OIDCAPIReference/Welcome.html)，与 [Kiro 远程认证流程](https://kiro.dev/docs/getting-started/authentication/)一致。本地测试覆盖设备初始化/轮询、拒绝、超时、减速、取消、绑定、凭证隔离及聊天/配额行为；Google/GitHub 和 Builder ID 的真实端点已通过匿名初始化验证。真实账号批准授权，以及模型权限、刷新和计费的端到端验收仍需账号实测。
 
 ### 路由能力
 

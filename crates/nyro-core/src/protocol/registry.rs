@@ -12,8 +12,9 @@ use std::sync::{Arc, OnceLock};
 
 use crate::protocol::ids::{
     ANTHROPIC_MESSAGES_2023_06_01, DEVIN_CHAT_CAPABILITIES, DEVIN_CHAT_V1, EndpointCapabilities,
-    GOOGLE_GEMINI_GENERATE_CONTENT_V1BETA, OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1,
-    OPENAI_COMPATIBLE_EMBEDDINGS_V1, OPENAI_RESPONSES_V1, Protocol, ProtocolEndpoint,
+    GOOGLE_GEMINI_GENERATE_CONTENT_V1BETA, KIRO_CHAT_CAPABILITIES, KIRO_CHAT_V1,
+    OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1, OPENAI_COMPATIBLE_EMBEDDINGS_V1, OPENAI_RESPONSES_V1,
+    Protocol, ProtocolEndpoint,
 };
 use crate::protocol::traits::EndpointHandler;
 
@@ -102,6 +103,15 @@ impl ProtocolRegistry {
             EndpointDescriptor {
                 id: DEVIN_CHAT_V1,
                 capabilities: DEVIN_CHAT_CAPABILITIES,
+                execution: ExecutionKind::VendorStream,
+            },
+        );
+
+        descriptors.insert(
+            KIRO_CHAT_V1,
+            EndpointDescriptor {
+                id: KIRO_CHAT_V1,
+                capabilities: KIRO_CHAT_CAPABILITIES,
                 execution: ExecutionKind::VendorStream,
             },
         );
@@ -295,6 +305,7 @@ fn default_endpoint_aliases() -> HashMap<&'static str, ProtocolEndpoint> {
         OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1,
     );
     m.insert("devin-chat", DEVIN_CHAT_V1);
+    m.insert("kiro-chat", KIRO_CHAT_V1);
     m.insert("openai-responses", OPENAI_RESPONSES_V1);
     m.insert("openai-embeddings", OPENAI_COMPATIBLE_EMBEDDINGS_V1);
     m.insert("anthropic-messages", ANTHROPIC_MESSAGES_2023_06_01);
@@ -326,6 +337,7 @@ fn default_protocol_aliases() -> HashMap<&'static str, Protocol> {
     m.insert("anthropic-messages", Protocol::AnthropicMessages);
     m.insert("google-gemini", Protocol::GoogleGemini);
     m.insert("devin-chat", Protocol::DevinChat);
+    m.insert("kiro-chat", Protocol::KiroChat);
 
     // Short names
     m.insert("openai", Protocol::OpenAICompatible);
@@ -371,15 +383,54 @@ mod tests {
         assert!(devin.capabilities.ingress_routes.is_empty());
         assert!(reg.get(&DEVIN_CHAT_V1).is_none());
         assert!(reg.list_by_protocol(Protocol::DevinChat).is_empty());
-        assert_eq!(reg.list_endpoints().len(), reg.list().len() + 1);
+        // Devin and Kiro are the descriptor-only vendor-stream endpoints.
+        assert_eq!(reg.list_endpoints().len(), reg.list().len() + 2);
         assert!(reg.routes.iter().all(|route| route.id != DEVIN_CHAT_V1));
         assert_eq!(reg.protocol_of(&DEVIN_CHAT_V1), Some(Protocol::DevinChat));
-        for alias in ["devin-chat", "devin-chat/get-chat-message/v1", " DEVIN-CHAT "] {
+        for alias in [
+            "devin-chat",
+            "devin-chat/get-chat-message/v1",
+            " DEVIN-CHAT ",
+        ] {
             assert_eq!(reg.resolve_alias(alias), Some(DEVIN_CHAT_V1));
-            assert_eq!(reg.normalize_string(alias), "devin-chat/get-chat-message/v1");
+            assert_eq!(
+                reg.normalize_string(alias),
+                "devin-chat/get-chat-message/v1"
+            );
         }
         assert_eq!(reg.parse_protocol("devin-chat"), Some(Protocol::DevinChat));
         assert_eq!(reg.resolve_alias("devin-chat/get-chat-message/v2"), None);
+    }
+
+    #[test]
+    fn kiro_is_descriptor_only_and_has_no_ingress_route() {
+        let reg = ProtocolRegistry::global();
+        let kiro = reg.describe(&KIRO_CHAT_V1).unwrap();
+        assert_eq!(kiro.id, KIRO_CHAT_V1);
+        assert_eq!(kiro.execution, ExecutionKind::VendorStream);
+        assert!(kiro.capabilities.streaming && kiro.capabilities.tools);
+        assert!(!kiro.capabilities.stream.server_sent_events);
+        assert!(kiro.capabilities.ingress_routes.is_empty());
+        assert!(reg.get(&KIRO_CHAT_V1).is_none());
+        assert!(reg.list_by_protocol(Protocol::KiroChat).is_empty());
+        assert!(reg.routes.iter().all(|route| route.id != KIRO_CHAT_V1));
+        assert_eq!(reg.protocol_of(&KIRO_CHAT_V1), Some(Protocol::KiroChat));
+        for alias in [
+            "kiro-chat",
+            "kiro-chat/generate-assistant-response/v1",
+            " KIRO-CHAT ",
+        ] {
+            assert_eq!(reg.resolve_alias(alias), Some(KIRO_CHAT_V1));
+            assert_eq!(
+                reg.normalize_string(alias),
+                "kiro-chat/generate-assistant-response/v1"
+            );
+        }
+        assert_eq!(reg.parse_protocol("kiro-chat"), Some(Protocol::KiroChat));
+        assert_eq!(
+            reg.resolve_alias("kiro-chat/generate-assistant-response/v2"),
+            None
+        );
     }
 
     #[test]

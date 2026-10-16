@@ -6,6 +6,7 @@ import { GitBranch, Pencil, Plus, Route as RouteIcon, Search, Trash2, ToggleRigh
 import { backend } from "@/lib/backend";
 import { localizeBackendErrorMessage } from "@/lib/backend-error";
 import { failedProbeModels } from "@/lib/model-probe";
+import { hasProviderModelCatalog } from "@/lib/native-provider";
 import type {
   CreateModel,
   CreateModelBackend,
@@ -110,11 +111,6 @@ function balanceLabel(value: ModelBalance, isZh: boolean) {
   if (value === "latency") return isZh ? "延迟优先" : "Latency";
   if (value === "usage") return isZh ? "用量优先" : "Usage";
   return isZh ? "加权轮询" : "Weighted";
-}
-
-function hasProviderModelsEndpoint(provider?: Provider) {
-  // Native catalogs are resolved server-side without a generic HTTP models URL.
-  return Boolean(provider?.models_source?.trim()) || provider?.vendor === "devin";
 }
 
 function withCurrentModel(options: string[], current?: string) {
@@ -300,7 +296,7 @@ function HelperModelRow({
   disableRemove: boolean;
 }) {
   const provider = providerMap.get(helper.provider_id);
-  const providerHasModelDiscovery = hasProviderModelsEndpoint(provider);
+  const providerHasModelDiscovery = hasProviderModelCatalog(provider);
   const { data: helperModels = [] } = useQuery<string[]>({
     queryKey: ["provider-models", "vision-helper", index, helper.provider_id],
     queryFn: () => backend("get_provider_models", { id: helper.provider_id }),
@@ -415,7 +411,7 @@ function TargetRow({
 }: TargetRowProps) {
   const [capsQueryModel, setCapsQueryModel] = useState("");
   const provider = providerMap.get(target.provider_id);
-  const providerHasModelDiscovery = hasProviderModelsEndpoint(provider);
+  const providerHasModelDiscovery = hasProviderModelCatalog(provider);
   const effectiveCapsQueryModel = target.provider_id && providerHasModelDiscovery
     ? capsQueryModel.trim()
     : "";

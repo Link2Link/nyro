@@ -4,12 +4,14 @@ mod devin;
 pub use devin::DevinAuthDriver;
 mod google;
 mod grok;
+mod kiro;
 mod openai;
 mod shared;
 
 pub use claude::ClaudeOAuthDriver;
 pub use google::{GoogleSubscriptionChannel, GoogleSubscriptionDriver};
 pub use grok::GrokOAuthDriver;
+pub use kiro::KiroAuthDriver;
 pub use openai::OpenAIOAuthDriver;
 pub use shared::{
     PkceAuthState, build_authorize_url, encode_scopes, expires_at_after, generate_code_challenge,

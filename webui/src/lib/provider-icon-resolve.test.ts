@@ -6,7 +6,7 @@ import {
 
 /** The shipped catalog keys these cases exercise, plus the predicate shape the app passes. */
 const shipped = new Set(["nyro", "bailian", "doubao", "googlecloud", "kimi", "zhipu", "gemini",
-  "openai", "anthropic", "grok", "opencode-logo-light", "zai", "qwen", "deepseek", "minimax", "devin"]);
+  "openai", "anthropic", "grok", "opencode-logo-light", "zai", "qwen", "deepseek", "minimax", "devin", "aws"]);
 const available = (iconKey: string) => shipped.has(iconKey);
 const resolve = (source: Parameters<typeof resolveProviderIconKey>[0]) =>
   resolveProviderIconKey(source, available);
@@ -31,6 +31,12 @@ test("Devin identity and native Codeium host use the Devin monogram", () => {
   equal(resolve({ iconKey: "devin", name: "OpenAI relay", baseUrl: "https://api.openai.com" }), "devin");
   equal(resolve({ name: "My CLI", baseUrl: "https://server.codeium.com" }), "devin");
   equal(resolve({ iconKey: "cognition" }), "devin");
+});
+
+test("Kiro subscription identity uses the shipped AWS icon", () => {
+  for (const iconKey of ["kiro", "amazon-q", "codewhisperer"]) {
+    equal(resolve({ iconKey, name: "OpenAI relay", baseUrl: "https://api.openai.com" }), "aws");
+  }
 });
 
 test("the wire protocol never brands a provider", () => {

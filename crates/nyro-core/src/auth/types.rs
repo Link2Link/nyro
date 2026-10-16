@@ -143,6 +143,29 @@ pub struct AuthDriverMetadata {
     pub supports_existing_provider: bool,
 }
 
+/// Kiro's browser login and legacy credential import share one provider identity.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum KiroLoginMethod {
+    #[default]
+    Import,
+    Google,
+    Github,
+    BuilderId,
+    Idc,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KiroLoginOptions {
+    #[serde(default)]
+    pub method: KiroLoginMethod,
+    /// Generation/profile region, independent of the enterprise OIDC region.
+    pub region: Option<String>,
+    pub idc_region: Option<String>,
+    pub start_url: Option<String>,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct StartAuthContext {
     pub provider_id: Option<String>,
@@ -150,6 +173,7 @@ pub struct StartAuthContext {
     pub use_proxy: bool,
     pub redirect_uri: Option<String>,
     pub requested_scopes: Vec<String>,
+    pub kiro: Option<KiroLoginOptions>,
     pub metadata: Value,
     pub http_client: Option<reqwest::Client>,
 }
@@ -337,6 +361,11 @@ pub trait AuthDriver: Send + Sync {
 
     fn completion_mode(&self) -> AuthCompletionMode {
         AuthCompletionMode::legacy_scheme(self.metadata().scheme.as_str())
+    }
+
+    /// A provider may support multiple login grants while keeping its identity.
+    fn supports_session_scheme(&self, scheme: &str) -> bool {
+        scheme == self.metadata().scheme.as_str()
     }
 
     async fn start(&self, _ctx: StartAuthContext) -> anyhow::Result<CreateAuthSession> {

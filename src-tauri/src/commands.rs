@@ -256,9 +256,10 @@ pub async fn init_oauth_session(
     gw: State<'_, Gateway>,
     vendor: String,
     use_proxy: Option<bool>,
+    kiro: Option<nyro_core::auth::KiroLoginOptions>,
 ) -> Result<AuthSessionInitData, String> {
     gw.admin()
-        .init_oauth_session(&vendor, use_proxy.unwrap_or(false))
+        .init_oauth_session_with_options(&vendor, use_proxy.unwrap_or(false), kiro)
         .await
         .map_err(|e| e.to_string())
 }

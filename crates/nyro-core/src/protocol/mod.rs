@@ -155,7 +155,8 @@ impl ProviderProtocols {
     /// persisting provider configuration. Legacy JSON/HTTP provider semantics
     /// are unchanged.
     pub fn validate_provider(provider: &Provider) -> Result<(), GatewayError> {
-        crate::provider::devin::validate(provider)
+        crate::provider::devin::validate(provider)?;
+        crate::provider::kiro::validate(provider)
     }
 
     /// Checked construction for dispatch/admin callers that need an explicit
@@ -183,6 +184,18 @@ impl ProviderProtocols {
                     record_id: None,
                     protocol: ids::DEVIN_CHAT_V1,
                     base_url: ids::DEVIN_BASE_URL.to_string(),
+                    auth_scheme: "oauth".to_string(),
+                }],
+                adaptive: false,
+            };
+        }
+        if crate::provider::kiro::is_kiro(provider) {
+            return Self {
+                default: ids::KIRO_CHAT_V1,
+                endpoints: vec![ProviderProtocolTarget {
+                    record_id: None,
+                    protocol: ids::KIRO_CHAT_V1,
+                    base_url: provider.base_url.trim().trim_end_matches('/').to_string(),
                     auth_scheme: "oauth".to_string(),
                 }],
                 adaptive: false,

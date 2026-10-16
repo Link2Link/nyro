@@ -72,6 +72,11 @@
 //! usable once a window is spent, so it is part of the availability decision:
 //! an exhausted window only pauses scheduling when no extra balance is left
 //! (see [`devin_reserve_available`]).
+//!
+//! Kiro (IDE/CLI imported OAuth credential): `getUsageLimits` supplies pooled
+//! credits, active bonuses/trials and optional explicit overage opt-in. Component
+//! rows are display-only; same-resource allowances are additive for scheduling.
+//! No inferred account availability or unknown quota shape clears exhaustion.
 
 use futures::stream::{self, StreamExt};
 use reqwest::header::CONTENT_TYPE;
@@ -311,6 +316,8 @@ enum UsageBackend {
     /// Devin CLI subscription quota (plan, daily/weekly windows, extra-usage
     /// balance) via OAuth, read from `GetUserStatus`.
     Devin,
+    /// Kiro subscription credits, bonuses and trial via `getUsageLimits`.
+    Kiro,
 }
 
 impl UsageBackend {
@@ -358,6 +365,10 @@ impl UsageBackend {
         // it and must never route a lookalike provider here.
         if crate::provider::devin::is_devin(provider) {
             return Some(UsageBackend::Devin);
+        }
+        // Never infer Kiro credentials from a shared AWS hostname.
+        if crate::provider::kiro::is_kiro(provider) {
+            return Some(UsageBackend::Kiro);
         }
         // Google subscription channels (antigravity = Google AI Pro,
         // gemini-cli = Code Assist) share the Code Assist quota backend.
@@ -450,6 +461,7 @@ impl UsageBackend {
             UsageBackend::MimoBalance => "mimo_balance",
             UsageBackend::MimoTokenPlan => "mimo_token_plan",
             UsageBackend::Devin => "devin_plan",
+            UsageBackend::Kiro => "kiro_plan",
         }
     }
 
@@ -465,6 +477,7 @@ impl UsageBackend {
                     || tiers.iter().any(|tier| !tier.name.starts_with("feature:"))
             }
             UsageBackend::Grok | UsageBackend::Devin => is_available.is_some() || !tiers.is_empty(),
+            UsageBackend::Kiro => tiers.iter().any(|tier| !tier.name.starts_with("feature:")),
             _ => !tiers.is_empty(),
         }
     }
@@ -482,6 +495,7 @@ impl UsageBackend {
             | UsageBackend::OpenAiCodex
             | UsageBackend::Grok
             | UsageBackend::Devin
+            | UsageBackend::Kiro
             | UsageBackend::GoogleSubscription => "global",
             UsageBackend::ArkCoding | UsageBackend::BailianCodingPlan => "cn",
             // The MiMo console quota surface is account-scoped; the
@@ -693,6 +707,65 @@ fn tier_display_rank(name: &str) -> (u8, u8) {
         // Unknown names keep their arrival order — the sort is stable.
         _ => (2, 0),
     }
+}
+
+/// Kiro allowances for one resource are additive, unlike independent rate
+/// windows. Keep component rows for display only and observe each pooled total
+/// for scheduling, so an exhausted base cannot hide a still-usable trial/bonus.
+fn kiro_usage_tiers(usage: &crate::provider::kiro::KiroUsage) -> Vec<ProviderUsageTier> {
+    let mut pools =
+        std::collections::BTreeMap::<&str, (f64, f64, Option<chrono::DateTime<chrono::Utc>>)>::new(
+        );
+    let mut details = Vec::new();
+    for (index, item) in usage.items.iter().enumerate() {
+        if !item.used.is_finite() || !item.limit.is_finite() || item.used < 0.0 || item.limit < 0.0
+        {
+            continue;
+        }
+        // An explicit zero allowance is authoritative, unlike absent numbers.
+        // Free accounts may have base=0 and be usable only while a trial lasts.
+        let remaining = item.remaining_percent().unwrap_or(0.0);
+        let pool = pools.entry(&item.resource).or_default();
+        pool.0 += item.used.min(item.limit);
+        pool.1 += item.limit;
+        // Bonus/trial expiration is NOT a reset that replenishes credits.
+        if item.kind == "base" {
+            let reset = item.resets_at.or(usage.resets_at);
+            pool.2 = match (pool.2, reset) {
+                (Some(previous), Some(next)) => Some(previous.min(next)),
+                (previous, next) => previous.or(next),
+            };
+        }
+        details.push(ProviderUsageTier {
+            name: format!("feature:kiro:{}:{}:{index}", item.kind, item.name),
+            used_percent: 100.0 - remaining,
+            resets_at: item
+                .resets_at
+                .or_else(|| (item.kind == "base").then_some(usage.resets_at).flatten())
+                .map(|at| at.to_rfc3339()),
+        });
+    }
+    let single_pool = pools.len() == 1;
+    let mut tiers = pools
+        .into_iter()
+        .filter_map(|(resource, (used, limit, reset))| {
+            (used.is_finite() && limit.is_finite()).then(|| ProviderUsageTier {
+                name: if single_pool {
+                    TIER_MONTHLY.into()
+                } else {
+                    format!("kiro:{resource}")
+                },
+                used_percent: if limit > 0.0 {
+                    (used / limit * 100.0).clamp(0.0, 100.0)
+                } else {
+                    100.0
+                },
+                resets_at: reset.map(|at| at.to_rfc3339()),
+            })
+        })
+        .collect::<Vec<_>>();
+    tiers.extend(details);
+    tiers
 }
 
 /// Currency of Devin's extra-usage balance.
@@ -2272,7 +2345,7 @@ impl AdminService {
         mode: UsageQueryMode,
     ) -> anyhow::Result<ProviderUsage> {
         match self.query_provider_usage(id, mode).await {
-            Ok((mut usage, true)) => {
+            Ok((mut usage, true, kiro_overage)) => {
                 // Feature-specific windows (Codex metered features such as
                 // Spark) are informational. Exhausting one feature must not
                 // pause the provider's main routing quota.
@@ -2293,7 +2366,8 @@ impl AdminService {
                 };
                 // An exhausted window only pauses the provider when no prepaid
                 // extra-usage balance is left to carry the traffic.
-                let reserve_available = devin_reserve_available(&usage.kind, &usage.balances);
+                let reserve_available = devin_reserve_available(&usage.kind, &usage.balances)
+                    || (usage.kind == UsageBackend::Kiro.kind() && kiro_overage);
                 usage.scheduling = self.gw.quota_registry.observe_with_reserve(
                     &usage.provider_id,
                     &tiers,
@@ -2302,7 +2376,7 @@ impl AdminService {
                 );
                 Ok(usage)
             }
-            Ok((mut usage, false)) => {
+            Ok((mut usage, false, _)) => {
                 tracing::warn!(
                     provider_id = %usage.provider_id,
                     kind = %usage.kind,
@@ -2322,7 +2396,7 @@ impl AdminService {
         &self,
         id: &str,
         mode: UsageQueryMode,
-    ) -> anyhow::Result<(ProviderUsage, bool)> {
+    ) -> anyhow::Result<(ProviderUsage, bool, bool)> {
         let provider = self.get_provider(id).await?;
 
         let backend = UsageBackend::detect(&provider).ok_or_else(|| {
@@ -2332,7 +2406,7 @@ impl AdminService {
                  Kimi (api.kimi.com), OpenCode Go (opencode.ai/zen), Ark \
                  (volces.com), Bailian token-plan (token-plan.maas.aliyuncs.com), \
                  DeepSeek (api.deepseek.com), Xiaomi MiMo (platform.xiaomimimo.com,
-                 Cookie-authenticated console quota), Devin CLI OAuth and Google \
+                 Cookie-authenticated console quota), Devin CLI OAuth, Kiro OAuth and Google \
                  subscription OAuth (Google AI Pro / Code Assist) are supported"
             )
         })?;
@@ -2342,6 +2416,7 @@ impl AdminService {
             UsageBackend::OpenAiCodex
                 | UsageBackend::Grok
                 | UsageBackend::Devin
+                | UsageBackend::Kiro
                 | UsageBackend::GoogleSubscription
         ) {
             None
@@ -2352,6 +2427,7 @@ impl AdminService {
             )
         };
 
+        let mut kiro_overage = false;
         let (mut tiers, balances, level, is_available, spends) = match backend {
             UsageBackend::OpenAiCodex => {
                 if provider.effective_auth_mode().trim() != "oauth" {
@@ -2798,6 +2874,32 @@ impl AdminService {
                 let (level, tiers, balances, is_available) = devin_usage_parts(&usage);
                 (tiers, balances, level, is_available, Vec::new())
             }
+            UsageBackend::Kiro => {
+                crate::provider::kiro::validate(&provider)?;
+                let runtime = self
+                    .resolve_provider_runtime(&provider)
+                    .await
+                    .context("resolve Kiro OAuth runtime for usage query")?;
+                let credential = runtime
+                    .credential
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("Kiro OAuth credential is missing"))?;
+                let usage = crate::provider::kiro::fetch_usage(
+                    &self.gw,
+                    &provider,
+                    credential,
+                    runtime.access_token.trim(),
+                )
+                .await?;
+                kiro_overage = usage.overage_enabled;
+                (
+                    kiro_usage_tiers(&usage),
+                    Vec::new(),
+                    usage.plan,
+                    None,
+                    Vec::new(),
+                )
+            }
             UsageBackend::GoogleSubscription => {
                 if provider.effective_auth_mode().trim() != "oauth" {
                     anyhow::bail!("Google subscription usage query requires an OAuth provider");
@@ -2888,6 +2990,7 @@ impl AdminService {
                 queried_at: chrono::Utc::now().to_rfc3339(),
             },
             authoritative,
+            kiro_overage,
         ))
     }
 
@@ -2944,6 +3047,9 @@ async fn provider_usage_monitorable(admin: &AdminService, provider: &Provider) -
     let Some(backend) = UsageBackend::detect(provider) else {
         return false;
     };
+    if backend == UsageBackend::Kiro && crate::provider::kiro::validate(provider).is_err() {
+        return false;
+    }
     // OAuth backends carry no API key; they are monitorable whenever the
     // provider is in OAuth mode.
     if matches!(
@@ -2951,6 +3057,7 @@ async fn provider_usage_monitorable(admin: &AdminService, provider: &Provider) -
         UsageBackend::OpenAiCodex
             | UsageBackend::Grok
             | UsageBackend::Devin
+            | UsageBackend::Kiro
             | UsageBackend::GoogleSubscription
     ) {
         return provider.effective_auth_mode().trim() == "oauth";
@@ -3553,6 +3660,201 @@ mod tests {
             created_at: String::new(),
             updated_at: String::new(),
         }
+    }
+
+    fn kiro_provider() -> Provider {
+        let mut provider = provider_for_usage(
+            Some("kiro"),
+            Some("kiro"),
+            Some("ide"),
+            "https://q.us-east-1.amazonaws.com",
+        );
+        provider.protocol = crate::provider::kiro::PROTOCOL_KEY.into();
+        provider
+    }
+
+    fn kiro_snapshot(
+        base_used: f64,
+        bonus_used: f64,
+        overage: bool,
+    ) -> crate::provider::kiro::KiroUsage {
+        crate::provider::kiro::usage::parse(&serde_json::json!({
+            "subscriptionInfo": {"subscriptionTitle": "KIRO PRO"},
+            "overageConfiguration": {"overageEnabled": overage},
+            "nextDateReset": (chrono::Utc::now() + chrono::Duration::days(10)).timestamp(),
+            "usageBreakdownList": [{
+                "resourceType": "AGENTIC_REQUEST", "displayName": "Credits",
+                "currentUsageWithPrecision": base_used, "usageLimit": 100,
+                "bonuses": [{"bonusCode": "PROMO", "currentUsage": bonus_used, "usageLimit": 50}]
+            }]
+        }))
+    }
+
+    #[test]
+    fn kiro_usage_detects_identity_not_aws_host_and_requires_authoritative_pool() {
+        assert_eq!(
+            UsageBackend::detect(&kiro_provider()),
+            Some(UsageBackend::Kiro)
+        );
+        assert_eq!(UsageBackend::Kiro.kind(), "kiro_plan");
+        assert_eq!(UsageBackend::Kiro.site(), "global");
+        assert!(usage_api_key(&kiro_provider()).is_none());
+        let mut lookalike = kiro_provider();
+        lookalike.vendor = Some("custom".into());
+        assert_eq!(UsageBackend::detect(&lookalike), None);
+        assert!(!UsageBackend::Kiro.has_authoritative_observation(&[], Some(true)));
+        assert!(
+            !UsageBackend::Kiro.has_authoritative_observation(
+                &[tier("feature:kiro:bonus:Promo:0", 0.0, None)],
+                None,
+            )
+        );
+        assert!(
+            UsageBackend::Kiro
+                .has_authoritative_observation(&[tier(TIER_MONTHLY, 50.0, None)], None,)
+        );
+    }
+
+    #[test]
+    fn kiro_usage_pools_bonus_credits_without_prematurely_pausing() {
+        use crate::router::quota::ProviderQuotaRegistry;
+        let usage = kiro_snapshot(100.0, 0.0, false);
+        assert_eq!(usage.plan.as_deref(), Some("PRO"));
+        let tiers = kiro_usage_tiers(&usage);
+        assert_eq!(tiers.len(), 3);
+        assert_eq!(tiers[0].name, TIER_MONTHLY);
+        assert!((tiers[0].used_percent - 100.0 / 150.0 * 100.0).abs() < 1e-8);
+        assert_eq!(tiers[1].used_percent, 100.0);
+        assert!(tiers[1].name.starts_with("feature:kiro:base:"));
+        let registry = ProviderQuotaRegistry::new();
+        let observe = |usage: &crate::provider::kiro::KiroUsage| {
+            let pooled = kiro_usage_tiers(usage)
+                .into_iter()
+                .filter(|t| !t.name.starts_with("feature:"))
+                .map(|t| QuotaTierObservation {
+                    name: t.name,
+                    used_percent: t.used_percent,
+                    resets_at: t.resets_at,
+                })
+                .collect::<Vec<_>>();
+            registry.observe_with_reserve("kiro", &pooled, None, usage.overage_enabled)
+        };
+        observe(&usage);
+        assert!(registry.is_schedulable("kiro"));
+        assert!(!registry.is_on_reserve("kiro"));
+        let depleted = kiro_snapshot(100.0, 50.0, false);
+        let state = observe(&depleted);
+        assert!(!registry.is_schedulable("kiro"));
+        assert_eq!(state.blocking_tiers, [TIER_MONTHLY]);
+        assert!(state.reset_at.is_some());
+        // Unknown/malformed query results must not clear existing depletion.
+        let unknown = kiro_usage_tiers(&Default::default());
+        assert!(!UsageBackend::Kiro.has_authoritative_observation(&unknown, None));
+        registry.record_query_failure("kiro");
+        assert!(!registry.is_schedulable("kiro"));
+        observe(&kiro_snapshot(100.0, 50.0, true));
+        assert!(registry.is_schedulable("kiro"));
+        assert!(registry.is_on_reserve("kiro"));
+        observe(&kiro_snapshot(0.0, 0.0, false));
+        assert!(registry.is_schedulable("kiro"));
+        assert!(!registry.is_on_reserve("kiro"));
+    }
+
+    #[test]
+    fn kiro_zero_base_becomes_exhausted_when_trial_expires_and_clears_reserve() {
+        use crate::router::quota::ProviderQuotaRegistry;
+        let registry = ProviderQuotaRegistry::new();
+        let snapshot = |expiry: i64, overage: bool| {
+            crate::provider::kiro::usage::parse(&serde_json::json!({
+                "overageConfiguration":{"overageEnabled":overage},
+                "usageBreakdownList":[{
+                    "resourceType":"AGENTIC_REQUEST","currentUsage":0,"usageLimit":0,
+                    "freeTrialInfo":{"currentUsage":0,"usageLimit":10,"freeTrialExpiry":expiry}
+                }]
+            }))
+        };
+        let observe = |usage: &crate::provider::kiro::KiroUsage| {
+            let tiers = kiro_usage_tiers(usage);
+            assert!(UsageBackend::Kiro.has_authoritative_observation(&tiers, None));
+            let pools = tiers
+                .into_iter()
+                .filter(|t| !t.name.starts_with("feature:"))
+                .map(|t| QuotaTierObservation {
+                    name: t.name,
+                    used_percent: t.used_percent,
+                    resets_at: t.resets_at,
+                })
+                .collect::<Vec<_>>();
+            registry.observe_with_reserve("kiro", &pools, None, usage.overage_enabled)
+        };
+        observe(&snapshot(
+            (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp(),
+            false,
+        ));
+        assert!(registry.is_schedulable("kiro"));
+        observe(&snapshot(1, false));
+        assert!(!registry.is_schedulable("kiro"));
+        observe(&snapshot(1, true));
+        assert!(registry.is_on_reserve("kiro"));
+        observe(&snapshot(1, false));
+        assert!(!registry.is_schedulable("kiro"));
+        assert!(!registry.is_on_reserve("kiro"));
+    }
+
+    #[test]
+    fn kiro_usage_keeps_resource_pools_separate_and_expiry_is_not_reset() {
+        let usage = crate::provider::kiro::usage::parse(&serde_json::json!({
+            "usageBreakdownList": [
+                {"resourceType":"A", "currentUsage":100, "usageLimit":100},
+                {"resourceType":"B", "freeTrialInfo":{
+                    "currentUsage":2, "usageLimit":20,
+                    "freeTrialExpiry": (chrono::Utc::now() + chrono::Duration::days(5)).timestamp()
+                }}
+            ]
+        }));
+        let tiers = kiro_usage_tiers(&usage);
+        assert_eq!(tiers[0].name, "kiro:A");
+        assert_eq!(tiers[0].used_percent, 100.0);
+        assert_eq!(tiers[1].name, "kiro:B");
+        assert_eq!(tiers[1].used_percent, 10.0);
+        assert!(
+            tiers[1].resets_at.is_none(),
+            "trial expiration cannot replenish credits"
+        );
+    }
+
+    #[tokio::test]
+    async fn kiro_oauth_is_monitorable_and_missing_credential_is_not_unsupported()
+    -> anyhow::Result<()> {
+        let data_dir =
+            std::env::temp_dir().join(format!("nyro-kiro-usage-{}", uuid::Uuid::new_v4()));
+        let (gw, _) = Gateway::new(crate::config::GatewayConfig {
+            data_dir: data_dir.clone(),
+            ..Default::default()
+        })
+        .await?;
+        let admin = gw.admin();
+        let mut provider = kiro_provider();
+        assert!(provider_usage_monitorable(&admin, &provider).await);
+        provider.is_enabled = false;
+        assert!(!provider_usage_monitorable(&admin, &provider).await);
+        provider.is_enabled = true;
+        provider.auth_mode = "apikey".into();
+        assert!(!provider_usage_monitorable(&admin, &provider).await);
+        let created = admin
+            .create_provider(serde_json::from_value(serde_json::json!({
+                "name":"Kiro usage fixture", "vendor":"kiro", "preset_key":"kiro", "channel":"ide",
+                "protocol":crate::provider::kiro::PROTOCOL_KEY,
+                "base_url":"https://q.us-east-1.amazonaws.com", "api_key":"", "auth_mode":"oauth"
+            }))?)
+            .await?;
+        let error = admin.get_provider_usage(&created.id).await.unwrap_err();
+        assert!(!error.to_string().contains("not supported"), "{error:#}");
+        assert!(format!("{error:#}").contains("credential"), "{error:#}");
+        drop(admin);
+        drop(gw);
+        let _ = std::fs::remove_dir_all(data_dir);
+        Ok(())
     }
 
     use crate::provider::devin::{DevinQuota, DevinUsage};

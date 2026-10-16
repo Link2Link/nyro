@@ -402,6 +402,28 @@ mod tests {
     }
 
     #[test]
+    fn kiro_plans_use_vendor_execution_for_every_json_ingress() {
+        use crate::protocol::ids::{KIRO_CHAT_V1, KIRO_DEFAULT_BASE_URL, OPENAI_RESPONSES_V1};
+        let decl = make_decl(KIRO_CHAT_V1, KIRO_DEFAULT_BASE_URL);
+        let mut c = ctx();
+        for ingress in [
+            ANTHROPIC_MESSAGES_2023_06_01,
+            OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1,
+            OPENAI_RESPONSES_V1,
+        ] {
+            for pref in [None, Some(KIRO_CHAT_V1)] {
+                let plan = negotiate(ingress, pref, Some(&decl), &mut c).unwrap();
+                assert_eq!(plan.egress, KIRO_CHAT_V1);
+                assert_eq!(plan.execution, ExecutionKind::VendorStream);
+                assert!(plan.needs_conversion);
+            }
+        }
+        // Kiro is egress-only: it has no ingress route and no embeddings.
+        assert!(negotiate(KIRO_CHAT_V1, None, Some(&decl), &mut c).is_err());
+        assert!(negotiate(OPENAI_COMPATIBLE_EMBEDDINGS_V1, None, Some(&decl), &mut c).is_err());
+    }
+
+    #[test]
     fn devin_default_preferred_and_required_plans_use_vendor_execution() {
         use crate::protocol::ids::{DEVIN_BASE_URL, DEVIN_CHAT_V1};
         let decl = make_decl(DEVIN_CHAT_V1, DEVIN_BASE_URL);

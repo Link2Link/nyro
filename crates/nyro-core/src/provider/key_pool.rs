@@ -45,7 +45,7 @@ pub(crate) fn resolve_endpoint(
     })?;
     if matches!(
         protocol.protocol,
-        crate::protocol::ids::Protocol::DevinChat
+        crate::protocol::ids::Protocol::DevinChat | crate::protocol::ids::Protocol::KiroChat
     ) {
         return Err(GatewayError::provider_unavailable(
             &provider.id,
@@ -322,7 +322,12 @@ mod tests {
         for adaptive in [false, true] {
             let p = provider("openai-compatible", "https://relay.test/v1", adaptive);
             let mut k = key("a", 0, true, None);
-            for pin in ["devin-chat", "devin-chat/get-chat-message/v1"] {
+            for pin in [
+                "devin-chat",
+                "devin-chat/get-chat-message/v1",
+                "kiro-chat",
+                "kiro-chat/generate-assistant-response/v1",
+            ] {
                 k.protocol = Some(pin.into());
                 assert!(resolve_endpoint(&p, Some(&k), "m").is_err());
             }

@@ -64,8 +64,7 @@ fn validate_oauth_session_for_provider(
             "auth vendor does not support binding an existing provider: {session_driver}"
         );
     }
-    let expected_scheme = driver.metadata().scheme.as_str();
-    if session.scheme.trim() != expected_scheme {
+    if !driver.supports_session_scheme(session.scheme.trim()) {
         anyhow::bail!(
             "OAuth session scheme '{}' is incompatible with provider driver '{}'",
             session.scheme,
@@ -83,6 +82,14 @@ fn validate_oauth_session_for_provider(
             || provider.base_url.trim_end_matches('/') != "https://server.codeium.com")
     {
         anyhow::bail!("Devin OAuth session can only bind to the official devin/cli channel");
+    }
+    if session_driver == "kiro"
+        && (!crate::provider::kiro::is_kiro(provider)
+            || provider.channel.as_deref() != Some("ide")
+            || provider.preset_key.as_deref() != Some("kiro")
+            || provider.protocol_mode != "fixed")
+    {
+        anyhow::bail!("Kiro OAuth session can only bind to the kiro/ide channel");
     }
     if session_driver == "codex"
         && (provider.protocol.trim() != "openai-responses"
@@ -139,19 +146,56 @@ fn validate_oauth_session_for_provider(
     Ok(())
 }
 
+fn refreshed_scheme<'a>(
+    driver: &dyn auth::AuthDriver,
+    credential: &'a StoredCredential,
+) -> &'a str {
+    if driver.supports_session_scheme(&credential.scheme) {
+        &credential.scheme
+    } else {
+        driver.metadata().scheme.as_str()
+    }
+}
+
+fn login_session_deadline(driver_expiry: Option<&str>) -> anyhow::Result<String> {
+    let now = Utc::now();
+    let cap = now + chrono::Duration::seconds(300);
+    let expiry = match driver_expiry {
+        Some(raw) => parse_datetime_utc(raw)
+            .ok_or_else(|| anyhow::anyhow!("auth driver returned an invalid login deadline"))?
+            .min(cap),
+        None => cap,
+    };
+    anyhow::ensure!(expiry > now, "auth session has already expired");
+    Ok(expiry.to_rfc3339())
+}
+
 impl AdminService {
     pub async fn init_oauth_session(
         &self,
         vendor: &str,
         use_proxy: bool,
     ) -> anyhow::Result<AuthSessionInitData> {
+        self.init_oauth_session_with_options(vendor, use_proxy, None)
+            .await
+    }
+
+    pub async fn init_oauth_session_with_options(
+        &self,
+        vendor: &str,
+        use_proxy: bool,
+        kiro: Option<auth::KiroLoginOptions>,
+    ) -> anyhow::Result<AuthSessionInitData> {
         let driver_key = auth::normalize_driver_key(vendor);
+        if kiro.is_some() && driver_key != "kiro" {
+            anyhow::bail!("Kiro login options require the Kiro provider");
+        }
         if driver_key.is_empty() {
             anyhow::bail!("auth vendor cannot be empty");
         }
         let driver = auth::build_driver(&driver_key)
             .ok_or_else(|| anyhow::anyhow!("auth vendor not implemented: {driver_key}"))?;
-        let client = if driver_key == "devin" {
+        let client = if matches!(driver_key.as_str(), "devin" | "kiro") {
             self.gw.devin_http_client(use_proxy, false).await?
         } else {
             self.gw.http_client_for_provider(use_proxy).await?
@@ -159,6 +203,7 @@ impl AdminService {
         let mut created = driver
             .start(StartAuthContext {
                 use_proxy,
+                kiro,
                 http_client: Some(client),
                 ..Default::default()
             })
@@ -169,13 +214,25 @@ impl AdminService {
             .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
             .and_then(|value| value.as_object().cloned())
             .unwrap_or_default();
-        context.insert(
-            "completion_mode".into(),
-            serde_json::to_value(driver.completion_mode())?,
+        // Only driver-generated context can select a completion transport. A
+        // multi-grant driver can use polling without changing provider identity.
+        if let Some(mode) = context.get("completion_mode") {
+            serde_json::from_value::<auth::AuthCompletionMode>(mode.clone())
+                .context("auth driver returned an invalid completion mode")?;
+        } else {
+            context.insert(
+                "completion_mode".into(),
+                serde_json::to_value(driver.completion_mode())?,
+            );
+        }
+        anyhow::ensure!(
+            driver.supports_session_scheme(&created.scheme),
+            "auth driver returned an unsupported login scheme"
         );
         created.context_json = Some(serde_json::to_string(&context)?);
-        // A login session is not a credential: never inherit token lifetime.
-        created.expires_at = Some(auth::drivers::expires_at_after(300));
+        // Bound local session lifetime, but never extend a shorter upstream
+        // device-code deadline. Credential lifetimes only begin after exchange.
+        created.expires_at = Some(login_session_deadline(created.expires_at.as_deref())?);
         let session = self.create_auth_session_record(created).await?;
         build_auth_session_init_data(&session)
     }
@@ -234,10 +291,8 @@ impl AdminService {
             return Ok(build_auth_session_pending_data(&session));
         };
         let operation = async {
-            let client = if session.driver_key == "devin" {
-                self.gw
-                    .devin_http_client(session.use_proxy, false)
-                    .await?
+            let client = if matches!(session.driver_key.as_str(), "devin" | "kiro") {
+                self.gw.devin_http_client(session.use_proxy, false).await?
             } else {
                 self.gw.http_client_for_provider(session.use_proxy).await?
             };
@@ -334,10 +389,8 @@ impl AdminService {
             .await?
             .ok_or_else(|| anyhow::anyhow!("auth session completion already in progress"))?;
         let operation = async {
-            let client = if session.driver_key == "devin" {
-                self.gw
-                    .devin_http_client(session.use_proxy, false)
-                    .await?
+            let client = if matches!(session.driver_key.as_str(), "devin" | "kiro") {
+                self.gw.devin_http_client(session.use_proxy, false).await?
             } else {
                 self.gw.http_client_for_provider(session.use_proxy).await?
             };
@@ -399,6 +452,16 @@ impl AdminService {
             return Ok(None);
         }
         control.in_flight.store(true, Ordering::Release);
+        if poll {
+            // Charge the interval even if a network/parse error prevents a
+            // progress publication; clients cannot hot-loop the token endpoint.
+            control.next_poll_at = Some(
+                tokio::time::Instant::now()
+                    + std::time::Duration::from_secs(
+                        session.poll_interval_seconds.unwrap_or(2).max(1) as u64,
+                    ),
+            );
+        }
         control.generation += 1;
         session.generation = control.generation;
         Ok(Some(SessionFlight {
@@ -482,7 +545,12 @@ impl AdminService {
         controls.insert(
             session.id.clone(),
             auth::AuthSessionControl {
-                next_poll_at: Some(tokio::time::Instant::now() + std::time::Duration::from_secs(2)),
+                next_poll_at: Some(
+                    tokio::time::Instant::now()
+                        + std::time::Duration::from_secs(
+                            session.poll_interval_seconds.unwrap_or(2).max(1) as u64,
+                        ),
+                ),
                 ..Default::default()
             },
         );
@@ -666,6 +734,20 @@ impl AdminService {
             input.protocol_endpoints.clear();
             input.base_url = "https://server.codeium.com".into();
         }
+        if session_driver == "kiro" {
+            input.vendor = Some("kiro".into());
+            input.preset_key = Some("kiro".into());
+            input.channel = Some("ide".into());
+            input.protocol = crate::provider::kiro::PROTOCOL_KEY.into();
+            input.protocol_mode = "fixed".into();
+            input.protocol_endpoints.clear();
+            // The regional origin comes from the imported credential.
+            input.base_url = bundle
+                .resource_url
+                .clone()
+                .filter(|url| crate::provider::kiro::credential::region_from_origin(url).is_some())
+                .unwrap_or_else(|| crate::protocol::ids::KIRO_DEFAULT_BASE_URL.into());
+        }
         if session_driver == "codex" {
             input.preset_key = Some("openai".to_string());
             input.channel = Some("codex".to_string());
@@ -845,8 +927,11 @@ impl AdminService {
         let bundle = self
             .refresh_locked_credential(&provider, &credential, &refresh_lock, driver.as_ref())
             .await?;
-        let refreshed_credential =
-            stored_credential_from_bundle(&driver_key, driver.metadata().scheme.as_str(), &bundle);
+        let refreshed_credential = stored_credential_from_bundle(
+            &driver_key,
+            refreshed_scheme(driver.as_ref(), &credential),
+            &bundle,
+        );
         let refreshed_provider = self
             .sync_provider_runtime_fields(&provider, &refreshed_credential)
             .await?;
@@ -1128,8 +1213,11 @@ impl AdminService {
         let bundle = self
             .refresh_locked_credential(provider, &credential, &refresh_lock, driver.as_ref())
             .await?;
-        let refreshed_credential =
-            stored_credential_from_bundle(&driver_key, driver.metadata().scheme.as_str(), &bundle);
+        let refreshed_credential = stored_credential_from_bundle(
+            &driver_key,
+            refreshed_scheme(driver.as_ref(), &credential),
+            &bundle,
+        );
         let refreshed_provider = self
             .sync_provider_runtime_fields(provider, &refreshed_credential)
             .await?;
@@ -1178,6 +1266,10 @@ impl AdminService {
                 &provider.id,
                 UpdateProvider {
                     base_url: Some(base_url),
+                    // Native Kiro transport derives its endpoint from the new
+                    // credential. Drop the legacy mirror atomically when a
+                    // re-import changes regions; a stale mirror fails validation.
+                    protocol_endpoints: crate::provider::kiro::is_kiro(provider).then(Vec::new),
                     models_source,
                     api_key: Some(String::new()),
                     auth_mode: Some("oauth".to_string()),
@@ -1271,7 +1363,7 @@ impl AdminService {
             {
                 anyhow::bail!("provider oauth refresh token is missing; reauthentication required");
             }
-            let client = if driver.metadata().key == "devin" {
+            let client = if matches!(driver.metadata().key, "devin" | "kiro") {
                 self.gw.devin_http_client(provider.use_proxy, false).await?
             } else {
                 self.gw.http_client_for_provider(provider.use_proxy).await?
@@ -1304,7 +1396,7 @@ impl AdminService {
             }
             let candidate = stored_credential_from_bundle(
                 driver.metadata().key,
-                driver.metadata().scheme.as_str(),
+                refreshed_scheme(driver, credential),
                 &bundle,
             );
             // Validate binding before persisting or making the new token visible.
@@ -1332,7 +1424,7 @@ impl AdminService {
         };
         let input = upsert_credential_from_bundle(
             driver.metadata().key,
-            driver.metadata().scheme.as_str(),
+            refreshed_scheme(driver, credential),
             &bundle,
         );
         match tokio::time::timeout_at(
@@ -1388,8 +1480,11 @@ impl AdminService {
         let bundle = self
             .refresh_locked_credential(provider, &credential, &refresh_lock, driver.as_ref())
             .await?;
-        let refreshed_credential =
-            stored_credential_from_bundle(&driver_key, driver.metadata().scheme.as_str(), &bundle);
+        let refreshed_credential = stored_credential_from_bundle(
+            &driver_key,
+            refreshed_scheme(driver.as_ref(), &credential),
+            &bundle,
+        );
         self.sync_provider_runtime_fields(provider, &refreshed_credential)
             .await?;
         self.bump_config_epoch().await?;
@@ -1496,6 +1591,352 @@ mod lifecycle_tests {
         Ok(())
     }
 
+    #[test]
+    fn login_deadline_caps_but_never_extends_device_expiry() {
+        let short = (Utc::now() + chrono::Duration::seconds(30)).to_rfc3339();
+        assert_eq!(login_session_deadline(Some(&short)).unwrap(), short);
+        let cap = login_session_deadline(Some("2099-01-01T00:00:00Z")).unwrap();
+        assert!((295..=300).contains(&remaining_seconds_until(Some(&cap))));
+        assert!(login_session_deadline(Some("2000-01-01T00:00:00Z")).is_err());
+        assert!(login_session_deadline(Some("invalid")).is_err());
+    }
+
+    #[tokio::test]
+    async fn kiro_login_options_are_typed_scoped_and_import_stays_compatible() -> anyhow::Result<()>
+    {
+        let gw = gateway().await?;
+        let admin = gw.admin();
+        assert!(
+            serde_json::from_value::<auth::KiroLoginOptions>(
+                serde_json::json!({"method":"unknown"})
+            )
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<auth::KiroLoginOptions>(
+                serde_json::json!({"completion_mode":"poll"})
+            )
+            .is_err()
+        );
+        assert!(
+            admin
+                .init_oauth_session_with_options("codex", false, Some(Default::default()))
+                .await
+                .is_err()
+        );
+        let init = admin
+            .init_oauth_session_with_options("kiro", false, Some(Default::default()))
+            .await?;
+        assert_eq!(
+            init.completion_mode,
+            Some(auth::AuthCompletionMode::ManualExchange)
+        );
+        assert!(init.auth_url.is_empty());
+        admin.cancel_oauth_session(&init.session_id).await?;
+        Ok(())
+    }
+
+    // Driver HTTP tests exercise real device responses. These fixture sessions
+    // verify admin lifecycle, secret boundaries and binding without live login.
+    async fn device_session(admin: &AdminService) -> anyhow::Result<AuthSession> {
+        admin
+            .create_auth_session_record(auth::CreateAuthSession {
+                provider_id: None,
+                driver_key: "kiro".into(),
+                scheme: AuthScheme::OAuthDeviceCode.as_str().into(),
+                status: "pending".into(),
+                use_proxy: false,
+                user_code: Some("ABCD-EFGH".into()),
+                verification_uri: Some("https://app.kiro.dev/device".into()),
+                verification_uri_complete: None,
+                state_json: Some(
+                    r#"{"deviceCode":"PRIVATE-DEVICE","clientSecret":"PRIVATE-CLIENT"}"#.into(),
+                ),
+                context_json: Some(r#"{"completion_mode":"poll"}"#.into()),
+                result_json: None,
+                expires_at: Some(auth::drivers::expires_at_after(60)),
+                poll_interval_seconds: Some(10),
+                last_error: None,
+            })
+            .await
+    }
+
+    #[tokio::test]
+    async fn kiro_device_session_public_status_cadence_cancel_and_bind() -> anyhow::Result<()> {
+        let gw = gateway().await?;
+        let admin = gw.admin();
+        let session = device_session(&admin).await?;
+        let init = build_auth_session_init_data(&session)?;
+        assert_eq!(init.completion_mode, Some(auth::AuthCompletionMode::Poll));
+        assert!(!init.requires_manual_code);
+        assert_eq!(init.auth_url, "https://app.kiro.dev/device");
+        assert_eq!(init.interval, 10);
+        let public = serde_json::to_string(&init)?;
+        assert!(!public.contains("PRIVATE"));
+        let pending = admin.get_oauth_session_status(&session.id).await?;
+        assert!(matches!(
+            pending,
+            AuthSessionStatusData::Pending { interval: 10, .. }
+        ));
+        assert!(!serde_json::to_string(&pending)?.contains("PRIVATE"));
+        assert!(
+            admin
+                .complete_oauth_session(&session.id, Default::default())
+                .await
+                .is_err()
+        );
+        assert!(
+            admin
+                .begin_session_flight(&session.id, true)
+                .await?
+                .is_none()
+        );
+        gw.auth_session_controls
+            .lock()
+            .await
+            .get_mut(&session.id)
+            .unwrap()
+            .next_poll_at = None;
+        let flight = admin
+            .begin_session_flight(&session.id, true)
+            .await?
+            .unwrap();
+        let updated = admin
+            .publish_session_progress(
+                &session.id,
+                &flight,
+                UpdateAuthSession {
+                    poll_interval_seconds: Some(15),
+                    ..Default::default()
+                },
+            )
+            .await?;
+        assert_eq!(updated.poll_interval_seconds, Some(15));
+        admin.cancel_oauth_session(&session.id).await?;
+        assert!(
+            admin
+                .publish_session_progress(
+                    &session.id,
+                    &flight,
+                    UpdateAuthSession {
+                        status: Some("ready".into()),
+                        ..Default::default()
+                    }
+                )
+                .await
+                .is_err()
+        );
+
+        let session = device_session(&admin).await?;
+        let bundle = CredentialBundle {
+            access_token: Some("PRIVATE-AT".into()),
+            refresh_token: Some("PRIVATE-RT".into()),
+            expires_at: Some((Utc::now() + chrono::Duration::hours(1)).to_rfc3339()),
+            resource_url: Some("https://q.us-east-1.amazonaws.com".into()),
+            raw: serde_json::json!({"auth_method":"social","region":"us-east-1"}),
+            ..Default::default()
+        };
+        admin
+            .update_auth_session_record(
+                &session.id,
+                UpdateAuthSession {
+                    status: Some("ready".into()),
+                    result_json: Some(serde_json::to_string(&bundle)?),
+                    ..Default::default()
+                },
+            )
+            .await?;
+        let provider = admin.create_provider_with_oauth_session(&session.id,
+            serde_json::from_value(serde_json::json!({"name":"Device Kiro","protocol":"openai-compatible","base_url":"https://unused.invalid","api_key":""}))?
+        ).await?;
+        assert!(crate::provider::kiro::validate(&provider).is_ok());
+        let stored = gw
+            .storage
+            .oauth_credentials()
+            .get(&provider.id)
+            .await?
+            .unwrap();
+        assert_eq!(stored.scheme, AuthScheme::OAuthDeviceCode.as_str());
+        let runtime = admin.resolve_provider_runtime(&provider).await?;
+        let credential = runtime.credential.unwrap();
+        assert_eq!(
+            refreshed_scheme(auth::build_driver("kiro").unwrap().as_ref(), &credential),
+            AuthScheme::OAuthDeviceCode.as_str()
+        );
+        assert!(!stored.meta.contains("PRIVATE-DEVICE"));
+        let mut reconnect = device_session(&admin).await?;
+        assert!(validate_oauth_session_for_provider(&reconnect, &provider).is_ok());
+        reconnect.scheme = AuthScheme::Custom.as_str().into();
+        assert!(validate_oauth_session_for_provider(&reconnect, &provider).is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn kiro_import_create_runtime_and_rebind_stay_native() -> anyhow::Result<()> {
+        let gw = gateway().await?;
+        let admin = gw.admin();
+        let init = admin.init_oauth_session("kiro", false).await?;
+        assert!(init.requires_manual_code);
+        assert!(init.auth_url.is_empty(), "import has no browser round trip");
+        assert_eq!(
+            init.completion_mode,
+            Some(auth::AuthCompletionMode::ManualExchange)
+        );
+        let future = (chrono::Utc::now() + chrono::Duration::hours(3)).to_rfc3339();
+        let pasted = |access: &str, region: &str| {
+            format!(
+                r#"{{"accessToken":"{access}","refreshToken":"RT-1","expiresAt":"{future}",
+                    "authMethod":"social","region":"{region}",
+                    "profileArn":"arn:aws:codewhisperer:{region}:1:profile/X"}}"#
+            )
+        };
+        let ready = admin
+            .complete_oauth_session(
+                &init.session_id,
+                auth::AuthExchangeInput {
+                    code: Some(pasted("AT-1", "eu-central-1")),
+                    ..Default::default()
+                },
+            )
+            .await?;
+        assert!(matches!(ready, AuthSessionStatusData::Ready { .. }));
+        // The generic form fields are overridden: Kiro owns protocol and origin.
+        let input: CreateProvider = serde_json::from_value(serde_json::json!({
+            "name": "Kiro fixture", "protocol": "openai-compatible",
+            "base_url": "https://unused.invalid", "api_key": ""
+        }))?;
+        let provider = admin
+            .create_provider_with_oauth_session(&init.session_id, input)
+            .await?;
+        assert_eq!(provider.vendor.as_deref(), Some("kiro"));
+        assert_eq!(provider.channel.as_deref(), Some("ide"));
+        assert_eq!(provider.protocol, crate::provider::kiro::PROTOCOL_KEY);
+        assert_eq!(provider.base_url, "https://q.eu-central-1.amazonaws.com");
+        assert_eq!(provider.protocol_mode, "fixed");
+        assert!(provider.keys.is_empty());
+        assert!(crate::provider::kiro::validate(&provider).is_ok());
+
+        let status = admin.get_provider_oauth_status(&provider.id).await?;
+        assert_eq!(status.status, "connected");
+        assert!(status.has_refresh_token);
+        let serialized = serde_json::to_string(&status)?;
+        assert!(!serialized.contains("AT-1") && !serialized.contains("RT-1"));
+
+        let runtime = admin.resolve_provider_runtime(&provider).await?;
+        assert_eq!(runtime.access_token, "AT-1");
+        assert!(runtime.binding.disable_default_auth);
+        assert_eq!(
+            runtime.binding.base_url_override.as_deref(),
+            Some("https://q.eu-central-1.amazonaws.com")
+        );
+        let stored = runtime.credential.expect("credential is resolved");
+        let kiro = crate::provider::kiro::credential::KiroCredential::from_stored(&stored);
+        assert_eq!(kiro.region, "eu-central-1");
+        assert_eq!(
+            kiro.profile_arn.as_deref(),
+            Some("arn:aws:codewhisperer:eu-central-1:1:profile/X")
+        );
+
+        // Re-authorization rebinds the same provider; wrong shapes are refused.
+        let reauth = admin.init_oauth_session("kiro", false).await?;
+        admin
+            .complete_oauth_session(
+                &reauth.session_id,
+                auth::AuthExchangeInput {
+                    code: Some(pasted("AT-2", "us-west-2")),
+                    ..Default::default()
+                },
+            )
+            .await?;
+        let session = admin
+            .get_auth_session_record(&reauth.session_id)
+            .await?
+            .unwrap();
+        let mut incompatible = provider.clone();
+        incompatible.channel = Some("cli".into());
+        assert!(validate_oauth_session_for_provider(&session, &incompatible).is_err());
+        incompatible = provider.clone();
+        incompatible.vendor = Some("custom".into());
+        assert!(validate_oauth_session_for_provider(&session, &incompatible).is_err());
+        let rebound = admin
+            .bind_provider_with_oauth_session(&provider.id, &reauth.session_id)
+            .await?;
+        assert_eq!(rebound.base_url, "https://q.us-west-2.amazonaws.com");
+        assert!(crate::provider::kiro::validate(&rebound).is_ok());
+        assert_eq!(
+            admin.resolve_provider_runtime(&rebound).await?.access_token,
+            "AT-2"
+        );
+        admin.logout_provider_oauth(&provider.id).await?;
+        assert!(admin.resolve_provider_runtime(&provider).await.is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn kiro_oidc_registration_survives_storage_without_public_secret_exposure()
+    -> anyhow::Result<()> {
+        let gw = gateway().await?;
+        let admin = gw.admin();
+        let init = admin.init_oauth_session("kiro", false).await?;
+        let future = (chrono::Utc::now() + chrono::Duration::hours(3)).to_rfc3339();
+        let ready = admin.complete_oauth_session(&init.session_id, auth::AuthExchangeInput {
+            code: Some(format!(r#"{{"accessToken":"OIDC-AT","refreshToken":"OIDC-RT",
+                "expiresAt":"{future}","authMethod":"builder-id","region":"eu-central-1",
+                "idcRegion":"us-east-1","profileArn":"arn:aws:codewhisperer:eu-central-1:1:profile/X"}}
+                {{"clientId":"fixture-client","clientSecret":"OIDC-CLIENT-SECRET"}}"#)),
+            ..Default::default()
+        }).await?;
+        let provider = admin
+            .create_provider_with_oauth_session(
+                &init.session_id,
+                serde_json::from_value(serde_json::json!({
+                    "name":"Kiro OIDC fixture", "protocol":"openai-compatible",
+                    "base_url":"https://unused.invalid", "api_key":""
+                }))?,
+            )
+            .await?;
+        let runtime = admin.resolve_provider_runtime(&provider).await?;
+        let stored = runtime.credential.unwrap();
+        let credential = crate::provider::kiro::credential::KiroCredential::from_stored(&stored);
+        assert_eq!(
+            credential.client_secret.as_deref(),
+            Some("OIDC-CLIENT-SECRET")
+        );
+        assert_eq!(credential.client_id.as_deref(), Some("fixture-client"));
+        assert_eq!(credential.idc_region, "us-east-1");
+        assert!(credential.refreshes_through_oidc());
+        let status = admin.get_provider_oauth_status(&provider.id).await?;
+        for public in [
+            serde_json::to_string(&ready)?,
+            serde_json::to_string(&provider)?,
+            serde_json::to_string(&status)?,
+        ] {
+            for secret in ["OIDC-AT", "OIDC-RT", "OIDC-CLIENT-SECRET"] {
+                assert!(!public.contains(secret));
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn kiro_import_rejects_garbage_without_leaking_the_input() -> anyhow::Result<()> {
+        let gw = gateway().await?;
+        let admin = gw.admin();
+        let init = admin.init_oauth_session("kiro", false).await?;
+        let error = admin
+            .complete_oauth_session(
+                &init.session_id,
+                auth::AuthExchangeInput {
+                    code: Some("{\"secret\": \"SHOULD-NOT-LEAK\" ".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(!format!("{error:#}").contains("SHOULD-NOT-LEAK"));
+        Ok(())
+    }
+
     #[tokio::test]
     async fn session_flight_excludes_overlap_and_cancel_rejects_late_publish() -> anyhow::Result<()>
     {
@@ -1558,6 +1999,19 @@ mod lifecycle_tests {
             .unwrap();
         let old_generation = old.generation;
         drop(old);
+        assert!(
+            admin
+                .begin_session_flight(&init.session_id, true)
+                .await?
+                .is_none(),
+            "failed/cancelled poll still consumes its interval"
+        );
+        gw.auth_session_controls
+            .lock()
+            .await
+            .get_mut(&init.session_id)
+            .unwrap()
+            .next_poll_at = None;
         let next = admin
             .begin_session_flight(&init.session_id, true)
             .await?

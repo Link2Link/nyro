@@ -2,7 +2,12 @@ import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { backend } from "@/lib/backend";
 import { oauthCompletionMode, useOAuthSession } from "@/lib/use-oauth-session";
-import { OAuthProgress, OAuthSessionRemaining, OAuthSessionError, DevinLoginNotice } from "@/components/oauth-session-status";
+import { KiroCredentialImport } from "@/components/kiro-credential-import";
+import { KiroLoginOptionsForm } from "@/components/kiro-login-options";
+import { kiroLoginConfigured, kiroLoginOptions } from "@/lib/kiro-login";
+import { copyToClipboard } from "@/lib/utils";
+import { providerUsageSupported } from "@/lib/provider-usage";
+import { OAuthProgress, OAuthSessionRemaining, OAuthSessionError, DevinLoginNotice, KiroLoginNotice } from "@/components/oauth-session-status";
 import { localizeBackendErrorMessage } from "@/lib/backend-error";
 import { invalidateModelRatings } from "@/lib/use-model-ratings";
 import type {
@@ -16,6 +21,7 @@ import type {
   ProviderEndpointAuthScheme,
   CreateProviderProtocolEndpoint,
   ProviderOAuthStatusData,
+  KiroLoginOptions,
   ModelProbeOutcome,
   ProviderUsageCredentials,
   ProviderKey,
@@ -77,7 +83,7 @@ import { ProviderUsageFooter } from "@/components/provider-usage";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { resolveProtocol, PROTOCOL_ENDPOINT_TABLE, PROTOCOL_TABLE } from "@/lib/protocol";
 import { openExternalUrl } from "@/lib/open-external";
-import { DEVIN_PROTOCOL, isDevinProvider, nativePresetProtocol } from "@/lib/native-provider";
+import { DEVIN_PROTOCOL, KIRO_PROTOCOL, isDevinProvider, isKiroProvider, nativePresetProtocol, nativeProviderProtocol, hasProviderModelCatalog } from "@/lib/native-provider";
 
 function protocolUrl(protocol: string) {
   return PROTOCOL_TABLE.find((p) => p.id === resolveProtocol(protocol))?.defaultBaseUrl
@@ -764,7 +770,8 @@ function resolvePresetConfig(
   const sourceBaseUrls = channel?.baseUrls ?? {};
   const rawBaseUrl = Object.entries(sourceBaseUrls).find(
     ([key]) => key === protocol || resolveProtocol(key) === protocol
-      || (preset.id === "devin" && key === "devin-chat" && protocol === DEVIN_PROTOCOL),
+      || (preset.id === "devin" && key === "devin-chat" && protocol === DEVIN_PROTOCOL)
+      || (preset.id === "kiro" && key === "kiro-chat" && protocol === KIRO_PROTOCOL),
   )?.[1];
   const baseUrl = rawBaseUrl ? toGatewayBaseUrl(rawBaseUrl) : "";
   const modelsSource = channel?.modelsSource ?? channel?.modelsEndpoint ?? "";
@@ -813,59 +820,6 @@ type TestLogEntry = {
 
 const PROVIDER_TEST_RESULTS_STORAGE_KEY = "nyro.provider-test-results.v1";
 
-/** Providers whose vendor has a coding-plan usage-query backend. Mirrors
- * nyro-core `admin::usage::UsageBackend::detect`. */
-function usageSupported(
-  provider: Pick<Provider, "base_url" | "vendor" | "preset_key" | "channel" | "auth_mode">,
-): boolean {
-  const url = provider.base_url.toLowerCase();
-  const vendor = (provider.vendor ?? provider.preset_key ?? "").toLowerCase();
-  const isCodexOAuth =
-    provider.auth_mode === "oauth" &&
-    provider.channel?.toLowerCase() === "codex" &&
-    (vendor === "openai" || vendor === "codex");
-  const isImportedCodexOAuth =
-    provider.auth_mode === "oauth" && url.includes("chatgpt.com/backend-api/codex");
-  const isGrokOAuth =
-    provider.auth_mode === "oauth" &&
-    provider.channel?.toLowerCase() === "grok" &&
-    (vendor === "xai" || vendor === "grok");
-  const isImportedGrokOAuth =
-    provider.auth_mode === "oauth" && url.includes("cli-chat-proxy.grok.com");
-  const isGoogleOAuth =
-    provider.auth_mode === "oauth" &&
-    vendor === "google" &&
-    (provider.channel?.toLowerCase() === "antigravity" ||
-      provider.channel?.toLowerCase() === "gemini-cli");
-  const isImportedGoogleOAuth =
-    provider.auth_mode === "oauth" && url.includes("cloudcode-pa.googleapis.com");
-  // Devin is recognised by identity alone (mirrors `UsageBackend::detect`): the
-  // Codeium host is not exclusive to it, so there is no URL fallback.
-  const isDevinOAuth = provider.auth_mode === "oauth" && isDevinProvider(provider);
-  return (
-    isCodexOAuth ||
-    isImportedCodexOAuth ||
-    isGrokOAuth ||
-    isImportedGrokOAuth ||
-    isGoogleOAuth ||
-    isImportedGoogleOAuth ||
-    isDevinOAuth ||
-    url.includes("bigmodel.cn") ||
-    url.includes("z.ai") ||
-    url.includes("minimaxi.com") ||
-    url.includes("minimax.io") ||
-    url.includes("api.kimi.com") ||
-    url.includes("api.deepseek.com") ||
-    url.includes("opencode.ai/zen") ||
-    url.includes("volces.com") ||
-    // MiMo cluster hosts (`token-plan-<cluster>.xiaomimimo.com`) end in
-    // `-cn.`/`-sgp.` rather than Bailian's `token-plan.`, so the vendor
-    // domain must be matched explicitly (mirrors `UsageBackend::detect`,
-    // which checks xiaomimimo before the `token-plan.` fallback).
-    url.includes("xiaomimimo.com") ||
-    url.includes("token-plan.")
-  );
-}
 
 function nowTimestamp() {
 
@@ -942,6 +896,9 @@ export default function ProvidersPage() {
   const [createOAuthCode, setCreateOAuthCode] = useState("");
   const [createOAuthCopied, setCreateOAuthCopied] = useState(false);
   const [createOAuthCopyFailed, setCreateOAuthCopyFailed] = useState(false);
+  const [createKiroLogin, setCreateKiroLogin] = useState<KiroLoginOptions>({ method: "google" });
+  const [editKiroLogin, setEditKiroLogin] = useState<KiroLoginOptions>({ method: "google" });
+  const [editOAuthCopied, setEditOAuthCopied] = useState(false);
   // Edit-mode OAuth re-authorization uses the same session lifecycle as creation.
   const editOAuth = useOAuthSession();
   const { session: editOAuthSession, status: editOAuthSessionStatus, busy: editOAuthBusy, reset: resetEditSession } = editOAuth;
@@ -1187,10 +1144,12 @@ export default function ProvidersPage() {
       });
       return;
     }
+    if (isKiroProvider(form) && !kiroLoginConfigured(createKiroLogin)) return;
     resetCreateOAuthState();
     await createOAuth.start({
       vendor,
       useProxy: Boolean(form.use_proxy),
+      ...(isKiroProvider(form) ? { kiro: kiroLoginOptions(createKiroLogin) } : {}),
       onInit: (init) => setForm((prev) => {
         if (prev.name.trim()) return prev;
         const providerName = selectedPreset ? presetLabel(selectedPreset, false).trim() : vendor.trim();
@@ -1209,7 +1168,7 @@ export default function ProvidersPage() {
   }
 
   async function reopenCreateOAuthPage() {
-    const authUrl = createOAuthSession?.auth_url || createOAuthSession?.verification_uri_complete;
+    const authUrl = createOAuthSession?.auth_url || createOAuthSession?.verification_uri_complete || createOAuthSession?.verification_uri;
     const sessionId = createOAuthSession?.session_id;
     if (!authUrl || !sessionId) return;
     try {
@@ -1239,14 +1198,17 @@ export default function ProvidersPage() {
     setEditOAuthCallbackUrl("");
     setEditOAuthCode("");
     setEditOAuthInputError("");
+    setEditOAuthCopied(false);
   }
 
   async function startEditReauth(providerId: string, vendor: string, useProxy: boolean) {
+    if (vendor === "kiro" && !kiroLoginConfigured(editKiroLogin)) return;
     resetEditOAuthState();
     setShowEditReauth(true);
     await editOAuth.start({
       vendor,
       useProxy,
+      ...(vendor === "kiro" ? { kiro: kiroLoginOptions(editKiroLogin) } : {}),
       onReady: async (_status, context) => {
         if (!context.isCurrent() || editingIdRef.current !== providerId) return;
         await backend("bind_provider_oauth", { id: providerId, sessionId: context.sessionId }, { signal: context.signal });
@@ -1303,9 +1265,8 @@ export default function ProvidersPage() {
     };
 
     try {
-      const protocol = isDevinProvider(provider)
-        ? DEVIN_PROTOCOL
-        : (resolveProtocol(provider.protocol || "openai") ?? "openai-compatible");
+      const protocol = nativeProviderProtocol(provider)
+        ?? (resolveProtocol(provider.protocol || "openai") ?? "openai-compatible");
       const baseUrl = provider.base_url?.trim() ?? "";
       const isAdaptive = provider.protocol_mode === "adaptive";
       const configuredEndpoints = (provider.protocol_endpoints ?? [])
@@ -1362,8 +1323,8 @@ export default function ProvidersPage() {
       );
 
       const modelsSource = provider.models_source?.trim();
-      const nativeCatalog = isDevinProvider(provider);
-      if (!modelsSource && !nativeCatalog) {
+      const nativeCatalog = nativeProviderProtocol(provider) !== null;
+      if (!hasProviderModelCatalog(provider)) {
         finish(
           {
             success: true,
@@ -1382,7 +1343,7 @@ export default function ProvidersPage() {
       appendTestLog(
         "info",
         nativeCatalog && !modelsSource
-          ? (isZh ? "→ Devin 配置的模型目录（静态建议）" : "→ Devin configured catalog (static suggestions)")
+          ? (isZh ? "→ 原生提供商配置的模型目录（静态建议）" : "→ Native provider configured catalog (static suggestions)")
           : `→ ${modelsSource}`,
       );
 
@@ -1613,6 +1574,7 @@ export default function ProvidersPage() {
 
   function startEdit(p: Provider) {
     resetEditOAuthState();
+    setEditKiroLogin({ method: "google" });
     setShowEditReauth(false);
     setEditingId(p.id);
     editingIdRef.current = p.id;
@@ -1634,7 +1596,7 @@ export default function ProvidersPage() {
     setProbeKeysError(null);
     setEditUsageAk("");
     setEditUsageSk("");
-    if (usageSupported(p)) {
+    if (providerUsageSupported(p)) {
       void backend<ProviderUsageCredentials>("get_provider_usage_credentials", { id: p.id })
         .then((credentials) => {
           if (editingIdRef.current !== p.id) return;
@@ -1646,15 +1608,14 @@ export default function ProvidersPage() {
         });
     }
     const presetForEdit = providerPresets.find(
-      (item) => item.id === (p.preset_key || DEFAULT_PRESET_ID),
+      (item) => item.id === (p.preset_key || (nativeProviderProtocol(p) ? p.vendor?.trim().toLowerCase() : undefined) || DEFAULT_PRESET_ID),
     );
     const channel = p.channel || "default";
     const savedProtocol = (resolveProtocol(p.protocol) ?? "openai-compatible") as ProviderProtocol;
-    const safeProtocol = isDevinProvider(p)
-      ? DEVIN_PROTOCOL
-      : presetForEdit
+    const safeProtocol = nativeProviderProtocol(p)
+      ?? (presetForEdit
         ? resolvePresetProtocol(presetForEdit, channel, savedProtocol)
-        : savedProtocol;
+        : savedProtocol);
     const protocolMode = normalizeAuthMode(p.auth_mode) !== "oauth" && p.protocol_mode === "adaptive" ? "adaptive" : "fixed";
 
     // Shared-key channels (e.g. GLM Coding Plan) always edit in adaptive mode
@@ -1698,7 +1659,7 @@ export default function ProvidersPage() {
         protocol_endpoints: endpoints,
         use_proxy: p.use_proxy,
         fast_mode: Boolean(p.fast_mode),
-        preset_key: p.preset_key || DEFAULT_PRESET_ID,
+        preset_key: p.preset_key || presetForEdit?.id || DEFAULT_PRESET_ID,
         channel,
         models_source: p.models_source ?? "",
         static_models: p.static_models ?? "",
@@ -1725,7 +1686,7 @@ export default function ProvidersPage() {
       })),
       use_proxy: p.use_proxy,
       fast_mode: Boolean(p.fast_mode),
-      preset_key: p.preset_key || DEFAULT_PRESET_ID,
+      preset_key: p.preset_key || presetForEdit?.id || DEFAULT_PRESET_ID,
       channel,
       models_source: p.models_source ?? "",
       static_models: p.static_models ?? "",
@@ -1737,6 +1698,7 @@ export default function ProvidersPage() {
   function handlePresetChange(nextPresetId: string) {
     if (!nextPresetId) return;
     resetCreateOAuthState(true);
+    setCreateKiroLogin({ method: "google" });
     setSelectedPresetId(nextPresetId);
     const preset = providerPresets.find((item) => item.id === nextPresetId);
     if (!preset) return;
@@ -1906,6 +1868,7 @@ export default function ProvidersPage() {
 
   function closeCreateForm() {
     resetCreateOAuthState(true);
+    setCreateKiroLogin({ method: "google" });
     setShowForm(false);
     setShowCreateApiKey(true);
     setSelectedPresetId(DEFAULT_PRESET_ID);
@@ -1932,6 +1895,7 @@ export default function ProvidersPage() {
     : [];
   const createOAuthReady = createOAuthStatus?.status === "ready";
   const createIsDevinOAuth = isDevinProvider(form);
+  const createIsKiroOAuth = isKiroProvider(form);
   const createOAuthRequiresManualCode = (!createOAuthSession && createIsDevinOAuth) || oauthCompletionMode(
     createOAuthStatus?.status === "pending" ? createOAuthStatus : createOAuthSession,
   ) === "manual_exchange";
@@ -2145,7 +2109,38 @@ export default function ProvidersPage() {
                   <p className="text-xs text-slate-500">{isZh ? "预设只是静态建议，不是账号可用模型保证。可填入账号支持的精确模型 UID。" : "Preset entries are static suggestions, not a guarantee of account access. Enter exact model UIDs supported by your account."}</p>
                 </div>
               </>}
-              {showCreateOAuthGuide ? (
+              {createIsKiroOAuth && <>
+                <KiroLoginNotice isZh={isZh} />
+                <KiroLoginOptionsForm value={createKiroLogin} isZh={isZh} disabled={createOAuthMut.isPending}
+                  onChange={(value) => { resetCreateOAuthState(); setCreateKiroLogin(value); }} />
+                <div className="col-span-2 space-y-2">
+                  <FieldLabel>{isZh ? "Kiro 模型（每行一个）" : "Kiro models (one per line)"}</FieldLabel>
+                  <textarea
+                    className="w-full rounded-md border border-border bg-background px-3 py-2 font-mono text-xs"
+                    rows={4}
+                    value={form.static_models ?? ""}
+                    onChange={(e) => setForm({ ...form, static_models: e.target.value })}
+                    spellCheck={false}
+                  />
+                  <p className="text-xs text-slate-500">{isZh ? "预设只是静态建议，不是账号可用模型保证。" : "Preset entries are static suggestions, not a guarantee of account access."}</p>
+                </div>
+              </>}
+              {showCreateOAuthGuide && createIsKiroOAuth && createKiroLogin.method === "import" ? (
+                <div className="col-span-2 space-y-2">
+                  <KiroCredentialImport
+                    key={createOAuthSession?.session_id ?? "new-kiro-import"}
+                    isZh={isZh}
+                    sessionId={createOAuthSession?.session_id}
+                    pending={createOAuthStatus?.status === "pending"}
+                    busy={createOAuthBusy}
+                    onStart={() => void startCreateOAuth()}
+                    onSubmit={(code) => createOAuth.complete({ code })}
+                    onCancel={() => resetCreateOAuthState()}
+                  />
+                  <OAuthSessionError status={createOAuthStatus} isZh={isZh} />
+                  <OAuthSessionRemaining expiresAt={createOAuth.expiresAt} isZh={isZh} />
+                </div>
+              ) : showCreateOAuthGuide ? (
                 <div className="col-span-2 rounded-xl border border-slate-200 bg-slate-50 p-4">
                   <div className="flex items-center justify-between gap-3">
                     <div>
@@ -2175,7 +2170,7 @@ export default function ProvidersPage() {
                       </p>
                       <div className="mt-3 flex flex-wrap gap-2">
                         {!createOAuthSession || createOAuthStatus?.status === "error" ? (
-                          <Button type="button" onClick={startCreateOAuth} disabled={createOAuthBusy || !selectedPreset}>
+                          <Button type="button" onClick={startCreateOAuth} disabled={createOAuthBusy || !selectedPreset || (createIsKiroOAuth && !kiroLoginConfigured(createKiroLogin))}>
                             {createOAuthBusy ? (isZh ? "初始化中..." : "Initializing...") : (isZh ? "开始授权" : "Start Authorization")}
                           </Button>
                         ) : (
@@ -2188,7 +2183,7 @@ export default function ProvidersPage() {
                               variant="secondary"
                               onClick={async () => {
                                 const sessionId = createOAuthSession.session_id;
-                                const url = createOAuthSession.auth_url || createOAuthSession.verification_uri_complete || "";
+                                const url = createOAuthSession.auth_url || createOAuthSession.verification_uri_complete || createOAuthSession.verification_uri || "";
                                 let ok = false;
                                 try {
                                   await navigator.clipboard.writeText(url);
@@ -2229,7 +2224,7 @@ export default function ProvidersPage() {
                         <div className="mt-2 space-y-1">
                           <p className="text-xs text-rose-600">{isZh ? "复制失败，请手动复制以下链接并在浏览器中打开完成授权：" : "Copy failed. Please manually copy the link below and open it in your browser to authorize:"}</p>
                           <div className="rounded-lg border border-dashed border-slate-300 bg-white px-3 py-2 text-xs text-slate-600 break-all select-all">
-                            {createOAuthSession.auth_url || createOAuthSession.verification_uri_complete}
+                            {createOAuthSession.auth_url || createOAuthSession.verification_uri_complete || createOAuthSession.verification_uri}
                           </div>
                         </div>
                       )}
@@ -2351,13 +2346,13 @@ export default function ProvidersPage() {
               ) : null}
               {createResolvedAuthMode === "oauth" && createOAuthReady ? (
                 <div className="col-span-2 rounded-xl border border-emerald-200 bg-emerald-50 p-4 text-sm text-emerald-700">
-                  <div className="font-medium">{isZh ? "OAuth 授权已完成" : "OAuth Authorization Completed"}</div>
+                  <div className="font-medium">{createIsKiroOAuth ? (isZh ? "Kiro 凭证已就绪" : "Kiro credential ready") : (isZh ? "OAuth 授权已完成" : "OAuth Authorization Completed")}</div>
                   <div className="mt-1 text-xs text-emerald-600">
                     {isZh ? "授权信息已就绪，请在会话到期前完成配置并创建。" : "Authorization is ready. Complete the configuration and create the provider before the session expires."}
                     <OAuthSessionRemaining expiresAt={createOAuth.expiresAt} isZh={isZh} />
                   </div>
                   <Button type="button" variant="secondary" className="mt-3" onClick={startCreateOAuth} disabled={createOAuthMut.isPending || createOAuthBusy}>
-                    {isZh ? "重新授权" : "Re-authorize"}
+                    {createIsKiroOAuth && createKiroLogin.method === "import" ? (isZh ? "重新导入凭证" : "Re-import credential") : (isZh ? "重新授权" : "Re-authorize")}
                   </Button>
                 </div>
               ) : null}
@@ -2909,6 +2904,23 @@ export default function ProvidersPage() {
                         <p className="text-xs text-slate-500">{isZh ? "预设只是静态建议，不是账号可用模型保证。可填入账号支持的精确模型 UID。" : "Preset entries are static suggestions, not a guarantee of account access. Enter exact model UIDs supported by your account."}</p>
                       </div>
                     </>}
+                    {isKiroProvider(editForm) && <>
+                      <KiroLoginNotice isZh={isZh} />
+                      <KiroLoginOptionsForm value={editKiroLogin} isZh={isZh}
+                        disabled={reconnectOAuthMut.isPending || logoutOAuthMut.isPending}
+                        onChange={(value) => { resetEditOAuthState(); setShowEditReauth(false); setEditKiroLogin(value); }} />
+                      <div className="col-span-2 space-y-2">
+                        <FieldLabel>{isZh ? "Kiro 模型（每行一个）" : "Kiro models (one per line)"}</FieldLabel>
+                        <textarea
+                          className="w-full rounded-md border border-border bg-background px-3 py-2 font-mono text-xs"
+                          rows={4}
+                          value={editForm.static_models ?? ""}
+                          onChange={(e) => setEditForm({ ...editForm, static_models: e.target.value })}
+                          spellCheck={false}
+                        />
+                        <p className="text-xs text-slate-500">{isZh ? "预设只是静态建议，不是账号可用模型保证。" : "Preset entries are static suggestions, not a guarantee of account access."}</p>
+                      </div>
+                    </>}
                     {editingResolvedAuthMode === "oauth" ? (
                       <details className="col-span-2 rounded-xl border border-slate-200 bg-slate-50" open={editOAuthStatus?.status !== "connected" || showEditReauth}>
                         <summary className="flex items-center justify-between gap-3 p-4 cursor-pointer list-none [&::-webkit-details-marker]:hidden">
@@ -2955,7 +2967,9 @@ export default function ProvidersPage() {
                               </div>
                               <div className="mt-1 text-xs text-slate-500">
                                 {editOAuthStatus?.expires_at && new Date(editOAuthStatus.expires_at).getTime() < Date.now()
-                                  ? (isZh ? "Access Token 已过期，请点击续期。" : "Access token has expired. Please renew.")
+                                  ? isKiroProvider(p)
+                                    ? (isZh ? "Access Token 已过期；可重新授权或导入凭证，也可让网关使用已有 refresh token 自动续期。" : "Access token has expired. Sign in again or import a credential, or let the gateway refresh it automatically using the stored refresh token.")
+                                    : (isZh ? "Access Token 已过期，请点击续期。" : "Access token has expired. Please renew.")
                                   : (isZh ? "授权有效，可正常使用当前 Provider。" : "Authorization is valid. The provider is ready to use.")}
                               </div>
                               {(editOAuthStatus?.tier_id || editOAuthStatus?.project_id) && (
@@ -2977,7 +2991,10 @@ export default function ProvidersPage() {
                               {isDevinProvider(p) && <Button type="button" onClick={() => startEditReauth(p.id, "devin", p.use_proxy)} disabled={reconnectOAuthMut.isPending || logoutOAuthMut.isPending}>
                                 {isZh ? "重新授权" : "Re-authorize"}
                               </Button>}
-                              {!isDevinProvider(p) && <Button
+                              {isKiroProvider(p) && <Button type="button" onClick={() => startEditReauth(p.id, "kiro", p.use_proxy)} disabled={reconnectOAuthMut.isPending || logoutOAuthMut.isPending || !kiroLoginConfigured(editKiroLogin)}>
+                                {editKiroLogin.method === "import" ? (isZh ? "重新导入凭证" : "Re-import credential") : (isZh ? "重新授权" : "Re-authorize")}
+                              </Button>}
+                              {!isDevinProvider(p) && !isKiroProvider(p) && <Button
                                 type="button"
                                 variant="secondary"
                                 onClick={() => reconnectOAuthMut.mutate(p.id)}
@@ -3005,7 +3022,9 @@ export default function ProvidersPage() {
                                 {editOAuthStatus?.status === "error"
                                   ? isDevinProvider(p)
                                     ? (isZh ? "Devin 会话令牌无效，请重新授权。" : "The Devin session token is invalid. Please authorize again.")
-                                    : (isZh ? "授权失败（Refresh Token 可能已失效），请重新授权。" : "Authorization failed (refresh token may have expired). Please re-authorize.")
+                                    : isKiroProvider(p)
+                                      ? (isZh ? "Kiro 凭证无效，请重新授权或导入凭证。" : "The Kiro credential is invalid. Sign in again or import a credential.")
+                                      : (isZh ? "授权失败（Refresh Token 可能已失效），请重新授权。" : "Authorization failed (refresh token may have expired). Please re-authorize.")
                                   : showEditReauth && editOAuthStatus?.status === "connected"
                                     ? (isZh ? "正在重新授权，原授权将在成功后替换。" : "Re-authorizing. The existing authorization is replaced after success.")
                                     : (isZh ? "未授权，请进行 OAuth 授权。" : "Not authorized. Please complete OAuth authorization.")}
@@ -3018,9 +3037,26 @@ export default function ProvidersPage() {
                               <Button
                                 type="button"
                                 onClick={() => startEditReauth(p.id, oauthVendorForChannel(p.vendor || p.preset_key || "", p.channel), p.use_proxy)}
+                                disabled={isKiroProvider(p) && !kiroLoginConfigured(editKiroLogin)}
                               >
-                                {isZh ? "开始授权" : "Start Authorization"}
+                                {isKiroProvider(p) && editKiroLogin.method === "import" ? (isZh ? "导入凭证" : "Import credential") : (isZh ? "开始授权" : "Start Authorization")}
                               </Button>
+                            ) : isKiroProvider(p) && editKiroLogin.method === "import" ? (
+                              <div className="space-y-2">
+                                <KiroCredentialImport
+                                  key={editOAuthSession?.session_id ?? "kiro-reimport"}
+                                  isZh={isZh}
+                                  reimport
+                                  sessionId={editOAuthSession?.session_id}
+                                  pending={editOAuthSessionStatus?.status === "pending"}
+                                  busy={editOAuthBusy}
+                                  onStart={() => void startEditReauth(p.id, "kiro", p.use_proxy)}
+                                  onSubmit={(code) => editOAuth.complete({ code })}
+                                  onCancel={() => { resetEditOAuthState(); setShowEditReauth(false); }}
+                                />
+                                <OAuthSessionError status={editOAuthSessionStatus} isZh={isZh} />
+                                <OAuthSessionRemaining expiresAt={editOAuth.expiresAt} isZh={isZh} />
+                              </div>
                             ) : (
                               <div className="space-y-3">
                                 <div className="grid gap-3 md:grid-cols-2">
@@ -3035,9 +3071,16 @@ export default function ProvidersPage() {
                                     {editOAuthSession ? (
                                       <div className="mt-3 rounded-lg border border-dashed border-slate-300 bg-white px-3 py-2 text-xs text-slate-600">
                                         <div className="font-medium text-slate-700">{isZh ? "授权链接" : "Authorization URL"}</div>
-                                        <div className="mt-1 break-all">{editOAuthSession.auth_url || editOAuthSession.verification_uri_complete}</div>
+                                        <div className="mt-1 select-all break-all">{editOAuthSession.auth_url || editOAuthSession.verification_uri_complete || editOAuthSession.verification_uri}</div>
+                                        <Button type="button" variant="secondary" className="mt-2 mr-2" onClick={async () => {
+                                          const sessionId = editOAuthSession.session_id;
+                                          const copied = await copyToClipboard(editOAuthSession.auth_url || editOAuthSession.verification_uri_complete || editOAuthSession.verification_uri);
+                                          if (editOAuth.ownsSession(sessionId)) setEditOAuthCopied(copied);
+                                        }}>
+                                          {editOAuthCopied ? (isZh ? "已复制" : "Copied!") : (isZh ? "复制链接" : "Copy Link")}
+                                        </Button>
                                         <Button type="button" className="mt-2" onClick={() => {
-                                          const url = editOAuthSession.auth_url || editOAuthSession.verification_uri_complete;
+                                          const url = editOAuthSession.auth_url || editOAuthSession.verification_uri_complete || editOAuthSession.verification_uri;
                                           const sessionId = editOAuthSession.session_id;
                                           if (url) void openExternalUrl(url).catch((error) => {
                                             if (editOAuth.ownsSession(sessionId)) showErrorDialog("无法打开授权页", "Could not open authorization page", error);
@@ -3827,7 +3870,7 @@ export default function ProvidersPage() {
                           preset_key: editForm.preset_key || undefined,
                           channel: editForm.channel || undefined,
                           models_source: editForm.models_source ?? "",
-                          static_models: isDevinProvider(editForm) ? (editForm.static_models ?? "") : editForm.static_models || undefined,
+                          static_models: nativeProviderProtocol(editForm) ? (editForm.static_models ?? "") : editForm.static_models || undefined,
                           api_key: adaptive ? (defaultEndpoint?.api_key ?? "") : (editForm.api_key || undefined),
                         };
                         updateMut.mutate({ id: editForm.id, ...input });
@@ -4025,7 +4068,7 @@ export default function ProvidersPage() {
                     </button>
                   </div>
                 </div>
-                {usageSupported(p) && <ProviderUsageFooter provider={p} />}
+                {providerUsageSupported(p) && <ProviderUsageFooter provider={p} />}
               </div>
             );
           })}

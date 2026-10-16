@@ -349,6 +349,22 @@ fn providers_json() -> Vec<Value> {
 }
 
 #[test]
+fn devin_and_kiro_use_supported_provider_labels() {
+    let reg = VendorRegistry::global();
+    for (id, label) in [("devin", "Devin"), ("kiro", "Kiro")] {
+        let metadata = reg.metadata(id).expect("native provider is registered");
+        assert_eq!(metadata.label.en, label);
+        assert_eq!(metadata.label.zh, label);
+        let snapshot = providers_json()
+            .into_iter()
+            .find(|entry| entry["id"] == id)
+            .unwrap();
+        assert_eq!(snapshot["label"]["en"], label);
+        assert_eq!(snapshot["label"]["zh"], label);
+    }
+}
+
+#[test]
 fn list_metadata_covers_every_providers_json_entry() {
     let reg = VendorRegistry::global();
     let registered: std::collections::HashSet<&str> =

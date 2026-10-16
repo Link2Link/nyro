@@ -547,7 +547,8 @@ export type ProviderProtocol =
   | "openai-responses"
   | "anthropic-messages"
   | "google-gemini"
-  | "devin-chat/get-chat-message/v1";
+  | "devin-chat/get-chat-message/v1"
+  | "kiro-chat/generate-assistant-response/v1";
 
 export type ProviderProtocolMode = "fixed" | "adaptive";
 
@@ -876,6 +877,16 @@ export interface ImportResult {
   ratings_imported?: number;
 }
 
+
+export type KiroLoginMethod = "import" | "google" | "github" | "builder-id" | "idc";
+
+/** Login-only configuration, not provider identity or a credential. */
+export interface KiroLoginOptions {
+  method: KiroLoginMethod;
+  region?: string;
+  idc_region?: string;
+  start_url?: string;
+}
 
 export interface OAuthSessionInitData {
   session_id: string;

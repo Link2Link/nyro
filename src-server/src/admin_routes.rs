@@ -563,6 +563,8 @@ struct InitOAuthSessionRequest {
     vendor: String,
     #[serde(default)]
     use_proxy: bool,
+    #[serde(default)]
+    kiro: Option<nyro_core::auth::KiroLoginOptions>,
 }
 
 #[derive(Deserialize)]
@@ -577,7 +579,7 @@ async fn init_oauth_session_handler(
 ) -> impl IntoResponse {
     match gw
         .admin()
-        .init_oauth_session(&input.vendor, input.use_proxy)
+        .init_oauth_session_with_options(&input.vendor, input.use_proxy, input.kiro)
         .await
     {
         Ok(v) => Json(serde_json::json!({ "data": v })).into_response(),
@@ -1187,6 +1189,34 @@ mod tests {
 
     fn status_of(message: &str) -> StatusCode {
         usage_err(anyhow::anyhow!("{message}")).status()
+    }
+
+    #[test]
+    fn oauth_init_preserves_legacy_defaults_and_typed_kiro_options() {
+        let legacy: InitOAuthSessionRequest =
+            serde_json::from_value(serde_json::json!({"vendor": "kiro"})).unwrap();
+        assert!(!legacy.use_proxy);
+        assert!(legacy.kiro.is_none());
+        let browser: InitOAuthSessionRequest = serde_json::from_value(serde_json::json!({
+            "vendor": "kiro", "use_proxy": true,
+            "kiro": {"method": "idc", "region": "eu-west-1", "idc_region": "us-east-1",
+                "start_url": "https://example.awsapps.com/start"}
+        }))
+        .unwrap();
+        assert!(browser.use_proxy);
+        let kiro = browser.kiro.unwrap();
+        assert_eq!(kiro.region.as_deref(), Some("eu-west-1"));
+        assert_eq!(kiro.idc_region.as_deref(), Some("us-east-1"));
+        assert_eq!(
+            kiro.start_url.as_deref(),
+            Some("https://example.awsapps.com/start")
+        );
+        assert!(
+            serde_json::from_value::<InitOAuthSessionRequest>(serde_json::json!({
+                "vendor": "kiro", "kiro": {"method": "unknown"}
+            }))
+            .is_err()
+        );
     }
 
     #[test]

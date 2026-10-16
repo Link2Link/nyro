@@ -207,6 +207,8 @@ pub(super) fn build_auth_session_init_data(
         auth_url: session
             .verification_uri_complete
             .clone()
+            .filter(|url| !url.is_empty())
+            .or_else(|| session.verification_uri.clone())
             .unwrap_or_default(),
         requires_manual_code: session_completion_mode(session)
             == auth::AuthCompletionMode::ManualExchange,
@@ -228,6 +230,8 @@ pub(super) fn build_auth_session_pending_data(session: &AuthSession) -> AuthSess
         auth_url: session
             .verification_uri_complete
             .clone()
+            .filter(|url| !url.is_empty())
+            .or_else(|| session.verification_uri.clone())
             .unwrap_or_default(),
         requires_manual_code: session_completion_mode(session)
             == auth::AuthCompletionMode::ManualExchange,

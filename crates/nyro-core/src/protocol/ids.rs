@@ -30,6 +30,8 @@ pub enum Protocol {
     GoogleGemini,
     /// Devin CLI chat protocol (egress-only Connect/protobuf stream).
     DevinChat,
+    /// Kiro chat protocol (egress-only JSON request, AWS event-stream response).
+    KiroChat,
 }
 
 impl Protocol {
@@ -40,6 +42,7 @@ impl Protocol {
             Self::AnthropicMessages => "anthropic-messages",
             Self::GoogleGemini => "google-gemini",
             Self::DevinChat => "devin-chat",
+            Self::KiroChat => "kiro-chat",
         }
     }
 
@@ -50,6 +53,7 @@ impl Protocol {
             Self::AnthropicMessages => "Anthropic Messages",
             Self::GoogleGemini => "Google Gemini",
             Self::DevinChat => "Devin Chat",
+            Self::KiroChat => "Kiro Chat",
         }
     }
 }
@@ -74,6 +78,7 @@ impl FromStr for Protocol {
                 Ok(Self::GoogleGemini)
             }
             "devin-chat" => Ok(Self::DevinChat),
+            "kiro-chat" => Ok(Self::KiroChat),
             other => anyhow::bail!("unknown protocol: {other}"),
         }
     }
@@ -143,6 +148,31 @@ pub const DEVIN_BASE_URL: &str = "https://server.codeium.com";
 /// Native Connect transport; constraints not represented on the wire are
 /// rejected by the request builder rather than silently discarded.
 pub const DEVIN_CHAT_CAPABILITIES: EndpointCapabilities = EndpointCapabilities {
+    streaming: true,
+    tools: true,
+    reasoning: true,
+    multimodal: true,
+    function_calling: true,
+    parallel_tool_calls: true,
+    extended_reasoning: true,
+    force_upstream_stream: true,
+    stream: StreamCaps {
+        server_sent_events: false,
+        usage_in_stream: true,
+        requires_stream_flag: false,
+    },
+    ..EndpointCapabilities::EMPTY
+};
+
+/// Kiro (Amazon Q Developer / AWS CodeWhisperer) `generateAssistantResponse`.
+/// The regional origin is credential-derived, so no fixed base URL exists.
+pub const KIRO_CHAT_V1: ProtocolEndpoint =
+    ProtocolEndpoint::new(Protocol::KiroChat, "generate-assistant-response", "v1");
+pub const KIRO_DEFAULT_BASE_URL: &str = "https://q.us-east-1.amazonaws.com";
+
+/// Native event-stream transport; constraints not represented on the wire are
+/// rejected by the request builder rather than silently discarded.
+pub const KIRO_CHAT_CAPABILITIES: EndpointCapabilities = EndpointCapabilities {
     streaming: true,
     tools: true,
     reasoning: true,
@@ -327,6 +357,7 @@ mod tests {
             Protocol::AnthropicMessages,
             Protocol::GoogleGemini,
             Protocol::DevinChat,
+            Protocol::KiroChat,
         ] {
             assert_eq!(p.as_str().parse::<Protocol>().unwrap(), p);
         }

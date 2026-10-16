@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use crate::auth::drivers::{
-    ClaudeOAuthDriver, DevinAuthDriver, GoogleSubscriptionDriver, GrokOAuthDriver,
+    ClaudeOAuthDriver, DevinAuthDriver, GoogleSubscriptionDriver, GrokOAuthDriver, KiroAuthDriver,
     OpenAIOAuthDriver,
 };
 use crate::auth::types::{AuthDriver, AuthDriverMetadata};
@@ -9,6 +9,9 @@ use crate::auth::types::{AuthDriver, AuthDriverMetadata};
 pub fn normalize_driver_key(value: &str) -> String {
     match value.trim().to_ascii_lowercase().as_str() {
         "devin" | "devin-cli" => "devin".to_string(),
+        "kiro" | "kiro-ide" | "kiro-cli" | "amazon-q" | "amazonq" | "codewhisperer" => {
+            "kiro".to_string()
+        }
         "openai-oauth" | "openai_oauth" | "openai" | "codex-cli" | "codex" => "codex".to_string(),
         "claude-code" | "claude_code" | "claude-oauth" | "claude_oauth" | "claude"
         | "anthropic" => "claude-code".to_string(),
@@ -28,6 +31,7 @@ pub fn normalize_driver_key(value: &str) -> String {
 pub fn build_driver(key: &str) -> Option<Arc<dyn AuthDriver>> {
     match normalize_driver_key(key).as_str() {
         "devin" => Some(Arc::new(DevinAuthDriver)),
+        "kiro" => Some(Arc::new(KiroAuthDriver)),
         "codex" => Some(Arc::new(OpenAIOAuthDriver)),
         "claude-code" => Some(Arc::new(ClaudeOAuthDriver)),
         "grok" => Some(Arc::new(GrokOAuthDriver)),
@@ -40,6 +44,7 @@ pub fn build_driver(key: &str) -> Option<Arc<dyn AuthDriver>> {
 pub fn list_driver_metadata() -> Vec<AuthDriverMetadata> {
     [
         build_driver("devin"),
+        build_driver("kiro"),
         build_driver("codex"),
         build_driver("claude-code"),
         build_driver("grok"),

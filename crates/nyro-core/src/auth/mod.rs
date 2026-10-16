@@ -7,6 +7,6 @@ pub use types::{
     AuthCompletionMode, AuthDriver, AuthDriverMetadata, AuthExchangeInput, AuthPollState,
     AuthProgress, AuthScheme, AuthSession, AuthSessionControl, AuthSessionInitData,
     AuthSessionStatus, AuthSessionStatusData, CreateAuthSession, CredentialBundle,
-    ExchangeAuthContext, RefreshAuthContext, RuntimeBinding, StartAuthContext, StoredCredential,
-    UpdateAuthSession,
+    ExchangeAuthContext, KiroLoginMethod, KiroLoginOptions, RefreshAuthContext, RuntimeBinding,
+    StartAuthContext, StoredCredential, UpdateAuthSession,
 };

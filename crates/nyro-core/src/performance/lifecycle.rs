@@ -65,13 +65,21 @@ struct NativeObservation {
 }
 impl NativeObservation {
     fn reason(&self, evidence: NativeTerminalEvidence) -> &'static str {
-        if self.vendor == "devin" {
-            match evidence {
-                NativeTerminalEvidence::Completed => "devin_turn_ended",
-                NativeTerminalEvidence::ToolHandoff => "devin_tool_handoff",
-            }
+        match (self.vendor, evidence) {
+            ("devin", NativeTerminalEvidence::Completed) => "devin_turn_ended",
+            ("devin", NativeTerminalEvidence::ToolHandoff) => "devin_tool_handoff",
+            ("kiro", NativeTerminalEvidence::Completed) => "kiro_turn_ended",
+            ("kiro", NativeTerminalEvidence::ToolHandoff) => "kiro_tool_handoff",
+            _ => evidence.reason(),
+        }
+    }
+
+    /// Wire format of the native stream, for diagnostics.
+    fn format(&self) -> &'static str {
+        if self.vendor == "kiro" {
+            "application/vnd.amazon.eventstream"
         } else {
-            evidence.reason()
+            "application/connect+proto"
         }
     }
 }
@@ -204,6 +212,15 @@ impl Attempt {
         let mut state = self.0.lock().unwrap();
         if let Some(native) = state.native.as_mut() {
             native.vendor = "devin";
+        }
+        state.sync_native_metadata();
+    }
+    /// Tag Kiro observations so usage provenance stays vendor-specific.
+    pub fn configure_kiro_stream(&self) {
+        self.configure_native_stream();
+        let mut state = self.0.lock().unwrap();
+        if let Some(native) = state.native.as_mut() {
+            native.vendor = "kiro";
         }
         state.sync_native_metadata();
     }
@@ -473,7 +490,7 @@ impl State {
     fn sync_native_metadata(&mut self) {
         if let Some(native) = &self.native {
             self.diagnostic.payload_metadata["native_stream"] = json!({
-                "format": "application/connect+proto",
+                "format": native.format(),
                 "terminal": native.terminal.map(|evidence| native.reason(evidence)),
                 "upstream_turn_ended": native.terminal.map(|e| e == NativeTerminalEvidence::Completed),
                 "api_round_complete": native.terminal.is_some(),
