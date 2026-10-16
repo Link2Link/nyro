@@ -158,6 +158,7 @@ impl ProviderProtocols {
     /// persisting provider configuration. Legacy JSON/HTTP provider semantics
     /// are unchanged; Cursor never inherits a generic provider/key fallback.
     pub fn validate_provider(provider: &Provider) -> Result<(), GatewayError> {
+        crate::provider::devin::validate(provider)?;
         let is_cursor = provider
             .vendor
             .as_deref()
@@ -249,6 +250,18 @@ impl ProviderProtocols {
                     record_id: None,
                     protocol: CURSOR_AGENT_RUN_V1,
                     base_url: CURSOR_AGENT_BASE_URL.to_string(),
+                    auth_scheme: "oauth".to_string(),
+                }],
+                adaptive: false,
+            };
+        }
+        if crate::provider::devin::is_devin(provider) {
+            return Self {
+                default: ids::DEVIN_CHAT_V1,
+                endpoints: vec![ProviderProtocolTarget {
+                    record_id: None,
+                    protocol: ids::DEVIN_CHAT_V1,
+                    base_url: ids::DEVIN_BASE_URL.to_string(),
                     auth_scheme: "oauth".to_string(),
                 }],
                 adaptive: false,

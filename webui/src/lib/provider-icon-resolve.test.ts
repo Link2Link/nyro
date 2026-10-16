@@ -6,7 +6,7 @@ import {
 
 /** The shipped catalog keys these cases exercise, plus the predicate shape the app passes. */
 const shipped = new Set(["nyro", "bailian", "doubao", "googlecloud", "kimi", "zhipu", "gemini",
-  "openai", "anthropic", "grok", "opencode-logo-light", "zai", "qwen", "deepseek", "minimax"]);
+  "openai", "anthropic", "grok", "opencode-logo-light", "zai", "qwen", "deepseek", "minimax", "devin"]);
 const available = (iconKey: string) => shipped.has(iconKey);
 const resolve = (source: Parameters<typeof resolveProviderIconKey>[0]) =>
   resolveProviderIconKey(source, available);
@@ -25,6 +25,12 @@ test("canonical provider identity outranks name and host, and maps through vendo
   equal(resolve({ iconKey: "vertexai" }), "googlecloud");
   // An unknown identity key falls through to the weaker signals instead of showing nothing.
   equal(resolve({ iconKey: "not-a-shipped-key", name: "SupurGrok", baseUrl: "https://cli-chat-proxy.grok.com/v1" }), "grok");
+});
+
+test("Devin identity and native Codeium host use the Devin monogram", () => {
+  equal(resolve({ iconKey: "devin", name: "OpenAI relay", baseUrl: "https://api.openai.com" }), "devin");
+  equal(resolve({ name: "My CLI", baseUrl: "https://server.codeium.com" }), "devin");
+  equal(resolve({ iconKey: "cognition" }), "devin");
 });
 
 test("the wire protocol never brands a provider", () => {

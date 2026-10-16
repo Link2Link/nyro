@@ -46,6 +46,7 @@ pub fn protocol_default_vendor(protocol: Protocol) -> &'static str {
         Protocol::AnthropicMessages => "anthropic",
         Protocol::GoogleGemini => "google",
         Protocol::CursorAgent => "cursor",
+        Protocol::DevinChat => "devin",
     }
 }
 

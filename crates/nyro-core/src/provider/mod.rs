@@ -33,6 +33,7 @@ pub mod bailian;
 pub mod cursor;
 pub mod custom;
 pub mod deepseek;
+pub mod devin;
 pub mod google;
 pub mod kimi_code;
 pub mod minimax;

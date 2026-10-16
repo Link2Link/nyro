@@ -76,6 +76,9 @@ fn build_model_probe_request(
         crate::protocol::ids::Protocol::CursorAgent => {
             anyhow::bail!("Cursor probes require native AgentService execution")
         }
+        crate::protocol::ids::Protocol::DevinChat => {
+            anyhow::bail!("Devin probes require native Connect/protobuf execution")
+        }
         crate::protocol::ids::Protocol::OpenAICompatible => (
             "/v1/chat/completions",
             serde_json::json!({
@@ -898,6 +901,33 @@ fn normalize_protocol_config(
         });
     }
 
+    if registry.parse_protocol(default_protocol) == Some(crate::protocol::ids::Protocol::DevinChat)
+    {
+        anyhow::ensure!(
+            mode == PROVIDER_PROTOCOL_MODE_FIXED
+                && endpoints.iter().all(|endpoint| {
+                    registry.resolve_alias(&endpoint.protocol)
+                        == Some(crate::protocol::ids::DEVIN_CHAT_V1)
+                        && endpoint.base_url.trim().trim_end_matches('/')
+                            == base_url.trim().trim_end_matches('/')
+                        && endpoint.api_key.trim().is_empty()
+                        && matches!(endpoint.auth_scheme.as_str(), "auto" | "oauth")
+                }),
+            "Devin requires fixed protocol mode without adaptive endpoints"
+        );
+        anyhow::ensure!(
+            auth_mode == "oauth" && api_key.trim().is_empty(),
+            "Devin requires OAuth authentication without API keys"
+        );
+        return Ok(NormalizedProtocolConfig {
+            mode: mode.to_string(),
+            default_protocol: crate::protocol::ids::DEVIN_CHAT_V1.to_string(),
+            base_url: normalize_endpoint_url(base_url)?,
+            api_key: String::new(),
+            endpoints: Vec::new(),
+        });
+    }
+
     if mode == PROVIDER_PROTOCOL_MODE_FIXED {
         let protocol = registry
             .parse_protocol(default_protocol)
@@ -1493,6 +1523,16 @@ fn validate_provider_input(input: &CreateProvider) -> anyhow::Result<()> {
 
 fn validate_admin_provider(provider: &Provider) -> anyhow::Result<()> {
     crate::protocol::ProviderProtocols::validate_provider(provider)?;
+    if provider
+        .preset_key
+        .as_deref()
+        .is_some_and(|preset| preset.eq_ignore_ascii_case("devin"))
+    {
+        anyhow::ensure!(
+            crate::provider::devin::is_devin(provider),
+            "Devin preset requires vendor=devin"
+        );
+    }
     if is_cursor_provider(provider) {
         anyhow::ensure!(
             provider
@@ -2041,6 +2081,26 @@ impl AdminService {
     }
     pub async fn test_provider(&self, id: &str) -> anyhow::Result<TestResult> {
         let provider = self.get_provider(id).await?;
+        if crate::provider::devin::is_devin(&provider) {
+            let start = Instant::now();
+            let outcome = async {
+                validate_admin_provider(&provider)?;
+                let runtime = self.resolve_provider_runtime(&provider).await?;
+                crate::provider::devin::check_connection(&self.gw, &provider, &runtime.access_token)
+                    .await
+            }
+            .await;
+            let result = TestResult {
+                success: outcome.is_ok(),
+                latency_ms: start.elapsed().as_millis() as u64,
+                model: None,
+                error: outcome.err().map(|error| error.to_string()),
+                endpoints: Vec::new(),
+            };
+            self.record_provider_test_result(&provider.id, &result)
+                .await?;
+            return Ok(result);
+        }
         if is_cursor_provider(&provider) {
             let start = Instant::now();
             // Force a fresh authenticated unary call; a cached directory or a
@@ -2473,6 +2533,9 @@ impl AdminService {
         if is_cursor_provider(&provider) {
             return self.probe_cursor_models(&provider, models).await;
         }
+        if crate::provider::devin::is_devin(&provider) {
+            return self.probe_devin_models(&provider, models).await;
+        }
 
         // Pick the probe endpoint: adaptive providers probe through the
         // endpoint matching their configured default protocol
@@ -2763,6 +2826,60 @@ impl AdminService {
         })
     }
 
+    async fn probe_devin_models(
+        &self,
+        provider: &Provider,
+        models: Vec<String>,
+    ) -> anyhow::Result<ProviderModelProbeOutcome> {
+        anyhow::ensure!(
+            models.len() <= 16,
+            "Devin model probes are limited to 16 models per request"
+        );
+        let runtime = self.resolve_provider_runtime(provider).await?;
+        let credential = runtime
+            .credential
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Devin OAuth credential is missing"))?;
+        let protocol = crate::protocol::ids::DEVIN_CHAT_V1.to_string();
+        let mut results = Vec::new();
+        for model in models {
+            let start = Instant::now();
+            let outcome =
+                crate::provider::devin::probe(&self.gw, provider, credential, &model).await;
+            let (reply, error) = match outcome {
+                Ok(reply) => (Some(reply), None),
+                Err(error) => (None, Some(error.to_string())),
+            };
+            results.push(ProviderModelProbeResult {
+                model,
+                success: error.is_none(),
+                error,
+                latency_ms: start.elapsed().as_millis() as u64,
+                protocol: protocol.clone(),
+                reply,
+                quota_remaining: None,
+                quota_resets_at: None,
+            });
+        }
+        Ok(ProviderModelProbeOutcome {
+            meta: ProviderModelProbeMeta {
+                protocol,
+                base_url: provider.base_url.clone(),
+            },
+            results,
+        })
+    }
+
+    async fn devin_provider_models(&self, provider: &Provider) -> anyhow::Result<Vec<String>> {
+        validate_admin_provider(provider)?;
+        let runtime = self.resolve_provider_runtime(provider).await?;
+        anyhow::ensure!(
+            !runtime.access_token.trim().is_empty(),
+            "Devin OAuth credential is missing"
+        );
+        Ok(crate::provider::devin::models(provider))
+    }
+
     async fn record_provider_test_result(
         &self,
         provider_id: &str,
@@ -2969,6 +3086,9 @@ impl AdminService {
         if is_cursor_provider(provider) {
             return self.cursor_provider_models(provider, true).await;
         }
+        if crate::provider::devin::is_devin(provider) {
+            return self.devin_provider_models(provider).await;
+        }
         // Key-pool providers route discovery through the pool snapshots (see
         // discover_provider_models); the runtime credential below is the
         // provider-level key, which an active pool deliberately ignores.
@@ -3104,6 +3224,9 @@ impl AdminService {
         validate_admin_provider(provider)?;
         if is_cursor_provider(provider) {
             return self.cursor_provider_models(provider, require_catalog).await;
+        }
+        if crate::provider::devin::is_devin(provider) {
+            return self.devin_provider_models(provider).await;
         }
         // Key-pool providers: the per-key snapshots are the catalog. Union
         // every informed key's effective model set; when no key has ever been
@@ -4014,6 +4137,121 @@ mod adaptive_protocol_tests {
         let error =
             ensure_adaptive_provider_supported("adaptive", Some("vertexai"), None).unwrap_err();
         assert!(error.to_string().contains("does not support Vertex AI"));
+    }
+}
+
+#[cfg(test)]
+mod devin_admin_tests {
+    use super::*;
+
+    fn input() -> CreateProvider {
+        CreateProvider {
+            name: "Devin".into(),
+            vendor: Some("devin".into()),
+            preset_key: Some("devin".into()),
+            channel: Some("cli".into()),
+            protocol: "devin-chat/get-chat-message/v1".into(),
+            protocol_mode: "fixed".into(),
+            base_url: "https://server.codeium.com".into(),
+            auth_mode: "oauth".into(),
+            api_key: String::new(),
+            keys: vec![],
+            protocol_endpoints: vec![],
+            models_source: None,
+            static_models: None,
+            use_proxy: false,
+            fast_mode: false,
+        }
+    }
+
+    #[test]
+    fn devin_native_protocol_is_egress_only_and_identity_is_validated() {
+        let registry = crate::protocol::registry::ProtocolRegistry::global();
+        let endpoint = crate::protocol::ids::DEVIN_CHAT_V1;
+        assert_eq!(registry.resolve_alias("devin-chat"), Some(endpoint));
+        assert!(registry.get(&endpoint).is_none());
+        assert_eq!(
+            registry.describe(&endpoint).unwrap().execution,
+            crate::protocol::ExecutionKind::VendorStream
+        );
+        validate_provider_input(&input()).unwrap();
+        for change in 0..6 {
+            let mut candidate = input();
+            match change {
+                0 => candidate.vendor = Some("custom".into()),
+                1 => candidate.channel = Some("default".into()),
+                2 => candidate.auth_mode = "apikey".into(),
+                3 => candidate.api_key = "forbidden".into(),
+                4 => candidate.base_url = "https://example.invalid".into(),
+                _ => candidate.protocol_mode = "adaptive".into(),
+            }
+            assert!(validate_provider_input(&candidate).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn devin_persists_and_survives_startup_normalization_without_schema_changes() {
+        let directory = tempfile::tempdir().unwrap();
+        let (gw, _) = Gateway::new(crate::config::GatewayConfig {
+            data_dir: directory.path().into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let admin = gw.admin();
+        let provider = admin.create_provider(input()).await.unwrap();
+        validate_admin_provider(&provider).unwrap();
+        admin
+            .update_provider(
+                &provider.id,
+                UpdateProvider {
+                    base_url: Some("https://server.codeium.com".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let copied = admin.copy_provider(&provider.id).await.unwrap();
+        assert!(!copied.is_enabled);
+        let (restarted, _) = Gateway::new(crate::config::GatewayConfig {
+            data_dir: directory.path().into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let stored = restarted.admin().get_provider(&provider.id).await.unwrap();
+        validate_admin_provider(&stored).unwrap();
+        let declaration = crate::protocol::ProviderProtocols::from_provider(&stored);
+        assert_eq!(declaration.default, crate::protocol::ids::DEVIN_CHAT_V1);
+        for ingress in [
+            crate::protocol::ids::OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1,
+            crate::protocol::ids::OPENAI_RESPONSES_V1,
+            crate::protocol::ids::ANTHROPIC_MESSAGES_2023_06_01,
+            crate::protocol::ids::GOOGLE_GEMINI_GENERATE_CONTENT_V1BETA,
+        ] {
+            assert_eq!(
+                declaration.resolve_egress(ingress).unwrap().protocol,
+                crate::protocol::ids::DEVIN_CHAT_V1
+            );
+        }
+        assert!(
+            declaration
+                .resolve_egress(crate::protocol::ids::OPENAI_COMPATIBLE_EMBEDDINGS_V1)
+                .is_none()
+        );
+        assert!(admin.get_provider_models(&provider.id).await.is_err());
+        assert!(!admin.test_provider(&provider.id).await.unwrap().success);
+        assert!(
+            admin
+                .probe_provider_models(
+                    &provider.id,
+                    Some((0..17).map(|i| format!("model-{i}")).collect())
+                )
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("limited to 16")
+        );
     }
 }
 

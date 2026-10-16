@@ -31,9 +31,9 @@ pub(crate) enum NativeUsageProvenance {
     Reported,
 }
 impl NativeUsageProvenance {
-    fn metadata(self) -> Value {
+    fn metadata(self, vendor: &str) -> Value {
         serde_json::json!({
-            "source": "cursor_native",
+            "source": if vendor == "devin" { "devin_native" } else { "cursor_native" },
             "status": match self {
                 Self::Unknown => "unknown",
                 Self::Partial => "partial",

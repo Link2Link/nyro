@@ -2,7 +2,7 @@ import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { backend } from "@/lib/backend";
 import { oauthCompletionMode, useOAuthSession } from "@/lib/use-oauth-session";
-import { OAuthProgress, OAuthSessionRemaining, OAuthSessionError, CursorExperimentalNotice } from "@/components/oauth-session-status";
+import { OAuthProgress, OAuthSessionRemaining, OAuthSessionError, CursorExperimentalNotice, DevinLoginNotice } from "@/components/oauth-session-status";
 import { localizeBackendErrorMessage } from "@/lib/backend-error";
 import { invalidateModelRatings } from "@/lib/use-model-ratings";
 import type {
@@ -77,6 +77,7 @@ import { ProviderUsageFooter } from "@/components/provider-usage";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { resolveProtocol, PROTOCOL_ENDPOINT_TABLE, PROTOCOL_TABLE } from "@/lib/protocol";
 import { openExternalUrl } from "@/lib/open-external";
+import { DEVIN_PROTOCOL, isDevinProvider, nativePresetProtocol } from "@/lib/native-provider";
 
 function protocolUrl(protocol: string) {
   return PROTOCOL_TABLE.find((p) => p.id === resolveProtocol(protocol))?.defaultBaseUrl
@@ -595,9 +596,8 @@ function availableProtocolsForPreset(
   }
   // Native OAuth-only transport: preserve the backend identity, never expose it
   // as a generic API-key/adaptive endpoint or fall back to OpenAI.
-  if (preset.id === "cursor" && preset.defaultProtocol === "cursor-agent/run/v1") {
-    return [preset.defaultProtocol];
-  }
+  const nativeProtocol = nativePresetProtocol(preset);
+  if (nativeProtocol) return [nativeProtocol];
 
   const byChannel = preset.channels?.find((channel) => channel.id === channelId);
   const collectKeys = (channels: ProviderChannelPreset[]) =>
@@ -624,7 +624,7 @@ function resolvePresetProtocol(
   preferred?: ProviderProtocol,
 ): ProviderProtocol {
   const available = availableProtocolsForPreset(preset, channelId);
-  const canonicalDefault = (resolveProtocol(preset.defaultProtocol) ?? "openai-compatible") as ProviderProtocol;
+  const canonicalDefault = nativePresetProtocol(preset) ?? (resolveProtocol(preset.defaultProtocol) ?? "openai-compatible") as ProviderProtocol;
   if (preferred && available.includes(preferred)) return preferred;
   if (available.includes(canonicalDefault)) return canonicalDefault;
   return available[0] ?? canonicalDefault;
@@ -766,7 +766,8 @@ function resolvePresetConfig(
   const channel = presetChannels(preset).find((item) => item.id === channelId) ?? presetChannels(preset)[0];
   const sourceBaseUrls = channel?.baseUrls ?? {};
   const rawBaseUrl = Object.entries(sourceBaseUrls).find(
-    ([key]) => key === protocol || resolveProtocol(key) === protocol,
+    ([key]) => key === protocol || resolveProtocol(key) === protocol
+      || (preset.id === "devin" && key === "devin-chat" && protocol === DEVIN_PROTOCOL),
   )?.[1];
   const baseUrl = rawBaseUrl ? toGatewayBaseUrl(rawBaseUrl) : "";
   const modelsSource = channel?.modelsSource ?? channel?.modelsEndpoint ?? "";
@@ -1301,7 +1302,7 @@ export default function ProvidersPage() {
     };
 
     try {
-      const protocol = isCursorProvider(provider)
+      const protocol = isDevinProvider(provider) ? DEVIN_PROTOCOL : isCursorProvider(provider)
         ? provider.protocol
         : (resolveProtocol(provider.protocol || "openai") ?? "openai-compatible");
       const baseUrl = provider.base_url?.trim() ?? "";
@@ -1362,7 +1363,7 @@ export default function ProvidersPage() {
       const modelsSource = provider.models_source?.trim();
       // Cursor has no HTTP discovery URL; test_provider_models resolves its
       // native AgentService GetUsableModels catalog server-side.
-      const nativeCatalog = provider.vendor === "cursor";
+      const nativeCatalog = isCursorProvider(provider) || isDevinProvider(provider);
       if (!modelsSource && !nativeCatalog) {
         finish(
           {
@@ -1382,9 +1383,9 @@ export default function ProvidersPage() {
       appendTestLog(
         "info",
         nativeCatalog && !modelsSource
-          ? isZh
-            ? "→ Cursor 原生模型目录（GetUsableModels）"
-            : "→ Cursor native catalog (GetUsableModels)"
+          ? isDevinProvider(provider)
+            ? (isZh ? "→ Devin 配置的模型目录（静态建议）" : "→ Devin configured catalog (static suggestions)")
+            : (isZh ? "→ Cursor 原生模型目录（GetUsableModels）" : "→ Cursor native catalog (GetUsableModels)")
           : `→ ${modelsSource}`,
       );
 
@@ -1633,7 +1634,7 @@ export default function ProvidersPage() {
         manual_models: key.manual_models ?? null,
       })),
     );
-    setKeyPoolEnabled((p.keys ?? []).length > 0);
+    setKeyPoolEnabled(normalizeAuthMode(p.auth_mode) !== "oauth" && (p.keys ?? []).length > 0);
     setProbeKeysError(null);
     setEditUsageAk("");
     setEditUsageSk("");
@@ -1653,12 +1654,12 @@ export default function ProvidersPage() {
     );
     const channel = p.channel || "default";
     const savedProtocol = (resolveProtocol(p.protocol) ?? "openai-compatible") as ProviderProtocol;
-    const safeProtocol = isCursorProvider(p)
+    const safeProtocol = isDevinProvider(p) ? DEVIN_PROTOCOL : isCursorProvider(p)
       ? p.protocol
       : presetForEdit
         ? resolvePresetProtocol(presetForEdit, channel, savedProtocol)
         : savedProtocol;
-    const protocolMode = p.protocol_mode === "adaptive" ? "adaptive" : "fixed";
+    const protocolMode = normalizeAuthMode(p.auth_mode) !== "oauth" && p.protocol_mode === "adaptive" ? "adaptive" : "fixed";
 
     // Shared-key channels (e.g. GLM Coding Plan) always edit in adaptive mode
     // with one endpoint per checked protocol sharing the provider API key.
@@ -1718,7 +1719,7 @@ export default function ProvidersPage() {
       protocol: protocolMode === "adaptive" ? p.protocol : safeProtocol,
       base_url: p.base_url,
       protocol_mode: protocolMode,
-      protocol_endpoints: (p.protocol_endpoints ?? []).map((endpoint) => ({
+      protocol_endpoints: (normalizeAuthMode(p.auth_mode) === "oauth" ? [] : p.protocol_endpoints ?? []).map((endpoint) => ({
         protocol: endpoint.protocol,
         base_url: endpoint.base_url,
         api_key: endpoint.api_key,
@@ -1934,10 +1935,11 @@ export default function ProvidersPage() {
     ? sharedKeyProtocolEntries(createSharedKeyChannel)
     : [];
   const createOAuthReady = createOAuthStatus?.status === "ready";
-  const createOAuthRequiresManualCode = oauthCompletionMode(
+  const createIsDevinOAuth = isDevinProvider(form);
+  const createOAuthRequiresManualCode = (!createOAuthSession && createIsDevinOAuth) || oauthCompletionMode(
     createOAuthStatus?.status === "pending" ? createOAuthStatus : createOAuthSession,
   ) === "manual_exchange";
-  const editOAuthRequiresManualCode = oauthCompletionMode(
+  const editOAuthRequiresManualCode = (!editOAuthSession && isDevinProvider(editForm)) || oauthCompletionMode(
     editOAuthSessionStatus?.status === "pending" ? editOAuthSessionStatus : editOAuthSession,
   ) === "manual_exchange";
   const showCreateOAuthGuide = createResolvedAuthMode === "oauth" && !createOAuthReady;
@@ -2134,6 +2136,20 @@ export default function ProvidersPage() {
                 </div>
               )}
               {isCursorProvider(form) && <CursorExperimentalNotice isZh={isZh} />}
+              {createIsDevinOAuth && <>
+                <DevinLoginNotice isZh={isZh} />
+                <div className="col-span-2 space-y-2">
+                  <FieldLabel>{isZh ? "Devin 模型 UID（每行一个）" : "Devin model UIDs (one per line)"}</FieldLabel>
+                  <textarea
+                    className="w-full rounded-md border border-border bg-background px-3 py-2 font-mono text-xs"
+                    rows={4}
+                    value={form.static_models ?? ""}
+                    onChange={(e) => setForm({ ...form, static_models: e.target.value })}
+                    spellCheck={false}
+                  />
+                  <p className="text-xs text-slate-500">{isZh ? "预设只是静态建议，不是账号可用模型保证。可填入账号支持的精确模型 UID。" : "Preset entries are static suggestions, not a guarantee of account access. Enter exact model UIDs supported by your account."}</p>
+                </div>
+              </>}
               {showCreateOAuthGuide ? (
                 <div className="col-span-2 rounded-xl border border-slate-200 bg-slate-50 p-4">
                   <div className="flex items-center justify-between gap-3">
@@ -2226,10 +2242,12 @@ export default function ProvidersPage() {
                     <div className={`rounded-lg border p-3 ${createOAuthStatus?.status === "error" ? "border-rose-200 bg-rose-50" : createOAuthSession ? "border-sky-200 bg-sky-50" : "border-slate-200 bg-white"}`}>
                       <div className="flex items-center gap-2 text-sm font-medium text-slate-800">
                         <span className={`inline-flex h-6 w-6 items-center justify-center rounded-full text-xs ${(createOAuthStatus?.status === "pending" || createOAuthStatus?.status === "error") ? "bg-sky-600 text-white" : "bg-slate-200 text-slate-700"}`}>2</span>
-                        <span>{!createOAuthRequiresManualCode ? (isZh ? "等待授权" : "Wait for Authorization") : createIsGrokOAuth ? (isZh ? "粘贴 Grok Build 授权码" : "Paste Grok Build Code") : (isZh ? "粘贴回调结果" : "Paste Callback Result")}</span>
+                        <span>{!createOAuthRequiresManualCode ? (isZh ? "等待授权" : "Wait for Authorization") : createIsDevinOAuth ? (isZh ? "粘贴 Devin CLI 授权码" : "Paste Devin CLI Code") : createIsGrokOAuth ? (isZh ? "粘贴 Grok Build 授权码" : "Paste Grok Build Code") : (isZh ? "粘贴回调结果" : "Paste Callback Result")}</span>
                       </div>
                       {createOAuthRequiresManualCode && <p className="mt-2 text-xs text-slate-500">
-                        {createIsGrokOAuth
+                        {createIsDevinOAuth
+                          ? (isZh ? "粘贴登录页显示的授权码，或导入已有的 Devin 会话令牌。" : "Paste the code from the sign-in page, or import an existing Devin session token.")
+                          : createIsGrokOAuth
                           ? (isZh
                             ? "授权页会显示「将下面的代码复制到 Grok Build 以完成登录」。把那串码原样贴到这里即可。"
                             : "The page says “copy the code below into Grok Build”. Paste that code here as-is.")
@@ -2240,6 +2258,23 @@ export default function ProvidersPage() {
                       <div className="mt-3 space-y-3">
                         {!createOAuthRequiresManualCode ? (
                           <OAuthProgress isZh={isZh} expiresAt={createOAuth.expiresAt} retryCount={createOAuth.retryCount} pending={createOAuthStatus?.status === "pending"} userCode={createOAuthStatus?.status === "pending" ? createOAuthStatus.user_code : undefined} />
+                        ) : createIsDevinOAuth ? (
+                          <div className="space-y-2">
+                            <FieldLabel>{isZh ? "Devin 授权码 / 会话令牌" : "Devin code / session token"}</FieldLabel>
+                            <Input
+                              type="password"
+                              autoComplete="off"
+                              spellCheck={false}
+                              placeholder={isZh ? "授权码、回调地址或 devin-session-token$…" : "Code, callback URL, or devin-session-token$…"}
+                              value={createOAuthCode}
+                              onChange={(e) => {
+                                setCreateOAuthCallbackUrl("");
+                                setCreateOAuthCallbackError("");
+                                setCreateOAuthCode(e.target.value);
+                              }}
+                              disabled={!createOAuthSession || createOAuthBusy}
+                            />
+                          </div>
                         ) : createIsGrokOAuth ? (
                           <div className="space-y-2">
                             <FieldLabel>{isZh ? "Grok Build 授权码" : "Grok Build authorization code"}</FieldLabel>
@@ -2556,7 +2591,7 @@ export default function ProvidersPage() {
                 <Button
                   onClick={() => {
                     const protocol = form.protocol || "openai-compatible";
-                    const adaptive = form.protocol_mode === "adaptive";
+                    const adaptive = createResolvedAuthMode !== "oauth" && form.protocol_mode === "adaptive";
                     const protocolEndpoints = form.protocol_endpoints ?? [];
                     const defaultEndpoint = protocolEndpoints.find((endpoint) => endpoint.protocol === protocol);
                     const baseUrl = toGatewayBaseUrl(
@@ -2866,6 +2901,20 @@ export default function ProvidersPage() {
                       </ToggleGroup>
                     </div>
                     {isCursorProvider(editForm) && <CursorExperimentalNotice isZh={isZh} />}
+                    {isDevinProvider(editForm) && <>
+                      <DevinLoginNotice isZh={isZh} />
+                      <div className="col-span-2 space-y-2">
+                        <FieldLabel>{isZh ? "Devin 模型 UID（每行一个）" : "Devin model UIDs (one per line)"}</FieldLabel>
+                        <textarea
+                          className="w-full rounded-md border border-border bg-background px-3 py-2 font-mono text-xs"
+                          rows={4}
+                          value={editForm.static_models ?? ""}
+                          onChange={(e) => setEditForm({ ...editForm, static_models: e.target.value })}
+                          spellCheck={false}
+                        />
+                        <p className="text-xs text-slate-500">{isZh ? "预设只是静态建议，不是账号可用模型保证。可填入账号支持的精确模型 UID。" : "Preset entries are static suggestions, not a guarantee of account access. Enter exact model UIDs supported by your account."}</p>
+                      </div>
+                    </>}
                     {editingResolvedAuthMode === "oauth" ? (
                       <details className="col-span-2 rounded-xl border border-slate-200 bg-slate-50" open={editOAuthStatus?.status !== "connected" || showEditReauth}>
                         <summary className="flex items-center justify-between gap-3 p-4 cursor-pointer list-none [&::-webkit-details-marker]:hidden">
@@ -2931,17 +2980,17 @@ export default function ProvidersPage() {
                               )}
                             </div>
                             <div className="flex flex-wrap gap-2">
-                              {isCursorProvider(p) && <Button type="button" onClick={() => startEditReauth(p.id, "cursor", p.use_proxy)} disabled={reconnectOAuthMut.isPending || logoutOAuthMut.isPending}>
+                              {(isCursorProvider(p) || isDevinProvider(p)) && <Button type="button" onClick={() => startEditReauth(p.id, isDevinProvider(p) ? "devin" : "cursor", p.use_proxy)} disabled={reconnectOAuthMut.isPending || logoutOAuthMut.isPending}>
                                 {isZh ? "重新授权" : "Re-authorize"}
                               </Button>}
-                              <Button
+                              {!isDevinProvider(p) && <Button
                                 type="button"
                                 variant="secondary"
                                 onClick={() => reconnectOAuthMut.mutate(p.id)}
                                 disabled={reconnectOAuthMut.isPending || logoutOAuthMut.isPending}
                               >
                                 {reconnectOAuthMut.isPending ? (isZh ? "续期中..." : "Renewing...") : (isZh ? "续期 Token" : "Renew Token")}
-                              </Button>
+                              </Button>}
                               <Button
                                 type="button"
                                 variant="secondary"
@@ -2960,7 +3009,9 @@ export default function ProvidersPage() {
                               </div>
                               <div className="mt-1 text-xs text-amber-600">
                                 {editOAuthStatus?.status === "error"
-                                  ? (isZh ? "授权失败（Refresh Token 可能已失效），请重新授权。" : "Authorization failed (refresh token may have expired). Please re-authorize.")
+                                  ? isDevinProvider(p)
+                                    ? (isZh ? "Devin 会话令牌无效，请重新授权。" : "The Devin session token is invalid. Please authorize again.")
+                                    : (isZh ? "授权失败（Refresh Token 可能已失效），请重新授权。" : "Authorization failed (refresh token may have expired). Please re-authorize.")
                                   : showEditReauth && editOAuthStatus?.status === "connected"
                                     ? (isZh ? "正在重新授权，原授权将在成功后替换。" : "Re-authorizing. The existing authorization is replaced after success.")
                                     : (isZh ? "未授权，请进行 OAuth 授权。" : "Not authorized. Please complete OAuth authorization.")}
@@ -3006,10 +3057,12 @@ export default function ProvidersPage() {
                                   <div className={`rounded-lg border p-3 ${editOAuthSession ? "border-sky-200 bg-sky-50" : "border-slate-200 bg-white"}`}>
                                     <div className="flex items-center gap-2 text-sm font-medium text-slate-800">
                                       <span className={`inline-flex h-6 w-6 items-center justify-center rounded-full text-xs ${editOAuthSession ? "bg-sky-600 text-white" : "bg-slate-200 text-slate-700"}`}>2</span>
-                                      <span>{!editOAuthRequiresManualCode ? (isZh ? "等待授权" : "Wait for Authorization") : editingIsGrokOAuth ? (isZh ? "粘贴 Grok Build 授权码" : "Paste Grok Build Code") : (isZh ? "粘贴回调结果" : "Paste Callback Result")}</span>
+                                      <span>{!editOAuthRequiresManualCode ? (isZh ? "等待授权" : "Wait for Authorization") : isDevinProvider(editForm) ? (isZh ? "粘贴 Devin CLI 授权码" : "Paste Devin CLI Code") : editingIsGrokOAuth ? (isZh ? "粘贴 Grok Build 授权码" : "Paste Grok Build Code") : (isZh ? "粘贴回调结果" : "Paste Callback Result")}</span>
                                     </div>
                                     {editOAuthRequiresManualCode && <p className="mt-2 text-xs text-slate-500">
-                                      {editingIsGrokOAuth
+                                      {isDevinProvider(editForm)
+                                        ? (isZh ? "粘贴登录页显示的授权码，或导入已有的 Devin 会话令牌。" : "Paste the code from the sign-in page, or import an existing Devin session token.")
+                                        : editingIsGrokOAuth
                                         ? (isZh
                                           ? "授权页会显示「将下面的代码复制到 Grok Build 以完成登录」。把那串码原样贴到这里即可。"
                                           : "The page says “copy the code below into Grok Build”. Paste that code here as-is.")
@@ -3020,6 +3073,23 @@ export default function ProvidersPage() {
                                     <div className="mt-3 space-y-3">
                                       {!editOAuthRequiresManualCode ? (
                                         <OAuthProgress isZh={isZh} expiresAt={editOAuth.expiresAt} retryCount={editOAuth.retryCount} pending={editOAuthSessionStatus?.status === "pending"} userCode={editOAuthSessionStatus?.status === "pending" ? editOAuthSessionStatus.user_code : undefined} />
+                                      ) : isDevinProvider(editForm) ? (
+                                        <div className="space-y-2">
+                                          <FieldLabel>{isZh ? "Devin 授权码 / 会话令牌" : "Devin code / session token"}</FieldLabel>
+                                          <Input
+                                            type="password"
+                                            autoComplete="off"
+                                            spellCheck={false}
+                                            placeholder={isZh ? "授权码、回调地址或 devin-session-token$…" : "Code, callback URL, or devin-session-token$…"}
+                                            value={editOAuthCode}
+                                            onChange={(e) => {
+                                              setEditOAuthCallbackUrl("");
+                                              setEditOAuthInputError("");
+                                              setEditOAuthCode(e.target.value);
+                                            }}
+                                            disabled={!editOAuthSession || editOAuthBusy}
+                                          />
+                                        </div>
                                       ) : editingIsGrokOAuth ? (
                                         <div className="space-y-2">
                                           <FieldLabel>{isZh ? "Grok Build 授权码" : "Grok Build authorization code"}</FieldLabel>
@@ -3701,7 +3771,7 @@ export default function ProvidersPage() {
                       onClick={() => {
                         setEditError(null);
                         const protocol = editForm.protocol || "openai-compatible";
-                        const adaptive = editForm.protocol_mode === "adaptive";
+                        const adaptive = editingResolvedAuthMode !== "oauth" && editForm.protocol_mode === "adaptive";
                         const protocolEndpoints = editForm.protocol_endpoints ?? [];
                         const defaultEndpoint = protocolEndpoints.find(
                           (endpoint) => endpoint.protocol === protocol,
@@ -3716,7 +3786,7 @@ export default function ProvidersPage() {
                           setEditError(validation);
                           return;
                         }
-                        if (keyPoolEnabled) {
+                        if (editingResolvedAuthMode !== "oauth" && keyPoolEnabled) {
                           const invalidKey = editKeys.find(
                             (key) => !key.name.trim() || !key.api_key.trim(),
                           );
@@ -3743,7 +3813,7 @@ export default function ProvidersPage() {
                           protocol,
                           base_url: baseUrl,
                           protocol_mode: adaptive ? "adaptive" : "fixed",
-                          keys: keyPoolEnabled
+                          keys: editingResolvedAuthMode !== "oauth" && keyPoolEnabled
                             ? editKeys.map((key, index) => ({
                                 ...key,
                                 protocol: key.protocol ?? null,
@@ -3763,7 +3833,7 @@ export default function ProvidersPage() {
                           preset_key: editForm.preset_key || undefined,
                           channel: editForm.channel || undefined,
                           models_source: editForm.models_source ?? "",
-                          static_models: editForm.static_models || undefined,
+                          static_models: isDevinProvider(editForm) ? (editForm.static_models ?? "") : editForm.static_models || undefined,
                           api_key: adaptive ? (defaultEndpoint?.api_key ?? "") : (editForm.api_key || undefined),
                         };
                         updateMut.mutate({ id: editForm.id, ...input });

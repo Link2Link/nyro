@@ -1018,7 +1018,10 @@ async fn dispatch_pipeline_inner(
         // Native binary/session upstreams consume IR directly. Keep them out of
         // JSON encoders, protocol-default URL rewriting and raw-wire compat.
         if plan.execution == crate::protocol::ExecutionKind::VendorStream {
-            ctx.trace("conversion", "strategy=native_ir; rule=cursor-agent-ir");
+            ctx.trace(
+                "conversion",
+                &format!("strategy=native_ir; endpoint={egress}"),
+            );
             let performance = crate::performance::Attempt::new(
                 gw.log_tx.clone(),
                 ctx.cancellation.clone(),
@@ -1030,7 +1033,12 @@ async fn dispatch_pipeline_inner(
             performance.correlate(&ctx.request_id, attempt_index);
             let producer = performance.producer();
             ctx.extensions.insert(performance.clone());
-            let client = match gw.required_http2_client(provider.use_proxy).await {
+            let native_client = if crate::provider::devin::is_devin(&provider) {
+                gw.devin_http_client(provider.use_proxy, true).await
+            } else {
+                gw.required_http2_client(provider.use_proxy).await
+            };
+            let client = match native_client {
                 Ok(client) => ProxyClient::new(client)
                     .with_timeouts(gw.config.upstream_timeouts)
                     .with_deadline(ctx.deadline.clone())
@@ -1040,7 +1048,7 @@ async fn dispatch_pipeline_inner(
                     health_permit.neutral();
                     last_response = Some(error_response(
                         502,
-                        &format!("Cursor transport configuration: {error}"),
+                        &format!("Native provider transport configuration: {error}"),
                     ));
                     skip_key_siblings!();
                     continue;
@@ -1088,7 +1096,8 @@ async fn dispatch_pipeline_inner(
             if matches!(
                 &upstream,
                 Err(GatewayError::UpstreamStatus { status: 401, .. })
-            ) && control.rejected.load(std::sync::atomic::Ordering::Acquire)
+            ) && adapter.vendor_id() == "cursor"
+                && control.rejected.load(std::sync::atomic::Ordering::Acquire)
                 && cursor_auth_refreshed.insert(provider.id.clone())
                 && !ctx.cancellation.is_cancelled()
             {
@@ -1137,7 +1146,7 @@ async fn dispatch_pipeline_inner(
                         GatewayError::ClientCancelled => ("cancelled", "client_cancelled"),
                         GatewayError::UpstreamTimeout { .. } => ("timed_out", "timeout"),
                         _ if local => ("failed", "local_capacity"),
-                        _ => ("failed", "cursor_upstream_error"),
+                        _ => ("failed", "native_upstream_error"),
                     };
                     performance.record_failure(outcome, kind, "upstream_request", &error);
                     LogBuilder::from_ctx(&call_ctx)

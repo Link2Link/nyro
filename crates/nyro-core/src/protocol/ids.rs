@@ -30,6 +30,8 @@ pub enum Protocol {
     GoogleGemini,
     /// Cursor Agent Run protocol (egress-only, vendor-owned binary stream).
     CursorAgent,
+    /// Devin CLI chat protocol (egress-only Connect/protobuf stream).
+    DevinChat,
 }
 
 impl Protocol {
@@ -40,6 +42,7 @@ impl Protocol {
             Self::AnthropicMessages => "anthropic-messages",
             Self::GoogleGemini => "google-gemini",
             Self::CursorAgent => "cursor-agent",
+            Self::DevinChat => "devin-chat",
         }
     }
 
@@ -50,6 +53,7 @@ impl Protocol {
             Self::AnthropicMessages => "Anthropic Messages",
             Self::GoogleGemini => "Google Gemini",
             Self::CursorAgent => "Cursor Agent",
+            Self::DevinChat => "Devin Chat",
         }
     }
 }
@@ -74,6 +78,7 @@ impl FromStr for Protocol {
                 Ok(Self::GoogleGemini)
             }
             "cursor-agent" => Ok(Self::CursorAgent),
+            "devin-chat" => Ok(Self::DevinChat),
             other => anyhow::bail!("unknown protocol: {other}"),
         }
     }
@@ -141,6 +146,30 @@ pub const CURSOR_AGENT_RUN_V1: ProtocolEndpoint =
 
 /// Cursor Agent uses a fixed service origin, not a configurable relay URL.
 pub const CURSOR_AGENT_BASE_URL: &str = "https://api2.cursor.sh";
+
+/// Devin's proprietary CLI endpoint, not a public OpenAI-compatible API.
+pub const DEVIN_CHAT_V1: ProtocolEndpoint =
+    ProtocolEndpoint::new(Protocol::DevinChat, "get-chat-message", "v1");
+pub const DEVIN_BASE_URL: &str = "https://server.codeium.com";
+
+/// Native Connect transport; constraints not represented on the wire are
+/// rejected by the request builder rather than silently discarded.
+pub const DEVIN_CHAT_CAPABILITIES: EndpointCapabilities = EndpointCapabilities {
+    streaming: true,
+    tools: true,
+    reasoning: true,
+    multimodal: true,
+    function_calling: true,
+    parallel_tool_calls: true,
+    extended_reasoning: true,
+    force_upstream_stream: true,
+    stream: StreamCaps {
+        server_sent_events: false,
+        usage_in_stream: true,
+        requires_stream_flag: false,
+    },
+    ..EndpointCapabilities::EMPTY
+};
 
 // ── Backward-compat type alias ────────────────────────────────────────────────
 
@@ -330,6 +359,7 @@ mod tests {
             Protocol::AnthropicMessages,
             Protocol::GoogleGemini,
             Protocol::CursorAgent,
+            Protocol::DevinChat,
         ] {
             assert_eq!(p.as_str().parse::<Protocol>().unwrap(), p);
         }

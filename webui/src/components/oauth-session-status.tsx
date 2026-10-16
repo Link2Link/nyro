@@ -53,6 +53,20 @@ export function OAuthSessionError({ status, isZh }: { status: OAuthSessionStatus
   return <p role="alert" className="text-xs text-rose-600">{status.code}: {message}</p>;
 }
 
+export function DevinLoginNotice({ isZh }: { isZh: boolean }) {
+  return (
+    <div className="col-span-2 space-y-1 rounded-lg border border-sky-200 bg-sky-50 px-3 py-2 text-xs text-sky-800">
+      <p className="font-semibold">{isZh ? "Devin CLI 原生接入" : "Devin CLI native provider"}</p>
+      <p>{isZh
+        ? "点击开始授权，打开 Devin CLI 登录页并选择账号，再粘贴页面显示的授权码。无浏览器的服务器可复制链接到其他设备完成登录，无需本地回调。也可在下方导入已有的 Devin 会话令牌。"
+        : "Start authorization, open the Devin CLI sign-in page, select your account, and paste the displayed authorization code. On a headless server, open the link on another device; no local callback is needed. You can also import an existing Devin session token below."}</p>
+      <p>{isZh
+        ? "仅使用固定原生协议 devin-chat/get-chat-message/v1，不是 OpenAI 兼容接口；不支持自适应协议或 API Key 密钥池。会话令牌无法自动续期，失效后请重新授权。"
+        : "Uses only the fixed native devin-chat/get-chat-message/v1 protocol, not an OpenAI-compatible endpoint. Adaptive protocols and API-key pools are not supported. Session tokens cannot be refreshed; authorize again if they stop working."}</p>
+    </div>
+  );
+}
+
 export function CursorExperimentalNotice({ isZh }: { isZh: boolean }) {
   return (
     <div className="col-span-2 space-y-1 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800">

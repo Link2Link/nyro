@@ -87,6 +87,18 @@ Nyro 同时提供 **桌面应用**（macOS / Windows / Linux）和 **独立服�
 - **工具调用**：跨协议 tool call 与结果格式归一化
 - **路由类型**：支持 chat 和 embedding 两种路由类型
 
+### Devin CLI（实验性）
+
+新增 Provider 时选择 **Devin → Devin CLI 订阅**，打开登录页面后将授权码粘贴回 Nyro；也可在同一个掩码输入框中导入已有的 `devin-session-token$…`。此接入使用 Devin CLI 的 PKCE 登录和 Codeium 原生 Connect/protobuf 聊天接口，**不是** Devin 公开的 sessions API，也不依赖 OpenAI 兼容中转；不会启动本地 Devin CLI 或执行本地工具。
+
+- 固定上游为 `https://server.codeium.com`，协议为 `devin-chat/get-chat-message/v1`；不支持 API Key、自适应协议或自定义上游地址。
+- 创建模型路由并指向此 Provider，例如 `swe-2`（默认映射到 `swe-2-high`）。客户端仍使用 Nyro 的 OpenAI Chat/Responses、Anthropic 或 Gemini 入口，支持流式和非流式响应。
+- 内置模型列表仅是建议，**不代表实时账户权限列表**。可编辑 **Devin 模型 UID**，填写账户实际支持的精确模型名称。显式带思考等级的模型名优先于请求体设置，已知基础名称会映射到上游变体。
+- 支持文本、函数工具调用/结果、思考内容/签名、内联 base64 图片和上游返回的 Token/缓存用量。远程图片 URL、embedding、托管工具、严格/强制工具约束和结构化输出会明确拒绝，不会静默丢弃。工具参数及思考后的文本可能缓冲到终止帧验证完成后返回。默认生成预算为 64,000 Token，显式预算原样传给上游。
+- **连接测试**仅调用鉴权后的 `GetUserStatus`，不生成聊天；**模型测试**会发送短聊天，可能消耗额度，单次最多测试 16 个模型。Session Token 没有刷新授权，失效后请使用**重新授权**。
+
+这是参考 CLIProxyAPI 已观察到的 Devin 协议实现的实验性接入；可用性及模型权限取决于 Devin 账户，上游协议变化可能需要更新适配器。鉴权和协议行为由本地模拟测试覆盖，订阅的端到端可用性仍需使用真实账户验证。
+
 ### 路由能力
 
 - 基于 `virtual_model` 的精确匹配路由

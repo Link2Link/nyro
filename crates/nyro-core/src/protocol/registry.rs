@@ -12,9 +12,9 @@ use std::sync::{Arc, OnceLock};
 
 use crate::protocol::ids::{
     ANTHROPIC_MESSAGES_2023_06_01, CURSOR_AGENT_CAPABILITIES, CURSOR_AGENT_RUN_V1,
-    EndpointCapabilities, GOOGLE_GEMINI_GENERATE_CONTENT_V1BETA,
-    OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1, OPENAI_COMPATIBLE_EMBEDDINGS_V1, OPENAI_RESPONSES_V1,
-    Protocol, ProtocolEndpoint,
+    DEVIN_CHAT_CAPABILITIES, DEVIN_CHAT_V1, EndpointCapabilities,
+    GOOGLE_GEMINI_GENERATE_CONTENT_V1BETA, OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1,
+    OPENAI_COMPATIBLE_EMBEDDINGS_V1, OPENAI_RESPONSES_V1, Protocol, ProtocolEndpoint,
 };
 use crate::protocol::traits::EndpointHandler;
 
@@ -103,6 +103,15 @@ impl ProtocolRegistry {
             EndpointDescriptor {
                 id: CURSOR_AGENT_RUN_V1,
                 capabilities: CURSOR_AGENT_CAPABILITIES,
+                execution: ExecutionKind::VendorStream,
+            },
+        );
+
+        descriptors.insert(
+            DEVIN_CHAT_V1,
+            EndpointDescriptor {
+                id: DEVIN_CHAT_V1,
+                capabilities: DEVIN_CHAT_CAPABILITIES,
                 execution: ExecutionKind::VendorStream,
             },
         );
@@ -296,6 +305,7 @@ fn default_endpoint_aliases() -> HashMap<&'static str, ProtocolEndpoint> {
         OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1,
     );
     m.insert("cursor-agent", CURSOR_AGENT_RUN_V1);
+    m.insert("devin-chat", DEVIN_CHAT_V1);
     m.insert("openai-responses", OPENAI_RESPONSES_V1);
     m.insert("openai-embeddings", OPENAI_COMPATIBLE_EMBEDDINGS_V1);
     m.insert("anthropic-messages", ANTHROPIC_MESSAGES_2023_06_01);
@@ -327,6 +337,7 @@ fn default_protocol_aliases() -> HashMap<&'static str, Protocol> {
     m.insert("anthropic-messages", Protocol::AnthropicMessages);
     m.insert("google-gemini", Protocol::GoogleGemini);
     m.insert("cursor-agent", Protocol::CursorAgent);
+    m.insert("devin-chat", Protocol::DevinChat);
 
     // Short names
     m.insert("openai", Protocol::OpenAICompatible);
@@ -380,7 +391,7 @@ mod tests {
         assert!(cursor.capabilities.ingress_routes.is_empty());
         assert!(reg.get(&CURSOR_AGENT_RUN_V1).is_none());
         assert!(reg.list_by_protocol(Protocol::CursorAgent).is_empty());
-        assert_eq!(reg.list_endpoints().len(), reg.list().len() + 1);
+        assert_eq!(reg.list_endpoints().len(), reg.list().len() + 2);
         assert!(
             reg.routes
                 .iter()

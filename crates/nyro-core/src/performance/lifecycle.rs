@@ -58,9 +58,22 @@ impl NativeCapture {
 }
 #[derive(Default)]
 struct NativeObservation {
+    vendor: &'static str,
     response: NativeCapture,
     terminal: Option<NativeTerminalEvidence>,
     usage: NativeUsageProvenance,
+}
+impl NativeObservation {
+    fn reason(&self, evidence: NativeTerminalEvidence) -> &'static str {
+        if self.vendor == "devin" {
+            match evidence {
+                NativeTerminalEvidence::Completed => "devin_turn_ended",
+                NativeTerminalEvidence::ToolHandoff => "devin_tool_handoff",
+            }
+        } else {
+            evidence.reason()
+        }
+    }
 }
 
 /// Accept only bounded, content-free semantic facts. Never trust arbitrary JSON
@@ -184,6 +197,15 @@ impl Attempt {
             s.metadata.response_mode = "stream".into();
             s.sync_native_metadata();
         }
+    }
+    /// Tag Devin observations without changing existing Cursor log semantics.
+    pub fn configure_devin_stream(&self) {
+        self.configure_native_stream();
+        let mut state = self.0.lock().unwrap();
+        if let Some(native) = state.native.as_mut() {
+            native.vendor = "devin";
+        }
+        state.sync_native_metadata();
     }
     /// Capture the exact encoded native request once, with redacted headers and
     /// allowlisted content-free counts/flags. Never persist full binary history.
@@ -436,7 +458,15 @@ impl State {
         let mut capture = NativeCapture::default();
         capture.push(data);
         let mut capture = capture.finish(true);
-        capture.metadata["semantic_summary"] = native_request_summary(summary);
+        capture.metadata["semantic_summary"] = if summary.is_null() {
+            self.request_capture
+                .as_ref()
+                .and_then(|previous| previous.metadata.get("semantic_summary"))
+                .cloned()
+                .unwrap_or_else(|| native_request_summary(summary))
+        } else {
+            native_request_summary(summary)
+        };
         self.request_capture = Some(Arc::new(capture));
         self.started = Some(Instant::now());
     }
@@ -444,11 +474,12 @@ impl State {
         if let Some(native) = &self.native {
             self.diagnostic.payload_metadata["native_stream"] = json!({
                 "format": "application/connect+proto",
-                "terminal": native.terminal.map(NativeTerminalEvidence::reason),
+                "terminal": native.terminal.map(|evidence| native.reason(evidence)),
                 "upstream_turn_ended": native.terminal.map(|e| e == NativeTerminalEvidence::Completed),
                 "api_round_complete": native.terminal.is_some(),
             });
-            self.diagnostic.payload_metadata["usage_provenance"] = native.usage.metadata();
+            self.diagnostic.payload_metadata["usage_provenance"] =
+                native.usage.metadata(native.vendor);
         }
     }
     fn terminal_completion(&self) -> Option<&'static str> {
@@ -459,7 +490,7 @@ impl State {
     }
     fn terminal_reason(&self) -> Option<String> {
         match &self.native {
-            Some(native) => native.terminal.map(|e| e.reason().into()),
+            Some(native) => native.terminal.map(|e| native.reason(e).into()),
             None => self.terminal.reason.clone(),
         }
     }
@@ -942,6 +973,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn devin_native_capture_preserves_summary_and_vendor_provenance() {
+        let (attempt, producer, mut receiver) = setup();
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            "authorization",
+            "Basic private-token-private-token".parse().unwrap(),
+        );
+        let body = b"\x00\x00\x00\x00\x05private-token";
+        attempt.configure_devin_stream();
+        attempt.note_native_request(&headers, body, &json!({"message_count": 2}));
+        // ProxyClient observes the same original request after semantic capture.
+        attempt.request(body);
+        attempt.observe_native_terminal(NativeTerminalEvidence::Completed);
+        attempt.note_native_usage_provenance(NativeUsageProvenance::Reported);
+        let response = attempt.wrap(Response::new(Body::empty()));
+        producer.finish();
+        drop(producer);
+        axum::body::to_bytes(response.into_body(), 100)
+            .await
+            .unwrap();
+        let log = receiver.try_recv().unwrap();
+        assert!(log.upstream_request_body.is_none());
+        let metadata = log.diagnostic.payload_metadata;
+        assert_eq!(
+            metadata["upstream_request_body"]["semantic_summary"]["message_count"],
+            2
+        );
+        assert_eq!(metadata["native_stream"]["terminal"], "devin_turn_ended");
+        assert_eq!(metadata["usage_provenance"]["source"], "devin_native");
+        assert!(!metadata.to_string().contains("private-token"));
+    }
+
+    #[tokio::test]
     async fn native_synthetic_sse_and_ir_done_never_prove_completion() {
         for bytes in [
             b"data: {\"choices\":[{\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n".as_slice(),
@@ -1137,7 +1201,7 @@ mod tests {
             assert_eq!(log.usage.prompt_tokens, 12);
             assert_eq!(
                 log.diagnostic.payload_metadata["usage_provenance"],
-                provenance.metadata()
+                provenance.metadata("cursor")
             );
             assert_eq!(
                 log.diagnostic.payload_metadata["usage_provenance"]["known_free"],

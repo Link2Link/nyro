@@ -17,6 +17,8 @@
 export const ICON_ALIASES: Record<string, string> = {
   // Preset keys declared by vendor metadata.
   "ark-coding": "doubao",
+  codeium: "devin",
+  cognition: "devin",
   vertexai: "googlecloud",
   "kimi-code": "kimi",
   moonshotai: "kimi",

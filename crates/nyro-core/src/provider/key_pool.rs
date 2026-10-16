@@ -56,10 +56,13 @@ pub(crate) fn resolve_endpoint(
     let protocol = ProviderProtocols::parse_protocol_key(raw).ok_or_else(|| {
         GatewayError::provider_unavailable(&provider.id, format!("unsupported key protocol: {raw}"))
     })?;
-    if protocol.protocol == crate::protocol::ids::Protocol::CursorAgent {
+    if matches!(
+        protocol.protocol,
+        crate::protocol::ids::Protocol::CursorAgent | crate::protocol::ids::Protocol::DevinChat
+    ) {
         return Err(GatewayError::provider_unavailable(
             &provider.id,
-            "cursor-agent cannot be selected by an API-key protocol pin",
+            "native OAuth protocols cannot be selected by an API-key protocol pin",
         ));
     }
     if let Some(required) = required {

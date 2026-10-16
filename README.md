@@ -88,6 +88,18 @@ Nyro ships as a **desktop app** (macOS / Windows / Linux) and a **standalone ser
 - **Tool calls**: cross-protocol tool call and result format normalization
 - **Route types**: chat and embedding routes with type-aware handling
 
+### Devin CLI (Experimental)
+
+Select **Devin → Devin CLI subscription** when adding a provider. Open the sign-in page and paste the authorization code back into Nyro; an existing `devin-session-token$…` token can also be imported in the same masked field. This uses Devin CLI's PKCE login and native Codeium Connect/protobuf chat endpoint, **not** the public Devin sessions API or an OpenAI-compatible relay. No local Devin CLI process or tools are launched.
+
+- The fixed upstream is `https://server.codeium.com` with protocol `devin-chat/get-chat-message/v1`; API keys, adaptive protocols and custom upstream origins are not supported.
+- Create a model route targeting this provider (for example `swe-2`, mapped to `swe-2-high` by default). Clients keep using Nyro's OpenAI Chat/Responses, Anthropic or Gemini endpoints, in streaming or non-streaming mode.
+- The built-in model list is a set of suggestions, **not a live entitlement catalog**. Edit **Devin model UIDs** to use exact account-supported model names. Explicit effort variants override request-body effort; known base names map to upstream variants.
+- Text, function tool calls/results, reasoning/signatures, inline base64 images and reported token/cache usage are supported. Remote image URLs, embeddings, hosted tools, strict/forced tool constraints and structured output are rejected rather than silently dropped. Tool arguments and text following reasoning may be buffered until the verified terminal frame. The default completion budget is 64,000 tokens; an explicit budget is forwarded to the upstream.
+- **Connection test** calls authenticated `GetUserStatus` without generating chat. **Model test** sends a short chat and may consume quota; at most 16 models are tested per call. Session tokens have no refresh grant: use **Reauthorize** if access is revoked.
+
+This is an experimental integration based on CLIProxyAPI's observed Devin wire protocol. Availability and model access depend on your Devin account, and upstream protocol changes may require adapter updates. Authentication and protocol behavior are covered by local fixtures; a live account is still needed to verify your subscription end to end.
+
 ### Routing
 
 - Exact match routing on `virtual_model`

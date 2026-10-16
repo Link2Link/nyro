@@ -82,6 +82,17 @@ fn validate_oauth_session_for_provider(
     {
         anyhow::bail!("Cursor OAuth session can only bind to the official cursor/agent channel");
     }
+    if session_driver == "devin"
+        && (!matches!(
+            provider.protocol.as_str(),
+            "devin-chat" | "devin-chat/get-chat-message/v1"
+        ) || provider.channel.as_deref() != Some("cli")
+            || provider.preset_key.as_deref() != Some("devin")
+            || provider.protocol_mode != "fixed"
+            || provider.base_url.trim_end_matches('/') != "https://server.codeium.com")
+    {
+        anyhow::bail!("Devin OAuth session can only bind to the official devin/cli channel");
+    }
     if session_driver == "codex"
         && (provider.protocol.trim() != "openai-responses"
             || !provider
@@ -149,7 +160,7 @@ impl AdminService {
         }
         let driver = auth::build_driver(&driver_key)
             .ok_or_else(|| anyhow::anyhow!("auth vendor not implemented: {driver_key}"))?;
-        let client = if driver_key == "cursor" {
+        let client = if matches!(driver_key.as_str(), "cursor" | "devin") {
             self.gw.cursor_auth_http_client(use_proxy).await?
         } else {
             self.gw.http_client_for_provider(use_proxy).await?
@@ -232,7 +243,7 @@ impl AdminService {
             return Ok(build_auth_session_pending_data(&session));
         };
         let operation = async {
-            let client = if session.driver_key == "cursor" {
+            let client = if matches!(session.driver_key.as_str(), "cursor" | "devin") {
                 self.gw.cursor_auth_http_client(session.use_proxy).await?
             } else {
                 self.gw.http_client_for_provider(session.use_proxy).await?
@@ -339,7 +350,7 @@ impl AdminService {
             .await?
             .ok_or_else(|| anyhow::anyhow!("auth session completion already in progress"))?;
         let operation = async {
-            let client = if session.driver_key == "cursor" {
+            let client = if matches!(session.driver_key.as_str(), "cursor" | "devin") {
                 self.gw.cursor_auth_http_client(session.use_proxy).await?
             } else {
                 self.gw.http_client_for_provider(session.use_proxy).await?
@@ -667,6 +678,15 @@ impl AdminService {
             input.protocol = "cursor-agent/run/v1".into();
             input.protocol_mode = "fixed".into();
             input.base_url = "https://api2.cursor.sh".into();
+        }
+        if session_driver == "devin" {
+            input.vendor = Some("devin".into());
+            input.preset_key = Some("devin".into());
+            input.channel = Some("cli".into());
+            input.protocol = "devin-chat/get-chat-message/v1".into();
+            input.protocol_mode = "fixed".into();
+            input.protocol_endpoints.clear();
+            input.base_url = "https://server.codeium.com".into();
         }
         if session_driver == "codex" {
             input.preset_key = Some("openai".to_string());
@@ -1557,6 +1577,86 @@ mod lifecycle_tests {
         .await?;
         Ok(gateway)
     }
+    #[tokio::test]
+    async fn devin_manual_import_create_runtime_and_rebind_stay_native() -> anyhow::Result<()> {
+        let gw = gateway().await?;
+        let admin = gw.admin();
+        let init = admin.init_oauth_session("devin", false).await?;
+        assert!(init.requires_manual_code);
+        assert_eq!(
+            init.completion_mode,
+            Some(auth::AuthCompletionMode::ManualExchange)
+        );
+        let ready = admin
+            .complete_oauth_session(
+                &init.session_id,
+                auth::AuthExchangeInput {
+                    code: Some("eyJlocal.fixture.signature".into()),
+                    ..Default::default()
+                },
+            )
+            .await?;
+        assert!(matches!(ready, AuthSessionStatusData::Ready { .. }));
+        let input: CreateProvider = serde_json::from_value(serde_json::json!({
+            "name": "Devin local auth fixture", "protocol": "openai-compatible",
+            "base_url": "https://unused.invalid", "api_key": ""
+        }))?;
+        let provider = admin
+            .create_provider_with_oauth_session(&init.session_id, input)
+            .await?;
+        assert_eq!(provider.vendor.as_deref(), Some("devin"));
+        assert_eq!(provider.channel.as_deref(), Some("cli"));
+        assert!(matches!(
+            provider.protocol.as_str(),
+            "devin-chat" | "devin-chat/get-chat-message/v1"
+        ));
+        assert_eq!(provider.base_url, "https://server.codeium.com");
+        assert_eq!(provider.protocol_mode, "fixed");
+        assert!(provider.keys.is_empty());
+        let status = admin.get_provider_oauth_status(&provider.id).await?;
+        assert_eq!(status.status, "connected");
+        assert!(!status.has_refresh_token);
+        assert!(status.expires_at.is_none());
+        let runtime = admin.resolve_provider_runtime(&provider).await?;
+        assert_eq!(
+            runtime.access_token,
+            "devin-session-token$eyJlocal.fixture.signature"
+        );
+        assert!(runtime.binding.disable_default_auth);
+        assert!(runtime.binding.extra_headers.is_empty());
+
+        let reauth = admin.init_oauth_session("devin", false).await?;
+        admin
+            .complete_oauth_session(
+                &reauth.session_id,
+                auth::AuthExchangeInput {
+                    code: Some("devin-session-token$replacement-fixture".into()),
+                    ..Default::default()
+                },
+            )
+            .await?;
+        let session = admin
+            .get_auth_session_record(&reauth.session_id)
+            .await?
+            .unwrap();
+        let mut incompatible = provider.clone();
+        incompatible.protocol = "openai-compatible".into();
+        assert!(validate_oauth_session_for_provider(&session, &incompatible).is_err());
+        incompatible = provider.clone();
+        incompatible.base_url = "https://unused.invalid".into();
+        assert!(validate_oauth_session_for_provider(&session, &incompatible).is_err());
+        let rebound = admin
+            .bind_provider_with_oauth_session(&provider.id, &reauth.session_id)
+            .await?;
+        assert_eq!(
+            admin.resolve_provider_runtime(&rebound).await?.access_token,
+            "devin-session-token$replacement-fixture"
+        );
+        admin.logout_provider_oauth(&provider.id).await?;
+        assert!(admin.resolve_provider_runtime(&provider).await.is_err());
+        Ok(())
+    }
+
     #[tokio::test]
     async fn session_flight_excludes_overlap_and_cancel_rejects_late_publish() -> anyhow::Result<()>
     {

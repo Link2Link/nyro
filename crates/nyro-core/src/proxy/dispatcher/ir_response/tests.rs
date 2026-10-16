@@ -275,6 +275,31 @@ async fn native_ir_formats_stream_and_buffered_for_all_ingress_protocols() {
 }
 
 #[tokio::test]
+async fn devin_native_response_does_not_advertise_cursor_limitations() {
+    let mut fixture = Fixture::new().await;
+    fixture.provider.vendor = Some("devin".into());
+    for stream in [false, true] {
+        let result = fixture
+            .invoke(
+                source(vec![Ok(vec![
+                    start("fixture"),
+                    AiStreamDelta::TextDelta("hello".into()),
+                    done(),
+                ])]),
+                OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1,
+                stream,
+                "fixture",
+            )
+            .await;
+        assert_eq!(
+            result.response.headers()["x-nyro-provider-limitations"],
+            "system_best_effort,inline_images_only,tools_buffered"
+        );
+        assert!(text(result.response).await.contains("hello"));
+    }
+}
+
+#[tokio::test]
 async fn midstream_failure_and_missing_done_cannot_emit_success_terminal() {
     let mut fixture = Fixture::new().await;
     for trailing in [

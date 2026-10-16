@@ -126,8 +126,8 @@ pub(crate) fn apply_max_tokens_floor(
     };
 
     match protocol {
-        crate::protocol::ids::Protocol::CursorAgent => {
-            // Binary AgentService applies its parameter policy on typed IR.
+        crate::protocol::ids::Protocol::CursorAgent | crate::protocol::ids::Protocol::DevinChat => {
+            // Native providers apply their parameter policy on typed IR.
         }
         crate::protocol::ids::Protocol::OpenAICompatible => {
             // OpenAI Chat: max_completion_tokens 优先级高于 max_tokens（镜像
@@ -489,8 +489,8 @@ pub(crate) fn apply_force_max_reasoning_body(
         return;
     };
     match protocol {
-        crate::protocol::ids::Protocol::CursorAgent => {
-            // Binary AgentService applies its parameter policy on typed IR.
+        crate::protocol::ids::Protocol::CursorAgent | crate::protocol::ids::Protocol::DevinChat => {
+            // Native providers apply their parameter policy on typed IR.
         }
         crate::protocol::ids::Protocol::OpenAICompatible => {
             object.insert(

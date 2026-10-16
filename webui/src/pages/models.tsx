@@ -113,9 +113,8 @@ function balanceLabel(value: ModelBalance, isZh: boolean) {
 }
 
 function hasProviderModelsEndpoint(provider?: Provider) {
-  // Cursor has no HTTP models URL: its catalog comes from the native
-  // AgentService GetUsableModels discovery exposed via get_provider_models.
-  return Boolean(provider?.models_source?.trim()) || provider?.vendor === "cursor";
+  // Native catalogs are resolved server-side without a generic HTTP models URL.
+  return Boolean(provider?.models_source?.trim()) || provider?.vendor === "cursor" || provider?.vendor === "devin";
 }
 
 function withCurrentModel(options: string[], current?: string) {

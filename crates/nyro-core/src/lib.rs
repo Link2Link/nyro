@@ -398,6 +398,37 @@ impl Gateway {
             .map_err(Into::into)
     }
 
+    /// Devin embeds credentials in protobuf bodies: never replay them to a
+    /// redirect target. Unlike Cursor duplex, server-streaming works over H1.
+    pub(crate) async fn devin_http_client(
+        &self,
+        use_proxy: bool,
+        inference: bool,
+    ) -> anyhow::Result<reqwest::Client> {
+        let mut builder = self.cursor_client_builder(use_proxy, inference).await?;
+        if use_proxy
+            && self
+                .storage
+                .settings()
+                .get("proxy_enabled")
+                .await?
+                .as_deref()
+                .map(parse_bool_setting)
+                .unwrap_or(false)
+            && self
+                .storage
+                .settings()
+                .get("proxy_force_http1")
+                .await?
+                .as_deref()
+                .map(parse_bool_setting)
+                .unwrap_or(false)
+        {
+            builder = builder.http1_only();
+        }
+        builder.build().map_err(Into::into)
+    }
+
     async fn cursor_client_builder(
         &self,
         use_proxy: bool,
