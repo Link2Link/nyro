@@ -46,6 +46,13 @@ pub(crate) const GEMINI_CLI_STATIC_MODELS: &[&str] = &[
     "gemini-3.5-flash-lite",
     "gemini-3.6-flash",
     "gemini-3.7-flash",
+    // Current accounts also expose reasoning-tier variants on this channel
+    // (per-account discovery lists them); the bare family id routes as a
+    // virtual alias through the shared tier rewrite.
+    "gemini-3.8-flash-high",
+    "gemini-3.8-flash-medium",
+    "gemini-3.8-flash-low",
+    "gemini-3.8-flash-tiered",
 ];
 
 /// Gemini CLI public OAuth client ("login without creating your own OAuth

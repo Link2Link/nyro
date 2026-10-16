@@ -2351,12 +2351,16 @@ impl AdminService {
         }
     }
 
-    /// Best-effort write of the discovered antigravity catalog into the
-    /// credential meta (`subscription_models`) so the pipeline effort→tier
-    /// rewrite is armed without waiting for the next token refresh.
-    /// Skips unchanged snapshots and never disturbs an in-flight refresh.
+    /// Best-effort write of the discovered Google subscription catalog into
+    /// the credential meta (`subscription_models`) so the pipeline effort→tier
+    /// rewrite is armed without waiting for the next token refresh. Covers
+    /// both subscription channels (antigravity + gemini-cli — the rewrite
+    /// reads the same snapshot on either). Skips unchanged snapshots and
+    /// never disturbs an in-flight refresh.
     async fn persist_subscription_catalog_snapshot(&self, provider: &Provider, ids: &[String]) {
-        if !crate::provider::google::antigravity::is_google_antigravity(provider) {
+        if !crate::provider::google::antigravity::is_google_antigravity(provider)
+            && !crate::provider::google::gemini_cli::is_google_gemini_cli(provider)
+        {
             return;
         }
         let mut snapshot: Vec<String> = ids
@@ -2411,12 +2415,12 @@ impl AdminService {
         match store.upsert(&provider.id, input).await {
             Ok(_) => tracing::debug!(
                 provider = %provider.id,
-                "antigravity catalog snapshot persisted for tier rewrites"
+                "google subscription catalog snapshot persisted for tier rewrites"
             ),
             Err(error) => tracing::warn!(
                 %error,
                 provider = %provider.id,
-                "failed to persist antigravity catalog snapshot"
+                "failed to persist google subscription catalog snapshot"
             ),
         }
     }

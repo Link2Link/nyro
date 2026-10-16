@@ -51,6 +51,13 @@ pub(crate) const ANTIGRAVITY_STATIC_MODELS: &[&str] = &[
     "gemini-pro-agent",
     "gemini-3.6-flash-high",
     "gemini-3.7-flash-high",
+    // gemini-3.8-flash is served only through its reasoning-tier variants on
+    // this surface; the bare family id stays routable as a virtual alias
+    // (see `apply_tier_model_rewrite`).
+    "gemini-3.8-flash-high",
+    "gemini-3.8-flash-medium",
+    "gemini-3.8-flash-low",
+    "gemini-3.8-flash-tiered",
     // Claude 5.5 reasoning tiers (verified 2026-10-04 by direct probes):
     // callable on the inference surface but NOT yet listed by the per-account
     // `fetchAvailableModels` catalog, so the curated list must carry them or
@@ -329,12 +336,14 @@ pub(crate) fn is_tier_suffixed(model: &str) -> bool {
 /// Preference ladders from the client effort vocabulary onto the surface's
 /// tier ids, nearest-first so missing tiers degrade gracefully instead of
 /// 404-ing the whole family:
-/// * `none` / `disable` (effort None or reasoning disabled) → `-extra-low`
+/// * `none` / `disable` (explicitly switching thinking off) → `-extra-low`
 /// * `minimal` → `-extra-low`
 /// * `low` → `-low`
 /// * `medium` → `-medium`
 /// * `high` / `xhigh` / `max` → `-high`
-/// * token budgets map by magnitude; no effort at all → `-tiered` (adaptive)
+/// * token budgets map by magnitude — as an effort variant or the bare
+///   `budget_tokens` field (Anthropic `thinking` / Gemini `thinkingBudget`)
+/// * no reasoning directive at all → `-tiered` (the adaptive family default)
 fn tier_ladder(reasoning: &crate::protocol::ir::ReasoningConfig) -> &'static [&'static str] {
     use crate::protocol::ir::ReasoningEffort::{Budget, High, Low, Max, Medium, Minimal, Xhigh};
     const EXTRA_LOW: &[&str] = &["-extra-low", "-low"];
@@ -342,26 +351,46 @@ fn tier_ladder(reasoning: &crate::protocol::ir::ReasoningConfig) -> &'static [&'
     const MEDIUM: &[&str] = &["-medium", "-low", "-high"];
     const HIGH: &[&str] = &["-high", "-medium", "-low"];
     const TIERED: &[&str] = &["-tiered", "-medium"];
-    // `none` / disabled thinking → lowest tier available.
-    if !reasoning.enabled
-        || matches!(
-            reasoning.effort.as_ref(),
-            Some(crate::protocol::ir::ReasoningEffort::None)
-        )
-    {
+    // A thinking budget: an explicit `Budget` effort variant, or the bare
+    // `budget_tokens` field when no qualitative effort was expressed
+    // (Anthropic `thinking` / Gemini `thinkingBudget`). A qualitative level
+    // always outranks a concurrently declared budget.
+    let budget = match reasoning.effort.as_ref() {
+        Some(Budget(tokens)) => Some(*tokens),
+        None => reasoning.budget_tokens,
+        _ => None,
+    };
+    // Explicitly switching thinking off (`none` / `disable`), or a carried
+    // qualitative level under a disabled thinking flag, maps to the lowest
+    // tier the family serves.
+    let explicitly_off = matches!(
+        reasoning.effort.as_ref(),
+        Some(crate::protocol::ir::ReasoningEffort::None)
+    ) || (!reasoning.enabled
+        && reasoning
+            .effort
+            .as_ref()
+            .is_some_and(|effort| !matches!(effort, Budget(_))));
+    if explicitly_off {
         return EXTRA_LOW;
     }
-    match reasoning.effort.as_ref() {
-        Some(crate::protocol::ir::ReasoningEffort::None) | Some(Minimal) => EXTRA_LOW,
-        Some(Low) => LOW,
-        Some(Medium) => MEDIUM,
-        Some(High | Xhigh | Max) => HIGH,
-        Some(Budget(tokens)) => match tokens {
+    if let Some(tokens) = budget {
+        return match tokens {
             0..=2048 => LOW,
             2049..=8192 => MEDIUM,
             _ => HIGH,
-        },
-        None => TIERED,
+        };
+    }
+    match reasoning.effort.as_ref() {
+        Some(Minimal) => EXTRA_LOW,
+        Some(Low) => LOW,
+        Some(Medium) => MEDIUM,
+        Some(High | Xhigh | Max) => HIGH,
+        // No reasoning directive at all — thinking merely on without a level,
+        // or a request that says nothing about reasoning (`ReasoningConfig::
+        // default()` across every ingress decoder) — is the family default:
+        // the adaptive `-tiered` variant.
+        _ => TIERED,
     }
 }
 
@@ -419,18 +448,20 @@ pub(crate) fn credential_catalog_snapshot(
         .unwrap_or_default()
 }
 
-/// Effort-aware tier rewrite for the antigravity v1internal envelope
-/// (pipeline step, runs after `post_encode`): a base-id gemini request
-/// carrying a reasoning effort maps onto the tier variant the account
-/// actually serves, and the inner `thinkingConfig` is dropped whenever the
-/// model id carries the tier (the id is the effort on this surface).
+/// Effort-aware tier rewrite for the Google subscription v1internal envelope
+/// (pipeline step, runs after `post_encode`; applies to BOTH subscription
+/// channels — antigravity and gemini-cli share the surface and both catalogs
+/// carry tier-suffixed gemini ids): a base-id gemini request carrying a
+/// reasoning effort maps onto the tier variant the account actually serves,
+/// and the inner `thinkingConfig` is dropped whenever the model id carries
+/// the tier (the id is the effort on this surface).
 pub(crate) fn apply_tier_model_rewrite(
     provider: &Provider,
     credential: Option<&crate::auth::types::StoredCredential>,
     reasoning: &crate::protocol::ir::ReasoningConfig,
     body: &mut Value,
 ) {
-    if !is_google_antigravity(provider) {
+    if !is_google_antigravity(provider) && !super::gemini_cli::is_google_gemini_cli(provider) {
         return;
     }
     let Some(model) = body
@@ -453,7 +484,7 @@ pub(crate) fn apply_tier_model_rewrite(
             tracing::debug!(
                 client_model = %model,
                 upstream_model = %effective,
-                "antigravity tier model rewrite"
+                "google subscription tier model rewrite"
             );
         }
     }
@@ -1204,6 +1235,19 @@ mod tests {
             resolve_tiered_model("gemini-3.8-flash", &reasoning(None), &catalog).as_deref(),
             Some("gemini-3.8-flash-tiered")
         );
+        // A request with no reasoning directive at all (what every ingress
+        // decoder produces when the client says nothing about reasoning) is
+        // the family default too — the adaptive `-tiered` variant, not a
+        // forced thinking-off tier.
+        assert_eq!(
+            resolve_tiered_model(
+                "gemini-3.8-flash",
+                &crate::protocol::ir::ReasoningConfig::default(),
+                &catalog
+            )
+            .as_deref(),
+            Some("gemini-3.8-flash-tiered")
+        );
         // minimal / none / disabled → lowest tier.
         assert_eq!(pick(Minimal).as_deref(), Some("gemini-3.8-flash-low"));
         let mut disabled = reasoning(Some(High));
@@ -1279,6 +1323,37 @@ mod tests {
                 Some(expected)
             );
         }
+        // The bare `budget_tokens` field (Anthropic thinking / Gemini
+        // thinkingBudget with no qualitative level) maps by the same
+        // magnitudes — Devin-style, an explicit budget is a directive.
+        for (tokens, expected) in [
+            (1024u32, "gemini-3.8-flash-low"),
+            (4096, "gemini-3.8-flash-medium"),
+            (32000, "gemini-3.8-flash-high"),
+        ] {
+            let cfg = crate::protocol::ir::ReasoningConfig {
+                enabled: true,
+                budget_tokens: Some(tokens),
+                effort: None,
+                display: None,
+            };
+            assert_eq!(
+                resolve_tiered_model("gemini-3.8-flash", &cfg, &full).as_deref(),
+                Some(expected)
+            );
+        }
+        // A qualitative level outranks a concurrently declared budget
+        // (Anthropic output_config.effort + thinking.budget_tokens).
+        let both = crate::protocol::ir::ReasoningConfig {
+            enabled: true,
+            budget_tokens: Some(1024),
+            effort: Some(crate::protocol::ir::ReasoningEffort::High),
+            display: None,
+        };
+        assert_eq!(
+            resolve_tiered_model("gemini-3.8-flash", &both, &full).as_deref(),
+            Some("gemini-3.8-flash-high")
+        );
     }
 
     #[test]
@@ -1355,6 +1430,59 @@ mod tests {
                 .get("thinkingConfig")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn apply_tier_model_rewrite_covers_the_gemini_cli_channel_and_default_effort() {
+        let credential = crate::auth::types::StoredCredential {
+            access_token: Some("ya29".into()),
+            meta: json!({
+                "project_id": "proj",
+                "subscription_models": [
+                    "gemini-3.8-flash-low", "gemini-3.8-flash-medium",
+                    "gemini-3.8-flash-high", "gemini-3.8-flash-tiered",
+                ],
+            }),
+            ..Default::default()
+        };
+        let envelope = json!({
+            "model": "gemini-3.8-flash",
+            "project": "proj",
+            "request": {"generationConfig": {"thinkingConfig": {"thinkingLevel": "high"}}},
+        });
+        // The slim gemini-cli envelope rides the same rewrite.
+        let (provider, _) = google_provider("gemini-cli", "gemini-3.8-flash");
+        let mut body = envelope.clone();
+        apply_tier_model_rewrite(
+            &provider,
+            Some(&credential),
+            &reasoning(Some(crate::protocol::ir::ReasoningEffort::High)),
+            &mut body,
+        );
+        assert_eq!(
+            body["model"], "gemini-3.8-flash-high",
+            "gemini-cli shares the v1internal surface and the tier rewrite"
+        );
+        // Default (no reasoning directive at all) → the adaptive tiered
+        // variant, not a forced thinking-off tier.
+        let mut body = envelope.clone();
+        apply_tier_model_rewrite(
+            &provider,
+            Some(&credential),
+            &crate::protocol::ir::ReasoningConfig::default(),
+            &mut body,
+        );
+        assert_eq!(body["model"], "gemini-3.8-flash-tiered");
+        // The API-key default channel stays untouched (no tier ids there).
+        let (default_provider, _) = google_provider("default", "gemini-3.8-flash");
+        let mut body = envelope;
+        apply_tier_model_rewrite(
+            &default_provider,
+            Some(&credential),
+            &reasoning(Some(crate::protocol::ir::ReasoningEffort::High)),
+            &mut body,
+        );
+        assert_eq!(body["model"], "gemini-3.8-flash");
     }
 
     fn google_provider(channel: &str, model: &str) -> (crate::db::models::Provider, Value) {

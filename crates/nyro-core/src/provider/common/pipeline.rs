@@ -609,8 +609,9 @@ where
     // 5e. Codex 消费级上游：规范化外来工具调用 ID 前缀（IR 转码路径）
     sanitize_codex_tool_call_ids(&mut body, ctx.provider);
     apply_vendor_effort_policy(&mut body, ctx.provider);
-    // 5f. google/antigravity 订阅表面：按客户端推理强度把基础模型 ID 改写为
-    // 目录中真实存在的档位变体（gemini-3.8-flash + high → gemini-3.8-flash-high）
+    // 5f. google 订阅表面（antigravity + gemini-cli）：按客户端推理强度把基础
+    // 模型 ID 改写为目录中真实存在的档位变体（gemini-3.8-flash + high →
+    // gemini-3.8-flash-high；无推理指令 → -tiered 自适应档）
     crate::provider::google::antigravity::apply_tier_model_rewrite(
         ctx.provider,
         ctx.credential,
@@ -1385,6 +1386,102 @@ mod tests {
         assert_eq!(out.body["model"], "gemini-3.8-flash-high");
         assert_eq!(out.body["project"], "cloudaicompanion-1");
         // The tier id carries the effort; the inner thinkingConfig is gone.
+        assert!(
+            out.body["request"]["generationConfig"]
+                .get("thinkingConfig")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn antigravity_channel_default_effort_routes_to_tiered_variant() {
+        let gw = build_test_gateway().await;
+        let provider = antigravity_provider();
+        let credential = crate::auth::types::StoredCredential {
+            access_token: Some("ya29.access".into()),
+            refresh_token: Some("1//refresh".into()),
+            meta: serde_json::json!({
+                "project_id": "cloudaicompanion-1",
+                "email": "u@example.com",
+                "subscription_models": [
+                    "gemini-3.8-flash-low", "gemini-3.8-flash-medium",
+                    "gemini-3.8-flash-high", "gemini-3.8-flash-tiered",
+                ],
+            }),
+            ..Default::default()
+        };
+        let mut req = minimal_chat_request();
+        req.meta.source_protocol = Some(GOOGLE_GEMINI_GENERATE_CONTENT_V1BETA);
+        // No reasoning directive at all (minimal_chat_request leaves the IR
+        // default): the family default is the adaptive `-tiered` variant.
+        assert!(!req.reasoning.enabled);
+        assert!(req.reasoning.effort.is_none());
+        let ctx = ProviderCtx {
+            provider: &provider,
+            protocol: GOOGLE_GEMINI_GENERATE_CONTENT_V1BETA,
+            egress_base_url: crate::provider::google::antigravity::ANTIGRAVITY_INFERENCE_BASE_URL,
+            api_key: "ya29.access",
+            auth_scheme: "auto",
+            actual_model: "gemini-3.8-flash",
+            force_max_reasoning: false,
+            credential: Some(&credential),
+            gw: &gw,
+            disable_default_auth: true,
+        };
+        let out = build_request(&crate::provider::google::GoogleVendor, &mut req, &ctx)
+            .await
+            .expect("build_request succeeds");
+        assert_eq!(out.body["model"], "gemini-3.8-flash-tiered");
+    }
+
+    #[tokio::test]
+    async fn gemini_cli_channel_effort_rewrites_base_model_to_tier_variant() {
+        let gw = build_test_gateway().await;
+        let mut provider = antigravity_provider();
+        provider.id = "p-gemini-cli".into();
+        provider.channel = Some("gemini-cli".into());
+        // gemini-cli inference stays on the prod Code Assist host.
+        provider.base_url = "https://cloudcode-pa.googleapis.com".into();
+        let credential = crate::auth::types::StoredCredential {
+            driver_key: "google-gemini-cli".into(),
+            access_token: Some("ya29.access".into()),
+            refresh_token: Some("1//refresh".into()),
+            meta: serde_json::json!({
+                "project_id": "cloudaicompanion-1",
+                "email": "u@example.com",
+                "subscription_models": [
+                    "gemini-3.8-flash-low", "gemini-3.8-flash-medium",
+                    "gemini-3.8-flash-high", "gemini-3.8-flash-tiered",
+                ],
+            }),
+            ..Default::default()
+        };
+        let mut req = minimal_chat_request();
+        req.meta.source_protocol = Some(GOOGLE_GEMINI_GENERATE_CONTENT_V1BETA);
+        req.reasoning = crate::protocol::ir::ReasoningConfig {
+            enabled: true,
+            budget_tokens: None,
+            effort: Some(crate::protocol::ir::ReasoningEffort::Low),
+            display: None,
+        };
+        let ctx = ProviderCtx {
+            provider: &provider,
+            protocol: GOOGLE_GEMINI_GENERATE_CONTENT_V1BETA,
+            egress_base_url: "https://cloudcode-pa.googleapis.com",
+            api_key: "ya29.access",
+            auth_scheme: "auto",
+            actual_model: "gemini-3.8-flash",
+            force_max_reasoning: false,
+            credential: Some(&credential),
+            gw: &gw,
+            disable_default_auth: true,
+        };
+        let out = build_request(&crate::provider::google::GoogleVendor, &mut req, &ctx)
+            .await
+            .expect("build_request succeeds");
+        // Slim `{model, project, request}` envelope carries the tier variant.
+        assert_eq!(out.body["model"], "gemini-3.8-flash-low");
+        assert_eq!(out.body["project"], "cloudaicompanion-1");
         assert!(
             out.body["request"]["generationConfig"]
                 .get("thinkingConfig")
