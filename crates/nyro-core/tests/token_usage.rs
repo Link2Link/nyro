@@ -81,6 +81,10 @@ async fn token_usage_half_open_utc_year_days_and_provider_model_identity() -> an
     );
     assert!(rows.iter().all(|r| r.request_count == 1));
     assert!(
+        rows.iter().all(|r| r.cost.is_none()),
+        "storage does not persist pricing"
+    );
+    assert!(
         storage
             .logs()
             .token_usage_days(start, start)
@@ -229,6 +233,174 @@ async fn token_usage_admin_year_validation_current_names_and_id_fallback() -> an
                 .is_empty()
         );
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn token_usage_admin_enriches_exact_and_prefix_costs_without_changing_utc_totals()
+-> anyhow::Result<()> {
+    let storage = storage().await?;
+    let provider = storage
+        .providers()
+        .create(CreateProvider {
+            name: "Current proxy".into(),
+            vendor: None,
+            protocol: "openai-compatible".into(),
+            base_url: "http://127.0.0.1:1/v1".into(),
+            protocol_mode: "fixed".into(),
+            protocol_endpoints: vec![],
+            keys: vec![],
+            preset_key: None,
+            channel: None,
+            models_source: None,
+            static_models: None,
+            api_key: "test-only".into(),
+            auth_mode: "apikey".into(),
+            use_proxy: false,
+            fast_mode: false,
+        })
+        .await?;
+    let cases = [
+        (
+            "2024-01-01T00:00:00Z",
+            provider.id.as_str(),
+            "gpt-price-fixture",
+            (Some(1_000_000), Some(500_000), Some(250_000)),
+        ),
+        (
+            "2024-02-29T00:00:00Z",
+            provider.id.as_str(),
+            "GPT-PRICE-FIXTURE-medium",
+            (Some(500_000), None, None),
+        ),
+        (
+            "2024-03-01T00:00:00Z",
+            provider.id.as_str(),
+            "gpt-cache-fallback-fixture:medium",
+            (Some(1_000_000), Some(0), Some(500_000)),
+        ),
+        (
+            "2024-04-01T00:00:00Z",
+            provider.id.as_str(),
+            "free-fixture/medium",
+            (Some(100), Some(200), Some(0)),
+        ),
+        (
+            "2024-05-01T00:00:00Z",
+            provider.id.as_str(),
+            "missing-fixture-medium",
+            (Some(0), Some(0), Some(0)),
+        ),
+        (
+            "2024-06-01T00:00:00Z",
+            provider.id.as_str(),
+            "invalid-fixture_medium",
+            (Some(100), Some(200), Some(0)),
+        ),
+        (
+            "2024-07-01T00:00:00Z",
+            provider.id.as_str(),
+            "ambiguous-fixture-medium",
+            (Some(100), Some(200), Some(0)),
+        ),
+        (
+            "2024-08-01T00:00:00Z",
+            provider.id.as_str(),
+            "unknown-fixture",
+            (Some(100), Some(200), Some(0)),
+        ),
+        (
+            "2024-12-31T23:59:59Z",
+            "deleted",
+            "gpt-price-fixture",
+            (Some(100), Some(200), Some(0)),
+        ),
+        (
+            "2025-01-01T00:00:00Z",
+            provider.id.as_str(),
+            "gpt-price-fixture",
+            (Some(1), Some(2), Some(0)),
+        ),
+    ];
+    for (date, provider, model, usage) in cases {
+        insert(
+            storage.pool(),
+            millis(date),
+            Some(provider),
+            Some(model),
+            usage,
+            200,
+        )
+        .await?;
+    }
+    let dir = tempfile::tempdir()?;
+    let (gw, _) = Gateway::from_storage(
+        GatewayConfig {
+            data_dir: dir.path().into(),
+            ..Default::default()
+        },
+        Arc::new(storage),
+    )
+    .await?;
+    // The stats call reads this local catalogue, not provider HTTP capabilities.
+    std::fs::write(dir.path().join("models.dev.json"), serde_json::json!({
+        "openai": {"models": {
+            "gpt-price-fixture": {"id": "gpt-price-fixture", "cost": {"input": 2, "output": 8, "cache_read": 0.5}},
+            "gpt-cache-fallback-fixture": {"id": "gpt-cache-fallback-fixture", "cost": {"input": 2, "output": 8}}
+        }},
+        "one": {"models": {
+            "free-fixture": {"id": "free-fixture", "cost": {"input": 0, "output": 0}},
+            "missing-fixture": {"id": "missing-fixture", "cost": {"input": 0}},
+            "invalid-fixture": {"id": "invalid-fixture", "cost": {"input": -1, "output": 8}},
+            "ambiguous-fixture": {"id": "ambiguous-fixture", "cost": {"input": 1, "output": 8}}
+        }},
+        "two": {"models": {"ambiguous-fixture": {"id": "ambiguous-fixture", "cost": {"input": 2, "output": 8}}}}
+    }).to_string())?;
+    let stats = gw.admin().get_token_usage_stats(2024).await?;
+    assert_eq!(stats.time_zone, "UTC");
+    assert_eq!(stats.rows.len(), 9);
+    let first = &stats.rows[0];
+    assert_eq!(first.date, "2024-01-01");
+    assert_eq!(first.provider_name, "Current proxy");
+    assert_eq!(
+        (
+            first.input_tokens,
+            first.cache_read_tokens,
+            first.output_tokens
+        ),
+        (1_000_000, 250_000, 500_000)
+    );
+    let cost = first.cost.as_ref().unwrap();
+    assert_eq!(
+        (
+            cost.input_cost,
+            cost.cache_read_cost,
+            cost.output_cost,
+            cost.total_cost
+        ),
+        (1.5, 0.125, 4.0, 5.625)
+    );
+    assert_eq!(cost.currency, "USD");
+    assert_eq!(cost.pricing_provider, "openai");
+    assert!(!cost.cache_rate_fallback);
+    assert_eq!(stats.rows[1].date, "2024-02-29");
+    assert_eq!(stats.rows[1].missing_usage_count, 1);
+    assert_eq!(stats.rows[1].cost.as_ref().unwrap().total_cost, 1.0);
+    assert_eq!(
+        stats.rows[1].cost.as_ref().unwrap().pricing_model,
+        "gpt-price-fixture"
+    );
+    let fallback = stats.rows[2].cost.as_ref().unwrap();
+    assert!(fallback.cache_rate_fallback);
+    assert_eq!(fallback.total_cost, 2.0);
+    assert_eq!(fallback.cache_read_rate, 2.0);
+    assert_eq!(stats.rows[3].cost.as_ref().unwrap().total_cost, 0.0);
+    assert!(stats.rows[4..].iter().all(|row| row.cost.is_none()));
+    assert_eq!(stats.rows[8].provider_name, "deleted");
+    assert_eq!(stats.rows[8].date, "2024-12-31");
+    let json = serde_json::to_value(stats)?;
+    assert!(json["rows"][4]["cost"].is_null());
+    assert_eq!(json["rows"][3]["cost"]["total_cost"], 0.0);
     Ok(())
 }
 

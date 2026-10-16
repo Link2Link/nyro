@@ -458,6 +458,87 @@ pub(super) fn lookup_models_dev_models(
     Ok(Some(models))
 }
 
+pub(super) fn is_subscription_pricing_catalog(vendor: &str) -> bool {
+    let vendor = vendor.to_ascii_lowercase();
+    vendor.contains("coding-plan")
+        || matches!(
+            vendor.as_str(),
+            "kimi-for-coding" | "github-copilot" | "opencode-go"
+        )
+}
+
+/// Exact identity first, then longest prefixes ending before an explicit variant
+/// delimiter. Do not split version dots or digits (gpt-4 is not gpt-40, and
+/// glm-5.3 is not glm-5.30). Callers control case normalization and whitespace.
+/// Slicing only at ASCII delimiter boundaries also keeps Unicode identities safe.
+pub(super) fn pricing_model_prefixes(model: &str) -> impl Iterator<Item = &str> {
+    std::iter::once(model).chain(model.char_indices().rev().filter_map(|(index, ch)| {
+        (index > 0 && matches!(ch, '-' | '_' | ':' | '/')).then_some(&model[..index])
+    }))
+}
+
+/// Bounded-prefix pricing index built from the local cache/snapshot once per call.
+/// Keep the capability API's weak fuzzy matching out of monetary estimates.
+pub(super) struct PricingCatalog {
+    by_model: HashMap<String, Vec<ModelCapabilities>>,
+}
+
+impl PricingCatalog {
+    pub(super) fn load(data_dir: &Path) -> anyhow::Result<Self> {
+        let data = parse_models_dev_data(data_dir)?;
+        let mut by_model: HashMap<String, Vec<ModelCapabilities>> = HashMap::new();
+        for (vendor, entries) in data {
+            // Subscription catalog rates (often zero) describe plan inclusion,
+            // not equivalent pay-as-you-go API prices. Exclude them even from
+            // the unique-match fallback used for custom/proxy providers.
+            if is_subscription_pricing_catalog(&vendor) {
+                continue;
+            }
+            for (model, entry) in entries.models {
+                // Inconsistent keys/IDs are not reliable pricing identities.
+                if !model.eq_ignore_ascii_case(&entry.id) {
+                    continue;
+                }
+                by_model
+                    .entry(model.to_ascii_lowercase())
+                    .or_default()
+                    .push(to_models_dev_capability(&vendor, &entry));
+            }
+        }
+        Ok(Self { by_model })
+    }
+
+    /// Exact first, then longest eligible prefix within the selected vendor (or
+    /// entire catalogue). Select identities before validating rates: an invalid
+    /// or ambiguous longest match must never fall back to a shorter price.
+    pub(super) fn resolve(
+        &self,
+        model: &str,
+        vendor: Option<&str>,
+    ) -> Result<Option<&ModelCapabilities>, ()> {
+        let model = model.trim().to_ascii_lowercase();
+        for base in pricing_model_prefixes(&model) {
+            let Some(entries) = self.by_model.get(base) else {
+                continue;
+            };
+            let mut matches = entries.iter().filter(|entry| {
+                vendor.is_none_or(|vendor| entry.provider.eq_ignore_ascii_case(vendor.trim()))
+            });
+            let Some(first) = matches.next() else {
+                continue;
+            };
+            // Includes case-colliding keys/IDs in one vendor. Never let map
+            // iteration order choose a price or fall through to another vendor.
+            return if matches.next().is_some() {
+                Err(())
+            } else {
+                Ok(Some(first))
+            };
+        }
+        Ok(None)
+    }
+}
+
 pub(super) fn lookup_models_dev_capability(
     data_dir: &Path,
     vendor_key: &str,
@@ -637,33 +718,53 @@ const BIGMODEL_CN_OFFICIAL_PRICING_CNY: &[(&str, f64, f64, f64)] = &[
     ("glm-5.3-flash", 0.8, 0.23, 2.8),
 ];
 
-/// 按 base_url 域名识别 bigmodel.cn 人民币计费 provider，用官方原生 CNY
-/// 牌价覆盖目录价。前缀匹配要求边界非字母数字（glm-5.3-flash-xxxx 类日期
-/// 变体一并覆盖）；未登记的模型维持目录原值。
-pub(super) fn apply_bigmodel_cn_official_pricing(caps: &mut ModelCapabilities, base_url: &str) {
-    if !base_url.contains("bigmodel.cn") {
-        return;
+/// Match the parsed host, never a URL substring (paths, queries and userinfo
+/// can all mention bigmodel.cn on an unrelated server).
+pub(super) fn is_bigmodel_cn_url(base_url: &str) -> bool {
+    reqwest::Url::parse(base_url).ok().is_some_and(|url| {
+        matches!(url.scheme(), "https" | "http")
+            && url.host_str().is_some_and(|host| {
+                let host = host.trim_end_matches('.');
+                host == "bigmodel.cn" || host.ends_with(".bigmodel.cn")
+            })
+    })
+}
+
+/// Exact registered native rate, otherwise the longest bounded variant prefix.
+/// Share matching between stats and capability presentation; never convert FX.
+pub(super) fn bigmodel_cn_pricing(
+    base_url: &str,
+    model: &str,
+) -> Option<(&'static str, f64, f64, f64)> {
+    if !is_bigmodel_cn_url(base_url) {
+        return None;
     }
-    let needle = caps.model_id.trim().to_ascii_lowercase();
-    // 命中的候选里取最长前缀（最具体者优先）：glm-5.3 的 `-` 边界同样
-    // 放行 glm-5.3-flash，顺序遍历会错拿前缀更短的那个条目的价格。
-    let matched = BIGMODEL_CN_OFFICIAL_PRICING_CNY
-        .iter()
-        .filter(|(name, ..)| {
-            needle.len() >= name.len()
-                && needle[..name.len()].eq_ignore_ascii_case(name)
-                && needle[name.len()..]
-                    .chars()
-                    .next()
-                    .is_none_or(|c| !c.is_ascii_alphanumeric())
-        })
-        .max_by_key(|(name, ..)| name.len());
-    let Some((_, input, cache_read, output)) = matched else {
+    for base in pricing_model_prefixes(model.trim()) {
+        let mut matches = BIGMODEL_CN_OFFICIAL_PRICING_CNY
+            .iter()
+            .copied()
+            .filter(|(name, ..)| name.eq_ignore_ascii_case(base));
+        if let Some(price) = matches.next() {
+            let valid = |rate: f64| rate.is_finite() && rate >= 0.0;
+            return (matches.next().is_none()
+                && valid(price.1)
+                && valid(price.2)
+                && valid(price.3))
+            .then_some(price);
+        }
+    }
+    None
+}
+
+/// Use native CNY for official bigmodel.cn and registered bounded variants.
+/// Unregistered capability models keep their catalogue values.
+pub(super) fn apply_bigmodel_cn_official_pricing(caps: &mut ModelCapabilities, base_url: &str) {
+    let Some((_, input, cache_read, output)) = bigmodel_cn_pricing(base_url, &caps.model_id) else {
         return;
     };
-    caps.input_cost = Some(*input);
-    caps.cache_read_cost = Some(*cache_read);
-    caps.output_cost = Some(*output);
+    caps.input_cost = Some(input);
+    caps.cache_read_cost = Some(cache_read);
+    caps.output_cost = Some(output);
     caps.currency = Some("CNY".to_string());
 }
 
@@ -799,6 +900,28 @@ mod tests {
             assert_eq!(caps.cache_read_cost, Some(0.23));
             assert_eq!(caps.output_cost, Some(2.8));
             assert_eq!(caps.currency.as_deref(), Some("CNY"));
+        }
+    }
+
+    #[test]
+    fn bigmodel_override_rejects_spoof_hosts_paths_and_userinfo() {
+        for url in [
+            "https://bigmodel.cn.evil.example/v1",
+            "https://notbigmodel.cn/v1",
+            "https://bigmodel.cn@evil.example/v1",
+            "https://evil.example/path/bigmodel.cn",
+            "https://evil.example/?host=bigmodel.cn",
+            "not a URL bigmodel.cn",
+        ] {
+            let mut caps = caps_for("glm-5.3");
+            apply_bigmodel_cn_official_pricing(&mut caps, url);
+            assert_eq!(caps.currency.as_deref(), Some("USD"), "{url}");
+            assert_eq!(caps.input_cost, Some(1.4));
+        }
+        for url in ["https://bigmodel.cn/v1", "https://OPEN.BIGMODEL.CN./v1"] {
+            let mut caps = caps_for("glm-5.3");
+            apply_bigmodel_cn_official_pricing(&mut caps, url);
+            assert_eq!(caps.currency.as_deref(), Some("CNY"), "{url}");
         }
     }
 

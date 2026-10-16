@@ -8,9 +8,25 @@
   --token-heat-4: #93c5fd;
   --token-heat-5: #60a5fa;
 }
+.token-usage[data-metric="cost"] {
+  --token-accent: #0d9488;
+  --token-heat-1: #f0fdfa;
+  --token-heat-2: #ccfbf1;
+  --token-heat-3: #99f6e4;
+  --token-heat-4: #5eead4;
+  --token-heat-5: #2dd4bf;
+}
+.token-heading-icon, .token-currency-badge { background: var(--token-heat-1); color: var(--token-accent); }
+.token-metric-switch, .token-rates { border-color: var(--token-border); background: var(--token-base); }
+.token-metric-button[aria-pressed="true"] { color: var(--token-accent); background: var(--token-heat-2); box-shadow: 0 1px 3px rgb(0 0 0 / 6%); }
+.token-pricing-note { border-color: color-mix(in srgb, var(--token-accent) 20%, transparent); background: color-mix(in srgb, var(--token-heat-1) 55%, var(--token-base)); color: #0f766e; }
+.token-share-fill, .token-input-segment { background: var(--token-accent); }
+.token-cache-segment { background: #a5b4fc; }
+.token-output-segment { background: #34d399; }
+.token-usage[data-metric="cost"] .token-output-segment { background: #38bdf8; }
 .token-kpi, .token-detail, .token-day { border-color: var(--token-border); background: var(--token-base); }
 .token-kpi-featured { background: linear-gradient(120deg, var(--token-heat-2), var(--token-heat-1)); border-color: color-mix(in srgb, var(--token-accent) 25%, transparent); }
-.token-kpi-featured p:nth-child(2) { color: #2563eb; }
+.token-kpi-featured p:nth-child(2) { color: var(--token-accent); }
 .token-day { cursor: pointer; transition: background-color 150ms, box-shadow 150ms; }
 .token-day[data-heat="1"], .token-swatch[data-heat="1"] { background: var(--token-heat-1); }
 .token-day[data-heat="2"], .token-swatch[data-heat="2"] { background: var(--token-heat-2); }
@@ -25,9 +41,19 @@
 .token-month-chart { border-bottom: 1px solid var(--token-border); background: repeating-linear-gradient(to top, transparent 0, transparent calc(25% - 1px), var(--token-border) 25%); }
 .token-month { cursor: pointer; transition: background-color 150ms; }
 .token-month:hover { background: var(--token-heat-1); }
-.token-month-bar { background: linear-gradient(to top, var(--token-accent), #93c5fd); }
+.token-month-bar { background: linear-gradient(to top, var(--token-accent), var(--token-heat-4)); }
 .token-models, .token-model-row, .token-footer { border-color: var(--token-border); }
 .token-share, .token-composition { background: var(--token-heat-2); }
+.token-family, .token-family-detail, .token-family-variant { border-color: var(--token-border); }
+.token-family-columns { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; column-gap: 12px; }
+.token-family > summary { list-style: none; outline-color: var(--token-accent); }
+.token-family > summary::-webkit-details-marker { display: none; }
+.token-family > summary:hover { background: var(--token-heat-1); }
+.token-family[open] > summary .token-family-chevron { transform: rotate(90deg); }
+.token-family-detail { background: var(--token-base); }
+@media (min-width: 640px) {
+  .token-family-columns { grid-template-columns: minmax(0, 1fr) minmax(90px, auto) 64px; }
+}
 .token-footer { background: var(--token-base); }
 html[data-theme="dark"] .token-usage {
   --token-accent: #60a5fa;
@@ -39,8 +65,17 @@ html[data-theme="dark"] .token-usage {
   --token-heat-4: #2d5d94;
   --token-heat-5: #326da8;
 }
-/* The shell's dark slate utilities use !important; keep the highlighted values legible. */
-html[data-theme="dark"] .token-kpi-featured p:nth-child(2) { color: #93c5fd !important; }
+html[data-theme="dark"] .token-usage[data-metric="cost"] {
+  --token-accent: #5eead4;
+  --token-heat-1: #182f30;
+  --token-heat-2: #1c4240;
+  --token-heat-3: #20594f;
+  --token-heat-4: #226e5e;
+  --token-heat-5: #26856e;
+}
+html[data-theme="dark"] .token-pricing-note { color: #99f6e4; }
+/* The shell's dark slate utilities use !important; keep highlighted values legible. */
+html[data-theme="dark"] .token-kpi-featured p:nth-child(2) { color: var(--token-accent) !important; }
 html[data-theme="dark"] .token-day[data-heat="4"] > span,
 html[data-theme="dark"] .token-day[data-heat="5"] > span { color: #f1f5f9 !important; }
 @media (max-width: 639px) {

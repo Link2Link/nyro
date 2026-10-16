@@ -915,6 +915,37 @@ pub struct TokenUsageDay {
     /// Attempts with non-NULL stored cache reads (not proof of upstream reporting when
     /// a log writer has normalized absent cache usage to zero).
     pub cache_read_reported_count: i64,
+    /// Current catalogue/manual API-equivalent value of known tokens, not an invoice.
+    /// Missing/invalid or ambiguous pricing is None, distinct from a priced zero.
+    #[serde(default)]
+    #[sqlx(skip)]
+    pub cost: Option<TokenUsageCost>,
+}
+
+/// Estimated API-equivalent value at current catalogue/manual rates, not historical billing.
+/// Cache writes are not recorded separately, so cache-write premiums are unmodeled.
+/// Partial usage includes only the known token totals; inspect `missing_usage_count`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TokenUsageCost {
+    pub currency: String,
+    /// Whether an exact provider/model manual rule supplied these rates.
+    #[serde(default)]
+    pub is_manual: bool,
+    /// Cost of non-cached input only; gross input already includes cache reads.
+    pub input_cost: f64,
+    pub cache_read_cost: f64,
+    pub output_cost: f64,
+    pub total_cost: f64,
+    /// True only when positive cache reads were priced at the input rate because
+    /// the selected price did not provide a cache-read rate.
+    pub cache_rate_fallback: bool,
+    pub pricing_provider: String,
+    pub pricing_model: String,
+    /// All rates are in `currency` per one million tokens.
+    pub input_rate: f64,
+    pub output_rate: f64,
+    /// Effective cache-read rate, including input-rate fallback when absent.
+    pub cache_read_rate: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1602,6 +1633,10 @@ pub struct ExportModelRating {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExportProvider {
+    /// Original identity for remapping provider-scoped settings on import.
+    /// Older backups omit it; never infer identity from a display name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_id: Option<String>,
     pub name: String,
     pub vendor: Option<String>,
     pub protocol: String,

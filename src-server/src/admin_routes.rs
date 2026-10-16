@@ -6,7 +6,9 @@ use axum::response::IntoResponse;
 use axum::routing::{get, post, put};
 use axum::{Extension, Json, Router};
 use nyro_core::Gateway;
-use nyro_core::admin::{CopyProviderOptions, ModelRatingError, SetModelRating};
+use nyro_core::admin::{
+    CopyProviderOptions, ModelRatingError, SetModelRating, TokenPriceError, TokenPriceInput,
+};
 use nyro_core::auth::AuthExchangeInput;
 use nyro_core::db::models::*;
 use serde::Deserialize;
@@ -157,6 +159,10 @@ pub fn create_router(gateway: Gateway, admin_token: Option<String>) -> Router {
         .route("/stats/hourly", get(stats_hourly))
         .route("/stats/timeseries", get(stats_timeseries))
         .route("/stats/token-usage", get(token_usage_stats))
+        .route(
+            "/stats/token-price",
+            get(get_token_price).put(set_token_price),
+        )
         .route("/stats/models", get(stats_by_model))
         .route("/stats/models/:id", get(model_usage_detail))
         .route("/stats/providers", get(stats_by_provider))
@@ -935,6 +941,56 @@ async fn stats_timeseries(
 }
 
 #[derive(Deserialize)]
+struct TokenPriceParams {
+    provider_id: String,
+    model: String,
+}
+
+async fn get_token_price(
+    State(gw): State<Gateway>,
+    query: Result<Query<TokenPriceParams>, axum::extract::rejection::QueryRejection>,
+) -> axum::response::Response {
+    let Query(params) = match query {
+        Ok(query) => query,
+        Err(error) => return rating_bad_request(error.body_text()),
+    };
+    match gw
+        .admin()
+        .get_token_price(&params.provider_id, &params.model)
+        .await
+    {
+        Ok(config) => Json(serde_json::json!({ "data": config })).into_response(),
+        Err(error) => token_price_error(error),
+    }
+}
+
+async fn set_token_price(
+    State(gw): State<Gateway>,
+    input: Result<Json<TokenPriceInput>, axum::extract::rejection::JsonRejection>,
+) -> axum::response::Response {
+    let Json(input) = match input {
+        Ok(input) => input,
+        Err(error) => return rating_bad_request(error.body_text()),
+    };
+    match gw.admin().set_token_price(input).await {
+        Ok(config) => Json(serde_json::json!({ "data": config })).into_response(),
+        Err(error) => token_price_error(error),
+    }
+}
+
+fn token_price_error(error: anyhow::Error) -> axum::response::Response {
+    let status = match error.downcast_ref::<TokenPriceError>() {
+        Some(TokenPriceError::InvalidInput(_)) => StatusCode::BAD_REQUEST,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    (
+        status,
+        Json(serde_json::json!({ "error": error.to_string() })),
+    )
+        .into_response()
+}
+
+#[derive(Deserialize)]
 struct TokenUsageParams {
     year: i32,
 }
@@ -950,7 +1006,7 @@ async fn token_usage_stats(
             Json(serde_json::json!({ "error": e.to_string() })),
         )
             .into_response(),
-        Err(e) => err(e),
+        Err(e) => token_price_error(e),
     }
 }
 
@@ -1106,12 +1162,19 @@ fn usage_err(e: anyhow::Error) -> axum::response::Response {
 }
 
 fn err(e: anyhow::Error) -> axum::response::Response {
+    if e.downcast_ref::<TokenPriceError>().is_some() {
+        return token_price_error(e);
+    }
     Json(serde_json::json!({ "error": e.to_string() })).into_response()
 }
 
 #[cfg(test)]
 #[path = "rating_api_tests.rs"]
 mod rating_api_tests;
+
+#[cfg(test)]
+#[path = "token_price_api_tests.rs"]
+mod token_price_api_tests;
 
 #[cfg(test)]
 #[path = "token_usage_api_tests.rs"]

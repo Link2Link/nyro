@@ -182,6 +182,45 @@ export interface GatewayStatus {
   proxy_port: number;
 }
 
+export interface TokenPriceRates {
+  currency: "USD" | "CNY";
+  input_rate: number;
+  output_rate: number;
+  /** null uses the regular input rate, not a zero/free cache price. */
+  cache_read_rate: number | null;
+}
+
+export interface TokenPriceReference extends TokenPriceRates {
+  pricing_provider: string;
+  pricing_model: string;
+}
+
+export interface TokenPriceConfig {
+  provider_id: string;
+  model: string;
+  default_price: TokenPriceReference | null;
+  override_price: TokenPriceRates | null;
+  /** Same-provider manual price inherited from a longer-matching model prefix. */
+  inherited_price?: TokenPriceReference | null;
+}
+
+/** Current effective rates per million tokens, not a historical bill. */
+export interface TokenUsageCost {
+  currency: string;
+  input_cost: number;
+  cache_read_cost: number;
+  output_cost: number;
+  total_cost: number;
+  cache_rate_fallback: boolean;
+  /** Missing on older servers means automatic catalog pricing. */
+  is_manual?: boolean;
+  pricing_provider: string;
+  pricing_model: string;
+  input_rate: number;
+  output_rate: number;
+  cache_read_rate: number;
+}
+
 export interface TokenUsageDay {
   date: string;
   provider_id: string;
@@ -194,6 +233,8 @@ export interface TokenUsageDay {
   cache_read_reported_count: number;
   /** Attempts missing either input or output usage; totals remain a known lower bound. */
   missing_usage_count: number;
+  /** Missing on older servers; null means no reliable catalog price. */
+  cost?: TokenUsageCost | null;
 }
 
 export interface TokenUsageStats {
@@ -789,6 +830,8 @@ export interface ExportModelRating {
 }
 
 export interface ExportProvider {
+  /** Source identity used to remap provider-scoped price overrides on import. */
+  source_id?: string | null;
   name: string;
   vendor?: string | null;
   protocol: string;

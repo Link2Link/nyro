@@ -256,21 +256,29 @@ impl AdminService {
             .logs()
             .token_usage_days(year_start(year), year_start(year + 1))
             .await?;
-        let names: HashMap<_, _> = self
+        let providers: HashMap<_, _> = self
             .gw
             .storage
             .providers()
             .list()
             .await?
             .into_iter()
-            .map(|provider| (provider.id, provider.name))
+            .map(|provider| (provider.id.clone(), provider))
             .collect();
         for row in &mut rows {
-            row.provider_name = names
+            row.provider_name = providers
                 .get(&row.provider_id)
-                .cloned()
+                .map(|provider| provider.name.clone())
                 .unwrap_or_else(|| row.provider_id.clone());
         }
+        let overrides =
+            super::token_price::parse_overrides(self.gw.storage.settings().list_all().await?)?;
+        super::token_cost::enrich_token_costs(
+            &mut rows,
+            &providers,
+            &self.gw.config.data_dir,
+            &overrides,
+        );
         Ok(TokenUsageStats {
             year,
             time_zone: "UTC".into(),

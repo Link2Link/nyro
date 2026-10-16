@@ -34,6 +34,11 @@ mod oauth;
 mod observability;
 mod providers;
 pub mod settings;
+mod token_cost;
+mod token_price;
+pub use token_price::{
+    TokenPriceConfig, TokenPriceError, TokenPriceInput, TokenPriceRates, TokenPriceReference,
+};
 mod usage;
 mod volcengine_sign;
 

@@ -119,6 +119,8 @@ pub fn run() {
             commands::get_stats_hourly,
             commands::get_stats_timeseries,
             commands::get_token_usage_stats,
+            commands::get_token_price,
+            commands::set_token_price,
             commands::get_stats_by_model,
             commands::get_model_usage_stats,
             commands::get_stats_by_provider,

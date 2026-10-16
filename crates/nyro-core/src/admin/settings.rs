@@ -11,6 +11,7 @@ impl AdminService {
     }
 
     pub async fn set_setting(&self, key: &str, value: &str) -> anyhow::Result<()> {
+        super::token_price::validate_setting(key, value)?;
         self.gw.storage.settings().set(key, value).await
     }
 

@@ -1,7 +1,7 @@
 # WebUI browser smoke tests
 
-These dependency-free Node scripts drive real Chromium through CDP using native
-`fetch` and `WebSocket`. They exercise a disposable admin server, never a running
+The model-ratings, performance, and log-outcomes dependency-free Node scripts drive
+real Chromium through CDP using native `fetch` and `WebSocket`. They exercise a disposable admin server, never a running
 Nyro instance. They do not install packages, commit, or deploy.
 
 ## Prerequisites and commands
@@ -36,6 +36,54 @@ test_dir=$(mktemp -d /tmp/nyro-ui-tests.XXXXXX)
 node --test "$test_dir/format.test.js" "$test_dir/model-ratings.test.js" \
   "$test_dir/model-performance.test.js" "$test_dir/model-probe-selection.test.js" \
   "$test_dir/provider-icon-resolve.test.js"
+```
+
+## Token usage and equivalent API value
+
+`token-usage-smoke.cjs` tests the built frontend with intercepted deterministic
+fixtures (not a live backend). It requires an externally installed Playwright;
+no dependency is added to the WebUI package. All external requests, including
+fonts, are fulfilled locally. No server or database is started or changed.
+
+```bash
+(cd webui && npm run build)
+PLAYWRIGHT_MODULE=/absolute/path/to/playwright \
+CHROME_BIN=/absolute/path/to/chromium node tests/webui/token-usage-smoke.cjs
+```
+
+Optional `NYRO_SMOKE_WEBUI` selects the build directory;
+`NYRO_SMOKE_SCREENSHOTS` selects the screenshot output directory (defaults to a
+new temporary directory). Coverage: Token/value switching and persistence,
+fixed-rate 1 USD = 7.0 CNY merged totals in both display currencies,
+matching totals and day/month drill-down, compact top-five cost families,
+show-all/collapse, merged base/effort variants with expandable exact-provider
+price-edit targets, model filters, zero vs unpriced vs
+tiny nonzero amounts, cache-rate fallback, prefix inheritance (manual rule on
+`claude-sonnet-5-5` pricing `claude-sonnet-5-5-max`, one combined family total,
+editor prefill and reset),
+older-server compatibility, empty/error states, EN/ZH, dark/light and mobile
+layout. Manual pricing checks include default prefilling, required/negative-price
+validation, exact-pair save payloads, blank vs zero cache rates, USD/CNY edits,
+recalculated totals, reload persistence in the fixture, confirmed reset, unknown
+models, load failures with retry and save failures preserving drafts. Price-editor
+screenshots are saved alongside the calendar screenshots. Actual database restart
+persistence and HTTP auth/validation are tested separately by:
+
+```bash
+cargo test -p nyro-core --test token_price --test token_usage
+cargo test -p nyro-core --lib admin::token_
+cargo test -p nyro-server admin_routes::
+```
+
+Helper regression tests:
+
+```bash
+cd webui
+test_dir=$(mktemp -d /tmp/nyro-cost-tests.XXXXXX)
+./node_modules/.bin/tsc src/lib/token-usage.test.ts src/lib/token-price.test.ts --outDir "$test_dir" \
+  --module commonjs --moduleResolution node --target es2020 \
+  --esModuleInterop --skipLibCheck
+node --test "$test_dir/token-usage.test.js" "$test_dir/token-price.test.js"
 ```
 
 ## Isolation and evidence

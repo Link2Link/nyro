@@ -87,6 +87,7 @@ impl AdminService {
                         })
                         .collect();
                     ExportProvider {
+                        source_id: Some(p.id),
                         name: p.name,
                         vendor: p.vendor,
                         protocol: p.protocol,
@@ -126,7 +127,24 @@ impl AdminService {
     }
 
     pub async fn import_config(&self, data: ExportData) -> anyhow::Result<ImportResult> {
-        // Validate every prefix rating before any configuration is changed.
+        // A None destination means the source provider was skipped (name conflict
+        // or create failure). Unknown historical identities are not guessed.
+        let mut price_provider_ids: HashMap<String, Option<String>> = HashMap::new();
+        for provider in &data.providers {
+            if let Some(source_id) = &provider.source_id {
+                if source_id.trim().is_empty() || price_provider_ids.contains_key(source_id) {
+                    return Err(TokenPriceError::InvalidInput(
+                        "Provider source_id must be nonblank and unique in the import".into(),
+                    )
+                    .into());
+                }
+                price_provider_ids.insert(source_id.clone(), None);
+            }
+        }
+        // Validate reserved price settings and ratings before any configuration changes.
+        for (key, value) in &data.settings {
+            super::token_price::validate_setting(key, value)?;
+        }
         super::model_ratings::validate_export_ratings(&data.model_ratings)?;
         if !data.model_ratings.is_empty() {
             self.rating_store()?;
@@ -209,7 +227,10 @@ impl AdminService {
                 })
                 .await;
             match created {
-                Ok(_provider) => {
+                Ok(provider) => {
+                    if let Some(source_id) = &p.source_id {
+                        price_provider_ids.insert(source_id.clone(), Some(provider.id));
+                    }
                     providers_imported += 1;
                 }
                 // Preserve legacy handling of providers that cannot be created.
@@ -241,12 +262,14 @@ impl AdminService {
             ratings_imported = restored.len() as u32;
         }
 
-        let fallback_provider_id = self
-            .list_providers()
-            .await?
+        let current_providers = self.list_providers().await?;
+        let fallback_provider_id = current_providers
+            .first()
+            .map(|provider| provider.id.clone());
+        let current_provider_ids: std::collections::HashSet<_> = current_providers
             .into_iter()
-            .next()
-            .map(|provider| provider.id);
+            .map(|provider| provider.id)
+            .collect();
 
         for m in &data.models {
             let exists = self
@@ -282,7 +305,16 @@ impl AdminService {
         }
 
         for (key, value) in &data.settings {
-            self.set_setting(key, value).await?;
+            let Some((key, value)) = super::token_price::remap_import_setting(
+                key,
+                value,
+                &price_provider_ids,
+                &current_provider_ids,
+            )?
+            else {
+                continue;
+            };
+            self.set_setting(&key, &value).await?;
             settings_imported += 1;
         }
 

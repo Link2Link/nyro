@@ -1,6 +1,7 @@
 use nyro_core::Gateway;
 use nyro_core::admin::{
     CopyProviderOptions, ModelPerformanceResponse, ProviderOAuthStatusData, SetModelRating,
+    TokenPriceConfig, TokenPriceInput,
 };
 use nyro_core::auth::{AuthExchangeInput, AuthSessionInitData, AuthSessionStatusData};
 use nyro_core::db::models::*;
@@ -528,6 +529,29 @@ pub async fn get_stats_timeseries(
 ) -> Result<StatsTimeSeries, String> {
     gw.admin()
         .get_stats_timeseries(hours)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn get_token_price(
+    gw: State<'_, Gateway>,
+    provider_id: String,
+    model: String,
+) -> Result<TokenPriceConfig, String> {
+    gw.admin()
+        .get_token_price(&provider_id, &model)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn set_token_price(
+    gw: State<'_, Gateway>,
+    input: TokenPriceInput,
+) -> Result<TokenPriceConfig, String> {
+    gw.admin()
+        .set_token_price(input)
         .await
         .map_err(|e| e.to_string())
 }

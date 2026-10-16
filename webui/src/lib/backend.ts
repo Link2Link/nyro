@@ -264,6 +264,12 @@ function resolveHTTP(cmd: string, args?: Record<string, unknown>): HTTPMapping {
     case "delete_log":
       return { method: "DELETE", url: `${base}/logs/${args?.id}` };
 
+    case "get_token_price": {
+      const params = new URLSearchParams({ provider_id: String(args?.providerId ?? ""), model: String(args?.model ?? "") });
+      return { method: "GET", url: `${base}/stats/token-price?${params.toString()}` };
+    }
+    case "set_token_price":
+      return { method: "PUT", url: `${base}/stats/token-price`, body: args?.input as Record<string, unknown> };
     case "get_token_usage_stats": {
       const params = new URLSearchParams({ year: String(args?.year ?? new Date().getUTCFullYear()) });
       return { method: "GET", url: `${base}/stats/token-usage?${params.toString()}` };
