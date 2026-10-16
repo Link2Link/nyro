@@ -402,13 +402,13 @@ mod tests {
     }
 
     #[test]
-    fn cursor_default_preferred_and_required_plans_use_vendor_execution() {
-        use crate::protocol::ids::{CURSOR_AGENT_BASE_URL, CURSOR_AGENT_RUN_V1};
-        let decl = make_decl(CURSOR_AGENT_RUN_V1, CURSOR_AGENT_BASE_URL);
+    fn devin_default_preferred_and_required_plans_use_vendor_execution() {
+        use crate::protocol::ids::{DEVIN_BASE_URL, DEVIN_CHAT_V1};
+        let decl = make_decl(DEVIN_CHAT_V1, DEVIN_BASE_URL);
         let mut c = ctx();
-        for pref in [None, Some(CURSOR_AGENT_RUN_V1)] {
+        for pref in [None, Some(DEVIN_CHAT_V1)] {
             let plan = negotiate(ANTHROPIC_MESSAGES_2023_06_01, pref, Some(&decl), &mut c).unwrap();
-            assert_eq!(plan.egress, CURSOR_AGENT_RUN_V1);
+            assert_eq!(plan.egress, DEVIN_CHAT_V1);
             assert_eq!(plan.execution, ExecutionKind::VendorStream);
             assert_eq!(plan.mode, ProtocolMode::Transform);
             assert!(plan.needs_conversion);
@@ -420,14 +420,12 @@ mod tests {
         )
         .unwrap();
         assert_eq!(plan.execution, ExecutionKind::VendorStream);
-        for pref in [None, Some(CURSOR_AGENT_RUN_V1)] {
+        for pref in [None, Some(DEVIN_CHAT_V1)] {
             assert!(negotiate(OPENAI_COMPATIBLE_EMBEDDINGS_V1, pref, Some(&decl), &mut c).is_err());
-            assert!(negotiate(CURSOR_AGENT_RUN_V1, pref, Some(&decl), &mut c).is_err());
+            assert!(negotiate(DEVIN_CHAT_V1, pref, Some(&decl), &mut c).is_err());
         }
-        assert!(negotiate(CURSOR_AGENT_RUN_V1, None, None, &mut c).is_err());
-        assert!(
-            negotiate_required(CURSOR_AGENT_RUN_V1, decl.endpoints[0].clone(), &mut c).is_err()
-        );
+        assert!(negotiate(DEVIN_CHAT_V1, None, None, &mut c).is_err());
+        assert!(negotiate_required(DEVIN_CHAT_V1, decl.endpoints[0].clone(), &mut c).is_err());
         assert!(
             negotiate_required(
                 OPENAI_COMPATIBLE_EMBEDDINGS_V1,

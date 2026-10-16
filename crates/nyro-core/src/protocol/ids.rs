@@ -2,7 +2,7 @@
 //!
 //! Canonical string form: `{protocol}/{name}/{version}`.
 //!
-//! - `protocol`: closed enum of protocol suites (JSON/HTTP families plus egress-only `cursor-agent`).
+//! - `protocol`: closed enum of protocol suites (JSON/HTTP families plus egress-only `devin-chat`).
 //! - `name`: wire-format endpoint name (`chat-completions` / `responses` / `messages` / `generate-content` / `embeddings`).
 //! - `version`: schema version as the vendor labels it (`v1`, `2023-06-01`, `v1beta`).
 //!
@@ -28,8 +28,6 @@ pub enum Protocol {
     AnthropicMessages,
     /// Google Generative AI (Gemini) protocol.
     GoogleGemini,
-    /// Cursor Agent Run protocol (egress-only, vendor-owned binary stream).
-    CursorAgent,
     /// Devin CLI chat protocol (egress-only Connect/protobuf stream).
     DevinChat,
 }
@@ -41,7 +39,6 @@ impl Protocol {
             Self::OpenAIResponses => "openai-responses",
             Self::AnthropicMessages => "anthropic-messages",
             Self::GoogleGemini => "google-gemini",
-            Self::CursorAgent => "cursor-agent",
             Self::DevinChat => "devin-chat",
         }
     }
@@ -52,7 +49,6 @@ impl Protocol {
             Self::OpenAIResponses => "OpenAI Responses",
             Self::AnthropicMessages => "Anthropic Messages",
             Self::GoogleGemini => "Google Gemini",
-            Self::CursorAgent => "Cursor Agent",
             Self::DevinChat => "Devin Chat",
         }
     }
@@ -77,7 +73,6 @@ impl FromStr for Protocol {
             "google-gemini" | "google-genai" | "google-generative-ai" | "gemini" | "google" => {
                 Ok(Self::GoogleGemini)
             }
-            "cursor-agent" => Ok(Self::CursorAgent),
             "devin-chat" => Ok(Self::DevinChat),
             other => anyhow::bail!("unknown protocol: {other}"),
         }
@@ -139,13 +134,6 @@ pub const ANTHROPIC_MESSAGES_2023_06_01: ProtocolEndpoint =
 
 pub const GOOGLE_GEMINI_GENERATE_CONTENT_V1BETA: ProtocolEndpoint =
     ProtocolEndpoint::new(Protocol::GoogleGemini, "generate-content", "v1beta");
-
-/// Cursor's native Agent Run endpoint. It is not an OpenAI-compatible API.
-pub const CURSOR_AGENT_RUN_V1: ProtocolEndpoint =
-    ProtocolEndpoint::new(Protocol::CursorAgent, "run", "v1");
-
-/// Cursor Agent uses a fixed service origin, not a configurable relay URL.
-pub const CURSOR_AGENT_BASE_URL: &str = "https://api2.cursor.sh";
 
 /// Devin's proprietary CLI endpoint, not a public OpenAI-compatible API.
 pub const DEVIN_CHAT_V1: ProtocolEndpoint =
@@ -222,7 +210,7 @@ pub struct EndpointCapabilities {
     pub reasoning: bool,
     pub embeddings: bool,
     /// Force the upstream call to be made in streaming mode regardless of the
-    /// client's `stream` flag (e.g. OpenAI Responses and Cursor Agent Run).
+    /// client's `stream` flag (e.g. OpenAI Responses and Devin Chat).
     pub force_upstream_stream: bool,
     /// The encoder writes the actual model name into the request body rather
     /// than the URL path. Currently only true for Google Generate.
@@ -303,25 +291,6 @@ impl EndpointCapabilities {
     };
 }
 
-/// Initial Cursor adapter contract: text, client function tools, and reasoning
-/// are translated through IR. Images, structured output, deterministic sampling,
-/// and parallel tool calls are not promised by this adapter. Streaming is a
-/// vendor-owned framed binary transport, never upstream SSE or a JSON stream flag.
-pub const CURSOR_AGENT_CAPABILITIES: EndpointCapabilities = EndpointCapabilities {
-    streaming: true,
-    tools: true,
-    reasoning: true,
-    force_upstream_stream: true,
-    function_calling: true,
-    extended_reasoning: true,
-    stream: StreamCaps {
-        server_sent_events: false,
-        usage_in_stream: false,
-        requires_stream_flag: false,
-    },
-    ..EndpointCapabilities::EMPTY
-};
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -348,7 +317,6 @@ mod tests {
             OPENAI_COMPATIBLE_EMBEDDINGS_V1.to_string(),
             "openai-compatible/embeddings/v1"
         );
-        assert_eq!(CURSOR_AGENT_RUN_V1.to_string(), "cursor-agent/run/v1");
     }
 
     #[test]
@@ -358,7 +326,6 @@ mod tests {
             Protocol::OpenAIResponses,
             Protocol::AnthropicMessages,
             Protocol::GoogleGemini,
-            Protocol::CursorAgent,
             Protocol::DevinChat,
         ] {
             assert_eq!(p.as_str().parse::<Protocol>().unwrap(), p);

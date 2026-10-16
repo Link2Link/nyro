@@ -27,7 +27,7 @@ use super::streaming::{IrTerminalState, StreamHookState, validate_decoded_batch}
 use super::{CallCtx, LogBuilder, StreamResponseAccumulator};
 
 const MAX_PRECOMMIT_DELTAS: usize = 2048;
-const LIMITATIONS: &str = "system_best_effort,token_budget_not_enforced,usage_unknown";
+const LIMITATIONS: &str = "system_best_effort,inline_images_only,tools_buffered";
 type FrameSender = mpsc::Sender<Result<String, Infallible>>;
 
 #[derive(Default)]
@@ -79,14 +79,10 @@ fn timeout_error() -> GatewayError {
     }
 }
 
-fn with_limitations(mut response: Response, devin: bool) -> Response {
+fn with_limitations(mut response: Response) -> Response {
     response.headers_mut().insert(
         "x-nyro-provider-limitations",
-        HeaderValue::from_static(if devin {
-            "system_best_effort,inline_images_only,tools_buffered"
-        } else {
-            LIMITATIONS
-        }),
+        HeaderValue::from_static(LIMITATIONS),
     );
     response
 }
@@ -135,13 +131,7 @@ fn failed_attempt(
     started: Instant,
 ) -> ConversionAttempt {
     record_error(&mut log, &error);
-    let response = with_limitations(
-        error.render(Some(request_id)),
-        log.diagnostic
-            .payload_metadata
-            .get("devin_model_route")
-            .is_some(),
-    );
+    let response = with_limitations(error.render(Some(request_id)));
     let health = super::health_outcome_from_status(response.status().as_u16());
     progress.log(log, response.status().as_u16(), started);
     ConversionAttempt::new(response, RetryDisposition::Never, health)
@@ -192,18 +182,12 @@ pub(super) async fn handle_ir_response(
         guard,
     } = upstream;
     let started = Instant::now();
-    let devin = crate::provider::devin::is_devin(call_ctx.provider);
     let mut log = LogBuilder::from_ctx(call_ctx)
         .upstream_url(&url)
         .upstream_status(i32::from(status))
         .upstream_resp_headers(crate::proxy::observability::headers_to_json(&headers));
     log.upstream_model = actual_model;
-    let model_key = if crate::provider::devin::is_devin(call_ctx.provider) {
-        "devin_model_route"
-    } else {
-        "cursor_model_route"
-    };
-    log.diagnostic.payload_metadata[model_key] = model_metadata;
+    log.diagnostic.payload_metadata["devin_model_route"] = model_metadata;
     log.diagnostic.client_request_id = Some(req_ctx.request_id.clone());
     let mut progress = Progress::default();
     if !(200..300).contains(&status) {
@@ -268,7 +252,7 @@ pub(super) async fn handle_ir_response(
                 let health = super::health_outcome_from_response(&response);
                 progress.log(log, response.status().as_u16(), started);
                 return ConversionAttempt::new(
-                    with_limitations(response, devin),
+                    with_limitations(response),
                     RetryDisposition::Never,
                     health,
                 );
@@ -276,7 +260,7 @@ pub(super) async fn handle_ir_response(
         };
         progress.log(log, response.status().as_u16(), started);
         return ConversionAttempt::new(
-            with_limitations(response, devin),
+            with_limitations(response),
             RetryDisposition::Never,
             HealthDisposition::Success,
         );
@@ -353,7 +337,7 @@ pub(super) async fn handle_ir_response(
         .body(Body::from_stream(ReceiverStream::new(rx)))
         .expect("static native stream response headers");
     ConversionAttempt::new(
-        with_limitations(response, devin),
+        with_limitations(response),
         RetryDisposition::Never,
         HealthDisposition::Deferred,
     )

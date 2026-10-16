@@ -184,7 +184,7 @@ pub fn sanitize_cause(message: &str) -> String {
 fn public_message(kind: &str) -> &'static str {
     match kind {
         "upstream_connect" => "Could not connect to the upstream provider",
-        "upstream_read" => "Failed to read the upstream response",
+        "upstream_read" | "upstream_read_error" => "Failed to read the upstream response",
         "upstream_decompress" => "Failed to decompress the upstream response",
         "upstream_protocol_error" => "The upstream response reported an error",
         "response_parse" => "Failed to parse the response",

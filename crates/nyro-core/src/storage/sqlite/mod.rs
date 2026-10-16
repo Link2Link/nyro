@@ -163,22 +163,6 @@ impl SqliteOAuthCredentialStore {
                 return Ok(None);
             }
         }
-        if input.driver_key == "cursor"
-            && let Some(subject) = input.subject_id.as_deref().filter(|id| !id.is_empty())
-        {
-            // The predicate and write share the serializable/write transaction.
-            // Excluding this provider permits rebind/refresh of the same account.
-            let duplicate = sqlx::query_scalar::<_, String>(
-                "SELECT provider_id FROM provider_oauth_credentials WHERE driver_key = 'cursor' AND subject_id = ?1 AND provider_id <> ?2 AND status <> 'disconnected'",
-            )
-            .bind(subject)
-            .bind(provider_id)
-            .fetch_optional(&mut *tx)
-            .await?;
-            if duplicate.is_some() {
-                anyhow::bail!("cursor_account_already_bound");
-            }
-        }
         let credential = sqlx::query_as::<_, OAuthCredential>(&format!(
             "INSERT INTO provider_oauth_credentials (provider_id, driver_key, scheme, access_token, refresh_token, expires_at, resource_url, subject_id, scopes, meta, status, status_version, last_error, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'connected', 0, NULL, datetime('now'), datetime('now')) ON CONFLICT(provider_id) DO UPDATE SET driver_key=excluded.driver_key, scheme=excluded.scheme, access_token=excluded.access_token, refresh_token=excluded.refresh_token, expires_at=excluded.expires_at, resource_url=excluded.resource_url, subject_id=excluded.subject_id, scopes=excluded.scopes, meta=excluded.meta, status='connected', status_version=provider_oauth_credentials.status_version+1, last_error=NULL, updated_at=datetime('now') RETURNING {OAUTH_COLUMNS}"
         ))
@@ -295,7 +279,7 @@ impl OAuthCredentialStore for SqliteOAuthCredentialStore {
         input: UpsertOAuthCredential,
     ) -> anyhow::Result<Option<OAuthCredential>> {
         let credential = sqlx::query_as::<_, OAuthCredential>(&format!(
-            "UPDATE provider_oauth_credentials SET driver_key=?1, scheme=?2, access_token=?3, refresh_token=?4, expires_at=?5, resource_url=?6, subject_id=?7, scopes=COALESCE(?8, scopes), meta=COALESCE(?9, meta), status='connected', status_version=status_version+1, last_error=NULL, last_refresh_at=datetime('now'), updated_at=datetime('now') WHERE provider_id=?10 AND status='refreshing' AND status_version=?11 AND ((driver_key <> 'cursor' AND ?1 <> 'cursor') OR (driver_key = ?1 AND subject_id IS ?7)) RETURNING {OAUTH_COLUMNS}"
+            "UPDATE provider_oauth_credentials SET driver_key=?1, scheme=?2, access_token=?3, refresh_token=?4, expires_at=?5, resource_url=?6, subject_id=?7, scopes=COALESCE(?8, scopes), meta=COALESCE(?9, meta), status='connected', status_version=status_version+1, last_error=NULL, last_refresh_at=datetime('now'), updated_at=datetime('now') WHERE provider_id=?10 AND status='refreshing' AND status_version=?11 RETURNING {OAUTH_COLUMNS}"
         ))
         .bind(&input.driver_key)
         .bind(&input.scheme)
@@ -347,9 +331,8 @@ impl OAuthCredentialStore for SqliteOAuthCredentialStore {
     async fn recover_stale_refreshing(&self, timeout: Duration) -> anyhow::Result<u64> {
         let seconds = i64::try_from(timeout.as_secs()).unwrap_or(i64::MAX);
         let result = sqlx::query(
-            "UPDATE provider_oauth_credentials SET status=CASE WHEN driver_key='cursor' THEN 'error' ELSE 'connected' END, last_error=CASE WHEN driver_key='cursor' THEN ?1 ELSE ?2 END, status_version=status_version+1, updated_at=datetime('now') WHERE status='refreshing' AND datetime(updated_at, '+' || ?3 || ' seconds') < datetime('now')",
+            "UPDATE provider_oauth_credentials SET status='connected', last_error=?1, status_version=status_version+1, updated_at=datetime('now') WHERE status='refreshing' AND datetime(updated_at, '+' || ?2 || ' seconds') < datetime('now')",
         )
-        .bind(crate::storage::oauth::CURSOR_STALE_REFRESH_ERROR)
         .bind(crate::storage::oauth::STALE_REFRESH_ERROR)
         .bind(seconds)
         .execute(&self.pool)
@@ -463,11 +446,7 @@ impl SqliteProviderStore {
 }
 
 fn endpoint_inputs_or_legacy(input: &CreateProvider) -> Vec<CreateProviderProtocolEndpoint> {
-    // Cursor's native transport has no compatibility endpoint to synthesize.
-    if !input.protocol_endpoints.is_empty()
-        || (normalize_provider_vendor(input.vendor.as_deref()).as_deref() == Some("cursor")
-            && input.protocol.trim() == "cursor-agent/run/v1")
-    {
+    if !input.protocol_endpoints.is_empty() {
         return input.protocol_endpoints.clone();
     }
     vec![CreateProviderProtocolEndpoint {

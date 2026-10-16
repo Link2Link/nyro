@@ -223,22 +223,6 @@ impl PostgresOAuthCredentialStore {
                 return Ok(None);
             }
         }
-        if input.driver_key == "cursor"
-            && let Some(subject) = input.subject_id.as_deref().filter(|id| !id.is_empty())
-        {
-            // The predicate and write share the serializable/write transaction.
-            // Excluding this provider permits rebind/refresh of the same account.
-            let duplicate = sqlx::query_scalar::<_, String>(
-                "SELECT provider_id FROM provider_oauth_credentials WHERE driver_key = 'cursor' AND subject_id = $1 AND provider_id <> $2 AND status <> 'disconnected'",
-            )
-            .bind(subject)
-            .bind(provider_id)
-            .fetch_optional(&mut *tx)
-            .await?;
-            if duplicate.is_some() {
-                anyhow::bail!("cursor_account_already_bound");
-            }
-        }
         let credential = sqlx::query_as::<_, OAuthCredential>(&format!(
             "INSERT INTO provider_oauth_credentials (provider_id, driver_key, scheme, access_token, refresh_token, expires_at, resource_url, subject_id, scopes, meta, status, status_version, last_error, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6::text::timestamptz, $7, $8, $9, $10, 'connected', 0, NULL, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP) ON CONFLICT(provider_id) DO UPDATE SET driver_key=excluded.driver_key, scheme=excluded.scheme, access_token=excluded.access_token, refresh_token=excluded.refresh_token, expires_at=excluded.expires_at, resource_url=excluded.resource_url, subject_id=excluded.subject_id, scopes=excluded.scopes, meta=excluded.meta, status='connected', status_version=provider_oauth_credentials.status_version+1, last_error=NULL, updated_at=CURRENT_TIMESTAMP RETURNING {OAUTH_COLUMNS}"
         ))
@@ -355,7 +339,7 @@ impl OAuthCredentialStore for PostgresOAuthCredentialStore {
         input: UpsertOAuthCredential,
     ) -> anyhow::Result<Option<OAuthCredential>> {
         let credential = sqlx::query_as::<_, OAuthCredential>(&format!(
-            "UPDATE provider_oauth_credentials SET driver_key=$1, scheme=$2, access_token=$3, refresh_token=$4, expires_at=$5::text::timestamptz, resource_url=$6, subject_id=$7, scopes=COALESCE($8, scopes), meta=COALESCE($9, meta), status='connected', status_version=status_version+1, last_error=NULL, last_refresh_at=CURRENT_TIMESTAMP, updated_at=CURRENT_TIMESTAMP WHERE provider_id=$10 AND status='refreshing' AND status_version=$11 AND ((driver_key <> 'cursor' AND $1 <> 'cursor') OR (driver_key = $1 AND subject_id IS NOT DISTINCT FROM $7)) RETURNING {OAUTH_COLUMNS}"
+            "UPDATE provider_oauth_credentials SET driver_key=$1, scheme=$2, access_token=$3, refresh_token=$4, expires_at=$5::text::timestamptz, resource_url=$6, subject_id=$7, scopes=COALESCE($8, scopes), meta=COALESCE($9, meta), status='connected', status_version=status_version+1, last_error=NULL, last_refresh_at=CURRENT_TIMESTAMP, updated_at=CURRENT_TIMESTAMP WHERE provider_id=$10 AND status='refreshing' AND status_version=$11 RETURNING {OAUTH_COLUMNS}"
         ))
         .bind(&input.driver_key)
         .bind(&input.scheme)
@@ -407,9 +391,8 @@ impl OAuthCredentialStore for PostgresOAuthCredentialStore {
     async fn recover_stale_refreshing(&self, timeout: Duration) -> anyhow::Result<u64> {
         let seconds = i64::try_from(timeout.as_secs()).unwrap_or(i64::MAX);
         let result = sqlx::query(
-            "UPDATE provider_oauth_credentials SET status=CASE WHEN driver_key='cursor' THEN 'error' ELSE 'connected' END, last_error=CASE WHEN driver_key='cursor' THEN $1 ELSE $2 END, status_version=status_version+1, updated_at=CURRENT_TIMESTAMP WHERE status='refreshing' AND updated_at + ($3::bigint * INTERVAL '1 second') < CURRENT_TIMESTAMP",
+            "UPDATE provider_oauth_credentials SET status='connected', last_error=$1, status_version=status_version+1, updated_at=CURRENT_TIMESTAMP WHERE status='refreshing' AND updated_at + ($2::bigint * INTERVAL '1 second') < CURRENT_TIMESTAMP",
         )
-        .bind(crate::storage::oauth::CURSOR_STALE_REFRESH_ERROR)
         .bind(crate::storage::oauth::STALE_REFRESH_ERROR)
         .bind(seconds)
         .execute(&self.pool)
@@ -524,11 +507,7 @@ impl PostgresProviderStore {
 fn postgres_endpoint_inputs_or_legacy(
     input: &CreateProvider,
 ) -> Vec<CreateProviderProtocolEndpoint> {
-    // Cursor's native transport has no compatibility endpoint to synthesize.
-    if !input.protocol_endpoints.is_empty()
-        || (normalize_provider_vendor(input.vendor.as_deref()).as_deref() == Some("cursor")
-            && input.protocol.trim() == "cursor-agent/run/v1")
-    {
+    if !input.protocol_endpoints.is_empty() {
         return input.protocol_endpoints.clone();
     }
     vec![CreateProviderProtocolEndpoint {
@@ -2052,9 +2031,7 @@ END $$;"#,
              (id, provider_id, protocol, base_url, api_key, auth_scheme, is_enabled, priority) \
              SELECT p.id || '-default-endpoint', p.id, p.protocol, p.base_url, p.api_key, 'auto', TRUE, 0 \
              FROM providers p \
-             WHERE NOT (COALESCE(lower(trim(p.vendor)), '') = 'cursor' \
-                 AND trim(p.protocol) = 'cursor-agent/run/v1') \
-               AND NOT EXISTS (\
+             WHERE NOT EXISTS (\
                  SELECT 1 FROM provider_protocol_endpoints e WHERE e.provider_id = p.id\
              )",
         )
@@ -2543,12 +2520,6 @@ fn normalize_provider_protocol_value(
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return String::new();
-    }
-    // Native Cursor is selected by an exact execution endpoint even in fixed
-    // mode; collapsing it to the suite makes the next startup backfill a legacy
-    // endpoint and loses the native provider identity.
-    if reg.resolve_alias(trimmed) == Some(crate::protocol::ids::CURSOR_AGENT_RUN_V1) {
-        return crate::protocol::ids::CURSOR_AGENT_RUN_V1.to_string();
     }
     if adaptive {
         return reg

@@ -351,61 +351,14 @@ impl Gateway {
         self.provider_http_client(use_proxy, true).await
     }
 
-    /// Cursor's bidirectional Connect transport requires HTTP/2. Preserve the
-    /// configured proxy path and reject explicit HTTP/1-only configuration.
-    pub(crate) async fn required_http2_client(
-        &self,
-        use_proxy: bool,
-    ) -> anyhow::Result<reqwest::Client> {
-        if use_proxy {
-            let enabled = self
-                .storage
-                .settings()
-                .get("proxy_enabled")
-                .await?
-                .as_deref()
-                .map(parse_bool_setting)
-                .unwrap_or(false);
-            let force_http1 = self
-                .storage
-                .settings()
-                .get("proxy_force_http1")
-                .await?
-                .as_deref()
-                .map(parse_bool_setting)
-                .unwrap_or(false);
-            if enabled && force_http1 {
-                anyhow::bail!(
-                    "Cursor requires HTTP/2; disable proxy_force_http1 for this provider"
-                );
-            }
-        }
-        self.cursor_client_builder(use_proxy, true)
-            .await?
-            .build()
-            .map_err(Into::into)
-    }
-
-    /// Cursor auth carries the PKCE verifier in a query parameter. Never follow
-    /// redirects, including same-origin redirects to a different API surface.
-    pub(crate) async fn cursor_auth_http_client(
-        &self,
-        use_proxy: bool,
-    ) -> anyhow::Result<reqwest::Client> {
-        self.cursor_client_builder(use_proxy, false)
-            .await?
-            .build()
-            .map_err(Into::into)
-    }
-
     /// Devin embeds credentials in protobuf bodies: never replay them to a
-    /// redirect target. Unlike Cursor duplex, server-streaming works over H1.
+    /// redirect target. Server-streaming works over HTTP/1.
     pub(crate) async fn devin_http_client(
         &self,
         use_proxy: bool,
         inference: bool,
     ) -> anyhow::Result<reqwest::Client> {
-        let mut builder = self.cursor_client_builder(use_proxy, inference).await?;
+        let mut builder = self.redirectless_client_builder(use_proxy, inference).await?;
         if use_proxy
             && self
                 .storage
@@ -429,7 +382,7 @@ impl Gateway {
         builder.build().map_err(Into::into)
     }
 
-    async fn cursor_client_builder(
+    async fn redirectless_client_builder(
         &self,
         use_proxy: bool,
         inference: bool,

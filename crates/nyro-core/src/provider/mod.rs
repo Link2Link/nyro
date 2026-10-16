@@ -30,7 +30,6 @@ pub mod vendor_ext;
 pub mod anthropic;
 pub mod ark_coding;
 pub mod bailian;
-pub mod cursor;
 pub mod custom;
 pub mod deepseek;
 pub mod devin;

@@ -296,108 +296,6 @@ async fn exercise_failure_policy(
     Ok(())
 }
 
-async fn exercise_cursor_uniqueness(
-    oauth: &dyn OAuthCredentialStore,
-    first: &str,
-    second: &str,
-) -> anyhow::Result<()> {
-    for round in 0..12 {
-        let subject = format!("race-{}-{round}", uuid::Uuid::new_v4());
-        let barrier = tokio::sync::Barrier::new(2);
-        let (a, b) = tokio::join!(
-            async {
-                barrier.wait().await;
-                oauth
-                    .upsert(first, cursor_credential("first", &subject))
-                    .await
-            },
-            async {
-                barrier.wait().await;
-                oauth
-                    .upsert(second, cursor_credential("second", &subject))
-                    .await
-            }
-        );
-        assert_ne!(a.is_ok(), b.is_ok(), "exactly one concurrent bind must win");
-        let (winner, loser, error) = match (a, b) {
-            (Ok(_), Err(error)) => (first, second, error),
-            (Err(error), Ok(_)) => (second, first, error),
-            _ => unreachable!(),
-        };
-        assert!(
-            error.to_string().contains("cursor_account_already_bound"),
-            "{error:#}"
-        );
-        assert!(oauth.get(loser).await?.is_none());
-        let current = oauth
-            .upsert(winner, cursor_credential("same-provider", &subject))
-            .await?;
-        let lock = oauth
-            .try_begin_refresh(winner, current.status_version)
-            .await?
-            .unwrap();
-        assert!(
-            oauth
-                .complete_refresh(
-                    winner,
-                    lock.status_version,
-                    cursor_credential("wrong-subject", "other-account")
-                )
-                .await?
-                .is_none()
-        );
-        let current = oauth
-            .complete_refresh(
-                winner,
-                lock.status_version,
-                cursor_credential("refreshed", &subject),
-            )
-            .await?
-            .unwrap();
-        assert_eq!(current.access_token, "refreshed");
-        // Terminal/error rows still own an account until an explicit logout.
-        let lock = oauth
-            .try_begin_refresh(winner, current.status_version)
-            .await?
-            .unwrap();
-        assert!(
-            oauth
-                .fail_refresh_with_policy(
-                    winner,
-                    lock.status_version,
-                    "reauth_required",
-                    true,
-                    None
-                )
-                .await?
-        );
-        assert!(
-            oauth
-                .upsert(loser, cursor_credential("duplicate-error", &subject))
-                .await
-                .is_err()
-        );
-        oauth.delete(winner).await?;
-        assert!(oauth.get(winner).await?.is_none());
-        oauth
-            .upsert(loser, cursor_credential("released-account", &subject))
-            .await?;
-        oauth.delete(loser).await?;
-    }
-    // The rule is Cursor-only and applies only to nonempty subjects.
-    oauth.upsert(first, credential("old-driver-one")).await?;
-    oauth.upsert(second, credential("old-driver-two")).await?;
-    oauth
-        .upsert(first, cursor_credential("empty-one", ""))
-        .await?;
-    oauth
-        .upsert(second, cursor_credential("empty-two", ""))
-        .await?;
-    oauth.delete(first).await?;
-    oauth.delete(second).await?;
-    Ok(())
-}
-
 async fn exercise_concurrent_snapshots(
     oauth: &dyn OAuthCredentialStore,
     provider: &str,
@@ -582,38 +480,15 @@ async fn exercise_bind_compensation(
             .await?
     );
 
-    // A released previous account may now belong to someone else. Compensation
-    // must use the same atomic uniqueness guard as a new bind.
+    // Subjects are not globally unique. Compensation and a second bind may
+    // both succeed; version fencing is what prevents a stale rollback.
     let published = oauth.upsert(first, published_input.clone()).await?;
     oauth.upsert(second, previous.clone()).await?;
-    let error = oauth
-        .restore_if_version(first, published.status_version, Some(previous.clone()))
-        .await
-        .unwrap_err();
-    assert!(error.to_string().contains("cursor_account_already_bound"));
-    assert_eq!(oauth.get(first).await?.unwrap().access_token, "published");
-    assert_eq!(
-        oauth.get(first).await?.unwrap().status_version,
-        published.status_version
+    assert!(
+        oauth
+            .restore_if_version(first, published.status_version, Some(previous.clone()))
+            .await?
     );
-    oauth.delete(second).await?;
-
-    // The subject check and restoration cannot race a second provider's bind.
-    let (restored, bound) = tokio::join!(
-        oauth.restore_if_version(first, published.status_version, Some(previous.clone())),
-        oauth.upsert(second, previous.clone()),
-    );
-    assert_ne!(
-        matches!(restored, Ok(true)),
-        bound.is_ok(),
-        "only one account claimant may win"
-    );
-    if let Err(error) = restored {
-        assert!(error.to_string().contains("cursor_account_already_bound"));
-    }
-    if let Err(error) = bound {
-        assert!(error.to_string().contains("cursor_account_already_bound"));
-    }
     oauth.delete(first).await?;
     oauth.delete(second).await?;
 
@@ -650,7 +525,6 @@ async fn exercise_contract(
     exercise_refresh_fences(oauth, first).await?;
     exercise_bind_compensation(oauth, first, second).await?;
     exercise_failure_policy(oauth, first).await?;
-    exercise_cursor_uniqueness(oauth, first, second).await?;
     exercise_concurrent_snapshots(oauth, first).await?;
     exercise_expiry_filter(oauth, first).await?;
     Ok(())
@@ -701,10 +575,10 @@ async fn assert_stale_recovery(
         0
     );
     let cursor_row = oauth.get(cursor).await?.unwrap();
-    assert_eq!(cursor_row.status, "error");
+    assert_eq!(cursor_row.status, "connected");
     assert_eq!(
         cursor_row.last_error.as_deref(),
-        Some(oauth::CURSOR_STALE_REFRESH_ERROR)
+        Some(oauth::STALE_REFRESH_ERROR)
     );
     assert_eq!(oauth.get(legacy).await?.unwrap().status, "connected");
     assert!(
@@ -799,7 +673,6 @@ async fn postgres_oauth_optional_disposable_database() -> anyhow::Result<()> {
     let first = create_test_provider(&storage).await?;
     let second = create_test_provider(&storage).await?;
     let result = async {
-        super::provider_endpoint_tests::exercise_native_cursor_endpoints(&storage).await?;
         exercise_contract(storage.oauth_credentials(), &first, &second).await?;
         prepare_stale_rows(storage.oauth_credentials(), &first, &second).await?;
         sqlx::query("UPDATE provider_oauth_credentials SET updated_at = '2000-01-01 00:00:00' WHERE provider_id IN ($1, $2)")
@@ -822,7 +695,6 @@ async fn mysql_oauth_optional_disposable_database() -> anyhow::Result<()> {
     let first = create_test_provider(&storage).await?;
     let second = create_test_provider(&storage).await?;
     let result = async {
-        super::provider_endpoint_tests::exercise_native_cursor_endpoints(&storage).await?;
         exercise_contract(storage.oauth_credentials(), &first, &second).await?;
         prepare_stale_rows(storage.oauth_credentials(), &first, &second).await?;
         sqlx::query("UPDATE provider_oauth_credentials SET updated_at = '2000-01-01 00:00:00' WHERE provider_id IN (?, ?)")

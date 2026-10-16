@@ -1,6 +1,4 @@
 mod claude;
-pub mod cursor;
-pub use cursor::CursorAuthDriver;
 pub(crate) mod codex_version;
 mod devin;
 pub use devin::DevinAuthDriver;

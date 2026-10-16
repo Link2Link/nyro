@@ -51,6 +51,118 @@ type UpstreamByteStream = Pin<
     Box<dyn Stream<Item = Result<Bytes, crate::proxy::client::UpstreamReadError>> + Send + 'static>,
 >;
 
+/// Only locally observed transport failure BEFORE committing a complete SSE
+/// event can authorize a replay. Never infer this proof from an HTTP status or
+/// an upstream error body.
+#[derive(Clone, Copy)]
+struct UncommittedStreamReadFailure;
+
+pub(super) fn can_retry_stream_start(
+    provider: &crate::db::models::Provider,
+    prepared: &PreparedRequest,
+    raw_body: Option<&[u8]>,
+) -> bool {
+    if !provider
+        .vendor
+        .as_deref()
+        .is_some_and(|v| v.eq_ignore_ascii_case("xai"))
+        || !provider
+            .channel
+            .as_deref()
+            .is_some_and(|v| v.eq_ignore_ascii_case("grok"))
+        || !matches!(
+            prepared.session.profile.direction,
+            Direction::XaiResponsesNative
+        )
+        || !prepared.session.profile.client_stream
+    {
+        return false;
+    }
+    // Sanitization can remove unsupported server tools. Eligibility must use
+    // both the client wire and the prepared upstream wire, never the latter alone.
+    raw_body.is_some_and(stateless_stream_body) && stateless_stream_body(&prepared.body)
+}
+
+fn stateless_stream_body(raw: &[u8]) -> bool {
+    let Ok(body) = serde_json::from_slice::<Value>(raw) else {
+        return false;
+    };
+    // This is a new generation, not a connection retry: the upstream may have
+    // processed the request. Opt in only for explicitly stateless inline
+    // histories without server-executed tools or background/conversation state.
+    body.get("stream") == Some(&Value::Bool(true))
+        && body.get("store") == Some(&Value::Bool(false))
+        && body
+            .get("background")
+            .is_none_or(|v| v == &Value::Bool(false))
+        && ["previous_response_id", "conversation", "conversation_id"]
+            .iter()
+            .all(|key| body.get(*key).is_none_or(Value::is_null))
+        && body.get("input").is_some_and(|input| {
+            input.is_string()
+                || input.as_array().is_some_and(|items| {
+                    items
+                        .iter()
+                        .all(|item| match item.get("type").and_then(Value::as_str) {
+                            Some(
+                                "message"
+                                | "reasoning"
+                                | "function_call"
+                                | "function_call_output"
+                                | "custom_tool_call"
+                                | "custom_tool_call_output",
+                            ) => true,
+                            None => {
+                                item.get("role").is_some_and(Value::is_string)
+                                    && item.get("content").is_some()
+                            }
+                            // References, server-tool continuations and unknown
+                            // items are not proven to be self-contained history.
+                            _ => false,
+                        })
+                })
+        })
+        && body.get("tools").is_none_or(|tools| {
+            tools.as_array().is_some_and(|tools| {
+                tools.iter().all(|tool| {
+                    matches!(
+                        tool.get("type").and_then(Value::as_str),
+                        Some("function" | "custom")
+                    )
+                })
+            })
+        })
+}
+
+pub(super) fn should_retry_stream_start(
+    response: &Response,
+    already_retried: bool,
+    ctx: &RequestContext,
+) -> bool {
+    !already_retried
+        && !ctx.cancellation.is_cancelled()
+        && !ctx.deadline.remaining().is_zero()
+        && response
+            .extensions()
+            .get::<UncommittedStreamReadFailure>()
+            .is_some()
+}
+
+/// The original-wire observer sees transport failures before converters can
+/// erase their type into io::Error/string. Keep that authoritative category on
+/// the public wire, while genuine conversion failures retain their own kind.
+fn stream_failure_kind(performance: Option<&crate::performance::Attempt>) -> &'static str {
+    match performance
+        .map(|p| p.diagnostic())
+        .as_ref()
+        .and_then(|d| d.failure_kind.as_deref())
+    {
+        Some("upstream_read_error") => "upstream_read_error",
+        Some("timeout") => "timeout",
+        _ => "conversion_stream_error",
+    }
+}
+
 pub(super) fn normalize_compat_request_headers(
     headers: &mut ReqwestHeaderMap,
     selection: &crate::conversion::RawWireCompatSelection,
@@ -186,6 +298,7 @@ pub(super) async fn handle_compat(
     req_ctx: &mut RequestContext,
     req_ir: &mut AiRequest,
     host: &crate::plugin::phase::HostContext<'_>,
+    original_body: Option<&[u8]>,
     health_permit: HealthPermit,
 ) -> CompatAttempt {
     let log = LogBuilder::from_ctx(call_ctx)
@@ -285,6 +398,7 @@ pub(super) async fn handle_compat(
         response,
         req_ctx,
         upstream_start,
+        call_ctx.gw.config.upstream_timeouts.first_byte,
     )
     .await
     {
@@ -300,30 +414,92 @@ pub(super) async fn handle_compat(
                     "Request total deadline exceeded during stream priming.",
                 );
             }
-            let log = log.failure("conversion_error", "response_conversion", &error);
+            let (kind, stage) = error.kind_and_stage();
+            if let Some(p) = &log.performance {
+                p.record_failure(
+                    match kind {
+                        "timeout" => "timed_out",
+                        "client_cancelled" => "cancelled",
+                        _ => "failed",
+                    },
+                    kind,
+                    stage,
+                    &error,
+                );
+            }
+            let upstream_status = status;
             let status = error.http_status();
-            let message = error.to_string();
-            let response = codex_compat_error_response(
-                &prepared.session,
-                call_ctx,
-                req_extras,
-                status,
-                &message,
-            );
+            let (mut response, body) = if matches!(&error, PrimeError::Conversion(_)) {
+                let message = error.to_string();
+                (
+                    codex_compat_error_response(
+                        &prepared.session,
+                        call_ctx,
+                        req_extras,
+                        status,
+                        &message,
+                    ),
+                    proxy_error_body(&message),
+                )
+            } else {
+                // Keep source chains/URLs private; the typed failure and request
+                // id are enough for clients to classify and correlate a retry.
+                let body = serde_json::json!({"error": {
+                    "type": kind, "failure_kind": kind, "code": status,
+                    "message": match kind {
+                        "timeout" => "The upstream response timed out.",
+                        "client_cancelled" => "The request was cancelled.",
+                        _ => "The upstream response could not be completed.",
+                    },
+                    "request_id": req_ctx.request_id,
+                }, "request_id": req_ctx.request_id})
+                .to_string();
+                (
+                    build_compat_response(
+                        ResponseMetadata::new(status).rebuilt("application/json"),
+                        Body::from(body.clone()),
+                    ),
+                    body,
+                )
+            };
+            if matches!(&error, PrimeError::Read(error) if !error.is_timeout()) {
+                response
+                    .extensions_mut()
+                    .insert(UncommittedStreamReadFailure);
+            }
+            let cancelled = matches!(&error, PrimeError::Cancelled);
+            // A failed pre-commit read can still follow upstream execution.
+            // Stateful/native server-tool requests must not be replayed via
+            // another route target either, not just the same-target fast retry.
+            let unsafe_native_replay = matches!(&error, PrimeError::Read(_))
+                && matches!(
+                    prepared.session.profile.direction,
+                    Direction::XaiResponsesNative
+                )
+                && !(original_body.is_some_and(stateless_stream_body)
+                    && stateless_stream_body(&prepared.body));
             log.status(status)
                 .with_upstream_request(upstream_req_headers, upstream_req_body)
                 .with_upstream_response(
-                    200,
+                    upstream_status as i32,
                     upstream_headers,
                     None,
                     Some(upstream_start.elapsed().as_millis() as i64),
                 )
-                .resp_body(Some(proxy_error_body(&message)))
+                .resp_body(Some(body))
                 .emit();
             return CompatAttempt {
                 response,
-                retry: RetryDisposition::ForceRetry,
-                health: HealthOutcome::Failure,
+                retry: if cancelled || unsafe_native_replay {
+                    RetryDisposition::Never
+                } else {
+                    RetryDisposition::ForceRetry
+                },
+                health: if cancelled {
+                    HealthOutcome::Neutral
+                } else {
+                    HealthOutcome::Failure
+                },
             };
         }
     };
@@ -673,13 +849,60 @@ struct PrimedStream {
     first_chunk_ms: Option<i64>,
 }
 
+#[derive(Debug, thiserror::Error)]
+enum PrimeError {
+    #[error(transparent)]
+    Read(#[from] crate::proxy::client::UpstreamReadError),
+    #[error(transparent)]
+    Conversion(#[from] CompatError),
+    #[error("upstream stream timed out before a complete event")]
+    Deadline,
+    #[error("upstream first-event deadline exceeded")]
+    FirstEventTimeout,
+    #[error("client cancelled before a complete upstream event")]
+    Cancelled,
+    #[error("upstream stream exceeded the pre-commit buffer limit")]
+    BufferLimit,
+}
+
+impl PrimeError {
+    fn kind_and_stage(&self) -> (&'static str, &'static str) {
+        match self {
+            Self::Read(error) => (
+                if error.is_timeout() {
+                    "timeout"
+                } else {
+                    "upstream_read_error"
+                },
+                error.stage(),
+            ),
+            Self::Deadline => ("timeout", "request_deadline"),
+            Self::FirstEventTimeout => ("timeout", "upstream_first_byte"),
+            Self::Cancelled => ("client_cancelled", "client_delivery"),
+            Self::BufferLimit => ("upstream_protocol_error", "upstream_read"),
+            Self::Conversion(_) => ("conversion_error", "response_conversion"),
+        }
+    }
+
+    fn http_status(&self) -> u16 {
+        match self {
+            Self::Read(error) if error.is_timeout() => 504,
+            Self::Read(_) | Self::BufferLimit => 502,
+            Self::Deadline | Self::FirstEventTimeout => 504,
+            Self::Cancelled => 499,
+            Self::Conversion(error) => error.http_status(),
+        }
+    }
+}
+
 async fn prime_stream(
     engine: &CompatEngine,
     session: &ConversionSession,
     response: crate::proxy::client::ObservedResponse,
     req_ctx: &RequestContext,
     started_at: std::time::Instant,
-) -> Result<PrimedStream, CompatError> {
+    first_event_timeout: std::time::Duration,
+) -> Result<PrimedStream, PrimeError> {
     const MAX_PRIME_BYTES: usize = 256 * 1024;
 
     let status = response.status().as_u16();
@@ -688,19 +911,38 @@ async fn prime_stream(
     let mut replay = Vec::new();
     let mut buffered = Vec::new();
     let mut first_chunk_ms = None;
+    let strict_framing = matches!(session.profile.direction, Direction::XaiResponsesNative);
+    // Native Responses heartbeats/partial bytes must not keep pre-commit
+    // buffering alive indefinitely. Reuse the configured first-byte budget as
+    // a first-complete-event wall-clock cap after headers, without changing the
+    // existing heartbeat behavior of other conversion directions.
+    let probe_started = tokio::time::Instant::now();
 
     loop {
         let remaining = req_ctx.deadline.remaining();
         if remaining.is_zero() {
-            return Err(CompatError::Stream(
-                "upstream stream timed out before producing output".to_string(),
-            ));
+            return Err(PrimeError::Deadline);
         }
-        let next = tokio::time::timeout(remaining, stream.next())
-            .await
-            .map_err(|_| {
-                CompatError::Stream("upstream stream timed out before producing output".to_string())
-            })?;
+        let probe_remaining = if strict_framing {
+            first_event_timeout.saturating_sub(probe_started.elapsed())
+        } else {
+            remaining
+        };
+        let probe_expires_first = strict_framing && probe_remaining < remaining;
+        if probe_expires_first && probe_remaining.is_zero() {
+            return Err(PrimeError::FirstEventTimeout);
+        }
+        let next = tokio::select! {
+            biased;
+            _ = req_ctx.cancellation.cancelled() => return Err(PrimeError::Cancelled),
+            result = tokio::time::timeout(remaining.min(probe_remaining), stream.next()) => {
+                result.map_err(|_| if probe_expires_first {
+                    PrimeError::FirstEventTimeout
+                } else {
+                    PrimeError::Deadline
+                })?
+            }
+        };
         let Some(item) = next else {
             return match engine.inspect_stream_end(session, &buffered) {
                 StreamStartDecision::Ready => {
@@ -711,25 +953,42 @@ async fn prime_stream(
                         first_chunk_ms,
                     })
                 }
-                StreamStartDecision::Failed(message) => Err(CompatError::Stream(message)),
+                StreamStartDecision::Failed(message) => Err(CompatError::Stream(message).into()),
                 StreamStartDecision::Pending => Err(CompatError::Stream(
                     "upstream stream ended before producing output".to_string(),
-                )),
+                )
+                .into()),
             };
         };
-        let chunk = item.map_err(|error| CompatError::Stream(error.to_string()))?;
+        let chunk = item?;
+        if chunk.is_empty() {
+            continue;
+        }
         if first_chunk_ms.is_none() {
             first_chunk_ms = Some(started_at.elapsed().as_millis() as i64);
         }
-        buffered.extend_from_slice(&chunk);
+        let inspect_len = if strict_framing {
+            chunk
+                .len()
+                .min(MAX_PRIME_BYTES.saturating_sub(buffered.len()))
+        } else {
+            chunk.len()
+        };
+        buffered.extend_from_slice(&chunk[..inspect_len]);
         replay.push(chunk);
 
         match engine.inspect_stream_start(session, &buffered) {
             StreamStartDecision::Ready => break,
-            StreamStartDecision::Failed(message) => return Err(CompatError::Stream(message)),
+            StreamStartDecision::Failed(message) => return Err(CompatError::Stream(message).into()),
             StreamStartDecision::Pending => {}
         }
         if buffered.len() >= MAX_PRIME_BYTES {
+            // Never turn an incomplete native Responses frame into Ready just
+            // because the probe budget ran out. Fail closed without replaying
+            // this non-transport failure on the same target.
+            if strict_framing {
+                return Err(PrimeError::BufferLimit);
+            }
             break;
         }
     }
@@ -847,18 +1106,16 @@ fn build_streaming_compat_response(
             let bytes = match item {
                 Ok(bytes) => bytes,
                 Err(error) => {
-                    if let Some(p) = &log.performance {
-                        p.record_failure(
-                            "failed",
-                            "conversion_stream_error",
-                            "response_conversion",
-                            &error,
-                        );
+                    let kind = stream_failure_kind(log.performance.as_ref());
+                    if kind == "conversion_stream_error"
+                        && let Some(p) = &log.performance
+                    {
+                        p.record_failure("failed", kind, "response_conversion", &error);
                     }
                     let event = super::stream_error_event(
                         client_protocol,
                         &request_context.request_id,
-                        "conversion_stream_error",
+                        kind,
                     );
                     if tx.send(Ok(Bytes::from(event))).await.is_ok()
                         && let Some(p) = &log.performance
@@ -1311,6 +1568,87 @@ mod tests {
     use super::*;
     use crate::protocol::ir::request::{Message, MessageContent, Role};
     use crate::proxy::context::RequestOutcome;
+
+    #[test]
+    fn stateless_replay_rejects_server_state_and_unknown_input() {
+        let baseline = json!({"stream":true,"store":false,"input":[
+            {"role":"user","content":"hello"},
+            {"type":"function_call","call_id":"call_fixture","name":"lookup","arguments":"{}"},
+            {"type":"function_call_output","call_id":"call_fixture","output":"ok"}
+        ],"tools":[{"type":"function","name":"lookup"}]});
+        let safe = |body: &Value| stateless_stream_body(&serde_json::to_vec(body).unwrap());
+        assert!(safe(&baseline));
+        for item in [
+            json!({"id":"msg_reference"}),
+            json!({"type":"item_reference","id":"msg_reference"}),
+            json!({"type":"mcp_approval_response","approval_request_id":"approval_fixture"}),
+            json!({"type":"future_unknown_item"}),
+        ] {
+            let mut body = baseline.clone();
+            body["input"] = json!([item]);
+            assert!(!safe(&body), "unsafe input: {body}");
+        }
+        for (key, value) in [
+            ("store", json!(true)),
+            ("background", json!(true)),
+            ("previous_response_id", json!("resp_prior")),
+            ("conversation", json!("conv_fixture")),
+            ("tools", json!([{"type":"web_search_preview"}])),
+        ] {
+            let mut body = baseline.clone();
+            body[key] = value;
+            assert!(!safe(&body), "unsafe field: {key}");
+        }
+        let mut body = baseline;
+        body.as_object_mut().unwrap().remove("store");
+        assert!(!safe(&body));
+    }
+
+    #[test]
+    fn transport_replay_requires_local_proof_and_live_budget() {
+        use crate::proxy::context::Deadline;
+        use std::time::Duration;
+        let mut ctx = RequestContext::new(OPENAI_RESPONSES_V1, Duration::from_secs(30));
+        let mut response = error_response(502, "upstream_read_error");
+        assert!(!should_retry_stream_start(&response, false, &ctx));
+        response
+            .extensions_mut()
+            .insert(UncommittedStreamReadFailure);
+        assert!(should_retry_stream_start(&response, false, &ctx));
+        assert!(!should_retry_stream_start(&response, true, &ctx));
+        ctx.deadline = Deadline::from_now(Duration::ZERO);
+        assert!(!should_retry_stream_start(&response, false, &ctx));
+        ctx.deadline = Deadline::never();
+        ctx.cancellation.cancel();
+        assert!(!should_retry_stream_start(&response, false, &ctx));
+    }
+
+    #[test]
+    fn converted_stream_error_preserves_authoritative_read_failure() {
+        assert_eq!(stream_failure_kind(None), "conversion_stream_error");
+        let (tx, _rx) = tokio::sync::mpsc::channel(4);
+        let ctx = RequestContext::without_total_timeout(OPENAI_RESPONSES_V1);
+        let attempt = crate::performance::Attempt::new(tx, ctx.cancellation, ctx.deadline);
+        assert_eq!(
+            stream_failure_kind(Some(&attempt)),
+            "conversion_stream_error"
+        );
+        attempt.record_message(
+            "failed",
+            "upstream_read_error",
+            "upstream_read",
+            "private source",
+        );
+        assert_eq!(stream_failure_kind(Some(&attempt)), "upstream_read_error");
+        // Converter wrapping cannot replace the first confirmed transport error.
+        attempt.record_message(
+            "failed",
+            "conversion_stream_error",
+            "response_conversion",
+            "wrapped",
+        );
+        assert_eq!(stream_failure_kind(Some(&attempt)), "upstream_read_error");
+    }
 
     #[test]
     fn cancelled_stream_is_neutral_for_provider_health() {
@@ -1771,6 +2109,7 @@ mod tests {
             &mut req_ctx,
             &mut req_ir,
             &host,
+            None,
             gw.health_registry.try_acquire("compat-test").unwrap(),
         )
         .await;
@@ -1858,6 +2197,7 @@ mod tests {
             &mut req_ctx,
             &mut req_ir,
             &host,
+            None,
             gw.health_registry.try_acquire("compat-test").unwrap(),
         )
         .await;
@@ -1923,6 +2263,7 @@ mod tests {
             &mut req_ctx,
             &mut req_ir,
             &host,
+            None,
             gw.health_registry.try_acquire("compat-test").unwrap(),
         )
         .await;
@@ -1988,6 +2329,7 @@ mod tests {
             &mut req_ctx,
             &mut req_ir,
             &host,
+            None,
             gw.health_registry.try_acquire("compat-test").unwrap(),
         )
         .await;
@@ -2051,6 +2393,7 @@ mod tests {
             &mut req_ctx,
             &mut req_ir,
             &host,
+            None,
             gw.health_registry.try_acquire("compat-test").unwrap(),
         )
         .await;
@@ -2110,6 +2453,7 @@ mod tests {
             &mut req_ctx,
             &mut req_ir,
             &host,
+            None,
             gw.health_registry.try_acquire("compat-test").unwrap(),
         )
         .await;
@@ -2168,6 +2512,7 @@ mod tests {
             &mut req_ctx,
             &mut req_ir,
             &host,
+            None,
             gw.health_registry.try_acquire("compat-test").unwrap(),
         )
         .await;
@@ -2244,6 +2589,7 @@ mod tests {
             &mut req_ctx,
             &mut req_ir,
             &host,
+            None,
             gw.health_registry.try_acquire("compat-test").unwrap(),
         )
         .await;
@@ -2308,6 +2654,7 @@ mod tests {
             &mut req_ctx,
             &mut req_ir,
             &host,
+            None,
             gw.health_registry.try_acquire(health_key).unwrap(),
         )
         .await;
@@ -2371,6 +2718,7 @@ mod tests {
             &mut req_ctx,
             &mut req_ir,
             &host,
+            None,
             gw.health_registry.try_acquire(health_key).unwrap(),
         )
         .await;
@@ -3190,6 +3538,7 @@ mod tests {
             &mut req_ctx,
             &mut req_ir,
             &host,
+            None,
             gw.health_registry.try_acquire("compat-test").unwrap(),
         )
         .await;
@@ -3243,6 +3592,7 @@ mod tests {
             &mut req_ctx,
             &mut req_ir,
             &host,
+            None,
             gw.health_registry.try_acquire("compat-test").unwrap(),
         )
         .await;
@@ -3293,6 +3643,7 @@ mod tests {
             &mut req_ctx,
             &mut req_ir,
             &host,
+            None,
             gw.health_registry.try_acquire("compat-test").unwrap(),
         )
         .await;
@@ -3352,6 +3703,7 @@ mod tests {
             &mut req_ctx,
             &mut req_ir,
             &host,
+            None,
             gw.health_registry.try_acquire("compat-test").unwrap(),
         )
         .await;
@@ -3429,6 +3781,7 @@ mod tests {
             &mut req_ctx,
             &mut req_ir,
             &host,
+            None,
             gw.health_registry.try_acquire("compat-test").unwrap(),
         )
         .await;
@@ -3485,6 +3838,7 @@ mod tests {
             &mut req_ctx,
             &mut req_ir,
             &host,
+            None,
             gw.health_registry.try_acquire("compat-test").unwrap(),
         )
         .await;

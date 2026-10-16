@@ -492,7 +492,6 @@ export type ProviderProtocol =
   | "openai-responses"
   | "anthropic-messages"
   | "google-gemini"
-  | "cursor-agent/run/v1"
   | "devin-chat/get-chat-message/v1";
 
 export type ProviderProtocolMode = "fixed" | "adaptive";

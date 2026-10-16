@@ -557,6 +557,9 @@ impl CompatEngine {
         session: &ConversionSession,
         buffered: &[u8],
     ) -> StreamStartDecision {
+        if matches!(session.profile.direction, Direction::XaiResponsesNative) {
+            return inspect_native_responses_stream_start(buffered, false);
+        }
         if !matches!(session.profile.direction, Direction::AnthropicToResponses) {
             return if buffered.is_empty() {
                 StreamStartDecision::Pending
@@ -573,6 +576,9 @@ impl CompatEngine {
         session: &ConversionSession,
         buffered: &[u8],
     ) -> StreamStartDecision {
+        if matches!(session.profile.direction, Direction::XaiResponsesNative) {
+            return inspect_native_responses_stream_start(buffered, true);
+        }
         if !matches!(session.profile.direction, Direction::AnthropicToResponses) {
             return if buffered.is_empty() {
                 StreamStartDecision::Failed(
@@ -809,6 +815,82 @@ fn responses_error_envelope_message(body: &[u8]) -> Option<String> {
             _ => "response generation failed",
         });
     Some(format!("{error_type}: {message}"))
+}
+
+/// Native Responses commits on framing/JSON validity, not model output. In
+/// particular, response.created is enough, and complete error/terminal events
+/// must remain available to the native client rather than become local errors.
+fn inspect_native_responses_stream_start(buffered: &[u8], eof: bool) -> StreamStartDecision {
+    // The caller supplies accumulated raw bytes. Decode only the valid prefix:
+    // a trailing split UTF-8 character must not invalidate an earlier complete
+    // event or be lossily replaced inside an incomplete one.
+    let (text, invalid_utf8) = match std::str::from_utf8(buffered) {
+        Ok(text) => (text, false),
+        Err(error) => (
+            std::str::from_utf8(&buffered[..error.valid_up_to()])
+                .expect("valid_up_to is a valid UTF-8 prefix"),
+            error.error_len().is_some(),
+        ),
+    };
+    let mut blocks = text.trim_start_matches('\u{feff}').to_string();
+    while let Some(block) = take_sse_block(&mut blocks) {
+        let mut named_event = None;
+        let mut data_lines = Vec::new();
+        for line in block.lines() {
+            if let Some(event) = strip_sse_field(line, "event") {
+                named_event = Some(event.trim());
+            } else if let Some(data) =
+                strip_sse_field(line, "data").or_else(|| (line == "data").then_some(""))
+            {
+                data_lines.push(data);
+            }
+        }
+        if data_lines.is_empty() {
+            // Comments, keepalives and id/retry-only frames are not data events.
+            continue;
+        }
+        let data = data_lines.join("\n");
+        if data.trim() == "[DONE]" {
+            return StreamStartDecision::Ready;
+        }
+        let value: Value = match serde_json::from_str(&data) {
+            Ok(value) => value,
+            Err(error) => {
+                return StreamStartDecision::Failed(format!(
+                    "Native Responses stream contains invalid JSON in a complete SSE data event: {error}"
+                ));
+            }
+        };
+        let event_type = value.get("type").and_then(Value::as_str);
+        let named_event = named_event.filter(|event| !event.is_empty());
+        let is_keepalive =
+            |event| matches!(event, "ping" | "keepalive" | "keep-alive" | "heartbeat");
+        // Ignore only unambiguous heartbeats. A response/error payload or an
+        // explicit non-heartbeat event must still reach the native client.
+        if (named_event.is_some() || event_type.is_some())
+            && named_event.is_none_or(is_keepalive)
+            && event_type.is_none_or(is_keepalive)
+            && value.get("error").is_none_or(Value::is_null)
+            && value.get("response").is_none()
+        {
+            continue;
+        }
+        return StreamStartDecision::Ready;
+    }
+    if invalid_utf8 {
+        return StreamStartDecision::Failed(
+            "Native Responses stream contains invalid UTF-8 before its first data event"
+                .to_string(),
+        );
+    }
+    if eof {
+        // Do not flush the tail as an event: even valid JSON without the SSE
+        // delimiter is incomplete. This is a clean EOF, not a transport error.
+        return StreamStartDecision::Failed(
+            "Native Responses stream ended before a complete SSE data event".to_string(),
+        );
+    }
+    StreamStartDecision::Pending
 }
 
 fn inspect_responses_stream_start(buffered: &[u8], eof: bool) -> StreamStartDecision {
@@ -1872,6 +1954,263 @@ mod tests {
             engine.inspect_stream_start(&session, delta.as_bytes()),
             StreamStartDecision::Ready
         ));
+    }
+
+    fn stream_inspection_session(profile: ConversionProfile) -> ConversionSession {
+        ConversionSession::new(
+            profile,
+            SessionIdentity::generated("stream-start-test"),
+            Default::default(),
+            Default::default(),
+            Default::default(),
+            Default::default(),
+        )
+    }
+
+    #[test]
+    fn native_responses_stream_start_ignores_keepalives_until_a_data_event() {
+        let engine = CompatEngine::default();
+        // Both native flavors share this direction and framing contract.
+        for profile in [
+            ConversionProfile::xai_responses_native(true),
+            ConversionProfile::third_party_responses_native(true),
+        ] {
+            let session = stream_inspection_session(profile);
+            let mut buffered = Vec::new();
+            for keepalive in [
+                "",
+                ": keepalive\n\n",
+                "id: 1\nretry: 1000\n\n",
+                "event: ping\n\n",
+                "event: ping\ndata: {}\n\n",
+                "data: {\"type\":\"keepalive\"}\n\n",
+                "data: {\"type\":\"keep-alive\"}\n\n",
+                "data: {\"type\":\"heartbeat\"}\n\n",
+            ] {
+                buffered.extend_from_slice(keepalive.as_bytes());
+                assert_eq!(
+                    engine.inspect_stream_start(&session, &buffered),
+                    StreamStartDecision::Pending,
+                    "{keepalive:?}"
+                );
+                assert!(matches!(
+                    engine.inspect_stream_end(&session, &buffered),
+                    StreamStartDecision::Failed(_)
+                ));
+            }
+            buffered.extend_from_slice(b"data: {\"type\":\"response.created\"}\n\n");
+            assert_eq!(
+                engine.inspect_stream_start(&session, &buffered),
+                StreamStartDecision::Ready
+            );
+        }
+    }
+
+    #[test]
+    fn native_responses_stream_start_waits_for_crlf_multiline_utf8_event() {
+        let engine = CompatEngine::default();
+        let session = stream_inspection_session(ConversionProfile::xai_responses_native(true));
+        let event = concat!(
+            "\u{feff}event: response.created\r\n",
+            "data:{\"type\":\"response.created\",\r\n",
+            "data: \"response\":{\"id\":\"resp_你好😀\",\"output\":[]}}\r\n\r\n"
+        );
+        // Every byte boundary includes splits inside CRLF, JSON and UTF-8.
+        for end in 0..event.len() {
+            assert_eq!(
+                engine.inspect_stream_start(&session, &event.as_bytes()[..end]),
+                StreamStartDecision::Pending,
+                "split at byte {end}"
+            );
+        }
+        assert_eq!(
+            engine.inspect_stream_start(&session, event.as_bytes()),
+            StreamStartDecision::Ready
+        );
+        // A partial next event/UTF-8 character does not delay the first event.
+        let mut buffered = event.as_bytes().to_vec();
+        buffered.extend_from_slice(b"data: {\"delta\":\"\xe4");
+        assert_eq!(
+            engine.inspect_stream_start(&session, &buffered),
+            StreamStartDecision::Ready
+        );
+    }
+
+    #[test]
+    fn native_responses_stream_start_holds_long_created_truncated_at_8186_bytes() {
+        let engine = CompatEngine::default();
+        let session = stream_inspection_session(ConversionProfile::xai_responses_native(true));
+        let value = serde_json::json!({
+            "type": "response.created",
+            "response": {"id": "resp_synthetic", "instructions": "x".repeat(16_384), "output": []}
+        });
+        let event = format!("event: response.created\ndata: {value}\n\n");
+        let first_chunk = &event.as_bytes()[..8186];
+        assert_eq!(first_chunk.len(), 8186);
+        assert_eq!(
+            engine.inspect_stream_start(&session, first_chunk),
+            StreamStartDecision::Pending
+        );
+        // A subsequent transport error remains the caller's error. Only clean
+        // EOF invokes inspect_stream_end and receives this framing diagnosis.
+        assert!(matches!(
+            engine.inspect_stream_end(&session, first_chunk),
+            StreamStartDecision::Failed(message)
+                if message.contains("ended before a complete SSE data event")
+        ));
+        let mut buffered = first_chunk.to_vec();
+        buffered.extend_from_slice(&event.as_bytes()[8186..]);
+        assert_eq!(
+            engine.inspect_stream_start(&session, &buffered),
+            StreamStartDecision::Ready
+        );
+        assert_eq!(
+            engine.inspect_stream_end(&session, &buffered),
+            StreamStartDecision::Ready
+        );
+    }
+
+    #[test]
+    fn native_responses_stream_start_rejects_invalid_complete_data() {
+        let engine = CompatEngine::default();
+        let session = stream_inspection_session(ConversionProfile::xai_responses_native(true));
+        for event in [
+            "data: not-json\n\n",
+            "event: response.created\ndata: {\"type\":\"response.created\"\n\n",
+            "data:\n\n",
+            "data\n\n",
+            "event: ping\ndata: not-json\n\n",
+        ] {
+            assert!(matches!(
+                engine.inspect_stream_start(&session, event.as_bytes()),
+                StreamStartDecision::Failed(message) if message.contains("invalid JSON")
+            ));
+            assert!(matches!(
+                engine.inspect_stream_end(&session, event.as_bytes()),
+                StreamStartDecision::Failed(message) if message.contains("invalid JSON")
+            ));
+        }
+        // Do not use lossy UTF-8 to turn corrupt JSON string bytes into Ready.
+        assert!(matches!(
+            engine.inspect_stream_start(&session, b"data: {\"id\":\"\xff\"}\n\n"),
+            StreamStartDecision::Failed(message) if message.contains("invalid UTF-8")
+        ));
+    }
+
+    #[test]
+    fn native_responses_stream_end_does_not_flush_an_unterminated_event() {
+        let engine = CompatEngine::default();
+        let session = stream_inspection_session(ConversionProfile::xai_responses_native(true));
+        for tail in [
+            "data: {\"type\":\"response.created\"}",
+            "data: {\"type\":\"response.created\"}\n",
+            "data: {\"type\":\"response.created\"}\r\n\r",
+            "data: [DONE]\n",
+            "event: error\ndata: {\"type\":\"error\",\"message\":\"busy\"}\n",
+            "{\"type\":\"response.created\"}",
+        ] {
+            let buffered = format!(": keepalive\n\n{tail}");
+            assert_eq!(
+                engine.inspect_stream_start(&session, buffered.as_bytes()),
+                StreamStartDecision::Pending,
+                "{tail:?}"
+            );
+            assert!(matches!(
+                engine.inspect_stream_end(&session, buffered.as_bytes()),
+                StreamStartDecision::Failed(message)
+                    if message.contains("ended before a complete SSE data event")
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn native_responses_stream_start_preserves_complete_terminal_and_error_events() {
+        let engine = CompatEngine::default();
+        let session = stream_inspection_session(ConversionProfile::xai_responses_native(true));
+        for event in [
+            "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[]}}\n\n",
+            "data: {\"type\":\"response.incomplete\",\"response\":{\"status\":\"incomplete\"}}\n\n",
+            "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"error\":{\"message\":\"busy\"}}}\n\n",
+            "event: error\ndata: {\"type\":\"error\",\"message\":\"busy\"}\n\n",
+            "event: ping\ndata: {\"type\":\"error\",\"message\":\"busy\"}\n\n",
+            "event: error\ndata: {\"type\":\"ping\",\"message\":\"busy\"}\n\n",
+            "event: ping\ndata: {\"type\":\"ping\",\"error\":{\"message\":\"busy\"}}\n\n",
+            "data: {\"error\":{\"message\":\"busy\"}}\n\n",
+            "data: [DONE]\n\n",
+        ] {
+            assert_eq!(
+                engine.inspect_stream_start(&session, event.as_bytes()),
+                StreamStartDecision::Ready,
+                "{event:?}"
+            );
+            assert_eq!(
+                engine.inspect_stream_end(&session, event.as_bytes()),
+                StreamStartDecision::Ready
+            );
+            let source = futures::stream::iter(vec![Ok::<_, std::io::Error>(
+                Bytes::copy_from_slice(event.as_bytes()),
+            )]);
+            let converted = engine
+                .convert_stream_response(&session, ResponseMetadata::new(200), source)
+                .unwrap();
+            let ResponseBody::Stream(stream) = converted.body else {
+                panic!("expected stream");
+            };
+            let output = stream.try_collect::<Vec<_>>().await.unwrap().concat();
+            assert_eq!(output, event.as_bytes());
+        }
+    }
+
+    #[test]
+    fn stream_start_other_directions_retain_existing_semantics() {
+        let engine = CompatEngine::default();
+        for profile in [
+            ConversionProfile::anthropic_to_chat(true),
+            ConversionProfile::anthropic_to_gemini(true),
+            ConversionProfile::anthropic_passthrough_normalized(true),
+            ConversionProfile::codex_responses_to_chat(true),
+            ConversionProfile::codex_responses_to_anthropic(true),
+        ] {
+            let session = stream_inspection_session(profile);
+            assert_eq!(
+                engine.inspect_stream_start(&session, b""),
+                StreamStartDecision::Pending
+            );
+            assert!(matches!(
+                engine.inspect_stream_end(&session, b""),
+                StreamStartDecision::Failed(_)
+            ));
+            assert_eq!(
+                engine.inspect_stream_start(&session, b"d"),
+                StreamStartDecision::Ready
+            );
+            assert_eq!(
+                engine.inspect_stream_end(&session, b"d"),
+                StreamStartDecision::Ready
+            );
+        }
+        let session = stream_inspection_session(ConversionProfile::anthropic_to_responses(
+            true,
+            UpstreamFlavor::StandardResponses,
+        ));
+        let created = b"data: {\"type\":\"response.created\"}\n\n";
+        assert_eq!(
+            engine.inspect_stream_start(&session, created),
+            StreamStartDecision::Pending
+        );
+        assert!(matches!(
+            engine.inspect_stream_end(&session, created),
+            StreamStartDecision::Failed(_)
+        ));
+        // Preserve Anthropic's existing lenient invalid-frame and EOF behavior.
+        assert_eq!(
+            engine.inspect_stream_start(&session, b"data: invalid\n\n"),
+            StreamStartDecision::Pending
+        );
+        assert_eq!(
+            engine.inspect_stream_end(&session, b"data: {\"type\":\"response.completed\"}"),
+            StreamStartDecision::Ready
+        );
     }
 
     #[tokio::test]

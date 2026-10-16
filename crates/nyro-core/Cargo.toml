@@ -25,7 +25,6 @@ tokio-stream = "0.1"
 futures = "0.3"
 bytes = "1"
 http-body = "1"
-http-body-util = "0.1"
 http = "1"
 prost = "0.13"
 prost-types = "0.13"
@@ -43,7 +42,6 @@ inventory = "0.3"
 gcp_auth = "0.12.6"
 
 [dev-dependencies]
-h2 = "0.4"
 tokio = { workspace = true, features = ["test-util"] }
 tempfile = "3"
 flate2 = "1"

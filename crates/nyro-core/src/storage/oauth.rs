@@ -2,8 +2,6 @@
 
 pub(super) const STALE_REFRESH_ERROR: &str =
     "refresh timeout: process did not complete within timeout";
-pub(super) const CURSOR_STALE_REFRESH_ERROR: &str =
-    "reauth_required: refresh outcome unknown after timeout";
 pub(super) const BIND_ATTEMPTS: usize = 4;
 
 pub(super) fn parse_timestamp(value: &str) -> Option<chrono::DateTime<chrono::Utc>> {

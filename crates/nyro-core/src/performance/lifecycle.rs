@@ -198,7 +198,7 @@ impl Attempt {
             s.sync_native_metadata();
         }
     }
-    /// Tag Devin observations without changing existing Cursor log semantics.
+    /// Tag Devin observations so usage provenance stays vendor-specific.
     pub fn configure_devin_stream(&self) {
         self.configure_native_stream();
         let mut state = self.0.lock().unwrap();
@@ -922,7 +922,7 @@ mod tests {
             "authorization",
             "Bearer private-credential".parse().unwrap(),
         );
-        headers.insert("x-cursor-token", "private-token".parse().unwrap());
+        headers.insert("x-session-token", "private-token".parse().unwrap());
         headers.insert("cookie", "private-cookie".parse().unwrap());
         headers.insert("content-type", "application/connect+proto".parse().unwrap());
         let binary = b"\xff\x00private-history";
@@ -1201,7 +1201,7 @@ mod tests {
             assert_eq!(log.usage.prompt_tokens, 12);
             assert_eq!(
                 log.diagnostic.payload_metadata["usage_provenance"],
-                provenance.metadata("cursor")
+                provenance.metadata("")
             );
             assert_eq!(
                 log.diagnostic.payload_metadata["usage_provenance"]["known_free"],

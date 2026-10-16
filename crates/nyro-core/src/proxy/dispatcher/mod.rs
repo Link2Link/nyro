@@ -645,7 +645,6 @@ async fn dispatch_pipeline_inner(
         .map(|target| TargetWithKey { target, key: None })
         .collect();
     let mut pending_key_siblings: usize = 0;
-    let mut cursor_auth_refreshed = std::collections::HashSet::new();
     while let Some(entry) = queue.pop_front() {
         let target = entry.target;
         let explicit_key = entry.key;
@@ -1033,11 +1032,7 @@ async fn dispatch_pipeline_inner(
             performance.correlate(&ctx.request_id, attempt_index);
             let producer = performance.producer();
             ctx.extensions.insert(performance.clone());
-            let native_client = if crate::provider::devin::is_devin(&provider) {
-                gw.devin_http_client(provider.use_proxy, true).await
-            } else {
-                gw.required_http2_client(provider.use_proxy).await
-            };
+            let native_client = gw.devin_http_client(provider.use_proxy, true).await;
             let client = match native_client {
                 Ok(client) => ProxyClient::new(client)
                     .with_timeouts(gw.config.upstream_timeouts)
@@ -1093,39 +1088,6 @@ async fn dispatch_pipeline_inner(
                     control.clone(),
                 )
                 .await;
-            if matches!(
-                &upstream,
-                Err(GatewayError::UpstreamStatus { status: 401, .. })
-            ) && adapter.vendor_id() == "cursor"
-                && control.rejected.load(std::sync::atomic::Ordering::Acquire)
-                && cursor_auth_refreshed.insert(provider.id.clone())
-                && !ctx.cancellation.is_cancelled()
-            {
-                performance.record_message(
-                    "failed",
-                    "upstream_auth_rejected",
-                    "upstream_headers",
-                    "Cursor rejected the credential before execution",
-                );
-                LogBuilder::from_ctx(&call_ctx)
-                    .status(401)
-                    .upstream_status(401)
-                    .emit();
-                producer.finish();
-                let admin = gw.admin();
-                let refreshed = tokio::select! {
-                    _ = ctx.cancellation.cancelled() => false,
-                    result = tokio::time::timeout(std::time::Duration::from_secs(30), admin.reconnect_provider_oauth(&provider.id)) => matches!(result, Ok(Ok(_))),
-                };
-                if refreshed {
-                    health_permit.neutral();
-                    queue.push_front(TargetWithKey {
-                        target: target.clone(),
-                        key: None,
-                    });
-                    continue;
-                }
-            }
             let attempt = match upstream {
                 Ok(upstream) => {
                     ir_response::handle_ir_response(
@@ -1461,12 +1423,16 @@ async fn dispatch_pipeline_inner(
             _ => unreachable!("PreparedConversion guarantees matching body/session variants"),
         };
 
-        // Replay only typed zero-output sampling failures, at most once per
-        // selected target/key. Do not rerun routing, hooks or request mutation:
-        // every attempt uses the same prepared business payload and identity,
-        // but receives independent decoder state, diagnostics and usage logs.
+        // Replay only locally proven pre-commit failures, at most once per
+        // selected target/key: zero-output sampling errors, or a transport read
+        // failure while probing a stateless Grok stream's first complete event.
+        // Never rerun routing/hooks/request mutation. Each attempt uses the same
+        // prepared payload and identity but independent diagnostics/usage logs.
         let mut prepared_compat = prepared_compat;
         let mut prepared_native_body = prepared_native_body;
+        let compat_replay_candidate = prepared_compat.as_ref().is_some_and(|prepared| {
+            compat::can_retry_stream_start(&provider, prepared, raw_body.as_deref())
+        });
         let replay_candidate = !uses_compat
             && ((is_stream && !native_response_passthrough)
                 || (!is_stream && upstream_forces_stream));
@@ -1518,7 +1484,12 @@ async fn dispatch_pipeline_inner(
             // `OnLog` runs once at the pipeline boundary (see `dispatch_pipeline`).
             // The handlers run the `OnResponse` phase: non-stream paths see a full
             // `AiResponse`, the streaming path is invoked per `AiStreamDelta`.
-            let attempt = if let Some(prepared) = prepared_compat.take() {
+            let compat_request = if compat_replay_candidate && !same_target_retried {
+                prepared_compat.as_ref().cloned()
+            } else {
+                prepared_compat.take()
+            };
+            let attempt = if let Some(prepared) = compat_request {
                 compat::handle_compat(
                     client,
                     &outbound.url,
@@ -1529,6 +1500,7 @@ async fn dispatch_pipeline_inner(
                     ctx,
                     &mut request_for_target,
                     host,
+                    raw_body.as_deref(),
                     health_permit.clone(),
                 )
                 .await
@@ -1612,8 +1584,11 @@ async fn dispatch_pipeline_inner(
 
             saw_zero_payload_malformed |=
                 replay_candidate && stream_probe::is_zero_payload_malformed(&response);
-            let replay = replay_candidate
-                && stream_probe::should_retry_same_target(&response, same_target_retried, ctx);
+            let compat_replay = compat_replay_candidate
+                && compat::should_retry_stream_start(&response, same_target_retried, ctx);
+            let replay = compat_replay
+                || (replay_candidate
+                    && stream_probe::should_retry_same_target(&response, same_target_retried, ctx));
             let status = response.status().as_u16();
             if status == 429 {
                 crate::admin::trigger_provider_usage_refresh(
@@ -1645,9 +1620,18 @@ async fn dispatch_pipeline_inner(
                 // In particular, settling a half-open permit as neutral here would
                 // reopen its circuit and prevent this one permitted replay.
                 same_target_retried = true;
+                let reason = if compat_replay {
+                    "upstream_read_error_before_first_event"
+                } else {
+                    "malformed_function_call"
+                };
                 ctx.trace(
                     "retry",
-                    "MALFORMED_FUNCTION_CALL without output; replaying the same target once",
+                    if compat_replay {
+                        "Grok transport read failed before a complete event; replaying the stateless request once"
+                    } else {
+                        "MALFORMED_FUNCTION_CALL without output; replaying the same target once"
+                    },
                 );
                 tracing::info!(
                     request_id = %ctx.request_id,
@@ -1656,7 +1640,7 @@ async fn dispatch_pipeline_inner(
                     provider_key_id = pool_key.as_ref().map(|key| key.id.as_str()),
                     model = %actual_model,
                     retry = 1,
-                    reason = "malformed_function_call",
+                    reason,
                     "retrying same target before any output"
                 );
                 drop(response);

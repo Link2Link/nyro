@@ -114,7 +114,7 @@ function balanceLabel(value: ModelBalance, isZh: boolean) {
 
 function hasProviderModelsEndpoint(provider?: Provider) {
   // Native catalogs are resolved server-side without a generic HTTP models URL.
-  return Boolean(provider?.models_source?.trim()) || provider?.vendor === "cursor" || provider?.vendor === "devin";
+  return Boolean(provider?.models_source?.trim()) || provider?.vendor === "devin";
 }
 
 function withCurrentModel(options: string[], current?: string) {

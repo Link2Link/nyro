@@ -15,8 +15,8 @@ pub(crate) enum NativeTerminalEvidence {
 impl NativeTerminalEvidence {
     fn reason(self) -> &'static str {
         match self {
-            Self::Completed => "cursor_turn_ended",
-            Self::ToolHandoff => "cursor_tool_handoff",
+            Self::Completed => "native_turn_ended",
+            Self::ToolHandoff => "native_tool_handoff",
         }
     }
 }
@@ -33,7 +33,7 @@ pub(crate) enum NativeUsageProvenance {
 impl NativeUsageProvenance {
     fn metadata(self, vendor: &str) -> Value {
         serde_json::json!({
-            "source": if vendor == "devin" { "devin_native" } else { "cursor_native" },
+            "source": if vendor == "devin" { "devin_native" } else { "native" },
             "status": match self {
                 Self::Unknown => "unknown",
                 Self::Partial => "partial",

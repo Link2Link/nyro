@@ -429,13 +429,13 @@ mod tests {
 
     #[test]
     fn vendor_streams_are_never_raw_wire_compat_candidates() {
-        use crate::protocol::ids::CURSOR_AGENT_RUN_V1;
-        let p = provider("cursor", "agent");
+        use crate::protocol::ids::DEVIN_CHAT_V1;
+        let p = provider("devin", "cli");
         let baseline = request("model", ANTHROPIC_MESSAGES_2023_06_01);
         for (ingress, egress) in [
-            (ANTHROPIC_MESSAGES_2023_06_01, CURSOR_AGENT_RUN_V1),
-            (CURSOR_AGENT_RUN_V1, OPENAI_RESPONSES_V1),
-            (CURSOR_AGENT_RUN_V1, CURSOR_AGENT_RUN_V1),
+            (ANTHROPIC_MESSAGES_2023_06_01, DEVIN_CHAT_V1),
+            (DEVIN_CHAT_V1, OPENAI_RESPONSES_V1),
+            (DEVIN_CHAT_V1, DEVIN_CHAT_V1),
         ] {
             assert!(!json_http_pair(ingress, egress));
             assert!(!supports_raw_wire_compat(

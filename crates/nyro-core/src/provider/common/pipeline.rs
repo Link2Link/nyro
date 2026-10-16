@@ -126,7 +126,7 @@ pub(crate) fn apply_max_tokens_floor(
     };
 
     match protocol {
-        crate::protocol::ids::Protocol::CursorAgent | crate::protocol::ids::Protocol::DevinChat => {
+        crate::protocol::ids::Protocol::DevinChat => {
             // Native providers apply their parameter policy on typed IR.
         }
         crate::protocol::ids::Protocol::OpenAICompatible => {
@@ -489,7 +489,7 @@ pub(crate) fn apply_force_max_reasoning_body(
         return;
     };
     match protocol {
-        crate::protocol::ids::Protocol::CursorAgent | crate::protocol::ids::Protocol::DevinChat => {
+        crate::protocol::ids::Protocol::DevinChat => {
             // Native providers apply their parameter policy on typed IR.
         }
         crate::protocol::ids::Protocol::OpenAICompatible => {

@@ -2,7 +2,7 @@ import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { backend } from "@/lib/backend";
 import { oauthCompletionMode, useOAuthSession } from "@/lib/use-oauth-session";
-import { OAuthProgress, OAuthSessionRemaining, OAuthSessionError, CursorExperimentalNotice, DevinLoginNotice } from "@/components/oauth-session-status";
+import { OAuthProgress, OAuthSessionRemaining, OAuthSessionError, DevinLoginNotice } from "@/components/oauth-session-status";
 import { localizeBackendErrorMessage } from "@/lib/backend-error";
 import { invalidateModelRatings } from "@/lib/use-model-ratings";
 import type {
@@ -134,9 +134,6 @@ function oauthVendorForChannel(presetId?: string | null, channelId?: string | nu
   return preset;
 }
 
-function isCursorProvider(provider?: { vendor?: string | null; preset_key?: string | null } | null) {
-  return [provider?.vendor, provider?.preset_key].some((value) => value?.trim().toLowerCase() === "cursor");
-}
 
 function grokBuildAuthorizationCode(raw: string) {
   const trimmed = raw.trim();
@@ -1306,8 +1303,8 @@ export default function ProvidersPage() {
     };
 
     try {
-      const protocol = isDevinProvider(provider) ? DEVIN_PROTOCOL : isCursorProvider(provider)
-        ? provider.protocol
+      const protocol = isDevinProvider(provider)
+        ? DEVIN_PROTOCOL
         : (resolveProtocol(provider.protocol || "openai") ?? "openai-compatible");
       const baseUrl = provider.base_url?.trim() ?? "";
       const isAdaptive = provider.protocol_mode === "adaptive";
@@ -1365,9 +1362,7 @@ export default function ProvidersPage() {
       );
 
       const modelsSource = provider.models_source?.trim();
-      // Cursor has no HTTP discovery URL; test_provider_models resolves its
-      // native AgentService GetUsableModels catalog server-side.
-      const nativeCatalog = isCursorProvider(provider) || isDevinProvider(provider);
+      const nativeCatalog = isDevinProvider(provider);
       if (!modelsSource && !nativeCatalog) {
         finish(
           {
@@ -1387,9 +1382,7 @@ export default function ProvidersPage() {
       appendTestLog(
         "info",
         nativeCatalog && !modelsSource
-          ? isDevinProvider(provider)
-            ? (isZh ? "→ Devin 配置的模型目录（静态建议）" : "→ Devin configured catalog (static suggestions)")
-            : (isZh ? "→ Cursor 原生模型目录（GetUsableModels）" : "→ Cursor native catalog (GetUsableModels)")
+          ? (isZh ? "→ Devin 配置的模型目录（静态建议）" : "→ Devin configured catalog (static suggestions)")
           : `→ ${modelsSource}`,
       );
 
@@ -1415,8 +1408,7 @@ export default function ProvidersPage() {
         "success",
         `${isZh ? "✓ 认证通过，获取到" : "✓ Auth valid, fetched"} ${models.length} ${isZh ? "个模型" : "models"}`,
       );
-      // Cursor catalogs can contain hundreds of account-specific IDs; keep the
-      // dialog readable instead of flooding it with one line per model.
+      // Large catalogs stay readable: do not flood the dialog with one line per model.
       const logLimit = 50;
       models.slice(0, logLimit).forEach((model) => appendTestLog("info", `· ${model}`));
       if (models.length > logLimit) {
@@ -1658,8 +1650,8 @@ export default function ProvidersPage() {
     );
     const channel = p.channel || "default";
     const savedProtocol = (resolveProtocol(p.protocol) ?? "openai-compatible") as ProviderProtocol;
-    const safeProtocol = isDevinProvider(p) ? DEVIN_PROTOCOL : isCursorProvider(p)
-      ? p.protocol
+    const safeProtocol = isDevinProvider(p)
+      ? DEVIN_PROTOCOL
       : presetForEdit
         ? resolvePresetProtocol(presetForEdit, channel, savedProtocol)
         : savedProtocol;
@@ -2139,7 +2131,6 @@ export default function ProvidersPage() {
                   </div>
                 </div>
               )}
-              {isCursorProvider(form) && <CursorExperimentalNotice isZh={isZh} />}
               {createIsDevinOAuth && <>
                 <DevinLoginNotice isZh={isZh} />
                 <div className="col-span-2 space-y-2">
@@ -2904,7 +2895,6 @@ export default function ProvidersPage() {
                         ))}
                       </ToggleGroup>
                     </div>
-                    {isCursorProvider(editForm) && <CursorExperimentalNotice isZh={isZh} />}
                     {isDevinProvider(editForm) && <>
                       <DevinLoginNotice isZh={isZh} />
                       <div className="col-span-2 space-y-2">
@@ -2984,7 +2974,7 @@ export default function ProvidersPage() {
                               )}
                             </div>
                             <div className="flex flex-wrap gap-2">
-                              {(isCursorProvider(p) || isDevinProvider(p)) && <Button type="button" onClick={() => startEditReauth(p.id, isDevinProvider(p) ? "devin" : "cursor", p.use_proxy)} disabled={reconnectOAuthMut.isPending || logoutOAuthMut.isPending}>
+                              {isDevinProvider(p) && <Button type="button" onClick={() => startEditReauth(p.id, "devin", p.use_proxy)} disabled={reconnectOAuthMut.isPending || logoutOAuthMut.isPending}>
                                 {isZh ? "重新授权" : "Re-authorize"}
                               </Button>}
                               {!isDevinProvider(p) && <Button
@@ -3900,7 +3890,6 @@ export default function ProvidersPage() {
                     <div>
                       <div className="flex flex-wrap items-center gap-2">
                         <span className="inline-flex h-5 items-center font-semibold text-slate-900">{p.name}</span>
-                        {isCursorProvider(p) && <Badge variant="warning">{isZh ? "实验性" : "Experimental"}</Badge>}
                         <code className="inline-flex h-5 items-center rounded bg-slate-100 px-2 py-0.5 text-[10px] leading-none font-medium text-slate-600">
                           {selectedProviderName}
                         </code>
@@ -4036,7 +4025,7 @@ export default function ProvidersPage() {
                     </button>
                   </div>
                 </div>
-                {isCursorProvider(p) ? <CursorExperimentalNotice isZh={isZh} /> : usageSupported(p) && <ProviderUsageFooter provider={p} />}
+                {usageSupported(p) && <ProviderUsageFooter provider={p} />}
               </div>
             );
           })}
@@ -4136,11 +4125,7 @@ export default function ProvidersPage() {
         title={isZh ? "确认复制提供商" : "Confirm provider copy"}
         description={
           providerToCopy
-            ? isCursorProvider(providerToCopy)
-              ? (isZh
-                ? `复制「${providerToCopy.name}」为「${nextProviderCopyName(providers, providerToCopy.name)}」。新副本默认禁用，不包含任何授权凭据；请重新授权后再启用。`
-                : `Copy "${providerToCopy.name}" as "${nextProviderCopyName(providers, providerToCopy.name)}". The copy is disabled and contains no credentials; re-authorize it before enabling.`)
-              : (isZh
+            ? (isZh
               ? `复制「${providerToCopy.name}」为「${nextProviderCopyName(providers, providerToCopy.name)}」，新提供商默认禁用。`
               : `Copy "${providerToCopy.name}" as "${nextProviderCopyName(providers, providerToCopy.name)}" (disabled by default).`)
             : undefined

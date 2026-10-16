@@ -379,10 +379,10 @@ mod tests {
         };
 
         let provenance = serde_json::json!({
-            "source": "cursor_native", "status": "partial", "known_free": false,
+            "source": "native", "status": "partial", "known_free": false,
         });
         let terminal = serde_json::json!({
-            "terminal": "cursor_tool_handoff", "upstream_turn_ended": false,
+            "terminal": "native_tool_handoff", "upstream_turn_ended": false,
         });
         entry.diagnostic.payload_metadata = serde_json::json!({
             "usage_provenance": provenance,

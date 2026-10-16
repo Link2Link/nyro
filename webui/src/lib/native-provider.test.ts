@@ -9,11 +9,10 @@ test("Devin canonical and persisted suite identity select only its native protoc
   }
   equal(isDevinProvider({ vendor: "Devin" }), true);
   equal(isDevinProvider({ preset_key: "devin" }), true);
-  equal(isDevinProvider({ vendor: "cursor" }), false);
+  equal(isDevinProvider({ vendor: "custom" }), false);
 });
 
-test("Cursor selection remains native and generic presets cannot select native transports", () => {
-  equal(nativePresetProtocol({ id: "cursor", defaultProtocol: "cursor-agent/run/v1" }), "cursor-agent/run/v1");
+test("Generic presets cannot select the native Devin transport", () => {
   equal(nativePresetProtocol({ id: "custom", defaultProtocol: DEVIN_PROTOCOL }), null);
   equal(nativePresetProtocol({ id: "openai", defaultProtocol: "openai-compatible" }), null);
   equal(nativePresetProtocol(null), null);

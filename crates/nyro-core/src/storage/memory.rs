@@ -465,17 +465,6 @@ fn write_memory_credential(
     input: UpsertOAuthCredential,
 ) -> anyhow::Result<OAuthCredential> {
     let now = now_rfc3339();
-    if input.driver_key == "cursor"
-        && let Some(subject) = input.subject_id.as_deref().filter(|id| !id.is_empty())
-        && map.values().any(|credential| {
-            credential.provider_id != provider_id
-                && credential.driver_key == "cursor"
-                && credential.subject_id.as_deref() == Some(subject)
-                && credential.status != "disconnected"
-        })
-    {
-        anyhow::bail!("cursor_account_already_bound");
-    }
     let version = map
         .get(provider_id)
         .map(|c| c.status_version + 1)
@@ -603,12 +592,6 @@ impl OAuthCredentialStore for MemoryOAuthCredentialStore {
         if cred.status != "refreshing" || cred.status_version != expected_version {
             return Ok(None);
         }
-        if (cred.driver_key == "cursor" || input.driver_key == "cursor")
-            && (cred.driver_key != input.driver_key || cred.subject_id != input.subject_id)
-        {
-            // A refresh cannot transfer an account or bypass bind uniqueness.
-            return Ok(None);
-        }
         let now = now_rfc3339();
         cred.driver_key = input.driver_key;
         cred.scheme = input.scheme;
@@ -683,13 +666,8 @@ impl OAuthCredentialStore for MemoryOAuthCredentialStore {
                 && super::oauth::parse_timestamp(&cred.updated_at)
                     .is_some_and(|updated| i128::from(updated.timestamp()) < cutoff)
             {
-                let cursor = cred.driver_key == "cursor";
-                cred.status = if cursor { "error" } else { "connected" }.to_string();
-                cred.last_error = Some(if cursor {
-                    super::oauth::CURSOR_STALE_REFRESH_ERROR.to_string()
-                } else {
-                    super::oauth::STALE_REFRESH_ERROR.to_string()
-                });
+                cred.status = "connected".to_string();
+                cred.last_error = Some(super::oauth::STALE_REFRESH_ERROR.to_string());
                 cred.status_version += 1;
                 cred.updated_at = now.format("%Y-%m-%d %H:%M:%S").to_string();
                 count += 1;
@@ -704,14 +682,14 @@ mod oauth_time_tests {
     use super::*;
 
     #[tokio::test]
-    async fn stale_recovery_respects_age_and_cursor_rotation_uncertainty() -> anyhow::Result<()> {
+    async fn stale_recovery_respects_age() -> anyhow::Result<()> {
         let store = MemoryOAuthCredentialStore {
             credentials: RwLock::new(std::collections::HashMap::new()),
         };
         for (provider, driver) in [
-            ("old-cursor", "cursor"),
+            ("old-a", "codex"),
             ("old-codex", "codex"),
-            ("fresh", "cursor"),
+            ("fresh", "codex"),
         ] {
             let initial = store
                 .upsert(
@@ -731,7 +709,7 @@ mod oauth_time_tests {
         }
         {
             let mut rows = store.credentials.write().await;
-            rows.get_mut("old-cursor").unwrap().updated_at =
+            rows.get_mut("old-a").unwrap().updated_at =
                 "2000-01-01T01:00:00+01:00".to_string();
             rows.get_mut("old-codex").unwrap().updated_at = "2000-01-01 00:00:00".to_string();
         }
@@ -747,26 +725,26 @@ mod oauth_time_tests {
                 .await?,
             0
         );
-        let cursor = store.get("old-cursor").await?.unwrap();
-        assert_eq!(cursor.status, "error");
+        let recovered = store.get("old-a").await?.unwrap();
+        assert_eq!(recovered.status, "connected");
         assert_eq!(
-            cursor.last_error.as_deref(),
-            Some(super::super::oauth::CURSOR_STALE_REFRESH_ERROR)
+            recovered.last_error.as_deref(),
+            Some(super::super::oauth::STALE_REFRESH_ERROR)
         );
-        assert_eq!(cursor.status_version, 2);
+        assert_eq!(recovered.status_version, 2);
         assert_eq!(store.get("old-codex").await?.unwrap().status, "connected");
         assert_eq!(store.get("fresh").await?.unwrap().status, "refreshing");
-        assert!(!store.fail_refresh("old-cursor", 1, "late").await?);
+        assert!(!store.fail_refresh("old-a", 1, "late").await?);
         assert!(
             store
-                .complete_refresh("old-cursor", 1, UpsertOAuthCredential::default())
+                .complete_refresh("old-a", 1, UpsertOAuthCredential::default())
                 .await?
                 .is_none()
         );
-        store.delete("old-cursor").await?;
-        assert!(store.get("old-cursor").await?.is_none());
+        store.delete("old-a").await?;
+        assert!(store.get("old-a").await?.is_none());
         let rows = store.credentials.read().await;
-        let tombstone = rows.get("old-cursor").unwrap();
+        let tombstone = rows.get("old-a").unwrap();
         assert_eq!(tombstone.status, "disconnected");
         assert_eq!(tombstone.access_token, "");
         assert_eq!(tombstone.meta, "{}");

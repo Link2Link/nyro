@@ -73,15 +73,6 @@ fn validate_oauth_session_for_provider(
         );
     }
 
-    if session_driver == "cursor"
-        && (provider.protocol != "cursor-agent/run/v1"
-            || provider.channel.as_deref() != Some("agent")
-            || provider.preset_key.as_deref() != Some("cursor")
-            || provider.protocol_mode != "fixed"
-            || provider.base_url.trim_end_matches('/') != "https://api2.cursor.sh")
-    {
-        anyhow::bail!("Cursor OAuth session can only bind to the official cursor/agent channel");
-    }
     if session_driver == "devin"
         && (!matches!(
             provider.protocol.as_str(),
@@ -160,8 +151,8 @@ impl AdminService {
         }
         let driver = auth::build_driver(&driver_key)
             .ok_or_else(|| anyhow::anyhow!("auth vendor not implemented: {driver_key}"))?;
-        let client = if matches!(driver_key.as_str(), "cursor" | "devin") {
-            self.gw.cursor_auth_http_client(use_proxy).await?
+        let client = if driver_key == "devin" {
+            self.gw.devin_http_client(use_proxy, false).await?
         } else {
             self.gw.http_client_for_provider(use_proxy).await?
         };
@@ -243,8 +234,10 @@ impl AdminService {
             return Ok(build_auth_session_pending_data(&session));
         };
         let operation = async {
-            let client = if matches!(session.driver_key.as_str(), "cursor" | "devin") {
-                self.gw.cursor_auth_http_client(session.use_proxy).await?
+            let client = if session.driver_key == "devin" {
+                self.gw
+                    .devin_http_client(session.use_proxy, false)
+                    .await?
             } else {
                 self.gw.http_client_for_provider(session.use_proxy).await?
             };
@@ -282,9 +275,6 @@ impl AdminService {
                 Ok(build_auth_session_pending_data(&updated))
             }
             Ok(AuthPollState::Ready(bundle)) => {
-                if session.driver_key == "cursor" {
-                    auth::drivers::cursor::validate_cursor_bundle(&bundle, None)?;
-                }
                 let updated = self
                     .publish_session_progress(
                         &session.id,
@@ -304,13 +294,7 @@ impl AdminService {
                 self.delete_auth_session_record(&session.id).await?;
                 Ok(AuthSessionStatusData::Error { code, message })
             }
-            Err(error) => {
-                if session.driver_key == "cursor" {
-                    self.delete_auth_session_record(&session.id).await?;
-                    return Err(auth::drivers::cursor::CursorAuthError::Reauthenticate.into());
-                }
-                Err(error)
-            }
+            Err(error) => Err(error),
         }
     }
 
@@ -350,8 +334,10 @@ impl AdminService {
             .await?
             .ok_or_else(|| anyhow::anyhow!("auth session completion already in progress"))?;
         let operation = async {
-            let client = if matches!(session.driver_key.as_str(), "cursor" | "devin") {
-                self.gw.cursor_auth_http_client(session.use_proxy).await?
+            let client = if session.driver_key == "devin" {
+                self.gw
+                    .devin_http_client(session.use_proxy, false)
+                    .await?
             } else {
                 self.gw.http_client_for_provider(session.use_proxy).await?
             };
@@ -671,14 +657,6 @@ impl AdminService {
                 _ => session.driver_key.clone(),
             });
         }
-        if session_driver == "cursor" {
-            input.vendor = Some("cursor".into());
-            input.preset_key = Some("cursor".into());
-            input.channel = Some("agent".into());
-            input.protocol = "cursor-agent/run/v1".into();
-            input.protocol_mode = "fixed".into();
-            input.base_url = "https://api2.cursor.sh".into();
-        }
         if session_driver == "devin" {
             input.vendor = Some("devin".into());
             input.preset_key = Some("devin".into());
@@ -764,9 +742,6 @@ impl AdminService {
                 .is_some_and(|c| !c.cancelled && c.generation == session.generation)
             {
                 anyhow::bail!("auth session was cancelled or superseded");
-            }
-            if session.driver_key == "cursor" {
-                auth::drivers::cursor::validate_cursor_bundle(&bundle, None)?;
             }
             self.gw
                 .storage
@@ -858,7 +833,6 @@ impl AdminService {
             .get(&provider.id)
             .await?
             .ok_or_else(|| anyhow::anyhow!("provider oauth credential not found"))?;
-        ensure_cursor_refresh_allowed(&oauth_cred)?;
         let oauth_store = self.gw.storage.oauth_credentials();
         let Some(refresh_lock) = oauth_store
             .try_begin_refresh(&provider.id, oauth_cred.status_version)
@@ -976,9 +950,6 @@ impl AdminService {
             {
                 anyhow::bail!("auth session was cancelled or superseded");
             }
-            if session.driver_key == "cursor" {
-                auth::drivers::cursor::validate_cursor_bundle(&bundle, None)?;
-            }
             oauth_store.upsert(&provider.id, credential_input).await
         }
         .await;
@@ -1075,9 +1046,6 @@ impl AdminService {
             oauth_cred.driver_key.clone()
         };
 
-        if driver_key == "cursor" && oauth_cred.status == "error" {
-            anyhow::bail!("Cursor reauthentication required");
-        }
         let credential = stored_credential_from_oauth(&oauth_cred, &driver_key);
         let access_token = credential
             .access_token
@@ -1086,10 +1054,7 @@ impl AdminService {
             .trim()
             .to_string();
 
-        if !access_token.is_empty()
-            && !is_expired_at(credential.expires_at.as_deref())
-            && (driver_key != "cursor" || oauth_cred.status == "connected")
-        {
+        if !access_token.is_empty() && !is_expired_at(credential.expires_at.as_deref()) {
             let binding = if let Some(driver) = auth::build_driver(&driver_key) {
                 driver.bind_runtime(provider, &credential)?
             } else {
@@ -1102,14 +1067,13 @@ impl AdminService {
             });
         }
 
-        ensure_cursor_refresh_allowed(&oauth_cred)?;
         let refresh_token = credential
             .refresh_token
             .as_deref()
             .unwrap_or("")
             .trim()
             .to_string();
-        if refresh_token.is_empty() && driver_key != "cursor" {
+        if refresh_token.is_empty() {
             anyhow::bail!("provider oauth refresh token is missing; reauthentication required");
         }
 
@@ -1248,10 +1212,7 @@ impl AdminService {
                 .as_deref()
                 .map(str::trim)
                 .is_some_and(|value| !value.is_empty());
-            if !has_refresh && cred.driver_key != "cursor" {
-                continue;
-            }
-            if ensure_cursor_refresh_allowed(&cred).is_err() {
+            if !has_refresh {
                 continue;
             }
 
@@ -1284,22 +1245,13 @@ impl AdminService {
         lease: &OAuthCredential,
         driver: &dyn auth::AuthDriver,
     ) -> anyhow::Result<CredentialBundle> {
-        // Include error persistence in the hard 30-second budget. Reserve five
-        // seconds inside it for fencing an ambiguous commit. If storage itself
-        // remains unavailable, the refreshing row stays unusable for Cursor and
-        // the existing 60-second stale-lease recovery requires reauthentication.
+        // Include error persistence in the hard 30-second budget.
         tokio::time::timeout(
             std::time::Duration::from_secs(30),
             self.refresh_locked_credential_inner(provider, credential, lease, driver),
         )
         .await
-        .unwrap_or_else(|_| {
-            Err(if driver.metadata().key == "cursor" {
-                auth::drivers::cursor::CursorAuthError::Reauthenticate.into()
-            } else {
-                anyhow::anyhow!("OAuth refresh deadline exceeded")
-            })
-        })
+        .unwrap_or_else(|_| Err(anyhow::anyhow!("OAuth refresh deadline exceeded")))
     }
 
     async fn refresh_locked_credential_inner(
@@ -1310,7 +1262,6 @@ impl AdminService {
         driver: &dyn auth::AuthDriver,
     ) -> anyhow::Result<CredentialBundle> {
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(25);
-        let cursor = driver.metadata().key == "cursor";
         let store = self.gw.storage.oauth_credentials();
         let operation = async {
             if credential
@@ -1318,13 +1269,10 @@ impl AdminService {
                 .as_deref()
                 .is_none_or(|value| value.trim().is_empty())
             {
-                if cursor {
-                    return Err(auth::drivers::cursor::CursorAuthError::Reauthenticate.into());
-                }
                 anyhow::bail!("provider oauth refresh token is missing; reauthentication required");
             }
-            let client = if cursor {
-                self.gw.cursor_auth_http_client(provider.use_proxy).await?
+            let client = if driver.metadata().key == "devin" {
+                self.gw.devin_http_client(provider.use_proxy, false).await?
             } else {
                 self.gw.http_client_for_provider(provider.use_proxy).await?
             };
@@ -1354,12 +1302,6 @@ impl AdminService {
             {
                 anyhow::bail!("OAuth refresh returned an invalid credential");
             }
-            if cursor {
-                auth::drivers::cursor::validate_cursor_bundle(
-                    &bundle,
-                    credential.subject_id.as_deref(),
-                )?;
-            }
             let candidate = stored_credential_from_bundle(
                 driver.metadata().key,
                 driver.metadata().scheme.as_str(),
@@ -1371,13 +1313,7 @@ impl AdminService {
         };
         let result = tokio::time::timeout_at(deadline, operation)
             .await
-            .unwrap_or_else(|_| {
-                Err(if cursor {
-                    auth::drivers::cursor::CursorAuthError::Reauthenticate.into()
-                } else {
-                    anyhow::anyhow!("OAuth refresh deadline exceeded")
-                })
-            });
+            .unwrap_or_else(|_| Err(anyhow::anyhow!("OAuth refresh deadline exceeded")));
         let bundle = match result {
             Ok(bundle) => bundle,
             Err(error) => {
@@ -1391,10 +1327,6 @@ impl AdminService {
                         meta,
                     )
                     .await?;
-                // Never expose arbitrary upstream text/URLs for Cursor.
-                if cursor {
-                    anyhow::bail!("{message}");
-                }
                 return Err(error);
             }
         };
@@ -1415,44 +1347,7 @@ impl AdminService {
         }) {
             Ok(Some(_)) => Ok(bundle),
             Ok(None) => anyhow::bail!("OAuth refresh result was superseded by newer credentials"),
-            Err(error) => {
-                if cursor {
-                    // A failed commit acknowledgement is not a transient failure:
-                    // upstream may have rotated the refresh token already.
-                    let message =
-                        "Cursor refresh commit outcome is unknown; reauthentication required";
-                    let changed = store
-                        .fail_refresh_with_policy(
-                            &provider.id,
-                            lease.status_version,
-                            message,
-                            true,
-                            None,
-                        )
-                        .await
-                        .unwrap_or(false);
-                    if !changed
-                        && let Ok(Some(current)) = store.get(&provider.id).await
-                        && current.status_version == lease.status_version + 1
-                        && current.access_token == bundle.access_token.as_deref().unwrap_or("")
-                        && let Ok(Some(relock)) = store
-                            .try_begin_refresh(&provider.id, current.status_version)
-                            .await
-                    {
-                        let _ = store
-                            .fail_refresh_with_policy(
-                                &provider.id,
-                                relock.status_version,
-                                message,
-                                true,
-                                None,
-                            )
-                            .await;
-                    }
-                    anyhow::bail!("{message}");
-                }
-                Err(error)
-            }
+            Err(error) => Err(error),
         }
     }
 
@@ -1474,7 +1369,6 @@ impl AdminService {
             cred.driver_key.clone()
         };
 
-        ensure_cursor_refresh_allowed(cred)?;
         let credential = stored_credential_from_oauth(cred, &driver_key);
 
         let Some(driver) = auth::build_driver(&driver_key) else {
@@ -1503,66 +1397,11 @@ impl AdminService {
     }
 }
 
-fn ensure_cursor_refresh_allowed(credential: &OAuthCredential) -> anyhow::Result<()> {
-    if credential.driver_key != "cursor" {
-        return Ok(());
-    }
-    if credential.status == "error" {
-        anyhow::bail!("Cursor reauthentication required");
-    }
-    let meta: Value = serde_json::from_str(&credential.meta).unwrap_or_default();
-    if meta
-        .get("cursor_refresh_retry_at")
-        .and_then(Value::as_i64)
-        .is_some_and(|retry| retry > Utc::now().timestamp())
-    {
-        anyhow::bail!("Cursor refresh is temporarily backed off; retry later");
-    }
-    Ok(())
-}
-
 fn refresh_failure_policy(
-    credential: &StoredCredential,
+    _credential: &StoredCredential,
     error: &anyhow::Error,
 ) -> (bool, Option<String>, String) {
-    if credential.driver_key != "cursor" {
-        return (false, None, error.to_string());
-    }
-    let transient = error.downcast_ref::<auth::drivers::cursor::CursorAuthError>();
-    let Some(auth::drivers::cursor::CursorAuthError::Transient { retry_after }) = transient else {
-        return (
-            true,
-            None,
-            "Cursor credential is invalid or refresh outcome is unknown; reauthentication required"
-                .into(),
-        );
-    };
-    let mut meta = credential.meta.as_object().cloned().unwrap_or_default();
-    let failures = meta
-        .get("cursor_refresh_failures")
-        .and_then(Value::as_u64)
-        .unwrap_or(0)
-        .saturating_add(1)
-        .min(32);
-    let delay = 30u64
-        .saturating_mul(1u64 << (failures - 1).min(4))
-        .max(retry_after.unwrap_or(0))
-        .clamp(30, 300);
-    meta.insert(
-        "cursor_refresh_failures".into(),
-        serde_json::json!(failures),
-    );
-    meta.insert(
-        "cursor_refresh_retry_at".into(),
-        serde_json::json!(Utc::now().timestamp() + delay as i64),
-    );
-    let mut meta = Value::Object(meta);
-    strip_auth_secrets(&mut meta);
-    (
-        false,
-        Some(meta.to_string()),
-        "Cursor authentication temporarily unavailable; retry later".into(),
-    )
+    (false, None, error.to_string())
 }
 
 #[cfg(test)]
@@ -1571,7 +1410,7 @@ mod lifecycle_tests {
     async fn gateway() -> anyhow::Result<Gateway> {
         let (gateway, _) = Gateway::new(crate::config::GatewayConfig {
             data_dir: std::env::temp_dir()
-                .join(format!("nyro-cursor-lifecycle-{}", uuid::Uuid::new_v4())),
+                .join(format!("nyro-oauth-lifecycle-{}", uuid::Uuid::new_v4())),
             ..Default::default()
         })
         .await?;
@@ -1662,7 +1501,7 @@ mod lifecycle_tests {
     {
         let gw = gateway().await?;
         let admin = gw.admin();
-        let init = admin.init_oauth_session("cursor", false).await?;
+        let init = admin.init_oauth_session("codex", false).await?;
         gw.auth_session_controls
             .lock()
             .await
@@ -1706,7 +1545,7 @@ mod lifecycle_tests {
     async fn dropped_flight_releases_busy_and_ready_ttl_is_not_token_ttl() -> anyhow::Result<()> {
         let gw = gateway().await?;
         let admin = gw.admin();
-        let init = admin.init_oauth_session("cursor", false).await?;
+        let init = admin.init_oauth_session("codex", false).await?;
         gw.auth_session_controls
             .lock()
             .await
@@ -1750,33 +1589,5 @@ mod lifecycle_tests {
             }
         ));
         Ok(())
-    }
-    #[test]
-    fn cursor_transient_backoff_is_bounded_and_terminal_error_is_redacted() {
-        let mut credential = StoredCredential {
-            driver_key: "cursor".into(),
-            meta: serde_json::json!({"account_label":"keep"}),
-            ..Default::default()
-        };
-        for expected in [30, 60, 120, 240, 300, 300] {
-            let before = Utc::now().timestamp();
-            let error = anyhow::anyhow!(auth::drivers::cursor::CursorAuthError::Transient {
-                retry_after: None
-            });
-            let (terminal, meta, _) = refresh_failure_policy(&credential, &error);
-            assert!(!terminal);
-            credential.meta = serde_json::from_str(meta.as_deref().unwrap()).unwrap();
-            assert_eq!(credential.meta["account_label"], "keep");
-            assert!((expected..=expected + 1).contains(
-                &(credential.meta["cursor_refresh_retry_at"].as_i64().unwrap() - before)
-            ));
-        }
-        let (terminal, _, message) = refresh_failure_policy(
-            &credential,
-            &anyhow::anyhow!("secret-token https://bad/?verifier=secret"),
-        );
-        assert!(terminal);
-        assert!(!message.contains("secret"));
-        assert!(message.contains("reauthentication"));
     }
 }

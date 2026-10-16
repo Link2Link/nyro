@@ -506,7 +506,7 @@ pub(super) fn observe_buffered_usage(protocol: ProtocolId, body: &[u8]) -> RawUs
     observer.into_observation()
 }
 
-/// Longest SSE block delimiter (`\r\n\r\n`). Cursor backtracks never need
+/// Longest SSE block delimiter (`\r\n\r\n`). The scan cursor never needs
 /// more than `DELIMITER_MAX - 1` bytes to re-detect a delimiter straddling
 /// a chunk boundary — for LF (`\n\n`) and CRLF alike.
 const DELIMITER_MAX: usize = 4;

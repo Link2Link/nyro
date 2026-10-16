@@ -67,16 +67,3 @@ export function DevinLoginNotice({ isZh }: { isZh: boolean }) {
   );
 }
 
-export function CursorExperimentalNotice({ isZh }: { isZh: boolean }) {
-  return (
-    <div className="col-span-2 space-y-1 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800">
-      <p className="font-semibold">{isZh ? "Cursor 原生接入（实验性）" : "Cursor native provider (experimental)"}</p>
-      <p>{isZh
-        ? "仅支持文本和串行工具调用，不支持图像。系统指令仅尽力保留，无法保证与原生 system 角色完全一致。用量未知，请勿将其视为零用量。"
-        : "Text and serial tool calls only; images are not supported. System instructions are best effort, not guaranteed native system-role semantics. Usage is unknown, not zero."}</p>
-      <p>{isZh
-        ? "使用固定的原生 HTTP/2 传输和浏览器授权，不支持 API Key 或自定义协议端点。"
-        : "Uses fixed native HTTP/2 transport and browser authorization, not API keys or custom protocol endpoints."}</p>
-    </div>
-  );
-}

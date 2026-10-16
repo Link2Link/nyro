@@ -10,9 +10,6 @@ export function isDevinProvider(provider?: ProviderIdentity | null): boolean {
 
 /** Native OAuth transports never enter the generic API-key/adaptive protocol tables. */
 export function nativePresetProtocol(preset?: { id: string; defaultProtocol: string } | null): ProviderProtocol | null {
-  if (preset?.id === "cursor" && preset.defaultProtocol === "cursor-agent/run/v1") {
-    return "cursor-agent/run/v1";
-  }
   if (preset?.id === "devin" && ["devin-chat", DEVIN_PROTOCOL].includes(preset.defaultProtocol)) {
     return DEVIN_PROTOCOL;
   }

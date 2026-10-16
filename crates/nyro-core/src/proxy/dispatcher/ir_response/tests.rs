@@ -78,8 +78,8 @@ impl Fixture {
         .await
         .unwrap();
         let provider = serde_json::from_value(serde_json::json!({
-            "id":"native-fixture", "name":"native-fixture", "vendor":"cursor",
-            "protocol":"cursor-agent", "base_url":"https://api.cursor.sh",
+            "id":"native-fixture", "name":"native-fixture", "vendor":"devin",
+            "protocol":"devin-chat", "base_url":"https://server.codeium.com",
             "api_key":"fixture", "is_enabled":true, "created_at":"", "updated_at":""
         }))
         .unwrap();
@@ -108,7 +108,7 @@ impl Fixture {
             egress: ingress,
             ingress,
             ingress_str: "fixture",
-            egress_str: "cursor-agent",
+            egress_str: "devin-chat",
             request_model: model,
             actual_model: model,
             backend_model: model,
@@ -140,7 +140,7 @@ fn source(batches: Vec<Result<Vec<AiStreamDelta>, GatewayError>>) -> IrUpstream 
     IrUpstream {
         status: 200,
         headers: Default::default(),
-        url: "https://api.cursor.sh/agent.v1.AgentService/Run".into(),
+        url: "https://server.codeium.com/exa.api_server_pb.ApiServerService/GetChatMessage".into(),
         actual_model: "actual-native-model".into(),
         model_metadata: serde_json::json!({"legacy_model_id":"actual-native-model"}),
         events: Box::pin(futures::stream::iter(batches)),
@@ -275,9 +275,8 @@ async fn native_ir_formats_stream_and_buffered_for_all_ingress_protocols() {
 }
 
 #[tokio::test]
-async fn devin_native_response_does_not_advertise_cursor_limitations() {
-    let mut fixture = Fixture::new().await;
-    fixture.provider.vendor = Some("devin".into());
+async fn native_response_advertises_devin_limitations() {
+    let fixture = Fixture::new().await;
     for stream in [false, true] {
         let result = fixture
             .invoke(
@@ -393,7 +392,7 @@ async fn dropping_stream_body_cancels_guard_and_aborts_parked_worker() {
     let upstream = IrUpstream {
         status: 200,
         headers: Default::default(),
-        url: "https://api.cursor.sh/Run".into(),
+        url: "https://server.codeium.com/Run".into(),
         actual_model: "actual-native-model".into(),
         model_metadata: serde_json::json!({}),
         events: Box::pin(ReceiverStream::new(rx)),

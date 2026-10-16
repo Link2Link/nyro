@@ -32,19 +32,6 @@ pub(crate) fn resolve_endpoint(
     model: &str,
 ) -> Result<Option<ProviderProtocolTarget>, GatewayError> {
     ProviderProtocols::validate_provider(provider)?;
-    if provider
-        .vendor
-        .as_deref()
-        .unwrap_or_default()
-        .trim()
-        .eq_ignore_ascii_case("cursor")
-        && key.is_some()
-    {
-        return Err(GatewayError::provider_unavailable(
-            &provider.id,
-            "Cursor does not support API-key candidates or protocol pins",
-        ));
-    }
     let required = crate::provider::opencode_go::routing::resolve_endpoint(provider, model)?;
     let Some(raw) = key
         .and_then(|key| key.protocol.as_deref())
@@ -58,7 +45,7 @@ pub(crate) fn resolve_endpoint(
     })?;
     if matches!(
         protocol.protocol,
-        crate::protocol::ids::Protocol::CursorAgent | crate::protocol::ids::Protocol::DevinChat
+        crate::protocol::ids::Protocol::DevinChat
     ) {
         return Err(GatewayError::provider_unavailable(
             &provider.id,
@@ -331,31 +318,11 @@ mod tests {
     }
 
     #[test]
-    fn cursor_rejects_any_key_candidate_including_openai_pin() {
-        let mut p = provider(
-            "cursor-agent",
-            crate::protocol::ids::CURSOR_AGENT_BASE_URL,
-            false,
-        );
-        p.vendor = Some("cursor".into());
-        p.channel = Some("agent".into());
-        p.auth_mode = "oauth".into();
-        assert!(resolve_endpoint(&p, None, "m").unwrap().is_none());
-        let mut k = key("a", 0, true, None);
-        for pin in [None, Some("openai"), Some("cursor-agent")] {
-            k.protocol = pin.map(str::to_string);
-            assert!(resolve_endpoint(&p, Some(&k), "m").is_err());
-        }
-        p.keys.push(k);
-        assert!(resolve_endpoint(&p, None, "m").is_err());
-    }
-
-    #[test]
-    fn non_cursor_key_cannot_pin_vendor_stream() {
+    fn non_native_key_cannot_pin_vendor_stream() {
         for adaptive in [false, true] {
             let p = provider("openai-compatible", "https://relay.test/v1", adaptive);
             let mut k = key("a", 0, true, None);
-            for pin in ["cursor-agent", "cursor-agent/run/v1"] {
+            for pin in ["devin-chat", "devin-chat/get-chat-message/v1"] {
                 k.protocol = Some(pin.into());
                 assert!(resolve_endpoint(&p, Some(&k), "m").is_err());
             }
