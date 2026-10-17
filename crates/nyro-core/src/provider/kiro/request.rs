@@ -15,7 +15,8 @@ use serde_json::{Map, Value, json};
 use sha2::{Digest as _, Sha256};
 
 use super::catalog;
-use super::stream::{PLACEHOLDER_TOOL, THINKING_CLOSE, THINKING_OPEN, estimate_tokens};
+use super::estimate;
+use super::stream::{PLACEHOLDER_TOOL, THINKING_CLOSE, THINKING_OPEN};
 use crate::error::GatewayError;
 use crate::protocol::ir::*;
 
@@ -26,8 +27,6 @@ const KEEP_IMAGES_WITHIN: usize = 5;
 const MIN_THINKING_BUDGET: u32 = 1024;
 const MAX_THINKING_BUDGET: u32 = 24_576;
 const DEFAULT_THINKING_BUDGET: u32 = 20_000;
-/// Flat token cost charged per inline image in the local prompt estimate.
-const IMAGE_TOKENS: u32 = 1_600;
 
 /// Everything the transport and response side need from one encoded request.
 pub struct Encoded {
@@ -174,6 +173,9 @@ pub fn encode(
         ));
     }
     let current = render_current(&turns[last], &upstream_model, tools, &tool_names);
+    // Estimated from the payload as built, so dropped images and the placeholder
+    // tool are accounted for exactly as they are sent.
+    let input_estimate = estimate::payload_input_tokens(&history, &current);
 
     let mut state = Map::new();
     state.insert("agentTaskType".into(), json!("vibe"));
@@ -200,7 +202,6 @@ pub fn encode(
     let body = serde_json::to_vec(&Value::Object(root))
         .map_err(|_| invalid("Kiro request could not be serialized"))?;
 
-    let input_estimate = estimate_input(&system, &turns, request);
     let summary = json!({
         "message_count": request.messages.len(),
         "history_count": last,
@@ -918,35 +919,9 @@ fn has_thinking_directive(system: &str) -> bool {
     .any(|tag| system.contains(tag))
 }
 
-// ── Local estimate ───────────────────────────────────────────────────────────
-
-fn estimate_input(system: &str, turns: &[Turn], request: &AiRequest) -> u32 {
-    let mut total = estimate_tokens(system);
-    for turn in turns {
-        total = total
-            .saturating_add(estimate_tokens(&turn.text()))
-            .saturating_add(estimate_tokens(&turn.thinking))
-            .saturating_add(IMAGE_TOKENS.saturating_mul(turn.images.len() as u32));
-        for call in &turn.tool_uses {
-            total = total
-                .saturating_add(estimate_tokens(&call.name))
-                .saturating_add(estimate_tokens(&call.input.to_string()));
-        }
-        for result in &turn.tool_results {
-            total = total.saturating_add(estimate_tokens(&result.text));
-        }
-    }
-    for tool in request.tools.iter().flatten() {
-        total = total
-            .saturating_add(estimate_tokens(&tool.name))
-            .saturating_add(estimate_tokens(tool.description.as_deref().unwrap_or("")))
-            .saturating_add(estimate_tokens(&tool.parameters.to_string()));
-    }
-    total
-}
-
 #[cfg(test)]
 mod tests {
+    use super::estimate::IMAGE_TOKENS;
     use super::*;
 
     fn user(text: &str) -> Message {

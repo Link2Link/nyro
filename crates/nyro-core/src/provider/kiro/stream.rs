@@ -11,6 +11,7 @@ use std::collections::HashMap;
 
 use serde_json::Value;
 
+use super::estimate::CharCounts;
 use super::eventstream::{self, Decoder, Frame};
 use crate::error::GatewayError;
 use crate::protocol::ir::{AiStreamDelta, ToolCall, ToolCallKind, Usage};
@@ -34,20 +35,6 @@ fn failure(status: u16, message: &str) -> GatewayError {
         status,
         body: Some(message.into()),
     }
-}
-
-/// Cheap token estimate used only when Kiro reports no token counts. Prose
-/// averages about four ASCII bytes per token; non-ASCII scripts about one.
-pub(super) fn estimate_tokens(text: &str) -> u32 {
-    let (mut ascii, mut wide) = (0u64, 0u64);
-    for ch in text.chars() {
-        if ch.is_ascii() {
-            ascii += 1;
-        } else {
-            wide += 1;
-        }
-    }
-    u32::try_from(ascii.div_ceil(4) + wide).unwrap_or(u32::MAX)
 }
 
 // ── Inline `<thinking>` splitter ─────────────────────────────────────────────
@@ -293,9 +280,10 @@ pub struct Session {
     done: bool,
     failed: bool,
     last_content: String,
-    /// Estimated tokens of visible text and of thinking, for local usage.
-    text_tokens: u32,
-    thinking_tokens: u32,
+    /// Characters of visible text and of thinking, for the local output
+    /// estimate. Converted to tokens once, when the stream ends.
+    text_chars: CharCounts,
+    thinking_chars: CharCounts,
     thinking_seen: bool,
     visible_text_seen: bool,
     tools: Vec<PendingTool>,
@@ -320,8 +308,8 @@ impl Session {
             done: false,
             failed: false,
             last_content: String::new(),
-            text_tokens: 0,
-            thinking_tokens: 0,
+            text_chars: CharCounts::default(),
+            thinking_chars: CharCounts::default(),
             thinking_seen: false,
             visible_text_seen: false,
             tools: Vec::new(),
@@ -451,12 +439,16 @@ impl Session {
     }
 
     fn final_usage(&self, calls: &[(usize, ToolCall)]) -> Usage {
-        let text = self.text_tokens.saturating_add(self.thinking_tokens);
-        let tool: u32 = calls
-            .iter()
-            .map(|(_, call)| estimate_tokens(&call.name) + estimate_tokens(&call.arguments))
-            .sum();
-        let output = text.saturating_add(tool);
+        // One estimate over everything the model produced (text, thinking and
+        // tool arguments), so small chunks are not each rounded up.
+        let mut produced = self.text_chars;
+        produced.merge(self.thinking_chars);
+        for (index, _) in calls {
+            if let Some(tool) = self.tools.get(*index) {
+                produced.add(&tool.input);
+            }
+        }
+        let output = produced.tokens();
         let input = match self.context_percentage {
             Some(pct) if pct > 0.0 && self.options.context_tokens > 0 => {
                 let total = (f64::from(self.options.context_tokens) * pct / 100.0).round() as u64;
@@ -468,7 +460,7 @@ impl Session {
             prompt_tokens: input,
             completion_tokens: output,
             total_tokens: input.saturating_add(output),
-            reasoning_tokens: self.thinking_seen.then_some(self.thinking_tokens),
+            reasoning_tokens: self.thinking_seen.then(|| self.thinking_chars.tokens()),
             ..Default::default()
         }
     }
@@ -588,7 +580,7 @@ impl Session {
             self.reserve(text.len())?;
             self.post_tool_text.push_str(text);
             self.visible_text_seen = true;
-            self.text_tokens = self.text_tokens.saturating_add(estimate_tokens(text));
+            self.text_chars.add(text);
             return Ok(());
         }
         match self.splitter.as_mut() {
@@ -630,7 +622,7 @@ impl Session {
         }
         self.start(events);
         self.visible_text_seen = true;
-        self.text_tokens = self.text_tokens.saturating_add(estimate_tokens(&text));
+        self.text_chars.add(&text);
         events.push(AiStreamDelta::TextDelta(text));
     }
 
@@ -640,7 +632,7 @@ impl Session {
         }
         self.start(events);
         self.thinking_seen = true;
-        self.thinking_tokens = self.thinking_tokens.saturating_add(estimate_tokens(&text));
+        self.thinking_chars.add(&text);
         events.push(AiStreamDelta::ThinkingDelta(text));
     }
 
@@ -849,6 +841,61 @@ mod tests {
             s.usage_provenance(),
             crate::performance::NativeUsageProvenance::Partial
         );
+    }
+
+    fn usage_of(out: &[AiStreamDelta]) -> Usage {
+        out.iter()
+            .find_map(|d| match d {
+                AiStreamDelta::Usage(u) => Some(u.clone()),
+                _ => None,
+            })
+            .expect("usage is always reported")
+    }
+
+    #[test]
+    fn output_is_estimated_once_over_all_chunks() {
+        // 20 chunks of 1 character. Rounding each chunk up would give 20 tokens;
+        // 20 characters at 2.8 per token is 8.
+        let mut wire = Vec::new();
+        for _ in 0..20 {
+            // Identical short chunks are legitimate tokens and are kept.
+            wire.extend(content("a"));
+        }
+        let mut s = session(false);
+        let out = run(&mut s, &wire);
+        assert_eq!(text(&out).chars().count(), 20);
+        assert_eq!(usage_of(&out).completion_tokens, 8);
+    }
+
+    #[test]
+    fn tool_arguments_count_as_output_but_names_do_not() {
+        let mut s = session(false);
+        let mut wire = Vec::new();
+        wire.extend(tool(serde_json::json!({
+            "name": "a_rather_long_tool_name_that_would_add_tokens",
+            "toolUseId": "tu_1",
+            "input": "{}"
+        })));
+        wire.extend(tool(serde_json::json!({"toolUseId":"tu_1","stop":true})));
+        let out = run(&mut s, &wire);
+        // "{}" is two characters: one token. The name is not charged.
+        assert_eq!(usage_of(&out).completion_tokens, 1);
+    }
+
+    #[test]
+    fn reasoning_tokens_come_from_thinking_text_alone() {
+        let mut s = session(false);
+        let mut wire = Vec::new();
+        wire.extend(encode_event(
+            "reasoningContentEvent",
+            r#"{"text":"abcdefghij"}"#,
+        ));
+        wire.extend(content("abcdefghijklmnopqrstuvwxyz01"));
+        let out = run(&mut s, &wire);
+        let usage = usage_of(&out);
+        // 10 / 2.8 -> 4 reasoning; 38 / 2.8 -> 14 output in total.
+        assert_eq!(usage.reasoning_tokens, Some(4));
+        assert_eq!(usage.completion_tokens, 14);
     }
 
     #[test]
@@ -1218,13 +1265,5 @@ mod tests {
             vec![Segment::Text("bye".into())]
         );
         assert!(splitter.finish().is_empty());
-    }
-
-    #[test]
-    fn estimate_weights_ascii_and_wide_text_differently() {
-        assert_eq!(estimate_tokens(""), 0);
-        assert_eq!(estimate_tokens("abcd"), 1);
-        assert_eq!(estimate_tokens("abcde"), 2);
-        assert_eq!(estimate_tokens("你好"), 2);
     }
 }

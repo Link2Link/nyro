@@ -5,6 +5,7 @@
 //! event-stream frames decoded into protocol-neutral IR deltas.
 mod catalog;
 pub(crate) mod credential;
+mod estimate;
 mod eventstream;
 mod request;
 mod runtime;
