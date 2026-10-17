@@ -1276,6 +1276,24 @@ impl LogStore for SqliteLogStore {
             self,
             pairs,
             as_of,
+            None::<i64>,
+            sqlx::Sqlite,
+            "upstream_model COLLATE BINARY",
+            "CAST(created_at AS INTEGER)",
+            "0"
+        )
+    }
+    async fn model_performance_stats_since(
+        &self,
+        pairs: &[(String, String)],
+        as_of: i64,
+        since: i64,
+    ) -> anyhow::Result<Vec<crate::db::PairPerformanceStats>> {
+        crate::db::model_performance::model_performance_method!(
+            self,
+            pairs,
+            as_of,
+            Some(since),
             sqlx::Sqlite,
             "upstream_model COLLATE BINARY",
             "CAST(created_at AS INTEGER)",
@@ -1592,22 +1610,18 @@ impl LogStore for SqliteLogStore {
         Ok(result.rows_affected())
     }
 
-    async fn stats_overview(&self, hours: Option<i64>) -> anyhow::Result<StatsOverview> {
+    async fn stats_overview_range(
+        &self,
+        start_at: Option<i64>,
+        end_at: Option<i64>,
+    ) -> anyhow::Result<StatsOverview> {
+        let range = crate::storage::traits::range_sql(start_at, end_at);
         let error = error_sql("");
-        if let Some(hours) = hours {
-            Ok(sqlx::query_as::<_, StatsOverview>(
-                &format!("SELECT COUNT(*) AS total_requests, COALESCE(SUM(input_tokens), 0) AS total_input_tokens, COALESCE(SUM(output_tokens), 0) AS total_output_tokens, COALESCE(SUM(cache_read_tokens), 0) AS total_cache_read_tokens, COALESCE(AVG(latency_total_ms), 0.0) AS avg_duration_ms, COALESCE(SUM(CASE WHEN {error} THEN 1 ELSE 0 END), 0) AS error_count FROM request_logs WHERE created_at >= CAST(strftime('%s', 'now', ?) AS INTEGER) * 1000"),
-            )
-            .bind(format!("-{hours} hours"))
-            .fetch_one(&self.pool)
-            .await?)
-        } else {
-            Ok(sqlx::query_as::<_, StatsOverview>(
-                &format!("SELECT COUNT(*) AS total_requests, COALESCE(SUM(input_tokens), 0) AS total_input_tokens, COALESCE(SUM(output_tokens), 0) AS total_output_tokens, COALESCE(SUM(cache_read_tokens), 0) AS total_cache_read_tokens, COALESCE(AVG(latency_total_ms), 0.0) AS avg_duration_ms, COALESCE(SUM(CASE WHEN {error} THEN 1 ELSE 0 END), 0) AS error_count FROM request_logs"),
-            )
-            .fetch_one(&self.pool)
-            .await?)
-        }
+        Ok(sqlx::query_as::<_, StatsOverview>(
+            &format!("SELECT COUNT(*) AS total_requests, COALESCE(SUM(input_tokens), 0) AS total_input_tokens, COALESCE(SUM(output_tokens), 0) AS total_output_tokens, COALESCE(SUM(cache_read_tokens), 0) AS total_cache_read_tokens, COALESCE(AVG(latency_total_ms), 0.0) AS avg_duration_ms, COALESCE(SUM(CASE WHEN {error} THEN 1 ELSE 0 END), 0) AS error_count FROM request_logs WHERE {range}"),
+        )
+        .fetch_one(&self.pool)
+        .await?)
     }
 
     async fn stats_hourly(&self, hours: i64) -> anyhow::Result<Vec<StatsHourly>> {
@@ -1687,22 +1701,18 @@ impl LogStore for SqliteLogStore {
         .await?)
     }
 
-    async fn stats_by_model(&self, hours: Option<i64>) -> anyhow::Result<Vec<ModelStats>> {
+    async fn stats_by_model_range(
+        &self,
+        start_at: Option<i64>,
+        end_at: Option<i64>,
+    ) -> anyhow::Result<Vec<ModelStats>> {
+        let range = crate::storage::traits::range_sql(start_at, end_at);
         let tps = crate::db::tps::tps_totals_columns(crate::db::tps::TpsSqlDialect::Sqlite);
-        if let Some(hours) = hours {
-            Ok(sqlx::query_as::<_, ModelStats>(
-                &format!("SELECT upstream_model AS model, COUNT(*) AS request_count, COALESCE(SUM(input_tokens), 0) AS total_input_tokens, COALESCE(SUM(output_tokens), 0) AS total_output_tokens, COALESCE(SUM(cache_read_tokens), 0) AS total_cache_read_tokens, COALESCE(AVG(latency_total_ms), 0.0) AS avg_duration_ms, CAST(COALESCE(SUM(latency_upstream_ms), 0) AS REAL) AS total_upstream_ms, {tps} FROM request_logs WHERE created_at >= CAST(strftime('%s', 'now', ?) AS INTEGER) * 1000 GROUP BY upstream_model ORDER BY request_count DESC"),
-            )
-            .bind(format!("-{hours} hours"))
-            .fetch_all(&self.pool)
-            .await?)
-        } else {
-            Ok(sqlx::query_as::<_, ModelStats>(
-                &format!("SELECT upstream_model AS model, COUNT(*) AS request_count, COALESCE(SUM(input_tokens), 0) AS total_input_tokens, COALESCE(SUM(output_tokens), 0) AS total_output_tokens, COALESCE(SUM(cache_read_tokens), 0) AS total_cache_read_tokens, COALESCE(AVG(latency_total_ms), 0.0) AS avg_duration_ms, CAST(COALESCE(SUM(latency_upstream_ms), 0) AS REAL) AS total_upstream_ms, {tps} FROM request_logs GROUP BY upstream_model ORDER BY request_count DESC"),
-            )
-            .fetch_all(&self.pool)
-            .await?)
-        }
+        Ok(sqlx::query_as::<_, ModelStats>(
+            &format!("SELECT upstream_model AS model, COUNT(*) AS request_count, COALESCE(SUM(input_tokens), 0) AS total_input_tokens, COALESCE(SUM(output_tokens), 0) AS total_output_tokens, COALESCE(SUM(cache_read_tokens), 0) AS total_cache_read_tokens, COALESCE(AVG(latency_total_ms), 0.0) AS avg_duration_ms, CAST(COALESCE(SUM(latency_upstream_ms), 0) AS REAL) AS total_upstream_ms, {tps} FROM request_logs WHERE {range} GROUP BY upstream_model ORDER BY request_count DESC"),
+        )
+        .fetch_all(&self.pool)
+        .await?)
     }
 
     async fn model_usage_stats(
@@ -1736,15 +1746,17 @@ impl LogStore for SqliteLogStore {
         Ok(ModelUsageStats::from_samples(totals, &samples))
     }
 
-    async fn stats_by_provider(&self, hours: Option<i64>) -> anyhow::Result<Vec<ProviderStats>> {
-        let modifier = hours.map(|hours| format!("-{hours} hours"));
+    async fn stats_by_provider_range(
+        &self,
+        start_at: Option<i64>,
+        end_at: Option<i64>,
+    ) -> anyhow::Result<Vec<ProviderStats>> {
+        let range = crate::storage::traits::range_sql(start_at, end_at);
         let error = error_sql("");
         let tps = crate::db::tps::tps_totals_columns(crate::db::tps::TpsSqlDialect::Sqlite);
         Ok(sqlx::query_as::<_, ProviderStats>(
-            &format!("WITH aggregated AS (SELECT provider_id, COUNT(*) AS request_count, COALESCE(SUM(CASE WHEN {error} THEN 1 ELSE 0 END), 0) AS error_count, COALESCE(AVG(latency_total_ms), 0.0) AS avg_duration_ms, COALESCE(SUM(output_tokens), 0) AS total_output_tokens, CAST(COALESCE(SUM(latency_upstream_ms), 0) AS REAL) AS total_upstream_ms, {tps} FROM request_logs WHERE provider_id IS NOT NULL AND TRIM(provider_id) <> '' AND (? IS NULL OR created_at >= CAST(strftime('%s', 'now', ?) AS INTEGER) * 1000) GROUP BY provider_id) SELECT a.provider_id, COALESCE((SELECT NULLIF(TRIM(r.provider_name), '') FROM request_logs r WHERE r.provider_id = a.provider_id AND NULLIF(TRIM(r.provider_name), '') IS NOT NULL ORDER BY r.created_at DESC, r.id DESC LIMIT 1), a.provider_id) AS provider, NULL AS provider_icon, NULL AS provider_protocol, a.request_count, a.error_count, a.avg_duration_ms, a.total_output_tokens, a.total_upstream_ms, a.tps_content_tokens, a.tps_output_tokens, a.tps_elapsed_ms FROM aggregated a ORDER BY a.request_count DESC, a.provider_id ASC"),
+            &format!("WITH aggregated AS (SELECT provider_id, COUNT(*) AS request_count, COALESCE(SUM(CASE WHEN {error} THEN 1 ELSE 0 END), 0) AS error_count, COALESCE(AVG(latency_total_ms), 0.0) AS avg_duration_ms, COALESCE(SUM(output_tokens), 0) AS total_output_tokens, CAST(COALESCE(SUM(latency_upstream_ms), 0) AS REAL) AS total_upstream_ms, {tps} FROM request_logs WHERE provider_id IS NOT NULL AND TRIM(provider_id) <> '' AND {range} GROUP BY provider_id) SELECT a.provider_id, COALESCE((SELECT NULLIF(TRIM(r.provider_name), '') FROM request_logs r WHERE r.provider_id = a.provider_id AND NULLIF(TRIM(r.provider_name), '') IS NOT NULL ORDER BY r.created_at DESC, r.id DESC LIMIT 1), a.provider_id) AS provider, NULL AS provider_icon, NULL AS provider_protocol, a.request_count, a.error_count, a.avg_duration_ms, a.total_output_tokens, a.total_upstream_ms, a.tps_content_tokens, a.tps_output_tokens, a.tps_elapsed_ms FROM aggregated a ORDER BY a.request_count DESC, a.provider_id ASC"),
         )
-        .bind(modifier.as_deref())
-        .bind(modifier.as_deref())
         .fetch_all(&self.pool)
         .await?)
     }
@@ -1814,15 +1826,17 @@ impl LogStore for SqliteLogStore {
         })
     }
 
-    async fn stats_by_api_key(&self, hours: Option<i64>) -> anyhow::Result<Vec<ApiKeyStats>> {
+    async fn stats_by_api_key_range(
+        &self,
+        start_at: Option<i64>,
+        end_at: Option<i64>,
+    ) -> anyhow::Result<Vec<ApiKeyStats>> {
+        let range = crate::storage::traits::range_sql(start_at, end_at);
         let error = error_sql("");
         let sql = format!(
-            "WITH aggregated AS (SELECT api_key_id, COUNT(*) AS request_count, COALESCE(SUM(CASE WHEN {error} THEN 1 ELSE 0 END), 0) AS error_count, COALESCE(SUM(input_tokens), 0) AS total_input_tokens, COALESCE(SUM(output_tokens), 0) AS total_output_tokens, COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens, MAX(created_at) AS last_used_at FROM request_logs WHERE api_key_id IS NOT NULL AND api_key_id <> '' AND (? IS NULL OR created_at >= CAST(strftime('%s', 'now', ?) AS INTEGER) * 1000) GROUP BY api_key_id) SELECT a.api_key_id, COALESCE((SELECT COALESCE(NULLIF(r.api_key_name, ''), r.api_key_id, '') FROM request_logs r WHERE r.api_key_id = a.api_key_id ORDER BY r.created_at DESC, r.id DESC LIMIT 1), a.api_key_id, '') AS api_key_name, a.request_count, a.error_count, a.total_input_tokens, a.total_output_tokens, a.cache_read_tokens, a.last_used_at FROM aggregated a ORDER BY a.request_count DESC, a.api_key_id ASC"
+            "WITH aggregated AS (SELECT api_key_id, COUNT(*) AS request_count, COALESCE(SUM(CASE WHEN {error} THEN 1 ELSE 0 END), 0) AS error_count, COALESCE(SUM(input_tokens), 0) AS total_input_tokens, COALESCE(SUM(output_tokens), 0) AS total_output_tokens, COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens, MAX(created_at) AS last_used_at FROM request_logs WHERE api_key_id IS NOT NULL AND api_key_id <> '' AND {range} GROUP BY api_key_id) SELECT a.api_key_id, COALESCE((SELECT COALESCE(NULLIF(r.api_key_name, ''), r.api_key_id, '') FROM request_logs r WHERE r.api_key_id = a.api_key_id ORDER BY r.created_at DESC, r.id DESC LIMIT 1), a.api_key_id, '') AS api_key_name, a.request_count, a.error_count, a.total_input_tokens, a.total_output_tokens, a.cache_read_tokens, a.last_used_at FROM aggregated a ORDER BY a.request_count DESC, a.api_key_id ASC"
         );
-        let modifier = hours.map(|hours| format!("-{hours} hours"));
         Ok(sqlx::query_as::<_, ApiKeyStats>(&sql)
-            .bind(modifier.as_deref())
-            .bind(modifier.as_deref())
             .fetch_all(&self.pool)
             .await?)
     }

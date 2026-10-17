@@ -29,7 +29,9 @@ import {
   tpsAggregateWindowTitle,
   tpsMetricTitle,
 } from "@/lib/format";
+import { StatsRangePicker } from "@/components/stats-range-picker";
 import { useLocale } from "@/lib/i18n";
+import { DEFAULT_RANGE, rangeArgs, rangeKey, rangeSpanHours, type StatsRange } from "@/lib/stats-range";
 import {
   outcomeFilterValue,
   outcomeQuery,
@@ -74,16 +76,13 @@ type Tab = "overview" | "requests";
 export interface ModelUsageDialogProps {
   open: boolean;
   onOpenChange: (open: boolean) => void;
-  initialHours?: number;
+  initialRange?: StatsRange;
   initialModel?: string | null;
 }
 
-const RANGES = [6, 24, 72, 168, 720] as const;
 const PAGE_SIZE = 10;
 const ALL_PROVIDERS_VALUE = "__all_providers__";
 const ALL_KEYS_VALUE = "__all_keys__";
-const safeHours = (value?: number) =>
-  RANGES.includes(value as (typeof RANGES)[number]) ? value! : 24;
 const protocolLabel = (value?: string | null) =>
   prettyName(value) ?? value ?? "–";
 const errorText = (value: unknown, fallback: string) =>
@@ -92,14 +91,14 @@ const errorText = (value: unknown, fallback: string) =>
 export function ModelUsageDialog({
   open,
   onOpenChange,
-  initialHours,
+  initialRange,
   initialModel,
 }: ModelUsageDialogProps) {
   const { locale } = useLocale();
   const zh = locale === "zh-CN";
   const previousOpen = useRef(false);
   const defaultSelectionMade = useRef(initialModel != null);
-  const [hours, setHours] = useState(() => safeHours(initialHours));
+  const [range, setRange] = useState<StatsRange>(() => initialRange ?? DEFAULT_RANGE);
   const [selectedId, setSelectedId] = useState<string | null>(
     initialModel ?? null,
   );
@@ -114,7 +113,7 @@ export function ModelUsageDialog({
   useEffect(() => {
     if (open && !previousOpen.current) {
       // eslint-disable-next-line react-hooks/set-state-in-effect
-      setHours(safeHours(initialHours));
+      setRange(initialRange ?? DEFAULT_RANGE);
       setSelectedId(initialModel ?? null);
       setTab("overview");
       setStatus("all");
@@ -126,11 +125,11 @@ export function ModelUsageDialog({
       defaultSelectionMade.current = initialModel != null;
     }
     previousOpen.current = open;
-  }, [open, initialHours, initialModel]);
+  }, [open, initialRange, initialModel]);
 
   const list = useQuery<ModelStats[]>({
-    queryKey: ["model-usage-list", hours],
-    queryFn: () => backend("get_stats_by_model", { hours }),
+    queryKey: ["model-usage-list", rangeKey(range)],
+    queryFn: () => backend("get_stats_by_model", rangeArgs(range)),
     enabled: open,
     refetchInterval: open ? 30_000 : false,
   });
@@ -162,9 +161,9 @@ export function ModelUsageDialog({
   }, [open, list.data, models, selectedId]);
 
   const detail = useQuery<ModelUsageDetail>({
-    queryKey: ["model-usage-detail", selectedId, hours],
+    queryKey: ["model-usage-detail", selectedId, rangeKey(range)],
     queryFn: () =>
-      backend("get_model_usage_detail", { model: selectedId!, hours }),
+      backend("get_model_usage_detail", { model: selectedId!, ...rangeArgs(range) }),
     enabled: open && !!selectedId,
     refetchInterval:
       open && selectedId ? (tab === "requests" ? 5_000 : 30_000) : false,
@@ -257,31 +256,18 @@ export function ModelUsageDialog({
                 </DialogDescription>
               </div>
               <div className="flex flex-wrap gap-2">
-                <Select
-                  value={String(hours)}
-                  onValueChange={(value) => {
-                    setHours(Number(value));
+                <StatsRangePicker
+                  value={range}
+                  showIcon
+                  triggerClassName="h-9 w-[132px]"
+                  onChange={(next) => {
+                    setRange(next);
                     if (selectedId === null) defaultSelectionMade.current = false;
                     setProvider(null);
                     setApiKey(null);
                     setPage(0);
                   }}
-                >
-                  <SelectTrigger
-                    className="h-9 w-[132px]"
-                    aria-label={zh ? "时间范围" : "Time range"}
-                  >
-                    <Clock3 className="mr-1 h-3.5 w-3.5" />
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="6">{zh ? "最近 6 小时" : "Last 6h"}</SelectItem>
-                    <SelectItem value="24">{zh ? "最近 24 小时" : "Last 24h"}</SelectItem>
-                    <SelectItem value="72">{zh ? "最近 3 天" : "Last 3d"}</SelectItem>
-                    <SelectItem value="168">{zh ? "最近 7 天" : "Last 7d"}</SelectItem>
-                    <SelectItem value="720">{zh ? "最近 30 天" : "Last 30d"}</SelectItem>
-                  </SelectContent>
-                </Select>
+                />
                 <Select
                   value={selectedId ?? undefined}
                   onValueChange={(value) => {
@@ -378,7 +364,7 @@ export function ModelUsageDialog({
                   <Overview
                     detail={detail.data}
                     zh={zh}
-                    showDateOnAxis={hours > 24}
+                    showDateOnAxis={rangeSpanHours(range) > 24}
                     onProvider={selectProvider}
                     onApiKey={selectApiKey}
                   />

@@ -5,6 +5,102 @@ const MAX_TIME_SERIES_HOURS: i32 = 720;
 const MILLIS_PER_MINUTE: i64 = 60_000;
 const MILLIS_PER_HOUR: i64 = 60 * MILLIS_PER_MINUTE;
 
+/// Longest custom statistics window a caller may request.
+const MAX_CUSTOM_RANGE_DAYS: i64 = 366;
+/// Error prefix mapped to HTTP 400 by the server.
+pub const INVALID_RANGE_PREFIX: &str = "invalid time range";
+
+/// A statistics window: a rolling preset (`hours`) or an explicit custom range
+/// in epoch milliseconds. `start_at` takes precedence over `hours`; a missing
+/// `end_at` means "up to now", which keeps month-to-date style ranges live.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+pub struct StatsRange {
+    pub hours: Option<i32>,
+    pub start_at: Option<i64>,
+    pub end_at: Option<i64>,
+}
+
+impl From<Option<i32>> for StatsRange {
+    fn from(hours: Option<i32>) -> Self {
+        Self {
+            hours,
+            start_at: None,
+            end_at: None,
+        }
+    }
+}
+
+impl StatsRange {
+    fn is_custom(&self) -> bool {
+        self.start_at.is_some() || self.end_at.is_some()
+    }
+}
+
+/// Validate a custom window and clamp its end to `now` (a future end only
+/// means "so far"). Returns the concrete `[start, end]` in epoch ms.
+fn resolve_custom_range(
+    start_at: Option<i64>,
+    end_at: Option<i64>,
+    now: i64,
+) -> anyhow::Result<(i64, i64)> {
+    let Some(start) = start_at else {
+        anyhow::bail!("{INVALID_RANGE_PREFIX}: start_at is required with end_at");
+    };
+    anyhow::ensure!(
+        start >= 0,
+        "{INVALID_RANGE_PREFIX}: start_at must not be negative"
+    );
+    let end = end_at.unwrap_or(now).min(now);
+    anyhow::ensure!(
+        start < end,
+        "{INVALID_RANGE_PREFIX}: start must be before end"
+    );
+    anyhow::ensure!(
+        end - start <= MAX_CUSTOM_RANGE_DAYS * 24 * MILLIS_PER_HOUR,
+        "{INVALID_RANGE_PREFIX}: range must not exceed {MAX_CUSTOM_RANGE_DAYS} days"
+    );
+    Ok((start, end))
+}
+
+/// List-style endpoints: `(None, None)` means every retained log.
+fn resolve_list_range(range: StatsRange, now: i64) -> anyhow::Result<(Option<i64>, Option<i64>)> {
+    if range.is_custom() {
+        let (start, end) = resolve_custom_range(range.start_at, range.end_at, now)?;
+        return Ok((Some(start), Some(end)));
+    }
+    let hours = range.hours.and_then(|value| (value > 0).then_some(value));
+    Ok((
+        hours.map(|hours| now.saturating_sub(i64::from(hours) * MILLIS_PER_HOUR)),
+        None,
+    ))
+}
+
+/// Detail endpoints: presets stay restricted to the supported set, custom
+/// windows are validated. Always returns a concrete `[start, end]`.
+fn resolve_detail_window(range: StatsRange, now: i64) -> anyhow::Result<(i64, i64)> {
+    if range.is_custom() {
+        return resolve_custom_range(range.start_at, range.end_at, now);
+    }
+    let hours = normalize_detail_hours(range.hours)?;
+    Ok((now - i64::from(hours) * MILLIS_PER_HOUR, now))
+}
+
+/// Time-series endpoint: presets clamp like before, custom windows validate.
+fn resolve_series_window(range: StatsRange, now: i64) -> anyhow::Result<(i64, i64)> {
+    if range.is_custom() {
+        return resolve_custom_range(range.start_at, range.end_at, now);
+    }
+    let hours = normalize_time_series_hours(range.hours);
+    Ok((now - i64::from(hours) * MILLIS_PER_HOUR, now))
+}
+
+/// Bucket width for a concrete window, from its span rounded up to whole hours.
+fn bucket_minutes_for_window(start_at: i64, end_at: i64) -> i32 {
+    let span = (end_at - start_at).max(0);
+    let hours = (span + MILLIS_PER_HOUR - 1) / MILLIS_PER_HOUR;
+    time_series_bucket_minutes(i32::try_from(hours).unwrap_or(i32::MAX))
+}
+
 fn normalize_detail_hours(hours: Option<i32>) -> anyhow::Result<i32> {
     let hours = hours.unwrap_or(24);
     anyhow::ensure!(
@@ -26,7 +122,11 @@ fn time_series_bucket_minutes(hours: i32) -> i32 {
         ..=24 => 15,
         ..=72 => 30,
         ..=168 => 60,
-        _ => 240,
+        // Up to a 31-day month.
+        ..=744 => 240,
+        // Up to roughly a quarter.
+        ..=2208 => 720,
+        _ => 1440,
     }
 }
 
@@ -190,15 +290,19 @@ impl AdminService {
     }
     // ── Stats ──
 
-    fn normalize_hours(hours: Option<i32>) -> Option<i32> {
-        hours.and_then(|value| (value > 0).then_some(value))
+    fn list_range(range: StatsRange) -> anyhow::Result<(Option<i64>, Option<i64>)> {
+        resolve_list_range(range, Utc::now().timestamp_millis())
     }
 
-    pub async fn get_stats_overview(&self, hours: Option<i32>) -> anyhow::Result<StatsOverview> {
+    pub async fn get_stats_overview(
+        &self,
+        range: impl Into<StatsRange>,
+    ) -> anyhow::Result<StatsOverview> {
+        let (start_at, end_at) = Self::list_range(range.into())?;
         self.gw
             .storage
             .logs()
-            .stats_overview(Self::normalize_hours(hours).map(i64::from))
+            .stats_overview_range(start_at, end_at)
             .await
     }
 
@@ -212,13 +316,12 @@ impl AdminService {
 
     pub async fn get_stats_timeseries(
         &self,
-        hours: Option<i32>,
+        range: impl Into<StatsRange>,
     ) -> anyhow::Result<StatsTimeSeries> {
-        let hours = normalize_time_series_hours(hours);
-        let bucket_minutes = time_series_bucket_minutes(hours);
+        let (start_at, end_at) =
+            resolve_series_window(range.into(), Utc::now().timestamp_millis())?;
+        let bucket_minutes = bucket_minutes_for_window(start_at, end_at);
         let bucket_ms = i64::from(bucket_minutes) * MILLIS_PER_MINUTE;
-        let end_at = Utc::now().timestamp_millis();
-        let start_at = end_at - i64::from(hours) * MILLIS_PER_HOUR;
         let buckets = self
             .gw
             .storage
@@ -287,11 +390,15 @@ impl AdminService {
         })
     }
 
-    pub async fn get_stats_by_model(&self, hours: Option<i32>) -> anyhow::Result<Vec<ModelStats>> {
+    pub async fn get_stats_by_model(
+        &self,
+        range: impl Into<StatsRange>,
+    ) -> anyhow::Result<Vec<ModelStats>> {
+        let (start_at, end_at) = Self::list_range(range.into())?;
         self.gw
             .storage
             .logs()
-            .stats_by_model(Self::normalize_hours(hours).map(i64::from))
+            .stats_by_model_range(start_at, end_at)
             .await
     }
 
@@ -309,13 +416,14 @@ impl AdminService {
 
     pub async fn get_stats_by_provider(
         &self,
-        hours: Option<i32>,
+        range: impl Into<StatsRange>,
     ) -> anyhow::Result<Vec<ProviderStats>> {
+        let (range_start, range_end) = Self::list_range(range.into())?;
         let mut stats = self
             .gw
             .storage
             .logs()
-            .stats_by_provider(Self::normalize_hours(hours).map(i64::from))
+            .stats_by_provider_range(range_start, range_end)
             .await?;
         let providers: HashMap<_, _> = self
             .gw
@@ -336,22 +444,25 @@ impl AdminService {
         // Price the same window the SQL above used; a pricing failure must not
         // take down the rest of the provider statistics.
         let now = Utc::now().timestamp_millis();
-        let start_at = Self::normalize_hours(hours)
-            .map_or(0, |hours| now - i64::from(hours) * MILLIS_PER_HOUR);
+        let start_at = range_start.unwrap_or(0);
+        let end_at = range_end.unwrap_or(now);
         match self
-            .priced_usage_rows(start_at, now.saturating_add(1), &providers)
+            .priced_usage_rows(start_at, end_at.saturating_add(1), &providers)
             .await
         {
             Ok(rows) => {
                 for item in &mut stats {
                     let (costs, unpriced) = super::token_cost::summarize_costs(
-                        rows.iter().filter(|row| row.provider_id == item.provider_id),
+                        rows.iter()
+                            .filter(|row| row.provider_id == item.provider_id),
                     );
                     item.equivalent_costs = costs;
                     item.unpriced_request_count = unpriced;
                 }
             }
-            Err(error) => tracing::warn!(%error, "equivalent API price unavailable for provider stats"),
+            Err(error) => {
+                tracing::warn!(%error, "equivalent API price unavailable for provider stats")
+            }
         }
         Ok(stats)
     }
@@ -384,11 +495,10 @@ impl AdminService {
     pub async fn get_provider_usage_detail(
         &self,
         provider_id: &str,
-        hours: Option<i32>,
+        range: impl Into<StatsRange>,
     ) -> anyhow::Result<ProviderUsageDetail> {
-        let hours = normalize_detail_hours(hours)?;
-        let end_at = Utc::now().timestamp_millis();
-        let start_at = end_at - i64::from(hours) * MILLIS_PER_HOUR;
+        let (start_at, end_at) =
+            resolve_detail_window(range.into(), Utc::now().timestamp_millis())?;
         let mut detail = self
             .gw
             .storage
@@ -431,20 +541,23 @@ impl AdminService {
                     model.unpriced_request_count = unpriced;
                 }
             }
-            Err(error) => tracing::warn!(%error, "equivalent API price unavailable for provider detail"),
+            Err(error) => {
+                tracing::warn!(%error, "equivalent API price unavailable for provider detail")
+            }
         }
         Ok(detail)
     }
 
     pub async fn get_stats_by_api_key(
         &self,
-        hours: Option<i32>,
+        range: impl Into<StatsRange>,
     ) -> anyhow::Result<Vec<ApiKeyStats>> {
+        let (start_at, end_at) = Self::list_range(range.into())?;
         let mut stats = self
             .gw
             .storage
             .logs()
-            .stats_by_api_key(Self::normalize_hours(hours).map(i64::from))
+            .stats_by_api_key_range(start_at, end_at)
             .await?;
         if let Some(store) = self.gw.storage.api_keys() {
             let current_names: HashMap<_, _> = store
@@ -465,11 +578,10 @@ impl AdminService {
     pub async fn get_api_key_usage_detail(
         &self,
         api_key_id: &str,
-        hours: Option<i32>,
+        range: impl Into<StatsRange>,
     ) -> anyhow::Result<ApiKeyUsageDetail> {
-        let hours = normalize_detail_hours(hours)?;
-        let end_at = Utc::now().timestamp_millis();
-        let start_at = end_at - i64::from(hours) * MILLIS_PER_HOUR;
+        let (start_at, end_at) =
+            resolve_detail_window(range.into(), Utc::now().timestamp_millis())?;
         let mut detail = self
             .gw
             .storage
@@ -499,7 +611,7 @@ impl AdminService {
 
         // Per-model token time series over the exact same window as the
         // summary cards, so trends and totals above can never disagree.
-        let bucket_minutes = time_series_bucket_minutes(hours);
+        let bucket_minutes = bucket_minutes_for_window(start_at, end_at);
         let bucket_ms = i64::from(bucket_minutes) * MILLIS_PER_MINUTE;
         let rows = self
             .gw
@@ -555,11 +667,10 @@ impl AdminService {
     pub async fn get_model_usage_detail(
         &self,
         upstream_model: &str,
-        hours: Option<i32>,
+        range: impl Into<StatsRange>,
     ) -> anyhow::Result<ModelUsageDetail> {
-        let hours = normalize_detail_hours(hours)?;
-        let end_at = Utc::now().timestamp_millis();
-        let start_at = end_at - i64::from(hours) * MILLIS_PER_HOUR;
+        let (start_at, end_at) =
+            resolve_detail_window(range.into(), Utc::now().timestamp_millis())?;
         let mut detail = self
             .gw
             .storage
@@ -600,7 +711,7 @@ impl AdminService {
 
         // Token time series over the exact same window as the summary cards so
         // the chart and the totals above it can never disagree.
-        let bucket_minutes = time_series_bucket_minutes(hours);
+        let bucket_minutes = bucket_minutes_for_window(start_at, end_at);
         let bucket_ms = i64::from(bucket_minutes) * MILLIS_PER_MINUTE;
         let buckets = self
             .gw
@@ -659,6 +770,96 @@ mod tests {
         assert_eq!(time_series_bucket_minutes(168), 60);
         assert_eq!(time_series_bucket_minutes(169), 240);
         assert_eq!(time_series_bucket_minutes(720), 240);
+        // Custom ranges: a 31-day month, a quarter, and a year.
+        assert_eq!(time_series_bucket_minutes(744), 240);
+        assert_eq!(time_series_bucket_minutes(745), 720);
+        assert_eq!(time_series_bucket_minutes(2208), 720);
+        assert_eq!(time_series_bucket_minutes(2209), 1440);
+    }
+
+    const NOW: i64 = 1_800_000_000_000;
+
+    #[test]
+    fn custom_range_is_validated_and_end_is_clamped_to_now() {
+        let day = 24 * MILLIS_PER_HOUR;
+        // Missing end means "until now"; a future end is clamped.
+        assert_eq!(
+            resolve_custom_range(Some(NOW - day), None, NOW).unwrap(),
+            (NOW - day, NOW)
+        );
+        assert_eq!(
+            resolve_custom_range(Some(NOW - day), Some(NOW + day), NOW).unwrap(),
+            (NOW - day, NOW)
+        );
+        assert_eq!(
+            resolve_custom_range(Some(NOW - 3 * day), Some(NOW - day), NOW).unwrap(),
+            (NOW - 3 * day, NOW - day)
+        );
+        for (start, end) in [
+            (None, Some(NOW)),
+            (Some(-1), None),
+            (Some(NOW), Some(NOW)),
+            (Some(NOW + day), None),
+            (Some(NOW - 2 * day), Some(NOW - 3 * day)),
+            (Some(NOW - 367 * day), None),
+        ] {
+            let error = resolve_custom_range(start, end, NOW)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.starts_with(INVALID_RANGE_PREFIX),
+                "{start:?} {end:?}: {error}"
+            );
+        }
+        assert!(resolve_custom_range(Some(NOW - 366 * day), None, NOW).is_ok());
+    }
+
+    #[test]
+    fn stats_ranges_resolve_per_endpoint_kind() {
+        let hours = |value| StatsRange::from(Some(value));
+        // List endpoints keep presets as a rolling start and stay unbounded without hours.
+        assert_eq!(
+            resolve_list_range(hours(24), NOW).unwrap(),
+            (Some(NOW - 24 * MILLIS_PER_HOUR), None)
+        );
+        assert_eq!(
+            resolve_list_range(StatsRange::default(), NOW).unwrap(),
+            (None, None)
+        );
+        let month = StatsRange {
+            start_at: Some(NOW - 1000),
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_list_range(month, NOW).unwrap(),
+            (Some(NOW - 1000), Some(NOW))
+        );
+        // Detail endpoints still reject unsupported presets but accept custom windows.
+        assert!(resolve_detail_window(hours(12), NOW).is_err());
+        assert_eq!(
+            resolve_detail_window(hours(6), NOW).unwrap(),
+            (NOW - 6 * MILLIS_PER_HOUR, NOW)
+        );
+        assert_eq!(
+            resolve_detail_window(month, NOW).unwrap(),
+            (NOW - 1000, NOW)
+        );
+        // The series clamps presets like before.
+        assert_eq!(
+            resolve_series_window(hours(999), NOW).unwrap(),
+            (NOW - 720 * MILLIS_PER_HOUR, NOW)
+        );
+    }
+
+    #[test]
+    fn bucket_width_follows_the_concrete_window() {
+        assert_eq!(bucket_minutes_for_window(0, 6 * MILLIS_PER_HOUR), 5);
+        assert_eq!(bucket_minutes_for_window(0, 6 * MILLIS_PER_HOUR + 1), 15);
+        assert_eq!(bucket_minutes_for_window(0, 31 * 24 * MILLIS_PER_HOUR), 240);
+        assert_eq!(
+            bucket_minutes_for_window(0, 366 * 24 * MILLIS_PER_HOUR),
+            1440
+        );
     }
 
     #[test]

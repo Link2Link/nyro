@@ -6,6 +6,7 @@ use axum::response::IntoResponse;
 use axum::routing::{get, post, put};
 use axum::{Extension, Json, Router};
 use nyro_core::Gateway;
+use nyro_core::admin::StatsRange;
 use nyro_core::admin::{
     CopyProviderOptions, ModelRatingError, SetModelRating, TokenPriceError, TokenPriceInput,
 };
@@ -897,18 +898,31 @@ async fn delete_log_handler(
 
 // ── Stats ──
 
+/// Rolling `hours` preset, or a custom `start_at`/`end_at` range in epoch ms.
 #[derive(Deserialize, Default)]
 struct StatsRangeParams {
     hours: Option<i32>,
+    start_at: Option<i64>,
+    end_at: Option<i64>,
+}
+
+impl StatsRangeParams {
+    fn range(&self) -> StatsRange {
+        StatsRange {
+            hours: self.hours,
+            start_at: self.start_at,
+            end_at: self.end_at,
+        }
+    }
 }
 
 async fn stats_overview(
     State(gw): State<Gateway>,
     Query(params): Query<StatsRangeParams>,
 ) -> impl IntoResponse {
-    match gw.admin().get_stats_overview(params.hours).await {
+    match gw.admin().get_stats_overview(params.range()).await {
         Ok(v) => Json(serde_json::json!({ "data": v })).into_response(),
-        Err(e) => err(e),
+        Err(e) => stats_range_error(e),
     }
 }
 
@@ -936,9 +950,9 @@ async fn stats_timeseries(
     State(gw): State<Gateway>,
     Query(params): Query<StatsRangeParams>,
 ) -> impl IntoResponse {
-    match gw.admin().get_stats_timeseries(params.hours).await {
+    match gw.admin().get_stats_timeseries(params.range()).await {
         Ok(v) => Json(serde_json::json!({ "data": v })).into_response(),
-        Err(e) => err(e),
+        Err(e) => stats_range_error(e),
     }
 }
 
@@ -1016,9 +1030,9 @@ async fn stats_by_model(
     State(gw): State<Gateway>,
     Query(params): Query<StatsRangeParams>,
 ) -> impl IntoResponse {
-    match gw.admin().get_stats_by_model(params.hours).await {
+    match gw.admin().get_stats_by_model(params.range()).await {
         Ok(v) => Json(serde_json::json!({ "data": v })).into_response(),
-        Err(e) => err(e),
+        Err(e) => stats_range_error(e),
     }
 }
 
@@ -1026,9 +1040,9 @@ async fn stats_by_provider(
     State(gw): State<Gateway>,
     Query(params): Query<StatsRangeParams>,
 ) -> impl IntoResponse {
-    match gw.admin().get_stats_by_provider(params.hours).await {
+    match gw.admin().get_stats_by_provider(params.range()).await {
         Ok(v) => Json(serde_json::json!({ "data": v })).into_response(),
-        Err(e) => err(e),
+        Err(e) => stats_range_error(e),
     }
 }
 
@@ -1039,7 +1053,7 @@ async fn provider_usage_detail(
 ) -> impl IntoResponse {
     match gw
         .admin()
-        .get_provider_usage_detail(&id, params.hours)
+        .get_provider_usage_detail(&id, params.range())
         .await
     {
         Ok(v) => Json(serde_json::json!({ "data": v })).into_response(),
@@ -1051,9 +1065,9 @@ async fn stats_by_api_key(
     State(gw): State<Gateway>,
     Query(params): Query<StatsRangeParams>,
 ) -> impl IntoResponse {
-    match gw.admin().get_stats_by_api_key(params.hours).await {
+    match gw.admin().get_stats_by_api_key(params.range()).await {
         Ok(v) => Json(serde_json::json!({ "data": v })).into_response(),
-        Err(e) => err(e),
+        Err(e) => stats_range_error(e),
     }
 }
 
@@ -1062,7 +1076,11 @@ async fn api_key_usage_detail(
     Path(id): Path<String>,
     Query(params): Query<StatsRangeParams>,
 ) -> impl IntoResponse {
-    match gw.admin().get_api_key_usage_detail(&id, params.hours).await {
+    match gw
+        .admin()
+        .get_api_key_usage_detail(&id, params.range())
+        .await
+    {
         Ok(v) => Json(serde_json::json!({ "data": v })).into_response(),
         Err(e) => stats_detail_error(e),
     }
@@ -1073,15 +1091,28 @@ async fn model_usage_detail(
     Path(id): Path<String>,
     Query(params): Query<StatsRangeParams>,
 ) -> impl IntoResponse {
-    match gw.admin().get_model_usage_detail(&id, params.hours).await {
+    match gw.admin().get_model_usage_detail(&id, params.range()).await {
         Ok(v) => Json(serde_json::json!({ "data": v })).into_response(),
         Err(e) => stats_detail_error(e),
     }
 }
 
+/// List endpoints: a rejected custom range is a client error; other failures keep
+/// the existing response shape.
+fn stats_range_error(e: anyhow::Error) -> axum::response::Response {
+    if e.to_string()
+        .starts_with(nyro_core::admin::INVALID_RANGE_PREFIX)
+    {
+        return stats_detail_error(e);
+    }
+    err(e)
+}
+
 fn stats_detail_error(e: anyhow::Error) -> axum::response::Response {
     let message = e.to_string();
-    let status = if message.starts_with("hours must be one of") {
+    let status = if message.starts_with("hours must be one of")
+        || message.starts_with(nyro_core::admin::INVALID_RANGE_PREFIX)
+    {
         StatusCode::BAD_REQUEST
     } else {
         StatusCode::INTERNAL_SERVER_ERROR

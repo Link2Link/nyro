@@ -196,10 +196,11 @@ mean of per-call rates: counts are sums that legitimately exceed fifty (up to fi
 variant), timestamps span the merged window, and a group with no usable TPS keeps a
 null average.
 
-Performance uses the **same latest-fifty retained-call sampling and TPS calculation as
-model usage statistics**, not a separate completion-qualified metric. There is no
-additional seven-day, HTTP-status, completion-state, reasoning-effort, or metadata-version
-filter. `window_start` is null; `as_of` describes when the response was fetched.
+Performance uses the **same TPS calculation as model usage statistics**, restricted to
+the last seven days: the latest fifty calls per variant are selected from calls created at
+or after `window_start` (`as_of` minus seven days). Variants and groups with no call in the
+window are omitted. There is no additional HTTP-status, completion-state,
+reasoning-effort, or metadata-version filter. `as_of` describes when the response was fetched.
 Unknown completion (including MiniMax responses whose terminal is not recognized)
 does not invalidate usable output-token and timing data. Invalid TPS samples among
 the selected fifty are not replaced with older requests.

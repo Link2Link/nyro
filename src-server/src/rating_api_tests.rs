@@ -141,11 +141,69 @@ async fn rating_performance_http_empty_without_logged_matches() -> anyhow::Resul
     assert_eq!(status, StatusCode::OK);
     let data = &response["data"];
     assert!(data["as_of"].as_i64().unwrap() > 0);
-    assert!(
-        data["window_start"].is_null(),
-        "latest retained calls have no extra time-window filter"
+    assert_eq!(
+        data["window_start"].as_i64().unwrap(),
+        data["as_of"].as_i64().unwrap() - 7 * 24 * 60 * 60 * 1000,
+        "performance samples cover the last seven days"
     );
     assert_eq!(data["models"].as_array().unwrap().len(), 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn stats_http_accepts_custom_ranges_and_rejects_invalid_ones() -> anyhow::Result<()> {
+    let (_dir, router) = fixture().await?;
+    let now = chrono::Utc::now().timestamp_millis();
+    let day = 24 * 60 * 60 * 1000;
+    let overview = "/api/v1/stats/overview";
+    // Custom window, and an open-ended "since" window, are accepted.
+    for query in [
+        format!("start_at={}&end_at={}", now - 3 * day, now - day),
+        format!("start_at={}", now - 3 * day),
+        "hours=24".to_string(),
+        String::new(),
+    ] {
+        let (status, body) =
+            call(&router, "GET", &format!("{overview}?{query}"), None, true).await?;
+        assert_eq!(status, StatusCode::OK, "{query}: {body}");
+        assert_eq!(body["data"]["total_requests"], json!(0));
+    }
+    // Invalid custom windows are client errors on list, series and detail routes.
+    let bad = [
+        format!("end_at={now}"),
+        format!("start_at={}&end_at={}", now - day, now - 2 * day),
+        format!("start_at={}", now - 400 * day),
+    ];
+    for path in [
+        "/api/v1/stats/overview",
+        "/api/v1/stats/timeseries",
+        "/api/v1/stats/models",
+        "/api/v1/stats/providers",
+        "/api/v1/stats/api-keys",
+        "/api/v1/stats/models/some-model",
+    ] {
+        for query in &bad {
+            let (status, body) =
+                call(&router, "GET", &format!("{path}?{query}"), None, true).await?;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{path}?{query}: {body}");
+        }
+    }
+    // A valid custom window on the time-series route returns concrete bounds.
+    let (status, body) = call(
+        &router,
+        "GET",
+        &format!(
+            "/api/v1/stats/timeseries?start_at={}&end_at={}",
+            now - 70 * day,
+            now - 10 * day
+        ),
+        None,
+        true,
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["data"]["bucket_minutes"], json!(720));
+    assert_eq!(body["data"]["start_at"], json!(now - 70 * day));
     Ok(())
 }
 

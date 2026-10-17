@@ -108,6 +108,18 @@ function probeAdminSession(): Promise<boolean> {
   return adminSessionProbe;
 }
 
+/** Query string for the stats endpoints: rolling `hours`, or a custom `startAt`/`endAt` range (epoch ms). */
+function statsQuery(args?: Record<string, unknown>, defaultHours?: number): string {
+  const params = new URLSearchParams();
+  const custom = args?.startAt != null || args?.endAt != null;
+  const hours = args?.hours ?? (custom ? undefined : defaultHours);
+  if (hours != null) params.set("hours", String(hours));
+  if (args?.startAt != null) params.set("start_at", String(args.startAt));
+  if (args?.endAt != null) params.set("end_at", String(args.endAt));
+  const qs = params.toString();
+  return qs ? `?${qs}` : "";
+}
+
 function resolveHTTP(cmd: string, args?: Record<string, unknown>): HTTPMapping {
   const base = "/api/v1";
   switch (cmd) {
@@ -276,10 +288,9 @@ function resolveHTTP(cmd: string, args?: Record<string, unknown>): HTTPMapping {
       return { method: "GET", url: `${base}/stats/token-usage?${params.toString()}` };
     }
     case "get_stats_overview": {
-      const hours = args?.hours;
       return {
         method: "GET",
-        url: `${base}/stats/overview${hours != null ? `?hours=${hours}` : ""}`,
+        url: `${base}/stats/overview${statsQuery(args)}`,
       };
     }
     case "get_stats_hourly": {
@@ -287,14 +298,12 @@ function resolveHTTP(cmd: string, args?: Record<string, unknown>): HTTPMapping {
       return { method: "GET", url: `${base}/stats/hourly?hours=${hours}` };
     }
     case "get_stats_timeseries": {
-      const hours = args?.hours ?? 24;
-      return { method: "GET", url: `${base}/stats/timeseries?hours=${hours}` };
+      return { method: "GET", url: `${base}/stats/timeseries${statsQuery(args, 24)}` };
     }
     case "get_stats_by_model": {
-      const hours = args?.hours;
       return {
         method: "GET",
-        url: `${base}/stats/models${hours != null ? `?hours=${hours}` : ""}`,
+        url: `${base}/stats/models${statsQuery(args)}`,
       };
     }
     case "get_model_usage_stats": {
@@ -305,38 +314,33 @@ function resolveHTTP(cmd: string, args?: Record<string, unknown>): HTTPMapping {
       };
     }
     case "get_stats_by_provider": {
-      const hours = args?.hours;
       return {
         method: "GET",
-        url: `${base}/stats/providers${hours != null ? `?hours=${hours}` : ""}`,
+        url: `${base}/stats/providers${statsQuery(args)}`,
       };
     }
     case "get_provider_usage_detail": {
-      const hours = args?.hours;
       return {
         method: "GET",
-        url: `${base}/stats/providers/${encodeURIComponent(String(args?.id ?? ""))}${hours != null ? `?hours=${hours}` : ""}`,
+        url: `${base}/stats/providers/${encodeURIComponent(String(args?.id ?? ""))}${statsQuery(args)}`,
       };
     }
     case "get_stats_by_api_key": {
-      const hours = args?.hours;
       return {
         method: "GET",
-        url: `${base}/stats/api-keys${hours != null ? `?hours=${hours}` : ""}`,
+        url: `${base}/stats/api-keys${statsQuery(args)}`,
       };
     }
     case "get_api_key_usage_detail": {
-      const hours = args?.hours;
       return {
         method: "GET",
-        url: `${base}/stats/api-keys/${encodeURIComponent(String(args?.id ?? ""))}${hours != null ? `?hours=${hours}` : ""}`,
+        url: `${base}/stats/api-keys/${encodeURIComponent(String(args?.id ?? ""))}${statsQuery(args)}`,
       };
     }
     case "get_model_usage_detail": {
-      const hours = args?.hours;
       return {
         method: "GET",
-        url: `${base}/stats/models/${encodeURIComponent(String(args?.model ?? ""))}${hours != null ? `?hours=${hours}` : ""}`,
+        url: `${base}/stats/models/${encodeURIComponent(String(args?.model ?? ""))}${statsQuery(args)}`,
       };
     }
 

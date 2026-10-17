@@ -11,16 +11,11 @@ import { ProviderUsageDialog } from "@/components/provider-usage-dialog";
 import { ModelUsageDialog } from "@/components/model-usage-dialog";
 import { ProviderIcon } from "@/components/ui/provider-icon";
 import { Button } from "@/components/ui/button";
+import { StatsRangePicker } from "@/components/stats-range-picker";
 import { useLocale } from "@/lib/i18n";
+import { DEFAULT_RANGE, rangeArgs, rangeKey, rangeSpanHours, type StatsRange } from "@/lib/stats-range";
 import { equivalentCostDisplay } from "@/lib/token-usage";
 import { computeAggregateTps, formatLogTime, formatTps, tpsAggregateStatusTitle, tpsAggregateWindowTitle, tpsMetricTitle } from "@/lib/format";
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
 
 const COLORS = ["#3b82f6", "#10b981", "#f59e0b", "#ef4444", "#8b5cf6", "#ec4899", "#06b6d4", "#84cc16"];
 
@@ -47,7 +42,7 @@ export default function StatsPage() {
   const { locale } = useLocale();
   const isZh = locale === "zh-CN";
 
-  const [hours, setHours] = useState(24);
+  const [range, setRange] = useState<StatsRange>(DEFAULT_RANGE);
   const [apiKeyDialog, setApiKeyDialog] = useState<{ open: boolean; apiKeyId: string | null }>({ open: false, apiKeyId: null });
   const [providerDialog, setProviderDialog] = useState<{ open: boolean; providerId: string | null }>({ open: false, providerId: null });
   const [modelDialog, setModelDialog] = useState<{ open: boolean; model: string | null }>({ open: false, model: null });
@@ -63,36 +58,36 @@ export default function StatsPage() {
   };
 
   const { data: overview, error: overviewError, isPending: overviewPending } = useQuery<StatsOverview>({
-    queryKey: ["stats-overview", hours],
-    queryFn: () => backend("get_stats_overview", { hours }),
+    queryKey: ["stats-overview", rangeKey(range)],
+    queryFn: () => backend("get_stats_overview", rangeArgs(range)),
     refetchInterval: 10_000,
   });
 
   const { data: timeSeries } = useQuery<StatsTimeSeries>({
-    queryKey: ["stats-timeseries", hours],
-    queryFn: () => backend("get_stats_timeseries", { hours }),
+    queryKey: ["stats-timeseries", rangeKey(range)],
+    queryFn: () => backend("get_stats_timeseries", rangeArgs(range)),
     refetchInterval: 30_000,
   });
 
   const { data: modelStats = [] } = useQuery<ModelStats[]>({
-    queryKey: ["stats-models", hours],
-    queryFn: () => backend("get_stats_by_model", { hours }),
+    queryKey: ["stats-models", rangeKey(range)],
+    queryFn: () => backend("get_stats_by_model", rangeArgs(range)),
     refetchInterval: 30_000,
   });
 
   const { data: providerStats = [] } = useQuery<ProviderStats[]>({
-    queryKey: ["stats-providers", hours],
-    queryFn: () => backend("get_stats_by_provider", { hours }),
+    queryKey: ["stats-providers", rangeKey(range)],
+    queryFn: () => backend("get_stats_by_provider", rangeArgs(range)),
     refetchInterval: 30_000,
   });
 
   const { data: apiKeyStats = [] } = useQuery<ApiKeyStats[]>({
-    queryKey: ["stats-apikeys", hours],
-    queryFn: () => backend("get_stats_by_api_key", { hours }),
+    queryKey: ["stats-apikeys", rangeKey(range)],
+    queryFn: () => backend("get_stats_by_api_key", rangeArgs(range)),
     refetchInterval: 30_000,
   });
 
-  const showDateOnAxis = hours > 24;
+  const showDateOnAxis = rangeSpanHours(range) > 24;
 
   const modelPie = modelStats.slice(0, 6).map((m) => ({
     name: m.model,
@@ -116,18 +111,7 @@ export default function StatsPage() {
           <h2 className="text-base font-semibold text-slate-900">{isZh ? "请求分析" : "Request analytics"}</h2>
           <p className="mt-1 text-xs text-slate-500">{isZh ? "观察近期调用、延迟、错误与 Token 时序" : "Recent attempts, latency, errors, and token time series"}</p>
         </div>
-        <Select value={String(hours)} onValueChange={(value) => setHours(Number(value))}>
-          <SelectTrigger className="w-40">
-            <SelectValue placeholder={isZh ? "选择时间范围" : "Select range"} />
-          </SelectTrigger>
-          <SelectContent>
-            <SelectItem value="6">{isZh ? "最近 6 小时" : "Last 6h"}</SelectItem>
-            <SelectItem value="24">{isZh ? "最近 24 小时" : "Last 24h"}</SelectItem>
-            <SelectItem value="72">{isZh ? "最近 3 天" : "Last 3d"}</SelectItem>
-            <SelectItem value="168">{isZh ? "最近 7 天" : "Last 7d"}</SelectItem>
-            <SelectItem value="720">{isZh ? "最近 30 天" : "Last 30d"}</SelectItem>
-          </SelectContent>
-        </Select>
+        <StatsRangePicker value={range} onChange={setRange} />
       </div>
 
       <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
@@ -428,21 +412,21 @@ export default function StatsPage() {
       <ProviderUsageDialog
         open={providerDialog.open}
         onOpenChange={(open) => setProviderDialog((current) => ({ ...current, open }))}
-        initialHours={hours}
+        initialRange={range}
         initialProviderId={providerDialog.providerId}
       />
 
       <ApiKeyUsageDialog
         open={apiKeyDialog.open}
         onOpenChange={(open) => setApiKeyDialog((current) => ({ ...current, open }))}
-        initialHours={hours}
+        initialRange={range}
         initialApiKeyId={apiKeyDialog.apiKeyId}
       />
 
       <ModelUsageDialog
         open={modelDialog.open}
         onOpenChange={(open) => setModelDialog((current) => ({ ...current, open }))}
-        initialHours={hours}
+        initialRange={range}
         initialModel={modelDialog.model}
       />
 

@@ -210,3 +210,112 @@ async fn sqlite_latest_fifty_window_selects_before_validation() -> anyhow::Resul
     assert_eq!(stats[0].mixed.first_sample_at, None);
     Ok(())
 }
+
+#[tokio::test]
+async fn sqlite_since_filter_selects_latest_fifty_inside_window() -> anyhow::Result<()> {
+    let storage = sqlite().await?;
+    // 3 valid rows inside the window, 5 valid rows before it.
+    for index in 0..3i64 {
+        sqlx::query(
+            "INSERT INTO request_logs(id, created_at, provider_id, upstream_model, output_tokens, latency_upstream_ms) VALUES (?, ?, 'tpsp', 'since', 600, 6000)",
+        )
+        .bind(format!("since-in-{index:02}"))
+        .bind(AS_OF + index)
+        .execute(storage.pool())
+        .await?;
+    }
+    for index in 0..5i64 {
+        sqlx::query(
+            "INSERT INTO request_logs(id, created_at, provider_id, upstream_model, output_tokens, latency_upstream_ms) VALUES (?, ?, 'tpsp', 'since', 600, 6000)",
+        )
+        .bind(format!("since-old-{index:02}"))
+        .bind(AS_OF - 10_000 + index)
+        .execute(storage.pool())
+        .await?;
+    }
+    let pairs = [("tpsp".to_string(), "since".to_string())];
+    let all = storage
+        .logs()
+        .model_performance_stats(&pairs, AS_OF)
+        .await?;
+    assert_eq!(all[0].mixed.selected_request_count, 8);
+
+    let recent = storage
+        .logs()
+        .model_performance_stats_since(&pairs, AS_OF + 10, AS_OF)
+        .await?;
+    assert_eq!(recent[0].mixed.selected_request_count, 3);
+    assert_eq!(recent[0].mixed.valid_tps_count, 3);
+    assert_eq!(recent[0].mixed.first_sample_at, Some(AS_OF));
+
+    let none = storage
+        .logs()
+        .model_performance_stats_since(&pairs, AS_OF + 10, AS_OF + 1000)
+        .await?;
+    assert_eq!(none[0].mixed.selected_request_count, 0);
+    assert_eq!(none[0].mixed.average_tps, None);
+    Ok(())
+}
+
+#[tokio::test]
+async fn sqlite_stats_range_bounds_are_inclusive_and_open_ended() -> anyhow::Result<()> {
+    let storage = sqlite().await?;
+    // Rows at AS_OF + 0, 10, 20, 30 for two models.
+    for (index, model) in [(0i64, "a"), (10, "a"), (20, "b"), (30, "b")] {
+        sqlx::query(
+            "INSERT INTO request_logs(id, created_at, provider_id, upstream_model, output_tokens, latency_upstream_ms) VALUES (?, ?, 'tpsp', ?, 10, 1000)",
+        )
+        .bind(format!("range-{index}"))
+        .bind(AS_OF + index)
+        .bind(model)
+        .execute(storage.pool())
+        .await?;
+    }
+    let logs = storage.logs();
+    assert_eq!(
+        logs.stats_overview_range(None, None).await?.total_requests,
+        4
+    );
+    // Both bounds are inclusive.
+    assert_eq!(
+        logs.stats_overview_range(Some(AS_OF + 10), Some(AS_OF + 20))
+            .await?
+            .total_requests,
+        2
+    );
+    // Open-ended on either side.
+    assert_eq!(
+        logs.stats_overview_range(Some(AS_OF + 11), None)
+            .await?
+            .total_requests,
+        2
+    );
+    assert_eq!(
+        logs.stats_overview_range(None, Some(AS_OF + 9))
+            .await?
+            .total_requests,
+        1
+    );
+    // Empty window.
+    assert_eq!(
+        logs.stats_overview_range(Some(AS_OF + 100), None)
+            .await?
+            .total_requests,
+        0
+    );
+
+    let by_model = logs
+        .stats_by_model_range(Some(AS_OF + 10), Some(AS_OF + 20))
+        .await?;
+    let counts: Vec<_> = by_model
+        .iter()
+        .map(|m| (m.model.clone(), m.request_count))
+        .collect();
+    assert_eq!(counts.len(), 2);
+    assert!(counts.contains(&("a".to_string(), 1)) && counts.contains(&("b".to_string(), 1)));
+
+    let by_provider = logs.stats_by_provider_range(Some(AS_OF + 20), None).await?;
+    assert_eq!(by_provider.len(), 1);
+    assert_eq!(by_provider[0].request_count, 2);
+    Ok(())
+}

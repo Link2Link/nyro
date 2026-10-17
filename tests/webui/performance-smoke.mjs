@@ -538,7 +538,7 @@ try {
   assert.equal(seedExit, 0, `Scratch SQLite seed failed: ${report.childLogs['sqlite-seed']}`);
   report.seed = JSON.parse(report.childLogs['sqlite-seed'].trim());
   const snapshot=await api('/model-performance'); report.snapshot=snapshot;
-  assert.equal(snapshot.window_start,null,'Retained logs have no seven-day performance cutoff');
+  assert.equal(snapshot.window_start,snapshot.as_of-7*24*60*60*1000,'Performance samples cover the last seven days');
   assert.equal(snapshot.models.length,rowPairs.length,'One row per matched prefix × provider, never one per logged variant');
   const groupFor=pair=>snapshot.models.find(item=>item.provider_id===pair.provider.id && item.model_prefix.toLowerCase()===prefixOf(pair).toLowerCase());
   const variantStats=(item,pair)=>item.variants.find(variant=>variant.upstream_model.toLowerCase()===pair.model.toLowerCase());

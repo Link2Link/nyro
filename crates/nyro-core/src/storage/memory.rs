@@ -285,7 +285,11 @@ impl LogStore for MemoryStorage {
         Ok(0)
     }
 
-    async fn stats_overview(&self, _hours: Option<i64>) -> anyhow::Result<StatsOverview> {
+    async fn stats_overview_range(
+        &self,
+        _start_at: Option<i64>,
+        _end_at: Option<i64>,
+    ) -> anyhow::Result<StatsOverview> {
         Ok(StatsOverview::default())
     }
 
@@ -322,7 +326,11 @@ impl LogStore for MemoryStorage {
         Ok(vec![])
     }
 
-    async fn stats_by_model(&self, _hours: Option<i64>) -> anyhow::Result<Vec<ModelStats>> {
+    async fn stats_by_model_range(
+        &self,
+        _start_at: Option<i64>,
+        _end_at: Option<i64>,
+    ) -> anyhow::Result<Vec<ModelStats>> {
         Ok(vec![])
     }
 
@@ -334,7 +342,11 @@ impl LogStore for MemoryStorage {
         Ok(ModelUsageStats::default())
     }
 
-    async fn stats_by_provider(&self, _hours: Option<i64>) -> anyhow::Result<Vec<ProviderStats>> {
+    async fn stats_by_provider_range(
+        &self,
+        _start_at: Option<i64>,
+        _end_at: Option<i64>,
+    ) -> anyhow::Result<Vec<ProviderStats>> {
         Ok(vec![])
     }
 
@@ -372,7 +384,11 @@ impl LogStore for MemoryStorage {
         })
     }
 
-    async fn stats_by_api_key(&self, _hours: Option<i64>) -> anyhow::Result<Vec<ApiKeyStats>> {
+    async fn stats_by_api_key_range(
+        &self,
+        _start_at: Option<i64>,
+        _end_at: Option<i64>,
+    ) -> anyhow::Result<Vec<ApiKeyStats>> {
         Ok(vec![])
     }
 
@@ -711,8 +727,7 @@ mod oauth_time_tests {
         }
         {
             let mut rows = store.credentials.write().await;
-            rows.get_mut("old-a").unwrap().updated_at =
-                "2000-01-01T01:00:00+01:00".to_string();
+            rows.get_mut("old-a").unwrap().updated_at = "2000-01-01T01:00:00+01:00".to_string();
             rows.get_mut("old-codex").unwrap().updated_at = "2000-01-01 00:00:00".to_string();
         }
         assert_eq!(

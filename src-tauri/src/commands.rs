@@ -505,9 +505,15 @@ pub async fn clear_error_logs(gw: State<'_, Gateway>) -> Result<u64, String> {
 pub async fn get_stats_overview(
     gw: State<'_, Gateway>,
     hours: Option<i32>,
+    start_at: Option<i64>,
+    end_at: Option<i64>,
 ) -> Result<StatsOverview, String> {
     gw.admin()
-        .get_stats_overview(hours)
+        .get_stats_overview(nyro_core::admin::StatsRange {
+            hours,
+            start_at,
+            end_at,
+        })
         .await
         .map_err(|e| e.to_string())
 }
@@ -527,9 +533,15 @@ pub async fn get_stats_hourly(
 pub async fn get_stats_timeseries(
     gw: State<'_, Gateway>,
     hours: Option<i32>,
+    start_at: Option<i64>,
+    end_at: Option<i64>,
 ) -> Result<StatsTimeSeries, String> {
     gw.admin()
-        .get_stats_timeseries(hours)
+        .get_stats_timeseries(nyro_core::admin::StatsRange {
+            hours,
+            start_at,
+            end_at,
+        })
         .await
         .map_err(|e| e.to_string())
 }
@@ -572,9 +584,15 @@ pub async fn get_token_usage_stats(
 pub async fn get_stats_by_model(
     gw: State<'_, Gateway>,
     hours: Option<i32>,
+    start_at: Option<i64>,
+    end_at: Option<i64>,
 ) -> Result<Vec<ModelStats>, String> {
     gw.admin()
-        .get_stats_by_model(hours)
+        .get_stats_by_model(nyro_core::admin::StatsRange {
+            hours,
+            start_at,
+            end_at,
+        })
         .await
         .map_err(|e| e.to_string())
 }
@@ -595,9 +613,15 @@ pub async fn get_model_usage_stats(
 pub async fn get_stats_by_provider(
     gw: State<'_, Gateway>,
     hours: Option<i32>,
+    start_at: Option<i64>,
+    end_at: Option<i64>,
 ) -> Result<Vec<ProviderStats>, String> {
     gw.admin()
-        .get_stats_by_provider(hours)
+        .get_stats_by_provider(nyro_core::admin::StatsRange {
+            hours,
+            start_at,
+            end_at,
+        })
         .await
         .map_err(|e| e.to_string())
 }
@@ -607,9 +631,18 @@ pub async fn get_provider_usage_detail(
     gw: State<'_, Gateway>,
     id: String,
     hours: Option<i32>,
+    start_at: Option<i64>,
+    end_at: Option<i64>,
 ) -> Result<ProviderUsageDetail, String> {
     gw.admin()
-        .get_provider_usage_detail(&id, hours)
+        .get_provider_usage_detail(
+            &id,
+            nyro_core::admin::StatsRange {
+                hours,
+                start_at,
+                end_at,
+            },
+        )
         .await
         .map_err(|e| e.to_string())
 }
@@ -618,9 +651,15 @@ pub async fn get_provider_usage_detail(
 pub async fn get_stats_by_api_key(
     gw: State<'_, Gateway>,
     hours: Option<i32>,
+    start_at: Option<i64>,
+    end_at: Option<i64>,
 ) -> Result<Vec<ApiKeyStats>, String> {
     gw.admin()
-        .get_stats_by_api_key(hours)
+        .get_stats_by_api_key(nyro_core::admin::StatsRange {
+            hours,
+            start_at,
+            end_at,
+        })
         .await
         .map_err(|e| e.to_string())
 }
@@ -630,9 +669,18 @@ pub async fn get_api_key_usage_detail(
     gw: State<'_, Gateway>,
     id: String,
     hours: Option<i32>,
+    start_at: Option<i64>,
+    end_at: Option<i64>,
 ) -> Result<ApiKeyUsageDetail, String> {
     gw.admin()
-        .get_api_key_usage_detail(&id, hours)
+        .get_api_key_usage_detail(
+            &id,
+            nyro_core::admin::StatsRange {
+                hours,
+                start_at,
+                end_at,
+            },
+        )
         .await
         .map_err(|e| e.to_string())
 }
@@ -642,9 +690,18 @@ pub async fn get_model_usage_detail(
     gw: State<'_, Gateway>,
     model: String,
     hours: Option<i32>,
+    start_at: Option<i64>,
+    end_at: Option<i64>,
 ) -> Result<ModelUsageDetail, String> {
     gw.admin()
-        .get_model_usage_detail(&model, hours)
+        .get_model_usage_detail(
+            &model,
+            nyro_core::admin::StatsRange {
+                hours,
+                start_at,
+                end_at,
+            },
+        )
         .await
         .map_err(|e| e.to_string())
 }

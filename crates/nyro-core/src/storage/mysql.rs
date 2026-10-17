@@ -1300,6 +1300,24 @@ impl LogStore for MysqlLogStore {
             self,
             pairs,
             as_of,
+            None::<i64>,
+            sqlx::MySql,
+            "BINARY upstream_model",
+            "CAST(created_at AS SIGNED)",
+            "0"
+        )
+    }
+    async fn model_performance_stats_since(
+        &self,
+        pairs: &[(String, String)],
+        as_of: i64,
+        since: i64,
+    ) -> anyhow::Result<Vec<crate::db::PairPerformanceStats>> {
+        crate::db::model_performance::model_performance_method!(
+            self,
+            pairs,
+            as_of,
+            Some(since),
             sqlx::MySql,
             "BINARY upstream_model",
             "CAST(created_at AS SIGNED)",
@@ -1657,17 +1675,16 @@ impl LogStore for MysqlLogStore {
         Ok(result.rows_affected())
     }
 
-    async fn stats_overview(&self, hours: Option<i64>) -> anyhow::Result<StatsOverview> {
+    async fn stats_overview_range(
+        &self,
+        start_at: Option<i64>,
+        end_at: Option<i64>,
+    ) -> anyhow::Result<StatsOverview> {
+        let range = crate::storage::traits::range_sql(start_at, end_at);
         let error = error_sql("");
-        let sql = if let Some(hours) = hours {
-            format!(
-                "SELECT COUNT(*) AS total_requests, CAST(COALESCE(SUM(input_tokens), 0) AS SIGNED) AS total_input_tokens, CAST(COALESCE(SUM(output_tokens), 0) AS SIGNED) AS total_output_tokens, CAST(COALESCE(SUM(cache_read_tokens), 0) AS SIGNED) AS total_cache_read_tokens, CAST(COALESCE(AVG(latency_total_ms), 0) AS DOUBLE) AS avg_duration_ms, CAST(COALESCE(SUM(CASE WHEN {error} THEN 1 ELSE 0 END), 0) AS SIGNED) AS error_count FROM request_logs WHERE created_at >= UNIX_TIMESTAMP(NOW() - INTERVAL {hours} HOUR) * 1000"
-            )
-        } else {
-            format!(
-                "SELECT COUNT(*) AS total_requests, CAST(COALESCE(SUM(input_tokens), 0) AS SIGNED) AS total_input_tokens, CAST(COALESCE(SUM(output_tokens), 0) AS SIGNED) AS total_output_tokens, CAST(COALESCE(SUM(cache_read_tokens), 0) AS SIGNED) AS total_cache_read_tokens, CAST(COALESCE(AVG(latency_total_ms), 0) AS DOUBLE) AS avg_duration_ms, CAST(COALESCE(SUM(CASE WHEN {error} THEN 1 ELSE 0 END), 0) AS SIGNED) AS error_count FROM request_logs"
-            )
-        };
+        let sql = format!(
+            "SELECT COUNT(*) AS total_requests, CAST(COALESCE(SUM(input_tokens), 0) AS SIGNED) AS total_input_tokens, CAST(COALESCE(SUM(output_tokens), 0) AS SIGNED) AS total_output_tokens, CAST(COALESCE(SUM(cache_read_tokens), 0) AS SIGNED) AS total_cache_read_tokens, CAST(COALESCE(AVG(latency_total_ms), 0) AS DOUBLE) AS avg_duration_ms, CAST(COALESCE(SUM(CASE WHEN {error} THEN 1 ELSE 0 END), 0) AS SIGNED) AS error_count FROM request_logs WHERE {range}"
+        );
         Ok(sqlx::query_as::<_, StatsOverview>(&sql)
             .fetch_one(&self.pool)
             .await?)
@@ -1754,17 +1771,16 @@ impl LogStore for MysqlLogStore {
         .await?)
     }
 
-    async fn stats_by_model(&self, hours: Option<i64>) -> anyhow::Result<Vec<ModelStats>> {
+    async fn stats_by_model_range(
+        &self,
+        start_at: Option<i64>,
+        end_at: Option<i64>,
+    ) -> anyhow::Result<Vec<ModelStats>> {
+        let range = crate::storage::traits::range_sql(start_at, end_at);
         let tps = crate::db::tps::tps_totals_columns(crate::db::tps::TpsSqlDialect::Mysql);
-        let sql = if let Some(hours) = hours {
-            format!(
-                "SELECT upstream_model AS model, COUNT(*) AS request_count, CAST(COALESCE(SUM(input_tokens), 0) AS SIGNED) AS total_input_tokens, CAST(COALESCE(SUM(output_tokens), 0) AS SIGNED) AS total_output_tokens, CAST(COALESCE(SUM(cache_read_tokens), 0) AS SIGNED) AS total_cache_read_tokens, CAST(COALESCE(AVG(latency_total_ms), 0) AS DOUBLE) AS avg_duration_ms, CAST(COALESCE(SUM(latency_upstream_ms), 0) AS DOUBLE) AS total_upstream_ms, {tps} FROM request_logs WHERE created_at >= UNIX_TIMESTAMP(NOW() - INTERVAL {hours} HOUR) * 1000 GROUP BY upstream_model ORDER BY request_count DESC"
-            )
-        } else {
-            format!(
-                "SELECT upstream_model AS model, COUNT(*) AS request_count, CAST(COALESCE(SUM(input_tokens), 0) AS SIGNED) AS total_input_tokens, CAST(COALESCE(SUM(output_tokens), 0) AS SIGNED) AS total_output_tokens, CAST(COALESCE(SUM(cache_read_tokens), 0) AS SIGNED) AS total_cache_read_tokens, CAST(COALESCE(AVG(latency_total_ms), 0) AS DOUBLE) AS avg_duration_ms, CAST(COALESCE(SUM(latency_upstream_ms), 0) AS DOUBLE) AS total_upstream_ms, {tps} FROM request_logs GROUP BY upstream_model ORDER BY request_count DESC"
-            )
-        };
+        let sql = format!(
+            "SELECT upstream_model AS model, COUNT(*) AS request_count, CAST(COALESCE(SUM(input_tokens), 0) AS SIGNED) AS total_input_tokens, CAST(COALESCE(SUM(output_tokens), 0) AS SIGNED) AS total_output_tokens, CAST(COALESCE(SUM(cache_read_tokens), 0) AS SIGNED) AS total_cache_read_tokens, CAST(COALESCE(AVG(latency_total_ms), 0) AS DOUBLE) AS avg_duration_ms, CAST(COALESCE(SUM(latency_upstream_ms), 0) AS DOUBLE) AS total_upstream_ms, {tps} FROM request_logs WHERE {range} GROUP BY upstream_model ORDER BY request_count DESC"
+        );
         Ok(sqlx::query_as::<_, ModelStats>(&sql)
             .fetch_all(&self.pool)
             .await?)
@@ -1800,14 +1816,15 @@ impl LogStore for MysqlLogStore {
         .await?;
         Ok(ModelUsageStats::from_samples(totals, &samples))
     }
-    async fn stats_by_provider(&self, hours: Option<i64>) -> anyhow::Result<Vec<ProviderStats>> {
+    async fn stats_by_provider_range(
+        &self,
+        start_at: Option<i64>,
+        end_at: Option<i64>,
+    ) -> anyhow::Result<Vec<ProviderStats>> {
+        let range = crate::storage::traits::range_sql(start_at, end_at);
         let error = error_sql("");
         let tps = crate::db::tps::tps_totals_columns(crate::db::tps::TpsSqlDialect::Mysql);
-        let time_filter = hours
-            .map(|hours| {
-                format!(" AND created_at >= UNIX_TIMESTAMP(NOW() - INTERVAL {hours} HOUR) * 1000")
-            })
-            .unwrap_or_default();
+        let time_filter = format!(" AND {range}");
         let sql = format!(
             "WITH aggregated AS (SELECT provider_id, COUNT(*) AS request_count, CAST(COALESCE(SUM(CASE WHEN {error} THEN 1 ELSE 0 END), 0) AS SIGNED) AS error_count, CAST(COALESCE(AVG(latency_total_ms), 0) AS DOUBLE) AS avg_duration_ms, CAST(COALESCE(SUM(output_tokens), 0) AS SIGNED) AS total_output_tokens, CAST(COALESCE(SUM(latency_upstream_ms), 0) AS DOUBLE) AS total_upstream_ms, {tps} FROM request_logs WHERE provider_id IS NOT NULL AND TRIM(provider_id) <> ''{time_filter} GROUP BY provider_id) SELECT a.provider_id, COALESCE((SELECT NULLIF(TRIM(r.provider_name), '') FROM request_logs r WHERE r.provider_id = a.provider_id AND NULLIF(TRIM(r.provider_name), '') IS NOT NULL ORDER BY r.created_at DESC, r.id DESC LIMIT 1), a.provider_id) AS provider, CAST(NULL AS CHAR) AS provider_icon, CAST(NULL AS CHAR) AS provider_protocol, a.request_count, a.error_count, a.avg_duration_ms, a.total_output_tokens, a.total_upstream_ms, a.tps_content_tokens, a.tps_output_tokens, a.tps_elapsed_ms FROM aggregated a ORDER BY a.request_count DESC, a.provider_id ASC"
         );
@@ -1874,13 +1891,14 @@ impl LogStore for MysqlLogStore {
         })
     }
 
-    async fn stats_by_api_key(&self, hours: Option<i64>) -> anyhow::Result<Vec<ApiKeyStats>> {
+    async fn stats_by_api_key_range(
+        &self,
+        start_at: Option<i64>,
+        end_at: Option<i64>,
+    ) -> anyhow::Result<Vec<ApiKeyStats>> {
+        let range = crate::storage::traits::range_sql(start_at, end_at);
         let error = error_sql("l");
-        let time_filter = hours
-            .map(|hours| {
-                format!(" AND created_at >= UNIX_TIMESTAMP(NOW() - INTERVAL {hours} HOUR) * 1000")
-            })
-            .unwrap_or_default();
+        let time_filter = format!(" AND {range}");
         let sql = format!(
             "SELECT COALESCE(l.api_key_id, '') AS api_key_id, \
              COALESCE((SELECT NULLIF(r.api_key_name, '') FROM request_logs r \

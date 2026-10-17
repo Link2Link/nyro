@@ -170,6 +170,17 @@ pub trait LogStore: Send + Sync {
     ) -> anyhow::Result<Vec<crate::db::PairPerformanceStats>> {
         anyhow::bail!("model performance statistics are unsupported by this storage")
     }
+    /// Same statistics, but the latest-fifty window is selected only from calls
+    /// created at or after `since` (ms epoch). Used by the Performance page to
+    /// keep the chart to recent traffic; `model_performance_stats` stays unfiltered.
+    async fn model_performance_stats_since(
+        &self,
+        _pairs: &[(String, String)],
+        _as_of: i64,
+        _since: i64,
+    ) -> anyhow::Result<Vec<crate::db::PairPerformanceStats>> {
+        anyhow::bail!("windowed model performance statistics are unsupported by this storage")
+    }
     /// Distinct (provider_id, upstream_model) pairs across all retained logs;
     /// the candidate set for prefix-matched performance statistics. Same
     /// retention scope as model_performance_stats.
@@ -198,7 +209,17 @@ pub trait LogStore: Send + Sync {
     async fn delete_by_id(&self, id: &str) -> anyhow::Result<u64>;
     /// Delete attempts matching the shared authoritative error predicate.
     async fn clear_errors(&self) -> anyhow::Result<u64>;
-    async fn stats_overview(&self, hours: Option<i64>) -> anyhow::Result<StatsOverview>;
+    /// Rolling "last N hours" window; `None` covers every retained log.
+    async fn stats_overview(&self, hours: Option<i64>) -> anyhow::Result<StatsOverview> {
+        self.stats_overview_range(hours_window_start(hours), None)
+            .await
+    }
+    /// Inclusive `created_at` range in epoch ms; a `None` bound is open.
+    async fn stats_overview_range(
+        &self,
+        start_at: Option<i64>,
+        end_at: Option<i64>,
+    ) -> anyhow::Result<StatsOverview>;
     async fn stats_hourly(&self, hours: i64) -> anyhow::Result<Vec<StatsHourly>>;
     async fn stats_time_buckets(
         &self,
@@ -214,20 +235,50 @@ pub trait LogStore: Send + Sync {
         start_at: i64,
         end_at: i64,
     ) -> anyhow::Result<Vec<crate::db::models::TokenUsageDay>>;
-    async fn stats_by_model(&self, hours: Option<i64>) -> anyhow::Result<Vec<ModelStats>>;
+    /// Rolling "last N hours" window; `None` covers every retained log.
+    async fn stats_by_model(&self, hours: Option<i64>) -> anyhow::Result<Vec<ModelStats>> {
+        self.stats_by_model_range(hours_window_start(hours), None)
+            .await
+    }
+    /// Inclusive `created_at` range in epoch ms; a `None` bound is open.
+    async fn stats_by_model_range(
+        &self,
+        start_at: Option<i64>,
+        end_at: Option<i64>,
+    ) -> anyhow::Result<Vec<ModelStats>>;
     async fn model_usage_stats(
         &self,
         provider_id: &str,
         upstream_model: &str,
     ) -> anyhow::Result<ModelUsageStats>;
-    async fn stats_by_provider(&self, hours: Option<i64>) -> anyhow::Result<Vec<ProviderStats>>;
+    /// Rolling "last N hours" window; `None` covers every retained log.
+    async fn stats_by_provider(&self, hours: Option<i64>) -> anyhow::Result<Vec<ProviderStats>> {
+        self.stats_by_provider_range(hours_window_start(hours), None)
+            .await
+    }
+    /// Inclusive `created_at` range in epoch ms; a `None` bound is open.
+    async fn stats_by_provider_range(
+        &self,
+        start_at: Option<i64>,
+        end_at: Option<i64>,
+    ) -> anyhow::Result<Vec<ProviderStats>>;
     async fn provider_usage_detail(
         &self,
         provider_id: &str,
         start_at: i64,
         end_at: i64,
     ) -> anyhow::Result<ProviderUsageDetail>;
-    async fn stats_by_api_key(&self, hours: Option<i64>) -> anyhow::Result<Vec<ApiKeyStats>>;
+    /// Rolling "last N hours" window; `None` covers every retained log.
+    async fn stats_by_api_key(&self, hours: Option<i64>) -> anyhow::Result<Vec<ApiKeyStats>> {
+        self.stats_by_api_key_range(hours_window_start(hours), None)
+            .await
+    }
+    /// Inclusive `created_at` range in epoch ms; a `None` bound is open.
+    async fn stats_by_api_key_range(
+        &self,
+        start_at: Option<i64>,
+        end_at: Option<i64>,
+    ) -> anyhow::Result<Vec<ApiKeyStats>>;
     async fn api_key_usage_detail(
         &self,
         api_key_id: &str,
@@ -349,3 +400,47 @@ pub trait Storage: Send + Sync {
 }
 
 pub type DynStorage = Arc<dyn Storage>;
+
+/// Start of a rolling "last N hours" window as epoch ms; `None` stays unbounded.
+pub fn hours_window_start(hours: Option<i64>) -> Option<i64> {
+    hours.map(|hours| {
+        chrono::Utc::now()
+            .timestamp_millis()
+            .saturating_sub(hours.saturating_mul(3_600_000))
+    })
+}
+
+/// Inclusive `created_at` predicate for the stats queries. Only integer
+/// literals are inlined, so it is injection-safe; no bound yields `1=1`.
+pub fn range_sql(start_at: Option<i64>, end_at: Option<i64>) -> String {
+    match (start_at, end_at) {
+        (Some(start), Some(end)) => format!("created_at >= {start} AND created_at <= {end}"),
+        (Some(start), None) => format!("created_at >= {start}"),
+        (None, Some(end)) => format!("created_at <= {end}"),
+        (None, None) => "1=1".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod range_tests {
+    use super::*;
+
+    #[test]
+    fn range_sql_covers_every_bound_combination() {
+        assert_eq!(range_sql(None, None), "1=1");
+        assert_eq!(range_sql(Some(5), None), "created_at >= 5");
+        assert_eq!(range_sql(None, Some(9)), "created_at <= 9");
+        assert_eq!(
+            range_sql(Some(5), Some(9)),
+            "created_at >= 5 AND created_at <= 9"
+        );
+    }
+
+    #[test]
+    fn hours_window_start_is_none_without_hours_and_in_the_past_otherwise() {
+        assert_eq!(hours_window_start(None), None);
+        let now = chrono::Utc::now().timestamp_millis();
+        let start = hours_window_start(Some(2)).unwrap();
+        assert!((now - start - 7_200_000).abs() < 5_000);
+    }
+}

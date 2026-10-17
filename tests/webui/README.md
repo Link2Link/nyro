@@ -146,8 +146,8 @@ independently compares **every logged stream's variant** `mixed.average_tps` wit
 `/api/v1/providers/:id/model-usage?model=...` using exact numeric equality, saves both
 responses in `report.json`, and asserts the group's `mixed` merges its variants by
 summing valid-sample tokens and durations (TPS = Σtokens ÷ Σduration, never an
-arithmetic mean of per-call rates). `window_start` is `null`: there is no seven-day
-cutoff beyond whatever request logs are still retained.
+arithmetic mean of per-call rates). `window_start` is `as_of` minus seven days: only calls
+from the last seven days are sampled.
 
 Coverage:
 

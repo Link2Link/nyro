@@ -16,8 +16,8 @@ import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 
 /** 统一输出 TPS 口径说明（总输出 Token 的端到端体感吞吐）。 */
-const TPS_INFO_ZH = "横轴按当前可见点的最低分向下、最高分向上取整至 10 的倍数自动缩放（满分 100），并在左右两端留出标记边距，极值点不会压在坐标轴上；纵轴为输出 TPS：总输出 Token ÷ Σ有效请求耗时（推理 Token 计入输出；耗时取上游耗时，仅未记录时回退总耗时，含首字延迟）。输出 ≤ 0 不计入。每个变体先取已保留日志中最近 50 次调用、再校验有效性，无效样本占位不回填更早记录。每个点显示该供应商的图标，虚线边框表示不足 3 个有效样本。不是主动测速或全历史平均。";
-const TPS_INFO_EN = "X automatically rounds the visible minimum score down and maximum up to multiples of 10 (scores remain out of 100) and keeps marker room at both ends, so extremes never straddle the axes; Y is output TPS: total output tokens ÷ Σvalid-request duration (reasoning tokens stay in the output; duration uses upstream latency, falling back to total latency only when unrecorded, and includes first-token latency). Output ≤ 0 is excluded. Each variant selects its latest 50 retained calls first, then validates them: invalid samples consume the window without refilling older records. Every point shows its provider's icon; a dashed border marks fewer than 3 valid samples. This is not an active benchmark or an all-time average.";
+const TPS_INFO_ZH = "横轴按当前可见点的最低分向下、最高分向上取整至 10 的倍数自动缩放（满分 100），并在左右两端留出标记边距，极值点不会压在坐标轴上；纵轴为输出 TPS：总输出 Token ÷ Σ有效请求耗时（推理 Token 计入输出；耗时取上游耗时，仅未记录时回退总耗时，含首字延迟）。输出 ≤ 0 不计入。仅统计最近 7 天内的调用：每个变体先取这 7 天内最近 50 次调用、再校验有效性，无效样本占位不回填更早记录；7 天内没有调用的变体不绘图。每个点显示该供应商的图标，虚线边框表示不足 3 个有效样本。不是主动测速或长期平均。";
+const TPS_INFO_EN = "X automatically rounds the visible minimum score down and maximum up to multiples of 10 (scores remain out of 100) and keeps marker room at both ends, so extremes never straddle the axes; Y is output TPS: total output tokens ÷ Σvalid-request duration (reasoning tokens stay in the output; duration uses upstream latency, falling back to total latency only when unrecorded, and includes first-token latency). Output ≤ 0 is excluded. Only calls from the last 7 days count: each variant selects its latest 50 calls inside that window first, then validates them (invalid samples consume the window without refilling older records); variants with no call in the last 7 days are not plotted. Every point shows its provider's icon; a dashed border marks fewer than 3 valid samples. This is not an active benchmark or a long-term average.";
 
 export default function PerformancePage() {
   const { locale } = useLocale();
@@ -81,13 +81,13 @@ export default function PerformancePage() {
             <h2 className="text-sm font-semibold text-slate-800">{isZh ? "能力 × 速度（端到端 TPS）" : "Capability × speed (end-to-end TPS)"}</h2>
             <p className="mt-1 text-xs text-slate-500">
               {isZh
-                ? "输出 TPS 按最近 50 次采样内有效请求的 Σ输出 Token ÷ Σ耗时 计算（端到端，含首字延迟与推理 Token）。仅包络线上的点直接显示前缀与供应商名称；虚线连接速度维度的右上凸包边界。"
-                : "Output TPS is Σoutput tokens ÷ Σduration over valid requests inside the latest-50 sample window (end-to-end, including first-token latency and reasoning tokens). Only envelope points are labeled directly; the dashed line follows the upper-right convex boundary."}
+                ? "输出 TPS 按最近 7 天内最近 50 次采样中有效请求的 Σ输出 Token ÷ Σ耗时 计算（端到端，含首字延迟与推理 Token）。仅包络线上的点直接显示前缀与供应商名称；虚线连接速度维度的右上凸包边界。"
+                : "Output TPS is Σoutput tokens ÷ Σduration over valid requests inside the latest-50 sample window of the last 7 days (end-to-end, including first-token latency and reasoning tokens). Only envelope points are labeled directly; the dashed line follows the upper-right convex boundary."}
             </p>
           </div>
           <ModelPerformanceChart points={points} isZh={isZh} />
           {!points.length && <div role="status" className="flex items-center justify-center gap-2 border-t border-slate-200 p-4 text-sm text-slate-500"><Activity className="h-4 w-4 shrink-0" />
-            {!rows.length ? <span>{isZh ? "尚无已评分且已产生流量的前缀。" : "No rated prefix has logged traffic yet."} <Link to="/model-ratings" className="text-blue-600 underline">{isZh ? "前往评分" : "Rate models"}</Link></span> : !visible.length ? (isZh ? "没有匹配的分组。" : "No groups match your filters.") : (isZh ? "暂无可绘制的数据；请查看下方状态。" : "No plottable data; check the statuses below.")}</div>}
+            {!rows.length ? <span>{isZh ? "最近 7 天内尚无已评分且已产生流量的前缀。" : "No rated prefix has logged traffic in the last 7 days."} <Link to="/model-ratings" className="text-blue-600 underline">{isZh ? "前往评分" : "Rate models"}</Link></span> : !visible.length ? (isZh ? "没有匹配的分组。" : "No groups match your filters.") : (isZh ? "暂无可绘制的数据；请查看下方状态。" : "No plottable data; check the statuses below.")}</div>}
         </section>
         <details className="glass rounded-2xl p-4" open={missing.length > 0}>
           <summary className="cursor-pointer text-sm font-semibold">{isZh ? "所有分组状态与诊断" : "All group statuses & diagnostics"} ({visible.length})</summary>

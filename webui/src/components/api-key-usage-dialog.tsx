@@ -29,7 +29,9 @@ import {
   tpsAggregateWindowTitle,
   tpsMetricTitle,
 } from "@/lib/format";
+import { StatsRangePicker } from "@/components/stats-range-picker";
 import { useLocale } from "@/lib/i18n";
+import { DEFAULT_RANGE, rangeArgs, rangeKey, rangeSpanHours, type StatsRange } from "@/lib/stats-range";
 import {
   outcomeFilterValue,
   outcomeQuery,
@@ -72,13 +74,10 @@ type Tab = "overview" | "requests";
 export interface ApiKeyUsageDialogProps {
   open: boolean;
   onOpenChange: (open: boolean) => void;
-  initialHours?: number;
+  initialRange?: StatsRange;
   initialApiKeyId?: string | null;
 }
-const RANGES = [6, 24, 72, 168, 720] as const;
 const PAGE_SIZE = 10;
-const safeHours = (value?: number) =>
-  RANGES.includes(value as (typeof RANGES)[number]) ? value! : 24;
 const err = (value: unknown, fallback: string) =>
   value instanceof Error && value.message ? value.message : fallback;
 const routeKey = (r: ApiKeyModelRouteStats) =>
@@ -90,14 +89,14 @@ const protocolLabel = (value?: string | null) =>
 export function ApiKeyUsageDialog({
   open,
   onOpenChange,
-  initialHours,
+  initialRange,
   initialApiKeyId,
 }: ApiKeyUsageDialogProps) {
   const { locale } = useLocale();
   const zh = locale === "zh-CN";
   const previousOpen = useRef(false);
   const defaultSelectionMade = useRef(initialApiKeyId != null);
-  const [hours, setHours] = useState(() => safeHours(initialHours));
+  const [range, setRange] = useState<StatsRange>(() => initialRange ?? DEFAULT_RANGE);
   const [selectedId, setSelectedId] = useState<string | null>(
     initialApiKeyId ?? null,
   );
@@ -112,7 +111,7 @@ export function ApiKeyUsageDialog({
   useEffect(() => {
     if (open && !previousOpen.current) {
       // eslint-disable-next-line react-hooks/set-state-in-effect
-      setHours(safeHours(initialHours));
+      setRange(initialRange ?? DEFAULT_RANGE);
       setSelectedId(initialApiKeyId ?? null);
       setTab("overview");
       setStatus("all");
@@ -123,11 +122,11 @@ export function ApiKeyUsageDialog({
       defaultSelectionMade.current = initialApiKeyId != null;
     }
     previousOpen.current = open;
-  }, [open, initialHours, initialApiKeyId]);
+  }, [open, initialRange, initialApiKeyId]);
 
   const list = useQuery<ApiKeyStats[]>({
-    queryKey: ["api-key-usage-list", hours],
-    queryFn: () => backend("get_stats_by_api_key", { hours }),
+    queryKey: ["api-key-usage-list", rangeKey(range)],
+    queryFn: () => backend("get_stats_by_api_key", rangeArgs(range)),
     enabled: open,
     refetchInterval: open ? 30_000 : false,
   });
@@ -156,9 +155,9 @@ export function ApiKeyUsageDialog({
   }, [open, list.data, selectedId]);
 
   const detail = useQuery<ApiKeyUsageDetail>({
-    queryKey: ["api-key-usage-detail", selectedId, hours],
+    queryKey: ["api-key-usage-detail", selectedId, rangeKey(range)],
     queryFn: () =>
-      backend("get_api_key_usage_detail", { id: selectedId!, hours }),
+      backend("get_api_key_usage_detail", { id: selectedId!, ...rangeArgs(range) }),
     enabled: open && !!selectedId,
     refetchInterval:
       open && selectedId ? (tab === "requests" ? 5_000 : 30_000) : false,
@@ -234,40 +233,17 @@ export function ApiKeyUsageDialog({
                 </DialogDescription>
               </div>
               <div className="flex flex-wrap gap-2">
-                <Select
-                  value={String(hours)}
-                  onValueChange={(v) => {
-                    setHours(Number(v));
+                <StatsRangePicker
+                  value={range}
+                  showIcon
+                  triggerClassName="h-9 w-[132px]"
+                  onChange={(next) => {
+                    setRange(next);
                     if (selectedId === null) defaultSelectionMade.current = false;
                     setRoute(null);
                     setPage(0);
                   }}
-                >
-                  <SelectTrigger
-                    className="h-9 w-[132px]"
-                    aria-label={zh ? "时间范围" : "Time range"}
-                  >
-                    <Clock3 className="mr-1 h-3.5 w-3.5" />
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="6">
-                      {zh ? "最近 6 小时" : "Last 6h"}
-                    </SelectItem>
-                    <SelectItem value="24">
-                      {zh ? "最近 24 小时" : "Last 24h"}
-                    </SelectItem>
-                    <SelectItem value="72">
-                      {zh ? "最近 3 天" : "Last 3d"}
-                    </SelectItem>
-                    <SelectItem value="168">
-                      {zh ? "最近 7 天" : "Last 7d"}
-                    </SelectItem>
-                    <SelectItem value="720">
-                      {zh ? "最近 30 天" : "Last 30d"}
-                    </SelectItem>
-                  </SelectContent>
-                </Select>
+                />
                 <Select
                   value={selectedId ?? undefined}
                   onValueChange={(v) => {
@@ -370,7 +346,7 @@ export function ApiKeyUsageDialog({
                   <Overview
                     detail={detail.data}
                     zh={zh}
-                    showDateOnAxis={hours > 24}
+                    showDateOnAxis={rangeSpanHours(range) > 24}
                     onRoute={selectRoute}
                   />
                 )}

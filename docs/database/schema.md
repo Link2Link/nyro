@@ -389,11 +389,12 @@ Bounded recovery may inspect retained final upstream request bodies from the las
 `reasoning_effort` as fallback. This diagnostic recovery no longer determines whether
 existing requests can populate performance charts.
 
-The Performance query now shares the model-usage TPS contract and samples the latest
-fifty retained calls for each exact provider/model, ordered by `created_at DESC, id DESC`
+The Performance query shares the model-usage TPS contract but only looks at the last
+seven days: for each exact provider/model it samples the latest fifty calls with
+`created_at >= as_of - 7 days`, ordered by `created_at DESC, id DESC`
 (first select, then validate; invalid samples consume a slot without fetching older
-replacements). There is no additional seven-day, completion, status, effort, or
-metadata-version filter. It reads the existing `output_tokens`, `reasoning_tokens`,
+replacements). Variants with no call in that window are omitted. There is no
+additional completion, status, effort, or metadata-version filter. It reads the existing `output_tokens`, `reasoning_tokens`,
 `latency_upstream_ms`, and `latency_total_ms`; stream/chunk flags and
 `stream_first_chunk_ms` may still be selected for other columns but are not used in the
 TPS formula, nor are the `performance_*` evidence timings: TPS uses total
@@ -404,7 +405,7 @@ counts as no usage while a pure-reasoning call with output > 0 stays valid at it
 output rate. Output TPS is Σoutput ÷ Σvalid duration (`average_tps`, aliased equal to
 `overall_tps`, `average_gross_tps`, and `overall_gross_tps`). Content-token sums remain
 diagnostic only. Sample times are the valid rows' `created_at` timestamps.
-The API returns `window_start: null`; compatibility diagnostic counters are zero.
+The API returns `window_start` = `as_of` minus seven days; compatibility diagnostic counters are zero.
 Existing completion/effort metadata remains available for diagnostics only.
 Counts and sample times are documented in [model ratings](../design/model-ratings.md#performance-chart).
 Whole-history token totals (`total_output_tokens`, `total_upstream_ms` and friends)

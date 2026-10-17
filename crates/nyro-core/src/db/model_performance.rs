@@ -85,15 +85,21 @@ impl ModelPerformanceStats {
 // Keep ordering and raw scalar selection aligned with model_usage_stats. Invalid
 // rows consume the latest-fifty window; completion metadata remains diagnostic only.
 macro_rules! model_performance_method {
-    ($this:expr, $pairs:expr, $as_of:expr, $database:ty, $model_column:expr, $timestamp_cast:expr, $stream_default:expr) => {{
+    ($this:expr, $pairs:expr, $as_of:expr, $since:expr, $database:ty, $model_column:expr, $timestamp_cast:expr, $stream_default:expr) => {{
             let pairs = $pairs;
             let _ = $as_of; // Compatibility: usage statistics cover all retained logs.
+            // Optional lower time bound (ms epoch): the latest-fifty window is then
+            // selected from rows at or after it. None keeps every retained log.
+            let since: Option<i64> = $since;
             let mut result = Vec::with_capacity(pairs.len());
             for (provider, model) in pairs {
                 let mut sql = sqlx::QueryBuilder::<$database>::new("SELECT ");
                 sql.push($timestamp_cast).push(" AS created_at, COALESCE(output_tokens, 0) AS output_tokens, COALESCE(reasoning_tokens, 0) AS reasoning_tokens, COALESCE(is_stream, ");
                 sql.push($stream_default).push(") AS is_stream, COALESCE(stream_chunks_count, 0) AS stream_chunks_count, latency_upstream_ms, latency_total_ms, stream_first_chunk_ms FROM request_logs WHERE provider_id = ");
                 sql.push_bind(provider).push(" AND ").push($model_column).push(" = ").push_bind(model);
+                if let Some(since) = since {
+                    sql.push(" AND ").push($timestamp_cast).push(" >= ").push_bind(since);
+                }
                 sql.push(" ORDER BY request_logs.created_at DESC, id DESC LIMIT ");
                 sql.push_bind(crate::db::models::RECENT_SAMPLE_LIMIT);
                 let rows = sql.build_query_as::<crate::db::model_performance::PerformanceSample>().fetch_all(&$this.pool).await?;
