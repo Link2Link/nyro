@@ -33,10 +33,11 @@ function errorText(code: StatsRangeError, zh: boolean): string {
  * rolling presets, month-to-date (local time), and a custom start/end range.
  * A custom range only takes effect on "Apply"; an empty end means "until now".
  */
-export function StatsRangePicker({ value, onChange, triggerClassName, showIcon = false }: {
+export function StatsRangePicker({ value, onChange, triggerClassName, className, showIcon = false }: {
   value: StatsRange;
   onChange: (range: StatsRange) => void;
   triggerClassName?: string;
+  className?: string;
   showIcon?: boolean;
 }) {
   const { locale } = useLocale();
@@ -68,10 +69,36 @@ export function StatsRangePicker({ value, onChange, triggerClassName, showIcon =
     if (code === null && startAt !== null) onChange({ kind: "custom", startAt, endAt });
   }
 
+  const monthHint = zh ? "本月 1 日 00:00（本地时区）至今" : "From 00:00 on the 1st (local time) until now";
+  const customHint = zh
+    ? `本地时区；结束时间留空表示至今（持续更新）；最长 ${MAX_CUSTOM_DAYS} 天`
+    : `Local time zone. Empty end = until now (keeps updating). Up to ${MAX_CUSTOM_DAYS} days.`;
+  const bareInput = "!h-8 !w-[172px] !border-0 !bg-transparent !px-1.5 !py-0 !text-xs !shadow-none focus-visible:!ring-0";
+
   return (
-    <div className="flex flex-wrap items-center gap-2">
+    <div className={cn("flex flex-wrap items-center justify-end gap-2", className)}>
+      {showCustom && (
+        <>
+          <div
+            title={customHint}
+            className="flex h-9 items-center gap-1 rounded-md border border-border bg-background px-1.5 focus-within:ring-2 focus-within:ring-slate-300"
+          >
+            <Input type="datetime-local" className={bareInput} value={startText}
+              onChange={(event) => setStartText(event.target.value)} aria-label={zh ? "开始时间" : "Start time"} />
+            <span className="text-xs text-slate-400" aria-hidden>→</span>
+            <Input type="datetime-local" className={bareInput} value={endText}
+              onChange={(event) => setEndText(event.target.value)}
+              aria-label={zh ? "结束时间（留空表示至今）" : "End time (empty means until now)"} />
+          </div>
+          <Button className="h-9" onClick={apply}>{zh ? "应用" : "Apply"}</Button>
+        </>
+      )}
       <Select value={selectValue} onValueChange={select}>
-        <SelectTrigger className={cn("w-40", triggerClassName)} aria-label={zh ? "时间范围" : "Time range"}>
+        <SelectTrigger
+          className={cn("w-40", triggerClassName)}
+          aria-label={zh ? "时间范围" : "Time range"}
+          title={!showCustom && value.kind === "month" ? monthHint : undefined}
+        >
           {showIcon && <Clock3 className="mr-1 h-3.5 w-3.5" />}
           <SelectValue placeholder={zh ? "选择时间范围" : "Select range"} />
         </SelectTrigger>
@@ -81,17 +108,8 @@ export function StatsRangePicker({ value, onChange, triggerClassName, showIcon =
           <SelectItem value="custom">{zh ? "自定义…" : "Custom…"}</SelectItem>
         </SelectContent>
       </Select>
-      {showCustom && <>
-        <Input type="datetime-local" className="h-9 w-[200px]" value={startText}
-          onChange={(event) => setStartText(event.target.value)} aria-label={zh ? "开始时间" : "Start time"} />
-        <span className="text-xs text-slate-500">→</span>
-        <Input type="datetime-local" className="h-9 w-[200px]" value={endText}
-          onChange={(event) => setEndText(event.target.value)} aria-label={zh ? "结束时间（留空表示至今）" : "End time (empty means until now)"} />
-        <Button size="sm" onClick={apply}>{zh ? "应用" : "Apply"}</Button>
-        <p className="w-full text-xs text-slate-500">{zh ? `本地时区；结束时间留空表示至今（持续更新）；最长 ${MAX_CUSTOM_DAYS} 天。` : `Local time zone. An empty end means until now (keeps updating). Up to ${MAX_CUSTOM_DAYS} days.`}</p>
-        {error && <p role="alert" className="w-full text-xs text-red-600">{errorText(error, zh)}</p>}
-      </>}
-      {value.kind === "month" && !showCustom && <p className="w-full text-xs text-slate-500">{zh ? "本月 1 日 00:00（本地时区）至今" : "From 00:00 on the 1st (local time) until now"}</p>}
+      {/* w-0 + min-w-full: wraps onto its own row without widening the picker */}
+      {error && <p role="alert" className="w-0 min-w-full text-right text-xs text-red-600">{errorText(error, zh)}</p>}
     </div>
   );
 }

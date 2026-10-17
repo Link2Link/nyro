@@ -111,7 +111,7 @@ export default function StatsPage() {
           <h2 className="text-base font-semibold text-slate-900">{isZh ? "请求分析" : "Request analytics"}</h2>
           <p className="mt-1 text-xs text-slate-500">{isZh ? "观察近期调用、延迟、错误与 Token 时序" : "Recent attempts, latency, errors, and token time series"}</p>
         </div>
-        <StatsRangePicker value={range} onChange={setRange} />
+        <StatsRangePicker className="ml-auto" value={range} onChange={setRange} />
       </div>
 
       <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
