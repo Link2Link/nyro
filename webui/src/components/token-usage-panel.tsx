@@ -21,6 +21,48 @@ type Metric = "tokens" | "cost";
 type Totals = ReturnType<typeof sumTokenUsage>;
 type CostField = "total_cost" | "input_cost" | "cache_read_cost" | "output_cost";
 
+const MODEL_PREVIEW_COUNT = 5;
+
+/** Usage by model: top rows by default, the rest behind a toggle (mirrors TokenModelCosts). */
+function TokenModelUsage({ items, totalTokens, selectedDay, cacheValue }: {
+  items: ReturnType<typeof groupTokenModels>;
+  totalTokens: number;
+  selectedDay: string | null;
+  cacheValue: (value: TokenUsageTotals, compact?: boolean) => string;
+}) {
+  const { locale } = useLocale();
+  const zh = locale === "zh-CN";
+  const [showAll, setShowAll] = useState(false);
+  const visible = showAll ? items : items.slice(0, MODEL_PREVIEW_COUNT);
+  const number = (value: number) => value.toLocaleString(locale);
+  return <div className="token-models border-t pt-5">
+    <div className="mb-3 flex flex-wrap items-baseline justify-between gap-2">
+      <h3 className="text-sm font-semibold text-slate-800">{selectedDay ? `${selectedDay} · ` : ""}{zh ? "模型消耗" : "Usage by model"}</h3>
+      <span className="text-xs text-slate-500">{zh ? `${items.length} 个模型 · 按 Token 消耗排序 · 区分提供商` : `${items.length} models · Ranked by tokens · Providers kept separate`}</span>
+    </div>
+    {items.length === 0 ? <div className="py-8 text-center text-sm text-slate-500">{zh ? "暂无已记录的模型消耗" : "No recorded model usage"}</div> : <>
+      <div className="overflow-x-auto">
+              <table className="w-full text-xs tabular-nums">
+                <thead className="text-slate-500"><tr>{[zh ? "模型 / 提供商" : "Model / provider", zh ? "总 Token" : "Total tokens", zh ? "占比" : "Share", zh ? "输入" : "Input", zh ? "缓存读取" : "Cache read", zh ? "输出" : "Output", zh ? "尝试数" : "Attempts"].map((text, index) => <th key={text} scope="col" className={cn("whitespace-nowrap px-3 py-2 font-medium", index === 0 ? "pl-0 text-left" : "text-right")}>{text}</th>)}</tr></thead>
+                <tbody>{visible.map((item) => {
+                  const share = totalTokens > 0 ? item.total_tokens / totalTokens * 100 : 0;
+                  return <tr key={item.key} className="token-model-row border-t text-slate-700">
+                    <td className="min-w-40 max-w-64 py-3 pr-3"><p className="break-words font-medium text-slate-800">{item.model || (zh ? "未知模型" : "Unknown model")}</p><p className="mt-1 break-words text-[11px] text-slate-500">{item.provider_name || (zh ? "未知提供商" : "Unknown provider")}</p></td>
+                    <td className="whitespace-nowrap px-3 py-3 text-right font-medium" title={number(item.total_tokens)}>{formatTokenCount(item.total_tokens)}</td>
+                    <td className="min-w-24 px-3 py-3 text-right"><span>{share.toFixed(1)}%</span><div className="token-share mt-1.5 h-1 overflow-hidden rounded-full"><div className="token-share-fill h-full rounded-full" style={{ width: `${share}%` }} /></div></td>
+                    <td className="whitespace-nowrap px-3 py-3 text-right" title={number(item.input_tokens)}>{formatTokenCount(item.input_tokens)}</td>
+                    <td className="whitespace-nowrap px-3 py-3 text-right" title={cacheValue(item, false)}>{cacheValue(item)}</td>
+                    <td className="whitespace-nowrap px-3 py-3 text-right" title={number(item.output_tokens)}>{formatTokenCount(item.output_tokens)}</td>
+                    <td className="px-3 py-3 text-right">{number(item.request_count)}{item.missing_usage_count > 0 && <span className="mt-1 block whitespace-nowrap text-[10px] text-amber-600">{number(item.missing_usage_count)} {zh ? "用量不完整" : "incomplete"}</span>}</td>
+                  </tr>;
+                })}</tbody>
+              </table>
+      </div>
+      {items.length > MODEL_PREVIEW_COUNT && <div className="mt-3 flex items-center justify-between gap-2 text-xs text-slate-500"><span>{zh ? `显示 ${visible.length} / ${items.length} 个模型` : `Showing ${visible.length} / ${items.length} models`}</span><Button variant="ghost" size="sm" onClick={() => setShowAll(!showAll)}>{showAll ? (zh ? "收起列表" : "Show less") : (zh ? `查看全部 ${items.length} 个模型` : `Show all ${items.length} models`)}</Button></div>}
+    </>}
+  </div>;
+}
+
 export function TokenUsagePanel() {
   const { locale } = useLocale();
   const zh = locale === "zh-CN";
@@ -241,29 +283,7 @@ export function TokenUsagePanel() {
             </aside>
           </div>
 
-          {isCost ? <TokenModelCosts key={`${period}:${mode}:${activeModel}:${selectedDay ?? "period"}`} rows={detailRows} currency={activeCurrency} selectedDay={selectedDay} onEdit={(target) => { setPriceNotice(null); setPriceTarget(target); }} /> : <div className="token-models border-t pt-5">
-            <div className="mb-3 flex flex-wrap items-baseline justify-between gap-2">
-              <h3 className="text-sm font-semibold text-slate-800">{selectedDay ? `${selectedDay} · ` : ""}{zh ? "模型消耗" : "Usage by model"}</h3>
-              <span className="text-xs text-slate-500">{zh ? "按 Token 消耗排序 · 区分提供商" : "Ranked by tokens · Providers kept separate"}</span>
-            </div>
-            {detailModels.length === 0 ? <div className="py-8 text-center text-sm text-slate-500">{zh ? "暂无已记录的模型消耗" : "No recorded model usage"}</div> : <div className="overflow-x-auto">
-              <table className="w-full text-xs tabular-nums">
-                <thead className="text-slate-500"><tr>{[zh ? "模型 / 提供商" : "Model / provider", zh ? "总 Token" : "Total tokens", zh ? "占比" : "Share", zh ? "输入" : "Input", zh ? "缓存读取" : "Cache read", zh ? "输出" : "Output", zh ? "尝试数" : "Attempts"].map((text, index) => <th key={text} scope="col" className={cn("whitespace-nowrap px-3 py-2 font-medium", index === 0 ? "pl-0 text-left" : "text-right")}>{text}</th>)}</tr></thead>
-                <tbody>{detailModels.map((item) => {
-                  const share = detail.total_tokens > 0 ? item.total_tokens / detail.total_tokens * 100 : 0;
-                  return <tr key={item.key} className="token-model-row border-t text-slate-700">
-                    <td className="min-w-40 max-w-64 py-3 pr-3"><p className="break-words font-medium text-slate-800">{item.model || (zh ? "未知模型" : "Unknown model")}</p><p className="mt-1 break-words text-[11px] text-slate-500">{item.provider_name || (zh ? "未知提供商" : "Unknown provider")}</p></td>
-                    <td className="whitespace-nowrap px-3 py-3 text-right font-medium" title={number(item.total_tokens)}>{formatTokenCount(item.total_tokens)}</td>
-                    <td className="min-w-24 px-3 py-3 text-right"><span>{share.toFixed(1)}%</span><div className="token-share mt-1.5 h-1 overflow-hidden rounded-full"><div className="token-share-fill h-full rounded-full" style={{ width: `${share}%` }} /></div></td>
-                    <td className="whitespace-nowrap px-3 py-3 text-right" title={number(item.input_tokens)}>{formatTokenCount(item.input_tokens)}</td>
-                    <td className="whitespace-nowrap px-3 py-3 text-right" title={cacheValue(item, false)}>{cacheValue(item)}</td>
-                    <td className="whitespace-nowrap px-3 py-3 text-right" title={number(item.output_tokens)}>{formatTokenCount(item.output_tokens)}</td>
-                    <td className="px-3 py-3 text-right">{number(item.request_count)}{item.missing_usage_count > 0 && <span className="mt-1 block whitespace-nowrap text-[10px] text-amber-600">{number(item.missing_usage_count)} {zh ? "用量不完整" : "incomplete"}</span>}</td>
-                  </tr>;
-                })}</tbody>
-              </table>
-            </div>}
-          </div>}
+          {isCost ? <TokenModelCosts key={`${period}:${mode}:${activeModel}:${selectedDay ?? "period"}`} rows={detailRows} currency={activeCurrency} selectedDay={selectedDay} onEdit={(target) => { setPriceNotice(null); setPriceTarget(target); }} /> : <TokenModelUsage key={`${period}:${mode}:${activeModel}:${selectedDay ?? "period"}`} items={detailModels} totalTokens={detail.total_tokens} selectedDay={selectedDay} cacheValue={cacheValue} />}
         </>}
       </div>
       <div className="token-footer border-t px-4 py-3 sm:px-6">
