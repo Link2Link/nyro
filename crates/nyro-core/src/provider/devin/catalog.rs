@@ -5,20 +5,53 @@ use crate::protocol::ir::request::{ReasoningConfig, ReasoningEffort};
 pub(super) const MODELS: &[&str] = &[
     "swe-2",
     "swe-1-7",
+    "swe-1-7-lightning",
     "swe-1-6",
     "swe-1-6-slow",
     "claude-opus-5-5",
+    "claude-opus-5",
+    "claude-opus-4-8",
+    "claude-opus-4-7",
     "claude-sonnet-5-5",
+    "claude-sonnet-5",
     "claude-fable-5-1",
+    "claude-5-fable",
     "claude-haiku-5-5",
     "claude-opus-4-6",
     "claude-sonnet-4-6",
     "claude-haiku-4-5",
     "gpt-6-astra",
+    "gpt-6-1-sol",
+    "gpt-6-sol",
+    "gpt-6-luna",
+    "gpt-5-6-sol",
+    "gpt-5-6-terra",
+    "gpt-5-6-luna",
+    "gpt-5-5",
+    "gpt-5-4",
+    "gpt-5-4-mini",
+    "gpt-5-3-codex",
     "gpt-5-2",
     "gemini-4-argon",
     "gemini-3-8-flash",
+    "gemini-3-7-flash",
+    "gemini-3-6-flash",
+    "gemini-3-5-flash",
+    "gemini-3-1-pro",
+    "glm-5-3",
+    "glm-5-3-flash",
     "glm-5-2",
+    "kimi-k3",
+    "kimi-k2-7",
+    "kimi-k2-6",
+    "grok-4-7",
+    "grok-4-6",
+    "grok-4-5",
+    "deepseek-v4-pro",
+    "deepseek-v4-1-flash",
+    "deepseek-v4-flash",
+    "nemotron-3-ultra",
+    "inkling",
 ];
 
 /// A model family whose upstream UIDs are `<family>-<effort>`.
@@ -39,42 +72,77 @@ struct TieredFamily {
 }
 
 const LOW_TO_MAX: &[&str] = &["low", "medium", "high", "xhigh", "max"];
+const NONE_TO_MAX: &[&str] = &["none", "low", "medium", "high", "xhigh", "max"];
+const NONE_TO_XHIGH: &[&str] = &["none", "low", "medium", "high", "xhigh"];
+const LOW_TO_XHIGH: &[&str] = &["low", "medium", "high", "xhigh"];
 const LOW_TO_HIGH: &[&str] = &["low", "medium", "high"];
+const MINIMAL_TO_HIGH: &[&str] = &["minimal", "low", "medium", "high"];
+const LOW_HIGH_MAX: &[&str] = &["low", "high", "max"];
+const HIGH_MAX: &[&str] = &["high", "max"];
+const NONE_MEDIUM_HIGH: &[&str] = &["none", "medium", "high"];
+const LOW_HIGH: &[&str] = &["low", "high"];
+
+const fn family(
+    family: &'static str,
+    tiers: &'static [&'static str],
+    default: &'static str,
+) -> TieredFamily {
+    TieredFamily {
+        family,
+        tiers,
+        default,
+    }
+}
 
 /// Families resolved by table lookup. `swe-2`, `gpt-5-2` and `gemini-3-8-flash`
 /// predate it and keep their own arms in `resolve`; a new `<family>-<effort>`
 /// model line only needs an entry here (plus one in `MODELS` for suggestions).
+///
+/// Tiers and defaults mirror CLIProxyAPI's `devin_models.json`. Its default rule
+/// is: GPT-5.x with a `low` tier use `low`; Gemini/Grok/GLM/Kimi/DeepSeek/Nemotron
+/// prefer `high` when they offer it; everything else prefers `medium`.
 const TIERED: &[TieredFamily] = &[
-    TieredFamily {
-        family: "claude-opus-5-5",
-        tiers: LOW_TO_MAX,
-        default: "medium",
-    },
-    TieredFamily {
-        family: "claude-sonnet-5-5",
-        tiers: LOW_TO_MAX,
-        default: "medium",
-    },
-    TieredFamily {
-        family: "claude-fable-5-1",
-        tiers: LOW_TO_MAX,
-        default: "medium",
-    },
-    TieredFamily {
-        family: "claude-haiku-5-5",
-        tiers: LOW_TO_HIGH,
-        default: "medium",
-    },
-    TieredFamily {
-        family: "gpt-6-astra",
-        tiers: LOW_TO_MAX,
-        default: "medium",
-    },
-    TieredFamily {
-        family: "gemini-4-argon",
-        tiers: LOW_TO_HIGH,
-        default: "high",
-    },
+    // Claude
+    family("claude-opus-5-5", LOW_TO_MAX, "medium"),
+    family("claude-opus-5", LOW_TO_MAX, "medium"),
+    family("claude-opus-4-8", LOW_TO_MAX, "medium"),
+    family("claude-opus-4-7", LOW_TO_MAX, "medium"),
+    family("claude-sonnet-5-5", LOW_TO_MAX, "medium"),
+    family("claude-sonnet-5", LOW_TO_MAX, "medium"),
+    family("claude-fable-5-1", LOW_TO_MAX, "medium"),
+    family("claude-5-fable", LOW_TO_MAX, "medium"),
+    family("claude-haiku-5-5", LOW_TO_HIGH, "medium"),
+    // OpenAI
+    family("gpt-6-astra", LOW_TO_MAX, "medium"),
+    family("gpt-6-1-sol", LOW_TO_MAX, "medium"),
+    family("gpt-6-sol", NONE_TO_MAX, "medium"),
+    family("gpt-6-luna", NONE_TO_MAX, "medium"),
+    family("gpt-5-6-sol", NONE_TO_MAX, "low"),
+    family("gpt-5-6-terra", NONE_TO_MAX, "low"),
+    family("gpt-5-6-luna", NONE_TO_MAX, "low"),
+    family("gpt-5-5", NONE_TO_XHIGH, "low"),
+    family("gpt-5-4", NONE_TO_XHIGH, "low"),
+    family("gpt-5-4-mini", LOW_TO_XHIGH, "medium"),
+    family("gpt-5-3-codex", LOW_TO_XHIGH, "medium"),
+    // Google
+    family("gemini-4-argon", LOW_TO_HIGH, "high"),
+    family("gemini-3-7-flash", LOW_TO_HIGH, "high"),
+    family("gemini-3-6-flash", MINIMAL_TO_HIGH, "high"),
+    family("gemini-3-5-flash", MINIMAL_TO_HIGH, "high"),
+    family("gemini-3-1-pro", LOW_HIGH, "high"),
+    // Zhipu / Moonshot / xAI / DeepSeek / NVIDIA / Cognition
+    family("glm-5-3", LOW_HIGH_MAX, "high"),
+    family("glm-5-3-flash", LOW_HIGH_MAX, "high"),
+    family("kimi-k3", LOW_HIGH_MAX, "high"),
+    family("grok-4-7", LOW_TO_XHIGH, "high"),
+    family("grok-4-6", LOW_TO_XHIGH, "high"),
+    family("grok-4-5", LOW_TO_HIGH, "high"),
+    family("deepseek-v4-pro", HIGH_MAX, "high"),
+    family("deepseek-v4-1-flash", HIGH_MAX, "high"),
+    family("deepseek-v4-flash", HIGH_MAX, "high"),
+    family("nemotron-3-ultra", NONE_MEDIUM_HIGH, "high"),
+    family("inkling", NONE_TO_MAX, "medium"),
+    family("swe-1-7-lightning", &["medium"], "medium"),
 ];
 
 fn effort(reasoning: &ReasoningConfig) -> Option<&'static str> {
@@ -113,7 +181,13 @@ fn clamp(requested: Option<&str>, allowed: &[&str], default: &str) -> String {
     let rank = |value: &str| order.iter().position(|entry| *entry == value).unwrap_or(0);
     allowed
         .iter()
-        .min_by_key(|value| rank(value).abs_diff(rank(requested)))
+        // On a tie prefer the higher tier (medium between low/high -> high).
+        .min_by_key(|value| {
+            (
+                rank(value).abs_diff(rank(requested)),
+                std::cmp::Reverse(rank(value)),
+            )
+        })
         .unwrap_or(&default)
         .to_string()
 }
@@ -293,6 +367,7 @@ mod tests {
             "claude-sonnet-5-5",
             "claude-fable-5-1",
             "gpt-6-astra",
+            "gpt-6-1-sol",
         ] {
             for (effort, tier) in &expected {
                 assert_eq!(
@@ -326,7 +401,7 @@ mod tests {
     #[test]
     fn tiered_families_reach_every_published_variant_and_nothing_else() {
         // Independent of TIERED: the upstream UIDs each family really publishes.
-        let published: [(&str, &[&str]); 6] = [
+        let published: [(&str, &[&str]); 7] = [
             (
                 "claude-opus-5-5",
                 &["low", "medium", "high", "xhigh", "max"],
@@ -341,6 +416,7 @@ mod tests {
             ),
             ("claude-haiku-5-5", &["low", "medium", "high"]),
             ("gpt-6-astra", &["low", "medium", "high", "xhigh", "max"]),
+            ("gpt-6-1-sol", &["low", "medium", "high", "xhigh", "max"]),
             ("gemini-4-argon", &["low", "medium", "high"]),
         ];
         for (family, tiers) in published {
@@ -403,6 +479,8 @@ mod tests {
             "claude-sonnet-5-5-medium"
         );
         assert_eq!(resolve("gpt-6-astra", &none), "gpt-6-astra-medium");
+        assert_eq!(resolve("gpt-6-1-sol", &none), "gpt-6-1-sol-medium");
+        assert_eq!(resolve("gpt-6.1-sol", &none), "gpt-6-1-sol-medium");
         assert_eq!(resolve("gemini-4-argon", &none), "gemini-4-argon-high");
         // Budget maps past a three-tier family's ceiling onto its top tier.
         assert_eq!(
@@ -434,8 +512,78 @@ mod tests {
         assert_eq!(resolve("Claude-Opus-5.5", &max), "claude-opus-5-5-max");
         assert_eq!(resolve("  gpt-6-astra  ", &max), "gpt-6-astra-max");
         // Lookalikes are not families and pass through untouched.
-        for other in ["claude-opus-5-55", "claude-opus-5", "gpt-6-astral"] {
+        for other in ["claude-opus-5-55", "claude-opus-6", "gpt-6-astral", "gpt-5-4-mi"] {
             assert_eq!(resolve(other, &max), other);
+        }
+    }
+
+    #[test]
+    fn upstream_catalog_families_follow_their_published_tiers() {
+        let resolve_with = |model: &str, effort: Option<ReasoningEffort>| {
+            let config = ReasoningConfig {
+                effort: effort.map(Some).unwrap_or(std::option::Option::None),
+                ..Default::default()
+            };
+            resolve(model, &config)
+        };
+        use ReasoningEffort::*;
+        // (model, effort, expected UID). `None` = no reasoning directive.
+        let cases: &[(&str, Option<ReasoningEffort>, &str)] = &[
+            // Families with a real thinking-off tier keep it.
+            ("gpt-6-sol", Some(None), "gpt-6-sol-none"),
+            ("gpt-6-luna", Some(Max), "gpt-6-luna-max"),
+            ("gpt-5-5", Some(Xhigh), "gpt-5-5-xhigh"),
+            ("inkling", Some(None), "inkling-none"),
+            ("nemotron-3-ultra", Some(None), "nemotron-3-ultra-none"),
+            // Defaults: GPT-5.x -> low, GPT-6 -> medium, Gemini/GLM/Kimi/Grok -> high.
+            ("gpt-5-6-sol", Option::None, "gpt-5-6-sol-low"),
+            ("gpt-5-4", Option::None, "gpt-5-4-low"),
+            ("gpt-5-4-mini", Option::None, "gpt-5-4-mini-medium"),
+            ("gpt-6-sol", Option::None, "gpt-6-sol-medium"),
+            ("claude-opus-4-8", Option::None, "claude-opus-4-8-medium"),
+            ("kimi-k3", Option::None, "kimi-k3-high"),
+            ("glm-5-3", Option::None, "glm-5-3-high"),
+            ("grok-4-6", Option::None, "grok-4-6-high"),
+            ("deepseek-v4-pro", Option::None, "deepseek-v4-pro-high"),
+            ("gemini-3-5-flash", Option::None, "gemini-3-5-flash-high"),
+            // Gapped tier sets clamp to the nearest tier; a tie goes up.
+            ("kimi-k3", Some(Medium), "kimi-k3-high"),
+            ("kimi-k3", Some(Xhigh), "kimi-k3-max"),
+            ("kimi-k3", Some(None), "kimi-k3-low"),
+            ("deepseek-v4-flash", Some(Low), "deepseek-v4-flash-high"),
+            ("deepseek-v4-flash", Some(Xhigh), "deepseek-v4-flash-max"),
+            ("gemini-3-1-pro", Some(Medium), "gemini-3-1-pro-high"),
+            ("nemotron-3-ultra", Some(Low), "nemotron-3-ultra-medium"),
+            ("gemini-3-6-flash", Some(Minimal), "gemini-3-6-flash-minimal"),
+            ("grok-4-6", Some(Max), "grok-4-6-xhigh"),
+            ("gpt-5-3-codex", Some(None), "gpt-5-3-codex-low"),
+            // Single-tier family.
+            ("swe-1-7-lightning", Some(Max), "swe-1-7-lightning-medium"),
+            ("swe-1-7-lightning", Option::None, "swe-1-7-lightning-medium"),
+            // The longer name must not be swallowed by its shorter sibling.
+            ("gpt-5-4-mini", Some(High), "gpt-5-4-mini-high"),
+            ("glm-5-3-flash", Some(High), "glm-5-3-flash-high"),
+            ("deepseek-v4-1-flash", Some(Max), "deepseek-v4-1-flash-max"),
+            ("claude-opus-5", Some(Xhigh), "claude-opus-5-xhigh"),
+            ("claude-sonnet-5", Some(Low), "claude-sonnet-5-low"),
+            ("claude-5-fable", Some(High), "claude-5-fable-high"),
+            ("claude-opus-5-5", Some(High), "claude-opus-5-5-high"),
+            ("gpt-6.1-sol", Some(High), "gpt-6-1-sol-high"),
+        ];
+        for (model, effort, expected) in cases {
+            assert_eq!(
+                resolve_with(model, effort.clone()),
+                *expected,
+                "{model} with {effort:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn bare_models_without_thinking_tiers_pass_through() {
+        let config = effort_config(ReasoningEffort::High);
+        for model in ["kimi-k2-6", "kimi-k2-7", "swe-1-6", "swe-1-6-slow"] {
+            assert_eq!(resolve(model, &config), model);
         }
     }
 
