@@ -141,8 +141,12 @@ pub fn encode(
 
     let (mut turns, mut system) = build_turns(request)?;
     let thinking_prefix = thinking_directive(&request.reasoning);
+    // A client-supplied directive also makes the model emit `<thinking>` tags,
+    // so tag parsing must be on even when the request carries no reasoning.
+    let client_directive = has_thinking_directive(&system);
+    let thinking_tags = thinking_prefix.is_some() || client_directive;
     if let Some(prefix) = &thinking_prefix
-        && !has_thinking_directive(&system)
+        && !client_directive
     {
         system = if system.is_empty() {
             prefix.clone()
@@ -170,6 +174,7 @@ pub fn encode(
             &upstream_model,
             distance <= KEEP_IMAGES_WITHIN,
             &tool_names,
+            thinking_tags,
         ));
     }
     let current = render_current(&turns[last], &upstream_model, tools, &tool_names);
@@ -214,7 +219,7 @@ pub fn encode(
     Ok(Encoded {
         body,
         tool_names,
-        thinking_tags: thinking_prefix.is_some(),
+        thinking_tags,
         input_estimate,
         upstream_model,
         summary,
@@ -809,10 +814,14 @@ fn render_history_turn(
     model: &str,
     keep_images: bool,
     _names: &HashMap<String, String>,
+    replay_thinking: bool,
 ) -> Value {
     if turn.assistant {
         let mut content = turn.text();
-        if !turn.thinking.trim().is_empty() {
+        // Past thoughts are replayed as tags only while thinking is active.
+        // With thinking off the gateway no longer parses the tags, and replaying
+        // them would invite the model to emit tags that leak into the answer.
+        if replay_thinking && !turn.thinking.trim().is_empty() {
             let thought = format!("{THINKING_OPEN}{}{THINKING_CLOSE}", turn.thinking);
             content = if content.is_empty() {
                 thought
@@ -1499,9 +1508,9 @@ mod tests {
     }
 
     #[test]
-    fn assistant_thinking_is_replayed_in_tags() {
-        let thought = Message {
-            role: Role::Assistant,
+    fn assistant_thinking_is_replayed_in_tags_only_while_thinking_is_active() {
+        let thought = |role: Role| Message {
+            role,
             content: MessageContent::Blocks(vec![
                 ContentBlock::Thinking {
                     thinking: "plan".into(),
@@ -1516,14 +1525,26 @@ mod tests {
             tool_call_id: None,
             meta: None,
         };
-        let body = decode(&encode_ok(&request(vec![
-            user("q"),
-            thought,
-            user("again"),
-        ])));
+
+        // Thinking on: the past thought is replayed inside the tags.
+        let mut req = request(vec![user("q"), thought(Role::Assistant), user("again")]);
+        req.reasoning = ReasoningConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let body = decode(&encode_ok(&req));
         assert_eq!(
             body["conversationState"]["history"][1]["assistantResponseMessage"]["content"],
             "<thinking>plan</thinking>\n\nanswer"
+        );
+
+        // Thinking off this turn: the tags are not parsed downstream, so the
+        // past thought is dropped instead of inviting the model to emit tags.
+        let req = request(vec![user("q"), thought(Role::Assistant), user("again")]);
+        let body = decode(&encode_ok(&req));
+        assert_eq!(
+            body["conversationState"]["history"][1]["assistantResponseMessage"]["content"],
+            "answer"
         );
     }
 
@@ -1601,6 +1622,28 @@ mod tests {
             .unwrap()
             .to_string();
         assert_eq!(content.matches("<thinking_mode>").count(), 1);
+    }
+
+    #[test]
+    fn client_supplied_directive_enables_tag_parsing() {
+        // The request carries no reasoning config, but the client's own system
+        // prompt asks for thinking: the model will emit `<thinking>` tags, so
+        // the response side must parse them.
+        let mut req = request(vec![user("q")]);
+        req.system = Some("<thinking_mode>enabled</thinking_mode> mine".into());
+        let encoded = encode_ok(&req);
+        assert!(encoded.thinking_tags);
+        let content =
+            decode(&encoded)["conversationState"]["currentMessage"]["userInputMessage"]["content"]
+                .as_str()
+                .unwrap()
+                .to_string();
+        assert_eq!(content.matches("<thinking_mode>").count(), 1);
+
+        // Without any directive anywhere, tags are not parsed.
+        let mut req = request(vec![user("q")]);
+        req.system = Some("plain rules".into());
+        assert!(!encode_ok(&req).thinking_tags);
     }
 
     #[test]

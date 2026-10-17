@@ -48,6 +48,21 @@ pub(super) fn is_retryable(status: u16) -> bool {
     matches!(status, 408 | 429 | 500 | 502 | 503 | 504 | 529)
 }
 
+/// Upstream rejected the provider's own credentials (HTTP 401/403).
+///
+/// Authentication happens before any processing, so the request was
+/// definitively not executed and replaying it on the next route target is
+/// safe. The failure is provider-scoped — a revoked key, expired OAuth
+/// session or missing entitlement — while other targets may still serve the
+/// request, so it must fail over at the target level. This mirrors
+/// `key_pool::key_failover_status` semantics for providers without a key
+/// pool (OAuth vendors carry a single credential), and applies even under
+/// `RetryDisposition::Never`, which only guards replaying ambiguous
+/// post-submission states a 401/403 can never produce.
+pub(super) fn is_credential_rejection(status: u16) -> bool {
+    matches!(status, 401 | 403)
+}
+
 pub(super) fn is_health_failure(status: u16) -> bool {
     is_retryable(status)
 }
@@ -220,6 +235,18 @@ mod tests {
         for status in [408, 429, 500, 502, 503, 504, 529] {
             assert!(is_retryable(status), "status {status}");
             assert!(is_health_failure(status), "status {status}");
+        }
+    }
+
+    #[test]
+    fn only_auth_rejections_qualify_for_credential_failover() {
+        for status in [401, 403] {
+            assert!(is_credential_rejection(status), "status {status}");
+        }
+        // Request-scoped 4xx (bad body, unknown model, conflict) and every
+        // retryable status belong to the request, not the credential.
+        for status in [400, 402, 404, 408, 409, 413, 422, 429, 500, 502, 503] {
+            assert!(!is_credential_rejection(status), "status {status}");
         }
     }
 

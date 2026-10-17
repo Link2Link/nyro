@@ -26,6 +26,27 @@ async fn upstream(Json(body): Json<Value>) -> Response {
         )
             .into_response();
     }
+    if model == "http401" {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"error":{"message":"invalid api key"}})),
+        )
+            .into_response();
+    }
+    if model == "http403" {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({"error":{"message":"AccessDeniedException"}})),
+        )
+            .into_response();
+    }
+    if model == "http400" {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error":{"message":"bad body"}})),
+        )
+            .into_response();
+    }
     let wire = match model {
         "raw-error" => "data: {\"error\":{\"message\":\"provider failed\"}}\n\n".to_owned(),
         "unknown" => "data: {\"vendor_event\":\"opaque\"}\n\n".to_owned(),
@@ -542,6 +563,162 @@ async fn retry_keeps_two_attempts_and_only_final_result() -> anyhow::Result<()> 
         assert_eq!(row.diagnostic.attempt_index, Some(n as i32 + 1));
     }
     assert!(logs.try_recv().is_err());
+    job.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn credential_rejection_fails_over_to_the_next_target() -> anyhow::Result<()> {
+    let (_dir, gw, mut logs, url, job) = setup().await?;
+    let a = provider(&gw, &url).await?;
+    let b = provider(&gw, &url).await?;
+    let targets = vec![
+        CreateModelBackend {
+            provider_id: a.clone(),
+            model: "http401".into(),
+            weight: Some(100),
+            priority: Some(1),
+            is_fallback: Some(false),
+        },
+        CreateModelBackend {
+            provider_id: b,
+            model: "ok".into(),
+            weight: Some(100),
+            priority: Some(2),
+            is_fallback: Some(false),
+        },
+    ];
+    route(&gw, "cred-401", a, "http401", targets).await?;
+    let (id, response) = dispatch(
+        &gw,
+        "cred-401",
+        OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1,
+        false,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024).await?;
+    let wire = String::from_utf8_lossy(&bytes);
+    assert!(wire.contains("hello"), "{wire}");
+    let mut rows = Vec::new();
+    for _ in 0..2 {
+        rows.push(
+            tokio::time::timeout(Duration::from_secs(3), logs.recv())
+                .await?
+                .unwrap(),
+        );
+    }
+    rows.sort_by_key(|row| row.diagnostic.attempt_index);
+    assert_eq!(rows[0].diagnostic.attempt_outcome, "failed");
+    assert_eq!(rows[0].upstream_status_code, Some(401));
+    assert!(rows[0].diagnostic.final_result.is_none());
+    assert_eq!(rows[1].diagnostic.attempt_outcome, "completed");
+    assert_eq!(
+        rows[1]
+            .diagnostic
+            .final_result
+            .as_ref()
+            .unwrap()
+            .attempt_count,
+        2
+    );
+    assert_eq!(
+        rows[1].diagnostic.client_request_id.as_deref(),
+        Some(id.as_str())
+    );
+    assert!(logs.try_recv().is_err());
+    job.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn credential_rejection_403_fails_over_for_streams() -> anyhow::Result<()> {
+    let (_dir, gw, _logs, url, job) = setup().await?;
+    let a = provider(&gw, &url).await?;
+    let b = provider(&gw, &url).await?;
+    let targets = vec![
+        CreateModelBackend {
+            provider_id: a.clone(),
+            model: "http403".into(),
+            weight: Some(100),
+            priority: Some(1),
+            is_fallback: Some(false),
+        },
+        CreateModelBackend {
+            provider_id: b,
+            model: "ok".into(),
+            weight: Some(100),
+            priority: Some(2),
+            is_fallback: Some(false),
+        },
+    ];
+    route(&gw, "cred-403", a, "http403", targets).await?;
+    let (_id, response) =
+        dispatch(&gw, "cred-403", OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1, true).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024).await?;
+    let wire = String::from_utf8_lossy(&bytes);
+    assert!(wire.contains("hello"), "{wire}");
+    job.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn credential_rejection_without_alternative_returns_the_upstream_error() -> anyhow::Result<()>
+{
+    let (_dir, gw, _logs, url, job) = setup().await?;
+    let a = provider(&gw, &url).await?;
+    let targets = vec![CreateModelBackend {
+        provider_id: a.clone(),
+        model: "http401".into(),
+        weight: Some(100),
+        priority: Some(1),
+        is_fallback: Some(false),
+    }];
+    route(&gw, "cred-401-alone", a, "http401", targets).await?;
+    let (_id, response) = dispatch(
+        &gw,
+        "cred-401-alone",
+        OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1,
+        false,
+    )
+    .await;
+    // No other target exists: the client still sees the real 401, never a
+    // synthetic 502.
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    axum::body::to_bytes(response.into_body(), 1024 * 1024).await?;
+    job.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn request_scoped_400_does_not_fail_over() -> anyhow::Result<()> {
+    let (_dir, gw, _logs, url, job) = setup().await?;
+    let a = provider(&gw, &url).await?;
+    let b = provider(&gw, &url).await?;
+    let targets = vec![
+        CreateModelBackend {
+            provider_id: a.clone(),
+            model: "http400".into(),
+            weight: Some(100),
+            priority: Some(1),
+            is_fallback: Some(false),
+        },
+        CreateModelBackend {
+            provider_id: b,
+            model: "ok".into(),
+            weight: Some(100),
+            priority: Some(2),
+            is_fallback: Some(false),
+        },
+    ];
+    route(&gw, "req-400", a, "http400", targets).await?;
+    let (_id, response) =
+        dispatch(&gw, "req-400", OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1, false).await;
+    // 400 belongs to the request body, not the credential: replaying it on
+    // another provider would just fail the same way, so it must not fail over.
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    axum::body::to_bytes(response.into_body(), 1024 * 1024).await?;
     job.abort();
     Ok(())
 }

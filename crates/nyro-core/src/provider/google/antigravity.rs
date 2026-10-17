@@ -94,8 +94,7 @@ const ANTIGRAVITY_PLATFORM: &str = "windows/amd64";
 /// Official Antigravity hub auto-updater manifest — the same electron-builder
 /// feed the real IDE polls; carries `version: x.y.z` as its first key.
 /// Surfaced by the CLIProxyAPI `antigravity_version.go` upstream tracker.
-const ANTIGRAVITY_HUB_MANIFEST_URL: &str =
-    "https://antigravity-hub-auto-updater-974169037036.us-central1.run.app/manifest/latest-arm64-mac.yml";
+const ANTIGRAVITY_HUB_MANIFEST_URL: &str = "https://antigravity-hub-auto-updater-974169037036.us-central1.run.app/manifest/latest-arm64-mac.yml";
 /// How long a successfully fetched version stays authoritative.
 const ANTIGRAVITY_VERSION_TTL: Duration = Duration::from_secs(6 * 60 * 60);
 /// Cooldown after a failed manifest fetch so offline hosts do not retry
@@ -114,14 +113,13 @@ struct AntigravityVersionState {
     last_attempt: Option<Instant>,
 }
 
-static ANTIGRAVITY_VERSION_STATE: LazyLock<RwLock<AntigravityVersionState>> =
-    LazyLock::new(|| {
-        RwLock::new(AntigravityVersionState {
-            version: ANTIGRAVITY_FALLBACK_VERSION.to_string(),
-            refreshed_at: None,
-            last_attempt: None,
-        })
-    });
+static ANTIGRAVITY_VERSION_STATE: LazyLock<RwLock<AntigravityVersionState>> = LazyLock::new(|| {
+    RwLock::new(AntigravityVersionState {
+        version: ANTIGRAVITY_FALLBACK_VERSION.to_string(),
+        refreshed_at: None,
+        last_attempt: None,
+    })
+});
 
 /// Strict `major.minor.patch` (dot-separated numeric triples only) — the
 /// shape the hub manifest guarantees; anything else keeps the fallback.
@@ -214,7 +212,11 @@ async fn refresh_antigravity_version(client: &reqwest::Client) {
 pub(crate) const X_GOOG_API_CLIENT: &str = "gl-node/22.21.1";
 
 pub(crate) fn antigravity_user_agent() -> String {
-    format!("antigravity/{} {}", antigravity_version(), ANTIGRAVITY_PLATFORM)
+    format!(
+        "antigravity/{} {}",
+        antigravity_version(),
+        ANTIGRAVITY_PLATFORM
+    )
 }
 
 /// Inference base URL for the antigravity channel. Consumer (Google AI
@@ -970,10 +972,7 @@ mod tests {
             "  - url: https://storage.googleapis.com/antigravity-public/x.zip\n",
             "sha512: base64==\n",
         );
-        assert_eq!(
-            parse_hub_manifest_version(feed).as_deref(),
-            Some("2.24.0")
-        );
+        assert_eq!(parse_hub_manifest_version(feed).as_deref(), Some("2.24.0"));
         // Whitespace-tolerant, first match wins.
         assert_eq!(
             parse_hub_manifest_version("  version:   9.9.9  \nversion: 1.0.0").as_deref(),
@@ -1022,7 +1021,11 @@ mod tests {
             .map(|id| id.to_string())
             .collect();
         assert_eq!(
-            resolve_tiered_model("gemini-4-argon", &reasoning(Some(crate::protocol::ir::ReasoningEffort::High)), &served),
+            resolve_tiered_model(
+                "gemini-4-argon",
+                &reasoning(Some(crate::protocol::ir::ReasoningEffort::High)),
+                &served
+            ),
             None
         );
         // Explicit tier id → caller's choice, never rewritten either.
@@ -1038,14 +1041,23 @@ mod tests {
             .map(|id| id.to_string())
             .collect();
         assert_eq!(
-            resolve_tiered_model("gemini-4-argon", &reasoning(Some(crate::protocol::ir::ReasoningEffort::High)), &high_only).as_deref(),
+            resolve_tiered_model(
+                "gemini-4-argon",
+                &reasoning(Some(crate::protocol::ir::ReasoningEffort::High)),
+                &high_only
+            )
+            .as_deref(),
             Some("gemini-4-argon-high")
         );
         // Lower efforts never get force-upgraded to a higher tier: their
         // ladders do not include `-high`, so the rewrite fails safe and the
         // bare id is sent as-is for upstream to answer honestly.
         assert_eq!(
-            resolve_tiered_model("gemini-4-argon", &reasoning(Some(crate::protocol::ir::ReasoningEffort::Low)), &high_only),
+            resolve_tiered_model(
+                "gemini-4-argon",
+                &reasoning(Some(crate::protocol::ir::ReasoningEffort::Low)),
+                &high_only
+            ),
             None
         );
         assert_eq!(

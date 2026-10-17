@@ -275,11 +275,13 @@ pub(super) fn summarize_costs<'a>(
     }
     let totals = by_currency
         .into_iter()
-        .map(|(currency, (total_cost, priced_request_count))| EquivalentCostTotal {
-            currency: currency.to_string(),
-            total_cost,
-            priced_request_count,
-        })
+        .map(
+            |(currency, (total_cost, priced_request_count))| EquivalentCostTotal {
+                currency: currency.to_string(),
+                total_cost,
+                priced_request_count,
+            },
+        )
         .collect();
     (totals, unpriced)
 }

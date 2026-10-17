@@ -47,15 +47,17 @@ pub(super) enum Segment {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SplitState {
-    /// No thinking block seen yet; text passes through.
-    Idle,
+    /// Outside a thinking block; text passes through and a block may open.
+    Text,
     InThinking,
-    /// Thinking closed; everything left is plain text.
-    After,
 }
 
 /// Streaming extractor for the `<thinking>…</thinking>` block Kiro models emit
 /// in-band when thinking mode was requested through the system prompt.
+///
+/// Both tags are structural unless the mention is wrapped in the *same* quote
+/// character on both sides (`` `<thinking>` ``), and decisions never depend on
+/// what follows the tag, so the split is identical under any chunking.
 pub(super) struct ThinkingSplitter {
     state: SplitState,
     buf: String,
@@ -65,17 +67,21 @@ pub(super) struct ThinkingSplitter {
     prev: Option<char>,
     strip_open_newline: bool,
     strip_close_newlines: u8,
+    /// Closed thinking blocks. After the first one, only a tag that starts a
+    /// line may open another block; a mid-line mention stays prose.
+    blocks: usize,
 }
 
 impl ThinkingSplitter {
     pub fn new() -> Self {
         Self {
-            state: SplitState::Idle,
+            state: SplitState::Text,
             buf: String::new(),
             held: String::new(),
             prev: None,
             strip_open_newline: false,
             strip_close_newlines: 0,
+            blocks: 0,
         }
     }
 
@@ -100,41 +106,66 @@ impl ThinkingSplitter {
         let mut out = Vec::new();
         loop {
             match self.state {
-                SplitState::Idle => {
-                    if let Some(pos) = find_real_tag(&self.buf, THINKING_OPEN, self.prev, None) {
-                        let before = self.consume(pos);
-                        self.consume(THINKING_OPEN.len());
-                        let combined = std::mem::take(&mut self.held) + &before;
-                        if !combined.trim().is_empty() {
-                            out.push(Segment::Text(combined));
-                        }
-                        self.state = SplitState::InThinking;
-                        self.strip_open_newline = true;
-                        continue;
-                    }
-                    let hold = if finishing {
-                        0
-                    } else {
-                        partial_suffix(&self.buf, THINKING_OPEN)
-                    };
-                    let safe = self.buf.len() - hold;
-                    if safe > 0 {
-                        let text = self.consume(safe);
-                        if text.trim().is_empty()
-                            && self.held.len() + text.len() <= MAX_HELD_WHITESPACE
-                        {
-                            self.held.push_str(&text);
+                SplitState::Text => {
+                    while self.strip_close_newlines > 0 {
+                        if let Some(rest) = self.buf.strip_prefix("\r\n") {
+                            let drop = self.buf.len() - rest.len();
+                            self.consume(drop);
+                            self.strip_close_newlines -= 1;
+                        } else if self.buf.starts_with('\n') {
+                            self.consume(1);
+                            self.strip_close_newlines -= 1;
                         } else {
-                            out.push(Segment::Text(std::mem::take(&mut self.held) + &text));
+                            if !self.buf.is_empty() {
+                                self.strip_close_newlines = 0;
+                            }
+                            break;
                         }
                     }
-                    if finishing {
-                        let rest = std::mem::take(&mut self.held);
-                        if !rest.is_empty() {
-                            out.push(Segment::Text(rest));
-                        }
+                    if self.buf.is_empty() && !finishing {
+                        // Waiting for the newline run after a closed block.
+                        return out;
                     }
-                    return out;
+                    match self.find_open(finishing) {
+                        FindTag::At(pos) => {
+                            let before = self.consume(pos);
+                            self.consume(THINKING_OPEN.len());
+                            let combined = std::mem::take(&mut self.held) + &before;
+                            if !combined.trim().is_empty() {
+                                out.push(Segment::Text(combined));
+                            }
+                            self.state = SplitState::InThinking;
+                            self.strip_open_newline = true;
+                        }
+                        FindTag::None => {
+                            let hold = if finishing {
+                                0
+                            } else {
+                                partial_suffix(&self.buf, THINKING_OPEN)
+                            };
+                            let safe = self.buf.len() - hold;
+                            if safe > 0 {
+                                let text = self.consume(safe);
+                                if text.trim().is_empty()
+                                    && self.held.len() + text.len() <= MAX_HELD_WHITESPACE
+                                {
+                                    self.held.push_str(&text);
+                                } else {
+                                    out.push(Segment::Text(std::mem::take(&mut self.held) + &text));
+                                }
+                            }
+                            if finishing {
+                                let rest = std::mem::take(&mut self.held);
+                                if !rest.is_empty() {
+                                    out.push(Segment::Text(rest));
+                                }
+                            }
+                            return out;
+                        }
+                        // A mention ends the buffer with a quote still open;
+                        // whether it wraps the tag is not decidable yet.
+                        FindTag::Pending => return out,
+                    }
                 }
                 SplitState::InThinking => {
                     if self.strip_open_newline {
@@ -149,51 +180,105 @@ impl ThinkingSplitter {
                             self.strip_open_newline = false;
                         }
                     }
-                    if let Some(pos) = find_real_close(&self.buf, self.prev) {
-                        let thought = self.consume(pos);
-                        self.consume(THINKING_CLOSE.len());
-                        if !thought.is_empty() {
-                            out.push(Segment::Thinking(thought));
-                        }
-                        self.state = SplitState::After;
-                        self.strip_close_newlines = 2;
-                        continue;
-                    }
-                    let hold = if finishing {
-                        0
-                    } else {
-                        partial_suffix(&self.buf, THINKING_CLOSE)
-                    };
-                    let safe = self.buf.len() - hold;
-                    if safe > 0 {
-                        out.push(Segment::Thinking(self.consume(safe)));
-                    }
-                    return out;
-                }
-                SplitState::After => {
-                    let text = std::mem::take(&mut self.buf);
-                    let mut rest = text.as_str();
-                    while self.strip_close_newlines > 0 {
-                        if let Some(next) = rest
-                            .strip_prefix("\r\n")
-                            .or_else(|| rest.strip_prefix('\n'))
-                        {
-                            rest = next;
-                            self.strip_close_newlines -= 1;
-                        } else {
-                            if !rest.is_empty() {
-                                self.strip_close_newlines = 0;
+                    match self.find_close(finishing) {
+                        FindTag::At(pos) => {
+                            let thought = self.consume(pos);
+                            self.consume(THINKING_CLOSE.len());
+                            if !thought.is_empty() {
+                                out.push(Segment::Thinking(thought));
                             }
-                            break;
+                            self.state = SplitState::Text;
+                            self.strip_close_newlines = 2;
+                            self.blocks += 1;
                         }
+                        FindTag::None => {
+                            let hold = if finishing {
+                                0
+                            } else {
+                                partial_suffix(&self.buf, THINKING_CLOSE)
+                            };
+                            let safe = self.buf.len() - hold;
+                            if safe > 0 {
+                                out.push(Segment::Thinking(self.consume(safe)));
+                            }
+                            return out;
+                        }
+                        FindTag::Pending => return out,
                     }
-                    if !rest.is_empty() {
-                        out.push(Segment::Text(rest.to_string()));
-                    }
-                    return out;
                 }
             }
         }
+    }
+
+    /// Locate the next structural `<thinking>`.
+    fn find_open(&self, finishing: bool) -> FindTag {
+        let mut from = 0;
+        while let Some(rel) = self.buf[from..].find(THINKING_OPEN) {
+            let pos = from + rel;
+            let before = self.buf[..pos].chars().next_back().or(self.prev);
+            let after = self.buf[pos + THINKING_OPEN.len()..].chars().next();
+            match wrapped_mention(before, after, finishing) {
+                Wrapped::Yes => {}
+                Wrapped::Pending => return FindTag::Pending,
+                Wrapped::No => {
+                    let line_start = matches!(before, None | Some('\n' | '\r'));
+                    if self.blocks == 0 || line_start {
+                        return FindTag::At(pos);
+                    }
+                }
+            }
+            from = pos + 1;
+        }
+        FindTag::None
+    }
+
+    /// Locate the next structural `</thinking>`. Nothing is required of what
+    /// follows the tag: a "blank line after" check made the split depend on how
+    /// the stream happened to be chunked.
+    fn find_close(&self, finishing: bool) -> FindTag {
+        let mut from = 0;
+        while let Some(rel) = self.buf[from..].find(THINKING_CLOSE) {
+            let pos = from + rel;
+            let before = self.buf[..pos].chars().next_back().or(self.prev);
+            let after = self.buf[pos + THINKING_CLOSE.len()..].chars().next();
+            match wrapped_mention(before, after, finishing) {
+                Wrapped::Yes => {}
+                Wrapped::Pending => return FindTag::Pending,
+                Wrapped::No => return FindTag::At(pos),
+            }
+            from = pos + 1;
+        }
+        FindTag::None
+    }
+}
+
+enum FindTag {
+    At(usize),
+    None,
+    Pending,
+}
+
+enum Wrapped {
+    Yes,
+    No,
+    Pending,
+}
+
+/// A mention wrapped in the same quote character on both sides — `` `tag` ``,
+/// `'tag'`, `"tag"` — is prose. A quote on one side only is thought text that
+/// happens to start or end with a quotation mark, not a mention.
+fn wrapped_mention(before: Option<char>, after: Option<char>, finishing: bool) -> Wrapped {
+    match (before, after) {
+        (Some(quote), Some(next)) if quote == next && is_quote(quote) => Wrapped::Yes,
+        (Some(quote), None) if is_quote(quote) => {
+            if finishing {
+                // An unclosed quote at EOF cannot wrap the tag; it is prose.
+                Wrapped::Yes
+            } else {
+                Wrapped::Pending
+            }
+        }
+        _ => Wrapped::No,
     }
 }
 
@@ -211,41 +296,6 @@ fn partial_suffix(buf: &str, tag: &str) -> usize {
                 && buf.ends_with(&tag[..*len])
         })
         .unwrap_or(0)
-}
-
-/// First occurrence of `tag` that is not wrapped in quotes or backticks. A
-/// quoted mention such as `` `<thinking>` `` is prose, not structure.
-fn find_real_tag(
-    buf: &str,
-    tag: &str,
-    prev: Option<char>,
-    accept: Option<&dyn Fn(&str) -> bool>,
-) -> Option<usize> {
-    let mut from = 0;
-    while let Some(rel) = buf[from..].find(tag) {
-        let pos = from + rel;
-        let before = buf[..pos].chars().next_back().or(prev);
-        let after = &buf[pos + tag.len()..];
-        let quoted = before.is_some_and(is_quote) || after.chars().next().is_some_and(is_quote);
-        if !quoted && accept.is_none_or(|accept| accept(after)) {
-            return Some(pos);
-        }
-        from = pos + 1;
-    }
-    None
-}
-
-/// A closing tag is structural only when followed by a blank line, or when it
-/// ends the buffer (only whitespace after it).
-fn find_real_close(buf: &str, prev: Option<char>) -> Option<usize> {
-    find_real_tag(
-        buf,
-        THINKING_CLOSE,
-        prev,
-        Some(&|after: &str| {
-            after.starts_with("\n\n") || after.starts_with("\r\n\r\n") || after.trim().is_empty()
-        }),
-    )
 }
 
 // ── Session ──────────────────────────────────────────────────────────────────
@@ -370,7 +420,7 @@ impl Session {
         let mut events = Vec::new();
         if let Some(mut splitter) = self.splitter.take() {
             let segments = splitter.finish();
-            self.emit_segments(segments, &mut events);
+            self.emit_segments(segments, &mut events)?;
         }
         let mut calls = Vec::new();
         for (index, tool) in self.tools.iter().enumerate() {
@@ -576,19 +626,15 @@ impl Session {
             return Ok(());
         }
         self.last_content = text.to_string();
-        if !self.tools.is_empty() {
-            self.reserve(text.len())?;
-            self.post_tool_text.push_str(text);
-            self.visible_text_seen = true;
-            self.text_chars.add(text);
-            return Ok(());
-        }
+        // Tool calls are buffered to the end of the stream, so any text that
+        // trails them is buffered too — but it still goes through the splitter:
+        // thinking emitted after a tool call must not spill into the answer.
         match self.splitter.as_mut() {
             Some(splitter) => {
                 let segments = splitter.push(text);
-                self.emit_segments(segments, events);
+                self.emit_segments(segments, events)?;
             }
-            None => self.emit_text(text.to_string(), events),
+            None => self.emit_text(text.to_string(), events)?,
         }
         Ok(())
     }
@@ -607,23 +653,39 @@ impl Session {
         Ok(())
     }
 
-    fn emit_segments(&mut self, segments: Vec<Segment>, events: &mut Vec<AiStreamDelta>) {
+    fn emit_segments(
+        &mut self,
+        segments: Vec<Segment>,
+        events: &mut Vec<AiStreamDelta>,
+    ) -> Result<(), GatewayError> {
         for segment in segments {
             match segment {
-                Segment::Text(text) => self.emit_text(text, events),
+                Segment::Text(text) => self.emit_text(text, events)?,
                 Segment::Thinking(text) => self.emit_thinking(text, events),
             }
         }
+        Ok(())
     }
 
-    fn emit_text(&mut self, text: String, events: &mut Vec<AiStreamDelta>) {
+    fn emit_text(
+        &mut self,
+        text: String,
+        events: &mut Vec<AiStreamDelta>,
+    ) -> Result<(), GatewayError> {
         if text.is_empty() {
-            return;
+            return Ok(());
         }
         self.start(events);
         self.visible_text_seen = true;
         self.text_chars.add(&text);
+        if !self.tools.is_empty() {
+            // Tool calls are buffered; keep the text that follows behind them.
+            self.reserve(text.len())?;
+            self.post_tool_text.push_str(&text);
+            return Ok(());
+        }
         events.push(AiStreamDelta::TextDelta(text));
+        Ok(())
     }
 
     fn emit_thinking(&mut self, text: String, events: &mut Vec<AiStreamDelta>) {
@@ -1265,5 +1327,95 @@ mod tests {
             vec![Segment::Text("bye".into())]
         );
         assert!(splitter.finish().is_empty());
+    }
+
+    #[test]
+    fn tag_adjacent_to_a_quote_is_still_structural() {
+        // Thought text that starts with a quotation mark is not a mention of
+        // the tag; the whole block used to leak into the answer.
+        let full = "<thinking>\"Let me see\" the user wants</thinking>\n\nAnswer";
+        for split in [full.len(), THINKING_OPEN.len()] {
+            let mut s = session(true);
+            let mut wire = content(&full[..split]);
+            wire.extend(content(&full[split..]));
+            let out = run(&mut s, &wire);
+            assert_eq!(
+                thinking(&out),
+                "\"Let me see\" the user wants",
+                "split {split}"
+            );
+            assert_eq!(text(&out), "Answer", "split {split}");
+            assert_eq!(stop_reason(&out), "stop", "split {split}");
+        }
+
+        // A quotation mark right before the closing tag does not extend the
+        // block: the answer used to be swallowed into thinking.
+        let mut s = session(true);
+        let out = run(
+            &mut s,
+            &content("<thinking>it said \"hi\"</thinking>\n\nAnswer"),
+        );
+        assert_eq!(thinking(&out), "it said \"hi\"");
+        assert_eq!(text(&out), "Answer");
+        assert_eq!(stop_reason(&out), "stop");
+    }
+
+    #[test]
+    fn close_tag_needs_no_blank_line_regardless_of_chunking() {
+        for full in [
+            "<thinking>plan</thinking>\nAnswer",
+            "<thinking>plan</thinking>Answer",
+        ] {
+            for step in 1..=full.len() {
+                let mut s = session(true);
+                let mut wire = Vec::new();
+                let mut i = 0;
+                while i < full.len() {
+                    let mut j = (i + step).min(full.len());
+                    while !full.is_char_boundary(j) {
+                        j += 1;
+                    }
+                    wire.extend(content(&full[i..j]));
+                    i = j;
+                }
+                let out = run(&mut s, &wire);
+                assert_eq!(thinking(&out), "plan", "{full} step {step}");
+                assert_eq!(text(&out), "Answer", "{full} step {step}");
+                assert_eq!(stop_reason(&out), "stop", "{full} step {step}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_second_line_start_thinking_block_is_parsed() {
+        let mut s = session(true);
+        let out = run(
+            &mut s,
+            &content("<thinking>a</thinking>\n\nmid\n<thinking>b</thinking>\n\nend"),
+        );
+        assert_eq!(thinking(&out), "ab");
+        assert_eq!(text(&out), "mid\nend");
+
+        // A second tag mid-line is prose, not another block.
+        let mut s = session(true);
+        let out = run(
+            &mut s,
+            &content("<thinking>a</thinking>\n\nmid <thinking>b</thinking>\n\nend"),
+        );
+        assert_eq!(thinking(&out), "a");
+        assert_eq!(text(&out), "mid <thinking>b</thinking>\n\nend");
+    }
+
+    #[test]
+    fn thinking_after_a_tool_call_is_not_spilled_into_text() {
+        let mut s = session(true);
+        let mut wire = tool(serde_json::json!({
+            "toolUseId": "t1", "name": "read", "input": "{}", "stop": true
+        }));
+        wire.extend(content("<thinking>after tool</thinking>\n\nDone"));
+        let out = run(&mut s, &wire);
+        assert_eq!(thinking(&out), "after tool");
+        assert_eq!(text(&out), "Done");
+        assert_eq!(stop_reason(&out), "tool_calls");
     }
 }

@@ -688,7 +688,10 @@ fn summarize_costs_sums_per_native_currency_and_counts_unpriced() {
     let (totals, unpriced_count) = summarize_costs(&rows);
     assert_eq!(unpriced_count, 4);
     assert_eq!(
-        totals.iter().map(|t| t.currency.as_str()).collect::<Vec<_>>(),
+        totals
+            .iter()
+            .map(|t| t.currency.as_str())
+            .collect::<Vec<_>>(),
         ["CNY", "USD"]
     );
     assert_close(totals[0].total_cost, 20.0);

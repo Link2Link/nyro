@@ -1121,6 +1121,22 @@ impl AdminService {
             None => anyhow::bail!("provider oauth credential not found"),
         };
 
+        // Terminal refresh failure (`refresh_failure_policy` classified the
+        // refresh token itself as rejected): the whole session lineage is
+        // dead, so even a nominally-unexpired access token must not be
+        // routed. Failing here lets the dispatcher skip this provider and
+        // fail over to the next route target until re-authorization replaces
+        // the credential (`upsert`/`complete_refresh` restore `connected`).
+        if oauth_cred.status == "error" {
+            anyhow::bail!(
+                "provider oauth credential was revoked ({})",
+                oauth_cred
+                    .last_error
+                    .as_deref()
+                    .unwrap_or("terminal refresh failure")
+            );
+        }
+
         let driver_key = if oauth_cred.driver_key.is_empty() {
             provider
                 .vendor
@@ -1492,11 +1508,36 @@ impl AdminService {
     }
 }
 
+/// Error-text markers that mean the refresh credential itself was rejected:
+/// the token was rotated away, revoked upstream, or never existed. These are
+/// permanent states no automated retry can recover from, so the credential
+/// goes terminal (`status='error'`) and routing skips the provider until it
+/// is re-authorized. Transient failures (network errors, timeouts, 5xx from
+/// the token endpoint) must never match.
+const TERMINAL_REFRESH_MARKERS: &[&str] = &[
+    // OAuth-standard rejection code embedded in driver error bodies.
+    "invalid_grant",
+    // Kiro: 400/401/403 from the refresh endpoint.
+    "rejected the refresh token",
+    // Missing refresh tokens (driver bails and the resolver's own guard).
+    "refresh token is missing",
+    "reauthentication required",
+    // Claude / Google-style driver wording with the endpoint status inline.
+    "refresh failed: HTTP 400",
+    "refresh failed: HTTP 401",
+    "refresh failed: HTTP 403",
+    "endpoint failed: HTTP 400",
+    "endpoint failed: HTTP 401",
+    "endpoint failed: HTTP 403",
+];
+
 fn refresh_failure_policy(
     _credential: &StoredCredential,
     error: &anyhow::Error,
 ) -> (bool, Option<String>, String) {
-    (false, None, error.to_string())
+    let message = error.to_string();
+    let terminal = TERMINAL_REFRESH_MARKERS.iter().any(|m| message.contains(m));
+    (terminal, None, message)
 }
 
 #[cfg(test)]
@@ -1511,6 +1552,166 @@ mod lifecycle_tests {
         .await?;
         Ok(gateway)
     }
+
+    #[test]
+    fn refresh_failures_are_terminal_only_for_rejected_credentials() {
+        let credential = StoredCredential::default();
+        for rejected in [
+            "Kiro rejected the refresh token (HTTP 401); sign in to Kiro again and re-import the credential",
+            "claude oauth token refresh failed: HTTP 400 {\"error\":\"invalid_grant\"}",
+            "google token endpoint failed: HTTP 403 forbidden",
+            "provider oauth refresh token is missing; reauthentication required",
+        ] {
+            let (terminal, _, _) = refresh_failure_policy(&credential, &anyhow::anyhow!(rejected));
+            assert!(terminal, "must be terminal: {rejected}");
+        }
+        for transient in [
+            "Kiro token refresh failed: HTTP 503",
+            "Kiro token refresh could not connect",
+            "OAuth refresh deadline exceeded",
+            "claude oauth token refresh failed: HTTP 500 upstream error",
+        ] {
+            let (terminal, _, _) = refresh_failure_policy(&credential, &anyhow::anyhow!(transient));
+            assert!(!terminal, "must stay transient: {transient}");
+        }
+    }
+
+    #[tokio::test]
+    async fn terminal_refresh_failure_skips_resolution_until_reauthorized() -> anyhow::Result<()> {
+        let gw = gateway().await?;
+        let admin = gw.admin();
+        let provider = admin
+            .create_provider(crate::db::models::CreateProvider {
+                keys: Vec::new(),
+                name: "oauth revoked fixture".into(),
+                vendor: None,
+                protocol: "openai-compatible".into(),
+                base_url: "https://example.test".into(),
+                protocol_mode: "fixed".into(),
+                protocol_endpoints: vec![],
+                preset_key: None,
+                channel: None,
+                models_source: None,
+                static_models: None,
+                api_key: String::new(),
+                auth_mode: "oauth".into(),
+                use_proxy: false,
+                fast_mode: false,
+            })
+            .await?;
+
+        let store = gw.storage.oauth_credentials();
+        let fresh = |access: &str| crate::db::models::UpsertOAuthCredential {
+            driver_key: "kiro".into(),
+            scheme: "oauth_device_code".into(),
+            access_token: access.into(),
+            refresh_token: Some("REFRESH".into()),
+            // Nominally valid for another hour: only revocation, never
+            // expiry, should stop this token from being routed.
+            expires_at: Some((chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339()),
+            resource_url: None,
+            subject_id: None,
+            scopes: None,
+            meta: None,
+        };
+        store.upsert(&provider.id, fresh("ACCESS")).await?;
+
+        // Replay the refresh pipeline's terminal path: CAS into refreshing,
+        // then a rejected refresh token lands with terminal policy.
+        let connected = store.get(&provider.id).await?.unwrap();
+        let refreshing = store
+            .try_begin_refresh(&provider.id, connected.status_version)
+            .await?
+            .expect("CAS must succeed from connected");
+        store
+            .fail_refresh_with_policy(
+                &provider.id,
+                refreshing.status_version,
+                "Kiro rejected the refresh token (HTTP 401); sign in to Kiro again and re-import the credential",
+                true,
+                None,
+            )
+            .await?;
+
+        // Routing must fail fast so the dispatcher skips this provider and
+        // serves the request from the next route target.
+        let error = match admin.resolve_provider_runtime(&provider).await {
+            Err(error) => error,
+            Ok(_) => panic!("terminal credential must not resolve"),
+        };
+        assert!(error.to_string().contains("revoked"), "{error}");
+
+        // Re-authorization (device login / re-import) restores routing.
+        store.upsert(&provider.id, fresh("ACCESS-2")).await?;
+        let runtime = admin.resolve_provider_runtime(&provider).await?;
+        assert_eq!(runtime.access_token, "ACCESS-2");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn transient_refresh_failure_keeps_the_credential_routable() -> anyhow::Result<()> {
+        let gw = gateway().await?;
+        let admin = gw.admin();
+        let provider = admin
+            .create_provider(crate::db::models::CreateProvider {
+                keys: Vec::new(),
+                name: "oauth transient fixture".into(),
+                vendor: None,
+                protocol: "openai-compatible".into(),
+                base_url: "https://example.test".into(),
+                protocol_mode: "fixed".into(),
+                protocol_endpoints: vec![],
+                preset_key: None,
+                channel: None,
+                models_source: None,
+                static_models: None,
+                api_key: String::new(),
+                auth_mode: "oauth".into(),
+                use_proxy: false,
+                fast_mode: false,
+            })
+            .await?;
+        let store = gw.storage.oauth_credentials();
+        store
+            .upsert(
+                &provider.id,
+                crate::db::models::UpsertOAuthCredential {
+                    driver_key: "kiro".into(),
+                    scheme: "oauth_device_code".into(),
+                    access_token: "ACCESS".into(),
+                    refresh_token: Some("REFRESH".into()),
+                    expires_at: Some(
+                        (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339(),
+                    ),
+                    resource_url: None,
+                    subject_id: None,
+                    scopes: None,
+                    meta: None,
+                },
+            )
+            .await?;
+
+        // A transient refresh failure (network) writes last_error but returns
+        // the credential to `connected`; the still-valid token keeps routing.
+        let connected = store.get(&provider.id).await?.unwrap();
+        let refreshing = store
+            .try_begin_refresh(&provider.id, connected.status_version)
+            .await?
+            .expect("CAS must succeed from connected");
+        store
+            .fail_refresh_with_policy(
+                &provider.id,
+                refreshing.status_version,
+                "Kiro token refresh could not connect",
+                false,
+                None,
+            )
+            .await?;
+        let runtime = admin.resolve_provider_runtime(&provider).await?;
+        assert_eq!(runtime.access_token, "ACCESS");
+        Ok(())
+    }
+
     #[tokio::test]
     async fn devin_manual_import_create_runtime_and_rebind_stay_native() -> anyhow::Result<()> {
         let gw = gateway().await?;

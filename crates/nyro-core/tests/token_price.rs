@@ -909,7 +909,10 @@ async fn provider_stats_and_detail_carry_equivalent_api_price() -> anyhow::Resul
 
     let stats = admin.get_stats_by_provider(Some(24)).await?;
     let item = stats.iter().find(|s| s.provider_id == id).unwrap();
-    assert_eq!(item.request_count, 3, "window excludes the 100h-old attempt");
+    assert_eq!(
+        item.request_count, 3,
+        "window excludes the 100h-old attempt"
+    );
     assert_eq!(item.unpriced_request_count, 1);
     assert_eq!(item.equivalent_costs.len(), 1);
     let total = &item.equivalent_costs[0];
@@ -918,7 +921,11 @@ async fn provider_stats_and_detail_carry_equivalent_api_price() -> anyhow::Resul
     // 1M gross input (250k cached) + 500k output, per attempt, at the registered
     // native CNY rates for glm-5.3: input 8.0, cache hit 2.3, output 28.0.
     let one = 750_000.0 / 1e6 * 8.0 + 250_000.0 / 1e6 * 2.3 + 500_000.0 / 1e6 * 28.0;
-    assert!((total.total_cost - 2.0 * one).abs() < 1e-9, "{}", total.total_cost);
+    assert!(
+        (total.total_cost - 2.0 * one).abs() < 1e-9,
+        "{}",
+        total.total_cost
+    );
     // A wider window picks up the older attempt as well.
     let wide = admin.get_stats_by_provider(Some(720)).await?;
     let wide = wide.iter().find(|s| s.provider_id == id).unwrap();
@@ -929,7 +936,11 @@ async fn provider_stats_and_detail_carry_equivalent_api_price() -> anyhow::Resul
     assert_eq!(detail.request_count, 3);
     assert_eq!(detail.unpriced_request_count, 1);
     assert_eq!(detail.equivalent_costs, item.equivalent_costs);
-    let glm = detail.models.iter().find(|m| m.upstream_model == "glm-5.3").unwrap();
+    let glm = detail
+        .models
+        .iter()
+        .find(|m| m.upstream_model == "glm-5.3")
+        .unwrap();
     assert_eq!(glm.equivalent_costs, item.equivalent_costs);
     assert_eq!(glm.unpriced_request_count, 0);
     let unpriced = detail

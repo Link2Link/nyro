@@ -1155,8 +1155,24 @@ async fn dispatch_pipeline_inner(
                 GatewayError::correlate_response(response, ingress, &ctx.request_id).await;
             let response = performance.wrap(response);
             producer.finish();
-            if status < 400 || !attempt.retry.should_retry(is_retryable(status)) {
+            if status < 400 {
                 return response;
+            }
+            // Credential rejections (401/403) fail over even when the retry
+            // disposition is Never: the disposition guards against replaying
+            // ambiguous post-submission states, while an auth rejection is a
+            // definitive pre-execution refusal that never ran the request.
+            if !attempt.retry.should_retry(is_retryable(status)) && !is_credential_rejection(status)
+            {
+                return response;
+            }
+            if is_credential_rejection(status) {
+                tracing::info!(
+                    request_id = %ctx.request_id,
+                    provider_id = %provider.id,
+                    status,
+                    "upstream rejected the provider credential; failing over to the next route target"
+                );
             }
             last_response = Some(response);
             skip_key_siblings!();
@@ -1680,7 +1696,15 @@ async fn dispatch_pipeline_inner(
             continue;
         }
         skip_key_siblings!();
-        if retry.should_retry(is_retryable(status)) {
+        if retry.should_retry(is_retryable(status)) || is_credential_rejection(status) {
+            if is_credential_rejection(status) && !retry.should_retry(is_retryable(status)) {
+                tracing::info!(
+                    request_id = %ctx.request_id,
+                    provider_id = %provider.id,
+                    status,
+                    "upstream rejected the provider credential; failing over to the next route target"
+                );
+            }
             last_response = Some(response);
             continue;
         }
