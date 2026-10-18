@@ -2823,8 +2823,9 @@ impl AdminService {
         };
         if pool_config.is_some() {
             anyhow::ensure!(
-                accounts.iter().any(|account| account.is_enabled
-                    && account.status == "connected"),
+                accounts
+                    .iter()
+                    .any(|account| account.is_enabled && account.status == "connected"),
                 "No enabled Devin accounts"
             );
         }
@@ -2845,9 +2846,7 @@ impl AdminService {
                         None,
                         &std::collections::HashSet::new(),
                     );
-                    let mut last = Err(anyhow::anyhow!(
-                        "No eligible Devin account for this model"
-                    ));
+                    let mut last = Err(anyhow::anyhow!("No eligible Devin account for this model"));
                     for account in ordered {
                         let attempt = async {
                             let runtime = self

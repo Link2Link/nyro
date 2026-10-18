@@ -381,55 +381,102 @@ pub async fn bind_provider_oauth(
 // ── Provider accounts ──
 
 #[tauri::command]
-pub async fn get_provider_account_pool(gw: State<'_, Gateway>, id: String) -> Result<AccountPoolView, String> {
-    gw.admin().get_provider_account_pool(&id).await.map_err(|e| e.to_string())
+pub async fn get_provider_account_pool(
+    gw: State<'_, Gateway>,
+    id: String,
+) -> Result<AccountPoolView, String> {
+    gw.admin()
+        .get_provider_account_pool(&id)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 pub async fn configure_provider_account_pool(
-    gw: State<'_, Gateway>, id: String, config: DevinPoolConfig,
+    gw: State<'_, Gateway>,
+    id: String,
+    config: DevinPoolConfig,
 ) -> Result<AccountPoolView, String> {
-    gw.admin().configure_provider_account_pool(&id, config).await.map_err(|e| e.to_string())
+    gw.admin()
+        .configure_provider_account_pool(&id, config)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 pub async fn init_provider_account_session(
-    gw: State<'_, Gateway>, id: String, account_id: Option<String>, expected_version: Option<i32>,
+    gw: State<'_, Gateway>,
+    id: String,
+    account_id: Option<String>,
+    expected_version: Option<i32>,
 ) -> Result<AuthSessionInitData, String> {
-    gw.admin().init_provider_account_session(&id, account_id.as_deref(), expected_version).await.map_err(|e| e.to_string())
+    gw.admin()
+        .init_provider_account_session(&id, account_id.as_deref(), expected_version)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 pub async fn bind_provider_account(
-    gw: State<'_, Gateway>, id: String, session_id: String, label: Option<String>,
+    gw: State<'_, Gateway>,
+    id: String,
+    session_id: String,
+    label: Option<String>,
 ) -> Result<ProviderAccountView, String> {
-    gw.admin().bind_provider_account(&id, &session_id, label.as_deref()).await.map_err(|e| e.to_string())
+    gw.admin()
+        .bind_provider_account(&id, &session_id, label.as_deref())
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 pub async fn update_provider_account(
-    gw: State<'_, Gateway>, id: String, account_id: String, expected_version: i32, update: OAuthAccountUpdate,
+    gw: State<'_, Gateway>,
+    id: String,
+    account_id: String,
+    expected_version: i32,
+    update: OAuthAccountUpdate,
 ) -> Result<ProviderAccountView, String> {
-    gw.admin().update_provider_account(&id, &account_id, expected_version, update).await.map_err(|e| e.to_string())
+    gw.admin()
+        .update_provider_account(&id, &account_id, expected_version, update)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 pub async fn disconnect_provider_account(
-    gw: State<'_, Gateway>, id: String, account_id: String, expected_version: i32,
+    gw: State<'_, Gateway>,
+    id: String,
+    account_id: String,
+    expected_version: i32,
 ) -> Result<(), String> {
-    gw.admin().disconnect_provider_account(&id, &account_id, expected_version).await.map_err(|e| e.to_string())
+    gw.admin()
+        .disconnect_provider_account(&id, &account_id, expected_version)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 pub async fn refresh_provider_account_usage(
-    gw: State<'_, Gateway>, id: String, account_id: String,
+    gw: State<'_, Gateway>,
+    id: String,
+    account_id: String,
 ) -> Result<ProviderAccountView, String> {
-    gw.admin().refresh_provider_account_usage(&id, &account_id).await.map_err(|e| e.to_string())
+    gw.admin()
+        .refresh_provider_account_usage(&id, &account_id)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-pub async fn refresh_provider_account_pool_usage(gw: State<'_, Gateway>, id: String) -> Result<AccountPoolView, String> {
-    gw.admin().refresh_provider_account_pool_usage(&id).await.map_err(|e| e.to_string())
+pub async fn refresh_provider_account_pool_usage(
+    gw: State<'_, Gateway>,
+    id: String,
+) -> Result<AccountPoolView, String> {
+    gw.admin()
+        .refresh_provider_account_pool_usage(&id)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 // ── Routes ──
