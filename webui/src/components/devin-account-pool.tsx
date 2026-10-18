@@ -159,8 +159,26 @@ export function DevinAccountPoolCard({ provider }: { provider: Provider }) {
   const isZh = locale === "zh-CN";
   const query = useAccountPool(provider.id);
   const [open, setOpen] = useState(false);
+  const qc = useQueryClient();
+  const refresh = useMutation({
+    mutationFn: () => backend<AccountPoolView>("refresh_provider_account_pool_usage", { id: provider.id }),
+    // Both card and management panel share this cache. Re-read even on failure
+    // because some accounts may have refreshed before the operation failed.
+    onSettled: async () => {
+      await Promise.all([
+        ...["provider-account-pool", "provider-usage", "provider-oauth-status"].map((key) =>
+          qc.invalidateQueries({ queryKey: [key, provider.id] })),
+        qc.invalidateQueries({ queryKey: ["providers"] }),
+      ]);
+    },
+  });
   return <div className="mt-2 space-y-2">
-    {query.data?.config ? <DevinPoolUsage pool={query.data} /> : query.data ? <>
+    {query.data?.config ? <>
+      <DevinPoolUsage pool={query.data} onRefresh={() => refresh.mutate()} refreshing={refresh.isPending} />
+      {refresh.error && <p role="alert" className="text-xs text-red-600">
+        {isZh ? "用量刷新失败" : "Usage refresh failed"}: {localizeBackendErrorMessage(refresh.error, isZh)}
+      </p>}
+    </> : query.data ? <>
       <ProviderUsageFooter provider={provider} />
       <p className="text-xs text-amber-700">{isZh ? "保存默认调度设置即可启用账号池，账号类型自动识别；原单账号仍可正常使用和重登。" : "Save the default scheduling settings to enable the pool with automatic account detection; the legacy single account can still be used and re-authorized."}</p>
     </> : <p className="text-xs text-slate-500">{query.error ? localizeBackendErrorMessage(query.error, isZh) : (isZh ? "读取账号池…" : "Loading account pool…")}</p>}

@@ -158,13 +158,29 @@ function BalanceRow({
 }
 
 /** Actual percentages stay backend-owned; the marker is a capacity-weighted time estimate. */
-export function DevinPoolUsage({ pool, detailed = false }: { pool: AccountPoolView; detailed?: boolean }) {
+export function DevinPoolUsage({ pool, detailed = false, onRefresh, refreshing = false }: {
+  pool: AccountPoolView;
+  detailed?: boolean;
+  onRefresh?: () => void;
+  refreshing?: boolean;
+}) {
   const { locale } = useLocale();
   const isZh = locale === "zh-CN";
   const now = useUsageClock();
   const windows = poolQuotaWindows(pool);
   if (!pool.config) return null;
-  return <div className="space-y-2 rounded-lg border border-slate-200/70 bg-white/40 px-3 py-2 text-xs">
+  return <div className={`relative space-y-2 rounded-lg border border-slate-200/70 bg-white/40 px-3 py-2 text-xs ${onRefresh ? "pr-10" : ""}`}>
+    {onRefresh && <button
+      type="button"
+      onClick={(event) => { event.stopPropagation(); onRefresh(); }}
+      disabled={refreshing}
+      aria-label={isZh ? "刷新全池用量" : "Refresh pool usage"}
+      aria-busy={refreshing}
+      title={refreshing ? (isZh ? "刷新用量中…" : "Refreshing usage…") : (isZh ? "刷新全池用量" : "Refresh pool usage")}
+      className="absolute right-2 top-1.5 cursor-pointer rounded p-1 text-slate-400 transition-colors hover:bg-slate-100 hover:text-slate-600 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-wait disabled:opacity-50"
+    >
+      <RefreshCw aria-hidden="true" className={`h-3.5 w-3.5 ${refreshing ? "animate-spin" : ""}`} />
+    </button>}
     {detailed && <>
     <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
       <strong>Devin</strong>

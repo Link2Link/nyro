@@ -78,6 +78,28 @@ test("collapsed card shows only quota rows and keeps pool details inside account
   });
 });
 
+test("collapsed pool card exposes a refresh action without opening account management", () => {
+  const html = panel(mixed, true);
+  const button = html.match(/<button[^>]*aria-label="Refresh pool usage"[^>]*>/)?.[0] ?? "";
+  match(button, /type="button"/);
+  match(button, /aria-busy="false"/);
+  doesNotMatch(button, /disabled=""/);
+  match(html, /aria-expanded="false"[^>]*>Manage accounts/);
+  doesNotMatch(html, /Devin account pool|Usage coverage/);
+  equal((html.match(/role="progressbar"/g) ?? []).length, 2);
+});
+
+test("pool refresh action indicates pending state and prevents duplicate clicks", () => {
+  const html = renderToStaticMarkup(<LocaleProvider>
+    <DevinPoolUsage pool={mixed} onRefresh={() => {}} refreshing />
+  </LocaleProvider>);
+  match(html, /<button[^>]*disabled=""[^>]*aria-label="Refresh pool usage"[^>]*aria-busy="true"/);
+  match(html, /Refreshing usage…/);
+  match(html, /animate-spin/);
+  equal((html.match(/role="progressbar"/g) ?? []).length, 2);
+  doesNotMatch(usage(mixed), /aria-label="Refresh pool usage"/);
+});
+
 test("compact quota rows retain stale and incomplete usage warnings", () => {
   const html = usage({ ...mixed, quota: { ...mixed.quota, weekly: {
     ...weekly, stale: true, used_percent: null, remaining_percent: null, remaining_units: null,
