@@ -1308,7 +1308,20 @@ async fn dispatch_pipeline_inner(
                         _ => ("failed", "native_upstream_error"),
                     };
                     performance.record_failure(outcome, kind, "upstream_request", &error);
-                    LogBuilder::from_ctx(&call_ctx)
+                    // `from_ctx` carries the route target (a bare family such as
+                    // `claude-sonnet-5-5`); label the failure with the wire UID
+                    // `execute` resolved, matching what a success would report.
+                    let mut failure_log = LogBuilder::from_ctx(&call_ctx);
+                    let wire_model = crate::provider::devin::resolve_wire_model(
+                        &actual_model,
+                        &upstream_request.reasoning,
+                    );
+                    failure_log.diagnostic.payload_metadata["devin_model_route"] = serde_json::json!({
+                        "requested_model": actual_model,
+                        "upstream_model": wire_model,
+                    });
+                    failure_log.upstream_model = wire_model;
+                    failure_log
                         .status(error.http_status().as_u16())
                         .error(error.to_string())
                         .emit();

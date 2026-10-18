@@ -28,6 +28,16 @@ use crate::proxy::client::ProxyClient;
 pub(crate) use runtime::{check_connection, fetch_usage, probe};
 pub(crate) use usage::{DevinQuota, DevinUsage, classify_plan_name};
 pub(crate) const BASE_URL: &str = DEVIN_BASE_URL;
+
+/// Wire model UID the runtime would send for `requested_model` under
+/// `reasoning`. Pure, so the dispatcher can label a failed attempt with the
+/// same UID a successful attempt reports (`claude-sonnet-5-5` -> `-high`).
+pub(crate) fn resolve_wire_model(
+    requested_model: &str,
+    reasoning: &crate::protocol::ir::ReasoningConfig,
+) -> String {
+    catalog::resolve(requested_model, reasoning)
+}
 const CHAT_PATH: &str = "/exa.api_server_pb.ApiServerService/GetChatMessage";
 const STATUS_PATH: &str = "/exa.seat_management_pb.SeatManagementService/GetUserStatus";
 
@@ -189,4 +199,27 @@ pub(crate) fn models(_provider: &Provider) -> Vec<String> {
         .iter()
         .map(|model| model.to_string())
         .collect()
+}
+
+#[cfg(test)]
+mod wire_model_tests {
+    use super::resolve_wire_model;
+    use crate::protocol::ir::{ReasoningConfig, ReasoningEffort};
+
+    #[test]
+    fn failed_attempt_label_matches_the_wire_uid_a_success_reports() {
+        let high = ReasoningConfig {
+            effort: Some(ReasoningEffort::High),
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_wire_model("claude-sonnet-5-5", &high),
+            "claude-sonnet-5-5-high"
+        );
+        // An exact UID is sent as-is, so the label must not be rewritten.
+        assert_eq!(
+            resolve_wire_model("claude-sonnet-5-5-low", &high),
+            "claude-sonnet-5-5-low"
+        );
+    }
 }
