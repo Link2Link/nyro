@@ -16,7 +16,7 @@ use crate::db::models::{
     CreateApiKey, CreateModel, CreateModelBackend, CreateProvider, CreateProviderProtocolEndpoint,
     LogPage, LogQuery, Model, ModelApiKeyUsageStats, ModelBackend, ModelProviderUsageStats,
     ModelStats, ModelTimeBucket, ModelUsageDetail, ModelUsageStats, ModelUsageTotals,
-    OAuthCredential, Provider, ProviderKey, ProviderKeyProbeResult, ProviderModelUsageStats,
+    OAuthAccountUpdate, OAuthCredential, Provider, ProviderKey, ProviderKeyProbeResult, ProviderModelUsageStats,
     ProviderProtocolEndpoint, ProviderStats, ProviderUsageDetail, RecentModelPerformance,
     RequestLog, RequestResult, StatsHourly, StatsOverview, StatsTimeBucket, UpdateApiKey,
     UpdateModel, UpdateProvider, UpsertOAuthCredential, UpsertProviderKey,
@@ -194,169 +194,239 @@ struct PostgresOAuthCredentialStore {
     pool: Pool<Postgres>,
 }
 
-// Keep projections identical for SELECT and RETURNING snapshots.
-const OAUTH_COLUMNS: &str = "provider_id, driver_key, scheme, access_token, refresh_token, to_char(expires_at AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS') AS expires_at, resource_url, subject_id, scopes, meta, status, status_version, last_error, to_char(last_refresh_at AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS') AS last_refresh_at, to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS') AS created_at, to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS') AS updated_at";
+// Keep account projections identical across snapshot queries.
+const OAUTH_COLUMNS: &str = "account_id, label, is_enabled, priority, account_state, provider_id, driver_key, scheme, access_token, refresh_token, to_char(expires_at AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS') AS expires_at, resource_url, subject_id, scopes, meta, status, status_version, last_error, to_char(last_refresh_at AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS') AS last_refresh_at, to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS') AS created_at, to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS') AS updated_at";
 
 impl PostgresOAuthCredentialStore {
-    async fn upsert_once(
+    async fn mutate(
         &self,
         provider_id: &str,
-        input: &UpsertOAuthCredential,
-        expected_version: Option<i32>,
+        action: crate::storage::oauth::Mutation<'_>,
     ) -> anyhow::Result<Option<OAuthCredential>> {
-        let mut tx = self
-            .pool
-            .begin_with("BEGIN ISOLATION LEVEL SERIALIZABLE")
-            .await?;
-        if let Some(expected_version) = expected_version {
-            // Hold the published generation through subject validation and write.
-            let current: Option<(String, i32)> = sqlx::query_as(
-                "SELECT status, status_version FROM provider_oauth_credentials WHERE provider_id = $1 FOR UPDATE",
-            )
-            .bind(provider_id)
-            .fetch_optional(&mut *tx)
-            .await?;
-            if current.as_ref().is_none_or(|(status, version)| {
-                status != "connected" || *version != expected_version
-            }) {
-                tx.commit().await?;
-                return Ok(None);
-            }
-        }
-        let credential = sqlx::query_as::<_, OAuthCredential>(&format!(
-            "INSERT INTO provider_oauth_credentials (provider_id, driver_key, scheme, access_token, refresh_token, expires_at, resource_url, subject_id, scopes, meta, status, status_version, last_error, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6::text::timestamptz, $7, $8, $9, $10, 'connected', 0, NULL, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP) ON CONFLICT(provider_id) DO UPDATE SET driver_key=excluded.driver_key, scheme=excluded.scheme, access_token=excluded.access_token, refresh_token=excluded.refresh_token, expires_at=excluded.expires_at, resource_url=excluded.resource_url, subject_id=excluded.subject_id, scopes=excluded.scopes, meta=excluded.meta, status='connected', status_version=provider_oauth_credentials.status_version+1, last_error=NULL, updated_at=CURRENT_TIMESTAMP RETURNING {OAUTH_COLUMNS}"
-        ))
-        .bind(provider_id)
-        .bind(&input.driver_key)
-        .bind(&input.scheme)
-        .bind(&input.access_token)
-        .bind(&input.refresh_token)
-        .bind(&input.expires_at)
-        .bind(&input.resource_url)
-        .bind(&input.subject_id)
-        .bind(input.scopes.as_deref().unwrap_or("[]"))
-        .bind(input.meta.as_deref().unwrap_or("{}"))
-        .fetch_one(&mut *tx)
-        .await?;
-        tx.commit().await?;
-        Ok(Some(credential))
-    }
-}
-
-#[async_trait]
-impl OAuthCredentialStore for PostgresOAuthCredentialStore {
-    async fn get(&self, provider_id: &str) -> anyhow::Result<Option<OAuthCredential>> {
-        Ok(sqlx::query_as::<_, OAuthCredential>(&format!(
-            "SELECT {OAUTH_COLUMNS} FROM provider_oauth_credentials WHERE provider_id = $1 AND status <> 'disconnected'"
-        ))
-        .bind(provider_id)
-        .fetch_optional(&self.pool)
-        .await?)
-    }
-
-    async fn upsert(
-        &self,
-        provider_id: &str,
-        input: UpsertOAuthCredential,
-    ) -> anyhow::Result<OAuthCredential> {
         for attempt in 0..crate::storage::oauth::BIND_ATTEMPTS {
-            match self.upsert_once(provider_id, &input, None).await {
+            match self.mutate_once(provider_id, &action).await {
                 Err(error)
                     if attempt + 1 < crate::storage::oauth::BIND_ATTEMPTS
                         && crate::storage::oauth::retryable_bind_error(&error) =>
                 {
                     tokio::time::sleep(Duration::from_millis(10 * (attempt as u64 + 1))).await;
                 }
-                result => return result?.context("credential not found after upsert"),
+                result => return result,
             }
         }
-        unreachable!("bounded retry always returns on the last attempt")
+        unreachable!("bounded retry returns on last attempt")
     }
 
+    async fn mutate_once(
+        &self,
+        provider_id: &str,
+        action: &crate::storage::oauth::Mutation<'_>,
+    ) -> anyhow::Result<Option<OAuthCredential>> {
+        let mut tx = self.pool.begin().await?;
+        // Parent lock serializes membership changes even for an empty pool.
+        let parent: Option<(String, String, String, String)> = sqlx::query_as(
+            "SELECT auth_mode, COALESCE(vendor, ''), COALESCE(preset_key, ''), COALESCE(channel, '') FROM providers WHERE id = $1 FOR UPDATE",
+        )
+        .bind(provider_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let rows = sqlx::query_as::<_, OAuthCredential>(&format!("SELECT {OAUTH_COLUMNS} FROM provider_oauth_credentials WHERE provider_id = $1 FOR UPDATE"))
+            .bind(provider_id).fetch_all(&mut *tx).await?;
+        let row = crate::storage::oauth::mutate(
+            provider_id,
+            parent
+                .as_ref()
+                .map(|(mode, vendor, preset, channel)| (mode.as_str(), vendor.as_str(), preset.as_str(), channel.as_str())),
+            &rows,
+            action,
+        )?;
+        if let Some(row) = &row {
+            sqlx::query("INSERT INTO provider_oauth_credentials (account_id, provider_id, label, is_enabled, priority, account_state, driver_key, scheme, access_token, refresh_token, expires_at, resource_url, subject_id, scopes, meta, status, status_version, last_error, last_refresh_at, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::text::timestamptz, $12, $13, $14, $15, $16, $17, $18, $19::text::timestamp AT TIME ZONE 'UTC', $20::text::timestamp AT TIME ZONE 'UTC', $21::text::timestamp AT TIME ZONE 'UTC') ON CONFLICT(account_id) DO UPDATE SET label=excluded.label, is_enabled=excluded.is_enabled, priority=excluded.priority, account_state=excluded.account_state, driver_key=excluded.driver_key, scheme=excluded.scheme, access_token=excluded.access_token, refresh_token=excluded.refresh_token, expires_at=excluded.expires_at, resource_url=excluded.resource_url, subject_id=excluded.subject_id, scopes=excluded.scopes, meta=excluded.meta, status=excluded.status, status_version=excluded.status_version, last_error=excluded.last_error, last_refresh_at=excluded.last_refresh_at, updated_at=excluded.updated_at")
+            .bind(&row.account_id)
+            .bind(&row.provider_id)
+            .bind(&row.label)
+            .bind(row.is_enabled)
+            .bind(row.priority)
+            .bind(&row.account_state)
+            .bind(&row.driver_key)
+            .bind(&row.scheme)
+            .bind(&row.access_token)
+            .bind(&row.refresh_token)
+            .bind(row.expires_at.as_deref().map(|value| crate::storage::oauth::parse_timestamp(value)
+                .map(|time| time.to_rfc3339()).ok_or_else(|| anyhow::anyhow!("invalid OAuth expiry timestamp"))).transpose()?)
+            .bind(&row.resource_url)
+            .bind(&row.subject_id)
+            .bind(&row.scopes)
+            .bind(&row.meta)
+            .bind(&row.status)
+            .bind(row.status_version)
+            .bind(&row.last_error)
+            .bind(&row.last_refresh_at)
+            .bind(&row.created_at)
+            .bind(&row.updated_at)
+            .execute(&mut *tx).await?;
+        }
+        // Read back the exact SQL representation while retaining row locks.
+        let row = if let Some(row) = row {
+            Some(
+                sqlx::query_as::<_, OAuthCredential>(&format!(
+                    "SELECT {OAUTH_COLUMNS} FROM provider_oauth_credentials WHERE account_id = $1"
+                ))
+                .bind(&row.account_id)
+                .fetch_one(&mut *tx)
+                .await?,
+            )
+        } else {
+            None
+        };
+        tx.commit().await?;
+        Ok(row)
+    }
+}
+
+#[async_trait]
+impl OAuthCredentialStore for PostgresOAuthCredentialStore {
+    async fn list_accounts(&self, provider_id: &str) -> anyhow::Result<Vec<OAuthCredential>> {
+        Ok(sqlx::query_as::<_, OAuthCredential>(&format!("SELECT {OAUTH_COLUMNS} FROM provider_oauth_credentials WHERE provider_id = $1 AND status <> 'disconnected' ORDER BY priority, created_at, account_id"))
+            .bind(provider_id).fetch_all(&self.pool).await?)
+    }
+    async fn get_account(
+        &self,
+        provider_id: &str,
+        account_id: &str,
+    ) -> anyhow::Result<Option<OAuthCredential>> {
+        Ok(sqlx::query_as::<_, OAuthCredential>(&format!("SELECT {OAUTH_COLUMNS} FROM provider_oauth_credentials WHERE provider_id = $1 AND account_id = $2 AND status <> 'disconnected'"))
+            .bind(provider_id).bind(account_id).fetch_optional(&self.pool).await?)
+    }
+
+    async fn create_account(
+        &self,
+        provider_id: &str,
+        label: &str,
+        input: UpsertOAuthCredential,
+    ) -> anyhow::Result<OAuthCredential> {
+        self.mutate(
+            provider_id,
+            crate::storage::oauth::Mutation::Create(label, &input),
+        )
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("Account was not created"))
+    }
+    async fn replace_account(
+        &self,
+        provider_id: &str,
+        account_id: &str,
+        expected_version: i32,
+        input: UpsertOAuthCredential,
+    ) -> anyhow::Result<Option<OAuthCredential>> {
+        self.mutate(
+            provider_id,
+            crate::storage::oauth::Mutation::Replace(account_id, expected_version, &input),
+        )
+        .await
+    }
+    async fn update_account(
+        &self,
+        provider_id: &str,
+        account_id: &str,
+        expected_version: i32,
+        update: OAuthAccountUpdate,
+    ) -> anyhow::Result<Option<OAuthCredential>> {
+        self.mutate(
+            provider_id,
+            crate::storage::oauth::Mutation::Update(account_id, expected_version, &update),
+        )
+        .await
+    }
+    async fn disconnect_account(
+        &self,
+        provider_id: &str,
+        account_id: &str,
+        expected_version: i32,
+    ) -> anyhow::Result<bool> {
+        Ok(self
+            .mutate(
+                provider_id,
+                crate::storage::oauth::Mutation::Disconnect(account_id, expected_version),
+            )
+            .await?
+            .is_some())
+    }
+    async fn compare_account_state(
+        &self,
+        provider_id: &str,
+        account_id: &str,
+        expected_version: i32,
+        expected_state: &str,
+        new_state: &str,
+    ) -> anyhow::Result<bool> {
+        Ok(self
+            .mutate(
+                provider_id,
+                crate::storage::oauth::Mutation::CompareState(
+                    account_id,
+                    expected_version,
+                    expected_state,
+                    new_state,
+                ),
+            )
+            .await?
+            .is_some())
+    }
+    async fn get(&self, provider_id: &str) -> anyhow::Result<Option<OAuthCredential>> {
+        crate::storage::oauth::singleton(&self.list_accounts(provider_id).await?)
+    }
+    async fn upsert(
+        &self,
+        provider_id: &str,
+        input: UpsertOAuthCredential,
+    ) -> anyhow::Result<OAuthCredential> {
+        self.mutate(provider_id, crate::storage::oauth::Mutation::Upsert(&input))
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("Credential was not bound"))
+    }
     async fn restore_if_version(
         &self,
         provider_id: &str,
         expected_version: i32,
         previous: Option<UpsertOAuthCredential>,
     ) -> anyhow::Result<bool> {
-        let Some(previous) = previous else {
-            let result = sqlx::query(
-                "UPDATE provider_oauth_credentials SET driver_key='', scheme='', access_token='', refresh_token=NULL, expires_at=NULL, resource_url=NULL, subject_id=NULL, scopes='[]', meta='{}', status='disconnected', status_version=status_version+1, last_error=NULL, last_refresh_at=NULL, updated_at=CURRENT_TIMESTAMP WHERE provider_id=$1 AND status='connected' AND status_version=$2",
+        Ok(self
+            .mutate(
+                provider_id,
+                crate::storage::oauth::Mutation::Restore(expected_version, previous.as_ref()),
             )
-            .bind(provider_id)
-            .bind(expected_version)
-            .execute(&self.pool)
-            .await?;
-            return Ok(result.rows_affected() > 0);
-        };
-        for attempt in 0..crate::storage::oauth::BIND_ATTEMPTS {
-            match self
-                .upsert_once(provider_id, &previous, Some(expected_version))
-                .await
-            {
-                Err(error)
-                    if attempt + 1 < crate::storage::oauth::BIND_ATTEMPTS
-                        && crate::storage::oauth::retryable_bind_error(&error) =>
-                {
-                    tokio::time::sleep(Duration::from_millis(10 * (attempt as u64 + 1))).await;
-                }
-                result => return Ok(result?.is_some()),
-            }
-        }
-        unreachable!("bounded retry always returns on the last attempt")
+            .await?
+            .is_some())
     }
-
     async fn delete(&self, provider_id: &str) -> anyhow::Result<()> {
-        // A scrubbed tombstone fences late completions across logout and rebind.
-        sqlx::query(
-            "UPDATE provider_oauth_credentials SET driver_key='', scheme='', access_token='', refresh_token=NULL, expires_at=NULL, resource_url=NULL, subject_id=NULL, scopes='[]', meta='{}', status='disconnected', status_version=status_version+1, last_error=NULL, last_refresh_at=NULL, updated_at=CURRENT_TIMESTAMP WHERE provider_id=$1"
-        )
-        .bind(provider_id)
-        .execute(&self.pool)
-        .await?;
+        self.mutate(provider_id, crate::storage::oauth::Mutation::Delete)
+            .await?;
         Ok(())
     }
-
     async fn try_begin_refresh(
         &self,
         provider_id: &str,
         expected_version: i32,
     ) -> anyhow::Result<Option<OAuthCredential>> {
-        let credential = sqlx::query_as::<_, OAuthCredential>(&format!(
-            "UPDATE provider_oauth_credentials SET status='refreshing', status_version=status_version+1, updated_at=CURRENT_TIMESTAMP WHERE provider_id=$1 AND status='connected' AND status_version=$2 RETURNING {OAUTH_COLUMNS}"
-        ))
-        .bind(provider_id)
-        .bind(expected_version)
-        .fetch_optional(&self.pool)
-        .await?;
-        Ok(credential)
+        self.mutate(
+            provider_id,
+            crate::storage::oauth::Mutation::BeginRefresh(expected_version),
+        )
+        .await
     }
-
     async fn complete_refresh(
         &self,
         provider_id: &str,
         expected_version: i32,
         input: UpsertOAuthCredential,
     ) -> anyhow::Result<Option<OAuthCredential>> {
-        let credential = sqlx::query_as::<_, OAuthCredential>(&format!(
-            "UPDATE provider_oauth_credentials SET driver_key=$1, scheme=$2, access_token=$3, refresh_token=$4, expires_at=$5::text::timestamptz, resource_url=$6, subject_id=$7, scopes=COALESCE($8, scopes), meta=COALESCE($9, meta), status='connected', status_version=status_version+1, last_error=NULL, last_refresh_at=CURRENT_TIMESTAMP, updated_at=CURRENT_TIMESTAMP WHERE provider_id=$10 AND status='refreshing' AND status_version=$11 RETURNING {OAUTH_COLUMNS}"
-        ))
-        .bind(&input.driver_key)
-        .bind(&input.scheme)
-        .bind(&input.access_token)
-        .bind(&input.refresh_token)
-        .bind(&input.expires_at)
-        .bind(&input.resource_url)
-        .bind(&input.subject_id)
-        .bind(input.scopes.as_deref())
-        .bind(input.meta.as_deref())
-        .bind(provider_id)
-        .bind(expected_version)
-        .fetch_optional(&self.pool)
-        .await?;
-        Ok(credential)
+        self.mutate(
+            provider_id,
+            crate::storage::oauth::Mutation::CompleteRefresh(expected_version, &input),
+        )
+        .await
     }
-
     async fn fail_refresh_with_policy(
         &self,
         provider_id: &str,
@@ -365,23 +435,24 @@ impl OAuthCredentialStore for PostgresOAuthCredentialStore {
         terminal: bool,
         meta: Option<String>,
     ) -> anyhow::Result<bool> {
-        let result = sqlx::query(
-            "UPDATE provider_oauth_credentials SET status=$1, last_error=$2, meta=COALESCE($3, meta), status_version=status_version+1, updated_at=CURRENT_TIMESTAMP WHERE provider_id=$4 AND status='refreshing' AND status_version=$5",
-        )
-        .bind(if terminal { "error" } else { "connected" })
-        .bind(error_message)
-        .bind(meta)
-        .bind(provider_id)
-        .bind(expected_version)
-        .execute(&self.pool)
-        .await?;
-        Ok(result.rows_affected() > 0)
+        Ok(self
+            .mutate(
+                provider_id,
+                crate::storage::oauth::Mutation::FailRefresh(
+                    expected_version,
+                    error_message,
+                    terminal,
+                    meta.as_deref(),
+                ),
+            )
+            .await?
+            .is_some())
     }
 
     async fn list_expiring(&self, before: Duration) -> anyhow::Result<Vec<OAuthCredential>> {
         let seconds = i64::try_from(before.as_secs()).unwrap_or(i64::MAX);
         Ok(sqlx::query_as::<_, OAuthCredential>(&format!(
-            "SELECT {OAUTH_COLUMNS} FROM provider_oauth_credentials WHERE status='connected' AND expires_at IS NOT NULL AND expires_at <= CURRENT_TIMESTAMP + ($1::bigint * INTERVAL '1 second')"
+            "SELECT {OAUTH_COLUMNS} FROM provider_oauth_credentials WHERE status='connected' AND driver_key <> 'devin' AND is_enabled = TRUE AND expires_at IS NOT NULL AND expires_at <= CURRENT_TIMESTAMP + ($1::bigint * INTERVAL '1 second')"
         ))
         .bind(seconds)
         .fetch_all(&self.pool)
@@ -400,6 +471,7 @@ impl OAuthCredentialStore for PostgresOAuthCredentialStore {
         Ok(result.rows_affected())
     }
 }
+
 
 #[derive(Clone)]
 struct PostgresProviderStore {
@@ -2109,18 +2181,34 @@ END $$;"#,
         .execute(self.adapter.pool())
         .await
         .ok();
+        // Provider-keyed -> account-keyed: DDL and ID assignment are atomic.
+        {
+            let mut tx = self.adapter.pool().begin().await?;
+            sqlx::query("LOCK TABLE provider_oauth_credentials IN ACCESS EXCLUSIVE MODE").execute(&mut *tx).await?;
+            let legacy: bool = sqlx::query_scalar("SELECT NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'provider_oauth_credentials' AND column_name = 'account_id')")
+                .fetch_one(&mut *tx).await?;
+            if legacy {
+                for statement in [
+                    "ALTER TABLE provider_oauth_credentials ADD COLUMN account_id TEXT",
+                    "UPDATE provider_oauth_credentials SET account_id = 'legacy:' || provider_id",
+                    "ALTER TABLE provider_oauth_credentials DROP CONSTRAINT provider_oauth_credentials_pkey, ADD PRIMARY KEY (account_id), ADD COLUMN label TEXT NOT NULL DEFAULT 'Default account', ADD COLUMN is_enabled BOOLEAN NOT NULL DEFAULT TRUE, ADD COLUMN priority INTEGER NOT NULL DEFAULT 0, ADD COLUMN account_state TEXT NOT NULL DEFAULT '{}'",
+                ] {
+                    sqlx::query(statement).execute(&mut *tx).await?;
+                }
+            }
+            tx.commit().await?;
+        }
         // Migrate OAuth credentials from providers table to new dedicated table
         sqlx::query(
             r#"
             INSERT INTO provider_oauth_credentials
-                (provider_id, access_token, refresh_token, expires_at, status)
-            SELECT id, COALESCE(access_token, ''), refresh_token, expires_at, 'connected'
-            FROM providers
-            WHERE auth_mode = 'oauth'
-              AND (
-                (access_token IS NOT NULL AND btrim(access_token) != '')
-                OR (refresh_token IS NOT NULL AND btrim(refresh_token) != '')
-              )
+                (account_id, provider_id, access_token, refresh_token, expires_at, status)
+            SELECT 'legacy:' || p.id, p.id, COALESCE(p.access_token, ''), p.refresh_token, p.expires_at, 'connected'
+            FROM providers p
+            WHERE p.auth_mode = 'oauth'
+              AND ((p.access_token IS NOT NULL AND btrim(p.access_token) != '')
+                OR (p.refresh_token IS NOT NULL AND btrim(p.refresh_token) != ''))
+              AND NOT EXISTS (SELECT 1 FROM provider_oauth_credentials c WHERE c.provider_id = p.id)
             ON CONFLICT DO NOTHING
             "#,
         )
@@ -2890,7 +2978,12 @@ CREATE INDEX IF NOT EXISTS idx_api_keys_token ON api_keys(token);
 CREATE INDEX IF NOT EXISTS idx_api_key_routes_route_id ON api_key_routes(route_id);
 
 CREATE TABLE IF NOT EXISTS provider_oauth_credentials (
-    provider_id       TEXT PRIMARY KEY REFERENCES providers(id) ON DELETE CASCADE,
+    account_id        TEXT PRIMARY KEY,
+    provider_id       TEXT NOT NULL REFERENCES providers(id) ON DELETE CASCADE,
+    label             TEXT NOT NULL DEFAULT 'Default account',
+    is_enabled        BOOLEAN NOT NULL DEFAULT TRUE,
+    priority          INTEGER NOT NULL DEFAULT 0,
+    account_state     TEXT NOT NULL DEFAULT '{}',
     driver_key        TEXT NOT NULL DEFAULT '',
     scheme            TEXT NOT NULL DEFAULT '',
     access_token      TEXT NOT NULL DEFAULT '',
@@ -2908,6 +3001,7 @@ CREATE TABLE IF NOT EXISTS provider_oauth_credentials (
     updated_at        TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
 );
 
+CREATE INDEX IF NOT EXISTS idx_oauth_creds_provider ON provider_oauth_credentials(provider_id);
 CREATE INDEX IF NOT EXISTS idx_oauth_creds_status ON provider_oauth_credentials(status);
 CREATE INDEX IF NOT EXISTS idx_oauth_creds_expires ON provider_oauth_credentials(expires_at);
 "#;

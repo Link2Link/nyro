@@ -74,7 +74,7 @@ pub(super) struct PlanStatus {
 }
 
 /// One included quota window.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct DevinQuota {
     /// Percentage still available, `0..=100`.
     pub remaining_percent: u8,
@@ -83,7 +83,7 @@ pub(crate) struct DevinQuota {
 }
 
 /// Everything the usage panel and the scheduler need from one status call.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct DevinUsage {
     /// Upstream plan name (e.g. `Pro`).
     pub plan_name: Option<String>,

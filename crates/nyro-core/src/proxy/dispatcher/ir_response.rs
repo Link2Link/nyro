@@ -134,7 +134,15 @@ fn failed_attempt(
     let response = with_limitations(error.render(Some(request_id)));
     let health = super::health_outcome_from_status(response.status().as_u16());
     progress.log(log, response.status().as_u16(), started);
-    ConversionAttempt::new(response, RetryDisposition::Never, health)
+    let retry = if error
+        .account_failure()
+        .is_some_and(|failure| failure.rejected_before_execution)
+    {
+        RetryDisposition::DefaultStatusPolicy
+    } else {
+        RetryDisposition::Never
+    };
+    ConversionAttempt::new(response, retry, health)
 }
 
 /// Buffer framing/usage until model output, a verified terminal, or the bounded

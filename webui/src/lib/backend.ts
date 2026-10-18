@@ -190,6 +190,34 @@ function resolveHTTP(cmd: string, args?: Record<string, unknown>): HTTPMapping {
         method: "GET",
         url: `${base}/providers/${args?.providerId}/model-capabilities?model=${encodeURIComponent(String(args?.model ?? ""))}`,
       };
+    case "get_provider_account_pool":
+      return { method: "GET", url: `${base}/providers/${encodeURIComponent(String(args?.id))}/accounts` };
+    case "configure_provider_account_pool":
+      return { method: "PUT", url: `${base}/providers/${encodeURIComponent(String(args?.id))}/account-pool`, body: args?.config as Record<string, unknown> };
+    case "init_provider_account_session":
+      return {
+        method: "POST", url: `${base}/providers/${encodeURIComponent(String(args?.id))}/accounts/auth-sessions`,
+        body: { account_id: args?.accountId ?? null, expected_version: args?.expectedVersion ?? null },
+      };
+    case "bind_provider_account":
+      return {
+        method: "POST", url: `${base}/providers/${encodeURIComponent(String(args?.id))}/accounts/bind`,
+        body: { session_id: args?.sessionId, label: args?.label ?? null },
+      };
+    case "update_provider_account":
+      return {
+        method: "PATCH", url: `${base}/providers/${encodeURIComponent(String(args?.id))}/accounts/${encodeURIComponent(String(args?.accountId))}`,
+        body: { expected_version: args?.expectedVersion, update: args?.update },
+      };
+    case "disconnect_provider_account":
+      return {
+        method: "DELETE", url: `${base}/providers/${encodeURIComponent(String(args?.id))}/accounts/${encodeURIComponent(String(args?.accountId))}`,
+        body: { expected_version: args?.expectedVersion },
+      };
+    case "refresh_provider_account_usage":
+      return { method: "POST", url: `${base}/providers/${encodeURIComponent(String(args?.id))}/accounts/${encodeURIComponent(String(args?.accountId))}/usage/refresh` };
+    case "refresh_provider_account_pool_usage":
+      return { method: "POST", url: `${base}/providers/${encodeURIComponent(String(args?.id))}/account-pool/usage/refresh` };
     case "get_provider_oauth_status":
       return { method: "GET", url: `${base}/providers/${args?.id}/oauth/status` };
     case "bind_provider_oauth":
@@ -225,6 +253,11 @@ function resolveHTTP(cmd: string, args?: Record<string, unknown>): HTTPMapping {
           callback_url: args?.callbackUrl ?? args?.callback_url,
           metadata: args?.metadata ?? {},
         },
+      };
+    case "create_devin_provider_with_pool":
+      return {
+        method: "POST", url: `${base}/providers/devin`,
+        body: { session_id: args?.sessionId, input: args?.input, config: args?.config },
       };
     case "create_oauth_provider":
       return {

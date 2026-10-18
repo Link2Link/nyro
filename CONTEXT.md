@@ -1,20 +1,54 @@
 # Domain Context
 
+## Language
+
+**Provider**:
+An operator-configured upstream service offered as one routing destination, with shared model and connection policies. A Provider is not the identity of an upstream subscriber.
+_Avoid_: Account when referring to a routing destination
+
+**Provider Account**:
+An upstream subscriber identity attached to a Provider, with its own authorization and applicable usage entitlements. Logging in again changes its authorization, not necessarily its identity or remaining quota.
+_Avoid_: Provider, API key
+
+**Provider Account Pool**:
+The Provider Accounts available within one Provider for serving requests under that Provider's shared policies. Pool membership does not create additional model-routing destinations.
+_Avoid_: Provider group
+
+**Account Enablement**:
+An operator-controlled setting determining whether a Provider Account may participate in its pool. Temporary quota or authorization problems do not change this setting.
+_Avoid_: Account health
+
+**Homogeneous Plan Pool**:
+A Provider Account Pool whose members share the same subscription tier and equal included entitlements for each applicable quota window. A Devin pool is designated Pro, with daily and weekly windows, or Max, with a weekly window only.
+_Avoid_: Mixed-plan pool
+
+**Account Quota Unit**:
+One full included allowance for one account of a specified plan and quota window. Units add across distinct, independent accounts of that same plan and window, but daily units, weekly units and different plans are not interchangeable.
+_Avoid_: Token allowance when no token-denominated capacity is known
+
+**Pool Quota Utilization**:
+The sum of consumed Account Quota Units divided by the total included capacity of the pool's accounting members for that window. This aggregate describes quota consumption, not the ability of any particular account to accept a request now.
+_Avoid_: Scheduling eligibility
+
 ## Provider Enablement
 
 A persistent operator-controlled setting that determines whether a provider may participate in routing at all.
 
 ## Quota Scheduling Eligibility
 
-A runtime decision derived from authoritative provider usage information that determines whether a provider may receive new requests. It does not change Provider Enablement or the provider's configured routing order.
+A runtime decision derived from authoritative upstream usage information that determines whether an account or a provider may receive new requests. It does not change operator-controlled enablement; one account losing eligibility does not by itself make its entire pool ineligible.
 
 ## Quota Exhaustion
 
-A condition in which at least one active provider quota window is fully consumed, or the provider explicitly reports that the account is unavailable. A quota-exhausted provider is temporarily ineligible for new requests.
+A condition in which at least one applicable included quota window is fully consumed, or the upstream explicitly reports that the account is unavailable. Exhausted included quota prevents new requests unless eligible Reserve Coverage applies; explicit account unavailability cannot be overridden by a balance.
+
+## Reserve Coverage
+
+An upstream-supported paid balance that may carry requests after included quota is exhausted, when the operator's spending policy permits it. It is not restored included quota and is distinct from Confirmed Recovery.
 
 ## Confirmed Recovery
 
-A successful provider usage observation showing that every active quota window is below its limit and that the account is not explicitly unavailable. Only Confirmed Recovery restores Quota Scheduling Eligibility after Quota Exhaustion.
+A successful authoritative usage observation showing that every applicable included quota window is below its limit and that the account is not explicitly unavailable. Elapsed reset time alone is not Confirmed Recovery.
 
 ## Protocol Negotiation
 

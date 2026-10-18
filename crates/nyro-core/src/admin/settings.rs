@@ -11,6 +11,17 @@ impl AdminService {
     }
 
     pub async fn set_setting(&self, key: &str, value: &str) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !key.starts_with("provider_account_fence:"),
+            "Account login fences are internal settings"
+        );
+        if let Some(provider_id) = key.strip_prefix(super::account_pool::POOL_SETTING_PREFIX) {
+            let config: DevinPoolConfig =
+                serde_json::from_str(value).context("Invalid account pool configuration")?;
+            self.configure_provider_account_pool(provider_id, config)
+                .await?;
+            return Ok(());
+        }
         super::token_price::validate_setting(key, value)?;
         self.gw.storage.settings().set(key, value).await
     }

@@ -9,7 +9,7 @@ use crate::db::models::{
     ModelStats, ModelTimeBucket, ModelUsageDetail, ModelUsageStats, OAuthCredential, Provider,
     ProviderKeyProbeResult, ProviderStats, ProviderUsageDetail, RequestLog, RequestResult,
     StatsHourly, StatsOverview, StatsTimeBucket, UpdateApiKey, UpdateModel, UpdateProvider,
-    UpsertOAuthCredential,
+    OAuthAccountUpdate, UpsertOAuthCredential,
 };
 use crate::logging::LogEntry;
 
@@ -308,6 +308,57 @@ pub trait LogStore: Send + Sync {
 
 #[async_trait]
 pub trait OAuthCredentialStore: Send + Sync {
+    /// Active accounts, including disabled/error rows; excludes disconnected tombstones.
+    async fn list_accounts(&self, provider_id: &str) -> anyhow::Result<Vec<OAuthCredential>>;
+    async fn get_account(
+        &self,
+        provider_id: &str,
+        account_id: &str,
+    ) -> anyhow::Result<Option<OAuthCredential>>;
+    /// Creates a new UUID; validates OAuth parent/vendor, deduplicates normalized
+    /// credentials and enforces non-Devin max_accounts=1 under the same lock.
+    async fn create_account(
+        &self,
+        provider_id: &str,
+        label: &str,
+        input: UpsertOAuthCredential,
+    ) -> anyhow::Result<OAuthCredential>;
+    /// CAS replacement preserves account identity/operator metadata, clears state,
+    /// and advances credential generation. Disconnected accounts cannot be revived.
+    async fn replace_account(
+        &self,
+        provider_id: &str,
+        account_id: &str,
+        expected_version: i32,
+        input: UpsertOAuthCredential,
+    ) -> anyhow::Result<Option<OAuthCredential>>;
+    /// Advances status_version (including label-only/no-op updates) to fence attempts;
+    /// preserves quota observations and authorization status.
+    async fn update_account(
+        &self,
+        provider_id: &str,
+        account_id: &str,
+        expected_version: i32,
+        update: OAuthAccountUpdate,
+    ) -> anyhow::Result<Option<OAuthCredential>>;
+    async fn disconnect_account(
+        &self,
+        provider_id: &str,
+        account_id: &str,
+        expected_version: i32,
+    ) -> anyhow::Result<bool>;
+    /// Exact old-state + generation CAS; does not advance generation. Callers must
+    /// provide sanitized/allowlisted JSON, never upstream errors or secret data.
+    async fn compare_account_state(
+        &self,
+        provider_id: &str,
+        account_id: &str,
+        expected_version: i32,
+        expected_state: &str,
+        new_state: &str,
+    ) -> anyhow::Result<bool>;
+    /// All provider-only methods fail with AMBIGUOUS_ACCOUNT for >1 active row,
+    /// counting disabled/error accounts too; writes never affect multiple rows.
     /// Disconnected version fences are never returned as credentials.
     async fn get(&self, provider_id: &str) -> anyhow::Result<Option<OAuthCredential>>;
     /// Atomically bind and advance the generation.
@@ -319,7 +370,9 @@ pub trait OAuthCredentialStore: Send + Sync {
     /// Compensate a failed bind only while its published connected generation
     /// still owns the row. `Some` restores prior credentials with a new generation;
     /// `None` scrubs a tombstone.
-    /// A newer bind, refresh, or logout returns false without mutation.
+    /// A newer bind, refresh, or logout returns false without mutation. Once
+    /// multiple account identities have existed, this account-less compensation
+    /// conservatively returns false; callers must use account-addressed CAS.
     async fn restore_if_version(
         &self,
         provider_id: &str,

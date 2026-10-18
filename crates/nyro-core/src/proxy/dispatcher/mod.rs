@@ -19,6 +19,7 @@
 //!      g. On success: record health, return; on retryable error: continue.
 //!   5. Return last error or 502.
 
+mod account_pool;
 mod accumulator;
 mod auth;
 mod buffered;
@@ -26,6 +27,7 @@ mod compat;
 mod ir_response;
 mod non_stream;
 mod param_overrides;
+mod passthrough_probe;
 mod stream;
 mod stream_probe;
 mod streaming;
@@ -346,6 +348,7 @@ async fn run_phase_hooks_slice(
 struct TargetWithKey {
     target: crate::router::selector::SelectedTarget,
     key: Option<crate::db::models::ProviderKey>,
+    account: Option<account_pool::SelectedAccount>,
 }
 
 /// Full pipeline entry point.
@@ -612,6 +615,28 @@ async fn dispatch_pipeline_inner(
     for provider_id in route_decision.unnamed_provider_ids() {
         if let Ok(Some(provider)) = gw.storage.providers().get(&provider_id).await {
             route_decision.set_provider_name(&provider_id, &provider.name);
+            if crate::provider::devin::is_devin(&provider)
+                && gw
+                    .admin()
+                    .provider_pool_config(&provider_id)
+                    .await
+                    .ok()
+                    .flatten()
+                    .is_some()
+            {
+                // An arbitrary sibling's circuit is not a pool-wide outage.
+                // Exact account/model permits are acquired below.
+                for candidate in &mut route_decision.candidates {
+                    if candidate.provider == provider_id
+                        && candidate
+                            .skipped
+                            .as_ref()
+                            .is_some_and(|reason| reason.reason == "circuit_open")
+                    {
+                        candidate.skipped = None;
+                    }
+                }
+            }
         }
     }
     if ordered_targets.is_empty() {
@@ -642,13 +667,28 @@ async fn dispatch_pipeline_inner(
     // next attempt moves on to a different target instead of retrying keys.
     let mut queue: std::collections::VecDeque<TargetWithKey> = ordered_targets
         .into_iter()
-        .map(|target| TargetWithKey { target, key: None })
+        .map(|target| TargetWithKey {
+            target,
+            key: None,
+            account: None,
+        })
         .collect();
     let mut pending_key_siblings: usize = 0;
+    let mut account_attempts: std::collections::HashMap<String, std::collections::HashSet<String>> =
+        std::collections::HashMap::new();
+    let mut visited_accounts: std::collections::HashSet<(String, String, String)> =
+        std::collections::HashSet::new();
     while let Some(entry) = queue.pop_front() {
+        if ctx.deadline.is_exceeded() || ctx.cancellation.is_cancelled() {
+            break;
+        }
+        if ctx.extensions.get::<AttemptCount>().unwrap_or_default().0 >= 8 {
+            break;
+        }
         let target = entry.target;
         let explicit_key = entry.key;
-        if explicit_key.is_some() {
+        let explicit_account = entry.account;
+        if explicit_key.is_some() || explicit_account.is_some() {
             pending_key_siblings = pending_key_siblings.saturating_sub(1);
         }
 
@@ -719,6 +759,7 @@ async fn dispatch_pipeline_inner(
                     queue.push_front(TargetWithKey {
                         target: target.clone(),
                         key: Some((*sibling).clone()),
+                        account: None,
                     });
                 }
                 pending_key_siblings = eligible.len() - 1;
@@ -728,7 +769,92 @@ async fn dispatch_pipeline_inner(
             None
         };
 
+        // Re-select queued OAuth siblings from current quota/policy snapshots;
+        // a former included account may now be paid reserve while another still
+        // has included capacity. API-key siblings retain their existing path.
+        if explicit_account.is_some() {
+            skip_key_siblings!();
+        }
+        let account_exclusions: std::collections::HashSet<String> = visited_accounts
+            .iter()
+            .filter(|(p, _, model)| p == &provider.id && model == &actual_model)
+            .map(|(_, account, _)| account.clone())
+            .collect();
+        let pool_account = {
+            match account_pool::candidates(
+                &gw,
+                &provider,
+                &actual_model,
+                &request,
+                auth_key.id.as_deref(),
+                &account_exclusions,
+            )
+            .await
+            {
+                Ok(Some(accounts)) => {
+                    let Some(first) = accounts.first().cloned() else {
+                        last_response = Some(pool_error_response(
+                            503,
+                            "Devin account pool has no available accounts",
+                        ));
+                        skip_key_siblings!();
+                        continue;
+                    };
+                    for sibling in accounts[1..].iter().rev() {
+                        queue.push_front(TargetWithKey {
+                            target: target.clone(),
+                            key: None,
+                            account: Some(sibling.clone()),
+                        });
+                    }
+                    pending_key_siblings = accounts.len() - 1;
+                    Some(first)
+                }
+                Ok(None) => None,
+                Err(error) => {
+                    tracing::warn!(provider_id=%provider.id, error=%error, "account pool selection failed");
+                    last_response = Some(pool_error_response(
+                        503,
+                        "Devin account pool is unavailable",
+                    ));
+                    continue;
+                }
+            }
+        };
+        if let Some(account) = &pool_account {
+            let used = account_attempts.get(&provider.id);
+            let is_new_account =
+                used.is_none_or(|set| !set.contains(&account.credential.account_id));
+            if (is_new_account
+                && used.map_or(0, |set| set.len()) >= account.config.max_account_attempts)
+                || account_exclusions.contains(&account.credential.account_id)
+            {
+                visited_accounts.insert((
+                    provider.id.clone(),
+                    account.credential.account_id.clone(),
+                    actual_model.clone(),
+                ));
+                continue;
+            }
+            if !account_pool::still_valid(&gw, account, &actual_model).await {
+                visited_accounts.insert((
+                    provider.id.clone(),
+                    account.credential.account_id.clone(),
+                    actual_model.clone(),
+                ));
+                continue;
+            }
+        }
+
         let mut request_for_target = request.clone();
+        if let Some(account) = &pool_account {
+            let session_key = account.affinity.as_deref().unwrap_or(&ctx.request_id);
+            crate::provider::account_pool::scope_session(
+                &mut request_for_target,
+                session_key,
+                &account.credential.account_id,
+            );
+        }
 
         // OpenCode Go models REQUIRE their exact endpoint. Resolve it through
         // the same function as probes; never downgrade a missing pin to ingress
@@ -798,22 +924,50 @@ async fn dispatch_pipeline_inner(
         if antigravity_force_stream {
             request_for_target.stream.enabled = true;
         }
+        // A late failure from a replaced token must not open the new
+        // credential generation's circuit.
+        let account_health_identity = pool_account.as_ref().map(|account| {
+            format!(
+                "{}@{}",
+                account.credential.account_id, account.credential.status_version
+            )
+        });
         let target_key = crate::provider::key_pool::health_key(
             &target.provider_id,
-            pool_key.as_ref().map(|key| key.id.as_str()),
+            account_health_identity
+                .as_deref()
+                .or_else(|| pool_key.as_ref().map(|key| key.id.as_str())),
             &egress.to_string(),
             &actual_model,
         );
         let Some(health_permit) = gw.health_registry.try_acquire(&target_key) else {
             // Pool health is per key: a denied permit must not discard
             // healthy siblings. Without a pool, keep target-level skipping.
-            if pool_key.is_none() {
+            if let Some(account) = &pool_account {
+                visited_accounts.insert((
+                    provider.id.clone(),
+                    account.credential.account_id.clone(),
+                    actual_model.clone(),
+                ));
+                gw.account_pool.release_generation(
+                    &account.credential.account_id,
+                    account.credential.status_version,
+                );
+            }
+            if pool_key.is_none() && pool_account.is_none() {
                 skip_key_siblings!();
             }
             continue;
         };
 
-        let mut provider_runtime = match gw.admin().resolve_provider_runtime(&provider).await {
+        let runtime_result = if let Some(account) = &pool_account {
+            gw.admin()
+                .resolve_provider_account_runtime(&provider, &account.credential)
+                .await
+        } else {
+            gw.admin().resolve_provider_runtime(&provider).await
+        };
+        let mut provider_runtime = match runtime_result {
             Ok(runtime) => runtime,
             Err(e) => {
                 last_response = Some(error_response(
@@ -1027,6 +1181,17 @@ async fn dispatch_pipeline_inner(
                 ctx.deadline.clone(),
             );
             performance.configure_native_stream();
+            if let Some(account) = &pool_account {
+                account_attempts
+                    .entry(provider.id.clone())
+                    .or_default()
+                    .insert(account.credential.account_id.clone());
+                visited_accounts.insert((
+                    provider.id.clone(),
+                    account.credential.account_id.clone(),
+                    actual_model.clone(),
+                ));
+            }
             let attempt_index = ctx.extensions.get::<AttemptCount>().unwrap_or_default().0 + 1;
             ctx.extensions.insert(AttemptCount(attempt_index));
             performance.correlate(&ctx.request_id, attempt_index);
@@ -1072,14 +1237,37 @@ async fn dispatch_pipeline_inner(
                 backend_model: &target.model,
                 api_key_id: auth_key.id.as_deref(),
                 api_key_name: auth_key.name.as_deref(),
-                provider_key_name: None,
-                route_decision: Some(route_decision.to_json()),
+                provider_key_name: pool_account
+                    .as_ref()
+                    .map(|account| account.credential.label.as_str()),
+                route_decision: Some({
+                    let mut decision: serde_json::Value =
+                        serde_json::from_str(&route_decision.to_json())
+                            .unwrap_or_else(|_| serde_json::json!({}));
+                    if let Some(account) = &pool_account {
+                        decision["account"] = serde_json::json!({
+                            "account_id": account.credential.account_id,
+                            "label": account.credential.label,
+                            "credential_version": account.credential.status_version,
+                            "distinct_account_attempts": account_attempts.get(&provider.id).map_or(0, |set| set.len()),
+                            "affinity": account.affinity.is_some(),
+                        });
+                    }
+                    decision.to_string()
+                }),
                 is_stream,
                 enable_payload: route.enable_payload,
                 reasoning_effort: reasoning_effort.clone(),
                 start,
                 req_ext: req_ctx_ext.clone(),
             };
+            if let Some(account) = &pool_account {
+                if !account_pool::still_valid(&gw, account, &actual_model).await {
+                    producer.finish();
+                    health_permit.neutral();
+                    continue;
+                }
+            }
             let upstream = adapter
                 .start_ir(
                     upstream_request.clone(),
@@ -1090,6 +1278,11 @@ async fn dispatch_pipeline_inner(
                 .await;
             let attempt = match upstream {
                 Ok(upstream) => {
+                    let upstream = if let Some(account) = &pool_account {
+                        account_pool::observe_stream(upstream, &gw, account, &actual_model)
+                    } else {
+                        upstream
+                    };
                     ir_response::handle_ir_response(
                         upstream,
                         &call_ctx,
@@ -1101,6 +1294,10 @@ async fn dispatch_pipeline_inner(
                     .await
                 }
                 Err(error) => {
+                    if let (Some(account), Some(failure)) = (&pool_account, error.account_failure())
+                    {
+                        account_pool::feedback(&gw, account, &actual_model, failure).await;
+                    }
                     let local = control
                         .local_failure
                         .load(std::sync::atomic::Ordering::Acquire);
@@ -1134,6 +1331,11 @@ async fn dispatch_pipeline_inner(
                 }
             };
             let status = attempt.response.status().as_u16();
+            let account_failure = attempt
+                .response
+                .extensions()
+                .get::<crate::error::AccountFailure>()
+                .copied();
             let response = if attempt.health == HealthOutcome::Deferred {
                 defer_stream_health(
                     attempt.response,
@@ -1156,14 +1358,31 @@ async fn dispatch_pipeline_inner(
             let response = performance.wrap(response);
             producer.finish();
             if status < 400 {
+                if let Some(account) = &pool_account {
+                    if account.config.session_affinity {
+                        if let Some(key) = &account.affinity {
+                            gw.account_pool.bind(
+                                key,
+                                &account.credential.account_id,
+                                account.credential.status_version,
+                                account.config.affinity_ttl_seconds,
+                            );
+                        }
+                    }
+                }
                 return response;
             }
-            // Credential rejections (401/403) fail over even when the retry
-            // disposition is Never: the disposition guards against replaying
-            // ambiguous post-submission states, while an auth rejection is a
-            // definitive pre-execution refusal that never ran the request.
-            if !attempt.retry.should_retry(is_retryable(status)) && !is_credential_rejection(status)
-            {
+            // Devin needs explicit protocol rejection evidence, never a final
+            // rendered 401/403 alone. Keep other native vendors' existing policy.
+            let devin_safe_refusal =
+                account_failure.is_some_and(|failure| failure.rejected_before_execution);
+            let can_retry = if crate::provider::devin::is_devin(&provider) {
+                (devin_safe_refusal || (!control.is_submitted() && is_retryable(status)))
+                    && crate::provider::account_pool::can_reconstruct(&request)
+            } else {
+                attempt.retry.should_retry(is_retryable(status)) || is_credential_rejection(status)
+            };
+            if !can_retry {
                 return response;
             }
             if is_credential_rejection(status) {
@@ -1175,6 +1394,9 @@ async fn dispatch_pipeline_inner(
                 );
             }
             last_response = Some(response);
+            if pool_account.is_some() && devin_safe_refusal && pending_key_siblings > 0 {
+                continue;
+            }
             skip_key_siblings!();
             continue;
         }
@@ -1455,6 +1677,15 @@ async fn dispatch_pipeline_inner(
         let mut same_target_retried = false;
         let mut saw_zero_payload_malformed = false;
         let (response, status, retry, health_outcome, defer_native_stream_health) = loop {
+            if ctx.extensions.get::<AttemptCount>().unwrap_or_default().0 >= 8 {
+                break (
+                    error_response(503, "upstream attempt budget exhausted"),
+                    503,
+                    crate::conversion::RetryDisposition::Never,
+                    HealthOutcome::Neutral,
+                    false,
+                );
+            }
             // Strict evidence belongs to this attempt, never the request OnceLock.
             let performance = crate::performance::Attempt::new(
                 gw.log_tx.clone(),

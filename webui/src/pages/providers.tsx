@@ -38,6 +38,8 @@ import { saveProbeSelection } from "@/lib/model-probe-selection";
 import { ModelProbePicker } from "@/components/model-probe-picker";
 import {
   Server,
+  Search,
+  AlertCircle,
   Plus,
   Trash2,
   CheckCircle,
@@ -79,7 +81,13 @@ import {
 } from "@/components/ui/select";
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
+import { ProviderGroup } from "@/components/provider-group";
+import { ProviderMoreActions } from "@/components/provider-more-actions";
+import { groupProviders, providerGroupKey, providerNeedsAttention, parseGroupExpansion, isGroupExpanded, PROVIDER_GROUP_STORAGE_KEY } from "@/lib/provider-groups";
 import { ProviderUsageFooter } from "@/components/provider-usage";
+import { DevinAccountPoolCard, DevinAccountPoolPanel } from "@/components/devin-account-pool";
+import { DevinPlanSelect } from "@/components/devin-pool-settings";
+import { newDevinPoolConfig, type DevinPlan } from "@/lib/devin-account-pool";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { resolveProtocol, PROTOCOL_ENDPOINT_TABLE, PROTOCOL_TABLE } from "@/lib/protocol";
 import { openExternalUrl } from "@/lib/open-external";
@@ -870,6 +878,16 @@ export default function ProvidersPage() {
 
   const qc = useQueryClient();
   const [showForm, setShowForm] = useState(false);
+  const [providerSearch, setProviderSearch] = useState("");
+  const [expandedGroups, setExpandedGroups] = useState<Record<string, boolean>>(() => {
+    try { return parseGroupExpansion(localStorage.getItem(PROVIDER_GROUP_STORAGE_KEY)); }
+    catch { return {}; }
+  });
+  const [highlightedProvider, setHighlightedProvider] = useState<string | null>(null);
+  useEffect(() => {
+    try { localStorage.setItem(PROVIDER_GROUP_STORAGE_KEY, JSON.stringify(expandedGroups)); }
+    catch { /* Storage can be unavailable in private browsing. */ }
+  }, [expandedGroups]);
   const [editingId, setEditingId] = useState<string | null>(null);
   const editingIdRef = useRef<string | null>(null);
   const [testingId, setTestingId] = useState<string | null>(null);
@@ -889,6 +907,7 @@ export default function ProvidersPage() {
   const [showCreateApiKey, setShowCreateApiKey] = useState(true);
   const [showEditApiKey, setShowEditApiKey] = useState(false);
   const [errorDialog, setErrorDialog] = useState<{ title: string; description?: string } | null>(null);
+  const [createDevinPlan, setCreateDevinPlan] = useState<DevinPlan | "">("");
   const createOAuth = useOAuthSession();
   const { session: createOAuthSession, status: createOAuthStatus, busy: createOAuthBusy } = createOAuth;
   const [createOAuthCallbackUrl, setCreateOAuthCallbackUrl] = useState("");
@@ -929,6 +948,31 @@ export default function ProvidersPage() {
     () => (providerPresetsRaw.length ? providerPresetsRaw : [fallbackProviderPreset()]),
     [providerPresetsRaw],
   );
+  const providerGroups = useMemo(
+    () => groupProviders(providers, providerPresets, isZh, providerSearch),
+    [providers, providerPresets, isZh, providerSearch],
+  );
+  const searchingProviders = Boolean(providerSearch.trim());
+  // Keep an active edit mounted even if its name no longer matches a search.
+  const visibleGroups = providerGroups.filter((group) => group.matches.length || group.providers.some((p) => p.id === editingId));
+
+  function revealProvider(provider: Provider) {
+    setProviderSearch("");
+    setExpandedGroups((current) => ({ ...current, [providerGroupKey(provider)]: true }));
+    setHighlightedProvider(provider.id);
+  }
+
+  useEffect(() => {
+    if (!highlightedProvider || !providers.some((p) => p.id === highlightedProvider)) return;
+    const frame = requestAnimationFrame(() => {
+      const row = document.getElementById(`provider-row-${highlightedProvider}`);
+      row?.scrollIntoView({ block: "nearest", behavior: window.matchMedia("(prefers-reduced-motion: reduce)").matches ? "instant" : "smooth" });
+      row?.focus({ preventScroll: true });
+    });
+    const timer = setTimeout(() => setHighlightedProvider(null), 3000);
+    return () => { cancelAnimationFrame(frame); clearTimeout(timer); };
+  }, [highlightedProvider, providers]);
+
   const editingProvider = useMemo(
     () => providers.find((provider) => provider.id === editingId) ?? null,
     [providers, editingId],
@@ -978,7 +1022,7 @@ export default function ProvidersPage() {
   const editOAuthStatusQuery = useQuery<ProviderOAuthStatusData>({
     queryKey: ["provider-oauth-status", editingProvider?.id],
     queryFn: () => backend("get_provider_oauth_status", { id: editingProvider?.id }),
-    enabled: isEditingOAuthProvider,
+    enabled: isEditingOAuthProvider && !isDevinProvider(editingProvider ?? {}),
   });
 
   function syncProviderOAuthStatus(status: ProviderOAuthStatusData) {
@@ -991,6 +1035,7 @@ export default function ProvidersPage() {
   const createMut = useMutation({
     mutationFn: (input: CreateProvider) => backend<Provider>("create_provider", { input }),
     onSuccess: async (createdProvider: Provider) => {
+      revealProvider(createdProvider);
       qc.invalidateQueries({ queryKey: ["providers"] });
       closeCreateForm();
       if (createdProvider.protocol_mode !== "adaptive") {
@@ -1003,11 +1048,13 @@ export default function ProvidersPage() {
   });
 
   const createOAuthMut = useMutation({
-    mutationFn: ({ sessionId, input }: { sessionId: string; input: CreateProvider }) =>
-      backend<Provider>("create_oauth_provider", { sessionId, input }),
+    mutationFn: ({ sessionId, input, plan }: { sessionId: string; input: CreateProvider; plan?: DevinPlan }) =>
+      plan ? backend<Provider>("create_devin_provider_with_pool", { sessionId, input, config: newDevinPoolConfig(plan) })
+        : backend<Provider>("create_oauth_provider", { sessionId, input }),
     onSuccess: async (createdProvider: Provider, { sessionId }) => {
       qc.invalidateQueries({ queryKey: ["providers"] });
       if (!createOAuth.ownsSession(sessionId)) return;
+      revealProvider(createdProvider);
       closeCreateForm();
       await handleTest(createdProvider);
     },
@@ -1082,7 +1129,8 @@ export default function ProvidersPage() {
   const copyMut = useMutation({
     mutationFn: ({ id, appendTargets }: { id: string; appendTargets: boolean }) =>
       backend<Provider>("copy_provider", { id, options: { append_targets: appendTargets } }),
-    onSuccess: () => {
+    onSuccess: (createdProvider) => {
+      revealProvider(createdProvider);
       qc.invalidateQueries({ queryKey: ["providers"] });
       qc.invalidateQueries({ queryKey: ["routes"] });
       void invalidateModelRatings(qc);
@@ -1699,6 +1747,7 @@ export default function ProvidersPage() {
     if (!nextPresetId) return;
     resetCreateOAuthState(true);
     setCreateKiroLogin({ method: "google" });
+    setCreateDevinPlan("");
     setSelectedPresetId(nextPresetId);
     const preset = providerPresets.find((item) => item.id === nextPresetId);
     if (!preset) return;
@@ -1868,6 +1917,7 @@ export default function ProvidersPage() {
 
   function closeCreateForm() {
     resetCreateOAuthState(true);
+    setCreateDevinPlan("");
     setCreateKiroLogin({ method: "google" });
     setShowForm(false);
     setShowCreateApiKey(true);
@@ -2096,6 +2146,7 @@ export default function ProvidersPage() {
                 </div>
               )}
               {createIsDevinOAuth && <>
+                <div className="col-span-2"><DevinPlanSelect value={createDevinPlan} onChange={(plan) => { resetCreateOAuthState(); setCreateDevinPlan(plan); }} disabled={createOAuthMut.isPending} /></div>
                 <DevinLoginNotice isZh={isZh} />
               </>}
               {createIsKiroOAuth && <>
@@ -2159,7 +2210,7 @@ export default function ProvidersPage() {
                       </p>
                       <div className="mt-3 flex flex-wrap gap-2">
                         {!createOAuthSession || createOAuthStatus?.status === "error" ? (
-                          <Button type="button" onClick={startCreateOAuth} disabled={createOAuthBusy || !selectedPreset || (createIsKiroOAuth && !kiroLoginConfigured(createKiroLogin))}>
+                          <Button type="button" onClick={startCreateOAuth} disabled={createOAuthBusy || !selectedPreset || (createIsDevinOAuth && !createDevinPlan) || (createIsKiroOAuth && !kiroLoginConfigured(createKiroLogin))}>
                             {createOAuthBusy ? (isZh ? "初始化中..." : "Initializing...") : (isZh ? "开始授权" : "Start Authorization")}
                           </Button>
                         ) : (
@@ -2602,7 +2653,8 @@ export default function ProvidersPage() {
                     if (createResolvedAuthMode === "oauth") {
                       const sessionId = createOAuthSession?.session_id;
                       if (!sessionId || !createOAuth.canConsume(sessionId)) return;
-                      createOAuthMut.mutate({ sessionId, input });
+                      if (createIsDevinOAuth && !createDevinPlan) return;
+                      createOAuthMut.mutate({ sessionId, input, ...(createIsDevinOAuth && createDevinPlan ? { plan: createDevinPlan } : {}) });
                       return;
                     }
                     createMut.mutate(input);
@@ -2617,6 +2669,7 @@ export default function ProvidersPage() {
                     || (form.protocol_mode === "adaptive"
                       && !(form.protocol_endpoints ?? []).some((endpoint) => endpoint.is_enabled !== false))
                     || (createResolvedAuthMode === "oauth" && !createOAuthReady)
+                    || (createIsDevinOAuth && !createDevinPlan)
                   }
                 >
                   {(createMut.isPending || createOAuthMut.isPending)
@@ -2644,8 +2697,32 @@ export default function ProvidersPage() {
           <p className="mt-1 text-xs text-slate-400">{isZh ? "添加提供商后开始使用" : "Add a provider to get started"}</p>
         </div>
       ) : (
-        <div className="grid gap-3">
-          {providers.map((p) => {
+        <div className="space-y-3">
+          <div className="flex flex-wrap items-center justify-between gap-3 pb-1">
+            <div className="relative w-full sm:max-w-sm">
+              <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" />
+              <Input value={providerSearch} onChange={(event) => setProviderSearch(event.target.value)}
+                className="pl-9 pr-9" aria-label={isZh ? "搜索供应商或配置" : "Search providers or configurations"}
+                placeholder={isZh ? "搜索供应商、配置名称、协议…" : "Search providers, configurations, protocols…"} />
+              {providerSearch && <button type="button" onClick={() => setProviderSearch("")} aria-label={isZh ? "清空搜索" : "Clear search"} className="absolute right-2 top-1/2 -translate-y-1/2 rounded p-1 text-slate-400 hover:text-slate-700"><X className="h-4 w-4" /></button>}
+            </div>
+            <div className="flex flex-wrap items-center gap-2 text-xs text-slate-500">
+              <span className="mr-2" aria-live="polite">{isZh ? `${providers.length} 个配置 · ${providerGroups.length} 个分组` : `${providers.length} configs · ${providerGroups.length} groups`}</span>
+              <Button size="sm" variant="ghost" disabled={searchingProviders} onClick={() => setExpandedGroups((current) => ({ ...current, ...Object.fromEntries(providerGroups.map((group) => [group.key, true])) }))}>{isZh ? "全部展开" : "Expand all"}</Button>
+              <Button size="sm" variant="ghost" disabled={searchingProviders || Boolean(editingId)} onClick={() => setExpandedGroups((current) => ({ ...current, ...Object.fromEntries(providerGroups.map((group) => [group.key, false])) }))}>{isZh ? "全部收起" : "Collapse all"}</Button>
+            </div>
+          </div>
+          {visibleGroups.length === 0 && <div className="glass rounded-2xl px-4 py-12 text-center text-sm text-slate-500" role="status">{isZh ? "没有匹配的供应商或配置" : "No matching providers or configurations"}</div>}
+          {visibleGroups.map((group) => {
+            const editing = group.providers.some((p) => p.id === editingId);
+            const expanded = searchingProviders || editing || isGroupExpanded(group, expandedGroups);
+            const issues = group.providers.filter((p) => providerNeedsAttention(p, testResult[p.id]));
+            const rows = group.providers.filter((p) => group.matches.includes(p) || p.id === editingId);
+            return <ProviderGroup key={group.key} group={group} expanded={expanded} searching={searchingProviders}
+              editing={editing} issueCount={issues.length} isZh={isZh}
+              onToggle={() => setExpandedGroups((current) => ({ ...current, [group.key]: !expanded }))}
+              onShowIssues={() => { if (issues[0]) revealProvider(issues[0]); }}>
+          {rows.map((p) => {
             const tr = testResult[p.id];
             const status = tr
               ? (tr.success ? "success" : "failed")
@@ -2685,10 +2762,6 @@ export default function ProvidersPage() {
                   enabled: true,
                   testStatus: null,
                 }];
-            const selectedPreset = providerPresets.find((preset) => preset.id === (p.preset_key || p.vendor || ""));
-            const selectedProviderName = selectedPreset
-              ? presetLabel(selectedPreset, isZh)
-              : (p.vendor || p.preset_key || p.name);
 
             if (isEditing) {
               const editingChannelOptions = presetChannels(editingPreset);
@@ -2721,7 +2794,7 @@ export default function ProvidersPage() {
               const editRequiresNewOAuthProvider = editingResolvedAuthMode === "oauth" && !currentProviderIsOAuth;
               const editOAuthStatus = editOAuthStatusQuery.data;
               return (
-                <div key={p.id} className="glass rounded-2xl p-5 space-y-4">
+                <div key={p.id} id={`provider-row-${p.id}`} className="p-4 sm:p-5 space-y-4">
                   <div className="flex items-center justify-between">
                     <h3 className="text-sm font-semibold text-slate-900">{isZh ? "编辑提供商" : "Edit Provider"}</h3>
                     <button onClick={() => { closeEditForm(); }} className="p-1 text-slate-400 hover:text-slate-600 cursor-pointer">
@@ -2899,7 +2972,9 @@ export default function ProvidersPage() {
                         <p className="text-xs text-slate-500">{isZh ? "预设只是静态建议，不是账号可用模型保证。" : "Preset entries are static suggestions, not a guarantee of account access."}</p>
                       </div>
                     </>}
-                    {editingResolvedAuthMode === "oauth" ? (
+                    {editingResolvedAuthMode === "oauth" && isDevinProvider(p) ? (
+                      <div className="col-span-2"><DevinAccountPoolPanel provider={p} /></div>
+                    ) : editingResolvedAuthMode === "oauth" ? (
                       <details className="col-span-2 rounded-xl border border-slate-200 bg-slate-50" open={editOAuthStatus?.status !== "connected" || showEditReauth}>
                         <summary className="flex items-center justify-between gap-3 p-4 cursor-pointer list-none [&::-webkit-details-marker]:hidden">
                           <div className="flex items-center gap-2">
@@ -3888,10 +3963,10 @@ export default function ProvidersPage() {
             }
 
             return (
-              <div key={p.id} className="glass rounded-2xl p-4">
-                <div className="flex items-center justify-between">
-                  <div className="flex items-center gap-3">
-                    <div className="flex h-9 w-9 items-center justify-center rounded-xl bg-slate-100">
+              <div key={p.id} id={`provider-row-${p.id}`} tabIndex={-1} className={`rounded-xl px-4 py-3 outline-none transition-colors motion-reduce:transition-none focus-visible:ring-2 focus-visible:ring-ring ${highlightedProvider === p.id ? "bg-sky-50 ring-1 ring-inset ring-sky-300" : ""}`}>
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div className="flex min-w-0 flex-1 items-center gap-3">
+                    {group.key === "custom" && <div className="flex h-9 w-9 items-center justify-center rounded-xl bg-slate-100">
                       <ProviderIcon
                         iconKey={p.preset_key ?? p.vendor ?? undefined}
                         name={p.name}
@@ -3907,13 +3982,10 @@ export default function ProvidersPage() {
                         monochrome
                         className="provider-preset-icon provider-preset-icon-mono rounded-xl border border-slate-300/70 bg-transparent"
                       />
-                    </div>
-                    <div>
+                    </div>}
+                    <div className="min-w-0">
                       <div className="flex flex-wrap items-center gap-2">
-                        <span className="inline-flex h-5 items-center font-semibold text-slate-900">{p.name}</span>
-                        <code className="inline-flex h-5 items-center rounded bg-slate-100 px-2 py-0.5 text-[10px] leading-none font-medium text-slate-600">
-                          {selectedProviderName}
-                        </code>
+                        <span className="break-words font-semibold text-slate-900 [overflow-wrap:anywhere]">{p.name}</span>
                         {adaptiveProvider && (
                           <Badge variant="secondary" className="connect-label-badge bg-sky-50 text-sky-700">
                             {isZh ? "自适应" : "Adaptive"}
@@ -3954,6 +4026,8 @@ export default function ProvidersPage() {
                             OAuth
                           </Badge>
                         )}
+                        {p.auth_mode !== "oauth" && <span className="text-[10px] text-slate-400">API Key</span>}
+                        {p.auth_mode === "oauth" && providerNeedsAttention({ ...p, last_test_success: null }) && <span className="inline-flex items-center gap-1 text-xs text-orange-600" title={p.oauth_status ?? undefined}><AlertCircle className="h-3 w-3" />{isZh ? "授权或配额异常" : "Authorization or quota issue"}</span>}
                         {!p.is_enabled && (
                           <Badge variant="danger" className="connect-label-badge">
                             {isZh ? "已禁用" : "Disabled"}
@@ -3962,18 +4036,18 @@ export default function ProvidersPage() {
                         {status === "success" ? (
                           <CheckCircle
                             className="h-3.5 w-3.5 text-green-500"
-                            aria-label={isZh ? "测试成功" : "Test passed"}
+                            aria-label={isZh ? "最近测试成功" : "Last test passed"}
                           />
                         ) : status === "failed" ? (
                           <XCircle
                             className="h-3.5 w-3.5 text-red-400"
-                            aria-label={isZh ? "测试失败" : "Test failed"}
+                            aria-label={isZh ? "最近测试失败" : "Last test failed"}
                           />
                         ) : null}
                       </div>
                     </div>
                   </div>
-                  <div className="flex items-center gap-0.5">
+                  <div className="flex shrink-0 items-center gap-0.5">
                     <button
                       onClick={() => {
                         if (p.is_enabled) {
@@ -3982,6 +4056,7 @@ export default function ProvidersPage() {
                           toggleEnabledMut.mutate({ id: p.id, is_enabled: true });
                         }
                       }}
+                      aria-label={p.is_enabled ? (isZh ? "禁用" : "Disable") : (isZh ? "启用" : "Enable")}
                       title={p.is_enabled ? (isZh ? "禁用" : "Disable") : (isZh ? "启用" : "Enable")}
                       className="rounded-lg p-2 text-slate-400 transition-colors hover:bg-slate-100 hover:text-slate-600 cursor-pointer"
                     >
@@ -3994,6 +4069,7 @@ export default function ProvidersPage() {
                     <button
                       onClick={() => handleTest(p)}
                       disabled={Boolean(testingId) || Boolean(probingId)}
+                      aria-label={isZh ? "测试" : "Test"}
                       title={isZh ? "测试" : "Test"}
                       className="rounded-lg p-2 text-slate-400 transition-colors hover:bg-amber-50 hover:text-amber-500 cursor-pointer disabled:opacity-50"
                     >
@@ -4003,6 +4079,7 @@ export default function ProvidersPage() {
                         <Zap className="h-3.5 w-3.5" />
                       )}
                     </button>
+                    <ProviderMoreActions label={isZh ? `${p.name}：更多操作` : `More actions for ${p.name}`}>
                     <button
                       onClick={() => setProbePickerTarget(p)}
                       disabled={Boolean(testingId) || Boolean(probingId)}
@@ -4014,13 +4091,14 @@ export default function ProvidersPage() {
                       ) : (
                         <ListChecks className="h-3.5 w-3.5" />
                       )}
+                      {isZh ? "模型测试" : "Test models"}
                     </button>
                     <button
                       onClick={() => startEdit(p)}
                       title={isZh ? "编辑" : "Edit"}
                       className="rounded-lg p-2 text-slate-400 transition-colors hover:bg-blue-50 hover:text-blue-500 cursor-pointer"
                     >
-                      <Pencil className="h-4 w-4" />
+                      <Pencil className="h-4 w-4" />{isZh ? "编辑" : "Edit"}
                     </button>
                     <button
                       onClick={() => {
@@ -4036,19 +4114,23 @@ export default function ProvidersPage() {
                       ) : (
                         <Copy className="h-4 w-4" />
                       )}
+                      {isZh ? "复制" : "Copy"}
                     </button>
                     <button
                       onClick={() => setProviderToDelete(p)}
                       title={isZh ? "删除" : "Delete"}
                       className="rounded-lg p-2 text-slate-400 transition-colors hover:bg-red-50 hover:text-red-500 cursor-pointer"
                     >
-                      <Trash2 className="h-4 w-4" />
+                      <Trash2 className="h-4 w-4" />{isZh ? "删除" : "Delete"}
                     </button>
+                    </ProviderMoreActions>
                   </div>
                 </div>
-                {providerUsageSupported(p) && <ProviderUsageFooter provider={p} />}
+                {isDevinProvider(p) ? <DevinAccountPoolCard provider={p} /> : providerUsageSupported(p) && <ProviderUsageFooter provider={p} compact />}
               </div>
             );
+          })}
+            </ProviderGroup>;
           })}
         </div>
       )}

@@ -210,6 +210,9 @@ pub struct ProviderUsage {
     /// Runtime scheduling decision derived from this usage snapshot.
     pub scheduling: ProviderScheduling,
     pub queried_at: String,
+    /// Homogeneous account capacity; never used as a synthetic routing tier.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub account_pool: Option<AccountPoolView>,
 }
 
 /// Outcome of a single provider row in [`AdminService::list_provider_usage`].
@@ -2344,6 +2347,13 @@ impl AdminService {
         id: &str,
         mode: UsageQueryMode,
     ) -> anyhow::Result<ProviderUsage> {
+        let provider = self.get_provider(id).await?;
+        if crate::provider::devin::is_devin(&provider) {
+            let view = self
+                .refresh_account_pool_usage(id, matches!(mode, UsageQueryMode::GuardOnly))
+                .await?;
+            return Ok(self.account_pool_provider_usage(view));
+        }
         match self.query_provider_usage(id, mode).await {
             Ok((mut usage, true, kiro_overage)) => {
                 // Feature-specific windows (Codex metered features such as
@@ -2988,6 +2998,7 @@ impl AdminService {
                 is_available,
                 scheduling: ProviderScheduling::default(),
                 queried_at: chrono::Utc::now().to_rfc3339(),
+                account_pool: None,
             },
             authoritative,
             kiro_overage,
@@ -3147,7 +3158,8 @@ async fn refresh_due_provider_usage(gw: &Gateway) {
     let mut due = Vec::new();
     for provider in providers {
         if !provider.is_enabled
-            || !gw.quota_registry.is_due(&provider.id)
+            || (!crate::provider::devin::is_devin(&provider)
+                && !gw.quota_registry.is_due(&provider.id))
             || !provider_usage_monitorable(&admin, &provider).await
         {
             continue;

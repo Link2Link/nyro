@@ -125,7 +125,12 @@ CREATE TABLE `provider_keys` (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE `provider_oauth_credentials` (
+  `account_id` varchar(191) COLLATE utf8mb4_unicode_ci NOT NULL,
   `provider_id` varchar(36) COLLATE utf8mb4_unicode_ci NOT NULL,
+  `label` text COLLATE utf8mb4_unicode_ci NOT NULL DEFAULT (_utf8mb4'Default account'),
+  `is_enabled` tinyint(1) NOT NULL DEFAULT '1',
+  `priority` int NOT NULL DEFAULT '0',
+  `account_state` longtext COLLATE utf8mb4_unicode_ci NOT NULL DEFAULT (_utf8mb4'{}'),
   `driver_key` text COLLATE utf8mb4_unicode_ci NOT NULL,
   `scheme` varchar(255) COLLATE utf8mb4_unicode_ci NOT NULL DEFAULT '',
   `access_token` text COLLATE utf8mb4_unicode_ci NOT NULL,
@@ -141,9 +146,10 @@ CREATE TABLE `provider_oauth_credentials` (
   `last_refresh_at` datetime DEFAULT NULL,
   `created_at` datetime DEFAULT CURRENT_TIMESTAMP,
   `updated_at` datetime DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-  PRIMARY KEY (`provider_id`),
+  PRIMARY KEY (`account_id`),
   KEY `idx_oauth_creds_status` (`status`),
   KEY `idx_oauth_creds_expires` (`expires_at`),
+  KEY `idx_oauth_creds_provider` (`provider_id`),
   CONSTRAINT `provider_oauth_credentials_ibfk_1` FOREIGN KEY (`provider_id`) REFERENCES `providers` (`id`) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 

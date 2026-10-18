@@ -33,6 +33,8 @@ impl AdminService {
 
     pub async fn export_config(&self) -> anyhow::Result<ExportData> {
         let providers = self.list_providers().await?;
+        let provider_ids: std::collections::HashSet<_> =
+            providers.iter().map(|p| p.id.clone()).collect();
         let models = self.list_models().await?;
         let settings = self.gw.storage.settings().list_all().await?;
         let mut model_ratings = self
@@ -122,11 +124,23 @@ impl AdminService {
                 })
                 .collect(),
             model_ratings,
-            settings: settings.into_iter().collect(),
+            settings: settings
+                .into_iter()
+                .filter(|(key, _)| {
+                    !key.starts_with("provider_account_fence:")
+                        && key
+                            .strip_prefix(super::account_pool::POOL_SETTING_PREFIX)
+                            .is_none_or(|id| provider_ids.contains(id))
+                })
+                .collect(),
         })
     }
 
     pub async fn import_config(&self, data: ExportData) -> anyhow::Result<ImportResult> {
+        anyhow::ensure!(
+            matches!(data.version, 1 | 2),
+            "Unsupported configuration format version"
+        );
         // A None destination means the source provider was skipped (name conflict
         // or create failure). Unknown historical identities are not guessed.
         let mut price_provider_ids: HashMap<String, Option<String>> = HashMap::new();
@@ -144,6 +158,20 @@ impl AdminService {
         // Validate reserved price settings and ratings before any configuration changes.
         for (key, value) in &data.settings {
             super::token_price::validate_setting(key, value)?;
+            if let Some(source_id) = key.strip_prefix(super::account_pool::POOL_SETTING_PREFIX) {
+                let config: DevinPoolConfig =
+                    serde_json::from_str(value).context("Invalid account pool configuration")?;
+                config.validate()?;
+                let provider = data
+                    .providers
+                    .iter()
+                    .find(|p| p.source_id.as_deref() == Some(source_id))
+                    .context("Account pool setting has no source provider")?;
+                anyhow::ensure!(
+                    provider.vendor.as_deref() == Some("devin") && provider.auth_mode == "oauth",
+                    "Account pool setting requires a Devin OAuth provider"
+                );
+            }
         }
         super::model_ratings::validate_export_ratings(&data.model_ratings)?;
         if !data.model_ratings.is_empty() {
@@ -305,6 +333,18 @@ impl AdminService {
         }
 
         for (key, value) in &data.settings {
+            if key.starts_with("provider_account_fence:") {
+                continue;
+            }
+            if let Some(source_id) = key.strip_prefix(super::account_pool::POOL_SETTING_PREFIX) {
+                // Never attach imported policy to a pre-existing/conflicting provider.
+                if let Some(Some(target_id)) = price_provider_ids.get(source_id) {
+                    self.configure_provider_account_pool(target_id, serde_json::from_str(value)?)
+                        .await?;
+                    settings_imported += 1;
+                }
+                continue;
+            }
             let Some((key, value)) = super::token_price::remap_import_setting(
                 key,
                 value,

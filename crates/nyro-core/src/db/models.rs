@@ -367,7 +367,13 @@ pub(crate) fn normalize_legacy_provider_protocol_config(
 
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
 pub struct OAuthCredential {
+    pub account_id: String,
     pub provider_id: String,
+    pub label: String,
+    pub is_enabled: bool,
+    pub priority: i32,
+    /// Safe quota/validation observations, separate from authorization lifecycle.
+    pub account_state: String,
     pub driver_key: String,
     pub scheme: String,
     pub access_token: String,
@@ -383,6 +389,13 @@ pub struct OAuthCredential {
     pub last_refresh_at: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct OAuthAccountUpdate {
+    pub label: Option<String>,
+    pub is_enabled: Option<bool>,
+    pub priority: Option<i32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

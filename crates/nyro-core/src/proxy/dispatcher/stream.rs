@@ -177,6 +177,42 @@ pub(super) async fn handle_stream(
     // mutations (passthrough_resp=true). Upstream bytes are forwarded verbatim;
     // a side-channel parser accumulates usage stats for logging only.
     if passthrough_resp {
+        // Pre-commit hold: do not commit the 200 on the first framing byte.
+        // Wait for the first payload event so a retryable in-stream failure
+        // (`server_error` after only `response.created`/keep-alives) fails
+        // this attempt and the dispatcher can fail over to the next target.
+        let mut upstream_bytes = resp.bytes_stream();
+        let max_hold = super::passthrough_probe::PRECOMMIT_HOLD_MAX
+            .min(call_ctx.gw.config.upstream_timeouts.first_byte);
+        let (held_replay, held_first_chunk_ms) =
+            match super::passthrough_probe::hold_until_committable(
+                &mut upstream_bytes,
+                req_ctx,
+                upstream_start,
+                max_hold,
+            )
+            .await
+            {
+                super::passthrough_probe::HoldOutcome::Commit {
+                    replay,
+                    first_chunk_ms,
+                } => (replay, first_chunk_ms),
+                super::passthrough_probe::HoldOutcome::Fail(failure) => {
+                    tracing::warn!(
+                        kind = failure.kind,
+                        stage = failure.stage,
+                        "passthrough stream failed before any output; failing the attempt for dispatcher failover: {}",
+                        failure.message
+                    );
+                    return super::passthrough_probe::fail_attempt(
+                        log,
+                        *failure,
+                        upstream_req_hdrs_str,
+                        upstream_req_body_str,
+                        upstream_hdrs_str,
+                    );
+                }
+            };
         let (pt_tx, pt_rx) = tokio::sync::mpsc::channel::<Result<Bytes, Infallible>>(64);
 
         // Clone the log builder into the spawn: all identity + request-side
@@ -195,10 +231,14 @@ pub(super) async fn handle_stream(
             let mut log_parser = egress.handler().make_stream_response_decoder();
             let mut accumulator = super::LogUsageAccumulator::default();
             let mut undecided_buf: Vec<u8> = Vec::new();
-            let mut byte_stream = resp.bytes_stream();
+            // Bytes withheld by the pre-commit hold replay first, then the live
+            // upstream stream continues; chunk counters see the whole exchange.
+            let mut byte_stream =
+                futures::stream::iter(held_replay.into_iter().map(Ok)).chain(upstream_bytes);
             let mut stream_error: Option<String> = None;
             let mut chunks_count: i32 = 0;
-            let mut first_chunk_ms: Option<i64> = None;
+            // TTFB reflects when upstream first answered, not when the hold ended.
+            let mut first_chunk_ms: Option<i64> = held_first_chunk_ms;
             let mut passthrough_mode = PassthroughBodyMode::Undecided;
             let mut converted_client_sse: Option<String> = None;
             let mut converted_ai_resp = None;

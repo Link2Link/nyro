@@ -850,10 +850,31 @@ async fn backfill_route_targets(pool: &SqlitePool) -> anyhow::Result<()> {
 }
 
 async fn ensure_oauth_credentials_table(pool: &SqlitePool) -> anyhow::Result<()> {
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    // Rebuild only the old provider-keyed table. Copy every lifecycle field,
+    // including scrubbed tombstones and their monotonically increasing fence.
+    let columns = sqlx::query("PRAGMA table_info(provider_oauth_credentials)")
+        .fetch_all(&mut *tx)
+        .await?;
+    let legacy = !columns.is_empty()
+        && !columns
+            .iter()
+            .any(|r| r.get::<String, _>("name") == "account_id");
+    if legacy {
+        sqlx::query(
+            "ALTER TABLE provider_oauth_credentials RENAME TO provider_oauth_credentials_legacy",
+        )
+        .execute(&mut *tx)
+        .await?;
+    }
     sqlx::query(
-        r#"
-        CREATE TABLE IF NOT EXISTS provider_oauth_credentials (
-            provider_id       TEXT PRIMARY KEY REFERENCES providers(id) ON DELETE CASCADE,
+        r#"CREATE TABLE IF NOT EXISTS provider_oauth_credentials (
+            account_id        TEXT PRIMARY KEY,
+            provider_id       TEXT NOT NULL REFERENCES providers(id) ON DELETE CASCADE,
+            label             TEXT NOT NULL DEFAULT 'Default account',
+            is_enabled        INTEGER NOT NULL DEFAULT 1,
+            priority          INTEGER NOT NULL DEFAULT 0,
+            account_state     TEXT NOT NULL DEFAULT '{}',
             driver_key        TEXT NOT NULL DEFAULT '',
             scheme            TEXT NOT NULL DEFAULT '',
             access_token      TEXT NOT NULL DEFAULT '',
@@ -869,11 +890,26 @@ async fn ensure_oauth_credentials_table(pool: &SqlitePool) -> anyhow::Result<()>
             last_refresh_at   TEXT,
             created_at        TEXT DEFAULT (datetime('now')),
             updated_at        TEXT DEFAULT (datetime('now'))
-        )
-        "#,
+        )"#,
     )
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
+    if legacy {
+        sqlx::query("INSERT INTO provider_oauth_credentials (account_id, provider_id, driver_key, scheme, access_token, refresh_token, expires_at, resource_url, subject_id, scopes, meta, status, status_version, last_error, last_refresh_at, created_at, updated_at) SELECT 'legacy:' || provider_id, provider_id, driver_key, scheme, access_token, refresh_token, expires_at, resource_url, subject_id, scopes, meta, status, status_version, last_error, last_refresh_at, created_at, updated_at FROM provider_oauth_credentials_legacy")
+            .execute(&mut *tx).await?;
+        sqlx::query("DROP TABLE provider_oauth_credentials_legacy")
+            .execute(&mut *tx)
+            .await?;
+    }
+    for (name, column) in [
+        ("provider", "provider_id"),
+        ("status", "status"),
+        ("expires", "expires_at"),
+    ] {
+        sqlx::query(&format!("CREATE INDEX IF NOT EXISTS idx_oauth_creds_{name} ON provider_oauth_credentials({column})"))
+            .execute(&mut *tx).await?;
+    }
+    tx.commit().await?;
     Ok(())
 }
 
@@ -881,21 +917,16 @@ async fn migrate_oauth_credentials_from_providers(pool: &SqlitePool) -> anyhow::
     if !column_exists(pool, "providers", "access_token").await? {
         return Ok(());
     }
-    sqlx::query(
-        r#"
+    sqlx::query(r#"
         INSERT OR IGNORE INTO provider_oauth_credentials
-            (provider_id, access_token, refresh_token, expires_at, status)
-        SELECT id, COALESCE(access_token, ''), refresh_token, expires_at, 'connected'
-        FROM providers
-        WHERE auth_mode = 'oauth'
-          AND (
-            (access_token IS NOT NULL AND access_token != '')
-            OR (refresh_token IS NOT NULL AND refresh_token != '')
-          )
-        "#,
-    )
-    .execute(pool)
-    .await?;
+            (account_id, provider_id, access_token, refresh_token, expires_at, status)
+        SELECT 'legacy:' || p.id, p.id, COALESCE(p.access_token, ''), p.refresh_token, p.expires_at, 'connected'
+        FROM providers p
+        WHERE p.auth_mode = 'oauth'
+          AND ((p.access_token IS NOT NULL AND trim(p.access_token) != '')
+            OR (p.refresh_token IS NOT NULL AND trim(p.refresh_token) != ''))
+          AND NOT EXISTS (SELECT 1 FROM provider_oauth_credentials c WHERE c.provider_id = p.id)
+    "#).execute(pool).await?;
     Ok(())
 }
 

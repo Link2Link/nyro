@@ -135,14 +135,42 @@ async fn execute(
     };
     let status = response.status().as_u16();
     if !(200..300).contains(&status) {
-        if matches!(status, 401 | 403 | 404 | 429 | 503) {
+        let retry_after = response
+            .headers()
+            .get("retry-after")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<u64>().ok());
+        // Bounded classification only; opaque response bytes are never logged.
+        let mut bytes = Vec::new();
+        let mut body = response.bytes_stream();
+        while bytes.len() < 16 * 1024 {
+            let chunk = tokio::select! {
+                biased;
+                _ = control.cancellation.cancelled() => return Err(GatewayError::ClientCancelled),
+                _ = tokio::time::sleep(control.deadline.remaining()) => break,
+                chunk = body.next() => chunk,
+            };
+            match chunk {
+                Some(Ok(chunk)) => {
+                    bytes.extend_from_slice(&chunk[..chunk.len().min(16 * 1024 - bytes.len())])
+                }
+                _ => break,
+            }
+        }
+        let message = String::from_utf8_lossy(&bytes);
+        let error = super::errors::failure(
+            if status >= 400 { status } else { 502 },
+            &message,
+            super::errors::http_refusal(status, &bytes),
+            retry_after,
+        );
+        if error
+            .account_failure()
+            .is_some_and(|f| f.rejected_before_execution)
+        {
             control.rejected.store(true, Ordering::Release);
         }
-        return Err(GatewayError::UpstreamStatus {
-            provider: "devin".into(),
-            status: if status >= 400 { status } else { 502 },
-            body: Some(format!("Devin returned HTTP {status}")),
-        });
+        return Err(error);
     }
     let response_headers = response.headers().clone();
     let (sender, receiver) = tokio::sync::mpsc::channel(32);

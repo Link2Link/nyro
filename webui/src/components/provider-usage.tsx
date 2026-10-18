@@ -5,6 +5,7 @@ import { backend } from "@/lib/backend";
 import { localizeBackendErrorMessage } from "@/lib/backend-error";
 import { isKiroOverage, providerUsageTitle, tierLabel } from "@/lib/provider-usage";
 import { useLocale } from "@/lib/i18n";
+import { accountStateLabel, poolQuotaWindows, type AccountPoolView } from "@/lib/devin-account-pool";
 import type {
   Provider,
   ProviderUsage,
@@ -222,7 +223,62 @@ function BalanceRow({
   );
 }
 
-export function ProviderUsageFooter({ provider }: { provider: Provider }) {
+/** Backend-owned pool percentages; deliberately no synthetic common reset/pace marker. */
+export function DevinPoolUsage({ pool }: { pool: AccountPoolView }) {
+  const { locale } = useLocale();
+  const isZh = locale === "zh-CN";
+  const windows = poolQuotaWindows(pool);
+  if (!pool.config) return null;
+  return <div className="space-y-2 rounded-lg border border-slate-200/70 bg-white/40 px-3 py-2 text-xs">
+    <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+      <strong>Devin · {pool.config.plan === "pro" ? "Pro" : "Max"}</strong>
+      <span>{isZh ? `${pool.counts.total} 个账号 · ${pool.counts.available} 个可用` : `${pool.counts.total} accounts · ${pool.counts.available} available`}</span>
+      {pool.quota.estimated && <span className="text-amber-700">{isZh ? "容量估算" : "Estimated capacity"}</span>}
+    </div>
+    <p className={pool.counts.available === 0 ? "font-medium text-red-600" : "text-slate-600"}>
+      {accountStateLabel(pool.readiness, isZh)}
+      {pool.counts.included === 0 && <span> · {isZh ? "当前无可用套餐账号" : "No included-quota account is currently available"}</span>}
+    </p>
+    {windows.map(([name, window]) => {
+      const used = window.used_percent;
+      const complete = used != null && window.remaining_percent != null && window.remaining_units != null;
+      return <div key={name} className="space-y-1">
+        <div className="flex flex-wrap items-center gap-2">
+          <span className="min-w-14 font-medium text-slate-500">{name === "daily" ? (isZh ? "日额度" : "Daily") : (isZh ? "周额度" : "Weekly")}</span>
+          {complete ? <>
+            <div role="progressbar" aria-label={name === "daily" ? (isZh ? "日额度已用" : "Daily used quota") : (isZh ? "周额度已用" : "Weekly used quota")}
+              aria-valuemin={0} aria-valuemax={100} aria-valuenow={used}
+              className="h-2 min-w-20 flex-1 overflow-hidden rounded-full bg-slate-100">
+              <div className={`h-full rounded-full ${utilizationBarClass(used)}`} style={{ width: `${Math.min(100, Math.max(0, used))}%` }} />
+            </div>
+            <span className={`tabular-nums ${utilizationColor(used)}`}>{isZh ? "已用" : "Used"} {used.toFixed(1)}%</span>
+            <span className="tabular-nums">{isZh ? "剩余" : "Remaining"} {window.remaining_percent!.toFixed(1)}%</span>
+            <span className="text-slate-500">{window.remaining_units!.toFixed(2)} / {window.total_units} {isZh ? "份账号额度" : "account units"}</span>
+          </> : <span className="text-slate-500">{window.total_units === 0
+            ? (isZh ? "无有效池容量" : "No eligible pool capacity")
+            : (isZh ? `更新中（${window.known_accounts}/${window.total_units} 账号）` : `Updating (${window.known_accounts}/${window.total_units} accounts)`)}</span>}
+          {window.stale && <span className="text-amber-700">{isZh ? "旧数据 / 不完整" : "Stale / incomplete"}</span>}
+        </div>
+        {window.next_reset_at && <p className="text-[10px] text-slate-500">
+          {window.reset_mode === "aligned" ? (isZh ? "共同重置" : "Aligned reset") : (isZh ? "下次账号额度重置" : "Next account reset")}: <time dateTime={window.next_reset_at}>{new Date(window.next_reset_at).toLocaleString()}</time>
+          {` (${window.next_reset_accounts}/${window.total_units} ${isZh ? "账号" : "accounts"})`}
+          {window.reset_mode === "unknown" && ` · ${isZh ? "重置时间覆盖不完整" : "Incomplete reset coverage"}`}
+        </p>}
+      </div>;
+    })}
+    {(pool.counts.disabled > 0 || pool.counts.disconnected > 0 || pool.counts.plan_mismatch > 0 || pool.counts.plan_unverified > 0) && <p className="text-slate-500">
+      {isZh ? "容量排除" : "Capacity exclusions"}: {isZh ? "停用" : "disabled"} {pool.counts.disabled} · {isZh ? "断开" : "disconnected"} {pool.counts.disconnected} · {isZh ? "套餐不匹配" : "plan mismatch"} {pool.counts.plan_mismatch} · {isZh ? "未验证" : "unverified"} {pool.counts.plan_unverified}
+    </p>}
+  </div>;
+}
+
+export function ProviderUsageFooter({
+  provider,
+  compact = false,
+}: {
+  provider: Provider;
+  compact?: boolean;
+}) {
   const { locale } = useLocale();
   const isZh = locale === "zh-CN";
   const [now, setNow] = useState(() => Date.now());
@@ -290,8 +346,8 @@ export function ProviderUsageFooter({ provider }: { provider: Provider }) {
   const title = providerUsageTitle(shown?.kind, isZh);
   const errorMessage = error ? localizeBackendErrorMessage(error, isZh) : "";
 
-  return (
-    <div className="mt-3 space-y-2 rounded-xl border border-slate-200/70 bg-white/40 px-3 py-2.5">
+  const fullFooter = (
+    <div className={compact ? "mt-2 space-y-2 border-t border-slate-200/70 pt-2" : "mt-3 space-y-2 rounded-xl border border-slate-200/70 bg-white/40 px-3 py-2.5"}>
       <div className="flex items-center justify-between gap-2">
         <div className="flex items-center gap-2 text-xs font-medium text-slate-500">
           <span>{title}</span>
@@ -392,5 +448,104 @@ export function ProviderUsageFooter({ provider }: { provider: Provider }) {
         <p className="text-xs text-slate-400">{isZh ? "暂无用量数据" : "No usage data"}</p>
       )}
     </div>
+  );
+
+  // Keep the default footer and its fetching lifecycle unchanged. Native
+  // details provides keyboard disclosure without mounting another query.
+  if (!compact) return fullFooter;
+
+  const tiers = shown?.tiers ?? [];
+  const spends = shown?.spends ?? [];
+  const queriedAt = shown?.queried_at;
+  const queriedAtMs = queriedAt ? Date.parse(queriedAt) : NaN;
+  const hasTimestamp = Number.isFinite(queriedAtMs);
+  // Treat a missed polling interval or a failed refresh as stale; never
+  // present cached values as a successful live query after an error.
+  const stale = Boolean(shown && (error || !hasTimestamp || now - queriedAtMs >= 5 * 60 * 1000));
+  const unavailable = isZh ? "未知" : "Unknown";
+  const formatAmount = (amount: number, currency: string) =>
+    Number.isFinite(amount) ? `${amount.toFixed(2)} ${currency}` : unavailable;
+  const extraCount = Math.max((tiers.length || balances.length || spends.length) - 2, 0);
+
+  return (
+    <details className="group mt-2 rounded-lg border border-slate-200/70 bg-white/40 px-2.5 py-1.5">
+      <summary
+        className="flex cursor-pointer list-none flex-wrap items-center gap-x-3 gap-y-1 rounded text-xs text-slate-600 outline-none focus-visible:ring-2 focus-visible:ring-slate-400 [&::-webkit-details-marker]:hidden"
+        onClick={(event) => event.stopPropagation()}
+      >
+        <span className="font-medium">{title}</span>
+        {tiers.length > 0 ? tiers.slice(0, 2).map((tier) => {
+          const used = Number.isFinite(tier.used_percent)
+            ? Math.min(Math.max(tier.used_percent, 0), 100)
+            : null;
+          return (
+            <span key={tier.name} className="inline-flex flex-wrap items-center gap-1.5">
+              <span>{tierLabel(tier.name, isZh)}</span>
+              <span className={`font-semibold tabular-nums ${used == null ? "text-slate-400" : utilizationColor(used)}`}>
+                {isZh ? "已用" : "Used"} {used == null ? unavailable : `${Math.round(used)}%`}
+              </span>
+              {used != null && (
+                <span aria-hidden="true" className="h-1 w-10 overflow-hidden rounded-full bg-slate-200">
+                  <span className={`block h-full rounded-full ${utilizationBarClass(used)}`} style={{ width: `${used}%` }} />
+                </span>
+              )}
+            </span>
+          );
+        }) : balances.length > 0 ? balances.slice(0, 2).map((balance) => (
+          <span key={balance.currency} className="tabular-nums">
+            {extraBalanceLabel ?? (isZh ? "余额" : "Balance")}: {formatAmount(balance.total, balance.currency)}
+          </span>
+        )) : spends.length > 0 ? spends.slice(0, 2).map((spend) => (
+          <span key={spend.name} className="tabular-nums">
+            {spend.name === "today" ? (isZh ? "今日" : "Today") : spend.name === "month" ? (isZh ? "本月" : "Month") : spend.name}{" "}
+            {isZh ? "已花费" : "Spent"}: {formatAmount(spend.amount, spend.currency)}
+          </span>
+        )) : (
+          <span className="text-slate-400">
+            {isFetching ? (isZh ? "查询用量中..." : "Querying usage...") : (isZh ? "暂无用量数据" : "No usage data")}
+          </span>
+        )}
+        {extraCount > 0 && <span>{isZh ? `另有 ${extraCount} 项` : `+${extraCount} more`}</span>}
+        {shown?.is_available === false && (
+          <span className="font-medium text-red-600">{isZh ? "不可用" : "Unavailable"}</span>
+        )}
+        {quotaPaused && (
+          <span className="font-medium text-red-600">
+            {isZh ? "额度已满，已暂停调度" : "Quota exhausted, routing paused"}
+            {blockedTierLabels && ` · ${blockedTierLabels}`}
+            {quotaCountdown && ` · ${quotaCountdown}`}
+          </span>
+        )}
+        {onExtraBalance && (
+          <span className="text-amber-700">
+            {isZh ? "套餐额度已用完，正按超额余额计费，调度已降为最后备选" : "Included quota spent; using extra balance, routing ranked last"}
+          </span>
+        )}
+        {isKiroOverage(shown) && (
+          <span className="text-amber-700">
+            {isZh ? "上游已启用超额计费，调度已降为最后备选。Nyro 不会主动开启付费功能。" : "Upstream-enabled overage billed; routing ranked last. Nyro does not enable paid features."}
+          </span>
+        )}
+        {error && (
+          <span className="inline-flex min-w-0 items-center gap-1 break-words text-red-600">
+            <AlertCircle aria-hidden="true" className="h-3 w-3 shrink-0" />
+            {isZh ? "用量查询失败" : "Usage query failed"}: {errorMessage}
+          </span>
+        )}
+        {shown && (
+          <span className={stale ? "text-amber-700" : "text-slate-400"} title={queriedAt}>
+            {stale ? (isZh ? "旧数据" : "Stale") : (isZh ? "更新于" : "Updated")}{" "}
+            {hasTimestamp ? (
+              <time dateTime={queriedAt}>{formatRelativeTime(queriedAt!, now, isZh)}</time>
+            ) : (isZh ? "时间未知" : "time unknown")}
+          </span>
+        )}
+        <span className="ml-auto whitespace-nowrap font-medium text-slate-500">
+          <span className="group-open:hidden">{isZh ? "展开详情" : "Show details"} ▾</span>
+          <span className="hidden group-open:inline">{isZh ? "收起详情" : "Hide details"} ▴</span>
+        </span>
+      </summary>
+      {fullFooter}
+    </details>
   );
 }

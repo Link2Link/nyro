@@ -4,6 +4,14 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 
+const LEGACY_BIND_INTENT: &str = "legacy_provider_bind_intent";
+
+#[derive(Serialize, Deserialize)]
+struct LegacyProviderBindIntent {
+    provider_id: String,
+    fence: u64,
+}
+
 struct SessionFlight {
     generation: u64,
     busy: Arc<AtomicBool>,
@@ -15,7 +23,7 @@ impl Drop for SessionFlight {
     }
 }
 
-fn validate_oauth_session_for_provider(
+pub(super) fn validate_oauth_session_for_provider(
     session: &AuthSession,
     provider: &Provider,
 ) -> anyhow::Result<()> {
@@ -694,6 +702,14 @@ impl AdminService {
         session_id: &str,
         mut input: CreateProvider,
     ) -> anyhow::Result<Provider> {
+        let preview = self
+            .get_auth_session_record(session_id)
+            .await?
+            .context("auth session not found")?;
+        anyhow::ensure!(
+            !super::account_pool::is_account_session(&preview) && preview.provider_id.is_none(),
+            "Provider-bound login sessions cannot create another provider"
+        );
         let session = self.take_ready_auth_session_record(session_id).await?;
         if is_expired_at(session.expires_at.as_deref()) {
             self.restore_auth_session_record(session).await?;
@@ -958,10 +974,7 @@ impl AdminService {
             return Ok(build_provider_oauth_status(&provider, "", None, None));
         }
 
-        self.gw
-            .storage
-            .oauth_credentials()
-            .delete(&provider.id)
+        self.disconnect_legacy_provider_credentials(&provider)
             .await?;
 
         let updated = self
@@ -988,13 +1001,181 @@ impl AdminService {
         ))
     }
 
+    async fn disconnect_legacy_provider_credentials(
+        &self,
+        provider: &Provider,
+    ) -> anyhow::Result<()> {
+        // Strict singleton lookup happens under the publication lock before
+        // changing fences or cancelling any session.
+        let id = provider.id.as_str();
+        let mut controls = self.gw.auth_session_controls.lock().await;
+        // Recheck under the same lock used by account publication.
+        self.gw
+            .storage
+            .oauth_credentials()
+            .get(&provider.id)
+            .await?;
+        self.fence_provider_account_logins(&provider.id).await?;
+        let mut sessions = self.gw.auth_sessions.write().await;
+        sessions.retain(|session_id, session| {
+            if session.provider_id.as_deref() != Some(id) {
+                return true;
+            }
+            if let Some(control) = controls.get_mut(session_id) {
+                control.cancelled = true;
+                control.generation += 1;
+                control.cancellation.cancel();
+            }
+            false
+        });
+        drop(sessions);
+        self.gw
+            .storage
+            .oauth_credentials()
+            .delete(&provider.id)
+            .await?;
+        drop(controls);
+        Ok(())
+    }
+
+    /// Claim the target, its empty-slot generation and the previous credential
+    /// under the publication/logout lock, before removing the ready session.
+    /// Restoring a failed bind keeps this intent: it cannot recapture a newer
+    /// logout fence or be redirected to another Provider on a later retry.
+    async fn begin_legacy_provider_bind(
+        &self,
+        provider: &Provider,
+        session_id: &str,
+    ) -> anyhow::Result<(AuthSession, Option<OAuthCredential>, u64)> {
+        let mut controls = self.gw.auth_session_controls.lock().await;
+        let previous = self
+            .gw
+            .storage
+            .oauth_credentials()
+            .get(&provider.id)
+            .await?;
+        anyhow::ensure!(
+            self.provider_pool_config(&provider.id).await?.is_none(),
+            "Configured pools require account-specific reauthorization"
+        );
+        let fence = self.account_login_fence(&provider.id).await?;
+        let mut sessions = self.gw.auth_sessions.write().await;
+        let session = sessions
+            .get_mut(session_id)
+            .context("auth session not found")?;
+        anyhow::ensure!(
+            !super::account_pool::is_account_session(session),
+            "Account login sessions require the account binding API"
+        );
+        anyhow::ensure!(
+            session
+                .provider_id
+                .as_deref()
+                .is_none_or(|id| id == provider.id),
+            "ACCOUNT_SESSION_TARGET_MISMATCH"
+        );
+        validate_oauth_session_for_provider(session, provider)?;
+        anyhow::ensure!(
+            session.status == AuthSessionStatus::Ready.as_str()
+                && !is_expired_at(session.expires_at.as_deref()),
+            "auth session is not ready or expired"
+        );
+        let control = controls.entry(session_id.to_owned()).or_default();
+        anyhow::ensure!(!control.cancelled, "auth session cancelled");
+        let mut context: Value =
+            serde_json::from_str(session.context_json.as_deref().unwrap_or("{}"))?;
+        let context = context
+            .as_object_mut()
+            .context("invalid auth session context")?;
+        if let Some(value) = context.get(LEGACY_BIND_INTENT) {
+            let intent: LegacyProviderBindIntent = serde_json::from_value(value.clone())?;
+            anyhow::ensure!(
+                intent.provider_id == provider.id && intent.fence == fence,
+                "ACCOUNT_VERSION_CONFLICT: login was superseded by logout or another bind"
+            );
+        } else {
+            context.insert(
+                LEGACY_BIND_INTENT.into(),
+                serde_json::to_value(LegacyProviderBindIntent {
+                    provider_id: provider.id.clone(),
+                    fence,
+                })?,
+            );
+        }
+        session.provider_id = Some(provider.id.clone());
+        session.context_json = Some(serde_json::to_string(context)?);
+        control.generation += 1;
+        session.generation = control.generation;
+        let session = sessions
+            .remove(session_id)
+            .expect("ready session claimed under write lock");
+        Ok((session, previous, fence))
+    }
+
+    async fn publish_legacy_provider_bind(
+        &self,
+        provider: &Provider,
+        session: &AuthSession,
+        previous: Option<&OAuthCredential>,
+        fence: u64,
+        input: UpsertOAuthCredential,
+    ) -> anyhow::Result<OAuthCredential> {
+        let controls = self.gw.auth_session_controls.lock().await;
+        anyhow::ensure!(
+            controls
+                .get(&session.id)
+                .is_some_and(|c| !c.cancelled && c.generation == session.generation),
+            "auth session was cancelled or superseded"
+        );
+        anyhow::ensure!(
+            session.provider_id.as_deref() == Some(provider.id.as_str())
+                && !is_expired_at(session.expires_at.as_deref()),
+            "auth session target changed or expired"
+        );
+        anyhow::ensure!(
+            self.account_login_fence(&provider.id).await? == fence,
+            "ACCOUNT_VERSION_CONFLICT: login was superseded by logout or another bind"
+        );
+        anyhow::ensure!(
+            self.provider_pool_config(&provider.id).await?.is_none(),
+            "Configured pools require account-specific reauthorization"
+        );
+        let store = self.gw.storage.oauth_credentials();
+        if previous.is_none() {
+            anyhow::ensure!(
+                store.get(&provider.id).await?.is_none(),
+                "ACCOUNT_VERSION_CONFLICT: another login filled the empty credential slot"
+            );
+        }
+        // Reserve this publication generation before writing, so concurrent
+        // empty-slot claims cannot overwrite each other even if storage fails.
+        self.fence_provider_account_logins(&provider.id).await?;
+        if let Some(previous) = previous {
+            store
+                .replace_account(
+                    &provider.id,
+                    &previous.account_id,
+                    previous.status_version,
+                    input,
+                )
+                .await?
+                .ok_or_else(|| {
+                    anyhow::anyhow!("ACCOUNT_VERSION_CONFLICT: credential changed during login")
+                })
+        } else {
+            store.upsert(&provider.id, input).await
+        }
+    }
+
     pub async fn bind_provider_with_oauth_session(
         &self,
         provider_id: &str,
         session_id: &str,
     ) -> anyhow::Result<Provider> {
         let provider = self.get_provider(provider_id).await?;
-        let session = self.take_ready_auth_session_record(session_id).await?;
+        let (session, previous_credential, fence) = self
+            .begin_legacy_provider_bind(&provider, session_id)
+            .await?;
         if is_expired_at(session.expires_at.as_deref()) {
             self.restore_auth_session_record(session).await?;
             anyhow::bail!("auth session expired");
@@ -1026,18 +1207,15 @@ impl AdminService {
         let credential_input =
             upsert_credential_from_bundle(&session.driver_key, &session.scheme, &bundle);
         let oauth_store = self.gw.storage.oauth_credentials();
-        let previous_credential = oauth_store.get(&provider.id).await?;
-        let published = async {
-            let controls = self.gw.auth_session_controls.lock().await;
-            if !controls
-                .get(&session.id)
-                .is_some_and(|c| !c.cancelled && c.generation == session.generation)
-            {
-                anyhow::bail!("auth session was cancelled or superseded");
-            }
-            oauth_store.upsert(&provider.id, credential_input).await
-        }
-        .await;
+        let published = self
+            .publish_legacy_provider_bind(
+                &provider,
+                &session,
+                previous_credential.as_ref(),
+                fence,
+                credential_input,
+            )
+            .await;
         let published = match published {
             Ok(published) => published,
             Err(error) => {
@@ -1121,6 +1299,23 @@ impl AdminService {
             None => anyhow::bail!("provider oauth credential not found"),
         };
 
+        if crate::provider::devin::is_devin(provider) {
+            let state =
+                crate::provider::account_pool::DevinAccountState::parse(&oauth_cred.account_state);
+            anyhow::ensure!(
+                oauth_cred.is_enabled
+                    && !state.auth_invalid
+                    && !state.hard_quota
+                    && !state.plan_mismatch,
+                "Devin account is unavailable; refresh usage or reauthorize"
+            );
+            if let Some(config) = self.provider_pool_config(&provider.id).await? {
+                anyhow::ensure!(
+                    state.cost_class(&config).is_some(),
+                    "Devin account is not eligible for the configured pool"
+                );
+            }
+        }
         // Terminal refresh failure (`refresh_failure_policy` classified the
         // refresh token itself as rejected): the whole session lineage is
         // dead, so even a nominally-unexpired access token must not be
@@ -1538,6 +1733,151 @@ fn refresh_failure_policy(
     let message = error.to_string();
     let terminal = TERMINAL_REFRESH_MARKERS.iter().any(|m| message.contains(m));
     (terminal, None, message)
+}
+
+#[cfg(test)]
+mod legacy_bind_fence_tests {
+    use super::*;
+
+    fn provider() -> Provider {
+        serde_json::from_value(serde_json::json!({
+            "id":"legacy", "name":"Legacy", "vendor":"devin", "protocol":"devin-chat/get-chat-message/v1",
+            "base_url":"https://server.codeium.com", "protocol_mode":"fixed", "protocol_endpoints":[], "keys":[],
+            "preset_key":"devin", "channel":"cli", "api_key":"", "auth_mode":"oauth", "use_proxy":false,
+            "fast_mode":false, "is_enabled":true, "created_at":"", "updated_at":""
+        })).unwrap()
+    }
+    async fn gateway() -> Gateway {
+        let storage = Arc::new(crate::storage::MemoryStorage::new(
+            vec![provider()],
+            vec![],
+            vec![],
+        ));
+        Gateway::from_storage(crate::config::GatewayConfig::default(), storage)
+            .await
+            .unwrap()
+            .0
+    }
+    fn input(token: &str) -> UpsertOAuthCredential {
+        UpsertOAuthCredential {
+            driver_key: "devin".into(),
+            scheme: "oauth_auth_code_pkce".into(),
+            access_token: token.into(),
+            ..Default::default()
+        }
+    }
+    async fn ready(admin: &AdminService) -> String {
+        let init = admin.init_oauth_session("devin", false).await.unwrap();
+        admin
+            .update_auth_session_record(
+                &init.session_id,
+                UpdateAuthSession {
+                    status: Some("ready".into()),
+                    result_json: Some(
+                        serde_json::to_string(&CredentialBundle {
+                            access_token: Some("token".into()),
+                            ..Default::default()
+                        })
+                        .unwrap(),
+                    ),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        init.session_id
+    }
+
+    #[tokio::test]
+    async fn claimed_legacy_bind_cannot_resurrect_after_logout_even_from_an_empty_slot() {
+        for initially_connected in [false, true] {
+            let gw = gateway().await;
+            let admin = gw.admin();
+            let provider = provider();
+            if initially_connected {
+                gw.storage
+                    .oauth_credentials()
+                    .upsert(&provider.id, input("old"))
+                    .await
+                    .unwrap();
+            }
+            let id = ready(&admin).await;
+            let (session, previous, fence) = admin
+                .begin_legacy_provider_bind(&provider, &id)
+                .await
+                .unwrap();
+            assert_eq!(session.provider_id.as_deref(), Some(provider.id.as_str()));
+            assert!(admin.get_auth_session_record(&id).await.unwrap().is_none());
+            // Exactly the real service's credential/logout phase, deliberately
+            // interleaved after claim and before publication. No DB or network.
+            admin
+                .disconnect_legacy_provider_credentials(&provider)
+                .await
+                .unwrap();
+            let error = admin
+                .publish_legacy_provider_bind(
+                    &provider,
+                    &session,
+                    previous.as_ref(),
+                    fence,
+                    input("stale"),
+                )
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("ACCOUNT_VERSION_CONFLICT"));
+            assert!(
+                gw.storage
+                    .oauth_credentials()
+                    .get(&provider.id)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            admin.restore_auth_session_record(session).await.unwrap();
+            let error = admin
+                .begin_legacy_provider_bind(&provider, &id)
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("ACCOUNT_VERSION_CONFLICT"));
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_empty_slot_claims_do_not_overwrite_the_winning_bind() {
+        let gw = gateway().await;
+        let admin = gw.admin();
+        let provider = provider();
+        let a = ready(&admin).await;
+        let b = ready(&admin).await;
+        let (a, old_a, fence_a) = admin
+            .begin_legacy_provider_bind(&provider, &a)
+            .await
+            .unwrap();
+        let (b, old_b, fence_b) = admin
+            .begin_legacy_provider_bind(&provider, &b)
+            .await
+            .unwrap();
+        assert!(old_a.is_none() && old_b.is_none());
+        admin
+            .publish_legacy_provider_bind(&provider, &a, None, fence_a, input("winner"))
+            .await
+            .unwrap();
+        let error = admin
+            .publish_legacy_provider_bind(&provider, &b, None, fence_b, input("loser"))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("ACCOUNT_VERSION_CONFLICT"));
+        assert_eq!(
+            gw.storage
+                .oauth_credentials()
+                .get(&provider.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .access_token,
+            "winner"
+        );
+    }
 }
 
 #[cfg(test)]

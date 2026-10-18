@@ -8,7 +8,8 @@ use axum::{Extension, Json, Router};
 use nyro_core::Gateway;
 use nyro_core::admin::StatsRange;
 use nyro_core::admin::{
-    CopyProviderOptions, ModelRatingError, SetModelRating, TokenPriceError, TokenPriceInput,
+    CopyProviderOptions, DevinPoolConfig, OAuthAccountUpdate, ModelRatingError, SetModelRating,
+    TokenPriceError, TokenPriceInput,
 };
 use nyro_core::auth::AuthExchangeInput;
 use nyro_core::db::models::*;
@@ -120,6 +121,17 @@ pub fn create_router(gateway: Gateway, admin_token: Option<String>) -> Router {
             "/providers/:id/oauth/bind",
             post(bind_provider_oauth_handler),
         )
+        .route("/providers/:id/accounts", get(get_provider_account_pool_handler))
+        .route("/providers/:id/account-pool", put(configure_provider_account_pool_handler))
+        .route("/providers/:id/accounts/auth-sessions", post(init_provider_account_session_handler))
+        .route("/providers/:id/accounts/bind", post(bind_provider_account_handler))
+        .route(
+            "/providers/:id/accounts/:account_id",
+            axum::routing::patch(update_provider_account_handler).delete(disconnect_provider_account_handler),
+        )
+        .route("/providers/:id/accounts/:account_id/usage/refresh", post(refresh_provider_account_usage_handler))
+        .route("/providers/:id/account-pool/usage/refresh", post(refresh_provider_account_pool_usage_handler))
+        .route("/providers/devin", post(create_devin_provider_with_pool_handler))
         .route("/providers/oauth", post(create_oauth_provider_handler))
         .route("/oauth/sessions/init", post(init_oauth_session_handler))
         .route(
@@ -633,6 +645,23 @@ async fn create_oauth_provider_handler(
     }
 }
 
+#[derive(Deserialize)]
+struct CreateDevinProviderRequest {
+    session_id: String,
+    input: CreateProvider,
+    config: DevinPoolConfig,
+}
+
+async fn create_devin_provider_with_pool_handler(
+    State(gw): State<Gateway>,
+    Json(input): Json<CreateDevinProviderRequest>,
+) -> impl IntoResponse {
+    match gw.admin().create_devin_provider_with_pool(&input.session_id, input.input, input.config).await {
+        Ok(v) => Json(serde_json::json!({ "data": v })).into_response(),
+        Err(e) => err(e),
+    }
+}
+
 async fn get_provider_oauth_status_handler(
     State(gw): State<Gateway>,
     Path(id): Path<String>,
@@ -680,6 +709,116 @@ async fn bind_provider_oauth_handler(
     {
         Ok(v) => Json(serde_json::json!({ "data": v })).into_response(),
         Err(e) => err(e),
+    }
+}
+
+// ── Provider accounts (all validation and state transitions live in core) ──
+
+#[derive(Deserialize)]
+struct InitProviderAccountSessionRequest {
+    account_id: Option<String>,
+    expected_version: Option<i32>,
+}
+
+#[derive(Deserialize)]
+struct BindProviderAccountRequest {
+    session_id: String,
+    label: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct UpdateProviderAccountRequest {
+    expected_version: i32,
+    update: OAuthAccountUpdate,
+}
+
+#[derive(Deserialize)]
+struct ProviderAccountVersionRequest {
+    expected_version: i32,
+}
+
+async fn get_provider_account_pool_handler(
+    State(gw): State<Gateway>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    match gw.admin().get_provider_account_pool(&id).await {
+        Ok(v) => Json(serde_json::json!({ "data": v })).into_response(),
+        Err(e) => err(e),
+    }
+}
+
+async fn configure_provider_account_pool_handler(
+    State(gw): State<Gateway>,
+    Path(id): Path<String>,
+    Json(config): Json<DevinPoolConfig>,
+) -> impl IntoResponse {
+    match gw.admin().configure_provider_account_pool(&id, config).await {
+        Ok(v) => Json(serde_json::json!({ "data": v })).into_response(),
+        Err(e) => err(e),
+    }
+}
+
+async fn init_provider_account_session_handler(
+    State(gw): State<Gateway>,
+    Path(id): Path<String>,
+    Json(input): Json<InitProviderAccountSessionRequest>,
+) -> impl IntoResponse {
+    match gw.admin().init_provider_account_session(&id, input.account_id.as_deref(), input.expected_version).await {
+        Ok(v) => Json(serde_json::json!({ "data": v })).into_response(),
+        Err(e) => err(e),
+    }
+}
+
+async fn bind_provider_account_handler(
+    State(gw): State<Gateway>,
+    Path(id): Path<String>,
+    Json(input): Json<BindProviderAccountRequest>,
+) -> impl IntoResponse {
+    match gw.admin().bind_provider_account(&id, &input.session_id, input.label.as_deref()).await {
+        Ok(v) => Json(serde_json::json!({ "data": v })).into_response(),
+        Err(e) => err(e),
+    }
+}
+
+async fn update_provider_account_handler(
+    State(gw): State<Gateway>,
+    Path((id, account_id)): Path<(String, String)>,
+    Json(input): Json<UpdateProviderAccountRequest>,
+) -> impl IntoResponse {
+    match gw.admin().update_provider_account(&id, &account_id, input.expected_version, input.update).await {
+        Ok(v) => Json(serde_json::json!({ "data": v })).into_response(),
+        Err(e) => err(e),
+    }
+}
+
+async fn disconnect_provider_account_handler(
+    State(gw): State<Gateway>,
+    Path((id, account_id)): Path<(String, String)>,
+    Json(input): Json<ProviderAccountVersionRequest>,
+) -> impl IntoResponse {
+    match gw.admin().disconnect_provider_account(&id, &account_id, input.expected_version).await {
+        Ok(v) => Json(serde_json::json!({ "data": v })).into_response(),
+        Err(e) => err(e),
+    }
+}
+
+async fn refresh_provider_account_usage_handler(
+    State(gw): State<Gateway>,
+    Path((id, account_id)): Path<(String, String)>,
+) -> impl IntoResponse {
+    match gw.admin().refresh_provider_account_usage(&id, &account_id).await {
+        Ok(v) => Json(serde_json::json!({ "data": v })).into_response(),
+        Err(e) => usage_err(e),
+    }
+}
+
+async fn refresh_provider_account_pool_usage_handler(
+    State(gw): State<Gateway>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    match gw.admin().refresh_provider_account_pool_usage(&id).await {
+        Ok(v) => Json(serde_json::json!({ "data": v })).into_response(),
+        Err(e) => usage_err(e),
     }
 }
 
@@ -1182,7 +1321,9 @@ fn usage_err(e: anyhow::Error) -> axum::response::Response {
     // the caller's admin token. Mapping them to 401 made WebUI clients treat
     // their admin session as expired and force a logout loop on the providers
     // page. Report them as upstream (502) failures with the same message.
-    let status = if lower.contains("not found") {
+    let status = if account_conflict(&message) {
+        StatusCode::CONFLICT
+    } else if lower.contains("not found") {
         StatusCode::NOT_FOUND
     } else if lower.contains("rate limited") || lower.contains("http 429") {
         StatusCode::TOO_MANY_REQUESTS
@@ -1194,11 +1335,23 @@ fn usage_err(e: anyhow::Error) -> axum::response::Response {
     (status, Json(serde_json::json!({ "error": message }))).into_response()
 }
 
+fn account_conflict(message: &str) -> bool {
+    // Core currently emits both structured coded errors and CODE: message.
+    let code = serde_json::from_str::<serde_json::Value>(message).ok()
+        .and_then(|value| value.get("code").and_then(|code| code.as_str()).map(str::to_owned))
+        .unwrap_or_else(|| message.split(':').next().unwrap_or("").trim().to_owned());
+    matches!(code.as_str(), "AMBIGUOUS_ACCOUNT" | "ACCOUNT_VERSION_CONFLICT" | "POOL_PLAN_LOCKED")
+}
+
 fn err(e: anyhow::Error) -> axum::response::Response {
     if e.downcast_ref::<TokenPriceError>().is_some() {
         return token_price_error(e);
     }
-    Json(serde_json::json!({ "error": e.to_string() })).into_response()
+    let message = e.to_string();
+    if account_conflict(&message) {
+        return (StatusCode::CONFLICT, Json(serde_json::json!({ "error": message }))).into_response();
+    }
+    Json(serde_json::json!({ "error": message })).into_response()
 }
 
 #[cfg(test)]
@@ -1220,6 +1373,23 @@ mod tests {
 
     fn status_of(message: &str) -> StatusCode {
         usage_err(anyhow::anyhow!("{message}")).status()
+    }
+
+    #[test]
+    fn account_conflicts_and_cas_inputs_are_explicit() {
+        for message in ["AMBIGUOUS_ACCOUNT: select an account", "ACCOUNT_VERSION_CONFLICT: reload", "POOL_PLAN_LOCKED: disconnect first", r#"{"code":"ACCOUNT_VERSION_CONFLICT","message":"reload"}"#] {
+            assert_eq!(err(anyhow::anyhow!("{message}")).status(), StatusCode::CONFLICT);
+        }
+        assert!(!account_conflict("upstream said AMBIGUOUS_ACCOUNT in an unrelated message"));
+        assert!(serde_json::from_value::<ProviderAccountVersionRequest>(serde_json::json!({})).is_err());
+        let input: UpdateProviderAccountRequest = serde_json::from_value(serde_json::json!({
+            "expected_version": 4, "update": {"is_enabled": false}
+        })).unwrap();
+        assert_eq!(input.expected_version, 4);
+        assert_eq!(input.update.is_enabled, Some(false));
+        let add: InitProviderAccountSessionRequest = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert!(add.account_id.is_none());
+        assert!(add.expected_version.is_none());
     }
 
     #[test]

@@ -65,6 +65,8 @@ pub struct Gateway {
     pub health_registry: Arc<HealthRegistry>,
     pub latency_registry: Arc<LatencyRegistry>,
     pub quota_registry: Arc<ProviderQuotaRegistry>,
+    pub(crate) account_quota_registry: Arc<ProviderQuotaRegistry>,
+    pub(crate) account_pool: Arc<provider::account_pool::AccountPoolRegistry>,
     /// Minted MiMo console sessions (passToken → serviceToken renewal);
     /// one entry per provider id, invalidated on credential changes.
     pub(crate) mimo_sessions: Arc<MimoSessionCache>,
@@ -217,6 +219,8 @@ impl Gateway {
             health_registry,
             latency_registry,
             quota_registry,
+            account_quota_registry: Arc::new(ProviderQuotaRegistry::new()),
+            account_pool: Arc::new(provider::account_pool::AccountPoolRegistry::default()),
             mimo_sessions,
             ollama_capability_cache,
             compat_engine: Arc::new(nyro_ccswitch_compat::CompatEngine::default()),

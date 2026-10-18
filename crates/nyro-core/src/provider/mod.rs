@@ -16,6 +16,7 @@
 //! └── <vendor>/mod.rs     — per-vendor Vendor impls
 //! ```
 
+pub(crate) mod account_pool;
 pub mod common;
 pub mod inbound;
 pub mod key_pool;

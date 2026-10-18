@@ -1647,6 +1647,11 @@ impl AdminService {
         options: CopyProviderOptions,
     ) -> anyhow::Result<Provider> {
         let original = self.get_provider(id).await?;
+        // Fail before creating anything; provider-only copy cannot choose an account.
+        if original.effective_auth_mode() == "oauth" {
+            self.gw.storage.oauth_credentials().get(id).await?;
+        }
+        let pool_config = self.provider_pool_config(id).await?;
         // Prefix ratings are provider-independent: the copy shares them automatically.
         let name = self.next_provider_copy_name(&original.name).await?;
         let copied = self
@@ -1744,6 +1749,10 @@ impl AdminService {
             copied
         };
 
+        if let Some(config) = pool_config {
+            self.configure_provider_account_pool(&copied.id, config)
+                .await?;
+        }
         if options.append_targets {
             self.append_provider_targets(&original.id, &copied.id)
                 .await?;
@@ -1809,6 +1818,15 @@ impl AdminService {
             resolve_admin_preset_channel_auth_mode(preset_key.as_deref(), channel.as_deref())
                 .or(input.auth_mode.clone())
                 .unwrap_or_else(|| current.auth_mode.clone());
+        if self.provider_pool_config(id).await?.is_some() {
+            anyhow::ensure!(
+                vendor.as_deref() == Some("devin")
+                    && preset_key.as_deref() == Some("devin")
+                    && channel.as_deref() == Some("cli")
+                    && auth_mode == "oauth",
+                "Configured account pools must retain the Devin OAuth channel"
+            );
+        }
         let raw_api_key = if auth_mode == "oauth" {
             String::new()
         } else {
@@ -2062,6 +2080,8 @@ impl AdminService {
     pub async fn test_provider(&self, id: &str) -> anyhow::Result<TestResult> {
         let provider = self.get_provider(id).await?;
         if crate::provider::devin::is_devin(&provider) {
+            // Do not persist one ambiguous account's test as Provider health.
+            self.gw.storage.oauth_credentials().get(id).await?;
             let start = Instant::now();
             let outcome = async {
                 validate_admin_provider(&provider)?;
@@ -2878,6 +2898,11 @@ impl AdminService {
 
     async fn devin_provider_models(&self, provider: &Provider) -> anyhow::Result<Vec<String>> {
         validate_admin_provider(provider)?;
+        if self.provider_pool_config(&provider.id).await?.is_some() {
+            // This catalog is static and Provider-scoped. Looking up a random
+            // account here would couple model discovery to incidental health.
+            return Ok(crate::provider::devin::models(provider));
+        }
         let runtime = self.resolve_provider_runtime(provider).await?;
         anyhow::ensure!(
             !runtime.access_token.trim().is_empty(),

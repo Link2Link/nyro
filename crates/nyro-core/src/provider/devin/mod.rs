@@ -2,6 +2,7 @@
 //! Wire behavior follows CLIProxyAPI's Devin executor; no Devin CLI process,
 //! hosted agent session, filesystem access or local tools are started.
 mod catalog;
+mod errors;
 mod request;
 mod runtime;
 mod stream;

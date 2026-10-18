@@ -8,7 +8,7 @@ Nyro supports three storage backends — **SQLite** (default), **PostgreSQL**, a
 providers ──1:N── model_backends ──N:1── models
     ├──1:N── provider_protocol_endpoints
     ├──1:N── provider_keys
-    └──1:1── provider_oauth_credentials
+    └──1:N── provider_oauth_credentials (non-Devin OAuth drivers remain singleton)
 
 model_rating_prefixes (prefix-keyed scores shared across providers; no FK)
 
@@ -209,11 +209,18 @@ API Key 与模型的访问绑定关系（M:N 关联表）。仅当 model 启用 
 
 ## provider_oauth_credentials
 
-OAuth 凭据存储，用于需要 OAuth 认证的供应商（如 Google Vertex AI）。
+Account-addressed OAuth credentials. Devin supports multiple accounts per Provider;
+other OAuth drivers retain a transactional one-account limit. Disconnected rows
+are retained as scrubbed generation fences, not active pool members.
 
 | Column | Type | Default | Description |
 |---|---|---|---|
-| `provider_id` | TEXT PK | — | 供应商 ID（FK → providers.id, ON DELETE CASCADE） |
+| `account_id` | TEXT PK | — | Immutable local account ID: new UUID, or deterministic `legacy:{provider_id}` for migrated rows; MySQL uses VARCHAR(191) |
+| `provider_id` | TEXT NOT NULL | — | Non-unique indexed membership (FK → providers.id, ON DELETE CASCADE); MySQL VARCHAR(36) |
+| `label` | TEXT NOT NULL | `'Default account'` | Operator alias; scrubbed on disconnect |
+| `is_enabled` | BOOLEAN NOT NULL | `true` | Operator intent, independent of authorization/quota; SQLite INTEGER/MySQL TINYINT(1) |
+| `priority` | INTEGER NOT NULL | `0` | Lower values first |
+| `account_state` | TEXT NOT NULL | `'{}'` | Safe quota/plan-validation JSON object; MySQL LONGTEXT; exact-text observation CAS |
 | `driver_key` | TEXT | `''` | OAuth 驱动标识 |
 | `scheme` | TEXT | `''` | 认证方案 |
 | `access_token` | TEXT | `''` | OAuth access token |
@@ -232,8 +239,55 @@ OAuth 凭据存储，用于需要 OAuth 认证的供应商（如 Google Vertex A
 
 ### OAuth credential storage invariants
 
-These rules are enforced consistently by Memory, SQLite, PostgreSQL, and MySQL
-stores without additional DDL:
+These rules are enforced consistently by Memory, SQLite, PostgreSQL, and MySQL.
+Indexes: `idx_oauth_creds_provider(provider_id)`, `idx_oauth_creds_status(status)`,
+`idx_oauth_creds_expires(expires_at)`; only `account_id` is unique.
+
+- **Migration and restart:** existing rows, including disconnected tombstones,
+  retain every credential field and `status_version`, receive deterministic
+  `legacy:{provider_id}` IDs, an English default alias, and empty account state.
+  SQLite rebuilds the old table in `BEGIN IMMEDIATE`; PostgreSQL changes the key
+  transactionally; MySQL uses restartable preparatory DDL and one final primary-key
+  switch (MySQL DDL implicitly commits). Old binaries must not write the upgraded
+  schema. Startup legacy-Provider token backfill uses deterministic IDs **and**
+  checks for any row belonging to the Provider, including tombstones, so logout
+  cannot resurrect a legacy token and a pool cannot acquire an extra legacy row.
+- **Atomic pool membership:** account create validates an OAuth parent and matching
+  normalized driver/vendor (falling back to the preset only when vendor is absent).
+  Google `gemini-cli` selects `google-gemini-cli`, distinct from the Antigravity
+  `google` OAuth client; create and replacement reject cross-channel credentials.
+  Creation requires a non-empty alias, normalizes tokens and rejects exact
+  duplicates with `DUPLICATE_ACCOUNT: <existing account ID>`.
+  Authenticated subjects are deduplicated only with an explicit matching
+  organization/tenant scope, never globally on subject alone. Non-Devin active
+  account count cannot exceed one. SQL operations lock the parent Provider before
+  checking membership and locking credential rows (SQLite takes the write lock);
+  memory uses a shared credential-map write lock. No token/fingerprint appears in
+  duplicate errors. Separate login tokens with unknown identity are **not** proof
+  of independent quota capacity.
+- **Strict compatibility facade:** provider-only read/write/refresh/logout returns
+  `AMBIGUOUS_ACCOUNT` if more than one non-disconnected account exists; disabled,
+  refreshing and error accounts count. It never chooses a pool member implicitly
+  or deletes multiple rows. An unambiguous existing account (or retained tombstone)
+  is reused by legacy bind instead of creating another account. New accounts and
+  legacy binds start above the maximum retained Provider generation (first row is
+  generation zero), fencing callbacks across disconnect/new-UUID creation.
+  Account-less compensation is conservatively rejected after multiple account
+  identities have existed; Devin refresh facades likewise do not operate on a
+  contracted historical pool. Use explicit account/version APIs instead.
+- **Account CAS:** replace/update/disconnect match Provider membership, account ID,
+  active lifecycle and expected `status_version`. Replace atomically deduplicates
+  the new credentials, clears `account_state` and advances generation. All metadata
+  updates, including label-only or no-op updates, advance generation and retain
+  quota state. Disconnect scrubs and advances generation. Late account mutations
+  cannot revive a disconnected row. `get_account` and `list_accounts` hide tombstones.
+- **Observation CAS:** `compare_account_state` matches both generation and the
+  exact previous JSON text, writes a bounded JSON object, and does **not** advance
+  credential generation. An observation started before a newer quota block cannot
+  overwrite it using its old state snapshot. Callers must supply sanitized,
+  allowlisted data; storage validates JSON shape/size, not domain-specific content.
+  Compare-state preserves a refresh lease's age so observations cannot indefinitely
+  postpone stale-refresh recovery.
 
 - **Refresh generation fencing:** begin, completion, and failure compare both
   state and `status_version`, then advance the version atomically. A successful
@@ -248,8 +302,9 @@ stores without additional DDL:
 - **Logout is a scrubbed tombstone, not physical credential-row deletion:**
   clear `driver_key`, `scheme`, and `access_token` to empty strings; set
   `refresh_token`, `expires_at`, `resource_url`, `subject_id`, `last_error`, and
-  `last_refresh_at` to NULL; reset `scopes` to `[]` and `meta` to `{}`; set
-  `status = 'disconnected'` and advance `status_version`. The provider identity,
+  `last_refresh_at` to NULL; reset `scopes` to `[]`, `meta`/`account_state` to `{}`;
+  clear `label`, disable the account and reset `priority` to zero; set
+  `status = 'disconnected'` and advance `status_version`. The account/provider identity,
   version fence, and row timestamps remain. Public credential lookup returns no
   credential for this row, and scheduling excludes it. A subsequent bind advances
   the retained generation instead of resetting it, preventing logout/rebind ABA

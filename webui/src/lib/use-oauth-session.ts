@@ -8,7 +8,14 @@ export function oauthCompletionMode(data: Pick<OAuthSessionInitData, "completion
   return data?.completion_mode ?? (data?.requires_manual_code ? "manual_exchange" : "poll");
 }
 
+export type OAuthSessionIntent =
+  | { kind: "reauthorize_legacy_provider"; providerId: string; useProxy: boolean }
+  | { kind: "add_account"; providerId: string }
+  | { kind: "reauthorize_account"; providerId: string; accountId: string; expectedVersion: number };
+
 export interface OAuthSessionContext {
+  /** UI snapshot only; the backend owns and validates the session's target. */
+  intent?: OAuthSessionIntent;
   sessionId: string;
   signal: AbortSignal;
   isCurrent: () => boolean;
@@ -18,6 +25,9 @@ interface StartOptions {
   vendor: string;
   useProxy: boolean;
   kiro?: KiroLoginOptions;
+  /** Custom backend initialization retains cancellation/polling/expiry handling. */
+  init?: () => Promise<OAuthSessionInitData>;
+  intent?: OAuthSessionIntent;
   onInit?: (session: OAuthSessionInitData) => void;
   onReady?: (status: Ready, context: OAuthSessionContext) => Promise<void> | void;
 }
@@ -34,6 +44,7 @@ interface SessionRun {
   processing: boolean;
   mode: "manual_exchange" | "poll";
   onReady?: StartOptions["onReady"];
+  intent?: OAuthSessionIntent;
 }
 
 function cancelRemote(sessionId: string) {
@@ -142,6 +153,7 @@ export function useOAuthSession() {
       if (run.sessionId) {
         const sessionId = run.sessionId;
         await run.onReady?.(next, {
+          intent: run.intent,
           sessionId,
           signal: run.controller.signal,
           isCurrent: () => isCurrent(run) && run.sessionId === sessionId,
@@ -185,17 +197,18 @@ export function useOAuthSession() {
       processing: false,
       mode: "poll",
       onReady: options.onReady,
+      intent: options.intent ? { ...options.intent } : undefined,
     };
     active.current = run;
     setBusy(true);
     try {
       // Do not abort init: it may allocate a remote session before cancellation.
       // Receive its ID even when superseded so that session can be cancelled too.
-      const init = await backend<OAuthSessionInitData>("init_oauth_session", {
+      const init = await (options.init ? options.init() : backend<OAuthSessionInitData>("init_oauth_session", {
         vendor: options.vendor,
         useProxy: options.useProxy,
         ...(options.kiro ? { kiro: options.kiro } : {}),
-      });
+      }));
       if (!isCurrent(run)) {
         cancelRemote(init.session_id);
         return;

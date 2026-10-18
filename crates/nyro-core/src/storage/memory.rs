@@ -5,7 +5,7 @@ use tokio::sync::RwLock;
 
 use crate::db::models::{
     ApiKeyStats, ApiKeyUsageDetail, CreateModel, CreateProvider, LogPage, LogQuery, Model,
-    ModelStats, ModelTimeBucket, ModelUsageDetail, ModelUsageStats, OAuthCredential, Provider,
+    ModelStats, ModelTimeBucket, ModelUsageDetail, ModelUsageStats, OAuthAccountUpdate, OAuthCredential, Provider,
     ProviderKeyProbeResult, ProviderStats, ProviderUsageDetail, RequestLog, StatsHourly,
     StatsOverview, StatsTimeBucket, UpdateModel, UpdateProvider, UpsertOAuthCredential,
 };
@@ -34,11 +34,13 @@ impl MemoryStorage {
         models: Vec<Model>,
         settings: Vec<(String, String)>,
     ) -> Self {
+        let providers = Arc::new(RwLock::new(providers));
         Self {
-            providers: Arc::new(RwLock::new(providers)),
+            providers: providers.clone(),
             models: Arc::new(RwLock::new(models)),
             settings: Arc::new(RwLock::new(settings)),
             oauth_credentials: Arc::new(MemoryOAuthCredentialStore {
+                providers,
                 credentials: RwLock::new(std::collections::HashMap::new()),
             }),
         }
@@ -46,6 +48,7 @@ impl MemoryStorage {
 }
 
 pub struct MemoryOAuthCredentialStore {
+    providers: Arc<RwLock<Vec<Provider>>>,
     credentials: RwLock<std::collections::HashMap<String, OAuthCredential>>,
 }
 
@@ -473,165 +476,195 @@ impl StorageBootstrap for MemoryStorage {
     }
 }
 
-fn now_rfc3339() -> String {
-    chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string()
-}
-
-fn write_memory_credential(
-    map: &mut std::collections::HashMap<String, OAuthCredential>,
-    provider_id: &str,
-    input: UpsertOAuthCredential,
-) -> anyhow::Result<OAuthCredential> {
-    let now = now_rfc3339();
-    let version = map
-        .get(provider_id)
-        .map(|c| c.status_version + 1)
-        .unwrap_or(0);
-    let cred = OAuthCredential {
-        provider_id: provider_id.to_string(),
-        driver_key: input.driver_key,
-        scheme: input.scheme,
-        access_token: input.access_token,
-        refresh_token: input.refresh_token,
-        expires_at: input.expires_at,
-        resource_url: input.resource_url,
-        subject_id: input.subject_id,
-        scopes: input.scopes.unwrap_or_else(|| "[]".to_string()),
-        meta: input.meta.unwrap_or_else(|| "{}".to_string()),
-        status: "connected".to_string(),
-        status_version: version,
-        last_error: None,
-        last_refresh_at: map.get(provider_id).and_then(|c| c.last_refresh_at.clone()),
-        created_at: map
-            .get(provider_id)
-            .map(|c| c.created_at.clone())
-            .unwrap_or_else(|| now.clone()),
-        updated_at: now,
-    };
-    map.insert(provider_id.to_string(), cred.clone());
-    Ok(cred)
-}
-
-fn scrub_memory_credential(credential: &mut OAuthCredential) {
-    // Preserve only the generation fence, not the logged-out account.
-    credential.driver_key.clear();
-    credential.scheme.clear();
-    credential.access_token.clear();
-    credential.refresh_token = None;
-    credential.expires_at = None;
-    credential.resource_url = None;
-    credential.subject_id = None;
-    credential.scopes = "[]".to_string();
-    credential.meta = "{}".to_string();
-    credential.status = "disconnected".to_string();
-    credential.status_version += 1;
-    credential.last_error = None;
-    credential.last_refresh_at = None;
-    credential.updated_at = now_rfc3339();
+impl MemoryOAuthCredentialStore {
+    async fn mutate(
+        &self,
+        provider_id: &str,
+        action: crate::storage::oauth::Mutation<'_>,
+    ) -> anyhow::Result<Option<OAuthCredential>> {
+        let providers = self.providers.read().await;
+        let parent = providers.iter().find(|p| p.id == provider_id);
+        let mut map = self.credentials.write().await;
+        let rows: Vec<_> = map
+            .values()
+            .filter(|r| r.provider_id == provider_id)
+            .cloned()
+            .collect();
+        let row = crate::storage::oauth::mutate(
+            provider_id,
+            parent.map(|p| (p.auth_mode.as_str(), p.vendor.as_deref().unwrap_or(""), p.preset_key.as_deref().unwrap_or(""), p.channel.as_deref().unwrap_or(""))),
+            &rows,
+            &action,
+        )?;
+        if let Some(row) = &row {
+            map.insert(row.account_id.clone(), row.clone());
+        }
+        Ok(row)
+    }
 }
 
 #[async_trait]
 impl OAuthCredentialStore for MemoryOAuthCredentialStore {
-    async fn get(&self, provider_id: &str) -> anyhow::Result<Option<OAuthCredential>> {
+    async fn list_accounts(&self, provider_id: &str) -> anyhow::Result<Vec<OAuthCredential>> {
+        let mut rows: Vec<_> = self
+            .credentials
+            .read()
+            .await
+            .values()
+            .filter(|r| r.provider_id == provider_id && r.status != "disconnected")
+            .cloned()
+            .collect();
+        rows.sort_by(|a, b| {
+            (&a.priority, &a.created_at, &a.account_id).cmp(&(
+                &b.priority,
+                &b.created_at,
+                &b.account_id,
+            ))
+        });
+        Ok(rows)
+    }
+    async fn get_account(
+        &self,
+        provider_id: &str,
+        account_id: &str,
+    ) -> anyhow::Result<Option<OAuthCredential>> {
         Ok(self
             .credentials
             .read()
             .await
-            .get(provider_id)
-            .filter(|credential| credential.status != "disconnected")
+            .get(account_id)
+            .filter(|r| r.provider_id == provider_id && r.status != "disconnected")
             .cloned())
     }
 
+    async fn create_account(
+        &self,
+        provider_id: &str,
+        label: &str,
+        input: UpsertOAuthCredential,
+    ) -> anyhow::Result<OAuthCredential> {
+        self.mutate(
+            provider_id,
+            crate::storage::oauth::Mutation::Create(label, &input),
+        )
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("Account was not created"))
+    }
+    async fn replace_account(
+        &self,
+        provider_id: &str,
+        account_id: &str,
+        expected_version: i32,
+        input: UpsertOAuthCredential,
+    ) -> anyhow::Result<Option<OAuthCredential>> {
+        self.mutate(
+            provider_id,
+            crate::storage::oauth::Mutation::Replace(account_id, expected_version, &input),
+        )
+        .await
+    }
+    async fn update_account(
+        &self,
+        provider_id: &str,
+        account_id: &str,
+        expected_version: i32,
+        update: OAuthAccountUpdate,
+    ) -> anyhow::Result<Option<OAuthCredential>> {
+        self.mutate(
+            provider_id,
+            crate::storage::oauth::Mutation::Update(account_id, expected_version, &update),
+        )
+        .await
+    }
+    async fn disconnect_account(
+        &self,
+        provider_id: &str,
+        account_id: &str,
+        expected_version: i32,
+    ) -> anyhow::Result<bool> {
+        Ok(self
+            .mutate(
+                provider_id,
+                crate::storage::oauth::Mutation::Disconnect(account_id, expected_version),
+            )
+            .await?
+            .is_some())
+    }
+    async fn compare_account_state(
+        &self,
+        provider_id: &str,
+        account_id: &str,
+        expected_version: i32,
+        expected_state: &str,
+        new_state: &str,
+    ) -> anyhow::Result<bool> {
+        Ok(self
+            .mutate(
+                provider_id,
+                crate::storage::oauth::Mutation::CompareState(
+                    account_id,
+                    expected_version,
+                    expected_state,
+                    new_state,
+                ),
+            )
+            .await?
+            .is_some())
+    }
+    async fn get(&self, provider_id: &str) -> anyhow::Result<Option<OAuthCredential>> {
+        crate::storage::oauth::singleton(&self.list_accounts(provider_id).await?)
+    }
     async fn upsert(
         &self,
         provider_id: &str,
         input: UpsertOAuthCredential,
     ) -> anyhow::Result<OAuthCredential> {
-        let mut map = self.credentials.write().await;
-        write_memory_credential(&mut map, provider_id, input)
+        self.mutate(provider_id, crate::storage::oauth::Mutation::Upsert(&input))
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("Credential was not bound"))
     }
-
     async fn restore_if_version(
         &self,
         provider_id: &str,
         expected_version: i32,
         previous: Option<UpsertOAuthCredential>,
     ) -> anyhow::Result<bool> {
-        let mut map = self.credentials.write().await;
-        if map.get(provider_id).is_none_or(|credential| {
-            credential.status != "connected" || credential.status_version != expected_version
-        }) {
-            return Ok(false);
-        }
-        if let Some(previous) = previous {
-            write_memory_credential(&mut map, provider_id, previous)?;
-        } else {
-            scrub_memory_credential(map.get_mut(provider_id).expect("checked under write lock"));
-        }
-        Ok(true)
+        Ok(self
+            .mutate(
+                provider_id,
+                crate::storage::oauth::Mutation::Restore(expected_version, previous.as_ref()),
+            )
+            .await?
+            .is_some())
     }
-
     async fn delete(&self, provider_id: &str) -> anyhow::Result<()> {
-        let mut map = self.credentials.write().await;
-        if let Some(credential) = map.get_mut(provider_id) {
-            scrub_memory_credential(credential);
-        }
+        self.mutate(provider_id, crate::storage::oauth::Mutation::Delete)
+            .await?;
         Ok(())
     }
-
     async fn try_begin_refresh(
         &self,
         provider_id: &str,
         expected_version: i32,
     ) -> anyhow::Result<Option<OAuthCredential>> {
-        let mut map = self.credentials.write().await;
-        let Some(cred) = map.get_mut(provider_id) else {
-            return Ok(None);
-        };
-        if cred.status != "connected" || cred.status_version != expected_version {
-            return Ok(None);
-        }
-        cred.status = "refreshing".to_string();
-        cred.status_version += 1;
-        cred.updated_at = now_rfc3339();
-        Ok(Some(cred.clone()))
+        self.mutate(
+            provider_id,
+            crate::storage::oauth::Mutation::BeginRefresh(expected_version),
+        )
+        .await
     }
-
     async fn complete_refresh(
         &self,
         provider_id: &str,
         expected_version: i32,
         input: UpsertOAuthCredential,
     ) -> anyhow::Result<Option<OAuthCredential>> {
-        let mut map = self.credentials.write().await;
-        let Some(cred) = map.get_mut(provider_id) else {
-            return Ok(None);
-        };
-        if cred.status != "refreshing" || cred.status_version != expected_version {
-            return Ok(None);
-        }
-        let now = now_rfc3339();
-        cred.driver_key = input.driver_key;
-        cred.scheme = input.scheme;
-        cred.access_token = input.access_token;
-        cred.refresh_token = input.refresh_token;
-        cred.expires_at = input.expires_at;
-        cred.resource_url = input.resource_url;
-        cred.subject_id = input.subject_id;
-        if let Some(scopes) = input.scopes {
-            cred.scopes = scopes;
-        }
-        if let Some(meta) = input.meta {
-            cred.meta = meta;
-        }
-        cred.status = "connected".to_string();
-        cred.status_version += 1;
-        cred.last_error = None;
-        cred.last_refresh_at = Some(now.clone());
-        cred.updated_at = now;
-        Ok(Some(cred.clone()))
+        self.mutate(
+            provider_id,
+            crate::storage::oauth::Mutation::CompleteRefresh(expected_version, &input),
+        )
+        .await
     }
-
     async fn fail_refresh_with_policy(
         &self,
         provider_id: &str,
@@ -640,23 +673,19 @@ impl OAuthCredentialStore for MemoryOAuthCredentialStore {
         terminal: bool,
         meta: Option<String>,
     ) -> anyhow::Result<bool> {
-        let mut map = self.credentials.write().await;
-        let Some(cred) = map.get_mut(provider_id) else {
-            return Ok(false);
-        };
-        if cred.status != "refreshing" || cred.status_version != expected_version {
-            return Ok(false);
-        }
-        cred.status = if terminal { "error" } else { "connected" }.to_string();
-        if let Some(meta) = meta {
-            cred.meta = meta;
-        }
-        cred.last_error = Some(error_message.to_string());
-        cred.status_version += 1;
-        cred.updated_at = now_rfc3339();
-        Ok(true)
+        Ok(self
+            .mutate(
+                provider_id,
+                crate::storage::oauth::Mutation::FailRefresh(
+                    expected_version,
+                    error_message,
+                    terminal,
+                    meta.as_deref(),
+                ),
+            )
+            .await?
+            .is_some())
     }
-
     async fn list_expiring(&self, before: Duration) -> anyhow::Result<Vec<OAuthCredential>> {
         let cutoff = i128::from(chrono::Utc::now().timestamp()) + i128::from(before.as_secs());
         let map = self.credentials.read().await;
@@ -664,6 +693,8 @@ impl OAuthCredentialStore for MemoryOAuthCredentialStore {
             .values()
             .filter(|credential| {
                 credential.status == "connected"
+                    && credential.driver_key != "devin"
+                    && credential.is_enabled
                     && credential
                         .expires_at
                         .as_deref()
@@ -702,6 +733,7 @@ mod oauth_time_tests {
     #[tokio::test]
     async fn stale_recovery_respects_age() -> anyhow::Result<()> {
         let store = MemoryOAuthCredentialStore {
+            providers: Arc::new(RwLock::new(Vec::new())),
             credentials: RwLock::new(std::collections::HashMap::new()),
         };
         for (provider, driver) in [
@@ -727,8 +759,10 @@ mod oauth_time_tests {
         }
         {
             let mut rows = store.credentials.write().await;
-            rows.get_mut("old-a").unwrap().updated_at = "2000-01-01T01:00:00+01:00".to_string();
-            rows.get_mut("old-codex").unwrap().updated_at = "2000-01-01 00:00:00".to_string();
+            rows.get_mut("legacy:old-a").unwrap().updated_at =
+                "2000-01-01T01:00:00+01:00".to_string();
+            rows.get_mut("legacy:old-codex").unwrap().updated_at =
+                "2000-01-01 00:00:00".to_string();
         }
         assert_eq!(
             store
@@ -761,7 +795,7 @@ mod oauth_time_tests {
         store.delete("old-a").await?;
         assert!(store.get("old-a").await?.is_none());
         let rows = store.credentials.read().await;
-        let tombstone = rows.get("old-a").unwrap();
+        let tombstone = rows.get("legacy:old-a").unwrap();
         assert_eq!(tombstone.status, "disconnected");
         assert_eq!(tombstone.access_token, "");
         assert_eq!(tombstone.meta, "{}");
@@ -773,6 +807,7 @@ mod oauth_time_tests {
     #[tokio::test]
     async fn invalid_or_absent_expiry_is_not_scheduled() -> anyhow::Result<()> {
         let store = MemoryOAuthCredentialStore {
+            providers: Arc::new(RwLock::new(Vec::new())),
             credentials: RwLock::new(std::collections::HashMap::new()),
         };
         for expiry in [None, Some("not-a-time".to_string())] {

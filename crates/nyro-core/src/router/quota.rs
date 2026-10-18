@@ -123,6 +123,47 @@ impl ProviderQuotaRegistry {
             .unwrap_or_default()
     }
 
+    /// Publish account-pool readiness without interpreting aggregate display
+    /// percentages as one subscriber's quota. `tiers` belong to one eligible
+    /// representative account and are used only for the outer usage score.
+    pub(crate) fn publish_pool(
+        &self,
+        provider_id: &str,
+        schedulable: bool,
+        on_reserve: bool,
+        tiers: &[QuotaTierObservation],
+        reason: Option<&str>,
+    ) -> ProviderScheduling {
+        let now = Utc::now();
+        let scheduling = ProviderScheduling {
+            status: if schedulable {
+                ProviderSchedulingStatus::Eligible
+            } else {
+                ProviderSchedulingStatus::QuotaExhausted
+            },
+            reason: (!schedulable).then(|| reason.unwrap_or("no_available_account").to_owned()),
+            blocking_tiers: Vec::new(),
+            reset_at: None,
+            next_check_at: Some(iso_after(now, EXHAUSTED_REFRESH_INTERVAL)),
+        };
+        let mut states = self.states.write().unwrap();
+        let next_check = states
+            .get(provider_id)
+            .map(|state| state.next_check)
+            .unwrap_or_else(Instant::now);
+        states.insert(
+            provider_id.to_owned(),
+            ProviderQuotaState {
+                scheduling: scheduling.clone(),
+                tiers: tiers.to_vec(),
+                on_reserve: schedulable && on_reserve,
+                next_check,
+                consecutive_failures: 0,
+            },
+        );
+        scheduling
+    }
+
     pub fn observe(
         &self,
         provider_id: &str,
@@ -181,6 +222,7 @@ impl ProviderQuotaRegistry {
                 .unwrap_or(Duration::ZERO)
                 .saturating_add(RESET_GRACE_PERIOD)
                 .max(RESET_GRACE_PERIOD)
+                .min(NORMAL_REFRESH_INTERVAL)
         } else {
             EXHAUSTED_REFRESH_INTERVAL
         };

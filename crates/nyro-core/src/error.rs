@@ -87,6 +87,29 @@ pub struct QuotaWindow {
 /// A dotted-path field reference, e.g. `"messages[0].content"`.
 pub type FieldPath = String;
 
+/// Safe, allowlisted account feedback. Never carries an upstream message or token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AccountFailureReason {
+    AuthInvalid,
+    DailyQuota,
+    WeeklyQuota,
+    RateLimited,
+    ModelForbidden,
+    Capacity,
+    RequestInvalid,
+    Other,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct AccountFailure {
+    pub reason: AccountFailureReason,
+    /// Explicit protocol refusal before any execution evidence, not merely no
+    /// downstream bytes yet. It is never inferred from a rendered status alone.
+    pub rejected_before_execution: bool,
+    pub retry_after_seconds: Option<u64>,
+}
+
 // ── The central error type ────────────────────────────────────────────────────
 
 /// Every cross-layer failure in the gateway MUST be expressed as one of these
@@ -123,6 +146,12 @@ pub enum GatewayError {
         body: Option<String>,
     },
 
+    /// Native provider failure with sanitized account-scoped scheduling facts.
+    AccountUpstream {
+        status: u16,
+        failure: AccountFailure,
+    },
+
     /// The upstream provider did not respond within the allowed time.
     UpstreamTimeout { phase: TimeoutPhase },
 
@@ -153,7 +182,8 @@ impl GatewayError {
             GatewayError::ModelNotFound { .. } => StatusCode::NOT_FOUND,
             GatewayError::ProtocolUnsupported { .. } => StatusCode::BAD_REQUEST,
             GatewayError::ProtocolLossyRejected { .. } => StatusCode::UNPROCESSABLE_ENTITY,
-            GatewayError::UpstreamStatus { status, .. } => {
+            GatewayError::UpstreamStatus { status, .. }
+            | GatewayError::AccountUpstream { status, .. } => {
                 StatusCode::from_u16(*status).unwrap_or(StatusCode::BAD_GATEWAY)
             }
             GatewayError::UpstreamTimeout { .. } => StatusCode::GATEWAY_TIMEOUT,
@@ -176,7 +206,9 @@ impl GatewayError {
             GatewayError::ModelNotFound { .. } => "NYRO_NOT_FOUND",
             GatewayError::ProtocolUnsupported { .. } => "NYRO_PROTOCOL_UNSUPPORTED",
             GatewayError::ProtocolLossyRejected { .. } => "NYRO_PROTOCOL_LOSSY_REJECTED",
-            GatewayError::UpstreamStatus { .. } => "NYRO_UPSTREAM_ERROR",
+            GatewayError::UpstreamStatus { .. } | GatewayError::AccountUpstream { .. } => {
+                "NYRO_UPSTREAM_ERROR"
+            }
             GatewayError::UpstreamTimeout { .. } => "NYRO_UPSTREAM_TIMEOUT",
             GatewayError::StreamParseError { .. } => "NYRO_STREAM_PARSE_ERROR",
             GatewayError::ClientCancelled => "NYRO_CLIENT_CANCELLED",
@@ -224,6 +256,9 @@ impl GatewayError {
                     format!("upstream {provider} returned {status}")
                 }
             }
+            GatewayError::AccountUpstream { status, failure } => {
+                format!("Devin upstream returned {status}: {:?}", failure.reason)
+            }
             GatewayError::UpstreamTimeout { phase } => {
                 format!("upstream timeout during {}", phase.as_str())
             }
@@ -260,6 +295,13 @@ impl GatewayError {
         )
     }
 
+    pub(crate) fn account_failure(&self) -> Option<AccountFailure> {
+        match self {
+            Self::AccountUpstream { failure, .. } => Some(*failure),
+            _ => None,
+        }
+    }
+
     /// Render to an axum `Response` with the canonical JSON body.
     ///
     /// `request_id` is included when available.
@@ -277,13 +319,17 @@ impl GatewayError {
         let mut response =
             (status, Json(serde_json::json!({ "error": error_obj }))).into_response();
         response.extensions_mut().insert(RenderedGatewayError);
+        if let Self::AccountUpstream { failure, .. } = self {
+            response.extensions_mut().insert(*failure);
+        }
         response
     }
 
     /// Machine-safe client message: never embeds upstream bodies or provider detail.
     fn public_message(&self) -> String {
         match self {
-            GatewayError::UpstreamStatus { status, .. } => {
+            GatewayError::UpstreamStatus { status, .. }
+            | GatewayError::AccountUpstream { status, .. } => {
                 format!("upstream returned an error status: {status}")
             }
             GatewayError::StreamParseError { .. } => "upstream stream could not be parsed".into(),

@@ -51,6 +51,7 @@ pub struct Session {
     model: String,
     id: String,
     started: bool,
+    execution_seen: bool,
     done: bool,
     failed: bool,
     thinking_seen: bool,
@@ -75,6 +76,7 @@ impl Session {
             model: model.into(),
             id: format!("devin-{}", uuid::Uuid::new_v4()),
             started: false,
+            execution_seen: false,
             done: false,
             failed: false,
             thinking_seen: false,
@@ -136,12 +138,16 @@ impl Session {
         for frame in self.decoder.feed(bytes)? {
             match frame {
                 Frame::Data(payload) => {
+                    // Even buffered tool/usage frames are execution evidence.
+                    // A later trailer cannot turn a partially executed request
+                    // into a safe account retry, including within one chunk.
+                    self.execution_seen = true;
                     let response = wire::ChatResponse::decode(payload.as_slice())
                         .map_err(|_| wire::protocol_error())?;
                     self.consume(response, &mut events)?;
                 }
                 Frame::End(payload) => {
-                    validate_trailer(&payload)?;
+                    validate_trailer_for_phase(&payload, !self.execution_seen)?;
                     self.complete(&mut events)?;
                 }
             }
@@ -418,7 +424,7 @@ impl Session {
     }
 }
 
-fn validate_trailer(payload: &[u8]) -> Result<(), GatewayError> {
+fn validate_trailer_for_phase(payload: &[u8], before_execution: bool) -> Result<(), GatewayError> {
     if payload.iter().all(u8::is_ascii_whitespace) {
         return Ok(());
     }
@@ -457,12 +463,15 @@ fn validate_trailer(payload: &[u8]) -> Result<(), GatewayError> {
         "failed_precondition" => 400,
         _ => 502,
     };
+    // A strict Connect refusal before ANY data frame is evidence of rejection.
+    // Other trailers retain Never even if no client output was delivered.
+    let refusal = before_execution
+        && matches!(
+            code,
+            "unauthenticated" | "permission_denied" | "resource_exhausted" | "failed_precondition"
+        );
     // Do not echo opaque upstream diagnostics: they can contain request text/credentials.
-    Err(GatewayError::UpstreamStatus {
-        provider: "devin".into(),
-        status,
-        body: Some("Devin Connect stream returned an upstream error".into()),
-    })
+    Err(super::errors::failure(status, &message, refusal, None))
 }
 
 #[cfg(test)]
@@ -723,6 +732,36 @@ mod tests {
             assert!(
                 matches!(events.last(), Some(AiStreamDelta::Done { stop_reason }) if stop_reason == expected)
             );
+        }
+    }
+
+    #[test]
+    fn quota_trailer_is_retryable_only_before_any_data_frame() {
+        let rejection =
+            eos(br#"{"error":{"code":"resource_exhausted","message":"weekly quota exhausted"}}"#);
+        let mut fresh = Session::new("test");
+        let error = fresh.push(&rejection).unwrap_err();
+        assert_eq!(
+            error.account_failure().unwrap().reason,
+            crate::error::AccountFailureReason::WeeklyQuota
+        );
+        assert!(error.account_failure().unwrap().rejected_before_execution);
+
+        for same_chunk in [false, true] {
+            let mut session = Session::new("test");
+            let data = frame(wire::ChatResponse {
+                usage: Some(wire::UsageSnapshot::default()),
+                ..Default::default()
+            });
+            let error = if same_chunk {
+                let mut bytes = data;
+                bytes.extend_from_slice(&rejection);
+                session.push(&bytes).unwrap_err()
+            } else {
+                session.push(&data).unwrap();
+                session.push(&rejection).unwrap_err()
+            };
+            assert!(!error.account_failure().unwrap().rejected_before_execution);
         }
     }
 

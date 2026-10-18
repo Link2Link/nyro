@@ -133,7 +133,12 @@ CREATE TABLE public.provider_keys (
 --
 
 CREATE TABLE public.provider_oauth_credentials (
+    account_id text NOT NULL,
     provider_id text NOT NULL,
+    label text DEFAULT 'Default account'::text NOT NULL,
+    is_enabled boolean DEFAULT true NOT NULL,
+    priority integer DEFAULT 0 NOT NULL,
+    account_state text DEFAULT '{}'::text NOT NULL,
     driver_key text DEFAULT ''::text NOT NULL,
     scheme text DEFAULT ''::text NOT NULL,
     access_token text DEFAULT ''::text NOT NULL,
@@ -339,7 +344,7 @@ ALTER TABLE ONLY public.provider_keys
 --
 
 ALTER TABLE ONLY public.provider_oauth_credentials
-    ADD CONSTRAINT provider_oauth_credentials_pkey PRIMARY KEY (provider_id);
+    ADD CONSTRAINT provider_oauth_credentials_pkey PRIMARY KEY (account_id);
 
 
 --
@@ -481,6 +486,13 @@ CREATE INDEX idx_logs_upstream_model ON public.request_logs USING btree (upstrea
 --
 
 CREATE INDEX idx_oauth_creds_expires ON public.provider_oauth_credentials USING btree (expires_at);
+
+
+--
+-- Name: idx_oauth_creds_provider; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_oauth_creds_provider ON public.provider_oauth_credentials USING btree (provider_id);
 
 
 --

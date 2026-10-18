@@ -54,6 +54,17 @@ function extractModel(params?: Record<string, unknown>) {
 export function localizeBackendErrorMessage(error: unknown, isZh: boolean): string {
   const raw = extractRawErrorMessage(error);
   const payload = parseErrorPayload(raw);
+  const code = payload?.code ?? raw.split(":", 1)[0];
+  const accountMessages: Record<string, [string, string]> = {
+    ACCOUNT_VERSION_CONFLICT: ["This account changed. Reload it and retry the operation.", "账号已变化，请重新读取后重试。"],
+    AMBIGUOUS_ACCOUNT: ["Select a specific account in Manage accounts.", "请在管理账号面板中选择具体账号。"],
+    POOL_PLAN_LOCKED: ["Disconnect all accounts before changing the pool plan.", "请先断开所有账号，再修改账号池套餐。"],
+    POOL_NOT_CONFIGURED: ["Select a pool plan before adding or re-authorizing accounts.", "添加或重登账号前请先选择账号池套餐。"],
+    PLAN_MISMATCH: ["This account's plan or quota windows do not match the pool.", "此账号套餐或额度窗口与账号池不匹配。"],
+    PLAN_UNVERIFIED: ["The account plan could not be verified.", "无法验证此账号的套餐。"],
+    ACCOUNT_SESSION_TARGET_MISMATCH: ["The login session does not belong to this account target.", "登录会话与目标账号不匹配。"],
+  };
+  if (accountMessages[code]) return accountMessages[code][isZh ? 1 : 0];
   if (!payload?.code) return raw;
 
   const name = extractName(payload.params);
