@@ -4,6 +4,49 @@ All notable changes to Nyro will be documented in this file.
 
 ---
 
+## v2.1.1
+
+> Released on 2026-10-18
+
+#### Features
+
+- **Devin CLI subscription provider**: PKCE authorization (auth-code and session-token import), native `devin-chat` Connect/protobuf endpoint, request encoding, stream parsing and a pinned built-in model catalog (49 suggestions across 37+ tier families); fixed upstream and OAuth only, API keys and adaptive protocols rejected
+- **Devin same-tier account pool**: multiple accounts per provider with independent management, priority round-robin with session stickiness, isolated per-account quota and failure cooldown, bounded safe retries, mixed-plan auto-detection, pool quota aggregated by equivalent capacity, per-account connectivity checks, and a one-click pool refresh from the provider card; credentials migrate across all four storage backends with legacy authorization preserved
+- **Devin usage and overage scheduling**: `devin_plan` usage backend reads plan, daily/weekly windows and overage balance via `GetUserStatus`; an exhausted window with remaining overage stays schedulable (60s recheck) and is ranked after scored and unknown pools; `daily` becomes a canonical routing window
+- **Devin base-name tier selection**: bare model names are mapped to the matching upstream variant by thinking effort (nearest-tier clamping, series default when unspecified, equal-distance ties pick the higher tier), covering opus / sonnet / haiku 5.5 / fable / astra / argon families
+- **Kiro native integration**: native event-stream protocol, web authorization and credential import, tool continuation rounds, model discovery, quota-aware scheduling, session cancellation and credential isolation
+- **Credential-rejection failover**: a refused OAuth refresh marks the credential terminal and skips it in routing until re-authorized; upstream 401/403 are treated as credential rejection and force failover to the next target
+- **Failover history replay compatibility**: third-party-safe replay policy cleans converted item identifiers, strips incompatible ciphertext conditionally, protects state references and tool pairing, and forbids replay after a broken stream
+- **No-output tool-call retry**: a tool call that fails before any output is retried once on the same target (same account and payload, usage recorded per attempt); never retried after output or cancellation
+- **Usage valuation and custom prices**: Token / cost toggle, separate cache and output cost, persisted per-model custom prices with prefix inheritance, fixed CNY/USD merging, merged model variants, and price association preserved across config import
+- **Provider-equivalent API price**: same-name models prefer official API pricing (no fallback to resale price when invalid or ambiguous); provider distribution gains an equivalent API price column, per-currency totals (mixed currencies converted to USD) and asterisk marking for unpriced requests
+- **Token consumption calendar**: yearly token-usage admin API (UTC half-open range, all four backends), heat-map calendar, monthly trend, model filter and per-day drill-down on the statistics page
+- **Custom time range for request analytics**: `start_at` / `end_at` on stats APIs (legacy `hours` still works), "this month" and custom range selector up to 366 days with coarser buckets for long ranges and 400 on invalid ranges; the capability × speed chart is limited to the latest 50 calls within 7 days
+- **Antigravity**: client version fetched dynamically from the official update feed (6h cache with failure cooldown, fallback 2.24.0), restoring access to Gemini 4 Argon; static catalog trimmed to active generations with older models discovered per account
+- **Google subscription thinking tiers**: effort rewrite extended to the gemini-cli channel, default adaptive tier when no reasoning directive, explicit disable maps to the lowest tier, bare `budget_tokens` mapped by magnitude, Gemini 3.8 tier variants added
+
+#### Improvements
+
+- **TPS unified as total output rate**: primary metric is total output over elapsed time, pure reasoning counted as output, frontend/backend contracts and docs aligned
+- **Model consumption list collapsed by default**: new `TokenModelUsage` component shows the top 5 models with a show-all toggle, re-collapsing on period/date/filter change
+- **Statistics range selector layout**: right-aligned, custom range merged into one bordered input group, hover hint replaces the "this month" caption
+- **Kiro token estimation by character class**: Latin 2.8 / CJK 1.5 chars per token over the actual request body, output estimated once at stream end
+- **Stats exclude unrouted requests**; native protocol display names completed with raw-value fallback for unknown protocols
+- **Streaming timeouts split by phase**: connect/first-byte and idle timeouts separated, no default total limit for reasoning streams, reasoning and admin clients isolated, new startup flags with range validation
+- Claude 5.5 budget-tier comments aligned (≤10240→xhigh, >10240→max); `token_cost` and related modules reformatted
+
+#### Fixes
+
+- **Devin**: haiku 5.5 bare name no longer returns 403 due to missing tier selection; streaming failover before commit fixed
+- **Kiro thinking parsing**: tag detection no longer depends on stream chunk boundaries, thinking blocks after tool calls no longer leak into the answer, tag parsing enabled when the client brings its own thinking directive, historical thinking replayed as tags only when thinking is on
+- **Model variant cost merging**: Grok build variants and Gemini reasoning tiers merged while keeping version/product boundaries
+- **MiniMax / Anthropic path**: no longer injects `disabled` thinking when the client did not declare it
+- **Grok**: handshake failure on the subscription channel retried once; declared client version raised from 0.2.114 to 1.0.13 (shared by inference, discovery and usage)
+- **Protocol stream conversion and account pool failover**: cross-chunk decoding and Google unwrapping fixed, independent tool calls and signatures preserved, cancelled requests no longer reported as conversion failures, healthy standby keys preserved after circuit breaking
+- **Thinking-model `max_tokens` defense**: output budget floor set to 128000, thinking models recognized by name (Claude 5.5 / GLM 5.3 series) so the lift also applies on passthrough without a `thinking` field
+
+---
+
 ## v2.1.0
 
 > Released on 2026-10-09
