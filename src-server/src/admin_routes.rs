@@ -8,7 +8,7 @@ use axum::{Extension, Json, Router};
 use nyro_core::Gateway;
 use nyro_core::admin::StatsRange;
 use nyro_core::admin::{
-    CopyProviderOptions, DevinPoolConfig, OAuthAccountUpdate, ModelRatingError, SetModelRating,
+    CopyProviderOptions, DevinPoolConfig, ModelRatingError, OAuthAccountUpdate, SetModelRating,
     TokenPriceError, TokenPriceInput,
 };
 use nyro_core::auth::AuthExchangeInput;
@@ -121,17 +121,39 @@ pub fn create_router(gateway: Gateway, admin_token: Option<String>) -> Router {
             "/providers/:id/oauth/bind",
             post(bind_provider_oauth_handler),
         )
-        .route("/providers/:id/accounts", get(get_provider_account_pool_handler))
-        .route("/providers/:id/account-pool", put(configure_provider_account_pool_handler))
-        .route("/providers/:id/accounts/auth-sessions", post(init_provider_account_session_handler))
-        .route("/providers/:id/accounts/bind", post(bind_provider_account_handler))
+        .route(
+            "/providers/:id/accounts",
+            get(get_provider_account_pool_handler),
+        )
+        .route(
+            "/providers/:id/account-pool",
+            put(configure_provider_account_pool_handler),
+        )
+        .route(
+            "/providers/:id/accounts/auth-sessions",
+            post(init_provider_account_session_handler),
+        )
+        .route(
+            "/providers/:id/accounts/bind",
+            post(bind_provider_account_handler),
+        )
         .route(
             "/providers/:id/accounts/:account_id",
-            axum::routing::patch(update_provider_account_handler).delete(disconnect_provider_account_handler),
+            axum::routing::patch(update_provider_account_handler)
+                .delete(disconnect_provider_account_handler),
         )
-        .route("/providers/:id/accounts/:account_id/usage/refresh", post(refresh_provider_account_usage_handler))
-        .route("/providers/:id/account-pool/usage/refresh", post(refresh_provider_account_pool_usage_handler))
-        .route("/providers/devin", post(create_devin_provider_with_pool_handler))
+        .route(
+            "/providers/:id/accounts/:account_id/usage/refresh",
+            post(refresh_provider_account_usage_handler),
+        )
+        .route(
+            "/providers/:id/account-pool/usage/refresh",
+            post(refresh_provider_account_pool_usage_handler),
+        )
+        .route(
+            "/providers/devin",
+            post(create_devin_provider_with_pool_handler),
+        )
         .route("/providers/oauth", post(create_oauth_provider_handler))
         .route("/oauth/sessions/init", post(init_oauth_session_handler))
         .route(
@@ -658,7 +680,11 @@ async fn create_devin_provider_with_pool_handler(
 ) -> impl IntoResponse {
     match gw
         .admin()
-        .create_devin_provider_with_pool(&input.session_id, input.input, input.config.unwrap_or_default())
+        .create_devin_provider_with_pool(
+            &input.session_id,
+            input.input,
+            input.config.unwrap_or_default(),
+        )
         .await
     {
         Ok(v) => Json(serde_json::json!({ "data": v })).into_response(),
@@ -756,7 +782,11 @@ async fn configure_provider_account_pool_handler(
     Path(id): Path<String>,
     Json(config): Json<DevinPoolConfig>,
 ) -> impl IntoResponse {
-    match gw.admin().configure_provider_account_pool(&id, config).await {
+    match gw
+        .admin()
+        .configure_provider_account_pool(&id, config)
+        .await
+    {
         Ok(v) => Json(serde_json::json!({ "data": v })).into_response(),
         Err(e) => err(e),
     }
@@ -767,7 +797,11 @@ async fn init_provider_account_session_handler(
     Path(id): Path<String>,
     Json(input): Json<InitProviderAccountSessionRequest>,
 ) -> impl IntoResponse {
-    match gw.admin().init_provider_account_session(&id, input.account_id.as_deref(), input.expected_version).await {
+    match gw
+        .admin()
+        .init_provider_account_session(&id, input.account_id.as_deref(), input.expected_version)
+        .await
+    {
         Ok(v) => Json(serde_json::json!({ "data": v })).into_response(),
         Err(e) => err(e),
     }
@@ -778,7 +812,11 @@ async fn bind_provider_account_handler(
     Path(id): Path<String>,
     Json(input): Json<BindProviderAccountRequest>,
 ) -> impl IntoResponse {
-    match gw.admin().bind_provider_account(&id, &input.session_id, input.label.as_deref()).await {
+    match gw
+        .admin()
+        .bind_provider_account(&id, &input.session_id, input.label.as_deref())
+        .await
+    {
         Ok(v) => Json(serde_json::json!({ "data": v })).into_response(),
         Err(e) => err(e),
     }
@@ -789,7 +827,11 @@ async fn update_provider_account_handler(
     Path((id, account_id)): Path<(String, String)>,
     Json(input): Json<UpdateProviderAccountRequest>,
 ) -> impl IntoResponse {
-    match gw.admin().update_provider_account(&id, &account_id, input.expected_version, input.update).await {
+    match gw
+        .admin()
+        .update_provider_account(&id, &account_id, input.expected_version, input.update)
+        .await
+    {
         Ok(v) => Json(serde_json::json!({ "data": v })).into_response(),
         Err(e) => err(e),
     }
@@ -800,7 +842,11 @@ async fn disconnect_provider_account_handler(
     Path((id, account_id)): Path<(String, String)>,
     Json(input): Json<ProviderAccountVersionRequest>,
 ) -> impl IntoResponse {
-    match gw.admin().disconnect_provider_account(&id, &account_id, input.expected_version).await {
+    match gw
+        .admin()
+        .disconnect_provider_account(&id, &account_id, input.expected_version)
+        .await
+    {
         Ok(v) => Json(serde_json::json!({ "data": v })).into_response(),
         Err(e) => err(e),
     }
@@ -810,7 +856,11 @@ async fn refresh_provider_account_usage_handler(
     State(gw): State<Gateway>,
     Path((id, account_id)): Path<(String, String)>,
 ) -> impl IntoResponse {
-    match gw.admin().refresh_provider_account_usage(&id, &account_id).await {
+    match gw
+        .admin()
+        .refresh_provider_account_usage(&id, &account_id)
+        .await
+    {
         Ok(v) => Json(serde_json::json!({ "data": v })).into_response(),
         Err(e) => usage_err(e),
     }
@@ -1341,10 +1391,19 @@ fn usage_err(e: anyhow::Error) -> axum::response::Response {
 
 fn account_conflict(message: &str) -> bool {
     // Core currently emits both structured coded errors and CODE: message.
-    let code = serde_json::from_str::<serde_json::Value>(message).ok()
-        .and_then(|value| value.get("code").and_then(|code| code.as_str()).map(str::to_owned))
+    let code = serde_json::from_str::<serde_json::Value>(message)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("code")
+                .and_then(|code| code.as_str())
+                .map(str::to_owned)
+        })
         .unwrap_or_else(|| message.split(':').next().unwrap_or("").trim().to_owned());
-    matches!(code.as_str(), "AMBIGUOUS_ACCOUNT" | "ACCOUNT_VERSION_CONFLICT" | "POOL_PLAN_LOCKED")
+    matches!(
+        code.as_str(),
+        "AMBIGUOUS_ACCOUNT" | "ACCOUNT_VERSION_CONFLICT" | "POOL_PLAN_LOCKED"
+    )
 }
 
 fn err(e: anyhow::Error) -> axum::response::Response {
@@ -1353,7 +1412,11 @@ fn err(e: anyhow::Error) -> axum::response::Response {
     }
     let message = e.to_string();
     if account_conflict(&message) {
-        return (StatusCode::CONFLICT, Json(serde_json::json!({ "error": message }))).into_response();
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "error": message })),
+        )
+            .into_response();
     }
     Json(serde_json::json!({ "error": message })).into_response()
 }
@@ -1381,17 +1444,31 @@ mod tests {
 
     #[test]
     fn account_conflicts_and_cas_inputs_are_explicit() {
-        for message in ["AMBIGUOUS_ACCOUNT: select an account", "ACCOUNT_VERSION_CONFLICT: reload", "POOL_PLAN_LOCKED: disconnect first", r#"{"code":"ACCOUNT_VERSION_CONFLICT","message":"reload"}"#] {
-            assert_eq!(err(anyhow::anyhow!("{message}")).status(), StatusCode::CONFLICT);
+        for message in [
+            "AMBIGUOUS_ACCOUNT: select an account",
+            "ACCOUNT_VERSION_CONFLICT: reload",
+            "POOL_PLAN_LOCKED: disconnect first",
+            r#"{"code":"ACCOUNT_VERSION_CONFLICT","message":"reload"}"#,
+        ] {
+            assert_eq!(
+                err(anyhow::anyhow!("{message}")).status(),
+                StatusCode::CONFLICT
+            );
         }
-        assert!(!account_conflict("upstream said AMBIGUOUS_ACCOUNT in an unrelated message"));
-        assert!(serde_json::from_value::<ProviderAccountVersionRequest>(serde_json::json!({})).is_err());
+        assert!(!account_conflict(
+            "upstream said AMBIGUOUS_ACCOUNT in an unrelated message"
+        ));
+        assert!(
+            serde_json::from_value::<ProviderAccountVersionRequest>(serde_json::json!({})).is_err()
+        );
         let input: UpdateProviderAccountRequest = serde_json::from_value(serde_json::json!({
             "expected_version": 4, "update": {"is_enabled": false}
-        })).unwrap();
+        }))
+        .unwrap();
         assert_eq!(input.expected_version, 4);
         assert_eq!(input.update.is_enabled, Some(false));
-        let add: InitProviderAccountSessionRequest = serde_json::from_value(serde_json::json!({})).unwrap();
+        let add: InitProviderAccountSessionRequest =
+            serde_json::from_value(serde_json::json!({})).unwrap();
         assert!(add.account_id.is_none());
         assert!(add.expected_version.is_none());
     }
@@ -1410,14 +1487,21 @@ mod tests {
                 request["config"] = config;
             }
             let parsed: CreateDevinProviderRequest = serde_json::from_value(request).unwrap();
-            assert_eq!(serde_json::to_value(parsed.config.unwrap_or_default()).unwrap(), defaults);
+            assert_eq!(
+                serde_json::to_value(parsed.config.unwrap_or_default()).unwrap(),
+                defaults
+            );
         }
         let mut legacy = defaults.clone();
         legacy["plan"] = serde_json::json!("max");
         let parsed: CreateDevinProviderRequest = serde_json::from_value(serde_json::json!({
             "session_id": "session", "input": input, "config": legacy
-        })).unwrap();
-        assert_eq!(serde_json::to_value(parsed.config.unwrap()).unwrap(), defaults);
+        }))
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(parsed.config.unwrap()).unwrap(),
+            defaults
+        );
     }
 
     #[test]

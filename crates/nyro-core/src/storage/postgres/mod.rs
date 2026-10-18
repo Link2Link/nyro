@@ -16,10 +16,10 @@ use crate::db::models::{
     CreateApiKey, CreateModel, CreateModelBackend, CreateProvider, CreateProviderProtocolEndpoint,
     LogPage, LogQuery, Model, ModelApiKeyUsageStats, ModelBackend, ModelProviderUsageStats,
     ModelStats, ModelTimeBucket, ModelUsageDetail, ModelUsageStats, ModelUsageTotals,
-    OAuthAccountUpdate, OAuthCredential, Provider, ProviderKey, ProviderKeyProbeResult, ProviderModelUsageStats,
-    ProviderProtocolEndpoint, ProviderStats, ProviderUsageDetail, RecentModelPerformance,
-    RequestLog, RequestResult, StatsHourly, StatsOverview, StatsTimeBucket, UpdateApiKey,
-    UpdateModel, UpdateProvider, UpsertOAuthCredential, UpsertProviderKey,
+    OAuthAccountUpdate, OAuthCredential, Provider, ProviderKey, ProviderKeyProbeResult,
+    ProviderModelUsageStats, ProviderProtocolEndpoint, ProviderStats, ProviderUsageDetail,
+    RecentModelPerformance, RequestLog, RequestResult, StatsHourly, StatsOverview, StatsTimeBucket,
+    UpdateApiKey, UpdateModel, UpdateProvider, UpsertOAuthCredential, UpsertProviderKey,
     is_valid_provider_auth_mode,
 };
 use crate::logging::LogEntry;
@@ -234,9 +234,14 @@ impl PostgresOAuthCredentialStore {
             .bind(provider_id).fetch_all(&mut *tx).await?;
         let row = crate::storage::oauth::mutate(
             provider_id,
-            parent
-                .as_ref()
-                .map(|(mode, vendor, preset, channel)| (mode.as_str(), vendor.as_str(), preset.as_str(), channel.as_str())),
+            parent.as_ref().map(|(mode, vendor, preset, channel)| {
+                (
+                    mode.as_str(),
+                    vendor.as_str(),
+                    preset.as_str(),
+                    channel.as_str(),
+                )
+            }),
             &rows,
             action,
         )?;
@@ -471,7 +476,6 @@ impl OAuthCredentialStore for PostgresOAuthCredentialStore {
         Ok(result.rows_affected())
     }
 }
-
 
 #[derive(Clone)]
 struct PostgresProviderStore {
@@ -2184,7 +2188,9 @@ END $$;"#,
         // Provider-keyed -> account-keyed: DDL and ID assignment are atomic.
         {
             let mut tx = self.adapter.pool().begin().await?;
-            sqlx::query("LOCK TABLE provider_oauth_credentials IN ACCESS EXCLUSIVE MODE").execute(&mut *tx).await?;
+            sqlx::query("LOCK TABLE provider_oauth_credentials IN ACCESS EXCLUSIVE MODE")
+                .execute(&mut *tx)
+                .await?;
             let legacy: bool = sqlx::query_scalar("SELECT NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'provider_oauth_credentials' AND column_name = 'account_id')")
                 .fetch_one(&mut *tx).await?;
             if legacy {

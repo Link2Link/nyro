@@ -18,10 +18,11 @@ use crate::db::models::{
     CreateApiKey, CreateModel, CreateModelBackend, CreateProvider, CreateProviderProtocolEndpoint,
     LogPage, LogQuery, Model, ModelApiKeyUsageStats, ModelBackend, ModelProviderUsageStats,
     ModelStats, ModelTimeBucket, ModelUsageDetail, ModelUsageStats, ModelUsageTotals,
-    OAuthAccountUpdate, OAuthCredential, Provider, ProviderKey, ProviderKeyProbeResult, ProviderModelUsageStats,
-    ProviderProtocolEndpoint, ProviderStats, ProviderUsageDetail, RecentModelPerformance,
-    RequestLog, StatsHourly, StatsOverview, StatsTimeBucket, UpdateApiKey, UpdateModel,
-    UpdateProvider, UpsertOAuthCredential, UpsertProviderKey, is_valid_provider_auth_mode,
+    OAuthAccountUpdate, OAuthCredential, Provider, ProviderKey, ProviderKeyProbeResult,
+    ProviderModelUsageStats, ProviderProtocolEndpoint, ProviderStats, ProviderUsageDetail,
+    RecentModelPerformance, RequestLog, StatsHourly, StatsOverview, StatsTimeBucket, UpdateApiKey,
+    UpdateModel, UpdateProvider, UpsertOAuthCredential, UpsertProviderKey,
+    is_valid_provider_auth_mode,
 };
 use crate::logging::LogEntry;
 use crate::logging::diagnostics::{RequestResult, error_sql, outcome_sql};
@@ -180,9 +181,14 @@ impl SqliteOAuthCredentialStore {
         .await?;
         let row = crate::storage::oauth::mutate(
             provider_id,
-            parent
-                .as_ref()
-                .map(|(mode, vendor, preset, channel)| (mode.as_str(), vendor.as_str(), preset.as_str(), channel.as_str())),
+            parent.as_ref().map(|(mode, vendor, preset, channel)| {
+                (
+                    mode.as_str(),
+                    vendor.as_str(),
+                    preset.as_str(),
+                    channel.as_str(),
+                )
+            }),
             &rows,
             action,
         )?;
@@ -416,7 +422,6 @@ impl OAuthCredentialStore for SqliteOAuthCredentialStore {
         Ok(result.rows_affected())
     }
 }
-
 
 #[derive(Clone)]
 struct SqliteProviderStore {

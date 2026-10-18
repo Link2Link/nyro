@@ -512,7 +512,12 @@ mod tests {
         assert_eq!(resolve("Claude-Opus-5.5", &max), "claude-opus-5-5-max");
         assert_eq!(resolve("  gpt-6-astra  ", &max), "gpt-6-astra-max");
         // Lookalikes are not families and pass through untouched.
-        for other in ["claude-opus-5-55", "claude-opus-6", "gpt-6-astral", "gpt-5-4-mi"] {
+        for other in [
+            "claude-opus-5-55",
+            "claude-opus-6",
+            "gpt-6-astral",
+            "gpt-5-4-mi",
+        ] {
             assert_eq!(resolve(other, &max), other);
         }
     }
@@ -554,12 +559,20 @@ mod tests {
             ("deepseek-v4-flash", Some(Xhigh), "deepseek-v4-flash-max"),
             ("gemini-3-1-pro", Some(Medium), "gemini-3-1-pro-high"),
             ("nemotron-3-ultra", Some(Low), "nemotron-3-ultra-medium"),
-            ("gemini-3-6-flash", Some(Minimal), "gemini-3-6-flash-minimal"),
+            (
+                "gemini-3-6-flash",
+                Some(Minimal),
+                "gemini-3-6-flash-minimal",
+            ),
             ("grok-4-6", Some(Max), "grok-4-6-xhigh"),
             ("gpt-5-3-codex", Some(None), "gpt-5-3-codex-low"),
             // Single-tier family.
             ("swe-1-7-lightning", Some(Max), "swe-1-7-lightning-medium"),
-            ("swe-1-7-lightning", Option::None, "swe-1-7-lightning-medium"),
+            (
+                "swe-1-7-lightning",
+                Option::None,
+                "swe-1-7-lightning-medium",
+            ),
             // The longer name must not be swallowed by its shorter sibling.
             ("gpt-5-4-mini", Some(High), "gpt-5-4-mini-high"),
             ("glm-5-3-flash", Some(High), "glm-5-3-flash-high"),

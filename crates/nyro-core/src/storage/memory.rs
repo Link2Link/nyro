@@ -5,9 +5,10 @@ use tokio::sync::RwLock;
 
 use crate::db::models::{
     ApiKeyStats, ApiKeyUsageDetail, CreateModel, CreateProvider, LogPage, LogQuery, Model,
-    ModelStats, ModelTimeBucket, ModelUsageDetail, ModelUsageStats, OAuthAccountUpdate, OAuthCredential, Provider,
-    ProviderKeyProbeResult, ProviderStats, ProviderUsageDetail, RequestLog, StatsHourly,
-    StatsOverview, StatsTimeBucket, UpdateModel, UpdateProvider, UpsertOAuthCredential,
+    ModelStats, ModelTimeBucket, ModelUsageDetail, ModelUsageStats, OAuthAccountUpdate,
+    OAuthCredential, Provider, ProviderKeyProbeResult, ProviderStats, ProviderUsageDetail,
+    RequestLog, StatsHourly, StatsOverview, StatsTimeBucket, UpdateModel, UpdateProvider,
+    UpsertOAuthCredential,
 };
 use crate::logging::LogEntry;
 
@@ -492,7 +493,14 @@ impl MemoryOAuthCredentialStore {
             .collect();
         let row = crate::storage::oauth::mutate(
             provider_id,
-            parent.map(|p| (p.auth_mode.as_str(), p.vendor.as_deref().unwrap_or(""), p.preset_key.as_deref().unwrap_or(""), p.channel.as_deref().unwrap_or(""))),
+            parent.map(|p| {
+                (
+                    p.auth_mode.as_str(),
+                    p.vendor.as_deref().unwrap_or(""),
+                    p.preset_key.as_deref().unwrap_or(""),
+                    p.channel.as_deref().unwrap_or(""),
+                )
+            }),
             &rows,
             &action,
         )?;

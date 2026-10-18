@@ -6,10 +6,10 @@ use async_trait::async_trait;
 use crate::db::models::{
     ApiKeyStats, ApiKeyUsageDetail, ApiKeyWithBindings, CreateApiKey, CreateModel,
     CreateModelBackend, CreateProvider, LogPage, LogQuery, Model, ModelBackend, ModelRatingEntry,
-    ModelStats, ModelTimeBucket, ModelUsageDetail, ModelUsageStats, OAuthCredential, Provider,
-    ProviderKeyProbeResult, ProviderStats, ProviderUsageDetail, RequestLog, RequestResult,
-    StatsHourly, StatsOverview, StatsTimeBucket, UpdateApiKey, UpdateModel, UpdateProvider,
-    OAuthAccountUpdate, UpsertOAuthCredential,
+    ModelStats, ModelTimeBucket, ModelUsageDetail, ModelUsageStats, OAuthAccountUpdate,
+    OAuthCredential, Provider, ProviderKeyProbeResult, ProviderStats, ProviderUsageDetail,
+    RequestLog, RequestResult, StatsHourly, StatsOverview, StatsTimeBucket, UpdateApiKey,
+    UpdateModel, UpdateProvider, UpsertOAuthCredential,
 };
 use crate::logging::LogEntry;
 

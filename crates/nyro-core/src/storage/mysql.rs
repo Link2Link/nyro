@@ -16,10 +16,10 @@ use crate::db::models::{
     CreateApiKey, CreateModel, CreateModelBackend, CreateProvider, CreateProviderProtocolEndpoint,
     LogPage, LogQuery, Model, ModelApiKeyUsageStats, ModelBackend, ModelProviderUsageStats,
     ModelStats, ModelTimeBucket, ModelUsageDetail, ModelUsageStats, ModelUsageTotals,
-    OAuthAccountUpdate, OAuthCredential, Provider, ProviderKey, ProviderKeyProbeResult, ProviderModelUsageStats,
-    ProviderProtocolEndpoint, ProviderStats, ProviderUsageDetail, RecentModelPerformance,
-    RequestLog, RequestResult, StatsHourly, StatsOverview, StatsTimeBucket, UpdateApiKey,
-    UpdateModel, UpdateProvider, UpsertOAuthCredential, UpsertProviderKey,
+    OAuthAccountUpdate, OAuthCredential, Provider, ProviderKey, ProviderKeyProbeResult,
+    ProviderModelUsageStats, ProviderProtocolEndpoint, ProviderStats, ProviderUsageDetail,
+    RecentModelPerformance, RequestLog, RequestResult, StatsHourly, StatsOverview, StatsTimeBucket,
+    UpdateApiKey, UpdateModel, UpdateProvider, UpsertOAuthCredential, UpsertProviderKey,
     is_valid_provider_auth_mode,
 };
 use crate::logging::LogEntry;
@@ -237,9 +237,14 @@ impl MysqlOAuthCredentialStore {
             .bind(provider_id).fetch_all(&mut *tx).await?;
         let row = crate::storage::oauth::mutate(
             provider_id,
-            parent
-                .as_ref()
-                .map(|(mode, vendor, preset, channel)| (mode.as_str(), vendor.as_str(), preset.as_str(), channel.as_str())),
+            parent.as_ref().map(|(mode, vendor, preset, channel)| {
+                (
+                    mode.as_str(),
+                    vendor.as_str(),
+                    preset.as_str(),
+                    channel.as_str(),
+                )
+            }),
             &rows,
             action,
         )?;
@@ -2320,12 +2325,48 @@ impl StorageBootstrap for MysqlBootstrap {
 
         // MySQL DDL auto-commits: each preparation step is restartable. The
         // final primary-key switch is a single ALTER; the FK keeps its own index.
-        mysql_add_column_if_not_exists(pool, "provider_oauth_credentials", "account_id", "VARCHAR(191)").await?;
-        mysql_add_column_if_not_exists(pool, "provider_oauth_credentials", "label", "TEXT NOT NULL DEFAULT ('Default account')").await?;
-        mysql_add_column_if_not_exists(pool, "provider_oauth_credentials", "is_enabled", "TINYINT(1) NOT NULL DEFAULT 1").await?;
-        mysql_add_column_if_not_exists(pool, "provider_oauth_credentials", "priority", "INTEGER NOT NULL DEFAULT 0").await?;
-        mysql_add_column_if_not_exists(pool, "provider_oauth_credentials", "account_state", "LONGTEXT NOT NULL DEFAULT ('{}')").await?;
-        mysql_ensure_index(pool, "provider_oauth_credentials", "provider_id", "idx_oauth_creds_provider").await?;
+        mysql_add_column_if_not_exists(
+            pool,
+            "provider_oauth_credentials",
+            "account_id",
+            "VARCHAR(191)",
+        )
+        .await?;
+        mysql_add_column_if_not_exists(
+            pool,
+            "provider_oauth_credentials",
+            "label",
+            "TEXT NOT NULL DEFAULT ('Default account')",
+        )
+        .await?;
+        mysql_add_column_if_not_exists(
+            pool,
+            "provider_oauth_credentials",
+            "is_enabled",
+            "TINYINT(1) NOT NULL DEFAULT 1",
+        )
+        .await?;
+        mysql_add_column_if_not_exists(
+            pool,
+            "provider_oauth_credentials",
+            "priority",
+            "INTEGER NOT NULL DEFAULT 0",
+        )
+        .await?;
+        mysql_add_column_if_not_exists(
+            pool,
+            "provider_oauth_credentials",
+            "account_state",
+            "LONGTEXT NOT NULL DEFAULT ('{}')",
+        )
+        .await?;
+        mysql_ensure_index(
+            pool,
+            "provider_oauth_credentials",
+            "provider_id",
+            "idx_oauth_creds_provider",
+        )
+        .await?;
         sqlx::query("UPDATE provider_oauth_credentials SET account_id = CONCAT('legacy:', provider_id) WHERE account_id IS NULL").execute(pool).await?;
         let legacy: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM information_schema.statistics WHERE table_schema = DATABASE() AND table_name = 'provider_oauth_credentials' AND index_name = 'PRIMARY' AND column_name = 'provider_id'").fetch_one(pool).await?;
         if legacy > 0 {
