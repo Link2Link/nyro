@@ -46,7 +46,9 @@ fn attempts_default() -> usize {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct DevinPoolConfig {
-    pub plan: DevinPlan,
+    /// Read legacy homogeneous-pool settings, but never use or write their plan.
+    #[serde(default, skip_serializing)]
+    pub plan: Option<DevinPlan>,
     #[serde(default)]
     pub strategy: DevinPoolStrategy,
     #[serde(default = "affinity_default")]
@@ -57,6 +59,18 @@ pub struct DevinPoolConfig {
     pub max_account_attempts: usize,
     #[serde(default)]
     pub reserve_policy: DevinReservePolicy,
+}
+impl Default for DevinPoolConfig {
+    fn default() -> Self {
+        Self {
+            plan: None,
+            strategy: DevinPoolStrategy::RoundRobin,
+            session_affinity: affinity_default(),
+            affinity_ttl_seconds: affinity_ttl_default(),
+            max_account_attempts: attempts_default(),
+            reserve_policy: DevinReservePolicy::Disabled,
+        }
+    }
 }
 impl DevinPoolConfig {
     pub fn validate(&self) -> anyhow::Result<()> {
@@ -98,6 +112,10 @@ pub struct ProviderAccountView {
 }
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct PoolQuotaWindow {
+    /// Applicable members, not weighted capacity (unknown plans are provisional members).
+    pub total_accounts: usize,
+    /// False if any unclassified member could change this window's capacity.
+    pub capacity_complete: bool,
     pub total_units: usize,
     pub known_accounts: usize,
     pub known_remaining_units: f64,
@@ -121,6 +139,9 @@ pub struct AccountPoolQuota {
 pub struct AccountPoolCounts {
     pub total: usize,
     pub accounting: usize,
+    pub pro: usize,
+    pub max: usize,
+    pub unclassified: usize,
     pub available: usize,
     pub included: usize,
     pub reserve: usize,
@@ -147,7 +168,6 @@ struct AccountSessionIntent {
     provider_id: String,
     account_id: Option<String>,
     expected_version: Option<i32>,
-    plan: DevinPlan,
     #[serde(default)]
     fence: u64,
 }
@@ -174,7 +194,7 @@ fn conflict() -> anyhow::Error {
     )
 }
 fn state(account: &OAuthCredential) -> DevinAccountState {
-    serde_json::from_str(&account.account_state).unwrap_or_default()
+    DevinAccountState::parse(&account.account_state)
 }
 fn reset_at(unix: Option<i64>) -> Option<String> {
     unix.and_then(|time| DateTime::<Utc>::from_timestamp(time, 0))
@@ -185,30 +205,6 @@ fn is_stale(state: &DevinAccountState) -> bool {
         || state
             .observed_at
             .is_none_or(|at| Utc::now().timestamp_millis().saturating_sub(at) > 300_000)
-}
-pub(crate) fn validate_devin_plan(plan: DevinPlan, usage: &DevinUsage) -> anyhow::Result<()> {
-    let actual = match usage
-        .plan_name
-        .as_deref()
-        .unwrap_or("")
-        .trim()
-        .to_ascii_lowercase()
-        .as_str()
-    {
-        "pro" | "devin pro" => Some(DevinPlan::Pro),
-        "max" | "devin max" => Some(DevinPlan::Max),
-        _ => None,
-    };
-    anyhow::ensure!(actual.is_some(), "PLAN_UNVERIFIED: unrecognized Devin plan");
-    anyhow::ensure!(
-        actual == Some(plan),
-        "PLAN_MISMATCH: account does not match the pool plan"
-    );
-    anyhow::ensure!(
-        usage.weekly.is_some() && (usage.daily.is_some() == (plan == DevinPlan::Pro)),
-        "PLAN_MISMATCH: incompatible quota window shape"
-    );
-    Ok(())
 }
 fn scheduling(
     account: &OAuthCredential,
@@ -221,22 +217,10 @@ fn scheduling(
     if !account.is_enabled {
         return "disabled";
     }
-    if state.plan_mismatch {
-        return "plan_mismatch";
-    }
-    if config.is_some_and(|c| state.verified_plan != Some(c.plan)) {
-        return "plan_unverified";
-    }
     if account.status != "connected" || account.access_token.is_empty() || state.auth_invalid {
         return "auth_required";
     }
-    let exhausted = state.hard_quota
-        || state.usage.as_ref().is_some_and(|usage| {
-            [&usage.daily, &usage.weekly]
-                .into_iter()
-                .flatten()
-                .any(|window| window.remaining_percent == 0)
-        });
+    let exhausted = state.hard_quota || state.included_exhausted();
     if exhausted {
         if !state.hard_quota
             && config.is_none_or(|c| c.reserve_policy == DevinReservePolicy::Fallback)
@@ -250,11 +234,77 @@ fn scheduling(
         }
         return "quota_exhausted";
     }
-    if state.usage.is_none() {
+    if config.is_some() && state.plan().is_none() {
+        return "plan_unverified";
+    }
+    if !state.usage_complete() {
         "unknown"
     } else {
         "included"
     }
+}
+fn authenticated_account_state(
+    mut usage: DevinUsage,
+    previous: Option<&DevinAccountState>,
+) -> DevinAccountState {
+    let mut fresh = DevinAccountState {
+        verified_plan: Some(usage.normalize_for_pool()),
+        usage: Some(usage),
+        observed_at: Some(Utc::now().timestamp_millis()),
+        ..Default::default()
+    };
+    if let Some(previous) = previous {
+        let quota_blocked = fresh.included_exhausted()
+            || previous.included_exhausted()
+            || (previous.hard_quota
+                && previous.hard_quota_reason.as_deref() != Some("reauthorization_verification"));
+        // A successful login repairs authentication, not established quota evidence.
+        // Keep that distinction through the required post-replacement observation.
+        fresh.hard_quota = true;
+        fresh.hard_quota_reason = Some(
+            if quota_blocked {
+                "quota_reauthorization_verification"
+            } else {
+                "reauthorization_verification"
+            }
+            .into(),
+        );
+    }
+    fresh
+}
+fn apply_usage_snapshot(
+    state: &mut DevinAccountState,
+    mut usage: DevinUsage,
+    config: Option<&DevinPoolConfig>,
+) {
+    let previously_exhausted = state.included_exhausted();
+    state.verified_plan = Some(usage.normalize_for_pool());
+    state.usage = Some(usage);
+    state.observed_at = Some(Utc::now().timestamp_millis());
+    state.usage_stale = false;
+    state.plan_mismatch = false;
+    let reserve_available = config.is_none_or(|c| c.reserve_policy == DevinReservePolicy::Fallback)
+        && state
+            .usage
+            .as_ref()
+            .and_then(|u| u.overage_usd)
+            .is_some_and(|usd| usd > 0.0);
+    // Missing quota windows are not evidence that a prior hard refusal recovered.
+    // Reauthorization's temporary fence only needs an authenticated observation;
+    // every other hard block needs complete, usable quota for the new plan.
+    if state.hard_quota_reason.as_deref() == Some("reauthorization_verification")
+        || (state.usage_complete() && (!state.included_exhausted() || reserve_available))
+    {
+        state.hard_quota = false;
+        state.hard_quota_reason = None;
+    } else if previously_exhausted && !state.usage_complete() {
+        state.hard_quota = true;
+        state
+            .hard_quota_reason
+            .get_or_insert_with(|| "quota_observation_incomplete".into());
+    }
+    // Never revive auth-invalid state or reset rejection_revision here. The raw
+    // state/status-version CAS protects this observation from newer refusals.
 }
 fn safe_account(
     account: &OAuthCredential,
@@ -273,7 +323,7 @@ fn safe_account(
         priority: account.priority,
         status: account.status.clone(),
         status_version: account.status_version,
-        verified_plan: state.verified_plan,
+        verified_plan: state.plan(),
         identity_verified: account
             .subject_id
             .as_deref()
@@ -296,43 +346,61 @@ fn safe_account(
     }
 }
 fn aggregate_window(members: &[&ProviderAccountView], daily: bool) -> PoolQuotaWindow {
+    // Unknown plans remain provisional members: do not guess their capacity or
+    // let their absence turn a partial observation into a complete percentage.
+    let members: Vec<_> = members
+        .iter()
+        .copied()
+        .filter(|a| !daily || a.verified_plan != Some(DevinPlan::Max))
+        .collect();
+    let capacity = |account: &ProviderAccountView| match account.verified_plan {
+        Some(DevinPlan::Pro) => Some(1),
+        Some(DevinPlan::Max) => Some(10),
+        None => None,
+    };
+    let capacity_complete = members.iter().all(|a| a.verified_plan.is_some());
+    let total_units: usize = members.iter().filter_map(|a| capacity(a)).sum();
     let windows: Vec<_> = members
         .iter()
         .filter_map(|a| {
-            if daily {
+            let units = capacity(a)?;
+            let window = if daily {
                 a.daily.as_ref()
             } else {
                 a.weekly.as_ref()
-            }
+            }?;
+            Some((window, units))
         })
         .collect();
     let n = members.len();
     let known = windows.len();
     let subtotal: f64 = windows
         .iter()
-        .map(|w| f64::from(w.remaining_percent) / 100.0)
+        .map(|(w, units)| f64::from(w.remaining_percent) / 100.0 * *units as f64)
         .sum();
-    let complete = n > 0 && n == known;
+    let complete = total_units > 0 && capacity_complete && n == known;
     let next = windows
         .iter()
-        .filter_map(|w| w.resets_at.as_ref())
+        .filter_map(|(w, _)| w.resets_at.as_ref())
         .min()
         .cloned();
     let next_count = next.as_ref().map_or(0, |next| {
         windows
             .iter()
-            .filter(|w| w.resets_at.as_ref() == Some(next))
+            .filter(|(w, _)| w.resets_at.as_ref() == Some(next))
             .count()
     });
-    let all_resets = known == n && n > 0 && windows.iter().all(|w| w.resets_at.is_some());
+    let all_resets = complete && windows.iter().all(|(w, _)| w.resets_at.is_some());
     PoolQuotaWindow {
-        total_units: n,
+        total_accounts: n,
+        capacity_complete,
+        total_units,
         known_accounts: known,
         known_remaining_units: subtotal,
-        used_units: complete.then_some(n as f64 - subtotal),
+        used_units: complete.then_some(total_units as f64 - subtotal),
         remaining_units: complete.then_some(subtotal),
-        used_percent: complete.then(|| 100.0 - subtotal / n as f64 * 100.0),
-        remaining_percent: complete.then(|| subtotal / n as f64 * 100.0),
+        used_percent: complete.then(|| 100.0 - subtotal / total_units as f64 * 100.0),
+        remaining_percent: complete.then(|| subtotal / total_units as f64 * 100.0),
         stale: !complete || members.iter().any(|a| a.stale),
         next_reset_at: next,
         next_reset_accounts: next_count,
@@ -360,6 +428,13 @@ fn pool_view(
         ..Default::default()
     };
     for account in &accounts {
+        if account.status != "disconnected" {
+            match account.verified_plan {
+                Some(DevinPlan::Pro) => counts.pro += 1,
+                Some(DevinPlan::Max) => counts.max += 1,
+                None => counts.unclassified += 1,
+            }
+        }
         match account.scheduling.as_str() {
             "included" => counts.included += 1,
             "reserve" => counts.reserve += 1,
@@ -368,28 +443,22 @@ fn pool_view(
             "disconnected" => counts.disconnected += 1,
             "auth_required" => counts.auth_required += 1,
             "quota_exhausted" => counts.quota_exhausted += 1,
-            "plan_mismatch" => counts.plan_mismatch += 1,
             _ => counts.plan_unverified += 1,
         }
     }
     counts.available = counts.included + counts.reserve + counts.unknown;
     let members: Vec<_> = accounts
         .iter()
-        .filter(|a| {
-            a.is_enabled
-                && a.status != "disconnected"
-                && config
-                    .as_ref()
-                    .is_some_and(|c| a.verified_plan == Some(c.plan))
-                && a.scheduling != "plan_mismatch"
-        })
+        .filter(|a| a.is_enabled && a.status != "disconnected")
         .collect();
     counts.accounting = members.len();
     let quota = AccountPoolQuota {
-        daily: config
-            .as_ref()
-            .filter(|c| c.plan == DevinPlan::Pro)
-            .map(|_| aggregate_window(&members, true)),
+        daily: config.as_ref().and_then(|_| {
+            members
+                .iter()
+                .any(|a| a.verified_plan != Some(DevinPlan::Max))
+                .then(|| aggregate_window(&members, true))
+        }),
         weekly: config.as_ref().map(|_| aggregate_window(&members, false)),
         estimated: true,
     };
@@ -422,8 +491,8 @@ fn pool_view(
 }
 
 impl AdminService {
-    /// New-provider login publishes no credential until its selected plan has
-    /// been authenticated. Existing provider-only login remains a legacy facade.
+    /// New-provider login publishes no credential until status is authenticated.
+    /// Each account is classified independently of the pool scheduling policy.
     pub async fn create_devin_provider_with_pool(
         &self,
         session_id: &str,
@@ -467,14 +536,13 @@ impl AdminService {
             provider_id: provider.id.clone(),
             account_id: None,
             expected_version: None,
-            plan: config.plan,
             fence: 0,
         };
         session.provider_id = Some(provider.id.clone());
         let result = async {
             self.configure_provider_account_pool(&provider.id, config.clone())
                 .await?;
-            self.bind_account_session(&provider, &session, &target, &config, "Default account")
+            self.bind_account_session(&provider, &session, &target, "Default account")
                 .await?;
             Ok(provider.clone())
         }
@@ -520,7 +588,8 @@ impl AdminService {
         self.get_setting(&format!("{POOL_SETTING_PREFIX}{id}"))
             .await?
             .map(|raw| {
-                let config: DevinPoolConfig = serde_json::from_str(&raw)?;
+                let mut config: DevinPoolConfig = serde_json::from_str(&raw)?;
+                config.plan = None;
                 config.validate()?;
                 Ok(config)
             })
@@ -572,24 +641,19 @@ impl AdminService {
     pub async fn configure_provider_account_pool(
         &self,
         id: &str,
-        config: DevinPoolConfig,
+        mut config: DevinPoolConfig,
     ) -> anyhow::Result<AccountPoolView> {
         self.devin_pool_provider(id).await?;
+        config.plan = None;
         config.validate()?;
         // Serialize with all session publications, including first-account adds.
         let controls = self.gw.auth_session_controls.lock().await;
-        let old = self.provider_pool_config(id).await?;
         let accounts = self
             .gw
             .storage
             .oauth_credentials()
             .list_accounts(id)
             .await?;
-        if old.as_ref().is_some_and(|old| old.plan != config.plan)
-            && accounts.iter().any(|a| a.status != "disconnected")
-        {
-            anyhow::bail!("POOL_PLAN_LOCKED: disconnect all accounts before changing the plan");
-        }
         self.gw
             .storage
             .settings()
@@ -616,10 +680,9 @@ impl AdminService {
         expected_version: Option<i32>,
     ) -> anyhow::Result<AuthSessionInitData> {
         let provider = self.devin_pool_provider(id).await?;
-        let config = self
-            .provider_pool_config(id)
+        self.provider_pool_config(id)
             .await?
-            .context("POOL_NOT_CONFIGURED: select a plan before adding accounts")?;
+            .context("POOL_NOT_CONFIGURED: configure the pool before adding accounts")?;
         anyhow::ensure!(
             account_id.is_some() == expected_version.is_some(),
             "Reauthorization requires account_id and expected_version together"
@@ -650,7 +713,6 @@ impl AdminService {
             provider_id: id.into(),
             account_id: account_id.map(str::to_owned),
             expected_version,
-            plan: config.plan,
             fence,
         })?;
         session.provider_id = Some(id.into());
@@ -676,14 +738,12 @@ impl AdminService {
             "ACCOUNT_SESSION_TARGET_MISMATCH"
         );
         super::oauth::validate_oauth_session_for_provider(&preview, &provider)?;
-        let config = self
-            .provider_pool_config(id)
+        self.provider_pool_config(id)
             .await?
             .context("POOL_NOT_CONFIGURED")?;
-        anyhow::ensure!(config.plan == target.plan, "Pool plan changed during login");
         let session = self.take_ready_auth_session_record(session_id).await?;
         let result = self
-            .bind_account_session(&provider, &session, &target, &config, &label)
+            .bind_account_session(&provider, &session, &target, &label)
             .await;
         if result.is_err() {
             self.restore_auth_session_record(session).await?;
@@ -695,7 +755,6 @@ impl AdminService {
         provider: &Provider,
         session: &AuthSession,
         target: &AccountSessionIntent,
-        config: &DevinPoolConfig,
         label: &str,
     ) -> anyhow::Result<ProviderAccountView> {
         anyhow::ensure!(
@@ -734,7 +793,7 @@ impl AdminService {
         let permit = STATUS_CONCURRENCY.acquire().await?;
         let usage = crate::provider::devin::fetch_usage(&self.gw, provider, token.trim()).await?;
         drop(permit);
-        validate_devin_plan(config.plan, &usage)?;
+        let previous_state = previous.as_ref().map(state);
         let mut controls = self.gw.auth_session_controls.lock().await;
         anyhow::ensure!(
             !is_expired_at(session.expires_at.as_deref()),
@@ -747,11 +806,8 @@ impl AdminService {
             "auth session was cancelled or superseded"
         );
         anyhow::ensure!(
-            self.provider_pool_config(&provider.id)
-                .await?
-                .as_ref()
-                .is_some_and(|c| c.plan == config.plan),
-            "Pool plan changed during login"
+            self.provider_pool_config(&provider.id).await?.is_some(),
+            "POOL_NOT_CONFIGURED: pool was removed during login"
         );
         anyhow::ensure!(
             self.account_login_fence(&provider.id).await? == target.fence,
@@ -772,17 +828,11 @@ impl AdminService {
         } else {
             store.create_account(&provider.id, label, input).await?
         };
-        let mut fresh = DevinAccountState::default();
-        fresh.verified_plan = Some(config.plan);
-        fresh.usage = Some(usage);
-        fresh.observed_at = Some(Utc::now().timestamp_millis());
         // The preflight predates the credential replacement. A rejection from
         // an old in-flight request may have landed in that interval. Require a
-        // post-replacement authoritative observation before releasing reauth.
-        if target.account_id.is_some() {
-            fresh.hard_quota = true;
-            fresh.hard_quota_reason = Some("reauthorization_verification".into());
-        }
+        // post-replacement authoritative observation before releasing reauth,
+        // and do not erase established quota blocks with partial observations.
+        let fresh = authenticated_account_state(usage, previous_state.as_ref());
         // Publish only after successful authenticated probe. A failed CAS cannot
         // overwrite a concurrent logout, disable, or newer request outcome.
         let saved = store
@@ -956,20 +1006,7 @@ impl AdminService {
         drop(permit);
         let result_error = match result {
             Ok(usage) => {
-                next.plan_mismatch = config
-                    .as_ref()
-                    .is_some_and(|c| validate_devin_plan(c.plan, &usage).is_err());
-                if !next.plan_mismatch {
-                    if let Some(config) = &config {
-                        next.verified_plan = Some(config.plan);
-                    }
-                }
-                next.usage = Some(usage);
-                next.observed_at = Some(Utc::now().timestamp_millis());
-                next.usage_stale = false;
-                // A usage observation never revives an auth-invalid account.
-                next.hard_quota = false;
-                next.hard_quota_reason = None;
+                apply_usage_snapshot(&mut next, usage, config.as_ref());
                 None
             }
             Err(error) => {
@@ -1050,9 +1087,7 @@ impl AdminService {
         let reserve: Vec<_> = view
             .accounts
             .iter()
-            .filter(|a| {
-                a.is_enabled && a.status != "disconnected" && a.scheduling != "plan_mismatch"
-            })
+            .filter(|a| a.is_enabled && a.status != "disconnected")
             .collect();
         if !reserve.is_empty() && reserve.iter().all(|a| a.reserve_usd.is_some()) {
             let total = reserve.iter().filter_map(|a| a.reserve_usd).sum();
@@ -1067,13 +1102,12 @@ impl AdminService {
             provider_id: view.provider_id.clone(),
             kind: "devin_plan".into(),
             site: "global".into(),
-            level: view.config.as_ref().map(|c| {
-                match c.plan {
-                    DevinPlan::Pro => "Pro",
-                    DevinPlan::Max => "Max",
-                }
-                .into()
-            }),
+            level: match (view.counts.pro > 0, view.counts.max > 0) {
+                (true, true) => Some("Mixed".into()),
+                (true, false) => Some("Pro".into()),
+                (false, true) => Some("Max".into()),
+                (false, false) => None,
+            },
             tiers,
             balances,
             spends: Vec::new(),
@@ -1125,7 +1159,7 @@ mod tests {
     use super::*;
     fn config(plan: DevinPlan) -> DevinPoolConfig {
         DevinPoolConfig {
-            plan,
+            plan: Some(plan),
             strategy: DevinPoolStrategy::RoundRobin,
             session_affinity: true,
             affinity_ttl_seconds: 3600,
@@ -1262,7 +1296,13 @@ mod tests {
             &[account("max", DevinPlan::Max, 0, 50)],
         );
         assert!(max.quota.daily.is_none());
-        assert_eq!(max.quota.weekly.unwrap().remaining_percent, Some(50.0));
+        let weekly = max.quota.weekly.unwrap();
+        assert_eq!(weekly.total_units, 10);
+        assert_eq!(weekly.total_accounts, 1);
+        assert_eq!(weekly.known_accounts, 1);
+        assert_eq!(weekly.next_reset_accounts, 1);
+        assert_eq!(weekly.remaining_units, Some(5.0));
+        assert_eq!(weekly.remaining_percent, Some(50.0));
     }
     #[test]
     fn cross_window_exhaustion_never_becomes_provider_availability() {
@@ -1338,39 +1378,445 @@ mod tests {
             assert!(!serialized.contains(secret), "leaked {secret}");
         }
         mutate(&mut b, |s| s.plan_mismatch = true);
-        assert_eq!(
-            pool_view("pool", Some(config(DevinPlan::Pro)), &[a, b])
-                .counts
-                .accounting,
-            1
-        );
+        let recovered = pool_view("pool", Some(config(DevinPlan::Pro)), &[a, b]);
+        assert_eq!(recovered.counts.accounting, 2);
+        assert_eq!(recovered.counts.available, 2);
+        assert_eq!(recovered.counts.plan_mismatch, 0);
         let empty = pool_view("pool", Some(config(DevinPlan::Pro)), &[]);
-        assert_eq!(empty.quota.daily.unwrap().remaining_percent, None);
+        assert!(empty.quota.daily.is_none());
+        assert_eq!(empty.quota.weekly.unwrap().remaining_percent, None);
     }
     #[test]
-    fn plan_validation_and_policy_defaults_fail_closed() {
-        assert!(validate_devin_plan(DevinPlan::Pro, &usage(DevinPlan::Pro, 0, 0)).is_ok());
-        assert!(validate_devin_plan(DevinPlan::Max, &usage(DevinPlan::Pro, 100, 100)).is_err());
-        let mut snapshot = usage(DevinPlan::Max, 0, 50);
-        snapshot.plan_name = Some("Teams".into());
-        assert!(validate_devin_plan(DevinPlan::Max, &snapshot).is_err());
-        snapshot.plan_name = Some("Max".into());
-        snapshot.daily = Some(DevinQuota {
-            remaining_percent: 0,
-            resets_at_unix: None,
+    fn mixed_weekly_capacity_is_weighted_but_coverage_and_daily_are_account_counts() {
+        let view = pool_view(
+            "pool",
+            Some(config(DevinPlan::Pro)),
+            &[
+                account("a", DevinPlan::Pro, 60, 20),
+                account("b", DevinPlan::Pro, 30, 60),
+                account("max", DevinPlan::Max, 0, 50),
+            ],
+        );
+        assert_eq!(
+            (view.counts.pro, view.counts.max, view.counts.unclassified),
+            (2, 1, 0)
+        );
+        assert_eq!(view.counts.available, 3);
+        let daily = view.quota.daily.unwrap();
+        assert_eq!(
+            (
+                daily.total_accounts,
+                daily.total_units,
+                daily.known_accounts
+            ),
+            (2, 2, 2)
+        );
+        assert!(daily.capacity_complete);
+        assert!((daily.remaining_percent.unwrap() - 45.0).abs() < 1e-9);
+        let weekly = view.quota.weekly.unwrap();
+        assert_eq!(
+            (
+                weekly.total_accounts,
+                weekly.total_units,
+                weekly.known_accounts
+            ),
+            (3, 12, 3)
+        );
+        assert_eq!(weekly.next_reset_accounts, 3);
+        assert_eq!(weekly.reset_mode, "aligned");
+        assert!(weekly.capacity_complete);
+        assert!((weekly.known_remaining_units - 5.8).abs() < 1e-9);
+        assert!((weekly.remaining_units.unwrap() - 5.8).abs() < 1e-9);
+        assert!((weekly.remaining_percent.unwrap() - 48.333333333333336).abs() < 1e-9);
+    }
+    #[test]
+    fn unclassified_members_do_not_guess_pro_or_complete_capacity() {
+        let mut unknown = account("unknown", DevinPlan::Pro, 0, 0);
+        unknown.account_state = "{}".into();
+        let max = account("max", DevinPlan::Max, 0, 50);
+        let view = pool_view("pool", Some(DevinPoolConfig::default()), &[max, unknown]);
+        assert_eq!(
+            (view.counts.pro, view.counts.max, view.counts.unclassified),
+            (0, 1, 1)
+        );
+        assert_eq!(
+            (view.counts.accounting, view.counts.plan_unverified),
+            (2, 1)
+        );
+        assert_eq!(view.counts.unknown, 0);
+        assert_eq!(view.counts.available, 1);
+        let daily = view.quota.daily.unwrap();
+        assert_eq!(
+            (
+                daily.total_accounts,
+                daily.total_units,
+                daily.known_accounts
+            ),
+            (1, 0, 0)
+        );
+        assert!(!daily.capacity_complete);
+        assert_eq!(daily.remaining_percent, None);
+        let weekly = view.quota.weekly.unwrap();
+        assert_eq!(
+            (
+                weekly.total_accounts,
+                weekly.total_units,
+                weekly.known_accounts
+            ),
+            (2, 10, 1)
+        );
+        assert!(!weekly.capacity_complete);
+        assert_eq!(weekly.known_remaining_units, 5.0);
+        assert_eq!(weekly.remaining_units, None);
+        assert_eq!(weekly.used_percent, None);
+        assert_eq!(weekly.next_reset_accounts, 1);
+        assert_eq!(weekly.reset_mode, "unknown");
+    }
+    #[test]
+    fn disabled_members_still_count_types_but_not_quota_capacity() {
+        let pro = account("pro", DevinPlan::Pro, 50, 50);
+        let mut max = account("max", DevinPlan::Max, 0, 50);
+        max.is_enabled = false;
+        let mut unknown = account("unknown", DevinPlan::Pro, 0, 0);
+        unknown.account_state = "{}".into();
+        unknown.is_enabled = false;
+        let mut gone = account("gone", DevinPlan::Max, 0, 100);
+        gone.status = "disconnected".into();
+        let view = pool_view(
+            "pool",
+            Some(DevinPoolConfig::default()),
+            &[pro, max, unknown, gone],
+        );
+        assert_eq!(
+            (view.counts.pro, view.counts.max, view.counts.unclassified),
+            (1, 1, 1)
+        );
+        assert_eq!(
+            (
+                view.counts.disabled,
+                view.counts.disconnected,
+                view.counts.accounting
+            ),
+            (2, 1, 1)
+        );
+        let weekly = view.quota.weekly.unwrap();
+        assert_eq!((weekly.total_units, weekly.total_accounts), (1, 1));
+        assert!(weekly.capacity_complete);
+    }
+    #[test]
+    fn only_explicit_max_names_classify_as_max_and_suppress_daily() {
+        for name in ["Max", "max", " MAX ", "Devin Max", " devin MAX "] {
+            let mut record = account("max", DevinPlan::Pro, 0, 50);
+            mutate(&mut record, |s| {
+                s.usage.as_mut().unwrap().plan_name = Some(name.into())
+            });
+            let view = safe_account(&record, Some(&config(DevinPlan::Pro)));
+            assert_eq!(view.verified_plan, Some(DevinPlan::Max), "{name}");
+            assert_eq!(view.scheduling, "included");
+            assert!(view.daily.is_none());
+        }
+    }
+    #[test]
+    fn successful_status_missing_and_non_max_names_fall_back_to_pro() {
+        for name in [
+            None,
+            Some(""),
+            Some("  "),
+            Some("Pro"),
+            Some("devin pro"),
+            Some("Teams"),
+            Some("Team Full Seat"),
+            Some("unknown-plan"),
+        ] {
+            let mut record = account("pro", DevinPlan::Max, 0, 50);
+            mutate(&mut record, |s| {
+                s.usage = Some(usage(DevinPlan::Pro, 60, 30));
+                s.usage.as_mut().unwrap().plan_name = name.map(str::to_owned);
+            });
+            let view = safe_account(&record, Some(&config(DevinPlan::Max)));
+            assert_eq!(view.verified_plan, Some(DevinPlan::Pro), "{name:?}");
+            assert_eq!(view.scheduling, "included");
+            assert_eq!(view.daily.unwrap().remaining_percent, 60);
+        }
+    }
+    #[test]
+    fn classification_does_not_fabricate_missing_quota_windows() {
+        let mut record = account("pro", DevinPlan::Pro, 50, 50);
+        mutate(&mut record, |s| {
+            let usage = s.usage.as_mut().unwrap();
+            usage.plan_name = None;
+            usage.daily = None;
+            usage.weekly = None;
         });
-        assert!(validate_devin_plan(DevinPlan::Max, &snapshot).is_err());
-        let defaults: DevinPoolConfig = serde_json::from_str("{\"plan\":\"pro\"}").unwrap();
+        let view = pool_view("pool", Some(DevinPoolConfig::default()), &[record]);
+        assert_eq!((view.counts.pro, view.counts.unknown), (1, 1));
+        assert_eq!(view.accounts[0].verified_plan, Some(DevinPlan::Pro));
+        for window in [view.quota.daily.unwrap(), view.quota.weekly.unwrap()] {
+            assert_eq!(
+                (
+                    window.total_units,
+                    window.total_accounts,
+                    window.known_accounts
+                ),
+                (1, 1, 0)
+            );
+            assert!(window.capacity_complete);
+            assert_eq!(window.remaining_percent, None);
+        }
+    }
+    #[test]
+    fn legacy_mismatch_recovers_without_relogin_but_auth_and_hard_quota_remain() {
+        let mut record = account("max", DevinPlan::Pro, 0, 50);
+        mutate(&mut record, |s| {
+            s.plan_mismatch = true;
+            s.usage.as_mut().unwrap().plan_name = Some("Max".into());
+        });
+        let view = pool_view("pool", Some(config(DevinPlan::Pro)), &[record.clone()]);
+        assert_eq!(view.counts.plan_mismatch, 0);
+        assert_eq!(view.counts.available, 1);
+        assert_eq!(view.quota.weekly.unwrap().total_units, 10);
+        mutate(&mut record, |s| s.auth_invalid = true);
+        assert_eq!(safe_account(&record, None).scheduling, "auth_required");
+        mutate(&mut record, |s| {
+            s.auth_invalid = false;
+            s.hard_quota = true;
+        });
+        assert_eq!(safe_account(&record, None).scheduling, "quota_exhausted");
+    }
+    #[test]
+    fn refreshed_upgrade_and_downgrade_reweight_without_isolating_accounts() {
+        let mut record = account("changing", DevinPlan::Pro, 0, 50);
+        mutate(&mut record, |s| {
+            s.hard_quota = true;
+            s.hard_quota_reason = Some("daily_exhausted".into());
+            s.rejection_revision = 7;
+            apply_usage_snapshot(
+                s,
+                usage(DevinPlan::Max, 0, 50),
+                Some(&DevinPoolConfig::default()),
+            );
+        });
+        let upgraded = pool_view("pool", Some(config(DevinPlan::Pro)), &[record.clone()]);
+        assert_eq!(
+            (
+                upgraded.counts.pro,
+                upgraded.counts.max,
+                upgraded.counts.available
+            ),
+            (0, 1, 1)
+        );
+        assert!(upgraded.quota.daily.is_none());
+        assert_eq!(upgraded.quota.weekly.unwrap().total_units, 10);
+        assert_eq!(state(&record).rejection_revision, 7);
+        mutate(&mut record, |s| {
+            apply_usage_snapshot(s, usage(DevinPlan::Pro, 60, 30), None)
+        });
+        let downgraded = pool_view("pool", Some(config(DevinPlan::Max)), &[record]);
+        assert_eq!(
+            (
+                downgraded.counts.pro,
+                downgraded.counts.max,
+                downgraded.counts.available
+            ),
+            (1, 0, 1)
+        );
+        assert_eq!(
+            downgraded.quota.daily.unwrap().remaining_percent,
+            Some(60.0)
+        );
+        assert_eq!(downgraded.quota.weekly.unwrap().total_units, 1);
+    }
+    #[test]
+    fn incomplete_refresh_never_releases_hard_quota_or_auth_failures() {
+        let mut state = DevinAccountState {
+            hard_quota: true,
+            hard_quota_reason: Some("quota_exhausted".into()),
+            auth_invalid: true,
+            rejection_revision: 8,
+            ..Default::default()
+        };
+        let mut incomplete = usage(DevinPlan::Pro, 50, 50);
+        incomplete.daily = None;
+        apply_usage_snapshot(&mut state, incomplete.clone(), None);
+        assert!(state.hard_quota && state.auth_invalid);
+        assert_eq!(state.rejection_revision, 8);
+        assert!(!state.usage_complete());
+        apply_usage_snapshot(&mut state, usage(DevinPlan::Pro, 0, 50), None);
+        assert!(state.hard_quota);
+        state.hard_quota_reason = Some("reauthorization_verification".into());
+        apply_usage_snapshot(&mut state, incomplete, None);
+        assert!(!state.hard_quota);
+        assert!(state.auth_invalid);
+        state.hard_quota = true;
+        state.hard_quota_reason = Some("quota_exhausted".into());
+        let mut reserve = usage(DevinPlan::Pro, 0, 50);
+        reserve.overage_usd = Some(1.0);
+        apply_usage_snapshot(
+            &mut state,
+            reserve.clone(),
+            Some(&DevinPoolConfig::default()),
+        );
+        assert!(state.hard_quota);
+        let policy = DevinPoolConfig {
+            reserve_policy: DevinReservePolicy::Fallback,
+            ..Default::default()
+        };
+        apply_usage_snapshot(&mut state, reserve, Some(&policy));
+        assert!(!state.hard_quota);
+        assert!(state.auth_invalid);
+    }
+    #[test]
+    fn reauthorization_keeps_quota_evidence_until_complete_usable_status() {
+        let mut incomplete = usage(DevinPlan::Pro, 100, 50);
+        incomplete.daily = None;
+        for previous in [
+            DevinAccountState {
+                usage: Some(usage(DevinPlan::Pro, 0, 50)),
+                ..Default::default()
+            },
+            DevinAccountState {
+                hard_quota: true,
+                hard_quota_reason: Some("daily_exhausted".into()),
+                auth_invalid: true,
+                ..Default::default()
+            },
+            DevinAccountState {
+                hard_quota: true,
+                hard_quota_reason: Some("reauthorization_verification".into()),
+                usage: Some(usage(DevinPlan::Pro, 0, 50)),
+                ..Default::default()
+            },
+        ] {
+            let mut fresh = authenticated_account_state(incomplete.clone(), Some(&previous));
+            assert!(!fresh.auth_invalid);
+            assert!(fresh.hard_quota);
+            assert_eq!(
+                fresh.hard_quota_reason.as_deref(),
+                Some("quota_reauthorization_verification")
+            );
+            apply_usage_snapshot(&mut fresh, incomplete.clone(), None);
+            assert!(fresh.hard_quota);
+            apply_usage_snapshot(&mut fresh, usage(DevinPlan::Max, 0, 50), None);
+            assert!(!fresh.hard_quota);
+            assert_eq!(fresh.plan(), Some(DevinPlan::Max));
+        }
+    }
+    #[test]
+    fn reauthorization_preflight_exhaustion_survives_partial_postflight() {
+        let mut fresh = authenticated_account_state(
+            usage(DevinPlan::Pro, 0, 50),
+            Some(&DevinAccountState::default()),
+        );
+        let mut incomplete = usage(DevinPlan::Pro, 100, 50);
+        incomplete.daily = None;
+        apply_usage_snapshot(&mut fresh, incomplete, None);
+        assert!(fresh.hard_quota);
+        assert_eq!(
+            fresh.hard_quota_reason.as_deref(),
+            Some("quota_reauthorization_verification")
+        );
+    }
+    #[test]
+    fn reauthorization_without_quota_evidence_can_release_temporary_fence() {
+        let mut incomplete = usage(DevinPlan::Pro, 100, 50);
+        incomplete.daily = None;
+        for previous in [
+            DevinAccountState {
+                auth_invalid: true,
+                ..Default::default()
+            },
+            DevinAccountState {
+                hard_quota: true,
+                hard_quota_reason: Some("reauthorization_verification".into()),
+                ..Default::default()
+            },
+        ] {
+            let mut fresh = authenticated_account_state(incomplete.clone(), Some(&previous));
+            assert!(!fresh.auth_invalid);
+            assert_eq!(
+                fresh.hard_quota_reason.as_deref(),
+                Some("reauthorization_verification")
+            );
+            apply_usage_snapshot(&mut fresh, incomplete.clone(), None);
+            assert!(!fresh.hard_quota);
+            assert!(!fresh.usage_complete());
+        }
+        let fresh = authenticated_account_state(incomplete, None);
+        assert!(!fresh.hard_quota);
+        assert_eq!(fresh.verified_plan, Some(DevinPlan::Pro));
+    }
+    #[test]
+    fn missing_windows_cannot_erase_previously_observed_exhaustion() {
+        let mut state = DevinAccountState {
+            usage: Some(usage(DevinPlan::Pro, 0, 50)),
+            ..Default::default()
+        };
+        let mut incomplete = usage(DevinPlan::Pro, 100, 50);
+        incomplete.daily = None;
+        apply_usage_snapshot(&mut state, incomplete, None);
+        assert!(state.hard_quota);
+        assert_eq!(
+            state.hard_quota_reason.as_deref(),
+            Some("quota_observation_incomplete")
+        );
+        apply_usage_snapshot(&mut state, usage(DevinPlan::Max, 0, 50), None);
+        assert!(!state.hard_quota);
+        assert_eq!(state.plan(), Some(DevinPlan::Max));
+    }
+    #[tokio::test]
+    async fn provider_usage_level_follows_accounts_not_legacy_selected_plan() {
+        let gw = gateway().await;
+        for (records, expected) in [
+            (vec![account("pro", DevinPlan::Pro, 50, 50)], Some("Pro")),
+            (vec![account("max", DevinPlan::Max, 0, 50)], Some("Max")),
+            (
+                vec![
+                    account("pro", DevinPlan::Pro, 50, 50),
+                    account("max", DevinPlan::Max, 0, 50),
+                ],
+                Some("Mixed"),
+            ),
+            (vec![], None),
+        ] {
+            let view = pool_view("pool", Some(config(DevinPlan::Max)), &records);
+            assert_eq!(
+                gw.admin()
+                    .account_pool_provider_usage(view)
+                    .level
+                    .as_deref(),
+                expected
+            );
+        }
+    }
+    #[test]
+    fn legacy_plan_json_is_read_only_and_default_policy_is_complete() {
+        let mut legacy: DevinPoolConfig = serde_json::from_str("{\"plan\":\"pro\"}").unwrap();
+        assert_eq!(legacy.plan, Some(DevinPlan::Pro));
+        assert!(serde_json::to_value(&legacy).unwrap().get("plan").is_none());
+        legacy.plan = None;
+        let defaults: DevinPoolConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(legacy, defaults);
+        assert_eq!(defaults, DevinPoolConfig::default());
+        assert_eq!(defaults.strategy, DevinPoolStrategy::RoundRobin);
+        assert!(defaults.session_affinity);
         assert_eq!(defaults.max_account_attempts, 3);
         assert_eq!(defaults.affinity_ttl_seconds, 3600);
         assert_eq!(defaults.reserve_policy, DevinReservePolicy::Disabled);
-        assert!(serde_json::from_str::<DevinPoolConfig>("{}").is_err());
         let mut invalid = defaults;
         invalid.max_account_attempts = 0;
         assert!(invalid.validate().is_err());
+        let old_intent: AccountSessionIntent = serde_json::from_value(serde_json::json!({"provider_id":"pool", "account_id":"a", "expected_version":2, "plan":"max", "fence":7})).unwrap();
+        assert_eq!(old_intent.fence, 7);
+        assert_eq!(old_intent.expected_version, Some(2));
+        assert!(
+            serde_json::to_value(old_intent)
+                .unwrap()
+                .get("plan")
+                .is_none()
+        );
     }
     #[tokio::test]
-    async fn settings_cannot_change_populated_plan_and_sessions_have_fixed_targets() {
+    async fn populated_pool_policy_ignores_legacy_plan_and_sessions_keep_fixed_targets() {
         let gw = gateway().await;
         let admin = gw.admin();
         assert!(
@@ -1384,14 +1830,34 @@ mod tests {
             .await
             .unwrap();
         let account = add(&gw, "A").await;
-        let raw = serde_json::to_string(&config(DevinPlan::Max)).unwrap();
+        let raw = r#"{"plan":"max","strategy":"fill_first"}"#;
+        admin
+            .set_setting("provider_account_pool:pool", raw)
+            .await
+            .unwrap();
+        let current = admin.provider_pool_config("pool").await.unwrap().unwrap();
+        assert_eq!(current.plan, None);
+        assert_eq!(current.strategy, DevinPoolStrategy::FillFirst);
+        let stored = admin
+            .get_setting("provider_account_pool:pool")
+            .await
+            .unwrap()
+            .unwrap();
         assert!(
-            admin
-                .set_setting("provider_account_pool:pool", &raw)
-                .await
-                .unwrap_err()
-                .to_string()
-                .contains("POOL_PLAN_LOCKED")
+            serde_json::from_str::<Value>(&stored)
+                .unwrap()
+                .get("plan")
+                .is_none()
+        );
+        // Directly seed a historical row in MemoryStorage to exercise read canonicalization.
+        gw.storage
+            .settings()
+            .set("provider_account_pool:pool", raw)
+            .await
+            .unwrap();
+        assert_eq!(
+            admin.provider_pool_config("pool").await.unwrap().unwrap(),
+            current
         );
         let init = admin
             .init_provider_account_session(
@@ -1470,23 +1936,49 @@ mod tests {
         );
     }
     #[tokio::test]
-    async fn provider_only_management_rejects_ambiguity_but_static_catalog_does_not() {
+    async fn pool_connectivity_handles_all_disabled_while_mutating_legacy_operations_reject_ambiguity()
+     {
         let gw = gateway().await;
         let admin = gw.admin();
-        add(&gw, "A").await;
-        add(&gw, "B").await;
+        admin
+            .configure_provider_account_pool("pool", DevinPoolConfig::default())
+            .await
+            .unwrap();
+        for label in ["A", "B"] {
+            let account = add(&gw, label).await;
+            admin
+                .update_provider_account(
+                    "pool",
+                    &account.account_id,
+                    account.status_version,
+                    OAuthAccountUpdate {
+                        is_enabled: Some(false),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+        }
         admin
             .configure_provider_account_pool("pool", config(DevinPlan::Pro))
             .await
             .unwrap();
         assert!(!admin.get_provider_models("pool").await.unwrap().is_empty());
-        let error = admin.test_provider("pool").await.unwrap_err();
-        assert!(error.to_string().contains("AMBIGUOUS_ACCOUNT"));
+        let result = admin.test_provider("pool").await.unwrap();
+        assert!(!result.success);
+        assert_eq!(result.error.as_deref(), Some("No enabled Devin accounts"));
+        assert_eq!(result.accounts.len(), 2);
+        assert!(
+            result
+                .accounts
+                .iter()
+                .all(|account| account.skipped_reason.as_deref() == Some("disabled"))
+        );
         let error = admin
             .probe_provider_models("pool", Some(vec!["claude-sonnet-4".into()]))
             .await
             .unwrap_err();
-        assert!(error.to_string().contains("AMBIGUOUS_ACCOUNT"));
+        assert!(error.to_string().contains("No enabled Devin accounts"));
         let error = admin.copy_provider("pool").await.unwrap_err();
         assert!(error.to_string().contains("AMBIGUOUS_ACCOUNT"));
         assert_eq!(admin.list_providers().await.unwrap().len(), 1);

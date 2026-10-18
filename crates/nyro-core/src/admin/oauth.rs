@@ -1305,8 +1305,7 @@ impl AdminService {
             anyhow::ensure!(
                 oauth_cred.is_enabled
                     && !state.auth_invalid
-                    && !state.hard_quota
-                    && !state.plan_mismatch,
+                    && !state.hard_quota,
                 "Devin account is unavailable; refresh usage or reauthorize"
             );
             if let Some(config) = self.provider_pool_config(&provider.id).await? {

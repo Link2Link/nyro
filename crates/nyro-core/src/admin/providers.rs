@@ -2080,23 +2080,8 @@ impl AdminService {
     pub async fn test_provider(&self, id: &str) -> anyhow::Result<TestResult> {
         let provider = self.get_provider(id).await?;
         if crate::provider::devin::is_devin(&provider) {
-            // Do not persist one ambiguous account's test as Provider health.
-            self.gw.storage.oauth_credentials().get(id).await?;
-            let start = Instant::now();
-            let outcome = async {
-                validate_admin_provider(&provider)?;
-                let runtime = self.resolve_provider_runtime(&provider).await?;
-                crate::provider::devin::check_connection(&self.gw, &provider, &runtime.access_token)
-                    .await
-            }
-            .await;
-            let result = TestResult {
-                success: outcome.is_ok(),
-                latency_ms: start.elapsed().as_millis() as u64,
-                model: None,
-                error: outcome.err().map(|error| error.to_string()),
-                endpoints: Vec::new(),
-            };
+            validate_admin_provider(&provider)?;
+            let result = self.test_devin_account_connections(&provider).await?;
             self.record_provider_test_result(&provider.id, &result)
                 .await?;
             return Ok(result);
@@ -2125,6 +2110,7 @@ impl AdminService {
                 model: None,
                 error: outcome.err().map(|error| error.to_string()),
                 endpoints: Vec::new(),
+                accounts: Vec::new(),
             };
             self.record_provider_test_result(&provider.id, &result)
                 .await?;
@@ -2161,6 +2147,7 @@ impl AdminService {
                 model: None,
                 error: Some("Base URL is empty".to_string()),
                 endpoints: Vec::new(),
+                accounts: Vec::new(),
             }
         } else {
             let mut failures: Vec<String> = Vec::new();
@@ -2194,6 +2181,7 @@ impl AdminService {
                     model: None,
                     error: None,
                     endpoints: Vec::new(),
+                    accounts: Vec::new(),
                 }
             } else {
                 TestResult {
@@ -2205,6 +2193,7 @@ impl AdminService {
                         failures.join("; ")
                     )),
                     endpoints: Vec::new(),
+                    accounts: Vec::new(),
                 }
             }
         };
@@ -2231,6 +2220,7 @@ impl AdminService {
                 model: None,
                 error: Some("Adaptive provider has no enabled protocol endpoints".to_string()),
                 endpoints: Vec::new(),
+                accounts: Vec::new(),
             });
         }
 
@@ -2281,6 +2271,7 @@ impl AdminService {
                 )
             }),
             endpoints: endpoint_results,
+            accounts: Vec::new(),
         })
     }
 
@@ -2807,17 +2798,78 @@ impl AdminService {
             models.len() <= 16,
             "Devin model probes are limited to 16 models per request"
         );
-        let runtime = self.resolve_provider_runtime(provider).await?;
-        let credential = runtime
-            .credential
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("Devin OAuth credential is missing"))?;
+        // A configured account pool selects accounts per model exactly like
+        // dispatch does; a provider-only lookup would be ambiguous (>1 account).
+        let pool_config = self.provider_pool_config(&provider.id).await?;
+        let accounts = match pool_config {
+            Some(_) => {
+                self.gw
+                    .storage
+                    .oauth_credentials()
+                    .list_accounts(&provider.id)
+                    .await?
+            }
+            None => Vec::new(),
+        };
+        let legacy_credential = if pool_config.is_none() {
+            let runtime = self.resolve_provider_runtime(provider).await?;
+            Some(
+                runtime
+                    .credential
+                    .ok_or_else(|| anyhow::anyhow!("Devin OAuth credential is missing"))?,
+            )
+        } else {
+            None
+        };
+        if pool_config.is_some() {
+            anyhow::ensure!(
+                accounts.iter().any(|account| account.is_enabled
+                    && account.status == "connected"),
+                "No enabled Devin accounts"
+            );
+        }
         let protocol = crate::protocol::ids::DEVIN_CHAT_V1.to_string();
         let mut results = Vec::new();
         for model in models {
             let start = Instant::now();
-            let outcome =
-                crate::provider::devin::probe(&self.gw, provider, credential, &model).await;
+            let outcome = match (&legacy_credential, pool_config.as_ref()) {
+                (Some(credential), _) => {
+                    crate::provider::devin::probe(&self.gw, provider, credential, &model).await
+                }
+                (None, Some(config)) => {
+                    let ordered = self.gw.account_pool.ordered(
+                        &provider.id,
+                        &model,
+                        config,
+                        &accounts,
+                        None,
+                        &std::collections::HashSet::new(),
+                    );
+                    let mut last = Err(anyhow::anyhow!(
+                        "No eligible Devin account for this model"
+                    ));
+                    for account in ordered {
+                        let attempt = async {
+                            let runtime = self
+                                .resolve_provider_account_runtime(provider, &account)
+                                .await?;
+                            let credential = runtime.credential.ok_or_else(|| {
+                                anyhow::anyhow!("Devin OAuth credential is missing")
+                            })?;
+                            crate::provider::devin::probe(&self.gw, provider, &credential, &model)
+                                .await
+                        }
+                        .await;
+                        let done = attempt.is_ok();
+                        last = attempt;
+                        if done {
+                            break;
+                        }
+                    }
+                    last
+                }
+                (None, None) => unreachable!("legacy credential is resolved without a pool"),
+            };
             let (reply, error) = match outcome {
                 Ok(reply) => (Some(reply), None),
                 Err(error) => (None, Some(error.to_string())),
@@ -2898,16 +2950,8 @@ impl AdminService {
 
     async fn devin_provider_models(&self, provider: &Provider) -> anyhow::Result<Vec<String>> {
         validate_admin_provider(provider)?;
-        if self.provider_pool_config(&provider.id).await?.is_some() {
-            // This catalog is static and Provider-scoped. Looking up a random
-            // account here would couple model discovery to incidental health.
-            return Ok(crate::provider::devin::models(provider));
-        }
-        let runtime = self.resolve_provider_runtime(provider).await?;
-        anyhow::ensure!(
-            !runtime.access_token.trim().is_empty(),
-            "Devin OAuth credential is missing"
-        );
+        // The built-in catalog is not an authentication/entitlement probe.
+        // Connectivity reports per-account authentication separately.
         Ok(crate::provider::devin::models(provider))
     }
 
@@ -4249,7 +4293,14 @@ mod devin_admin_tests {
                 .resolve_egress(crate::protocol::ids::OPENAI_COMPATIBLE_EMBEDDINGS_V1)
                 .is_none()
         );
-        assert!(admin.get_provider_models(&provider.id).await.is_err());
+        // Static model suggestions do not prove or require an account login.
+        assert!(
+            !admin
+                .get_provider_models(&provider.id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
         assert!(!admin.test_provider(&provider.id).await.unwrap().success);
         assert!(
             admin

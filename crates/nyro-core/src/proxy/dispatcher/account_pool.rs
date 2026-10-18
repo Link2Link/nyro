@@ -280,6 +280,78 @@ mod tests {
         (gw, provider, accounts)
     }
     #[tokio::test]
+    async fn legacy_pro_pool_admits_max_and_rechecks_dynamic_weekly_exhaustion() {
+        let (gw, provider, accounts) = fixture().await;
+        let max = &accounts[1];
+        let mut state = DevinAccountState::parse(&max.account_state);
+        state.usage.as_mut().unwrap().plan_name = Some("Max".into());
+        state
+            .usage
+            .as_mut()
+            .unwrap()
+            .daily
+            .as_mut()
+            .unwrap()
+            .remaining_percent = 0;
+        state.plan_mismatch = true;
+        let raw = serde_json::to_string(&state).unwrap();
+        assert!(
+            gw.storage
+                .oauth_credentials()
+                .compare_account_state(
+                    "pool",
+                    &max.account_id,
+                    max.status_version,
+                    &max.account_state,
+                    &raw
+                )
+                .await
+                .unwrap()
+        );
+        let request = AiRequest::new("swe-2", vec![]);
+        let all = candidates(&gw, &provider, "swe-2", &request, None, &HashSet::new())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(all.len(), 2);
+        let candidate = all
+            .iter()
+            .find(|a| a.credential.account_id == max.account_id)
+            .unwrap();
+        assert!(candidate.config.plan.is_none());
+        assert!(still_valid(&gw, candidate, "swe-2").await);
+        let mut exhausted = DevinAccountState::parse(&raw);
+        exhausted
+            .usage
+            .as_mut()
+            .unwrap()
+            .weekly
+            .as_mut()
+            .unwrap()
+            .remaining_percent = 0;
+        assert!(
+            gw.storage
+                .oauth_credentials()
+                .compare_account_state(
+                    "pool",
+                    &max.account_id,
+                    max.status_version,
+                    &raw,
+                    &serde_json::to_string(&exhausted).unwrap()
+                )
+                .await
+                .unwrap()
+        );
+        assert!(!still_valid(&gw, candidate, "swe-2").await);
+        let remaining = candidates(&gw, &provider, "swe-2", &request, None, &HashSet::new())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].credential.account_id, accounts[0].account_id);
+    }
+
+    #[tokio::test]
     async fn quota_feedback_is_account_scoped_and_stale_generation_cannot_revoke_reauth() {
         let (gw, provider, accounts) = fixture().await;
         let request = AiRequest::new("swe-2", vec![]);

@@ -649,14 +649,18 @@ async fn create_oauth_provider_handler(
 struct CreateDevinProviderRequest {
     session_id: String,
     input: CreateProvider,
-    config: DevinPoolConfig,
+    config: Option<DevinPoolConfig>,
 }
 
 async fn create_devin_provider_with_pool_handler(
     State(gw): State<Gateway>,
     Json(input): Json<CreateDevinProviderRequest>,
 ) -> impl IntoResponse {
-    match gw.admin().create_devin_provider_with_pool(&input.session_id, input.input, input.config).await {
+    match gw
+        .admin()
+        .create_devin_provider_with_pool(&input.session_id, input.input, input.config.unwrap_or_default())
+        .await
+    {
         Ok(v) => Json(serde_json::json!({ "data": v })).into_response(),
         Err(e) => err(e),
     }
@@ -1390,6 +1394,30 @@ mod tests {
         let add: InitProviderAccountSessionRequest = serde_json::from_value(serde_json::json!({})).unwrap();
         assert!(add.account_id.is_none());
         assert!(add.expected_version.is_none());
+    }
+
+    #[test]
+    fn devin_creation_defaults_without_plan_and_ignores_legacy_plan() {
+        let input = serde_json::json!({
+            "name": "Devin", "vendor": "devin", "protocol": "devin-chat/get-chat-message/v1",
+            "base_url": "https://api.devin.ai", "api_key": "", "auth_mode": "oauth"
+        });
+        let defaults = serde_json::to_value(DevinPoolConfig::default()).unwrap();
+        assert!(defaults.get("plan").is_none());
+        for config in [None, Some(serde_json::Value::Null), Some(defaults.clone())] {
+            let mut request = serde_json::json!({"session_id": "session", "input": input.clone()});
+            if let Some(config) = config {
+                request["config"] = config;
+            }
+            let parsed: CreateDevinProviderRequest = serde_json::from_value(request).unwrap();
+            assert_eq!(serde_json::to_value(parsed.config.unwrap_or_default()).unwrap(), defaults);
+        }
+        let mut legacy = defaults.clone();
+        legacy["plan"] = serde_json::json!("max");
+        let parsed: CreateDevinProviderRequest = serde_json::from_value(serde_json::json!({
+            "session_id": "session", "input": input, "config": legacy
+        })).unwrap();
+        assert_eq!(serde_json::to_value(parsed.config.unwrap()).unwrap(), defaults);
     }
 
     #[test]

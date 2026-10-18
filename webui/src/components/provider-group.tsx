@@ -3,9 +3,13 @@ import { AlertCircle, ChevronRight, Layers } from "lucide-react";
 import { ProviderIcon } from "@/components/ui/provider-icon";
 import type { ProviderGroup as Group } from "@/lib/provider-groups";
 
-export function ProviderGroup({ group, expanded, searching, editing, issueCount, isZh, onToggle, onShowIssues, children }: {
+export function ProviderGroup({ group, expanded, standalone = false, summary, searching, editing, issueCount, isZh, onToggle, onShowIssues, children }: {
   group: Group;
   expanded: boolean;
+  /** Single-provider group: no header, no fold; the row is shown as-is. */
+  standalone?: boolean;
+  /** Usage summary shown in the header only while the group is folded. */
+  summary?: ReactNode;
   searching: boolean;
   editing: boolean;
   issueCount: number;
@@ -16,6 +20,7 @@ export function ProviderGroup({ group, expanded, searching, editing, issueCount,
 }) {
   const id = useId();
   const enabled = group.providers.filter((provider) => provider.is_enabled).length;
+  if (standalone) return <section className="glass rounded-2xl">{children}</section>;
   return (
     <section className="glass rounded-2xl">
       <div className="flex min-h-16 flex-wrap items-center gap-x-3 gap-y-1 px-4 py-2">
@@ -40,6 +45,7 @@ export function ProviderGroup({ group, expanded, searching, editing, issueCount,
             {searching ? (isZh ? `匹配 ${group.matches.length} / 共 ${group.providers.length}` : `${group.matches.length} / ${group.providers.length} matches`) : (isZh ? `${group.providers.length} 个配置` : `${group.providers.length} configs`)}
           </span>
         </button>
+        {!expanded && summary}
         <div className="flex items-center gap-3 pl-7 text-xs sm:pl-0">
           <span className="text-slate-500">{isZh ? "已启用" : "Enabled"} <span className="tabular-nums">{enabled}/{group.providers.length}</span></span>
           {issueCount > 0 && <button type="button" onClick={onShowIssues} className="inline-flex items-center gap-1 rounded-md px-2 py-1 text-orange-600 hover:bg-orange-50 focus-visible:ring-2 focus-visible:ring-ring" title={isZh ? "查看最近测试失败或授权异常的配置" : "View failed tests or authorization issues"}>

@@ -94,6 +94,27 @@ pub(crate) struct DevinUsage {
     pub overage_usd: Option<f64>,
 }
 
+/// Pool classification is deliberately binary: only an explicit Max label is
+/// Max; Pro, Team full seats and every other successful status label use Pro.
+pub(crate) fn classify_plan_name(name: Option<&str>) -> crate::admin::DevinPlan {
+    match name.unwrap_or("").trim().to_ascii_lowercase().as_str() {
+        "max" | "devin max" => crate::admin::DevinPlan::Max,
+        _ => crate::admin::DevinPlan::Pro,
+    }
+}
+
+impl DevinUsage {
+    /// Max has no daily allowance. Remove proto default/legacy daily artifacts
+    /// from the pool view without inventing any weekly remaining percentage.
+    pub(crate) fn normalize_for_pool(&mut self) -> crate::admin::DevinPlan {
+        let plan = classify_plan_name(self.plan_name.as_deref());
+        if plan == crate::admin::DevinPlan::Max {
+            self.daily = None;
+        }
+        plan
+    }
+}
+
 fn window(
     remaining: Option<i32>,
     reset_unix: i64,
@@ -123,9 +144,16 @@ pub(super) fn snapshot(response: StatusResponse) -> anyhow::Result<DevinUsage> {
         .user
         .ok_or_else(|| anyhow::anyhow!("Devin status response contains no user status"))?;
     let status = user.plan_status.unwrap_or_default();
+    let plan_name = response
+        .plan
+        .as_ref()
+        .into_iter()
+        .chain(status.plan.as_ref())
+        .map(|plan| plan.name.trim())
+        .find(|name| !name.is_empty())
+        .map(str::to_owned);
     let plan = response.plan.or(status.plan.clone()).unwrap_or_default();
     let quota_billed = plan.billing_strategy == BILLING_STRATEGY_QUOTA;
-    let plan_name = Some(plan.name.trim().to_string()).filter(|name| !name.is_empty());
 
     let daily = window(
         status.daily_remaining_percent,
@@ -243,6 +271,44 @@ mod tests {
 
         assert_eq!(usage.plan_name.as_deref(), Some("Pro"));
         assert!(usage.daily.is_some());
+    }
+
+    #[test]
+    fn blank_outer_plan_name_uses_nested_max_without_discarding_quota_fields() {
+        let mut status = live_pro_status();
+        status.plan = Some(plan("Max", BILLING_STRATEGY_QUOTA));
+        let mut usage = snapshot(response(plan("  ", BILLING_STRATEGY_QUOTA), status)).unwrap();
+        assert_eq!(usage.plan_name.as_deref(), Some("Max"));
+        assert_eq!(usage.normalize_for_pool(), crate::admin::DevinPlan::Max);
+        assert!(usage.daily.is_none());
+        assert_eq!(usage.weekly.as_ref().unwrap().remaining_percent, 91);
+    }
+
+    #[test]
+    fn only_max_removes_daily_and_non_max_names_keep_pro_observations() {
+        for name in [
+            None,
+            Some(""),
+            Some("Pro"),
+            Some("Team Full Seat"),
+            Some("unknown"),
+        ] {
+            assert_eq!(classify_plan_name(name), crate::admin::DevinPlan::Pro);
+        }
+        for name in ["Max", " max ", " DEVIN MAX "] {
+            assert_eq!(classify_plan_name(Some(name)), crate::admin::DevinPlan::Max);
+        }
+        let mut pro = snapshot(response(
+            plan("Team Full Seat", BILLING_STRATEGY_QUOTA),
+            live_pro_status(),
+        ))
+        .unwrap();
+        assert_eq!(pro.normalize_for_pool(), crate::admin::DevinPlan::Pro);
+        assert!(pro.daily.is_some());
+        pro.plan_name = Some("Max".into());
+        pro.weekly = None;
+        pro.normalize_for_pool();
+        assert!(pro.daily.is_none() && pro.weekly.is_none());
     }
 
     #[test]

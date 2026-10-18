@@ -322,9 +322,15 @@ pub async fn create_oauth_provider(
 
 #[tauri::command]
 pub async fn create_devin_provider_with_pool(
-    gw: State<'_, Gateway>, session_id: String, input: CreateProvider, config: DevinPoolConfig,
+    gw: State<'_, Gateway>,
+    session_id: String,
+    input: CreateProvider,
+    config: Option<DevinPoolConfig>,
 ) -> Result<Provider, String> {
-    gw.admin().create_devin_provider_with_pool(&session_id, input, config).await.map_err(|e| e.to_string())
+    gw.admin()
+        .create_devin_provider_with_pool(&session_id, input, config.unwrap_or_default())
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]

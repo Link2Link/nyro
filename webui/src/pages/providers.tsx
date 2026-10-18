@@ -9,6 +9,7 @@ import { copyToClipboard } from "@/lib/utils";
 import { providerUsageSupported } from "@/lib/provider-usage";
 import { OAuthProgress, OAuthSessionRemaining, OAuthSessionError, DevinLoginNotice, KiroLoginNotice } from "@/components/oauth-session-status";
 import { localizeBackendErrorMessage } from "@/lib/backend-error";
+import { formatAccountTestLogs, formatProviderModelListLog, normalizeCachedProviderTestResult, providerTestError } from "@/lib/provider-test";
 import { invalidateModelRatings } from "@/lib/use-model-ratings";
 import type {
   Provider,
@@ -83,11 +84,10 @@ import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { ProviderGroup } from "@/components/provider-group";
 import { ProviderMoreActions } from "@/components/provider-more-actions";
-import { groupProviders, providerGroupKey, providerNeedsAttention, parseGroupExpansion, isGroupExpanded, PROVIDER_GROUP_STORAGE_KEY } from "@/lib/provider-groups";
-import { ProviderUsageFooter } from "@/components/provider-usage";
+import { groupProviders, isStandaloneGroup, providerGroupKey, providerNeedsAttention, parseGroupExpansion, isGroupExpanded, PROVIDER_GROUP_STORAGE_KEY } from "@/lib/provider-groups";
+import { GroupUsageSummary, ProviderUsageFooter } from "@/components/provider-usage";
 import { DevinAccountPoolCard, DevinAccountPoolPanel } from "@/components/devin-account-pool";
-import { DevinPlanSelect } from "@/components/devin-pool-settings";
-import { newDevinPoolConfig, type DevinPlan } from "@/lib/devin-account-pool";
+import { newDevinPoolConfig } from "@/lib/devin-account-pool";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { resolveProtocol, PROTOCOL_ENDPOINT_TABLE, PROTOCOL_TABLE } from "@/lib/protocol";
 import { openExternalUrl } from "@/lib/open-external";
@@ -848,14 +848,8 @@ function loadProviderTestResults(): Record<string, TestResult> {
 
     const normalized: Record<string, TestResult> = {};
     for (const [id, value] of Object.entries(parsed)) {
-      if (!value || typeof value !== "object" || typeof value.success !== "boolean") continue;
-      normalized[id] = {
-        success: value.success,
-        latency_ms: Number.isFinite(value.latency_ms) ? value.latency_ms : 0,
-        model: typeof value.model === "string" ? value.model : undefined,
-        error: typeof value.error === "string" ? value.error : undefined,
-        endpoints: Array.isArray(value.endpoints) ? value.endpoints : undefined,
-      };
+      const result = normalizeCachedProviderTestResult(value);
+      if (result) normalized[id] = result;
     }
     return normalized;
   } catch {
@@ -907,7 +901,6 @@ export default function ProvidersPage() {
   const [showCreateApiKey, setShowCreateApiKey] = useState(true);
   const [showEditApiKey, setShowEditApiKey] = useState(false);
   const [errorDialog, setErrorDialog] = useState<{ title: string; description?: string } | null>(null);
-  const [createDevinPlan, setCreateDevinPlan] = useState<DevinPlan | "">("");
   const createOAuth = useOAuthSession();
   const { session: createOAuthSession, status: createOAuthStatus, busy: createOAuthBusy } = createOAuth;
   const [createOAuthCallbackUrl, setCreateOAuthCallbackUrl] = useState("");
@@ -954,6 +947,8 @@ export default function ProvidersPage() {
   );
   const searchingProviders = Boolean(providerSearch.trim());
   // Keep an active edit mounted even if its name no longer matches a search.
+  // Single-provider groups render flat and have no fold state to toggle.
+  const foldableGroups = providerGroups.filter((group) => !isStandaloneGroup(group));
   const visibleGroups = providerGroups.filter((group) => group.matches.length || group.providers.some((p) => p.id === editingId));
 
   function revealProvider(provider: Provider) {
@@ -1048,8 +1043,8 @@ export default function ProvidersPage() {
   });
 
   const createOAuthMut = useMutation({
-    mutationFn: ({ sessionId, input, plan }: { sessionId: string; input: CreateProvider; plan?: DevinPlan }) =>
-      plan ? backend<Provider>("create_devin_provider_with_pool", { sessionId, input, config: newDevinPoolConfig(plan) })
+    mutationFn: ({ sessionId, input }: { sessionId: string; input: CreateProvider }) =>
+      isDevinProvider(input) ? backend<Provider>("create_devin_provider_with_pool", { sessionId, input, config: newDevinPoolConfig() })
         : backend<Provider>("create_oauth_provider", { sessionId, input }),
     onSuccess: async (createdProvider: Provider, { sessionId }) => {
       qc.invalidateQueries({ queryKey: ["providers"] });
@@ -1303,10 +1298,16 @@ export default function ProvidersPage() {
       return next;
     });
 
+    let connectivityResult: TestResult | undefined;
     const finish = (result: TestResult, finalMessage: string, level: "success" | "error") => {
       if (isCanceled()) return;
       appendTestLog(level, finalMessage);
-      setTestResult((prev) => ({ ...prev, [provider.id]: result }));
+      // Preserve per-account diagnostics in every outcome, including a later catalog error.
+      setTestResult((prev) => ({ ...prev, [provider.id]: {
+        ...result,
+        endpoints: connectivityResult?.endpoints,
+        accounts: connectivityResult?.accounts,
+      } }));
       void qc.invalidateQueries({ queryKey: ["providers"] });
       setIsTestRunning(false);
       setTestingId(null);
@@ -1332,6 +1333,7 @@ export default function ProvidersPage() {
 
       const connectivity = await backend<TestResult>("test_provider", { id: provider.id });
       if (isCanceled()) return;
+      connectivityResult = connectivity;
 
       connectivity.endpoints?.forEach((endpoint) => {
         if (endpoint.success) {
@@ -1347,8 +1349,12 @@ export default function ProvidersPage() {
         }
       });
 
+      formatAccountTestLogs(connectivity.accounts, isZh).forEach(({ level, message }) => {
+        appendTestLog(level, message);
+      });
+
       if (!connectivity.success) {
-        const reason = connectivity.error ?? (isZh ? "连接失败" : "Connectivity check failed");
+        const reason = providerTestError(connectivity.error, isZh);
         finish(
           {
             success: false,
@@ -1415,7 +1421,7 @@ export default function ProvidersPage() {
 
       appendTestLog(
         "success",
-        `${isZh ? "✓ 认证通过，获取到" : "✓ Auth valid, fetched"} ${models.length} ${isZh ? "个模型" : "models"}`,
+        formatProviderModelListLog(models.length, nativeCatalog, isZh),
       );
       // Large catalogs stay readable: do not flood the dialog with one line per model.
       const logLimit = 50;
@@ -1444,7 +1450,7 @@ export default function ProvidersPage() {
       if (isCanceled()) return;
       const message = normalizeErrorMessage(error);
       finish(
-        { success: false, latency_ms: 0, model: undefined, error: message },
+        { success: false, latency_ms: connectivityResult?.latency_ms ?? 0, model: undefined, error: message },
         `${isZh ? "✗ 测试失败" : "✗ Test failed"}: ${message}`,
         "error",
       );
@@ -1747,7 +1753,6 @@ export default function ProvidersPage() {
     if (!nextPresetId) return;
     resetCreateOAuthState(true);
     setCreateKiroLogin({ method: "google" });
-    setCreateDevinPlan("");
     setSelectedPresetId(nextPresetId);
     const preset = providerPresets.find((item) => item.id === nextPresetId);
     if (!preset) return;
@@ -1917,7 +1922,6 @@ export default function ProvidersPage() {
 
   function closeCreateForm() {
     resetCreateOAuthState(true);
-    setCreateDevinPlan("");
     setCreateKiroLogin({ method: "google" });
     setShowForm(false);
     setShowCreateApiKey(true);
@@ -2146,7 +2150,9 @@ export default function ProvidersPage() {
                 </div>
               )}
               {createIsDevinOAuth && <>
-                <div className="col-span-2"><DevinPlanSelect value={createDevinPlan} onChange={(plan) => { resetCreateOAuthState(); setCreateDevinPlan(plan); }} disabled={createOAuthMut.isPending} /></div>
+                <p className="col-span-2 text-xs text-slate-500">{isZh
+                  ? "账号类型自动识别，无需选择套餐。Pro / Team Full Seat 和 Max 可加入同一账号池。"
+                  : "Account types are detected automatically; no plan selection is needed. Pro / Team Full Seat and Max can share one pool."}</p>
                 <DevinLoginNotice isZh={isZh} />
               </>}
               {createIsKiroOAuth && <>
@@ -2210,7 +2216,7 @@ export default function ProvidersPage() {
                       </p>
                       <div className="mt-3 flex flex-wrap gap-2">
                         {!createOAuthSession || createOAuthStatus?.status === "error" ? (
-                          <Button type="button" onClick={startCreateOAuth} disabled={createOAuthBusy || !selectedPreset || (createIsDevinOAuth && !createDevinPlan) || (createIsKiroOAuth && !kiroLoginConfigured(createKiroLogin))}>
+                          <Button type="button" onClick={startCreateOAuth} disabled={createOAuthBusy || !selectedPreset || (createIsKiroOAuth && !kiroLoginConfigured(createKiroLogin))}>
                             {createOAuthBusy ? (isZh ? "初始化中..." : "Initializing...") : (isZh ? "开始授权" : "Start Authorization")}
                           </Button>
                         ) : (
@@ -2653,8 +2659,7 @@ export default function ProvidersPage() {
                     if (createResolvedAuthMode === "oauth") {
                       const sessionId = createOAuthSession?.session_id;
                       if (!sessionId || !createOAuth.canConsume(sessionId)) return;
-                      if (createIsDevinOAuth && !createDevinPlan) return;
-                      createOAuthMut.mutate({ sessionId, input, ...(createIsDevinOAuth && createDevinPlan ? { plan: createDevinPlan } : {}) });
+                      createOAuthMut.mutate({ sessionId, input });
                       return;
                     }
                     createMut.mutate(input);
@@ -2669,7 +2674,6 @@ export default function ProvidersPage() {
                     || (form.protocol_mode === "adaptive"
                       && !(form.protocol_endpoints ?? []).some((endpoint) => endpoint.is_enabled !== false))
                     || (createResolvedAuthMode === "oauth" && !createOAuthReady)
-                    || (createIsDevinOAuth && !createDevinPlan)
                   }
                 >
                   {(createMut.isPending || createOAuthMut.isPending)
@@ -2708,17 +2712,21 @@ export default function ProvidersPage() {
             </div>
             <div className="flex flex-wrap items-center gap-2 text-xs text-slate-500">
               <span className="mr-2" aria-live="polite">{isZh ? `${providers.length} 个配置 · ${providerGroups.length} 个分组` : `${providers.length} configs · ${providerGroups.length} groups`}</span>
-              <Button size="sm" variant="ghost" disabled={searchingProviders} onClick={() => setExpandedGroups((current) => ({ ...current, ...Object.fromEntries(providerGroups.map((group) => [group.key, true])) }))}>{isZh ? "全部展开" : "Expand all"}</Button>
-              <Button size="sm" variant="ghost" disabled={searchingProviders || Boolean(editingId)} onClick={() => setExpandedGroups((current) => ({ ...current, ...Object.fromEntries(providerGroups.map((group) => [group.key, false])) }))}>{isZh ? "全部收起" : "Collapse all"}</Button>
+              {foldableGroups.length > 0 && <>
+                <Button size="sm" variant="ghost" disabled={searchingProviders} onClick={() => setExpandedGroups((current) => ({ ...current, ...Object.fromEntries(foldableGroups.map((group) => [group.key, true])) }))}>{isZh ? "全部展开" : "Expand all"}</Button>
+                <Button size="sm" variant="ghost" disabled={searchingProviders || Boolean(editingId)} onClick={() => setExpandedGroups((current) => ({ ...current, ...Object.fromEntries(foldableGroups.map((group) => [group.key, false])) }))}>{isZh ? "全部收起" : "Collapse all"}</Button>
+              </>}
             </div>
           </div>
           {visibleGroups.length === 0 && <div className="glass rounded-2xl px-4 py-12 text-center text-sm text-slate-500" role="status">{isZh ? "没有匹配的供应商或配置" : "No matching providers or configurations"}</div>}
           {visibleGroups.map((group) => {
             const editing = group.providers.some((p) => p.id === editingId);
-            const expanded = searchingProviders || editing || isGroupExpanded(group, expandedGroups);
+            const standalone = isStandaloneGroup(group);
+            const expanded = standalone || searchingProviders || editing || isGroupExpanded(group, expandedGroups);
             const issues = group.providers.filter((p) => providerNeedsAttention(p, testResult[p.id]));
             const rows = group.providers.filter((p) => group.matches.includes(p) || p.id === editingId);
-            return <ProviderGroup key={group.key} group={group} expanded={expanded} searching={searchingProviders}
+            return <ProviderGroup key={group.key} group={group} expanded={expanded} standalone={standalone}
+              summary={<GroupUsageSummary providers={group.providers} />} searching={searchingProviders}
               editing={editing} issueCount={issues.length} isZh={isZh}
               onToggle={() => setExpandedGroups((current) => ({ ...current, [group.key]: !expanded }))}
               onShowIssues={() => { if (issues[0]) revealProvider(issues[0]); }}>
@@ -3966,7 +3974,7 @@ export default function ProvidersPage() {
               <div key={p.id} id={`provider-row-${p.id}`} tabIndex={-1} className={`rounded-xl px-4 py-3 outline-none transition-colors motion-reduce:transition-none focus-visible:ring-2 focus-visible:ring-ring ${highlightedProvider === p.id ? "bg-sky-50 ring-1 ring-inset ring-sky-300" : ""}`}>
                 <div className="flex flex-wrap items-center justify-between gap-2">
                   <div className="flex min-w-0 flex-1 items-center gap-3">
-                    {group.key === "custom" && <div className="flex h-9 w-9 items-center justify-center rounded-xl bg-slate-100">
+                    {(group.key === "custom" || standalone) && <div className="flex h-9 w-9 items-center justify-center rounded-xl bg-slate-100">
                       <ProviderIcon
                         iconKey={p.preset_key ?? p.vendor ?? undefined}
                         name={p.name}
@@ -4126,7 +4134,7 @@ export default function ProvidersPage() {
                     </ProviderMoreActions>
                   </div>
                 </div>
-                {isDevinProvider(p) ? <DevinAccountPoolCard provider={p} /> : providerUsageSupported(p) && <ProviderUsageFooter provider={p} compact />}
+                {isDevinProvider(p) ? <DevinAccountPoolCard provider={p} /> : providerUsageSupported(p) && <ProviderUsageFooter provider={p} />}
               </div>
             );
           })}

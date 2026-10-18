@@ -120,3 +120,66 @@ export function tierLabel(name: string, isZh: boolean): string {
   }
   return readableFeatureName(name);
 }
+
+/** One group member's usage query state, as seen by the group header. */
+export interface GroupUsageEntry {
+  name: string;
+  usage?: ProviderUsage | null;
+  failed?: boolean;
+  loading?: boolean;
+}
+
+export interface GroupUsageSummary {
+  /** Members that have a usage backend and are being queried. */
+  tracked: number;
+  /** Highest main-window used percent across members (0-100), if any reported. */
+  peak: { name: string; tier: string; percent: number } | null;
+  /** Per-member worst main-window percent, for the tooltip. */
+  perProvider: { name: string; percent: number }[];
+  paused: number;
+  unavailable: number;
+  failed: number;
+  loading: number;
+  /** Balance totals per currency, only for members without percent tiers. */
+  balances: { currency: string; total: number }[];
+}
+
+/** Worst main-window tier of one usage report. `feature:` tiers are extra
+ * detail, never the routing quota, so they never drive the group summary. */
+function worstMainTier(usage: ProviderUsage): { tier: string; percent: number } | null {
+  let worst: { tier: string; percent: number } | null = null;
+  for (const tier of usage.tiers) {
+    if (tier.name.startsWith("feature:") || !Number.isFinite(tier.used_percent)) continue;
+    const percent = Math.min(Math.max(tier.used_percent, 0), 100);
+    if (!worst || percent > worst.percent) worst = { tier: tier.name, percent };
+  }
+  return worst;
+}
+
+export function summarizeGroupUsage(entries: GroupUsageEntry[]): GroupUsageSummary {
+  const summary: GroupUsageSummary = {
+    tracked: entries.length, peak: null, perProvider: [],
+    paused: 0, unavailable: 0, failed: 0, loading: 0, balances: [],
+  };
+  const totals = new Map<string, number>();
+  for (const { name, usage, failed, loading } of entries) {
+    if (!usage) {
+      if (failed) summary.failed += 1;
+      else if (loading) summary.loading += 1;
+      continue;
+    }
+    if (usage.scheduling?.status === "quota_exhausted") summary.paused += 1;
+    if (usage.is_available === false) summary.unavailable += 1;
+    const worst = worstMainTier(usage);
+    if (worst) {
+      summary.perProvider.push({ name, percent: worst.percent });
+      if (!summary.peak || worst.percent > summary.peak.percent) summary.peak = { name, ...worst };
+    } else {
+      for (const balance of usage.balances ?? []) {
+        if (Number.isFinite(balance.total)) totals.set(balance.currency, (totals.get(balance.currency) ?? 0) + balance.total);
+      }
+    }
+  }
+  summary.balances = [...totals].map(([currency, total]) => ({ currency, total }));
+  return summary;
+}

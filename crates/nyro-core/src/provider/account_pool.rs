@@ -1,4 +1,4 @@
-//! Account-scoped admission and affinity for homogeneous Devin subscriptions.
+//! Account-scoped admission and affinity for mixed Devin subscriptions.
 //! Credentials stay in storage; this registry contains only bounded scheduling
 //! hints. A request always carries an immutable credential generation.
 use std::collections::{HashMap, HashSet};
@@ -33,35 +33,59 @@ pub(crate) struct DevinAccountState {
 
 impl DevinAccountState {
     pub fn parse(raw: &str) -> Self {
-        serde_json::from_str(raw).unwrap_or_default()
+        let mut state: Self = serde_json::from_str(raw).unwrap_or_default();
+        if let Some(usage) = &mut state.usage {
+            state.verified_plan = Some(usage.normalize_for_pool());
+        }
+        // Older homogeneous pools quarantined otherwise valid accounts when
+        // their plan differed from the Provider. That restriction no longer
+        // exists; authentication and quota rejections remain independent.
+        state.plan_mismatch = false;
+        state
+    }
+
+    pub fn plan(&self) -> Option<DevinPlan> {
+        self.usage
+            .as_ref()
+            .map(|usage| super::devin::classify_plan_name(usage.plan_name.as_deref()))
+            .or(self.verified_plan)
+    }
+
+    pub fn included_exhausted(&self) -> bool {
+        self.usage.as_ref().is_some_and(|usage| {
+            (self.plan() != Some(DevinPlan::Max)
+                && usage
+                    .daily
+                    .as_ref()
+                    .is_some_and(|quota| quota.remaining_percent == 0))
+                || usage
+                    .weekly
+                    .as_ref()
+                    .is_some_and(|quota| quota.remaining_percent == 0)
+        })
+    }
+
+    pub fn usage_complete(&self) -> bool {
+        self.usage.as_ref().is_some_and(|usage| {
+            usage.weekly.is_some() && (self.plan() == Some(DevinPlan::Max) || usage.daily.is_some())
+        })
     }
 
     /// Lower class wins. Unknown usage never overrides an explicit hard block.
     pub fn cost_class(&self, config: &DevinPoolConfig) -> Option<u8> {
-        if self.auth_invalid
-            || self.plan_mismatch
-            || self.verified_plan != Some(config.plan)
-            || self.hard_quota
-        {
+        if self.auth_invalid || self.plan().is_none() || self.hard_quota {
             return None;
         }
-        let Some(usage) = &self.usage else {
-            return Some(1);
-        };
-        let depleted = usage
-            .daily
-            .as_ref()
-            .is_some_and(|q| q.remaining_percent == 0)
-            || usage
-                .weekly
-                .as_ref()
-                .is_some_and(|q| q.remaining_percent == 0);
-        if !depleted {
-            return Some(0);
+        if self.included_exhausted() {
+            return (config.reserve_policy == DevinReservePolicy::Fallback
+                && self
+                    .usage
+                    .as_ref()
+                    .and_then(|usage| usage.overage_usd)
+                    .is_some_and(|balance| balance > 0.0))
+            .then_some(2);
         }
-        (config.reserve_policy == DevinReservePolicy::Fallback
-            && usage.overage_usd.is_some_and(|balance| balance > 0.0))
-        .then_some(2)
+        Some(if self.usage_complete() { 0 } else { 1 })
     }
 }
 
@@ -389,7 +413,7 @@ mod tests {
         })).unwrap()
     }
     fn config() -> DevinPoolConfig {
-        serde_json::from_value(serde_json::json!({"plan":"pro"})).unwrap()
+        DevinPoolConfig::default()
     }
     #[test]
     fn round_robin_new_sessions_and_stable_affinity() {
@@ -469,16 +493,76 @@ mod tests {
     #[test]
     fn max_is_weekly_only_and_hard_quota_never_uses_old_reserve() {
         let mut config = config();
-        config.plan = DevinPlan::Max;
         config.reserve_policy = DevinReservePolicy::Fallback;
         let mut state = DevinAccountState::parse(&account("a", 0, 80).account_state);
         state.verified_plan = Some(DevinPlan::Max);
-        state.usage.as_mut().unwrap().daily = None;
+        state.usage.as_mut().unwrap().plan_name = Some("Max".into());
+        // A legacy/proto artifact must not make a Max account daily-blocked.
+        assert!(state.usage.as_ref().unwrap().daily.is_some());
         assert_eq!(state.cost_class(&config), Some(0));
         state.hard_quota = true;
         state.usage.as_mut().unwrap().overage_usd = Some(20.0);
         assert_eq!(state.cost_class(&config), None);
     }
+    #[test]
+    fn mixed_plan_accounts_share_round_robin_without_provider_plan_gate() {
+        let registry = AccountPoolRegistry::default();
+        let mut accounts = vec![account("a", 80, 80), account("b", 0, 80)];
+        let mut max = DevinAccountState::parse(&accounts[1].account_state);
+        max.usage.as_mut().unwrap().plan_name = Some("Max".into());
+        max.plan_mismatch = true; // old Pro-only pool quarantine
+        accounts[1].account_state = serde_json::to_string(&max).unwrap();
+        let config: DevinPoolConfig = serde_json::from_str(r#"{"plan":"pro"}"#).unwrap();
+        let excluded = HashSet::new();
+        assert_eq!(
+            registry.ordered("p", "m", &config, &accounts, Some("one"), &excluded)[0].account_id,
+            "a"
+        );
+        assert_eq!(
+            registry.ordered("p", "m", &config, &accounts, Some("two"), &excluded)[0].account_id,
+            "b"
+        );
+        assert_eq!(
+            registry.ordered("p", "m", &config, &accounts, Some("two"), &excluded)[0].account_id,
+            "b"
+        );
+    }
+
+    #[test]
+    fn old_plan_mismatch_is_cleared_but_hard_failures_survive_normalization() {
+        let mut state = DevinAccountState::parse(&account("a", 0, 80).account_state);
+        state.plan_mismatch = true;
+        state.usage.as_mut().unwrap().plan_name = Some("Max".into());
+        state.auth_invalid = true;
+        state.hard_quota = true;
+        state.rejection_revision = 5;
+        let parsed = DevinAccountState::parse(&serde_json::to_string(&state).unwrap());
+        assert_eq!(parsed.plan(), Some(DevinPlan::Max));
+        assert!(parsed.usage.as_ref().unwrap().daily.is_none());
+        assert!(!parsed.plan_mismatch);
+        assert!(parsed.auth_invalid && parsed.hard_quota);
+        assert_eq!(parsed.rejection_revision, 5);
+        assert_eq!(parsed.cost_class(&config()), None);
+    }
+
+    #[test]
+    fn partial_usage_stays_unknown_and_never_overrides_known_exhaustion() {
+        let mut state = DevinAccountState::parse(&account("a", 90, 90).account_state);
+        state.usage.as_mut().unwrap().weekly = None;
+        assert!(!state.usage_complete());
+        assert_eq!(state.cost_class(&config()), Some(1));
+        state
+            .usage
+            .as_mut()
+            .unwrap()
+            .daily
+            .as_mut()
+            .unwrap()
+            .remaining_percent = 0;
+        assert_eq!(state.cost_class(&config()), None);
+        assert_eq!(DevinAccountState::default().cost_class(&config()), None);
+    }
+
     #[test]
     fn priority_and_fill_first_are_stable_but_exclusions_win() {
         let registry = AccountPoolRegistry::default();

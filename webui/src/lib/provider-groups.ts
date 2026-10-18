@@ -64,6 +64,15 @@ export function parseGroupExpansion(raw: string | null): Record<string, boolean>
   }
 }
 
+/** A single-provider group has nothing to fold: render its row flat, with no
+ * group header, so its usage is visible without an extra click. Decided by
+ * member count only, never by persisted expansion state. */
+export function isStandaloneGroup(group: ProviderGroup): boolean {
+  return group.providers.length === 1;
+}
+
+/** Multi-provider groups default to collapsed; the header carries a usage
+ * summary instead. Standalone groups ignore this entirely. */
 export function isGroupExpanded(group: ProviderGroup, stored: Record<string, boolean>): boolean {
-  return Object.prototype.hasOwnProperty.call(stored, group.key) ? stored[group.key] : group.providers.length === 1;
+  return Object.prototype.hasOwnProperty.call(stored, group.key) ? stored[group.key] : false;
 }

@@ -2,7 +2,8 @@ export type DevinPlan = "pro" | "max";
 
 /** Mirrors the public nyro_core::admin contract. Never store credentials here. */
 export interface DevinPoolConfig {
-  plan: DevinPlan;
+  /** Legacy input only; never use this to determine account types or capacity. */
+  plan?: DevinPlan;
   strategy: "round_robin" | "fill_first";
   session_affinity: boolean;
   affinity_ttl_seconds: number;
@@ -35,7 +36,10 @@ export interface ProviderAccountView {
 }
 
 export interface PoolQuotaWindow {
+  /** Capacity is weighted in Pro-equivalent units, not account count. */
   total_units: number;
+  total_accounts: number;
+  capacity_complete: boolean;
   known_accounts: number;
   known_remaining_units: number;
   used_units: number | null;
@@ -48,16 +52,19 @@ export interface PoolQuotaWindow {
   reset_mode: string;
 }
 
+export interface AccountPoolCounts {
+  total: number; accounting: number; available: number; included: number; reserve: number;
+  pro: number; max: number; unclassified: number;
+  unknown: number; disabled: number; disconnected: number; auth_required: number;
+  quota_exhausted: number; plan_mismatch: number; plan_unverified: number;
+}
+
 export interface AccountPoolView {
   provider_id: string;
   config: DevinPoolConfig | null;
   accounts: ProviderAccountView[];
   quota: { daily: PoolQuotaWindow | null; weekly: PoolQuotaWindow | null; estimated: boolean };
-  counts: {
-    total: number; accounting: number; available: number; included: number; reserve: number;
-    unknown: number; disabled: number; disconnected: number; auth_required: number;
-    quota_exhausted: number; plan_mismatch: number; plan_unverified: number;
-  };
+  counts: AccountPoolCounts;
   readiness: string;
 }
 
@@ -93,15 +100,14 @@ export function canReauthorizeLegacyProvider(pool: AccountPoolView, providerId: 
 export function poolQuotaWindows(pool: AccountPoolView): ["daily" | "weekly", PoolQuotaWindow][] {
   if (!pool.config) return [];
   const windows: ["daily" | "weekly", PoolQuotaWindow][] = [];
-  if (pool.config.plan === "pro" && pool.quota.daily) windows.push(["daily", pool.quota.daily]);
+  if (pool.quota.daily) windows.push(["daily", pool.quota.daily]);
   if (pool.quota.weekly) windows.push(["weekly", pool.quota.weekly]);
   return windows;
 }
 
-/** A plan is deliberately required: missing upstream data must not imply Pro. */
-export function newDevinPoolConfig(plan: DevinPlan): DevinPoolConfig {
+/** Account types are detected upstream; configuration only controls scheduling. */
+export function newDevinPoolConfig(): DevinPoolConfig {
   return {
-    plan,
     strategy: "round_robin",
     session_affinity: true,
     affinity_ttl_seconds: 3600,

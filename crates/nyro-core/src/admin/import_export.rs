@@ -132,7 +132,17 @@ impl AdminService {
                             .strip_prefix(super::account_pool::POOL_SETTING_PREFIX)
                             .is_none_or(|id| provider_ids.contains(id))
                 })
-                .collect(),
+                .map(|(key, value)| {
+                    let value = if key.starts_with(super::account_pool::POOL_SETTING_PREFIX) {
+                        // Legacy selected plans are read compatibility only, not exported policy.
+                        let config: DevinPoolConfig = serde_json::from_str(&value)?;
+                        serde_json::to_string(&config)?
+                    } else {
+                        value
+                    };
+                    Ok((key, value))
+                })
+                .collect::<anyhow::Result<_>>()?,
         })
     }
 

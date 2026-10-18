@@ -502,6 +502,20 @@ export interface TestResult {
   model?: string;
   error?: string;
   endpoints?: EndpointTestResult[];
+  /** Per-account connectivity only; absent in older results. Not a quota or model-access check. */
+  accounts?: AccountTestResult[];
+}
+
+export interface AccountTestResult {
+  account_id: string;
+  label: string;
+  success: boolean;
+  latency_ms: number;
+  /** Safe diagnostic text only; never credentials or raw upstream responses. */
+  error?: string | null;
+  /** disabled | disconnected | account_changed: skipped, not a failed probe. */
+  skipped_reason?: string | null;
+  tested_at: string;
 }
 
 export interface EndpointTestResult {

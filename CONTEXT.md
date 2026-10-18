@@ -18,16 +18,20 @@ _Avoid_: Provider group
 An operator-controlled setting determining whether a Provider Account may participate in its pool. Temporary quota or authorization problems do not change this setting.
 _Avoid_: Account health
 
-**Homogeneous Plan Pool**:
-A Provider Account Pool whose members share the same subscription tier and equal included entitlements for each applicable quota window. A Devin pool is designated Pro, with daily and weekly windows, or Max, with a weekly window only.
-_Avoid_: Mixed-plan pool
+**Mixed Plan Pool**:
+A Provider Account Pool that may contain both Pro-equivalent and Max accounts, without requiring a shared subscription tier. The pool's quota capacity is the sum of its members' allowances after conversion to the same window's Pro-equivalent units.
+_Avoid_: Provider plan
 
-**Account Quota Unit**:
-One full included allowance for one account of a specified plan and quota window. Units add across distinct, independent accounts of that same plan and window, but daily units, weekly units and different plans are not interchangeable.
-_Avoid_: Token allowance when no token-denominated capacity is known
+**Devin Pool Plan Classification**:
+The per-account distinction between explicitly identified Max accounts and all other successfully observed accounts, including Pro and Team Full Seat, which are treated as Pro-equivalent. A missing plan label on a successful observation means Pro-equivalent, whereas an account with no successful observation remains unclassified.
+_Avoid_: Verified subscription identity
+
+**Pro-Equivalent Quota Unit**:
+One full included allowance of a Pro-equivalent account for a specified window. A Max account contributes ten Pro-equivalent weekly units and no daily units; daily and weekly units are not interchangeable.
+_Avoid_: Account count, token allowance when no token-denominated capacity is known
 
 **Pool Quota Utilization**:
-The sum of consumed Account Quota Units divided by the total included capacity of the pool's accounting members for that window. This aggregate describes quota consumption, not the ability of any particular account to accept a request now.
+The sum of consumed Pro-Equivalent Quota Units divided by the total included capacity of the pool's accounting members for that window. This aggregate describes quota consumption, not the ability of any particular account to accept a request now.
 _Avoid_: Scheduling eligibility
 
 ## Provider Enablement

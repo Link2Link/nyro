@@ -1,6 +1,6 @@
 import { deepEqual, equal } from "node:assert/strict";
 import { test } from "node:test";
-import { groupProviders, isGroupExpanded, parseGroupExpansion, providerGroupKey, providerNeedsAttention } from "./provider-groups";
+import { groupProviders, isGroupExpanded, isStandaloneGroup, parseGroupExpansion, providerGroupKey, providerNeedsAttention } from "./provider-groups";
 import type { Provider, ProviderPreset } from "./types";
 
 function provider(id: string, overrides: Partial<Provider> = {}): Provider {
@@ -60,18 +60,19 @@ test("labels use preset locale with English fallback and named custom vendors re
   deepEqual(groupProviders([provider("a", { vendor: "Relay A" }), provider("b", { vendor: "Relay B" })], [], false).map((g) => g.key), ["relay a", "relay b"]);
 });
 
-test("collapse persistence rejects corrupt values, supports special keys, and defaults by size", () => {
+test("collapse persistence rejects corrupt values, supports special keys, and defaults to collapsed for multi-provider groups", () => {
   for (const raw of [null, "invalid", "null", "[]", "true", "42"]) deepEqual(parseGroupExpansion(raw), {});
   deepEqual(parseGroupExpansion('{"openai":false,"google":true,"bad":"yes"}'), { openai: false, google: true });
   const single = groupProviders([provider("one", { vendor: "openai" })], presets, false)[0];
   const multiple = groupProviders([provider("one"), provider("two")], presets, false)[0];
-  equal(isGroupExpanded(single, {}), true);
+  equal(isStandaloneGroup(single), true);
+  equal(isStandaloneGroup(multiple), false);
   equal(isGroupExpanded(multiple, {}), false);
-  equal(isGroupExpanded(single, { openai: false }), false);
+  equal(isGroupExpanded(single, { openai: true }), true);
   equal(isGroupExpanded(multiple, { custom: true }), true);
   const unusual = groupProviders([provider("x", { vendor: "constructor" })], [], false)[0];
-  equal(isGroupExpanded(unusual, {}), true);
-  equal(isGroupExpanded(unusual, parseGroupExpansion('{"constructor":false}')), false);
+  equal(isGroupExpanded(unusual, {}), false);
+  equal(isGroupExpanded(unusual, parseGroupExpansion('{"constructor":true}')), true);
 });
 
 test("attention counts failed tests and OAuth issues, never infers health from enabled state", () => {

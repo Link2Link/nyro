@@ -2,48 +2,34 @@ import { useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { useLocale } from "@/lib/i18n";
-import { type DevinPlan, type DevinPoolConfig } from "@/lib/devin-account-pool";
-
-export function DevinPlanSelect({ value, onChange, disabled = false }: {
-  value: DevinPlan | "";
-  onChange: (plan: DevinPlan) => void;
-  disabled?: boolean;
-}) {
-  const { locale } = useLocale();
-  const isZh = locale === "zh-CN";
-  return <label className="block space-y-1 text-xs font-medium text-slate-600">
-    <span>{isZh ? "套餐（必选）" : "Plan (required)"}</span>
-    <select className="w-full rounded-md border border-slate-300 bg-white px-3 py-2 text-sm" value={value} disabled={disabled}
-      onChange={(event) => { if (event.target.value === "pro" || event.target.value === "max") onChange(event.target.value); }}>
-      <option value="" disabled>{isZh ? "请选择套餐" : "Select a plan"}</option>
-      <option value="pro">Pro</option>
-      <option value="max">Max</option>
-    </select>
-  </label>;
-}
+import { newDevinPoolConfig, type DevinPoolConfig } from "@/lib/devin-account-pool";
 
 /** Local form state only; no account eligibility or quota calculations. */
-export function DevinPoolSettings({ config, hasAccounts, pending, onSave }: {
+export function DevinPoolSettings({ config, pending, onSave }: {
   config: DevinPoolConfig | null;
-  hasAccounts: boolean;
   pending: boolean;
   onSave: (config: DevinPoolConfig) => void;
 }) {
   const { locale } = useLocale();
   const isZh = locale === "zh-CN";
-  const [plan, setPlan] = useState<DevinPlan | "">(config?.plan ?? "");
-  const [draft, setDraft] = useState<Omit<DevinPoolConfig, "plan">>(config ?? {
-    strategy: "round_robin", session_affinity: true, affinity_ttl_seconds: 3600,
-    max_account_attempts: 3, reserve_policy: "disabled",
+  const [draft, setDraft] = useState<Omit<DevinPoolConfig, "plan">>(() => {
+    const defaults = config ?? newDevinPoolConfig();
+    return {
+      strategy: defaults.strategy, session_affinity: defaults.session_affinity,
+      affinity_ttl_seconds: defaults.affinity_ttl_seconds, max_account_attempts: defaults.max_account_attempts,
+      reserve_policy: defaults.reserve_policy,
+    };
   });
-  const valid = plan !== "" && Number.isSafeInteger(draft.affinity_ttl_seconds) && draft.affinity_ttl_seconds > 0 && draft.affinity_ttl_seconds <= 86400
+  const valid = Number.isSafeInteger(draft.affinity_ttl_seconds) && draft.affinity_ttl_seconds > 0 && draft.affinity_ttl_seconds <= 86400
     && Number.isSafeInteger(draft.max_account_attempts) && draft.max_account_attempts > 0 && draft.max_account_attempts <= 8;
-  return <form className="space-y-3" onSubmit={(event) => { event.preventDefault(); if (valid && plan) onSave({ ...draft, plan }); }}>
+  return <form className="space-y-3" onSubmit={(event) => { event.preventDefault(); if (valid) onSave(draft); }}>
     {!config && <p className="rounded-md bg-amber-50 p-2 text-xs text-amber-800">{isZh
-      ? "请选择并验证套餐后再添加账号。此处未配置时保留原单账号路径，不推测套餐或池容量。"
-      : "Select and validate a plan before adding accounts. Until configured, the existing single-account path is preserved without assuming a plan or pool capacity."}</p>}
+      ? "保存默认设置即可启用账号池，随后可添加账号。未启用时保留原单账号使用和重登流程。"
+      : "Save the default settings to enable the pool, then add accounts. Until enabled, the legacy single-account usage and sign-in flow are preserved."}</p>}
+    <p className="text-xs text-slate-600">{isZh
+      ? "账号类型自动识别，Pro / Team Full Seat 与 Max 可混用。Max 无日额度，周容量为 Pro 的 10 倍。"
+      : "Account types are detected automatically. Pro / Team Full Seat and Max can share a pool. Max has no daily quota and 10× Pro weekly capacity."}</p>
     <div className="grid gap-3 sm:grid-cols-2">
-      <DevinPlanSelect value={plan} onChange={setPlan} disabled={pending || (Boolean(config) && hasAccounts)} />
       <label className="space-y-1 text-xs font-medium text-slate-600">
         <span>{isZh ? "调度策略" : "Scheduling strategy"}</span>
         <select className="w-full rounded-md border border-slate-300 bg-white px-3 py-2 text-sm" value={draft.strategy} disabled={pending}

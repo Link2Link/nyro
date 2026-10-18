@@ -15,9 +15,12 @@ test("account HTTP mappings preserve provider/account addressing, intent and CAS
   try {
     const id = "provider/a";
     const accountId = "account/b";
-    const config = newDevinPoolConfig("max");
+    const config = newDevinPoolConfig();
+    equal("plan" in config, false);
     await backend("create_devin_provider_with_pool", { sessionId: "create-session", input: { name: "Devin" }, config });
     deepEqual(requests.shift(), { method: "POST", url: "/api/v1/providers/devin", body: { session_id: "create-session", input: { name: "Devin" }, config } });
+    await backend("create_devin_provider_with_pool", { sessionId: "auto-session", input: { name: "Automatic Devin" } });
+    deepEqual(requests.shift(), { method: "POST", url: "/api/v1/providers/devin", body: { session_id: "auto-session", input: { name: "Automatic Devin" } } });
     equal(await backend("get_provider_account_pool", { id }), null);
     await backend("configure_provider_account_pool", { id, config });
     await backend("init_provider_account_session", { id });

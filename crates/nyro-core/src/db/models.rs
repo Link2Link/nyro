@@ -1619,6 +1619,20 @@ pub struct TestResult {
     pub error: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub endpoints: Vec<EndpointTestResult>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub accounts: Vec<AccountTestResult>,
+}
+
+/// Safe per-account connectivity observations; never includes credential fields.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AccountTestResult {
+    pub account_id: String,
+    pub label: String,
+    pub success: bool,
+    pub latency_ms: u64,
+    pub error: Option<String>,
+    pub skipped_reason: Option<String>,
+    pub tested_at: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
