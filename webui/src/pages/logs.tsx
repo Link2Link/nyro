@@ -688,7 +688,7 @@ export default function LogsPage() {
 }
 
 function ProtocolCell({ value }: { value: string | null | undefined }) {
-  const label = prettyName(value);
+  const label = prettyName(value) ?? (value?.trim() || null);
   if (!label) {
     return <span className="text-slate-400">–</span>;
   }

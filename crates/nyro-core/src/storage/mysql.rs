@@ -1761,7 +1761,7 @@ impl LogStore for MysqlLogStore {
              CAST(COALESCE(SUM(cache_read_tokens), 0) AS SIGNED) AS cache_read_tokens, \
              CAST(SUM(CASE WHEN input_tokens IS NULL OR output_tokens IS NULL THEN 1 ELSE 0 END) AS SIGNED) AS missing_usage_count, \
              CAST(COUNT(cache_read_tokens) AS SIGNED) AS cache_read_reported_count \
-             FROM request_logs WHERE created_at >= ? AND created_at < ? \
+             FROM request_logs WHERE created_at >= ? AND created_at < ? AND provider_id <> '' \
              GROUP BY date, BINARY COALESCE(provider_id, ''), BINARY COALESCE(upstream_model, '') \
              ORDER BY date, BINARY provider_id, BINARY model",
         )

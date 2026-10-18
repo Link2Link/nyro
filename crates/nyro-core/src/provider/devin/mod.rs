@@ -179,24 +179,13 @@ pub(crate) fn validate(provider: &Provider) -> Result<(), GatewayError> {
     Ok(())
 }
 
-/// Curated suggestions, not an account-specific entitlement catalog. User model
-/// overrides allow exact new upstream UIDs without waiting for a Nyro release.
-pub(crate) fn models(provider: &Provider) -> Vec<String> {
-    let configured: Vec<String> = provider
-        .static_models
-        .as_deref()
-        .unwrap_or_default()
-        .split([',', '\n'])
-        .map(str::trim)
-        .filter(|model| !model.is_empty())
-        .map(str::to_string)
-        .collect();
-    if configured.is_empty() {
-        catalog::MODELS
-            .iter()
-            .map(|model| model.to_string())
-            .collect()
-    } else {
-        configured
-    }
+/// The built-in catalog. It is a curated suggestion list, not an
+/// account-specific entitlement catalog. Any per-provider `static_models`
+/// override is deliberately ignored: Devin models always come from the catalog,
+/// and exact upstream UIDs remain usable by naming them in a route.
+pub(crate) fn models(_provider: &Provider) -> Vec<String> {
+    catalog::MODELS
+        .iter()
+        .map(|model| model.to_string())
+        .collect()
 }

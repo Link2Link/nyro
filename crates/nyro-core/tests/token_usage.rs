@@ -412,19 +412,62 @@ async fn token_usage_memory_mode_has_no_retained_logs() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
-async fn token_usage_extreme_supported_dates_and_unknown_identity() -> anyhow::Result<()> {
+async fn token_usage_extreme_supported_dates_and_unknown_model() -> anyhow::Result<()> {
     let storage = storage().await?;
     for (date, expected) in [
         ("1970-01-01T00:00:00Z", "1970-01-01"),
         ("9998-12-31T23:59:59Z", "9998-12-31"),
     ] {
         let at = millis(date);
-        insert(storage.pool(), at, None, None, (None, None, None), 200).await?;
+        // A routed attempt with no recorded upstream model is still real usage.
+        insert(storage.pool(), at, Some("p"), None, (None, None, None), 200).await?;
         let rows = storage.logs().token_usage_days(at, at + 1).await?;
+        assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].date, expected);
-        assert_eq!(rows[0].provider_id, "");
+        assert_eq!(rows[0].provider_id, "p");
         assert_eq!(rows[0].model, "");
         assert_eq!(rows[0].missing_usage_count, 1);
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn token_usage_excludes_pre_routing_rejections_without_provider() -> anyhow::Result<()> {
+    let storage = storage().await?;
+    let at = millis("2024-06-01T00:00:00Z");
+    // `no route for model` rejections log NULL (legacy) or '' provider/model.
+    insert(
+        storage.pool(),
+        at,
+        None,
+        None,
+        (Some(0), Some(0), None),
+        404,
+    )
+    .await?;
+    insert(
+        storage.pool(),
+        at,
+        Some(""),
+        Some(""),
+        (Some(0), Some(0), None),
+        404,
+    )
+    .await?;
+    insert(
+        storage.pool(),
+        at,
+        Some("p"),
+        Some("m"),
+        (Some(5), Some(1), None),
+        200,
+    )
+    .await?;
+    let rows = storage.logs().token_usage_days(at, at + 1).await?;
+    let identities: Vec<_> = rows
+        .iter()
+        .map(|r| (r.provider_id.as_str(), r.model.as_str(), r.request_count))
+        .collect();
+    assert_eq!(identities, vec![("p", "m", 1)]);
     Ok(())
 }

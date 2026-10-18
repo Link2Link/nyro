@@ -129,7 +129,29 @@ export function protocolDisplayName(raw: string | null | undefined): string | nu
  * @deprecated prefer `protocolDisplayName` for new code.
  */
 export function prettyName(raw: string | null | undefined): string | null {
-  return protocolDisplayName(raw);
+  return protocolDisplayName(raw) ?? nativeEgressDisplayName(raw);
+}
+
+/**
+ * Display names for egress-only native transports (Devin / Kiro).
+ *
+ * These are deliberately kept OUT of `PROTOCOL_ALIASES` / `PROTOCOL_TABLE`
+ * so generic provider forms can never select them (see
+ * `native-provider.test.ts`). They still appear as `upstream_protocol` in
+ * request logs, so display call-sites need a label for them.
+ * Mirrors `Protocol::display_name` in crates/nyro-core/src/protocol/ids.rs.
+ */
+const NATIVE_EGRESS_DISPLAY_NAMES: Record<string, string> = {
+  "devin-chat": "Devin Chat",
+  "kiro-chat": "Kiro Chat",
+};
+
+function nativeEgressDisplayName(raw: string | null | undefined): string | null {
+  if (!raw) return null;
+  // Accept both the suite id (`devin-chat`) and the endpoint id
+  // (`devin-chat/get-chat-message/v1`).
+  const suite = raw.trim().toLowerCase().split("/")[0];
+  return NATIVE_EGRESS_DISPLAY_NAMES[suite] ?? null;
 }
 
 // ── ProtocolEndpoint ───────────────────────────────────────────────────────

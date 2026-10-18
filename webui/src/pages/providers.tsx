@@ -2097,17 +2097,6 @@ export default function ProvidersPage() {
               )}
               {createIsDevinOAuth && <>
                 <DevinLoginNotice isZh={isZh} />
-                <div className="col-span-2 space-y-2">
-                  <FieldLabel>{isZh ? "Devin 模型 UID（每行一个）" : "Devin model UIDs (one per line)"}</FieldLabel>
-                  <textarea
-                    className="w-full rounded-md border border-border bg-background px-3 py-2 font-mono text-xs"
-                    rows={4}
-                    value={form.static_models ?? ""}
-                    onChange={(e) => setForm({ ...form, static_models: e.target.value })}
-                    spellCheck={false}
-                  />
-                  <p className="text-xs text-slate-500">{isZh ? "预设只是静态建议，不是账号可用模型保证。可填入账号支持的精确模型 UID。" : "Preset entries are static suggestions, not a guarantee of account access. Enter exact model UIDs supported by your account."}</p>
-                </div>
               </>}
               {createIsKiroOAuth && <>
                 <KiroLoginNotice isZh={isZh} />
@@ -2892,17 +2881,6 @@ export default function ProvidersPage() {
                     </div>
                     {isDevinProvider(editForm) && <>
                       <DevinLoginNotice isZh={isZh} />
-                      <div className="col-span-2 space-y-2">
-                        <FieldLabel>{isZh ? "Devin 模型 UID（每行一个）" : "Devin model UIDs (one per line)"}</FieldLabel>
-                        <textarea
-                          className="w-full rounded-md border border-border bg-background px-3 py-2 font-mono text-xs"
-                          rows={4}
-                          value={editForm.static_models ?? ""}
-                          onChange={(e) => setEditForm({ ...editForm, static_models: e.target.value })}
-                          spellCheck={false}
-                        />
-                        <p className="text-xs text-slate-500">{isZh ? "预设只是静态建议，不是账号可用模型保证。可填入账号支持的精确模型 UID。" : "Preset entries are static suggestions, not a guarantee of account access. Enter exact model UIDs supported by your account."}</p>
-                      </div>
                     </>}
                     {isKiroProvider(editForm) && <>
                       <KiroLoginNotice isZh={isZh} />

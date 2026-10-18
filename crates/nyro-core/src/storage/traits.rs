@@ -230,6 +230,10 @@ pub trait LogStore: Send + Sync {
     ) -> anyhow::Result<Vec<StatsTimeBucket>>;
     /// Sparse UTC days grouped by provider ID and upstream model over the half-open
     /// millisecond range [start_at, end_at). Includes all retained attempts, not final results.
+    /// Excludes rows with no provider (NULL or empty `provider_id`): those are
+    /// pre-routing rejections (e.g. `no route for model`) that never reached an
+    /// upstream, so they carry no billable usage and must not surface as an
+    /// "unknown model" cost entry. They remain visible in the request logs.
     async fn token_usage_days(
         &self,
         start_at: i64,

@@ -1691,7 +1691,7 @@ impl LogStore for SqliteLogStore {
              COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens, \
              SUM(CASE WHEN input_tokens IS NULL OR output_tokens IS NULL THEN 1 ELSE 0 END) AS missing_usage_count, \
              COUNT(cache_read_tokens) AS cache_read_reported_count \
-             FROM request_logs WHERE created_at >= ? AND created_at < ? \
+             FROM request_logs WHERE created_at >= ? AND created_at < ? AND provider_id <> '' \
              GROUP BY date, COALESCE(provider_id, '') COLLATE BINARY, COALESCE(upstream_model, '') COLLATE BINARY \
              ORDER BY date, provider_id COLLATE BINARY, model COLLATE BINARY",
         )

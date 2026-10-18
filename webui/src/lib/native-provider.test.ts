@@ -1,7 +1,14 @@
 import { equal } from "node:assert/strict";
 import { test } from "node:test";
 import { DEVIN_PROTOCOL, KIRO_PROTOCOL, isDevinProvider, isKiroProvider, nativePresetProtocol, nativeProviderProtocol, hasProviderModelCatalog } from "./native-provider";
-import { PROTOCOL_ENDPOINT_TABLE, PROTOCOL_TABLE, resolveProtocol } from "./protocol";
+import { PROTOCOL_ENDPOINT_TABLE, PROTOCOL_TABLE, prettyName, resolveProtocol } from "./protocol";
+
+test("Native egress protocols get a display label without becoming selectable", () => {
+  for (const raw of [DEVIN_PROTOCOL, "devin-chat"]) equal(prettyName(raw), "Devin Chat");
+  for (const raw of [KIRO_PROTOCOL, "kiro-chat"]) equal(prettyName(raw), "Kiro Chat");
+  equal(prettyName("anthropic-messages/messages/2023-06-01"), "Anthropic Messages");
+  equal(prettyName("unknown/x/v1"), null);
+});
 
 test("Devin canonical and persisted suite identity select only its native protocol", () => {
   for (const defaultProtocol of [DEVIN_PROTOCOL, "devin-chat"]) {

@@ -1672,7 +1672,7 @@ impl LogStore for PostgresLogStore {
              COALESCE(SUM(cache_read_tokens), 0)::BIGINT AS cache_read_tokens, \
              SUM(CASE WHEN input_tokens IS NULL OR output_tokens IS NULL THEN 1 ELSE 0 END)::BIGINT AS missing_usage_count, \
              COUNT(cache_read_tokens) AS cache_read_reported_count \
-             FROM request_logs WHERE created_at >= $1 AND created_at < $2 \
+             FROM request_logs WHERE created_at >= $1 AND created_at < $2 AND provider_id <> '' \
              GROUP BY 1, 2, 3, 4 ORDER BY 1, 2, 4",
         )
         .bind(start_at)
