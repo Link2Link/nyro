@@ -140,7 +140,8 @@ async fn execute(
             .get("retry-after")
             .and_then(|value| value.to_str().ok())
             .and_then(|value| value.parse::<u64>().ok());
-        // Bounded classification only; opaque response bytes are never logged.
+        // Bounded classification and a sanitized structured diagnostic only;
+        // opaque response bytes are never logged.
         let mut bytes = Vec::new();
         let mut body = response.bytes_stream();
         while bytes.len() < 16 * 1024 {
@@ -156,6 +157,13 @@ async fn execute(
                 }
                 _ => break,
             }
+        }
+        if let Ok(value) = serde_json::from_slice(&bytes)
+            && let Some(diagnostic) = super::errors::diagnostic(&value, "http_error", token)
+        {
+            control.performance.with_diagnostic(|d| {
+                d.payload_metadata["devin_upstream_error"] = diagnostic;
+            });
         }
         let message = String::from_utf8_lossy(&bytes);
         let error = super::errors::failure(
@@ -177,6 +185,8 @@ async fn execute(
     let cancel = CancellationToken::new();
     let child = cancel.clone();
     let model = actual_model.clone();
+    // Needed only to detect an unlabeled credential echoed in an error message.
+    let diagnostic_token = token.to_owned();
     let worker = tokio::spawn(async move {
         let mut session = stream::Session::new(&model);
         let mut bytes = Box::pin(response.bytes_stream());
@@ -195,6 +205,11 @@ async fn execute(
                 None => session.finish(),
             };
             let failed = batch.is_err();
+            if let Some(diagnostic) = session.take_error_diagnostic(&diagnostic_token) {
+                control.performance.with_diagnostic(|d| {
+                    d.payload_metadata["devin_upstream_error"] = diagnostic;
+                });
+            }
             match &batch {
                 Ok(events) => {
                     for event in events {

@@ -329,6 +329,83 @@ async fn mocked_transport_rejects_truncation_and_error_trailers_without_done() {
 }
 
 #[tokio::test]
+async fn upstream_diagnostics_are_admin_only_sanitized_and_keep_refusal_semantics() {
+    for http_status in [200, 403] {
+        for message in [
+            "Tool web_search is not available",
+            "credential echoed: mock-token",
+        ] {
+            let error_body = serde_json::to_vec(&serde_json::json!({"error": {
+                "code": "permission_denied", "message": message,
+                "details": [{"opaque": "mock-token"}]
+            }}))
+            .unwrap();
+            let body = if http_status == 200 {
+                end(&error_body)
+            } else {
+                error_body
+            };
+            let (url, _captured, server) = mock(http_status, body).await;
+            let control = control();
+            let result = execute(
+                input(true),
+                "claude-sonnet-5-5-max",
+                "mock-token",
+                url,
+                client(&control),
+                control.clone(),
+            )
+            .await;
+            let error = match result {
+                Ok(mut upstream) => {
+                    assert_eq!(upstream.status, 200);
+                    let error = upstream.events.next().await.unwrap().unwrap_err();
+                    while upstream.events.next().await.is_some() {}
+                    error
+                }
+                Err(error) => error,
+            };
+            assert_eq!(error.http_status().as_u16(), 403);
+            assert!(error.account_failure().unwrap().rejected_before_execution);
+            // Neither Debug/Display nor the client-facing error gets upstream text.
+            assert!(!error.to_string().contains(message));
+            assert!(!format!("{error:?}").contains("mock-token"));
+            let response = axum::body::to_bytes(error.render(None).into_body(), 4096)
+                .await
+                .unwrap();
+            let response = String::from_utf8(response.to_vec()).unwrap();
+            assert!(!response.contains(message));
+            let diagnostic = control.performance.diagnostic();
+            let safe = &diagnostic.payload_metadata["devin_upstream_error"];
+            assert_eq!(safe["code"], "permission_denied");
+            assert_eq!(
+                safe["source"],
+                if http_status == 200 {
+                    "connect_trailer"
+                } else {
+                    "http_error"
+                }
+            );
+            assert_eq!(
+                safe["message"],
+                if message.contains("mock-token") {
+                    "Sensitive diagnostic text omitted"
+                } else {
+                    message
+                }
+            );
+            assert!(
+                !serde_json::to_string(&diagnostic)
+                    .unwrap()
+                    .contains("mock-token")
+            );
+            server.abort();
+            let _ = server.await;
+        }
+    }
+}
+
+#[tokio::test]
 async fn mocked_http_401_is_an_explicit_rejection() {
     let (url, _captured, server) = mock(401, b"secret-token".to_vec()).await;
     let control = control();

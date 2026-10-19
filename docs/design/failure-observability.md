@@ -160,6 +160,29 @@ when retained. A model override does not bypass a disabled global switch for
 ordinary traffic. Forced retention means retaining the bounded evidence that was
 actually observed, not guaranteeing four complete bodies or durable persistence.
 
+### Native Devin/Kiro diagnostics
+
+Native IR attempts attach the same pre-hook client request capture and redacted
+headers as HTTP attempts, including failures before a response stream starts.
+The client JSON capture is reserialized JSON (not byte-exact original whitespace)
+and retains the existing size limits and retention gates. Body contents are not
+recursively scrubbed; the admin-only privacy rules below still apply.
+
+Native **upstream** bodies remain digest-only (`encoding: binary`,
+`capture_state: digest_only`), regardless of the payload switch. This is a capture
+policy, not content detection: Kiro's JSON request also uses it. Devin's protobuf
+request embeds credentials, so enabling payload recording must not persist it.
+
+Structured Devin HTTP errors and Connect error trailers additionally expose
+`payload_metadata.devin_upstream_error` with `source`, `code`, `message`, and
+`sanitized: true`. Only code/message are selected; details and opaque bodies are
+excluded. Diagnostic parsing is capped at 16 KiB, retained codes at 64 bytes, and
+messages at 512 UTF-8 bytes. Credential-bearing messages (including an echo of the
+current upstream token) are omitted conservatively. Missing diagnostics do not
+mean no upstream error: malformed or oversized envelopes are omitted. This is
+admin diagnostic metadata, preserved like other failure metadata even when
+payloads are cleared; it does not change public errors, scheduling, or retries.
+
 ### Metadata and UI interpretation
 
 `payload_metadata` is keyed by the eight payload field names (for example

@@ -54,6 +54,8 @@ pub struct Session {
     execution_seen: bool,
     done: bool,
     failed: bool,
+    // Transient parser state only; runtime takes and sanitizes it before logging.
+    error_trailer: Option<Value>,
     thinking_seen: bool,
     text_utf8: Utf8,
     thinking_utf8: Utf8,
@@ -79,6 +81,7 @@ impl Session {
             execution_seen: false,
             done: false,
             failed: false,
+            error_trailer: None,
             thinking_seen: false,
             text_utf8: Utf8::default(),
             thinking_utf8: Utf8::default(),
@@ -97,6 +100,12 @@ impl Session {
     #[cfg(test)]
     pub fn is_done(&self) -> bool {
         self.done
+    }
+
+    pub(super) fn take_error_diagnostic(&mut self, token: &str) -> Option<Value> {
+        self.error_trailer
+            .take()
+            .and_then(|value| super::errors::diagnostic(&value, "connect_trailer", token))
     }
 
     pub(crate) fn usage_provenance(&self) -> crate::performance::NativeUsageProvenance {
@@ -147,7 +156,14 @@ impl Session {
                     self.consume(response, &mut events)?;
                 }
                 Frame::End(payload) => {
-                    validate_trailer_for_phase(&payload, !self.execution_seen)?;
+                    if let Err(error) = validate_trailer_for_phase(&payload, !self.execution_seen) {
+                        // Diagnostic reparsing has its own small budget, independent
+                        // of the protocol's much larger frame-size allowance.
+                        if payload.len() <= 16 * 1024 {
+                            self.error_trailer = serde_json::from_slice(&payload).ok();
+                        }
+                        return Err(error);
+                    }
                     self.complete(&mut events)?;
                 }
             }
@@ -546,6 +562,19 @@ mod tests {
         let mut session = Session::new("test");
         session.push(&text(&[0xe7])).unwrap();
         assert!(session.push(&eos(b"{}")).is_err());
+    }
+
+    #[test]
+    fn oversized_error_trailer_is_not_copied_into_diagnostics() {
+        let trailer = serde_json::json!({"error": {
+            "code": "permission_denied", "message": "a ".repeat(10000)
+        }});
+        let mut session = Session::new("test");
+        let error = session
+            .push(&eos(trailer.to_string().as_bytes()))
+            .unwrap_err();
+        assert_eq!(error.http_status().as_u16(), 403);
+        assert!(session.take_error_diagnostic("test-token").is_none());
     }
 
     #[test]

@@ -1,4 +1,4 @@
-//! Extract allowlisted scheduling facts before throwing away opaque diagnostics.
+//! Keep scheduling facts separate from bounded, admin-only upstream diagnostics.
 use crate::error::{AccountFailure, AccountFailureReason as Reason, GatewayError};
 
 pub(super) fn failure(
@@ -78,6 +78,68 @@ pub(super) fn http_refusal(status: u16, body: &[u8]) -> bool {
         && (message.contains("exhausted") || message.contains("exceeded"))
 }
 
+/// A diagnostic copy, never a wire body or a client-facing error. Unknown fields
+/// (including Connect details/metadata) are deliberately excluded. The actual
+/// credential is checked before truncation, even when echoed without a label.
+pub(super) fn diagnostic(
+    value: &serde_json::Value,
+    source: &str,
+    token: &str,
+) -> Option<serde_json::Value> {
+    let error = value.get("error").unwrap_or(value);
+    let code = error.get("code").and_then(serde_json::Value::as_str);
+    let message = error.get("message").and_then(serde_json::Value::as_str);
+    if code.is_none() && message.is_none() {
+        return None;
+    }
+    let sanitize = |text: &str| {
+        // Refuse oversized opaque diagnostics before allocating normalization
+        // buffers. Connect permits much larger frames than our logging budget.
+        if text.len() > 16 * 1024 {
+            return "Oversized diagnostic text omitted".to_string();
+        }
+        let lower = text.to_ascii_lowercase();
+        if (!token.is_empty() && text.contains(token))
+            || [
+                "basic ",
+                "api-key",
+                "api key",
+                "private key",
+                "://",
+                "cookie",
+                "secret",
+                "token",
+                "credential",
+                "signature",
+                "session",
+                "sk-",
+                "eyj",
+            ]
+            .iter()
+            .any(|marker| lower.contains(marker))
+        {
+            "Sensitive diagnostic text omitted".to_string()
+        } else {
+            crate::logging::diagnostics::sanitize_cause(text)
+        }
+    };
+    // Codes are expected to be a short machine identifier. Do not permit an
+    // opaque upstream string to bypass message redaction through this field.
+    let code = code.map(|code| {
+        if code.len() <= 64 && code.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
+            sanitize(code)
+        } else {
+            "Unrecognized upstream code omitted".into()
+        }
+    });
+    Some(serde_json::json!({
+        "source": source,
+        "code": code,
+        "message": message.map(sanitize),
+        "sanitized": true,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -115,6 +177,73 @@ mod tests {
             br#"{"error":{"code":"permission_denied"}}"#
         ));
     }
+    #[test]
+    fn diagnostics_keep_only_bounded_sanitized_code_and_message() {
+        let value = serde_json::json!({"error": {
+            "code": "permission_denied",
+            "message": "Tool web_search is not available for this request",
+            "details": [{"token": "private-value"}], "metadata": {"secret": "private-value"}
+        }});
+        let safe = diagnostic(&value, "connect_trailer", "private-value").unwrap();
+        assert_eq!(safe["code"], "permission_denied");
+        assert_eq!(
+            safe["message"],
+            "Tool web_search is not available for this request"
+        );
+        assert!(!safe.to_string().contains("private-value"));
+        for message in [
+            "Bearer abc",
+            "Basic abc",
+            "password: abc",
+            "session_cookie=abc",
+            "signature abc",
+            "x-api-key: abc123",
+            "See HTTPS://user:pass@host/?key=abc123",
+            "unlabeled private-value",
+        ] {
+            let safe = diagnostic(
+                &serde_json::json!({"message":message}),
+                "http_error",
+                "private-value",
+            )
+            .unwrap();
+            assert_eq!(
+                safe["message"], "Sensitive diagnostic text omitted",
+                "{message}"
+            );
+        }
+        let long = "错误".repeat(1000);
+        let safe = diagnostic(
+            &serde_json::json!({"code":"permission_denied", "message":long}),
+            "http_error",
+            "private-value",
+        )
+        .unwrap();
+        assert!(safe["message"].as_str().unwrap().len() <= 512);
+        let safe = diagnostic(
+            &serde_json::json!({"message": "a ".repeat(10000)}),
+            "http_error",
+            "",
+        )
+        .unwrap();
+        assert_eq!(safe["message"], "Oversized diagnostic text omitted");
+        let safe = diagnostic(
+            &serde_json::json!({"message":"See https://host/?key=value"}),
+            "http_error",
+            "",
+        )
+        .unwrap();
+        assert!(!safe["message"].as_str().unwrap().contains("key=value"));
+        assert!(diagnostic(&serde_json::json!({"other":"opaque"}), "http_error", "").is_none());
+        let safe = diagnostic(
+            &serde_json::json!({"code":"private-value", "message":"ok"}),
+            "http_error",
+            "private-value",
+        )
+        .unwrap();
+        assert!(!safe.to_string().contains("private-value"));
+    }
+
     #[test]
     fn post_execution_error_never_proves_safe_replay() {
         assert!(

@@ -85,6 +85,14 @@ retain = is_error
 
 已确认异常覆盖全局和模型的普通记录开关。普通 completed/unknown 仍受全局/模型开关控制，开启时使用 **相同上限**。普通流量的模型开关不能绕过关闭的全局开关。“强制保留”指保留实际观察到的有界证据，不保证四个完整正文，也不保证持久化成功。
 
+### Devin/Kiro 原生路径诊断
+
+native IR 尝试与普通 HTTP 路径一样接入 hooks 前的客户端请求捕获和脱敏请求头，包括响应流启动前失败的情况。客户端 JSON 捕获属于重新序列化，不保证原始空白逐字一致；仍遵守既有大小上限和保留开关。正文不递归脱敏，仍适用下方仅管理员可查看的隐私边界。
+
+native **上游**请求/响应继续只存摘要（`encoding: binary`、`capture_state: digest_only`），不因载荷开关开启而保存原文。这是捕获策略，不是内容检测；Kiro 的 JSON 请求也使用此策略。Devin protobuf 请求包含凭证，开启载荷记录不能让它落盘。
+
+结构化 Devin HTTP 错误和 Connect 错误结束帧额外记录 `payload_metadata.devin_upstream_error`，包含 `source`、`code`、`message` 和 `sanitized: true`。仅选择 code/message，不保留 details 或不透明正文。诊断解析限制为 16 KiB，保留的错误码最多 64 字节，消息最多 512 个 UTF-8 字节。含凭证特征或回显当前上游 token 的消息保守省略。诊断缺失不表示上游没有报错：无效或过大的错误结构会被省略。这是管理员诊断元数据，与其他失败元数据一样在清空载荷后仍保留；不改变客户端错误、调度或重试行为。
+
 ### 元数据与界面解释
 
 `payload_metadata` 以八个载荷字段名为键，例如 `client_request_body`、`upstream_response_headers`，每项说明：

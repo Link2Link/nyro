@@ -99,7 +99,29 @@ impl Fixture {
         model: &str,
     ) -> ConversionAttempt {
         let mut ctx = RequestContext::new(ingress, Duration::from_secs(10));
-        let call = CallCtx {
+        let call = self.call_ctx(&ctx, ingress, stream, model);
+        let mut request = AiRequest::new(model, Vec::new());
+        request.stream.enabled = stream;
+        handle_ir_response(
+            upstream,
+            &call,
+            &request_extras(),
+            ToolRoutePlan::default(),
+            &mut ctx,
+            &mut request,
+            &HostContext::new(&self.gw),
+        )
+        .await
+    }
+
+    fn call_ctx<'a>(
+        &'a self,
+        ctx: &RequestContext,
+        ingress: ProtocolId,
+        stream: bool,
+        model: &'a str,
+    ) -> CallCtx<'a> {
+        CallCtx {
             performance: None,
             gw: self.gw.clone(),
             provider: &self.provider,
@@ -121,19 +143,72 @@ impl Fixture {
             route_decision: None,
             start: Instant::now(),
             req_ext: ctx.extensions.clone(),
-        };
-        let mut request = AiRequest::new(model, Vec::new());
-        request.stream.enabled = stream;
-        handle_ir_response(
-            upstream,
-            &call,
-            ToolRoutePlan::default(),
-            &mut ctx,
-            &mut request,
-            &HostContext::new(&self.gw),
-        )
-        .await
+        }
     }
+}
+
+fn request_extras() -> RequestExtras {
+    let headers = std::collections::HashMap::from([
+        ("authorization".into(), "Bearer client-secret".into()),
+        ("x-api-key".into(), "api-key-secret".into()),
+        ("cookie".into(), "session=cookie-secret".into()),
+        ("content-type".into(), "application/json".into()),
+    ]);
+    RequestExtras {
+        method: "POST".into(),
+        path: "/v1/chat/completions".into(),
+        headers: Some(Arc::new(crate::logging::payload::capture_header_map(
+            &headers,
+        ))),
+        body: Some(Arc::new(crate::logging::payload::capture_json(
+            &serde_json::json!({
+                "model": "client-model",
+                "messages": [{"role": "user", "content": "native logging request"}],
+            }),
+            true,
+        ))),
+    }
+}
+
+fn assert_request_extras(row: &crate::logging::LogEntry) {
+    let expected = request_extras();
+    assert_eq!(row.method.as_deref(), Some(expected.method.as_str()));
+    assert_eq!(row.path.as_deref(), Some(expected.path.as_str()));
+    let headers = row
+        .client_request_headers
+        .as_deref()
+        .expect("client headers");
+    let parsed: serde_json::Value = serde_json::from_str(headers).unwrap();
+    for name in ["authorization", "x-api-key", "cookie"] {
+        assert_eq!(parsed[name], "***", "{name} must remain redacted");
+    }
+    assert_eq!(parsed["content-type"], "application/json");
+    for secret in ["client-secret", "api-key-secret", "cookie-secret"] {
+        assert!(!headers.contains(secret));
+    }
+    let capture = expected.body.unwrap();
+    assert_eq!(row.client_request_body, capture.body);
+    assert_eq!(
+        row.diagnostic.payload_metadata["client_request_body"],
+        capture.metadata
+    );
+    assert_eq!(
+        row.diagnostic.payload_metadata["client_request_headers"],
+        expected.headers.unwrap().metadata
+    );
+    assert_eq!(
+        row.diagnostic.payload_metadata["client_request_headers"]["redacted_headers"],
+        3
+    );
+    // The sink still owns retention: attaching captures must not change this gate.
+    assert_eq!(row.enable_payload, Some(false));
+}
+
+async fn next_log(fixture: &mut Fixture) -> crate::logging::LogEntry {
+    tokio::time::timeout(Duration::from_secs(2), fixture.logs.recv())
+        .await
+        .expect("native log must be emitted")
+        .expect("log channel remains open")
 }
 
 fn source(batches: Vec<Result<Vec<AiStreamDelta>, GatewayError>>) -> IrUpstream {
@@ -167,6 +242,100 @@ async fn text(response: Response) -> String {
     .expect("body must terminate")
     .unwrap();
     String::from_utf8(bytes.to_vec()).unwrap()
+}
+
+#[tokio::test]
+async fn native_success_logs_preserve_client_request_extras() {
+    let mut fixture = Fixture::new().await;
+    for stream in [false, true] {
+        let result = fixture
+            .invoke(
+                source(vec![Ok(vec![
+                    start("fixture"),
+                    AiStreamDelta::TextDelta("answer".into()),
+                    done(),
+                ])]),
+                OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1,
+                stream,
+                "fixture",
+            )
+            .await;
+        assert_eq!(result.response.status(), StatusCode::OK);
+        assert!(text(result.response).await.contains("answer"));
+        let row = next_log(&mut fixture).await;
+        assert_eq!(row.client_status_code, 200);
+        assert_eq!(row.is_stream, stream);
+        assert_request_extras(&row);
+    }
+}
+
+#[tokio::test]
+async fn native_handler_failure_logs_preserve_client_request_extras() {
+    let mut fixture = Fixture::new().await;
+    for stream in [false, true] {
+        for after_payload in [false, true] {
+            let mut batches = vec![Ok(vec![start("fixture")])];
+            if after_payload {
+                batches.push(Ok(vec![AiStreamDelta::TextDelta("partial".into())]));
+            }
+            batches.push(Err(invalid_ir("native fixture failure")));
+            let result = fixture
+                .invoke(
+                    source(batches),
+                    OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1,
+                    stream,
+                    "fixture",
+                )
+                .await;
+            let expected_status = if stream && after_payload { 200 } else { 502 };
+            assert_eq!(result.response.status().as_u16(), expected_status);
+            let _ = text(result.response).await;
+            let row = next_log(&mut fixture).await;
+            assert_eq!(row.client_status_code, i32::from(expected_status));
+            assert_eq!(row.diagnostic.attempt_outcome, "failed");
+            assert_request_extras(&row);
+        }
+    }
+}
+
+#[tokio::test]
+async fn native_start_error_log_preserves_client_request_extras() {
+    let mut fixture = Fixture::new().await;
+    let ingress = OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1;
+    let ctx = RequestContext::new(ingress, Duration::from_secs(10));
+    let performance = crate::performance::Attempt::new(
+        fixture.gw.log_tx.clone(),
+        ctx.cancellation.clone(),
+        ctx.deadline.clone(),
+    );
+    performance.configure_native_stream();
+    performance.correlate(&ctx.request_id, 1);
+    let mut call = fixture.call_ctx(&ctx, ingress, true, "claude-sonnet-5-5");
+    call.performance = Some(performance.clone());
+    let mut request = AiRequest::new("claude-sonnet-5-5", Vec::new());
+    request.reasoning.effort = Some(crate::protocol::ir::ReasoningEffort::High);
+    let error = invalid_ir("native start failed");
+    performance.record_failure(
+        "failed",
+        "native_upstream_error",
+        "upstream_request",
+        &error,
+    );
+    // Exercise the exact log emitter used by the dispatcher's start_ir Err arm,
+    // without real OAuth credentials or any native upstream network calls.
+    super::super::log_native_start_error(&call, &request_extras(), &request, &error);
+    let row = next_log(&mut fixture).await;
+    assert_eq!(row.client_status_code, 502);
+    assert_eq!(
+        row.diagnostic.failure_stage.as_deref(),
+        Some("upstream_request")
+    );
+    assert_eq!(row.upstream_model, "claude-sonnet-5-5-high");
+    assert_eq!(
+        row.diagnostic.payload_metadata["devin_model_route"]["upstream_model"],
+        "claude-sonnet-5-5-high"
+    );
+    assert_request_extras(&row);
 }
 
 #[tokio::test]

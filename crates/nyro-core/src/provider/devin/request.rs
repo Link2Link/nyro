@@ -101,6 +101,11 @@ pub fn encode(
                         ContentBlock::Image { source: media, .. } => {
                             prompt.images.push(image(media)?)
                         }
+                        // Anthropic server-executed tools (web_search …) cannot run
+                        // on Devin; replayed history of them is dropped, the
+                        // assistant text that summarised the result stays.
+                        ContentBlock::ServerToolUse { .. }
+                        | ContentBlock::ServerToolResult { .. } => {}
                         ContentBlock::Thinking {
                             thinking,
                             signature,
@@ -190,6 +195,11 @@ pub fn encode(
     let mut names = HashSet::new();
     if !matches!(request.tool_choice, Some(ToolChoice::None)) {
         for tool in request.tools.iter().flatten() {
+            // Sentinel for an Anthropic/Responses server tool (`web_search_…`);
+            // Devin has no equivalent, so it is not advertised (like Kiro).
+            if tool.name.starts_with("__builtin__") {
+                continue;
+            }
             if tool.is_custom() || tool.namespace.is_some() {
                 return Err(unsupported("tools.custom_or_namespace"));
             }
@@ -327,15 +337,17 @@ fn validate_options(request: &AiRequest) -> Result<(), GatewayError> {
         {
             return Err(unsupported("responses stateful/generation extensions"));
         }
+        // Server-side tools (e.g. Claude Code's web_search) cannot run on
+        // Devin; clients advertise them on every request, so they are ignored
+        // rather than rejected.
         Some(ProtocolExt::Anthropic(ext))
             if ext.container.is_some()
-                || ext.server_tools.as_ref().is_some_and(|v| !v.is_empty())
                 || ext
                     .output_config
                     .as_ref()
                     .is_some_and(|v| v.get("format").is_some()) =>
         {
-            return Err(unsupported("anthropic server tools/output format"));
+            return Err(unsupported("anthropic container/output format"));
         }
         Some(ProtocolExt::Google(ext))
             if ext.candidate_count.is_some_and(|n| n != 1)
@@ -776,6 +788,45 @@ mod tests {
             json!({"text":"business","other":1})
         );
         assert_eq!(body.tools[0].parameters, br#"{"type":"object"}"#);
+    }
+    #[test]
+    fn server_tools_are_ignored_not_rejected() {
+        let mut request = request();
+        request.ext = Some(ProtocolExt::Anthropic(crate::protocol::ir::AnthropicExt {
+            server_tools: Some(vec![json!({"type":"web_search_20250305"})]),
+            ..Default::default()
+        }));
+        request.tools = Some(vec![
+            ToolSpec {
+                name: "__builtin__web_search_20250305".into(),
+                namespace: None,
+                description: None,
+                kind: ToolSpecKind::Function,
+                parameters: json!({}),
+                strict: None,
+                cache_control: None,
+                meta: None,
+            },
+            ToolSpec {
+                name: "lookup".into(),
+                namespace: None,
+                description: None,
+                kind: ToolSpecKind::Function,
+                parameters: json!({"type":"object"}),
+                strict: None,
+                cache_control: None,
+                meta: None,
+            },
+        ]);
+        let body = decoded(&request);
+        assert_eq!(body.tools.len(), 1);
+        assert_eq!(body.tools[0].name, "lookup");
+        // container / output format are still rejected.
+        request.ext = Some(ProtocolExt::Anthropic(crate::protocol::ir::AnthropicExt {
+            output_config: Some(json!({"format":{"type":"json_schema"}})),
+            ..Default::default()
+        }));
+        assert!(encode(&request, "secret", "swe-2-high").is_err());
     }
     #[test]
     fn inline_images_and_unsupported_inputs() {

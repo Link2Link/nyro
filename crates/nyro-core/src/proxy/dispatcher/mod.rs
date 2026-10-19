@@ -1287,6 +1287,7 @@ async fn dispatch_pipeline_inner(
                     ir_response::handle_ir_response(
                         upstream,
                         &call_ctx,
+                        &req_extras,
                         tool_route_plan,
                         ctx,
                         &mut upstream_request,
@@ -1309,23 +1310,7 @@ async fn dispatch_pipeline_inner(
                         _ => ("failed", "native_upstream_error"),
                     };
                     performance.record_failure(outcome, kind, "upstream_request", &error);
-                    // `from_ctx` carries the route target (a bare family such as
-                    // `claude-sonnet-5-5`); label the failure with the wire UID
-                    // `execute` resolved, matching what a success would report.
-                    let mut failure_log = LogBuilder::from_ctx(&call_ctx);
-                    let wire_model = crate::provider::devin::resolve_wire_model(
-                        &actual_model,
-                        &upstream_request.reasoning,
-                    );
-                    failure_log.diagnostic.payload_metadata["devin_model_route"] = serde_json::json!({
-                        "requested_model": actual_model,
-                        "upstream_model": wire_model,
-                    });
-                    failure_log.upstream_model = wire_model;
-                    failure_log
-                        .status(error.http_status().as_u16())
-                        .error(error.to_string())
-                        .emit();
+                    log_native_start_error(&call_ctx, &req_extras, &upstream_request, &error);
                     // Explicit rejection is different from an ambiguous accepted
                     // Run. Never let an unknown post-submit failure replay.
                     let retry = if !control.is_submitted()
@@ -2062,14 +2047,35 @@ struct CallCtx<'a> {
     req_ext: ContextBag,
 }
 
-/// Owned request HTTP metadata kept for log entries. Used by the non-stream
-/// and stream handlers (not the force-stream handler which omits request
-/// details from its log path).
+/// Owned request HTTP metadata kept for log entries. Shared by HTTP response
+/// handlers and native IR attempts, including failures before a stream starts.
 struct RequestExtras {
     method: String,
     path: String,
     headers: Option<Arc<crate::logging::payload::CapturedHeaders>>,
     body: Option<Arc<crate::logging::payload::CapturedPayload>>,
+}
+
+fn log_native_start_error(
+    call_ctx: &CallCtx<'_>,
+    req_extras: &RequestExtras,
+    request: &AiRequest,
+    error: &GatewayError,
+) {
+    // `from_ctx` carries the route target (a bare family such as
+    // `claude-sonnet-5-5`); label the failure with the wire UID
+    // `execute` resolved, matching what a success would report.
+    let mut log = LogBuilder::from_ctx(call_ctx).with_req_extras(req_extras);
+    let wire_model =
+        crate::provider::devin::resolve_wire_model(call_ctx.actual_model, &request.reasoning);
+    log.diagnostic.payload_metadata["devin_model_route"] = serde_json::json!({
+        "requested_model": call_ctx.actual_model,
+        "upstream_model": wire_model,
+    });
+    log.upstream_model = wire_model;
+    log.status(error.http_status().as_u16())
+        .error(error.to_string())
+        .emit();
 }
 
 // ── Log builder ───────────────────────────────────────────────────────────────

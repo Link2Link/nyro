@@ -24,7 +24,7 @@ use crate::proxy::context::RequestContext;
 use super::buffered::{BufferedFinalize, finalize_buffered_response};
 use super::stream_probe::stream_delta_is_payload;
 use super::streaming::{IrTerminalState, StreamHookState, validate_decoded_batch};
-use super::{CallCtx, LogBuilder, StreamResponseAccumulator};
+use super::{CallCtx, LogBuilder, RequestExtras, StreamResponseAccumulator};
 
 const MAX_PRECOMMIT_DELTAS: usize = 2048;
 const LIMITATIONS: &str = "system_best_effort,inline_images_only,tools_buffered";
@@ -175,6 +175,7 @@ async fn precommit(
 pub(super) async fn handle_ir_response(
     upstream: IrUpstream,
     call_ctx: &CallCtx<'_>,
+    req_extras: &RequestExtras,
     tool_route_plan: ToolRoutePlan,
     req_ctx: &mut RequestContext,
     req_ir: &mut AiRequest,
@@ -191,6 +192,7 @@ pub(super) async fn handle_ir_response(
     } = upstream;
     let started = Instant::now();
     let mut log = LogBuilder::from_ctx(call_ctx)
+        .with_req_extras(req_extras)
         .upstream_url(&url)
         .upstream_status(i32::from(status))
         .upstream_resp_headers(crate::proxy::observability::headers_to_json(&headers));
