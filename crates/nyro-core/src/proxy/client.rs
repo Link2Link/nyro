@@ -15,6 +15,7 @@ use serde_json::Value;
 
 mod timeouts;
 use crate::config::UpstreamTimeouts;
+use crate::db::models::Provider;
 use crate::proxy::context::Deadline;
 use timeouts::{TimedReadStream, bounded_timeout};
 pub use timeouts::{UpstreamReadError, UpstreamTimeoutPhase};
@@ -350,6 +351,34 @@ async fn read_body_with_limit(response: ObservedResponse, limit: usize) -> Resul
 /// that just reset the handshake, short enough to stay inside one user turn.
 const TRANSIENT_CONNECT_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_millis(250);
 
+/// How many extra connect attempts a provider's channel may make.
+///
+/// These channels are reached through whatever DNS the host uses. On a
+/// fake-ip proxy the first TLS handshake of a fresh connection is
+/// occasionally reset (`tls handshake eof`) before the HTTP request is
+/// written — observed in production against `cli-chat-proxy.grok.com`
+/// (xai/grok) and `server.codeium.com` (devin/cli). The route usually has
+/// a single warm candidate, and a connect failure proves the body was not
+/// sent, so replaying such a channel once is safe. Other vendors and
+/// channels stay single-attempt until they show the same signature.
+pub(crate) fn transient_connect_retries(provider: &Provider) -> u8 {
+    let is_channel = |vendor: &str, channel: &str| {
+        provider
+            .vendor
+            .as_deref()
+            .is_some_and(|v| v.eq_ignore_ascii_case(vendor))
+            && provider
+                .channel
+                .as_deref()
+                .is_some_and(|c| c.eq_ignore_ascii_case(channel))
+    };
+    if is_channel("xai", "grok") || is_channel("devin", "cli") {
+        1
+    } else {
+        0
+    }
+}
+
 fn ensure_json_content_type(headers: &mut HeaderMap) {
     if !headers.contains_key(CONTENT_TYPE) {
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
@@ -660,5 +689,76 @@ mod tests {
             .expect("the second connect reaches the listener");
         assert_eq!(response.status().as_u16(), 200);
         assert_eq!(response.bytes().await.expect("body"), "{}");
+    }
+
+    fn retry_provider(vendor: Option<&str>, channel: Option<&str>) -> Provider {
+        Provider {
+            keys: Vec::new(),
+            id: "provider-1".to_string(),
+            name: "Probe".to_string(),
+            vendor: vendor.map(str::to_string),
+            protocol: "devin-chat".to_string(),
+            base_url: "https://server.codeium.com".to_string(),
+            protocol_mode: "fixed".to_string(),
+            protocol_endpoints: vec![],
+            preset_key: None,
+            channel: channel.map(str::to_string),
+            models_source: None,
+            static_models: None,
+            api_key: String::new(),
+            auth_mode: "oauth".to_string(),
+            use_proxy: false,
+            fast_mode: false,
+            last_test_success: None,
+            last_test_at: None,
+            is_enabled: true,
+            created_at: String::new(),
+            updated_at: String::new(),
+        }
+    }
+
+    #[test]
+    fn only_fake_ip_reset_channels_replay_a_dropped_connect() {
+        // Both channels with production `tls handshake eof` evidence.
+        assert_eq!(
+            transient_connect_retries(&retry_provider(Some("xai"), Some("grok"))),
+            1
+        );
+        assert_eq!(
+            transient_connect_retries(&retry_provider(Some("devin"), Some("cli"))),
+            1
+        );
+        // Channel matching is case-insensitive, mirroring vendor checks.
+        assert_eq!(
+            transient_connect_retries(&retry_provider(Some("Devin"), Some("CLI"))),
+            1
+        );
+        // Wrong channel, missing channel, or a cross combination stays 0.
+        assert_eq!(
+            transient_connect_retries(&retry_provider(Some("devin"), Some("default"))),
+            0
+        );
+        assert_eq!(
+            transient_connect_retries(&retry_provider(Some("devin"), None)),
+            0
+        );
+        assert_eq!(
+            transient_connect_retries(&retry_provider(Some("xai"), Some("cli"))),
+            0
+        );
+        assert_eq!(
+            transient_connect_retries(&retry_provider(Some("kiro"), Some("cli"))),
+            0
+        );
+        // Other vendors, and vendor-less providers, stay single-attempt.
+        assert_eq!(
+            transient_connect_retries(&retry_provider(Some("openai"), Some("grok"))),
+            0
+        );
+        assert_eq!(
+            transient_connect_retries(&retry_provider(None, Some("grok"))),
+            0
+        );
+        assert_eq!(transient_connect_retries(&retry_provider(None, None)), 0);
     }
 }

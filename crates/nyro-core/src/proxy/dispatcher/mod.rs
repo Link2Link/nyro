@@ -63,7 +63,7 @@ use crate::protocol::ir::Usage;
 use crate::protocol::ir::{AiRequest, AiResponse, RawEnvelope};
 use crate::provider::VendorRegistry;
 use crate::provider::vendor::ProviderCtx;
-use crate::proxy::client::ProxyClient;
+use crate::proxy::client::{ProxyClient, transient_connect_retries};
 use crate::proxy::context::{ContextBag, RequestContext};
 use crate::proxy::observability::{LogExtras, send_log};
 use crate::proxy::planner::{ProtocolMode, negotiate};
@@ -1202,6 +1202,7 @@ async fn dispatch_pipeline_inner(
                 Ok(client) => ProxyClient::new(client)
                     .with_timeouts(gw.config.upstream_timeouts)
                     .with_deadline(ctx.deadline.clone())
+                    .with_connect_retries(transient_connect_retries(&provider))
                     .with_performance(performance.clone()),
                 Err(error) => {
                     producer.finish();
@@ -1606,9 +1607,7 @@ async fn dispatch_pipeline_inner(
             Ok(http_client) => ProxyClient::new(http_client)
                 .with_timeouts(gw.config.upstream_timeouts)
                 .with_deadline(ctx.deadline.clone())
-                .with_connect_retries(crate::provider::xai::grok::transient_connect_retries(
-                    &provider,
-                )),
+                .with_connect_retries(transient_connect_retries(&provider)),
             Err(e) => {
                 let msg = format!("provider transport error: {e}");
                 last_response = Some(error_response(502, &msg));

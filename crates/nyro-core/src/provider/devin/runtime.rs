@@ -20,7 +20,7 @@ use crate::provider::{
     vendor::ProviderCtx,
 };
 use crate::proxy::{
-    client::{ProxyClient, UpstreamReadError, UpstreamTimeoutPhase},
+    client::{ProxyClient, UpstreamReadError, UpstreamTimeoutPhase, transient_connect_retries},
     context::{CancellationToken, Deadline},
 };
 use crate::{
@@ -284,7 +284,8 @@ async fn request_status(
     super::validate(provider)?;
     let client = ProxyClient::new(gw.devin_http_client(provider.use_proxy, false).await?)
         .with_timeouts(gw.config.upstream_timeouts)
-        .with_deadline(Deadline::from_now(Duration::from_secs(15)));
+        .with_deadline(Deadline::from_now(Duration::from_secs(15)))
+        .with_connect_retries(transient_connect_retries(provider));
     request_status_with(&client, token, url).await
 }
 
@@ -379,6 +380,7 @@ pub(crate) async fn probe(
     let client = ProxyClient::new(gw.devin_http_client(provider.use_proxy, true).await?)
         .with_timeouts(gw.config.upstream_timeouts)
         .with_deadline(deadline.clone())
+        .with_connect_retries(transient_connect_retries(provider))
         .with_performance(performance.clone());
     let ctx = ProviderCtx {
         provider,

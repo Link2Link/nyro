@@ -22,24 +22,9 @@ pub(crate) fn grok_cli_user_agent() -> String {
     format!("xai-grok-workspace/{GROK_CLI_VERSION}")
 }
 
-/// How many extra connect attempts the Grok subscription channel may make.
-///
-/// `cli-chat-proxy.grok.com` is reached through whatever DNS the host uses.
-/// On a fake-ip proxy the handshake is occasionally reset (`tls handshake eof`)
-/// before the HTTP request is written. The route usually has a single
-/// candidate, so the dispatcher's "try the next target" retry never runs.
-/// Replaying this channel once is safe: a connect failure means the body was
-/// not sent. Other vendors, and the xAI API-key channel, stay single-attempt.
-pub(crate) fn transient_connect_retries(provider: &crate::db::models::Provider) -> u8 {
-    match (provider.vendor.as_deref(), provider.channel.as_deref()) {
-        (Some(vendor), Some(channel))
-            if vendor.eq_ignore_ascii_case("xai") && channel.eq_ignore_ascii_case("grok") =>
-        {
-            1
-        }
-        _ => 0,
-    }
-}
+// How many extra connect attempts a channel may make before the HTTP
+// request is written is decided per channel in
+// `proxy::client::transient_connect_retries` (fake-ip handshake resets).
 
 pub struct XaiGrokChannel;
 
@@ -124,22 +109,5 @@ mod tests {
             "https://cli-chat-proxy.grok.com/v1/chat/completions"
         );
         assert!(XaiGrokChannel.auth_headers(&ctx).is_empty());
-    }
-
-    #[test]
-    fn only_the_grok_channel_replays_a_dropped_connect() {
-        let mut provider = provider();
-        assert_eq!(transient_connect_retries(&provider), 1);
-
-        provider.channel = Some("default".to_string());
-        assert_eq!(transient_connect_retries(&provider), 0);
-
-        provider.channel = Some("grok".to_string());
-        provider.vendor = Some("openai".to_string());
-        assert_eq!(transient_connect_retries(&provider), 0);
-
-        provider.vendor = None;
-        provider.channel = None;
-        assert_eq!(transient_connect_retries(&provider), 0);
     }
 }
