@@ -74,13 +74,15 @@ export interface PayloadMetadata {
   tail_bytes?: number;
   truncated: boolean;
   complete: boolean;
-  encoding: "utf8" | "base64" | "none";
-  capture_state: "absent" | "empty" | "captured" | "not_retained";
+  encoding: "utf8" | "base64" | "none" | "binary";
+  capture_state: "absent" | "empty" | "captured" | "not_retained" | "digest_only";
+  sha256?: string | null;
+  chunks?: number;
   omitted_headers?: number;
   [key: string]: unknown;
 }
 export interface PayloadEvidence {
-  state: "cleared" | "unknown" | "invalid" | "absent" | "empty" | "missing" | "captured" | "not_retained";
+  state: "cleared" | "unknown" | "invalid" | "absent" | "empty" | "missing" | "captured" | "not_retained" | "digest_only";
   metadata?: PayloadMetadata;
   segments: { label: "content" | "head" | "tail"; text: string; encoding: "utf8" | "base64" | "unverified" }[];
   missingBytes: number | null;
@@ -96,12 +98,49 @@ export function parsePayloadMetadata(raw: string | null | undefined): { entries:
   return { entries: {}, malformed: true };
 }
 
+export interface DevinUpstreamDiagnostic {
+  source: "http_error" | "connect_trailer";
+  code: string | null;
+  message: string | null;
+}
+
+/** Diagnostics are backend-sanitized admin metadata, never raw response bodies.
+ * Fail closed on malformed or unmarked entries; render accepted strings as text.
+ */
+export function parseDevinUpstreamDiagnostic(raw: string | null | undefined): { diagnostic: DevinUpstreamDiagnostic | null; malformed: boolean } {
+  const parsed = parsePayloadMetadata(raw);
+  const value = parsed.entries.devin_upstream_error;
+  if (parsed.malformed) return { diagnostic: null, malformed: true };
+  if (value == null) return { diagnostic: null, malformed: false };
+  if (typeof value !== "object" || Array.isArray(value)) return { diagnostic: null, malformed: true };
+  const d = value as Record<string, unknown>;
+  const bounded = (text: unknown, limit: number): text is string | null => text === null
+    || (typeof text === "string" && text.length <= limit && new TextEncoder().encode(text).length <= limit);
+  if (d.sanitized !== true || (d.source !== "http_error" && d.source !== "connect_trailer")
+    || !bounded(d.code, 64) || !bounded(d.message, 512) || (d.code === null && d.message === null)) {
+    return { diagnostic: null, malformed: true };
+  }
+  return { diagnostic: { source: d.source, code: d.code, message: d.message }, malformed: false };
+}
+
 function validMetadata(value: unknown, header: boolean): value is PayloadMetadata {
   if (!value || typeof value !== "object") return false;
   const m = value as PayloadMetadata;
   if (!byteCount(m.total_observed_bytes) || !byteCount(m.retained_bytes)
     || typeof m.truncated !== "boolean" || typeof m.complete !== "boolean"
-    || !["utf8", "base64", "none"].includes(m.encoding) || !["absent", "empty", "captured", "not_retained"].includes(m.capture_state)) return false;
+    || !["utf8", "base64", "none", "binary"].includes(m.encoding) || !["absent", "empty", "captured", "not_retained", "digest_only"].includes(m.capture_state)) return false;
+  // Native bodies intentionally retain no bytes. This is not truncation or
+  // missing storage; validate their distinct digest contract before byte copies.
+  if (m.encoding === "binary" || m.capture_state === "digest_only") {
+    if (header || m.encoding !== "binary" || m.retained_bytes !== 0
+      || m.head_bytes !== 0 || m.tail_bytes !== 0 || m.truncated) return false;
+    if (m.capture_state === "not_retained") return true;
+    if (!byteCount(m.chunks)) return false;
+    if (m.capture_state === "absent") return m.total_observed_bytes === 0 && m.chunks === 0 && m.sha256 == null;
+    return m.capture_state === "digest_only" && typeof m.sha256 === "string"
+      && /^[a-fA-F0-9]{64}$/.test(m.sha256)
+      && (m.total_observed_bytes === 0 ? m.chunks === 0 : m.chunks > 0);
+  }
   // Recording-disabled entries can preserve original capture lengths or zero them;
   // availability is explicit, so neither lengths nor original truncation imply stored bytes.
   if (m.capture_state === "not_retained") return (m.head_bytes == null || byteCount(m.head_bytes)) && (m.tail_bytes == null || byteCount(m.tail_bytes));
@@ -132,7 +171,11 @@ export function payloadEvidence(log: Partial<RequestLog>, field: PayloadField, p
   }
   if (!value) return { state: "unknown", segments: fallback, missingBytes: null };
   const metadata = value as PayloadMetadata;
-  const base = { metadata, missingBytes: header || metadata.capture_state === "not_retained" ? null : metadata.total_observed_bytes - metadata.retained_bytes };
+  const base = { metadata, missingBytes: header || metadata.encoding === "binary" || metadata.capture_state === "not_retained" ? null : metadata.total_observed_bytes - metadata.retained_bytes };
+  if (metadata.encoding === "binary" && raw != null) {
+    return { ...base, state: "invalid", segments: fallback, issue: "Stored payload contradicts digest-only native capture metadata." };
+  }
+  if (metadata.capture_state === "digest_only") return { ...base, state: "digest_only", segments: [] };
   if (metadata.capture_state === "not_retained") return { ...base, state: "not_retained", segments: [] };
   if (metadata.capture_state === "absent" && raw == null) return { ...base, state: "absent", segments: [] };
   if (raw == null) return { ...base, state: "missing", segments: [] };
@@ -141,7 +184,7 @@ export function payloadEvidence(log: Partial<RequestLog>, field: PayloadField, p
     const bytes = metadata.encoding === "base64"
       ? Uint8Array.from(atob(raw), (char) => char.charCodeAt(0))
       : new TextEncoder().encode(raw);
-    if (metadata.encoding === "none" || bytes.length !== metadata.retained_bytes) throw new Error("Stored payload length or encoding disagrees with metadata.");
+    if (metadata.encoding === "none" || metadata.encoding === "binary" || bytes.length !== metadata.retained_bytes) throw new Error("Stored payload length or encoding disagrees with metadata.");
     if (metadata.truncated && !header) {
       const head = bytes.slice(0, metadata.head_bytes);
       const tail = bytes.slice(metadata.head_bytes);
@@ -168,6 +211,7 @@ export function payloadStateLabel(state: PayloadEvidence["state"], isZh = false)
     invalid: ["Invalid capture metadata or evidence", "采集元数据或证据无效"], absent: ["Not captured", "未采集"],
     empty: ["Observed empty", "已观测为空"], missing: ["Stored payload missing", "已存载荷缺失"], captured: ["Captured", "已采集"],
     not_retained: ["Not retained (payload recording disabled)", "未保留（已禁用载荷记录）"],
+    digest_only: ["Digest only (raw body not retained)", "仅保存摘要，未保留原始正文"],
   };
   return labels[state][isZh ? 1 : 0];
 }

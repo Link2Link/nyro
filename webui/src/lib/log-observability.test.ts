@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { effectiveOutcome, isLogRelatedQueryKey, outcomeLabel, outcomeQuery, parseErrorCauses, payloadDownload, payloadEvidence, payloadStateLabel, usageOutcomeRates, type PayloadMetadata } from "./log-observability.ts";
+import { effectiveOutcome, isLogRelatedQueryKey, outcomeLabel, outcomeQuery, parseErrorCauses, parseDevinUpstreamDiagnostic, payloadDownload, payloadEvidence, payloadStateLabel, usageOutcomeRates, type PayloadMetadata } from "./log-observability.ts";
 import type { RequestLog } from "./types.ts";
 
 const field = "upstream_response_body";
@@ -131,6 +131,63 @@ test("manual clear overrides every retained body/header without altering result 
   assert.match(output, /Payload cleared at: 1/);
   assert.match(output, /Payload metadata/);
   assert.doesNotMatch(output, /secret|credentials/);
+});
+
+const nativeDigest: Partial<PayloadMetadata> = {
+  capture_state: "digest_only", encoding: "binary", total_observed_bytes: 152,
+  retained_bytes: 0, head_bytes: 0, tail_bytes: 0, truncated: false,
+  complete: false, chunks: 1, sha256: "6ed79909fffda6b662a4094b5c3d9a31f0fc44b791353b286cd7dc636c68f0cd",
+};
+
+test("live Devin digest-only response is valid evidence, not a missing or truncated body", () => {
+  for (const complete of [false, true]) {
+    const log = evidence(undefined, { ...nativeDigest, complete });
+    const parsed = payloadEvidence(log, field);
+    assert.equal(parsed.state, "digest_only");
+    assert.equal(parsed.issue, undefined);
+    assert.equal(parsed.missingBytes, null);
+    assert.deepEqual(parsed.segments, []);
+    assert.equal(parsed.metadata?.complete, complete);
+    assert.equal(parsed.metadata?.sha256, nativeDigest.sha256);
+    const downloaded = payloadDownload(log as RequestLog);
+    assert.match(downloaded, /Digest only/);
+    assert.match(downloaded, new RegExp(nativeDigest.sha256!));
+    assert.doesNotMatch(downloaded, /Invalid payload|Missing observed bytes: 152/);
+    assert.equal(payloadEvidence({ ...log, payload_cleared_at: 1 }, field).state, "cleared");
+  }
+  assert.equal(payloadStateLabel("digest_only", true), "仅保存摘要，未保留原始正文");
+  assert.equal(payloadEvidence(evidence(undefined, { ...nativeDigest, capture_state: "not_retained" }), field).state, "not_retained");
+  assert.equal(payloadEvidence(evidence(undefined, { ...nativeDigest, total_observed_bytes: 0, chunks: 0, sha256: null, capture_state: "absent" }), field).state, "absent");
+  assert.equal(payloadEvidence(evidence(undefined, { ...nativeDigest, total_observed_bytes: 0, chunks: 0 }), field).state, "digest_only");
+});
+
+test("native digest contradictions fail closed without loosening ordinary payload validation", () => {
+  for (const patch of [
+    { retained_bytes: 1 }, { head_bytes: 1 }, { tail_bytes: 1 }, { truncated: true },
+    { encoding: "utf8" }, { capture_state: "captured" }, { chunks: -1 }, { chunks: 0 },
+    { sha256: null }, { sha256: "invalid" }, { total_observed_bytes: -1 },
+  ] as Partial<PayloadMetadata>[]) {
+    assert.equal(payloadEvidence(evidence(undefined, { ...nativeDigest, ...patch }), field).state, "invalid", JSON.stringify(patch));
+  }
+  assert.equal(payloadEvidence(evidence("unexpected bytes", nativeDigest), field).state, "invalid");
+  assert.equal(payloadEvidence({ payload_metadata: JSON.stringify({ upstream_response_headers: nativeDigest }) }, "upstream_response_headers").state, "invalid");
+});
+
+test("Devin diagnostic parser accepts bounded sanitized admin metadata only", () => {
+  const diagnostic = { source: "connect_trailer", code: "permission_denied", message: "an internal error occurred (trace ID: fixture)", sanitized: true };
+  const wrap = (value: unknown) => JSON.stringify({ devin_upstream_error: value });
+  assert.deepEqual(parseDevinUpstreamDiagnostic(wrap({ ...diagnostic, details: "not displayed" })), {
+    diagnostic: { source: diagnostic.source, code: diagnostic.code, message: diagnostic.message }, malformed: false,
+  });
+  assert.equal(parseDevinUpstreamDiagnostic(wrap({ ...diagnostic, source: "http_error", code: null })).diagnostic?.source, "http_error");
+  assert.deepEqual(parseDevinUpstreamDiagnostic(undefined), { diagnostic: null, malformed: false });
+  assert.deepEqual(parseDevinUpstreamDiagnostic('{}'), { diagnostic: null, malformed: false });
+  for (const value of [false, [], "raw", { ...diagnostic, sanitized: false }, { ...diagnostic, source: "unknown" },
+    { ...diagnostic, message: "x".repeat(513) }, { ...diagnostic, message: "错".repeat(171) },
+    { ...diagnostic, code: "x".repeat(65) }, { ...diagnostic, code: null, message: null }]) {
+    assert.deepEqual(parseDevinUpstreamDiagnostic(wrap(value)), { diagnostic: null, malformed: true });
+  }
+  assert.equal(parseDevinUpstreamDiagnostic('broken').malformed, true);
 });
 
 test("all destructive actions invalidate logs, details, correlation and usage/stat query families", () => {

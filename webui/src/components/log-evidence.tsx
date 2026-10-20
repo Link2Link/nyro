@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { Check, Copy } from "lucide-react";
 import type { RequestLog, RequestLogAttempts } from "@/lib/types";
-import { outcomeLabel, parseErrorCauses, payloadEvidence, payloadStateLabel, type PayloadField } from "@/lib/log-observability";
+import { outcomeLabel, parseErrorCauses, parseDevinUpstreamDiagnostic, payloadEvidence, payloadStateLabel, type PayloadField } from "@/lib/log-observability";
 import { formatLogTime } from "@/lib/format";
 import { copyToClipboard } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
@@ -16,6 +16,7 @@ export function AttemptResultBanner({ log, correlation, correlationLoading, corr
   isZh: boolean;
 }) {
   const evidence = parseErrorCauses(log.error_causes);
+  const upstream = parseDevinUpstreamDiagnostic(log.payload_metadata);
   const result = correlation ? correlation.result : log.request_result;
   return (
     <section className="space-y-2 rounded-lg border border-slate-200 bg-slate-50 p-3 text-xs text-slate-600">
@@ -25,6 +26,14 @@ export function AttemptResultBanner({ log, correlation, correlationLoading, corr
       {log.failure_kind && <p>{isZh ? "失败类型" : "Failure kind"}: <code>{log.failure_kind}</code></p>}
       {log.error_message && <p className="whitespace-pre-wrap break-all text-red-700">{log.error_message}</p>}
       {evidence.causes.length > 0 && <div><strong>{isZh ? "原因链" : "Error causes"}</strong>{evidence.malformed && <p className="text-amber-700">{isZh ? "原因 JSON 无效；以下为原始文本。" : "Malformed causes JSON; raw text follows."}</p>}<ol className="list-decimal space-y-1 pl-5">{evidence.causes.map((cause, index) => <li key={index} className="whitespace-pre-wrap break-all">{cause}</li>)}</ol></div>}
+      {upstream.diagnostic && <div className="space-y-1 rounded border border-amber-200 bg-amber-50 p-2">
+        <strong>{isZh ? "Devin 上游错误诊断（已脱敏）" : "Devin upstream error diagnostic (sanitized)"}</strong>
+        <p>{isZh ? "来源" : "Source"}: {upstream.diagnostic.source === "connect_trailer" ? (isZh ? "Connect 错误结束帧" : "Connect error trailer") : (isZh ? "HTTP 错误响应" : "HTTP error response")}</p>
+        {upstream.diagnostic.code && <p>{isZh ? "上游错误码" : "Upstream code"}: <code className="select-all break-all">{upstream.diagnostic.code}</code></p>}
+        {upstream.diagnostic.message && <p className="select-all whitespace-pre-wrap break-all">{upstream.diagnostic.message}</p>}
+        <p className="text-slate-500">{isZh ? "这是限长、脱敏的诊断摘要，不是原始响应体；不替代本地错误分类。" : "This bounded, sanitized diagnostic is not the raw response body and does not replace local error classification."}</p>
+      </div>}
+      {upstream.malformed && <p role="alert" className="text-amber-700">{isZh ? "上游诊断元数据无效，未展示其内容。" : "Invalid upstream diagnostic metadata; contents are not displayed."}</p>}
       <p className="text-slate-500">{isZh ? "HTTP 200 不代表完整成功；未知历史结果不推断为错误。" : "HTTP 200 does not establish full success; unknown historical results are not inferred errors."}</p>
       {log.client_request_id ? <div className="space-y-2 border-t border-slate-200 pt-2">
         <p>{isZh ? "关联客户端请求 ID" : "Correlated client request ID"}: <code className="select-all break-all">{log.client_request_id}</code> · {isZh ? "尝试序号" : "Attempt index"}: {log.attempt_index ?? "–"}</p>
@@ -67,6 +76,12 @@ export function PayloadBlock({ title, log, field, isZh }: { title: string; log: 
     <div className="space-y-1 px-3 py-2 text-[11px] text-slate-500">
       <p>{payloadStateLabel(evidence.state, isZh)}{log?.payload_cleared_at != null && ` · ${formatLogTime(log.payload_cleared_at)}`}</p>
       {metadata && <p>{isZh ? "已观测" : "Observed"} {metadata.total_observed_bytes} B · {isZh ? "保留" : "Retained"} {metadata.retained_bytes} B · {metadata.encoding} · {metadata.complete ? (isZh ? "传输采集结束" : "Capture complete") : (isZh ? "传输采集不完整，最终大小未知" : "Capture incomplete; final size unknown")} · {metadata.truncated ? (isZh ? "已截断" : "Truncated") : (isZh ? "未截断" : "Not truncated")}</p>}
+      {evidence.state === "digest_only" && <div className="space-y-1">
+        <p>{isZh ? "此原生载荷按策略仅记录摘要。没有可复制的原始正文；这不表示数据损坏或载荷记录开关未开启。" : "This native payload retains only a digest by policy. No raw body is available to copy; this does not indicate corruption or disabled payload recording."}</p>
+        <p className="break-all">SHA-256: <code className="select-all">{metadata?.sha256}</code></p>
+        {metadata?.chunks != null && <p>{isZh ? "已观测数据块" : "Observed chunks"}: {metadata.chunks}</p>}
+        {!metadata?.complete && <p>{isZh ? "摘要仅覆盖已观测字节，不代表完整上游响应。" : "The digest covers observed bytes only, not necessarily the complete upstream response."}</p>}
+      </div>}
       {metadata?.omitted_headers != null && <p>{isZh ? "省略请求头" : "Omitted headers"}: {metadata.omitted_headers}</p>}
       {evidence.missingBytes != null && evidence.missingBytes > 0 && <p className="text-amber-700">{isZh ? `中间缺失 ${evidence.missingBytes} 个已观测字节；下方头尾片段不连续。` : `${evidence.missingBytes} observed bytes missing from the middle; head and tail below are not contiguous.`}</p>}
       {evidence.issue && <p role="alert" className="text-amber-700">{isZh ? "元数据或存储内容不一致；显示原始文本，不进行 JSON 格式化。" : evidence.issue}</p>}
