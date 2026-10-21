@@ -1,10 +1,13 @@
 import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { RefreshCw } from "lucide-react";
+import { Clock, RefreshCw } from "lucide-react";
 import { backend } from "@/lib/backend";
 import { localizeBackendErrorMessage } from "@/lib/backend-error";
 import { useLocale } from "@/lib/i18n";
 import { useUsageClock } from "@/lib/use-usage-clock";
+import { kiroPoolUsage, looksLikeCredential } from "@/lib/kiro-pool-usage";
+import { tierLabel } from "@/lib/provider-usage";
+import { countdownStr, utilizationColor } from "@/lib/usage-pace";
 import { accountStateLabel, canReauthorizeLegacyProvider, type AccountPoolView, type OAuthAccountUpdate, type ProviderAccountView } from "@/lib/devin-account-pool";
 import type { Provider } from "@/lib/types";
 import type { OAuthSessionIntent } from "@/lib/use-oauth-session";
@@ -15,6 +18,7 @@ import { AccountPoolSettings } from "@/components/devin-pool-settings";
 import { KiroAccountLogin } from "@/components/kiro-account-login";
 import { ProviderUsageFooter } from "@/components/provider-usage";
 import { UsageProgress } from "@/components/usage-progress";
+import { PoolRefreshButton } from "@/components/pool-refresh-button";
 
 function useAccountPool(providerId: string) {
   return useQuery<AccountPoolView>({
@@ -84,10 +88,74 @@ export function KiroAccountUsage({ account, isZh, compact = false }: { account: 
   </div>;
 }
 
-function PoolSummary({ pool, isZh }: { pool: AccountPoolView; isZh: boolean }) {
-  return <div className="space-y-1 text-xs text-slate-600">
+const amount = (value: number) => value.toLocaleString(undefined, { maximumFractionDigits: 2 });
+
+function PoolCounts({ pool, isZh }: { pool: AccountPoolView; isZh: boolean }) {
+  return <div className="space-y-1 text-slate-600">
     <p>{isZh ? `${pool.counts.total} 个账号 · ${pool.counts.available} 个可用` : `${pool.counts.total} accounts · ${pool.counts.available} available`} · {kiroStateLabel(pool.readiness, isZh)}</p>
     <p>{isZh ? `已停用 ${pool.counts.disabled} · 已断开 ${pool.counts.disconnected} · 需要登录 ${pool.counts.auth_required} · 额度耗尽 ${pool.counts.quota_exhausted}` : `Disabled ${pool.counts.disabled} · Disconnected ${pool.counts.disconnected} · Needs login ${pool.counts.auth_required} · Quota exhausted ${pool.counts.quota_exhausted}`}</p>
+  </div>;
+}
+
+/**
+ * Pool total per resource: summed actual used/limit, percent bar and a
+ * limit-weighted steady pace. With `counts`/`onRefresh` it is the whole
+ * compact card box, laid out like DevinPoolUsage.
+ */
+export function KiroPoolUsage({ pool, isZh, now, detailed = false, counts = false, onRefresh, refreshing = false }: {
+  pool: AccountPoolView; isZh: boolean; now: number; detailed?: boolean;
+  /** Show the account counts inside the box (compact card). */
+  counts?: boolean;
+  onRefresh?: () => void;
+  refreshing?: boolean;
+}) {
+  const summary = kiroPoolUsage(pool, now);
+  if (summary.members === 0 && !counts && !onRefresh) return null;
+  const single = summary.resources.length === 1;
+  return <div className={`relative space-y-2 rounded-lg border border-slate-200/70 bg-white/40 px-3 py-2 text-xs ${onRefresh ? "pr-10" : ""}`}>
+    {onRefresh && <PoolRefreshButton onRefresh={onRefresh} refreshing={refreshing} isZh={isZh} />}
+    {counts && <PoolCounts pool={pool} isZh={isZh} />}
+    {summary.members > 0 && summary.resources.length === 0 && <p className="text-slate-500">{isZh ? "账号池总用量：用量未知" : "Pool total: usage unknown"}</p>}
+    {summary.resources.map((resource) => {
+      // `kiro:<resource>` already reads "<Resource> · Total pool"; avoid a doubled suffix.
+      const label = single
+        ? `${tierLabel("monthly", isZh)} · ${isZh ? "账号池合计" : "Pool total"}`
+        : tierLabel(`kiro:${resource.resource}`, isZh);
+      const countdown = countdownStr(resource.nextResetAt, now);
+      return <div key={resource.resource} className="space-y-1">
+        <div className="flex items-center gap-3">
+          <span className="min-w-14 max-w-36 shrink-0 font-medium text-slate-500" title={resource.resource}>{label}</span>
+          <UsageProgress usedPercent={resource.usedPercent} pacePercent={resource.pacePercent} isZh={isZh} weighted
+            weightBasis={isZh ? "各账号月度窗口进度与额度上限" : "each account's monthly window progress and allowance"}
+            label={`${label} ${isZh ? "已用额度" : "used quota"}`} />
+          <span className={`w-10 shrink-0 text-right font-semibold tabular-nums ${utilizationColor(resource.usedPercent)}`}>{Math.round(resource.usedPercent)}%</span>
+          <span className="flex w-14 shrink-0 items-center gap-0.5 text-[10px] text-slate-400" title={resource.nextResetAt ?? undefined}>
+            {countdown && <><Clock className="h-3 w-3" />{countdown}</>}
+          </span>
+        </div>
+        <p className="flex flex-wrap gap-x-3 text-[10px] text-slate-500 tabular-nums">
+          <span>{isZh ? "已用" : "Used"} {amount(resource.used)} / {amount(resource.limit)}</span>
+          <span>{isZh ? "剩余" : "Remaining"} {resource.remainingPercent.toFixed(1)}%</span>
+          {resource.pacePercent != null && <span>{isZh ? `匀速使用预估：${resource.pacePercent.toFixed(1)}%` : `Steady-pace estimate: ${resource.pacePercent.toFixed(1)}%`}</span>}
+          <span>{isZh ? "用量覆盖" : "Usage coverage"}: {resource.accounts}/{summary.members} {isZh ? "账号" : "accounts"}</span>
+          {resource.staleAccounts > 0 && <span className="text-amber-700">{isZh ? `${resource.staleAccounts} 个账号为旧数据` : `${resource.staleAccounts} stale`}</span>}
+        </p>
+        {detailed && resource.nextResetAt && <p className="text-[10px] text-slate-500">
+          {resource.resetAligned ? (isZh ? "共同重置" : "Aligned reset") : (isZh ? "下次账号额度重置" : "Next account reset")}: <time dateTime={resource.nextResetAt}>{new Date(resource.nextResetAt).toLocaleString()}</time>
+          {` (${resource.nextResetAccounts}/${resource.accounts} ${isZh ? "账号" : "accounts"})`}
+          {resource.pacePercent != null && ` · ${isZh ? "匀速预估按各账号额度上限与各自重置时间加权" : "Pace weighted by each account's allowance and reset time"}`}
+        </p>}
+      </div>;
+    })}
+  </div>;
+}
+
+/** Management panel header: counts, then the detailed pool total. */
+function PoolSummary({ pool, isZh }: { pool: AccountPoolView; isZh: boolean }) {
+  const now = useUsageClock();
+  return <div className="space-y-2 text-xs">
+    <PoolCounts pool={pool} isZh={isZh} />
+    <KiroPoolUsage pool={pool} isZh={isZh} now={now} detailed />
   </div>;
 }
 
@@ -99,6 +167,7 @@ function AccountRow({ account, pending, canLogin, onUpdate, onLogin, onRefresh, 
   const [priority, setPriority] = useState(account.priority);
   const changed = label !== account.label || priority !== account.priority;
   const disconnected = account.status === "disconnected";
+  const unsafeLabel = looksLikeCredential(label);
   return <tr className="border-t border-slate-200 align-top">
     <td className="min-w-44 space-y-2 p-2">
       <Input aria-label={isZh ? "账号别名" : "Account label"} value={label} maxLength={120} disabled={pending || disconnected} onChange={(event) => setLabel(event.target.value)} />
@@ -106,7 +175,8 @@ function AccountRow({ account, pending, canLogin, onUpdate, onLogin, onRefresh, 
       <label className="flex items-center gap-2 text-[10px] text-slate-500"><span>{isZh ? "优先级（越小越优先）" : "Priority (lower first)"}</span>
         <Input className="w-20" aria-label={isZh ? "账号优先级" : "Account priority"} type="number" step={1} value={priority} disabled={pending || disconnected} onChange={(event) => setPriority(Number(event.target.value))} />
       </label>
-      {changed && <Button type="button" variant="secondary" disabled={pending || disconnected || !label.trim() || !Number.isInteger(priority) || priority < -2147483648 || priority > 2147483647} onClick={() => onUpdate({ label: label.trim(), priority })}>{isZh ? "保存" : "Save"}</Button>}
+      {unsafeLabel && <p role="alert" className="text-[10px] text-red-600">{isZh ? "别名看起来包含凭证，请改为普通名称" : "This label looks like a credential; use a plain name"}</p>}
+      {changed && <Button type="button" variant="secondary" disabled={pending || disconnected || !label.trim() || unsafeLabel || !Number.isInteger(priority) || priority < -2147483648 || priority > 2147483647} onClick={() => onUpdate({ label: label.trim(), priority })}>{isZh ? "保存" : "Save"}</Button>}
     </td>
     <td className="space-y-1 p-2"><p>{accountStateLabel(account.status, isZh)}</p><p className="text-slate-500">{kiroStateLabel(account.scheduling, isZh)}</p><p>{account.is_enabled ? (isZh ? "已启用" : "Enabled") : (isZh ? "已停用" : "Disabled")}</p></td>
     <td className="p-2"><KiroAccountUsage account={account} isZh={isZh} /></td>
@@ -186,24 +256,23 @@ export function KiroAccountPoolCard({ provider }: { provider: Provider }) {
   const isZh = locale === "zh-CN";
   const query = useAccountPool(provider.id);
   const [open, setOpen] = useState(false);
+  const now = useUsageClock();
   const invalidate = useInvalidatePool(provider.id);
   const refresh = useMutation({
     mutationFn: () => backend("refresh_provider_account_pool_usage", { id: provider.id }),
     onSettled: invalidate,
   });
   return <div className="mt-2 space-y-2">
-    {query.data?.config ? <div className="space-y-2 rounded-lg border border-slate-200 p-3">
-      <PoolSummary pool={query.data} isZh={isZh} />
-      {!open && query.data.accounts.filter((account) => account.status !== "disconnected").map((account) => <div key={account.account_id} className="space-y-1 border-t border-slate-100 pt-2">
-        <p className="text-xs font-semibold">{account.label} · {account.kiro_usage?.plan ?? (isZh ? "套餐未知" : "Plan unknown")} · {kiroStateLabel(account.scheduling, isZh)}</p>
-        <KiroAccountUsage account={account} isZh={isZh} compact />
-      </div>)}
-      <Button type="button" variant="secondary" disabled={refresh.isPending} aria-busy={refresh.isPending} onClick={() => refresh.mutate()}><RefreshCw className={`mr-1 h-3 w-3 ${refresh.isPending ? "animate-spin" : ""}`} />{isZh ? "刷新全池用量" : "Refresh pool usage"}</Button>
-    </div> : query.data ? <>
+    {/* Summary only, one box like Devin: per-account usage lives in "Manage accounts". */}
+    {query.data?.config ? <KiroPoolUsage pool={query.data} isZh={isZh} now={now} counts
+      onRefresh={() => refresh.mutate()} refreshing={refresh.isPending} />
+    : query.data ? <>
       <ProviderUsageFooter provider={provider} />
       <p className="text-xs text-amber-700">{isZh ? "保存账号池调度设置即可添加更多 Kiro 账号；原单账号仍可使用和重新授权。" : "Save pool scheduling settings to add more Kiro accounts; the legacy account can still be used and re-authorized."}</p>
     </> : <p className="text-xs text-slate-500">{query.error ? localizeBackendErrorMessage(query.error, isZh) : (isZh ? "读取账号池…" : "Loading account pool…")}</p>}
-    {refresh.error && <p role="alert" className="text-xs text-red-600">{localizeBackendErrorMessage(refresh.error, isZh)}</p>}
+    {refresh.error && <p role="alert" className="text-xs text-red-600">
+      {isZh ? "用量刷新失败" : "Usage refresh failed"}: {localizeBackendErrorMessage(refresh.error, isZh)}
+    </p>}
     <Button type="button" variant="secondary" onClick={() => setOpen(!open)} aria-expanded={open}>{open ? (isZh ? "收起账号" : "Hide accounts") : (isZh ? "管理账号" : "Manage accounts")}</Button>
     {open && <KiroAccountPoolPanel provider={provider} />}
   </div>;

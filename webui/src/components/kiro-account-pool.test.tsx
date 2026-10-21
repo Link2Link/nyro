@@ -6,7 +6,7 @@ import { LocaleProvider } from "../lib/i18n";
 import { newDevinPoolConfig, type AccountPoolView, type ProviderAccountView } from "../lib/devin-account-pool";
 import type { Provider } from "../lib/types";
 import { AccountPoolSettings } from "./devin-pool-settings";
-import { KiroAccountPoolCard, KiroAccountPoolPanel, KiroAccountUsage } from "./kiro-account-pool";
+import { KiroAccountPoolCard, KiroAccountPoolPanel, KiroAccountUsage, KiroPoolUsage } from "./kiro-account-pool";
 import { KiroAccountLogin } from "./kiro-account-login";
 
 const account: ProviderAccountView = {
@@ -46,7 +46,8 @@ test("Kiro management has scoped account actions and actual usage, not Devin quo
   for (const text of ["Kiro account pool", "Add account", "Re-authorize / import", "Refresh usage", "Refresh pool usage", "Disable", "Remove", "Account label", "Account priority", "account-a · v4", "automatically refreshes credentials", "POWER", "work@example.com", "Credits", "Welcome bonus", "Free trial", "Upstream overage enabled"]) match(html, new RegExp(text));
   match(html, /Used 80 \/ 100/);
   match(html, /dateTime="2030-01-15T00:00:00Z"/);
-  equal((html.match(/role="progressbar"/g) ?? []).length, 3);
+  // Three account allowances + two pool totals (CREDIT, CHAT).
+  equal((html.match(/role="progressbar"/g) ?? []).length, 5);
   doesNotMatch(html, /Devin|Daily usage|Weekly usage|Pro-equivalent|Team Full Seat|10×|Plan unverified|Paid balance/);
 });
 
@@ -76,14 +77,14 @@ test("disconnected Kiro rows retain records but disable mutations and reauthoriz
   doesNotMatch(html, /role="progressbar"/);
 });
 
-test("compact Kiro card exposes accounts and refresh without a legacy singleton summary", () => {
+test("compact Kiro card shows only the pool summary; account details stay in Manage accounts", () => {
   const html = panel(pool, true);
   match(html, /1 accounts · 1 available/);
-  match(html, /Work · POWER/);
-  match(html, /Refresh pool usage/);
+  match(html, /aria-label="Refresh pool usage"/);
   match(html, /aria-expanded="false"[^>]*>Manage accounts/);
-  equal((html.match(/role="progressbar"/g) ?? []).length, 3);
-  doesNotMatch(html, /work@example.com|Re-authorize \/ import|Devin|Daily|Weekly|Pro-equivalent/);
+  // Pool totals only (CREDIT, CHAT): no per-account rows, labels or allowance bars.
+  equal((html.match(/role="progressbar"/g) ?? []).length, 2);
+  doesNotMatch(html, /Work · POWER|Welcome bonus|Base allowance|Observed|work@example.com|Re-authorize \/ import|Devin|Daily|Weekly|Pro-equivalent/);
 });
 
 test("unknown, zero-limit and stale Kiro usage never invent quota capacity", () => {
@@ -109,9 +110,9 @@ test("Kiro reserve scheduling is paid overage rather than a Devin USD balance", 
   for (const card of [false, true]) {
     const html = panel(value, card);
     match(html, /Paid overage only/);
-    match(html, /Paid overage/);
     doesNotMatch(html, /Paid balance|\$|Pro-equivalent/);
   }
+  match(panel(value), /Paid overage</);
 });
 
 test("expired Kiro bonus and trial snapshots are historical in compact and full views", () => {
@@ -153,4 +154,82 @@ test("Kiro account login keeps Google GitHub Builder ID IAM and import options",
   match(html, /Start authorization/);
   match(html, /gateway checks the result automatically/);
   doesNotMatch(html, /<textarea|type="password"|Devin/);
+});
+
+function withNow<T>(iso: string, run: () => T): T {
+  const previousNow = Date.now;
+  Date.now = () => Date.parse(iso);
+  try { return run(); } finally { Date.now = previousNow; }
+}
+
+const monthly = (id: string, label: string, plan: string, used: number, limit: number): ProviderAccountView => ({
+  ...account, account_id: id, label,
+  kiro_usage: { plan, email: null, resets_at: "2026-11-01T00:00:00Z", overage_enabled: false, items: [
+    { resource: "CREDIT", kind: "base", name: "Credit", used, limit, resets_at: "2026-11-01T00:00:00Z" },
+  ] },
+});
+const twoAccounts: AccountPoolView = { ...pool, accounts: [monthly("a", "Kiro", "PRO+", 1153.6, 2000), monthly("b", "Kiro 2", "PRO MAX", 0.05, 5000)],
+  counts: { ...pool.counts, total: 2, accounting: 2, available: 2, included: 2 } };
+
+test("Kiro pool card shows the summed pool percent, totals and a weighted steady-pace marker", () => {
+  const html = withNow("2026-10-21T10:00:00Z", () => panel(twoAccounts, true));
+  // The card carries the pool total only; per-account bars live in Manage accounts.
+  equal((html.match(/role="progressbar"/g) ?? []).length, 1);
+  doesNotMatch(html, /Kiro 2 · PRO MAX|Used 0\.05 \/ 5,000|Observed/);
+  match(html, /Monthly · Pool total/);
+  match(html, />16%</);
+  match(html, /Used 1,153\.65 \/ 7,000/);
+  match(html, /Remaining 83\.5%/);
+  match(html, /Steady-pace estimate: 64\.7%/);
+  match(html, /Usage coverage: 2\/2 accounts/);
+  match(html, /data-steady-pace-marker="weighted"[^>]*title="Steady pace: 64\.7% \(weighted by each account&#x27;s monthly window progress and allowance; estimate only\)"/);
+  match(html, /10d14h/);
+  doesNotMatch(html, /Pro-equivalent|Daily|Weekly|NaN/);
+  const zh = renderToStaticMarkup(<KiroPoolUsageZh />);
+  for (const text of ["每月 · 账号池合计", "已用 1,153.65 / 7,000", "剩余 83.5%", "匀速使用预估：64.7%", "用量覆盖: 2/2 账号"]) match(zh, new RegExp(text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+});
+
+function KiroPoolUsageZh() {
+  return <KiroPoolUsage pool={twoAccounts} isZh now={Date.parse("2026-10-21T10:00:00Z")} detailed />;
+}
+
+test("Kiro pool panel explains aligned resets; unknown members lower coverage without inventing usage", () => {
+  const html = withNow("2026-10-21T10:00:00Z", () => panel(twoAccounts));
+  match(html, /Aligned reset: <time dateTime="2026-11-01T00:00:00.000Z">/);
+  match(html, /\(2\/2 accounts\)/);
+  const partial = renderToStaticMarkup(<KiroPoolUsage pool={{ ...twoAccounts, accounts: [twoAccounts.accounts[0], { ...twoAccounts.accounts[1], kiro_usage: null }] }}
+    isZh={false} now={Date.parse("2026-10-21T10:00:00Z")} />);
+  match(partial, /Used 1,153\.6 \/ 2,000/);
+  match(partial, /Usage coverage: 1\/2 accounts/);
+  const none = renderToStaticMarkup(<KiroPoolUsage pool={{ ...twoAccounts, accounts: twoAccounts.accounts.map((a) => ({ ...a, kiro_usage: null })) }}
+    isZh={false} now={Date.parse("2026-10-21T10:00:00Z")} />);
+  match(none, /Pool total: usage unknown/);
+  doesNotMatch(none, /role="progressbar"|0%/);
+});
+
+test("credential-shaped account labels are flagged and cannot be saved or used to start login", () => {
+  // Synthetic fixture shaped like a pasted credential file; not a real token.
+  const leaked = '"refreshToken": "aorAAAAAFakeFixtureTokenNotReal0000000000';
+  const html = panel({ ...pool, accounts: [{ ...account, label: leaked }] });
+  match(html, /This label looks like a credential; use a plain name/);
+  const login = renderToStaticMarkup(<LocaleProvider><KiroAccountLogin intent={{ kind: "add_account", providerId: "kiro" }} initialLabel={leaked} onBound={() => {}} onCancel={() => {}} /></LocaleProvider>);
+  match(login, /looks like a credential/);
+  match(login, /<button[^>]*disabled=""[^>]*>Start authorization<\/button>/);
+  const clean = renderToStaticMarkup(<LocaleProvider><KiroAccountLogin intent={{ kind: "add_account", providerId: "kiro" }} initialLabel="Kiro 2" onBound={() => {}} onCancel={() => {}} /></LocaleProvider>);
+  doesNotMatch(clean, /looks like a credential/);
+});
+
+test("Kiro card puts the pool refresh as a Devin-style top-right icon inside the usage box", () => {
+  const html = panel(pool, true);
+  // One box: refresh icon first, then counts and pool totals inside it.
+  match(html, /<div class="relative space-y-2 rounded-lg[^"]*pr-10"><button[^>]*aria-label="Refresh pool usage"[^>]*aria-busy="false"[^>]*class="absolute right-2 top-1\.5[^"]*"><svg[^>]*aria-hidden="true"[^>]*>[\s\S]*?<\/svg><\/button><div[^>]*><p>1 accounts · 1 available/);
+  match(html, /CREDIT · Total pool</);
+  doesNotMatch(html, /Total pool · Pool total/);
+  doesNotMatch(html, />Refresh pool usage</);
+  const pending = renderToStaticMarkup(<KiroPoolUsage pool={pool} isZh={false} now={Date.now()} counts onRefresh={() => {}} refreshing />);
+  match(pending, /<button[^>]*disabled=""[^>]*aria-label="Refresh pool usage"[^>]*aria-busy="true"/);
+  match(pending, /Refreshing usage…/);
+  match(pending, /animate-spin/);
+  // Without a refresh handler (management panel), no icon is rendered.
+  doesNotMatch(renderToStaticMarkup(<KiroPoolUsage pool={pool} isZh={false} now={Date.now()} detailed />), /aria-label="Refresh pool usage"/);
 });

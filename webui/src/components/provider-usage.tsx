@@ -7,9 +7,10 @@ import { isKiroOverage, providerUsageSupported, providerUsageTitle, summarizeGro
 import { isDevinProvider, isKiroProvider } from "@/lib/native-provider";
 import { useLocale } from "@/lib/i18n";
 import { accountStateLabel, poolQuotaWindows, type AccountPoolView } from "@/lib/devin-account-pool";
-import { poolSteadyPacePercent, steadyPacePercent, utilizationBarClass, utilizationColor } from "@/lib/usage-pace";
+import { countdownStr, poolSteadyPacePercent, steadyPacePercent, utilizationBarClass, utilizationColor } from "@/lib/usage-pace";
 import { useUsageClock } from "@/lib/use-usage-clock";
 import { UsageProgress } from "@/components/usage-progress";
+import { PoolRefreshButton } from "@/components/pool-refresh-button";
 import type {
   Provider,
   ProviderUsage,
@@ -25,23 +26,6 @@ import type {
  * color-coded by utilization (green < 70%, orange >= 70%, red >= 90%) and a
  * reset countdown like "2h30m" / "3d12h".
  */
-
-/** Compact countdown like "2h30m" / "3d12h" (cc-switch countdownStr). */
-function countdownStr(resetsAt?: string | null): string | null {
-  if (!resetsAt) return null;
-  const diffMs = new Date(resetsAt).getTime() - Date.now();
-  if (diffMs <= 0) return null;
-
-  const hours = Math.floor(diffMs / (1000 * 60 * 60));
-  const minutes = Math.floor((diffMs % (1000 * 60 * 60)) / (1000 * 60));
-
-  if (hours > 24) {
-    const days = Math.floor(hours / 24);
-    return `${days}d${hours % 24}h`;
-  }
-  if (hours > 0) return `${hours}h${minutes}m`;
-  return `${minutes}m`;
-}
 
 function formatRelativeTime(timestamp: string, now: number, isZh: boolean): string {
   const diff = Math.floor((now - new Date(timestamp).getTime()) / 1000);
@@ -170,17 +154,7 @@ export function DevinPoolUsage({ pool, detailed = false, onRefresh, refreshing =
   const windows = poolQuotaWindows(pool);
   if (!pool.config) return null;
   return <div className={`relative space-y-2 rounded-lg border border-slate-200/70 bg-white/40 px-3 py-2 text-xs ${onRefresh ? "pr-10" : ""}`}>
-    {onRefresh && <button
-      type="button"
-      onClick={(event) => { event.stopPropagation(); onRefresh(); }}
-      disabled={refreshing}
-      aria-label={isZh ? "刷新全池用量" : "Refresh pool usage"}
-      aria-busy={refreshing}
-      title={refreshing ? (isZh ? "刷新用量中…" : "Refreshing usage…") : (isZh ? "刷新全池用量" : "Refresh pool usage")}
-      className="absolute right-2 top-1.5 cursor-pointer rounded p-1 text-slate-400 transition-colors hover:bg-slate-100 hover:text-slate-600 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-wait disabled:opacity-50"
-    >
-      <RefreshCw aria-hidden="true" className={`h-3.5 w-3.5 ${refreshing ? "animate-spin" : ""}`} />
-    </button>}
+    {onRefresh && <PoolRefreshButton onRefresh={onRefresh} refreshing={refreshing} isZh={isZh} />}
     {detailed && <>
     <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
       <strong>Devin</strong>

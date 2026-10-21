@@ -2405,6 +2405,12 @@ END $$;"#,
         pg_rename_column_if_needed(self.adapter.pool(), "api_keys", "key", "token").await?;
         migrate_performance_pg(self.adapter.pool()).await?;
         migrate_diagnostics_pg(self.adapter.pool()).await?;
+        sqlx::query(&crate::db::backfill_kiro_cache_read_sql(
+            StorageBackend::Postgres,
+        ))
+        .bind(crate::provider::kiro::PROTOCOL_KEY)
+        .execute(self.adapter.pool())
+        .await?;
         // Provider-scoped ratings were replaced by prefix ratings; old rows are
         // deliberately dropped instead of migrated.
         sqlx::query("DROP TABLE IF EXISTS provider_model_ratings")

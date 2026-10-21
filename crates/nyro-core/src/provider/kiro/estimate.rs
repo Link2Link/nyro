@@ -20,6 +20,25 @@ pub(super) const ENTRY_FRAMING_TOKENS: u32 = 27;
 /// Flat token cost charged per inline image in the prompt estimate.
 pub(super) const IMAGE_TOKENS: u32 = 1_600;
 
+/// Share of the gross prompt treated as a prompt-cache read, in percent.
+///
+/// Kiro reports no prompt-cache accounting, so its real hit rate is unknown.
+/// Agentic sessions mostly resend a stable prefix and observed hit rates sit
+/// around 90%, so every Kiro request (and every historical Kiro log row, see
+/// `db::backfill_kiro_cache_read_sql`) assumes that share. This keeps
+/// API-equivalent token pricing comparable with providers that report cache
+/// reads; it is an assumption, not an observation.
+pub(crate) const ASSUMED_CACHE_READ_PERCENT: u32 = 90;
+const _: () = assert!(ASSUMED_CACHE_READ_PERCENT <= 100);
+
+/// Assumed cache-read tokens for a gross prompt count, rounded down so the
+/// cached share never exceeds the prompt.
+pub(crate) fn assumed_cache_read_tokens(prompt_tokens: u32) -> u32 {
+    let cached = u64::from(prompt_tokens) * u64::from(ASSUMED_CACHE_READ_PERCENT) / 100;
+    // Always <= prompt_tokens because the percentage is at most 100.
+    cached as u32
+}
+
 /// Characters of a text blob split by script.
 ///
 /// Lengths are UTF-16 code units, matching the reference implementation, so
@@ -242,6 +261,17 @@ mod tests {
             "content": "ok", "toolUses": [{"toolUseId": "1", "name": "t", "input": {}}]
         }})];
         assert!(payload_input_tokens(&assistant, &bare) > payload_input_tokens(&[], &bare));
+    }
+
+    #[test]
+    fn assumed_cache_read_is_ninety_percent_rounded_down() {
+        assert_eq!(assumed_cache_read_tokens(0), 0);
+        assert_eq!(assumed_cache_read_tokens(1), 0);
+        assert_eq!(assumed_cache_read_tokens(10), 9);
+        assert_eq!(assumed_cache_read_tokens(19), 17);
+        assert_eq!(assumed_cache_read_tokens(20_000), 18_000);
+        // Widened arithmetic: no overflow at the top of the range.
+        assert_eq!(assumed_cache_read_tokens(u32::MAX), 3_865_470_565);
     }
 
     #[test]

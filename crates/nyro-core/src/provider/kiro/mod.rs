@@ -28,6 +28,7 @@ use crate::provider::vendor::{ProviderCtx, Vendor};
 use crate::provider::{InboundResponse, OutboundRequest};
 use crate::proxy::client::ProxyClient;
 
+pub(crate) use estimate::ASSUMED_CACHE_READ_PERCENT;
 pub(crate) use runtime::{check_connection, fetch_usage, probe};
 pub(crate) use usage::KiroUsage;
 

@@ -376,7 +376,7 @@ and loss-accounting semantics.
 | `input_tokens` | INTEGER | `0` | 输入 token 数 |
 | `output_tokens` | INTEGER | `0` | 输出 token 数（含思考 token） |
 | `reasoning_tokens` | INTEGER | `0` | 思考/推理 token 数（output_tokens 的子集） |
-| `cache_read_tokens` | INTEGER | `0` | 缓存命中 token 数 |
+| `cache_read_tokens` | INTEGER | `0` | 缓存命中 token 数（Kiro 上游不报告缓存，固定按 `input_tokens` 的 90% 向下取整假设，见迁移说明） |
 | `is_stream` | INTEGER | `0` | 是否为流式请求 |
 | `stream_chunks_count` | INTEGER | `0` | 流式分块数量 |
 | `stream_first_chunk_ms` | INTEGER | NULL | 首个分块延迟（毫秒）；旧用量统计保持原口径 |
@@ -703,3 +703,10 @@ api_keys.key       → api_keys.token
 `adaptive`，并保留原有默认协议、Base URL 和共享 API Key。
 
 所有 rename 操作均为幂等：先检查旧列存在且新列不存在，才执行 `ALTER TABLE RENAME`。
+
+Kiro 缓存命中回填（纯数据迁移，不改表结构，`deploy/schema/` 无需重新生成）：Kiro
+不报告 prompt cache，新请求按 `input_tokens × 90%`（向下取整）写入 `cache_read_tokens`，
+使等效 token 价格与报告缓存的供应商口径一致。每次启动 `migrate()` 对
+`upstream_protocol = 'kiro-chat/generate-assistant-response/v1'` 且 `cache_read_tokens`
+为 0/NULL 的历史行回填同一比例；已有非零缓存值的行、以及比例取整为 0 的行不会被改写，
+因此重复执行不会重写数据。这是假设值，不是上游观测值。

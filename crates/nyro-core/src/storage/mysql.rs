@@ -2563,6 +2563,12 @@ impl StorageBootstrap for MysqlBootstrap {
         mysql_rename_column_if_needed(pool, "api_keys", "key", "token").await?;
         migrate_performance_mysql(pool).await?;
         migrate_diagnostics_mysql(pool).await?;
+        sqlx::query(&crate::db::backfill_kiro_cache_read_sql(
+            StorageBackend::Mysql,
+        ))
+        .bind(crate::provider::kiro::PROTOCOL_KEY)
+        .execute(pool)
+        .await?;
         // Provider-scoped ratings were replaced by prefix ratings; old rows are
         // deliberately dropped instead of migrated.
         sqlx::query("DROP TABLE IF EXISTS provider_model_ratings")

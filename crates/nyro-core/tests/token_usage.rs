@@ -147,6 +147,59 @@ async fn token_usage_null_zero_gross_input_and_error_attempts() -> anyhow::Resul
 }
 
 #[tokio::test]
+async fn migration_backfills_kiro_cache_reads_at_ninety_percent_only_once() -> anyhow::Result<()> {
+    let storage = storage().await?;
+    let pool = storage.pool();
+    let kiro = "kiro-chat/generate-assistant-response/v1";
+    let at = millis("2024-06-01T00:00:00Z");
+    // (id, upstream protocol, input, cache read)
+    for (id, protocol, input, cached) in [
+        ("kiro-zero", kiro, Some(1_000), Some(0)),
+        ("kiro-null", kiro, Some(19), None),
+        ("kiro-reported", kiro, Some(1_000), Some(123)),
+        ("kiro-tiny", kiro, Some(1), Some(0)),
+        ("kiro-no-usage", kiro, None, None),
+        (
+            "other",
+            "openai-compatible/chat-completions/v1",
+            Some(1_000),
+            Some(0),
+        ),
+    ] {
+        sqlx::query("INSERT INTO request_logs (id, created_at, provider_id, upstream_protocol, upstream_model, input_tokens, output_tokens, cache_read_tokens, client_status_code) VALUES (?, ?, 'p', ?, 'm', ?, 1, ?, 200)")
+            .bind(id).bind(at).bind(protocol).bind(input).bind(cached)
+            .execute(pool).await?;
+    }
+    let cache = |id: &'static str| async move {
+        sqlx::query_scalar::<_, Option<i32>>(
+            "SELECT cache_read_tokens FROM request_logs WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_one(pool)
+        .await
+    };
+    for _ in 0..2 {
+        // Idempotent across restarts.
+        db::migrate(pool).await?;
+        assert_eq!(cache("kiro-zero").await?, Some(900));
+        assert_eq!(
+            cache("kiro-null").await?,
+            Some(17),
+            "90% of 19, rounded down"
+        );
+        assert_eq!(
+            cache("kiro-reported").await?,
+            Some(123),
+            "existing counts are kept"
+        );
+        assert_eq!(cache("kiro-tiny").await?, Some(0), "share rounds to zero");
+        assert_eq!(cache("kiro-no-usage").await?, None);
+        assert_eq!(cache("other").await?, Some(0), "only Kiro rows are assumed");
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn token_usage_admin_year_validation_current_names_and_id_fallback() -> anyhow::Result<()> {
     let storage = storage().await?;
     let provider = storage

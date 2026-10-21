@@ -1,22 +1,25 @@
 import { utilizationBarClass } from "@/lib/usage-pace";
 
 /** Shared quota track and steady-pace needle for providers, pools and accounts. */
-export function UsageProgress({ usedPercent, pacePercent = null, label, isZh, weighted = false, className = "" }: {
+export function UsageProgress({ usedPercent, pacePercent = null, label, isZh, weighted = false, weightBasis, className = "" }: {
   usedPercent: number;
   pacePercent?: number | null;
   label: string;
   isZh: boolean;
   weighted?: boolean;
+  /** Pool-specific weighting description; defaults to Devin's Pro-equivalent capacity. */
+  weightBasis?: string;
   className?: string;
 }) {
   if (!Number.isFinite(usedPercent)) return null;
   const used = Math.min(100, Math.max(0, usedPercent));
   const pace = pacePercent != null && Number.isFinite(pacePercent)
     ? Math.min(100, Math.max(0, pacePercent)) : null;
+  const basis = weightBasis ?? (isZh ? "各账号窗口进度与 Pro 等价容量" : "each account's window progress and Pro-equivalent capacity");
   const paceTitle = pace == null ? undefined : weighted
     ? (isZh
-      ? `匀速参考线：${pace.toFixed(1)}%（按各账号窗口进度与 Pro 等价容量加权，仅供参考）`
-      : `Steady pace: ${pace.toFixed(1)}% (weighted by each account's window progress and Pro-equivalent capacity; estimate only)`)
+      ? `匀速参考线：${pace.toFixed(1)}%（按${basis}加权，仅供参考）`
+      : `Steady pace: ${pace.toFixed(1)}% (weighted by ${basis}; estimate only)`)
     : (isZh
       ? `匀速参考线：${Math.round(pace)}%（按整窗匀速使用推进）`
       : `Steady pace: ${Math.round(pace)}% (even consumption over the window)`);

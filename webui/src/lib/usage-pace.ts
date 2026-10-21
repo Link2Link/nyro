@@ -15,6 +15,23 @@ export function utilizationBarClass(utilization: number): string {
   return "bg-emerald-500";
 }
 
+/** Compact countdown like "2h30m" / "3d12h" (cc-switch countdownStr). */
+export function countdownStr(resetsAt?: string | null, now = Date.now()): string | null {
+  if (!resetsAt) return null;
+  const diffMs = new Date(resetsAt).getTime() - now;
+  if (!Number.isFinite(diffMs) || diffMs <= 0) return null;
+
+  const hours = Math.floor(diffMs / (1000 * 60 * 60));
+  const minutes = Math.floor((diffMs % (1000 * 60 * 60)) / (1000 * 60));
+
+  if (hours > 24) {
+    const days = Math.floor(hours / 24);
+    return `${days}d${hours % 24}h`;
+  }
+  if (hours > 0) return `${hours}h${minutes}m`;
+  return `${minutes}m`;
+}
+
 /** Window length per tier, used only for the visual steady-pace marker. */
 export function tierWindowMs(name: string): number | null {
   // Feature-specific limits are not the provider's main routing quota, even

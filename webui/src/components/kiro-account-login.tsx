@@ -2,6 +2,7 @@ import { useState } from "react";
 import { useLocale } from "@/lib/i18n";
 import { localizeBackendErrorMessage } from "@/lib/backend-error";
 import { bindKiroAccountSession, initKiroAccountSession, kiroLoginConfigured } from "@/lib/kiro-login";
+import { looksLikeCredential } from "@/lib/kiro-pool-usage";
 import { openExternalUrl } from "@/lib/open-external";
 import { useOAuthSession, type OAuthSessionIntent } from "@/lib/use-oauth-session";
 import type { KiroLoginOptions } from "@/lib/types";
@@ -27,11 +28,12 @@ export function KiroAccountLogin({ intent, initialLabel = "", onBound, onCancel 
   const legacy = intent.kind === "reauthorize_legacy_provider";
   const reauth = intent.kind !== "add_account";
   const importing = options.method === "import";
+  const unsafeLabel = looksLikeCredential(label);
   const active = Boolean(oauth.session) && oauth.status?.status !== "error";
   const authUrl = active && (oauth.session?.auth_url || oauth.session?.verification_uri_complete || oauth.session?.verification_uri);
 
   async function start() {
-    if (!kiroLoginConfigured(options)) return;
+    if (!kiroLoginConfigured(options) || unsafeLabel) return;
     setError("");
     // Immutable label/options/target snapshots: controls cannot retarget a session.
     const boundLabel = label.trim() || undefined;
@@ -61,7 +63,8 @@ export function KiroAccountLogin({ intent, initialLabel = "", onBound, onCancel 
         ? (isZh ? "仅在授权成功后替换所选账号的凭据，其他账号不受影响。版本已过期时请关闭并重试。" : "Only the selected account's credentials are replaced after successful authorization. Other accounts are unaffected. Close and retry if its version has changed.")
         : (isZh ? "追加账号，不覆盖现有授权。" : "Append an account without replacing existing authorizations.")}</p>
     {!legacy && <label className="block space-y-1 text-xs"><span>{isZh ? "安全别名（可选，不要填写令牌）" : "Safe label (optional; do not enter a token)"}</span>
-      <Input value={label} disabled={active || oauth.busy} maxLength={120} onChange={(event) => setLabel(event.target.value)} />
+      <Input value={label} disabled={active || oauth.busy} maxLength={120} aria-invalid={unsafeLabel || undefined} onChange={(event) => setLabel(event.target.value)} />
+      {unsafeLabel && <span role="alert" className="block text-red-600">{isZh ? "别名看起来包含凭证，请改为普通名称；凭证请粘贴到下方导入框" : "This label looks like a credential; use a plain name and paste credentials into the import box below"}</span>}
     </label>}
     <KiroLoginOptionsForm value={options} isZh={isZh} disabled={oauth.status?.status === "ready"}
       onChange={(value) => { oauth.reset(); setError(""); setOptions(value); }} />
@@ -71,7 +74,7 @@ export function KiroAccountLogin({ intent, initialLabel = "", onBound, onCancel 
         onStart={() => void start()} onSubmit={(code) => oauth.complete({ code })} onCancel={cancel} />
       <OAuthSessionRemaining expiresAt={oauth.expiresAt} isZh={isZh} />
     </> : <>
-      {!active && <Button type="button" disabled={oauth.busy || !kiroLoginConfigured(options)} onClick={() => void start()}>{isZh ? "开始授权" : "Start authorization"}</Button>}
+      {!active && <Button type="button" disabled={oauth.busy || unsafeLabel || !kiroLoginConfigured(options)} onClick={() => void start()}>{isZh ? "开始授权" : "Start authorization"}</Button>}
       {authUrl && <div className="space-y-2 text-xs">
         <p className="select-all break-all">{authUrl}</p>
         <Button type="button" variant="secondary" onClick={() => {

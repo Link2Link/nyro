@@ -11,7 +11,7 @@ use std::collections::HashMap;
 
 use serde_json::Value;
 
-use super::estimate::CharCounts;
+use super::estimate::{CharCounts, assumed_cache_read_tokens};
 use super::eventstream::{self, Decoder, Frame};
 use crate::error::GatewayError;
 use crate::protocol::ir::{AiStreamDelta, ToolCall, ToolCallKind, Usage};
@@ -510,6 +510,9 @@ impl Session {
             prompt_tokens: input,
             completion_tokens: output,
             total_tokens: input.saturating_add(output),
+            // Kiro reports no prompt-cache accounting; assume a fixed share so
+            // token pricing stays comparable with cache-reporting providers.
+            cache_read_tokens: Some(assumed_cache_read_tokens(input)),
             reasoning_tokens: self.thinking_seen.then(|| self.thinking_chars.tokens()),
             ..Default::default()
         }
@@ -854,6 +857,8 @@ mod tests {
         });
         let usage = usage.expect("usage is always reported");
         assert_eq!(usage.prompt_tokens, 7, "falls back to the local estimate");
+        assert_eq!(usage.cache_read_tokens, Some(6), "90% of 7, rounded down");
+        assert_eq!(usage.cache_creation_tokens, None);
         assert!(usage.completion_tokens > 0);
         assert_eq!(
             usage.total_tokens,
@@ -895,6 +900,11 @@ mod tests {
             })
             .unwrap();
         assert_eq!(usage.prompt_tokens + usage.completion_tokens, 20_000);
+        assert_eq!(
+            usage.cache_read_tokens,
+            Some(usage.prompt_tokens * 9 / 10),
+            "cache share follows the gross prompt, not the window"
+        );
         assert_eq!(
             s.usage_provenance(),
             crate::performance::NativeUsageProvenance::Partial

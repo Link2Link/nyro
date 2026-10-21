@@ -103,6 +103,12 @@ pub async fn migrate(pool: &SqlitePool) -> anyhow::Result<()> {
     ensure_request_log_column(pool, "provider_key_name", "TEXT").await?;
     migrate_log_diagnostics(pool).await?;
     migrate_performance_metadata(pool).await?;
+    sqlx::query(&backfill_kiro_cache_read_sql(
+        crate::storage::traits::StorageBackend::Sqlite,
+    ))
+    .bind(crate::provider::kiro::PROTOCOL_KEY)
+    .execute(pool)
+    .await?;
     // Provider-scoped ratings were replaced by prefix ratings; old rows are
     // deliberately dropped instead of migrated.
     sqlx::query("DROP TABLE IF EXISTS provider_model_ratings")
@@ -688,6 +694,36 @@ async fn migrate_performance_metadata(pool: &SqlitePool) -> anyhow::Result<()> {
     sqlx::query("CREATE INDEX IF NOT EXISTS idx_logs_performance_pair ON request_logs(provider_id, upstream_model COLLATE BINARY, request_completion, performance_completed_at, id)").execute(pool).await?;
     sqlx::query("CREATE INDEX IF NOT EXISTS idx_logs_performance_recovery ON request_logs(performance_metadata_version, created_at, id)").execute(pool).await?;
     Ok(())
+}
+
+/// Give historical Kiro log rows the same assumed cache-read share that new
+/// Kiro requests report (`provider::kiro::ASSUMED_CACHE_READ_PERCENT` of the
+/// gross input, rounded down), so token pricing is uniform across old and new
+/// rows. Kiro never reports cache reads, so a zero/NULL count is always "not
+/// reported" rather than "no hit". Idempotent: rows that already carry a cache
+/// count, or whose share rounds to zero, never match again, so this runs on
+/// every start without rewriting rows. One placeholder binds the Kiro
+/// protocol key (`$1` on PostgreSQL, `?` elsewhere).
+pub(crate) fn backfill_kiro_cache_read_sql(
+    backend: crate::storage::traits::StorageBackend,
+) -> String {
+    use crate::storage::traits::StorageBackend;
+    let percent = crate::provider::kiro::ASSUMED_CACHE_READ_PERCENT;
+    // Widen before multiplying; MySQL needs DIV to truncate instead of round.
+    let (param, share) = match backend {
+        StorageBackend::Sqlite => ("?", format!("input_tokens * {percent} / 100")),
+        StorageBackend::Postgres => (
+            "$1",
+            format!("CAST(input_tokens AS BIGINT) * {percent} / 100"),
+        ),
+        StorageBackend::Mysql => ("?", format!("input_tokens * {percent} DIV 100")),
+    };
+    format!(
+        "UPDATE request_logs SET cache_read_tokens = {share} \
+         WHERE upstream_protocol = {param} \
+         AND COALESCE(cache_read_tokens, 0) = 0 \
+         AND {share} > 0"
+    )
 }
 
 async fn ensure_request_log_column(
