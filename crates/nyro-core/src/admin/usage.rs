@@ -715,10 +715,8 @@ fn tier_display_rank(name: &str) -> (u8, u8) {
 /// Kiro allowances for one resource are additive, unlike independent rate
 /// windows. Keep component rows for display only and observe each pooled total
 /// for scheduling, so an exhausted base cannot hide a still-usable trial/bonus.
-fn kiro_usage_tiers(usage: &crate::provider::kiro::KiroUsage) -> Vec<ProviderUsageTier> {
-    let mut pools =
-        std::collections::BTreeMap::<&str, (f64, f64, Option<chrono::DateTime<chrono::Utc>>)>::new(
-        );
+pub(super) fn kiro_usage_tiers(usage: &crate::provider::kiro::KiroUsage) -> Vec<ProviderUsageTier> {
+    let pools = usage.resource_pools();
     let mut details = Vec::new();
     for (index, item) in usage.items.iter().enumerate() {
         if !item.used.is_finite() || !item.limit.is_finite() || item.used < 0.0 || item.limit < 0.0
@@ -728,16 +726,8 @@ fn kiro_usage_tiers(usage: &crate::provider::kiro::KiroUsage) -> Vec<ProviderUsa
         // An explicit zero allowance is authoritative, unlike absent numbers.
         // Free accounts may have base=0 and be usable only while a trial lasts.
         let remaining = item.remaining_percent().unwrap_or(0.0);
-        let pool = pools.entry(&item.resource).or_default();
-        pool.0 += item.used.min(item.limit);
-        pool.1 += item.limit;
-        // Bonus/trial expiration is NOT a reset that replenishes credits.
-        if item.kind == "base" {
-            let reset = item.resets_at.or(usage.resets_at);
-            pool.2 = match (pool.2, reset) {
-                (Some(previous), Some(next)) => Some(previous.min(next)),
-                (previous, next) => previous.or(next),
-            };
+        if item.kind != "base" && item.resets_at.is_some_and(|at| at <= Utc::now()) {
+            continue;
         }
         details.push(ProviderUsageTier {
             name: format!("feature:kiro:{}:{}:{index}", item.kind, item.name),
@@ -751,7 +741,9 @@ fn kiro_usage_tiers(usage: &crate::provider::kiro::KiroUsage) -> Vec<ProviderUsa
     let single_pool = pools.len() == 1;
     let mut tiers = pools
         .into_iter()
-        .filter_map(|(resource, (used, limit, reset))| {
+        .filter_map(|pool| {
+            let (resource, used, limit, reset) =
+                (pool.resource, pool.used, pool.limit, pool.resets_at);
             (used.is_finite() && limit.is_finite()).then(|| ProviderUsageTier {
                 name: if single_pool {
                     TIER_MONTHLY.into()
@@ -2348,7 +2340,10 @@ impl AdminService {
         mode: UsageQueryMode,
     ) -> anyhow::Result<ProviderUsage> {
         let provider = self.get_provider(id).await?;
-        if crate::provider::devin::is_devin(&provider) {
+        if crate::provider::devin::is_devin(&provider)
+            || (crate::provider::kiro::is_kiro(&provider)
+                && self.provider_pool_config(id).await?.is_some())
+        {
             let view = self
                 .refresh_account_pool_usage(id, matches!(mode, UsageQueryMode::GuardOnly))
                 .await?;
@@ -3157,9 +3152,16 @@ async fn refresh_due_provider_usage(gw: &Gateway) {
 
     let mut due = Vec::new();
     for provider in providers {
+        let account_pool = crate::provider::devin::is_devin(&provider)
+            || (crate::provider::kiro::is_kiro(&provider)
+                && admin
+                    .provider_pool_config(&provider.id)
+                    .await
+                    .ok()
+                    .flatten()
+                    .is_some());
         if !provider.is_enabled
-            || (!crate::provider::devin::is_devin(&provider)
-                && !gw.quota_registry.is_due(&provider.id))
+            || (!account_pool && !gw.quota_registry.is_due(&provider.id))
             || !provider_usage_monitorable(&admin, &provider).await
         {
             continue;

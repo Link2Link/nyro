@@ -22,10 +22,12 @@ use crate::storage::traits::{ProviderEndpointTestResult, ProviderTestResult};
 
 mod account_pool;
 mod account_test;
+mod kiro_accounts;
 pub use account_pool::{
     AccountPoolCounts, AccountPoolQuota, AccountPoolView, AccountQuotaWindow, DevinPlan,
     DevinPoolConfig, DevinPoolStrategy, DevinReservePolicy, PoolQuotaWindow, ProviderAccountView,
 };
+use kiro_accounts::*;
 mod aliyun_sign;
 mod api_keys;
 mod auth_data;

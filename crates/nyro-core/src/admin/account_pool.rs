@@ -1,14 +1,15 @@
-//! Devin account management. Credentials never cross this module's DTO boundary.
+//! OAuth account-pool management. Credentials never cross this module's DTO boundary.
 use super::*;
-use crate::provider::account_pool::DevinAccountState;
+use crate::provider::account_pool::{DevinAccountState, KiroAccountState};
 use crate::provider::devin::{DevinQuota, DevinUsage};
+use crate::provider::kiro::KiroUsage;
 use crate::router::quota::QuotaTierObservation;
 use crate::router::usage::{dynamic_weight, score_provider, window_boost};
 use futures::{StreamExt, stream};
 
 pub(crate) const POOL_SETTING_PREFIX: &str = "provider_account_pool:";
 const SESSION_INTENT: &str = "provider_account_intent";
-static STATUS_CONCURRENCY: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
+pub(super) static STATUS_CONCURRENCY: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -106,6 +107,8 @@ pub struct ProviderAccountView {
     pub daily: Option<AccountQuotaWindow>,
     pub weekly: Option<AccountQuotaWindow>,
     pub reserve_usd: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kiro_usage: Option<KiroUsage>,
     pub observed_at: Option<i64>,
     pub stale: bool,
     pub updated_at: String,
@@ -156,6 +159,8 @@ pub struct AccountPoolCounts {
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct AccountPoolView {
     pub provider_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
     pub config: Option<DevinPoolConfig>,
     pub accounts: Vec<ProviderAccountView>,
     pub quota: AccountPoolQuota,
@@ -211,6 +216,9 @@ fn scheduling(
     state: &DevinAccountState,
     config: Option<&DevinPoolConfig>,
 ) -> &'static str {
+    if account.driver_key == "kiro" {
+        return kiro_scheduling(account, config);
+    }
     if account.status == "disconnected" {
         return "disconnected";
     }
@@ -310,6 +318,9 @@ fn safe_account(
     account: &OAuthCredential,
     config: Option<&DevinPoolConfig>,
 ) -> ProviderAccountView {
+    if account.driver_key == "kiro" {
+        return safe_kiro_account(account, config);
+    }
     let state = state(account);
     let window = |quota: &DevinQuota| AccountQuotaWindow {
         remaining_percent: quota.remaining_percent,
@@ -340,6 +351,7 @@ fn safe_account(
             .and_then(|u| u.weekly.as_ref())
             .map(window),
         reserve_usd: state.usage.as_ref().and_then(|u| u.overage_usd),
+        kiro_usage: None,
         observed_at: state.observed_at,
         stale: is_stale(&state),
         updated_at: account.updated_at.clone(),
@@ -414,21 +426,36 @@ fn aggregate_window(members: &[&ProviderAccountView], daily: bool) -> PoolQuotaW
         .into(),
     }
 }
+#[cfg(test)]
 fn pool_view(
     id: &str,
     config: Option<DevinPoolConfig>,
     records: &[OAuthCredential],
 ) -> AccountPoolView {
+    pool_view_with_kind(id, config, records, false)
+}
+fn pool_view_with_kind(
+    id: &str,
+    config: Option<DevinPoolConfig>,
+    records: &[OAuthCredential],
+    kiro: bool,
+) -> AccountPoolView {
     let accounts: Vec<_> = records
         .iter()
-        .map(|a| safe_account(a, config.as_ref()))
+        .map(|a| {
+            if kiro {
+                safe_kiro_account(a, config.as_ref())
+            } else {
+                safe_account(a, config.as_ref())
+            }
+        })
         .collect();
     let mut counts = AccountPoolCounts {
         total: accounts.len(),
         ..Default::default()
     };
     for account in &accounts {
-        if account.status != "disconnected" {
+        if !kiro && account.status != "disconnected" {
             match account.verified_plan {
                 Some(DevinPlan::Pro) => counts.pro += 1,
                 Some(DevinPlan::Max) => counts.max += 1,
@@ -452,15 +479,24 @@ fn pool_view(
         .filter(|a| a.is_enabled && a.status != "disconnected")
         .collect();
     counts.accounting = members.len();
-    let quota = AccountPoolQuota {
-        daily: config.as_ref().and_then(|_| {
-            members
-                .iter()
-                .any(|a| a.verified_plan != Some(DevinPlan::Max))
-                .then(|| aggregate_window(&members, true))
-        }),
-        weekly: config.as_ref().map(|_| aggregate_window(&members, false)),
-        estimated: true,
+    let quota = if kiro {
+        // Resource quotas are exposed per account, never as Devin plan weights.
+        AccountPoolQuota {
+            daily: None,
+            weekly: None,
+            estimated: false,
+        }
+    } else {
+        AccountPoolQuota {
+            daily: config.as_ref().and_then(|_| {
+                members
+                    .iter()
+                    .any(|a| a.verified_plan != Some(DevinPlan::Max))
+                    .then(|| aggregate_window(&members, true))
+            }),
+            weekly: config.as_ref().map(|_| aggregate_window(&members, false)),
+            estimated: true,
+        }
     };
     let readiness = if counts.included > 0 {
         "eligible"
@@ -482,6 +518,7 @@ fn pool_view(
     .into();
     AccountPoolView {
         provider_id: id.into(),
+        kind: Some(if kiro { "kiro" } else { "devin" }.into()),
         config,
         accounts,
         quota,
@@ -493,6 +530,7 @@ fn pool_view(
 impl AdminService {
     /// New-provider login publishes no credential until status is authenticated.
     /// Each account is classified independently of the pool scheduling policy.
+    // Kept as a compatibility entry point; the login session selects the vendor.
     pub async fn create_devin_provider_with_pool(
         &self,
         session_id: &str,
@@ -505,24 +543,45 @@ impl AdminService {
             .await?
             .context("auth session not found")?;
         anyhow::ensure!(
-            preview.driver_key == "devin"
+            matches!(preview.driver_key.as_str(), "devin" | "kiro")
                 && !is_account_session(&preview)
                 && preview.provider_id.is_none(),
-            "A fresh Devin login session is required"
+            "A fresh Devin or Kiro login session is required"
         );
         let mut session = self.take_ready_auth_session_record(session_id).await?;
         if is_expired_at(session.expires_at.as_deref()) {
             self.restore_auth_session_record(session).await?;
             anyhow::bail!("auth session expired");
         }
-        input.vendor = Some("devin".into());
-        input.preset_key = Some("devin".into());
-        input.channel = Some("cli".into());
-        input.protocol = "devin-chat/get-chat-message/v1".into();
+        let bundle = match parse_auth_session_bundle(&session) {
+            Ok(bundle) => bundle,
+            Err(error) => {
+                self.restore_auth_session_record(session).await?;
+                return Err(error);
+            }
+        };
+        let kiro = session.driver_key == "kiro";
+        let driver = if kiro { "kiro" } else { "devin" };
+        input.vendor = Some(driver.into());
+        input.preset_key = Some(driver.into());
+        input.channel = Some(if kiro { "ide" } else { "cli" }.into());
+        input.protocol = if kiro {
+            crate::provider::kiro::PROTOCOL_KEY
+        } else {
+            "devin-chat/get-chat-message/v1"
+        }
+        .into();
         input.protocol_mode = "fixed".into();
         input.protocol_endpoints.clear();
         input.keys.clear();
-        input.base_url = "https://server.codeium.com".into();
+        input.base_url = if kiro {
+            bundle
+                .resource_url
+                .filter(|url| crate::provider::kiro::credential::region_from_origin(url).is_some())
+                .unwrap_or_else(|| crate::protocol::ids::KIRO_DEFAULT_BASE_URL.into())
+        } else {
+            "https://server.codeium.com".into()
+        };
         input.auth_mode = "oauth".into();
         input.api_key.clear();
         let provider = match self.create_provider(input).await {
@@ -572,12 +631,13 @@ impl AdminService {
             .set(&format!("provider_account_fence:{id}"), &fence.to_string())
             .await
     }
-    async fn devin_pool_provider(&self, id: &str) -> anyhow::Result<Provider> {
+    async fn account_pool_provider(&self, id: &str) -> anyhow::Result<Provider> {
         let provider = self.get_provider(id).await?;
         anyhow::ensure!(
-            crate::provider::devin::is_devin(&provider)
+            (crate::provider::devin::is_devin(&provider)
+                || crate::provider::kiro::is_kiro(&provider))
                 && provider.effective_auth_mode() == "oauth",
-            "Account pools require a Devin OAuth provider"
+            "Account pools require a Devin or Kiro OAuth provider"
         );
         Ok(provider)
     }
@@ -596,7 +656,7 @@ impl AdminService {
             .transpose()
     }
     pub async fn get_provider_account_pool(&self, id: &str) -> anyhow::Result<AccountPoolView> {
-        self.devin_pool_provider(id).await?;
+        let provider = self.account_pool_provider(id).await?;
         let config = self.provider_pool_config(id).await?;
         let accounts = self
             .gw
@@ -608,7 +668,12 @@ impl AdminService {
             config.is_some() || accounts.len() <= 1,
             "AMBIGUOUS_ACCOUNT: an unconfigured provider cannot select among multiple accounts"
         );
-        let view = pool_view(id, config, &accounts);
+        let view = pool_view_with_kind(
+            id,
+            config,
+            &accounts,
+            crate::provider::kiro::is_kiro(&provider),
+        );
         self.publish_pool_scheduling(&view, &accounts);
         Ok(view)
     }
@@ -621,7 +686,15 @@ impl AdminService {
             if class != "included" {
                 continue;
             }
-            let tiers = state.usage.as_ref().map(usage_tiers).unwrap_or_default();
+            let tiers = if account.driver_key == "kiro" {
+                KiroAccountState::parse(&account.account_state)
+                    .usage
+                    .as_ref()
+                    .map(kiro_usage_observations)
+                    .unwrap_or_default()
+            } else {
+                state.usage.as_ref().map(usage_tiers).unwrap_or_default()
+            };
             let score = score_provider(&tiers, Utc::now())
                 .map(|s| dynamic_weight(s.rate) * window_boost(s.window))
                 .unwrap_or(0.0);
@@ -643,7 +716,7 @@ impl AdminService {
         id: &str,
         mut config: DevinPoolConfig,
     ) -> anyhow::Result<AccountPoolView> {
-        self.devin_pool_provider(id).await?;
+        self.account_pool_provider(id).await?;
         config.plan = None;
         config.validate()?;
         // Serialize with all session publications, including first-account adds.
@@ -679,7 +752,17 @@ impl AdminService {
         account_id: Option<&str>,
         expected_version: Option<i32>,
     ) -> anyhow::Result<AuthSessionInitData> {
-        let provider = self.devin_pool_provider(id).await?;
+        self.init_provider_account_session_with_options(id, account_id, expected_version, None)
+            .await
+    }
+    pub async fn init_provider_account_session_with_options(
+        &self,
+        id: &str,
+        account_id: Option<&str>,
+        expected_version: Option<i32>,
+        kiro: Option<auth::KiroLoginOptions>,
+    ) -> anyhow::Result<AuthSessionInitData> {
+        let provider = self.account_pool_provider(id).await?;
         self.provider_pool_config(id)
             .await?
             .context("POOL_NOT_CONFIGURED: configure the pool before adding accounts")?;
@@ -702,7 +785,14 @@ impl AdminService {
             );
         }
         let fence = self.account_login_fence(id).await?;
-        let init = self.init_oauth_session("devin", provider.use_proxy).await?;
+        let driver = if crate::provider::kiro::is_kiro(&provider) {
+            "kiro"
+        } else {
+            "devin"
+        };
+        let init = self
+            .init_oauth_session_with_options(driver, provider.use_proxy, kiro)
+            .await?;
         let mut sessions = self.gw.auth_sessions.write().await;
         let session = sessions
             .get_mut(&init.session_id)
@@ -725,7 +815,7 @@ impl AdminService {
         session_id: &str,
         label: Option<&str>,
     ) -> anyhow::Result<ProviderAccountView> {
-        let provider = self.devin_pool_provider(id).await?;
+        let provider = self.account_pool_provider(id).await?;
         let label = normalize_name(label.unwrap_or("Default account"), "account label")?;
         anyhow::ensure!(label.len() <= 128, "Account label is too long");
         let preview = self
@@ -791,9 +881,23 @@ impl AdminService {
             None
         };
         let permit = STATUS_CONCURRENCY.acquire().await?;
-        let usage = crate::provider::devin::fetch_usage(&self.gw, provider, token.trim()).await?;
+        let fresh = if crate::provider::kiro::is_kiro(provider) {
+            let credential =
+                stored_credential_from_bundle(&session.driver_key, &session.scheme, &bundle);
+            let usage =
+                crate::provider::kiro::fetch_usage(&self.gw, provider, &credential, token.trim())
+                    .await?;
+            let previous_state = previous
+                .as_ref()
+                .map(|a| KiroAccountState::parse(&a.account_state));
+            serde_json::to_string(&authenticated_kiro_state(usage, previous_state.as_ref()))?
+        } else {
+            let usage =
+                crate::provider::devin::fetch_usage(&self.gw, provider, token.trim()).await?;
+            let previous_state = previous.as_ref().map(state);
+            serde_json::to_string(&authenticated_account_state(usage, previous_state.as_ref()))?
+        };
         drop(permit);
-        let previous_state = previous.as_ref().map(state);
         let mut controls = self.gw.auth_session_controls.lock().await;
         anyhow::ensure!(
             !is_expired_at(session.expires_at.as_deref()),
@@ -832,7 +936,6 @@ impl AdminService {
         // an old in-flight request may have landed in that interval. Require a
         // post-replacement authoritative observation before releasing reauth,
         // and do not erase established quota blocks with partial observations.
-        let fresh = authenticated_account_state(usage, previous_state.as_ref());
         // Publish only after successful authenticated probe. A failed CAS cannot
         // overwrite a concurrent logout, disable, or newer request outcome.
         let saved = store
@@ -841,7 +944,7 @@ impl AdminService {
                 &account.account_id,
                 account.status_version,
                 &account.account_state,
-                &serde_json::to_string(&fresh)?,
+                &fresh,
             )
             .await?;
         // Credential publication consumes the result even if state publication
@@ -873,7 +976,7 @@ impl AdminService {
         expected_version: i32,
         mut input: OAuthAccountUpdate,
     ) -> anyhow::Result<ProviderAccountView> {
-        self.devin_pool_provider(id).await?;
+        self.account_pool_provider(id).await?;
         if let Some(label) = &input.label {
             let label = normalize_name(label, "account label")?;
             anyhow::ensure!(label.len() <= 128, "Account label is too long");
@@ -901,7 +1004,7 @@ impl AdminService {
         account_id: &str,
         expected_version: i32,
     ) -> anyhow::Result<()> {
-        self.devin_pool_provider(id).await?;
+        self.account_pool_provider(id).await?;
         anyhow::ensure!(
             self.gw
                 .storage
@@ -927,23 +1030,28 @@ impl AdminService {
                 && account.status == "connected",
             "account is unavailable"
         );
+        let kiro = crate::provider::kiro::is_kiro(provider);
         anyhow::ensure!(
-            crate::provider::devin::is_devin(provider) && provider.effective_auth_mode() == "oauth",
-            "Account runtime currently supports Devin OAuth only"
+            (kiro || crate::provider::devin::is_devin(provider))
+                && provider.effective_auth_mode() == "oauth",
+            "Account runtime supports Devin or Kiro OAuth only"
         );
-        crate::provider::devin::validate(provider)?;
-        // Historical singleton backfills left driver_key empty. Only the
-        // validated Devin parent may supply that missing identity.
+        if kiro {
+            crate::provider::kiro::validate(provider)?;
+        } else {
+            crate::provider::devin::validate(provider)?;
+        }
+        let driver_key = if kiro { "kiro" } else { "devin" };
         anyhow::ensure!(
-            account.driver_key.trim().is_empty() || account.driver_key == "devin",
-            "Account runtime currently supports Devin only"
+            account.driver_key.trim().is_empty() || account.driver_key == driver_key,
+            "Account runtime driver does not match its provider"
         );
-        let credential = stored_credential_from_oauth(account, "devin");
+        let credential = stored_credential_from_oauth(account, driver_key);
         let access_token = credential
             .access_token
             .clone()
             .context("account credential is missing")?;
-        let driver = auth::build_driver("devin").context("Devin auth driver missing")?;
+        let driver = auth::build_driver(driver_key).context("Account auth driver missing")?;
         Ok(ResolvedProviderRuntime {
             access_token,
             binding: driver.bind_runtime(provider, &credential)?,
@@ -989,8 +1097,13 @@ impl AdminService {
         id: &str,
         account_id: &str,
     ) -> anyhow::Result<ProviderAccountView> {
-        let provider = self.devin_pool_provider(id).await?;
+        let provider = self.account_pool_provider(id).await?;
         let config = self.provider_pool_config(id).await?;
+        if crate::provider::kiro::is_kiro(&provider) {
+            return self
+                .refresh_kiro_account_usage_locked(&provider, account_id, config.as_ref())
+                .await;
+        }
         let store = self.gw.storage.oauth_credentials();
         let account = store
             .get_account(id, account_id)
@@ -1054,6 +1167,9 @@ impl AdminService {
         Ok(safe_account(&updated, config.as_ref()))
     }
     pub(super) fn account_pool_provider_usage(&self, view: AccountPoolView) -> ProviderUsage {
+        if view.kind.as_deref() == Some("kiro") {
+            return self.kiro_account_pool_provider_usage(view);
+        }
         let mut tiers = Vec::new();
         let mut balances = Vec::new();
         if view.config.is_some() {
@@ -1128,7 +1244,7 @@ impl AdminService {
         id: &str,
         due_only: bool,
     ) -> anyhow::Result<AccountPoolView> {
-        self.devin_pool_provider(id).await?;
+        self.account_pool_provider(id).await?;
         let accounts = self
             .gw
             .storage
@@ -1143,7 +1259,11 @@ impl AdminService {
         let jobs = accounts.into_iter().filter(|a| {
             a.is_enabled
                 && a.status == "connected"
-                && !state(a).auth_invalid
+                && !(if a.driver_key == "kiro" {
+                    KiroAccountState::parse(&a.account_state).auth_invalid
+                } else {
+                    state(a).auth_invalid
+                })
                 && (!due_only || self.gw.account_quota_registry.is_due(&a.account_id))
         });
         stream::iter(jobs).for_each_concurrent(4, |account| async move {

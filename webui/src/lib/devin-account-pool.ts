@@ -16,6 +16,24 @@ export interface AccountQuotaWindow {
   resets_at: string | null;
 }
 
+/** Raw Kiro allowances: never interpret them as Devin daily/weekly windows. */
+export interface KiroUsageItem {
+  resource: string;
+  kind: string;
+  name: string;
+  used: number;
+  limit: number;
+  resets_at: string | null;
+}
+
+export interface KiroUsage {
+  plan: string | null;
+  email: string | null;
+  resets_at: string | null;
+  overage_enabled: boolean;
+  items: KiroUsageItem[];
+}
+
 export interface ProviderAccountView {
   account_id: string;
   provider_id: string;
@@ -30,6 +48,7 @@ export interface ProviderAccountView {
   daily: AccountQuotaWindow | null;
   weekly: AccountQuotaWindow | null;
   reserve_usd: number | null;
+  kiro_usage?: KiroUsage | null;
   observed_at: number | null;
   stale: boolean;
   updated_at: string;
@@ -60,6 +79,7 @@ export interface AccountPoolCounts {
 }
 
 export interface AccountPoolView {
+  kind?: "devin" | "kiro";
   provider_id: string;
   config: DevinPoolConfig | null;
   accounts: ProviderAccountView[];

@@ -316,7 +316,7 @@ pub trait OAuthCredentialStore: Send + Sync {
         account_id: &str,
     ) -> anyhow::Result<Option<OAuthCredential>>;
     /// Creates a new UUID; validates OAuth parent/vendor, deduplicates normalized
-    /// credentials and enforces non-Devin max_accounts=1 under the same lock.
+    /// credentials and enforces max_accounts=1 except for Devin/Kiro under the same lock.
     async fn create_account(
         &self,
         provider_id: &str,
@@ -356,6 +356,35 @@ pub trait OAuthCredentialStore: Send + Sync {
         expected_version: i32,
         expected_state: &str,
         new_state: &str,
+    ) -> anyhow::Result<bool>;
+    /// Acquire this exact account's connected generation for refresh. Preserves
+    /// account state, label, priority and enablement; never touches sibling rows.
+    async fn try_begin_account_refresh(
+        &self,
+        provider_id: &str,
+        account_id: &str,
+        expected_version: i32,
+    ) -> anyhow::Result<Option<OAuthCredential>>;
+    /// Complete only this account's refreshing generation, preserving account
+    /// state and operator metadata. Stale/missing/disconnected targets return None.
+    async fn complete_account_refresh(
+        &self,
+        provider_id: &str,
+        account_id: &str,
+        expected_version: i32,
+        input: UpsertOAuthCredential,
+    ) -> anyhow::Result<Option<OAuthCredential>>;
+    /// Fail only this account's refreshing generation, to error when terminal or
+    /// connected when retryable. None preserves metadata; supplied metadata must
+    /// be sanitized/allowlisted. Preserves account state and operator metadata.
+    async fn fail_account_refresh_with_policy(
+        &self,
+        provider_id: &str,
+        account_id: &str,
+        expected_version: i32,
+        error_message: &str,
+        terminal: bool,
+        meta: Option<String>,
     ) -> anyhow::Result<bool>;
     /// All provider-only methods fail with AMBIGUOUS_ACCOUNT for >1 active row,
     /// counting disabled/error accounts too; writes never affect multiple rows.

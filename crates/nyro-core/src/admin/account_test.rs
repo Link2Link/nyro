@@ -9,7 +9,7 @@ const ACCOUNT_TEST_CONCURRENCY: usize = 4;
 const ACCOUNT_TEST_TIMEOUT: Duration = Duration::from_secs(15);
 
 impl AdminService {
-    pub(super) async fn test_devin_account_connections(
+    pub(super) async fn test_pool_account_connections(
         &self,
         provider: &Provider,
     ) -> anyhow::Result<TestResult> {
@@ -20,8 +20,10 @@ impl AdminService {
             .list_accounts(&provider.id)
             .await?;
         let admin = self.clone();
+        let kiro = crate::provider::kiro::is_kiro(provider);
+        let name = if kiro { "Kiro" } else { "Devin" };
         let provider = provider.clone();
-        Ok(probe_accounts(accounts, move |account| {
+        let mut result = probe_accounts(accounts, move |account| {
             let admin = admin.clone();
             let provider = provider.clone();
             async move {
@@ -34,15 +36,33 @@ impl AdminService {
                 if !same_generation(current.as_ref(), &account) {
                     return Ok(ProbeOutcome::Changed);
                 }
+                let account = if kiro {
+                    admin.refresh_kiro_pool_account(&provider, &account).await?
+                } else {
+                    account
+                };
                 let runtime = admin
                     .resolve_provider_account_runtime(&provider, &account)
                     .await?;
-                let outcome = crate::provider::devin::check_connection(
-                    &admin.gw,
-                    &provider,
-                    &runtime.access_token,
-                )
-                .await;
+                let outcome = if kiro {
+                    crate::provider::kiro::check_connection(
+                        &admin.gw,
+                        &provider,
+                        runtime
+                            .credential
+                            .as_ref()
+                            .context("account credential is missing")?,
+                        &runtime.access_token,
+                    )
+                    .await
+                } else {
+                    crate::provider::devin::check_connection(
+                        &admin.gw,
+                        &provider,
+                        &runtime.access_token,
+                    )
+                    .await
+                };
                 // A removal, disable, or reauthorization while the RPC ran is
                 // authoritative. Do not report old credentials as a current pass.
                 let current = admin
@@ -57,7 +77,16 @@ impl AdminService {
                 outcome.map(|()| ProbeOutcome::Connected)
             }
         })
-        .await)
+        .await;
+        // Shared probe logic keeps its legacy Devin wording for compatibility.
+        // Public Kiro results use their own vendor name, never upstream text.
+        if kiro {
+            result.error = result.error.map(|e| e.replace("Devin", name));
+            for account in &mut result.accounts {
+                account.error = account.error.take().map(|e| e.replace("Devin", name));
+            }
+        }
+        Ok(result)
     }
 }
 
@@ -151,6 +180,8 @@ fn safe_probe_error(error: &anyhow::Error) -> String {
     let text = error.to_string();
     if text.starts_with("Devin authentication failed (HTTP 401)")
         || text.starts_with("Devin authentication failed (HTTP 403)")
+        || text.starts_with("Kiro authentication failed (HTTP 401)")
+        || text.starts_with("Kiro authentication failed (HTTP 403)")
     {
         "Devin account authentication was rejected; sign in again".into()
     } else if text == "account is unavailable" || text == "account credential is missing" {

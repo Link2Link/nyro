@@ -1313,6 +1313,26 @@ impl AdminService {
                 );
             }
         }
+        if crate::provider::kiro::is_kiro(provider) {
+            let state =
+                crate::provider::account_pool::KiroAccountState::parse(&oauth_cred.account_state);
+            anyhow::ensure!(
+                oauth_cred.is_enabled && !state.auth_invalid && !state.hard_quota,
+                "Kiro account is unavailable; refresh usage or reauthorize"
+            );
+            if let Some(config) = self.provider_pool_config(&provider.id).await? {
+                anyhow::ensure!(
+                    state.cost_class(&config).is_some(),
+                    "Kiro account is not eligible for the configured pool"
+                );
+            }
+            let account = self
+                .refresh_kiro_pool_account(provider, &oauth_cred)
+                .await?;
+            return self
+                .resolve_provider_account_runtime(provider, &account)
+                .await;
+        }
         // Terminal refresh failure (`refresh_failure_policy` classified the
         // refresh token itself as rejected): the whole session lineage is
         // dead, so even a nominally-unexpired access token must not be
@@ -1446,6 +1466,116 @@ impl AdminService {
         })
     }
 
+    /// Refresh one immutable account generation, never a provider's ambiguous
+    /// singleton slot. Local singleflight joins work; storage CAS fences replicas.
+    /// Call before selection; runtime binding itself does not mutate generations.
+    ///
+    /// The work runs in a detached task: a cancelled or timed-out request must
+    /// not drop a claimed `refreshing` lease midway (stranding the account
+    /// until the stale-lease sweep) or lose a rotated refresh token that the
+    /// upstream already issued. Dropping the returned future only stops waiting.
+    pub(crate) async fn refresh_kiro_pool_account(
+        &self,
+        provider: &Provider,
+        account: &OAuthCredential,
+    ) -> anyhow::Result<OAuthCredential> {
+        let admin = self.clone();
+        let provider = provider.clone();
+        let account = account.clone();
+        tokio::spawn(async move {
+            admin
+                .refresh_kiro_pool_account_inner(&provider, &account)
+                .await
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("Kiro account refresh task failed"))?
+    }
+
+    async fn refresh_kiro_pool_account_inner(
+        &self,
+        provider: &Provider,
+        account: &OAuthCredential,
+    ) -> anyhow::Result<OAuthCredential> {
+        anyhow::ensure!(
+            crate::provider::kiro::is_kiro(provider) && account.provider_id == provider.id,
+            "Kiro account target mismatch"
+        );
+        let lock = self
+            .gw
+            .account_quota_registry
+            .refresh_lock(&format!("oauth:{}", account.account_id));
+        let _guard = lock.lock().await;
+        let store = self.gw.storage.oauth_credentials();
+        let current = store
+            .get_account(&provider.id, &account.account_id)
+            .await?
+            .context("account not found")?;
+        anyhow::ensure!(
+            current.is_enabled && matches!(current.status.as_str(), "connected" | "refreshing"),
+            "account is unavailable"
+        );
+        let due = current.access_token.trim().is_empty()
+            || current.expires_at.as_deref().is_some_and(|raw| {
+                parse_datetime_utc(raw)
+                    .is_none_or(|at| at <= Utc::now() + chrono::Duration::seconds(300))
+            });
+        if current.status == "connected" && !due {
+            return Ok(current);
+        }
+        if current.status == "connected"
+            && current.status_version != account.status_version
+            && !current.access_token.trim().is_empty()
+            && !is_expired_at(current.expires_at.as_deref())
+        {
+            return Ok(current);
+        }
+        let driver = auth::build_driver("kiro").context("Kiro auth driver missing")?;
+        let credential = stored_credential_from_oauth(&current, "kiro");
+        if let Some(lease) = store
+            .try_begin_account_refresh(&provider.id, &current.account_id, current.status_version)
+            .await?
+        {
+            self.refresh_locked_credential(provider, &credential, &lease, driver.as_ref())
+                .await?;
+            self.bump_config_epoch().await?;
+        } else {
+            // A different replica owns the account lease. Wait boundedly for its
+            // result, never route the expired token that triggered the refresh.
+            for attempt in 0..300 {
+                let joined = store
+                    .get_account(&provider.id, &current.account_id)
+                    .await?
+                    .context("account disappeared during refresh")?;
+                if joined.status != "refreshing" {
+                    anyhow::ensure!(
+                        joined.is_enabled
+                            && joined.status == "connected"
+                            && !joined.access_token.trim().is_empty()
+                            && !is_expired_at(joined.expires_at.as_deref()),
+                        "Kiro account refresh failed or was superseded"
+                    );
+                    return Ok(joined);
+                }
+                if attempt < 299 {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            }
+            anyhow::bail!("Concurrent Kiro account refresh timed out");
+        }
+        let refreshed = store
+            .get_account(&provider.id, &current.account_id)
+            .await?
+            .context("account disappeared during refresh")?;
+        anyhow::ensure!(
+            refreshed.is_enabled
+                && refreshed.status == "connected"
+                && !refreshed.access_token.trim().is_empty()
+                && !is_expired_at(refreshed.expires_at.as_deref()),
+            "Kiro account refresh was superseded"
+        );
+        Ok(refreshed)
+    }
+
     pub(super) async fn sync_provider_runtime_fields(
         &self,
         provider: &Provider,
@@ -1521,6 +1651,19 @@ impl AdminService {
                 None => continue,
             };
 
+            if crate::provider::kiro::is_kiro(&provider) {
+                if !cred.is_enabled {
+                    continue;
+                }
+                match self.refresh_kiro_pool_account(&provider, &cred).await {
+                    Ok(_) => refreshed += 1,
+                    Err(_) => {
+                        tracing::warn!(provider_id = %provider.id, account_id = %cred.account_id,
+                        "Background Kiro account refresh failed")
+                    }
+                }
+                continue;
+            }
             match self.proactive_refresh_credential(&provider, &cred).await {
                 Ok(_) => refreshed += 1,
                 Err(error) => tracing::warn!(
@@ -1618,15 +1761,28 @@ impl AdminService {
             Ok(bundle) => bundle,
             Err(error) => {
                 let (terminal, meta, message) = refresh_failure_policy(credential, &error);
-                store
-                    .fail_refresh_with_policy(
-                        &provider.id,
-                        lease.status_version,
-                        &message,
-                        terminal,
-                        meta,
-                    )
-                    .await?;
+                if crate::provider::kiro::is_kiro(provider) {
+                    store
+                        .fail_account_refresh_with_policy(
+                            &provider.id,
+                            &lease.account_id,
+                            lease.status_version,
+                            "Kiro credential refresh failed",
+                            terminal,
+                            meta,
+                        )
+                        .await?;
+                } else {
+                    store
+                        .fail_refresh_with_policy(
+                            &provider.id,
+                            lease.status_version,
+                            &message,
+                            terminal,
+                            meta,
+                        )
+                        .await?;
+                }
                 return Err(error);
             }
         };
@@ -1635,16 +1791,29 @@ impl AdminService {
             refreshed_scheme(driver, credential),
             &bundle,
         );
-        match tokio::time::timeout_at(
-            deadline,
-            store.complete_refresh(&provider.id, lease.status_version, input),
-        )
-        .await
-        .unwrap_or_else(|_| {
-            Err(anyhow::anyhow!(
-                "OAuth refresh publication deadline exceeded"
-            ))
-        }) {
+        let publish = async {
+            if crate::provider::kiro::is_kiro(provider) {
+                store
+                    .complete_account_refresh(
+                        &provider.id,
+                        &lease.account_id,
+                        lease.status_version,
+                        input,
+                    )
+                    .await
+            } else {
+                store
+                    .complete_refresh(&provider.id, lease.status_version, input)
+                    .await
+            }
+        };
+        match tokio::time::timeout_at(deadline, publish)
+            .await
+            .unwrap_or_else(|_| {
+                Err(anyhow::anyhow!(
+                    "OAuth refresh publication deadline exceeded"
+                ))
+            }) {
             Ok(Some(_)) => Ok(bundle),
             Ok(None) => anyhow::bail!("OAuth refresh result was superseded by newer credentials"),
             Err(error) => Err(error),
@@ -2581,5 +2750,192 @@ mod lifecycle_tests {
             }
         ));
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod kiro_account_refresh_tests {
+    use super::*;
+    struct RefreshFixture {
+        reject: bool,
+    }
+    #[async_trait::async_trait]
+    impl auth::AuthDriver for RefreshFixture {
+        fn metadata(&self) -> auth::AuthDriverMetadata {
+            auth::build_driver("kiro").unwrap().metadata()
+        }
+        fn supports_session_scheme(&self, scheme: &str) -> bool {
+            matches!(scheme, "oauth_device_code" | "oauth_auth_code_pkce")
+        }
+        async fn refresh(
+            &self,
+            credential: &StoredCredential,
+            _: RefreshAuthContext,
+        ) -> anyhow::Result<CredentialBundle> {
+            if self.reject {
+                anyhow::bail!("Kiro rejected the refresh token PRIVATE");
+            }
+            Ok(CredentialBundle {
+                access_token: Some("rotated-account-a".into()),
+                refresh_token: None,
+                expires_at: Some((Utc::now() + chrono::Duration::hours(1)).to_rfc3339()),
+                resource_url: credential.resource_url.clone(),
+                raw: credential.meta.clone(),
+                ..Default::default()
+            })
+        }
+    }
+    async fn setup() -> (Gateway, Provider, OAuthCredential, OAuthCredential) {
+        let provider: Provider = serde_json::from_value(serde_json::json!({
+            "id":"kiro", "name":"Kiro", "vendor":"kiro", "preset_key":"kiro", "channel":"ide",
+            "protocol":"kiro-chat/generate-assistant-response/v1", "protocol_mode":"fixed",
+            "base_url":"https://q.us-east-1.amazonaws.com", "protocol_endpoints":[],"keys":[],
+            "api_key":"","auth_mode":"oauth","use_proxy":false,"fast_mode":false,
+            "is_enabled":true,"created_at":"","updated_at":""
+        }))
+        .unwrap();
+        let storage = Arc::new(crate::storage::MemoryStorage::new(
+            vec![provider.clone()],
+            vec![],
+            vec![],
+        ));
+        let gw = Gateway::from_storage(crate::config::GatewayConfig::default(), storage)
+            .await
+            .unwrap()
+            .0;
+        let make = |name: &str| UpsertOAuthCredential {
+            driver_key: "kiro".into(),
+            scheme: "oauth_device_code".into(),
+            access_token: format!("old-{name}"),
+            refresh_token: Some(format!("refresh-{name}")),
+            expires_at: Some("2000-01-01T00:00:00Z".into()),
+            resource_url: Some("https://q.us-east-1.amazonaws.com".into()),
+            ..Default::default()
+        };
+        let a = gw
+            .storage
+            .oauth_credentials()
+            .create_account("kiro", "A", make("a"))
+            .await
+            .unwrap();
+        let b = gw
+            .storage
+            .oauth_credentials()
+            .create_account("kiro", "B", make("b"))
+            .await
+            .unwrap();
+        (gw, provider, a, b)
+    }
+    #[tokio::test]
+    async fn kiro_refresh_rotates_only_the_leased_account_and_preserves_device_scheme() {
+        let (gw, p, a, b) = setup().await;
+        let store = gw.storage.oauth_credentials();
+        let lease = store
+            .try_begin_account_refresh(&p.id, &a.account_id, a.status_version)
+            .await
+            .unwrap()
+            .unwrap();
+        gw.admin()
+            .refresh_locked_credential(
+                &p,
+                &stored_credential_from_oauth(&a, "kiro"),
+                &lease,
+                &RefreshFixture { reject: false },
+            )
+            .await
+            .unwrap();
+        let a = store
+            .get_account(&p.id, &a.account_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let b = store
+            .get_account(&p.id, &b.account_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(a.access_token, "rotated-account-a");
+        assert_eq!(a.refresh_token.as_deref(), Some("refresh-a"));
+        assert_eq!(a.scheme, "oauth_device_code");
+        assert_eq!(b.access_token, "old-b");
+        assert_eq!(b.status, "connected");
+    }
+    #[tokio::test]
+    async fn kiro_terminal_refresh_failure_is_account_local_and_sanitized() {
+        let (gw, p, a, b) = setup().await;
+        let store = gw.storage.oauth_credentials();
+        let lease = store
+            .try_begin_account_refresh(&p.id, &a.account_id, a.status_version)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            gw.admin()
+                .refresh_locked_credential(
+                    &p,
+                    &stored_credential_from_oauth(&a, "kiro"),
+                    &lease,
+                    &RefreshFixture { reject: true }
+                )
+                .await
+                .is_err()
+        );
+        let a = store
+            .get_account(&p.id, &a.account_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let b = store
+            .get_account(&p.id, &b.account_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(a.status, "error");
+        assert!(!a.last_error.unwrap().contains("PRIVATE"));
+        assert_eq!(b.status, "connected");
+        assert_eq!(b.access_token, "old-b");
+    }
+    #[tokio::test]
+    async fn kiro_late_refresh_cannot_resurrect_disconnect_or_modify_sibling() {
+        let (gw, p, a, b) = setup().await;
+        let store = gw.storage.oauth_credentials();
+        let lease = store
+            .try_begin_account_refresh(&p.id, &a.account_id, a.status_version)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            store
+                .disconnect_account(&p.id, &a.account_id, lease.status_version)
+                .await
+                .unwrap()
+        );
+        assert!(
+            gw.admin()
+                .refresh_locked_credential(
+                    &p,
+                    &stored_credential_from_oauth(&a, "kiro"),
+                    &lease,
+                    &RefreshFixture { reject: false }
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            store
+                .get_account(&p.id, &a.account_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            store
+                .get_account(&p.id, &b.account_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .access_token,
+            "old-b"
+        );
     }
 }

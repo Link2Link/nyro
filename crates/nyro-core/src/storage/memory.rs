@@ -650,6 +650,58 @@ impl OAuthCredentialStore for MemoryOAuthCredentialStore {
             .await?;
         Ok(())
     }
+    async fn try_begin_account_refresh(
+        &self,
+        provider_id: &str,
+        account_id: &str,
+        expected_version: i32,
+    ) -> anyhow::Result<Option<OAuthCredential>> {
+        self.mutate(
+            provider_id,
+            crate::storage::oauth::Mutation::BeginAccountRefresh(account_id, expected_version),
+        )
+        .await
+    }
+    async fn complete_account_refresh(
+        &self,
+        provider_id: &str,
+        account_id: &str,
+        expected_version: i32,
+        input: UpsertOAuthCredential,
+    ) -> anyhow::Result<Option<OAuthCredential>> {
+        self.mutate(
+            provider_id,
+            crate::storage::oauth::Mutation::CompleteAccountRefresh(
+                account_id,
+                expected_version,
+                &input,
+            ),
+        )
+        .await
+    }
+    async fn fail_account_refresh_with_policy(
+        &self,
+        provider_id: &str,
+        account_id: &str,
+        expected_version: i32,
+        error_message: &str,
+        terminal: bool,
+        meta: Option<String>,
+    ) -> anyhow::Result<bool> {
+        Ok(self
+            .mutate(
+                provider_id,
+                crate::storage::oauth::Mutation::FailAccountRefresh(
+                    account_id,
+                    expected_version,
+                    error_message,
+                    terminal,
+                    meta.as_deref(),
+                ),
+            )
+            .await?
+            .is_some())
+    }
     async fn try_begin_refresh(
         &self,
         provider_id: &str,

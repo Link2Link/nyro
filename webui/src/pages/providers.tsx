@@ -87,6 +87,7 @@ import { ProviderMoreActions } from "@/components/provider-more-actions";
 import { groupProviders, isStandaloneGroup, providerGroupKey, providerNeedsAttention, parseGroupExpansion, isGroupExpanded, PROVIDER_GROUP_STORAGE_KEY } from "@/lib/provider-groups";
 import { GroupUsageSummary, ProviderUsageFooter } from "@/components/provider-usage";
 import { DevinAccountPoolCard, DevinAccountPoolPanel } from "@/components/devin-account-pool";
+import { KiroAccountPoolCard, KiroAccountPoolPanel } from "@/components/kiro-account-pool";
 import { newDevinPoolConfig } from "@/lib/devin-account-pool";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { resolveProtocol, PROTOCOL_ENDPOINT_TABLE, PROTOCOL_TABLE } from "@/lib/protocol";
@@ -1017,7 +1018,7 @@ export default function ProvidersPage() {
   const editOAuthStatusQuery = useQuery<ProviderOAuthStatusData>({
     queryKey: ["provider-oauth-status", editingProvider?.id],
     queryFn: () => backend("get_provider_oauth_status", { id: editingProvider?.id }),
-    enabled: isEditingOAuthProvider && !isDevinProvider(editingProvider ?? {}),
+    enabled: isEditingOAuthProvider && !isDevinProvider(editingProvider) && !isKiroProvider(editingProvider),
   });
 
   function syncProviderOAuthStatus(status: ProviderOAuthStatusData) {
@@ -2965,9 +2966,6 @@ export default function ProvidersPage() {
                     </>}
                     {isKiroProvider(editForm) && <>
                       <KiroLoginNotice isZh={isZh} />
-                      <KiroLoginOptionsForm value={editKiroLogin} isZh={isZh}
-                        disabled={reconnectOAuthMut.isPending || logoutOAuthMut.isPending}
-                        onChange={(value) => { resetEditOAuthState(); setShowEditReauth(false); setEditKiroLogin(value); }} />
                       <div className="col-span-2 space-y-2">
                         <FieldLabel>{isZh ? "Kiro 模型（每行一个）" : "Kiro models (one per line)"}</FieldLabel>
                         <textarea
@@ -2982,6 +2980,8 @@ export default function ProvidersPage() {
                     </>}
                     {editingResolvedAuthMode === "oauth" && isDevinProvider(p) ? (
                       <div className="col-span-2"><DevinAccountPoolPanel provider={p} /></div>
+                    ) : editingResolvedAuthMode === "oauth" && isKiroProvider(p) ? (
+                      <div className="col-span-2"><KiroAccountPoolPanel key={p.id} provider={p} /></div>
                     ) : editingResolvedAuthMode === "oauth" ? (
                       <details className="col-span-2 rounded-xl border border-slate-200 bg-slate-50" open={editOAuthStatus?.status !== "connected" || showEditReauth}>
                         <summary className="flex items-center justify-between gap-3 p-4 cursor-pointer list-none [&::-webkit-details-marker]:hidden">
@@ -4134,7 +4134,7 @@ export default function ProvidersPage() {
                     </ProviderMoreActions>
                   </div>
                 </div>
-                {isDevinProvider(p) ? <DevinAccountPoolCard provider={p} /> : providerUsageSupported(p) && <ProviderUsageFooter provider={p} />}
+                {isDevinProvider(p) ? <DevinAccountPoolCard provider={p} /> : isKiroProvider(p) ? <KiroAccountPoolCard provider={p} /> : providerUsageSupported(p) && <ProviderUsageFooter provider={p} />}
               </div>
             );
           })}

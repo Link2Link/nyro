@@ -615,7 +615,7 @@ async fn dispatch_pipeline_inner(
     for provider_id in route_decision.unnamed_provider_ids() {
         if let Ok(Some(provider)) = gw.storage.providers().get(&provider_id).await {
             route_decision.set_provider_name(&provider_id, &provider.name);
-            if crate::provider::devin::is_devin(&provider)
+            if crate::provider::account_pool::supports_pool(&provider)
                 && gw
                     .admin()
                     .provider_pool_config(&provider_id)
@@ -781,21 +781,32 @@ async fn dispatch_pipeline_inner(
             .map(|(_, account, _)| account.clone())
             .collect();
         let pool_account = {
-            match account_pool::candidates(
-                &gw,
-                &provider,
-                &actual_model,
-                &request,
-                auth_key.id.as_deref(),
-                &account_exclusions,
-            )
-            .await
-            {
+            let selection = tokio::select! {
+                biased;
+                _ = ctx.cancellation.cancelled() => {
+                    return GatewayError::ClientCancelled.render(None);
+                }
+                _ = tokio::time::sleep(ctx.deadline.remaining()) => {
+                    return GatewayError::UpstreamTimeout {
+                        phase: crate::error::TimeoutPhase::Total,
+                    }
+                    .render(None);
+                }
+                result = account_pool::candidates(
+                    &gw,
+                    &provider,
+                    &actual_model,
+                    request,
+                    auth_key.id.as_deref(),
+                    &account_exclusions,
+                ) => result,
+            };
+            match selection {
                 Ok(Some(accounts)) => {
                     let Some(first) = accounts.first().cloned() else {
                         last_response = Some(pool_error_response(
                             503,
-                            "Devin account pool has no available accounts",
+                            "Account pool has no available accounts",
                         ));
                         skip_key_siblings!();
                         continue;
@@ -813,10 +824,7 @@ async fn dispatch_pipeline_inner(
                 Ok(None) => None,
                 Err(error) => {
                     tracing::warn!(provider_id=%provider.id, error=%error, "account pool selection failed");
-                    last_response = Some(pool_error_response(
-                        503,
-                        "Devin account pool is unavailable",
-                    ));
+                    last_response = Some(pool_error_response(503, "Account pool is unavailable"));
                     continue;
                 }
             }
@@ -974,7 +982,19 @@ async fn dispatch_pipeline_inner(
                     502,
                     &format!("provider credential error: {e}"),
                 ));
-                skip_key_siblings!();
+                if let Some(account) = &pool_account {
+                    visited_accounts.insert((
+                        provider.id.clone(),
+                        account.credential.account_id.clone(),
+                        actual_model.clone(),
+                    ));
+                    gw.account_pool.release_generation(
+                        &account.credential.account_id,
+                        account.credential.status_version,
+                    );
+                } else {
+                    skip_key_siblings!();
+                }
                 continue;
             }
         };
@@ -1371,12 +1391,12 @@ async fn dispatch_pipeline_inner(
                 }
                 return response;
             }
-            // Devin needs explicit protocol rejection evidence, never a final
-            // rendered 401/403 alone. Keep other native vendors' existing policy.
-            let devin_safe_refusal =
+            // Native account pools need explicit refusal evidence, never just
+            // a rendered status or absence of downstream bytes.
+            let safe_account_refusal =
                 account_failure.is_some_and(|failure| failure.rejected_before_execution);
-            let can_retry = if crate::provider::devin::is_devin(&provider) {
-                (devin_safe_refusal || (!control.is_submitted() && is_retryable(status)))
+            let can_retry = if crate::provider::account_pool::supports_pool(&provider) {
+                (safe_account_refusal || (!control.is_submitted() && is_retryable(status)))
                     && crate::provider::account_pool::can_reconstruct(&request)
             } else {
                 attempt.retry.should_retry(is_retryable(status)) || is_credential_rejection(status)
@@ -1393,7 +1413,7 @@ async fn dispatch_pipeline_inner(
                 );
             }
             last_response = Some(response);
-            if pool_account.is_some() && devin_safe_refusal && pending_key_siblings > 0 {
+            if pool_account.is_some() && safe_account_refusal && pending_key_siblings > 0 {
                 continue;
             }
             skip_key_siblings!();

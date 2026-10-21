@@ -1,4 +1,4 @@
-//! Account-scoped admission and affinity for mixed Devin subscriptions.
+//! Account-scoped admission and affinity for Devin and Kiro subscriptions.
 //! Credentials stay in storage; this registry contains only bounded scheduling
 //! hints. A request always carries an immutable credential generation.
 use std::collections::{HashMap, HashSet};
@@ -89,6 +89,71 @@ impl DevinAccountState {
     }
 }
 
+/// Kiro keeps real resource allowances instead of Devin plan-equivalent units.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub(crate) struct KiroAccountState {
+    pub usage: Option<super::kiro::KiroUsage>,
+    pub observed_at: Option<i64>,
+    pub usage_stale: bool,
+    pub auth_invalid: bool,
+    pub hard_quota: bool,
+    pub hard_quota_reason: Option<String>,
+    pub rejection_revision: u64,
+}
+
+impl KiroAccountState {
+    pub fn parse(raw: &str) -> Self {
+        serde_json::from_str(raw).unwrap_or_default()
+    }
+
+    pub fn included_exhausted(&self) -> bool {
+        self.usage.as_ref().is_some_and(|usage| {
+            usage
+                .resource_pools()
+                .iter()
+                .any(|pool| pool.used >= pool.limit)
+        })
+    }
+
+    pub fn usage_complete(&self) -> bool {
+        self.usage
+            .as_ref()
+            .is_some_and(|usage| !usage.resource_pools().is_empty())
+    }
+
+    pub fn cost_class(&self, config: &DevinPoolConfig) -> Option<u8> {
+        if self.auth_invalid || self.hard_quota {
+            return None;
+        }
+        if self.included_exhausted() {
+            return (config.reserve_policy == DevinReservePolicy::Fallback
+                && self
+                    .usage
+                    .as_ref()
+                    .is_some_and(|usage| usage.overage_enabled))
+            .then_some(2);
+        }
+        Some(if self.usage_complete() { 0 } else { 1 })
+    }
+}
+
+pub(crate) fn supports_pool(provider: &crate::db::models::Provider) -> bool {
+    provider.effective_auth_mode() == "oauth"
+        && (super::devin::is_devin(provider) || super::kiro::is_kiro(provider))
+}
+
+pub(crate) fn account_cost_class(
+    account: &OAuthCredential,
+    config: &DevinPoolConfig,
+) -> Option<u8> {
+    if account.driver_key == "kiro" {
+        KiroAccountState::parse(&account.account_state).cost_class(config)
+    } else {
+        DevinAccountState::parse(&account.account_state).cost_class(config)
+    }
+}
+
 struct Binding {
     account_id: String,
     version: i32,
@@ -136,9 +201,13 @@ impl AccountPoolRegistry {
         let mut eligible = accounts
             .iter()
             .filter_map(|account| {
+                // A Kiro account mid-refresh is still a member: admission joins
+                // the in-flight account lease instead of reporting an empty pool.
+                let joinable_refresh =
+                    account.driver_key == "kiro" && account.status == "refreshing";
                 if account.provider_id != provider_id
                     || !account.is_enabled
-                    || account.status != "connected"
+                    || (account.status != "connected" && !joinable_refresh)
                     || account.access_token.trim().is_empty()
                     || excluded.contains(&account.account_id)
                     || state
@@ -152,7 +221,7 @@ impl AccountPoolRegistry {
                 {
                     return None;
                 }
-                let class = DevinAccountState::parse(&account.account_state).cost_class(config)?;
+                let class = account_cost_class(account, config)?;
                 Some((class, account))
             })
             .collect::<Vec<_>>();
@@ -415,6 +484,75 @@ mod tests {
     fn config() -> DevinPoolConfig {
         DevinPoolConfig::default()
     }
+    fn kiro_account(id: &str, used: f64, limit: f64, overage: bool) -> OAuthCredential {
+        let mut account = account(id, 100, 100);
+        account.driver_key = "kiro".into();
+        let usage = super::super::kiro::usage::parse(&serde_json::json!({
+            "subscriptionInfo":{"subscriptionTitle":"KIRO PRO"},
+            "overageConfiguration":{"overageEnabled":overage},
+            "usageBreakdownList":[{"resourceType":"CREDITS","currentUsage":used,"usageLimit":limit}]
+        }));
+        account.account_state = serde_json::to_string(&KiroAccountState {
+            usage: Some(usage),
+            ..Default::default()
+        })
+        .unwrap();
+        account
+    }
+
+    #[test]
+    fn kiro_pool_round_robin_affinity_priority_and_real_allowances() {
+        let registry = AccountPoolRegistry::default();
+        let mut accounts = vec![
+            kiro_account("a", 10.0, 100.0, false),
+            kiro_account("b", 100.0, 1000.0, false),
+        ];
+        let config = config();
+        let empty = HashSet::new();
+        assert_eq!(
+            registry.ordered("p", "m", &config, &accounts, Some("s"), &empty)[0].account_id,
+            "a"
+        );
+        assert_eq!(
+            registry.ordered("p", "m", &config, &accounts, Some("s"), &empty)[0].account_id,
+            "a"
+        );
+        assert_eq!(
+            registry.ordered("p", "m", &config, &accounts, None, &empty)[0].account_id,
+            "b"
+        );
+        accounts[1].priority = -1;
+        assert_eq!(
+            registry.ordered("p", "m", &config, &accounts, Some("s"), &empty)[0].account_id,
+            "b"
+        );
+        registry.cooldown("b", 0, "m", Some(30));
+        assert_eq!(
+            registry.ordered("p", "m", &config, &accounts, Some("s"), &empty)[0].account_id,
+            "a"
+        );
+    }
+
+    #[test]
+    fn kiro_unknown_usage_does_not_override_blocks_or_enable_paid_usage() {
+        let mut config = config();
+        let exhausted = kiro_account("a", 100.0, 100.0, true);
+        assert_eq!(account_cost_class(&exhausted, &config), None);
+        config.reserve_policy = DevinReservePolicy::Fallback;
+        assert_eq!(account_cost_class(&exhausted, &config), Some(2));
+        assert_eq!(
+            account_cost_class(&kiro_account("b", 100.0, 100.0, false), &config),
+            None
+        );
+        let mut state = KiroAccountState::default();
+        assert_eq!(state.cost_class(&config), Some(1));
+        state.hard_quota = true;
+        assert_eq!(state.cost_class(&config), None);
+        state.hard_quota = false;
+        state.auth_invalid = true;
+        assert_eq!(state.cost_class(&config), None);
+    }
+
     #[test]
     fn round_robin_new_sessions_and_stable_affinity() {
         let registry = AccountPoolRegistry::default();

@@ -197,7 +197,7 @@ function resolveHTTP(cmd: string, args?: Record<string, unknown>): HTTPMapping {
     case "init_provider_account_session":
       return {
         method: "POST", url: `${base}/providers/${encodeURIComponent(String(args?.id))}/accounts/auth-sessions`,
-        body: { account_id: args?.accountId ?? null, expected_version: args?.expectedVersion ?? null },
+        body: { account_id: args?.accountId ?? null, expected_version: args?.expectedVersion ?? null, kiro: args?.kiro },
       };
     case "bind_provider_account":
       return {

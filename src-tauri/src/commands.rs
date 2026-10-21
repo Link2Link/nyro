@@ -409,9 +409,15 @@ pub async fn init_provider_account_session(
     id: String,
     account_id: Option<String>,
     expected_version: Option<i32>,
+    kiro: Option<nyro_core::auth::KiroLoginOptions>,
 ) -> Result<AuthSessionInitData, String> {
     gw.admin()
-        .init_provider_account_session(&id, account_id.as_deref(), expected_version)
+        .init_provider_account_session_with_options(
+            &id,
+            account_id.as_deref(),
+            expected_version,
+            kiro,
+        )
         .await
         .map_err(|e| e.to_string())
 }

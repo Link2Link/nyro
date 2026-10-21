@@ -2079,39 +2079,10 @@ impl AdminService {
     }
     pub async fn test_provider(&self, id: &str) -> anyhow::Result<TestResult> {
         let provider = self.get_provider(id).await?;
-        if crate::provider::devin::is_devin(&provider) {
+        if crate::provider::devin::is_devin(&provider) || crate::provider::kiro::is_kiro(&provider)
+        {
             validate_admin_provider(&provider)?;
-            let result = self.test_devin_account_connections(&provider).await?;
-            self.record_provider_test_result(&provider.id, &result)
-                .await?;
-            return Ok(result);
-        }
-        if crate::provider::kiro::is_kiro(&provider) {
-            let start = Instant::now();
-            let outcome = async {
-                validate_admin_provider(&provider)?;
-                let runtime = self.resolve_provider_runtime(&provider).await?;
-                let credential = runtime
-                    .credential
-                    .as_ref()
-                    .ok_or_else(|| anyhow::anyhow!("Kiro OAuth credential is missing"))?;
-                crate::provider::kiro::check_connection(
-                    &self.gw,
-                    &provider,
-                    credential,
-                    &runtime.access_token,
-                )
-                .await
-            }
-            .await;
-            let result = TestResult {
-                success: outcome.is_ok(),
-                latency_ms: start.elapsed().as_millis() as u64,
-                model: None,
-                error: outcome.err().map(|error| error.to_string()),
-                endpoints: Vec::new(),
-                accounts: Vec::new(),
-            };
+            let result = self.test_pool_account_connections(&provider).await?;
             self.record_provider_test_result(&provider.id, &result)
                 .await?;
             return Ok(result);
@@ -2902,17 +2873,73 @@ impl AdminService {
             models.len() <= 16,
             "Kiro model probes are limited to 16 models per request"
         );
-        let runtime = self.resolve_provider_runtime(provider).await?;
-        let credential = runtime
-            .credential
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("Kiro OAuth credential is missing"))?;
+        let pool_config = self.provider_pool_config(&provider.id).await?;
+        let legacy = if pool_config.is_none() {
+            Some(self.resolve_provider_runtime(provider).await?)
+        } else {
+            None
+        };
         let protocol = crate::protocol::ids::KIRO_CHAT_V1.to_string();
         let mut results = Vec::new();
         for model in models {
             let start = Instant::now();
-            let outcome =
-                crate::provider::kiro::probe(&self.gw, provider, credential, &model).await;
+            let outcome = if let Some(runtime) = &legacy {
+                crate::provider::kiro::probe(
+                    &self.gw,
+                    provider,
+                    runtime
+                        .credential
+                        .as_ref()
+                        .context("Kiro OAuth credential is missing")?,
+                    &model,
+                )
+                .await
+            } else {
+                let config = pool_config.as_ref().expect("pool configuration");
+                let records = self
+                    .gw
+                    .storage
+                    .oauth_credentials()
+                    .list_accounts(&provider.id)
+                    .await?;
+                let mut accounts = Vec::new();
+                for account in records
+                    .into_iter()
+                    .filter(|a| a.is_enabled && a.status == "connected")
+                {
+                    if let Ok(account) = self.refresh_kiro_pool_account(provider, &account).await {
+                        accounts.push(account);
+                    }
+                }
+                let ordered = self.gw.account_pool.ordered(
+                    &provider.id,
+                    &model,
+                    config,
+                    &accounts,
+                    None,
+                    &std::collections::HashSet::new(),
+                );
+                let mut last = Err(anyhow::anyhow!("No eligible Kiro account for this model"));
+                for account in ordered.into_iter().take(config.max_account_attempts) {
+                    let attempt = async {
+                        let runtime = self
+                            .resolve_provider_account_runtime(provider, &account)
+                            .await?;
+                        let credential = runtime
+                            .credential
+                            .as_ref()
+                            .context("Kiro OAuth credential is missing")?;
+                        crate::provider::kiro::probe(&self.gw, provider, credential, &model).await
+                    }
+                    .await;
+                    let done = attempt.is_ok();
+                    last = attempt;
+                    if done {
+                        break;
+                    }
+                }
+                last
+            };
             let (reply, error) = match outcome {
                 Ok(reply) => (Some(reply), None),
                 Err(error) => (None, Some(error.to_string())),
@@ -2939,11 +2966,8 @@ impl AdminService {
 
     async fn kiro_provider_models(&self, provider: &Provider) -> anyhow::Result<Vec<String>> {
         validate_admin_provider(provider)?;
-        let runtime = self.resolve_provider_runtime(provider).await?;
-        anyhow::ensure!(
-            !runtime.access_token.trim().is_empty(),
-            "Kiro OAuth credential is missing"
-        );
+        // Curated suggestions are not an authentication or entitlement probe;
+        // never resolve an ambiguous provider-only credential for a pool.
         Ok(crate::provider::kiro::models(provider))
     }
 

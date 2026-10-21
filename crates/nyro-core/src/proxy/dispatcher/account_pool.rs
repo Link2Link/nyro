@@ -3,7 +3,10 @@
 use super::*;
 use crate::db::models::OAuthCredential;
 use crate::error::{AccountFailure, AccountFailureReason as Reason};
-use crate::provider::account_pool::{DevinAccountState, affinity_key, logical_session};
+use crate::provider::account_pool::{
+    DevinAccountState, KiroAccountState, account_cost_class, affinity_key, logical_session,
+    supports_pool,
+};
 use std::collections::HashSet;
 
 #[derive(Clone)]
@@ -11,6 +14,9 @@ pub(super) struct SelectedAccount {
     pub credential: OAuthCredential,
     pub affinity: Option<String>,
     pub config: crate::admin::DevinPoolConfig,
+    /// Cost class at admission. Submission must not silently degrade from
+    /// included allowance to paid overage while a better sibling exists.
+    pub class: u8,
 }
 
 pub(super) async fn candidates(
@@ -21,7 +27,7 @@ pub(super) async fn candidates(
     principal: Option<&str>,
     excluded: &HashSet<String>,
 ) -> anyhow::Result<Option<Vec<SelectedAccount>>> {
-    if !crate::provider::devin::is_devin(provider) {
+    if !supports_pool(provider) {
         return Ok(None);
     }
     let Some(config) = gw.admin().provider_pool_config(&provider.id).await? else {
@@ -34,7 +40,7 @@ pub(super) async fn candidates(
         .await?;
     let affinity =
         logical_session(request).map(|session| affinity_key(principal, &provider.id, &session));
-    let accounts = gw.account_pool.ordered(
+    let mut ordered = gw.account_pool.ordered(
         &provider.id,
         model,
         &config,
@@ -42,13 +48,59 @@ pub(super) async fn candidates(
         affinity.as_deref(),
         excluded,
     );
+    // Refresh only the admitted head account, never a provider-global token.
+    // The returned snapshot pins the new generation before health/admission
+    // checks. A failed refresh cools down that account and lets a healthy
+    // sibling take its place. If the refreshed head's cost class is worse than
+    // its ranking assumed (for example a concurrent usage observation moved it
+    // from included allowance to paid overage), rank again from current state
+    // so a better sibling is not skipped. Each pass consumes one account, so
+    // this terminates within the pool size.
+    if crate::provider::kiro::is_kiro(provider) {
+        let mut remaining = ordered.len();
+        while remaining > 0 && !ordered.is_empty() {
+            remaining -= 1;
+            let head = ordered.remove(0);
+            let expected = account_cost_class(&head, &config);
+            match gw.admin().refresh_kiro_pool_account(provider, &head).await {
+                Ok(current) if account_cost_class(&current, &config) == expected => {
+                    ordered.insert(0, current);
+                    break;
+                }
+                Ok(current) => {
+                    let mut snapshot = ordered;
+                    snapshot.push(current);
+                    ordered = gw.account_pool.ordered(
+                        &provider.id,
+                        model,
+                        &config,
+                        &snapshot,
+                        affinity.as_deref(),
+                        excluded,
+                    );
+                }
+                Err(_) => {
+                    gw.account_pool.cooldown(
+                        &head.account_id,
+                        head.status_version,
+                        model,
+                        Some(30),
+                    );
+                }
+            }
+        }
+    }
     Ok(Some(
-        accounts
+        ordered
             .into_iter()
-            .map(|credential| SelectedAccount {
-                credential,
-                affinity: affinity.clone(),
-                config: config.clone(),
+            .filter_map(|credential| {
+                let class = account_cost_class(&credential, &config)?;
+                Some(SelectedAccount {
+                    credential,
+                    affinity: affinity.clone(),
+                    config: config.clone(),
+                    class,
+                })
             })
             .collect(),
     ))
@@ -68,10 +120,13 @@ pub(super) async fn still_valid(gw: &Gateway, candidate: &SelectedAccount, model
     {
         return false;
     }
+    // A worse current class (e.g. included -> paid overage) is not silently
+    // accepted: the dispatcher re-selects so a better sibling wins first.
     matches!(gw.storage.oauth_credentials().get_account(&account.provider_id, &account.account_id).await,
         Ok(Some(current)) if current.status_version == account.status_version
             && current.is_enabled && current.status == "connected"
-            && DevinAccountState::parse(&current.account_state).cost_class(&candidate.config).is_some())
+            && account_cost_class(&current, &candidate.config)
+                .is_some_and(|class| class <= candidate.class))
 }
 
 pub(super) async fn feedback(
@@ -95,7 +150,7 @@ pub(super) async fn feedback(
     gw.account_pool
         .release_generation(&account.account_id, account.status_version);
     match failure.reason {
-        Reason::AuthInvalid | Reason::DailyQuota | Reason::WeeklyQuota => {
+        Reason::AuthInvalid | Reason::DailyQuota | Reason::WeeklyQuota | Reason::MonthlyQuota => {
             // CAS the original generation, but merge into the latest same-generation
             // state: an intervening successful usage refresh cannot hide this newer
             // rejection. A concurrent reauthorization always fences this write.
@@ -111,21 +166,33 @@ pub(super) async fn feedback(
                 if current.status_version != account.status_version {
                     return;
                 }
-                let mut state = DevinAccountState::parse(&current.account_state);
-                state.rejection_revision = state.rejection_revision.saturating_add(1);
-                if failure.reason == Reason::AuthInvalid {
-                    state.auth_invalid = true;
+                let reason = match failure.reason {
+                    Reason::DailyQuota => "daily_quota",
+                    Reason::MonthlyQuota => "monthly_quota",
+                    _ => "weekly_quota",
+                };
+                let raw = if account.driver_key == "kiro" {
+                    let mut state = KiroAccountState::parse(&current.account_state);
+                    state.rejection_revision = state.rejection_revision.saturating_add(1);
+                    if failure.reason == Reason::AuthInvalid {
+                        state.auth_invalid = true;
+                    } else {
+                        state.hard_quota = true;
+                        state.hard_quota_reason = Some(reason.into());
+                    }
+                    serde_json::to_string(&state)
                 } else {
-                    state.hard_quota = true;
-                    state.hard_quota_reason = Some(
-                        match failure.reason {
-                            Reason::DailyQuota => "daily_quota",
-                            _ => "weekly_quota",
-                        }
-                        .into(),
-                    );
-                }
-                let Ok(raw) = serde_json::to_string(&state) else {
+                    let mut state = DevinAccountState::parse(&current.account_state);
+                    state.rejection_revision = state.rejection_revision.saturating_add(1);
+                    if failure.reason == Reason::AuthInvalid {
+                        state.auth_invalid = true;
+                    } else {
+                        state.hard_quota = true;
+                        state.hard_quota_reason = Some(reason.into());
+                    }
+                    serde_json::to_string(&state)
+                };
+                let Ok(raw) = raw else {
                     return;
                 };
                 match gw
@@ -501,6 +568,319 @@ mod tests {
         );
         assert_eq!(accounts.len(), 2);
     }
+    async fn kiro_fixture() -> (Gateway, Provider, Vec<OAuthCredential>) {
+        let provider: Provider = serde_json::from_value(serde_json::json!({
+            "id":"kiro-pool","name":"Kiro pool","vendor":"kiro","preset_key":"kiro",
+            "channel":"ide","protocol":"kiro-chat/generate-assistant-response/v1",
+            "base_url":"https://q.us-east-1.amazonaws.com","api_key":"","auth_mode":"oauth",
+            "last_test_success":null,"last_test_at":null,"is_enabled":false,
+            "created_at":"","updated_at":""
+        }))
+        .unwrap();
+        let mut provider = provider;
+        provider.protocol = crate::provider::kiro::PROTOCOL_KEY.into();
+        let storage = Arc::new(crate::storage::MemoryStorage::new(
+            vec![provider.clone()],
+            vec![],
+            vec![],
+        ));
+        let (gw, _) = Gateway::from_storage(crate::config::GatewayConfig::default(), storage)
+            .await
+            .unwrap();
+        gw.admin()
+            .configure_provider_account_pool(&provider.id, Default::default())
+            .await
+            .unwrap();
+        let mut accounts = Vec::new();
+        for name in ["a", "b"] {
+            accounts.push(
+                gw.storage
+                    .oauth_credentials()
+                    .create_account(
+                        &provider.id,
+                        name,
+                        UpsertOAuthCredential {
+                            driver_key: "kiro".into(),
+                            scheme: "manual".into(),
+                            access_token: format!("ksk_fixture_{name}"),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .unwrap(),
+            );
+        }
+        (gw, provider, accounts)
+    }
+
+    #[tokio::test]
+    async fn kiro_pool_feedback_isolates_accounts_and_old_credential_generations() {
+        let (gw, provider, _) = kiro_fixture().await;
+        let request = AiRequest::new("claude-sonnet-4.5", vec![]);
+        let selected = candidates(
+            &gw,
+            &provider,
+            &request.model,
+            &request,
+            None,
+            &HashSet::new(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            selected.len(),
+            2,
+            "unknown usage is not a Devin plan requirement"
+        );
+        let first = &selected[0];
+        let second = &selected[1];
+        let runtime = gw
+            .admin()
+            .resolve_provider_account_runtime(&provider, &first.credential)
+            .await
+            .unwrap();
+        assert_eq!(runtime.access_token, first.credential.access_token);
+        feedback(
+            &gw,
+            first,
+            &request.model,
+            AccountFailure {
+                reason: Reason::MonthlyQuota,
+                rejected_before_execution: true,
+                retry_after_seconds: None,
+            },
+        )
+        .await;
+        assert!(!still_valid(&gw, first, &request.model).await);
+        assert!(still_valid(&gw, second, &request.model).await);
+        let remaining = candidates(
+            &gw,
+            &provider,
+            &request.model,
+            &request,
+            None,
+            &HashSet::new(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(
+            remaining[0].credential.account_id,
+            second.credential.account_id
+        );
+        let replaced = gw
+            .storage
+            .oauth_credentials()
+            .replace_account(
+                &provider.id,
+                &first.credential.account_id,
+                first.credential.status_version,
+                UpsertOAuthCredential {
+                    driver_key: "kiro".into(),
+                    scheme: "manual".into(),
+                    access_token: "ksk_reauthorized".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        feedback(
+            &gw,
+            first,
+            &request.model,
+            AccountFailure {
+                reason: Reason::AuthInvalid,
+                rejected_before_execution: false,
+                retry_after_seconds: None,
+            },
+        )
+        .await;
+        let current = gw
+            .storage
+            .oauth_credentials()
+            .get_account(&provider.id, &replaced.account_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!KiroAccountState::parse(&current.account_state).auth_invalid);
+        assert_eq!(current.access_token, "ksk_reauthorized");
+    }
+
+    #[tokio::test]
+    async fn kiro_failed_expired_credential_does_not_hide_healthy_sibling() {
+        let (gw, provider, accounts) = kiro_fixture().await;
+        let first = &accounts[0];
+        let expired = gw
+            .storage
+            .oauth_credentials()
+            .replace_account(
+                &provider.id,
+                &first.account_id,
+                first.status_version,
+                UpsertOAuthCredential {
+                    driver_key: "kiro".into(),
+                    scheme: "manual".into(),
+                    access_token: "expired".into(),
+                    expires_at: Some("2000-01-01T00:00:00Z".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        gw.storage
+            .oauth_credentials()
+            .update_account(
+                &provider.id,
+                &expired.account_id,
+                expired.status_version,
+                crate::db::models::OAuthAccountUpdate {
+                    priority: Some(-1),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let selected = candidates(
+            &gw,
+            &provider,
+            "m",
+            &AiRequest::new("m", vec![]),
+            None,
+            &HashSet::new(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].credential.account_id, accounts[1].account_id);
+    }
+
+    fn kiro_usage_state(used: f64, limit: f64, overage: bool) -> String {
+        let usage = crate::provider::kiro::usage::parse(&serde_json::json!({
+            "overageConfiguration":{"overageEnabled":overage},
+            "usageBreakdownList":[{"resourceType":"CREDITS","currentUsage":used,"usageLimit":limit}]
+        }));
+        serde_json::to_string(&KiroAccountState {
+            usage: Some(usage),
+            ..Default::default()
+        })
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn kiro_paid_overage_never_jumps_ahead_of_an_included_sibling() {
+        let (gw, provider, accounts) = kiro_fixture().await;
+        let config = crate::admin::DevinPoolConfig {
+            reserve_policy: crate::admin::DevinReservePolicy::Fallback,
+            ..Default::default()
+        };
+        gw.admin()
+            .configure_provider_account_pool(&provider.id, config)
+            .await
+            .unwrap();
+        let store = gw.storage.oauth_credentials();
+        for account in &accounts {
+            let current = store
+                .get_account(&provider.id, &account.account_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                store
+                    .compare_account_state(
+                        &provider.id,
+                        &account.account_id,
+                        current.status_version,
+                        &current.account_state,
+                        &kiro_usage_state(10.0, 100.0, true)
+                    )
+                    .await
+                    .unwrap()
+            );
+        }
+        let request = AiRequest::new("m", vec![]);
+        let selected = candidates(&gw, &provider, "m", &request, None, &HashSet::new())
+            .await
+            .unwrap()
+            .unwrap();
+        let head = &selected[0];
+        assert_eq!(head.class, 0);
+        assert!(still_valid(&gw, head, "m").await);
+        // A concurrent usage observation exhausts the head's included
+        // allowance after admission: it is now paid overage only.
+        let current = store
+            .get_account(&provider.id, &head.credential.account_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            store
+                .compare_account_state(
+                    &provider.id,
+                    &head.credential.account_id,
+                    current.status_version,
+                    &current.account_state,
+                    &kiro_usage_state(100.0, 100.0, true)
+                )
+                .await
+                .unwrap()
+        );
+        assert!(
+            !still_valid(&gw, head, "m").await,
+            "degraded head must not be submitted"
+        );
+        let reselected = candidates(&gw, &provider, "m", &request, None, &HashSet::new())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(
+            reselected[0].credential.account_id,
+            head.credential.account_id
+        );
+        assert_eq!(reselected[0].class, 0, "included sibling wins");
+        assert_eq!(
+            reselected.last().unwrap().class,
+            2,
+            "overage stays a last resort"
+        );
+    }
+
+    #[tokio::test]
+    async fn kiro_refreshing_account_is_still_a_pool_member() {
+        let (gw, provider, accounts) = kiro_fixture().await;
+        let store = gw.storage.oauth_credentials();
+        let lease = store
+            .try_begin_account_refresh(
+                &provider.id,
+                &accounts[0].account_id,
+                accounts[0].status_version,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(lease.status, "refreshing");
+        let listed = store.list_accounts(&provider.id).await.unwrap();
+        let ordered = gw.account_pool.ordered(
+            &provider.id,
+            "m",
+            &Default::default(),
+            &listed,
+            None,
+            &HashSet::new(),
+        );
+        assert!(
+            ordered
+                .iter()
+                .any(|a| a.account_id == accounts[0].account_id),
+            "a routine token refresh must not empty a single-account pool"
+        );
+    }
+
     #[tokio::test]
     async fn queued_candidates_observe_new_policy_and_model_cooldown() {
         let (gw, provider, _) = fixture().await;

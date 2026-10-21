@@ -55,6 +55,9 @@ pub(super) enum Mutation<'a> {
     BeginRefresh(i32),
     CompleteRefresh(i32, &'a UpsertOAuthCredential),
     FailRefresh(i32, &'a str, bool, Option<&'a str>),
+    BeginAccountRefresh(&'a str, i32),
+    CompleteAccountRefresh(&'a str, i32, &'a UpsertOAuthCredential),
+    FailAccountRefresh(&'a str, i32, &'a str, bool, Option<&'a str>),
     Create(&'a str, &'a UpsertOAuthCredential),
     Replace(&'a str, i32, &'a UpsertOAuthCredential),
     Update(&'a str, i32, &'a OAuthAccountUpdate),
@@ -242,7 +245,10 @@ pub(super) fn mutate(
         Mutation::Replace(id, version, _)
         | Mutation::Update(id, version, _)
         | Mutation::Disconnect(id, version)
-        | Mutation::CompareState(id, version, _, _) => Some((*id, *version)),
+        | Mutation::CompareState(id, version, _, _)
+        | Mutation::BeginAccountRefresh(id, version)
+        | Mutation::CompleteAccountRefresh(id, version, _)
+        | Mutation::FailAccountRefresh(id, version, _, _, _) => Some((*id, *version)),
         _ => None,
     };
     let mut row = if let Mutation::Create(label, input) = action {
@@ -250,8 +256,10 @@ pub(super) fn mutate(
         anyhow::ensure!(!label.trim().is_empty(), "Account label is required");
         check_duplicates(rows, None, input)?;
         anyhow::ensure!(
-            crate::auth::normalize_driver_key(&input.driver_key) == "devin"
-                || rows.iter().all(|r| r.status == "disconnected"),
+            matches!(
+                crate::auth::normalize_driver_key(&input.driver_key).as_str(),
+                "devin" | "kiro"
+            ) || rows.iter().all(|r| r.status == "disconnected"),
             "MAX_ACCOUNTS: this OAuth driver permits one account"
         );
         let mut row = new_row(
@@ -287,7 +295,10 @@ pub(super) fn mutate(
                     other.account_id != row.account_id && other.status_version >= row.status_version
                 }) || rows.len() > 1
                     && (matches!(action, Mutation::Restore(..))
-                        || crate::auth::normalize_driver_key(&row.driver_key) == "devin"))
+                        || matches!(
+                            crate::auth::normalize_driver_key(&row.driver_key).as_str(),
+                            "devin" | "kiro"
+                        )))
                 {
                     return Ok(None);
                 }
@@ -329,8 +340,10 @@ pub(super) fn mutate(
         Mutation::Replace(_, _, input) => {
             validate_input(parent, input)?;
             anyhow::ensure!(
-                crate::auth::normalize_driver_key(&input.driver_key) == "devin"
-                    || rows.iter().filter(|r| r.status != "disconnected").count() <= 1,
+                matches!(
+                    crate::auth::normalize_driver_key(&input.driver_key).as_str(),
+                    "devin" | "kiro"
+                ) || rows.iter().filter(|r| r.status != "disconnected").count() <= 1,
                 "MAX_ACCOUNTS: this OAuth driver permits one account"
             );
             check_duplicates(rows, Some(&row.account_id), input)?;
@@ -347,19 +360,21 @@ pub(super) fn mutate(
             }
         }
         Mutation::Delete | Mutation::Disconnect(_, _) => scrub(&mut row),
-        Mutation::BeginRefresh(version) => {
+        Mutation::BeginRefresh(version) | Mutation::BeginAccountRefresh(_, version) => {
             if row.status != "connected" || old_version != *version {
                 return Ok(None);
             }
             row.status = "refreshing".into();
         }
-        Mutation::CompleteRefresh(version, input) => {
+        Mutation::CompleteRefresh(version, input)
+        | Mutation::CompleteAccountRefresh(_, version, input) => {
             if row.status != "refreshing" || old_version != *version {
                 return Ok(None);
             }
             bind(&mut row, input, true);
         }
-        Mutation::FailRefresh(version, error, terminal, meta) => {
+        Mutation::FailRefresh(version, error, terminal, meta)
+        | Mutation::FailAccountRefresh(_, version, error, terminal, meta) => {
             if row.status != "refreshing" || old_version != *version {
                 return Ok(None);
             }

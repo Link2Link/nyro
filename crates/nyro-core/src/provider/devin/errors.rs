@@ -32,7 +32,9 @@ pub(super) fn failure(
         Reason::Other
     };
     GatewayError::AccountUpstream {
+        provider: "Devin",
         status,
+        message: None,
         failure: AccountFailure {
             reason,
             rejected_before_execution: explicit_refusal

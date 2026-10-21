@@ -767,17 +767,13 @@ fn exception(kind: &str, payload: &[u8]) -> GatewayError {
         "serviceUnavailableException" | "ServiceUnavailableException" => 503,
         _ => 502,
     };
-    let message = serde_json::from_slice::<Value>(payload)
-        .ok()
-        .and_then(|value| {
-            value
-                .get("message")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-        })
-        .unwrap_or_default();
-    let message: String = message.chars().take(300).collect();
-    failure(status, &format!("Kiro {kind}: {message}"))
+    let mut error = super::runtime::classify(status, payload);
+    if let GatewayError::AccountUpstream { failure, .. } = &mut error {
+        // An exception after HTTP acceptance is health evidence only. Buffered
+        // tools/usage or content in the same chunk may already have executed.
+        failure.rejected_before_execution = false;
+    }
+    error
 }
 
 #[cfg(test)]
@@ -1203,14 +1199,11 @@ mod tests {
                 &[(":message-type", "exception"), (":exception-type", kind)],
                 br#"{"message":"boom"}"#,
             );
-            match s.push(&frame).unwrap_err() {
-                GatewayError::UpstreamStatus {
-                    status: got, body, ..
-                } => {
-                    assert_eq!(got, status, "{kind}");
-                    assert!(body.unwrap().contains("boom"));
-                }
-                other => panic!("unexpected {other:?}"),
+            let error = s.push(&frame).unwrap_err();
+            assert_eq!(error.http_status().as_u16(), status, "{kind}");
+            if let Some(failure) = error.account_failure() {
+                assert!(!failure.rejected_before_execution);
+                assert!(!error.message().contains("boom"));
             }
             assert!(s.push(&[]).is_err(), "a failed session stays failed");
         }

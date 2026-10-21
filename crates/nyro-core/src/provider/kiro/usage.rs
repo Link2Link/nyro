@@ -10,11 +10,11 @@ use chrono::{DateTime, Utc};
 use serde_json::Value;
 
 /// One quota line: the base allowance, a bonus, or the free trial.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct KiroUsageItem {
     /// Base, bonus and trial entries with this key share one credit pool.
     pub resource: String,
-    pub kind: &'static str,
+    pub kind: String,
     pub name: String,
     pub used: f64,
     pub limit: f64,
@@ -28,7 +28,7 @@ impl KiroUsageItem {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Default)]
+#[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 pub struct KiroUsage {
     /// Subscription plan, e.g. `PRO`; `KIRO ` prefix stripped.
     pub plan: Option<String>,
@@ -37,6 +37,61 @@ pub struct KiroUsage {
     /// Only an explicit upstream opt-in allows paid usage beyond the pool.
     pub overage_enabled: bool,
     pub items: Vec<KiroUsageItem>,
+}
+
+/// Actual allowance for one resource; different resources are never averaged.
+#[derive(Debug, Clone, PartialEq)]
+pub struct KiroResourcePool {
+    pub resource: String,
+    pub used: f64,
+    pub limit: f64,
+    pub resets_at: Option<DateTime<Utc>>,
+}
+
+impl KiroUsage {
+    pub fn resource_pools(&self) -> Vec<KiroResourcePool> {
+        self.resource_pools_at(Utc::now())
+    }
+
+    fn resource_pools_at(&self, now: DateTime<Utc>) -> Vec<KiroResourcePool> {
+        let mut pools = std::collections::BTreeMap::<String, KiroResourcePool>::new();
+        for item in &self.items {
+            if !item.used.is_finite()
+                || !item.limit.is_finite()
+                || item.used < 0.0
+                || item.limit < 0.0
+            {
+                continue;
+            }
+            let pool = pools
+                .entry(item.resource.clone())
+                .or_insert_with(|| KiroResourcePool {
+                    resource: item.resource.clone(),
+                    used: 0.0,
+                    limit: 0.0,
+                    resets_at: None,
+                });
+            // Persisted observations outlive bonus/trial expiry. Keep the resource
+            // with a zero allowance when its last grant expires; never restore it
+            // by treating an expired observation as unknown usage.
+            if item.kind != "base" && item.resets_at.is_some_and(|at| at <= now) {
+                continue;
+            }
+            pool.used += item.used.min(item.limit);
+            pool.limit += item.limit;
+            if item.kind == "base" {
+                let reset = item.resets_at.or(self.resets_at);
+                pool.resets_at = match (pool.resets_at, reset) {
+                    (Some(previous), Some(next)) => Some(previous.min(next)),
+                    (previous, next) => previous.or(next),
+                };
+            }
+        }
+        pools
+            .into_values()
+            .filter(|pool| pool.used.is_finite() && pool.limit.is_finite())
+            .collect()
+    }
 }
 
 /// Timestamps arrive as epoch seconds or milliseconds.
@@ -112,7 +167,7 @@ fn parse_at(raw: &Value, now: DateTime<Utc>) -> KiroUsage {
         {
             items.push(KiroUsageItem {
                 resource: resource.clone(),
-                kind: "base",
+                kind: "base".into(),
                 name: name_of(entry, &["displayName", "resourceType"], "Usage"),
                 used,
                 limit,
@@ -138,7 +193,7 @@ fn parse_at(raw: &Value, now: DateTime<Utc>) -> KiroUsage {
             {
                 items.push(KiroUsageItem {
                     resource: resource.clone(),
-                    kind: "bonus",
+                    kind: "bonus".into(),
                     name: name_of(bonus, &["displayName", "bonusCode"], "bonus"),
                     used,
                     limit,
@@ -157,7 +212,7 @@ fn parse_at(raw: &Value, now: DateTime<Utc>) -> KiroUsage {
         {
             items.push(KiroUsageItem {
                 resource: resource.clone(),
-                kind: "free_trial",
+                kind: "free_trial".into(),
                 name: "Free trial".into(),
                 used,
                 limit,
@@ -181,6 +236,25 @@ fn parse_at(raw: &Value, now: DateTime<Utc>) -> KiroUsage {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn persisted_allowances_expire_without_fabricating_a_quota_reset() {
+        let now = DateTime::from_timestamp(1_800_000_000, 0).unwrap();
+        let usage = parse_at(
+            &serde_json::json!({
+                "usageBreakdownList":[{"resourceType":"CREDITS","currentUsage":100,"usageLimit":100,
+                    "bonuses":[{"currentUsage":0,"usageLimit":50,"expiresAt":1_800_000_060}]}]
+            }),
+            now,
+        );
+        let stored = serde_json::to_string(&usage).unwrap();
+        let restored: KiroUsage = serde_json::from_str(&stored).unwrap();
+        assert_eq!(restored.resource_pools_at(now)[0].limit, 150.0);
+        let expired = restored.resource_pools_at(now + chrono::Duration::seconds(61));
+        assert_eq!(expired[0].limit, 100.0);
+        assert_eq!(expired[0].used, 100.0);
+        assert!(expired[0].resets_at.is_none());
+    }
 
     #[test]
     fn parses_plan_email_windows_bonuses_and_trial() {
@@ -237,7 +311,7 @@ mod tests {
     fn zero_limits_have_no_percentage_and_full_use_is_clamped() {
         let zero = KiroUsageItem {
             resource: "AGENTIC_REQUEST".into(),
-            kind: "base",
+            kind: "base".into(),
             name: "x".into(),
             used: 0.0,
             limit: 0.0,
@@ -246,7 +320,7 @@ mod tests {
         assert_eq!(zero.remaining_percent(), None);
         let over = KiroUsageItem {
             resource: "AGENTIC_REQUEST".into(),
-            kind: "base",
+            kind: "base".into(),
             name: "x".into(),
             used: 150.0,
             limit: 100.0,

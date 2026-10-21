@@ -676,6 +676,7 @@ async fn postgres_oauth_optional_disposable_database() -> anyhow::Result<()> {
     let result = async {
         exercise_contract(storage.oauth_credentials(), &first, &second).await?;
         exercise_pool_storage(&storage).await?;
+        exercise_account_refresh_storage(&storage).await?;
         prepare_stale_rows(storage.oauth_credentials(), &first, &second).await?;
         sqlx::query("UPDATE provider_oauth_credentials SET updated_at = '2000-01-01 00:00:00' WHERE provider_id IN ($1, $2)")
             .bind(&first).bind(&second).execute(storage.pool()).await?;
@@ -700,6 +701,7 @@ async fn mysql_oauth_optional_disposable_database() -> anyhow::Result<()> {
     let result = async {
         exercise_contract(storage.oauth_credentials(), &first, &second).await?;
         exercise_pool_storage(&storage).await?;
+        exercise_account_refresh_storage(&storage).await?;
         prepare_stale_rows(storage.oauth_credentials(), &first, &second).await?;
         sqlx::query("UPDATE provider_oauth_credentials SET updated_at = '2000-01-01 00:00:00' WHERE provider_id IN (?, ?)")
             .bind(&first).bind(&second).execute(storage.pool()).await?;
@@ -1102,6 +1104,391 @@ async fn exercise_account_pool(
     Ok(())
 }
 
+fn kiro_credential(token: &str) -> UpsertOAuthCredential {
+    UpsertOAuthCredential {
+        driver_key: "kiro".into(),
+        scheme: "oauth_device_code".into(),
+        scopes: Some(r#"["kiro:read"]"#.into()),
+        meta: Some(r#"{"region":"us-east-1"}"#.into()),
+        ..credential(token)
+    }
+}
+
+async fn assert_rejected_account_refresh(
+    oauth: &dyn OAuthCredentialStore,
+    provider: &str,
+    account_id: &str,
+    version: i32,
+) -> anyhow::Result<()> {
+    let before = serde_json::to_value(oauth.list_accounts(provider).await?)?;
+    assert!(
+        oauth
+            .complete_account_refresh(provider, account_id, version, kiro_credential("stale"))
+            .await?
+            .is_none()
+    );
+    assert!(
+        !oauth
+            .fail_account_refresh_with_policy(
+                provider,
+                account_id,
+                version,
+                "stale failure",
+                true,
+                Some("{}".into()),
+            )
+            .await?
+    );
+    assert_eq!(
+        serde_json::to_value(oauth.list_accounts(provider).await?)?,
+        before,
+        "rejected callbacks must not mutate any account"
+    );
+    Ok(())
+}
+
+async fn exercise_account_refresh(
+    oauth: &dyn OAuthCredentialStore,
+    kiro: &str,
+    other: &str,
+) -> anyhow::Result<()> {
+    // Kiro supports multiple accounts, but other drivers keep their singleton limit.
+    let a = oauth
+        .create_account(kiro, "A", kiro_credential("a"))
+        .await?;
+    let b = oauth
+        .create_account(kiro, "B", kiro_credential("b"))
+        .await?;
+    assert_eq!(oauth.list_accounts(kiro).await?.len(), 2);
+    let sibling = serde_json::to_value(&b)?;
+    let single = oauth
+        .create_account(other, "Only", credential("only"))
+        .await?;
+    assert!(
+        oauth
+            .create_account(other, "Second", credential("second"))
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("MAX_ACCOUNTS")
+    );
+    assert_eq!(
+        oauth.get(kiro).await.unwrap_err().to_string(),
+        "AMBIGUOUS_ACCOUNT"
+    );
+
+    // Explicit refresh mirrors the legacy status policy, including preserving a
+    // disabled account's enablement. Callers decide whether to start its refresh.
+    let a = oauth
+        .update_account(
+            kiro,
+            &a.account_id,
+            a.status_version,
+            OAuthAccountUpdate {
+                label: Some("Primary".into()),
+                priority: Some(-7),
+                is_enabled: Some(false),
+            },
+        )
+        .await?
+        .unwrap();
+    assert_eq!(
+        a.status_version, b.status_version,
+        "identical versions need exact identity"
+    );
+    let state = r#"{"quota":{"remaining":12},"cooldown_until":2000000000}"#;
+    assert!(
+        oauth
+            .compare_account_state(kiro, &a.account_id, a.status_version, "{}", state)
+            .await?
+    );
+    for (provider, id) in [(other, a.account_id.as_str()), (kiro, "missing")] {
+        assert!(
+            oauth
+                .try_begin_account_refresh(provider, id, a.status_version)
+                .await?
+                .is_none()
+        );
+        assert_rejected_account_refresh(oauth, provider, id, a.status_version).await?;
+    }
+    assert_rejected_account_refresh(oauth, kiro, &a.account_id, a.status_version).await?;
+
+    let (left, right) = tokio::join!(
+        oauth.try_begin_account_refresh(kiro, &a.account_id, a.status_version),
+        oauth.try_begin_account_refresh(kiro, &a.account_id, a.status_version),
+    );
+    let (left, right) = (left?, right?);
+    assert_ne!(
+        left.is_some(),
+        right.is_some(),
+        "one generation has one refresh owner"
+    );
+    let lease = left.or(right).unwrap();
+    assert_eq!(lease.account_id, a.account_id);
+    assert_eq!(lease.status, "refreshing");
+    assert_eq!(lease.status_version, a.status_version + 1);
+    assert_eq!(lease.account_state, state);
+    assert_eq!(
+        serde_json::to_value(oauth.get_account(kiro, &b.account_id).await?.unwrap())?,
+        sibling
+    );
+    assert!(
+        oauth
+            .try_begin_account_refresh(kiro, &a.account_id, lease.status_version)
+            .await?
+            .is_none()
+    );
+    assert_rejected_account_refresh(oauth, kiro, &a.account_id, a.status_version).await?;
+
+    // Observations do not advance the generation, and completion preserves the
+    // latest state rather than a snapshot from when the refresh began.
+    let observed = r#"{"quota":{"remaining":9},"cooldown_until":2000000000}"#;
+    assert!(
+        oauth
+            .compare_account_state(kiro, &a.account_id, lease.status_version, state, observed)
+            .await?
+    );
+    let mut input = kiro_credential("refreshed");
+    input.meta = None;
+    input.scopes = None;
+    input.refresh_token = Some("rotated-refresh-token".into());
+    let refreshed = oauth
+        .complete_account_refresh(kiro, &a.account_id, lease.status_version, input)
+        .await?
+        .unwrap();
+    assert_eq!(refreshed.status, "connected");
+    assert_eq!(refreshed.status_version, lease.status_version + 1);
+    assert_eq!(refreshed.access_token, "refreshed");
+    assert_eq!(
+        refreshed.refresh_token.as_deref(),
+        Some("rotated-refresh-token")
+    );
+    assert_eq!(refreshed.meta, a.meta);
+    assert_eq!(refreshed.scopes, a.scopes);
+    assert_eq!(refreshed.account_state, observed);
+    assert_eq!(refreshed.label, "Primary");
+    assert_eq!(refreshed.priority, -7);
+    assert!(!refreshed.is_enabled);
+    assert!(refreshed.last_refresh_at.is_some());
+    assert!(refreshed.last_error.is_none());
+    assert_rejected_account_refresh(oauth, kiro, &a.account_id, lease.status_version).await?;
+    assert_eq!(
+        serde_json::to_value(oauth.get_account(kiro, &b.account_id).await?.unwrap())?,
+        sibling
+    );
+
+    let retry_meta = r#"{"region":"us-east-1","refresh_failures":1}"#;
+    let mut current = refreshed;
+    for (terminal, meta) in [
+        (false, Some(retry_meta.to_string())),
+        (false, None),
+        (true, None),
+    ] {
+        let lease = oauth
+            .try_begin_account_refresh(kiro, &a.account_id, current.status_version)
+            .await?
+            .unwrap();
+        assert!(
+            oauth
+                .fail_account_refresh_with_policy(
+                    kiro,
+                    &a.account_id,
+                    lease.status_version,
+                    "safe failure",
+                    terminal,
+                    meta
+                )
+                .await?
+        );
+        current = oauth.get_account(kiro, &a.account_id).await?.unwrap();
+        assert_eq!(current.status, if terminal { "error" } else { "connected" });
+        assert_eq!(current.status_version, lease.status_version + 1);
+        assert_eq!(current.last_error.as_deref(), Some("safe failure"));
+        assert_eq!(current.meta, retry_meta);
+        assert_eq!(current.access_token, "refreshed");
+        assert_eq!(current.account_state, observed);
+        assert_eq!(current.label, "Primary");
+        assert_eq!(current.priority, -7);
+        assert!(!current.is_enabled);
+        assert_rejected_account_refresh(oauth, kiro, &a.account_id, lease.status_version).await?;
+        assert_eq!(
+            serde_json::to_value(oauth.get_account(kiro, &b.account_id).await?.unwrap())?,
+            sibling
+        );
+    }
+    assert!(
+        oauth
+            .try_begin_account_refresh(kiro, &a.account_id, current.status_version)
+            .await?
+            .is_none()
+    );
+
+    // Reauthorization remains separate from refresh: it resets account state and
+    // fences callbacks, even with sibling accounts present.
+    current = oauth
+        .replace_account(
+            kiro,
+            &a.account_id,
+            current.status_version,
+            kiro_credential("reauthorized"),
+        )
+        .await?
+        .unwrap();
+    assert_eq!(current.account_state, "{}");
+    current = oauth
+        .update_account(
+            kiro,
+            &a.account_id,
+            current.status_version,
+            OAuthAccountUpdate {
+                is_enabled: Some(true),
+                ..Default::default()
+            },
+        )
+        .await?
+        .unwrap();
+    let lease = oauth
+        .try_begin_account_refresh(kiro, &a.account_id, current.status_version)
+        .await?
+        .unwrap();
+    let rebound = oauth
+        .replace_account(
+            kiro,
+            &a.account_id,
+            lease.status_version,
+            kiro_credential("new-reauth"),
+        )
+        .await?
+        .unwrap();
+    assert_rejected_account_refresh(oauth, kiro, &a.account_id, lease.status_version).await?;
+    assert_eq!(
+        oauth
+            .get_account(kiro, &a.account_id)
+            .await?
+            .unwrap()
+            .access_token,
+        "new-reauth"
+    );
+
+    let lease = oauth
+        .try_begin_account_refresh(kiro, &a.account_id, rebound.status_version)
+        .await?
+        .unwrap();
+    assert!(
+        oauth
+            .compare_account_state(kiro, &a.account_id, lease.status_version, "{}", state)
+            .await?
+    );
+    let disabled = oauth
+        .update_account(
+            kiro,
+            &a.account_id,
+            lease.status_version,
+            OAuthAccountUpdate {
+                is_enabled: Some(false),
+                ..Default::default()
+            },
+        )
+        .await?
+        .unwrap();
+    assert_rejected_account_refresh(oauth, kiro, &a.account_id, lease.status_version).await?;
+    assert!(!disabled.is_enabled);
+    assert_eq!(disabled.account_state, state);
+    assert_eq!(
+        oauth
+            .get_account(kiro, &a.account_id)
+            .await?
+            .unwrap()
+            .status_version,
+        disabled.status_version
+    );
+
+    let rebound = oauth
+        .replace_account(
+            kiro,
+            &a.account_id,
+            disabled.status_version,
+            kiro_credential("before-disconnect"),
+        )
+        .await?
+        .unwrap();
+    let lease = oauth
+        .try_begin_account_refresh(kiro, &a.account_id, rebound.status_version)
+        .await?
+        .unwrap();
+    assert!(
+        oauth
+            .disconnect_account(kiro, &a.account_id, lease.status_version)
+            .await?
+    );
+    for version in [lease.status_version, lease.status_version + 1] {
+        assert!(
+            oauth
+                .try_begin_account_refresh(kiro, &a.account_id, version)
+                .await?
+                .is_none()
+        );
+        assert_rejected_account_refresh(oauth, kiro, &a.account_id, version).await?;
+    }
+    assert!(oauth.get_account(kiro, &a.account_id).await?.is_none());
+    assert_eq!(
+        serde_json::to_value(oauth.get_account(kiro, &b.account_id).await?.unwrap())?,
+        sibling
+    );
+
+    // A pool reduced to one account still rejects account-less refresh callbacks,
+    // while exact account refresh continues to work beside disconnected fences.
+    let rebound = oauth.upsert(kiro, kiro_credential("b-rebound")).await?;
+    assert_eq!(rebound.account_id, b.account_id);
+    assert!(rebound.status_version > lease.status_version + 1);
+    assert!(
+        oauth
+            .try_begin_refresh(kiro, rebound.status_version)
+            .await?
+            .is_none()
+    );
+    let lease = oauth
+        .try_begin_account_refresh(kiro, &b.account_id, rebound.status_version)
+        .await?
+        .unwrap();
+    assert_rejected_account_refresh(oauth, kiro, &a.account_id, lease.status_version).await?;
+    let completed = oauth
+        .complete_account_refresh(
+            kiro,
+            &b.account_id,
+            lease.status_version,
+            kiro_credential("b-refreshed"),
+        )
+        .await?
+        .unwrap();
+    assert_eq!(completed.account_id, b.account_id);
+    assert_eq!(completed.access_token, "b-refreshed");
+    assert!(
+        oauth
+            .disconnect_account(kiro, &b.account_id, completed.status_version)
+            .await?
+    );
+    assert!(
+        oauth
+            .disconnect_account(other, &single.account_id, single.status_version)
+            .await?
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn memory_oauth_account_refresh() -> anyhow::Result<()> {
+    let storage = MemoryStorage::new(
+        vec![
+            account_provider("kiro", "kiro"),
+            account_provider("codex", "openai"),
+        ],
+        vec![],
+        vec![],
+    );
+    exercise_account_refresh(storage.oauth_credentials(), "kiro", "codex").await
+}
+
 #[tokio::test]
 async fn memory_oauth_account_pool() -> anyhow::Result<()> {
     let mut apikey = account_provider("apikey", "devin");
@@ -1141,6 +1528,26 @@ async fn exercise_pool_storage(storage: &dyn Storage) -> anyhow::Result<()> {
     storage.providers().delete(&other).await?;
     result?;
     exercise_google_channel_storage(storage).await
+}
+
+async fn exercise_account_refresh_storage(storage: &dyn Storage) -> anyhow::Result<()> {
+    let kiro = create_pool_test_provider(storage, "kiro").await?;
+    let other = create_pool_test_provider(storage, "openai").await?;
+    let result = exercise_account_refresh(storage.oauth_credentials(), &kiro, &other).await;
+    storage.providers().delete(&kiro).await?;
+    storage.providers().delete(&other).await?;
+    result
+}
+
+#[tokio::test]
+async fn sqlite_oauth_account_refresh() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let pool = crate::db::init_pool(dir.path()).await?;
+    crate::db::migrate(&pool).await?;
+    let storage = SqliteStorage::from_pool(pool.clone());
+    exercise_account_refresh_storage(&storage).await?;
+    pool.close().await;
+    Ok(())
 }
 
 #[tokio::test]

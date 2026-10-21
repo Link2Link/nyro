@@ -748,6 +748,7 @@ async fn bind_provider_oauth_handler(
 struct InitProviderAccountSessionRequest {
     account_id: Option<String>,
     expected_version: Option<i32>,
+    kiro: Option<nyro_core::auth::KiroLoginOptions>,
 }
 
 #[derive(Deserialize)]
@@ -799,7 +800,12 @@ async fn init_provider_account_session_handler(
 ) -> impl IntoResponse {
     match gw
         .admin()
-        .init_provider_account_session(&id, input.account_id.as_deref(), input.expected_version)
+        .init_provider_account_session_with_options(
+            &id,
+            input.account_id.as_deref(),
+            input.expected_version,
+            input.kiro,
+        )
         .await
     {
         Ok(v) => Json(serde_json::json!({ "data": v })).into_response(),

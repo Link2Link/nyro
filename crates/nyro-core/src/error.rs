@@ -94,6 +94,7 @@ pub enum AccountFailureReason {
     AuthInvalid,
     DailyQuota,
     WeeklyQuota,
+    MonthlyQuota,
     RateLimited,
     ModelForbidden,
     Capacity,
@@ -148,7 +149,10 @@ pub enum GatewayError {
 
     /// Native provider failure with sanitized account-scoped scheduling facts.
     AccountUpstream {
+        provider: &'static str,
         status: u16,
+        /// Allowlisted provider description, never the raw upstream body.
+        message: Option<String>,
         failure: AccountFailure,
     },
 
@@ -256,8 +260,18 @@ impl GatewayError {
                     format!("upstream {provider} returned {status}")
                 }
             }
-            GatewayError::AccountUpstream { status, failure } => {
-                format!("Devin upstream returned {status}: {:?}", failure.reason)
+            GatewayError::AccountUpstream {
+                provider,
+                status,
+                message,
+                failure,
+            } => {
+                format!(
+                    "{provider} upstream returned {status}: {}",
+                    message
+                        .clone()
+                        .unwrap_or_else(|| format!("{:?}", failure.reason))
+                )
             }
             GatewayError::UpstreamTimeout { phase } => {
                 format!("upstream timeout during {}", phase.as_str())

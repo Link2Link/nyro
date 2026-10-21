@@ -26,7 +26,7 @@ use crate::proxy::context::{CancellationToken, Deadline};
 use crate::{
     Gateway,
     db::models::Provider,
-    error::{GatewayError, TimeoutPhase},
+    error::{AccountFailure, AccountFailureReason as Reason, GatewayError, TimeoutPhase},
 };
 
 const STREAM_TARGET: &str = "AmazonCodeWhispererStreamingService.GenerateAssistantResponse";
@@ -260,10 +260,59 @@ pub(super) fn classify(status: u16, body: &[u8]) -> GatewayError {
         400..=499 => (status, format!("Kiro returned HTTP {status}")),
         _ => (502, format!("Kiro returned HTTP {status}")),
     };
-    GatewayError::UpstreamStatus {
-        provider: "kiro".into(),
-        status: mapped,
-        body: Some(message),
+    let reason = match mapped {
+        401 => Some(Reason::AuthInvalid),
+        403 if message.contains("suspended") => Some(Reason::AuthInvalid),
+        403 => Some(Reason::ModelForbidden),
+        429 if status == 402 || message.contains("quota is exhausted") => {
+            Some(Reason::MonthlyQuota)
+        }
+        429 => Some(Reason::RateLimited),
+        503 => Some(Reason::Capacity),
+        _ => None,
+    };
+    if let Some(reason) = reason {
+        // A bare proxy 403/429/503 is not proof that generation was refused.
+        // Accept only a recognized AWS exception code or an explicit auth/billing
+        // refusal; messages alone affect health, not replay permission.
+        let code = serde_json::from_slice::<Value>(body)
+            .ok()
+            .and_then(|value| {
+                ["__type", "code", "error"]
+                    .iter()
+                    .find_map(|key| value.get(key)?.as_str().map(str::to_owned))
+            })
+            .unwrap_or_default();
+        let code = code.rsplit(['#', ':']).next().unwrap_or("");
+        let explicit = matches!(status, 401 | 402)
+            || matches!(
+                code,
+                "ThrottlingException"
+                    | "TooManyRequestsException"
+                    | "AccessDeniedException"
+                    | "UnauthorizedException"
+                    | "UnrecognizedClientException"
+                    | "ExpiredTokenException"
+                    | "ServiceQuotaExceededException"
+                    | "LimitExceededException"
+                    | "ServiceUnavailableException"
+            );
+        GatewayError::AccountUpstream {
+            provider: "Kiro",
+            status: mapped,
+            message: Some(message),
+            failure: AccountFailure {
+                reason,
+                rejected_before_execution: explicit,
+                retry_after_seconds: None,
+            },
+        }
+    } else {
+        GatewayError::UpstreamStatus {
+            provider: "kiro".into(),
+            status: mapped,
+            body: Some(message),
+        }
     }
 }
 
@@ -328,9 +377,9 @@ async fn execute(
     control
         .performance
         .note_native_request(&identity, &encoded.body, &encoded.summary);
-    // Generation is stateless and has no agent-side effects, so a failure
-    // before the first response byte may be replayed: the run is deliberately
-    // not marked as submitted.
+    // Once submitted, even an empty timeout can represent billed generation.
+    // Only a structured refusal can authorize another account attempt.
+    control.mark_submitted();
     let response = tokio::select! {
         biased;
         _ = control.cancellation.cancelled() => return Err(GatewayError::ClientCancelled),
@@ -338,8 +387,21 @@ async fn execute(
     };
     let status = response.status().as_u16();
     if !(200..300).contains(&status) {
+        let retry_after = response
+            .headers()
+            .get("retry-after")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<u64>().ok());
         let body = read_limited(response, MAX_ERROR_BYTES).await;
-        return Err(classify(status, &body));
+        let mut error = classify(status, &body);
+        if let GatewayError::AccountUpstream { failure, .. } = &mut error {
+            failure.retry_after_seconds = retry_after;
+            control.rejected.store(
+                failure.rejected_before_execution,
+                std::sync::atomic::Ordering::Release,
+            );
+        }
+        return Err(error);
     }
     let response_headers = response.headers().clone();
     let (sender, receiver) = tokio::sync::mpsc::channel(32);
@@ -850,16 +912,33 @@ mod tests {
                 Err(error) => error,
             };
             server.abort();
-            match error {
-                GatewayError::UpstreamStatus { status, body, .. } => {
-                    assert_eq!(status, expected_status, "{body:?}");
-                    let body = body.unwrap();
-                    assert!(body.to_lowercase().contains(needle), "{body}");
-                    assert!(!body.contains("SECRET"), "{body}");
-                }
-                other => panic!("unexpected {other:?}"),
-            }
+            assert_eq!(error.http_status().as_u16(), expected_status);
+            let message = error.message();
+            assert!(message.to_lowercase().contains(needle), "{message}");
+            assert!(!message.contains("SECRET"), "{message}");
+            assert!(error.account_failure().is_some());
         }
+    }
+
+    #[test]
+    fn account_failures_require_explicit_refusal_for_replay() {
+        for status in [403, 429, 503] {
+            let failure = classify(status, br#"{"message":"proxy rejected request"}"#)
+                .account_failure()
+                .unwrap();
+            assert!(!failure.rejected_before_execution);
+        }
+        let limited = classify(429, br#"{"__type":"com.amazon#ThrottlingException"}"#)
+            .account_failure()
+            .unwrap();
+        assert_eq!(limited.reason, Reason::RateLimited);
+        assert!(limited.rejected_before_execution);
+        let quota = classify(402, b"").account_failure().unwrap();
+        assert_eq!(quota.reason, Reason::MonthlyQuota);
+        assert!(quota.rejected_before_execution);
+        let auth = classify(401, b"").account_failure().unwrap();
+        assert_eq!(auth.reason, Reason::AuthInvalid);
+        assert!(auth.rejected_before_execution);
     }
 
     #[tokio::test]
@@ -917,7 +996,14 @@ mod tests {
         );
         assert!(matches!(
             failure,
-            Some(GatewayError::UpstreamStatus { status: 429, .. })
+            Some(GatewayError::AccountUpstream {
+                status: 429,
+                failure: AccountFailure {
+                    rejected_before_execution: false,
+                    ..
+                },
+                ..
+            })
         ));
     }
 

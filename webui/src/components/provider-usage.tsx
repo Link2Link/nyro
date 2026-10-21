@@ -4,7 +4,7 @@ import { Clock, RefreshCw, AlertCircle, CirclePause } from "lucide-react";
 import { backend } from "@/lib/backend";
 import { localizeBackendErrorMessage } from "@/lib/backend-error";
 import { isKiroOverage, providerUsageSupported, providerUsageTitle, summarizeGroupUsage, tierLabel } from "@/lib/provider-usage";
-import { isDevinProvider } from "@/lib/native-provider";
+import { isDevinProvider, isKiroProvider } from "@/lib/native-provider";
 import { useLocale } from "@/lib/i18n";
 import { accountStateLabel, poolQuotaWindows, type AccountPoolView } from "@/lib/devin-account-pool";
 import { poolSteadyPacePercent, steadyPacePercent, utilizationBarClass, utilizationColor } from "@/lib/usage-pace";
@@ -445,8 +445,8 @@ export function ProviderUsageFooter({ provider }: { provider: Provider }) {
 export function GroupUsageSummary({ providers }: { providers: Provider[] }) {
   const { locale } = useLocale();
   const isZh = locale === "zh-CN";
-  // Devin shows its own account-pool card; it has no per-provider usage query.
-  const members = providers.filter((p) => !isDevinProvider(p) && providerUsageSupported(p));
+  // Native account pools show their own per-account usage, not a singleton summary.
+  const members = providers.filter((p) => !isDevinProvider(p) && !isKiroProvider(p) && providerUsageSupported(p));
 
   const credentials = useQueries({
     queries: members.map((p) => ({ ...arkCredentialsQuery(p), enabled: isArkProvider(p) })),
