@@ -17,6 +17,10 @@ use serde_json::Value;
 
 const SOCIAL_ORIGIN: &str = "https://prod.us-east-1.auth.desktop.kiro.dev";
 const SOCIAL_CLIENT_ID: &str = "kiro-cli";
+// Client registration name used by the AIClient2API Kiro auth reference:
+// https://github.com/justlovemaki/AIClient-2-API/blob/master/src/auth/kiro-oauth.js
+// Only new registrations use this name; refreshing an old client cannot rename it.
+const OIDC_CLIENT_NAME: &str = "Kiro IDE";
 const BUILDER_START_URL: &str = "https://view.awsapps.com/start";
 const DEVICE_GRANT: &str = "urn:ietf:params:oauth:grant-type:device_code";
 const SCOPES: [&str; 3] = [
@@ -217,6 +221,7 @@ async fn post_json(client: &reqwest::Client, url: &str, body: &Value) -> Result<
         .post(url)
         .timeout(HTTP_TIMEOUT)
         .header(reqwest::header::ACCEPT, "application/json")
+        .header(reqwest::header::USER_AGENT, IDE_USER_AGENT)
         .json(body)
         .send()
         .await
@@ -264,7 +269,7 @@ async fn start_with(
             &client,
             &format!("{}/client/register", endpoints.oidc),
             &json!({
-                "clientName":"Nyro Kiro Gateway", "clientType":"public",
+                "clientName":OIDC_CLIENT_NAME, "clientType":"public",
                 "scopes":SCOPES, "grantTypes":[DEVICE_GRANT,"refresh_token"]
             }),
         )
@@ -594,8 +599,14 @@ mod tests {
     async fn mock(
         State(mock): State<Mock>,
         uri: Uri,
+        headers: axum::http::HeaderMap,
         Json(body): Json<Value>,
     ) -> impl IntoResponse {
+        // Exercise the shared helper for registration, authorization and polling
+        // across Google, GitHub, Builder ID and IAM Identity Center.
+        assert_eq!(headers["user-agent"], "KiroIDE");
+        assert_eq!(headers["accept"], "application/json");
+        assert_eq!(headers["content-type"], "application/json");
         mock.requests
             .lock()
             .unwrap()
@@ -633,6 +644,7 @@ mod tests {
     fn client() -> reqwest::Client {
         reqwest::Client::builder()
             .no_proxy()
+            .user_agent("Nyro Kiro Gateway")
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .unwrap()
@@ -761,6 +773,8 @@ mod tests {
             assert!(ready.raw.get("client_secret").is_none());
             let requests = seen.requests.lock().unwrap();
             assert_eq!(requests[0].0, "/oauth/device/authorization");
+            assert_eq!(requests[0].1["clientId"], "kiro-cli");
+            assert!(requests[0].1.get("clientName").is_none());
             assert_eq!(
                 requests[0].1["loginProvider"],
                 if method == KiroLoginMethod::Google {
@@ -821,6 +835,7 @@ mod tests {
         assert_eq!(ready.scopes, SCOPES);
         let requests = seen.requests.lock().unwrap();
         assert_eq!(requests[0].0, "/client/register");
+        assert_eq!(requests[0].1["clientName"], "Kiro IDE");
         assert_eq!(requests[0].1["clientType"], "public");
         assert_eq!(requests[0].1["scopes"], json!(SCOPES));
         assert_eq!(
@@ -877,8 +892,11 @@ mod tests {
         assert_eq!(ready.raw["auth_method"], "idc");
         assert_eq!(ready.raw["idc_region"], "eu-north-1");
         assert_eq!(ready.raw["region"], "us-east-1");
+        let requests = seen.requests.lock().unwrap();
+        assert_eq!(requests[0].0, "/client/register");
+        assert_eq!(requests[0].1["clientName"], "Kiro IDE");
         assert_eq!(
-            seen.requests.lock().unwrap()[1].1["startUrl"],
+            requests[1].1["startUrl"],
             "https://company.awsapps.com/start"
         );
         task.abort();

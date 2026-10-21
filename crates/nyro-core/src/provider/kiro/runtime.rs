@@ -30,9 +30,6 @@ use crate::{
 };
 
 const STREAM_TARGET: &str = "AmazonCodeWhispererStreamingService.GenerateAssistantResponse";
-// Kiro's backend accepts the Amazon Q CLI client identity for generation.
-const CLI_AMZ_USER_AGENT: &str = "aws-sdk-rust/1.3.15 ua/2.1 api/codewhispererstreaming/0.1.17593 os/linux lang/rust/1.92.0 m/F app/AmazonQ-For-CLI";
-const CLI_USER_AGENT: &str = "aws-sdk-rust/1.3.15 ua/2.1 api/codewhispererstreaming/0.1.17593 os/linux lang/rust/1.92.0 md/appVersion-2.10.0 app/AmazonQ-For-CLI";
 const IDE_VERSION: &str = "0.11.63";
 /// Error bodies are read only to classify the failure; never forwarded.
 const MAX_ERROR_BYTES: usize = 16 * 1024;
@@ -63,8 +60,11 @@ fn token_headers(token: &str) -> Result<HeaderMap, GatewayError> {
     Ok(headers)
 }
 
-fn stream_headers(token: &str) -> Result<HeaderMap, GatewayError> {
-    let mut headers = token_headers(token)?;
+fn stream_headers(token: &str, credential: &KiroCredential) -> Result<HeaderMap, GatewayError> {
+    // Generation and usage share the Kiro IDE identity, as in the reference:
+    // https://github.com/justlovemaki/AIClient-2-API/blob/master/src/providers/claude/claude-kiro.js
+    // Keep operation-specific headers (including retry metadata) separate.
+    let mut headers = ide_headers(token, credential)?;
     headers.insert("content-type", HeaderValue::from_static("application/json"));
     headers.insert("accept", HeaderValue::from_static("application/json"));
     headers.insert(
@@ -72,11 +72,6 @@ fn stream_headers(token: &str) -> Result<HeaderMap, GatewayError> {
         HeaderValue::from_static("attempt=1; max=3"),
     );
     headers.insert("x-amz-target", HeaderValue::from_static(STREAM_TARGET));
-    headers.insert(
-        "x-amz-user-agent",
-        HeaderValue::from_static(CLI_AMZ_USER_AGENT),
-    );
-    headers.insert("user-agent", HeaderValue::from_static(CLI_USER_AGENT));
     Ok(headers)
 }
 
@@ -364,7 +359,7 @@ async fn execute(
     transport: ProxyClient,
     control: AttemptControl,
 ) -> Result<IrUpstream, GatewayError> {
-    let identity = stream_headers(token)?;
+    let identity = stream_headers(token, credential)?;
     let encoded = request::encode(&request, requested_model, credential.profile_arn.as_deref())?;
     let upstream_model = encoded.upstream_model.clone();
     let options = SessionOptions {
@@ -689,9 +684,15 @@ mod tests {
     }
 
     fn client(control: &AttemptControl) -> ProxyClient {
-        ProxyClient::new(reqwest::Client::builder().no_proxy().build().unwrap())
-            .with_deadline(control.deadline.clone())
-            .with_performance(control.performance.clone())
+        ProxyClient::new(
+            reqwest::Client::builder()
+                .no_proxy()
+                .user_agent("Nyro Kiro Gateway")
+                .build()
+                .unwrap(),
+        )
+        .with_deadline(control.deadline.clone())
+        .with_performance(control.performance.clone())
     }
 
     fn input() -> AiRequest {
@@ -807,8 +808,16 @@ mod tests {
             headers["user-agent"]
                 .to_str()
                 .unwrap()
-                .contains("AmazonQ-For-CLI")
+                .ends_with(&format!("KiroIDE-0.11.63-{}", machine_id(&credential())))
         );
+        assert_eq!(
+            headers["x-amz-user-agent"],
+            format!(
+                "aws-sdk-js/1.0.34 KiroIDE-0.11.63-{}",
+                machine_id(&credential())
+            )
+        );
+        assert_eq!(headers["amz-sdk-request"], "attempt=1; max=3");
         assert!(headers.get("tokentype").is_none());
         let body: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(
@@ -1026,15 +1035,24 @@ mod tests {
 
     #[test]
     fn headers_mark_the_token_sensitive_and_reject_blank_or_malformed_tokens() {
-        let headers = stream_headers("secret-token").unwrap();
+        let credential = credential();
+        let headers = stream_headers("secret-token", &credential).unwrap();
         assert!(headers["authorization"].is_sensitive());
         assert_eq!(headers["amz-sdk-request"], "attempt=1; max=3");
-        assert!(stream_headers("").is_err());
-        assert!(stream_headers("   ").is_err());
-        assert!(stream_headers("bad\nvalue").is_err());
-        let ide = ide_headers("t", &credential()).unwrap();
+        assert!(stream_headers("", &credential).is_err());
+        assert!(stream_headers("   ", &credential).is_err());
+        assert!(stream_headers("bad\nvalue", &credential).is_err());
+        let ide = ide_headers("t", &credential).unwrap();
         assert!(ide["user-agent"].to_str().unwrap().contains("KiroIDE-"));
         assert!(ide.get("x-amz-target").is_none());
+        assert_eq!(ide["amz-sdk-request"], "attempt=1; max=1");
+        for name in ["user-agent", "x-amz-user-agent"] {
+            assert_eq!(headers[name], ide[name]);
+            let value = headers[name].to_str().unwrap().to_ascii_lowercase();
+            assert!(!value.contains("nyro"));
+            assert!(!value.contains("gateway"));
+            assert!(!value.contains("amazonq-for-cli"));
+        }
     }
 
     #[test]
@@ -1046,6 +1064,25 @@ mod tests {
         assert_eq!(machine_id(&a), machine_id(&a));
         assert_ne!(machine_id(&a), machine_id(&b));
         assert_eq!(machine_id(&a).len(), 64);
+        for account in [&a, &b] {
+            let stream = stream_headers("token", account).unwrap();
+            let usage = ide_headers("token", account).unwrap();
+            for name in ["user-agent", "x-amz-user-agent"] {
+                assert_eq!(stream[name], usage[name]);
+                assert!(
+                    stream[name]
+                        .to_str()
+                        .unwrap()
+                        .ends_with(&machine_id(account))
+                );
+            }
+        }
+        a.client_id = Some("client-a".into());
+        let profile_id = machine_id(&a);
+        a.client_id = Some("client-b".into());
+        assert_eq!(machine_id(&a), profile_id, "profile takes precedence");
+        a.profile_arn = None;
+        assert_eq!(machine_id(&a), hex::encode(Sha256::digest(b"client-b")));
     }
 
     #[test]
@@ -1076,6 +1113,12 @@ mod tests {
                 let query = request.uri().query().unwrap_or("").to_string();
                 assert!(query.contains("resourceType=AGENTIC_REQUEST"), "{query}");
                 assert!(query.contains("profileArn=arn"), "{query}");
+                assert!(query.contains("origin=AI_EDITOR"), "{query}");
+                let headers = request.headers();
+                assert!(headers["user-agent"].to_str().unwrap().contains("KiroIDE-0.11.63-"));
+                assert!(headers["x-amz-user-agent"].to_str().unwrap().starts_with("aws-sdk-js/1.0.34 KiroIDE-0.11.63-"));
+                assert_eq!(headers["amz-sdk-request"], "attempt=1; max=1");
+                assert!(!headers.contains_key("x-amz-target"));
                 axum::Json(serde_json::json!({
                     "subscriptionInfo": {"subscriptionTitle": "KIRO PRO"},
                     "usageBreakdownList": [{"currentUsage": 5, "usageLimit": 50, "displayName": "Credits"}]

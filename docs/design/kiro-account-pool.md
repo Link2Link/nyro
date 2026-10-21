@@ -10,6 +10,14 @@ In **Providers → Kiro → Manage accounts** (or the expanded Provider settings
 
 Accounts have their own immutable ID, alias, priority, enabled flag, credential generation, usage observation and scheduling state. Smaller priority values are preferred. Reauthorization/import targets one account and expected version; removing an account clears only that account's secrets and retains a disconnected tombstone to fence delayed callbacks. Disconnected rows are not reusable: add a new account instead. A known profile identity must match during reauthorization.
 
+## Upstream client identity
+
+New AWS Builder ID / IAM Identity Center device logins register with `clientName = "Kiro IDE"`, following the [AIClient2API authentication reference](https://github.com/justlovemaki/AIClient-2-API/blob/master/src/auth/kiro-oauth.js). Google/GitHub device login keeps the existing `clientId = "kiro-cli"`; it does not perform AWS client registration. Authentication requests use `User-Agent: KiroIDE`. Generation and usage requests share the existing versioned `KiroIDE-0.11.63-<machine-id>` user-agent pair rather than mixing Amazon Q CLI and Kiro IDE identities. The gateway does not add its own brand to these client identity fields.
+
+Existing AWS registrations retain the name they were created with: an upgrade or token refresh does **not** rename `Nyro Kiro Gateway`. Reauthorize the affected account after upgrading to create a new registration; imported credentials retain their original registration until reauthorization. Reauthorization does not delete old upstream authorization records, which can be reviewed/revoked in the upstream account settings.
+
+These values align with the named reference implementation, not a verified complete capture of the current official client. Endpoints, grant types, scopes, credential storage, request conversion and retry behavior remain unchanged. Matching names and HTTP headers does not imply identical TLS, telemetry or execution behavior; live browser and generation acceptance still require separate verification.
+
 ## Scheduling and safe failover
 
 The implementation reuses Devin's bounded account registry, shared management endpoints and existing credential storage, not its plan classification:

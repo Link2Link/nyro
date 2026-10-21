@@ -75,13 +75,11 @@ async fn read_json<T: for<'de> Deserialize<'de>>(
     serde_json::from_slice(&body).map_err(|_| anyhow!("{what} response is invalid"))
 }
 
-/// Refresh `credential` with `refresh_token`. Upstream bodies are never put in
-/// errors: they can echo credentials or authorization material.
-async fn refresh_tokens(
+fn refresh_request(
     client: &reqwest::Client,
     credential: &KiroCredential,
     refresh_token: &str,
-) -> Result<TokenResponse> {
+) -> Result<reqwest::RequestBuilder> {
     let request = if credential.refreshes_through_oidc() {
         let (Some(client_id), Some(client_secret)) = (
             credential.client_id.as_deref(),
@@ -91,23 +89,31 @@ async fn refresh_tokens(
                 "Kiro Builder ID / IAM Identity Center credentials need clientId and clientSecret to refresh"
             );
         };
-        client
-            .post(credential.oidc_token_url())
-            .header(reqwest::header::USER_AGENT, IDE_USER_AGENT)
-            .json(&json!({
-                "refreshToken": refresh_token,
-                "clientId": client_id,
-                "clientSecret": client_secret,
-                "grantType": "refresh_token",
-            }))
+        client.post(credential.oidc_token_url()).json(&json!({
+            "refreshToken": refresh_token,
+            "clientId": client_id,
+            "clientSecret": client_secret,
+            "grantType": "refresh_token",
+        }))
     } else {
         client
             .post(credential.social_refresh_url())
             .json(&json!({ "refreshToken": refresh_token }))
     };
-    let response = request
+    Ok(request
         .timeout(HTTP_TIMEOUT)
         .header(reqwest::header::ACCEPT, "application/json")
+        .header(reqwest::header::USER_AGENT, IDE_USER_AGENT))
+}
+
+/// Refresh `credential` with `refresh_token`. Upstream bodies are never put in
+/// errors: they can echo credentials or authorization material.
+async fn refresh_tokens(
+    client: &reqwest::Client,
+    credential: &KiroCredential,
+    refresh_token: &str,
+) -> Result<TokenResponse> {
+    let response = refresh_request(client, credential, refresh_token)?
         .send()
         .await
         .map_err(|_| anyhow!("Kiro token refresh could not connect"))?;
@@ -513,6 +519,54 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.to_string().contains("clientId and clientSecret"));
+    }
+
+    #[test]
+    fn refresh_requests_use_kiro_identity_and_keep_each_auth_protocol() {
+        use crate::provider::kiro::credential::AuthMethod;
+
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .user_agent("Nyro Kiro Gateway")
+            .build()
+            .unwrap();
+        for method in [AuthMethod::Social, AuthMethod::BuilderId, AuthMethod::Idc] {
+            let mut credential = KiroCredential::from_stored(&StoredCredential::default());
+            credential.auth_method = method;
+            credential.idc_region = "eu-north-1".into();
+            credential.client_id = Some("CID".into());
+            credential.client_secret = Some("SECRET".into());
+            let request = refresh_request(&client, &credential, "REFRESH")
+                .unwrap()
+                .build()
+                .unwrap();
+            assert_eq!(request.method(), reqwest::Method::POST);
+            assert_eq!(request.headers()["user-agent"], "KiroIDE");
+            assert_eq!(request.headers()["accept"], "application/json");
+            assert_eq!(request.headers()["content-type"], "application/json");
+            assert_eq!(request.timeout(), Some(&HTTP_TIMEOUT));
+            let body: Value =
+                serde_json::from_slice(request.body().unwrap().as_bytes().unwrap()).unwrap();
+            if method == AuthMethod::Social {
+                assert_eq!(
+                    request.url().as_str(),
+                    "https://prod.us-east-1.auth.desktop.kiro.dev/refreshToken"
+                );
+                assert_eq!(body, json!({"refreshToken":"REFRESH"}));
+            } else {
+                assert_eq!(
+                    request.url().as_str(),
+                    "https://oidc.eu-north-1.amazonaws.com/token"
+                );
+                assert_eq!(
+                    body,
+                    json!({
+                        "refreshToken":"REFRESH", "clientId":"CID",
+                        "clientSecret":"SECRET", "grantType":"refresh_token"
+                    })
+                );
+            }
+        }
     }
 
     #[tokio::test]
