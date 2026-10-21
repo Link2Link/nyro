@@ -404,9 +404,12 @@ export function ProviderUsageFooter({ provider }: { provider: Provider }) {
           {/* Tier order is owned by the gateway API (canonical window order:
               5h → daily → weekly → monthly → …), so every consumer shows the
               same sequence. Do not re-sort here. */}
-          {shown.tiers.map((tier) => (
-            <TierBar key={tier.name} tier={tier} isZh={isZh} now={now} />
-          ))}
+          {/* Kiro shows pooled quota only; allowance details remain in the API. */}
+          {shown.tiers
+            .filter((tier) => shown.kind !== "kiro_plan" || !tier.name.startsWith("feature:kiro:"))
+            .map((tier) => (
+              <TierBar key={tier.name} tier={tier} isZh={isZh} now={now} />
+            ))}
           {/* Windows and balances render together: Devin's extra balance sits
               under its daily/weekly bars and decides whether a spent window
               pauses routing at all. */}
