@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, type ReactNode } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { RefreshCw } from "lucide-react";
 import { backend } from "@/lib/backend";
@@ -6,6 +6,8 @@ import { localizeBackendErrorMessage } from "@/lib/backend-error";
 import { useLocale } from "@/lib/i18n";
 import { accountStateLabel, canReauthorizeLegacyProvider, type AccountPoolView, type AccountQuotaWindow, type OAuthAccountUpdate, type ProviderAccountView } from "@/lib/devin-account-pool";
 import type { Provider } from "@/lib/types";
+import { useAccountUsageStats } from "@/lib/account-usage-stats";
+import { AccountUsageSummary } from "@/components/account-usage-summary";
 import type { OAuthSessionIntent } from "@/lib/use-oauth-session";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -48,8 +50,8 @@ function AccountQuota({ window, name, now, isZh, notApplicable = false }: {
   </div>;
 }
 
-function AccountRow({ account, showDaily, now, pending, canLogin, onUpdate, onLogin, onRefresh, onRemove }: {
-  account: ProviderAccountView; showDaily: boolean; now: number; pending: boolean; canLogin: boolean;
+function AccountRow({ account, showDaily, now, pending, canLogin, usageSummary, onUpdate, onLogin, onRefresh, onRemove }: {
+  account: ProviderAccountView; showDaily: boolean; now: number; pending: boolean; canLogin: boolean; usageSummary: ReactNode;
   onUpdate: (update: OAuthAccountUpdate) => void; onLogin: () => void; onRefresh: () => void; onRemove: () => void;
 }) {
   const { locale } = useLocale();
@@ -80,7 +82,7 @@ function AccountRow({ account, showDaily, now, pending, canLogin, onUpdate, onLo
       <Button type="button" variant="secondary" disabled={pending || disconnected || !canLogin} onClick={onLogin}>{isZh ? "重登" : "Re-authorize"}</Button>
       <Button type="button" variant="secondary" disabled={pending || disconnected} onClick={() => onUpdate({ is_enabled: !account.is_enabled })}>{account.is_enabled ? (isZh ? "停用" : "Disable") : (isZh ? "启用" : "Enable")}</Button>
       <Button type="button" variant="secondary" disabled={pending || disconnected} onClick={onRemove}>{isZh ? "移除" : "Remove"}</Button>
-    </div></td>
+    </div>{usageSummary}</td>
   </tr>;
 }
 
@@ -89,11 +91,12 @@ export function DevinAccountPoolPanel({ provider }: { provider: Provider }) {
   const isZh = locale === "zh-CN";
   const query = useAccountPool(provider.id);
   const now = useUsageClock();
+  const usageStats = useAccountUsageStats(provider.id, "week", now);
   const qc = useQueryClient();
   const [login, setLogin] = useState<{ intent: OAuthSessionIntent; label: string } | null>(null);
   const [remove, setRemove] = useState<ProviderAccountView | null>(null);
   function invalidate() {
-    for (const key of ["provider-account-pool", "provider-usage", "provider-oauth-status"]) void qc.invalidateQueries({ queryKey: [key, provider.id] });
+    for (const key of ["provider-account-pool", "provider-account-usage-stats", "provider-usage", "provider-oauth-status"]) void qc.invalidateQueries({ queryKey: [key, provider.id] });
     void qc.invalidateQueries({ queryKey: ["providers"] });
   }
   const mutation = useMutation({
@@ -138,6 +141,8 @@ export function DevinAccountPoolPanel({ provider }: { provider: Provider }) {
       <tbody>{pool.accounts.map((account) => {
         const target = { accountId: account.account_id, expectedVersion: account.status_version };
         return <AccountRow key={`${account.account_id}:${account.status_version}`} account={account} showDaily={Boolean(pool.quota.daily)} now={now} pending={pending} canLogin={Boolean(pool.config)}
+          usageSummary={<AccountUsageSummary stats={usageStats.byAccount.get(account.account_id)} period="week" periodStart={usageStats.periodStart}
+            loading={usageStats.query.isPending} error={usageStats.query.isError} locale={locale} />}
           onUpdate={(update) => act("update_provider_account", { ...target, update })}
           onRefresh={() => act("refresh_provider_account_usage", { accountId: account.account_id })}
           onRemove={() => setRemove(account)}
@@ -166,7 +171,7 @@ export function DevinAccountPoolCard({ provider }: { provider: Provider }) {
     // because some accounts may have refreshed before the operation failed.
     onSettled: async () => {
       await Promise.all([
-        ...["provider-account-pool", "provider-usage", "provider-oauth-status"].map((key) =>
+        ...["provider-account-pool", "provider-account-usage-stats", "provider-usage", "provider-oauth-status"].map((key) =>
           qc.invalidateQueries({ queryKey: [key, provider.id] })),
         qc.invalidateQueries({ queryKey: ["providers"] }),
       ]);

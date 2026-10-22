@@ -4,7 +4,8 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { LocaleProvider } from "../lib/i18n";
 import { newDevinPoolConfig, type AccountPoolView, type ProviderAccountView } from "../lib/devin-account-pool";
-import type { Provider } from "../lib/types";
+import type { AccountUsageStats, Provider } from "../lib/types";
+import { accountUsagePeriodStart } from "../lib/account-usage-stats";
 import { AccountPoolSettings } from "./devin-pool-settings";
 import { KiroAccountPoolCard, KiroAccountPoolPanel, KiroAccountUsage, KiroPoolUsage } from "./kiro-account-pool";
 import { KiroAccountLogin } from "./kiro-account-login";
@@ -31,15 +32,40 @@ const provider: Provider = {
   base_url: "https://q.us-east-1.amazonaws.com", use_proxy: false, fast_mode: false, is_enabled: true, created_at: "", updated_at: "",
 };
 
-function panel(value = pool, card = false) {
+function panel(value = pool, card = false, stats?: AccountUsageStats[], inspect?: (client: QueryClient) => void) {
   const client = new QueryClient();
   client.setQueryData(["provider-account-pool", "kiro"], value);
+  if (stats) client.setQueryData(["provider-account-usage-stats", "kiro", accountUsagePeriodStart("month", Date.now())], stats);
   try {
-    return renderToStaticMarkup(<QueryClientProvider client={client}><LocaleProvider>
+    const html = renderToStaticMarkup(<QueryClientProvider client={client}><LocaleProvider>
       {card ? <KiroAccountPoolCard provider={provider} /> : <KiroAccountPoolPanel provider={provider} />}
     </LocaleProvider></QueryClientProvider>);
+    inspect?.(client);
+    return html;
   } finally { client.clear(); }
 }
+
+test("Kiro management shows retained and calendar-month account totals beneath actions", () => {
+  const zero = { total_tokens: 0, request_count: 0, equivalent_costs: [], unpriced_request_count: 0 };
+  const stats: AccountUsageStats[] = [{ account_id: "account-a", all_time: { ...zero, total_tokens: 2_500_000, request_count: 1, equivalent_costs: [{ currency: "USD", total_cost: 7.5, priced_request_count: 1 }] }, period: zero }];
+  const html = panel(pool, false, stats);
+  match(html, /data-account-usage="account-a"[\s\S]*2\.50M[\s\S]*\$7\.50[\s\S]*This month[\s\S]*\$0\.00/);
+  match(html, />Remove<\/button><\/div><div data-account-usage=/);
+  match(html, /Kiro tokens are estimates, not actual credit usage/);
+  match(html, /calendar month starts on the 1st/);
+  equal((html.match(/<th class=/g) ?? []).length, 4);
+  doesNotMatch(html, /This week|Loading totals/);
+});
+
+test("Kiro usage query stays inside management and is shared across all account rows", () => {
+  panel(pool, true, undefined, (client) => equal(client.getQueryCache().findAll({ queryKey: ["provider-account-usage-stats"] }).length, 0));
+  panel({ ...pool, accounts: [account, { ...account, account_id: "account-b" }] }, false, undefined, (client) => {
+    const queries = client.getQueryCache().findAll({ queryKey: ["provider-account-usage-stats"] });
+    equal(queries.length, 1);
+    equal(queries[0].queryKey[2], accountUsagePeriodStart("month", Date.now()));
+    equal((queries[0].options as { refetchInterval?: number }).refetchInterval, 60_000);
+  });
+});
 
 test("Kiro management has scoped account actions and actual usage, not Devin quota rules", () => {
   const html = panel();

@@ -47,6 +47,12 @@ Bonus/trial expiry never counts as a replenishing reset. Persisted grants are ex
 
 The UI shows pool account counts, a **pool total per resource**, and per-account resource usage. The pool total sums each enabled, non-disconnected account's actual pooled `used` (capped at its limit) and `limit` for the same resource, and shows the resulting used percentage, remaining percentage, coverage (accounts with observations / members), stale contributors, and the earliest account reset (marked aligned when every contributor shares it). Different resources are never merged with each other. Its steady-pace marker is display-only: each contributor's monthly window progress toward its own reset, weighted by that account's allowance; it is hidden if any contributor lacks a reset. The UI does not invent daily/weekly windows, Pro-equivalent units, or a shared reset. The provider-usage API also exposes display-only totals in the generic `tiers` field (see below); scheduling stays per-account. Connection tests check enabled accounts independently, are non-generating, and succeed if any account passes; model suggestions are not a guarantee of account entitlement.
 
+## Per-account retained gateway usage
+
+Each account's actions also include a compact **All records / This month** summary showing total tokens and estimated API-equivalent value. This month starts on the first day at 00:00 in the browser's local time zone, independent of Kiro's quota reset. The shared [account usage API and accounting rules](./devin-account-pool.md#per-account-retained-gateway-usage) apply: stable account-ID attribution, retained attempts including retries/failures, no cache double counting, current reference/manual prices, explicit missing/partial prices, and separate native currencies. Log retention/deletion reduces the historical coverage; this is not a permanent ledger.
+
+Kiro token counts are estimates based on context percentage/local content estimates (with assumed cache reads), not the actual Credits charged upstream. Neither these tokens nor API-equivalent values replace the resource-allowance observations above. The statistics endpoint is read-only and never changes quotas or scheduling.
+
 ## APIs and persistence
 
 Existing account APIs support both Devin and Kiro:

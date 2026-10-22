@@ -330,6 +330,16 @@ impl LogStore for MemoryStorage {
         Ok(vec![])
     }
 
+    async fn account_token_usage(
+        &self,
+        _provider_id: &str,
+        _start_at: Option<i64>,
+        _end_at: Option<i64>,
+    ) -> anyhow::Result<Vec<crate::db::models::AccountModelUsage>> {
+        // YAML-only memory storage does not retain request logs.
+        Ok(vec![])
+    }
+
     async fn stats_by_model_range(
         &self,
         _start_at: Option<i64>,

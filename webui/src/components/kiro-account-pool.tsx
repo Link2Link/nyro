@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, type ReactNode } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Clock, RefreshCw } from "lucide-react";
 import { backend } from "@/lib/backend";
@@ -19,6 +19,8 @@ import { KiroAccountLogin } from "@/components/kiro-account-login";
 import { ProviderUsageFooter } from "@/components/provider-usage";
 import { UsageProgress } from "@/components/usage-progress";
 import { PoolRefreshButton } from "@/components/pool-refresh-button";
+import { AccountUsageSummary } from "@/components/account-usage-summary";
+import { useAccountUsageStats } from "@/lib/account-usage-stats";
 
 function useAccountPool(providerId: string) {
   return useQuery<AccountPoolView>({
@@ -31,7 +33,7 @@ function useAccountPool(providerId: string) {
 function useInvalidatePool(providerId: string) {
   const qc = useQueryClient();
   return () => Promise.all([
-    ...["provider-account-pool", "provider-usage", "provider-oauth-status"].map((key) => qc.invalidateQueries({ queryKey: [key, providerId] })),
+    ...["provider-account-pool", "provider-account-usage-stats", "provider-usage", "provider-oauth-status"].map((key) => qc.invalidateQueries({ queryKey: [key, providerId] })),
     qc.invalidateQueries({ queryKey: ["providers"] }),
   ]);
 }
@@ -159,8 +161,8 @@ function PoolSummary({ pool, isZh }: { pool: AccountPoolView; isZh: boolean }) {
   </div>;
 }
 
-function AccountRow({ account, pending, canLogin, onUpdate, onLogin, onRefresh, onRemove, isZh }: {
-  account: ProviderAccountView; pending: boolean; canLogin: boolean; isZh: boolean;
+function AccountRow({ account, pending, canLogin, usageSummary, onUpdate, onLogin, onRefresh, onRemove, isZh }: {
+  account: ProviderAccountView; pending: boolean; canLogin: boolean; isZh: boolean; usageSummary: ReactNode;
   onUpdate: (update: OAuthAccountUpdate) => void; onLogin: () => void; onRefresh: () => void; onRemove: () => void;
 }) {
   const [label, setLabel] = useState(account.label);
@@ -185,7 +187,7 @@ function AccountRow({ account, pending, canLogin, onUpdate, onLogin, onRefresh, 
       <Button type="button" variant="secondary" disabled={pending || disconnected || !canLogin} onClick={onLogin}>{isZh ? "重新授权 / 导入" : "Re-authorize / import"}</Button>
       <Button type="button" variant="secondary" disabled={pending || disconnected} onClick={() => onUpdate({ is_enabled: !account.is_enabled })}>{account.is_enabled ? (isZh ? "停用" : "Disable") : (isZh ? "启用" : "Enable")}</Button>
       <Button type="button" variant="secondary" disabled={pending || disconnected} onClick={onRemove}>{isZh ? "移除" : "Remove"}</Button>
-    </div></td>
+    </div>{usageSummary}</td>
   </tr>;
 }
 
@@ -193,6 +195,8 @@ export function KiroAccountPoolPanel({ provider }: { provider: Provider }) {
   const { locale } = useLocale();
   const isZh = locale === "zh-CN";
   const query = useAccountPool(provider.id);
+  const now = useUsageClock();
+  const usageStats = useAccountUsageStats(provider.id, "month", now);
   const invalidate = useInvalidatePool(provider.id);
   const [login, setLogin] = useState<{ intent: OAuthSessionIntent; label: string } | null>(null);
   const [remove, setRemove] = useState<ProviderAccountView | null>(null);
@@ -236,6 +240,8 @@ export function KiroAccountPoolPanel({ provider }: { provider: Provider }) {
       <tbody>{pool.accounts.map((account) => {
         const target = { accountId: account.account_id, expectedVersion: account.status_version };
         return <AccountRow key={`${account.account_id}:${account.status_version}`} account={account} isZh={isZh} pending={pending} canLogin={Boolean(pool.config)}
+          usageSummary={<AccountUsageSummary stats={usageStats.byAccount.get(account.account_id)} period="month" periodStart={usageStats.periodStart}
+            loading={usageStats.query.isPending} error={usageStats.query.isError} locale={locale} />}
           onUpdate={(update) => act("update_provider_account", { ...target, update })}
           onRefresh={() => act("refresh_provider_account_usage", { accountId: account.account_id })}
           onRemove={() => setRemove(account)}

@@ -100,6 +100,7 @@ pub fn run() {
             commands::logout_provider_oauth,
             commands::bind_provider_oauth,
             commands::get_provider_account_pool,
+            commands::get_provider_account_usage_stats,
             commands::configure_provider_account_pool,
             commands::init_provider_account_session,
             commands::bind_provider_account,

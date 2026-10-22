@@ -631,7 +631,7 @@ impl AdminService {
             .set(&format!("provider_account_fence:{id}"), &fence.to_string())
             .await
     }
-    async fn account_pool_provider(&self, id: &str) -> anyhow::Result<Provider> {
+    pub(super) async fn account_pool_provider(&self, id: &str) -> anyhow::Result<Provider> {
         let provider = self.get_provider(id).await?;
         anyhow::ensure!(
             (crate::provider::devin::is_devin(&provider)

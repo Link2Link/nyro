@@ -22,6 +22,8 @@ use crate::storage::traits::{ProviderEndpointTestResult, ProviderTestResult};
 
 mod account_pool;
 mod account_test;
+mod account_usage;
+pub use account_usage::{AccountUsageStats, AccountUsageTotals};
 mod kiro_accounts;
 pub use account_pool::{
     AccountPoolCounts, AccountPoolQuota, AccountPoolView, AccountQuotaWindow, DevinPlan,

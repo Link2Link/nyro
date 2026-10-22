@@ -126,6 +126,10 @@ pub fn create_router(gateway: Gateway, admin_token: Option<String>) -> Router {
             get(get_provider_account_pool_handler),
         )
         .route(
+            "/providers/:id/accounts/usage-stats",
+            get(get_provider_account_usage_stats_handler),
+        )
+        .route(
             "/providers/:id/account-pool",
             put(configure_provider_account_pool_handler),
         )
@@ -775,6 +779,26 @@ async fn get_provider_account_pool_handler(
     match gw.admin().get_provider_account_pool(&id).await {
         Ok(v) => Json(serde_json::json!({ "data": v })).into_response(),
         Err(e) => err(e),
+    }
+}
+
+#[derive(Deserialize)]
+struct AccountUsageParams {
+    period_start: i64,
+}
+
+async fn get_provider_account_usage_stats_handler(
+    State(gw): State<Gateway>,
+    Path(id): Path<String>,
+    Query(params): Query<AccountUsageParams>,
+) -> impl IntoResponse {
+    match gw
+        .admin()
+        .get_provider_account_usage_stats(&id, params.period_start)
+        .await
+    {
+        Ok(v) => Json(serde_json::json!({ "data": v })).into_response(),
+        Err(e) => stats_detail_error(e),
     }
 }
 
@@ -1438,6 +1462,10 @@ mod token_price_api_tests;
 #[cfg(test)]
 #[path = "token_usage_api_tests.rs"]
 mod token_usage_api_tests;
+
+#[cfg(test)]
+#[path = "account_usage_api_tests.rs"]
+mod account_usage_api_tests;
 
 #[cfg(test)]
 mod tests {

@@ -149,6 +149,14 @@ For each account/window, the visual steady-pace estimate is `clamp(100 * (1 - (r
 
 The marker refreshes on a local 30-second clock without querying upstream. Hover text explains the estimate and its capacity weighting. Missing/invalid resets, unknown account class, incomplete usage or inconsistent capacity suppress the pool needle; actual bars and backend percentages are not recalculated. Exhausted/auth-invalid accounts remain in the denominator, and elapsed reset time does not restore quota or imply readiness.
 
+### Per-account retained gateway usage
+
+Below each account's actions, a compact summary shows **All records** and **This week**, with total tokens and estimated API-equivalent value for each. This week begins Monday at 00:00 in the browser's local time zone, not at the upstream weekly quota reset. Totals include retained upstream attempts (including retries and failures) attributed by `route_decision.account.account_id` under the exact Provider. Account renames, priority changes, disablement and credential refresh do not reset attribution; old records without an account ID are not guessed or redistributed. Gross input already includes cache reads, so total tokens are input plus output only.
+
+`GET /api/v1/providers/:id/accounts/usage-stats?period_start=<epoch-ms>` (desktop command `get_provider_account_usage_stats`) returns one entry per current account: `account_id`, `all_time`, and `period`. Each total contains `total_tokens`, `request_count`, `equivalent_costs` (native currency buckets), and `unpriced_request_count`. Both windows end at the server's captured current time; `period_start` is supplied by the client and must be between zero and now. The expanded management panel queries all accounts together and refreshes every minute; this endpoint does not query upstream or alter scheduling.
+
+Prices reuse current manual overrides/catalogue pricing, not subscription charges or historical invoices. Unknown prices stay unavailable (partial estimates are marked); currencies are not silently added. These are **retained-log totals**, not a permanent ledger: log deletion/retention affects both windows, and absent upstream usage cannot be reconstructed. SQLite, PostgreSQL and MySQL use the existing logs without a schema migration; memory-only mode has no retained log usage.
+
 ### Provider connectivity testing
 
 `test_provider` checks all enabled Devin accounts using the non-generating authenticated status RPC, with at most four concurrent checks and a 15-second timeout per account. A failed account does not prevent checking its siblings; any passing account makes Provider connectivity succeed. Disabled accounts are skipped, and no enabled accounts or all failed accounts produce a failed aggregate.

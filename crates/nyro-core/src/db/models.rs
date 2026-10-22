@@ -908,6 +908,25 @@ pub struct StatsTimeSeries {
     pub points: Vec<StatsTimeBucket>,
 }
 
+/// Totals over retained attempts for one stable account ID and upstream model.
+/// Includes failed/retried attempts; labels and credential versions do not affect identity.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccountModelUsage {
+    pub account_id: String,
+    /// The upstream model, not the client-facing model alias.
+    pub model: String,
+    pub request_count: i64,
+    /// Gross input tokens; cache reads are a subset and must not be added again.
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub cache_read_tokens: i64,
+    /// Attempts with either input or output SQL NULL. Known partial values are summed.
+    pub missing_usage_count: i64,
+    /// Attempts with non-NULL stored cache reads, including reported zero.
+    /// Historical writers may have normalized absent usage to zero.
+    pub cache_read_reported_count: i64,
+}
+
 /// Sparse UTC calendar-day totals over retained upstream attempts, including errors.
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
 pub struct TokenUsageDay {

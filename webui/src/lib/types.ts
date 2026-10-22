@@ -328,6 +328,20 @@ export interface EquivalentCostTotal {
   priced_request_count: number;
 }
 
+/** Totals from retained request logs, including failed/retried attempts. */
+export interface AccountUsageTotals {
+  total_tokens: number;
+  request_count: number;
+  equivalent_costs: EquivalentCostTotal[];
+  unpriced_request_count: number;
+}
+
+export interface AccountUsageStats {
+  account_id: string;
+  all_time: AccountUsageTotals;
+  period: AccountUsageTotals;
+}
+
 export interface ProviderStats extends TpsSampleSums {
   provider_id: string;
   provider: string;

@@ -392,6 +392,18 @@ pub async fn get_provider_account_pool(
 }
 
 #[tauri::command]
+pub async fn get_provider_account_usage_stats(
+    gw: State<'_, Gateway>,
+    id: String,
+    period_start: i64,
+) -> Result<Vec<nyro_core::admin::AccountUsageStats>, String> {
+    gw.admin()
+        .get_provider_account_usage_stats(&id, period_start)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 pub async fn configure_provider_account_pool(
     gw: State<'_, Gateway>,
     id: String,

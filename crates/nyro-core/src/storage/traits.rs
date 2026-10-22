@@ -4,7 +4,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 
 use crate::db::models::{
-    ApiKeyStats, ApiKeyUsageDetail, ApiKeyWithBindings, CreateApiKey, CreateModel,
+    AccountModelUsage, ApiKeyStats, ApiKeyUsageDetail, ApiKeyWithBindings, CreateApiKey, CreateModel,
     CreateModelBackend, CreateProvider, LogPage, LogQuery, Model, ModelBackend, ModelRatingEntry,
     ModelStats, ModelTimeBucket, ModelUsageDetail, ModelUsageStats, OAuthAccountUpdate,
     OAuthCredential, Provider, ProviderKeyProbeResult, ProviderStats, ProviderUsageDetail,
@@ -239,6 +239,17 @@ pub trait LogStore: Send + Sync {
         start_at: i64,
         end_at: i64,
     ) -> anyhow::Result<Vec<crate::db::models::TokenUsageDay>>;
+    /// Retained attempts, including failures/retries, strictly filtered by provider ID
+    /// and grouped by `route_decision.account.account_id` plus upstream model.
+    /// Missing/empty/non-string account IDs and malformed JSON are skipped; labels
+    /// and the current account catalog never supply historical identity.
+    /// Inclusive `created_at` range in epoch ms; a `None` bound is open.
+    async fn account_token_usage(
+        &self,
+        provider_id: &str,
+        start_at: Option<i64>,
+        end_at: Option<i64>,
+    ) -> anyhow::Result<Vec<AccountModelUsage>>;
     /// Rolling "last N hours" window; `None` covers every retained log.
     async fn stats_by_model(&self, hours: Option<i64>) -> anyhow::Result<Vec<ModelStats>> {
         self.stats_by_model_range(hours_window_start(hours), None)
