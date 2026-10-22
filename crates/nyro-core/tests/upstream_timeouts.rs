@@ -136,6 +136,9 @@ enum Reply {
     NoHeaders,
     NoFirstByte,
     PartialThenIdle,
+    /// One complete event, then a flushed chunk that stops inside the next
+    /// event's JSON, then silence (observed on a GLM coding-plan stream).
+    PartialEventThenIdle,
     HealthyFallback,
 }
 
@@ -246,6 +249,13 @@ async fn serve(
     match reply {
         Reply::NoHeaders | Reply::NoFirstByte => {}
         Reply::PartialThenIdle => chunk(&mut socket, &path.text_event("partial output")).await?,
+        Reply::PartialEventThenIdle => {
+            chunk(&mut socket, &path.text_event("partial output")).await?;
+            tokio::time::sleep(TICK).await;
+            // Cut inside the JSON object, e.g. `data: {"choices":[{"`.
+            let unfinished = path.text_event("never finished");
+            chunk(&mut socket, &unfinished[..20]).await?;
+        }
         Reply::Active | Reply::HeartbeatsBeforeOutput => {
             for index in 0..TICKS {
                 tokio::time::sleep(TICK).await;
@@ -500,7 +510,38 @@ async fn one_log(
     Ok(row)
 }
 
+/// Every event a client can dispatch must decode on its own. A timeout event
+/// appended after a half-forwarded upstream event fuses with it into a single
+/// unparseable `data:` line, hiding the typed failure from the client.
+fn assert_sse_events_well_formed(path: Path, output: &Output) {
+    let wire = output.wire.replace("\r\n", "\n");
+    let mut blocks: Vec<&str> = wire.split("\n\n").collect();
+    let tail = blocks.pop().unwrap_or_default();
+    assert!(
+        tail.is_empty(),
+        "{path:?}: stream must end on an event boundary, trailing {tail:?}: {}",
+        output.wire
+    );
+    for block in blocks {
+        let data: Vec<&str> = block
+            .lines()
+            .filter_map(|line| line.strip_prefix("data:"))
+            .map(|value| value.strip_prefix(' ').unwrap_or(value))
+            .collect();
+        if data.is_empty() {
+            continue; // comment-only or event-name-only block
+        }
+        let data = data.join("\n");
+        assert!(
+            data == "[DONE]" || serde_json::from_str::<Value>(&data).is_ok(),
+            "{path:?}: unparseable SSE event {data:?} in: {}",
+            output.wire
+        );
+    }
+}
+
 fn assert_timeout_event(path: Path, output: &Output) {
+    assert_sse_events_well_formed(path, output);
     let errors: Vec<Value> = output
         .wire
         .lines()
@@ -760,6 +801,16 @@ async fn headers_without_first_body_byte_times_out_on_all_paths() -> anyhow::Res
 async fn partial_output_then_idle_emits_timeout_without_retry_or_fallback() -> anyhow::Result<()> {
     for path in STREAM_PATHS {
         assert_stall(path, Reply::PartialThenIdle, "upstream_idle", true).await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn half_flushed_event_then_idle_keeps_timeout_event_parseable() -> anyhow::Result<()> {
+    // The relay must not splice its timeout event onto the unfinished upstream
+    // event: the client would see one fused, unparseable `data:` line.
+    for path in STREAM_PATHS {
+        assert_stall(path, Reply::PartialEventThenIdle, "upstream_idle", true).await?;
     }
     Ok(())
 }

@@ -6,7 +6,9 @@
 //! - IR round-trip: parse → accumulate → format → re-emit as target-protocol SSE.
 
 mod input;
+mod sse_framer;
 pub(super) use input::StreamInput;
+use sse_framer::SseFramer;
 
 use std::convert::Infallible;
 use std::sync::Arc;
@@ -240,6 +242,9 @@ pub(super) async fn handle_stream(
             // TTFB reflects when upstream first answered, not when the hold ended.
             let mut first_chunk_ms: Option<i64> = held_first_chunk_ms;
             let mut passthrough_mode = PassthroughBodyMode::Undecided;
+            // Raw SSE is forwarded only up to complete events, so a terminal
+            // error event below can never fuse with a half-forwarded one.
+            let mut framer = SseFramer::default();
             let mut converted_client_sse: Option<String> = None;
             let mut converted_ai_resp = None;
 
@@ -268,11 +273,13 @@ pub(super) async fn handle_stream(
                                     Some(PassthroughBodyMode::RawSse) => {
                                         passthrough_mode = PassthroughBodyMode::RawSse;
                                         let pending = std::mem::take(&mut undecided_buf);
-                                        if pt_tx.send(Ok(Bytes::from(pending))).await.is_err() {
-                                            break; // client disconnected
-                                        }
-                                        if let Some(p) = &log_pt.performance {
-                                            p.note_client_frame_sent();
+                                        if let Some(ready) = framer.push(Bytes::from(pending)) {
+                                            if pt_tx.send(Ok(ready)).await.is_err() {
+                                                break; // client disconnected
+                                            }
+                                            if let Some(p) = &log_pt.performance {
+                                                p.note_client_frame_sent();
+                                            }
                                         }
                                     }
                                     Some(PassthroughBodyMode::NonSseJson) => {
@@ -283,11 +290,13 @@ pub(super) async fn handle_stream(
                                 }
                             }
                             PassthroughBodyMode::RawSse => {
-                                if pt_tx.send(Ok(b)).await.is_err() {
-                                    break; // client disconnected
-                                }
-                                if let Some(p) = &log_pt.performance {
-                                    p.note_client_frame_sent();
+                                if let Some(ready) = framer.push(b) {
+                                    if pt_tx.send(Ok(ready)).await.is_err() {
+                                        break; // client disconnected
+                                    }
+                                    if let Some(p) = &log_pt.performance {
+                                        p.note_client_frame_sent();
+                                    }
                                 }
                             }
                             PassthroughBodyMode::NonSseJson => {
@@ -298,7 +307,13 @@ pub(super) async fn handle_stream(
                         }
                     }
                     Err(e) => {
-                        tracing::warn!(error = %e, "upstream stream error during passthrough");
+                        // The unfinished upstream event can never complete now.
+                        let dropped = framer.discard();
+                        tracing::warn!(
+                            error = %e,
+                            dropped_unfinished_event_bytes = dropped,
+                            "upstream stream error during passthrough"
+                        );
                         stream_error = Some(e.to_string());
                         let request_id = log_pt
                             .diagnostic
@@ -325,6 +340,14 @@ pub(super) async fn handle_stream(
             }
 
             let upstream_latency_ms = upstream_start_pt.elapsed().as_millis() as i64;
+            // Upstream EOF: forward a final event lacking its blank line
+            // verbatim, as before. Empty after an error (discarded above).
+            if let Some(tail) = framer.finish()
+                && pt_tx.send(Ok(tail)).await.is_ok()
+                && let Some(p) = &log_pt.performance
+            {
+                p.note_client_frame_sent();
+            }
             let raw_sse = String::from_utf8_lossy(&json_buf).into_owned();
 
             if matches!(
