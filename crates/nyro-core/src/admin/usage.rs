@@ -199,7 +199,8 @@ pub struct ProviderUsage {
     pub site: String,
     /// Plan tier reported by the upstream (e.g. GLM `max`), when present.
     pub level: Option<String>,
-    /// Time-window usage tiers (coding plans).
+    /// Time-window usage tiers (coding plans). Configured account pools may
+    /// expose display-only totals here; `scheduling` remains account-derived.
     pub tiers: Vec<ProviderUsageTier>,
     /// Account balances (pay-as-you-go vendors).
     pub balances: Vec<ProviderUsageBalance>,

@@ -170,6 +170,62 @@ pub(super) fn kiro_usage_observations(usage: &KiroUsage) -> Vec<QuotaTierObserva
         .collect()
 }
 
+/// Display-only totals for generic provider-usage clients. Account scheduling
+/// continues to use each account's observations, never these cross-account sums.
+fn kiro_pool_usage_tiers(members: &[&ProviderAccountView]) -> Vec<ProviderUsageTier> {
+    #[derive(Default)]
+    struct Total {
+        used: f64,
+        limit: f64,
+        resets_at: Option<chrono::DateTime<Utc>>,
+        accounts: usize,
+    }
+
+    let mut totals = std::collections::BTreeMap::<String, Total>::new();
+    for account in members {
+        let Some(usage) = &account.kiro_usage else {
+            continue;
+        };
+        // Reuse the authoritative per-account allowance rules: cap included
+        // usage, combine base/active grants and exclude expired bonus/trial.
+        for pool in usage.resource_pools() {
+            let total = totals.entry(pool.resource).or_default();
+            if total.accounts == 0 {
+                total.resets_at = pool.resets_at;
+            } else if total.resets_at != pool.resets_at {
+                // A generic tier has only one reset: do not pretend staggered
+                // account resets replenish the entire pool at once.
+                total.resets_at = None;
+            }
+            total.used += pool.used;
+            total.limit += pool.limit;
+            total.accounts += 1;
+        }
+    }
+    let single_resource = totals.len() == 1;
+    totals
+        .into_iter()
+        .filter(|(_, total)| {
+            // Missing usage is unknown, not a zero-used account. Incomplete or
+            // overflowing totals stay in account_pool details, not a fake tier.
+            total.accounts == members.len() && total.used.is_finite() && total.limit.is_finite()
+        })
+        .map(|(resource, total)| ProviderUsageTier {
+            name: if single_resource {
+                "monthly".into()
+            } else {
+                format!("kiro:{resource}")
+            },
+            used_percent: if total.limit > 0.0 {
+                (total.used / total.limit * 100.0).clamp(0.0, 100.0)
+            } else {
+                100.0
+            },
+            resets_at: total.resets_at.map(|at| at.to_rfc3339()),
+        })
+        .collect()
+}
+
 impl AdminService {
     pub(super) async fn refresh_kiro_account_usage_locked(
         &self,
@@ -264,8 +320,8 @@ impl AdminService {
             .iter()
             .filter(|a| a.is_enabled && a.status != "disconnected")
             .collect();
-        // No guessed cross-account capacity: actual used/limit is available on
-        // every account. Only a genuine singleton can expose provider tiers.
+        // Preserve singleton allowance details; multi-account clients receive
+        // one actual allowance-weighted total per resource, not plan weights.
         let tiers = if members.len() == 1 {
             members[0]
                 .kiro_usage
@@ -273,7 +329,7 @@ impl AdminService {
                 .map(super::usage::kiro_usage_tiers)
                 .unwrap_or_default()
         } else {
-            Vec::new()
+            kiro_pool_usage_tiers(&members)
         };
         let mut plans: Vec<_> = members
             .iter()
@@ -421,13 +477,238 @@ mod tests {
         ] {
             assert!(!public.contains(secret), "leaked {secret}");
         }
+        let before = gw.quota_registry.tier_snapshot("kiro-pool");
+        let scheduling = gw.quota_registry.snapshot("kiro-pool");
         let combined = admin.account_pool_provider_usage(view);
         assert_eq!(combined.kind, "kiro_plan");
-        assert!(
-            combined.tiers.is_empty(),
-            "Do not invent a combined quota from unrelated accounts"
+        assert_eq!(combined.tiers.len(), 1);
+        assert_eq!(combined.tiers[0].name, "monthly");
+        assert!((combined.tiers[0].used_percent - 135.0 / 350.0 * 100.0).abs() < 1e-10);
+        assert_eq!(combined.scheduling, scheduling);
+        assert_eq!(gw.quota_registry.tier_snapshot("kiro-pool"), before);
+        let public = serde_json::to_value(&combined).unwrap();
+        assert_eq!(public["tiers"][0]["name"], "monthly");
+        assert_eq!(
+            public["account_pool"]["accounts"].as_array().unwrap().len(),
+            2
         );
     }
+
+    fn pool_account(usage: Option<KiroUsage>) -> ProviderAccountView {
+        ProviderAccountView {
+            account_id: "account".into(),
+            provider_id: "kiro-pool".into(),
+            label: "Account".into(),
+            is_enabled: true,
+            priority: 0,
+            status: "connected".into(),
+            status_version: 1,
+            verified_plan: None,
+            identity_verified: true,
+            scheduling: "included".into(),
+            daily: None,
+            weekly: None,
+            reserve_usd: None,
+            kiro_usage: usage,
+            observed_at: Some(Utc::now().timestamp_millis()),
+            stale: false,
+            updated_at: String::new(),
+        }
+    }
+
+    #[test]
+    fn kiro_pool_total_uses_allowances_not_account_percentages_and_only_aligned_resets() {
+        let reset = Utc::now() + chrono::Duration::days(10);
+        let mut a = pool_account(Some(usage(1308.87, 2000.0)));
+        let mut b = pool_account(Some(usage(176.56, 1000.0)));
+        a.kiro_usage.as_mut().unwrap().resets_at = Some(reset);
+        b.kiro_usage.as_mut().unwrap().resets_at = Some(reset);
+        b.kiro_usage.as_mut().unwrap().plan = Some("STUDENT".into());
+        let tiers = kiro_pool_usage_tiers(&[&a, &b]);
+        assert_eq!(tiers.len(), 1);
+        assert_eq!(tiers[0].name, "monthly");
+        assert!((tiers[0].used_percent - 49.51433333333333).abs() < 1e-10);
+        assert_eq!(tiers[0].resets_at, Some(reset.to_rfc3339()));
+
+        b.kiro_usage.as_mut().unwrap().resets_at = Some(reset + chrono::Duration::days(1));
+        assert!(kiro_pool_usage_tiers(&[&a, &b])[0].resets_at.is_none());
+        // Alignment cannot recover when a third account matches the first.
+        assert!(kiro_pool_usage_tiers(&[&a, &b, &a])[0].resets_at.is_none());
+        b.kiro_usage.as_mut().unwrap().resets_at = None;
+        assert!(kiro_pool_usage_tiers(&[&a, &b])[0].resets_at.is_none());
+        assert!(kiro_pool_usage_tiers(&[&b, &a])[0].resets_at.is_none());
+    }
+
+    #[test]
+    fn kiro_pool_total_reuses_grant_expiry_and_keeps_resources_separate() {
+        let mut first = usage(120.0, 100.0); // Included usage is capped; not paid overage.
+        let base = first.items[0].clone();
+        first
+            .items
+            .push(crate::provider::kiro::usage::KiroUsageItem {
+                kind: "bonus".into(),
+                used: 10.0,
+                limit: 50.0,
+                resets_at: Some(Utc::now() + chrono::Duration::days(10)),
+                ..base.clone()
+            });
+        first
+            .items
+            .push(crate::provider::kiro::usage::KiroUsageItem {
+                kind: "free_trial".into(),
+                used: 0.0,
+                limit: 500.0,
+                resets_at: Some(Utc::now() - chrono::Duration::days(1)),
+                ..base.clone()
+            });
+        first
+            .items
+            .push(crate::provider::kiro::usage::KiroUsageItem {
+                resource: "REQUESTS".into(),
+                used: 2.0,
+                limit: 10.0,
+                ..base.clone()
+            });
+        let mut second = usage(25.0, 50.0);
+        second
+            .items
+            .push(crate::provider::kiro::usage::KiroUsageItem {
+                resource: "REQUESTS".into(),
+                used: 8.0,
+                limit: 10.0,
+                ..base
+            });
+        let tiers =
+            kiro_pool_usage_tiers(&[&pool_account(Some(first)), &pool_account(Some(second))]);
+        assert_eq!(tiers.len(), 2);
+        assert_eq!(tiers[0].name, "kiro:CREDITS");
+        assert_eq!(tiers[0].used_percent, 67.5); // (100 + 10 + 25) / (100 + 50 + 50)
+        assert!(
+            tiers[0].resets_at.is_none(),
+            "bonus expiry is not a shared reset"
+        );
+        assert_eq!(tiers[1].name, "kiro:REQUESTS");
+        assert_eq!(tiers[1].used_percent, 50.0);
+    }
+
+    #[test]
+    fn kiro_pool_total_distinguishes_unknown_zero_stale_and_invalid_usage() {
+        let a = pool_account(Some(usage(10.0, 100.0)));
+        assert!(kiro_pool_usage_tiers(&[]).is_empty());
+        assert!(kiro_pool_usage_tiers(&[&a, &pool_account(None)]).is_empty());
+        assert!(kiro_pool_usage_tiers(&[&a, &pool_account(Some(KiroUsage::default()))]).is_empty());
+        let zero = pool_account(Some(usage(0.0, 0.0)));
+        assert_eq!(
+            kiro_pool_usage_tiers(&[&zero, &zero])[0].used_percent,
+            100.0
+        );
+
+        let mut stale = pool_account(Some(usage(50.0, 100.0)));
+        stale.stale = true;
+        assert_eq!(kiro_pool_usage_tiers(&[&a, &stale])[0].used_percent, 30.0);
+        for invalid in [f64::NAN, f64::INFINITY, -1.0] {
+            stale.kiro_usage.as_mut().unwrap().items[0].limit = invalid;
+            assert!(kiro_pool_usage_tiers(&[&a, &stale]).is_empty());
+        }
+        let huge = pool_account(Some(usage(0.0, f64::MAX)));
+        assert!(kiro_pool_usage_tiers(&[&huge, &huge]).is_empty());
+    }
+
+    #[tokio::test]
+    async fn kiro_pool_total_excludes_disabled_and_disconnected_and_preserves_singleton() {
+        let gw = gateway().await;
+        let admin = gw.admin();
+        let mut view = admin.get_provider_account_pool("kiro-pool").await.unwrap();
+        let mut a = pool_account(Some(usage(10.0, 100.0)));
+        let b = pool_account(Some(usage(125.0, 250.0)));
+        let mut disabled = pool_account(Some(usage(10_000.0, 10_000.0)));
+        disabled.is_enabled = false;
+        let mut disconnected = disabled.clone();
+        disconnected.is_enabled = true;
+        disconnected.status = "disconnected".into();
+        a.status = "refreshing".into(); // Transient token refresh remains a member.
+        view.accounts = vec![a.clone(), b, disabled, disconnected];
+        view.counts.available = 2;
+        let combined = admin.account_pool_provider_usage(view.clone());
+        assert!((combined.tiers[0].used_percent - 135.0 / 350.0 * 100.0).abs() < 1e-10);
+        assert_eq!(combined.account_pool.unwrap().accounts.len(), 4);
+
+        view.accounts.remove(1);
+        assert_eq!(
+            admin.account_pool_provider_usage(view).tiers,
+            super::super::usage::kiro_usage_tiers(a.kiro_usage.as_ref().unwrap())
+        );
+    }
+
+    #[tokio::test]
+    async fn kiro_pool_total_is_exposed_by_single_and_bulk_usage_without_affecting_availability() {
+        let gw = gateway().await;
+        let admin = gw.admin();
+        admin
+            .configure_provider_account_pool("kiro-pool", DevinPoolConfig::default())
+            .await
+            .unwrap();
+        for (label, used, limit) in [("A", 1308.87, 2000.0), ("B", 176.56, 1000.0)] {
+            let account = add(&gw, label, "us-east-1").await;
+            // Retained observations of auth-rejected accounts do not trigger
+            // upstream queries. This public-API test is fully offline and also
+            // proves a low aggregate percentage cannot restore availability.
+            let state = KiroAccountState {
+                usage: Some(usage(used, limit)),
+                observed_at: Some(Utc::now().timestamp_millis()),
+                auth_invalid: true,
+                usage_stale: true,
+                ..Default::default()
+            };
+            assert!(
+                gw.storage
+                    .oauth_credentials()
+                    .compare_account_state(
+                        "kiro-pool",
+                        &account.account_id,
+                        account.status_version,
+                        &account.account_state,
+                        &serde_json::to_string(&state).unwrap()
+                    )
+                    .await
+                    .unwrap()
+            );
+        }
+        let single = admin.get_provider_usage("kiro-pool").await.unwrap();
+        let bulk = admin.list_provider_usage().await.unwrap();
+        assert_eq!(bulk.len(), 1);
+        assert_eq!(bulk[0].status, ProviderUsageQueryStatus::Ok);
+        assert_eq!(bulk[0].usage.as_ref().unwrap().tiers, single.tiers);
+        assert_eq!(single.tiers.len(), 1);
+        assert!((single.tiers[0].used_percent - 49.51433333333333).abs() < 1e-10);
+        assert_eq!(single.is_available, Some(false));
+        assert!(!gw.quota_registry.is_schedulable("kiro-pool"));
+        let body = serde_json::json!({"data": bulk});
+        assert_eq!(body["data"][0]["usage"]["tiers"][0]["name"], "monthly");
+        assert_eq!(
+            body["data"][0]["usage"]["scheduling"]["status"],
+            "quota_exhausted"
+        );
+        let accounts = body["data"][0]["usage"]["account_pool"]["accounts"]
+            .as_array()
+            .unwrap();
+        assert_eq!(accounts.len(), 2);
+        assert!(
+            accounts
+                .iter()
+                .all(|a| a["stale"] == true && a["kiro_usage"].is_object())
+        );
+        for secret in [
+            "SECRET-",
+            "REFRESH-",
+            "PRIVATE",
+            "client_secret",
+            "access_token",
+        ] {
+            assert!(!body.to_string().contains(secret));
+        }
+    }
+
     #[test]
     fn kiro_partial_usage_does_not_clear_hard_quota_or_newer_rejections() {
         let mut state = KiroAccountState {
