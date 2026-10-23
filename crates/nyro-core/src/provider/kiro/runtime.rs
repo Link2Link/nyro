@@ -31,10 +31,9 @@ use crate::{
 
 const STREAM_TARGET: &str = "AmazonCodeWhispererStreamingService.GenerateAssistantResponse";
 const IDE_VERSION: &str = "0.11.63";
-/// Error bodies are read only to classify the failure; never forwarded.
-const MAX_ERROR_BYTES: usize = 16 * 1024;
+/// Error bodies are bounded classification input, never forwarded or retained.
+const MAX_ERROR_BYTES: usize = super::errors::MAX_ERROR_BYTES;
 const MAX_USAGE_BYTES: usize = 1024 * 1024;
-const MAX_DETAIL_CHARS: usize = 300;
 
 fn sensitive(value: &str) -> Result<HeaderValue, GatewayError> {
     let mut value =
@@ -190,22 +189,9 @@ fn error_text(body: &[u8]) -> String {
     text.to_ascii_lowercase().replace('_', " ")
 }
 
-fn detail(body: &[u8]) -> String {
-    let mut text = String::new();
-    if let Ok(value) = serde_json::from_slice::<Value>(body) {
-        collect_text(&value, &mut text, 0);
-    }
-    text.lines()
-        .next()
-        .unwrap_or("")
-        .chars()
-        .filter(|c| !c.is_control())
-        .take(MAX_DETAIL_CHARS)
-        .collect()
-}
-
-/// Map a non-2xx upstream response to the status and (sanitized) message the
-/// client sees. Quota exhaustion maps to 429 so the dispatcher fails over to
+/// Map a non-2xx upstream response to status and safe internal failure text.
+/// The client render stays generic; detailed diagnostics are admin-only.
+/// Quota exhaustion maps to 429 so the dispatcher fails over to
 /// the next target; credential problems keep 401/403.
 pub(super) fn classify(status: u16, body: &[u8]) -> GatewayError {
     let text = error_text(body);
@@ -240,17 +226,7 @@ pub(super) fn classify(status: u16, body: &[u8]) -> GatewayError {
             "Kiro denied the request; check the account's profile and entitlement".to_string(),
         ),
         429 => (429, "Kiro rate limit reached".to_string()),
-        400 | 422 => {
-            let detail = detail(body);
-            (
-                400,
-                if detail.is_empty() {
-                    "Kiro rejected the request".to_string()
-                } else {
-                    format!("Kiro rejected the request: {detail}")
-                },
-            )
-        }
+        400 | 422 => (400, "Kiro rejected the request".to_string()),
         500..=599 => (status, "Kiro upstream error".to_string()),
         400..=499 => (status, format!("Kiro returned HTTP {status}")),
         _ => (502, format!("Kiro returned HTTP {status}")),
@@ -311,17 +287,34 @@ pub(super) fn classify(status: u16, body: &[u8]) -> GatewayError {
     }
 }
 
-async fn read_limited(response: ObservedResponse, limit: usize) -> Vec<u8> {
+async fn read_limited(
+    response: ObservedResponse,
+    limit: usize,
+    control: &AttemptControl,
+) -> (Vec<u8>, bool) {
     let mut stream = Box::pin(response.bytes_stream());
     let mut body = Vec::new();
-    while let Some(Ok(chunk)) = stream.next().await {
-        let room = limit.saturating_sub(body.len());
-        body.extend_from_slice(&chunk[..chunk.len().min(room)]);
-        if body.len() >= limit {
-            break;
+    loop {
+        let chunk = tokio::select! {
+            biased;
+            _ = control.cancellation.cancelled() => return (body, false),
+            _ = tokio::time::sleep_until(tokio::time::Instant::from_std(control.deadline.at())) => return (body, false),
+            chunk = stream.next() => chunk,
+        };
+        match chunk {
+            Some(Ok(chunk)) => {
+                let room = limit.saturating_sub(body.len());
+                body.extend_from_slice(&chunk[..chunk.len().min(room)]);
+                if chunk.len() > room {
+                    return (body, false);
+                }
+                // At exactly the limit, only EOF proves completeness. The next
+                // poll is bounded by the same request deadline/cancellation.
+            }
+            Some(Err(_)) => return (body, false),
+            None => return (body, true),
         }
     }
-    body
 }
 
 // ── Chat ─────────────────────────────────────────────────────────────────────
@@ -387,7 +380,16 @@ async fn execute(
             .get("retry-after")
             .and_then(|value| value.to_str().ok())
             .and_then(|value| value.parse::<u64>().ok());
-        let body = read_limited(response, MAX_ERROR_BYTES).await;
+        let safe_headers = super::errors::safe_headers(response.headers(), token);
+        // Replace only the logging snapshot with allowlisted sanitized headers.
+        // response() is idempotent for status/native mode; the already-recorded
+        // HTTP failure remains sticky. No wire headers or retry facts change.
+        control.performance.response(status, &safe_headers);
+        let (body, complete) = read_limited(response, MAX_ERROR_BYTES, &control).await;
+        let diagnostic = super::errors::diagnostic(&body, complete, &safe_headers, status, token);
+        control.performance.with_diagnostic(|d| {
+            d.payload_metadata["kiro_upstream_error"] = diagnostic;
+        });
         let mut error = classify(status, &body);
         if let GatewayError::AccountUpstream { failure, .. } = &mut error {
             failure.retry_after_seconds = retry_after;
@@ -653,6 +655,10 @@ pub(crate) async fn probe(
         reply
     })
 }
+
+#[cfg(test)]
+#[path = "error_persistence_tests.rs"]
+mod error_persistence_tests;
 
 #[cfg(test)]
 mod tests {
@@ -951,14 +957,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn validation_errors_surface_the_upstream_reason_without_control_characters() {
+    async fn validation_error_objects_do_not_retain_upstream_text() {
         let error = classify(400, br#"{"message":"Improperly formed\u0007 request.","reason":"CONTENT_LENGTH_EXCEEDS_THRESHOLD"}"#);
         match error {
             GatewayError::UpstreamStatus {
                 status: 400, body, ..
             } => {
                 let body = body.unwrap();
-                assert!(body.contains("Improperly formed request."), "{body}");
+                assert_eq!(body, "Kiro rejected the request");
                 assert!(!body.chars().any(char::is_control));
             }
             other => panic!("unexpected {other:?}"),

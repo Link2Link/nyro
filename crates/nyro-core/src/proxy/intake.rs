@@ -9,6 +9,7 @@
 //! This module has NO knowledge of auth, routing, or upstream calls.
 
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use async_trait::async_trait;
 use axum::Json;
@@ -38,11 +39,16 @@ where
     type Rejection = JsonRejection;
 
     async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
+        let started_at = Instant::now();
         let (mut parts, body) = req.into_parts();
         // Wire snapshot taken before `parts` is consumed by the inner `Json`
         // extractor: intake-rejection logging needs the original view (the
         // compressed path strips content headers before re-invoking `Json`).
         let wire = WireMeta {
+            started_at: parts
+                .extensions
+                .get::<RequestContext>()
+                .map_or(started_at, |ctx| ctx.started_at),
             method: parts.method.clone(),
             path: parts.uri.path().to_string(),
             headers: parts.headers.clone(),
@@ -56,7 +62,27 @@ where
             .as_deref()
             .is_some_and(nyro_ccswitch_compat::is_supported_content_encoding)
         {
-            let compressed = collect_body(body).await;
+            let (body, captured) = observe_body(body, false);
+            // Unlike to_bytes(usize::MAX), the Bytes extractor enforces the
+            // request's DefaultBodyLimit and preserves read/limit rejections.
+            let compressed =
+                match Bytes::from_request(Request::from_parts(parts.clone(), body), state).await {
+                    Ok(bytes) => bytes,
+                    Err(rejection) => {
+                        let rejection = JsonRejection::BytesRejection(rejection);
+                        let capture = captured
+                            .lock()
+                            .expect("request body capture mutex poisoned");
+                        report_intake_rejection(
+                            state,
+                            &wire,
+                            capture.payload(&wire, "wire", None),
+                            &rejection,
+                            None,
+                        );
+                        return Err(rejection);
+                    }
+                };
             // Bounded decode: a compressed body within the transport limit can
             // still expand without bound (decompression bomb), so expansion is
             // capped at the same request-body limit. Oversized payloads fall
@@ -77,7 +103,23 @@ where
                     let Json(value) = match Json::<Value>::from_request(req, state).await {
                         Ok(v) => v,
                         Err(rejection) => {
-                            report_intake_rejection(state, &wire, &decoded, &rejection);
+                            let wire_capture = captured
+                                .lock()
+                                .expect("request body capture mutex poisoned");
+                            let mut decoded_capture = IntakeCapture::default();
+                            decoded_capture.observe(&decoded, false);
+                            decoded_capture.complete = wire_capture.complete;
+                            report_intake_rejection(
+                                state,
+                                &wire,
+                                decoded_capture.payload(
+                                    &wire,
+                                    "decoded",
+                                    Some(wire_capture.total_observed_bytes),
+                                ),
+                                &rejection,
+                                None,
+                            );
                             return Err(rejection);
                         }
                     };
@@ -86,12 +128,34 @@ where
                         raw: decoded,
                     });
                 }
-                _ => {
+                decode_result => {
+                    let failure = match decode_result {
+                        Err(nyro_ccswitch_compat::DecompressError::TooLarge { .. }) => Some((
+                            "intake_body_limit",
+                            "intake_decompress",
+                            "The decoded client request body exceeded the size limit.",
+                        )),
+                        Err(_) => Some((
+                            "intake_decompress_error",
+                            "intake_decompress",
+                            "The encoded client request body could not be decompressed.",
+                        )),
+                        _ => None,
+                    };
                     let req = Request::from_parts(parts, Body::from(compressed.clone()));
                     let Json(value) = match Json::<Value>::from_request(req, state).await {
                         Ok(v) => v,
                         Err(rejection) => {
-                            report_intake_rejection(state, &wire, &compressed, &rejection);
+                            let capture = captured
+                                .lock()
+                                .expect("request body capture mutex poisoned");
+                            report_intake_rejection(
+                                state,
+                                &wire,
+                                capture.payload(&wire, "wire", None),
+                                &rejection,
+                                failure,
+                            );
                             return Err(rejection);
                         }
                     };
@@ -103,38 +167,34 @@ where
             }
         }
 
-        let captured = Arc::new(Mutex::new(BytesMut::new()));
-        let capture = Arc::clone(&captured);
-        let body = Body::from_stream(body.into_data_stream().map(move |chunk| {
-            if let Ok(bytes) = &chunk {
-                capture
-                    .lock()
-                    .expect("request body capture mutex poisoned")
-                    .extend_from_slice(bytes);
-            }
-            chunk
-        }));
+        // The full raw copy is needed by successful JsonIntake consumers, not
+        // diagnostic retention. The separate logging capture only keeps 512 bytes.
+        let (body, captured) = observe_body(body, true);
         let req = Request::from_parts(parts, body);
 
         let Json(value) = match Json::<Value>::from_request(req, state).await {
             Ok(v) => v,
             Err(rejection) => {
-                let prefix = captured
+                let capture = captured
                     .lock()
-                    .expect("request body capture mutex poisoned")
-                    .iter()
-                    .take(crate::proxy::dispatcher::INTAKE_REJECTION_BODY_PREFIX_BYTES)
-                    .copied()
-                    .collect::<Vec<u8>>();
-                report_intake_rejection(state, &wire, &prefix, &rejection);
+                    .expect("request body capture mutex poisoned");
+                report_intake_rejection(
+                    state,
+                    &wire,
+                    capture.payload(&wire, "wire", None),
+                    &rejection,
+                    None,
+                );
                 return Err(rejection);
             }
         };
-        let raw = captured
-            .lock()
-            .expect("request body capture mutex poisoned")
-            .clone()
-            .freeze();
+        let raw = std::mem::take(
+            &mut captured
+                .lock()
+                .expect("request body capture mutex poisoned")
+                .raw,
+        )
+        .freeze();
 
         Ok(Self { value, raw })
     }
@@ -142,6 +202,7 @@ where
 
 /// Original wire metadata kept for intake-rejection logging.
 struct WireMeta {
+    started_at: Instant,
     method: axum::http::Method,
     path: String,
     headers: axum::http::HeaderMap,
@@ -155,33 +216,136 @@ struct WireMeta {
 fn report_intake_rejection<S>(
     state: &S,
     wire: &WireMeta,
-    body_prefix: &[u8],
+    body: crate::logging::payload::CapturedPayload,
     rejection: &JsonRejection,
+    failure: Option<(&'static str, &'static str, &'static str)>,
 ) where
     S: 'static,
 {
     let any_state: &dyn std::any::Any = state;
     if let Some(gw) = any_state.downcast_ref::<crate::Gateway>() {
+        let (kind, stage, cause) = failure.unwrap_or_else(|| match rejection {
+            JsonRejection::BytesRejection(_)
+                if rejection.status() == axum::http::StatusCode::PAYLOAD_TOO_LARGE =>
+            {
+                (
+                    "intake_body_limit",
+                    "intake_read",
+                    "The client request body exceeded the size limit.",
+                )
+            }
+            JsonRejection::BytesRejection(_) => (
+                "intake_read_error",
+                "intake_read",
+                "The client request body could not be read to completion.",
+            ),
+            JsonRejection::MissingJsonContentType(_) => (
+                "intake_content_type",
+                "intake_headers",
+                "The client request did not specify a JSON content type.",
+            ),
+            _ => (
+                "intake_parse_error",
+                "intake_parse",
+                "The client request body could not be parsed as JSON.",
+            ),
+        });
         crate::proxy::dispatcher::log_intake_rejection(
             gw,
-            &wire.method,
-            &wire.path,
-            &wire.headers,
-            body_prefix,
-            rejection.status(),
-            &rejection.body_text(),
-            wire.context.as_ref(),
+            crate::proxy::dispatcher::IntakeRejectionLog {
+                method: &wire.method,
+                path: &wire.path,
+                headers: &wire.headers,
+                status: rejection.status(),
+                rejection_text: &rejection.body_text(),
+                context: wire.context.as_ref(),
+                body,
+                started_at: wire.started_at,
+                failure_kind: kind,
+                failure_stage: stage,
+                safe_cause: cause,
+            },
         );
     }
 }
 
-async fn collect_body(body: Body) -> Bytes {
-    // The ambient request-body-limit layer has already run by this point. A
-    // transport failure is surfaced as the same syntax rejection an empty body
-    // receives rather than bypassing JsonRejection's public constructors.
-    axum::body::to_bytes(body, usize::MAX)
-        .await
-        .unwrap_or_default()
+/// Intake diagnostics retain a prefix only, independently of the raw bytes
+/// needed by successful requests. Observed counts never come from Content-Length.
+#[derive(Default)]
+struct IntakeCapture {
+    prefix: Vec<u8>,
+    total_observed_bytes: u64,
+    observed: bool,
+    complete: bool,
+    raw: BytesMut,
+}
+
+impl IntakeCapture {
+    fn observe(&mut self, bytes: &[u8], retain_raw: bool) {
+        self.observed = true;
+        self.total_observed_bytes = self.total_observed_bytes.saturating_add(bytes.len() as u64);
+        let remaining = crate::proxy::dispatcher::INTAKE_REJECTION_BODY_PREFIX_BYTES
+            .saturating_sub(self.prefix.len());
+        self.prefix
+            .extend_from_slice(&bytes[..bytes.len().min(remaining)]);
+        if retain_raw {
+            self.raw.extend_from_slice(bytes);
+        }
+    }
+
+    fn payload(
+        &self,
+        wire: &WireMeta,
+        byte_domain: &str,
+        wire_observed_bytes: Option<u64>,
+    ) -> crate::logging::payload::CapturedPayload {
+        // capture_bytes preserves the retained bytes exactly, using base64 for
+        // binary data or a UTF-8 character split at the prefix boundary.
+        let mut capture = if self.observed || self.complete {
+            crate::logging::payload::capture_bytes(&self.prefix, self.complete)
+        } else {
+            crate::logging::payload::CapturedPayload::default()
+        };
+        capture.metadata["total_observed_bytes"] = self.total_observed_bytes.into();
+        capture.metadata["truncated"] =
+            (self.total_observed_bytes > self.prefix.len() as u64).into();
+        capture.metadata["byte_domain"] = byte_domain.into();
+        capture.metadata["encoding_scope"] = "retained_prefix".into();
+        if let Some(declared) = wire
+            .headers
+            .get(header::CONTENT_LENGTH)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<u64>().ok())
+        {
+            // Content-Length always describes the wire representation, even
+            // when the prefix and observed count describe decoded JSON bytes.
+            capture.metadata["declared_bytes"] = declared.into();
+            capture.metadata["declared_byte_domain"] = "wire".into();
+        }
+        if let Some(observed) = wire_observed_bytes {
+            capture.metadata["wire_observed_bytes"] = observed.into();
+        }
+        capture
+    }
+}
+
+fn observe_body(body: Body, retain_raw: bool) -> (Body, Arc<Mutex<IntakeCapture>>) {
+    let captured = Arc::new(Mutex::new(IntakeCapture::default()));
+    let capture = Arc::clone(&captured);
+    let mut stream = body.into_data_stream();
+    let mut failed = false;
+    let body = Body::from_stream(futures::stream::poll_fn(move |cx| {
+        let polled = stream.poll_next_unpin(cx);
+        let mut capture = capture.lock().expect("request body capture mutex poisoned");
+        match &polled {
+            std::task::Poll::Ready(Some(Ok(bytes))) => capture.observe(bytes, retain_raw),
+            std::task::Poll::Ready(Some(Err(_))) => failed = true,
+            std::task::Poll::Ready(None) if !failed => capture.complete = true,
+            _ => {}
+        }
+        polled
+    }));
+    (body, captured)
 }
 
 fn request_content_encoding(headers: &HeaderMap) -> Option<String> {
@@ -352,8 +516,29 @@ mod tests {
         drop(payload);
         assert!(compressed.len() < 1024 * 1024);
 
-        let intake = JsonIntake::from_request(encoded_request(compressed, "gzip"), &()).await;
-        assert!(intake.is_err(), "compressed bomb must not decode to a body");
+        let compressed_len = compressed.len();
+        let (status, entry) =
+            finalized_rejection_log(encoded_request(compressed, "gzip"), Some(Instant::now()))
+                .await;
+        // Keep the established JSON-rejection response, but diagnose the
+        // bounded decode failure rather than falsely claiming a parser error.
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            entry.diagnostic.failure_kind.as_deref(),
+            Some("intake_body_limit")
+        );
+        assert_eq!(
+            entry.diagnostic.failure_stage.as_deref(),
+            Some("intake_decompress")
+        );
+        let meta = &entry.diagnostic.payload_metadata["client_request_body"];
+        assert_eq!(meta["byte_domain"], "wire");
+        assert_eq!(meta["total_observed_bytes"], compressed_len);
+        assert_eq!(meta["retained_bytes"], 512);
+        assert_eq!(meta["complete"], true);
+        assert_eq!(meta["truncated"], true);
+        // The decoder returned no decoded body: do not invent an output count.
+        assert!(meta.get("wire_observed_bytes").is_none());
     }
 
     #[tokio::test]
@@ -444,6 +629,267 @@ mod tests {
             .expect("log channel should remain open")
     }
 
+    async fn finalized_rejection_log(
+        mut req: Request,
+        started_at: Option<Instant>,
+    ) -> (StatusCode, crate::logging::LogEntry) {
+        let (gw, mut log_rx) = log_test_gateway().await;
+        let context = started_at.map(|started_at| {
+            let mut ctx = RequestContext::without_total_timeout(
+                crate::protocol::ids::OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1,
+            );
+            ctx.started_at = started_at;
+            req.extensions_mut().insert(ctx.clone());
+            ctx
+        });
+        let rejection = JsonIntake::from_request(req, &gw)
+            .await
+            .expect_err("invalid intake");
+        let status = rejection.status();
+        if let Some(ctx) = context {
+            let response = crate::proxy::dispatcher::finish_preflight_response(
+                rejection.into_response(),
+                &ctx,
+            );
+            to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        }
+        let entry = next_log_entry(&mut log_rx).await;
+        assert!(entry.upstream_status_code.is_none());
+        assert!(entry.upstream_url.is_none());
+        assert!(entry.provider_id.is_empty());
+        assert_eq!(entry.diagnostic.attempt_outcome, "failed");
+        (status, entry)
+    }
+
+    fn streaming_request(body: Body, encoding: Option<&str>, declared: Option<u64>) -> Request {
+        let mut builder = HttpRequest::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header(header::CONTENT_TYPE, "application/json");
+        if let Some(encoding) = encoding {
+            builder = builder.header(header::CONTENT_ENCODING, encoding);
+        }
+        if let Some(declared) = declared {
+            builder = builder.header(header::CONTENT_LENGTH, declared.to_string());
+        }
+        builder.body(body).unwrap()
+    }
+
+    #[tokio::test]
+    async fn intake_complete_invalid_json_logs_real_counts_and_entry_latency() {
+        let mut raw = vec![b' '; 2048];
+        raw[0] = b'!';
+        let req = streaming_request(Body::from(raw), None, Some(2048));
+        let (status, entry) = finalized_rejection_log(
+            req,
+            Some(Instant::now() - std::time::Duration::from_millis(75)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(entry.latency_total_ms >= 75);
+        assert_eq!(
+            entry.diagnostic.failure_kind.as_deref(),
+            Some("intake_parse_error")
+        );
+        assert_eq!(
+            entry.diagnostic.failure_stage.as_deref(),
+            Some("intake_parse")
+        );
+        let meta = &entry.diagnostic.payload_metadata["client_request_body"];
+        assert_eq!(meta["total_observed_bytes"], 2048);
+        assert_eq!(meta["retained_bytes"], 512);
+        assert_eq!(meta["head_bytes"], 512);
+        assert_eq!(meta["tail_bytes"], 0);
+        assert_eq!(meta["complete"], true);
+        assert_eq!(meta["truncated"], true);
+        assert_eq!(meta["declared_bytes"], 2048);
+        assert_eq!(entry.client_request_body.as_ref().unwrap().len(), 512);
+    }
+
+    #[tokio::test]
+    async fn intake_partial_io_error_keeps_counts_and_safe_failure_after_finalization() {
+        for observed in [128, 768] {
+            let chunks = vec![
+                Ok(Bytes::from(vec![b'x'; observed])),
+                Err(std::io::Error::other(
+                    "Bearer secret=do-not-copy-source-body",
+                )),
+            ];
+            let req = streaming_request(
+                Body::from_stream(futures::stream::iter(chunks)),
+                None,
+                Some(21_950_000),
+            );
+            let (status, entry) = finalized_rejection_log(req, Some(Instant::now())).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(
+                entry.diagnostic.failure_kind.as_deref(),
+                Some("intake_read_error")
+            );
+            assert_eq!(
+                entry.diagnostic.failure_stage.as_deref(),
+                Some("intake_read")
+            );
+            assert_eq!(
+                entry.diagnostic.error_causes,
+                vec!["The client request body could not be read to completion."]
+            );
+            let meta = &entry.diagnostic.payload_metadata["client_request_body"];
+            assert_eq!(meta["total_observed_bytes"], observed);
+            assert_eq!(meta["retained_bytes"], observed.min(512));
+            assert_eq!(meta["complete"], false);
+            assert_eq!(meta["truncated"], observed > 512);
+            assert_eq!(meta["declared_bytes"], 21_950_000);
+            assert_eq!(meta["byte_domain"], "wire");
+            assert_eq!(
+                entry.client_request_body.as_ref().unwrap().len(),
+                observed.min(512)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn intake_empty_body_logs_complete_empty_capture_without_declared_length() {
+        let req = streaming_request(Body::empty(), None, None);
+        let (status, entry) = finalized_rejection_log(req, None).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let meta = &entry.diagnostic.payload_metadata["client_request_body"];
+        assert_eq!(meta["total_observed_bytes"], 0);
+        assert_eq!(meta["retained_bytes"], 0);
+        assert_eq!(meta["capture_state"], "empty");
+        assert_eq!(meta["complete"], true);
+        assert_eq!(meta["truncated"], false);
+        assert!(meta.get("declared_bytes").is_none());
+        assert_eq!(entry.client_request_body.as_deref(), Some(""));
+    }
+
+    #[tokio::test]
+    async fn intake_fallback_latency_includes_body_read_wait() {
+        // A short async wait exercises the no-RequestContext timestamp fallback.
+        let chunks = futures::stream::once(async {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            Err::<Bytes, _>(std::io::Error::other("read failed"))
+        });
+        let req = streaming_request(Body::from_stream(chunks), None, None);
+        let (_, entry) = finalized_rejection_log(req, None).await;
+        assert!(entry.latency_total_ms >= 20);
+        let meta = &entry.diagnostic.payload_metadata["client_request_body"];
+        assert_eq!(meta["total_observed_bytes"], 0);
+        assert_eq!(meta["capture_state"], "absent");
+        assert_eq!(meta["complete"], false);
+        assert_eq!(meta["truncated"], false);
+        assert!(meta.get("declared_bytes").is_none());
+    }
+
+    #[tokio::test]
+    async fn intake_body_limit_records_only_observed_bytes_for_plain_and_compressed() {
+        // No router override: Axum's default body limit is 2 MiB. A second
+        // successful data frame crosses it; the third frame is never polled.
+        let limit = 2 * 1024 * 1024;
+        for encoding in [None, Some("gzip")] {
+            let chunks = vec![
+                Ok::<_, std::io::Error>(Bytes::from(vec![b'x'; 700])),
+                Ok(Bytes::from(vec![b'y'; limit])),
+                Ok(Bytes::from_static(b"unread")),
+            ];
+            let req = streaming_request(
+                Body::from_stream(futures::stream::iter(chunks)),
+                encoding,
+                Some(30_000_000),
+            );
+            let (status, entry) = finalized_rejection_log(req, Some(Instant::now())).await;
+            assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+            assert_eq!(
+                entry.diagnostic.failure_kind.as_deref(),
+                Some("intake_body_limit")
+            );
+            assert_eq!(
+                entry.diagnostic.failure_stage.as_deref(),
+                Some("intake_read")
+            );
+            let meta = &entry.diagnostic.payload_metadata["client_request_body"];
+            assert_eq!(meta["total_observed_bytes"], limit + 700);
+            assert_eq!(meta["retained_bytes"], 512);
+            assert_eq!(meta["complete"], false);
+            assert_eq!(meta["truncated"], true);
+        }
+    }
+
+    #[tokio::test]
+    async fn intake_non_utf8_and_split_utf8_prefix_are_byte_exact() {
+        use base64::Engine;
+        let binary = vec![0xff; 700];
+        let mut split = vec![b'x'; 511];
+        split.extend_from_slice("é".as_bytes());
+        split.extend_from_slice(b"not-json");
+        for raw in [binary, split] {
+            let expected = raw[..512].to_vec();
+            let observed = raw.len();
+            let req = streaming_request(Body::from(raw), None, None);
+            let (_, entry) = finalized_rejection_log(req, None).await;
+            let meta = &entry.diagnostic.payload_metadata["client_request_body"];
+            assert_eq!(meta["encoding"], "base64");
+            assert_eq!(meta["encoding_scope"], "retained_prefix");
+            assert_eq!(meta["total_observed_bytes"], observed);
+            assert_eq!(meta["retained_bytes"], 512);
+            assert_eq!(meta["complete"], true);
+            assert_eq!(meta["truncated"], true);
+            assert_eq!(
+                base64::engine::general_purpose::STANDARD
+                    .decode(entry.client_request_body.unwrap())
+                    .unwrap(),
+                expected,
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn intake_compressed_io_failure_remains_read_error_with_wire_prefix() {
+        let chunks = vec![
+            Ok(Bytes::from(vec![0x1f; 800])),
+            Err(std::io::Error::other("connection closed")),
+        ];
+        let req = streaming_request(
+            Body::from_stream(futures::stream::iter(chunks)),
+            Some("gzip"),
+            Some(1000),
+        );
+        let (status, entry) = finalized_rejection_log(req, Some(Instant::now())).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            entry.diagnostic.failure_kind.as_deref(),
+            Some("intake_read_error")
+        );
+        let meta = &entry.diagnostic.payload_metadata["client_request_body"];
+        assert_eq!(meta["byte_domain"], "wire");
+        assert_eq!(meta["total_observed_bytes"], 800);
+        assert_eq!(meta["retained_bytes"], 512);
+        assert_eq!(meta["complete"], false);
+        assert_eq!(meta["truncated"], true);
+    }
+
+    #[tokio::test]
+    async fn intake_corrupt_compression_logs_wire_transport_as_complete() {
+        let raw = vec![0xff; 800];
+        let req = streaming_request(Body::from(raw), Some("gzip"), None);
+        let (_, entry) = finalized_rejection_log(req, Some(Instant::now())).await;
+        assert_eq!(
+            entry.diagnostic.failure_kind.as_deref(),
+            Some("intake_decompress_error")
+        );
+        assert_eq!(
+            entry.diagnostic.failure_stage.as_deref(),
+            Some("intake_decompress")
+        );
+        let meta = &entry.diagnostic.payload_metadata["client_request_body"];
+        assert_eq!(meta["byte_domain"], "wire");
+        assert_eq!(meta["total_observed_bytes"], 800);
+        assert_eq!(meta["complete"], true);
+        assert_eq!(meta["truncated"], true);
+        assert_eq!(meta["encoding"], "base64");
+        assert!(meta.get("wire_observed_bytes").is_none());
+    }
+
     #[tokio::test]
     async fn intake_rejection_is_logged_with_wire_evidence() {
         let (gw, mut log_rx) = log_test_gateway().await;
@@ -528,6 +974,21 @@ mod tests {
         let entry = next_log_entry(&mut log_rx).await;
         assert_eq!(entry.client_status_code, 415);
         assert_eq!(entry.client_protocol, "openai-responses/responses/v1");
+        assert_eq!(
+            entry.diagnostic.failure_kind.as_deref(),
+            Some("intake_content_type")
+        );
+        assert_eq!(
+            entry.diagnostic.failure_stage.as_deref(),
+            Some("intake_headers")
+        );
+        let meta = &entry.diagnostic.payload_metadata["client_request_body"];
+        assert_eq!(meta["total_observed_bytes"], 0);
+        assert_eq!(meta["retained_bytes"], 0);
+        assert_eq!(meta["capture_state"], "absent");
+        assert_eq!(meta["complete"], false);
+        assert_eq!(meta["truncated"], false);
+        assert!(entry.client_request_body.is_none());
         let resp = entry.client_response_body.expect("rejection text recorded");
         assert!(resp.contains("Expected request with"), "unexpected: {resp}");
     }
@@ -536,19 +997,35 @@ mod tests {
     async fn compressed_rejection_logs_parsed_view_and_original_headers() {
         let (gw, mut log_rx) = log_test_gateway().await;
         let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
-        std::io::Write::write_all(&mut encoder, b"still not json after decompression").unwrap();
+        let raw = format!("still not json after decompression{}", " ".repeat(900));
+        std::io::Write::write_all(&mut encoder, raw.as_bytes()).unwrap();
         let compressed = encoder.finish().unwrap();
+        let compressed_len = compressed.len();
 
         let req = HttpRequest::builder()
             .method("POST")
             .uri("/v1/chat/completions")
             .header(header::CONTENT_TYPE, "application/json")
             .header(header::CONTENT_ENCODING, "gzip")
+            .header(header::CONTENT_LENGTH, compressed_len.to_string())
             .body(Body::from(compressed))
             .expect("valid test request");
         assert!(JsonIntake::from_request(req, &gw).await.is_err());
 
         let entry = next_log_entry(&mut log_rx).await;
+        let meta = &entry.diagnostic.payload_metadata["client_request_body"];
+        assert_eq!(
+            entry.diagnostic.failure_kind.as_deref(),
+            Some("intake_parse_error")
+        );
+        assert_eq!(meta["byte_domain"], "decoded");
+        assert_eq!(meta["total_observed_bytes"], raw.len());
+        assert_eq!(meta["wire_observed_bytes"], compressed_len);
+        assert_eq!(meta["declared_bytes"], compressed_len);
+        assert_eq!(meta["declared_byte_domain"], "wire");
+        assert_eq!(meta["retained_bytes"], 512);
+        assert_eq!(meta["complete"], true);
+        assert_eq!(meta["truncated"], true);
         // The decompression succeeded, so the logged prefix is the
         // decompressed bytes the JSON parser actually rejected.
         let body_str = entry.client_request_body.expect("body prefix recorded");

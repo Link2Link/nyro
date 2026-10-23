@@ -5,6 +5,7 @@
 //! event-stream frames decoded into protocol-neutral IR deltas.
 mod catalog;
 pub(crate) mod credential;
+mod errors;
 mod estimate;
 mod eventstream;
 mod request;
@@ -122,6 +123,11 @@ inventory::submit! { VendorRegistration { make: || Box::new(KiroVendor) } }
 
 fn unavailable(message: impl Into<String>) -> GatewayError {
     GatewayError::provider_unavailable("kiro", message)
+}
+
+/// Resolve the same wire model before native dispatch, including failed calls.
+pub(crate) fn resolve_wire_model(requested_model: &str) -> String {
+    catalog::resolve(requested_model)
 }
 
 pub(crate) fn is_kiro(provider: &Provider) -> bool {

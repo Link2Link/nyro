@@ -197,7 +197,8 @@ pub(super) async fn handle_ir_response(
         .upstream_status(i32::from(status))
         .upstream_resp_headers(crate::proxy::observability::headers_to_json(&headers));
     log.upstream_model = actual_model;
-    log.diagnostic.payload_metadata["devin_model_route"] = model_metadata;
+    log.diagnostic.payload_metadata[super::native_model_route_key(call_ctx.provider)] =
+        model_metadata;
     log.diagnostic.client_request_id = Some(req_ctx.request_id.clone());
     let mut progress = Progress::default();
     if !(200..300).contains(&status) {

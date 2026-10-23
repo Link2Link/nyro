@@ -339,6 +339,122 @@ async fn native_start_error_log_preserves_client_request_extras() {
 }
 
 #[tokio::test]
+async fn kiro_start_error_log_uses_kiro_wire_model_and_namespace() {
+    let mut fixture = Fixture::new().await;
+    fixture.provider.vendor = Some("kiro".into());
+    let ingress = ANTHROPIC_MESSAGES_2023_06_01;
+    for requested_model in ["claude-opus-5-5", "claude-opus-5.5"] {
+        let ctx = RequestContext::new(ingress, Duration::from_secs(10));
+        let performance = crate::performance::Attempt::new(
+            fixture.gw.log_tx.clone(),
+            ctx.cancellation.clone(),
+            ctx.deadline.clone(),
+        );
+        performance.configure_kiro_stream();
+        performance.correlate(&ctx.request_id, 1);
+        performance.response(400, &reqwest::header::HeaderMap::new());
+        let mut call = fixture.call_ctx(&ctx, ingress, true, requested_model);
+        call.performance = Some(performance.clone());
+        let mut request = AiRequest::new(requested_model, Vec::new());
+        request.reasoning.effort = Some(crate::protocol::ir::ReasoningEffort::Max);
+        let error = GatewayError::upstream_status("kiro", 400, None);
+        super::super::log_native_start_error(&call, &request_extras(), &request, &error);
+        let row = next_log(&mut fixture).await;
+        assert_eq!(row.client_status_code, 400);
+        assert_eq!(row.upstream_status_code, Some(400));
+        assert_eq!(row.upstream_model, "claude-opus-5.5");
+        assert_eq!(
+            row.diagnostic.payload_metadata["kiro_model_route"],
+            serde_json::json!({
+                "requested_model": requested_model,
+                "upstream_model": "claude-opus-5.5",
+            })
+        );
+        assert!(
+            row.diagnostic
+                .payload_metadata
+                .get("devin_model_route")
+                .is_none()
+        );
+        assert_request_extras(&row);
+    }
+}
+
+#[tokio::test]
+async fn unknown_native_start_error_does_not_apply_devin_model_dialect() {
+    let mut fixture = Fixture::new().await;
+    fixture.provider.vendor = Some("future-native".into());
+    let ctx = RequestContext::new(OPENAI_RESPONSES_V1, Duration::from_secs(10));
+    let call = fixture.call_ctx(&ctx, OPENAI_RESPONSES_V1, false, "claude-opus-5-5");
+    let mut request = AiRequest::new("claude-opus-5-5", Vec::new());
+    request.reasoning.effort = Some(crate::protocol::ir::ReasoningEffort::High);
+    super::super::log_native_start_error(
+        &call,
+        &request_extras(),
+        &request,
+        &invalid_ir("native start failed"),
+    );
+    let row = next_log(&mut fixture).await;
+    assert_eq!(row.upstream_model, "claude-opus-5-5");
+    assert_eq!(
+        row.diagnostic.payload_metadata["native_model_route"]["upstream_model"],
+        "claude-opus-5-5"
+    );
+    assert!(
+        row.diagnostic
+            .payload_metadata
+            .get("devin_model_route")
+            .is_none()
+    );
+    assert!(
+        row.diagnostic
+            .payload_metadata
+            .get("kiro_model_route")
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn kiro_started_response_uses_same_model_namespace_as_start_errors() {
+    let mut fixture = Fixture::new().await;
+    fixture.provider.vendor = Some("kiro".into());
+    for stream in [false, true] {
+        let mut upstream = source(vec![Ok(vec![
+            start("claude-opus-5.5"),
+            AiStreamDelta::TextDelta("answer".into()),
+            done(),
+        ])]);
+        upstream.actual_model = "claude-opus-5.5".into();
+        upstream.model_metadata = serde_json::json!({
+            "requested_model": "claude-opus-5-5",
+            "upstream_model": "claude-opus-5.5",
+        });
+        let result = fixture
+            .invoke(
+                upstream,
+                ANTHROPIC_MESSAGES_2023_06_01,
+                stream,
+                "claude-opus-5-5",
+            )
+            .await;
+        assert_eq!(result.response.status(), StatusCode::OK);
+        assert!(text(result.response).await.contains("answer"));
+        let row = next_log(&mut fixture).await;
+        assert_eq!(row.upstream_model, "claude-opus-5.5");
+        assert_eq!(
+            row.diagnostic.payload_metadata["kiro_model_route"]["upstream_model"],
+            "claude-opus-5.5"
+        );
+        assert!(
+            row.diagnostic
+                .payload_metadata
+                .get("devin_model_route")
+                .is_none()
+        );
+    }
+}
+
+#[tokio::test]
 async fn initial_failures_are_json_never_retry_and_preserve_upstream_status() {
     let mut fixture = Fixture::new().await;
     for batches in [

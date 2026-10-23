@@ -2076,19 +2076,36 @@ struct RequestExtras {
     body: Option<Arc<crate::logging::payload::CapturedPayload>>,
 }
 
+/// Keep provider-owned model metadata under its own namespace on both the
+/// successful-start and failed-start paths. Unknown native adapters must not
+/// inherit another provider's model dialect.
+fn native_model_route_key(provider: &Provider) -> &'static str {
+    if crate::provider::kiro::is_kiro(provider) {
+        "kiro_model_route"
+    } else if crate::provider::devin::is_devin(provider) {
+        "devin_model_route"
+    } else {
+        "native_model_route"
+    }
+}
+
 fn log_native_start_error(
     call_ctx: &CallCtx<'_>,
     req_extras: &RequestExtras,
     request: &AiRequest,
     error: &GatewayError,
 ) {
-    // `from_ctx` carries the route target (a bare family such as
-    // `claude-sonnet-5-5`); label the failure with the wire UID
-    // `execute` resolved, matching what a success would report.
+    // Resolve through the same provider-owned mapping used by its encoder.
+    // Kiro carries effort separately; Devin may encode it in the model UID.
     let mut log = LogBuilder::from_ctx(call_ctx).with_req_extras(req_extras);
-    let wire_model =
-        crate::provider::devin::resolve_wire_model(call_ctx.actual_model, &request.reasoning);
-    log.diagnostic.payload_metadata["devin_model_route"] = serde_json::json!({
+    let wire_model = if crate::provider::kiro::is_kiro(call_ctx.provider) {
+        crate::provider::kiro::resolve_wire_model(call_ctx.actual_model)
+    } else if crate::provider::devin::is_devin(call_ctx.provider) {
+        crate::provider::devin::resolve_wire_model(call_ctx.actual_model, &request.reasoning)
+    } else {
+        call_ctx.actual_model.to_string()
+    };
+    log.diagnostic.payload_metadata[native_model_route_key(call_ctx.provider)] = serde_json::json!({
         "requested_model": call_ctx.actual_model,
         "upstream_model": wire_model,
     });
@@ -2699,47 +2716,61 @@ fn ingress_from_path(path: &str) -> crate::protocol::ids::ProtocolEndpoint {
     }
 }
 
+/// Intake owns byte observation and the stricter 512-byte privacy budget. Do not
+/// reconstruct this capture from its prefix: that loses transport completeness
+/// and confuses retained bytes with the number actually observed.
+pub(crate) struct IntakeRejectionLog<'a> {
+    pub method: &'a axum::http::Method,
+    pub path: &'a str,
+    pub headers: &'a axum::http::HeaderMap,
+    pub status: axum::http::StatusCode,
+    pub rejection_text: &'a str,
+    pub context: Option<&'a RequestContext>,
+    pub body: crate::logging::payload::CapturedPayload,
+    pub started_at: Instant,
+    pub failure_kind: &'static str,
+    pub failure_stage: &'static str,
+    pub safe_cause: &'static str,
+}
+
 /// Emit a `LogEntry` for a request rejected at the JSON intake boundary -
 /// before any handler, decoder, or router ran. The body never parsed, so the
 /// wire evidence (rejection status and text, redacted request headers, and
 /// the leading body bytes) is all the log can carry. Without this, malformed
 /// intake rejections leave no `request_logs` row and are only diagnosable
 /// via packet capture.
-pub(crate) fn log_intake_rejection(
-    gw: &Gateway,
-    method: &axum::http::Method,
-    path: &str,
-    headers: &axum::http::HeaderMap,
-    body_prefix: &[u8],
-    status: axum::http::StatusCode,
-    rejection_text: &str,
-    ctx: Option<&RequestContext>,
-) {
-    let ingress_str = ingress_from_path(path).to_string();
-    let shown = body_prefix
-        .len()
-        .min(crate::proxy::dispatcher::INTAKE_REJECTION_BODY_PREFIX_BYTES);
-    let mut body_str = String::from_utf8_lossy(&body_prefix[..shown]).to_string();
-    if body_prefix.len() > shown {
-        body_str.push_str(&format!(
-            " ...[first {shown} of {} body bytes]",
-            body_prefix.len()
-        ));
+pub(crate) fn log_intake_rejection(gw: &Gateway, evidence: IntakeRejectionLog<'_>) {
+    let ingress_str = ingress_from_path(evidence.path).to_string();
+    let mut log = LogBuilder::from_dispatch(gw, &ingress_str, "", None, evidence.started_at)
+        .preflight(evidence.context);
+    // Only fixed intake-owned causes enter structured diagnostics: a body/source
+    // error may contain credentials or arbitrary request bytes. Record before
+    // emit/wrap so generic HTTP or delivery failures cannot replace intake facts.
+    log.diagnostic.record_message(
+        "failed",
+        evidence.failure_kind,
+        evidence.failure_stage,
+        evidence.safe_cause,
+    );
+    if let Some(attempt) = &log.performance {
+        attempt.record_message(
+            "failed",
+            evidence.failure_kind,
+            evidence.failure_stage,
+            evidence.safe_cause,
+        );
     }
-    LogBuilder::from_dispatch(gw, &ingress_str, "", None, Instant::now())
-        .preflight(ctx)
-        .status(status.as_u16())
+    log.status(evidence.status.as_u16())
         .with_req_extras(&RequestExtras {
-            method: method.to_string(),
-            path: path.to_string(),
-            headers: Some(Arc::new(crate::logging::payload::capture_headers(headers))),
-            body: Some(Arc::new(crate::logging::payload::capture_bytes(
-                body_str.as_bytes(),
-                true,
+            method: evidence.method.to_string(),
+            path: evidence.path.to_string(),
+            headers: Some(Arc::new(crate::logging::payload::capture_headers(
+                evidence.headers,
             ))),
+            body: Some(Arc::new(evidence.body)),
         })
         .resp_body(Some(
-            serde_json::json!({ "error": { "message": rejection_text } }).to_string(),
+            serde_json::json!({ "error": { "message": evidence.rejection_text } }).to_string(),
         ))
         .emit();
 }
