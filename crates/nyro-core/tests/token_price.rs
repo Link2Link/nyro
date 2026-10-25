@@ -975,3 +975,87 @@ async fn provider_stats_and_detail_carry_equivalent_api_price() -> anyhow::Resul
     assert!(json["models"][0].get("equivalent_costs").is_some());
     Ok(())
 }
+
+/// Like `recent_log`, attributed to an API key.
+async fn key_log(
+    storage: &SqliteStorage,
+    key: &str,
+    provider: &str,
+    model: &str,
+    age_hours: i64,
+) -> anyhow::Result<()> {
+    let at = chrono::Utc::now().timestamp_millis() - age_hours * 3_600_000 - 60_000;
+    sqlx::query("INSERT INTO request_logs (id, created_at, api_key_id, api_key_name, provider_id, upstream_model, input_tokens, output_tokens, cache_read_tokens, upstream_status_code, client_status_code, outcome_version, attempt_outcome) VALUES (?, ?, ?, ?, ?, ?, 1000000, 500000, 250000, 200, 200, 1, 'completed')")
+        .bind(uuid::Uuid::new_v4().to_string()).bind(at).bind(key).bind(key)
+        .bind(provider).bind(model).execute(storage.pool()).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn model_and_api_key_stats_carry_equivalent_api_price() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let (gw, storage) = open(dir.path()).await?;
+    let bigmodel = provider(&storage, "BigModel", "https://open.bigmodel.cn/api/paas/v4").await?;
+    let reseller = provider(&storage, "Reseller", "http://127.0.0.1:1/v1").await?;
+    let admin = gw.admin();
+    // The same upstream model on two providers: native CNY vs a manual USD rule.
+    admin
+        .set_token_price(input(&reseller, "glm-5.3", Some(rates(2.0, 8.0, Some(1.0)))))
+        .await?;
+    key_log(&storage, "key-a", &bigmodel, "glm-5.3", 1).await?;
+    key_log(&storage, "key-a", &bigmodel, "glm-5.3", 2).await?;
+    key_log(&storage, "key-a", &bigmodel, "glm-5.3", 100).await?;
+    key_log(&storage, "key-b", &reseller, "glm-5.3", 1).await?;
+    key_log(&storage, "key-b", &reseller, "unpriced-model", 3).await?;
+
+    let cny_one = 750_000.0 / 1e6 * 8.0 + 250_000.0 / 1e6 * 2.3 + 500_000.0 / 1e6 * 28.0;
+    let usd_one = 750_000.0 / 1e6 * 2.0 + 250_000.0 / 1e6 * 1.0 + 500_000.0 / 1e6 * 8.0;
+
+    let models = admin.get_stats_by_model(Some(24)).await?;
+    let glm = models.iter().find(|m| m.model == "glm-5.3").unwrap();
+    assert_eq!(glm.request_count, 3, "window excludes the 100h-old attempt");
+    assert_eq!(glm.unpriced_request_count, 0);
+    // Never merged across currencies; sorted by currency code.
+    assert_eq!(glm.equivalent_costs.len(), 2);
+    assert_eq!(glm.equivalent_costs[0].currency, "CNY");
+    assert_eq!(glm.equivalent_costs[0].priced_request_count, 2);
+    assert!((glm.equivalent_costs[0].total_cost - 2.0 * cny_one).abs() < 1e-9);
+    assert_eq!(glm.equivalent_costs[1].currency, "USD");
+    assert_eq!(glm.equivalent_costs[1].priced_request_count, 1);
+    assert!((glm.equivalent_costs[1].total_cost - usd_one).abs() < 1e-9);
+    let unpriced = models.iter().find(|m| m.model == "unpriced-model").unwrap();
+    assert!(unpriced.equivalent_costs.is_empty());
+    assert_eq!(unpriced.unpriced_request_count, 1);
+
+    let keys = admin.get_stats_by_api_key(Some(24)).await?;
+    let a = keys.iter().find(|k| k.api_key_id == "key-a").unwrap();
+    assert_eq!(a.request_count, 2);
+    assert_eq!(a.unpriced_request_count, 0);
+    assert_eq!(a.equivalent_costs.len(), 1);
+    assert_eq!(a.equivalent_costs[0].currency, "CNY");
+    assert!((a.equivalent_costs[0].total_cost - 2.0 * cny_one).abs() < 1e-9);
+    let b = keys.iter().find(|k| k.api_key_id == "key-b").unwrap();
+    assert_eq!(b.request_count, 2);
+    assert_eq!(b.unpriced_request_count, 1);
+    assert_eq!(b.equivalent_costs.len(), 1);
+    assert_eq!(b.equivalent_costs[0].currency, "USD");
+    assert_eq!(b.equivalent_costs[0].priced_request_count, 1);
+    assert!((b.equivalent_costs[0].total_cost - usd_one).abs() < 1e-9);
+
+    // A wider window picks up the older attempt for both views.
+    let wide = admin.get_stats_by_api_key(Some(720)).await?;
+    let wide_a = wide.iter().find(|k| k.api_key_id == "key-a").unwrap();
+    assert_eq!(wide_a.equivalent_costs[0].priced_request_count, 3);
+    let wide_models = admin.get_stats_by_model(Some(720)).await?;
+    let wide_glm = wide_models.iter().find(|m| m.model == "glm-5.3").unwrap();
+    assert_eq!(wide_glm.equivalent_costs[0].priced_request_count, 3);
+
+    // Wire format: the UI reads these exact field names.
+    let json = serde_json::to_value(glm)?;
+    assert!(json["equivalent_costs"][0]["total_cost"].is_number());
+    assert_eq!(json["unpriced_request_count"], 0);
+    let json = serde_json::to_value(b)?;
+    assert_eq!(json["equivalent_costs"][0]["currency"], "USD");
+    assert_eq!(json["unpriced_request_count"], 1);
+    Ok(())
+}

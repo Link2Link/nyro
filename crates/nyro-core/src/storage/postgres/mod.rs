@@ -1974,6 +1974,26 @@ impl LogStore for PostgresLogStore {
             .await?)
     }
 
+    async fn api_key_token_usage(
+        &self,
+        start_at: Option<i64>,
+        end_at: Option<i64>,
+    ) -> anyhow::Result<Vec<crate::db::models::ApiKeyTokenUsage>> {
+        let range = crate::storage::traits::range_sql(start_at, end_at);
+        let sql = format!(
+            "SELECT api_key_id, provider_id COLLATE \"C\" AS provider_id, \
+             COALESCE(upstream_model, '') COLLATE \"C\" AS model, COUNT(*) AS request_count, \
+             COALESCE(SUM(input_tokens), 0)::BIGINT AS input_tokens, \
+             COALESCE(SUM(output_tokens), 0)::BIGINT AS output_tokens, \
+             COALESCE(SUM(cache_read_tokens), 0)::BIGINT AS cache_read_tokens, \
+             SUM(CASE WHEN input_tokens IS NULL OR output_tokens IS NULL THEN 1 ELSE 0 END)::BIGINT AS missing_usage_count, \
+             COUNT(cache_read_tokens) AS cache_read_reported_count \
+             FROM request_logs WHERE api_key_id IS NOT NULL AND api_key_id <> '' AND provider_id <> '' AND {range} \
+             GROUP BY 1, 2, 3"
+        );
+        Ok(sqlx::query_as(&sql).fetch_all(&self.pool).await?)
+    }
+
     async fn api_key_usage_detail(
         &self,
         api_key_id: &str,

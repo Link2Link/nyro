@@ -406,6 +406,15 @@ impl LogStore for MemoryStorage {
         Ok(vec![])
     }
 
+    async fn api_key_token_usage(
+        &self,
+        _start_at: Option<i64>,
+        _end_at: Option<i64>,
+    ) -> anyhow::Result<Vec<crate::db::models::ApiKeyTokenUsage>> {
+        // YAML-only memory storage does not retain request logs.
+        Ok(vec![])
+    }
+
     async fn api_key_usage_detail(
         &self,
         api_key_id: &str,

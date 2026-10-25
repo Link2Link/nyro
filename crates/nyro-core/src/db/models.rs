@@ -1016,6 +1016,15 @@ pub struct ModelStats {
     #[sqlx(flatten)]
     #[serde(flatten)]
     pub tps_totals: TpsTotals,
+    /// API-equivalent value of this upstream model's known tokens across all
+    /// providers, one entry per native currency. Filled by the admin service.
+    #[serde(default)]
+    #[sqlx(skip)]
+    pub equivalent_costs: Vec<EquivalentCostTotal>,
+    /// Attempts in the window without a reliable price (not in `equivalent_costs`).
+    #[serde(default)]
+    #[sqlx(skip)]
+    pub unpriced_request_count: i64,
 }
 
 #[derive(Debug, Clone, Default, FromRow)]
@@ -1550,6 +1559,32 @@ pub struct ApiKeyStats {
     pub total_output_tokens: i64,
     pub cache_read_tokens: i64,
     pub last_used_at: i64,
+    /// API-equivalent value of this key's known tokens per native currency;
+    /// filled by the admin service. Not an invoice.
+    #[serde(default)]
+    #[sqlx(skip)]
+    pub equivalent_costs: Vec<EquivalentCostTotal>,
+    /// Attempts in the window without a reliable price (not in `equivalent_costs`).
+    #[serde(default)]
+    #[sqlx(skip)]
+    pub unpriced_request_count: i64,
+}
+
+/// Retained usage grouped by API key, provider and upstream model: the pricing
+/// grain for per-key API-equivalent value. Includes failed/retried attempts.
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct ApiKeyTokenUsage {
+    pub api_key_id: String,
+    pub provider_id: String,
+    /// The upstream model, not the client-facing model alias.
+    pub model: String,
+    pub request_count: i64,
+    /// Stored gross input tokens; cache reads are already included.
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub cache_read_tokens: i64,
+    pub missing_usage_count: i64,
+    pub cache_read_reported_count: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -2039,6 +2039,28 @@ impl LogStore for MysqlLogStore {
             .await?)
     }
 
+    async fn api_key_token_usage(
+        &self,
+        start_at: Option<i64>,
+        end_at: Option<i64>,
+    ) -> anyhow::Result<Vec<crate::db::models::ApiKeyTokenUsage>> {
+        let range = crate::storage::traits::range_sql(start_at, end_at);
+        // Key grouping matches `stats_by_api_key_range`; provider/model use binary
+        // keys like `token_usage_days`. MIN satisfies ONLY_FULL_GROUP_BY.
+        let sql = format!(
+            "SELECT MIN(api_key_id) AS api_key_id, MIN(provider_id) AS provider_id, \
+             MIN(COALESCE(upstream_model, '')) AS model, CAST(COUNT(*) AS SIGNED) AS request_count, \
+             CAST(COALESCE(SUM(input_tokens), 0) AS SIGNED) AS input_tokens, \
+             CAST(COALESCE(SUM(output_tokens), 0) AS SIGNED) AS output_tokens, \
+             CAST(COALESCE(SUM(cache_read_tokens), 0) AS SIGNED) AS cache_read_tokens, \
+             CAST(SUM(CASE WHEN input_tokens IS NULL OR output_tokens IS NULL THEN 1 ELSE 0 END) AS SIGNED) AS missing_usage_count, \
+             CAST(COUNT(cache_read_tokens) AS SIGNED) AS cache_read_reported_count \
+             FROM request_logs WHERE api_key_id IS NOT NULL AND api_key_id <> '' AND provider_id <> '' AND {range} \
+             GROUP BY api_key_id, BINARY provider_id, BINARY COALESCE(upstream_model, '')"
+        );
+        Ok(sqlx::query_as(&sql).fetch_all(&self.pool).await?)
+    }
+
     async fn api_key_usage_detail(
         &self,
         api_key_id: &str,

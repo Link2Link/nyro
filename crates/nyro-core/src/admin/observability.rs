@@ -394,12 +394,54 @@ impl AdminService {
         &self,
         range: impl Into<StatsRange>,
     ) -> anyhow::Result<Vec<ModelStats>> {
-        let (start_at, end_at) = Self::list_range(range.into())?;
-        self.gw
+        let (range_start, range_end) = Self::list_range(range.into())?;
+        let mut stats = self
+            .gw
             .storage
             .logs()
-            .stats_by_model_range(start_at, end_at)
-            .await
+            .stats_by_model_range(range_start, range_end)
+            .await?;
+        if stats.is_empty() {
+            return Ok(stats);
+        }
+        // Same window as the SQL above; one upstream model can be served by
+        // several providers, each priced against its own record. A pricing
+        // failure must not take down the rest of the model statistics.
+        let now = Utc::now().timestamp_millis();
+        let start_at = range_start.unwrap_or(0);
+        let end_at = range_end.unwrap_or(now);
+        let priced = async {
+            let providers = self.provider_map().await?;
+            self.priced_usage_rows(start_at, end_at.saturating_add(1), &providers)
+                .await
+        };
+        match priced.await {
+            Ok(rows) => {
+                for item in &mut stats {
+                    let (costs, unpriced) = super::token_cost::summarize_costs(
+                        rows.iter().filter(|row| row.model == item.model),
+                    );
+                    item.equivalent_costs = costs;
+                    item.unpriced_request_count = unpriced;
+                }
+            }
+            Err(error) => {
+                tracing::warn!(%error, "equivalent API price unavailable for model stats")
+            }
+        }
+        Ok(stats)
+    }
+
+    async fn provider_map(&self) -> anyhow::Result<HashMap<String, Provider>> {
+        Ok(self
+            .gw
+            .storage
+            .providers()
+            .list()
+            .await?
+            .into_iter()
+            .map(|provider| (provider.id.clone(), provider))
+            .collect())
     }
 
     pub async fn get_model_usage_stats(
@@ -572,7 +614,71 @@ impl AdminService {
                 }
             }
         }
+        if stats.is_empty() {
+            return Ok(stats);
+        }
+        match self.priced_api_key_usage(start_at, end_at).await {
+            Ok(rows) => {
+                for item in &mut stats {
+                    let (costs, unpriced) = super::token_cost::summarize_costs(
+                        rows.iter()
+                            .filter(|(key, _)| *key == item.api_key_id)
+                            .map(|(_, row)| row),
+                    );
+                    item.equivalent_costs = costs;
+                    item.unpriced_request_count = unpriced;
+                }
+            }
+            Err(error) => {
+                tracing::warn!(%error, "equivalent API price unavailable for API key stats")
+            }
+        }
         Ok(stats)
+    }
+
+    /// Per API key/provider/upstream-model usage over the inclusive window used by
+    /// `stats_by_api_key_range`, priced like `priced_usage_rows`.
+    async fn priced_api_key_usage(
+        &self,
+        start_at: Option<i64>,
+        end_at: Option<i64>,
+    ) -> anyhow::Result<Vec<(String, TokenUsageDay)>> {
+        let usage = self
+            .gw
+            .storage
+            .logs()
+            .api_key_token_usage(start_at, end_at)
+            .await?;
+        let (keys, mut rows): (Vec<_>, Vec<_>) = usage
+            .into_iter()
+            .map(|u| {
+                // Pricing ignores the date; reuse the shared enrichment/summary path.
+                let row = TokenUsageDay {
+                    date: String::new(),
+                    provider_name: u.provider_id.clone(),
+                    provider_id: u.provider_id,
+                    model: u.model,
+                    request_count: u.request_count,
+                    input_tokens: u.input_tokens,
+                    output_tokens: u.output_tokens,
+                    cache_read_tokens: u.cache_read_tokens,
+                    missing_usage_count: u.missing_usage_count,
+                    cache_read_reported_count: u.cache_read_reported_count,
+                    cost: None,
+                };
+                (u.api_key_id, row)
+            })
+            .unzip();
+        let providers = self.provider_map().await?;
+        let overrides =
+            super::token_price::parse_overrides(self.gw.storage.settings().list_all().await?)?;
+        super::token_cost::enrich_token_costs(
+            &mut rows,
+            &providers,
+            &self.gw.config.data_dir,
+            &overrides,
+        );
+        Ok(keys.into_iter().zip(rows).collect())
     }
 
     pub async fn get_api_key_usage_detail(

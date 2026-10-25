@@ -89,6 +89,15 @@ export default function StatsPage() {
 
   const showDateOnAxis = rangeSpanHours(range) > 24;
 
+  const priceHeader = (
+    <th
+      className="px-4 py-2.5 text-right font-medium"
+      title={isZh ? "按官方 API 定价折算的等额价格（当前参考价估算，非实际账单）" : "Equivalent value at official API prices (current rates, not a bill)"}
+    >
+      {isZh ? "等额 API 价格" : "Equivalent API Price"}
+    </th>
+  );
+
   const modelPie = modelStats.slice(0, 6).map((m) => ({
     name: m.model,
     value: m.request_count,
@@ -283,12 +292,7 @@ export default function StatsPage() {
                 >
                   {isZh ? "输出 TPS" : "Output TPS"}
                 </th>
-                <th
-                  className="px-4 py-2.5 text-right font-medium"
-                  title={isZh ? "按官方 API 定价折算的等额价格（当前参考价估算，非实际账单）" : "Equivalent value at official API prices (current rates, not a bill)"}
-                >
-                  {isZh ? "等额 API 价格" : "Equivalent API Price"}
-                </th>
+                {priceHeader}
               </tr>
             </thead>
             <tbody>
@@ -354,7 +358,7 @@ export default function StatsPage() {
             {isZh ? "查看详情" : "View Details"}
           </Button>
         </div>
-        <div className="overflow-hidden rounded-xl border border-white/70 bg-white/50">
+        <div className="overflow-x-auto rounded-xl border border-white/70 bg-white/50">
           <table className="w-full text-sm">
             <thead className="bg-white/70 text-slate-500">
               <tr>
@@ -365,11 +369,12 @@ export default function StatsPage() {
                 <th className="px-4 py-2.5 text-right font-medium">{isZh ? "缓存命中" : "Cache Hits"}</th>
                 <th className="px-4 py-2.5 text-right font-medium">{isZh ? "输出 Token" : "Output Tokens"}</th>
                 <th className="px-4 py-2.5 text-right font-medium">{isZh ? "最后调用" : "Last Used"}</th>
+                {priceHeader}
               </tr>
             </thead>
             <tbody>
               {apiKeyStats.length === 0 && (
-                <tr><td className="px-4 py-6 text-center text-slate-400" colSpan={7}>{isZh ? "暂无数据" : "No data"}</td></tr>
+                <tr><td className="px-4 py-6 text-center text-slate-400" colSpan={8}>{isZh ? "暂无数据" : "No data"}</td></tr>
               )}
               {apiKeyStats.slice(0, 8).map((k) => {
                 // input_tokens 已包含 cache_read_tokens (GROSS 语义),
@@ -377,6 +382,7 @@ export default function StatsPage() {
                 const cacheRate = k.total_input_tokens > 0
                   ? Math.round((k.cache_read_tokens / k.total_input_tokens) * 100)
                   : 0;
+                const price = equivalentCostDisplay(k.equivalent_costs, k.unpriced_request_count, isZh, locale);
                 return (
                   <tr
                     key={k.api_key_id}
@@ -401,6 +407,9 @@ export default function StatsPage() {
                     </td>
                     <td className="px-4 py-2.5 text-right">{fmt(k.total_output_tokens)}</td>
                     <td className="px-4 py-2.5 text-right text-xs text-slate-500 whitespace-nowrap">{formatLogTime(k.last_used_at)}</td>
+                    <td className="px-4 py-2.5 text-right tabular-nums" title={price.title}>
+                      {price.text}
+                    </td>
                   </tr>
                 );
               })}
@@ -455,11 +464,12 @@ export default function StatsPage() {
                 >
                   {isZh ? "输出 TPS" : "Output TPS"}
                 </th>
+                {priceHeader}
               </tr>
             </thead>
             <tbody>
               {modelStats.length === 0 && (
-                <tr><td className="px-4 py-6 text-center text-slate-400" colSpan={8}>{isZh ? "暂无数据" : "No data"}</td></tr>
+                <tr><td className="px-4 py-6 text-center text-slate-400" colSpan={9}>{isZh ? "暂无数据" : "No data"}</td></tr>
               )}
               {modelStats.slice(0, 10).map((m) => {
                 // 同上:input_tokens 已含 cache_read_tokens,直接相除。
@@ -467,6 +477,7 @@ export default function StatsPage() {
                   ? Math.round((m.total_cache_read_tokens / m.total_input_tokens) * 100)
                   : 0;
                 const tps = computeAggregateTps(m);
+                const price = equivalentCostDisplay(m.equivalent_costs, m.unpriced_request_count, isZh, locale);
                 const clickable = m.model.length > 0;
                 return (
                   <tr
@@ -500,6 +511,9 @@ export default function StatsPage() {
                       title={tpsAggregateStatusTitle(m, isZh)}
                     >
                       {formatTps(tps)}
+                    </td>
+                    <td className="px-4 py-2.5 text-right tabular-nums" title={price.title}>
+                      {price.text}
                     </td>
                   </tr>
                 );

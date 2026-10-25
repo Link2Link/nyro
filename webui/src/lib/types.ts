@@ -299,6 +299,9 @@ export interface ModelStats extends TpsSampleSums {
   total_cache_read_tokens: number;
   avg_duration_ms: number;
   total_upstream_ms: number;
+  /** Missing on older servers. */
+  equivalent_costs?: EquivalentCostTotal[];
+  unpriced_request_count?: number;
 }
 
 export interface ModelUsageStats {
@@ -408,6 +411,9 @@ export interface ApiKeyStats {
   total_output_tokens: number;
   cache_read_tokens: number;
   last_used_at: number;
+  /** Missing on older servers. */
+  equivalent_costs?: EquivalentCostTotal[];
+  unpriced_request_count?: number;
 }
 
 export interface ApiKeyModelRouteStats extends TpsSampleSums {

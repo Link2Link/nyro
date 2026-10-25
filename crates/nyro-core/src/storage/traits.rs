@@ -294,6 +294,15 @@ pub trait LogStore: Send + Sync {
         start_at: Option<i64>,
         end_at: Option<i64>,
     ) -> anyhow::Result<Vec<ApiKeyStats>>;
+    /// Usage grouped by API key, provider ID and upstream model for pricing.
+    /// Same key filter as `stats_by_api_key_range`; like `token_usage_days`, rows
+    /// with no provider are excluded (pre-routing rejections carry no usage).
+    /// Inclusive `created_at` range in epoch ms; a `None` bound is open.
+    async fn api_key_token_usage(
+        &self,
+        start_at: Option<i64>,
+        end_at: Option<i64>,
+    ) -> anyhow::Result<Vec<crate::db::models::ApiKeyTokenUsage>>;
     async fn api_key_usage_detail(
         &self,
         api_key_id: &str,
