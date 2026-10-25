@@ -21,7 +21,15 @@ pub struct ProviderKeyProbeStatus {
     pub tested_at: String,
 }
 
-/// Per-model result of the "send hi" probe over a provider's model list.
+/// Default user message of the HTTP-protocol model probe.
+pub const DEFAULT_MODEL_PROBE_PROMPT: &str = "hi";
+
+/// Upper bound (in characters) of a caller-supplied probe message. The probe
+/// is a connectivity check, not a chat surface; this keeps it cheap.
+pub const MAX_MODEL_PROBE_PROMPT_CHARS: usize = 4000;
+
+/// Per-model result of the model probe (default message "hi") over a
+/// provider's model list.
 #[derive(Debug, Clone, Serialize)]
 pub struct ProviderModelProbeResult {
     pub model: String,
@@ -31,7 +39,7 @@ pub struct ProviderModelProbeResult {
     /// Canonical protocol endpoint id used for the probe (e.g.
     /// `openai-compatible/chat-completions/v1`); empty on local routing failure.
     pub protocol: String,
-    /// Assistant text received for the "hi" probe (success only).
+    /// Assistant text received for the probe message (success only).
     /// The value "[completed]" means the upstream completed without displayable text.
     pub reply: Option<String>,
     /// Remaining quota fraction (0.0–1.0) reported by the subscription
@@ -57,6 +65,26 @@ pub struct ProviderModelProbeOutcome {
     pub results: Vec<ProviderModelProbeResult>,
 }
 
+/// Normalize a caller-supplied probe message: surrounding whitespace is
+/// trimmed and a blank message means "use the built-in default". Oversized
+/// messages are rejected instead of being silently truncated.
+pub fn normalize_probe_prompt(prompt: Option<String>) -> anyhow::Result<Option<String>> {
+    let Some(prompt) = prompt else {
+        return Ok(None);
+    };
+    let trimmed = prompt.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    let chars = trimmed.chars().count();
+    if chars > MAX_MODEL_PROBE_PROMPT_CHARS {
+        anyhow::bail!(
+            "probe prompt is too long ({chars} characters, max {MAX_MODEL_PROBE_PROMPT_CHARS})"
+        );
+    }
+    Ok(Some(trimmed.to_string()))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_model_probe_request(
     suite: crate::protocol::ids::Protocol,
@@ -65,6 +93,7 @@ fn build_model_probe_request(
     auth_scheme: &str,
     runtime_headers: &HeaderMap,
     model: &str,
+    prompt: &str,
     fast_mode: bool,
     channel: Option<&str>,
     is_codex_oauth: bool,
@@ -83,7 +112,7 @@ fn build_model_probe_request(
             "/v1/chat/completions",
             serde_json::json!({
                 "model": model,
-                "messages": [{"role": "user", "content": "hi"}],
+                "messages": [{"role": "user", "content": prompt}],
                 "max_tokens": 1024,
                 "stream": false,
             }),
@@ -97,7 +126,7 @@ fn build_model_probe_request(
                     "model": model,
                     "input": [{
                         "role": "user",
-                        "content": [{"type": "input_text", "text": "hi"}],
+                        "content": [{"type": "input_text", "text": prompt}],
                     }],
                     "instructions": "You are a helpful assistant.",
                     "store": false,
@@ -106,7 +135,7 @@ fn build_model_probe_request(
             } else {
                 serde_json::json!({
                     "model": model,
-                    "input": "hi",
+                    "input": prompt,
                     "max_output_tokens": 1024,
                     "stream": false,
                 })
@@ -116,7 +145,7 @@ fn build_model_probe_request(
             "/v1/messages",
             serde_json::json!({
                 "model": model,
-                "messages": [{"role": "user", "content": "hi"}],
+                "messages": [{"role": "user", "content": prompt}],
                 "max_tokens": 1024,
             }),
         ),
@@ -129,6 +158,7 @@ fn build_model_probe_request(
                 api_key,
                 runtime_headers,
                 model,
+                prompt,
                 channel,
                 antigravity_project,
             );
@@ -181,7 +211,7 @@ fn build_model_probe_request(
     Ok((url, headers, body))
 }
 
-/// Build a minimal "hi" probe for a google-gemini provider.
+/// Build a minimal probe (default message "hi") for a google-gemini provider.
 ///
 /// Both shapes stream (`streamGenerateContent?alt=sse`) and let the SSE
 /// reply extractor aggregate — mirroring sub2api's account test service,
@@ -199,6 +229,7 @@ fn build_gemini_model_probe_request(
     api_key: &str,
     runtime_headers: &HeaderMap,
     model: &str,
+    prompt: &str,
     channel: Option<&str>,
     antigravity_project: Option<&str>,
 ) -> anyhow::Result<(String, HeaderMap, Value)> {
@@ -209,7 +240,7 @@ fn build_gemini_model_probe_request(
     // sub2api's account-test payload: user turn + system instruction, no
     // generationConfig (the internal surface rejects surprises).
     let inner_body = serde_json::json!({
-        "contents": [{"role": "user", "parts": [{"text": "hi"}]}],
+        "contents": [{"role": "user", "parts": [{"text": prompt}]}],
         "systemInstruction": {"parts": [{"text": "You are a helpful AI assistant."}]},
     });
 
@@ -244,7 +275,7 @@ re-login the provider to re-run onboarding"
     Ok((url, headers, inner_body))
 }
 
-/// Probe one model with a minimal "hi" request (30s timeout).
+/// Probe one model with a single minimal request carrying `prompt` (30s timeout).
 #[allow(clippy::too_many_arguments)]
 async fn probe_single_model(
     client: reqwest::Client,
@@ -254,6 +285,7 @@ async fn probe_single_model(
     auth_scheme: &str,
     runtime_headers: &HeaderMap,
     model: &str,
+    prompt: &str,
     protocol_id: &str,
     fast_mode: bool,
     channel: Option<&str>,
@@ -270,6 +302,7 @@ async fn probe_single_model(
             auth_scheme,
             runtime_headers,
             model,
+            prompt,
             fast_mode,
             channel,
             is_codex_oauth,
@@ -1409,6 +1442,7 @@ mod probe_routing_tests {
             "bearer",
             &runtime_headers,
             "kimi-k3",
+            DEFAULT_MODEL_PROBE_PROMPT,
             false,
             None,
             false,
@@ -1457,6 +1491,69 @@ mod probe_selection_tests {
         .unwrap()
         .unwrap();
         assert_eq!(selection, vec!["b", "a", "c"]);
+    }
+
+    #[test]
+    fn absent_or_blank_prompt_keeps_the_builtin_default() {
+        assert_eq!(normalize_probe_prompt(None).unwrap(), None);
+        assert_eq!(normalize_probe_prompt(Some("".into())).unwrap(), None);
+        assert_eq!(normalize_probe_prompt(Some(" \n\t ".into())).unwrap(), None);
+    }
+
+    #[test]
+    fn prompt_is_trimmed_and_length_is_bounded_in_characters() {
+        assert_eq!(
+            normalize_probe_prompt(Some("  1+1=?\n".into())).unwrap(),
+            Some("1+1=?".to_string())
+        );
+        // Multi-byte text counts characters, not bytes.
+        let at_limit = "你".repeat(MAX_MODEL_PROBE_PROMPT_CHARS);
+        assert_eq!(
+            normalize_probe_prompt(Some(at_limit.clone())).unwrap(),
+            Some(at_limit)
+        );
+        let over = "a".repeat(MAX_MODEL_PROBE_PROMPT_CHARS + 1);
+        assert!(normalize_probe_prompt(Some(over)).is_err());
+    }
+
+    #[test]
+    fn custom_prompt_lands_in_every_protocol_body() {
+        use crate::protocol::ids::Protocol;
+        let prompt = "What model are you?";
+        let build = |suite, is_codex_oauth| {
+            build_model_probe_request(
+                suite,
+                "https://example.com/v1",
+                "sk-test",
+                "bearer",
+                &HeaderMap::new(),
+                "m",
+                prompt,
+                false,
+                None,
+                is_codex_oauth,
+                None,
+            )
+            .unwrap()
+            .2
+        };
+        assert_eq!(
+            build(Protocol::OpenAICompatible, false)["messages"][0]["content"],
+            prompt
+        );
+        assert_eq!(
+            build(Protocol::AnthropicMessages, false)["messages"][0]["content"],
+            prompt
+        );
+        assert_eq!(build(Protocol::OpenAIResponses, false)["input"], prompt);
+        assert_eq!(
+            build(Protocol::OpenAIResponses, true)["input"][0]["content"][0]["text"],
+            prompt
+        );
+        assert_eq!(
+            build(Protocol::GoogleGemini, false)["contents"][0]["parts"][0]["text"],
+            prompt
+        );
     }
 }
 
@@ -2480,22 +2577,40 @@ impl AdminService {
     }
 
     /// Send a minimal "hi" chat request to each selected model and report
-    /// which ones actually answer. The WebUI uses the results to hide
-    /// non-callable models from route target pickers.
+    /// which ones actually answer. Same as
+    /// [`Self::probe_provider_models_with_prompt`] with the default message.
+    pub async fn probe_provider_models(
+        &self,
+        id: &str,
+        models: Option<Vec<String>>,
+    ) -> anyhow::Result<ProviderModelProbeOutcome> {
+        self.probe_provider_models_with_prompt(id, models, None)
+            .await
+    }
+
+    /// Send a minimal chat request to each selected model and report which
+    /// ones actually answer. The WebUI uses the results to hide non-callable
+    /// models from route target pickers.
     ///
     /// `models: None` probes every model in the provider's discovered list;
     /// `models: Some(list)` probes exactly the named models (after
     /// normalization) — including names outside the discovered catalog. OpenCode
     /// Go validates every name against its strict routing catalog; other providers
     /// resolve against the default probe endpoint.
-    pub async fn probe_provider_models(
+    ///
+    /// `prompt` replaces the user message of every probe request; `None` (or a
+    /// blank message) keeps each transport's built-in default ("hi" for the
+    /// HTTP protocols, "Reply with OK." for Devin/Kiro).
+    pub async fn probe_provider_models_with_prompt(
         &self,
         id: &str,
         models: Option<Vec<String>>,
+        prompt: Option<String>,
     ) -> anyhow::Result<ProviderModelProbeOutcome> {
         use futures::StreamExt;
 
         let selection = normalize_probe_selection(models)?;
+        let prompt = normalize_probe_prompt(prompt)?;
         let provider = self.get_provider(id).await?;
         validate_admin_provider(&provider)?;
         let models = match selection {
@@ -2510,11 +2625,19 @@ impl AdminService {
         };
 
         if crate::provider::devin::is_devin(&provider) {
-            return self.probe_devin_models(&provider, models).await;
+            return self
+                .probe_devin_models(&provider, models, prompt.as_deref())
+                .await;
         }
         if crate::provider::kiro::is_kiro(&provider) {
-            return self.probe_kiro_models(&provider, models).await;
+            return self
+                .probe_kiro_models(&provider, models, prompt.as_deref())
+                .await;
         }
+        let prompt: std::sync::Arc<str> = prompt
+            .as_deref()
+            .unwrap_or(DEFAULT_MODEL_PROBE_PROMPT)
+            .into();
 
         // Pick the probe endpoint: adaptive providers probe through the
         // endpoint matching their configured default protocol
@@ -2687,6 +2810,7 @@ impl AdminService {
             );
             let channel = channel.clone();
             let antigravity_project = antigravity_project.clone();
+            let prompt = prompt.clone();
             let target = resolve_probe_target(
                 &provider,
                 &model,
@@ -2725,6 +2849,7 @@ impl AdminService {
                     &target.auth_scheme,
                     &runtime_headers,
                     &model,
+                    &prompt,
                     &target.protocol_id,
                     fast_mode,
                     channel.as_deref(),
@@ -2764,6 +2889,7 @@ impl AdminService {
         &self,
         provider: &Provider,
         models: Vec<String>,
+        prompt: Option<&str>,
     ) -> anyhow::Result<ProviderModelProbeOutcome> {
         anyhow::ensure!(
             models.len() <= 16,
@@ -2806,7 +2932,8 @@ impl AdminService {
             let start = Instant::now();
             let outcome = match (&legacy_credential, pool_config.as_ref()) {
                 (Some(credential), _) => {
-                    crate::provider::devin::probe(&self.gw, provider, credential, &model).await
+                    crate::provider::devin::probe(&self.gw, provider, credential, &model, prompt)
+                        .await
                 }
                 (None, Some(config)) => {
                     let ordered = self.gw.account_pool.ordered(
@@ -2826,8 +2953,14 @@ impl AdminService {
                             let credential = runtime.credential.ok_or_else(|| {
                                 anyhow::anyhow!("Devin OAuth credential is missing")
                             })?;
-                            crate::provider::devin::probe(&self.gw, provider, &credential, &model)
-                                .await
+                            crate::provider::devin::probe(
+                                &self.gw,
+                                provider,
+                                &credential,
+                                &model,
+                                prompt,
+                            )
+                            .await
                         }
                         .await;
                         let done = attempt.is_ok();
@@ -2868,6 +3001,7 @@ impl AdminService {
         &self,
         provider: &Provider,
         models: Vec<String>,
+        prompt: Option<&str>,
     ) -> anyhow::Result<ProviderModelProbeOutcome> {
         anyhow::ensure!(
             models.len() <= 16,
@@ -2892,6 +3026,7 @@ impl AdminService {
                         .as_ref()
                         .context("Kiro OAuth credential is missing")?,
                     &model,
+                    prompt,
                 )
                 .await
             } else {
@@ -2929,7 +3064,8 @@ impl AdminService {
                             .credential
                             .as_ref()
                             .context("Kiro OAuth credential is missing")?;
-                        crate::provider::kiro::probe(&self.gw, provider, credential, &model).await
+                        crate::provider::kiro::probe(&self.gw, provider, credential, &model, prompt)
+                            .await
                     }
                     .await;
                     let done = attempt.is_ok();
@@ -3633,6 +3769,7 @@ mod probe_reply_tests {
             "ya29.probe",
             &runtime_headers,
             "gemini-2.5-pro",
+            DEFAULT_MODEL_PROBE_PROMPT,
             Some("antigravity"),
             Some("cloudaicompanion-9"),
         )
@@ -3655,6 +3792,7 @@ mod probe_reply_tests {
             "ya29.probe",
             &HeaderMap::new(),
             "gemini-2.5-pro",
+            DEFAULT_MODEL_PROBE_PROMPT,
             Some("antigravity"),
             None,
         )
@@ -3669,6 +3807,7 @@ mod probe_reply_tests {
             "gem-key",
             &HeaderMap::new(),
             "gemini-2.5-flash",
+            DEFAULT_MODEL_PROBE_PROMPT,
             Some("default"),
             None,
         )
@@ -4001,6 +4140,7 @@ mod probe_reply_tests {
             "none",
             &runtime_headers,
             "gpt-5-codex",
+            DEFAULT_MODEL_PROBE_PROMPT,
             true,
             Some("codex"),
             true,
@@ -4067,6 +4207,7 @@ mod probe_reply_tests {
             "bearer",
             &HeaderMap::new(),
             "gpt-test",
+            DEFAULT_MODEL_PROBE_PROMPT,
             true,
             Some("sub2api"),
             false,
@@ -4103,6 +4244,7 @@ mod probe_reply_tests {
                 "bearer",
                 &HeaderMap::new(),
                 "gpt-test",
+                DEFAULT_MODEL_PROBE_PROMPT,
                 fast_mode,
                 channel,
                 false,
@@ -4130,6 +4272,7 @@ mod probe_reply_tests {
             "bearer",
             &runtime_headers,
             "gpt-test",
+            DEFAULT_MODEL_PROBE_PROMPT,
             false,
             None,
             false,

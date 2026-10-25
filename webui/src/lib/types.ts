@@ -678,7 +678,7 @@ export interface ProviderChannelPreset {
   authSchemes?: Record<string, string>;
 }
 
-/** Per-model result of the "send hi" probe over a provider's model list. */
+/** Per-model result of the model probe (default message "hi") over a provider's model list. */
 export interface ModelProbeResult {
   model: string;
   success: boolean;
@@ -686,7 +686,7 @@ export interface ModelProbeResult {
   latency_ms: number;
   /** Canonical protocol endpoint id used for the probe. */
   protocol: string;
-  /** Assistant text received for the "hi" probe (success only). */
+  /** Assistant text received for the probe message (success only). */
   reply?: string | null;
   /** Remaining quota fraction (0-1) reported by the subscription catalog, when available. */
   quota_remaining?: number | null;

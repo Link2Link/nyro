@@ -351,18 +351,29 @@ struct ProbeModelsRequest {
     /// Explicit probe selection; absent/null keeps the legacy full run.
     #[serde(default)]
     models: Option<Vec<String>>,
+    /// Custom probe message; absent/null/blank keeps the built-in default.
+    #[serde(default)]
+    prompt: Option<String>,
 }
 
-/// Parse the optional probe-selection body. An empty body keeps the legacy
-/// "probe every model" behavior; a body that is present must parse and hold
-/// up under normalization — garbage input never falls back to a full run.
-fn parse_probe_selection(body: &Bytes) -> Result<Option<Vec<String>>, String> {
+/// Normalized probe-models request: (model selection, custom message).
+type ProbeModelsInput = (Option<Vec<String>>, Option<String>);
+
+/// Parse the optional probe body. An empty body keeps the legacy "probe every
+/// model with the default message" behavior; a body that is present must
+/// parse and hold up under normalization — garbage input never falls back to
+/// a full run.
+fn parse_probe_request(body: &Bytes) -> Result<ProbeModelsInput, String> {
     if body.iter().all(|byte| byte.is_ascii_whitespace()) {
-        return Ok(None);
+        return Ok((None, None));
     }
     let request: ProbeModelsRequest =
         serde_json::from_slice(body).map_err(|e| format!("invalid JSON body: {e}"))?;
-    nyro_core::admin::normalize_probe_selection(request.models).map_err(|e| e.to_string())
+    let selection =
+        nyro_core::admin::normalize_probe_selection(request.models).map_err(|e| e.to_string())?;
+    let prompt =
+        nyro_core::admin::normalize_probe_prompt(request.prompt).map_err(|e| e.to_string())?;
+    Ok((selection, prompt))
 }
 
 async fn probe_provider_keys_handler(
@@ -380,8 +391,8 @@ async fn probe_provider_models_handler(
     Path(id): Path<String>,
     body: Bytes,
 ) -> impl IntoResponse {
-    let selection = match parse_probe_selection(&body) {
-        Ok(selection) => selection,
+    let (selection, prompt) = match parse_probe_request(&body) {
+        Ok(request) => request,
         Err(message) => {
             return (
                 StatusCode::BAD_REQUEST,
@@ -390,7 +401,11 @@ async fn probe_provider_models_handler(
                 .into_response();
         }
     };
-    match gw.admin().probe_provider_models(&id, selection).await {
+    match gw
+        .admin()
+        .probe_provider_models_with_prompt(&id, selection, prompt)
+        .await
+    {
         Ok(v) => Json(serde_json::json!({ "data": v })).into_response(),
         Err(e) => err(e),
     }
@@ -1585,6 +1600,31 @@ mod tests {
             status_of("missing chatgpt_account_id for codex usage query"),
             StatusCode::BAD_GATEWAY
         );
+    }
+
+    #[test]
+    fn probe_request_body_carries_optional_selection_and_prompt() {
+        let parse = |raw: &str| parse_probe_request(&Bytes::from(raw.to_string()));
+        assert_eq!(parse("").unwrap(), (None, None));
+        assert_eq!(parse("  \n").unwrap(), (None, None));
+        assert_eq!(parse("{}").unwrap(), (None, None));
+        assert_eq!(
+            parse(r#"{"models":["m1"," m1 ","m2"]}"#).unwrap(),
+            (Some(vec!["m1".to_string(), "m2".to_string()]), None)
+        );
+        assert_eq!(
+            parse(r#"{"models":["m1"],"prompt":"  Say OK  "}"#).unwrap(),
+            (Some(vec!["m1".to_string()]), Some("Say OK".to_string()))
+        );
+        // A blank prompt falls back to the default; only models are validated.
+        assert_eq!(parse(r#"{"prompt":"   "}"#).unwrap(), (None, None));
+        assert!(parse(r#"{"models":[]}"#).is_err());
+        assert!(parse("not json").is_err());
+        let too_long = format!(
+            r#"{{"prompt":"{}"}}"#,
+            "a".repeat(nyro_core::admin::MAX_MODEL_PROBE_PROMPT_CHARS + 1)
+        );
+        assert!(parse(&too_long).unwrap_err().contains("too long"));
     }
 
     #[test]

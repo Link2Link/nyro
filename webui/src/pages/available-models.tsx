@@ -33,7 +33,7 @@ import {
   saveModelProbeResults,
   type ProviderModelProbeStore,
 } from "@/lib/model-probe";
-import { saveProbeSelection } from "@/lib/model-probe-selection";
+import { saveProbePrompt, saveProbeSelection } from "@/lib/model-probe-selection";
 import { ModelProbePicker } from "@/components/model-probe-picker";
 import type {
   Model as ModelMapping,
@@ -691,7 +691,7 @@ export default function AvailableModelsPage() {
     )));
   }
 
-  async function runProbe(provider: Provider, models: string[]) {
+  async function runProbe(provider: Provider, models: string[], prompt: string) {
     setProbingId(provider.id);
     setProbeErrors((current) => {
       const next = { ...current };
@@ -703,6 +703,8 @@ export default function AvailableModelsPage() {
       const outcome = await backend<ModelProbeOutcome>("probe_provider_models", {
         id: provider.id,
         models,
+        // Blank keeps the server's built-in probe message.
+        ...(prompt ? { prompt } : {}),
       });
       setProbeStore((current) => {
         // Merge per model (newest run wins): a subset run must not wipe the
@@ -870,12 +872,13 @@ export default function AvailableModelsPage() {
           isZh={isZh}
           lastResults={probePickerTarget ? probeStore[probePickerTarget.id]?.results : undefined}
           onCancel={() => setProbePickerTarget(null)}
-          onConfirm={(models) => {
+          onConfirm={(models, prompt) => {
             const target = probePickerTarget;
             setProbePickerTarget(null);
             if (!target) return;
             saveProbeSelection(target.id, models);
-            void runProbe(target, models);
+            saveProbePrompt(prompt);
+            void runProbe(target, models, prompt);
           }}
         />
         {editingRating && (

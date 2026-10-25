@@ -35,7 +35,7 @@ import {
   saveModelProbeResults,
   type ProviderModelProbeRecord,
 } from "@/lib/model-probe";
-import { saveProbeSelection } from "@/lib/model-probe-selection";
+import { probePromptLabel, saveProbePrompt, saveProbeSelection } from "@/lib/model-probe-selection";
 import { ModelProbePicker } from "@/components/model-probe-picker";
 import {
   Server,
@@ -1458,7 +1458,7 @@ export default function ProvidersPage() {
     }
   }
 
-  async function runModelProbe(provider: Provider, models: string[]) {
+  async function runModelProbe(provider: Provider, models: string[], prompt: string) {
     const runId = activeTestRunRef.current + 1;
     activeTestRunRef.current = runId;
     const isCanceled = () => activeTestRunRef.current !== runId;
@@ -1480,11 +1480,12 @@ export default function ProvidersPage() {
     };
 
     try {
+      const promptLabel = probePromptLabel(prompt);
       appendTestLog(
         "info",
         isZh
-          ? `开始模型测试 ${provider.name}（向 ${models.length} 个模型发送 "hi"）...`
-          : `Start model probing ${provider.name} (sending "hi" to ${models.length} models)...`,
+          ? `开始模型测试 ${provider.name}（向 ${models.length} 个模型发送 "${promptLabel}"）...`
+          : `Start model probing ${provider.name} (sending "${promptLabel}" to ${models.length} models)...`,
       );
       appendTestLog(
         "info",
@@ -1494,6 +1495,8 @@ export default function ProvidersPage() {
       const outcome = await backend<ModelProbeOutcome>("probe_provider_models", {
         id: provider.id,
         models,
+        // Blank keeps the server's built-in probe message.
+        ...(prompt ? { prompt } : {}),
       });
       const results = outcome.results;
       // Persist first and unconditionally: closing the dialog stops the log
@@ -4149,12 +4152,13 @@ export default function ProvidersPage() {
         isZh={isZh}
         lastResults={probePickerTarget ? modelProbeResults[probePickerTarget.id]?.results : undefined}
         onCancel={() => setProbePickerTarget(null)}
-        onConfirm={(models) => {
+        onConfirm={(models, prompt) => {
           const target = probePickerTarget;
           setProbePickerTarget(null);
           if (!target) return;
           saveProbeSelection(target.id, models);
-          void runModelProbe(target, models);
+          saveProbePrompt(prompt);
+          void runModelProbe(target, models, prompt);
         }}
       />
 

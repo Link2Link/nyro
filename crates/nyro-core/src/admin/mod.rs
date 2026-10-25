@@ -64,8 +64,9 @@ pub use model_performance::{ModelPerformanceItem, ModelPerformanceResponse};
 pub use model_ratings::{MAX_RATING_PREFIX_BYTES, ModelRatingError, SetModelRating};
 pub use observability::{INVALID_RANGE_PREFIX, RequestLogAttempts, StatsRange};
 pub use providers::{
-    ProviderKeyProbeStatus, ProviderModelProbeMeta, ProviderModelProbeOutcome,
-    ProviderModelProbeResult, normalize_probe_selection,
+    DEFAULT_MODEL_PROBE_PROMPT, MAX_MODEL_PROBE_PROMPT_CHARS, ProviderKeyProbeStatus,
+    ProviderModelProbeMeta, ProviderModelProbeOutcome, ProviderModelProbeResult,
+    normalize_probe_prompt, normalize_probe_selection,
 };
 pub use usage::{
     ProviderUsage, ProviderUsageBalance, ProviderUsageListItem, ProviderUsageQueryStatus,

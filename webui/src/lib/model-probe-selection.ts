@@ -7,6 +7,45 @@
  */
 
 const MODEL_PROBE_SELECTION_STORAGE_KEY = "nyro.providerModelProbeSelection.v1";
+const MODEL_PROBE_PROMPT_STORAGE_KEY = "nyro.providerModelProbePrompt.v1";
+
+/** Built-in probe message used when the prompt box is left blank. */
+export const DEFAULT_MODEL_PROBE_PROMPT = "hi";
+
+/** Mirrors the server-side cap (`MAX_MODEL_PROBE_PROMPT_CHARS`). */
+export const MAX_MODEL_PROBE_PROMPT_CHARS = 4000;
+
+/** Trim the custom probe message; blank means "use the built-in default". */
+export function normalizeProbePrompt(prompt: string): string {
+  return prompt.trim();
+}
+
+/** Short single-line label of the message a probe run sends, for logs. */
+export function probePromptLabel(prompt: string, max = 60): string {
+  const flat = normalizeProbePrompt(prompt).replace(/\s+/g, " ") || DEFAULT_MODEL_PROBE_PROMPT;
+  return flat.length > max ? `${flat.slice(0, max)}…` : flat;
+}
+
+/** The custom probe message is shared by every provider (last one used). */
+export function loadProbePrompt(): string {
+  if (typeof window === "undefined") return "";
+  try {
+    return window.localStorage.getItem(MODEL_PROBE_PROMPT_STORAGE_KEY) ?? "";
+  } catch {
+    return "";
+  }
+}
+
+export function saveProbePrompt(prompt: string): void {
+  if (typeof window === "undefined") return;
+  try {
+    const value = normalizeProbePrompt(prompt);
+    if (value) window.localStorage.setItem(MODEL_PROBE_PROMPT_STORAGE_KEY, value);
+    else window.localStorage.removeItem(MODEL_PROBE_PROMPT_STORAGE_KEY);
+  } catch {
+    // Ignore storage errors; the picker just falls back to the default.
+  }
+}
 
 /** Trim, drop empty entries and exact duplicates; keep first-seen order. */
 export function normalizeModelList(names: readonly string[]): string[] {

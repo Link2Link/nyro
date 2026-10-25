@@ -15,7 +15,11 @@ import { backend } from "@/lib/backend";
 import type { StoredModelProbeResult } from "@/lib/model-probe";
 import {
   buildProbeSelection,
+  DEFAULT_MODEL_PROBE_PROMPT,
+  loadProbePrompt,
   loadProbeSelection,
+  MAX_MODEL_PROBE_PROMPT_CHARS,
+  normalizeProbePrompt,
   partitionSavedSelection,
 } from "@/lib/model-probe-selection";
 
@@ -28,8 +32,11 @@ interface ModelProbePickerProps {
   isZh: boolean;
   /** Latest persisted probe results — rendered as status badges only. */
   lastResults?: StoredModelProbeResult[];
-  /** Receives a non-empty, normalized selection when the user confirms. */
-  onConfirm: (models: string[]) => void;
+  /**
+   * Receives a non-empty, normalized selection and the trimmed probe message
+   * (empty = built-in default) when the user confirms.
+   */
+  onConfirm: (models: string[], prompt: string) => void;
   onCancel: () => void;
 }
 
@@ -87,6 +94,8 @@ function ModelProbePickerBody({
   const [checked, setChecked] = useState<Set<string>>(new Set());
   const [extrasText, setExtrasText] = useState("");
   const [search, setSearch] = useState("");
+  // Remembered across providers; blank keeps the built-in "hi".
+  const [promptText, setPromptText] = useState(loadProbePrompt);
 
   useEffect(() => {
     let stale = false;
@@ -169,12 +178,29 @@ function ModelProbePickerBody({
         </DialogTitle>
         <DialogDescription>
           {isZh
-            ? "仅向选中的模型发送 \"hi\"，未选中的模型不会被访问。"
-            : "Sends \"hi\" only to the selected models; unselected models are never touched."}
+            ? "仅向选中的模型发送测试消息，未选中的模型不会被访问。"
+            : "Sends the test message only to the selected models; unselected models are never touched."}
         </DialogDescription>
       </DialogHeader>
 
       <div className="space-y-3">
+        <div className="space-y-1">
+          <label htmlFor="model-probe-prompt" className="text-xs text-slate-500">
+            {isZh
+              ? `测试消息（留空则使用默认的 "${DEFAULT_MODEL_PROBE_PROMPT}"）`
+              : `Test message (leave blank for the default "${DEFAULT_MODEL_PROBE_PROMPT}")`}
+          </label>
+          <textarea
+            id="model-probe-prompt"
+            value={promptText}
+            onChange={(event) => setPromptText(event.target.value)}
+            rows={2}
+            maxLength={MAX_MODEL_PROBE_PROMPT_CHARS}
+            className="w-full rounded-md border border-slate-200 px-3 py-2 text-xs"
+            placeholder={DEFAULT_MODEL_PROBE_PROMPT}
+          />
+        </div>
+
         <div className="flex items-center gap-2">
           <Input
             value={search}
@@ -255,7 +281,7 @@ function ModelProbePickerBody({
         </Button>
         <Button
           type="button"
-          onClick={() => onConfirm(selection)}
+          onClick={() => onConfirm(selection, normalizeProbePrompt(promptText))}
           disabled={count === 0}
           variant={warnLarge ? "outline" : "default"}
           className={

@@ -581,11 +581,13 @@ pub(crate) async fn check_connection(
 }
 
 /// Explicit per-model probe: one tiny generation through the real transport.
+/// `prompt: None` sends the built-in "Reply with OK." message.
 pub(crate) async fn probe(
     gw: &Gateway,
     provider: &Provider,
     credential: &StoredCredential,
     model: &str,
+    prompt: Option<&str>,
 ) -> anyhow::Result<String> {
     use crate::protocol::ir::request::{Message as ChatMessage, MessageContent, Role};
     super::validate(provider)?;
@@ -594,7 +596,7 @@ pub(crate) async fn probe(
         model,
         vec![ChatMessage {
             role: Role::User,
-            content: MessageContent::Text("Reply with OK.".into()),
+            content: MessageContent::Text(prompt.unwrap_or("Reply with OK.").into()),
             tool_calls: None,
             tool_call_id: None,
             meta: None,

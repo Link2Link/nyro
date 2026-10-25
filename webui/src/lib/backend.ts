@@ -162,14 +162,19 @@ function resolveHTTP(cmd: string, args?: Record<string, unknown>): HTTPMapping {
       return { method: "GET", url: `${base}/providers/${args?.id}/test-models` };
     case "probe_provider_keys":
       return { method: "POST", url: `${base}/providers/${args?.id}/probe-keys` };
-    case "probe_provider_models":
+    case "probe_provider_models": {
+      // Omit the body entirely for legacy full runs; an explicit empty list
+      // is rejected server-side, so only send real selections. A blank or
+      // absent prompt keeps the server's built-in probe message.
+      const body: Record<string, unknown> = {};
+      if (Array.isArray(args?.models)) body.models = args.models;
+      if (typeof args?.prompt === "string" && args.prompt.trim()) body.prompt = args.prompt;
       return {
         method: "POST",
         url: `${base}/providers/${args?.id}/probe-models`,
-        // Omit the body entirely for legacy full runs; an explicit empty list
-        // is rejected server-side, so only send real selections.
-        ...(Array.isArray(args?.models) ? { body: { models: args.models } } : {}),
+        ...(Object.keys(body).length > 0 ? { body } : {}),
       };
+    }
     case "get_provider_models":
       return { method: "GET", url: `${base}/providers/${args?.id}/models${args?.requireCatalog === true ? "?require_catalog=true" : ""}` };
     case "get_model_performance": {

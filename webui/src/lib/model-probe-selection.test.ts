@@ -2,8 +2,11 @@ import { deepEqual, equal, ok } from "node:assert/strict";
 import { test } from "node:test";
 import {
   buildProbeSelection,
+  DEFAULT_MODEL_PROBE_PROMPT,
   normalizeModelList,
+  normalizeProbePrompt,
   partitionSavedSelection,
+  probePromptLabel,
   splitExtraModels,
 } from "./model-probe-selection";
 import { mergeProbeResults, type ProviderModelProbeRecord } from "./model-probe";
@@ -45,6 +48,14 @@ test("every remembered name lands in the extras box when the catalog is unavaila
 test("probe selection is the checked ∪ extras union, deduped", () => {
   deepEqual(buildProbeSelection(["m1", "m2"], "m2\nghost, m1"), ["m1", "m2", "ghost"]);
   equal(buildProbeSelection([], " \n , ").length, 0);
+});
+
+test("probe prompt is trimmed; blank means the built-in default", () => {
+  equal(normalizeProbePrompt("  1+1=?\n"), "1+1=?");
+  equal(normalizeProbePrompt(" \n\t "), "");
+  equal(probePromptLabel(""), DEFAULT_MODEL_PROBE_PROMPT);
+  equal(probePromptLabel("line one\n  line two"), "line one line two");
+  equal(probePromptLabel("x".repeat(70), 60), `${"x".repeat(60)}…`);
 });
 
 test("a run only overwrites the models it reported", () => {
