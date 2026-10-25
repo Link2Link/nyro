@@ -330,6 +330,15 @@ impl LogStore for MemoryStorage {
         Ok(vec![])
     }
 
+    async fn token_usage_rollup_days(
+        &self,
+        _start_at: i64,
+        _end_at: i64,
+    ) -> anyhow::Result<Vec<crate::db::models::TokenUsageDay>> {
+        // No logs are ever stored, so none are ever folded.
+        Ok(vec![])
+    }
+
     async fn account_token_usage(
         &self,
         _provider_id: &str,

@@ -28,10 +28,10 @@ use crate::logging::diagnostics::{error_sql, outcome_sql};
 use crate::storage::sql::config::SqlBackendConfig;
 use crate::storage::sql::pool::RelationalPool;
 use crate::storage::traits::{
-    ApiKeyAccessRecord, ApiKeyStore, AuthAccessStore, LogStore, ModelBackendStore,
+    ApiKeyAccessRecord, ApiKeyStore, AuthAccessStore, LogStore, MILLIS_PER_DAY, ModelBackendStore,
     ModelSnapshotStore, ModelStore, OAuthCredentialStore, ProviderEndpointTestResult,
     ProviderStore, ProviderTestResult, SettingsStore, Storage, StorageBackend, StorageBootstrap,
-    StorageHealth, UsageWindow,
+    StorageHealth, TOKEN_USAGE_DAILY_HEALTH_SQL, UsageWindow,
 };
 
 #[derive(Clone)]
@@ -84,6 +84,7 @@ impl MysqlAdapter {
                     .unwrap_or(false)
                 && sqlx::query("SELECT performance_metadata_version, upstream_effort_status, upstream_effort_raw, upstream_effort_tier, request_completion, completion_reason, upstream_response_mode, performance_upstream_ms, performance_first_chunk_ms, performance_completed_at, client_request_id, attempt_index, outcome_version, attempt_outcome, failure_kind, failure_stage, error_message, error_causes_json, payload_metadata_json, payload_cleared_at FROM request_logs LIMIT 0").execute(&self.pool).await.is_ok()
                 && sqlx::query("SELECT client_request_id, final_outcome, final_attempt_id, attempt_count, finished_at FROM request_results LIMIT 0").execute(&self.pool).await.is_ok()
+                && sqlx::query(TOKEN_USAGE_DAILY_HEALTH_SQL).execute(&self.pool).await.is_ok()
         } else {
             false
         };
@@ -1708,18 +1709,36 @@ impl LogStore for MysqlLogStore {
             amount >= 0 && parts.next().is_none(),
             "invalid log retention interval"
         );
-        let sql = format!(
-            "DELETE FROM request_logs WHERE created_at < UNIX_TIMESTAMP(NOW() - INTERVAL ? {unit}) * 1000"
-        );
         let mut tx = self.pool.begin().await?;
-        let result = sqlx::query(&sql).bind(amount).execute(&mut *tx).await?;
+        // Evaluate NOW() once so the fold and the delete see the same bound.
+        let cutoff: Option<i64> = sqlx::query_scalar(&format!(
+            "SELECT CAST(UNIX_TIMESTAMP(NOW() - INTERVAL ? {unit}) * 1000 AS SIGNED)"
+        ))
+        .bind(amount)
+        .fetch_one(&mut *tx)
+        .await?;
+        let mut deleted = 0;
+        if let Some(cutoff) = cutoff {
+            sqlx::query(&mysql_fold_usage_sql("created_at < ?"))
+                .bind(cutoff)
+                .execute(&mut *tx)
+                .await?;
+            deleted = sqlx::query("DELETE FROM request_logs WHERE created_at < ?")
+                .bind(cutoff)
+                .execute(&mut *tx)
+                .await?
+                .rows_affected();
+        }
         mysql_cleanup_orphan_request_results(&mut tx).await?;
         tx.commit().await?;
-        Ok(result.rows_affected())
+        Ok(deleted)
     }
 
     async fn clear_all(&self) -> anyhow::Result<u64> {
         let mut tx = self.pool.begin().await?;
+        sqlx::query(&mysql_fold_usage_sql("1=1"))
+            .execute(&mut *tx)
+            .await?;
         let result = sqlx::query("DELETE FROM request_logs")
             .execute(&mut *tx)
             .await?;
@@ -1750,6 +1769,10 @@ impl LogStore for MysqlLogStore {
 
     async fn delete_by_id(&self, id: &str) -> anyhow::Result<u64> {
         let mut tx = self.pool.begin().await?;
+        sqlx::query(&mysql_fold_usage_sql("id = ?"))
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
         let result = sqlx::query("DELETE FROM request_logs WHERE id = ?")
             .bind(id)
             .execute(&mut *tx)
@@ -1761,6 +1784,9 @@ impl LogStore for MysqlLogStore {
 
     async fn clear_errors(&self) -> anyhow::Result<u64> {
         let mut tx = self.pool.begin().await?;
+        sqlx::query(&mysql_fold_usage_sql(&error_sql("")))
+            .execute(&mut *tx)
+            .await?;
         let result = sqlx::query(&format!("DELETE FROM request_logs WHERE {}", error_sql("")))
             .execute(&mut *tx)
             .await?;
@@ -1857,12 +1883,46 @@ impl LogStore for MysqlLogStore {
              CAST(COUNT(cache_read_tokens) AS SIGNED) AS cache_read_reported_count \
              FROM request_logs WHERE created_at >= ? AND created_at < ? AND provider_id <> '' \
              GROUP BY date, BINARY COALESCE(provider_id, ''), BINARY COALESCE(upstream_model, '') \
-             ORDER BY date, BINARY provider_id, BINARY model",
+             ORDER BY date, BINARY COALESCE(provider_id, ''), BINARY COALESCE(upstream_model, '')",
         )
         .bind(start_at)
         .bind(end_at)
         .fetch_all(&self.pool)
         .await?)
+    }
+
+    async fn token_usage_rollup_days(
+        &self,
+        start_at: i64,
+        end_at: i64,
+    ) -> anyhow::Result<Vec<crate::db::models::TokenUsageDay>> {
+        use sqlx::Row;
+        // Identity columns are VARBINARY: decode the original UTF-8 bytes.
+        sqlx::query(
+            "SELECT day_start_ms, provider_id, model, request_count, input_tokens, output_tokens, \
+             cache_read_tokens, missing_usage_count, cache_read_reported_count \
+             FROM token_usage_daily WHERE day_start_ms >= ? AND day_start_ms < ? \
+             ORDER BY day_start_ms, provider_id, model",
+        )
+        .bind(start_at)
+        .bind(end_at)
+        .fetch_all(&self.pool)
+        .await?
+        .into_iter()
+        .map(|row| {
+            crate::storage::traits::rollup_row_to_usage_day((
+                row.try_get("day_start_ms")?,
+                String::from_utf8(row.try_get::<Vec<u8>, _>("provider_id")?)?,
+                String::from_utf8(row.try_get::<Vec<u8>, _>("model")?)?,
+                row.try_get("request_count")?,
+                row.try_get("input_tokens")?,
+                row.try_get("output_tokens")?,
+                row.try_get("cache_read_tokens")?,
+                row.try_get("missing_usage_count")?,
+                row.try_get("cache_read_reported_count")?,
+            ))
+        })
+        .collect()
     }
 
     async fn account_token_usage(
@@ -2251,6 +2311,38 @@ fn mysql_outcome_counts(alias: &str) -> String {
          CAST(COALESCE(SUM(CASE WHEN {unknown} THEN 1 ELSE 0 END), 0) AS SIGNED) AS unknown_count, \
          CAST(COALESCE(SUM(CASE WHEN {cancelled} THEN 1 ELSE 0 END), 0) AS SIGNED) AS cancelled_count, \
          CAST(COALESCE(SUM(CASE WHEN {output_limited} THEN 1 ELSE 0 END), 0) AS SIGNED) AS output_limited_count"
+    )
+}
+
+/// Fold the usage of `request_logs` rows matching `predicate` into the
+/// permanent `token_usage_daily` totals. Must run in the same transaction as,
+/// and immediately before, the DELETE with the identical predicate; under
+/// InnoDB's default REPEATABLE READ this INSERT ... SELECT takes shared
+/// next-key locks on the scanned rows, so no concurrent insert can slip in
+/// between the fold and the delete. Binary grouping mirrors `token_usage_days`.
+/// `predicate` is an internal constant SQL fragment; values are bound by the caller.
+fn mysql_fold_usage_sql(predicate: &str) -> String {
+    format!(
+        "INSERT INTO token_usage_daily (day_start_ms, provider_id, model, request_count, \
+         input_tokens, output_tokens, cache_read_tokens, missing_usage_count, cache_read_reported_count) \
+         SELECT * FROM (SELECT (COALESCE(created_at, 0) DIV {day}) * {day} AS day_start, \
+         BINARY provider_id AS provider_bytes, BINARY COALESCE(upstream_model, '') AS model_bytes, \
+         CAST(COUNT(*) AS SIGNED) AS requests, \
+         CAST(COALESCE(SUM(input_tokens), 0) AS SIGNED) AS input_sum, \
+         CAST(COALESCE(SUM(output_tokens), 0) AS SIGNED) AS output_sum, \
+         CAST(COALESCE(SUM(cache_read_tokens), 0) AS SIGNED) AS cache_sum, \
+         CAST(SUM(CASE WHEN input_tokens IS NULL OR output_tokens IS NULL THEN 1 ELSE 0 END) AS SIGNED) AS missing_sum, \
+         CAST(COUNT(cache_read_tokens) AS SIGNED) AS cache_reported_sum \
+         FROM request_logs WHERE ({predicate}) AND provider_id <> '' \
+         GROUP BY day_start, provider_bytes, model_bytes) AS folded \
+         ON DUPLICATE KEY UPDATE \
+         request_count = request_count + folded.requests, \
+         input_tokens = input_tokens + folded.input_sum, \
+         output_tokens = output_tokens + folded.output_sum, \
+         cache_read_tokens = cache_read_tokens + folded.cache_sum, \
+         missing_usage_count = missing_usage_count + folded.missing_sum, \
+         cache_read_reported_count = cache_read_reported_count + folded.cache_reported_sum",
+        day = MILLIS_PER_DAY
     )
 }
 
@@ -3282,6 +3374,23 @@ CREATE TABLE IF NOT EXISTS request_results (
     final_attempt_id VARCHAR(36),
     attempt_count INTEGER NOT NULL,
     finished_at BIGINT NOT NULL
+) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+
+-- Permanent per-UTC-day token usage folded from request_logs rows at the
+-- moment they are deleted. Binary identity columns keep case and trailing
+-- spaces distinct, matching the BINARY grouping of retained-log statistics;
+-- sizes hold the full utf8mb4 byte length of the source VARCHAR columns.
+CREATE TABLE IF NOT EXISTS token_usage_daily (
+    day_start_ms BIGINT NOT NULL,
+    provider_id VARBINARY(144) NOT NULL,
+    model VARBINARY(1020) NOT NULL,
+    request_count BIGINT NOT NULL DEFAULT 0,
+    input_tokens BIGINT NOT NULL DEFAULT 0,
+    output_tokens BIGINT NOT NULL DEFAULT 0,
+    cache_read_tokens BIGINT NOT NULL DEFAULT 0,
+    missing_usage_count BIGINT NOT NULL DEFAULT 0,
+    cache_read_reported_count BIGINT NOT NULL DEFAULT 0,
+    PRIMARY KEY (day_start_ms, provider_id, model)
 ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
 
 CREATE TABLE IF NOT EXISTS settings (

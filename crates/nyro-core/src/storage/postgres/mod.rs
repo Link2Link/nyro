@@ -28,10 +28,10 @@ use crate::logging::diagnostics::{error_sql, outcome_sql};
 use crate::storage::sql::config::SqlBackendConfig;
 use crate::storage::sql::pool::RelationalPool;
 use crate::storage::traits::{
-    ApiKeyAccessRecord, ApiKeyStore, AuthAccessStore, LogStore, ModelBackendStore,
+    ApiKeyAccessRecord, ApiKeyStore, AuthAccessStore, LogStore, MILLIS_PER_DAY, ModelBackendStore,
     ModelSnapshotStore, ModelStore, OAuthCredentialStore, ProviderEndpointTestResult,
     ProviderStore, ProviderTestResult, SettingsStore, Storage, StorageBackend, StorageBootstrap,
-    StorageHealth, UsageWindow,
+    StorageHealth, TOKEN_USAGE_DAILY_HEALTH_SQL, UsageWindow,
 };
 
 #[derive(Clone)]
@@ -85,6 +85,7 @@ impl PostgresAdapter {
                 && sqlx::query("SELECT performance_metadata_version, upstream_effort_status, upstream_effort_raw, upstream_effort_tier, request_completion, completion_reason, upstream_response_mode, performance_upstream_ms, performance_first_chunk_ms, performance_completed_at FROM request_logs LIMIT 0").execute(&self.pool).await.is_ok()
                 && sqlx::query("SELECT client_request_id, attempt_index, outcome_version, attempt_outcome, failure_kind, failure_stage, error_message, error_causes_json, payload_metadata_json, payload_cleared_at FROM request_logs LIMIT 0").execute(&self.pool).await.is_ok()
                 && sqlx::query("SELECT client_request_id, final_outcome, final_attempt_id, attempt_count, finished_at FROM request_results LIMIT 0").execute(&self.pool).await.is_ok()
+                && sqlx::query(TOKEN_USAGE_DAILY_HEALTH_SQL).execute(&self.pool).await.is_ok()
         } else {
             false
         };
@@ -1658,27 +1659,27 @@ impl LogStore for PostgresLogStore {
     async fn cleanup_before(&self, cutoff_expression: &str) -> anyhow::Result<u64> {
         let interval = cutoff_expression.trim().trim_start_matches('-').trim();
         let mut tx = self.pool.begin().await?;
-        let result = sqlx::query(
-            "DELETE FROM request_logs WHERE created_at < EXTRACT(EPOCH FROM CURRENT_TIMESTAMP - $1::TEXT::INTERVAL) * 1000",
-        )
+        let deleted: i64 = sqlx::query_scalar(&pg_delete_and_fold_usage_sql(
+            "created_at < EXTRACT(EPOCH FROM CURRENT_TIMESTAMP - $1::TEXT::INTERVAL) * 1000",
+        ))
         .bind(interval)
-        .execute(&mut *tx)
+        .fetch_one(&mut *tx)
         .await?;
         cleanup_orphan_request_results_pg(&mut tx).await?;
         tx.commit().await?;
-        Ok(result.rows_affected())
+        Ok(deleted as u64)
     }
 
     async fn clear_all(&self) -> anyhow::Result<u64> {
         let mut tx = self.pool.begin().await?;
-        let result = sqlx::query("DELETE FROM request_logs")
-            .execute(&mut *tx)
+        let deleted: i64 = sqlx::query_scalar(&pg_delete_and_fold_usage_sql("TRUE"))
+            .fetch_one(&mut *tx)
             .await?;
         sqlx::query("DELETE FROM request_results")
             .execute(&mut *tx)
             .await?;
         tx.commit().await?;
-        Ok(result.rows_affected())
+        Ok(deleted as u64)
     }
 
     async fn clear_payloads(&self) -> anyhow::Result<u64> {
@@ -1702,23 +1703,23 @@ impl LogStore for PostgresLogStore {
 
     async fn delete_by_id(&self, id: &str) -> anyhow::Result<u64> {
         let mut tx = self.pool.begin().await?;
-        let result = sqlx::query("DELETE FROM request_logs WHERE id = $1")
+        let deleted: i64 = sqlx::query_scalar(&pg_delete_and_fold_usage_sql("id = $1"))
             .bind(id)
-            .execute(&mut *tx)
+            .fetch_one(&mut *tx)
             .await?;
         cleanup_orphan_request_results_pg(&mut tx).await?;
         tx.commit().await?;
-        Ok(result.rows_affected())
+        Ok(deleted as u64)
     }
 
     async fn clear_errors(&self) -> anyhow::Result<u64> {
         let mut tx = self.pool.begin().await?;
-        let result = sqlx::query(&format!("DELETE FROM request_logs WHERE {}", error_sql("")))
-            .execute(&mut *tx)
+        let deleted: i64 = sqlx::query_scalar(&pg_delete_and_fold_usage_sql(&error_sql("")))
+            .fetch_one(&mut *tx)
             .await?;
         cleanup_orphan_request_results_pg(&mut tx).await?;
         tx.commit().await?;
-        Ok(result.rows_affected())
+        Ok(deleted as u64)
     }
 
     async fn stats_overview_range(
@@ -1808,6 +1809,26 @@ impl LogStore for PostgresLogStore {
         .bind(end_at)
         .fetch_all(&self.pool)
         .await?)
+    }
+
+    async fn token_usage_rollup_days(
+        &self,
+        start_at: i64,
+        end_at: i64,
+    ) -> anyhow::Result<Vec<crate::db::models::TokenUsageDay>> {
+        sqlx::query_as::<_, crate::storage::traits::TokenUsageRollupRow>(
+            "SELECT day_start_ms, provider_id, model, request_count, input_tokens, output_tokens, \
+             cache_read_tokens, missing_usage_count, cache_read_reported_count \
+             FROM token_usage_daily WHERE day_start_ms >= $1 AND day_start_ms < $2 \
+             ORDER BY day_start_ms, provider_id, model",
+        )
+        .bind(start_at)
+        .bind(end_at)
+        .fetch_all(&self.pool)
+        .await?
+        .into_iter()
+        .map(crate::storage::traits::rollup_row_to_usage_day)
+        .collect()
     }
 
     async fn account_token_usage(
@@ -2144,6 +2165,37 @@ impl LogStore for PostgresLogStore {
             tps_totals: summary.tps_totals,
         })
     }
+}
+
+/// One statement that deletes the `request_logs` rows matching `predicate`,
+/// folds exactly those rows' usage into the permanent `token_usage_daily`
+/// totals, and returns the deleted-row count (all deleted rows, including
+/// provider-less ones that are not folded). Data-modifying CTEs always run to
+/// completion and share one snapshot, so no concurrently inserted row can be
+/// deleted without being folded. Grouping mirrors `token_usage_days`.
+/// `predicate` is an internal constant SQL fragment; values are bound by the caller.
+fn pg_delete_and_fold_usage_sql(predicate: &str) -> String {
+    format!(
+        "WITH deleted AS (DELETE FROM request_logs WHERE {predicate} \
+         RETURNING created_at, provider_id, upstream_model, input_tokens, output_tokens, cache_read_tokens), \
+         folded AS (INSERT INTO token_usage_daily (day_start_ms, provider_id, model, request_count, \
+         input_tokens, output_tokens, cache_read_tokens, missing_usage_count, cache_read_reported_count) \
+         SELECT (COALESCE(created_at, 0) / {day}) * {day}, provider_id, COALESCE(upstream_model, ''), COUNT(*), \
+         COALESCE(SUM(input_tokens), 0)::BIGINT, COALESCE(SUM(output_tokens), 0)::BIGINT, \
+         COALESCE(SUM(cache_read_tokens), 0)::BIGINT, \
+         SUM(CASE WHEN input_tokens IS NULL OR output_tokens IS NULL THEN 1 ELSE 0 END)::BIGINT, \
+         COUNT(cache_read_tokens) \
+         FROM deleted WHERE provider_id <> '' GROUP BY 1, 2, 3 \
+         ON CONFLICT (day_start_ms, provider_id, model) DO UPDATE SET \
+         request_count = token_usage_daily.request_count + EXCLUDED.request_count, \
+         input_tokens = token_usage_daily.input_tokens + EXCLUDED.input_tokens, \
+         output_tokens = token_usage_daily.output_tokens + EXCLUDED.output_tokens, \
+         cache_read_tokens = token_usage_daily.cache_read_tokens + EXCLUDED.cache_read_tokens, \
+         missing_usage_count = token_usage_daily.missing_usage_count + EXCLUDED.missing_usage_count, \
+         cache_read_reported_count = token_usage_daily.cache_read_reported_count + EXCLUDED.cache_read_reported_count) \
+         SELECT COUNT(*) FROM deleted",
+        day = MILLIS_PER_DAY
+    )
 }
 
 async fn cleanup_orphan_request_results_pg(
@@ -3049,6 +3101,21 @@ CREATE TABLE IF NOT EXISTS request_results (
     final_attempt_id TEXT,
     attempt_count INTEGER NOT NULL,
     finished_at BIGINT NOT NULL
+);
+
+-- Permanent per-UTC-day token usage folded from request_logs rows at the
+-- moment they are deleted (retention, clear, error clear, single delete).
+CREATE TABLE IF NOT EXISTS token_usage_daily (
+    day_start_ms BIGINT NOT NULL,
+    provider_id TEXT COLLATE "C" NOT NULL,
+    model TEXT COLLATE "C" NOT NULL,
+    request_count BIGINT NOT NULL DEFAULT 0,
+    input_tokens BIGINT NOT NULL DEFAULT 0,
+    output_tokens BIGINT NOT NULL DEFAULT 0,
+    cache_read_tokens BIGINT NOT NULL DEFAULT 0,
+    missing_usage_count BIGINT NOT NULL DEFAULT 0,
+    cache_read_reported_count BIGINT NOT NULL DEFAULT 0,
+    PRIMARY KEY (day_start_ms, provider_id, model)
 );
 
 CREATE INDEX IF NOT EXISTS idx_logs_created_at ON request_logs(created_at);

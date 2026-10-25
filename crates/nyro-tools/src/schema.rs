@@ -428,7 +428,8 @@ fn ensure_final_tables(tables: &[String]) -> Result<()> {
             "models",
             "model_backends",
             "api_key_models",
-            "model_rating_prefixes"
+            "model_rating_prefixes",
+            "token_usage_daily"
         ]
         .iter()
         .all(|name| tables.iter().any(|table| table == name))
@@ -627,6 +628,11 @@ mod tests {
             "ratings table is required"
         );
         tables.push("model_rating_prefixes".into());
+        assert!(
+            ensure_final_tables(&tables).is_err(),
+            "permanent token usage table is required"
+        );
+        tables.push("token_usage_daily".into());
         assert!(ensure_final_tables(&tables).is_ok());
         tables.push("route_targets".into());
         assert!(ensure_final_tables(&tables).is_err());

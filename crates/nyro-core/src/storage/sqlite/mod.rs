@@ -28,10 +28,10 @@ use crate::db::models::{
 use crate::logging::LogEntry;
 use crate::logging::diagnostics::{RequestResult, error_sql, outcome_sql};
 use crate::storage::traits::{
-    ApiKeyAccessRecord, ApiKeyStore, AuthAccessStore, LogStore, ModelBackendStore,
+    ApiKeyAccessRecord, ApiKeyStore, AuthAccessStore, LogStore, MILLIS_PER_DAY, ModelBackendStore,
     ModelSnapshotStore, ModelStore, OAuthCredentialStore, ProviderEndpointTestResult,
     ProviderStore, ProviderTestResult, SettingsStore, Storage, StorageBackend, StorageBootstrap,
-    StorageHealth, UsageWindow,
+    StorageHealth, TOKEN_USAGE_DAILY_HEALTH_SQL, UsageWindow,
 };
 
 #[derive(Clone)]
@@ -1680,20 +1680,36 @@ impl LogStore for SqliteLogStore {
     async fn cleanup_before(&self, cutoff_expression: &str) -> anyhow::Result<u64> {
         let mut tx = self.pool.begin().await?;
         // created_at is Unix milliseconds; convert cutoff to ms via strftime.
-        let result = sqlx::query(
-            "DELETE FROM request_logs WHERE created_at < CAST(strftime('%s', 'now', ?) AS INTEGER) * 1000"
-        )
-            .bind(cutoff_expression)
-            .execute(&mut *tx)
-            .await?;
+        // Evaluate 'now' once so the fold and the delete see the same bound;
+        // an invalid modifier yields NULL, which (as before) deletes nothing.
+        let cutoff: Option<i64> =
+            sqlx::query_scalar("SELECT CAST(strftime('%s', 'now', ?) AS INTEGER) * 1000")
+                .bind(cutoff_expression)
+                .fetch_one(&mut *tx)
+                .await?;
+        let mut deleted = 0;
+        if let Some(cutoff) = cutoff {
+            sqlx::query(&sqlite_fold_usage_sql("created_at < ?"))
+                .bind(cutoff)
+                .execute(&mut *tx)
+                .await?;
+            deleted = sqlx::query("DELETE FROM request_logs WHERE created_at < ?")
+                .bind(cutoff)
+                .execute(&mut *tx)
+                .await?
+                .rows_affected();
+        }
         sqlx::query("DELETE FROM request_results WHERE NOT EXISTS (SELECT 1 FROM request_logs WHERE request_logs.client_request_id = request_results.client_request_id)")
             .execute(&mut *tx).await?;
         tx.commit().await?;
-        Ok(result.rows_affected())
+        Ok(deleted)
     }
 
     async fn clear_all(&self) -> anyhow::Result<u64> {
         let mut tx = self.pool.begin().await?;
+        sqlx::query(&sqlite_fold_usage_sql("1=1"))
+            .execute(&mut *tx)
+            .await?;
         let result = sqlx::query("DELETE FROM request_logs")
             .execute(&mut *tx)
             .await?;
@@ -1724,6 +1740,10 @@ impl LogStore for SqliteLogStore {
 
     async fn delete_by_id(&self, id: &str) -> anyhow::Result<u64> {
         let mut tx = self.pool.begin().await?;
+        sqlx::query(&sqlite_fold_usage_sql("id = ?"))
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
         let result = sqlx::query("DELETE FROM request_logs WHERE id = ?")
             .bind(id)
             .execute(&mut *tx)
@@ -1736,6 +1756,9 @@ impl LogStore for SqliteLogStore {
 
     async fn clear_errors(&self) -> anyhow::Result<u64> {
         let mut tx = self.pool.begin().await?;
+        sqlx::query(&sqlite_fold_usage_sql(&error_sql("")))
+            .execute(&mut *tx)
+            .await?;
         let result = sqlx::query(&format!("DELETE FROM request_logs WHERE {}", error_sql("")))
             .execute(&mut *tx)
             .await?;
@@ -1834,6 +1857,26 @@ impl LogStore for SqliteLogStore {
         .bind(end_at)
         .fetch_all(&self.pool)
         .await?)
+    }
+
+    async fn token_usage_rollup_days(
+        &self,
+        start_at: i64,
+        end_at: i64,
+    ) -> anyhow::Result<Vec<crate::db::models::TokenUsageDay>> {
+        sqlx::query_as::<_, crate::storage::traits::TokenUsageRollupRow>(
+            "SELECT day_start_ms, provider_id, model, request_count, input_tokens, output_tokens, \
+             cache_read_tokens, missing_usage_count, cache_read_reported_count \
+             FROM token_usage_daily WHERE day_start_ms >= ? AND day_start_ms < ? \
+             ORDER BY day_start_ms, provider_id, model",
+        )
+        .bind(start_at)
+        .bind(end_at)
+        .fetch_all(&self.pool)
+        .await?
+        .into_iter()
+        .map(crate::storage::traits::rollup_row_to_usage_day)
+        .collect()
     }
 
     async fn account_token_usage(
@@ -2170,6 +2213,34 @@ impl LogStore for SqliteLogStore {
     }
 }
 
+/// Fold the usage of `request_logs` rows matching `predicate` into the
+/// permanent `token_usage_daily` totals. Must run in the same transaction as,
+/// and immediately before, the DELETE with the identical predicate. The
+/// grouping and NULL/empty-provider exclusion mirror `token_usage_days`.
+/// `predicate` is an internal constant SQL fragment; values are bound by the caller.
+fn sqlite_fold_usage_sql(predicate: &str) -> String {
+    format!(
+        "INSERT INTO token_usage_daily (day_start_ms, provider_id, model, request_count, \
+         input_tokens, output_tokens, cache_read_tokens, missing_usage_count, cache_read_reported_count) \
+         SELECT (CAST(COALESCE(created_at, 0) AS INTEGER) / {day}) * {day}, provider_id, COALESCE(upstream_model, ''), \
+         COUNT(*), COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0), \
+         COALESCE(SUM(cache_read_tokens), 0), \
+         SUM(CASE WHEN input_tokens IS NULL OR output_tokens IS NULL THEN 1 ELSE 0 END), \
+         COUNT(cache_read_tokens) \
+         FROM request_logs WHERE ({predicate}) AND provider_id <> '' \
+         GROUP BY (CAST(COALESCE(created_at, 0) AS INTEGER) / {day}) * {day}, provider_id COLLATE BINARY, \
+         COALESCE(upstream_model, '') COLLATE BINARY \
+         ON CONFLICT (day_start_ms, provider_id, model) DO UPDATE SET \
+         request_count = request_count + excluded.request_count, \
+         input_tokens = input_tokens + excluded.input_tokens, \
+         output_tokens = output_tokens + excluded.output_tokens, \
+         cache_read_tokens = cache_read_tokens + excluded.cache_read_tokens, \
+         missing_usage_count = missing_usage_count + excluded.missing_usage_count, \
+         cache_read_reported_count = cache_read_reported_count + excluded.cache_read_reported_count",
+        day = MILLIS_PER_DAY
+    )
+}
+
 #[derive(Clone)]
 struct SqliteBootstrap {
     pool: SqlitePool,
@@ -2200,6 +2271,7 @@ impl StorageBootstrap for SqliteBootstrap {
                 && sqlx::query("SELECT performance_metadata_version, upstream_effort_status, upstream_effort_raw, upstream_effort_tier, request_completion, completion_reason, upstream_response_mode, performance_upstream_ms, performance_first_chunk_ms, performance_completed_at FROM request_logs LIMIT 0").execute(&self.pool).await.is_ok()
                 && sqlx::query("SELECT client_request_id, attempt_index, outcome_version, attempt_outcome, failure_kind, failure_stage, error_message, error_causes_json, payload_metadata_json, payload_cleared_at FROM request_logs LIMIT 0").execute(&self.pool).await.is_ok()
                 && sqlx::query("SELECT client_request_id, final_outcome, final_attempt_id, attempt_count, finished_at FROM request_results LIMIT 0").execute(&self.pool).await.is_ok()
+                && sqlx::query(TOKEN_USAGE_DAILY_HEALTH_SQL).execute(&self.pool).await.is_ok()
         } else {
             false
         };

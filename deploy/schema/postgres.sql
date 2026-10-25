@@ -300,6 +300,23 @@ CREATE TABLE public.settings (
 
 
 --
+-- Name: token_usage_daily; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.token_usage_daily (
+    day_start_ms bigint NOT NULL,
+    provider_id text NOT NULL COLLATE pg_catalog."C",
+    model text NOT NULL COLLATE pg_catalog."C",
+    request_count bigint DEFAULT 0 NOT NULL,
+    input_tokens bigint DEFAULT 0 NOT NULL,
+    output_tokens bigint DEFAULT 0 NOT NULL,
+    cache_read_tokens bigint DEFAULT 0 NOT NULL,
+    missing_usage_count bigint DEFAULT 0 NOT NULL,
+    cache_read_reported_count bigint DEFAULT 0 NOT NULL
+);
+
+
+--
 -- Name: api_key_models api_key_routes_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -409,6 +426,14 @@ ALTER TABLE ONLY public.models
 
 ALTER TABLE ONLY public.settings
     ADD CONSTRAINT settings_pkey PRIMARY KEY (name);
+
+
+--
+-- Name: token_usage_daily token_usage_daily_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.token_usage_daily
+    ADD CONSTRAINT token_usage_daily_pkey PRIMARY KEY (day_start_ms, provider_id, model);
 
 
 --

@@ -1,5 +1,34 @@
 use super::*;
 
+/// Sum rollup and retained-log rows sharing (date, provider ID, model).
+/// Output keeps the storage order: date, then byte-wise provider ID and model,
+/// matching the binary collation of `token_usage_days`.
+fn merge_token_usage_days(
+    rollup: Vec<TokenUsageDay>,
+    retained: Vec<TokenUsageDay>,
+) -> Vec<TokenUsageDay> {
+    let mut merged: std::collections::BTreeMap<(String, String, String), TokenUsageDay> =
+        Default::default();
+    for row in rollup.into_iter().chain(retained) {
+        let key = (row.date.clone(), row.provider_id.clone(), row.model.clone());
+        match merged.entry(key) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(row);
+            }
+            std::collections::btree_map::Entry::Occupied(mut entry) => {
+                let total = entry.get_mut();
+                total.request_count += row.request_count;
+                total.input_tokens += row.input_tokens;
+                total.output_tokens += row.output_tokens;
+                total.cache_read_tokens += row.cache_read_tokens;
+                total.missing_usage_count += row.missing_usage_count;
+                total.cache_read_reported_count += row.cache_read_reported_count;
+            }
+        }
+    }
+    merged.into_values().collect()
+}
+
 const DEFAULT_TIME_SERIES_HOURS: i32 = 24;
 const MAX_TIME_SERIES_HOURS: i32 = 720;
 const MILLIS_PER_MINUTE: i64 = 60_000;
@@ -353,12 +382,15 @@ impl AdminService {
                 .and_utc()
                 .timestamp_millis()
         };
-        let mut rows = self
-            .gw
-            .storage
-            .logs()
-            .token_usage_days(year_start(year), year_start(year + 1))
-            .await?;
+        // Permanent totals: attempts already deleted from the logs (retention,
+        // clearing) were folded into the daily rollup; the rest are still
+        // retained. The two are disjoint, so summing them never double counts.
+        let (start_at, end_at) = (year_start(year), year_start(year + 1));
+        let logs = self.gw.storage.logs();
+        let mut rows = merge_token_usage_days(
+            logs.token_usage_rollup_days(start_at, end_at).await?,
+            logs.token_usage_days(start_at, end_at).await?,
+        );
         let providers: HashMap<_, _> = self
             .gw
             .storage

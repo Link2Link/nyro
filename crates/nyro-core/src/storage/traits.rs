@@ -4,12 +4,12 @@ use std::time::Duration;
 use async_trait::async_trait;
 
 use crate::db::models::{
-    AccountModelUsage, ApiKeyStats, ApiKeyUsageDetail, ApiKeyWithBindings, CreateApiKey, CreateModel,
-    CreateModelBackend, CreateProvider, LogPage, LogQuery, Model, ModelBackend, ModelRatingEntry,
-    ModelStats, ModelTimeBucket, ModelUsageDetail, ModelUsageStats, OAuthAccountUpdate,
-    OAuthCredential, Provider, ProviderKeyProbeResult, ProviderStats, ProviderUsageDetail,
-    RequestLog, RequestResult, StatsHourly, StatsOverview, StatsTimeBucket, UpdateApiKey,
-    UpdateModel, UpdateProvider, UpsertOAuthCredential,
+    AccountModelUsage, ApiKeyStats, ApiKeyUsageDetail, ApiKeyWithBindings, CreateApiKey,
+    CreateModel, CreateModelBackend, CreateProvider, LogPage, LogQuery, Model, ModelBackend,
+    ModelRatingEntry, ModelStats, ModelTimeBucket, ModelUsageDetail, ModelUsageStats,
+    OAuthAccountUpdate, OAuthCredential, Provider, ProviderKeyProbeResult, ProviderStats,
+    ProviderUsageDetail, RequestLog, RequestResult, StatsHourly, StatsOverview, StatsTimeBucket,
+    UpdateApiKey, UpdateModel, UpdateProvider, UpsertOAuthCredential,
 };
 use crate::logging::LogEntry;
 
@@ -199,6 +199,11 @@ pub trait LogStore: Send + Sync {
     ) -> anyhow::Result<Option<RequestResult>> {
         Ok(None)
     }
+    // Every request_logs deletion below must, in the same transaction, fold the
+    // deleted rows' usage into `token_usage_daily` (rows with a provider only),
+    // so token totals survive log retention and clearing. A row is counted
+    // either there or in the retained logs, never both. Payload clearing keeps
+    // rows and token columns, so it does not fold.
     async fn cleanup_before(&self, cutoff_expression: &str) -> anyhow::Result<u64>;
     async fn clear_all(&self) -> anyhow::Result<u64>;
     /// Clear all recorded request/response headers and bodies, including errors.
@@ -234,7 +239,19 @@ pub trait LogStore: Send + Sync {
     /// pre-routing rejections (e.g. `no route for model`) that never reached an
     /// upstream, so they carry no billable usage and must not surface as an
     /// "unknown model" cost entry. They remain visible in the request logs.
+    /// Retained logs only; deleted attempts live in `token_usage_rollup_days`.
     async fn token_usage_days(
+        &self,
+        start_at: i64,
+        end_at: i64,
+    ) -> anyhow::Result<Vec<crate::db::models::TokenUsageDay>>;
+    /// Permanent usage of already-deleted attempts, read from `token_usage_daily`
+    /// with the same row identity and fields as `token_usage_days` (provider
+    /// name is the ID; cost is unset). Days are selected by their UTC start in
+    /// `[start_at, end_at)`, which equals attempt-time filtering when both
+    /// bounds fall on UTC midnight. Disjoint from `token_usage_days`: sum both
+    /// for all-time totals.
+    async fn token_usage_rollup_days(
         &self,
         start_at: i64,
         end_at: i64,
@@ -516,6 +533,44 @@ pub fn hours_window_start(hours: Option<i64>) -> Option<i64> {
     })
 }
 
+/// Length of a UTC day in epoch milliseconds (`token_usage_daily.day_start_ms` step).
+pub(crate) const MILLIS_PER_DAY: i64 = 86_400_000;
+
+/// Schema-compatibility probe for the permanent usage table (all SQL backends).
+pub(crate) const TOKEN_USAGE_DAILY_HEALTH_SQL: &str = "SELECT day_start_ms, provider_id, model, \
+     request_count, input_tokens, output_tokens, cache_read_tokens, missing_usage_count, \
+     cache_read_reported_count FROM token_usage_daily LIMIT 0";
+
+/// One `token_usage_daily` row as decoded by a backend:
+/// `(day_start_ms, provider_id, model, request_count, input, output, cache_read,
+/// missing_usage_count, cache_read_reported_count)`.
+pub(crate) type TokenUsageRollupRow = (i64, String, String, i64, i64, i64, i64, i64, i64);
+
+/// Shape a rollup row like a `token_usage_days` row: `YYYY-MM-DD` UTC date,
+/// provider name = ID (the admin service resolves current names), no cost.
+pub(crate) fn rollup_row_to_usage_day(
+    row: TokenUsageRollupRow,
+) -> anyhow::Result<crate::db::models::TokenUsageDay> {
+    let (day, provider_id, model, requests, input, output, cache, missing, cache_reported) = row;
+    let date = chrono::DateTime::from_timestamp_millis(day)
+        .ok_or_else(|| anyhow::anyhow!("token usage rollup day out of range: {day}"))?
+        .format("%Y-%m-%d")
+        .to_string();
+    Ok(crate::db::models::TokenUsageDay {
+        date,
+        provider_name: provider_id.clone(),
+        provider_id,
+        model,
+        request_count: requests,
+        input_tokens: input,
+        output_tokens: output,
+        cache_read_tokens: cache,
+        missing_usage_count: missing,
+        cache_read_reported_count: cache_reported,
+        cost: None,
+    })
+}
+
 /// Inclusive `created_at` predicate for the stats queries. Only integer
 /// literals are inlined, so it is injection-safe; no bound yields `1=1`.
 pub fn range_sql(start_at: Option<i64>, end_at: Option<i64>) -> String {
@@ -540,6 +595,37 @@ mod range_tests {
             range_sql(Some(5), Some(9)),
             "created_at >= 5 AND created_at <= 9"
         );
+    }
+
+    #[test]
+    fn rollup_rows_format_utc_dates_like_retained_log_days() {
+        let row = |day| (day, "p".to_string(), "m".to_string(), 1, 2, 3, 4, 5, 6);
+        let day = rollup_row_to_usage_day(row(0)).unwrap();
+        assert_eq!(day.date, "1970-01-01");
+        assert_eq!(
+            (day.provider_id.as_str(), day.provider_name.as_str()),
+            ("p", "p")
+        );
+        assert_eq!(
+            (
+                day.request_count,
+                day.input_tokens,
+                day.output_tokens,
+                day.cache_read_tokens,
+                day.missing_usage_count,
+                day.cache_read_reported_count
+            ),
+            (1, 2, 3, 4, 5, 6)
+        );
+        assert!(day.cost.is_none());
+        // 2024-02-29 is day 19782 since the epoch.
+        assert_eq!(
+            rollup_row_to_usage_day(row(19_782 * MILLIS_PER_DAY))
+                .unwrap()
+                .date,
+            "2024-02-29"
+        );
+        assert!(rollup_row_to_usage_day(row(i64::MAX)).is_err());
     }
 
     #[test]

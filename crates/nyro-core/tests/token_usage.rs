@@ -20,12 +20,52 @@ async fn insert(
     usage: (Option<i32>, Option<i32>, Option<i32>),
     status: i32,
 ) -> anyhow::Result<()> {
+    let id = uuid::Uuid::new_v4().to_string();
+    insert_with_id(pool, &id, at, provider, model, usage, status).await
+}
+
+async fn insert_with_id(
+    pool: &sqlx::SqlitePool,
+    id: &str,
+    at: i64,
+    provider: Option<&str>,
+    model: Option<&str>,
+    usage: (Option<i32>, Option<i32>, Option<i32>),
+    status: i32,
+) -> anyhow::Result<()> {
     sqlx::query("INSERT INTO request_logs (id, created_at, provider_id, provider_name, client_model, upstream_model, input_tokens, output_tokens, cache_read_tokens, upstream_status_code, client_status_code, outcome_version, attempt_outcome) VALUES (?, ?, ?, 'Old provider name', 'client-alias', ?, ?, ?, ?, ?, 200, 1, ?)")
-        .bind(uuid::Uuid::new_v4().to_string()).bind(at).bind(provider).bind(model)
+        .bind(id).bind(at).bind(provider).bind(model)
         .bind(usage.0).bind(usage.1).bind(usage.2).bind(status)
         .bind(if status >= 400 { "failed" } else { "completed" })
         .execute(pool).await?;
     Ok(())
+}
+
+/// Order-preserving projection of every counted field of a usage day.
+type UsageKey = (String, String, String, i64, i64, i64, i64, i64, i64);
+
+fn usage_keys(rows: &[TokenUsageDay]) -> Vec<UsageKey> {
+    rows.iter()
+        .map(|r| {
+            (
+                r.date.clone(),
+                r.provider_id.clone(),
+                r.model.clone(),
+                r.request_count,
+                r.input_tokens,
+                r.output_tokens,
+                r.cache_read_tokens,
+                r.missing_usage_count,
+                r.cache_read_reported_count,
+            )
+        })
+        .collect()
+}
+
+async fn log_count(pool: &sqlx::SqlitePool) -> anyhow::Result<i64> {
+    Ok(sqlx::query_scalar("SELECT COUNT(*) FROM request_logs")
+        .fetch_one(pool)
+        .await?)
 }
 
 async fn storage() -> anyhow::Result<SqliteStorage> {
@@ -461,6 +501,13 @@ async fn token_usage_admin_enriches_exact_and_prefix_costs_without_changing_utc_
 async fn token_usage_memory_mode_has_no_retained_logs() -> anyhow::Result<()> {
     let storage = MemoryStorage::new(vec![], vec![], vec![]);
     assert!(storage.logs().token_usage_days(0, 1).await?.is_empty());
+    assert!(
+        storage
+            .logs()
+            .token_usage_rollup_days(0, 1)
+            .await?
+            .is_empty()
+    );
     Ok(())
 }
 
@@ -522,5 +569,377 @@ async fn token_usage_excludes_pre_routing_rejections_without_provider() -> anyho
         .map(|r| (r.provider_id.as_str(), r.model.as_str(), r.request_count))
         .collect();
     assert_eq!(identities, vec![("p", "m", 1)]);
+    Ok(())
+}
+
+async fn current_provider(storage: &SqliteStorage, name: &str) -> anyhow::Result<Provider> {
+    storage
+        .providers()
+        .create(CreateProvider {
+            name: name.into(),
+            vendor: None,
+            protocol: "openai-compatible".into(),
+            base_url: "http://127.0.0.1:1/v1".into(),
+            protocol_mode: "fixed".into(),
+            protocol_endpoints: vec![],
+            keys: vec![],
+            preset_key: None,
+            channel: None,
+            models_source: None,
+            static_models: None,
+            api_key: "test-only".into(),
+            auth_mode: "apikey".into(),
+            use_proxy: false,
+            fast_mode: false,
+        })
+        .await
+}
+
+#[tokio::test]
+async fn token_usage_totals_survive_every_log_deletion_path() -> anyhow::Result<()> {
+    let storage = storage().await?;
+    let pool = storage.pool().clone();
+    let provider = current_provider(&storage, "Current proxy").await?;
+    let p = provider.id.as_str();
+    let day1 = millis("2024-03-01T08:00:00Z");
+    let day2 = millis("2024-03-02T23:59:59Z");
+    for (id, at, provider, model, usage, status) in [
+        (
+            "ok",
+            day1,
+            Some(p),
+            Some("gpt-price-fixture"),
+            (Some(1_000_000), Some(500_000), Some(250_000)),
+            200,
+        ),
+        (
+            "failed",
+            day1,
+            Some(p),
+            Some("gpt-price-fixture"),
+            (Some(4), Some(2), Some(1)),
+            429,
+        ),
+        (
+            "no-usage",
+            day1,
+            Some(p),
+            Some("gpt-price-fixture"),
+            (None, None, None),
+            200,
+        ),
+        (
+            "lower",
+            day2,
+            Some(p),
+            Some("model"),
+            (Some(10), Some(1), None),
+            200,
+        ),
+        (
+            "upper",
+            day2,
+            Some(p),
+            Some("Model"),
+            (Some(20), Some(2), Some(0)),
+            200,
+        ),
+        (
+            "no-model",
+            day2,
+            Some(p),
+            None,
+            (Some(3), Some(3), None),
+            200,
+        ),
+        (
+            "deleted-provider",
+            day2,
+            Some("gone"),
+            Some("model"),
+            (Some(5), Some(5), Some(5)),
+            200,
+        ),
+        (
+            "pre-routing",
+            day2,
+            None,
+            None,
+            (Some(0), Some(0), None),
+            404,
+        ),
+        (
+            "pre-routing-empty",
+            day2,
+            Some(""),
+            Some(""),
+            (Some(0), Some(0), None),
+            404,
+        ),
+    ] {
+        insert_with_id(&pool, id, at, provider, model, usage, status).await?;
+    }
+    let dir = tempfile::tempdir()?;
+    std::fs::write(
+        dir.path().join("models.dev.json"),
+        serde_json::json!({"openai": {"models": {
+            "gpt-price-fixture": {"id": "gpt-price-fixture", "cost": {"input": 2, "output": 8, "cache_read": 0.5}}
+        }}})
+        .to_string(),
+    )?;
+    let (gw, _) = Gateway::from_storage(
+        GatewayConfig {
+            data_dir: dir.path().into(),
+            ..Default::default()
+        },
+        Arc::new(storage),
+    )
+    .await?;
+    let stats = || async { gw.admin().get_token_usage_stats(2024).await };
+    let baseline = stats().await?;
+    assert_eq!(
+        baseline.rows.len(),
+        5,
+        "provider-less attempts are not usage"
+    );
+    let expected = usage_keys(&baseline.rows);
+    let priced = |rows: &[TokenUsageDay]| {
+        rows.iter()
+            .map(|r| r.cost.as_ref().map(|c| c.total_cost))
+            .collect::<Vec<_>>()
+    };
+    let expected_costs = priced(&baseline.rows);
+    // Day-1 attempts merge: 1_000_004 gross input incl. 250_001 cache reads, 500_002 output
+    // at 2 / 0.5 / 8 USD per million tokens.
+    let day1_cost = expected_costs[0].unwrap();
+    assert!((day1_cost - (1.500_006 + 0.125_000_5 + 4.000_016)).abs() < 1e-9);
+    assert!(
+        expected_costs[1..].iter().all(Option::is_none),
+        "unknown models stay unpriced"
+    );
+
+    // Single delete, error clear and full clear each fold before deleting.
+    assert_eq!(gw.admin().delete_log("ok").await?, 1);
+    assert_eq!(usage_keys(&stats().await?.rows), expected);
+    assert_eq!(
+        gw.admin().clear_error_logs().await?,
+        3,
+        "429 plus both 404s"
+    );
+    assert_eq!(usage_keys(&stats().await?.rows), expected);
+    // Payload clearing keeps the rows and their token columns.
+    gw.admin().clear_log_payloads().await?;
+    assert_eq!(usage_keys(&stats().await?.rows), expected);
+    assert_eq!(gw.admin().clear_logs().await?, 5);
+    assert_eq!(log_count(&pool).await?, 0);
+    let after = stats().await?;
+    assert_eq!(usage_keys(&after.rows), expected);
+    assert_eq!(
+        priced(&after.rows),
+        expected_costs,
+        "costs are recomputed from kept tokens"
+    );
+    assert_eq!(after.rows[0].provider_name, "Current proxy");
+    assert_eq!(
+        after
+            .rows
+            .iter()
+            .find(|r| r.provider_id == "gone")
+            .unwrap()
+            .provider_name,
+        "gone",
+        "deleted providers keep falling back to their ID"
+    );
+
+    // Clearing again cannot double count; new logs add to the kept totals.
+    assert_eq!(gw.admin().clear_logs().await?, 0);
+    assert_eq!(usage_keys(&stats().await?.rows), expected);
+    insert(
+        &pool,
+        day1,
+        Some(p),
+        Some("gpt-price-fixture"),
+        (Some(1), Some(1), Some(1)),
+        200,
+    )
+    .await?;
+    let grown = stats().await?;
+    assert_eq!(
+        (grown.rows[0].request_count, grown.rows[0].input_tokens),
+        (expected[0].3 + 1, expected[0].4 + 1),
+        "retained and folded rows of one day merge into one row"
+    );
+    assert_eq!(grown.rows.len(), expected.len());
+    gw.admin().clear_logs().await?;
+    assert_eq!(usage_keys(&stats().await?.rows), usage_keys(&grown.rows));
+    Ok(())
+}
+
+#[tokio::test]
+async fn token_usage_rollup_keeps_identity_null_semantics_and_utc_days() -> anyhow::Result<()> {
+    let storage = storage().await?;
+    let start = millis("2024-01-01T00:00:00Z");
+    let end = millis("2025-01-01T00:00:00Z");
+    let leap_day = millis("2024-02-29T00:00:00Z");
+    for (at, provider, model, usage) in [
+        (
+            start - 1,
+            Some("p1"),
+            Some("shared"),
+            (Some(10), Some(2), Some(3)),
+        ),
+        (
+            start,
+            Some("p1"),
+            Some("shared"),
+            (Some(10), Some(2), Some(3)),
+        ),
+        (
+            leap_day - 1,
+            Some("p1"),
+            Some("shared"),
+            (Some(10), Some(2), Some(3)),
+        ),
+        (leap_day, Some("p2"), Some("shared"), (None, Some(2), None)),
+        (
+            leap_day,
+            Some("p2"),
+            Some("Shared"),
+            (Some(9), None, Some(0)),
+        ),
+        (leap_day, Some("p2"), None, (Some(1), Some(1), None)),
+        (
+            end - 1,
+            Some("p1"),
+            Some("shared"),
+            (Some(10), Some(2), Some(3)),
+        ),
+        (
+            end,
+            Some("p1"),
+            Some("shared"),
+            (Some(10), Some(2), Some(3)),
+        ),
+        (leap_day, None, None, (Some(7), Some(7), None)),
+    ] {
+        insert(storage.pool(), at, provider, model, usage, 200).await?;
+    }
+    let all = (
+        millis("2023-01-01T00:00:00Z"),
+        millis("2026-01-01T00:00:00Z"),
+    );
+    let retained = usage_keys(&storage.logs().token_usage_days(all.0, all.1).await?);
+    assert_eq!(storage.logs().clear_all().await?, 9);
+    assert!(
+        storage
+            .logs()
+            .token_usage_days(all.0, all.1)
+            .await?
+            .is_empty()
+    );
+    assert_eq!(
+        usage_keys(&storage.logs().token_usage_rollup_days(all.0, all.1).await?),
+        retained,
+        "folded rows match the retained-log view row for row"
+    );
+    let year = storage.logs().token_usage_rollup_days(start, end).await?;
+    let identities: Vec<_> = year
+        .iter()
+        .map(|r| (r.date.as_str(), r.provider_id.as_str(), r.model.as_str()))
+        .collect();
+    assert_eq!(
+        identities,
+        vec![
+            ("2024-01-01", "p1", "shared"),
+            ("2024-02-28", "p1", "shared"),
+            ("2024-02-29", "p2", ""),
+            ("2024-02-29", "p2", "Shared"),
+            ("2024-02-29", "p2", "shared"),
+            ("2024-12-31", "p1", "shared"),
+        ]
+    );
+    let shared = &year[4];
+    assert_eq!(
+        (shared.missing_usage_count, shared.cache_read_reported_count),
+        (1, 0)
+    );
+    let upper = &year[3];
+    assert_eq!(
+        (upper.missing_usage_count, upper.cache_read_reported_count),
+        (1, 1)
+    );
+    assert!(
+        year.iter()
+            .all(|r| r.cost.is_none() && r.provider_name == r.provider_id)
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn retention_cleanup_folds_only_the_rows_it_deletes() -> anyhow::Result<()> {
+    let storage = storage().await?;
+    let now = chrono::Utc::now().timestamp_millis();
+    let old = now - 30 * 86_400_000;
+    insert(
+        storage.pool(),
+        old,
+        Some("p"),
+        Some("m"),
+        (Some(5), Some(6), Some(1)),
+        200,
+    )
+    .await?;
+    insert(
+        storage.pool(),
+        now,
+        Some("p"),
+        Some("m"),
+        (Some(1), Some(2), None),
+        200,
+    )
+    .await?;
+    let all = (0, now + 86_400_000);
+    // An unparseable modifier keeps the previous "delete nothing" behavior.
+    assert_eq!(storage.logs().cleanup_before("not a modifier").await?, 0);
+    assert!(
+        storage
+            .logs()
+            .token_usage_rollup_days(all.0, all.1)
+            .await?
+            .is_empty()
+    );
+    assert_eq!(storage.logs().cleanup_before("-7 days").await?, 1);
+    let folded = storage.logs().token_usage_rollup_days(all.0, all.1).await?;
+    assert_eq!(folded.len(), 1);
+    assert_eq!(
+        (
+            folded[0].request_count,
+            folded[0].input_tokens,
+            folded[0].output_tokens
+        ),
+        (1, 5, 6)
+    );
+    let kept = storage.logs().token_usage_days(all.0, all.1).await?;
+    assert_eq!((kept.len(), kept[0].input_tokens), (1, 1));
+    assert_eq!(storage.logs().cleanup_before("-7 days").await?, 0);
+    assert_eq!(
+        storage.logs().token_usage_rollup_days(all.0, all.1).await?[0].request_count,
+        1,
+        "a repeated cleanup folds nothing twice"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn missing_permanent_usage_table_is_schema_incompatible_until_migrated() -> anyhow::Result<()>
+{
+    let storage = storage().await?;
+    assert!(storage.bootstrap().health().await?.schema_compatible);
+    sqlx::query("DROP TABLE token_usage_daily")
+        .execute(storage.pool())
+        .await?;
+    assert!(!storage.bootstrap().health().await?.schema_compatible);
+    storage.bootstrap().migrate().await?;
+    assert!(storage.bootstrap().health().await?.schema_compatible);
     Ok(())
 }

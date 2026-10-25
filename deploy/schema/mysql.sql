@@ -257,3 +257,16 @@ CREATE TABLE `settings` (
   `updated_at` datetime DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   PRIMARY KEY (`name`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE `token_usage_daily` (
+  `day_start_ms` bigint NOT NULL,
+  `provider_id` varbinary(144) NOT NULL,
+  `model` varbinary(1020) NOT NULL,
+  `request_count` bigint NOT NULL DEFAULT '0',
+  `input_tokens` bigint NOT NULL DEFAULT '0',
+  `output_tokens` bigint NOT NULL DEFAULT '0',
+  `cache_read_tokens` bigint NOT NULL DEFAULT '0',
+  `missing_usage_count` bigint NOT NULL DEFAULT '0',
+  `cache_read_reported_count` bigint NOT NULL DEFAULT '0',
+  PRIMARY KEY (`day_start_ms`,`provider_id`,`model`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;

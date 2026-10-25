@@ -1206,6 +1206,21 @@ CREATE TABLE IF NOT EXISTS request_results (
     finished_at      INTEGER NOT NULL
 );
 
+-- Permanent per-UTC-day token usage folded from request_logs rows at the
+-- moment they are deleted (retention, clear, error clear, single delete).
+CREATE TABLE IF NOT EXISTS token_usage_daily (
+    day_start_ms              INTEGER NOT NULL,
+    provider_id               TEXT NOT NULL COLLATE BINARY,
+    model                     TEXT NOT NULL COLLATE BINARY,
+    request_count             INTEGER NOT NULL DEFAULT 0,
+    input_tokens              INTEGER NOT NULL DEFAULT 0,
+    output_tokens             INTEGER NOT NULL DEFAULT 0,
+    cache_read_tokens         INTEGER NOT NULL DEFAULT 0,
+    missing_usage_count       INTEGER NOT NULL DEFAULT 0,
+    cache_read_reported_count INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (day_start_ms, provider_id, model)
+);
+
 CREATE TABLE IF NOT EXISTS settings (
     name       TEXT PRIMARY KEY,
     value      TEXT NOT NULL,

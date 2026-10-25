@@ -14,7 +14,8 @@ model_rating_prefixes (prefix-keyed scores shared across providers; no FK)
 
 api_keys ──M:N── models (via api_key_models)
 request_logs (one row per attempt; explicit payload clearing/deletion supported)
-    └──N:1── request_results (logical join by client_request_id; no FK)
+    ├──N:1── request_results (logical join by client_request_id; no FK)
+    └──folded on delete──► token_usage_daily (permanent per-day usage; no FK)
 settings (key-value)
 ```
 
@@ -513,6 +514,59 @@ There is no migration backfill of authoritative outcomes or request results from
 historical HTTP success/performance markers. The log queue/database write path
 can lose evidence and reports explicit process-local loss counters; it has no
 retry/spool or historical outcome recovery guarantee.
+
+---
+
+## token_usage_daily
+
+Permanent token usage of **deleted** `request_logs` rows, one row per UTC day,
+provider ID and upstream model. Every log deletion path — retention cleanup,
+"clear logs", "clear error logs" and single-row delete — folds the usage of
+exactly the rows it deletes into this table **in the same transaction**, so the
+Usage & Value totals survive log retention and clearing. A log row is counted
+either here or in the retained logs, never both; the admin service sums the two
+(`token_usage_rollup_days` + `token_usage_days`). Payload clearing keeps rows and
+token columns and does not fold. Grouping and NULL handling mirror the retained-
+log view: rows with a NULL/empty `provider_id` (pre-routing rejections) are not
+folded, a NULL upstream model becomes `''`, and failed/retried attempts count.
+
+Only token counts are kept. API-equivalent value is recomputed at read time from
+the current price catalogue and manual price rules, exactly as for retained
+logs, so price edits apply retroactively. Usage of a deleted provider stays
+counted but is unpriced unless a manual rule covers it.
+
+| Column | Type | Default | Description |
+|---|---|---|---|
+| `day_start_ms` | INTEGER NOT NULL (PostgreSQL/MySQL: BIGINT) | — | Unix millisecond start of the UTC day: `(created_at / 86400000) * 86400000` |
+| `provider_id` | TEXT NOT NULL (MySQL: VARBINARY(144)) | — | `request_logs.provider_id`; byte-exact identity |
+| `model` | TEXT NOT NULL (MySQL: VARBINARY(1020)) | — | Upstream model (`request_logs.upstream_model`, NULL → `''`); byte-exact identity |
+| `request_count` | INTEGER NOT NULL (PostgreSQL/MySQL: BIGINT) | `0` | Folded attempts, including failures and retries |
+| `input_tokens` | INTEGER NOT NULL (PostgreSQL/MySQL: BIGINT) | `0` | Sum of gross input tokens (cache reads already included) |
+| `output_tokens` | INTEGER NOT NULL (PostgreSQL/MySQL: BIGINT) | `0` | Sum of output tokens |
+| `cache_read_tokens` | INTEGER NOT NULL (PostgreSQL/MySQL: BIGINT) | `0` | Sum of cache-read tokens |
+| `missing_usage_count` | INTEGER NOT NULL (PostgreSQL/MySQL: BIGINT) | `0` | Folded attempts with NULL input or output tokens |
+| `cache_read_reported_count` | INTEGER NOT NULL (PostgreSQL/MySQL: BIGINT) | `0` | Folded attempts with non-NULL cache-read tokens |
+
+**Physical primary key**: `(day_start_ms, provider_id, model)`. Folds upsert and
+add to an existing day row. Identity is byte-exact on every backend, like the
+retained-log grouping: SQLite `COLLATE BINARY`, PostgreSQL `COLLATE "C"`, MySQL
+`VARBINARY` sized for the full utf8mb4 byte length of the source `VARCHAR(36)` /
+`VARCHAR(255)` columns (case and trailing spaces stay distinct).
+
+**Atomicity**: PostgreSQL deletes and folds in one statement
+(`WITH deleted AS (DELETE ... RETURNING ...) INSERT ...`). SQLite and MySQL run
+the fold `INSERT ... SELECT` and the `DELETE` with the identical predicate in one
+transaction; SQLite holds the database write lock from the fold to commit, and
+InnoDB's default REPEATABLE READ takes shared next-key locks on the folded rows.
+Retention cleanup evaluates its cutoff once and binds it to both statements.
+Rows removed by direct SQL outside these paths are not folded.
+
+**Upgrade**: the table is created empty by `CREATE TABLE IF NOT EXISTS`; no
+backfill is needed because retained logs are still counted directly and are
+folded when they are eventually deleted. Usage of logs deleted before this table
+existed cannot be recovered. With `migrate_on_start = false`, apply the
+regenerated reference SQL first: until the table exists, health reports
+`schema_compatible = false` and log deletion and the Usage & Value statistics fail.
 
 ---
 

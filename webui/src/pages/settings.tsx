@@ -343,8 +343,8 @@ export default function SettingsPage() {
                 <HelpHint
                   text={
                     isZh
-                      ? "自动删除超过设置时长的日志"
-                      : "Auto-delete logs older than the configured period"
+                      ? "自动删除超过设置时长的日志；统计页「用量与价值」的 Token 用量和等值费用会永久保留"
+                      : "Auto-delete logs older than the configured period. Token usage and API value totals in Usage & value are kept permanently"
                   }
                 />
               </label>

@@ -621,8 +621,8 @@ export default function LogsPage() {
         title={isZh ? "清空所有日志" : "Clear All Logs"}
         description={
           isZh
-            ? "确认清空所有请求日志？此操作不可恢复。"
-            : "All request logs will be permanently deleted. This action cannot be undone."
+            ? "确认清空所有请求日志？此操作不可恢复。统计页「用量与价值」的 Token 用量和等值费用会永久保留。"
+            : "All request logs will be permanently deleted. This action cannot be undone. Token usage and API value totals in Usage & value are kept."
         }
         confirmText={isZh ? "清空" : "Clear"}
         cancelText={isZh ? "取消" : "Cancel"}
@@ -660,8 +660,8 @@ export default function LogsPage() {
         title={isZh ? "清除报错日志" : "Delete Error Logs"}
         description={
           isZh
-            ? "永久删除所有错误尝试日志：客户端或上游 HTTP 4xx/5xx，或核心确认失败/超时（即使 HTTP 200）。仅取消、输出受限或未知结果不属于错误，不会删除。此操作不可恢复。"
-            : "Permanently delete all error attempt logs: client or upstream HTTP 4xx/5xx, or core-confirmed failure/timeout (including HTTP 200). Pure cancellation, output-limited and unknown results are excluded. This action cannot be undone."
+            ? "永久删除所有错误尝试日志：客户端或上游 HTTP 4xx/5xx，或核心确认失败/超时（即使 HTTP 200）。仅取消、输出受限或未知结果不属于错误，不会删除。此操作不可恢复。「用量与价值」的 Token 用量会永久保留。"
+            : "Permanently delete all error attempt logs: client or upstream HTTP 4xx/5xx, or core-confirmed failure/timeout (including HTTP 200). Pure cancellation, output-limited and unknown results are excluded. This action cannot be undone. Token usage totals in Usage & value are kept."
         }
         confirmText={isZh ? "删除" : "Delete"}
         cancelText={isZh ? "取消" : "Cancel"}
