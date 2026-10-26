@@ -257,6 +257,8 @@ chmod +x nyro-server-linux-x86_64
 
 打开 `http://localhost:19531` 进入管理界面。详细配置参见 [Server 文档](docs/server/README.md) 和 [Standalone 文档](docs/standalone/README.md)。
 
+如需面向 CentOS 7.6 / glibc 2.17 的 x86_64 原生二进制，请参阅容器化的 [CentOS 7.6 构建指南](<docs/server/centos7-build_CN.md>)（[English](<docs/server/centos7-build.md>)）。该方案从源码构建内嵌 WebUI 的服务端，不会安装或启动生产服务。
+
 ### 本地 Docker 镜像
 
 在 Linux amd64 或 arm64 主机上，先构建服务端，再把编译结果打包成本地 Docker 镜像和归档文件：

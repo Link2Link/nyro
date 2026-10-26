@@ -258,6 +258,8 @@ Available server binaries: `linux-x86_64`, `linux-aarch64`, `macos-x86_64`, `mac
 
 Open `http://localhost:19531` for the management UI. See [Server docs](docs/server/README.md) and [Standalone docs](docs/standalone/README.md) for full configuration reference.
 
+For a native x86_64 binary targeting CentOS 7.6 / glibc 2.17, use the containerized [CentOS 7.6 build guide](<docs/server/centos7-build.md>) ([中文](<docs/server/centos7-build_CN.md>)). It builds from source with embedded WebUI; it does not install or start a production service.
+
 ### Local Docker Image
 
 On a Linux amd64 or arm64 host, build the server and package the resulting binary into a local Docker image and archive:

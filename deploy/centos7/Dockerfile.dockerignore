@@ -1,0 +1,13 @@
+**/.git
+**/target
+**/node_modules
+**/dist
+**/.env
+**/.env.*
+**/*.db
+**/*.db-wal
+**/*.db-shm
+**/*.log
+**/__pycache__
+**/gen
+**/.DS_Store

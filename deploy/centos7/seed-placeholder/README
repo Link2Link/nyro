@@ -1,0 +1,1 @@
+Empty default for the optional cargo-seed build context. The build wrapper may replace it with a Cargo registry directory; no host toolchain, target artifacts or credentials are copied.
