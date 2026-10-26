@@ -822,7 +822,7 @@ Token 格式：`sk-<32位hex>`（`sk-` + v4 UUID 的 simple 形式；存储字�
 
 ```
 0. （仅当配置 --proxy-auth-key / NYRO_PROXY_AUTH_KEY）全局代理鉴权中间件 proxy/auth.rs::bearer_auth：
-   只读取 Authorization: Bearer；等于该 key，或为已启用且未过期的数据库 API Token 才放行，否则 401。
+   按与后续 dispatcher 相同的凭据提取顺序读取（Authorization: Bearer > x-api-key > x-goog-api-key）；等于该 key，或为已启用且未过期的数据库 API Token 才放行，否则 401。
    /health /healthz /readyz / 不受限。
 1. 运行 OnRequest phase hooks（可改写 request.model）→ 取 model
 2. match(model) → 路由缓存（仅已启用模型）按 name 精确匹配
@@ -911,7 +911,7 @@ Provider 通过 `models_source`（预设 channel JSON 中为 `modelsSource`）�
 - **Desktop**（Tauri）不开放管理 HTTP 端口：WebUI 通过 Tauri IPC 直接调用 core；仅启动代理监听 `127.0.0.1:19530`，不配置代理鉴权 key。
 - **Server 监听**：`--mode all|proxy|admin` 决定启动哪些监听；代理默认 `127.0.0.1:19530`，管理 API（`/api/v1`）+ WebUI 默认 `127.0.0.1:19531`，两者端口独立。
 - **管理鉴权**：设置 `--admin-token`（`NYRO_ADMIN_TOKEN`）后 `/api/v1/*` 要求 `Authorization: Bearer <token>`（也接受裸 token），否则 401；健康检查与 WebUI 静态资源不鉴权。未设置时管理 API 无鉴权，仅打印警告；`--admin-host` 为非回环地址且未设 token 时拒绝启动。
-- **代理鉴权**：设置 `--proxy-auth-key`（`NYRO_PROXY_AUTH_KEY`）后，所有数据面路由要求 `Authorization: Bearer <key>`（或 Bearer 为已启用且未过期的数据库 API Token）；`/health`、`/healthz`、`/readyz`、`/` 保持开放。该 key 同时是 master key，跳过模型级绑定与配额（见 §8.3）。代理绑定非回环地址而未设 key 时不会拒绝启动，只有 `--lan` 强制。
+- **代理鉴权**：设置 `--proxy-auth-key`（`NYRO_PROXY_AUTH_KEY`）后，所有数据面路由要求有效凭据（`Authorization: Bearer <key>`、`x-api-key` 或 `x-goog-api-key`；也可以是任一已启用且未过期的数据库 API Token）；`/health`、`/healthz`、`/readyz`、`/` 保持开放。该 key 同时是 master key，跳过模型级绑定与配额（见 §8.3）。代理绑定非回环地址而未设 key 时不会拒绝启动，只有 `--lan` 强制。
 - **`--lan`**（`NYRO_LAN`）：代理与管理监听均绑定 `0.0.0.0`，强制要求 `--proxy-auth-key`；`all` / `admin` 模式还强制要求 `--admin-token`，缺失即拒绝启动。Standalone YAML 模式下 `--lan` 同样要求 `--proxy-auth-key`。
 - **CORS**：默认仅允许 `tauri://localhost`、`http://tauri.localhost` 与本机端口对应的 `http://127.0.0.1:<port>` / `http://localhost:<port>`；`--proxy-cors-origin` / `--admin-cors-origin` 可追加，`*` 放开全部。
 

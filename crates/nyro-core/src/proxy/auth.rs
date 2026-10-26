@@ -4,7 +4,7 @@ use axum::http::StatusCode;
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 
-use crate::proxy::security::is_key_expired;
+use crate::proxy::security::{extract_api_key, is_key_expired};
 use crate::storage::traits::DynStorage;
 
 /// Auth material injected by the proxy router: the startup-configured gateway
@@ -26,13 +26,13 @@ pub async fn bearer_auth(request: Request, next: Next) -> Response {
         return next.run(request).await;
     }
 
-    let header = request
-        .headers()
-        .get("authorization")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-
-    let token = header.strip_prefix("Bearer ").unwrap_or("").trim();
+    // Accept every ingress auth scheme the dispatcher accepts: Anthropic
+    // clients send `x-api-key` and Gemini clients `x-goog-api-key`, so parsing
+    // only `Authorization: Bearer` here rejects valid credentials before the
+    // per-model layer ever sees them (notably for nyro→nyro chains, where the
+    // Anthropic egress path rewrites Bearer into `x-api-key`).
+    let token = extract_api_key(request.headers()).unwrap_or_default();
+    let token = token.trim();
 
     if token == expected {
         return next.run(request).await;

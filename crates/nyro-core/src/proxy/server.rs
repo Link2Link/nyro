@@ -271,6 +271,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn proxy_with_auth_key_accepts_anthropic_and_google_headers() {
+        let base_url = spawn_proxy_with_auth("secret-key").await;
+
+        // Anthropic clients authenticate with `x-api-key`; the middleware must
+        // not reject a credential the dispatcher would accept.
+        for header in ["x-api-key", "x-goog-api-key"] {
+            let ok = reqwest::Client::new()
+                .post(format!("{base_url}/v1/chat/completions"))
+                .header(header, "secret-key")
+                .json(&serde_json::json!({"model": "gpt-4o", "messages": []}))
+                .send()
+                .await
+                .expect("proxy response");
+            assert_ne!(
+                ok.status(),
+                reqwest::StatusCode::UNAUTHORIZED,
+                "{header} with the gateway key must be accepted"
+            );
+        }
+
+        // A wrong key in the same scheme is still rejected.
+        let wrong = reqwest::Client::new()
+            .post(format!("{base_url}/v1/chat/completions"))
+            .header("x-api-key", "not-the-key")
+            .json(&serde_json::json!({"model": "gpt-4o", "messages": []}))
+            .send()
+            .await
+            .expect("proxy response");
+        assert_eq!(wrong.status(), reqwest::StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
     async fn proxy_health_stays_open_when_auth_key_set() {
         let base_url = spawn_proxy_with_auth("secret-key").await;
 

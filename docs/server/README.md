@@ -48,7 +48,7 @@ curl http://127.0.0.1:19531/healthz         # 管理面健康检查
 |------|----------|--------|------|
 | `--proxy-host` | `NYRO_PROXY_HOST` | `127.0.0.1` | 代理监听地址 |
 | `--proxy-port` | `NYRO_PROXY_PORT` | `19530` | 代理监听端口 |
-| `--proxy-auth-key` | `NYRO_PROXY_AUTH_KEY` | 无 | 代理数据面强制 `Authorization: Bearer <key>`（健康检查端点保持开放）。代理监听非回环地址时建议必须设置 |
+| `--proxy-auth-key` | `NYRO_PROXY_AUTH_KEY` | 无 | 代理数据面强制鉴权：接受 `Authorization: Bearer <key>`、`x-api-key` 或 `x-goog-api-key`（健康检查端点保持开放）。代理监听非回环地址时建议必须设置 |
 | `--admin-host` | `NYRO_ADMIN_HOST` | `127.0.0.1` | Admin API 监听地址 |
 | `--admin-port` | `NYRO_ADMIN_PORT` | `19531` | Admin API 监听端口 |
 | `--admin-token` | `NYRO_ADMIN_TOKEN` | 无 | Admin API Bearer Token 鉴权 |
@@ -176,7 +176,7 @@ nyro-server --lan \
 
 `--lan` 会把代理（`:19530`）与 Admin/WebUI（`:19531`）监听都绑定到 `0.0.0.0`，并要求：
 
-- `--proxy-auth-key`：代理数据面强制 Bearer 鉴权，局域网设备调用模型时必须携带 `Authorization: Bearer your-proxy-key`；
+- `--proxy-auth-key`：代理数据面强制鉴权，局域网设备调用模型时须携带 `Authorization: Bearer your-proxy-key`（Anthropic 客户端也可用 `x-api-key`，Gemini 客户端可用 `x-goog-api-key`）；
 - `--admin-token`：Admin API 强制 Bearer 鉴权，WebUI 登录需要该令牌。
 
 两者缺一即拒绝启动。客户端使用示例：
