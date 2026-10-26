@@ -3,7 +3,7 @@ import { useQueries, useQuery } from "@tanstack/react-query";
 import { Clock, RefreshCw, AlertCircle, CirclePause } from "lucide-react";
 import { backend } from "@/lib/backend";
 import { localizeBackendErrorMessage } from "@/lib/backend-error";
-import { isKiroOverage, providerUsageSupported, providerUsageTitle, summarizeGroupUsage, tierLabel } from "@/lib/provider-usage";
+import { isKiroOverage, providerUsagePause, providerUsageSupported, providerUsageTitle, summarizeGroupUsage, tierLabel } from "@/lib/provider-usage";
 import { isDevinProvider, isKiroProvider } from "@/lib/native-provider";
 import { useLocale } from "@/lib/i18n";
 import { accountStateLabel, poolQuotaWindows, type AccountPoolView } from "@/lib/devin-account-pool";
@@ -274,11 +274,9 @@ export function ProviderUsageFooter({ provider }: { provider: Provider }) {
 
   const shown = usage;
   const balances = shown?.balances ?? [];
-  const quotaPaused = shown?.scheduling?.status === "quota_exhausted";
-  const quotaCountdown = countdownStr(
-    shown?.scheduling?.reset_at ?? shown?.scheduling?.next_check_at,
-  );
-  const blockedTierLabels = (shown?.scheduling?.blocking_tiers ?? [])
+  const pause = providerUsagePause(shown, isZh);
+  const quotaCountdown = countdownStr(pause?.resetAt);
+  const blockedTierLabels = (pause?.quotaExhausted ? shown?.scheduling?.blocking_tiers ?? [] : [])
     .map((name) => tierLabel(name, isZh))
     .join(", ");
   // Devin reports an extra-usage balance next to its included windows: it is
@@ -289,7 +287,7 @@ export function ProviderUsageFooter({ provider }: { provider: Provider }) {
   // bars read 100% but the provider is NOT paused, so say so explicitly.
   const onExtraBalance =
     isDevin &&
-    !quotaPaused &&
+    !pause &&
     (shown?.tiers ?? []).some((tier) => tier.used_percent >= 100) &&
     balances.some((balance) => balance.total > 0);
   const title = providerUsageTitle(shown?.kind, isZh);
@@ -333,15 +331,17 @@ export function ProviderUsageFooter({ provider }: { provider: Provider }) {
         </div>
       </div>
 
-      {quotaPaused && (
+      {pause && (
         <div className="flex items-center gap-2 border-y border-red-200 bg-red-50 px-2 py-1.5 text-xs text-red-700">
           <CirclePause className="h-3.5 w-3.5 shrink-0" />
           <span className="min-w-0 flex-1">
-            {isZh ? "额度已满，已暂停调度" : "Quota exhausted, routing paused"}
+            {pause.message}
             {blockedTierLabels && ` · ${blockedTierLabels}`}
           </span>
           {quotaCountdown && (
-            <span className="shrink-0 font-medium tabular-nums">{quotaCountdown}</span>
+            <span className="shrink-0 font-medium tabular-nums" title={pause.resetAt ?? undefined}>
+              {isZh ? "额度重置" : "Quota reset"}: {quotaCountdown}
+            </span>
           )}
         </div>
       )}
@@ -368,7 +368,7 @@ export function ProviderUsageFooter({ provider }: { provider: Provider }) {
         </div>
       )}
 
-      {shown?.is_available === false && !quotaPaused && <p className="text-xs font-medium text-red-600">{isZh ? "不可用" : "Unavailable"}</p>}
+      {shown?.is_available === false && !pause && <p className="text-xs font-medium text-red-600">{isZh ? "不可用" : "Unavailable"}</p>}
       {error && <div role="alert" className="flex items-center gap-1.5 text-xs text-red-500" title={errorMessage}>
         <AlertCircle className="h-3.5 w-3.5 shrink-0" />
         <span className="break-words">{isZh ? "用量查询失败" : "Usage query failed"}: {errorMessage}</span>

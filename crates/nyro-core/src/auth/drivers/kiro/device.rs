@@ -221,7 +221,7 @@ async fn post_json(client: &reqwest::Client, url: &str, body: &Value) -> Result<
         .post(url)
         .timeout(HTTP_TIMEOUT)
         .header(reqwest::header::ACCEPT, "application/json")
-        .header(reqwest::header::USER_AGENT, IDE_USER_AGENT)
+        .headers(crate::provider::kiro::identity::headers())
         .json(body)
         .send()
         .await
@@ -604,7 +604,10 @@ mod tests {
     ) -> impl IntoResponse {
         // Exercise the shared helper for registration, authorization and polling
         // across Google, GitHub, Builder ID and IAM Identity Center.
-        assert_eq!(headers["user-agent"], "KiroIDE");
+        assert_eq!(
+            headers["user-agent"],
+            crate::provider::kiro::identity::headers()["user-agent"]
+        );
         assert_eq!(headers["accept"], "application/json");
         assert_eq!(headers["content-type"], "application/json");
         mock.requests

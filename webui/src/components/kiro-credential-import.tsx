@@ -40,8 +40,8 @@ export function KiroCredentialImport({
       </p>
       <p className="text-xs text-slate-600">
         {isZh
-          ? "先在 Kiro IDE / CLI 登录，然后复制凭证文件内容。这里只导入已有凭证，不会打开浏览器或等待回调。Builder ID / IAM Identity Center 请同时粘贴客户端注册 JSON。"
-          : "Sign in to the Kiro IDE / CLI first, then copy the credential file contents. This form imports an existing credential; there is no browser sign-in or callback. For Builder ID / IAM Identity Center, also paste the client-registration JSON."}
+          ? "可粘贴 kiro-account-lite 的完整单账号导出 JSON，无需单独提取 accounts[0].credentials。多账号导出会被拒绝，请每次仅导出并导入一个账号。也可先在 Kiro IDE / CLI 登录，然后复制凭证 JSON，或粘贴 refresh token / ksk_ API Key。这里只导入已有凭证，不会打开浏览器或等待回调。导入 IDE / CLI 的 Builder ID / IAM Identity Center 凭证时，请同时粘贴客户端注册 JSON。"
+          : "Paste a complete single-account JSON export from kiro-account-lite; no need to extract accounts[0].credentials. Multi-account exports are rejected; export and import one account at a time. You can also sign in to the Kiro IDE / CLI and copy the credential JSON, or paste a refresh token / ksk_ API key. This form imports an existing credential; there is no browser sign-in or callback. When importing IDE / CLI credentials for Builder ID / IAM Identity Center, also paste the client-registration JSON."}
       </p>
       {reimport && <p className="text-xs text-slate-500">
         {isZh ? "导入成功后才会替换现有授权。" : "The existing authorization is replaced only after a successful import."}
@@ -69,7 +69,7 @@ export function KiroCredentialImport({
               autoCapitalize="none"
               spellCheck={false}
               rows={5}
-              placeholder={isZh ? "粘贴 kiro-auth-token.json，可在后面追加注册 JSON；也支持 refresh token 或 ksk_…" : "Paste kiro-auth-token.json, optionally followed by registration JSON; or a refresh token / ksk_…"}
+              placeholder={isZh ? "粘贴 kiro-account-lite 完整单账号导出 JSON（不支持多账号），或 Kiro IDE / CLI 的 kiro-auth-token.json，可在后面追加注册 JSON；也支持 refresh token 或 ksk_…" : "Paste a complete single-account kiro-account-lite JSON export (no multi-account exports), or Kiro IDE / CLI kiro-auth-token.json, optionally followed by registration JSON; or a refresh token / ksk_…"}
               value={credential}
               onChange={(event) => setCredential(event.target.value)}
               disabled={busy}

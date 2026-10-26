@@ -165,34 +165,67 @@ impl KiroCredential {
         !self.auth_method.is_social()
     }
 
-    /// Builder ID accounts without a profile talk to the CodeWhisperer host.
-    pub fn uses_codewhisperer_host(&self) -> bool {
-        self.auth_method == AuthMethod::BuilderId && self.profile_arn.is_none()
-    }
-
-    /// `https://q.<region>.amazonaws.com` (or the CodeWhisperer variant).
-    pub fn api_origin(&self) -> String {
-        let prefix = if self.uses_codewhisperer_host() {
-            "codewhisperer"
+    /// Runtime services are deployed in US/EU; OIDC keeps its original region.
+    pub fn service_region(&self) -> &'static str {
+        if self.region.starts_with("eu-") {
+            "eu-central-1"
         } else {
-            "q"
-        };
-        format!("https://{prefix}.{}.amazonaws.com", self.region)
+            DEFAULT_REGION
+        }
     }
 
-    pub fn generate_url(&self) -> String {
-        format!("{}/generateAssistantResponse", self.api_origin())
+    /// Compatibility profiles used by the IDE, not account identity evidence.
+    /// Never persist these defaults as subject_id, and never guess an enterprise
+    /// organization's ARN. Explicit/upstream-discovered profiles always win.
+    pub fn request_profile(&self, token: &str) -> Option<&str> {
+        if is_api_key(token) {
+            return None;
+        }
+        self.profile_arn
+            .as_deref()
+            .map(str::trim)
+            .filter(|arn| !arn.is_empty())
+            .or(match self.auth_method {
+                AuthMethod::BuilderId => {
+                    Some("arn:aws:codewhisperer:us-east-1:638616132270:profile/AAAACCCCXXXX")
+                }
+                AuthMethod::Social => {
+                    Some("arn:aws:codewhisperer:us-east-1:699475941385:profile/EHGA3GRVQMUK")
+                }
+                AuthMethod::Idc => None,
+            })
     }
 
-    pub fn usage_limits_url(&self) -> String {
-        // Usage limits always live on the Q host, never on CodeWhisperer.
-        format!("https://q.{}.amazonaws.com/getUsageLimits", self.region)
+    pub fn api_origin(&self) -> String {
+        format!("https://q.{}.amazonaws.com", self.service_region())
+    }
+
+    pub fn generate_url(&self, token: &str) -> String {
+        if is_api_key(token) {
+            format!(
+                "https://runtime.{}.kiro.dev/generateAssistantResponse",
+                self.service_region()
+            )
+        } else {
+            format!("{}/generateAssistantResponse", self.api_origin())
+        }
+    }
+
+    pub fn usage_limits_url(&self, token: &str) -> String {
+        if is_api_key(token) {
+            format!(
+                "https://management.{}.kiro.dev/Get-Usage-Limits",
+                self.service_region()
+            )
+        } else {
+            format!("{}/getUsageLimits", self.api_origin())
+        }
     }
 
     pub fn list_profiles_url(&self) -> String {
         format!(
             "https://codewhisperer.{}.amazonaws.com/ListAvailableProfiles",
-            self.region
+            self.service_region()
         )
     }
 
@@ -216,7 +249,13 @@ struct ImportFields {
     access_token: Option<String>,
     #[serde(default, alias = "refreshToken")]
     refresh_token: Option<String>,
-    #[serde(default, alias = "expiresAt", alias = "expired", alias = "expiration")]
+    #[serde(
+        default,
+        alias = "expiresAt",
+        alias = "expired",
+        alias = "expiration",
+        deserialize_with = "deserialize_import_expiry"
+    )]
     expires_at: Option<String>,
     #[serde(default, alias = "authMethod")]
     auth_method: Option<String>,
@@ -232,6 +271,59 @@ struct ImportFields {
     idc_region: Option<String>,
     #[serde(default, alias = "startUrl")]
     start_url: Option<String>,
+}
+
+/// Account-manager exports use Unix milliseconds; IDE files use RFC3339 strings.
+/// Keep strings unchanged so the auth driver retains its existing refresh fallback.
+fn deserialize_import_expiry<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<Value>::deserialize(deserializer)?;
+    match value {
+        None => Ok(None),
+        Some(Value::String(value)) => Ok(Some(value)),
+        Some(Value::Number(value)) => value
+            .as_i64()
+            .and_then(chrono::DateTime::<chrono::Utc>::from_timestamp_millis)
+            .map(|at| Some(at.to_rfc3339()))
+            .ok_or_else(|| serde::de::Error::custom("Invalid Kiro expiry timestamp")),
+        _ => Err(serde::de::Error::custom("Invalid Kiro expiry type")),
+    }
+}
+
+/// Extract only credentials. Exported subscription/usage/status are untrusted
+/// snapshots, not authoritative account state, and must never be persisted here.
+fn account_lite_fields(value: &Value) -> Result<ImportFields, ImportError> {
+    if value.get("app").and_then(Value::as_str) != Some("kiro-account-lite") {
+        return Err(ImportError::Invalid);
+    }
+    let accounts = value
+        .get("accounts")
+        .and_then(Value::as_array)
+        .ok_or(ImportError::Invalid)?;
+    match accounts.len() {
+        0 => return Err(ImportError::MissingToken),
+        1 => {}
+        _ => return Err(ImportError::MultipleAccounts),
+    }
+    let account = &accounts[0];
+    let credentials = account
+        .get("credentials")
+        .filter(|value| value.is_object())
+        .ok_or(ImportError::Invalid)?;
+    let mut fields: ImportFields =
+        serde_json::from_value(credentials.clone()).map_err(|_| ImportError::Invalid)?;
+    // Some exports keep the profile only on the account. The credential's own
+    // profile always wins; never merge tokens or expiry from other objects.
+    if fields
+        .profile_arn
+        .as_deref()
+        .is_none_or(|arn| arn.trim().is_empty())
+    {
+        fields.profile_arn = text(account, "profileArn").map(str::to_string);
+    }
+    Ok(fields)
 }
 
 fn fill(target: &mut Option<String>, value: Option<String>) {
@@ -280,6 +372,8 @@ pub enum ImportError {
     MissingToken,
     /// IdC/Builder ID credentials refresh with the registered client.
     MissingClient,
+    /// The existing authorization session binds exactly one account.
+    MultipleAccounts,
 }
 
 impl std::fmt::Display for ImportError {
@@ -289,6 +383,9 @@ impl std::fmt::Display for ImportError {
             Self::TooLarge => "Kiro credential input is too large",
             Self::Invalid => {
                 "Kiro credential input is not valid JSON, a refresh token or an API key"
+            }
+            Self::MultipleAccounts => {
+                "Import one Kiro account at a time; export a single account from kiro-account-lite"
             }
             Self::MissingToken => "Kiro credential needs a refreshToken (or an accessToken)",
             Self::MissingClient => {
@@ -302,7 +399,7 @@ impl std::error::Error for ImportError {}
 
 /// Accepts, in order of preference: one or more concatenated JSON objects
 /// (the token file, optionally followed by the client-registration file), a
-/// `ksk_` API key, or a bare refresh token.
+/// single-account kiro-account-lite export, a `ksk_` API key, or a bare refresh token.
 pub fn parse_import(input: &str) -> Result<Imported, ImportError> {
     let input = input.trim().trim_matches(['\'', '"']).trim();
     if input.is_empty() {
@@ -314,8 +411,23 @@ pub fn parse_import(input: &str) -> Result<Imported, ImportError> {
     let mut fields = ImportFields::default();
     if input.starts_with('{') {
         let mut count = 0;
-        for value in serde_json::Deserializer::from_str(input).into_iter::<ImportFields>() {
-            fields.absorb(value.map_err(|_| ImportError::Invalid)?);
+        let mut account_export = false;
+        for value in serde_json::Deserializer::from_str(input).into_iter::<Value>() {
+            let value = value.map_err(|_| ImportError::Invalid)?;
+            let is_export = value.get("accounts").is_some()
+                || value.get("app").and_then(Value::as_str) == Some("kiro-account-lite");
+            // Unlike IDE token + registration files, a complete account export
+            // cannot be concatenated with other objects: that could mix identities.
+            if account_export || (is_export && count != 0) {
+                return Err(ImportError::Invalid);
+            }
+            let next = if is_export {
+                account_export = true;
+                account_lite_fields(&value)?
+            } else {
+                serde_json::from_value(value).map_err(|_| ImportError::Invalid)?
+            };
+            fields.absorb(next);
             count += 1;
         }
         if count == 0 {
@@ -454,7 +566,7 @@ mod tests {
         let mut credential = KiroCredential::from_stored(&stored(json!({})));
         assert_eq!(credential.auth_method, AuthMethod::Social);
         assert_eq!(
-            credential.generate_url(),
+            credential.generate_url("oauth-token"),
             "https://q.us-east-1.amazonaws.com/generateAssistantResponse"
         );
         assert_eq!(
@@ -463,13 +575,12 @@ mod tests {
         );
 
         credential.auth_method = AuthMethod::BuilderId;
-        assert!(credential.uses_codewhisperer_host());
         assert_eq!(
-            credential.generate_url(),
-            "https://codewhisperer.us-east-1.amazonaws.com/generateAssistantResponse"
+            credential.generate_url("oauth-token"),
+            "https://q.us-east-1.amazonaws.com/generateAssistantResponse"
         );
         assert_eq!(
-            credential.usage_limits_url(),
+            credential.usage_limits_url("oauth-token"),
             "https://q.us-east-1.amazonaws.com/getUsageLimits"
         );
         credential.profile_arn = Some("arn:aws:codewhisperer:us-east-1:1:profile/X".into());
@@ -549,6 +660,149 @@ mod tests {
         assert!(imported.credential.profile_arn.is_some());
     }
 
+    fn account_lite_export() -> Value {
+        json!({
+            "app": "kiro-account-lite", "version": "1.0.37", "exportedAt": 1793011196617_i64,
+            "accounts": [{
+                "id": "fixture-account", "email": "fixture@example.com", "idp": "Github",
+                "credentials": {
+                    "accessToken": "FIXTURE-AT", "refreshToken": "FIXTURE-RT", "csrfToken": "",
+                    "expiresAt": 1793013476000_i64, "authMethod": "social", "provider": "Github",
+                    "region": "us-east-1", "profileArn": "arn:aws:codewhisperer:us-east-1:1:profile/X"
+                },
+                "subscription": {"title": "KIRO PRO MAX", "expiresAt": 1793491200000_i64},
+                "usage": {"current": 0, "limit": 5000}, "status": "active",
+                "profileArn": "arn:aws:codewhisperer:eu-west-1:1:profile/OTHER"
+            }]
+        })
+    }
+
+    #[test]
+    fn imports_account_lite_export_without_trusting_subscription_snapshot() {
+        let input = account_lite_export();
+        let imported = parse_import(&input.to_string()).unwrap();
+        assert_eq!(
+            imported,
+            parse_import(&input["accounts"][0]["credentials"].to_string()).unwrap()
+        );
+        assert_eq!(imported.access_token.as_deref(), Some("FIXTURE-AT"));
+        assert_eq!(imported.refresh_token.as_deref(), Some("FIXTURE-RT"));
+        assert_eq!(imported.credential.auth_method, AuthMethod::Social);
+        assert_eq!(imported.credential.region, "us-east-1");
+        let expiry =
+            chrono::DateTime::parse_from_rfc3339(imported.expires_at.as_deref().unwrap()).unwrap();
+        assert_eq!(expiry.timestamp_millis(), 1793013476000_i64);
+        let meta = imported.credential.to_meta();
+        assert_eq!(meta.as_object().unwrap().len(), 4);
+        for key in [
+            "usage",
+            "subscription",
+            "email",
+            "status",
+            "accessToken",
+            "refreshToken",
+        ] {
+            assert!(meta.get(key).is_none());
+        }
+    }
+
+    #[test]
+    fn account_lite_profile_fallback_and_oidc_client_requirements() {
+        let mut input = account_lite_export();
+        input["accounts"][0]["credentials"]
+            .as_object_mut()
+            .unwrap()
+            .remove("profileArn");
+        let imported = parse_import(&input.to_string()).unwrap();
+        assert_eq!(
+            imported.credential.profile_arn.as_deref(),
+            Some("arn:aws:codewhisperer:eu-west-1:1:profile/OTHER")
+        );
+        input["accounts"][0]["credentials"]["authMethod"] = json!("builder-id");
+        assert_eq!(
+            parse_import(&input.to_string()).unwrap_err(),
+            ImportError::MissingClient
+        );
+        input["accounts"][0]["credentials"]["clientId"] = json!("CID");
+        input["accounts"][0]["credentials"]["clientSecret"] = json!("SECRET");
+        let imported = parse_import(&input.to_string()).unwrap();
+        assert_eq!(imported.credential.auth_method, AuthMethod::BuilderId);
+        assert_eq!(imported.credential.client_id.as_deref(), Some("CID"));
+    }
+
+    #[test]
+    fn account_lite_rejects_ambiguous_or_malformed_exports_without_echoing_secrets() {
+        let valid = account_lite_export();
+        for (accounts, expected) in [
+            (json!([]), ImportError::MissingToken),
+            (
+                json!([valid["accounts"][0], valid["accounts"][0]]),
+                ImportError::MultipleAccounts,
+            ),
+            (json!({}), ImportError::Invalid),
+            (json!([{}]), ImportError::Invalid),
+            (
+                json!([{"credentials": "FIXTURE-SECRET"}]),
+                ImportError::Invalid,
+            ),
+            (json!([{"credentials": {}}]), ImportError::MissingToken),
+        ] {
+            let mut input = valid.clone();
+            input["accounts"] = accounts;
+            let error = parse_import(&input.to_string()).unwrap_err();
+            assert!(!error.to_string().contains("FIXTURE"));
+            assert_eq!(error, expected);
+        }
+        let mut unknown = valid.clone();
+        unknown["app"] = json!("unknown");
+        assert_eq!(
+            parse_import(&unknown.to_string()).unwrap_err(),
+            ImportError::Invalid
+        );
+        for input in [
+            format!("{valid} {{\"refreshToken\":\"OTHER\"}}"),
+            format!("{{}} {valid}"),
+        ] {
+            assert_eq!(parse_import(&input).unwrap_err(), ImportError::Invalid);
+        }
+    }
+
+    #[test]
+    fn import_expiry_accepts_milliseconds_null_and_existing_strings_but_rejects_invalid_types() {
+        for expiry in [
+            json!(true),
+            json!({}),
+            json!([]),
+            json!(1.5),
+            json!(i64::MAX),
+            json!(u64::MAX),
+        ] {
+            let input = json!({"refreshToken": "RT", "expiresAt": expiry});
+            assert_eq!(
+                parse_import(&input.to_string()).unwrap_err(),
+                ImportError::Invalid
+            );
+        }
+        let input = json!({"refreshToken": "RT", "expiresAt": null});
+        assert!(
+            parse_import(&input.to_string())
+                .unwrap()
+                .expires_at
+                .is_none()
+        );
+        for key in ["expiresAt", "expires_at", "expired", "expiration"] {
+            let mut input = json!({"refreshToken": "RT"});
+            input[key] = json!(0);
+            assert_eq!(
+                parse_import(&input.to_string())
+                    .unwrap()
+                    .expires_at
+                    .as_deref(),
+                Some("1970-01-01T00:00:00+00:00")
+            );
+        }
+    }
+
     #[test]
     fn merges_the_token_file_with_the_client_registration_file() {
         let imported = parse_import(
@@ -615,5 +869,56 @@ mod tests {
     fn hostile_regions_in_an_import_fall_back_to_the_default() {
         let imported = parse_import(r#"{"refreshToken":"RT","region":"evil.com/x"}"#).unwrap();
         assert_eq!(imported.credential.region, DEFAULT_REGION);
+    }
+    #[test]
+    fn request_profiles_do_not_fabricate_verified_identity_or_enterprise_profiles() {
+        let mut c = KiroCredential::from_stored(&stored(json!({"auth_method":"builder-id"})));
+        assert!(
+            c.request_profile("oauth")
+                .unwrap()
+                .ends_with("AAAACCCCXXXX")
+        );
+        assert!(c.profile_arn.is_none());
+        assert!(c.to_meta().get("profile_arn").is_none());
+        c.auth_method = AuthMethod::Social;
+        assert!(
+            c.request_profile("oauth")
+                .unwrap()
+                .ends_with("EHGA3GRVQMUK")
+        );
+        c.auth_method = AuthMethod::Idc;
+        assert_eq!(c.request_profile("oauth"), None);
+        c.profile_arn = Some("arn:aws:codewhisperer:eu-central-1:1:profile/REAL".into());
+        assert_eq!(c.request_profile("oauth"), c.profile_arn.as_deref());
+        assert_eq!(c.request_profile("ksk_fixture"), None);
+    }
+
+    #[test]
+    fn service_mapping_preserves_oidc_region_and_separates_api_keys() {
+        let c = KiroCredential::from_stored(&stored(
+            json!({"region":"eu-west-1", "idc_region":"ap-southeast-2"}),
+        ));
+        assert_eq!(
+            c.generate_url("oauth"),
+            "https://q.eu-central-1.amazonaws.com/generateAssistantResponse"
+        );
+        assert_eq!(
+            c.generate_url("ksk_fixture"),
+            "https://runtime.eu-central-1.kiro.dev/generateAssistantResponse"
+        );
+        assert_eq!(
+            c.usage_limits_url("ksk_fixture"),
+            "https://management.eu-central-1.kiro.dev/Get-Usage-Limits"
+        );
+        assert_eq!(
+            c.oidc_token_url(),
+            "https://oidc.ap-southeast-2.amazonaws.com/token"
+        );
+        assert_eq!(
+            c.list_profiles_url(),
+            "https://codewhisperer.eu-central-1.amazonaws.com/ListAvailableProfiles"
+        );
+        let c = KiroCredential::from_stored(&stored(json!({"region":"ap-southeast-2"})));
+        assert_eq!(c.service_region(), "us-east-1");
     }
 }

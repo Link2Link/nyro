@@ -11,7 +11,7 @@ use anyhow::{Result, anyhow, bail};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{Value, json};
 
 use super::shared::{expires_at_after, required_http_client};
 use crate::auth::types::*;
@@ -22,7 +22,6 @@ const MAX_BODY: usize = 256 * 1024;
 const DEFAULT_LIFETIME_SECONDS: i64 = 3600;
 /// An imported access token must outlive this margin to be used as-is.
 const IMPORT_MARGIN_SECONDS: i64 = 300;
-const IDE_USER_AGENT: &str = "KiroIDE";
 
 #[derive(Debug, Default)]
 pub struct KiroAuthDriver;
@@ -103,7 +102,37 @@ fn refresh_request(
     Ok(request
         .timeout(HTTP_TIMEOUT)
         .header(reqwest::header::ACCEPT, "application/json")
-        .header(reqwest::header::USER_AGENT, IDE_USER_AGENT))
+        .headers(crate::provider::kiro::identity::headers()))
+}
+
+/// Only explicit OAuth rejection codes prove a refresh credential is unusable.
+/// Generic 400/403 may be client/profile/proxy refusals; do not make them terminal.
+fn refresh_failure(status: u16, body: &[u8]) -> anyhow::Error {
+    let raw = serde_json::from_slice::<Value>(body).ok();
+    let rejected = raw.as_ref().is_some_and(|raw| {
+        ["error", "code", "__type"].iter().any(|key| {
+            raw.get(*key).and_then(Value::as_str).is_some_and(|code| {
+                matches!(
+                    code.rsplit('#').next().unwrap_or(code),
+                    "invalid_grant"
+                        | "invalid_client"
+                        | "InvalidGrantException"
+                        | "InvalidClientException"
+                )
+            })
+        })
+    });
+    if status == 401 || (matches!(status, 400 | 403) && rejected) {
+        anyhow!(
+            "Kiro rejected the refresh token (HTTP {status}); sign in to Kiro again and re-import the credential"
+        )
+    } else {
+        // Deliberately not the generic `refresh failed: HTTP ...` marker used by
+        // other drivers: that would terminally invalidate this account again.
+        anyhow!(
+            "Kiro refresh request denied or unavailable (HTTP {status}); verify client compatibility and network settings"
+        )
+    }
 }
 
 /// Refresh `credential` with `refresh_token`. Upstream bodies are never put in
@@ -118,14 +147,24 @@ async fn refresh_tokens(
         .await
         .map_err(|_| anyhow!("Kiro token refresh could not connect"))?;
     let status = response.status();
-    if matches!(status.as_u16(), 400 | 401 | 403) {
-        bail!(
-            "Kiro rejected the refresh token (HTTP {}); sign in to Kiro again and re-import the credential",
-            status.as_u16()
-        );
-    }
     if !status.is_success() {
-        bail!("Kiro token refresh failed: HTTP {}", status.as_u16());
+        let mut response = response;
+        let mut body = Vec::new();
+        loop {
+            match response.chunk().await {
+                Ok(Some(chunk)) if body.len().saturating_add(chunk.len()) <= MAX_BODY => {
+                    body.extend_from_slice(&chunk);
+                }
+                Ok(None) => break,
+                _ => {
+                    // Never parse partial error evidence; the HTTP status still
+                    // applies, especially an explicit 401 with a truncated body.
+                    body.clear();
+                    break;
+                }
+            }
+        }
+        return Err(refresh_failure(status.as_u16(), &body));
     }
     let token: TokenResponse = read_json(response, "Kiro token").await?;
     if token
@@ -139,8 +178,8 @@ async fn refresh_tokens(
 }
 
 /// Social credentials receive a profile ARN with every refresh; Builder ID and
-/// IdC credentials must look it up. A failed lookup is soft: Builder ID falls
-/// back to the profile-less CodeWhisperer host at request time.
+/// IdC credentials must look it up. Compatibility profiles are resolved only
+/// at request time, never persisted as a verified account identity.
 async fn discover_profile(
     client: &reqwest::Client,
     credential: &KiroCredential,
@@ -149,7 +188,7 @@ async fn discover_profile(
     let response = client
         .post(credential.list_profiles_url())
         .timeout(HTTP_TIMEOUT)
-        .header(reqwest::header::USER_AGENT, IDE_USER_AGENT)
+        .headers(crate::provider::kiro::identity::headers())
         .bearer_auth(access_token)
         .json(&json!({ "maxResults": 10 }))
         .send()
@@ -181,9 +220,7 @@ fn bundle(
         access_token: Some(access_token),
         refresh_token,
         expires_at,
-        // The provider's base URL must always be the Q origin of the region,
-        // even for Builder ID accounts that generate through CodeWhisperer.
-        resource_url: Some(format!("https://q.{}.amazonaws.com", credential.region)),
+        resource_url: Some(credential.api_origin()),
         subject_id: credential.profile_arn.clone(),
         scopes: Vec::new(),
         raw: credential.to_meta(),
@@ -468,6 +505,45 @@ mod tests {
         assert!(at > Utc::now() + chrono::Duration::seconds(IMPORT_MARGIN_SECONDS));
     }
 
+    #[tokio::test]
+    async fn fresh_account_lite_export_imports_without_network_or_snapshot_metadata() {
+        let future = Utc::now() + chrono::Duration::hours(2);
+        let input = json!({
+            "app": "kiro-account-lite", "version": "1.0.37",
+            "accounts": [{
+                "credentials": {
+                    "accessToken": "FIXTURE-AT", "refreshToken": "FIXTURE-RT",
+                    "expiresAt": future.timestamp_millis(), "authMethod": "social",
+                    "region": "us-east-1",
+                    "profileArn": "arn:aws:codewhisperer:us-east-1:1:profile/X"
+                },
+                "subscription": {"title": "KIRO PRO MAX"},
+                "usage": {"current": 0, "limit": 5000}
+            }]
+        });
+        // A loopback-only proxy makes any accidental upstream access fail locally.
+        let http = reqwest::Client::builder()
+            .proxy(reqwest::Proxy::all("http://127.0.0.1:9").unwrap())
+            .timeout(Duration::from_secs(1))
+            .build()
+            .unwrap();
+        let bundle = KiroAuthDriver
+            .import(&input.to_string(), &http)
+            .await
+            .unwrap();
+        assert_eq!(bundle.access_token.as_deref(), Some("FIXTURE-AT"));
+        assert_eq!(bundle.refresh_token.as_deref(), Some("FIXTURE-RT"));
+        assert_eq!(
+            parse_expiry(bundle.expires_at.as_deref().unwrap())
+                .unwrap()
+                .timestamp_millis(),
+            future.timestamp_millis()
+        );
+        assert_eq!(bundle.raw["auth_method"], "social");
+        assert!(bundle.raw.get("subscription").is_none());
+        assert!(bundle.raw.get("usage").is_none());
+    }
+
     #[test]
     fn bundle_stores_client_secret_and_a_q_origin_resource_url() {
         let credential = KiroCredential {
@@ -480,8 +556,7 @@ mod tests {
             start_url: None,
         };
         let bundle = bundle(&credential, "AT".into(), Some("RT".into()), None);
-        // Builder ID without a profile generates through CodeWhisperer, but the
-        // provider's base URL must stay on the Q origin.
+        // Builder ID uses the Q service; compatibility profiles are not stored.
         assert_eq!(
             bundle.resource_url.as_deref(),
             Some("https://q.us-east-1.amazonaws.com")
@@ -541,7 +616,10 @@ mod tests {
                 .build()
                 .unwrap();
             assert_eq!(request.method(), reqwest::Method::POST);
-            assert_eq!(request.headers()["user-agent"], "KiroIDE");
+            assert_eq!(
+                request.headers()["user-agent"],
+                crate::provider::kiro::identity::headers()["user-agent"]
+            );
             assert_eq!(request.headers()["accept"], "application/json");
             assert_eq!(request.headers()["content-type"], "application/json");
             assert_eq!(request.timeout(), Some(&HTTP_TIMEOUT));
@@ -668,5 +746,29 @@ mod tests {
             );
         }
         server.abort();
+    }
+    #[test]
+    fn refresh_rejections_require_explicit_evidence_and_never_echo_body() {
+        for (status, body, terminal) in [
+            (
+                400,
+                r#"{"error":"invalid_grant","refreshToken":"SECRET"}"#,
+                true,
+            ),
+            (403, r#"{"__type":"aws#InvalidGrantException"}"#, true),
+            (401, "SECRET", true),
+            (
+                403,
+                r#"{"message":"User is not authorized to make this call","token":"SECRET"}"#,
+                false,
+            ),
+            (400, r#"{"message":"Invalid request"}"#, false),
+            (500, r#"{"error":"invalid_grant"}"#, false),
+        ] {
+            let message = refresh_failure(status, body.as_bytes()).to_string();
+            assert_eq!(message.contains("rejected the refresh token"), terminal);
+            assert!(!message.contains("SECRET"));
+            assert!(!message.contains("refresh failed: HTTP"));
+        }
     }
 }

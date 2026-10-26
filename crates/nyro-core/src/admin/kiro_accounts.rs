@@ -263,13 +263,7 @@ impl AdminService {
             }
             Err(error) => {
                 next.usage_stale = true;
-                if error
-                    .to_string()
-                    .starts_with("Kiro authentication failed (HTTP 401)")
-                    || error
-                        .to_string()
-                        .starts_with("Kiro authentication failed (HTTP 403)")
-                {
+                if crate::provider::kiro::usage_authentication_rejected(&error) {
                     next.auth_invalid = true;
                 }
                 Some(error)

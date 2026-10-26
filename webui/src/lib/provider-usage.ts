@@ -1,5 +1,49 @@
 import type { Provider, ProviderUsage } from "./types";
 import { nativeProviderProtocol } from "./native-provider";
+import { accountStateLabel } from "./devin-account-pool";
+
+export interface ProviderUsagePause {
+  message: string;
+  quotaExhausted: boolean;
+  resetAt: string | null;
+}
+
+/** `quota_exhausted` is the legacy routing stop flag, not necessarily a quota
+ * diagnosis. Prefer explicit account failures over quota-looking cached tiers.
+ * A polling deadline is never a quota reset or a promised recovery time. */
+export function providerUsagePause(
+  usage?: Pick<ProviderUsage, "scheduling" | "account_pool"> | null,
+  isZh = false,
+): ProviderUsagePause | null {
+  const scheduling = usage?.scheduling;
+  if (scheduling?.status !== "quota_exhausted") return null;
+
+  const reason = scheduling.reason?.trim();
+  const readiness = usage?.account_pool?.readiness?.trim();
+  const isQuota = (value?: string) => value === "usage_limit" || value === "quota_exhausted";
+  const generic = !reason || reason === "account_unavailable" || reason === "no_available_account";
+  // Eligible/read-only pool states must not replace an actual pause diagnosis.
+  const poolReason = readiness && !["eligible", "included", "reserve", "reserve_only"].includes(readiness)
+    ? readiness : undefined;
+  const effectiveReason = (generic || isQuota(reason)) && poolReason ? poolReason : reason;
+  const quotaExhausted = isQuota(effectiveReason)
+    || (!effectiveReason && scheduling.blocking_tiers.length > 0);
+
+  let message: string;
+  if (quotaExhausted) {
+    message = isZh ? "额度已满，已暂停调度" : "Quota exhausted, routing paused";
+  } else {
+    const fallback = isZh ? "账号不可用" : "Account unavailable";
+    const label = !effectiveReason || ["account_unavailable", "no_available_account"].includes(effectiveReason)
+      ? fallback : accountStateLabel(effectiveReason, isZh);
+    message = isZh ? `${label}，已暂停调度` : `${label}, routing paused`;
+  }
+  return {
+    message,
+    quotaExhausted,
+    resetAt: quotaExhausted ? scheduling.reset_at ?? null : null,
+  };
+}
 
 /** Providers whose vendor has a coding-plan usage-query backend. Mirrors
  * nyro-core `admin::usage::UsageBackend::detect`. */

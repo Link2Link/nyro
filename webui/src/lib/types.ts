@@ -1,3 +1,5 @@
+import type { AccountPoolView } from "./devin-account-pool";
+
 export interface Provider {
   id: string;
   name: string;
@@ -1009,7 +1011,8 @@ export interface ProviderUsageBalance {
 
 export interface ProviderScheduling {
   status: "eligible" | "quota_exhausted";
-  reason?: "usage_limit" | "account_unavailable" | null;
+  /** Includes account-pool readiness reasons; unknown backend reasons remain displayable. */
+  reason?: string | null;
   blocking_tiers: string[];
   reset_at?: string | null;
   next_check_at?: string | null;
@@ -1045,5 +1048,7 @@ export interface ProviderUsage {
   is_available?: boolean | null;
   /** Runtime decision controlling whether this provider receives new requests. */
   scheduling?: ProviderScheduling;
+  /** Native Devin/Kiro account readiness, including legacy single-account providers. */
+  account_pool?: AccountPoolView | null;
   queried_at: string;
 }

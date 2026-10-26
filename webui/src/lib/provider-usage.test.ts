@@ -1,6 +1,6 @@
 import { deepEqual, equal } from "node:assert/strict";
 import { test } from "node:test";
-import { isKiroOverage, providerUsageSupported, providerUsageTitle, summarizeGroupUsage, tierLabel } from "./provider-usage";
+import { isKiroOverage, providerUsagePause, providerUsageSupported, providerUsageTitle, summarizeGroupUsage, tierLabel } from "./provider-usage";
 import type { ProviderUsage } from "./types";
 
 const kiro = { vendor: "kiro", preset_key: "kiro", channel: "ide", auth_mode: "oauth" as const, base_url: "https://q.us-east-1.amazonaws.com" };
@@ -40,6 +40,67 @@ test("Only an eligible exhausted total Kiro pool displays upstream overage", () 
   equal(isKiroOverage({ ...usage, tiers: [{ name: "monthly", used_percent: 50 }, { name: "feature:kiro:base:Credits:0", used_percent: 100 }] }), false);
   equal(isKiroOverage({ ...usage, tiers: [] }), false);
   equal(isKiroOverage(null), false);
+});
+
+const pool: NonNullable<ProviderUsage["account_pool"]> = {
+  provider_id: "p", config: null, accounts: [], readiness: "auth_required",
+  quota: { daily: null, weekly: null, estimated: false },
+  counts: { total: 1, accounting: 1, available: 0, included: 0, reserve: 0,
+    pro: 0, max: 0, unclassified: 1, unknown: 0, disabled: 0, disconnected: 0,
+    auth_required: 1, quota_exhausted: 0, plan_mismatch: 0, plan_unverified: 0 },
+};
+const resetAt = "2030-01-02T00:00:00Z";
+const paused = { status: "quota_exhausted" as const, blocking_tiers: ["monthly"], reset_at: resetAt,
+  next_check_at: "2030-01-01T00:05:00Z" };
+
+test("routing pause labels use non-quota reasons in English by default and explicit Chinese", () => {
+  for (const [reason, en, zh] of [
+    ["auth_required", "Needs login", "需要登录"],
+    ["account_unavailable", "Account unavailable", "账号不可用"],
+    ["no_available_account", "Account unavailable", "账号不可用"],
+    ["no_account", "No account", "无账号"],
+    ["disabled", "Disabled", "已停用"],
+    ["plan_mismatch", "Plan mismatch", "套餐不匹配"],
+    ["plan_unverified", "Plan unverified", "套餐未验证"],
+    ["plan_verification_required", "Plan verification required", "需要验证套餐"],
+    ["unknown_usage", "Usage unknown", "用量未知"],
+    ["future_reason", "future_reason", "future_reason"],
+  ]) {
+    const input = { scheduling: { ...paused, reason } };
+    deepEqual(providerUsagePause(input), {
+      message: `${en}, routing paused`, quotaExhausted: false, resetAt: null,
+    });
+    equal(providerUsagePause(input, true)?.message, `${zh}，已暂停调度`);
+  }
+});
+
+test("pool readiness refines generic/legacy quota reasons but explicit non-quota reasons win", () => {
+  for (const reason of [undefined, "account_unavailable", "no_available_account", "usage_limit", "quota_exhausted"]) {
+    const result = providerUsagePause({ scheduling: { ...paused, reason }, account_pool: pool });
+    equal(result?.message, "Needs login, routing paused");
+    equal(result?.resetAt, null);
+  }
+  equal(providerUsagePause({ scheduling: { ...paused, reason: "auth_required" },
+    account_pool: { ...pool, readiness: "quota_exhausted" } })?.quotaExhausted, false);
+  equal(providerUsagePause({ scheduling: { ...paused, reason: "account_unavailable" },
+    account_pool: { ...pool, readiness: "plan_verification_required" } })?.message,
+  "Plan verification required, routing paused");
+});
+
+test("only quota pauses expose real reset times, never next checks", () => {
+  for (const reason of ["usage_limit", "quota_exhausted", undefined]) {
+    deepEqual(providerUsagePause({ scheduling: { ...paused, reason } }), {
+      message: "Quota exhausted, routing paused", quotaExhausted: true, resetAt,
+    });
+    equal(providerUsagePause({ scheduling: { ...paused, reason, reset_at: null } })?.resetAt, null);
+    equal(providerUsagePause({ scheduling: { ...paused, reason } }, true)?.message, "额度已满，已暂停调度");
+  }
+  equal(providerUsagePause({ scheduling: { ...paused, blocking_tiers: [] } })?.quotaExhausted, false);
+  equal(providerUsagePause({ scheduling: { ...paused, reason: "account_unavailable" },
+    account_pool: { ...pool, readiness: "quota_exhausted" } })?.quotaExhausted, true);
+  equal(providerUsagePause({ scheduling: { ...paused, status: "eligible", reason: "auth_required" }, account_pool: pool }), null);
+  equal(providerUsagePause({ account_pool: pool }), null);
+  equal(providerUsagePause(null), null);
 });
 
 const usage = (over: Partial<ProviderUsage>): ProviderUsage => ({

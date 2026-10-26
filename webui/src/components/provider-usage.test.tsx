@@ -61,6 +61,60 @@ test("balance and spend details stay visible without an expand action", () => {
   match(render({ ...base, spends: [{ name: "today", currency: "USD", amount: 1.25 }] }), /1\.25/);
 });
 
+test("native pool and single-account authentication pauses never claim exhausted quota or recovery", () => {
+  for (const kind of ["devin_plan", "kiro_plan", "glm_coding_plan"]) {
+    for (const reason of ["auth_required", "account_unavailable", "no_account", "disabled", "plan_verification_required", "future_reason"]) {
+      const html = render({ ...base, kind, is_available: false,
+        scheduling: { status: "quota_exhausted", reason, blocking_tiers: ["monthly"],
+          reset_at: new Date(now + 3600_000).toISOString(), next_check_at: new Date(now + 300_000).toISOString() },
+      });
+      match(html, /routing paused/);
+      doesNotMatch(html, /Quota exhausted|Quota reset|Monthly|1h|5m|ranked last/);
+      if (reason === "auth_required") match(html, /Needs login, routing paused/);
+    }
+  }
+});
+
+test("Devin and Kiro pool readiness explains a generic pause even for legacy singleton config", () => {
+  for (const kind of ["devin_plan", "kiro_plan"]) {
+    const html = render({ ...base, kind,
+      scheduling: { status: "quota_exhausted", reason: "account_unavailable", blocking_tiers: [],
+        next_check_at: new Date(now + 300_000).toISOString() },
+      account_pool: {
+        provider_id: provider.id, config: null, accounts: [], readiness: "auth_required",
+        quota: { daily: null, weekly: null, estimated: false },
+        counts: { total: 1, accounting: 1, available: 0, included: 0, reserve: 0,
+          pro: 0, max: 0, unclassified: 1, unknown: 0, disabled: 0, disconnected: 0,
+          auth_required: 1, quota_exhausted: 0, plan_mismatch: 0, plan_unverified: 0 },
+      },
+    });
+    match(html, /Needs login, routing paused/);
+    doesNotMatch(html, /Quota exhausted|Quota reset|5m/);
+  }
+});
+
+test("quota pause shows only a labeled actual reset, not the polling deadline", () => {
+  const scheduling = { status: "quota_exhausted" as const, reason: "usage_limit", blocking_tiers: ["monthly"],
+    next_check_at: new Date(now + 300_000).toISOString() };
+  const withoutReset = render({ ...base, scheduling });
+  match(withoutReset, /Quota exhausted, routing paused.*Monthly/);
+  doesNotMatch(withoutReset, /Quota reset|5m/);
+  const withReset = render({ ...base, scheduling: { ...scheduling, reset_at: new Date(now + 3600_000).toISOString() } });
+  match(withReset, /Quota reset: 1h/);
+  doesNotMatch(withReset, /5m/);
+});
+
+test("eligible Devin reserve and Kiro overage remain available without pause warnings", () => {
+  for (const kind of ["devin_plan", "kiro_plan"]) {
+    const html = render({ ...base, kind, tiers: [{ name: "monthly", used_percent: 100 }],
+      balances: [{ currency: "USD", total: 5, granted: 0, topped_up: 5 }],
+      scheduling: { status: "eligible", blocking_tiers: [] },
+    });
+    match(html, /ranked last/);
+    doesNotMatch(html, /routing paused|Quota reset/);
+  }
+});
+
 test("cached usage retains visible refresh failures, stale state and quota pause warning", () => {
   const html = render({ ...base, tiers: [{ name: "weekly_limit", used_percent: 100 }], scheduling: {
     status: "quota_exhausted", blocking_tiers: ["weekly_limit"], reason: "usage_limit",

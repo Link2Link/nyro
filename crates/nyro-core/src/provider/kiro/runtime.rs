@@ -7,7 +7,6 @@ use std::time::Duration;
 use futures::StreamExt;
 use reqwest::header::{HeaderMap, HeaderValue};
 use serde_json::Value;
-use sha2::{Digest as _, Sha256};
 use tokio_stream::wrappers::ReceiverStream;
 
 use super::credential::KiroCredential;
@@ -30,7 +29,6 @@ use crate::{
 };
 
 const STREAM_TARGET: &str = "AmazonCodeWhispererStreamingService.GenerateAssistantResponse";
-const IDE_VERSION: &str = "0.11.63";
 /// Error bodies are bounded classification input, never forwarded or retained.
 const MAX_ERROR_BYTES: usize = super::errors::MAX_ERROR_BYTES;
 const MAX_USAGE_BYTES: usize = 1024 * 1024;
@@ -66,50 +64,20 @@ fn stream_headers(token: &str, credential: &KiroCredential) -> Result<HeaderMap,
     let mut headers = ide_headers(token, credential)?;
     headers.insert("content-type", HeaderValue::from_static("application/json"));
     headers.insert("accept", HeaderValue::from_static("application/json"));
-    headers.insert(
-        "amz-sdk-request",
-        HeaderValue::from_static("attempt=1; max=3"),
-    );
+    headers.insert("x-amzn-kiro-agent-mode", HeaderValue::from_static("vibe"));
+    if super::credential::is_api_key(token) {
+        headers.insert(
+            "x-amzn-codewhisperer-optout",
+            HeaderValue::from_static("true"),
+        );
+    }
     headers.insert("x-amz-target", HeaderValue::from_static(STREAM_TARGET));
     Ok(headers)
 }
 
-/// Stable per-account identity the IDE embeds in its user agent.
-fn machine_id(credential: &KiroCredential) -> String {
-    let seed = credential
-        .profile_arn
-        .as_deref()
-        .or(credential.client_id.as_deref())
-        .unwrap_or("KIRO_DEFAULT_MACHINE");
-    hex::encode(Sha256::digest(seed.as_bytes()))
-}
-
-fn ide_headers(token: &str, credential: &KiroCredential) -> Result<HeaderMap, GatewayError> {
-    let mut headers = token_headers(token)?;
-    let machine = machine_id(credential);
-    let os = std::env::consts::OS;
-    headers.insert("accept", HeaderValue::from_static("application/json"));
-    headers.insert(
-        "amz-sdk-request",
-        HeaderValue::from_static("attempt=1; max=1"),
-    );
-    for (name, value) in [
-        (
-            "x-amz-user-agent",
-            format!("aws-sdk-js/1.0.34 KiroIDE-{IDE_VERSION}-{machine}"),
-        ),
-        (
-            "user-agent",
-            format!(
-                "aws-sdk-js/1.0.34 ua/2.1 os/{os} lang/js md/nodejs#22.12.0 api/codewhispererstreaming#1.0.34 m/E KiroIDE-{IDE_VERSION}-{machine}"
-            ),
-        ),
-    ] {
-        headers.insert(
-            name,
-            HeaderValue::from_str(&value).map_err(|_| unavailable("invalid Kiro header"))?,
-        );
-    }
+fn ide_headers(token: &str, _credential: &KiroCredential) -> Result<HeaderMap, GatewayError> {
+    let mut headers = super::identity::headers();
+    headers.extend(token_headers(token)?);
     Ok(headers)
 }
 
@@ -330,7 +298,7 @@ pub(super) async fn start(
         .credential
         .ok_or_else(|| unavailable("Kiro OAuth credential is missing"))?;
     let credential = KiroCredential::from_stored(stored);
-    let url = credential.generate_url();
+    let url = credential.generate_url(ctx.api_key);
     execute(
         request,
         ctx.actual_model,
@@ -353,7 +321,7 @@ async fn execute(
     control: AttemptControl,
 ) -> Result<IrUpstream, GatewayError> {
     let identity = stream_headers(token, credential)?;
-    let encoded = request::encode(&request, requested_model, credential.profile_arn.as_deref())?;
+    let encoded = request::encode(&request, requested_model, credential.request_profile(token))?;
     let upstream_model = encoded.upstream_model.clone();
     let options = SessionOptions {
         thinking_tags: encoded.thinking_tags,
@@ -501,6 +469,45 @@ fn observe(control: &AttemptControl, session: &Session, events: &[AiStreamDelta]
 
 // ── Admin: connection check, usage, probe ────────────────────────────────────
 
+#[derive(Debug, thiserror::Error)]
+#[error("{message}")]
+struct UsageFailure {
+    authentication_rejected: bool,
+    message: String,
+}
+
+fn usage_failure(status: u16, body: &[u8], complete: bool, headers: &HeaderMap) -> UsageFailure {
+    use super::errors::DiagnosticReason;
+    let reason = super::errors::reason_class(body, complete, headers);
+    let authentication_rejected = status == 401
+        || (status == 403
+            && matches!(
+                reason,
+                Some(
+                    DiagnosticReason::TokenExpired
+                        | DiagnosticReason::TokenInvalid
+                        | DiagnosticReason::AccountSuspended
+                )
+            ));
+    let message = if authentication_rejected {
+        format!("Kiro authentication failed (HTTP {status}); re-authorize this provider")
+    } else if status == 403 {
+        "Kiro usage access denied (HTTP 403); verify the profile, entitlement and client compatibility".into()
+    } else {
+        format!("Kiro usage check returned HTTP {status}")
+    };
+    UsageFailure {
+        authentication_rejected,
+        message,
+    }
+}
+
+pub(crate) fn usage_authentication_rejected(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<UsageFailure>()
+        .is_some_and(|error| error.authentication_rejected)
+}
+
 async fn fetch_usage_with(
     client: &reqwest::Client,
     credential: &KiroCredential,
@@ -512,7 +519,7 @@ async fn fetch_usage_with(
         ("origin", "AI_EDITOR"),
         ("resourceType", "AGENTIC_REQUEST"),
     ];
-    if let Some(arn) = credential.profile_arn.as_deref() {
+    if let Some(arn) = credential.request_profile(token) {
         query.push(("profileArn", arn));
     }
     let response = client
@@ -524,19 +531,28 @@ async fn fetch_usage_with(
         .await
         .map_err(|_| anyhow::anyhow!("Kiro usage request could not connect"))?;
     let status = response.status();
-    // Wording matters: callers map these phrases to a provider-credential
-    // failure instead of an admin-session expiry.
-    if matches!(status.as_u16(), 401 | 403) {
-        anyhow::bail!(
-            "Kiro authentication failed (HTTP {}); re-authorize this provider",
-            status.as_u16()
-        );
+    if !status.is_success() {
+        // A generic 403 can be a profile, entitlement or client-version refusal,
+        // not a revoked credential. Preserve that distinction for account state.
+        let headers = response.headers().clone();
+        let mut response = response;
+        let mut body = Vec::new();
+        let mut complete = true;
+        loop {
+            match response.chunk().await {
+                Ok(Some(chunk)) if body.len().saturating_add(chunk.len()) <= MAX_ERROR_BYTES => {
+                    body.extend_from_slice(&chunk);
+                }
+                Ok(None) => break,
+                _ => {
+                    // A broken error body must not erase an already-known 401.
+                    complete = false;
+                    break;
+                }
+            }
+        }
+        return Err(usage_failure(status.as_u16(), &body, complete, &headers).into());
     }
-    anyhow::ensure!(
-        status.is_success(),
-        "Kiro usage check returned HTTP {}",
-        status.as_u16()
-    );
     let mut response = response;
     let mut body = Vec::new();
     while let Some(chunk) = response
@@ -565,7 +581,7 @@ pub(crate) async fn fetch_usage(
     super::validate(provider)?;
     let kiro = KiroCredential::from_stored(credential);
     let client = gw.devin_http_client(provider.use_proxy, false).await?;
-    fetch_usage_with(&client, &kiro, token, &kiro.usage_limits_url()).await
+    fetch_usage_with(&client, &kiro, token, &kiro.usage_limits_url(token)).await
 }
 
 /// Authenticated, non-generating health check.
@@ -812,20 +828,11 @@ mod tests {
         assert_eq!(headers["authorization"], "Bearer access-token");
         assert_eq!(headers["content-type"], "application/json");
         assert_eq!(headers["x-amz-target"], STREAM_TARGET);
-        assert!(
-            headers["user-agent"]
-                .to_str()
-                .unwrap()
-                .ends_with(&format!("KiroIDE-0.11.63-{}", machine_id(&credential())))
-        );
-        assert_eq!(
-            headers["x-amz-user-agent"],
-            format!(
-                "aws-sdk-js/1.0.34 KiroIDE-0.11.63-{}",
-                machine_id(&credential())
-            )
-        );
-        assert_eq!(headers["amz-sdk-request"], "attempt=1; max=3");
+        for name in ["user-agent", "x-amz-user-agent"] {
+            assert_eq!(headers[name], super::super::identity::headers()[name]);
+        }
+        assert_eq!(headers["amz-sdk-request"], "attempt=1; max=1");
+        assert_eq!(headers["x-amzn-kiro-agent-mode"], "vibe");
         assert!(headers.get("tokentype").is_none());
         let body: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(
@@ -1046,7 +1053,8 @@ mod tests {
         let credential = credential();
         let headers = stream_headers("secret-token", &credential).unwrap();
         assert!(headers["authorization"].is_sensitive());
-        assert_eq!(headers["amz-sdk-request"], "attempt=1; max=3");
+        assert_eq!(headers["amz-sdk-request"], "attempt=1; max=1");
+        assert_eq!(headers["x-amzn-kiro-agent-mode"], "vibe");
         assert!(stream_headers("", &credential).is_err());
         assert!(stream_headers("   ", &credential).is_err());
         assert!(stream_headers("bad\nvalue", &credential).is_err());
@@ -1064,33 +1072,22 @@ mod tests {
     }
 
     #[test]
-    fn machine_id_is_stable_per_account_and_differs_between_accounts() {
+    fn all_accounts_and_operations_share_the_host_identity() {
         let mut a = credential();
-        a.profile_arn = Some("arn:aws:codewhisperer:us-east-1:1:profile/A".into());
         let mut b = credential();
+        a.profile_arn = Some("arn:aws:codewhisperer:us-east-1:1:profile/A".into());
         b.profile_arn = Some("arn:aws:codewhisperer:us-east-1:1:profile/B".into());
-        assert_eq!(machine_id(&a), machine_id(&a));
-        assert_ne!(machine_id(&a), machine_id(&b));
-        assert_eq!(machine_id(&a).len(), 64);
-        for account in [&a, &b] {
-            let stream = stream_headers("token", account).unwrap();
-            let usage = ide_headers("token", account).unwrap();
-            for name in ["user-agent", "x-amz-user-agent"] {
-                assert_eq!(stream[name], usage[name]);
-                assert!(
-                    stream[name]
-                        .to_str()
-                        .unwrap()
-                        .ends_with(&machine_id(account))
-                );
-            }
+        let stream = stream_headers("token-a", &a).unwrap();
+        let usage = ide_headers("token-b", &b).unwrap();
+        let auth = super::super::identity::headers();
+        for name in ["user-agent", "x-amz-user-agent"] {
+            assert_eq!(stream[name], usage[name]);
+            assert_eq!(stream[name], auth[name]);
         }
-        a.client_id = Some("client-a".into());
-        let profile_id = machine_id(&a);
-        a.client_id = Some("client-b".into());
-        assert_eq!(machine_id(&a), profile_id, "profile takes precedence");
-        a.profile_arn = None;
-        assert_eq!(machine_id(&a), hex::encode(Sha256::digest(b"client-b")));
+        assert_ne!(
+            stream["amz-sdk-invocation-id"],
+            usage["amz-sdk-invocation-id"]
+        );
     }
 
     #[test]
@@ -1123,8 +1120,8 @@ mod tests {
                 assert!(query.contains("profileArn=arn"), "{query}");
                 assert!(query.contains("origin=AI_EDITOR"), "{query}");
                 let headers = request.headers();
-                assert!(headers["user-agent"].to_str().unwrap().contains("KiroIDE-0.11.63-"));
-                assert!(headers["x-amz-user-agent"].to_str().unwrap().starts_with("aws-sdk-js/1.0.34 KiroIDE-0.11.63-"));
+                assert!(headers["user-agent"].to_str().unwrap().contains("KiroIDE-0.12.333-"));
+                assert!(headers["x-amz-user-agent"].to_str().unwrap().starts_with("aws-sdk-js/1.0.39 KiroIDE-0.12.333-"));
                 assert_eq!(headers["amz-sdk-request"], "attempt=1; max=1");
                 assert!(!headers.contains_key("x-amz-target"));
                 axum::Json(serde_json::json!({
@@ -1156,7 +1153,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn usage_auth_failures_use_the_credential_failure_wording() {
+    async fn generic_usage_forbidden_does_not_invalidate_the_credential() {
         let app = Router::new().route(
             "/getUsageLimits",
             axum::routing::get(|| async { (http::StatusCode::FORBIDDEN, "no") }),
@@ -1174,10 +1171,93 @@ mod tests {
         .await
         .unwrap_err();
         server.abort();
-        assert!(
-            error
-                .to_string()
-                .contains("authentication failed (HTTP 403)")
-        );
+        assert!(error.to_string().contains("usage access denied (HTTP 403)"));
+    }
+    #[test]
+    fn usage_authentication_requires_specific_evidence() {
+        for (status, body, expected) in [
+            (401, "no", true),
+            (
+                403,
+                r#"{"message":"User is not authorized to make this call."}"#,
+                false,
+            ),
+            (403, r#"{"message":"profileArn is invalid"}"#, false),
+            (403, r#"{"__type":"InvalidTokenException"}"#, true),
+            (403, r#"{"message":"The token has expired"}"#, true),
+            (403, r#"{"message":"Account is suspended"}"#, true),
+            (403, r#"{"message":"quota exhausted"}"#, false),
+            (500, r#"{"message":"invalid token"}"#, false),
+        ] {
+            let error: anyhow::Error =
+                usage_failure(status, body.as_bytes(), true, &HeaderMap::new()).into();
+            assert_eq!(
+                usage_authentication_rejected(&error),
+                expected,
+                "{status} {body}"
+            );
+            assert!(!error.to_string().contains("InvalidTokenException"));
+        }
+        let error: anyhow::Error = usage_failure(
+            403,
+            br#"{"message":"invalid token"}"#,
+            false,
+            &HeaderMap::new(),
+        )
+        .into();
+        assert!(!usage_authentication_rejected(&error));
+        assert!(!usage_authentication_rejected(&anyhow::anyhow!(
+            "Kiro authentication failed (HTTP 403)"
+        )));
+    }
+
+    #[tokio::test]
+    async fn api_key_generation_omits_oauth_profile() {
+        let wire = encode_event("assistantResponseEvent", r#"{"content":"OK"}"#);
+        let (url, captured, server) = mock(200, wire).await;
+        let control = control();
+        let upstream = execute(
+            input(),
+            "claude-sonnet-4.5",
+            "ksk_fixture",
+            &credential(),
+            url,
+            client(&control),
+            control,
+        )
+        .await
+        .unwrap();
+        collect(upstream).await.unwrap();
+        let (headers, body) = captured.await.unwrap();
+        server.abort();
+        assert_eq!(headers["tokentype"], "API_KEY");
+        assert_eq!(headers["x-amzn-codewhisperer-optout"], "true");
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert!(body.get("profileArn").is_none());
+    }
+    #[tokio::test]
+    async fn usage_401_with_truncated_error_body_still_invalidates_credentials() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0; 4096];
+            socket.read(&mut request).await.unwrap();
+            socket.write_all(b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 100\r\nConnection: close\r\n\r\nshort").await.unwrap();
+            socket.shutdown().await.unwrap();
+        });
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let error = fetch_usage_with(
+            &client,
+            &credential(),
+            "fixture",
+            &format!("http://{address}/usage"),
+        )
+        .await
+        .unwrap_err();
+        server.await.unwrap();
+        assert!(usage_authentication_rejected(&error));
+        assert!(error.to_string().contains("HTTP 401"));
     }
 }

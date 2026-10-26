@@ -12,11 +12,19 @@
 
 ## 上游客户端标识
 
-新的 AWS Builder ID / IAM Identity Center 设备登录使用 `clientName = "Kiro IDE"` 注册，沿用 [AIClient2API 的认证参考实现](https://github.com/justlovemaki/AIClient-2-API/blob/master/src/auth/kiro-oauth.js)。Google/GitHub 设备登录保留现有的 `clientId = "kiro-cli"`，不会执行 AWS 客户端注册。认证请求使用 `User-Agent: KiroIDE`。生成与用量请求共用现有的 `KiroIDE-0.11.63-<machine-id>` 双 User-Agent 标识，不再混用 Amazon Q CLI 与 Kiro IDE 身份。网关不会在这些客户端身份字段中添加自身品牌。
+新的 AWS Builder ID / IAM Identity Center 设备登录使用 `clientName = "Kiro IDE"` 注册。Google/GitHub 设备登录保留现有的 `clientId = "kiro-cli"`，不会执行 AWS 客户端注册。授权、令牌刷新、profile 发现、生成和用量共用一个身份构造器：参考 kiro-manager-lite 使用 `KiroIDE-0.12.333-<machine-id>` 与流式 SDK 兼容版本 `1.0.39`。Node 版本字段是兼容声明，不代表 Nyro 启动了 Node 进程。每次调用声明单次尝试并生成独立的 invocation UUID；生成请求另带 `x-amzn-kiro-agent-mode: vibe`。
+
+机器标识为进程内缓存的主机哈希，与 profile ARN、客户端注册和令牌轮换无关。Linux 优先读取规范化后的系统 machine-id；其他/回退路径使用主机名，无主机身份时使用进程内稳定的随机值。如需重启后保持一致，应保持容器 machine-id/主机名稳定。不会发送原始设备标识，也不模拟 TLS 指纹。
+
+运行时服务区域将 `eu-*` 映射到 `eu-central-1`，其他区域映射到 `us-east-1`；AWS OIDC 保留原注册区域。OAuth 生成使用 Amazon Q。显式 profile 始终优先；Builder ID/社交账号缺少 profile 时，仅在请求中使用参考实现的兼容默认值，不会存为已验证的 `subject_id`。Enterprise/IdC 使用发现的真实 profile，不猜测其他组织的 ARN。导入的 `ksk_` API Key 使用 Kiro runtime/management 端点、声明 `tokentype: API_KEY`，且绝不发送 OAuth profile。
 
 已有 AWS 注册会保留创建时的名称：升级或刷新令牌**不会**把 `Nyro Kiro Gateway` 自动改名。升级后需对受影响账号重新授权，以创建新的注册；导入凭证在重新授权前也保留原注册。重新授权不会删除旧的上游授权记录，可在上游账号设置中检查/撤销旧记录。
 
-这些值与上述参考实现对齐，并非经过完整抓包验证的当前官方客户端行为。端点、授权类型、scope、凭证存储、请求转换与重试行为均不变。名称和 HTTP 请求头一致，不代表 TLS、遥测或执行行为完全一致；真实浏览器登录和生成请求仍需单独验收。
+这些值与参考实现对齐，并非经过完整抓包验证的当前官方客户端行为。授权类型、scope、凭证存储和生成重放安全边界保持不变。本次不增加盲目生成重试、跨区域试探、TLS 模拟或企业 profile 猜测。名称和 HTTP 请求头一致，不代表遥测或执行行为完全一致；真实浏览器登录和生成请求仍需单独验收。
+
+普通的用量 HTTP 403 不再永久作废账号：只有 HTTP 401 或明确的令牌过期/无效/账号暂停证据才会标记失效。刷新 HTTP 400/403 也需要明确的 OAuth 拒绝码才会作终态处理；HTTP 401 仍为终态。诊断保留脱敏白名单错误类型和固定原因分类，不保存原始凭证或任意上游文本。升级与用量轮询不会自动清除历史 `auth_invalid` 标记；应确认上游拒绝原因后重新授权。
+
+通用用量界面区分账号池实际就绪原因（如需要登录）与真正额度耗尽，即使兼容的调度状态仍为 `quota_exhausted`。只有真正额度的 `reset_at` 才显示重置倒计时；`next_check_at` 不代表恢复承诺。
 
 ## 调度与安全切换
 

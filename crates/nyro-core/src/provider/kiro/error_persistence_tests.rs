@@ -306,6 +306,99 @@ async fn kiro_redaction_precedes_truncation_and_covers_final_header_copies() {
 }
 
 #[tokio::test]
+async fn kiro_auth_types_and_safe_reasons_survive_sqlite_without_token_bearing_messages() {
+    let mut entries = Vec::new();
+    let cases = [
+        (
+            "UnauthorizedException",
+            "The security token included in the request is expired",
+            "token_expired",
+        ),
+        (
+            "InvalidTokenException",
+            "The provided token is invalid",
+            "token_invalid",
+        ),
+        (
+            "AccessDeniedException",
+            "Authorization permission denied",
+            "permission_denied",
+        ),
+        (
+            "AccessDeniedException",
+            "Your account has been suspended; token cannot be used",
+            "account_suspended",
+        ),
+        (
+            "ServiceQuotaExceededException",
+            "Monthly quota exceeded for token",
+            "quota_exhausted",
+        ),
+    ];
+    for (error_type, message, reason) in cases {
+        // Real AWS field shapes with synthetic secrets: known types must survive,
+        // but even unknown credentials, URLs, and namespace details must not.
+        let body = serde_json::to_vec(&json!({
+            "type": format!("com.amazon.auth#{error_type}:private-type-detail"),
+            "message": format!("{message}; Authorization: Bearer {TOKEN}; other-secret-value; https://private.test/?token=other-secret-value"),
+            "unknown": TOKEN, "raw": RAW,
+        })).unwrap();
+        let mut headers = headers();
+        headers.insert(
+            "x-amzn-errortype",
+            HeaderValue::from_str(&format!(
+                "{error_type}:https://private.test/?token=other-secret-value"
+            ))
+            .unwrap(),
+        );
+        let (log, _, rendered) = run_http(403, body, headers).await;
+        let safe = &log.diagnostic.payload_metadata["kiro_upstream_error"];
+        assert_eq!(safe["code"], error_type);
+        assert_eq!(safe["error_type"], error_type);
+        assert_eq!(safe["reason_class"], reason);
+        assert_eq!(safe["message"], "Sensitive diagnostic text omitted");
+        assert!(!rendered.contains(error_type));
+        assert!(!rendered.contains(reason));
+        let encoded = format!("{log:?}");
+        for forbidden in [
+            "other-secret-value",
+            "private.test",
+            "private-type-detail",
+            "com.amazon.auth",
+        ] {
+            assert!(
+                !encoded.contains(forbidden),
+                "{forbidden} leaked to LogEntry"
+            );
+        }
+        entries.push(log);
+    }
+    let rows = persist(entries).await;
+    assert_eq!(rows.len(), cases.len());
+    for (row, (error_type, _, reason)) in rows.iter().zip(cases) {
+        let metadata: Value =
+            serde_json::from_str(row.payload_metadata.as_deref().unwrap()).unwrap();
+        let safe = &metadata["kiro_upstream_error"];
+        assert_eq!(safe["code"], error_type);
+        assert_eq!(safe["error_type"], error_type);
+        assert_eq!(safe["reason_class"], reason);
+        assert_eq!(safe["message"], "Sensitive diagnostic text omitted");
+        let encoded = serde_json::to_string(row).unwrap();
+        for forbidden in [
+            "other-secret-value",
+            "private.test",
+            "private-type-detail",
+            "com.amazon.auth",
+        ] {
+            assert!(
+                !encoded.contains(forbidden),
+                "{forbidden} leaked to RequestLog"
+            );
+        }
+    }
+}
+
+#[tokio::test]
 async fn kiro_incomplete_invalid_and_oversized_errors_never_persist_body_prefixes() {
     let mut exact = br#"{"message":"synthetic bounded validation"}"#.to_vec();
     exact.resize(MAX_ERROR_BYTES, b' ');

@@ -8,6 +8,7 @@ pub(crate) mod credential;
 mod errors;
 mod estimate;
 mod eventstream;
+pub(crate) mod identity;
 mod request;
 mod runtime;
 mod stream;
@@ -30,7 +31,7 @@ use crate::provider::{InboundResponse, OutboundRequest};
 use crate::proxy::client::ProxyClient;
 
 pub(crate) use estimate::ASSUMED_CACHE_READ_PERCENT;
-pub(crate) use runtime::{check_connection, fetch_usage, probe};
+pub(crate) use runtime::{check_connection, fetch_usage, probe, usage_authentication_rejected};
 pub(crate) use usage::KiroUsage;
 
 pub(crate) const PROTOCOL_KEY: &str = "kiro-chat/generate-assistant-response/v1";
