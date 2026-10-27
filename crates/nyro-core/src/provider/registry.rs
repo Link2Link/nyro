@@ -225,6 +225,7 @@ impl VendorRegistry {
     pub fn list_metadata_for_webui(&self) -> Vec<serde_json::Value> {
         const LEGACY_ORDER: &[&str] = &[
             "custom",
+            "nyro-gateway",
             "openai",
             "anthropic",
             "ark-coding",

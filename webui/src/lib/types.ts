@@ -1050,5 +1050,31 @@ export interface ProviderUsage {
   scheduling?: ProviderScheduling;
   /** Native Devin/Kiro account readiness, including legacy single-account providers. */
   account_pool?: AccountPoolView | null;
+  /** Nyro preset (`nyro_gateway`): the remote Nyro's forwarded usage report. */
+  upstream?: NyroUpstreamUsage | null;
   queried_at: string;
+}
+
+/** One upstream provider behind the routes the Nyro preset's key can use. */
+export interface NyroUpstreamProvider {
+  id: string;
+  name: string;
+  /** Remote preset/vendor key, for the icon. */
+  vendor?: string | null;
+  /** Remote route names this provider serves for the key. */
+  routes: string[];
+  status: ProviderUsageQueryStatus;
+  error?: string | null;
+  /** The remote's own usage snapshot (one hop deep: no `upstream`, no `account_pool`). */
+  usage?: ProviderUsage | null;
+}
+
+/** `GET /v1/nyro/usage` report forwarded by a remote Nyro. */
+export interface NyroUpstreamUsage {
+  object?: string;
+  version?: number;
+  generated_at?: string;
+  /** Fields the remote withheld from this key (`balances`, `spends`). */
+  redacted?: string[];
+  providers: NyroUpstreamProvider[];
 }

@@ -137,7 +137,7 @@ const BAILIAN_USAGE_API: &str = "zeldaHttp.apikeyMgr./tokenplan/personal/api/v2/
 const OPENAI_CODEX_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
 const OPENAI_CODEX_USAGE_TIMEOUT: Duration = Duration::from_secs(20);
 /// Max concurrent upstream usage queries when listing every provider.
-const LIST_USAGE_CONCURRENCY: usize = 4;
+pub(super) const LIST_USAGE_CONCURRENCY: usize = 4;
 const OPENAI_CODEX_BETA: &str = "codex-1";
 const OPENAI_CODEX_ORIGINATOR: &str = "Codex Desktop";
 const OPENAI_CODEX_LANGUAGE: &str = "zh-CN";
@@ -214,6 +214,10 @@ pub struct ProviderUsage {
     /// Homogeneous account capacity; never used as a synthetic routing tier.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub account_pool: Option<AccountPoolView>,
+    /// Nyro preset only: the remote Nyro's forwarded usage report
+    /// (`GET /v1/nyro/usage`), passed through as received.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upstream: Option<Value>,
 }
 
 /// Outcome of a single provider row in [`AdminService::list_provider_usage`].
@@ -322,12 +326,18 @@ enum UsageBackend {
     Devin,
     /// Kiro subscription credits, bonuses and trial via `getUsageLimits`.
     Kiro,
+    /// Nyro preset: usage forwarded by the remote Nyro (`/v1/nyro/usage`).
+    NyroGateway,
 }
 
 impl UsageBackend {
     /// Detect a backend from provider identity first, then fall back to URL
     /// matching for imported/legacy rows that predate preset + channel fields.
     fn detect(provider: &Provider) -> Option<Self> {
+        // A chained Nyro is recognised by identity only: its address is any host.
+        if crate::provider::nyro_gateway::is_nyro_gateway(provider) {
+            return Some(UsageBackend::NyroGateway);
+        }
         let is_codex_channel = provider
             .channel
             .as_deref()
@@ -466,6 +476,7 @@ impl UsageBackend {
             UsageBackend::MimoTokenPlan => "mimo_token_plan",
             UsageBackend::Devin => "devin_plan",
             UsageBackend::Kiro => "kiro_plan",
+            UsageBackend::NyroGateway => "nyro_gateway",
         }
     }
 
@@ -482,6 +493,8 @@ impl UsageBackend {
             }
             UsageBackend::Grok | UsageBackend::Devin => is_available.is_some() || !tiers.is_empty(),
             UsageBackend::Kiro => tiers.iter().any(|tier| !tier.name.starts_with("feature:")),
+            // A parsed report is authoritative even when it lists no provider.
+            UsageBackend::NyroGateway => true,
             _ => !tiers.is_empty(),
         }
     }
@@ -500,6 +513,7 @@ impl UsageBackend {
             | UsageBackend::Grok
             | UsageBackend::Devin
             | UsageBackend::Kiro
+            | UsageBackend::NyroGateway
             | UsageBackend::GoogleSubscription => "global",
             UsageBackend::ArkCoding | UsageBackend::BailianCodingPlan => "cn",
             // The MiMo console quota surface is account-scoped; the
@@ -2282,7 +2296,12 @@ impl AdminService {
     /// - Kimi For Coding: `GET https://api.kimi.com/coding/v1/usages`,
     ///   Bearer key.
     pub async fn get_provider_usage(&self, id: &str) -> anyhow::Result<ProviderUsage> {
-        self.refresh_provider_usage(id, UsageQueryMode::Full).await
+        let usage = self
+            .refresh_provider_usage(id, UsageQueryMode::Full)
+            .await?;
+        // Full snapshots back usage forwarding to downstream Nyro instances.
+        self.gw.usage_snapshots.store(&usage);
+        Ok(usage)
     }
 
     /// Query usage for every configured provider.
@@ -2367,6 +2386,13 @@ impl AdminService {
                     .collect::<Vec<_>>();
                 let tiers = if usage.kind == UsageBackend::GoogleSubscription.kind() {
                     google_scheduling_observation(&usage.tiers)
+                } else if usage.kind == UsageBackend::NyroGateway.kind() {
+                    // Pause only when every upstream provider is paused.
+                    usage
+                        .upstream
+                        .as_ref()
+                        .map(crate::provider::nyro_gateway::usage::upstream_scheduling_observation)
+                        .unwrap_or_default()
                 } else {
                     tiers
                 };
@@ -2413,7 +2439,8 @@ impl AdminService {
                  (volces.com), Bailian token-plan (token-plan.maas.aliyuncs.com), \
                  DeepSeek (api.deepseek.com), Xiaomi MiMo (platform.xiaomimimo.com,
                  Cookie-authenticated console quota), Devin CLI OAuth, Kiro OAuth and Google \
-                 subscription OAuth (Google AI Pro / Code Assist) are supported"
+                 subscription OAuth (Google AI Pro / Code Assist) and chained Nyro instances \
+                 are supported"
             )
         })?;
 
@@ -2434,7 +2461,31 @@ impl AdminService {
         };
 
         let mut kiro_overage = false;
+        let mut upstream = None;
         let (mut tiers, balances, level, is_available, spends) = match backend {
+            UsageBackend::NyroGateway => {
+                let api_key = api_key.as_deref().expect("non-OAuth backend API key");
+                let base_url = [provider.base_url.as_str()]
+                    .into_iter()
+                    .chain(
+                        provider
+                            .protocol_endpoints
+                            .iter()
+                            .filter(|endpoint| endpoint.is_enabled)
+                            .map(|endpoint| endpoint.base_url.as_str()),
+                    )
+                    .map(str::trim)
+                    .find(|value| !value.is_empty())
+                    .ok_or_else(|| anyhow::anyhow!("the Nyro provider has no remote address"))?;
+                let client = self.gw.http_client_for_provider(provider.use_proxy).await?;
+                upstream = Some(
+                    crate::provider::nyro_gateway::usage::fetch_forwarded_usage(
+                        &client, base_url, api_key,
+                    )
+                    .await?,
+                );
+                (Vec::new(), Vec::new(), None, None, Vec::new())
+            }
             UsageBackend::OpenAiCodex => {
                 if provider.effective_auth_mode().trim() != "oauth" {
                     anyhow::bail!("OpenAI Codex usage query requires an OAuth provider");
@@ -2995,6 +3046,7 @@ impl AdminService {
                 scheduling: ProviderScheduling::default(),
                 queried_at: chrono::Utc::now().to_rfc3339(),
                 account_pool: None,
+                upstream,
             },
             authoritative,
             kiro_overage,
@@ -3041,13 +3093,14 @@ impl AdminService {
         store.set(&a_key, access_key.trim()).await?;
         store.set(&b_key, secret_key.trim()).await?;
         self.gw.quota_registry.invalidate(provider_id);
+        self.gw.usage_snapshots.invalidate(provider_id);
         // A changed MiMo credential invalidates any minted console session.
         self.gw.mimo_sessions.invalidate(provider_id).await;
         Ok(())
     }
 }
 
-async fn provider_usage_monitorable(admin: &AdminService, provider: &Provider) -> bool {
+pub(super) async fn provider_usage_monitorable(admin: &AdminService, provider: &Provider) -> bool {
     if !provider.is_enabled {
         return false;
     }

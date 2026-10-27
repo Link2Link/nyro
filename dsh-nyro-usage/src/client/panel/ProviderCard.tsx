@@ -4,11 +4,17 @@
  * HTML5-draggable for manual reordering (order persisted by the panel).
  * Unsupported providers render muted; per-provider query failures render an
  * inline error banner — one vendor outage never fails the whole listing.
+ *
+ * Chained Nyro gateways: each forwarded upstream provider gets its own card
+ * (`via` set) with an accent bar and a "via upstream Nyro" line, replacing
+ * the gateway's card; the gateway card (one-line summary) only appears as a
+ * fallback when it forwards nothing drawable.
  */
 import type { DragEvent } from 'react'
 import type { NyroUsageItem } from '../../nyro.ts'
 import { agoLabel, tt } from '../tt.ts'
 import { TierBar } from './TierBar.tsx'
+import type { CardVia } from './upstream.ts'
 import css from './panel.module.css'
 
 /** Currency → symbol (anything else keeps its ISO code). */
@@ -18,9 +24,16 @@ function currencySymbol(currency: string): string {
   return `${currency} `
 }
 
+/** Money fields an upstream API key can withhold. */
+function hidesMoney(redacted: readonly string[] | undefined): boolean {
+  return (redacted ?? []).some(field => field === 'balances' || field === 'spends')
+}
+
 /** Props the card needs. */
 export interface ProviderCardProps {
   item: NyroUsageItem
+  /** Set for a provider forwarded by a chained Nyro gateway. */
+  via?: CardVia
   /** Current time, tracked so the steady-pace markers re-evaluate on the 30s tick. */
   now: number
   /** True while this card is the one being dragged (dimmed). */
@@ -37,19 +50,50 @@ export interface ProviderCardProps {
 
 /** Render one provider card. */
 export function ProviderCard(props: ProviderCardProps) {
-  const { item } = props
+  const { item, via } = props
   const usage = item.usage
-  const exhausted = usage?.scheduling?.status === 'quota_exhausted'
+  const scheduling = item.status === 'ok' ? usage?.scheduling?.status : undefined
+  const exhausted = scheduling === 'quota_exhausted'
   const balances = usage?.balances ?? []
   const spends = usage?.spends ?? []
-  const tiers = usage?.tiers ?? []
+  // Kiro reports its pooled quota as `monthly` plus one `feature:kiro:*` row
+  // per allowance component (base / bonus / free trial) that sums into it.
+  // Show only the pooled window, like the Nyro WebUI does.
+  const tiers = (usage?.tiers ?? [])
+    .filter(tier => usage?.kind !== 'kiro_plan' || !tier.name.startsWith('feature:kiro:'))
+  const upstream = usage?.upstream
 
   const classes = [css.card]
   if (!item.is_enabled) classes.push(css.cardMuted)
+  if (via !== undefined) classes.push(css.cardForwarded)
   if (exhausted) classes.push(css.cardExhausted)
   if (props.dragging === true) classes.push(css.cardDragging)
   if (props.dropBefore === true) classes.push(css.cardDropBefore)
   if (props.dropAfter === true) classes.push(css.cardDropAfter)
+
+  // Gateway card: a one-line pointer at the forwarded cards that follow it.
+  let gatewayMeta: string | null = null
+  if (upstream != null) {
+    const unsupported = upstream.providers.filter(provider => provider.status === 'unsupported').length
+    const parts = [upstream.providers.length === 0
+      ? tt('card.upstreamEmpty')
+      : tt('card.upstreamCount', { count: upstream.providers.length })]
+    if (unsupported > 0) parts.push(tt('card.upstreamUnsupported', { count: unsupported }))
+    if (hidesMoney(upstream.redacted)) parts.push(tt('card.upstreamRedacted'))
+    gatewayMeta = parts.join(' · ')
+  }
+
+  // Forwarded card: say where the numbers come from, with the detail in a tooltip.
+  const viaTitle = via === undefined
+    ? undefined
+    : [
+        via.vendor ? `${item.provider_name} · ${via.vendor}` : item.provider_name,
+        via.routes && via.routes.length > 0 ? tt('card.routes', { routes: via.routes.join(', ') }) : '',
+        via.redacted && via.redacted.length > 0 ? tt('card.redacted', { fields: via.redacted.join(', ') }) : '',
+      ].filter(line => line !== '').join('\n')
+  // Nothing else to show and the amounts were withheld: say so instead of a blank card.
+  const moneyHidden = via !== undefined && item.status === 'ok' && hidesMoney(via.redacted)
+    && tiers.length === 0 && balances.length === 0 && spends.length === 0
 
   return (
     <div
@@ -69,9 +113,15 @@ export function ProviderCard(props: ProviderCardProps) {
           {!item.is_enabled ? <span className={css.badge}>{tt('card.disabled')}</span> : null}
           {exhausted
             ? <span className={`${css.pill} ${css.pillExhausted}`}>{tt('card.quotaExhausted')}</span>
-            : <span className={`${css.pill} ${css.pillEligible}`}>{tt('card.eligible')}</span>}
+            : scheduling === 'eligible'
+              ? <span className={`${css.pill} ${css.pillEligible}`}>{tt('card.eligible')}</span>
+              : null}
         </span>
       </div>
+
+      {via !== undefined
+        ? <div className={css.viaLine} title={viaTitle}>{tt('card.via', { gateway: via.gateway })}</div>
+        : null}
 
       {item.status === 'error'
         ? (
@@ -81,6 +131,19 @@ export function ProviderCard(props: ProviderCardProps) {
           </div>
         )
         : null}
+
+      {gatewayMeta !== null
+        ? (
+          <div
+            className={css.gatewayMeta}
+            title={upstream?.redacted?.length ? tt('card.redacted', { fields: upstream.redacted.join(', ') }) : undefined}
+          >
+            {gatewayMeta}
+          </div>
+        )
+        : null}
+
+      {moneyHidden ? <div className={css.gatewayMeta}>{tt('card.upstreamHidden')}</div> : null}
 
       {tiers.length > 0
         ? (

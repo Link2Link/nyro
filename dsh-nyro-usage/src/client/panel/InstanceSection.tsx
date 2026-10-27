@@ -6,11 +6,14 @@
  * persisted per gateway.
  */
 import { useCallback, useId, useState, type DragEvent } from 'react'
-import type { NyroInstanceStatus, NyroInstanceUsage, NyroUsageItem } from '../api.ts'
+import type { NyroInstanceStatus, NyroInstanceUsage } from '../api.ts'
 import { agoLabel, tt } from '../tt.ts'
 import { bySavedOrder, useCardOrder } from './cardOrder.ts'
 import { ProviderCard } from './ProviderCard.tsx'
+import { cardEntries, countUsage, type CardEntry } from './upstream.ts'
 import css from './panel.module.css'
+
+export { countUsage, type UsageCounts } from './upstream.ts'
 
 /** Load state of one gateway. */
 export interface InstanceSectionState {
@@ -32,24 +35,6 @@ export interface InstanceSectionProps {
   onRefresh: () => void
 }
 
-/** Usage counters shown in the panel and section headers (a type alias so it reads as template values). */
-export type UsageCounts = {
-  ok: number
-  exhausted: number
-}
-
-/**
- * Count healthy and quota-exhausted providers.
- * @param items - one gateway's provider rows.
- * @returns the counters.
- */
-export function countUsage(items: readonly NyroUsageItem[]): UsageCounts {
-  return {
-    ok: items.filter(item => item.status === 'ok').length,
-    exhausted: items.filter(item => item.usage?.scheduling?.status === 'quota_exhausted').length,
-  }
-}
-
 /** Render one gateway section. */
 export function InstanceSection(props: InstanceSectionProps) {
   const { instance, state } = props
@@ -61,9 +46,15 @@ export function InstanceSection(props: InstanceSectionProps) {
 
   const items = state.usage?.items ?? []
   const counts = countUsage(items)
+  // A chained Nyro's forwarded providers become cards right after it.
   // Unsupported providers (no upstream usage API) are hidden from the grid.
-  const visible = bySavedOrder(items.filter(item => item.status !== 'unsupported'), order, item => item.provider_id)
-  const visibleIds = visible.map(item => item.provider_id)
+  const visible = bySavedOrder(
+    cardEntries(items).filter(entry => entry.item.status !== 'unsupported'),
+    order,
+    entry => entry.key,
+    entry => entry.anchor,
+  )
+  const visibleIds = visible.map(entry => entry.key)
   // A gateway-level failure: the host could not answer, or this gateway's own slice failed.
   const failure = state.error ?? state.usage?.error ?? null
   const updated = agoLabel(state.usage?.cachedAt)
@@ -81,30 +72,30 @@ export function InstanceSection(props: InstanceSectionProps) {
     return event.clientX < rect.left + rect.width / 2
   }
 
-  const cardDragHandlers = (item: NyroUsageItem) => ({
+  const cardDragHandlers = (entry: CardEntry) => ({
     onCardDragStart: (event: DragEvent<HTMLDivElement>): void => {
-      setDragId(item.provider_id)
+      setDragId(entry.key)
       event.dataTransfer.effectAllowed = 'move'
       // Firefox only starts a drag once data is set.
-      event.dataTransfer.setData('text/plain', item.provider_id)
+      event.dataTransfer.setData('text/plain', entry.key)
     },
     onCardDragEnd: clearDrag,
     onCardDragOver: (event: DragEvent<HTMLDivElement>): void => {
       if (dragId === null) return
       event.preventDefault()
       event.dataTransfer.dropEffect = 'move'
-      if (dragId === item.provider_id) return
+      if (dragId === entry.key) return
       const before = sideOf(event)
       setDropSide(previous =>
-        previous !== null && previous.id === item.provider_id && previous.before === before
+        previous !== null && previous.id === entry.key && previous.before === before
           ? previous
-          : { id: item.provider_id, before })
+          : { id: entry.key, before })
     },
     onCardDrop: (event: DragEvent<HTMLDivElement>): void => {
       if (dragId === null) return
       event.preventDefault()
       event.stopPropagation()
-      if (dragId !== item.provider_id) move(visibleIds, dragId, item.provider_id, sideOf(event))
+      if (dragId !== entry.key) move(visibleIds, dragId, entry.key, sideOf(event))
       clearDrag()
     },
   })
@@ -202,15 +193,16 @@ export function InstanceSection(props: InstanceSectionProps) {
                     clearDrag()
                   }}
                 >
-                  {visible.map(item => (
+                  {visible.map(entry => (
                     <ProviderCard
-                      key={item.provider_id}
-                      item={item}
+                      key={entry.key}
+                      item={entry.item}
+                      via={entry.via}
                       now={props.now}
-                      dragging={dragId === item.provider_id}
-                      dropBefore={dropSide !== null && dropSide.id === item.provider_id && dropSide.before && dragId !== item.provider_id}
-                      dropAfter={dropSide !== null && dropSide.id === item.provider_id && !dropSide.before && dragId !== item.provider_id}
-                      {...cardDragHandlers(item)}
+                      dragging={dragId === entry.key}
+                      dropBefore={dropSide !== null && dropSide.id === entry.key && dropSide.before && dragId !== entry.key}
+                      dropAfter={dropSide !== null && dropSide.id === entry.key && !dropSide.before && dragId !== entry.key}
+                      {...cardDragHandlers(entry)}
                     />
                   ))}
                 </div>

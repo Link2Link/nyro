@@ -1,5 +1,6 @@
 import { cn } from "@/lib/utils";
 import { useProviderIconMarkup } from "@/lib/provider-icon";
+import { NyroIcon } from "@/components/ui/nyro-icon";
 
 interface ProviderIconProps {
   /** Canonical provider identity (preset key or vendor id); outranks name and host. */
@@ -21,8 +22,10 @@ export function ProviderIcon({
   monochrome = false,
   fill = false,
 }: ProviderIconProps) {
-  const { iconMarkup } = useProviderIconMarkup({ iconKey, name, baseUrl }, monochrome);
+  const { iconKey: resolvedIconKey, iconMarkup } = useProviderIconMarkup({ iconKey, name, baseUrl }, monochrome);
   const fallback = (name || "?").slice(0, 1).toUpperCase();
+  // `nyro.svg` renders blank (artwork outside its viewBox); draw the raster mark instead.
+  const innerSize = Math.round(size * (fill ? 1 : 0.78));
 
   return (
     <span
@@ -33,7 +36,9 @@ export function ProviderIcon({
       style={{ width: size, height: size }}
       title={name || "provider"}
     >
-      {iconMarkup ? (
+      {resolvedIconKey === "nyro" ? (
+        <NyroIcon size={innerSize} monochrome={monochrome} title={name || "Nyro"} />
+      ) : iconMarkup ? (
         <span
           aria-hidden="true"
           className={cn("provider-icon-markup", fill ? "h-full w-full" : "h-[78%] w-[78%]")}

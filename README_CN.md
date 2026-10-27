@@ -114,6 +114,17 @@ Devin 是 Nyro 正式支持的供应商，接入参考 CLIProxyAPI 已观察到�
 
 Kiro 是 Nyro 正式支持的供应商，适配器基于已观察到的 Kiro 协议行为实现。网页登录使用 Kiro Social 设备接口和 [AWS SSO OIDC API](https://docs.aws.amazon.com/singlesignon/latest/OIDCAPIReference/Welcome.html)，与 [Kiro 远程认证流程](https://kiro.dev/docs/getting-started/authentication/)一致。本地测试覆盖设备初始化/轮询、拒绝、超时、减速、取消、绑定、凭证隔离及聊天/配额行为；Google/GitHub 和 Builder ID 的真实端点已通过匿名初始化验证。真实账号批准授权，以及模型权限、刷新和计费的端到端验收仍需账号实测。
 
+### 级联 Nyro 实例
+
+添加供应商时选择 **Nyro**，即可把另一个 Nyro 实例作为上游，例如边缘网关级联到中心网关。只需填写一次对端代理地址（如 `http://10.0.0.2:19530`，末尾 `/v1` 可省略），API Key 填写对端的 `NYRO_PROXY_AUTH_KEY` 或在对端创建的 API Key。
+
+- 四种协议（OpenAI Chat、OpenAI Responses、Anthropic Messages、Gemini）默认全部启用，共用同一地址和 Key；客户端请求按原协议发往对端对应端点，不做协议转换。不需要的协议可取消勾选。
+- 模型发现读取对端 `/v1/models`，返回该 Key 可访问的路由；路由时按对端的路由名称引用模型。
+- 所有请求统一使用 `Authorization: Bearer` 鉴权，兼容各版本 Nyro。
+- **用量**通过对端代理端口的 `GET /v1/nyro/usage` 转发对端的上游用量，使用同一个 Key。按该 Key 可访问的路由列出背后的每个上游供应商：套餐窗口、调度暂停状态以及它服务的路由，已暂停的排在最前。余额与消费只对对端的网关 Key 或特权 API Key 显示，其他 Key 只能看到配额窗口；即使对端未开启鉴权，匿名请求也会被拒绝。只有全部上游供应商都已暂停时，本地才暂停该供应商的调度，任一上游重置即恢复。对端需升级到本版本及以上，旧版对端会提示不支持用量转发。
+- 转发只有一层：对端不会查询它自己的 Nyro 供应商，级联实例之间不会互相查询用量形成回环。对端会复用 60 秒内的用量快照，多个下游轮询不会成倍增加对上游厂商的配额查询。
+- 不要把供应商指向本实例，也不要组成回环级联；Nyro 不检测转发回环。
+
 ### 路由能力
 
 - 基于 `virtual_model` 的精确匹配路由

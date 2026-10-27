@@ -1,7 +1,7 @@
 import { deepEqual, equal } from "node:assert/strict";
 import { test } from "node:test";
-import { isKiroOverage, providerUsagePause, providerUsageSupported, providerUsageTitle, summarizeGroupUsage, tierLabel } from "./provider-usage";
-import type { ProviderUsage } from "./types";
+import { isKiroOverage, nyroUpstreamView, providerUsagePause, providerUsageSupported, providerUsageTitle, summarizeGroupUsage, tierLabel } from "./provider-usage";
+import type { NyroUpstreamProvider, ProviderUsage } from "./types";
 
 const kiro = { vendor: "kiro", preset_key: "kiro", channel: "ide", auth_mode: "oauth" as const, base_url: "https://q.us-east-1.amazonaws.com" };
 
@@ -138,4 +138,50 @@ test("group summary sums balances per currency only for members without percent 
   ]);
   deepEqual(s.balances, [{ currency: "CNY", total: 15.5 }, { currency: "USD", total: 1 }]);
   equal(summarizeGroupUsage([]).peak, null);
+});
+
+const upstream = (name: string, over: Partial<NyroUpstreamProvider> = {}): NyroUpstreamProvider => ({
+  id: name, name, routes: ["r"], status: "ok", ...over,
+});
+
+test("a chained Nyro is a usage provider by identity, whatever its address", () => {
+  const nyro = { vendor: "nyro-gateway", preset_key: "nyro-gateway", channel: "default", auth_mode: "apikey" as const, base_url: "http://10.0.0.2:19530" };
+  equal(providerUsageSupported(nyro), true);
+  equal(providerUsageSupported({ ...nyro, vendor: null, preset_key: " Nyro-Gateway " }), true);
+  // The retired `nyro` id is the Custom preset, never the chain preset.
+  equal(providerUsageSupported({ ...nyro, vendor: "nyro", preset_key: "nyro" }), false);
+  equal(providerUsageTitle("nyro_gateway", false), "Upstream Nyro Usage");
+  equal(providerUsageTitle("nyro_gateway", true), "上游 Nyro 用量");
+  equal(tierLabel("nyro_upstream", false), "All upstream providers paused");
+});
+
+test("upstream rows put paused first, then the most used, then failures; unsupported become names", () => {
+  const view = nyroUpstreamView({
+    redacted: ["balances", "spends"],
+    providers: [
+      upstream("low", { usage: usage({ tiers: [{ name: "weekly_limit", used_percent: 10 }] }) }),
+      upstream("relay", { status: "unsupported" }),
+      upstream("broken", { status: "error", error: "HTTP 500" }),
+      upstream("high", { usage: usage({ tiers: [{ name: "five_hour", used_percent: 90 }] }) }),
+      upstream("paused", { usage: usage({ scheduling: { status: "quota_exhausted", blocking_tiers: ["daily"] } }) }),
+      upstream("balance-only", { usage: usage({}) }),
+    ],
+  });
+  deepEqual(view.shown.map((p) => p.name), ["paused", "high", "low", "balance-only", "broken"]);
+  deepEqual(view.unsupported, ["relay"]);
+  deepEqual([view.total, view.paused, view.failed, view.moneyRedacted], [6, 1, 1, true]);
+  equal(nyroUpstreamView(null).total, 0);
+  equal(nyroUpstreamView({ providers: [] }).moneyRedacted, false);
+});
+
+test("group summary reads a chained Nyro's upstream windows, never its remote balances", () => {
+  const report = { providers: [
+    upstream("kimi", { usage: usage({ tiers: [{ name: "five_hour", used_percent: 72 }] }) }),
+    upstream("deepseek", { usage: usage({ balances: [{ currency: "CNY", total: 50 } as never] }) }),
+  ] };
+  const s = summarizeGroupUsage([{ name: "edge", usage: usage({ kind: "nyro_gateway", upstream: report }) }]);
+  equal(s.peak?.name, "edge");
+  equal(s.peak?.percent, 72);
+  const balancesOnly = summarizeGroupUsage([{ name: "edge", usage: usage({ kind: "nyro_gateway", balances: [{ currency: "CNY", total: 1 } as never], upstream: { providers: [] } }) }]);
+  deepEqual(balancesOnly.balances, []);
 });

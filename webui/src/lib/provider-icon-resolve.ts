@@ -13,10 +13,13 @@
  *  the backend source of truth; every value here must be a shipped icon file name.
  *  The `custom` preset has no usable vector mark: `assets/icons/nyro.svg` renders blank
  *  (its artwork sits outside its own viewBox), so a custom provider keeps whatever its
- *  name and host identify, and otherwise falls back to the provider initial. */
+ *  name and host identify, and otherwise falls back to the provider initial. The `nyro`
+ *  key itself (the Nyro chain preset `nyro-gateway`) is drawn by the HTML badge from
+ *  `assets/icons/nyro.png` instead of the blank vector file. */
 export const ICON_ALIASES: Record<string, string> = {
   // Preset keys declared by vendor metadata.
   "ark-coding": "doubao",
+  "nyro-gateway": "nyro",
   codeium: "devin",
   cognition: "devin",
   kiro: "aws",

@@ -19,6 +19,38 @@
     ]
   },
   {
+    "id": "nyro-gateway",
+    "label": {
+      "zh": "Nyro",
+      "en": "Nyro"
+    },
+    "icon": "nyro",
+    "defaultProtocol": "openai-compatible",
+    "channels": [
+      {
+        "id": "default",
+        "label": {
+          "zh": "默认",
+          "en": "Default"
+        },
+        "baseUrls": {
+          "openai-compatible": "",
+          "openai-responses": "",
+          "anthropic-messages": "",
+          "google-gemini": ""
+        },
+        "authMode": "apikey",
+        "authSchemes": {
+          "openai-compatible": "bearer",
+          "openai-responses": "bearer",
+          "anthropic-messages": "bearer",
+          "google-gemini": "bearer"
+        },
+        "sharedKeyProtocols": true
+      }
+    ]
+  },
+  {
     "id": "openai",
     "label": {
       "zh": "OpenAI",

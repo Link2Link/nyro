@@ -93,6 +93,7 @@ import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/comp
 import { resolveProtocol, PROTOCOL_ENDPOINT_TABLE, PROTOCOL_TABLE } from "@/lib/protocol";
 import { openExternalUrl } from "@/lib/open-external";
 import { DEVIN_PROTOCOL, KIRO_PROTOCOL, isDevinProvider, isKiroProvider, nativePresetProtocol, nativeProviderProtocol, hasProviderModelCatalog } from "@/lib/native-provider";
+import { applyNyroGatewayAddress, isNyroGatewayPreset, withNyroGatewayAddress } from "@/lib/nyro-gateway";
 
 function protocolUrl(protocol: string) {
   return PROTOCOL_TABLE.find((p) => p.id === resolveProtocol(protocol))?.defaultBaseUrl
@@ -572,6 +573,39 @@ function SharedKeyProtocolPicker({
           </SelectContent>
         </Select>
       </div>
+    </div>
+  );
+}
+
+/** Remote address for the Nyro preset: one origin serves every checked protocol. */
+function NyroGatewayAddressField({
+  value,
+  isZh,
+  onChange,
+}: {
+  value: string;
+  isZh: boolean;
+  onChange: (address: string) => void;
+}) {
+  return (
+    <div className="col-span-2 space-y-2">
+      <FieldLabel
+        info={
+          isZh
+            ? "另一个 Nyro 实例的代理地址（默认端口 19530），所有勾选的协议共用该地址，可省略 /v1。API Key 填写对端的 NYRO_PROXY_AUTH_KEY 或对端创建的 API Key。"
+            : "Proxy address of the other Nyro instance (default port 19530), shared by every checked protocol; /v1 is optional. Use the remote's NYRO_PROXY_AUTH_KEY or an API key created on it."
+        }
+      >
+        {isZh ? "Nyro 地址" : "Nyro Address"}
+      </FieldLabel>
+      <Input
+        placeholder="http://<nyro-host>:19530"
+        value={value}
+        autoCapitalize="none"
+        autoCorrect="off"
+        spellCheck={false}
+        onChange={(e) => onChange(e.target.value)}
+      />
     </div>
   );
 }
@@ -1680,7 +1714,10 @@ export default function ProvidersPage() {
     // with one endpoint per checked protocol sharing the provider API key.
     const sharedChannel = presetForEdit ? presetSharedKeyChannel(presetForEdit, channel) : null;
     if (sharedChannel) {
-      const entries = sharedKeyProtocolEntries(sharedChannel);
+      // The Nyro preset ships no address; reseed missing endpoints from the saved one.
+      const entries = isNyroGatewayPreset(presetForEdit?.id)
+        ? withNyroGatewayAddress(sharedKeyProtocolEntries(sharedChannel), p.base_url ?? "")
+        : sharedKeyProtocolEntries(sharedChannel);
       const savedEndpointId = endpointOption(p.protocol || safeProtocol).id;
       const existing = (p.protocol_endpoints ?? [])
         .filter((endpoint) =>
@@ -1948,8 +1985,11 @@ export default function ProvidersPage() {
   const createIsSharedKey = createResolvedAuthMode === "apikey"
     && createSharedKeyChannel !== null
     && !createUsesVertexServiceAccount;
+  const createIsNyroGateway = createIsSharedKey && isNyroGatewayPreset(selectedPreset?.id);
   const createSharedKeyEntries = createSharedKeyChannel
-    ? sharedKeyProtocolEntries(createSharedKeyChannel)
+    ? (createIsNyroGateway
+      ? withNyroGatewayAddress(sharedKeyProtocolEntries(createSharedKeyChannel), form.base_url ?? "")
+      : sharedKeyProtocolEntries(createSharedKeyChannel))
     : [];
   const createOAuthReady = createOAuthStatus?.status === "ready";
   const createIsDevinOAuth = isDevinProvider(form);
@@ -2575,6 +2615,13 @@ export default function ProvidersPage() {
                   })}
                 />
               )}
+              {createResolvedAuthMode !== "oauth" && createIsNyroGateway && (
+                <NyroGatewayAddressField
+                  value={form.base_url ?? ""}
+                  isZh={isZh}
+                  onChange={(address) => setForm(applyNyroGatewayAddress(form, address))}
+                />
+              )}
               {createResolvedAuthMode !== "oauth" && createIsSharedKey && (
                 <SharedKeyProtocolPicker
                   entries={createSharedKeyEntries}
@@ -2677,6 +2724,7 @@ export default function ProvidersPage() {
                       && !form.api_key)
                     || (form.protocol_mode === "adaptive"
                       && !(form.protocol_endpoints ?? []).some((endpoint) => endpoint.is_enabled !== false))
+                    || (createIsNyroGateway && !(form.base_url ?? "").trim())
                     || (createResolvedAuthMode === "oauth" && !createOAuthReady)
                   }
                 >
@@ -2793,8 +2841,11 @@ export default function ProvidersPage() {
               const editingIsSharedKey = editingResolvedAuthMode === "apikey"
                 && editingSharedKeyChannel !== null
                 && !editUsesVertexServiceAccount;
+              const editingIsNyroGateway = editingIsSharedKey && isNyroGatewayPreset(editingPreset?.id);
               const editingSharedKeyEntries = editingSharedKeyChannel
-                ? sharedKeyProtocolEntries(editingSharedKeyChannel)
+                ? (editingIsNyroGateway
+                  ? withNyroGatewayAddress(sharedKeyProtocolEntries(editingSharedKeyChannel), editForm.base_url ?? "")
+                  : sharedKeyProtocolEntries(editingSharedKeyChannel))
                 : [];
               const editingProviderIsArk = p.base_url.toLowerCase().includes("volces.com");
               const editingProviderIsDeepSeek = p.base_url.toLowerCase().includes("api.deepseek.com");
@@ -3649,6 +3700,13 @@ export default function ProvidersPage() {
                           protocol: defaultProtocol,
                           protocol_endpoints: protocolEndpoints,
                         })}
+                      />
+                    ) : null}
+                    {editingResolvedAuthMode !== "oauth" && editingIsNyroGateway ? (
+                      <NyroGatewayAddressField
+                        value={editForm.base_url ?? ""}
+                        isZh={isZh}
+                        onChange={(address) => setEditForm(applyNyroGatewayAddress(editForm, address))}
                       />
                     ) : null}
                     {editingResolvedAuthMode !== "oauth" && editingIsSharedKey ? (

@@ -108,6 +108,14 @@ const zh = {
 	"card.spendMonth": "本月",
 	"card.queriedAt": "查询于 {ago}",
 	"card.dragHandle": "按住拖动可调整卡片顺序",
+	"card.via": "↳ 上游 Nyro 用量 · 经「{gateway}」转发",
+	"card.upstreamCount": "转发上游 {count} 个供应商",
+	"card.upstreamUnsupported": "{count} 个不支持查询",
+	"card.upstreamRedacted": "金额未开放",
+	"card.upstreamEmpty": "当前 API Key 下没有可见的上游供应商",
+	"card.upstreamHidden": "上游未开放金额数据（不代表为零）",
+	"card.redacted": "上游 API Key 权限未开放：{fields}（不代表用量为零）",
+	"card.routes": "模型路由：{routes}",
 	"tier.five_hour": "5小时",
 	"tier.daily": "每日",
 	"tier.weekly_limit": "每周",
@@ -202,6 +210,14 @@ const en = {
 	"card.spendMonth": "Month",
 	"card.queriedAt": "Queried {ago}",
 	"card.dragHandle": "Hold and drag to reorder cards",
+	"card.via": "↳ Upstream Nyro usage · via {gateway}",
+	"card.upstreamCount": "Forwards {count} upstream providers",
+	"card.upstreamUnsupported": "{count} without usage API",
+	"card.upstreamRedacted": "amounts hidden",
+	"card.upstreamEmpty": "No upstream providers are visible to this API key",
+	"card.upstreamHidden": "Upstream does not expose amounts (not zero)",
+	"card.redacted": "The upstream API key does not expose: {fields} (not zero usage)",
+	"card.routes": "Model routes: {routes}",
 	"tier.five_hour": "5h",
 	"tier.daily": "Daily",
 	"tier.weekly_limit": "Weekly",
@@ -355,13 +371,20 @@ function saveOrder(key, ids) {
 /**
 * Sort items by the saved id order. `Array#sort` is stable, so ids missing
 * from `order` keep their incoming relative order after the ordered ones.
+* An unsaved item with an anchor (a forwarded upstream card) sits right after
+* its saved anchor instead of falling to the end.
 */
-function bySavedOrder(items, order, idOf) {
+function bySavedOrder(items, order, idOf, anchorOf) {
 	if (order.length === 0) return items;
 	const rank = new Map(order.map((id, index) => [id, index]));
-	return [...items].sort((a, b) => {
-		return (rank.get(idOf(a)) ?? order.length) - (rank.get(idOf(b)) ?? order.length);
-	});
+	const rankOf = (item) => {
+		const own = rank.get(idOf(item));
+		if (own !== void 0) return own;
+		const anchor = anchorOf?.(item);
+		const anchored = anchor === void 0 ? void 0 : rank.get(anchor);
+		return anchored === void 0 ? order.length : anchored + .5;
+	};
+	return [...items].sort((a, b) => rankOf(a) - rankOf(b));
 }
 /** Move `dragId` to before/after `overId` inside `ids`; an unknown anchor
 * appends at the end (the whole displayed sequence is what gets saved). */
@@ -401,7 +424,7 @@ function useCardOrder(instanceId) {
 }
 //#endregion
 //#region \0dsh-nyro-usage-css:/home/ubuntu/code/nyro/dsh-nyro-usage/src/client/panel/panel.module.css.js
-const cssText$1 = "/**\n * nyro usage panel styles. Scoped by the plugin's own data attributes so\n * nothing leaks into the rest of the GUI; colors ride the dsh --dsw-* tokens\n * so the panel follows the active theme (light/dark and skins). The\n * center-column hide rules are attribute-scoped and must stay in this\n * stylesheet (it is imported by mount.tsx, so the styles load with the\n * plugin).\n *\n * Class names get the `nyu-` prefix at build time (see tsdown.config.ts).\n */\n\n/* --- center-column takeover (global rules, attribute-scoped) ---------------- */\n\n[data-pane='conversation'],\n[class*='centerCol'] {\n  position: relative;\n}\n\n/* The panel container rides inside the conversation grid item as an extra\n   trailing child; hidden unless the panel is active. */\n[data-dsh-nyro-usage-view] {\n  position: absolute;\n  inset: 0;\n  display: none;\n  z-index: 60;\n  background: var(--dsw-alias-bg-base);\n  overflow: hidden;\n}\n\nhtml[data-dsh-nyro-usage-active]:not([data-dsh-taskboard-active]):not([data-dsh-ssh-active]) [data-dsh-nyro-usage-view] {\n  display: block;\n}\n\nhtml[data-dsh-nyro-usage-active]:not([data-dsh-taskboard-active]):not([data-dsh-ssh-active]) [data-pane='conversation'] > :not([data-dsh-nyro-usage-view]),\nhtml[data-dsh-nyro-usage-active]:not([data-dsh-taskboard-active]):not([data-dsh-ssh-active]) [class*='centerCol'] > :not([data-dsh-nyro-usage-view]) {\n  display: none !important;\n}\n\n/* --- sidebar entry (mirrors the shell's nav-item look) ---------------------- */\n\n.nyu-entry {\n  width: 100%;\n  height: 32px;\n  color: var(--dsw-alias-label-secondary);\n  cursor: pointer;\n  white-space: nowrap;\n  background: 0 0;\n  border: none;\n  border-radius: 8px;\n  align-items: center;\n  gap: 8px;\n  padding: 0 12px;\n  font-size: 13px;\n  display: flex;\n}\n\n.nyu-entry:hover {\n  background: var(--dsw-specific-sidebar-nav-item-hover);\n  color: var(--dsw-alias-label-primary);\n}\n\n.nyu-entry[data-active] {\n  background: var(--dsw-specific-sidebar-nav-item-active);\n  color: var(--dsw-alias-label-primary);\n  font-weight: 600;\n}\n\n.nyu-entryIcon {\n  flex: none;\n  justify-content: center;\n  align-items: center;\n  display: inline-flex;\n}\n\n.nyu-entryLabel {\n  text-overflow: ellipsis;\n  overflow: hidden;\n}\n\n[data-dsh-frame][data-sidebar-collapsed] .nyu-entry {\n  justify-content: center;\n  width: 100%;\n  padding: 0;\n}\n\n[data-dsh-frame][data-sidebar-collapsed] .nyu-entryLabel {\n  display: none;\n}\n\n/* --- panel frame ------------------------------------------------------------ */\n\n.nyu-panel {\n  background: var(--dsw-alias-bg-base);\n  min-width: 0;\n  height: 100%;\n  min-height: 0;\n  color: var(--dsw-alias-label-primary);\n  font-family: var(--dsw-font-family);\n  flex-direction: column;\n  gap: 12px;\n  padding: 14px 16px 16px;\n  display: flex;\n}\n\n.nyu-panelHeader {\n  flex: none;\n  align-items: center;\n  flex-wrap: wrap;\n  gap: 10px;\n  display: flex;\n}\n\n.nyu-panelTitle {\n  color: var(--dsw-alias-label-primary);\n  white-space: nowrap;\n  flex: none;\n  margin: 0;\n  font-size: 16px;\n  font-weight: 700;\n}\n\n.nyu-baseUrlChip {\n  color: var(--dsw-alias-label-tertiary);\n  background: var(--dsw-alias-bg-layer-2);\n  border: 1px solid var(--dsw-alias-border-l1);\n  white-space: nowrap;\n  max-width: 260px;\n  overflow: hidden;\n  text-overflow: ellipsis;\n  border-radius: 999px;\n  padding: 2px 10px;\n  font-size: 11.5px;\n  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;\n}\n\n.nyu-summary {\n  color: var(--dsw-alias-label-secondary);\n  white-space: nowrap;\n  font-size: 12px;\n}\n\n.nyu-toolbarSpacer {\n  flex: 1;\n}\n\n.nyu-autoRefreshLabel {\n  color: var(--dsw-alias-label-secondary);\n  align-items: center;\n  gap: 6px;\n  font-size: 12px;\n  display: inline-flex;\n}\n\n.nyu-autoRefreshSelect {\n  color: var(--dsw-alias-label-primary);\n  background: var(--dsw-specific-input-major);\n  border: 1px solid var(--dsw-alias-border-l2);\n  border-radius: 8px;\n  outline: none;\n  padding: 4px 8px;\n  font: inherit;\n  font-size: 12px;\n}\n\n.nyu-updated {\n  color: var(--dsw-alias-label-tertiary);\n  white-space: nowrap;\n  font-size: 11.5px;\n}\n\n.nyu-refreshButton {\n  color: var(--dsw-alias-label-primary-foreground);\n  background: var(--dsh-alias-button-info-fill, var(--dsw-alias-state-business-primary));\n  cursor: pointer;\n  white-space: nowrap;\n  align-items: center;\n  gap: 6px;\n  border: none;\n  border-radius: 8px;\n  padding: 6px 14px;\n  font-size: 13px;\n  font-weight: 600;\n  display: inline-flex;\n}\n\n.nyu-refreshButton:hover:not(:disabled) {\n  background: var(--dsh-alias-button-info-hover, var(--dsw-alias-state-business-primary));\n}\n\n.nyu-refreshButton:disabled {\n  opacity: 0.5;\n  cursor: default;\n}\n\n.nyu-spinner {\n  border: 2px solid currentcolor;\n  border-top-color: transparent;\n  border-radius: 50%;\n  flex: none;\n  width: 11px;\n  height: 11px;\n  animation: 0.8s linear infinite nyu-spin;\n  display: inline-block;\n}\n\n@keyframes nyu-spin {\n  to {\n    transform: rotate(360deg);\n  }\n}\n\n.nyu-panelContent {\n  flex-direction: column;\n  flex: 1;\n  gap: 12px;\n  min-height: 0;\n  display: flex;\n  overflow-y: auto;\n}\n\n.nyu-placeholder {\n  text-align: center;\n  color: var(--dsw-alias-label-tertiary);\n  gap: 6px;\n  padding: 40px 16px;\n  font-size: 12.5px;\n  display: flex;\n  flex-direction: column;\n}\n\n.nyu-placeholderTitle {\n  color: var(--dsw-alias-label-secondary);\n  margin: 0;\n  font-size: 14px;\n  font-weight: 600;\n}\n\n.nyu-placeholderHint {\n  margin: 0;\n  line-height: 1.6;\n}\n\n.nyu-loadError {\n  color: var(--dsw-alias-state-error-primary);\n  background: var(--dsw-alias-bg-layer-2);\n  border: 1px solid var(--dsw-alias-state-error-primary);\n  align-items: center;\n  justify-content: space-between;\n  gap: 12px;\n  border-radius: 10px;\n  padding: 10px 14px;\n  font-size: 12.5px;\n  line-height: 1.5;\n  display: flex;\n}\n\n.nyu-retryButton {\n  color: var(--dsw-alias-label-primary);\n  border: 1px solid var(--dsw-alias-border-l2);\n  cursor: pointer;\n  white-space: nowrap;\n  background: 0 0;\n  border-radius: 8px;\n  padding: 4px 12px;\n  font: inherit;\n  font-size: 12px;\n  flex: none;\n}\n\n.nyu-retryButton:hover {\n  background: var(--dsw-alias-interactive-bg-hover);\n}\n\n/* --- per-gateway sections ---------------------------------------------------- */\n\n.nyu-instanceCount {\n  color: var(--dsw-alias-label-secondary);\n  background: var(--dsw-alias-bg-layer-2);\n  border: 1px solid var(--dsw-alias-border-l1);\n  white-space: nowrap;\n  border-radius: 999px;\n  padding: 2px 10px;\n  font-size: 11.5px;\n}\n\n.nyu-section {\n  flex-direction: column;\n  flex: none;\n  gap: 10px;\n  min-width: 0;\n  display: flex;\n}\n\n.nyu-section + .nyu-section {\n  border-top: 1px solid var(--dsw-alias-border-l1);\n  padding-top: 14px;\n}\n\n.nyu-sectionHeader {\n  align-items: center;\n  flex-wrap: wrap;\n  gap: 8px 10px;\n  min-width: 0;\n  display: flex;\n}\n\n.nyu-sectionToggle {\n  appearance: none;\n  color: var(--dsw-alias-label-primary);\n  cursor: pointer;\n  background: 0 0;\n  border: none;\n  border-radius: 6px;\n  align-items: center;\n  gap: 6px;\n  min-width: 0;\n  max-width: 100%;\n  padding: 2px 4px;\n  font: inherit;\n  display: inline-flex;\n}\n\n.nyu-sectionToggle:hover {\n  background: var(--dsw-alias-interactive-bg-hover);\n}\n\n.nyu-sectionToggle:focus-visible,\n.nyu-sectionRefresh:focus-visible {\n  outline: 2px solid var(--dsw-alias-brand-primary);\n  outline-offset: 1px;\n}\n\n.nyu-sectionChevron {\n  color: var(--dsw-alias-label-tertiary);\n  flex: none;\n  transition: transform 0.16s;\n}\n\n.nyu-sectionChevronCollapsed {\n  transform: rotate(-90deg);\n}\n\n.nyu-sectionHeading {\n  min-width: 0;\n  margin: 0;\n  font-size: 14px;\n  font-weight: 600;\n}\n\n.nyu-sectionTitle {\n  white-space: nowrap;\n  text-overflow: ellipsis;\n  overflow: hidden;\n}\n\n.nyu-sectionBody {\n  flex-direction: column;\n  gap: 10px;\n  min-width: 0;\n  display: flex;\n}\n\n.nyu-sectionRefresh {\n  color: var(--dsw-alias-label-secondary);\n  border: 1px solid var(--dsw-alias-border-l2);\n  cursor: pointer;\n  white-space: nowrap;\n  background: 0 0;\n  border-radius: 8px;\n  align-items: center;\n  gap: 6px;\n  padding: 3px 10px;\n  font: inherit;\n  font-size: 12px;\n  display: inline-flex;\n}\n\n.nyu-sectionRefresh:hover:not(:disabled) {\n  color: var(--dsw-alias-label-primary);\n  background: var(--dsw-alias-interactive-bg-hover);\n}\n\n.nyu-sectionRefresh:disabled {\n  opacity: 0.5;\n  cursor: default;\n}\n\n/* --- provider card grid ------------------------------------------------------ */\n\n.nyu-grid {\n  grid-template-columns: repeat(auto-fill, minmax(340px, 1fr));\n  gap: 12px;\n  display: grid;\n}\n\n.nyu-card {\n  background: var(--dsw-alias-bg-layer-2);\n  border: 1px solid var(--dsw-alias-border-l1);\n  border-radius: 12px;\n  flex-direction: column;\n  gap: 10px;\n  padding: 12px 14px;\n  display: flex;\n  min-width: 0;\n}\n\n/* --- drag-to-reorder --------------------------------------------------------- */\n\n/* Grip affordance: the whole card is draggable, the grip just says so. */\n.nyu-dragHandle {\n  color: var(--dsw-alias-label-tertiary);\n  cursor: grab;\n  flex: none;\n  font-size: 14px;\n  line-height: 1;\n  opacity: 0.8;\n}\n\n.nyu-dragHandle:hover {\n  color: var(--dsw-alias-label-secondary);\n  opacity: 1;\n}\n\n/* Source card dims while a drag is in flight. */\n.nyu-cardDragging {\n  opacity: 0.4;\n}\n\n/* Insertion indicator: a business-colored bar on the target edge. */\n.nyu-cardDropBefore {\n  box-shadow: -3px 0 0 0 var(--dsw-alias-state-business-primary);\n}\n\n.nyu-cardDropAfter {\n  box-shadow: 3px 0 0 0 var(--dsw-alias-state-business-primary);\n}\n\n.nyu-resetOrderButton {\n  color: var(--dsw-alias-label-secondary);\n  background: 0 0;\n  border: 1px solid var(--dsw-alias-border-l2);\n  cursor: pointer;\n  white-space: nowrap;\n  border-radius: 8px;\n  padding: 5px 12px;\n  font: inherit;\n  font-size: 12px;\n  flex: none;\n}\n\n.nyu-resetOrderButton:hover {\n  color: var(--dsw-alias-label-primary);\n  background: var(--dsw-alias-interactive-bg-hover);\n}\n\n.nyu-cardMuted {\n  opacity: 0.55;\n}\n\n.nyu-cardExhausted {\n  border-color: var(--dsw-alias-state-error-primary);\n}\n\n.nyu-cardHeader {\n  align-items: center;\n  gap: 8px;\n  display: flex;\n}\n\n.nyu-cardTitle {\n  color: var(--dsw-alias-label-primary);\n  text-overflow: ellipsis;\n  white-space: nowrap;\n  min-width: 0;\n  flex: 1;\n  overflow: hidden;\n  font-size: 13.5px;\n  font-weight: 600;\n}\n\n.nyu-cardBadges {\n  align-items: center;\n  gap: 6px;\n  flex-wrap: wrap;\n  justify-content: flex-end;\n  display: inline-flex;\n}\n\n.nyu-badge {\n  color: var(--dsw-alias-label-secondary);\n  background: var(--dsw-alias-bg-layer-3);\n  border: 1px solid var(--dsw-alias-border-l2);\n  white-space: nowrap;\n  border-radius: 999px;\n  padding: 1px 8px;\n  font-size: 11px;\n  line-height: 1.6;\n  display: inline-block;\n}\n\n.nyu-badgeLevel {\n  color: var(--dsw-alias-state-business-primary);\n  border-color: var(--dsw-alias-state-business-primary);\n  background: 0 0;\n}\n\n.nyu-pill {\n  white-space: nowrap;\n  border-radius: 999px;\n  padding: 1px 8px;\n  font-size: 11px;\n  font-weight: 600;\n  line-height: 1.6;\n  display: inline-block;\n}\n\n.nyu-pillEligible {\n  color: var(--dsw-alias-state-success-primary);\n  border: 1px solid var(--dsw-alias-state-success-primary);\n}\n\n.nyu-pillExhausted {\n  color: #fff;\n  background: var(--dsw-alias-state-error-primary);\n  border: 1px solid var(--dsw-alias-state-error-primary);\n}\n\n.nyu-errorBanner {\n  color: var(--dsw-alias-state-error-primary);\n  background: var(--dsw-alias-bg-layer-3);\n  border: 1px solid var(--dsw-alias-separator-primary);\n  border-left: 3px solid var(--dsw-alias-state-error-primary);\n  flex-direction: column;\n  gap: 2px;\n  border-radius: 8px;\n  padding: 8px 10px;\n  display: flex;\n}\n\n.nyu-errorTitle {\n  font-size: 11.5px;\n  font-weight: 600;\n}\n\n.nyu-errorText {\n  color: var(--dsw-alias-label-secondary);\n  overflow-wrap: anywhere;\n  font-size: 11.5px;\n  line-height: 1.5;\n}\n\n/* --- quota tier rows --------------------------------------------------------- */\n\n.nyu-tierList {\n  flex-direction: column;\n  gap: 7px;\n  display: flex;\n}\n\n.nyu-tierRow {\n  align-items: center;\n  gap: 8px;\n  font-size: 12px;\n  display: flex;\n}\n\n.nyu-tierLabel {\n  color: var(--dsw-alias-label-secondary);\n  text-overflow: ellipsis;\n  white-space: nowrap;\n  min-width: 84px;\n  max-width: 150px;\n  overflow: hidden;\n  flex: none;\n  font-weight: 500;\n}\n\n.nyu-tierTrack {\n  background: var(--dsw-alias-interactive-bg-hover);\n  border-radius: 999px;\n  height: 8px;\n  flex: 1;\n  /* visible overflow: the steady-pace triangle renders above the track. */\n  overflow: visible;\n  position: relative;\n}\n\n.nyu-tierFill {\n  border-radius: 999px;\n  height: 100%;\n  transition: width 0.15s linear;\n  /* clip the fill itself to the track's rounded shape. */\n  overflow: hidden;\n}\n\n/* Steady-pace indicator: a small triangle hovering above the track,\n   pointing down at the position an even consumer would be at right now\n   (0% right after reset → 100% at reset time). Rendered outside the track's\n   rounded clipping via the wrapper's overflow: visible. */\n.nyu-tierPaceWrap {\n  position: absolute;\n  top: -8px;\n  left: 0;\n  right: 0;\n  height: 0;\n  pointer-events: none;\n}\n\n.nyu-tierPace {\n  position: absolute;\n  top: 0;\n  width: 0;\n  height: 0;\n  transform: translateX(-50%);\n  border-left: 4px solid transparent;\n  border-right: 4px solid transparent;\n  /* Theme-tracking ink: the token flips with body[data-ds-dark-theme] —\n     bright (neutral-50) on dark backgrounds, dark (neutral-1000) on light\n     ones. The bg-colored drop-shadow halo separates the shape from the\n     colored fill and the pale track in both themes. */\n  border-top: 5px solid var(--dsw-alias-label-primary, #334155);\n  filter: drop-shadow(0 0 1.5px var(--dsw-alias-bg-base, rgba(255, 255, 255, 0.9)));\n  cursor: help;\n  pointer-events: auto;\n}\n\n.nyu-tierFillOk {\n  background: var(--dsw-alias-state-success-primary);\n}\n\n.nyu-tierFillWarn {\n  background: var(--dsw-alias-state-warn-primary);\n}\n\n.nyu-tierFillDanger {\n  background: var(--dsw-alias-state-error-primary);\n}\n\n/* --- balances / spends ------------------------------------------------------- */\n\n.nyu-tierPercent {\n  width: 38px;\n  text-align: right;\n  flex: none;\n  font-weight: 600;\n  font-variant-numeric: tabular-nums;\n}\n\n.nyu-tierPercentOk {\n  color: var(--dsw-alias-state-success-primary);\n}\n\n.nyu-tierPercentWarn {\n  color: var(--dsw-alias-state-warn-primary);\n}\n\n.nyu-tierPercentDanger {\n  color: var(--dsw-alias-state-error-primary);\n}\n\n.nyu-tierReset {\n  color: var(--dsw-alias-label-tertiary);\n  white-space: nowrap;\n  width: 52px;\n  text-align: right;\n  flex: none;\n  font-size: 10.5px;\n  font-variant-numeric: tabular-nums;\n}\n\n/* --- balances / spends ------------------------------------------------------- */\n\n.nyu-balanceList {\n  flex-direction: column;\n  gap: 5px;\n  display: flex;\n}\n\n.nyu-balanceRow {\n  align-items: baseline;\n  gap: 6px;\n  font-size: 12px;\n  display: flex;\n}\n\n.nyu-balanceLabel {\n  color: var(--dsw-alias-label-secondary);\n  width: 52px;\n  flex: none;\n  font-weight: 500;\n}\n\n.nyu-balanceValue {\n  color: var(--dsw-alias-label-primary);\n  font-weight: 600;\n  font-variant-numeric: tabular-nums;\n}\n\n.nyu-balanceDetail {\n  color: var(--dsw-alias-label-tertiary);\n  font-size: 10.5px;\n}\n\n.nyu-unavailableBadge {\n  color: var(--dsw-alias-state-error-primary);\n  font-weight: 700;\n}\n\n.nyu-spendRow {\n  color: var(--dsw-alias-label-secondary);\n  align-items: center;\n  flex-wrap: wrap;\n  gap: 4px 14px;\n  font-size: 12px;\n  display: flex;\n}\n\n.nyu-spendValue {\n  color: var(--dsw-alias-label-primary);\n  font-weight: 600;\n  font-variant-numeric: tabular-nums;\n}\n\n.nyu-cardFooter {\n  color: var(--dsw-alias-label-tertiary);\n  font-size: 10.5px;\n}\n\n@media (prefers-reduced-motion: reduce) {\n  .nyu-tierFill,\n  .nyu-spinner,\n  .nyu-sectionChevron {\n    transition: none;\n    animation-duration: 1.6s;\n  }\n}\n";
+const cssText$1 = "/**\n * nyro usage panel styles. Scoped by the plugin's own data attributes so\n * nothing leaks into the rest of the GUI; colors ride the dsh --dsw-* tokens\n * so the panel follows the active theme (light/dark and skins). The\n * center-column hide rules are attribute-scoped and must stay in this\n * stylesheet (it is imported by mount.tsx, so the styles load with the\n * plugin).\n *\n * Class names get the `nyu-` prefix at build time (see tsdown.config.ts).\n */\n\n/* --- center-column takeover (global rules, attribute-scoped) ---------------- */\n\n[data-pane='conversation'],\n[class*='centerCol'] {\n  position: relative;\n}\n\n/* The panel container rides inside the conversation grid item as an extra\n   trailing child; hidden unless the panel is active. */\n[data-dsh-nyro-usage-view] {\n  position: absolute;\n  inset: 0;\n  display: none;\n  z-index: 60;\n  background: var(--dsw-alias-bg-base);\n  overflow: hidden;\n}\n\nhtml[data-dsh-nyro-usage-active]:not([data-dsh-taskboard-active]):not([data-dsh-ssh-active]) [data-dsh-nyro-usage-view] {\n  display: block;\n}\n\nhtml[data-dsh-nyro-usage-active]:not([data-dsh-taskboard-active]):not([data-dsh-ssh-active]) [data-pane='conversation'] > :not([data-dsh-nyro-usage-view]),\nhtml[data-dsh-nyro-usage-active]:not([data-dsh-taskboard-active]):not([data-dsh-ssh-active]) [class*='centerCol'] > :not([data-dsh-nyro-usage-view]) {\n  display: none !important;\n}\n\n/* --- sidebar entry (mirrors the shell's nav-item look) ---------------------- */\n\n.nyu-entry {\n  width: 100%;\n  height: 32px;\n  color: var(--dsw-alias-label-secondary);\n  cursor: pointer;\n  white-space: nowrap;\n  background: 0 0;\n  border: none;\n  border-radius: 8px;\n  align-items: center;\n  gap: 8px;\n  padding: 0 12px;\n  font-size: 13px;\n  display: flex;\n}\n\n.nyu-entry:hover {\n  background: var(--dsw-specific-sidebar-nav-item-hover);\n  color: var(--dsw-alias-label-primary);\n}\n\n.nyu-entry[data-active] {\n  background: var(--dsw-specific-sidebar-nav-item-active);\n  color: var(--dsw-alias-label-primary);\n  font-weight: 600;\n}\n\n.nyu-entryIcon {\n  flex: none;\n  justify-content: center;\n  align-items: center;\n  display: inline-flex;\n}\n\n.nyu-entryLabel {\n  text-overflow: ellipsis;\n  overflow: hidden;\n}\n\n[data-dsh-frame][data-sidebar-collapsed] .nyu-entry {\n  justify-content: center;\n  width: 100%;\n  padding: 0;\n}\n\n[data-dsh-frame][data-sidebar-collapsed] .nyu-entryLabel {\n  display: none;\n}\n\n/* --- panel frame ------------------------------------------------------------ */\n\n.nyu-panel {\n  background: var(--dsw-alias-bg-base);\n  min-width: 0;\n  height: 100%;\n  min-height: 0;\n  color: var(--dsw-alias-label-primary);\n  font-family: var(--dsw-font-family);\n  flex-direction: column;\n  gap: 12px;\n  padding: 14px 16px 16px;\n  display: flex;\n}\n\n.nyu-panelHeader {\n  flex: none;\n  align-items: center;\n  flex-wrap: wrap;\n  gap: 10px;\n  display: flex;\n}\n\n.nyu-panelTitle {\n  color: var(--dsw-alias-label-primary);\n  white-space: nowrap;\n  flex: none;\n  margin: 0;\n  font-size: 16px;\n  font-weight: 700;\n}\n\n.nyu-baseUrlChip {\n  color: var(--dsw-alias-label-tertiary);\n  background: var(--dsw-alias-bg-layer-2);\n  border: 1px solid var(--dsw-alias-border-l1);\n  white-space: nowrap;\n  max-width: 260px;\n  overflow: hidden;\n  text-overflow: ellipsis;\n  border-radius: 999px;\n  padding: 2px 10px;\n  font-size: 11.5px;\n  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;\n}\n\n.nyu-summary {\n  color: var(--dsw-alias-label-secondary);\n  white-space: nowrap;\n  font-size: 12px;\n}\n\n.nyu-toolbarSpacer {\n  flex: 1;\n}\n\n.nyu-autoRefreshLabel {\n  color: var(--dsw-alias-label-secondary);\n  align-items: center;\n  gap: 6px;\n  font-size: 12px;\n  display: inline-flex;\n}\n\n.nyu-autoRefreshSelect {\n  color: var(--dsw-alias-label-primary);\n  background: var(--dsw-specific-input-major);\n  border: 1px solid var(--dsw-alias-border-l2);\n  border-radius: 8px;\n  outline: none;\n  padding: 4px 8px;\n  font: inherit;\n  font-size: 12px;\n}\n\n.nyu-updated {\n  color: var(--dsw-alias-label-tertiary);\n  white-space: nowrap;\n  font-size: 11.5px;\n}\n\n.nyu-refreshButton {\n  color: var(--dsw-alias-label-primary-foreground);\n  background: var(--dsh-alias-button-info-fill, var(--dsw-alias-state-business-primary));\n  cursor: pointer;\n  white-space: nowrap;\n  align-items: center;\n  gap: 6px;\n  border: none;\n  border-radius: 8px;\n  padding: 6px 14px;\n  font-size: 13px;\n  font-weight: 600;\n  display: inline-flex;\n}\n\n.nyu-refreshButton:hover:not(:disabled) {\n  background: var(--dsh-alias-button-info-hover, var(--dsw-alias-state-business-primary));\n}\n\n.nyu-refreshButton:disabled {\n  opacity: 0.5;\n  cursor: default;\n}\n\n.nyu-spinner {\n  border: 2px solid currentcolor;\n  border-top-color: transparent;\n  border-radius: 50%;\n  flex: none;\n  width: 11px;\n  height: 11px;\n  animation: 0.8s linear infinite nyu-spin;\n  display: inline-block;\n}\n\n@keyframes nyu-spin {\n  to {\n    transform: rotate(360deg);\n  }\n}\n\n.nyu-panelContent {\n  flex-direction: column;\n  flex: 1;\n  gap: 12px;\n  min-height: 0;\n  display: flex;\n  overflow-y: auto;\n}\n\n.nyu-placeholder {\n  text-align: center;\n  color: var(--dsw-alias-label-tertiary);\n  gap: 6px;\n  padding: 40px 16px;\n  font-size: 12.5px;\n  display: flex;\n  flex-direction: column;\n}\n\n.nyu-placeholderTitle {\n  color: var(--dsw-alias-label-secondary);\n  margin: 0;\n  font-size: 14px;\n  font-weight: 600;\n}\n\n.nyu-placeholderHint {\n  margin: 0;\n  line-height: 1.6;\n}\n\n.nyu-loadError {\n  color: var(--dsw-alias-state-error-primary);\n  background: var(--dsw-alias-bg-layer-2);\n  border: 1px solid var(--dsw-alias-state-error-primary);\n  align-items: center;\n  justify-content: space-between;\n  gap: 12px;\n  border-radius: 10px;\n  padding: 10px 14px;\n  font-size: 12.5px;\n  line-height: 1.5;\n  display: flex;\n}\n\n.nyu-retryButton {\n  color: var(--dsw-alias-label-primary);\n  border: 1px solid var(--dsw-alias-border-l2);\n  cursor: pointer;\n  white-space: nowrap;\n  background: 0 0;\n  border-radius: 8px;\n  padding: 4px 12px;\n  font: inherit;\n  font-size: 12px;\n  flex: none;\n}\n\n.nyu-retryButton:hover {\n  background: var(--dsw-alias-interactive-bg-hover);\n}\n\n/* --- per-gateway sections ---------------------------------------------------- */\n\n.nyu-instanceCount {\n  color: var(--dsw-alias-label-secondary);\n  background: var(--dsw-alias-bg-layer-2);\n  border: 1px solid var(--dsw-alias-border-l1);\n  white-space: nowrap;\n  border-radius: 999px;\n  padding: 2px 10px;\n  font-size: 11.5px;\n}\n\n.nyu-section {\n  flex-direction: column;\n  flex: none;\n  gap: 10px;\n  min-width: 0;\n  display: flex;\n}\n\n.nyu-section + .nyu-section {\n  border-top: 1px solid var(--dsw-alias-border-l1);\n  padding-top: 14px;\n}\n\n.nyu-sectionHeader {\n  align-items: center;\n  flex-wrap: wrap;\n  gap: 8px 10px;\n  min-width: 0;\n  display: flex;\n}\n\n.nyu-sectionToggle {\n  appearance: none;\n  color: var(--dsw-alias-label-primary);\n  cursor: pointer;\n  background: 0 0;\n  border: none;\n  border-radius: 6px;\n  align-items: center;\n  gap: 6px;\n  min-width: 0;\n  max-width: 100%;\n  padding: 2px 4px;\n  font: inherit;\n  display: inline-flex;\n}\n\n.nyu-sectionToggle:hover {\n  background: var(--dsw-alias-interactive-bg-hover);\n}\n\n.nyu-sectionToggle:focus-visible,\n.nyu-sectionRefresh:focus-visible {\n  outline: 2px solid var(--dsw-alias-brand-primary);\n  outline-offset: 1px;\n}\n\n.nyu-sectionChevron {\n  color: var(--dsw-alias-label-tertiary);\n  flex: none;\n  transition: transform 0.16s;\n}\n\n.nyu-sectionChevronCollapsed {\n  transform: rotate(-90deg);\n}\n\n.nyu-sectionHeading {\n  min-width: 0;\n  margin: 0;\n  font-size: 14px;\n  font-weight: 600;\n}\n\n.nyu-sectionTitle {\n  white-space: nowrap;\n  text-overflow: ellipsis;\n  overflow: hidden;\n}\n\n.nyu-sectionBody {\n  flex-direction: column;\n  gap: 10px;\n  min-width: 0;\n  display: flex;\n}\n\n.nyu-sectionRefresh {\n  color: var(--dsw-alias-label-secondary);\n  border: 1px solid var(--dsw-alias-border-l2);\n  cursor: pointer;\n  white-space: nowrap;\n  background: 0 0;\n  border-radius: 8px;\n  align-items: center;\n  gap: 6px;\n  padding: 3px 10px;\n  font: inherit;\n  font-size: 12px;\n  display: inline-flex;\n}\n\n.nyu-sectionRefresh:hover:not(:disabled) {\n  color: var(--dsw-alias-label-primary);\n  background: var(--dsw-alias-interactive-bg-hover);\n}\n\n.nyu-sectionRefresh:disabled {\n  opacity: 0.5;\n  cursor: default;\n}\n\n/* --- provider card grid ------------------------------------------------------ */\n\n.nyu-grid {\n  grid-template-columns: repeat(auto-fill, minmax(340px, 1fr));\n  gap: 12px;\n  display: grid;\n}\n\n.nyu-card {\n  background: var(--dsw-alias-bg-layer-2);\n  border: 1px solid var(--dsw-alias-border-l1);\n  border-radius: 12px;\n  flex-direction: column;\n  gap: 10px;\n  padding: 12px 14px;\n  display: flex;\n  min-width: 0;\n}\n\n/* --- chained Nyro: forwarded upstream provider cards --------------------------\n   Each upstream provider a chained Nyro forwards gets its own ordinary card;\n   a left accent bar plus the \"via\" line mark it as upstream Nyro usage.\n   Declared before .nyu-cardExhausted so a paused upstream still reads red. */\n\n.nyu-cardForwarded {\n  border-left: 3px solid var(--dsw-alias-state-business-primary);\n}\n\n.nyu-viaLine {\n  color: var(--dsw-alias-state-business-primary);\n  white-space: nowrap;\n  text-overflow: ellipsis;\n  overflow: hidden;\n  margin-top: -4px;\n  font-size: 11px;\n  font-weight: 500;\n}\n\n/* The gateway's own card: one line pointing at its forwarded cards. */\n.nyu-gatewayMeta {\n  color: var(--dsw-alias-label-tertiary);\n  white-space: nowrap;\n  text-overflow: ellipsis;\n  overflow: hidden;\n  font-size: 11.5px;\n}\n\n/* --- drag-to-reorder --------------------------------------------------------- */\n\n/* Grip affordance: the whole card is draggable, the grip just says so. */\n.nyu-dragHandle {\n  color: var(--dsw-alias-label-tertiary);\n  cursor: grab;\n  flex: none;\n  font-size: 14px;\n  line-height: 1;\n  opacity: 0.8;\n}\n\n.nyu-dragHandle:hover {\n  color: var(--dsw-alias-label-secondary);\n  opacity: 1;\n}\n\n/* Source card dims while a drag is in flight. */\n.nyu-cardDragging {\n  opacity: 0.4;\n}\n\n/* Insertion indicator: a business-colored bar on the target edge. */\n.nyu-cardDropBefore {\n  box-shadow: -3px 0 0 0 var(--dsw-alias-state-business-primary);\n}\n\n.nyu-cardDropAfter {\n  box-shadow: 3px 0 0 0 var(--dsw-alias-state-business-primary);\n}\n\n.nyu-resetOrderButton {\n  color: var(--dsw-alias-label-secondary);\n  background: 0 0;\n  border: 1px solid var(--dsw-alias-border-l2);\n  cursor: pointer;\n  white-space: nowrap;\n  border-radius: 8px;\n  padding: 5px 12px;\n  font: inherit;\n  font-size: 12px;\n  flex: none;\n}\n\n.nyu-resetOrderButton:hover {\n  color: var(--dsw-alias-label-primary);\n  background: var(--dsw-alias-interactive-bg-hover);\n}\n\n.nyu-cardMuted {\n  opacity: 0.55;\n}\n\n.nyu-cardExhausted {\n  border-color: var(--dsw-alias-state-error-primary);\n}\n\n.nyu-cardHeader {\n  align-items: center;\n  gap: 8px;\n  display: flex;\n}\n\n.nyu-cardTitle {\n  color: var(--dsw-alias-label-primary);\n  text-overflow: ellipsis;\n  white-space: nowrap;\n  min-width: 0;\n  flex: 1;\n  overflow: hidden;\n  font-size: 13.5px;\n  font-weight: 600;\n}\n\n.nyu-cardBadges {\n  align-items: center;\n  gap: 6px;\n  flex-wrap: wrap;\n  justify-content: flex-end;\n  display: inline-flex;\n}\n\n.nyu-badge {\n  color: var(--dsw-alias-label-secondary);\n  background: var(--dsw-alias-bg-layer-3);\n  border: 1px solid var(--dsw-alias-border-l2);\n  white-space: nowrap;\n  border-radius: 999px;\n  padding: 1px 8px;\n  font-size: 11px;\n  line-height: 1.6;\n  display: inline-block;\n}\n\n.nyu-badgeLevel {\n  color: var(--dsw-alias-state-business-primary);\n  border-color: var(--dsw-alias-state-business-primary);\n  background: 0 0;\n}\n\n.nyu-pill {\n  white-space: nowrap;\n  border-radius: 999px;\n  padding: 1px 8px;\n  font-size: 11px;\n  font-weight: 600;\n  line-height: 1.6;\n  display: inline-block;\n}\n\n.nyu-pillEligible {\n  color: var(--dsw-alias-state-success-primary);\n  border: 1px solid var(--dsw-alias-state-success-primary);\n}\n\n.nyu-pillExhausted {\n  color: #fff;\n  background: var(--dsw-alias-state-error-primary);\n  border: 1px solid var(--dsw-alias-state-error-primary);\n}\n\n.nyu-errorBanner {\n  color: var(--dsw-alias-state-error-primary);\n  background: var(--dsw-alias-bg-layer-3);\n  border: 1px solid var(--dsw-alias-separator-primary);\n  border-left: 3px solid var(--dsw-alias-state-error-primary);\n  flex-direction: column;\n  gap: 2px;\n  border-radius: 8px;\n  padding: 8px 10px;\n  display: flex;\n}\n\n.nyu-errorTitle {\n  font-size: 11.5px;\n  font-weight: 600;\n}\n\n.nyu-errorText {\n  color: var(--dsw-alias-label-secondary);\n  overflow-wrap: anywhere;\n  font-size: 11.5px;\n  line-height: 1.5;\n}\n\n/* --- quota tier rows --------------------------------------------------------- */\n\n.nyu-tierList {\n  flex-direction: column;\n  gap: 7px;\n  display: flex;\n}\n\n.nyu-tierRow {\n  align-items: center;\n  gap: 8px;\n  font-size: 12px;\n  display: flex;\n}\n\n.nyu-tierLabel {\n  color: var(--dsw-alias-label-secondary);\n  text-overflow: ellipsis;\n  white-space: nowrap;\n  min-width: 84px;\n  max-width: 150px;\n  overflow: hidden;\n  flex: none;\n  font-weight: 500;\n}\n\n.nyu-tierTrack {\n  background: var(--dsw-alias-interactive-bg-hover);\n  border-radius: 999px;\n  height: 8px;\n  flex: 1;\n  /* visible overflow: the steady-pace triangle renders above the track. */\n  overflow: visible;\n  position: relative;\n}\n\n.nyu-tierFill {\n  border-radius: 999px;\n  height: 100%;\n  transition: width 0.15s linear;\n  /* clip the fill itself to the track's rounded shape. */\n  overflow: hidden;\n}\n\n/* Steady-pace indicator: a small triangle hovering above the track,\n   pointing down at the position an even consumer would be at right now\n   (0% right after reset → 100% at reset time). Rendered outside the track's\n   rounded clipping via the wrapper's overflow: visible. */\n.nyu-tierPaceWrap {\n  position: absolute;\n  top: -8px;\n  left: 0;\n  right: 0;\n  height: 0;\n  pointer-events: none;\n}\n\n.nyu-tierPace {\n  position: absolute;\n  top: 0;\n  width: 0;\n  height: 0;\n  transform: translateX(-50%);\n  border-left: 4px solid transparent;\n  border-right: 4px solid transparent;\n  /* Theme-tracking ink: the token flips with body[data-ds-dark-theme] —\n     bright (neutral-50) on dark backgrounds, dark (neutral-1000) on light\n     ones. The bg-colored drop-shadow halo separates the shape from the\n     colored fill and the pale track in both themes. */\n  border-top: 5px solid var(--dsw-alias-label-primary, #334155);\n  filter: drop-shadow(0 0 1.5px var(--dsw-alias-bg-base, rgba(255, 255, 255, 0.9)));\n  cursor: help;\n  pointer-events: auto;\n}\n\n.nyu-tierFillOk {\n  background: var(--dsw-alias-state-success-primary);\n}\n\n.nyu-tierFillWarn {\n  background: var(--dsw-alias-state-warn-primary);\n}\n\n.nyu-tierFillDanger {\n  background: var(--dsw-alias-state-error-primary);\n}\n\n/* --- balances / spends ------------------------------------------------------- */\n\n.nyu-tierPercent {\n  width: 38px;\n  text-align: right;\n  flex: none;\n  font-weight: 600;\n  font-variant-numeric: tabular-nums;\n}\n\n.nyu-tierPercentOk {\n  color: var(--dsw-alias-state-success-primary);\n}\n\n.nyu-tierPercentWarn {\n  color: var(--dsw-alias-state-warn-primary);\n}\n\n.nyu-tierPercentDanger {\n  color: var(--dsw-alias-state-error-primary);\n}\n\n.nyu-tierReset {\n  color: var(--dsw-alias-label-tertiary);\n  white-space: nowrap;\n  width: 52px;\n  text-align: right;\n  flex: none;\n  font-size: 10.5px;\n  font-variant-numeric: tabular-nums;\n}\n\n/* --- balances / spends ------------------------------------------------------- */\n\n.nyu-balanceList {\n  flex-direction: column;\n  gap: 5px;\n  display: flex;\n}\n\n.nyu-balanceRow {\n  align-items: baseline;\n  gap: 6px;\n  font-size: 12px;\n  display: flex;\n}\n\n.nyu-balanceLabel {\n  color: var(--dsw-alias-label-secondary);\n  width: 52px;\n  flex: none;\n  font-weight: 500;\n}\n\n.nyu-balanceValue {\n  color: var(--dsw-alias-label-primary);\n  font-weight: 600;\n  font-variant-numeric: tabular-nums;\n}\n\n.nyu-balanceDetail {\n  color: var(--dsw-alias-label-tertiary);\n  font-size: 10.5px;\n}\n\n.nyu-unavailableBadge {\n  color: var(--dsw-alias-state-error-primary);\n  font-weight: 700;\n}\n\n.nyu-spendRow {\n  color: var(--dsw-alias-label-secondary);\n  align-items: center;\n  flex-wrap: wrap;\n  gap: 4px 14px;\n  font-size: 12px;\n  display: flex;\n}\n\n.nyu-spendValue {\n  color: var(--dsw-alias-label-primary);\n  font-weight: 600;\n  font-variant-numeric: tabular-nums;\n}\n\n.nyu-cardFooter {\n  color: var(--dsw-alias-label-tertiary);\n  font-size: 10.5px;\n}\n\n@media (prefers-reduced-motion: reduce) {\n  .nyu-tierFill,\n  .nyu-spinner,\n  .nyu-sectionChevron {\n    transition: none;\n    animation-duration: 1.6s;\n  }\n}\n";
 if (typeof document !== "undefined") {
 	const tag = "data-dsh-nyro-usage-css";
 	if (document.querySelector("style[" + tag + "]") === null) {
@@ -444,13 +467,16 @@ var panel_module_css_default = {
 	"sectionBody": "nyu-sectionBody",
 	"grid": "nyu-grid",
 	"card": "nyu-card",
+	"cardExhausted": "nyu-cardExhausted",
+	"cardForwarded": "nyu-cardForwarded",
+	"viaLine": "nyu-viaLine",
+	"gatewayMeta": "nyu-gatewayMeta",
 	"dragHandle": "nyu-dragHandle",
 	"cardDragging": "nyu-cardDragging",
 	"cardDropBefore": "nyu-cardDropBefore",
 	"cardDropAfter": "nyu-cardDropAfter",
 	"resetOrderButton": "nyu-resetOrderButton",
 	"cardMuted": "nyu-cardMuted",
-	"cardExhausted": "nyu-cardExhausted",
 	"cardHeader": "nyu-cardHeader",
 	"cardTitle": "nyu-cardTitle",
 	"cardBadges": "nyu-cardBadges",
@@ -592,20 +618,41 @@ function currencySymbol(currency) {
 	if (currency === "USD") return "$";
 	return `${currency} `;
 }
+/** Money fields an upstream API key can withhold. */
+function hidesMoney(redacted) {
+	return (redacted ?? []).some((field) => field === "balances" || field === "spends");
+}
 /** Render one provider card. */
 function ProviderCard(props) {
-	const { item } = props;
+	const { item, via } = props;
 	const usage = item.usage;
-	const exhausted = usage?.scheduling?.status === "quota_exhausted";
+	const scheduling = item.status === "ok" ? usage?.scheduling?.status : void 0;
+	const exhausted = scheduling === "quota_exhausted";
 	const balances = usage?.balances ?? [];
 	const spends = usage?.spends ?? [];
-	const tiers = usage?.tiers ?? [];
+	const tiers = (usage?.tiers ?? []).filter((tier) => usage?.kind !== "kiro_plan" || !tier.name.startsWith("feature:kiro:"));
+	const upstream = usage?.upstream;
 	const classes = [panel_module_css_default.card];
 	if (!item.is_enabled) classes.push(panel_module_css_default.cardMuted);
+	if (via !== void 0) classes.push(panel_module_css_default.cardForwarded);
 	if (exhausted) classes.push(panel_module_css_default.cardExhausted);
 	if (props.dragging === true) classes.push(panel_module_css_default.cardDragging);
 	if (props.dropBefore === true) classes.push(panel_module_css_default.cardDropBefore);
 	if (props.dropAfter === true) classes.push(panel_module_css_default.cardDropAfter);
+	let gatewayMeta = null;
+	if (upstream != null) {
+		const unsupported = upstream.providers.filter((provider) => provider.status === "unsupported").length;
+		const parts = [upstream.providers.length === 0 ? tt("card.upstreamEmpty") : tt("card.upstreamCount", { count: upstream.providers.length })];
+		if (unsupported > 0) parts.push(tt("card.upstreamUnsupported", { count: unsupported }));
+		if (hidesMoney(upstream.redacted)) parts.push(tt("card.upstreamRedacted"));
+		gatewayMeta = parts.join(" · ");
+	}
+	const viaTitle = via === void 0 ? void 0 : [
+		via.vendor ? `${item.provider_name} · ${via.vendor}` : item.provider_name,
+		via.routes && via.routes.length > 0 ? tt("card.routes", { routes: via.routes.join(", ") }) : "",
+		via.redacted && via.redacted.length > 0 ? tt("card.redacted", { fields: via.redacted.join(", ") }) : ""
+	].filter((line) => line !== "").join("\n");
+	const moneyHidden = via !== void 0 && item.status === "ok" && hidesMoney(via.redacted) && tiers.length === 0 && balances.length === 0 && spends.length === 0;
 	return /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
 		className: classes.join(" "),
 		draggable: true,
@@ -646,14 +693,19 @@ function ProviderCard(props) {
 							exhausted ? /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
 								className: `${panel_module_css_default.pill} ${panel_module_css_default.pillExhausted}`,
 								children: tt("card.quotaExhausted")
-							}) : /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+							}) : scheduling === "eligible" ? /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
 								className: `${panel_module_css_default.pill} ${panel_module_css_default.pillEligible}`,
 								children: tt("card.eligible")
-							})
+							}) : null
 						]
 					})
 				]
 			}),
+			via !== void 0 ? /* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
+				className: panel_module_css_default.viaLine,
+				title: viaTitle,
+				children: tt("card.via", { gateway: via.gateway })
+			}) : null,
 			item.status === "error" ? /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
 				className: panel_module_css_default.errorBanner,
 				role: "alert",
@@ -664,6 +716,15 @@ function ProviderCard(props) {
 					className: panel_module_css_default.errorText,
 					children: item.error ?? ""
 				})]
+			}) : null,
+			gatewayMeta !== null ? /* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
+				className: panel_module_css_default.gatewayMeta,
+				title: upstream?.redacted?.length ? tt("card.redacted", { fields: upstream.redacted.join(", ") }) : void 0,
+				children: gatewayMeta
+			}) : null,
+			moneyHidden ? /* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
+				className: panel_module_css_default.gatewayMeta,
+				children: tt("card.upstreamHidden")
 			}) : null,
 			tiers.length > 0 ? /* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
 				className: panel_module_css_default.tierList,
@@ -719,6 +780,72 @@ function ProviderCard(props) {
 	});
 }
 //#endregion
+//#region src/client/panel/upstream.ts
+/**
+* Expand a section's provider rows into cards: an ordinary row keeps its
+* card; a chained Nyro row becomes one card per forwarded provider (its own
+* card is kept only as a fallback when none of them would be drawn).
+* @param items - the gateway section's provider rows, in natural order.
+* @returns cards in natural order.
+*/
+function cardEntries(items) {
+	const entries = [];
+	for (const item of items) {
+		const upstream = item.usage?.upstream;
+		if (upstream == null) {
+			entries.push({
+				key: item.provider_id,
+				item
+			});
+			continue;
+		}
+		const forwarded = [];
+		for (const provider of upstream.providers) {
+			const usage = provider.usage == null ? provider.usage : {
+				...provider.usage,
+				upstream: void 0
+			};
+			forwarded.push({
+				key: `${item.provider_id}\u0000${provider.id}`,
+				anchor: item.provider_id,
+				via: {
+					gateway: item.provider_name,
+					vendor: provider.vendor,
+					routes: provider.routes,
+					redacted: upstream.redacted
+				},
+				item: {
+					provider_id: provider.id,
+					provider_name: provider.name,
+					is_enabled: true,
+					status: provider.status,
+					error: provider.error,
+					usage
+				}
+			});
+		}
+		if (!forwarded.some((entry) => entry.item.status !== "unsupported")) entries.push({
+			key: item.provider_id,
+			item
+		});
+		entries.push(...forwarded);
+	}
+	return entries;
+}
+/**
+* Count healthy and quota-exhausted cards, forwarded upstream cards included
+* (the counters describe what the grid shows).
+* @param items - one gateway's provider rows.
+* @returns the counters.
+*/
+function countUsage(items) {
+	const cards = cardEntries(items).map((entry) => entry.item);
+	return {
+		ok: cards.filter((item) => item.status === "ok").length,
+		exhausted: cards.filter((item) => item.usage?.scheduling?.status === "quota_exhausted").length
+	};
+}
+//#endregion
 //#region src/client/panel/InstanceSection.tsx
 /**
 * One nyro gateway's group in the usage panel: a collapsible header (name,
@@ -727,17 +854,6 @@ function ProviderCard(props) {
 * A gateway's failure renders inside its own group only; the card order is
 * persisted per gateway.
 */
-/**
-* Count healthy and quota-exhausted providers.
-* @param items - one gateway's provider rows.
-* @returns the counters.
-*/
-function countUsage(items) {
-	return {
-		ok: items.filter((item) => item.status === "ok").length,
-		exhausted: items.filter((item) => item.usage?.scheduling?.status === "quota_exhausted").length
-	};
-}
 /** Render one gateway section. */
 function InstanceSection(props) {
 	const { instance, state } = props;
@@ -748,8 +864,8 @@ function InstanceSection(props) {
 	const [dropSide, setDropSide] = (0, react.useState)(null);
 	const items = state.usage?.items ?? [];
 	const counts = countUsage(items);
-	const visible = bySavedOrder(items.filter((item) => item.status !== "unsupported"), order, (item) => item.provider_id);
-	const visibleIds = visible.map((item) => item.provider_id);
+	const visible = bySavedOrder(cardEntries(items).filter((entry) => entry.item.status !== "unsupported"), order, (entry) => entry.key, (entry) => entry.anchor);
+	const visibleIds = visible.map((entry) => entry.key);
 	const failure = state.error ?? state.usage?.error ?? null;
 	const updated = agoLabel(state.usage?.cachedAt);
 	const clearDrag = (0, react.useCallback)(() => {
@@ -760,21 +876,21 @@ function InstanceSection(props) {
 		const rect = event.currentTarget.getBoundingClientRect();
 		return event.clientX < rect.left + rect.width / 2;
 	};
-	const cardDragHandlers = (item) => ({
+	const cardDragHandlers = (entry) => ({
 		onCardDragStart: (event) => {
-			setDragId(item.provider_id);
+			setDragId(entry.key);
 			event.dataTransfer.effectAllowed = "move";
-			event.dataTransfer.setData("text/plain", item.provider_id);
+			event.dataTransfer.setData("text/plain", entry.key);
 		},
 		onCardDragEnd: clearDrag,
 		onCardDragOver: (event) => {
 			if (dragId === null) return;
 			event.preventDefault();
 			event.dataTransfer.dropEffect = "move";
-			if (dragId === item.provider_id) return;
+			if (dragId === entry.key) return;
 			const before = sideOf(event);
-			setDropSide((previous) => previous !== null && previous.id === item.provider_id && previous.before === before ? previous : {
-				id: item.provider_id,
+			setDropSide((previous) => previous !== null && previous.id === entry.key && previous.before === before ? previous : {
+				id: entry.key,
 				before
 			});
 		},
@@ -782,7 +898,7 @@ function InstanceSection(props) {
 			if (dragId === null) return;
 			event.preventDefault();
 			event.stopPropagation();
-			if (dragId !== item.provider_id) move(visibleIds, dragId, item.provider_id, sideOf(event));
+			if (dragId !== entry.key) move(visibleIds, dragId, entry.key, sideOf(event));
 			clearDrag();
 		}
 	});
@@ -902,14 +1018,15 @@ function InstanceSection(props) {
 						append(visibleIds, dragId);
 						clearDrag();
 					},
-					children: visible.map((item) => /* @__PURE__ */ (0, react_jsx_runtime.jsx)(ProviderCard, {
-						item,
+					children: visible.map((entry) => /* @__PURE__ */ (0, react_jsx_runtime.jsx)(ProviderCard, {
+						item: entry.item,
+						via: entry.via,
 						now: props.now,
-						dragging: dragId === item.provider_id,
-						dropBefore: dropSide !== null && dropSide.id === item.provider_id && dropSide.before && dragId !== item.provider_id,
-						dropAfter: dropSide !== null && dropSide.id === item.provider_id && !dropSide.before && dragId !== item.provider_id,
-						...cardDragHandlers(item)
-					}, item.provider_id))
+						dragging: dragId === entry.key,
+						dropBefore: dropSide !== null && dropSide.id === entry.key && dropSide.before && dragId !== entry.key,
+						dropAfter: dropSide !== null && dropSide.id === entry.key && !dropSide.before && dragId !== entry.key,
+						...cardDragHandlers(entry)
+					}, entry.key))
 				}) : null
 			]
 		})]

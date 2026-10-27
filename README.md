@@ -115,6 +115,17 @@ Select **Kiro → Kiro IDE / CLI subscription** when adding a provider, choose a
 
 Kiro is a supported Nyro provider; its adapter follows observed Kiro wire behavior. Browser login uses Kiro's social device endpoints and the [AWS SSO OIDC APIs](https://docs.aws.amazon.com/singlesignon/latest/OIDCAPIReference/Welcome.html), consistent with [Kiro's remote authentication flow](https://kiro.dev/docs/getting-started/authentication/). Local fixtures cover device initialization/polling, denial, timeout, slowdown, cancellation, binding and credential isolation as well as chat/quota behavior. Anonymous initialization was checked against the live Google/GitHub and Builder ID endpoints; approving a real account and validating model entitlement, refresh and billing still require account-level acceptance testing.
 
+### Chaining Nyro Instances
+
+Select **Nyro** when adding a provider to use another Nyro instance as the upstream, for example an edge gateway in front of a central one. Enter the remote proxy address once (such as `http://10.0.0.2:19530`; a trailing `/v1` is optional) and use the remote's `NYRO_PROXY_AUTH_KEY` or an API key created on it.
+
+- All four protocols (OpenAI Chat, OpenAI Responses, Anthropic Messages, Gemini) are enabled with the same address and key, so each client request goes to the matching remote endpoint without protocol conversion. Uncheck protocols you don't need.
+- Model discovery reads the remote `/v1/models`, which lists the routes the key can access. Route models by the remote's route names.
+- Every request sends `Authorization: Bearer`, which every Nyro version accepts.
+- **Usage** forwards the remote's upstream usage through `GET /v1/nyro/usage` on its proxy port, using the same key. It lists each upstream provider behind the routes the key can access: plan windows, pause state, and the routes it serves. Paused providers are listed first. Balances and spend are shown only for the remote's gateway key or a privileged API key; other keys see quota windows only. Anonymous requests are rejected even on an open proxy. The local provider pauses routing only when every upstream provider is paused, and resumes when the first one resets. The remote needs this version or later; older remotes report that usage forwarding is unsupported.
+- Forwarding goes one level deep: a remote doesn't query its own Nyro providers, so chained instances can't call each other's usage in a loop. A remote reuses each usage snapshot for up to 60 seconds, so polling from many downstream instances doesn't multiply vendor quota queries.
+- Don't point a provider at the same instance, and avoid chains that loop back. Nyro doesn't detect forwarding loops.
+
 ### Routing
 
 - Exact match routing on `virtual_model`

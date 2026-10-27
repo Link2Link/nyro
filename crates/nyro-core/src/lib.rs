@@ -70,6 +70,8 @@ pub struct Gateway {
     /// Minted MiMo console sessions (passToken → serviceToken renewal);
     /// one entry per provider id, invalidated on credential changes.
     pub(crate) mimo_sessions: Arc<MimoSessionCache>,
+    /// Last full provider usage snapshots, reused by nyro→nyro usage forwarding.
+    pub(crate) usage_snapshots: Arc<admin::UsageSnapshotCache>,
     pub ollama_capability_cache: Arc<tokio::sync::RwLock<HashMap<String, CapabilityCacheEntry>>>,
     pub(crate) compat_engine: Arc<nyro_ccswitch_compat::CompatEngine>,
     pub log_tx: mpsc::Sender<LogEntry>,
@@ -222,6 +224,7 @@ impl Gateway {
             account_quota_registry: Arc::new(ProviderQuotaRegistry::new()),
             account_pool: Arc::new(provider::account_pool::AccountPoolRegistry::default()),
             mimo_sessions,
+            usage_snapshots: Arc::new(admin::UsageSnapshotCache::new()),
             ollama_capability_cache,
             compat_engine: Arc::new(nyro_ccswitch_compat::CompatEngine::default()),
             log_tx,

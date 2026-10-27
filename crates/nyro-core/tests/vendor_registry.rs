@@ -951,3 +951,69 @@ fn bailian_channels_are_shared_key_multi_protocol() {
         Some("https://dashscope.aliyuncs.com/compatible-mode/v1/models")
     );
 }
+
+// ── 12. Nyro (nyro→nyro chain) shared-key four-protocol channel ────────────
+
+#[test]
+fn nyro_gateway_resolves_and_routes_every_protocol_to_the_remote_root() {
+    let reg = VendorRegistry::global();
+    let meta = reg
+        .metadata("nyro-gateway")
+        .expect("nyro-gateway vendor metadata");
+    assert_eq!(meta.label.en, "Nyro");
+    assert_eq!(meta.label.zh, "Nyro");
+    assert_eq!(meta.icon, "nyro");
+    // `nyro` is the retired Custom preset id; startup migrations rewrite it
+    // to `custom`, so the chain vendor must never claim it.
+    assert!(reg.metadata("nyro").is_none());
+
+    let channel = meta
+        .channels
+        .iter()
+        .find(|channel| channel.id == "default")
+        .expect("nyro-gateway default channel");
+    assert!(channel.shared_key_protocols, "channel must be shared-key");
+    assert!(channel.models_source.is_none());
+
+    let p = make_provider(Some("nyro-gateway"), Some("default"));
+    for (protocol, path, expected) in [
+        (
+            OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1,
+            "/v1/chat/completions",
+            "http://10.0.0.2:19530/v1/chat/completions",
+        ),
+        (
+            OPENAI_RESPONSES_V1,
+            "/v1/responses",
+            "http://10.0.0.2:19530/v1/responses",
+        ),
+        (
+            ANTHROPIC_MESSAGES_2023_06_01,
+            "/v1/messages",
+            "http://10.0.0.2:19530/v1/messages",
+        ),
+        (
+            GOOGLE_GEMINI_GENERATE_CONTENT_V1BETA,
+            "/v1beta/models/gemini-pro:generateContent",
+            "http://10.0.0.2:19530/v1beta/models/gemini-pro:generateContent",
+        ),
+    ] {
+        let ext = reg.resolve(&p, protocol).expect("nyro-gateway ext");
+        assert!(matches!(
+            ext.scope(),
+            VendorScope::Vendor {
+                vendor_id: "nyro-gateway"
+            }
+        ));
+        let c = ctx(&p, protocol, "sk-remote", "m", None);
+        // A pasted `/v1` suffix must not double-version any route.
+        assert_eq!(
+            ext.build_url(&c, "http://10.0.0.2:19530/v1", path),
+            expected
+        );
+        assert_eq!(
+            ext.auth_headers(&c).get("authorization").unwrap(),
+            "Bearer sk-remote"
+        );
+    }
+}

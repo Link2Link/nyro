@@ -70,9 +70,12 @@ pub use providers::{
 };
 pub use usage::{
     ProviderUsage, ProviderUsageBalance, ProviderUsageListItem, ProviderUsageQueryStatus,
-    ProviderUsageTier,
+    ProviderUsageSpend, ProviderUsageTier,
 };
 pub(crate) use usage::{run_provider_usage_monitor, trigger_provider_usage_refresh};
+mod usage_forward;
+pub(crate) use usage_forward::UsageSnapshotCache;
+pub use usage_forward::{ForwardedProviderUsage, ForwardedUsageReport, RouteAccess};
 
 #[cfg(test)]
 mod session_tests;

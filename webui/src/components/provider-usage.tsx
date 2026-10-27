@@ -3,7 +3,7 @@ import { useQueries, useQuery } from "@tanstack/react-query";
 import { Clock, RefreshCw, AlertCircle, CirclePause } from "lucide-react";
 import { backend } from "@/lib/backend";
 import { localizeBackendErrorMessage } from "@/lib/backend-error";
-import { isKiroOverage, providerUsagePause, providerUsageSupported, providerUsageTitle, summarizeGroupUsage, tierLabel } from "@/lib/provider-usage";
+import { isKiroOverage, nyroUpstreamView, providerUsagePause, providerUsageSupported, providerUsageTitle, summarizeGroupUsage, tierLabel } from "@/lib/provider-usage";
 import { isDevinProvider, isKiroProvider } from "@/lib/native-provider";
 import { useLocale } from "@/lib/i18n";
 import { accountStateLabel, poolQuotaWindows, type AccountPoolView } from "@/lib/devin-account-pool";
@@ -11,7 +11,10 @@ import { countdownStr, poolSteadyPacePercent, steadyPacePercent, utilizationBarC
 import { useUsageClock } from "@/lib/use-usage-clock";
 import { UsageProgress } from "@/components/usage-progress";
 import { PoolRefreshButton } from "@/components/pool-refresh-button";
+import { ProviderIcon } from "@/components/ui/provider-icon";
 import type {
+  NyroUpstreamProvider,
+  NyroUpstreamUsage,
   Provider,
   ProviderUsage,
   ProviderUsageBalance,
@@ -211,6 +214,109 @@ export function DevinPoolUsage({ pool, detailed = false, onRefresh, refreshing =
   </div>;
 }
 
+/** Collapsed list length for a chained Nyro's upstream providers. */
+const NYRO_UPSTREAM_COLLAPSED = 4;
+const MAX_ROUTE_CHIPS = 4;
+
+function NyroUpstreamRow({ provider, isZh, now }: { provider: NyroUpstreamProvider; isZh: boolean; now: number }) {
+  const usage = provider.usage;
+  const pause = usage ? providerUsagePause(usage, isZh) : null;
+  const countdown = countdownStr(pause?.resetAt);
+  const balances = usage?.balances ?? [];
+  const routes = provider.routes ?? [];
+  const extraRoutes = routes.length - MAX_ROUTE_CHIPS;
+  return (
+    <li className="space-y-1.5 py-2 first:pt-0 last:pb-0">
+      <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 text-xs">
+        <ProviderIcon iconKey={provider.vendor ?? undefined} name={provider.name} size={16} className="border-0 bg-transparent" />
+        <span className="min-w-0 truncate font-medium text-slate-700" title={provider.name}>{provider.name}</span>
+        {usage?.level && (
+          <span className="rounded bg-slate-100 px-1.5 py-0.5 text-[10px] font-semibold uppercase text-slate-600">{usage.level}</span>
+        )}
+        {pause && (
+          <span className="inline-flex items-center gap-1 rounded bg-red-50 px-1.5 py-0.5 text-[10px] font-semibold text-red-600"
+            title={pause.resetAt ?? undefined}>
+            <CirclePause aria-hidden="true" className="h-3 w-3" />
+            {isZh ? "已暂停" : "Paused"}
+            {countdown && <span className="tabular-nums">· {countdown}</span>}
+          </span>
+        )}
+        {!pause && usage?.is_available === false && (
+          <span className="rounded bg-red-50 px-1.5 py-0.5 text-[10px] font-semibold text-red-600">{isZh ? "不可用" : "Unavailable"}</span>
+        )}
+      </div>
+      {routes.length > 0 && (
+        <p className="truncate pl-6 text-[10px] text-slate-400" title={routes.join(", ")}>
+          {isZh ? "路由" : "Routes"}: {routes.slice(0, MAX_ROUTE_CHIPS).join(", ")}
+          {extraRoutes > 0 && ` +${extraRoutes}`}
+        </p>
+      )}
+      {provider.status === "error" ? (
+        <p className="flex items-start gap-1.5 pl-6 text-xs text-amber-700" title={provider.error ?? undefined}>
+          <AlertCircle aria-hidden="true" className="mt-0.5 h-3 w-3 shrink-0" />
+          <span className="break-words">{isZh ? "上游查询失败" : "Upstream query failed"}: {provider.error}</span>
+        </p>
+      ) : (
+        <div className="flex flex-col gap-1.5 pl-6">
+          {(usage?.tiers ?? [])
+            .filter((tier) => usage?.kind !== "kiro_plan" || !tier.name.startsWith("feature:kiro:"))
+            .map((tier) => <TierBar key={tier.name} tier={tier} isZh={isZh} now={now} />)}
+          {balances.map((balance) => (
+            <BalanceRow key={balance.currency} balance={balance} isAvailable={usage?.is_available !== false} isZh={isZh}
+              label={usage?.kind === "devin_plan" ? (isZh ? "超额余额" : "Extra balance") : undefined} />
+          ))}
+          {(usage?.spends ?? []).map((spend) => <SpendRow key={spend.name} spend={spend} isZh={isZh} />)}
+        </div>
+      )}
+    </li>
+  );
+}
+
+/**
+ * A chained Nyro's forwarded usage: one row per upstream provider behind the
+ * routes this key can use, the most urgent first. The data is the remote's own
+ * snapshot; this instance only pauses when every upstream provider is paused.
+ */
+function NyroUpstreamUsagePanel({ report, isZh, now }: { report: NyroUpstreamUsage; isZh: boolean; now: number }) {
+  const [expanded, setExpanded] = useState(false);
+  const view = nyroUpstreamView(report);
+  if (view.total === 0) {
+    return <p className="text-xs text-slate-400">{isZh ? "该 Key 在上游没有可用路由" : "This key has no routes on the remote"}</p>;
+  }
+  const rows = expanded ? view.shown : view.shown.slice(0, NYRO_UPSTREAM_COLLAPSED);
+  const hidden = view.shown.length - rows.length;
+  return (
+    <div className="space-y-2">
+      <p className="flex flex-wrap items-center gap-x-2 text-[11px] text-slate-500">
+        <span>{isZh ? `${view.total} 个上游供应商` : `${view.total} upstream providers`}</span>
+        {view.paused > 0 && <span className="font-medium text-red-600">{isZh ? `${view.paused} 个已暂停` : `${view.paused} paused`}</span>}
+        {view.failed > 0 && <span className="text-amber-700">{isZh ? `${view.failed} 个查询失败` : `${view.failed} query failed`}</span>}
+      </p>
+      {rows.length > 0 && (
+        <ul className="divide-y divide-slate-200/60">
+          {rows.map((provider) => <NyroUpstreamRow key={provider.id || provider.name} provider={provider} isZh={isZh} now={now} />)}
+        </ul>
+      )}
+      {(hidden > 0 || (expanded && view.shown.length > NYRO_UPSTREAM_COLLAPSED)) && (
+        <button type="button" onClick={() => setExpanded((value) => !value)} aria-expanded={expanded}
+          className="cursor-pointer text-[11px] font-medium text-sky-700 hover:underline focus-visible:ring-2 focus-visible:ring-ring">
+          {expanded ? (isZh ? "收起" : "Show less") : (isZh ? `展开其余 ${hidden} 个` : `Show ${hidden} more`)}
+        </button>
+      )}
+      {view.unsupported.length > 0 && (
+        <p className="text-[10px] text-slate-400" title={view.unsupported.join(", ")}>
+          {isZh ? "无用量接口" : "No usage data"}: {view.unsupported.join(", ")}
+        </p>
+      )}
+      {view.moneyRedacted && (
+        <p className="text-[10px] text-slate-400">
+          {isZh ? "余额与消费仅对上游的网关 Key 或特权 Key 可见" : "Balances and spend are visible only to the remote's gateway key or a privileged key"}
+        </p>
+      )}
+    </div>
+  );
+}
+
 /** Shared by the row footer and the group header so both read one cache entry. */
 const isArkProvider = (provider: Provider) => provider.base_url.toLowerCase().includes("volces.com");
 
@@ -373,7 +479,9 @@ export function ProviderUsageFooter({ provider }: { provider: Provider }) {
         <AlertCircle className="h-3.5 w-3.5 shrink-0" />
         <span className="break-words">{isZh ? "用量查询失败" : "Usage query failed"}: {errorMessage}</span>
       </div>}
-      {shown && (shown.tiers.length > 0 || balances.length > 0 || (shown.spends?.length ?? 0) > 0) ? (
+      {shown?.upstream ? (
+        <NyroUpstreamUsagePanel report={shown.upstream} isZh={isZh} now={now} />
+      ) : shown && (shown.tiers.length > 0 || balances.length > 0 || (shown.spends?.length ?? 0) > 0) ? (
         <div className="flex flex-col gap-1.5">
           {/* Tier order is owned by the gateway API (canonical window order:
               5h → daily → weekly → monthly → …), so every consumer shows the

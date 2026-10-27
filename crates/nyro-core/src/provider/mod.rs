@@ -40,6 +40,7 @@ pub mod kiro;
 pub mod minimax;
 pub mod moonshotai;
 pub mod nvidia;
+pub mod nyro_gateway;
 pub mod ollama;
 pub mod openai;
 pub mod opencode_go;

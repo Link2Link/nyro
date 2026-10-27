@@ -20,6 +20,8 @@ test("canonical provider identity outranks name and host, and maps through vendo
   equal(resolve({ iconKey: "custom", name: "UUAPI gemini" }), "gemini");
   equal(resolve({ iconKey: "ark-coding", name: "火山引擎" }), "doubao");
   equal(resolve({ iconKey: "opencode-go", name: "opencode go" }), "opencode-logo-light");
+  // The Nyro chain preset is identified by the Nyro mark even when named after the remote.
+  equal(resolve({ iconKey: "nyro-gateway", name: "HK relay", baseUrl: "http://10.0.0.2:19530" }), "nyro");
   equal(resolve({ iconKey: "zhipuai", name: "GLM" }), "zhipu");
   equal(resolve({ iconKey: "kimi-code", name: "Kimi" }), "kimi");
   equal(resolve({ iconKey: "vertexai" }), "googlecloud");

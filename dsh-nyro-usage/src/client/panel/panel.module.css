@@ -404,6 +404,34 @@ html[data-dsh-nyro-usage-active]:not([data-dsh-taskboard-active]):not([data-dsh-
   min-width: 0;
 }
 
+/* --- chained Nyro: forwarded upstream provider cards --------------------------
+   Each upstream provider a chained Nyro forwards gets its own ordinary card;
+   a left accent bar plus the "via" line mark it as upstream Nyro usage.
+   Declared before .cardExhausted so a paused upstream still reads red. */
+
+.cardForwarded {
+  border-left: 3px solid var(--dsw-alias-state-business-primary);
+}
+
+.viaLine {
+  color: var(--dsw-alias-state-business-primary);
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  overflow: hidden;
+  margin-top: -4px;
+  font-size: 11px;
+  font-weight: 500;
+}
+
+/* The gateway's own card: one line pointing at its forwarded cards. */
+.gatewayMeta {
+  color: var(--dsw-alias-label-tertiary);
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  overflow: hidden;
+  font-size: 11.5px;
+}
+
 /* --- drag-to-reorder --------------------------------------------------------- */
 
 /* Grip affordance: the whole card is draggable, the grip just says so. */

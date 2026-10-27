@@ -125,3 +125,50 @@ test("cached usage retains visible refresh failures, stale state and quota pause
   match(html, /aria-valuenow="100"/);
   doesNotMatch(html, /<details|<summary/);
 });
+
+const upstreamUsage = (over: Partial<ProviderUsage>): ProviderUsage => ({ ...base, provider_id: "remote", ...over });
+
+test("a chained Nyro lists forwarded upstream providers, most urgent first, with their routes", () => {
+  const html = render({ ...base, kind: "nyro_gateway", upstream: { redacted: ["balances", "spends"], providers: [
+    { id: "a", name: "Kimi Coding", vendor: "kimi-code", routes: ["kimi", "claude-sonnet"], status: "ok",
+      usage: upstreamUsage({ kind: "kimi_coding_plan", tiers: [{ name: "five_hour", used_percent: 41 }] }) },
+    { id: "b", name: "GLM", vendor: "zhipuai", routes: ["glm"], status: "ok", usage: upstreamUsage({
+      level: "max", tiers: [{ name: "weekly_limit", used_percent: 100 }],
+      scheduling: { status: "quota_exhausted", reason: "usage_limit", blocking_tiers: ["weekly_limit"],
+        reset_at: new Date(now + 3600_000).toISOString() } }) },
+    { id: "c", name: "Broken", routes: ["x"], status: "error", error: "HTTP 500" },
+    { id: "d", name: "Relay", routes: ["relay"], status: "unsupported" },
+  ] } });
+  match(html, /Upstream Nyro Usage/);
+  match(html, /4 upstream providers/);
+  match(html, /1 paused/);
+  match(html, /1 query failed/);
+  // Paused GLM is listed before the 41% Kimi row; failures come after both.
+  match(html, /GLM.*Paused.*1h.*Kimi Coding.*Broken/s);
+  match(html, /Routes: kimi, claude-sonnet/);
+  match(html, /Upstream query failed: HTTP 500/);
+  match(html, /No usage data: Relay/);
+  match(html, /visible only to the remote&#x27;s gateway key/);
+  equal((html.match(/role="progressbar"/g) ?? []).length, 2);
+  doesNotMatch(html, /No usage data<\/p>/);
+});
+
+test("a chained Nyro collapses long upstream lists and explains an empty route scope", () => {
+  const providers = Array.from({ length: 6 }, (_, i) => ({
+    id: `p${i}`, name: `Provider ${i}`, routes: [`r${i}`], status: "ok" as const,
+    usage: upstreamUsage({ tiers: [{ name: "daily", used_percent: 10 * i }] }),
+  }));
+  const html = render({ ...base, kind: "nyro_gateway", upstream: { providers } });
+  match(html, /Show 2 more/);
+  equal((html.match(/role="progressbar"/g) ?? []).length, 4);
+  doesNotMatch(html, /Provider 0</);
+  match(render({ ...base, kind: "nyro_gateway", upstream: { providers: [] } }), /This key has no routes on the remote/);
+});
+
+test("all upstream providers paused pauses the chained Nyro with the first recovery time", () => {
+  const html = render({ ...base, kind: "nyro_gateway", upstream: { providers: [] },
+    scheduling: { status: "quota_exhausted", reason: "usage_limit", blocking_tiers: ["nyro_upstream"],
+      reset_at: new Date(now + 2 * 3600_000).toISOString() } });
+  match(html, /Quota exhausted, routing paused · All upstream providers paused/);
+  match(html, /Quota reset: 2h/);
+});

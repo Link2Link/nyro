@@ -1,4 +1,4 @@
-import type { Provider, ProviderUsage } from "./types";
+import type { NyroUpstreamProvider, NyroUpstreamUsage, Provider, ProviderUsage } from "./types";
 import { nativeProviderProtocol } from "./native-provider";
 import { accountStateLabel } from "./devin-account-pool";
 
@@ -74,7 +74,11 @@ export function providerUsageSupported(
   // Native subscription providers are recognised by identity, not a shared
   // Codeium/AWS host (mirrors `UsageBackend::detect`).
   const isNativeOAuth = provider.auth_mode === "oauth" && nativeProviderProtocol(provider) !== null;
+  // A chained Nyro forwards its upstream usage; its address is any host.
+  const isNyroGateway = [provider.vendor, provider.preset_key]
+    .some((value) => value?.trim().toLowerCase() === "nyro-gateway");
   return (
+    isNyroGateway ||
     isCodexOAuth ||
     isImportedCodexOAuth ||
     isGrokOAuth ||
@@ -115,6 +119,7 @@ export function providerUsageTitle(kind: string | undefined, isZh: boolean): str
   if (kind === "devin_plan") return isZh ? "Devin 用量" : "Devin Usage";
   if (kind === "kiro_plan") return isZh ? "Kiro 用量" : "Kiro Usage";
   if (kind === "google_subscription") return isZh ? "Google AI Pro 配额" : "Google AI Pro Quota";
+  if (kind === "nyro_gateway") return isZh ? "上游 Nyro 用量" : "Upstream Nyro Usage";
   return isZh ? "套餐用量" : "Plan Usage";
 }
 
@@ -126,6 +131,7 @@ const TIER_LABELS_ZH: Record<string, string> = {
   primary_window: "主要窗口",
   secondary_window: "次要窗口",
   gemini: "Gemini 共享池",
+  nyro_upstream: "上游供应商全部暂停",
 };
 const TIER_LABELS_EN: Record<string, string> = {
   five_hour: "5h",
@@ -135,6 +141,7 @@ const TIER_LABELS_EN: Record<string, string> = {
   primary_window: "Primary Window",
   secondary_window: "Secondary Window",
   gemini: "Gemini Shared Pool",
+  nyro_upstream: "All upstream providers paused",
 };
 
 function readableFeatureName(value: string): string {
@@ -189,10 +196,14 @@ export interface GroupUsageSummary {
 }
 
 /** Worst main-window tier of one usage report. `feature:` tiers are extra
- * detail, never the routing quota, so they never drive the group summary. */
+ * detail, never the routing quota, so they never drive the group summary.
+ * A chained Nyro reports its upstream providers' windows instead of its own. */
 function worstMainTier(usage: ProviderUsage): { tier: string; percent: number } | null {
   let worst: { tier: string; percent: number } | null = null;
-  for (const tier of usage.tiers) {
+  const tiers = usage.upstream
+    ? usage.upstream.providers.flatMap((provider) => provider.usage?.tiers ?? [])
+    : usage.tiers;
+  for (const tier of tiers) {
     if (tier.name.startsWith("feature:") || !Number.isFinite(tier.used_percent)) continue;
     const percent = Math.min(Math.max(tier.used_percent, 0), 100);
     if (!worst || percent > worst.percent) worst = { tier: tier.name, percent };
@@ -218,7 +229,7 @@ export function summarizeGroupUsage(entries: GroupUsageEntry[]): GroupUsageSumma
     if (worst) {
       summary.perProvider.push({ name, percent: worst.percent });
       if (!summary.peak || worst.percent > summary.peak.percent) summary.peak = { name, ...worst };
-    } else {
+    } else if (!usage.upstream) {
       for (const balance of usage.balances ?? []) {
         if (Number.isFinite(balance.total)) totals.set(balance.currency, (totals.get(balance.currency) ?? 0) + balance.total);
       }
@@ -226,4 +237,44 @@ export function summarizeGroupUsage(entries: GroupUsageEntry[]): GroupUsageSumma
   }
   summary.balances = [...totals].map(([currency, total]) => ({ currency, total }));
   return summary;
+}
+
+/** Upstream provider rows of a forwarded Nyro report, ordered by urgency. */
+export interface NyroUpstreamView {
+  /** Providers with usage data or a query error, most urgent first. */
+  shown: NyroUpstreamProvider[];
+  /** Names of upstream providers without a usage backend on the remote. */
+  unsupported: string[];
+  total: number;
+  paused: number;
+  failed: number;
+  /** Money fields the remote withheld from this key. */
+  moneyRedacted: boolean;
+}
+
+function upstreamRank(provider: NyroUpstreamProvider): [number, number] {
+  if (provider.status === "ok" && provider.usage?.scheduling?.status === "quota_exhausted") return [0, 0];
+  if (provider.status === "ok") {
+    const worst = provider.usage ? worstMainTier(provider.usage) : null;
+    return [provider.usage?.is_available === false ? 1 : 2, -(worst?.percent ?? -1)];
+  }
+  return [3, 0];
+}
+
+/** Paused first, then the most used, then query failures; unsupported last as names. */
+export function nyroUpstreamView(report?: NyroUpstreamUsage | null): NyroUpstreamView {
+  const providers = report?.providers ?? [];
+  const shown = providers
+    .filter((provider) => provider.status !== "unsupported")
+    .map((provider, index) => ({ provider, index, rank: upstreamRank(provider) }))
+    .sort((a, b) => a.rank[0] - b.rank[0] || a.rank[1] - b.rank[1] || a.index - b.index)
+    .map(({ provider }) => provider);
+  return {
+    shown,
+    unsupported: providers.filter((provider) => provider.status === "unsupported").map((provider) => provider.name),
+    total: providers.length,
+    paused: providers.filter((provider) => upstreamRank(provider)[0] === 0).length,
+    failed: providers.filter((provider) => provider.status === "error").length,
+    moneyRedacted: (report?.redacted ?? []).some((field) => field === "balances" || field === "spends"),
+  };
 }

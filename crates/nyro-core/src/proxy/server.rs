@@ -38,7 +38,8 @@ pub fn create_router(gateway: Gateway) -> Router {
             "/v1beta/models/:model_action",
             post(ingress::google_generative::generate_content::handler),
         )
-        .route("/v1/models", get(handler::models_list));
+        .route("/v1/models", get(handler::models_list))
+        .route("/v1/nyro/usage", get(handler::nyro_usage));
 
     // Global proxy auth: when `auth_key` is configured, every data-plane route
     // requires `Authorization: Bearer <auth_key>`. Health endpoints stay open

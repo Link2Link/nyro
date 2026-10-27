@@ -45,15 +45,25 @@ function saveOrder(key: string, ids: string[]): void {
 /**
  * Sort items by the saved id order. `Array#sort` is stable, so ids missing
  * from `order` keep their incoming relative order after the ordered ones.
+ * An unsaved item with an anchor (a forwarded upstream card) sits right after
+ * its saved anchor instead of falling to the end.
  */
-export function bySavedOrder<T>(items: T[], order: readonly string[], idOf: (item: T) => string): T[] {
+export function bySavedOrder<T>(
+  items: T[],
+  order: readonly string[],
+  idOf: (item: T) => string,
+  anchorOf?: (item: T) => string | undefined,
+): T[] {
   if (order.length === 0) return items
   const rank = new Map(order.map((id, index) => [id, index]))
-  return [...items].sort((a, b) => {
-    const va = rank.get(idOf(a)) ?? order.length
-    const vb = rank.get(idOf(b)) ?? order.length
-    return va - vb
-  })
+  const rankOf = (item: T): number => {
+    const own = rank.get(idOf(item))
+    if (own !== undefined) return own
+    const anchor = anchorOf?.(item)
+    const anchored = anchor === undefined ? undefined : rank.get(anchor)
+    return anchored === undefined ? order.length : anchored + 0.5
+  }
+  return [...items].sort((a, b) => rankOf(a) - rankOf(b))
 }
 
 /** Move `dragId` to before/after `overId` inside `ids`; an unknown anchor

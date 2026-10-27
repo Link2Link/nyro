@@ -54,6 +54,28 @@ export interface NyroUsage {
   is_available?: boolean | null
   scheduling?: NyroScheduling
   queried_at?: string
+  /** One-hop report forwarded by a Nyro gateway; not part of its own quota. */
+  upstream?: NyroUpstreamUsage | null
+}
+
+/** Forwarded entries use id/name, unlike the admin bulk endpoint's rows. */
+export interface NyroUpstreamProvider {
+  id: string
+  name: string
+  vendor?: string | null
+  routes?: string[]
+  status: 'ok' | 'unsupported' | 'error'
+  error?: string | null
+  usage?: NyroUsage | null
+}
+
+export interface NyroUpstreamUsage {
+  object: string
+  version: number
+  generated_at?: string
+  providers: NyroUpstreamProvider[]
+  /** Fields deliberately withheld by the upstream API key's permissions. */
+  redacted?: string[]
 }
 
 /** One provider row of the bulk usage listing. */
