@@ -6,6 +6,10 @@ SERVER_BINARY="${ROOT_DIR}/target/release/nyro-server"
 IMAGE_TAG="nyro:mine"
 OUTPUT_ARCHIVE="${ROOT_DIR}/nyro-mine.tar"
 ENV_FILE="${ROOT_DIR}/.env"
+RUNTIME_IMAGE="${RUNTIME_IMAGE:-debian:bookworm-slim}"
+# Docker Hub is unreliable from mainland China; these registry mirrors are tried
+# in order when the base image is not cached and the Docker Hub pull fails.
+DOCKER_MIRRORS="${NYRO_DOCKER_MIRRORS:-docker.m.daocloud.io docker.1ms.run}"
 BUILD_CONTEXT=""
 TEMP_ARCHIVE=""
 
@@ -31,6 +35,40 @@ generate_admin_token() {
     else
         die "openssl or od is required to generate NYRO_ADMIN_TOKEN"
     fi
+}
+
+# Make sure RUNTIME_IMAGE is in the local image store for TARGET_PLATFORM, so
+# `docker build` does not depend on a registry round-trip. A mirrored copy is
+# retagged as RUNTIME_IMAGE, keeping the Dockerfile reference unchanged.
+ensure_runtime_image() {
+    local first mirror path mirrored
+
+    if [[ "$(docker image inspect --format '{{.Os}}/{{.Architecture}}' "${RUNTIME_IMAGE}" 2>/dev/null)" == "${TARGET_PLATFORM}" ]]; then
+        return
+    fi
+    echo "Pulling base image ${RUNTIME_IMAGE}"
+    if docker pull --platform "${TARGET_PLATFORM}" "${RUNTIME_IMAGE}"; then
+        return
+    fi
+
+    # Mirrors only stand in for Docker Hub references (no registry host).
+    first="${RUNTIME_IMAGE%%/*}"
+    if [[ "${RUNTIME_IMAGE}" == */* && ( "${first}" == *.* || "${first}" == *:* || "${first}" == localhost ) ]]; then
+        die "failed to pull ${RUNTIME_IMAGE}"
+    fi
+    path="${RUNTIME_IMAGE}"
+    [[ "${path}" == */* ]] || path="library/${path}"
+
+    for mirror in ${DOCKER_MIRRORS}; do
+        mirrored="${mirror}/${path}"
+        echo "Docker Hub pull failed; trying mirror ${mirrored}"
+        if docker pull --platform "${TARGET_PLATFORM}" "${mirrored}"; then
+            docker tag "${mirrored}" "${RUNTIME_IMAGE}"
+            docker rmi "${mirrored}" >/dev/null
+            return
+        fi
+    done
+    die "failed to pull ${RUNTIME_IMAGE} from Docker Hub and mirrors (${DOCKER_MIRRORS}); set NYRO_DOCKER_MIRRORS or RUNTIME_IMAGE"
 }
 
 ensure_compose_env() {
@@ -101,10 +139,13 @@ BUILD_CONTEXT="$(mktemp -d)"
 trap cleanup EXIT
 install -m 0755 "${SERVER_BINARY}" "${BUILD_CONTEXT}/nyro-server"
 
+ensure_runtime_image
+
 echo "Building ${IMAGE_TAG} for ${TARGET_PLATFORM} from Nyro ${NYRO_VERSION}"
 docker build \
     --platform "${TARGET_PLATFORM}" \
     --build-arg "NYRO_VERSION=${NYRO_VERSION}" \
+    --build-arg "RUNTIME_IMAGE=${RUNTIME_IMAGE}" \
     --file "${ROOT_DIR}/Dockerfile" \
     --tag "${IMAGE_TAG}" \
     "${BUILD_CONTEXT}"
