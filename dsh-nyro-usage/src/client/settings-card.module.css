@@ -365,3 +365,142 @@
   font-size: 12px;
   line-height: 1.5;
 }
+
+.testList {
+  flex-direction: column;
+  flex-basis: 100%;
+  gap: 2px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+}
+
+/* --- gateway groups (nyro-usage multi-gateway extension) -------------------- */
+
+.group {
+  border-top: 1px solid var(--dsw-alias-border-l2);
+  flex-direction: column;
+  padding: 12px 0 4px;
+  display: flex;
+}
+
+.groupTitle {
+  color: var(--dsw-alias-label-primary);
+  margin: 0;
+  font-size: 14px;
+  font-weight: 600;
+  line-height: 1.5;
+}
+
+.groupHint {
+  color: var(--dsw-alias-label-tertiary);
+  margin: 2px 0 0;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.instanceList {
+  flex-direction: column;
+  gap: 10px;
+  margin: 10px 0 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+}
+
+.instanceRow {
+  border: 1px solid var(--dsw-alias-border-l2);
+  background: var(--dsw-alias-bg-layer-3);
+  border-radius: 10px;
+  padding: 4px 12px 2px;
+}
+
+.instanceHead {
+  align-items: center;
+  gap: 10px;
+  padding: 8px 0 2px;
+  display: flex;
+}
+
+.instanceTitle {
+  min-width: 0;
+  color: var(--dsw-alias-label-primary);
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  overflow: hidden;
+  flex: 1;
+  margin: 0;
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1.5;
+}
+
+.instanceToggle {
+  color: var(--dsw-alias-label-secondary);
+  white-space: nowrap;
+  cursor: pointer;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  display: inline-flex;
+}
+
+.instanceToggle input {
+  cursor: inherit;
+  margin: 0;
+}
+
+.instanceRemove,
+.instanceAdd {
+  appearance: none;
+  font: inherit;
+  cursor: pointer;
+  background: transparent;
+  border-radius: 8px;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.instanceRemove {
+  color: var(--dsw-alias-label-secondary);
+  border: 1px solid var(--dsw-alias-border-l2);
+  padding: 2px 10px;
+}
+
+.instanceRemove:hover:not(:disabled) {
+  color: var(--dsw-alias-label-error, var(--dsw-alias-state-error-primary));
+  border-color: var(--dsw-alias-label-error, var(--dsw-alias-state-error-primary));
+}
+
+.instanceAdd {
+  color: var(--dsw-alias-label-primary);
+  border: 1px dashed var(--dsw-alias-border-l2);
+  align-self: flex-start;
+  margin-top: 10px;
+  padding: 5px 14px;
+}
+
+.instanceAdd:hover:not(:disabled) {
+  border-color: var(--dsw-alias-label-dimmed);
+}
+
+.instanceRemove:disabled,
+.instanceAdd:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.instanceRemove:focus-visible,
+.instanceAdd:focus-visible,
+.instanceToggle input:focus-visible {
+  outline: 2px solid var(--dsw-alias-brand-primary);
+  outline-offset: 1px;
+}
+
+.instanceNote {
+  color: var(--dsw-alias-label-tertiary);
+  margin: 10px 0 0;
+  font-size: 12px;
+  line-height: 1.5;
+}

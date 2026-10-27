@@ -11,11 +11,12 @@ let _deepseek_ai_dsh_client_store = require("@deepseek-ai/dsh-client-store");
 //#region src/client/api.ts
 /** Error carrying the route's JSON error message. */
 var NyroPanelApiError = class extends Error {
+	/** Route error kind when the host provided one (e.g. `unauthorized`). */
 	kind;
 	constructor(message, kind) {
 		super(message);
-		this.kind = kind;
 		this.name = "NyroPanelApiError";
+		this.kind = kind;
 	}
 };
 /** Parse a JSON response or throw a NyroPanelApiError. */
@@ -32,19 +33,41 @@ async function readJson(response) {
 	}
 	return body;
 }
+/** Build a route URL with optional `instance` / `refresh` query params. */
+function routeUrl(path, params) {
+	const search = new URLSearchParams();
+	if (params.instance !== void 0) search.set("instance", params.instance);
+	if (params.refresh === true) search.set("refresh", "1");
+	const query = search.toString();
+	return query === "" ? path : `${path}?${query}`;
+}
 /** The host proxy routes (same origin). */
 var NyroPanelApi = class {
-	/** Sanitized config + cache state. */
+	/** Sanitized config + per-gateway cache state. */
 	async status() {
 		return readJson(await fetch("/api/nyro-usage/status"));
 	}
-	/** Every provider's usage; `refresh` bypasses the host-side cache. */
-	async usage(refresh = false) {
-		return readJson(await fetch(`/api/nyro-usage/usage${refresh ? "?refresh=1" : ""}`));
+	/**
+	* One gateway's provider usage.
+	* @param instance - gateway id from the status route.
+	* @param refresh - bypass the host-side cache.
+	* @returns that gateway's slice (its own failure is reported inside it).
+	*/
+	async usage(instance, refresh = false) {
+		const slice = (await readJson(await fetch(routeUrl("/api/nyro-usage/usage", {
+			instance,
+			refresh
+		})))).instances.find((entry) => entry.id === instance);
+		if (slice === void 0) throw new NyroPanelApiError("unknown nyro instance", "not-found");
+		return slice;
 	}
-	/** Connectivity + auth test against the saved configuration. */
-	async test() {
-		return readJson(await fetch("/api/nyro-usage/test", { method: "POST" }));
+	/**
+	* Connectivity + auth test against the saved configuration.
+	* @param instance - one gateway id; omitted tests every gateway.
+	* @returns the overall verdict plus one result per tested gateway.
+	*/
+	async test(instance) {
+		return readJson(await fetch(routeUrl("/api/nyro-usage/test", { instance }), { method: "POST" }));
 	}
 };
 //#endregion
@@ -62,13 +85,20 @@ const zh = {
 	"panel.autoRefresh": "自动刷新",
 	"panel.autoRefresh.off": "关闭",
 	"panel.summary": "{ok} 正常 · {exhausted} 配额耗尽",
+	"panel.instances": "{count} 个网关",
+	"panel.refreshAll": "全部刷新",
 	"panel.notConfigured": "尚未配置 nyro 连接",
-	"panel.notConfiguredHint": "在「设置 → 插件 → Nyro 用量」中填写 baseUrl 与 adminToken，保存后回到本面板。",
+	"panel.notConfiguredHint": "在「设置 → 插件 → Nyro 用量」中填写主网关或添加 nyro 网关，保存后回到本面板。",
+	"panel.disabled": "Nyro 用量插件已关闭",
+	"panel.disabledHint": "在「设置 → 插件 → Nyro 用量」中打开「启用插件」。",
 	"panel.loadError": "加载失败",
 	"panel.retry": "重试",
 	"panel.empty": "nyro 中没有 provider。",
 	"panel.cached": "缓存",
 	"panel.resetOrder": "恢复默认排序",
+	"section.refresh": "刷新此网关",
+	"section.collapse": "收起网关 {name}",
+	"section.expand": "展开网关 {name}",
 	"card.disabled": "已停用",
 	"card.error": "查询失败",
 	"card.eligible": "可调度",
@@ -91,10 +121,28 @@ const zh = {
 	"settings.description": "nyro 网关 provider 用量面板的连接与刷新设置",
 	"settings.enabled": "启用插件",
 	"settings.enabledHint": "关闭后卸载用量代理路由，面板不再加载数据。",
+	"settings.primary": "主网关",
+	"settings.primaryHint": "原有的单网关配置，在面板中排在第一位。留空 Base URL 表示不使用主网关。",
+	"settings.name": "显示名称",
+	"settings.nameHint": "面板中该网关分组的标题，留空时使用地址的主机名。",
 	"settings.baseUrl": "nyro Base URL",
 	"settings.baseUrlHint": "nyro 管理面地址，例如 http://192.168.31.2:19531（结尾的 /api/v1 可省略）。",
 	"settings.adminToken": "Admin Token",
 	"settings.adminTokenHint": "nyro 的 NYRO_ADMIN_TOKEN（Bearer 鉴权）。保存后回读脱敏，留空表示不修改。",
+	"settings.instances": "其他 nyro 网关",
+	"settings.instancesHint": "每个网关在用量面板中单独成组，查询互不影响。",
+	"settings.instancesInherited": "网关列表来自基础配置文件（cordis.yml），请在该文件中修改。",
+	"settings.instancesEmpty": "尚未添加其他网关。",
+	"settings.instanceAdd": "添加 nyro 网关",
+	"settings.instanceUntitled": "网关 {index}",
+	"settings.instanceNew": "新增",
+	"settings.instanceRemove": "删除",
+	"settings.instanceRemoveLabel": "删除网关 {name}",
+	"settings.instanceEnabled": "启用",
+	"settings.instanceBadUrl": "请填写 http(s) 地址",
+	"settings.instanceTokenSet": "已配置（留空保持不变）",
+	"settings.instanceTokenUnset": "未配置",
+	"settings.instanceTokenRequired": "新网关需要填写 Admin Token",
 	"settings.refreshSeconds": "自动刷新间隔（秒）",
 	"settings.refreshSecondsHint": "面板自动刷新的最小间隔，不低于 15 秒。",
 	"settings.cacheSeconds": "缓存 TTL（秒）",
@@ -103,6 +151,8 @@ const zh = {
 	"settings.testing": "测试中…",
 	"settings.testOk": "连接成功（{count} 个 provider）",
 	"settings.testFail": "连接失败：{message}",
+	"settings.testInstanceOk": "{name}：连接成功（{count} 个 provider）",
+	"settings.testInstanceFail": "{name}：{message}",
 	"settings.collapse": "收起",
 	"settings.expand": "展开",
 	"settings.notExposed": "当前部署未向浏览器开放此插件的设置命名空间。",
@@ -129,13 +179,20 @@ const en = {
 	"panel.autoRefresh": "Auto refresh",
 	"panel.autoRefresh.off": "Off",
 	"panel.summary": "{ok} ok · {exhausted} exhausted",
+	"panel.instances": "{count} gateways",
+	"panel.refreshAll": "Refresh all",
 	"panel.notConfigured": "nyro connection is not configured",
-	"panel.notConfiguredHint": "Fill in baseUrl and adminToken under \"Settings → Plugins → Nyro Usage\", save, then come back to this panel.",
+	"panel.notConfiguredHint": "Fill in the primary gateway or add nyro gateways under \"Settings → Plugins → Nyro Usage\", save, then come back to this panel.",
+	"panel.disabled": "The Nyro Usage plugin is turned off",
+	"panel.disabledHint": "Turn on \"Enable plugin\" under \"Settings → Plugins → Nyro Usage\".",
 	"panel.loadError": "Failed to load",
 	"panel.retry": "Retry",
 	"panel.empty": "No providers configured in nyro.",
 	"panel.cached": "cached",
 	"panel.resetOrder": "Reset order",
+	"section.refresh": "Refresh this gateway",
+	"section.collapse": "Collapse gateway {name}",
+	"section.expand": "Expand gateway {name}",
 	"card.disabled": "Disabled",
 	"card.error": "Query failed",
 	"card.eligible": "Eligible",
@@ -158,10 +215,28 @@ const en = {
 	"settings.description": "Connection and refresh settings for the nyro provider usage panel",
 	"settings.enabled": "Enable plugin",
 	"settings.enabledHint": "When off, the usage proxy routes are dropped and the panel loads no data.",
+	"settings.primary": "Primary gateway",
+	"settings.primaryHint": "The original single-gateway settings, listed first in the panel. Leave the Base URL empty to skip it.",
+	"settings.name": "Display name",
+	"settings.nameHint": "Title of this gateway's group in the panel; defaults to the address host.",
 	"settings.baseUrl": "nyro Base URL",
 	"settings.baseUrlHint": "nyro admin-plane address, e.g. http://192.168.31.2:19531 (a trailing /api/v1 is tolerated).",
 	"settings.adminToken": "Admin Token",
 	"settings.adminTokenHint": "nyro's NYRO_ADMIN_TOKEN (Bearer auth). Redacted on read-back once saved; leave empty to keep it.",
+	"settings.instances": "More nyro gateways",
+	"settings.instancesHint": "Each gateway gets its own group in the usage panel and is queried independently.",
+	"settings.instancesInherited": "The gateway list comes from the base config file (cordis.yml); edit it there.",
+	"settings.instancesEmpty": "No additional gateways yet.",
+	"settings.instanceAdd": "Add nyro gateway",
+	"settings.instanceUntitled": "Gateway {index}",
+	"settings.instanceNew": "New",
+	"settings.instanceRemove": "Remove",
+	"settings.instanceRemoveLabel": "Remove gateway {name}",
+	"settings.instanceEnabled": "Enabled",
+	"settings.instanceBadUrl": "Enter an http(s) address",
+	"settings.instanceTokenSet": "Configured (leave empty to keep)",
+	"settings.instanceTokenUnset": "Not configured",
+	"settings.instanceTokenRequired": "A new gateway needs an Admin Token",
 	"settings.refreshSeconds": "Auto refresh (seconds)",
 	"settings.refreshSecondsHint": "Minimum panel auto-refresh interval, at least 15 seconds.",
 	"settings.cacheSeconds": "Cache TTL (seconds)",
@@ -170,6 +245,8 @@ const en = {
 	"settings.testing": "Testing…",
 	"settings.testOk": "Connected ({count} providers)",
 	"settings.testFail": "Connection failed: {message}",
+	"settings.testInstanceOk": "{name}: connected ({count} providers)",
+	"settings.testInstanceFail": "{name}: {message}",
 	"settings.collapse": "Collapse",
 	"settings.expand": "Expand",
 	"settings.notExposed": "This deployment does not serve the plugin settings namespace to the browser.",
@@ -242,17 +319,24 @@ function countdownLabel(resetsAt) {
 //#region src/client/panel/cardOrder.ts
 /**
 * Provider-card ordering: drag-to-reorder positions persisted per browser
-* in localStorage (task-board `dsh.<plugin>.<feature>.vN` precedent).
-* Provider ids unknown to the saved order — added in nyro after the last
-* drag — keep the gateway's natural order, appended after every explicitly
-* ordered card, so new providers never shuffle existing positions.
+* and per nyro gateway in localStorage (task-board
+* `dsh.<plugin>.<feature>.vN` precedent). Provider ids unknown to the saved
+* order — added in nyro after the last drag — keep the gateway's natural
+* order, appended after every explicitly ordered card, so new providers
+* never shuffle existing positions.
 */
-/** localStorage slot holding the saved provider order (array of ids). */
+/** localStorage slot of the primary gateway (the pre-multi-gateway key, kept so saved orders survive). */
 const ORDER_KEY = "dsh.nyroUsage.cardOrder.v1";
+/** Id of the primary gateway (mirrors the host's PRIMARY_INSTANCE_ID). */
+const PRIMARY_INSTANCE_ID = "default";
+/** localStorage slot holding one gateway's saved provider order (array of ids). */
+function orderKey(instanceId) {
+	return instanceId === PRIMARY_INSTANCE_ID ? ORDER_KEY : `${ORDER_KEY}:${instanceId}`;
+}
 /** Read the saved order; any corruption falls back to "no custom order". */
-function loadOrder() {
+function loadOrder(key) {
 	try {
-		const raw = window.localStorage.getItem(ORDER_KEY);
+		const raw = window.localStorage.getItem(key);
 		if (raw === null) return [];
 		const parsed = JSON.parse(raw);
 		if (!Array.isArray(parsed)) return [];
@@ -262,10 +346,10 @@ function loadOrder() {
 	}
 }
 /** Persist (or clear) the order; storage failures just don't persist. */
-function saveOrder(ids) {
+function saveOrder(key, ids) {
 	try {
-		if (ids.length === 0) window.localStorage.removeItem(ORDER_KEY);
-		else window.localStorage.setItem(ORDER_KEY, JSON.stringify(ids));
+		if (ids.length === 0) window.localStorage.removeItem(key);
+		else window.localStorage.setItem(key, JSON.stringify(ids));
 	} catch {}
 }
 /**
@@ -287,13 +371,21 @@ function moved(ids, dragId, overId, before) {
 	next.splice(index === -1 ? next.length : before ? index : index + 1, 0, dragId);
 	return next;
 }
-/** State hook backing the draggable card order. */
-function useCardOrder() {
-	const [order, setOrder] = (0, react.useState)(loadOrder);
+/**
+* State hook backing one gateway's draggable card order.
+* @param instanceId - the gateway whose cards are ordered.
+* @returns the saved order and its drop actions.
+*/
+function useCardOrder(instanceId) {
+	const key = orderKey(instanceId);
+	const [order, setOrder] = (0, react.useState)(() => loadOrder(key));
+	(0, react.useEffect)(() => {
+		setOrder(loadOrder(key));
+	}, [key]);
 	const commit = (0, react.useCallback)((next) => {
 		setOrder(next);
-		saveOrder(next);
-	}, []);
+		saveOrder(key, next);
+	}, [key]);
 	return {
 		order,
 		move: (0, react.useCallback)((displayed, dragId, overId, before) => {
@@ -309,7 +401,7 @@ function useCardOrder() {
 }
 //#endregion
 //#region \0dsh-nyro-usage-css:/home/ubuntu/code/nyro/dsh-nyro-usage/src/client/panel/panel.module.css.js
-const cssText$1 = "/**\n * nyro usage panel styles. Scoped by the plugin's own data attributes so\n * nothing leaks into the rest of the GUI; colors ride the dsh --dsw-* tokens\n * so the panel follows the active theme (light/dark and skins). The\n * center-column hide rules are attribute-scoped and must stay in this\n * stylesheet (it is imported by mount.tsx, so the styles load with the\n * plugin).\n *\n * Class names get the `nyu-` prefix at build time (see tsdown.config.ts).\n */\n\n/* --- center-column takeover (global rules, attribute-scoped) ---------------- */\n\n[data-pane='conversation'],\n[class*='centerCol'] {\n  position: relative;\n}\n\n/* The panel container rides inside the conversation grid item as an extra\n   trailing child; hidden unless the panel is active. */\n[data-dsh-nyro-usage-view] {\n  position: absolute;\n  inset: 0;\n  display: none;\n  z-index: 60;\n  background: var(--dsw-alias-bg-base);\n  overflow: hidden;\n}\n\nhtml[data-dsh-nyro-usage-active]:not([data-dsh-taskboard-active]):not([data-dsh-ssh-active]) [data-dsh-nyro-usage-view] {\n  display: block;\n}\n\nhtml[data-dsh-nyro-usage-active]:not([data-dsh-taskboard-active]):not([data-dsh-ssh-active]) [data-pane='conversation'] > :not([data-dsh-nyro-usage-view]),\nhtml[data-dsh-nyro-usage-active]:not([data-dsh-taskboard-active]):not([data-dsh-ssh-active]) [class*='centerCol'] > :not([data-dsh-nyro-usage-view]) {\n  display: none !important;\n}\n\n/* --- sidebar entry (mirrors the shell's nav-item look) ---------------------- */\n\n.nyu-entry {\n  width: 100%;\n  height: 32px;\n  color: var(--dsw-alias-label-secondary);\n  cursor: pointer;\n  white-space: nowrap;\n  background: 0 0;\n  border: none;\n  border-radius: 8px;\n  align-items: center;\n  gap: 8px;\n  padding: 0 12px;\n  font-size: 13px;\n  display: flex;\n}\n\n.nyu-entry:hover {\n  background: var(--dsw-specific-sidebar-nav-item-hover);\n  color: var(--dsw-alias-label-primary);\n}\n\n.nyu-entry[data-active] {\n  background: var(--dsw-specific-sidebar-nav-item-active);\n  color: var(--dsw-alias-label-primary);\n  font-weight: 600;\n}\n\n.nyu-entryIcon {\n  flex: none;\n  justify-content: center;\n  align-items: center;\n  display: inline-flex;\n}\n\n.nyu-entryLabel {\n  text-overflow: ellipsis;\n  overflow: hidden;\n}\n\n[data-dsh-frame][data-sidebar-collapsed] .nyu-entry {\n  justify-content: center;\n  width: 100%;\n  padding: 0;\n}\n\n[data-dsh-frame][data-sidebar-collapsed] .nyu-entryLabel {\n  display: none;\n}\n\n/* --- panel frame ------------------------------------------------------------ */\n\n.nyu-panel {\n  background: var(--dsw-alias-bg-base);\n  min-width: 0;\n  height: 100%;\n  min-height: 0;\n  color: var(--dsw-alias-label-primary);\n  font-family: var(--dsw-font-family);\n  flex-direction: column;\n  gap: 12px;\n  padding: 14px 16px 16px;\n  display: flex;\n}\n\n.nyu-panelHeader {\n  flex: none;\n  align-items: center;\n  flex-wrap: wrap;\n  gap: 10px;\n  display: flex;\n}\n\n.nyu-panelTitle {\n  color: var(--dsw-alias-label-primary);\n  white-space: nowrap;\n  flex: none;\n  margin: 0;\n  font-size: 16px;\n  font-weight: 700;\n}\n\n.nyu-baseUrlChip {\n  color: var(--dsw-alias-label-tertiary);\n  background: var(--dsw-alias-bg-layer-2);\n  border: 1px solid var(--dsw-alias-border-l1);\n  white-space: nowrap;\n  max-width: 260px;\n  overflow: hidden;\n  text-overflow: ellipsis;\n  border-radius: 999px;\n  padding: 2px 10px;\n  font-size: 11.5px;\n  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;\n}\n\n.nyu-summary {\n  color: var(--dsw-alias-label-secondary);\n  white-space: nowrap;\n  font-size: 12px;\n}\n\n.nyu-toolbarSpacer {\n  flex: 1;\n}\n\n.nyu-autoRefreshLabel {\n  color: var(--dsw-alias-label-secondary);\n  align-items: center;\n  gap: 6px;\n  font-size: 12px;\n  display: inline-flex;\n}\n\n.nyu-autoRefreshSelect {\n  color: var(--dsw-alias-label-primary);\n  background: var(--dsw-specific-input-major);\n  border: 1px solid var(--dsw-alias-border-l2);\n  border-radius: 8px;\n  outline: none;\n  padding: 4px 8px;\n  font: inherit;\n  font-size: 12px;\n}\n\n.nyu-updated {\n  color: var(--dsw-alias-label-tertiary);\n  white-space: nowrap;\n  font-size: 11.5px;\n}\n\n.nyu-refreshButton {\n  color: var(--dsw-alias-label-primary-foreground);\n  background: var(--dsh-alias-button-info-fill, var(--dsw-alias-state-business-primary));\n  cursor: pointer;\n  white-space: nowrap;\n  align-items: center;\n  gap: 6px;\n  border: none;\n  border-radius: 8px;\n  padding: 6px 14px;\n  font-size: 13px;\n  font-weight: 600;\n  display: inline-flex;\n}\n\n.nyu-refreshButton:hover:not(:disabled) {\n  background: var(--dsh-alias-button-info-hover, var(--dsw-alias-state-business-primary));\n}\n\n.nyu-refreshButton:disabled {\n  opacity: 0.5;\n  cursor: default;\n}\n\n.nyu-spinner {\n  border: 2px solid currentcolor;\n  border-top-color: transparent;\n  border-radius: 50%;\n  flex: none;\n  width: 11px;\n  height: 11px;\n  animation: 0.8s linear infinite nyu-spin;\n  display: inline-block;\n}\n\n@keyframes nyu-spin {\n  to {\n    transform: rotate(360deg);\n  }\n}\n\n.nyu-panelContent {\n  flex-direction: column;\n  flex: 1;\n  gap: 12px;\n  min-height: 0;\n  display: flex;\n  overflow-y: auto;\n}\n\n.nyu-placeholder {\n  text-align: center;\n  color: var(--dsw-alias-label-tertiary);\n  gap: 6px;\n  padding: 40px 16px;\n  font-size: 12.5px;\n  display: flex;\n  flex-direction: column;\n}\n\n.nyu-placeholderTitle {\n  color: var(--dsw-alias-label-secondary);\n  margin: 0;\n  font-size: 14px;\n  font-weight: 600;\n}\n\n.nyu-placeholderHint {\n  margin: 0;\n  line-height: 1.6;\n}\n\n.nyu-loadError {\n  color: var(--dsw-alias-state-error-primary);\n  background: var(--dsw-alias-bg-layer-2);\n  border: 1px solid var(--dsw-alias-state-error-primary);\n  align-items: center;\n  justify-content: space-between;\n  gap: 12px;\n  border-radius: 10px;\n  padding: 10px 14px;\n  font-size: 12.5px;\n  line-height: 1.5;\n  display: flex;\n}\n\n.nyu-retryButton {\n  color: var(--dsw-alias-label-primary);\n  border: 1px solid var(--dsw-alias-border-l2);\n  cursor: pointer;\n  white-space: nowrap;\n  background: 0 0;\n  border-radius: 8px;\n  padding: 4px 12px;\n  font: inherit;\n  font-size: 12px;\n  flex: none;\n}\n\n.nyu-retryButton:hover {\n  background: var(--dsw-alias-interactive-bg-hover);\n}\n\n/* --- provider card grid ------------------------------------------------------ */\n\n.nyu-grid {\n  grid-template-columns: repeat(auto-fill, minmax(340px, 1fr));\n  gap: 12px;\n  display: grid;\n}\n\n.nyu-card {\n  background: var(--dsw-alias-bg-layer-2);\n  border: 1px solid var(--dsw-alias-border-l1);\n  border-radius: 12px;\n  flex-direction: column;\n  gap: 10px;\n  padding: 12px 14px;\n  display: flex;\n  min-width: 0;\n}\n\n/* --- drag-to-reorder --------------------------------------------------------- */\n\n/* Grip affordance: the whole card is draggable, the grip just says so. */\n.nyu-dragHandle {\n  color: var(--dsw-alias-label-tertiary);\n  cursor: grab;\n  flex: none;\n  font-size: 14px;\n  line-height: 1;\n  opacity: 0.8;\n}\n\n.nyu-dragHandle:hover {\n  color: var(--dsw-alias-label-secondary);\n  opacity: 1;\n}\n\n/* Source card dims while a drag is in flight. */\n.nyu-cardDragging {\n  opacity: 0.4;\n}\n\n/* Insertion indicator: a business-colored bar on the target edge. */\n.nyu-cardDropBefore {\n  box-shadow: -3px 0 0 0 var(--dsw-alias-state-business-primary);\n}\n\n.nyu-cardDropAfter {\n  box-shadow: 3px 0 0 0 var(--dsw-alias-state-business-primary);\n}\n\n.nyu-resetOrderButton {\n  color: var(--dsw-alias-label-secondary);\n  background: 0 0;\n  border: 1px solid var(--dsw-alias-border-l2);\n  cursor: pointer;\n  white-space: nowrap;\n  border-radius: 8px;\n  padding: 5px 12px;\n  font: inherit;\n  font-size: 12px;\n  flex: none;\n}\n\n.nyu-resetOrderButton:hover {\n  color: var(--dsw-alias-label-primary);\n  background: var(--dsw-alias-interactive-bg-hover);\n}\n\n.nyu-cardMuted {\n  opacity: 0.55;\n}\n\n.nyu-cardExhausted {\n  border-color: var(--dsw-alias-state-error-primary);\n}\n\n.nyu-cardHeader {\n  align-items: center;\n  gap: 8px;\n  display: flex;\n}\n\n.nyu-cardTitle {\n  color: var(--dsw-alias-label-primary);\n  text-overflow: ellipsis;\n  white-space: nowrap;\n  min-width: 0;\n  flex: 1;\n  overflow: hidden;\n  font-size: 13.5px;\n  font-weight: 600;\n}\n\n.nyu-cardBadges {\n  align-items: center;\n  gap: 6px;\n  flex-wrap: wrap;\n  justify-content: flex-end;\n  display: inline-flex;\n}\n\n.nyu-badge {\n  color: var(--dsw-alias-label-secondary);\n  background: var(--dsw-alias-bg-layer-3);\n  border: 1px solid var(--dsw-alias-border-l2);\n  white-space: nowrap;\n  border-radius: 999px;\n  padding: 1px 8px;\n  font-size: 11px;\n  line-height: 1.6;\n  display: inline-block;\n}\n\n.nyu-badgeLevel {\n  color: var(--dsw-alias-state-business-primary);\n  border-color: var(--dsw-alias-state-business-primary);\n  background: 0 0;\n}\n\n.nyu-pill {\n  white-space: nowrap;\n  border-radius: 999px;\n  padding: 1px 8px;\n  font-size: 11px;\n  font-weight: 600;\n  line-height: 1.6;\n  display: inline-block;\n}\n\n.nyu-pillEligible {\n  color: var(--dsw-alias-state-success-primary);\n  border: 1px solid var(--dsw-alias-state-success-primary);\n}\n\n.nyu-pillExhausted {\n  color: #fff;\n  background: var(--dsw-alias-state-error-primary);\n  border: 1px solid var(--dsw-alias-state-error-primary);\n}\n\n.nyu-errorBanner {\n  color: var(--dsw-alias-state-error-primary);\n  background: var(--dsw-alias-bg-layer-3);\n  border: 1px solid var(--dsw-alias-separator-primary);\n  border-left: 3px solid var(--dsw-alias-state-error-primary);\n  flex-direction: column;\n  gap: 2px;\n  border-radius: 8px;\n  padding: 8px 10px;\n  display: flex;\n}\n\n.nyu-errorTitle {\n  font-size: 11.5px;\n  font-weight: 600;\n}\n\n.nyu-errorText {\n  color: var(--dsw-alias-label-secondary);\n  overflow-wrap: anywhere;\n  font-size: 11.5px;\n  line-height: 1.5;\n}\n\n/* --- quota tier rows --------------------------------------------------------- */\n\n.nyu-tierList {\n  flex-direction: column;\n  gap: 7px;\n  display: flex;\n}\n\n.nyu-tierRow {\n  align-items: center;\n  gap: 8px;\n  font-size: 12px;\n  display: flex;\n}\n\n.nyu-tierLabel {\n  color: var(--dsw-alias-label-secondary);\n  text-overflow: ellipsis;\n  white-space: nowrap;\n  min-width: 84px;\n  max-width: 150px;\n  overflow: hidden;\n  flex: none;\n  font-weight: 500;\n}\n\n.nyu-tierTrack {\n  background: var(--dsw-alias-interactive-bg-hover);\n  border-radius: 999px;\n  height: 8px;\n  flex: 1;\n  /* visible overflow: the steady-pace triangle renders above the track. */\n  overflow: visible;\n  position: relative;\n}\n\n.nyu-tierFill {\n  border-radius: 999px;\n  height: 100%;\n  transition: width 0.15s linear;\n  /* clip the fill itself to the track's rounded shape. */\n  overflow: hidden;\n}\n\n/* Steady-pace indicator: a small triangle hovering above the track,\n   pointing down at the position an even consumer would be at right now\n   (0% right after reset → 100% at reset time). Rendered outside the track's\n   rounded clipping via the wrapper's overflow: visible. */\n.nyu-tierPaceWrap {\n  position: absolute;\n  top: -8px;\n  left: 0;\n  right: 0;\n  height: 0;\n  pointer-events: none;\n}\n\n.nyu-tierPace {\n  position: absolute;\n  top: 0;\n  width: 0;\n  height: 0;\n  transform: translateX(-50%);\n  border-left: 4px solid transparent;\n  border-right: 4px solid transparent;\n  /* Theme-tracking ink: the token flips with body[data-ds-dark-theme] —\n     bright (neutral-50) on dark backgrounds, dark (neutral-1000) on light\n     ones. The bg-colored drop-shadow halo separates the shape from the\n     colored fill and the pale track in both themes. */\n  border-top: 5px solid var(--dsw-alias-label-primary, #334155);\n  filter: drop-shadow(0 0 1.5px var(--dsw-alias-bg-base, rgba(255, 255, 255, 0.9)));\n  cursor: help;\n  pointer-events: auto;\n}\n\n.nyu-tierFillOk {\n  background: var(--dsw-alias-state-success-primary);\n}\n\n.nyu-tierFillWarn {\n  background: var(--dsw-alias-state-warn-primary);\n}\n\n.nyu-tierFillDanger {\n  background: var(--dsw-alias-state-error-primary);\n}\n\n/* --- balances / spends ------------------------------------------------------- */\n\n.nyu-tierPercent {\n  width: 38px;\n  text-align: right;\n  flex: none;\n  font-weight: 600;\n  font-variant-numeric: tabular-nums;\n}\n\n.nyu-tierPercentOk {\n  color: var(--dsw-alias-state-success-primary);\n}\n\n.nyu-tierPercentWarn {\n  color: var(--dsw-alias-state-warn-primary);\n}\n\n.nyu-tierPercentDanger {\n  color: var(--dsw-alias-state-error-primary);\n}\n\n.nyu-tierReset {\n  color: var(--dsw-alias-label-tertiary);\n  white-space: nowrap;\n  width: 52px;\n  text-align: right;\n  flex: none;\n  font-size: 10.5px;\n  font-variant-numeric: tabular-nums;\n}\n\n/* --- balances / spends ------------------------------------------------------- */\n\n.nyu-balanceList {\n  flex-direction: column;\n  gap: 5px;\n  display: flex;\n}\n\n.nyu-balanceRow {\n  align-items: baseline;\n  gap: 6px;\n  font-size: 12px;\n  display: flex;\n}\n\n.nyu-balanceLabel {\n  color: var(--dsw-alias-label-secondary);\n  width: 52px;\n  flex: none;\n  font-weight: 500;\n}\n\n.nyu-balanceValue {\n  color: var(--dsw-alias-label-primary);\n  font-weight: 600;\n  font-variant-numeric: tabular-nums;\n}\n\n.nyu-balanceDetail {\n  color: var(--dsw-alias-label-tertiary);\n  font-size: 10.5px;\n}\n\n.nyu-unavailableBadge {\n  color: var(--dsw-alias-state-error-primary);\n  font-weight: 700;\n}\n\n.nyu-spendRow {\n  color: var(--dsw-alias-label-secondary);\n  align-items: center;\n  flex-wrap: wrap;\n  gap: 4px 14px;\n  font-size: 12px;\n  display: flex;\n}\n\n.nyu-spendValue {\n  color: var(--dsw-alias-label-primary);\n  font-weight: 600;\n  font-variant-numeric: tabular-nums;\n}\n\n.nyu-cardFooter {\n  color: var(--dsw-alias-label-tertiary);\n  font-size: 10.5px;\n}\n\n@media (prefers-reduced-motion: reduce) {\n  .nyu-tierFill,\n  .nyu-spinner {\n    transition: none;\n    animation-duration: 1.6s;\n  }\n}\n";
+const cssText$1 = "/**\n * nyro usage panel styles. Scoped by the plugin's own data attributes so\n * nothing leaks into the rest of the GUI; colors ride the dsh --dsw-* tokens\n * so the panel follows the active theme (light/dark and skins). The\n * center-column hide rules are attribute-scoped and must stay in this\n * stylesheet (it is imported by mount.tsx, so the styles load with the\n * plugin).\n *\n * Class names get the `nyu-` prefix at build time (see tsdown.config.ts).\n */\n\n/* --- center-column takeover (global rules, attribute-scoped) ---------------- */\n\n[data-pane='conversation'],\n[class*='centerCol'] {\n  position: relative;\n}\n\n/* The panel container rides inside the conversation grid item as an extra\n   trailing child; hidden unless the panel is active. */\n[data-dsh-nyro-usage-view] {\n  position: absolute;\n  inset: 0;\n  display: none;\n  z-index: 60;\n  background: var(--dsw-alias-bg-base);\n  overflow: hidden;\n}\n\nhtml[data-dsh-nyro-usage-active]:not([data-dsh-taskboard-active]):not([data-dsh-ssh-active]) [data-dsh-nyro-usage-view] {\n  display: block;\n}\n\nhtml[data-dsh-nyro-usage-active]:not([data-dsh-taskboard-active]):not([data-dsh-ssh-active]) [data-pane='conversation'] > :not([data-dsh-nyro-usage-view]),\nhtml[data-dsh-nyro-usage-active]:not([data-dsh-taskboard-active]):not([data-dsh-ssh-active]) [class*='centerCol'] > :not([data-dsh-nyro-usage-view]) {\n  display: none !important;\n}\n\n/* --- sidebar entry (mirrors the shell's nav-item look) ---------------------- */\n\n.nyu-entry {\n  width: 100%;\n  height: 32px;\n  color: var(--dsw-alias-label-secondary);\n  cursor: pointer;\n  white-space: nowrap;\n  background: 0 0;\n  border: none;\n  border-radius: 8px;\n  align-items: center;\n  gap: 8px;\n  padding: 0 12px;\n  font-size: 13px;\n  display: flex;\n}\n\n.nyu-entry:hover {\n  background: var(--dsw-specific-sidebar-nav-item-hover);\n  color: var(--dsw-alias-label-primary);\n}\n\n.nyu-entry[data-active] {\n  background: var(--dsw-specific-sidebar-nav-item-active);\n  color: var(--dsw-alias-label-primary);\n  font-weight: 600;\n}\n\n.nyu-entryIcon {\n  flex: none;\n  justify-content: center;\n  align-items: center;\n  display: inline-flex;\n}\n\n.nyu-entryLabel {\n  text-overflow: ellipsis;\n  overflow: hidden;\n}\n\n[data-dsh-frame][data-sidebar-collapsed] .nyu-entry {\n  justify-content: center;\n  width: 100%;\n  padding: 0;\n}\n\n[data-dsh-frame][data-sidebar-collapsed] .nyu-entryLabel {\n  display: none;\n}\n\n/* --- panel frame ------------------------------------------------------------ */\n\n.nyu-panel {\n  background: var(--dsw-alias-bg-base);\n  min-width: 0;\n  height: 100%;\n  min-height: 0;\n  color: var(--dsw-alias-label-primary);\n  font-family: var(--dsw-font-family);\n  flex-direction: column;\n  gap: 12px;\n  padding: 14px 16px 16px;\n  display: flex;\n}\n\n.nyu-panelHeader {\n  flex: none;\n  align-items: center;\n  flex-wrap: wrap;\n  gap: 10px;\n  display: flex;\n}\n\n.nyu-panelTitle {\n  color: var(--dsw-alias-label-primary);\n  white-space: nowrap;\n  flex: none;\n  margin: 0;\n  font-size: 16px;\n  font-weight: 700;\n}\n\n.nyu-baseUrlChip {\n  color: var(--dsw-alias-label-tertiary);\n  background: var(--dsw-alias-bg-layer-2);\n  border: 1px solid var(--dsw-alias-border-l1);\n  white-space: nowrap;\n  max-width: 260px;\n  overflow: hidden;\n  text-overflow: ellipsis;\n  border-radius: 999px;\n  padding: 2px 10px;\n  font-size: 11.5px;\n  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;\n}\n\n.nyu-summary {\n  color: var(--dsw-alias-label-secondary);\n  white-space: nowrap;\n  font-size: 12px;\n}\n\n.nyu-toolbarSpacer {\n  flex: 1;\n}\n\n.nyu-autoRefreshLabel {\n  color: var(--dsw-alias-label-secondary);\n  align-items: center;\n  gap: 6px;\n  font-size: 12px;\n  display: inline-flex;\n}\n\n.nyu-autoRefreshSelect {\n  color: var(--dsw-alias-label-primary);\n  background: var(--dsw-specific-input-major);\n  border: 1px solid var(--dsw-alias-border-l2);\n  border-radius: 8px;\n  outline: none;\n  padding: 4px 8px;\n  font: inherit;\n  font-size: 12px;\n}\n\n.nyu-updated {\n  color: var(--dsw-alias-label-tertiary);\n  white-space: nowrap;\n  font-size: 11.5px;\n}\n\n.nyu-refreshButton {\n  color: var(--dsw-alias-label-primary-foreground);\n  background: var(--dsh-alias-button-info-fill, var(--dsw-alias-state-business-primary));\n  cursor: pointer;\n  white-space: nowrap;\n  align-items: center;\n  gap: 6px;\n  border: none;\n  border-radius: 8px;\n  padding: 6px 14px;\n  font-size: 13px;\n  font-weight: 600;\n  display: inline-flex;\n}\n\n.nyu-refreshButton:hover:not(:disabled) {\n  background: var(--dsh-alias-button-info-hover, var(--dsw-alias-state-business-primary));\n}\n\n.nyu-refreshButton:disabled {\n  opacity: 0.5;\n  cursor: default;\n}\n\n.nyu-spinner {\n  border: 2px solid currentcolor;\n  border-top-color: transparent;\n  border-radius: 50%;\n  flex: none;\n  width: 11px;\n  height: 11px;\n  animation: 0.8s linear infinite nyu-spin;\n  display: inline-block;\n}\n\n@keyframes nyu-spin {\n  to {\n    transform: rotate(360deg);\n  }\n}\n\n.nyu-panelContent {\n  flex-direction: column;\n  flex: 1;\n  gap: 12px;\n  min-height: 0;\n  display: flex;\n  overflow-y: auto;\n}\n\n.nyu-placeholder {\n  text-align: center;\n  color: var(--dsw-alias-label-tertiary);\n  gap: 6px;\n  padding: 40px 16px;\n  font-size: 12.5px;\n  display: flex;\n  flex-direction: column;\n}\n\n.nyu-placeholderTitle {\n  color: var(--dsw-alias-label-secondary);\n  margin: 0;\n  font-size: 14px;\n  font-weight: 600;\n}\n\n.nyu-placeholderHint {\n  margin: 0;\n  line-height: 1.6;\n}\n\n.nyu-loadError {\n  color: var(--dsw-alias-state-error-primary);\n  background: var(--dsw-alias-bg-layer-2);\n  border: 1px solid var(--dsw-alias-state-error-primary);\n  align-items: center;\n  justify-content: space-between;\n  gap: 12px;\n  border-radius: 10px;\n  padding: 10px 14px;\n  font-size: 12.5px;\n  line-height: 1.5;\n  display: flex;\n}\n\n.nyu-retryButton {\n  color: var(--dsw-alias-label-primary);\n  border: 1px solid var(--dsw-alias-border-l2);\n  cursor: pointer;\n  white-space: nowrap;\n  background: 0 0;\n  border-radius: 8px;\n  padding: 4px 12px;\n  font: inherit;\n  font-size: 12px;\n  flex: none;\n}\n\n.nyu-retryButton:hover {\n  background: var(--dsw-alias-interactive-bg-hover);\n}\n\n/* --- per-gateway sections ---------------------------------------------------- */\n\n.nyu-instanceCount {\n  color: var(--dsw-alias-label-secondary);\n  background: var(--dsw-alias-bg-layer-2);\n  border: 1px solid var(--dsw-alias-border-l1);\n  white-space: nowrap;\n  border-radius: 999px;\n  padding: 2px 10px;\n  font-size: 11.5px;\n}\n\n.nyu-section {\n  flex-direction: column;\n  flex: none;\n  gap: 10px;\n  min-width: 0;\n  display: flex;\n}\n\n.nyu-section + .nyu-section {\n  border-top: 1px solid var(--dsw-alias-border-l1);\n  padding-top: 14px;\n}\n\n.nyu-sectionHeader {\n  align-items: center;\n  flex-wrap: wrap;\n  gap: 8px 10px;\n  min-width: 0;\n  display: flex;\n}\n\n.nyu-sectionToggle {\n  appearance: none;\n  color: var(--dsw-alias-label-primary);\n  cursor: pointer;\n  background: 0 0;\n  border: none;\n  border-radius: 6px;\n  align-items: center;\n  gap: 6px;\n  min-width: 0;\n  max-width: 100%;\n  padding: 2px 4px;\n  font: inherit;\n  display: inline-flex;\n}\n\n.nyu-sectionToggle:hover {\n  background: var(--dsw-alias-interactive-bg-hover);\n}\n\n.nyu-sectionToggle:focus-visible,\n.nyu-sectionRefresh:focus-visible {\n  outline: 2px solid var(--dsw-alias-brand-primary);\n  outline-offset: 1px;\n}\n\n.nyu-sectionChevron {\n  color: var(--dsw-alias-label-tertiary);\n  flex: none;\n  transition: transform 0.16s;\n}\n\n.nyu-sectionChevronCollapsed {\n  transform: rotate(-90deg);\n}\n\n.nyu-sectionHeading {\n  min-width: 0;\n  margin: 0;\n  font-size: 14px;\n  font-weight: 600;\n}\n\n.nyu-sectionTitle {\n  white-space: nowrap;\n  text-overflow: ellipsis;\n  overflow: hidden;\n}\n\n.nyu-sectionBody {\n  flex-direction: column;\n  gap: 10px;\n  min-width: 0;\n  display: flex;\n}\n\n.nyu-sectionRefresh {\n  color: var(--dsw-alias-label-secondary);\n  border: 1px solid var(--dsw-alias-border-l2);\n  cursor: pointer;\n  white-space: nowrap;\n  background: 0 0;\n  border-radius: 8px;\n  align-items: center;\n  gap: 6px;\n  padding: 3px 10px;\n  font: inherit;\n  font-size: 12px;\n  display: inline-flex;\n}\n\n.nyu-sectionRefresh:hover:not(:disabled) {\n  color: var(--dsw-alias-label-primary);\n  background: var(--dsw-alias-interactive-bg-hover);\n}\n\n.nyu-sectionRefresh:disabled {\n  opacity: 0.5;\n  cursor: default;\n}\n\n/* --- provider card grid ------------------------------------------------------ */\n\n.nyu-grid {\n  grid-template-columns: repeat(auto-fill, minmax(340px, 1fr));\n  gap: 12px;\n  display: grid;\n}\n\n.nyu-card {\n  background: var(--dsw-alias-bg-layer-2);\n  border: 1px solid var(--dsw-alias-border-l1);\n  border-radius: 12px;\n  flex-direction: column;\n  gap: 10px;\n  padding: 12px 14px;\n  display: flex;\n  min-width: 0;\n}\n\n/* --- drag-to-reorder --------------------------------------------------------- */\n\n/* Grip affordance: the whole card is draggable, the grip just says so. */\n.nyu-dragHandle {\n  color: var(--dsw-alias-label-tertiary);\n  cursor: grab;\n  flex: none;\n  font-size: 14px;\n  line-height: 1;\n  opacity: 0.8;\n}\n\n.nyu-dragHandle:hover {\n  color: var(--dsw-alias-label-secondary);\n  opacity: 1;\n}\n\n/* Source card dims while a drag is in flight. */\n.nyu-cardDragging {\n  opacity: 0.4;\n}\n\n/* Insertion indicator: a business-colored bar on the target edge. */\n.nyu-cardDropBefore {\n  box-shadow: -3px 0 0 0 var(--dsw-alias-state-business-primary);\n}\n\n.nyu-cardDropAfter {\n  box-shadow: 3px 0 0 0 var(--dsw-alias-state-business-primary);\n}\n\n.nyu-resetOrderButton {\n  color: var(--dsw-alias-label-secondary);\n  background: 0 0;\n  border: 1px solid var(--dsw-alias-border-l2);\n  cursor: pointer;\n  white-space: nowrap;\n  border-radius: 8px;\n  padding: 5px 12px;\n  font: inherit;\n  font-size: 12px;\n  flex: none;\n}\n\n.nyu-resetOrderButton:hover {\n  color: var(--dsw-alias-label-primary);\n  background: var(--dsw-alias-interactive-bg-hover);\n}\n\n.nyu-cardMuted {\n  opacity: 0.55;\n}\n\n.nyu-cardExhausted {\n  border-color: var(--dsw-alias-state-error-primary);\n}\n\n.nyu-cardHeader {\n  align-items: center;\n  gap: 8px;\n  display: flex;\n}\n\n.nyu-cardTitle {\n  color: var(--dsw-alias-label-primary);\n  text-overflow: ellipsis;\n  white-space: nowrap;\n  min-width: 0;\n  flex: 1;\n  overflow: hidden;\n  font-size: 13.5px;\n  font-weight: 600;\n}\n\n.nyu-cardBadges {\n  align-items: center;\n  gap: 6px;\n  flex-wrap: wrap;\n  justify-content: flex-end;\n  display: inline-flex;\n}\n\n.nyu-badge {\n  color: var(--dsw-alias-label-secondary);\n  background: var(--dsw-alias-bg-layer-3);\n  border: 1px solid var(--dsw-alias-border-l2);\n  white-space: nowrap;\n  border-radius: 999px;\n  padding: 1px 8px;\n  font-size: 11px;\n  line-height: 1.6;\n  display: inline-block;\n}\n\n.nyu-badgeLevel {\n  color: var(--dsw-alias-state-business-primary);\n  border-color: var(--dsw-alias-state-business-primary);\n  background: 0 0;\n}\n\n.nyu-pill {\n  white-space: nowrap;\n  border-radius: 999px;\n  padding: 1px 8px;\n  font-size: 11px;\n  font-weight: 600;\n  line-height: 1.6;\n  display: inline-block;\n}\n\n.nyu-pillEligible {\n  color: var(--dsw-alias-state-success-primary);\n  border: 1px solid var(--dsw-alias-state-success-primary);\n}\n\n.nyu-pillExhausted {\n  color: #fff;\n  background: var(--dsw-alias-state-error-primary);\n  border: 1px solid var(--dsw-alias-state-error-primary);\n}\n\n.nyu-errorBanner {\n  color: var(--dsw-alias-state-error-primary);\n  background: var(--dsw-alias-bg-layer-3);\n  border: 1px solid var(--dsw-alias-separator-primary);\n  border-left: 3px solid var(--dsw-alias-state-error-primary);\n  flex-direction: column;\n  gap: 2px;\n  border-radius: 8px;\n  padding: 8px 10px;\n  display: flex;\n}\n\n.nyu-errorTitle {\n  font-size: 11.5px;\n  font-weight: 600;\n}\n\n.nyu-errorText {\n  color: var(--dsw-alias-label-secondary);\n  overflow-wrap: anywhere;\n  font-size: 11.5px;\n  line-height: 1.5;\n}\n\n/* --- quota tier rows --------------------------------------------------------- */\n\n.nyu-tierList {\n  flex-direction: column;\n  gap: 7px;\n  display: flex;\n}\n\n.nyu-tierRow {\n  align-items: center;\n  gap: 8px;\n  font-size: 12px;\n  display: flex;\n}\n\n.nyu-tierLabel {\n  color: var(--dsw-alias-label-secondary);\n  text-overflow: ellipsis;\n  white-space: nowrap;\n  min-width: 84px;\n  max-width: 150px;\n  overflow: hidden;\n  flex: none;\n  font-weight: 500;\n}\n\n.nyu-tierTrack {\n  background: var(--dsw-alias-interactive-bg-hover);\n  border-radius: 999px;\n  height: 8px;\n  flex: 1;\n  /* visible overflow: the steady-pace triangle renders above the track. */\n  overflow: visible;\n  position: relative;\n}\n\n.nyu-tierFill {\n  border-radius: 999px;\n  height: 100%;\n  transition: width 0.15s linear;\n  /* clip the fill itself to the track's rounded shape. */\n  overflow: hidden;\n}\n\n/* Steady-pace indicator: a small triangle hovering above the track,\n   pointing down at the position an even consumer would be at right now\n   (0% right after reset → 100% at reset time). Rendered outside the track's\n   rounded clipping via the wrapper's overflow: visible. */\n.nyu-tierPaceWrap {\n  position: absolute;\n  top: -8px;\n  left: 0;\n  right: 0;\n  height: 0;\n  pointer-events: none;\n}\n\n.nyu-tierPace {\n  position: absolute;\n  top: 0;\n  width: 0;\n  height: 0;\n  transform: translateX(-50%);\n  border-left: 4px solid transparent;\n  border-right: 4px solid transparent;\n  /* Theme-tracking ink: the token flips with body[data-ds-dark-theme] —\n     bright (neutral-50) on dark backgrounds, dark (neutral-1000) on light\n     ones. The bg-colored drop-shadow halo separates the shape from the\n     colored fill and the pale track in both themes. */\n  border-top: 5px solid var(--dsw-alias-label-primary, #334155);\n  filter: drop-shadow(0 0 1.5px var(--dsw-alias-bg-base, rgba(255, 255, 255, 0.9)));\n  cursor: help;\n  pointer-events: auto;\n}\n\n.nyu-tierFillOk {\n  background: var(--dsw-alias-state-success-primary);\n}\n\n.nyu-tierFillWarn {\n  background: var(--dsw-alias-state-warn-primary);\n}\n\n.nyu-tierFillDanger {\n  background: var(--dsw-alias-state-error-primary);\n}\n\n/* --- balances / spends ------------------------------------------------------- */\n\n.nyu-tierPercent {\n  width: 38px;\n  text-align: right;\n  flex: none;\n  font-weight: 600;\n  font-variant-numeric: tabular-nums;\n}\n\n.nyu-tierPercentOk {\n  color: var(--dsw-alias-state-success-primary);\n}\n\n.nyu-tierPercentWarn {\n  color: var(--dsw-alias-state-warn-primary);\n}\n\n.nyu-tierPercentDanger {\n  color: var(--dsw-alias-state-error-primary);\n}\n\n.nyu-tierReset {\n  color: var(--dsw-alias-label-tertiary);\n  white-space: nowrap;\n  width: 52px;\n  text-align: right;\n  flex: none;\n  font-size: 10.5px;\n  font-variant-numeric: tabular-nums;\n}\n\n/* --- balances / spends ------------------------------------------------------- */\n\n.nyu-balanceList {\n  flex-direction: column;\n  gap: 5px;\n  display: flex;\n}\n\n.nyu-balanceRow {\n  align-items: baseline;\n  gap: 6px;\n  font-size: 12px;\n  display: flex;\n}\n\n.nyu-balanceLabel {\n  color: var(--dsw-alias-label-secondary);\n  width: 52px;\n  flex: none;\n  font-weight: 500;\n}\n\n.nyu-balanceValue {\n  color: var(--dsw-alias-label-primary);\n  font-weight: 600;\n  font-variant-numeric: tabular-nums;\n}\n\n.nyu-balanceDetail {\n  color: var(--dsw-alias-label-tertiary);\n  font-size: 10.5px;\n}\n\n.nyu-unavailableBadge {\n  color: var(--dsw-alias-state-error-primary);\n  font-weight: 700;\n}\n\n.nyu-spendRow {\n  color: var(--dsw-alias-label-secondary);\n  align-items: center;\n  flex-wrap: wrap;\n  gap: 4px 14px;\n  font-size: 12px;\n  display: flex;\n}\n\n.nyu-spendValue {\n  color: var(--dsw-alias-label-primary);\n  font-weight: 600;\n  font-variant-numeric: tabular-nums;\n}\n\n.nyu-cardFooter {\n  color: var(--dsw-alias-label-tertiary);\n  font-size: 10.5px;\n}\n\n@media (prefers-reduced-motion: reduce) {\n  .nyu-tierFill,\n  .nyu-spinner,\n  .nyu-sectionChevron {\n    transition: none;\n    animation-duration: 1.6s;\n  }\n}\n";
 if (typeof document !== "undefined") {
 	const tag = "data-dsh-nyro-usage-css";
 	if (document.querySelector("style[" + tag + "]") === null) {
@@ -340,6 +432,16 @@ var panel_module_css_default = {
 	"placeholderHint": "nyu-placeholderHint",
 	"loadError": "nyu-loadError",
 	"retryButton": "nyu-retryButton",
+	"instanceCount": "nyu-instanceCount",
+	"section": "nyu-section",
+	"sectionHeader": "nyu-sectionHeader",
+	"sectionToggle": "nyu-sectionToggle",
+	"sectionRefresh": "nyu-sectionRefresh",
+	"sectionChevron": "nyu-sectionChevron",
+	"sectionChevronCollapsed": "nyu-sectionChevronCollapsed",
+	"sectionHeading": "nyu-sectionHeading",
+	"sectionTitle": "nyu-sectionTitle",
+	"sectionBody": "nyu-sectionBody",
 	"grid": "nyu-grid",
 	"card": "nyu-card",
 	"dragHandle": "nyu-dragHandle",
@@ -617,116 +719,39 @@ function ProviderCard(props) {
 	});
 }
 //#endregion
-//#region src/client/panel/NyroUsagePanel.tsx
+//#region src/client/panel/InstanceSection.tsx
 /**
-* The nyro usage panel: header (base URL chip, scheduling summary, manual
-* refresh, auto-refresh selector, last-updated stamp) over a responsive
-* grid of provider cards the user can drag to reorder (order persisted per
-* browser). Loads through the same-origin host proxy; state machine:
-* unconfigured → loading → data | error.
+* One nyro gateway's group in the usage panel: a collapsible header (name,
+* base URL chip, per-gateway summary, last-updated stamp, reset-order and
+* refresh actions) over that gateway's drag-to-reorder provider card grid.
+* A gateway's failure renders inside its own group only; the card order is
+* persisted per gateway.
 */
-/** Auto-refresh choices offered next to the configured default. */
-const AUTO_REFRESH_CHOICES = [
-	0,
-	60,
-	300,
-	600
-];
-/** Render the nyro provider usage panel. */
-function NyroUsagePanel(props) {
-	const { api } = props;
-	const snapshot = (0, react.useSyncExternalStore)(props.controller.subscribe, props.controller.getSnapshot);
-	const [status, setStatus] = (0, react.useState)(null);
-	const [state, setState] = (0, react.useState)({
-		loading: false,
-		items: [],
-		cachedAt: null,
-		error: null,
-		errorKind: null
-	});
-	const [autoSeconds, setAutoSeconds] = (0, react.useState)(null);
-	const { order, move, append, reset } = useCardOrder();
+/**
+* Count healthy and quota-exhausted providers.
+* @param items - one gateway's provider rows.
+* @returns the counters.
+*/
+function countUsage(items) {
+	return {
+		ok: items.filter((item) => item.status === "ok").length,
+		exhausted: items.filter((item) => item.usage?.scheduling?.status === "quota_exhausted").length
+	};
+}
+/** Render one gateway section. */
+function InstanceSection(props) {
+	const { instance, state } = props;
+	const [collapsed, setCollapsed] = (0, react.useState)(false);
+	const contentId = (0, react.useId)();
+	const { order, move, append, reset } = useCardOrder(instance.id);
 	const [dragId, setDragId] = (0, react.useState)(null);
 	const [dropSide, setDropSide] = (0, react.useState)(null);
-	const [now, setNow] = (0, react.useState)(() => Date.now());
-	const inFlight = (0, react.useRef)(false);
-	const loadSeq = (0, react.useRef)(0);
-	(0, react.useEffect)(() => {
-		const timer = window.setInterval(() => {
-			setNow(Date.now());
-		}, 3e4);
-		return () => {
-			window.clearInterval(timer);
-		};
-	}, []);
-	const load = (0, react.useCallback)(async (refresh) => {
-		if (inFlight.current) return;
-		inFlight.current = true;
-		const seq = ++loadSeq.current;
-		setState((previous) => ({
-			...previous,
-			loading: true
-		}));
-		try {
-			const [nextStatus, usage] = await Promise.all([api.status().catch(() => null), api.usage(refresh)]);
-			if (seq !== loadSeq.current) return;
-			if (nextStatus !== null) setStatus(nextStatus);
-			setState({
-				loading: false,
-				items: usage.data,
-				cachedAt: usage.cachedAt,
-				error: null,
-				errorKind: null
-			});
-		} catch (error) {
-			if (seq !== loadSeq.current) return;
-			const message = errorMessage(error);
-			const kind = error instanceof NyroPanelApiError ? error.kind ?? null : null;
-			setState((previous) => ({
-				...previous,
-				loading: false,
-				error: message,
-				errorKind: kind
-			}));
-		} finally {
-			inFlight.current = false;
-		}
-	}, [api]);
-	(0, react.useEffect)(() => {
-		if (!snapshot.panelOpen) return;
-		api.status().then((next) => {
-			setStatus(next);
-		}).catch(() => {});
-	}, [api, snapshot.panelOpen]);
-	const configured = status?.configured ?? false;
-	(0, react.useEffect)(() => {
-		if (!snapshot.panelOpen || !configured) return;
-		load(false);
-	}, [
-		snapshot.panelOpen,
-		configured,
-		load
-	]);
-	const interval = autoSeconds ?? status?.refreshSeconds ?? 300;
-	(0, react.useEffect)(() => {
-		if (!snapshot.panelOpen || !configured || interval <= 0) return;
-		const timer = window.setInterval(() => {
-			load(false);
-		}, interval * 1e3);
-		return () => {
-			window.clearInterval(timer);
-		};
-	}, [
-		snapshot.panelOpen,
-		configured,
-		interval,
-		load
-	]);
-	const exhausted = state.items.filter((item) => item.usage?.scheduling?.status === "quota_exhausted").length;
-	const ok = state.items.filter((item) => item.status === "ok").length;
-	const visible = bySavedOrder(state.items.filter((item) => item.status !== "unsupported"), order, (item) => item.provider_id);
+	const items = state.usage?.items ?? [];
+	const counts = countUsage(items);
+	const visible = bySavedOrder(items.filter((item) => item.status !== "unsupported"), order, (item) => item.provider_id);
 	const visibleIds = visible.map((item) => item.provider_id);
-	const updated = agoLabel(state.cachedAt);
+	const failure = state.error ?? state.usage?.error ?? null;
+	const updated = agoLabel(state.usage?.cachedAt);
 	const clearDrag = (0, react.useCallback)(() => {
 		setDragId(null);
 		setDropSide(null);
@@ -761,26 +786,51 @@ function NyroUsagePanel(props) {
 			clearDrag();
 		}
 	});
-	return /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
-		className: panel_module_css_default.panel,
+	return /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("section", {
+		className: panel_module_css_default.section,
+		"aria-label": instance.name,
 		children: [/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
-			className: panel_module_css_default.panelHeader,
+			className: panel_module_css_default.sectionHeader,
 			children: [
-				/* @__PURE__ */ (0, react_jsx_runtime.jsx)("h1", {
-					className: panel_module_css_default.panelTitle,
-					children: tt("panel.title")
-				}),
-				status !== null && status.baseUrl !== "" ? /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
-					className: panel_module_css_default.baseUrlChip,
-					title: status.baseUrl,
-					children: status.baseUrl
-				}) : null,
-				state.items.length > 0 ? /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
-					className: panel_module_css_default.summary,
-					children: tt("panel.summary", {
-						ok,
-						exhausted
+				/* @__PURE__ */ (0, react_jsx_runtime.jsx)("h2", {
+					className: panel_module_css_default.sectionHeading,
+					children: /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("button", {
+						type: "button",
+						className: panel_module_css_default.sectionToggle,
+						"aria-expanded": !collapsed,
+						"aria-controls": contentId,
+						title: tt(collapsed ? "section.expand" : "section.collapse", { name: instance.name }),
+						onClick: () => {
+							setCollapsed(!collapsed);
+						},
+						children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("svg", {
+							width: "12",
+							height: "12",
+							viewBox: "0 0 12 12",
+							"aria-hidden": "true",
+							className: collapsed ? `${panel_module_css_default.sectionChevron} ${panel_module_css_default.sectionChevronCollapsed}` : panel_module_css_default.sectionChevron,
+							children: /* @__PURE__ */ (0, react_jsx_runtime.jsx)("path", {
+								d: "M2.5 4.25 6 7.75l3.5-3.5",
+								fill: "none",
+								stroke: "currentColor",
+								strokeWidth: "1.4",
+								strokeLinecap: "round",
+								strokeLinejoin: "round"
+							})
+						}), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+							className: panel_module_css_default.sectionTitle,
+							children: instance.name
+						})]
 					})
+				}),
+				/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+					className: panel_module_css_default.baseUrlChip,
+					title: instance.baseUrl,
+					children: instance.baseUrl
+				}),
+				items.length > 0 ? /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+					className: panel_module_css_default.summary,
+					children: tt("panel.summary", counts)
 				}) : null,
 				/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", { className: panel_module_css_default.toolbarSpacer }),
 				order.length > 0 ? /* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
@@ -789,72 +839,54 @@ function NyroUsagePanel(props) {
 					onClick: reset,
 					children: tt("panel.resetOrder")
 				}) : null,
-				/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("label", {
-					className: panel_module_css_default.autoRefreshLabel,
-					children: [tt("panel.autoRefresh"), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("select", {
-						className: panel_module_css_default.autoRefreshSelect,
-						value: String(interval),
-						onChange: (event) => {
-							setAutoSeconds(Number(event.target.value));
-						},
-						children: AUTO_REFRESH_CHOICES.map((choice) => /* @__PURE__ */ (0, react_jsx_runtime.jsx)("option", {
-							value: String(choice),
-							children: choice === 0 ? tt("panel.autoRefresh.off") : choice >= 60 ? `${choice / 60}m` : `${choice}s`
-						}, choice))
-					})]
-				}),
 				/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
 					className: panel_module_css_default.updated,
-					title: state.cachedAt ?? void 0,
+					title: state.usage?.cachedAt ?? void 0,
 					children: updated === "" ? "" : tt("panel.updated", { ago: updated })
 				}),
 				/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("button", {
 					type: "button",
-					className: panel_module_css_default.refreshButton,
-					disabled: state.loading || !configured,
-					onClick: () => {
-						load(true);
-					},
+					className: panel_module_css_default.sectionRefresh,
+					title: tt("section.refresh"),
+					"aria-label": `${tt("section.refresh")}: ${instance.name}`,
+					disabled: state.loading,
+					onClick: props.onRefresh,
 					children: [state.loading ? /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
 						className: panel_module_css_default.spinner,
 						"aria-hidden": "true"
 					}) : null, state.loading ? tt("panel.refreshing") : tt("panel.refresh")]
 				})
 			]
-		}), /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
-			className: panel_module_css_default.panelContent,
+		}), collapsed ? null : /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+			id: contentId,
+			className: panel_module_css_default.sectionBody,
 			children: [
-				status !== null && !configured ? /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
-					className: panel_module_css_default.placeholder,
-					children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("p", {
-						className: panel_module_css_default.placeholderTitle,
-						children: tt("panel.notConfigured")
-					}), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("p", {
-						className: panel_module_css_default.placeholderHint,
-						children: tt("panel.notConfiguredHint")
-					})]
-				}) : null,
-				configured && state.error !== null ? /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+				failure !== null ? /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
 					className: panel_module_css_default.loadError,
 					role: "alert",
 					children: [/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("span", { children: [
 						tt("panel.loadError"),
 						"：",
-						state.error
+						failure
 					] }), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
 						type: "button",
 						className: panel_module_css_default.retryButton,
-						onClick: () => {
-							load(true);
-						},
+						onClick: props.onRefresh,
 						children: tt("panel.retry")
 					})]
 				}) : null,
-				configured && state.error === null && !state.loading && visible.length === 0 ? /* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
+				failure === null && !state.loading && state.usage !== void 0 && visible.length === 0 ? /* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
 					className: panel_module_css_default.placeholder,
 					children: /* @__PURE__ */ (0, react_jsx_runtime.jsx)("p", {
 						className: panel_module_css_default.placeholderHint,
 						children: tt("panel.empty")
+					})
+				}) : null,
+				state.loading && state.usage === void 0 && state.error === null ? /* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
+					className: panel_module_css_default.placeholder,
+					children: /* @__PURE__ */ (0, react_jsx_runtime.jsx)("p", {
+						className: panel_module_css_default.placeholderHint,
+						children: tt("panel.refreshing")
 					})
 				}) : null,
 				visible.length > 0 ? /* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
@@ -872,20 +904,263 @@ function NyroUsagePanel(props) {
 					},
 					children: visible.map((item) => /* @__PURE__ */ (0, react_jsx_runtime.jsx)(ProviderCard, {
 						item,
-						now,
+						now: props.now,
 						dragging: dragId === item.provider_id,
 						dropBefore: dropSide !== null && dropSide.id === item.provider_id && dropSide.before && dragId !== item.provider_id,
 						dropAfter: dropSide !== null && dropSide.id === item.provider_id && !dropSide.before && dragId !== item.provider_id,
 						...cardDragHandlers(item)
 					}, item.provider_id))
-				}) : null,
-				configured && state.loading && state.items.length === 0 && state.error === null ? /* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
-					className: panel_module_css_default.placeholder,
-					children: /* @__PURE__ */ (0, react_jsx_runtime.jsx)("p", {
-						className: panel_module_css_default.placeholderHint,
-						children: tt("panel.refreshing")
-					})
 				}) : null
+			]
+		})]
+	});
+}
+//#endregion
+//#region src/client/panel/NyroUsagePanel.tsx
+/**
+* The nyro usage panel: a header (gateway count, overall summary,
+* auto-refresh selector, refresh-all) over one section per configured nyro
+* gateway. Loads through the same-origin host proxy, one request per
+* gateway, so a slow or failing gateway never holds back the others.
+* State machine per panel: status loading → disabled | unconfigured |
+* sections; per section: loading → data | error.
+*/
+/** Auto-refresh choices offered next to the configured default. */
+const AUTO_REFRESH_CHOICES = [
+	0,
+	60,
+	300,
+	600
+];
+/**
+* Section identity: a gateway whose URL or token presence changed is a new
+* section with fresh state, so it never shows the previous gateway's data.
+*/
+function sectionKey(instance) {
+	return `${instance.id}\u0000${instance.baseUrl}\u0000${instance.hasToken ? "1" : "0"}`;
+}
+/** Section state before its first answer. */
+const INITIAL_SECTION = {
+	loading: true,
+	usage: void 0,
+	error: null
+};
+/** Render the nyro provider usage panel. */
+function NyroUsagePanel(props) {
+	const { api } = props;
+	const snapshot = (0, react.useSyncExternalStore)(props.controller.subscribe, props.controller.getSnapshot);
+	const [status, setStatus] = (0, react.useState)(null);
+	const [statusError, setStatusError] = (0, react.useState)(null);
+	const [sections, setSections] = (0, react.useState)({});
+	const [autoSeconds, setAutoSeconds] = (0, react.useState)(null);
+	const [now, setNow] = (0, react.useState)(() => Date.now());
+	const inFlight = (0, react.useRef)(/* @__PURE__ */ new Set());
+	const loadSeq = (0, react.useRef)(/* @__PURE__ */ new Map());
+	(0, react.useEffect)(() => {
+		const timer = window.setInterval(() => {
+			setNow(Date.now());
+		}, 3e4);
+		return () => {
+			window.clearInterval(timer);
+		};
+	}, []);
+	const refreshStatus = (0, react.useCallback)(async () => {
+		try {
+			setStatus(await api.status());
+			setStatusError(null);
+		} catch (error) {
+			setStatusError(errorMessage(error));
+		}
+	}, [api]);
+	/** Load one gateway; a request already in flight for it is not repeated. */
+	const loadOne = (0, react.useCallback)(async (instance, refresh) => {
+		const key = sectionKey(instance);
+		if (inFlight.current.has(key)) return;
+		inFlight.current.add(key);
+		const seq = (loadSeq.current.get(key) ?? 0) + 1;
+		loadSeq.current.set(key, seq);
+		setSections((previous) => ({
+			...previous,
+			[key]: {
+				...previous[key] ?? INITIAL_SECTION,
+				loading: true
+			}
+		}));
+		try {
+			const usage = await api.usage(instance.id, refresh);
+			if (loadSeq.current.get(key) !== seq) return;
+			setSections((previous) => ({
+				...previous,
+				[key]: {
+					loading: false,
+					usage,
+					error: null
+				}
+			}));
+		} catch (error) {
+			if (loadSeq.current.get(key) !== seq) return;
+			const message = errorMessage(error);
+			setSections((previous) => ({
+				...previous,
+				[key]: {
+					...previous[key] ?? INITIAL_SECTION,
+					loading: false,
+					error: message
+				}
+			}));
+		} finally {
+			inFlight.current.delete(key);
+		}
+	}, [api]);
+	const configured = status?.configured ?? false;
+	const listKey = configured ? (status?.instances ?? []).map((instance) => `${sectionKey(instance)}\u0000${instance.name}`).join("") : "";
+	const statusRef = (0, react.useRef)(status);
+	statusRef.current = status;
+	const instances = (0, react.useMemo)(() => statusRef.current?.configured === true ? statusRef.current.instances : [], [listKey]);
+	const loadAll = (0, react.useCallback)((refresh) => {
+		for (const instance of instances) loadOne(instance, refresh);
+	}, [instances, loadOne]);
+	(0, react.useEffect)(() => {
+		if (!snapshot.panelOpen) return;
+		refreshStatus();
+	}, [snapshot.panelOpen, refreshStatus]);
+	(0, react.useEffect)(() => {
+		const live = new Set(instances.map(sectionKey));
+		setSections((previous) => {
+			const stale = Object.keys(previous).filter((key) => !live.has(key));
+			if (stale.length === 0) return previous;
+			const next = { ...previous };
+			for (const key of stale) delete next[key];
+			return next;
+		});
+		if (snapshot.panelOpen) loadAll(false);
+	}, [
+		instances,
+		snapshot.panelOpen,
+		loadAll
+	]);
+	const interval = autoSeconds ?? status?.refreshSeconds ?? 300;
+	(0, react.useEffect)(() => {
+		if (!snapshot.panelOpen || !configured || interval <= 0) return;
+		const timer = window.setInterval(() => {
+			loadAll(false);
+		}, interval * 1e3);
+		return () => {
+			window.clearInterval(timer);
+		};
+	}, [
+		snapshot.panelOpen,
+		configured,
+		interval,
+		loadAll
+	]);
+	const states = instances.map((instance) => sections[sectionKey(instance)] ?? INITIAL_SECTION);
+	const anyLoading = states.some((state) => state.loading);
+	const total = states.reduce((sum, state) => {
+		const counts = countUsage(state.usage?.items ?? []);
+		return {
+			ok: sum.ok + counts.ok,
+			exhausted: sum.exhausted + counts.exhausted
+		};
+	}, {
+		ok: 0,
+		exhausted: 0
+	});
+	const anyItems = states.some((state) => (state.usage?.items.length ?? 0) > 0);
+	const refreshAll = () => {
+		refreshStatus();
+		loadAll(true);
+	};
+	return /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+		className: panel_module_css_default.panel,
+		children: [/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+			className: panel_module_css_default.panelHeader,
+			children: [
+				/* @__PURE__ */ (0, react_jsx_runtime.jsx)("h1", {
+					className: panel_module_css_default.panelTitle,
+					children: tt("panel.title")
+				}),
+				instances.length > 1 ? /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+					className: panel_module_css_default.instanceCount,
+					children: tt("panel.instances", { count: instances.length })
+				}) : null,
+				anyItems ? /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+					className: panel_module_css_default.summary,
+					children: tt("panel.summary", total)
+				}) : null,
+				/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", { className: panel_module_css_default.toolbarSpacer }),
+				/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("label", {
+					className: panel_module_css_default.autoRefreshLabel,
+					children: [tt("panel.autoRefresh"), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("select", {
+						className: panel_module_css_default.autoRefreshSelect,
+						value: String(interval),
+						onChange: (event) => {
+							setAutoSeconds(Number(event.target.value));
+						},
+						children: AUTO_REFRESH_CHOICES.map((choice) => /* @__PURE__ */ (0, react_jsx_runtime.jsx)("option", {
+							value: String(choice),
+							children: choice === 0 ? tt("panel.autoRefresh.off") : choice >= 60 ? `${choice / 60}m` : `${choice}s`
+						}, choice))
+					})]
+				}),
+				/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("button", {
+					type: "button",
+					className: panel_module_css_default.refreshButton,
+					disabled: anyLoading || !configured,
+					onClick: refreshAll,
+					children: [anyLoading ? /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+						className: panel_module_css_default.spinner,
+						"aria-hidden": "true"
+					}) : null, anyLoading ? tt("panel.refreshing") : instances.length > 1 ? tt("panel.refreshAll") : tt("panel.refresh")]
+				})
+			]
+		}), /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+			className: panel_module_css_default.panelContent,
+			children: [
+				statusError !== null && status === null ? /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+					className: panel_module_css_default.loadError,
+					role: "alert",
+					children: [/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("span", { children: [
+						tt("panel.loadError"),
+						"：",
+						statusError
+					] }), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
+						type: "button",
+						className: panel_module_css_default.retryButton,
+						onClick: () => {
+							refreshStatus();
+						},
+						children: tt("panel.retry")
+					})]
+				}) : null,
+				status !== null && status.disabled ? /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+					className: panel_module_css_default.placeholder,
+					children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("p", {
+						className: panel_module_css_default.placeholderTitle,
+						children: tt("panel.disabled")
+					}), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("p", {
+						className: panel_module_css_default.placeholderHint,
+						children: tt("panel.disabledHint")
+					})]
+				}) : null,
+				status !== null && !status.disabled && !configured ? /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+					className: panel_module_css_default.placeholder,
+					children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("p", {
+						className: panel_module_css_default.placeholderTitle,
+						children: tt("panel.notConfigured")
+					}), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("p", {
+						className: panel_module_css_default.placeholderHint,
+						children: tt("panel.notConfiguredHint")
+					})]
+				}) : null,
+				instances.map((instance, index) => /* @__PURE__ */ (0, react_jsx_runtime.jsx)(InstanceSection, {
+					instance,
+					state: states[index],
+					now,
+					onRefresh: () => {
+						loadOne(instance, true);
+					}
+				}, sectionKey(instance)))
 			]
 		})]
 	});
@@ -987,8 +1262,282 @@ function mountPanel(controller, api) {
 	};
 }
 //#endregion
+//#region src/client/instances-editor.ts
+/** Normalize one read-back row; anything that is not an object reads as an empty row. */
+function normalizeRow(raw) {
+	const row = typeof raw === "object" && raw !== null ? raw : {};
+	return {
+		name: typeof row.name === "string" ? row.name : "",
+		baseUrl: typeof row.baseUrl === "string" ? row.baseUrl : "",
+		enabled: row.enabled !== false
+	};
+}
+/**
+* Read the stored list and its edit mode from a scope snapshot.
+* @param snapshot - the namespace snapshot.
+* @returns the mode and the stored rows (user layer when it owns the list).
+*/
+function storedInstances(snapshot) {
+	if (snapshot.status !== "ready") return {
+		mode: "unavailable",
+		rows: []
+	};
+	const user = typeof snapshot.user === "object" && snapshot.user !== null ? snapshot.user : void 0;
+	if (Array.isArray(user?.instances)) return {
+		mode: "editable",
+		rows: user.instances.map(normalizeRow)
+	};
+	const effective = snapshot.value?.instances;
+	if (Array.isArray(effective) && effective.length > 0) return {
+		mode: "inherited",
+		rows: effective.map(normalizeRow)
+	};
+	return {
+		mode: "editable",
+		rows: []
+	};
+}
+/**
+* Whether a base URL draft is an http(s) address. Mirrors the host's
+* normalization (whitespace trimmed); an empty draft is invalid.
+* @param text - the draft.
+* @returns validity.
+*/
+function isHttpUrl(text) {
+	const trimmed = text.trim();
+	if (trimmed === "") return false;
+	try {
+		const url = new URL(trimmed);
+		return url.protocol === "http:" || url.protocol === "https:";
+	} catch {
+		return false;
+	}
+}
+/** Stages edits of the gateway list and turns them into path-addressed writes. */
+var InstancesForm = class {
+	scope;
+	edits = /* @__PURE__ */ new Map();
+	removed = /* @__PURE__ */ new Set();
+	added = [];
+	counter = 0;
+	listeners = /* @__PURE__ */ new Set();
+	fingerprint;
+	/** @param scope - the bound settings scope for the `nyro-usage` namespace. */
+	constructor(scope) {
+		this.scope = scope;
+		this.fingerprint = JSON.stringify(this.stored());
+		scope.subscribe(() => {
+			const next = JSON.stringify(this.stored());
+			if (next === this.fingerprint) return;
+			this.fingerprint = next;
+			this.clear();
+			this.notify();
+		});
+	}
+	/** The current stored list and mode. */
+	stored() {
+		return storedInstances(this.scope.getSnapshot());
+	}
+	/** The list as the card renders it: kept stored rows with their edits, then new rows. */
+	state() {
+		const { mode, rows: stored } = this.stored();
+		const rows = [];
+		stored.forEach((row, index) => {
+			if (this.removed.has(index)) return;
+			const edit = this.edits.get(index);
+			const baseUrl = edit?.baseUrl ?? row.baseUrl;
+			rows.push({
+				key: `s:${index}`,
+				storedIndex: index,
+				name: edit?.name ?? row.name,
+				baseUrl,
+				enabled: edit?.enabled ?? row.enabled,
+				token: edit?.token ?? "",
+				badUrl: edit !== void 0 && !isHttpUrl(baseUrl),
+				tokenMissing: false
+			});
+		});
+		for (const row of this.added) rows.push({
+			key: row.key,
+			storedIndex: void 0,
+			name: row.name,
+			baseUrl: row.baseUrl,
+			enabled: row.enabled,
+			token: row.token,
+			badUrl: !isHttpUrl(row.baseUrl),
+			tokenMissing: row.token.trim() === ""
+		});
+		return {
+			mode,
+			rows
+		};
+	}
+	dirty() {
+		if (this.stored().mode !== "editable") return false;
+		return this.edits.size > 0 || this.removed.size > 0 || this.added.length > 0;
+	}
+	invalid() {
+		return this.state().rows.some((row) => row.badUrl || row.tokenMissing);
+	}
+	ops() {
+		const { mode, rows: stored } = this.stored();
+		if (mode !== "editable") return [];
+		const ops = [];
+		stored.forEach((row, index) => {
+			const edit = this.edits.get(index);
+			if (edit === void 0 || this.removed.has(index)) return;
+			const path = (field) => [
+				"instances",
+				String(index),
+				field
+			];
+			for (const field of ["name", "baseUrl"]) {
+				const value = edit[field];
+				if (value === void 0) continue;
+				const trimmed = value.trim();
+				ops.push(trimmed === "" ? {
+					op: "unset",
+					path: path(field)
+				} : {
+					op: "set",
+					path: path(field),
+					value: trimmed
+				});
+			}
+			if (edit.enabled !== void 0) ops.push({
+				op: "set",
+				path: path("enabled"),
+				value: edit.enabled
+			});
+			const token = edit.token?.trim() ?? "";
+			if (token !== "") ops.push({
+				op: "set",
+				path: path("adminToken"),
+				value: token
+			});
+		});
+		for (const index of [...this.removed].sort((a, b) => b - a)) if (index < stored.length) ops.push({
+			op: "unset",
+			path: ["instances", String(index)]
+		});
+		let next = stored.length - [...this.removed].filter((index) => index < stored.length).length;
+		for (const row of this.added) {
+			const value = {
+				baseUrl: row.baseUrl.trim(),
+				adminToken: row.token.trim()
+			};
+			const name = row.name.trim();
+			if (name !== "") value.name = name;
+			if (!row.enabled) value.enabled = false;
+			ops.push({
+				op: "set",
+				path: ["instances", String(next)],
+				value
+			});
+			next += 1;
+		}
+		return ops;
+	}
+	landed() {
+		this.clear();
+		this.fingerprint = JSON.stringify(this.stored());
+		this.notify();
+	}
+	discard() {
+		if (!this.hasDrafts()) return;
+		this.clear();
+		this.notify();
+	}
+	subscribe(listener) {
+		this.listeners.add(listener);
+		return () => {
+			this.listeners.delete(listener);
+		};
+	}
+	/**
+	* Stage one field of a row.
+	* @param key - the row key from {@link state}.
+	* @param field - the field.
+	* @param value - text for name/baseUrl/token, a boolean for enabled.
+	*/
+	edit(key, field, value) {
+		if (this.stored().mode !== "editable") return;
+		if (this.added.find((row) => row.key === key) !== void 0) {
+			if (field === "enabled" !== (typeof value === "boolean")) return;
+			this.added = this.added.map((row) => row.key === key ? {
+				...row,
+				[field]: value
+			} : row);
+			this.notify();
+			return;
+		}
+		const index = storedIndexOf(key);
+		const stored = index === void 0 ? void 0 : this.stored().rows[index];
+		if (index === void 0 || stored === void 0 || this.removed.has(index)) return;
+		const edit = { ...this.edits.get(index) };
+		if (field === "enabled") {
+			if (typeof value !== "boolean") return;
+			if (value === stored.enabled) delete edit.enabled;
+			else edit.enabled = value;
+		} else {
+			if (typeof value !== "string") return;
+			if (field === "token" ? value === "" : value === stored[field]) delete edit[field];
+			else edit[field] = value;
+		}
+		if (Object.keys(edit).length === 0) this.edits.delete(index);
+		else this.edits.set(index, edit);
+		this.notify();
+	}
+	/** Stage a new, empty, enabled row at the end. */
+	add() {
+		if (this.stored().mode !== "editable") return;
+		this.counter += 1;
+		this.added = [...this.added, {
+			key: `n:${this.counter}`,
+			name: "",
+			baseUrl: "",
+			enabled: true,
+			token: ""
+		}];
+		this.notify();
+	}
+	/**
+	* Stage a row's removal (a new row is simply dropped).
+	* @param key - the row key from {@link state}.
+	*/
+	remove(key) {
+		if (this.stored().mode !== "editable") return;
+		if (this.added.some((row) => row.key === key)) {
+			this.added = this.added.filter((row) => row.key !== key);
+			this.notify();
+			return;
+		}
+		const index = storedIndexOf(key);
+		if (index === void 0 || index >= this.stored().rows.length) return;
+		this.removed.add(index);
+		this.edits.delete(index);
+		this.notify();
+	}
+	hasDrafts() {
+		return this.edits.size > 0 || this.removed.size > 0 || this.added.length > 0;
+	}
+	clear() {
+		this.edits.clear();
+		this.removed.clear();
+		this.added = [];
+	}
+	notify() {
+		for (const listener of this.listeners) listener();
+	}
+};
+/** Parse a stored-row key (`s:<index>`). */
+function storedIndexOf(key) {
+	const match = /^s:(\d+)$/.exec(key);
+	return match === null ? void 0 : Number(match[1]);
+}
+//#endregion
 //#region \0dsh-nyro-usage-css:/home/ubuntu/code/nyro/dsh-nyro-usage/src/client/settings-card.module.css.js
-const cssText = "/* Generated by scripts/sync-shared.mjs from shared/client/settings/settings-card.module.css. Do not edit this copy; edit the shared source and run \"node scripts/sync-shared.mjs\". */\n/* Plugin settings card chrome + staged form fields.\n * Aligned with the official ui-settings-plugins PluginCard / fields CSS:\n * same semantic tokens, radius, typography and states so family cards read\n * as siblings of the built-in Shell / Agent loop / Web search cards. */\n\n.nyu-card {\n  border: 1px solid var(--dsw-alias-border-l2);\n  background: var(--dsw-alias-bg-layer-3);\n  border-radius: 12px;\n  list-style: none;\n  transition: border-color 0.16s, background 0.16s;\n}\n\n.nyu-card:hover {\n  border-color: var(--dsw-alias-label-dimmed);\n}\n\n.nyu-cardOpen {\n  background: var(--dsw-alias-bg-layer-2);\n  border-color: var(--dsw-alias-label-dimmed);\n}\n\n.nyu-header {\n  appearance: none;\n  width: 100%;\n  font: inherit;\n  color: inherit;\n  text-align: left;\n  cursor: pointer;\n  background: transparent;\n  border: 0;\n  border-radius: 12px;\n  align-items: center;\n  gap: 12px;\n  padding: 14px 16px;\n  display: flex;\n}\n\n.nyu-header:focus-visible {\n  outline: 2px solid var(--dsw-alias-brand-primary);\n  outline-offset: -2px;\n}\n\n.nyu-headerStatic {\n  width: 100%;\n  border-radius: 12px;\n  align-items: center;\n  gap: 12px;\n  padding: 14px 16px;\n  display: flex;\n}\n\n.nyu-headText {\n  flex-direction: column;\n  flex: 1;\n  gap: 4px;\n  min-width: 0;\n  display: flex;\n}\n\n.nyu-name {\n  color: var(--dsw-alias-label-primary);\n  font-size: 15px;\n  font-weight: 600;\n  line-height: 1.4;\n}\n\n.nyu-description {\n  color: var(--dsw-alias-label-tertiary);\n  font-size: 13px;\n  line-height: 1.5;\n}\n\n.nyu-pending {\n  white-space: nowrap;\n  background: var(--dsw-alias-bg-module-platform);\n  color: var(--dsw-alias-label-secondary);\n  border-radius: 999px;\n  flex: none;\n  padding: 1px 8px;\n  font-size: 11px;\n  font-weight: 500;\n  line-height: 17px;\n}\n\n.nyu-chevron {\n  color: var(--dsw-alias-label-tertiary);\n  flex: none;\n  transition: transform 0.16s;\n}\n\n.nyu-chevronOpen {\n  transform: rotate(180deg);\n}\n\n.nyu-body {\n  border-top: 1px solid var(--dsw-alias-border-l2);\n  margin: 0 16px;\n  padding-bottom: 8px;\n}\n\n.nyu-readOnly {\n  color: var(--dsw-alias-label-tertiary);\n  margin: 12px 0 0;\n  font-size: 12px;\n  line-height: 1.5;\n}\n\n.nyu-notExposed {\n  color: var(--dsw-alias-state-warn-primary);\n  margin: 12px 0 0;\n  font-size: 12px;\n  line-height: 1.5;\n}\n\n.nyu-footer {\n  border-top: 1px solid var(--dsw-alias-border-l2);\n  justify-content: flex-end;\n  align-items: center;\n  gap: 8px;\n  padding: 12px 0 4px;\n  display: flex;\n}\n\n.nyu-failed {\n  min-width: 0;\n  color: var(--dsw-alias-label-error);\n  flex: 1;\n  margin: 0;\n  font-size: 12px;\n  line-height: 1.5;\n  text-overflow: ellipsis;\n  overflow: hidden;\n  white-space: nowrap;\n}\n\n.nyu-discard,\n.nyu-save {\n  appearance: none;\n  font: inherit;\n  cursor: pointer;\n  border: 1px solid transparent;\n  border-radius: 8px;\n  padding: 5px 14px;\n  font-size: 13px;\n  line-height: 1.5;\n}\n\n.nyu-discard {\n  border-color: var(--dsw-alias-border-l2);\n  color: var(--dsw-alias-label-secondary);\n  background: transparent;\n}\n\n.nyu-discard:hover:not(:disabled) {\n  color: var(--dsw-alias-label-primary);\n  border-color: var(--dsw-alias-label-dimmed);\n}\n\n.nyu-save {\n  background: var(--dsw-alias-label-primary);\n  color: var(--dsw-alias-bg-layer-3);\n}\n\n.nyu-discard:disabled,\n.nyu-save:disabled {\n  opacity: 0.4;\n  cursor: default;\n}\n\n.nyu-discard:focus-visible,\n.nyu-save:focus-visible {\n  outline: 2px solid var(--dsw-alias-brand-primary);\n  outline-offset: 1px;\n}\n\n.nyu-field {\n  flex-direction: column;\n  gap: 6px;\n  padding: 12px 0;\n  display: flex;\n}\n\n.nyu-field + .nyu-field {\n  border-top: 1px solid var(--dsw-alias-border-l2);\n}\n\n.nyu-head {\n  align-items: center;\n  gap: 8px;\n  display: flex;\n}\n\n.nyu-label {\n  min-width: 0;\n  color: var(--dsw-alias-label-primary);\n  flex: 1;\n  font-size: 13px;\n  font-weight: 500;\n  line-height: 1.5;\n}\n\n.nyu-badges {\n  align-items: center;\n  gap: 8px;\n  display: inline-flex;\n}\n\n.nyu-badge {\n  white-space: nowrap;\n  background: var(--dsw-alias-bg-module-platform);\n  color: var(--dsw-alias-label-secondary);\n  border-radius: 999px;\n  padding: 1px 8px;\n  font-size: 11px;\n  font-weight: 500;\n  line-height: 17px;\n}\n\n.nyu-reset {\n  font: inherit;\n  color: var(--dsw-alias-label-secondary);\n  cursor: pointer;\n  background: transparent;\n  border: none;\n  padding: 0;\n  font-size: 12px;\n  line-height: 1.5;\n}\n\n.nyu-reset:hover:not(:disabled) {\n  color: var(--dsw-alias-label-primary);\n}\n\n.nyu-reset:disabled {\n  cursor: default;\n}\n\n.nyu-reset:focus-visible {\n  outline: 2px solid var(--dsw-alias-brand-primary);\n  outline-offset: 2px;\n}\n\n.nyu-reset:focus-visible {\n  outline: 2px solid var(--dsw-alias-brand-primary);\n  outline-offset: 2px;\n}\n\n.nyu-input,\n.nyu-select {\n  border: 1px solid var(--dsw-alias-border-l2);\n  background: var(--dsw-alias-bg-layer-3);\n  height: 34px;\n  font: inherit;\n  color: var(--dsw-alias-label-primary);\n  border-radius: 8px;\n  padding: 0 12px;\n  font-size: 13px;\n  line-height: 1.5;\n}\n\n.nyu-input:focus-visible,\n.nyu-select:focus-visible {\n  border-color: var(--dsw-alias-brand-primary);\n  outline: none;\n}\n\n.nyu-input:disabled,\n.nyu-select:disabled {\n  color: var(--dsw-alias-label-tertiary);\n  cursor: default;\n}\n\n.nyu-inputInvalid {\n  border: 1px solid var(--dsw-alias-label-error);\n  background: var(--dsw-alias-bg-layer-3);\n  height: 34px;\n  font: inherit;\n  color: var(--dsw-alias-label-primary);\n  border-radius: 8px;\n  padding: 0 12px;\n  font-size: 13px;\n  line-height: 1.5;\n}\n\n.nyu-inputInvalid:focus-visible {\n  outline: 2px solid var(--dsw-alias-label-error);\n  outline-offset: 1px;\n  border-color: var(--dsw-alias-label-error);\n}\n\n.nyu-invalid {\n  color: var(--dsw-alias-label-error);\n  margin: 0;\n  font-size: 12px;\n  line-height: 1.5;\n}\n\n.nyu-hint {\n  color: var(--dsw-alias-label-tertiary);\n  margin: 0;\n  font-size: 12px;\n  line-height: 1.5;\n}\n\n@media (prefers-reduced-motion: reduce) {\n  .nyu-card,\n  .nyu-header,\n  .nyu-chevron,\n  .nyu-chevronOpen,\n  .nyu-discard,\n  .nyu-save {\n    transition: none;\n  }\n}\n\n/* --- connection test row (nyro-usage extension of the family slice) --------- */\n\n.nyu-testRow {\n  align-items: center;\n  flex-wrap: wrap;\n  gap: 10px;\n  padding: 12px 0 4px;\n  display: flex;\n}\n\n.nyu-testButton {\n  appearance: none;\n  font: inherit;\n  cursor: pointer;\n  color: var(--dsw-alias-label-secondary);\n  border: 1px solid var(--dsw-alias-border-l2);\n  background: transparent;\n  border-radius: 8px;\n  padding: 5px 14px;\n  font-size: 13px;\n  line-height: 1.5;\n}\n\n.nyu-testButton:hover:not(:disabled) {\n  color: var(--dsw-alias-label-primary);\n  border-color: var(--dsw-alias-label-dimmed);\n}\n\n.nyu-testButton:disabled {\n  opacity: 0.4;\n  cursor: default;\n}\n\n.nyu-testButton:focus-visible {\n  outline: 2px solid var(--dsw-alias-brand-primary);\n  outline-offset: 1px;\n}\n\n.nyu-testOk {\n  color: var(--dsw-alias-label-success, var(--dsw-alias-state-success-primary));\n  font-size: 12px;\n  line-height: 1.5;\n}\n\n.nyu-testFail {\n  color: var(--dsw-alias-label-error, var(--dsw-alias-state-error-primary));\n  overflow-wrap: anywhere;\n  font-size: 12px;\n  line-height: 1.5;\n}\n";
+const cssText = "/* Generated by scripts/sync-shared.mjs from shared/client/settings/settings-card.module.css. Do not edit this copy; edit the shared source and run \"node scripts/sync-shared.mjs\". */\n/* Plugin settings card chrome + staged form fields.\n * Aligned with the official ui-settings-plugins PluginCard / fields CSS:\n * same semantic tokens, radius, typography and states so family cards read\n * as siblings of the built-in Shell / Agent loop / Web search cards. */\n\n.nyu-card {\n  border: 1px solid var(--dsw-alias-border-l2);\n  background: var(--dsw-alias-bg-layer-3);\n  border-radius: 12px;\n  list-style: none;\n  transition: border-color 0.16s, background 0.16s;\n}\n\n.nyu-card:hover {\n  border-color: var(--dsw-alias-label-dimmed);\n}\n\n.nyu-cardOpen {\n  background: var(--dsw-alias-bg-layer-2);\n  border-color: var(--dsw-alias-label-dimmed);\n}\n\n.nyu-header {\n  appearance: none;\n  width: 100%;\n  font: inherit;\n  color: inherit;\n  text-align: left;\n  cursor: pointer;\n  background: transparent;\n  border: 0;\n  border-radius: 12px;\n  align-items: center;\n  gap: 12px;\n  padding: 14px 16px;\n  display: flex;\n}\n\n.nyu-header:focus-visible {\n  outline: 2px solid var(--dsw-alias-brand-primary);\n  outline-offset: -2px;\n}\n\n.nyu-headerStatic {\n  width: 100%;\n  border-radius: 12px;\n  align-items: center;\n  gap: 12px;\n  padding: 14px 16px;\n  display: flex;\n}\n\n.nyu-headText {\n  flex-direction: column;\n  flex: 1;\n  gap: 4px;\n  min-width: 0;\n  display: flex;\n}\n\n.nyu-name {\n  color: var(--dsw-alias-label-primary);\n  font-size: 15px;\n  font-weight: 600;\n  line-height: 1.4;\n}\n\n.nyu-description {\n  color: var(--dsw-alias-label-tertiary);\n  font-size: 13px;\n  line-height: 1.5;\n}\n\n.nyu-pending {\n  white-space: nowrap;\n  background: var(--dsw-alias-bg-module-platform);\n  color: var(--dsw-alias-label-secondary);\n  border-radius: 999px;\n  flex: none;\n  padding: 1px 8px;\n  font-size: 11px;\n  font-weight: 500;\n  line-height: 17px;\n}\n\n.nyu-chevron {\n  color: var(--dsw-alias-label-tertiary);\n  flex: none;\n  transition: transform 0.16s;\n}\n\n.nyu-chevronOpen {\n  transform: rotate(180deg);\n}\n\n.nyu-body {\n  border-top: 1px solid var(--dsw-alias-border-l2);\n  margin: 0 16px;\n  padding-bottom: 8px;\n}\n\n.nyu-readOnly {\n  color: var(--dsw-alias-label-tertiary);\n  margin: 12px 0 0;\n  font-size: 12px;\n  line-height: 1.5;\n}\n\n.nyu-notExposed {\n  color: var(--dsw-alias-state-warn-primary);\n  margin: 12px 0 0;\n  font-size: 12px;\n  line-height: 1.5;\n}\n\n.nyu-footer {\n  border-top: 1px solid var(--dsw-alias-border-l2);\n  justify-content: flex-end;\n  align-items: center;\n  gap: 8px;\n  padding: 12px 0 4px;\n  display: flex;\n}\n\n.nyu-failed {\n  min-width: 0;\n  color: var(--dsw-alias-label-error);\n  flex: 1;\n  margin: 0;\n  font-size: 12px;\n  line-height: 1.5;\n  text-overflow: ellipsis;\n  overflow: hidden;\n  white-space: nowrap;\n}\n\n.nyu-discard,\n.nyu-save {\n  appearance: none;\n  font: inherit;\n  cursor: pointer;\n  border: 1px solid transparent;\n  border-radius: 8px;\n  padding: 5px 14px;\n  font-size: 13px;\n  line-height: 1.5;\n}\n\n.nyu-discard {\n  border-color: var(--dsw-alias-border-l2);\n  color: var(--dsw-alias-label-secondary);\n  background: transparent;\n}\n\n.nyu-discard:hover:not(:disabled) {\n  color: var(--dsw-alias-label-primary);\n  border-color: var(--dsw-alias-label-dimmed);\n}\n\n.nyu-save {\n  background: var(--dsw-alias-label-primary);\n  color: var(--dsw-alias-bg-layer-3);\n}\n\n.nyu-discard:disabled,\n.nyu-save:disabled {\n  opacity: 0.4;\n  cursor: default;\n}\n\n.nyu-discard:focus-visible,\n.nyu-save:focus-visible {\n  outline: 2px solid var(--dsw-alias-brand-primary);\n  outline-offset: 1px;\n}\n\n.nyu-field {\n  flex-direction: column;\n  gap: 6px;\n  padding: 12px 0;\n  display: flex;\n}\n\n.nyu-field + .nyu-field {\n  border-top: 1px solid var(--dsw-alias-border-l2);\n}\n\n.nyu-head {\n  align-items: center;\n  gap: 8px;\n  display: flex;\n}\n\n.nyu-label {\n  min-width: 0;\n  color: var(--dsw-alias-label-primary);\n  flex: 1;\n  font-size: 13px;\n  font-weight: 500;\n  line-height: 1.5;\n}\n\n.nyu-badges {\n  align-items: center;\n  gap: 8px;\n  display: inline-flex;\n}\n\n.nyu-badge {\n  white-space: nowrap;\n  background: var(--dsw-alias-bg-module-platform);\n  color: var(--dsw-alias-label-secondary);\n  border-radius: 999px;\n  padding: 1px 8px;\n  font-size: 11px;\n  font-weight: 500;\n  line-height: 17px;\n}\n\n.nyu-reset {\n  font: inherit;\n  color: var(--dsw-alias-label-secondary);\n  cursor: pointer;\n  background: transparent;\n  border: none;\n  padding: 0;\n  font-size: 12px;\n  line-height: 1.5;\n}\n\n.nyu-reset:hover:not(:disabled) {\n  color: var(--dsw-alias-label-primary);\n}\n\n.nyu-reset:disabled {\n  cursor: default;\n}\n\n.nyu-reset:focus-visible {\n  outline: 2px solid var(--dsw-alias-brand-primary);\n  outline-offset: 2px;\n}\n\n.nyu-reset:focus-visible {\n  outline: 2px solid var(--dsw-alias-brand-primary);\n  outline-offset: 2px;\n}\n\n.nyu-input,\n.nyu-select {\n  border: 1px solid var(--dsw-alias-border-l2);\n  background: var(--dsw-alias-bg-layer-3);\n  height: 34px;\n  font: inherit;\n  color: var(--dsw-alias-label-primary);\n  border-radius: 8px;\n  padding: 0 12px;\n  font-size: 13px;\n  line-height: 1.5;\n}\n\n.nyu-input:focus-visible,\n.nyu-select:focus-visible {\n  border-color: var(--dsw-alias-brand-primary);\n  outline: none;\n}\n\n.nyu-input:disabled,\n.nyu-select:disabled {\n  color: var(--dsw-alias-label-tertiary);\n  cursor: default;\n}\n\n.nyu-inputInvalid {\n  border: 1px solid var(--dsw-alias-label-error);\n  background: var(--dsw-alias-bg-layer-3);\n  height: 34px;\n  font: inherit;\n  color: var(--dsw-alias-label-primary);\n  border-radius: 8px;\n  padding: 0 12px;\n  font-size: 13px;\n  line-height: 1.5;\n}\n\n.nyu-inputInvalid:focus-visible {\n  outline: 2px solid var(--dsw-alias-label-error);\n  outline-offset: 1px;\n  border-color: var(--dsw-alias-label-error);\n}\n\n.nyu-invalid {\n  color: var(--dsw-alias-label-error);\n  margin: 0;\n  font-size: 12px;\n  line-height: 1.5;\n}\n\n.nyu-hint {\n  color: var(--dsw-alias-label-tertiary);\n  margin: 0;\n  font-size: 12px;\n  line-height: 1.5;\n}\n\n@media (prefers-reduced-motion: reduce) {\n  .nyu-card,\n  .nyu-header,\n  .nyu-chevron,\n  .nyu-chevronOpen,\n  .nyu-discard,\n  .nyu-save {\n    transition: none;\n  }\n}\n\n/* --- connection test row (nyro-usage extension of the family slice) --------- */\n\n.nyu-testRow {\n  align-items: center;\n  flex-wrap: wrap;\n  gap: 10px;\n  padding: 12px 0 4px;\n  display: flex;\n}\n\n.nyu-testButton {\n  appearance: none;\n  font: inherit;\n  cursor: pointer;\n  color: var(--dsw-alias-label-secondary);\n  border: 1px solid var(--dsw-alias-border-l2);\n  background: transparent;\n  border-radius: 8px;\n  padding: 5px 14px;\n  font-size: 13px;\n  line-height: 1.5;\n}\n\n.nyu-testButton:hover:not(:disabled) {\n  color: var(--dsw-alias-label-primary);\n  border-color: var(--dsw-alias-label-dimmed);\n}\n\n.nyu-testButton:disabled {\n  opacity: 0.4;\n  cursor: default;\n}\n\n.nyu-testButton:focus-visible {\n  outline: 2px solid var(--dsw-alias-brand-primary);\n  outline-offset: 1px;\n}\n\n.nyu-testOk {\n  color: var(--dsw-alias-label-success, var(--dsw-alias-state-success-primary));\n  font-size: 12px;\n  line-height: 1.5;\n}\n\n.nyu-testFail {\n  color: var(--dsw-alias-label-error, var(--dsw-alias-state-error-primary));\n  overflow-wrap: anywhere;\n  font-size: 12px;\n  line-height: 1.5;\n}\n\n.nyu-testList {\n  flex-direction: column;\n  flex-basis: 100%;\n  gap: 2px;\n  margin: 0;\n  padding: 0;\n  list-style: none;\n  display: flex;\n}\n\n/* --- gateway groups (nyro-usage multi-gateway extension) -------------------- */\n\n.nyu-group {\n  border-top: 1px solid var(--dsw-alias-border-l2);\n  flex-direction: column;\n  padding: 12px 0 4px;\n  display: flex;\n}\n\n.nyu-groupTitle {\n  color: var(--dsw-alias-label-primary);\n  margin: 0;\n  font-size: 14px;\n  font-weight: 600;\n  line-height: 1.5;\n}\n\n.nyu-groupHint {\n  color: var(--dsw-alias-label-tertiary);\n  margin: 2px 0 0;\n  font-size: 12px;\n  line-height: 1.5;\n}\n\n.nyu-instanceList {\n  flex-direction: column;\n  gap: 10px;\n  margin: 10px 0 0;\n  padding: 0;\n  list-style: none;\n  display: flex;\n}\n\n.nyu-instanceRow {\n  border: 1px solid var(--dsw-alias-border-l2);\n  background: var(--dsw-alias-bg-layer-3);\n  border-radius: 10px;\n  padding: 4px 12px 2px;\n}\n\n.nyu-instanceHead {\n  align-items: center;\n  gap: 10px;\n  padding: 8px 0 2px;\n  display: flex;\n}\n\n.nyu-instanceTitle {\n  min-width: 0;\n  color: var(--dsw-alias-label-primary);\n  white-space: nowrap;\n  text-overflow: ellipsis;\n  overflow: hidden;\n  flex: 1;\n  margin: 0;\n  font-size: 13px;\n  font-weight: 600;\n  line-height: 1.5;\n}\n\n.nyu-instanceToggle {\n  color: var(--dsw-alias-label-secondary);\n  white-space: nowrap;\n  cursor: pointer;\n  align-items: center;\n  gap: 6px;\n  font-size: 12px;\n  display: inline-flex;\n}\n\n.nyu-instanceToggle input {\n  cursor: inherit;\n  margin: 0;\n}\n\n.nyu-instanceRemove,\n.nyu-instanceAdd {\n  appearance: none;\n  font: inherit;\n  cursor: pointer;\n  background: transparent;\n  border-radius: 8px;\n  font-size: 12px;\n  line-height: 1.5;\n}\n\n.nyu-instanceRemove {\n  color: var(--dsw-alias-label-secondary);\n  border: 1px solid var(--dsw-alias-border-l2);\n  padding: 2px 10px;\n}\n\n.nyu-instanceRemove:hover:not(:disabled) {\n  color: var(--dsw-alias-label-error, var(--dsw-alias-state-error-primary));\n  border-color: var(--dsw-alias-label-error, var(--dsw-alias-state-error-primary));\n}\n\n.nyu-instanceAdd {\n  color: var(--dsw-alias-label-primary);\n  border: 1px dashed var(--dsw-alias-border-l2);\n  align-self: flex-start;\n  margin-top: 10px;\n  padding: 5px 14px;\n}\n\n.nyu-instanceAdd:hover:not(:disabled) {\n  border-color: var(--dsw-alias-label-dimmed);\n}\n\n.nyu-instanceRemove:disabled,\n.nyu-instanceAdd:disabled {\n  opacity: 0.4;\n  cursor: default;\n}\n\n.nyu-instanceRemove:focus-visible,\n.nyu-instanceAdd:focus-visible,\n.nyu-instanceToggle input:focus-visible {\n  outline: 2px solid var(--dsw-alias-brand-primary);\n  outline-offset: 1px;\n}\n\n.nyu-instanceNote {\n  color: var(--dsw-alias-label-tertiary);\n  margin: 10px 0 0;\n  font-size: 12px;\n  line-height: 1.5;\n}\n";
 if (typeof document !== "undefined") {
 	const tag = "data-dsh-nyro-usage-css";
 	if (document.querySelector("style[" + tag + "]") === null) {
@@ -1030,7 +1579,19 @@ var settings_card_module_css_default = {
 	"testRow": "nyu-testRow",
 	"testButton": "nyu-testButton",
 	"testOk": "nyu-testOk",
-	"testFail": "nyu-testFail"
+	"testFail": "nyu-testFail",
+	"testList": "nyu-testList",
+	"group": "nyu-group",
+	"groupTitle": "nyu-groupTitle",
+	"groupHint": "nyu-groupHint",
+	"instanceList": "nyu-instanceList",
+	"instanceRow": "nyu-instanceRow",
+	"instanceHead": "nyu-instanceHead",
+	"instanceTitle": "nyu-instanceTitle",
+	"instanceToggle": "nyu-instanceToggle",
+	"instanceRemove": "nyu-instanceRemove",
+	"instanceAdd": "nyu-instanceAdd",
+	"instanceNote": "nyu-instanceNote"
 };
 //#endregion
 //#region src/client/PluginSettingsCard.tsx
@@ -1266,6 +1827,17 @@ function BooleanField(props) {
 }
 //#endregion
 //#region src/client/settings-form.ts
+/** A top-level field write as the path-addressed edit the settings wire accepts. */
+function pathOp(write) {
+	return write.op === "set" ? {
+		op: "set",
+		path: [write.field],
+		value: write.value
+	} : {
+		op: "unset",
+		path: [write.field]
+	};
+}
 /** A whole- or decimal-number field. An empty draft clears the field; any other draft that is not a finite number within the constraints blocks the save. */
 function numberField(field, constraints = {}) {
 	const { integer = false, min } = constraints;
@@ -1340,18 +1912,31 @@ function booleanField(field) {
 * land keeps its drafts, so the user can correct them instead of retyping.
 */
 var CardForm = class {
-	scope;
 	specs;
 	staged = /* @__PURE__ */ new Map();
 	listeners = /* @__PURE__ */ new Set();
 	saving = false;
 	failed = false;
 	failedReason;
-	/** @param scope - the bound settings scope for this card's namespace. */
-	constructor(scope, specs) {
+	scope;
+	extension;
+	/**
+	* @param scope - the bound settings scope for this card's namespace.
+	* @param specs - the card's scalar fields.
+	* @param extension - optional edits saved in the same mutation as the scalar fields.
+	*/
+	constructor(scope, specs, extension) {
 		this.scope = scope;
+		this.extension = extension;
 		this.specs = new Map(specs.map((spec) => [spec.field, spec]));
 		scope.subscribe(() => {
+			this.publish();
+		});
+		extension?.subscribe(() => {
+			if (!this.saving) {
+				this.failed = false;
+				this.failedReason = void 0;
+			}
 			this.publish();
 		});
 	}
@@ -1371,8 +1956,8 @@ var CardForm = class {
 			available: snapshot.status !== "loading",
 			exposed: snapshot.status === "ready",
 			writable: snapshot.writable,
-			dirty: plan.length > 0,
-			invalid: plan.some((item) => item.run === void 0),
+			dirty: plan.length > 0 || this.extension?.dirty() === true,
+			invalid: plan.some((item) => item.run === void 0) || this.extension?.invalid() === true,
 			saving: this.saving,
 			failed: this.failed,
 			...this.failedReason === void 0 ? {} : { failedReason: this.failedReason }
@@ -1413,10 +1998,11 @@ var CardForm = class {
 				this.save();
 			},
 			discard: () => {
-				if (this.staged.size === 0 && !this.failed) return;
+				if (this.staged.size === 0 && !this.failed && this.extension?.dirty() !== true) return;
 				this.staged.clear();
 				this.failed = false;
 				this.failedReason = void 0;
+				this.extension?.discard();
 				this.publish();
 			}
 		};
@@ -1435,24 +2021,39 @@ var CardForm = class {
 	async save() {
 		const plan = this.plan();
 		const valid = plan.filter((item) => item.run !== void 0);
-		if (plan.length === 0 || this.saving || valid.length !== plan.length) return;
-		const plannedWrites = valid.map((item) => item.op);
+		const extension = this.extension;
+		const extensionDirty = extension?.dirty() === true;
+		if (plan.length === 0 && !extensionDirty || this.saving || valid.length !== plan.length) return;
+		if (extension?.invalid() === true) return;
+		const extensionOps = extensionDirty ? extension.ops() : [];
 		const fields = new Set(plan.map((item) => item.field));
 		this.saving = true;
 		this.failed = false;
 		this.failedReason = void 0;
 		this.publish();
 		const landed = /* @__PURE__ */ new Set();
+		let extensionLanded = extensionOps.length === 0;
 		const batch = this.batchedScope();
 		if (batch !== void 0) {
-			const result = await batch.mutate(plannedWrites);
-			if (result.ok) {
+			const ops = [...valid.map((item) => pathOp(item.op)), ...extensionOps];
+			const result = await batch.mutate(ops);
+			if (typeof result === "boolean") {
+				if (result) {
+					for (const field of fields) landed.add(field);
+					extensionLanded = true;
+				}
+			} else if (result.ok) {
 				for (const field of result.fields) if (field.landed) landed.add(field.field);
+				extensionLanded = true;
 			} else this.failedReason = result.message;
-		} else for (const item of valid) if (await item.run()) landed.add(item.field);
+		} else {
+			for (const item of valid) if (await item.run()) landed.add(item.field);
+			if (!extensionLanded) this.failedReason = "settings scope does not support path edits";
+		}
 		for (const field of fields) if (landed.has(field)) this.staged.delete(field);
+		if (extensionLanded && extensionOps.length > 0) extension.landed();
 		this.saving = false;
-		this.failed = landed.size !== fields.size;
+		this.failed = landed.size !== fields.size || !extensionLanded;
 		this.publish();
 	}
 	/** The scope's batch surface when it supports one; undefined conservatively otherwise. */
@@ -1555,20 +2156,26 @@ var CardForm = class {
 //#endregion
 //#region src/client/NyroSettingsCard.tsx
 /**
-* The nyro-usage settings card: the connection (baseUrl + adminToken) and
-* refresh parameters. Registers into the `web-ui.plugin.item` slot the
-* plugin-configuration section renders, bound to the `nyro-usage` settings
-* namespace. Includes a "test connection" action that exercises the saved
-* configuration through the host proxy.
+* The nyro-usage settings card: the master switch, the primary gateway
+* (name + baseUrl + adminToken — the original single-gateway fields), the
+* list of additional nyro gateways, and the refresh parameters. Registers
+* into the `web-ui.plugin.item` slot the plugin-configuration section
+* renders, bound to the `nyro-usage` settings namespace. One Save writes the
+* scalar fields and the gateway-list edits in a single mutation. Includes a
+* "test connection" action that exercises every saved gateway through the
+* host proxy.
 */
 /** Bridges the `nyro-usage` scope onto the card's staged form. */
 var NyroUsageSettingsCardController = class {
+	instances;
 	form;
 	store;
 	/** @param scope - the bound settings scope for the `nyro-usage` namespace. */
 	constructor(scope) {
+		this.instances = new InstancesForm(scope);
 		this.form = new CardForm(scope, [
 			booleanField("enabled"),
+			textField("name"),
 			textField("baseUrl"),
 			secretField("adminToken"),
 			numberField("refreshSeconds", {
@@ -1579,30 +2186,172 @@ var NyroUsageSettingsCardController = class {
 				integer: true,
 				min: 0
 			})
-		]);
+		], this.instances);
 		this.store = this.form.bind(() => this.projection());
 	}
 	projection() {
 		return {
 			...this.form.shell(),
 			enabled: this.form.field("enabled"),
+			name: this.form.field("name"),
 			baseUrl: this.form.field("baseUrl"),
 			adminToken: this.form.field("adminToken"),
 			refreshSeconds: this.form.field("refreshSeconds"),
-			cacheSeconds: this.form.field("cacheSeconds")
+			cacheSeconds: this.form.field("cacheSeconds"),
+			instances: this.instances.state()
 		};
 	}
 	/**
 	* Build the face the card's slot registration injects.
-	* @returns the card's snapshot and its form actions.
+	* @returns the card's snapshot, its form actions and the gateway-list actions.
 	*/
 	inject() {
 		return {
 			hooks: { nyroUsageSettingsCard: this.store },
-			...this.form.actions()
+			...this.form.actions(),
+			editInstance: (key, field, value) => {
+				this.instances.edit(key, field, value);
+			},
+			addInstance: () => {
+				this.instances.add();
+			},
+			removeInstance: (key) => {
+				this.instances.remove(key);
+			}
 		};
 	}
 };
+/** A DOM-id-safe form of a row key. */
+function idPart(key) {
+	return key.replace(/[^A-Za-z0-9_-]/g, "-");
+}
+/** Render one additional-gateway row. */
+function InstanceRow(props) {
+	const { row, t, disabled } = props;
+	const id = `settings-nyro-usage-instance-${idPart(row.key)}`;
+	const title = row.name.trim() !== "" ? row.name.trim() : t("settings.instanceUntitled", { index: props.position });
+	const isNew = row.storedIndex === void 0;
+	const tokenPlaceholder = isNew ? "nyro NYRO_ADMIN_TOKEN" : props.hasToken === true ? t("settings.instanceTokenSet") : t("settings.instanceTokenUnset");
+	return /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("li", {
+		className: settings_card_module_css_default.instanceRow,
+		role: "group",
+		"aria-labelledby": `${id}-title`,
+		children: [
+			/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+				className: settings_card_module_css_default.instanceHead,
+				children: [
+					/* @__PURE__ */ (0, react_jsx_runtime.jsx)("h4", {
+						id: `${id}-title`,
+						className: settings_card_module_css_default.instanceTitle,
+						title,
+						children: title
+					}),
+					isNew ? /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+						className: settings_card_module_css_default.badge,
+						children: t("settings.instanceNew")
+					}) : null,
+					/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("label", {
+						className: settings_card_module_css_default.instanceToggle,
+						children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("input", {
+							type: "checkbox",
+							checked: row.enabled,
+							disabled,
+							onChange: (event) => {
+								props.onEdit("enabled", event.target.checked);
+							}
+						}), t("settings.instanceEnabled")]
+					}),
+					/* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
+						type: "button",
+						className: settings_card_module_css_default.instanceRemove,
+						disabled,
+						"aria-label": t("settings.instanceRemoveLabel", { name: title }),
+						onClick: props.onRemove,
+						children: t("settings.instanceRemove")
+					})
+				]
+			}),
+			/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+				className: settings_card_module_css_default.field,
+				children: [
+					/* @__PURE__ */ (0, react_jsx_runtime.jsx)("label", {
+						className: settings_card_module_css_default.label,
+						htmlFor: `${id}-name`,
+						children: t("settings.name")
+					}),
+					/* @__PURE__ */ (0, react_jsx_runtime.jsx)("input", {
+						id: `${id}-name`,
+						className: settings_card_module_css_default.input,
+						type: "text",
+						value: row.name,
+						disabled,
+						onChange: (event) => {
+							props.onEdit("name", event.target.value);
+						}
+					}),
+					/* @__PURE__ */ (0, react_jsx_runtime.jsx)("p", {
+						className: settings_card_module_css_default.hint,
+						children: t("settings.nameHint")
+					})
+				]
+			}),
+			/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+				className: settings_card_module_css_default.field,
+				children: [
+					/* @__PURE__ */ (0, react_jsx_runtime.jsx)("label", {
+						className: settings_card_module_css_default.label,
+						htmlFor: `${id}-url`,
+						children: t("settings.baseUrl")
+					}),
+					/* @__PURE__ */ (0, react_jsx_runtime.jsx)("input", {
+						id: `${id}-url`,
+						className: row.badUrl ? settings_card_module_css_default.inputInvalid : settings_card_module_css_default.input,
+						type: "text",
+						inputMode: "url",
+						value: row.baseUrl,
+						placeholder: "http://192.168.31.2:19531",
+						disabled,
+						...row.badUrl ? { "aria-invalid": true } : {},
+						onChange: (event) => {
+							props.onEdit("baseUrl", event.target.value);
+						}
+					}),
+					/* @__PURE__ */ (0, react_jsx_runtime.jsx)("p", {
+						className: row.badUrl ? settings_card_module_css_default.invalid : settings_card_module_css_default.hint,
+						children: row.badUrl ? t("settings.instanceBadUrl") : t("settings.baseUrlHint")
+					})
+				]
+			}),
+			/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+				className: settings_card_module_css_default.field,
+				children: [
+					/* @__PURE__ */ (0, react_jsx_runtime.jsx)("label", {
+						className: settings_card_module_css_default.label,
+						htmlFor: `${id}-token`,
+						children: t("settings.adminToken")
+					}),
+					/* @__PURE__ */ (0, react_jsx_runtime.jsx)("input", {
+						id: `${id}-token`,
+						className: row.tokenMissing ? settings_card_module_css_default.inputInvalid : settings_card_module_css_default.input,
+						type: "password",
+						autoComplete: "new-password",
+						value: row.token,
+						placeholder: tokenPlaceholder,
+						disabled,
+						...row.tokenMissing ? { "aria-invalid": true } : {},
+						onChange: (event) => {
+							props.onEdit("token", event.target.value);
+						}
+					}),
+					/* @__PURE__ */ (0, react_jsx_runtime.jsx)("p", {
+						className: row.tokenMissing ? settings_card_module_css_default.invalid : settings_card_module_css_default.hint,
+						children: row.tokenMissing ? t("settings.instanceTokenRequired") : t("settings.adminTokenHint")
+					})
+				]
+			})
+		]
+	});
+}
 /** Render the nyro-usage card. */
 function NyroUsageSettingsCard(props) {
 	const { t } = props;
@@ -1610,6 +2359,22 @@ function NyroUsageSettingsCard(props) {
 	const disabled = !state.writable;
 	const [testing, setTesting] = (0, react.useState)(false);
 	const [testResult, setTestResult] = (0, react.useState)(null);
+	const [tokens, setTokens] = (0, react.useState)(void 0);
+	const loadTokens = (0, react.useCallback)(async () => {
+		try {
+			setTokens((await new NyroPanelApi().status()).tokens);
+		} catch {
+			setTokens(void 0);
+		}
+	}, []);
+	const wasSaving = (0, react.useRef)(false);
+	(0, react.useEffect)(() => {
+		if (wasSaving.current && !state.saving) loadTokens();
+		wasSaving.current = state.saving;
+	}, [state.saving, loadTokens]);
+	(0, react.useEffect)(() => {
+		loadTokens();
+	}, [loadTokens]);
 	const runTest = async () => {
 		if (testing) return;
 		setTesting(true);
@@ -1620,7 +2385,8 @@ function NyroUsageSettingsCard(props) {
 			setTestResult({
 				ok: false,
 				kind: "network",
-				message: error instanceof Error ? error.message : String(error)
+				message: error instanceof Error ? error.message : String(error),
+				instances: []
 			});
 		} finally {
 			setTesting(false);
@@ -1632,6 +2398,8 @@ function NyroUsageSettingsCard(props) {
 		invalidLabel: t("settings.invalidNumber"),
 		disabled
 	};
+	const list = state.instances;
+	const listLocked = disabled || list.mode !== "editable";
 	return /* @__PURE__ */ (0, react_jsx_runtime.jsxs)(PluginSettingsCard, {
 		t,
 		titleKey: "settings.title",
@@ -1656,79 +2424,174 @@ function NyroUsageSettingsCard(props) {
 					props.resetField("enabled");
 				}
 			}),
-			/* @__PURE__ */ (0, react_jsx_runtime.jsx)(ValueField, {
-				id: "settings-nyro-usage-base-url",
-				label: t("settings.baseUrl"),
-				hint: t("settings.baseUrlHint"),
-				placeholder: "http://192.168.31.2:19531",
-				...fieldProps,
-				...state.baseUrl,
-				onEdit: (text) => {
-					props.edit("baseUrl", text);
-				},
-				onReset: () => {
-					props.resetField("baseUrl");
-				}
+			/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("section", {
+				className: settings_card_module_css_default.group,
+				"aria-labelledby": "settings-nyro-usage-primary",
+				children: [
+					/* @__PURE__ */ (0, react_jsx_runtime.jsx)("h3", {
+						id: "settings-nyro-usage-primary",
+						className: settings_card_module_css_default.groupTitle,
+						children: t("settings.primary")
+					}),
+					/* @__PURE__ */ (0, react_jsx_runtime.jsx)("p", {
+						className: settings_card_module_css_default.groupHint,
+						children: t("settings.primaryHint")
+					}),
+					/* @__PURE__ */ (0, react_jsx_runtime.jsx)(ValueField, {
+						id: "settings-nyro-usage-name",
+						label: t("settings.name"),
+						hint: t("settings.nameHint"),
+						...fieldProps,
+						...state.name,
+						onEdit: (text) => {
+							props.edit("name", text);
+						},
+						onReset: () => {
+							props.resetField("name");
+						}
+					}),
+					/* @__PURE__ */ (0, react_jsx_runtime.jsx)(ValueField, {
+						id: "settings-nyro-usage-base-url",
+						label: t("settings.baseUrl"),
+						hint: t("settings.baseUrlHint"),
+						placeholder: "http://192.168.31.2:19531",
+						...fieldProps,
+						...state.baseUrl,
+						onEdit: (text) => {
+							props.edit("baseUrl", text);
+						},
+						onReset: () => {
+							props.resetField("baseUrl");
+						}
+					}),
+					/* @__PURE__ */ (0, react_jsx_runtime.jsx)(ValueField, {
+						id: "settings-nyro-usage-admin-token",
+						label: t("settings.adminToken"),
+						hint: t("settings.adminTokenHint"),
+						placeholder: tokens?.primary === true ? t("settings.instanceTokenSet") : "nyro NYRO_ADMIN_TOKEN",
+						...fieldProps,
+						...state.adminToken,
+						onEdit: (text) => {
+							props.edit("adminToken", text);
+						},
+						onReset: () => {
+							props.resetField("adminToken");
+						}
+					})
+				]
 			}),
-			/* @__PURE__ */ (0, react_jsx_runtime.jsx)(ValueField, {
-				id: "settings-nyro-usage-admin-token",
-				label: t("settings.adminToken"),
-				hint: t("settings.adminTokenHint"),
-				placeholder: "nyro NYRO_ADMIN_TOKEN",
-				...fieldProps,
-				...state.adminToken,
-				onEdit: (text) => {
-					props.edit("adminToken", text);
-				},
-				onReset: () => {
-					props.resetField("adminToken");
-				}
+			/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("section", {
+				className: settings_card_module_css_default.group,
+				"aria-labelledby": "settings-nyro-usage-instances",
+				children: [
+					/* @__PURE__ */ (0, react_jsx_runtime.jsx)("h3", {
+						id: "settings-nyro-usage-instances",
+						className: settings_card_module_css_default.groupTitle,
+						children: t("settings.instances")
+					}),
+					/* @__PURE__ */ (0, react_jsx_runtime.jsx)("p", {
+						className: settings_card_module_css_default.groupHint,
+						children: t("settings.instancesHint")
+					}),
+					list.mode === "inherited" ? /* @__PURE__ */ (0, react_jsx_runtime.jsx)("p", {
+						className: settings_card_module_css_default.instanceNote,
+						role: "status",
+						children: t("settings.instancesInherited")
+					}) : null,
+					list.rows.length > 0 ? /* @__PURE__ */ (0, react_jsx_runtime.jsx)("ul", {
+						className: settings_card_module_css_default.instanceList,
+						children: list.rows.map((row, index) => /* @__PURE__ */ (0, react_jsx_runtime.jsx)(InstanceRow, {
+							row,
+							position: index + 1,
+							hasToken: row.storedIndex === void 0 ? void 0 : tokens?.rows[row.storedIndex],
+							disabled: listLocked,
+							t,
+							onEdit: (field, value) => {
+								props.editInstance(row.key, field, value);
+							},
+							onRemove: () => {
+								props.removeInstance(row.key);
+							}
+						}, row.key))
+					}) : /* @__PURE__ */ (0, react_jsx_runtime.jsx)("p", {
+						className: settings_card_module_css_default.instanceNote,
+						children: t("settings.instancesEmpty")
+					}),
+					list.mode === "editable" ? /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("button", {
+						type: "button",
+						className: settings_card_module_css_default.instanceAdd,
+						disabled,
+						onClick: props.addInstance,
+						children: ["+ ", t("settings.instanceAdd")]
+					}) : null
+				]
 			}),
-			/* @__PURE__ */ (0, react_jsx_runtime.jsx)(ValueField, {
-				id: "settings-nyro-usage-refresh",
-				label: t("settings.refreshSeconds"),
-				hint: t("settings.refreshSecondsHint"),
-				numeric: true,
-				...fieldProps,
-				...state.refreshSeconds,
-				onEdit: (text) => {
-					props.edit("refreshSeconds", text);
-				},
-				onReset: () => {
-					props.resetField("refreshSeconds");
-				}
-			}),
-			/* @__PURE__ */ (0, react_jsx_runtime.jsx)(ValueField, {
-				id: "settings-nyro-usage-cache",
-				label: t("settings.cacheSeconds"),
-				hint: t("settings.cacheSecondsHint"),
-				numeric: true,
-				...fieldProps,
-				...state.cacheSeconds,
-				onEdit: (text) => {
-					props.edit("cacheSeconds", text);
-				},
-				onReset: () => {
-					props.resetField("cacheSeconds");
-				}
+			/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("section", {
+				className: settings_card_module_css_default.group,
+				"aria-label": t("settings.refreshSeconds"),
+				children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)(ValueField, {
+					id: "settings-nyro-usage-refresh",
+					label: t("settings.refreshSeconds"),
+					hint: t("settings.refreshSecondsHint"),
+					numeric: true,
+					...fieldProps,
+					...state.refreshSeconds,
+					onEdit: (text) => {
+						props.edit("refreshSeconds", text);
+					},
+					onReset: () => {
+						props.resetField("refreshSeconds");
+					}
+				}), /* @__PURE__ */ (0, react_jsx_runtime.jsx)(ValueField, {
+					id: "settings-nyro-usage-cache",
+					label: t("settings.cacheSeconds"),
+					hint: t("settings.cacheSecondsHint"),
+					numeric: true,
+					...fieldProps,
+					...state.cacheSeconds,
+					onEdit: (text) => {
+						props.edit("cacheSeconds", text);
+					},
+					onReset: () => {
+						props.resetField("cacheSeconds");
+					}
+				})]
 			}),
 			/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
 				className: settings_card_module_css_default.testRow,
-				children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
-					type: "button",
-					className: settings_card_module_css_default.testButton,
-					disabled: testing || state.dirty || state.invalid,
-					onClick: () => {
-						runTest();
-					},
-					children: testing ? t("settings.testing") : t("settings.test")
-				}), testResult !== null ? testResult.ok ? /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
-					className: settings_card_module_css_default.testOk,
-					children: tt("settings.testOk", { count: testResult.providerCount ?? 0 })
-				}) : /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
-					className: settings_card_module_css_default.testFail,
-					children: tt("settings.testFail", { message: testResult.message })
-				}) : null]
+				children: [
+					/* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
+						type: "button",
+						className: settings_card_module_css_default.testButton,
+						disabled: testing || state.dirty || state.invalid,
+						onClick: () => {
+							runTest();
+						},
+						children: testing ? t("settings.testing") : t("settings.test")
+					}),
+					testResult !== null ? testResult.ok ? /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+						className: settings_card_module_css_default.testOk,
+						role: "status",
+						children: t("settings.testOk", { count: testResult.providerCount ?? 0 })
+					}) : /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+						className: settings_card_module_css_default.testFail,
+						role: "status",
+						children: t("settings.testFail", { message: testResult.message })
+					}) : null,
+					testResult !== null && testResult.instances.length > 1 ? /* @__PURE__ */ (0, react_jsx_runtime.jsx)("ul", {
+						className: settings_card_module_css_default.testList,
+						children: testResult.instances.map((result) => /* @__PURE__ */ (0, react_jsx_runtime.jsx)("li", {
+							className: result.ok ? settings_card_module_css_default.testOk : settings_card_module_css_default.testFail,
+							children: result.ok ? t("settings.testInstanceOk", {
+								name: result.name,
+								count: result.providerCount ?? 0
+							}) : t("settings.testInstanceFail", {
+								name: result.name,
+								message: result.message
+							})
+						}, result.id))
+					}) : null
+				]
 			})
 		]
 	});

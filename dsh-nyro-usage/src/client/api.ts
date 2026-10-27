@@ -3,25 +3,35 @@
  * data access path the panel uses — plain same-origin fetch.
  */
 
-import type { NyroStatusResponse, NyroTestResult, NyroUsageItem } from '../nyro.ts'
+import type {
+  NyroInstanceStatus,
+  NyroInstanceTestResult,
+  NyroInstanceUsage,
+  NyroStatusResponse,
+  NyroTestRouteResponse,
+  NyroUsageItem,
+  NyroUsageRouteResponse,
+} from '../nyro.ts'
 
-/** Bulk usage response (items + cache metadata). */
-export interface UsageResponse {
-  data: NyroUsageItem[]
-  cachedAt: string
+export type {
+  NyroInstanceStatus,
+  NyroInstanceTestResult,
+  NyroInstanceUsage,
+  NyroStatusResponse,
+  NyroTestRouteResponse,
+  NyroUsageItem,
+  NyroUsageRouteResponse,
 }
-
-export type { NyroStatusResponse, NyroTestResult, NyroUsageItem }
 
 /** Error carrying the route's JSON error message. */
 export class NyroPanelApiError extends Error {
-  constructor(
-    message: string,
-    /** Route error kind when the host provided one (e.g. `unauthorized`). */
-    readonly kind?: string,
-  ) {
+  /** Route error kind when the host provided one (e.g. `unauthorized`). */
+  readonly kind: string | undefined
+
+  constructor(message: string, kind?: string) {
     super(message)
     this.name = 'NyroPanelApiError'
+    this.kind = kind
   }
 }
 
@@ -42,21 +52,41 @@ async function readJson<T>(response: Response): Promise<T> {
   return body as T
 }
 
+/** Build a route URL with optional `instance` / `refresh` query params. */
+function routeUrl(path: string, params: { instance?: string; refresh?: boolean }): string {
+  const search = new URLSearchParams()
+  if (params.instance !== undefined) search.set('instance', params.instance)
+  if (params.refresh === true) search.set('refresh', '1')
+  const query = search.toString()
+  return query === '' ? path : `${path}?${query}`
+}
+
 /** The host proxy routes (same origin). */
 export class NyroPanelApi {
-  /** Sanitized config + cache state. */
+  /** Sanitized config + per-gateway cache state. */
   async status(): Promise<NyroStatusResponse> {
     return readJson<NyroStatusResponse>(await fetch('/api/nyro-usage/status'))
   }
 
-  /** Every provider's usage; `refresh` bypasses the host-side cache. */
-  async usage(refresh = false): Promise<UsageResponse> {
-    const search = refresh ? '?refresh=1' : ''
-    return readJson<UsageResponse>(await fetch(`/api/nyro-usage/usage${search}`))
+  /**
+   * One gateway's provider usage.
+   * @param instance - gateway id from the status route.
+   * @param refresh - bypass the host-side cache.
+   * @returns that gateway's slice (its own failure is reported inside it).
+   */
+  async usage(instance: string, refresh = false): Promise<NyroInstanceUsage> {
+    const body = await readJson<NyroUsageRouteResponse>(await fetch(routeUrl('/api/nyro-usage/usage', { instance, refresh })))
+    const slice = body.instances.find(entry => entry.id === instance)
+    if (slice === undefined) throw new NyroPanelApiError('unknown nyro instance', 'not-found')
+    return slice
   }
 
-  /** Connectivity + auth test against the saved configuration. */
-  async test(): Promise<NyroTestResult> {
-    return readJson<NyroTestResult>(await fetch('/api/nyro-usage/test', { method: 'POST' }))
+  /**
+   * Connectivity + auth test against the saved configuration.
+   * @param instance - one gateway id; omitted tests every gateway.
+   * @returns the overall verdict plus one result per tested gateway.
+   */
+  async test(instance?: string): Promise<NyroTestRouteResponse> {
+    return readJson<NyroTestRouteResponse>(await fetch(routeUrl('/api/nyro-usage/test', { instance }), { method: 'POST' }))
   }
 }

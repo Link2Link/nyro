@@ -63,7 +63,7 @@ function inlineCssModules(prefix: string, styleTag: string): Plugin {
 }
 
 /** Runtime-provided imports must never be bundled. */
-const EXTERNAL = [/^@deepseek-ai\//, /^react(\/.*)?$/, /^react-dom(\/.*)?$/, /^schemastery$/]
+const EXTERNAL = [/^@deepseek-ai\//, /^react(\/.*)?$/, /^react-dom(\/.*)?$/]
 
 /**
  * Two entries, matching the package exports:

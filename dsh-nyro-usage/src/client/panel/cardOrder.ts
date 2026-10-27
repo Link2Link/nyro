@@ -1,19 +1,28 @@
 /**
  * Provider-card ordering: drag-to-reorder positions persisted per browser
- * in localStorage (task-board `dsh.<plugin>.<feature>.vN` precedent).
- * Provider ids unknown to the saved order — added in nyro after the last
- * drag — keep the gateway's natural order, appended after every explicitly
- * ordered card, so new providers never shuffle existing positions.
+ * and per nyro gateway in localStorage (task-board
+ * `dsh.<plugin>.<feature>.vN` precedent). Provider ids unknown to the saved
+ * order — added in nyro after the last drag — keep the gateway's natural
+ * order, appended after every explicitly ordered card, so new providers
+ * never shuffle existing positions.
  */
-import { useCallback, useState } from 'react'
+import { useCallback, useEffect, useState } from 'react'
 
-/** localStorage slot holding the saved provider order (array of ids). */
+/** localStorage slot of the primary gateway (the pre-multi-gateway key, kept so saved orders survive). */
 const ORDER_KEY = 'dsh.nyroUsage.cardOrder.v1'
 
+/** Id of the primary gateway (mirrors the host's PRIMARY_INSTANCE_ID). */
+const PRIMARY_INSTANCE_ID = 'default'
+
+/** localStorage slot holding one gateway's saved provider order (array of ids). */
+export function orderKey(instanceId: string): string {
+  return instanceId === PRIMARY_INSTANCE_ID ? ORDER_KEY : `${ORDER_KEY}:${instanceId}`
+}
+
 /** Read the saved order; any corruption falls back to "no custom order". */
-function loadOrder(): string[] {
+function loadOrder(key: string): string[] {
   try {
-    const raw = window.localStorage.getItem(ORDER_KEY)
+    const raw = window.localStorage.getItem(key)
     if (raw === null) return []
     const parsed: unknown = JSON.parse(raw)
     if (!Array.isArray(parsed)) return []
@@ -24,10 +33,10 @@ function loadOrder(): string[] {
 }
 
 /** Persist (or clear) the order; storage failures just don't persist. */
-function saveOrder(ids: string[]): void {
+function saveOrder(key: string, ids: string[]): void {
   try {
-    if (ids.length === 0) window.localStorage.removeItem(ORDER_KEY)
-    else window.localStorage.setItem(ORDER_KEY, JSON.stringify(ids))
+    if (ids.length === 0) window.localStorage.removeItem(key)
+    else window.localStorage.setItem(key, JSON.stringify(ids))
   } catch {
     /* private mode / quota — the ordering stays session-only */
   }
@@ -68,13 +77,20 @@ export interface CardOrder {
   reset: () => void
 }
 
-/** State hook backing the draggable card order. */
-export function useCardOrder(): CardOrder {
-  const [order, setOrder] = useState<string[]>(loadOrder)
+/**
+ * State hook backing one gateway's draggable card order.
+ * @param instanceId - the gateway whose cards are ordered.
+ * @returns the saved order and its drop actions.
+ */
+export function useCardOrder(instanceId: string): CardOrder {
+  const key = orderKey(instanceId)
+  const [order, setOrder] = useState<string[]>(() => loadOrder(key))
+  // A section reused for another gateway reloads that gateway's order.
+  useEffect(() => { setOrder(loadOrder(key)) }, [key])
   const commit = useCallback((next: string[]): void => {
     setOrder(next)
-    saveOrder(next)
-  }, [])
+    saveOrder(key, next)
+  }, [key])
   // The displayed sequence (already merged with the saved order) is the
   // seed, so never-dragged providers keep their visual neighbors and the
   // saved order always covers every visible card.

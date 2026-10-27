@@ -73,6 +73,7 @@ export const inject = ['slots', 'locale', 'connection', 'configForms']
 /** Type-only surface (export discipline: no value exports beyond the plugin contract). */
 export type { PanelControllerSnapshot } from './controller.ts'
 export type { NyroUsagePanelProps } from './panel/NyroUsagePanel.tsx'
+export type { InstanceSectionProps } from './panel/InstanceSection.tsx'
 export type { ProviderCardProps } from './panel/ProviderCard.tsx'
 export type { TierBarProps } from './panel/TierBar.tsx'
 export type { NyroUsageSettingsCardProps } from './NyroSettingsCard.tsx'

@@ -1,16 +1,16 @@
 /**
- * The nyro usage panel: header (base URL chip, scheduling summary, manual
- * refresh, auto-refresh selector, last-updated stamp) over a responsive
- * grid of provider cards the user can drag to reorder (order persisted per
- * browser). Loads through the same-origin host proxy; state machine:
- * unconfigured → loading → data | error.
+ * The nyro usage panel: a header (gateway count, overall summary,
+ * auto-refresh selector, refresh-all) over one section per configured nyro
+ * gateway. Loads through the same-origin host proxy, one request per
+ * gateway, so a slow or failing gateway never holds back the others.
+ * State machine per panel: status loading → disabled | unconfigured |
+ * sections; per section: loading → data | error.
  */
-import { useCallback, useEffect, useRef, useState, useSyncExternalStore, type DragEvent } from 'react'
-import { NyroPanelApi, NyroPanelApiError, type NyroStatusResponse, type NyroUsageItem } from '../api.ts'
+import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react'
+import type { NyroInstanceStatus, NyroPanelApi, NyroStatusResponse } from '../api.ts'
 import type { PanelController } from '../controller.ts'
-import { agoLabel, errorMessage, tt } from '../tt.ts'
-import { bySavedOrder, useCardOrder } from './cardOrder.ts'
-import { ProviderCard } from './ProviderCard.tsx'
+import { errorMessage, tt } from '../tt.ts'
+import { countUsage, InstanceSection, type InstanceSectionState } from './InstanceSection.tsx'
 import css from './panel.module.css'
 
 /** Auto-refresh choices offered next to the configured default. */
@@ -22,148 +22,135 @@ export interface NyroUsagePanelProps {
   api: NyroPanelApi
 }
 
-/** Load state of the bulk usage listing. */
-interface UsageState {
-  loading: boolean
-  items: NyroUsageItem[]
-  cachedAt: string | null
-  error: string | null
-  errorKind: string | null
+/**
+ * Section identity: a gateway whose URL or token presence changed is a new
+ * section with fresh state, so it never shows the previous gateway's data.
+ */
+function sectionKey(instance: NyroInstanceStatus): string {
+  return `${instance.id}\u0000${instance.baseUrl}\u0000${instance.hasToken ? '1' : '0'}`
 }
+
+/** Section state before its first answer. */
+const INITIAL_SECTION: InstanceSectionState = { loading: true, usage: undefined, error: null }
 
 /** Render the nyro provider usage panel. */
 export function NyroUsagePanel(props: NyroUsagePanelProps) {
   const { api } = props
   const snapshot = useSyncExternalStore(props.controller.subscribe, props.controller.getSnapshot)
   const [status, setStatus] = useState<NyroStatusResponse | null>(null)
-  const [state, setState] = useState<UsageState>({ loading: false, items: [], cachedAt: null, error: null, errorKind: null })
+  const [statusError, setStatusError] = useState<string | null>(null)
+  const [sections, setSections] = useState<Record<string, InstanceSectionState>>({})
   const [autoSeconds, setAutoSeconds] = useState<number | null>(null)
-  // Drag-to-reorder state: the dragged provider id + the hovered drop slot.
-  const { order, move, append, reset } = useCardOrder()
-  const [dragId, setDragId] = useState<string | null>(null)
-  const [dropSide, setDropSide] = useState<{ id: string; before: boolean } | null>(null)
   // Re-evaluates the steady-pace markers and countdowns on a 30s tick.
   const [now, setNow] = useState(() => Date.now())
-  const inFlight = useRef(false)
-  const loadSeq = useRef(0)
+  const inFlight = useRef(new Set<string>())
+  const loadSeq = useRef(new Map<string, number>())
 
   useEffect(() => {
     const timer = window.setInterval(() => { setNow(Date.now()) }, 30_000)
     return () => { window.clearInterval(timer) }
   }, [])
 
-  const load = useCallback(async (refresh: boolean): Promise<void> => {
-    if (inFlight.current) return
-    inFlight.current = true
-    const seq = ++loadSeq.current
-    setState(previous => ({ ...previous, loading: true }))
+  const refreshStatus = useCallback(async (): Promise<void> => {
     try {
-      const [nextStatus, usage] = await Promise.all([
-        api.status().catch(() => null),
-        api.usage(refresh),
-      ])
-      if (seq !== loadSeq.current) return
-      if (nextStatus !== null) setStatus(nextStatus)
-      setState({ loading: false, items: usage.data, cachedAt: usage.cachedAt, error: null, errorKind: null })
+      setStatus(await api.status())
+      setStatusError(null)
     } catch (error) {
-      if (seq !== loadSeq.current) return
-      const message = errorMessage(error)
-      const kind = error instanceof NyroPanelApiError ? (error.kind ?? null) : null
-      setState(previous => ({ ...previous, loading: false, error: message, errorKind: kind }))
-    } finally {
-      inFlight.current = false
+      setStatusError(errorMessage(error))
     }
   }, [api])
 
-  // Panel becomes visible (or mounts): refresh the status immediately, and
-  // load usage when configured. Re-checks whenever the panel reopens so a
-  // settings change made in between is picked up.
-  useEffect(() => {
-    if (!snapshot.panelOpen) return
-    void api.status().then(next => { setStatus(next) }).catch(() => {})
-  }, [api, snapshot.panelOpen])
+  /** Load one gateway; a request already in flight for it is not repeated. */
+  const loadOne = useCallback(async (instance: NyroInstanceStatus, refresh: boolean): Promise<void> => {
+    const key = sectionKey(instance)
+    if (inFlight.current.has(key)) return
+    inFlight.current.add(key)
+    const seq = (loadSeq.current.get(key) ?? 0) + 1
+    loadSeq.current.set(key, seq)
+    setSections(previous => ({ ...previous, [key]: { ...(previous[key] ?? INITIAL_SECTION), loading: true } }))
+    try {
+      const usage = await api.usage(instance.id, refresh)
+      if (loadSeq.current.get(key) !== seq) return
+      setSections(previous => ({ ...previous, [key]: { loading: false, usage, error: null } }))
+    } catch (error) {
+      if (loadSeq.current.get(key) !== seq) return
+      const message = errorMessage(error)
+      setSections(previous => ({ ...previous, [key]: { ...(previous[key] ?? INITIAL_SECTION), loading: false, error: message } }))
+    } finally {
+      inFlight.current.delete(key)
+    }
+  }, [api])
 
   const configured = status?.configured ?? false
+  // Keyed on the gateway list's identity rather than the status object (a
+  // fresh one arrives on every panel open), so the effects and the
+  // auto-refresh timer below only restart when the list actually changes.
+  const listKey = configured ? (status?.instances ?? []).map(instance => `${sectionKey(instance)}\u0000${instance.name}`).join('\u0001') : ''
+  const statusRef = useRef(status)
+  statusRef.current = status
+  const instances = useMemo(
+    () => (statusRef.current?.configured === true ? statusRef.current.instances : []),
+    [listKey],
+  )
+
+  const loadAll = useCallback((refresh: boolean): void => {
+    for (const instance of instances) void loadOne(instance, refresh)
+  }, [instances, loadOne])
+
+  // Panel becomes visible (or mounts): refresh the status immediately.
+  // Re-checks whenever the panel reopens so a settings change made in
+  // between (gateways added/removed) is picked up.
   useEffect(() => {
-    if (!snapshot.panelOpen || !configured) return
-    void load(false)
-  }, [snapshot.panelOpen, configured, load])
+    if (!snapshot.panelOpen) return
+    void refreshStatus()
+  }, [snapshot.panelOpen, refreshStatus])
+
+  // A new gateway list loads every section (the host cache keeps repeats
+  // cheap) and drops the state of gateways that are gone.
+  useEffect(() => {
+    const live = new Set(instances.map(sectionKey))
+    setSections((previous) => {
+      const stale = Object.keys(previous).filter(key => !live.has(key))
+      if (stale.length === 0) return previous
+      const next = { ...previous }
+      for (const key of stale) delete next[key]
+      return next
+    })
+    if (snapshot.panelOpen) loadAll(false)
+  }, [instances, snapshot.panelOpen, loadAll])
 
   // Auto-refresh while the panel is open and configured.
   const interval = autoSeconds ?? status?.refreshSeconds ?? 300
   useEffect(() => {
     if (!snapshot.panelOpen || !configured || interval <= 0) return
-    const timer = window.setInterval(() => { void load(false) }, interval * 1000)
+    const timer = window.setInterval(() => { loadAll(false) }, interval * 1000)
     return () => { window.clearInterval(timer) }
-  }, [snapshot.panelOpen, configured, interval, load])
+  }, [snapshot.panelOpen, configured, interval, loadAll])
 
-  const exhausted = state.items.filter(item => item.usage?.scheduling?.status === 'quota_exhausted').length
-  const ok = state.items.filter(item => item.status === 'ok').length
-  // Unsupported providers (no upstream usage API) are hidden from the grid.
-  const items = state.items.filter(item => item.status !== 'unsupported')
-  const visible = bySavedOrder(items, order, item => item.provider_id)
-  const visibleIds = visible.map(item => item.provider_id)
-  const updated = agoLabel(state.cachedAt)
+  const states = instances.map(instance => sections[sectionKey(instance)] ?? INITIAL_SECTION)
+  const anyLoading = states.some(state => state.loading)
+  const total = states.reduce((sum, state) => {
+    const counts = countUsage(state.usage?.items ?? [])
+    return { ok: sum.ok + counts.ok, exhausted: sum.exhausted + counts.exhausted }
+  }, { ok: 0, exhausted: 0 })
+  const anyItems = states.some(state => (state.usage?.items.length ?? 0) > 0)
 
-  // --- drag-to-reorder (HTML5 DnD) ------------------------------------------
-  // Row-major grid: the pointer's horizontal half of the hovered card
-  // decides before/after; a drop on the grid's empty area appends to the end.
-  const clearDrag = useCallback((): void => {
-    setDragId(null)
-    setDropSide(null)
-  }, [])
-
-  const sideOf = (event: DragEvent<HTMLDivElement>): boolean => {
-    const rect = event.currentTarget.getBoundingClientRect()
-    return event.clientX < rect.left + rect.width / 2
+  const refreshAll = (): void => {
+    void refreshStatus()
+    loadAll(true)
   }
-
-  const cardDragHandlers = (item: NyroUsageItem) => ({
-    onCardDragStart: (event: DragEvent<HTMLDivElement>): void => {
-      setDragId(item.provider_id)
-      event.dataTransfer.effectAllowed = 'move'
-      // Firefox only starts a drag once data is set.
-      event.dataTransfer.setData('text/plain', item.provider_id)
-    },
-    onCardDragEnd: clearDrag,
-    onCardDragOver: (event: DragEvent<HTMLDivElement>): void => {
-      if (dragId === null) return
-      event.preventDefault()
-      event.dataTransfer.dropEffect = 'move'
-      if (dragId === item.provider_id) return
-      const before = sideOf(event)
-      setDropSide(previous =>
-        previous !== null && previous.id === item.provider_id && previous.before === before
-          ? previous
-          : { id: item.provider_id, before })
-    },
-    onCardDrop: (event: DragEvent<HTMLDivElement>): void => {
-      if (dragId === null) return
-      event.preventDefault()
-      event.stopPropagation()
-      if (dragId !== item.provider_id) move(visibleIds, dragId, item.provider_id, sideOf(event))
-      clearDrag()
-    },
-  })
 
   return (
     <div className={css.panel}>
       <div className={css.panelHeader}>
         <h1 className={css.panelTitle}>{tt('panel.title')}</h1>
-        {status !== null && status.baseUrl !== ''
-          ? <span className={css.baseUrlChip} title={status.baseUrl}>{status.baseUrl}</span>
+        {instances.length > 1
+          ? <span className={css.instanceCount}>{tt('panel.instances', { count: instances.length })}</span>
           : null}
-        {state.items.length > 0
-          ? <span className={css.summary}>{tt('panel.summary', { ok, exhausted })}</span>
+        {anyItems
+          ? <span className={css.summary}>{tt('panel.summary', total)}</span>
           : null}
         <span className={css.toolbarSpacer} />
-        {order.length > 0
-          ? (
-            <button type="button" className={css.resetOrderButton} onClick={reset}>
-              {tt('panel.resetOrder')}
-            </button>
-          )
-          : null}
         <label className={css.autoRefreshLabel}>
           {tt('panel.autoRefresh')}
           <select
@@ -178,22 +165,39 @@ export function NyroUsagePanel(props: NyroUsagePanelProps) {
             ))}
           </select>
         </label>
-        <span className={css.updated} title={state.cachedAt ?? undefined}>
-          {updated === '' ? '' : tt('panel.updated', { ago: updated })}
-        </span>
         <button
           type="button"
           className={css.refreshButton}
-          disabled={state.loading || !configured}
-          onClick={() => { void load(true) }}
+          disabled={anyLoading || !configured}
+          onClick={refreshAll}
         >
-          {state.loading ? <span className={css.spinner} aria-hidden="true" /> : null}
-          {state.loading ? tt('panel.refreshing') : tt('panel.refresh')}
+          {anyLoading ? <span className={css.spinner} aria-hidden="true" /> : null}
+          {anyLoading ? tt('panel.refreshing') : instances.length > 1 ? tt('panel.refreshAll') : tt('panel.refresh')}
         </button>
       </div>
 
       <div className={css.panelContent}>
-        {status !== null && !configured
+        {statusError !== null && status === null
+          ? (
+            <div className={css.loadError} role="alert">
+              <span>{tt('panel.loadError')}：{statusError}</span>
+              <button type="button" className={css.retryButton} onClick={() => { void refreshStatus() }}>
+                {tt('panel.retry')}
+              </button>
+            </div>
+          )
+          : null}
+
+        {status !== null && status.disabled
+          ? (
+            <div className={css.placeholder}>
+              <p className={css.placeholderTitle}>{tt('panel.disabled')}</p>
+              <p className={css.placeholderHint}>{tt('panel.disabledHint')}</p>
+            </div>
+          )
+          : null}
+
+        {status !== null && !status.disabled && !configured
           ? (
             <div className={css.placeholder}>
               <p className={css.placeholderTitle}>{tt('panel.notConfigured')}</p>
@@ -202,57 +206,15 @@ export function NyroUsagePanel(props: NyroUsagePanelProps) {
           )
           : null}
 
-        {configured && state.error !== null
-          ? (
-            <div className={css.loadError} role="alert">
-              <span>{tt('panel.loadError')}：{state.error}</span>
-              <button type="button" className={css.retryButton} onClick={() => { void load(true) }}>
-                {tt('panel.retry')}
-              </button>
-            </div>
-          )
-          : null}
-
-        {configured && state.error === null && !state.loading && visible.length === 0
-          ? <div className={css.placeholder}><p className={css.placeholderHint}>{tt('panel.empty')}</p></div>
-          : null}
-
-        {visible.length > 0
-          ? (
-            <div
-              className={css.grid}
-              // The grid's empty area is a drop target too: dropping there
-              // sends the dragged card to the end of the custom order.
-              onDragOver={(event) => {
-                if (dragId === null) return
-                event.preventDefault()
-                event.dataTransfer.dropEffect = 'move'
-              }}
-              onDrop={(event) => {
-                if (dragId === null) return
-                event.preventDefault()
-                append(visibleIds, dragId)
-                clearDrag()
-              }}
-            >
-              {visible.map(item => (
-                <ProviderCard
-                  key={item.provider_id}
-                  item={item}
-                  now={now}
-                  dragging={dragId === item.provider_id}
-                  dropBefore={dropSide !== null && dropSide.id === item.provider_id && dropSide.before && dragId !== item.provider_id}
-                  dropAfter={dropSide !== null && dropSide.id === item.provider_id && !dropSide.before && dragId !== item.provider_id}
-                  {...cardDragHandlers(item)}
-                />
-              ))}
-            </div>
-          )
-          : null}
-
-        {configured && state.loading && state.items.length === 0 && state.error === null
-          ? <div className={css.placeholder}><p className={css.placeholderHint}>{tt('panel.refreshing')}</p></div>
-          : null}
+        {instances.map((instance, index) => (
+          <InstanceSection
+            key={sectionKey(instance)}
+            instance={instance}
+            state={states[index]}
+            now={now}
+            onRefresh={() => { void loadOne(instance, true) }}
+          />
+        ))}
       </div>
     </div>
   )

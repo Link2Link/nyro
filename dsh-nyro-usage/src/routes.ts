@@ -1,22 +1,34 @@
 /**
  * The /api/nyro-usage route family: a loopback-fenced proxy in front of the
- * configured nyro gateway's admin plane. The browser half fetches these
- * same-origin routes — the nyro base URL never needs CORS openings and the
- * admin token never leaves the host process.
+ * configured nyro gateways' admin planes. The browser half fetches these
+ * same-origin routes — no nyro base URL needs CORS openings and no admin
+ * token ever leaves the host process.
  *
  * Routes (all loopback-only, mirroring the dsh-ssh trust fence):
- * - GET  /api/nyro-usage/usage?refresh=1 — bulk provider usage (TTL-cached;
- *   `refresh=1` bypasses the cache). nyro queries its upstreams live, so the
- *   cache keeps sidebar badges / auto-refresh / multiple tabs polite.
- * - GET  /api/nyro-usage/status — sanitized config + cache age (no token).
- * - POST /api/nyro-usage/test — connectivity + auth test against the saved
- *   configuration.
+ * - GET  /api/nyro-usage/usage?instance=<id>&refresh=1 — bulk provider usage
+ *   per gateway (TTL-cached per gateway; `refresh=1` bypasses the cache;
+ *   without `instance` every gateway is queried concurrently). One gateway's
+ *   failure is reported in its own slice and never fails the others.
+ * - GET  /api/nyro-usage/status — sanitized config + per-gateway cache age
+ *   (token presence only, never a token).
+ * - POST /api/nyro-usage/test?instance=<id> — connectivity + auth test
+ *   against the saved configuration (every gateway without `instance`).
  */
 
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import type { WebRoute } from '@deepseek-ai/dsh-host-webserver'
-import { NyroApiError, NyroClient, normalizeBaseUrl, type NyroStatusResponse, type NyroTestResult, type NyroUsageResponse } from './nyro.ts'
-export type { NyroStatusResponse }
+import type { ResolvedInstance, TokenFlags } from './instances.ts'
+import {
+  NyroApiError,
+  NyroClient,
+  type NyroInstanceStatus,
+  type NyroInstanceTestResult,
+  type NyroInstanceUsage,
+  type NyroStatusResponse,
+  type NyroTestRouteResponse,
+  type NyroUsageResponse,
+  type NyroUsageRouteResponse,
+} from './nyro.ts'
 
 /** Route paths this family owns. */
 export const NYRO_API = {
@@ -57,46 +69,49 @@ function writeJson(res: ServerResponse, status: number, body: unknown): void {
   res.end(payload)
 }
 
-/** Map a NyroApiError to an HTTP status the panel can branch on. */
-function errorStatus(kind: string): number {
-  switch (kind) {
-    case 'unconfigured': return 400
-    case 'bad-url': return 400
-    case 'unauthorized': return 401
-    case 'not-found': return 501
-    case 'network': return 502
-    default: return 502
-  }
-}
-
 /** What the plugin currently resolves from its settings. */
 export interface NyroUsageRouteConfig {
-  baseUrl: string
-  adminToken: string
+  /** Plugin master switch. */
+  enabled: boolean
+  /** Gateways to query, primary first. */
+  instances: ResolvedInstance[]
+  /** Token presence by config position (settings card read-back). */
+  tokens: TokenFlags
   refreshSeconds: number
   cacheSeconds: number
 }
 
-/** Cached bulk-usage snapshot with in-flight dedupe. */
+/** A cached bulk-usage snapshot. */
+interface Snapshot {
+  at: number
+  data: NyroUsageResponse
+}
+
+/** Cached bulk-usage snapshot of ONE gateway with in-flight dedupe. */
 class UsageCache {
-  private entry: { at: number; data: NyroUsageResponse } | undefined
-  private inflight: Promise<{ at: number; data: NyroUsageResponse }> | undefined
+  private readonly instance: ResolvedInstance
+  private entry: Snapshot | undefined
+  private inflight: Promise<Snapshot> | undefined
+
+  constructor(instance: ResolvedInstance) {
+    this.instance = instance
+  }
 
   /**
    * Read the bulk usage, serving the cached copy while it is fresh enough.
    * Concurrent readers share one upstream call.
-   * @param config - resolved plugin config (client + TTL).
+   * @param ttlSeconds - cache TTL (0 disables caching).
    * @param force - bypass the cache (manual refresh).
    * @returns the snapshot plus its fetch time.
    */
-  read(config: NyroUsageRouteConfig, force: boolean): Promise<{ at: number; data: NyroUsageResponse }> {
-    const ttl = Math.max(0, config.cacheSeconds) * 1000
+  read(ttlSeconds: number, force: boolean): Promise<Snapshot> {
+    const ttl = Math.max(0, ttlSeconds) * 1000
     if (!force && this.entry !== undefined && Date.now() - this.entry.at < ttl) {
       return Promise.resolve(this.entry)
     }
-    this.inflight ??= new NyroClient(config.baseUrl, config.adminToken)
+    this.inflight ??= new NyroClient(this.instance.baseUrl, this.instance.adminToken)
       .usage()
-      .then(data => {
+      .then((data) => {
         const snapshot = { at: Date.now(), data }
         this.entry = snapshot
         return snapshot
@@ -109,11 +124,18 @@ class UsageCache {
   cachedAt(): number | undefined {
     return this.entry?.at
   }
+}
 
-  /** Drop the cache (config change: the token/baseUrl may have changed). */
-  invalidate(): void {
-    this.entry = undefined
-  }
+/** Cache identity: a gateway whose URL or token changed must not serve the
+ * previous gateway's data. */
+function signatureOf(instance: ResolvedInstance): string {
+  return `${instance.id}\u0000${instance.baseUrl}\u0000${instance.adminToken}`
+}
+
+/** Error text + kind of anything a gateway call threw. */
+function describeError(error: unknown): { message: string; kind: string } {
+  if (error instanceof NyroApiError) return { message: error.message, kind: error.kind }
+  return { message: error instanceof Error ? error.message : String(error), kind: 'network' }
 }
 
 /** Route family dependencies. */
@@ -128,61 +150,97 @@ export interface NyroUsageRoutesDeps {
  * @returns the routes to register on the webserver.
  */
 export function makeRoutes(deps: NyroUsageRoutesDeps): WebRoute[] {
-  const cache = new UsageCache()
-  // A config change must not serve another gateway's cached data.
-  let lastSignature = ''
-  const signature = (): string => {
-    const value = deps.config()
-    return `${value.baseUrl}\u0000${value.adminToken}`
-  }
+  /** One cache per gateway signature; stale signatures are pruned per request. */
+  const caches = new Map<string, UsageCache>()
 
-  const clientOf = (): NyroClient => {
+  const current = (): NyroUsageRouteConfig => {
     const value = deps.config()
-    const next = signature()
-    if (next !== lastSignature) {
-      cache.invalidate()
-      lastSignature = next
+    const live = new Set(value.instances.map(signatureOf))
+    for (const key of caches.keys()) {
+      if (!live.has(key)) caches.delete(key)
     }
-    return new NyroClient(value.baseUrl, value.adminToken)
+    return value
   }
 
-  const guard = (req: IncomingMessage, res: ServerResponse): boolean => {
+  const cacheOf = (instance: ResolvedInstance): UsageCache => {
+    const key = signatureOf(instance)
+    let cache = caches.get(key)
+    if (cache === undefined) {
+      cache = new UsageCache(instance)
+      caches.set(key, cache)
+    }
+    return cache
+  }
+
+  /** Narrow to `?instance=<id>` when given; undefined = unknown id. */
+  const targetsOf = (url: URL, value: NyroUsageRouteConfig): ResolvedInstance[] | undefined => {
+    const wanted = url.searchParams.get('instance')
+    if (wanted === null || wanted === '') return value.instances
+    const match = value.instances.find(instance => instance.id === wanted)
+    return match === undefined ? undefined : [match]
+  }
+
+  const guard = (req: IncomingMessage, res: ServerResponse, method: string): URL | undefined => {
     if (!isLoopbackRequest(req)) {
       writeJson(res, 403, { error: 'forbidden: loopback-only' })
-      return false
+      return undefined
     }
-    return true
+    if (req.method !== method) {
+      writeJson(res, 405, { error: `method not allowed: ${req.method}` })
+      return undefined
+    }
+    return new URL(req.url ?? '/', 'http://localhost')
+  }
+
+  const readInstance = async (instance: ResolvedInstance, ttl: number, force: boolean): Promise<NyroInstanceUsage> => {
+    const head = { id: instance.id, name: instance.name, baseUrl: instance.baseUrl }
+    if (instance.adminToken === '') {
+      return { ...head, items: [], cachedAt: null, error: 'adminToken is not configured', errorKind: 'unconfigured' }
+    }
+    try {
+      const snapshot = await cacheOf(instance).read(ttl, force)
+      return { ...head, items: snapshot.data.data ?? [], cachedAt: new Date(snapshot.at).toISOString(), error: null, errorKind: null }
+    } catch (error) {
+      const { message, kind } = describeError(error)
+      return { ...head, items: [], cachedAt: null, error: message, errorKind: kind }
+    }
+  }
+
+  const testInstance = async (instance: ResolvedInstance): Promise<NyroInstanceTestResult> => {
+    const head = { id: instance.id, name: instance.name, baseUrl: instance.baseUrl }
+    try {
+      return { ...head, ...await new NyroClient(instance.baseUrl, instance.adminToken).test() }
+    } catch (error) {
+      const { message, kind } = describeError(error)
+      return { ...head, ok: false, kind, message }
+    }
   }
 
   const usageRoute: WebRoute = {
     kind: 'exact',
     path: NYRO_API.usage,
     handler: async (req, res) => {
-      if (!guard(req, res)) return
-      if (req.method !== 'GET') {
-        writeJson(res, 405, { error: `method not allowed: ${req.method}` })
+      const url = guard(req, res, 'GET')
+      if (url === undefined) return
+      const value = current()
+      if (!value.enabled) {
+        writeJson(res, 503, { error: 'nyro-usage plugin is disabled', kind: 'disabled' })
         return
       }
-      const value = deps.config()
-      if (value.baseUrl === '' || value.adminToken.trim() === '') {
-        writeJson(res, 400, { error: 'nyro baseUrl / adminToken not configured' })
+      if (value.instances.length === 0) {
+        writeJson(res, 400, { error: 'no nyro gateway configured (baseUrl / instances)', kind: 'unconfigured' })
         return
       }
-      const url = new URL(req.url ?? '/', 'http://localhost')
+      const targets = targetsOf(url, value)
+      if (targets === undefined) {
+        writeJson(res, 404, { error: 'unknown nyro instance', kind: 'not-found' })
+        return
+      }
       const force = url.searchParams.get('refresh') === '1'
-      try {
-        clientOf() // signature check + cache invalidate on config change
-        const snapshot = await cache.read(value, force)
-        // Flatten nyro's own `{data: [...]}` envelope: the panel contract is
-        // `{data: items, cachedAt}`.
-        writeJson(res, 200, { data: snapshot.data.data ?? [], cachedAt: new Date(snapshot.at).toISOString() })
-      } catch (error) {
-        if (error instanceof NyroApiError) {
-          writeJson(res, errorStatus(error.kind), { error: error.message, kind: error.kind })
-          return
-        }
-        writeJson(res, 502, { error: error instanceof Error ? error.message : String(error) })
+      const body: NyroUsageRouteResponse = {
+        instances: await Promise.all(targets.map(instance => readInstance(instance, value.cacheSeconds, force))),
       }
+      writeJson(res, 200, body)
     },
   }
 
@@ -190,20 +248,25 @@ export function makeRoutes(deps: NyroUsageRoutesDeps): WebRoute[] {
     kind: 'exact',
     path: NYRO_API.status,
     handler: (req, res) => {
-      if (!guard(req, res)) return
-      if (req.method !== 'GET') {
-        writeJson(res, 405, { error: `method not allowed: ${req.method}` })
-        return
-      }
-      const value = deps.config()
-      const cachedAt = cache.cachedAt()
+      if (guard(req, res, 'GET') === undefined) return
+      const value = current()
+      const instances: NyroInstanceStatus[] = value.instances.map((instance) => {
+        const at = caches.get(signatureOf(instance))?.cachedAt()
+        return {
+          id: instance.id,
+          name: instance.name,
+          baseUrl: instance.baseUrl,
+          hasToken: instance.adminToken !== '',
+          cachedAt: at === undefined ? null : new Date(at).toISOString(),
+        }
+      })
       const body: NyroStatusResponse = {
-        configured: value.baseUrl !== '' && value.adminToken.trim() !== '',
-        baseUrl: value.baseUrl,
-        hasToken: value.adminToken.trim() !== '',
+        configured: value.enabled && instances.length > 0,
+        disabled: !value.enabled,
         refreshSeconds: value.refreshSeconds,
         cacheSeconds: value.cacheSeconds,
-        cachedAt: cachedAt === undefined ? null : new Date(cachedAt).toISOString(),
+        instances,
+        tokens: { primary: value.tokens.primary, rows: [...value.tokens.rows] },
       }
       writeJson(res, 200, body)
     },
@@ -213,21 +276,35 @@ export function makeRoutes(deps: NyroUsageRoutesDeps): WebRoute[] {
     kind: 'exact',
     path: NYRO_API.test,
     handler: async (req, res) => {
-      if (!guard(req, res)) return
-      if (req.method !== 'POST') {
-        writeJson(res, 405, { error: `method not allowed: ${req.method}` })
+      const url = guard(req, res, 'POST')
+      if (url === undefined) return
+      const value = current()
+      if (!value.enabled) {
+        writeJson(res, 200, { ok: false, kind: 'disabled', message: 'nyro-usage plugin is disabled', instances: [] } satisfies NyroTestRouteResponse)
         return
       }
-      try {
-        const result: NyroTestResult = await clientOf().test()
-        writeJson(res, 200, result)
-      } catch (error) {
-        if (error instanceof NyroApiError) {
-          writeJson(res, 200, { ok: false, kind: error.kind, message: error.message } satisfies NyroTestResult)
-          return
-        }
-        writeJson(res, 200, { ok: false, kind: 'network', message: error instanceof Error ? error.message : String(error) } satisfies NyroTestResult)
+      const targets = targetsOf(url, value)
+      if (targets === undefined || targets.length === 0) {
+        writeJson(res, 200, {
+          ok: false,
+          kind: targets === undefined ? 'not-found' : 'unconfigured',
+          message: targets === undefined ? 'unknown nyro instance' : 'no nyro gateway configured (baseUrl / instances)',
+          instances: [],
+        } satisfies NyroTestRouteResponse)
+        return
       }
+      const instances = await Promise.all(targets.map(testInstance))
+      const failed = instances.find(result => !result.ok)
+      const body: NyroTestRouteResponse = failed === undefined
+        ? {
+            ok: true,
+            kind: 'reachable',
+            message: 'connected',
+            providerCount: instances.reduce((sum, result) => sum + (result.providerCount ?? 0), 0),
+            instances,
+          }
+        : { ok: false, kind: failed.kind, message: `${failed.name}: ${failed.message}`, instances }
+      writeJson(res, 200, body)
     },
   }
 

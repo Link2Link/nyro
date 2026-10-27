@@ -93,26 +93,76 @@ export function normalizeBaseUrl(raw: string | undefined): string {
   return url
 }
 
-/** What the plugin currently resolves from its settings (sanitized form the
- * browser may see — never the token itself). */
-export interface NyroStatusResponse {
-  configured: boolean
+/** One configured gateway as the browser may see it (never the token itself). */
+export interface NyroInstanceStatus {
+  /** Stable id (`default` for the primary gateway). */
+  id: string
+  name: string
   baseUrl: string
   hasToken: boolean
+  /** Fetch time of this gateway's cached usage, if any. */
+  cachedAt: string | null
+}
+
+/** What the plugin currently resolves from its settings (sanitized form the
+ * browser may see — never a token). */
+export interface NyroStatusResponse {
+  /** Plugin enabled and at least one gateway configured. */
+  configured: boolean
+  /** The plugin master switch is off. */
+  disabled: boolean
   refreshSeconds: number
   cacheSeconds: number
+  /** The gateways the panel renders, primary first. */
+  instances: NyroInstanceStatus[]
+  /** Token presence by config position, for the settings card. */
+  tokens: {
+    /** Whether the primary gateway has a token. */
+    primary: boolean
+    /** Per `instances[]` index, including disabled and URL-less rows. */
+    rows: boolean[]
+  }
+}
+
+/** One gateway's slice of the bulk usage response. */
+export interface NyroInstanceUsage {
+  id: string
+  name: string
+  baseUrl: string
+  items: NyroUsageItem[]
+  /** Fetch time of `items`; null when this gateway failed. */
   cachedAt: string | null
+  /** This gateway's failure; the other gateways are unaffected. */
+  error: string | null
+  errorKind: string | null
+}
+
+/** Bulk usage route body: one entry per requested gateway. */
+export interface NyroUsageRouteResponse {
+  instances: NyroInstanceUsage[]
+}
+
+/** One gateway's connection test outcome. */
+export interface NyroInstanceTestResult extends NyroTestResult {
+  id: string
+  name: string
+  baseUrl: string
+}
+
+/** Test route body: an overall verdict plus one result per tested gateway. */
+export interface NyroTestRouteResponse extends NyroTestResult {
+  instances: NyroInstanceTestResult[]
 }
 
 /** Errors carrying a machine-readable classification for route mapping. */
 export class NyroApiError extends Error {
-  constructor(
-    message: string,
-    /** `unauthorized` | `not-found` | `network` | `bad-url` | `unconfigured` | `server`. */
-    readonly kind: string,
-  ) {
+  /** `unauthorized` | `not-found` | `network` | `bad-url` | `unconfigured` | `server`. */
+  readonly kind: string
+
+  constructor(message: string, kind: string) {
     super(message)
     this.name = 'NyroApiError'
+    this.kind = kind
   }
 }
 
@@ -186,10 +236,13 @@ async function nyroFetch(base: string, token: string, path: string, timeoutMs: n
 
 /** Client for one configured nyro gateway. Cheap to construct per request. */
 export class NyroClient {
-  constructor(
-    private readonly baseUrl: string,
-    private readonly adminToken: string,
-  ) {}
+  private readonly baseUrl: string
+  private readonly adminToken: string
+
+  constructor(baseUrl: string, adminToken: string) {
+    this.baseUrl = baseUrl
+    this.adminToken = adminToken
+  }
 
   /** Fetch every provider's usage (the bulk endpoint). */
   async usage(): Promise<NyroUsageResponse> {
