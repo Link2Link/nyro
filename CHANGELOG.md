@@ -4,6 +4,37 @@ All notable changes to Nyro will be documented in this file.
 
 ---
 
+## v2.1.2
+
+> Released on 2026-10-27
+
+#### Features
+
+- **Kiro multi-account pool**: manage multiple OAuth accounts per provider with round-robin or fill-first scheduling, resource-usage and cost-tier awareness, isolated refresh leases and compare-and-swap credential updates; paid overage requires both local policy and upstream allowance
+- **Kiro pool usage summary**: aggregate actual resource quotas across accounts while preserving per-account scheduling and details; validate observation completeness and reset alignment, with weighted steady-pace markers
+- **Account usage across two periods**: aggregate retained request logs by stable account identity, showing all retained records and current-week/month token usage with equivalent API-price estimates in server and desktop interfaces; clearing logs reduces these account totals
+- **Persistent token usage statistics**: fold request usage into daily rollups transactionally before retention cleanup or manual log deletion; usage and value panels combine rollups with retained logs, and equivalent costs are recalculated using current prices
+- **Model and API-key equivalent API prices**: model and API-key statistics include multi-currency price estimates and unpriced-request counts, backed by API-key/provider/model usage grouping across all four storage backends
+- **Custom model-test messages**: model probes accept a custom message across supported protocols, including Devin and Kiro; blank input keeps the defaults, messages are trimmed and limited to 4,000 characters, and logs show the actual message sent
+- **CentOS 7.6 containerized build**: add a pinned multi-stage glibc 2.17 build, offline/registry-preseed support, target-host smoke and binary-verification scripts, a `make server-centos7` target, and bilingual build guides
+
+#### Improvements
+
+- **Kiro usage accounting and display**: assume 90% input cache hits for estimates and idempotently backfill historical Kiro logs; simplify provider cards to monthly/pool summaries, retain account details, and reject credential-like account aliases
+- **Kiro client compatibility**: align upstream client versions and host identity, remove gateway branding from registration names, improve account configuration and endpoint selection, and preserve single-account credential import/export compatibility
+- **Architecture documentation**: align deployment modes, workspace structure, core interfaces, protocol compatibility boundaries, storage responsibilities and test coverage with the implementation
+
+#### Fixes
+
+- **Proxy authentication**: accept `x-api-key` and `x-goog-api-key` as well as Bearer credentials in global authentication, fixing false 401 responses in chained Nyro gateways
+- **SSE passthrough errors**: forward data at event boundaries and discard incomplete events before emitting an upstream error, preventing timeout errors from being appended to half-written SSE events
+- **Devin compatibility and retry**: filter unsupported built-in tools and retry an initial connection failure once for inference, status polling and model probes
+- **Native request and error diagnostics**: record Devin native payloads and resolved upstream model IDs; preserve redacted upstream error details, correctly recognize summary-only payloads, and improve error rendering
+- **Kiro and request-intake diagnostics**: persist redacted errors with correct model labels, distinguish credential rejection and quota-pause reasons, correct countdowns, and preserve intake timing, capture metadata and compressed-body errors
+- **MySQL usage queries**: fix ordering that violated grouped-query requirements; extend storage health checks to cover the daily usage-rollup schema
+
+---
+
 ## v2.1.1
 
 > Released on 2026-10-18

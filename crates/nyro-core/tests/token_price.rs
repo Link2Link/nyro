@@ -1000,7 +1000,11 @@ async fn model_and_api_key_stats_carry_equivalent_api_price() -> anyhow::Result<
     let admin = gw.admin();
     // The same upstream model on two providers: native CNY vs a manual USD rule.
     admin
-        .set_token_price(input(&reseller, "glm-5.3", Some(rates(2.0, 8.0, Some(1.0)))))
+        .set_token_price(input(
+            &reseller,
+            "glm-5.3",
+            Some(rates(2.0, 8.0, Some(1.0))),
+        ))
         .await?;
     key_log(&storage, "key-a", &bigmodel, "glm-5.3", 1).await?;
     key_log(&storage, "key-a", &bigmodel, "glm-5.3", 2).await?;
