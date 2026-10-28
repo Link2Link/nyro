@@ -132,25 +132,60 @@ impl AdminService {
         &self,
         access: &RouteAccess,
     ) -> anyhow::Result<ForwardedUsageReport> {
-        let mut routes_by_provider: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-        {
+        // Snapshot the visible routes first so the cache lock is not held
+        // across backend-store queries.
+        let visible_routes = {
             let cache = self.gw.model_cache.read().await;
-            for model in cache.models.iter().filter(|model| access.can_route(model)) {
-                let route = model.name.trim();
-                if route.is_empty() {
+            cache
+                .models
+                .iter()
+                .filter(|model| access.can_route(model) && !model.name.trim().is_empty())
+                .map(|model| {
+                    (
+                        model.id.clone(),
+                        model.name.trim().to_string(),
+                        model.target_provider.clone(),
+                        model
+                            .targets
+                            .iter()
+                            .map(|target| target.provider_id.clone())
+                            .collect::<Vec<_>>(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut routes_by_provider: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        for (model_id, route, primary, cached_targets) in visible_routes {
+            // The SQL route snapshot carries only the primary provider; every
+            // other target (weighted peers, fallbacks) lives in the backend
+            // store. Resolve them the way the dispatcher does, so a provider
+            // that only backs a route as fallback is still reported.
+            let stored_targets = match self.gw.storage.model_backends() {
+                Some(store) => match store.list_backends_by_model(&model_id).await {
+                    Ok(backends) => backends
+                        .into_iter()
+                        .map(|backend| backend.provider_id)
+                        .collect(),
+                    Err(error) => {
+                        tracing::warn!(%error, route, "usage forwarding could not load route backends");
+                        Vec::new()
+                    }
+                },
+                None => Vec::new(),
+            };
+            let provider_ids = stored_targets
+                .into_iter()
+                .chain(cached_targets)
+                .chain(std::iter::once(primary));
+            for provider_id in provider_ids {
+                let provider_id = provider_id.trim();
+                if provider_id.is_empty() {
                     continue;
                 }
-                let provider_ids = model
-                    .targets
-                    .iter()
-                    .map(|target| target.provider_id.as_str())
-                    .chain(std::iter::once(model.target_provider.as_str()));
-                for provider_id in provider_ids.map(str::trim).filter(|id| !id.is_empty()) {
-                    routes_by_provider
-                        .entry(provider_id.to_string())
-                        .or_default()
-                        .insert(route.to_string());
-                }
+                routes_by_provider
+                    .entry(provider_id.to_string())
+                    .or_default()
+                    .insert(route.clone());
             }
         }
 
@@ -497,6 +532,50 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(names(&report), ["Edge Nyro", "Relay"]);
+    }
+
+    #[tokio::test]
+    async fn fallback_and_secondary_targets_are_attributed_to_the_route() {
+        // Regression: the SQL route snapshot only carries the primary
+        // provider, so a provider that backs a route as a fallback (Devin
+        // behind Kiro on a remote) used to vanish from the report.
+        let dir = tempfile::tempdir().unwrap();
+        let gw = gateway(&dir).await;
+        let primary = provider(&gw, "Primary", None, "https://a.example/v1", true).await;
+        let fallback = provider(&gw, "Fallback", None, "https://b.example/v1", true).await;
+        let backend = |provider_id: &str, priority: i32, is_fallback: bool| CreateModelBackend {
+            provider_id: provider_id.into(),
+            model: "m".into(),
+            weight: Some(100),
+            priority: Some(priority),
+            is_fallback: Some(is_fallback),
+        };
+        let route_id = gw
+            .admin()
+            .create_model(CreateModel {
+                name: "opus".into(),
+                balance: Some("priority".into()),
+                target_provider: String::new(),
+                target_model: String::new(),
+                targets: vec![backend(&primary, 1, false), backend(&fallback, 2, true)],
+                enable_auth: Some(true),
+                enable_payload: Some(false),
+                force_max_reasoning: None,
+                vision_shim: None,
+            })
+            .await
+            .expect("create route")
+            .id;
+
+        let access = RouteAccess {
+            privileged: false,
+            bound_route_ids: HashSet::from([route_id]),
+        };
+        let report = gw.admin().forwarded_provider_usage(&access).await.unwrap();
+        assert_eq!(names(&report), ["Fallback", "Primary"]);
+        for entry in &report.providers {
+            assert_eq!(entry.routes, ["opus"], "{} serves the route", entry.name);
+        }
     }
 
     #[test]
