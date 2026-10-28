@@ -22,6 +22,8 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Switch } from "@/components/ui/switch";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
+import { UpdateCard } from "@/components/update-card";
+import { useVersionInfo } from "@/lib/use-update";
 import {
   Tooltip,
   TooltipContent,
@@ -61,7 +63,9 @@ function ToggleStatusLabel({ enabled, isZh }: { enabled: boolean; isZh: boolean 
 export default function SettingsPage() {
   const { locale } = useLocale();
   const isZh = locale === "zh-CN";
-  const appVersion = import.meta.env.VITE_APP_VERSION;
+  const { data: versionInfo } = useVersionInfo();
+  // The server reports the version actually running (it changes after an update).
+  const appVersion = versionInfo?.version ?? import.meta.env.VITE_APP_VERSION;
 
   const qc = useQueryClient();
   const fileRef = useRef<HTMLInputElement>(null);
@@ -275,6 +279,8 @@ export default function SettingsPage() {
           </div>
         </div>
       </div>
+
+      {!IS_TAURI && <UpdateCard isZh={isZh} />}
 
       <div className="grid grid-cols-1 gap-5 md:grid-cols-2">
         {/* Proxy Configuration */}

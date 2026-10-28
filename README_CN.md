@@ -268,6 +268,8 @@ chmod +x nyro-server-linux-x86_64
 
 打开 `http://localhost:19531` 进入管理界面。详细配置参见 [Server 文档](docs/server/README.md) 和 [Standalone 文档](docs/standalone/README.md)。
 
+已部署的实例可在管理界面 **设置 → 版本更新** 中检查并一键安装新版本：二进制经签名校验后原地替换并自动重启，只升不降。详见 [在线更新](<docs/server/upgrade_CN.md>)。
+
 如需面向 CentOS 7.6 / glibc 2.17 的 x86_64 原生二进制，请参阅容器化的 [CentOS 7.6 构建指南](<docs/server/centos7-build_CN.md>)（[English](<docs/server/centos7-build.md>)）。该方案从源码构建内嵌 WebUI 的服务端，不会安装或启动生产服务。
 
 ### 本地 Docker 镜像

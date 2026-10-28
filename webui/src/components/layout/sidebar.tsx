@@ -17,6 +17,7 @@ import {
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import { useLocale } from "@/lib/i18n";
+import { useUpdateCheck } from "@/lib/use-update";
 import NyroLogo from "@/assets/logos/NYRO-logo.png";
 
 const NAV_ITEMS = [
@@ -44,6 +45,9 @@ interface SidebarProps {
 export function Sidebar({ collapsed, onToggle }: SidebarProps) {
   const { locale } = useLocale();
   const isZh = locale === "zh-CN";
+  const { data: updateCheck } = useUpdateCheck();
+  const updateAvailable = updateCheck?.update_available === true;
+  const updateHint = isZh ? "有新版本可用" : "Update available";
 
   return (
     <aside
@@ -79,12 +83,14 @@ export function Sidebar({ collapsed, onToggle }: SidebarProps) {
             "Model Ratings": "模型评分", "Model Mapping": "模型映射", "API Keys": "密钥",
             Connect: "接入", Logs: "日志", Stats: "统计", Performance: "性能", Extensions: "扩展", Settings: "系统设置",
           } as Record<string, string>)[label] ?? label : label;
+          const showUpdateDot = path === "/settings" && updateAvailable;
+          const accessibleLabel = showUpdateDot ? `${displayLabel} (${updateHint})` : displayLabel;
           return (
             <NavLink
               key={path}
               to={path}
-              aria-label={displayLabel}
-              title={collapsed ? displayLabel : undefined}
+              aria-label={accessibleLabel}
+              title={collapsed ? accessibleLabel : showUpdateDot ? updateHint : undefined}
               end={path === "/"}
               className={({ isActive }) =>
                 cn(
@@ -98,7 +104,15 @@ export function Sidebar({ collapsed, onToggle }: SidebarProps) {
                 )
               }
             >
-              <Icon className="h-4 w-4 shrink-0" />
+              <span className="relative shrink-0">
+                <Icon className="h-4 w-4" />
+                {showUpdateDot && (
+                  <span
+                    aria-hidden="true"
+                    className="absolute -right-1 -top-1 h-2 w-2 rounded-full bg-amber-500 ring-2 ring-white"
+                  />
+                )}
+              </span>
               {!collapsed && <span>{displayLabel}</span>}
             </NavLink>
           );

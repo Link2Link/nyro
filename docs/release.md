@@ -103,8 +103,11 @@ git push origin vX.Y.Z
 The tag-push run:
 
 - validates that `Cargo.toml`, `src-tauri/tauri.conf.json`, and `webui/package.json` all match `X.Y.Z`
-- builds the WebUI and the Linux x86_64 server binary
+- builds the WebUI, the Linux x86_64 server binary, and static musl server binaries (`nyro-server-linux-x86_64-musl`, `nyro-server-linux-aarch64-musl`)
+- signs `nyro-server-update.json` with the `NYRO_UPDATE_SIGNING_KEY` secret so deployed instances can install the release from **Settings → Updates** (release notes come from the matching `CHANGELOG.md` entry; see [In-place updates](server/upgrade.md) for key setup)
 - creates the GitHub Release `vX.Y.Z` with those assets (`publish=true`, `build_desktop=false`)
+
+Once published, the release is offered to every running instance as soon as it becomes the GitHub "latest" release. Deployed instances only move forward, so double-check a release before tagging it.
 
 Manual `workflow_dispatch` remains available to republish from `master` or to set `build_desktop=true` for signed desktop installers. Do not dispatch `publish=true` for a tag that already has a GitHub Release.
 

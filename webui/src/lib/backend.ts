@@ -392,6 +392,15 @@ function resolveHTTP(cmd: string, args?: Record<string, unknown>): HTTPMapping {
     case "get_gateway_status":
       return { method: "GET", url: `${base}/status` };
 
+    case "get_system_version":
+      return { method: "GET", url: `${base}/system/version` };
+    case "check_system_update":
+      return { method: "GET", url: `${base}/system/update/check${args?.force ? "?force=true" : ""}` };
+    case "apply_system_update":
+      return { method: "POST", url: `${base}/system/update/apply`, body: { version: args?.version } };
+    case "get_system_update_status":
+      return { method: "GET", url: `${base}/system/update/status` };
+
     case "export_config":
       return { method: "GET", url: `${base}/config/export` };
     case "import_config":

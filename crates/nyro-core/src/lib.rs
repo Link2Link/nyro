@@ -13,6 +13,7 @@ pub mod provider;
 pub mod proxy;
 pub mod router;
 pub mod storage;
+pub mod update;
 pub mod vision_shim;
 
 use std::collections::HashMap;
@@ -340,6 +341,20 @@ impl Gateway {
 
     pub fn admin(&self) -> admin::AdminService {
         admin::AdminService::new(self.clone())
+    }
+
+    /// Close database pools so pending writes are flushed before the host
+    /// replaces the process (self-update restart).
+    pub async fn close_storage(&self) {
+        if let Some(pool) = &self.sqlite_pool {
+            pool.close().await;
+        }
+        if let Some(pool) = &self.postgres_pool {
+            pool.close().await;
+        }
+        if let Some(pool) = &self.mysql_pool {
+            pool.close().await;
+        }
     }
 
     pub async fn http_client_for_provider(

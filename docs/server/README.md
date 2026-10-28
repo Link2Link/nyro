@@ -116,6 +116,16 @@ NYRO_UPSTREAM_FIRST_BYTE_TIMEOUT_SECS=900 \
 | `--admin-cors-origin` | Admin API 允许的 CORS 源（可重复，`*` 表示任意） |
 | `--proxy-cors-origin` | 代理 API 允许的 CORS 源（可重复，`*` 表示任意） |
 
+### Updates
+
+| 参数 | 环境变量 | 默认值 | 说明 |
+|------|----------|--------|------|
+| `--update-check` | `NYRO_UPDATE_CHECK` | `true` | 允许管理界面检查新版本；离线部署设为 `false` |
+| `--self-update` | `NYRO_SELF_UPDATE` | `true` | 允许在管理界面一键在线更新；由镜像或包管理升级时设为 `false` |
+| `--update-manifest-url` | `NYRO_UPDATE_MANIFEST_URL` | GitHub 最新 Release 的 `nyro-server-update.json` | 签名的版本清单地址 |
+
+在线更新的机制、Docker 部署注意事项与发布签名见 [在线更新](upgrade_CN.md)（[English](upgrade.md)）。
+
 ---
 
 ## 存储后端

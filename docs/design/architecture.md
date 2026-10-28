@@ -44,7 +44,7 @@ nyro/
 ├── crates/
 │   ├── nyro-core/               # 核心库
 │   │   ├── src/
-│   │   │   ├── lib.rs            # 16 个顶层 pub mod + Gateway 根类型
+│   │   │   ├── lib.rs            # 17 个顶层 pub mod + Gateway 根类型
 │   │   │   ├── config.rs         # GatewayConfig / GatewayStorageConfig / SqlStorageConfig / UpstreamTimeouts
 │   │   │   ├── error.rs          # GatewayError taxonomy（§7）
 │   │   │   ├── proxy/            # 代理面
@@ -176,6 +176,8 @@ nyro/
 │   │   │   ├── logging/          # LogEntry / enqueue_log / run_collector + diagnostics（结果判定）
 │   │   │   │                     # + payload（有界载荷采集、header 脱敏）
 │   │   │   ├── performance/      # 与载荷无关的严格性能证据（Attempt / ProducerGuard 生命周期）
+│   │   │   ├── update/           # Server 在线更新：签名清单校验（minisign，公钥编译内置）/ 检查 / 下载校验安装
+│   │   │   │                     # / 启动交接决策（boot.rs）；进程 exec 由 src-server 负责（docs/server/upgrade.md）
 │   │   │   ├── vision_shim/      # 视觉垫片：OnAccess PhaseHook，用 helper 模型把图片转写为文字，
 │   │   │   │                     # 供纯文本目标模型使用（config / caption / ir_scan / cache / hook）
 │   │   │   └── integrations/     # HookRegistry（旧版 request/response hook）
@@ -183,7 +185,8 @@ nyro/
 │   ├── nyro-ccswitch-compat/    # cc-switch raw-wire 兼容层（机械移植转换核心 + CompatEngine，§3.0）
 │   └── nyro-tools/              # CLI：proxy / record / replay / print-scenarios / dump-schema（§12.5）
 ├── src-tauri/                   # nyro-desktop：Tauri 外壳（IPC command、托盘、自动更新）
-├── src-server/                  # nyro-server：Server 外壳（Admin REST 路由、YAML standalone、内嵌 WebUI）
+├── src-server/                  # nyro-server：Server 外壳（Admin REST 路由、YAML standalone、内嵌 WebUI、
+│                                #   self_update.rs：启动交接与更新后 exec 重启）
 ├── webui/                       # React 管理台（§11）
 ├── tests/                       # Python E2E（pytest）+ WebUI smoke 脚本
 └── deploy/schema/               # 由迁移生成的 PostgreSQL / MySQL 最终态参考 schema

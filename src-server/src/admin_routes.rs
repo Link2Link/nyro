@@ -13,6 +13,7 @@ use nyro_core::admin::{
 };
 use nyro_core::auth::AuthExchangeInput;
 use nyro_core::db::models::*;
+use nyro_core::update::{UpdateError, UpdateService, VersionInfo};
 use serde::Deserialize;
 
 #[derive(Clone)]
@@ -46,7 +47,16 @@ async fn admin_auth(
     }
 }
 
+#[cfg(test)]
 pub fn create_router(gateway: Gateway, admin_token: Option<String>) -> Router {
+    create_router_with_updater(gateway, admin_token, None)
+}
+
+pub fn create_router_with_updater(
+    gateway: Gateway,
+    admin_token: Option<String>,
+    updater: Option<UpdateService>,
+) -> Router {
     let providers_item = get(get_provider_handler)
         .put(update_provider_handler)
         .delete(delete_provider_handler);
@@ -58,6 +68,10 @@ pub fn create_router(gateway: Gateway, admin_token: Option<String>) -> Router {
 
     let mut api = Router::new()
         .route("/system/extensions", get(list_loaded_extensions))
+        .route("/system/version", get(system_version_handler))
+        .route("/system/update/check", get(update_check_handler))
+        .route("/system/update/apply", post(update_apply_handler))
+        .route("/system/update/status", get(update_status_handler))
         .route("/logging/status", get(logging_status_handler))
         .route(
             "/log-requests/:request_id",
@@ -213,6 +227,10 @@ pub fn create_router(gateway: Gateway, admin_token: Option<String>) -> Router {
         .route("/config/export", get(export_config_handler))
         .route("/config/import", axum::routing::post(import_config_handler))
         .with_state(gateway.clone());
+
+    if let Some(updater) = updater {
+        api = api.layer(Extension(updater));
+    }
 
     if let Some(token) = admin_token
         && !token.is_empty()
@@ -1393,6 +1411,84 @@ async fn get_status(State(gw): State<Gateway>) -> impl IntoResponse {
     }))
 }
 
+// ── Version & self-update ──
+
+type Updater = Option<Extension<UpdateService>>;
+
+async fn system_version_handler(updater: Updater) -> impl IntoResponse {
+    let info = match updater {
+        Some(Extension(updater)) => updater.version_info(),
+        None => VersionInfo::unavailable("unavailable"),
+    };
+    Json(serde_json::json!({ "data": info }))
+}
+
+#[derive(Deserialize)]
+struct UpdateCheckQuery {
+    #[serde(default)]
+    force: bool,
+}
+
+async fn update_check_handler(
+    updater: Updater,
+    Query(query): Query<UpdateCheckQuery>,
+) -> axum::response::Response {
+    let Some(Extension(updater)) = updater else {
+        return update_err(UpdateError::Unsupported("unavailable".into()));
+    };
+    match updater.check(query.force).await {
+        Ok(check) => Json(serde_json::json!({ "data": check })).into_response(),
+        Err(error) => update_err(error),
+    }
+}
+
+#[derive(Deserialize)]
+struct UpdateApplyRequest {
+    version: String,
+}
+
+async fn update_apply_handler(
+    updater: Updater,
+    Json(body): Json<UpdateApplyRequest>,
+) -> axum::response::Response {
+    let Some(Extension(updater)) = updater else {
+        return update_err(UpdateError::Unsupported("unavailable".into()));
+    };
+    match updater.apply(&body.version).await {
+        Ok(job) => (
+            StatusCode::ACCEPTED,
+            Json(serde_json::json!({ "data": job })),
+        )
+            .into_response(),
+        Err(error) => update_err(error),
+    }
+}
+
+async fn update_status_handler(updater: Updater) -> axum::response::Response {
+    let Some(Extension(updater)) = updater else {
+        return update_err(UpdateError::Unsupported("unavailable".into()));
+    };
+    Json(serde_json::json!({ "data": updater.job() })).into_response()
+}
+
+fn update_err(error: UpdateError) -> axum::response::Response {
+    let status = match &error {
+        UpdateError::Unsupported(_) | UpdateError::NoAsset { .. } => StatusCode::BAD_REQUEST,
+        UpdateError::Busy | UpdateError::VersionMismatch { .. } | UpdateError::NotNewer(_) => {
+            StatusCode::CONFLICT
+        }
+        UpdateError::Verification(_) | UpdateError::InvalidManifest(_) | UpdateError::Fetch(_) => {
+            StatusCode::BAD_GATEWAY
+        }
+        UpdateError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    (
+        status,
+        Json(serde_json::json!({ "error": error.to_string(), "code": error.code() })),
+    )
+        .into_response()
+}
+
 // ── Config Import/Export ──
 
 async fn export_config_handler(State(gw): State<Gateway>) -> impl IntoResponse {
@@ -1481,6 +1577,10 @@ mod token_usage_api_tests;
 #[cfg(test)]
 #[path = "account_usage_api_tests.rs"]
 mod account_usage_api_tests;
+
+#[cfg(test)]
+#[path = "self_update_api_tests.rs"]
+mod self_update_api_tests;
 
 #[cfg(test)]
 mod tests {

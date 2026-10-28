@@ -152,6 +152,18 @@ jobs:
             os: ubuntu-latest
             binary: nyro-server
             asset: nyro-server-linux-x86_64
+          # Static musl builds are the self-update assets: they run on any
+          # Linux libc (Debian images, CentOS 7, Alpine).
+          - platform: linux-x86_64-musl
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            binary: nyro-server
+            asset: nyro-server-linux-x86_64-musl
+          - platform: linux-aarch64-musl
+            os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            binary: nyro-server
+            asset: nyro-server-linux-aarch64-musl
 
     steps:
       - name: Checkout
@@ -159,6 +171,14 @@ jobs:
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install musl toolchain
+        if: ${{ matrix.target }}
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends musl-tools
 
       - name: Cache Rust build
         uses: Swatinem/rust-cache@v2
@@ -172,13 +192,27 @@ jobs:
           path: webui/dist
 
       - name: Build server
-        run: cargo build -p nyro-server --release
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          if [[ -n "$TARGET" ]]; then
+            cargo build -p nyro-server --release --target "$TARGET"
+          else
+            cargo build -p nyro-server --release
+          fi
 
       - name: Package server
         shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
         run: |
           mkdir -p dist
-          cp "target/release/${{ matrix.binary }}" "dist/${{ matrix.asset }}"
+          output="target/release"
+          [[ -n "$TARGET" ]] && output="target/$TARGET/release"
+          cp "$output/${{ matrix.binary }}" "dist/${{ matrix.asset }}"
+          # The self-update installer smoke-tests `--version`; check it here too.
+          "dist/${{ matrix.asset }}" --version
 
       - name: Upload server artifact
         uses: actions/upload-artifact@v7
@@ -334,6 +368,29 @@ jobs:
           VERSION: ${{ needs.validate.outputs.version }}
           REPO: ${{ github.repository }}
         run: python3 scripts/release/gen_latest_json.py --assets-dir release-assets --output release-assets/latest.json
+
+      - name: Generate signed server update manifest
+        shell: bash
+        env:
+          VERSION: ${{ needs.validate.outputs.version }}
+          REPO: ${{ github.repository }}
+          NYRO_UPDATE_SIGNING_KEY: ${{ secrets.NYRO_UPDATE_SIGNING_KEY }}
+        run: |
+          if [[ -z "$NYRO_UPDATE_SIGNING_KEY" ]]; then
+            echo "::warning::NYRO_UPDATE_SIGNING_KEY is not set; nyro-server-update.json is skipped and running instances will not see this release"
+            exit 0
+          fi
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends minisign
+          key="$RUNNER_TEMP/nyro-update.key"
+          printf '%s\n' "$NYRO_UPDATE_SIGNING_KEY" > "$key"
+          chmod 600 "$key"
+          python3 scripts/release/gen_server_update.py \
+            --assets-dir release-assets \
+            --secret-key "$key" \
+            --verify-pubkey crates/nyro-core/src/update/release.pub \
+            --output release-assets/nyro-server-update.json
+          rm -f "$key"
 
       - name: Generate checksums
         shell: bash

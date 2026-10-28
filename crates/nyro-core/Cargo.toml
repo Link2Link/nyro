@@ -40,6 +40,8 @@ hex = "0.4"
 dashmap = "6"
 inventory = "0.3"
 gcp_auth = "0.12.6"
+minisign-verify = "0.2.5"
+semver = "1.0.28"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

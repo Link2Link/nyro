@@ -18,8 +18,9 @@ use nyro_core::{
     },
     logging,
     storage::MemoryStorage,
+    update::{RestartTarget, UpdateOptions, UpdateService},
 };
-use tokio::sync::broadcast;
+use tokio::sync::watch;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use tower_http::services::{ServeDir, ServeFile};
 
@@ -27,7 +28,11 @@ use tower_http::services::{ServeDir, ServeFile};
 use rust_embed::RustEmbed;
 
 mod admin_routes;
+mod self_update;
 mod yaml_config;
+
+/// How long in-flight requests may drain before a self-update restart.
+const RESTART_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[cfg(feature = "embed-webui")]
 #[derive(RustEmbed)]
@@ -301,6 +306,36 @@ struct Args {
     )]
     webui_dir: Option<PathBuf>,
 
+    // ── Updates ───────────────────────────────────────────────────────────────
+    #[arg(
+        long,
+        default_value = "true",
+        action = clap::ArgAction::Set,
+        env = "NYRO_UPDATE_CHECK",
+        help = "Allow the admin console to check for new releases (true/false). Set false for offline deployments.",
+        help_heading = "Updates"
+    )]
+    update_check: bool,
+
+    #[arg(
+        long,
+        default_value = "true",
+        action = clap::ArgAction::Set,
+        env = "NYRO_SELF_UPDATE",
+        help = "Allow installing new releases in place from the admin console (true/false). Set false when upgrades are managed by images or packages.",
+        help_heading = "Updates"
+    )]
+    self_update: bool,
+
+    #[arg(
+        long,
+        default_value = nyro_core::update::DEFAULT_MANIFEST_URL,
+        env = "NYRO_UPDATE_MANIFEST_URL",
+        help = "Signed release manifest URL used for update checks",
+        help_heading = "Updates"
+    )]
+    update_manifest_url: String,
+
     // ── Standalone ────────────────────────────────────────────────────────────
     #[arg(
         long = "config",
@@ -402,6 +437,48 @@ mod timeout_config_tests {
     }
 
     #[test]
+    fn update_options_default_on_and_accept_explicit_values() {
+        let args = Args::try_parse_from(["nyro-server"]).unwrap();
+        let options = build_update_options(&args, PathBuf::from("/data"));
+        assert!(options.check_enabled && options.self_update_enabled);
+        assert_eq!(
+            options.manifest_url,
+            nyro_core::update::DEFAULT_MANIFEST_URL
+        );
+        assert_eq!(options.current_version, env!("CARGO_PKG_VERSION"));
+
+        let args = Args::try_parse_from([
+            "nyro-server",
+            "--update-check",
+            "false",
+            "--self-update",
+            "false",
+            "--update-manifest-url",
+            " https://mirror.example/nyro-server-update.json ",
+        ])
+        .unwrap();
+        let options = build_update_options(&args, PathBuf::from("/data"));
+        assert!(!options.check_enabled && !options.self_update_enabled);
+        assert_eq!(
+            options.manifest_url,
+            "https://mirror.example/nyro-server-update.json"
+        );
+
+        let command = Args::command();
+        for (id, env) in [
+            ("update_check", "NYRO_UPDATE_CHECK"),
+            ("self_update", "NYRO_SELF_UPDATE"),
+            ("update_manifest_url", "NYRO_UPDATE_MANIFEST_URL"),
+        ] {
+            let arg = command
+                .get_arguments()
+                .find(|arg| arg.get_id() == id)
+                .unwrap();
+            assert_eq!(arg.get_env(), Some(std::ffi::OsStr::new(env)));
+        }
+    }
+
+    #[test]
     fn timeout_options_reject_zero_negative_and_non_integer_values() {
         for (id, _, _) in TIMEOUT_ARGS {
             let flag = format!("--{}", id.replace('_', "-"));
@@ -417,13 +494,43 @@ mod timeout_config_tests {
 
 // ── Entry point ───────────────────────────────────────────────────────────────
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+/// How the async server body finished.
+enum RunOutcome {
+    Exit,
+    Restart(RestartTarget),
+}
+
+fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
     let filter = format!("nyro={level},tower_http={level}", level = args.log_level);
     tracing_subscriber::fmt().with_env_filter(filter).init();
 
+    // Before any listener binds: hand off to an installed newer binary.
+    self_update::bootstrap(&PathBuf::from(
+        shellexpand::tilde(&args.data_dir).to_string(),
+    ));
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    let outcome = runtime.block_on(run(&args));
+    // Stop background tasks before the process image is replaced.
+    runtime.shutdown_timeout(Duration::from_secs(2));
+
+    match outcome? {
+        RunOutcome::Exit => Ok(()),
+        RunOutcome::Restart(target) => {
+            let error = self_update::restart_into(&target);
+            Err(anyhow::anyhow!(
+                "failed to restart into nyro-server {}: {error}",
+                target.version
+            ))
+        }
+    }
+}
+
+async fn run(args: &Args) -> anyhow::Result<RunOutcome> {
     if let Some(ref config_path) = args.config_file {
         if args.mode != Mode::All {
             tracing::warn!(
@@ -435,14 +542,16 @@ async fn main() -> anyhow::Result<()> {
                 }
             );
         }
-        return run_standalone(config_path, &args).await;
+        run_standalone(config_path, args).await?;
+        return Ok(RunOutcome::Exit);
     }
 
     if args.migrate_only {
-        return run_migrate(&args).await;
+        run_migrate(args).await?;
+        return Ok(RunOutcome::Exit);
     }
 
-    run_full(&args).await
+    run_full(args).await
 }
 
 // ── Migrate-only mode ─────────────────────────────────────────────────────────
@@ -549,7 +658,7 @@ async fn run_standalone(config_path: &str, args: &Args) -> anyhow::Result<()> {
 
 // ── Full mode (DB-backed, mode-aware) ─────────────────────────────────────────
 
-async fn run_full(args: &Args) -> anyhow::Result<()> {
+async fn run_full(args: &Args) -> anyhow::Result<RunOutcome> {
     let data_dir = shellexpand::tilde(&args.data_dir).to_string();
     let admin_token = args.admin_token.clone().filter(|t| !t.trim().is_empty());
 
@@ -632,44 +741,67 @@ async fn run_full(args: &Args) -> anyhow::Result<()> {
         logging::run_collector(log_rx, storage_for_logs).await;
     });
 
+    // Self-update needs the admin API; proxy-only replicas are upgraded by
+    // whatever manages them.
+    let updater = if args.mode == Mode::Proxy {
+        None
+    } else {
+        Some(UpdateService::new(
+            gateway.storage.clone(),
+            build_update_options(args, gateway.config.data_dir.clone()),
+        )?)
+    };
+    let shutdown = Shutdown::new();
+    shutdown.trigger_on(shutdown_signal());
+    if let Some(updater) = updater.clone() {
+        shutdown.trigger_on(async move {
+            updater.restart_requested().await;
+        });
+    }
+
     match args.mode {
         Mode::Proxy => {
             let proxy_addr = format!("{}:{}", proxy_host, args.proxy_port);
             tracing::info!("mode=proxy  proxy → http://{proxy_addr}");
             tracing::info!("admin API and WebUI are disabled in proxy mode");
-            gateway.start_proxy_with_shutdown(shutdown_signal()).await?;
+            gateway
+                .start_proxy_with_shutdown(shutdown.clone().wait())
+                .await?;
         }
 
         Mode::Admin => {
             let admin_addr = format!("{}:{}", admin_host, args.admin_port);
-            let admin_router = admin_routes::create_router(gateway, admin_token.clone());
+            let admin_router = admin_routes::create_router_with_updater(
+                gateway.clone(),
+                admin_token.clone(),
+                updater.clone(),
+            );
             let app = build_admin_app(admin_router, &args.webui_dir, &admin_cors_origins);
             let listener = tokio::net::TcpListener::bind(&admin_addr).await?;
             tracing::info!("mode=admin  admin → http://{admin_addr}");
             if admin_token.is_none() {
                 tracing::warn!("admin API auth disabled: set --admin-token for production");
             }
-            axum::serve(listener, app)
-                .with_graceful_shutdown(shutdown_signal())
-                .await?;
+            let serve = axum::serve(listener, app).with_graceful_shutdown(shutdown.clone().wait());
+            drain_bounded(serve.into_future(), restart_drain_deadline(&updater)).await?;
         }
 
         Mode::All => {
-            let (shutdown_tx, _) = broadcast::channel::<()>(1);
-            let proxy_shutdown = shutdown_tx.subscribe();
-            let admin_shutdown_tx = shutdown_tx.clone();
-
             let gw_proxy = gateway.clone();
+            let proxy_shutdown = shutdown.clone();
+            let proxy_deadline = restart_drain_deadline(&updater);
             let proxy_task = tokio::spawn(async move {
-                if let Err(e) = gw_proxy
-                    .start_proxy_with_shutdown(wait_for_shutdown(proxy_shutdown))
-                    .await
-                {
+                let serve = gw_proxy.start_proxy_with_shutdown(proxy_shutdown.wait());
+                if let Err(e) = drain_bounded(serve, proxy_deadline).await {
                     tracing::error!("proxy server error: {e}");
                 }
             });
 
-            let admin_router = admin_routes::create_router(gateway, admin_token.clone());
+            let admin_router = admin_routes::create_router_with_updater(
+                gateway.clone(),
+                admin_token.clone(),
+                updater.clone(),
+            );
             let app = build_admin_app(admin_router, &args.webui_dir, &admin_cors_origins);
             let admin_addr = format!("{}:{}", admin_host, args.admin_port);
             let listener = tokio::net::TcpListener::bind(&admin_addr).await?;
@@ -682,14 +814,12 @@ async fn run_full(args: &Args) -> anyhow::Result<()> {
                 tracing::warn!("admin API auth disabled: set --admin-token for production");
             }
 
-            let admin_result = axum::serve(listener, app)
-                .with_graceful_shutdown(async move {
-                    shutdown_signal().await;
-                    let _ = admin_shutdown_tx.send(());
-                })
-                .await;
+            let serve = axum::serve(listener, app).with_graceful_shutdown(shutdown.clone().wait());
+            let admin_result =
+                drain_bounded(serve.into_future(), restart_drain_deadline(&updater)).await;
 
-            let _ = shutdown_tx.send(());
+            // Stop the proxy too if the admin listener ended on its own.
+            shutdown.trigger();
             if let Err(error) = proxy_task.await {
                 tracing::error!("proxy server task failed: {error}");
             }
@@ -698,7 +828,59 @@ async fn run_full(args: &Args) -> anyhow::Result<()> {
         }
     }
 
-    Ok(())
+    if let Some(target) = updater.as_ref().and_then(UpdateService::pending_restart) {
+        if tokio::time::timeout(Duration::from_secs(5), gateway.close_storage())
+            .await
+            .is_err()
+        {
+            tracing::warn!("timed out closing storage before restart");
+        }
+        return Ok(RunOutcome::Restart(target));
+    }
+    Ok(RunOutcome::Exit)
+}
+
+fn build_update_options(args: &Args, data_dir: PathBuf) -> UpdateOptions {
+    let mut options = UpdateOptions::new(data_dir);
+    options.check_enabled = args.update_check;
+    options.self_update_enabled = args.self_update;
+    options.manifest_url = args.update_manifest_url.trim().to_string();
+    options
+}
+
+/// Resolves once a self-update restart has been requested plus the drain
+/// budget; never resolves for ordinary shutdowns, which keep draining fully.
+fn restart_drain_deadline(
+    updater: &Option<UpdateService>,
+) -> impl std::future::Future<Output = ()> + Send + 'static {
+    let updater = updater.clone();
+    async move {
+        match updater {
+            Some(updater) => {
+                updater.restart_requested().await;
+                tokio::time::sleep(RESTART_DRAIN_TIMEOUT).await;
+            }
+            None => std::future::pending::<()>().await,
+        }
+    }
+}
+
+/// Await a graceful-shutdown server future, abandoning it at `deadline` so
+/// long-lived streams cannot hold a restart hostage.
+async fn drain_bounded<E>(
+    serve: impl std::future::Future<Output = Result<(), E>>,
+    deadline: impl std::future::Future<Output = ()>,
+) -> Result<(), E> {
+    tokio::select! {
+        result = serve => result,
+        () = deadline => {
+            tracing::warn!(
+                "in-flight requests did not finish within {}s; restarting anyway",
+                RESTART_DRAIN_TIMEOUT.as_secs()
+            );
+            Ok(())
+        }
+    }
 }
 
 // ── Admin app builder (three-state webui) ─────────────────────────────────────
@@ -785,8 +967,32 @@ async fn shutdown_signal() {
     tracing::info!("shutdown signal received");
 }
 
-async fn wait_for_shutdown(mut shutdown: broadcast::Receiver<()>) {
-    let _ = shutdown.recv().await;
+/// One shutdown switch shared by every listener; flipped by OS signals or a
+/// self-update restart request.
+#[derive(Clone)]
+struct Shutdown(Arc<watch::Sender<bool>>);
+
+impl Shutdown {
+    fn new() -> Self {
+        Self(Arc::new(watch::channel(false).0))
+    }
+
+    fn trigger(&self) {
+        self.0.send_replace(true);
+    }
+
+    fn trigger_on(&self, reason: impl std::future::Future<Output = ()> + Send + 'static) {
+        let shutdown = self.clone();
+        tokio::spawn(async move {
+            reason.await;
+            shutdown.trigger();
+        });
+    }
+
+    async fn wait(self) {
+        let mut rx = self.0.subscribe();
+        let _ = rx.wait_for(|stopped| *stopped).await;
+    }
 }
 
 // ── WebUI (embedded, feature-gated) ──────────────────────────────────────────

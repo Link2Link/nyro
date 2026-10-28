@@ -269,6 +269,8 @@ Available server binaries: `linux-x86_64`, `linux-aarch64`, `macos-x86_64`, `mac
 
 Open `http://localhost:19531` for the management UI. See [Server docs](docs/server/README.md) and [Standalone docs](docs/standalone/README.md) for full configuration reference.
 
+Deployed instances can check for and install new releases from **Settings → Updates** in the management UI: the signed binary is verified, swapped in place and the gateway restarts automatically; updates only move forward. See [In-place updates](<docs/server/upgrade.md>).
+
 For a native x86_64 binary targeting CentOS 7.6 / glibc 2.17, use the containerized [CentOS 7.6 build guide](<docs/server/centos7-build.md>) ([中文](<docs/server/centos7-build_CN.md>)). It builds from source with embedded WebUI; it does not install or start a production service.
 
 ### Local Docker Image

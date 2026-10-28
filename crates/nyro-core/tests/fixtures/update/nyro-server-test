@@ -1,0 +1,3 @@
+#!/bin/sh
+# Stand-in release binary for self-update tests.
+echo "nyro-server 9.9.9"
