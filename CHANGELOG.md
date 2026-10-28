@@ -4,6 +4,20 @@ All notable changes to Nyro will be documented in this file.
 
 ---
 
+## v2.1.6
+
+> Released on 2026-10-28
+
+#### Features
+
+- **Claude subscription usage**: `claude-code` OAuth providers now show their subscription usage like the Codex and xAI cards, read from `GET /api/oauth/usage` (the endpoint Claude Code's `/usage` panel uses). The card shows the 5-hour session window, the weekly all-models window and per-model weekly limits (e.g. Sonnet, Fable); routing pauses when the 5-hour or weekly window is exhausted, while per-model rows are informational. Only Claude Code OAuth providers are matched — API-key providers on `api.anthropic.com` are left alone
+
+#### Improvements
+
+- **Claude Code model list**: the built-in model list now mirrors Claude Code 2.1.312's `/model` picker (`claude-opus-5-5`, `claude-sonnet-5-5`, `claude-fable-5-1`, `claude-haiku-5-5`, then `claude-opus-5`, `claude-sonnet-5`, `claude-fable-5`, `claude-opus-4-8` and older), and keeps the older dated ids so existing routes stay discoverable. Model discovery returns this list without calling upstream, matching Claude Code, which does not use `/v1/models` for subscription logins
+
+---
+
 ## v2.1.5
 
 > Released on 2026-10-28

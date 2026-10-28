@@ -4,6 +4,20 @@ Nyro 的所有重要变更均记录在此文件中。
 
 ---
 
+## v2.1.6
+
+> 发布于 2026-10-28
+
+#### 新功能
+
+- **Claude 订阅用量**：`claude-code` OAuth 供应商像 Codex、xAI 卡片一样显示订阅用量，数据来自 `GET /api/oauth/usage`（Claude Code `/usage` 面板使用的同一接口）。卡片展示 5 小时会话窗口、每周全部模型窗口以及按模型的周限额（如 Sonnet、Fable）；5 小时或每周窗口用满时暂停调度，按模型行仅作展示。只匹配 Claude Code OAuth 供应商，`api.anthropic.com` 上的 API Key 供应商不受影响
+
+#### 改进
+
+- **Claude Code 模型列表**：内置模型列表同步 Claude Code 2.1.312 的 `/model` 选择器（`claude-opus-5-5`、`claude-sonnet-5-5`、`claude-fable-5-1`、`claude-haiku-5-5`，其后为 `claude-opus-5`、`claude-sonnet-5`、`claude-fable-5`、`claude-opus-4-8` 及更早版本），并保留旧版带日期 ID 以便现有路由继续可见。模型发现直接返回该列表、不请求上游，与 Claude Code 一致（订阅登录不使用 `/v1/models`）
+
+---
+
 ## v2.1.5
 
 > 发布于 2026-10-28
