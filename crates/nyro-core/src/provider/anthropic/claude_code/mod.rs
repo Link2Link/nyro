@@ -6,6 +6,13 @@
 //! and intentionally returns no fallback auth headers so that flipping
 //! `disable_default_auth` cannot leak an empty `x-api-key`.
 
+pub mod cch;
+pub(crate) mod cloak;
+pub(crate) mod egress;
+pub(crate) mod identity;
+pub(crate) mod profile;
+pub(crate) mod tool_alias;
+
 use reqwest::header::HeaderMap;
 
 use crate::provider::registry::{ExtensionRegistration, VendorScope};

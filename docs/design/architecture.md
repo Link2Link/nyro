@@ -136,7 +136,8 @@ nyro/
 │   │   │   │   │   ├── pipeline.rs       # build_request / parse_response / passthrough_run
 │   │   │   │   │   └── effort_policy.rs  # 按上游方言规整 reasoning_effort
 │   │   │   │   ├── openai/           # OpenAiVendor + OpenAIFamilyExt；codex/（OpenAiCodexChannel）
-│   │   │   │   ├── anthropic/        # AnthropicVendor + AnthropicFamilyExt；claude_code/（AnthropicClaudeCodeChannel）
+│   │   │   │   ├── anthropic/        # AnthropicVendor + AnthropicFamilyExt；claude_code/（AnthropicClaudeCodeChannel
+│   │   │   │   │                     #   + egress/cloak/cch/profile/identity/tool_alias，见 §6.5a）
 │   │   │   │   ├── google/           # GoogleVendor + GoogleFamilyExt + Antigravity / Gemini CLI ext
 │   │   │   │   │                     # （antigravity.rs · gemini_cli.rs）
 │   │   │   │   ├── xai/              # XaiVendor；grok/（XaiGrokChannel）
@@ -720,6 +721,19 @@ Google 订阅共两条 channel，均经 Code Assist 内部 API（`cloudcode-pa.g
 - **强制上游流式**：Code Assist v1internal 的非流式 action 可能返回空体——sub2api 与 CLIProxyAPI 均以 `:streamGenerateContent` 调上游再聚合。nyro 对两个 channel 无条件走流式上游（`antigravity::forces_upstream_stream` 翻转 IR stream 标志 → 聚合路径 `handle_non_stream_via_upstream_stream`，同样应用 `StreamRawChunkHook` 解包），非流式客户端收到聚合后的完整响应；admin 模型探测（probe）同样以流式 + SSE 提取实现（按 channel 选择信封）。
 - **模型目录**：优先调用 `v1internal:fetchAvailableModels` 做**按账号动态发现**（订阅的真实目录，新模型先于此处任何静态表出现；失败时自动回退 curated 静态表 `ANTIGRAVITY_STATIC_MODELS` / `GEMINI_CLI_STATIC_MODELS`）；`deprecatedModelIds` 声明的条目在解析时剔除（上游自标已死、推理表面 404）；antigravity 通道另有 curated 不可用清单 `GEMINI_SUBSCRIPTION_UNAVAILABLE_MODELS`（退役 preview/image id、defunct id）+ `chat_<数字>` 内部噪音模式，经 `filter_subscription_unavailable` 从发现/探测列表过滤（手填模型名仍可路由，镜像 opencode-go 的 `UNAVAILABLE_MODELS` 语义；精选清单仅作用于 antigravity——相同 preview id 在 API-key/GCP 表面可能仍活）。配额（remainingFraction）接入探测结果展示。
 - **WebUI**：google 预设下选择 channel 后，OAuth 会话以 channel 感知的 vendor key 发起（`google-gemini-cli`），provider 创建/重连时按 driver key 标记 `channel` 字段。
+
+### 6.5a Anthropic Claude Code 订阅通道（`anthropic/claude-code` OAuth）
+
+用 Claude 订阅 OAuth token（`sk-ant-oat…`）调用 `api.anthropic.com` 时，Anthropic 会按内容判定是否为第三方客户端（判定为第三方时计入 extra usage，而不是直接拒绝）。该通道移植 CLIProxyAPI Claude executor 的伪装机制（`internal/runtime/executor/claude_*`，基线 Claude Code 2.1.280），实现在 `provider/anthropic/claude_code/`：
+
+- **接入点**：dispatcher 在三条请求构建路径（passthrough / IR 编码 / raw-wire compat）产出最终 body、header 合并完成之后调用 `egress::prepare`（`proxy/dispatcher/mod.rs::claude_code_egress`，仅 `vendor=anthropic, channel=claude-code` 且出站为 Anthropic Messages）。admin 模型探测（`admin/providers.rs::probe_single_model`）走同一函数，因此探测通过即代表真实流量的线格式可用。
+- **原生客户端识别**（`profile::detect_native`）：`x-app: cli` + `claude-cli/x.y.z (external, cli|sdk-cli|sdk-ts|claude-vscode)` UA + `claude-code-20250219` beta + 2.1.220+ 形态的 `metadata.user_id`（count_tokens 免后者）。原生 Claude Code 保留自身 body 与身份 header（不再被 runtime binding 的固定 UA 覆盖）；只补凭证相关项：`oauth-2025-04-20`（插在 claude-code 之后）与 `extended-cache-ttl`、按选中账号重建 `metadata.user_id`、补回 `cch`。UA 低于基线或无法解析时整体回落到基线 CLI 指纹。
+- **伪装（非原生客户端）**（`cloak.rs`）：`system` 只保留 `[billing header, "You are Claude Code, Anthropic's official CLI for Claude."]`；调用方 system 移出顶层槽位（支持 mid-conversation system 的模型 → 首个 user 段之后的 `role:system` 轮；`LEGACY_SYSTEM_REMINDER_MODELS` 中的旧模型 → 首条 user 内的 `<system-reminder>`；含 advisor 历史时保留顶层避免位移）；首条 user 前置 `currentDate` reminder；剥离 temperature/top_p（思考时含 top_k）；强制 tool_choice 时移除 thinking；thinking 开启且为第一方上游时补 `context_management.clear_thinking`；cache_control 按 CLI 规则布点、上限 4、OAuth 升级为 1h 并修正 TTL 顺序；5.5 系保留思考补 `block_binding.drop_block`。非 text 的 system 块本地返回 400。
+- **billing header + `cch` 签名**（`cloak::billing_header`、`cch.rs`）：`cc_version=<ver>.<fp>`（fp = SHA256(salt + 首条 user 文本 UTF-16 下标 4/7/20 + ver) 前 3 位）、`cc_entrypoint`、`cch=00000`、`cc_prompt_id`、`cc_turn_origin`。`cch` 为对**最终发送字节**（model 值置空、剔除 `max_tokens`/`fallbacks`/`fallback_credit_token`）做 xxHash64（seed `0x4D659218E32A3268`）取低 20 位；签名在 `ProxyClient` 发送边界由 `EgressHook::finalize_request_body` 完成（`proxy/client/egress_hook.rs`），覆盖重试/回放。测试固定了 CLIProxyAPI 的已知向量，并与其 Go 实现交叉验证。
+- **身份**（`identity.rs`）：`metadata.user_id` 为 JSON 字符串 `{"device_id","account_uuid","session_id"}`；`account_uuid` 取 token 响应的 `account.uuid`（OAuth driver 刷新时若响应缺省则沿用旧值），缺失时按 provider 派生确定性 UUID；`device_id` 由 provider + 账号派生（64 hex，稳定）；`session_id` 原生取 `X-Claude-Code-Session-Id`，否则由会话首轮指纹派生（跨轮稳定），同值写入 `X-Claude-Code-Session-Id`。
+- **工具名伪装**（`tool_alias.rs`）：非原生请求的客户端工具改名为 `mcp__<词>_<词>__<词>_<原名>`（HMAC-SHA256 + BIP-39 词表，按 provider + 下游 API Key 稳定，与 CLIProxyAPI 算法逐字一致）；server tool 与已是 `mcp__` 形态的名字不动。响应侧在 `ProxyClient` 的字节流上还原（JSON 整体、SSE 仅 `content_block_start` 行），因此 passthrough、IR 转码、compat 三条响应路径与日志看到的都是原名。
+- **Header**：非原生客户端整体重建（不透传调用方的 `x-stainless-*`/UA 等指纹，也不再发送浏览器专用 Origin/Referer）：CLI UA、`x-app: cli`、`x-stainless-*`（js/node/0.112.1/MacOS/arm64/600）、`anthropic-dangerous-direct-browser-access`、`x-client-request-id`、按请求组装的 `anthropic-beta`（`profile::cloaked_betas`，第一方上游丢弃调用方的受管 beta、转发未知 beta），URL 追加 `?beta=true`。
+- **未移植**：uTLS ClientHello 与 HTTP/1.1 header 顺序/大小写（reqwest/rustls 不可控）、`diagnostics`/`cc_prev_req` 等需要跨请求连续状态的字段、按会话固定 currentDate、敏感词混淆、strict/cloak mode 配置项、thread 别名存储。
 
 ### 6.6 OpenCode Go（opencode.ai/zen/go）通道
 

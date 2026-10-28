@@ -23,15 +23,18 @@ const ANTHROPIC_PRESET_ID: &str = "anthropic";
 const CLAUDE_CODE_CHANNEL_ID: &str = "claude-code";
 const ANTHROPIC_PROTOCOL_ID: &str = "anthropic-messages";
 
-/// User-Agent the official `claude` CLI sends; mirrored on both the
-/// OAuth token endpoint and the inference runtime. **Bump this** when
-/// upgrading Claude Code CLI compatibility — Anthropic has at points
-/// gated the OAuth surface on the CLI version string.
+/// User-Agent sent to the OAuth token endpoint. Kept on the value this
+/// driver has always used for login/refresh; the inference runtime uses the
+/// measured Claude Code profile instead (see `bind_runtime`).
 const CLAUDE_CLI_USER_AGENT: &str = "claude-cli/1.0.98 (external, cli)";
 
 /// Anthropic OAuth-beta header the runtime + token endpoint require.
 /// Bump (or drop) once the OAuth flow GAs.
 const ANTHROPIC_OAUTH_BETA: &str = "oauth-2025-04-20";
+
+/// Identity fields of the token response that refreshes may omit; carried
+/// forward so the Claude Code `metadata.user_id` keeps the same account.
+const PRESERVED_IDENTITY_META_KEYS: &[&str] = &["account", "organization"];
 
 #[derive(Debug, Clone, Copy)]
 struct ClaudeCodeConfig {
@@ -114,6 +117,26 @@ impl ClaudeOAuthDriver {
             scopes: encode_scopes(token.scope.as_deref()),
             raw: serde_json::from_str(body).unwrap_or(serde_json::Value::Null),
         })
+    }
+
+    /// Keep `account` / `organization` from the stored credential when a
+    /// refresh response omits them: the stored meta is replaced wholesale.
+    fn carry_identity_meta(bundle: &mut CredentialBundle, previous: &StoredCredential) {
+        let Some(previous) = previous.meta.as_object() else {
+            return;
+        };
+        if !bundle.raw.is_object() {
+            bundle.raw = serde_json::Value::Object(serde_json::Map::new());
+        }
+        let Some(raw) = bundle.raw.as_object_mut() else {
+            return;
+        };
+        for key in PRESERVED_IDENTITY_META_KEYS {
+            let missing = raw.get(*key).is_none_or(serde_json::Value::is_null);
+            if missing && let Some(value) = previous.get(*key) {
+                raw.insert((*key).to_string(), value.clone());
+            }
+        }
     }
 
     fn parse_error(body: &str) -> Option<String> {
@@ -295,7 +318,9 @@ impl AuthDriver for ClaudeOAuthDriver {
             bail!("claude oauth token refresh failed: HTTP {status} {detail}");
         }
 
-        Self::normalize_token_response(&body, Some(refresh_token), config)
+        let mut bundle = Self::normalize_token_response(&body, Some(refresh_token), config)?;
+        Self::carry_identity_meta(&mut bundle, credential);
+        Ok(bundle)
     }
 
     fn bind_runtime(
@@ -317,14 +342,26 @@ impl AuthDriver for ClaudeOAuthDriver {
             format!("Bearer {access_token}"),
         );
         extra_headers.insert("anthropic-version".to_string(), "2023-06-01".to_string());
-        // Mirror the CLI-shaped headers token-exchange uses (User-Agent,
-        // Referer, Origin, anthropic-beta) so a future runtime-gating
-        // change at Anthropic does not silently 4xx mid-session. Single
-        // source of truth keeps the version string in
-        // `CLAUDE_CLI_USER_AGENT` / `ANTHROPIC_OAUTH_BETA`.
-        for (key, value) in Self::claude_cli_headers() {
-            extra_headers.insert(key.to_ascii_lowercase(), value.to_string());
-        }
+        // Inference identity of the Claude Code CLI. The proxy refines this
+        // per request (native caller passthrough, per-request beta list) in
+        // `provider::anthropic::claude_code::egress`; these static values
+        // cover the admin-side callers (model probes) that do not go through
+        // the dispatcher. Browser-only Referer/Origin are not sent: the CLI
+        // never sends them on `/v1/messages`.
+        use crate::provider::anthropic::claude_code::profile;
+        extra_headers.insert(
+            "user-agent".to_string(),
+            profile::CLI_USER_AGENT.to_string(),
+        );
+        extra_headers.insert("x-app".to_string(), "cli".to_string());
+        extra_headers.insert(
+            "anthropic-beta".to_string(),
+            format!("{},{ANTHROPIC_OAUTH_BETA}", profile::CLAUDE_CODE_BETA),
+        );
+        extra_headers.insert(
+            "anthropic-dangerous-direct-browser-access".to_string(),
+            "true".to_string(),
+        );
 
         let base_url_override = credential
             .resource_url
@@ -413,6 +450,43 @@ mod tests {
     }
 
     #[test]
+    fn refresh_keeps_account_identity_when_response_omits_it() {
+        let config = ClaudeOAuthDriver::claude_code_config().unwrap();
+        let previous = StoredCredential {
+            meta: serde_json::json!({
+                "account": {"uuid": "1b4e28ba-2fa1-11d2-883f-0016d3cca427", "email_address": "a@example.com"},
+                "organization": {"uuid": "org-1"}
+            }),
+            ..Default::default()
+        };
+        let mut bundle = ClaudeOAuthDriver::normalize_token_response(
+            r#"{"access_token":"new","expires_in":3600}"#,
+            Some("ref"),
+            config,
+        )
+        .unwrap();
+        ClaudeOAuthDriver::carry_identity_meta(&mut bundle, &previous);
+        assert_eq!(
+            bundle.raw["account"]["uuid"],
+            "1b4e28ba-2fa1-11d2-883f-0016d3cca427"
+        );
+        assert_eq!(bundle.raw["organization"]["uuid"], "org-1");
+
+        // A refresh that does return identity wins.
+        let mut fresh = ClaudeOAuthDriver::normalize_token_response(
+            r#"{"access_token":"new","account":{"uuid":"2b4e28ba-2fa1-11d2-883f-0016d3cca427"}}"#,
+            Some("ref"),
+            config,
+        )
+        .unwrap();
+        ClaudeOAuthDriver::carry_identity_meta(&mut fresh, &previous);
+        assert_eq!(
+            fresh.raw["account"]["uuid"],
+            "2b4e28ba-2fa1-11d2-883f-0016d3cca427"
+        );
+    }
+
+    #[test]
     fn parse_error_prefers_description() {
         let body = r#"{"error":"invalid_grant","error_description":"code expired"}"#;
         assert_eq!(
@@ -437,12 +511,15 @@ mod tests {
         );
         assert_eq!(
             binding.extra_headers.get("anthropic-beta").unwrap(),
-            "oauth-2025-04-20"
+            "claude-code-20250219,oauth-2025-04-20"
         );
         assert_eq!(
             binding.extra_headers.get("user-agent").unwrap(),
-            "claude-cli/1.0.98 (external, cli)"
+            "claude-cli/2.1.280 (external, cli)"
         );
+        assert_eq!(binding.extra_headers.get("x-app").unwrap(), "cli");
+        assert!(!binding.extra_headers.contains_key("origin"));
+        assert!(!binding.extra_headers.contains_key("referer"));
         assert!(binding.disable_default_auth);
         assert_eq!(
             binding.base_url_override.as_deref(),

@@ -85,6 +85,13 @@ pub fn normalize_probe_prompt(prompt: Option<String>) -> anyhow::Result<Option<S
     Ok(Some(trimmed.to_string()))
 }
 
+/// Provider + credential a Claude Code OAuth probe needs to build the same
+/// cloaked wire request as dispatch.
+struct ClaudeCodeProbe {
+    provider: Provider,
+    credential: Option<crate::auth::types::StoredCredential>,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_model_probe_request(
     suite: crate::protocol::ids::Protocol,
@@ -291,11 +298,12 @@ async fn probe_single_model(
     channel: Option<&str>,
     is_codex_oauth: bool,
     antigravity_project: Option<&str>,
+    claude_code: Option<&ClaudeCodeProbe>,
 ) -> ProviderModelProbeResult {
     let start = Instant::now();
 
     let outcome = tokio::time::timeout(Duration::from_secs(30), async {
-        let (url, headers, body) = build_model_probe_request(
+        let (mut url, mut headers, mut body) = build_model_probe_request(
             suite,
             base_url,
             api_key,
@@ -309,10 +317,41 @@ async fn probe_single_model(
             antigravity_project,
         )?;
 
+        // Claude Code OAuth: probe with exactly the wire shape dispatch sends
+        // (cloaked CLI body + headers, signed `cch`), so a passing probe means
+        // real traffic passes too.
+        let payload = match claude_code {
+            Some(probe) if suite == crate::protocol::ids::Protocol::AnthropicMessages => {
+                use crate::proxy::client::EgressHook;
+                let input = crate::provider::anthropic::claude_code::egress::EgressInput {
+                    provider: &probe.provider,
+                    credential: probe.credential.as_ref(),
+                    incoming: &HeaderMap::new(),
+                    caller_scope: "admin-probe",
+                    date: &chrono::Local::now().format("%Y-%m-%d").to_string(),
+                };
+                let hook = crate::provider::anthropic::claude_code::egress::prepare(
+                    &input,
+                    &mut url,
+                    &mut headers,
+                    &mut body,
+                )
+                .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+                hook.finalize_request_body(bytes::Bytes::from(serde_json::to_vec(&body)?))
+            }
+            _ => bytes::Bytes::from(serde_json::to_vec(&body)?),
+        };
+        if !headers.contains_key(reqwest::header::CONTENT_TYPE) {
+            headers.insert(
+                reqwest::header::CONTENT_TYPE,
+                HeaderValue::from_static("application/json"),
+            );
+        }
+
         let response = client
             .post(url)
             .headers(headers)
-            .json(&body)
+            .body(payload)
             .timeout(Duration::from_secs(30))
             .send()
             .await
@@ -2661,6 +2700,15 @@ impl AdminService {
             .and_then(|credential| {
                 crate::provider::google::antigravity::code_assist_project_id(Some(credential)).ok()
             });
+        // Claude Code OAuth probes go out in the dispatcher's exact wire shape.
+        let claude_code_probe: Option<std::sync::Arc<ClaudeCodeProbe>> =
+            crate::provider::anthropic::claude_code::egress::is_claude_code_channel(&provider)
+                .then(|| {
+                    std::sync::Arc::new(ClaudeCodeProbe {
+                        provider: provider.clone(),
+                        credential: runtime.as_ref().and_then(|r| r.credential.clone()),
+                    })
+                });
         // Per-model quota state from the subscription catalog (best-effort,
         // fetched before `runtime` is consumed by probe-target resolution):
         // on Google subscription channels a 429 almost always means that
@@ -2810,6 +2858,7 @@ impl AdminService {
             );
             let channel = channel.clone();
             let antigravity_project = antigravity_project.clone();
+            let claude_code_probe = claude_code_probe.clone();
             let prompt = prompt.clone();
             let target = resolve_probe_target(
                 &provider,
@@ -2855,6 +2904,7 @@ impl AdminService {
                     channel.as_deref(),
                     is_codex_oauth,
                     antigravity_project.as_deref(),
+                    claude_code_probe.as_deref(),
                 )
                 .await
             }

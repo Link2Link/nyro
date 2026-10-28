@@ -1685,6 +1685,43 @@ async fn dispatch_pipeline_inner(
         // prepared payload and identity but independent diagnostics/usage logs.
         let mut prepared_compat = prepared_compat;
         let mut prepared_native_body = prepared_native_body;
+
+        // Anthropic Claude Code OAuth channel: shape the final request like the
+        // official CLI (native callers keep their own identity) once every
+        // request path has produced its body. The wire hook then signs the
+        // exact bytes sent and restores aliased tool names in the response.
+        let client =
+            if crate::provider::anthropic::claude_code::egress::is_claude_code_channel(&provider)
+                && egress.protocol == crate::protocol::ids::Protocol::AnthropicMessages
+            {
+                match claude_code_egress(
+                    &provider,
+                    provider_runtime.credential.as_ref(),
+                    &headers,
+                    auth_key.id.as_deref().unwrap_or_default(),
+                    &mut outbound.url,
+                    &mut outbound.headers,
+                    &mut prepared_native_body,
+                    &mut prepared_compat,
+                ) {
+                    Ok(hook) => {
+                        ctx.trace(
+                            "claude_code",
+                            if hook.native {
+                                "client=native"
+                            } else {
+                                "client=cloaked"
+                            },
+                        );
+                        client.with_egress_hook(Some(hook.into_hook()))
+                    }
+                    Err(error) => {
+                        return error_response(400, &error.to_string());
+                    }
+                }
+            } else {
+                client
+            };
         let compat_replay_candidate = prepared_compat.as_ref().is_some_and(|prepared| {
             compat::can_retry_stream_start(&provider, prepared, raw_body.as_deref())
         });
@@ -2818,6 +2855,48 @@ fn pool_error_response(status: u16, message: &str) -> Response {
             serde_json::json!({"error": {"code": status, "message": message, "type": "NYRO_PROVIDER_KEY_POOL"}}).to_string(),
         ))
         .expect("static response build")
+}
+
+/// Apply the Anthropic Claude Code channel's final request shaping to
+/// whichever body this attempt is about to send (native JSON or raw-wire
+/// compat bytes). See `provider::anthropic::claude_code::egress`.
+#[allow(clippy::too_many_arguments)]
+fn claude_code_egress(
+    provider: &Provider,
+    credential: Option<&crate::auth::types::StoredCredential>,
+    incoming: &HeaderMap,
+    caller_scope: &str,
+    url: &mut String,
+    headers: &mut reqwest::header::HeaderMap,
+    native_body: &mut Option<Value>,
+    compat: &mut Option<nyro_ccswitch_compat::PreparedRequest>,
+) -> Result<
+    crate::provider::anthropic::claude_code::egress::ClaudeCodeWireHook,
+    crate::provider::anthropic::claude_code::egress::InvalidRequest,
+> {
+    use crate::provider::anthropic::claude_code::egress;
+
+    let date = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let input = egress::EgressInput {
+        provider,
+        credential,
+        incoming,
+        caller_scope,
+        date: &date,
+    };
+    if let Some(body) = native_body.as_mut() {
+        return egress::prepare(&input, url, headers, body);
+    }
+    if let Some(prepared) = compat.as_mut()
+        && let Ok(mut body) = serde_json::from_slice::<Value>(&prepared.body)
+    {
+        let hook = egress::prepare(&input, url, headers, &mut body)?;
+        if let Ok(bytes) = serde_json::to_vec(&body) {
+            prepared.body = Bytes::from(bytes);
+        }
+        return Ok(hook);
+    }
+    Ok(egress::ClaudeCodeWireHook::default())
 }
 
 pub(crate) fn error_response(status: u16, message: &str) -> Response {

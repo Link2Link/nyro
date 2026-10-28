@@ -22,6 +22,10 @@ pub use timeouts::{UpstreamReadError, UpstreamTimeoutPhase};
 
 pub const MAX_UPSTREAM_RESPONSE_BODY_BYTES: usize = 128 * 1024 * 1024;
 
+mod egress_hook;
+pub(crate) use egress_hook::EgressHook;
+use egress_hook::RewriteStream;
+
 #[derive(Clone)]
 pub struct ProxyClient {
     pub http: reqwest::Client,
@@ -31,6 +35,10 @@ pub struct ProxyClient {
     /// Extra attempts after a connect failure that happened before the request
     /// was written. Zero preserves the historical single-attempt behavior.
     connect_retries: u8,
+    /// Provider-owned last-mile wire hook (final-body signing, response
+    /// restoration). Applied at this single send boundary so every request
+    /// path — passthrough, IR encode, raw-wire compat — gets it.
+    egress_hook: Option<std::sync::Arc<dyn EgressHook>>,
 }
 
 pub struct ObservedResponse {
@@ -39,6 +47,7 @@ pub struct ObservedResponse {
     timeouts: UpstreamTimeouts,
     deadline: Deadline,
     headers_at: tokio::time::Instant,
+    egress_hook: Option<std::sync::Arc<dyn EgressHook>>,
 }
 impl ObservedResponse {
     pub fn status(&self) -> reqwest::StatusCode {
@@ -56,9 +65,13 @@ impl ObservedResponse {
             self.deadline,
             self.headers_at,
         );
-        match self.performance {
+        let observed = match self.performance {
             Some(attempt) => futures::future::Either::Left(attempt.observe(stream)),
             None => futures::future::Either::Right(stream),
+        };
+        match self.egress_hook.filter(|hook| hook.rewrites_response()) {
+            Some(hook) => futures::future::Either::Left(RewriteStream::new(observed, hook)),
+            None => futures::future::Either::Right(observed),
         }
     }
     pub async fn bytes(self) -> Result<Bytes> {
@@ -104,7 +117,14 @@ impl ProxyClient {
             timeouts: UpstreamTimeouts::default(),
             deadline: Deadline::never(),
             connect_retries: 0,
+            egress_hook: None,
         }
+    }
+
+    /// Install a provider-owned last-mile hook for every call on this client.
+    pub(crate) fn with_egress_hook(mut self, hook: Option<std::sync::Arc<dyn EgressHook>>) -> Self {
+        self.egress_hook = hook;
+        self
     }
 
     pub fn with_timeouts(mut self, timeouts: UpstreamTimeouts) -> Self {
@@ -230,6 +250,10 @@ impl ProxyClient {
         body: Bytes,
     ) -> Result<ObservedResponse> {
         ensure_json_content_type(&mut headers);
+        let body = match &self.egress_hook {
+            Some(hook) => hook.finalize_request_body(body),
+            None => body,
+        };
         if let Some(attempt) = &self.performance {
             attempt.request(&body);
             attempt.request_headers(&headers);
@@ -308,6 +332,7 @@ impl ProxyClient {
             timeouts: self.timeouts,
             deadline: self.deadline.clone(),
             headers_at: tokio::time::Instant::now(),
+            egress_hook: self.egress_hook.clone(),
         })
     }
 
