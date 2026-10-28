@@ -1,4 +1,4 @@
-.PHONY: dev build server server-musl server-slim server-centos7 tools check test test-core test-server fmt fmt-check clean webui smoke smoke-storage release-check help
+.PHONY: dev build server server-musl server-gnu server-slim server-centos7 tools check test test-core test-server fmt fmt-check clean webui smoke smoke-storage release-check help
 
 # Development — start Tauri desktop app with hot reload
 dev: webui-build
@@ -8,15 +8,32 @@ dev: webui-build
 build: webui-build
 	cargo tauri build
 
-# Build server binary only (release, webui embedded)
-server: webui-build
-	cargo build -p nyro-server --release
+# Static musl target for this Linux host (empty on other systems).
+HOST_OS := $(shell uname -s)
+HOST_ARCH := $(shell uname -m | sed -e 's/^arm64$$/aarch64/')
+MUSL_TARGET := $(if $(filter Linux,$(HOST_OS)),$(HOST_ARCH)-unknown-linux-musl)
 
-# Build static musl server binary (release, webui embedded). Runs on any Linux
-# libc; make-docker.sh prefers it. Needs: rustup target add
-# x86_64-unknown-linux-musl, and musl-tools (musl-gcc).
-server-musl: webui-build
-	cargo build -p nyro-server --release --target x86_64-unknown-linux-musl
+# Build server binary (release, webui embedded). On Linux it is statically linked
+# against musl and does not depend on the system C library, so it runs on any
+# Linux (Debian images, CentOS 7, Alpine, iStoreOS); output:
+# target/<arch>-unknown-linux-musl/release/nyro-server. Needs `rustup target add
+# <arch>-unknown-linux-musl` and musl-tools (musl-gcc). Other hosts build natively.
+server: webui-build
+ifneq ($(MUSL_TARGET),)
+	cargo build -p nyro-server --release --target $(MUSL_TARGET)
+else
+	@echo "musl static build is Linux-only; building for $(HOST_OS) natively"
+	cargo build -p nyro-server --release
+endif
+
+# Alias kept for existing scripts and habits.
+server-musl: server
+
+# Build server binary dynamically linked against the system glibc (release,
+# webui embedded); output: target/release/nyro-server. Runs only on hosts whose
+# glibc is at least as new as the build machine's.
+server-gnu: webui-build
+	cargo build -p nyro-server --release
 
 # Build slim server binary (release, no embedded webui, no pnpm build required)
 server-slim:
@@ -84,8 +101,8 @@ help:
 	@echo ""
 	@echo "  make dev          Start Tauri desktop app (dev mode)"
 	@echo "  make build        Build desktop app (release)"
-	@echo "  make server       Build server binary (release, webui embedded)"
-	@echo "  make server-musl  Build static musl server binary (used by make-docker.sh)"
+	@echo "  make server       Build static musl server binary (release, webui embedded)"
+	@echo "  make server-gnu   Build server binary linked against system glibc"
 	@echo "  make server-slim  Build slim server binary (release, no embedded webui)"
 	@echo "  make server-centos7 Build CentOS 7.6 compatible server in Docker"
 	@echo "  make tools        Build nyro-tools binary (release)"

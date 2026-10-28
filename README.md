@@ -275,7 +275,7 @@ For a native x86_64 binary targeting CentOS 7.6 / glibc 2.17, use the containeri
 
 ### Local Docker Image
 
-On a Linux amd64 or arm64 host, build the server and package the resulting binary into a local Docker image and archive:
+On a Linux amd64 or arm64 host, build the server and package the resulting binary into a local Docker image and archive. `make server` produces a binary statically linked against musl (`target/<arch>-unknown-linux-musl/release/nyro-server`) that does not depend on the system C library; use `make server-gnu` for a binary linked against the build host's glibc:
 
 ```bash
 make server

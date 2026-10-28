@@ -274,7 +274,7 @@ chmod +x nyro-server-linux-x86_64
 
 ### 本地 Docker 镜像
 
-在 Linux amd64 或 arm64 主机上，先构建服务端，再把编译结果打包成本地 Docker 镜像和归档文件：
+在 Linux amd64 或 arm64 主机上，先构建服务端，再把编译结果打包成本地 Docker 镜像和归档文件。`make server` 产出静态链接 musl 的二进制（`target/<arch>-unknown-linux-musl/release/nyro-server`），不依赖系统 C 库；需要链接本机 glibc 的版本时用 `make server-gnu`：
 
 ```bash
 make server

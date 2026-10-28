@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 # 以 native 方式本地启动 Nyro,配置语义与 compose.yaml 保持一致:
-#   release 二进制 + .env(NYRO_ADMIN_TOKEN / NYRO_STORAGE_BACKEND / NYRO_LOG_LEVEL)
+#   release 二进制(优先 make server 的 musl 静态版) + .env(NYRO_ADMIN_TOKEN / NYRO_STORAGE_BACKEND / NYRO_LOG_LEVEL)
 #   + 本地持久化数据目录 + 19530/19531 端口,前台运行,Ctrl+C 停止。
 # 数据目录等价于 compose 的 nyro-data 卷,默认 ~/.nyro,可用 NYRO_DATA_DIR 覆盖。
 #
@@ -11,12 +11,26 @@ set -Eeuo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ENV_FILE="${ROOT_DIR}/.env"
-SERVER_BINARY="${ROOT_DIR}/target/release/nyro-server"
 DATA_DIR="${NYRO_DATA_DIR:-${HOME}/.nyro}"
 
 die() {
     echo "error: $*" >&2
     exit 1
+}
+
+# `make server` builds the static musl binary; fall back to a glibc build
+# (`make server-gnu`). NYRO_SERVER_BINARY overrides both.
+pick_server_binary() {
+    local arch="$(uname -m)"
+    [[ "${arch}" == "arm64" ]] && arch="aarch64"
+    local musl="${ROOT_DIR}/target/${arch}-unknown-linux-musl/release/nyro-server"
+    if [[ -n "${NYRO_SERVER_BINARY:-}" ]]; then
+        SERVER_BINARY="${NYRO_SERVER_BINARY}"
+    elif [[ -x "${musl}" ]]; then
+        SERVER_BINARY="${musl}"
+    else
+        SERVER_BINARY="${ROOT_DIR}/target/release/nyro-server"
+    fi
 }
 
 generate_admin_token() {
@@ -74,9 +88,11 @@ env_get() {
 
 cd "${ROOT_DIR}"
 
+pick_server_binary
 if [[ ! -x "${SERVER_BINARY}" ]]; then
     echo "nyro-server binary missing; running 'make server' ..."
     make server
+    pick_server_binary
 fi
 
 ensure_env

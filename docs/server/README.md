@@ -19,6 +19,8 @@ cd <nyro 仓库路径>
 # 2. 构建(debug 或 release 二选一)
 cargo build -p nyro-server               # debug,产物在 target/debug/nyro-server
 # cargo build -p nyro-server --release   # release,产物在 target/release/nyro-server
+# make server                            # release + 内嵌 WebUI,静态链接 musl、不依赖系统 C 库,
+#                                        # 产物在 target/<arch>-unknown-linux-musl/release/nyro-server
 
 # 3. 手动启动(默认 mode=all:代理 19530 + 管理 19531)
 ./target/debug/nyro-server \

@@ -2,9 +2,11 @@
 set -Eeuo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# Prefer the static musl build (`make server-musl`): it does not depend on the
+# Prefer the static musl build (`make server`): it does not depend on the
 # runtime image's glibc and matches the binaries that in-place updates install.
-MUSL_BINARY="${ROOT_DIR}/target/x86_64-unknown-linux-musl/release/nyro-server"
+HOST_ARCH="$(uname -m)"
+[[ "${HOST_ARCH}" == "arm64" ]] && HOST_ARCH="aarch64"
+MUSL_BINARY="${ROOT_DIR}/target/${HOST_ARCH}-unknown-linux-musl/release/nyro-server"
 GNU_BINARY="${ROOT_DIR}/target/release/nyro-server"
 if [[ -n "${NYRO_SERVER_BINARY:-}" ]]; then
     SERVER_BINARY="${NYRO_SERVER_BINARY}"
@@ -89,14 +91,14 @@ ensure_glibc_compatible() {
 
     [[ "${BINARY_DESCRIPTION}" == *"dynamically linked"* ]] || return 0
     command -v objdump >/dev/null 2>&1 \
-        || die "objdump (binutils) is required to check glibc compatibility; or run 'make server-musl' for a static binary"
+        || die "objdump (binutils) is required to check glibc compatibility; or run 'make server' for a static binary"
     required="$(objdump -T "${SERVER_BINARY}" | grep -oE 'GLIBC_[0-9]+(\.[0-9]+)+' | sed 's/^GLIBC_//' | sort -Vu | tail -1)"
     [[ -n "${required}" ]] || return 0
     available="$(docker run --rm --network none --platform "${TARGET_PLATFORM}" --entrypoint ldd \
         "${RUNTIME_IMAGE}" --version 2>/dev/null | head -1 | grep -oE '[0-9]+\.[0-9]+$' || true)"
     [[ -n "${available}" ]] || die "could not determine the glibc version of ${RUNTIME_IMAGE}"
     if [[ "$(printf '%s\n%s\n' "${required}" "${available}" | sort -V | tail -1)" != "${available}" ]]; then
-        die "${SERVER_BINARY} needs glibc ${required} but ${RUNTIME_IMAGE} has ${available}; the container would fail to start. Run 'make server-musl' (static binary) and retry"
+        die "${SERVER_BINARY} needs glibc ${required} but ${RUNTIME_IMAGE} has ${available}; the container would fail to start. Run 'make server' (static binary) and retry"
     fi
     echo "glibc check: binary needs ${required}, ${RUNTIME_IMAGE} has ${available}"
 }
@@ -151,7 +153,7 @@ command -v docker >/dev/null 2>&1 || die "docker is required"
 command -v file >/dev/null 2>&1 || die "file is required"
 docker info >/dev/null 2>&1 || die "the Docker daemon is not available"
 
-[[ -x "${SERVER_BINARY}" ]] || die "${SERVER_BINARY} is missing; run 'make server-musl' first"
+[[ -x "${SERVER_BINARY}" ]] || die "${SERVER_BINARY} is missing; run 'make server' first"
 
 BINARY_DESCRIPTION="$(file -b "${SERVER_BINARY}")"
 case "${BINARY_DESCRIPTION}" in
