@@ -537,7 +537,16 @@ mod tests {
             .static_models_override
             .as_deref()
             .expect("claude-code channel must ship a curated static model list");
+        // Current Claude Code picker leads; older dated ids stay routable.
+        assert_eq!(
+            static_models.first().map(String::as_str),
+            Some("claude-opus-5-5")
+        );
         for expected in [
+            "claude-sonnet-5-5",
+            "claude-fable-5-1",
+            "claude-haiku-5-5",
+            "claude-opus-4-8",
             "claude-opus-4-6",
             "claude-sonnet-4-6",
             "claude-opus-4-5-20251101",

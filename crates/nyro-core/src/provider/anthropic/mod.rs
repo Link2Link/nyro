@@ -61,17 +61,9 @@ const METADATA: VendorMetadata = VendorMetadata {
             api_key: None,
             models_source: Some("ai://models.dev/anthropic"),
             capabilities_source: CapabilitiesSource::ModelsDev("anthropic"),
-            static_models: &[
-                "claude-opus-4-6",
-                "claude-sonnet-4-6",
-                "claude-opus-4-5-20251101",
-                "claude-sonnet-4-5-20250929",
-                "claude-sonnet-4-20250514",
-                "claude-opus-4-1-20250805",
-                "claude-opus-4-20250514",
-                "claude-haiku-4-5-20251001",
-                "claude-3-5-haiku-20241022",
-            ],
+            // Fallback for the per-account served catalog (see
+            // `claude_code::catalog`); mirrors the Claude Code CLI picker.
+            static_models: claude_code::catalog::STATIC_MODELS,
             auth_mode: AuthMode::OAuth,
             oauth: Some(OAuthConfig {
                 auth_base_url: "https://claude.ai",

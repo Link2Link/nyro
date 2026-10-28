@@ -328,6 +328,9 @@ enum UsageBackend {
     Kiro,
     /// Nyro preset: usage forwarded by the remote Nyro (`/v1/nyro/usage`).
     NyroGateway,
+    /// Claude subscription (Pro/Max) via the Claude Code OAuth channel:
+    /// session / weekly windows from `GET /api/oauth/usage`.
+    ClaudeCode,
 }
 
 impl UsageBackend {
@@ -383,6 +386,11 @@ impl UsageBackend {
         // Never infer Kiro credentials from a shared AWS hostname.
         if crate::provider::kiro::is_kiro(provider) {
             return Some(UsageBackend::Kiro);
+        }
+        // Claude subscription: identity only — api.anthropic.com also serves
+        // API-key providers, whose usage this endpoint cannot report.
+        if crate::provider::anthropic::claude_code::egress::is_claude_code_channel(provider) {
+            return Some(UsageBackend::ClaudeCode);
         }
         // Google subscription channels (antigravity = Google AI Pro,
         // gemini-cli = Code Assist) share the Code Assist quota backend.
@@ -477,6 +485,7 @@ impl UsageBackend {
             UsageBackend::Devin => "devin_plan",
             UsageBackend::Kiro => "kiro_plan",
             UsageBackend::NyroGateway => "nyro_gateway",
+            UsageBackend::ClaudeCode => "claude_code_plan",
         }
     }
 
@@ -492,6 +501,7 @@ impl UsageBackend {
                     || tiers.iter().any(|tier| !tier.name.starts_with("feature:"))
             }
             UsageBackend::Grok | UsageBackend::Devin => is_available.is_some() || !tiers.is_empty(),
+            UsageBackend::ClaudeCode => tiers.iter().any(|tier| !tier.name.starts_with("feature:")),
             UsageBackend::Kiro => tiers.iter().any(|tier| !tier.name.starts_with("feature:")),
             // A parsed report is authoritative even when it lists no provider.
             UsageBackend::NyroGateway => true,
@@ -514,6 +524,7 @@ impl UsageBackend {
             | UsageBackend::Devin
             | UsageBackend::Kiro
             | UsageBackend::NyroGateway
+            | UsageBackend::ClaudeCode
             | UsageBackend::GoogleSubscription => "global",
             UsageBackend::ArkCoding | UsageBackend::BailianCodingPlan => "cn",
             // The MiMo console quota surface is account-scoped; the
@@ -2438,9 +2449,9 @@ impl AdminService {
                  Kimi (api.kimi.com), OpenCode Go (opencode.ai/zen), Ark \
                  (volces.com), Bailian token-plan (token-plan.maas.aliyuncs.com), \
                  DeepSeek (api.deepseek.com), Xiaomi MiMo (platform.xiaomimimo.com,
-                 Cookie-authenticated console quota), Devin CLI OAuth, Kiro OAuth and Google \
-                 subscription OAuth (Google AI Pro / Code Assist) and chained Nyro instances \
-                 are supported"
+                 Cookie-authenticated console quota), Devin CLI OAuth, Kiro OAuth, Google \
+                 subscription OAuth (Google AI Pro / Code Assist), Claude subscription OAuth \
+                 (Claude Code) and chained Nyro instances are supported"
             )
         })?;
 
@@ -2451,6 +2462,7 @@ impl AdminService {
                 | UsageBackend::Devin
                 | UsageBackend::Kiro
                 | UsageBackend::GoogleSubscription
+                | UsageBackend::ClaudeCode
         ) {
             None
         } else {
@@ -2914,6 +2926,32 @@ impl AdminService {
                 let (level, tiers, is_available) = parse_grok_billing(&billing);
                 (tiers, Vec::new(), level, is_available, Vec::new())
             }
+            UsageBackend::ClaudeCode => {
+                if provider.effective_auth_mode().trim() != "oauth" {
+                    anyhow::bail!("Claude subscription usage query requires an OAuth provider");
+                }
+                let runtime = self
+                    .resolve_provider_runtime(&provider)
+                    .await
+                    .context("resolve Claude Code OAuth runtime for usage query")?;
+                let client = self.gw.http_client_for_provider(provider.use_proxy).await?;
+                let usage = crate::provider::anthropic::claude_code::usage::fetch_usage(
+                    &client,
+                    runtime.binding.base_url_override.as_deref().unwrap_or(""),
+                    runtime.access_token.trim(),
+                )
+                .await?;
+                let tiers = usage
+                    .windows
+                    .into_iter()
+                    .map(|window| ProviderUsageTier {
+                        name: window.name,
+                        used_percent: window.used_percent,
+                        resets_at: window.resets_at,
+                    })
+                    .collect();
+                (tiers, Vec::new(), None, None, Vec::new())
+            }
             UsageBackend::Devin => {
                 if provider.effective_auth_mode().trim() != "oauth" {
                     anyhow::bail!("Devin usage query requires an OAuth provider");
@@ -3119,6 +3157,7 @@ pub(super) async fn provider_usage_monitorable(admin: &AdminService, provider: &
             | UsageBackend::Devin
             | UsageBackend::Kiro
             | UsageBackend::GoogleSubscription
+            | UsageBackend::ClaudeCode
     ) {
         return provider.effective_auth_mode().trim() == "oauth";
     }

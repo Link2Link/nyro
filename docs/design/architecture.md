@@ -687,7 +687,7 @@ DeepSeek / Moonshot / GLM 等 OpenAI 兼容厂商直接实现 `Vendor`，组合�
 | 厂商 | vendor_id | 特殊处理 |
 |---|---|---|
 | OpenAI | `openai` | channel：`default`、`sub2api`（Responses 中转，API Key）、`codex`（OAuth，`OpenAiCodexChannel`） |
-| Anthropic | `anthropic` | `x-api-key` + `anthropic-version`；含 `claude-code` channel |
+| Anthropic | `anthropic` | `x-api-key` + `anthropic-version`；含 `claude-code` channel（Claude 订阅 OAuth，见 §6.5a；用量后端 `claude_code_plan`） |
 | Google | `google` | default channel：URL 追加 `?key=<api_key>`；含 `antigravity` channel（Google AI Pro 订阅 OAuth，见 6.5）与 `gemini-cli` channel（Gemini CLI / Code Assist 订阅 OAuth，见 6.5） |
 | Vertex AI | `vertexai` | Service Account JSON 存于 api_key，经 `gcp_auth` 换取 access token 后以 Bearer 发送；`{project}` 取自 SA JSON；预设为 `locations/global`；channel：`native`（Gemini）/ `openai`（OpenAI 兼容） |
 | DeepSeek / Moonshot / GLM (zhipuai) / MiniMax / ZAI / OpenRouter / Nvidia / Ollama | 各自 vendor_id | 直接实现 `Vendor`，组合 `openai_*` helpers + `pipeline::*`（见 6.3）；额外 channel：moonshotai / minimax `china`，zhipuai / zai `coding`；MiniMax 在 post_encode 补推理默认值并声明请求 mutation；Ollama 在 pre_request 探测模型能力并剥离不支持的 tools |
@@ -733,6 +733,8 @@ Google 订阅共两条 channel，均经 Code Assist 内部 API（`cloudcode-pa.g
 - **身份**（`identity.rs`）：`metadata.user_id` 为 JSON 字符串 `{"device_id","account_uuid","session_id"}`；`account_uuid` 取 token 响应的 `account.uuid`（OAuth driver 刷新时若响应缺省则沿用旧值），缺失时按 provider 派生确定性 UUID；`device_id` 由 provider + 账号派生（64 hex，稳定）；`session_id` 原生取 `X-Claude-Code-Session-Id`，否则由会话首轮指纹派生（跨轮稳定），同值写入 `X-Claude-Code-Session-Id`。
 - **工具名伪装**（`tool_alias.rs`）：非原生请求的客户端工具改名为 `mcp__<词>_<词>__<词>_<原名>`（HMAC-SHA256 + BIP-39 词表，按 provider + 下游 API Key 稳定，与 CLIProxyAPI 算法逐字一致）；server tool 与已是 `mcp__` 形态的名字不动。响应侧在 `ProxyClient` 的字节流上还原（JSON 整体、SSE 仅 `content_block_start` 行），因此 passthrough、IR 转码、compat 三条响应路径与日志看到的都是原名。
 - **Header**：非原生客户端整体重建（不透传调用方的 `x-stainless-*`/UA 等指纹，也不再发送浏览器专用 Origin/Referer）：CLI UA、`x-app: cli`、`x-stainless-*`（js/node/0.112.1/MacOS/arm64/600）、`anthropic-dangerous-direct-browser-access`、`x-client-request-id`、按请求组装的 `anthropic-beta`（`profile::cloaked_betas`，第一方上游丢弃调用方的受管 beta、转发未知 beta），URL 追加 `?beta=true`。
+- **模型目录**（`catalog.rs`）：与 Claude Code 一致，订阅登录**不调用 `/v1/models`**（CLI 只在网关模式且设置 `CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY` 时才查它），`/model` 选择器来自 CLI 内置目录。`catalog::STATIC_MODELS` 镜像 Claude Code 2.1.312 内置的 `cc` 选择器（main：opus-5-5 / sonnet-5-5 / fable-5-1 / haiku-5-5，其后 overflow），再附 CLIProxyAPI 保留的旧版带日期 id；它即 channel 的 `static_models`，模型发现与「测试模型」原样返回、不请求上游。新版 Claude Code 调整选择器时同步更新该表。手填模型名不受目录限制，照常路由。
+- **用量显示**（`usage.rs`，后端 `claude_code_plan`）：与 Claude Code 的 `/usage` 面板同源，`GET https://api.anthropic.com/api/oauth/usage`（OAuth Bearer + `oauth-2025-04-20`）。`utilization` 已是 0–100 百分比：`five_hour` →「5小时」（当前会话）、`seven_day` →「每周」（全部模型），`seven_day_sonnet` / `seven_day_opus` / `seven_day_oauth_apps` 与 `limits[]` 里 `group:"weekly"` 的按模型限额（如 Fable）→ `feature:<模型>:weekly_limit` 信息行。仅按身份识别（`api.anthropic.com` 也服务 API Key 供应商），OAuth 模式即可监控；5 小时 / 每周主窗口打满时暂停调度，按模型行只展示。该接口对频繁请求返回 429，报错文案提示稍后重试。
 - **未移植**：uTLS ClientHello 与 HTTP/1.1 header 顺序/大小写（reqwest/rustls 不可控）、`diagnostics`/`cc_prev_req` 等需要跨请求连续状态的字段、按会话固定 currentDate、敏感词混淆、strict/cloak mode 配置项、thread 别名存储。
 
 ### 6.6 OpenCode Go（opencode.ai/zen/go）通道

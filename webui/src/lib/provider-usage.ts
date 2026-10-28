@@ -71,6 +71,12 @@ export function providerUsageSupported(
       provider.channel?.toLowerCase() === "gemini-cli");
   const isImportedGoogleOAuth =
     provider.auth_mode === "oauth" && url.includes("cloudcode-pa.googleapis.com");
+  // Claude subscription: identity only — api.anthropic.com also serves
+  // API-key providers (mirrors `UsageBackend::detect`).
+  const isClaudeCodeOAuth =
+    provider.auth_mode === "oauth" &&
+    provider.channel?.toLowerCase() === "claude-code" &&
+    vendor === "anthropic";
   // Native subscription providers are recognised by identity, not a shared
   // Codeium/AWS host (mirrors `UsageBackend::detect`).
   const isNativeOAuth = provider.auth_mode === "oauth" && nativeProviderProtocol(provider) !== null;
@@ -85,6 +91,7 @@ export function providerUsageSupported(
     isImportedGrokOAuth ||
     isGoogleOAuth ||
     isImportedGoogleOAuth ||
+    isClaudeCodeOAuth ||
     isNativeOAuth ||
     url.includes("bigmodel.cn") ||
     url.includes("z.ai") ||
@@ -119,6 +126,7 @@ export function providerUsageTitle(kind: string | undefined, isZh: boolean): str
   if (kind === "devin_plan") return isZh ? "Devin 用量" : "Devin Usage";
   if (kind === "kiro_plan") return isZh ? "Kiro 用量" : "Kiro Usage";
   if (kind === "google_subscription") return isZh ? "Google AI Pro 配额" : "Google AI Pro Quota";
+  if (kind === "claude_code_plan") return isZh ? "Claude 订阅用量" : "Claude Subscription Usage";
   if (kind === "nyro_gateway") return isZh ? "上游 Nyro 用量" : "Upstream Nyro Usage";
   return isZh ? "套餐用量" : "Plan Usage";
 }

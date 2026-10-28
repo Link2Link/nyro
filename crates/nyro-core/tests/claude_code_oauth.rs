@@ -58,6 +58,27 @@ async fn start_upstream() -> (String, Arc<Mutex<Vec<Captured>>>) {
                     return;
                 };
                 let body: Value = serde_json::from_slice(&request.raw_body).unwrap_or(Value::Null);
+                // Claude subscription usage (`/api/oauth/usage`, as Claude Code reads it).
+                if request.line.starts_with("GET /api/oauth/usage ") {
+                    let usage = json!({
+                        "five_hour": {"utilization": 42.0, "resets_at": "2099-01-01T05:00:00Z"},
+                        "seven_day": {"utilization": 18.0, "resets_at": "2099-01-07T00:00:00Z"},
+                        "seven_day_sonnet": {"utilization": 6.0, "resets_at": "2099-01-07T00:00:00Z"},
+                        "seven_day_opus": null,
+                        "limits": [{"kind": "weekly_scoped", "group": "weekly", "percent": 33,
+                            "resets_at": "2099-01-07T00:00:00Z", "severity": "normal", "is_active": true,
+                            "scope": {"model": {"display_name": "Fable"}}}]
+                    })
+                    .to_string();
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{usage}",
+                        usage.len()
+                    );
+                    sink.lock().unwrap().push(request);
+                    let _ = socket.write_all(response.as_bytes()).await;
+                    let _ = socket.shutdown().await;
+                    return;
+                }
                 sink.lock().unwrap().push(request);
                 let tool = body["tools"][0]["name"]
                     .as_str()
@@ -343,6 +364,88 @@ async fn third_party_anthropic_client_is_cloaked_signed_and_restored() {
     let reply: Value = serde_json::from_str(&wire).unwrap();
     assert_eq!(reply["content"][0]["name"], "bash", "{wire}");
     assert!(!wire.contains("mcp__"), "{wire}");
+}
+
+async fn provider_id(gw: &Gateway) -> String {
+    gw.admin()
+        .list_providers()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|p| p.channel.as_deref() == Some("claude-code"))
+        .unwrap()
+        .id
+}
+
+#[tokio::test]
+async fn subscription_usage_reads_the_claude_code_usage_endpoint() {
+    let (url, captured) = start_upstream().await;
+    let (_dir, gw) = setup(&url).await;
+    let id = provider_id(&gw).await;
+
+    let usage = gw.admin().get_provider_usage(&id).await.unwrap();
+    assert_eq!(usage.kind, "claude_code_plan");
+    let tiers: Vec<(&str, f64)> = usage
+        .tiers
+        .iter()
+        .map(|tier| (tier.name.as_str(), tier.used_percent))
+        .collect();
+    assert_eq!(
+        tiers,
+        [
+            ("five_hour", 42.0),
+            ("weekly_limit", 18.0),
+            ("feature:sonnet:weekly_limit", 6.0),
+            ("feature:fable:weekly_limit", 33.0),
+        ]
+    );
+    assert_eq!(
+        usage.tiers[0].resets_at.as_deref(),
+        Some("2099-01-01T05:00:00Z")
+    );
+
+    let request = captured.lock().unwrap()[0].clone();
+    assert!(
+        request.line.starts_with("GET /api/oauth/usage "),
+        "{}",
+        request.line
+    );
+    assert_eq!(
+        request.header("authorization"),
+        Some("Bearer sk-ant-oat01-fixture")
+    );
+    assert_eq!(request.header("anthropic-beta"), Some("oauth-2025-04-20"));
+}
+
+#[tokio::test]
+async fn model_discovery_returns_the_built_in_claude_code_catalog() {
+    let (url, captured) = start_upstream().await;
+    let (_dir, gw) = setup(&url).await;
+    let id = provider_id(&gw).await;
+
+    // Claude Code's `/model` picker comes from its compiled catalog; nyro
+    // mirrors it and asks nothing upstream for discovery.
+    for models in [
+        gw.admin().get_provider_models(&id).await.unwrap(),
+        gw.admin().test_provider_models(&id).await.unwrap(),
+    ] {
+        assert_eq!(
+            &models[..4],
+            &[
+                "claude-opus-5-5",
+                "claude-sonnet-5-5",
+                "claude-fable-5-1",
+                "claude-haiku-5-5"
+            ],
+            "{models:?}"
+        );
+        assert!(models.iter().any(|m| m == "claude-opus-4-8"));
+        assert!(models.iter().any(|m| m == "claude-3-5-haiku-20241022"));
+    }
+    assert!(
+        captured.lock().unwrap().is_empty(),
+        "discovery must not call upstream"
+    );
 }
 
 #[tokio::test]

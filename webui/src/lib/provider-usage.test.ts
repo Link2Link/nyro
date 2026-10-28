@@ -14,6 +14,18 @@ test("Kiro usage requires OAuth identity, not an Amazon Q URL alone", () => {
   equal(providerUsageSupported({ ...kiro, vendor: "devin", preset_key: "devin" }), true);
 });
 
+test("Claude subscription usage needs the Claude Code OAuth identity, not the API host", () => {
+  const claude = { vendor: "anthropic", preset_key: "anthropic", channel: "claude-code", auth_mode: "oauth" as const, base_url: "https://api.anthropic.com" };
+  equal(providerUsageSupported(claude), true);
+  equal(providerUsageSupported({ ...claude, channel: "Claude-Code" }), true);
+  equal(providerUsageSupported({ ...claude, auth_mode: "apikey" }), false);
+  equal(providerUsageSupported({ ...claude, channel: "default", auth_mode: "apikey" }), false);
+  equal(providerUsageTitle("claude_code_plan", false), "Claude Subscription Usage");
+  equal(providerUsageTitle("claude_code_plan", true), "Claude 订阅用量");
+  equal(tierLabel("feature:sonnet:weekly_limit", false), "Sonnet · Weekly");
+  equal(tierLabel("feature:fable:weekly_limit", true), "Fable · 每周");
+});
+
 test("Kiro plan title and quota breakdown labels are readable in both locales", () => {
   equal(providerUsageTitle("kiro_plan", false), "Kiro Usage");
   equal(providerUsageTitle("kiro_plan", true), "Kiro 用量");
