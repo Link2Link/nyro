@@ -4,6 +4,28 @@ Nyro 的所有重要变更均记录在此文件中。
 
 ---
 
+## v2.1.4
+
+> 发布于 2026-10-28
+
+#### 新功能
+
+- **Claude Code 订阅通道伪装**：Anthropic `claude-code` OAuth 通道按 Claude Code CLI 2.1.280 的形态发出请求，移植自 CLIProxyAPI 的 Claude executor
+  - 真正的 Claude Code 客户端（`x-app: cli`、`claude-cli/…` UA、`claude-code-20250219` beta 与 2.1.220+ 形态的 `metadata.user_id`）保留自身请求体和身份头，不再被运行时的固定 User-Agent 覆盖；只补上与凭证相关的部分：OAuth / extended-cache-ttl beta、按所选账号重建的 `metadata.user_id`、`cch` 计费签名
+  - 其他客户端整体伪装：顶层 `system` 只保留计费头和 Claude Code 身份声明，调用方的 system prompt 移入对话中的 `role: system` 轮（旧模型放入 `<system-reminder>`）；补充 `currentDate` 提示，去掉 Anthropic 会拒绝的采样参数，强制 `tool_choice` 时关闭 thinking，补充 `context_management`，缓存断点按 CLI 规则布置（最多 4 个，1h TTL）
+  - 计费头携带 `cc_version` 指纹与 `cch` 签名（xxHash64，在发送边界对实际发出的字节计算，重试与回放同样签名）；已对照 CLIProxyAPI 的已知向量及其 Go 实现验证
+  - 客户端工具名以稳定的 `mcp__<词>_<词>__<词>_<原名>` 别名发送，并在所有响应路径的 JSON 与 SSE 响应中还原
+  - 请求头按 CLI 指纹重建，`anthropic-beta` 按请求逐个组装，URL 追加 `?beta=true`
+  - 管理端模型探测与真实流量发出同样的请求
+
+#### 改进
+
+- **Claude Code OAuth 身份**：刷新 token 时若响应未带账号与组织信息则沿用已保存的值；推理请求不再发送浏览器专用的 Origin / Referer
+
+> **行为变更**：对于非真正 Claude Code 的客户端，`claude-code` 通道不再把你的 system prompt 放在顶层 `system` 字段里，而是按上文移入对话。
+
+---
+
 ## v2.1.3
 
 > 发布于 2026-10-28

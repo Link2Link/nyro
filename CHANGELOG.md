@@ -4,6 +4,28 @@ All notable changes to Nyro will be documented in this file.
 
 ---
 
+## v2.1.4
+
+> Released on 2026-10-28
+
+#### Features
+
+- **Claude Code subscription channel disguise**: the Anthropic `claude-code` OAuth channel now sends requests in the shape of Claude Code CLI 2.1.280, ported from CLIProxyAPI's Claude executor
+  - Genuine Claude Code clients (`x-app: cli`, a `claude-cli/…` UA, the `claude-code-20250219` beta and a 2.1.220+ `metadata.user_id`) keep their own body and identity headers, which the runtime's fixed User-Agent no longer overwrites. Only the credential-scoped parts are added: the OAuth / extended-cache-ttl betas, a `metadata.user_id` rebound to the selected account, and the `cch` billing signature
+  - Other clients are cloaked: the top-level `system` holds only the billing header and the Claude Code identity line, and the caller's system prompt moves into a mid-conversation `role: system` turn (or a `<system-reminder>` on older models). A `currentDate` reminder is added, sampling knobs Anthropic rejects are dropped, thinking is disabled under a forced `tool_choice`, `context_management` is filled in, and cache breakpoints follow the CLI layout (at most 4, 1h TTL)
+  - The billing header carries the `cc_version` fingerprint and a `cch` xxHash64 attestation computed over the exact bytes sent at the transport boundary, so retries and replays are signed too; verified against CLIProxyAPI's known vectors and its Go implementation
+  - Client tool names are sent as stable `mcp__<word>_<word>__<word>_<name>` aliases and restored in JSON and SSE responses on every response path
+  - Headers are rebuilt with the CLI profile and a per-request `anthropic-beta` list, and the URL gains `?beta=true`
+  - The admin model probe sends the same wire shape as live traffic
+
+#### Improvements
+
+- **Claude Code OAuth identity**: refreshing a token keeps the stored account and organization identity when the token response omits them; inference no longer sends the browser-only Origin / Referer headers
+
+> **Behavior change**: for clients other than genuine Claude Code, the `claude-code` channel no longer sends your system prompt in the top-level `system` field. It is moved into the conversation as described above.
+
+---
+
 ## v2.1.3
 
 > Released on 2026-10-28
