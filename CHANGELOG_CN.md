@@ -4,6 +4,30 @@ Nyro 的所有重要变更均记录在此文件中。
 
 ---
 
+## v2.1.3
+
+> 发布于 2026-10-28
+
+#### 新功能
+
+- **nyro-server 在线一键更新**：新增 core 更新模块，使用内置且运行时不可替换的 minisign 公钥校验签名清单，下载后校验大小、sha256 并执行 `--version` 冒烟测试，版本只升不降地安装至数据卷 `upgrade/versions`；启动时自动交接到已安装的更新版本，镜像版本更新时清理过期升级，更新后排空在途请求再 `exec` 重启。新增 `system/version` 与 `system/update/{check,apply,status}` 管理接口、`--self-update` / `--update-check` / `--update-manifest-url` 启动参数、设置页版本更新卡片与进度以及侧边栏新版本提示；发布流程新增 musl 静态构建与签名的 `nyro-server-update.json`
+- **Nyro 实例级联与用量转发**：新增 `nyro-gateway` 预设，四协议共享 Key 直通对端 Nyro；代理新增 `GET /v1/nyro/usage` 用量转发端点，按 Key 路由范围过滤、非特权 Key 脱敏金额、拒绝匿名请求，且仅转发一跳防止回环；60 秒用量快照在凭据变更时失效，全部上游暂停时才暂停本地调度。WebUI 新增 Nyro 地址字段与上游用量展示，DSH 用量面板展示转发的上游供应商卡片
+- **DSH Nyro 用量插件多网关支持**：新增 `instances` 网关列表配置，顶层配置保留为主网关；路由按网关分别缓存与返回，单个网关失败不影响其他网关，面板按网关分组、独立刷新并分别保存卡片排序。设置卡支持增删改与停用网关，保存时只写改动字段以保留已存 token
+
+#### 改进
+
+- **server 默认 musl 静态构建**：`make server` 在 Linux 上编译 musl 静态二进制，按主机架构选择目标（支持 arm64），非 Linux 主机回退为原生编译；`make server-gnu` 保留 glibc 动态链接版，`server-musl` 保留为别名；`start-local.sh` 优先使用 musl 二进制
+- **镜像构建基础镜像拉取**：构建前预拉取运行时基础镜像，Docker Hub 失败时依次回退国内镜像源（可通过 `NYRO_DOCKER_MIRRORS` 配置），`RUNTIME_IMAGE` 透传为 Dockerfile 构建参数
+
+#### 修复
+
+- **镜像 glibc 不兼容导致崩溃**：`make-docker.sh` 默认打包 musl 静态二进制，支持 `NYRO_SERVER_BINARY` 指定二进制，打包前校验其 glibc 版本与底座镜像兼容，不兼容时提前报错且不覆盖旧镜像包
+- **未发布更新清单时误报网络错误**：清单返回 404 时改报 `UPDATE_NOT_PUBLISHED`（管理接口返回 404），设置页按错误码而非文案识别，改为中性提示不再标红报错
+- **用量转发遗漏 fallback provider**：从 backend store 解析路由全部目标，补全权重副目标与 fallback 归属，先快照路由避免跨查询持有缓存锁，加载 backend 失败时记录警告
+- **DSH 用量插件设置**：修复保存后不实时生效与批量保存请求格式错误
+
+---
+
 ## v2.1.2
 
 > 发布于 2026-10-27

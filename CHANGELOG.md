@@ -4,6 +4,30 @@ All notable changes to Nyro will be documented in this file.
 
 ---
 
+## v2.1.3
+
+> Released on 2026-10-28
+
+#### Features
+
+- **nyro-server in-place updates**: a new core update module verifies minisign-signed release manifests against a built-in public key that cannot be replaced at runtime, checks size, sha256 and a `--version` smoke test after download, and installs versions forward-only under the data volume's `upgrade/versions`; the server hands off to an installed newer version at startup, prunes stale upgrades when the image version moves ahead, and drains in-flight requests before an `exec` restart. Adds `system/version` and `system/update/{check,apply,status}` admin APIs, `--self-update` / `--update-check` / `--update-manifest-url` startup flags, a Settings update card with progress and a sidebar new-version hint; the release workflow now builds static musl server binaries and publishes a signed `nyro-server-update.json`
+- **Nyro gateway cascading and usage forwarding**: a new `nyro-gateway` preset passes the shared key straight through to a peer Nyro across all four protocols; the proxy exposes `GET /v1/nyro/usage`, filtered by the key's route scope with amounts redacted for non-privileged keys, anonymous requests rejected and forwarding limited to one hop to prevent loops; 60-second usage snapshots are invalidated on credential changes, and local scheduling pauses only when every upstream is paused. The WebUI gains a Nyro address field and upstream usage display, and the DSH usage panel shows forwarded upstream provider cards
+- **Multi-gateway DSH Nyro usage plugin**: an `instances` list configures several gateways while the top-level settings remain the primary gateway; routes cache and respond per gateway, one failing gateway does not affect the others, and the panel groups, refreshes and orders cards per gateway. The settings card adds, edits and disables gateways and saves only changed fields so stored tokens are preserved
+
+#### Improvements
+
+- **Static musl server builds by default**: `make server` builds a static musl binary on Linux, choosing the target by host architecture (arm64 included) and falling back to a native build on other hosts; `make server-gnu` keeps the dynamically linked glibc build and `server-musl` remains an alias; `start-local.sh` prefers the musl binary
+- **Docker base-image pulls**: pre-pull the runtime base image before building, fall back through domestic mirrors when Docker Hub fails (configurable via `NYRO_DOCKER_MIRRORS`), and pass `RUNTIME_IMAGE` through as a Dockerfile build argument
+
+#### Fixes
+
+- **Docker image glibc crash**: `make-docker.sh` packages the static musl binary by default, accepts `NYRO_SERVER_BINARY` to override it, and checks the binary's glibc requirement against the base image before packaging, failing early without overwriting the previous image bundle
+- **Update check without a published manifest**: a 404 manifest now reports `UPDATE_NOT_PUBLISHED` (HTTP 404 from the admin API) instead of a network error, and the Settings page shows a neutral notice keyed on the error code rather than message text
+- **Usage forwarding missed fallback providers**: resolve every route target from the backend store, including weighted secondary and fallback targets, snapshot routes to avoid holding the cache lock across queries, and log a warning when backends fail to load
+- **DSH usage plugin settings**: changes take effect immediately after saving, and batch saves send the correct request format
+
+---
+
 ## v2.1.2
 
 > Released on 2026-10-27
