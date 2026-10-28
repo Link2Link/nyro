@@ -7,9 +7,13 @@ interface BackendOptions {
 }
 
 export class BackendHTTPError extends Error {
-  constructor(message: string, readonly status: number) {
+  /** Stable machine-readable error code, when the endpoint provides one. */
+  readonly code?: string;
+
+  constructor(message: string, readonly status: number, code?: string) {
     super(message);
     this.name = "BackendHTTPError";
+    this.code = code;
   }
 }
 
@@ -60,7 +64,11 @@ async function invokeHTTP<T>(cmd: string, args?: Record<string, unknown>, option
 
   if (!resp.ok) {
     const body = await resp.json().catch(() => ({}));
-    throw new BackendHTTPError(body.error || `HTTP ${resp.status}`, resp.status);
+    throw new BackendHTTPError(
+      body.error || `HTTP ${resp.status}`,
+      resp.status,
+      typeof body.code === "string" ? body.code : undefined,
+    );
   }
   const text = await resp.text();
   if (!text) return {} as T;

@@ -73,7 +73,7 @@ cp nyro-update.pub crates/nyro-core/src/update/release.pub
 gh secret set NYRO_UPDATE_SIGNING_KEY < nyro-update.key
 ```
 
-Keep `nyro-update.key` offline. The workflow verifies every signature against `release.pub` and fails the release if they do not match, so a wrong secret cannot publish a manifest that instances would reject. Without the secret, the release still publishes, with a warning, but running instances will not be offered it.
+Keep `nyro-update.key` offline. The workflow verifies every signature against `release.pub` and fails the release if they do not match, so a wrong secret cannot publish a manifest that instances would reject. Without the secret, the release still publishes, with a warning, but running instances will not be offered it. While the latest release has no manifest (for example, releases published before self-update existed), **Settings → Updates** reports that no in-place update is published yet instead of an error.
 
 Rotating the key requires shipping a release that contains the new `release.pub`, signed with the **old** key. Instances on older versions only trust the old key.
 

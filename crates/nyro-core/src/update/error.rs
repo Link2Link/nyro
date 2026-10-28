@@ -16,6 +16,10 @@ pub enum UpdateError {
     NotNewer(String),
     #[error("release {version} has no binary for platform {platform}")]
     NoAsset { version: String, platform: String },
+    /// The release channel has no signed manifest (HTTP 404), e.g. the latest
+    /// release predates self-update or was published without a signing key.
+    #[error("no installable update has been published yet")]
+    NotPublished,
     #[error("failed to fetch update: {0}")]
     Fetch(String),
     #[error(transparent)]
@@ -33,6 +37,7 @@ impl UpdateError {
             Self::VersionMismatch { .. } => "UPDATE_VERSION_MISMATCH",
             Self::NotNewer(_) => "UPDATE_NOT_NEWER",
             Self::NoAsset { .. } => "UPDATE_NO_ASSET",
+            Self::NotPublished => "UPDATE_NOT_PUBLISHED",
             Self::Fetch(_) => "UPDATE_FETCH_FAILED",
             Self::Internal(_) => "UPDATE_INTERNAL",
         }

@@ -112,10 +112,30 @@ export function selfUpdateBlockReason(
   return null;
 }
 
+/** Returned when the latest release carries no signed update manifest yet. */
+export const UPDATE_NOT_PUBLISHED = "UPDATE_NOT_PUBLISHED";
+
+/** Machine-readable code of an update API error, if any. */
+export function updateErrorCode(error: unknown): string | undefined {
+  if (error && typeof error === "object" && "code" in error) {
+    const code = (error as { code?: unknown }).code;
+    if (typeof code === "string") return code;
+  }
+  return undefined;
+}
+
+/** Neutral notice shown instead of an error when nothing is published yet. */
+export function notPublishedNotice(isZh: boolean): string {
+  return isZh
+    ? "当前最新发布版本尚未提供在线更新包，发布带在线更新的新版本后即可在此一键更新。"
+    : "The latest release does not offer an in-place update yet. New versions published with update support will appear here.";
+}
+
 /** Localize the update API's English error messages. */
 export function localizeUpdateError(message: string, isZh: boolean): string {
   if (!isZh) return message;
   const prefixes: [string, string][] = [
+    ["no installable update has been published yet", "当前最新发布版本尚未提供在线更新包"],
     ["failed to fetch update", "无法获取更新信息，请检查网络或代理设置"],
     ["update verification failed", "更新校验失败"],
     ["invalid update manifest", "更新清单无效"],

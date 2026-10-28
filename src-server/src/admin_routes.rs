@@ -1474,6 +1474,7 @@ async fn update_status_handler(updater: Updater) -> axum::response::Response {
 fn update_err(error: UpdateError) -> axum::response::Response {
     let status = match &error {
         UpdateError::Unsupported(_) | UpdateError::NoAsset { .. } => StatusCode::BAD_REQUEST,
+        UpdateError::NotPublished => StatusCode::NOT_FOUND,
         UpdateError::Busy | UpdateError::VersionMismatch { .. } | UpdateError::NotNewer(_) => {
             StatusCode::CONFLICT
         }

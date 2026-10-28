@@ -363,6 +363,9 @@ impl UpdateService {
             .send()
             .await
             .map_err(|error| UpdateError::Fetch(error.to_string()))?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Err(UpdateError::NotPublished);
+        }
         if !response.status().is_success() {
             return Err(UpdateError::Fetch(format!(
                 "release manifest returned HTTP {}",
@@ -739,6 +742,22 @@ mod tests {
             offline.check(false).await,
             Err(UpdateError::Unsupported(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn missing_manifest_is_reported_as_not_published() {
+        let dir = tempfile::tempdir().unwrap();
+        let url = serve(TEST_BINARY.to_vec()).await;
+        // Same host, but a release without the signed manifest asset.
+        let missing = url.replace("nyro-server-update.json", "absent.json");
+        let service = make_service(dir.path(), missing, "2.1.2");
+        let error = service.check(true).await.unwrap_err();
+        assert_eq!(error.code(), "UPDATE_NOT_PUBLISHED", "{error}");
+        assert!(matches!(
+            service.apply("9.9.9").await,
+            Err(UpdateError::NotPublished)
+        ));
+        assert_eq!(service.job().phase, UpdatePhase::Idle);
     }
 
     #[tokio::test]

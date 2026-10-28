@@ -5,9 +5,12 @@ import {
   formatReleaseDate,
   isJobActive,
   localizeUpdateError,
+  notPublishedNotice,
   phaseLabel,
   progressPercent,
   selfUpdateBlockReason,
+  UPDATE_NOT_PUBLISHED,
+  updateErrorCode,
   type VersionInfo,
 } from "./update";
 
@@ -66,6 +69,20 @@ test("block reason explains why in-place install is unavailable", () => {
 
   const noAsset = { asset_available: false, platform: "linux-riscv64" };
   equal(selfUpdateBlockReason(supported, noAsset, false)?.includes("linux-riscv64"), true);
+});
+
+test("unpublished manifest is recognized by code, not by message text", () => {
+  equal(updateErrorCode({ code: UPDATE_NOT_PUBLISHED, message: "x" }), UPDATE_NOT_PUBLISHED);
+  equal(updateErrorCode(Object.assign(new Error("boom"), { code: "UPDATE_FETCH_FAILED" })), "UPDATE_FETCH_FAILED");
+  equal(updateErrorCode(new Error("release manifest returned HTTP 404")), undefined);
+  equal(updateErrorCode({ code: 404 }), undefined);
+  equal(updateErrorCode(null), undefined);
+  equal(notPublishedNotice(false).startsWith("The latest release does not offer"), true);
+  equal(notPublishedNotice(true).includes("网络"), false);
+  equal(
+    localizeUpdateError("no installable update has been published yet", true),
+    "当前最新发布版本尚未提供在线更新包",
+  );
 });
 
 test("update errors stay English by default and localize known prefixes", () => {

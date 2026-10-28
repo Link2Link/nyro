@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
-import { CheckCircle2, Download, ExternalLink, Loader2, RefreshCw, TriangleAlert } from "lucide-react";
+import { CheckCircle2, Download, ExternalLink, Info, Loader2, RefreshCw, TriangleAlert } from "lucide-react";
 import { backend } from "@/lib/backend";
 import { openExternalUrl } from "@/lib/open-external";
 import {
@@ -10,7 +10,10 @@ import {
   localizeUpdateError,
   phaseLabel,
   progressPercent,
+  notPublishedNotice,
   selfUpdateBlockReason,
+  UPDATE_NOT_PUBLISHED,
+  updateErrorCode,
   type UpdateCheck,
   type UpdateJob,
   type VersionInfo,
@@ -91,7 +94,7 @@ export function UpdateCard({ isZh }: { isZh: boolean }) {
   const checkQuery = useUpdateCheck();
   const check = checkQuery.data;
   const [checking, setChecking] = useState(false);
-  const [checkError, setCheckError] = useState<string | null>(null);
+  const [checkError, setCheckError] = useState<unknown>(null);
   const [confirmOpen, setConfirmOpen] = useState(false);
   const [target, setTarget] = useState<string | null>(null);
   const [flowError, setFlowError] = useState<string | null>(null);
@@ -127,7 +130,10 @@ export function UpdateCard({ isZh }: { isZh: boolean }) {
       const fresh = await backend<UpdateCheck>("check_system_update", { force: true });
       qc.setQueryData(UPDATE_CHECK_KEY, fresh);
     } catch (error) {
-      setCheckError(localizeUpdateError(errorMessage(error), isZh));
+      if (updateErrorCode(error) === UPDATE_NOT_PUBLISHED) {
+        qc.removeQueries({ queryKey: UPDATE_CHECK_KEY });
+      }
+      setCheckError(error);
     } finally {
       setChecking(false);
     }
@@ -151,9 +157,11 @@ export function UpdateCard({ isZh }: { isZh: boolean }) {
   const following = target !== null;
   const blockReason = selfUpdateBlockReason(info, check, isZh);
   const percent = job ? progressPercent(job) : null;
+  const failure = checkError ?? checkQuery.error ?? null;
+  // A release without a signed manifest is not a failure; show it neutrally.
+  const notPublished = !check && updateErrorCode(failure) === UPDATE_NOT_PUBLISHED;
   const queryError =
-    checkError ??
-    (checkQuery.error ? localizeUpdateError(errorMessage(checkQuery.error), isZh) : null);
+    failure && !notPublished ? localizeUpdateError(errorMessage(failure), isZh) : null;
   const releaseUrl = check?.release_url ?? RELEASES_URL;
 
   return (
@@ -206,6 +214,13 @@ export function UpdateCard({ isZh }: { isZh: boolean }) {
         <p role="alert" className="flex items-start gap-1.5 text-sm text-red-600">
           <TriangleAlert className="mt-0.5 h-4 w-4 shrink-0" />
           {queryError}
+        </p>
+      )}
+
+      {notPublished && !following && (
+        <p className="flex items-start gap-1.5 text-sm text-slate-500">
+          <Info className="mt-0.5 h-4 w-4 shrink-0" />
+          {notPublishedNotice(isZh)}
         </p>
       )}
 

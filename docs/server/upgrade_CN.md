@@ -73,7 +73,7 @@ cp nyro-update.pub crates/nyro-core/src/update/release.pub
 gh secret set NYRO_UPDATE_SIGNING_KEY < nyro-update.key
 ```
 
-`nyro-update.key` 请离线保管。工作流每次都会用 `release.pub` 验证签名，对不上就让发布失败，所以 Secret 配错了也不会发出实例无法验证的清单。如果没有配置 Secret，发布仍会完成并给出警告，但运行中的实例收不到这个版本。
+`nyro-update.key` 请离线保管。工作流每次都会用 `release.pub` 验证签名，对不上就让发布失败，所以 Secret 配错了也不会发出实例无法验证的清单。如果没有配置 Secret，发布仍会完成并给出警告，但运行中的实例收不到这个版本。最新 Release 没有清单时（例如在线更新功能上线之前发布的版本），**设置 → 版本更新** 会提示尚未发布在线更新包，而不是显示报错。
 
 更换密钥时，需要先发布一个包含新 `release.pub` 的版本，并用**旧**密钥签名，因为旧版本实例只信任旧密钥。
 

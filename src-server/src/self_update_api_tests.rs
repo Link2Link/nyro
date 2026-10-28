@@ -103,6 +103,34 @@ async fn version_and_status_report_updater_state() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn release_without_manifest_is_not_published_not_a_network_error() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let gw = gateway(&dir).await?;
+    // A release host that answers 404 for the manifest (release predates it).
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, Router::new()).await;
+    });
+    let mut options = UpdateOptions::new(gw.config.data_dir.clone());
+    options.manifest_url = format!("http://{addr}/nyro-server-update.json");
+    let updater = UpdateService::new(gw.storage.clone(), options)?;
+    let router = create_router_with_updater(gw, Some("test-admin".into()), Some(updater));
+
+    let (status, body) = call(
+        &router,
+        "GET",
+        "/api/v1/system/update/check?force=true",
+        None,
+        true,
+    )
+    .await?;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body["code"], "UPDATE_NOT_PUBLISHED");
+    Ok(())
+}
+
+#[tokio::test]
 async fn disabled_or_missing_updater_rejects_apply() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let gw = gateway(&dir).await?;
