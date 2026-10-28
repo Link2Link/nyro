@@ -76,7 +76,10 @@ const METADATA: VendorMetadata = VendorMetadata {
             oauth: Some(OAuthConfig {
                 auth_base_url: "https://claude.ai",
                 authorize_url: "https://claude.ai/oauth/authorize",
-                token_url: "https://console.anthropic.com/v1/oauth/token",
+                // Code exchange and refresh both live here (Claude Code
+                // 2.1.220+). The former console.anthropic.com host now
+                // answers 404 `not_found_error` for both grants.
+                token_url: "https://platform.claude.com/v1/oauth/token",
                 client_id: "9d1c250a-e61b-44d9-88ed-5944d1962f5e",
                 redirect_uri: "https://platform.claude.com/oauth/code/callback",
                 scope: "user:inference user:profile",

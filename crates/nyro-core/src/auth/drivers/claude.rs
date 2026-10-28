@@ -430,7 +430,11 @@ mod tests {
         let config = ClaudeOAuthDriver::claude_code_config().unwrap();
         assert_eq!(config.oauth.auth_base_url, "https://claude.ai");
         assert!(config.oauth.authorize_url.contains("claude.ai"));
-        assert!(config.oauth.token_url.contains("anthropic.com"));
+        // console.anthropic.com retired the token endpoint (HTTP 404).
+        assert_eq!(
+            config.oauth.token_url,
+            "https://platform.claude.com/v1/oauth/token"
+        );
         assert_eq!(config.api_base_url, "https://api.anthropic.com");
     }
 
