@@ -634,7 +634,25 @@ async fn handle_buffered_compat(
         // nonstandard upstream bodies normalized); other clients keep the
         // upstream body as-is. Retryability is decided by the outer loop's
         // `is_retryable(status)`.
-        let health_outcome = health_outcome_from_status(metadata.status);
+        // An entitlement refusal (Anthropic `credits_required`) is
+        // request-scoped: it must not count against provider health.
+        let entitlement =
+            crate::provider::anthropic::claude_code::errors::entitlement_refusal_bytes(
+                metadata.status,
+                &body,
+            )
+            .is_some();
+        let health_outcome = if entitlement {
+            HealthOutcome::Neutral
+        } else {
+            health_outcome_from_status(metadata.status)
+        };
+        let tag = |mut response: Response| {
+            if entitlement {
+                response.extensions_mut().insert(super::EntitlementRefusal);
+            }
+            response
+        };
         if let Some(client_body) = codex_ingress_error_body(
             session,
             call_ctx,
@@ -657,16 +675,16 @@ async fn handle_buffered_compat(
                 )
                 .emit();
             return CompatAttempt {
-                response: build_compat_response(
+                response: tag(build_compat_response(
                     metadata.rebuilt("application/json"),
                     Body::from(client_body),
-                ),
+                )),
                 retry: RetryDisposition::DefaultStatusPolicy,
                 health: health_outcome,
             };
         }
         return CompatAttempt {
-            response: build_compat_response(metadata, Body::from(body)),
+            response: tag(build_compat_response(metadata, Body::from(body))),
             retry: RetryDisposition::DefaultStatusPolicy,
             health: health_outcome,
         };

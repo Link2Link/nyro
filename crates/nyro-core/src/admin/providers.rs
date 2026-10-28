@@ -362,18 +362,31 @@ async fn probe_single_model(
             // Keep enough of the body for Google-style errors to surface their
             // details (links, verification hints) instead of cutting mid-word.
             let preview: String = body_text.chars().take(300).collect();
-            let hint = if body_text.contains("Verify your account") {
+            let entitlement =
+                crate::provider::anthropic::claude_code::errors::entitlement_refusal_bytes(
+                    status.as_u16(),
+                    body_text.as_bytes(),
+                );
+            let hint = if let Some(refusal) = &entitlement {
+                refusal.hint()
+            } else if body_text.contains("Verify your account") {
                 " — Google is gating this account: open https://antigravity.google \
                  (or gemini.google.com) in a browser with the SAME Google account \
                  and complete the verification prompt, then retry the test."
-            } else if status.as_u16() == 429 {
+                    .to_string()
+            } else if status.as_u16() == 429
+                && suite == crate::protocol::ids::Protocol::GoogleGemini
+            {
                 " — quota/entitlement gate: if the quota readout shows plenty \
                  remaining, this account's subscription tier does not include \
                  the model (Google returns RESOURCE_EXHAUSTED for tier-gated \
                  models too); otherwise the per-model quota window is spent \
                  and resets automatically."
+                    .to_string()
+            } else if status.as_u16() == 429 {
+                " — rate limited by the upstream; retry after the reset time.".to_string()
             } else {
-                ""
+                String::new()
             };
             anyhow::bail!("HTTP {status}: {preview}{hint}");
         }

@@ -2935,12 +2935,26 @@ impl AdminService {
                     .await
                     .context("resolve Claude Code OAuth runtime for usage query")?;
                 let client = self.gw.http_client_for_provider(provider.use_proxy).await?;
+                let base_url = runtime.binding.base_url_override.as_deref().unwrap_or("");
+                let token = runtime.access_token.trim();
                 let usage = crate::provider::anthropic::claude_code::usage::fetch_usage(
-                    &client,
-                    runtime.binding.base_url_override.as_deref().unwrap_or(""),
-                    runtime.access_token.trim(),
+                    &client, base_url, token,
                 )
                 .await?;
+                // Plan badge (Pro / Max 5x / Max 20x …), cached per account:
+                // the account UUID survives token refreshes, and a re-login
+                // to another account changes it.
+                let account = runtime
+                    .credential
+                    .as_ref()
+                    .and_then(|credential| credential.meta.pointer("/account/uuid"))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let plan_key = format!("{}:{account}", provider.id);
+                let level = crate::provider::anthropic::claude_code::usage::fetch_plan(
+                    &client, base_url, token, &plan_key,
+                )
+                .await;
                 let tiers = usage
                     .windows
                     .into_iter()
@@ -2950,7 +2964,7 @@ impl AdminService {
                         resets_at: window.resets_at,
                     })
                     .collect();
-                (tiers, Vec::new(), None, None, Vec::new())
+                (tiers, Vec::new(), level, None, Vec::new())
             }
             UsageBackend::Devin => {
                 if provider.effective_auth_mode().trim() != "oauth" {

@@ -134,6 +134,101 @@ pub(crate) fn parse_usage(body: &Value) -> ClaudeUsage {
     ClaudeUsage { windows }
 }
 
+const PROFILE_PATH: &str = "/api/oauth/profile";
+/// The plan almost never changes and the account endpoints throttle hard,
+/// so a resolved plan is reused for an hour per credential.
+const PLAN_TTL: std::time::Duration = std::time::Duration::from_secs(3600);
+
+type PlanCache =
+    std::sync::Mutex<std::collections::HashMap<String, (std::time::Instant, Option<String>)>>;
+
+/// Plan badge from `/api/oauth/profile`, using Claude Code's own mapping
+/// (`organization_type`: `claude_max` → max, `claude_pro` → pro, `claude_team`
+/// → team, `claude_enterprise` → enterprise) plus the Max tier from
+/// `rate_limit_tier` (`default_claude_max_5x` / `_20x`). Short lowercase
+/// tokens, like the other subscription backends' `level`.
+pub(crate) fn parse_plan(profile: &Value) -> Option<String> {
+    let organization = profile.get("organization")?;
+    let plan = match organization
+        .get("organization_type")
+        .and_then(Value::as_str)?
+    {
+        "claude_max" => "max",
+        "claude_pro" => "pro",
+        "claude_team" => "team",
+        "claude_enterprise" => "enterprise",
+        _ => return None,
+    };
+    if plan != "max" {
+        return Some(plan.to_string());
+    }
+    let tier = organization
+        .get("rate_limit_tier")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let max = if tier.ends_with("_20x") {
+        "max 20x"
+    } else if tier.ends_with("_5x") {
+        "max 5x"
+    } else {
+        "max"
+    };
+    Some(max.to_string())
+}
+
+fn plan_cache() -> &'static PlanCache {
+    static CACHE: std::sync::OnceLock<PlanCache> = std::sync::OnceLock::new();
+    CACHE.get_or_init(Default::default)
+}
+
+/// The account's plan badge, cached per credential. Best effort: any failure
+/// yields `None` and never fails the usage query (failures are not cached).
+pub(crate) async fn fetch_plan(
+    client: &reqwest::Client,
+    api_base_url: &str,
+    access_token: &str,
+    cache_key: &str,
+) -> Option<String> {
+    let cached = plan_cache()
+        .lock()
+        .ok()
+        .and_then(|cache| cache.get(cache_key).cloned());
+    if let Some((at, plan)) = cached
+        && at.elapsed() < PLAN_TTL
+    {
+        return plan;
+    }
+    let base = api_base_url.trim().trim_end_matches('/');
+    let base = if base.is_empty() {
+        "https://api.anthropic.com"
+    } else {
+        base
+    };
+    let response = client
+        .get(format!("{base}{PROFILE_PATH}"))
+        .bearer_auth(access_token)
+        .header("content-type", "application/json")
+        .header("cache-control", "no-cache")
+        .header("user-agent", profile::CLI_USER_AGENT)
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .await
+        .ok()?;
+    if !response.status().is_success() {
+        tracing::debug!(status = %response.status(), "claude-code: oauth profile unavailable");
+        return None;
+    }
+    let body: Value = response.json().await.ok()?;
+    let plan = parse_plan(&body);
+    if let Ok(mut cache) = plan_cache().lock() {
+        cache.insert(
+            cache_key.to_string(),
+            (std::time::Instant::now(), plan.clone()),
+        );
+    }
+    plan
+}
+
 /// Fetch and parse the subscription usage for one OAuth access token.
 pub(crate) async fn fetch_usage(
     client: &reqwest::Client,
@@ -216,6 +311,32 @@ mod tests {
             Some("2026-10-28T18:00:00Z")
         );
         assert_eq!(usage.windows[3].used_percent, 61.0);
+    }
+
+    #[test]
+    fn plan_badge_follows_claude_code_mapping() {
+        let plan = |organization_type: &str, tier: &str| {
+            parse_plan(&json!({"organization": {
+                "organization_type": organization_type, "rate_limit_tier": tier
+            }}))
+        };
+        assert_eq!(
+            plan("claude_max", "default_claude_max_20x").as_deref(),
+            Some("max 20x")
+        );
+        assert_eq!(
+            plan("claude_max", "default_claude_max_5x").as_deref(),
+            Some("max 5x")
+        );
+        assert_eq!(plan("claude_max", "").as_deref(), Some("max"));
+        assert_eq!(
+            plan("claude_pro", "default_claude_zero").as_deref(),
+            Some("pro")
+        );
+        assert_eq!(plan("claude_team", "").as_deref(), Some("team"));
+        assert_eq!(plan("claude_enterprise", "").as_deref(), Some("enterprise"));
+        assert_eq!(plan("api_org", ""), None);
+        assert_eq!(parse_plan(&json!({})), None);
     }
 
     #[test]

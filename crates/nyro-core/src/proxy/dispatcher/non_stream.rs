@@ -110,11 +110,13 @@ pub(super) async fn handle_non_stream(
             )
             .resp_body(body_str)
             .emit();
-        return (
+        let mut response = (
             StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY),
-            Json(resp),
+            Json(&resp),
         )
             .into_response();
+        super::mark_entitlement_refusal(&mut response, status, &resp);
+        return response;
     }
 
     // Embeddings: passthrough response (parse_response is not implemented for codec).
@@ -1297,11 +1299,13 @@ pub(super) async fn handle_non_stream_via_upstream_stream(
             )
             .resp_body(err_body_str)
             .emit();
-        return (
+        let mut response = (
             StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY),
-            Json(err_body),
+            Json(&err_body),
         )
             .into_response();
+        super::mark_entitlement_refusal(&mut response, status, &err_body);
+        return response;
     }
 
     let mut stream_parser = egress.handler().make_stream_response_decoder();

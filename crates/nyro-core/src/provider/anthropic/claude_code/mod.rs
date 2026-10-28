@@ -10,6 +10,7 @@ pub(crate) mod catalog;
 pub mod cch;
 pub(crate) mod cloak;
 pub(crate) mod egress;
+pub(crate) mod errors;
 pub(crate) mod identity;
 pub(crate) mod profile;
 pub(crate) mod tool_alias;

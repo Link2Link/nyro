@@ -105,6 +105,21 @@ pub(super) fn health_outcome_from_status(status: u16) -> HealthOutcome {
 #[derive(Clone, Copy, Debug)]
 struct LocalHealthNeutral;
 
+/// The upstream refused the request for lack of an entitlement (Anthropic
+/// `credits_required`): request-scoped, so neither provider health nor the
+/// quota monitor treats it as the credential's fault.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct EntitlementRefusal;
+
+/// Tag an upstream error response that is an entitlement refusal.
+pub(super) fn mark_entitlement_refusal(response: &mut Response, status: u16, body: &Value) {
+    if crate::provider::anthropic::claude_code::errors::entitlement_refusal(status, body).is_some()
+    {
+        response.extensions_mut().insert(LocalHealthNeutral);
+        response.extensions_mut().insert(EntitlementRefusal);
+    }
+}
+
 fn health_outcome_from_response(response: &Response) -> HealthOutcome {
     if response.extensions().get::<LocalHealthNeutral>().is_some() {
         HealthOutcome::Neutral
@@ -1891,7 +1906,10 @@ async fn dispatch_pipeline_inner(
                 || (replay_candidate
                     && stream_probe::should_retry_same_target(&response, same_target_retried, ctx));
             let status = response.status().as_u16();
-            if status == 429 {
+            // An entitlement refusal says nothing about the account's quota
+            // windows; re-reading usage would only add load to a 429-prone
+            // usage endpoint.
+            if status == 429 && response.extensions().get::<EntitlementRefusal>().is_none() {
                 crate::admin::trigger_provider_usage_refresh(
                     gw.clone(),
                     target.provider_id.clone(),

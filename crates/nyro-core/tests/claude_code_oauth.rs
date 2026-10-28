@@ -23,6 +23,8 @@ const MODEL: &str = "cc-fixture";
 /// A model with a mid-conversation `role: system` slot (not in the legacy list).
 const UPSTREAM_MODEL: &str = "claude-opus-5";
 const ACCOUNT_UUID: &str = "1b4e28ba-2fa1-11d2-883f-0016d3cca427";
+/// The fixture answers this model with Anthropic's `credits_required` 429.
+const CREDITS_MODEL: &str = "claude-fable-5-1";
 
 #[derive(Debug, Clone)]
 struct Captured {
@@ -73,6 +75,42 @@ async fn start_upstream() -> (String, Arc<Mutex<Vec<Captured>>>) {
                     let response = format!(
                         "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{usage}",
                         usage.len()
+                    );
+                    sink.lock().unwrap().push(request);
+                    let _ = socket.write_all(response.as_bytes()).await;
+                    let _ = socket.shutdown().await;
+                    return;
+                }
+                // OAuth profile: the plan behind the usage card badge.
+                if request.line.starts_with("GET /api/oauth/profile ") {
+                    let profile = json!({
+                        "account": {"uuid": ACCOUNT_UUID, "email": "user@example.com"},
+                        "organization": {"uuid": "org-1", "organization_type": "claude_max",
+                            "rate_limit_tier": "default_claude_max_20x"}
+                    })
+                    .to_string();
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{profile}",
+                        profile.len()
+                    );
+                    sink.lock().unwrap().push(request);
+                    let _ = socket.write_all(response.as_bytes()).await;
+                    let _ = socket.shutdown().await;
+                    return;
+                }
+                // A model this plan only runs on usage credits (Anthropic's reply).
+                if body["model"] == CREDITS_MODEL {
+                    let refusal = json!({"type": "error", "error": {
+                        "type": "rate_limit_error",
+                        "message": "Usage credits are required for this model.",
+                        "details": {"error_code": "credits_required", "can_user_purchase_credits": true,
+                            "has_chargeable_saved_payment_method": false,
+                            "disabled_reason": "org_level_disabled", "exhausted_included_allowance": false}
+                    }})
+                    .to_string();
+                    let response = format!(
+                        "HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{refusal}",
+                        refusal.len()
                     );
                     sink.lock().unwrap().push(request);
                     let _ = socket.write_all(response.as_bytes()).await;
@@ -262,10 +300,16 @@ async fn dispatch(
     (status, String::from_utf8(bytes.to_vec()).unwrap())
 }
 
+/// The single inference call. The gateway's background usage monitor may
+/// also read `/api/oauth/*` on this fixture; those calls are not inference.
 fn only_request(captured: &Arc<Mutex<Vec<Captured>>>) -> Captured {
     let requests = captured.lock().unwrap();
-    assert_eq!(requests.len(), 1, "exactly one upstream call");
-    requests[0].clone()
+    let inference: Vec<&Captured> = requests
+        .iter()
+        .filter(|r| r.line.starts_with("POST /v1/messages"))
+        .collect();
+    assert_eq!(inference.len(), 1, "exactly one upstream inference call");
+    inference[0].clone()
 }
 
 #[tokio::test]
@@ -415,6 +459,129 @@ async fn subscription_usage_reads_the_claude_code_usage_endpoint() {
         Some("Bearer sk-ant-oat01-fixture")
     );
     assert_eq!(request.header("anthropic-beta"), Some("oauth-2025-04-20"));
+
+    // Plan badge, read the way Claude Code reads it.
+    assert_eq!(usage.level.as_deref(), Some("max 20x"));
+    let profile = captured.lock().unwrap()[1].clone();
+    assert!(
+        profile.line.starts_with("GET /api/oauth/profile "),
+        "{}",
+        profile.line
+    );
+    // Cached: a second refresh re-reads usage but not the profile.
+    gw.admin().get_provider_usage(&id).await.unwrap();
+    let profile_calls = captured
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|r| r.line.starts_with("GET /api/oauth/profile "))
+        .count();
+    assert_eq!(profile_calls, 1);
+}
+
+#[tokio::test]
+async fn model_probe_explains_credits_required_instead_of_quota() {
+    let (url, _captured) = start_upstream().await;
+    let (_dir, gw) = setup(&url).await;
+    let id = provider_id(&gw).await;
+
+    let outcome = gw
+        .admin()
+        .probe_provider_models_with_prompt(&id, Some(vec![CREDITS_MODEL.to_string()]), None)
+        .await
+        .unwrap();
+    let result = &outcome.results[0];
+    assert!(!result.success);
+    let error = result.error.as_deref().unwrap();
+    assert!(error.starts_with("HTTP 429"), "{error}");
+    assert!(error.contains("not a quota window"), "{error}");
+    assert!(
+        error.contains("does not include it without usage credits"),
+        "{error}"
+    );
+    assert!(error.contains("disabled for the organization"), "{error}");
+    assert!(
+        !error.contains("Google"),
+        "no Google-specific wording on Anthropic: {error}"
+    );
+}
+
+#[tokio::test]
+async fn credits_required_refusal_does_not_trip_provider_health() {
+    let (url, captured) = start_upstream().await;
+    let (_dir, gw) = setup(&url).await;
+    let id = provider_id(&gw).await;
+    let models = gw.admin().list_models().await.unwrap();
+    let model = models.iter().find(|m| m.name == MODEL).unwrap();
+    gw.admin()
+        .update_model(
+            &model.id,
+            nyro_core::db::models::UpdateModel {
+                target_model: Some(CREDITS_MODEL.into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    // Only refreshes the refusals could cause count; the background monitor
+    // may have swept this fixture before the first request.
+    let usage_reads_before = captured
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|r| r.line.starts_with("GET /api/oauth/usage"))
+        .count();
+
+    // More refusals than the circuit's failure threshold (3).
+    for attempt in 1..=4 {
+        let body = json!({
+            "model": MODEL,
+            "max_tokens": 64,
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let (status, wire) = dispatch(
+            &gw,
+            ANTHROPIC_MESSAGES_2023_06_01,
+            "/v1/messages",
+            HeaderMap::new(),
+            body,
+        )
+        .await;
+        assert_eq!(status, 429, "attempt {attempt}: {wire}");
+        assert!(
+            wire.contains("credits_required"),
+            "upstream reason reaches the client: {wire}"
+        );
+    }
+    let health_key = nyro_core::provider::key_pool::health_key(
+        &id,
+        None,
+        &ANTHROPIC_MESSAGES_2023_06_01.to_string(),
+        CREDITS_MODEL,
+    );
+    assert!(
+        gw.health_registry.is_healthy(&health_key),
+        "an entitlement refusal must not open the provider circuit"
+    );
+    // Exactly one upstream call per request, and no usage re-read.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let requests = captured.lock().unwrap();
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|r| r.line.starts_with("POST /v1/messages"))
+            .count(),
+        4
+    );
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|r| r.line.starts_with("GET /api/oauth/usage"))
+            .count(),
+        usage_reads_before,
+        "credits_required must not trigger a usage refresh"
+    );
 }
 
 #[tokio::test]
