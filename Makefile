@@ -1,4 +1,4 @@
-.PHONY: dev build server server-slim server-centos7 tools check test test-core test-server fmt fmt-check clean webui smoke smoke-storage release-check help
+.PHONY: dev build server server-musl server-slim server-centos7 tools check test test-core test-server fmt fmt-check clean webui smoke smoke-storage release-check help
 
 # Development — start Tauri desktop app with hot reload
 dev: webui-build
@@ -11,6 +11,12 @@ build: webui-build
 # Build server binary only (release, webui embedded)
 server: webui-build
 	cargo build -p nyro-server --release
+
+# Build static musl server binary (release, webui embedded). Runs on any Linux
+# libc; make-docker.sh prefers it. Needs: rustup target add
+# x86_64-unknown-linux-musl, and musl-tools (musl-gcc).
+server-musl: webui-build
+	cargo build -p nyro-server --release --target x86_64-unknown-linux-musl
 
 # Build slim server binary (release, no embedded webui, no pnpm build required)
 server-slim:
@@ -79,6 +85,7 @@ help:
 	@echo "  make dev          Start Tauri desktop app (dev mode)"
 	@echo "  make build        Build desktop app (release)"
 	@echo "  make server       Build server binary (release, webui embedded)"
+	@echo "  make server-musl  Build static musl server binary (used by make-docker.sh)"
 	@echo "  make server-slim  Build slim server binary (release, no embedded webui)"
 	@echo "  make server-centos7 Build CentOS 7.6 compatible server in Docker"
 	@echo "  make tools        Build nyro-tools binary (release)"
