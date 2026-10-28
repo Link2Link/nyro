@@ -4,6 +4,21 @@ Nyro 的所有重要变更均记录在此文件中。
 
 ---
 
+## v2.1.7
+
+> 发布于 2026-10-28
+
+#### 新功能
+
+- **Claude 订阅类型显示**：Claude 订阅用量卡片像 Codex 的 `pro` 一样显示订阅类型（`pro`、`max 5x`、`max 20x`、`team`、`enterprise`）。与 Claude Code 一致，读取 `GET /api/oauth/profile` 的 `organization.organization_type`，Max 按 `rate_limit_tier` 区分 5x / 20x；结果按账号缓存一小时，读取失败时仅不显示类型，不影响用量
+
+#### 修复
+
+- **「需要使用额度」被当作额度耗尽或故障**：Anthropic 对订阅未包含的模型或模式（如 Pro 账号使用 Fable 5.1、fast mode）返回 429 `credits_required`。此前 nyro 将其计入供应商健康失败，连续几次即可熔断该模型，并触发易被限流的用量刷新；现在识别为请求级拒绝，不计入健康、不刷新用量，错误原样返回客户端，仍可正常切换到其他路由目标
+- **模型测试提示**：上述拒绝改为说明真实原因（订阅不含该模型、组织关闭了额外用量，需在 claude.ai 开启 usage credits 或改用其他供应商）；原先的 Google 专属 429 提示只在 Gemini 协议下显示
+
+---
+
 ## v2.1.6
 
 > 发布于 2026-10-28

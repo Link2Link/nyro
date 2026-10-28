@@ -4,6 +4,21 @@ All notable changes to Nyro will be documented in this file.
 
 ---
 
+## v2.1.7
+
+> Released on 2026-10-28
+
+#### Features
+
+- **Claude subscription plan badge**: the Claude subscription usage card shows the plan like the Codex `pro` badge (`pro`, `max 5x`, `max 20x`, `team`, `enterprise`). Matching Claude Code, it reads `organization.organization_type` from `GET /api/oauth/profile` and splits Max into 5x / 20x by `rate_limit_tier`; the result is cached per account for an hour, and a failed lookup only hides the badge without affecting usage
+
+#### Fixes
+
+- **"Usage credits required" treated as quota exhaustion or a fault**: Anthropic answers models or modes the subscription does not include (e.g. Fable 5.1 on a Pro account, fast mode) with 429 `credits_required`. nyro used to count this as a provider health failure — a few in a row tripped that model's circuit — and to trigger a rate-limit-prone usage refresh. It is now recognized as a request-scoped refusal: no health penalty, no usage refresh, the upstream error reaches the client unchanged, and failover to other route targets still works
+- **Model test hint**: these refusals now explain the real cause (the plan does not include the model and extra usage is disabled for the organization; enable usage credits in claude.ai or route the model elsewhere). The Google-specific 429 hint is shown only for the Gemini protocol
+
+---
+
 ## v2.1.6
 
 > Released on 2026-10-28
