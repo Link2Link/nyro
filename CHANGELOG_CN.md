@@ -4,6 +4,16 @@ Nyro 的所有重要变更均记录在此文件中。
 
 ---
 
+## v2.1.5
+
+> 发布于 2026-10-28
+
+#### 修复
+
+- **Claude Code OAuth 登录与 token 刷新返回 404**：Anthropic 已下线 `console.anthropic.com/v1/oauth/token`，授权码兑换与刷新均返回 `404 not_found_error`。`claude-code` 通道改用 `platform.claude.com/v1/oauth/token`，与 Claude Code 2.1.220+ 一致。此前新登录在换取 token 时失败，已登录的供应商会在 access token 过期后无法刷新；本版本之前失败的登录需重新进行
+
+---
+
 ## v2.1.4
 
 > 发布于 2026-10-28

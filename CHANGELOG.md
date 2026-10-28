@@ -4,6 +4,16 @@ All notable changes to Nyro will be documented in this file.
 
 ---
 
+## v2.1.5
+
+> Released on 2026-10-28
+
+#### Fixes
+
+- **Claude Code OAuth login and token refresh returned 404**: Anthropic retired the `console.anthropic.com/v1/oauth/token` endpoint, which now answers `404 not_found_error` for both code exchange and refresh. The `claude-code` channel now uses `platform.claude.com/v1/oauth/token`, matching Claude Code 2.1.220+. New logins failed at the token exchange step, and existing providers would stop working once their access token expired; logins that failed before this release must be redone
+
+---
+
 ## v2.1.4
 
 > Released on 2026-10-28
