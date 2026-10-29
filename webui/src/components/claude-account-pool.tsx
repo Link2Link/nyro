@@ -71,13 +71,23 @@ function claudePlanLabel(plan: string | null | undefined, isZh: boolean): string
   return `${label} (${isZh ? "按 Pro 计算" : "counted as Pro"})`;
 }
 
-function ClaudePoolWindow({ name, quota, pace, isZh }: { name: string; quota: PoolQuotaWindow; pace: number | null; isZh: boolean }) {
+function ClaudePoolWindow({ name, quota, pace, isZh, detailed }: { name: string; quota: PoolQuotaWindow; pace: number | null; isZh: boolean; detailed: boolean }) {
   const label = tierLabel(name, isZh);
   const complete = quota.capacity_complete && quota.known_accounts === quota.total_accounts && !quota.stale;
   const used = complete && quota.used_percent != null && Number.isFinite(quota.used_percent)
     && quota.used_percent >= 0 && quota.used_percent <= 100 ? quota.used_percent : null;
   const units = (value: number | null) => value != null && Number.isFinite(value) ? value.toFixed(2) : "—";
   const reset = quota.next_reset_at && Number.isFinite(Date.parse(quota.next_reset_at)) ? quota.next_reset_at : null;
+  const progress = used != null && <UsageProgress usedPercent={used} pacePercent={pace} weighted
+    weightBasis={isZh ? "各账号窗口进度与 Claude 套餐容量" : "each account's window progress and Claude plan capacity"}
+    label={`${label} ${isZh ? "账号池已用额度" : "pool used quota"}`} isZh={isZh} />;
+  if (!detailed) return <div className="flex flex-wrap items-center gap-2" data-claude-pool-window={name}>
+    <span className="min-w-14 shrink-0 font-medium text-slate-500">{label}</span>
+    {used != null ? <>
+      {progress}
+      <span className={`shrink-0 tabular-nums ${utilizationColor(used)}`}>{isZh ? "已用" : "Used"} {used.toFixed(1)}%</span>
+    </> : <span className="text-slate-500">{isZh ? "用量未知 / 数据不完整" : "Usage unknown / incomplete data"}</span>}
+  </div>;
   return <div className="space-y-1.5 rounded-md border border-slate-200/70 p-2" data-claude-pool-window={name}>
     <div className="flex flex-wrap items-center justify-between gap-x-3 gap-y-1">
       <span className="font-medium">{label} · {isZh ? "加权估算" : "Weighted estimate"}</span>
@@ -85,9 +95,7 @@ function ClaudePoolWindow({ name, quota, pace, isZh }: { name: string; quota: Po
         : <span className="text-slate-500">{isZh ? "用量未知 / 数据不完整" : "Usage unknown / incomplete data"}</span>}
     </div>
     {used != null && <>
-      <UsageProgress usedPercent={used} pacePercent={pace} weighted
-        weightBasis={isZh ? "各账号窗口进度与 Claude 套餐容量" : "each account's window progress and Claude plan capacity"}
-        label={`${label} ${isZh ? "账号池已用额度" : "pool used quota"}`} isZh={isZh} />
+      {progress}
       {pace != null && <p className="text-[10px] text-slate-500">{isZh ? `匀速预估用量 ${pace.toFixed(1)}%（进度条竖线，仅供参考）` : `Steady-pace estimate ${pace.toFixed(1)}% (vertical marker; reference only)`}</p>}
     </>}
     <p className="tabular-nums text-slate-500">{used != null
@@ -102,8 +110,8 @@ function ClaudePoolWindow({ name, quota, pace, isZh }: { name: string; quota: Po
   </div>;
 }
 
-export function ClaudePoolSummary({ pool, isZh, onRefresh, refreshing = false }: {
-  pool: AccountPoolView; isZh: boolean; onRefresh?: () => void; refreshing?: boolean;
+export function ClaudePoolSummary({ pool, isZh, detailed = false, onRefresh, refreshing = false }: {
+  pool: AccountPoolView; isZh: boolean; detailed?: boolean; onRefresh?: () => void; refreshing?: boolean;
 }) {
   const now = useUsageClock();
   const planCounts = new Map<string, number>();
@@ -114,6 +122,7 @@ export function ClaudePoolSummary({ pool, isZh, onRefresh, refreshing = false }:
   }
   return <div className={`relative space-y-1 rounded-lg border border-slate-200/70 bg-white/40 px-3 py-2 text-xs text-slate-600 ${onRefresh ? "pr-10" : ""}`}>
     {onRefresh && <PoolRefreshButton onRefresh={onRefresh} refreshing={refreshing} isZh={isZh} />}
+    {detailed && <>
     <p>{isZh ? `${pool.counts.total} 个账号 · ${pool.counts.available} 个可用` : `${pool.counts.total} accounts · ${pool.counts.available} available`} · {accountStateLabel(pool.readiness, isZh)}</p>
     <p>{isZh ? `已停用 ${pool.counts.disabled} · 已断开 ${pool.counts.disconnected} · 需要登录 ${pool.counts.auth_required} · 额度耗尽 ${pool.counts.quota_exhausted}` : `Disabled ${pool.counts.disabled} · Disconnected ${pool.counts.disconnected} · Needs login ${pool.counts.auth_required} · Quota exhausted ${pool.counts.quota_exhausted}`}</p>
     <div className="flex flex-wrap items-center gap-1.5" data-claude-pool-plans>
@@ -121,13 +130,14 @@ export function ClaudePoolSummary({ pool, isZh, onRefresh, refreshing = false }:
       {planCounts.size ? [...planCounts].map(([plan, count]) => <span key={plan} className="rounded border border-slate-200 px-1.5 py-0.5 text-[10px]">{claudePlanLabel(plan, isZh)} · {count}</span>)
         : <span className="text-slate-400">{isZh ? "无参与汇总的账号" : "No accounts in totals"}</span>}
     </div>
-    <div className="grid grid-cols-1 gap-2 pt-1" data-claude-pool-windows>
-      {(pool.quota.claude_windows ?? []).map(({ name, quota }) => <ClaudePoolWindow key={name} name={name} quota={quota} pace={claudePoolSteadyPacePercent(pool, name, now)} isZh={isZh} />)}
+    </>}
+    <div className={`grid grid-cols-1 gap-2 ${detailed ? "pt-1" : ""}`} data-claude-pool-windows>
+      {(pool.quota.claude_windows ?? []).map(({ name, quota }) => <ClaudePoolWindow key={name} name={name} quota={quota} pace={claudePoolSteadyPacePercent(pool, name, now)} isZh={isZh} detailed={detailed} />)}
     </div>
     {!pool.quota.claude_windows?.length && <p className="text-slate-500">{isZh ? "账号池用量未知，请刷新用量。" : "Pool usage unknown; refresh usage to load it."}</p>}
-    <p className="text-[10px] text-slate-500">{isZh
+    {detailed && <p className="text-[10px] text-slate-500">{isZh
       ? "按 Pro / Max 5× / Max 20× 加权：5 小时 1 / 5 / 20，每周 1 / 5 / 10（估算）。未知或未识别套餐默认按 Pro（1）计算。仅统计已启用且未断开的账号，含额度耗尽账号；不代表当前可调度额度。模型专属窗口请展开管理账号查看。"
-      : "Weights for Pro / Max 5× / Max 20×: 5h 1 / 5 / 20; weekly 1 / 5 / 10 (estimated). Unknown or unrecognized plans default to Pro (1). Includes enabled, non-disconnected accounts, including exhausted accounts; not currently routable capacity. Open Manage accounts for model-specific windows."}</p>
+      : "Weights for Pro / Max 5× / Max 20×: 5h 1 / 5 / 20; weekly 1 / 5 / 10 (estimated). Unknown or unrecognized plans default to Pro (1). Includes enabled, non-disconnected accounts, including exhausted accounts; not currently routable capacity. Open Manage accounts for model-specific windows."}</p>}
   </div>;
 }
 
@@ -186,7 +196,7 @@ export function ClaudeAccountPoolPanel({ provider }: { provider: Provider }) {
   </div>;
   return <section className="space-y-3 rounded-xl border border-slate-200 bg-slate-50 p-3">
     <h3 className="text-sm font-semibold">{isZh ? "Claude Code 账号池" : "Claude Code account pool"}</h3>
-    <ClaudePoolSummary pool={pool} isZh={isZh} />
+    <ClaudePoolSummary pool={pool} isZh={isZh} detailed />
     <p className="text-xs text-slate-500">{isZh ? "网关会使用已保存的 refresh token 自动续期。仅在凭证失效时重新授权。" : "The gateway automatically refreshes credentials using stored refresh tokens. Re-authorize when credentials become invalid."}</p>
     {error && <p role="alert" className="text-xs text-red-600">{localizeBackendErrorMessage(error, isZh)}</p>}
     <details open={!pool.config}><summary className="cursor-pointer text-xs font-medium">{isZh ? "账号池调度设置" : "Pool scheduling settings"}</summary>

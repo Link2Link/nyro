@@ -4,6 +4,17 @@ All notable changes to Nyro will be documented in this file.
 
 ---
 
+## v2.1.11
+
+> Released on 2026-10-29
+
+#### Improvements
+
+- **Compact Claude pool cards**: provider cards show only the 5-hour and weekly progress bars, used percentages, steady-pace markers and refresh action. Account counts, subscription breakdowns, Pro-equivalent units, reset details and weighting explanations remain available under Manage accounts
+- **Preserved usage safeguards**: compact cards continue to flag unknown or incomplete usage rather than presenting it as zero; weighted calculations, account management and routing behavior are unchanged
+
+---
+
 ## v2.1.10
 
 > Released on 2026-10-29
