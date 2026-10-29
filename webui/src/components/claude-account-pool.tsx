@@ -8,7 +8,7 @@ import { useUsageClock } from "@/lib/use-usage-clock";
 import { looksLikeCredential } from "@/lib/kiro-pool-usage";
 import { tierLabel } from "@/lib/provider-usage";
 import { steadyPacePercent, utilizationColor } from "@/lib/usage-pace";
-import { accountStateLabel, canReauthorizeLegacyProvider, type AccountPoolView, type OAuthAccountUpdate, type ProviderAccountView } from "@/lib/devin-account-pool";
+import { accountStateLabel, canReauthorizeLegacyProvider, type AccountPoolView, type OAuthAccountUpdate, type PoolQuotaWindow, type ProviderAccountView } from "@/lib/devin-account-pool";
 import type { Provider } from "@/lib/types";
 import type { OAuthSessionIntent } from "@/lib/use-oauth-session";
 import { Button } from "@/components/ui/button";
@@ -38,7 +38,7 @@ function useInvalidatePool(providerId: string) {
   ]);
 }
 
-/** Percentages belong to a single account and window, never to pooled capacity. */
+/** Raw per-account windows remain available alongside weighted pool estimates. */
 export function ClaudeAccountUsage({ account, isZh }: { account: ProviderAccountView; isZh: boolean }) {
   const now = useUsageClock();
   const windows = account.claude_usage?.windows ?? [];
@@ -63,14 +63,65 @@ export function ClaudeAccountUsage({ account, isZh }: { account: ProviderAccount
   </div>;
 }
 
+function claudePlanLabel(plan: string | null | undefined, isZh: boolean): string {
+  if (plan === "pro") return "Pro";
+  if (plan === "max 5x") return "Max 5×";
+  if (plan === "max 20x") return "Max 20×";
+  const label = plan?.trim() ? tierLabel(plan, isZh) : (isZh ? "套餐未知" : "Plan unknown");
+  return `${label} (${isZh ? "按 Pro 计算" : "counted as Pro"})`;
+}
+
+function ClaudePoolWindow({ name, quota, isZh }: { name: string; quota: PoolQuotaWindow; isZh: boolean }) {
+  const label = tierLabel(name, isZh);
+  const complete = quota.capacity_complete && quota.known_accounts === quota.total_accounts && !quota.stale;
+  const used = complete && quota.used_percent != null && Number.isFinite(quota.used_percent)
+    && quota.used_percent >= 0 && quota.used_percent <= 100 ? quota.used_percent : null;
+  const units = (value: number | null) => value != null && Number.isFinite(value) ? value.toFixed(2) : "—";
+  const reset = quota.next_reset_at && Number.isFinite(Date.parse(quota.next_reset_at)) ? quota.next_reset_at : null;
+  return <div className="space-y-1.5 rounded-md border border-slate-200/70 p-2" data-claude-pool-window={name}>
+    <div className="flex flex-wrap items-center justify-between gap-x-3 gap-y-1">
+      <span className="font-medium">{label} · {isZh ? "加权估算" : "Weighted estimate"}</span>
+      {used != null ? <span className={`tabular-nums ${utilizationColor(used)}`}>{isZh ? "已用" : "Used"} {used.toFixed(1)}%</span>
+        : <span className="text-slate-500">{isZh ? "用量未知 / 数据不完整" : "Usage unknown / incomplete data"}</span>}
+    </div>
+    {used != null && <UsageProgress usedPercent={used} label={`${label} ${isZh ? "账号池已用额度" : "pool used quota"}`} isZh={isZh} />}
+    <p className="tabular-nums text-slate-500">{used != null
+      ? (isZh ? `已用 ${units(quota.used_units)} / ${units(quota.total_units)} Pro 等价单位 · 剩余 ${units(quota.remaining_units)}`
+        : `Used ${units(quota.used_units)} / ${units(quota.total_units)} Pro-equivalent units · Remaining ${units(quota.remaining_units)}`)
+      : (isZh ? `已知容量 ${units(quota.total_units)} Pro 等价单位${quota.capacity_complete ? "" : "（套餐未完全识别）"}`
+        : `Known capacity ${units(quota.total_units)} Pro-equivalent units${quota.capacity_complete ? "" : " (unidentified plans)"}`)}</p>
+    <p className={quota.stale ? "text-amber-700" : "text-slate-400"}>{isZh
+      ? `有效用量 ${quota.known_accounts} / ${quota.total_accounts} 个账号${quota.stale ? " · 存在旧数据 / 未知用量" : ""}`
+      : `Known usage ${quota.known_accounts} / ${quota.total_accounts} accounts${quota.stale ? " · Stale / unknown usage" : ""}`}</p>
+    {reset && <p className="text-[10px] text-slate-400">{isZh ? `最近重置（${quota.next_reset_accounts} 个账号，不一定是全池）` : `Next reset (${quota.next_reset_accounts} accounts, not necessarily the whole pool)`}: <time dateTime={reset}>{new Date(reset).toLocaleString()}</time></p>}
+  </div>;
+}
+
 export function ClaudePoolSummary({ pool, isZh, onRefresh, refreshing = false }: {
   pool: AccountPoolView; isZh: boolean; onRefresh?: () => void; refreshing?: boolean;
 }) {
+  const planCounts = new Map<string, number>();
+  for (const account of pool.accounts) {
+    if (!account.is_enabled || account.status === "disconnected") continue;
+    const plan = account.claude_usage?.plan?.trim() || "";
+    planCounts.set(plan, (planCounts.get(plan) ?? 0) + 1);
+  }
   return <div className={`relative space-y-1 rounded-lg border border-slate-200/70 bg-white/40 px-3 py-2 text-xs text-slate-600 ${onRefresh ? "pr-10" : ""}`}>
     {onRefresh && <PoolRefreshButton onRefresh={onRefresh} refreshing={refreshing} isZh={isZh} />}
     <p>{isZh ? `${pool.counts.total} 个账号 · ${pool.counts.available} 个可用` : `${pool.counts.total} accounts · ${pool.counts.available} available`} · {accountStateLabel(pool.readiness, isZh)}</p>
     <p>{isZh ? `已停用 ${pool.counts.disabled} · 已断开 ${pool.counts.disconnected} · 需要登录 ${pool.counts.auth_required} · 额度耗尽 ${pool.counts.quota_exhausted}` : `Disabled ${pool.counts.disabled} · Disconnected ${pool.counts.disconnected} · Needs login ${pool.counts.auth_required} · Quota exhausted ${pool.counts.quota_exhausted}`}</p>
-    <p className="text-slate-500">{isZh ? "各账号的 5 小时、每周和模型窗口独立显示；不同套餐的百分比不可相加或平均。请展开管理账号查看实际用量。" : "5-hour, weekly and model windows are shown per account; percentages across plans are not summed or averaged. Open Manage accounts for actual usage."}</p>
+    <div className="flex flex-wrap items-center gap-1.5" data-claude-pool-plans>
+      <span>{isZh ? "汇总账号套餐：" : "Plans in pool totals:"}</span>
+      {planCounts.size ? [...planCounts].map(([plan, count]) => <span key={plan} className="rounded border border-slate-200 px-1.5 py-0.5 text-[10px]">{claudePlanLabel(plan, isZh)} · {count}</span>)
+        : <span className="text-slate-400">{isZh ? "无参与汇总的账号" : "No accounts in totals"}</span>}
+    </div>
+    <div className="grid gap-2 pt-1 sm:grid-cols-2">
+      {(pool.quota.claude_windows ?? []).map(({ name, quota }) => <ClaudePoolWindow key={name} name={name} quota={quota} isZh={isZh} />)}
+    </div>
+    {!pool.quota.claude_windows?.length && <p className="text-slate-500">{isZh ? "账号池用量未知，请刷新用量。" : "Pool usage unknown; refresh usage to load it."}</p>}
+    <p className="text-[10px] text-slate-500">{isZh
+      ? "按 Pro / Max 5× / Max 20× 加权：5 小时 1 / 5 / 20，每周 1 / 5 / 10（估算）。未知或未识别套餐默认按 Pro（1）计算。仅统计已启用且未断开的账号，含额度耗尽账号；不代表当前可调度额度。模型专属窗口请展开管理账号查看。"
+      : "Weights for Pro / Max 5× / Max 20×: 5h 1 / 5 / 20; weekly 1 / 5 / 10 (estimated). Unknown or unrecognized plans default to Pro (1). Includes enabled, non-disconnected accounts, including exhausted accounts; not currently routable capacity. Open Manage accounts for model-specific windows."}</p>
   </div>;
 }
 
@@ -87,6 +138,7 @@ function AccountRow({ account, pending, canLogin, usageSummary, onUpdate, onLogi
     <td className="min-w-44 space-y-2 p-2">
       <Input aria-label={isZh ? "账号别名" : "Account label"} value={label} maxLength={120} disabled={pending || disconnected} onChange={(event) => setLabel(event.target.value)} />
       <div className="break-all text-[10px] text-slate-400">{account.account_id} · v{account.status_version}</div>
+      <p className="text-[10px] text-slate-500">{isZh ? "套餐：" : "Plan: "}{claudePlanLabel(account.claude_usage?.plan, isZh)}</p>
       <label className="flex items-center gap-2 text-[10px] text-slate-500"><span>{isZh ? "优先级（越小越优先）" : "Priority (lower first)"}</span>
         <Input className="w-20" aria-label={isZh ? "账号优先级" : "Account priority"} type="number" step={1} value={priority} disabled={pending || disconnected} onChange={(event) => setPriority(Number(event.target.value))} />
       </label>
@@ -147,7 +199,7 @@ export function ClaudeAccountPoolPanel({ provider }: { provider: Provider }) {
       intent={login.intent} initialLabel={login.label} onCancel={() => setLogin(null)} onBound={() => { setLogin(null); void invalidate(); }} />}
     <div className="overflow-x-auto"><table className="w-full text-left text-xs">
       <thead className="text-slate-500"><tr>
-        <th className="p-2">{isZh ? "账号 / 版本" : "Account / version"}</th><th className="p-2">{isZh ? "授权 / 调度" : "Authorization / scheduling"}</th>
+        <th className="p-2">{isZh ? "账号 / 版本 / 套餐" : "Account / version / plan"}</th><th className="p-2">{isZh ? "授权 / 调度" : "Authorization / scheduling"}</th>
         <th className="p-2">{isZh ? "实际额度窗口" : "Actual quota windows"}</th><th className="p-2">{isZh ? "操作" : "Actions"}</th>
       </tr></thead>
       <tbody>{pool.accounts.map((account) => {
@@ -181,7 +233,7 @@ export function ClaudeAccountPoolCard({ provider }: { provider: Provider }) {
     onSettled: invalidate,
   });
   return <div className="mt-2 space-y-2">
-    {/* No synthetic pool percentage: plans have different capacities. */}
+    {/* Core aggregates each window using its own subscription capacity weights. */}
     {query.data?.config ? <ClaudePoolSummary pool={query.data} isZh={isZh}
       onRefresh={() => refresh.mutate()} refreshing={refresh.isPending} />
     : query.data ? <>

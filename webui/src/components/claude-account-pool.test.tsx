@@ -3,7 +3,7 @@ import { test } from "node:test";
 import { renderToStaticMarkup } from "react-dom/server";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { LocaleProvider } from "../lib/i18n";
-import { newDevinPoolConfig, type AccountPoolView, type ProviderAccountView } from "../lib/devin-account-pool";
+import { newDevinPoolConfig, type AccountPoolView, type PoolQuotaWindow, type ProviderAccountView } from "../lib/devin-account-pool";
 import type { AccountUsageStats, Provider } from "../lib/types";
 import { accountUsagePeriodStart } from "../lib/account-usage-stats";
 import { AccountPoolSettings } from "./devin-pool-settings";
@@ -53,6 +53,31 @@ test("Claude management shows actual 5h weekly and model windows with scoped con
   doesNotMatch(html, /Devin|Pro-equivalent|Team Full Seat|10×|Paid balance|Plan unverified|Kiro/);
 });
 
+test("account rows preserve detected plans and disclose the unknown-plan Pro fallback", () => {
+  for (const [plan, label] of [["pro", "Pro"], ["max 5x", "Max 5×"], ["max 20x", "Max 20×"], [null, "Plan unknown"]]) {
+    const html = panel({ ...pool, accounts: [{ ...account, claude_usage: { plan, windows: [] } }] });
+    match(html, new RegExp(label!));
+    if (plan == null) match(html, /Plan unknown \(counted as Pro\)/);
+  }
+});
+
+test("pool summary labels detected plan counts with explicit Pro fallback", () => {
+  const accounts = ["pro", "pro", "max 5x", "max 20x", null, "team"].map((plan, i) => ({
+    ...account, account_id: `account-${i}`, claude_usage: { plan, windows: [] },
+  }));
+  accounts.push({ ...accounts[0], account_id: "disabled", is_enabled: false });
+  accounts.push({ ...accounts[0], account_id: "disconnected", status: "disconnected" });
+  for (const isZh of [false, true]) {
+    const html = renderToStaticMarkup(<ClaudePoolSummary pool={{ ...pool, accounts }} isZh={isZh} />);
+    match(html, /Pro · 2/); match(html, /Max 5× · 1/); match(html, /Max 20× · 1/);
+    match(html, isZh ? /汇总账号套餐：/ : /Plans in pool totals:/);
+    match(html, isZh ? /套餐未知 \(按 Pro 计算\) · 1/ : /Plan unknown \(counted as Pro\) · 1/);
+    match(html, isZh ? /Team \(按 Pro 计算\) · 1/ : /Team \(counted as Pro\) · 1/);
+  }
+  const empty = renderToStaticMarkup(<ClaudePoolSummary pool={{ ...pool, accounts: [] }} isZh={false} />);
+  match(empty, /No accounts in totals/);
+});
+
 test("Claude settings expose strategy affinity attempts but no paid reserve switch", () => {
   const html = renderToStaticMarkup(<LocaleProvider><AccountPoolSettings vendor="claude_code" config={{ ...newDevinPoolConfig(), reserve_policy: "fallback" }} pending={false} onSave={() => {}} /></LocaleProvider>);
   for (const text of ["Scheduling strategy", "Round robin", "Fill first", "Session affinity TTL", "Maximum account attempts", "Enable session affinity", "Paid extra-usage fallback is disabled", "not a billing hard limit"]) match(html, new RegExp(text));
@@ -76,12 +101,62 @@ test("disconnected Claude records retain stats but disallow account mutations", 
   doesNotMatch(html, /role="progressbar"/);
 });
 
-test("Claude summary never synthesizes pooled percentages from different accounts", () => {
-  const html = panel({ ...pool, accounts: [account, { ...account, account_id: "account-b", claude_usage: { windows: [{ name: "five_hour", used_percent: 90, resets_at: null }] } }] }, true);
-  match(html, /percentages across plans are not summed or averaged/);
+const weightedWindow: PoolQuotaWindow = {
+  total_units: 26, total_accounts: 3, capacity_complete: true, known_accounts: 3,
+  known_remaining_units: 22.5, used_units: 3.5, remaining_units: 22.5,
+  used_percent: 3.5 / 26 * 100, remaining_percent: 22.5 / 26 * 100,
+  stale: false, next_reset_at: "2030-01-01T05:00:00Z", next_reset_accounts: 1, reset_mode: "independent",
+};
+const weightedPool: AccountPoolView = { ...pool, quota: { ...pool.quota, estimated: true, claude_windows: [
+  { name: "five_hour", quota: weightedWindow },
+  { name: "weekly_limit", quota: { ...weightedWindow, total_units: 16, used_units: 2.5, remaining_units: 13.5,
+    known_remaining_units: 13.5, used_percent: 15.625, remaining_percent: 84.375 } },
+] } };
+
+test("Claude collapsed card renders core-weighted session and weekly estimates", () => {
+  const html = panel(weightedPool, true);
+  match(html, /5h · Weighted estimate/);
+  match(html, /Weekly · Weighted estimate/);
+  match(html, /Used 13.5%/); match(html, /Used 15.6%/);
+  match(html, /Used 3.50 \/ 26.00 Pro-equivalent units · Remaining 22.50/);
+  match(html, /Used 2.50 \/ 16.00 Pro-equivalent units · Remaining 13.50/);
+  match(html, /5h 1 \/ 5 \/ 20; weekly 1 \/ 5 \/ 10/);
+  match(html, /Unknown or unrecognized plans default to Pro \(1\)/);
+  match(html, /Known usage 3 \/ 3 accounts/);
+  match(html, /not necessarily the whole pool/);
   match(html, /aria-label="Refresh pool usage"/);
   match(html, /aria-expanded="false"[^>]*>Manage accounts/);
-  doesNotMatch(html, /role="progressbar"|Used [\d.]+%|Pro-equivalent/);
+  equal((html.match(/role="progressbar"/g) ?? []).length, 2);
+  doesNotMatch(html, /data-steady-pace-marker|Sonnet · Weekly/);
+});
+
+test("Claude summary does not average account percentages on older backend responses", () => {
+  const html = panel({ ...pool, accounts: [account, { ...account, account_id: "account-b", claude_usage: { windows: [{ name: "five_hour", used_percent: 90, resets_at: null }] } }] }, true);
+  match(html, /Pool usage unknown; refresh usage/);
+  doesNotMatch(html, /role="progressbar"|Used [\d.]+%/);
+});
+
+test("incomplete unknown stale and invalid pool totals never display a fabricated percentage", () => {
+  for (const patch of [
+    { capacity_complete: false }, { known_accounts: 2 }, { stale: true },
+    { used_percent: null }, { used_percent: NaN }, { used_percent: Infinity }, { used_percent: -1 }, { used_percent: 101 },
+  ]) {
+    const html = renderToStaticMarkup(<ClaudePoolSummary pool={{ ...pool, quota: { ...pool.quota,
+      claude_windows: [{ name: "five_hour", quota: { ...weightedWindow, ...patch } }],
+    } }} isZh={false} />);
+    match(html, /Usage unknown \/ incomplete data/);
+    doesNotMatch(html, /role="progressbar"|Used [\d.]+%|NaN|Infinity/);
+  }
+});
+
+test("missing pool data does not hide a complete independent window", () => {
+  const html = panel({ ...weightedPool, quota: { ...weightedPool.quota, claude_windows: [
+    { name: "five_hour", quota: weightedWindow },
+    { name: "weekly_limit", quota: { ...weightedWindow, used_percent: null, known_accounts: 1, stale: true, next_reset_at: "invalid" } },
+  ] } }, true);
+  equal((html.match(/role="progressbar"/g) ?? []).length, 1);
+  match(html, /Known usage 1 \/ 3 accounts · Stale \/ unknown usage/);
+  doesNotMatch(html, /Invalid Date/);
 });
 
 test("unknown invalid and stale Claude windows never invent fresh or zero capacity", () => {
@@ -97,8 +172,8 @@ test("unknown invalid and stale Claude windows never invent fresh or zero capaci
 test("Claude window names are escaped and Chinese labels are explicit", () => {
   const html = renderToStaticMarkup(<ClaudeAccountUsage account={account} isZh />);
   for (const text of ["5小时", "每周", "已用", "重置", "已观察"]) match(html, new RegExp(text));
-  const summary = renderToStaticMarkup(<ClaudePoolSummary pool={pool} isZh />);
-  match(summary, /不可相加或平均/);
+  const summary = renderToStaticMarkup(<ClaudePoolSummary pool={weightedPool} isZh />);
+  for (const text of ["加权估算", "已用 13.5%", "已用 15.6%", "5 小时 1 / 5 / 20", "每周 1 / 5 / 10", "不一定是全池", "有效用量 3 / 3 个账号", "未知或未识别套餐默认按 Pro"]) match(summary, new RegExp(text));
   const unsafe = renderToStaticMarkup(<ClaudeAccountUsage account={{ ...account, claude_usage: { windows: [{ name: '<script>alert(1)</script>', used_percent: 1, resets_at: null }] } }} isZh={false} />);
   doesNotMatch(unsafe, /<script>/i); match(unsafe, /&lt;Script&gt;/);
 });

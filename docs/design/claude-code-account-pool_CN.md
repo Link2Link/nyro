@@ -10,7 +10,7 @@
 
 ## 管理界面
 
-供应商卡片显示后端返回的账号数量、可用状态和全池用量刷新按钮。**管理账号**与供应商编辑面板支持：
+供应商卡片显示后端返回的账号数量、可用状态和全池用量刷新按钮。卡片与管理面板汇总框均列出已启用且未断开账号的识别套餐分布，各账号行也标注识别到的套餐。未知或未识别套餐明确标注按 Pro 估算，不冒充已验证的 Pro 订阅。**管理账号**与供应商编辑面板支持：
 
 - 通过浏览器 OAuth 和授权码交换添加账号。
 - 定向重新授权；打开浏览器前固定稳定账号 ID 与状态版本。
@@ -29,6 +29,7 @@ Claude 设置始终提交 `reserve_policy = "disabled"`，不提供付费余额�
 
 ```ts
 claude_usage?: {
+  plan?: string | null; // pro、max 5x、max 20x 或其他识别到的套餐
   windows: Array<{
     name: string;
     used_percent: number;
@@ -37,11 +38,20 @@ claude_usage?: {
 } | null;
 ```
 
-该契约不要求套餐或额外用量字段。原有账号授权状态、调度状态、观察时间和 stale 标记继续以后端为准。
+套餐在刷新用量和账号授权时逐账号从上游 OAuth profile 识别。旧快照没有套餐字段仍可读取。缺失或未识别的套餐（包括无法识别档位的 Max、Team、Enterprise）在两个汇总窗口均默认按 Pro 权重 1 计算。这是显式的估算兜底，不表示已验证为 Pro，不修改识别到的套餐。不要求额外用量字段。原有账号授权状态、调度状态、观察时间和 stale 标记继续以后端为准。
 
 规范窗口名称包括 `five_hour`、`weekly_limit` 和 `feature:<模型或功能>:weekly_limit`，例如 Sonnet、Opus、OAuth apps 或特定模型的周限制。后端规范化实际上游窗口，UI 逐项展示全部返回窗口，包括模型窗口。缺失窗口不会凭空补齐；缺失用量表示**未知**，不表示零。缺失或无效的重置时间显示未知；旧快照明确标记。时间到达重置点不会在本地恢复额度。
 
-刻意**不展示 Claude 全池汇总百分比**。不同订阅计划容量不同，相同百分比不代表相同剩余容量。不得套用 Devin Pro 等价单位、Devin Max 倍率、Kiro Credit，或对各账号百分比做算术平均。卡片显示数量与就绪状态，展开管理后查看各账号实际窗口。沿用的单窗口匀速标记只表示时间估算，不参与调度。
+卡片与管理面板展示由 core 计算的**账号池加权估算**，通过 `quota.claude_windows` 返回 `{ name, quota: PoolQuotaWindow }` 数组，`quota.estimated` 为 true。两个窗口分别使用以下 Pro 等价容量权重：
+
+| 窗口 | Pro | Max 5× | Max 20× |
+|---|---:|---:|---:|
+| `five_hour`（5 小时） | 1 | 5 | 20 |
+| `weekly_limit`（每周） | 1 | 5 | 10 |
+
+已用单位为 `sum(权重 × 已用百分比 / 100)`，全池已用百分比为 `100 × 已用单位 / sum(权重)`。周权重属于应用估算，不声称为官方承诺额度；这里使用 Claude 专属权重，不套用 Devin Max 倍率或 Kiro Credit。模型专属窗口仍逐账号展示，不合并。
+
+汇总纳入已启用且未断开的账号，包括额度耗尽账号；不代表当前可调度容量。未知套餐在每个窗口按一个 Pro 等价容量单位计入；缺失、无效、过期用量使汇总百分比显示未知，不把该账号当成零用量，UI 同时展示有效用量覆盖率与已知容量。两个窗口独立判断完整性。各账号保留自己的重置时间；最近重置及涉及账号数不表示全池同时重置，不据此伪造全池匀速参考线。单账号匀速标记仍仅表示视觉估算。加权汇总不改变调度决策。
 
 保留日志统计复用原有账号 usage-stats 端点：全部保留记录和本自然周（浏览器本地时区、周一开始）。Token 与等价 API 价格来自日志，不是上游额度或永久账单；不同币种分开展示，清理日志会减少累计值，失败/重试请求和缺失参考价格沿用原统计语义。
 
@@ -80,7 +90,7 @@ Token 在请求前进入五分钟到期余量时刷新，采用逐账号版本/C
 - [Claude 账号池组件](<../../webui/src/components/claude-account-pool.tsx>)：卡片、管理、实际窗口展示、保留日志统计。
 - [Claude 登录组件](<../../webui/src/components/claude-account-login.tsx>)与[会话辅助函数](<../../webui/src/lib/claude-account-login.ts>)：浏览器/授权码交换与不可改目标的会话意图。
 - [共享调度表单](<../../webui/src/components/devin-pool-settings.tsx>)：Claude 的付费兜底限制，同时保留 Devin/Kiro 原行为。
-- [UI 测试](<../../webui/src/components/claude-account-pool.test.tsx>)与[契约测试](<../../webui/src/lib/claude-account-login.test.ts>)：身份门控、窗口渲染、不聚合、未知/旧数据、双语标签、保留统计、单账号兼容、目标/CAS 参数及取消防护。
+- [UI 测试](<../../webui/src/components/claude-account-pool.test.tsx>)与[契约测试](<../../webui/src/lib/claude-account-login.test.ts>)：身份门控、窗口渲染、分窗口加权汇总、未知/旧数据、双语标签、保留统计、单账号兼容、目标/CAS 参数及取消防护。
 
 使用项目已安装的 esbuild 编译相关 Node 测试。Vite 图标 glob 仅在测试产物中替换为空映射，不改变应用行为。同时回归 Devin/Kiro 账号池、HTTP 映射、provider-usage 与 usage-pace 测试。生产类型检查/构建不得覆盖受版本控制的生成文件：
 

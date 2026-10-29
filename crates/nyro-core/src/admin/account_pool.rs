@@ -115,11 +115,12 @@ pub struct ProviderAccountView {
     pub stale: bool,
     pub updated_at: String,
 }
-#[derive(Debug, Clone, Serialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PoolQuotaWindow {
-    /// Applicable members, not weighted capacity (unknown plans are provisional members).
+    /// Applicable members, not weighted capacity (including members with unknown plans).
     pub total_accounts: usize,
-    /// False if any unclassified member could change this window's capacity.
+    /// Whether every member has capacity under this window's estimation policy.
+    /// Claude uses Pro-equivalent fallback capacity; unclassified Devin members do not.
     pub capacity_complete: bool,
     pub total_units: usize,
     pub known_accounts: usize,
@@ -133,10 +134,17 @@ pub struct PoolQuotaWindow {
     pub next_reset_accounts: usize,
     pub reset_mode: String,
 }
-#[derive(Debug, Clone, Serialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ClaudePoolQuotaWindow {
+    pub name: String,
+    pub quota: PoolQuotaWindow,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct AccountPoolQuota {
     pub daily: Option<PoolQuotaWindow>,
     pub weekly: Option<PoolQuotaWindow>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub claude_windows: Vec<ClaudePoolQuotaWindow>,
     /// The upstream does not expose independently audited entitlement capacity.
     pub estimated: bool,
 }
@@ -493,11 +501,22 @@ fn pool_view_with_kind(
         .collect();
     counts.accounting = members.len();
     let quota = if kiro || claude {
-        // Resource quotas are exposed per account, never as Devin plan weights.
+        // Claude estimates are UI-only and never feed routing quota observations.
         AccountPoolQuota {
             daily: None,
             weekly: None,
-            estimated: false,
+            claude_windows: if claude {
+                ["five_hour", "weekly_limit"]
+                    .into_iter()
+                    .map(|name| ClaudePoolQuotaWindow {
+                        name: name.into(),
+                        quota: aggregate_claude_window(&members, name),
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            },
+            estimated: claude,
         }
     } else {
         AccountPoolQuota {
@@ -508,6 +527,7 @@ fn pool_view_with_kind(
                     .then(|| aggregate_window(&members, true))
             }),
             weekly: config.as_ref().map(|_| aggregate_window(&members, false)),
+            claude_windows: Vec::new(),
             estimated: true,
         }
     };
@@ -935,13 +955,14 @@ impl AdminService {
             let binding = auth::build_driver("claude-code")
                 .context("Claude auth driver missing")?
                 .bind_runtime(provider, &credential)?;
-            let usage = crate::provider::anthropic::claude_code::usage::fetch_usage(
+            let usage = crate::provider::anthropic::claude_code::usage::fetch_usage_with_plan(
                 &client,
                 binding
                     .base_url_override
                     .as_deref()
                     .unwrap_or(&provider.base_url),
                 token.trim(),
+                target.account_id.as_deref().unwrap_or(&session.id),
             )
             .await?;
             let previous_state = previous
@@ -1482,6 +1503,226 @@ mod tests {
             .await
             .unwrap()
     }
+    fn claude_account(id: &str, plan: Option<&str>, session: f64, week: f64) -> OAuthCredential {
+        let mut record = account(id, DevinPlan::Pro, 0, 0);
+        record.driver_key = "claude-code".into();
+        let mut usage =
+            crate::provider::anthropic::claude_code::usage::parse_usage(&serde_json::json!({
+                "five_hour": {"utilization": session, "resets_at": "2099-01-01T05:00:00Z"},
+                "seven_day": {"utilization": week, "resets_at": "2099-01-07T00:00:00Z"},
+                "seven_day_opus": {"utilization": 100}
+            }));
+        usage.plan = plan.map(str::to_owned);
+        record.account_state =
+            serde_json::to_string(&authenticated_claude_state(usage, None)).unwrap();
+        record
+    }
+
+    fn mutate_claude(record: &mut OAuthCredential, f: impl FnOnce(&mut ClaudeAccountState)) {
+        let mut state = ClaudeAccountState::parse(&record.account_state);
+        f(&mut state);
+        record.account_state = serde_json::to_string(&state).unwrap();
+    }
+
+    #[test]
+    fn claude_pool_mixed_capacity_and_membership_are_not_routing_quotas() {
+        let mut disabled = claude_account("disabled", Some("max 20x"), 0.0, 0.0);
+        disabled.is_enabled = false;
+        let mut disconnected = disabled.clone();
+        disconnected.is_enabled = true;
+        disconnected.status = "disconnected".into();
+        let records = [
+            claude_account("pro", Some("pro"), 100.0, 0.0),
+            claude_account("five", Some("max 5x"), 0.0, 100.0),
+            claude_account("twenty", Some("max 20x"), 50.0, 50.0),
+            disabled,
+            disconnected,
+        ];
+        let view = pool_view_with_kind(
+            "pool",
+            Some(DevinPoolConfig::default()),
+            &records,
+            "claude_code",
+        );
+        assert_eq!(view.counts.accounting, 3);
+        assert_eq!(view.counts.quota_exhausted, 2);
+        assert_eq!(view.counts.available, 1);
+        assert!(view.quota.estimated);
+        assert!(view.quota.daily.is_none() && view.quota.weekly.is_none());
+        assert_eq!(view.quota.claude_windows.len(), 2); // No guessed model weights.
+        let session = &view.quota.claude_windows[0];
+        let week = &view.quota.claude_windows[1];
+        assert_eq!(session.name, "five_hour");
+        assert_eq!(week.name, "weekly_limit");
+        assert_eq!(
+            (session.quota.total_units, week.quota.total_units),
+            (26, 16)
+        );
+        assert_eq!(
+            (session.quota.remaining_units, week.quota.remaining_units),
+            (Some(15.0), Some(6.0))
+        );
+        assert!((session.quota.used_percent.unwrap() - 11.0 / 26.0 * 100.0).abs() < 1e-9);
+        assert_eq!(week.quota.used_percent, Some(62.5));
+        assert_eq!(session.quota.known_accounts, 3);
+        assert_eq!(session.quota.reset_mode, "aligned");
+    }
+
+    #[test]
+    fn claude_pool_unknown_and_unsupported_plans_use_pro_estimates_without_changing_plan() {
+        for plan in [
+            None,
+            Some(""),
+            Some("max"),
+            Some("team"),
+            Some("enterprise"),
+            Some("unrecognized"),
+        ] {
+            let records = [
+                claude_account("known", Some("max 5x"), 20.0, 40.0),
+                claude_account("fallback", plan, 80.0, 100.0),
+            ];
+            let view = pool_view_with_kind("pool", None, &records, "claude_code");
+            for (window, remaining) in view.quota.claude_windows.iter().zip([4.2, 3.0]) {
+                let quota = &window.quota;
+                assert!(quota.capacity_complete, "{plan:?}");
+                assert_eq!(quota.total_units, 6, "{plan:?}");
+                assert_eq!(quota.known_accounts, 2, "{plan:?}");
+                assert!((quota.remaining_units.unwrap() - remaining).abs() < 1e-9);
+                assert!((quota.remaining_percent.unwrap() - remaining / 6.0 * 100.0).abs() < 1e-9);
+                assert!(!quota.stale);
+            }
+            assert_eq!(
+                view.accounts[1]
+                    .claude_usage
+                    .as_ref()
+                    .unwrap()
+                    .plan
+                    .as_deref(),
+                plan
+            );
+            assert_eq!(
+                ClaudeAccountState::parse(&records[1].account_state)
+                    .usage
+                    .unwrap()
+                    .plan
+                    .as_deref(),
+                plan
+            );
+        }
+    }
+
+    #[test]
+    fn claude_pool_stale_missing_and_invalid_usage_are_incomplete_with_fallback_capacity() {
+        for condition in [
+            "no_usage", "missing", "stale", "old", "auth", "negative", "over", "expired",
+        ] {
+            let known = claude_account("known", Some("pro"), 20.0, 40.0);
+            let mut other = claude_account("other", None, 0.0, 0.0);
+            mutate_claude(&mut other, |state| {
+                match condition {
+                    "no_usage" => state.usage = None,
+                    "missing" => {
+                        state.usage.as_mut().unwrap().windows.remove(0);
+                    }
+                    "stale" => {
+                        state.usage_stale = true;
+                        return;
+                    }
+                    "old" => {
+                        state.observed_at = Some(0);
+                        return;
+                    }
+                    "auth" => {
+                        state.auth_invalid = true;
+                        return;
+                    }
+                    "negative" => {
+                        state.usage.as_mut().unwrap().windows[0].used_percent = -1.0;
+                        return;
+                    }
+                    "over" => {
+                        state.usage.as_mut().unwrap().windows[0].used_percent = 101.0;
+                        return;
+                    }
+                    "expired" => {
+                        state.usage.as_mut().unwrap().windows[0].resets_at =
+                            Some("2000-01-01T00:00:00Z".into());
+                        return;
+                    }
+                    _ => unreachable!(),
+                };
+            });
+            let view = pool_view_with_kind("pool", None, &[known, other], "claude_code");
+            let window = &view.quota.claude_windows[0].quota;
+            assert_eq!(window.total_accounts, 2, "{condition}");
+            assert_eq!(window.known_accounts, 1, "{condition}");
+            assert!((window.known_remaining_units - 0.8).abs() < 1e-9);
+            assert!(
+                window.used_percent.is_none() && window.remaining_percent.is_none(),
+                "{condition}"
+            );
+            assert!(window.used_units.is_none() && window.remaining_units.is_none());
+            assert!(window.stale);
+            assert!(window.capacity_complete, "{condition}");
+            assert_eq!(window.total_units, 2, "{condition}");
+            if condition == "no_usage" {
+                let weekly = &view.quota.claude_windows[1].quota;
+                assert!(weekly.capacity_complete);
+                assert_eq!(weekly.total_units, 2);
+                assert_eq!(weekly.known_accounts, 1);
+                assert_eq!(weekly.used_percent, None);
+                assert_eq!(weekly.remaining_percent, None);
+                assert!(view.accounts[1].claude_usage.is_none());
+            }
+            if matches!(condition, "missing" | "negative" | "over" | "expired") {
+                assert_eq!(view.quota.claude_windows[1].quota.known_accounts, 2);
+                assert!(view.quota.claude_windows[1].quota.used_percent.is_some());
+            }
+        }
+    }
+
+    #[test]
+    fn claude_pool_reset_instants_are_normalized_and_partial_not_whole_pool() {
+        let a = claude_account("a", Some("pro"), 20.0, 30.0);
+        let mut b = claude_account("b", Some("pro"), 50.0, 30.0);
+        mutate_claude(&mut b, |state| {
+            state.usage.as_mut().unwrap().windows[0].resets_at =
+                Some("2099-01-01T07:00:00+01:00".into())
+        });
+        let view = pool_view_with_kind("pool", None, &[a.clone(), b.clone()], "claude_code");
+        let window = &view.quota.claude_windows[0].quota;
+        assert_eq!(window.reset_mode, "staggered");
+        assert_eq!(window.next_reset_accounts, 1);
+        assert_eq!(
+            window.next_reset_at.as_deref(),
+            Some("2099-01-01T05:00:00+00:00")
+        );
+        mutate_claude(&mut b, |state| {
+            state.usage.as_mut().unwrap().windows[0].resets_at =
+                Some("2099-01-01T06:00:00+01:00".into())
+        });
+        let view = pool_view_with_kind("pool", None, &[a, b], "claude_code");
+        assert_eq!(view.quota.claude_windows[0].quota.reset_mode, "aligned");
+        assert_eq!(view.quota.claude_windows[0].quota.next_reset_accounts, 2);
+    }
+
+    #[test]
+    fn claude_pool_old_quota_serialization_is_compatible() {
+        let old = serde_json::json!({"daily":null,"weekly":null,"estimated":false});
+        let quota: AccountPoolQuota = serde_json::from_value(old.clone()).unwrap();
+        assert!(quota.claude_windows.is_empty());
+        assert_eq!(serde_json::to_value(quota).unwrap(), old);
+        let empty = pool_view_with_kind("pool", None, &[], "claude_code");
+        assert!(
+            empty
+                .quota
+                .claude_windows
+                .iter()
+                .all(|w| w.quota.used_percent.is_none())
+        );
+    }
+
     #[test]
     fn homogeneous_units_and_max_daily_absence() {
         let records = vec![

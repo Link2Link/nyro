@@ -39,6 +39,9 @@ pub struct UsageWindow {
 #[serde(default)]
 pub struct ClaudeUsage {
     pub windows: Vec<UsageWindow>,
+    /// Canonical upstream profile plan; unknown stays unknown in stored metadata.
+    /// Pool estimates separately use Pro-equivalent capacity for missing/unsupported plans.
+    pub plan: Option<String>,
 }
 
 fn window(bucket: Option<&Value>, name: String) -> Option<UsageWindow> {
@@ -133,7 +136,10 @@ pub(crate) fn parse_usage(body: &Value) -> ClaudeUsage {
                 .map(str::to_string),
         });
     }
-    ClaudeUsage { windows }
+    ClaudeUsage {
+        windows,
+        plan: None,
+    }
 }
 
 const PROFILE_PATH: &str = "/api/oauth/profile";
@@ -191,10 +197,16 @@ pub(crate) async fn fetch_plan(
     access_token: &str,
     cache_key: &str,
 ) -> Option<String> {
+    // Scope even legacy provider-level callers to the exact credential and origin.
+    // A replaced login must not inherit another account's cached entitlement.
+    use sha2::{Digest, Sha256};
+    let cache_key = hex::encode(Sha256::digest(
+        serde_json::to_vec(&(cache_key, api_base_url, access_token)).unwrap(),
+    ));
     let cached = plan_cache()
         .lock()
         .ok()
-        .and_then(|cache| cache.get(cache_key).cloned());
+        .and_then(|cache| cache.get(&cache_key).cloned());
     if let Some((at, plan)) = cached
         && at.elapsed() < PLAN_TTL
     {
@@ -229,6 +241,19 @@ pub(crate) async fn fetch_plan(
         );
     }
     plan
+}
+
+/// Account usage refresh and login share the same best-effort profile lookup.
+/// Never copy a previous plan when the current profile cannot be resolved.
+pub(crate) async fn fetch_usage_with_plan(
+    client: &reqwest::Client,
+    api_base_url: &str,
+    access_token: &str,
+    account_identity: &str,
+) -> anyhow::Result<ClaudeUsage> {
+    let mut usage = fetch_usage(client, api_base_url, access_token).await?;
+    usage.plan = fetch_plan(client, api_base_url, access_token, account_identity).await;
+    Ok(usage)
 }
 
 /// Fetch and parse the subscription usage for one OAuth access token.
@@ -319,6 +344,77 @@ mod tests {
                 status == 401
             );
         }
+    }
+
+    #[test]
+    fn old_serialized_usage_has_unknown_plan() {
+        let usage: ClaudeUsage = serde_json::from_value(json!({"windows":[{
+            "name":"five_hour", "used_percent":25.0, "resets_at":null
+        }]}))
+        .unwrap();
+        assert_eq!(usage.plan, None);
+        assert_eq!(usage.windows[0].used_percent, 25.0);
+        assert_eq!(
+            serde_json::from_str::<ClaudeUsage>("{}").unwrap(),
+            ClaudeUsage::default()
+        );
+    }
+
+    #[tokio::test]
+    async fn account_usage_profile_is_credential_scoped_and_failure_is_unknown() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move {
+            // Three credentials sharing one legacy provider cache key. The last
+            // profile fails and must not inherit either previous plan.
+            for _ in 0..6 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = [0u8; 4096];
+                let n = socket.read(&mut request).await.unwrap();
+                let request = String::from_utf8_lossy(&request[..n]);
+                let (status, body) = if request.starts_with("GET /api/oauth/usage ") {
+                    (
+                        200,
+                        json!({"five_hour":{"utilization":20},"seven_day":{"utilization":30}}),
+                    )
+                } else if request.contains("Bearer token-pro") {
+                    (
+                        200,
+                        json!({"organization":{"organization_type":"claude_pro"}}),
+                    )
+                } else if request.contains("Bearer token-max") {
+                    (
+                        200,
+                        json!({"organization":{"organization_type":"claude_max","rate_limit_tier":"default_claude_max_20x"}}),
+                    )
+                } else {
+                    (500, json!({"error":"private"}))
+                };
+                let body = body.to_string();
+                socket.write_all(format!("HTTP/1.1 {status} Response\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+            }
+        });
+        let client = reqwest::Client::new();
+        for (token, expected) in [
+            ("token-pro", Some("pro")),
+            ("token-max", Some("max 20x")),
+            ("token-failed", None),
+        ] {
+            let usage = fetch_usage_with_plan(&client, &base, token, "same-provider")
+                .await
+                .unwrap();
+            assert_eq!(usage.plan.as_deref(), expected);
+            assert_eq!(usage.windows.len(), 2);
+        }
+        task.await.unwrap();
+        // The server is gone: a same-credential hit still resolves from cache.
+        assert_eq!(
+            fetch_plan(&client, &base, "token-pro", "same-provider")
+                .await
+                .as_deref(),
+            Some("pro")
+        );
     }
 
     #[test]

@@ -68,6 +68,102 @@ pub(super) fn safe_claude_account(
     }
 }
 
+/// Plan-relative estimates, deliberately separate from scheduling observations.
+/// Missing/unsupported plans use Pro-equivalent capacity without changing metadata.
+/// Missing, stale, or invalid usage never becomes a zero-percent member.
+pub(super) fn aggregate_claude_window(
+    members: &[&ProviderAccountView],
+    name: &str,
+) -> PoolQuotaWindow {
+    let capacity = |account: &ProviderAccountView| match (
+        account
+            .claude_usage
+            .as_ref()
+            .and_then(|usage| usage.plan.as_deref()),
+        name,
+    ) {
+        (Some("max 5x"), "five_hour" | "weekly_limit") => Some(5),
+        (Some("max 20x"), "five_hour") => Some(20),
+        (Some("max 20x"), "weekly_limit") => Some(10),
+        (_, "five_hour" | "weekly_limit") => Some(1),
+        _ => None,
+    };
+    let total_units: usize = members.iter().filter_map(|a| capacity(a)).sum();
+    let capacity_complete = members.iter().all(|a| capacity(a).is_some());
+    let now = Utc::now();
+    let windows: Vec<_> = members
+        .iter()
+        .filter_map(|a| {
+            let units = capacity(a)?;
+            if a.stale || a.scheduling == "auth_required" {
+                return None;
+            }
+            let mut matches = a
+                .claude_usage
+                .as_ref()?
+                .windows
+                .iter()
+                .filter(|w| w.name == name);
+            let window = matches.next()?;
+            if matches.next().is_some()
+                || !window.used_percent.is_finite()
+                || !(0.0..=100.0).contains(&window.used_percent)
+            {
+                return None;
+            }
+            // Past reset timestamps invalidate the old observation; they do not
+            // imply a fresh zero-use window. Missing/invalid reset timestamps
+            // leave reset coverage unknown without inventing a reset instant.
+            let reset = window
+                .resets_at
+                .as_deref()
+                .and_then(|raw| DateTime::parse_from_rfc3339(raw).ok())
+                .map(|at| at.with_timezone(&Utc));
+            if reset.is_some_and(|at| at <= now) {
+                return None;
+            }
+            Some((window, units, reset))
+        })
+        .collect();
+    let known = windows.len();
+    let subtotal: f64 = windows
+        .iter()
+        .map(|(w, units, _)| (1.0 - w.used_percent / 100.0) * *units as f64)
+        .sum();
+    let n = members.len();
+    let complete = total_units > 0 && capacity_complete && known == n;
+    let next = windows.iter().filter_map(|(_, _, reset)| *reset).min();
+    let next_count = next.map_or(0, |at| {
+        windows
+            .iter()
+            .filter(|(_, _, reset)| *reset == Some(at))
+            .count()
+    });
+    let all_resets = complete && windows.iter().all(|(_, _, reset)| reset.is_some());
+    PoolQuotaWindow {
+        total_accounts: n,
+        capacity_complete,
+        total_units,
+        known_accounts: known,
+        known_remaining_units: subtotal,
+        used_units: complete.then_some(total_units as f64 - subtotal),
+        remaining_units: complete.then_some(subtotal),
+        used_percent: complete.then(|| 100.0 - subtotal / total_units as f64 * 100.0),
+        remaining_percent: complete.then(|| subtotal / total_units as f64 * 100.0),
+        stale: !complete,
+        next_reset_at: next.map(|at| at.to_rfc3339()),
+        next_reset_accounts: next_count,
+        reset_mode: if !all_resets {
+            "unknown"
+        } else if next_count == n {
+            "aligned"
+        } else {
+            "staggered"
+        }
+        .into(),
+    }
+}
+
 pub(super) fn authenticated_claude_state(
     usage: ClaudeUsage,
     previous: Option<&ClaudeAccountState>,
@@ -169,7 +265,7 @@ impl AdminService {
         let client = self.gw.http_client_for_provider(provider.use_proxy).await?;
         let mut next = ClaudeAccountState::parse(&account.account_state);
         let permit = super::account_pool::STATUS_CONCURRENCY.acquire().await?;
-        let result = crate::provider::anthropic::claude_code::usage::fetch_usage(
+        let result = crate::provider::anthropic::claude_code::usage::fetch_usage_with_plan(
             &client,
             runtime
                 .binding
@@ -177,6 +273,7 @@ impl AdminService {
                 .as_deref()
                 .unwrap_or(&provider.base_url),
             runtime.access_token.trim(),
+            &account.account_id,
         )
         .await;
         drop(permit);
@@ -244,10 +341,9 @@ impl AdminService {
             .iter()
             .filter(|a| a.is_enabled && a.status != "disconnected")
             .collect();
-        // Upstream percentages have no comparable capacity denominator. Do not
-        // average Pro/Max percentages or fabricate Devin-equivalent units.
-        // Preserve singleton tiers; multiple accounts expose their exact windows
-        // in account_pool.accounts[].claude_usage instead of misleading totals.
+        // Preserve exact singleton tiers. Multi-account weighted estimates live
+        // only in account_pool.quota.claude_windows, never provider usage tiers
+        // or routing observations; model-specific windows remain per account.
         let tiers = if members.len() == 1 {
             members[0]
                 .claude_usage
@@ -370,8 +466,18 @@ mod tests {
             (view.counts.pro, view.counts.max, view.counts.unclassified),
             (0, 0, 0)
         );
-        assert!(view.quota.daily.is_none() && view.quota.weekly.is_none() && !view.quota.estimated);
+        assert!(view.quota.daily.is_none() && view.quota.weekly.is_none() && view.quota.estimated);
+        assert_eq!(view.quota.claude_windows.len(), 2);
+        assert!(
+            view.quota
+                .claude_windows
+                .iter()
+                .all(|w| w.quota.capacity_complete && w.quota.total_units == 2)
+        );
+        assert_eq!(view.quota.claude_windows[0].quota.used_percent, Some(25.0));
+        assert_eq!(view.quota.claude_windows[1].quota.used_percent, Some(20.0));
         for account in &view.accounts {
+            assert_eq!(account.claude_usage.as_ref().unwrap().plan, None);
             assert!(
                 account.daily.is_none()
                     && account.weekly.is_none()
@@ -451,6 +557,145 @@ mod tests {
             "five_hour"
         );
         assert!(!gw.quota_registry.is_schedulable("claude-pool"));
+    }
+
+    #[tokio::test]
+    async fn claude_aggregate_rejects_nonfinite_duplicate_windows_but_defaults_unspecified_max() {
+        // Direct DTOs exercise IEEE values which JSON cannot represent.
+        let gw = gateway().await;
+        let record = add(&gw, "nonfinite").await;
+        let mut account = safe_claude_account(&record, None);
+        account.stale = false;
+        account.scheduling = "included".into();
+        let mut known = usage(25.0, 40.0); // Unknown plan still has fallback capacity.
+        for invalid in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let mut snapshot = known.clone();
+            snapshot.windows[0].used_percent = invalid;
+            account.claude_usage = Some(snapshot);
+            let aggregate = aggregate_claude_window(&[&account], "five_hour");
+            assert!(aggregate.capacity_complete);
+            assert_eq!(aggregate.total_units, 1);
+            assert_eq!(aggregate.known_accounts, 0);
+            assert_eq!(aggregate.used_percent, None);
+            assert_eq!(aggregate.known_remaining_units, 0.0);
+        }
+        let mut duplicate = known.clone();
+        duplicate.windows.push(duplicate.windows[0].clone());
+        account.claude_usage = Some(duplicate);
+        assert_eq!(
+            aggregate_claude_window(&[&account], "five_hour").known_accounts,
+            0
+        );
+        known.plan = Some("max".into());
+        account.claude_usage = Some(known);
+        let aggregate = aggregate_claude_window(&[&account], "five_hour");
+        assert!(aggregate.capacity_complete);
+        assert_eq!(aggregate.total_units, 1);
+        assert_eq!(aggregate.used_percent, Some(25.0));
+        assert_eq!(
+            account.claude_usage.as_ref().unwrap().plan.as_deref(),
+            Some("max")
+        );
+    }
+
+    #[tokio::test]
+    async fn claude_account_refresh_persists_profile_plan_and_clears_failed_profile() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            for _ in 0..4 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = [0u8; 4096];
+                let n = socket.read(&mut request).await.unwrap();
+                let request = String::from_utf8_lossy(&request[..n]);
+                let (status, body) = if request.starts_with("GET /api/oauth/usage ") {
+                    (
+                        200,
+                        serde_json::json!({"five_hour":{"utilization":10}, "seven_day":{"utilization":20}}),
+                    )
+                } else if request.contains("Bearer success") {
+                    (
+                        200,
+                        serde_json::json!({"organization":{"organization_type":"claude_pro"}}),
+                    )
+                } else {
+                    (500, serde_json::json!({}))
+                };
+                let body = body.to_string();
+                socket.write_all(format!("HTTP/1.1 {status} Response\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+            }
+        });
+        let gw = gateway().await;
+        let admin = gw.admin();
+        admin
+            .configure_provider_account_pool("claude-pool", DevinPoolConfig::default())
+            .await
+            .unwrap();
+        for (token, expected) in [("success", Some("pro")), ("failed", None)] {
+            let store = gw.storage.oauth_credentials();
+            let account = store
+                .create_account(
+                    "claude-pool",
+                    token,
+                    UpsertOAuthCredential {
+                        driver_key: "claude-code".into(),
+                        scheme: "oauth_auth_code_pkce".into(),
+                        access_token: token.into(),
+                        resource_url: Some(base.clone()),
+                        expires_at: Some((Utc::now() + chrono::Duration::hours(1)).to_rfc3339()),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            let mut old = usage(30.0, 40.0);
+            old.plan = Some("max 20x".into());
+            let state = authenticated_claude_state(old, None);
+            assert!(
+                store
+                    .compare_account_state(
+                        "claude-pool",
+                        &account.account_id,
+                        account.status_version,
+                        &account.account_state,
+                        &serde_json::to_string(&state).unwrap()
+                    )
+                    .await
+                    .unwrap()
+            );
+            let refreshed = admin
+                .refresh_provider_account_usage("claude-pool", &account.account_id)
+                .await
+                .unwrap();
+            assert_eq!(refreshed.claude_usage.unwrap().plan.as_deref(), expected);
+            let saved = store
+                .get_account("claude-pool", &account.account_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                ClaudeAccountState::parse(&saved.account_state)
+                    .usage
+                    .unwrap()
+                    .plan
+                    .as_deref(),
+                expected
+            );
+        }
+        server.await.unwrap();
+    }
+
+    #[test]
+    fn claude_refresh_and_relogin_do_not_retain_previous_plan_on_profile_failure() {
+        let mut old_usage = usage(20.0, 30.0);
+        old_usage.plan = Some("max 20x".into());
+        let mut state = authenticated_claude_state(old_usage, None);
+        let fresh = usage(10.0, 20.0); // Best-effort profile fetch returned None.
+        let login = authenticated_claude_state(fresh.clone(), Some(&state));
+        assert_eq!(login.usage.unwrap().plan, None);
+        apply_claude_usage_snapshot(&mut state, fresh);
+        assert_eq!(state.usage.unwrap().plan, None);
     }
 
     #[test]

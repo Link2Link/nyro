@@ -4,6 +4,22 @@ All notable changes to Nyro will be documented in this file.
 
 ---
 
+## v2.1.9
+
+> Released on 2026-10-29
+
+#### Features
+
+- **Weighted Claude account-pool usage**: provider cards and account management show separate 5-hour and weekly usage bars, used/remaining Pro-equivalent units and observation coverage. Pro / Max 5× / Max 20× use weights of 1 / 5 / 20 for the 5-hour window and 1 / 5 / 10 for the weekly estimate; model-specific windows remain per-account and routing decisions are unchanged
+- **Account-pool plan labels**: usage refresh and account authorization detect each account's subscription plan. The pool summary shows plan counts, and each account row shows its detected plan. Missing or unrecognized plans explicitly default to Pro weight 1 for estimation without changing the recorded subscription identity
+
+#### Improvements
+
+- **Conservative usage aggregation**: disabled and disconnected accounts are excluded while exhausted accounts remain in capacity totals. Missing, stale, invalid or expired observations never become zero usage; incomplete windows show unknown totals and coverage. Reset timestamps identify the next affected accounts rather than implying that the whole pool resets together
+- **Plan lookup isolation**: profile caching is scoped to the credential, upstream origin and account identity. Failed profile lookups do not retain a previous plan; existing stored usage without plan metadata remains compatible
+
+---
+
 ## v2.1.8
 
 > Released on 2026-10-29

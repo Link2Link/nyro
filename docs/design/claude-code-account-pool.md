@@ -10,7 +10,7 @@ Ordinary Anthropic API-key providers, other OAuth channels, and provider creatio
 
 ## Management UI
 
-The provider card shows backend account counts and readiness with a pool usage refresh button. **Manage accounts** and the provider edit panel expose:
+The provider card shows backend account counts and readiness with a pool usage refresh button. Both the card and management summary list detected plan counts for enabled, non-disconnected accounts; each account row also labels its detected plan. Unknown or unrecognized plans explicitly show the Pro estimation fallback instead of claiming a verified Pro subscription. **Manage accounts** and the provider edit panel expose:
 
 - Add account through browser OAuth and authorization-code exchange.
 - Re-authorize the exact account, with its stable account ID and status version captured before opening the browser.
@@ -29,6 +29,7 @@ The shared public account DTO adds this optional field:
 
 ```ts
 claude_usage?: {
+  plan?: string | null; // pro, max 5x, max 20x, or another detected plan
   windows: Array<{
     name: string;
     used_percent: number;
@@ -37,11 +38,20 @@ claude_usage?: {
 } | null;
 ```
 
-No plan or extra-usage field is required by this contract. Existing account status, scheduling, observation time, and stale flags remain authoritative.
+The plan is detected per account from the upstream OAuth profile during usage refresh and account authorization. Old snapshots without a plan remain readable. Missing or unrecognized plans (including unspecified Max tiers, Team and Enterprise) default to Pro weight 1 in both aggregate windows. This is an explicit estimation fallback, not a verified Pro subscription; the detected plan remains unchanged. No extra-usage field is required. Existing account status, scheduling, observation time, and stale flags remain authoritative.
 
 Canonical windows are `five_hour`, `weekly_limit`, and `feature:<model-or-feature>:weekly_limit` (for example Sonnet, Opus, OAuth apps, or a model-scoped limit). The backend normalizes the actual upstream buckets; the UI renders every returned window independently, including model-specific windows. Missing windows are not invented. Missing usage is **unknown**, not zero. Missing/invalid reset times are unknown; stale snapshots remain explicitly marked. Reaching a reset timestamp does not locally restore quota.
 
-There is deliberately **no aggregate Claude pool percentage**. Different subscription plans have different capacities, and equal percentages do not imply equal remaining capacity. Never apply Devin Pro-equivalent units, the Devin Max multiplier, Kiro credits, or arithmetic averages of account percentages. The card reports counts/readiness; expand management for actual account windows. Existing per-window steady-pace markers are only visual time estimates, never scheduling inputs.
+The card and management panel show **weighted pool estimates** computed by core in `quota.claude_windows`, an array of `{ name, quota: PoolQuotaWindow }`. `quota.estimated` is true. Each window uses its own Pro-equivalent capacity weights:
+
+| Window | Pro | Max 5× | Max 20× |
+|---|---:|---:|---:|
+| `five_hour` | 1 | 5 | 20 |
+| `weekly_limit` | 1 | 5 | 10 |
+
+Used units are `sum(weight × used_percent / 100)`; pool used percent is `100 × used_units / sum(weight)`. Weekly weights are an application estimate, not a claim of official entitlement. These are Claude-specific weights, not Devin Max weights or Kiro credits. Model-specific windows remain per-account only.
+
+Accounting includes enabled, non-disconnected accounts, including exhausted ones; totals are not a promise of currently routable capacity. Unknown plans contribute one Pro-equivalent capacity unit per window. Missing, invalid or stale usage leaves the aggregate percentage unknown rather than treating the account as unused; the UI reports known coverage and capacity. Windows are independently complete or incomplete. Each account retains its own reset time; the earliest reset and affected account count do not imply a whole-pool reset. No single reset-based pace marker is fabricated for the pool. Per-account steady-pace markers remain visual estimates only. Aggregates never change scheduling decisions.
 
 Retained usage statistics use the existing account usage-stats endpoint: all retained records plus the current calendar week (Monday start in the browser's local time). Tokens and equivalent API prices are log-derived estimates, not upstream quota or a permanent bill. Mixed currencies remain separate; deleted logs reduce totals; failed/retried attempts and missing reference prices follow the existing statistics semantics.
 
@@ -80,7 +90,7 @@ Credentials are refreshed before requests within the five-minute expiry margin, 
 - [Claude pool components](<../../webui/src/components/claude-account-pool.tsx>): card, management, actual-window presentation and retained stats.
 - [Claude login component](<../../webui/src/components/claude-account-login.tsx>) and [session helpers](<../../webui/src/lib/claude-account-login.ts>): browser/code exchange and immutable session intent.
 - [Shared scheduling form](<../../webui/src/components/devin-pool-settings.tsx>): Claude-specific reserve restrictions, with existing Devin/Kiro behavior preserved.
-- [UI tests](<../../webui/src/components/claude-account-pool.test.tsx>) and [contract tests](<../../webui/src/lib/claude-account-login.test.ts>): identity gating, quota rendering, no aggregation, unknown/stale cases, bilingual labels, retained stats, legacy compatibility, target/CAS wiring and cancellation guards.
+- [UI tests](<../../webui/src/components/claude-account-pool.test.tsx>) and [contract tests](<../../webui/src/lib/claude-account-login.test.ts>): identity gating, quota rendering, independently weighted pool windows, unknown/stale cases, bilingual labels, retained stats, legacy compatibility, target/CAS wiring and cancellation guards.
 
 Run the related bundled Node tests using the repository's installed esbuild. The Vite icon glob is stubbed only in test output; application behavior is unchanged. Also run the existing Devin/Kiro account-pool, HTTP mapping, provider-usage, and usage-pace tests. Production type-check/build must not touch generated tracked output:
 

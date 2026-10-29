@@ -34,8 +34,9 @@ export interface KiroUsage {
   items: KiroUsageItem[];
 }
 
-/** Actual upstream Claude subscription windows; percentages are not pool capacity. */
+/** Actual upstream Claude subscription windows and independently detected plan. */
 export interface ClaudeUsage {
+  plan?: string | null;
   windows: { name: string; used_percent: number; resets_at: string | null }[];
 }
 
@@ -89,7 +90,13 @@ export interface AccountPoolView {
   provider_id: string;
   config: DevinPoolConfig | null;
   accounts: ProviderAccountView[];
-  quota: { daily: PoolQuotaWindow | null; weekly: PoolQuotaWindow | null; estimated: boolean };
+  quota: {
+    daily: PoolQuotaWindow | null;
+    weekly: PoolQuotaWindow | null;
+    estimated: boolean;
+    /** Computed by core; five-hour and weekly windows have different plan weights. */
+    claude_windows?: { name: string; quota: PoolQuotaWindow }[];
+  };
   counts: AccountPoolCounts;
   readiness: string;
 }
