@@ -98,6 +98,25 @@ async fn start_upstream() -> (String, Arc<Mutex<Vec<Captured>>>) {
                     let _ = socket.shutdown().await;
                     return;
                 }
+                // Pool regression tokens exercise refusal evidence, not status-only retry.
+                if let Some(token) = request.header("authorization") {
+                    let rejection = match token {
+                        "Bearer pool-auth-rejected" => Some((401, json!({"type":"error", "error":{"type":"authentication_error","message":"Invalid token"}}).to_string())),
+                        "Bearer pool-bare-throttle" => Some((429, "proxy throttle".to_string())),
+                        "Bearer pool-rate-limited" => Some((429, json!({"type":"error", "error":{"type":"rate_limit_error","message":"Rate limited"}}).to_string())),
+                        _ => None,
+                    };
+                    if let Some((status, error)) = rejection {
+                        let response = format!(
+                            "HTTP/1.1 {status} Refused\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{error}",
+                            error.len()
+                        );
+                        sink.lock().unwrap().push(request);
+                        let _ = socket.write_all(response.as_bytes()).await;
+                        let _ = socket.shutdown().await;
+                        return;
+                    }
+                }
                 // A model this plan only runs on usage credits (Anthropic's reply).
                 if body["model"] == CREDITS_MODEL {
                     let refusal = json!({"type": "error", "error": {
@@ -610,8 +629,12 @@ async fn model_discovery_returns_the_built_in_claude_code_catalog() {
         assert!(models.iter().any(|m| m == "claude-3-5-haiku-20241022"));
     }
     assert!(
-        captured.lock().unwrap().is_empty(),
-        "discovery must not call upstream"
+        captured.lock().unwrap().iter().all(|r| {
+            // The independent background usage monitor may run during discovery.
+            r.line.starts_with("GET /api/oauth/usage ")
+                || r.line.starts_with("GET /api/oauth/profile ")
+        }),
+        "discovery must not call upstream model or inference endpoints"
     );
 }
 
@@ -779,4 +802,136 @@ async fn openai_client_through_ir_gets_original_tool_names_back() {
     assert!(cch::verify_body(&request.raw_body));
     assert!(wire.contains("\"get_weather\""), "{wire}");
     assert!(!wire.contains("mcp__"), "{wire}");
+}
+
+async fn setup_pool(
+    url: &str,
+    first_token: &str,
+    attempts: usize,
+) -> (tempfile::TempDir, Gateway, String) {
+    let (dir, gw) = setup(url).await;
+    let id = provider_id(&gw).await;
+    let store = gw.storage.oauth_credentials();
+    let first = store.list_accounts(&id).await.unwrap().remove(0);
+    let credential = |token: &str| UpsertOAuthCredential {
+        driver_key: "claude-code".into(),
+        scheme: "oauth_auth_code_pkce".into(),
+        access_token: token.into(),
+        expires_at: Some("2099-01-01T00:00:00Z".into()),
+        resource_url: Some(url.into()),
+        ..Default::default()
+    };
+    let first = store
+        .replace_account(
+            &id,
+            &first.account_id,
+            first.status_version,
+            credential(first_token),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    store
+        .update_account(
+            &id,
+            &first.account_id,
+            first.status_version,
+            nyro_core::db::models::OAuthAccountUpdate {
+                priority: Some(-10),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    store
+        .create_account(&id, "Healthy sibling", credential("pool-healthy"))
+        .await
+        .unwrap();
+    gw.admin()
+        .configure_provider_account_pool(
+            &id,
+            nyro_core::admin::DevinPoolConfig {
+                max_account_attempts: attempts,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    (dir, gw, id)
+}
+
+#[tokio::test]
+async fn claude_pool_structured_refusals_fail_over_with_account_credentials() {
+    for token in ["pool-auth-rejected", "pool-rate-limited"] {
+        for ingress in [
+            ANTHROPIC_MESSAGES_2023_06_01,
+            OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1,
+        ] {
+            for streaming in [false, true] {
+                let (url, captured) = start_upstream().await;
+                let (_dir, gw, id) = setup_pool(&url, token, 3).await;
+                let (status, body) = dispatch(&gw, ingress, "/v1/messages", HeaderMap::new(), json!({
+                "model": MODEL, "max_tokens": 64, "stream": streaming, "messages": [{"role":"user","content":"hello"}]
+            })).await;
+                assert_eq!(status, 200, "{token}: {body}");
+                let calls = captured
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|r| r.line.starts_with("POST /v1/messages"))
+                    .map(|r| r.header("authorization").unwrap().to_owned())
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    calls,
+                    [format!("Bearer {token}"), "Bearer pool-healthy".into()]
+                );
+                let accounts = gw
+                    .storage
+                    .oauth_credentials()
+                    .list_accounts(&id)
+                    .await
+                    .unwrap();
+                let rejected = accounts.iter().find(|a| a.access_token == token).unwrap();
+                let state: Value = serde_json::from_str(&rejected.account_state).unwrap();
+                assert_eq!(
+                    state["auth_invalid"].as_bool().unwrap_or(false),
+                    token == "pool-auth-rejected"
+                );
+                let healthy = accounts
+                    .iter()
+                    .find(|a| a.access_token == "pool-healthy")
+                    .unwrap();
+                let state: Value = serde_json::from_str(&healthy.account_state).unwrap();
+                assert!(!state["auth_invalid"].as_bool().unwrap_or(false));
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn claude_pool_bare_status_never_replays_and_attempt_limit_is_enforced() {
+    for (token, limit, expected_calls) in
+        [("pool-bare-throttle", 3, 1), ("pool-auth-rejected", 1, 1)]
+    {
+        let (url, captured) = start_upstream().await;
+        let (_dir, gw, _id) = setup_pool(&url, token, limit).await;
+        let (status, _) = dispatch(
+            &gw,
+            ANTHROPIC_MESSAGES_2023_06_01,
+            "/v1/messages",
+            HeaderMap::new(),
+            json!({
+                "model":MODEL,"max_tokens":64,"messages":[{"role":"user","content":"hello"}]
+            }),
+        )
+        .await;
+        assert!(status >= 400);
+        let calls = captured
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| r.line.starts_with("POST /v1/messages"))
+            .count();
+        assert_eq!(calls, expected_calls, "{token}");
+    }
 }

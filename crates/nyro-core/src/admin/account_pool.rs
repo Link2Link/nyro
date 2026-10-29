@@ -1,6 +1,6 @@
 //! OAuth account-pool management. Credentials never cross this module's DTO boundary.
 use super::*;
-use crate::provider::account_pool::{DevinAccountState, KiroAccountState};
+use crate::provider::account_pool::{ClaudeAccountState, DevinAccountState, KiroAccountState};
 use crate::provider::devin::{DevinQuota, DevinUsage};
 use crate::provider::kiro::KiroUsage;
 use crate::router::quota::QuotaTierObservation;
@@ -109,6 +109,8 @@ pub struct ProviderAccountView {
     pub reserve_usd: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub kiro_usage: Option<KiroUsage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub claude_usage: Option<ClaudeUsage>,
     pub observed_at: Option<i64>,
     pub stale: bool,
     pub updated_at: String,
@@ -216,6 +218,9 @@ fn scheduling(
     state: &DevinAccountState,
     config: Option<&DevinPoolConfig>,
 ) -> &'static str {
+    if is_claude_account(account) {
+        return claude_scheduling(account, config);
+    }
     if account.driver_key == "kiro" {
         return kiro_scheduling(account, config);
     }
@@ -318,6 +323,9 @@ fn safe_account(
     account: &OAuthCredential,
     config: Option<&DevinPoolConfig>,
 ) -> ProviderAccountView {
+    if is_claude_account(account) {
+        return safe_claude_account(account, config);
+    }
     if account.driver_key == "kiro" {
         return safe_kiro_account(account, config);
     }
@@ -352,6 +360,7 @@ fn safe_account(
             .map(window),
         reserve_usd: state.usage.as_ref().and_then(|u| u.overage_usd),
         kiro_usage: None,
+        claude_usage: None,
         observed_at: state.observed_at,
         stale: is_stale(&state),
         updated_at: account.updated_at.clone(),
@@ -432,18 +441,22 @@ fn pool_view(
     config: Option<DevinPoolConfig>,
     records: &[OAuthCredential],
 ) -> AccountPoolView {
-    pool_view_with_kind(id, config, records, false)
+    pool_view_with_kind(id, config, records, "devin")
 }
 fn pool_view_with_kind(
     id: &str,
     config: Option<DevinPoolConfig>,
     records: &[OAuthCredential],
-    kiro: bool,
+    kind: &str,
 ) -> AccountPoolView {
+    let kiro = kind == "kiro";
+    let claude = kind == "claude_code";
     let accounts: Vec<_> = records
         .iter()
         .map(|a| {
-            if kiro {
+            if claude {
+                safe_claude_account(a, config.as_ref())
+            } else if kiro {
                 safe_kiro_account(a, config.as_ref())
             } else {
                 safe_account(a, config.as_ref())
@@ -455,7 +468,7 @@ fn pool_view_with_kind(
         ..Default::default()
     };
     for account in &accounts {
-        if !kiro && account.status != "disconnected" {
+        if !kiro && !claude && account.status != "disconnected" {
             match account.verified_plan {
                 Some(DevinPlan::Pro) => counts.pro += 1,
                 Some(DevinPlan::Max) => counts.max += 1,
@@ -479,7 +492,7 @@ fn pool_view_with_kind(
         .filter(|a| a.is_enabled && a.status != "disconnected")
         .collect();
     counts.accounting = members.len();
-    let quota = if kiro {
+    let quota = if kiro || claude {
         // Resource quotas are exposed per account, never as Devin plan weights.
         AccountPoolQuota {
             daily: None,
@@ -518,7 +531,7 @@ fn pool_view_with_kind(
     .into();
     AccountPoolView {
         provider_id: id.into(),
-        kind: Some(if kiro { "kiro" } else { "devin" }.into()),
+        kind: Some(kind.into()),
         config,
         accounts,
         quota,
@@ -543,10 +556,12 @@ impl AdminService {
             .await?
             .context("auth session not found")?;
         anyhow::ensure!(
-            matches!(preview.driver_key.as_str(), "devin" | "kiro")
-                && !is_account_session(&preview)
+            matches!(
+                preview.driver_key.as_str(),
+                "devin" | "kiro" | "claude-code" | "claude"
+            ) && !is_account_session(&preview)
                 && preview.provider_id.is_none(),
-            "A fresh Devin or Kiro login session is required"
+            "A fresh Devin, Kiro or Claude Code login session is required"
         );
         let mut session = self.take_ready_auth_session_record(session_id).await?;
         if is_expired_at(session.expires_at.as_deref()) {
@@ -561,12 +576,30 @@ impl AdminService {
             }
         };
         let kiro = session.driver_key == "kiro";
-        let driver = if kiro { "kiro" } else { "devin" };
+        let claude = matches!(session.driver_key.as_str(), "claude-code" | "claude");
+        let driver = if kiro {
+            "kiro"
+        } else if claude {
+            "anthropic"
+        } else {
+            "devin"
+        };
         input.vendor = Some(driver.into());
         input.preset_key = Some(driver.into());
-        input.channel = Some(if kiro { "ide" } else { "cli" }.into());
+        input.channel = Some(
+            if kiro {
+                "ide"
+            } else if claude {
+                "claude-code"
+            } else {
+                "cli"
+            }
+            .into(),
+        );
         input.protocol = if kiro {
             crate::provider::kiro::PROTOCOL_KEY
+        } else if claude {
+            "anthropic-messages"
         } else {
             "devin-chat/get-chat-message/v1"
         }
@@ -579,6 +612,8 @@ impl AdminService {
                 .resource_url
                 .filter(|url| crate::provider::kiro::credential::region_from_origin(url).is_some())
                 .unwrap_or_else(|| crate::protocol::ids::KIRO_DEFAULT_BASE_URL.into())
+        } else if claude {
+            "https://api.anthropic.com".into()
         } else {
             "https://server.codeium.com".into()
         };
@@ -634,10 +669,8 @@ impl AdminService {
     pub(super) async fn account_pool_provider(&self, id: &str) -> anyhow::Result<Provider> {
         let provider = self.get_provider(id).await?;
         anyhow::ensure!(
-            (crate::provider::devin::is_devin(&provider)
-                || crate::provider::kiro::is_kiro(&provider))
-                && provider.effective_auth_mode() == "oauth",
-            "Account pools require a Devin or Kiro OAuth provider"
+            crate::provider::account_pool::supports_pool(&provider),
+            "Account pools require a Devin, Kiro or Claude Code OAuth provider"
         );
         Ok(provider)
     }
@@ -672,7 +705,13 @@ impl AdminService {
             id,
             config,
             &accounts,
-            crate::provider::kiro::is_kiro(&provider),
+            if is_claude_provider(&provider) {
+                "claude_code"
+            } else if crate::provider::kiro::is_kiro(&provider) {
+                "kiro"
+            } else {
+                "devin"
+            },
         );
         self.publish_pool_scheduling(&view, &accounts);
         Ok(view)
@@ -686,7 +725,13 @@ impl AdminService {
             if class != "included" {
                 continue;
             }
-            let tiers = if account.driver_key == "kiro" {
+            let tiers = if is_claude_account(account) {
+                ClaudeAccountState::parse(&account.account_state)
+                    .usage
+                    .as_ref()
+                    .map(claude_usage_observations)
+                    .unwrap_or_default()
+            } else if account.driver_key == "kiro" {
                 KiroAccountState::parse(&account.account_state)
                     .usage
                     .as_ref()
@@ -785,7 +830,9 @@ impl AdminService {
             );
         }
         let fence = self.account_login_fence(id).await?;
-        let driver = if crate::provider::kiro::is_kiro(&provider) {
+        let driver = if is_claude_provider(&provider) {
+            "claude-code"
+        } else if crate::provider::kiro::is_kiro(&provider) {
             "kiro"
         } else {
             "devin"
@@ -881,7 +928,27 @@ impl AdminService {
             None
         };
         let permit = STATUS_CONCURRENCY.acquire().await?;
-        let fresh = if crate::provider::kiro::is_kiro(provider) {
+        let fresh = if is_claude_provider(provider) {
+            let client = self.gw.http_client_for_provider(provider.use_proxy).await?;
+            let credential =
+                stored_credential_from_bundle(&session.driver_key, &session.scheme, &bundle);
+            let binding = auth::build_driver("claude-code")
+                .context("Claude auth driver missing")?
+                .bind_runtime(provider, &credential)?;
+            let usage = crate::provider::anthropic::claude_code::usage::fetch_usage(
+                &client,
+                binding
+                    .base_url_override
+                    .as_deref()
+                    .unwrap_or(&provider.base_url),
+                token.trim(),
+            )
+            .await?;
+            let previous_state = previous
+                .as_ref()
+                .map(|a| ClaudeAccountState::parse(&a.account_state));
+            serde_json::to_string(&authenticated_claude_state(usage, previous_state.as_ref()))?
+        } else if crate::provider::kiro::is_kiro(provider) {
             let credential =
                 stored_credential_from_bundle(&session.driver_key, &session.scheme, &bundle);
             let usage =
@@ -1031,19 +1098,28 @@ impl AdminService {
             "account is unavailable"
         );
         let kiro = crate::provider::kiro::is_kiro(provider);
+        let claude = is_claude_provider(provider);
         anyhow::ensure!(
-            (kiro || crate::provider::devin::is_devin(provider))
+            (kiro || claude || crate::provider::devin::is_devin(provider))
                 && provider.effective_auth_mode() == "oauth",
-            "Account runtime supports Devin or Kiro OAuth only"
+            "Account runtime supports Devin, Kiro or Claude Code OAuth only"
         );
         if kiro {
             crate::provider::kiro::validate(provider)?;
-        } else {
+        } else if !claude {
             crate::provider::devin::validate(provider)?;
         }
-        let driver_key = if kiro { "kiro" } else { "devin" };
+        let driver_key = if kiro {
+            "kiro"
+        } else if claude {
+            "claude-code"
+        } else {
+            "devin"
+        };
         anyhow::ensure!(
-            account.driver_key.trim().is_empty() || account.driver_key == driver_key,
+            account.driver_key.trim().is_empty()
+                || account.driver_key == driver_key
+                || (claude && account.driver_key == "claude"),
             "Account runtime driver does not match its provider"
         );
         let credential = stored_credential_from_oauth(account, driver_key);
@@ -1099,6 +1175,11 @@ impl AdminService {
     ) -> anyhow::Result<ProviderAccountView> {
         let provider = self.account_pool_provider(id).await?;
         let config = self.provider_pool_config(id).await?;
+        if is_claude_provider(&provider) {
+            return self
+                .refresh_claude_account_usage_locked(&provider, account_id, config.as_ref())
+                .await;
+        }
         if crate::provider::kiro::is_kiro(&provider) {
             return self
                 .refresh_kiro_account_usage_locked(&provider, account_id, config.as_ref())
@@ -1167,6 +1248,9 @@ impl AdminService {
         Ok(safe_account(&updated, config.as_ref()))
     }
     pub(super) fn account_pool_provider_usage(&self, view: AccountPoolView) -> ProviderUsage {
+        if view.kind.as_deref() == Some("claude_code") {
+            return self.claude_account_pool_provider_usage(view);
+        }
         if view.kind.as_deref() == Some("kiro") {
             return self.kiro_account_pool_provider_usage(view);
         }
@@ -1260,7 +1344,9 @@ impl AdminService {
         let jobs = accounts.into_iter().filter(|a| {
             a.is_enabled
                 && a.status == "connected"
-                && !(if a.driver_key == "kiro" {
+                && !(if is_claude_account(a) {
+                    ClaudeAccountState::parse(&a.account_state).auth_invalid
+                } else if a.driver_key == "kiro" {
                     KiroAccountState::parse(&a.account_state).auth_invalid
                 } else {
                     state(a).auth_invalid

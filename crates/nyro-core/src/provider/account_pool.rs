@@ -138,19 +138,111 @@ impl KiroAccountState {
     }
 }
 
+/// Claude quotas are percentages of real windows, never plan-equivalent units.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub(crate) struct ClaudeAccountState {
+    pub usage: Option<super::anthropic::claude_code::usage::ClaudeUsage>,
+    pub observed_at: Option<i64>,
+    pub usage_stale: bool,
+    pub auth_invalid: bool,
+    pub hard_quota: bool,
+    pub hard_quota_reason: Option<String>,
+    pub rejection_revision: u64,
+}
+
+impl ClaudeAccountState {
+    pub fn parse(raw: &str) -> Self {
+        serde_json::from_str(raw).unwrap_or_default()
+    }
+
+    pub fn included_exhausted(&self) -> bool {
+        self.exhausted_for_model(None)
+    }
+
+    fn exhausted_for_model(&self, model: Option<&str>) -> bool {
+        self.usage.as_ref().is_some_and(|usage| {
+            usage.windows.iter().any(|window| {
+                claude_window_applies(&window.name, model) && window.used_percent >= 100.0
+            })
+        })
+    }
+
+    pub fn usage_complete(&self) -> bool {
+        self.usage.as_ref().is_some_and(|usage| {
+            ["five_hour", "weekly_limit"].iter().all(|name| {
+                usage
+                    .windows
+                    .iter()
+                    .any(|w| w.name == *name && w.used_percent.is_finite())
+            })
+        })
+    }
+
+    pub fn cost_class(&self, config: &DevinPoolConfig) -> Option<u8> {
+        self.cost_class_for_model(config, None)
+    }
+
+    pub fn cost_class_for_model(
+        &self,
+        _config: &DevinPoolConfig,
+        model: Option<&str>,
+    ) -> Option<u8> {
+        // extra_usage.is_enabled alone is not evidence of an available paid
+        // balance. Until payment capacity is verifiable, never select overage,
+        // even when the operator enables the generic reserve fallback policy.
+        if self.auth_invalid || self.hard_quota || self.exhausted_for_model(model) {
+            return None;
+        }
+        Some(if self.usage_complete() { 0 } else { 1 })
+    }
+}
+
+/// Feature windows are model scoped; oauth_apps applies to this OAuth channel.
+/// With no model, report provider-wide windows only, not an Opus-only refusal.
+fn claude_window_applies(name: &str, model: Option<&str>) -> bool {
+    let Some(feature) = name.strip_prefix("feature:") else {
+        return true;
+    };
+    let feature = feature.split(':').next().unwrap_or_default();
+    if feature == "oauth_apps" {
+        return true;
+    }
+    model.is_some_and(|model| {
+        let model = model.to_ascii_lowercase().replace('-', "_");
+        !feature.is_empty() && model.contains(feature)
+    })
+}
+
 pub(crate) fn supports_pool(provider: &crate::db::models::Provider) -> bool {
     provider.effective_auth_mode() == "oauth"
-        && (super::devin::is_devin(provider) || super::kiro::is_kiro(provider))
+        && (super::devin::is_devin(provider)
+            || super::kiro::is_kiro(provider)
+            || super::anthropic::claude_code::egress::is_claude_code_channel(provider))
 }
 
 pub(crate) fn account_cost_class(
     account: &OAuthCredential,
     config: &DevinPoolConfig,
 ) -> Option<u8> {
-    if account.driver_key == "kiro" {
+    if matches!(account.driver_key.as_str(), "claude-code" | "claude") {
+        ClaudeAccountState::parse(&account.account_state).cost_class(config)
+    } else if account.driver_key == "kiro" {
         KiroAccountState::parse(&account.account_state).cost_class(config)
     } else {
         DevinAccountState::parse(&account.account_state).cost_class(config)
+    }
+}
+
+pub(crate) fn account_cost_class_for_model(
+    account: &OAuthCredential,
+    config: &DevinPoolConfig,
+    model: &str,
+) -> Option<u8> {
+    if matches!(account.driver_key.as_str(), "claude-code" | "claude") {
+        ClaudeAccountState::parse(&account.account_state).cost_class_for_model(config, Some(model))
+    } else {
+        account_cost_class(account, config)
     }
 }
 
@@ -203,8 +295,10 @@ impl AccountPoolRegistry {
             .filter_map(|account| {
                 // A Kiro account mid-refresh is still a member: admission joins
                 // the in-flight account lease instead of reporting an empty pool.
-                let joinable_refresh =
-                    account.driver_key == "kiro" && account.status == "refreshing";
+                let joinable_refresh = matches!(
+                    account.driver_key.as_str(),
+                    "kiro" | "claude-code" | "claude"
+                ) && account.status == "refreshing";
                 if account.provider_id != provider_id
                     || !account.is_enabled
                     || (account.status != "connected" && !joinable_refresh)
@@ -221,7 +315,7 @@ impl AccountPoolRegistry {
                 {
                     return None;
                 }
-                let class = account_cost_class(account, config)?;
+                let class = account_cost_class_for_model(account, config, model)?;
                 Some((class, account))
             })
             .collect::<Vec<_>>();
@@ -396,26 +490,45 @@ impl AccountPoolRegistry {
 /// shared anonymous pseudo-session. Bound untrusted identifiers before hashing.
 pub(crate) fn logical_session(request: &AiRequest) -> Option<String> {
     let raw = request.meta.raw.as_ref()?;
-    let id = [
+    let bounded = |id: &str| {
+        let id = id.trim();
+        (!id.is_empty() && id.len() <= 4096).then(|| id.to_owned())
+    };
+    [
         "session_id",
         "sessionId",
         "conversation_id",
         "previous_interaction_id",
     ]
     .iter()
-    .find_map(|key| raw.body.as_ref()?.get(*key)?.as_str())
+    .find_map(|key| bounded(raw.body.as_ref()?.get(*key)?.as_str()?))
     .or_else(|| {
+        raw.headers
+            .get("x-claude-code-session-id")
+            .and_then(|id| bounded(id))
+    })
+    .or_else(|| {
+        // Native Claude Code can carry its sole explicit session identifier in
+        // a JSON-encoded metadata.user_id. Own the string before dropping the
+        // parsed value; never use account_uuid/device_id as conversation keys.
+        let encoded = raw.body.as_ref()?.pointer("/metadata/user_id")?.as_str()?;
+        if encoded.len() > 16_384 {
+            return None;
+        }
+        let identity: serde_json::Value = serde_json::from_str(encoded).ok()?;
+        bounded(identity.get("session_id")?.as_str()?)
+    })
+    .or_else(|| {
+        // Match Claude identity's generic-header precedence.
         [
-            "x-session-id",
             "session-id",
+            "x-session-id",
+            "x-session-affinity",
             "x-conversation-id",
-            "x-claude-code-session-id",
         ]
         .iter()
-        .find_map(|key| raw.headers.get(*key).map(String::as_str))
-    })?;
-    let id = id.trim();
-    (!id.is_empty() && id.len() <= 4096).then(|| id.to_owned())
+        .find_map(|key| bounded(raw.headers.get(*key)?))
+    })
 }
 
 pub(crate) fn affinity_key(principal: Option<&str>, provider: &str, session: &str) -> String {
@@ -498,6 +611,68 @@ mod tests {
         })
         .unwrap();
         account
+    }
+
+    #[test]
+    fn claude_windows_are_model_scoped_and_paid_usage_is_never_assumed() {
+        let mut account = account("claude", 100, 100);
+        account.driver_key = "claude-code".into();
+        let usage = super::super::anthropic::claude_code::usage::parse_usage(&serde_json::json!({
+            "five_hour":{"utilization":30}, "seven_day":{"utilization":20},
+            "seven_day_opus":{"utilization":100},
+            "extra_usage":{"is_enabled":true,"monthly_limit":10000,"used_credits":0}
+        }));
+        let mut state = ClaudeAccountState {
+            usage: Some(usage),
+            ..Default::default()
+        };
+        account.account_state = serde_json::to_string(&state).unwrap();
+        let mut config = config();
+        assert_eq!(
+            account_cost_class_for_model(&account, &config, "claude-sonnet-4-6"),
+            Some(0)
+        );
+        assert_eq!(
+            account_cost_class_for_model(&account, &config, "claude-opus-4-6"),
+            None
+        );
+        assert_eq!(account_cost_class(&account, &config), Some(0));
+        let registry = AccountPoolRegistry::default();
+        assert!(
+            registry
+                .ordered(
+                    "p",
+                    "claude-opus-4-6",
+                    &config,
+                    &[account.clone()],
+                    None,
+                    &HashSet::new()
+                )
+                .is_empty()
+        );
+        assert_eq!(
+            registry
+                .ordered(
+                    "p",
+                    "claude-sonnet-4-6",
+                    &config,
+                    &[account.clone()],
+                    None,
+                    &HashSet::new()
+                )
+                .len(),
+            1
+        );
+        state.usage.as_mut().unwrap().windows[0].used_percent = 100.0;
+        config.reserve_policy = DevinReservePolicy::Fallback;
+        assert_eq!(state.cost_class(&config), None);
+        state.usage = None;
+        assert_eq!(state.cost_class(&config), Some(1));
+        state.hard_quota = true;
+        assert_eq!(state.cost_class(&config), None);
+        state.hard_quota = false;
+        state.auth_invalid = true;
+        assert_eq!(state.cost_class(&config), None);
     }
 
     #[test]
@@ -776,6 +951,52 @@ mod tests {
             b.meta.raw.unwrap().body.unwrap()["session_id"]
         );
     }
+    #[test]
+    fn claude_native_metadata_and_affinity_headers_supply_explicit_sessions() {
+        let mut request = AiRequest::new("claude-sonnet-4-6", vec![]);
+        request.meta.raw = Some(crate::protocol::ir::RawEnvelope {
+            body: Some(serde_json::json!({"metadata":{"user_id":serde_json::json!({
+                "session_id":" native-conversation ", "account_uuid":"never-use-account", "device_id":"never-use-device"
+            }).to_string()}})),
+            headers: HashMap::from([("x-session-affinity".into(), "generic-affinity".into())]),
+            ..Default::default()
+        });
+        assert_eq!(
+            logical_session(&request).as_deref(),
+            Some("native-conversation")
+        );
+        request
+            .meta
+            .raw
+            .as_mut()
+            .unwrap()
+            .headers
+            .insert("x-claude-code-session-id".into(), "native-header".into());
+        assert_eq!(logical_session(&request).as_deref(), Some("native-header"));
+        let raw = request.meta.raw.as_mut().unwrap();
+        raw.headers.remove("x-claude-code-session-id");
+        raw.body = Some(serde_json::json!({"metadata":{"user_id":"not-json"}}));
+        assert_eq!(
+            logical_session(&request).as_deref(),
+            Some("generic-affinity")
+        );
+        request.meta.raw.as_mut().unwrap().headers.clear();
+        assert!(logical_session(&request).is_none());
+        request.meta.raw.as_mut().unwrap().body =
+            Some(serde_json::json!({"metadata":{"user_id":serde_json::json!({
+            "session_id":"x".repeat(4097), "account_uuid":"never-use-account"
+        }).to_string()}}));
+        assert!(logical_session(&request).is_none());
+        request
+            .meta
+            .raw
+            .as_mut()
+            .unwrap()
+            .headers
+            .insert("x-session-affinity".into(), " ".into());
+        assert!(logical_session(&request).is_none());
+    }
+
     #[test]
     fn caller_identity_is_part_of_affinity_namespace() {
         assert_ne!(

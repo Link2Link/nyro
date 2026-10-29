@@ -113,6 +113,11 @@ pub(super) struct EntitlementRefusal;
 
 /// Tag an upstream error response that is an entitlement refusal.
 pub(super) fn mark_entitlement_refusal(response: &mut Response, status: u16, body: &Value) {
+    if let Some(failure) =
+        crate::provider::anthropic::claude_code::errors::account_refusal(status, body)
+    {
+        response.extensions_mut().insert(failure);
+    }
     if crate::provider::anthropic::claude_code::errors::entitlement_refusal(status, body).is_some()
     {
         response.extensions_mut().insert(LocalHealthNeutral);
@@ -1709,8 +1714,16 @@ async fn dispatch_pipeline_inner(
             if crate::provider::anthropic::claude_code::egress::is_claude_code_channel(&provider)
                 && egress.protocol == crate::protocol::ids::Protocol::AnthropicMessages
             {
+                // Identity fallback/tool aliases must stay account-scoped even
+                // when OAuth did not return an upstream account UUID. Never
+                // mutate the routing/storage Provider or the shared token.
+                let mut identity_provider = provider.clone();
+                if let Some(account) = &pool_account {
+                    identity_provider.id =
+                        format!("{}:{}", provider.id, account.credential.account_id);
+                }
                 match claude_code_egress(
-                    &provider,
+                    &identity_provider,
                     provider_runtime.credential.as_ref(),
                     &headers,
                     auth_key.id.as_deref().unwrap_or_default(),
@@ -1743,6 +1756,26 @@ async fn dispatch_pipeline_inner(
         let replay_candidate = !uses_compat
             && ((is_stream && !native_response_passthrough)
                 || (!is_stream && upstream_forces_stream));
+        if let Some(account) = &pool_account {
+            if !account_pool::still_valid(&gw, account, &actual_model).await {
+                visited_accounts.insert((
+                    provider.id.clone(),
+                    account.credential.account_id.clone(),
+                    actual_model.clone(),
+                ));
+                health_permit.neutral();
+                continue;
+            }
+            account_attempts
+                .entry(provider.id.clone())
+                .or_default()
+                .insert(account.credential.account_id.clone());
+            visited_accounts.insert((
+                provider.id.clone(),
+                account.credential.account_id.clone(),
+                actual_model.clone(),
+            ));
+        }
         let mut same_target_retried = false;
         let mut saw_zero_payload_malformed = false;
         let (response, status, retry, health_outcome, defer_native_stream_health) = loop {
@@ -1784,8 +1817,24 @@ async fn dispatch_pipeline_inner(
                 backend_model: &target.model,
                 api_key_id: auth_key.id.as_deref(),
                 api_key_name: auth_key.name.as_deref(),
-                provider_key_name: pool_key.as_ref().map(|key| key.name.as_str()),
-                route_decision: Some(route_decision.to_json()),
+                provider_key_name: pool_account
+                    .as_ref()
+                    .map(|a| a.credential.label.as_str())
+                    .or_else(|| pool_key.as_ref().map(|key| key.name.as_str())),
+                route_decision: Some({
+                    let mut decision: Value = serde_json::from_str(&route_decision.to_json())
+                        .unwrap_or_else(|_| serde_json::json!({}));
+                    if let Some(account) = &pool_account {
+                        decision["account"] = serde_json::json!({
+                            "account_id": account.credential.account_id,
+                            "label": account.credential.label,
+                            "credential_version": account.credential.status_version,
+                            "distinct_account_attempts": account_attempts.get(&provider.id).map_or(0, |set| set.len()),
+                            "affinity": account.affinity.is_some(),
+                        });
+                    }
+                    decision.to_string()
+                }),
                 is_stream,
                 enable_payload: route.enable_payload,
                 reasoning_effort: reasoning_effort.clone(),
@@ -1902,9 +1951,14 @@ async fn dispatch_pipeline_inner(
                 replay_candidate && stream_probe::is_zero_payload_malformed(&response);
             let compat_replay = compat_replay_candidate
                 && compat::should_retry_stream_start(&response, same_target_retried, ctx);
-            let replay = compat_replay
-                || (replay_candidate
-                    && stream_probe::should_retry_same_target(&response, same_target_retried, ctx));
+            let replay = pool_account.is_none()
+                && (compat_replay
+                    || (replay_candidate
+                        && stream_probe::should_retry_same_target(
+                            &response,
+                            same_target_retried,
+                            ctx,
+                        )));
             let status = response.status().as_u16();
             // An entitlement refusal says nothing about the account's quota
             // windows; re-reading usage would only add load to a 429-prone
@@ -1983,6 +2037,39 @@ async fn dispatch_pipeline_inner(
             HealthOutcome::Failure => health_permit.failure(),
             HealthOutcome::Neutral => health_permit.neutral(),
             HealthOutcome::Deferred => drop(health_permit),
+        }
+        if let Some(account) = &pool_account {
+            if status < 400 {
+                if account.config.session_affinity {
+                    if let Some(key) = &account.affinity {
+                        gw.account_pool.bind(
+                            key,
+                            &account.credential.account_id,
+                            account.credential.status_version,
+                            account.config.affinity_ttl_seconds,
+                        );
+                    }
+                }
+                return response;
+            }
+            let failure = response
+                .extensions()
+                .get::<crate::error::AccountFailure>()
+                .copied();
+            if let Some(failure) = failure {
+                // Credits-required is request/mode-scoped, not an account health failure.
+                if response.extensions().get::<EntitlementRefusal>().is_none() {
+                    account_pool::feedback(&gw, account, &actual_model, failure).await;
+                }
+            }
+            let safe = failure.is_some_and(|f| f.rejected_before_execution)
+                && crate::provider::account_pool::can_reconstruct(&request);
+            if !safe {
+                return response;
+            }
+            last_response = Some(response);
+            // Only structured pre-execution refusals may cross account boundaries.
+            continue;
         }
         if status < 400
             || (saw_zero_payload_malformed

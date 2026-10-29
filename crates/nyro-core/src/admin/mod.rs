@@ -24,11 +24,16 @@ mod account_pool;
 mod account_test;
 mod account_usage;
 pub use account_usage::{AccountUsageStats, AccountUsageTotals};
+mod claude_accounts;
 mod kiro_accounts;
+pub use crate::provider::anthropic::claude_code::usage::{
+    ClaudeUsage, UsageWindow as ClaudeUsageWindow,
+};
 pub use account_pool::{
     AccountPoolCounts, AccountPoolQuota, AccountPoolView, AccountQuotaWindow, DevinPlan,
     DevinPoolConfig, DevinPoolStrategy, DevinReservePolicy, PoolQuotaWindow, ProviderAccountView,
 };
+use claude_accounts::*;
 use kiro_accounts::*;
 mod aliyun_sign;
 mod api_keys;

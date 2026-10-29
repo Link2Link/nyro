@@ -21,7 +21,14 @@ impl AdminService {
             .await?;
         let admin = self.clone();
         let kiro = crate::provider::kiro::is_kiro(provider);
-        let name = if kiro { "Kiro" } else { "Devin" };
+        let claude = is_claude_provider(provider);
+        let name = if kiro {
+            "Kiro"
+        } else if claude {
+            "Claude Code"
+        } else {
+            "Devin"
+        };
         let provider = provider.clone();
         let mut result = probe_accounts(accounts, move |account| {
             let admin = admin.clone();
@@ -38,13 +45,33 @@ impl AdminService {
                 }
                 let account = if kiro {
                     admin.refresh_kiro_pool_account(&provider, &account).await?
+                } else if claude {
+                    admin
+                        .refresh_claude_pool_account(&provider, &account)
+                        .await?
                 } else {
                     account
                 };
                 let runtime = admin
                     .resolve_provider_account_runtime(&provider, &account)
                     .await?;
-                let outcome = if kiro {
+                let outcome = if claude {
+                    let client = admin
+                        .gw
+                        .http_client_for_provider(provider.use_proxy)
+                        .await?;
+                    crate::provider::anthropic::claude_code::usage::fetch_usage(
+                        &client,
+                        runtime
+                            .binding
+                            .base_url_override
+                            .as_deref()
+                            .unwrap_or(&provider.base_url),
+                        &runtime.access_token,
+                    )
+                    .await
+                    .map(|_| ())
+                } else if kiro {
                     crate::provider::kiro::check_connection(
                         &admin.gw,
                         &provider,
@@ -80,7 +107,7 @@ impl AdminService {
         .await;
         // Shared probe logic keeps its legacy Devin wording for compatibility.
         // Public Kiro results use their own vendor name, never upstream text.
-        if kiro {
+        if kiro || claude {
             result.error = result.error.map(|e| e.replace("Devin", name));
             for account in &mut result.accounts {
                 account.error = account.error.take().map(|e| e.replace("Devin", name));
@@ -182,6 +209,7 @@ fn safe_probe_error(error: &anyhow::Error) -> String {
         || text.starts_with("Devin authentication failed (HTTP 403)")
         || text.starts_with("Kiro authentication failed (HTTP 401)")
         || text.starts_with("Kiro authentication failed (HTTP 403)")
+        || text.starts_with("Claude authentication failed (HTTP ")
     {
         "Devin account authentication was rejected; sign in again".into()
     } else if text == "account is unavailable" || text == "account credential is missing" {

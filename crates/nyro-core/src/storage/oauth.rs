@@ -258,7 +258,7 @@ pub(super) fn mutate(
         anyhow::ensure!(
             matches!(
                 crate::auth::normalize_driver_key(&input.driver_key).as_str(),
-                "devin" | "kiro"
+                "devin" | "kiro" | "claude-code"
             ) || rows.iter().all(|r| r.status == "disconnected"),
             "MAX_ACCOUNTS: this OAuth driver permits one account"
         );
@@ -297,7 +297,7 @@ pub(super) fn mutate(
                     && (matches!(action, Mutation::Restore(..))
                         || matches!(
                             crate::auth::normalize_driver_key(&row.driver_key).as_str(),
-                            "devin" | "kiro"
+                            "devin" | "kiro" | "claude-code"
                         )))
                 {
                     return Ok(None);
@@ -342,7 +342,7 @@ pub(super) fn mutate(
             anyhow::ensure!(
                 matches!(
                     crate::auth::normalize_driver_key(&input.driver_key).as_str(),
-                    "devin" | "kiro"
+                    "devin" | "kiro" | "claude-code"
                 ) || rows.iter().filter(|r| r.status != "disconnected").count() <= 1,
                 "MAX_ACCOUNTS: this OAuth driver permits one account"
             );

@@ -76,6 +76,33 @@ pub(crate) fn entitlement_refusal_bytes(status: u16, body: &[u8]) -> Option<Enti
         .and_then(|value| entitlement_refusal(status, &value))
 }
 
+/// Only a structured Anthropic HTTP refusal authorizes account failover.
+/// Bare proxy statuses and errors inside an accepted stream are not replay evidence.
+pub(crate) fn account_refusal(status: u16, body: &Value) -> Option<crate::error::AccountFailure> {
+    use crate::error::{AccountFailure, AccountFailureReason as Reason};
+    if body.get("type").and_then(Value::as_str) != Some("error") {
+        return None;
+    }
+    let kind = body.pointer("/error/type")?.as_str()?;
+    let reason = if entitlement_refusal(status, body).is_some() {
+        // Request-scoped entitlement: do not poison account quota or health.
+        Reason::ModelForbidden
+    } else {
+        match (status, kind) {
+            (401, "authentication_error") => Reason::AuthInvalid,
+            (403, "permission_error") => Reason::ModelForbidden,
+            (429, "rate_limit_error") => Reason::RateLimited,
+            (529 | 503, "overloaded_error") => Reason::Capacity,
+            _ => return None,
+        }
+    };
+    Some(AccountFailure {
+        reason,
+        rejected_before_execution: true,
+        retry_after_seconds: None,
+    })
+}
+
 impl EntitlementRefusal {
     /// Operator-facing explanation appended to a probe failure.
     pub(crate) fn hint(&self) -> String {

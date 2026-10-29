@@ -34,6 +34,11 @@ export interface KiroUsage {
   items: KiroUsageItem[];
 }
 
+/** Actual upstream Claude subscription windows; percentages are not pool capacity. */
+export interface ClaudeUsage {
+  windows: { name: string; used_percent: number; resets_at: string | null }[];
+}
+
 export interface ProviderAccountView {
   account_id: string;
   provider_id: string;
@@ -49,6 +54,7 @@ export interface ProviderAccountView {
   weekly: AccountQuotaWindow | null;
   reserve_usd: number | null;
   kiro_usage?: KiroUsage | null;
+  claude_usage?: ClaudeUsage | null;
   observed_at: number | null;
   stale: boolean;
   updated_at: string;
@@ -79,7 +85,7 @@ export interface AccountPoolCounts {
 }
 
 export interface AccountPoolView {
-  kind?: "devin" | "kiro";
+  kind?: "devin" | "kiro" | "claude_code";
   provider_id: string;
   config: DevinPoolConfig | null;
   accounts: ProviderAccountView[];

@@ -1969,11 +1969,11 @@ impl AdminService {
                 .unwrap_or_else(|| current.auth_mode.clone());
         if self.provider_pool_config(id).await?.is_some() {
             anyhow::ensure!(
-                vendor.as_deref() == Some("devin")
-                    && preset_key.as_deref() == Some("devin")
-                    && channel.as_deref() == Some("cli")
+                vendor == current.vendor
+                    && preset_key == current.preset_key
+                    && channel == current.channel
                     && auth_mode == "oauth",
-                "Configured account pools must retain the Devin OAuth channel"
+                "Configured account pools must retain their OAuth vendor and channel"
             );
         }
         let raw_api_key = if auth_mode == "oauth" {
@@ -2228,7 +2228,9 @@ impl AdminService {
     }
     pub async fn test_provider(&self, id: &str) -> anyhow::Result<TestResult> {
         let provider = self.get_provider(id).await?;
-        if crate::provider::devin::is_devin(&provider) || crate::provider::kiro::is_kiro(&provider)
+        if crate::provider::devin::is_devin(&provider)
+            || crate::provider::kiro::is_kiro(&provider)
+            || (is_claude_provider(&provider) && self.provider_pool_config(id).await?.is_some())
         {
             validate_admin_provider(&provider)?;
             let result = self.test_pool_account_connections(&provider).await?;
@@ -3368,6 +3370,16 @@ impl AdminService {
         if crate::provider::kiro::is_kiro(provider) {
             return self.kiro_provider_models(provider).await;
         }
+        if is_claude_provider(provider) && provider.effective_auth_mode() == "oauth" {
+            // The Claude Code picker is static and must not resolve an ambiguous
+            // provider-only OAuth credential when multiple accounts are bound.
+            return Ok(
+                crate::provider::anthropic::claude_code::catalog::STATIC_MODELS
+                    .iter()
+                    .map(|model| (*model).to_owned())
+                    .collect(),
+            );
+        }
         // Key-pool providers route discovery through the pool snapshots (see
         // discover_provider_models); the runtime credential below is the
         // provider-level key, which an active pool deliberately ignores.
@@ -3506,6 +3518,16 @@ impl AdminService {
         }
         if crate::provider::kiro::is_kiro(provider) {
             return self.kiro_provider_models(provider).await;
+        }
+        if is_claude_provider(provider) && provider.effective_auth_mode() == "oauth" {
+            // The Claude Code picker is static and must not resolve an ambiguous
+            // provider-only OAuth credential when multiple accounts are bound.
+            return Ok(
+                crate::provider::anthropic::claude_code::catalog::STATIC_MODELS
+                    .iter()
+                    .map(|model| (*model).to_owned())
+                    .collect(),
+            );
         }
         // Key-pool providers: the per-key snapshots are the catalog. Union
         // every informed key's effective model set; when no key has ever been

@@ -88,6 +88,8 @@ import { groupProviders, isStandaloneGroup, providerGroupKey, providerNeedsAtten
 import { GroupUsageSummary, ProviderUsageFooter } from "@/components/provider-usage";
 import { DevinAccountPoolCard, DevinAccountPoolPanel } from "@/components/devin-account-pool";
 import { KiroAccountPoolCard, KiroAccountPoolPanel } from "@/components/kiro-account-pool";
+import { ClaudeAccountPoolCard, ClaudeAccountPoolPanel } from "@/components/claude-account-pool";
+import { isClaudeCodeOAuthProvider } from "@/lib/claude-account-pool";
 import { newDevinPoolConfig } from "@/lib/devin-account-pool";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { resolveProtocol, PROTOCOL_ENDPOINT_TABLE, PROTOCOL_TABLE } from "@/lib/protocol";
@@ -1052,7 +1054,7 @@ export default function ProvidersPage() {
   const editOAuthStatusQuery = useQuery<ProviderOAuthStatusData>({
     queryKey: ["provider-oauth-status", editingProvider?.id],
     queryFn: () => backend("get_provider_oauth_status", { id: editingProvider?.id }),
-    enabled: isEditingOAuthProvider && !isDevinProvider(editingProvider) && !isKiroProvider(editingProvider),
+    enabled: isEditingOAuthProvider && !isDevinProvider(editingProvider) && !isKiroProvider(editingProvider) && !isClaudeCodeOAuthProvider(editingProvider),
   });
 
   function syncProviderOAuthStatus(status: ProviderOAuthStatusData) {
@@ -3036,6 +3038,8 @@ export default function ProvidersPage() {
                       <div className="col-span-2"><DevinAccountPoolPanel provider={p} /></div>
                     ) : editingResolvedAuthMode === "oauth" && isKiroProvider(p) ? (
                       <div className="col-span-2"><KiroAccountPoolPanel key={p.id} provider={p} /></div>
+                    ) : editingResolvedAuthMode === "oauth" && isClaudeCodeOAuthProvider(p) ? (
+                      <div className="col-span-2"><ClaudeAccountPoolPanel key={p.id} provider={p} /></div>
                     ) : editingResolvedAuthMode === "oauth" ? (
                       <details className="col-span-2 rounded-xl border border-slate-200 bg-slate-50" open={editOAuthStatus?.status !== "connected" || showEditReauth}>
                         <summary className="flex items-center justify-between gap-3 p-4 cursor-pointer list-none [&::-webkit-details-marker]:hidden">
@@ -4195,7 +4199,7 @@ export default function ProvidersPage() {
                     </ProviderMoreActions>
                   </div>
                 </div>
-                {isDevinProvider(p) ? <DevinAccountPoolCard provider={p} /> : isKiroProvider(p) ? <KiroAccountPoolCard provider={p} /> : providerUsageSupported(p) && <ProviderUsageFooter provider={p} />}
+                {isDevinProvider(p) ? <DevinAccountPoolCard provider={p} /> : isKiroProvider(p) ? <KiroAccountPoolCard provider={p} /> : isClaudeCodeOAuthProvider(p) ? <ClaudeAccountPoolCard provider={p} /> : providerUsageSupported(p) && <ProviderUsageFooter provider={p} />}
               </div>
             );
           })}

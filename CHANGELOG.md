@@ -4,6 +4,27 @@ All notable changes to Nyro will be documented in this file.
 
 ---
 
+## v2.1.8
+
+> Released on 2026-10-29
+
+#### Features
+
+- **Claude Code OAuth account pool**: manage multiple independently authorized Claude accounts behind one Anthropic `claude-code` provider. Add or re-authorize a specific account, edit its label and priority, enable/disable or remove it, and refresh individual or pooled usage from the WebUI. Existing single-account providers remain compatible; the implementation reuses the Devin/Kiro account registry and credential storage without a database migration
+- **Account-aware scheduling and usage**: round-robin or fill-first selection, explicit session affinity and bounded account attempts use each account's actual 5-hour, weekly and model-specific windows. Opus-only exhaustion does not block Sonnet. Per-account retained token/API-equivalent statistics are included; unlike Devin, Claude percentages are not averaged across plans and automatic paid-overage fallback is not enabled
+
+#### Improvements
+
+- **Isolated credentials and safe failover**: request-time and background token refresh use account-scoped singleflight and versioned publication. Requests retain an immutable credential snapshot, account-specific health and diagnostics. Only structured pre-execution refusals can switch accounts; bare HTTP statuses, ambiguous timeouts and accepted streams do not authorize replay
+- **Pool-aware administration**: non-generating connectivity checks inspect enabled accounts independently, model discovery uses the built-in Claude catalog, and OAuth callbacks retain their original account/version target. Account removal fences stale callbacks; ambiguous provider-only model-generation probes are rejected rather than choosing an arbitrary account
+
+#### Fixes
+
+- **Claude usage error handling**: only an explicit HTTP 401 marks usage credentials invalid; a 403 leaves last-good observations stale instead of permanently disabling the account. Usage failures no longer expose raw upstream response snippets or transport error details
+- **Claude session and identity isolation**: session affinity recognizes Claude's native session header and `metadata.user_id.session_id`; fallback wire identities and tool aliases remain account-scoped when upstream account metadata is absent
+
+---
+
 ## v2.1.7
 
 > Released on 2026-10-28

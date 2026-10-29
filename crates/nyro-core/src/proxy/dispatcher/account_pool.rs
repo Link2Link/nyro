@@ -4,8 +4,8 @@ use super::*;
 use crate::db::models::OAuthCredential;
 use crate::error::{AccountFailure, AccountFailureReason as Reason};
 use crate::provider::account_pool::{
-    DevinAccountState, KiroAccountState, account_cost_class, affinity_key, logical_session,
-    supports_pool,
+    ClaudeAccountState, DevinAccountState, KiroAccountState, account_cost_class_for_model,
+    affinity_key, logical_session, supports_pool,
 };
 use std::collections::HashSet;
 
@@ -56,14 +56,25 @@ pub(super) async fn candidates(
     // from included allowance to paid overage), rank again from current state
     // so a better sibling is not skipped. Each pass consumes one account, so
     // this terminates within the pool size.
-    if crate::provider::kiro::is_kiro(provider) {
+    if crate::provider::kiro::is_kiro(provider)
+        || crate::provider::anthropic::claude_code::egress::is_claude_code_channel(provider)
+    {
         let mut remaining = ordered.len();
         while remaining > 0 && !ordered.is_empty() {
             remaining -= 1;
             let head = ordered.remove(0);
-            let expected = account_cost_class(&head, &config);
-            match gw.admin().refresh_kiro_pool_account(provider, &head).await {
-                Ok(current) if account_cost_class(&current, &config) == expected => {
+            let expected = account_cost_class_for_model(&head, &config, model);
+            let refreshed = if crate::provider::kiro::is_kiro(provider) {
+                gw.admin().refresh_kiro_pool_account(provider, &head).await
+            } else {
+                gw.admin()
+                    .refresh_claude_pool_account(provider, &head)
+                    .await
+            };
+            match refreshed {
+                Ok(current)
+                    if account_cost_class_for_model(&current, &config, model) == expected =>
+                {
                     ordered.insert(0, current);
                     break;
                 }
@@ -94,7 +105,7 @@ pub(super) async fn candidates(
         ordered
             .into_iter()
             .filter_map(|credential| {
-                let class = account_cost_class(&credential, &config)?;
+                let class = account_cost_class_for_model(&credential, &config, model)?;
                 Some(SelectedAccount {
                     credential,
                     affinity: affinity.clone(),
@@ -125,7 +136,7 @@ pub(super) async fn still_valid(gw: &Gateway, candidate: &SelectedAccount, model
     matches!(gw.storage.oauth_credentials().get_account(&account.provider_id, &account.account_id).await,
         Ok(Some(current)) if current.status_version == account.status_version
             && current.is_enabled && current.status == "connected"
-            && account_cost_class(&current, &candidate.config)
+            && account_cost_class_for_model(&current, &candidate.config, model)
                 .is_some_and(|class| class <= candidate.class))
 }
 
@@ -173,6 +184,16 @@ pub(super) async fn feedback(
                 };
                 let raw = if account.driver_key == "kiro" {
                     let mut state = KiroAccountState::parse(&current.account_state);
+                    state.rejection_revision = state.rejection_revision.saturating_add(1);
+                    if failure.reason == Reason::AuthInvalid {
+                        state.auth_invalid = true;
+                    } else {
+                        state.hard_quota = true;
+                        state.hard_quota_reason = Some(reason.into());
+                    }
+                    serde_json::to_string(&state)
+                } else if matches!(account.driver_key.as_str(), "claude-code" | "claude") {
+                    let mut state = ClaudeAccountState::parse(&current.account_state);
                     state.rejection_revision = state.rejection_revision.saturating_add(1);
                     if failure.reason == Reason::AuthInvalid {
                         state.auth_invalid = true;

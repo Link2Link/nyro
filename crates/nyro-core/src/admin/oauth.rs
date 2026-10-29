@@ -1333,6 +1333,20 @@ impl AdminService {
                 .resolve_provider_account_runtime(provider, &account)
                 .await;
         }
+        if crate::provider::anthropic::claude_code::egress::is_claude_code_channel(provider) {
+            let state =
+                crate::provider::account_pool::ClaudeAccountState::parse(&oauth_cred.account_state);
+            anyhow::ensure!(
+                oauth_cred.is_enabled && !state.auth_invalid && !state.hard_quota,
+                "Claude Code account is unavailable; refresh usage or reauthorize"
+            );
+            let account = self
+                .refresh_claude_pool_account(provider, &oauth_cred)
+                .await?;
+            return self
+                .resolve_provider_account_runtime(provider, &account)
+                .await;
+        }
         // Terminal refresh failure (`refresh_failure_policy` classified the
         // refresh token itself as rejected): the whole session lineage is
         // dead, so even a nominally-unexpired access token must not be
@@ -1479,26 +1493,42 @@ impl AdminService {
         provider: &Provider,
         account: &OAuthCredential,
     ) -> anyhow::Result<OAuthCredential> {
+        self.refresh_pool_account(provider, account).await
+    }
+
+    pub(crate) async fn refresh_claude_pool_account(
+        &self,
+        provider: &Provider,
+        account: &OAuthCredential,
+    ) -> anyhow::Result<OAuthCredential> {
+        self.refresh_pool_account(provider, account).await
+    }
+
+    async fn refresh_pool_account(
+        &self,
+        provider: &Provider,
+        account: &OAuthCredential,
+    ) -> anyhow::Result<OAuthCredential> {
         let admin = self.clone();
         let provider = provider.clone();
         let account = account.clone();
-        tokio::spawn(async move {
-            admin
-                .refresh_kiro_pool_account_inner(&provider, &account)
-                .await
-        })
-        .await
-        .map_err(|_| anyhow::anyhow!("Kiro account refresh task failed"))?
+        tokio::spawn(async move { admin.refresh_pool_account_inner(&provider, &account).await })
+            .await
+            .map_err(|_| anyhow::anyhow!("Account refresh task failed"))?
     }
 
-    async fn refresh_kiro_pool_account_inner(
+    async fn refresh_pool_account_inner(
         &self,
         provider: &Provider,
         account: &OAuthCredential,
     ) -> anyhow::Result<OAuthCredential> {
         anyhow::ensure!(
-            crate::provider::kiro::is_kiro(provider) && account.provider_id == provider.id,
-            "Kiro account target mismatch"
+            (crate::provider::kiro::is_kiro(provider)
+                || crate::provider::anthropic::claude_code::egress::is_claude_code_channel(
+                    provider
+                ))
+                && account.provider_id == provider.id,
+            "OAuth account target mismatch"
         );
         let lock = self
             .gw
@@ -1529,8 +1559,18 @@ impl AdminService {
         {
             return Ok(current);
         }
-        let driver = auth::build_driver("kiro").context("Kiro auth driver missing")?;
-        let credential = stored_credential_from_oauth(&current, "kiro");
+        let driver_key = if crate::provider::kiro::is_kiro(provider) {
+            "kiro"
+        } else {
+            "claude-code"
+        };
+        anyhow::ensure!(
+            current.driver_key.is_empty()
+                || auth::normalize_driver_key(&current.driver_key) == driver_key,
+            "Account auth driver mismatch"
+        );
+        let driver = auth::build_driver(driver_key).context("Account auth driver missing")?;
+        let credential = stored_credential_from_oauth(&current, driver_key);
         if let Some(lease) = store
             .try_begin_account_refresh(&provider.id, &current.account_id, current.status_version)
             .await?
@@ -1552,7 +1592,7 @@ impl AdminService {
                             && joined.status == "connected"
                             && !joined.access_token.trim().is_empty()
                             && !is_expired_at(joined.expires_at.as_deref()),
-                        "Kiro account refresh failed or was superseded"
+                        "Account refresh failed or was superseded"
                     );
                     return Ok(joined);
                 }
@@ -1560,7 +1600,7 @@ impl AdminService {
                     tokio::time::sleep(Duration::from_millis(100)).await;
                 }
             }
-            anyhow::bail!("Concurrent Kiro account refresh timed out");
+            anyhow::bail!("Concurrent account refresh timed out");
         }
         let refreshed = store
             .get_account(&provider.id, &current.account_id)
@@ -1571,7 +1611,7 @@ impl AdminService {
                 && refreshed.status == "connected"
                 && !refreshed.access_token.trim().is_empty()
                 && !is_expired_at(refreshed.expires_at.as_deref()),
-            "Kiro account refresh was superseded"
+            "Account refresh was superseded"
         );
         Ok(refreshed)
     }
@@ -1651,15 +1691,19 @@ impl AdminService {
                 None => continue,
             };
 
-            if crate::provider::kiro::is_kiro(&provider) {
+            if crate::provider::kiro::is_kiro(&provider)
+                || crate::provider::anthropic::claude_code::egress::is_claude_code_channel(
+                    &provider,
+                )
+            {
                 if !cred.is_enabled {
                     continue;
                 }
-                match self.refresh_kiro_pool_account(&provider, &cred).await {
+                match self.refresh_pool_account(&provider, &cred).await {
                     Ok(_) => refreshed += 1,
                     Err(_) => {
                         tracing::warn!(provider_id = %provider.id, account_id = %cred.account_id,
-                        "Background Kiro account refresh failed")
+                        "Background account refresh failed")
                     }
                 }
                 continue;
@@ -1761,13 +1805,13 @@ impl AdminService {
             Ok(bundle) => bundle,
             Err(error) => {
                 let (terminal, meta, message) = refresh_failure_policy(credential, &error);
-                if crate::provider::kiro::is_kiro(provider) {
+                if crate::provider::account_pool::supports_pool(provider) {
                     store
                         .fail_account_refresh_with_policy(
                             &provider.id,
                             &lease.account_id,
                             lease.status_version,
-                            "Kiro credential refresh failed",
+                            "Account credential refresh failed",
                             terminal,
                             meta,
                         )
@@ -1792,7 +1836,7 @@ impl AdminService {
             &bundle,
         );
         let publish = async {
-            if crate::provider::kiro::is_kiro(provider) {
+            if crate::provider::account_pool::supports_pool(provider) {
                 store
                     .complete_account_refresh(
                         &provider.id,
@@ -2758,6 +2802,119 @@ mod kiro_account_refresh_tests {
     use super::*;
     struct RefreshFixture {
         reject: bool,
+    }
+    struct ClaudeRefreshFixture {
+        reject: bool,
+    }
+    #[async_trait::async_trait]
+    impl auth::AuthDriver for ClaudeRefreshFixture {
+        fn metadata(&self) -> auth::AuthDriverMetadata {
+            auth::build_driver("claude-code").unwrap().metadata()
+        }
+        async fn refresh(
+            &self,
+            _: &StoredCredential,
+            _: RefreshAuthContext,
+        ) -> anyhow::Result<CredentialBundle> {
+            if self.reject {
+                anyhow::bail!("invalid_grant PRIVATE");
+            }
+            Ok(CredentialBundle {
+                access_token: Some("claude-rotated".into()),
+                refresh_token: Some("claude-refresh-rotated".into()),
+                expires_at: Some((Utc::now() + chrono::Duration::hours(1)).to_rfc3339()),
+                ..Default::default()
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn claude_refresh_is_account_scoped_and_disconnect_fences_publication() {
+        for mode in ["success", "reject", "disconnect"] {
+            let mut provider: Provider = serde_json::from_value(serde_json::json!({
+                "id":"claude-pool", "name":"Claude", "vendor":"anthropic", "preset_key":"anthropic", "channel":"claude-code",
+                "protocol":"anthropic-messages", "protocol_mode":"fixed", "base_url":"https://api.anthropic.com",
+                "api_key":"", "auth_mode":"oauth", "is_enabled":false, "created_at":"", "updated_at":""
+            })).unwrap();
+            provider.is_enabled = false;
+            let storage = Arc::new(crate::storage::MemoryStorage::new(
+                vec![provider.clone()],
+                vec![],
+                vec![],
+            ));
+            let (gw, _) = Gateway::from_storage(Default::default(), storage)
+                .await
+                .unwrap();
+            let store = gw.storage.oauth_credentials();
+            let input = |name: &str| UpsertOAuthCredential {
+                driver_key: "claude-code".into(),
+                scheme: "oauth_auth_code_pkce".into(),
+                access_token: name.into(),
+                refresh_token: Some(format!("refresh-{name}")),
+                ..Default::default()
+            };
+            let a = store
+                .create_account(&provider.id, "A", input("a"))
+                .await
+                .unwrap();
+            let b = store
+                .create_account(&provider.id, "B", input("b"))
+                .await
+                .unwrap();
+            let lease = store
+                .try_begin_account_refresh(&provider.id, &a.account_id, a.status_version)
+                .await
+                .unwrap()
+                .unwrap();
+            if mode == "disconnect" {
+                assert!(
+                    store
+                        .disconnect_account(&provider.id, &a.account_id, lease.status_version)
+                        .await
+                        .unwrap()
+                );
+            }
+            let result = gw
+                .admin()
+                .refresh_locked_credential(
+                    &provider,
+                    &stored_credential_from_oauth(&a, "claude-code"),
+                    &lease,
+                    &ClaudeRefreshFixture {
+                        reject: mode == "reject",
+                    },
+                )
+                .await;
+            assert_eq!(result.is_ok(), mode == "success");
+            let current = store
+                .get_account(&provider.id, &a.account_id)
+                .await
+                .unwrap();
+            match mode {
+                "success" => {
+                    let current = current.unwrap();
+                    assert_eq!(current.access_token, "claude-rotated");
+                    assert_eq!(
+                        current.refresh_token.as_deref(),
+                        Some("claude-refresh-rotated")
+                    );
+                    assert_eq!(current.scheme, "oauth_auth_code_pkce");
+                }
+                "reject" => {
+                    let current = current.unwrap();
+                    assert_eq!(current.status, "error");
+                    assert!(!current.last_error.unwrap().contains("PRIVATE"));
+                }
+                _ => assert!(current.is_none()),
+            }
+            let sibling = store
+                .get_account(&provider.id, &b.account_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(sibling.access_token, "b");
+            assert_eq!(sibling.status_version, b.status_version);
+        }
     }
     #[async_trait::async_trait]
     impl auth::AuthDriver for RefreshFixture {

@@ -647,7 +647,18 @@ async fn handle_buffered_compat(
         } else {
             health_outcome_from_status(metadata.status)
         };
+        let refusal = serde_json::from_slice::<Value>(&body)
+            .ok()
+            .and_then(|body| {
+                crate::provider::anthropic::claude_code::errors::account_refusal(
+                    metadata.status,
+                    &body,
+                )
+            });
         let tag = |mut response: Response| {
+            if let Some(failure) = refusal {
+                response.extensions_mut().insert(failure);
+            }
             if entitlement {
                 response.extensions_mut().insert(super::EntitlementRefusal);
             }

@@ -18,6 +18,7 @@
 //! Sonnet-only week on Max/Team plans, and one row per model-scoped weekly
 //! limit; nyro maps the same buckets onto its common usage tiers.
 
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::profile;
@@ -25,8 +26,8 @@ use super::profile;
 const USAGE_PATH: &str = "/api/oauth/usage";
 
 /// One usage window, in nyro's tier vocabulary (see `admin::usage`).
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) struct UsageWindow {
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct UsageWindow {
     /// `five_hour`, `weekly_limit`, or `feature:<name>:<window>`.
     pub name: String,
     pub used_percent: f64,
@@ -34,8 +35,9 @@ pub(crate) struct UsageWindow {
 }
 
 /// Parsed `/api/oauth/usage`.
-#[derive(Debug, Clone, Default, PartialEq)]
-pub(crate) struct ClaudeUsage {
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct ClaudeUsage {
     pub windows: Vec<UsageWindow>,
 }
 
@@ -250,26 +252,33 @@ pub(crate) async fn fetch_usage(
         .timeout(std::time::Duration::from_secs(15))
         .send()
         .await
-        .map_err(|error| anyhow::anyhow!("Claude usage request failed: {error}"))?;
+        .map_err(|_| {
+            anyhow::anyhow!("Claude usage request failed; verify proxy/network settings")
+        })?;
     let status = response.status();
     let raw = response
         .bytes()
         .await
-        .map_err(|error| anyhow::anyhow!("failed to read Claude usage response: {error}"))?;
+        .map_err(|_| anyhow::anyhow!("Failed to read Claude usage response"))?;
     if !status.is_success() {
-        let preview: String = String::from_utf8_lossy(&raw).chars().take(240).collect();
+        // Usage errors reach management APIs: never include raw upstream bodies,
+        // request URLs or credentials in diagnostics. A bare 403 may be policy
+        // or scope denial, not proof that the credential was revoked.
         match status {
-            reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN => anyhow::bail!(
-                "Claude authentication failed (HTTP {status}); re-authorize this provider"
-            ),
+            reqwest::StatusCode::UNAUTHORIZED => {
+                anyhow::bail!("Claude authentication failed (HTTP 401); re-authorize this provider")
+            }
+            reqwest::StatusCode::FORBIDDEN => {
+                anyhow::bail!("Claude usage access denied (HTTP 403); verify account permissions")
+            }
             reqwest::StatusCode::TOO_MANY_REQUESTS => {
                 anyhow::bail!("Claude usage endpoint is rate limited (HTTP 429); retry later")
             }
-            _ => anyhow::bail!("Claude usage query failed (HTTP {status}): {preview}"),
+            _ => anyhow::bail!("Claude usage query failed (HTTP {})", status.as_u16()),
         }
     }
     let body: Value = serde_json::from_slice(&raw)
-        .map_err(|error| anyhow::anyhow!("failed to parse Claude usage response: {error}"))?;
+        .map_err(|_| anyhow::anyhow!("Invalid Claude usage response"))?;
     Ok(parse_usage(&body))
 }
 
@@ -277,6 +286,40 @@ pub(crate) async fn fetch_usage(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn usage_http_errors_are_sanitized_and_only_401_means_auth_rejection() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for status in [401, 403, 429, 500] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let task = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = [0u8; 4096];
+                let _ = socket.read(&mut request).await.unwrap();
+                let body = "PRIVATE-UPSTREAM-ACCESS-TOKEN";
+                socket.write_all(format!("HTTP/1.1 {status} Error\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+            });
+            let error = fetch_usage(
+                &reqwest::Client::new(),
+                &format!("http://{address}"),
+                "SECRET-TOKEN",
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+            task.await.unwrap();
+            assert!(
+                !error.contains("PRIVATE")
+                    && !error.contains("SECRET")
+                    && !error.contains(&address.to_string())
+            );
+            assert_eq!(
+                error.starts_with("Claude authentication failed"),
+                status == 401
+            );
+        }
+    }
 
     #[test]
     fn maps_session_week_and_model_buckets() {
@@ -311,6 +354,23 @@ mod tests {
             Some("2026-10-28T18:00:00Z")
         );
         assert_eq!(usage.windows[3].used_percent, 61.0);
+    }
+
+    #[test]
+    fn public_usage_round_trips_only_typed_windows() {
+        let usage = parse_usage(&json!({
+            "five_hour":{"utilization":23.5,"resets_at":"2030-01-01T00:00:00Z"},
+            "seven_day":{"utilization":40},
+            "secret":"PRIVATE", "extra_usage":{"is_enabled":true,"opaque":"PRIVATE"}
+        }));
+        let serialized = serde_json::to_string(&usage).unwrap();
+        assert!(!serialized.contains("PRIVATE") && !serialized.contains("extra_usage"));
+        let restored: ClaudeUsage = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(restored, usage);
+        assert_eq!(
+            serde_json::to_value(restored).unwrap()["windows"][1]["name"],
+            "weekly_limit"
+        );
     }
 
     #[test]

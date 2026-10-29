@@ -2372,7 +2372,7 @@ impl AdminService {
     ) -> anyhow::Result<ProviderUsage> {
         let provider = self.get_provider(id).await?;
         if crate::provider::devin::is_devin(&provider)
-            || (crate::provider::kiro::is_kiro(&provider)
+            || ((crate::provider::kiro::is_kiro(&provider) || is_claude_provider(&provider))
                 && self.provider_pool_config(id).await?.is_some())
         {
             let view = self
@@ -3260,7 +3260,7 @@ async fn refresh_due_provider_usage(gw: &Gateway) {
     let mut due = Vec::new();
     for provider in providers {
         let account_pool = crate::provider::devin::is_devin(&provider)
-            || (crate::provider::kiro::is_kiro(&provider)
+            || ((crate::provider::kiro::is_kiro(&provider) || is_claude_provider(&provider))
                 && admin
                     .provider_pool_config(&provider.id)
                     .await
