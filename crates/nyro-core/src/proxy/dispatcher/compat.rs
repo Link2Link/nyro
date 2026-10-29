@@ -1077,14 +1077,30 @@ fn build_streaming_compat_response(
         // lets the log layer tell hook adjustments apart from conversion loss.
         let mut pre_hook_accumulator = super::LogUsageAccumulator::default();
         let mut terminal = StreamTerminal::default();
+        // Track actual post-hook bytes only after a successful send. The
+        // pre-hook terminal alone cannot prove the client was sent completion.
+        let mut sent_terminal = StreamTerminal::default();
         let mut chunks = 0_i32;
         let mut stream_error = None;
         let mut upstream_ended = false;
+        let mut completed_on_close = false;
 
         loop {
             let item = tokio::select! {
                 biased;
                 _ = tx.closed() => {
+                    // Codex may stop reading at response.completed, before the
+                    // upstream EOF and downstream EOS polls. Do not turn that
+                    // fully delivered completion into an explicit cancellation:
+                    // it would disable Attempt's drop/EOF reconciliation.
+                    // Send-failure branches below deliberately keep cancelling;
+                    // their current frame has NOT reached the drain counters.
+                    if sent_terminal.confirmed_success()
+                        && log.performance.as_ref().is_some_and(|p| p.completed_delivery_confirmed())
+                    {
+                        completed_on_close = true;
+                        break;
+                    }
                     request_context.cancellation.cancel();
                     let _ = bridge.push_chunk(Ok(()));
                     if let Some(p) = &log.performance { p.record_message("cancelled", "client_cancelled", "client_delivery", "Client disconnected."); }
@@ -1198,7 +1214,7 @@ fn build_streaming_compat_response(
                 biased;
                 _ = tx.closed() => false,
                 _ = tokio::time::sleep(request_context.deadline.remaining()) => false,
-                result = tx.send(Ok(outgoing)) => result.is_ok(),
+                result = tx.send(Ok(outgoing.clone())) => result.is_ok(),
             };
             if !sent {
                 request_context.cancellation.cancel();
@@ -1206,6 +1222,7 @@ fn build_streaming_compat_response(
                 stream_error = Some("client disconnected".to_string());
                 break;
             }
+            observe_terminal(&mut sent_terminal, &outgoing, client_protocol);
             if let Some(p) = &log.performance {
                 p.note_client_frame_sent();
             }
@@ -1246,9 +1263,10 @@ fn build_streaming_compat_response(
                     biased;
                     _ = tx.closed() => false,
                     _ = tokio::time::sleep(request_context.deadline.remaining()) => false,
-                    result = tx.send(Ok(outgoing)) => result.is_ok(),
+                    result = tx.send(Ok(outgoing.clone())) => result.is_ok(),
                 };
                 if sent {
+                    observe_terminal(&mut sent_terminal, &outgoing, client_protocol);
                     if let Some(p) = &log.performance {
                         p.note_client_frame_sent();
                     }
@@ -1272,11 +1290,20 @@ fn build_streaming_compat_response(
         let stream_completed =
             stream_error.is_none() && terminal.error.is_none() && terminal.success;
         let provider_error = terminal.error.is_some() || (upstream_ended && !terminal.success);
+        // Recheck after parser/hook flushing: a failed final send, external
+        // cancellation or deadline must not inherit an earlier graceful close.
+        let completed_on_close = completed_on_close
+            && stream_completed
+            && sent_terminal.confirmed_success()
+            && log
+                .performance
+                .as_ref()
+                .is_some_and(|p| p.completed_delivery_confirmed());
         match stream_health_outcome(
             bridge.state(),
             stream_completed,
             provider_error,
-            tx.is_closed(),
+            tx.is_closed() && !completed_on_close,
         ) {
             StreamHealthOutcome::Neutral => health_permit.neutral(),
             StreamHealthOutcome::Success => {
@@ -1363,10 +1390,22 @@ fn stream_health_outcome(
 struct StreamTerminal {
     buffer: String,
     success: bool,
+    incomplete: bool,
+    invalid: bool,
     error: Option<String>,
 }
 
 impl StreamTerminal {
+    /// A fully framed successful client terminal, not an incomplete response or
+    /// an unterminated SSE block. Never flush the buffer to justify a close.
+    fn confirmed_success(&self) -> bool {
+        self.success
+            && !self.incomplete
+            && !self.invalid
+            && self.error.is_none()
+            && self.buffer.trim().is_empty()
+    }
+
     fn finish(&mut self, protocol: ProtocolId) {
         if !self.buffer.trim().is_empty() {
             let block = std::mem::take(&mut self.buffer);
@@ -1388,6 +1427,24 @@ impl StreamTerminal {
         let event = event_name
             .or_else(|| value.as_ref()?.get("type")?.as_str())
             .unwrap_or_default();
+        // Keep legacy health-round detection below, but require consistent
+        // JSON evidence for the stricter delivered-success close exception.
+        if !data.is_empty() || !event.is_empty() {
+            self.invalid |= value.as_ref().is_none_or(|value| {
+                !value.is_object()
+                    || value
+                        .get("type")
+                        .is_some_and(|kind| kind.as_str() != Some(event))
+                    || value.get("error").is_some_and(|error| !error.is_null())
+                    || value
+                        .pointer("/response/error")
+                        .is_some_and(|error| !error.is_null())
+                    || (event == "response.completed"
+                        && value
+                            .pointer("/response/status")
+                            .is_some_and(|status| status != "completed"))
+            });
+        }
         if protocol == ANTHROPIC_MESSAGES_2023_06_01 {
             match event {
                 "message_stop" => self.success = true,
@@ -1398,7 +1455,11 @@ impl StreamTerminal {
             }
         } else if protocol == OPENAI_RESPONSES_V1 {
             match event {
-                "response.completed" | "response.incomplete" => self.success = true,
+                "response.completed" => self.success = true,
+                "response.incomplete" => {
+                    self.success = true;
+                    self.incomplete = true;
+                }
                 "response.failed" | "error" => {
                     self.error = Some("Responses compat stream emitted an error".to_string())
                 }
@@ -1677,6 +1738,78 @@ mod tests {
             "wrapped",
         );
         assert_eq!(stream_failure_kind(Some(&attempt)), "upstream_read_error");
+    }
+
+    #[test]
+    fn sent_terminal_requires_complete_successful_client_framing() {
+        let completed = b"event: response.completed\ndata: {\"type\":\"response.completed\"}\n\n";
+        for payload in [
+            "not-json",
+            "[]",
+            r#"{"type":"response.incomplete"}"#,
+            r#"{"type":"response.completed","response":{"status":"incomplete"}}"#,
+            r#"{"type":"response.completed","error":{"message":"failed"}}"#,
+        ] {
+            let mut terminal = StreamTerminal::default();
+            let wire = format!("event: response.completed\ndata: {payload}\n\n");
+            observe_terminal(&mut terminal, wire.as_bytes(), OPENAI_RESPONSES_V1);
+            assert!(
+                !terminal.confirmed_success(),
+                "invalid client terminal: {payload}"
+            );
+        }
+        let mut terminal = StreamTerminal::default();
+        observe_terminal(
+            &mut terminal,
+            &completed[..completed.len() - 1],
+            OPENAI_RESPONSES_V1,
+        );
+        assert!(
+            !terminal.confirmed_success(),
+            "an unterminated terminal is not delivered completion"
+        );
+        observe_terminal(&mut terminal, b"\n", OPENAI_RESPONSES_V1);
+        assert!(terminal.confirmed_success());
+        observe_terminal(
+            &mut terminal,
+            b"event: response.incomplete\ndata: {\"type\":\"response.incomplete\"}\n\n",
+            OPENAI_RESPONSES_V1,
+        );
+        assert!(
+            terminal.success,
+            "incomplete still ends the API round for health tracking"
+        );
+        assert!(
+            !terminal.confirmed_success(),
+            "post-hook incomplete must not count as completed"
+        );
+        observe_terminal(&mut terminal, completed, OPENAI_RESPONSES_V1);
+        assert!(
+            !terminal.confirmed_success(),
+            "incomplete evidence stays sticky"
+        );
+
+        let mut terminal = StreamTerminal::default();
+        observe_terminal(&mut terminal, completed, OPENAI_RESPONSES_V1);
+        observe_terminal(
+            &mut terminal,
+            b"event: error\ndata: {\"type\":\"error\"}\n\n",
+            OPENAI_RESPONSES_V1,
+        );
+        assert!(
+            !terminal.confirmed_success(),
+            "errors stay sticky after completion"
+        );
+        let mut terminal = StreamTerminal::default();
+        observe_terminal(
+            &mut terminal,
+            b"event: response.output_text.delta\ndata: {\"delta\":\"partial\"}\n\n",
+            OPENAI_RESPONSES_V1,
+        );
+        assert!(
+            !terminal.confirmed_success(),
+            "a hook that removes the terminal cannot prove completion"
+        );
     }
 
     #[test]
@@ -2091,6 +2224,97 @@ mod tests {
             body: None,
         };
         (call_ctx, req_ctx, req_ir, req_extras)
+    }
+
+    #[tokio::test]
+    async fn unsent_terminal_frame_still_cancels_after_original_completion() {
+        let (gw, mut logs) = test_gateway().await;
+        let provider = provider("nyro-gateway", "default");
+        let (mut call, ctx, request, _) = call_context(
+            &gw,
+            &provider,
+            OPENAI_RESPONSES_V1,
+            OPENAI_RESPONSES_V1,
+            true,
+        );
+        let performance = crate::performance::Attempt::new(
+            gw.log_tx.clone(),
+            ctx.cancellation.clone(),
+            ctx.deadline.clone(),
+        );
+        performance.correlate(&ctx.request_id, 1);
+        performance.select_final(1);
+        performance.expect_delivery();
+        let completed = Bytes::from_static(b"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[]}}\n\n");
+        // The converter has already read the ORIGINAL terminal, but has not
+        // yielded its client-facing terminal yet.
+        performance.chunk(&completed);
+        call.performance = Some(performance.clone());
+        let body_slot =
+            std::sync::Arc::new(std::sync::Mutex::new(None::<axum::body::BodyDataStream>));
+        let slot = body_slot.clone();
+        let observed = performance.clone();
+        let (release, ready) = tokio::sync::oneshot::channel();
+        let first = futures::stream::once(async {
+            Ok(Bytes::from_static(b"event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"status\":\"in_progress\",\"output\":[]}}\n\n"))
+        });
+        let last = futures::stream::once(async move {
+            ready.await.unwrap();
+            assert!(
+                observed.completed_delivery_confirmed(),
+                "previous frames are fully drained"
+            );
+            // Close INSIDE stream.next(), after the top-level tx.closed poll
+            // was pending. This deterministically exercises the failed-send
+            // branch, not the next iteration's graceful-close exception.
+            drop(slot.lock().unwrap().take().unwrap());
+            Ok(completed)
+        });
+        let mut metadata = ResponseMetadata::new(200);
+        metadata.content_type = Some("text/event-stream".into());
+        let converted = ConvertedResponse {
+            metadata,
+            body: ResponseBody::Stream(Box::pin(first.chain(last))),
+            usage: None,
+        };
+        let attempt = build_streaming_compat_response(
+            converted,
+            LogBuilder::from_ctx(&call),
+            None,
+            None,
+            None,
+            std::time::Instant::now(),
+            None,
+            &call,
+            &ctx,
+            &request,
+            gw.health_registry.try_acquire("unsent-terminal").unwrap(),
+            RawUsageHandle::new(OPENAI_RESPONSES_V1),
+        );
+        let mut body = performance
+            .wrap(attempt.response)
+            .into_body()
+            .into_data_stream();
+        let first = tokio::time::timeout(std::time::Duration::from_secs(3), body.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(!String::from_utf8_lossy(&first).contains("response.completed"));
+        *body_slot.lock().unwrap() = Some(body);
+        release.send(()).unwrap();
+        let row = tokio::time::timeout(std::time::Duration::from_secs(3), logs.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(ctx.cancellation.is_cancelled());
+        assert_eq!(row.diagnostic.attempt_outcome, "cancelled");
+        assert!(row.performance.completed_at.is_none());
+        assert!(
+            !row.client_response_body
+                .unwrap()
+                .contains("response.completed")
+        );
     }
 
     #[tokio::test]

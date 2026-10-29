@@ -4,6 +4,17 @@ All notable changes to Nyro will be documented in this file.
 
 ---
 
+## v2.1.12
+
+> Released on 2026-10-30
+
+#### Fixes
+
+- **Completed Codex streams misreported as cancelled**: Responses-Lite requests routed through the compatibility path, including chained Nyro gateways, now remain completed when the client closes after receiving the full success terminal but before HTTP EOF. Completion requires original upstream evidence, a valid terminal in the actual client-facing bytes and full frame consumption; successful closes also settle provider health correctly
+- **Preserved cancellation and failure safeguards**: mid-stream disconnects, unsent or unread terminal frames, explicit cancellation, deadlines, upstream errors and incomplete responses are not promoted to success. Added deterministic regression coverage for terminal-close races, failed terminal delivery and malformed client-facing terminal events
+
+---
+
 ## v2.1.11
 
 > Released on 2026-10-29

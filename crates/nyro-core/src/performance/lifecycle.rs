@@ -274,6 +274,13 @@ impl Attempt {
     pub fn is_timed_out(&self) -> bool {
         self.0.lock().unwrap().diagnostic.attempt_outcome == "timed_out"
     }
+    /// Original-wire completion plus full HTTP-layer consumption, even before
+    /// EOF/EOS. Only consult between successful sends: an unsent converted frame
+    /// is not part of the drain counters. Callers must also verify that the
+    /// client-facing terminal was actually sent (not removed by conversion/hooks).
+    pub fn completed_delivery_confirmed(&self) -> bool {
+        self.0.lock().unwrap().completed_delivery_confirmed()
+    }
     /// Called only after retry selection. Emission still waits for outer Body EOS.
     pub fn select_final(&self, attempt_count: i32) {
         self.0.lock().unwrap().final_attempt_count = Some(attempt_count);
@@ -524,6 +531,16 @@ impl State {
     fn client_drained(&self) -> bool {
         self.client_frames_sent > 0 && self.client_frames_polled >= self.client_frames_sent
     }
+    fn completed_delivery_confirmed(&self) -> bool {
+        self.confirmed_completed()
+            && self.client_drained()
+            && !self.cancellation.is_cancelled()
+            && !self.deadline.is_exceeded()
+            && !matches!(
+                self.diagnostic.attempt_outcome.as_str(),
+                "failed" | "timed_out" | "output_limited"
+            )
+    }
     fn accepts(&self, outcome: &str) -> bool {
         fn rank(outcome: &str) -> u8 {
             match outcome {
@@ -622,15 +639,7 @@ impl State {
         // every produced client frame reconciles those drop artifacts into
         // confirmed completion. Confirmed failures, timeouts and output
         // limits stay sticky and are never demoted.
-        if self.confirmed_completed()
-            && !self.cancellation.is_cancelled()
-            && !self.deadline.is_exceeded()
-            && self.client_drained()
-            && !matches!(
-                self.diagnostic.attempt_outcome.as_str(),
-                "failed" | "timed_out" | "completed" | "output_limited"
-            )
-        {
+        if self.completed_delivery_confirmed() && self.diagnostic.attempt_outcome != "completed" {
             self.diagnostic.outcome_version = crate::logging::diagnostics::OUTCOME_VERSION;
             self.diagnostic.attempt_outcome = "completed".into();
             self.diagnostic.failure_kind = None;
@@ -1514,6 +1523,54 @@ mod tests {
         drop(body);
         assert_eq!(rx.try_recv().unwrap().performance.completion, "timed_out");
     }
+    #[test]
+    fn completed_delivery_evidence_requires_original_terminal_drain_and_live_context() {
+        for case in [
+            "delivered",
+            "drop_artifact",
+            "undrained",
+            "empty",
+            "no_terminal",
+            "external_cancel",
+            "deadline",
+            "failed",
+            "timed_out",
+            "output_limited",
+        ] {
+            let (a, _producer, _logs) = setup();
+            if case != "no_terminal" {
+                // Intentionally no EOF: this is evidence for a terminal close.
+                a.chunk(b"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n");
+            }
+            {
+                let mut state = a.0.lock().unwrap();
+                state.client_frames_sent = 2;
+                state.client_frames_polled = 2;
+                match case {
+                    "drop_artifact" => {
+                        state.fail("cancelled", "downstream body dropped before EOS".into())
+                    }
+                    "undrained" => state.client_frames_polled = 1,
+                    "empty" => {
+                        state.client_frames_sent = 0;
+                        state.client_frames_polled = 0;
+                    }
+                    "external_cancel" => state.cancellation.cancel(),
+                    "deadline" => state.deadline = Deadline::from_now(std::time::Duration::ZERO),
+                    "failed" | "timed_out" | "output_limited" => {
+                        state.fail(case, "sticky outcome".into())
+                    }
+                    _ => {}
+                }
+            }
+            assert_eq!(
+                a.completed_delivery_confirmed(),
+                matches!(case, "delivered" | "drop_artifact"),
+                "{case}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn terminal_delivered_client_close_is_completed_not_cancelled() {
         // codex-style consumers stop reading once they see the protocol

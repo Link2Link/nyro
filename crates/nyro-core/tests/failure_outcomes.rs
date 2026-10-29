@@ -207,6 +207,260 @@ async fn codex_style_close_after_terminal_is_completed_not_cancelled() -> anyhow
     Ok(())
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum ResponsesClose {
+    Terminal,
+    FirstFrame,
+    ExternalCancel,
+    Deadline,
+}
+
+// Reduced from incident 7f5449a7: Codex Responses-Lite tool carrier, a normal
+// response.completed with usage, then downstream close BEFORE upstream HTTP EOF.
+// The pending tail makes the close/EOF race deterministic without timing sleeps.
+async fn responses_compat_close_case(
+    terminal: Option<&str>,
+    close: ResponsesClose,
+) -> anyhow::Result<()> {
+    let (_dir, gw, mut logs, _, setup_job) = setup().await?;
+    let prefix = concat!(
+        "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_test\",\"status\":\"in_progress\",\"output\":[]}}\n\n",
+        "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"content_index\":0,\"delta\":\"hello\"}\n\n",
+    );
+    let tail = match terminal {
+        Some("completed") => {
+            "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_test\",\"status\":\"completed\",\"error\":null,\"output\":[],\"usage\":{\"input_tokens\":11377,\"output_tokens\":392,\"total_tokens\":11769}}}\n\n"
+        }
+        Some("failed") => {
+            "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp_test\",\"status\":\"failed\",\"error\":{\"message\":\"upstream failed\"}}}\n\n"
+        }
+        Some("incomplete") => {
+            "event: response.incomplete\ndata: {\"type\":\"response.incomplete\",\"response\":{\"status\":\"incomplete\",\"incomplete_details\":{\"reason\":\"max_output_tokens\"},\"output\":[]}}\n\n"
+        }
+        None => "",
+        _ => unreachable!(),
+    };
+    let wire = format!("{prefix}{tail}");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let url = format!("http://{}/v1", listener.local_addr()?);
+    let (request_tx, mut request_rx) = tokio::sync::mpsc::channel(1);
+    let source = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            Router::new().route(
+                "/v1/responses",
+                post(move |Json(body): Json<Value>| {
+                    let request_tx = request_tx.clone();
+                    let wire = wire.clone();
+                    async move {
+                        request_tx.send(body).await.unwrap();
+                        let stream = futures::stream::once(async move {
+                            Ok::<_, std::convert::Infallible>(bytes::Bytes::from(wire))
+                        })
+                        .chain(futures::stream::pending());
+                        (
+                            [("content-type", "text/event-stream")],
+                            Body::from_stream(stream),
+                        )
+                    }
+                }),
+            ),
+        )
+        .await
+        .unwrap();
+    });
+    let p = gw
+        .admin()
+        .create_provider(CreateProvider {
+            keys: Vec::new(),
+            name: "Chained Nyro".into(),
+            vendor: Some("nyro-gateway".into()),
+            protocol: OPENAI_RESPONSES_V1.to_string(),
+            base_url: url,
+            protocol_mode: "fixed".into(),
+            protocol_endpoints: vec![],
+            preset_key: None,
+            channel: Some("default".into()),
+            models_source: None,
+            static_models: None,
+            api_key: "test-key".into(),
+            auth_mode: "apikey".into(),
+            use_proxy: false,
+            fast_mode: false,
+        })
+        .await?
+        .id;
+    route(&gw, "responses-close", p, "upstream-model", vec![]).await?;
+    let body = json!({
+        "model":"responses-close", "stream":true, "store":false,
+        "input":[
+            {"type":"additional_tools", "role":"developer", "tools":[
+                {"type":"function", "name":"test_tool", "parameters":{"type":"object", "properties":{}}},
+                {"type":"custom", "name":"custom_tool", "format":{"type":"text"}}
+            ]},
+            {"type":"message", "role":"user", "content":[{"type":"input_text", "text":"hi"}]}
+        ]
+    });
+    let request = OPENAI_RESPONSES_V1
+        .handler()
+        .make_request_decoder()
+        .decode_request(body.clone())?;
+    let ctx = RequestContext::new(
+        OPENAI_RESPONSES_V1,
+        Duration::from_secs(if close == ResponsesClose::Deadline {
+            1
+        } else {
+            10
+        }),
+    );
+    let deadline = ctx.deadline.clone();
+    let cancellation = ctx.cancellation.clone();
+    let outcome = ctx.outcome.clone();
+    let id = ctx.request_id.clone();
+    let response = dispatch_pipeline(
+        gw.clone(),
+        HeaderMap::new(),
+        RawEnvelope::new(Some(body), HashMap::new(), "POST", "/v1/responses"),
+        request,
+        OPENAI_RESPONSES_V1,
+        ctx,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let upstream_request = tokio::time::timeout(Duration::from_secs(3), request_rx.recv())
+        .await?
+        .unwrap();
+    assert_eq!(upstream_request["tools"][0]["name"], "test_tool");
+    assert_eq!(
+        upstream_request["input"].as_array().unwrap().len(),
+        1,
+        "Responses-Lite carrier must select the third-party compat path"
+    );
+    let mut stream = response.into_body().into_data_stream();
+    let mut received = String::new();
+    loop {
+        let chunk = tokio::time::timeout(Duration::from_secs(3), stream.next())
+            .await?
+            .unwrap()?;
+        received.push_str(&String::from_utf8_lossy(&chunk));
+        if close == ResponsesClose::FirstFrame
+            || received.contains(&format!("event: response.{}\n", terminal.unwrap()))
+        {
+            break;
+        }
+    }
+    if close == ResponsesClose::FirstFrame {
+        assert!(
+            !received.contains("event: response.completed\n"),
+            "test must close before consuming the terminal"
+        );
+    }
+    if close == ResponsesClose::ExternalCancel {
+        cancellation.cancel();
+    }
+    if close == ResponsesClose::Deadline {
+        // Deadline uses std::time::Instant, not Tokio's pausable clock. Wait
+        // for its exact wall-clock boundary, not an arbitrary race delay.
+        tokio::time::sleep_until(
+            tokio::time::Instant::from_std(deadline.at()) + Duration::from_millis(1),
+        )
+        .await;
+        assert!(deadline.is_exceeded());
+    }
+    drop(stream);
+    let row = tokio::time::timeout(Duration::from_secs(3), logs.recv())
+        .await?
+        .unwrap();
+    let expected = if close == ResponsesClose::Deadline {
+        "timed_out"
+    } else if terminal == Some("failed") && close != ResponsesClose::FirstFrame {
+        "failed"
+    } else if terminal == Some("completed") && close == ResponsesClose::Terminal {
+        "completed"
+    } else {
+        "cancelled"
+    };
+    assert_eq!(
+        row.diagnostic.attempt_outcome, expected,
+        "{:?}",
+        row.diagnostic
+    );
+    assert_eq!(row.client_status_code, 200);
+    assert_eq!(row.upstream_status_code, Some(200));
+    assert_eq!(
+        row.diagnostic.client_request_id.as_deref(),
+        Some(id.as_str())
+    );
+    assert_eq!(
+        row.diagnostic.final_result.as_ref().unwrap().final_outcome,
+        expected
+    );
+    assert_eq!(
+        row.diagnostic.payload_metadata["upstream_response_body"]["complete"],
+        false
+    );
+    if expected == "completed" {
+        assert!(
+            !cancellation.is_cancelled(),
+            "terminal close must not set explicit cancellation"
+        );
+        assert!(row.diagnostic.failure_kind.is_none());
+        assert!(row.diagnostic.error_causes.is_empty());
+        assert!(row.performance.completed_at.is_some());
+        assert_eq!(
+            outcome.get(),
+            Some(&nyro_core::proxy::context::RequestOutcome::Success)
+        );
+        assert_eq!(row.input_tokens(), 11377);
+        assert_eq!(row.output_tokens(), 392);
+        assert_eq!(
+            row.diagnostic.payload_metadata["client_response_body"]["complete"],
+            true
+        );
+    } else {
+        assert!(row.performance.completed_at.is_none());
+    }
+    assert!(logs.try_recv().is_err());
+    source.abort();
+    setup_job.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn responses_compat_terminal_close_is_completed() -> anyhow::Result<()> {
+    responses_compat_close_case(Some("completed"), ResponsesClose::Terminal).await
+}
+
+#[tokio::test]
+async fn responses_compat_midstream_close_is_cancelled() -> anyhow::Result<()> {
+    responses_compat_close_case(None, ResponsesClose::FirstFrame).await
+}
+
+#[tokio::test]
+async fn responses_compat_terminal_close_preserves_explicit_cancellation() -> anyhow::Result<()> {
+    responses_compat_close_case(Some("completed"), ResponsesClose::ExternalCancel).await
+}
+
+#[tokio::test]
+async fn responses_compat_error_terminal_close_stays_failed() -> anyhow::Result<()> {
+    responses_compat_close_case(Some("failed"), ResponsesClose::Terminal).await
+}
+
+#[tokio::test]
+async fn responses_compat_undrained_terminal_stays_cancelled() -> anyhow::Result<()> {
+    responses_compat_close_case(Some("completed"), ResponsesClose::FirstFrame).await
+}
+
+#[tokio::test]
+async fn responses_compat_incomplete_terminal_is_not_completed() -> anyhow::Result<()> {
+    responses_compat_close_case(Some("incomplete"), ResponsesClose::Terminal).await
+}
+
+#[tokio::test]
+async fn responses_compat_terminal_close_preserves_deadline() -> anyhow::Result<()> {
+    responses_compat_close_case(Some("completed"), ResponsesClose::Deadline).await
+}
+
 #[tokio::test]
 async fn mid_stream_disconnect_without_terminal_stays_cancelled() -> anyhow::Result<()> {
     // A client that vanishes before the upstream produced any terminal must
