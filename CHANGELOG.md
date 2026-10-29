@@ -4,6 +4,17 @@ All notable changes to Nyro will be documented in this file.
 
 ---
 
+## v2.1.10
+
+> Released on 2026-10-29
+
+#### Improvements
+
+- **Stacked Claude pool windows**: the 5-hour and weekly usage panels now stack vertically at every screen width, keeping each quota bar full-width in provider cards and account management
+- **Weighted steady-pace markers**: Claude pool progress bars now show a vertical reference marker and estimated usage percentage, refreshed every 30 seconds. The estimate uses each account's own reset time and the corresponding 1 / 5 / 20 session or 1 / 5 / 10 weekly capacity weights, with unknown plans counted as Pro. Incomplete or invalid account/reset coverage hides the marker; actual usage and routing remain unchanged
+
+---
+
 ## v2.1.9
 
 > Released on 2026-10-29

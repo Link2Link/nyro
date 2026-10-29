@@ -130,6 +130,30 @@ test("Claude collapsed card renders core-weighted session and weekly estimates",
   doesNotMatch(html, /data-steady-pace-marker|Sonnet · Weekly/);
 });
 
+test("Claude pool windows stack vertically and show weighted steady-pace markers", () => {
+  const now = Date.now();
+  const accounts = ["pro", "max 5x", "max 20x"].map((plan, index) => ({
+    ...account, account_id: `pace-${index}`, claude_usage: { plan, windows: [
+      { name: "five_hour", used_percent: 20, resets_at: new Date(now + 2.5 * 3600_000).toISOString() },
+      { name: "weekly_limit", used_percent: 30, resets_at: new Date(now + 3.5 * 24 * 3600_000).toISOString() },
+    ] },
+  }));
+  const value = { ...weightedPool, accounts };
+  const html = panel(value, true);
+  match(html, /grid grid-cols-1 gap-2 pt-1/);
+  doesNotMatch(html, /sm:grid-cols-2/);
+  equal((html.match(/data-steady-pace-marker="weighted"/g) ?? []).length, 2);
+  match(html, /Steady-pace estimate 50.0%/);
+  match(html, /Claude plan capacity/);
+  const zh = renderToStaticMarkup(<ClaudePoolSummary pool={value} isZh />);
+  match(zh, /匀速预估用量 50.0%/); match(zh, /进度条竖线，仅供参考/);
+  const incomplete = panel({ ...value, accounts: accounts.map((a) => ({ ...a, claude_usage: {
+    ...a.claude_usage, windows: a.claude_usage.windows.map((w) => ({ ...w, resets_at: null })),
+  } })) }, true);
+  doesNotMatch(incomplete, /data-steady-pace-marker|Steady-pace estimate/);
+  equal((incomplete.match(/role="progressbar"/g) ?? []).length, 2);
+});
+
 test("Claude summary does not average account percentages on older backend responses", () => {
   const html = panel({ ...pool, accounts: [account, { ...account, account_id: "account-b", claude_usage: { windows: [{ name: "five_hour", used_percent: 90, resets_at: null }] } }] }, true);
   match(html, /Pool usage unknown; refresh usage/);

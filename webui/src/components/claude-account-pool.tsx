@@ -7,7 +7,7 @@ import { useLocale } from "@/lib/i18n";
 import { useUsageClock } from "@/lib/use-usage-clock";
 import { looksLikeCredential } from "@/lib/kiro-pool-usage";
 import { tierLabel } from "@/lib/provider-usage";
-import { steadyPacePercent, utilizationColor } from "@/lib/usage-pace";
+import { claudePoolSteadyPacePercent, steadyPacePercent, utilizationColor } from "@/lib/usage-pace";
 import { accountStateLabel, canReauthorizeLegacyProvider, type AccountPoolView, type OAuthAccountUpdate, type PoolQuotaWindow, type ProviderAccountView } from "@/lib/devin-account-pool";
 import type { Provider } from "@/lib/types";
 import type { OAuthSessionIntent } from "@/lib/use-oauth-session";
@@ -71,7 +71,7 @@ function claudePlanLabel(plan: string | null | undefined, isZh: boolean): string
   return `${label} (${isZh ? "按 Pro 计算" : "counted as Pro"})`;
 }
 
-function ClaudePoolWindow({ name, quota, isZh }: { name: string; quota: PoolQuotaWindow; isZh: boolean }) {
+function ClaudePoolWindow({ name, quota, pace, isZh }: { name: string; quota: PoolQuotaWindow; pace: number | null; isZh: boolean }) {
   const label = tierLabel(name, isZh);
   const complete = quota.capacity_complete && quota.known_accounts === quota.total_accounts && !quota.stale;
   const used = complete && quota.used_percent != null && Number.isFinite(quota.used_percent)
@@ -84,7 +84,12 @@ function ClaudePoolWindow({ name, quota, isZh }: { name: string; quota: PoolQuot
       {used != null ? <span className={`tabular-nums ${utilizationColor(used)}`}>{isZh ? "已用" : "Used"} {used.toFixed(1)}%</span>
         : <span className="text-slate-500">{isZh ? "用量未知 / 数据不完整" : "Usage unknown / incomplete data"}</span>}
     </div>
-    {used != null && <UsageProgress usedPercent={used} label={`${label} ${isZh ? "账号池已用额度" : "pool used quota"}`} isZh={isZh} />}
+    {used != null && <>
+      <UsageProgress usedPercent={used} pacePercent={pace} weighted
+        weightBasis={isZh ? "各账号窗口进度与 Claude 套餐容量" : "each account's window progress and Claude plan capacity"}
+        label={`${label} ${isZh ? "账号池已用额度" : "pool used quota"}`} isZh={isZh} />
+      {pace != null && <p className="text-[10px] text-slate-500">{isZh ? `匀速预估用量 ${pace.toFixed(1)}%（进度条竖线，仅供参考）` : `Steady-pace estimate ${pace.toFixed(1)}% (vertical marker; reference only)`}</p>}
+    </>}
     <p className="tabular-nums text-slate-500">{used != null
       ? (isZh ? `已用 ${units(quota.used_units)} / ${units(quota.total_units)} Pro 等价单位 · 剩余 ${units(quota.remaining_units)}`
         : `Used ${units(quota.used_units)} / ${units(quota.total_units)} Pro-equivalent units · Remaining ${units(quota.remaining_units)}`)
@@ -100,6 +105,7 @@ function ClaudePoolWindow({ name, quota, isZh }: { name: string; quota: PoolQuot
 export function ClaudePoolSummary({ pool, isZh, onRefresh, refreshing = false }: {
   pool: AccountPoolView; isZh: boolean; onRefresh?: () => void; refreshing?: boolean;
 }) {
+  const now = useUsageClock();
   const planCounts = new Map<string, number>();
   for (const account of pool.accounts) {
     if (!account.is_enabled || account.status === "disconnected") continue;
@@ -115,8 +121,8 @@ export function ClaudePoolSummary({ pool, isZh, onRefresh, refreshing = false }:
       {planCounts.size ? [...planCounts].map(([plan, count]) => <span key={plan} className="rounded border border-slate-200 px-1.5 py-0.5 text-[10px]">{claudePlanLabel(plan, isZh)} · {count}</span>)
         : <span className="text-slate-400">{isZh ? "无参与汇总的账号" : "No accounts in totals"}</span>}
     </div>
-    <div className="grid gap-2 pt-1 sm:grid-cols-2">
-      {(pool.quota.claude_windows ?? []).map(({ name, quota }) => <ClaudePoolWindow key={name} name={name} quota={quota} isZh={isZh} />)}
+    <div className="grid grid-cols-1 gap-2 pt-1" data-claude-pool-windows>
+      {(pool.quota.claude_windows ?? []).map(({ name, quota }) => <ClaudePoolWindow key={name} name={name} quota={quota} pace={claudePoolSteadyPacePercent(pool, name, now)} isZh={isZh} />)}
     </div>
     {!pool.quota.claude_windows?.length && <p className="text-slate-500">{isZh ? "账号池用量未知，请刷新用量。" : "Pool usage unknown; refresh usage to load it."}</p>}
     <p className="text-[10px] text-slate-500">{isZh

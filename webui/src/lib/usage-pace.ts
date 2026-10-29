@@ -125,3 +125,59 @@ export function poolSteadyPacePercent(
   if (totalWeight !== window.total_units) return null;
   return Math.min(100, Math.max(0, weightedPace / totalWeight));
 }
+
+/**
+ * Display-only Claude pace, weighted by each account's own window reset.
+ * Pro/unknown=1; Max 5x=5; Max 20x=20 for five-hour and 10 for weekly.
+ * These estimates mirror backend capacity, never usage or routing decisions.
+ * Incomplete/stale observations hide the marker rather than using the pool's
+ * next_reset_at (which only describes the earliest account reset).
+ */
+export function claudePoolSteadyPacePercent(
+  pool: AccountPoolView,
+  name: string,
+  now: number,
+): number | null {
+  if (!Number.isFinite(now) || (name !== "five_hour" && name !== "weekly_limit")) return null;
+  const windows = pool.quota.claude_windows?.filter((window) => window.name === name);
+  if (windows?.length !== 1) return null;
+  const window = windows[0].quota;
+  if (
+    !window || !window.capacity_complete || window.stale
+    || !Number.isFinite(window.total_units) || window.total_units <= 0
+  ) return null;
+
+  // Exhausted members still contribute capacity; only disabled/disconnected
+  // accounts are excluded, matching the backend's accounting membership.
+  const members = pool.accounts.filter((account) =>
+    account.is_enabled && account.status !== "disconnected",
+  );
+  if (
+    window.total_accounts !== members.length
+    || window.known_accounts !== window.total_accounts
+    || [window.known_remaining_units, window.used_units, window.remaining_units]
+      .some((value) => value == null || !Number.isFinite(value) || value < 0 || value > window.total_units)
+    || [window.used_percent, window.remaining_percent]
+      .some((value) => value == null || !Number.isFinite(value) || value < 0 || value > 100)
+  ) return null;
+
+  let totalWeight = 0;
+  let weightedPace = 0;
+  for (const account of members) {
+    if (account.stale || account.scheduling === "auth_required") return null;
+    const usage = account.claude_usage;
+    const quotas = usage?.windows?.filter((quota) => quota.name === name);
+    if (quotas?.length !== 1) return null;
+    const quota = quotas[0];
+    if (!Number.isFinite(quota.used_percent) || quota.used_percent < 0 || quota.used_percent > 100) return null;
+    const pace = steadyPacePercent({ name, resets_at: quota.resets_at }, now);
+    if (pace == null) return null;
+    const weight = usage?.plan === "max 5x" ? 5
+      : usage?.plan === "max 20x" ? (name === "five_hour" ? 20 : 10) : 1;
+    totalWeight += weight;
+    weightedPace += weight * pace;
+  }
+
+  if (totalWeight !== window.total_units) return null;
+  return Math.min(100, Math.max(0, weightedPace / totalWeight));
+}

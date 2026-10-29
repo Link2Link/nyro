@@ -8,6 +8,7 @@ import {
   type ProviderAccountView,
 } from "./devin-account-pool";
 import {
+  claudePoolSteadyPacePercent,
   poolSteadyPacePercent,
   steadyPacePercent,
   tierWindowMs,
@@ -63,6 +64,39 @@ function pool(
       plan_mismatch: 0, plan_unverified: 0,
     },
     readiness: "included",
+  };
+}
+
+function claudeAccount(
+  id: string,
+  plan: string | null = "pro",
+  sessionPace = 50,
+  weeklyPace = 50,
+  overrides: Partial<ProviderAccountView> = {},
+): ProviderAccountView {
+  return account(id, null, 50, 50, {
+    provider_id: "claude", daily: null, weekly: null,
+    claude_usage: {
+      plan,
+      windows: [
+        { name: "five_hour", used_percent: 35, resets_at: resetAt(5 * HOUR, sessionPace) },
+        { name: "weekly_limit", used_percent: 35, resets_at: resetAt(WEEK, weeklyPace) },
+      ],
+    },
+    ...overrides,
+  });
+}
+
+function claudePool(accounts = [claudeAccount("pro")], sessionUnits = 1, weeklyUnits = 1, totalAccounts = accounts.length): AccountPoolView {
+  return {
+    ...pool(accounts), kind: "claude_code", provider_id: "claude", config: null,
+    quota: {
+      daily: null, weekly: null, estimated: true,
+      claude_windows: [
+        { name: "five_hour", quota: completeWindow(sessionUnits, totalAccounts) },
+        { name: "weekly_limit", quota: completeWindow(weeklyUnits, totalAccounts) },
+      ],
+    },
   };
 }
 
@@ -295,4 +329,148 @@ test("stale but complete snapshots retain their visual time projection without i
   });
   equal(poolSteadyPacePercent(subject, "daily", NOW), 75);
   equal(poolSteadyPacePercent(subject, "weekly", NOW), 75);
+});
+
+test("Claude mixed plans use distinct five-hour 1:5:20 and weekly 1:5:10 weights", () => {
+  const subject = claudePool([
+    claudeAccount("pro", "pro", 100, 100),
+    claudeAccount("five", "max 5x", 50, 50),
+    claudeAccount("twenty", "max 20x", 0, 0),
+  ], 26, 16);
+  close(claudePoolSteadyPacePercent(subject, "five_hour", NOW), 350 / 26);
+  close(claudePoolSteadyPacePercent(subject, "weekly_limit", NOW), 350 / 16);
+});
+
+test("Claude unknown and unsupported plans use one unit without changing plan metadata", () => {
+  for (const plan of [undefined, null, "", "unknown", "max", "team", "max5x", "MAX 20X"]) {
+    const subject = claudePool([
+      claudeAccount("five", "max 5x", 0, 0),
+      claudeAccount("fallback", plan ?? null, 100, 100),
+    ], 6, 6);
+    subject.accounts[1].claude_usage!.plan = plan;
+    subject.accounts[1].verified_plan = "max"; // Devin identity is not Claude capacity.
+    const before = structuredClone(subject);
+    for (const name of ["five_hour", "weekly_limit"]) {
+      close(claudePoolSteadyPacePercent(subject, name, NOW), 100 / 6);
+    }
+    deepEqual(subject, before);
+  }
+});
+
+test("Claude excludes disabled/disconnected accounts but includes exhausted members", () => {
+  const subject = claudePool([
+    claudeAccount("exhausted", "pro", 100, 100, { scheduling: "quota_exhausted" }),
+    claudeAccount("five", "max 5x", 0, 0),
+    claudeAccount("disabled", null, 0, 0, { is_enabled: false, stale: true, claude_usage: null }),
+    claudeAccount("disconnected", null, 0, 0, { status: "disconnected", scheduling: "auth_required", claude_usage: null }),
+  ], 6, 6, 2);
+  for (const window of subject.accounts[0].claude_usage!.windows) window.used_percent = 100;
+  subject.counts.available = 0;
+  for (const name of ["five_hour", "weekly_limit"]) {
+    close(claudePoolSteadyPacePercent(subject, name, NOW), 100 / 6);
+  }
+});
+
+test("Claude uses distinct member resets, never aggregate next_reset_at", () => {
+  const subject = claudePool([
+    claudeAccount("early", "pro", 75, 75), claudeAccount("late", "pro", 25, 25),
+  ], 2, 2);
+  for (const aggregate of subject.quota.claude_windows!) {
+    Object.assign(aggregate.quota, { reset_mode: "staggered", next_reset_accounts: 1 });
+    for (const next of [resetAt(WEEK, 100), resetAt(WEEK, 0), "invalid", null]) {
+      aggregate.quota.next_reset_at = next;
+      equal(claudePoolSteadyPacePercent(subject, aggregate.name, NOW), 50);
+    }
+    subject.accounts[0].claude_usage!.windows.find((window) => window.name === aggregate.name)!.resets_at = null;
+    aggregate.quota.next_reset_at = resetAt(WEEK, 50);
+    equal(claudePoolSteadyPacePercent(subject, aggregate.name, NOW), null);
+  }
+});
+
+test("Claude supports only its two main windows and requires unique matching aggregates", () => {
+  const subject = claudePool();
+  for (const name of ["", "daily", "weekly", "monthly", "feature:five_hour", "seven_day_sonnet"]) {
+    subject.quota.claude_windows!.push({ name, quota: completeWindow() });
+    equal(claudePoolSteadyPacePercent(subject, name, NOW), null);
+  }
+  for (const name of ["five_hour", "weekly_limit"]) {
+    for (const claude_windows of [undefined, [], null as unknown as NonNullable<AccountPoolView["quota"]["claude_windows"]>]) {
+      equal(claudePoolSteadyPacePercent({ ...subject, quota: { ...subject.quota, claude_windows } }, name, NOW), null);
+    }
+    const aggregate = subject.quota.claude_windows!.find((window) => window.name === name)!;
+    subject.quota.claude_windows!.push(aggregate);
+    equal(claudePoolSteadyPacePercent(subject, name, NOW), null);
+    subject.quota.claude_windows!.pop();
+    aggregate.quota = null as unknown as PoolQuotaWindow;
+    equal(claudePoolSteadyPacePercent(subject, name, NOW), null);
+  }
+});
+
+test("Claude rejects incomplete, stale, invalid or mismatched aggregate coverage and capacity", () => {
+  const invalidWindows: Partial<PoolQuotaWindow>[] = [
+    { capacity_complete: false }, { stale: true },
+    ...[0, -1, NaN, Infinity, -Infinity, 5].map((total_units) => ({ total_units })),
+    ...[0, 2, NaN, 1.5].map((total_accounts) => ({ total_accounts })),
+    ...[0, 2, NaN].map((known_accounts) => ({ known_accounts })),
+  ];
+  for (const field of ["used_percent", "remaining_percent", "used_units", "remaining_units", "known_remaining_units"] as const) {
+    for (const value of [null, undefined, NaN, Infinity, -Infinity, -1, 101]) {
+      invalidWindows.push({ [field]: value });
+    }
+  }
+  invalidWindows.push({ used_units: 2 }, { remaining_units: 2 }, { known_remaining_units: 2 });
+  for (const name of ["five_hour", "weekly_limit"]) {
+    for (const invalid of invalidWindows) {
+      const subject = claudePool();
+      Object.assign(subject.quota.claude_windows!.find((window) => window.name === name)!.quota, invalid);
+      equal(claudePoolSteadyPacePercent(subject, name, NOW), null, `${name}: ${JSON.stringify(invalid)}`);
+    }
+    equal(claudePoolSteadyPacePercent(claudePool([], 0, 0), name, NOW), null);
+  }
+});
+
+test("Claude rejects missing/duplicate windows, invalid usage/resets, stale and auth-required members", () => {
+  for (const name of ["five_hour", "weekly_limit"]) {
+    for (const overrides of [
+      { stale: true }, { scheduling: "auth_required" }, { claude_usage: null },
+      { claude_usage: undefined }, { claude_usage: { plan: "pro", windows: [] } },
+    ]) {
+      equal(claudePoolSteadyPacePercent(claudePool([claudeAccount("pro", "pro", 50, 50, overrides)]), name, NOW), null);
+    }
+    const subject = claudePool();
+    const windows = subject.accounts[0].claude_usage!.windows;
+    const window = windows.find((window) => window.name === name)!;
+    windows.push({ ...window });
+    equal(claudePoolSteadyPacePercent(subject, name, NOW), null);
+    windows.pop();
+    for (const used of [NaN, Infinity, -Infinity, -1, 101, null, undefined]) {
+      window.used_percent = used as number;
+      equal(claudePoolSteadyPacePercent(subject, name, NOW), null);
+    }
+    window.used_percent = 35;
+    for (const reset of [null, undefined, "", "invalid", "2030-99-15T12:00:00Z"]) {
+      window.resets_at = reset as string | null;
+      equal(claudePoolSteadyPacePercent(subject, name, NOW), null);
+    }
+  }
+});
+
+test("Claude clock changes move only the marker, clamped at bounds without reviving exhausted usage", () => {
+  const subject = claudePool([claudeAccount("spent", "pro", 25, 25, { scheduling: "quota_exhausted" })]);
+  for (const window of subject.accounts[0].claude_usage!.windows) window.used_percent = 100;
+  for (const aggregate of subject.quota.claude_windows!) {
+    Object.assign(aggregate.quota, { used_percent: 100, remaining_percent: 0, used_units: 1, remaining_units: 0, known_remaining_units: 0 });
+  }
+  const before = structuredClone(subject);
+  for (const [name, duration] of [["five_hour", 5 * HOUR], ["weekly_limit", WEEK]] as const) {
+    equal(claudePoolSteadyPacePercent(subject, name, NOW), 25);
+    equal(claudePoolSteadyPacePercent(subject, name, NOW + duration / 4), 50);
+    equal(claudePoolSteadyPacePercent(subject, name, NOW - duration), 0);
+    equal(claudePoolSteadyPacePercent(subject, name, NOW + duration * 3 / 4), 100);
+    equal(claudePoolSteadyPacePercent(subject, name, NOW + 10 * duration), 100);
+    for (const now of [NaN, Infinity, -Infinity, null, undefined]) {
+      equal(claudePoolSteadyPacePercent(subject, name, now as number), null);
+    }
+  }
+  deepEqual(subject, before);
 });
