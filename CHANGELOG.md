@@ -4,6 +4,22 @@ All notable changes to Nyro will be documented in this file.
 
 ---
 
+## v2.1.13
+
+> Released on 2026-10-30
+
+#### Features
+
+- **Account-specific model probes**: the model-test picker can select a connected account from Claude Code, Devin and Kiro OAuth pools. Explicit probes use only the selected account, never fall back to a sibling, and preserve authentication, quota and pool-policy safeguards. Account or policy changes invalidate in-flight results and prevent subsequent model requests
+- **Isolated probe history**: WebUI and desktop requests carry the selected account through the probe API, and the result must confirm its identity. Results and history are stored separately per account; one account's failure does not hide provider-wide models or overwrite another account's results
+
+#### Fixes
+
+- **Missing Claude pool usage across chained gateways**: provider usage and Nyro usage forwarding now expose an anonymous, display-only `pool_quota` summary with weighted capacity, coverage, stale/unknown values and reset metadata. Allowlisted parsing strips account identities and unknown nested fields, and the summary never changes routing decisions
+- **Account-pool usage display**: the DSH usage panel displays anonymous pool quota, preserves exact windows for single-account providers, and distinguishes unavailable quota summaries from restricted monetary data without inventing a shared pool reset or steady-pace marker
+
+---
+
 ## v2.1.12
 
 > Released on 2026-10-30
