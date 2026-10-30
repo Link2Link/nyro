@@ -39,7 +39,11 @@ export function AccountPoolSettings({ config, pending, onSave, vendor = "devin" 
           onChange={(event) => setDraft({ ...draft, strategy: event.target.value as DevinPoolConfig["strategy"] })}>
           <option value="round_robin">{isZh ? "轮询" : "Round robin"}</option>
           <option value="fill_first">{isZh ? "优先用满" : "Fill first"}</option>
+          {vendor === "claude_code" && <option value="weekly_reset_first">{isZh ? "最近周重置优先" : "Soonest weekly reset first"}</option>}
         </select>
+        {vendor === "claude_code" && draft.strategy === "weekly_reset_first" && <p className="font-normal text-slate-500">{isZh
+          ? "可用性、额度等级和手动优先级仍优先；同组账号按下一次有效周额度重置时间由近到远排序，不看用量获取时间。未知、无效或已过期的重置时间排在同组后。启用的会话粘性仍保留。"
+          : "Availability, quota tier and manual priority still take precedence. Within the same group, the soonest valid future weekly quota reset wins, not the latest usage fetch. Unknown, invalid or expired reset times sort last in that group. Enabled session affinity is preserved."}</p>}
       </label>
       <label className="space-y-1 text-xs font-medium text-slate-600">
         <span>{isZh ? "会话粘性 TTL（秒）" : "Session affinity TTL (seconds)"}</span>

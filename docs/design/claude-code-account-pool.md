@@ -16,7 +16,7 @@ The provider card shows backend account counts and readiness with a pool usage r
 - Re-authorize the exact account, with its stable account ID and status version captured before opening the browser.
 - Edit a safe label and integer priority (lower first), enable/disable, or remove an account.
 - Refresh an individual account or the entire pool.
-- Round-robin / fill-first strategy, session affinity and TTL, and maximum account attempts.
+- Round-robin / fill-first / nearest weekly reset first strategy, session affinity and TTL, and maximum account attempts.
 - Per-account upstream quota windows and retained-log usage statistics.
 
 Removing an account clears its credentials but keeps an internal disconnected record/version fence, preventing old OAuth callbacks from restoring it. Removed accounts are no longer listed in management (or its per-account statistics rows); retained request logs remain. If an older cached response contains a disconnected row, its mutations are disabled. Errors and conflicts trigger query invalidation so a subsequent action uses a fresh status version. Queries for account totals are shared by all rows and only mounted inside account management, not on collapsed cards.
@@ -101,6 +101,8 @@ The shared [OAuth session hook](<../../webui/src/lib/use-oauth-session.ts>) hand
 Like the existing account pools, an untargeted model-generation probe is not supported once account selection is ambiguous: it returns `AMBIGUOUS_ACCOUNT` rather than silently selecting an account. Non-generating connectivity checks and model discovery remain available.
 
 The UI never derives eligibility or retries from percentage bars. The backend considers each account's five-hour, global weekly, and applicable model window. An exhausted Opus-only window must not block Sonnet.
+
+The optional Claude-only `weekly_reset_first` strategy prefers the account whose next **global weekly** reset (`weekly_limit.resets_at`) is soonest, not the most recently refreshed usage snapshot or the most recently reset account. Existing eligibility classes, explicit priorities (lower first), and valid session affinity take precedence. Within the same class and priority, future reset times are compared as timestamps; missing, invalid or elapsed resets come last. Ties fall back to creation time and account ID. Sticky accounts remain first, with fallback candidates retaining deadline order. Elapsed resets never clear exhaustion without an upstream observation. The default remains `round_robin`; Devin/Kiro pools cannot save this strategy.
 
 Credentials are refreshed before requests within the five-minute expiry margin, with per-account version/CAS isolation; background refresh follows the same isolation. Structured upstream rejection permits safe account switching for `authentication_error` (401), `rate_limit_error` (429), `permission_error` (403), and `overloaded_error` (529 or 503). Bare HTTP status codes, transport timeouts, or streams already accepted must not cause replay. A credits-required rejection may try another account but must not rewrite account health or quota. Usage-query 401 requires reauthorization; usage-query 403 only marks the observation stale conservatively.
 

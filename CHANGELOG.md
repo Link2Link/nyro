@@ -4,6 +4,21 @@ All notable changes to Nyro will be documented in this file.
 
 ---
 
+## v2.1.14
+
+> Released on 2026-10-31
+
+#### Features
+
+- **Soonest weekly reset first for Claude Code pools**: a new optional `weekly_reset_first` strategy prefers accounts closest to their next global weekly quota reset within the same eligibility tier and manual priority. Valid session affinity is preserved, fallback accounts retain reset order, and unknown, invalid or elapsed reset times sort last. Existing quota/authentication safeguards and the default round-robin strategy remain unchanged
+- **Claude-specific scheduling controls**: bilingual WebUI settings expose the new strategy only for Claude Code pools, explain its interaction with priority and affinity, and persist it through existing account-pool APIs. Non-Claude saves and unsupported imports reject the strategy before configuration writes
+
+#### Fixes
+
+- **DSH usage-card layout and alignment**: compact account-pool cards show the key quota bars consistently, move quota/reset details into expandable sections, distinguish partial-account resets, and align card heights and query timestamps
+
+---
+
 ## v2.1.13
 
 > Released on 2026-10-30

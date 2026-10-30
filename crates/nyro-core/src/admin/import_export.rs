@@ -181,6 +181,12 @@ impl AdminService {
                     provider.vendor.as_deref() == Some("devin") && provider.auth_mode == "oauth",
                     "Account pool setting requires a Devin OAuth provider"
                 );
+                // Reject Claude-only policies during preflight, not after the
+                // currently supported Devin import has already created providers.
+                anyhow::ensure!(
+                    config.strategy != DevinPoolStrategy::WeeklyResetFirst,
+                    "weekly_reset_first strategy requires a Claude Code OAuth provider"
+                );
             }
         }
         super::model_ratings::validate_export_ratings(&data.model_ratings)?;

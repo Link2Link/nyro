@@ -1,7 +1,7 @@
 import { deepEqual, equal, rejects } from "node:assert/strict";
 import { test } from "node:test";
 import { backend, BackendHTTPError } from "./backend";
-import { newDevinPoolConfig } from "./devin-account-pool";
+import { newDevinPoolConfig, type DevinPoolConfig } from "./devin-account-pool";
 import type { AccountUsageStats } from "./types";
 
 test("account usage HTTP responses preserve both periods, native prices and missing-price counts", async () => {
@@ -38,10 +38,11 @@ test("account HTTP mappings preserve provider/account addressing, intent and CAS
   const previousFetch = globalThis.fetch;
   const previousStorage = Object.getOwnPropertyDescriptor(globalThis, "localStorage");
   const requests: { url: string; method: string | undefined; body: unknown }[] = [];
+  let responseData: unknown = null;
   Object.defineProperty(globalThis, "localStorage", { configurable: true, value: { getItem: () => null } });
   globalThis.fetch = async (url, init) => {
     requests.push({ url: String(url), method: init?.method, body: init?.body ? JSON.parse(String(init.body)) : undefined });
-    return new Response(JSON.stringify({ data: null }), { status: 200 });
+    return new Response(JSON.stringify({ data: responseData }), { status: 200 });
   };
   try {
     const id = "provider/a";
@@ -74,6 +75,16 @@ test("account HTTP mappings preserve provider/account addressing, intent and CAS
       { method: "DELETE", url: `${base}/accounts/account%2Fb`, body: { expected_version: 8 } },
       { method: "POST", url: `${base}/accounts/account%2Fb/usage/refresh`, body: undefined },
       { method: "POST", url: `${base}/account-pool/usage/refresh`, body: undefined },
+    ]);
+    requests.length = 0;
+    const weeklyConfig: DevinPoolConfig = { ...config, strategy: "weekly_reset_first" };
+    responseData = { config: weeklyConfig };
+    await backend("configure_provider_account_pool", { id: "claude/a", config: weeklyConfig });
+    const reloaded = await backend<{ config: DevinPoolConfig }>("get_provider_account_pool", { id: "claude/a" });
+    deepEqual(reloaded.config, weeklyConfig);
+    deepEqual(requests, [
+      { method: "PUT", url: "/api/v1/providers/claude%2Fa/account-pool", body: weeklyConfig },
+      { method: "GET", url: "/api/v1/providers/claude%2Fa/accounts", body: undefined },
     ]);
     requests.length = 0;
     await backend("init_oauth_session", { vendor: "devin", useProxy: true });

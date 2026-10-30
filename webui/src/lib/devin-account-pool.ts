@@ -4,7 +4,7 @@ export type DevinPlan = "pro" | "max";
 export interface DevinPoolConfig {
   /** Legacy input only; never use this to determine account types or capacity. */
   plan?: DevinPlan;
-  strategy: "round_robin" | "fill_first";
+  strategy: "round_robin" | "fill_first" | "weekly_reset_first";
   session_affinity: boolean;
   affinity_ttl_seconds: number;
   max_account_attempts: number;

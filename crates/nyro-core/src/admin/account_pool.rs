@@ -24,6 +24,8 @@ pub enum DevinPoolStrategy {
     #[default]
     RoundRobin,
     FillFirst,
+    /// Claude Code only: consume accounts closest to their next weekly reset first.
+    WeeklyResetFirst,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -781,9 +783,13 @@ impl AdminService {
         id: &str,
         mut config: DevinPoolConfig,
     ) -> anyhow::Result<AccountPoolView> {
-        self.account_pool_provider(id).await?;
+        let provider = self.account_pool_provider(id).await?;
         config.plan = None;
         config.validate()?;
+        anyhow::ensure!(
+            config.strategy != DevinPoolStrategy::WeeklyResetFirst || is_claude_provider(&provider),
+            "weekly_reset_first strategy requires a Claude Code OAuth provider"
+        );
         // Serialize with all session publications, including first-account adds.
         let controls = self.gw.auth_session_controls.lock().await;
         let accounts = self
@@ -2264,6 +2270,101 @@ mod tests {
                 .is_none()
         );
     }
+    #[tokio::test]
+    async fn weekly_reset_first_policy_round_trips_only_for_claude_pools() {
+        let config: DevinPoolConfig =
+            serde_json::from_str(r#"{"strategy":"weekly_reset_first"}"#).unwrap();
+        assert_eq!(config.strategy, DevinPoolStrategy::WeeklyResetFirst);
+        config.validate().unwrap();
+        assert_eq!(
+            serde_json::to_value(&config).unwrap()["strategy"],
+            "weekly_reset_first"
+        );
+        for vendor in ["anthropic", "devin", "kiro"] {
+            let mut provider = provider();
+            provider.vendor = Some(vendor.into());
+            provider.preset_key = Some(vendor.into());
+            if vendor == "anthropic" {
+                provider.channel = Some("claude-code".into());
+                provider.protocol = "anthropic-messages".into();
+                provider.base_url = "https://api.anthropic.com".into();
+            } else if vendor == "kiro" {
+                provider.channel = Some("ide".into());
+                provider.protocol = crate::provider::kiro::PROTOCOL_KEY.into();
+            }
+            let storage = std::sync::Arc::new(crate::storage::MemoryStorage::new(
+                vec![provider],
+                vec![],
+                vec![],
+            ));
+            let gw = Gateway::from_storage(crate::config::GatewayConfig::default(), storage)
+                .await
+                .unwrap()
+                .0;
+            let admin = gw.admin();
+            let result = admin
+                .configure_provider_account_pool("pool", config.clone())
+                .await;
+            if vendor == "anthropic" {
+                assert_eq!(result.unwrap().config.as_ref(), Some(&config));
+                assert_eq!(
+                    admin.provider_pool_config("pool").await.unwrap().as_ref(),
+                    Some(&config)
+                );
+                assert_eq!(
+                    admin
+                        .get_provider_account_pool("pool")
+                        .await
+                        .unwrap()
+                        .config
+                        .as_ref(),
+                    Some(&config)
+                );
+            } else {
+                assert!(
+                    result.unwrap_err().to_string().contains(
+                        "weekly_reset_first strategy requires a Claude Code OAuth provider"
+                    )
+                );
+                assert!(admin.provider_pool_config("pool").await.unwrap().is_none());
+                assert!(
+                    admin
+                        .set_setting(
+                            "provider_account_pool:pool",
+                            r#"{"strategy":"weekly_reset_first"}"#
+                        )
+                        .await
+                        .is_err()
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn weekly_reset_first_import_rejects_non_claude_before_writes() {
+        let gw = gateway().await;
+        let admin = gw.admin();
+        let data: ExportData = serde_json::from_value(serde_json::json!({
+            "version": 2,
+            "providers": [{
+                "source_id": "imported", "name": "Imported Devin", "vendor": "devin",
+                "protocol": "devin-chat/get-chat-message/v1", "base_url": "https://server.codeium.com",
+                "preset_key": "devin", "channel": "cli", "api_key": "", "auth_mode": "oauth", "is_enabled": true
+            }],
+            "models": [],
+            "settings": [["provider_account_pool:imported", r#"{"strategy":"weekly_reset_first"}"#]]
+        })).unwrap();
+        let before = gw.storage.settings().list_all().await.unwrap();
+        let error = admin.import_config(data).await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("weekly_reset_first strategy requires a Claude Code OAuth provider")
+        );
+        assert_eq!(admin.list_providers().await.unwrap().len(), 1);
+        assert_eq!(gw.storage.settings().list_all().await.unwrap(), before);
+    }
+
     #[tokio::test]
     async fn populated_pool_policy_ignores_legacy_plan_and_sessions_keep_fixed_targets() {
         let gw = gateway().await;

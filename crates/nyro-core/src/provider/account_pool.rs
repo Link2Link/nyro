@@ -1,4 +1,4 @@
-//! Account-scoped admission and affinity for Devin and Kiro subscriptions.
+//! Account-scoped admission and affinity for Devin, Kiro and Claude subscriptions.
 //! Credentials stay in storage; this registry contains only bounded scheduling
 //! hints. A request always carries an immutable credential generation.
 use std::collections::{HashMap, HashSet};
@@ -179,6 +179,25 @@ impl ClaudeAccountState {
         })
     }
 
+    /// Only the global weekly window drives this preference. Observation time,
+    /// five-hour and model-specific resets are unrelated to the weekly deadline.
+    fn next_weekly_reset_at(
+        &self,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Option<chrono::DateTime<chrono::Utc>> {
+        let window = self
+            .usage
+            .as_ref()?
+            .windows
+            .iter()
+            .find(|w| w.name == "weekly_limit")?;
+        let reset = chrono::DateTime::parse_from_rfc3339(window.resets_at.as_deref()?.trim())
+            .ok()?
+            .with_timezone(&chrono::Utc);
+        // A passed deadline does not prove that the upstream renewed the quota.
+        (reset > now).then_some(reset)
+    }
+
     pub fn cost_class(&self, config: &DevinPoolConfig) -> Option<u8> {
         self.cost_class_for_model(config, None)
     }
@@ -285,6 +304,8 @@ impl AccountPoolRegistry {
         excluded: &HashSet<String>,
     ) -> Vec<OAuthCredential> {
         let now = Instant::now();
+        let wall_now = chrono::Utc::now();
+        let weekly_reset_first = config.strategy == DevinPoolStrategy::WeeklyResetFirst;
         let mut state = self.inner.lock().unwrap();
         state.bindings.retain(|_, binding| binding.expires_at > now);
         state
@@ -316,16 +337,35 @@ impl AccountPoolRegistry {
                     return None;
                 }
                 let class = account_cost_class_for_model(account, config, model)?;
-                Some((class, account))
+                let weekly_reset = if weekly_reset_first
+                    && matches!(account.driver_key.as_str(), "claude-code" | "claude")
+                {
+                    ClaudeAccountState::parse(&account.account_state).next_weekly_reset_at(wall_now)
+                } else {
+                    None
+                };
+                Some((class, account, weekly_reset))
             })
             .collect::<Vec<_>>();
-        eligible.sort_by(|(a_class, a), (b_class, b)| {
-            (a_class, a.priority, &a.created_at, &a.account_id).cmp(&(
-                b_class,
-                b.priority,
-                &b.created_at,
-                &b.account_id,
-            ))
+        eligible.sort_by(|(a_class, a, a_reset), (b_class, b, b_reset)| {
+            // Preserve eligibility classes and explicit priorities. Unknown,
+            // invalid or elapsed weekly deadlines sort after known future ones.
+            (
+                a_class,
+                a.priority,
+                a_reset.is_none(),
+                a_reset,
+                &a.created_at,
+                &a.account_id,
+            )
+                .cmp(&(
+                    b_class,
+                    b.priority,
+                    b_reset.is_none(),
+                    b_reset,
+                    &b.created_at,
+                    &b.account_id,
+                ))
         });
         if eligible.is_empty() {
             return Vec::new();
@@ -334,7 +374,7 @@ impl AccountPoolRegistry {
         let best_priority = eligible[0].1.priority;
         let group_end = eligible
             .iter()
-            .take_while(|(class, account)| {
+            .take_while(|(class, account, _)| {
                 *class == best_class && account.priority == best_priority
             })
             .count();
@@ -342,14 +382,14 @@ impl AccountPoolRegistry {
         let sticky_index = affinity
             .and_then(|key| state.bindings.get(key))
             .and_then(|binding| {
-                eligible[..group_end].iter().position(|(_, account)| {
+                eligible[..group_end].iter().position(|(_, account, _)| {
                     account.account_id == binding.account_id
                         && account.status_version == binding.version
                 })
             });
         let cursor_key = format!("{provider_id}:{best_class}:{best_priority}");
         let index = sticky_index.unwrap_or_else(|| {
-            if config.strategy == DevinPoolStrategy::FillFirst {
+            if config.strategy != DevinPoolStrategy::RoundRobin {
                 return 0;
             }
             state
@@ -358,12 +398,18 @@ impl AccountPoolRegistry {
                 .and_then(|previous| {
                     eligible[..group_end]
                         .iter()
-                        .position(|(_, account)| &account.account_id == previous)
+                        .position(|(_, account, _)| &account.account_id == previous)
                 })
                 .map(|i| (i + 1) % group_end)
                 .unwrap_or(0)
         });
-        eligible[..group_end].rotate_left(index);
+        if weekly_reset_first {
+            // Move a sticky choice to the front without disturbing deadline order
+            // for fallback candidates (rotating the group would wrap earlier ones).
+            eligible[..=index].rotate_right(1);
+        } else {
+            eligible[..group_end].rotate_left(index);
+        }
         let chosen = &eligible[0].1.account_id;
         if sticky_index.is_none() {
             if state.cursors.len() >= MAX_SCHEDULING_KEYS {
@@ -396,7 +442,7 @@ impl AccountPoolRegistry {
         // consume no outbound attempt and must not hide a later healthy member.
         eligible
             .into_iter()
-            .map(|(_, account)| account.clone())
+            .map(|(_, account, _)| account.clone())
             .collect()
     }
 
@@ -673,6 +719,246 @@ mod tests {
         state.hard_quota = false;
         state.auth_invalid = true;
         assert_eq!(state.cost_class(&config), None);
+    }
+
+    fn claude_account(id: &str, reset: Option<&str>) -> OAuthCredential {
+        let mut account = account(id, 100, 100);
+        account.driver_key = "claude-code".into();
+        account.account_state = serde_json::to_string(&ClaudeAccountState {
+            usage: Some(super::super::anthropic::claude_code::usage::parse_usage(
+                &serde_json::json!({
+                    "five_hour": {"utilization": 30},
+                    "seven_day": {"utilization": 20, "resets_at": reset},
+                }),
+            )),
+            ..Default::default()
+        })
+        .unwrap();
+        account
+    }
+
+    fn mutate_claude(account: &mut OAuthCredential, update: impl FnOnce(&mut ClaudeAccountState)) {
+        let mut state = ClaudeAccountState::parse(&account.account_state);
+        update(&mut state);
+        account.account_state = serde_json::to_string(&state).unwrap();
+    }
+
+    fn weekly_config() -> DevinPoolConfig {
+        DevinPoolConfig {
+            strategy: DevinPoolStrategy::WeeklyResetFirst,
+            ..config()
+        }
+    }
+
+    fn future_reset(hours: i64) -> String {
+        (chrono::Utc::now() + chrono::Duration::hours(hours)).to_rfc3339()
+    }
+
+    fn account_ids(accounts: &[OAuthCredential]) -> Vec<&str> {
+        accounts.iter().map(|a| a.account_id.as_str()).collect()
+    }
+
+    #[test]
+    fn claude_weekly_reset_first_uses_global_deadline_not_observation_or_other_windows() {
+        let registry = AccountPoolRegistry::default();
+        let mut accounts = vec![
+            claude_account("later", Some("2099-01-01T02:00:00Z")),
+            // Lexically later, but earlier once the timezone is normalized.
+            claude_account("sooner", Some("2099-01-01T08:00:00+08:00")),
+        ];
+        mutate_claude(&mut accounts[0], |state| {
+            state.observed_at = Some(i64::MAX);
+            let usage = state.usage.as_mut().unwrap();
+            usage.windows[0].resets_at = Some(future_reset(1));
+            usage
+                .windows
+                .push(super::super::anthropic::claude_code::usage::UsageWindow {
+                    name: "feature:sonnet:weekly_limit".into(),
+                    used_percent: 10.0,
+                    resets_at: Some(future_reset(1)),
+                });
+        });
+        mutate_claude(&mut accounts[1], |state| state.observed_at = Some(1));
+        accounts[1].driver_key = "claude".into(); // Legacy driver alias.
+        for session in [None, Some("one"), Some("two")] {
+            assert_eq!(
+                account_ids(&registry.ordered(
+                    "p",
+                    "claude-sonnet",
+                    &weekly_config(),
+                    &accounts,
+                    session,
+                    &HashSet::new()
+                )),
+                ["sooner", "later"]
+            );
+        }
+        // Existing strategies still use creation/ID order and round-robin cursors.
+        let registry = AccountPoolRegistry::default();
+        for strategy in [DevinPoolStrategy::RoundRobin, DevinPoolStrategy::FillFirst] {
+            let config = DevinPoolConfig {
+                strategy,
+                ..config()
+            };
+            assert_eq!(
+                registry.ordered("p", "m", &config, &accounts, None, &HashSet::new())[0].account_id,
+                "later"
+            );
+        }
+    }
+
+    #[test]
+    fn claude_weekly_reset_first_unknown_deadlines_and_ties_are_deterministic() {
+        let reset = future_reset(1);
+        let mut accounts = vec![
+            claude_account("unknown", None),
+            claude_account("invalid", Some("not-a-date")),
+            claude_account("elapsed", Some(&future_reset(-1))),
+            claude_account("b", Some(&reset)),
+            claude_account("a", Some(&reset)),
+            claude_account("older", Some(&reset)),
+            claude_account("missing", None),
+        ];
+        accounts[5].created_at = "-1".into();
+        mutate_claude(&mut accounts[6], |state| {
+            state
+                .usage
+                .as_mut()
+                .unwrap()
+                .windows
+                .retain(|w| w.name != "weekly_limit")
+        });
+        let registry = AccountPoolRegistry::default();
+        let ordered =
+            registry.ordered("p", "m", &weekly_config(), &accounts, None, &HashSet::new());
+        assert_eq!(
+            account_ids(&ordered),
+            [
+                "older", "a", "b", "elapsed", "invalid", "unknown", "missing"
+            ]
+        );
+        let now = chrono::Utc::now();
+        let at_reset = claude_account("boundary", Some(&now.to_rfc3339()));
+        assert_eq!(
+            ClaudeAccountState::parse(&at_reset.account_state).next_weekly_reset_at(now),
+            None
+        );
+        // No global window means no deadline, even when feature windows exist.
+        mutate_claude(&mut accounts[6], |state| {
+            state.usage.as_mut().unwrap().windows[0].name = "feature:opus:weekly_limit".into()
+        });
+        assert_eq!(
+            ClaudeAccountState::parse(&accounts[6].account_state).next_weekly_reset_at(now),
+            None
+        );
+    }
+
+    #[test]
+    fn claude_weekly_reset_first_preserves_affinity_priority_and_fallback_order() {
+        let registry = AccountPoolRegistry::default();
+        let mut accounts = vec![
+            claude_account("soon", Some(&future_reset(1))),
+            claude_account("sticky", Some(&future_reset(2))),
+            claude_account("later", Some(&future_reset(3))),
+        ];
+        let mut config = weekly_config();
+        let empty = HashSet::new();
+        registry.bind("session", "sticky", 0, 3600);
+        assert_eq!(
+            account_ids(&registry.ordered("p", "m", &config, &accounts, Some("session"), &empty)),
+            ["sticky", "soon", "later"]
+        );
+        assert_eq!(
+            account_ids(&registry.ordered("p", "m", &config, &accounts, Some("new"), &empty)),
+            ["soon", "sticky", "later"]
+        );
+        config.session_affinity = false;
+        assert_eq!(
+            registry.ordered("p", "m", &config, &accounts, Some("session"), &empty)[0].account_id,
+            "soon"
+        );
+        config.session_affinity = true;
+        accounts[2].priority = -1;
+        assert_eq!(
+            registry.ordered("p", "m", &config, &accounts, Some("session"), &empty)[0].account_id,
+            "later"
+        );
+        // Known complete usage still beats a higher-priority incomplete snapshot.
+        mutate_claude(&mut accounts[2], |state| {
+            state
+                .usage
+                .as_mut()
+                .unwrap()
+                .windows
+                .retain(|w| w.name != "five_hour")
+        });
+        assert_eq!(
+            registry.ordered("p", "m", &config, &accounts, Some("session"), &empty)[0].account_id,
+            "soon"
+        );
+    }
+
+    #[test]
+    fn claude_weekly_reset_first_never_bypasses_admission_blocks() {
+        let registry = AccountPoolRegistry::default();
+        let mut accounts = vec![
+            claude_account("good", Some(&future_reset(2))),
+            claude_account("disabled", Some(&future_reset(1))),
+            claude_account("disconnected", Some(&future_reset(1))),
+            claude_account("auth", Some(&future_reset(1))),
+            claude_account("hard-quota", Some(&future_reset(1))),
+            claude_account("weekly-full", Some(&future_reset(-1))),
+            claude_account("five-hour-full", Some(&future_reset(1))),
+            claude_account("model-full", Some(&future_reset(1))),
+            claude_account("cooldown", Some(&future_reset(1))),
+            claude_account("excluded", Some(&future_reset(1))),
+        ];
+        accounts[1].is_enabled = false;
+        accounts[2].status = "disconnected".into();
+        mutate_claude(&mut accounts[3], |state| state.auth_invalid = true);
+        mutate_claude(&mut accounts[4], |state| state.hard_quota = true);
+        mutate_claude(&mut accounts[5], |state| {
+            state.usage.as_mut().unwrap().windows[1].used_percent = 100.0
+        });
+        mutate_claude(&mut accounts[6], |state| {
+            state.usage.as_mut().unwrap().windows[0].used_percent = 100.0
+        });
+        mutate_claude(&mut accounts[7], |state| {
+            state.usage.as_mut().unwrap().windows.push(
+                super::super::anthropic::claude_code::usage::UsageWindow {
+                    name: "feature:opus:weekly_limit".into(),
+                    used_percent: 100.0,
+                    resets_at: Some(future_reset(1)),
+                },
+            )
+        });
+        registry.cooldown("cooldown", 0, "claude-opus", Some(60));
+        registry.bind("session", "disabled", 0, 3600);
+        let excluded = HashSet::from(["excluded".into()]);
+        assert_eq!(
+            account_ids(&registry.ordered(
+                "p",
+                "claude-opus",
+                &weekly_config(),
+                &accounts,
+                Some("session"),
+                &excluded
+            )),
+            ["good"]
+        );
+        accounts[0].is_enabled = false;
+        assert!(
+            registry
+                .ordered(
+                    "p",
+                    "claude-opus",
+                    &weekly_config(),
+                    &accounts,
+                    Some("session"),
+                    &excluded
+                )
+                .is_empty()
+        );
     }
 
     #[test]
