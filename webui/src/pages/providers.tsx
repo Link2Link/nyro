@@ -31,7 +31,8 @@ import type {
 } from "@/lib/types";
 import {
   loadModelProbeResults,
-  mergeProbeResults,
+  mergeModelProbeRun,
+  probeResultAccountId,
   saveModelProbeResults,
   type ProviderModelProbeRecord,
 } from "@/lib/model-probe";
@@ -1494,7 +1495,7 @@ export default function ProvidersPage() {
     }
   }
 
-  async function runModelProbe(provider: Provider, models: string[], prompt: string) {
+  async function runModelProbe(provider: Provider, models: string[], prompt: string, accountId?: string) {
     const runId = activeTestRunRef.current + 1;
     activeTestRunRef.current = runId;
     const isCanceled = () => activeTestRunRef.current !== runId;
@@ -1528,21 +1529,32 @@ export default function ProvidersPage() {
         isZh ? `▶ 探测 ${models.length} 个指定模型` : `▶ Probing ${models.length} selected models`,
       );
 
+      if (accountId) {
+        appendTestLog("info", isZh ? `▶ 本次所选账号：${accountId}` : `▶ Selected account: ${accountId}`);
+      }
       const outcome = await backend<ModelProbeOutcome>("probe_provider_models", {
         id: provider.id,
         models,
+        ...(accountId ? { accountId } : {}),
         // Blank keeps the server's built-in probe message.
         ...(prompt ? { prompt } : {}),
       });
       const results = outcome.results;
+      // Validate before entering the state updater, so a mismatch is caught here.
+      const resultAccountId = probeResultAccountId(outcome.meta, accountId);
       // Persist first and unconditionally: closing the dialog stops the log
       // feed but must never throw paid-for results away. The per-model merge
       // keeps a late superseded run from overwriting a newer retry.
       setModelProbeResults((prev) => ({
         ...prev,
-        [provider.id]: mergeProbeResults(prev[provider.id], results, runAt),
+        [provider.id]: mergeModelProbeRun(prev[provider.id], results, runAt, outcome.meta, accountId),
       }));
       if (isCanceled()) return;
+      if (resultAccountId) {
+        appendTestLog("info", isZh
+          ? `▶ 测试账号：${outcome.meta?.account_label || resultAccountId}（${resultAccountId}）；结果仅对此账号有效`
+          : `▶ Probe account: ${outcome.meta?.account_label || resultAccountId} (${resultAccountId}); results apply only to this account`);
+      }
       const probeProtocol = outcome.meta?.protocol
         ? (endpointDisplayName(outcome.meta.protocol) ?? outcome.meta.protocol)
         : "";
@@ -1599,9 +1611,11 @@ export default function ProvidersPage() {
       if (failed.length > 0) {
         appendTestLog(
           "info",
-          isZh
-            ? "· 不可用的模型已从模型编辑的目标列表中隐藏（仍可手动输入）"
-            : "· Unreachable models are hidden from route target pickers (still enterable manually)",
+          resultAccountId
+            ? (isZh ? "· 账号级失败不会隐藏供应商模型或影响其他账号的结果" : "· Account failures do not hide provider models or affect other accounts' results")
+            : (isZh
+              ? "· 不可用的模型已从模型编辑的目标列表中隐藏（仍可手动输入）"
+              : "· Unreachable models are hidden from route target pickers (still enterable manually)"),
         );
       }
       finishProbing(
@@ -4212,15 +4226,15 @@ export default function ProvidersPage() {
         open={Boolean(probePickerTarget)}
         provider={probePickerTarget}
         isZh={isZh}
-        lastResults={probePickerTarget ? modelProbeResults[probePickerTarget.id]?.results : undefined}
+        lastRecord={probePickerTarget ? modelProbeResults[probePickerTarget.id] : undefined}
         onCancel={() => setProbePickerTarget(null)}
-        onConfirm={(models, prompt) => {
+        onConfirm={(models, prompt, accountId) => {
           const target = probePickerTarget;
           setProbePickerTarget(null);
           if (!target) return;
           saveProbeSelection(target.id, models);
           saveProbePrompt(prompt);
-          void runModelProbe(target, models, prompt);
+          void runModelProbe(target, models, prompt, accountId);
         }}
       />
 

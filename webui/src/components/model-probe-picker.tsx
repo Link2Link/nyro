@@ -12,7 +12,18 @@ import {
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { backend } from "@/lib/backend";
-import type { StoredModelProbeResult } from "@/lib/model-probe";
+import { probeResultsForScope, type ProviderModelProbeRecord, type StoredModelProbeResult } from "@/lib/model-probe";
+import { accountStateLabel, type AccountPoolView } from "@/lib/devin-account-pool";
+import {
+  canConfirmModelProbe,
+  canProbeAccount,
+  initialProbeAccountId,
+  probePoolAccounts,
+  selectedProbeAccount,
+  supportsProbeAccounts,
+  type ProbeAccountsState,
+  type ProbeProvider,
+} from "@/lib/model-probe-accounts";
 import {
   buildProbeSelection,
   DEFAULT_MODEL_PROBE_PROMPT,
@@ -28,15 +39,15 @@ const LARGE_SELECTION = 20;
 
 interface ModelProbePickerProps {
   open: boolean;
-  provider: { id: string; name: string } | null;
+  provider: ProbeProvider | null;
   isZh: boolean;
-  /** Latest persisted probe results — rendered as status badges only. */
-  lastResults?: StoredModelProbeResult[];
+  /** Status badges are read only from the selected account's namespace. */
+  lastRecord?: ProviderModelProbeRecord;
   /**
    * Receives a non-empty, normalized selection and the trimmed probe message
    * (empty = built-in default) when the user confirms.
    */
-  onConfirm: (models: string[], prompt: string) => void;
+  onConfirm: (models: string[], prompt: string, accountId?: string) => void;
   onCancel: () => void;
 }
 
@@ -49,7 +60,7 @@ export function ModelProbePicker({
   open,
   provider,
   isZh,
-  lastResults,
+  lastRecord,
   onConfirm,
   onCancel,
 }: ModelProbePickerProps) {
@@ -60,13 +71,13 @@ export function ModelProbePicker({
         if (!value) onCancel();
       }}
     >
-      <DialogContent className="w-[min(92vw,560px)]">
-        {provider && (
+      <DialogContent className="max-h-[90vh] w-[min(92vw,560px)] overflow-y-auto">
+        {open && provider && (
           <ModelProbePickerBody
             key={provider.id}
             provider={provider}
             isZh={isZh}
-            lastResults={lastResults}
+            lastRecord={lastRecord}
             onConfirm={onConfirm}
             onCancel={onCancel}
           />
@@ -84,10 +95,10 @@ export function ModelProbePicker({
 function ModelProbePickerBody({
   provider,
   isZh,
-  lastResults,
+  lastRecord,
   onConfirm,
   onCancel,
-}: Omit<ModelProbePickerProps, "open"> & { provider: { id: string; name: string } }) {
+}: Omit<ModelProbePickerProps, "open"> & { provider: ProbeProvider }) {
   const [catalog, setCatalog] = useState<string[]>([]);
   const [catalogError, setCatalogError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
@@ -96,6 +107,28 @@ function ModelProbePickerBody({
   const [search, setSearch] = useState("");
   // Remembered across providers; blank keeps the built-in "hi".
   const [promptText, setPromptText] = useState(loadProbePrompt);
+  const requiresAccount = supportsProbeAccounts(provider);
+  const [accountState, setAccountState] = useState<ProbeAccountsState>({ status: "loading" });
+  const [accountId, setAccountId] = useState("");
+  const account = selectedProbeAccount(accountState, accountId);
+
+  useEffect(() => {
+    if (!requiresAccount) return;
+    const controller = new AbortController();
+    void backend<AccountPoolView | null>("get_provider_account_pool", { id: provider.id }, { signal: controller.signal })
+      .then((pool) => {
+        if (controller.signal.aborted) return;
+        const accounts = probePoolAccounts(pool, provider.id);
+        setAccountState({ status: "ready", accounts });
+        setAccountId(initialProbeAccountId(accounts));
+      })
+      .catch((error: unknown) => {
+        if (!controller.signal.aborted) {
+          setAccountState({ status: "error", error: error instanceof Error ? error.message : String(error) });
+        }
+      });
+    return () => controller.abort();
+  }, [provider.id, requiresAccount]);
 
   useEffect(() => {
     let stale = false;
@@ -138,9 +171,11 @@ function ModelProbePickerBody({
   );
   const badgeByModel = useMemo(() => {
     const map = new Map<string, StoredModelProbeResult>();
-    for (const result of lastResults ?? []) map.set(result.model, result);
+    const results = requiresAccount && !account
+      ? [] : probeResultsForScope(lastRecord, requiresAccount ? account?.account_id : undefined);
+    for (const result of results) map.set(result.model, result);
     return map;
-  }, [lastResults]);
+  }, [lastRecord, requiresAccount, account]);
 
   const selection = buildProbeSelection([...checked], extrasText);
   const count = selection.length;
@@ -184,6 +219,41 @@ function ModelProbePickerBody({
       </DialogHeader>
 
       <div className="space-y-3">
+        {requiresAccount && (
+          <div className="space-y-1 rounded-md border border-slate-200 p-3">
+            <label htmlFor="model-probe-account" className="text-xs font-medium text-slate-700">
+              {isZh ? "测试账号（必选）" : "Probe account (required)"}
+            </label>
+            <select
+              id="model-probe-account"
+              value={accountId}
+              onChange={(event) => setAccountId(event.target.value)}
+              disabled={accountState.status !== "ready" || accountState.accounts.length === 0}
+              className="w-full rounded-md border border-slate-200 bg-white px-2 py-2 text-xs disabled:opacity-50"
+            >
+              <option value="">{isZh ? "请选择账号" : "Select an account"}</option>
+              {accountState.status === "ready" && accountState.accounts.map((item) => (
+                <option key={item.account_id} value={item.account_id} disabled={!canProbeAccount(item)}>
+                  {item.label || item.account_id} · {item.account_id} · {accountStateLabel(item.status, isZh)}
+                  {!item.is_enabled ? ` · ${accountStateLabel("disabled", isZh)}` : ""}
+                </option>
+              ))}
+            </select>
+            <p className="text-xs text-slate-500" role="status">
+              {accountState.status === "loading"
+                ? (isZh ? "正在加载账号…" : "Loading accounts…")
+                : accountState.status === "error"
+                  ? (isZh ? `账号加载失败：${accountState.error}` : `Failed to load accounts: ${accountState.error}`)
+                  : accountState.accounts.length === 0
+                    ? (isZh ? "没有账号，请先在供应商中添加并授权账号。" : "No accounts. Add and authorize an account in the provider first.")
+                    : !accountState.accounts.some(canProbeAccount)
+                      ? (isZh ? "没有已启用且已授权的账号。" : "No enabled, connected accounts.")
+                      : account
+                        ? (isZh ? `本次账号：${account.label || account.account_id}（${account.account_id}）。历史标记仅属于此账号。` : `This run: ${account.label || account.account_id} (${account.account_id}). History badges belong only to this account.`)
+                        : (isZh ? "请选择一个已启用且已授权的账号；不会自动调度或回退到其他账号。" : "Choose an enabled, connected account; no automatic scheduling or fallback to another account.")}
+            </p>
+          </div>
+        )}
         <div className="space-y-1">
           <label htmlFor="model-probe-prompt" className="text-xs text-slate-500">
             {isZh
@@ -281,8 +351,11 @@ function ModelProbePickerBody({
         </Button>
         <Button
           type="button"
-          onClick={() => onConfirm(selection, normalizeProbePrompt(promptText))}
-          disabled={count === 0}
+          onClick={() => {
+            if (!canConfirmModelProbe(provider, count, accountState, accountId)) return;
+            onConfirm(selection, normalizeProbePrompt(promptText), requiresAccount ? account?.account_id : undefined);
+          }}
+          disabled={!canConfirmModelProbe(provider, count, accountState, accountId)}
           variant={warnLarge ? "outline" : "default"}
           className={
             warnLarge

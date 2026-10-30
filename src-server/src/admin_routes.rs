@@ -372,10 +372,13 @@ struct ProbeModelsRequest {
     /// Custom probe message; absent/null/blank keeps the built-in default.
     #[serde(default)]
     prompt: Option<String>,
+    /// Explicit account; never fall back to a sibling when supplied.
+    #[serde(default)]
+    account_id: Option<String>,
 }
 
-/// Normalized probe-models request: (model selection, custom message).
-type ProbeModelsInput = (Option<Vec<String>>, Option<String>);
+/// Normalized probe-models request: (selection, message, explicit account).
+type ProbeModelsInput = (Option<Vec<String>>, Option<String>, Option<String>);
 
 /// Parse the optional probe body. An empty body keeps the legacy "probe every
 /// model with the default message" behavior; a body that is present must
@@ -383,7 +386,7 @@ type ProbeModelsInput = (Option<Vec<String>>, Option<String>);
 /// a full run.
 fn parse_probe_request(body: &Bytes) -> Result<ProbeModelsInput, String> {
     if body.iter().all(|byte| byte.is_ascii_whitespace()) {
-        return Ok((None, None));
+        return Ok((None, None, None));
     }
     let request: ProbeModelsRequest =
         serde_json::from_slice(body).map_err(|e| format!("invalid JSON body: {e}"))?;
@@ -391,7 +394,9 @@ fn parse_probe_request(body: &Bytes) -> Result<ProbeModelsInput, String> {
         nyro_core::admin::normalize_probe_selection(request.models).map_err(|e| e.to_string())?;
     let prompt =
         nyro_core::admin::normalize_probe_prompt(request.prompt).map_err(|e| e.to_string())?;
-    Ok((selection, prompt))
+    let account_id = nyro_core::admin::normalize_probe_account_id(request.account_id)
+        .map_err(|e| e.to_string())?;
+    Ok((selection, prompt, account_id))
 }
 
 async fn probe_provider_keys_handler(
@@ -409,7 +414,7 @@ async fn probe_provider_models_handler(
     Path(id): Path<String>,
     body: Bytes,
 ) -> impl IntoResponse {
-    let (selection, prompt) = match parse_probe_request(&body) {
+    let (selection, prompt, account_id) = match parse_probe_request(&body) {
         Ok(request) => request,
         Err(message) => {
             return (
@@ -421,7 +426,7 @@ async fn probe_provider_models_handler(
     };
     match gw
         .admin()
-        .probe_provider_models_with_prompt(&id, selection, prompt)
+        .probe_provider_models_with_account(&id, selection, prompt, account_id)
         .await
     {
         Ok(v) => Json(serde_json::json!({ "data": v })).into_response(),
@@ -1549,6 +1554,21 @@ fn account_conflict(message: &str) -> bool {
 }
 
 fn err(e: anyhow::Error) -> axum::response::Response {
+    if let Some(error) = e.downcast_ref::<nyro_core::admin::ModelProbeAccountError>() {
+        use nyro_core::admin::ModelProbeAccountError::*;
+        let status = match error {
+            InvalidId | Unsupported => StatusCode::BAD_REQUEST,
+            NotFound => StatusCode::NOT_FOUND,
+            Unavailable | Changed => StatusCode::CONFLICT,
+            RefreshFailed => StatusCode::BAD_GATEWAY,
+            StateUnavailable => StatusCode::INTERNAL_SERVER_ERROR,
+        };
+        return (
+            status,
+            Json(serde_json::json!({ "error": error.to_string() })),
+        )
+            .into_response();
+    }
     if e.downcast_ref::<TokenPriceError>().is_some() {
         return token_price_error(e);
     }
@@ -1704,21 +1724,53 @@ mod tests {
     }
 
     #[test]
+    fn probe_account_errors_have_safe_http_statuses() {
+        use nyro_core::admin::ModelProbeAccountError::*;
+        for (error, status) in [
+            (InvalidId, StatusCode::BAD_REQUEST),
+            (Unsupported, StatusCode::BAD_REQUEST),
+            (NotFound, StatusCode::NOT_FOUND),
+            (Unavailable, StatusCode::CONFLICT),
+            (Changed, StatusCode::CONFLICT),
+            (RefreshFailed, StatusCode::BAD_GATEWAY),
+            (StateUnavailable, StatusCode::INTERNAL_SERVER_ERROR),
+        ] {
+            assert_eq!(err(error.into()).status(), status);
+        }
+    }
+
+    #[test]
     fn probe_request_body_carries_optional_selection_and_prompt() {
         let parse = |raw: &str| parse_probe_request(&Bytes::from(raw.to_string()));
-        assert_eq!(parse("").unwrap(), (None, None));
-        assert_eq!(parse("  \n").unwrap(), (None, None));
-        assert_eq!(parse("{}").unwrap(), (None, None));
+        assert_eq!(parse("").unwrap(), (None, None, None));
+        assert_eq!(parse("  \n").unwrap(), (None, None, None));
+        assert_eq!(parse("{}").unwrap(), (None, None, None));
         assert_eq!(
             parse(r#"{"models":["m1"," m1 ","m2"]}"#).unwrap(),
-            (Some(vec!["m1".to_string(), "m2".to_string()]), None)
+            (Some(vec!["m1".to_string(), "m2".to_string()]), None, None)
         );
         assert_eq!(
             parse(r#"{"models":["m1"],"prompt":"  Say OK  "}"#).unwrap(),
-            (Some(vec!["m1".to_string()]), Some("Say OK".to_string()))
+            (
+                Some(vec!["m1".to_string()]),
+                Some("Say OK".to_string()),
+                None
+            )
         );
         // A blank prompt falls back to the default; only models are validated.
-        assert_eq!(parse(r#"{"prompt":"   "}"#).unwrap(), (None, None));
+        assert_eq!(parse(r#"{"prompt":"   "}"#).unwrap(), (None, None, None));
+        assert_eq!(
+            parse(r#"{"models":["m1"],"account_id":" selected "}"#).unwrap(),
+            (Some(vec!["m1".into()]), None, Some("selected".into()))
+        );
+        assert_eq!(parse(r#"{"account_id":null}"#).unwrap(), (None, None, None));
+        for raw in [
+            r#"{"account_id":" "}"#,
+            r#"{"account_id":3}"#,
+            r#"{"account_id":[]}"#,
+        ] {
+            assert!(parse(raw).is_err(), "{raw}");
+        }
         assert!(parse(r#"{"models":[]}"#).is_err());
         assert!(parse("not json").is_err());
         let too_long = format!(

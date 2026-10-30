@@ -696,10 +696,12 @@ export interface ModelProbeResult {
   quota_resets_at?: string | null;
 }
 
-/** Which protocol/base_url a model probe ran through. */
+/** Which protocol/base_url and optional pinned account a model probe ran through. */
 export interface ModelProbeMeta {
   protocol: string;
   base_url: string;
+  account_id?: string | null;
+  account_label?: string | null;
 }
 
 /** Full model-probe response: shared run metadata plus per-model results. */

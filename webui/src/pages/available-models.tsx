@@ -29,7 +29,9 @@ import { ModelRatingBadge, ModelRatingClearedNotice, ModelRatingEditor, ModelRat
 const modelKey = (providerId: string, model: string) => JSON.stringify([providerId, model]);
 import {
   loadModelProbeResults,
-  mergeProbeResults,
+  mergeModelProbeRun,
+  probeResultAccountId,
+  type ProviderModelProbeRecord,
   saveModelProbeResults,
   type ProviderModelProbeStore,
 } from "@/lib/model-probe";
@@ -197,6 +199,44 @@ function ProbeBadge({ result, isZh }: { result?: ModelProbeResult; isZh: boolean
       <CircleAlert className="h-3 w-3" />
       {isZh ? "不可用" : "Unavailable"}
     </Badge>
+  );
+}
+
+/** Account failures are visible here, but never feed the provider-wide catalog filter. */
+function AccountProbeHistory({ record, isZh, locale }: { record?: ProviderModelProbeRecord; isZh: boolean; locale: string }) {
+  const records = Object.values(record?.accounts ?? {}).sort((a, b) => b.tested_at.localeCompare(a.tested_at));
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const selected = records.find((item) => item.account_id === selectedId) ?? records[0];
+  if (!selected) return null;
+  return (
+    <details className="border-b border-slate-200 bg-slate-50/60 px-4 py-2 text-xs">
+      <summary className="cursor-pointer text-slate-600">
+        {isZh ? "账号测试结果（不影响供应商模型列表）" : "Account probe results (do not filter provider models)"}
+      </summary>
+      <label className="mt-2 flex flex-wrap items-center gap-2 text-slate-600">
+        {isZh ? "查看账号" : "View account"}
+        <select
+          value={selected.account_id}
+          onChange={(event) => setSelectedId(event.target.value)}
+          className="max-w-full rounded border border-slate-200 bg-white px-2 py-1"
+        >
+          {records.map((item) => (
+            <option key={item.account_id} value={item.account_id}>
+              {item.account_label || item.account_id} · {item.account_id}
+            </option>
+          ))}
+        </select>
+        <span>{formatTimestamp(selected.tested_at, locale)}</span>
+      </label>
+      <div className="mt-2 max-h-64 space-y-1 overflow-y-auto">
+        {selected.results.map((result) => (
+          <div key={result.model} className="flex items-center justify-between gap-2">
+            <span className="min-w-0 truncate font-mono" title={result.model}>{result.model}</span>
+            <ProbeBadge result={result} isZh={isZh} />
+          </div>
+        ))}
+      </div>
+    </details>
   );
 }
 
@@ -488,6 +528,7 @@ function ProviderSection({
   const record = probeStore[provider.id];
   const testedAt = record?.tested_at ? formatTimestamp(record.tested_at, locale) : null;
   const availableCount = record?.results.filter((result) => result.success).length ?? 0;
+  const latestAccountProbe = Object.values(record?.accounts ?? {}).sort((a, b) => b.tested_at.localeCompare(a.tested_at))[0];
   const visibleModels = filteredModels.slice(0, visibleCount);
 
   return (
@@ -521,8 +562,12 @@ function ProviderSection({
             </div>
             <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-slate-500">
               <span>{isZh ? displayedModels.length + " 个模型" : displayedModels.length + " models"}</span>
-              {record && <span className="text-green-600">{isZh ? availableCount + " 个已验证可用" : availableCount + " verified available"}</span>}
-              {testedAt && <span>{isZh ? "测试于 " + testedAt : "Tested " + testedAt}</span>}
+              {Boolean(record?.results.length) && <span className="text-green-600">{isZh ? availableCount + " 个已验证可用" : availableCount + " verified available"}</span>}
+              {testedAt && <span>{isZh ? "供应商级测试于 " + testedAt : "Provider-level test " + testedAt}</span>}
+              {latestAccountProbe && <span title={latestAccountProbe.account_id}>
+                {isZh ? "最近测试账号：" : "Latest probe account: "}{latestAccountProbe.account_label || latestAccountProbe.account_id}
+                {" · "}{formatTimestamp(latestAccountProbe.tested_at, locale)}
+              </span>}
             </div>
           </div>
         </button>
@@ -567,6 +612,8 @@ function ProviderSection({
           {probeError && (
             <div className="border-b border-red-100 bg-red-50/70 px-4 py-2 text-xs text-red-600">{probeError}</div>
           )}
+
+          <AccountProbeHistory record={record} isZh={isZh} locale={locale} />
 
           {provider.is_enabled && !query.isLoading && !query.error && filteredModels.length === 0 && (
             <div className="px-4 py-8 text-center text-sm text-slate-500">
@@ -691,7 +738,7 @@ export default function AvailableModelsPage() {
     )));
   }
 
-  async function runProbe(provider: Provider, models: string[], prompt: string) {
+  async function runProbe(provider: Provider, models: string[], prompt: string, accountId?: string) {
     setProbingId(provider.id);
     setProbeErrors((current) => {
       const next = { ...current };
@@ -703,15 +750,17 @@ export default function AvailableModelsPage() {
       const outcome = await backend<ModelProbeOutcome>("probe_provider_models", {
         id: provider.id,
         models,
+        ...(accountId ? { accountId } : {}),
         // Blank keeps the server's built-in probe message.
         ...(prompt ? { prompt } : {}),
       });
+      probeResultAccountId(outcome.meta, accountId);
       setProbeStore((current) => {
-        // Merge per model (newest run wins): a subset run must not wipe the
+        // Merge per model and account (newest run wins): a subset run must not wipe the
         // state of models it did not probe.
         const next = {
           ...current,
-          [provider.id]: mergeProbeResults(current[provider.id], outcome.results, runAt),
+          [provider.id]: mergeModelProbeRun(current[provider.id], outcome.results, runAt, outcome.meta, accountId),
         };
         saveModelProbeResults(next);
         return next;
@@ -719,7 +768,7 @@ export default function AvailableModelsPage() {
     } catch (error) {
       setProbeErrors((current) => ({
         ...current,
-        [provider.id]: error instanceof Error ? error.message : String(error),
+        [provider.id]: `${accountId ? (isZh ? `账号 ${accountId}：` : `Account ${accountId}: `) : ""}${error instanceof Error ? error.message : String(error)}`,
       }));
     } finally {
       setProbingId(null);
@@ -870,15 +919,15 @@ export default function AvailableModelsPage() {
           open={Boolean(probePickerTarget)}
           provider={probePickerTarget}
           isZh={isZh}
-          lastResults={probePickerTarget ? probeStore[probePickerTarget.id]?.results : undefined}
+          lastRecord={probePickerTarget ? probeStore[probePickerTarget.id] : undefined}
           onCancel={() => setProbePickerTarget(null)}
-          onConfirm={(models, prompt) => {
+          onConfirm={(models, prompt, accountId) => {
             const target = probePickerTarget;
             setProbePickerTarget(null);
             if (!target) return;
             saveProbeSelection(target.id, models);
             saveProbePrompt(prompt);
-            void runProbe(target, models, prompt);
+            void runProbe(target, models, prompt, accountId);
           }}
         />
         {editingRating && (

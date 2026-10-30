@@ -193,9 +193,10 @@ pub async fn probe_provider_models(
     id: String,
     models: Option<Vec<String>>,
     prompt: Option<String>,
+    account_id: Option<String>,
 ) -> Result<nyro_core::admin::ProviderModelProbeOutcome, String> {
     gw.admin()
-        .probe_provider_models_with_prompt(&id, models, prompt)
+        .probe_provider_models_with_account(&id, models, prompt, account_id)
         .await
         .map_err(|e| e.to_string())
 }

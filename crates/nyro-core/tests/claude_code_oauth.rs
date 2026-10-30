@@ -167,8 +167,9 @@ async fn start_upstream() -> (String, Arc<Mutex<Vec<Captured>>>) {
                 } else {
                     let message = json!({
                         "id":"msg_1","type":"message","role":"assistant","model":UPSTREAM_MODEL,
-                        "content":[{"type":"tool_use","id":"toolu_1","name":tool,"input":{"cmd":"ls"}}],
-                        "stop_reason":"tool_use","usage":{"input_tokens":5,"output_tokens":3}
+                        "content": if tool == "none" { json!([{"type":"text","text":"OK"}]) } else { json!([{"type":"tool_use","id":"toolu_1","name":tool,"input":{"cmd":"ls"}}]) },
+                        "stop_reason": if tool == "none" { "end_turn" } else { "tool_use" },
+                        "usage":{"input_tokens":5,"output_tokens":3}
                     })
                     .to_string();
                     format!(
@@ -858,6 +859,244 @@ async fn setup_pool(
         .await
         .unwrap();
     (dir, gw, id)
+}
+
+#[tokio::test]
+async fn claude_model_probe_uses_selected_account_and_never_falls_back() {
+    let (url, captured) = start_upstream().await;
+    let (_dir, gw, id) = setup_pool(&url, "pool-auth-rejected", 3).await;
+    let accounts = gw
+        .storage
+        .oauth_credentials()
+        .list_accounts(&id)
+        .await
+        .unwrap();
+    let good = accounts
+        .iter()
+        .find(|a| a.access_token == "pool-healthy")
+        .unwrap();
+    let bad = accounts
+        .iter()
+        .find(|a| a.access_token == "pool-auth-rejected")
+        .unwrap();
+    for (account, expected_success) in [(good, true), (bad, false)] {
+        captured.lock().unwrap().clear();
+        let outcome = gw
+            .admin()
+            .probe_provider_models_with_account(
+                &id,
+                Some(vec![UPSTREAM_MODEL.into()]),
+                Some("Say selected account".into()),
+                Some(account.account_id.clone()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome.meta.account_id.as_deref(),
+            Some(account.account_id.as_str())
+        );
+        assert_eq!(
+            outcome.meta.account_label.as_deref(),
+            Some(account.label.as_str())
+        );
+        assert_eq!(outcome.results.len(), 1);
+        assert_eq!(
+            outcome.results[0].success, expected_success,
+            "{:?}",
+            outcome.results
+        );
+        let requests = captured.lock().unwrap();
+        let calls: Vec<_> = requests
+            .iter()
+            .filter(|r| r.line.starts_with("POST /v1/messages"))
+            .collect();
+        assert_eq!(calls.len(), 1, "no sibling retry is allowed");
+        assert_eq!(
+            calls[0].header("authorization"),
+            Some(format!("Bearer {}", account.access_token).as_str())
+        );
+        assert!(cch::verify_body(&calls[0].raw_body));
+        assert!(calls[0].body().to_string().contains("Say selected account"));
+        let serialized = serde_json::to_string(&outcome).unwrap();
+        assert!(!serialized.contains("pool-healthy") && !serialized.contains("pool-auth-rejected"));
+    }
+    // Backward compatibility: the old provider-only API stays ambiguous for a
+    // Claude pool rather than silently selecting an arbitrary account.
+    assert!(
+        gw.admin()
+            .probe_provider_models_with_prompt(&id, Some(vec![UPSTREAM_MODEL.into()]), None)
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn claude_model_probe_discards_changed_account_results_without_sibling_retry() {
+    for mutation in ["disable", "disconnect", "reauthorize", "quota", "policy"] {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let (seen_tx, seen_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let barrier = Arc::new(Mutex::new(Some((seen_tx, release_rx))));
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = calls.clone();
+        let server = tokio::spawn(async move {
+            // Background usage/profile reads are not model generations. Serve
+            // them independently so they cannot accidentally release our gate.
+            let app = axum::Router::new().route("/v1/messages", axum::routing::post(move |headers: HeaderMap| {
+                let barrier = barrier.clone();
+                let count = count.clone();
+                async move {
+                    count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let gate = barrier.lock().unwrap().take();
+                    if let Some((seen, release)) = gate {
+                        let _ = seen.send(headers);
+                        let _ = release.await;
+                    }
+                    axum::Json(json!({"id":"msg_probe","type":"message","role":"assistant","content":[{"type":"text","text":"old generation reply"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}))
+                }
+            })).fallback(|| async { axum::Json(json!({})) });
+            axum::serve(listener, app).await.unwrap();
+        });
+        let (_dir, gw, id) = setup_pool(&url, "pool-selected", 3).await;
+        let store = gw.storage.oauth_credentials();
+        let selected = store
+            .list_accounts(&id)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|a| a.access_token == "pool-selected")
+            .unwrap();
+        let admin = gw.admin();
+        let probe_id = id.clone();
+        let account_id = selected.account_id.clone();
+        let probe = tokio::spawn(async move {
+            admin
+                .probe_provider_models_with_account(
+                    &probe_id,
+                    Some(vec!["claude-sonnet-5-5".into(), "claude-opus-5-5".into()]),
+                    None,
+                    Some(account_id),
+                )
+                .await
+                .unwrap()
+        });
+        let request = tokio::time::timeout(Duration::from_secs(5), seen_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(request["authorization"], "Bearer pool-selected");
+        match mutation {
+            "disable" => {
+                store
+                    .update_account(
+                        &id,
+                        &selected.account_id,
+                        selected.status_version,
+                        nyro_core::db::models::OAuthAccountUpdate {
+                            is_enabled: Some(false),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .unwrap()
+                    .unwrap();
+            }
+            "disconnect" => {
+                assert!(
+                    store
+                        .disconnect_account(&id, &selected.account_id, selected.status_version)
+                        .await
+                        .unwrap()
+                );
+            }
+            "reauthorize" => {
+                store
+                    .replace_account(
+                        &id,
+                        &selected.account_id,
+                        selected.status_version,
+                        UpsertOAuthCredential {
+                            driver_key: "claude-code".into(),
+                            scheme: "oauth_auth_code_pkce".into(),
+                            access_token: "new-secret".into(),
+                            expires_at: Some("2099-01-01T00:00:00Z".into()),
+                            resource_url: Some(url.clone()),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .unwrap()
+                    .unwrap();
+            }
+            "quota" => {
+                // The background usage monitor may have updated account_state
+                // without changing the credential generation. CAS the latest
+                // state just as a real rejection does.
+                let mut applied = false;
+                for _ in 0..10 {
+                    let current = store
+                        .get_account(&id, &selected.account_id)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(current.status_version, selected.status_version);
+                    if store
+                        .compare_account_state(
+                            &id,
+                            &selected.account_id,
+                            current.status_version,
+                            &current.account_state,
+                            r#"{"hard_quota":true}"#,
+                        )
+                        .await
+                        .unwrap()
+                    {
+                        applied = true;
+                        break;
+                    }
+                }
+                assert!(applied);
+            }
+            "policy" => {
+                gw.admin()
+                    .configure_provider_account_pool(
+                        &id,
+                        nyro_core::admin::DevinPoolConfig {
+                            reserve_policy: nyro_core::admin::DevinReservePolicy::Fallback,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .unwrap();
+            }
+            _ => unreachable!(),
+        }
+        release_tx.send(()).unwrap();
+        let outcome = tokio::time::timeout(Duration::from_secs(5), probe)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(outcome.results.len(), 2);
+        assert!(
+            outcome
+                .results
+                .iter()
+                .all(|r| !r.success && r.reply.is_none()),
+            "{mutation}: {:?}",
+            outcome.results
+        );
+        assert_eq!(
+            outcome.meta.account_id.as_deref(),
+            Some(selected.account_id.as_str())
+        );
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "{mutation}: later model must not be sent"
+        );
+        server.abort();
+    }
 }
 
 #[tokio::test]

@@ -177,6 +177,10 @@ function resolveHTTP(cmd: string, args?: Record<string, unknown>): HTTPMapping {
       const body: Record<string, unknown> = {};
       if (Array.isArray(args?.models)) body.models = args.models;
       if (typeof args?.prompt === "string" && args.prompt.trim()) body.prompt = args.prompt;
+      // Preserve explicit values for server validation; dropping invalid/blank
+      // account ids could silently turn a pinned run into automatic scheduling.
+      // IPC already receives camelCase args; the HTTP contract uses snake_case.
+      if (args?.accountId !== undefined) body.account_id = args.accountId;
       return {
         method: "POST",
         url: `${base}/providers/${args?.id}/probe-models`,

@@ -1,5 +1,8 @@
 use super::*;
 
+mod model_probe_accounts;
+pub use model_probe_accounts::{ModelProbeAccountError, normalize_probe_account_id};
+
 #[derive(Debug)]
 struct NormalizedProtocolConfig {
     mode: String,
@@ -56,6 +59,10 @@ pub struct ProviderModelProbeResult {
 pub struct ProviderModelProbeMeta {
     pub protocol: String,
     pub base_url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub account_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub account_label: Option<String>,
 }
 
 /// Full probe response: shared run metadata plus per-model results.
@@ -2945,6 +2952,8 @@ impl AdminService {
             meta: ProviderModelProbeMeta {
                 protocol: protocol_id,
                 base_url,
+                account_id: None,
+                account_label: None,
             },
             results,
         })
@@ -3057,6 +3066,8 @@ impl AdminService {
             meta: ProviderModelProbeMeta {
                 protocol,
                 base_url: provider.base_url.clone(),
+                account_id: None,
+                account_label: None,
             },
             results,
         })
@@ -3160,6 +3171,8 @@ impl AdminService {
             meta: ProviderModelProbeMeta {
                 protocol,
                 base_url: provider.base_url.clone(),
+                account_id: None,
+                account_label: None,
             },
             results,
         })
