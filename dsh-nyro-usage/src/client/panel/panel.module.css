@@ -388,7 +388,9 @@ html[data-dsh-nyro-usage-active]:not([data-dsh-taskboard-active]):not([data-dsh-
 /* --- provider card grid ------------------------------------------------------ */
 
 .grid {
-  grid-template-columns: repeat(auto-fill, minmax(340px, 1fr));
+  grid-template-columns: repeat(auto-fill, minmax(min(340px, 100%), 1fr));
+  /* Equal height within each row; compact pool details stay collapsed. */
+  align-items: stretch;
   gap: 12px;
   display: grid;
 }
@@ -664,17 +666,52 @@ html[data-dsh-nyro-usage-active]:not([data-dsh-taskboard-active]):not([data-dsh-
   background: var(--dsw-alias-state-error-primary);
 }
 
-/* Pool estimates intentionally have no single-window pace/reset marker. */
+/* Pool estimates share tier rows, but never a single-account pace marker.
+   A starred countdown refers only to the next resetting accounts. */
 .poolSummary {
   display: flex;
   flex-direction: column;
-  gap: 10px;
+  gap: 7px;
 }
 
-.poolHeading {
+.poolDetails {
+  color: var(--dsw-alias-label-tertiary);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.poolDetails > summary {
+  cursor: pointer;
+  width: fit-content;
+  max-width: 100%;
+  overflow-wrap: anywhere;
+}
+
+.poolDetails > summary:hover {
   color: var(--dsw-alias-label-secondary);
-  font-size: 11.5px;
-  font-weight: 600;
+}
+
+.poolDetails > summary:focus-visible {
+  outline: 2px solid var(--dsw-alias-state-business-primary);
+  outline-offset: 3px;
+  border-radius: 3px;
+}
+
+.poolDetailsBody {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  border-top: 1px solid var(--dsw-alias-border-l1);
+  margin-top: 8px;
+  padding-top: 8px;
+}
+
+.poolTrackUnknown {
+  background: repeating-linear-gradient(135deg, var(--dsw-alias-interactive-bg-hover) 0 4px, transparent 4px 8px);
+}
+
+.poolUnknown {
+  color: var(--dsw-alias-label-tertiary);
 }
 
 .poolWindow {
@@ -692,11 +729,6 @@ html[data-dsh-nyro-usage-active]:not([data-dsh-taskboard-active]):not([data-dsh-
   font-variant-numeric: tabular-nums;
 }
 
-.poolWindow .tierTrack {
-  flex: none;
-  width: 100%;
-}
-
 .poolMeta {
   color: var(--dsw-alias-label-tertiary);
   font-size: 11px;
@@ -707,7 +739,7 @@ html[data-dsh-nyro-usage-active]:not([data-dsh-taskboard-active]):not([data-dsh-
 /* --- balances / spends ------------------------------------------------------- */
 
 .tierPercent {
-  width: 38px;
+  width: 44px;
   text-align: right;
   flex: none;
   font-weight: 600;
@@ -729,7 +761,7 @@ html[data-dsh-nyro-usage-active]:not([data-dsh-taskboard-active]):not([data-dsh-
 .tierReset {
   color: var(--dsw-alias-label-tertiary);
   white-space: nowrap;
-  width: 52px;
+  width: 60px;
   text-align: right;
   flex: none;
   font-size: 10.5px;
@@ -790,6 +822,7 @@ html[data-dsh-nyro-usage-active]:not([data-dsh-taskboard-active]):not([data-dsh-
 }
 
 .cardFooter {
+  margin-top: auto;
   color: var(--dsw-alias-label-tertiary);
   font-size: 10.5px;
 }

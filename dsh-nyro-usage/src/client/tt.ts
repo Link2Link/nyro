@@ -43,9 +43,9 @@ export function agoLabel(timestamp: string | null | undefined): string {
 }
 
 /** Compact countdown like "2h30m" / "3d12h"; empty when already past. */
-export function countdownLabel(resetsAt: string | null | undefined): string {
+export function countdownLabel(resetsAt: string | null | undefined, now = Date.now()): string {
   if (resetsAt === null || resetsAt === undefined) return ''
-  const diffMs = new Date(resetsAt).getTime() - Date.now()
+  const diffMs = new Date(resetsAt).getTime() - now
   if (!Number.isFinite(diffMs) || diffMs <= 0) return ''
   const seconds = Math.floor(diffMs / 1000)
   if (seconds < 60) return `${seconds}s`

@@ -81,7 +81,7 @@ export interface TierBarProps {
 /** Render one quota-window row. */
 export function TierBar(props: TierBarProps) {
   const used = Math.min(Math.max(Number.isFinite(props.tier.used_percent) ? props.tier.used_percent : 0, 0), 100)
-  const countdown = countdownLabel(props.tier.resets_at)
+  const countdown = countdownLabel(props.tier.resets_at, props.now)
   const state = tierState(used)
   const pace = steadyPacePercent(props.tier.resets_at, props.tier.name, props.now)
   return (

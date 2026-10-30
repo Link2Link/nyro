@@ -33,6 +33,14 @@ accounts. Partial or stale data is not displayed as zero, and a reset for part
 of a pool is never shown as a reset for every account. These summaries are
 informational, not scheduling inputs.
 
+Pool windows use the same compact label/bar/percentage/countdown rows as other
+providers. Expand **Account pool · Weighted estimate** for coverage, remaining
+quota and exact reset times. A `*` on a countdown denotes a partial-account reset,
+not recovery of the entire pool; pool rows never show a single-account pace marker.
+Unknown usage remains visibly marked, and expired resets show **Refresh** instead
+of a misleading countdown. Cards in each grid row share the same height, with query
+timestamps aligned at the bottom; expanding details preserves that row alignment.
+
 The panel prefers `usage.pool_quota` (anonymous display-only data) and supports
 older direct Admin responses via `usage.account_pool.quota`. Forwarded reports
 must include `pool_quota`; upgrade the upstream Nyro to produce this field.

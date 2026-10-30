@@ -251,6 +251,43 @@ test('pool copy defaults to English unless Chinese is selected', () => {
   } finally { document.documentElement.lang = 'zh-CN' }
 })
 
+test('pool windows use compact tier rows with details collapsed by default', () => {
+  const html = renderCard({ now: Date.parse('2030-01-01T04:30:00Z'), item: claude({ pool_quota: poolQuota() }) })
+  const compact = html.slice(0, html.indexOf('<details'))
+  assert.equal((compact.match(/class="tierRow"/g) ?? []).length, 2)
+  assert.ok(compact.includes('class="tierPercent tierPercentOk">36.5%</span>'))
+  assert.ok(compact.includes('⏳ 30m*'), 'countdown uses the supplied clock and marks partial resets')
+  assert.ok(html.includes('<details class="poolDetails"><summary') && !html.includes(' open='))
+  assert.ok(html.includes('* 部分账号重置') && html.includes('汇总仅供参考'))
+  assert.ok(!compact.includes('<time') && !compact.includes('poolWindowHeader'), 'verbose rows stay inside details')
+  assert.ok(!html.includes('tierPace'), 'aggregate quota is not a single scheduling window')
+})
+
+test('pool reset countdown distinguishes aligned, unknown, invalid and expired resets', () => {
+  const now = Date.parse('2030-01-01T04:30:00Z')
+  const render = (patch: Partial<NyroPoolQuotaWindow>) => renderCard({ now, item: claude({ pool_quota: poolQuota(patch) }) })
+  const aligned = render({ next_reset_accounts: 2, reset_mode: 'aligned' })
+  assert.ok(aligned.includes('⏳ 30m') && !aligned.includes('⏳ 30m*') && !aligned.includes('* 部分账号重置'))
+  for (const patch of [{ next_reset_at: null }, { next_reset_at: 'invalid' }, { next_reset_accounts: 0 }, { next_reset_accounts: 3 }]) {
+    const html = render(patch)
+    assert.ok(!html.includes('⏳') && !html.includes('<time') && html.includes('重置时间未知'))
+  }
+  const expired = render({ next_reset_at: '2030-01-01T04:00:00Z' })
+  assert.ok(!expired.includes('⏳') && expired.includes('>待刷新</span>') && expired.includes('重置时间已过'))
+})
+
+test('compact pools retain precision, thresholds and visible unknown states', () => {
+  for (const [used, state] of [[0, 'Ok'], [69.9, 'Ok'], [70, 'Warn'], [87.5, 'Warn'], [90, 'Danger'], [100, 'Danger']] as const) {
+    const html = renderCard({ item: claude({ pool_quota: poolQuota({ used_percent: used }) }) })
+    assert.ok(html.includes(`class="tierPercent tierPercent${state}">${used}%</span>`))
+    assert.ok(html.includes(`aria-valuenow="${used}"`))
+  }
+  const html = renderCard({ item: claude({ pool_quota: poolQuota({ stale: true }) }) })
+  const compact = html.slice(0, html.indexOf('<details'))
+  assert.ok(compact.includes('poolTrackUnknown') && compact.includes('>未知</span>'))
+  assert.ok(!compact.includes('role="progressbar"') && !compact.includes('tierPercentOk'))
+})
+
 test('ordinary provider tiers, balances and spends still render', () => {
   const html = renderCard({ item: direct })
   for (const text of ['19%', '$12.50', '$1.25']) assert.ok(html.includes(text), text)
