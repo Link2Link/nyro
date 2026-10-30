@@ -342,8 +342,9 @@ impl AdminService {
             .filter(|a| a.is_enabled && a.status != "disconnected")
             .collect();
         // Preserve exact singleton tiers. Multi-account weighted estimates live
-        // only in account_pool.quota.claude_windows, never provider usage tiers
-        // or routing observations; model-specific windows remain per account.
+        // only in account_pool.quota.claude_windows and its anonymous pool_quota
+        // copy, never provider usage tiers or routing observations; model-specific
+        // windows remain per account.
         let tiers = if members.len() == 1 {
             members[0]
                 .claude_usage
@@ -374,6 +375,7 @@ impl AdminService {
             is_available: Some(view.counts.available > 0),
             scheduling: self.gw.quota_registry.snapshot(&view.provider_id),
             queried_at: Utc::now().to_rfc3339(),
+            pool_quota: Some((&view.quota).into()),
             account_pool: Some(view),
             upstream: None,
         }
@@ -501,6 +503,22 @@ mod tests {
         }
         let multi = admin.account_pool_provider_usage(view.clone());
         assert!(multi.tiers.is_empty());
+        assert_eq!(
+            serde_json::to_value(multi.pool_quota.as_ref().unwrap()).unwrap(),
+            serde_json::to_value(&view.quota).unwrap(),
+            "anonymous display summary preserves the pool quota, not synthetic tiers"
+        );
+        let summary = serde_json::to_string(&multi.pool_quota).unwrap();
+        for private in [
+            "account_id",
+            "label",
+            "config",
+            "reserve_usd",
+            "SECRET-",
+            "PRIVATE",
+        ] {
+            assert!(!summary.contains(private), "leaked {private}");
+        }
         let mut single = view;
         single.accounts.truncate(1);
         assert_eq!(

@@ -264,6 +264,8 @@ impl AdminService {
         };
         match usage {
             Ok(mut usage) => {
+                // pool_quota is an independent anonymous display DTO. Keep it
+                // for every caller while removing admin-only identity/config.
                 usage.account_pool = None;
                 usage.upstream = None;
                 if !include_money {
@@ -391,6 +393,7 @@ mod tests {
             },
             queried_at: Utc::now().to_rfc3339(),
             account_pool: None,
+            pool_quota: None,
             upstream: Some(serde_json::json!({"providers": []})),
         }
     }
@@ -521,6 +524,111 @@ mod tests {
             serde_json::json!([])
         );
         assert!(wire["providers"][0]["usage"].get("upstream").is_none());
+    }
+
+    #[tokio::test]
+    async fn anonymous_pool_quota_survives_both_money_permissions_without_identity() {
+        let f = fixture().await;
+        let window = PoolQuotaWindow {
+            total_accounts: 2,
+            capacity_complete: true,
+            total_units: 2,
+            known_accounts: 1,
+            known_remaining_units: 0.7,
+            used_units: None,
+            remaining_units: None,
+            used_percent: None,
+            remaining_percent: None,
+            stale: true,
+            next_reset_at: Some("2030-01-07T00:00:00Z".into()),
+            next_reset_accounts: 1,
+            reset_mode: "staggered".into(),
+        };
+        let quota = AccountPoolQuota {
+            daily: None,
+            weekly: None,
+            claude_windows: vec![ClaudePoolQuotaWindow {
+                name: "weekly_limit".into(),
+                quota: window,
+            }],
+            estimated: true,
+        };
+        let view = AccountPoolView {
+            provider_id: f.deepseek.clone(),
+            kind: Some("claude_code".into()),
+            config: Some(DevinPoolConfig::default()),
+            accounts: vec![ProviderAccountView {
+                account_id: "PRIVATE-ACCOUNT".into(),
+                provider_id: f.deepseek.clone(),
+                label: "PRIVATE-EMAIL@example.org".into(),
+                is_enabled: true,
+                priority: 0,
+                status: "connected".into(),
+                status_version: 1,
+                verified_plan: None,
+                identity_verified: false,
+                scheduling: "included".into(),
+                daily: None,
+                weekly: None,
+                reserve_usd: Some(123.0),
+                kiro_usage: None,
+                claude_usage: None,
+                observed_at: None,
+                stale: true,
+                updated_at: String::new(),
+            }],
+            quota: quota.clone(),
+            counts: AccountPoolCounts::default(),
+            readiness: "eligible".into(),
+        };
+        let mut cached = snapshot(&f.deepseek, false);
+        cached.kind = "claude_code_plan".into();
+        cached.tiers.clear();
+        cached.pool_quota = Some((&quota).into());
+        cached.account_pool = Some(view);
+        f.gw.usage_snapshots.store(&cached);
+        let expected = serde_json::to_value(&quota).unwrap();
+        for privileged in [false, true] {
+            let report =
+                f.gw.admin()
+                    .forwarded_provider_usage(&RouteAccess {
+                        privileged,
+                        bound_route_ids: HashSet::from([f.bound_route.clone()]),
+                    })
+                    .await
+                    .unwrap();
+            let usage = report
+                .providers
+                .iter()
+                .find(|p| p.id == f.deepseek)
+                .unwrap()
+                .usage
+                .as_ref()
+                .unwrap();
+            assert!(
+                usage.tiers.is_empty(),
+                "estimates never become routing tiers"
+            );
+            assert_eq!(usage.scheduling.status, ProviderSchedulingStatus::Eligible);
+            assert_eq!(usage.balances.is_empty(), !privileged);
+            assert_eq!(usage.spends.is_empty(), !privileged);
+            assert_eq!(report.redacted.is_empty(), privileged);
+            assert_eq!(serde_json::to_value(&usage.pool_quota).unwrap(), expected);
+            let wire = serde_json::to_value(usage).unwrap();
+            assert!(wire.get("account_pool").is_none());
+            assert!(wire.get("upstream").is_none());
+            let text = wire.to_string();
+            for private in [
+                "PRIVATE-",
+                "account_id",
+                "label",
+                "config",
+                "reserve_usd",
+                "\"accounts\"",
+            ] {
+                assert!(!text.contains(private), "leaked {private}");
+            }
+        }
     }
 
     #[tokio::test]

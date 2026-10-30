@@ -55,6 +55,25 @@ Accounting includes enabled, non-disconnected accounts, including exhausted ones
 
 Retained usage statistics use the existing account usage-stats endpoint: all retained records plus the current calendar week (Monday start in the browser's local time). Tokens and equivalent API prices are log-derived estimates, not upstream quota or a permanent bill. Mixed currencies remain separate; deleted logs reduce totals; failed/retried attempts and missing reference prices follow the existing statistics semantics.
 
+### Anonymous usage forwarding and DSH
+
+Provider usage also exposes `pool_quota`, an anonymous, display-only copy of the
+pool quota (`daily`, `weekly`, `claude_windows`, `estimated`). Multi-account
+`tiers` remain empty. `/v1/nyro/usage` preserves this summary for both ordinary
+and privileged keys, independently of `balances`/`spends` permissions, but never
+forwards `account_pool` identities, configuration or nested upstream reports.
+Both endpoints use a separate quota DTO; downstream deserialization strips
+unknown nested fields, accepts only canonical Claude pool window names and
+validates reset metadata. Coverage, null percentages, stale flags and staggered
+resets retain their meaning. This field is never used as a routing observation.
+
+DSH prefers `pool_quota` and supports older direct Admin responses through
+`account_pool.quota`. It does not read forwarded account details or guess a
+shared reset/steady-pace marker from the earliest account reset. Old forwarded
+reports without quota show a missing-quota notice rather than a hidden-money
+message. Producing the summary requires an upstream Nyro upgrade; deployment
+is separate from building/reloading the DSH plugin.
+
 ## API and session lifecycle
 
 The WebUI calls the existing commands mapped in [backend.ts](<../../webui/src/lib/backend.ts>):

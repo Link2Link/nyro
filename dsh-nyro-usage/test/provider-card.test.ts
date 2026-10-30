@@ -5,7 +5,10 @@ import { test } from 'node:test'
 import React from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
 import ts from 'typescript'
-import type { NyroUsage, NyroUsageItem, NyroUpstreamProvider } from '../src/nyro.ts'
+import type { NyroPoolQuota, NyroPoolQuotaWindow, NyroUsage, NyroUsageItem, NyroUpstreamProvider } from '../src/nyro.ts'
+
+// Existing fixtures exercise the explicitly selected Chinese UI, not the fallback locale.
+Object.defineProperty(globalThis, 'document', { configurable: true, value: { documentElement: { lang: 'zh-CN' } } })
 
 // Exercise the real cards and grid without a browser or a new dependency.
 // Node strips .ts types; compile JSX and stub CSS module names only.
@@ -155,6 +158,97 @@ test('Kiro shows only its pooled monthly window, not the per-allowance feature r
     { name: 'feature:codex_bengalfox:five_hour', used_percent: 20 },
   ] }) } })
   assert.ok(codex.includes('feature:codex_bengalfox:five_hour'))
+})
+
+const poolWindow = (overrides: Partial<NyroPoolQuotaWindow> = {}): NyroPoolQuotaWindow => ({
+  total_accounts: 2, capacity_complete: true, total_units: 2,
+  known_accounts: 2, known_remaining_units: 1.36, used_units: 0.64, remaining_units: 1.36,
+  used_percent: 32, remaining_percent: 68, stale: false,
+  next_reset_at: '2030-01-01T05:00:00Z', next_reset_accounts: 1, reset_mode: 'staggered', ...overrides,
+})
+const poolQuota = (overrides: Partial<NyroPoolQuotaWindow> = {}): NyroPoolQuota => ({
+  estimated: true, claude_windows: [
+    { name: 'five_hour', quota: poolWindow(overrides) },
+    { name: 'weekly_limit', quota: poolWindow({ used_percent: 36.5, remaining_percent: 63.5, ...overrides }) },
+  ],
+})
+const claude = (overrides: Partial<NyroUsage> = {}): NyroUsageItem => ({
+  ...direct, usage: usage({ kind: 'claude_code_plan', tiers: [], ...overrides }),
+})
+
+test('direct legacy Claude pools render existing Admin quota with no identity details', () => {
+  const item = claude({ account_pool: { quota: poolQuota(), accounts: [{ label: 'PRIVATE@example.org' }] } as never })
+  const html = renderCard({ item })
+  for (const text of ['加权估算', '已用 32%', '已用 36.5%', '剩余 63.5%', '有效用量 2 / 2', '账号分批重置', '不一定是全池']) assert.ok(html.includes(text), text)
+  assert.equal((html.match(/role="progressbar"/g) ?? []).length, 2)
+  for (const text of ['PRIVATE', 'tierPace', '未开放金额']) assert.ok(!html.includes(text), text)
+})
+
+test('new anonymous forwarded summaries render even with redacted money and never duplicate tiers', () => {
+  const item = claude({ pool_quota: poolQuota(), tiers: [{ name: 'five_hour', used_percent: 99 }, { name: 'feature:opus:weekly_limit', used_percent: 20 }] })
+  const [entry] = cardEntries([gateway([remote({ usage: item.usage })], ['balances', 'spends'])])
+  const html = renderCard({ item: entry.item, via: entry.via })
+  for (const text of ['加权估算', '已用 36.5%', 'feature:opus', 'pillEligible']) assert.ok(html.includes(text), text)
+  assert.ok(!html.includes('99%') && !html.includes('未开放金额数据'))
+  assert.ok(!html.includes('tierPace'), 'pool estimates never use a single-account pace marker')
+})
+
+test('legacy forwarded Claude quota gaps are not mistaken for hidden money', () => {
+  const html = renderCard({ item: claude(), via: { gateway: 'US Nyro', redacted: ['balances', 'spends'] } })
+  assert.ok(html.includes('未返回 Claude 配额摘要') && html.includes('升级上游 Nyro'))
+  assert.ok(!html.includes('未开放金额数据') && !html.includes('0%'))
+  // Never use an accidentally forwarded account_pool as a privacy workaround.
+  const leaked = renderCard({ item: claude({ account_pool: { quota: poolQuota() } }), via: { gateway: 'US Nyro' } })
+  assert.ok(!leaked.includes('已用 32%'))
+  assert.ok(renderCard({ item: claude() }).includes('暂未取得配额数据'))
+})
+
+test('unknown, invalid, partial and stale pool windows never turn into 0% or complete usage', () => {
+  for (const patch of [
+    { used_percent: null }, { used_percent: NaN }, { used_percent: Infinity }, { used_percent: -1 },
+    { used_percent: 101 }, { stale: true }, { known_accounts: 1 }, { capacity_complete: false }, { total_accounts: 0 },
+  ]) {
+    const html = renderCard({ item: claude({ pool_quota: poolQuota(patch) }) })
+    assert.ok(html.includes('用量未知 / 数据不完整'), JSON.stringify(patch))
+    assert.ok(!html.includes('role="progressbar"') && !html.includes('剩余 68%'))
+    if (patch.stale) assert.ok(html.includes('存在旧数据'))
+  }
+  const unknown = renderCard({ item: claude({ pool_quota: poolQuota({ next_reset_at: 'invalid', reset_mode: 'unknown' }) }) })
+  assert.ok(unknown.includes('重置时间未知') && !unknown.includes('<time'))
+  const expired = renderCard({ now: Date.parse('2031-01-01'), item: claude({ pool_quota: poolQuota() }) })
+  assert.ok(expired.includes('重置时间已过，等待刷新'))
+})
+
+test('valid zero usage and exact singleton windows are preserved', () => {
+  const zero = renderCard({ item: claude({ pool_quota: poolQuota({ used_percent: 0, remaining_percent: 100 }) }) })
+  assert.ok(zero.includes('已用 0%') && zero.includes('aria-valuenow="0"'))
+  const single = renderCard({ item: claude({ tiers: [{ name: 'five_hour', used_percent: 64 }] }) })
+  assert.ok(single.includes('64%') && !single.includes('配额数据') && !single.includes('加权估算'))
+})
+
+test('real singleton responses prefer exact tiers when a summary is also present', () => {
+  const quota = poolQuota({ total_accounts: 1, known_accounts: 1 })
+  const tiers = [
+    { name: 'five_hour', used_percent: 64, resets_at: '2030-01-01T05:00:00Z' },
+    { name: 'weekly_limit', used_percent: 35, resets_at: '2030-01-07T00:00:00Z' },
+  ]
+  for (const summary of [{ pool_quota: quota }, { account_pool: { quota } }]) {
+    const html = renderCard({ item: claude({ tiers, ...summary }) })
+    assert.ok(html.includes('64%') && html.includes('35%') && html.includes('tierPace'))
+    assert.ok(!html.includes('加权估算') && !html.includes('已用 32%'))
+  }
+  const partial = renderCard({ item: claude({ pool_quota: quota, tiers: tiers.slice(0, 1) }) })
+  assert.ok(partial.includes('64%') && partial.includes('已用 36.5%'), 'missing exact windows may still use the summary')
+})
+
+test('pool copy defaults to English unless Chinese is selected', () => {
+  try {
+    document.documentElement.lang = 'en'
+    const html = renderCard({ item: claude({ pool_quota: poolQuota() }) })
+    assert.ok(html.includes('Weighted estimate') && html.includes('Used 36.5%') && html.includes('not necessarily the whole pool'))
+    document.documentElement.lang = ''
+    assert.ok(renderCard({ item: claude() }).includes('Quota data is unavailable'))
+  } finally { document.documentElement.lang = 'zh-CN' }
 })
 
 test('ordinary provider tiers, balances and spends still render', () => {

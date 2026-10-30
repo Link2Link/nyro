@@ -25,6 +25,22 @@ Data flows browser → same-origin dsh webserver routes → the nyro Admin API,
 so the nyro base URL needs no CORS openings and the admin token never
 leaves the host process.
 
+## Claude account pools
+
+Claude Pro/Max pools render their 5-hour and weekly quota summaries as **weighted
+estimates**, including coverage, stale/unknown state and the next resetting
+accounts. Partial or stale data is not displayed as zero, and a reset for part
+of a pool is never shown as a reset for every account. These summaries are
+informational, not scheduling inputs.
+
+The panel prefers `usage.pool_quota` (anonymous display-only data) and supports
+older direct Admin responses via `usage.account_pool.quota`. Forwarded reports
+must include `pool_quota`; upgrade the upstream Nyro to produce this field.
+Account identities and configuration remain excluded from forwarding. An older
+forwarded Claude report without quota now shows a specific missing-quota notice,
+not a misleading hidden-money message. Money visibility still follows API-key
+permissions and does not control subscription quota visibility.
+
 ## Configure
 
 Settings → Plugins → **Nyro Usage**:

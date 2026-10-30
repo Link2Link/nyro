@@ -664,6 +664,46 @@ html[data-dsh-nyro-usage-active]:not([data-dsh-taskboard-active]):not([data-dsh-
   background: var(--dsw-alias-state-error-primary);
 }
 
+/* Pool estimates intentionally have no single-window pace/reset marker. */
+.poolSummary {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.poolHeading {
+  color: var(--dsw-alias-label-secondary);
+  font-size: 11.5px;
+  font-weight: 600;
+}
+
+.poolWindow {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.poolWindowHeader {
+  display: flex;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 4px 8px;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+.poolWindow .tierTrack {
+  flex: none;
+  width: 100%;
+}
+
+.poolMeta {
+  color: var(--dsw-alias-label-tertiary);
+  font-size: 11px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
 /* --- balances / spends ------------------------------------------------------- */
 
 .tierPercent {

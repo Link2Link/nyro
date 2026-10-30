@@ -10,8 +10,8 @@ export type TranslateValues = Record<string, string | number>
 
 /** Active dictionary, picked by the document language at call time. */
 export function dictionary(): Record<string, string> {
-  const lang = typeof document !== 'undefined' ? document.documentElement.lang : 'zh'
-  return lang.toLowerCase().startsWith('en') ? { ...en } : { ...zh }
+  const lang = typeof document !== 'undefined' ? document.documentElement.lang : 'en'
+  return lang.toLowerCase().startsWith('zh') ? { ...zh } : { ...en }
 }
 
 /** Translate a key with optional {name} template params (current language). */

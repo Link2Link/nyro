@@ -55,6 +55,21 @@ claude_usage?: {
 
 保留日志统计复用原有账号 usage-stats 端点：全部保留记录和本自然周（浏览器本地时区、周一开始）。Token 与等价 API 价格来自日志，不是上游额度或永久账单；不同币种分开展示，清理日志会减少累计值，失败/重试请求和缺失参考价格沿用原统计语义。
 
+### 匿名用量转发与 DSH
+
+Provider 用量新增 `pool_quota`，作为账号池配额的匿名、仅供展示副本，结构为
+`daily`、`weekly`、`claude_windows`、`estimated`。多账号的 `tiers` 仍为空。
+`/v1/nyro/usage` 对普通 Key 与特权 Key 均保留此摘要，不受 `balances`/`spends`
+金额权限影响；`account_pool` 中的身份、配置及嵌套上游报告仍不转发。两端采用独立
+配额 DTO；下游类型反序列化剔除嵌套未知字段，仅接受规范 Claude 池窗口名并校验
+重置元数据。有效覆盖率、空百分比、旧数据与错峰重置语义保持不变；该字段不作为
+调度观察输入。
+
+DSH 优先显示 `pool_quota`，直连旧版 Admin 响应时兼容 `account_pool.quota`。
+不读取转发账号明细，也不从最近一次账号重置推导共同窗口或匀速标记。旧转发报告
+缺少配额时明确提示缺少摘要，不再误报金额未开放。摘要生成需要升级上游 Nyro；
+部署与 DSH 插件构建、重载是独立步骤。
+
 ## API 与会话生命周期
 
 WebUI 复用 [backend.ts](<../../webui/src/lib/backend.ts>) 中已有的命令映射：

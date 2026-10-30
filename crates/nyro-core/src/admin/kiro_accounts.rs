@@ -349,6 +349,7 @@ impl AdminService {
             scheduling: self.gw.quota_registry.snapshot(&view.provider_id),
             queried_at: Utc::now().to_rfc3339(),
             account_pool: Some(view),
+            pool_quota: None,
             upstream: None,
         }
     }

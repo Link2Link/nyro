@@ -42,6 +42,30 @@ export interface NyroScheduling {
   next_check_at?: string | null
 }
 
+/** Anonymous display-only pool quota; never a synthetic scheduling tier. */
+export interface NyroPoolQuotaWindow {
+  total_accounts: number
+  capacity_complete: boolean
+  total_units: number
+  known_accounts: number
+  known_remaining_units: number
+  used_units: number | null
+  remaining_units: number | null
+  used_percent: number | null
+  remaining_percent: number | null
+  stale: boolean
+  next_reset_at: string | null
+  next_reset_accounts: number
+  reset_mode: string
+}
+
+export interface NyroPoolQuota {
+  daily?: NyroPoolQuotaWindow | null
+  weekly?: NyroPoolQuotaWindow | null
+  claude_windows?: { name: string; quota: NyroPoolQuotaWindow }[]
+  estimated: boolean
+}
+
 /** Full usage payload of one provider. */
 export interface NyroUsage {
   provider_id: string
@@ -54,6 +78,10 @@ export interface NyroUsage {
   is_available?: boolean | null
   scheduling?: NyroScheduling
   queried_at?: string
+  /** Privacy-safe summary on newer Nyro instances, including forwarded usage. */
+  pool_quota?: NyroPoolQuota | null
+  /** Read only quota from older direct Admin API responses, never account identities. */
+  account_pool?: { quota?: NyroPoolQuota } | null
   /** One-hop report forwarded by a Nyro gateway; not part of its own quota. */
   upstream?: NyroUpstreamUsage | null
 }

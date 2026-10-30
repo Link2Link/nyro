@@ -214,6 +214,10 @@ pub struct ProviderUsage {
     /// Homogeneous account capacity; never used as a synthetic routing tier.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub account_pool: Option<AccountPoolView>,
+    /// Anonymous display-only pool estimates. Never used as routing tiers or
+    /// quota observations; safe to forward without the admin-only account list.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pool_quota: Option<crate::provider::nyro_gateway::usage::pool_quota::AnonymousPoolQuota>,
     /// Nyro preset only: the remote Nyro's forwarded usage report
     /// (`GET /v1/nyro/usage`), passed through as received.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -3098,6 +3102,7 @@ impl AdminService {
                 scheduling: ProviderScheduling::default(),
                 queried_at: chrono::Utc::now().to_rfc3339(),
                 account_pool: None,
+                pool_quota: None,
                 upstream,
             },
             authoritative,

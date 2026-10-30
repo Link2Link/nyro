@@ -14,6 +14,7 @@ import type { DragEvent } from 'react'
 import type { NyroUsageItem } from '../../nyro.ts'
 import { agoLabel, tt } from '../tt.ts'
 import { TierBar } from './TierBar.tsx'
+import { PoolQuota } from './PoolQuota.tsx'
 import type { CardVia } from './upstream.ts'
 import css from './panel.module.css'
 
@@ -56,11 +57,23 @@ export function ProviderCard(props: ProviderCardProps) {
   const exhausted = scheduling === 'quota_exhausted'
   const balances = usage?.balances ?? []
   const spends = usage?.spends ?? []
+  // Older direct Admin responses expose the same safe quota under account_pool.
+  // Never consult account identities or infer a pool from a different gateway.
+  const pool = usage?.kind === 'claude_code_plan'
+    ? usage.pool_quota ?? (via === undefined ? usage.account_pool?.quota : undefined)
+    : undefined
+  const poolWindows = (pool?.claude_windows ?? [])
+    .filter(window => ['five_hour', 'weekly_limit'].includes(window.name) && window.quota != null)
+    // Singleton responses also include a summary; retain their exact tier/reset/pace.
+    .filter(window => window.quota.total_accounts !== 1
+      || !(usage?.tiers ?? []).some(tier => tier.name === window.name))
+  const poolNames = new Set(poolWindows.map(window => window.name))
   // Kiro reports its pooled quota as `monthly` plus one `feature:kiro:*` row
   // per allowance component (base / bonus / free trial) that sums into it.
   // Show only the pooled window, like the Nyro WebUI does.
   const tiers = (usage?.tiers ?? [])
     .filter(tier => usage?.kind !== 'kiro_plan' || !tier.name.startsWith('feature:kiro:'))
+    .filter(tier => !poolNames.has(tier.name))
   const upstream = usage?.upstream
 
   const classes = [css.card]
@@ -91,9 +104,14 @@ export function ProviderCard(props: ProviderCardProps) {
         via.routes && via.routes.length > 0 ? tt('card.routes', { routes: via.routes.join(', ') }) : '',
         via.redacted && via.redacted.length > 0 ? tt('card.redacted', { fields: via.redacted.join(', ') }) : '',
       ].filter(line => line !== '').join('\n')
-  // Nothing else to show and the amounts were withheld: say so instead of a blank card.
-  const moneyHidden = via !== undefined && item.status === 'ok' && hidesMoney(via.redacted)
+  const noUsage = item.status === 'ok' && upstream == null && poolWindows.length === 0
     && tiers.length === 0 && balances.length === 0 && spends.length === 0
+  // Report-level money redaction says nothing about missing subscription quotas.
+  const moneyHidden = noUsage && via !== undefined && hidesMoney(via.redacted)
+    && ['deepseek_balance', 'mimo_balance'].includes(usage?.kind ?? '')
+  const quotaMissing = noUsage && !moneyHidden
+  const missingMessage = usage?.kind === 'claude_code_plan' && via !== undefined
+    ? 'card.poolNotForwarded' : 'card.quotaUnknown'
 
   return (
     <div
@@ -144,6 +162,11 @@ export function ProviderCard(props: ProviderCardProps) {
         : null}
 
       {moneyHidden ? <div className={css.gatewayMeta}>{tt('card.upstreamHidden')}</div> : null}
+      {quotaMissing ? <div className={css.poolMeta}>{tt(missingMessage)}</div> : null}
+
+      {poolWindows.length > 0
+        ? <PoolQuota windows={poolWindows} estimated={pool?.estimated !== false} now={props.now} />
+        : null}
 
       {tiers.length > 0
         ? (
