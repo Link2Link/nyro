@@ -980,7 +980,9 @@ async fn malformed_recovers_in_place_without_touching_fallback() -> anyhow::Resu
             .map(|(_, value)| value.into_owned())
             .collect::<Vec<_>>();
         if subscription {
-            assert_eq!(request_body["model"], "gemini-3.8-flash");
+            // The public base name resolves to the adaptive tier even before
+            // account discovery. Retrying must reuse that exact prepared id.
+            assert_eq!(request_body["model"], "gemini-3.8-flash-tiered");
             // This local fixture intentionally bypasses the Google auth driver
             // to retain its loopback URL. It has no runtime Bearer binding and
             // does not test Bearer generation; the entire prepared header/URI
@@ -1065,8 +1067,8 @@ async fn same_provider_different_models_have_independent_retry_budgets() -> anyh
         assert_eq!(
             models,
             [
-                "gemini-3.8-flash",
-                "gemini-3.8-flash",
+                "gemini-3.8-flash-tiered",
+                "gemini-3.8-flash-tiered",
                 "gemini-3.5-pro",
                 "gemini-3.5-pro"
             ]
@@ -1077,7 +1079,15 @@ async fn same_provider_different_models_have_independent_retry_budgets() -> anyh
             assert_malformed_attempt(row);
         }
         assert_eq!(rows[3].diagnostic.attempt_outcome, "completed");
-        for (row, model) in rows.iter().zip(models) {
+        // HTTP attempt logs retain the configured backend names, whereas the
+        // subscription envelope above carries the resolved wire tier. Each
+        // backend must still own its independent two-attempt retry budget.
+        for (row, model) in rows.iter().zip([
+            "gemini-3.8-flash",
+            "gemini-3.8-flash",
+            "gemini-3.5-pro",
+            "gemini-3.5-pro",
+        ]) {
             assert_eq!(row.provider_id, provider);
             assert_eq!(row.upstream_model, model);
         }

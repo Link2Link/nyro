@@ -452,6 +452,19 @@ pub(crate) fn parse_quota_summary_buckets(payload: &Value) -> Vec<QuotaSummaryBu
 /// Tier suffixes the antigravity surface bakes into model ids.
 const TIER_SUFFIXES: &[&str] = &["-extra-low", "-tiered", "-medium", "-high", "-low"];
 
+/// These families expose one public model name; reasoning selects the wire id.
+/// Do not strip suffixes globally: other families (e.g. Argon) serve a real
+/// bare id as well as independently selectable tier variants.
+const UNIFIED_TIER_MODELS: &[&str] = &["claude-opus-5-5", "claude-sonnet-5-5", "gemini-3.8-flash"];
+
+fn unified_tier_base(model: &str) -> Option<&'static str> {
+    UNIFIED_TIER_MODELS.iter().copied().find(|base| {
+        model
+            .strip_prefix(base)
+            .is_some_and(|suffix| TIER_SUFFIXES.contains(&suffix))
+    })
+}
+
 /// True when the model id already carries an antigravity thinking tier.
 pub(crate) fn is_tier_suffixed(model: &str) -> bool {
     let model = model.trim();
@@ -468,7 +481,7 @@ pub(crate) fn is_tier_suffixed(model: &str) -> bool {
 /// * `high` / `xhigh` / `max` → `-high`
 /// * token budgets map by magnitude — as an effort variant or the bare
 ///   `budget_tokens` field (Anthropic `thinking` / Gemini `thinkingBudget`)
-/// * no reasoning directive at all → `-tiered` (the adaptive family default)
+/// * no reasoning directive → `-tiered` when served (Gemini), otherwise `-medium`
 fn tier_ladder(reasoning: &crate::protocol::ir::ReasoningConfig) -> &'static [&'static str] {
     use crate::protocol::ir::ReasoningEffort::{Budget, High, Low, Max, Medium, Minimal, Xhigh};
     const EXTRA_LOW: &[&str] = &["-extra-low", "-low"];
@@ -513,15 +526,15 @@ fn tier_ladder(reasoning: &crate::protocol::ir::ReasoningConfig) -> &'static [&'
         Some(High | Xhigh | Max) => HIGH,
         // No reasoning directive at all — thinking merely on without a level,
         // or a request that says nothing about reasoning (`ReasoningConfig::
-        // default()` across every ingress decoder) — is the family default:
-        // the adaptive `-tiered` variant.
+        // default()` across every ingress decoder) — uses the family default:
+        // adaptive `-tiered` where available, otherwise `-medium`.
         _ => TIERED,
     }
 }
 
 /// Resolve the tier-suffixed model id for a base-id request on the
 /// antigravity surface, driven by the client's reasoning effort.
-/// Catalog-gated: the suffixed id must exist in the account's model snapshot
+/// Catalog-gated: the suffixed id must exist in the supplied raw wire catalog
 /// AND the bare base id must NOT be served itself (e.g. `gemini-2.5-flash`
 /// is a real id — never rewritten), so families without tier variants fail
 /// safe (no rewrite, upstream answers honestly).
@@ -531,7 +544,7 @@ pub(crate) fn resolve_tiered_model(
     catalog: &[String],
 ) -> Option<String> {
     let model = model.trim();
-    if !model.starts_with("gemini-") {
+    if !model.starts_with("gemini-") && !UNIFIED_TIER_MODELS.contains(&model) {
         return None;
     }
     // Explicit tier id — the caller already chose; never rewrite.
@@ -573,13 +586,42 @@ pub(crate) fn credential_catalog_snapshot(
         .unwrap_or_default()
 }
 
+/// Raw wire catalog used by dispatch and probes, never the collapsed public
+/// names. Discovery also merges these channel-specific curated entries: Claude
+/// 5.5 tiers are callable on Antigravity but absent from fetchAvailableModels.
+/// Include curated tiers for the unified families so their aliases work before
+/// discovery or after an OAuth refresh replaces the snapshot with fetched ids.
+/// Other families keep their existing snapshot-only routing semantics.
+pub(crate) fn subscription_model_catalog(
+    provider: &Provider,
+    credential: Option<&crate::auth::types::StoredCredential>,
+) -> Vec<String> {
+    let curated = if is_google_antigravity(provider) {
+        ANTIGRAVITY_STATIC_MODELS
+    } else if super::gemini_cli::is_google_gemini_cli(provider) {
+        super::gemini_cli::GEMINI_CLI_STATIC_MODELS
+    } else {
+        return Vec::new();
+    };
+    let mut catalog = credential_catalog_snapshot(credential);
+    catalog.extend(
+        curated
+            .iter()
+            .filter(|id| unified_tier_base(id).is_some())
+            .map(|id| (*id).to_string()),
+    );
+    catalog.sort();
+    catalog.dedup();
+    catalog
+}
+
 /// Effort-aware tier rewrite for the Google subscription v1internal envelope
 /// (pipeline step, runs after `post_encode`; applies to BOTH subscription
-/// channels — antigravity and gemini-cli share the surface and both catalogs
-/// carry tier-suffixed gemini ids): a base-id gemini request carrying a
-/// reasoning effort maps onto the tier variant the account actually serves,
-/// and the inner `thinkingConfig` is dropped whenever the model id carries
-/// the tier (the id is the effort on this surface).
+/// channels). Gemini and the unified Claude families resolve against the raw
+/// channel catalog. Without an effort, Gemini 3.8 Flash uses `-tiered`, while
+/// Claude 5.5 has no adaptive tier and falls back to `-medium`.
+/// The inner `thinkingConfig` is dropped whenever the model id carries the
+/// tier (the id is the effort on this surface).
 pub(crate) fn apply_tier_model_rewrite(
     provider: &Provider,
     credential: Option<&crate::auth::types::StoredCredential>,
@@ -596,10 +638,7 @@ pub(crate) fn apply_tier_model_rewrite(
     else {
         return;
     };
-    let catalog = credential_catalog_snapshot(credential);
-    if catalog.is_empty() {
-        return;
-    }
+    let catalog = subscription_model_catalog(provider, credential);
     let effective =
         resolve_tiered_model(&model, reasoning, &catalog).unwrap_or_else(|| model.clone());
     let tier_carried_by_id = is_tier_suffixed(&effective);
@@ -804,6 +843,25 @@ pub(crate) fn filter_subscription_unavailable(
             }
         })
         .collect()
+}
+
+/// Public discovery names for subscription providers. Preserve raw catalog ids
+/// in credentials and quota data; only the picker/test-list surface collapses
+/// the explicitly unified families. Explicit tier routes remain valid.
+pub(crate) fn visible_subscription_models(provider: &Provider, models: Vec<String>) -> Vec<String> {
+    if !is_google_antigravity(provider) && !super::gemini_cli::is_google_gemini_cli(provider) {
+        return models;
+    }
+    let mut models: Vec<String> = filter_subscription_unavailable(provider, models)
+        .into_iter()
+        .map(|model| match unified_tier_base(&model) {
+            Some(base) => base.to_string(),
+            None => model,
+        })
+        .collect();
+    models.sort();
+    models.dedup();
+    models
 }
 
 /// Read the companion project id from the OAuth credential metadata.
@@ -1433,6 +1491,110 @@ mod tests {
             budget_tokens: None,
             effort,
             display: None,
+        }
+    }
+
+    #[test]
+    fn visible_subscription_models_unifies_only_the_requested_families() {
+        let mut raw = ANTIGRAVITY_STATIC_MODELS
+            .iter()
+            .map(|id| (*id).to_string())
+            .collect::<Vec<_>>();
+        raw.extend([
+            "claude-opus-5-5".into(),
+            "claude-sonnet-5-5-medium".into(),
+            "gemini-3.8-flash".into(),
+            "gemini-3.8-flash-image-high".into(),
+            "claude-opus-5-5-high-preview".into(),
+            "gpt-oss-120b-medium".into(),
+            "chat_20706".into(),
+        ]);
+        for channel in ["antigravity", "gemini-cli"] {
+            let (provider, _) = google_provider(channel, "gemini-3.8-flash");
+            assert_eq!(
+                visible_subscription_models(&provider, raw.clone()),
+                [
+                    "claude-opus-5-5",
+                    "claude-opus-5-5-high-preview",
+                    "claude-sonnet-5-5",
+                    "gemini-3.8-flash",
+                    "gemini-3.8-flash-image-high",
+                    "gemini-4-argon",
+                    "gemini-4-argon-high",
+                    "gpt-oss-120b-medium",
+                ],
+                "{channel} must collapse only the three exact families"
+            );
+        }
+        let (mut provider, _) = google_provider("default", "gemini-3.8-flash");
+        assert_eq!(visible_subscription_models(&provider, raw.clone()), raw);
+        provider.channel = Some("antigravity".into());
+        provider.vendor = Some("custom".into());
+        assert_eq!(visible_subscription_models(&provider, raw.clone()), raw);
+    }
+
+    #[test]
+    fn subscription_model_catalog_keeps_wire_ids_and_channel_specific_fallbacks() {
+        let credential = crate::auth::types::StoredCredential {
+            meta: json!({"subscription_models": ["gemini-3.8-flash-high", "gemini-future-high"]}),
+            ..Default::default()
+        };
+        for channel in ["antigravity", "gemini-cli"] {
+            let (provider, _) = google_provider(channel, "gemini-3.8-flash");
+            let raw = subscription_model_catalog(&provider, Some(&credential));
+            assert!(raw.iter().any(|id| id == "gemini-future-high"));
+            assert!(raw.iter().any(|id| id == "gemini-3.8-flash-high"));
+            assert!(!raw.iter().any(|id| id == "gemini-3.8-flash"));
+            assert_eq!(
+                raw.iter().any(|id| id == "claude-opus-5-5-medium"),
+                channel == "antigravity"
+            );
+            let visible = visible_subscription_models(&provider, raw.clone());
+            assert!(visible.iter().any(|id| id == "gemini-3.8-flash"));
+            assert_eq!(
+                raw,
+                subscription_model_catalog(&provider, Some(&credential))
+            );
+        }
+        let (provider, _) = google_provider("default", "gemini-3.8-flash");
+        assert!(subscription_model_catalog(&provider, Some(&credential)).is_empty());
+    }
+
+    #[test]
+    fn unified_claude_families_map_effort_without_inventing_a_tiered_model() {
+        use crate::protocol::ir::ReasoningEffort::{High, Low, Max, Medium, Minimal, Xhigh};
+        let catalog = ANTIGRAVITY_STATIC_MODELS
+            .iter()
+            .map(|id| (*id).to_string())
+            .collect::<Vec<_>>();
+        for model in ["claude-opus-5-5", "claude-sonnet-5-5"] {
+            for (effort, suffix) in [
+                (Low, "low"),
+                (Medium, "medium"),
+                (High, "high"),
+                (Xhigh, "high"),
+                (Max, "high"),
+                (Minimal, "low"),
+                (crate::protocol::ir::ReasoningEffort::None, "low"),
+            ] {
+                assert_eq!(
+                    resolve_tiered_model(model, &reasoning(Some(effort)), &catalog),
+                    Some(format!("{model}-{suffix}"))
+                );
+            }
+            assert_eq!(
+                resolve_tiered_model(model, &Default::default(), &catalog),
+                Some(format!("{model}-medium"))
+            );
+            assert!(!catalog.contains(&format!("{model}-tiered")));
+            assert!(
+                resolve_tiered_model(&format!("{model}-low"), &reasoning(Some(Max)), &catalog)
+                    .is_none()
+            );
+            let mut with_bare = catalog.clone();
+            with_bare.push(model.into());
+            assert!(resolve_tiered_model(model, &reasoning(Some(High)), &with_bare).is_none());
+            assert!(resolve_tiered_model(model, &reasoning(Some(High)), &[]).is_none());
         }
     }
 

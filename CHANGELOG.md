@@ -4,6 +4,17 @@ All notable changes to Nyro will be documented in this file.
 
 ---
 
+## v2.1.15
+
+> Released on 2026-10-31
+
+#### Fixes
+
+- **Unified Google subscription models**: model discovery now groups the reasoning variants of `claude-opus-5-5`, `claude-sonnet-5-5` and `gemini-3.8-flash` under their base names. Requests select the matching low, medium or high upstream model; `xhigh` and `max` map to high. Without an explicit effort, Claude defaults to medium and Gemini 3.8 Flash defaults to its adaptive tiered model. Explicit tier selections remain valid, and direct API-key providers are unchanged
+- **Consistent subscription routing and model probes**: raw account catalogs remain intact and are supplemented with channel-specific curated tiers, so Antigravity Claude aliases keep working when discovery or refreshed credentials omit them. Model probes use the same resolver, retain the public model name in results and read quota metadata from the selected upstream tier. Added regression coverage for discovery, defaults, effort mapping and channel isolation
+
+---
+
 ## v2.1.14
 
 > Released on 2026-10-31

@@ -289,6 +289,34 @@ re-login the provider to re-run onboarding"
     Ok((url, headers, inner_body))
 }
 
+/// Resolve public subscription names for probes using dispatch's catalog plus
+/// the just-fetched raw ids (the resolved credential may still be one refresh
+/// behind). The map also identifies the quota bucket for each public result.
+fn google_subscription_probe_models(
+    provider: &Provider,
+    credential: Option<&crate::auth::types::StoredCredential>,
+    fresh_catalog: &[crate::provider::google::antigravity::AvailableModel],
+    models: &[String],
+) -> std::collections::HashMap<String, String> {
+    let mut catalog =
+        crate::provider::google::antigravity::subscription_model_catalog(provider, credential);
+    if catalog.is_empty() {
+        return Default::default();
+    }
+    catalog.extend(fresh_catalog.iter().map(|entry| entry.id.clone()));
+    models
+        .iter()
+        .filter_map(|model| {
+            crate::provider::google::antigravity::resolve_tiered_model(
+                model,
+                &crate::protocol::ir::ReasoningConfig::default(),
+                &catalog,
+            )
+            .map(|wire_model| (model.clone(), wire_model))
+        })
+        .collect()
+}
+
 /// Probe one model with a single minimal request carrying `prompt` (30s timeout).
 #[allow(clippy::too_many_arguments)]
 async fn probe_single_model(
@@ -1324,6 +1352,87 @@ mod probe_routing_tests {
         ANTHROPIC_MESSAGES_2023_06_01, OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1, OPENAI_RESPONSES_V1,
         Protocol, ProtocolId,
     };
+
+    #[test]
+    fn google_subscription_probes_resolve_public_names_to_default_wire_tiers() {
+        let mut provider = provider();
+        provider.vendor = Some("google".into());
+        provider.channel = Some("antigravity".into());
+        let models: Vec<String> = [
+            "claude-opus-5-5",
+            "claude-sonnet-5-5",
+            "gemini-3.8-flash",
+            "claude-opus-5-5-high",
+            "gemini-4-argon",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+        let resolved = google_subscription_probe_models(&provider, None, &[], &models);
+        assert_eq!(resolved.len(), 3);
+        for (model, wire_model) in [
+            ("claude-opus-5-5", "claude-opus-5-5-medium"),
+            ("claude-sonnet-5-5", "claude-sonnet-5-5-medium"),
+            ("gemini-3.8-flash", "gemini-3.8-flash-tiered"),
+        ] {
+            assert_eq!(resolved.get(model).map(String::as_str), Some(wire_model));
+            let (_, _, body) = build_gemini_model_probe_request(
+                "https://cloudcode-pa.googleapis.com",
+                "probe-token",
+                &HeaderMap::new(),
+                &resolved[model],
+                DEFAULT_MODEL_PROBE_PROMPT,
+                provider.channel.as_deref(),
+                Some("probe-project"),
+            )
+            .unwrap();
+            assert_eq!(body["model"], wire_model);
+            assert_eq!(body["project"], "probe-project");
+        }
+        // Exact tier selections and unrelated families need no translation.
+        assert!(!resolved.contains_key("claude-opus-5-5-high"));
+        assert!(!resolved.contains_key("gemini-4-argon"));
+        provider.channel = Some("default".into());
+        assert!(google_subscription_probe_models(&provider, None, &[], &models).is_empty());
+    }
+
+    #[test]
+    fn google_subscription_probes_use_fresh_catalog_and_wire_quota_ids() {
+        use crate::provider::google::antigravity::AvailableModel;
+        let mut provider = provider();
+        provider.vendor = Some("google".into());
+        provider.channel = Some("gemini-cli".into());
+        let models = vec!["claude-opus-5-5".to_string()];
+        let credential = crate::auth::types::StoredCredential {
+            meta: serde_json::json!({"subscription_models": ["gemini-3.8-flash-high"]}),
+            ..Default::default()
+        };
+        assert!(
+            google_subscription_probe_models(&provider, Some(&credential), &[], &models).is_empty()
+        );
+        let fresh = vec![AvailableModel {
+            id: "claude-opus-5-5-medium".into(),
+            quota_remaining: Some(0.42),
+            quota_resets_at: Some("2026-11-01T00:00:00Z".into()),
+        }];
+        let resolved =
+            google_subscription_probe_models(&provider, Some(&credential), &fresh, &models);
+        let wire_model = &resolved[&models[0]];
+        assert_eq!(wire_model, "claude-opus-5-5-medium");
+        let quota = fresh.iter().find(|entry| &entry.id == wire_model).unwrap();
+        assert_eq!(quota.quota_remaining, Some(0.42));
+        assert_eq!(
+            quota.quota_resets_at.as_deref(),
+            Some("2026-11-01T00:00:00Z")
+        );
+
+        // A same-named channel on another vendor must not inherit this dialect.
+        provider.vendor = Some("custom".into());
+        assert!(
+            google_subscription_probe_models(&provider, Some(&credential), &fresh, &models)
+                .is_empty()
+        );
+    }
 
     fn endpoint(id: &str, protocol: ProtocolId, priority: i32) -> ProviderProtocolEndpoint {
         ProviderProtocolEndpoint {
@@ -2740,6 +2849,14 @@ impl AdminService {
             .google_subscription_catalog(&provider, runtime.as_ref(), false)
             .await?
             .unwrap_or_default();
+        let subscription_probe_models = google_subscription_probe_models(
+            &provider,
+            runtime
+                .as_ref()
+                .and_then(|runtime| runtime.credential.as_ref()),
+            &subscription_quotas,
+            &models,
+        );
         let (suite_raw, base_url, api_key, auth_scheme, runtime_headers) = if provider.is_adaptive()
         {
             let enabled: Vec<&ProviderProtocolEndpoint> = provider
@@ -2881,6 +2998,10 @@ impl AdminService {
             let channel = channel.clone();
             let antigravity_project = antigravity_project.clone();
             let claude_code_probe = claude_code_probe.clone();
+            let wire_model = subscription_probe_models
+                .get(&model)
+                .cloned()
+                .unwrap_or_else(|| model.clone());
             let prompt = prompt.clone();
             let target = resolve_probe_target(
                 &provider,
@@ -2912,14 +3033,14 @@ impl AdminService {
                     Ok(target) => target,
                     Err(error) => return model_probe_routing_failure(model, error),
                 };
-                probe_single_model(
+                let mut result = probe_single_model(
                     client,
                     target.suite,
                     &target.base_url,
                     &target.api_key,
                     &target.auth_scheme,
                     &runtime_headers,
-                    &model,
+                    &wire_model,
                     &prompt,
                     &target.protocol_id,
                     fast_mode,
@@ -2928,7 +3049,9 @@ impl AdminService {
                     antigravity_project.as_deref(),
                     claude_code_probe.as_deref(),
                 )
-                .await
+                .await;
+                result.model = model;
+                result
             }
         });
         let mut results: Vec<ProviderModelProbeResult> = futures::stream::iter(probes)
@@ -2938,9 +3061,12 @@ impl AdminService {
         results.sort_by(|a, b| a.model.cmp(&b.model));
         if !subscription_quotas.is_empty() {
             for result in &mut results {
+                let wire_model = subscription_probe_models
+                    .get(&result.model)
+                    .unwrap_or(&result.model);
                 if let Some(entry) = subscription_quotas
                     .iter()
-                    .find(|entry| entry.id == result.model)
+                    .find(|entry| &entry.id == wire_model)
                 {
                     result.quota_remaining = entry.quota_remaining;
                     result.quota_resets_at = entry.quota_resets_at.clone();
@@ -3214,7 +3340,7 @@ impl AdminService {
         let provider = self.get_provider(id).await?;
         let models = self.fetch_provider_models(&provider).await?;
         Ok(
-            crate::provider::google::antigravity::filter_subscription_unavailable(
+            crate::provider::google::antigravity::visible_subscription_models(
                 &provider,
                 crate::provider::opencode_go::routing::visible_models(&provider, models),
             ),
@@ -3512,7 +3638,7 @@ impl AdminService {
             .discover_provider_models(&provider, require_catalog)
             .await?;
         Ok(
-            crate::provider::google::antigravity::filter_subscription_unavailable(
+            crate::provider::google::antigravity::visible_subscription_models(
                 &provider,
                 crate::provider::opencode_go::routing::visible_models(&provider, models),
             ),
