@@ -1489,6 +1489,172 @@ mod tests {
         );
     }
 
+    async fn build_google_subscription_tier_request(
+        gw: &Gateway,
+        provider: &Provider,
+        credential: &crate::auth::types::StoredCredential,
+        model: &str,
+        effort: Option<ReasoningEffort>,
+    ) -> Value {
+        let mut req = minimal_chat_request();
+        req.meta.source_protocol = Some(GOOGLE_GEMINI_GENERATE_CONTENT_V1BETA);
+        req.reasoning.enabled = effort.is_some();
+        req.reasoning.effort = effort;
+        req.generation.temperature = Some(0.25);
+        let ctx = ProviderCtx {
+            actual_model: model,
+            egress_base_url: &provider.base_url,
+            ..antigravity_ctx(provider, Some(credential), gw)
+        };
+        let out = crate::provider::google::GoogleVendor
+            .build_request(&mut req, &ctx)
+            .await
+            .expect("Google subscription build_request succeeds");
+        assert_eq!(
+            out.url,
+            format!("{}/v1internal:generateContent", provider.base_url)
+        );
+        assert_eq!(out.body["project"], "cloudaicompanion-1");
+        assert_eq!(
+            out.body["request"]["contents"][0]["parts"][0]["text"],
+            "ping"
+        );
+        // Removing thinkingConfig must not discard sibling generation settings.
+        assert_eq!(out.body["request"]["generationConfig"]["temperature"], 0.25);
+        out.body
+    }
+
+    #[tokio::test]
+    async fn google_subscription_unified_models_route_effort_with_channel_catalogs() {
+        use ReasoningEffort::{High, Low, Max, Medium, Xhigh};
+        let gw = build_test_gateway().await;
+        let snapshots = [
+            ("absent", None, false),
+            (
+                "gemini-only",
+                Some(serde_json::json!([
+                    "gemini-3.8-flash-low",
+                    "gemini-3.8-flash-medium",
+                    "gemini-3.8-flash-high",
+                    "gemini-3.8-flash-tiered",
+                ])),
+                false,
+            ),
+            (
+                "claude-only",
+                Some(serde_json::json!([
+                    "claude-opus-5-5-low",
+                    "claude-opus-5-5-medium",
+                    "claude-opus-5-5-high",
+                    "claude-sonnet-5-5-low",
+                    "claude-sonnet-5-5-medium",
+                    "claude-sonnet-5-5-high",
+                ])),
+                true,
+            ),
+        ];
+        for provider in [antigravity_provider(), gemini_cli_provider()] {
+            let channel = provider.channel.as_deref().unwrap();
+            for (snapshot_name, snapshot, has_claude) in &snapshots {
+                let mut credential = antigravity_credential();
+                if channel == "gemini-cli" {
+                    credential.driver_key = "google-gemini-cli".into();
+                }
+                if let Some(snapshot) = snapshot {
+                    credential.meta["subscription_models"] = snapshot.clone();
+                }
+                for (model, default_suffix) in [
+                    ("claude-opus-5-5", "medium"),
+                    ("claude-sonnet-5-5", "medium"),
+                    ("gemini-3.8-flash", "tiered"),
+                ] {
+                    // Static catalogs supplement rather than replace raw snapshots:
+                    // only Antigravity has Claude tiers without account discovery.
+                    let has_tiers =
+                        model == "gemini-3.8-flash" || channel == "antigravity" || *has_claude;
+                    for (effort, suffix) in [
+                        (Some(Low), "low"),
+                        (Some(Medium), "medium"),
+                        (Some(High), "high"),
+                        (Some(Xhigh), "high"),
+                        (Some(Max), "high"),
+                        // Gemini has -tiered; Claude falls back to -medium.
+                        (None, default_suffix),
+                    ] {
+                        let case = format!("{channel}/{snapshot_name}/{model}/{effort:?}");
+                        let has_effort = effort.is_some();
+                        let body = build_google_subscription_tier_request(
+                            &gw,
+                            &provider,
+                            &credential,
+                            model,
+                            effort,
+                        )
+                        .await;
+                        let expected = if has_tiers {
+                            format!("{model}-{suffix}")
+                        } else {
+                            model.to_string()
+                        };
+                        assert_eq!(body["model"], expected, "{case}");
+                        let thinking = body.pointer("/request/generationConfig/thinkingConfig");
+                        if !has_tiers && has_effort {
+                            // Gemini CLI must not invent Claude routing or strip
+                            // the client's effort when its catalog has no tiers.
+                            assert_eq!(
+                                thinking,
+                                Some(&serde_json::json!({"thinkingLevel": suffix})),
+                                "{case}"
+                            );
+                        } else {
+                            assert!(thinking.is_none(), "{case}: {body}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn google_subscription_explicit_tiers_win_over_effort_without_snapshot() {
+        use ReasoningEffort::{High, Low};
+        let gw = build_test_gateway().await;
+        for provider in [antigravity_provider(), gemini_cli_provider()] {
+            let mut credential = antigravity_credential();
+            if provider.channel.as_deref() == Some("gemini-cli") {
+                credential.driver_key = "google-gemini-cli".into();
+            }
+            for model in ["claude-opus-5-5", "claude-sonnet-5-5", "gemini-3.8-flash"] {
+                for (suffix, effort) in [
+                    ("low", High),
+                    ("medium", Low),
+                    ("high", Low),
+                    ("tiered", High),
+                ] {
+                    if suffix == "tiered" && model != "gemini-3.8-flash" {
+                        continue;
+                    }
+                    let explicit_model = format!("{model}-{suffix}");
+                    let case = format!("{:?}/{explicit_model}/{effort:?}", provider.channel);
+                    let body = build_google_subscription_tier_request(
+                        &gw,
+                        &provider,
+                        &credential,
+                        &explicit_model,
+                        Some(effort),
+                    )
+                    .await;
+                    assert_eq!(body["model"], explicit_model, "{case}");
+                    assert!(
+                        body.pointer("/request/generationConfig/thinkingConfig")
+                            .is_none(),
+                        "{case}: {body}"
+                    );
+                }
+            }
+        }
+    }
+
     #[tokio::test]
     async fn antigravity_channel_fills_thought_signature_on_tool_history() {
         use crate::protocol::ir::request::ToolCallKind;
