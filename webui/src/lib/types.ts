@@ -344,7 +344,11 @@ export interface AccountUsageTotals {
 export interface AccountUsageStats {
   account_id: string;
   all_time: AccountUsageTotals;
-  period: AccountUsageTotals;
+  /** All three cycle fields are null when no valid current reset cycle is known. */
+  period: AccountUsageTotals | null;
+  /** Backend-defined account reset bounds in epoch ms, [start, end). */
+  period_start: number | null;
+  period_end: number | null;
 }
 
 export interface ProviderStats extends TpsSampleSums {

@@ -266,7 +266,29 @@ pub trait LogStore: Send + Sync {
         provider_id: &str,
         start_at: Option<i64>,
         end_at: Option<i64>,
-    ) -> anyhow::Result<Vec<AccountModelUsage>>;
+    ) -> anyhow::Result<Vec<AccountModelUsage>> {
+        Ok(self
+            .account_token_usage_with_periods(
+                provider_id,
+                start_at,
+                end_at,
+                &std::collections::HashMap::new(),
+            )
+            .await?
+            .0)
+    }
+    /// Scan retained attempts once, returning all matching usage and each account's
+    /// current-period usage with identical identity/token accounting semantics.
+    /// The outer `start_at`/`end_at` bounds are inclusive epoch milliseconds.
+    /// `periods` maps exact account IDs to half-open `[start, end)` epoch-ms windows;
+    /// absent, empty or reversed windows contribute nothing to the second result.
+    async fn account_token_usage_with_periods(
+        &self,
+        provider_id: &str,
+        start_at: Option<i64>,
+        end_at: Option<i64>,
+        periods: &std::collections::HashMap<String, (i64, i64)>,
+    ) -> anyhow::Result<(Vec<AccountModelUsage>, Vec<AccountModelUsage>)>;
     /// Rolling "last N hours" window; `None` covers every retained log.
     async fn stats_by_model(&self, hours: Option<i64>) -> anyhow::Result<Vec<ModelStats>> {
         self.stats_by_model_range(hours_window_start(hours), None)

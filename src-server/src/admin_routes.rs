@@ -820,21 +820,11 @@ async fn get_provider_account_pool_handler(
     }
 }
 
-#[derive(Deserialize)]
-struct AccountUsageParams {
-    period_start: i64,
-}
-
 async fn get_provider_account_usage_stats_handler(
     State(gw): State<Gateway>,
     Path(id): Path<String>,
-    Query(params): Query<AccountUsageParams>,
 ) -> impl IntoResponse {
-    match gw
-        .admin()
-        .get_provider_account_usage_stats(&id, params.period_start)
-        .await
-    {
+    match gw.admin().get_provider_account_usage_stats(&id).await {
         Ok(v) => Json(serde_json::json!({ "data": v })).into_response(),
         Err(e) => stats_detail_error(e),
     }

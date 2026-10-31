@@ -1925,19 +1925,23 @@ impl LogStore for MysqlLogStore {
         .collect()
     }
 
-    async fn account_token_usage(
+    async fn account_token_usage_with_periods(
         &self,
         provider_id: &str,
         start_at: Option<i64>,
         end_at: Option<i64>,
-    ) -> anyhow::Result<Vec<crate::db::models::AccountModelUsage>> {
+        periods: &std::collections::HashMap<String, (i64, i64)>,
+    ) -> anyhow::Result<(
+        Vec<crate::db::models::AccountModelUsage>,
+        Vec<crate::db::models::AccountModelUsage>,
+    )> {
         use crate::storage::account_usage::{AccountUsageAccumulator, AccountUsageRow};
 
         let range = crate::storage::traits::range_sql(start_at, end_at);
         // Keep the index-friendly predicate, then enforce exact bytes independently
         // of a case-insensitive or trailing-space-insensitive database collation.
         let sql = format!(
-            "SELECT route_decision, upstream_model, CAST(input_tokens AS SIGNED) AS input_tokens, \
+            "SELECT created_at, route_decision, upstream_model, CAST(input_tokens AS SIGNED) AS input_tokens, \
              CAST(output_tokens AS SIGNED) AS output_tokens, CAST(cache_read_tokens AS SIGNED) AS cache_read_tokens \
              FROM request_logs WHERE provider_id = ? AND BINARY provider_id = BINARY ? AND {range}"
         );
@@ -1945,7 +1949,7 @@ impl LogStore for MysqlLogStore {
             .bind(provider_id)
             .bind(provider_id)
             .fetch(&self.pool);
-        let mut usage = AccountUsageAccumulator::default();
+        let mut usage = AccountUsageAccumulator::new(periods);
         while let Some(row) = rows.try_next().await? {
             usage.add(row);
         }

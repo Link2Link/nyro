@@ -1831,25 +1831,29 @@ impl LogStore for PostgresLogStore {
         .collect()
     }
 
-    async fn account_token_usage(
+    async fn account_token_usage_with_periods(
         &self,
         provider_id: &str,
         start_at: Option<i64>,
         end_at: Option<i64>,
-    ) -> anyhow::Result<Vec<crate::db::models::AccountModelUsage>> {
+        periods: &std::collections::HashMap<String, (i64, i64)>,
+    ) -> anyhow::Result<(
+        Vec<crate::db::models::AccountModelUsage>,
+        Vec<crate::db::models::AccountModelUsage>,
+    )> {
         use crate::storage::account_usage::{AccountUsageAccumulator, AccountUsageRow};
 
         let range = crate::storage::traits::range_sql(start_at, end_at);
         // Preserve the provider index under its native collation, then require exact IDs.
         let sql = format!(
-            "SELECT route_decision, upstream_model, input_tokens::BIGINT AS input_tokens, \
+            "SELECT created_at, route_decision, upstream_model, input_tokens::BIGINT AS input_tokens, \
              output_tokens::BIGINT AS output_tokens, cache_read_tokens::BIGINT AS cache_read_tokens \
              FROM request_logs WHERE provider_id = $1 AND provider_id COLLATE \"C\" = $1 AND {range}"
         );
         let mut rows = sqlx::query_as::<_, AccountUsageRow>(&sql)
             .bind(provider_id)
             .fetch(&self.pool);
-        let mut usage = AccountUsageAccumulator::default();
+        let mut usage = AccountUsageAccumulator::new(periods);
         while let Some(row) = rows.try_next().await? {
             usage.add(row);
         }

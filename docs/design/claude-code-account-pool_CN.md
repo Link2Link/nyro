@@ -53,7 +53,7 @@ claude_usage?: {
 
 汇总纳入已启用且未断开的账号，包括额度耗尽账号；不代表当前可调度容量。未知套餐在每个窗口按一个 Pro 等价容量单位计入；缺失、无效、过期用量使汇总百分比显示未知，不把该账号当成零用量，UI 同时展示有效用量覆盖率与已知容量。两个窗口独立判断完整性。各账号保留自己的重置时间；最近重置及涉及账号数不表示全池同时重置，不据此伪造共同窗口。两个汇总窗口在所有屏幕宽度均上下排列，进度条的匀速预估标记按各账号独立窗口已过时间及对应 Claude 套餐容量加权，并标注预估百分比；用量、成员、容量或重置时间覆盖不完整时隐藏标记。账号池及单账号匀速标记均仅表示视觉估算。加权汇总不改变调度决策。
 
-保留日志统计复用原有账号 usage-stats 端点：全部保留记录和本自然周（浏览器本地时区、周一开始）。Token 与等价 API 价格来自日志，不是上游额度或永久账单；不同币种分开展示，清理日志会减少累计值，失败/重试请求和缺失参考价格沿用原统计语义。
+保留日志统计复用原有账号 usage-stats 端点：全部保留记录和 **本周期**，后者从每个账号的 `weekly_limit.resets_at` 向前推 7 天，统计至重置时刻之前，且不超过当前时间。后端返回毫秒时间戳 `period_start`/`period_end`；重置时间缺失、无效或已过期时 `period` 为 null，不回退自然周，也不伪造零用量。界面以本地时间展示周期起止，并在周期未知或到期时提示刷新用量。Token 与等价 API 价格来自日志，不是上游额度或永久账单；不同币种分开展示，清理日志会减少累计值，失败/重试请求和缺失参考价格沿用原统计语义。
 
 ### 匿名用量转发与 DSH
 
@@ -84,7 +84,7 @@ WebUI 复用 [backend.ts](<../../webui/src/lib/backend.ts>) 中已有的命令�
 | 移除账号 | `DELETE /api/v1/providers/:id/accounts/:account_id` |
 | 刷新账号用量 | `POST /api/v1/providers/:id/accounts/:account_id/usage/refresh` |
 | 刷新全池用量 | `POST /api/v1/providers/:id/account-pool/usage/refresh` |
-| 保留日志统计 | `GET /api/v1/providers/:id/accounts/usage-stats?period_start=...` |
+| 保留日志统计 | `GET /api/v1/providers/:id/accounts/usage-stats` |
 
 初始化账号会话时固定添加意图（`account_id` / `expected_version` 均为 null），或定向重新授权意图（两者均有值）。返回 Claude 浏览器授权地址以及 `completion_mode = "manual_exchange"`。用户打开页面登录目标账号，粘贴授权码（包括 `code#state`）或完整回调地址；UI 调用 `complete_oauth_session`，然后通过 `bind_provider_account` 消费就绪会话。**绑定请求只发送会话 ID 和可选别名，不重新选择账号 ID。** 目标与 CAS 校验由后端负责。
 

@@ -1,11 +1,10 @@
-import { doesNotMatch, equal, match } from "node:assert/strict";
+import { deepEqual, doesNotMatch, equal, match } from "node:assert/strict";
 import { test } from "node:test";
 import { renderToStaticMarkup } from "react-dom/server";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { LocaleProvider } from "../lib/i18n";
 import { newDevinPoolConfig, type AccountPoolView, type PoolQuotaWindow, type ProviderAccountView } from "../lib/devin-account-pool";
 import type { AccountUsageStats, Provider } from "../lib/types";
-import { accountUsagePeriodStart } from "../lib/account-usage-stats";
 import { DevinPoolUsage } from "./provider-usage";
 import { DevinPoolSettings } from "./devin-pool-settings";
 import { DevinAccountPoolCard, DevinAccountPoolPanel } from "./devin-account-pool";
@@ -36,7 +35,7 @@ function usage(pool: AccountPoolView, detailed = true): string {
 function panel(pool: AccountPoolView, collapsed = false, stats?: AccountUsageStats[], inspect?: (client: QueryClient) => void): string {
   const client = new QueryClient();
   client.setQueryData(["provider-account-pool", "devin"], pool);
-  if (stats) client.setQueryData(["provider-account-usage-stats", "devin", accountUsagePeriodStart("week", Date.now())], stats);
+  if (stats) client.setQueryData(["provider-account-usage-stats", "devin"], stats);
   const provider: Provider = {
     id: "devin", name: "Devin", vendor: "devin", protocol: "devin-chat/get-chat-message/v1",
     base_url: "https://api.devin.ai", use_proxy: false, fast_mode: false, is_enabled: true,
@@ -53,22 +52,27 @@ function panel(pool: AccountPoolView, collapsed = false, stats?: AccountUsageSta
   }
 }
 
-test("Devin management matches retained and weekly totals by stable account ID without adding table columns", () => {
+test("Devin management matches retained and current-cycle totals by stable account ID without adding table columns", () => {
   const pool = { ...mixed, accounts: [paceAccount("a", "pro", 50, 50, 25, 25), paceAccount("b", "max", 0, 50, 0, 25)] };
   const zero = { total_tokens: 0, request_count: 0, equivalent_costs: [], unpriced_request_count: 0 };
   const stats: AccountUsageStats[] = [
-    { account_id: "b", all_time: { ...zero, total_tokens: 8_000, request_count: 1, unpriced_request_count: 1 }, period: zero },
-    { account_id: "a", all_time: { ...zero, total_tokens: 1_234, request_count: 1, equivalent_costs: [{ currency: "USD", total_cost: 0.5, priced_request_count: 1 }] }, period: { ...zero, total_tokens: 321, request_count: 1, unpriced_request_count: 1 } },
+    { account_id: "b", all_time: { ...zero, total_tokens: 8_000, request_count: 1, unpriced_request_count: 1 }, period: zero, period_start: Date.now() - 172_800_000, period_end: Date.now() + 432_000_000 },
+    { account_id: "a", all_time: { ...zero, total_tokens: 1_234, request_count: 1, equivalent_costs: [{ currency: "USD", total_cost: 0.5, priced_request_count: 1 }] }, period: { ...zero, total_tokens: 321, request_count: 1, unpriced_request_count: 1 }, period_start: Date.now() - 86_400_000, period_end: Date.now() + 518_400_000 },
   ];
   const html = panel(pool, false, stats);
   const rows = html.match(/<tbody>([\s\S]*?)<\/tbody>/)?.[1].match(/<tr[\s\S]*?<\/tr>/g) ?? [];
   equal(rows.length, 2);
   match(rows[0], /data-account-usage="a"[\s\S]*1\.2K[\s\S]*\$0\.50[\s\S]*321/);
   match(rows[1], /data-account-usage="b"[\s\S]*8\.0K[\s\S]*—[\s\S]*\$0\.00/);
-  equal((html.match(/>This week</g) ?? []).length, 2);
+  equal((html.match(/>Current cycle</g) ?? []).length, 2);
   equal((html.match(/<th class=/g) ?? []).length, 6);
   for (const row of rows) match(row, />Remove<\/button><\/div><div data-account-usage=/);
-  doesNotMatch(html, />This month</);
+  doesNotMatch(html, /This week|This month|Kiro tokens/);
+  for (const [index, accountStats] of [stats[1], stats[0]].entries()) {
+    match(rows[index], /actual reset cycle, not a calendar week or month/);
+    equal(rows[index].includes(new Date(accountStats.period_start!).toLocaleString("en-US")), true);
+    equal(rows[index].includes(new Date(accountStats.period_end!).toLocaleString("en-US")), true);
+  }
 });
 
 test("Devin collapsed cards never create the usage query; expanded rows share one 60-second query", () => {
@@ -77,7 +81,7 @@ test("Devin collapsed cards never create the usage query; expanded rows share on
   panel(pool, false, undefined, (client) => {
     const queries = client.getQueryCache().findAll({ queryKey: ["provider-account-usage-stats"] });
     equal(queries.length, 1);
-    equal(queries[0].queryKey[2], accountUsagePeriodStart("week", Date.now()));
+    deepEqual(queries[0].queryKey, ["provider-account-usage-stats", "devin"]);
     equal((queries[0].options as { refetchInterval?: number }).refetchInterval, 60_000);
   });
 });

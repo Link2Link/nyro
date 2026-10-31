@@ -210,7 +210,7 @@ function resolveHTTP(cmd: string, args?: Record<string, unknown>): HTTPMapping {
     case "get_provider_account_pool":
       return { method: "GET", url: `${base}/providers/${encodeURIComponent(String(args?.id))}/accounts` };
     case "get_provider_account_usage_stats":
-      return { method: "GET", url: `${base}/providers/${encodeURIComponent(String(args?.id))}/accounts/usage-stats?period_start=${encodeURIComponent(String(args?.periodStart))}` };
+      return { method: "GET", url: `${base}/providers/${encodeURIComponent(String(args?.id))}/accounts/usage-stats` };
     case "configure_provider_account_pool":
       return { method: "PUT", url: `${base}/providers/${encodeURIComponent(String(args?.id))}/account-pool`, body: args?.config as Record<string, unknown> };
     case "init_provider_account_session":

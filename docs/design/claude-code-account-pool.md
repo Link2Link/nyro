@@ -53,7 +53,7 @@ Used units are `sum(weight × used_percent / 100)`; pool used percent is `100 ×
 
 Accounting includes enabled, non-disconnected accounts, including exhausted ones; totals are not a promise of currently routable capacity. Unknown plans contribute one Pro-equivalent capacity unit per window. Missing, invalid or stale usage leaves the aggregate percentage unknown rather than treating the account as unused; the UI reports known coverage and capacity. Windows are independently complete or incomplete. Each account retains its own reset time; the earliest reset and affected account count do not imply a whole-pool reset. The two pool windows stack vertically at all viewport widths. Their progress bars show a steady-pace reference marker computed from each member's own window elapsed percentage, weighted by that window's Claude plan capacity; the next reset is never used as a shared pool reset. Incomplete usage, membership, capacity or reset coverage hides the reference. A bilingual label identifies the estimated percentage. Both pool and per-account steady-pace markers remain visual estimates only. Aggregates never change scheduling decisions.
 
-Retained usage statistics use the existing account usage-stats endpoint: all retained records plus the current calendar week (Monday start in the browser's local time). Tokens and equivalent API prices are log-derived estimates, not upstream quota or a permanent bill. Mixed currencies remain separate; deleted logs reduce totals; failed/retried attempts and missing reference prices follow the existing statistics semantics.
+Retained usage statistics use the existing account usage-stats endpoint: all retained records plus **Current cycle**, from each account's `weekly_limit.resets_at` minus 7 days up to that reset (exclusive), capped at the current time. The backend returns `period_start`/`period_end` in epoch milliseconds; missing, invalid or expired resets yield a null `period` rather than a calendar-week fallback or a fabricated zero. The UI displays the cycle dates in local time and asks for a usage refresh when the cycle is unknown or expires. Tokens and equivalent API prices are log-derived estimates, not upstream quota or a permanent bill. Mixed currencies remain separate; deleted logs reduce totals; failed/retried attempts and missing reference prices follow the existing statistics semantics.
 
 ### Anonymous usage forwarding and DSH
 
@@ -88,7 +88,7 @@ The WebUI calls the existing commands mapped in [backend.ts](<../../webui/src/li
 | Remove account | `DELETE /api/v1/providers/:id/accounts/:account_id` |
 | Refresh account usage | `POST /api/v1/providers/:id/accounts/:account_id/usage/refresh` |
 | Refresh pool usage | `POST /api/v1/providers/:id/account-pool/usage/refresh` |
-| Retained account statistics | `GET /api/v1/providers/:id/accounts/usage-stats?period_start=...` |
+| Retained account statistics | `GET /api/v1/providers/:id/accounts/usage-stats` |
 
 Account initialization fixes either add-account intent (`account_id` / `expected_version` null), or targeted reauthorization intent (both populated). It returns the Claude browser authorization URL and `completion_mode = "manual_exchange"`. The user opens the page, signs into the intended account, and pastes a code (including `code#state`) or full callback URL. The UI calls `complete_oauth_session`, then consumes the ready session with `bind_provider_account`. **Binding sends only the session ID and optional label, not a newly selected account ID.** The backend owns target and CAS validation.
 

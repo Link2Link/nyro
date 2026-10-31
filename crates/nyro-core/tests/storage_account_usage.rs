@@ -304,6 +304,173 @@ async fn account_usage_supports_inclusive_period_bounds_and_open_ranges() -> any
 }
 
 #[tokio::test]
+async fn account_usage_uses_each_exact_accounts_half_open_period() -> anyhow::Result<()> {
+    let storage = sqlite().await?;
+    for account in [
+        "account",
+        "other-account",
+        "ACCOUNT",
+        "account ",
+        "empty",
+        "reversed",
+    ] {
+        for (at, input) in [
+            (999, 1),
+            (1000, 10),
+            (2000, 100),
+            (3000, 1000),
+            (3001, 10000),
+        ] {
+            insert(
+                &storage,
+                Attempt {
+                    created_at: at,
+                    tokens: (Some(input), Some(0), None),
+                    ..Attempt::account(account)
+                },
+            )
+            .await?;
+        }
+    }
+    let periods = std::collections::HashMap::from([
+        ("account".into(), (1000, 2000)),
+        ("other-account".into(), (2000, 3001)),
+        ("empty".into(), (1000, 1000)),
+        ("reversed".into(), (3000, 1000)),
+        ("missing-account".into(), (1000, 3001)),
+    ]);
+    // Outer bounds still include both endpoints; account periods exclude their end.
+    let (all_time, period) = storage
+        .logs()
+        .account_token_usage_with_periods("provider", Some(1000), Some(3000), &periods)
+        .await?;
+    assert_eq!(
+        all_time,
+        storage
+            .logs()
+            .account_token_usage("provider", Some(1000), Some(3000))
+            .await?
+    );
+    assert_eq!(all_time.len(), 6);
+    assert!(
+        all_time
+            .iter()
+            .all(|row| row.request_count == 3 && row.input_tokens == 1110)
+    );
+    assert_eq!(
+        period,
+        vec![
+            AccountModelUsage {
+                account_id: "account".into(),
+                model: "model".into(),
+                request_count: 1,
+                input_tokens: 10,
+                ..Default::default()
+            },
+            AccountModelUsage {
+                account_id: "other-account".into(),
+                model: "model".into(),
+                request_count: 2,
+                input_tokens: 1100,
+                ..Default::default()
+            },
+        ]
+    );
+    let (empty_map_all, empty_map_period) = storage
+        .logs()
+        .account_token_usage_with_periods("provider", None, None, &std::collections::HashMap::new())
+        .await?;
+    assert!(empty_map_period.is_empty());
+    assert!(empty_map_all.iter().all(|row| row.request_count == 5));
+    let (reversed_all, reversed_period) = storage
+        .logs()
+        .account_token_usage_with_periods("provider", Some(3000), Some(1000), &periods)
+        .await?;
+    assert!(reversed_all.is_empty() && reversed_period.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn account_usage_period_preserves_every_pricing_and_missing_usage_field() -> anyhow::Result<()>
+{
+    let storage = sqlite().await?;
+    for (at, tokens) in [
+        (99, (Some(1000), Some(100), Some(400))),
+        (100, (Some(100), Some(10), Some(40))),
+        (101, (None, Some(7), Some(0))),
+        (102, (None, None, None)),
+        (103, (Some(5), None, None)),
+        (104, (Some(1000), Some(100), Some(400))),
+    ] {
+        insert(
+            &storage,
+            Attempt {
+                created_at: at,
+                tokens,
+                outcome: "error",
+                attempt_index: 1,
+                ..Attempt::account("account")
+            },
+        )
+        .await?;
+    }
+    for model in [Some("Model"), Some("model "), None] {
+        insert(
+            &storage,
+            Attempt {
+                created_at: 101,
+                model,
+                ..Attempt::account("account")
+            },
+        )
+        .await?;
+    }
+    insert(
+        &storage,
+        Attempt {
+            created_at: 101,
+            route_decision: Some("{invalid".into()),
+            ..Attempt::account("account")
+        },
+    )
+    .await?;
+    let periods = std::collections::HashMap::from([("account".into(), (100, 104))]);
+    let (all_time, period) = storage
+        .logs()
+        .account_token_usage_with_periods("provider", None, None, &periods)
+        .await?;
+    assert_eq!(
+        period,
+        storage
+            .logs()
+            .account_token_usage("provider", Some(100), Some(103))
+            .await?
+    );
+    assert_eq!(period.len(), 4);
+    assert_eq!(
+        period.iter().find(|row| row.model == "model").unwrap(),
+        &AccountModelUsage {
+            account_id: "account".into(),
+            model: "model".into(),
+            request_count: 4,
+            input_tokens: 105,
+            output_tokens: 17,
+            cache_read_tokens: 40,
+            missing_usage_count: 3,
+            cache_read_reported_count: 2,
+        }
+    );
+    let all_model = all_time.iter().find(|row| row.model == "model").unwrap();
+    assert_eq!(all_model.request_count, 6);
+    assert_eq!(all_model.input_tokens, 2105);
+    assert_eq!(all_model.output_tokens, 217);
+    assert_eq!(all_model.cache_read_tokens, 840);
+    assert_eq!(all_model.missing_usage_count, 3);
+    assert_eq!(all_model.cache_read_reported_count, 4);
+    Ok(())
+}
+
+#[tokio::test]
 async fn account_usage_reads_all_retained_history_without_log_pagination_limits()
 -> anyhow::Result<()> {
     let storage = sqlite().await?;
@@ -334,6 +501,12 @@ async fn account_usage_reads_all_retained_history_without_log_pagination_limits(
 #[tokio::test]
 async fn account_usage_memory_has_no_retained_logs() -> anyhow::Result<()> {
     let storage = MemoryStorage::new(vec![], vec![], vec![]);
+    let periods = std::collections::HashMap::from([("account".into(), (0, 1000))]);
+    let (all_time, period) = storage
+        .logs()
+        .account_token_usage_with_periods("provider", None, Some(1000), &periods)
+        .await?;
+    assert!(all_time.is_empty() && period.is_empty());
     assert!(
         storage
             .logs()

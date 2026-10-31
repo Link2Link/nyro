@@ -6,7 +6,7 @@ use std::sync::Arc;
 use tower::ServiceExt;
 
 #[tokio::test]
-async fn account_usage_http_contract_auth_and_period_validation() -> anyhow::Result<()> {
+async fn account_usage_http_contract_auth_and_server_owned_cycles() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let config = nyro_core::config::GatewayConfig {
         data_dir: dir.path().into(),
@@ -47,17 +47,16 @@ async fn account_usage_http_contract_auth_and_period_validation() -> anyhow::Res
             },
         )
         .await?;
+    let reset = chrono::Utc::now().timestamp() + 86_400;
+    assert!(storage.oauth_credentials().compare_account_state(
+        &provider.id, &account.account_id, account.status_version, &account.account_state,
+        &serde_json::json!({"usage": {"weekly": {"remaining_percent": 80, "resets_at_unix": reset}}}).to_string(),
+    ).await?);
     let router = create_router(gw, Some("test-admin".into()));
     for (query, authenticated, expected) in [
-        ("?period_start=0", false, StatusCode::UNAUTHORIZED),
-        ("?period_start=-1", true, StatusCode::BAD_REQUEST),
-        (
-            "?period_start=9223372036854775807",
-            true,
-            StatusCode::BAD_REQUEST,
-        ),
-        ("?period_start=invalid", true, StatusCode::BAD_REQUEST),
-        ("", true, StatusCode::BAD_REQUEST),
+        ("", false, StatusCode::UNAUTHORIZED),
+        ("", true, StatusCode::OK),
+        // Legacy client parameters cannot override account-owned cycle dates.
         ("?period_start=0", true, StatusCode::OK),
     ] {
         let mut request = Request::builder().uri(format!(
@@ -74,6 +73,11 @@ async fn account_usage_http_contract_auth_and_period_validation() -> anyhow::Res
             let value: serde_json::Value = serde_json::from_slice(&bytes)?;
             assert_eq!(value["data"].as_array().unwrap().len(), 1);
             assert_eq!(value["data"][0]["account_id"], account.account_id);
+            assert_eq!(
+                value["data"][0]["period_start"],
+                (reset - 7 * 86_400) * 1000
+            );
+            assert_eq!(value["data"][0]["period_end"], reset * 1000);
             for window in ["all_time", "period"] {
                 assert_eq!(value["data"][0][window]["total_tokens"], 0);
                 assert_eq!(value["data"][0][window]["request_count"], 0);
