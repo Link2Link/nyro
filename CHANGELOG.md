@@ -4,6 +4,17 @@ All notable changes to Nyro will be documented in this file.
 
 ---
 
+## v2.1.16
+
+> Released on 2026-10-31
+
+#### Fixes
+
+- **Account usage follows actual reset cycles**: Claude Code and Devin account statistics now use each account's upstream weekly reset, while Kiro uses its monthly reset rather than a browser-local calendar week or month. Tokens and equivalent API costs share the same per-account cycle, calculated in a single retained-log scan. The WebUI shows cycle boundaries and requests a usage refresh for unknown or expired cycles instead of displaying fabricated zero usage; no database migration is required
+- **Protocol-content preservation across Nyro gateways**: same-protocol relays no longer apply final-provider compatibility rewrites that could remove custom tools, namespaces, encrypted reasoning or replay IDs. They preserve non-streaming Responses, response JSON fields and complete SSE events, and reject missing matching protocol endpoints instead of silently converting requests. Authentication, routing, timeouts and failover remain in place; explicit request-mutating overrides are outside the unmodified-body guarantee. Added two-hop relay regressions and clarified the documented preservation boundaries
+
+---
+
 ## v2.1.15
 
 > Released on 2026-10-31

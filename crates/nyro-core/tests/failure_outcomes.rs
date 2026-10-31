@@ -221,6 +221,7 @@ enum ResponsesClose {
 async fn responses_compat_close_case(
     terminal: Option<&str>,
     close: ResponsesClose,
+    nyro_relay: bool,
 ) -> anyhow::Result<()> {
     let (_dir, gw, mut logs, _, setup_job) = setup().await?;
     let prefix = concat!(
@@ -241,6 +242,12 @@ async fn responses_compat_close_case(
         _ => unreachable!(),
     };
     let wire = format!("{prefix}{tail}");
+    // Raw passthrough preserves HTTP chunks; unlike compat it does not split
+    // one chunk into individual events. Gate the raw terminal until after the
+    // first frame is read so a close-before-terminal case stays deterministic.
+    let park_terminal = nyro_relay && close == ResponsesClose::FirstFrame;
+    let terminal_gate = Arc::new(tokio::sync::Notify::new());
+    let upstream_gate = terminal_gate.clone();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let url = format!("http://{}/v1", listener.local_addr()?);
     let (request_tx, mut request_rx) = tokio::sync::mpsc::channel(1);
@@ -252,11 +259,23 @@ async fn responses_compat_close_case(
                 post(move |Json(body): Json<Value>| {
                     let request_tx = request_tx.clone();
                     let wire = wire.clone();
+                    let upstream_gate = upstream_gate.clone();
                     async move {
                         request_tx.send(body).await.unwrap();
+                        let first = if park_terminal {
+                            prefix.to_string()
+                        } else {
+                            wire
+                        };
                         let stream = futures::stream::once(async move {
-                            Ok::<_, std::convert::Infallible>(bytes::Bytes::from(wire))
+                            Ok::<_, std::convert::Infallible>(bytes::Bytes::from(first))
                         })
+                        .chain(futures::stream::once(async move {
+                            upstream_gate.notified().await;
+                            Ok::<_, std::convert::Infallible>(bytes::Bytes::from_static(
+                                tail.as_bytes(),
+                            ))
+                        }))
                         .chain(futures::stream::pending());
                         (
                             [("content-type", "text/event-stream")],
@@ -273,8 +292,8 @@ async fn responses_compat_close_case(
         .admin()
         .create_provider(CreateProvider {
             keys: Vec::new(),
-            name: "Chained Nyro".into(),
-            vendor: Some("nyro-gateway".into()),
+            name: "Responses close fixture".into(),
+            vendor: Some(if nyro_relay { "nyro-gateway" } else { "custom" }.into()),
             protocol: OPENAI_RESPONSES_V1.to_string(),
             base_url: url,
             protocol_mode: "fixed".into(),
@@ -317,6 +336,8 @@ async fn responses_compat_close_case(
     let cancellation = ctx.cancellation.clone();
     let outcome = ctx.outcome.clone();
     let id = ctx.request_id.clone();
+    let mut expected_relay_body = body.clone();
+    expected_relay_body["model"] = json!("upstream-model");
     let response = dispatch_pipeline(
         gw.clone(),
         HeaderMap::new(),
@@ -330,12 +351,19 @@ async fn responses_compat_close_case(
     let upstream_request = tokio::time::timeout(Duration::from_secs(3), request_rx.recv())
         .await?
         .unwrap();
-    assert_eq!(upstream_request["tools"][0]["name"], "test_tool");
-    assert_eq!(
-        upstream_request["input"].as_array().unwrap().len(),
-        1,
-        "Responses-Lite carrier must select the third-party compat path"
-    );
+    if nyro_relay {
+        assert_eq!(
+            upstream_request, expected_relay_body,
+            "Nyro relays preserve the tool carrier, including custom tools"
+        );
+    } else {
+        assert_eq!(upstream_request["tools"][0]["name"], "test_tool");
+        assert_eq!(
+            upstream_request["input"].as_array().unwrap().len(),
+            1,
+            "Responses-Lite carrier must select the third-party compat path"
+        );
+    }
     let mut stream = response.into_body().into_data_stream();
     let mut received = String::new();
     loop {
@@ -368,6 +396,9 @@ async fn responses_compat_close_case(
         assert!(deadline.is_exceeded());
     }
     drop(stream);
+    if park_terminal {
+        terminal_gate.notify_one();
+    }
     let row = tokio::time::timeout(Duration::from_secs(3), logs.recv())
         .await?
         .unwrap();
@@ -407,10 +438,15 @@ async fn responses_compat_close_case(
         assert!(row.diagnostic.failure_kind.is_none());
         assert!(row.diagnostic.error_causes.is_empty());
         assert!(row.performance.completed_at.is_some());
-        assert_eq!(
-            outcome.get(),
-            Some(&nyro_core::proxy::context::RequestOutcome::Success)
-        );
+        if !nyro_relay {
+            // The compat lifecycle publishes this additional context outcome;
+            // raw passthrough records the authoritative result in performance
+            // and diagnostic fields asserted above instead.
+            assert_eq!(
+                outcome.get(),
+                Some(&nyro_core::proxy::context::RequestOutcome::Success)
+            );
+        }
         assert_eq!(row.input_tokens(), 11377);
         assert_eq!(row.output_tokens(), 392);
         assert_eq!(
@@ -428,37 +464,53 @@ async fn responses_compat_close_case(
 
 #[tokio::test]
 async fn responses_compat_terminal_close_is_completed() -> anyhow::Result<()> {
-    responses_compat_close_case(Some("completed"), ResponsesClose::Terminal).await
+    responses_compat_close_case(Some("completed"), ResponsesClose::Terminal, false).await
 }
 
 #[tokio::test]
 async fn responses_compat_midstream_close_is_cancelled() -> anyhow::Result<()> {
-    responses_compat_close_case(None, ResponsesClose::FirstFrame).await
+    responses_compat_close_case(None, ResponsesClose::FirstFrame, false).await
 }
 
 #[tokio::test]
 async fn responses_compat_terminal_close_preserves_explicit_cancellation() -> anyhow::Result<()> {
-    responses_compat_close_case(Some("completed"), ResponsesClose::ExternalCancel).await
+    responses_compat_close_case(Some("completed"), ResponsesClose::ExternalCancel, false).await
 }
 
 #[tokio::test]
 async fn responses_compat_error_terminal_close_stays_failed() -> anyhow::Result<()> {
-    responses_compat_close_case(Some("failed"), ResponsesClose::Terminal).await
+    responses_compat_close_case(Some("failed"), ResponsesClose::Terminal, false).await
 }
 
 #[tokio::test]
 async fn responses_compat_undrained_terminal_stays_cancelled() -> anyhow::Result<()> {
-    responses_compat_close_case(Some("completed"), ResponsesClose::FirstFrame).await
+    responses_compat_close_case(Some("completed"), ResponsesClose::FirstFrame, false).await
 }
 
 #[tokio::test]
 async fn responses_compat_incomplete_terminal_is_not_completed() -> anyhow::Result<()> {
-    responses_compat_close_case(Some("incomplete"), ResponsesClose::Terminal).await
+    responses_compat_close_case(Some("incomplete"), ResponsesClose::Terminal, false).await
 }
 
 #[tokio::test]
 async fn responses_compat_terminal_close_preserves_deadline() -> anyhow::Result<()> {
-    responses_compat_close_case(Some("completed"), ResponsesClose::Deadline).await
+    responses_compat_close_case(Some("completed"), ResponsesClose::Deadline, false).await
+}
+
+#[tokio::test]
+async fn nyro_relay_preserves_tool_carriers_and_terminal_close_outcomes() -> anyhow::Result<()> {
+    for (terminal, close) in [
+        (Some("completed"), ResponsesClose::Terminal),
+        (None, ResponsesClose::FirstFrame),
+        (Some("completed"), ResponsesClose::ExternalCancel),
+        (Some("failed"), ResponsesClose::Terminal),
+        (Some("completed"), ResponsesClose::FirstFrame),
+        (Some("incomplete"), ResponsesClose::Terminal),
+        (Some("completed"), ResponsesClose::Deadline),
+    ] {
+        responses_compat_close_case(terminal, close, true).await?;
+    }
+    Ok(())
 }
 
 #[tokio::test]
