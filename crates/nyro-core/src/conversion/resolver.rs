@@ -154,7 +154,11 @@ pub(crate) fn supports_raw_wire_compat(
     egress_base_url: &str,
     actual_model: &str,
 ) -> bool {
-    if !json_http_pair(ingress, egress) {
+    if !json_http_pair(ingress, egress) || crate::provider::nyro_gateway::is_nyro_gateway(provider)
+    {
+        // A Nyro relay is not a third-party model backend. In particular,
+        // Responses-Lite tools and opaque replay state belong to the remote;
+        // normalizing them here loses information before it can choose a vendor.
         return false;
     }
     let vendor_id = provider
@@ -225,7 +229,8 @@ pub(crate) fn resolve_raw_wire_compat(
         current_request,
     } = input;
 
-    if !json_http_pair(ingress, egress) {
+    if !json_http_pair(ingress, egress) || crate::provider::nyro_gateway::is_nyro_gateway(provider)
+    {
         return Ok(None);
     }
 
@@ -481,6 +486,43 @@ mod tests {
                 "https://example.com",
                 "gpt-5",
             ));
+        }
+    }
+
+    #[test]
+    fn nyro_gateway_never_normalizes_native_responses() {
+        let baseline = request("gpt-5", OPENAI_RESPONSES_V1);
+        let raw_body = br#"{"model":"gpt-5","store":false,"input":[{"role":"user","content":"hello"},{"type":"reasoning","id":"rs_remote","encrypted_content":"opaque","summary":[]}],"tools":[{"type":"custom","name":"apply_patch","format":{"type":"text"}}]}"#;
+        assert!(nyro_ccswitch_compat::request_needs_rewrite(raw_body));
+        for preset_only in [false, true] {
+            let mut p = provider("nyro-gateway", "default");
+            if preset_only {
+                p.vendor = None;
+                p.preset_key = Some("nyro-gateway".into());
+            }
+            assert!(!supports_raw_wire_compat(
+                OPENAI_RESPONSES_V1,
+                OPENAI_RESPONSES_V1,
+                &p,
+                &p.base_url,
+                "gpt-5",
+            ));
+            assert!(
+                resolve_raw_wire_compat(ResolveRawWireCompatInput {
+                    ingress: OPENAI_RESPONSES_V1,
+                    egress: OPENAI_RESPONSES_V1,
+                    provider: &p,
+                    egress_base_url: &p.base_url,
+                    actual_model: "gpt-5",
+                    client_stream: true,
+                    headers: &HeaderMap::new(),
+                    raw_body,
+                    baseline_request: &baseline,
+                    current_request: &baseline,
+                })
+                .unwrap()
+                .is_none()
+            );
         }
     }
 

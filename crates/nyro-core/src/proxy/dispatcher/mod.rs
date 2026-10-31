@@ -907,6 +907,17 @@ async fn dispatch_pipeline_inner(
                 let provider_protocols = ProviderProtocols::from_provider(&provider);
                 negotiate(ingress, None, Some(&provider_protocols), ctx)
             }
+        })
+        .and_then(|plan| {
+            if crate::provider::nyro_gateway::is_nyro_gateway(&provider) && plan.egress != ingress {
+                // A disabled/missing native endpoint is a configuration error,
+                // not permission to silently transcode a gateway-to-gateway hop.
+                return Err(GatewayError::ProtocolUnsupported {
+                    ingress: ingress.to_string(),
+                    egress: plan.egress.to_string(),
+                });
+            }
+            Ok(plan)
         });
         let mut plan = match resolved_plan {
             Ok(p) => p,
@@ -940,6 +951,8 @@ async fn dispatch_pipeline_inner(
             plan.base_url = base_url.to_string();
         }
         let egress = plan.egress;
+        let nyro_native_relay = crate::provider::nyro_gateway::is_nyro_gateway(&provider)
+            && plan.mode == ProtocolMode::Native;
         // google/antigravity must always call upstream in streaming mode (the
         // Code Assist v1internal non-stream action can return empty bodies —
         // both sub2api and CLIProxyAPI stream and aggregate). Non-stream
@@ -1145,7 +1158,9 @@ async fn dispatch_pipeline_inner(
         // The selected compat engine validates and constructs the real wire
         // body, including schemas the native Gemini subset cannot represent.
         upstream_request.meta.raw_wire_preview = compat_candidate;
-        let tool_route_plan = if compat_candidate {
+        let tool_route_plan = if compat_candidate || nyro_native_relay {
+            // Same-protocol relays must not rename tools for a different
+            // backend's name/length restrictions (or force an IR re-encode).
             ToolRoutePlan::default()
         } else {
             let plan = ToolRoutePlan::for_request(&upstream_request, egress);
@@ -1202,11 +1217,12 @@ async fn dispatch_pipeline_inner(
         // rewriting here makes the change ride that patch. A rewrite also
         // forces the re-encode path below, skipping the native passthrough
         // that would forward the verbatim client body.
-        let param_override_applied = param_overrides::apply_upstream_param_overrides(
-            &mut upstream_request,
-            &provider,
-            &actual_model,
-        );
+        let param_override_applied = !nyro_native_relay
+            && param_overrides::apply_upstream_param_overrides(
+                &mut upstream_request,
+                &provider,
+                &actual_model,
+            );
 
         // Native binary/session upstreams consume IR directly. Keep them out of
         // JSON encoders, protocol-default URL rewriting and raw-wire compat.
@@ -1643,7 +1659,12 @@ async fn dispatch_pipeline_inner(
 
         let egress_str = egress.to_string();
         let egress_caps = egress.handler().capabilities();
-        let upstream_forces_stream = egress_caps.force_upstream_stream || antigravity_force_stream;
+        // The remote Nyro owns any final-backend streaming requirement. Do
+        // not aggregate its native JSON reply through the lossy Responses IR.
+        // Explicit request mutations still use the encoder's stream contract.
+        let upstream_forces_stream = (egress_caps.force_upstream_stream
+            && !(nyro_native_relay && passthrough_req))
+            || antigravity_force_stream;
         debug_assert_eq!(
             prepared_conversion.plan().kind().as_str(),
             conversion_strategy

@@ -13,7 +13,14 @@
 //!
 //! The preset is therefore a shared-key adaptive channel declaring all four
 //! protocols: every client protocol lands on the same-protocol remote route
-//! and is forwarded natively (no IR round-trip, no lossy conversion).
+//! and is forwarded natively (no IR round-trip, no lossy conversion). Missing
+//! native endpoints are rejected rather than silently transcoded. Automatic
+//! backend normalization and forced streaming belong to the remote, not this hop.
+//!
+//! This preserves JSON fields and normal SSE event bytes, not HTTP wire identity:
+//! JSON is reserialized, models/auth are routed, ingress validation and transport
+//! safety/failover still apply. Explicit route/plugin mutations opt out of the
+//! unmodified request-body guarantee.
 //!
 //! The vendor id is `nyro-gateway`, not `nyro`: `nyro` is the retired id of
 //! the Custom preset — every storage backend still migrates
@@ -186,7 +193,7 @@ impl Vendor for NyroGatewayVendor {
             GOOGLE_GEMINI_GENERATE_CONTENT_V1BETA,
         ]
     }
-    // The remote speaks every protocol natively: forward byte-for-byte.
+    // The remote speaks every protocol natively: preserve protocol content.
     fn declared_request_mutations(&self) -> bool {
         false
     }

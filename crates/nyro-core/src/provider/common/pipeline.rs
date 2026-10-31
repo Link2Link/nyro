@@ -732,6 +732,7 @@ pub async fn passthrough_run(
     is_stream: bool,
 ) -> Result<crate::provider::outbound::OutboundRequest, GatewayError> {
     let vendor_ctx = ctx.to_vendor_ctx();
+    let nyro_relay = crate::provider::nyro_gateway::is_nyro_gateway(ctx.provider);
     let is_openai_chat = ctx.protocol.protocol == crate::protocol::ids::Protocol::OpenAICompatible
         && ctx.protocol.name == "chat-completions";
 
@@ -753,7 +754,7 @@ pub async fn passthrough_run(
         // precedence as the encoder). Embeddings (non-streaming, different
         // shape), Responses, and Anthropic/Gemini (usage reported by default)
         // are excluded.
-        if is_stream && is_openai_chat && !obj.contains_key("stream_options") {
+        if !nyro_relay && is_stream && is_openai_chat && !obj.contains_key("stream_options") {
             obj.insert(
                 "stream_options".to_string(),
                 serde_json::json!({"include_usage": true}),
@@ -769,55 +770,62 @@ pub async fn passthrough_run(
         apply_force_max_reasoning_body(&mut raw_body, ctx.protocol.protocol);
     }
 
-    crate::provider::minimax::apply_chat_output_token_floor(
-        &mut raw_body,
-        ctx.provider.vendor.as_deref(),
-        ctx.protocol,
-    );
-    crate::provider::google::apply_output_token_floor(
-        &mut raw_body,
-        ctx.provider.vendor.as_deref(),
-    );
+    // A gateway alias is not a final model identity. Leave all automatic
+    // backend policy to the remote (including tool defaults and effort floors).
+    // Explicit route overrides above remain intentional local configuration.
+    if !nyro_relay {
+        crate::provider::minimax::apply_chat_output_token_floor(
+            &mut raw_body,
+            ctx.provider.vendor.as_deref(),
+            ctx.protocol,
+        );
+        crate::provider::google::apply_output_token_floor(
+            &mut raw_body,
+            ctx.provider.vendor.as_deref(),
+        );
 
-    // 思考模型输出预算下限：提升过小的 max_tokens（< 128K）到 128000（直通路径）
-    // 直通路径没有 IR，从 raw_body 检查是否存在 thinking 字段，或模型本身是否为思考模型
-    let has_thinking_field = raw_body
-        .get("thinking")
-        .and_then(|v| v.as_object())
-        .is_some();
-    let model_name = raw_body
-        .get("model")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    let is_thinking_request = has_thinking_field || is_thinking_model(model_name);
-    apply_max_tokens_floor(&mut raw_body, ctx.protocol.protocol, is_thinking_request);
+        // 思考模型输出预算下限：提升过小的 max_tokens（< 128K）到 128000（直通路径）
+        // 直通路径没有 IR，从 raw_body 检查是否存在 thinking 字段，或模型本身是否为思考模型
+        let has_thinking_field = raw_body
+            .get("thinking")
+            .and_then(|v| v.as_object())
+            .is_some();
+        let model_name = raw_body
+            .get("model")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let is_thinking_request = has_thinking_field || is_thinking_model(model_name);
+        apply_max_tokens_floor(&mut raw_body, ctx.protocol.protocol, is_thinking_request);
 
-    if is_openai_chat {
-        normalize_openai_developer_roles(&mut raw_body);
-        apply_vendor_effort_policy(&mut raw_body, ctx.provider);
-    }
-    if ctx.protocol == crate::protocol::ids::OPENAI_RESPONSES_V1 {
-        crate::protocol::codec::openai::responses::normalize_function_tool_defaults(&mut raw_body);
-        // sub2api Fast 模式：缺 service_tier 时补 priority（Responses 直通路径）
-        maybe_inject_openai_fast_mode(&mut raw_body, ctx.provider, ctx.protocol);
-        // Codex 消费级上游：剥离其拒绝的 Responses 参数（Responses 直通路径）
-        maybe_sanitize_codex_consumer_request(&mut raw_body, ctx.provider);
-        // Codex 消费级上游：剥离 reasoning 项的非空 content（Responses 直通路径）
-        sanitize_codex_reasoning_content(&mut raw_body, ctx.provider);
-        // Codex 消费级上游：规范化外来工具调用 ID 前缀（Responses 直通路径）
-        sanitize_codex_tool_call_ids(&mut raw_body, ctx.provider);
-        // 供应商 effort 方言（Responses 直通路径）：grok 对 max 是 400 硬拒
-        // （线上事故 65fffc9a），none/off 同样拒绝——此前只挂在 IR 转码与
-        // Chat 透传两路，Responses 直通漏挂。
-        apply_vendor_effort_policy(&mut raw_body, ctx.provider);
-    }
-    if ctx.protocol == crate::protocol::ids::ANTHROPIC_MESSAGES_2023_06_01 {
-        // Anthropic 直通路径：Claude 5.5 系列把经典 thinking.type=enabled
-        // 逐出契约（线上 400，请求 b0500316，UUAPI claude-sonnet-5-5），
-        // 剥除整字段退回自适应思考。模型已在上方改写为 actual_model，
-        // 门控按上游真实模型名判定；其余 vendor 方言分支对 Anthropic
-        // wire 形态（无 reasoning_effort 键）均为 no-op。
-        apply_vendor_effort_policy(&mut raw_body, ctx.provider);
+        if is_openai_chat {
+            normalize_openai_developer_roles(&mut raw_body);
+            apply_vendor_effort_policy(&mut raw_body, ctx.provider);
+        }
+        if ctx.protocol == crate::protocol::ids::OPENAI_RESPONSES_V1 {
+            crate::protocol::codec::openai::responses::normalize_function_tool_defaults(
+                &mut raw_body,
+            );
+            // sub2api Fast 模式：缺 service_tier 时补 priority（Responses 直通路径）
+            maybe_inject_openai_fast_mode(&mut raw_body, ctx.provider, ctx.protocol);
+            // Codex 消费级上游：剥离其拒绝的 Responses 参数（Responses 直通路径）
+            maybe_sanitize_codex_consumer_request(&mut raw_body, ctx.provider);
+            // Codex 消费级上游：剥离 reasoning 项的非空 content（Responses 直通路径）
+            sanitize_codex_reasoning_content(&mut raw_body, ctx.provider);
+            // Codex 消费级上游：规范化外来工具调用 ID 前缀（Responses 直通路径）
+            sanitize_codex_tool_call_ids(&mut raw_body, ctx.provider);
+            // 供应商 effort 方言（Responses 直通路径）：grok 对 max 是 400 硬拒
+            // （线上事故 65fffc9a），none/off 同样拒绝——此前只挂在 IR 转码与
+            // Chat 透传两路，Responses 直通漏挂。
+            apply_vendor_effort_policy(&mut raw_body, ctx.provider);
+        }
+        if ctx.protocol == crate::protocol::ids::ANTHROPIC_MESSAGES_2023_06_01 {
+            // Anthropic 直通路径：Claude 5.5 系列把经典 thinking.type=enabled
+            // 逐出契约（线上 400，请求 b0500316，UUAPI claude-sonnet-5-5），
+            // 剥除整字段退回自适应思考。模型已在上方改写为 actual_model，
+            // 门控按上游真实模型名判定；其余 vendor 方言分支对 Anthropic
+            // wire 形态（无 reasoning_effort 键）均为 no-op。
+            apply_vendor_effort_policy(&mut raw_body, ctx.provider);
+        }
     }
 
     let mut headers = if ctx.disable_default_auth {
@@ -825,6 +833,15 @@ pub async fn passthrough_run(
     } else {
         vendor.auth_headers(&vendor_ctx)
     };
+
+    if nyro_relay && is_stream {
+        // Native SSE has no decompression/re-encoding leg. Match the compat
+        // transport's identity request rather than inviting compressed events.
+        headers.insert(
+            reqwest::header::ACCEPT_ENCODING,
+            reqwest::header::HeaderValue::from_static("identity"),
+        );
+    }
 
     // Anthropic-family egress: rewrite Bearer → x-api-key (mirrors build_request).
     if !ctx.disable_default_auth
