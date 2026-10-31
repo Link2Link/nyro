@@ -67,6 +67,71 @@ pub(super) fn is_health_failure(status: u16) -> bool {
     is_retryable(status)
 }
 
+/// Metadata that survives a same-protocol Nyro relay. The local response owns
+/// framing, representation headers and browser security policy: JSON may have
+/// been reserialized (or a JSON stream fallback converted to SSE), so upstream
+/// lengths, encodings and validators cannot describe the delivered bytes.
+/// Credentials/cookies belong to the remote gateway, not this origin.
+pub(super) fn forwarded_response_metadata(headers: &ReqwestHeaderMap) -> ReqwestHeaderMap {
+    let mut entries = headers
+        .iter()
+        .map(|(name, value)| {
+            nyro_ccswitch_compat::Header::new(
+                name.as_str(),
+                bytes::Bytes::copy_from_slice(value.as_bytes()),
+            )
+        })
+        .collect();
+    nyro_ccswitch_compat::strip_hop_by_hop_headers(&mut entries);
+
+    let mut forwarded = ReqwestHeaderMap::new();
+    for entry in entries {
+        let name = entry.name.as_str();
+        if matches!(
+            name,
+            "content-type"
+                | "content-length"
+                | "content-encoding"
+                | "content-range"
+                | "accept-ranges"
+                | "etag"
+                | "content-md5"
+                | "digest"
+                | "content-digest"
+                | "repr-digest"
+                | "authorization"
+                | "www-authenticate"
+                | "authentication-info"
+                | "cookie"
+                | "set-cookie"
+                | "set-cookie2"
+                | "x-api-key"
+                | "x-goog-api-key"
+                | "api-key"
+                | "x-auth-token"
+                | "x-access-token"
+                | "x-refresh-token"
+                | "access-token"
+                | "refresh-token"
+                | "clear-site-data"
+                | "strict-transport-security"
+                | "content-security-policy"
+                | "content-security-policy-report-only"
+        ) || name.starts_with("access-control-")
+            || name.ends_with("-api-key")
+        {
+            continue;
+        }
+        if let (Ok(name), Ok(value)) = (
+            ReqwestHeaderName::from_bytes(name.as_bytes()),
+            ReqwestHeaderValue::from_bytes(&entry.value),
+        ) {
+            forwarded.append(name, value);
+        }
+    }
+    forwarded
+}
+
 // ── Runtime-binding extra headers ─────────────────────────────────────────────
 
 pub(super) fn runtime_binding_headers(
@@ -247,6 +312,102 @@ mod tests {
         // retryable status belong to the request, not the credential.
         for status in [400, 402, 404, 408, 409, 413, 422, 429, 500, 502, 503] {
             assert!(!is_credential_rejection(status), "status {status}");
+        }
+    }
+
+    #[test]
+    fn response_metadata_preserves_diagnostics_and_repeated_values() {
+        let mut upstream = HeaderMap::new();
+        upstream.insert("retry-after", HeaderValue::from_static("7"));
+        upstream.insert("x-request-id", HeaderValue::from_static("remote-request"));
+        upstream.insert("x-ratelimit-remaining", HeaderValue::from_static("42"));
+        upstream.insert("cache-control", HeaderValue::from_static("no-store"));
+        upstream.append("warning", HeaderValue::from_static("199 first"));
+        upstream.append("warning", HeaderValue::from_static("299 second"));
+
+        let metadata = forwarded_response_metadata(&upstream);
+        assert_eq!(metadata["retry-after"], "7");
+        assert_eq!(metadata["x-request-id"], "remote-request");
+        assert_eq!(metadata["x-ratelimit-remaining"], "42");
+        assert_eq!(metadata["cache-control"], "no-store");
+        assert_eq!(
+            metadata
+                .get_all("warning")
+                .iter()
+                .map(|value| value.to_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["199 first", "299 second"]
+        );
+    }
+
+    #[test]
+    fn response_metadata_drops_transport_representation_and_sensitive_headers() {
+        let mut upstream = HeaderMap::new();
+        let dropped = [
+            "keep-alive",
+            "proxy-authenticate",
+            "transfer-encoding",
+            "trailer",
+            "upgrade",
+            "content-type",
+            "content-length",
+            "content-encoding",
+            "content-range",
+            "accept-ranges",
+            "etag",
+            "digest",
+            "content-md5",
+            "content-digest",
+            "repr-digest",
+            "authorization",
+            "www-authenticate",
+            "authentication-info",
+            "cookie",
+            "set-cookie",
+            "set-cookie2",
+            "x-api-key",
+            "x-goog-api-key",
+            "x-access-token",
+            "clear-site-data",
+            "strict-transport-security",
+            "content-security-policy",
+            "access-control-allow-origin",
+            "access-control-allow-credentials",
+            "x-first-hop",
+            "x-second-hop",
+        ];
+        for name in dropped {
+            upstream.insert(name, HeaderValue::from_static("must-not-forward"));
+        }
+        upstream.append(
+            "connection",
+            HeaderValue::from_static(" X-First-Hop , keep-alive"),
+        );
+        upstream.append("connection", HeaderValue::from_static("x-second-hop"));
+        upstream.insert("retry-after", HeaderValue::from_static("7"));
+
+        let metadata = forwarded_response_metadata(&upstream);
+        assert_eq!(
+            metadata.len(),
+            1,
+            "unexpected forwarded headers: {metadata:?}"
+        );
+        assert_eq!(metadata["retry-after"], "7");
+    }
+
+    #[test]
+    fn response_metadata_keeps_local_content_type_when_merged() {
+        let mut upstream = HeaderMap::new();
+        upstream.insert("content-type", HeaderValue::from_static("text/html"));
+        upstream.insert("content-length", HeaderValue::from_static("999"));
+        upstream.insert("x-request-id", HeaderValue::from_static("remote"));
+        for content_type in ["application/json", "text/event-stream"] {
+            let mut local = HeaderMap::new();
+            local.insert("content-type", HeaderValue::from_static(content_type));
+            local.extend(forwarded_response_metadata(&upstream));
+            assert_eq!(local["content-type"], content_type);
+            assert!(!local.contains_key("content-length"));
+            assert_eq!(local["x-request-id"], "remote");
         }
     }
 

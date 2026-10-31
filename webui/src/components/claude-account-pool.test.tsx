@@ -1,11 +1,10 @@
-import { doesNotMatch, equal, match } from "node:assert/strict";
+import { deepEqual, doesNotMatch, equal, match } from "node:assert/strict";
 import { test } from "node:test";
 import { renderToStaticMarkup } from "react-dom/server";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { LocaleProvider } from "../lib/i18n";
 import { newDevinPoolConfig, type AccountPoolView, type PoolQuotaWindow, type ProviderAccountView } from "../lib/devin-account-pool";
 import type { AccountUsageStats, Provider } from "../lib/types";
-import { accountUsagePeriodStart } from "../lib/account-usage-stats";
 import { AccountPoolSettings } from "./devin-pool-settings";
 import { ClaudeAccountPoolCard, ClaudeAccountPoolPanel, ClaudeAccountUsage, ClaudePoolSummary } from "./claude-account-pool";
 import { ClaudeAccountLogin } from "./claude-account-login";
@@ -35,7 +34,7 @@ const provider: Provider = {
 function panel(value = pool, card = false, stats?: AccountUsageStats[], inspect?: (client: QueryClient) => void) {
   const client = new QueryClient();
   client.setQueryData(["provider-account-pool", "claude"], value);
-  if (stats) client.setQueryData(["provider-account-usage-stats", "claude", accountUsagePeriodStart("week", Date.now())], stats);
+  if (stats) client.setQueryData(["provider-account-usage-stats", "claude"], stats);
   try {
     const html = renderToStaticMarkup(<QueryClientProvider client={client}><LocaleProvider>
       {card ? <ClaudeAccountPoolCard provider={provider} /> : <ClaudeAccountPoolPanel provider={provider} />}
@@ -224,16 +223,21 @@ test("Claude window names are escaped and Chinese labels are explicit", () => {
   doesNotMatch(unsafe, /<script>/i); match(unsafe, /&lt;Script&gt;/);
 });
 
-test("Claude management preserves retained and calendar-week usage stats without Kiro units", () => {
+test("Claude management preserves retained and actual reset-cycle usage stats without Kiro units", () => {
   const zero = { total_tokens: 0, request_count: 0, equivalent_costs: [], unpriced_request_count: 0 };
-  const stats: AccountUsageStats[] = [{ account_id: "account-a", all_time: { ...zero, total_tokens: 2_500_000, request_count: 1, equivalent_costs: [{ currency: "USD", total_cost: 7.5, priced_request_count: 1 }] }, period: zero }];
+  const stats: AccountUsageStats[] = [{ account_id: "account-a", all_time: { ...zero, total_tokens: 2_500_000, request_count: 1, equivalent_costs: [{ currency: "USD", total_cost: 7.5, priced_request_count: 1 }] }, period: zero, period_start: Date.now() - 86_400_000, period_end: Date.now() + 518_400_000 }];
   const html = panel(pool, false, stats);
-  match(html, /data-account-usage="account-a"[\s\S]*2\.50M[\s\S]*\$7\.50[\s\S]*This week[\s\S]*\$0\.00/);
+  match(html, /data-account-usage="account-a"[\s\S]*2\.50M[\s\S]*\$7\.50[\s\S]*Current cycle[\s\S]*\$0\.00/);
   match(html, />Remove<\/button><\/div><div data-account-usage=/);
-  match(html, /calendar week starts Monday/);
+  match(html, /actual reset cycle, not a calendar week or month/);
   doesNotMatch(html, /This month|Kiro tokens|Loading totals/);
   panel(pool, true, undefined, (client) => equal(client.getQueryCache().findAll({ queryKey: ["provider-account-usage-stats"] }).length, 0));
-  panel({ ...pool, accounts: [account, { ...account, account_id: "account-b" }] }, false, undefined, (client) => equal(client.getQueryCache().findAll({ queryKey: ["provider-account-usage-stats"] }).length, 1));
+  panel({ ...pool, accounts: [account, { ...account, account_id: "account-b" }] }, false, undefined, (client) => {
+    const queries = client.getQueryCache().findAll({ queryKey: ["provider-account-usage-stats"] });
+    equal(queries.length, 1);
+    deepEqual(queries[0].queryKey, ["provider-account-usage-stats", "claude"]);
+    equal((queries[0].options as { refetchInterval?: number }).refetchInterval, 60_000);
+  });
 });
 
 test("Claude login explains browser code exchange and exact target, not Devin token import", () => {

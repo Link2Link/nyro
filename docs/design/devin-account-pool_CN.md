@@ -151,9 +151,9 @@ Devin · 混合                2个Pro等价账号 · 1个Max · 3个可用
 
 ### 每账号网关历史用量
 
-每个账号的操作按钮下方增加紧凑统计块，分别显示 **全部记录** 与 **本周** 的总 Token 和等价 API 估算金额。本周从浏览器本地时区的周一 00:00 开始，不跟随上游周额度重置。按精确 Provider 下的 `route_decision.account.account_id` 归属统计保留的上游尝试（包括重试和失败）；修改别名、优先级、启停和刷新凭据不会重置归属。旧日志缺少账号 ID 时不猜测或分摊。输入 Token 已含缓存读取，总 Token 仅为输入加输出。
+每个账号的操作按钮下方增加紧凑统计块，分别显示 **全部记录** 与 **本周期** 的总 Token 和等价 API 估算金额。周期以每个账号自己的上游重置时间为锚点：Devin、Claude 从周重置时间向前推 7 天；Kiro 从月重置时间向前推一个日历月（按 UTC 保留时分秒，月末日期截到上月最后一天）。不再使用浏览器本地自然周/月，也不共用全池重置时间。Kiro 优先使用基础资源重置时间、全局时间兜底，且各资源须一致；赠送/试用到期时间不作为周期重置。按精确 Provider 下的 `route_decision.account.account_id` 归属统计保留的上游尝试（包括重试和失败）；修改别名、优先级、启停和刷新凭据不会重置归属。旧日志缺少账号 ID 时不猜测或分摊。输入 Token 已含缓存读取，总 Token 仅为输入加输出。
 
-`GET /api/v1/providers/:id/accounts/usage-stats?period_start=<毫秒时间戳>`（桌面命令 `get_provider_account_usage_stats`）为每个当前账号返回 `account_id`、`all_time`、`period`。两个窗口均包含 `total_tokens`、`request_count`、按原始币种分组的 `equivalent_costs`、`unpriced_request_count`。窗口截止到服务端采集的当前时间；客户端传入的 `period_start` 必须介于零和当前时间之间。仅展开的管理面板批量查询所有账号，每分钟刷新；该接口不查询上游，也不影响调度。
+`GET /api/v1/providers/:id/accounts/usage-stats`（桌面命令 `get_provider_account_usage_stats`，仅传 `id`）为每个当前账号返回 `account_id`、`all_time`、可空的 `period`、可空的毫秒时间戳 `period_start`/`period_end`。统计包含 `total_tokens`、`request_count`、按原始币种分组的 `equivalent_costs`、`unpriced_request_count`。后端根据已保存的额度观察推导左闭右开周期 `[period_start, period_end)`，且日志读取不超过采集的当前时间。重置时间缺失、无效、有歧义或已过期时，周期字段为 null；界面显示破折号并提示刷新用量，缓存周期到期时也如此。不将旧重置时间自动滚动到下一期，也不回退自然周/月。仅展开的管理面板批量查询所有账号，每分钟刷新；该接口不查询上游，也不影响调度。三个 SQL 后端一次扫描日志，同时累计全部记录与逐账号周期，再应用共享计价引擎。
 
 金额复用当前手工价/目录价，并非订阅扣费或历史账单；缺价显示不可用，部分估算会标注，币种不直接混加。这是 **保留日志累计** 而非永久台账：删除/清理日志会改变两个窗口，缺失的上游用量无法还原。SQLite、PostgreSQL、MySQL 复用现有日志，不改数据库结构；纯内存模式没有保留日志用量。
 

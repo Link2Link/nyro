@@ -153,6 +153,14 @@ pub(super) async fn handle_stream(
 
     let (resp, status) = call_result;
     let upstream_hdrs_str = headers_to_json(resp.headers());
+    let nyro_passthrough = passthrough_resp
+        && ingress == egress
+        && crate::provider::nyro_gateway::is_nyro_gateway(call_ctx.provider);
+    let response_metadata = if nyro_passthrough {
+        super::util::forwarded_response_metadata(resp.headers())
+    } else {
+        ReqwestHeaderMap::new()
+    };
 
     if status >= 400 {
         let err_body: Value = resp
@@ -172,6 +180,7 @@ pub(super) async fn handle_stream(
             Json(&err_body),
         )
             .into_response();
+        response.headers_mut().extend(response_metadata);
         super::mark_entitlement_refusal(&mut response, status, &err_body);
         return response;
     }
@@ -181,6 +190,7 @@ pub(super) async fn handle_stream(
     // mutations (passthrough_resp=true). Upstream bytes are forwarded verbatim;
     // a side-channel parser accumulates usage stats for logging only.
     if passthrough_resp {
+        let client_status = if nyro_passthrough { status } else { 200 };
         // Pre-commit hold: do not commit the 200 on the first framing byte.
         // Wait for the first payload event so a retryable in-stream failure
         // (`server_error` after only `response.created`/keep-alives) fails
@@ -384,13 +394,13 @@ pub(super) async fn handle_stream(
             }
 
             log_pt
-                .status(200)
-                .upstream_status(200)
+                .status(client_status)
+                .upstream_status(client_status as i32)
                 .usage(ai_resp.usage.clone())
                 .maybe_error(stream_error)
                 .with_upstream_request(upstream_req_hdrs_pt, upstream_req_body_pt)
                 .with_upstream_response(
-                    200,
+                    client_status as i32,
                     upstream_hdrs_pt,
                     Some(raw_sse.clone()),
                     Some(upstream_latency_ms),
@@ -402,13 +412,14 @@ pub(super) async fn handle_stream(
 
         let stream = ReceiverStream::new(pt_rx);
         let body = Body::from_stream(stream);
-        let response = Response::builder()
-            .status(StatusCode::OK)
+        let mut response = Response::builder()
+            .status(StatusCode::from_u16(client_status).unwrap_or(StatusCode::OK))
             .header(header::CONTENT_TYPE, "text/event-stream")
             .header(header::CACHE_CONTROL, "no-cache")
             .header(header::CONNECTION, "keep-alive")
             .body(body)
             .unwrap();
+        response.headers_mut().extend(response_metadata);
         return response;
     }
 

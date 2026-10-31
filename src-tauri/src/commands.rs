@@ -397,10 +397,9 @@ pub async fn get_provider_account_pool(
 pub async fn get_provider_account_usage_stats(
     gw: State<'_, Gateway>,
     id: String,
-    period_start: i64,
 ) -> Result<Vec<nyro_core::admin::AccountUsageStats>, String> {
     gw.admin()
-        .get_provider_account_usage_stats(&id, period_start)
+        .get_provider_account_usage_stats(&id)
         .await
         .map_err(|e| e.to_string())
 }

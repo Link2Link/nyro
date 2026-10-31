@@ -1,11 +1,10 @@
-import { doesNotMatch, equal, match } from "node:assert/strict";
+import { deepEqual, doesNotMatch, equal, match } from "node:assert/strict";
 import { test } from "node:test";
 import { renderToStaticMarkup } from "react-dom/server";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { LocaleProvider } from "../lib/i18n";
 import { newDevinPoolConfig, type AccountPoolView, type ProviderAccountView } from "../lib/devin-account-pool";
 import type { AccountUsageStats, Provider } from "../lib/types";
-import { accountUsagePeriodStart } from "../lib/account-usage-stats";
 import { AccountPoolSettings } from "./devin-pool-settings";
 import { KiroAccountPoolCard, KiroAccountPoolPanel, KiroAccountUsage, KiroPoolUsage } from "./kiro-account-pool";
 import { KiroAccountLogin } from "./kiro-account-login";
@@ -35,7 +34,7 @@ const provider: Provider = {
 function panel(value = pool, card = false, stats?: AccountUsageStats[], inspect?: (client: QueryClient) => void) {
   const client = new QueryClient();
   client.setQueryData(["provider-account-pool", "kiro"], value);
-  if (stats) client.setQueryData(["provider-account-usage-stats", "kiro", accountUsagePeriodStart("month", Date.now())], stats);
+  if (stats) client.setQueryData(["provider-account-usage-stats", "kiro"], stats);
   try {
     const html = renderToStaticMarkup(<QueryClientProvider client={client}><LocaleProvider>
       {card ? <KiroAccountPoolCard provider={provider} /> : <KiroAccountPoolPanel provider={provider} />}
@@ -45,14 +44,14 @@ function panel(value = pool, card = false, stats?: AccountUsageStats[], inspect?
   } finally { client.clear(); }
 }
 
-test("Kiro management shows retained and calendar-month account totals beneath actions", () => {
+test("Kiro management shows retained and actual reset-cycle account totals beneath actions", () => {
   const zero = { total_tokens: 0, request_count: 0, equivalent_costs: [], unpriced_request_count: 0 };
-  const stats: AccountUsageStats[] = [{ account_id: "account-a", all_time: { ...zero, total_tokens: 2_500_000, request_count: 1, equivalent_costs: [{ currency: "USD", total_cost: 7.5, priced_request_count: 1 }] }, period: zero }];
+  const stats: AccountUsageStats[] = [{ account_id: "account-a", all_time: { ...zero, total_tokens: 2_500_000, request_count: 1, equivalent_costs: [{ currency: "USD", total_cost: 7.5, priced_request_count: 1 }] }, period: zero, period_start: Date.now() - 86_400_000, period_end: Date.now() + 2_505_600_000 }];
   const html = panel(pool, false, stats);
-  match(html, /data-account-usage="account-a"[\s\S]*2\.50M[\s\S]*\$7\.50[\s\S]*This month[\s\S]*\$0\.00/);
+  match(html, /data-account-usage="account-a"[\s\S]*2\.50M[\s\S]*\$7\.50[\s\S]*Current cycle[\s\S]*\$0\.00/);
   match(html, />Remove<\/button><\/div><div data-account-usage=/);
   match(html, /Kiro tokens are estimates, not actual credit usage/);
-  match(html, /calendar month starts on the 1st/);
+  match(html, /actual reset cycle, not a calendar week or month/);
   equal((html.match(/<th class=/g) ?? []).length, 4);
   doesNotMatch(html, /This week|Loading totals/);
 });
@@ -62,7 +61,7 @@ test("Kiro usage query stays inside management and is shared across all account 
   panel({ ...pool, accounts: [account, { ...account, account_id: "account-b" }] }, false, undefined, (client) => {
     const queries = client.getQueryCache().findAll({ queryKey: ["provider-account-usage-stats"] });
     equal(queries.length, 1);
-    equal(queries[0].queryKey[2], accountUsagePeriodStart("month", Date.now()));
+    deepEqual(queries[0].queryKey, ["provider-account-usage-stats", "kiro"]);
     equal((queries[0].options as { refetchInterval?: number }).refetchInterval, 60_000);
   });
 });

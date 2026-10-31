@@ -95,6 +95,14 @@ pub(super) async fn handle_non_stream(
 
     let (resp, status, upstream_headers) = call_result;
     let upstream_hdrs_str = headers_to_json(&upstream_headers);
+    let response_metadata = if passthrough_resp
+        && ingress == egress
+        && crate::provider::nyro_gateway::is_nyro_gateway(call_ctx.provider)
+    {
+        super::util::forwarded_response_metadata(&upstream_headers)
+    } else {
+        ReqwestHeaderMap::new()
+    };
 
     if status >= 400 {
         let body_str = crate::logging::payload::capture_json(&resp, true).body;
@@ -115,6 +123,7 @@ pub(super) async fn handle_non_stream(
             Json(&resp),
         )
             .into_response();
+        response.headers_mut().extend(response_metadata);
         super::mark_entitlement_refusal(&mut response, status, &resp);
         return response;
     }
@@ -135,11 +144,13 @@ pub(super) async fn handle_non_stream(
             )
             .with_client_response(None, resp_str)
             .emit();
-        return (
+        let mut response = (
             StatusCode::from_u16(status).unwrap_or(StatusCode::OK),
             Json(resp),
         )
             .into_response();
+        response.headers_mut().extend(response_metadata);
+        return response;
     }
 
     // PassThrough: Native protocol + no response mutations → forward upstream JSON verbatim,
@@ -182,11 +193,13 @@ pub(super) async fn handle_non_stream(
             )
             .with_client_response(None, resp_str)
             .emit();
-        return (
+        let mut response = (
             StatusCode::from_u16(status).unwrap_or(StatusCode::OK),
             Json(resp),
         )
             .into_response();
+        response.headers_mut().extend(response_metadata);
+        return response;
     }
 
     // Parse response via ProviderAdapter.
