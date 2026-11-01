@@ -948,7 +948,7 @@ Provider 通过 `models_source`（预设 channel JSON 中为 `modelsSource`）�
 - **Desktop 版**：检测到 `window.__TAURI_INTERNALS__` 时走 Tauri IPC（`invoke(cmd, args)`，支持 AbortSignal）
 - **Server 版**：经 `resolveHTTP` 将同名 cmd 映射到 `/api/v1/...` REST（未映射的 cmd 回落为 `POST /api/v1/<cmd>`）；携带 `Authorization: Bearer <admin token>`，响应 `{data}` 解包、`{error}` 抛错；401 时先探测 `/api/v1/status` 再决定清除 token 并跳转 `/login`（`/login` 路由仅在非 Tauri 环境注册）
 
-**页面（`webui/src/pages/`）：** dashboard · connect · providers · models（`models-route.tsx` 包装）· available-models · api-keys · logs · stats · performance · model-ratings · extensions · settings · login（仅 HTTP 模式）
+**页面（`webui/src/pages/`）：** dashboard · connect · providers · models（`models-route.tsx` 包装）· available-models · api-keys · logs · stats · performance · system-monitor（[系统资源监控](<system-monitor_CN.md>)） · model-ratings · extensions · settings · login（仅 HTTP 模式）
 
 **技术栈：**
 

@@ -1,7 +1,7 @@
 use nyro_core::Gateway;
 use nyro_core::admin::{
     AccountPoolView, CopyProviderOptions, DevinPoolConfig, ModelPerformanceResponse,
-    OAuthAccountUpdate, ProviderAccountView, ProviderOAuthStatusData, SetModelRating,
+    OAuthAccountUpdate, ProviderAccountView, ProviderOAuthStatusData, SetModelRating, SystemStatus,
     TokenPriceConfig, TokenPriceInput,
 };
 use nyro_core::auth::{AuthExchangeInput, AuthSessionInitData, AuthSessionStatusData};
@@ -866,6 +866,14 @@ pub async fn get_gateway_status(gw: State<'_, Gateway>) -> Result<serde_json::Va
         "status": "running",
         "proxy_port": gw.config.proxy_port,
     }))
+}
+
+#[tauri::command]
+pub async fn get_system_status(gw: State<'_, Gateway>) -> Result<SystemStatus, String> {
+    gw.admin()
+        .get_system_status()
+        .await
+        .map_err(|e| e.to_string())
 }
 
 // ── Config Import/Export ──

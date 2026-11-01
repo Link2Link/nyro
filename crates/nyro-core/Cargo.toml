@@ -42,6 +42,7 @@ inventory = "0.3"
 gcp_auth = "0.12.6"
 minisign-verify = "0.2.5"
 semver = "1.0.28"
+sysinfo = { version = "0.33", default-features = false, features = ["system", "disk", "network"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

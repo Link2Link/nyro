@@ -38,6 +38,31 @@ node --test "$test_dir/format.test.js" "$test_dir/model-ratings.test.js" \
   "$test_dir/provider-icon-resolve.test.js"
 ```
 
+## System monitor
+
+```bash
+(cd webui && npm run build)
+node tests/webui/system-monitor-smoke.mjs
+```
+
+This dependency-free Chromium/CDP test fulfills all navigation, assets, and API
+requests from the built frontend and deterministic fixtures. It does not start an
+HTTP server, access a running Nyro instance, or send monitoring traffic externally.
+It covers EN/ZH, light/dark, desktop/mobile layouts, warm-up unknown values,
+resource/network summaries, polling/pause/manual refresh, and error/retry states.
+Screenshots and a JSON report are saved in a fresh temporary directory.
+
+Helper tests:
+
+```bash
+cd webui
+test_dir=$(mktemp -d /tmp/nyro-system-monitor-unit.XXXXXX)
+./node_modules/.bin/tsc src/lib/system-monitor.test.ts --outDir "$test_dir" \
+  --module commonjs --moduleResolution node --target es2020 \
+  --esModuleInterop --skipLibCheck
+node --test "$test_dir/system-monitor.test.js"
+```
+
 ## Token usage and equivalent API value
 
 `token-usage-smoke.cjs` tests the built frontend with intercepted deterministic

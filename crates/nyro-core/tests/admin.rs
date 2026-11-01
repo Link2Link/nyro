@@ -11,6 +11,83 @@ const FAR_FUTURE_RFC3339: &str = "2099-01-01T00:00:00Z";
 const CODEX_RUNTIME_URL: &str = "https://chatgpt.com/backend-api/codex";
 
 #[tokio::test]
+async fn system_status_public_api_shares_cache_across_admin_handles() -> anyhow::Result<()> {
+    let gw = build_gateway().await?;
+    let first_admin = gw.admin();
+    let second_admin = gw.clone().admin();
+    let (first, second) = tokio::join!(
+        first_admin.get_system_status(),
+        second_admin.get_system_status()
+    );
+    let first = first?;
+    assert_eq!(first, second?);
+    assert_eq!(first.process.pid, std::process::id());
+    assert!(first.sampled_at > 0);
+    assert_eq!(first.sample_interval_seconds, None);
+    assert_eq!(first.cpu.usage_percent, None);
+    assert!(first.cpu.cores.is_empty());
+    assert_eq!(first.process.cpu_percent, None);
+    assert!(first.networks.iter().all(|network| {
+        network.receive_bytes_per_second.is_none() && network.transmit_bytes_per_second.is_none()
+    }));
+
+    // Exercise a real second refresh through the public API, not a synthetic
+    // timestamp that could claim sysinfo's CPU counters had warmed up.
+    tokio::time::sleep(std::time::Duration::from_millis(2100)).await;
+    let warmed = gw.admin().get_system_status().await?;
+    assert!(warmed.sampled_at > first.sampled_at);
+    assert!(
+        warmed
+            .sample_interval_seconds
+            .is_some_and(|seconds| seconds >= 2.0)
+    );
+    if sysinfo::IS_SUPPORTED_SYSTEM && warmed.cpu.logical_cores > 0 {
+        assert!(
+            warmed
+                .cpu
+                .usage_percent
+                .is_some_and(|usage| (0.0..=100.0).contains(&usage))
+        );
+        assert_eq!(warmed.cpu.cores.len(), warmed.cpu.logical_cores);
+        assert!(
+            warmed
+                .cpu
+                .cores
+                .iter()
+                .all(|usage| (0.0..=100.0).contains(usage))
+        );
+    }
+    for network in &warmed.networks {
+        for rate in [
+            network.receive_bytes_per_second,
+            network.transmit_bytes_per_second,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            assert!(rate.is_finite() && rate >= 0.0);
+        }
+        if let Some(previous) = first
+            .networks
+            .iter()
+            .find(|previous| previous.name == network.name)
+        {
+            if network.received_bytes >= previous.received_bytes {
+                assert!(network.receive_bytes_per_second.is_some());
+            }
+            if network.transmitted_bytes >= previous.transmitted_bytes {
+                assert!(network.transmit_bytes_per_second.is_some());
+            }
+        }
+    }
+    if let Some(usage) = warmed.process.cpu_percent {
+        assert!((0.0..=100.0).contains(&usage));
+    }
+    assert_eq!(warmed.process.pid, first.process.pid);
+    Ok(())
+}
+
+#[tokio::test]
 async fn copy_provider_creates_disabled_provider_with_copy_suffix() -> anyhow::Result<()> {
     let gw = build_gateway().await?;
     let original = gw
