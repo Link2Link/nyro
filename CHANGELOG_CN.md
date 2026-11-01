@@ -4,6 +4,17 @@ Nyro 的所有重要变更均记录在此文件中。
 
 ---
 
+## v2.1.20
+
+> 发布于 2026-11-01
+
+#### 修复
+
+- **历史工具描述更新兼容**：Codex Desktop Responses 请求中，多次 `additional_tools` 声明若仅修改同一工具的 description，不再因 `conflicting tool definitions for 'functions.exec'` 被拒绝。匹配的声明采用最新描述，支持空字符串或省略描述；参数 schema、strict 模式与 custom grammar 仍须一致，不同 namespace 的工具保持隔离（#8）
+- **工具合并回归保障**：新增连续历史更新、描述增删、namespace 隔离、Responses 与 Chat Completions 编码，以及不兼容契约拒绝测试，包含参数 schema 内部 description 变化仍应拒绝的边界；无需数据库迁移（#8）
+
+---
+
 ## v2.1.19
 
 > 发布于 2026-11-01

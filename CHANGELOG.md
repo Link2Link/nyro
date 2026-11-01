@@ -4,6 +4,17 @@ All notable changes to Nyro will be documented in this file.
 
 ---
 
+## v2.1.20
+
+> Released on 2026-11-01
+
+#### Fixes
+
+- **Historical tool description updates**: Codex Desktop Responses requests no longer fail with `conflicting tool definitions for 'functions.exec'` when repeated `additional_tools` declarations change only a tool's description. Matching declarations retain the latest description, including empty or omitted text, while parameter schemas, strict mode and custom grammars must still agree; tools in different namespaces remain isolated (#8)
+- **Tool-merge regression coverage**: added tests for repeated historical updates, description addition/removal, namespace isolation, Responses and Chat Completions encoding, and rejection of incompatible contracts, including description changes nested inside a parameter schema. No database migration is required (#8)
+
+---
+
 ## v2.1.19
 
 > Released on 2026-11-01

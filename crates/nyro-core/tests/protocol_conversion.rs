@@ -1488,9 +1488,14 @@ fn responses_namespaced_tools_merge_by_qualified_identity() {
     });
     let body = serde_json::json!({
         "model": "gpt-5.6",
-        "tools": [crm.clone(), support],
+        "tools": [crm.clone(), support, leaf("Unnamespaced lookup")],
         "input": [
             {"type": "additional_tools", "role": "developer", "tools": [crm]},
+            {"type": "additional_tools", "role": "developer", "tools": [{
+                "type": "namespace",
+                "name": "crm",
+                "tools": [leaf("Updated CRM lookup")]
+            }]},
             {"type": "message", "role": "user", "content": "lookup"}
         ]
     });
@@ -1499,13 +1504,186 @@ fn responses_namespaced_tools_merge_by_qualified_identity() {
         .decode_request(body)
         .expect("qualified tool identities should merge");
     let tools = request.tools.expect("namespaced tools");
-    assert_eq!(tools.len(), 2);
-    assert!(tools.iter().any(|tool| {
-        tool.namespace.as_deref() == Some("crm") && tool.name == "lookup_customer"
-    }));
-    assert!(tools.iter().any(|tool| {
-        tool.namespace.as_deref() == Some("support") && tool.name == "lookup_customer"
-    }));
+    assert_eq!(tools.len(), 3);
+    for (namespace, description) in [
+        (Some("crm"), "Updated CRM lookup"),
+        (Some("support"), "Support lookup"),
+        (None, "Unnamespaced lookup"),
+    ] {
+        let tool = tools
+            .iter()
+            .find(|tool| tool.namespace.as_deref() == namespace && tool.name == "lookup_customer")
+            .expect("separate qualified identity");
+        assert_eq!(tool.description.as_deref(), Some(description));
+    }
+}
+
+// Regression for request 525ada65-0dcd-4d30-94e6-623ac2a17747: Codex
+// Desktop replayed two functions.exec declarations with identical grammars but
+// different descriptions. Historical descriptions are updates, not conflicts.
+#[test]
+fn responses_historical_additional_tools_use_latest_description() {
+    let grammar = serde_json::json!({
+        "type": "grammar",
+        "syntax": "lark",
+        "definition": "start: source\nsource: /.+/"
+    });
+    let declaration = |description: &str| {
+        serde_json::json!({
+            "type": "additional_tools",
+            "role": "developer",
+            "tools": [{
+                "type": "namespace",
+                "name": "functions",
+                "tools": [{
+                    "type": "custom",
+                    "name": "exec",
+                    "description": description,
+                    "format": grammar
+                }]
+            }]
+        })
+    };
+    let body = serde_json::json!({
+        "model": "gpt-6-luna",
+        "input": [
+            declaration("Original tool instructions"),
+            {"type": "message", "role": "user", "content": "inspect the project"},
+            declaration("Updated tool instructions"),
+            declaration("Latest tool instructions"),
+            {"type": "message", "role": "user", "content": "continue"}
+        ]
+    });
+
+    let request = ResponsesDecoder
+        .decode_request(body.clone())
+        .expect("description-only updates should merge");
+    let tools = request.tools.as_ref().expect("merged tools");
+    assert_eq!(tools.len(), 1);
+    assert_eq!(tools[0].name, "exec");
+    assert_eq!(tools[0].namespace.as_deref(), Some("functions"));
+    assert_eq!(
+        tools[0].description.as_deref(),
+        Some("Latest tool instructions")
+    );
+    assert_eq!(tools[0].custom_format(), Some(&grammar));
+
+    let (encoded, _) = ResponsesEncoder
+        .encode_request(&request)
+        .expect("re-encode updated custom tool");
+    assert_eq!(encoded["tools"].as_array().unwrap().len(), 1);
+    let exec = &encoded["tools"][0]["tools"][0];
+    assert_eq!(exec["description"], "Latest tool instructions");
+    assert_eq!(exec["format"], grammar);
+
+    let encoded = transcode_responses_to_openai_compatible(body);
+    assert_eq!(encoded["tools"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        encoded["tools"][0]["function"]["description"],
+        "Latest tool instructions"
+    );
+}
+
+#[test]
+fn responses_additional_function_tool_description_updates_include_removal() {
+    // The last declaration wins even when it explicitly clears or omits the
+    // description; no earlier description should be resurrected during merging.
+    for previous in [None, Some(""), Some("Original instructions")] {
+        for latest in [None, Some(""), Some("Latest instructions")] {
+            let tool = |description: Option<&str>| {
+                let mut tool = serde_json::json!({
+                    "type": "function",
+                    "name": "wait",
+                    "parameters": {"type": "object", "properties": {}},
+                    "strict": false
+                });
+                if let Some(description) = description {
+                    tool["description"] = description.into();
+                }
+                tool
+            };
+            let body = serde_json::json!({
+                "model": "gpt-5.6",
+                "tools": [tool(previous)],
+                "input": [
+                    {"type": "additional_tools", "tools": [tool(previous)]},
+                    {"type": "additional_tools", "tools": [tool(latest)]},
+                    {"type": "message", "role": "user", "content": "wait"}
+                ]
+            });
+            let request = ResponsesDecoder
+                .decode_request(body)
+                .expect("description updates must allow adding, clearing and removing text");
+            let tools = request.tools.expect("merged function tool");
+            assert_eq!(tools.len(), 1);
+            assert_eq!(tools[0].description.as_deref(), latest);
+            assert_eq!(tools[0].strict, Some(false));
+        }
+    }
+}
+
+#[test]
+fn responses_historical_additional_tools_still_reject_contract_changes() {
+    let function = serde_json::json!({
+        "type": "function",
+        "name": "wait",
+        "description": "Original instructions",
+        "parameters": {"type": "object", "properties": {"cell_id": {"type": "string"}}},
+        "strict": false
+    });
+    let custom = serde_json::json!({
+        "type": "custom",
+        "name": "exec",
+        "description": "Original instructions",
+        "format": {"type": "grammar", "syntax": "lark", "definition": "start: /.+/"}
+    });
+    for (original, field, value) in [
+        (
+            function.clone(),
+            "parameters",
+            serde_json::json!({"type": "object", "properties": {"timeout": {"type": "number"}}}),
+        ),
+        (
+            function.clone(),
+            "parameters",
+            serde_json::json!({
+                "type": "object",
+                "properties": {"cell_id": {"type": "string", "description": "Cell identifier"}}
+            }),
+        ),
+        (function, "strict", serde_json::json!(true)),
+        (
+            custom,
+            "format",
+            serde_json::json!({"type": "grammar", "syntax": "lark", "definition": "start: /[0-9]+/"}),
+        ),
+    ] {
+        let mut updated = original.clone();
+        updated["description"] = "Updated instructions".into();
+        updated[field] = value;
+        let body = serde_json::json!({
+            "model": "gpt-5.6",
+            "input": [
+                {"type": "additional_tools", "tools": [{
+                    "type": "namespace", "name": "functions", "tools": [original.clone()]
+                }]},
+                {"type": "additional_tools", "tools": [{
+                    "type": "namespace", "name": "functions", "tools": [updated]
+                }]},
+                {"type": "message", "role": "user", "content": "continue"}
+            ]
+        });
+        let error = ResponsesDecoder
+            .decode_request(body)
+            .expect_err("description updates must not hide incompatible tool contracts");
+        let name = original["name"].as_str().unwrap();
+        assert!(
+            error.to_string().contains(&format!(
+                "conflicting tool definitions for 'functions.{name}'"
+            )),
+            "{field}: unexpected error: {error:#}"
+        );
+    }
 }
 
 #[test]
