@@ -4,6 +4,24 @@ All notable changes to Nyro will be documented in this file.
 
 ---
 
+## v2.1.17
+
+> Released on 2026-11-01
+
+#### Features
+
+- **Per-account full-cycle API value estimates**: Devin, Kiro and Claude Code account-pool rows now show Estimated capacity below Current cycle. The estimate divides the recorded current-cycle equivalent API price by the account's used quota fraction to project total value at 100% usage, including usage so far rather than remaining balance. Devin and Claude use their main weekly quota; Kiro uses one resource's credit allowance, including active bonus/trial grants and excluding paid overage. Native currencies remain separate, and partial pricing is marked explicitly (#5)
+
+#### Improvements
+
+- **Conservative estimate availability**: unknown, zero, invalid, stale, expired or mismatched-cycle usage does not produce an estimate. Bilingual tooltips explain log coverage, model-mix and observation-time limits, including Kiro grants that may span cycles. Added calculation, rendering and three-pool integration regressions; no database migration or routing changes are required (#5)
+
+#### Fixes
+
+- **Bundled DSH usage-panel client**: synchronized the shipped client bundle with compact pool progress rows, striped unknown-usage placeholders, pending-refresh and partial-reset hints, and collapsible details (#5)
+
+---
+
 ## v2.1.16
 
 > Released on 2026-10-31

@@ -2,6 +2,7 @@ import { doesNotMatch, equal, match, ok } from "node:assert/strict";
 import { test } from "node:test";
 import { renderToStaticMarkup } from "react-dom/server";
 import type { AccountUsageStats, AccountUsageTotals } from "../lib/types";
+import type { ProviderAccountView } from "../lib/devin-account-pool";
 import { AccountUsageSummary } from "./account-usage-summary";
 
 const zero: AccountUsageTotals = { total_tokens: 0, request_count: 0, equivalent_costs: [], unpriced_request_count: 0 };
@@ -13,8 +14,9 @@ const props = { now: periodStart + 86_400_000, loading: false, error: false, loc
 const render = (value?: AccountUsageStats, overrides: Partial<Parameters<typeof AccountUsageSummary>[0]> = {}) =>
   renderToStaticMarkup(<AccountUsageSummary {...props} stats={value} {...overrides} />);
 
-// Only the four metric values; the surrounding labels/tooltips intentionally carry context.
-function values(html: string) { return [...html.matchAll(/<span class="[^"]*text-xs font-semibold[^>]*>(.*?)<\/span>/g)].map((match) => match[1]); }
+// Only the four recorded metric values; projections are checked separately below.
+function values(html: string) { return [...html.split("data-account-usage-estimate")[0].matchAll(/<span class="[^"]*text-xs font-semibold[^>]*>(.*?)<\/span>/g)].map((match) => match[1]); }
+function estimateValue(html: string) { return html.split("data-account-usage-estimate")[1]?.match(/<span class="[^"]*text-xs font-semibold[^>]*>(.*?)<\/span>/)?.[1]; }
 
 test("account metrics show retained and backend-defined current-cycle logs", () => {
   const html = render(stats);
@@ -137,6 +139,66 @@ test("Kiro token estimate warning uses an explicit prop, even with an unknown cy
   match(render(stats, { tokensEstimated: true }), /Kiro tokens are estimates, not actual credit usage/);
   match(render({ ...stats, period: null, period_start: null, period_end: null }, { tokensEstimated: true }), /Kiro tokens are estimates, not actual credit usage/);
   match(render(stats, { locale: "zh-CN", tokensEstimated: true }), /Kiro Token 为估算值，不代表实际 Credit 用量/);
+});
+
+const estimateAccount: ProviderAccountView = {
+  account_id: stats.account_id, provider_id: "p", label: "Account", is_enabled: true, priority: 0,
+  status: "connected", status_version: 1, verified_plan: null, identity_verified: true,
+  scheduling: "included", daily: null, weekly: { remaining_percent: 90, resets_at: new Date(periodEnd).toISOString() },
+  reserve_usd: null, observed_at: props.now, stale: false, updated_at: "",
+};
+const estimateProps = { account: estimateAccount, kind: "devin" as const };
+
+test("estimated capacity appears below the current cycle and projects price only with explanatory bilingual tooltips", () => {
+  const s = { ...stats, period: { ...priced, equivalent_costs: [{ currency: "USD", total_cost: 21.4, priced_request_count: 3 }] } };
+  for (const locale of ["en-US", "zh-CN"] as const) {
+    const html = render(s, { ...estimateProps, locale });
+    equal(estimateValue(html), "≈ $214.00");
+    match(html, locale === "zh-CN" ? />本周期<[\s\S]*>预估可用</ : />Current cycle<[\s\S]*>Estimated capacity</);
+    match(html, locale === "zh-CN" ? /包含已用部分，并非剩余余额/ : /includes usage so far, not remaining balance/);
+    match(html, locale === "zh-CN" ? /用于估算的已用比例：10%/ : /Used for projection: 10%/);
+    match(html, locale === "zh-CN" ? /仅估算等价 API 价格/ : /Equivalent API price projection only/);
+    equal(values(html)[3], "$21.40");
+  }
+});
+
+test("estimated prices preserve mixed currencies, partial-price warnings, tiny amounts and priced zero", () => {
+  const s = { ...stats, period: { ...priced, unpriced_request_count: 1, equivalent_costs: [
+    { currency: "USD", total_cost: 1, priced_request_count: 1 },
+    { currency: "CNY", total_cost: 7, priced_request_count: 1 },
+  ] } };
+  const html = render(s, estimateProps);
+  equal(estimateValue(html), "≈ $10.00 + ¥70.00 *");
+  match(html.split("data-account-usage-estimate")[1], /1 attempts unpriced and excluded/);
+  match(html.split("data-account-usage-estimate")[1], /text-amber-700/);
+  doesNotMatch(html, /Converted to USD/);
+  for (const [cost, expected] of [[0.001, "≈ $0.01"], [0.0001, "≈ &lt;$0.01"], [0, "≈ $0.00"]] as const) {
+    equal(estimateValue(render({ ...stats, period: { ...priced, equivalent_costs: [{ currency: "USD", total_cost: cost, priced_request_count: 1 }] } }, estimateProps)), expected);
+  }
+});
+
+test("missing, unpriced, stale and expired inputs render a dash for estimated capacity without losing recorded totals", () => {
+  const s = { ...stats, period: priced };
+  equal(estimateValue(render(s)), "—");
+  for (const overrides of [
+    { error: true }, { account: { ...estimateAccount, stale: true } }, { now: periodEnd },
+    { account: { ...estimateAccount, weekly: { remaining_percent: 100, resets_at: new Date(periodEnd).toISOString() } } },
+  ]) equal(estimateValue(render(s, { ...estimateProps, ...overrides })), "—");
+  equal(estimateValue(render(undefined, { ...estimateProps, loading: true })), "—");
+  equal(estimateValue(render(stats, estimateProps)), "—"); // No requests yet.
+  equal(estimateValue(render({ ...s, period: { ...priced, equivalent_costs: [], unpriced_request_count: 3 } }, estimateProps)), "—");
+  match(render(s, { ...estimateProps, error: true }), /showing stale totals/);
+});
+
+test("Kiro projection explicitly discloses active grants, cross-cycle approximation and separate resources", () => {
+  const html = render({ ...stats, period: priced }, { ...estimateProps, kind: "kiro", account: { ...estimateAccount, kiro_usage: {
+    plan: null, email: null, resets_at: new Date(periodEnd).toISOString(), overage_enabled: false,
+    items: [{ resource: "CREDIT", name: "Credits", kind: "base", used: 10, limit: 100, resets_at: null }],
+  } } });
+  equal(estimateValue(html), "≈ $125.00");
+  match(html, /base plus currently active bonus \/ trial allowance/);
+  match(html, /grant usage may span cycles/);
+  match(html, /Different resources are not combined/);
 });
 
 test("Chinese cycle metrics localize labels, reset scope, pricing gaps and refresh hints", () => {

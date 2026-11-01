@@ -221,7 +221,7 @@ export function ClaudeAccountPoolPanel({ provider }: { provider: Provider }) {
       <tbody>{pool.accounts.map((account) => {
         const target = { accountId: account.account_id, expectedVersion: account.status_version };
         return <AccountRow key={`${account.account_id}:${account.status_version}`} account={account} isZh={isZh} pending={pending} canLogin={Boolean(pool.config)}
-          usageSummary={<AccountUsageSummary stats={usageStats.byAccount.get(account.account_id)} now={now}
+          usageSummary={<AccountUsageSummary stats={usageStats.byAccount.get(account.account_id)} account={query.isError ? undefined : account} kind="claude_code" now={now}
             loading={usageStats.query.isPending} error={usageStats.query.isError} locale={locale} />}
           onUpdate={(update) => act("update_provider_account", { ...target, update })}
           onRefresh={() => act("refresh_provider_account_usage", { accountId: account.account_id })}

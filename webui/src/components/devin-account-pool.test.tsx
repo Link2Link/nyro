@@ -75,6 +75,20 @@ test("Devin management matches retained and current-cycle totals by stable accou
   }
 });
 
+test("Devin rows estimate each account's full weekly API value from its own cycle and quota", () => {
+  const accounts = [paceAccount("a", "pro", 1, 50, 25, 25), paceAccount("b", "max", 0, 80, 0, 25)];
+  const stats: AccountUsageStats[] = [accounts[1], accounts[0]].map((account) => {
+    const totals = { total_tokens: 1000, request_count: 1, unpriced_request_count: 0,
+      equivalent_costs: [{ currency: "USD", total_cost: account.account_id === "a" ? 25 : 20, priced_request_count: 1 }] };
+    const end = Date.parse(account.weekly!.resets_at!);
+    return { account_id: account.account_id, all_time: totals, period: totals, period_start: end - 7 * 86_400_000, period_end: end };
+  });
+  const html = frozenNow(() => panel({ ...mixed, accounts }, false, stats));
+  const rows = html.match(/<tbody>([\s\S]*?)<\/tbody>/)?.[1].match(/<tr[\s\S]*?<\/tr>/g) ?? [];
+  match(rows[0] ?? "", /data-account-usage-estimate[\s\S]*>Estimated capacity<[\s\S]*≈ \$50\.00/);
+  match(rows[1] ?? "", /data-account-usage-estimate[\s\S]*≈ \$100\.00/);
+});
+
 test("Devin collapsed cards never create the usage query; expanded rows share one 60-second query", () => {
   const pool = { ...mixed, accounts: [paceAccount("a", "pro", 50, 50, 25, 25), paceAccount("b", "max", 0, 50, 0, 25)] };
   panel(pool, true, undefined, (client) => equal(client.getQueryCache().findAll({ queryKey: ["provider-account-usage-stats"] }).length, 0));
