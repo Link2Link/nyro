@@ -2,6 +2,8 @@ import { formatTokenCount } from "@/lib/format";
 import type { Locale } from "@/lib/i18n";
 import { equivalentCostDisplay, formatUsageCost } from "@/lib/token-usage";
 import type { AccountUsageStats, AccountUsageTotals } from "@/lib/types";
+import { estimateAccountUsagePrice, type AccountUsageKind } from "@/lib/account-usage-estimate";
+import type { ProviderAccountView } from "@/lib/devin-account-pool";
 
 function accountPrice(totals: AccountUsageTotals, isZh: boolean, locale: Locale) {
   if (totals.request_count === 0) {
@@ -19,9 +21,11 @@ function accountPrice(totals: AccountUsageTotals, isZh: boolean, locale: Locale)
   };
 }
 
-/** Log-based metrics only; upstream quota, account actions and permissions stay separate. */
-export function AccountUsageSummary({ stats, now, tokensEstimated = false, loading, error, locale }: {
+/** Retained log metrics and a display-only quota projection; account actions stay separate. */
+export function AccountUsageSummary({ stats, account, kind, now, tokensEstimated = false, loading, error, locale }: {
   stats?: AccountUsageStats;
+  account?: ProviderAccountView;
+  kind?: AccountUsageKind;
   /** Shared panel clock: expired cached totals must not remain a current cycle. */
   now: number;
   tokensEstimated?: boolean;
@@ -54,6 +58,18 @@ export function AccountUsageSummary({ stats, now, tokensEstimated = false, loadi
       ? `浏览器本地时间：${new Date(start).toLocaleString(locale)} → ${new Date(end).toLocaleString(locale)}（含开始，不含结束）。`
       : `Browser local time: ${new Date(start).toLocaleString(locale)} → ${new Date(end).toLocaleString(locale)} (start inclusive, end exclusive).`)
     : "", cycleStatus].filter(Boolean).join("\n");
+  const estimate = !error && stats && account && kind ? estimateAccountUsagePrice(stats, account, kind, now) : null;
+  const estimatePrice = estimate && period ? accountPrice({ ...period, equivalent_costs: estimate.costs }, isZh, locale) : null;
+  const estimateTitle = [periodTitle, isZh
+    ? "本周期等价 API 价格 ÷ 本周期已用比例，线性外推用满 100% 时的总等价 API 价格（包含已用部分，并非剩余余额）。仅供参考，受日志覆盖、模型组合和用量观察时间影响。"
+    : "Current-cycle equivalent API price ÷ current-cycle used fraction, linearly projected to 100% usage (includes usage so far, not remaining balance). Reference only; affected by log coverage, model mix and usage observation time.",
+  kind === "kiro" ? (isZh
+    ? "Kiro 按单一资源的基础额度与当前有效赠送 / 试用额度合计比例估算，不含付费超额；赠送 / 试用用量可能跨周期，估值仅供参考。不同资源不合并估算。"
+    : "Kiro uses one resource's base plus currently active bonus / trial allowance, excluding paid overage; grant usage may span cycles, so this is approximate. Different resources are not combined.") : "",
+  estimate ? (isZh ? `用于估算的已用比例：${estimate.usedPercent.toLocaleString(locale, { maximumFractionDigits: 4 })}%。` : `Used for projection: ${estimate.usedPercent.toLocaleString(locale, { maximumFractionDigits: 4 })}%.`) : (isZh
+    ? "暂无可用估算：需要有效的本周期价格及同周期用量比例（大于 0 且不超过 100%）；旧数据、周期不匹配或资源不明确时不估算。"
+    : "Estimate unavailable: requires a current-cycle price and matching-cycle usage above 0% and at most 100%; stale, mismatched or ambiguous resources are not projected."),
+  estimatePrice?.title ?? ""].filter(Boolean).join("\n");
   const rows = [
     { key: "all_time", label: isZh ? "全部记录" : "All records", title: scope, totals: stats?.all_time },
     { key: "period", label: isZh ? "本周期" : "Current cycle", title: periodTitle, totals: period },
@@ -76,6 +92,13 @@ export function AccountUsageSummary({ stats, now, tokensEstimated = false, loadi
           </span>
         </div>;
       })}
+      <div className="contents" data-account-usage-estimate>
+        <span className="text-[10px] font-medium text-slate-500" title={estimateTitle}>{isZh ? "预估可用" : "Estimated capacity"}</span>
+        <span className="text-xs text-slate-400" title={isZh ? "仅估算等价 API 价格" : "Equivalent API price projection only"}>—</span>
+        <span className={`break-words text-xs font-semibold tabular-nums ${period?.unpriced_request_count ? "text-amber-700" : "text-slate-700"}`} title={estimateTitle}>
+          {estimatePrice ? `≈ ${estimatePrice.text}` : "—"}
+        </span>
+      </div>
     </div>
     {cycleStatus && <p role="status" className="mt-1.5 text-[10px] text-amber-700">{cycleStatus}</p>}
     {status && <p role="status" className={`mt-1.5 text-[10px] ${error ? "text-amber-700" : "text-slate-400"}`}>{status}</p>}

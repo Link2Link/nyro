@@ -196,6 +196,18 @@ const monthly = (id: string, label: string, plan: string, used: number, limit: n
 const twoAccounts: AccountPoolView = { ...pool, accounts: [monthly("a", "Kiro", "PRO+", 1153.6, 2000), monthly("b", "Kiro 2", "PRO MAX", 0.05, 5000)],
   counts: { ...pool.counts, total: 2, accounting: 2, available: 2, included: 2 } };
 
+test("Kiro management projects monthly API value from allowance usage rather than estimated tokens", () => {
+  const a = monthly("a", "Kiro", "PRO", 20, 100);
+  const totals = { total_tokens: 2_000_000, request_count: 1, unpriced_request_count: 0,
+    equivalent_costs: [{ currency: "USD", total_cost: 10, priced_request_count: 1 }] };
+  const html = withNow("2026-10-21T10:00:00Z", () => panel({ ...pool, accounts: [a] }, false, [{
+    account_id: "a", all_time: totals, period: totals,
+    period_start: Date.parse("2026-10-01T00:00:00Z"), period_end: Date.parse("2026-11-01T00:00:00Z"),
+  }]));
+  match(html, /data-account-usage-estimate[\s\S]*>Estimated capacity<[\s\S]*≈ \$50\.00/);
+  match(html, /Used for projection: 20%/);
+});
+
 test("Kiro pool card shows the summed pool percent, totals and a weighted steady-pace marker", () => {
   const html = withNow("2026-10-21T10:00:00Z", () => panel(twoAccounts, true));
   // The card carries the pool total only; per-account bars live in Manage accounts.

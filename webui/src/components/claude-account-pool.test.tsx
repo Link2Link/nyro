@@ -240,6 +240,22 @@ test("Claude management preserves retained and actual reset-cycle usage stats wi
   });
 });
 
+test("Claude management projects full-cycle price from weekly usage, never the 5h window", () => {
+  const now = Date.now();
+  const end = now + 3 * 86_400_000;
+  const reset = new Date(end).toISOString();
+  const value = { ...pool, accounts: [{ ...account, claude_usage: { windows: [
+    { name: "five_hour", used_percent: 90, resets_at: reset },
+    { name: "weekly_limit", used_percent: 10, resets_at: reset },
+  ] } }] };
+  const totals = { total_tokens: 54_740_000, request_count: 1, unpriced_request_count: 0,
+    equivalent_costs: [{ currency: "USD", total_cost: 21.4, priced_request_count: 1 }] };
+  const html = panel(value, false, [{ account_id: account.account_id, all_time: totals, period: totals,
+    period_start: end - 7 * 86_400_000, period_end: end }]);
+  match(html, /data-account-usage-estimate[\s\S]*>Estimated capacity<[\s\S]*≈ \$214\.00/);
+  match(html, /Used for projection: 10%/);
+});
+
 test("Claude login explains browser code exchange and exact target, not Devin token import", () => {
   const html = renderToStaticMarkup(<LocaleProvider><ClaudeAccountLogin intent={{ kind: "reauthorize_account", providerId: "claude", accountId: "account-a", expectedVersion: 4 }} initialLabel="Work" onBound={() => {}} onCancel={() => {}} /></LocaleProvider>);
   match(html, /Only the selected account/); match(html, /authorization code or full callback URL/);

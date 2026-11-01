@@ -48,7 +48,7 @@ const validNumber = (value: number) => Number.isFinite(value) && value >= 0;
  * allowances of one resource are additive; expired grants contribute nothing,
  * and only base allowances own the resource's reset.
  */
-function accountResources(usage: KiroUsage, now: number): Map<string, AccountResource> {
+export function kiroAccountResources(usage: KiroUsage, now: number): Map<string, AccountResource> {
   const pools = new Map<string, AccountResource>();
   for (const item of usage.items) {
     if (!validNumber(item.used) || !validNumber(item.limit)) continue;
@@ -88,7 +88,7 @@ export function kiroPoolUsage(pool: AccountPoolView, now: number): KiroPoolUsage
   let observed = 0;
   for (const account of members) {
     if (!account.kiro_usage) continue;
-    const resources = accountResources(account.kiro_usage, now);
+    const resources = kiroAccountResources(account.kiro_usage, now);
     if (resources.size === 0) continue;
     observed += 1;
     for (const [resource, value] of resources) {
