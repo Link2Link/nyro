@@ -4,6 +4,21 @@ All notable changes to Nyro will be documented in this file.
 
 ---
 
+## v2.1.18
+
+> Released on 2026-11-01
+
+#### Improvements
+
+- **Kiro original-wire payload diagnostics**: opted-in requests now retain the upstream JSON request and AWS EventStream response alongside client-side payloads instead of storing only digests. HTTP errors and observed stream failures retain evidence even when ordinary recording is disabled; successful requests still obey the global and model switches. UTF-8 text and reversible Base64 binary captures keep the existing 1 MiB per-body head/tail limit, explicit completeness/truncation metadata, SHA-256 and chunk counts, plus the thinking-tag parser setting. Devin's credential-bearing native bodies remain digest-only (#6)
+- **Evidence display and export**: the WebUI shows retained native bytes, full-observation hashes, chunk counts, missing-middle and interrupted-capture warnings, while preserving legacy digest-only records. Bilingual recording controls explain forced error retention, limits and sensitive-body risks; regression coverage verifies four-direction persistence, switch combinations, native reasoning/tool frames and byte-exact exports (#6)
+
+#### Fixes
+
+- **Larger Kiro error bodies and safe diagnostics**: the 16 KiB sanitized-error classification window no longer stops raw evidence capture prematurely. Error-response reading reaches EOF or stops at cancellation, a shorter upstream timeout/deadline or a five-second capture budget, with incomplete reads marked explicitly. Untrusted AWS stream error headers no longer enter diagnostic error chains, and truncated UTF-8 exports preserve BOM bytes. Credential headers remain redacted; raw bodies are authorized-admin evidence and may contain sensitive data. No database migration is required (#6)
+
+---
+
 ## v2.1.17
 
 > Released on 2026-11-01
