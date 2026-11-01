@@ -586,7 +586,7 @@ fn required_non_empty_tool_name(item: &Value, tool_type: &str) -> Result<String>
 
 fn merge_tool_specs(existing: &mut Vec<ToolSpec>, incoming: Vec<ToolSpec>) -> Result<()> {
     for tool in incoming {
-        let Some(current) = existing.iter().find(|candidate| {
+        let Some(current) = existing.iter_mut().find(|candidate| {
             candidate.name == tool.name
                 && candidate.namespace == tool.namespace
                 && candidate.is_custom() == tool.is_custom()
@@ -595,7 +595,12 @@ fn merge_tool_specs(existing: &mut Vec<ToolSpec>, incoming: Vec<ToolSpec>) -> Re
             continue;
         };
 
-        if serde_json::to_value(current)? != serde_json::to_value(&tool)? {
+        // Codex can redeclare historical additional_tools with updated prose.
+        // Ignore only description when checking compatibility; schemas, strict
+        // mode and custom grammars must still match the existing definition.
+        let mut comparable = tool.clone();
+        comparable.description.clone_from(&current.description);
+        if serde_json::to_value(&*current)? != serde_json::to_value(&comparable)? {
             let qualified_name = tool
                 .namespace
                 .as_ref()
@@ -603,6 +608,9 @@ fn merge_tool_specs(existing: &mut Vec<ToolSpec>, incoming: Vec<ToolSpec>) -> Re
                 .unwrap_or_else(|| tool.name.clone());
             anyhow::bail!("conflicting tool definitions for '{qualified_name}'");
         }
+        // Input declarations are merged in history order, so the latest one
+        // controls the description, including an empty or omitted description.
+        current.description = tool.description;
     }
     Ok(())
 }
