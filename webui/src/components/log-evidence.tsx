@@ -76,12 +76,13 @@ export function PayloadBlock({ title, log, field, isZh }: { title: string; log: 
     <div className="space-y-1 px-3 py-2 text-[11px] text-slate-500">
       <p>{payloadStateLabel(evidence.state, isZh)}{log?.payload_cleared_at != null && ` · ${formatLogTime(log.payload_cleared_at)}`}</p>
       {metadata && <p>{isZh ? "已观测" : "Observed"} {metadata.total_observed_bytes} B · {isZh ? "保留" : "Retained"} {metadata.retained_bytes} B · {metadata.encoding} · {metadata.complete ? (isZh ? "传输采集结束" : "Capture complete") : (isZh ? "传输采集不完整，最终大小未知" : "Capture incomplete; final size unknown")} · {metadata.truncated ? (isZh ? "已截断" : "Truncated") : (isZh ? "未截断" : "Not truncated")}</p>}
-      {evidence.state === "digest_only" && <div className="space-y-1">
-        <p>{isZh ? "此原生载荷按策略仅记录摘要。没有可复制的原始正文；这不表示数据损坏或载荷记录开关未开启。" : "This native payload retains only a digest by policy. No raw body is available to copy; this does not indicate corruption or disabled payload recording."}</p>
-        <p className="break-all">SHA-256: <code className="select-all">{metadata?.sha256}</code></p>
-        {metadata?.chunks != null && <p>{isZh ? "已观测数据块" : "Observed chunks"}: {metadata.chunks}</p>}
-        {!metadata?.complete && <p>{isZh ? "摘要仅覆盖已观测字节，不代表完整上游响应。" : "The digest covers observed bytes only, not necessarily the complete upstream response."}</p>}
+      {evidence.state === "digest_only" && <p>{isZh ? "此记录仅保留摘要，没有可复制的原始正文。这可能来自旧版原生捕获或供应商安全策略（Devin 上游正文仍仅存摘要，避免保存内嵌凭证），不表示数据损坏；Kiro 新记录支持有界原文捕获。" : "This record retains only a digest; no raw body is available to copy. This can reflect legacy native capture or a provider safety policy (Devin upstream bodies remain digest-only to avoid storing embedded credentials), not corruption. New Kiro records support bounded raw capture."}</p>}
+      {metadata?.sha256 && <div className="space-y-1">
+        <p className="break-all">SHA-256: <code className="select-all">{metadata.sha256}</code></p>
+        <p>{isZh ? "摘要覆盖全部已观测原始字节（含截断时省略的中间部分），不是仅对保留片段计算。" : "The digest covers all observed raw bytes, including any omitted middle, not just the retained segments."}</p>
+        {!metadata.complete && <p>{isZh ? "摘要仅覆盖已观测字节，不代表完整上游响应。" : "The digest covers observed bytes only, not necessarily the complete upstream response."}</p>}
       </div>}
+      {metadata?.chunks != null && <p>{isZh ? "已观测非空数据块" : "Observed non-empty chunks"}: {metadata.chunks}</p>}
       {metadata?.omitted_headers != null && <p>{isZh ? "省略请求头" : "Omitted headers"}: {metadata.omitted_headers}</p>}
       {evidence.missingBytes != null && evidence.missingBytes > 0 && <p className="text-amber-700">{isZh ? `中间缺失 ${evidence.missingBytes} 个已观测字节；下方头尾片段不连续。` : `${evidence.missingBytes} observed bytes missing from the middle; head and tail below are not contiguous.`}</p>}
       {evidence.issue && <p role="alert" className="text-amber-700">{isZh ? "元数据或存储内容不一致；显示原始文本，不进行 JSON 格式化。" : evidence.issue}</p>}

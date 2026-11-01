@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import test from "node:test";
-import { effectiveOutcome, isLogRelatedQueryKey, outcomeLabel, outcomeQuery, parseErrorCauses, parseDevinUpstreamDiagnostic, payloadDownload, payloadEvidence, payloadStateLabel, usageOutcomeRates, type PayloadMetadata } from "./log-observability.ts";
+import { effectiveOutcome, isLogRelatedQueryKey, outcomeLabel, outcomeQuery, parseErrorCauses, parseDevinUpstreamDiagnostic, payloadDownload, payloadEvidence, payloadRecordingHelp, payloadStateLabel, usageOutcomeRates, type PayloadMetadata } from "./log-observability.ts";
 import type { RequestLog } from "./types.ts";
 
 const field = "upstream_response_body";
@@ -64,6 +65,17 @@ test("truncated UTF-8 splits at byte offset rather than character count", () => 
   assert.equal(parsed.state, "captured");
   assert.equal(parsed.missingBytes, 91);
   assert.deepEqual(parsed.segments, [{ label: "head", text: "你好", encoding: "utf8" }, { label: "tail", text: "END", encoding: "utf8" }]);
+});
+
+test("truncated UTF-8 preserves BOM bytes at both retained boundaries in exports", () => {
+  const raw = "\uFEFFHEAD\uFEFFTAIL";
+  const log = evidence(raw, { total_observed_bytes: 100, head_bytes: 7, tail_bytes: 7, truncated: true });
+  const parsed = payloadEvidence(log, field);
+  assert.deepEqual(parsed.segments.map((part) => part.text), ["\uFEFFHEAD", "\uFEFFTAIL"]);
+  assert.deepEqual(Buffer.from(parsed.segments.map((part) => part.text).join("")), Buffer.from(raw));
+  const downloaded = payloadDownload(log as RequestLog);
+  assert.ok(downloaded.includes("# head (utf8)\n\uFEFFHEAD"));
+  assert.ok(downloaded.includes("# tail (utf8)\n\uFEFFTAIL"));
 });
 
 test("base64 split retains exact raw bytes and broken UTF-8 stays base64", () => {
@@ -133,13 +145,86 @@ test("manual clear overrides every retained body/header without altering result 
   assert.doesNotMatch(output, /secret|credentials/);
 });
 
+test("captured native UTF-8 and binary bodies retain hashes and export recoverable bytes", () => {
+  for (const encoding of ["utf8", "base64"] as const) {
+    // Native JSON and AWS EventStream-like binary both use the ordinary capture contract.
+    const original = encoding === "utf8" ? Buffer.from('{"message":"你好","keep":"\\r\\n"}\n') : Buffer.from([0, 0, 0, 24, 0xff, 0x80, 10, 13, 0]);
+    const raw = original.toString(encoding === "utf8" ? "utf8" : "base64");
+    const sha256 = createHash("sha256").update(original).digest("hex");
+    for (const bodyField of ["upstream_request_body", "upstream_response_body"] as const) {
+      for (const complete of [true, false]) {
+        const metadata = { total_observed_bytes: original.length, retained_bytes: original.length, head_bytes: original.length,
+          tail_bytes: 0, truncated: false, complete, encoding, capture_state: "captured", sha256, chunks: 2 };
+        const log: Partial<RequestLog> = { id: "native-capture", [bodyField]: raw, payload_metadata: JSON.stringify({ [bodyField]: metadata }) };
+        const parsed = payloadEvidence(log, bodyField, false);
+        assert.equal(parsed.state, "captured");
+        assert.equal(parsed.metadata?.sha256, sha256);
+        assert.equal(parsed.metadata?.chunks, 2);
+        assert.equal(parsed.metadata?.complete, complete);
+        assert.equal(parsed.missingBytes, 0);
+        assert.equal(parsed.segments[0].text, raw);
+        const downloaded = payloadDownload(log as RequestLog);
+        const prefix = `# content (${encoding})\n`;
+        const content = downloaded.split(`## ${bodyField}\n`)[1];
+        const start = content.indexOf(prefix) + prefix.length;
+        const exported = content.slice(start, start + raw.length);
+        assert.equal(exported, raw);
+        assert.deepEqual(Buffer.from(exported, encoding === "utf8" ? "utf8" : "base64"), original);
+        assert.match(downloaded, new RegExp(sha256));
+        assert.match(downloaded, /including any omitted middle/);
+      }
+    }
+  }
+});
+
+test("truncated native binary exports independently decodable head/tail with full observed hash", () => {
+  const original = Buffer.from([0, 0xff, 1, 2, 3, 4, 5, 0x80, 9]);
+  const retained = Buffer.concat([original.subarray(0, 2), original.subarray(-3)]);
+  const sha256 = createHash("sha256").update(original).digest("hex");
+  const log = evidence(retained.toString("base64"), { encoding: "base64", capture_state: "captured", total_observed_bytes: original.length,
+    retained_bytes: retained.length, head_bytes: 2, tail_bytes: 3, truncated: true, complete: false, sha256, chunks: 3 });
+  const parsed = payloadEvidence(log, field);
+  assert.equal(parsed.state, "captured");
+  assert.equal(parsed.missingBytes, 4);
+  assert.equal(parsed.metadata?.complete, false);
+  assert.deepEqual(parsed.segments.map((part) => Buffer.from(part.text, "base64")), [original.subarray(0, 2), original.subarray(-3)]);
+  const downloaded = payloadDownload(log as RequestLog);
+  for (const part of parsed.segments) assert.ok(downloaded.includes(`# ${part.label} (base64)\n${part.text}`));
+  assert.match(downloaded, /Missing observed bytes: 4/);
+  assert.match(downloaded, /"complete":false/);
+  assert.match(downloaded, new RegExp(sha256));
+  assert.doesNotMatch(downloaded, /Digest only/);
+});
+
+test("native observed empty and absent captures remain distinct with optional hash/chunks", () => {
+  const sha256 = createHash("sha256").update("").digest("hex");
+  const empty = payloadEvidence(evidence("", { sha256, chunks: 0 }), field);
+  assert.equal(empty.state, "empty");
+  assert.equal(empty.metadata?.sha256, sha256);
+  const absent = payloadEvidence(evidence(undefined, { capture_state: "absent", encoding: "none", sha256: null, chunks: 0 }), field);
+  assert.equal(absent.state, "absent");
+  for (const patch of [{ sha256: "invalid" }, { chunks: -1 }, { chunks: 1.5 }]) {
+    assert.equal(payloadEvidence(evidence("native", patch), field).state, "invalid");
+  }
+});
+
+test("recording help explains opt-in, forced diagnostics, limits, encoding and sensitive data in EN/ZH", () => {
+  const english = payloadRecordingHelp();
+  assert.match(english, /both global and model switches/);
+  assert.match(english, /successful requests do not retain payloads when off/);
+  assert.match(english, /HTTP\/stream errors.*even when off/);
+  for (const word of ["1 MiB", "head/tail", "incomplete", "Base64", "Devin", "digest-only", "sensitive data"]) assert.ok(english.includes(word));
+  const chinese = payloadRecordingHelp(true);
+  for (const word of ["全局与模型", "即使关闭", "1 MiB", "头尾", "不完整", "Base64", "Devin", "敏感信息"]) assert.ok(chinese.includes(word));
+});
+
 const nativeDigest: Partial<PayloadMetadata> = {
   capture_state: "digest_only", encoding: "binary", total_observed_bytes: 152,
   retained_bytes: 0, head_bytes: 0, tail_bytes: 0, truncated: false,
   complete: false, chunks: 1, sha256: "6ed79909fffda6b662a4094b5c3d9a31f0fc44b791353b286cd7dc636c68f0cd",
 };
 
-test("live Devin digest-only response is valid evidence, not a missing or truncated body", () => {
+test("Devin and legacy native digest-only responses remain valid evidence, not missing bodies", () => {
   for (const complete of [false, true]) {
     const log = evidence(undefined, { ...nativeDigest, complete });
     const parsed = payloadEvidence(log, field);

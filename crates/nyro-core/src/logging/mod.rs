@@ -121,8 +121,9 @@ pub struct LogEntry {
     pub stream_first_chunk_ms: Option<i64>,
 
     // === 瞬态（不写入 DB） ===
-    /// Per-model enable_payload override.
-    /// None = use default (true), Some(true) = force on, Some(false) = force off.
+    /// Per-model opt-out under the global enable_payload gate.
+    /// None/Some(true) records ordinary traffic only when the global gate is on;
+    /// Some(false) opts out. Confirmed abnormal outcomes override both switches.
     pub enable_payload: Option<bool>,
 }
 

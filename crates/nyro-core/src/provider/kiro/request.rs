@@ -215,6 +215,7 @@ pub fn encode(
         "image_count": turns.iter().map(|t| t.images.len()).sum::<usize>(),
         "system_bytes": system.len(),
         "stream": request.stream.enabled,
+        "thinking_tags": thinking_tags,
     });
     Ok(Encoded {
         body,
@@ -1607,6 +1608,7 @@ mod tests {
         req.system = Some("rules".into());
         let encoded = encode_ok(&req);
         assert!(encoded.thinking_tags);
+        assert_eq!(encoded.summary["thinking_tags"], true);
         let content =
             decode(&encoded)["conversationState"]["currentMessage"]["userInputMessage"]["content"]
                 .as_str()
@@ -1633,6 +1635,7 @@ mod tests {
         req.system = Some("<thinking_mode>enabled</thinking_mode> mine".into());
         let encoded = encode_ok(&req);
         assert!(encoded.thinking_tags);
+        assert_eq!(encoded.summary["thinking_tags"], true);
         let content =
             decode(&encoded)["conversationState"]["currentMessage"]["userInputMessage"]["content"]
                 .as_str()
@@ -1745,5 +1748,6 @@ mod tests {
         let text = encoded.summary.to_string();
         assert!(!text.contains("secret"));
         assert_eq!(encoded.summary["message_count"], 1);
+        assert_eq!(encoded.summary["thinking_tags"], false);
     }
 }

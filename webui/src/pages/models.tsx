@@ -911,8 +911,8 @@ export default function ModelsPage() {
                 title={isZh ? "记录载荷" : "Record Payloads"}
                 isZh={isZh}
                 checked={createForm.enable_payload}
-                checkedMessage={isZh ? "记录完整的请求与响应内容" : "Log full request and response content"}
-                uncheckedMessage={isZh ? "仅记录 Token 用量等基础指标" : "Only basic metrics are logged"}
+                checkedMessage={isZh ? "保留请求与响应载荷（每正文最多 1 MiB；Devin 上游仅摘要）" : "Retain request/response payloads (1 MiB/body; Devin upstream digest only)"}
+                uncheckedMessage={isZh ? "成功请求仅记录基础指标；异常仍保留诊断载荷" : "Basic metrics for successful requests; abnormal outcomes still retain diagnostic payloads"}
                 switchId="create-route-enable-payload"
                 onCheckedChange={(checked) => setCreateForm((prev) => ({ ...prev, enable_payload: checked }))}
               />
@@ -1137,8 +1137,8 @@ export default function ModelsPage() {
                         title={isZh ? "记录载荷" : "Record Payloads"}
                         isZh={isZh}
                         checked={editForm.enable_payload}
-                        checkedMessage={isZh ? "记录完整的请求与响应内容" : "Log full request and response content"}
-                        uncheckedMessage={isZh ? "仅记录 Token 用量等基础指标" : "Only basic metrics are logged"}
+                        checkedMessage={isZh ? "保留请求与响应载荷（每正文最多 1 MiB；Devin 上游仅摘要）" : "Retain request/response payloads (1 MiB/body; Devin upstream digest only)"}
+                        uncheckedMessage={isZh ? "成功请求仅记录基础指标；异常仍保留诊断载荷" : "Basic metrics for successful requests; abnormal outcomes still retain diagnostic payloads"}
                         onCheckedChange={(checked) =>
                           setEditForm((prev) => (prev ? { ...prev, enable_payload: checked } : prev))
                         }
@@ -1273,7 +1273,7 @@ export default function ModelsPage() {
                     )}
                     {route.enable_payload === false && (
                       <Badge variant="danger" className="connect-label-badge">
-                        {isZh ? "不记录载荷" : "No Payloads"}
+                        {isZh ? "成功时不留载荷" : "No Success Payloads"}
                       </Badge>
                     )}
                     {!route.is_enabled && (

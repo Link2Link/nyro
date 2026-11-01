@@ -129,8 +129,10 @@ function validMetadata(value: unknown, header: boolean): value is PayloadMetadat
   if (!byteCount(m.total_observed_bytes) || !byteCount(m.retained_bytes)
     || typeof m.truncated !== "boolean" || typeof m.complete !== "boolean"
     || !["utf8", "base64", "none", "binary"].includes(m.encoding) || !["absent", "empty", "captured", "not_retained", "digest_only"].includes(m.capture_state)) return false;
-  // Native bodies intentionally retain no bytes. This is not truncation or
-  // missing storage; validate their distinct digest contract before byte copies.
+  if ((m.sha256 != null && (typeof m.sha256 !== "string" || !/^[a-fA-F0-9]{64}$/.test(m.sha256)))
+    || (m.chunks != null && !byteCount(m.chunks))) return false;
+  // Legacy native captures and credential-bearing providers can retain only a
+  // digest. New bounded native captures use the ordinary UTF-8/Base64 contract.
   if (m.encoding === "binary" || m.capture_state === "digest_only") {
     if (header || m.encoding !== "binary" || m.retained_bytes !== 0
       || m.head_bytes !== 0 || m.tail_bytes !== 0 || m.truncated) return false;
@@ -138,7 +140,6 @@ function validMetadata(value: unknown, header: boolean): value is PayloadMetadat
     if (!byteCount(m.chunks)) return false;
     if (m.capture_state === "absent") return m.total_observed_bytes === 0 && m.chunks === 0 && m.sha256 == null;
     return m.capture_state === "digest_only" && typeof m.sha256 === "string"
-      && /^[a-fA-F0-9]{64}$/.test(m.sha256)
       && (m.total_observed_bytes === 0 ? m.chunks === 0 : m.chunks > 0);
   }
   // Recording-disabled entries can preserve original capture lengths or zero them;
@@ -190,8 +191,9 @@ export function payloadEvidence(log: Partial<RequestLog>, field: PayloadField, p
       const tail = bytes.slice(metadata.head_bytes);
       const segment = (label: "head" | "tail", data: Uint8Array) => {
         if (metadata.encoding === "base64") return { label, text: encodeBase64(data), encoding: "base64" as const };
-        // Fatal decoding avoids silently replacing a split UTF-8 edge with U+FFFD.
-        return { label, text: new TextDecoder("utf-8", { fatal: true }).decode(data), encoding: "utf8" as const };
+        // Fatal decoding avoids replacing a split UTF-8 edge; preserve BOM bytes
+        // too, so display/download never silently remove retained evidence.
+        return { label, text: new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(data), encoding: "utf8" as const };
       };
       return { ...base, state: "captured", segments: [segment("head", head), segment("tail", tail)] };
     }
@@ -216,9 +218,17 @@ export function payloadStateLabel(state: PayloadEvidence["state"], isZh = false)
   return labels[state][isZh ? 1 : 0];
 }
 
+export function payloadRecordingHelp(isZh = false): string {
+  return isZh
+    ? "全局与模型开关均开启时，保留请求与响应载荷；关闭后成功请求不保留载荷。HTTP/流式错误，以及已观测的异常或无法确认的结果，即使关闭仍保留诊断。每正文最多 1 MiB，超出仅保留头尾并标明缺口；中断采集不完整。二进制用 Base64；Devin 上游正文因内嵌凭证仍仅存摘要。请求头凭据脱敏，但正文可能含敏感信息，分享前请检查。"
+    : "Enable both global and model switches to retain request/response payloads; successful requests do not retain payloads when off. HTTP/stream errors and observed abnormal or uncertain outcomes retain diagnostics even when off. Each body is capped at 1 MiB; larger bodies keep head/tail with a marked gap, and interrupted captures are incomplete. Binary uses Base64; Devin upstream bodies remain digest-only due to embedded credentials. Header credentials are redacted, but bodies may contain sensitive data; review before sharing.";
+}
+
 export function payloadDownload(log: RequestLog): string {
   return [
     "# ADMIN EVIDENCE: bodies are raw and may contain sensitive data; credential header redaction is backend-owned.",
+    "# Base64 segments decode to retained raw bytes. Truncated head/tail segments are not contiguous or a complete body.",
+    "# SHA-256, when present, covers all observed raw bytes (including any omitted middle); incomplete captures do not cover unobserved bytes.",
     `# Payload cleared at: ${log.payload_cleared_at ?? "not marked cleared"}`,
     `# Payload metadata (raw JSON): ${log.payload_metadata ?? "unavailable (legacy / unknown)"}`,
     ...PAYLOAD_FIELDS.flatMap((field) => {
