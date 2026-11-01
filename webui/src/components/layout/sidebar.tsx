@@ -9,6 +9,7 @@ import {
   ScrollText,
   BarChart3,
   Activity,
+  Monitor,
   KeyRound,
   Plug,
   Puzzle,
@@ -32,6 +33,7 @@ const NAV_ITEMS = [
   { label: "Logs", path: "/logs", icon: ScrollText },
   { label: "Stats", path: "/stats", icon: BarChart3 },
   { label: "Performance", path: "/performance", icon: Activity },
+  { label: "System Monitor", path: "/system-monitor", icon: Monitor },
   { label: "Extensions", path: "/extensions", icon: Puzzle },
   { type: "divider" as const },
   { label: "Settings", path: "/settings", icon: Settings },
@@ -81,7 +83,7 @@ export function Sidebar({ collapsed, onToggle }: SidebarProps) {
           const displayLabel = isZh ? ({
             Dashboard: "概览", Providers: "提供商", "Available Models": "可用模型",
             "Model Ratings": "模型评分", "Model Mapping": "模型映射", "API Keys": "密钥",
-            Connect: "接入", Logs: "日志", Stats: "统计", Performance: "性能", Extensions: "扩展", Settings: "系统设置",
+            Connect: "接入", Logs: "日志", Stats: "统计", Performance: "性能", "System Monitor": "系统监控", Extensions: "扩展", Settings: "系统设置",
           } as Record<string, string>)[label] ?? label : label;
           const showUpdateDot = path === "/settings" && updateAvailable;
           const accessibleLabel = showUpdateDot ? `${displayLabel} (${updateHint})` : displayLabel;

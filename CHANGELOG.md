@@ -4,6 +4,21 @@ All notable changes to Nyro will be documented in this file.
 
 ---
 
+## v2.1.19
+
+> Released on 2026-11-01
+
+#### Features
+
+- **Live system monitor**: a new System Monitor page shows CPU and per-core usage, memory and swap, individual storage volumes, network receive/send throughput and cumulative interface traffic, OS details, uptime and Nyro process resources. Resource and network trends retain up to 60 samples / 10 minutes in memory, with 3/5/10-second polling, pause/resume and manual refresh; the bilingual responsive panels follow the console's light/dark themes (#7)
+- **Shared authenticated metrics**: HTTP `GET /api/v1/system/status` and desktop IPC use the same cross-platform collector, running blocking collection outside the async runtime with a shared two-second cache. Initial CPU/network rates, new interfaces and reset counters remain unavailable instead of fabricated zero or traffic spikes. Network summaries exclude loopback and disk capacities are not double-counted across mounts (#7)
+
+#### Improvements
+
+- **Explicit monitoring boundaries and regression coverage**: round-trip latency is labeled as client-to-admin time rather than upstream-model latency, and throughput is distinguished from internet speed or link capacity. Container visibility, shared mounts and virtual-interface counting limits are documented; failed refreshes preserve a clearly disconnected snapshot. Added sampling/cache, authenticated HTTP, helper and browser interaction/layout tests; no database migration or routing changes are required (#7)
+
+---
+
 ## v2.1.18
 
 > Released on 2026-11-01

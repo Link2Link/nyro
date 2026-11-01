@@ -19,6 +19,7 @@ const ApiKeysPage = lazy(() => import("@/pages/api-keys"));
 const LogsPage = lazy(() => import("@/pages/logs"));
 const StatsPage = lazy(() => import("@/pages/stats"));
 const PerformancePage = lazy(() => import("@/pages/performance"));
+const SystemMonitorPage = lazy(() => import("@/pages/system-monitor"));
 const SettingsPage = lazy(() => import("@/pages/settings"));
 const ExtensionsPage = lazy(() => import("@/pages/extensions"));
 const ConnectPage = lazy(() => import("@/pages/connect"));
@@ -55,6 +56,7 @@ createRoot(document.getElementById("root")!).render(
                   <Route path="logs" element={<LogsPage />} />
                   <Route path="stats" element={<StatsPage />} />
                   <Route path="performance" element={<PerformancePage />} />
+                  <Route path="system-monitor" element={<SystemMonitorPage />} />
                   <Route path="connect" element={<ConnectPage />} />
                   <Route path="extensions" element={<ExtensionsPage />} />
                   <Route path="settings" element={<SettingsPage />} />

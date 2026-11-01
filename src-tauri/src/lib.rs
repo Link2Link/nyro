@@ -141,6 +141,7 @@ pub fn run() {
             commands::get_setting,
             commands::set_setting,
             commands::get_gateway_status,
+            commands::get_system_status,
             commands::export_config,
             commands::import_config,
             commands::detect_cli_tools,

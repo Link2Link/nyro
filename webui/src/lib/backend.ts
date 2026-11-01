@@ -135,6 +135,8 @@ function resolveHTTP(cmd: string, args?: Record<string, unknown>): HTTPMapping {
       return { method: "GET", url: `${base}/providers` };
     case "get_provider_presets":
       return { method: "GET", url: `${base}/providers/presets` };
+    case "get_system_status":
+      return { method: "GET", url: `${base}/system/status` };
     case "get_loaded_extensions":
       return { method: "GET", url: `${base}/system/extensions` };
     case "create_provider":

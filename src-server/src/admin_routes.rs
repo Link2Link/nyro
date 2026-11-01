@@ -69,6 +69,7 @@ pub fn create_router_with_updater(
     let mut api = Router::new()
         .route("/system/extensions", get(list_loaded_extensions))
         .route("/system/version", get(system_version_handler))
+        .route("/system/status", get(system_status_handler))
         .route("/system/update/check", get(update_check_handler))
         .route("/system/update/apply", post(update_apply_handler))
         .route("/system/update/status", get(update_status_handler))
@@ -1406,6 +1407,17 @@ async fn get_status(State(gw): State<Gateway>) -> impl IntoResponse {
     }))
 }
 
+async fn system_status_handler(State(gw): State<Gateway>) -> impl IntoResponse {
+    match gw.admin().get_system_status().await {
+        Ok(status) => Json(serde_json::json!({ "data": status })).into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": error.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
 // ── Version & self-update ──
 
 type Updater = Option<Extension<UpdateService>>;
@@ -1597,6 +1609,47 @@ mod self_update_api_tests;
 mod tests {
     use super::*;
     use axum::http::StatusCode;
+
+    #[tokio::test]
+    async fn system_status_requires_admin_auth_and_returns_metrics() -> anyhow::Result<()> {
+        use axum::body::{Body, to_bytes};
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let dir = tempfile::tempdir()?;
+        let (gw, _) = Gateway::new(nyro_core::config::GatewayConfig {
+            data_dir: dir.path().into(),
+            ..Default::default()
+        })
+        .await?;
+        let admin = gw.admin();
+        let router = create_router(gw, Some("test-admin".into()));
+        let uri = "/api/v1/system/status";
+        for token in [None, Some("Bearer wrong-token")] {
+            let mut request = Request::builder().uri(uri);
+            if let Some(token) = token {
+                request = request.header("authorization", token);
+            }
+            let response = router.clone().oneshot(request.body(Body::empty())?).await?;
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        }
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .header("authorization", "Bearer test-admin")
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 1024 * 1024).await?)?;
+        let expected = serde_json::to_value(admin.get_system_status().await?)?;
+        assert_eq!(body["data"], expected);
+        assert_eq!(body["data"]["process"]["pid"], std::process::id());
+        assert!(body["data"]["sampled_at"].as_i64().is_some());
+        Ok(())
+    }
 
     fn status_of(message: &str) -> StatusCode {
         usage_err(anyhow::anyhow!("{message}")).status()

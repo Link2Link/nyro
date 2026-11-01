@@ -50,6 +50,10 @@ mod oauth;
 mod observability;
 mod providers;
 pub mod settings;
+mod system_status;
+pub use system_status::{
+    CpuStatus, DiskStatus, MemoryStatus, NetworkStatus, ProcessStatus, SystemStatus,
+};
 mod token_cost;
 mod token_price;
 pub use token_price::{
