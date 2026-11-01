@@ -10,6 +10,7 @@ import type {
 } from "@/lib/types";
 import { useLocale } from "@/lib/i18n";
 import { formatLocalDateStamp } from "@/lib/format";
+import { payloadRecordingHelp } from "@/lib/log-observability";
 import {
   Download,
   HelpCircle,
@@ -365,13 +366,7 @@ export default function SettingsPage() {
             <div className="space-y-1.5">
               <label className="ml-1 flex items-center gap-1 text-xs text-slate-700">
                 {isZh ? "记录载荷" : "Record Payloads"}
-                <HelpHint
-                  text={
-                    isZh
-                      ? "总开关，关闭后所有模型均不记录载荷。开启后可在单个模型中按需关闭"
-                      : "Master switch — when off, no payloads are recorded. When on, individual models can opt out"
-                  }
-                />
+                <HelpHint text={payloadRecordingHelp(isZh)} />
               </label>
               <div className="flex items-center justify-between rounded-lg border border-slate-200 bg-white px-3 py-2.5">
                 <div className="flex items-center gap-2">

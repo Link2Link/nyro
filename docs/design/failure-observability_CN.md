@@ -6,7 +6,7 @@
 
 ## 范围与不变量
 
-- 已确认失败、超时、取消、输出上限，即使普通载荷记录关闭，也保留有界诊断证据。
+- HTTP/流式失败、超时、取消、输出上限，以及主动观测后无法确认的结果，即使普通载荷记录关闭，也保留有界诊断证据。
 - 区分单次上游尝试失败与可能经过重试的客户端请求最终结果；最终结果行不能计入尝试统计。
 - 缺失或不受支持的证据视为 **unknown（未知）**，而非成功或失败。
 - 不改变既有 TPS 公式、token/配额计数、路由、重试策略或线上传输字节。诊断副本的大小限制不是请求/响应传输限制。
@@ -79,17 +79,23 @@ request_count = success_count + error_count + cancelled_count
 
 ```text
 retain = is_error
-      OR (outcome_version == 1 AND attempt_outcome IN {cancelled, output_limited})
+      OR (outcome_version == 1 AND attempt_outcome IN {cancelled, output_limited, unknown})
       OR (global_enable_payload AND model_enable_payload.unwrap_or(true))
 ```
 
-已确认异常覆盖全局和模型的普通记录开关。普通 completed/unknown 仍受全局/模型开关控制，开启时使用 **相同上限**。普通流量的模型开关不能绕过关闭的全局开关。“强制保留”指保留实际观察到的有界证据，不保证四个完整正文，也不保证持久化成功。
+HTTP/流式错误与版本化异常或不确定结果覆盖全局和模型的普通记录开关。版本 1 的 `unknown` 表示观察器主动检查后仍无法确认结果，与版本 0 的历史/默认 `unknown` 不同，会为排查强制保留，但不因此算作错误。completed 和版本 0 的 unknown 仍受全局/模型开关控制，开启时使用 **相同上限**；任一开关关闭时，成功请求清除载荷。普通流量的模型开关不能绕过关闭的全局开关。“强制保留”指保留实际观察到的有界证据，不保证四个完整正文，也不保证持久化成功。尤其是传输中断时，即使已观察字节都在上限内，仍标记 `complete: false`。
 
 ### Devin/Kiro 原生路径诊断
 
 native IR 尝试与普通 HTTP 路径一样接入 hooks 前的客户端请求捕获和脱敏请求头，包括响应流启动前失败的情况。客户端 JSON 捕获属于重新序列化，不保证原始空白逐字一致；仍遵守既有大小上限和保留开关。正文不递归脱敏，仍适用下方仅管理员可查看的隐私边界。
 
-native **上游**请求/响应继续只存摘要（`encoding: binary`、`capture_state: digest_only`），不因载荷开关开启而保存原文。这是捕获策略，不是内容检测；Kiro 的 JSON 请求也使用此策略。Devin protobuf 请求包含凭证，开启载荷记录不能让它落盘。
+**Kiro 上游** JSON 请求和 AWS EventStream 响应使用与普通 HTTP 正文相同的有界原文捕获。全局与模型记录开关都开启，或者异常强制保留时，1 MiB 内的已观察正文完整保留；更大正文仅保留开头 512 KiB 和末尾 512 KiB，并明确标出中间缺失字节数。文本使用 `encoding: utf8`，二进制（或保留边界切开 UTF-8 字符）使用 `encoding: base64`，不再用摘要代替正文。最终保留开关处理前，`capture_state` 为 `captured`、`empty` 或 `absent`。中断时保持 `complete: false`，与大小截断独立。
+
+Kiro 元数据额外保留覆盖 **全部已观察原始字节** 的 `sha256`，包括截断后未保留的中间部分；`chunks` 统计已观察的非空数据块。明确空正文具有空字节的 SHA-256 和零块数；未捕获方向为 `sha256: null`、零块数。不完整捕获的摘要不覆盖从未观察到的字节，也无法恢复已丢弃的中间部分。界面在保留的 UTF-8/Base64 正文旁显示摘要和块数。下载保持保留文本/解码字节不变；截断时 Base64 头尾必须分别解码，不能当作可重放的完整正文。
+
+Kiro HTTP 错误分类/脱敏诊断仍使用独立的 **16 KiB** 解析窗口，原文证据则遵守 **1 MiB** 正文上限。解析窗口已满后仍持续读取，但额外受 **总计 5 秒的错误响应读取预算** 限制，避免无限错误流阻塞请求；EOF、读取失败、取消，以及更短的既有请求 deadline 或空闲超时均可提前停止。预算耗尽时标记 `complete: false`，原始字节上限不变。安全诊断标记 `incomplete_or_oversized` 不等于原文被丢弃，应另行查看捕获元数据。Kiro 请求摘要还包含 `thinking_tags` 布尔值，便于对照解析开关与保留的请求/响应证据。
+
+**Devin 上游** 正文仍只存摘要（`encoding: binary`、`capture_state: digest_only`），不受载荷开关影响。其 protobuf 请求内嵌凭证，无差别开启原文捕获不安全，因此保留该供应商例外。旧 Kiro/其他 native 的 `digest_only` 记录仍作为有效摘要证据显示，不视为损坏或缺失，但无法恢复原始正文；不能以此描述新 Kiro 的捕获策略。
 
 结构化 Devin HTTP 错误和 Connect 错误结束帧额外记录 `payload_metadata.devin_upstream_error`，包含 `source`、`code`、`message` 和 `sanitized: true`。仅选择 code/message，不保留 details 或不透明正文。诊断解析限制为 16 KiB，保留的错误码最多 64 字节，消息最多 512 个 UTF-8 字节。含凭证特征或回显当前上游 token 的消息保守省略。诊断缺失不表示上游没有报错：无效或过大的错误结构会被省略。这是管理员诊断元数据，与其他失败元数据一样在清空载荷后仍保留；不改变客户端错误、调度或重试行为。
 
@@ -97,11 +103,11 @@ native **上游**请求/响应继续只存摘要（`encoding: binary`、`capture
 
 `payload_metadata` 以八个载荷字段名为键，例如 `client_request_body`、`upstream_response_headers`，每项说明：
 
-- `capture_state`：`captured`、`empty`、`absent` 或 `not_retained`；
+- `capture_state`：`captured`、`empty`、`absent`、`not_retained`，或历史/供应商安全策略的 `digest_only`；
 - `complete`：观察方向是否完整结束，与截断独立；
 - `total_observed_bytes`、`retained_bytes`、`truncated`；
-- `encoding`：按内容为 `utf8`、`base64` 或 `none`；
-- 正文的 `head_bytes`/`tail_bytes`，或头部的 `total_headers`、`retained_headers`、`omitted_headers`、`redacted_headers`。
+- `encoding`：按内容为 `utf8`、`base64` 或 `none`（`binary` 仅用于 native 摘要证据）；
+- 正文的 `head_bytes`/`tail_bytes`、可选的 native `sha256`/`chunks`，或头部的 `total_headers`、`retained_headers`、`omitted_headers`、`redacted_headers`。
 
 界面区分完整、部分、缺失、截断、Base64、管理员已清除，不能把每个非空字符串都当作完整正文。已观察字节数不推测从未接收到的字节。头部观察字节统计原始名称/值，保留字节统计脱敏后 JSON，二者不能直接按同一口径比较。元数据不存第二份原始正文。
 

@@ -22,38 +22,56 @@ use std::{
     time::Instant,
 };
 
-/// Native bodies are never decoded or retained, including for failed requests.
-/// Hash every exact upstream byte in constant memory, independently of framing.
+/// Hash every exact native upstream byte independently of framing. Kiro also
+/// keeps the same bounded, reversible byte copy as ordinary HTTP payloads; the
+/// collector applies the recording/error retention gate after the outcome is
+/// known. Other native providers stay digest-only: Devin embeds credentials in
+/// its protobuf request and must not opt into raw capture implicitly.
 #[derive(Default)]
 struct NativeCapture {
     hash: Sha256,
     bytes: u64,
     chunks: u64,
     observed: bool,
+    payload: Option<BoundedPayloadCapture>,
 }
 impl NativeCapture {
+    fn retaining() -> Self {
+        Self {
+            payload: Some(BoundedPayloadCapture::default()),
+            ..Default::default()
+        }
+    }
     fn push(&mut self, bytes: &[u8]) {
         self.observed = true;
         self.bytes = self.bytes.saturating_add(bytes.len() as u64);
         self.chunks = self.chunks.saturating_add(u64::from(!bytes.is_empty()));
         self.hash.update(bytes);
+        if let Some(payload) = self.payload.as_mut() {
+            payload.push(bytes);
+        }
     }
     fn finish(self, complete: bool) -> CapturedPayload {
-        CapturedPayload {
-            body: None,
-            metadata: json!({
-                "total_observed_bytes": self.bytes,
-                "retained_bytes": 0,
-                "head_bytes": 0,
-                "tail_bytes": 0,
-                "truncated": false,
-                "complete": complete,
-                "encoding": "binary",
-                "capture_state": if self.observed { "digest_only" } else { "absent" },
-                "sha256": self.observed.then(|| hex::encode(self.hash.finalize())),
-                "chunks": self.chunks,
-            }),
-        }
+        let mut captured = match self.payload {
+            Some(payload) => payload.finish(complete),
+            None => CapturedPayload {
+                body: None,
+                metadata: json!({
+                    "total_observed_bytes": self.bytes,
+                    "retained_bytes": 0,
+                    "head_bytes": 0,
+                    "tail_bytes": 0,
+                    "truncated": false,
+                    "complete": complete,
+                    "encoding": "binary",
+                    "capture_state": if self.observed { "digest_only" } else { "absent" },
+                }),
+            },
+        };
+        captured.metadata["sha256"] =
+            json!(self.observed.then(|| hex::encode(self.hash.finalize())));
+        captured.metadata["chunks"] = json!(self.chunks);
+        captured
     }
 }
 #[derive(Default)]
@@ -108,6 +126,7 @@ fn native_request_summary(summary: &Value) -> Value {
         "has_tools",
         "has_images",
         "has_tool_results",
+        "thinking_tags",
     ] {
         if let Some(value) = summary.get(name).and_then(Value::as_bool) {
             safe.insert(name.into(), json!(value));
@@ -215,17 +234,22 @@ impl Attempt {
         }
         state.sync_native_metadata();
     }
-    /// Tag Kiro observations so usage provenance stays vendor-specific.
+    /// Kiro credentials live in redacted headers, not in its encoded request.
+    /// Retain bounded raw upstream evidence before the final recording/error gate.
     pub fn configure_kiro_stream(&self) {
         self.configure_native_stream();
         let mut state = self.0.lock().unwrap();
         if let Some(native) = state.native.as_mut() {
             native.vendor = "kiro";
+            if native.response.payload.is_none() && !native.response.observed {
+                native.response = NativeCapture::retaining();
+            }
         }
         state.sync_native_metadata();
     }
-    /// Capture the exact encoded native request once, with redacted headers and
-    /// allowlisted content-free counts/flags. Never persist full binary history.
+    /// Capture the encoded native request with redacted headers and allowlisted
+    /// content-free counts/flags. Kiro retains bounded bytes; credential-bearing
+    /// native protocols remain digest-only. Neither path changes the wire data.
     pub fn note_native_request(
         &self,
         headers: &reqwest::header::HeaderMap,
@@ -479,7 +503,11 @@ impl Attempt {
 }
 impl State {
     fn native_request(&mut self, data: &[u8], summary: &Value) {
-        let mut capture = NativeCapture::default();
+        let mut capture = if self.native.as_ref().is_some_and(|n| n.vendor == "kiro") {
+            NativeCapture::retaining()
+        } else {
+            NativeCapture::default()
+        };
         capture.push(data);
         let mut capture = capture.finish(true);
         capture.metadata["semantic_summary"] = if summary.is_null() {
@@ -859,6 +887,17 @@ impl<S> Drop for ObservedStream<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+
+    fn retained_bytes(capture: &CapturedPayload) -> Vec<u8> {
+        let body = capture.body.as_deref().expect("observed native bytes");
+        match capture.metadata["encoding"].as_str().unwrap() {
+            "utf8" => body.as_bytes().to_vec(),
+            "base64" => STANDARD.decode(body).unwrap(),
+            encoding => panic!("unexpected capture encoding: {encoding}"),
+        }
+    }
+
     fn entry() -> LogEntry {
         LogEntry {
             provider_key_name: None,
@@ -940,8 +979,72 @@ mod tests {
         assert!(capture.metadata.to_string().len() < 512);
     }
 
+    #[test]
+    fn retaining_native_capture_preserves_exact_bytes_and_full_hash_with_bounded_memory() {
+        use crate::logging::payload::{BODY_CAPTURE_LIMIT, BODY_HEAD_LIMIT, BODY_TAIL_LIMIT};
+
+        let data: Vec<u8> = (0..=255).cycle().take(2 * BODY_CAPTURE_LIMIT + 7).collect();
+        let mut expected = data[..BODY_HEAD_LIMIT].to_vec();
+        expected.extend_from_slice(&data[data.len() - BODY_TAIL_LIMIT..]);
+        for size in [1, 4093, BODY_CAPTURE_LIMIT + 13] {
+            let mut capture = NativeCapture::retaining();
+            for chunk in data.chunks(size) {
+                capture.push(chunk);
+                assert!(capture.payload.as_ref().unwrap().retained_bytes() <= BODY_CAPTURE_LIMIT);
+            }
+            let captured = capture.finish(true);
+            assert_eq!(retained_bytes(&captured), expected, "chunk size {size}");
+            assert_eq!(captured.metadata["capture_state"], "captured");
+            assert_eq!(captured.metadata["encoding"], "base64");
+            assert_eq!(captured.metadata["retained_bytes"], BODY_CAPTURE_LIMIT);
+            assert_eq!(captured.metadata["total_observed_bytes"], data.len());
+            assert_eq!(captured.metadata["head_bytes"], BODY_HEAD_LIMIT);
+            assert_eq!(captured.metadata["tail_bytes"], BODY_TAIL_LIMIT);
+            assert_eq!(captured.metadata["truncated"], true);
+            assert_eq!(captured.metadata["complete"], true);
+            assert_eq!(
+                captured.metadata["sha256"],
+                hex::encode(Sha256::digest(&data))
+            );
+            assert_eq!(captured.metadata["chunks"], data.len().div_ceil(size));
+        }
+    }
+
+    #[test]
+    fn retaining_native_capture_distinguishes_absence_empty_partial_and_full() {
+        let absent = NativeCapture::retaining().finish(false);
+        assert!(absent.body.is_none());
+        assert_eq!(absent.metadata["encoding"], "none");
+        assert_eq!(absent.metadata["capture_state"], "absent");
+        assert_eq!(absent.metadata["sha256"], Value::Null);
+        assert_eq!(absent.metadata["chunks"], 0);
+
+        for (data, complete) in [
+            (b"".as_slice(), true),
+            (b"\xffpartial", false),
+            (b"{\"content\":\"ok\"}", true),
+        ] {
+            let mut capture = NativeCapture::retaining();
+            capture.push(data);
+            let captured = capture.finish(complete);
+            assert_eq!(retained_bytes(&captured), data);
+            assert_eq!(captured.metadata["retained_bytes"], data.len());
+            assert_eq!(captured.metadata["complete"], complete);
+            assert_eq!(captured.metadata["truncated"], false);
+            assert_eq!(
+                captured.metadata["sha256"],
+                hex::encode(Sha256::digest(data))
+            );
+            assert_eq!(captured.metadata["chunks"], u64::from(!data.is_empty()));
+            assert_eq!(
+                captured.metadata["capture_state"],
+                if data.is_empty() { "empty" } else { "captured" }
+            );
+        }
+    }
+
     #[tokio::test]
-    async fn native_request_redacts_headers_and_never_retains_history() {
+    async fn kiro_native_request_and_response_retain_bytes_with_redacted_headers() {
         let (a, g, mut rx) = setup();
         let mut headers = reqwest::header::HeaderMap::new();
         headers.insert(
@@ -950,8 +1053,12 @@ mod tests {
         );
         headers.insert("x-session-token", "private-token".parse().unwrap());
         headers.insert("cookie", "private-cookie".parse().unwrap());
-        headers.insert("content-type", "application/connect+proto".parse().unwrap());
+        headers.insert(
+            "content-type",
+            "application/vnd.amazon.eventstream".parse().unwrap(),
+        );
         let binary = b"\xff\x00private-history";
+        a.configure_kiro_stream();
         a.note_native_request(
             &headers,
             binary,
@@ -959,6 +1066,7 @@ mod tests {
                 "message_count": 3,
                 "tool_count": "private-history",
                 "has_tools": true,
+                "thinking_tags": true,
                 "history": ["private-history"],
                 "authorization": "private-credential",
                 "nested": {"history_bytes": 25},
@@ -972,8 +1080,16 @@ mod tests {
         drop(g);
         axum::body::to_bytes(body.into_body(), 100).await.unwrap();
         let log = rx.try_recv().unwrap();
-        assert!(log.upstream_request_body.is_none());
-        assert!(log.upstream_response_body.is_none());
+        assert_eq!(
+            STANDARD.decode(log.upstream_request_body.unwrap()).unwrap(),
+            binary
+        );
+        assert_eq!(
+            STANDARD
+                .decode(log.upstream_response_body.unwrap())
+                .unwrap(),
+            b"\xfe\x00response-history"
+        );
         assert_eq!(log.performance.response_mode, "stream");
         assert_eq!(log.performance.effort_status, "unknown");
         let headers = log.upstream_request_headers.unwrap();
@@ -991,11 +1107,22 @@ mod tests {
         assert_eq!(
             metadata["upstream_request_body"]["semantic_summary"],
             json!({
-                "message_count": 3, "has_tools": true,
+                "message_count": 3, "has_tools": true, "thinking_tags": true,
             })
         );
         assert!(!metadata.to_string().contains("private-"));
-        assert_eq!(metadata["upstream_response_body"]["retained_bytes"], 0);
+        assert_eq!(
+            metadata["upstream_response_body"]["retained_bytes"],
+            b"\xfe\x00response-history".len()
+        );
+        assert_eq!(
+            metadata["upstream_request_body"]["capture_state"],
+            "captured"
+        );
+        assert_eq!(
+            metadata["upstream_response_body"]["capture_state"],
+            "captured"
+        );
     }
 
     #[tokio::test]
@@ -1029,6 +1156,59 @@ mod tests {
         assert_eq!(metadata["native_stream"]["terminal"], "devin_turn_ended");
         assert_eq!(metadata["usage_provenance"]["source"], "devin_native");
         assert!(!metadata.to_string().contains("private-token"));
+    }
+
+    #[tokio::test]
+    async fn repeated_kiro_configuration_preserves_capture_and_request_summary() {
+        let (attempt, producer, mut receiver) = setup();
+        let request = br#"{"conversationState":{"history":["private dialogue"]}}"#;
+        attempt.configure_kiro_stream();
+        attempt.note_native_request(
+            &reqwest::header::HeaderMap::new(),
+            request,
+            &json!({"message_count": 2}),
+        );
+        // The transport observes the same request after the provider attaches its
+        // summary. Reconfiguration must neither drop response bytes nor hash the
+        // same request twice.
+        attempt.request(request);
+        attempt.chunk(b"first");
+        attempt.configure_kiro_stream();
+        attempt.chunk(b"second");
+        attempt.observe_native_terminal(NativeTerminalEvidence::Completed);
+        attempt.eof();
+        let response = attempt.wrap(Response::new(Body::empty()));
+        producer.finish();
+        drop(producer);
+        axum::body::to_bytes(response.into_body(), 100)
+            .await
+            .unwrap();
+        let log = receiver.try_recv().unwrap();
+        assert_eq!(
+            log.upstream_request_body.as_deref(),
+            Some(std::str::from_utf8(request).unwrap())
+        );
+        assert_eq!(log.upstream_response_body.as_deref(), Some("firstsecond"));
+        let metadata = log.diagnostic.payload_metadata;
+        assert_eq!(
+            metadata["upstream_request_body"]["sha256"],
+            hex::encode(Sha256::digest(request))
+        );
+        assert_eq!(metadata["upstream_request_body"]["chunks"], 1);
+        assert_eq!(
+            metadata["upstream_request_body"]["semantic_summary"]["message_count"],
+            2
+        );
+        assert_eq!(
+            metadata["upstream_response_body"]["sha256"],
+            hex::encode(Sha256::digest(b"firstsecond"))
+        );
+        assert_eq!(metadata["upstream_response_body"]["chunks"], 2);
+        assert_eq!(
+            metadata["native_stream"]["format"],
+            "application/vnd.amazon.eventstream"
+        );
+        assert_eq!(metadata["native_stream"]["terminal"], "kiro_turn_ended");
     }
 
     #[tokio::test]
@@ -1136,8 +1316,9 @@ mod tests {
         ] {
             for outcome in ["failed", "timed_out", "cancelled", "output_limited"] {
                 let (a, g, mut rx) = setup();
-                a.configure_native_stream();
-                a.chunk(b"\x00original");
+                a.configure_kiro_stream();
+                a.request(br#"{"conversationState":{"history":["debug request"]}}"#);
+                a.chunk(b"\xfforiginal");
                 a.observe_native_terminal(evidence);
                 if outcome == "cancelled" {
                     a.0.lock().unwrap().cancellation.cancel();
@@ -1159,6 +1340,29 @@ mod tests {
                 let log = rx.try_recv().unwrap();
                 assert_eq!(log.performance.completion, outcome);
                 assert!(log.performance.completed_at.is_none());
+                assert!(crate::logging::diagnostics::force_payload(
+                    Some(log.client_status_code),
+                    log.upstream_status_code,
+                    &log.diagnostic,
+                ));
+                assert_eq!(
+                    log.upstream_request_body.as_deref(),
+                    Some(r#"{"conversationState":{"history":["debug request"]}}"#)
+                );
+                assert_eq!(
+                    STANDARD
+                        .decode(log.upstream_response_body.unwrap())
+                        .unwrap(),
+                    b"\xfforiginal"
+                );
+                let metadata = &log.diagnostic.payload_metadata["upstream_response_body"];
+                assert_eq!(metadata["complete"], false);
+                assert_eq!(metadata["truncated"], false);
+                assert_eq!(metadata["retained_bytes"], 9);
+                assert_eq!(
+                    metadata["sha256"],
+                    hex::encode(Sha256::digest(b"\xfforiginal"))
+                );
             }
         }
     }

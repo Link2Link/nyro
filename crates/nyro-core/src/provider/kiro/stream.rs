@@ -539,14 +539,10 @@ impl Session {
     fn frame(&mut self, frame: Frame, events: &mut Vec<AiStreamDelta>) -> Result<(), GatewayError> {
         match frame.message_type() {
             "exception" => return Err(exception(frame.exception_type(), &frame.payload)),
-            "error" => {
-                let code = frame
-                    .headers
-                    .get(":error-code")
-                    .map(String::as_str)
-                    .unwrap_or("");
-                return Err(failure(502, &format!("Kiro stream error: {code}")));
-            }
+            // Arbitrary error-code/message headers may echo credentials. The
+            // privileged raw capture preserves them; public errors and durable
+            // diagnostic metadata must never copy these untrusted strings.
+            "error" => return Err(failure(502, "Kiro stream returned an error")),
             _ => {}
         }
         let kind = frame.event_type();

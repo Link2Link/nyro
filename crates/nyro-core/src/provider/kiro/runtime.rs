@@ -29,8 +29,12 @@ use crate::{
 };
 
 const STREAM_TARGET: &str = "AmazonCodeWhispererStreamingService.GenerateAssistantResponse";
-/// Error bodies are bounded classification input, never forwarded or retained.
+/// The safe classification prefix is independent of the bounded admin raw copy.
+/// Neither raw error bodies nor arbitrary upstream strings reach public errors.
 const MAX_ERROR_BYTES: usize = super::errors::MAX_ERROR_BYTES;
+/// Do not let an endless error body keep a rejected attempt/failover open when
+/// the client has no total deadline. Any cutoff remains an incomplete capture.
+const ERROR_CAPTURE_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_USAGE_BYTES: usize = 1024 * 1024;
 
 fn sensitive(value: &str) -> Result<HeaderValue, GatewayError> {
@@ -262,25 +266,28 @@ async fn read_limited(
 ) -> (Vec<u8>, bool) {
     let mut stream = Box::pin(response.bytes_stream());
     let mut body = Vec::new();
+    let mut fits = true;
+    let capture_deadline = (tokio::time::Instant::now() + ERROR_CAPTURE_TIMEOUT)
+        .min(tokio::time::Instant::from_std(control.deadline.at()));
     loop {
         let chunk = tokio::select! {
             biased;
             _ = control.cancellation.cancelled() => return (body, false),
-            _ = tokio::time::sleep_until(tokio::time::Instant::from_std(control.deadline.at())) => return (body, false),
+            _ = tokio::time::sleep_until(capture_deadline) => return (body, false),
             chunk = stream.next() => chunk,
         };
         match chunk {
             Some(Ok(chunk)) => {
                 let room = limit.saturating_sub(body.len());
                 body.extend_from_slice(&chunk[..chunk.len().min(room)]);
-                if chunk.len() > room {
-                    return (body, false);
-                }
-                // At exactly the limit, only EOF proves completeness. The next
-                // poll is bounded by the same request deadline/cancellation.
+                fits &= chunk.len() <= room;
+                // Classification stays bounded, but keep draining through the
+                // observed transport so logs retain the raw error's head/tail,
+                // hash and actual EOF. Never mistake a retained prefix for a
+                // complete error envelope. Deadline/cancellation still apply.
             }
             Some(Err(_)) => return (body, false),
-            None => return (body, true),
+            None => return (body, fits),
         }
     }
 }
@@ -792,6 +799,62 @@ mod tests {
             out.extend(batch?);
         }
         Ok(out)
+    }
+
+    #[tokio::test]
+    async fn error_capture_budget_bounds_active_stream_without_a_total_deadline() {
+        let app = Router::new().route(
+            "/generateAssistantResponse",
+            post(|| async {
+                let stream = futures::stream::unfold((), |()| async {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    Some((
+                        Ok::<_, std::io::Error>(Bytes::from_static(b"error detail")),
+                        (),
+                    ))
+                });
+                Response::builder()
+                    .status(400)
+                    .body(Body::from_stream(stream))
+                    .unwrap()
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let (tx, _rx) = mpsc::channel(2);
+        let control = AttemptControl {
+            deadline: Deadline::never(),
+            cancellation: CancellationToken::new(),
+            performance: crate::performance::Attempt::new(
+                tx,
+                CancellationToken::new(),
+                Deadline::never(),
+            ),
+            run_submitted: Arc::new(AtomicBool::new(false)),
+            local_failure: Arc::new(AtomicBool::new(false)),
+            rejected: Arc::new(AtomicBool::new(false)),
+        };
+        let response = client(&control)
+            .call_stream_raw(
+                &format!("http://{address}/generateAssistantResponse"),
+                HeaderMap::new(),
+                Bytes::new(),
+            )
+            .await
+            .unwrap();
+        let started = std::time::Instant::now();
+        let result = tokio::time::timeout(
+            ERROR_CAPTURE_TIMEOUT + Duration::from_secs(2),
+            read_limited(response, 8, &control),
+        )
+        .await;
+        server.abort();
+        let _ = server.await;
+        let (prefix, complete) = result.expect("active error stream must not drain indefinitely");
+        assert_eq!(prefix, b"error de");
+        assert!(!complete, "a time-budget cutoff must not masquerade as EOF");
+        assert!(started.elapsed() >= ERROR_CAPTURE_TIMEOUT);
     }
 
     #[tokio::test]

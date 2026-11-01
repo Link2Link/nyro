@@ -10,8 +10,9 @@ service. HTTP and desktop administration consume the same core semantics.
 
 ## Scope and invariants
 
-- Preserve evidence for confirmed failures, timeouts, cancellations, and output
-  limits even when ordinary payload recording is disabled.
+- Preserve bounded evidence for HTTP/stream failures, timeouts, cancellations,
+  output limits, and actively observed uncertain outcomes even when ordinary
+  payload recording is disabled.
 - Distinguish a failed attempt from the eventual result of a client request that
   may have retried. Do not add final-result rows to attempt statistics.
 - Treat missing or unsupported evidence as **unknown**, not success or failure.
@@ -150,15 +151,20 @@ The final retention gate is:
 
 ```text
 retain = is_error
-      OR (outcome_version == 1 AND attempt_outcome IN {cancelled, output_limited})
+      OR (outcome_version == 1 AND attempt_outcome IN {cancelled, output_limited, unknown})
       OR (global_enable_payload AND model_enable_payload.unwrap_or(true))
 ```
 
-Thus confirmed abnormal outcomes override both ordinary switches. Ordinary
-completed/unknown attempts obey the global/model gate and use the **same caps**
-when retained. A model override does not bypass a disabled global switch for
-ordinary traffic. Forced retention means retaining the bounded evidence that was
-actually observed, not guaranteeing four complete bodies or durable persistence.
+Thus HTTP/stream errors and versioned abnormal or uncertain outcomes override
+both ordinary switches. Version-1 `unknown` means an observer actively could not
+confirm the result; unlike version-0 legacy/default `unknown`, it forces retention
+for diagnosis without becoming an error. Completed attempts and version-0 unknown
+attempts obey the global/model gate and use the **same caps** when retained. With
+either switch off, successful attempts discard their payloads. A model override
+does not bypass a disabled global switch for ordinary traffic. Forced retention
+means retaining the bounded evidence actually observed, not guaranteeing four
+complete bodies or durable persistence. In particular, transport interruption
+leaves `complete: false`, even if every byte observed so far fits within the cap.
 
 ### Native Devin/Kiro diagnostics
 
@@ -168,10 +174,44 @@ The client JSON capture is reserialized JSON (not byte-exact original whitespace
 and retains the existing size limits and retention gates. Body contents are not
 recursively scrubbed; the admin-only privacy rules below still apply.
 
-Native **upstream** bodies remain digest-only (`encoding: binary`,
-`capture_state: digest_only`), regardless of the payload switch. This is a capture
-policy, not content detection: Kiro's JSON request also uses it. Devin's protobuf
-request embeds credentials, so enabling payload recording must not persist it.
+**Kiro upstream** JSON requests and AWS EventStream responses use the same
+bounded raw-body capture as ordinary HTTP bodies. When ordinary recording is
+enabled globally and for the model, or an abnormal outcome forces retention,
+observed bodies within 1 MiB are retained in full; larger bodies retain only the
+512 KiB head and 512 KiB tail, with an explicit missing-middle count. Text uses
+`encoding: utf8`; binary data (or UTF-8 split at a retained boundary) uses
+`encoding: base64`, not a digest-only substitute. `capture_state` is `captured`,
+`empty`, or `absent` before the final retention gate. Interruption keeps
+`complete: false`, independently of size truncation.
+
+Kiro capture metadata additionally preserves `sha256` over **all observed raw
+bytes**, including a truncated middle that is no longer retained, and `chunks`
+counts non-empty observed chunks. Explicit empty bodies have the SHA-256 of empty
+bytes and zero chunks; absent directions have `sha256: null` and zero chunks.
+A hash for an incomplete capture does not cover bytes never observed, and cannot
+restore a discarded middle. The UI displays hash/chunk evidence alongside the
+retained UTF-8/Base64 data. Downloads preserve exact retained text/decoded bytes;
+Base64 head/tail segments must be decoded separately and are not a replayable full
+body when truncated.
+
+Kiro HTTP-error classification/sanitized diagnostics still use an independent
+**16 KiB** parse window; raw evidence retains the **1 MiB** body cap. HTTP-error
+reading continues after that parse window fills, but has an additional **5-second
+total drain budget** to prevent an unbounded error stream from blocking the
+request. EOF, read failure, cancellation, or a shorter existing request deadline
+or idle timeout can stop it earlier. Budget expiry leaves `complete: false`; it
+does not change the raw-byte cap. A safe diagnostic marked `incomplete_or_oversized` therefore
+does not mean the raw body was discarded; inspect its capture metadata separately.
+The Kiro request summary also includes the `thinking_tags` boolean to compare the
+parser setting with the retained request and response evidence.
+
+**Devin upstream** bodies remain digest-only (`encoding: binary`,
+`capture_state: digest_only`), regardless of the payload switch. Its protobuf
+request embeds credentials, so enabling raw capture indiscriminately is unsafe;
+this provider-specific exception remains in place. Older Kiro/other native
+`digest_only` records are still readable as digest evidence, not corrupt or
+missing bodies, but their original bytes cannot be recovered. A digest-only
+record does not describe the new Kiro capture policy.
 
 Structured Devin HTTP errors and Connect error trailers additionally expose
 `payload_metadata.devin_upstream_error` with `source`, `code`, `message`, and
@@ -188,12 +228,12 @@ payloads are cleared; it does not change public errors, scheduling, or retries.
 `payload_metadata` is keyed by the eight payload field names (for example
 `client_request_body` or `upstream_response_headers`). Entries describe:
 
-- `capture_state`: `captured`, `empty`, `absent`, or `not_retained`;
+- `capture_state`: `captured`, `empty`, `absent`, `not_retained`, or the legacy/provider-safe `digest_only`;
 - `complete`: whether the observed direction completed; independent of truncation;
 - `total_observed_bytes`, `retained_bytes`, and `truncated`;
-- `encoding`: `utf8`, `base64`, or `none` as appropriate;
-- body `head_bytes`/`tail_bytes`, or header `total_headers`, `retained_headers`,
-  `omitted_headers`, and `redacted_headers`.
+- `encoding`: `utf8`, `base64`, or `none` as appropriate (`binary` only for digest-only native evidence);
+- body `head_bytes`/`tail_bytes`, optional native `sha256`/`chunks`, or header
+  `total_headers`, `retained_headers`, `omitted_headers`, and `redacted_headers`.
 
 The UI distinguishes full, partial, absent, truncated, Base64, and administratively
 cleared data rather than treating every non-null string as a complete body.
