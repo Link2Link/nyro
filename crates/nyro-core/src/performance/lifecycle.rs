@@ -298,6 +298,11 @@ impl Attempt {
     pub fn is_timed_out(&self) -> bool {
         self.0.lock().unwrap().diagnostic.attempt_outcome == "timed_out"
     }
+    /// Numeric wire fact only, including responses whose diagnostic body capture
+    /// was cut short by a probe deadline. Not the gateway's mapped error status.
+    pub fn upstream_status(&self) -> Option<u16> {
+        self.0.lock().unwrap().upstream_status
+    }
     /// Original-wire completion plus full HTTP-layer consumption, even before
     /// EOF/EOS. Only consult between successful sends: an unsent converted frame
     /// is not part of the drain counters. Callers must also verify that the

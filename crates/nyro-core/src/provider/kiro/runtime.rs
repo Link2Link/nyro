@@ -14,7 +14,6 @@ use super::stream::{Session, SessionOptions};
 use super::usage::{self, KiroUsage};
 use super::{catalog, request, unavailable};
 use crate::auth::types::StoredCredential;
-use crate::protocol::ids::KIRO_CHAT_V1;
 use crate::protocol::ir::{AiRequest, AiStreamDelta};
 use crate::provider::native::{AttemptControl, IrUpstream, SessionGuard};
 use crate::provider::vendor::ProviderCtx;
@@ -613,7 +612,12 @@ pub(crate) async fn probe(
     prompt: Option<&str>,
 ) -> anyhow::Result<String> {
     use crate::protocol::ir::request::{Message as ChatMessage, MessageContent, Role};
-    super::validate(provider)?;
+    let deadline = Deadline::from_now(Duration::from_secs(60));
+    let cancellation = CancellationToken::new();
+    let performance =
+        crate::performance::Attempt::new(gw.log_tx.clone(), cancellation.clone(), deadline.clone());
+    super::validate(provider)
+        .map_err(|error| probe_failure(error, &performance, "configuration", None))?;
     let token = credential.access_token.as_deref().unwrap_or_default();
     let mut request = AiRequest::new(
         model,
@@ -626,29 +630,40 @@ pub(crate) async fn probe(
         }],
     );
     request.stream.enabled = true;
-    let deadline = Deadline::from_now(Duration::from_secs(60));
-    let cancellation = CancellationToken::new();
-    let performance =
-        crate::performance::Attempt::new(gw.log_tx.clone(), cancellation.clone(), deadline.clone());
-    let client = ProxyClient::new(gw.devin_http_client(provider.use_proxy, true).await?)
+    let client = tokio::time::timeout_at(
+        tokio::time::Instant::from_std(deadline.at()),
+        gw.devin_http_client(provider.use_proxy, true),
+    )
+    .await
+    .map_err(|_| {
+        probe_failure(
+            GatewayError::UpstreamTimeout {
+                phase: TimeoutPhase::Total,
+            },
+            &performance,
+            "transport_setup",
+            None,
+        )
+    })?
+    .map_err(|_| {
+        probe_failure(
+            unavailable("Unable to prepare Kiro model probe transport"),
+            &performance,
+            "transport_setup",
+            None,
+        )
+    })?;
+    let client = ProxyClient::new(client)
         .with_timeouts(gw.config.upstream_timeouts)
         .with_deadline(deadline.clone())
         .with_performance(performance.clone());
-    let ctx = ProviderCtx {
-        provider,
-        protocol: KIRO_CHAT_V1,
-        egress_base_url: &provider.base_url,
-        api_key: token,
-        auth_scheme: "oauth",
-        actual_model: model,
-        force_max_reasoning: false,
-        credential: Some(credential),
-        gw,
-        disable_default_auth: true,
-    };
-    let mut upstream = start(
+    let credential = KiroCredential::from_stored(credential);
+    execute_probe(
         request,
-        &ctx,
+        model,
+        token,
+        &credential,
+        credential.generate_url(token),
         client,
         AttemptControl {
             deadline,
@@ -659,26 +674,102 @@ pub(crate) async fn probe(
             rejected: Arc::new(AtomicBool::new(false)),
         },
     )
-    .await?;
-    let mut completed = false;
-    let mut reply = String::new();
-    while let Some(batch) = upstream.events.next().await {
-        for event in batch? {
-            match event {
-                AiStreamDelta::TextDelta(text) => reply.push_str(&text),
-                AiStreamDelta::Done { stop_reason } => {
-                    completed = stop_reason == "stop" || stop_reason == "length"
+    .await
+}
+
+/// Use the same wire encoder/transport as inference, but do not enqueue an
+/// inference log or update scheduling from an explicit diagnostic generation.
+async fn execute_probe(
+    request: AiRequest,
+    model: &str,
+    token: &str,
+    credential: &KiroCredential,
+    url: String,
+    transport: ProxyClient,
+    control: AttemptControl,
+) -> anyhow::Result<String> {
+    let performance = control.performance.clone();
+    let deadline = tokio::time::Instant::from_std(control.deadline.at());
+    let result = tokio::time::timeout_at(
+        deadline,
+        execute(request, model, token, credential, url, transport, control),
+    )
+    .await
+    .unwrap_or_else(|_| {
+        Err(GatewayError::UpstreamTimeout {
+            phase: TimeoutPhase::Total,
+        })
+    });
+    let mut upstream = result.map_err(|error| probe_failure(error, &performance, "start", None))?;
+    let status = upstream.status;
+    let result = tokio::time::timeout_at(deadline, async {
+        let mut completed = false;
+        let mut reply = String::new();
+        while let Some(batch) = upstream.events.next().await {
+            for event in batch? {
+                match event {
+                    AiStreamDelta::TextDelta(text) => reply.push_str(&text),
+                    AiStreamDelta::Done { stop_reason } => {
+                        completed = stop_reason == "stop" || stop_reason == "length"
+                    }
+                    _ => {}
                 }
-                _ => {}
             }
         }
-    }
-    anyhow::ensure!(completed, "Kiro probe did not reach verified completion");
-    Ok(if reply.is_empty() {
-        "[completed]".into()
-    } else {
-        reply
+        if !completed {
+            // The worker can close its channel when the deadline wins its send
+            // race. A closed channel must not overwrite an observed timeout.
+            return Err(
+                if performance.is_timed_out() || tokio::time::Instant::now() >= deadline {
+                    GatewayError::UpstreamTimeout {
+                        phase: TimeoutPhase::Total,
+                    }
+                } else {
+                    GatewayError::StreamParseError {
+                        provider: "kiro".into(),
+                        raw_chunk: None,
+                    }
+                },
+            );
+        }
+        Ok(if reply.is_empty() {
+            "[completed]".into()
+        } else {
+            reply
+        })
     })
+    .await
+    .unwrap_or_else(|_| {
+        Err(GatewayError::UpstreamTimeout {
+            phase: TimeoutPhase::Total,
+        })
+    });
+    result.map_err(|error| probe_failure(error, &performance, "stream", Some(status)).into())
+}
+
+fn probe_failure(
+    error: GatewayError,
+    performance: &crate::performance::Attempt,
+    stage: &'static str,
+    http_status: Option<u16>,
+) -> crate::provider::native::ModelProbeFailure {
+    let diagnostic = performance.diagnostic();
+    let facts = super::errors::probe_facts(&diagnostic.payload_metadata["kiro_upstream_error"]);
+    let http_status = http_status.or_else(|| performance.upstream_status());
+    // Only static classifications and numeric wire facts belong in the process
+    // journal. Never log the raw error, body, prompt, headers or account label.
+    tracing::warn!(
+        probe_id = %diagnostic.log_id,
+        stage,
+        upstream_http_status = ?http_status,
+        gateway_status = error.http_status().as_u16(),
+        error_code = error.stable_code(),
+        failure_reason = ?error.account_failure().map(|failure| failure.reason),
+        timeout_phase = ?match &error { GatewayError::UpstreamTimeout { phase } => Some(phase.as_str()), _ => None },
+        diagnostic = %facts,
+        "Kiro model probe failed"
+    );
+    crate::provider::native::ModelProbeFailure::new(error, diagnostic.log_id, stage, http_status)
 }
 
 #[cfg(test)]
@@ -953,6 +1044,212 @@ mod tests {
         server.abort();
         let (headers, _) = captured.await.unwrap();
         assert_eq!(headers["tokentype"], "API_KEY");
+    }
+
+    #[tokio::test]
+    async fn model_probe_http_failures_keep_wire_status_and_safe_classification() {
+        for (status, body, expected) in [
+            (
+                401,
+                r#"{"message":"invalid token SECRET"}"#,
+                "authentication",
+            ),
+            (402, r#"{"message":"quota SECRET"}"#, "quota is exhausted"),
+            (
+                403,
+                r#"{"__type":"AccessDeniedException","message":"PRIVATE"}"#,
+                "Model access",
+            ),
+            (
+                422,
+                r#"{"message":"PRIVATE"}"#,
+                "rejected the model probe request",
+            ),
+            (429, r#"{"message":"PRIVATE"}"#, "rate limited"),
+            (503, r#"{"message":"PRIVATE"}"#, "capacity"),
+        ] {
+            let (url, _captured, server) = mock(status, body.as_bytes().to_vec()).await;
+            let mut control = control();
+            let (tx, mut rx) = mpsc::channel(2);
+            control.performance = crate::performance::Attempt::new(
+                tx,
+                control.cancellation.clone(),
+                control.deadline.clone(),
+            );
+            let performance = control.performance.clone();
+            let probe_id = performance.diagnostic().log_id;
+            let result = execute_probe(
+                input(),
+                "claude-opus-5.5",
+                "SECRET",
+                &credential(),
+                url,
+                client(&control),
+                control,
+            )
+            .await;
+            server.abort();
+            let error = result.unwrap_err();
+            let message = crate::provider::native::model_probe_error(&error);
+            assert!(message.contains(expected), "{message}");
+            assert!(
+                message.contains(&format!("upstream HTTP {status}")),
+                "{message}"
+            );
+            assert!(
+                message.contains(&format!("probe_id={probe_id}")),
+                "{message}"
+            );
+            assert!(message.contains("stage=start"), "{message}");
+            assert!(!message.contains("SECRET"));
+            assert!(!message.contains("PRIVATE"));
+            if status == 402 {
+                assert!(message.contains("gateway status 429"));
+            }
+            if status == 422 {
+                assert!(message.contains("gateway status 400"));
+            }
+            assert!(
+                matches!(rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)),
+                "probes must not enqueue inference logs"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn model_probe_stream_failures_do_not_report_mapped_status_as_http_status() {
+        let mut malformed = encode_event("assistantResponseEvent", r#"{"content":"partial"}"#);
+        malformed.pop();
+        let limited = encode_frame(
+            &[
+                (":message-type", "exception"),
+                (":exception-type", "throttlingException"),
+            ],
+            br#"{"message":"SECRET PRIVATE"}"#,
+        );
+        for (wire, expected) in [
+            (malformed, "invalid or incomplete"),
+            (limited, "rate limited"),
+        ] {
+            let (url, _captured, server) = mock(200, wire).await;
+            let control = control();
+            let error = execute_probe(
+                input(),
+                "m",
+                "SECRET",
+                &credential(),
+                url,
+                client(&control),
+                control,
+            )
+            .await
+            .unwrap_err();
+            server.abort();
+            let message = crate::provider::native::model_probe_error(&error);
+            assert!(message.contains(expected), "{message}");
+            assert!(message.contains("upstream HTTP 200"), "{message}");
+            assert!(message.contains("stage=stream"), "{message}");
+            assert!(!message.contains("upstream HTTP 429"));
+            assert!(!message.contains("SECRET"));
+        }
+    }
+
+    #[tokio::test]
+    async fn model_probe_success_uses_real_opus_id_and_prompt() {
+        let wire = encode_event("assistantResponseEvent", r#"{"content":"OK"}"#);
+        let (url, captured, server) = mock(200, wire).await;
+        let control = control();
+        let reply = execute_probe(
+            input(),
+            "claude-opus-5.5",
+            "SECRET",
+            &credential(),
+            url,
+            client(&control),
+            control,
+        )
+        .await
+        .unwrap();
+        server.abort();
+        assert_eq!(reply, "OK");
+        let (_, body) = captured.await.unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        let current = &body["conversationState"]["currentMessage"]["userInputMessage"];
+        assert_eq!(current["modelId"], "claude-opus-5.5");
+        assert_eq!(current["content"], "hello");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn model_probe_deadline_is_reported_instead_of_an_unverified_completion() {
+        let control = control();
+        let performance = control.performance.clone();
+        tokio::time::advance(Duration::from_secs(6)).await;
+        let error = execute_probe(
+            input(),
+            "m",
+            "SECRET",
+            &credential(),
+            "http://127.0.0.1:1".into(),
+            client(&control),
+            control,
+        )
+        .await
+        .unwrap_err();
+        let message = crate::provider::native::model_probe_error(&error);
+        assert!(message.contains("timed out"), "{message}");
+        assert!(message.contains("probe_id="), "{message}");
+        assert!(
+            !message.contains("upstream HTTP"),
+            "a local timeout is not an HTTP response: {message}"
+        );
+        assert!(performance.diagnostic().payload_metadata["kiro_upstream_error"].is_null());
+    }
+
+    #[tokio::test]
+    async fn model_probe_stream_deadline_remains_a_timeout_after_http_acceptance() {
+        let app = Router::new().route(
+            "/generateAssistantResponse",
+            post(|| async {
+                let first = encode_event("assistantResponseEvent", r#"{"content":"partial"}"#);
+                let stream =
+                    futures::stream::once(
+                        async move { Ok::<_, std::io::Error>(Bytes::from(first)) },
+                    )
+                    .chain(futures::stream::pending());
+                Response::builder()
+                    .status(200)
+                    .body(Body::from_stream(stream))
+                    .unwrap()
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let mut control = control();
+        control.deadline = Deadline::from_now(Duration::from_millis(200));
+        let (tx, _rx) = mpsc::channel(2);
+        control.performance = crate::performance::Attempt::new(
+            tx,
+            control.cancellation.clone(),
+            control.deadline.clone(),
+        );
+        let error = execute_probe(
+            input(),
+            "m",
+            "SECRET",
+            &credential(),
+            format!("http://{address}/generateAssistantResponse"),
+            client(&control),
+            control,
+        )
+        .await
+        .unwrap_err();
+        server.abort();
+        let message = crate::provider::native::model_probe_error(&error);
+        assert!(message.contains("timed out"), "{message}");
+        assert!(message.contains("upstream HTTP 200"), "{message}");
+        assert!(message.contains("stage=stream"), "{message}");
+        assert!(!message.contains("invalid or incomplete"), "{message}");
     }
 
     #[tokio::test]

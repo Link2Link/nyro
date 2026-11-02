@@ -112,6 +112,8 @@ Devin 是 Nyro 正式支持的供应商，接入参考 CLIProxyAPI 已观察到�
 - 远程图片 URL、embedding、强制工具选择、结构化输出和不支持的有状态/生成选项会明确拒绝。原生接口无对应控制项，因此不转发采样参数（`temperature`、`top_p`、正数 `max_tokens`）。Token 用量由上游上下文占比或本地文本大小估算，不是权威计费数据。
 - **连接测试**和**用量查询**通过 `getUsageLimits` 获取数据，不生成聊天。显示套餐、合并额度池及基础/赠送/试用明细；同一资源的有效额度相加，单项耗尽但总池仍有余量时不会停用。总池耗尽后暂停调度，只有上游明确返回**已开启超额计费**时才继续作为 `usage` 路由策略的付费最后备选，Nyro 不会替用户开启超额计费。已过期赠送额度不计入总池；未知配额形状不会覆盖已知调度状态。**模型测试**会生成短回复，可能消耗额度，单次最多 16 个模型。
 
+- Kiro 模型测试失败会区分认证、模型权限、额度、限流、超时及响应异常。结果包含用于关联服务端 `Kiro model probe failed` 警告的 `probe_id`、失败阶段，以及确实收到响应时的上游 HTTP 状态；网关状态属于本地分类，不一定等于上游 HTTP 状态。警告仅保留白名单诊断信息，不记录 Token 或对话正文；模型测试不会生成推理请求日志或影响其统计。systemd 部署可执行 `journalctl -u <服务名> --since '10 minutes ago' --no-pager` 后定位对应 `probe_id`。网络或协议错误不应直接视为账号无模型权限。
+
 Kiro 是 Nyro 正式支持的供应商，适配器基于已观察到的 Kiro 协议行为实现。网页登录使用 Kiro Social 设备接口和 [AWS SSO OIDC API](https://docs.aws.amazon.com/singlesignon/latest/OIDCAPIReference/Welcome.html)，与 [Kiro 远程认证流程](https://kiro.dev/docs/getting-started/authentication/)一致。本地测试覆盖设备初始化/轮询、拒绝、超时、减速、取消、绑定、凭证隔离及聊天/配额行为；Google/GitHub 和 Builder ID 的真实端点已通过匿名初始化验证。真实账号批准授权，以及模型权限、刷新和计费的端到端验收仍需账号实测。
 
 ### 级联 Nyro 实例

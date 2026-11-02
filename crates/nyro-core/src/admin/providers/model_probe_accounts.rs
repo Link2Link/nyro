@@ -292,7 +292,7 @@ impl AdminService {
                     Err(error) => result_error(
                         &model,
                         &protocol,
-                        &safe_account_probe_error(&error.to_string()),
+                        &crate::provider::native::model_probe_error(&error),
                     ),
                 }
             };
