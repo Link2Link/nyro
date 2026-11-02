@@ -4,6 +4,18 @@ All notable changes to Nyro will be documented in this file.
 
 ---
 
+## v2.1.21
+
+> Released on 2026-11-02
+
+#### Fixes
+
+- **Native account model-probe errors**: Kiro and Devin account-scoped model tests now classify typed native failures instead of matching formatted error prefixes. Authentication, model access, quota, rate limits, capacity, timeouts and invalid responses no longer collapse into the same generic error; arbitrary upstream bodies and credential echoes remain excluded (#9)
+- **Traceable Kiro probe diagnostics**: failed tests return a `probe_id`, failure stage and observed upstream HTTP status, correlated with an allowlisted server warning. Actual HTTP status remains distinct from the gateway's mapped status, including HTTP 402 to 429 and stream failures after HTTP 200. Warnings omit tokens, account labels and conversation content, and probes do not create inference request-log rows or affect their statistics (#9)
+- **Kiro probe deadline handling**: transport setup and response consumption share the existing 60-second deadline. A stream channel closing at the deadline no longer masks a timeout as an invalid response; observed HTTP status survives interrupted diagnostic-body capture. Added seven regression tests and bilingual troubleshooting guidance; no database migration or inference routing changes are required (#9)
+
+---
+
 ## v2.1.20
 
 > Released on 2026-11-01
