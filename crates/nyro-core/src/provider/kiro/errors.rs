@@ -397,9 +397,68 @@ pub(super) fn diagnostic(
     diagnostic
 }
 
+/// Process-log projection of admin diagnostics. Free-form upstream strings can
+/// still contain conversation or PII after credential redaction; omit them here.
+pub(super) fn probe_facts(diagnostic: &Value) -> Value {
+    let mut facts = json!({});
+    if let Some(status) = diagnostic["status"]
+        .as_u64()
+        .filter(|status| (100..=599).contains(status))
+    {
+        facts["status"] = json!(status);
+    }
+    for field in ["code", "error_type"] {
+        if let Some(kind) = diagnostic[field].as_str().and_then(known_error_type) {
+            facts[field] = json!(kind);
+        }
+    }
+    if let Some(state @ ("json" | "invalid_json" | "incomplete_or_oversized")) =
+        diagnostic["body_state"].as_str()
+    {
+        facts["body_state"] = json!(state);
+    }
+    if let Some(
+        reason @ ("token_expired" | "token_invalid" | "permission_denied" | "account_suspended"
+        | "quota_exhausted"),
+    ) = diagnostic["reason_class"].as_str()
+    {
+        facts["reason_class"] = json!(reason);
+    }
+    facts
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn probe_journal_facts_only_keep_known_classifications() {
+        let facts = probe_facts(&json!({
+            "status": 403,
+            "code": "com.amazon#AccessDeniedException",
+            "error_type": "SECRET unknown upstream string",
+            "body_state": "json",
+            "reason_class": "permission_denied",
+            "message": "private conversation without credential markers",
+            "reason": "PRIVATE",
+            "param": "PRIVATE",
+            "request_id": "PRIVATE",
+        }));
+        assert_eq!(
+            facts,
+            json!({
+                "status":403,"code":"AccessDeniedException","body_state":"json",
+                "reason_class":"permission_denied"
+            })
+        );
+        assert_eq!(
+            probe_facts(&json!({
+                "status":65535,"code":"unknown","body_state":"PRIVATE","reason_class":"PRIVATE"
+            })),
+            json!({})
+        );
+        assert_eq!(probe_facts(&Value::Null), json!({}));
+    }
 
     #[test]
     fn fields_are_independent_and_sanitized_before_truncation() {

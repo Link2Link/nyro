@@ -339,6 +339,101 @@ async fn explicit_probe_rejects_unsupported_provider_and_hard_blocks_before_refr
 }
 
 #[test]
+fn native_probe_errors_keep_typed_categories_without_echoing_secrets() {
+    use crate::error::{
+        AccountFailure, AccountFailureReason as Reason, GatewayError, TimeoutPhase,
+    };
+    use crate::provider::native::{ModelProbeFailure, model_probe_error};
+
+    for (reason, status, expected) in [
+        (Reason::AuthInvalid, 401, "authentication"),
+        (Reason::ModelForbidden, 403, "Model access"),
+        (Reason::MonthlyQuota, 429, "quota is exhausted"),
+        (Reason::RateLimited, 429, "rate limited"),
+        (Reason::Capacity, 503, "capacity"),
+    ] {
+        let error = anyhow::Error::new(GatewayError::AccountUpstream {
+            provider: "Kiro",
+            status,
+            message: Some("SECRET upstream credential echo".into()),
+            failure: AccountFailure {
+                reason,
+                rejected_before_execution: true,
+                retry_after_seconds: None,
+            },
+        })
+        .context("SECRET outer context");
+        let message = model_probe_error(&error);
+        assert!(message.contains(expected), "{message}");
+        assert!(
+            message.contains(&format!("gateway status {status}")),
+            "{message}"
+        );
+        assert!(!message.contains("SECRET"), "{message}");
+    }
+    for (error, expected) in [
+        (
+            GatewayError::UpstreamTimeout {
+                phase: TimeoutPhase::FirstByte,
+            },
+            "timed out during first_byte",
+        ),
+        (
+            GatewayError::StreamParseError {
+                provider: "SECRET".into(),
+                raw_chunk: Some("SECRET".into()),
+            },
+            "invalid or incomplete",
+        ),
+        (
+            GatewayError::UpstreamStatus {
+                provider: "SECRET".into(),
+                status: 400,
+                body: Some("SECRET".into()),
+            },
+            "rejected the model probe request",
+        ),
+        (
+            GatewayError::UpstreamStatus {
+                provider: "SECRET".into(),
+                status: 404,
+                body: Some("SECRET".into()),
+            },
+            "not found",
+        ),
+        (
+            GatewayError::UpstreamStatus {
+                provider: "SECRET".into(),
+                status: 502,
+                body: Some("SECRET".into()),
+            },
+            "network settings",
+        ),
+    ] {
+        let message = model_probe_error(&anyhow::Error::new(error));
+        assert!(message.contains(expected), "{message}");
+        assert!(!message.contains("SECRET"), "{message}");
+    }
+    let failure = ModelProbeFailure::new(
+        GatewayError::UpstreamStatus {
+            provider: "kiro".into(),
+            status: 400,
+            body: Some("SECRET".into()),
+        },
+        "local-probe-id".into(),
+        "start",
+        Some(422),
+    );
+    let error = anyhow::Error::new(failure).context("local context");
+    let message = model_probe_error(&error);
+    assert!(message.contains("gateway status 400"));
+    assert!(message.contains("upstream HTTP 422"));
+    assert!(message.contains("probe_id=local-probe-id"));
+    assert!(!format!("{error:#?}").contains("SECRET"));
+    assert!(!model_probe_error(&anyhow::anyhow!("SECRET unknown failure")).contains("SECRET"));
+}
+
+#[test]
 fn account_probe_errors_never_echo_upstream_secrets() {
     for message in [
         "HTTP 401 SECRET-token",
