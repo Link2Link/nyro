@@ -148,17 +148,22 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # Pinned on purpose: `ubuntu-latest` rolled to Ubuntu 26.04
+          # (amd64v3 / AVX2 baseline) on 2026-11-02 and produced release
+          # binaries that crash with SIGILL on CPUs without AVX.
           - platform: linux-x86_64
-            os: ubuntu-latest
+            os: ubuntu-24.04
             binary: nyro-server
             asset: nyro-server-linux-x86_64
+            cflags: "-march=x86-64 -mtune=generic"
           # Static musl builds are the self-update assets: they run on any
           # Linux libc (Debian images, CentOS 7, Alpine).
           - platform: linux-x86_64-musl
-            os: ubuntu-latest
+            os: ubuntu-24.04
             target: x86_64-unknown-linux-musl
             binary: nyro-server
             asset: nyro-server-linux-x86_64-musl
+            cflags: "-march=x86-64 -mtune=generic"
           - platform: linux-aarch64-musl
             os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-musl
@@ -195,6 +200,11 @@ jobs:
         shell: bash
         env:
           TARGET: ${{ matrix.target }}
+          # Force the x86-64 baseline for bundled C dependencies (SQLite,
+          # zstd, ...). Without this a newer runner image whose compiler
+          # defaults to amd64v3 emits AVX2 instructions unconditionally.
+          CFLAGS: ${{ matrix.cflags }}
+          CXXFLAGS: ${{ matrix.cflags }}
         run: |
           if [[ -n "$TARGET" ]]; then
             cargo build -p nyro-server --release --target "$TARGET"
@@ -213,6 +223,39 @@ jobs:
           cp "$output/${{ matrix.binary }}" "dist/${{ matrix.asset }}"
           # The self-update installer smoke-tests `--version`; check it here too.
           "dist/${{ matrix.asset }}" --version
+
+      - name: Verify binary runs without AVX
+        if: ${{ matrix.platform != 'linux-aarch64-musl' }}
+        shell: bash
+        env:
+          ASSET: ${{ matrix.asset }}
+        run: |
+          # Release artifacts must run on CPUs without AVX/AVX2. qemu with the
+          # Nehalem CPU model lacks those extensions, so any AVX instruction
+          # the binary executes raises SIGILL -- the exact failure caused by
+          # building on an Ubuntu 26.04 (amd64v3) runner image.
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends qemu-user
+          data_dir="$(mktemp -d)"
+          log="$data_dir/server.log"
+          timeout 120 qemu-x86_64 -cpu Nehalem "dist/$ASSET" \
+            --data-dir "$data_dir" --mode proxy \
+            --proxy-host 127.0.0.1 --proxy-port 39530 >"$log" 2>&1 &
+          pid=$!
+          ok=0
+          for _ in $(seq 1 180); do
+            if grep -q "proxy listening" "$log" 2>/dev/null; then ok=1; break; fi
+            if ! kill -0 "$pid" 2>/dev/null; then break; fi
+            sleep 0.5
+          done
+          kill "$pid" 2>/dev/null
+          wait "$pid" 2>/dev/null || true
+          if [[ "$ok" != "1" ]]; then
+            echo "::error::$ASSET does not start on a CPU without AVX (SIGILL?)"
+            tail -n 40 "$log" || true
+            exit 1
+          fi
+          echo "OK: $ASSET starts on a CPU without AVX"
 
       - name: Upload server artifact
         uses: actions/upload-artifact@v7
@@ -233,7 +276,7 @@ jobs:
       matrix:
         include:
           - platform: linux-x86_64
-            os: ubuntu-latest
+            os: ubuntu-24.04
             bundles: appimage
           - platform: macos-aarch64
             os: macos-latest
@@ -287,6 +330,9 @@ jobs:
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          # Force the x86-64 baseline for C dependencies on the Linux build.
+          CFLAGS: ${{ matrix.platform == 'linux-x86_64' && '-march=x86-64 -mtune=generic' || '' }}
+          CXXFLAGS: ${{ matrix.platform == 'linux-x86_64' && '-march=x86-64 -mtune=generic' || '' }}
         run: cargo tauri build --bundles "${{ matrix.bundles }}"
 
       - name: Add architecture suffix to macOS updater bundle
