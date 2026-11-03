@@ -1,6 +1,6 @@
 # Coding-plan API-equivalent prices
 
-MiniMax, GLM and xAI/Grok provider cards show three figures below their upstream quota windows:
+MiniMax, GLM, xAI/Grok and OpenAI Codex OAuth provider cards show three figures below their upstream quota windows:
 
 - **Total API price:** the API-equivalent value of all retained upstream attempts for that provider ID.
 - **Current-cycle API price:** the retained value within the selected upstream reset cycle.
@@ -16,7 +16,9 @@ USD, CNY and other native currency buckets remain separate. Missing reference pr
 
 ## Reset-cycle selection
 
-The backend selects `weekly_limit` when reported, regardless of its position among the quota bars. If no weekly tier is reported, GLM and MiniMax use `five_hour`; Grok uses `monthly`. Feature/model-specific windows are not combined with the selected quota.
+The backend selects `weekly_limit` when reported, regardless of its position among the quota bars. If no weekly tier is reported, GLM, MiniMax and OpenAI Codex use an identified `five_hour` tier; Grok uses `monthly`. Feature/model-specific windows are not combined with the selected quota.
+
+OpenAI Codex includes weekly-only Pro accounts. Window identity comes from the upstream duration, not the primary/secondary slot or plan name. Unknown-duration `primary_window` / `secondary_window` and feature-specific limits are not treated as a provider-wide cycle: retained total prices remain available, but current-cycle prices and capacity stay unknown. This applies to Codex OAuth subscriptions, not regular OpenAI API-key billing.
 
 - Weekly: upstream reset minus seven days.
 - Five-hour: upstream reset minus five hours.
@@ -28,7 +30,7 @@ Only finite usage above 0% and at most 100%, with a priced sample from the same 
 
 ## Admin contract
 
-`GET /api/v1/providers/:id/usage`, the bulk admin usage listing, and the existing desktop `get_provider_usage` command share the optional `api_price` field for `glm_coding_plan`, `minimax_coding_plan` and `grok_plan`:
+`GET /api/v1/providers/:id/usage`, the bulk admin usage listing, and the existing desktop `get_provider_usage` command share the optional `api_price` field for `glm_coding_plan`, `minimax_coding_plan`, `grok_plan` and `openai_codex`:
 
 | Field | Meaning |
 | --- | --- |

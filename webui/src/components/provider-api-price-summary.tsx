@@ -26,8 +26,8 @@ export function ProviderApiPriceSummary({ usage, now, stale, loading, locale }: 
     ? (isZh ? "本周期已结束，请刷新用量。" : "Current cycle ended; refresh usage.")
     : (isZh ? "本周期未知，请刷新用量。" : "Current cycle unknown; refresh usage.");
   const cycleScope = isZh
-    ? "由后端按上游报告的重置周期确定，而非自然周或自然月。优先使用每周额度；未报告周额度时，GLM / MiniMax 使用 5 小时周期，xAI 使用月度周期。不合并不同额度窗口。"
-    : "Determined by the backend from the upstream-reported reset cycle, not a calendar week or month. Weekly quota is preferred; when no weekly tier is reported, GLM / MiniMax use the 5h cycle and xAI uses the monthly cycle. Different quota windows are not combined.";
+    ? "由后端按上游报告的重置周期确定，而非自然周或自然月。优先使用每周额度；未报告周额度时，GLM / MiniMax / OpenAI Codex 使用已识别的 5 小时周期，xAI 使用月度周期。不合并不同额度窗口；OpenAI Codex 的功能专用窗口和时长未知的窗口不用于本周期统计。"
+    : "Determined by the backend from the upstream-reported reset cycle, not a calendar week or month. Weekly quota is preferred; when no weekly tier is reported, GLM / MiniMax / OpenAI Codex use an identified 5h cycle and xAI uses the monthly cycle. Different quota windows are not combined; OpenAI Codex feature-specific and unknown-duration windows are not used for current-cycle statistics.";
   const periodTitle = [scope, cycleScope, stats?.period_tier ? `${isZh ? "额度窗口" : "Quota window"}: ${tierLabel(stats.period_tier, isZh)}` : "", hasBounds
     ? (isZh
       ? `浏览器本地时间：${new Date(start).toLocaleString(locale)} → ${new Date(end).toLocaleString(locale)}（含开始，不含结束）。`

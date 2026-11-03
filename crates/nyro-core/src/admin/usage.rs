@@ -4746,6 +4746,135 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn codex_weekly_only_pro_api_prices_follow_the_parsed_quota_without_quota_request()
+    -> anyhow::Result<()> {
+        use crate::storage::{SqliteStorage, Storage};
+        use std::sync::Arc;
+
+        let now = chrono::DateTime::parse_from_rfc3339("2026-11-03T10:29:00+08:00")?
+            .with_timezone(&chrono::Utc);
+        let reset = now + chrono::Duration::hours(32);
+        let start = reset - chrono::Duration::days(7);
+        // Screenshot shape: Pro has a weekly primary window only. A separate
+        // metered-feature quota must never become the account-wide denominator.
+        let body = serde_json::json!({
+            "plan_type": "pro",
+            "rate_limit": {
+                "allowed": true,
+                "primary_window": {
+                    "used_percent": 76,
+                    "limit_window_seconds": 604800,
+                    "reset_at": reset.timestamp()
+                }
+            },
+            "additional_rate_limits": [{
+                "metered_feature": "codex_bengalfox",
+                "rate_limit": {"primary_window": {
+                    "used_percent": 99,
+                    "limit_window_seconds": 604800,
+                    "reset_at": (reset - chrono::Duration::hours(1)).timestamp()
+                }}
+            }]
+        });
+        let (level, tiers, is_available) = parse_openai_codex_usage(&body, now);
+        assert_eq!(level.as_deref(), Some("pro"));
+        assert_eq!(tiers[0].name, "weekly_limit");
+        assert_eq!(tiers[1].name, "feature:codex_bengalfox:weekly_limit");
+
+        let dir = tempfile::tempdir()?;
+        let config = crate::config::GatewayConfig {
+            data_dir: dir.path().into(),
+            ..Default::default()
+        };
+        let storage = SqliteStorage::from_config(&config).await?;
+        let (gw, _) = Gateway::from_storage(config, Arc::new(storage.clone())).await?;
+        let provider = storage.providers().create(serde_json::from_value(serde_json::json!({
+            "name": "OpenAI Pro 200", "vendor": "openai", "preset_key": "openai",
+            "channel": "codex", "auth_mode": "oauth", "protocol": "openai-responses/responses/v1",
+            "base_url": "https://chatgpt.com/backend-api/codex", "api_key": ""
+        }))?).await?;
+        assert_eq!(
+            UsageBackend::detect(&provider),
+            Some(UsageBackend::OpenAiCodex)
+        );
+        // Keep the model price deterministic, independent of catalogue refreshes.
+        gw.admin()
+            .set_token_price(TokenPriceInput {
+                provider_id: provider.id.clone(),
+                model: "gpt-codex-fixture".into(),
+                price: Some(TokenPriceRates {
+                    currency: "USD".into(),
+                    input_rate: 76.0,
+                    output_rate: 0.0,
+                    cache_read_rate: None,
+                }),
+            })
+            .await?;
+        for at in [
+            start.timestamp_millis() - 1,
+            start.timestamp_millis(),
+            now.timestamp_millis(),
+            now.timestamp_millis() + 1,
+        ] {
+            sqlx::query("INSERT INTO request_logs (id, provider_id, upstream_model, created_at, input_tokens, output_tokens, route_decision, outcome_version, attempt_outcome) VALUES (?, ?, 'gpt-codex-fixture', ?, 1000000, 0, NULL, 1, 'failed')")
+                .bind(uuid::Uuid::new_v4().to_string()).bind(&provider.id).bind(at)
+                .execute(storage.pool()).await?;
+        }
+        let mut usage = ProviderUsage {
+            provider_id: provider.id,
+            kind: "openai_codex".into(),
+            site: "global".into(),
+            level,
+            tiers,
+            is_available,
+            balances: vec![],
+            spends: vec![],
+            scheduling: ProviderScheduling::default(),
+            queried_at: now.to_rfc3339(),
+            api_price: None,
+            account_pool: None,
+            pool_quota: None,
+            upstream: None,
+        };
+        let scheduling = usage.scheduling.clone();
+        // Deliberately enrich the parsed fixture, not get_provider_usage, whose
+        // Codex quota URL is fixed and would otherwise contact the real service.
+        gw.admin().enrich_provider_api_price(&mut usage).await;
+        assert_eq!(usage.scheduling, scheduling);
+        let stats = usage.api_price.as_ref().unwrap();
+        assert_eq!(
+            (stats.period_start, stats.period_end),
+            (
+                Some(start.timestamp_millis()),
+                Some(reset.timestamp_millis())
+            )
+        );
+        assert_eq!(stats.period_tier.as_deref(), Some("weekly_limit"));
+        assert_eq!(stats.used_percent, Some(76.0));
+        assert_eq!(stats.all_time.request_count, 3);
+        assert_eq!(stats.all_time.equivalent_costs[0].total_cost, 228.0);
+        let period = stats.period.as_ref().unwrap();
+        assert_eq!((period.request_count, period.total_tokens), (2, 2_000_000));
+        assert_eq!(period.equivalent_costs[0].total_cost, 152.0);
+        assert_eq!(
+            stats.estimated_capacity.as_ref().unwrap()[0].total_cost,
+            200.0
+        );
+
+        // Unknown primary/secondary durations retain totals but never guess a
+        // week or month, even when a feature-specific weekly limit is present.
+        let mut unknown = body;
+        unknown["rate_limit"]["primary_window"]["limit_window_seconds"] = serde_json::json!(86400);
+        let (_, tiers, _) = parse_openai_codex_usage(&unknown, now);
+        usage.tiers = tiers;
+        gw.admin().enrich_provider_api_price(&mut usage).await;
+        let stats = usage.api_price.unwrap();
+        assert_eq!(stats.all_time.equivalent_costs[0].total_cost, 228.0);
+        assert!(stats.period.is_none() && stats.estimated_capacity.is_none());
+        Ok(())
+    }
+
     #[test]
     fn codex_parser_preserves_additional_feature_windows_with_stable_names() {
         let now = chrono::DateTime::parse_from_rfc3339("2026-08-20T00:00:00Z")

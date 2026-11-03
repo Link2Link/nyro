@@ -29,7 +29,12 @@ fn provider_api_price_weekly_wins_over_short_monthly_and_feature_windows() {
         ),
         tier("weekly_limit", Some(end), 4.0),
     ];
-    for kind in ["glm_coding_plan", "minimax_coding_plan", "grok_plan"] {
+    for kind in [
+        "glm_coding_plan",
+        "minimax_coding_plan",
+        "grok_plan",
+        "openai_codex",
+    ] {
         let period = provider_period(kind, &tiers, now).unwrap();
         assert_eq!(
             (period.start, period.end),
@@ -54,7 +59,12 @@ fn provider_api_price_present_invalid_weekly_never_falls_back() {
         tier("five_hour", Some("2026-10-31T07:00:00Z"), 20.0),
         tier("monthly", Some("2026-11-01T00:00:00Z"), 20.0),
     ];
-    for kind in ["glm_coding_plan", "minimax_coding_plan", "grok_plan"] {
+    for kind in [
+        "glm_coding_plan",
+        "minimax_coding_plan",
+        "grok_plan",
+        "openai_codex",
+    ] {
         assert!(provider_period(kind, &fallback, now).is_some());
         for reset in [
             None,
@@ -101,8 +111,45 @@ fn provider_api_price_present_invalid_weekly_never_falls_back() {
 }
 
 #[test]
+fn provider_api_price_codex_weekly_only_and_known_five_hour_fallback() {
+    let now = ms("2026-11-03T10:29:00+08:00");
+    let reset = "2026-11-04T18:29:00+08:00";
+    let weekly = tier("weekly_limit", Some(reset), 76.0);
+    let period = provider_period("openai_codex", std::slice::from_ref(&weekly), now).unwrap();
+    assert_eq!(period.start, ms("2026-10-28T18:29:00+08:00"));
+    assert_eq!(period.end, ms(reset));
+    assert_eq!(period.tier.used_percent, 76.0);
+
+    let short = tier("five_hour", Some("2026-11-03T13:29:00+08:00"), 20.0);
+    let tiers = [
+        tier("feature:codex_bengalfox:weekly_limit", Some(reset), 99.0),
+        tier("primary_window", Some(reset), 50.0),
+        short.clone(),
+    ];
+    let period = provider_period("openai_codex", &tiers, now).unwrap();
+    assert_eq!(period.tier.name, "five_hour");
+    assert_eq!(period.start, ms("2026-11-03T08:29:00+08:00"));
+    assert_eq!(period.end, ms("2026-11-03T13:29:00+08:00"));
+    assert!(provider_period("openai_codex", &[short.clone(), short], now).is_none());
+
+    for name in [
+        "primary_window",
+        "secondary_window",
+        "daily",
+        "monthly",
+        "feature:codex_bengalfox:weekly_limit",
+        "feature:codex_bengalfox:five_hour",
+    ] {
+        assert!(
+            provider_period("openai_codex", &[tier(name, Some(reset), 76.0)], now).is_none(),
+            "unknown-duration or feature quota is not an account cycle: {name}"
+        );
+    }
+}
+
+#[test]
 fn provider_api_price_five_hour_and_grok_utc_date_only_month_clamping() {
-    for kind in ["glm_coding_plan", "minimax_coding_plan"] {
+    for kind in ["glm_coding_plan", "minimax_coding_plan", "openai_codex"] {
         let tiers = [tier("five_hour", Some("2026-10-31T07:00:00Z"), 25.0)];
         let period = provider_period(kind, &tiers, ms("2026-10-31T05:48:02Z")).unwrap();
         assert_eq!(
@@ -295,7 +342,12 @@ async fn provider_api_price_all_kinds_retained_history_unknown_cycles_and_fail_o
             }),
         })
         .await?;
-    for kind in ["glm_coding_plan", "minimax_coding_plan", "grok_plan"] {
+    for kind in [
+        "glm_coding_plan",
+        "minimax_coding_plan",
+        "grok_plan",
+        "openai_codex",
+    ] {
         for reset in [None, Some("invalid"), Some("2026-10-30T00:00:00Z")] {
             let mut usage = snapshot(
                 &provider.id,

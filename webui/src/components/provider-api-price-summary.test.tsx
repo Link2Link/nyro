@@ -31,13 +31,13 @@ function updateStats(update: Partial<ProviderApiPriceStats>, base = usage): Prov
   return { ...base, api_price: { ...stats, ...update } };
 }
 
-test("only GLM MiniMax and xAI plan backends display provider price totals", () => {
-  for (const kind of ["glm_coding_plan", "minimax_coding_plan", "grok_plan"]) equal(providerApiPriceSupported(kind), true);
-  for (const kind of ["devin_plan", "kiro_plan", "deepseek_balance", "claude_code_plan", "nyro_gateway", "openai_codex", undefined]) equal(providerApiPriceSupported(kind), false);
+test("GLM MiniMax xAI and OpenAI Codex plan backends display provider price totals", () => {
+  for (const kind of ["glm_coding_plan", "minimax_coding_plan", "grok_plan", "openai_codex"]) equal(providerApiPriceSupported(kind), true);
+  for (const kind of ["devin_plan", "kiro_plan", "deepseek_balance", "claude_code_plan", "nyro_gateway", "openai", "openai_api", undefined]) equal(providerApiPriceSupported(kind), false);
 });
 
-test("all three providers show server-computed total, cycle price and full-cycle capacity", () => {
-  for (const kind of ["glm_coding_plan", "minimax_coding_plan", "grok_plan"]) {
+test("all supported providers show server-computed total, cycle price and full-cycle capacity", () => {
+  for (const kind of ["glm_coding_plan", "minimax_coding_plan", "grok_plan", "openai_codex"]) {
     const html = render({ ...usage, kind });
     equal(values(html).join(","), "$228.79,$21.40,≈ $214.00");
     for (const label of ["Total API price", "Current-cycle API price", "Estimated cycle API capacity", "including failed and retried attempts",
@@ -46,6 +46,25 @@ test("all three providers show server-computed total, cycle price and full-cycle
     doesNotMatch(html, /\$428\.00|\$2,287\.90|Total tokens|role="progressbar"/);
   }
   equal(stats.estimated_capacity?.[0].total_cost, 214); // No mutation or UI recalculation.
+});
+
+test("OpenAI Codex weekly-only quota uses the same three price metrics in both languages", () => {
+  const codex = { ...usage, kind: "openai_codex", level: "pro", tiers: [
+    { name: "weekly_limit", used_percent: 76, resets_at: new Date(end).toISOString() },
+    { name: "feature:codex_bengalfox:weekly_limit", used_percent: 99, resets_at: new Date(end - 3600_000).toISOString() },
+  ] };
+  const value = updateStats({ used_percent: 76,
+    period: { ...period, equivalent_costs: [{ currency: "USD", total_cost: 152, priced_request_count: 3 }] },
+    estimated_capacity: [{ currency: "USD", total_cost: 200, priced_request_count: 3 }],
+  }, codex);
+  for (const locale of ["en-US", "zh-CN"] as const) {
+    const html = render(value, { locale });
+    equal(values(html).join(","), "$228.79,$152.00,≈ $200.00");
+    match(html, locale === "zh-CN" ? /用于估算的已用比例：76%/ : /Used for projection: 76%/);
+    match(html, locale === "zh-CN" ? /OpenAI Codex.*已识别的 5 小时周期|已识别的 5 小时周期.*OpenAI Codex/ : /OpenAI Codex use an identified 5h cycle/);
+    match(html, locale === "zh-CN" ? /功能专用窗口和时长未知的窗口不用于本周期统计/ : /feature-specific and unknown-duration windows are not used for current-cycle statistics/);
+    doesNotMatch(html, /Used for projection: 99%|用于估算的已用比例：99%/);
+  }
 });
 
 test("English and Chinese labels explain actual reset cycle and projection scope", () => {
@@ -148,6 +167,7 @@ test("tiny amounts and explicitly priced zero preserve account-pool formatter be
 test("5h and monthly fallback and Grok date-only reset display the backend-selected cycle", () => {
   for (const [kind, period_tier, reset, label] of [
     ["minimax_coding_plan", "five_hour", new Date(end).toISOString(), "5h"],
+    ["openai_codex", "five_hour", new Date(end).toISOString(), "5h"],
     ["grok_plan", "monthly", new Date(end).toISOString(), "Monthly"],
     ["grok_plan", "weekly_limit", "2030-01-07", "Weekly"],
   ]) {
