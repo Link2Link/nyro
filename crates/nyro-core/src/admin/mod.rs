@@ -48,7 +48,9 @@ mod model_ratings;
 mod models;
 mod oauth;
 mod observability;
+mod provider_api_price;
 mod providers;
+pub use provider_api_price::ProviderApiPriceStats;
 pub mod settings;
 mod system_status;
 pub use system_status::{

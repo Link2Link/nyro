@@ -351,6 +351,20 @@ export interface AccountUsageStats {
   period_end: number | null;
 }
 
+/** Provider-level retained-log prices, computed alongside one upstream quota observation. */
+export interface ProviderApiPriceStats {
+  all_time: AccountUsageTotals;
+  /** Unknown or expired reset cycles have null totals and bounds, never a fake zero. */
+  period: AccountUsageTotals | null;
+  /** Backend-defined upstream reset interval in epoch ms, [start, end). */
+  period_start: number | null;
+  period_end: number | null;
+  period_tier: string | null;
+  used_percent: number | null;
+  /** Projected full-cycle value, including usage so far, not remaining balance. */
+  estimated_capacity: EquivalentCostTotal[] | null;
+}
+
 export interface ProviderStats extends TpsSampleSums {
   provider_id: string;
   provider: string;
@@ -1056,6 +1070,8 @@ export interface ProviderUsage {
   scheduling?: ProviderScheduling;
   /** Native Devin/Kiro account readiness, including legacy single-account providers. */
   account_pool?: AccountPoolView | null;
+  /** MiniMax / GLM / Grok retained-log prices; not upstream billing or routing quota. */
+  api_price?: ProviderApiPriceStats | null;
   /** Nyro preset (`nyro_gateway`): the remote Nyro's forwarded usage report. */
   upstream?: NyroUpstreamUsage | null;
   queried_at: string;

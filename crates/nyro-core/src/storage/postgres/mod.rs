@@ -1831,6 +1831,33 @@ impl LogStore for PostgresLogStore {
         .collect()
     }
 
+    async fn provider_token_usage_with_period(
+        &self,
+        provider_id: &str,
+        now: i64,
+        period: Option<(i64, i64)>,
+    ) -> anyhow::Result<(
+        Vec<crate::db::models::TokenUsageDay>,
+        Vec<crate::db::models::TokenUsageDay>,
+    )> {
+        use crate::storage::provider_usage::{ProviderUsageAccumulator, ProviderUsageRow};
+
+        // Keep the native index predicate and independently require exact ID bytes.
+        let mut rows = sqlx::query_as::<_, ProviderUsageRow>(
+            "SELECT created_at, upstream_model, input_tokens::BIGINT AS input_tokens, \
+             output_tokens::BIGINT AS output_tokens, cache_read_tokens::BIGINT AS cache_read_tokens \
+             FROM request_logs WHERE provider_id = $1 AND provider_id COLLATE \"C\" = $1 AND created_at <= $2",
+        )
+        .bind(provider_id)
+        .bind(now)
+        .fetch(&self.pool);
+        let mut usage = ProviderUsageAccumulator::new(provider_id, period);
+        while let Some(row) = rows.try_next().await? {
+            usage.add(row);
+        }
+        Ok(usage.finish())
+    }
+
     async fn account_token_usage_with_periods(
         &self,
         provider_id: &str,

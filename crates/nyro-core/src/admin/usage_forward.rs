@@ -9,7 +9,8 @@
 //! - money figures (`balances`, `spends`) only for the gateway key and
 //!   privileged API keys. A regular key still sees quota windows and pause
 //!   state, which decide whether its routes keep working;
-//! - account-pool details (per-account identities) are never forwarded.
+//! - account-pool details (per-account identities) and local retained-log API
+//!   price statistics are admin-only and never forwarded, even to privileged keys.
 //!
 //! Chain guard: this endpoint never queries its own `nyro-gateway` providers.
 //! They are reported as `unsupported`, so two instances pointing at each
@@ -44,10 +45,14 @@ impl UsageSnapshotCache {
     }
 
     pub(crate) fn store(&self, usage: &ProviderUsage) {
+        let mut usage = usage.clone();
+        // This cache serves proxy forwarding, not admin statistics. Never retain
+        // local log prices here, even if an enriched admin snapshot is supplied.
+        usage.api_price = None;
         self.entries
             .write()
             .unwrap()
-            .insert(usage.provider_id.clone(), (Instant::now(), usage.clone()));
+            .insert(usage.provider_id.clone(), (Instant::now(), usage));
     }
 
     pub(crate) fn fresh(&self, provider_id: &str, max_age: Duration) -> Option<ProviderUsage> {
@@ -260,13 +265,14 @@ impl AdminService {
             .fresh(&provider.id, FORWARDED_USAGE_MAX_AGE)
         {
             Some(usage) => Ok(usage),
-            None => self.get_provider_usage(&provider.id).await,
+            None => self.provider_usage_snapshot(&provider.id).await,
         };
         match usage {
             Ok(mut usage) => {
                 // pool_quota is an independent anonymous display DTO. Keep it
                 // for every caller while removing admin-only identity/config.
                 usage.account_pool = None;
+                usage.api_price = None;
                 usage.upstream = None;
                 if !include_money {
                     usage.balances.clear();
@@ -392,6 +398,7 @@ mod tests {
                 ..Default::default()
             },
             queried_at: Utc::now().to_rfc3339(),
+            api_price: None,
             account_pool: None,
             pool_quota: None,
             upstream: Some(serde_json::json!({"providers": []})),
@@ -683,6 +690,71 @@ mod tests {
         assert_eq!(names(&report), ["Fallback", "Primary"]);
         for entry in &report.providers {
             assert_eq!(entry.routes, ["opus"], "{} serves the route", entry.name);
+        }
+    }
+
+    fn admin_price() -> ProviderApiPriceStats {
+        ProviderApiPriceStats {
+            all_time: AccountUsageTotals {
+                total_tokens: 123,
+                request_count: 1,
+                equivalent_costs: vec![EquivalentCostTotal {
+                    currency: "USD".into(),
+                    total_cost: 999.0,
+                    priced_request_count: 1,
+                }],
+                unpriced_request_count: 0,
+            },
+            period: None,
+            period_start: None,
+            period_end: None,
+            period_tier: None,
+            used_percent: None,
+            estimated_capacity: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn admin_api_prices_are_never_cached_or_forwarded_even_for_privileged_keys() {
+        let f = fixture().await;
+        let mut usage = snapshot(&f.deepseek, false);
+        usage.api_price = Some(admin_price());
+        f.gw.usage_snapshots.store(&usage);
+        assert!(
+            f.gw.usage_snapshots
+                .fresh(&f.deepseek, FORWARDED_USAGE_MAX_AGE)
+                .unwrap()
+                .api_price
+                .is_none(),
+            "the forwarding cache must not retain local admin prices"
+        );
+        // Bypass cache.store to exercise the redaction boundary independently,
+        // including snapshots left over from an older cache implementation.
+        f.gw.usage_snapshots
+            .entries
+            .write()
+            .unwrap()
+            .insert(f.deepseek.clone(), (Instant::now(), usage));
+        for privileged in [false, true] {
+            let report =
+                f.gw.admin()
+                    .forwarded_provider_usage(&RouteAccess {
+                        privileged,
+                        bound_route_ids: HashSet::from([f.bound_route.clone()]),
+                    })
+                    .await
+                    .unwrap();
+            let entry = report
+                .providers
+                .iter()
+                .find(|entry| entry.id == f.deepseek)
+                .unwrap();
+            assert!(entry.usage.as_ref().unwrap().api_price.is_none());
+            assert!(
+                serde_json::to_value(entry).unwrap()["usage"]
+                    .get("api_price")
+                    .is_none()
+            );
         }
     }
 

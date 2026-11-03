@@ -4,6 +4,21 @@ All notable changes to Nyro will be documented in this file.
 
 ---
 
+## v2.1.22
+
+> Released on 2026-11-03
+
+#### Features
+
+- **MiniMax, GLM and xAI API-equivalent prices**: provider cards now show the total retained-log API value, current-cycle API value and estimated full-cycle API capacity below the quota bars, following the existing Kiro/Devin account-pool pricing semantics. Capacity projects current-cycle recorded prices to 100% quota use and includes usage so far rather than remaining balance (#10)
+- **Upstream-anchored cycle statistics**: weekly quota is preferred; when no weekly tier is reported, GLM/MiniMax use their five-hour window and Grok uses its calendar-month window. Grok date-only resets explicitly use UTC, and monthly arithmetic preserves timestamp offsets and month-end clamping. Provider-scoped aggregation includes failed/retried attempts without requiring account IDs and reuses current reference/manual model prices (#10)
+
+#### Improvements
+
+- **Conservative monetary display and isolation**: native currencies stay separate, partial prices are marked, and missing rates remain unknown rather than zero. Unknown, expired, stale, zero-usage or mismatched cycles do not produce a capacity estimate. Bilingual tooltips explain retained-log coverage and the reference-only nature of prices; clearing logs reduces totals. Pricing is best-effort and admin-only, excluded from routing decisions, quota monitoring and downstream usage forwarding. Added frontend, pricing, storage and forwarding regressions plus bilingual documentation; no database migration is required (#10)
+
+---
+
 ## v2.1.21
 
 > Released on 2026-11-02

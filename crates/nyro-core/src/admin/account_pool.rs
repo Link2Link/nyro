@@ -1341,6 +1341,7 @@ impl AdminService {
             is_available: Some(view.counts.available > 0),
             scheduling: self.gw.quota_registry.snapshot(&view.provider_id),
             queried_at: Utc::now().to_rfc3339(),
+            api_price: None,
             account_pool: Some(view),
             pool_quota: None,
             upstream: None,
