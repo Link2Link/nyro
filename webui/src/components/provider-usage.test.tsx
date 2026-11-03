@@ -17,16 +17,16 @@ const base: ProviderUsage = {
   is_available: true, queried_at: new Date(now).toISOString(),
 };
 
-function render(usage: ProviderUsage, error?: Error): string {
+function render(usage: ProviderUsage, error?: Error, currentProvider: Provider = provider): string {
   const originalNow = Date.now;
   Date.now = () => now;
   const client = new QueryClient();
-  const key = ["provider-usage", provider.id];
+  const key = ["provider-usage", currentProvider.id];
   client.setQueryData(key, usage);
   if (error) client.getQueryCache().find({ queryKey: key })!.setState({ status: "error", error });
   try {
     return renderToStaticMarkup(<QueryClientProvider client={client}><LocaleProvider>
-      <ProviderUsageFooter provider={provider} />
+      <ProviderUsageFooter provider={currentProvider} />
     </LocaleProvider></QueryClientProvider>);
   } finally {
     Date.now = originalNow;
@@ -70,8 +70,8 @@ const apiPrice: ProviderApiPriceStats = {
 const priceUsage: ProviderUsage = { ...base, api_price: apiPrice,
   tiers: [{ name: "weekly_limit", used_percent: 10, resets_at: new Date(apiPrice.period_end!).toISOString() }] };
 
-test("GLM MiniMax and xAI card footers include all three API prices under the quota bars", () => {
-  for (const kind of ["glm_coding_plan", "minimax_coding_plan", "grok_plan"]) {
+test("GLM MiniMax xAI and OpenAI Codex card footers include all three API prices under the quota bars", () => {
+  for (const kind of ["glm_coding_plan", "minimax_coding_plan", "grok_plan", "openai_codex"]) {
     const html = render({ ...priceUsage, kind });
     match(html, /Total API price/);
     match(html, /Current-cycle API price/);
@@ -80,9 +80,36 @@ test("GLM MiniMax and xAI card footers include all three API prices under the qu
     equal((html.match(/role="progressbar"/g) ?? []).length, 1);
     doesNotMatch(html, /<details|<summary|Show details/);
   }
-  for (const kind of ["deepseek_balance", "openai_codex", "devin_plan", "kiro_plan", "claude_code_plan", "nyro_gateway"]) {
+  for (const kind of ["deepseek_balance", "openai", "devin_plan", "kiro_plan", "claude_code_plan", "nyro_gateway"]) {
     doesNotMatch(render({ ...priceUsage, kind }), /data-provider-api-price/);
   }
+});
+
+test("OpenAI Pro OAuth card displays weekly prices and hides only the estimate on stale or expired data", () => {
+  const codexProvider: Provider = { ...provider, id: "openai-pro", name: "OpenAI Pro 200", vendor: "openai", preset_key: "openai",
+    channel: "codex", auth_mode: "oauth", base_url: "https://chatgpt.com/backend-api/codex" };
+  const codexUsage: ProviderUsage = { ...priceUsage, provider_id: codexProvider.id, kind: "openai_codex", level: "pro",
+    tiers: [{ name: "weekly_limit", used_percent: 76, resets_at: new Date(apiPrice.period_end!).toISOString() }],
+    api_price: { ...apiPrice, used_percent: 76,
+      period: { ...apiPrice.period!, equivalent_costs: [{ currency: "USD", total_cost: 152, priced_request_count: 1 }] },
+      estimated_capacity: [{ currency: "USD", total_cost: 200, priced_request_count: 1 }],
+    },
+  };
+  const html = render(codexUsage, undefined, codexProvider);
+  match(html, /ChatGPT Codex Usage/);
+  match(html, /class="[^"]*uppercase[^"]*">pro<\/span>/);
+  match(html, /76%/);
+  match(html, /data-provider-api-price="openai-pro"/);
+  match(html, />\$152\.00</);
+  match(html, />≈ \$200\.00</);
+  equal((html.match(/role="progressbar"/g) ?? []).length, 1);
+  const stale = render(codexUsage, new Error("Temporary failure"), codexProvider);
+  match(stale, /Showing stale totals/);
+  match(stale, />\$152\.00</);
+  doesNotMatch(stale, />≈ \$200\.00</);
+  const expired = render({ ...codexUsage, api_price: { ...codexUsage.api_price!, period_end: now } }, undefined, codexProvider);
+  match(expired, /Current cycle ended; refresh usage/);
+  doesNotMatch(expired, />\$152\.00<|>≈ \$200\.00</);
 });
 
 test("provider price projection hides on refresh failures and stale observations while history remains", () => {

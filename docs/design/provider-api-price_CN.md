@@ -1,6 +1,6 @@
 # Coding Plan 等价 API 金额
 
-MiniMax、GLM 和 xAI/Grok 供应商卡片在上游额度进度条下显示三个金额：
+MiniMax、GLM、xAI/Grok 和 OpenAI Codex OAuth 供应商卡片在上游额度进度条下显示三个金额：
 
 - **累计 API 价格**：此供应商 ID 下全部保留的上游尝试对应的等价 API 金额。
 - **本周期 API 价格**：选定的上游实际重置周期内，保留日志对应的等价 API 金额。
@@ -16,7 +16,9 @@ USD、CNY 等原始币种分开展示。没有参考价时显示 `—`；部分�
 
 ## 周期选择
 
-后端优先选择上游报告的 `weekly_limit`，与进度条显示顺序无关。未报告周额度时，GLM 和 MiniMax 使用 `five_hour`，Grok 使用 `monthly`。不会合并模型 / 功能专用窗口和不同额度窗口。
+后端优先选择上游报告的 `weekly_limit`，与进度条显示顺序无关。未报告周额度时，GLM、MiniMax 和 OpenAI Codex 使用已识别的 `five_hour`，Grok 使用 `monthly`。不会合并模型 / 功能专用窗口和不同额度窗口。
+
+OpenAI Codex 支持只有周额度的 Pro 账号。窗口身份来自上游时长，而非 primary/secondary 位置或套餐名称。时长未知的 `primary_window` / `secondary_window` 和功能专用额度不作为供应商级周期：保留累计金额，本周期金额与预估可用保持未知。此功能针对 Codex OAuth 订阅，不是普通 OpenAI API Key 账单查询。
 
 - 每周：上游重置时间向前推 7 天。
 - 5 小时：上游重置时间向前推 5 小时。
@@ -28,7 +30,7 @@ Grok 的纯日期重置值（`YYYY-MM-DD`）明确按 UTC 零点处理；RFC 333
 
 ## 管理接口
 
-`GET /api/v1/providers/:id/usage`、批量管理用量列表和已有桌面命令 `get_provider_usage` 共用可选字段 `api_price`，仅对 `glm_coding_plan`、`minimax_coding_plan` 和 `grok_plan` 返回：
+`GET /api/v1/providers/:id/usage`、批量管理用量列表和已有桌面命令 `get_provider_usage` 共用可选字段 `api_price`，仅对 `glm_coding_plan`、`minimax_coding_plan`、`grok_plan` 和 `openai_codex` 返回：
 
 | 字段 | 含义 |
 | --- | --- |
