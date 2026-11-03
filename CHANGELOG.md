@@ -4,6 +4,17 @@ All notable changes to Nyro will be documented in this file.
 
 ---
 
+## v2.1.23
+
+> Released on 2026-11-03
+
+#### Fixes
+
+- **OpenAI Codex API-equivalent price coverage**: OpenAI Codex OAuth provider cards now show total retained-log API value, current-cycle API value and estimated full-cycle API capacity alongside MiniMax, GLM and xAI. Weekly-only Pro accounts use their actual weekly reset; only when no weekly tier is reported does a known five-hour window supply the cycle. Feature-specific and unknown-duration windows are not guessed into provider-wide cycles (#11)
+- **Codex pricing safeguards and regression coverage**: prices reuse current OpenAI reference rates or manual overrides rather than the subscription fee. Capacity includes usage so far, not remaining balance; stale, expired, missing-price and unknown-cycle safeguards remain intact. Added weekly-only Pro parser-to-pricing, canonical-window and bilingual UI regressions plus updated documentation. Admin-only isolation, quota scheduling and routing are unchanged; no database migration is required (#11)
+
+---
+
 ## v2.1.22
 
 > Released on 2026-11-03
