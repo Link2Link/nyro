@@ -4,6 +4,16 @@ All notable changes to Nyro will be documented in this file.
 
 ---
 
+## v2.1.24
+
+> Released on 2026-11-04
+
+#### Fixes
+
+- **Release binaries work on CPUs without AVX again**: the Linux x86_64 server artifacts published for v2.1.21-v2.1.23 were built on GitHub's `ubuntu-latest` image after it rolled to Ubuntu 26.04, whose compiler defaults to the x86-64-v3 (AVX2) baseline. Bundled C dependencies (SQLite, zstd) therefore contained unconditional AVX2 instructions, and instances crashed with `SIGILL` (`trap invalid opcode`) on CPUs without AVX. The release workflow now pins `ubuntu-24.04`, forces `-march=x86-64` for C dependencies in the server and Linux desktop builds, and rejects any x86_64 artifact that cannot start under qemu with a CPU model lacking AVX (`qemu-x86_64 -cpu Nehalem`). No application code changes; instances already running a broken v2.1.21-v2.1.23 Linux x86_64 binary must be upgraded manually to recover.
+
+---
+
 ## v2.1.23
 
 > Released on 2026-11-03
