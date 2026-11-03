@@ -1,25 +1,9 @@
 import { formatTokenCount } from "@/lib/format";
 import type { Locale } from "@/lib/i18n";
-import { equivalentCostDisplay, formatUsageCost } from "@/lib/token-usage";
-import type { AccountUsageStats, AccountUsageTotals } from "@/lib/types";
+import { retainedUsagePriceDisplay } from "@/lib/token-usage";
+import type { AccountUsageStats } from "@/lib/types";
 import { estimateAccountUsagePrice, type AccountUsageKind } from "@/lib/account-usage-estimate";
 import type { ProviderAccountView } from "@/lib/devin-account-pool";
-
-function accountPrice(totals: AccountUsageTotals, isZh: boolean, locale: Locale) {
-  if (totals.request_count === 0) {
-    return { text: formatUsageCost(0, "USD", locale), title: isZh ? "保留日志中无请求" : "No requests in retained logs" };
-  }
-  // Keep native currencies separate: the shared formatter otherwise converts mixed totals to USD.
-  const prices = totals.equivalent_costs.map((cost) => ({
-    currency: cost.currency,
-    display: equivalentCostDisplay([cost], totals.unpriced_request_count, isZh, locale),
-  })).filter(({ display }) => display.priced);
-  if (!prices.length) return equivalentCostDisplay([], totals.unpriced_request_count, isZh, locale);
-  return {
-    text: prices.map(({ display }) => display.text.replace(/ \*$/, "")).join(" + ") + (totals.unpriced_request_count > 0 ? " *" : ""),
-    title: prices.map(({ currency, display }) => `${currency}: ${display.title}`).join("\n"),
-  };
-}
 
 /** Retained log metrics and a display-only quota projection; account actions stay separate. */
 export function AccountUsageSummary({ stats, account, kind, now, tokensEstimated = false, loading, error, locale }: {
@@ -59,7 +43,7 @@ export function AccountUsageSummary({ stats, account, kind, now, tokensEstimated
       : `Browser local time: ${new Date(start).toLocaleString(locale)} → ${new Date(end).toLocaleString(locale)} (start inclusive, end exclusive).`)
     : "", cycleStatus].filter(Boolean).join("\n");
   const estimate = !error && stats && account && kind ? estimateAccountUsagePrice(stats, account, kind, now) : null;
-  const estimatePrice = estimate && period ? accountPrice({ ...period, equivalent_costs: estimate.costs }, isZh, locale) : null;
+  const estimatePrice = estimate && period ? retainedUsagePriceDisplay({ ...period, equivalent_costs: estimate.costs }, isZh, locale) : null;
   const estimateTitle = [periodTitle, isZh
     ? "本周期等价 API 价格 ÷ 本周期已用比例，线性外推用满 100% 时的总等价 API 价格（包含已用部分，并非剩余余额）。仅供参考，受日志覆盖、模型组合和用量观察时间影响。"
     : "Current-cycle equivalent API price ÷ current-cycle used fraction, linearly projected to 100% usage (includes usage so far, not remaining balance). Reference only; affected by log coverage, model mix and usage observation time.",
@@ -81,7 +65,7 @@ export function AccountUsageSummary({ stats, account, kind, now, tokensEstimated
       <span className="text-[10px] text-slate-500">{isZh ? "总 Token" : "Total tokens"}</span>
       <span className="text-[10px] text-slate-500">{isZh ? "等价 API 价格" : "Equivalent API price"}</span>
       {rows.map(({ key, label, title, totals }) => {
-        const price = totals ? accountPrice(totals, isZh, locale) : null;
+        const price = totals ? retainedUsagePriceDisplay(totals, isZh, locale) : null;
         return <div key={key} className="contents">
           <span className="text-[10px] font-medium text-slate-500" title={title}>{label}</span>
           <span className="text-xs font-semibold tabular-nums text-slate-700" title={`${title}\n${totals ? totals.total_tokens.toLocaleString(locale) : status}`}>

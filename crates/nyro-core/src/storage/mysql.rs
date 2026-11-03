@@ -1925,6 +1925,34 @@ impl LogStore for MysqlLogStore {
         .collect()
     }
 
+    async fn provider_token_usage_with_period(
+        &self,
+        provider_id: &str,
+        now: i64,
+        period: Option<(i64, i64)>,
+    ) -> anyhow::Result<(
+        Vec<crate::db::models::TokenUsageDay>,
+        Vec<crate::db::models::TokenUsageDay>,
+    )> {
+        use crate::storage::provider_usage::{ProviderUsageAccumulator, ProviderUsageRow};
+
+        // Preserve the index while excluding case/trailing-space collation matches.
+        let mut rows = sqlx::query_as::<_, ProviderUsageRow>(
+            "SELECT created_at, upstream_model, CAST(input_tokens AS SIGNED) AS input_tokens, \
+             CAST(output_tokens AS SIGNED) AS output_tokens, CAST(cache_read_tokens AS SIGNED) AS cache_read_tokens \
+             FROM request_logs WHERE provider_id = ? AND BINARY provider_id = BINARY ? AND created_at <= ?",
+        )
+        .bind(provider_id)
+        .bind(provider_id)
+        .bind(now)
+        .fetch(&self.pool);
+        let mut usage = ProviderUsageAccumulator::new(provider_id, period);
+        while let Some(row) = rows.try_next().await? {
+            usage.add(row);
+        }
+        Ok(usage.finish())
+    }
+
     async fn account_token_usage_with_periods(
         &self,
         provider_id: &str,

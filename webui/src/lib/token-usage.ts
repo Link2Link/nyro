@@ -1,4 +1,4 @@
-import type { EquivalentCostTotal, TokenUsageDay } from "./types";
+import type { AccountUsageTotals, EquivalentCostTotal, TokenUsageDay } from "./types";
 
 export type TokenUsageTotals = Pick<TokenUsageDay,
   "request_count" | "input_tokens" | "output_tokens" | "cache_read_tokens" |
@@ -186,6 +186,23 @@ export interface EquivalentCostDisplay {
   text: string;
   title: string;
   priced: boolean;
+}
+
+/** Retained-log totals: preserve each native currency and distinguish unpriced from unused. */
+export function retainedUsagePriceDisplay(totals: AccountUsageTotals, zh: boolean, locale = "en-US"): EquivalentCostDisplay {
+  if (totals.request_count === 0) {
+    return { text: formatUsageCost(0, "USD", locale), title: zh ? "保留日志中无请求" : "No requests in retained logs", priced: true };
+  }
+  const prices = totals.equivalent_costs.map((cost) => ({
+    currency: cost.currency,
+    display: equivalentCostDisplay([cost], totals.unpriced_request_count, zh, locale),
+  })).filter(({ display }) => display.priced);
+  if (!prices.length) return equivalentCostDisplay([], totals.unpriced_request_count, zh, locale);
+  return {
+    text: prices.map(({ display }) => display.text.replace(/ \*$/, "")).join(" + ") + (totals.unpriced_request_count > 0 ? " *" : ""),
+    title: prices.map(({ currency, display }) => `${currency}: ${display.title}`).join("\n"),
+    priced: true,
+  };
 }
 
 /**

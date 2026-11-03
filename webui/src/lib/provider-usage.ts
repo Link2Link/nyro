@@ -120,6 +120,11 @@ export function isKiroOverage(usage?: Pick<ProviderUsage, "kind" | "scheduling" 
     && usage.tiers.some((tier) => !tier.name.startsWith("feature:") && tier.used_percent >= 100);
 }
 
+/** Provider-level API-equivalent totals are currently emitted for these plan backends only. */
+export function providerApiPriceSupported(kind: string | undefined): boolean {
+  return kind === "glm_coding_plan" || kind === "minimax_coding_plan" || kind === "grok_plan";
+}
+
 export function providerUsageTitle(kind: string | undefined, isZh: boolean): string {
   if (kind?.endsWith("_balance")) return isZh ? "账户余额" : "Balance";
   if (kind === "openai_codex") return isZh ? "ChatGPT Codex 用量" : "ChatGPT Codex Usage";

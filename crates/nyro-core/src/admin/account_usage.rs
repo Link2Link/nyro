@@ -59,7 +59,7 @@ fn account_period(driver: &str, raw: &str, now: i64) -> Option<(i64, i64)> {
 }
 
 /// Known token totals and current API-equivalent estimates, not an upstream bill.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct AccountUsageTotals {
     /// Gross input plus output; cache reads are already included in input.
     pub total_tokens: i64,
@@ -80,7 +80,7 @@ pub struct AccountUsageStats {
     pub period_end: Option<i64>,
 }
 
-fn summarize(rows: &[TokenUsageDay]) -> AccountUsageTotals {
+pub(super) fn summarize(rows: &[TokenUsageDay]) -> AccountUsageTotals {
     let (equivalent_costs, unpriced_request_count) = super::token_cost::summarize_costs(rows);
     AccountUsageTotals {
         total_tokens: rows.iter().fold(0_i64, |total, row| {

@@ -3,7 +3,7 @@ import { test } from "node:test";
 import { renderToStaticMarkup } from "react-dom/server";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { LocaleProvider } from "../lib/i18n";
-import type { Provider, ProviderUsage } from "../lib/types";
+import type { Provider, ProviderApiPriceStats, ProviderUsage } from "../lib/types";
 import { ProviderUsageFooter } from "./provider-usage";
 
 const now = Date.parse("2030-01-01T00:00:00Z");
@@ -18,12 +18,12 @@ const base: ProviderUsage = {
 };
 
 function render(usage: ProviderUsage, error?: Error): string {
+  const originalNow = Date.now;
+  Date.now = () => now;
   const client = new QueryClient();
   const key = ["provider-usage", provider.id];
   client.setQueryData(key, usage);
   if (error) client.getQueryCache().find({ queryKey: key })!.setState({ status: "error", error });
-  const originalNow = Date.now;
-  Date.now = () => now;
   try {
     return renderToStaticMarkup(<QueryClientProvider client={client}><LocaleProvider>
       <ProviderUsageFooter provider={provider} />
@@ -59,6 +59,43 @@ test("balance and spend details stay visible without an expand action", () => {
   match(html, /2\.50/);
   doesNotMatch(html, /<details|<summary|Show details|Hide details/);
   match(render({ ...base, spends: [{ name: "today", currency: "USD", amount: 1.25 }] }), /1\.25/);
+});
+
+const apiPrice: ProviderApiPriceStats = {
+  all_time: { total_tokens: 1_000_000, request_count: 2, equivalent_costs: [{ currency: "USD", total_cost: 30, priced_request_count: 2 }], unpriced_request_count: 0 },
+  period: { total_tokens: 100_000, request_count: 1, equivalent_costs: [{ currency: "USD", total_cost: 3, priced_request_count: 1 }], unpriced_request_count: 0 },
+  period_start: now - 3 * 86400_000, period_end: now + 4 * 86400_000, period_tier: "weekly_limit", used_percent: 10,
+  estimated_capacity: [{ currency: "USD", total_cost: 30, priced_request_count: 1 }],
+};
+const priceUsage: ProviderUsage = { ...base, api_price: apiPrice,
+  tiers: [{ name: "weekly_limit", used_percent: 10, resets_at: new Date(apiPrice.period_end!).toISOString() }] };
+
+test("GLM MiniMax and xAI card footers include all three API prices under the quota bars", () => {
+  for (const kind of ["glm_coding_plan", "minimax_coding_plan", "grok_plan"]) {
+    const html = render({ ...priceUsage, kind });
+    match(html, /Total API price/);
+    match(html, /Current-cycle API price/);
+    match(html, /Estimated cycle API capacity/);
+    match(html, /data-api-price="all_time"[\s\S]*>\$30\.00<[^]*data-api-price="period"[\s\S]*>\$3\.00<[^]*>≈ \$30\.00</);
+    equal((html.match(/role="progressbar"/g) ?? []).length, 1);
+    doesNotMatch(html, /<details|<summary|Show details/);
+  }
+  for (const kind of ["deepseek_balance", "openai_codex", "devin_plan", "kiro_plan", "claude_code_plan", "nyro_gateway"]) {
+    doesNotMatch(render({ ...priceUsage, kind }), /data-provider-api-price/);
+  }
+});
+
+test("provider price projection hides on refresh failures and stale observations while history remains", () => {
+  for (const html of [render(priceUsage, new Error("Temporary failure")),
+    render({ ...priceUsage, queried_at: new Date(now - 5 * 60_000).toISOString() }),
+    render({ ...priceUsage, queried_at: "invalid" })]) {
+    match(html, /data-provider-api-price/);
+    match(html, /Showing stale totals; refresh usage to estimate capacity/);
+    doesNotMatch(html, /≈ \$30\.00/);
+    match(html, /\$30\.00/);
+    match(html, /\$3\.00/);
+  }
+  match(render({ ...base, api_price: undefined }), /API price totals unavailable/);
 });
 
 test("native pool and single-account authentication pauses never claim exhausted quota or recovery", () => {

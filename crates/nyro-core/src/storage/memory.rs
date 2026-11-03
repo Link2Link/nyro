@@ -339,6 +339,19 @@ impl LogStore for MemoryStorage {
         Ok(vec![])
     }
 
+    async fn provider_token_usage_with_period(
+        &self,
+        _provider_id: &str,
+        _now: i64,
+        _period: Option<(i64, i64)>,
+    ) -> anyhow::Result<(
+        Vec<crate::db::models::TokenUsageDay>,
+        Vec<crate::db::models::TokenUsageDay>,
+    )> {
+        // YAML-only memory storage does not retain request logs.
+        Ok((vec![], vec![]))
+    }
+
     async fn account_token_usage_with_periods(
         &self,
         _provider_id: &str,

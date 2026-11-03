@@ -211,6 +211,10 @@ pub struct ProviderUsage {
     /// Runtime scheduling decision derived from this usage snapshot.
     pub scheduling: ProviderScheduling,
     pub queried_at: String,
+    /// Admin-only current API-equivalent value of retained provider attempts,
+    /// not upstream spend or an invoice. Never forwarded or used for scheduling.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub api_price: Option<ProviderApiPriceStats>,
     /// Homogeneous account capacity; never used as a synthetic routing tier.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub account_pool: Option<AccountPoolView>,
@@ -2311,10 +2315,18 @@ impl AdminService {
     /// - Kimi For Coding: `GET https://api.kimi.com/coding/v1/usages`,
     ///   Bearer key.
     pub async fn get_provider_usage(&self, id: &str) -> anyhow::Result<ProviderUsage> {
+        let mut usage = self.provider_usage_snapshot(id).await?;
+        // Price enrichment belongs only to this admin path, never GuardOnly or
+        // proxy forwarding; failures cannot alter a successful quota observation.
+        self.enrich_provider_api_price(&mut usage).await;
+        Ok(usage)
+    }
+
+    /// Full vendor snapshot for forwarding without local admin-only log pricing.
+    pub(super) async fn provider_usage_snapshot(&self, id: &str) -> anyhow::Result<ProviderUsage> {
         let usage = self
             .refresh_provider_usage(id, UsageQueryMode::Full)
             .await?;
-        // Full snapshots back usage forwarding to downstream Nyro instances.
         self.gw.usage_snapshots.store(&usage);
         Ok(usage)
     }
@@ -3101,6 +3113,7 @@ impl AdminService {
                 is_available,
                 scheduling: ProviderScheduling::default(),
                 queried_at: chrono::Utc::now().to_rfc3339(),
+                api_price: None,
                 account_pool: None,
                 pool_quota: None,
                 upstream,

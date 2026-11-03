@@ -256,6 +256,22 @@ pub trait LogStore: Send + Sync {
         start_at: i64,
         end_at: i64,
     ) -> anyhow::Result<Vec<crate::db::models::TokenUsageDay>>;
+    /// Scan one exact provider's retained attempts once, including failures/retries
+    /// without requiring an account ID, grouped by exact upstream model. Returns
+    /// all retained usage through inclusive epoch-ms `now`, plus usage within the
+    /// optional half-open `[start, end)` epoch-ms period, also capped at `now`.
+    /// Missing, empty or reversed periods contribute nothing to the second result.
+    /// Reuses token/pricing rows with an empty date and unset cost. Deleted-log
+    /// daily rollups are deliberately excluded: log clearing reduces these totals.
+    async fn provider_token_usage_with_period(
+        &self,
+        provider_id: &str,
+        now: i64,
+        period: Option<(i64, i64)>,
+    ) -> anyhow::Result<(
+        Vec<crate::db::models::TokenUsageDay>,
+        Vec<crate::db::models::TokenUsageDay>,
+    )>;
     /// Retained attempts, including failures/retries, strictly filtered by provider ID
     /// and grouped by `route_decision.account.account_id` plus upstream model.
     /// Missing/empty/non-string account IDs and malformed JSON are skipped; labels

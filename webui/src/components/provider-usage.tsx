@@ -3,7 +3,7 @@ import { useQueries, useQuery } from "@tanstack/react-query";
 import { Clock, RefreshCw, AlertCircle, CirclePause } from "lucide-react";
 import { backend } from "@/lib/backend";
 import { localizeBackendErrorMessage } from "@/lib/backend-error";
-import { isKiroOverage, nyroUpstreamView, providerUsagePause, providerUsageSupported, providerUsageTitle, summarizeGroupUsage, tierLabel } from "@/lib/provider-usage";
+import { isKiroOverage, nyroUpstreamView, providerApiPriceSupported, providerUsagePause, providerUsageSupported, providerUsageTitle, summarizeGroupUsage, tierLabel } from "@/lib/provider-usage";
 import { isDevinProvider, isKiroProvider } from "@/lib/native-provider";
 import { useLocale } from "@/lib/i18n";
 import { accountStateLabel, poolQuotaWindows, type AccountPoolView } from "@/lib/devin-account-pool";
@@ -12,6 +12,7 @@ import { useUsageClock } from "@/lib/use-usage-clock";
 import { UsageProgress } from "@/components/usage-progress";
 import { PoolRefreshButton } from "@/components/pool-refresh-button";
 import { ProviderIcon } from "@/components/ui/provider-icon";
+import { ProviderApiPriceSummary } from "@/components/provider-api-price-summary";
 import type {
   NyroUpstreamProvider,
   NyroUpstreamUsage,
@@ -513,6 +514,8 @@ export function ProviderUsageFooter({ provider }: { provider: Provider }) {
       ) : (
         <p className="text-xs text-slate-400">{isZh ? "暂无用量数据" : "No usage data"}</p>
       )}
+      {shown && providerApiPriceSupported(shown.kind) && <ProviderApiPriceSummary
+        usage={shown} now={now} stale={stale} loading={isFetching} locale={locale} />}
     </div>
   );
 
