@@ -32,8 +32,8 @@ export function useModelRatingMutations() {
   const client = useQueryClient();
   async function syncSavedRating(identity: RatingIdentity, saved: ModelRatingEntry | null) {
     await client.cancelQueries({ queryKey: MODEL_RATINGS_QUERY_KEY });
-    // Backend keys are canonical lowercase; compare identities canonically so a
-    // mixed-case draft still replaces its own cache row instead of duplicating it.
+    // Backend keys are canonical; compare identities canonically so case or
+    // numeric dot/hyphen variants replace their own cache row instead of duplicating it.
     const key = canonicalModelPrefix(identity.modelPrefix);
     client.setQueryData<ModelRatingEntry[]>(MODEL_RATINGS_QUERY_KEY, (previous) => {
       // Never invent a successful full list from a single-row mutation.
@@ -47,7 +47,7 @@ export function useModelRatingMutations() {
     mutationFn: async ({ modelPrefix, score }: RatingIdentity & { score: number }) => {
       if (!Number.isInteger(score) || score < 0 || score > 100) throw new Error("Score must be an integer from 0 to 100.");
       const saved = await backend<unknown>("set_model_rating", { modelPrefix, input: { score } });
-      // The backend canonicalizes the prefix to lowercase before storing.
+      // The backend lowercases and normalizes numeric dots before storing.
       if (!isModelRatingEntry(saved)
         || saved.model_prefix !== canonicalModelPrefix(modelPrefix)
         || saved.score !== score) {

@@ -288,20 +288,27 @@ impl AdminService {
         // Ratings replace the whole prefix table after providers land; old
         // backups' nested per-provider ratings were already dropped by serde.
         if !data.model_ratings.is_empty() {
-            let restored: Vec<ModelRatingEntry> = data
-                .model_ratings
-                .iter()
-                .map(|entry| ModelRatingEntry {
-                    // Canonical lowercase key; already validated pre-mutation.
-                    model_prefix: canonical_model_prefix(&entry.model_prefix),
-                    score: entry.score,
-                    // Retain the original instant in the canonical UTC millisecond form.
-                    updated_at: DateTime::parse_from_rfc3339(&entry.updated_at)
-                        .expect("rating timestamp prevalidated")
-                        .with_timezone(&Utc)
-                        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
-                })
-                .collect();
+            let restored = super::model_ratings::canonical_rating_entries(
+                data.model_ratings
+                    .iter()
+                    .map(|entry| ModelRatingEntry {
+                        // Keep spelling and full timestamp precision until aliases are resolved.
+                        model_prefix: entry.model_prefix.clone(),
+                        score: entry.score,
+                        updated_at: entry.updated_at.clone(),
+                    })
+                    .collect(),
+            )
+            .into_iter()
+            .map(|entry| ModelRatingEntry {
+                // Retain the original instant in the canonical UTC millisecond form.
+                updated_at: DateTime::parse_from_rfc3339(&entry.updated_at)
+                    .expect("rating timestamp prevalidated")
+                    .with_timezone(&Utc)
+                    .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                ..entry
+            })
+            .collect::<Vec<_>>();
             self.rating_store()?.restore(&restored).await?;
             ratings_imported = restored.len() as u32;
         }

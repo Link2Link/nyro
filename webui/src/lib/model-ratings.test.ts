@@ -44,10 +44,23 @@ test("prefix validation mirrors backend blank/NUL/1024-byte rules", () => {
   }
 });
 
-test("canonical prefix lowercases like the backend write path", () => {
-  equal(canonicalModelPrefix("DeepSeek-V4-Pro"), "deepseek-v4-pro");
-  equal(canonicalModelPrefix("already-lower"), "already-lower");
-  equal(canonicalModelPrefix("模型-É"), "模型-é");
+test("canonical prefix lowercases and normalizes only dots between ASCII digits like the backend", () => {
+  for (const [input, expected] of [
+    ["DeepSeek-V4-Pro", "deepseek-v4-pro"],
+    ["already-lower", "already-lower"],
+    ["模型-É", "模型-é"],
+    ["Claude-Opus-5.5", "claude-opus-5-5"],
+    ["claude-opus-5-5", "claude-opus-5-5"],
+    ["GPT-4.1.2", "gpt-4-1-2"],
+    ["model-12.34.56", "model-12-34-56"],
+    ["model.v1.2.preview", "model.v1-2.preview"],
+    ["model-.5-5.-5..5", "model-.5-5.-5..5"],
+    ["model-５.５-5.５-５.5", "model-５.５-5.５-５.5"],
+    [" Model_5/5:5--5 5.5\t", " model_5/5:5--5 5-5\t"],
+  ] as const) {
+    equal(canonicalModelPrefix(input), expected, input);
+    equal(canonicalModelPrefix(expected), expected, `idempotent: ${input}`);
+  }
 });
 
 test("segment-boundary matching mirrors the Rust rules exactly", () => {
@@ -63,12 +76,37 @@ test("segment-boundary matching mirrors the Rust rules exactly", () => {
   equal(modelMatchesPrefix("deepseek-v4-pro-0813", "DEEPSEEK-V4-PRO"), true);
   equal(modelMatchesPrefix("GPT-4-TURBO", "gpt-4"), true);
   equal(modelMatchesPrefix("GPT-4O", "gpt-4"), false);
-  // Separator identity is still exact.
+  // Other separator identity is still exact.
   equal(modelMatchesPrefix("deepseek v4 pro", "deepseek-v4"), false);
   equal(modelMatchesPrefix("a--b", "a-"), true);
   equal(modelMatchesPrefix("a-b", "a-"), false);
   equal(modelMatchesPrefix("模型-专业-0813", "模型-专业"), true);
   equal(modelMatchesPrefix("模型-x", "模型"), true);
+});
+
+test("numeric dot/hyphen matching works in both directions with suffix and mismatch boundaries", () => {
+  for (const prefix of ["claude-opus-5.5", "claude-opus-5-5"]) {
+    for (const model of ["Claude-Opus-5.5", "claude-opus-5-5"]) {
+      equal(modelMatchesPrefix(model, prefix), true, `${model} = ${prefix}`);
+      equal(modelMatchesPrefix(`${model}-20251101`, prefix), true, `${model} suffix = ${prefix}`);
+    }
+    for (const model of [
+      "claude-opus-5.50", "claude-opus-5-50", "claude-opus-5.5x", "claude-opus-5-5x",
+      "claude-opus-5.5.preview", "claude-opus-5-5_preview", "claude-opus-5/5",
+      "claude-opus-5--5", "claude-opus-5 5", "claude-opus-５.５", "claude-opus-5",
+      " claude-opus-5.5", "claude-opus-5.5 ", "claude-sonnet-5.5",
+    ]) equal(modelMatchesPrefix(model, prefix), false, `${model} != ${prefix}`);
+  }
+  for (const prefix of ["GPT-4.1.2", "GPT-4-1-2"]) {
+    for (const model of ["gpt-4.1.2", "gpt-4-1-2", "gpt-4.1-2", "gpt-4-1.2"]) {
+      equal(modelMatchesPrefix(model, prefix), true, `${model} = ${prefix}`);
+      equal(modelMatchesPrefix(`${model}-preview`, prefix), true, `${model} suffix = ${prefix}`);
+    }
+    equal(modelMatchesPrefix("gpt-4.1.20", prefix), false);
+  }
+  equal(modelMatchesPrefix("gpt-4.1.2", "gpt-4"), true);
+  equal(modelMatchesPrefix("model.v1.2-preview", "model.v1-2"), true);
+  equal(modelMatchesPrefix("model-v1-2-preview", "model.v1.2"), false);
 });
 
 test("longest prefix wins overlaps and matchingEntries orders shortest first", () => {
@@ -79,6 +117,23 @@ test("longest prefix wins overlaps and matchingEntries orders shortest first", (
   equal(longestRatingMatch("glm-4.5", entries), null);
   equal(longestRatingMatch("", entries), null);
   deepEqual(matchingEntries("deepseek-v4-pro-0813", entries).map((item) => item.model_prefix), ["deepseek-v4", "deepseek-v4-pro"]);
+});
+
+test("longest canonical prefix wins across numeric separator variants without rewriting entries", () => {
+  const broad = entry("gpt-4", 70);
+  const middle = entry("gpt-4.1", 80);
+  const specific = entry("gpt-4-1-2", 90);
+  const entries = [specific, broad, middle];
+  for (const model of ["GPT-4.1.2-preview", "gpt-4-1-2-preview"]) {
+    equal(longestRatingMatch(model, entries), specific);
+    deepEqual(matchingEntries(model, entries), [broad, middle, specific]);
+  }
+  equal(longestRatingMatch("gpt-4-1-preview", entries), middle);
+  equal(longestRatingMatch("gpt-4.10", entries), broad);
+  const state = ratingDisplayState("ready", "GPT-4.1.2-preview", entries);
+  equal(state.status, "rated");
+  if (state.status === "rated") equal(state.entry, specific);
+  deepEqual(entries.map((item) => item.model_prefix), ["gpt-4-1-2", "gpt-4", "gpt-4.1"]);
 });
 
 test("list payload failures never masquerade as empty ratings", () => {
@@ -115,6 +170,36 @@ test("coverage counts models per provider at segment boundaries only", () => {
   const rows = buildModelRatingRows([entry("deepseek-v4-pro", 92)], catalogs, providers);
   equal(rows[0].modelCount, 3);
   equal(rows[0].providerCount, 2);
+});
+
+test("coverage and unmatched models share numeric separator equivalence without rewriting concrete names", () => {
+  const providers = [provider("p", "Alpha"), provider("q", "Beta")];
+  const catalogs = [
+    catalog("p", "success", ["Claude-Opus-5.5", "claude-opus-5-5", "claude-opus-5.5-20251101", "claude-opus-5.50"]),
+    catalog("q", "success", ["CLAUDE-OPUS-5-5-20251101", "claude-opus-5-50"]),
+  ];
+  const routes = [
+    route("p", "claude-opus-5-5-saved"), route("q", "Claude-Opus-5.5-saved"),
+    route("p", "Unrated-1.2"), route("p", "Unrated-1-2"),
+  ];
+  const expectedCoverage = [
+    { provider: providers[0], models: ["Claude-Opus-5.5", "claude-opus-5-5", "claude-opus-5.5-20251101"] },
+    { provider: providers[1], models: ["CLAUDE-OPUS-5-5-20251101"] },
+  ];
+  const snapshot = JSON.stringify({ catalogs, routes });
+  for (const prefix of ["claude-opus-5.5", "claude-opus-5-5"]) {
+    deepEqual(prefixCoverage(prefix, catalogs, providers), expectedCoverage);
+    const rows = buildModelRatingRows([entry(prefix, 92)], catalogs, providers);
+    equal(rows[0].modelCount, 4);
+    equal(rows[0].providerCount, 2);
+    deepEqual(rows[0].coverage, expectedCoverage);
+    const unmatched = buildUnmatchedModels(providers, routes, catalogs, [entry(prefix, 92)]);
+    deepEqual(unmatched.map((row) => [row.provider.id, row.model]).sort(), [
+      ["p", "Unrated-1-2"], ["p", "Unrated-1.2"], ["p", "claude-opus-5.50"], ["q", "claude-opus-5-50"],
+    ]);
+    for (const row of unmatched) equal(row.key, JSON.stringify([row.provider.id, row.model]));
+  }
+  equal(JSON.stringify({ catalogs, routes }), snapshot);
 });
 
 test("unmatched union covers catalogs and route targets minus every matched model", () => {

@@ -53,11 +53,12 @@ pub(super) fn validate_rating_score(score: i32) -> anyhow::Result<()> {
 pub(super) fn validate_export_ratings(entries: &[ExportModelRating]) -> anyhow::Result<()> {
     let mut prefixes = std::collections::HashSet::new();
     for entry in entries {
-        // Canonical form decides duplicates and bounds; case variants collide.
         let canonical = canonical_model_prefix(&entry.model_prefix);
         validate_rating_prefix(&canonical)?;
         validate_rating_score(entry.score)?;
-        if !prefixes.insert(canonical) {
+        // Continue rejecting exact/case duplicates, but accept numeric separator
+        // aliases from older backups; restoration merges them by update time.
+        if !prefixes.insert(entry.model_prefix.to_lowercase()) {
             return Err(ModelRatingError::InvalidInput(format!(
                 "Duplicate model rating prefix: {}",
                 entry.model_prefix
@@ -74,6 +75,33 @@ pub(super) fn validate_export_ratings(entries: &[ExportModelRating]) -> anyhow::
     Ok(())
 }
 
+/// Resolve legacy spelling aliases without mutating storage on reads. The latest
+/// evaluation wins; equal instants use the lexically smaller original prefix for
+/// a stable result independent of database ordering (hyphens sort before dots).
+pub(super) fn canonical_rating_entries(entries: Vec<ModelRatingEntry>) -> Vec<ModelRatingEntry> {
+    let mut merged = std::collections::BTreeMap::<String, ModelRatingEntry>::new();
+    for entry in entries {
+        let key = canonical_model_prefix(&entry.model_prefix);
+        if let Some(current) = merged.get(&key) {
+            let order = DateTime::parse_from_rfc3339(&entry.updated_at)
+                .ok()
+                .cmp(&DateTime::parse_from_rfc3339(&current.updated_at).ok())
+                .then_with(|| current.model_prefix.cmp(&entry.model_prefix));
+            if !order.is_gt() {
+                continue;
+            }
+        }
+        merged.insert(key, entry);
+    }
+    merged
+        .into_iter()
+        .map(|(canonical, entry)| ModelRatingEntry {
+            model_prefix: canonical,
+            ..entry
+        })
+        .collect()
+}
+
 impl AdminService {
     pub(super) fn rating_store(&self) -> anyhow::Result<&dyn ModelRatingStore> {
         self.gw
@@ -83,9 +111,7 @@ impl AdminService {
     }
 
     pub async fn list_model_ratings(&self) -> anyhow::Result<Vec<ModelRatingEntry>> {
-        let mut entries = self.rating_store()?.list().await?;
-        entries.sort_by(|a, b| a.model_prefix.cmp(&b.model_prefix));
-        Ok(entries)
+        Ok(canonical_rating_entries(self.rating_store()?.list().await?))
     }
 
     pub async fn set_model_rating(
@@ -93,25 +119,47 @@ impl AdminService {
         model_prefix: &str,
         input: SetModelRating,
     ) -> anyhow::Result<ModelRatingEntry> {
-        // Prefixes are stored lowercase: the case-insensitive match can never
-        // see two same-length variants of one prefix.
         let canonical = canonical_model_prefix(model_prefix);
         validate_rating_prefix(&canonical)?;
         validate_rating_score(input.score)?;
         let store = self.rating_store()?;
-        store
+        let aliases = store
+            .list()
+            .await?
+            .into_iter()
+            .filter(|entry| {
+                entry.model_prefix != canonical
+                    && canonical_model_prefix(&entry.model_prefix) == canonical
+            })
+            .collect::<Vec<_>>();
+        // Save first, so a failed write cannot destroy the previous evaluation.
+        let saved = store
             .upsert(ModelRatingEntry {
                 model_prefix: canonical,
                 score: input.score,
                 updated_at: Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
             })
-            .await
+            .await?;
+        for alias in aliases {
+            store.delete(&alias.model_prefix).await?;
+        }
+        Ok(saved)
     }
 
     pub async fn delete_model_rating(&self, model_prefix: &str) -> anyhow::Result<()> {
         let canonical = canonical_model_prefix(model_prefix);
         validate_rating_prefix(&canonical)?;
-        self.rating_store()?.delete(&canonical).await
+        let store = self.rating_store()?;
+        // Remove every persisted alias so clearing a merged row cannot reveal an
+        // older dot-spelled evaluation on the next read.
+        for entry in store.list().await? {
+            if entry.model_prefix != canonical
+                && canonical_model_prefix(&entry.model_prefix) == canonical
+            {
+                store.delete(&entry.model_prefix).await?;
+            }
+        }
+        store.delete(&canonical).await
     }
 }
 
@@ -179,5 +227,37 @@ mod tests {
             .is_err()
         );
         assert!(validate_export_ratings(&[entry("a", "not-a-timestamp")]).is_err());
+        validate_export_ratings(&[
+            entry("claude-opus-5.5", "2026-01-01T00:00:00Z"),
+            entry("claude-opus-5-5", "2026-01-02T00:00:00Z"),
+        ])
+        .unwrap();
+    }
+
+    #[test]
+    fn legacy_alias_merge_uses_instants_and_stable_ties() {
+        let row = |prefix: &str, score, time: &str| ModelRatingEntry {
+            model_prefix: prefix.to_string(),
+            score,
+            updated_at: time.to_string(),
+        };
+        let earlier = row("claude-opus-5-5", 59, "2026-01-01T00:00:00Z");
+        // The lexical timestamp order differs from the instant order.
+        let later = row("Claude-Opus-5.5", 60, "2025-12-31T23:30:00-01:00");
+        let expected = ModelRatingEntry {
+            model_prefix: "claude-opus-5-5".into(),
+            ..later.clone()
+        };
+        for entries in [vec![earlier.clone(), later.clone()], vec![later, earlier]] {
+            assert_eq!(canonical_rating_entries(entries), vec![expected.clone()]);
+        }
+        let dotted = row("claude-opus-5.5", 60, "2026-01-01T01:00:00+01:00");
+        let dashed = row("claude-opus-5-5", 59, "2026-01-01T00:00:00Z");
+        for entries in [
+            vec![dotted.clone(), dashed.clone()],
+            vec![dashed.clone(), dotted],
+        ] {
+            assert_eq!(canonical_rating_entries(entries), vec![dashed.clone()]);
+        }
     }
 }

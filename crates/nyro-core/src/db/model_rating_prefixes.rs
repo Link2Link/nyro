@@ -11,13 +11,13 @@ pub struct ModelRatingEntry {
     pub updated_at: String,
 }
 
-/// Case-insensitive segment-boundary prefix match: the model either equals the
-/// prefix or the prefix ends exactly at a "-" boundary, comparing both sides
-/// lowercased. Segment identity is still exact, so "gpt-4" does not match
-/// "gpt-4o" and "deepseek-v4-pro" does not match "deepseek-v4-pro2".
+/// Case-insensitive segment-boundary prefix match, treating dots between ASCII
+/// digits as hyphens ("claude-opus-5.5" equals "claude-opus-5-5"). The model must
+/// equal the canonical prefix or continue after a "-" boundary, so "gpt-4" does
+/// not match "gpt-4o" and "deepseek-v4-pro" does not match "deepseek-v4-pro2".
 pub fn model_matches_prefix(model: &str, prefix: &str) -> bool {
-    let model = model.to_lowercase();
-    let prefix = prefix.to_lowercase();
+    let model = canonical_model_prefix(model);
+    let prefix = canonical_model_prefix(prefix);
     if model.len() <= prefix.len() {
         return model == prefix;
     }
@@ -27,7 +27,7 @@ pub fn model_matches_prefix(model: &str, prefix: &str) -> bool {
 }
 
 /// Longest matching entry wins when several prefixes hit one model; lengths are
-/// compared on the lowercased form so case variants never tie.
+/// compared on the canonical form.
 pub fn longest_matching_entry<'a>(
     model: &str,
     entries: &'a [ModelRatingEntry],
@@ -35,13 +35,28 @@ pub fn longest_matching_entry<'a>(
     entries
         .iter()
         .filter(|entry| model_matches_prefix(model, &entry.model_prefix))
-        .max_by_key(|entry| entry.model_prefix.to_lowercase().len())
+        .max_by_key(|entry| canonical_model_prefix(&entry.model_prefix).len())
 }
 
-/// Canonical storage key: prefixes are stored lowercased so the case-insensitive
-/// match can never see two same-length variants of one prefix.
+/// Canonical rating key: lowercase and replace dots between ASCII digits with
+/// hyphens. Other punctuation, whitespace and upstream model identities stay exact.
 pub fn canonical_model_prefix(prefix: &str) -> String {
-    prefix.to_lowercase()
+    let lower = prefix.to_lowercase();
+    let bytes = lower.as_bytes();
+    lower
+        .char_indices()
+        .map(|(index, ch)| {
+            if ch == '.'
+                && index > 0
+                && bytes[index - 1].is_ascii_digit()
+                && bytes.get(index + 1).is_some_and(u8::is_ascii_digit)
+            {
+                '-'
+            } else {
+                ch
+            }
+        })
+        .collect()
 }
 
 /// Prevent truncation on backends that can run in non-strict SQL modes.
@@ -109,6 +124,55 @@ mod tests {
     }
 
     #[test]
+    fn numeric_version_separators_are_equivalent() {
+        for prefix in ["claude-opus-5-5", "claude-opus-5.5"] {
+            for model in [
+                "claude-opus-5-5",
+                "Claude-Opus-5.5",
+                "claude-opus-5-5-20251101",
+                "claude-opus-5.5-20251101",
+            ] {
+                assert!(model_matches_prefix(model, prefix), "{model}: {prefix}");
+            }
+            for model in [
+                "claude-opus-5.50",
+                "claude-opus-5-50",
+                "claude-opus-5.5x",
+                "claude-opus-5.5_preview",
+                "claude-sonnet-5.5",
+            ] {
+                assert!(!model_matches_prefix(model, prefix), "{model}: {prefix}");
+            }
+        }
+        for model in ["gpt-4.1.2", "gpt-4-1-2", "gpt-4.1-2", "gpt-4-1.2"] {
+            assert!(model_matches_prefix(model, "gpt-4.1.2"));
+            assert!(model_matches_prefix(model, "gpt-4-1-2"));
+        }
+        assert!(!model_matches_prefix("model.preview", "model-preview"));
+        assert!(!model_matches_prefix("model-５.５", "model-５-５"));
+    }
+
+    #[test]
+    fn canonical_prefix_normalizes_only_numeric_dots() {
+        for (prefix, expected) in [
+            ("Claude-Opus-5.5", "claude-opus-5-5"),
+            ("GPT-4.1.2", "gpt-4-1-2"),
+            ("model-12.34.56", "model-12-34-56"),
+            ("model.v1.2.preview", "model.v1-2.preview"),
+            (".5", ".5"),
+            ("5.", "5."),
+            ("5..5", "5..5"),
+            ("５.5", "５.5"),
+            ("5.５", "5.５"),
+            (" model-5.5 ", " model-5-5 "),
+            ("vendor/model_x:5.5", "vendor/model_x:5-5"),
+        ] {
+            assert_eq!(canonical_model_prefix(prefix), expected);
+            assert_eq!(canonical_model_prefix(expected), expected);
+        }
+    }
+
+    #[test]
     fn longest_prefix_wins_overlaps() {
         let entries = vec![entry("deepseek-v4"), entry("deepseek-v4-pro")];
         assert_eq!(
@@ -129,6 +193,12 @@ mod tests {
         );
         assert_eq!(longest_matching_entry("glm-4.5", &entries), None);
         assert_eq!(longest_matching_entry("", &entries), None);
+        let versions = vec![entry("claude-opus-5"), entry("claude-opus-5.5")];
+        assert_eq!(
+            longest_matching_entry("Claude-Opus-5-5-20251101", &versions)
+                .map(|found| found.model_prefix.as_str()),
+            Some("claude-opus-5.5")
+        );
     }
 
     #[test]

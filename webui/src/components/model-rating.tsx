@@ -4,6 +4,7 @@ import { useLocale } from "@/lib/i18n";
 import { localizeBackendErrorMessage } from "@/lib/backend-error";
 import { formatLocalDateTime } from "@/lib/format";
 import {
+  canonicalModelPrefix,
   isValidRatingPrefix,
   modelMatchesPrefix,
   parseRatingScore,
@@ -124,14 +125,14 @@ export function ModelRatingEditor({ target, providers, catalogs, onClose, onClea
     const coverage = prefixCoverage(prefixDraft, catalogs, providers);
     const modelCount = coverage.reduce((total, group) => total + group.models.length, 0);
     // Entries strictly shorter than the draft would be shadowed by it. The
-    // canonical (lowercased) comparison excludes the entry being edited.
-    const draftKey = prefixDraft.toLowerCase();
-    const shadowed = (ratings.data ?? []).filter((entry) => entry.model_prefix.toLowerCase() !== draftKey
+    // canonical comparison excludes the entry being edited.
+    const draftKey = canonicalModelPrefix(prefixDraft);
+    const shadowed = (ratings.data ?? []).filter((entry) => canonicalModelPrefix(entry.model_prefix) !== draftKey
       && coverage.some((group) => group.models.some((model) => modelMatchesPrefix(model, entry.model_prefix))));
     return { coverage, modelCount, shadowed };
   }, [prefixDraft, catalogs, providers, ratings.data]);
 
-  const prefixChanged = prefixDraft.toLowerCase() !== (target.entry?.model_prefix ?? target.initialPrefix).toLowerCase();
+  const prefixChanged = canonicalModelPrefix(prefixDraft) !== canonicalModelPrefix(target.entry?.model_prefix ?? target.initialPrefix);
 
   function handleSave(event: FormEvent) {
     event.preventDefault();
@@ -160,7 +161,7 @@ export function ModelRatingEditor({ target, providers, catalogs, onClose, onClea
         <DialogContent showCloseButton={!pending} className="max-h-[90vh] overflow-y-auto">
           <DialogHeader>
             <DialogTitle>{isZh ? "编辑前缀评分" : "Edit prefix rating"}</DialogTitle>
-            <DialogDescription>{isZh ? "前缀跨所有供应商共享：模型名等于前缀、或以“前缀-”开头的模型都会命中此分数，匹配忽略大小写（保存时统一转为小写）。评分不影响路由。" : "A prefix is shared by every provider: models equal to it or continuing after \"prefix-\" match this score. Matching ignores case (prefixes are stored lowercase). Ratings do not affect routing."}</DialogDescription>
+            <DialogDescription>{isZh ? "前缀跨所有供应商共享：规范化后模型名等于前缀、或以“前缀-”开头时命中此分数。匹配忽略大小写，ASCII 数字之间的点与连字符等价（5.5 = 5-5）；保存时统一为小写和数字间连字符，其他分隔符与空白保持不变。评分不影响路由。" : "A prefix is shared by every provider: after canonicalization, models equal to it or continuing after \"prefix-\" match this score. Matching ignores case and treats dots between ASCII digits as hyphens (5.5 = 5-5). Prefixes are stored lowercase with numeric hyphens; other separators and whitespace stay unchanged. Ratings do not affect routing."}</DialogDescription>
           </DialogHeader>
           <form onSubmit={handleSave} noValidate className="space-y-3">
             <div className="space-y-1.5">
@@ -178,7 +179,7 @@ export function ModelRatingEditor({ target, providers, catalogs, onClose, onClea
                 className="font-mono"
                 placeholder="deepseek-v4-pro"
               />
-              <p id={`${prefixId}-help`} className="text-xs text-slate-500">{isZh ? "示例：前缀 deepseek-v4-pro 命中 deepseek-v4-pro、DeepSeek-V4-Pro-0813，但不命中 deepseek-v4-pro2。匹配忽略大小写，多条命中时最长前缀胜出。" : "Example: prefix deepseek-v4-pro matches deepseek-v4-pro and DeepSeek-V4-Pro-0813, but not deepseek-v4-pro2. Matching ignores case; longest prefix wins on overlaps."}</p>
+              <p id={`${prefixId}-help`} className="text-xs text-slate-500">{isZh ? "示例：前缀 claude-opus-5.5 与 claude-opus-5-5 等价，均命中 Claude-Opus-5.5-20251101，但不命中 claude-opus-5.50。非数字间的点、其他分隔符与空白仍精确匹配；多条命中时规范化后最长前缀胜出。" : "Example: prefixes claude-opus-5.5 and claude-opus-5-5 are equivalent and match Claude-Opus-5.5-20251101, but not claude-opus-5.50. Nonnumeric dots, other separators, and whitespace still match exactly; the longest canonical prefix wins on overlaps."}</p>
               {validationError === "prefix" && <p role="alert" className="text-xs text-red-600">{prefixMessage}</p>}
             </div>
             <div className="space-y-1.5">
