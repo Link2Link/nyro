@@ -1,16 +1,16 @@
 import type { Model, ModelRatingEntry, Provider } from "./types";
 
 /**
- * Case-insensitive segment-boundary prefix match, mirrored in Rust
+ * Canonical segment-boundary prefix match, mirrored in Rust
  * (db/model_rating_prefixes.rs): the model equals the prefix or continues
- * after a "-", comparing both sides lowercased. Separators and whitespace stay
- * exact — only case differences are ignored.
+ * after a "-". Case and dots between ASCII digits are normalized on both sides;
+ * all other separators and whitespace stay exact.
  */
 export function modelMatchesPrefix(model: string, prefix: string): boolean {
-  const lowerModel = model.toLowerCase();
-  const lowerPrefix = prefix.toLowerCase();
-  if (lowerModel.length <= lowerPrefix.length) return lowerModel === lowerPrefix;
-  return lowerModel.startsWith(lowerPrefix) && lowerModel.charCodeAt(lowerPrefix.length) === 0x2d;
+  const canonicalModel = canonicalModelPrefix(model);
+  const canonicalPrefix = canonicalModelPrefix(prefix);
+  if (canonicalModel.length <= canonicalPrefix.length) return canonicalModel === canonicalPrefix;
+  return canonicalModel.startsWith(canonicalPrefix) && canonicalModel.charCodeAt(canonicalPrefix.length) === 0x2d;
 }
 
 export interface RatingMatch {
@@ -18,7 +18,7 @@ export interface RatingMatch {
   model: string;
 }
 
-/** Longest matching prefix wins, comparing lengths on the lowercased form. */
+/** Longest matching prefix wins, comparing lengths on the canonical form. */
 export function longestRatingMatch(
   model: string,
   entries: ModelRatingEntry[],
@@ -27,7 +27,7 @@ export function longestRatingMatch(
   let bestLength = -1;
   for (const entry of entries) {
     if (!modelMatchesPrefix(model, entry.model_prefix)) continue;
-    const length = entry.model_prefix.toLowerCase().length;
+    const length = canonicalModelPrefix(entry.model_prefix).length;
     if (length > bestLength) {
       best = entry;
       bestLength = length;
@@ -40,7 +40,7 @@ export function longestRatingMatch(
 export function matchingEntries(model: string, entries: ModelRatingEntry[]): ModelRatingEntry[] {
   return entries
     .filter((entry) => modelMatchesPrefix(model, entry.model_prefix))
-    .sort((a, b) => a.model_prefix.length - b.model_prefix.length);
+    .sort((a, b) => canonicalModelPrefix(a.model_prefix).length - canonicalModelPrefix(b.model_prefix).length);
 }
 
 /** Every (provider, model) a prefix entry would cover, grouped by provider. */
@@ -83,9 +83,9 @@ export function isValidRatingPrefix(prefix: string): boolean {
   return prefix.trim() !== "" && !prefix.includes("\0") && new Blob([prefix]).size <= 1024;
 }
 
-/** Canonical storage form, mirroring the backend's lowercase canonicalization. */
+/** Canonical storage form: lowercase, with dots between ASCII digits as hyphens. */
 export function canonicalModelPrefix(prefix: string): string {
-  return prefix.toLowerCase();
+  return prefix.toLowerCase().replace(/([0-9])\.(?=[0-9])/g, "$1-");
 }
 
 export function isModelRatingEntry(value: unknown): value is ModelRatingEntry {

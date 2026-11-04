@@ -233,6 +233,134 @@ async fn rating_validation_retains_exact_identity_without_catalog_requests() -> 
     Ok(())
 }
 
+async fn seed_version_aliases(pool: &sqlx::SqlitePool) -> anyhow::Result<()> {
+    for (prefix, score, time) in [
+        ("claude-opus-5-5", 59, "2026-01-01T00:00:00Z"),
+        ("claude-opus-5.5", 60, "2026-01-02T00:00:00Z"),
+    ] {
+        sqlx::query(
+            "INSERT INTO model_rating_prefixes (model_prefix, score, updated_at) VALUES (?, ?, ?)",
+        )
+        .bind(prefix)
+        .bind(score)
+        .bind(time)
+        .execute(pool)
+        .await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn rating_version_aliases_share_one_key_and_clean_up_legacy_rows() -> anyhow::Result<()> {
+    let app = app().await?;
+    let admin = app.gateway.admin();
+    seed_version_aliases(&app.pool).await?;
+    let merged = admin.list_model_ratings().await?;
+    assert_eq!(merged.len(), 1);
+    assert_eq!(merged[0].model_prefix, "claude-opus-5-5");
+    assert_eq!(merged[0].score, 60);
+    assert_eq!(merged[0].updated_at, "2026-01-02T00:00:00Z");
+    assert_eq!(admin.export_config().await?.model_ratings.len(), 1);
+    // Reading is non-destructive; unrelated administrative reads cannot rewrite data.
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM model_rating_prefixes")
+        .fetch_one(&app.pool)
+        .await?;
+    assert_eq!(count, 2);
+    for (prefix, score) in [("Claude-Opus-5.5", 0), ("claude-opus-5-5", 70)] {
+        let saved = admin
+            .set_model_rating(prefix, SetModelRating { score })
+            .await?;
+        assert_eq!(saved.model_prefix, "claude-opus-5-5");
+        assert_eq!(saved.score, score);
+        assert_eq!(admin.list_model_ratings().await?, vec![saved]);
+    }
+    let persisted: Vec<String> =
+        sqlx::query_scalar("SELECT model_prefix FROM model_rating_prefixes")
+            .fetch_all(&app.pool)
+            .await?;
+    assert_eq!(persisted, vec!["claude-opus-5-5"]);
+    let reopened = SqliteStorage::from_config(&app.gateway.config).await?;
+    assert_eq!(reopened.model_ratings().unwrap().list().await?[0].score, 70);
+    admin.delete_model_rating("CLAUDE-OPUS-5.5").await?;
+    assert!(admin.list_model_ratings().await?.is_empty());
+    // Deleting either spelling clears every legacy row, with no old score resurfacing.
+    for prefix in ["claude-opus-5.5", "claude-opus-5-5"] {
+        seed_version_aliases(&app.pool).await?;
+        admin.delete_model_rating(prefix).await?;
+        admin.delete_model_rating(prefix).await?;
+        assert!(admin.list_model_ratings().await?.is_empty());
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM model_rating_prefixes")
+            .fetch_one(&app.pool)
+            .await?;
+        assert_eq!(count, 0);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn rating_legacy_version_alias_backup_import_merges_latest_score() -> anyhow::Result<()> {
+    let source = app().await?;
+    let mut export = source.gateway.admin().export_config().await?;
+    // An older version could export both spellings. Either order must import.
+    export.model_ratings = serde_json::from_value(json!([
+        {"model_prefix": "claude-opus-5-5", "score": 59, "updated_at": "2026-01-01T00:00:00Z"},
+        {"model_prefix": "Claude-Opus-5.5", "score": 0, "updated_at": "2026-01-02T08:00:00+08:00"}
+    ]))?;
+    let dest = app().await?;
+    let admin = dest.gateway.admin();
+    for _ in 0..2 {
+        let result = admin.import_config(export.clone()).await?;
+        assert_eq!(result.ratings_imported, 1);
+        let restored = admin.list_model_ratings().await?;
+        assert_eq!(restored.len(), 1);
+        assert_eq!(restored[0].model_prefix, "claude-opus-5-5");
+        assert_eq!(restored[0].score, 0);
+        assert_eq!(restored[0].updated_at, "2026-01-02T00:00:00.000Z");
+        let backup = admin.export_config().await?;
+        assert_eq!(backup.model_ratings.len(), 1);
+        assert_eq!(backup.model_ratings[0].model_prefix, "claude-opus-5-5");
+        export.model_ratings.reverse();
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn rating_performance_groups_version_aliases_without_rewriting_models() -> anyhow::Result<()>
+{
+    let app = app().await?;
+    let admin = app.gateway.admin();
+    let p = admin.create_provider(provider("version-aliases")).await?;
+    seed_version_aliases(&app.pool).await?;
+    for model in ["claude-opus-5.5", "claude-opus-5-5", "claude-opus-5.50"] {
+        sqlx::query(
+            "INSERT INTO request_logs (id, created_at, provider_id, upstream_model, output_tokens, \
+             latency_upstream_ms, latency_total_ms) VALUES (?, ?, ?, ?, 100, 1000, 1000)",
+        )
+        .bind(uuid::Uuid::new_v4().to_string())
+        .bind(chrono::Utc::now().timestamp_millis() - 1000)
+        .bind(&p.id)
+        .bind(model)
+        .execute(&app.pool)
+        .await?;
+    }
+    let stats = admin.get_model_performance(Some(&p.id)).await?;
+    assert_eq!(stats.models.len(), 1);
+    let group = &stats.models[0];
+    assert_eq!(group.model_prefix, "claude-opus-5-5");
+    assert_eq!(group.score, 60);
+    assert_eq!(group.mixed.selected_request_count, 2);
+    assert_eq!(group.mixed.average_tps, Some(100.0));
+    assert_eq!(
+        group
+            .variants
+            .iter()
+            .map(|v| v.upstream_model.as_str())
+            .collect::<Vec<_>>(),
+        vec!["claude-opus-5-5", "claude-opus-5.5"]
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn rating_changes_do_not_affect_routes_or_epoch_and_outlive_providers() -> anyhow::Result<()>
 {

@@ -4,6 +4,17 @@ All notable changes to Nyro will be documented in this file.
 
 ---
 
+## v2.1.25
+
+> Released on 2026-11-04
+
+#### Fixes
+
+- **Equivalent numeric model-rating versions**: rating prefixes now treat dots between ASCII digits as hyphens, so `claude-opus-5.5` and `claude-opus-5-5` share one score across providers. The WebUI, coverage previews, unmatched-model lists and performance grouping use the same canonical matching rules; longer versions such as `5.50` do not accidentally match `5.5`.
+- **Existing rating and backup compatibility**: legacy dot/hyphen entries merge into one displayed prefix using the most recently updated score. Saving or clearing either spelling removes legacy aliases, and older backups containing both spellings restore the latest evaluation without losing its timestamp. Added backend and frontend regressions for matching boundaries, alias cleanup, backups and performance grouping. Original upstream model names and inference routing remain unchanged; no database migration is required.
+
+---
+
 ## v2.1.24
 
 > Released on 2026-11-04
