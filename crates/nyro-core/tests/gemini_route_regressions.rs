@@ -14,8 +14,10 @@ use std::{
 
 use axum::{
     Json, Router,
-    extract::State,
+    body::{Body, to_bytes},
+    extract::{Request, State},
     http::{HeaderMap, HeaderValue, StatusCode, Uri},
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::post,
 };
@@ -43,6 +45,7 @@ const TIMEOUT: Duration = Duration::from_secs(5);
 #[derive(Clone, Copy)]
 enum Reply {
     Text,
+    StreamText,
     ParallelCalls,
     InvalidCall,
     ConflictingCall,
@@ -104,6 +107,14 @@ async fn upstream_handler(
     let reply = upstream.next_reply();
     match reply {
         Reply::Text => Json(text_reply()).into_response(),
+        Reply::StreamText => {
+            let reply = text_reply();
+            (
+                [("content-type", "text/event-stream")],
+                format!("data: {reply}\n\n"),
+            )
+                .into_response()
+        }
         Reply::ParallelCalls => {
             // Neither call has a provider ID. Both occupy candidate 0 but need
             // different downstream tool indices and distinct synthesized IDs.
@@ -204,13 +215,17 @@ fn runtime() -> anyhow::Result<tokio::runtime::Runtime> {
 /// tasks; it never synchronously polls them, and this runtime has no workers.
 /// Dropping it cancels every queued task before any can perform network I/O.
 /// If construction ever starts yielding, fail closed instead of driving it.
-fn offline_gateway(config: GatewayConfig, provider: Provider) -> anyhow::Result<Gateway> {
+fn offline_gateway(
+    config: GatewayConfig,
+    provider: Provider,
+    target_model: &str,
+) -> anyhow::Result<Gateway> {
     let model = Model {
         id: "local-model".into(),
         name: CLIENT_MODEL.into(),
         balance: "priority".into(),
         target_provider: provider.id.clone(),
-        target_model: UPSTREAM_MODEL.into(),
+        target_model: target_model.into(),
         enable_auth: false,
         enable_payload: Some(false),
         force_max_reasoning: false,
@@ -291,6 +306,7 @@ impl Fixture {
                 ..Default::default()
             },
             provider,
+            UPSTREAM_MODEL,
         )?;
         Ok(Self {
             gateway,
@@ -778,12 +794,12 @@ fn anthropic_to_gemini_compat_rich_schema_is_not_rejected_or_cleaned_by_native_p
     let mut fixture = Fixture::new("google", Reply::Text)?;
     runtime()?.block_on(async {
         let _server = fixture.start()?;
-        // A non-const oneOf is intentionally unsupported by native lowering.
-        // The ordinary dispatcher-selected compat route supports it using the
-        // richer parametersJsonSchema channel; the preview must not reject it.
+        // Overlapping number/integer oneOf branches cannot safely become anyOf.
+        // The ordinary dispatcher-selected compat route supports the original
+        // rich schema; its native preview must not reject it.
         let schema = json!({
             "type": "object",
-            "properties": {"city": {"oneOf": [{"type": "string"}, {"type": "integer"}]}},
+            "properties": {"city": {"oneOf": [{"type": "number"}, {"type": "integer"}]}},
             "required": ["city"],
             "additionalProperties": false
         });
@@ -824,6 +840,222 @@ fn anthropic_to_gemini_compat_rich_schema_is_not_rejected_or_cleaned_by_native_p
     })
 }
 
+/// Sanitized reproduction of the live schedule tool schema. Only tool schemas
+/// are copied from the incident; no user conversation or credentials are used.
+fn schedule_parameters() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "at": {
+                "description": "Absolute target: an RFC 3339 date-time with offset, or a local date, time, and IANA time_zone.",
+                "oneOf": [
+                    {"type": "string"},
+                    {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "properties": {
+                            "date": {"type": "string"},
+                            "time": {"type": "string"},
+                            "time_zone": {"type": "string"}
+                        },
+                        "required": ["date", "time", "time_zone"]
+                    }
+                ]
+            }
+        },
+        "additionalProperties": false
+    })
+}
+
+fn schedule_request(stream: bool) -> Value {
+    // The failed request contained 80 tools. Keep that shape, replacing unrelated
+    // tools with inert schemas rather than copying a private session wholesale.
+    let mut tools: Vec<Value> = (0..78)
+        .map(|index| {
+            json!({
+                "type": "function",
+                "function": {
+                    "name": format!("local_tool_{index}"),
+                    "parameters": {"type": "object", "properties": {"text": {"type": "string"}}}
+                }
+            })
+        })
+        .collect();
+    for name in ["schedule_create", "schedule_update"] {
+        tools.push(json!({
+            "type": "function",
+            "function": {"name": name, "parameters": schedule_parameters()}
+        }));
+    }
+    json!({
+        "model": CLIENT_MODEL,
+        "messages": [{"role": "user", "content": "Check the schedule tool schema."}],
+        "max_completion_tokens": 64,
+        "reasoning_effort": "high",
+        "store": false,
+        "stream": stream,
+        "tools": tools
+    })
+}
+
+fn assert_schedule_schema(body: &Value) {
+    let declarations = body["tools"][0]["functionDeclarations"]
+        .as_array()
+        .expect("Gemini function declarations");
+    assert_eq!(declarations.len(), 80, "tools must not be silently dropped");
+    for name in ["schedule_create", "schedule_update"] {
+        let declaration = declarations
+            .iter()
+            .find(|tool| tool["name"] == name)
+            .expect("schedule tool survives lowering");
+        let at = &declaration["parameters"]["properties"]["at"];
+        let original = schedule_parameters();
+        let original_at = &original["properties"]["at"];
+        assert_eq!(at["description"], original_at["description"]);
+        assert!(at.get("oneOf").is_none());
+        assert_eq!(at["anyOf"][0], original_at["oneOf"][0]);
+        let mut expected_object = original_at["oneOf"][1].clone();
+        // Existing native Schema-proto cleanup is unchanged. In particular it
+        // cannot encode additionalProperties, but must retain both branches,
+        // every property and the local-date required-member constraints.
+        expected_object
+            .as_object_mut()
+            .unwrap()
+            .remove("additionalProperties");
+        assert_eq!(at["anyOf"][1], expected_object);
+        assert_eq!(at["anyOf"].as_array().unwrap().len(), 2);
+        assert!(declaration.get("parametersJsonSchema").is_none());
+    }
+}
+
+#[test]
+fn native_gemini_schedule_one_of_replay_preserves_both_branches() -> anyhow::Result<()> {
+    for stream in [false, true] {
+        let mut fixture = Fixture::new(
+            "google",
+            if stream {
+                Reply::StreamText
+            } else {
+                Reply::Text
+            },
+        )?;
+        runtime()?.block_on(async {
+            let _server = fixture.start()?;
+            let wire = dispatch(
+                &fixture.gateway,
+                OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1,
+                schedule_request(stream),
+            )
+            .await?;
+            assert!(wire.contains("local reply"), "missing completion: {wire}");
+            assert_schedule_schema(&fixture.only_request().body);
+            Ok::<_, anyhow::Error>(())
+        })?;
+    }
+    Ok(())
+}
+
+async fn capture_relay_request(
+    State(seen): State<Arc<Mutex<Vec<Value>>>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let (parts, body) = request.into_parts();
+    let bytes = to_bytes(body, 1024 * 1024).await.expect("local relay body");
+    seen.lock()
+        .unwrap()
+        .push(serde_json::from_slice(&bytes).expect("local relay JSON"));
+    next.run(Request::from_parts(parts, Body::from(bytes)))
+        .await
+}
+
+#[test]
+fn nyro_to_nyro_schedule_one_of_replay_reaches_native_gemini() -> anyhow::Result<()> {
+    for stream in [false, true] {
+        let mut fixture = Fixture::new(
+            "google",
+            if stream {
+                Reply::StreamText
+            } else {
+                Reply::Text
+            },
+        )?;
+        let dir = tempfile::tempdir()?;
+        let remote_listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        remote_listener.set_nonblocking(true)?;
+        let remote_url = format!("http://{}", remote_listener.local_addr()?);
+        // Bootstrap both gateways before driving a runtime: startup background
+        // refresh/OAuth tasks must be cancelled, not merely left unobserved.
+        let relay = offline_gateway(
+            GatewayConfig {
+                data_dir: dir.path().into(),
+                ..Default::default()
+            },
+            Provider {
+                id: "local-relay".into(),
+                name: "Local Nyro relay".into(),
+                vendor: Some("nyro-gateway".into()),
+                protocol: OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1.to_string(),
+                base_url: remote_url,
+                protocol_mode: "fixed".into(),
+                protocol_endpoints: vec![],
+                keys: vec![],
+                preset_key: Some("nyro-gateway".into()),
+                channel: Some("default".into()),
+                models_source: None,
+                static_models: None,
+                api_key: "local-inert-relay-token".into(),
+                auth_mode: "apikey".into(),
+                use_proxy: false,
+                fast_mode: false,
+                last_test_success: None,
+                last_test_at: None,
+                is_enabled: true,
+                created_at: String::new(),
+                updated_at: String::new(),
+            },
+            CLIENT_MODEL,
+        )?;
+        runtime()?.block_on(async {
+            let _upstream = fixture.start()?;
+            let seen = Arc::new(Mutex::new(Vec::<Value>::new()));
+            let remote_listener = tokio::net::TcpListener::from_std(remote_listener)?;
+            let remote = nyro_core::proxy::server::create_router(fixture.gateway.clone()).layer(
+                middleware::from_fn_with_state(seen.clone(), capture_relay_request),
+            );
+            let _remote = AbortOnDrop(tokio::spawn(async move {
+                axum::serve(remote_listener, remote).await.unwrap();
+            }));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+            let url = format!("http://{}/v1/chat/completions", listener.local_addr()?);
+            let router = nyro_core::proxy::server::create_router(relay);
+            let _local = AbortOnDrop(tokio::spawn(async move {
+                axum::serve(listener, router).await.unwrap();
+            }));
+            let body = schedule_request(stream);
+            let response = fixture
+                .gateway
+                .http_client
+                .post(url)
+                .json(&body)
+                .send()
+                .await?;
+            let status = response.status();
+            let wire = response.text().await?;
+            assert_eq!(status, StatusCode::OK, "two-hop request failed: {wire}");
+            assert!(wire.contains("local reply"), "missing completion: {wire}");
+            assert_eq!(
+                *seen.lock().unwrap(),
+                vec![body],
+                "relay must preserve client tools"
+            );
+            assert_schedule_schema(&fixture.only_request().body);
+            Ok::<_, anyhow::Error>(())
+        })?;
+    }
+    Ok(())
+}
+
 #[test]
 fn native_gemini_unsupported_schema_is_typed_422_without_contacting_upstream() -> anyhow::Result<()>
 {
@@ -835,7 +1067,7 @@ fn native_gemini_unsupported_schema_is_typed_422_without_contacting_upstream() -
         // test, but native lowering must reject rather than silently drop it.
         body["tools"][0]["function"]["parameters"] = json!({
             "type": "object",
-            "properties": {"city": {"oneOf": [{"type": "string"}, {"type": "integer"}]}}
+            "properties": {"city": {"oneOf": [{"type": "number"}, {"type": "integer"}]}}
         });
         let (status, wire) = dispatch_outcome(
             &fixture.gateway,
@@ -878,7 +1110,7 @@ fn default_gemini_passthrough_preserves_raw_schema_without_native_cleanup() -> a
                     "$defs": {"City": {"type": "string", "format": "custom-city"}},
                     "properties": {
                         "city": {"$ref": "#/$defs/City"},
-                        "mode": {"oneOf": [{"type": "string"}, {"type": "integer"}]}
+                        "mode": {"oneOf": [{"type": "number"}, {"type": "integer"}]}
                     },
                     "additionalProperties": false,
                     "x-client-schema": {"keep": true}

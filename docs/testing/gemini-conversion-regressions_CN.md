@@ -48,11 +48,17 @@ dispatcher 新增统一的批次校验，在工具缓存和 formatter 之前识�
 
 - 基于原始根节点解析局部 JSON Pointer `$ref`/旧式 `ref`，支持转义及 URI fragment。递归栈区分真实循环与兄弟字段复用。
 - 合并兼容 object `allOf`，required 保持首次出现顺序；冲突或不能证明安全的 closed-object 交集拒绝，不后写覆盖。
-- 不同字符串单值分支精确转为 enum；不猜任意 union、重复 oneOf 分支或有损交集。
+- 不同字符串单值分支精确转为 enum。显式 JSON 类型可证明互斥的 oneOf 转为 anyOf，保留分支顺序、schema 和注释；integer 与 number 视为重叠，nullable 分支包含 null 域。重叠、缺少类型或无法证明安全的分支以及有损交集仍拒绝，不放宽语义。
 - required 与 nullable 独立；属性名和 default/enum 字面量不会被误当 schema 关键字处理。
 - 深度上限 64、访问/复制节点数上限 10,000（包含边界值）；测试覆盖边界和重复引用展开。不请求外部 ref。
 
 无法表示的原生结构返回类型化 `ProtocolLossyRejected`（422），不再返回空 schema 的成功请求，也不会意外变成内部错误。pipeline 保留这类错误的状态，但不把其他 anyhow 错误无差别当成客户端错误。原生请求已显式选择的 `parametersJsonSchema` 保留，不未经验证地将所有端点自动切换到富通道。
+
+### E. 调度工具联合类型与发送前失败日志
+
+脱敏回归复现 `schedule_create`、`schedule_update` 的 `at.oneOf = [string, object{date,time,time_zone}]`，以 80 个工具分别通过原生直接转换和真实 Nyro→Nyro loopback 链路，覆盖流式与非流式。两个分支和本地日期/时间的 required 成员必须保留，不能换成无约束 schema。原有 native Schema-proto 关键字清理不变，包括移除 `additionalProperties`；这不等于完整 JSON Schema 校验等价或真实 Antigravity 验收。
+
+`passthrough_run`、`build_request` 返回的失败记为本地请求构建错误，不是上游 HTTP 错误。本轮不改变其他发送前准入、钩子或运行时准备分支。构建失败日志保留关联的客户端请求 ID、所选路由/供应商/模型、类型化客户端状态和 `request_build` 阶段，不伪造上游状态或已发送请求。每个失败有独立 attempt 编号；fallback 成功仍是客户端最终结果。本地准备失败不消耗远端尝试预算，也不惩罚供应商健康状态。诊断原因有长度与凭证安全限制，载荷沿用 collector 的异常强制保留规则。
 
 ## 原生与 compat 校验边界
 
@@ -68,7 +74,9 @@ dispatcher 只有在选定 raw-wire compat 后，才设置客户端无法反序�
 
 ## 验证结果
 
-最终仓库门禁完成，**没有失败的测试目标**：
+以下数量记录最初四项修复的基线验证，不是新增调度工具联合类型与构建失败日志回归后的数量。
+
+该次仓库门禁完成，**没有失败的测试目标**：
 
 - 原生流式回归：**21 个通过**。
 - 原生请求回归：**16 个通过**。
@@ -77,6 +85,17 @@ dispatcher 只有在选定 raw-wire compat 后，才设置客户端无法反序�
 - 完整 workspace 门禁（`--exclude nyro-desktop --no-default-features --no-fail-fast`）：**通过**；原有 server/doc-test 的忽略项未改动。
 - `cargo clippy -p nyro-core --all-targets`：**通过，仍有仓库既存告警**，未使用 `-D warnings`。
 - `cargo fmt --all -- --check`、`git diff --check`：**通过**。
+
+### 调度工具联合类型与构建失败日志的追加验证
+
+在基于 v2.1.25 的本地工作区、Rust 1.96.0 下验证：
+
+- `cargo test -p nyro-core`：**2,280 个通过**，零失败；含 1,533 个库单测和 747 个集成测试。原有 6 个 doctest 忽略项未改动。
+- 请求 codec 回归 **18 个通过**、路由回归 **10 个通过**、构建失败日志回归 **4 个通过**，均已包含在完整测试中。
+- `cargo check -p nyro-core --all-targets`、`cargo fmt --all -- --check`、`git diff --check`：**通过**。
+- `cargo clippy -p nyro-core --lib --test conv_google_request_regressions --test gemini_route_regressions --test request_build_logging`：**通过**，保留原有库告警。
+- 完整 `cargo clippy -p nyro-core --all-targets` 仍被原有 Kiro runtime 测试的 `clippy::unused_io_amount` 阻挡（`runtime.rs:1606`，由 `95980b0e` 引入）；没有修改该无关测试或压制 lint。
+- `cargo build --release -p nyro-server --no-default-features`：**通过**。此项验证不内嵌 WebUI 的服务器构建，不等于正式发版、部署或真实 Google 验收。
 
 ## 测试组织和命令
 
@@ -88,7 +107,8 @@ dispatcher 只有在选定 raw-wire compat 后，才设置客户端无法反序�
 | `crates/nyro-core/src/protocol/codec/google/gemini/schema.rs` 单测 | 局部引用、转义、循环、精确 enum/交集规则、资源限制 |
 | `provider/common/pipeline.rs` 单测 | 类型化错误状态及 compat 拥有的预览校验 |
 | `proxy/dispatcher/streaming.rs` / `non_stream.rs` 单测 | 失败批次整体拒绝及强制流式 502 |
-| `crates/nyro-core/tests/gemini_route_regressions.rs` | 真实 dispatcher + loopback 上游：原生、compat、直通、Vertex、schema 拒绝和失败流 |
+| `crates/nyro-core/tests/gemini_route_regressions.rs` | 真实 dispatcher + loopback 上游：原生、compat、直通、Vertex、schema 拒绝、失败流，以及 80 工具调度 schema 的直接/两跳路由 |
+| `crates/nyro-core/tests/request_build_logging.rs` | 原生/直通构建失败、SQLite collector 持久化及公开 Admin 查询、最终结果关联、载荷隐私、fallback 与预算隔离 |
 
 专项执行：
 
@@ -96,6 +116,7 @@ dispatcher 只有在选定 raw-wire compat 后，才设置客户端无法反序�
 cargo test -p nyro-core --test conv_google_stream_regressions
 cargo test -p nyro-core --test conv_google_request_regressions
 cargo test -p nyro-core --test gemini_route_regressions
+cargo test -p nyro-core --test request_build_logging
 cargo test -p nyro-core --lib proxy::dispatcher::accumulator::tests
 cargo test -p nyro-core --lib proxy::dispatcher::streaming::tests
 cargo test -p nyro-core --lib proxy::dispatcher::non_stream::tests

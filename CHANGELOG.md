@@ -4,6 +4,18 @@ All notable changes to Nyro will be documented in this file.
 
 ---
 
+## v2.1.26
+
+> Released on 2026-11-05
+
+#### Fixes
+
+- **Gemini tool-parameter unions**: native Gemini conversion now lowers `oneOf` alternatives with provably disjoint explicit JSON types to `anyOf`, fixing the HTTP 422 rejection of schedule tools whose `at` parameter accepts either a timestamp string or a local date/time object. Both branches, their order, descriptions, defaults and required members are preserved. Existing string-constant enum lowering remains intact; overlapping types such as `number`/`integer`, ambiguous nullable alternatives and unproven unions are still rejected rather than weakened. Reference, nesting and resource-limit safeguards remain in place.
+- **Traceable request-build failures**: failures returned by native and passthrough request builders now persist logs correlated with the response request ID, selected provider/model, typed status and `request_build` stage. Local failures do not fabricate upstream HTTP or sent-payload evidence, penalize provider health, or consume the remote-attempt budget. Attempt numbering and final results remain correct when every build fails or a later fallback succeeds; authentication headers and diagnostic causes remain credential-safe.
+- **Regression coverage**: added sanitized schedule-schema replay through direct native conversion and an actual two-hop Nyro chain with 80 tools in streaming and buffered modes, plus overlap/nullable/reference/resource boundaries and SQLite-backed Admin log queries, retention, redaction and fallback-result tests. Existing native Gemini keyword cleanup is unchanged; no database migration is required.
+
+---
+
 ## v2.1.25
 
 > Released on 2026-11-04

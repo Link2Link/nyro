@@ -289,6 +289,161 @@ fn one_of_distinct_string_constants_retains_finite_enum_choices() {
 }
 
 #[test]
+fn schedule_targets_encode_as_native_any_of_from_chat_and_raw_google_tools() {
+    // A reduced public-schema fixture only: no captured messages, tool arguments,
+    // IDs, or other real-session payloads. Both schedule tools expose this union.
+    let at = json!({
+        "description": "Absolute target: an RFC 3339 date-time with offset, or a local date, time, and IANA time_zone.",
+        "oneOf": [
+            {"type": "string"},
+            {
+                "type": "object", "additionalProperties": false,
+                "properties": {
+                    "date": {"type": "string"},
+                    "time": {"type": "string"},
+                    "time_zone": {"type": "string"}
+                },
+                "required": ["date", "time", "time_zone"]
+            }
+        ]
+    });
+    let create = json!({
+        "type": "object",
+        "properties": {
+            "at": at, "title": {"type": "string"}, "prompt": {"type": "string"},
+            "after_seconds": {"type": "integer", "minimum": 1}
+        },
+        "required": ["title", "prompt"]
+    });
+    let update = json!({
+        "type": "object",
+        "properties": {"at": at, "id": {"type": "string"}, "title": {"type": "string"}},
+        "required": ["id"]
+    });
+    let req = decode_request(
+        P::OpenAiChat,
+        json!({
+            "model": "gemini-3.8-flash",
+            "messages": [{"role": "user", "content": "Configure a reminder"}],
+            "tools": [
+                {"type": "function", "function": {
+                    "name": "schedule_create", "description": "Create a reminder", "parameters": create
+                }},
+                {"type": "function", "function": {
+                    "name": "schedule_update", "description": "Update a reminder", "parameters": update
+                }}
+            ]
+        }),
+    );
+    let raw_req = decode_google_request(
+        json!({
+            "contents": [{"role": "user", "parts": [{"text": "Configure a reminder"}]}],
+            "tools": [
+                {"functionDeclarations": [
+                    {"name": "schedule_create", "description": "Create a reminder", "parameters": create},
+                    {"name": "schedule_update", "description": "Update a reminder", "parameters": update}
+                ]},
+                {"googleSearch": {}}
+            ]
+        }),
+        "gemini-3.8-flash",
+    );
+    // A built-in keeps Google's original tool envelope in the ingress bag, so
+    // this explicitly reaches prepare_raw_tools rather than the IR ToolSpec arm.
+    assert!(
+        raw_req
+            .meta
+            .vendor
+            .ingress
+            .contains_key("__google_raw_tools")
+    );
+    let chat_body = encode_request(P::GoogleGemini, &req);
+    let raw_body = encode_request(P::GoogleGemini, &raw_req);
+    assert_eq!(raw_body["tools"][1]["googleSearch"], json!({}));
+
+    // additionalProperties remains owned by the existing native sanitizer. The
+    // lowering unit fixture checks it survives lowering; this wire fixture must
+    // neither change that global cleanup policy nor switch schema channels.
+    let expected_at = json!({
+        "description": "Absolute target: an RFC 3339 date-time with offset, or a local date, time, and IANA time_zone.",
+        "anyOf": [
+            {"type": "string"},
+            {
+                "type": "object",
+                "properties": {
+                    "date": {"type": "string"},
+                    "time": {"type": "string"},
+                    "time_zone": {"type": "string"}
+                },
+                "required": ["date", "time", "time_zone"]
+            }
+        ]
+    });
+    let expected = [
+        json!({
+            "type": "object",
+            "properties": {
+                "at": expected_at, "title": {"type": "string"}, "prompt": {"type": "string"},
+                "after_seconds": {"type": "integer", "minimum": 1}
+            },
+            "required": ["title", "prompt"]
+        }),
+        json!({
+            "type": "object",
+            "properties": {"at": expected_at, "id": {"type": "string"}, "title": {"type": "string"}},
+            "required": ["id"]
+        }),
+    ];
+    for body in [&chat_body, &raw_body] {
+        let declarations = field(body, "/tools/0/functionDeclarations")
+            .as_array()
+            .unwrap();
+        assert_eq!(declarations.len(), 2);
+        for ((declaration, expected), name) in declarations
+            .iter()
+            .zip(&expected)
+            .zip(["schedule_create", "schedule_update"])
+        {
+            field_str_eq(declaration, "/name", name);
+            assert_eq!(field(declaration, "/parameters"), expected);
+            assert!(declaration.get("parametersJsonSchema").is_none());
+        }
+    }
+}
+
+#[test]
+fn one_of_native_any_of_keeps_branch_specific_defaults_descriptions_and_required() {
+    let original = json!({
+        "type": "object", "properties": {"at": {
+            "description": "Absolute or local target", "default": "2030-01-02T03:04:05Z",
+            "oneOf": [
+                {"type": "object", "description": "Local target",
+                 "properties": {"date": {"type": "string"}, "time": {"type": "string"}, "time_zone": {"type": "string"}},
+                 "required": ["date", "time", "time_zone"],
+                 "default": {"date": "2030-01-02", "time": "03:04:05", "time_zone": "UTC"}},
+                {"type": "string", "description": "Absolute target", "pattern": "T", "default": "2030-01-02T03:04:05Z"}
+            ]
+        }}, "required": ["at"]
+    });
+    let expected = json!({
+        "type": "object", "properties": {"at": {
+            "description": "Absolute or local target", "default": "2030-01-02T03:04:05Z",
+            "anyOf": [
+                {"type": "object", "description": "Local target",
+                 "properties": {"date": {"type": "string"}, "time": {"type": "string"}, "time_zone": {"type": "string"}},
+                 "required": ["date", "time", "time_zone"],
+                 "default": {"date": "2030-01-02", "time": "03:04:05", "time_zone": "UTC"}},
+                {"type": "string", "description": "Absolute target", "pattern": "T", "default": "2030-01-02T03:04:05Z"}
+            ]
+        }}, "required": ["at"]
+    });
+    let body = encode_request(P::GoogleGemini, &request_with_parameters(original));
+    let declaration = field(&body, "/tools/0/functionDeclarations/0");
+    assert_eq!(field(declaration, "/parameters"), &expected);
+    assert!(declaration.get("parametersJsonSchema").is_none());
+}
+
+#[test]
 fn nullable_properties_keep_explicit_required_membership_independent() {
     // Required means present, nullable means null is a valid value. A required
     // nullable property must not become optional, nor the optional one required.
@@ -463,7 +618,9 @@ fn unrepresentable_native_schema_is_typed_lossy_rejection_not_empty_success() {
     for schema in [
         json!({"$ref":"#"}),
         json!({"$ref":"https://invalid.test/schema.json"}),
-        json!({"oneOf":[{"type":"string"},{"type":"integer"}]}),
+        // String/integer is now provably disjoint. Number/integer overlaps
+        // because every integer is also a number, so exact-one must still reject.
+        json!({"oneOf":[{"type":"number"},{"type":"integer"}]}),
     ] {
         let error = GoogleEncoder
             .encode_request(&request_with_parameters(schema))

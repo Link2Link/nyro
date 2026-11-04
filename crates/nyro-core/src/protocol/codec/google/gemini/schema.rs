@@ -294,65 +294,91 @@ impl<'a> Lowerer<'a> {
             let one_of_path = child(path, "oneOf");
             self.visit(&one_of_path, depth + 1)?;
             let branches = nonempty_branches(one_of, &one_of_path)?;
-            let mut constants = Vec::new();
-            let mut common_constraints: Option<Map<String, Value>> = None;
+            let mut lowered_branches = Vec::new();
             for (index, branch) in branches.iter().enumerate() {
                 let branch_path = child(&one_of_path, &index.to_string());
                 if !branch.is_object() {
                     return Err(reject(
                         &branch_path,
-                        "oneOf alternatives must be distinct string constants",
+                        "oneOf branches must be object schemas",
                     ));
                 }
-                let lowered = self.lower(branch, &branch_path, depth + 2)?;
-                let Value::Object(mut branch) = lowered else {
+                let Value::Object(branch) = self.lower(branch, &branch_path, depth + 2)? else {
                     unreachable!("object lowering returns an object")
                 };
-                if branch.remove("type") != Some(Value::String("string".into())) {
-                    return Err(reject(
-                        &branch_path,
-                        "oneOf alternatives must be distinct string constants",
-                    ));
-                }
-                let Some(Value::Array(mut values)) = branch.remove("enum") else {
-                    return Err(reject(
-                        &branch_path,
-                        "oneOf alternatives must be distinct string constants",
-                    ));
-                };
-                if values.len() != 1 || !values[0].is_string() {
-                    return Err(reject(
-                        &branch_path,
-                        "oneOf alternatives must be distinct string constants",
-                    ));
-                }
-                let constant = values.remove(0);
-                if constants.contains(&constant) {
-                    return Err(reject(
-                        &branch_path,
-                        "duplicate oneOf constants are not equivalent to an enum",
-                    ));
-                }
-                // Mutually exclusive singletons allow *identical* residual
-                // constraints/annotations to be hoisted, never discarded.
-                match &common_constraints {
-                    Some(common) if common != &branch => {
+                lowered_branches.push(branch);
+            }
+
+            if lowered_branches.iter().all(string_singleton) {
+                // Preserve the historical finite-enum lowering, including its
+                // conservative annotation/constraint and nullable checks.
+                let mut constants = Vec::new();
+                let mut common_constraints: Option<Map<String, Value>> = None;
+                for (index, mut branch) in lowered_branches.into_iter().enumerate() {
+                    let branch_path = child(&one_of_path, &index.to_string());
+                    branch.remove("type");
+                    let Some(Value::Array(mut values)) = branch.remove("enum") else {
+                        unreachable!("string singleton checked above")
+                    };
+                    let constant = values.remove(0);
+                    if constants.contains(&constant) {
                         return Err(reject(
                             &branch_path,
-                            "oneOf alternatives have differing constraints or annotations",
+                            "duplicate oneOf constants are not equivalent to an enum",
                         ));
                     }
-                    None => common_constraints = Some(branch),
-                    _ => {}
+                    // Identical residual constraints/annotations may be
+                    // hoisted; branch-specific data must never be discarded.
+                    match &common_constraints {
+                        Some(common) if common != &branch => {
+                            return Err(reject(
+                                &branch_path,
+                                "oneOf alternatives have differing constraints or annotations",
+                            ));
+                        }
+                        None => common_constraints = Some(branch),
+                        _ => {}
+                    }
+                    constants.push(constant);
                 }
-                constants.push(constant);
+                let mut alternatives = common_constraints.expect("nonempty branches checked above");
+                reject_nullable_constant(&alternatives, &one_of_path)?;
+                reject_nullable_constant(&siblings, path)?;
+                alternatives.insert("type".into(), Value::String("string".into()));
+                alternatives.insert("enum".into(), Value::Array(constants));
+                siblings = merge(siblings, alternatives, &one_of_path)?;
+            } else {
+                // Explicit types give upper bounds on the values accepted by
+                // each *lowered* branch. Pairwise-disjoint bounds prove exactly
+                // one branch can match, without inspecting or removing any of
+                // its other constraints. Do not infer types from nested unions,
+                // properties, enums, or sibling constraints.
+                nullable(&siblings, path)?;
+                let mut accepted_types = 0;
+                for (index, branch) in lowered_branches.iter().enumerate() {
+                    let branch_path = child(&one_of_path, &index.to_string());
+                    let types = explicit_type_domain(branch, &branch_path)?;
+                    if accepted_types & types != 0 {
+                        return Err(reject(
+                            &branch_path,
+                            "oneOf alternatives have overlapping explicit types; anyOf equivalence is not proven",
+                        ));
+                    }
+                    accepted_types |= types;
+                }
+                // The removed oneOf wrapper was counted above. Account for
+                // the generated anyOf wrapper too; branch nodes were already
+                // visited at the same depth and are moved, not expanded again.
+                self.visit(&child(path, "anyOf"), depth + 1)?;
+                let mut alternatives = Map::new();
+                alternatives.insert(
+                    "anyOf".into(),
+                    Value::Array(lowered_branches.into_iter().map(Value::Object).collect()),
+                );
+                // An existing anyOf (including one supplied by allOf or a ref)
+                // is another conjunct, never a field that may be overwritten.
+                siblings = merge(siblings, alternatives, &one_of_path)?;
             }
-            let mut alternatives = common_constraints.expect("nonempty branches checked above");
-            reject_nullable_constant(&alternatives, &one_of_path)?;
-            reject_nullable_constant(&siblings, path)?;
-            alternatives.insert("type".into(), Value::String("string".into()));
-            alternatives.insert("enum".into(), Value::Array(constants));
-            siblings = merge(siblings, alternatives, &one_of_path)?;
         }
 
         let mut referenced = Map::new();
@@ -513,8 +539,53 @@ fn object_intersection_branch(map: &Map<String, Value>) -> bool {
     }
 }
 
+fn string_singleton(map: &Map<String, Value>) -> bool {
+    map.get("type").and_then(Value::as_str) == Some("string")
+        && matches!(map.get("enum"), Some(Value::Array(values)) if values.len() == 1 && values[0].is_string())
+}
+
+fn nullable(map: &Map<String, Value>, path: &str) -> LoweringResult<bool> {
+    match map.get("nullable") {
+        None | Some(Value::Bool(false)) => Ok(false),
+        Some(Value::Bool(true)) => Ok(true),
+        Some(_) => Err(reject(
+            &child(path, "nullable"),
+            "nullable must be a boolean for safe schema lowering",
+        )),
+    }
+}
+
+/// An overapproximation, not a schema satisfiability solver. Number occupies
+/// both integer and non-integer partitions: JSON Schema integer is a subset of
+/// number, so differently spelled types alone do not prove their disjointness.
+/// Unknown, missing, or array-valued types do not provide this limited proof.
+fn explicit_type_domain(map: &Map<String, Value>, path: &str) -> LoweringResult<u8> {
+    const NULL: u8 = 1;
+    const INTEGER: u8 = 1 << 1;
+    const NON_INTEGER: u8 = 1 << 2;
+    let mut types = match map.get("type").and_then(Value::as_str) {
+        Some("null") => NULL,
+        Some("integer") => INTEGER,
+        Some("number") => INTEGER | NON_INTEGER,
+        Some("string") => 1 << 3,
+        Some("object") => 1 << 4,
+        Some("array") => 1 << 5,
+        Some("boolean") => 1 << 6,
+        _ => {
+            return Err(reject(
+                &child(path, "type"),
+                "oneOf alternatives require a supported explicit atomic JSON type for anyOf lowering",
+            ));
+        }
+    };
+    if nullable(map, path)? {
+        types |= NULL;
+    }
+    Ok(types)
+}
+
 fn reject_nullable_constant(map: &Map<String, Value>, path: &str) -> LoweringResult<()> {
-    if map.get("nullable") == Some(&Value::Bool(true)) {
+    if nullable(map, path)? {
         return Err(reject(
             &child(path, "nullable"),
             "nullable string constants cannot be lowered to an exact native enum",
@@ -548,6 +619,11 @@ fn merge(
         return Ok(left);
     }
     if has_validation(&left) && has_validation(&right) {
+        // A reference can supply the composition while its use site supplies
+        // nullable (or vice versa). Validate both sides before reasoning about
+        // their null domains, including non-boolean values from those siblings.
+        let left_nullable = nullable(&left, path)?;
+        let right_nullable = nullable(&right, path)?;
         if restricts_object_members(&left) || restricts_object_members(&right) {
             return Err(reject(
                 path,
@@ -557,10 +633,7 @@ fn merge(
         // Hoisting nullable:true from just one conjunct could make the other,
         // non-nullable type constraint accept null. Do not conflate this with
         // required membership, which is preserved independently below.
-        if (left.get("nullable") == Some(&Value::Bool(true))
-            || right.get("nullable") == Some(&Value::Bool(true)))
-            && left.get("nullable") != right.get("nullable")
-        {
+        if (left_nullable || right_nullable) && left.get("nullable") != right.get("nullable") {
             return Err(reject(
                 &child(path, "nullable"),
                 "nullable intersection equivalence is not proven",
@@ -944,10 +1017,284 @@ mod tests {
     }
 
     #[test]
-    fn arbitrary_duplicate_or_conflicting_constant_alternatives_are_rejected() {
+    fn one_of_string_and_object_schedule_fixture_preserves_order_and_constraints() {
+        let description = "Absolute target: an RFC 3339 date-time with offset, or a local date, time, and IANA time_zone.";
+        let branches = vec![
+            json!({"type": "string", "description": "Absolute timestamp", "pattern": "T", "default": "2030-01-02T03:04:05Z"}),
+            json!({
+                "type": "object", "additionalProperties": false,
+                "description": "Local target", "default": {"date": "2030-01-02", "time": "03:04:05", "time_zone": "UTC"},
+                "properties": {
+                    "date": {"type": "string", "minLength": 10},
+                    "time": {"type": "string", "description": "Local time"},
+                    "time_zone": {"type": "string", "enum": ["UTC", "Asia/Shanghai"]}
+                },
+                "required": ["date", "time", "time_zone"]
+            }),
+        ];
+        for branches in [branches.clone(), branches.into_iter().rev().collect()] {
+            let output = lowered(json!({
+                "type": "object", "properties": {"at": {
+                    "description": description, "default": "2030-01-02T03:04:05Z", "oneOf": branches
+                }}, "required": ["at"]
+            }));
+            assert_eq!(
+                output,
+                json!({
+                    "type": "object", "properties": {"at": {
+                        "description": description, "default": "2030-01-02T03:04:05Z", "anyOf": branches
+                    }}, "required": ["at"]
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn one_of_distinct_atomic_types_lower_to_any_of() {
+        // Integer and number each exclude all the nonnumeric JSON types, but
+        // are deliberately never placed together in this positive fixture.
+        for numeric in ["integer", "number"] {
+            let branches = json!([
+                {"type": "object", "required": ["id"]},
+                {"type": "string", "pattern": "^target"},
+                {"type": numeric, "minimum": 1, "maximum": 10},
+                {"type": "array", "items": {"type": "string"}, "maxItems": 2},
+                {"type": "null"},
+                {"type": "boolean", "default": false, "nullable": false}
+            ]);
+            assert_eq!(
+                lowered(json!({"oneOf": branches})),
+                json!({"anyOf": branches})
+            );
+        }
+        assert_eq!(
+            lowered(json!({"oneOf": [{"type": "string"}]})),
+            json!({"anyOf": [{"type": "string"}]})
+        );
+    }
+
+    #[test]
+    fn one_of_disjoint_type_proof_uses_lowered_refs_and_intersections() {
+        let output = lowered(json!({
+            "$defs": {
+                "timestamp": {"type": "string", "pattern": "T"},
+                "local": {"allOf": [
+                    {"type": "object", "properties": {"date": {"type": "string"}}, "required": ["date"]},
+                    {"type": "object", "properties": {"time": {"type": "string"}}, "required": ["time"]}
+                ]}
+            },
+            "properties": {"at": {"oneOf": [
+                {"$ref": "#/$defs/timestamp", "description": "Absolute timestamp"},
+                {"ref": "#/$defs/local", "description": "Local timestamp"}
+            ]}}
+        }));
+        assert_eq!(
+            output["properties"]["at"],
+            json!({"anyOf": [
+                {"type": "string", "pattern": "T", "description": "Absolute timestamp"},
+                {"type": "object", "properties": {"date": {"type": "string"}, "time": {"type": "string"}}, "required": ["date", "time"], "description": "Local timestamp"}
+            ]})
+        );
+        let error = rejects(
+            json!({
+                "$defs": {"number": {"type": "number"}, "integer": {"type": "integer"}},
+                "oneOf": [{"$ref": "#/$defs/number"}, {"$ref": "#/$defs/integer"}]
+            }),
+            "overlapping explicit types",
+        );
+        assert_eq!(error.path, "#/oneOf/1");
+    }
+
+    #[test]
+    fn one_of_nullable_type_domains_include_null_without_changing_required() {
+        let branches = json!([
+            {"type": "string", "nullable": true, "default": null},
+            {"type": "object", "nullable": false, "required": ["date"]}
+        ]);
+        assert_eq!(
+            lowered(json!({"properties": {"at": {"oneOf": branches}}, "required": ["at"]})),
+            json!({"properties": {"at": {"anyOf": branches}}, "required": ["at"]})
+        );
+        assert_eq!(
+            lowered(
+                json!({"oneOf": [{"type": "string", "nullable": false}, {"type": "null", "nullable": true}]})
+            ),
+            json!({"anyOf": [{"type": "string", "nullable": false}, {"type": "null", "nullable": true}]})
+        );
+        for branches in [
+            json!([{"type": "string", "nullable": true}, {"type": "object", "nullable": true}]),
+            json!([{"type": "null"}, {"type": "string", "nullable": true}]),
+            json!([{"type": "integer", "nullable": true}, {"type": "number"}]),
+        ] {
+            rejects(json!({"oneOf": branches}), "overlapping explicit types");
+        }
+        // A parent nullable flag is not a branch-local flag and must not
+        // silently broaden the intersection with non-nullable alternatives.
         rejects(
-            json!({"oneOf": [{"type": "string"}, {"type": "integer"}]}),
-            "distinct string constants",
+            json!({"nullable": true, "oneOf": [{"type": "string"}, {"type": "object"}]}),
+            "nullable intersection",
+        );
+        for invalid in [json!(null), json!("true"), json!(1), json!([])] {
+            let error = rejects(
+                json!({"oneOf": [{"type": "string", "nullable": invalid}, {"type": "object"}]}),
+                "nullable must be a boolean",
+            );
+            assert_eq!(error.path, "#/oneOf/0/nullable");
+            let error = rejects(
+                json!({"nullable": invalid, "oneOf": [{"type": "string"}, {"type": "object"}]}),
+                "nullable must be a boolean",
+            );
+            assert_eq!(error.path, "#/nullable");
+        }
+    }
+
+    #[test]
+    fn one_of_reference_sibling_nullable_constraints_are_not_ignored() {
+        let union = json!({"oneOf": [{"type": "string"}, {"type": "object"}]});
+        for (flag, reason) in [
+            (json!(true), "nullable intersection"),
+            (json!("true"), "nullable must be a boolean"),
+            (json!(null), "nullable must be a boolean"),
+        ] {
+            let error = rejects(
+                json!({"$defs": {"union": union}, "$ref": "#/$defs/union", "nullable": flag}),
+                reason,
+            );
+            assert_eq!(error.path, "#/nullable");
+            let error = rejects(
+                json!({"$defs": {"flag": {"nullable": flag}}, "$ref": "#/$defs/flag", "oneOf": union["oneOf"]}),
+                reason,
+            );
+            assert_eq!(error.path, "#/nullable");
+        }
+        let output = lowered(json!({
+            "$defs": {"union": union}, "$ref": "#/$defs/union", "nullable": false
+        }));
+        assert_eq!(output["anyOf"], union["oneOf"]);
+        assert_eq!(output["nullable"], false);
+    }
+
+    #[test]
+    fn one_of_overlapping_or_unproven_atomic_types_are_rejected() {
+        for branches in [
+            json!([{"type": "number"}, {"type": "integer"}]),
+            json!([{"type": "integer"}, {"type": "number"}]),
+            json!([{"type": "string"}, {"type": "string", "pattern": "^x"}]),
+            json!([{"type": "boolean"}, {"type": "boolean"}]),
+            json!([{"type": "array", "maxItems": 0}, {"type": "array", "minItems": 1}]),
+            json!([{"type": "integer", "minimum": 1}, {"type": "number", "maximum": 0}]),
+            json!([
+                {"type": "object", "additionalProperties": false, "properties": {"a": {"type": "string"}}, "required": ["a"]},
+                {"type": "object", "additionalProperties": false, "properties": {"b": {"type": "string"}}, "required": ["b"]}
+            ]),
+        ] {
+            let error = rejects(json!({"oneOf": branches}), "overlapping explicit types");
+            assert_eq!(error.path, "#/oneOf/1");
+        }
+        for branch in [
+            json!({}),
+            json!({"properties": {"date": {"type": "string"}}}),
+            json!({"enum": ["fixed"]}),
+            json!({"type": ["string"]}),
+            json!({"type": ["string", "null"]}),
+            json!({"type": "unknown"}),
+            json!({"type": "STRING"}),
+            json!({"type": null}),
+            json!({"type": 1}),
+            json!({"anyOf": [{"type": "string"}, {"type": "object"}]}),
+            json!({"oneOf": [{"type": "string"}, {"type": "object"}]}),
+        ] {
+            let error = rejects(
+                json!({"oneOf": [branch, {"type": "boolean"}]}),
+                "supported explicit atomic JSON type",
+            );
+            assert_eq!(error.path, "#/oneOf/0/type");
+        }
+        for branch in [json!(true), json!(null), json!(1), json!([])] {
+            let error = rejects(
+                json!({"oneOf": [branch, {"type": "string"}]}),
+                "oneOf branches must be object schemas",
+            );
+            assert_eq!(error.path, "#/oneOf/0");
+        }
+    }
+
+    #[test]
+    fn one_of_nested_compositions_remain_within_their_schema_boundaries() {
+        let inner_branches =
+            json!([{"type": "boolean"}, {"type": "array", "items": {"type": "integer"}}]);
+        let output = lowered(json!({"anyOf": [{"type": "array", "items": {"oneOf": [
+            {"type": "string", "anyOf": [{"type": "string", "pattern": "^a"}, {"type": "string", "pattern": "^b"}]},
+            {"type": "object", "properties": {"choice": {"oneOf": inner_branches}}, "required": ["choice"]}
+        ]}}]}));
+        assert_eq!(
+            output,
+            json!({"anyOf": [{"type": "array", "items": {"anyOf": [
+                {"type": "string", "anyOf": [{"type": "string", "pattern": "^a"}, {"type": "string", "pattern": "^b"}]},
+                {"type": "object", "properties": {"choice": {"anyOf": inner_branches}}, "required": ["choice"]}
+            ]}}]})
+        );
+    }
+
+    #[test]
+    fn one_of_does_not_overwrite_an_existing_sibling_or_reference_any_of() {
+        let branches = json!([{"type": "string"}, {"type": "object", "required": ["date"]}]);
+        assert_eq!(
+            lowered(json!({"description": "Shared", "anyOf": branches, "oneOf": branches})),
+            json!({"description": "Shared", "anyOf": branches})
+        );
+        let error = rejects(
+            json!({"anyOf": [{"type": "boolean"}], "oneOf": branches}),
+            "conflicting",
+        );
+        assert_eq!(error.path, "#/oneOf/anyOf");
+        let error = rejects(
+            json!({"$defs": {"existing": {"anyOf": [{"type": "boolean"}]}}, "$ref": "#/$defs/existing", "oneOf": branches}),
+            "conflicting",
+        );
+        assert_eq!(error.path, "#/anyOf");
+        let output = lowered(
+            json!({"$defs": {"existing": {"anyOf": branches}}, "$ref": "#/$defs/existing", "oneOf": branches}),
+        );
+        assert_eq!(output["anyOf"], branches);
+    }
+
+    #[test]
+    fn one_of_singleton_enums_keep_the_existing_constant_strategy() {
+        assert_eq!(
+            lowered(json!({"oneOf": [
+                {"type": "string", "enum": ["b"], "description": "Shared", "default": "b"},
+                {"type": "string", "enum": ["a"], "description": "Shared", "default": "b"}
+            ]})),
+            json!({"type": "string", "enum": ["b", "a"], "description": "Shared", "default": "b"})
+        );
+        let output = lowered(json!({
+            "$defs": {"a": {"const": "a"}, "b": {"type": "string", "enum": ["b"]}},
+            "oneOf": [{"$ref": "#/$defs/b"}, {"$ref": "#/$defs/a"}]
+        }));
+        assert_eq!(output["enum"], json!(["b", "a"]));
+        assert!(output.get("anyOf").is_none());
+        rejects(
+            json!({"oneOf": [{"type": "string", "enum": ["a", "b"]}, {"type": "string", "enum": ["c", "d"]}]}),
+            "overlapping explicit types",
+        );
+        rejects(
+            json!({"oneOf": [{"type": "string", "enum": ["a"], "nullable": true}, {"type": "string", "enum": ["b"], "nullable": true}]}),
+            "nullable string constants",
+        );
+        rejects(
+            json!({"nullable": "true", "oneOf": [{"const": "a"}, {"const": "b"}]}),
+            "nullable must be a boolean",
+        );
+    }
+
+    #[test]
+    fn arbitrary_duplicate_or_conflicting_constant_alternatives_are_rejected() {
+        // String/integer now has a disjoint-type proof. String/string remains
+        // overlapping and must not be weakened from oneOf into anyOf.
+        rejects(
+            json!({"oneOf": [{"type": "string"}, {"type": "string"}]}),
+            "overlapping explicit types",
         );
         rejects(
             json!({"oneOf": [{"const": "a"}, {"const": "a"}]}),
@@ -1085,6 +1432,83 @@ mod tests {
         let over_limit = json!({"default": vec![Value::Null; MAX_EXPANDED_NODES - 1]});
         let error = rejects(over_limit, "maximum expanded node count 10000");
         assert_eq!(error.path, "#/default/9998");
+    }
+
+    #[test]
+    fn one_of_any_of_lowering_counts_depth_and_the_generated_wrapper() {
+        // At the deepest union, oneOf + branch + type consume three levels.
+        let union = json!({"oneOf": [{"type": "string"}, {"type": "object"}]});
+        let mut at_limit = union.clone();
+        for _ in 0..MAX_DEPTH - 3 {
+            at_limit = json!({"items": at_limit});
+        }
+        let output = lower_parameters(&at_limit).expect("depth 64 is inclusive");
+        let pointer = format!("{}/anyOf", "/items".repeat(MAX_DEPTH - 3));
+        assert_eq!(
+            output.pointer(&pointer),
+            Some(&json!([{"type": "string"}, {"type": "object"}]))
+        );
+        rejects(json!({"items": at_limit}), "maximum lowering depth 64");
+
+        // root + copied default array + oneOf array + two (branch, type)
+        // pairs + generated anyOf array = eight nodes, before literal members.
+        let members = MAX_EXPANDED_NODES - 8;
+        let at_limit = json!({"default": vec![Value::Null; members], "oneOf": union["oneOf"]});
+        let output = lower_parameters(&at_limit).expect("10,000 visited nodes are inclusive");
+        assert_eq!(output["default"].as_array().unwrap().len(), members);
+        assert!(output.get("oneOf").is_none());
+        assert_eq!(output["anyOf"], union["oneOf"]);
+        let error = rejects(
+            json!({"default": vec![Value::Null; members + 1], "oneOf": union["oneOf"]}),
+            "maximum expanded node count 10000",
+        );
+        assert_eq!(
+            error.path, "#/anyOf",
+            "the generated array must consume budget"
+        );
+        rejects(
+            json!({"oneOf": [{"type": "string", "default": vec![Value::Null; MAX_EXPANDED_NODES]}, {"type": "object"}]}),
+            "maximum expanded node count 10000",
+        );
+    }
+
+    #[test]
+    fn one_of_lowering_still_bounds_reference_expansion() {
+        let mut at_limit = json!({"oneOf": [{"$ref": "#/$defs/text"}, {"type": "object"}]});
+        // The referenced branch adds one expansion level before its type.
+        for _ in 0..MAX_DEPTH - 4 {
+            at_limit = json!({"items": at_limit});
+        }
+        at_limit
+            .as_object_mut()
+            .unwrap()
+            .insert("$defs".into(), json!({"text": {"type": "string"}}));
+        assert!(lower_parameters(&at_limit).is_ok());
+        let definitions = at_limit.as_object_mut().unwrap().remove("$defs").unwrap();
+        rejects(
+            json!({"$defs": definitions, "items": at_limit}),
+            "maximum lowering depth 64",
+        );
+
+        // Even branches with a simple explicit type still walk and account for
+        // every expanded child, rather than skipping validation after proof.
+        let mut definitions = Map::new();
+        definitions.insert("n0".into(), json!({"type": "object"}));
+        for index in 1..=13 {
+            let reference = format!("#/$defs/n{}", index - 1);
+            definitions.insert(
+                format!("n{index}"),
+                json!({
+                    "type": "object", "properties": {
+                        "left": {"$ref": reference}, "right": {"$ref": reference}
+                    }
+                }),
+            );
+        }
+        rejects(
+            json!({"$defs": definitions, "oneOf": [{"type": "string"}, {"$ref": "#/$defs/n13"}]}),
+            "maximum expanded node count 10000",
+        );
     }
 
     #[test]

@@ -1117,7 +1117,8 @@ mod tests {
             name: "lookup".into(),
             kind: Default::default(),
             description: None,
-            parameters: serde_json::json!({"type":"object","properties":{"value":{"oneOf":[{"type":"string"},{"type":"integer"}]}}}),
+            // Integer is a subset of number, unlike disjoint string/object.
+            parameters: serde_json::json!({"type":"object","properties":{"value":{"oneOf":[{"type":"number"},{"type":"integer"}]}}}),
             strict: None,
             cache_control: None,
             meta: None,
