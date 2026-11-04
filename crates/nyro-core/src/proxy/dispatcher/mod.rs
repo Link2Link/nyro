@@ -28,6 +28,7 @@ mod ir_response;
 mod non_stream;
 mod param_overrides;
 mod passthrough_probe;
+mod request_build;
 mod stream;
 mod stream_probe;
 mod streaming;
@@ -72,8 +73,12 @@ use crate::router::health::HealthPermit;
 
 pub(super) type HealthOutcome = crate::conversion::HealthDisposition;
 
+/// All logged attempts, including local request-build failures.
 #[derive(Clone, Copy, Default)]
 struct AttemptCount(i32);
+/// Keep the existing upstream retry budget independent of local diagnostics.
+#[derive(Clone, Copy, Default)]
+struct UpstreamAttemptCount(i32);
 #[derive(Clone)]
 struct PreflightAttempt(crate::performance::Attempt);
 
@@ -702,7 +707,13 @@ async fn dispatch_pipeline_inner(
         if ctx.deadline.is_exceeded() || ctx.cancellation.is_cancelled() {
             break;
         }
-        if ctx.extensions.get::<AttemptCount>().unwrap_or_default().0 >= 8 {
+        if ctx
+            .extensions
+            .get::<UpstreamAttemptCount>()
+            .unwrap_or_default()
+            .0
+            >= 8
+        {
             break;
         }
         let target = entry.target;
@@ -1250,6 +1261,13 @@ async fn dispatch_pipeline_inner(
             }
             let attempt_index = ctx.extensions.get::<AttemptCount>().unwrap_or_default().0 + 1;
             ctx.extensions.insert(AttemptCount(attempt_index));
+            let upstream_attempts = ctx
+                .extensions
+                .get::<UpstreamAttemptCount>()
+                .unwrap_or_default()
+                .0;
+            ctx.extensions
+                .insert(UpstreamAttemptCount(upstream_attempts + 1));
             performance.correlate(&ctx.request_id, attempt_index);
             let producer = performance.producer();
             ctx.extensions.insert(performance.clone());
@@ -1504,34 +1522,68 @@ async fn dispatch_pipeline_inner(
             "resolved protocol conversion path"
         );
 
-        let mut outbound = if passthrough_req {
+        let outbound = if passthrough_req {
             let raw = envelope.body.clone().unwrap_or_default();
-            match crate::provider::common::pipeline::passthrough_run(
+            crate::provider::common::pipeline::passthrough_run(
                 adapter.as_ref(),
                 raw,
                 &provider_ctx,
                 is_stream,
             )
             .await
-            {
-                Ok(o) => o,
-                Err(e) => {
-                    last_response = Some(e.render(None));
-                    skip_key_siblings!();
-                    continue;
-                }
-            }
         } else {
-            match adapter
+            adapter
                 .build_request(&mut upstream_request, &provider_ctx)
                 .await
-            {
-                Ok(o) => o,
-                Err(e) => {
-                    last_response = Some(e.render(None));
-                    skip_key_siblings!();
-                    continue;
-                }
+        };
+        let mut outbound = match outbound {
+            Ok(outbound) => outbound,
+            Err(error) => {
+                // No transport attempt exists yet. Give this local failure its
+                // own lifecycle so the final response can select its result,
+                // while a later successful fallback remains request-successful.
+                let call_ctx = CallCtx {
+                    performance: None,
+                    gw: gw.clone(),
+                    provider: &provider,
+                    model_id: &route.id,
+                    model_name: &route.name,
+                    egress,
+                    ingress,
+                    ingress_str: &ingress_str,
+                    egress_str: &egress.to_string(),
+                    request_model: &request_model,
+                    actual_model: &actual_model,
+                    backend_model: &target.model,
+                    api_key_id: auth_key.id.as_deref(),
+                    api_key_name: auth_key.name.as_deref(),
+                    provider_key_name: pool_account
+                        .as_ref()
+                        .map(|account| account.credential.label.as_str())
+                        .or_else(|| pool_key.as_ref().map(|key| key.name.as_str())),
+                    route_decision: Some(route_decision.to_json()),
+                    is_stream,
+                    enable_payload: route.enable_payload,
+                    reasoning_effort: reasoning_effort.clone(),
+                    start,
+                    req_ext: req_ctx_ext.clone(),
+                };
+                last_response = Some(request_build::failed_response(
+                    call_ctx,
+                    &req_extras,
+                    ctx,
+                    &error,
+                    if passthrough_req {
+                        "passthrough"
+                    } else {
+                        "build_request"
+                    },
+                    conversion_strategy,
+                    conversion_rule,
+                ));
+                health_permit.neutral();
+                skip_key_siblings!();
+                continue;
             }
         };
 
@@ -1800,7 +1852,13 @@ async fn dispatch_pipeline_inner(
         let mut same_target_retried = false;
         let mut saw_zero_payload_malformed = false;
         let (response, status, retry, health_outcome, defer_native_stream_health) = loop {
-            if ctx.extensions.get::<AttemptCount>().unwrap_or_default().0 >= 8 {
+            if ctx
+                .extensions
+                .get::<UpstreamAttemptCount>()
+                .unwrap_or_default()
+                .0
+                >= 8
+            {
                 break (
                     error_response(503, "upstream attempt budget exhausted"),
                     503,
@@ -1818,6 +1876,13 @@ async fn dispatch_pipeline_inner(
             performance.configure_terminal(provider.vendor.as_deref(), egress);
             let attempt_index = ctx.extensions.get::<AttemptCount>().unwrap_or_default().0 + 1;
             ctx.extensions.insert(AttemptCount(attempt_index));
+            let upstream_attempts = ctx
+                .extensions
+                .get::<UpstreamAttemptCount>()
+                .unwrap_or_default()
+                .0;
+            ctx.extensions
+                .insert(UpstreamAttemptCount(upstream_attempts + 1));
             performance.correlate(&ctx.request_id, attempt_index);
             let attempt_producer = performance.producer();
             ctx.extensions.insert(performance.clone());

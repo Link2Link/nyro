@@ -85,8 +85,11 @@ schema-aware cleanup:
   distinguishes real cycles from repeated sibling references.
 - Compatible object `allOf` merges with first-appearance required ordering;
   conflicting or unproven closed-object intersections are rejected, not overwritten.
-- Exact distinct string singleton alternatives become an enum. Arbitrary unions,
-  duplicate `oneOf` alternatives, and lossy intersections are not guessed.
+- Exact distinct string singleton alternatives become an enum. `oneOf` branches
+  with provably disjoint explicit JSON types become `anyOf`, preserving branch
+  order, schemas, and annotations. `integer` overlaps `number`; nullable branches
+  include the null domain. Overlapping, untyped, or unproven alternatives and
+  lossy intersections are rejected rather than widened.
 - Required and nullable remain independent. Property names and literal
   `default`/`enum` payloads are not interpreted as schema keywords.
 - Lowering is bounded to depth 64 and 10,000 visited/copied nodes, inclusive.
@@ -98,6 +101,28 @@ instead of an empty success schema or an accidental internal error. The pipeline
 preserves typed codec errors without reclassifying unrelated `anyhow` failures.
 Existing explicitly selected `parametersJsonSchema` wire content is preserved;
 there is no unverified automatic endpoint-wide switch to the richer channel.
+
+### E. Schedule-tool unions and pre-transport failure logs
+
+The sanitized regression reproduces `schedule_create` and `schedule_update` with
+`at.oneOf = [string, object{date,time,time_zone}]`. It exercises 80 tools through
+both direct native conversion and an actual Nyro-to-Nyro loopback chain, in
+streaming and buffered modes. Both alternatives and the date/time required
+members must survive; replacing the union with an unconstrained schema is not a
+repair. Existing native Schema-proto keyword cleanup is unchanged, including
+its removal of `additionalProperties`; this is not a claim of full JSON Schema
+validation parity or live Antigravity acceptance.
+
+Failures returned by `passthrough_run` or `build_request` are logged as local
+request-build failures, not upstream HTTP errors. This follow-up does not change
+other pre-transport admission, hook, or runtime-setup branches.
+These build failures retain the correlated client request ID, selected route/provider/model,
+typed client status, and a `request_build` failure stage, without inventing an
+upstream status or transmitted request. Each logged failure has its own attempt
+index; fallback success remains the final client result. Local preparation
+failures must not consume the remote-attempt budget or penalize provider health.
+Diagnostics use bounded, credential-safe causes and the ordinary collector's
+abnormal-outcome payload-retention rules.
 
 ## Native versus compat validation boundary
 
@@ -120,7 +145,10 @@ Exposure is route-specific:
 
 ## Verification results
 
-The final repository gate completed with **zero failing targets**:
+The following counts describe the original four-repair baseline, not the expanded
+schedule-union and request-build logging follow-up suite.
+
+That repository gate completed with **zero failing targets**:
 
 - Native stream regressions: **21 passed**.
 - Native request regressions: **16 passed**.
@@ -133,6 +161,26 @@ The final repository gate completed with **zero failing targets**:
   warnings**; it was not a `-D warnings` run.
 - `cargo fmt --all -- --check` and `git diff --check`: **passed**.
 
+### Schedule-union and request-build logging follow-up
+
+Validated on the local v2.1.25-based checkout with Rust 1.96.0:
+
+- `cargo test -p nyro-core`: **2,280 passed**, zero failed; 1,533 library unit
+  tests and 747 integration tests. The six existing doctest ignores are unchanged.
+- Request codec regressions: **18 passed**; route regressions: **10 passed**;
+  request-build logging regressions: **4 passed** (included in the full run).
+- `cargo check -p nyro-core --all-targets`, `cargo fmt --all -- --check`, and
+  `git diff --check`: **passed**.
+- `cargo clippy -p nyro-core --lib --test conv_google_request_regressions
+  --test gemini_route_regressions --test request_build_logging`: **passed** with
+  existing library warnings.
+- Full `cargo clippy -p nyro-core --all-targets` remains blocked by the pre-existing
+  `clippy::unused_io_amount` in the Kiro runtime test (`runtime.rs:1606`, introduced
+  by `95980b0e`); that unrelated test was not changed or lint-suppressed.
+- `cargo build --release -p nyro-server --no-default-features`: **passed**. This
+  validates the server without embedded WebUI; it is not a published release,
+  deployment, or live Google acceptance check.
+
 ## Test layout and commands
 
 | Location | Purpose |
@@ -143,7 +191,8 @@ The final repository gate completed with **zero failing targets**:
 | `crates/nyro-core/src/protocol/codec/google/gemini/schema.rs` tests | Local refs, escapes, cycles, exact enum/intersection rules and resource limits |
 | `provider/common/pipeline.rs` tests | Typed error status and compat-owned preview validation |
 | `proxy/dispatcher/streaming.rs` / `non_stream.rs` tests | Atomic decoder-error batches and forced-stream 502 behavior |
-| `crates/nyro-core/tests/gemini_route_regressions.rs` | Real dispatcher plus loopback upstream: native, compat, passthrough, Vertex, rejected schema and failed streaming |
+| `crates/nyro-core/tests/gemini_route_regressions.rs` | Real dispatcher plus loopback upstream: native, compat, passthrough, Vertex, rejected schema, failed streaming, and 80-tool schedule unions through direct/two-hop routes |
+| `crates/nyro-core/tests/request_build_logging.rs` | Native/passthrough build failures, SQLite collector persistence and public Admin queries, correlated final results, payload privacy, and fallback/budget isolation |
 
 Targeted runs:
 
@@ -151,6 +200,7 @@ Targeted runs:
 cargo test -p nyro-core --test conv_google_stream_regressions
 cargo test -p nyro-core --test conv_google_request_regressions
 cargo test -p nyro-core --test gemini_route_regressions
+cargo test -p nyro-core --test request_build_logging
 cargo test -p nyro-core --lib proxy::dispatcher::accumulator::tests
 cargo test -p nyro-core --lib proxy::dispatcher::streaming::tests
 cargo test -p nyro-core --lib proxy::dispatcher::non_stream::tests
