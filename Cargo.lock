@@ -2945,7 +2945,7 @@ dependencies = [
 
 [[package]]
 name = "nyro-ccswitch-compat"
-version = "2.1.33"
+version = "2.1.34"
 dependencies = [
  "async-stream",
  "base64 0.22.1",
@@ -2965,7 +2965,7 @@ dependencies = [
 
 [[package]]
 name = "nyro-core"
-version = "2.1.33"
+version = "2.1.34"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3008,7 +3008,7 @@ dependencies = [
 
 [[package]]
 name = "nyro-desktop"
-version = "2.1.33"
+version = "2.1.34"
 dependencies = [
  "nyro-core",
  "serde",
@@ -3025,7 +3025,7 @@ dependencies = [
 
 [[package]]
 name = "nyro-server"
-version = "2.1.33"
+version = "2.1.34"
 dependencies = [
  "anyhow",
  "axum",
@@ -3048,7 +3048,7 @@ dependencies = [
 
 [[package]]
 name = "nyro-tools"
-version = "2.1.33"
+version = "2.1.34"
 dependencies = [
  "anyhow",
  "axum",
