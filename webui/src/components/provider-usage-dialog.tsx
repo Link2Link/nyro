@@ -464,13 +464,19 @@ export function ProviderUsageDialog({
 export function QuotaBucketFilters({ buckets, value, onChange, isZh = false }: {
   buckets: QuotaBucket[]; value: QuotaBucketFilter; onChange: (value: QuotaBucketFilter) => void; isZh?: boolean;
 }) {
+  const filterable = buckets.filter((bucket) => bucket.source !== "google_family_display_v1"
+    && bucket.binding.source !== "google_family_display_v1"
+    && !["shared_constraint", "window_constraint"].includes(bucket.binding.status));
   const options: { key: string; label: string; filter: QuotaBucketFilter }[] = [
     { key: "all", label: isZh ? "全部" : "All", filter: {} as QuotaBucketFilter },
-    ...buckets.filter((bucket) => !["shared_constraint", "window_constraint"].includes(bucket.binding.status)).map((bucket) => ({
+    ...filterable.map((bucket) => ({
       key: JSON.stringify([bucket.scope_id, bucket.id]), label: bucket.label,
       filter: { quota_bucket: bucket.id, quota_scope: bucket.scope_id },
     })),
-    ...(value.quota_bucket && value.quota_bucket !== "unassigned" && !buckets.some((bucket) => bucket.id === value.quota_bucket && bucket.scope_id === value.quota_scope)
+    ...(value.quota_bucket && value.quota_bucket !== "unassigned"
+      && !buckets.some((bucket) => (bucket.source === "google_family_display_v1" || bucket.binding.source === "google_family_display_v1")
+        && bucket.id === value.quota_bucket && bucket.scope_id === value.quota_scope)
+      && !filterable.some((bucket) => bucket.id === value.quota_bucket && bucket.scope_id === value.quota_scope)
       ? [{ key: "retained-selection", label: isZh ? "历史配额桶" : "Retained bucket", filter: value }] : []),
     { key: "unassigned", label: isZh ? "未归属" : "Unassigned", filter: { quota_bucket: "unassigned" } },
   ];

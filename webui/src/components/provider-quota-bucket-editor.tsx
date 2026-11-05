@@ -4,10 +4,13 @@ import { AlertCircle, Loader2, Plus, Trash2 } from "lucide-react";
 import { backend } from "@/lib/backend";
 import { useLocale } from "@/lib/i18n";
 import { tierLabel } from "@/lib/provider-usage";
+import { isGoogleFamilyDisplayBucket } from "@/lib/quota-bucket-display";
 import type { QuotaBucket, QuotaBucketConfig, ManualQuotaBucketBinding } from "@/lib/types";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog";
+
+const observedResources = (buckets: QuotaBucket[]) => buckets.filter((bucket) => !isGoogleFamilyDisplayBucket(bucket));
 
 export function ProviderQuotaBucketEditor({ providerId, buckets, open, onOpenChange }: {
   providerId: string; buckets: QuotaBucket[]; open: boolean; onOpenChange: (open: boolean) => void;
@@ -35,8 +38,9 @@ export function QuotaBindingFields({ binding, resources, onChange, onRemove, isZ
   binding: ManualQuotaBucketBinding; resources: QuotaBucket[]; onChange: (binding: ManualQuotaBucketBinding) => void;
   onRemove: () => void; isZh?: boolean; existing?: boolean;
 }) {
-  const scopes = [...new Set([binding.scope_id, ...resources.map((bucket) => bucket.scope_id)].filter(Boolean))];
-  const choices = resources.filter((bucket) => bucket.scope_id === binding.scope_id && bucket.binding.source !== "configured" && bucket.source !== "catalog");
+  const observed = observedResources(resources);
+  const scopes = [...new Set([binding.scope_id, ...observed.map((bucket) => bucket.scope_id)].filter(Boolean))];
+  const choices = observed.filter((bucket) => bucket.scope_id === binding.scope_id && bucket.binding.source !== "configured" && bucket.source !== "catalog");
   const missing = binding.constraint_ids.filter((id) => !choices.some((bucket) => bucket.id === id));
   return <fieldset className="space-y-3 rounded-xl border border-slate-200 p-3">
     <div className="grid gap-3 sm:grid-cols-2">
@@ -75,6 +79,7 @@ function BindingForm({ providerId, buckets, config, zh, onSaved }: {
   providerId: string; buckets: QuotaBucket[]; config: QuotaBucketConfig; zh: boolean; onSaved: () => void;
 }) {
   const [bindings, setBindings] = useState(() => config.bindings.map((binding) => ({ ...binding, models: [...binding.models], constraint_ids: [...binding.constraint_ids] })));
+  const resources = observedResources(buckets);
   const client = useQueryClient();
   const save = useMutation({
     mutationFn: () => backend<QuotaBucketConfig>("set_provider_quota_buckets_config", { id: providerId,
@@ -90,7 +95,7 @@ function BindingForm({ providerId, buckets, config, zh, onSaved }: {
     <p className="flex gap-2 rounded-lg bg-amber-50 p-3 text-xs text-amber-800"><AlertCircle className="h-4 w-4 shrink-0" />
       {zh ? "绑定会影响新请求的准入与归属。仅合并已有证据证明共享的窗口；不要以相同百分比、标签或价格认定共享。旧记录不会按新绑定强行分摊。" : "Bindings affect admission and attribution of new attempts. Combine only windows proven to share an allowance, never by equal percentages, labels or prices. New bindings do not reassign ambiguous historical logs."}
     </p>
-    {bindings.map((binding, index) => <QuotaBindingFields key={index} binding={binding} resources={buckets} isZh={zh}
+    {bindings.map((binding, index) => <QuotaBindingFields key={index} binding={binding} resources={resources} isZh={zh}
       existing={config.bindings.some((item) => item.id === binding.id)}
       onChange={(next) => setBindings((current) => current.map((item, i) => i === index ? next : item))}
       onRemove={() => setBindings((current) => current.filter((_, i) => i !== index))} />)}
@@ -99,7 +104,7 @@ function BindingForm({ providerId, buckets, config, zh, onSaved }: {
     <div className="flex flex-wrap justify-between gap-2">
       <Button type="button" variant="outline" onClick={() => setBindings((current) => [...current, {
         id: typeof crypto !== "undefined" && typeof crypto.randomUUID === "function" ? crypto.randomUUID() : `binding-${Date.now()}-${Math.random().toString(16).slice(2)}`,
-        scope_id: buckets[0]?.scope_id ?? "", label: "", models: [], constraint_ids: [],
+        scope_id: resources[0]?.scope_id ?? "", label: "", models: [], constraint_ids: [],
       }])}><Plus className="h-4 w-4" />{zh ? "添加绑定" : "Add binding"}</Button>
       <Button type="submit" disabled={save.isPending}>{save.isPending && <Loader2 className="h-4 w-4 animate-spin" />}{zh ? "保存绑定" : "Save bindings"}</Button>
     </div>

@@ -2588,6 +2588,12 @@ impl AdminService {
         // Price enrichment belongs only to this admin path, never GuardOnly or
         // proxy forwarding; failures cannot alter a successful quota observation.
         self.enrich_provider_api_price(&mut usage).await;
+        // Presentation only: caches, admission, persistent fences and immutable
+        // attempt attribution keep the exact discovered resource identities.
+        if usage.kind == UsageBackend::GoogleSubscription.kind() {
+            usage.quota_buckets =
+                crate::quota_buckets::google_display_buckets(&usage.quota_buckets);
+        }
         Ok(usage)
     }
 

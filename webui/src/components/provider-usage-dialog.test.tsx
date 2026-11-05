@@ -26,6 +26,20 @@ test("bucket filters expose All / exact scoped buckets / Unassigned without shar
   match(zh, />未归属</);
 });
 
+test("Google display families never become synthetic retained-log filter actions", () => {
+  const family: QuotaBucket = { ...bucket, id: "display-flash", label: "gemini-3.8-flash",
+    source: "google_family_display_v1", binding: { ...bucket.binding, source: "google_family_display_v1" } };
+  const selections: QuotaBucketFilter[] = [];
+  const element = QuotaBucketFilters({ buckets: [...buckets, family], value: {}, onChange: (value) => selections.push(value) });
+  const buttons = element.props.children as ReactElement<{ onClick: () => void }>[];
+  for (const button of buttons) button.props.onClick();
+  equal(selections.some((filter) => filter.quota_bucket === family.id), false);
+  const html = renderToStaticMarkup(<QuotaBucketFilters buckets={[family]} value={{ quota_bucket: family.id, quota_scope: family.scope_id }} onChange={() => {}} />);
+  doesNotMatch(html, /gemini-3\.8-flash|display-flash|Retained bucket/);
+  match(html, />All</);
+  match(html, />Unassigned</);
+});
+
 test("dialog overview cache identities include the attribution filter and retain the real provider ID", () => {
   const client = new QueryClient();
   const filter = { quota_bucket: "bucket", quota_scope: "scope-b" };

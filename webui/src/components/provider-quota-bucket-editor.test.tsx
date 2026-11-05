@@ -32,3 +32,18 @@ test("binding editor explicitly localizes guidance and preserves absent historic
   match(html, /Resource absent from current snapshot; backend will validate on save/);
   match(html, /retired-resource/);
 });
+
+test("Google display families cannot become binding resources while raw windows and shared constraints remain available", () => {
+  const family: QuotaBucket = { ...resource, id: "synthetic-family", label: "Synthetic family", models: ["gemini-3.8-flash"],
+    source: "google_family_display_v1", binding: { ...resource.binding, status: "resolved", source: "google_family_display_v1" } };
+  const html = render(false, [family,
+    { ...family, id: "source-marker-only", source: "google_family_display_v1", binding: { ...resource.binding } },
+    { ...family, id: "binding-marker-only", source: "enforced_summary" },
+    { ...family, id: "family-other-scope", scope_id: "synthetic-only-scope" },
+    { ...resource, id: "raw-weekly", label: "Raw weekly window", tiers: [{ name: "weekly_limit", used_percent: 20 }] },
+    { ...resource, id: "raw-shared", label: "Raw shared constraint", binding: { ...resource.binding, status: "shared_constraint" } },
+    { ...resource, scope_id: "scope-b", label: "Other owner same raw ID" }]);
+  equal((html.match(/type="checkbox"/g) ?? []).length, 3);
+  for (const value of ["observed-resource", "raw-weekly", "raw-shared", "Weekly"]) match(html, new RegExp(value));
+  doesNotMatch(html, /synthetic-family|Synthetic family|source-marker-only|binding-marker-only|synthetic-only-scope|Other owner same raw ID/);
+});

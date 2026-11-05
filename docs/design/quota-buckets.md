@@ -11,6 +11,42 @@ Google raw structured denial-to-summary constraint identifiers have not been est
 Live owner/fence/resource mappings (`quota_bucket_owner.*`, `quota_bucket_fence.*`, `quota_buckets.*`) are intentionally excluded from configuration export and ignored on import. Restored providers must rediscover and explicitly rebind live resources; copied identifiers cannot transfer quota or owner state. The existing permanent daily usage ledger is unchanged. Filtered detail aggregation uses one scalar SQL cursor; filtered paginated logs remain a metadata postfilter compatibility path and may need snapshot/keyset optimization for high-traffic consistency.
 
 
+## Google two-family presentation
+
+The usage view now folds only the confirmed `gemini-3.8-flash` and
+`gemini-4-argon` families. Bare IDs and the exact `-extra-low`, `-low`, `-medium`,
+`-high`, and `-tiered` suffixes belong to their corresponding display card;
+Argon low/medium/high are not separate cards. Unknown suffixes, lookalike model
+names and other models are not guessed into either family. At most two observed
+family cards are shown per entitlement scope; missing observations are unknown,
+not manufactured 0% / free capacity.
+
+This is a read-only core projection marked `google_family_display_v1`, not a new
+quota binding. Raw model/resource observations remain unchanged in the registry,
+forwarding cache, configuration editor, enforcement fences and immutable attempt
+attribution. The structured admin response is projected **after** raw-bucket
+pricing, retaining raw IDs as non-card resources. A synthetic family ID is never
+a retained-log filter: source-detail links use the original bucket and scope.
+The UI does not sum prices or discover families itself, and keeps model/diagnostic
+metadata collapsed by default. Non-Google presentation is unchanged.
+
+Utilization is a conservative maximum per observed window, never a sum. Different
+reset times lose their group reset rather than borrowing one source's timestamp.
+Retained prices count each scoped source partition once; a source covering both
+families is split only by its existing exact-model price breakdown. Multi-source
+or mixed-family current-cycle prices/capacity remain unknown when they cannot be
+proved to share the same accounting interval; a valid single-source cycle retains
+its three figures. Provider grand totals and unassigned/retired history are not
+copied into both cards or retroactively reassigned.
+
+Bulk publication uses these same two families and leaves unrelated raw diagnostics
+in the structured view. Catalog-only family observations are explicitly unknown,
+not healthy independent suppliers. Proxy forwarding first evaluates each
+**authorized exact route** against raw buckets, then folds only its visible output
+rows; the separate route-admission states, hidden siblings and admin-price redaction
+are unchanged. This display change does not claim to add cross-variant admission
+or quota-exhaustion coupling beyond the existing raw evidence.
+
 ## Goal and non-goals
 
 One Provider can serve models backed by independent upstream allowances. The motivating case is the operator-reported separation between Gemini 3.8 Flash and Gemini 4 Argon. Show and account for each allowance independently, admit requests against the allowance they actually consume, and retain one Provider configuration and its credentials.
@@ -67,7 +103,7 @@ PreparedAdmission(logical_model, backend_model, wire_model, owner, credential_ge
 QuotaEvaluation(eligible | exhausted | unknown, blockers[], reserve, freshness, score?)
 ```
 
-`model_binding` uses exact discovered wire IDs and explicitly supported aliases. Quota identity, public model identity and API-price identity are different mappings. For example, Flash effort variants may be mapped to one verified allowance while pricing still uses their correct reference model. Argon's bare/tier IDs must not be collapsed merely because a suffix resembles a reasoning level.
+`model_binding` uses exact discovered wire IDs and explicitly supported aliases. Quota identity, public model identity and API-price identity are different mappings. For example, Flash effort variants may be mapped to one verified allowance while pricing still uses their correct reference model. Argon's callable bare/tier identities remain exact for admission; the two-family presentation whitelist above only collapses their read-only usage cards and does not rewrite bindings.
 
 Bucket IDs are opaque, stable within their scoped lifetime, and never derived from utilization/reset timestamps or mutable display labels. Raw account/project IDs and email addresses are not exposed as public bucket IDs. Known incompatible entitlement changes create a new scoped identity; renamed labels do not.
 
@@ -185,7 +221,7 @@ Add optional `quota_buckets` and model-aware scheduling detail to the shared cor
 
 Example is illustrative and not a live observation. Include source observations/quality and independently timestamped windows in the actual contract. `models` denotes a resolved binding, not a loosely inferred family membership. Backend labels/defaults are English with explicit Chinese UI translations.
 
-Keep one Provider card, with two stable subcards (Flash / Argon), each showing:
+Keep one Provider card, with at most two observed family subcards per scope (`gemini-3.8-flash` / `gemini-4-argon`). Missing families are not fabricated. Model/resource metadata and exact price breakdowns are collapsed diagnostics rather than extra cards. Each observed family shows:
 
 - bound models, source/binding status and individual scheduling state;
 - its own five-hour/weekly bars, reset timestamps, stale/unknown warnings;

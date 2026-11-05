@@ -13,6 +13,7 @@ import { UsageProgress } from "@/components/usage-progress";
 import { PoolRefreshButton } from "@/components/pool-refresh-button";
 import { ProviderIcon } from "@/components/ui/provider-icon";
 import { ProviderApiPriceSummary } from "@/components/provider-api-price-summary";
+import { hasStructuredQuotaBuckets, isGoogleFamilyDisplayBucket } from "@/lib/quota-bucket-display";
 import { ProviderQuotaBuckets, QuotaBucketAvailability } from "@/components/provider-quota-buckets";
 import { ProviderUsageDialog } from "@/components/provider-usage-dialog";
 import { ProviderQuotaBucketEditor } from "@/components/provider-quota-bucket-editor";
@@ -387,7 +388,7 @@ export function ProviderUsageFooter({ provider }: { provider: Provider }) {
 
   const shown = usage;
   const balances = shown?.balances ?? [];
-  const hasBuckets = Boolean(shown?.quota_buckets?.length);
+  const hasBuckets = hasStructuredQuotaBuckets(shown);
   const pause = hasBuckets ? null : providerUsagePause(shown, isZh);
   const quotaCountdown = countdownStr(pause?.resetAt);
   const blockedTierLabels = (pause?.quotaExhausted ? shown?.scheduling?.blocking_tiers ?? [] : [])
@@ -417,7 +418,8 @@ export function ProviderUsageFooter({ provider }: { provider: Provider }) {
       <div className="flex flex-wrap items-center justify-between gap-2">
         <div className="flex flex-wrap items-center gap-2 text-xs font-medium text-slate-500">
           <span>{title}</span>
-          {hasBuckets && <QuotaBucketAvailability buckets={shown!.quota_buckets!} stale={Boolean(error)} isZh={isZh} now={now} />}
+          {hasBuckets && <QuotaBucketAvailability buckets={shown!.quota_buckets!} stale={Boolean(error)} isZh={isZh} now={now}
+            expectedCount={shown?.kind === "google_subscription" ? 2 : undefined} />}
           {shown?.level && (
             <span className="rounded bg-slate-100 px-1.5 py-0.5 text-[10px] font-semibold uppercase text-slate-600">
               {shown.level}
@@ -528,10 +530,10 @@ export function ProviderUsageFooter({ provider }: { provider: Provider }) {
       )}
       {!hasBuckets && shown && providerApiPriceSupported(shown.kind) && <ProviderApiPriceSummary
         usage={shown} now={now} stale={stale} loading={isFetching} locale={locale} />}
-      {bindingEditorOpen && <ProviderQuotaBucketEditor providerId={provider.id} buckets={shown?.quota_buckets ?? []}
+      {bindingEditorOpen && <ProviderQuotaBucketEditor providerId={provider.id} buckets={(shown?.quota_buckets ?? []).filter((bucket) => !isGoogleFamilyDisplayBucket(bucket))}
         open onOpenChange={setBindingEditorOpen} />}
       {detailFilter && <ProviderUsageDialog open onOpenChange={(open) => { if (!open) setDetailFilter(null); }}
-        initialProviderId={provider.id} initialQuotaFilter={detailFilter} quotaBuckets={shown?.quota_buckets} />}
+        initialProviderId={provider.id} initialQuotaFilter={detailFilter} quotaBuckets={shown?.quota_buckets?.filter((bucket) => !isGoogleFamilyDisplayBucket(bucket))} />}
     </div>
   );
 
@@ -546,6 +548,7 @@ export function ProviderUsageFooter({ provider }: { provider: Provider }) {
 export function GroupUsageSummary({ providers }: { providers: Provider[] }) {
   const { locale } = useLocale();
   const isZh = locale === "zh-CN";
+  const now = useUsageClock();
   // Native account pools show their own per-account usage, not a singleton summary.
   const members = providers.filter((p) => !isDevinProvider(p) && !isKiroProvider(p) && providerUsageSupported(p));
 
@@ -565,11 +568,12 @@ export function GroupUsageSummary({ providers }: { providers: Provider[] }) {
       usage: queries[i]?.data,
       failed: Boolean(queries[i]?.error),
       loading: !queries[i]?.data && queries[i]?.isFetching,
-    })).filter((entry) => !entry.usage?.quota_buckets?.length),
+    })).filter((entry) => !hasStructuredQuotaBuckets(entry.usage)),
   );
   const bucketMembers = tracked.flatMap((provider, i) => {
-    const buckets = queries[i]?.data?.quota_buckets;
-    return buckets?.length ? [{ provider, buckets, failed: Boolean(queries[i]?.error) }] : [];
+    const usage = queries[i]?.data;
+    return usage && hasStructuredQuotaBuckets(usage) ? [{ provider, buckets: usage.quota_buckets ?? [],
+      expectedCount: usage.kind === "google_subscription" ? 2 : undefined, failed: Boolean(queries[i]?.error) }] : [];
   });
   const money = (n: number) => (Number.isFinite(n) ? n.toFixed(2) : "?");
   const detail = summary.perProvider
@@ -578,9 +582,9 @@ export function GroupUsageSummary({ providers }: { providers: Provider[] }) {
 
   return (
     <span className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1 text-xs text-slate-600" title={detail || undefined}>
-      {bucketMembers.map(({ provider, buckets, failed }) => <span key={provider.id} className="inline-flex items-center gap-1.5">
+      {bucketMembers.map(({ provider, buckets, expectedCount, failed }) => <span key={provider.id} className="inline-flex items-center gap-1.5">
         {tracked.length > 1 && <span className="max-w-32 truncate">{provider.name}</span>}
-        <QuotaBucketAvailability buckets={buckets} stale={failed} isZh={isZh} />
+        <QuotaBucketAvailability buckets={buckets} stale={failed} isZh={isZh} expectedCount={expectedCount} now={now} />
         {failed && <AlertCircle className="h-3 w-3 text-amber-700" aria-label={isZh ? "用量查询失败" : "Usage query failed"} />}
       </span>)}
       {summary.peak ? (

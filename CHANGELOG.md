@@ -4,6 +4,18 @@ All notable changes to Nyro will be documented in this file.
 
 ---
 
+## v2.1.32
+
+> Released on 2026-11-05
+
+#### Fixes
+
+- **Two Google model-family usage cards**: Google subscription usage now folds the confirmed `gemini-3.8-flash` and `gemini-4-argon` families into at most two observed cards per entitlement scope. Their exact low, medium, high, extra-low and tiered variants no longer appear as separate suppliers; unrelated model/resource observations remain in collapsed diagnostics. Management cards, bulk usage publication and authorized Nyro forwarding use the same core display projection without client-side quota summation.
+- **Safe scoped presentation and prices**: raw resource identities, model bindings, scheduling decisions, cache/fence state and immutable request attribution remain unchanged. Family cards keep source-detail links using real bucket/scope IDs rather than synthetic display IDs. Utilization is a conservative per-window maximum, not a sum; inconsistent resets are withheld. Retained prices deduplicate scoped partitions and split mixed-family totals only from exact-model evidence; multi-source or incompatible cycles do not fabricate current-cycle prices or capacity. Missing/catalog-only observations stay unknown, and hidden routes or administrator prices are not exposed by forwarding.
+- **Compact diagnostics and regression coverage**: variant lists, raw resources, binding metadata and retained history are collapsed by default while bucket amounts and provider totals remain available. Added family whitelist, owner isolation, zero/missing-price, source-filter, editor, publication and forwarding regressions, including all Argon low/medium/high variants. No database migration, automatic deployment or quota-admission policy change is included.
+
+---
+
 ## v2.1.31
 
 > Released on 2026-11-05

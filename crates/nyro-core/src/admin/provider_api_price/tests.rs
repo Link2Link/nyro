@@ -351,6 +351,97 @@ fn bucket(id: &str, scope: &str, now: i64, reset: &str) -> crate::quota_buckets:
     }
 }
 
+#[test]
+fn google_display_prices_split_mixed_exact_models_without_reassigning_raw_history() {
+    use crate::quota_buckets::{google_display_buckets, is_google_display_bucket};
+    let now = ms("2026-11-03T10:29:00+08:00");
+    let reset = "2026-11-04T18:29:00+08:00";
+    let mut raw = bucket("immutable-mixed", "owner", now, reset);
+    raw.models = vec!["gemini-3.8-flash-high".into(), "gemini-4-argon-low".into()];
+    let mut stats = ProviderApiPriceStats {
+        all_time: totals(30.0, 2, 0),
+        period: Some(totals(20.0, 2, 0)),
+        period_start: Some(now - 1),
+        period_end: Some(ms(reset)),
+        period_tier: Some("weekly_limit".into()),
+        used_percent: Some(25.0),
+        estimated_capacity: Some(totals(80.0, 2, 0).equivalent_costs),
+        all_time_coverage: Some(ProviderApiPriceCoverage {
+            input_tokens: 200,
+            priced_request_count: 2,
+            attributed_request_count: 2,
+            ..Default::default()
+        }),
+        period_coverage: None,
+        estimated_capacity_partial: None,
+        unassigned: None,
+        unassigned_coverage: None,
+        retained_buckets: Vec::new(),
+        models: vec![],
+    };
+    for (model, cost) in [
+        ("gemini-3.8-flash-high", 10.0),
+        ("gemini-4-argon-low", 20.0),
+    ] {
+        stats.models.push(QuotaModelPriceStats {
+            model: model.into(),
+            all_time: totals(cost, 1, 0),
+            coverage: ProviderApiPriceCoverage {
+                input_tokens: 100,
+                priced_request_count: 1,
+                attributed_request_count: 1,
+                ..Default::default()
+            },
+        });
+    }
+    raw.api_price = Some(stats);
+    let original = raw.clone();
+    let projected = google_display_buckets(std::slice::from_ref(&raw));
+    let families = projected
+        .iter()
+        .filter(|bucket| is_google_display_bucket(bucket))
+        .collect::<Vec<_>>();
+    assert_eq!(families.len(), 2);
+    assert_eq!(
+        families
+            .iter()
+            .map(|bucket| bucket.api_price.as_ref().unwrap().all_time.request_count)
+            .sum::<i64>(),
+        2
+    );
+    assert_eq!(
+        families[0]
+            .api_price
+            .as_ref()
+            .unwrap()
+            .all_time
+            .equivalent_costs[0]
+            .total_cost,
+        10.0
+    );
+    assert_eq!(
+        families[1]
+            .api_price
+            .as_ref()
+            .unwrap()
+            .all_time
+            .equivalent_costs[0]
+            .total_cost,
+        20.0
+    );
+    assert!(families.iter().all(|bucket| {
+        let stats = bucket.api_price.as_ref().unwrap();
+        stats.period.is_none() && stats.estimated_capacity.is_none() && stats.models.len() == 1
+    }));
+    let retained = projected.iter().find(|bucket| bucket.id == raw.id).unwrap();
+    assert_eq!(retained.api_price, raw.api_price);
+    assert_eq!(retained.scope_id, "owner");
+    assert_eq!(
+        raw, original,
+        "display projection must never rewrite immutable accounting evidence"
+    );
+}
+
 #[tokio::test]
 async fn bucket_prices_partition_history_periods_exact_prices_currencies_and_missing_evidence()
 -> anyhow::Result<()> {

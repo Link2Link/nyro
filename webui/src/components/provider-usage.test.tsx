@@ -3,7 +3,7 @@ import { test } from "node:test";
 import { renderToStaticMarkup } from "react-dom/server";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { LocaleProvider } from "../lib/i18n";
-import type { Provider, ProviderApiPriceStats, ProviderUsage } from "../lib/types";
+import type { Provider, ProviderApiPriceStats, ProviderUsage, QuotaBucket } from "../lib/types";
 import { GroupUsageSummary, ProviderUsageFooter } from "./provider-usage";
 
 const now = Date.parse("2030-01-01T00:00:00Z");
@@ -334,28 +334,61 @@ test("cached usage retains visible refresh failures, stale state and quota pause
   doesNotMatch(html, /<details|<summary/);
 });
 
-test("structured buckets replace parent bars and prices while empty buckets retain legacy cards", () => {
-  const currentProvider = googleProviders[0];
-  const original = googleUsage(currentProvider);
-  const bucket = { id: "flash", scope_id: "scope", label: "Gemini Flash", models: ["gemini-3.8-flash"],
-    binding: { status: "resolved", source: "configured", revision: 1 }, tiers: original.tiers, constraint_ids: [],
-    source: "enforced_summary", queried_at: original.queried_at, stale: false,
-    scheduling: { status: "eligible" as const, blocking_tiers: [] }, api_price: apiPrice };
-  const html = render({ ...original, quota_buckets: [bucket, { ...bucket, id: "argon", label: "Gemini Argon", models: ["gemini-4-argon"] }] }, undefined, currentProvider);
-  equal((html.match(/data-quota-bucket=/g) ?? []).length, 2);
-  equal((html.match(/role="progressbar"/g) ?? []).length, 4);
-  equal((html.match(/data-api-price="all_time"/g) ?? []).length, 3);
-  equal((html.match(/data-api-price="period"/g) ?? []).length, 2);
-  match(html, /data-quota-availability="available"/);
-  match(html, /Model bindings|Bucket details/);
-  const client = new QueryClient();
-  client.setQueryData(["provider-usage", currentProvider.id], { ...original, quota_buckets: [bucket] });
-  try {
-    const group = renderToStaticMarkup(<QueryClientProvider client={client}><LocaleProvider><GroupUsageSummary providers={[currentProvider]} /></LocaleProvider></QueryClientProvider>);
-    match(group, /data-quota-availability="available"/);
-    doesNotMatch(group, /Peak used|progressbar|%/);
-  } finally { client.clear(); }
-  equal(render({ ...original, quota_buckets: [] }, undefined, currentProvider), render(original, undefined, currentProvider));
+test("Google family snapshots replace parent quota while footer and group share conservative family availability", () => {
+  for (const currentProvider of googleProviders) {
+    const original = googleUsage(currentProvider);
+    const raw: QuotaBucket = { id: "raw-flash", scope_id: "scope", label: "Original Flash", models: ["gemini-3.8-flash", "gemini-3.8-flash-high"],
+      binding: { status: "window_constraint", source: "configured", revision: 1 }, tiers: original.tiers, constraint_ids: [],
+      source: "enforced_summary", queried_at: original.queried_at, stale: false,
+      scheduling: { status: "eligible", blocking_tiers: [] }, api_price: apiPrice };
+    const flash: QuotaBucket = { ...raw, id: "display-family-flash", label: "gemini-3.8-flash", constraint_ids: [raw.id],
+      binding: { ...raw.binding, status: "resolved", source: "google_family_display_v1" }, source: "google_family_display_v1" };
+    const argon: QuotaBucket = { ...flash, id: "display-family-argon", label: "gemini-4-argon", models: ["gemini-4-argon"], constraint_ids: [] };
+    const html = render({ ...original, quota_buckets: [flash, argon, raw] }, undefined, currentProvider);
+    equal((html.match(/data-quota-bucket=/g) ?? []).length, 2);
+    equal((html.match(/role="progressbar"/g) ?? []).length, 4);
+    equal((html.match(/data-api-price="all_time"/g) ?? []).length, 3);
+    equal((html.match(/data-api-price="period"/g) ?? []).length, 2);
+    match(html, /data-quota-availability="available"[^]*Available · 2\/2/);
+    match(html, /Model bindings|Source bucket details/);
+    doesNotMatch(html, /data-quota-detail="[^">]*display-family/);
+    const single = render({ ...original, quota_buckets: [flash, raw] }, undefined, currentProvider);
+    match(single, /data-quota-availability="partial"[^]*Partially available · 1\/2/);
+    const client = new QueryClient();
+    const originalNow = Date.now;
+    Date.now = () => now;
+    try {
+      for (const quota_buckets of [[flash, raw], [raw], [], [flash, { ...argon, scope_id: "other-owner" }, raw]]) {
+        client.setQueryData(["provider-usage", currentProvider.id], { ...original, quota_buckets });
+        const group = renderToStaticMarkup(<QueryClientProvider client={client}><LocaleProvider><GroupUsageSummary providers={[currentProvider]} /></LocaleProvider></QueryClientProvider>);
+        match(group, quota_buckets[0] === flash && quota_buckets.length === 2 ? /data-quota-availability="partial"/ : /data-quota-availability="unknown"/);
+        doesNotMatch(group, /Peak used|progressbar|%/);
+      }
+    } finally { Date.now = originalNow; client.clear(); }
+    for (const quota_buckets of [[], [raw]]) {
+      const empty = render({ ...original, quota_buckets }, undefined, currentProvider);
+      match(empty, /data-quota-availability="unknown"/);
+      equal((empty.match(/No quota observations for the target model families/g) ?? []).length, 1);
+      equal((empty.match(/data-api-price="all_time"/g) ?? []).length, 1);
+      match(empty, /Model bindings/);
+      doesNotMatch(empty, /data-quota-bucket=|role="progressbar"|data-api-price="period"|data-api-price="estimated_capacity"|\$0\.00/);
+    }
+    // Old servers omit the field; only those snapshots preserve the legacy parent presentation.
+    equal(render({ ...original, quota_buckets: undefined }, undefined, currentProvider), render(original, undefined, currentProvider));
+  }
+});
+
+test("non-Google bucket cards and empty snapshots retain the legacy presentation", () => {
+  const raw: QuotaBucket = { id: "raw-model", scope_id: "scope", label: "Other provider model", models: ["model-high"],
+    binding: { status: "resolved", source: "configured", revision: 1 }, tiers: priceUsage.tiers, constraint_ids: [],
+    source: "enforced_summary", queried_at: priceUsage.queried_at, stale: false,
+    scheduling: { status: "eligible", blocking_tiers: [] }, api_price: apiPrice };
+  const html = render({ ...priceUsage, quota_buckets: [raw] });
+  equal((html.match(/data-quota-bucket=/g) ?? []).length, 1);
+  match(html, /Other provider model|model-high|Bucket details/);
+  match(html, /data-quota-availability="available"[^]*1\/1/);
+  doesNotMatch(html, /data-bucket-diagnostics|data-provider-quota-diagnostics/);
+  equal(render({ ...priceUsage, quota_buckets: [] }), render(priceUsage));
 });
 
 const upstreamUsage = (over: Partial<ProviderUsage>): ProviderUsage => ({ ...base, provider_id: "remote", ...over });
