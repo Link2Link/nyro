@@ -4,6 +4,18 @@ Nyro 的所有重要变更均记录在此文件中。
 
 ---
 
+## v2.1.30
+
+> 发布于 2026-11-05
+
+#### 修复
+
+- **Gemini 原生通道的空字符串枚举成员**：Google 原生 Schema 拒绝 `enum` 中的空字符串（`400 INVALID_ARGUMENT ... enum[i]: cannot be empty`；线上请求 109a83f1 复现：v2.1.29 将 `task_board_update.permission` 合并为 `enum: [read-only, workspace-write, danger-full-access, ""]` 后，请求顺利穿过两跳 Nyro 却被 Google 拒绝）。原生工具参数准备阶段现在把空字符串枚举成员无损改写为 `pattern: "^$"`：有其他非空值时作为 `anyOf` 的兄弟分支，空字符串是唯一取值时作为唯一约束。
+- **保守边界**：改写仅遍历与原生关键字清理相同的 schema 位置（名称映射、`items`、`anyOf`），绝不触碰字面数据（`default`、`examples`、`required` 名称）。已携带 `anyOf`、空值枚举且已有 `pattern`、或含非字符串成员的 schema 保持原样不做猜测；全非空枚举不受影响，改写幂等，OpenAI/Anthropic 兼容通道（原样接受空串枚举）完全不受影响。
+- **回归保障**：新增 encoder 单测回放线上报错形状，覆盖仅空值、pattern 冲突、嵌套 `items`/`$defs`、字面数据与幂等边界，以及 `prepare_parameters` 端到端断言；59 工具原生路由回归改为断言流式/非流式下的 `anyOf` 枚举/pattern 线上形状、父级枚举交集场景，并全量扫描原生请求中不得再出现空枚举成员。无需数据库迁移。
+
+---
+
 ## v2.1.29
 
 > 发布于 2026-11-05

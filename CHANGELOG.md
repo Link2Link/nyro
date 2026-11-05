@@ -4,6 +4,18 @@ All notable changes to Nyro will be documented in this file.
 
 ---
 
+## v2.1.30
+
+> Released on 2026-11-05
+
+#### Fixes
+
+- **Empty enum members on the native Gemini wire**: Google's native Schema rejects empty strings inside `enum` with `400 INVALID_ARGUMENT ... enum[i]: cannot be empty` (observed on the Google AI Pro subscription `v1internal` surface with request 109a83f1: the v2.1.29 finite-enum merge of `task_board_update.permission` produced `enum: [read-only, workspace-write, danger-full-access, ""]`, which passed both Nyro hops and was refused by Google). Native tool-parameter preparation now rewrites every empty-string enum member losslessly to `pattern: "^$"`: as a sibling `anyOf` branch next to the remaining non-empty values, or as the sole constraint when the empty string is the only value.
+- **Conservative scope**: the rewrite follows the same schema positions as the native keyword cleanup (name maps, `items`, `anyOf`) and never touches literal payloads (`default`, `examples`, `required` names). Schemas that already carry `anyOf`, an empty-only `pattern`, or non-string enum members stay exactly as lowered instead of being guessed at. All-non-empty enums are untouched, the rewrite is idempotent, and the OpenAI/Anthropic-compatible channels (which accept empty enum members verbatim) are unaffected.
+- **Regression coverage**: added encoder unit tests replaying the incident shape plus empty-only, conflicting-pattern, nested-`items`/`$defs`, literal-payload and idempotency boundaries, and a `prepare_parameters` end-to-end check. The 59-tool native route regressions now assert the `anyOf` enum/pattern wire form in streaming and buffered modes, the intersected parent-enum case, and that no enum anywhere on the native wire carries an empty member. No database migration is required.
+
+---
+
 ## v2.1.29
 
 > Released on 2026-11-05
