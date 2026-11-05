@@ -85,6 +85,7 @@ Nyro ships as a **desktop app** (macOS / Windows / Linux) and a **standalone ser
 - **Egress**: route to any OpenAI-compatible, Anthropic, or Gemini upstream
 - **Streaming**: full SSE passthrough and cross-protocol format conversion
 - **Reasoning**: `<think>` tag parsing and conversion across protocol boundaries
+- **OpenAI effort floor**: for every model under the OpenAI provider (default API, Codex and Sub2API channels), explicit `none` reasoning effort is sent upstream as `low` in Chat Completions and Responses, including converted requests. Other effort tiers remain unchanged, and an absent effort is not filled in. This is a provider policy, not a rule for all OpenAI-compatible backends or Nyro relays.
 - **Tool calls**: cross-protocol tool call and result format normalization
 - **Route types**: chat and embedding routes with type-aware handling
 

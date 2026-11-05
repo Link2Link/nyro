@@ -84,6 +84,7 @@ Nyro 同时提供 **桌面应用**（macOS / Windows / Linux）和 **独立服�
 - **出口协议**：可路由到任意 OpenAI 兼容、Anthropic 或 Gemini 上游
 - **流式响应**：完整 SSE 透传与跨协议格式转换
 - **推理内容**：支持 `<think>` 标签解析与跨协议转换
+- **OpenAI 推理档位下限**：OpenAI 供应商下所有模型（默认 API、Codex、Sub2API 渠道）在 Chat Completions、Responses 及转码请求中，将显式 `none` 推理档位改为 `low` 再发送上游；其他档位保持不变，未指定档位时不补填。这是供应商策略，不扩展到所有 OpenAI 兼容后端或 Nyro 中继。
 - **工具调用**：跨协议 tool call 与结果格式归一化
 - **路由类型**：支持 chat 和 embedding 两种路由类型
 

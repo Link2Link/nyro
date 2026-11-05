@@ -1,7 +1,9 @@
 //! Per-vendor `reasoning_effort` egress policy.
 //!
-//! Different upstreams disagree on which effort values they accept (measured
-//! against the live production matrix on 2026-08-22):
+//! Different upstreams disagree on which effort values they accept. Other rows
+//! reflect the live production matrix measured on 2026-08-22; the OpenAI row is
+//! a local, provider-wide defensive policy requested for all models/channels,
+//! not a claim that every OpenAI model rejects `none`:
 //!
 //! | Upstream            | `none` | `disable`/`disabled` | Policy              |
 //! |---------------------|:------:|:----------------------:|---------------------|
@@ -10,7 +12,7 @@
 //! | grok (x.ai build)   | ❌ 400 |          ✅ ignored    | drop off; `max`→`xhigh` |
 //! | MiniMax             |   ✅   |     ✅ honored off     | normalize → `none`  |
 //! | Kimi coding         |   ✅   |       ✅ ignored       | normalize → `none`  |
-//! | OpenAI / sub2api    |   ✅   |       ✅ ignored       | normalize → `none`  |
+//! | OpenAI / sub2api    | model-dependent | varies       | policy: off → `low` |
 //! | GPT-6 Astra         | ❌ 400 |       n/a (→none)      | clamp off → `low`   |
 //! | OpenCode zen (go)   | ❌ 400 |       n/a (→none)      | clamp off → `low`   |
 //! | Volcengine Ark glm  | ❌ 400 |       n/a (→none)      | clamp off → `low`   |
@@ -145,7 +147,9 @@ fn is_max_effort(effort: &str) -> bool {
 }
 
 /// Off 意图（`none` 及其 misspelling）钳制为最小合法档 `low` 的共享内核。
-/// 供「思考型模型拒收一切 off 形态」的上游方言复用。
+/// 供「思考型模型拒收一切 off 形态」的上游方言及 OpenAI 供应商级防御复用。
+/// Only explicit off strings are changed; missing or malformed values are not
+/// defaulted, and unrelated/opaque request content is never traversed.
 /// Handles Chat and Responses without narrowing other tiers: GPT-6 Astra
 /// accepts medium/xhigh as well as low/high/max (request bcd2a3ed).
 pub(crate) fn clamp_off_effort_to_low(body: &mut Value) {
@@ -376,7 +380,17 @@ mod tests {
 
     #[test]
     fn off_clamp_handles_both_wire_shapes_without_narrowing_valid_tiers() {
-        for raw in ["none", "disable", "disabled", "off", " NONE ", "OFF"] {
+        for raw in [
+            "none",
+            "disable",
+            "disabled",
+            "off",
+            " NONE ",
+            "\tDisAble\n",
+            " Disabled ",
+            "OFF",
+            "  oFf\t",
+        ] {
             let mut body = json!({
                 "reasoning_effort": raw,
                 "reasoning": {"effort": raw, "summary": "auto"}
@@ -389,7 +403,17 @@ mod tests {
             clamp_off_effort_to_low(&mut body);
             assert_eq!(body, once, "clamp must be idempotent");
         }
-        for raw in ["low", "medium", "high", "xhigh", "max", "future-value"] {
+        for raw in [
+            "low",
+            "minimal",
+            "medium",
+            "high",
+            "xhigh",
+            "max",
+            "future-value",
+            " Low ",
+            "",
+        ] {
             let mut body = json!({"reasoning_effort": raw, "reasoning": {"effort": raw}});
             let original = body.clone();
             clamp_off_effort_to_low(&mut body);
@@ -398,10 +422,16 @@ mod tests {
         for mut body in [
             json!(null),
             json!([]),
+            json!("none"),
             json!({}),
             json!({"reasoning": {"summary": "auto"}}),
             json!({"reasoning_effort": null, "reasoning": {"effort": 3}}),
+            json!({"reasoning_effort": 3, "reasoning": {"effort": null}}),
+            json!({"reasoning_effort": false, "reasoning": {"effort": true}}),
+            json!({"reasoning_effort": [], "reasoning": {"effort": {"value": "none"}}}),
+            json!({"reasoning_effort": {"effort": "none"}, "reasoning": []}),
             json!({"reasoning": "none"}),
+            json!({"reasoning": null}),
         ] {
             let original = body.clone();
             clamp_off_effort_to_low(&mut body);
@@ -410,6 +440,34 @@ mod tests {
                 "missing/malformed directives stay untouched"
             );
         }
+    }
+
+    #[test]
+    fn off_clamp_preserves_siblings_and_opaque_payloads() {
+        let original = json!({
+            "model": "unknown-model",
+            "reasoning_effort": "disabled",
+            "reasoning": {"effort": " NONE ", "summary": "auto", "vendor_option": "none"},
+            "input": [{"type": "message", "content": [{
+                "type": "input_text", "text": "none", "reasoning_effort": "off"
+            }]}],
+            "tools": [{
+                "type": "function", "name": "lookup",
+                "parameters": {"type": "object", "properties": {
+                    "reasoning": {"const": {"effort": "none"}},
+                    "reasoning_effort": {"enum": ["none", "off"]}
+                }}
+            }],
+            "metadata": {"reasoning": {"effort": "none"}}
+        });
+        let mut body = original.clone();
+        clamp_off_effort_to_low(&mut body);
+        let mut expected = original;
+        expected["reasoning_effort"] = json!("low");
+        expected["reasoning"]["effort"] = json!("low");
+        assert_eq!(body, expected, "only the two directive slots may change");
+        clamp_off_effort_to_low(&mut body);
+        assert_eq!(body, expected, "a second clamp must be a no-op");
     }
 
     #[test]

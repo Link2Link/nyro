@@ -409,6 +409,22 @@ fn is_thinking_model(body_model: &str) -> bool {
     is_claude_55_model(body_model) || is_thinking_mandatory_model(body_model)
 }
 
+/// Provider-wide OpenAI policy uses identity, not a model/channel/protocol guess.
+/// An explicit vendor wins over stale preset metadata; only legacy rows without
+/// a nonempty vendor may fall back to the OpenAI preset.
+fn is_openai_effort_provider(provider: &Provider) -> bool {
+    if crate::provider::nyro_gateway::is_nyro_gateway(provider) {
+        return false;
+    }
+    provider
+        .vendor
+        .as_deref()
+        .map(str::trim)
+        .filter(|vendor| !vendor.is_empty())
+        .or_else(|| provider.preset_key.as_deref().map(str::trim))
+        .is_some_and(|vendor| vendor.eq_ignore_ascii_case("openai"))
+}
+
 pub(crate) fn apply_vendor_effort_policy(body: &mut Value, provider: &Provider) {
     let vendor_id = provider
         .vendor
@@ -416,9 +432,9 @@ pub(crate) fn apply_vendor_effort_policy(body: &mut Value, provider: &Provider) 
         .map(str::trim)
         .filter(|v| !v.is_empty())
         .unwrap_or_default();
-    // grok 判定优先看请求体里的实际模型名：中继型 provider（如 sub2api、
-    // 国模组合）的 vendor 字段是 custom，但转发的模型仍以 grok- 开头。
-    // 模型名是跨中继最稳定的信号，比 vendor 字段可靠。
+    // Registered model policies use the actual wire model after route aliasing.
+    // Custom relays may carry grok-* even without vendor=xai, but an explicit
+    // OpenAI provider policy below wins over a misleading model name.
     let body_model = body
         .get("model")
         .and_then(Value::as_str)
@@ -433,7 +449,14 @@ pub(crate) fn apply_vendor_effort_policy(body: &mut Value, provider: &Provider) 
     }
     let is_grok = vendor_id.eq_ignore_ascii_case("xai")
         || body_model.trim().to_ascii_lowercase().starts_with("grok-");
-    if is_grok {
+    if is_openai_effort_provider(provider) {
+        // User-requested OpenAI provider defense, across every model/channel
+        // (API key, Codex OAuth, sub2api, and future channels). This is not a
+        // protocol-wide assertion about which upstream models accept none.
+        // Explicit provider identity precedes model-name fallback rules so
+        // non-off tiers remain untouched even for misleading grok/GLM names.
+        super::effort_policy::clamp_off_effort_to_low(body);
+    } else if is_grok {
         super::effort_policy::drop_grok_effort(body);
     } else if body_model.trim().eq_ignore_ascii_case("gpt-6-astra") {
         // Live Codex rejection, request bcd2a3ed-af4b-44d7-8b94-3c7c29876396:
@@ -3465,6 +3488,447 @@ mod tests {
             out.body["generationConfig"]["temperature"], 0.7,
             "sibling generationConfig keys must survive",
         );
+    }
+
+    /// Bootstrap on an undriven, isolated runtime, then cancel queued startup
+    /// jobs before returning. These wire-only regressions must never contact
+    /// models.dev, OAuth endpoints, or any configured provider.
+    fn offline_effort_gateway() -> Gateway {
+        std::thread::spawn(|| {
+            use std::future::Future;
+            use std::task::{Context, Poll};
+
+            let bootstrap = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("offline bootstrap runtime");
+            let result = {
+                let _entered = bootstrap.enter();
+                let storage =
+                    std::sync::Arc::new(crate::storage::MemoryStorage::new(vec![], vec![], vec![]));
+                let mut constructor = Box::pin(Gateway::from_storage(
+                    GatewayConfig {
+                        config_poll_interval: std::time::Duration::ZERO,
+                        ..Default::default()
+                    },
+                    storage,
+                ));
+                let mut context = Context::from_waker(futures::task::noop_waker_ref());
+                match constructor.as_mut().poll(&mut context) {
+                    Poll::Ready(result) => result,
+                    Poll::Pending => {
+                        panic!("offline gateway yielded; refusing to drive startup jobs")
+                    }
+                }
+            };
+            drop(bootstrap);
+            let (gateway, _logs) = result.expect("offline gateway construction");
+            gateway
+        })
+        .join()
+        .expect("offline bootstrap thread")
+    }
+
+    fn openai_effort_provider(channel: Option<&str>) -> Provider {
+        let mut provider = provider_with_vendor("local-test-only", Some("openai"));
+        provider.preset_key = Some("openai".into());
+        provider.channel = channel.map(str::to_string);
+        if channel == Some("codex") {
+            provider.auth_mode = "oauth".into();
+            provider.api_key.clear();
+        }
+        provider
+    }
+
+    #[test]
+    fn openai_effort_policy_uses_vendor_then_missing_vendor_preset_fallback() {
+        for (vendor, preset_key, should_clamp) in [
+            (Some("openai"), None, true),
+            (Some(" OPENAI "), Some("custom"), true),
+            (Some("openai"), Some("zhipuai"), true),
+            (Some("openai"), Some("nyro-gateway"), false),
+            (Some(" OPENAI "), Some(" NyRo-Gateway "), false),
+            (None, Some("openai"), true),
+            (Some(""), Some(" OPENAI "), true),
+            (Some(" \t\n"), Some("openai"), true),
+            (Some("custom"), Some("openai"), false),
+            (Some("zhipuai"), Some("openai"), false),
+            (Some("codex"), Some("openai"), false),
+            (Some("nyro-gateway"), Some("openai"), false),
+            (None, None, false),
+            (Some(""), Some(""), false),
+            (None, Some("custom"), false),
+            (None, Some("codex"), false),
+        ] {
+            let mut provider = provider_with_vendor("local-test-only", vendor);
+            provider.preset_key = preset_key.map(str::to_string);
+            assert_eq!(is_openai_effort_provider(&provider), should_clamp);
+            let mut body = serde_json::json!({
+                "model": "unknown-upstream-model",
+                "reasoning_effort": "none",
+                "reasoning": {"effort": "none", "summary": "auto"}
+            });
+            apply_vendor_effort_policy(&mut body, &provider);
+            let expected = if should_clamp { "low" } else { "none" };
+            assert_eq!(
+                body["reasoning_effort"], expected,
+                "vendor={vendor:?}, preset={preset_key:?}"
+            );
+            assert_eq!(body["reasoning"]["effort"], expected);
+            assert_eq!(body["reasoning"]["summary"], "auto");
+            let once = body.clone();
+            apply_vendor_effort_policy(&mut body, &provider);
+            assert_eq!(body, once, "vendor policy must be idempotent");
+        }
+    }
+
+    #[test]
+    fn openai_effort_policy_is_not_inferred_from_protocol_channel_or_model_prefix() {
+        for vendor in [
+            None,
+            Some("custom"),
+            Some("openrouter"),
+            Some("codex"),
+            Some("zhipuai"),
+        ] {
+            for channel in [None, Some("default"), Some("codex"), Some("sub2api")] {
+                let mut provider = provider_with_vendor("local-test-only", vendor);
+                provider.preset_key = None;
+                provider.channel = channel.map(str::to_string);
+                provider.protocol = "openai".into();
+                for model in ["gpt-6.1-sol", "gpt-6", "gpt-5", "o3", "unknown-model"] {
+                    let mut body = serde_json::json!({
+                        "model": model,
+                        "reasoning_effort": "none",
+                        "reasoning": {"effort": "none"}
+                    });
+                    let original = body.clone();
+                    apply_vendor_effort_policy(&mut body, &provider);
+                    assert_eq!(
+                        body, original,
+                        "vendor={vendor:?}, channel={channel:?}, model={model}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn openai_effort_policy_precedes_model_fallbacks_without_changing_other_vendors() {
+        let openai = openai_effort_provider(Some("codex"));
+        for model in [
+            "grok-4.6",
+            "glm-5.3",
+            "claude-sonnet-5-5",
+            "unregistered-model",
+        ] {
+            for (raw, expected) in [
+                ("none", "low"),
+                ("minimal", "minimal"),
+                ("medium", "medium"),
+                ("xhigh", "xhigh"),
+                ("max", "max"),
+            ] {
+                let mut body = serde_json::json!({
+                    "model": model,
+                    "reasoning_effort": raw,
+                    "reasoning": {"effort": raw}
+                });
+                apply_vendor_effort_policy(&mut body, &openai);
+                assert_eq!(body["reasoning_effort"], expected, "OpenAI {model}/{raw}");
+                assert_eq!(body["reasoning"]["effort"], expected);
+            }
+        }
+        for vendor in ["xai", "custom"] {
+            let provider = provider_with_vendor("local-test-only", Some(vendor));
+            let mut off = serde_json::json!({"model": "grok-4.6", "reasoning_effort": "none", "reasoning": {"effort": "off", "summary": "auto"}});
+            apply_vendor_effort_policy(&mut off, &provider);
+            assert!(off.get("reasoning_effort").is_none());
+            assert!(off["reasoning"].get("effort").is_none());
+            assert_eq!(off["reasoning"]["summary"], "auto");
+            let mut max = serde_json::json!({"model": "grok-4.6", "reasoning_effort": "max", "reasoning": {"effort": "max"}});
+            apply_vendor_effort_policy(&mut max, &provider);
+            assert_eq!(max["reasoning_effort"], "xhigh");
+            assert_eq!(max["reasoning"]["effort"], "xhigh");
+        }
+        let custom = provider_with_vendor("local-test-only", Some("custom"));
+        let mut glm = serde_json::json!({"model": "glm-5.3", "reasoning_effort": "medium", "reasoning": {"effort": "none"}});
+        apply_vendor_effort_policy(&mut glm, &custom);
+        assert_eq!(glm["reasoning_effort"], "high");
+        assert_eq!(glm["reasoning"]["effort"], "low");
+        for provider in [&openai, &custom] {
+            let mut claude = serde_json::json!({
+                "model": "claude-sonnet-5-5",
+                "thinking": {"type": "enabled", "budget_tokens": 16384, "display": "summarized"}
+            });
+            apply_vendor_effort_policy(&mut claude, provider);
+            assert_eq!(claude["thinking"]["type"], "adaptive");
+            assert_eq!(claude["thinking"]["display"], "summarized");
+            assert_eq!(claude["output_config"]["effort"], "max");
+        }
+    }
+
+    #[tokio::test]
+    async fn openai_provider_passthrough_clamps_off_across_channels_models_and_wire_shapes() {
+        let gw = offline_effort_gateway();
+        for channel in [
+            None,
+            Some("default"),
+            Some("codex"),
+            Some("sub2api"),
+            Some("future-channel"),
+        ] {
+            let provider = openai_effort_provider(channel);
+            // Includes a sanitized OpenAI Pro200/Codex gpt-6.1-sol incident and
+            // an unregistered model with no GPT prefix: identity alone gates.
+            for actual_model in ["gpt-6.1-sol", "unregistered-upstream-model"] {
+                for protocol in [OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1, OPENAI_RESPONSES_V1] {
+                    let ctx = ProviderCtx {
+                        protocol,
+                        disable_default_auth: channel == Some("codex"),
+                        ..openai_chat_ctx(&provider, &gw, actual_model)
+                    };
+                    for raw in [
+                        "none",
+                        "disable",
+                        "disabled",
+                        "off",
+                        " NONE ",
+                        "\tDisAble\n",
+                        " Disabled ",
+                        "OFF",
+                    ] {
+                        let mut body = if protocol == OPENAI_RESPONSES_V1 {
+                            serde_json::json!({
+                                "model": "grok-client-alias",
+                                "input": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "ping"}]}],
+                                "reasoning": {"effort": raw, "summary": "auto", "vendor_option": "none"},
+                                "store": false,
+                                "stream": true
+                            })
+                        } else {
+                            serde_json::json!({
+                                "model": "grok-client-alias",
+                                "messages": [{"role": "user", "content": "ping"}],
+                                "reasoning_effort": raw,
+                                "stream": true,
+                                "stream_options": {"include_usage": false}
+                            })
+                        };
+                        body["tools"] = serde_json::json!([{"type": "custom", "name": "opaque_tool", "format": {"type": "text"}, "metadata": {"reasoning_effort": "none"}}]);
+                        body["metadata"] = serde_json::json!({"reasoning": {"effort": "none"}});
+                        let mut expected = body.clone();
+                        expected["model"] = serde_json::json!(actual_model);
+                        if protocol == OPENAI_RESPONSES_V1 {
+                            expected["reasoning"]["effort"] = serde_json::json!("low");
+                        } else {
+                            expected["reasoning_effort"] = serde_json::json!("low");
+                        }
+                        let out = passthrough_run(&FakeBearerVendor, body, &ctx, true)
+                            .await
+                            .expect("offline OpenAI passthrough");
+                        assert_eq!(
+                            out.body, expected,
+                            "{channel:?}/{actual_model}/{protocol:?}/{raw:?}"
+                        );
+                        let twice = passthrough_run(&FakeBearerVendor, out.body, &ctx, true)
+                            .await
+                            .expect("idempotent OpenAI passthrough");
+                        assert_eq!(twice.body, expected);
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn openai_provider_passthrough_preserves_nonoff_missing_and_malformed_effort() {
+        let gw = offline_effort_gateway();
+        let provider = openai_effort_provider(Some("codex"));
+        for protocol in [OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1, OPENAI_RESPONSES_V1] {
+            let ctx = ProviderCtx {
+                protocol,
+                disable_default_auth: true,
+                ..openai_chat_ctx(&provider, &gw, "unregistered-model")
+            };
+            let mut cases = vec![
+                serde_json::json!({}),
+                serde_json::json!({"reasoning": {"summary": "auto"}}),
+                serde_json::json!({"reasoning": null}),
+                serde_json::json!({"reasoning": "none"}),
+                serde_json::json!({"reasoning": []}),
+            ];
+            for raw in [
+                serde_json::json!(null),
+                serde_json::json!(false),
+                serde_json::json!(3),
+                serde_json::json!([]),
+                serde_json::json!({"effort": "none"}),
+            ] {
+                cases.push(serde_json::json!({"reasoning_effort": raw, "reasoning": {"effort": raw, "summary": "auto"}}));
+            }
+            for raw in [
+                "low",
+                "minimal",
+                "medium",
+                "high",
+                "xhigh",
+                "max",
+                "future-value",
+                " Low ",
+                "",
+            ] {
+                cases.push(serde_json::json!({"reasoning_effort": raw, "reasoning": {"effort": raw, "summary": "auto"}}));
+            }
+            for mut body in cases {
+                body["model"] = serde_json::json!("client-alias");
+                body["input"] = serde_json::json!("ping");
+                body["messages"] = serde_json::json!([{"role": "user", "content": "ping"}]);
+                let mut expected = body.clone();
+                expected["model"] = serde_json::json!(ctx.actual_model);
+                let out = passthrough_run(&FakeBearerVendor, body, &ctx, false)
+                    .await
+                    .expect("offline passthrough with untouched effort");
+                assert_eq!(out.body, expected, "{protocol:?}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn openai_provider_build_request_clamps_none_after_actual_model_and_preserves_tiers() {
+        let gw = offline_effort_gateway();
+        for channel in [None, Some("default"), Some("codex"), Some("sub2api")] {
+            let provider = openai_effort_provider(channel);
+            for actual_model in ["gpt-6.1-sol", "unregistered-upstream-model"] {
+                for protocol in [OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1, OPENAI_RESPONSES_V1] {
+                    let ctx = ProviderCtx {
+                        protocol,
+                        disable_default_auth: channel == Some("codex"),
+                        ..openai_chat_ctx(&provider, &gw, actual_model)
+                    };
+                    for (effort, expected) in [
+                        (None, None),
+                        (Some(ReasoningEffort::None), Some("low")),
+                        (Some(ReasoningEffort::Minimal), Some("minimal")),
+                        (Some(ReasoningEffort::Low), Some("low")),
+                        (Some(ReasoningEffort::Medium), Some("medium")),
+                        (Some(ReasoningEffort::High), Some("high")),
+                        (Some(ReasoningEffort::Xhigh), Some("xhigh")),
+                        (Some(ReasoningEffort::Max), Some("max")),
+                    ] {
+                        let mut req = minimal_chat_request();
+                        req.model = "grok-client-alias".into();
+                        req.reasoning.effort = effort;
+                        req.reasoning.display = Some("auto".into());
+                        let out = build_request(&FakeBearerVendor, &mut req, &ctx)
+                            .await
+                            .expect("offline OpenAI build_request");
+                        let slot = if protocol == OPENAI_RESPONSES_V1 {
+                            "/reasoning/effort"
+                        } else {
+                            "/reasoning_effort"
+                        };
+                        assert_eq!(
+                            out.body.pointer(slot).and_then(Value::as_str),
+                            expected,
+                            "{channel:?}/{actual_model}/{protocol:?}"
+                        );
+                        assert_eq!(out.body["model"], actual_model);
+                        assert_eq!(req.model, actual_model);
+                        if protocol == OPENAI_RESPONSES_V1 {
+                            assert_eq!(out.body["reasoning"]["summary"], "auto");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn openai_provider_force_max_precedes_off_clamp_on_passthrough_and_build_request() {
+        let gw = offline_effort_gateway();
+        for channel in [Some("default"), Some("codex"), Some("sub2api")] {
+            let provider = openai_effort_provider(channel);
+            for protocol in [OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1, OPENAI_RESPONSES_V1] {
+                let ctx = ProviderCtx {
+                    protocol,
+                    force_max_reasoning: true,
+                    disable_default_auth: channel == Some("codex"),
+                    ..openai_chat_ctx(&provider, &gw, "unregistered-model")
+                };
+                let slot = if protocol == OPENAI_RESPONSES_V1 {
+                    "/reasoning/effort"
+                } else {
+                    "/reasoning_effort"
+                };
+                let body = if protocol == OPENAI_RESPONSES_V1 {
+                    serde_json::json!({"input": "ping", "reasoning": {"effort": "none", "summary": "auto"}})
+                } else {
+                    serde_json::json!({"messages": [{"role": "user", "content": "ping"}], "reasoning_effort": "none"})
+                };
+                let out = passthrough_run(&FakeBearerVendor, body, &ctx, false)
+                    .await
+                    .expect("forced max passthrough");
+                assert_eq!(out.body.pointer(slot), Some(&serde_json::json!("max")));
+                if protocol == OPENAI_RESPONSES_V1 {
+                    assert_eq!(out.body["reasoning"]["summary"], "auto");
+                }
+                let mut req = minimal_chat_request();
+                req.reasoning.effort = Some(ReasoningEffort::None);
+                // Mirrors dispatcher precedence for IR/compat construction.
+                force_max_reasoning_ir(&mut req);
+                let out = build_request(&FakeBearerVendor, &mut req, &ctx)
+                    .await
+                    .expect("forced max build_request");
+                assert_eq!(out.body.pointer(slot), Some(&serde_json::json!("max")));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn openai_provider_passthrough_does_not_clamp_foreign_vendors_or_nyro_relay() {
+        let gw = offline_effort_gateway();
+        for vendor in [
+            Some("custom"),
+            Some("zhipuai"),
+            Some("codex"),
+            Some("nyro-gateway"),
+        ] {
+            let mut provider = provider_with_vendor("local-test-only", vendor);
+            // A stale OpenAI preset and consumer-channel name cannot overrule
+            // an explicit non-OpenAI provider, including a remote Nyro hop.
+            provider.preset_key = Some("openai".into());
+            provider.channel = Some("codex".into());
+            for protocol in [OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1, OPENAI_RESPONSES_V1] {
+                let ctx = ProviderCtx {
+                    protocol,
+                    ..openai_chat_ctx(&provider, &gw, "gpt-6.1-sol")
+                };
+                let body = if protocol == OPENAI_RESPONSES_V1 {
+                    serde_json::json!({"model": "client-alias", "input": "ping", "reasoning": {"effort": "none", "summary": "auto"}})
+                } else {
+                    serde_json::json!({"model": "client-alias", "messages": [{"role": "user", "content": "ping"}], "reasoning_effort": "none"})
+                };
+                let mut expected = body.clone();
+                expected["model"] = serde_json::json!(ctx.actual_model);
+                let out = passthrough_run(&FakeBearerVendor, body, &ctx, false)
+                    .await
+                    .expect("foreign vendor passthrough");
+                assert_eq!(out.body, expected, "vendor={vendor:?}/{protocol:?}");
+            }
+        }
+        let mut relay = openai_effort_provider(Some("default"));
+        relay.preset_key = Some("nyro-gateway".into());
+        let ctx = responses_ctx_model(&relay, &gw, "gpt-6.1-sol");
+        let out = passthrough_run(
+            &FakeBearerVendor,
+            serde_json::json!({"input": "ping", "reasoning": {"effort": "none"}}),
+            &ctx,
+            false,
+        )
+        .await
+        .expect("Nyro relay policy remains remote-owned");
+        assert_eq!(out.body["reasoning"]["effort"], "none");
     }
 
     /// Sanitized reproduction of bcd2a3ed-af4b-44d7-8b94-3c7c29876396:

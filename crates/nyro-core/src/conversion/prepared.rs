@@ -145,6 +145,7 @@ async fn prepare_raw_wire(
     let vendor_patch =
         value_patch(vendor_wire_before, &native_body).map_err(CompatError::InvalidRequestJson)?;
     if let Some(patch) = vendor_patch {
+        let patch = reasoning_floor_patch(patch, &prepared.body)?;
         prepared.body = engine.apply_json_patch(prepared.body, patch)?;
     }
 
@@ -154,6 +155,38 @@ async fn prepare_raw_wire(
         force_upstream_stream: prepared.force_upstream_stream,
         session: PreparedSession::RawWireCompat(Box::new(prepared.session)),
     })
+}
+
+/// A paired transform may omit the entire Responses reasoning object for a
+/// model it does not recognize as reasoning-capable. The native preview can
+/// still carry `none`, so its vendor floor is a nested `effort = low` patch.
+/// Restore only that missing parent, not unrelated native-preview fields. An
+/// existing object (including opaque siblings) or malformed parent is untouched.
+fn reasoning_floor_patch(patch: Bytes, converted: &[u8]) -> Result<Bytes, CompatError> {
+    let mut operations: Vec<Value> = serde_json::from_slice(&patch)
+        .map_err(|e| CompatError::InvalidRequestJson(e.to_string()))?;
+    if !operations.iter().any(|operation| {
+        operation["op"] == "set"
+            && operation["path"] == serde_json::json!(["reasoning", "effort"])
+            && operation["value"] == "low"
+    }) {
+        return Ok(patch);
+    }
+    let body: Value = serde_json::from_slice(converted)
+        .map_err(|e| CompatError::InvalidRequestJson(e.to_string()))?;
+    if body
+        .as_object()
+        .is_none_or(|object| object.contains_key("reasoning"))
+    {
+        return Ok(patch);
+    }
+    operations.insert(
+        0,
+        serde_json::json!({"op": "set", "path": ["reasoning"], "value": {}}),
+    );
+    serde_json::to_vec(&operations)
+        .map(Bytes::from)
+        .map_err(|e| CompatError::InvalidRequestJson(e.to_string()))
 }
 
 pub(crate) fn rebuild_raw_wire_request(
@@ -316,6 +349,56 @@ mod tests {
             value["reasoning_effort"], "max",
             "force-max rewrite must ride the vendor patch onto the compat body",
         );
+    }
+
+    #[test]
+    fn raw_wire_reasoning_floor_restores_only_a_missing_parent() {
+        let engine = CompatEngine::default();
+        let floor = value_patch(
+            &json!({"reasoning": {"effort": "none"}}),
+            &json!({"reasoning": {"effort": "low"}}),
+        )
+        .unwrap()
+        .unwrap();
+        for original in [
+            json!({"model": "arbitrary-model", "input": "ping", "opaque": {"effort": "none"}}),
+            json!({"reasoning": {"effort": "none", "summary": "auto", "opaque": "preserve"}}),
+        ] {
+            let raw = Bytes::from(serde_json::to_vec(&original).unwrap());
+            let patch = reasoning_floor_patch(floor.clone(), &raw).unwrap();
+            let result = engine.apply_json_patch(raw, patch).unwrap();
+            let result: Value = serde_json::from_slice(&result).unwrap();
+            let mut expected = original;
+            if expected.get("reasoning").is_none() {
+                expected["reasoning"] = json!({});
+            }
+            expected["reasoning"]["effort"] = json!("low");
+            assert_eq!(result, expected);
+        }
+        for malformed in [Value::Null, json!([]), json!("none"), json!(3)] {
+            let raw = Bytes::from(serde_json::to_vec(&json!({"reasoning": malformed})).unwrap());
+            let patch = reasoning_floor_patch(floor.clone(), &raw).unwrap();
+            assert_eq!(
+                patch, floor,
+                "existing malformed parents must not be coerced"
+            );
+            assert!(engine.apply_json_patch(raw, patch).is_err());
+        }
+    }
+
+    #[test]
+    fn raw_wire_reasoning_floor_does_not_create_arbitrary_patch_parents() {
+        let raw = br#"{"input":"ping"}"#;
+        for patch in [
+            json!([{ "op": "set", "path": ["reasoning", "effort"], "value": "high" }]),
+            json!([{ "op": "remove", "path": ["reasoning", "effort"] }]),
+            json!([{ "op": "set", "path": ["metadata", "effort"], "value": "low" }]),
+            json!([{ "op": "set", "path": ["reasoning", "other", "effort"], "value": "low" }]),
+            json!([{ "op": "set", "path": ["reasoning"], "value": {"effort": "low"} }]),
+        ] {
+            let patch = Bytes::from(serde_json::to_vec(&patch).unwrap());
+            assert_eq!(reasoning_floor_patch(patch.clone(), raw).unwrap(), patch);
+        }
     }
 
     #[tokio::test]

@@ -4,6 +4,17 @@ All notable changes to Nyro will be documented in this file.
 
 ---
 
+## v2.1.34
+
+> Released on 2026-11-06
+
+#### Fixes
+
+- **OpenAI provider-wide reasoning floor**: every model under an explicitly identified OpenAI provider now sends explicit `none` reasoning effort as `low`, covering default API, Codex and Sub2API channels instead of only the previously verified Astra model. The wire-level guard also recognizes off aliases while leaving non-off tiers and missing or malformed directives untouched. Native Chat/Responses, native IR conversion and Raw-Wire Compat carry the same floor; explicit maximum-reasoning route overrides keep precedence. Other OpenAI-compatible providers and Nyro relays do not inherit this provider policy, and existing vendor/model-specific rules remain available.
+- **Safe compatibility patching and regression coverage**: when a paired Responses transform omits the entire reasoning object for an unrecognized model, the exact `reasoning.effort=low` vendor patch now creates only the missing parent rather than failing or losing the floor. Existing reasoning siblings, malformed parent values, replay content and tool schemas are not broadly rewritten. Added offline unit and real-dispatch loopback regressions across five paths, streaming/buffered clients, Sol and arbitrary model names, provider identity boundaries, supported tiers, route overrides and opaque replay. No database migration, automatic deployment or provider configuration change is included.
+
+---
+
 ## v2.1.33
 
 > Released on 2026-11-05
