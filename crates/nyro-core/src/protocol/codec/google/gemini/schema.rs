@@ -5,6 +5,7 @@
 //! catalogs and unsupported non-composition keywords are retained here. Only
 //! referenced definitions are interpreted; unused catalogs are inert data.
 
+use std::collections::BTreeSet;
 use std::error::Error;
 use std::fmt;
 
@@ -309,24 +310,35 @@ impl<'a> Lowerer<'a> {
                 lowered_branches.push(branch);
             }
 
-            if lowered_branches.iter().all(string_singleton) {
-                // Preserve the historical finite-enum lowering, including its
-                // conservative annotation/constraint and nullable checks.
-                let mut constants = Vec::new();
+            if lowered_branches.iter().all(finite_string_enum) {
+                // Pairwise-disjoint finite domains prove oneOf is their union,
+                // even when the explicit types overlap. Consts and references
+                // have already been lowered, and every original value budgeted.
+                let mut union = Vec::new();
+                let mut accepted_values = BTreeSet::new();
                 let mut common_constraints: Option<Map<String, Value>> = None;
                 for (index, mut branch) in lowered_branches.into_iter().enumerate() {
                     let branch_path = child(&one_of_path, &index.to_string());
                     branch.remove("type");
-                    let Some(Value::Array(mut values)) = branch.remove("enum") else {
-                        unreachable!("string singleton checked above")
+                    let Some(Value::Array(values)) = branch.remove("enum") else {
+                        unreachable!("finite string enum checked above")
                     };
-                    let constant = values.remove(0);
-                    if constants.contains(&constant) {
-                        return Err(reject(
-                            &branch_path,
-                            "duplicate oneOf constants are not equivalent to an enum",
-                        ));
+                    let mut branch_values = BTreeSet::new();
+                    for value in values {
+                        let text = value.as_str().expect("string enum checked above");
+                        if accepted_values.contains(text) {
+                            return Err(reject(
+                                &branch_path,
+                                "overlapping oneOf enum values (duplicate oneOf alternatives) are not equivalent to an enum",
+                            ));
+                        }
+                        // Enum has set semantics within a branch. Only values
+                        // shared by different oneOf branches break exclusivity.
+                        if branch_values.insert(text.to_owned()) {
+                            union.push(value);
+                        }
                     }
+                    accepted_values.extend(branch_values);
                     // Identical residual constraints/annotations may be
                     // hoisted; branch-specific data must never be discarded.
                     match &common_constraints {
@@ -339,13 +351,14 @@ impl<'a> Lowerer<'a> {
                         None => common_constraints = Some(branch),
                         _ => {}
                     }
-                    constants.push(constant);
                 }
                 let mut alternatives = common_constraints.expect("nonempty branches checked above");
                 reject_nullable_constant(&alternatives, &one_of_path)?;
                 reject_nullable_constant(&siblings, path)?;
+                // Move the visited values to a shallower, smaller schema; no
+                // expansion or unaccounted generated child nodes are needed.
                 alternatives.insert("type".into(), Value::String("string".into()));
-                alternatives.insert("enum".into(), Value::Array(constants));
+                alternatives.insert("enum".into(), Value::Array(union));
                 siblings = merge(siblings, alternatives, &one_of_path)?;
             } else {
                 // Explicit types give upper bounds on the values accepted by
@@ -539,9 +552,9 @@ fn object_intersection_branch(map: &Map<String, Value>) -> bool {
     }
 }
 
-fn string_singleton(map: &Map<String, Value>) -> bool {
+fn finite_string_enum(map: &Map<String, Value>) -> bool {
     map.get("type").and_then(Value::as_str) == Some("string")
-        && matches!(map.get("enum"), Some(Value::Array(values)) if values.len() == 1 && values[0].is_string())
+        && matches!(map.get("enum"), Some(Value::Array(values)) if !values.is_empty() && values.iter().all(Value::is_string))
 }
 
 fn nullable(map: &Map<String, Value>, path: &str) -> LoweringResult<bool> {
@@ -1274,9 +1287,11 @@ mod tests {
         }));
         assert_eq!(output["enum"], json!(["b", "a"]));
         assert!(output.get("anyOf").is_none());
-        rejects(
-            json!({"oneOf": [{"type": "string", "enum": ["a", "b"]}, {"type": "string", "enum": ["c", "d"]}]}),
-            "overlapping explicit types",
+        assert_eq!(
+            lowered(
+                json!({"oneOf": [{"type": "string", "enum": ["a", "b"]}, {"type": "string", "enum": ["c", "d"]}]})
+            ),
+            json!({"type": "string", "enum": ["a", "b", "c", "d"]})
         );
         rejects(
             json!({"oneOf": [{"type": "string", "enum": ["a"], "nullable": true}, {"type": "string", "enum": ["b"], "nullable": true}]}),
@@ -1285,6 +1300,268 @@ mod tests {
         rejects(
             json!({"nullable": "true", "oneOf": [{"const": "a"}, {"const": "b"}]}),
             "nullable must be a boolean",
+        );
+    }
+
+    #[test]
+    fn one_of_finite_string_enums_lower_permission_request_fixture() {
+        let branches = vec![
+            json!({"type": "string", "enum": ["read-only", "workspace-write", "danger-full-access"]}),
+            json!({"type": "string", "const": ""}),
+        ];
+        for branches in [branches.clone(), branches.into_iter().rev().collect()] {
+            let expected: Vec<Value> = branches
+                .iter()
+                .flat_map(|branch| {
+                    branch
+                        .get("enum")
+                        .and_then(Value::as_array)
+                        .cloned()
+                        .unwrap_or_else(|| vec![branch["const"].clone()])
+                })
+                .collect();
+            let output = lowered(json!({
+                "type": "object",
+                "properties": {"permission": {
+                    "description": "Execution permission; an empty string keeps the current setting.",
+                    "default": "",
+                    "oneOf": branches
+                }},
+                "required": ["permission"]
+            }));
+            assert_eq!(
+                output,
+                json!({
+                    "type": "object",
+                    "properties": {"permission": {
+                        "description": "Execution permission; an empty string keeps the current setting.",
+                        "default": "",
+                        "type": "string", "enum": expected
+                    }},
+                    "required": ["permission"]
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn one_of_finite_string_enums_preserve_shared_constraints_and_sibling_intersections() {
+        let output = lowered(json!({
+            "type": "string", "enum": ["b", "c", "outside"],
+            "oneOf": [
+                {"type": "string", "enum": ["a", "b"], "pattern": "^[a-d]$", "description": "Shared", "default": "b", "nullable": false},
+                {"type": "string", "enum": ["c", "d"], "pattern": "^[a-d]$", "description": "Shared", "default": "b", "nullable": false}
+            ]
+        }));
+        assert_eq!(
+            output,
+            json!({
+                "type": "string", "enum": ["b", "c"], "pattern": "^[a-d]$",
+                "description": "Shared", "default": "b", "nullable": false
+            })
+        );
+        rejects(
+            json!({
+                "enum": ["outside"], "oneOf": [
+                    {"type": "string", "enum": ["a", "b"]}, {"const": "c"}
+                ]
+            }),
+            "empty intersection",
+        );
+    }
+
+    #[test]
+    fn one_of_finite_string_enums_lower_refs_and_nested_unions_before_proving_disjointness() {
+        let output = lowered(json!({
+            "$defs": {
+                "permissions": {"type": "string", "enum": ["read-only", "workspace-write"]},
+                "empty": {"const": ""}
+            },
+            "properties": {"permission": {"oneOf": [
+                {"$ref": "#/$defs/permissions"},
+                {"oneOf": [{"const": "danger-full-access"}, {"ref": "#/$defs/empty"}]}
+            ]}}
+        }));
+        assert_eq!(
+            output["properties"]["permission"],
+            json!({
+                "type": "string", "enum": ["read-only", "workspace-write", "danger-full-access", ""]
+            })
+        );
+        assert!(
+            output.get("$defs").is_some(),
+            "definition catalogs are still cleanup-owned"
+        );
+        let narrowed = lowered(json!({
+            "$defs": {
+                "left": {"type": "string", "enum": ["a", "b"]},
+                "right": {"type": "string", "enum": ["b", "c"]}
+            },
+            "oneOf": [{"$ref": "#/$defs/left", "enum": ["a"]}, {"$ref": "#/$defs/right"}]
+        }));
+        assert_eq!(narrowed["enum"], json!(["a", "b", "c"]));
+        assert_eq!(
+            lowered(json!({"oneOf": [
+                {"type": "string", "enum": ["a", "b"]}, {"type": "object"}
+            ]})),
+            json!({"anyOf": [
+                {"type": "string", "enum": ["a", "b"]}, {"type": "object"}
+            ]})
+        );
+    }
+
+    #[test]
+    fn one_of_finite_string_enums_deduplicate_within_branches_but_reject_cross_branch_overlap() {
+        assert_eq!(
+            lowered(json!({"oneOf": [
+                {"type": "string", "enum": ["a", "a", "b"]},
+                {"type": "string", "enum": ["c", "c"]}
+            ]})),
+            json!({"type": "string", "enum": ["a", "b", "c"]})
+        );
+        for branches in [
+            json!([{"type": "string", "enum": ["a", "b"]}, {"const": "b"}]),
+            json!([{"type": "string", "enum": ["a", "b"]}, {"type": "string", "enum": ["b", "c"]}]),
+            json!([{"type": "string", "enum": ["a", "b"]}, {"type": "string", "enum": ["a", "b"]}]),
+        ] {
+            let error = rejects(
+                json!({"properties": {"a/b~c": {"oneOf": branches}}}),
+                "overlapping oneOf enum values",
+            );
+            assert_eq!(error.path, "#/properties/a~1b~0c/oneOf/1");
+        }
+        let error = rejects(
+            json!({"oneOf": [
+                {"type": "string", "enum": ["a", "b"]}, {"const": "c"}, {"const": "a"}
+            ]}),
+            "overlapping oneOf enum values",
+        );
+        assert_eq!(error.path, "#/oneOf/2");
+    }
+
+    #[test]
+    fn one_of_finite_string_enums_keep_conservative_constraint_and_nullable_rejections() {
+        for (key, first, second) in [
+            ("description", json!("First"), json!("Second")),
+            ("pattern", json!("^a"), json!("^b")),
+            ("default", json!("a"), json!("b")),
+            ("nullable", json!(false), json!(true)),
+        ] {
+            let mut first_branch = json!({"type": "string", "enum": ["a", "aa"]});
+            let mut second_branch = json!({"type": "string", "enum": ["b", "bb"]});
+            first_branch[key] = first;
+            second_branch[key] = second;
+            rejects(
+                json!({"oneOf": [first_branch, second_branch]}),
+                "differing constraints or annotations",
+            );
+        }
+        for nullable in [json!(true), json!("true"), json!(null)] {
+            let reason = if nullable == true {
+                "nullable string constants"
+            } else {
+                "nullable must be a boolean"
+            };
+            rejects(
+                json!({"nullable": nullable, "oneOf": [
+                    {"type": "string", "enum": ["a", "b"]}, {"const": "c"}
+                ]}),
+                reason,
+            );
+            rejects(
+                json!({"oneOf": [
+                    {"type": "string", "enum": ["a", "b"], "nullable": nullable},
+                    {"type": "string", "enum": ["c", "d"], "nullable": nullable}
+                ]}),
+                reason,
+            );
+        }
+        for invalid_enum in [json!([]), json!(["a", 1]), json!([null]), json!("a")] {
+            rejects(
+                json!({"oneOf": [
+                    {"type": "string", "enum": invalid_enum}, {"const": "b"}
+                ]}),
+                "overlapping explicit types",
+            );
+        }
+        rejects(
+            json!({"oneOf": [
+                {"enum": ["a", "b"]}, {"const": "c"}
+            ]}),
+            "supported explicit atomic JSON type",
+        );
+    }
+
+    #[test]
+    fn one_of_finite_string_enums_match_exactly_one_branch_for_all_small_value_sets() {
+        let values = ["", "a", "b"];
+        for first_mask in 1..8 {
+            for second_mask in 1..8 {
+                let domain = |mask| {
+                    values
+                        .iter()
+                        .enumerate()
+                        .filter(|(index, _)| mask & (1 << index) != 0)
+                        .map(|(_, value)| *value)
+                        .collect::<Vec<_>>()
+                };
+                let first = domain(first_mask);
+                let second = domain(second_mask);
+                let schema = json!({"oneOf": [
+                    {"type": "string", "enum": first}, {"type": "string", "enum": second}
+                ]});
+                if first_mask & second_mask != 0 {
+                    rejects(schema, "overlapping oneOf enum values");
+                } else {
+                    let output = lowered(schema);
+                    let actual = output["enum"].as_array().unwrap();
+                    for candidate in [
+                        json!(""),
+                        json!("a"),
+                        json!("b"),
+                        json!("outside"),
+                        json!(null),
+                        json!(1),
+                    ] {
+                        let matches = candidate.as_str().map_or(0, |value| {
+                            usize::from(first.contains(&value))
+                                + usize::from(second.contains(&value))
+                        });
+                        assert_eq!(actual.contains(&candidate), matches == 1);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn one_of_finite_string_enums_respect_exact_depth_and_node_budgets() {
+        let union = json!({"oneOf": [
+            {"type": "string", "enum": ["a", "b"]}, {"type": "string", "enum": ["c", "d"]}
+        ]});
+        // oneOf + branch + enum + value consume four levels.
+        let mut at_limit = union.clone();
+        for _ in 0..MAX_DEPTH - 4 {
+            at_limit = json!({"items": at_limit});
+        }
+        let output = lowered(at_limit.clone());
+        let pointer = format!("{}/enum", "/items".repeat(MAX_DEPTH - 4));
+        assert_eq!(output.pointer(&pointer), Some(&json!(["a", "b", "c", "d"])));
+        rejects(json!({"items": at_limit}), "maximum lowering depth 64");
+
+        // root + default array + oneOf array + two (branch, type, enum, two values) = 13.
+        let at_limit =
+            json!({"default": vec![Value::Null; MAX_EXPANDED_NODES - 13], "oneOf": union["oneOf"]});
+        assert_eq!(lowered(at_limit)["enum"], json!(["a", "b", "c", "d"]));
+        rejects(
+            json!({"default": vec![Value::Null; MAX_EXPANDED_NODES - 12], "oneOf": union["oneOf"]}),
+            "maximum expanded node count 10000",
+        );
+        rejects(
+            json!({"oneOf": [
+                {"type": "string", "enum": vec!["a"; MAX_EXPANDED_NODES]}, {"const": "b"}
+            ]}),
+            "maximum expanded node count 10000",
         );
     }
 
