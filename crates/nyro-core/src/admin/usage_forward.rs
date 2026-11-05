@@ -28,7 +28,7 @@ use super::usage::{
 use super::usage_publication::{bucket_tiers_conflict, bucket_usage, effective_bucket_scheduling};
 use super::*;
 use crate::provider::nyro_gateway::usage::public_usage::PublicProviderUsage;
-use crate::quota_buckets::opaque_quota_id;
+use crate::quota_buckets::{google_display_buckets, opaque_quota_id};
 
 /// Reuse window for forwarded snapshots. Downstream monitors poll every five
 /// minutes, so one remote serves any number of them with at most one vendor
@@ -510,7 +510,22 @@ fn project_forwarded_entry(
                 visible.entry(*index).or_default().insert(route.clone());
                 choices.push(Some(effective_bucket_scheduling(usage, bucket)));
             } else {
-                unresolved.insert(route.clone());
+                if usage.kind == "google_subscription" {
+                    // Catalog observations can be displayed as unknown family
+                    // usage, but remain unknown admission evidence. Exact route
+                    // membership is still required before exposing a resource.
+                    let mut observed = primary
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, bucket)| bucket.models.iter().any(|id| id == model));
+                    if let Some((index, _)) = observed.next()
+                        && observed.next().is_none()
+                    {
+                        visible.entry(index).or_default().insert(route.clone());
+                    }
+                } else {
+                    unresolved.insert(route.clone());
+                }
                 // Preserve explicit owner/auth or shared/global denial, but do
                 // not borrow a sibling bucket as a model mapping.
                 choices.push(
@@ -524,15 +539,116 @@ fn project_forwarded_entry(
         }
         states.insert(route.clone(), choices);
     }
+    // Admission choices above always use exact raw bindings. Only the visible,
+    // authorized output rows are folded into model-family presentation cards.
+    // Unrelated/hidden routes must never acquire a sibling family's allowance.
+    let mut display = usage.clone();
+    let output: Vec<(crate::quota_buckets::QuotaBucket, BTreeSet<String>)> =
+        if usage.kind == "google_subscription" {
+            let mut source_ids: HashSet<_> = visible
+                .keys()
+                .map(|index| {
+                    let bucket = primary[*index];
+                    (bucket.scope_id.clone(), bucket.id.clone())
+                })
+                .collect();
+            let mut pending: Vec<_> = source_ids.iter().cloned().collect();
+            // Resource closures may contain another observed allowance; include
+            // its constraints, not its otherwise-hidden publication membership.
+            while let Some((scope, id)) = pending.pop() {
+                for resource in usage
+                    .quota_buckets
+                    .iter()
+                    .filter(|bucket| bucket.scope_id == scope && bucket.id == id)
+                {
+                    for reference in &resource.constraint_ids {
+                        let key = (scope.clone(), reference.clone());
+                        if source_ids.insert(key.clone()) {
+                            pending.push(key);
+                        }
+                    }
+                }
+            }
+            let visible_scopes: HashSet<_> = visible
+                .keys()
+                .map(|index| primary[*index].scope_id.as_str())
+                .collect();
+            for global in usage.quota_buckets.iter().filter(|bucket| {
+                bucket.is_global_constraint() && visible_scopes.contains(bucket.scope_id.as_str())
+            }) {
+                source_ids.insert((global.scope_id.clone(), global.id.clone()));
+            }
+            let visible_ids: HashSet<_> = visible
+                .keys()
+                .map(|index| {
+                    let source = primary[*index];
+                    (source.scope_id.clone(), source.id.clone())
+                })
+                .collect();
+            let scoped_sources: Vec<_> = usage
+                .quota_buckets
+                .iter()
+                .filter(|bucket| source_ids.contains(&(bucket.scope_id.clone(), bucket.id.clone())))
+                .cloned()
+                .map(|mut bucket| {
+                    if bucket.is_primary()
+                        && !visible_ids.contains(&(bucket.scope_id.clone(), bucket.id.clone()))
+                    {
+                        // A referenced admission resource is not authorization
+                        // to publish its unrelated model-family membership.
+                        bucket.binding.status = "window_constraint".into();
+                    }
+                    bucket
+                })
+                .collect();
+            display.quota_buckets = google_display_buckets(&scoped_sources);
+            display
+                .quota_buckets
+                .iter()
+                .filter(|bucket| bucket.is_primary())
+                .filter_map(|bucket| {
+                    let authorized = visible
+                        .iter()
+                        .filter(|(index, _)| {
+                            let source = primary[**index];
+                            source.scope_id == bucket.scope_id
+                                && source
+                                    .models
+                                    .iter()
+                                    .any(|model| bucket.models.contains(model))
+                        })
+                        .flat_map(|(_, visible_routes)| visible_routes.iter())
+                        .filter(|route| {
+                            routes.get(*route).is_some_and(|models| {
+                                models.iter().any(|model| bucket.models.contains(model))
+                            })
+                        })
+                        .cloned()
+                        .collect::<BTreeSet<_>>();
+                    (!authorized.is_empty()).then(|| (bucket.clone(), authorized))
+                })
+                .collect()
+        } else {
+            visible
+                .into_iter()
+                .map(|(index, routes)| (primary[index].clone(), routes))
+                .collect()
+        };
     let mut rows = Vec::new();
-    for (index, routes) in visible {
-        let bucket = primary[index];
-        let projected = bucket_usage(usage, bucket);
+    for (bucket, routes) in output {
+        let bucket = &bucket;
+        let projected = bucket_usage(&display, bucket);
         let mut row = entry.clone();
         row.id = projected.provider_id.clone();
         row.name = format!("{} · {}", entry.name, bucket.label);
         row.routes = routes.into_iter().collect();
-        row.status = ProviderUsageQueryStatus::Ok;
+        let known = bucket.is_resolved() && !bucket_tiers_conflict(&bucket.tiers);
+        row.status = if known {
+            ProviderUsageQueryStatus::Ok
+        } else {
+            ProviderUsageQueryStatus::Error
+        };
+        row.error = (!known).then(|| "Model-family quota observation is incomplete".into());
         row.usage = Some(PublicProviderUsage::from_usage(
             &projected,
             false,
@@ -1074,6 +1190,165 @@ mod tests {
             },
             api_price: Some(admin_price()),
         }
+    }
+
+    #[test]
+    fn google_forwarded_family_cards_fold_variants_after_exact_route_admission() {
+        let mut usage = snapshot("google", false);
+        usage.kind = "google_subscription".into();
+        usage.quota_buckets = vec![
+            bucket("flash-high", "gemini-3.8-flash-high", false),
+            bucket("flash-medium", "gemini-3.8-flash-medium", false),
+            bucket("PRIVATE-low", "gemini-3.8-flash-low", true),
+            bucket("argon-low", "gemini-4-argon-low", false),
+            bucket("argon-medium", "gemini-4-argon-medium", false),
+            bucket("argon-high", "gemini-4-argon-high", true),
+            bucket("PRIVATE-other", "unrelated-model", true),
+        ];
+        let entry = ForwardedProviderUsage {
+            id: "google".into(),
+            name: "Google AI Pro".into(),
+            vendor: Some("google".into()),
+            routes: Vec::new(),
+            status: ProviderUsageQueryStatus::Ok,
+            error: None,
+            usage: None,
+            usage_entry: None,
+        };
+        let routes = BTreeMap::from([
+            (
+                "flash".into(),
+                BTreeSet::from([
+                    "gemini-3.8-flash-high".into(),
+                    "gemini-3.8-flash-medium".into(),
+                ]),
+            ),
+            (
+                "argon".into(),
+                BTreeSet::from(["gemini-4-argon-low".into(), "gemini-4-argon-medium".into()]),
+            ),
+            (
+                "argon-blocked".into(),
+                BTreeSet::from(["gemini-4-argon-high".into()]),
+            ),
+        ]);
+        let (rows, states) = project_forwarded_entry(entry.clone(), &usage, &routes, false);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].name, "Google AI Pro · gemini-3.8-flash");
+        assert_eq!(rows[0].routes, ["flash"]);
+        assert_eq!(rows[1].routes, ["argon", "argon-blocked"]);
+        assert_eq!(
+            alternative_scheduling(&states["flash"]).status,
+            ProviderSchedulingStatus::Eligible
+        );
+        assert_eq!(
+            alternative_scheduling(&states["argon"]).status,
+            ProviderSchedulingStatus::Eligible
+        );
+        assert_eq!(
+            alternative_scheduling(&states["argon-blocked"]).status,
+            ProviderSchedulingStatus::QuotaExhausted
+        );
+        let wire = serde_json::to_string(&rows).unwrap();
+        for forbidden in [
+            "PRIVATE",
+            "unrelated-model",
+            "flash-low",
+            "api_price",
+            "scope_id",
+            "quota_buckets",
+        ] {
+            assert!(
+                !wire.contains(forbidden),
+                "leaked hidden source: {forbidden}"
+            );
+        }
+        // Removing a hidden sibling cannot change a visible family's identity.
+        usage
+            .quota_buckets
+            .retain(|bucket| !bucket.label.starts_with("PRIVATE"));
+        let (again, _) = project_forwarded_entry(entry, &usage, &routes, false);
+        assert_eq!(again[0].id, rows[0].id);
+        assert_eq!(again[1].id, rows[1].id);
+    }
+
+    #[test]
+    fn google_forwarding_referenced_hidden_allowance_is_a_constraint_not_a_published_sibling() {
+        let mut usage = snapshot("google", false);
+        usage.kind = "google_subscription".into();
+        let mut flash = bucket("flash", "gemini-3.8-flash-high", false);
+        flash.constraint_ids = vec!["PRIVATE-argon".into()];
+        let mut hidden = bucket("PRIVATE-argon", "gemini-4-argon-high", true);
+        hidden.constraint_ids = vec!["raw-child".into()];
+        // The snapshot has already passed registry admission: the applicable
+        // denial is present on the visible source before any display folding.
+        // Projection must retain that decision, not recompute route admission.
+        flash.scheduling = hidden.scheduling.clone();
+        let mut child = bucket("raw-child", "gemini-4-argon-high", true);
+        child.binding.status = "window_constraint".into();
+        usage.quota_buckets = vec![flash, hidden, child];
+        let entry = ForwardedProviderUsage {
+            id: "google".into(),
+            name: "Google".into(),
+            vendor: None,
+            routes: vec![],
+            status: ProviderUsageQueryStatus::Ok,
+            error: None,
+            usage: None,
+            usage_entry: None,
+        };
+        let routes = BTreeMap::from([(
+            "only-flash".into(),
+            BTreeSet::from(["gemini-3.8-flash-high".into()]),
+        )]);
+        let (rows, states) = project_forwarded_entry(entry, &usage, &routes, false);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].name, "Google · gemini-3.8-flash");
+        assert_eq!(rows[0].routes, ["only-flash"]);
+        assert_eq!(
+            alternative_scheduling(&states["only-flash"]).status,
+            ProviderSchedulingStatus::QuotaExhausted
+        );
+        assert_eq!(
+            rows[0].usage.as_ref().unwrap().scheduling.status,
+            ProviderSchedulingStatus::QuotaExhausted
+        );
+        let wire = serde_json::to_string(&rows).unwrap();
+        assert!(
+            !wire.contains("PRIVATE-argon")
+                && !wire.contains("gemini-4-argon")
+                && !wire.contains("raw-child")
+        );
+    }
+
+    #[test]
+    fn google_catalog_forwarding_keeps_unknown_route_choices_without_extra_cards() {
+        let mut usage = snapshot("google", false);
+        usage.kind = "google_subscription".into();
+        let mut source = bucket("catalog-flash-high", "gemini-3.8-flash-high", false);
+        source.source = "catalog".into();
+        source.tiers[0].name = "catalog".into();
+        source.binding.source = "catalog_exact_model_v1".into();
+        usage.quota_buckets = vec![source];
+        let entry = ForwardedProviderUsage {
+            id: "google".into(),
+            name: "Google".into(),
+            vendor: Some("google".into()),
+            routes: vec![],
+            status: ProviderUsageQueryStatus::Ok,
+            error: None,
+            usage: None,
+            usage_entry: None,
+        };
+        let routes = BTreeMap::from([(
+            "flash".into(),
+            BTreeSet::from(["gemini-3.8-flash-high".into()]),
+        )]);
+        let (rows, states) = project_forwarded_entry(entry, &usage, &routes, false);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].status, ProviderUsageQueryStatus::Error);
+        assert!(rows[0].usage.as_ref().unwrap().tiers.is_empty());
+        assert!(states["flash"][0].is_none());
     }
 
     #[tokio::test]

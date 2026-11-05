@@ -1,5 +1,7 @@
+import { useState } from "react";
 import { AlertCircle, ArrowUpRight, Clock } from "lucide-react";
 import type { Locale } from "@/lib/i18n";
+import { hasStructuredQuotaBuckets, isGoogleFamilyDisplayBucket, isPrimaryQuotaBucket, providerQuotaDisplayBuckets } from "@/lib/quota-bucket-display";
 import { tierLabel, providerUsagePause } from "@/lib/provider-usage";
 import { formatTokenCount } from "@/lib/format";
 import { retainedUsagePriceDisplay } from "@/lib/token-usage";
@@ -29,6 +31,7 @@ const sourceLabel = (source: string, zh: boolean) => {
   const labels: Record<string, [string, string]> = {
     configured: ["Configured", "显式绑定"], official: ["Official", "官方绑定"],
     adapter: ["Validated adapter", "已验证适配规则"], google_exact_model_v1: ["Validated Google binding", "已验证 Google 绑定"],
+    google_family_display_v1: ["Google family display", "Google 模型族展示"],
     catalog_exact_model_v1: ["Catalog exact-model binding", "目录精确模型绑定"], enforced_summary: ["Enforced summary", "强制额度摘要"],
     model_catalog: ["Model catalog", "模型目录"], catalog: ["Model catalog", "模型目录"],
     unresolved: ["Unresolved", "未解析"], unknown: ["Unknown", "未知"],
@@ -36,23 +39,47 @@ const sourceLabel = (source: string, zh: boolean) => {
   return labels[source]?.[zh ? 1 : 0] ?? source;
 };
 
-export function QuotaBucketAvailability({ buckets, stale = false, isZh = false, now = Date.now() }: {
-  buckets: QuotaBucket[]; stale?: boolean; isZh?: boolean; now?: number;
+export function QuotaBucketAvailability({ buckets, stale = false, isZh = false, now, expectedCount }: {
+  buckets: QuotaBucket[]; stale?: boolean; isZh?: boolean; now?: number; expectedCount?: number;
 }) {
-  const states = buckets.filter((bucket) => !["shared_constraint", "window_constraint"].includes(bucket.binding.status))
-    .map((bucket) => bucketState(bucket, bucketStale(bucket, now, stale)));
+  const [initialNow] = useState(() => Date.now());
+  const observedNow = now ?? initialNow;
+  const primary = buckets.filter((bucket) => isPrimaryQuotaBucket(bucket) && (expectedCount == null || isGoogleFamilyDisplayBucket(bucket)));
+  const states = primary.map((bucket) => bucketState(bucket, bucketStale(bucket, observedNow, stale)));
   const available = states.filter((state) => state === "available").length;
   const exhausted = states.filter((state) => state === "exhausted").length;
-  const state = states.length > 0 && available === states.length ? "available"
-    : states.length > 0 && exhausted === states.length ? "exhausted"
+  // A fixed family count is meaningful only within one entitlement owner, never across scopes.
+  const scoped = expectedCount == null || (new Set(primary.map((bucket) => bucket.scope_id)).size <= 1 && states.length <= expectedCount);
+  const complete = scoped && states.length > 0 && (expectedCount == null || states.length === expectedCount);
+  const state = !scoped ? "unknown" : complete && available === states.length ? "available"
+    : complete && exhausted === states.length ? "exhausted"
       : available > 0 ? "partial" : "unknown";
   const label = state === "available" ? (isZh ? "全部可用" : "Available")
     : state === "partial" ? (isZh ? "部分可用" : "Partially available")
       : state === "exhausted" ? (isZh ? "全部暂停" : "Exhausted / unavailable") : (isZh ? "状态未知" : "Unknown");
   return <span data-quota-availability={state} className={`inline-flex items-center gap-1.5 rounded-full px-2 py-0.5 text-[10px] font-semibold ${stateClass(state)}`}>
     <span aria-hidden="true" className="h-1.5 w-1.5 rounded-full bg-current" />
-    {label}{available > 0 && ` · ${available}/${states.length}`}
+    {label}{scoped && available > 0 && ` · ${available}/${expectedCount ?? states.length}`}
   </span>;
+}
+
+/** Display-family IDs are not attribution filters. Only same-scope raw accounting sources can open detail. */
+export function QuotaBucketSourceLinks({ bucket, resources, onDetails, isZh = false }: {
+  bucket: QuotaBucket; resources: QuotaBucket[]; onDetails?: (filter: QuotaBucketFilter) => void; isZh?: boolean;
+}) {
+  const sources = resources.filter((source) => source.scope_id === bucket.scope_id && bucket.constraint_ids.includes(source.id)
+    && !isGoogleFamilyDisplayBucket(source) && source.binding.status !== "shared_constraint" && source.models.length > 0);
+  if (!onDetails || !sources.length) return null;
+  return <div className="space-y-1" data-quota-source-links>
+    <p>{isZh ? "原始归属桶详情" : "Source bucket details"}</p>
+    <p className="text-slate-400">{isZh ? "按原始日志归属查询；窗口资源可能没有归属记录。" : "Uses original log attribution; a window resource may have no attributed attempts."}</p>
+    <ul className="space-y-1">{sources.map((source) => <li key={identity(source)}>
+      <button type="button" data-quota-detail={identity(source)} className="inline-flex cursor-pointer items-center gap-0.5 text-sky-700 hover:underline"
+        onClick={(event) => { event.stopPropagation(); onDetails({ quota_bucket: source.id, quota_scope: source.scope_id }); }}>
+        {source.label || source.id}<ArrowUpRight className="h-3 w-3 shrink-0" />
+      </button>
+    </li>)}</ul>
+  </div>;
 }
 
 function BucketCard({ usage, bucket, now, stale, loading, locale, onDetails }: {
@@ -67,6 +94,27 @@ function BucketCard({ usage, bucket, now, stale, loading, locale, onDetails }: {
   const queriedAt = Date.parse(bucket.queried_at);
   // A scoped adapter prevents parent money/balances or unrelated tiers leaking into the summary.
   const priceUsage = { provider_id: usage.provider_id, tiers: bucket.tiers, api_price: bucket.api_price };
+  const family = usage.kind === "google_subscription" && isGoogleFamilyDisplayBucket(bucket);
+  const bindingDetails = <>
+    <p className="break-words font-mono text-[10px] text-slate-500" title={bucket.models.join(", ")}>
+      {bucket.models.length ? bucket.models.join(" · ") : (zh ? "模型绑定未知" : "Model binding unknown")}
+    </p>
+    <p className="text-[10px] text-slate-400">
+      {sourceLabel(bucket.binding.source, zh)} · {bucket.binding.status === "resolved" ? (zh ? "已解析" : "Resolved") : (zh ? "绑定待确认" : "Binding unresolved")} · r{bucket.binding.revision}
+    </p>
+  </>;
+  const coverageDetails = bucket.api_price?.all_time_coverage && <div className="space-y-1 text-[10px] text-slate-500">
+    <p>{zh ? "Token（入 / 出 / 缓存）" : "Tokens (in / out / cache)"}: {formatTokenCount(bucket.api_price.all_time_coverage.input_tokens)} / {formatTokenCount(bucket.api_price.all_time_coverage.output_tokens)} / {formatTokenCount(bucket.api_price.all_time_coverage.cache_read_tokens)}</p>
+    <p>{zh ? "缺少用量" : "Missing usage"}: {bucket.api_price.all_time_coverage.missing_usage_request_count} · {zh ? "未计价" : "Unpriced"}: {bucket.api_price.all_time_coverage.unpriced_request_count} · {zh ? "推断归属" : "Inferred"}: {bucket.api_price.all_time_coverage.inferred_request_count}</p>
+  </div>;
+  const exactPrices = Boolean(bucket.api_price?.models?.length) && <details className="text-[10px] text-slate-500"><summary className="cursor-pointer">{zh ? "精确模型计价明细" : "Exact-model price breakdown"}</summary>
+    <ul className="mt-1 space-y-1">{bucket.api_price!.models!.map((model) => <li key={model.model} className="flex flex-wrap justify-between gap-2">
+      <span className="break-all font-mono">{model.model}</span><span className="tabular-nums" title={retainedUsagePriceDisplay(model.all_time, zh, locale).title}>{retainedUsagePriceDisplay(model.all_time, zh, locale).text} · {model.all_time.request_count} {zh ? "次" : "attempts"}</span>
+    </li>)}</ul>
+  </details>;
+  const constraints = bucket.constraint_ids.length > 0 && <details className="text-[10px] text-slate-400"><summary className="cursor-pointer">{zh ? "适用约束" : "Applicable constraints"} · {bucket.constraint_ids.length}</summary>
+    <p className="mt-1 break-all font-mono">{bucket.constraint_ids.join(" · ")}</p>
+  </details>;
   return <article data-quota-bucket={identity(bucket)} aria-label={`${bucket.label} ${zh ? "配额桶" : "quota bucket"}`}
     className="min-w-0 space-y-3 rounded-xl border border-slate-200/80 bg-white/60 p-3">
     <header className="space-y-1.5">
@@ -76,12 +124,7 @@ function BucketCard({ usage, bucket, now, stale, loading, locale, onDetails }: {
           {stateLabel(state, zh)}{isStale && ` · ${zh ? "旧快照" : "stale"}`}
         </span>
       </div>
-      <p className="break-words font-mono text-[10px] text-slate-500" title={bucket.models.join(", ")}>
-        {bucket.models.length ? bucket.models.join(" · ") : (zh ? "模型绑定未知" : "Model binding unknown")}
-      </p>
-      <p className="text-[10px] text-slate-400">
-        {sourceLabel(bucket.binding.source, zh)} · {bucket.binding.status === "resolved" ? (zh ? "已解析" : "Resolved") : (zh ? "绑定待确认" : "Binding unresolved")} · r{bucket.binding.revision}
-      </p>
+      {!family && bindingDetails}
     </header>
     {pause && <p className="rounded-lg bg-red-50 px-2 py-1.5 text-[10px] text-red-700">
       {pause.message}{pause.quotaExhausted && bucket.scheduling.blocking_tiers.length > 0 && ` · ${bucket.scheduling.blocking_tiers.map((name) => tierLabel(name, zh)).join(", ")}`}
@@ -121,25 +164,20 @@ function BucketCard({ usage, bucket, now, stale, loading, locale, onDetails }: {
     <ProviderApiPriceSummary usage={priceUsage} now={now} stale={isStale} loading={loading} locale={locale}
       bucketLabel={bucket.label} scopeKey={identity(bucket)} projectionAllowed={bucket.binding.status === "resolved" && bucket.source !== "catalog"
         && !["unknown_mapping", "conflicting_binding"].includes(bucket.scheduling.reason ?? "")} />
-    {bucket.api_price?.all_time_coverage && <div className="space-y-1 text-[10px] text-slate-500">
-      <p>{zh ? "Token（入 / 出 / 缓存）" : "Tokens (in / out / cache)"}: {formatTokenCount(bucket.api_price.all_time_coverage.input_tokens)} / {formatTokenCount(bucket.api_price.all_time_coverage.output_tokens)} / {formatTokenCount(bucket.api_price.all_time_coverage.cache_read_tokens)}</p>
-      <p>{zh ? "缺少用量" : "Missing usage"}: {bucket.api_price.all_time_coverage.missing_usage_request_count} · {zh ? "未计价" : "Unpriced"}: {bucket.api_price.all_time_coverage.unpriced_request_count} · {zh ? "推断归属" : "Inferred"}: {bucket.api_price.all_time_coverage.inferred_request_count}</p>
-    </div>}
-    {Boolean(bucket.api_price?.models?.length) && <details className="text-[10px] text-slate-500"><summary className="cursor-pointer">{zh ? "精确模型计价明细" : "Exact-model price breakdown"}</summary>
-      <ul className="mt-1 space-y-1">{bucket.api_price!.models!.map((model) => <li key={model.model} className="flex flex-wrap justify-between gap-2">
-        <span className="break-all font-mono">{model.model}</span><span className="tabular-nums" title={retainedUsagePriceDisplay(model.all_time, zh, locale).title}>{retainedUsagePriceDisplay(model.all_time, zh, locale).text} · {model.all_time.request_count} {zh ? "次" : "attempts"}</span>
-      </li>)}</ul>
+    {!family && <>{coverageDetails}{exactPrices}</>}
+    {family && <details data-bucket-diagnostics className="space-y-2 text-[10px] text-slate-500">
+      <summary className="cursor-pointer">{zh ? "模型与诊断详情" : "Models and diagnostics"}</summary>
+      {bindingDetails}{coverageDetails}{exactPrices}{constraints}
+      <QuotaBucketSourceLinks bucket={bucket} resources={usage.quota_buckets ?? []} onDetails={onDetails} isZh={zh} />
     </details>}
     <footer className="flex flex-wrap items-center justify-between gap-2 border-t border-slate-200/60 pt-2 text-[10px] text-slate-400">
-      <span title={bucket.queried_at}>{sourceLabel(bucket.source, zh)} · {Number.isFinite(queriedAt) ? <time dateTime={bucket.queried_at}>{new Date(queriedAt).toLocaleString(locale)}</time> : (zh ? "观察时间未知" : "Observation time unknown")}</span>
-      {onDetails && <button type="button" className="inline-flex cursor-pointer items-center gap-0.5 font-medium text-sky-700 hover:underline"
+      <span title={bucket.queried_at}>{!family && <>{sourceLabel(bucket.source, zh)} · </>}{Number.isFinite(queriedAt) ? <time dateTime={bucket.queried_at}>{new Date(queriedAt).toLocaleString(locale)}</time> : (zh ? "观察时间未知" : "Observation time unknown")}</span>
+      {!isGoogleFamilyDisplayBucket(bucket) && onDetails && <button type="button" className="inline-flex cursor-pointer items-center gap-0.5 font-medium text-sky-700 hover:underline"
         onClick={(event) => { event.stopPropagation(); onDetails({ quota_bucket: bucket.id, quota_scope: bucket.scope_id }); }}>
         {zh ? "查看桶详情" : "Bucket details"}<ArrowUpRight className="h-3 w-3" />
       </button>}
     </footer>
-    {bucket.constraint_ids.length > 0 && <details className="text-[10px] text-slate-400"><summary className="cursor-pointer">{zh ? "适用约束" : "Applicable constraints"} · {bucket.constraint_ids.length}</summary>
-      <p className="mt-1 break-all font-mono">{bucket.constraint_ids.join(" · ")}</p>
-    </details>}
+    {!family && constraints}
   </article>;
 }
 
@@ -149,26 +187,28 @@ export function ProviderQuotaBuckets({ usage, now, stale, loading, locale = "en-
   onDetails?: (filter: QuotaBucketFilter) => void;
 }) {
   const zh = locale === "zh-CN";
-  const buckets = (usage.quota_buckets ?? []).filter((bucket) => !["shared_constraint", "window_constraint"].includes(bucket.binding.status));
-  const shared = (usage.quota_buckets ?? []).filter((bucket) => bucket.binding.status === "shared_constraint");
-  if (!buckets.length && !shared.length) return null;
+  const google = usage.kind === "google_subscription";
+  const buckets = providerQuotaDisplayBuckets(usage);
+  const raw = (usage.quota_buckets ?? []).filter((bucket) => !isGoogleFamilyDisplayBucket(bucket));
+  const observations = google ? raw : raw.filter((bucket) => bucket.binding.status === "shared_constraint");
+  if (!buckets.length && !observations.length && !(google && hasStructuredQuotaBuckets(usage))) return null;
   const unassigned = usage.api_price?.unassigned;
   const price = unassigned ? retainedUsagePriceDisplay(unassigned, zh, locale) : null;
-  const historical = (usage.api_price?.retained_buckets ?? []).filter((retained) => !buckets.some((bucket) => bucket.id === retained.bucket_id && bucket.scope_id === retained.scope_id));
-  return <div className="space-y-3">
-    <div className="grid grid-cols-[repeat(auto-fit,minmax(min(100%,20rem),1fr))] gap-3">
-      {buckets.map((bucket) => <BucketCard key={identity(bucket)} usage={usage} bucket={bucket} now={now} stale={stale}
-        loading={loading} locale={locale} onDetails={onDetails} />)}
-    </div>
-    {shared.length > 0 && <details className="rounded-lg border border-slate-200/70 p-2 text-[10px] text-slate-500">
-      <summary className="cursor-pointer">{zh ? "共享约束 / 绑定资源（非独立容量）" : "Shared constraints / binding resources (not independent capacity)"} · {shared.length}</summary>
-      <ul className="mt-2 space-y-1">{shared.map((bucket) => <li key={identity(bucket)} className="break-words">
-        <strong>{bucket.label}</strong> · {sourceLabel(bucket.source, zh)} · {bucket.scheduling.status === "quota_exhausted" ? (zh ? "阻塞中" : "Blocking") : (zh ? "约束观察" : "Constraint observation")}
-        {bucket.stale && ` · ${zh ? "旧数据" : "Stale"}`}
-        {bucket.tiers.map((tier) => ` · ${tierLabel(tier.name, zh)}: ${Number.isFinite(tier.used_percent) ? `${tier.used_percent}%` : (zh ? "未知" : "Unknown")}`).join("")}
-      </li>)}</ul>
-    </details>}
-    <ProviderApiPriceSummary usage={usage} now={now} stale={stale} loading={loading} locale={locale} totalOnly />
+  // Display families do not replace immutable raw accounting identities or make current raw sources retired.
+  const accountingBuckets = google ? raw : buckets;
+  const historical = (usage.api_price?.retained_buckets ?? []).filter((retained) => !accountingBuckets.some((bucket) => bucket.id === retained.bucket_id && bucket.scope_id === retained.scope_id));
+  const observationDetails = observations.length > 0 && <details className="rounded-lg border border-slate-200/70 p-2 text-[10px] text-slate-500">
+    <summary className="cursor-pointer">{google
+      ? (zh ? "原始配额观察（仅诊断）" : "Raw quota observations (diagnostics only)")
+      : (zh ? "共享约束 / 绑定资源（非独立容量）" : "Shared constraints / binding resources (not independent capacity)")} · {observations.length}</summary>
+    <ul className="mt-2 space-y-1">{observations.map((bucket) => <li key={identity(bucket)} data-quota-observation={identity(bucket)} className="break-words">
+      <strong>{bucket.label}</strong> · {sourceLabel(bucket.source, zh)} · {bucket.scheduling.status === "quota_exhausted" ? (zh ? "阻塞中" : "Blocking") : (zh ? "约束观察" : "Constraint observation")}
+      {bucket.stale && ` · ${zh ? "旧数据" : "Stale"}`}
+      {bucket.tiers.map((tier) => ` · ${tierLabel(tier.name, zh)}: ${Number.isFinite(tier.used_percent) ? `${tier.used_percent}%` : (zh ? "未知" : "Unknown")}`).join("")}
+      {google && <span className="block break-all font-mono">{bucket.models.join(" · ") || bucket.id}</span>}
+    </li>)}</ul>
+  </details>;
+  const retainedDetails = <>
     {historical.length > 0 && <details className="text-[10px] text-slate-500"><summary className="cursor-pointer">{zh ? "历史配额桶（非当前额度）" : "Retired bucket history (not current capacity)"} · {historical.length}</summary>
       <ul className="mt-1 space-y-1">{historical.map((retained) => <li key={JSON.stringify([retained.scope_id, retained.bucket_id])} className="flex flex-wrap justify-between gap-2">
         <span className="break-all font-mono">{retained.models.map((model) => model.model).join(" · ") || retained.bucket_id}</span>
@@ -182,5 +222,19 @@ export function ProviderQuotaBuckets({ usage, now, stale, loading, locale = "en-
       {onDetails && <button type="button" className="cursor-pointer font-medium text-sky-700 hover:underline"
         onClick={(event) => { event.stopPropagation(); onDetails({ quota_bucket: "unassigned" }); }}>{zh ? "查看未归属" : "Unassigned details"}</button>}
     </div>
+  </>;
+  return <div className="space-y-3">
+    {buckets.length > 0 ? <div className="grid grid-cols-[repeat(auto-fit,minmax(min(100%,20rem),1fr))] gap-3">
+      {buckets.map((bucket) => <BucketCard key={identity(bucket)} usage={usage} bucket={bucket} now={now} stale={stale}
+        loading={loading} locale={locale} onDetails={onDetails} />)}
+    </div> : google && <p role="status" className="text-[11px] text-amber-700">{zh
+      ? "尚无目标模型族的配额观察；可用性未知。"
+      : "No quota observations for the target model families; availability is unknown."}</p>}
+    {!google && observationDetails}
+    <ProviderApiPriceSummary usage={usage} now={now} stale={stale} loading={loading} locale={locale} totalOnly />
+    {google ? <details data-provider-quota-diagnostics className="space-y-2 text-[10px] text-slate-500">
+      <summary className="cursor-pointer">{zh ? "配额诊断与历史" : "Quota diagnostics and history"}</summary>
+      {observationDetails}{retainedDetails}
+    </details> : retainedDetails}
   </div>;
 }

@@ -9,7 +9,7 @@ use super::{
     AdminService, ProviderScheduling, ProviderSchedulingStatus, ProviderUsage,
     ProviderUsageListItem, ProviderUsageQueryStatus, ProviderUsageTier,
 };
-use crate::quota_buckets::{QuotaBucket, opaque_quota_id};
+use crate::quota_buckets::{QuotaBucket, google_display_buckets, opaque_quota_id};
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct PublishedUsageEntry {
@@ -91,7 +91,9 @@ pub(crate) fn effective_bucket_scheduling(
 ) -> ProviderScheduling {
     let mut scheduling = bucket.scheduling.clone();
     for constraint in usage.quota_buckets.iter().filter(|constraint| {
-        !constraint.is_primary() && bucket.constraint_ids.contains(&constraint.id)
+        !constraint.is_primary()
+            && constraint.scope_id == bucket.scope_id
+            && bucket.constraint_ids.contains(&constraint.id)
     }) {
         if constraint.scheduling.status == ProviderSchedulingStatus::QuotaExhausted {
             and_blocker(&mut scheduling, &constraint.scheduling);
@@ -159,6 +161,53 @@ pub(crate) fn bucket_usage(usage: &ProviderUsage, bucket: &QuotaBucket) -> Provi
     }
 }
 
+/// Google families are a read-only display projection. Their stable published
+/// IDs are not configuration/admission IDs or valid retained-log filters.
+fn published_google_items(
+    item: &ProviderUsageListItem,
+    usage: &ProviderUsage,
+) -> Vec<PublishedProviderUsageListItem> {
+    let mut display = usage.clone();
+    display.quota_buckets = google_display_buckets(&usage.quota_buckets);
+    display
+        .quota_buckets
+        .iter()
+        .filter(|bucket| bucket.is_primary())
+        .map(|bucket| {
+            let known = bucket.is_resolved() && !bucket_tiers_conflict(&bucket.tiers);
+            let projected = bucket_usage(&display, bucket);
+            PublishedProviderUsageListItem {
+                provider_id: projected.provider_id.clone(),
+                provider_name: format!("{} · {}", item.provider_name, bucket.label),
+                is_enabled: item.is_enabled,
+                status: if known {
+                    item.status
+                } else {
+                    ProviderUsageQueryStatus::Error
+                },
+                error: if known {
+                    item.error.clone()
+                } else {
+                    Some(
+                        "Model-family quota is incomplete; inspect the structured provider view"
+                            .into(),
+                    )
+                },
+                // Unknown observations may carry measured utilization, never an
+                // invented healthy supplier or an inferred fixed-window cycle.
+                usage: Some(projected),
+                usage_entry: Some(PublishedUsageEntry {
+                    kind: "quota_bucket",
+                    source_provider_ref: item.provider_id.clone(),
+                    bucket_ref: bucket.id.clone(),
+                    binding_status: bucket.binding.status.clone(),
+                    stale: bucket.stale,
+                }),
+            }
+        })
+        .collect()
+}
+
 /// Expand primary buckets only, never shared sidecars or a duplicate aggregate
 /// parent. Even a single remaining primary bucket retains its published ID.
 pub fn published_usage_items(
@@ -180,6 +229,11 @@ pub fn published_usage_items(
                 // the relay row: DSH expands its safe upstream.providers[] itself,
                 // using the relay ID plus remote bucket ID as the composite key.
                 return vec![item.into()];
+            }
+            if usage.kind == "google_subscription" {
+                // Hide unrelated model/resource diagnostics in the structured
+                // view rather than adding a third ordinary usage supplier.
+                return published_google_items(&item, usage);
             }
             let primary = usage
                 .quota_buckets
@@ -366,7 +420,7 @@ mod tests {
             error: None,
             usage: Some(ProviderUsage {
                 provider_id: "real-provider".into(),
-                kind: "google_subscription".into(),
+                kind: "fixture_quota_vendor".into(),
                 site: "global".into(),
                 level: Some("pro".into()),
                 tiers: Vec::new(),
@@ -514,6 +568,128 @@ mod tests {
                 .filter(|row| row.status == ProviderUsageQueryStatus::Ok)
                 .count(),
             1
+        );
+    }
+
+    fn google_item() -> ProviderUsageListItem {
+        let mut source = item();
+        let usage = source.usage.as_mut().unwrap();
+        usage.kind = "google_subscription".into();
+        usage.quota_buckets = [
+            "gemini-3.8-flash-high",
+            "gemini-3.8-flash-medium",
+            "gemini-3.8-flash-low",
+            "gemini-4-argon-low",
+            "gemini-4-argon-medium",
+            "gemini-4-argon-high",
+            "gemini-other-high",
+            "claude-other",
+        ]
+        .into_iter()
+        .map(|model| {
+            let mut resource = bucket(model, model);
+            resource.models = vec![model.into()];
+            resource
+        })
+        .collect();
+        source
+    }
+
+    #[test]
+    fn google_published_cards_fold_both_effort_families_without_unrelated_diagnostics() {
+        let source = google_item();
+        let before = source.clone();
+        let rows = published_usage_items(vec![source]);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.provider_name.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "Google Pro · gemini-3.8-flash",
+                "Google Pro · gemini-4-argon"
+            ]
+        );
+        for row in &rows {
+            let usage = row.usage.as_ref().unwrap();
+            assert_eq!(row.status, ProviderUsageQueryStatus::Ok);
+            assert_eq!(row.provider_id, usage.provider_id);
+            assert_eq!(usage.tiers.len(), 2);
+            assert!(usage.quota_buckets.is_empty());
+        }
+        let mut changed = before;
+        let buckets = &mut changed.usage.as_mut().unwrap().quota_buckets;
+        buckets.retain(|bucket| !bucket.models[0].starts_with("gemini-4-argon"));
+        buckets.reverse();
+        for bucket in buckets {
+            bucket.label = "Renamed source".into();
+        }
+        let single = published_usage_items(vec![changed]);
+        assert_eq!(single.len(), 1);
+        assert_eq!(single[0].provider_id, rows[0].provider_id);
+        let wire = serde_json::to_string(&rows).unwrap();
+        for forbidden in [
+            "flash-high",
+            "argon-low",
+            "gemini-other",
+            "claude-other",
+            "Unresolved quota",
+        ] {
+            assert!(
+                !wire.contains(forbidden),
+                "unexpected model/diagnostic in published family cards: {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn google_catalog_families_are_unknown_rows_not_healthy_or_extra_suppliers() {
+        let mut source = google_item();
+        for bucket in &mut source.usage.as_mut().unwrap().quota_buckets {
+            bucket.source = "catalog".into();
+            bucket.binding.source = "catalog_exact_model_v1".into();
+            bucket.scheduling.reason = Some("unknown_mapping".into());
+            bucket.tiers = vec![ProviderUsageTier {
+                name: "catalog".into(),
+                used_percent: 20.0,
+                resets_at: None,
+            }];
+        }
+        let rows = published_usage_items(vec![source]);
+        assert_eq!(rows.len(), 2);
+        assert!(
+            rows.iter()
+                .all(|row| row.status == ProviderUsageQueryStatus::Error)
+        );
+        assert!(
+            rows.iter()
+                .all(|row| row.usage.as_ref().unwrap().tiers.is_empty())
+        );
+        assert!(
+            rows.iter()
+                .all(|row| row.usage_entry.as_ref().unwrap().binding_status == "unresolved")
+        );
+    }
+
+    #[test]
+    fn effective_bucket_constraints_are_owner_scoped_before_presentation() {
+        let mut source = item();
+        let usage = source.usage.as_mut().unwrap();
+        usage.quota_buckets[0].constraint_ids.push("same-id".into());
+        let mut foreign = bucket("same-id", "Foreign blocked constraint");
+        foreign.scope_id = "different-owner".into();
+        foreign.binding.status = "shared_constraint".into();
+        foreign.scheduling.status = ProviderSchedulingStatus::QuotaExhausted;
+        usage.quota_buckets.push(foreign.clone());
+        assert_eq!(
+            effective_bucket_scheduling(usage, &usage.quota_buckets[0]).status,
+            ProviderSchedulingStatus::Eligible
+        );
+        foreign.scope_id = usage.quota_buckets[0].scope_id.clone();
+        usage.quota_buckets.push(foreign);
+        assert_eq!(
+            effective_bucket_scheduling(usage, &usage.quota_buckets[0]).status,
+            ProviderSchedulingStatus::QuotaExhausted
         );
     }
 
