@@ -34,6 +34,7 @@ fn provider_api_price_weekly_wins_over_short_monthly_and_feature_windows() {
         "minimax_coding_plan",
         "grok_plan",
         "openai_codex",
+        "google_subscription",
     ] {
         let period = provider_period(kind, &tiers, now).unwrap();
         assert_eq!(
@@ -64,6 +65,7 @@ fn provider_api_price_present_invalid_weekly_never_falls_back() {
         "minimax_coding_plan",
         "grok_plan",
         "openai_codex",
+        "google_subscription",
     ] {
         assert!(provider_period(kind, &fallback, now).is_some());
         for reset in [
@@ -148,8 +150,54 @@ fn provider_api_price_codex_weekly_only_and_known_five_hour_fallback() {
 }
 
 #[test]
+fn provider_api_price_google_weekly_and_five_hour_require_canonical_account_windows() {
+    let now = ms("2026-11-03T10:29:00+08:00");
+    let reset = "2026-11-04T18:29:00+08:00";
+    let weekly = tier("weekly_limit", Some(reset), 76.0);
+    let period =
+        provider_period("google_subscription", std::slice::from_ref(&weekly), now).unwrap();
+    assert_eq!(period.start, ms("2026-10-28T18:29:00+08:00"));
+    assert_eq!(period.end, ms(reset));
+    assert_eq!(period.tier.used_percent, 76.0);
+
+    let short = tier("five_hour", Some("2026-11-03T13:29:00+08:00"), 20.0);
+    let tiers = [
+        tier("gemini", Some(reset), 50.0),
+        tier("feature:gemini:weekly_limit", Some(reset), 99.0),
+        short.clone(),
+    ];
+    let period = provider_period("google_subscription", &tiers, now).unwrap();
+    assert_eq!(period.tier.name, "five_hour");
+    assert_eq!(period.start, ms("2026-11-03T08:29:00+08:00"));
+    assert_eq!(period.end, ms("2026-11-03T13:29:00+08:00"));
+    assert!(provider_period("google_subscription", &[short.clone(), short], now).is_none());
+
+    for name in [
+        "gemini",
+        "gemini-3.8-flash",
+        "primary_window",
+        "secondary_window",
+        "daily",
+        "monthly",
+        "window",
+        "feature:gemini:weekly_limit",
+        "feature:gemini:five_hour",
+    ] {
+        assert!(
+            provider_period("google_subscription", &[tier(name, Some(reset), 76.0)], now).is_none(),
+            "catalog, feature and unknown-duration quotas must not define a Google account cycle: {name}"
+        );
+    }
+}
+
+#[test]
 fn provider_api_price_five_hour_and_grok_utc_date_only_month_clamping() {
-    for kind in ["glm_coding_plan", "minimax_coding_plan", "openai_codex"] {
+    for kind in [
+        "glm_coding_plan",
+        "minimax_coding_plan",
+        "openai_codex",
+        "google_subscription",
+    ] {
         let tiers = [tier("five_hour", Some("2026-10-31T07:00:00Z"), 25.0)];
         let period = provider_period(kind, &tiers, ms("2026-10-31T05:48:02Z")).unwrap();
         assert_eq!(
@@ -347,6 +395,7 @@ async fn provider_api_price_all_kinds_retained_history_unknown_cycles_and_fail_o
         "minimax_coding_plan",
         "grok_plan",
         "openai_codex",
+        "google_subscription",
     ] {
         for reset in [None, Some("invalid"), Some("2026-10-30T00:00:00Z")] {
             let mut usage = snapshot(
@@ -391,6 +440,69 @@ async fn provider_api_price_all_kinds_retained_history_unknown_cycles_and_fail_o
         assert_eq!(stats.period.as_ref().unwrap().request_count, 2);
         assert_eq!(stats.period.as_ref().unwrap().unpriced_request_count, 1);
         assert_eq!(stats.estimated_capacity.unwrap()[0].total_cost, 8.0);
+        for used in [0.0, -1.0, 100.1, f64::NAN, f64::INFINITY] {
+            usage.api_price = None;
+            usage.tiers[0].used_percent = used;
+            admin.enrich_provider_api_price(&mut usage).await;
+            let stats = usage.api_price.as_ref().unwrap();
+            assert_eq!(stats.period.as_ref().unwrap().request_count, 2);
+            assert_eq!(stats.used_percent, (used == 0.0).then_some(0.0));
+            assert!(stats.estimated_capacity.is_none(), "{kind}: {used}");
+        }
+    }
+    // Every supported kind reuses current manual rates, not historical billing
+    // or a persisted projection; retention controls these same totals.
+    admin
+        .set_token_price(TokenPriceInput {
+            provider_id: provider.id.clone(),
+            model: "priced".into(),
+            price: Some(TokenPriceRates {
+                currency: "USD".into(),
+                input_rate: 3.0,
+                output_rate: 8.0,
+                cache_read_rate: None,
+            }),
+        })
+        .await?;
+    for kind in [
+        "glm_coding_plan",
+        "minimax_coding_plan",
+        "grok_plan",
+        "openai_codex",
+        "google_subscription",
+    ] {
+        let mut usage = snapshot(
+            &provider.id,
+            kind,
+            now,
+            vec![tier("weekly_limit", Some("2026-11-06T00:00:00Z"), 25.0)],
+        );
+        admin.enrich_provider_api_price(&mut usage).await;
+        let stats = usage.api_price.unwrap();
+        assert_eq!(stats.all_time.equivalent_costs[0].total_cost, 6.0);
+        assert_eq!(stats.period.unwrap().equivalent_costs[0].total_cost, 3.0);
+        assert_eq!(stats.estimated_capacity.unwrap()[0].total_cost, 12.0);
+    }
+    storage.logs().clear_all().await?;
+    for kind in [
+        "glm_coding_plan",
+        "minimax_coding_plan",
+        "grok_plan",
+        "openai_codex",
+        "google_subscription",
+    ] {
+        let mut usage = snapshot(
+            &provider.id,
+            kind,
+            now,
+            vec![tier("weekly_limit", Some("2026-11-06T00:00:00Z"), 25.0)],
+        );
+        admin.enrich_provider_api_price(&mut usage).await;
+        let stats = usage.api_price.unwrap();
+        assert_eq!(stats.all_time.request_count, 0);
+        assert_eq!(stats.period.unwrap().request_count, 0);
+        assert!(stats.all_time.equivalent_costs.is_empty());
+        assert!(stats.estimated_capacity.is_none());
     }
     let mut unsupported = snapshot(&provider.id, "kimi_coding_plan", now, vec![]);
     admin.enrich_provider_api_price(&mut unsupported).await;
@@ -405,15 +517,24 @@ async fn provider_api_price_all_kinds_retained_history_unknown_cycles_and_fail_o
         .settings()
         .set("token_price.v1.corrupt", "not-json")
         .await?;
-    let mut usage = snapshot(
-        &provider.id,
+    for kind in [
         "glm_coding_plan",
-        now,
-        vec![tier("weekly_limit", Some("2026-11-06T00:00:00Z"), 100.0)],
-    );
-    let before = usage.clone();
-    admin.enrich_provider_api_price(&mut usage).await;
-    assert_eq!(usage, before);
-    assert!(usage.api_price.is_none());
+        "minimax_coding_plan",
+        "grok_plan",
+        "openai_codex",
+        "google_subscription",
+    ] {
+        let mut usage = snapshot(
+            &provider.id,
+            kind,
+            now,
+            vec![tier("weekly_limit", Some("2026-11-06T00:00:00Z"), 100.0)],
+        );
+        let before = usage.clone();
+        admin.enrich_provider_api_price(&mut usage).await;
+        assert_eq!(usage, before);
+        assert!(usage.api_price.is_none());
+        assert!(serde_json::to_value(&usage)?.get("api_price").is_none());
+    }
     Ok(())
 }

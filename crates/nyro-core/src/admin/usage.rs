@@ -5697,6 +5697,272 @@ mod tests {
     }
 
     #[test]
+    fn google_subscription_pro_api_prices_follow_the_parsed_quota_without_quota_request()
+    -> anyhow::Result<()> {
+        use crate::provider::google::antigravity::{
+            parse_available_models_detailed, parse_quota_summary_buckets,
+        };
+        use crate::storage::{MemoryStorage, SqliteStorage, Storage};
+        use serde_json::json;
+        use std::future::Future;
+        use std::sync::Arc;
+        use std::task::{Context, Poll};
+
+        let dir = tempfile::tempdir()?;
+        let config = crate::config::GatewayConfig {
+            data_dir: dir.path().into(),
+            config_poll_interval: Duration::ZERO,
+            ..Default::default()
+        };
+        // As in request_build_logging, never drive the bootstrap runtime. The
+        // in-memory constructor must finish in one poll; dropping the runtime
+        // cancels models.dev discovery, quota monitoring and OAuth refresh before
+        // any background task can run. Only the later SQLite runtime is driven.
+        let bootstrap = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        let constructed = {
+            let _entered = bootstrap.enter();
+            let memory = Arc::new(MemoryStorage::new(vec![], vec![], vec![]));
+            let mut constructor = Box::pin(Gateway::from_storage(config.clone(), memory));
+            let mut context = Context::from_waker(futures::task::noop_waker_ref());
+            match constructor.as_mut().poll(&mut context) {
+                Poll::Ready(result) => result,
+                Poll::Pending => anyhow::bail!(
+                    "offline Gateway construction yielded; refusing to run background network tasks"
+                ),
+            }
+        };
+        drop(bootstrap);
+        let (mut gw, _logs) = constructed?;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        runtime.block_on(async {
+            let storage = SqliteStorage::from_config(&config).await?;
+            gw.storage = Arc::new(storage.clone());
+            let now = chrono::DateTime::parse_from_rfc3339("2026-11-03T10:29:00+08:00")?;
+            let reset = chrono::DateTime::parse_from_rfc3339("2026-11-04T18:29:00+08:00")?;
+            let start = reset - chrono::Duration::days(7);
+            let short_reset = chrono::DateTime::parse_from_rfc3339("2026-11-03T13:29:00+08:00")?;
+            let short_start = short_reset - chrono::Duration::hours(5);
+            // Static, sanitized retrieveUserQuotaSummary response shape: no
+            // project IDs, credentials or upstream requests. Per-family buckets
+            // collapse to their tightest canonical Gemini account windows;
+            // unrelated Claude quota must not become the price denominator.
+            let body = json!({"groups": [
+                {"displayName": "Gemini", "buckets": [
+                    {"bucketId": "fixture-pro-5h", "window": "FIVE_HOURS",
+                     "remainingFraction": 0.2, "resetTime": "2026-11-03T13:29:00+08:00"},
+                    {"bucketId": "fixture-pro-week", "window": "WEEKLY",
+                     "remainingFraction": 0.75, "resetTime": "2026-11-04T18:29:00+08:00"},
+                    {"bucketId": "fixture-flash-5h", "window": "FIVE_HOURS",
+                     "remainingFraction": 0.9, "resetTime": "2026-11-03T13:29:00+08:00"},
+                    {"bucketId": "fixture-flash-week", "window": "WEEKLY",
+                     "remainingFraction": 0.9, "resetTime": "2026-11-04T18:29:00+08:00"}
+                ]},
+                {"displayName": "Claude", "buckets": [
+                    {"bucketId": "fixture-ancillary", "window": "WEEKLY",
+                     "remainingFraction": 0.0, "resetTime": "2026-11-03T13:00:00+08:00"}
+                ]}
+            ]});
+            let tiers = quota_summary_tiers(&parse_quota_summary_buckets(&body));
+            assert_eq!(
+                tiers,
+                vec![
+                    tier("five_hour", 80.0, Some("2026-11-03T13:29:00+08:00")),
+                    tier("weekly_limit", 25.0, Some("2026-11-04T18:29:00+08:00")),
+                ]
+            );
+            let mut forwarding_snapshots = Vec::new();
+            for channel in ["antigravity", "gemini-cli"] {
+                let provider = storage.providers().create(serde_json::from_value(json!({
+                    "name": format!("Google AI Pro fixture {channel}"),
+                    "vendor": "google", "preset_key": "google", "channel": channel,
+                    "auth_mode": "oauth", "protocol": "google-gemini",
+                    "base_url": "https://cloudcode-pa.googleapis.com", "api_key": ""
+                }))?).await?;
+                let backend = UsageBackend::detect(&provider).unwrap();
+                assert_eq!(backend, UsageBackend::GoogleSubscription);
+                assert_eq!(backend.kind(), "google_subscription");
+                assert!(provider_usage_monitorable(&gw.admin(), &provider).await);
+                // Deterministic current manual rates, not a catalogue fetch or
+                // an invented subscription invoice. This synthetic model has no
+                // automatic reference when the manual rate is removed below.
+                gw.admin().set_token_price(TokenPriceInput {
+                    provider_id: provider.id.clone(),
+                    model: "gemini-api-price-fixture".into(),
+                    price: Some(TokenPriceRates {
+                        currency: "USD".into(), input_rate: 10.0, output_rate: 0.0,
+                        cache_read_rate: None,
+                    }),
+                }).await?;
+                for (model, at, input) in [
+                    ("gemini-api-price-fixture", start.timestamp_millis() - 1, 1_000_000),
+                    ("gemini-api-price-fixture", start.timestamp_millis(), 1_000_000),
+                    ("gemini-api-price-fixture", short_start.timestamp_millis() - 1, 1_000_000),
+                    ("gemini-api-price-fixture", short_start.timestamp_millis(), 1_000_000),
+                    ("gemini-api-price-fixture", now.timestamp_millis(), 1_000_000),
+                    ("unpriced-fixture", now.timestamp_millis(), 0),
+                    ("gemini-api-price-fixture", now.timestamp_millis() + 1, 100_000_000),
+                ] {
+                    sqlx::query("INSERT INTO request_logs (id, provider_id, upstream_model, created_at, input_tokens, output_tokens, route_decision, outcome_version, attempt_outcome) VALUES (?, ?, ?, ?, ?, 0, NULL, 1, 'failed')")
+                        .bind(uuid::Uuid::new_v4().to_string()).bind(&provider.id).bind(model)
+                        .bind(at).bind(input).execute(storage.pool()).await?;
+                }
+                let observations = google_scheduling_observation(&tiers);
+                let scheduling = gw.quota_registry.observe(&provider.id, &observations, Some(true));
+                let mut usage = ProviderUsage {
+                    provider_id: provider.id.clone(), kind: backend.kind().into(),
+                    site: backend.site().into(), level: Some("G1-PRO-TIER".into()),
+                    tiers: tiers.clone(), balances: vec![], spends: vec![],
+                    is_available: Some(true), scheduling: scheduling.clone(),
+                    queried_at: now.to_rfc3339(), api_price: None,
+                    account_pool: None, pool_quota: None, upstream: None,
+                };
+                let before = usage.clone();
+                let settings_before = storage.settings().list_all().await?;
+                let credentials_before = serde_json::to_value(
+                    storage.oauth_credentials().list_accounts(&provider.id).await?
+                )?;
+                let logs_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM request_logs")
+                    .fetch_one(storage.pool()).await?;
+                // Deliberately enrich the parsed response rather than call
+                // get_provider_usage: real Google quota/OAuth URLs stay fixed.
+                gw.admin().enrich_provider_api_price(&mut usage).await;
+                let mut without_price = usage.clone();
+                without_price.api_price = None;
+                assert_eq!(without_price, before);
+                assert_eq!(gw.quota_registry.snapshot(&provider.id), scheduling);
+                assert_eq!(gw.quota_registry.tier_snapshot(&provider.id), observations);
+                assert_eq!(storage.settings().list_all().await?, settings_before);
+                assert_eq!(serde_json::to_value(
+                    storage.oauth_credentials().list_accounts(&provider.id).await?
+                )?, credentials_before);
+                assert_eq!(sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM request_logs")
+                    .fetch_one(storage.pool()).await?, logs_before);
+                let stats = usage.api_price.as_ref().unwrap();
+                assert_eq!(stats.period_tier.as_deref(), Some("weekly_limit"));
+                assert_eq!(stats.used_percent, Some(25.0));
+                assert_eq!((stats.period_start, stats.period_end),
+                    (Some(start.timestamp_millis()), Some(reset.timestamp_millis())));
+                assert_eq!((stats.all_time.request_count, stats.all_time.total_tokens), (6, 5_000_000));
+                assert_eq!(stats.all_time.equivalent_costs[0].total_cost, 50.0);
+                assert_eq!(stats.all_time.unpriced_request_count, 1);
+                let period = stats.period.as_ref().unwrap();
+                assert_eq!((period.request_count, period.total_tokens), (5, 4_000_000));
+                assert_eq!(period.unpriced_request_count, 1);
+                assert_eq!(period.equivalent_costs[0].total_cost, 40.0);
+                assert_eq!(stats.estimated_capacity.as_ref().unwrap()[0].total_cost, 160.0);
+                assert!(serde_json::to_value(&usage)?.get("api_price").is_some());
+
+                // The Full Admin enrichment is not retained by the proxy cache
+                // and cannot leak to either regular or privileged proxy callers.
+                gw.admin().create_model(serde_json::from_value(json!({
+                    "name": format!("google-price-{channel}"),
+                    "target_provider": provider.id, "target_model": "gemini-api-price-fixture",
+                    "enable_auth": false, "enable_payload": false
+                }))?).await?;
+                forwarding_snapshots.push(usage.clone());
+                for privileged in [false, true] {
+                    // Refresh every routed fixture so a later channel can never
+                    // miss an earlier entry and enter real quota/OAuth lookup.
+                    for snapshot in &forwarding_snapshots {
+                        gw.usage_snapshots.store(snapshot);
+                    }
+                    let cached = gw.usage_snapshots.fresh(&provider.id, Duration::from_secs(60)).unwrap();
+                    assert_eq!(cached, before);
+                    assert!(serde_json::to_value(cached)?.get("api_price").is_none());
+                    let report = gw.admin().forwarded_provider_usage(&RouteAccess {
+                        privileged, ..Default::default()
+                    }).await?;
+                    let entry = report.providers.iter().find(|entry| entry.id == provider.id).unwrap();
+                    assert_eq!(entry.status, ProviderUsageQueryStatus::Ok);
+                    assert!(entry.usage.as_ref().unwrap().api_price.is_none());
+                    assert!(serde_json::to_value(entry)?["usage"].get("api_price").is_none());
+                }
+
+                // The denominator follows the selected account window, not the
+                // first displayed row. A five-hour-only response may fall back.
+                let short_body = json!({"groups": [{"displayName": "Gemini", "buckets": [
+                    body["groups"][0]["buckets"][0].clone()
+                ]}]});
+                usage.tiers = quota_summary_tiers(&parse_quota_summary_buckets(&short_body));
+                gw.admin().enrich_provider_api_price(&mut usage).await;
+                let short = usage.api_price.as_ref().unwrap();
+                assert_eq!(short.period_tier.as_deref(), Some("five_hour"));
+                assert_eq!((short.period_start, short.period_end),
+                    (Some(short_start.timestamp_millis()), Some(short_reset.timestamp_millis())));
+                assert_eq!(short.used_percent, Some(80.0));
+                assert_eq!(short.period.as_ref().unwrap().request_count, 3);
+                assert_eq!(short.period.as_ref().unwrap().equivalent_costs[0].total_cost, 20.0);
+                assert_eq!(short.estimated_capacity.as_ref().unwrap()[0].total_cost, 25.0);
+
+                // Screenshot zero-percent quotas still have retained cycle
+                // totals, but never a guessed projection (or the 5h percentage).
+                let mut zero = body.clone();
+                zero["groups"][0]["buckets"][1]["remainingFraction"] = json!(1.0);
+                zero["groups"][0]["buckets"][3]["remainingFraction"] = json!(1.0);
+                usage.tiers = quota_summary_tiers(&parse_quota_summary_buckets(&zero));
+                gw.admin().enrich_provider_api_price(&mut usage).await;
+                let zero = usage.api_price.as_ref().unwrap();
+                assert_eq!(zero.period_tier.as_deref(), Some("weekly_limit"));
+                assert_eq!(zero.used_percent, Some(0.0));
+                assert_eq!(zero.period.as_ref().unwrap().equivalent_costs[0].total_cost, 40.0);
+                assert!(zero.estimated_capacity.is_none());
+
+                // Invalid/expired selected weekly resets cannot be disguised by
+                // the valid five-hour quota or another model family's bucket.
+                for reset in [Value::Null, json!("bad"), json!("2026-11-01T00:00:00Z")] {
+                    let mut invalid = body.clone();
+                    invalid["groups"][0]["buckets"][1]["resetTime"] = reset;
+                    usage.tiers = quota_summary_tiers(&parse_quota_summary_buckets(&invalid));
+                    gw.admin().enrich_provider_api_price(&mut usage).await;
+                    let stats = usage.api_price.as_ref().unwrap();
+                    assert_eq!(stats.all_time.equivalent_costs[0].total_cost, 50.0);
+                    assert!(stats.period.is_none() && stats.estimated_capacity.is_none());
+                }
+                let unknown = json!({"groups": [{"displayName": "Gemini", "buckets": [
+                    {"window": "PRIMARY_WINDOW", "remainingFraction": 0.75, "resetTime": "2026-11-04T18:29:00+08:00"},
+                    {"window": "SECONDARY_WINDOW", "remainingFraction": 0.75, "resetTime": "2026-11-04T18:29:00+08:00"},
+                    {"window": "DAILY", "remainingFraction": 0.75, "resetTime": "2026-11-04T18:29:00+08:00"}
+                ]}]});
+                let catalog = json!({"models": {"gemini-api-price-fixture": {"quotaInfo": {
+                    "remainingFraction": 0.75, "resetTime": "2026-11-04T18:29:00+08:00"
+                }}}});
+                let catalog_tiers = google_subscription_tiers(&parse_available_models_detailed(&catalog));
+                assert_eq!(catalog_tiers[0].name, "gemini");
+                for unanchored in [
+                    quota_summary_tiers(&parse_quota_summary_buckets(&unknown)),
+                    catalog_tiers,
+                ] {
+                    usage.tiers = unanchored;
+                    gw.admin().enrich_provider_api_price(&mut usage).await;
+                    let stats = usage.api_price.as_ref().unwrap();
+                    assert_eq!(stats.all_time.equivalent_costs[0].total_cost, 50.0);
+                    assert!(stats.period.is_none() && stats.estimated_capacity.is_none());
+                }
+
+                // Missing prices are unknown, not free. Retained tokens and the
+                // anchored cycle remain readable without an estimate.
+                gw.admin().set_token_price(TokenPriceInput {
+                    provider_id: provider.id.clone(), model: "gemini-api-price-fixture".into(),
+                    price: None,
+                }).await?;
+                usage.tiers = tiers.clone();
+                gw.admin().enrich_provider_api_price(&mut usage).await;
+                let unpriced = usage.api_price.as_ref().unwrap();
+                assert_eq!(unpriced.all_time.unpriced_request_count, 6);
+                assert!(unpriced.all_time.equivalent_costs.is_empty());
+                assert_eq!(unpriced.period.as_ref().unwrap().unpriced_request_count, 5);
+                assert!(unpriced.estimated_capacity.is_none());
+                assert_eq!(gw.quota_registry.snapshot(&provider.id), scheduling);
+            }
+            Ok(())
+        })
+    }
+
+    #[test]
     fn quota_summary_tiers_name_windows_and_percent() {
         use crate::provider::google::antigravity::QuotaSummaryBucket;
         let buckets = vec![

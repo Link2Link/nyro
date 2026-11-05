@@ -31,13 +31,13 @@ function updateStats(update: Partial<ProviderApiPriceStats>, base = usage): Prov
   return { ...base, api_price: { ...stats, ...update } };
 }
 
-test("GLM MiniMax xAI and OpenAI Codex plan backends display provider price totals", () => {
-  for (const kind of ["glm_coding_plan", "minimax_coding_plan", "grok_plan", "openai_codex"]) equal(providerApiPriceSupported(kind), true);
+test("GLM MiniMax xAI OpenAI Codex and Google subscription backends display provider price totals", () => {
+  for (const kind of ["glm_coding_plan", "minimax_coding_plan", "grok_plan", "openai_codex", "google_subscription"]) equal(providerApiPriceSupported(kind), true);
   for (const kind of ["devin_plan", "kiro_plan", "deepseek_balance", "claude_code_plan", "nyro_gateway", "openai", "openai_api", undefined]) equal(providerApiPriceSupported(kind), false);
 });
 
 test("all supported providers show server-computed total, cycle price and full-cycle capacity", () => {
-  for (const kind of ["glm_coding_plan", "minimax_coding_plan", "grok_plan", "openai_codex"]) {
+  for (const kind of ["glm_coding_plan", "minimax_coding_plan", "grok_plan", "openai_codex", "google_subscription"]) {
     const html = render({ ...usage, kind });
     equal(values(html).join(","), "$228.79,$21.40,≈ $214.00");
     for (const label of ["Total API price", "Current-cycle API price", "Estimated cycle API capacity", "including failed and retried attempts",
@@ -64,6 +64,53 @@ test("OpenAI Codex weekly-only quota uses the same three price metrics in both l
     match(html, locale === "zh-CN" ? /OpenAI Codex.*已识别的 5 小时周期|已识别的 5 小时周期.*OpenAI Codex/ : /OpenAI Codex use an identified 5h cycle/);
     match(html, locale === "zh-CN" ? /功能专用窗口和时长未知的窗口不用于本周期统计/ : /feature-specific and unknown-duration windows are not used for current-cycle statistics/);
     doesNotMatch(html, /Used for projection: 99%|用于估算的已用比例：99%/);
+  }
+});
+
+test("Google OAuth subscription cycle tooltips cover official windows in both locales with English default", () => {
+  const google: ProviderUsage = { ...usage, kind: "google_subscription", level: "G1-PRO-TIER" };
+  for (const locale of ["en-US", "zh-CN"] as const) {
+    const html = render(google, { locale });
+    equal(values(html).join(","), "$228.79,$21.40,≈ $214.00");
+    for (const label of locale === "zh-CN" ? [
+      "Google OAuth 订阅（Antigravity / Gemini CLI）", "仅使用官方已识别的每周窗口", "无周窗口时使用已识别的 5 小时窗口",
+      "不从模型目录的 Gemini 共享池或时长未知的主要/次要窗口推断周期", "额度窗口: 每周", "用于估算的已用比例：10%",
+    ] : [
+      "Google OAuth subscriptions (Antigravity / Gemini CLI)", "only identified official weekly windows",
+      "falling back to an identified 5h window when no weekly window is reported",
+      "cycles are not inferred from the catalog Gemini shared pool or unknown-duration primary/secondary windows",
+      "Quota window: Weekly", "Used for projection: 10%",
+    ]) ok(html.includes(label));
+  }
+  const defaultLocale = renderToStaticMarkup(<ProviderApiPriceSummary usage={google} now={now} stale={false} loading={false} />);
+  equal(defaultLocale, render(google));
+  match(defaultLocale, /Total API price|Current-cycle API price|Estimated cycle API capacity/);
+  doesNotMatch(defaultLocale, /累计 API 价格|本周期 API 价格|本周期预估可用 API 价格/);
+});
+
+test("Google zero-used weekly quota retains actual prices without projecting from the 5h window", () => {
+  const google = updateStats({ used_percent: 0 }, { ...usage, kind: "google_subscription",
+    tiers: [{ ...usage.tiers[0], used_percent: 50 }, { ...usage.tiers[1], used_percent: 0 }] });
+  for (const locale of ["en-US", "zh-CN"] as const) {
+    const html = render(google, { locale });
+    equal(values(html).join(","), "$228.79,$21.40,—");
+    match(html, locale === "zh-CN" ? /额度窗口: 每周/ : /Quota window: Weekly/);
+    doesNotMatch(html, /≈|Used for projection: 50%|用于估算的已用比例：50%/);
+  }
+});
+
+test("Google catalog and unknown-duration windows retain totals without inventing a cycle", () => {
+  for (const name of ["gemini", "primary_window", "secondary_window"]) {
+    const google = updateStats({ period: null, period_start: null, period_end: null,
+      period_tier: null, used_percent: null, estimated_capacity: null }, {
+      ...usage, kind: "google_subscription", tiers: [{ name, used_percent: 25, resets_at: new Date(end).toISOString() }],
+    });
+    for (const locale of ["en-US", "zh-CN"] as const) {
+      const html = render(google, { locale });
+      equal(values(html).join(","), "$228.79,—,—");
+      match(html, locale === "zh-CN" ? /本周期未知，请刷新用量。/ : /Current cycle unknown; refresh usage/);
+      doesNotMatch(html, /≈|\$0\.00/);
+    }
   }
 });
 
@@ -140,6 +187,21 @@ test("projection requires a unique matching tier, finite positive ratio and pric
   match(render(updateStats({ estimated_capacity: null })), /Estimate unavailable/);
 });
 
+test("Google projection rejects corrupt or missing cycle prices even with a leftover capacity", () => {
+  const google: ProviderUsage = { ...usage, kind: "google_subscription" };
+  for (const equivalent_costs of [[],
+    [{ currency: "USD", total_cost: 21.4, priced_request_count: 0 }],
+    ...[NaN, Infinity, -1].map((total_cost) => [{ currency: "USD", total_cost, priced_request_count: 1 }]),
+  ]) {
+    const value = updateStats({ period: { ...period, equivalent_costs, unpriced_request_count: 3 } }, google);
+    const html = render(value);
+    equal(values(html)[0], "$228.79");
+    equal(values(html)[2], "—");
+    match(html, /Estimate unavailable/);
+    doesNotMatch(html, /≈|NaN|Infinity/);
+  }
+});
+
 test("missing prices stay unknown, no requests display zero and mixed prices remain native", () => {
   const unpriced = { ...period, equivalent_costs: [], unpriced_request_count: 3 };
   const unknown = render(updateStats({ all_time: unpriced, period: unpriced, estimated_capacity: null }));
@@ -156,11 +218,13 @@ test("missing prices stay unknown, no requests display zero and mixed prices rem
 });
 
 test("tiny amounts and explicitly priced zero preserve account-pool formatter behavior", () => {
-  for (const [total_cost, expected] of [[0.0001, "&lt;$0.01"], [0, "$0.00"]] as const) {
-    const costs = [{ currency: "USD", total_cost, priced_request_count: 1 }];
-    const html = render(updateStats({ period: { ...period, equivalent_costs: costs }, estimated_capacity: costs }));
-    equal(values(html)[1], expected);
-    equal(values(html)[2], `≈ ${expected}`);
+  for (const kind of ["glm_coding_plan", "google_subscription"]) {
+    for (const [total_cost, expected] of [[0.0001, "&lt;$0.01"], [0, "$0.00"]] as const) {
+      const costs = [{ currency: "USD", total_cost, priced_request_count: 1 }];
+      const html = render(updateStats({ period: { ...period, equivalent_costs: costs }, estimated_capacity: costs }, { ...usage, kind }));
+      equal(values(html)[1], expected);
+      equal(values(html)[2], `≈ ${expected}`);
+    }
   }
 });
 
@@ -168,6 +232,7 @@ test("5h and monthly fallback and Grok date-only reset display the backend-selec
   for (const [kind, period_tier, reset, label] of [
     ["minimax_coding_plan", "five_hour", new Date(end).toISOString(), "5h"],
     ["openai_codex", "five_hour", new Date(end).toISOString(), "5h"],
+    ["google_subscription", "five_hour", new Date(end).toISOString(), "5h"],
     ["grok_plan", "monthly", new Date(end).toISOString(), "Monthly"],
     ["grok_plan", "weekly_limit", "2030-01-07", "Weekly"],
   ]) {

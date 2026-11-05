@@ -4,12 +4,12 @@ import { retainedUsagePriceDisplay } from "@/lib/token-usage";
 import type { ProviderUsage } from "@/lib/types";
 
 /** Display backend-priced retained attempts; never infer cycles or change routing quota. */
-export function ProviderApiPriceSummary({ usage, now, stale, loading, locale }: {
+export function ProviderApiPriceSummary({ usage, now, stale, loading, locale = "en-US" }: {
   usage: ProviderUsage;
   now: number;
   stale: boolean;
   loading: boolean;
-  locale: Locale;
+  locale?: Locale;
 }) {
   const isZh = locale === "zh-CN";
   const stats = usage.api_price;
@@ -26,8 +26,8 @@ export function ProviderApiPriceSummary({ usage, now, stale, loading, locale }: 
     ? (isZh ? "本周期已结束，请刷新用量。" : "Current cycle ended; refresh usage.")
     : (isZh ? "本周期未知，请刷新用量。" : "Current cycle unknown; refresh usage.");
   const cycleScope = isZh
-    ? "由后端按上游报告的重置周期确定，而非自然周或自然月。优先使用每周额度；未报告周额度时，GLM / MiniMax / OpenAI Codex 使用已识别的 5 小时周期，xAI 使用月度周期。不合并不同额度窗口；OpenAI Codex 的功能专用窗口和时长未知的窗口不用于本周期统计。"
-    : "Determined by the backend from the upstream-reported reset cycle, not a calendar week or month. Weekly quota is preferred; when no weekly tier is reported, GLM / MiniMax / OpenAI Codex use an identified 5h cycle and xAI uses the monthly cycle. Different quota windows are not combined; OpenAI Codex feature-specific and unknown-duration windows are not used for current-cycle statistics.";
+    ? "由后端按上游报告的重置周期确定，而非自然周或自然月。优先使用每周额度；未报告周额度时，GLM / MiniMax / OpenAI Codex 使用已识别的 5 小时周期，xAI 使用月度周期。不合并不同额度窗口；OpenAI Codex 的功能专用窗口和时长未知的窗口不用于本周期统计。Google OAuth 订阅（Antigravity / Gemini CLI）仅使用官方已识别的每周窗口，无周窗口时使用已识别的 5 小时窗口；不从模型目录的 Gemini 共享池或时长未知的主要/次要窗口推断周期。"
+    : "Determined by the backend from the upstream-reported reset cycle, not a calendar week or month. Weekly quota is preferred; when no weekly tier is reported, GLM / MiniMax / OpenAI Codex use an identified 5h cycle and xAI uses the monthly cycle. Different quota windows are not combined; OpenAI Codex feature-specific and unknown-duration windows are not used for current-cycle statistics. Google OAuth subscriptions (Antigravity / Gemini CLI) use only identified official weekly windows, falling back to an identified 5h window when no weekly window is reported; cycles are not inferred from the catalog Gemini shared pool or unknown-duration primary/secondary windows.";
   const periodTitle = [scope, cycleScope, stats?.period_tier ? `${isZh ? "额度窗口" : "Quota window"}: ${tierLabel(stats.period_tier, isZh)}` : "", hasBounds
     ? (isZh
       ? `浏览器本地时间：${new Date(start).toLocaleString(locale)} → ${new Date(end).toLocaleString(locale)}（含开始，不含结束）。`
@@ -40,6 +40,7 @@ export function ProviderApiPriceSummary({ usage, now, stale, loading, locale }: 
     && tiers[0].used_percent === usedPercent;
   const costs = stats?.estimated_capacity;
   const canEstimate = !stale && period && period.request_count > 0 && matchingTier
+    && period.equivalent_costs.some((cost) => Number.isFinite(cost.total_cost) && cost.total_cost >= 0 && cost.priced_request_count > 0)
     && usedPercent != null && Number.isFinite(usedPercent) && usedPercent > 0 && usedPercent <= 100
     && costs?.length && costs.every((cost) => Number.isFinite(cost.total_cost) && cost.total_cost >= 0 && cost.priced_request_count > 0);
   const estimatePrice = canEstimate ? retainedUsagePriceDisplay({ ...period, equivalent_costs: costs }, isZh, locale) : null;

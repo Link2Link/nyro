@@ -1,6 +1,6 @@
 # Coding-plan API-equivalent prices
 
-MiniMax, GLM, xAI/Grok and OpenAI Codex OAuth provider cards show three figures below their upstream quota windows:
+MiniMax, GLM, xAI/Grok, OpenAI Codex OAuth and Google Gemini subscription provider cards show three figures below their upstream quota windows:
 
 - **Total API price:** the API-equivalent value of all retained upstream attempts for that provider ID.
 - **Current-cycle API price:** the retained value within the selected upstream reset cycle.
@@ -16,9 +16,11 @@ USD, CNY and other native currency buckets remain separate. Missing reference pr
 
 ## Reset-cycle selection
 
-The backend selects `weekly_limit` when reported, regardless of its position among the quota bars. If no weekly tier is reported, GLM, MiniMax and OpenAI Codex use an identified `five_hour` tier; Grok uses `monthly`. Feature/model-specific windows are not combined with the selected quota.
+The backend selects `weekly_limit` when reported, regardless of its position among the quota bars. If no weekly tier is reported, GLM, MiniMax, OpenAI Codex and Google Gemini subscriptions use an identified `five_hour` tier; Grok uses `monthly`. Feature/model-specific windows are not combined with the selected quota.
 
 OpenAI Codex includes weekly-only Pro accounts. Window identity comes from the upstream duration, not the primary/secondary slot or plan name. Unknown-duration `primary_window` / `secondary_window` and feature-specific limits are not treated as a provider-wide cycle: retained total prices remain available, but current-cycle prices and capacity stay unknown. This applies to Codex OAuth subscriptions, not regular OpenAI API-key billing.
+
+Google AI Pro / Code Assist uses the same admin statistics for the Antigravity and Gemini CLI OAuth channels (`google_subscription`). Its canonical weekly/five-hour windows come from the enforced quota summary; the catalog-only `gemini` shared-pool fallback does not identify a duration and must not be guessed into a week or five hours. A reported weekly tier with 0% usage can still show the retained current-cycle price, but not projected capacity; a nonzero five-hour ratio never overrides that weekly ratio. Native upstream model identities and effort variants reuse the current Google API base reference or explicit manual price. Missing/new model references remain unpriced, not a free subscription or an older model's rate. This is not an actual Google subscription balance or API-key billing query.
 
 - Weekly: upstream reset minus seven days.
 - Five-hour: upstream reset minus five hours.
@@ -30,7 +32,7 @@ Only finite usage above 0% and at most 100%, with a priced sample from the same 
 
 ## Admin contract
 
-`GET /api/v1/providers/:id/usage`, the bulk admin usage listing, and the existing desktop `get_provider_usage` command share the optional `api_price` field for `glm_coding_plan`, `minimax_coding_plan`, `grok_plan` and `openai_codex`:
+`GET /api/v1/providers/:id/usage`, the bulk admin usage listing, and the existing desktop `get_provider_usage` command share the optional `api_price` field for `glm_coding_plan`, `minimax_coding_plan`, `grok_plan`, `openai_codex` and `google_subscription`:
 
 | Field | Meaning |
 | --- | --- |

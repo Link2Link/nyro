@@ -1070,7 +1070,7 @@ export interface ProviderUsage {
   scheduling?: ProviderScheduling;
   /** Native Devin/Kiro account readiness, including legacy single-account providers. */
   account_pool?: AccountPoolView | null;
-  /** MiniMax / GLM / Grok / OpenAI Codex retained-log prices; not upstream billing or routing quota. */
+  /** MiniMax / GLM / Grok / OpenAI Codex / Google subscription retained-log prices; not upstream billing or routing quota. */
   api_price?: ProviderApiPriceStats | null;
   /** Nyro preset (`nyro_gateway`): the remote Nyro's forwarded usage report. */
   upstream?: NyroUpstreamUsage | null;

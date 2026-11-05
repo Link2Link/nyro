@@ -1,6 +1,6 @@
 import { deepEqual, equal } from "node:assert/strict";
 import { test } from "node:test";
-import { isKiroOverage, nyroUpstreamView, providerUsagePause, providerUsageSupported, providerUsageTitle, summarizeGroupUsage, tierLabel } from "./provider-usage";
+import { isKiroOverage, nyroUpstreamView, providerApiPriceSupported, providerUsagePause, providerUsageSupported, providerUsageTitle, summarizeGroupUsage, tierLabel } from "./provider-usage";
 import type { NyroUpstreamProvider, ProviderUsage } from "./types";
 
 const kiro = { vendor: "kiro", preset_key: "kiro", channel: "ide", auth_mode: "oauth" as const, base_url: "https://q.us-east-1.amazonaws.com" };
@@ -24,6 +24,25 @@ test("Claude subscription usage needs the Claude Code OAuth identity, not the AP
   equal(providerUsageTitle("claude_code_plan", true), "Claude 订阅用量");
   equal(tierLabel("feature:sonnet:weekly_limit", false), "Sonnet · Weekly");
   equal(tierLabel("feature:fable:weekly_limit", true), "Fable · 每周");
+});
+
+test("Google subscription usage requires Antigravity or Gemini CLI OAuth identity, not Gemini API access", () => {
+  for (const channel of ["antigravity", "gemini-cli"]) {
+    const google = { vendor: "google", preset_key: "google", channel, auth_mode: "oauth" as const,
+      base_url: "https://example.test" };
+    equal(providerUsageSupported(google), true);
+    equal(providerUsageSupported({ ...google, channel: channel.toUpperCase() }), true);
+    equal(providerUsageSupported({ ...google, auth_mode: "apikey" }), false);
+    equal(providerUsageSupported({ ...google, channel: "default" }), false);
+    equal(providerUsageSupported({ ...google, auth_mode: "apikey", channel: "default",
+      base_url: "https://generativelanguage.googleapis.com" }), false);
+  }
+  equal(providerUsageTitle("google_subscription", false), "Google AI Pro Quota");
+  equal(providerUsageTitle("google_subscription", true), "Google AI Pro 配额");
+  equal(providerApiPriceSupported("google_subscription"), true);
+  for (const kind of ["google", "gemini", "google_api", "nyro_gateway", undefined]) {
+    equal(providerApiPriceSupported(kind), false);
+  }
 });
 
 test("Kiro plan title and quota breakdown labels are readable in both locales", () => {

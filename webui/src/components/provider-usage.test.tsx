@@ -69,9 +69,19 @@ const apiPrice: ProviderApiPriceStats = {
 };
 const priceUsage: ProviderUsage = { ...base, api_price: apiPrice,
   tiers: [{ name: "weekly_limit", used_percent: 10, resets_at: new Date(apiPrice.period_end!).toISOString() }] };
+const priceValues = (html: string) => [...html.matchAll(/<dd[^>]*>(.*?)<\/dd>/g)].map((result) => result[1]).join(",");
+const googleProviders = ["antigravity", "gemini-cli"].map((channel): Provider => ({
+  ...provider, id: `google-${channel}`, name: `Google AI Pro ${channel}`, vendor: "google", preset_key: "google",
+  channel, auth_mode: "oauth", protocol: "gemini", base_url: "https://cloudcode-pa.googleapis.com",
+}));
+const googleUsage = (currentProvider: Provider): ProviderUsage => ({
+  ...priceUsage, provider_id: currentProvider.id, kind: "google_subscription", level: "G1-PRO-TIER",
+  tiers: [{ name: "five_hour", used_percent: 50, resets_at: new Date(now + 2.5 * 3600_000).toISOString() },
+    ...priceUsage.tiers],
+});
 
-test("GLM MiniMax xAI and OpenAI Codex card footers include all three API prices under the quota bars", () => {
-  for (const kind of ["glm_coding_plan", "minimax_coding_plan", "grok_plan", "openai_codex"]) {
+test("GLM MiniMax xAI OpenAI Codex and Google subscription footers include all three API prices under the quota bars", () => {
+  for (const kind of ["glm_coding_plan", "minimax_coding_plan", "grok_plan", "openai_codex", "google_subscription"]) {
     const html = render({ ...priceUsage, kind });
     match(html, /Total API price/);
     match(html, /Current-cycle API price/);
@@ -110,6 +120,140 @@ test("OpenAI Pro OAuth card displays weekly prices and hides only the estimate o
   const expired = render({ ...codexUsage, api_price: { ...codexUsage.api_price!, period_end: now } }, undefined, codexProvider);
   match(expired, /Current cycle ended; refresh usage/);
   doesNotMatch(expired, />\$152\.00<|>≈ \$200\.00</);
+});
+
+test("Google AI Pro Antigravity and Gemini CLI OAuth cards use the canonical weekly price snapshot", () => {
+  for (const currentProvider of googleProviders) {
+    const html = render(googleUsage(currentProvider), undefined, currentProvider);
+    match(html, /Google AI Pro Quota/);
+    match(html, /class="[^"]*uppercase[^"]*">G1-PRO-TIER<\/span>/);
+    match(html, new RegExp(`data-provider-api-price="${currentProvider.id}"`));
+    match(html, /Total API price/);
+    match(html, /Current-cycle API price/);
+    match(html, /Estimated cycle API capacity/);
+    equal(priceValues(html), "$30.00,$3.00,≈ $30.00");
+    equal((html.match(/data-provider-api-price=/g) ?? []).length, 1);
+    equal((html.match(/role="progressbar"/g) ?? []).length, 2);
+    match(html, /5h used quota/);
+    match(html, /Weekly used quota/);
+    match(html, /Quota window: Weekly/);
+    match(html, /Used for projection: 10%/);
+    doesNotMatch(html, /≈ \$6\.00|Used for projection: 50%|<details|<summary/);
+  }
+});
+
+test("Google subscription cards accept the backend's 5h-only cycle without guessing another window", () => {
+  const period_end = now + 2 * 3600_000;
+  for (const currentProvider of googleProviders) {
+    const usage: ProviderUsage = { ...googleUsage(currentProvider),
+      tiers: [{ name: "five_hour", used_percent: 25, resets_at: new Date(period_end).toISOString() }],
+      api_price: { ...apiPrice, period_tier: "five_hour", period_start: period_end - 5 * 3600_000,
+        period_end, used_percent: 25, estimated_capacity: [{ currency: "USD", total_cost: 12, priced_request_count: 1 }] },
+    };
+    const html = render(usage, undefined, currentProvider);
+    equal(priceValues(html), "$30.00,$3.00,≈ $12.00");
+    equal((html.match(/role="progressbar"/g) ?? []).length, 1);
+    match(html, /Quota window: 5h/);
+    match(html, /Used for projection: 25%/);
+  }
+});
+
+test("Google weekly zero used keeps actual prices while capacity stays unknown even if 5h is used", () => {
+  for (const currentProvider of googleProviders) {
+    const original = googleUsage(currentProvider);
+    for (const fiveHourUsed of [0, 50]) {
+      const usage: ProviderUsage = { ...original,
+        tiers: [{ ...original.tiers[0], used_percent: fiveHourUsed }, { ...original.tiers[1], used_percent: 0 }],
+        api_price: { ...apiPrice, used_percent: 0, estimated_capacity: null },
+      };
+      const html = render(usage, undefined, currentProvider);
+      equal(priceValues(html), "$30.00,$3.00,—");
+      equal((html.match(/role="progressbar"/g) ?? []).length, 2);
+      match(html, /aria-valuenow="0"/);
+      match(html, /Quota window: Weekly/);
+      doesNotMatch(html, /≈|Used for projection:/);
+    }
+  }
+});
+
+test("Google stale, refresh-error and expired snapshots keep recorded totals without a capacity estimate", () => {
+  for (const currentProvider of googleProviders) {
+    const usage = googleUsage(currentProvider);
+    for (const html of [render(usage, new Error("Temporary Google refresh failure"), currentProvider),
+      render({ ...usage, queried_at: new Date(now - 5 * 60_000).toISOString() }, undefined, currentProvider),
+      render({ ...usage, queried_at: "invalid" }, undefined, currentProvider)]) {
+      equal(priceValues(html), "$30.00,$3.00,—");
+      match(html, /Showing stale totals; refresh usage to estimate capacity/);
+      equal((html.match(/role="progressbar"/g) ?? []).length, 2);
+    }
+    const expired = render({ ...usage, api_price: { ...apiPrice, period_end: now } }, undefined, currentProvider);
+    equal(priceValues(expired), "$30.00,—,—");
+    match(expired, /Current cycle ended; refresh usage/);
+    equal((expired.match(/role="progressbar"/g) ?? []).length, 2);
+  }
+});
+
+test("Google catalog Gemini and unknown-duration windows render quota but do not create price cycles", () => {
+  for (const currentProvider of googleProviders) {
+    for (const name of ["gemini", "primary_window", "secondary_window"]) {
+      const usage: ProviderUsage = { ...googleUsage(currentProvider),
+        tiers: [{ name, used_percent: 25, resets_at: new Date(apiPrice.period_end!).toISOString() }],
+        api_price: { ...apiPrice, period: null, period_start: null, period_end: null,
+          period_tier: null, used_percent: null, estimated_capacity: null },
+      };
+      const html = render(usage, undefined, currentProvider);
+      equal(priceValues(html), "$30.00,—,—");
+      match(html, /Current cycle unknown; refresh usage/);
+      equal((html.match(/role="progressbar"/g) ?? []).length, 1);
+      doesNotMatch(html, /≈|\$0\.00/);
+    }
+  }
+});
+
+test("Google corrupt, mismatched or missing price snapshots keep the quota card renderable", () => {
+  for (const currentProvider of googleProviders) {
+    const original = googleUsage(currentProvider);
+    for (const api_price of [undefined, null]) {
+      const html = render({ ...original, api_price }, undefined, currentProvider);
+      equal(priceValues(html), "—,—,—");
+      match(html, /API price totals unavailable/);
+      equal((html.match(/role="progressbar"/g) ?? []).length, 2);
+    }
+    for (const update of [{ period_start: NaN }, { period_end: Infinity }, { period_end: apiPrice.period_start },
+      { period: null }]) {
+      const html = render({ ...original, api_price: { ...apiPrice, ...update } }, undefined, currentProvider);
+      equal(priceValues(html), "$30.00,—,—");
+      match(html, /Current cycle unknown; refresh usage/);
+      doesNotMatch(html, /NaN|Infinity|Invalid Date/);
+    }
+    for (const estimated_capacity of [null, [], [{ currency: "USD", total_cost: NaN, priced_request_count: 1 }]]) {
+      const html = render({ ...original, api_price: { ...apiPrice, estimated_capacity } }, undefined, currentProvider);
+      equal(priceValues(html), "$30.00,$3.00,—");
+    }
+    for (const tiers of [[{ ...original.tiers[1], used_percent: 11 }],
+      [{ ...original.tiers[1], resets_at: new Date(apiPrice.period_end! + 1).toISOString() }],
+      [original.tiers[1], original.tiers[1]]]) {
+      equal(priceValues(render({ ...original, tiers }, undefined, currentProvider)), "$30.00,$3.00,—");
+    }
+    const unpriced = { ...apiPrice.period!, equivalent_costs: [], unpriced_request_count: 1 };
+    const missingCyclePrice = render({ ...original, api_price: { ...apiPrice, period: unpriced } }, undefined, currentProvider);
+    equal(priceValues(missingCyclePrice), "$30.00,—,—");
+    match(missingCyclePrice, /1 attempts unpriced and excluded/);
+  }
+});
+
+test("a downstream Nyro never renders Google administrator price summaries from forwarded usage", () => {
+  const currentProvider: Provider = { ...provider, id: "nyro-downstream", vendor: "nyro-gateway", preset_key: "nyro-gateway",
+    auth_mode: "apikey", base_url: "https://upstream.example.test" };
+  const html = render({ ...priceUsage, provider_id: currentProvider.id, kind: "nyro_gateway", upstream: {
+    redacted: ["api_price"], providers: googleProviders.map((google) => ({ id: google.id, name: google.name,
+      vendor: google.vendor, routes: ["gemini-pro"], status: "ok", usage: googleUsage(google) })),
+  } }, undefined, currentProvider);
+  match(html, /Upstream Nyro Usage/);
+  match(html, /Google AI Pro antigravity/);
+  match(html, /Google AI Pro gemini-cli/);
+  equal((html.match(/role="progressbar"/g) ?? []).length, 4);
+  doesNotMatch(html, /data-provider-api-price|data-api-price=|Total API price|Current-cycle API price|Estimated cycle API capacity|\$30\.00|\$3\.00/);
 });
 
 test("provider price projection hides on refresh failures and stale observations while history remains", () => {
