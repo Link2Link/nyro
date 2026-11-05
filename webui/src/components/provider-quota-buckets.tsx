@@ -10,27 +10,44 @@ import type { ProviderUsage, QuotaBucket, QuotaBucketFilter } from "@/lib/types"
 import { UsageProgress } from "@/components/usage-progress";
 import { ProviderApiPriceSummary } from "@/components/provider-api-price-summary";
 
-type BucketState = "available" | "exhausted" | "unknown";
+type BucketState = "available" | "observed" | "exhausted" | "unavailable" | "unknown";
 const identity = (bucket: QuotaBucket) => JSON.stringify([bucket.scope_id, bucket.id]);
 const bucketStale = (bucket: QuotaBucket, now: number, refreshFailed: boolean) => {
   const observed = Date.parse(bucket.queried_at);
   return refreshFailed || bucket.stale || !Number.isFinite(observed) || now - observed >= 5 * 60_000;
 };
-// Summarize backend decisions, never percentages or guessed model memberships.
-function bucketState(bucket: QuotaBucket, stale: boolean): BucketState {
+const accountUnavailable = (reason?: string | null) => ["account_unavailable", "no_available_account", "auth_required", "auth_error",
+  "authentication_failed", "disabled", "disconnected"].includes(reason ?? "");
+const unavailableOwner = (usage?: Pick<ProviderUsage, "is_available" | "scheduling">) => usage?.is_available === false
+  || accountUnavailable(usage?.scheduling?.reason);
+const bucketTierLabel = (name: string, zh: boolean) => name === "catalog"
+  ? (zh ? "模型目录用量" : "Model catalog usage") : tierLabel(name, zh);
+// Observation success is independent of binding/admission. Only server-projected
+// Google families can be observed here; raw labels/models never establish a family.
+function bucketState(bucket: QuotaBucket, stale: boolean, ownerUnavailable = false): BucketState {
+  if (ownerUnavailable || accountUnavailable(bucket.scheduling?.reason)) return "unavailable";
   if (bucket.scheduling?.status === "quota_exhausted") return "exhausted";
-  if (stale || bucket.binding.status !== "resolved" || !bucket.models.length || bucket.scheduling?.status !== "eligible"
+  if (stale) return "unknown";
+  if (isGoogleFamilyDisplayBucket(bucket) && bucket.binding.status === "unresolved" && bucket.models.length > 0
+    && bucket.scheduling?.status === "eligible" && ["", "unknown_mapping", "unresolved_binding"].includes(bucket.scheduling.reason ?? "")
+    && bucket.tiers.length > 0 && bucket.tiers.every((tier) => Number.isFinite(tier.used_percent)
+      && tier.used_percent >= 0 && tier.used_percent <= 100)) return "observed";
+  if (bucket.binding.status !== "resolved" || !bucket.models.length || bucket.scheduling?.status !== "eligible"
     || bucket.source === "catalog" || ["unknown_mapping", "conflicting_binding"].includes(bucket.scheduling.reason ?? "")) return "unknown";
   return "available";
 }
 const stateClass = (state: string) => state === "available" ? "bg-emerald-50 text-emerald-700"
-  : state === "exhausted" ? "bg-red-50 text-red-700" : "bg-amber-50 text-amber-700";
+  : state === "exhausted" || state === "unavailable" ? "bg-red-50 text-red-700" : "bg-amber-50 text-amber-700";
 const stateLabel = (state: BucketState, zh: boolean) => state === "available" ? (zh ? "可调度" : "Available")
-  : state === "exhausted" ? (zh ? "已暂停" : "Paused") : (zh ? "状态未知" : "Unknown");
+  : state === "observed" ? (zh ? "用量已更新" : "Usage updated")
+    : state === "unavailable" ? (zh ? "账号不可用" : "Account unavailable")
+      : state === "exhausted" ? (zh ? "已暂停" : "Paused") : (zh ? "状态未知" : "Unknown");
 const sourceLabel = (source: string, zh: boolean) => {
   const labels: Record<string, [string, string]> = {
     configured: ["Configured", "显式绑定"], official: ["Official", "官方绑定"],
     adapter: ["Validated adapter", "已验证适配规则"], google_exact_model_v1: ["Validated Google binding", "已验证 Google 绑定"],
+    google_subscription_resources_v1: ["Validated Google subscription resources", "已验证 Google 订阅资源"],
+    google_named_family_v1: ["Validated Google named family", "已验证 Google 命名模型族"],
     google_family_display_v1: ["Google family display", "Google 模型族展示"],
     catalog_exact_model_v1: ["Catalog exact-model binding", "目录精确模型绑定"], enforced_summary: ["Enforced summary", "强制额度摘要"],
     model_catalog: ["Model catalog", "模型目录"], catalog: ["Model catalog", "模型目录"],
@@ -39,27 +56,41 @@ const sourceLabel = (source: string, zh: boolean) => {
   return labels[source]?.[zh ? 1 : 0] ?? source;
 };
 
-export function QuotaBucketAvailability({ buckets, stale = false, isZh = false, now, expectedCount }: {
+export function QuotaBucketAvailability({ buckets, stale = false, isZh = false, now, expectedCount, owner }: {
   buckets: QuotaBucket[]; stale?: boolean; isZh?: boolean; now?: number; expectedCount?: number;
+  owner?: Pick<ProviderUsage, "is_available" | "scheduling">;
 }) {
   const [initialNow] = useState(() => Date.now());
   const observedNow = now ?? initialNow;
+  const ownerUnavailable = unavailableOwner(owner);
   const primary = buckets.filter((bucket) => isPrimaryQuotaBucket(bucket) && (expectedCount == null || isGoogleFamilyDisplayBucket(bucket)));
-  const states = primary.map((bucket) => bucketState(bucket, bucketStale(bucket, observedNow, stale)));
+  const states = primary.map((bucket) => bucketState(bucket, bucketStale(bucket, observedNow, stale), ownerUnavailable));
   const available = states.filter((state) => state === "available").length;
+  const observed = states.filter((state) => state === "observed").length;
   const exhausted = states.filter((state) => state === "exhausted").length;
+  const unavailable = states.filter((state) => state === "unavailable").length;
   // A fixed family count is meaningful only within one entitlement owner, never across scopes.
   const scoped = expectedCount == null || (new Set(primary.map((bucket) => bucket.scope_id)).size <= 1 && states.length <= expectedCount);
   const complete = scoped && states.length > 0 && (expectedCount == null || states.length === expectedCount);
-  const state = !scoped ? "unknown" : complete && available === states.length ? "available"
-    : complete && exhausted === states.length ? "exhausted"
-      : available > 0 ? "partial" : "unknown";
+  const state = !scoped ? "unknown" : ownerUnavailable || (complete && unavailable === states.length) ? "unavailable"
+    : complete && available === states.length ? "available"
+      : complete && exhausted === states.length ? "exhausted"
+        : available > 0 ? "partial" : observed > 0 ? "observed" : "unknown";
+  const count = state === "observed" ? available + observed : available;
+  const old = primary.some((bucket) => bucketStale(bucket, observedNow, stale));
   const label = state === "available" ? (isZh ? "全部可用" : "Available")
     : state === "partial" ? (isZh ? "部分可用" : "Partially available")
-      : state === "exhausted" ? (isZh ? "全部暂停" : "Exhausted / unavailable") : (isZh ? "状态未知" : "Unknown");
+      : state === "observed" ? (isZh ? "用量已更新" : "Usage updated")
+        : state === "unavailable" ? (isZh ? "账号不可用" : "Account unavailable")
+          : state === "exhausted" ? (isZh ? "全部暂停" : "Exhausted / unavailable")
+            : stale ? (isZh ? "刷新失败" : "Refresh failed") : old ? (isZh ? "旧数据" : "Stale") : (isZh ? "状态未知" : "Unknown");
   return <span data-quota-availability={state} className={`inline-flex items-center gap-1.5 rounded-full px-2 py-0.5 text-[10px] font-semibold ${stateClass(state)}`}>
     <span aria-hidden="true" className="h-1.5 w-1.5 rounded-full bg-current" />
-    {label}{scoped && available > 0 && ` · ${available}/${expectedCount ?? states.length}`}
+    {label}{scoped && count > 0 && ` · ${count}/${expectedCount ?? states.length}`}
+    {scoped && available > 0 && observed > 0 && ` · ${isZh ? "用量已更新" : "Usage updated"} · ${available + observed}/${expectedCount ?? states.length}`}
+    {scoped && observed > 0 && exhausted > 0 && ` · ${isZh ? "已暂停" : "Paused"} ${exhausted}`}
+    {scoped && observed > 0 && unavailable > 0 && ` · ${isZh ? "账号不可用" : "Account unavailable"} ${unavailable}`}
+    {state !== "unknown" && old && ` · ${stale ? (isZh ? "刷新失败" : "Refresh failed") : (isZh ? "旧数据" : "Stale")}`}
   </span>;
 }
 
@@ -88,8 +119,10 @@ function BucketCard({ usage, bucket, now, stale, loading, locale, onDetails }: {
 }) {
   const zh = locale === "zh-CN";
   const isStale = bucketStale(bucket, now, stale);
-  const state = bucketState(bucket, isStale);
+  const state = bucketState(bucket, isStale, unavailableOwner(usage));
   const pause = providerUsagePause({ scheduling: bucket.scheduling }, zh);
+  const statusLabel = state === "unknown" && stale ? (zh ? "刷新失败" : "Refresh failed")
+    : state === "unknown" && isStale ? (zh ? "旧数据" : "Stale") : stateLabel(state, zh);
   const totals = bucket.api_price?.all_time;
   const queriedAt = Date.parse(bucket.queried_at);
   // A scoped adapter prevents parent money/balances or unrelated tiers leaking into the summary.
@@ -121,11 +154,19 @@ function BucketCard({ usage, bucket, now, stale, loading, locale, onDetails }: {
       <div className="flex flex-wrap items-center justify-between gap-2">
         <h3 className="text-xs font-semibold text-slate-800">{bucket.label || (zh ? "未命名配额桶" : "Unnamed quota bucket")}</h3>
         <span data-bucket-status={state} className={`rounded-full px-2 py-0.5 text-[10px] font-semibold ${stateClass(state)}`}>
-          {stateLabel(state, zh)}{isStale && ` · ${zh ? "旧快照" : "stale"}`}
+          {statusLabel}{isStale && state !== "unknown" && ` · ${zh ? "旧快照" : "stale"}`}
         </span>
       </div>
       {!family && bindingDetails}
     </header>
+    {state === "observed" && <p role="status" className="rounded-lg bg-amber-50 px-2 py-1.5 text-[10px] text-amber-700">
+      {zh ? "配额绑定待确认；已取得最新用量观察，不代表强制配额已解析或可调度。"
+        : "Quota binding pending confirmation; fresh usage was observed, but enforced quota and routing availability are not confirmed."}
+    </p>}
+    {bucket.tiers.some((tier) => tier.name === "catalog") && <p className="text-[10px] text-slate-500">
+      {zh ? "来源：模型目录；用量周期未知，不用于推断周 / 5 小时配额或容量。"
+        : "Source: model catalog. The usage window is unknown; no weekly / 5h quota or capacity is inferred."}
+    </p>}
     {pause && <p className="rounded-lg bg-red-50 px-2 py-1.5 text-[10px] text-red-700">
       {pause.message}{pause.quotaExhausted && bucket.scheduling.blocking_tiers.length > 0 && ` · ${bucket.scheduling.blocking_tiers.map((name) => tierLabel(name, zh)).join(", ")}`}
     </p>}
@@ -141,12 +182,12 @@ function BucketCard({ usage, bucket, now, stale, loading, locale, onDetails }: {
         // Do not infer fixed-duration semantics from a reset timestamp. The backend owns the cycle.
         return <div key={JSON.stringify([bucket.scope_id, bucket.id, tier.name])} data-bucket-window={JSON.stringify([bucket.scope_id, bucket.id, tier.name])} className="space-y-1">
           <div className="flex justify-between gap-2 text-[11px]">
-            <span className="font-medium text-slate-500">{tierLabel(tier.name, zh)}</span>
+            <span className="font-medium text-slate-500">{bucketTierLabel(tier.name, zh)}</span>
             <span className={`font-semibold tabular-nums ${used == null ? "text-slate-400" : utilizationColor(used)}`}>
               {used == null ? (zh ? "未知" : "Unknown") : `${Math.round(used)}% ${zh ? "已用" : "used"}`}
             </span>
           </div>
-          {used != null ? <UsageProgress usedPercent={used} isZh={zh} label={`${bucket.label} ${tierLabel(tier.name, zh)} ${zh ? "已用额度" : "used quota"}`} />
+          {used != null ? <UsageProgress usedPercent={used} isZh={zh} label={`${bucket.label} ${bucketTierLabel(tier.name, zh)} ${zh ? "已用额度" : "used quota"}`} />
             : <div className="h-2 rounded-full bg-slate-100" aria-label={zh ? "用量未知" : "Usage unknown"} />}
           <p className="flex items-center gap-1 text-[10px] text-slate-400">
             <Clock className="h-3 w-3" />{zh ? "重置" : "Reset"}: {Number.isFinite(reset)
@@ -204,7 +245,7 @@ export function ProviderQuotaBuckets({ usage, now, stale, loading, locale = "en-
     <ul className="mt-2 space-y-1">{observations.map((bucket) => <li key={identity(bucket)} data-quota-observation={identity(bucket)} className="break-words">
       <strong>{bucket.label}</strong> · {sourceLabel(bucket.source, zh)} · {bucket.scheduling.status === "quota_exhausted" ? (zh ? "阻塞中" : "Blocking") : (zh ? "约束观察" : "Constraint observation")}
       {bucket.stale && ` · ${zh ? "旧数据" : "Stale"}`}
-      {bucket.tiers.map((tier) => ` · ${tierLabel(tier.name, zh)}: ${Number.isFinite(tier.used_percent) ? `${tier.used_percent}%` : (zh ? "未知" : "Unknown")}`).join("")}
+      {bucket.tiers.map((tier) => ` · ${bucketTierLabel(tier.name, zh)}: ${Number.isFinite(tier.used_percent) ? `${tier.used_percent}%` : (zh ? "未知" : "Unknown")}`).join("")}
       {google && <span className="block break-all font-mono">{bucket.models.join(" · ") || bucket.id}</span>}
     </li>)}</ul>
   </details>;

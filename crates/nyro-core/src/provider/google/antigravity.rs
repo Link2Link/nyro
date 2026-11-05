@@ -453,6 +453,8 @@ pub(crate) struct QuotaSummaryBucket {
     pub group_id: Option<String>,
     /// Actual optional model membership supplied by the response.
     pub model_ids: Vec<String>,
+    /// Contradictory/malformed identity fields cannot authorize a label fallback.
+    pub membership_conflict: bool,
     /// Only true for an explicit scope declaration, never inferred from labels.
     pub applies_to_all_models: bool,
     /// Bucket display name, when reported (takes naming priority).
@@ -522,27 +524,47 @@ fn nonempty_json_string(value: &Value) -> Option<String> {
         .map(ToString::to_string)
 }
 
-/// Read only explicit model-ID fields. Unknown schema is deliberately unbound;
-/// a displayName or a percentage is never promoted to model membership.
-fn explicit_quota_models(value: &Value) -> Vec<String> {
-    let mut models = Vec::new();
+/// Read explicit model-ID fields, retaining contradictory selectors only as
+/// diagnostic/fail-closed evidence. An invalid field must not enable a weaker
+/// catalog or human-label fallback.
+fn explicit_quota_models(value: &Value) -> (Vec<String>, bool) {
+    let mut sets = Vec::new();
+    let mut conflict = false;
     for key in ["modelIds", "models"] {
-        if let Some(entries) = value.get(key).and_then(Value::as_array) {
-            for entry in entries {
-                if let Some(id) = nonempty_json_string(entry)
-                    .or_else(|| entry.get("modelId").and_then(nonempty_json_string))
-                {
-                    models.push(id);
-                }
+        let Some(field) = value.get(key).filter(|field| !field.is_null()) else {
+            continue;
+        };
+        let Some(entries) = field.as_array() else {
+            conflict = true;
+            continue;
+        };
+        let mut ids = Vec::new();
+        for entry in entries {
+            if let Some(id) = nonempty_json_string(entry)
+                .or_else(|| entry.get("modelId").and_then(nonempty_json_string))
+            {
+                ids.push(id);
+            } else {
+                conflict = true;
             }
         }
+        ids.sort();
+        ids.dedup();
+        if !ids.is_empty() {
+            sets.push(ids);
+        }
     }
-    if let Some(model) = value.get("modelId").and_then(nonempty_json_string) {
-        models.push(model);
+    if let Some(field) = value.get("modelId").filter(|field| !field.is_null()) {
+        match nonempty_json_string(field) {
+            Some(model) => sets.push(vec![model]),
+            None => conflict = true,
+        }
     }
+    conflict |= sets.windows(2).any(|pair| pair[0] != pair[1]);
+    let mut models: Vec<_> = sets.into_iter().flatten().collect();
     models.sort();
     models.dedup();
-    models
+    (models, conflict)
 }
 
 /// Response shape: `{ groups: [ { displayName, buckets: [ { bucketId,
@@ -563,24 +585,50 @@ pub(crate) fn parse_quota_summary_buckets(payload: &Value) -> Vec<QuotaSummaryBu
         .iter()
         .flat_map(|group| {
             let group_name = non_empty(group.get("displayName").and_then(Value::as_str));
+            let (group_models, group_conflict) = explicit_quota_models(group);
+            let group_id = group.get("groupId").and_then(nonempty_json_string);
+            let quota_group_id = group.get("quotaGroupId").and_then(nonempty_json_string);
+            let id_conflict = group_id
+                .as_ref()
+                .zip(quota_group_id.as_ref())
+                .is_some_and(|(left, right)| left != right);
+            let group_id = group_id.or(quota_group_id);
             let buckets = group.get("buckets").and_then(Value::as_array);
             buckets.into_iter().flatten().filter_map(move |bucket| {
-                let remaining = bucket
-                    .get("remainingFraction")
-                    .and_then(Value::as_f64)?
-                    .clamp(0.0, 1.0);
-                let bucket_models = explicit_quota_models(bucket);
+                // A disabled/malformed observation does not prove recovery.
+                if bucket
+                    .get("disabled")
+                    .filter(|value| !value.is_null())
+                    .is_some_and(|value| value.as_bool() != Some(false))
+                {
+                    return None;
+                }
+                let remaining = bucket.get("remainingFraction").and_then(Value::as_f64)?;
+                if !remaining.is_finite() || !(0.0..=1.0).contains(&remaining) {
+                    return None;
+                }
+                let (mut bucket_models, bucket_conflict) = explicit_quota_models(bucket);
+                let scope_conflict = !group_models.is_empty()
+                    && bucket_models
+                        .iter()
+                        .any(|model| !group_models.contains(model));
+                if scope_conflict {
+                    bucket_models.extend(group_models.iter().cloned());
+                    bucket_models.sort();
+                    bucket_models.dedup();
+                }
                 Some(QuotaSummaryBucket {
                     group: group_name.clone(),
-                    group_id: group
-                        .get("groupId")
-                        .or_else(|| group.get("quotaGroupId"))
-                        .and_then(nonempty_json_string),
+                    group_id: group_id.clone(),
                     model_ids: if bucket_models.is_empty() {
-                        explicit_quota_models(group)
+                        group_models.clone()
                     } else {
                         bucket_models
                     },
+                    membership_conflict: group_conflict
+                        || bucket_conflict
+                        || scope_conflict
+                        || id_conflict,
                     applies_to_all_models: bucket
                         .get("appliesToAllModels")
                         .or_else(|| group.get("appliesToAllModels"))
@@ -1627,6 +1675,46 @@ mod tests {
         assert_eq!(models[0].id, "gemini-4-argon-high");
         assert_eq!(models[0].quota_bucket_id.as_deref(), Some("argon-week"));
         assert_eq!(models[0].quota_group_id.as_deref(), Some("argon-budget"));
+    }
+
+    #[test]
+    fn quota_parser_rejects_invalid_observations_without_inventing_fields() {
+        let payload = json!({"groups": [{"displayName": "Gemini 4 Argon", "buckets": [
+            {"bucketId": "disabled", "remainingFraction": 1.0, "disabled": true},
+            {"bucketId": "malformed", "remainingFraction": 1.0, "disabled": "false"},
+            {"bucketId": "negative", "remainingFraction": -0.1},
+            {"bucketId": "over", "remainingFraction": 1.1},
+            {"bucketId": "missing"},
+            {"bucketId": "valid", "window": "weekly", "remainingFraction": 0.4,
+             "disabled": false, "routing": {"model": "not-a-documented-field"}}
+        ]}]});
+        let buckets = parse_quota_summary_buckets(&payload);
+        assert_eq!(buckets.len(), 1);
+        assert_eq!(buckets[0].bucket_id.as_deref(), Some("valid"));
+        assert_eq!(buckets[0].window.as_deref(), Some("weekly"));
+        assert!(buckets[0].model_ids.is_empty());
+        assert!(buckets[0].group_id.is_none());
+        assert!(!buckets[0].membership_conflict);
+    }
+
+    #[test]
+    fn quota_parser_preserves_explicit_selector_conflicts() {
+        let buckets = parse_quota_summary_buckets(&json!({"groups": [
+            {"groupId": "g", "quotaGroupId": "different", "modelIds": ["flash"], "buckets": [
+                {"bucketId": "ids", "remainingFraction": 0.5}]},
+            {"modelIds": ["flash"], "buckets": [
+                {"bucketId": "scope", "modelId": "argon", "remainingFraction": 0.5}]},
+            {"buckets": [
+                {"bucketId": "aliases", "modelIds": ["flash"], "models": [{"modelId": "argon"}], "remainingFraction": 0.5},
+                {"bucketId": "type", "modelIds": "argon", "remainingFraction": 0.5},
+                {"bucketId": "consistent", "modelIds": ["argon", "argon"], "models": [{"modelId": "argon"}], "modelId": "argon", "remainingFraction": 0.5}]}
+        ]}));
+        assert_eq!(buckets.len(), 5);
+        assert!(buckets[..4].iter().all(|bucket| bucket.membership_conflict));
+        assert_eq!(buckets[1].model_ids, vec!["argon", "flash"]);
+        assert_eq!(buckets[2].model_ids, vec!["argon", "flash"]);
+        assert!(!buckets[4].membership_conflict);
+        assert_eq!(buckets[4].model_ids, vec!["argon"]);
     }
 
     #[test]

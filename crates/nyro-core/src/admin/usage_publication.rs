@@ -72,6 +72,74 @@ pub(crate) fn canonical_bucket_tiers(tiers: &[ProviderUsageTier]) -> Vec<Provide
         .collect()
 }
 
+/// Preserve successful Google model-catalog observations without assigning a
+/// made-up duration. Observation quality is independent of admission binding.
+fn google_observation_tiers(tiers: &[ProviderUsageTier]) -> Vec<ProviderUsageTier> {
+    let mut result = canonical_bucket_tiers(tiers);
+    let mut catalog = tiers.iter().filter(|tier| tier.name == "catalog");
+    if let Some(first) = catalog.next()
+        && first.used_percent.is_finite()
+        && (0.0..=100.0).contains(&first.used_percent)
+        && catalog.all(|tier| tier == first)
+    {
+        result.push(first.clone());
+    }
+    result
+}
+
+/// A successful query can return observed usage while resource binding remains
+/// incomplete. Do not report that as an upstream/HTTP query failure, or rewrite
+/// binding/scheduling evidence just to make a usage consumer render the values.
+pub(crate) fn google_bucket_query_succeeded(usage: &ProviderUsage, bucket: &QuotaBucket) -> bool {
+    let observed_at = chrono::DateTime::parse_from_rfc3339(&bucket.queried_at).ok();
+    let snapshot_at = chrono::DateTime::parse_from_rfc3339(&usage.queried_at).ok();
+    let fresh = observed_at
+        .zip(snapshot_at)
+        .is_some_and(|(observed, snapshot)| {
+            let age = snapshot.signed_duration_since(observed).num_milliseconds();
+            (0..300_000).contains(&age)
+        });
+    let invalid_source = usage.quota_buckets.iter().any(|source| {
+        source.scope_id == bucket.scope_id
+            && bucket.constraint_ids.contains(&source.id)
+            && (source.binding.status == "conflict"
+                || source.tiers.iter().any(|tier| {
+                    !tier.used_percent.is_finite() || !(0.0..=100.0).contains(&tier.used_percent)
+                }))
+    });
+    !bucket.stale
+        && fresh
+        && !invalid_source
+        && !bucket.models.is_empty()
+        && !google_observation_tiers(&bucket.tiers).is_empty()
+        && !bucket_tiers_conflict(&bucket.tiers)
+        && bucket
+            .tiers
+            .iter()
+            .all(|tier| tier.used_percent.is_finite() && (0.0..=100.0).contains(&tier.used_percent))
+        && usage.is_available != Some(false)
+        && !matches!(
+            bucket.scheduling.reason.as_deref(),
+            Some(
+                "conflicting_binding"
+                    | "account_unavailable"
+                    | "auth_required"
+                    | "auth_error"
+                    | "authentication_failed"
+            )
+        )
+        && !matches!(
+            usage.scheduling.reason.as_deref(),
+            Some(
+                "account_unavailable"
+                    | "no_available_account"
+                    | "auth_required"
+                    | "auth_error"
+                    | "authentication_failed"
+            )
+        )
+}
+
 pub(crate) fn bucket_tiers_conflict(tiers: &[ProviderUsageTier]) -> bool {
     ["five_hour", "daily", "weekly_limit", "monthly"]
         .into_iter()
@@ -147,7 +215,11 @@ pub(crate) fn bucket_usage(usage: &ProviderUsage, bucket: &QuotaBucket) -> Provi
         kind: usage.kind.clone(),
         site: usage.site.clone(),
         level: usage.level.clone(),
-        tiers: canonical_bucket_tiers(&bucket.tiers),
+        tiers: if usage.kind == "google_subscription" {
+            google_observation_tiers(&bucket.tiers)
+        } else {
+            canonical_bucket_tiers(&bucket.tiers)
+        },
         balances: Vec::new(),
         spends: Vec::new(),
         is_available: usage.is_available,
@@ -174,28 +246,28 @@ fn published_google_items(
         .iter()
         .filter(|bucket| bucket.is_primary())
         .map(|bucket| {
-            let known = bucket.is_resolved() && !bucket_tiers_conflict(&bucket.tiers);
+            let observed = google_bucket_query_succeeded(&display, bucket);
             let projected = bucket_usage(&display, bucket);
             PublishedProviderUsageListItem {
                 provider_id: projected.provider_id.clone(),
                 provider_name: format!("{} · {}", item.provider_name, bucket.label),
                 is_enabled: item.is_enabled,
-                status: if known {
+                status: if observed {
                     item.status
                 } else {
                     ProviderUsageQueryStatus::Error
                 },
-                error: if known {
+                error: if observed {
                     item.error.clone()
                 } else {
                     Some(
-                        "Model-family quota is incomplete; inspect the structured provider view"
+                        "No fresh valid model-family usage observation; refresh the provider usage"
                             .into(),
                     )
                 },
-                // Unknown observations may carry measured utilization, never an
-                // invented healthy supplier or an inferred fixed-window cycle.
-                usage: Some(projected),
+                // Preserve the status discriminator: measured catalog usage is
+                // query-successful, while its binding may still be unresolved.
+                usage: observed.then_some(projected),
                 usage_entry: Some(PublishedUsageEntry {
                     kind: "quota_bucket",
                     source_provider_ref: item.provider_id.clone(),
@@ -643,7 +715,7 @@ mod tests {
     }
 
     #[test]
-    fn google_catalog_families_are_unknown_rows_not_healthy_or_extra_suppliers() {
+    fn google_catalog_families_publish_successful_observations_without_claiming_binding() {
         let mut source = google_item();
         for bucket in &mut source.usage.as_mut().unwrap().quota_buckets {
             bucket.source = "catalog".into();
@@ -659,16 +731,99 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert!(
             rows.iter()
-                .all(|row| row.status == ProviderUsageQueryStatus::Error)
+                .all(|row| row.status == ProviderUsageQueryStatus::Ok && row.error.is_none())
         );
-        assert!(
-            rows.iter()
-                .all(|row| row.usage.as_ref().unwrap().tiers.is_empty())
-        );
+        assert!(rows.iter().all(|row| {
+            let usage = row.usage.as_ref().unwrap();
+            usage.tiers.len() == 1
+                && usage.tiers[0].name == "catalog"
+                && usage.tiers[0].used_percent == 20.0
+                && usage.scheduling.reason.as_deref() == Some("unknown_mapping")
+                && usage.api_price.as_ref().is_none_or(|price| {
+                    price.period.is_none() && price.estimated_capacity.is_none()
+                })
+        }));
         assert!(
             rows.iter()
                 .all(|row| row.usage_entry.as_ref().unwrap().binding_status == "unresolved")
         );
+    }
+
+    #[test]
+    fn google_usage_query_quality_is_separate_from_binding_and_invalid_observations() {
+        let mut source = google_item();
+        let usage = source.usage.as_mut().unwrap();
+        usage.queried_at = "2030-01-01T00:00:00Z".into();
+        let mut observed = usage.quota_buckets[0].clone();
+        observed.binding.status = "unresolved".into();
+        observed.source = "google_family_display_v1".into();
+        observed.queried_at = usage.queried_at.clone();
+        observed.scheduling.reason = Some("unknown_mapping".into());
+        observed.tiers = vec![ProviderUsageTier {
+            name: "catalog".into(),
+            used_percent: 0.0,
+            resets_at: None,
+        }];
+        assert!(google_bucket_query_succeeded(usage, &observed));
+        for mode in [
+            "stale",
+            "old",
+            "future",
+            "invalid-time",
+            "nan",
+            "over",
+            "empty",
+            "auth",
+            "conflict",
+        ] {
+            let mut invalid = observed.clone();
+            match mode {
+                "stale" => invalid.stale = true,
+                "old" => invalid.queried_at = "2029-12-31T23:55:00Z".into(),
+                "future" => invalid.queried_at = "2030-01-01T00:00:01Z".into(),
+                "invalid-time" => invalid.queried_at = "invalid".into(),
+                "nan" => invalid.tiers[0].used_percent = f64::NAN,
+                "over" => invalid.tiers[0].used_percent = 101.0,
+                "empty" => invalid.tiers.clear(),
+                "auth" => invalid.scheduling.reason = Some("account_unavailable".into()),
+                "conflict" => invalid.scheduling.reason = Some("conflicting_binding".into()),
+                _ => unreachable!(),
+            }
+            assert!(!google_bucket_query_succeeded(usage, &invalid), "{mode}");
+        }
+        observed.queried_at = "2029-12-31T23:59:59Z".into();
+        observed.tiers[0].used_percent = 100.0;
+        observed.scheduling.status = ProviderSchedulingStatus::QuotaExhausted;
+        observed.scheduling.reason = Some("usage_limit".into());
+        assert!(
+            google_bucket_query_succeeded(usage, &observed),
+            "known exhaustion is a successful query, not an upstream outage"
+        );
+        usage.is_available = Some(false);
+        assert!(!google_bucket_query_succeeded(usage, &observed));
+    }
+
+    #[test]
+    fn google_published_query_errors_do_not_carry_success_usage_payloads() {
+        for mode in ["stale", "invalid"] {
+            let mut source = google_item();
+            for bucket in &mut source.usage.as_mut().unwrap().quota_buckets {
+                if mode == "stale" {
+                    bucket.stale = true;
+                } else {
+                    bucket.tiers[0].used_percent = f64::NAN;
+                }
+            }
+            let rows = published_usage_items(vec![source]);
+            assert_eq!(rows.len(), 2);
+            assert!(
+                rows.iter()
+                    .all(|row| row.status == ProviderUsageQueryStatus::Error
+                        && row.error.is_some()
+                        && row.usage.is_none()),
+                "{mode}"
+            );
+        }
     }
 
     #[test]

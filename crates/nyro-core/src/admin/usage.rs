@@ -711,6 +711,16 @@ fn google_subscription_tiers(
 /// `weekly_limit` -> "每周") and feeds the steady-pace marker; unknown
 /// windows fall back to a lowercased copy.
 fn quota_window_tag(window: Option<&str>) -> String {
+    let legacy = legacy_quota_window_tag(window);
+    match legacy.as_str() {
+        "5h" => "five_hour".to_owned(),
+        _ => legacy,
+    }
+}
+
+/// Resource hashes predate the `5h` presentation alias. Keep their input stable:
+/// an alias fix must not retire operator references or an exhausted window fence.
+fn legacy_quota_window_tag(window: Option<&str>) -> String {
     let window = window.unwrap_or_default().trim();
     match window.to_ascii_uppercase().as_str() {
         "WEEKLY" => "weekly_limit".to_owned(),
@@ -977,6 +987,74 @@ fn google_scheduling_observation(tiers: &[ProviderUsageTier]) -> Vec<QuotaTierOb
     .unwrap_or_default()
 }
 
+/// Versioned adapter associations for the observed subscription contract. This
+/// whitelist is usage-only: it never collapses callable models or strips tiers.
+/// Shared Gemini resource IDs were independently verified against Admin opaque
+/// IDs; generic Gemini/Weekly labels and third-party pools remain unbound.
+fn google_subscription_family(
+    observation: &crate::provider::google::antigravity::QuotaSummaryBucket,
+) -> Result<Option<(&'static str, &'static str)>, ()> {
+    let window = quota_window_tag(observation.window.as_deref());
+    if !matches!(window.as_str(), "five_hour" | "weekly_limit") {
+        return Ok(None);
+    }
+    // These known resources never establish first-party family membership,
+    // even if a malformed response supplies a misleading human label.
+    if matches!(
+        observation.bucket_id.as_deref(),
+        Some("3p-5h" | "3p-weekly")
+    ) {
+        return Ok(None);
+    }
+    let resource_family = match (observation.bucket_id.as_deref(), window.as_str()) {
+        (Some("gemini-5h"), "five_hour") | (Some("gemini-weekly"), "weekly_limit") => {
+            Some("gemini-3.8-flash")
+        }
+        _ => None,
+    };
+    let mut named_family = None;
+    for label in [
+        observation.group.as_deref(),
+        observation.display_name.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        for (label_base, family) in [
+            ("Gemini 3.8 Flash", "gemini-3.8-flash"),
+            ("Gemini 4 Argon", "gemini-4-argon"),
+        ] {
+            let named = label == label_base
+                || match window.as_str() {
+                    "weekly_limit" => {
+                        label == format!("{label_base} Weekly Limit")
+                            || label == format!("{label_base} Weekly Limit Remaining")
+                    }
+                    "five_hour" => {
+                        label == format!("{label_base} Five Hour Limit")
+                            || label == format!("{label_base} Five Hour Limit Remaining")
+                    }
+                    _ => false,
+                };
+            if named {
+                if named_family.is_some_and(|old| old != family) {
+                    return Err(());
+                }
+                named_family = Some(family);
+            }
+        }
+    }
+    if resource_family
+        .zip(named_family)
+        .is_some_and(|(left, right)| left != right)
+    {
+        return Err(());
+    }
+    Ok(resource_family
+        .map(|family| (family, "google_subscription_resources_v1"))
+        .or_else(|| named_family.map(|family| (family, "google_named_family_v1"))))
+}
+
 /// Preserve actual Google model/resource identity before aggregation. Equal
 /// percentages, reset times and generic labels are never binding evidence.
 fn google_quota_buckets(
@@ -992,9 +1070,11 @@ fn google_quota_buckets(
     for observation in summary {
         let mut members = observation.model_ids.clone();
         let mut binding_source = "official";
+        let mut membership_conflict = observation.membership_conflict;
+        let mut adapter_family = None;
         // Catalog resource references are explicit associations too. A label
         // substring is not. Never strip tier suffixes (especially Argon's).
-        if members.is_empty() {
+        if members.is_empty() && !membership_conflict {
             members = models
                 .iter()
                 .filter(|model| {
@@ -1010,9 +1090,8 @@ fn google_quota_buckets(
                 .map(|model| model.id.clone())
                 .collect();
         }
-        if members.is_empty() {
-            // Version 1 rule accepts only a literal discovered wire model ID,
-            // never human family labels such as "Gemini" or "Flash".
+        if members.is_empty() && !membership_conflict {
+            // Preserve literal discovered wire-ID precedence over adapter names.
             for name in [
                 observation.group.as_deref(),
                 observation.display_name.as_deref(),
@@ -1026,10 +1105,34 @@ fn google_quota_buckets(
             }
             binding_source = "google_exact_model_v1";
         }
+        if members.is_empty()
+            && !membership_conflict
+            && !observation.applies_to_all_models
+            && (observation.bucket_id.is_some() || observation.group_id.is_some())
+        {
+            match google_subscription_family(observation) {
+                Ok(Some((family, source))) => {
+                    // No synthetic base aliases or unknown suffixes: expand only
+                    // exact IDs actually present in this account's discovery.
+                    members = models
+                        .iter()
+                        .filter(|model| {
+                            crate::quota_buckets::google_display_family(&model.id) == Some(family)
+                        })
+                        .map(|model| model.id.clone())
+                        .collect();
+                    binding_source = source;
+                    adapter_family = Some(family);
+                }
+                Ok(None) => {}
+                Err(()) => membership_conflict = true,
+            }
+        }
         members.sort();
         members.dedup();
         let member_key = members.join("\0");
         let window = quota_window_tag(observation.window.as_deref());
+        let identity_window = legacy_quota_window_tag(observation.window.as_deref());
         let resource_key = observation
             .bucket_id
             .as_deref()
@@ -1047,7 +1150,7 @@ fn google_quota_buckets(
                 scope_id,
                 resource_key.unwrap_or("unidentified"),
                 identity_members,
-                &window,
+                &identity_window,
             ],
         );
         let label = observation
@@ -1061,13 +1164,17 @@ fn google_quota_buckets(
             label,
             models: members.clone(),
             binding: QuotaBucketBinding {
-                status: if observation.applies_to_all_models {
+                status: if membership_conflict {
+                    "conflict"
+                } else if observation.applies_to_all_models {
                     "shared_constraint"
                 } else {
                     "unresolved"
                 }
                 .to_owned(),
-                source: if observation.applies_to_all_models {
+                source: if membership_conflict {
+                    "conflicting_official_v1"
+                } else if observation.applies_to_all_models {
                     "official_all_models_v1"
                 } else {
                     binding_source
@@ -1104,15 +1211,16 @@ fn google_quota_buckets(
         }
         let index = result.len();
         result.push(bucket);
-        if observation.applies_to_all_models {
+        if observation.applies_to_all_models && !membership_conflict {
             global_ids.push(id);
-        } else if !members.is_empty() {
+        } else if !members.is_empty() && !membership_conflict {
             // Explicit group identity can establish the parent across windows;
             // absent that, exact official member sets establish the same scope.
-            let group_key = observation
-                .group_id
-                .clone()
-                .unwrap_or_else(|| member_key.clone());
+            let group_key = observation.group_id.clone().unwrap_or_else(|| {
+                adapter_family
+                    .map(|family| format!("{binding_source}:{family}"))
+                    .unwrap_or_else(|| member_key.clone())
+            });
             groups.entry(group_key).or_default().push(index);
         }
     }
@@ -6382,6 +6490,318 @@ mod tests {
     }
 
     #[test]
+    fn google_subscription_resources_bind_only_confirmed_discovered_families() {
+        use crate::provider::google::antigravity::{
+            parse_available_models_detailed, parse_quota_summary_buckets,
+        };
+        let models = parse_available_models_detailed(&serde_json::json!({"models": {
+            "gemini-3.8-flash-high": {"quotaInfo": {"remainingFraction": 0.99}},
+            "gemini-3.8-flash-medium": {"quotaInfo": {"remainingFraction": 0.99}},
+            "gemini-3.8-flash-low": {"quotaInfo": {"remainingFraction": 0.99}},
+            "gemini-3.8-flash-tiered": {"quotaInfo": {"remainingFraction": 0.99}},
+            "gemini-3.8-flash-future": {"quotaInfo": {"remainingFraction": 0.99}},
+            "gemini-4-argon-high": {"quotaInfo": {"remainingFraction": 0.99}},
+            "gemini-4-argon-medium": {"quotaInfo": {"remainingFraction": 0.99}},
+            "gemini-4-argon-low": {"quotaInfo": {"remainingFraction": 0.99}},
+            "claude-opus-5-5-high": {"quotaInfo": {"remainingFraction": 0.99}}
+        }}));
+        // Sanitized observed shape. The Argon ID is deliberately arbitrary:
+        // its complete explicit family label, not an invented ID, binds it.
+        let mut summary = parse_quota_summary_buckets(&serde_json::json!({"groups": [
+            {"displayName": "Gemini Models", "buckets": [
+                {"bucketId": "gemini-weekly", "displayName": "Weekly Limit Remaining", "window": "weekly", "remainingFraction": 0.8},
+                {"bucketId": "gemini-5h", "displayName": "Five Hour Limit Remaining", "window": "5h", "remainingFraction": 0.0}]},
+            {"displayName": "Claude and GPT models", "buckets": [
+                {"bucketId": "3p-weekly", "displayName": "Weekly Limit Remaining", "window": "weekly", "remainingFraction": 0.0},
+                {"bucketId": "3p-5h", "displayName": "Five Hour Limit Remaining", "window": "5h", "remainingFraction": 0.0}]},
+            {"displayName": "Gemini 4 Argon", "buckets": [
+                {"bucketId": "observed-argon-resource", "displayName": "Gemini 4 Argon Weekly Limit", "window": "weekly", "remainingFraction": 0.9}]}
+        ]}));
+        for channel in ["antigravity", "gemini-cli"] {
+            let provider = provider_for_usage(
+                Some("google"),
+                Some("google"),
+                Some(channel),
+                "https://cloudcode-pa.googleapis.com",
+            );
+            assert_eq!(
+                UsageBackend::detect(&provider),
+                Some(UsageBackend::GoogleSubscription)
+            );
+            let raw = google_quota_buckets(channel, &models, &summary, "2030-01-01T00:00:00Z");
+            let enforced: Vec<_> = raw
+                .iter()
+                .filter(|bucket| bucket.is_resolved() && bucket.source == "enforced_summary")
+                .collect();
+            assert_eq!(enforced.len(), 2);
+            let flash = enforced
+                .iter()
+                .find(|bucket| {
+                    bucket
+                        .models
+                        .iter()
+                        .any(|model| model == "gemini-3.8-flash-high")
+                })
+                .unwrap();
+            assert_eq!(flash.binding.source, "google_subscription_resources_v1");
+            assert_eq!(flash.models.len(), 4);
+            assert_eq!(
+                flash
+                    .tiers
+                    .iter()
+                    .map(|tier| tier.name.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["five_hour", "weekly_limit"]
+            );
+            let argon = enforced
+                .iter()
+                .find(|bucket| {
+                    bucket
+                        .models
+                        .iter()
+                        .any(|model| model == "gemini-4-argon-low")
+                })
+                .unwrap();
+            assert_eq!(argon.binding.source, "google_named_family_v1");
+            assert_eq!(argon.models.len(), 3);
+            assert_eq!(argon.tiers.len(), 1);
+            assert_eq!(argon.tiers[0].name, "weekly_limit");
+            assert_eq!(argon.tiers[0].used_percent, 10.0);
+            assert!(
+                argon
+                    .constraint_ids
+                    .iter()
+                    .all(|id| !flash.constraint_ids.contains(id))
+            );
+            let registry = crate::router::quota::ProviderQuotaRegistry::new();
+            let (effective, _) = registry.observe_buckets(channel, &raw, Some(true));
+            for model in &flash.models {
+                assert!(!registry.is_model_schedulable(channel, model));
+            }
+            for model in &argon.models {
+                assert!(registry.is_model_schedulable(channel, model));
+            }
+            assert!(registry.is_model_schedulable(channel, "gemini-3.8-flash"));
+            assert!(
+                registry
+                    .model_snapshot(channel, "gemini-3.8-flash")
+                    .is_none()
+            );
+            assert_eq!(
+                registry
+                    .model_snapshot(channel, "gemini-3.8-flash-future")
+                    .unwrap()
+                    .source,
+                "catalog"
+            );
+            assert!(
+                effective
+                    .iter()
+                    .filter(|bucket| bucket.label == "Weekly Limit Remaining"
+                        && bucket.models.is_empty())
+                    .count()
+                    >= 1
+            );
+            assert!(
+                effective
+                    .iter()
+                    .filter(|bucket| bucket.source == "enforced_summary")
+                    .all(|bucket| !bucket.models.iter().any(|id| id.starts_with("claude")))
+            );
+        }
+        // The dedicated Argon window blocks only Argon; an exhausted 3p window
+        // cannot be attached to either family, even with identical utilization.
+        summary[1].remaining_fraction = 0.9;
+        summary[4].remaining_fraction = 0.0;
+        let registry = crate::router::quota::ProviderQuotaRegistry::new();
+        registry.observe_buckets(
+            "p",
+            &google_quota_buckets("owner", &models, &summary, "2030-01-01T00:00:00Z"),
+            Some(true),
+        );
+        assert!(registry.is_model_schedulable("p", "gemini-3.8-flash-high"));
+        assert!(!registry.is_model_schedulable("p", "gemini-4-argon-high"));
+    }
+
+    #[test]
+    fn google_named_family_rules_are_exact_and_never_override_explicit_members() {
+        use crate::provider::google::antigravity::{
+            parse_available_models_detailed, parse_quota_summary_buckets,
+        };
+        let models = parse_available_models_detailed(&serde_json::json!({"models": {
+            "gemini-3.8-flash-high": {"quotaInfo": {"remainingFraction": 0.8}},
+            "gemini-4-argon-low": {"quotaInfo": {"remainingFraction": 0.8}}
+        }}));
+        for (label, window) in [
+            ("Gemini", "weekly"),
+            ("Flash", "5h"),
+            ("Argon", "weekly"),
+            ("Weekly Limit Remaining", "weekly"),
+            ("Five Hour Limit Remaining", "5h"),
+            ("Gemini 4 Argon Weekly Limit Extra", "weekly"),
+            ("Gemini 4 Argon Weekly Limit", "5h"),
+            ("Gemini 4 Argon", "rolling_week"),
+        ] {
+            let summary = parse_quota_summary_buckets(
+                &serde_json::json!({"groups": [{"buckets": [{
+                    "bucketId": "unknown", "displayName": label, "window": window, "remainingFraction": 0.0
+                }]}]}),
+            );
+            let raw = google_quota_buckets("owner", &models, &summary, "2030-01-01T00:00:00Z");
+            assert!(
+                !raw.iter()
+                    .any(|bucket| bucket.is_resolved() && bucket.source == "enforced_summary"),
+                "{label} / {window}"
+            );
+        }
+        let summary = parse_quota_summary_buckets(&serde_json::json!({"groups": [{"buckets": [
+            {"bucketId": "explicit", "modelIds": ["gemini-3.8-flash-high"], "displayName": "Gemini 4 Argon Weekly Limit", "window": "weekly", "remainingFraction": 0.0},
+            {"bucketId": "3p-weekly", "displayName": "Gemini 4 Argon Weekly Limit", "window": "weekly", "remainingFraction": 0.0},
+            {"bucketId": "conflict", "modelIds": ["gemini-3.8-flash-high"], "modelId": "gemini-4-argon-low", "displayName": "Gemini 4 Argon Weekly Limit", "window": "weekly", "remainingFraction": 0.9}
+        ]}]}));
+        let raw = google_quota_buckets("owner", &models, &summary, "2030-01-01T00:00:00Z");
+        let explicit = raw
+            .iter()
+            .find(|bucket| bucket.is_resolved() && bucket.source == "enforced_summary")
+            .unwrap();
+        assert_eq!(explicit.models, vec!["gemini-3.8-flash-high"]);
+        assert_eq!(explicit.binding.source, "official");
+        assert!(
+            raw.iter()
+                .any(|bucket| bucket.binding.source == "conflicting_official_v1")
+        );
+        assert!(
+            !raw.iter()
+                .any(|bucket| bucket.binding.source == "google_named_family_v1")
+        );
+        let registry = crate::router::quota::ProviderQuotaRegistry::new();
+        registry.observe_buckets("p", &raw, None);
+        assert!(!registry.is_model_schedulable("p", "gemini-4-argon-low"));
+    }
+
+    #[test]
+    fn google_adapter_promotion_keeps_resource_ids_and_parent_membership_stable() {
+        use crate::provider::google::antigravity::{
+            parse_available_models_detailed, parse_quota_summary_buckets,
+        };
+        let partial = parse_available_models_detailed(&serde_json::json!({"models": {
+            "gemini-3.8-flash-high": {"quotaInfo": {"remainingFraction": 0.99}},
+            "gemini-4-argon-low": {"quotaInfo": {"remainingFraction": 0.99}}
+        }}));
+        let complete = parse_available_models_detailed(&serde_json::json!({"models": {
+            "gemini-3.8-flash-high": {"quotaInfo": {"remainingFraction": 0.99}},
+            "gemini-3.8-flash-low": {"quotaInfo": {"remainingFraction": 0.99}},
+            "gemini-4-argon-low": {"quotaInfo": {"remainingFraction": 0.99}},
+            "gemini-4-argon-high": {"quotaInfo": {"remainingFraction": 0.99}}
+        }}));
+        let summary = parse_quota_summary_buckets(&serde_json::json!({"groups": [{"buckets": [
+            {"bucketId": "gemini-5h", "window": "5h", "remainingFraction": 0.1},
+            {"bucketId": "gemini-weekly", "window": "weekly", "remainingFraction": 0.9},
+            {"bucketId": "argon-specific", "displayName": "Gemini 4 Argon Weekly Limit", "window": "weekly", "remainingFraction": 0.8}
+        ]}]}));
+        let first = google_quota_buckets("owner", &partial, &summary, "2030-01-01T00:00:00Z");
+        let second = google_quota_buckets("owner", &complete, &summary, "2030-01-01T00:01:00Z");
+        assert_eq!(
+            first
+                .iter()
+                .filter(|bucket| bucket.is_resolved())
+                .map(|bucket| &bucket.id)
+                .collect::<Vec<_>>(),
+            second
+                .iter()
+                .filter(|bucket| bucket.is_resolved())
+                .map(|bucket| &bucket.id)
+                .collect::<Vec<_>>()
+        );
+        let raw_id = opaque_quota_id("google_constraint_v1", &["owner", "gemini-5h", "", "5h"]);
+        assert!(
+            second
+                .iter()
+                .any(|bucket| bucket.id == raw_id && bucket.tiers[0].name == "five_hour")
+        );
+        let registry = crate::router::quota::ProviderQuotaRegistry::new();
+        // Simulate the pre-fix catalog primaries plus unbound official resources.
+        let mut legacy = google_quota_buckets("owner", &partial, &[], "2029-12-31T23:59:00Z");
+        legacy.extend(
+            first
+                .iter()
+                .filter(|bucket| !bucket.is_primary())
+                .cloned()
+                .map(|mut bucket| {
+                    bucket.models.clear();
+                    bucket.binding.status = "unresolved".to_owned();
+                    bucket.binding.source = "google_exact_model_v1".to_owned();
+                    bucket
+                }),
+        );
+        registry.observe_buckets("p", &legacy, None);
+        registry.observe_buckets("p", &first, None);
+        registry.observe_buckets("p", &second, None);
+        assert!(
+            registry
+                .model_snapshot("p", "gemini-3.8-flash-low")
+                .is_some()
+        );
+        assert!(
+            registry
+                .model_snapshot("p", "gemini-4-argon-high")
+                .is_some()
+        );
+        assert!(
+            !registry
+                .bucket_snapshot("p")
+                .iter()
+                .any(|bucket| bucket.binding.status == "conflict")
+        );
+        // Retired catalog diagnostics may remain with no members; they must
+        // neither bind a known model nor create an active competing primary.
+        assert!(
+            registry
+                .bucket_snapshot("p")
+                .iter()
+                .filter(|bucket| bucket.source == "catalog")
+                .all(|bucket| bucket.models.is_empty() && !bucket.is_resolved())
+        );
+        for model in &complete {
+            assert_eq!(
+                registry.model_snapshot("p", &model.id).unwrap().source,
+                "enforced_summary"
+            );
+        }
+        let config = QuotaBucketConfig {
+            revision: 1,
+            bindings: vec![crate::quota_buckets::ManualQuotaBucketBinding {
+                id: "operator-flash".into(),
+                scope_id: "owner".into(),
+                label: "Flash allowance".into(),
+                models: vec![
+                    "gemini-3.8-flash-high".into(),
+                    "gemini-3.8-flash-low".into(),
+                ],
+                constraint_ids: second
+                    .iter()
+                    .find(|bucket| {
+                        bucket.binding.source == "google_subscription_resources_v1"
+                            && bucket.is_resolved()
+                    })
+                    .unwrap()
+                    .constraint_ids
+                    .clone(),
+            }],
+        };
+        let resources: Vec<_> = second
+            .iter()
+            .filter(|bucket| !bucket.is_primary())
+            .cloned()
+            .collect();
+        assert!(apply_quota_bucket_config(&resources, &config).is_ok());
+        let other_owner =
+            google_quota_buckets("other-owner", &complete, &summary, "2030-01-01T00:01:00Z");
+        assert!(!other_owner.iter().any(|bucket| bucket.id == raw_id));
+        assert!(apply_quota_bucket_config(&other_owner, &config).is_err());
+    }
+
+    #[test]
     fn google_buckets_preserve_flash_argon_and_unknown_identity() {
         use crate::provider::google::antigravity::{
             parse_available_models_detailed, parse_quota_summary_buckets,
@@ -6487,6 +6907,10 @@ mod tests {
     #[test]
     fn google_rolling_or_unrecognized_windows_do_not_gain_fixed_duration() {
         assert_eq!(quota_window_tag(Some("FIVE_HOURS")), "five_hour");
+        assert_eq!(quota_window_tag(Some(" 5h ")), "five_hour");
+        assert_eq!(quota_window_tag(Some("FIVE_HOUR")), "five_hour");
+        assert_eq!(legacy_quota_window_tag(Some("5h")), "5h");
+        assert_eq!(quota_window_tag(Some("weekly_limit")), "weekly_limit");
         assert_eq!(quota_window_tag(Some("WEEKLY")), "weekly_limit");
         assert_eq!(quota_window_tag(Some("ROLLING_WEEK")), "rolling_week");
         assert_eq!(
@@ -6586,6 +7010,7 @@ mod tests {
             QuotaSummaryBucket {
                 group_id: None,
                 model_ids: Vec::new(),
+                membership_conflict: false,
                 applies_to_all_models: false,
                 group: Some("Gemini".into()),
                 display_name: Some("Five Hour Limit Remaining".into()),
@@ -6597,6 +7022,7 @@ mod tests {
             QuotaSummaryBucket {
                 group_id: None,
                 model_ids: Vec::new(),
+                membership_conflict: false,
                 applies_to_all_models: false,
                 group: Some("Gemini".into()),
                 display_name: Some("Weekly Limit Remaining".into()),
@@ -6608,6 +7034,7 @@ mod tests {
             QuotaSummaryBucket {
                 group_id: None,
                 model_ids: Vec::new(),
+                membership_conflict: false,
                 applies_to_all_models: false,
                 group: Some("Claude".into()),
                 display_name: Some("Five Hour Limit Remaining".into()),
@@ -6619,6 +7046,7 @@ mod tests {
             QuotaSummaryBucket {
                 group_id: None,
                 model_ids: Vec::new(),
+                membership_conflict: false,
                 applies_to_all_models: false,
                 group: Some("Claude".into()),
                 display_name: Some("Weekly Limit Remaining".into()),
@@ -6649,6 +7077,7 @@ mod tests {
             QuotaSummaryBucket {
                 group_id: None,
                 model_ids: Vec::new(),
+                membership_conflict: false,
                 applies_to_all_models: false,
                 group: Some("Mainline".into()),
                 display_name: None,
@@ -6660,6 +7089,7 @@ mod tests {
             QuotaSummaryBucket {
                 group_id: None,
                 model_ids: Vec::new(),
+                membership_conflict: false,
                 applies_to_all_models: false,
                 group: Some("Companion".into()),
                 display_name: None,
@@ -6687,6 +7117,7 @@ mod tests {
             QuotaSummaryBucket {
                 group_id: None,
                 model_ids: Vec::new(),
+                membership_conflict: false,
                 applies_to_all_models: false,
                 group: Some("Gemini".into()),
                 display_name: Some("Weekly Limit Remaining".into()),
@@ -6698,6 +7129,7 @@ mod tests {
             QuotaSummaryBucket {
                 group_id: None,
                 model_ids: Vec::new(),
+                membership_conflict: false,
                 applies_to_all_models: false,
                 group: Some("Gemini".into()),
                 display_name: Some("Five Hour Limit Remaining".into()),

@@ -194,10 +194,21 @@ impl ProviderQuotaRegistry {
         // Absence/partial failure is not deletion. Preserve independently timed
         // last-good constraints and mark them stale before merging successes.
         for bucket in &mut state.buckets {
+            normalize_google_window_aliases(bucket);
             bucket.stale = true;
         }
         for incoming in buckets {
             let mut incoming = incoming.clone();
+            normalize_google_window_aliases(&mut incoming);
+            if incoming.source == "enforced_summary"
+                && (parse_reset_at(&incoming.queried_at).is_none()
+                    || incoming.tiers.iter().any(|tier| {
+                        !tier.used_percent.is_finite()
+                            || !(0.0..=100.0).contains(&tier.used_percent)
+                    }))
+            {
+                incoming.stale = true;
+            }
             incoming.models.sort();
             incoming.models.dedup();
             // A catalog may discover models but cannot replace an enforced
@@ -1012,6 +1023,30 @@ impl ProviderQuotaRegistry {
     }
 }
 
+/// Only the Google enforced-summary surface emits this observed alias. Preserve
+/// opaque resource IDs and references while upgrading restored/display tier names.
+/// Duplicate aliases remain conservative evidence, never an accidental recovery.
+fn normalize_google_window_aliases(bucket: &mut QuotaBucket) {
+    if bucket.source != "enforced_summary" || !bucket.tiers.iter().any(|tier| tier.name == "5h") {
+        return;
+    }
+    let mut tiers: Vec<crate::admin::ProviderUsageTier> = Vec::new();
+    for mut tier in std::mem::take(&mut bucket.tiers) {
+        if tier.name == "5h" {
+            tier.name = "five_hour".to_owned();
+        }
+        if let Some(old) = tiers.iter_mut().find(|old| old.name == tier.name) {
+            bucket.stale = true;
+            if tier.used_percent > old.used_percent {
+                *old = tier;
+            }
+        } else {
+            tiers.push(tier);
+        }
+    }
+    bucket.tiers = tiers;
+}
+
 fn source_rank(source: &str) -> u8 {
     match source {
         "enforced_summary" | "configured" | "forwarded_route" => 2,
@@ -1322,6 +1357,100 @@ mod tests {
         assert!(!registry.is_model_schedulable("p", "flash"));
         registry.observe_buckets("p", &[bucket("flash", "flash", 10.0, 10.0)], None);
         assert!(registry.is_model_schedulable("p", "flash"));
+    }
+
+    #[test]
+    fn restored_google_five_hour_alias_recovers_only_from_same_resource_fresh_evidence() {
+        let before = ProviderQuotaRegistry::new();
+        let mut primary = bucket("flash", "flash", 100.0, 20.0);
+        primary.tiers[0].name = "5h".to_owned();
+        primary.constraint_ids = vec!["flash-five".to_owned()];
+        let mut window = bucket("flash-five", "flash", 100.0, 20.0);
+        window.tiers.truncate(1);
+        window.tiers[0].name = "5h".to_owned();
+        window.binding.status = "window_constraint".to_owned();
+        before.observe_buckets("p", &[primary.clone(), window.clone()], None);
+        // Persist a genuine pre-fix spelling rather than the normalized runtime view.
+        let mut fences = before.persistent_bucket_fences("p");
+        for fence in &mut fences {
+            for tier in &mut fence.tiers {
+                if tier.name == "five_hour" {
+                    tier.name = "5h".to_owned();
+                }
+            }
+        }
+        let registry = ProviderQuotaRegistry::new();
+        registry.restore_bucket_fences("p", &fences);
+        assert!(!registry.is_model_schedulable("p", "flash"));
+        let snapshot = registry.model_snapshot("p", "flash").unwrap();
+        assert_eq!(snapshot.constraint_ids, vec!["flash-five"]);
+        assert_eq!(snapshot.tiers.len(), 2);
+        assert_eq!(snapshot.tiers[0].name, "five_hour");
+        for (at, used, stale) in [
+            ("2029-12-31T23:59:00Z", 20.0, false),
+            ("2030-01-01T00:01:00Z", 20.0, true),
+            ("invalid-time", 20.0, false),
+            ("2030-01-01T00:01:00Z", f64::NAN, false),
+            ("2030-01-01T00:01:00Z", -1.0, false),
+        ] {
+            let mut invalid = window.clone();
+            invalid.tiers[0].name = "five_hour".to_owned();
+            invalid.tiers[0].used_percent = used;
+            invalid.queried_at = at.to_owned();
+            invalid.stale = stale;
+            registry.observe_buckets("p", &[invalid], None);
+            assert!(
+                !registry.is_model_schedulable("p", "flash"),
+                "{at} {used} {stale}"
+            );
+        }
+        let mut catalog = window.clone();
+        catalog.source = "catalog".to_owned();
+        catalog.tiers[0].used_percent = 0.0;
+        registry.observe_buckets("p", &[catalog], None);
+        assert!(!registry.is_model_schedulable("p", "flash"));
+        let mut recovered = window.clone();
+        recovered.tiers[0].name = "five_hour".to_owned();
+        recovered.tiers[0].used_percent = 20.0;
+        recovered.queried_at = "2030-01-01T00:02:00Z".to_owned();
+        registry.observe_buckets("p", &[recovered], None);
+        assert!(registry.is_model_schedulable("p", "flash"));
+        let snapshot = registry.model_snapshot("p", "flash").unwrap();
+        assert_eq!(snapshot.constraint_ids, vec!["flash-five"]);
+        assert_eq!(snapshot.tiers.len(), 2);
+        assert_eq!(snapshot.tiers[0].used_percent, 20.0);
+        assert!(snapshot.tiers.iter().all(|tier| tier.name != "5h"));
+    }
+
+    #[test]
+    fn google_alias_upgrade_cannot_cross_owner_generation_or_erase_other_windows() {
+        let registry = ProviderQuotaRegistry::new();
+        let mut old = bucket("same-resource", "flash", 100.0, 100.0);
+        old.tiers[0].name = "5h".to_owned();
+        registry.observe_buckets("p", &[old.clone()], None);
+        let old_fence = registry.bucket_refresh_fence("p");
+        let mut new_owner = old.clone();
+        new_owner.scope_id = "new-owner".to_owned();
+        registry.observe_buckets("p", &[new_owner.clone()], None);
+        old.tiers[0].name = "five_hour".to_owned();
+        old.tiers[0].used_percent = 0.0;
+        old.tiers[1].used_percent = 0.0;
+        registry.observe_buckets_fenced("p", &[old], None, old_fence);
+        assert!(!registry.is_model_schedulable("p", "flash"));
+        new_owner.queried_at = "2030-01-01T00:01:00Z".to_owned();
+        new_owner.tiers.truncate(1);
+        new_owner.tiers[0].name = "five_hour".to_owned();
+        new_owner.tiers[0].used_percent = 20.0;
+        registry.observe_buckets("p", &[new_owner], None);
+        let snapshot = registry.model_snapshot("p", "flash").unwrap();
+        assert_eq!(snapshot.scope_id, "new-owner");
+        assert!(
+            snapshot
+                .tiers
+                .iter()
+                .any(|tier| tier.name == "weekly_limit" && tier.used_percent == 100.0)
+        );
+        assert!(!registry.is_model_schedulable("p", "flash"));
     }
 
     #[test]

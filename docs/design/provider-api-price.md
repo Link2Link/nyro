@@ -28,6 +28,8 @@ Google AI Pro / Code Assist uses the same admin statistics for the Antigravity a
 
 Grok date-only resets (`YYYY-MM-DD`) mean midnight UTC; RFC 3339 timestamps retain their instant. The interval is `[start, end)` and log reads are also capped at the captured upstream observation time. A present but duplicated, missing-reset, invalid or expired weekly tier remains unknown; it does not silently fall back to a short or calendar window. A zero used fraction can identify a cycle, but cannot produce a capacity estimate.
 
+A successful Google catalog observation is not a pricing failure: it retains measured usage and all-time prices while its quota binding/cycle remains pending. Recognized `5h` windows normalize to the canonical five-hour tier without changing existing raw resource references. The verified subscription resource adapter supplies Flash and Argon cycles only from their identified resources; it does not borrow the other family's denominator or third-party pools.
+
 Only finite usage above 0% and at most 100%, with a priced sample from the same cycle, is projected. Invalid or overflowing estimates are withheld. The WebUI suppresses capacity estimates after a query error or when the quota observation is stale (five minutes), and invalidates current-cycle values at the reset boundary without rolling the cached reset forward. Tooltips show backend cycle bounds in the browser's local time and explain the projection's sensitivity to log coverage, external usage and model mix.
 
 ## Admin contract

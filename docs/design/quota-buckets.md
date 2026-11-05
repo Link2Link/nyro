@@ -40,12 +40,43 @@ its three figures. Provider grand totals and unassigned/retired history are not
 copied into both cards or retroactively reassigned.
 
 Bulk publication uses these same two families and leaves unrelated raw diagnostics
-in the structured view. Catalog-only family observations are explicitly unknown,
-not healthy independent suppliers. Proxy forwarding first evaluates each
+in the structured view. Fresh catalog-only family observations are explicitly
+**Usage updated / Quota binding pending**, not healthy independent suppliers;
+missing or stale observations remain unknown. Proxy forwarding first evaluates each
 **authorized exact route** against raw buckets, then folds only its visible output
 rows; the separate route-admission states, hidden siblings and admin-price redaction
 are unchanged. This display change does not claim to add cross-variant admission
 or quota-exhaustion coupling beyond the existing raw evidence.
+
+## Google query outcome and verified resource associations
+
+A successful usage request is not the same fact as a resolved scheduling binding.
+Fresh finite model-catalog observations are published as `status=ok` with their
+`catalog` tier intact, and shown as **Usage updated / Quota binding pending**.
+They do not become green admission evidence, fixed-duration cycles or capacity
+estimates. Stale, invalid, absent or authentication-failed observations remain
+explicit failures/unknowns. Published error rows omit `usage`; they no longer
+combine `status=error` with a successful observation payload. Known exhaustion
+is a successful query with a separate blocked scheduling decision.
+
+The Google subscription adapter recognizes the exact `gemini-5h` and
+`gemini-weekly` resource IDs for discovered Flash 3.8 wire variants, and exact
+`Gemini 4 Argon` family labels (including their supported window labels) for
+discovered Argon variants. These are versioned association rules, not generic
+label/percentage/reset matching; `3p-5h` / `3p-weekly` never bind first-party
+families. Existing explicit official selectors and catalog resource references
+retain precedence; contradictory or malformed selectors stay conflicts.
+Argon's dedicated allowance is not assigned extra Gemini-pool constraints without
+separate evidence. Unknown resources remain unbound rather than becoming free
+or unlimited quota.
+
+Observed `5h` / canonical five-hour aliases are normalized for pacing and period
+selection. The raw resource hash keeps its pre-fix window component, and restored
+same-owner Google fences normalize known tier aliases before merging. This
+preserves manual references and exhausted fences: only a fresh valid observation
+of the same resource can demonstrate recovery. Invalid, stale or older
+observations do not clear exhaustion. No SQL migration or online configuration
+write is needed for these local-code changes.
 
 ## Goal and non-goals
 
