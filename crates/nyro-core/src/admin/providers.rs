@@ -1414,6 +1414,8 @@ mod probe_routing_tests {
             id: "claude-opus-5-5-medium".into(),
             quota_remaining: Some(0.42),
             quota_resets_at: Some("2026-11-01T00:00:00Z".into()),
+            quota_bucket_id: None,
+            quota_group_id: None,
         }];
         let resolved =
             google_subscription_probe_models(&provider, Some(&credential), &fresh, &models);
@@ -2033,6 +2035,26 @@ impl AdminService {
     ) -> anyhow::Result<Provider> {
         let current = self.get_provider(id).await?;
         let current_base_url = current.base_url.clone();
+        let quota_identity_changed = input
+            .api_key
+            .as_ref()
+            .is_some_and(|value| value != &current.api_key)
+            || input
+                .auth_mode
+                .as_ref()
+                .is_some_and(|value| value != &current.auth_mode)
+            || input
+                .vendor
+                .as_ref()
+                .is_some_and(|value| Some(value.as_str()) != current.vendor.as_deref())
+            || input
+                .channel
+                .as_ref()
+                .is_some_and(|value| Some(value.as_str()) != current.channel.as_deref())
+            || input
+                .base_url
+                .as_ref()
+                .is_some_and(|value| value != &current.base_url);
         let protocol_config_changed = input.protocol_mode.is_some()
             || input.protocol.is_some()
             || input.base_url.is_some()
@@ -2211,11 +2233,19 @@ impl AdminService {
             provider = self.get_provider(id).await?;
         }
 
-        if quota_config_changed {
-            if provider.is_enabled {
-                self.gw.quota_registry.invalidate(id);
+        if quota_identity_changed {
+            self.clear_provider_quota_identity(id).await?;
+        } else if quota_config_changed {
+            // Enablement/transport-policy edits are not evidence that the same
+            // subscription's quota recovered. Keep owner-scoped last-good state.
+            if self.gw.quota_registry.bucket_snapshot(id).is_empty() {
+                if provider.is_enabled {
+                    self.gw.quota_registry.invalidate(id);
+                } else {
+                    self.gw.quota_registry.remove(id);
+                }
             } else {
-                self.gw.quota_registry.remove(id);
+                self.gw.quota_registry.request_refresh(id);
             }
         }
         self.bump_config_epoch().await?;
@@ -2223,6 +2253,7 @@ impl AdminService {
     }
 
     pub async fn delete_provider(&self, id: &str) -> anyhow::Result<()> {
+        self.clear_provider_quota_identity(id).await?;
         self.gw.storage.providers().delete(id).await?;
         self.reload_model_cache().await?;
         self.bump_config_epoch().await?;

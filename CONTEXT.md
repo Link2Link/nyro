@@ -40,7 +40,7 @@ A persistent operator-controlled setting that determines whether a provider may 
 
 ## Quota Scheduling Eligibility
 
-A runtime decision derived from authoritative upstream usage information that determines whether an account or a provider may receive new requests. It does not change operator-controlled enablement; one account losing eligibility does not by itself make its entire pool ineligible.
+A runtime decision derived from applicable authoritative upstream quota constraints that determines whether a model request may use a particular account or provider. It does not change operator-controlled enablement; one account or model bucket losing eligibility does not by itself make unrelated accounts or model buckets ineligible.
 
 ## Quota Exhaustion
 
@@ -53,6 +53,32 @@ An upstream-supported paid balance that may carry requests after included quota 
 ## Confirmed Recovery
 
 A successful authoritative usage observation showing that every applicable included quota window is below its limit and that the account is not explicitly unavailable. Elapsed reset time alone is not Confirmed Recovery.
+
+## Quota Buckets
+
+**Quota Bucket**:
+An upstream-defined allowance shared by a specific set of model requests under one entitlement owner. Models sharing a bucket compete for the same allowance; models using different buckets do not consume one another's bucket allowance, although a shared constraint may still apply to both.
+_Avoid_: Provider, account pool, quota window
+
+**Quota Window**:
+A time-bounded constraint on a Quota Bucket, such as a five-hour or weekly allowance. Several windows on the same bucket are simultaneous constraints, not additional interchangeable capacity.
+_Avoid_: Bucket when referring only to a reset period
+
+**Quota Applicability**:
+The relationship identifying which bucket and shared constraints apply to a request using a particular upstream model and entitlement owner. Similar model names or matching usage percentages alone do not establish shared quota.
+_Avoid_: Price-model matching, display grouping
+
+**API-Equivalent Price**:
+The estimated monetary value of recorded token usage at identified API reference or explicit manual rates. It is not the subscription's actual bill, a quota unit, or evidence of remaining allowance.
+_Avoid_: Actual spend, quota balance
+
+**Usage Attribution**:
+The assignment of a recorded upstream attempt to the model, entitlement owner, and quota bucket known when it was served. An attempt may be constrained by several quota windows without its token usage or price being counted several times in a provider total.
+_Avoid_: Client-request count when referring to upstream attempts
+
+**Published Usage Entry**:
+A separately identified read-only view of one quota bucket, presented to external usage consumers as an individual provider entry. It does not create a configured Provider, credential, routing destination, or additional allowance.
+_Avoid_: Provider when implying a separately configured upstream
 
 ## Protocol Negotiation
 

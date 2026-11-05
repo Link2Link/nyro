@@ -89,6 +89,11 @@ pub fn create_router_with_updater(
         .route("/providers/:id/test", get(test_provider_handler))
         .route("/providers/:id/usage", get(provider_usage_handler))
         .route(
+            "/providers/:id/quota-buckets",
+            get(get_provider_quota_buckets_config_handler)
+                .put(set_provider_quota_buckets_config_handler),
+        )
+        .route(
             "/providers/:id/test-models",
             get(test_provider_models_handler),
         )
@@ -477,10 +482,76 @@ async fn provider_usage_handler(
     }
 }
 
-async fn list_provider_usage_handler(State(gw): State<Gateway>) -> impl IntoResponse {
-    match gw.admin().list_provider_usage().await {
-        Ok(v) => Json(serde_json::json!({ "data": v })).into_response(),
-        Err(e) => err(e),
+#[derive(Default, Deserialize)]
+struct ProviderUsageViewQuery {
+    view: Option<String>,
+}
+
+async fn list_provider_usage_handler(
+    State(gw): State<Gateway>,
+    Query(query): Query<ProviderUsageViewQuery>,
+) -> impl IntoResponse {
+    match query.view.as_deref() {
+        None | Some("buckets") => match gw.admin().list_published_provider_usage().await {
+            Ok(v) => Json(serde_json::json!({ "data": v })).into_response(),
+            Err(e) => err(e),
+        },
+        Some("providers") => match gw.admin().list_provider_usage().await {
+            Ok(v) => Json(serde_json::json!({ "data": v })).into_response(),
+            Err(e) => err(e),
+        },
+        Some(_) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "Unknown usage view; expected buckets or providers"})),
+        )
+            .into_response(),
+    }
+}
+
+async fn get_provider_quota_buckets_config_handler(
+    State(gw): State<Gateway>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    match gw.admin().get_provider_quota_buckets_config(&id).await {
+        Ok(config) => Json(serde_json::json!({"data": config})).into_response(),
+        Err(error) => err(error),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct QuotaBucketsConfigInput {
+    config: nyro_core::quota_buckets::QuotaBucketConfig,
+}
+
+async fn set_provider_quota_buckets_config_handler(
+    State(gw): State<Gateway>,
+    Path(id): Path<String>,
+    Json(input): Json<QuotaBucketsConfigInput>,
+) -> impl IntoResponse {
+    match gw
+        .admin()
+        .set_provider_quota_buckets_config(&id, input.config)
+        .await
+    {
+        Ok(config) => Json(serde_json::json!({"data": config})).into_response(),
+        Err(error)
+            if error
+                .to_string()
+                .starts_with("QUOTA_BUCKET_REVISION_CONFLICT:") =>
+        {
+            (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({"error": error.to_string()})),
+            )
+                .into_response()
+        }
+        Err(error) if error.to_string().contains("provider not found") => err(error),
+        Err(error) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": error.to_string()})),
+        )
+            .into_response(),
     }
 }
 
@@ -1056,6 +1127,8 @@ struct LogQueryParams {
     model: Option<String>,
     client_model: Option<String>,
     upstream_model: Option<String>,
+    quota_bucket: Option<String>,
+    quota_scope: Option<String>,
     status_min: Option<i32>,
     status_max: Option<i32>,
     api_key: Option<String>,
@@ -1092,6 +1165,8 @@ async fn query_logs_handler(
         model: params.model,
         client_model: params.client_model,
         upstream_model: params.upstream_model,
+        quota_bucket: params.quota_bucket,
+        quota_scope: params.quota_scope,
         status_min: params.status_min,
         status_max: params.status_max,
         api_key: params.api_key,
@@ -1156,6 +1231,8 @@ struct StatsRangeParams {
     hours: Option<i32>,
     start_at: Option<i64>,
     end_at: Option<i64>,
+    quota_bucket: Option<String>,
+    quota_scope: Option<String>,
 }
 
 impl StatsRangeParams {
@@ -1305,7 +1382,12 @@ async fn provider_usage_detail(
 ) -> impl IntoResponse {
     match gw
         .admin()
-        .get_provider_usage_detail(&id, params.range())
+        .get_provider_usage_detail_filtered(
+            &id,
+            params.range(),
+            params.quota_bucket.as_deref(),
+            params.quota_scope.as_deref(),
+        )
         .await
     {
         Ok(v) => Json(serde_json::json!({ "data": v })).into_response(),
@@ -1648,6 +1730,97 @@ mod tests {
         assert_eq!(body["data"], expected);
         assert_eq!(body["data"]["process"]["pid"], std::process::id());
         assert!(body["data"]["sampled_at"].as_i64().is_some());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn usage_http_views_are_explicit_and_unknown_views_rejected() -> anyhow::Result<()> {
+        use axum::body::{Body, to_bytes};
+        use axum::http::Request;
+        use tower::ServiceExt;
+        let dir = tempfile::tempdir()?;
+        let (gw, _) = Gateway::new(nyro_core::config::GatewayConfig {
+            data_dir: dir.path().into(),
+            ..Default::default()
+        })
+        .await?;
+        let admin = gw.admin();
+        let id = admin
+            .create_provider(CreateProvider {
+                keys: Vec::new(),
+                name: "Offline custom".into(),
+                vendor: None,
+                protocol: "openai-compatible".into(),
+                base_url: "https://example.invalid/v1".into(),
+                protocol_mode: "fixed".into(),
+                protocol_endpoints: Vec::new(),
+                preset_key: None,
+                channel: None,
+                models_source: None,
+                static_models: None,
+                api_key: "offline".into(),
+                auth_mode: "apikey".into(),
+                use_proxy: false,
+                fast_mode: false,
+            })
+            .await?
+            .id;
+        let router = create_router(gw, None);
+        let structured = serde_json::to_value(admin.list_provider_usage().await?)?;
+        for query in ["", "?view=buckets", "?view=providers"] {
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/api/v1/providers/usage{query}"))
+                        .body(Body::empty())?,
+                )
+                .await?;
+            assert_eq!(response.status(), StatusCode::OK);
+            let body: serde_json::Value =
+                serde_json::from_slice(&to_bytes(response.into_body(), 1024 * 1024).await?)?;
+            assert_eq!(
+                body["data"], structured,
+                "legacy single providers preserve their shape"
+            );
+            assert_eq!(body["data"][0]["provider_id"], id);
+        }
+        for query in ["?view=unknown", "?view="] {
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/api/v1/providers/usage{query}"))
+                        .body(Body::empty())?,
+                )
+                .await?;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
+        // Synthetic publication IDs are not providers, nor accepted by the
+        // exact-provider endpoint or config API.
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/providers/qb_not_a_configured_provider/usage")
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/v1/providers/{id}/quota-buckets"))
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 1024 * 1024).await?)?;
+        assert_eq!(
+            body["data"],
+            serde_json::json!({"revision":0,"bindings":[]})
+        );
         Ok(())
     }
 

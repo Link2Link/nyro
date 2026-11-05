@@ -351,6 +351,27 @@ export interface AccountUsageStats {
   period_end: number | null;
 }
 
+/** Backend-owned evidence coverage for retained quota-attributed attempts. */
+export interface ProviderApiPriceCoverage {
+  input_tokens: number;
+  output_tokens: number;
+  cache_read_tokens: number;
+  missing_usage_request_count: number;
+  cache_read_reported_request_count: number;
+  priced_request_count: number;
+  unpriced_request_count: number;
+  attributed_request_count: number;
+  inferred_request_count: number;
+  unassigned_request_count: number;
+  legacy_timestamp_request_count: number;
+}
+
+export interface QuotaModelPriceStats {
+  model: string;
+  all_time: AccountUsageTotals;
+  coverage: ProviderApiPriceCoverage;
+}
+
 /** Provider-level retained-log prices, computed alongside one upstream quota observation. */
 export interface ProviderApiPriceStats {
   all_time: AccountUsageTotals;
@@ -363,6 +384,15 @@ export interface ProviderApiPriceStats {
   used_percent: number | null;
   /** Projected full-cycle value, including usage so far, not remaining balance. */
   estimated_capacity: EquivalentCostTotal[] | null;
+  /** Provider-only retained history without reliable primary-bucket attribution. */
+  unassigned?: AccountUsageTotals | null;
+  all_time_coverage?: ProviderApiPriceCoverage;
+  period_coverage?: ProviderApiPriceCoverage;
+  estimated_capacity_partial?: boolean;
+  unassigned_coverage?: ProviderApiPriceCoverage;
+  models?: QuotaModelPriceStats[];
+  /** Retired scopes retain history; these are not current schedulable buckets. */
+  retained_buckets?: { scope_id: string; bucket_id: string; all_time: AccountUsageTotals; coverage: ProviderApiPriceCoverage; models: QuotaModelPriceStats[] }[];
 }
 
 export interface ProviderStats extends TpsSampleSums {
@@ -865,7 +895,7 @@ export interface UpdateApiKey {
   model_ids?: string[];
 }
 
-export interface LogQuery {
+export interface LogQuery extends QuotaBucketFilter {
   /** Combined with raw HTTP filters using AND by the backend. */
   is_error?: boolean;
   outcome?: EffectiveOutcome;
@@ -1040,7 +1070,45 @@ export interface ProviderScheduling {
 
 export type ProviderUsageQueryStatus = "ok" | "unsupported" | "error";
 
-/** One row from `GET /api/v1/providers/usage`. */
+/** A server-owned primary accounting scope; never a published provider ID. */
+export interface QuotaBucket {
+  id: string;
+  scope_id: string;
+  /** Backend defaults are English; do not infer models from this label. */
+  label: string;
+  models: string[];
+  binding: { status: string; source: string; revision: number };
+  tiers: ProviderUsageTier[];
+  constraint_ids: string[];
+  source: string;
+  queried_at: string;
+  stale: boolean;
+  scheduling: ProviderScheduling;
+  api_price?: ProviderApiPriceStats | null;
+}
+
+export interface ManualQuotaBucketBinding {
+  /** Operator-chosen immutable key, independent of the display label. */
+  id: string;
+  scope_id: string;
+  label: string;
+  models: string[];
+  constraint_ids: string[];
+}
+
+export interface QuotaBucketConfig {
+  revision: number;
+  bindings: ManualQuotaBucketBinding[];
+}
+
+/** Server-side retained-attempt attribution filter, shared by overview and logs. */
+export interface QuotaBucketFilter {
+  /** `unassigned` selects attempts without a reliable primary bucket. */
+  quota_bucket?: string;
+  quota_scope?: string;
+}
+
+/** One real-provider row from `GET /api/v1/providers/usage?view=providers`. */
 export interface ProviderUsageListItem {
   provider_id: string;
   provider_name: string;
@@ -1060,6 +1128,8 @@ export interface ProviderUsage {
   level?: string | null;
   /** Time-window usage tiers (coding plans). */
   tiers: ProviderUsageTier[];
+  /** Independent model allowances; empty/missing preserves legacy vendor presentation. */
+  quota_buckets?: QuotaBucket[];
   /** Account balances (pay-as-you-go vendors). */
   balances?: ProviderUsageBalance[];
   /** Spend figures over periods (e.g. DeepSeek today/month cost). */

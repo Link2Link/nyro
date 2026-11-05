@@ -13,6 +13,9 @@ import { UsageProgress } from "@/components/usage-progress";
 import { PoolRefreshButton } from "@/components/pool-refresh-button";
 import { ProviderIcon } from "@/components/ui/provider-icon";
 import { ProviderApiPriceSummary } from "@/components/provider-api-price-summary";
+import { ProviderQuotaBuckets, QuotaBucketAvailability } from "@/components/provider-quota-buckets";
+import { ProviderUsageDialog } from "@/components/provider-usage-dialog";
+import { ProviderQuotaBucketEditor } from "@/components/provider-quota-bucket-editor";
 import type {
   NyroUpstreamProvider,
   NyroUpstreamUsage,
@@ -22,6 +25,7 @@ import type {
   ProviderUsageCredentials,
   ProviderUsageSpend,
   ProviderUsageTier,
+  QuotaBucketFilter,
 } from "@/lib/types";
 
 /**
@@ -353,6 +357,8 @@ export function ProviderUsageFooter({ provider }: { provider: Provider }) {
   const { locale } = useLocale();
   const isZh = locale === "zh-CN";
   const [now, setNow] = useState(() => Date.now());
+  const [detailFilter, setDetailFilter] = useState<QuotaBucketFilter | null>(null);
+  const [bindingEditorOpen, setBindingEditorOpen] = useState(false);
 
   // Ark usage needs Volcengine IAM AK/SK (distinct from the inference key).
   // Until they are configured the footer stays hidden — no error banner.
@@ -381,7 +387,8 @@ export function ProviderUsageFooter({ provider }: { provider: Provider }) {
 
   const shown = usage;
   const balances = shown?.balances ?? [];
-  const pause = providerUsagePause(shown, isZh);
+  const hasBuckets = Boolean(shown?.quota_buckets?.length);
+  const pause = hasBuckets ? null : providerUsagePause(shown, isZh);
   const quotaCountdown = countdownStr(pause?.resetAt);
   const blockedTierLabels = (pause?.quotaExhausted ? shown?.scheduling?.blocking_tiers ?? [] : [])
     .map((name) => tierLabel(name, isZh))
@@ -407,16 +414,19 @@ export function ProviderUsageFooter({ provider }: { provider: Provider }) {
 
   return (
     <div className="mt-3 space-y-2 rounded-xl border border-slate-200/70 bg-white/40 px-3 py-2.5">
-      <div className="flex items-center justify-between gap-2">
-        <div className="flex items-center gap-2 text-xs font-medium text-slate-500">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <div className="flex flex-wrap items-center gap-2 text-xs font-medium text-slate-500">
           <span>{title}</span>
+          {hasBuckets && <QuotaBucketAvailability buckets={shown!.quota_buckets!} stale={Boolean(error)} isZh={isZh} now={now} />}
           {shown?.level && (
             <span className="rounded bg-slate-100 px-1.5 py-0.5 text-[10px] font-semibold uppercase text-slate-600">
               {shown.level}
             </span>
           )}
         </div>
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center gap-2">
+          {hasBuckets && <button type="button" className="cursor-pointer text-[10px] font-medium text-sky-700 hover:underline"
+            onClick={(event) => { event.stopPropagation(); setBindingEditorOpen(true); }}>{isZh ? "模型绑定" : "Model bindings"}</button>}
           {shown && (
             <span className={`flex items-center gap-1 text-[10px] ${stale ? "text-amber-700" : "text-slate-400"}`} title={queriedAt}>
               <Clock className="h-3 w-3" />
@@ -475,12 +485,14 @@ export function ProviderUsageFooter({ provider }: { provider: Provider }) {
         </div>
       )}
 
-      {shown?.is_available === false && !pause && <p className="text-xs font-medium text-red-600">{isZh ? "不可用" : "Unavailable"}</p>}
+      {!hasBuckets && shown?.is_available === false && !pause && <p className="text-xs font-medium text-red-600">{isZh ? "不可用" : "Unavailable"}</p>}
       {error && <div role="alert" className="flex items-center gap-1.5 text-xs text-red-500" title={errorMessage}>
         <AlertCircle className="h-3.5 w-3.5 shrink-0" />
         <span className="break-words">{isZh ? "用量查询失败" : "Usage query failed"}: {errorMessage}</span>
       </div>}
-      {shown?.upstream ? (
+      {hasBuckets && shown ? (
+        <ProviderQuotaBuckets usage={shown} now={now} stale={Boolean(error)} loading={isFetching} locale={locale} onDetails={setDetailFilter} />
+      ) : shown?.upstream ? (
         <NyroUpstreamUsagePanel report={shown.upstream} isZh={isZh} now={now} />
       ) : shown && (shown.tiers.length > 0 || balances.length > 0 || (shown.spends?.length ?? 0) > 0) ? (
         <div className="flex flex-col gap-1.5">
@@ -514,8 +526,12 @@ export function ProviderUsageFooter({ provider }: { provider: Provider }) {
       ) : (
         <p className="text-xs text-slate-400">{isZh ? "暂无用量数据" : "No usage data"}</p>
       )}
-      {shown && providerApiPriceSupported(shown.kind) && <ProviderApiPriceSummary
+      {!hasBuckets && shown && providerApiPriceSupported(shown.kind) && <ProviderApiPriceSummary
         usage={shown} now={now} stale={stale} loading={isFetching} locale={locale} />}
+      {bindingEditorOpen && <ProviderQuotaBucketEditor providerId={provider.id} buckets={shown?.quota_buckets ?? []}
+        open onOpenChange={setBindingEditorOpen} />}
+      {detailFilter && <ProviderUsageDialog open onOpenChange={(open) => { if (!open) setDetailFilter(null); }}
+        initialProviderId={provider.id} initialQuotaFilter={detailFilter} quotaBuckets={shown?.quota_buckets} />}
     </div>
   );
 
@@ -549,8 +565,12 @@ export function GroupUsageSummary({ providers }: { providers: Provider[] }) {
       usage: queries[i]?.data,
       failed: Boolean(queries[i]?.error),
       loading: !queries[i]?.data && queries[i]?.isFetching,
-    })),
+    })).filter((entry) => !entry.usage?.quota_buckets?.length),
   );
+  const bucketMembers = tracked.flatMap((provider, i) => {
+    const buckets = queries[i]?.data?.quota_buckets;
+    return buckets?.length ? [{ provider, buckets, failed: Boolean(queries[i]?.error) }] : [];
+  });
   const money = (n: number) => (Number.isFinite(n) ? n.toFixed(2) : "?");
   const detail = summary.perProvider
     .map((item) => `${item.name}: ${Math.round(item.percent)}%`)
@@ -558,6 +578,11 @@ export function GroupUsageSummary({ providers }: { providers: Provider[] }) {
 
   return (
     <span className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1 text-xs text-slate-600" title={detail || undefined}>
+      {bucketMembers.map(({ provider, buckets, failed }) => <span key={provider.id} className="inline-flex items-center gap-1.5">
+        {tracked.length > 1 && <span className="max-w-32 truncate">{provider.name}</span>}
+        <QuotaBucketAvailability buckets={buckets} stale={failed} isZh={isZh} />
+        {failed && <AlertCircle className="h-3 w-3 text-amber-700" aria-label={isZh ? "用量查询失败" : "Usage query failed"} />}
+      </span>)}
       {summary.peak ? (
         <span className="inline-flex items-center gap-1.5">
           <span>{isZh ? "最高已用" : "Peak used"}</span>

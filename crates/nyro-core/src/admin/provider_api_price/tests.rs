@@ -330,6 +330,228 @@ fn provider_api_price_projection_requires_finite_positive_usage_and_priced_sampl
     );
 }
 
+fn bucket(id: &str, scope: &str, now: i64, reset: &str) -> crate::quota_buckets::QuotaBucket {
+    crate::quota_buckets::QuotaBucket {
+        id: id.to_owned(),
+        scope_id: scope.to_owned(),
+        label: id.to_owned(),
+        models: vec![format!("wire-{id}")],
+        binding: crate::quota_buckets::QuotaBucketBinding {
+            status: "resolved".into(),
+            source: "configured".into(),
+            revision: 1,
+        },
+        tiers: vec![tier("weekly_limit", Some(reset), 25.0)],
+        constraint_ids: vec![],
+        source: "enforced_summary".into(),
+        queried_at: DateTime::from_timestamp_millis(now).unwrap().to_rfc3339(),
+        stale: false,
+        scheduling: ProviderScheduling::default(),
+        api_price: None,
+    }
+}
+
+#[tokio::test]
+async fn bucket_prices_partition_history_periods_exact_prices_currencies_and_missing_evidence()
+-> anyhow::Result<()> {
+    use crate::config::GatewayConfig;
+    use crate::storage::{SqliteStorage, Storage};
+    use std::sync::Arc;
+    let dir = tempfile::tempdir()?;
+    let config = GatewayConfig {
+        data_dir: dir.path().into(),
+        ..Default::default()
+    };
+    let storage = SqliteStorage::from_config(&config).await?;
+    let (gw, _) = Gateway::from_storage(config, Arc::new(storage.clone())).await?;
+    let admin = gw.admin();
+    let provider = storage.providers().create(serde_json::from_value(json!({
+        "name":"buckets", "protocol":"openai/chat", "base_url":"https://example.invalid", "api_key":"test"
+    }))?).await?;
+    let now = ms("2026-11-05T08:00:00Z");
+    let attribution = |scope: &str, bucket: &str, model: &str, dispatched_at: i64| {
+        json!({"quota_attribution": {
+        "version":1,"scope_id":scope,"bucket_id":bucket,"backend_model":"alias","wire_model":model,
+        "source":"configured","revision":1,"dispatched_at":dispatched_at
+    }}).to_string()
+    };
+    for (index, decision, at, input, output) in [
+        (
+            0,
+            Some(attribution("owner", "flash", "wire-flash", now - 1)),
+            now,
+            Some(1_000_000_i64),
+            Some(0_i64),
+        ),
+        (
+            1,
+            Some(attribution("owner", "argon", "wire-argon", now - 1)),
+            now,
+            Some(1_000_000),
+            Some(0),
+        ),
+        (
+            2,
+            Some(attribution("old-owner", "flash", "wire-flash", now - 1)),
+            now,
+            Some(1_000_000),
+            Some(0),
+        ),
+        (3, None, now, Some(1_000_000), Some(0)),
+        (
+            4,
+            Some(attribution("owner", "flash", "wire-flash", now - 1)),
+            now,
+            None,
+            None,
+        ),
+        (
+            5,
+            Some(attribution("owner", "argon", "no-argon-price", now - 1)),
+            now,
+            Some(100),
+            Some(0),
+        ),
+        // Emitted inside Flash's week but dispatched before it: all-time only.
+        (
+            6,
+            Some(attribution(
+                "owner",
+                "flash",
+                "wire-flash",
+                ms("2026-10-29T00:00:00Z"),
+            )),
+            now,
+            Some(1_000_000),
+            Some(0),
+        ),
+        (
+            7,
+            Some(attribution("owner", "flash", "wire-flash", now)),
+            now + 1,
+            Some(1_000_000),
+            Some(0),
+        ),
+    ] {
+        sqlx::query("INSERT INTO request_logs (id, provider_id, upstream_model, created_at, route_decision, input_tokens, output_tokens, cache_read_tokens) VALUES (?, ?, 'wire-flash', ?, ?, ?, ?, 400000)")
+            .bind(format!("bucket-{index}")).bind(&provider.id).bind(at).bind(decision).bind(input).bind(output).execute(storage.pool()).await?;
+    }
+    for (model, currency, input_rate) in [("wire-flash", "USD", 2.0), ("wire-argon", "CNY", 7.0)] {
+        admin
+            .set_token_price(TokenPriceInput {
+                provider_id: provider.id.clone(),
+                model: model.into(),
+                price: Some(TokenPriceRates {
+                    currency: currency.into(),
+                    input_rate,
+                    output_rate: 8.0,
+                    cache_read_rate: None,
+                }),
+            })
+            .await?;
+    }
+    let mut usage = snapshot(
+        &provider.id,
+        "google_subscription",
+        now,
+        vec![tier("weekly_limit", Some("2026-11-06T00:00:00Z"), 25.0)],
+    );
+    usage.quota_buckets = vec![
+        bucket("flash", "owner", now, "2026-11-06T00:00:00Z"),
+        bucket("argon", "owner", now, "2026-11-10T00:00:00Z"),
+    ];
+    admin.enrich_provider_api_price(&mut usage).await;
+    let stats = usage.api_price.as_ref().unwrap();
+    assert_eq!(stats.all_time.request_count, 7);
+    assert!(stats.period.is_none() && stats.estimated_capacity.is_none());
+    assert_eq!(
+        stats
+            .all_time
+            .equivalent_costs
+            .iter()
+            .map(|cost| (cost.currency.as_str(), cost.total_cost))
+            .collect::<Vec<_>>(),
+        [("CNY", 7.0), ("USD", 8.0)]
+    );
+    assert_eq!(stats.unassigned.as_ref().unwrap().request_count, 1);
+    assert_eq!(stats.retained_buckets[0].scope_id, "old-owner");
+    let flash = usage.quota_buckets[0].api_price.as_ref().unwrap();
+    assert_eq!(flash.all_time.request_count, 3);
+    assert_eq!(
+        flash.all_time.unpriced_request_count, 1,
+        "missing evidence is not a priced free zero"
+    );
+    assert_eq!(flash.period.as_ref().unwrap().request_count, 2);
+    assert_eq!(
+        flash.period.as_ref().unwrap().equivalent_costs[0].total_cost,
+        2.0
+    );
+    assert_eq!(
+        flash.estimated_capacity.as_ref().unwrap()[0].total_cost,
+        8.0
+    );
+    assert_eq!(flash.estimated_capacity_partial, Some(true));
+    assert_eq!(
+        flash
+            .period_coverage
+            .as_ref()
+            .unwrap()
+            .missing_usage_request_count,
+        1
+    );
+    let argon = usage.quota_buckets[1].api_price.as_ref().unwrap();
+    assert_eq!(
+        argon.all_time.unpriced_request_count, 1,
+        "unknown Argon pricing never borrows Flash's rate"
+    );
+    assert_ne!(flash.period_start, argon.period_start);
+    // Exact log/detail predicate also uses immutable identity, not current model membership.
+    let filtered = admin
+        .get_provider_usage_detail_filtered(
+            &provider.id,
+            StatsRange {
+                start_at: Some(now - 1000),
+                end_at: Some(now),
+                hours: None,
+            },
+            Some("argon"),
+            Some("owner"),
+        )
+        .await?;
+    assert_eq!(filtered.request_count, 2);
+    assert_eq!(
+        filtered
+            .models
+            .iter()
+            .map(|model| model.upstream_model.as_str())
+            .collect::<Vec<_>>(),
+        ["no-argon-price", "wire-argon"]
+    );
+    usage.quota_buckets[0].stale = true;
+    usage.quota_buckets[1].source = "catalog_exact_model_v1".into();
+    admin.enrich_provider_api_price(&mut usage).await;
+    for bucket in &usage.quota_buckets {
+        let stats = bucket.api_price.as_ref().unwrap();
+        assert!(
+            stats.period.is_none() && stats.estimated_capacity.is_none(),
+            "stale/catalog reset cannot fabricate a cycle"
+        );
+    }
+    storage.logs().clear_all().await?;
+    admin.enrich_provider_api_price(&mut usage).await;
+    assert_eq!(usage.api_price.unwrap().all_time.request_count, 0);
+    assert!(
+        usage.quota_buckets.iter().all(|bucket| bucket
+            .api_price
+            .as_ref()
+            .unwrap()
+            .all_time
+            .request_count
+            == 0)
+    );
+    Ok(())
+}
+
 fn snapshot(provider: &str, kind: &str, now: i64, tiers: Vec<ProviderUsageTier>) -> ProviderUsage {
     ProviderUsage {
         provider_id: provider.into(),
@@ -343,6 +565,7 @@ fn snapshot(provider: &str, kind: &str, now: i64, tiers: Vec<ProviderUsageTier>)
         scheduling: ProviderScheduling::default(),
         queried_at: DateTime::from_timestamp_millis(now).unwrap().to_rfc3339(),
         api_price: None,
+        quota_buckets: vec![],
         account_pool: None,
         pool_quota: None,
         upstream: None,

@@ -87,6 +87,10 @@ use crate::provider::xai::grok::{
 use crate::provider::xiaomimimo::passport::{
     MimoSessionRejected, MimoUsageCredential, classify_usage_credential,
 };
+use crate::quota_buckets::{
+    QuotaBucket, QuotaBucketBinding, QuotaBucketConfig, apply_quota_bucket_config, opaque_quota_id,
+    quota_bucket_config_key,
+};
 use crate::router::quota::{ProviderScheduling, QuotaTierObservation};
 
 use super::*;
@@ -202,6 +206,9 @@ pub struct ProviderUsage {
     /// Time-window usage tiers (coding plans). Configured account pools may
     /// expose display-only totals here; `scheduling` remains account-derived.
     pub tiers: Vec<ProviderUsageTier>,
+    /// Independent model allowances and separately referenced shared constraints.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub quota_buckets: Vec<QuotaBucket>,
     /// Account balances (pay-as-you-go vendors).
     pub balances: Vec<ProviderUsageBalance>,
     /// Spend figures over periods (e.g. DeepSeek today/month cost).
@@ -562,6 +569,7 @@ impl UsageBackend {
 /// Strip the antigravity thinking-tier suffix so the variants of one model
 /// family collapse into a single pool row (`gemini-3.8-flash-high` and
 /// `-low` share the `gemini-3.8-flash` pool entry).
+#[cfg(test)]
 fn google_model_family(model: &str) -> &str {
     // Only gemini ids carry antigravity thinking tiers: `gpt-oss-120b-medium`
     // ends in `-medium` as part of its own name and must stay intact.
@@ -579,12 +587,15 @@ fn google_model_family(model: &str) -> &str {
 /// Tier name of the collapsed first-party Gemini row. Every `gemini-*` family
 /// draws from one shared subscription bucket, so a single row stands for the
 /// provider-level usage instead of a dozen lockstep duplicates.
+#[cfg(test)]
 const GEMINI_BUCKET_TIER: &str = "gemini";
 
 /// Usage value and reset time of one pool row.
+#[cfg(test)]
 type GooglePool = (f64, Option<String>);
 
 /// True for the first-party families that share Google's subscription bucket.
+#[cfg(test)]
 fn is_gemini_family(family: &str) -> bool {
     family.starts_with("gemini")
 }
@@ -595,6 +606,7 @@ fn is_gemini_family(family: &str) -> bool {
 /// The mode, not the maximum, is what identifies the shared bucket: a Gemini
 /// family holding its own separate quota must not masquerade as the bucket.
 /// Ties resolve to the higher usage, the conservative reading.
+#[cfg(test)]
 fn google_gemini_bucket(
     families: &std::collections::BTreeMap<String, GooglePool>,
 ) -> Option<GooglePool> {
@@ -637,6 +649,7 @@ fn google_gemini_bucket(
 /// are deliberately not surfaced: this backend is used for Gemini traffic.
 /// Internal noise entries (`chat_<digits>`, `tab_*_preview`) and models
 /// without `quotaInfo` are dropped.
+#[cfg(test)]
 fn google_subscription_tiers(
     models: &[crate::provider::google::antigravity::AvailableModel],
 ) -> Vec<ProviderUsageTier> {
@@ -699,17 +712,14 @@ fn google_subscription_tiers(
 /// windows fall back to a lowercased copy.
 fn quota_window_tag(window: Option<&str>) -> String {
     let window = window.unwrap_or_default().trim();
-    let upper = window.to_uppercase();
-    if upper.contains("WEEK") {
-        "weekly_limit".to_string()
-    } else if upper.contains("FIVE") || upper.contains("5H") {
-        "five_hour".to_string()
-    } else if upper.contains("DAY") {
-        "daily".to_string()
-    } else if window.is_empty() {
-        "window".to_string()
-    } else {
-        window.to_lowercase()
+    match window.to_ascii_uppercase().as_str() {
+        "WEEKLY" => "weekly_limit".to_owned(),
+        "FIVE_HOURS" => "five_hour".to_owned(),
+        "DAILY" => "daily".to_owned(),
+        "MONTHLY" => "monthly".to_owned(),
+        "" => "window".to_owned(),
+        // In particular ROLLING_WEEK is not a measured fixed seven-day cycle.
+        _ => window.to_ascii_lowercase(),
     }
 }
 
@@ -874,6 +884,7 @@ fn sort_tiers_for_display(tiers: &mut [ProviderUsageTier]) {
 /// previews) are deliberately dropped — the same convention as the catalog
 /// fold above. Falls back to every bucket when no group names itself
 /// Gemini, so an upstream naming change never blanks the readout.
+#[cfg(test)]
 fn gemini_quota_buckets(
     buckets: &[crate::provider::google::antigravity::QuotaSummaryBucket],
 ) -> Vec<crate::provider::google::antigravity::QuotaSummaryBucket> {
@@ -911,6 +922,7 @@ fn gemini_quota_buckets(
 /// surfaces Gemini traffic. This is the enforcement-grade readout - the
 /// model-catalog fold above stays as the fallback when the quota summary
 /// surface is unavailable or empty.
+#[cfg(test)]
 fn quota_summary_tiers(
     buckets: &[crate::provider::google::antigravity::QuotaSummaryBucket],
 ) -> Vec<ProviderUsageTier> {
@@ -948,6 +960,7 @@ fn quota_summary_tiers(
 /// pool must never pause the whole provider: the observation carries the
 /// pool with the most headroom, i.e. routing only pauses when every pool is
 /// exhausted.
+#[cfg(test)]
 fn google_scheduling_observation(tiers: &[ProviderUsageTier]) -> Vec<QuotaTierObservation> {
     let best = tiers.iter().min_by(|a, b| {
         a.used_percent
@@ -962,6 +975,262 @@ fn google_scheduling_observation(tiers: &[ProviderUsageTier]) -> Vec<QuotaTierOb
         }]
     })
     .unwrap_or_default()
+}
+
+/// Preserve actual Google model/resource identity before aggregation. Equal
+/// percentages, reset times and generic labels are never binding evidence.
+fn google_quota_buckets(
+    scope_id: &str,
+    models: &[crate::provider::google::antigravity::AvailableModel],
+    summary: &[crate::provider::google::antigravity::QuotaSummaryBucket],
+    queried_at: &str,
+) -> Vec<QuotaBucket> {
+    use std::collections::{BTreeMap, HashSet};
+    let mut result = Vec::new();
+    let mut groups = BTreeMap::<String, Vec<usize>>::new();
+    let mut global_ids = Vec::new();
+    for observation in summary {
+        let mut members = observation.model_ids.clone();
+        let mut binding_source = "official";
+        // Catalog resource references are explicit associations too. A label
+        // substring is not. Never strip tier suffixes (especially Argon's).
+        if members.is_empty() {
+            members = models
+                .iter()
+                .filter(|model| {
+                    observation
+                        .bucket_id
+                        .as_ref()
+                        .is_some_and(|id| model.quota_bucket_id.as_ref() == Some(id))
+                        || observation
+                            .group_id
+                            .as_ref()
+                            .is_some_and(|id| model.quota_group_id.as_ref() == Some(id))
+                })
+                .map(|model| model.id.clone())
+                .collect();
+        }
+        if members.is_empty() {
+            // Version 1 rule accepts only a literal discovered wire model ID,
+            // never human family labels such as "Gemini" or "Flash".
+            for name in [
+                observation.group.as_deref(),
+                observation.display_name.as_deref(),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                if models.iter().any(|model| model.id == name) {
+                    members.push(name.to_owned());
+                }
+            }
+            binding_source = "google_exact_model_v1";
+        }
+        members.sort();
+        members.dedup();
+        let member_key = members.join("\0");
+        let window = quota_window_tag(observation.window.as_deref());
+        let resource_key = observation
+            .bucket_id
+            .as_deref()
+            .or(observation.group_id.as_deref());
+        // No opaque upstream resource identity and no exact membership means
+        // identity itself is unresolved. Do not use labels/utilization/time.
+        let identity_members = if resource_key.is_some() {
+            ""
+        } else {
+            &member_key
+        };
+        let id = opaque_quota_id(
+            "google_constraint_v1",
+            &[
+                scope_id,
+                resource_key.unwrap_or("unidentified"),
+                identity_members,
+                &window,
+            ],
+        );
+        let label = observation
+            .display_name
+            .clone()
+            .or_else(|| observation.group.clone())
+            .unwrap_or_else(|| "Unresolved Google allowance".to_owned());
+        let bucket = QuotaBucket {
+            id: id.clone(),
+            scope_id: scope_id.to_owned(),
+            label,
+            models: members.clone(),
+            binding: QuotaBucketBinding {
+                status: if observation.applies_to_all_models {
+                    "shared_constraint"
+                } else {
+                    "unresolved"
+                }
+                .to_owned(),
+                source: if observation.applies_to_all_models {
+                    "official_all_models_v1"
+                } else {
+                    binding_source
+                }
+                .to_owned(),
+                revision: 1,
+            },
+            tiers: vec![ProviderUsageTier {
+                name: window,
+                used_percent: ((1.0 - observation.remaining_fraction) * 10_000.0).round() / 100.0,
+                resets_at: observation.resets_at.clone(),
+            }],
+            constraint_ids: Vec::new(),
+            source: "enforced_summary".to_owned(),
+            queried_at: queried_at.to_owned(),
+            stale: false,
+            scheduling: ProviderScheduling::default(),
+            api_price: None,
+        };
+        if let Some(duplicate) = result
+            .iter_mut()
+            .find(|old: &&mut QuotaBucket| old.id == id)
+        {
+            // A collision without a unique resource ID cannot support either
+            // precise display or recovery. Keep a diagnostic, not a max fold.
+            duplicate.tiers.extend(bucket.tiers);
+            duplicate.models.extend(bucket.models);
+            duplicate.models.sort();
+            duplicate.models.dedup();
+            duplicate.binding.status = "conflict".to_owned();
+            duplicate.binding.source = "conflicting_official_v1".to_owned();
+            duplicate.label = "Conflicting Google quota resources".to_owned();
+            continue;
+        }
+        let index = result.len();
+        result.push(bucket);
+        if observation.applies_to_all_models {
+            global_ids.push(id);
+        } else if !members.is_empty() {
+            // Explicit group identity can establish the parent across windows;
+            // absent that, exact official member sets establish the same scope.
+            let group_key = observation
+                .group_id
+                .clone()
+                .unwrap_or_else(|| member_key.clone());
+            groups.entry(group_key).or_default().push(index);
+        }
+    }
+    for (group_key, indices) in groups {
+        let mut members = Vec::new();
+        let mut tiers = Vec::new();
+        let mut windows = HashSet::new();
+        let mut conflict = false;
+        for index in &indices {
+            let resource = &result[*index];
+            if resource.binding.status == "conflict" {
+                conflict = true;
+            }
+            if !members.is_empty() && members != resource.models {
+                conflict = true;
+            }
+            members = resource.models.clone();
+            for tier in &resource.tiers {
+                if !windows.insert(tier.name.clone()) {
+                    conflict = true;
+                }
+                tiers.push(tier.clone());
+            }
+        }
+        if conflict || tiers.is_empty() {
+            continue;
+        }
+        let first = result[indices[0]].clone();
+        let mut constraints = global_ids.clone();
+        constraints.extend(indices.iter().map(|index| result[*index].id.clone()));
+        for index in &indices {
+            result[*index].binding.status = "window_constraint".to_owned();
+        }
+        sort_tiers_for_display(&mut tiers);
+        result.push(QuotaBucket {
+            id: opaque_quota_id("google_bucket_v1", &[scope_id, &group_key]),
+            scope_id: scope_id.to_owned(),
+            label: first.label,
+            models: members,
+            binding: QuotaBucketBinding {
+                status: "resolved".to_owned(),
+                source: first.binding.source,
+                revision: 1,
+            },
+            tiers,
+            constraint_ids: constraints,
+            source: "enforced_summary".to_owned(),
+            queried_at: queried_at.to_owned(),
+            stale: false,
+            scheduling: ProviderScheduling::default(),
+            api_price: None,
+        });
+    }
+    let bound: HashSet<_> = result
+        .iter()
+        .filter(|bucket| bucket.is_resolved())
+        .flat_map(|bucket| bucket.models.iter().cloned())
+        .collect();
+    for model in models {
+        if bound.contains(&model.id)
+            || crate::provider::google::antigravity::is_subscription_usage_noise(&model.id)
+        {
+            continue;
+        }
+        let Some(remaining) = model
+            .quota_remaining
+            .filter(|remaining| remaining.is_finite())
+        else {
+            // Catalog discovery without quotaInfo does not create an allowance
+            // or a healthy published supplier. Keep model discovery separate.
+            continue;
+        };
+        let tiers = vec![ProviderUsageTier {
+            // Duration is unknown: never invent weekly/five-hour pacing.
+            name: "catalog".to_owned(),
+            used_percent: (((1.0 - remaining) * 10_000.0).round() / 100.0).clamp(0.0, 100.0),
+            resets_at: model.quota_resets_at.clone(),
+        }];
+        result.push(QuotaBucket {
+            id: opaque_quota_id("google_catalog_model_v1", &[scope_id, &model.id]),
+            scope_id: scope_id.to_owned(),
+            label: model.id.clone(),
+            models: vec![model.id.clone()],
+            binding: QuotaBucketBinding {
+                status: "resolved".to_owned(),
+                source: "catalog_exact_model_v1".to_owned(),
+                revision: 1,
+            },
+            tiers,
+            constraint_ids: global_ids.clone(),
+            source: "catalog".to_owned(),
+            queried_at: queried_at.to_owned(),
+            stale: false,
+            scheduling: ProviderScheduling::default(),
+            api_price: None,
+        });
+    }
+    if result.is_empty() && !models.is_empty() {
+        result.push(QuotaBucket {
+            id: opaque_quota_id("google_unknown_owner_v1", &[scope_id]),
+            scope_id: scope_id.to_owned(),
+            label: "Google quota observation unavailable".to_owned(),
+            models: Vec::new(),
+            binding: QuotaBucketBinding {
+                status: "unresolved".to_owned(),
+                source: "unknown".to_owned(),
+                revision: 1,
+            },
+            tiers: Vec::new(),
+            constraint_ids: Vec::new(),
+            source: "unknown".to_owned(),
+            queried_at: queried_at.to_owned(),
+            stale: true,
+            scheduling: ProviderScheduling::default(),
+            api_price: None,
+        });
+    }
+    result
 }
 
 fn millis_to_iso8601(ms: i64) -> Option<String> {
@@ -2324,8 +2593,13 @@ impl AdminService {
 
     /// Full vendor snapshot for forwarding without local admin-only log pricing.
     pub(super) async fn provider_usage_snapshot(&self, id: &str) -> anyhow::Result<ProviderUsage> {
+        // Identity replacement/config mutation uses the same lock; publish
+        // before releasing it so a stale old-owner snapshot cannot repopulate
+        // a cache which that mutation has just invalidated.
+        let refresh_lock = self.gw.quota_registry.refresh_lock(id);
+        let _guard = refresh_lock.lock().await;
         let usage = self
-            .refresh_provider_usage(id, UsageQueryMode::Full)
+            .refresh_provider_usage_locked(id, UsageQueryMode::Full)
             .await?;
         self.gw.usage_snapshots.store(&usage);
         Ok(usage)
@@ -2396,7 +2670,39 @@ impl AdminService {
                 .await?;
             return Ok(self.account_pool_provider_usage(view));
         }
+        let fence = self.gw.quota_registry.bucket_refresh_fence(id);
         match self.query_provider_usage(id, mode).await {
+            Ok((mut usage, _, _))
+                if usage.kind == UsageBackend::GoogleSubscription.kind()
+                    || (usage.kind == UsageBackend::NyroGateway.kind()
+                        && !usage.quota_buckets.is_empty()) =>
+            {
+                let (buckets, scheduling) = self.gw.quota_registry.observe_buckets_fenced(
+                    id,
+                    &usage.quota_buckets,
+                    usage.is_available,
+                    fence,
+                );
+                usage.quota_buckets = buckets;
+                usage.scheduling = scheduling;
+                if usage.kind == UsageBackend::GoogleSubscription.kind() {
+                    let fences = self.gw.quota_registry.persistent_bucket_fences(id);
+                    if let Ok(value) = serde_json::to_string(&fences) {
+                        if let Err(error) = self
+                            .gw
+                            .storage
+                            .settings()
+                            .set(&crate::quota_buckets::quota_bucket_fence_key(id), &value)
+                            .await
+                        {
+                            tracing::warn!(%error, provider_id = id, "Failed to persist scoped quota enforcement fences");
+                        }
+                    }
+                }
+                // A model-aware provider has no honest aggregate percentage.
+                usage.tiers.clear();
+                Ok(usage)
+            }
             Ok((mut usage, true, kiro_overage)) => {
                 // Feature-specific windows (Codex metered features such as
                 // Spark) are informational. Exhausting one feature must not
@@ -2411,9 +2717,7 @@ impl AdminService {
                         resets_at: tier.resets_at.clone(),
                     })
                     .collect::<Vec<_>>();
-                let tiers = if usage.kind == UsageBackend::GoogleSubscription.kind() {
-                    google_scheduling_observation(&usage.tiers)
-                } else if usage.kind == UsageBackend::NyroGateway.kind() {
+                let tiers = if usage.kind == UsageBackend::NyroGateway.kind() {
                     // Pause only when every upstream provider is paused.
                     usage
                         .upstream
@@ -2490,6 +2794,7 @@ impl AdminService {
 
         let mut kiro_overage = false;
         let mut upstream = None;
+        let mut quota_buckets = Vec::new();
         let (mut tiers, balances, level, is_available, spends) = match backend {
             UsageBackend::NyroGateway => {
                 let api_key = api_key.as_deref().expect("non-OAuth backend API key");
@@ -2511,6 +2816,10 @@ impl AdminService {
                         &client, base_url, api_key,
                     )
                     .await?,
+                );
+                quota_buckets = crate::provider::nyro_gateway::usage::forwarded_route_buckets(
+                    id,
+                    upstream.as_ref().expect("forwarded usage report"),
                 );
                 (Vec::new(), Vec::new(), None, None, Vec::new())
             }
@@ -3045,44 +3354,146 @@ impl AdminService {
                         crate::provider::google::antigravity::antigravity_user_agent()
                     };
                 let client = self.gw.http_client_for_provider(provider.use_proxy).await?;
-                let models = crate::provider::google::antigravity::fetch_available_models(
-                    &client,
-                    runtime.access_token.trim(),
-                    &project_id,
-                    &user_agent,
-                )
-                .await
-                .context("fetch Google subscription model catalog for usage query")?;
-                // Enforcement-grade quota first: the official quota surface
-                // (`retrieveUserQuotaSummary`) reports the budget windows the
-                // gate actually enforces; the model-catalog quotaInfo fold is
-                // a request-dimension readout that can show 100% while
-                // requests 429, so it only serves as the fallback.
-                let tiers = match crate::provider::google::antigravity::retrieve_user_quota_summary(
-                    &client,
-                    runtime.access_token.trim(),
-                    &project_id,
-                    &user_agent,
-                )
-                .await
-                {
-                    Ok(buckets) if !buckets.is_empty() => quota_summary_tiers(&buckets),
-                    Ok(_) => {
-                        tracing::warn!(
-                            "Google subscription quota summary returned no buckets; \
-                             falling back to catalog quotaInfo"
-                        );
-                        google_subscription_tiers(&models)
-                    }
+                // Independent failures: discovery must never prevent a valid
+                // enforced summary, nor replace stronger last-good evidence.
+                let (models, summary) = tokio::join!(
+                    crate::provider::google::antigravity::fetch_available_models(
+                        &client,
+                        runtime.access_token.trim(),
+                        &project_id,
+                        &user_agent,
+                    ),
+                    crate::provider::google::antigravity::retrieve_user_quota_summary(
+                        &client,
+                        runtime.access_token.trim(),
+                        &project_id,
+                        &user_agent,
+                    ),
+                );
+                let summary_ok = summary.as_ref().is_ok_and(|summary| !summary.is_empty());
+                let models = match models {
+                    Ok(models) => models,
                     Err(error) => {
-                        tracing::warn!(
-                            %error,
-                            "Google subscription quota summary query failed; \
-                             falling back to catalog quotaInfo"
-                        );
-                        google_subscription_tiers(&models)
+                        tracing::warn!(%error, "Google quota model discovery failed; retaining last-good mappings");
+                        Vec::new()
                     }
                 };
+                let summary = match summary {
+                    Ok(summary) => summary,
+                    Err(error) => {
+                        tracing::warn!(%error, "Google enforced quota summary failed; catalog cannot clear enforced fences");
+                        Vec::new()
+                    }
+                };
+                if models.is_empty()
+                    && summary.is_empty()
+                    && self.gw.quota_registry.bucket_snapshot(id).is_empty()
+                {
+                    anyhow::bail!(
+                        "Google quota discovery and enforced summary provided no observations"
+                    );
+                }
+                // Prefer stable official subject. Legacy credentials without a
+                // subject get a persisted local identity, not a rotating token.
+                let owner = match crate::quota_buckets::google_quota_owner_id(credential, None) {
+                    Some(owner) => owner,
+                    None => {
+                        let key = format!("quota_bucket_owner.{id}");
+                        let settings = self.gw.storage.settings();
+                        match settings.get(&key).await? {
+                            Some(owner) if !owner.trim().is_empty() => owner,
+                            _ => {
+                                let owner = uuid::Uuid::new_v4().to_string();
+                                settings.set(&key, &owner).await?;
+                                owner
+                            }
+                        }
+                    }
+                };
+                let authority =
+                    if crate::provider::google::gemini_cli::is_google_gemini_cli(&provider) {
+                        "google_code_assist"
+                    } else {
+                        "google_antigravity"
+                    };
+                let scope =
+                    crate::quota_buckets::google_quota_scope_id(id, authority, &owner, &project_id);
+                quota_buckets = google_quota_buckets(
+                    &scope,
+                    &models,
+                    &summary,
+                    &chrono::Utc::now().to_rfc3339(),
+                );
+                // A valid summary with a discovery outage may reuse exact last
+                // good model membership only for the SAME opaque resources.
+                let old = self.gw.quota_registry.bucket_snapshot(id);
+                if quota_buckets.is_empty()
+                    && old.first().is_some_and(|bucket| bucket.scope_id != scope)
+                {
+                    quota_buckets.push(QuotaBucket {
+                        id: opaque_quota_id("google_unknown_owner_v1", &[&scope]),
+                        scope_id: scope.clone(),
+                        label: "Google quota observation unavailable".to_owned(),
+                        models: Vec::new(),
+                        binding: QuotaBucketBinding {
+                            status: "unresolved".to_owned(),
+                            source: "unknown".to_owned(),
+                            revision: 1,
+                        },
+                        tiers: Vec::new(),
+                        constraint_ids: Vec::new(),
+                        source: "unknown".to_owned(),
+                        queried_at: chrono::Utc::now().to_rfc3339(),
+                        stale: true,
+                        scheduling: ProviderScheduling::default(),
+                        api_price: None,
+                    });
+                }
+                for bucket in &mut quota_buckets {
+                    if !bucket.is_resolved() {
+                        if let Some(previous) = old.iter().find(|old| {
+                            old.id == bucket.id
+                                && old.scope_id == bucket.scope_id
+                                && old.is_resolved()
+                        }) {
+                            bucket.models = previous.models.clone();
+                            bucket.binding = previous.binding.clone();
+                        }
+                    }
+                    if bucket.source == "catalog" && !summary_ok {
+                        bucket.stale = true;
+                    }
+                }
+                if let Some(value) = self
+                    .gw
+                    .storage
+                    .settings()
+                    .get(&quota_bucket_config_key(id))
+                    .await?
+                {
+                    let mut config: QuotaBucketConfig = serde_json::from_str(&value)
+                        .context("Invalid quota bucket configuration")?;
+                    // An operator mapping is scoped to one owner; never carry
+                    // it into a newly authenticated subscriber/project.
+                    config.bindings.retain(|binding| binding.scope_id == scope);
+                    // Partial summary refreshes need last-good discovered
+                    // resource evidence to validate the COMPLETE mapping.
+                    let mut resources = self.gw.quota_registry.raw_bucket_snapshot(id);
+                    resources.retain(|bucket| bucket.scope_id == scope);
+                    for resource in &mut resources {
+                        resource.stale = true;
+                    }
+                    for bucket in &quota_buckets {
+                        if let Some(old) = resources.iter_mut().find(|old| old.id == bucket.id) {
+                            *old = bucket.clone();
+                        } else {
+                            resources.push(bucket.clone());
+                        }
+                    }
+                    quota_buckets = apply_quota_bucket_config(&resources, &config)
+                        .map_err(|error| anyhow::anyhow!(error))?;
+                }
+                let tiers = Vec::new();
                 let level = credential
                     .meta
                     .get("tier_id")
@@ -3108,6 +3519,7 @@ impl AdminService {
                 site,
                 level,
                 tiers,
+                quota_buckets,
                 balances,
                 spends,
                 is_available,
@@ -4827,6 +5239,7 @@ mod tests {
             site: "global".into(),
             level,
             tiers,
+            quota_buckets: Vec::new(),
             is_available,
             balances: vec![],
             spends: vec![],
@@ -5815,7 +6228,7 @@ mod tests {
                 let mut usage = ProviderUsage {
                     provider_id: provider.id.clone(), kind: backend.kind().into(),
                     site: backend.site().into(), level: Some("G1-PRO-TIER".into()),
-                    tiers: tiers.clone(), balances: vec![], spends: vec![],
+                    tiers: tiers.clone(), quota_buckets: Vec::new(), balances: vec![], spends: vec![],
                     is_available: Some(true), scheduling: scheduling.clone(),
                     queried_at: now.to_rfc3339(), api_price: None,
                     account_pool: None, pool_quota: None, upstream: None,
@@ -5878,7 +6291,7 @@ mod tests {
                     }).await?;
                     let entry = report.providers.iter().find(|entry| entry.id == provider.id).unwrap();
                     assert_eq!(entry.status, ProviderUsageQueryStatus::Ok);
-                    assert!(entry.usage.as_ref().unwrap().api_price.is_none());
+                    assert!(serde_json::to_value(entry.usage.as_ref().unwrap())?.get("api_price").is_none());
                     assert!(serde_json::to_value(entry)?["usage"].get("api_price").is_none());
                 }
 
@@ -5963,10 +6376,211 @@ mod tests {
     }
 
     #[test]
+    fn google_buckets_preserve_flash_argon_and_unknown_identity() {
+        use crate::provider::google::antigravity::{
+            parse_available_models_detailed, parse_quota_summary_buckets,
+        };
+        let models = parse_available_models_detailed(&serde_json::json!({"models": {
+            "gemini-3.8-flash-high": {"quotaInfo": {"remainingFraction": 0.8}},
+            "gemini-4-argon": {"quotaInfo": {"remainingFraction": 0.8}},
+            "gemini-4-argon-high": {"quotaInfo": {"remainingFraction": 0.8}}
+        }}));
+        let summary = parse_quota_summary_buckets(&serde_json::json!({"groups": [
+            {"groupId": "flash", "modelIds": ["gemini-3.8-flash-high"], "buckets": [
+                {"bucketId": "f5", "window": "FIVE_HOURS", "remainingFraction": 0.0},
+                {"bucketId": "fw", "window": "WEEKLY", "remainingFraction": 0.8}]},
+            {"groupId": "argon", "modelIds": ["gemini-4-argon"], "buckets": [
+                {"bucketId": "a5", "window": "FIVE_HOURS", "remainingFraction": 0.8},
+                {"bucketId": "aw", "window": "WEEKLY", "remainingFraction": 0.8}]},
+            {"displayName": "Gemini", "buckets": [{"bucketId": "unrecognized", "window": "MONTHLY", "remainingFraction": 0.8}]}
+        ]}));
+        let buckets = google_quota_buckets("owner", &models, &summary, "2030-01-01T00:00:00Z");
+        let registry = crate::router::quota::ProviderQuotaRegistry::new();
+        let (effective, _) = registry.observe_buckets("p", &buckets, None);
+        assert!(!registry.is_model_schedulable("p", "gemini-3.8-flash-high"));
+        assert!(registry.is_model_schedulable("p", "gemini-4-argon"));
+        assert_eq!(
+            registry
+                .model_snapshot("p", "gemini-4-argon-high")
+                .unwrap()
+                .source,
+            "catalog"
+        );
+        assert_ne!(
+            registry.model_snapshot("p", "gemini-4-argon").unwrap().id,
+            registry
+                .model_snapshot("p", "gemini-4-argon-high")
+                .unwrap()
+                .id
+        );
+        assert!(
+            effective
+                .iter()
+                .any(|bucket| bucket.binding.status == "unresolved")
+        );
+        assert!(
+            effective
+                .iter()
+                .filter(|bucket| bucket.is_primary())
+                .all(|bucket| bucket.tiers.len() <= 2)
+        );
+    }
+
+    #[test]
+    fn partial_google_catalog_never_grants_public_flash_alias_quota_binding() {
+        use crate::provider::google::antigravity::{
+            parse_available_models_detailed, parse_quota_summary_buckets,
+        };
+        let models = parse_available_models_detailed(&serde_json::json!({"models": {
+            "gemini-3.8-flash-low": {"quotaInfo": {"remainingFraction": 0.0}}
+        }}));
+        let summary = parse_quota_summary_buckets(&serde_json::json!({"groups": [
+            {"groupId": "low", "modelIds": ["gemini-3.8-flash-low"], "buckets": [{"bucketId": "low-five", "window": "FIVE_HOURS", "remainingFraction": 0.0}]},
+            {"groupId": "high", "modelIds": ["gemini-3.8-flash-high"], "buckets": [{"bucketId": "high-five", "window": "FIVE_HOURS", "remainingFraction": 0.9}]}
+        ]}));
+        let registry = crate::router::quota::ProviderQuotaRegistry::new();
+        registry.observe_buckets(
+            "p",
+            &google_quota_buckets("owner", &models, &summary, "2030-01-01T00:00:00Z"),
+            None,
+        );
+        assert!(!registry.is_model_schedulable("p", "gemini-3.8-flash-low"));
+        assert!(registry.is_model_schedulable("p", "gemini-3.8-flash-high"));
+        assert!(registry.model_snapshot("p", "gemini-3.8-flash").is_none());
+        assert!(registry.is_model_schedulable("p", "gemini-3.8-flash"));
+    }
+
+    #[test]
+    fn contradictory_google_duplicate_cannot_disappear_behind_healthy_weekly() {
+        use crate::provider::google::antigravity::parse_quota_summary_buckets;
+        let summary = parse_quota_summary_buckets(&serde_json::json!({"groups": [{
+            "groupId": "flash", "modelIds": ["flash"], "buckets": [
+                {"bucketId": "five", "window": "FIVE_HOURS", "remainingFraction": 0.0},
+                {"bucketId": "five", "window": "FIVE_HOURS", "remainingFraction": 0.9},
+                {"bucketId": "week", "window": "WEEKLY", "remainingFraction": 0.8}
+            ]
+        }]}));
+        let registry = crate::router::quota::ProviderQuotaRegistry::new();
+        let contradictory = google_quota_buckets("owner", &[], &summary, "2030-01-01T00:00:00Z");
+        registry.observe_buckets("p", &contradictory, None);
+        registry.observe_buckets("p", &contradictory, None);
+        assert!(!registry.is_model_schedulable("p", "flash"));
+        assert!(
+            registry
+                .bucket_snapshot("p")
+                .iter()
+                .any(|bucket| bucket.tiers.iter().any(|tier| tier.used_percent >= 100.0))
+        );
+        assert!(registry.model_snapshot("p", "flash").is_none());
+        assert_eq!(
+            registry.model_scheduling("p", "flash").reason.as_deref(),
+            Some("conflicting_binding")
+        );
+    }
+
+    #[test]
+    fn google_rolling_or_unrecognized_windows_do_not_gain_fixed_duration() {
+        assert_eq!(quota_window_tag(Some("FIVE_HOURS")), "five_hour");
+        assert_eq!(quota_window_tag(Some("WEEKLY")), "weekly_limit");
+        assert_eq!(quota_window_tag(Some("ROLLING_WEEK")), "rolling_week");
+        assert_eq!(
+            quota_window_tag(Some("FIVE_HOURS_ROLLING")),
+            "five_hours_rolling"
+        );
+        assert_eq!(quota_window_tag(Some("SOMEDAY")), "someday");
+    }
+
+    #[test]
+    fn google_model_discovery_without_quota_is_one_unknown_diagnostic() {
+        use crate::provider::google::antigravity::parse_available_models_detailed;
+        let models = parse_available_models_detailed(&serde_json::json!({"models": {
+            "gemini-3.8-flash-low": {}, "gemini-4-argon": {"displayName": "Argon"}
+        }}));
+        let buckets = google_quota_buckets("owner", &models, &[], "2030-01-01T00:00:00Z");
+        assert_eq!(buckets.len(), 1);
+        assert!(!buckets[0].is_resolved());
+        assert!(buckets[0].models.is_empty());
+        assert!(buckets[0].tiers.is_empty());
+        assert_eq!(buckets[0].source, "unknown");
+        let registry = crate::router::quota::ProviderQuotaRegistry::new();
+        registry.observe_buckets("p", &buckets, None);
+        assert!(registry.model_snapshot("p", "gemini-4-argon").is_none());
+        assert_eq!(
+            registry
+                .model_scheduling("p", "gemini-4-argon")
+                .reason
+                .as_deref(),
+            Some("unknown_mapping")
+        );
+    }
+
+    #[test]
+    fn generic_google_summary_requires_manual_binding_not_modal_guess() {
+        use crate::provider::google::antigravity::{
+            parse_available_models_detailed, parse_quota_summary_buckets,
+        };
+        let models = parse_available_models_detailed(&serde_json::json!({"models": {
+            "gemini-3.8-flash": {"quotaInfo": {"remainingFraction": 0.8}},
+            "gemini-4-argon": {"quotaInfo": {"remainingFraction": 0.8}}
+        }}));
+        let summary = parse_quota_summary_buckets(&serde_json::json!({"groups": [
+            {"displayName": "Gemini", "buckets": [
+                {"bucketId": "f5", "window": "FIVE_HOURS", "remainingFraction": 0.0},
+                {"bucketId": "fw", "window": "WEEKLY", "remainingFraction": 0.8}]}
+        ]}));
+        let raw = google_quota_buckets("owner", &models, &summary, "2030-01-01T00:00:00Z");
+        assert_eq!(
+            raw.iter()
+                .filter(|bucket| bucket.source == "enforced_summary" && bucket.is_resolved())
+                .count(),
+            0
+        );
+        assert_eq!(
+            raw.iter()
+                .filter(|bucket| bucket.source == "catalog")
+                .count(),
+            2
+        );
+        let resource_ids = raw
+            .iter()
+            .filter(|bucket| bucket.source == "enforced_summary")
+            .map(|bucket| bucket.id.clone())
+            .collect();
+        let config = QuotaBucketConfig {
+            revision: 2,
+            bindings: vec![crate::quota_buckets::ManualQuotaBucketBinding {
+                id: "flash".to_owned(),
+                scope_id: "owner".to_owned(),
+                label: "Gemini Flash".to_owned(),
+                models: vec!["gemini-3.8-flash".to_owned()],
+                constraint_ids: resource_ids,
+            }],
+        };
+        let configured = apply_quota_bucket_config(&raw, &config).unwrap();
+        let registry = crate::router::quota::ProviderQuotaRegistry::new();
+        registry.observe_buckets("p", &configured, None);
+        assert!(!registry.is_model_schedulable("p", "gemini-3.8-flash"));
+        assert!(registry.is_model_schedulable("p", "gemini-4-argon"));
+        let snapshot = registry.raw_bucket_snapshot("p");
+        assert!(apply_quota_bucket_config(&snapshot, &config).is_ok());
+        registry.replace_bucket_mapping("p", &snapshot);
+        assert!(registry.model_snapshot("p", "gemini-3.8-flash").is_none());
+        assert!(
+            registry
+                .bucket_snapshot("p")
+                .iter()
+                .any(|bucket| bucket.tiers.iter().any(|tier| tier.used_percent == 100.0))
+        );
+    }
+
+    #[test]
     fn quota_summary_tiers_name_windows_and_percent() {
         use crate::provider::google::antigravity::QuotaSummaryBucket;
         let buckets = vec![
             QuotaSummaryBucket {
+                group_id: None,
+                model_ids: Vec::new(),
+                applies_to_all_models: false,
                 group: Some("Gemini".into()),
                 display_name: Some("Five Hour Limit Remaining".into()),
                 bucket_id: Some("b1".into()),
@@ -5975,6 +6589,9 @@ mod tests {
                 resets_at: Some("2026-09-16T10:35:34Z".into()),
             },
             QuotaSummaryBucket {
+                group_id: None,
+                model_ids: Vec::new(),
+                applies_to_all_models: false,
                 group: Some("Gemini".into()),
                 display_name: Some("Weekly Limit Remaining".into()),
                 bucket_id: Some("b2".into()),
@@ -5983,6 +6600,9 @@ mod tests {
                 resets_at: Some("2026-09-23T05:35:34Z".into()),
             },
             QuotaSummaryBucket {
+                group_id: None,
+                model_ids: Vec::new(),
+                applies_to_all_models: false,
                 group: Some("Claude".into()),
                 display_name: Some("Five Hour Limit Remaining".into()),
                 bucket_id: Some("b3".into()),
@@ -5991,6 +6611,9 @@ mod tests {
                 resets_at: Some("2026-09-16T12:59:59Z".into()),
             },
             QuotaSummaryBucket {
+                group_id: None,
+                model_ids: Vec::new(),
+                applies_to_all_models: false,
                 group: Some("Claude".into()),
                 display_name: Some("Weekly Limit Remaining".into()),
                 bucket_id: Some("b4".into()),
@@ -6018,6 +6641,9 @@ mod tests {
         // falls back to every bucket rather than blanking the readout.
         let buckets = vec![
             QuotaSummaryBucket {
+                group_id: None,
+                model_ids: Vec::new(),
+                applies_to_all_models: false,
                 group: Some("Mainline".into()),
                 display_name: None,
                 bucket_id: Some("m1".into()),
@@ -6026,6 +6652,9 @@ mod tests {
                 resets_at: None,
             },
             QuotaSummaryBucket {
+                group_id: None,
+                model_ids: Vec::new(),
+                applies_to_all_models: false,
                 group: Some("Companion".into()),
                 display_name: None,
                 bucket_id: Some("c1".into()),
@@ -6050,6 +6679,9 @@ mod tests {
         // orders. Window rows are ordered by duration, never by usage.
         let buckets = vec![
             QuotaSummaryBucket {
+                group_id: None,
+                model_ids: Vec::new(),
+                applies_to_all_models: false,
                 group: Some("Gemini".into()),
                 display_name: Some("Weekly Limit Remaining".into()),
                 bucket_id: Some("b1".into()),
@@ -6058,6 +6690,9 @@ mod tests {
                 resets_at: Some("2026-09-23T05:35:34Z".into()),
             },
             QuotaSummaryBucket {
+                group_id: None,
+                model_ids: Vec::new(),
+                applies_to_all_models: false,
                 group: Some("Gemini".into()),
                 display_name: Some("Five Hour Limit Remaining".into()),
                 bucket_id: Some("b2".into()),
@@ -6144,27 +6779,37 @@ mod tests {
         use crate::provider::google::antigravity::AvailableModel;
         let models = vec![
             AvailableModel {
+                quota_bucket_id: None,
+                quota_group_id: None,
                 id: "gemini-3.8-flash-high".into(),
                 quota_remaining: Some(0.0),
                 quota_resets_at: Some("2026-09-11T08:54:27Z".into()),
             },
             AvailableModel {
+                quota_bucket_id: None,
+                quota_group_id: None,
                 id: "gemini-3.8-flash-low".into(),
                 quota_remaining: Some(0.5),
                 quota_resets_at: None,
             },
             AvailableModel {
+                quota_bucket_id: None,
+                quota_group_id: None,
                 id: "gemini-3.8-flash-tiered".into(),
                 quota_remaining: Some(1.0),
                 quota_resets_at: None,
             },
             // Non-family ids stay their own pool; gpt-oss keeps its -medium.
             AvailableModel {
+                quota_bucket_id: None,
+                quota_group_id: None,
                 id: "gpt-oss-120b-medium".into(),
                 quota_remaining: Some(0.25),
                 quota_resets_at: None,
             },
             AvailableModel {
+                quota_bucket_id: None,
+                quota_group_id: None,
                 id: "claude-sonnet-4-6".into(),
                 quota_remaining: Some(0.9),
                 quota_resets_at: None,
@@ -6172,22 +6817,30 @@ mod tests {
             // Internal noise drops before the quota check: chat_20706 reports a
             // full quota and must still not produce a row.
             AvailableModel {
+                quota_bucket_id: None,
+                quota_group_id: None,
                 id: "chat_20706".into(),
                 quota_remaining: Some(1.0),
                 quota_resets_at: None,
             },
             AvailableModel {
+                quota_bucket_id: None,
+                quota_group_id: None,
                 id: "tab_flash_lite_preview".into(),
                 quota_remaining: Some(1.0),
                 quota_resets_at: None,
             },
             AvailableModel {
+                quota_bucket_id: None,
+                quota_group_id: None,
                 id: "tab_jump_flash_lite_preview".into(),
                 quota_remaining: Some(1.0),
                 quota_resets_at: None,
             },
             // No quotaInfo → skipped.
             AvailableModel {
+                quota_bucket_id: None,
+                quota_group_id: None,
                 id: "chat_23310".into(),
                 quota_remaining: None,
                 quota_resets_at: None,
@@ -6216,6 +6869,8 @@ mod tests {
     fn google_subscription_tiers_use_the_modal_shared_bucket() {
         use crate::provider::google::antigravity::AvailableModel;
         let model = |id: &str, remaining: f64| AvailableModel {
+            quota_bucket_id: None,
+            quota_group_id: None,
             id: id.into(),
             quota_remaining: Some(remaining),
             quota_resets_at: Some("2026-09-11T08:54:27Z".into()),
@@ -6241,6 +6896,8 @@ mod tests {
     fn google_subscription_tiers_fall_back_without_gemini_entries() {
         use crate::provider::google::antigravity::AvailableModel;
         let model = |id: &str, remaining: f64| AvailableModel {
+            quota_bucket_id: None,
+            quota_group_id: None,
             id: id.into(),
             quota_remaining: Some(remaining),
             quota_resets_at: None,
@@ -6268,6 +6925,8 @@ mod tests {
     fn google_subscription_tiers_fold_the_live_catalog_shape() {
         use crate::provider::google::antigravity::AvailableModel;
         let model = |id: &str, remaining: f64| AvailableModel {
+            quota_bucket_id: None,
+            quota_group_id: None,
             id: id.into(),
             quota_remaining: Some(remaining),
             quota_resets_at: Some("2026-09-11T08:54:27Z".into()),

@@ -352,6 +352,40 @@ impl LogStore for MemoryStorage {
         Ok((vec![], vec![]))
     }
 
+    async fn provider_quota_token_usage_with_periods(
+        &self,
+        _provider_id: &str,
+        _now: i64,
+        _provider_period: Option<(i64, i64)>,
+        _bucket_periods: &std::collections::HashMap<
+            (String, String),
+            crate::storage::provider_usage::ProviderQuotaPeriod,
+        >,
+    ) -> anyhow::Result<super::provider_usage::ProviderQuotaUsage> {
+        // YAML-only memory storage never retains request logs.
+        Ok(Default::default())
+    }
+
+    async fn provider_quota_usage_detail(
+        &self,
+        provider_id: &str,
+        start_at: i64,
+        end_at: i64,
+        quota_bucket: &str,
+        quota_scope: Option<&str>,
+    ) -> anyhow::Result<super::provider_usage::ProviderQuotaUsageDetail> {
+        let periods = std::collections::HashMap::new();
+        Ok(super::provider_usage::QuotaDetailAccumulator::new(
+            provider_id,
+            start_at,
+            end_at,
+            quota_bucket,
+            quota_scope,
+            &periods,
+        )
+        .finish())
+    }
+
     async fn account_token_usage_with_periods(
         &self,
         _provider_id: &str,

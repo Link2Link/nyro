@@ -952,7 +952,18 @@ impl AdminService {
             .sync_provider_runtime_fields(&provider, &refreshed_credential)
             .await?;
         self.bump_config_epoch().await?;
-        self.gw.quota_registry.invalidate(&provider.id);
+        // Reconnecting by refreshing the same subscriber token is not quota
+        // recovery. Keep scoped enforcement until a new authoritative query.
+        if self
+            .gw
+            .quota_registry
+            .bucket_snapshot(&provider.id)
+            .is_empty()
+        {
+            self.gw.quota_registry.invalidate(&provider.id);
+        } else {
+            self.gw.quota_registry.request_refresh(&provider.id);
+        }
 
         Ok(build_provider_oauth_status(
             &refreshed_provider,
@@ -976,6 +987,7 @@ impl AdminService {
 
         self.disconnect_legacy_provider_credentials(&provider)
             .await?;
+        self.clear_provider_quota_identity(&provider.id).await?;
 
         let updated = self
             .gw
@@ -1253,7 +1265,7 @@ impl AdminService {
         };
 
         self.bump_config_epoch().await?;
-        self.gw.quota_registry.invalidate(&provider.id);
+        self.clear_provider_quota_identity(&provider.id).await?;
         Ok(provider)
     }
     pub(crate) async fn resolve_provider_runtime(

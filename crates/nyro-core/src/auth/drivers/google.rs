@@ -719,6 +719,10 @@ impl AuthDriver for GoogleSubscriptionDriver {
         let (project_id, tier_summary) = self
             .resolve_project_id(&client, &config, &access_token, None)
             .await?;
+        // Resolve the stable subscriber identity at first login as well as
+        // refresh; otherwise quota ownership would switch from a random legacy
+        // scope to email on the first routine token renewal.
+        bundle.subject_id = Some(email.clone());
         if let Some(meta) = bundle.raw.as_object_mut() {
             meta.insert("email".to_string(), Value::String(email));
             meta.insert("project_id".to_string(), Value::String(project_id.clone()));

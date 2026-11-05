@@ -272,6 +272,31 @@ pub trait LogStore: Send + Sync {
         Vec<crate::db::models::TokenUsageDay>,
         Vec<crate::db::models::TokenUsageDay>,
     )>;
+    /// One provider-filtered retained metadata scan, partitioned by immutable
+    /// (scope, primary bucket, exact wire model). Malformed/legacy attribution
+    /// stays unassigned. Dispatch time anchors periods; emitted/completion time
+    /// caps visibility at `now`. Does not read or alter the permanent ledger.
+    async fn provider_quota_token_usage_with_periods(
+        &self,
+        provider_id: &str,
+        now: i64,
+        provider_period: Option<(i64, i64)>,
+        bucket_periods: &std::collections::HashMap<
+            (String, String),
+            crate::storage::provider_usage::ProviderQuotaPeriod,
+        >,
+    ) -> anyhow::Result<super::provider_usage::ProviderQuotaUsage>;
+    /// Stream narrow provider/range metadata once, applying the same guarded
+    /// immutable bucket predicate as log listing. Folds summary/model metrics
+    /// and nullable-token pricing partitions together; no payloads or page rescans.
+    async fn provider_quota_usage_detail(
+        &self,
+        provider_id: &str,
+        start_at: i64,
+        end_at: i64,
+        quota_bucket: &str,
+        quota_scope: Option<&str>,
+    ) -> anyhow::Result<super::provider_usage::ProviderQuotaUsageDetail>;
     /// Retained attempts, including failures/retries, strictly filtered by provider ID
     /// and grouped by `route_decision.account.account_id` plus upstream model.
     /// Missing/empty/non-string account IDs and malformed JSON are skipped; labels

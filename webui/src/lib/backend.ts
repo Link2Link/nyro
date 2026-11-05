@@ -156,7 +156,11 @@ function resolveHTTP(cmd: string, args?: Record<string, unknown>): HTTPMapping {
     case "get_provider_usage":
       return { method: "GET", url: `${base}/providers/${args?.id}/usage` };
     case "list_provider_usage":
-      return { method: "GET", url: `${base}/providers/usage` };
+      return { method: "GET", url: `${base}/providers/usage?view=providers` };
+    case "get_provider_quota_buckets_config":
+      return { method: "GET", url: `${base}/providers/${encodeURIComponent(String(args?.id ?? ""))}/quota-buckets` };
+    case "set_provider_quota_buckets_config":
+      return { method: "PUT", url: `${base}/providers/${encodeURIComponent(String(args?.id ?? ""))}/quota-buckets`, body: { config: args?.config } };
     case "get_provider_usage_credentials":
       return { method: "GET", url: `${base}/providers/${args?.id}/usage-credentials` };
     case "set_provider_usage_credentials":
@@ -374,9 +378,13 @@ function resolveHTTP(cmd: string, args?: Record<string, unknown>): HTTPMapping {
       };
     }
     case "get_provider_usage_detail": {
+      const params = new URLSearchParams(statsQuery(args).replace(/^\?/, ""));
+      if (args?.quotaBucket != null) params.set("quota_bucket", String(args.quotaBucket));
+      if (args?.quotaScope != null) params.set("quota_scope", String(args.quotaScope));
+      const qs = params.toString();
       return {
         method: "GET",
-        url: `${base}/stats/providers/${encodeURIComponent(String(args?.id ?? ""))}${statsQuery(args)}`,
+        url: `${base}/stats/providers/${encodeURIComponent(String(args?.id ?? ""))}${qs ? `?${qs}` : ""}`,
       };
     }
     case "get_stats_by_api_key": {

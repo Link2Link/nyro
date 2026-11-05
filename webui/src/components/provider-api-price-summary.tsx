@@ -4,18 +4,29 @@ import { retainedUsagePriceDisplay } from "@/lib/token-usage";
 import type { ProviderUsage } from "@/lib/types";
 
 /** Display backend-priced retained attempts; never infer cycles or change routing quota. */
-export function ProviderApiPriceSummary({ usage, now, stale, loading, locale = "en-US" }: {
-  usage: ProviderUsage;
+export function ProviderApiPriceSummary({ usage, now, stale, loading, locale = "en-US", bucketLabel, scopeKey, totalOnly = false, projectionAllowed = true }: {
+  usage: Pick<ProviderUsage, "provider_id" | "tiers" | "api_price">;
   now: number;
   stale: boolean;
   loading: boolean;
   locale?: Locale;
+  /** Scope labels describe backend attribution only; no model matching happens here. */
+  bucketLabel?: string;
+  scopeKey?: string;
+  /** Independent bucket cycles must never be aggregated on the provider footer. */
+  totalOnly?: boolean;
+  /** Unresolved/catalog bucket observations cannot support matched capacity. */
+  projectionAllowed?: boolean;
 }) {
   const isZh = locale === "zh-CN";
   const stats = usage.api_price;
-  const scope = isZh
-    ? "按此供应商 ID 累计保留日志（含失败与重试），清理日志会减少累计值；不包含网关外的使用。等价 API 价格按已记录 Token 和当前参考价估算，非上游实际账单或套餐余额。"
-    : "Retained logs for this provider ID, including failed and retried attempts; clearing logs reduces these totals. Usage outside this gateway is not included. Equivalent API price uses recorded tokens and current reference rates, not an upstream bill or plan balance.";
+  const scope = bucketLabel
+    ? (isZh
+      ? `仅统计主要归属为“${bucketLabel}”的保留日志（含失败与重试），不重复累计其窗口或共享约束。清理日志会减少累计值。等价 API 价格按已记录 Token 和当前参考价估算，非实际账单或套餐余额。`
+      : `Retained logs primarily attributed to “${bucketLabel}”, including failed and retried attempts; windows and shared constraints are not counted again. Clearing logs reduces these totals. Equivalent API price uses recorded tokens and current reference rates, not a bill or plan balance.`)
+    : isZh
+      ? "按此供应商 ID 累计保留日志（含失败与重试），清理日志会减少累计值；不包含网关外的使用。等价 API 价格按已记录 Token 和当前参考价估算，非上游实际账单或套餐余额。"
+      : "Retained logs for this provider ID, including failed and retried attempts; clearing logs reduces these totals. Usage outside this gateway is not included. Equivalent API price uses recorded tokens and current reference rates, not an upstream bill or plan balance.";
   const start = stats?.period_start;
   const end = stats?.period_end;
   const hasBounds = start != null && end != null && 0 <= start && start < end
@@ -39,7 +50,7 @@ export function ProviderApiPriceSummary({ usage, now, stale, loading, locale = "
   const matchingTier = tiers.length === 1 && tiers[0].resets_at != null && Date.parse(tiers[0].resets_at) === end
     && tiers[0].used_percent === usedPercent;
   const costs = stats?.estimated_capacity;
-  const canEstimate = !stale && period && period.request_count > 0 && matchingTier
+  const canEstimate = projectionAllowed && !stale && period && period.request_count > 0 && matchingTier
     && period.equivalent_costs.some((cost) => Number.isFinite(cost.total_cost) && cost.total_cost >= 0 && cost.priced_request_count > 0)
     && usedPercent != null && Number.isFinite(usedPercent) && usedPercent > 0 && usedPercent <= 100
     && costs?.length && costs.every((cost) => Number.isFinite(cost.total_cost) && cost.total_cost >= 0 && cost.priced_request_count > 0);
@@ -54,12 +65,12 @@ export function ProviderApiPriceSummary({ usage, now, stale, loading, locale = "
     : "Estimate unavailable: requires a current-cycle price and matching-cycle usage above 0% and at most 100%; stale data, mismatched cycles or missing reference prices are not projected."),
   estimatePrice?.title ?? ""].filter(Boolean).join("\n");
   const rows = [
-    { key: "all_time", label: isZh ? "累计 API 价格" : "Total API price", title: scope, totals: stats?.all_time },
-    { key: "period", label: isZh ? "本周期 API 价格" : "Current-cycle API price", title: periodTitle, totals: period },
+    { key: "all_time", label: totalOnly ? (isZh ? "供应商保留日志总价格" : "Provider retained-log total") : (isZh ? "累计 API 价格" : "Total API price"), title: scope, totals: stats?.all_time },
+    ...(!totalOnly ? [{ key: "period", label: isZh ? "本周期 API 价格" : "Current-cycle API price", title: periodTitle, totals: period }] : []),
   ];
-  return <div data-provider-api-price={usage.provider_id} aria-busy={loading && !stats}
+  return <div data-provider-api-price={usage.provider_id} data-price-scope={scopeKey} aria-busy={loading && !stats}
     className="border-t border-slate-200/70 pt-2" title={scope}>
-    <dl className="grid gap-x-6 gap-y-2 sm:grid-cols-3">
+    <dl className={`grid gap-x-6 gap-y-2 ${totalOnly ? "" : "sm:grid-cols-3"}`}>
       {rows.map(({ key, label, title, totals }) => {
         const price = totals ? retainedUsagePriceDisplay(totals, isZh, locale) : null;
         return <div key={key} data-api-price={key} className="min-w-0" title={title}>
@@ -70,18 +81,19 @@ export function ProviderApiPriceSummary({ usage, now, stale, loading, locale = "
           </dd>
         </div>;
       })}
-      <div data-api-price="estimated_capacity" className="min-w-0" title={estimateTitle}>
+      {!totalOnly && <div data-api-price="estimated_capacity" className="min-w-0" title={estimateTitle}>
         <dt className="text-[10px] font-medium text-slate-500">{isZh ? "本周期预估可用 API 价格" : "Estimated cycle API capacity"}</dt>
         <dd className={`mt-0.5 break-words text-xs font-semibold tabular-nums ${period?.unpriced_request_count ? "text-amber-700" : "text-slate-700"}`}>
-          {estimatePrice?.priced ? `≈ ${estimatePrice.text}` : "—"}
+          {estimatePrice?.priced ? `≈ ${estimatePrice.text}${stats?.estimated_capacity_partial ? (isZh ? "（部分估算）" : " (partial)") : ""}` : "—"}
         </dd>
-      </div>
+      </div>}
     </dl>
-    {cycleStatus && <p role="status" className="mt-1.5 text-[10px] text-amber-700">{cycleStatus}</p>}
+    {totalOnly && <p className="mt-1.5 text-[10px] text-slate-400">{isZh ? "含未归属用量；不合并独立桶的周期或容量。" : "Includes unassigned usage; independent bucket cycles and capacities are not combined."}</p>}
+    {!totalOnly && cycleStatus && <p role="status" className="mt-1.5 text-[10px] text-amber-700">{cycleStatus}</p>}
     {!stats && <p role="status" className="mt-1.5 text-[10px] text-slate-400">
       {loading ? (isZh ? "正在读取金额统计…" : "Loading price totals…") : (isZh ? "API 金额统计暂不可用" : "API price totals unavailable")}
     </p>}
-    {stats && stale && <p role="status" className="mt-1.5 text-[10px] text-amber-700">
+    {!totalOnly && stats && stale && <p role="status" className="mt-1.5 text-[10px] text-amber-700">
       {isZh ? "当前为旧数据，暂不估算可用金额，请刷新用量。" : "Showing stale totals; refresh usage to estimate capacity."}
     </p>}
   </div>;

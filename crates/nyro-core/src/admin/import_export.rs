@@ -128,6 +128,9 @@ impl AdminService {
                 .into_iter()
                 .filter(|(key, _)| {
                     !key.starts_with("provider_account_fence:")
+                        && !key.starts_with("quota_bucket_owner.")
+                        && !key.starts_with("quota_bucket_fence.")
+                        && !key.starts_with("quota_buckets.")
                         && key
                             .strip_prefix(super::account_pool::POOL_SETTING_PREFIX)
                             .is_none_or(|id| provider_ids.contains(id))
@@ -356,7 +359,14 @@ impl AdminService {
         }
 
         for (key, value) in &data.settings {
-            if key.starts_with("provider_account_fence:") {
+            // Runtime entitlement identity and live discovered-resource bindings
+            // are not portable configuration. Imported providers get new IDs and
+            // must rediscover/rebind rather than inherit another owner's fences.
+            if key.starts_with("provider_account_fence:")
+                || key.starts_with("quota_bucket_owner.")
+                || key.starts_with("quota_bucket_fence.")
+                || key.starts_with("quota_buckets.")
+            {
                 continue;
             }
             if let Some(source_id) = key.strip_prefix(super::account_pool::POOL_SETTING_PREFIX) {

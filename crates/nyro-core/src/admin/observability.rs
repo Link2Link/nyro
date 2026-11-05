@@ -225,12 +225,27 @@ fn decorate_log_result(log: &mut RequestLog) {
     .to_string();
 }
 
+fn validate_quota_filter(bucket: Option<&str>, scope: Option<&str>) -> anyhow::Result<()> {
+    for value in [bucket, scope].into_iter().flatten() {
+        anyhow::ensure!(
+            !value.trim().is_empty() && value.len() <= 512,
+            "invalid quota bucket filter"
+        );
+    }
+    anyhow::ensure!(
+        scope.is_none() || bucket.is_some_and(|bucket| bucket != "unassigned"),
+        "quota scope requires a bucket filter"
+    );
+    Ok(())
+}
+
 impl AdminService {
     // ── Logs ──
 
     pub async fn query_logs(&self, q: LogQuery) -> anyhow::Result<LogPage> {
         let mut q = q;
-        q.limit = Some(q.limit.unwrap_or(50).min(500));
+        validate_quota_filter(q.quota_bucket.as_deref(), q.quota_scope.as_deref())?;
+        q.limit = Some(q.limit.unwrap_or(50).clamp(0, 500));
         q.offset = Some(q.offset.unwrap_or(0));
         if let Some(outcome) = q.outcome.as_deref() {
             anyhow::ensure!(
@@ -564,6 +579,79 @@ impl AdminService {
             &overrides,
         );
         Ok(rows)
+    }
+
+    /// Bucket-aware retained detail. Uses the exact same guarded immutable JSON
+    /// predicate as query_logs; no present-day mapping is retroactive evidence.
+    pub async fn get_provider_usage_detail_filtered(
+        &self,
+        provider_id: &str,
+        range: impl Into<StatsRange>,
+        quota_bucket: Option<&str>,
+        quota_scope: Option<&str>,
+    ) -> anyhow::Result<ProviderUsageDetail> {
+        validate_quota_filter(quota_bucket, quota_scope)?;
+        let range = range.into();
+        let Some(bucket) = quota_bucket else {
+            return self.get_provider_usage_detail(provider_id, range).await;
+        };
+        let (start_at, end_at) = resolve_detail_window(range, Utc::now().timestamp_millis())?;
+        let scanned = self
+            .gw
+            .storage
+            .logs()
+            .provider_quota_usage_detail(provider_id, start_at, end_at, bucket, quota_scope)
+            .await?;
+        let mut detail = scanned.detail;
+        let partitions = scanned.usage;
+        let provider = self.gw.storage.providers().get(provider_id).await?;
+        if let Some(provider) = &provider {
+            detail.provider_name = provider.name.clone();
+            detail.provider_icon = provider.preset_key.clone().or(provider.vendor.clone());
+            detail.provider_protocol = Some(provider.protocol.clone());
+        }
+        // Summary, model metrics and priceable nullable tokens were folded in
+        // the same bounded-memory provider/range stream; never rescan per page.
+        let priced = async {
+            let mut rows: Vec<_> = partitions.iter().map(|row| row.usage.clone()).collect();
+            let providers = provider
+                .into_iter()
+                .map(|provider| (provider.id.clone(), provider))
+                .collect();
+            let overrides =
+                super::token_price::parse_overrides(self.gw.storage.settings().list_all().await?)?;
+            super::token_cost::enrich_token_costs(
+                &mut rows,
+                &providers,
+                &self.gw.config.data_dir,
+                &overrides,
+            );
+            for (partition, row) in partitions.iter().zip(&mut rows) {
+                if partition.fully_missing_usage_request_count > 0 {
+                    row.cost = None;
+                }
+            }
+            Ok::<_, anyhow::Error>(rows)
+        }
+        .await;
+        match priced {
+            Ok(rows) => {
+                let (costs, unpriced) = super::token_cost::summarize_costs(&rows);
+                detail.equivalent_costs = costs;
+                detail.unpriced_request_count = unpriced;
+                for model in &mut detail.models {
+                    let (costs, unpriced) = super::token_cost::summarize_costs(
+                        rows.iter().filter(|row| row.model == model.upstream_model),
+                    );
+                    model.equivalent_costs = costs;
+                    model.unpriced_request_count = unpriced;
+                }
+            }
+            Err(error) => {
+                tracing::warn!(%error, "equivalent API price unavailable for quota bucket detail")
+            }
+        }
+        Ok(detail)
     }
 
     pub async fn get_provider_usage_detail(
