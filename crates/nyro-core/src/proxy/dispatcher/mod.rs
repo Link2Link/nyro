@@ -1590,12 +1590,16 @@ async fn dispatch_pipeline_inner(
         // Channel-scoped extensions own URL quirks such as ChatGPT Codex's
         // `/backend-api/codex/responses` path. The full vendor builds the
         // request body, then the resolved extension canonicalizes its URL.
+        // Keep the effective upstream mode: subscription Gemini can force SSE
+        // even when the client expects one buffered response. Reusing the
+        // ingress flag here would undo the encoder's streamGenerateContent
+        // action; `is_stream` still controls downstream aggregation below.
         if let Some(extension) = VendorRegistry::global().resolve(&provider, egress) {
             let vendor_ctx = provider_ctx.to_vendor_ctx();
             let egress_path = egress
                 .handler()
                 .make_request_encoder()
-                .egress_path(&transport_model, is_stream);
+                .egress_path(&transport_model, upstream_request.stream.enabled);
             outbound.url = extension.build_url(&vendor_ctx, &egress_base_url, &egress_path);
         }
 

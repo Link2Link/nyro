@@ -4009,6 +4009,88 @@ mod probe_reply_tests {
         assert!(body["request"]["systemInstruction"]["parts"].is_array());
     }
 
+    #[tokio::test]
+    async fn google_subscription_probe_sends_driver_bound_channel_identity() {
+        use crate::auth::{AuthDriver, StoredCredential, drivers::GoogleSubscriptionDriver};
+        // Exercise the real OAuth bind -> header conversion -> HTTP probe
+        // without OAuth/discovery or the process-global manifest cache.
+        for channel in ["antigravity", "gemini-cli"] {
+            let provider: Provider = serde_json::from_value(serde_json::json!({
+                "id":"probe", "name":"probe", "vendor":"google", "channel":channel,
+                "protocol":"google-gemini", "base_url":"https://unused.invalid",
+                "api_key":"", "auth_mode":"oauth", "preset_key":"google",
+                "last_test_success":null,"last_test_at":null,
+                "is_enabled":true,"created_at":"","updated_at":""
+            }))
+            .unwrap();
+            let credential = StoredCredential {
+                access_token: Some("fixture-token".into()),
+                meta: serde_json::json!({"project_id":"fixture-project"}),
+                ..Default::default()
+            };
+            let driver = if channel == "antigravity" {
+                &GoogleSubscriptionDriver::ANTIGRAVITY
+            } else {
+                &GoogleSubscriptionDriver::GEMINI_CLI
+            };
+            let binding = driver.bind_runtime(&provider, &credential).unwrap();
+            let runtime_headers = runtime_binding_headers(&binding).unwrap();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let app = axum::Router::new().route(
+                "/v1internal:streamGenerateContent",
+                axum::routing::post(move |headers: HeaderMap, axum::Json(body): axum::Json<Value>| async move {
+                    assert_eq!(headers[AUTHORIZATION], "Bearer fixture-token");
+                    if channel == "antigravity" {
+                        assert_eq!(headers["user-agent"],
+                            "antigravity/hub/2.29.0 (aidev_client; os_type=darwin; arch=arm64; cl=1013060670)");
+                        assert_eq!(body["userAgent"], "antigravity");
+                    } else {
+                        assert_eq!(headers["user-agent"], "GeminiCLI/0.1.5 (Windows; AMD64)");
+                        assert!(!headers.contains_key("x-goog-api-client"));
+                        assert!(body.get("userAgent").is_none());
+                    }
+                    assert_eq!(body["model"], "gemini-4-argon");
+                    assert_eq!(body["project"], "fixture-project");
+                    ([ ("content-type", "text/event-stream") ],
+                        "data: {\"response\":{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"Hello\"}]},\"finishReason\":\"STOP\"}]}}\n\n")
+                }),
+            );
+            struct AbortOnDrop(tokio::task::JoinHandle<()>);
+            impl Drop for AbortOnDrop {
+                fn drop(&mut self) {
+                    self.0.abort();
+                }
+            }
+            let _server = AbortOnDrop(tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            }));
+            let result = probe_single_model(
+                reqwest::Client::builder()
+                    .no_proxy()
+                    .redirect(reqwest::redirect::Policy::none())
+                    .build()
+                    .unwrap(),
+                crate::protocol::ids::Protocol::GoogleGemini,
+                &url,
+                "fixture-token",
+                "none",
+                &runtime_headers,
+                "gemini-4-argon",
+                "hi",
+                "google-gemini",
+                false,
+                Some(channel),
+                false,
+                Some("fixture-project"),
+                None,
+            )
+            .await;
+            assert!(result.success, "{}", result.error.unwrap_or_default());
+            assert_eq!(result.reply.as_deref(), Some("Hello"));
+        }
+    }
+
     #[test]
     fn antigravity_probe_request_without_project_fails() {
         let error = build_gemini_model_probe_request(

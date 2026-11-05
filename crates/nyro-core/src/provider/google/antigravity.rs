@@ -81,15 +81,13 @@ pub(crate) const ANTIGRAVITY_OAUTH_SCOPES: &str = concat!(
     "https://www.googleapis.com/auth/experimentsandconfigs",
 );
 
-/// Antigravity client version reported in the User-Agent. Cloud Code gates
-/// model access by a client-version floor — sub-2.9.0 clients were rejected
-/// outright, and the Gemini 4 Argon rollout required current-generation
-/// clients. The live version is refreshed from the official hub auto-updater
-/// manifest (see [`refresh_antigravity_version`]); this constant is the
-/// fallback while the manifest has not been fetched (first start) or is
-/// unreachable. **Bump the fallback** when Google tightens client gating.
-pub(crate) const ANTIGRAVITY_FALLBACK_VERSION: &str = "2.24.0";
-const ANTIGRAVITY_PLATFORM: &str = "windows/amd64";
+/// Antigravity Hub release used before the manifest is fetched, after cache
+/// expiry, or when the updater is unreachable. Keep this release and its known
+/// changelist in `hub_user_agent_for_version` in sync. Reference: CLIProxyAPI
+/// f72f8bfd6a1c7d69ca371dd4a7bdf490db50c154 (2026-11-04).
+pub(crate) const ANTIGRAVITY_FALLBACK_VERSION: &str = "2.29.0";
+/// Match the darwin-arm64 Hub manifest, not the legacy IDE/Windows identity.
+const ANTIGRAVITY_HUB_PLATFORM: &str = "aidev_client; os_type=darwin; arch=arm64";
 
 /// Official Antigravity hub auto-updater manifest — the same electron-builder
 /// feed the real IDE polls; carries `version: x.y.z` as its first key.
@@ -113,30 +111,146 @@ struct AntigravityVersionState {
     last_attempt: Option<Instant>,
 }
 
-static ANTIGRAVITY_VERSION_STATE: LazyLock<RwLock<AntigravityVersionState>> = LazyLock::new(|| {
-    RwLock::new(AntigravityVersionState {
-        version: ANTIGRAVITY_FALLBACK_VERSION.to_string(),
-        refreshed_at: None,
-        last_attempt: None,
-    })
-});
+impl AntigravityVersionState {
+    fn new() -> Self {
+        Self {
+            version: ANTIGRAVITY_FALLBACK_VERSION.to_string(),
+            refreshed_at: None,
+            last_attempt: None,
+        }
+    }
+
+    fn is_fresh(&self, now: Instant) -> bool {
+        self.refreshed_at
+            .is_some_and(|at| now.saturating_duration_since(at) < ANTIGRAVITY_VERSION_TTL)
+    }
+
+    fn cached_or_fallback(&self, now: Instant) -> &str {
+        if self.is_fresh(now) {
+            &self.version
+        } else {
+            ANTIGRAVITY_FALLBACK_VERSION
+        }
+    }
+
+    fn should_refresh(&self, now: Instant) -> bool {
+        !self.is_fresh(now)
+            && !self.last_attempt.is_some_and(|at| {
+                now.saturating_duration_since(at) < ANTIGRAVITY_VERSION_RETRY_AFTER
+            })
+    }
+}
+
+/// The async gate deduplicates concurrent cold starts without holding the
+/// synchronous state lock over network I/O. Separate instances keep cache tests
+/// isolated from the process-wide version used by the auth driver.
+struct AntigravityVersionCache {
+    state: RwLock<AntigravityVersionState>,
+    fetch_gate: tokio::sync::Mutex<()>,
+}
+
+impl AntigravityVersionCache {
+    fn new() -> Self {
+        Self {
+            state: RwLock::new(AntigravityVersionState::new()),
+            fetch_gate: tokio::sync::Mutex::new(()),
+        }
+    }
+
+    fn version(&self) -> String {
+        self.state
+            .read()
+            .expect("antigravity version state lock poisoned")
+            .cached_or_fallback(Instant::now())
+            .to_string()
+    }
+
+    fn needs_refresh(&self) -> bool {
+        let state = self
+            .state
+            .read()
+            .expect("antigravity version state lock poisoned");
+        let now = Instant::now();
+        // An active attempt also sets last_attempt. Its concurrent callers
+        // must wait for the shared result instead of treating it as a failure
+        // cooldown and binding the fallback while that fetch is still running.
+        !state.is_fresh(now) && (state.should_refresh(now) || self.fetch_gate.try_lock().is_err())
+    }
+
+    async fn refresh(&self, client: &reqwest::Client, manifest_url: &str) {
+        if !self.needs_refresh() {
+            return;
+        }
+        let _gate = self.fetch_gate.lock().await;
+        if !self
+            .state
+            .read()
+            .expect("antigravity version state lock poisoned")
+            .should_refresh(Instant::now())
+        {
+            return;
+        }
+        // Also throttle a cancelled fetch; a dropped caller must not leave a
+        // permanently-held in-flight flag or cause an immediate retry storm.
+        self.state
+            .write()
+            .expect("antigravity version state lock poisoned")
+            .last_attempt = Some(Instant::now());
+        let fetched = async {
+            client
+                .get(manifest_url)
+                .header("User-Agent", "electron-builder")
+                .header("Cache-Control", "no-cache")
+                .timeout(ANTIGRAVITY_MANIFEST_TIMEOUT)
+                .send()
+                .await?
+                .error_for_status()?
+                .text()
+                .await
+        }
+        .await;
+        let version = fetched
+            .as_deref()
+            .ok()
+            .and_then(parse_hub_manifest_version)
+            .filter(|version| {
+                parse_semver_triple(version) >= parse_semver_triple(ANTIGRAVITY_FALLBACK_VERSION)
+            });
+        let mut state = self
+            .state
+            .write()
+            .expect("antigravity version state lock poisoned");
+        state.last_attempt = Some(Instant::now());
+        if let Some(version) = version {
+            tracing::debug!(%version, "antigravity client version refreshed from hub manifest");
+            state.version = version;
+            state.refreshed_at = state.last_attempt;
+        } else {
+            // Readers fall back when the last success has expired, even if
+            // this failure leaves an older live version in the cache.
+            tracing::debug!(
+                fallback = ANTIGRAVITY_FALLBACK_VERSION,
+                "antigravity Hub manifest unavailable or below the supported version floor"
+            );
+        }
+    }
+}
+
+static ANTIGRAVITY_VERSION_CACHE: LazyLock<AntigravityVersionCache> =
+    LazyLock::new(AntigravityVersionCache::new);
 
 /// Strict `major.minor.patch` (dot-separated numeric triples only) — the
 /// shape the hub manifest guarantees; anything else keeps the fallback.
-fn is_semver_triple(version: &str) -> bool {
+fn parse_semver_triple(version: &str) -> Option<(u64, u64, u64)> {
     let mut parts = version.split('.');
-    let mut count = 0;
-    loop {
-        match parts.next() {
-            Some(part) => {
-                count += 1;
-                if count > 3 || part.is_empty() || !part.bytes().all(|b| b.is_ascii_digit()) {
-                    return false;
-                }
-            }
-            None => return count == 3,
-        }
-    }
+    let mut number = || {
+        let part = parts.next()?;
+        (!part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()))
+            .then(|| part.parse::<u64>().ok())
+            .flatten()
+    };
+    let triple = (number()?, number()?, number()?);
+    parts.next().is_none().then_some(triple)
 }
 
 /// Extract the `version:` value from a hub auto-updater manifest body.
@@ -146,7 +260,7 @@ pub(crate) fn parse_hub_manifest_version(body: &str) -> Option<String> {
         let (key, value) = line.split_once(':')?;
         (key.trim() == "version")
             .then(|| value.trim().to_string())
-            .filter(|version| is_semver_triple(version))
+            .filter(|version| parse_semver_triple(version).is_some())
     })
 }
 
@@ -155,68 +269,44 @@ pub(crate) fn parse_hub_manifest_version(body: &str) -> Option<String> {
 /// dials the network; freshness is advanced by [`refresh_antigravity_version`]
 /// from the periodic catalog/quota flows.
 pub(crate) fn antigravity_version() -> String {
-    ANTIGRAVITY_VERSION_STATE
-        .read()
-        .expect("antigravity version state lock poisoned")
-        .version
-        .clone()
+    ANTIGRAVITY_VERSION_CACHE.version()
 }
 
-/// Best-effort refresh of the client version from the hub auto-updater
-/// manifest. TTL-gated with a failure cooldown; errors are silently ignored
-/// (the fallback keeps serving). The refreshed version applies to every
-/// User-Agent constructed after this call.
-async fn refresh_antigravity_version(client: &reqwest::Client) {
-    {
-        let state = ANTIGRAVITY_VERSION_STATE
-            .read()
-            .expect("antigravity version state lock poisoned");
-        let now = Instant::now();
-        let fresh = state
-            .refreshed_at
-            .is_some_and(|at| now.duration_since(at) < ANTIGRAVITY_VERSION_TTL);
-        let cooling = state
-            .last_attempt
-            .is_some_and(|at| now.duration_since(at) < ANTIGRAVITY_VERSION_RETRY_AFTER);
-        if fresh || cooling {
-            return;
-        }
-    }
-    let fetched = async {
-        let body = client
-            .get(ANTIGRAVITY_HUB_MANIFEST_URL)
-            .header("User-Agent", "electron-builder")
-            .header("Cache-Control", "no-cache")
-            .timeout(ANTIGRAVITY_MANIFEST_TIMEOUT)
-            .send()
-            .await?
-            .error_for_status()?
-            .text()
-            .await?;
-        Ok::<String, reqwest::Error>(body)
-    }
-    .await;
-    let mut state = ANTIGRAVITY_VERSION_STATE
-        .write()
-        .expect("antigravity version state lock poisoned");
-    state.last_attempt = Some(Instant::now());
-    if let Some(version) = fetched.ok().as_deref().and_then(parse_hub_manifest_version) {
-        tracing::debug!(%version, "antigravity client version refreshed from hub manifest");
-        state.version = version;
-        state.refreshed_at = state.last_attempt;
-    }
+pub(crate) fn antigravity_version_needs_refresh() -> bool {
+    ANTIGRAVITY_VERSION_CACHE.needs_refresh()
+}
+
+/// Prepare the Hub identity BEFORE binding runtime headers or constructing a
+/// control-plane User-Agent. Shared Gemini CLI catalog transport must never
+/// call this: only the actual Antigravity OAuth driver refreshes the Hub feed.
+pub(crate) async fn refresh_antigravity_version(client: &reqwest::Client) {
+    ANTIGRAVITY_VERSION_CACHE
+        .refresh(client, ANTIGRAVITY_HUB_MANIFEST_URL)
+        .await;
 }
 
 /// X-Goog-Api-Client header the Antigravity node client sends on
 /// control-plane calls.
 pub(crate) const X_GOOG_API_CLIENT: &str = "gl-node/22.21.1";
 
+fn hub_user_agent_for_version(version: &str) -> String {
+    // A changelist identifies one specific Hub build. A newer manifest only
+    // supplies the version, so never attach a different release's changelist.
+    let changelist = match version {
+        "2.23.0" => Some("998057262"),
+        "2.24.0" => Some("1000335682"),
+        "2.29.0" => Some("1013060670"),
+        _ => None,
+    };
+    let metadata = match changelist {
+        Some(cl) => format!("{ANTIGRAVITY_HUB_PLATFORM}; cl={cl}"),
+        None => ANTIGRAVITY_HUB_PLATFORM.to_string(),
+    };
+    format!("antigravity/hub/{version} ({metadata})")
+}
+
 pub(crate) fn antigravity_user_agent() -> String {
-    format!(
-        "antigravity/{} {}",
-        antigravity_version(),
-        ANTIGRAVITY_PLATFORM
-    )
+    hub_user_agent_for_version(&antigravity_version())
 }
 
 /// Inference base URL for the antigravity channel. Consumer (Google AI
@@ -277,12 +367,9 @@ pub(crate) async fn fetch_available_models(
     project_id: &str,
     user_agent: &str,
 ) -> Result<Vec<AvailableModel>> {
-    // Catalog calls are the natural heartbeat of the subscription channels
-    // (token exchange/refresh, model probing, usage polling) — piggyback the
-    // client-version refresh on them. The refreshed version applies to every
-    // User-Agent constructed after this call; `user_agent` was already built
-    // by the caller and keeps the pre-refresh version for this one request.
-    refresh_antigravity_version(client).await;
+    // Pure shared transport: callers prepare their channel's identity first.
+    // Refreshing here would send an already-bound stale UA and make Gemini CLI
+    // unnecessarily query the Antigravity Hub manifest.
     let endpoint = "https://cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels";
     let response = client
         .post(endpoint)
@@ -1048,14 +1135,178 @@ mod tests {
 
     #[test]
     fn antigravity_user_agent_carries_current_version_shape() {
-        // Tests never run the manifest refresh, so the version is exactly
-        // the fallback constant; live refresh can only raise it, and the
-        // shape (id + semver + platform) is what Cloud Code gates on.
         assert_eq!(
             antigravity_user_agent(),
-            format!("antigravity/{ANTIGRAVITY_FALLBACK_VERSION} windows/amd64")
+            "antigravity/hub/2.29.0 (aidev_client; os_type=darwin; arch=arm64; cl=1013060670)"
         );
-        assert!(is_semver_triple(&antigravity_version()));
+        assert!(parse_semver_triple(&antigravity_version()).is_some());
+        assert_eq!(
+            hub_user_agent_for_version("2.30.0"),
+            "antigravity/hub/2.30.0 (aidev_client; os_type=darwin; arch=arm64)"
+        );
+        assert!(!hub_user_agent_for_version("2.30.0").contains("cl="));
+    }
+
+    #[test]
+    fn hub_version_cache_expires_without_extending_success_on_failure() {
+        let now = Instant::now();
+        let mut state = AntigravityVersionState::new();
+        assert_eq!(state.cached_or_fallback(now), ANTIGRAVITY_FALLBACK_VERSION);
+        assert!(state.should_refresh(now));
+        state.version = "2.30.0".to_string();
+        state.refreshed_at = Some(now);
+        assert_eq!(state.cached_or_fallback(now), "2.30.0");
+        assert!(!state.should_refresh(now));
+        let expired = now + ANTIGRAVITY_VERSION_TTL;
+        assert_eq!(
+            state.cached_or_fallback(expired),
+            ANTIGRAVITY_FALLBACK_VERSION
+        );
+        assert!(state.should_refresh(expired));
+        state.last_attempt = Some(expired);
+        assert_eq!(
+            state.cached_or_fallback(expired),
+            ANTIGRAVITY_FALLBACK_VERSION
+        );
+        assert!(!state.should_refresh(expired));
+        assert!(state.should_refresh(expired + ANTIGRAVITY_VERSION_RETRY_AFTER));
+    }
+
+    /// A local manifest server; no test mutates the global cache or contacts
+    /// Google. Dropping the guard aborts the listener even on assertion failure.
+    struct HubManifestServer {
+        url: String,
+        hits: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    impl Drop for HubManifestServer {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+
+    async fn hub_manifest_server(body: &str, status: axum::http::StatusCode) -> HubManifestServer {
+        use axum::{Router, routing::get};
+        use std::sync::{Arc, atomic::AtomicUsize};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/manifest.yml", listener.local_addr().unwrap());
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counter = hits.clone();
+        let body = body.to_string();
+        let app = Router::new().route(
+            "/manifest.yml",
+            get(move |headers: axum::http::HeaderMap| {
+                let counter = counter.clone();
+                let body = body.clone();
+                async move {
+                    assert_eq!(headers["user-agent"], "electron-builder");
+                    assert_eq!(headers["cache-control"], "no-cache");
+                    counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    (status, body)
+                }
+            }),
+        );
+        let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        HubManifestServer { url, hits, task }
+    }
+
+    #[tokio::test]
+    async fn hub_version_refresh_single_flight_uses_new_identity_on_first_request() {
+        use std::sync::atomic::Ordering;
+        let server = hub_manifest_server("version: 2.30.0\n", axum::http::StatusCode::OK).await;
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let cache = AntigravityVersionCache::new();
+        let resolve = || async {
+            cache.refresh(&client, &server.url).await;
+            cache.version()
+        };
+        let (first, second, third) = tokio::join!(resolve(), resolve(), resolve());
+        assert_eq!(server.hits.load(Ordering::SeqCst), 1);
+        assert_eq!([first, second, third], ["2.30.0", "2.30.0", "2.30.0"]);
+        assert_eq!(cache.version(), "2.30.0");
+        assert!(!cache.needs_refresh());
+        // This is the ordering required of token/runtime binding: refresh
+        // finishes before any header is constructed, not after catalog send.
+        assert_eq!(
+            hub_user_agent_for_version(&cache.version()),
+            "antigravity/hub/2.30.0 (aidev_client; os_type=darwin; arch=arm64)"
+        );
+    }
+
+    #[tokio::test]
+    async fn hub_version_cancelled_refresh_does_not_stick_or_retry_in_cooldown() {
+        use std::sync::Arc;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/manifest.yml", listener.local_addr().unwrap());
+        let reached = Arc::new(tokio::sync::Notify::new());
+        let signal = reached.clone();
+        let app = axum::Router::new().route(
+            "/manifest.yml",
+            axum::routing::get(move || {
+                let signal = signal.clone();
+                async move {
+                    signal.notify_one();
+                    std::future::pending::<&'static str>().await
+                }
+            }),
+        );
+        let _server = HubManifestServer {
+            url: url.clone(),
+            hits: Default::default(),
+            task: tokio::spawn(async move { axum::serve(listener, app).await.unwrap() }),
+        };
+        let cache = Arc::new(AntigravityVersionCache::new());
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let leader_cache = cache.clone();
+        let leader_client = client.clone();
+        let task = tokio::spawn(async move { leader_cache.refresh(&leader_client, &url).await });
+        tokio::time::timeout(Duration::from_secs(2), reached.notified())
+            .await
+            .unwrap();
+        // A waiter must see an in-flight refresh even though last_attempt is
+        // recent. The synchronous getter remains available during the request.
+        assert!(cache.needs_refresh());
+        assert_eq!(cache.version(), ANTIGRAVITY_FALLBACK_VERSION);
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert!(!cache.needs_refresh());
+        assert!(cache.fetch_gate.try_lock().is_ok());
+        let retry = hub_manifest_server("version: 2.30.0\n", axum::http::StatusCode::OK).await;
+        cache.refresh(&client, &retry.url).await;
+        assert_eq!(retry.hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+        cache.state.write().unwrap().last_attempt =
+            Some(Instant::now() - ANTIGRAVITY_VERSION_RETRY_AFTER);
+        cache.refresh(&client, &retry.url).await;
+        assert_eq!(cache.version(), "2.30.0");
+        assert_eq!(retry.hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn hub_version_refresh_failure_and_old_manifest_use_fallback_and_cooldown() {
+        use std::sync::atomic::Ordering;
+        for (body, status) in [
+            ("version: 2.28.9\n", axum::http::StatusCode::OK),
+            ("version: 2.9.99\n", axum::http::StatusCode::OK),
+            ("version: nope\n", axum::http::StatusCode::OK),
+            ("unavailable", axum::http::StatusCode::SERVICE_UNAVAILABLE),
+        ] {
+            let server = hub_manifest_server(body, status).await;
+            let client = reqwest::Client::builder().no_proxy().build().unwrap();
+            let cache = AntigravityVersionCache::new();
+            // Simulate an expired successful fetch, then a failed refresh.
+            {
+                let mut state = cache.state.write().unwrap();
+                state.version = "2.30.0".to_string();
+                state.refreshed_at = Some(Instant::now() - ANTIGRAVITY_VERSION_TTL);
+            }
+            cache.refresh(&client, &server.url).await;
+            cache.refresh(&client, &server.url).await;
+            assert_eq!(cache.version(), ANTIGRAVITY_FALLBACK_VERSION, "{body}");
+            assert_eq!(server.hits.load(Ordering::SeqCst), 1);
+            assert!(!cache.needs_refresh());
+            assert!(hub_user_agent_for_version(&cache.version()).contains("cl=1013060670"));
+        }
     }
 
     #[test]
