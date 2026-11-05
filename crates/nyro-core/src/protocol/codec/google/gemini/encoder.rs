@@ -337,7 +337,8 @@ fn prepare_parameters(value: &Value, preview: bool) -> Result<Value> {
             lost: vec![format!("tools.parameters{}: {}", error.path, error.reason)],
         }
     })?;
-    Ok(sanitize_gemini_schema(&lowered))
+    let encoded = encode_empty_enum_strings(&lowered);
+    Ok(sanitize_gemini_schema(&encoded))
 }
 
 fn prepare_raw_tools(value: &Value, preview: bool) -> Result<Value> {
@@ -412,6 +413,100 @@ fn sanitize_schema_node(value: &Value, in_name_map: bool) -> Value {
         ),
         _ => value.clone(),
     }
+}
+
+/// Google's native Schema rejects empty strings inside `enum` outright
+/// (`INVALID_ARGUMENT ... enum[i]: cannot be empty`, observed on the
+/// subscription `v1internal` surface). Encode such members losslessly with
+/// `pattern: "^$"` instead: as a sibling `anyOf` branch next to the
+/// remaining non-empty values, or as the whole constraint when the empty
+/// string is the only value. Schemas that already carry `anyOf`, an
+/// empty-only `pattern`, or non-string enum members stay exactly as
+/// lowered rather than being guessed at. Traversal mirrors the cleanup's
+/// schema positions; literal payloads (`default`, `examples`, `required`
+/// names, `enum` members) are never rewritten.
+fn encode_empty_enum_strings(value: &Value) -> Value {
+    encode_empty_enum_node(value, false)
+}
+
+fn encode_empty_enum_node(value: &Value, in_name_map: bool) -> Value {
+    match value {
+        Value::Object(map) => {
+            let mut out = serde_json::Map::new();
+            for (key, child) in map {
+                if in_name_map {
+                    out.insert(key.clone(), encode_empty_enum_node(child, false));
+                    continue;
+                }
+                let child_is_name_map =
+                    SCHEMA_NAME_MAP_KEYS.contains(&key.as_str()) && child.is_object();
+                let schema_child = child_is_name_map || matches!(key.as_str(), "items" | "anyOf");
+                let rewritten = if schema_child {
+                    encode_empty_enum_node(child, child_is_name_map)
+                } else {
+                    child.clone()
+                };
+                out.insert(key.clone(), rewritten);
+            }
+            if in_name_map {
+                return Value::Object(out);
+            }
+            split_empty_enum_member(out)
+        }
+        Value::Array(arr) => Value::Array(
+            arr.iter()
+                .map(|v| encode_empty_enum_node(v, in_name_map))
+                .collect(),
+        ),
+        _ => value.clone(),
+    }
+}
+
+/// Replace this schema node's empty-string `enum` members with the
+/// pattern-based encoding. Returns the map unchanged when the rewrite
+/// would not be provably equivalent.
+fn split_empty_enum_member(mut map: serde_json::Map<String, Value>) -> Value {
+    let Some(Value::Array(members)) = map.get("enum") else {
+        return Value::Object(map);
+    };
+    if !members.iter().all(Value::is_string)
+        || !members.iter().any(|member| member.as_str() == Some(""))
+    {
+        return Value::Object(map);
+    }
+    let mut non_empty = Vec::new();
+    for member in members {
+        if member.as_str() != Some("") {
+            non_empty.push(member.clone());
+        }
+    }
+    if !non_empty.is_empty() {
+        // An existing anyOf is another disjunct of this schema, never a
+        // field that may be overwritten; keep such nodes exactly as lowered.
+        if map.contains_key("anyOf") {
+            return Value::Object(map);
+        }
+        map.remove("enum");
+        map.insert(
+            "anyOf".into(),
+            serde_json::json!([
+                {"type": "string", "enum": non_empty},
+                {"type": "string", "pattern": "^$"}
+            ]),
+        );
+        return Value::Object(map);
+    }
+    // RE2 cannot conjoin two patterns into one, so a schema that already
+    // constrains with `pattern` keeps its empty-only enum verbatim and the
+    // upstream judgement stays with the caller's own composition.
+    if map.contains_key("pattern") {
+        return Value::Object(map);
+    }
+    map.remove("enum");
+    map.entry("type".to_string())
+        .or_insert_with(|| Value::String("string".into()));
+    map.insert("pattern".into(), Value::String("^$".into()));
+    Value::Object(map)
 }
 
 // ── Content encoding ──────────────────────────────────────────────────────────
@@ -726,5 +821,184 @@ mod tests {
             "integer"
         );
         assert_eq!(out[1]["googleSearch"], serde_json::json!({}));
+    }
+
+    /// Production shape from request 109a83f1-51ae-446f-8399-fee2eb682a48:
+    /// after the v2.1.29 finite-enum merge Google rejected
+    /// `permission.enum[3]: cannot be empty` (400 INVALID_ARGUMENT on the
+    /// `v1internal` subscription surface). The empty member must travel as
+    /// a `pattern: "^$"` anyOf branch instead.
+    #[test]
+    fn empty_enum_member_becomes_a_pattern_any_of_branch() {
+        let lowered = serde_json::json!({
+            "type": "object",
+            "properties": {"permission": {
+                "type": "string",
+                "description": "New permission preset; an empty string clears it back to the session default.",
+                "default": "",
+                "enum": ["read-only", "workspace-write", "danger-full-access", ""]
+            }},
+            "required": ["permission"]
+        });
+        let out = encode_empty_enum_strings(&lowered);
+        let permission = &out["properties"]["permission"];
+        assert_eq!(
+            permission["description"],
+            lowered["properties"]["permission"]["description"]
+        );
+        assert_eq!(permission["default"], "");
+        assert_eq!(permission["type"], "string");
+        assert!(
+            permission.get("enum").is_none(),
+            "empty member must leave the enum: {permission}"
+        );
+        assert_eq!(
+            permission["anyOf"],
+            serde_json::json!([
+                {"type": "string", "enum": ["read-only", "workspace-write", "danger-full-access"]},
+                {"type": "string", "pattern": "^$"}
+            ])
+        );
+        assert_eq!(
+            out["required"],
+            serde_json::json!(["permission"]),
+            "siblings are untouched"
+        );
+        // The rewritten form carries no empty member, so re-running is a no-op.
+        assert_eq!(encode_empty_enum_strings(&out), out);
+    }
+
+    #[test]
+    fn empty_only_enum_becomes_a_pattern() {
+        let out = encode_empty_enum_strings(&serde_json::json!({
+            "type": "string",
+            "description": "Keeps the current setting.",
+            "enum": [""]
+        }));
+        assert_eq!(
+            out,
+            serde_json::json!({
+                "type": "string",
+                "description": "Keeps the current setting.",
+                "pattern": "^$"
+            })
+        );
+        // Type is supplied when the schema relied on enum-only typing.
+        assert_eq!(
+            encode_empty_enum_strings(&serde_json::json!({"enum": ["", ""]})),
+            serde_json::json!({"type": "string", "pattern": "^$"})
+        );
+        // An existing pattern cannot be conjoined with "^$" in RE2; the
+        // composition stays verbatim for the upstream to judge.
+        let conflicting = serde_json::json!({"type": "string", "pattern": "^a", "enum": [""]});
+        assert_eq!(encode_empty_enum_strings(&conflicting), conflicting.clone());
+    }
+
+    #[test]
+    fn unprovable_or_unrelated_enums_stay_verbatim() {
+        // All-non-empty enums are untouched at every rewritten position.
+        let clean = serde_json::json!({
+            "type": "object",
+            "properties": {"mode": {"type": "string", "enum": ["fast", "slow"]}},
+            "items_placeholder": {"type": "string"}
+        });
+        assert_eq!(encode_empty_enum_strings(&clean), clean);
+        // Non-string members are not this encoder's call.
+        let mixed = serde_json::json!({"type": "string", "enum": ["", 5]});
+        assert_eq!(encode_empty_enum_strings(&mixed), mixed.clone());
+        // An existing anyOf is a disjunct, never a field to overwrite.
+        let union = serde_json::json!({
+            "anyOf": [{"type": "string"}],
+            "enum": ["a", ""]
+        });
+        assert_eq!(encode_empty_enum_strings(&union), union.clone());
+    }
+
+    #[test]
+    fn empty_members_rewrite_inside_nested_schema_positions() {
+        let out = encode_empty_enum_strings(&serde_json::json!({
+            "type": "object",
+            "properties": {"tags": {
+                "type": "array",
+                "items": {"type": "string", "enum": ["urgent", ""]}
+            }},
+            "$defs": {"kept": {"type": "string", "enum": ["x", ""]}}
+        }));
+        let items = &out["properties"]["tags"]["items"];
+        assert_eq!(
+            items["anyOf"],
+            serde_json::json!([
+                {"type": "string", "enum": ["urgent"]},
+                {"type": "string", "pattern": "^$"}
+            ])
+        );
+        // Definition catalogs follow the same schema positions.
+        assert_eq!(
+            out["$defs"]["kept"]["anyOf"][1],
+            serde_json::json!({"type": "string", "pattern": "^$"})
+        );
+    }
+
+    #[test]
+    fn literal_payloads_are_never_rewritten() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {"note": {"type": "string"}},
+            "default": {"enum": [""]},
+            "examples": [{"enum": [""]}]
+        });
+        assert_eq!(encode_empty_enum_strings(&schema), schema.clone());
+    }
+
+    /// End-to-end native wire shape for the incident: the lowered
+    /// permission union must reach the cleanup with no empty enum member.
+    #[test]
+    fn permission_union_prepares_without_empty_enum_members() {
+        let original = serde_json::json!({
+            "type": "object",
+            "properties": {"permission": {
+                "description": "New permission preset; an empty string clears it back to the session default.",
+                "oneOf": [
+                    {"type": "string", "enum": ["read-only", "workspace-write", "danger-full-access"]},
+                    {"type": "string", "const": ""}
+                ]
+            }},
+            "required": ["permission"],
+            "additionalProperties": false
+        });
+        let prepared = prepare_parameters(&original, false).expect("native parameters");
+        let permission = &prepared["properties"]["permission"];
+        assert_eq!(
+            permission["anyOf"],
+            serde_json::json!([
+                {"type": "string", "enum": ["read-only", "workspace-write", "danger-full-access"]},
+                {"type": "string", "pattern": "^$"}
+            ]),
+            "prepared wire: {prepared}"
+        );
+        assert_eq!(
+            permission["description"],
+            original["properties"]["permission"]["description"]
+        );
+        assert!(permission.get("oneOf").is_none());
+        assert!(permission.get("const").is_none());
+        assert!(prepared.get("additionalProperties").is_none());
+        // No enum anywhere on the wire still carries an empty member.
+        fn assert_no_empty_enum(value: &Value) {
+            match value {
+                Value::Array(arr) => arr.iter().for_each(assert_no_empty_enum),
+                Value::Object(map) => {
+                    if let Some(Value::Array(members)) = map.get("enum") {
+                        assert!(
+                            !members.iter().any(|m| m.as_str() == Some("")),
+                            "empty enum member on the wire: {value}"
+                        );
+                    }
+                    map.values().for_each(assert_no_empty_enum);
+                }
+                _ => {}
+            }
+        }
+        assert_no_empty_enum(&prepared);
     }
 }
