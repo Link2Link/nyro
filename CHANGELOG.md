@@ -4,6 +4,23 @@ All notable changes to Nyro will be documented in this file.
 
 ---
 
+## v2.1.31
+
+> Released on 2026-11-05
+
+#### Features
+
+- **Model-aware quota buckets** (#19): a single Provider can now expose independent allowance buckets with their own five-hour/weekly windows, reset times, exact model bindings, freshness and scheduling state. The management UI keeps one real Provider with responsive bucket subcards, a revision-checked explicit resource-binding editor, per-bucket retained attempt/token/API-equivalent price summaries and server-side bucket/scope detail filters. Official model/resource associations are preserved; generic Google labels, matching percentages and partial model catalogs are not guessed into Flash/Argon sharing. Unresolved discovery requires a verified explicit binding rather than fabricated capacity.
+- **Bucket-specific admission and accounting** (#19): every balance strategy honors the applicable model bucket's simultaneous constraints; usage balance scores buckets independently while preserving one representative outer Provider weight. Final native and Raw-Wire Compat model identities and credential-owner generations are rechecked before transport. Attempts retain immutable scoped quota attribution even with payload recording disabled. A single metadata scan prices exact models within each bucket's own observed cycle, keeps currencies, missing usage, unpriced and unassigned history distinct, and never divides mixed-provider prices by another bucket's percentage. Retained totals still decrease when logs are cleared; the permanent daily usage ledger is unchanged.
+- **Separate external usage entries for DSH** (#19): `GET /api/v1/providers/usage` now defaults to one stable, read-only provider-shaped entry per resolved bucket, so Flash and Argon do not put duplicate five-hour/weekly rows into one external card. `?view=providers` preserves the structured real-Provider view used by Nyro Web; exact-provider and desktop management remain structured. `/v1/nyro/usage` publishes anonymous bucket entries with authorized concrete-route associations and route-specific scheduling. Parent totals, shared capacities, credentials and admin-only prices are not duplicated or leaked. Consumers requiring real configuration IDs must use the provider view; published usage IDs are not CRUD or routing IDs.
+
+#### Fixes
+
+- **Scoped recovery and owner isolation** (#19): preserve enforced exhaustion through stale/partial/catalog-only observations, process restarts and token refresh; separate explicitly global constraints from referenced shared budgets. Contradictory duplicate resources remain conflicts, and manual bindings cannot duplicate an aggregate/leaf allowance or omit proven windows. Late refreshes, old-owner dispatch and rejection feedback are generation-fenced; runtime-owner/project checks and startup scope validation prevent transferring quota state between subscribers. Unknown 429s use narrow model cooldowns without claiming an unverified Google error-to-resource mapping. Zero-weight alternatives no longer make blocked remote routes appear eligible.
+- **Compatibility and regression coverage** (#19): live owner/fence/discovered-resource settings are excluded from backups and ignored on restore, requiring rediscovery/rebinding rather than transferring quota identity. Added offline route, owner-switch, projection/redaction, configuration, retained-pricing/storage, backup and frontend fixtures. SQL schema is unchanged; PostgreSQL/MySQL quota contracts are opt-in tests requiring dedicated disposable databases. No automatic paid-overage activation, cross-model substitution or Google account-pool support is introduced.
+
+---
+
 ## v2.1.30
 
 > Released on 2026-11-05
