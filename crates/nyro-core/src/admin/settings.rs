@@ -12,9 +12,18 @@ impl AdminService {
 
     pub async fn set_setting(&self, key: &str, value: &str) -> anyhow::Result<()> {
         anyhow::ensure!(
-            !key.starts_with("provider_account_fence:"),
-            "Account login fences are internal settings"
+            !key.starts_with("provider_account_fence:")
+                && !key.starts_with("quota_bucket_owner.")
+                && !key.starts_with("quota_bucket_fence."),
+            "Account and quota identity fences are internal settings"
         );
+        if let Some(provider_id) = key.strip_prefix("quota_buckets.") {
+            let config: crate::quota_buckets::QuotaBucketConfig =
+                serde_json::from_str(value).context("Invalid quota bucket configuration")?;
+            self.set_provider_quota_buckets_config(provider_id, config)
+                .await?;
+            return Ok(());
+        }
         if let Some(provider_id) = key.strip_prefix(super::account_pool::POOL_SETTING_PREFIX) {
             let config: DevinPoolConfig =
                 serde_json::from_str(value).context("Invalid account pool configuration")?;
@@ -24,6 +33,31 @@ impl AdminService {
         }
         super::token_price::validate_setting(key, value)?;
         self.gw.storage.settings().set(key, value).await
+    }
+
+    /// Explicit owner/credential replacement invalidates the old entitlement,
+    /// unlike routine token refresh or a temporary quota-query failure.
+    pub(super) async fn clear_provider_quota_identity(
+        &self,
+        provider_id: &str,
+    ) -> anyhow::Result<()> {
+        // The same lock spans quota observation and persistent publication.
+        // A late old-owner refresh must finish before its fence is cleared.
+        let lock = self.gw.quota_registry.refresh_lock(provider_id);
+        let _guard = lock.lock().await;
+        let store = self.gw.storage.settings();
+        store
+            .set(&format!("quota_bucket_owner.{provider_id}"), "")
+            .await?;
+        store
+            .set(
+                &crate::quota_buckets::quota_bucket_fence_key(provider_id),
+                "[]",
+            )
+            .await?;
+        self.gw.quota_registry.invalidate(provider_id);
+        self.gw.usage_snapshots.invalidate(provider_id);
+        Ok(())
     }
 
     /// Increment the shared `config_epoch` counter so other replicas know they

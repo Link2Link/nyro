@@ -62,6 +62,13 @@ pub use token_price::{
     TokenPriceConfig, TokenPriceError, TokenPriceInput, TokenPriceRates, TokenPriceReference,
 };
 mod usage;
+mod usage_publication;
+pub use crate::quota_buckets::{
+    ManualQuotaBucketBinding, QuotaBucket, QuotaBucketBinding, QuotaBucketConfig,
+};
+pub use usage_publication::{
+    PublishedProviderUsageListItem, PublishedUsageEntry, published_usage_items,
+};
 mod volcengine_sign;
 
 pub use crate::db::models::OAuthAccountUpdate;

@@ -193,7 +193,14 @@ async fn provider_api_price_public_usage_retained_prices_cycles_projection_and_f
         (stats.all_time.request_count, stats.all_time.total_tokens),
         (7, 7_500_000)
     );
-    assert_eq!(stats.all_time.unpriced_request_count, 1);
+    // The model with no reference price and the entirely missing token sample
+    // are both unpriced. A known rate must not turn SQL NULL usage into a free
+    // observed-zero attempt (the monthly test below covers a real priced zero).
+    assert_eq!(stats.all_time.unpriced_request_count, 2);
+    let all_coverage = stats.all_time_coverage.as_ref().unwrap();
+    assert_eq!(all_coverage.missing_usage_request_count, 1);
+    assert_eq!(all_coverage.priced_request_count, 5);
+    assert_eq!(all_coverage.unpriced_request_count, 2);
     let period = stats.period.as_ref().unwrap();
     assert_eq!(
         (
@@ -201,15 +208,20 @@ async fn provider_api_price_public_usage_retained_prices_cycles_projection_and_f
             period.total_tokens,
             period.unpriced_request_count
         ),
-        (5, 4_500_000, 1)
+        (5, 4_500_000, 2)
     );
+    let period_coverage = stats.period_coverage.as_ref().unwrap();
+    assert_eq!(period_coverage.missing_usage_request_count, 1);
+    assert_eq!(period_coverage.priced_request_count, 3);
+    assert_eq!(period_coverage.unpriced_request_count, 2);
+    assert_eq!(stats.estimated_capacity_partial, Some(true));
     assert_eq!(
         period
             .equivalent_costs
             .iter()
             .map(|c| (c.currency.as_str(), c.total_cost, c.priced_request_count))
             .collect::<Vec<_>>(),
-        [("CNY", 13.0, 1), ("USD", 11.5, 3)]
+        [("CNY", 13.0, 1), ("USD", 11.5, 2)]
     );
     assert_eq!(
         stats
@@ -219,7 +231,7 @@ async fn provider_api_price_public_usage_retained_prices_cycles_projection_and_f
             .iter()
             .map(|c| (c.currency.as_str(), c.total_cost, c.priced_request_count))
             .collect::<Vec<_>>(),
-        [("CNY", 52.0, 1), ("USD", 46.0, 3)]
+        [("CNY", 52.0, 1), ("USD", 46.0, 2)]
     );
     assert_eq!(
         serde_json::to_value(storage.oauth_credentials().list_accounts(&id).await?)?,
@@ -266,11 +278,8 @@ async fn provider_api_price_public_usage_retained_prices_cycles_projection_and_f
         .forwarded_provider_usage(&nyro_core::admin::RouteAccess::privileged())
         .await?;
     assert!(
-        forwarded.providers[0]
-            .usage
-            .as_ref()
-            .unwrap()
-            .api_price
+        serde_json::to_value(forwarded.providers[0].usage.as_ref().unwrap())?
+            .get("api_price")
             .is_none()
     );
     // Corrupt retained-stat settings cannot fail quota observation/scheduling.

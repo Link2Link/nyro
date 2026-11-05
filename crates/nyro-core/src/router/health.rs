@@ -146,6 +146,39 @@ impl HealthRegistry {
             .min()
     }
 
+    /// Read-only recovery delay for this exact model's non-pooled circuits.
+    /// Keys are `provider:egress:model` or `provider:key/account:egress:model`.
+    /// Strip the complete model suffix rather than splitting on its last colon:
+    /// model IDs may themselves contain colons. Pooled circuits are deliberately
+    /// excluded: one unavailable credential cannot mark healthy siblings skipped
+    /// before the dispatcher has selected their credential and egress.
+    pub fn open_model_secs(&self, provider_id: &str, model: &str) -> Option<i64> {
+        let states = self.states.read().unwrap();
+        let prefix = format!("{provider_id}:");
+        let suffix = format!(":{model}");
+        states
+            .iter()
+            .filter_map(|(key, state)| {
+                let egress = key.strip_prefix(&prefix)?.strip_suffix(&suffix)?;
+                if egress.is_empty() || egress.contains(':') || state.state != CircuitState::Open {
+                    return None;
+                }
+                // Dispatcher always writes canonical protocol endpoint IDs.
+                // A shorter suffix of a colon-bearing model must not turn the
+                // preceding model segment (or a pool key) into a fake egress.
+                let endpoint =
+                    crate::protocol::registry::ProtocolRegistry::global().resolve_alias(egress)?;
+                if endpoint.to_string() != egress {
+                    return None;
+                }
+                let remaining = self
+                    .recovery_after
+                    .checked_sub(state.last_failure_at?.elapsed())?;
+                Some(remaining.as_secs() as i64)
+            })
+            .min()
+    }
+
     pub fn is_healthy(&self, target_key: &str) -> bool {
         let states = self.states.read().unwrap();
         match states.get(target_key) {
@@ -256,6 +289,51 @@ impl HealthRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn model_circuit_snapshot_matches_exact_colon_model_and_provider() {
+        let registry = Arc::new(HealthRegistry::with_config(1, Duration::from_secs(30)));
+        registry
+            .try_acquire("p:openai-compatible/chat-completions/v1:model:variant")
+            .unwrap()
+            .failure();
+        assert!(registry.open_model_secs("p", "model:variant").is_some());
+        assert!(registry.open_model_secs("p", "variant").is_none());
+        assert!(registry.open_model_secs("p", "model").is_none());
+        assert!(registry.open_model_secs("p", "sibling").is_none());
+        assert!(registry.open_model_secs("other", "model:variant").is_none());
+        // A read-only snapshot does not acquire a recovery probe or mutate state.
+        assert!(
+            registry
+                .try_acquire("p:openai-compatible/chat-completions/v1:model:variant")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn model_circuit_snapshot_excludes_individual_pool_credentials() {
+        let registry = Arc::new(HealthRegistry::with_config(1, Duration::from_secs(30)));
+        registry
+            .try_acquire("p:account@1:openai-compatible/chat-completions/v1:model")
+            .unwrap()
+            .failure();
+        registry
+            .try_acquire("p:key:openai-compatible/chat-completions/v1:model")
+            .unwrap()
+            .failure();
+        assert!(registry.open_model_secs("p", "model").is_none());
+        assert!(registry.open_provider_secs("p").is_some());
+    }
+
+    #[test]
+    fn model_circuit_snapshot_omits_elapsed_recovery() {
+        let registry = Arc::new(HealthRegistry::with_config(1, Duration::ZERO));
+        registry
+            .try_acquire("p:openai-compatible/chat-completions/v1:model")
+            .unwrap()
+            .failure();
+        assert!(registry.open_model_secs("p", "model").is_none());
+    }
 
     #[test]
     fn opens_after_consecutive_failures() {

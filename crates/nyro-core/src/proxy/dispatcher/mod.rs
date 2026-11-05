@@ -609,7 +609,15 @@ async fn dispatch_pipeline_inner(
 
     // ── Target iteration ──────────────────────────────────────────────────────
 
-    let targets = load_model_backends(&gw, &route).await;
+    let mut targets = load_model_backends(&gw, &route).await;
+    // Quota applicability belongs to the concrete requested backend model, not
+    // to a wildcard row. Materialize once before selection so every strategy,
+    // gate and decision snapshot evaluates the same target identity.
+    for target in &mut targets {
+        if target.model.is_empty() || target.model == "*" {
+            target.model.clone_from(&request_model);
+        }
+    }
     if targets.is_empty() {
         LogBuilder::from_dispatch(
             &gw,
@@ -733,7 +741,10 @@ async fn dispatch_pipeline_inner(
                 }
             }};
         }
-        if !gw.quota_registry.is_schedulable(&target.provider_id) {
+        if !gw
+            .quota_registry
+            .is_model_schedulable(&target.provider_id, &target.model)
+        {
             quota_skipped += 1;
             skip_key_siblings!();
             continue;
@@ -1012,6 +1023,10 @@ async fn dispatch_pipeline_inner(
             continue;
         };
 
+        // Bind this credential-resolution attempt to the quota-owner generation.
+        // A rebind while hooks/encoding await must not send an old owner's token
+        // against a replacement owner's allowances or feedback state.
+        let quota_owner_fence = gw.quota_registry.bucket_refresh_fence(&provider.id);
         let runtime_result = if let Some(account) = &pool_account {
             gw.admin()
                 .resolve_provider_account_runtime(&provider, &account.credential)
@@ -1827,6 +1842,88 @@ async fn dispatch_pipeline_inner(
             } else {
                 client
             };
+        // Admission uses the final encoded model, after vendor tier rewriting
+        // and conversion. An IR/client hint must not authorize a different
+        // bucket than the bytes that will actually be dispatched.
+        let runtime_quota_scope =
+            if crate::provider::google::antigravity::is_google_antigravity(&provider)
+                || crate::provider::google::gemini_cli::is_google_gemini_cli(&provider)
+            {
+                if let Some(credential) = provider_runtime.credential.as_ref() {
+                    let fallback = gw
+                        .storage
+                        .settings()
+                        .get(&format!("quota_bucket_owner.{}", provider.id))
+                        .await
+                        .ok()
+                        .flatten();
+                    crate::quota_buckets::google_quota_owner_id(credential, fallback.as_deref())
+                        .zip(
+                            crate::provider::google::antigravity::code_assist_project_id(Some(
+                                credential,
+                            ))
+                            .ok(),
+                        )
+                        .map(|(owner, project)| {
+                            crate::quota_buckets::google_quota_scope_id(
+                                &provider.id,
+                                if crate::provider::google::gemini_cli::is_google_gemini_cli(
+                                    &provider,
+                                ) {
+                                    "google_code_assist"
+                                } else {
+                                    "google_antigravity"
+                                },
+                                &owner,
+                                &project,
+                            )
+                        })
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+        let runtime_scope_matches = || {
+            let known = gw.quota_registry.bucket_snapshot(&provider.id);
+            match runtime_quota_scope.as_ref() {
+                Some(scope) => known.iter().all(|bucket| &bucket.scope_id == scope),
+                None if crate::provider::google::antigravity::is_google_antigravity(&provider)
+                    || crate::provider::google::gemini_cli::is_google_gemini_cli(&provider) => known.is_empty(),
+                None => true,
+            }
+        };
+        let compat_quota_body = prepared_compat
+            .as_ref()
+            .and_then(|prepared| serde_json::from_slice::<Value>(&prepared.body).ok());
+        let quota_wire_model = prepared_native_body
+            .as_ref()
+            .or(compat_quota_body.as_ref())
+            .and_then(|body| {
+                body.get("model")
+                    .or_else(|| body.pointer("/request/model"))
+                    .and_then(Value::as_str)
+            })
+            .filter(|model| !model.is_empty())
+            .unwrap_or(&transport_model)
+            .to_owned();
+        if !runtime_scope_matches()
+            || !gw
+                .quota_registry
+                .bucket_fence_is_current(&provider.id, &quota_owner_fence)
+            || !gw
+                .quota_registry
+                .is_model_schedulable(&provider.id, &quota_wire_model)
+        {
+            quota_skipped += 1;
+            health_permit.neutral();
+            ctx.trace(
+                "quota",
+                "final upstream model is blocked by its applicable quota scope",
+            );
+            skip_key_siblings!();
+            continue;
+        }
         let compat_replay_candidate = prepared_compat.as_ref().is_some_and(|prepared| {
             compat::can_retry_stream_start(&provider, prepared, raw_body.as_deref())
         });
@@ -1856,6 +1953,25 @@ async fn dispatch_pipeline_inner(
         let mut same_target_retried = false;
         let mut saw_zero_payload_malformed = false;
         let (response, status, retry, health_outcome, defer_native_stream_health) = loop {
+            if !runtime_scope_matches()
+                || !gw
+                    .quota_registry
+                    .bucket_fence_is_current(&provider.id, &quota_owner_fence)
+                || !gw
+                    .quota_registry
+                    .is_model_schedulable(&provider.id, &quota_wire_model)
+            {
+                break (
+                    error_response(
+                        503,
+                        "upstream model quota became unavailable before dispatch",
+                    ),
+                    503,
+                    crate::conversion::RetryDisposition::Never,
+                    HealthOutcome::Neutral,
+                    false,
+                );
+            }
             if ctx
                 .extensions
                 .get::<UpstreamAttemptCount>()
@@ -1922,6 +2038,23 @@ async fn dispatch_pipeline_inner(
                             "distinct_account_attempts": account_attempts.get(&provider.id).map_or(0, |set| set.len()),
                             "affinity": account.affinity.is_some(),
                         });
+                    }
+                    if let Some(bucket) = gw
+                        .quota_registry
+                        .model_snapshot(&provider.id, &quota_wire_model)
+                    {
+                        decision["quota_attribution"] =
+                            serde_json::to_value(crate::quota_buckets::QuotaAttribution {
+                                version: 1,
+                                bucket_id: bucket.id,
+                                scope_id: bucket.scope_id,
+                                backend_model: actual_model.clone(),
+                                wire_model: quota_wire_model.clone(),
+                                source: bucket.binding.source,
+                                revision: bucket.binding.revision,
+                                dispatched_at: chrono::Utc::now().timestamp_millis(),
+                            })
+                            .expect("quota attribution has serializable scalar fields");
                     }
                     decision.to_string()
                 }),
@@ -2054,6 +2187,21 @@ async fn dispatch_pipeline_inner(
             // windows; re-reading usage would only add load to a 429-prone
             // usage endpoint.
             if status == 429 && response.extensions().get::<EntitlementRefusal>().is_none() {
+                let retry_after = response
+                    .headers()
+                    .get(reqwest::header::RETRY_AFTER)
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(|value| value.parse::<u64>().ok());
+                // An opaque 429 is a narrow model/owner throttle, not proof of
+                // exhausted allowance for all models on this provider.
+                if !gw.quota_registry.bucket_snapshot(&provider.id).is_empty() {
+                    gw.quota_registry.record_model_rejection_fenced(
+                        &provider.id,
+                        &quota_wire_model,
+                        retry_after,
+                        &quota_owner_fence,
+                    );
+                }
                 crate::admin::trigger_provider_usage_refresh(
                     gw.clone(),
                     target.provider_id.clone(),
@@ -2409,7 +2557,17 @@ impl LogBuilder {
             client_protocol: call_ctx.ingress_str.to_string(),
             upstream_protocol: call_ctx.egress_str.to_string(),
             client_model: call_ctx.request_model.to_string(),
-            upstream_model: call_ctx.actual_model.to_string(),
+            upstream_model: call_ctx
+                .route_decision
+                .as_deref()
+                .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+                .and_then(|decision| {
+                    decision
+                        .pointer("/quota_attribution/wire_model")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                })
+                .unwrap_or_else(|| call_ctx.actual_model.to_string()),
             backend_model: Some(call_ctx.backend_model.to_string()),
             api_key_id: call_ctx.api_key_id.map(ToString::to_string),
             api_key_name: call_ctx.api_key_name.map(ToString::to_string),

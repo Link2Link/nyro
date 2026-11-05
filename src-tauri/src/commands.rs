@@ -166,6 +166,29 @@ pub async fn list_provider_usage(
 }
 
 #[tauri::command]
+pub async fn get_provider_quota_buckets_config(
+    gw: State<'_, Gateway>,
+    id: String,
+) -> Result<nyro_core::quota_buckets::QuotaBucketConfig, String> {
+    gw.admin()
+        .get_provider_quota_buckets_config(&id)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn set_provider_quota_buckets_config(
+    gw: State<'_, Gateway>,
+    id: String,
+    config: nyro_core::quota_buckets::QuotaBucketConfig,
+) -> Result<nyro_core::quota_buckets::QuotaBucketConfig, String> {
+    gw.admin()
+        .set_provider_quota_buckets_config(&id, config)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
 pub async fn test_provider_models(
     gw: State<'_, Gateway>,
     id: String,
@@ -767,15 +790,19 @@ pub async fn get_provider_usage_detail(
     hours: Option<i32>,
     start_at: Option<i64>,
     end_at: Option<i64>,
+    quota_bucket: Option<String>,
+    quota_scope: Option<String>,
 ) -> Result<ProviderUsageDetail, String> {
     gw.admin()
-        .get_provider_usage_detail(
+        .get_provider_usage_detail_filtered(
             &id,
             nyro_core::admin::StatsRange {
                 hours,
                 start_at,
                 end_at,
             },
+            quota_bucket.as_deref(),
+            quota_scope.as_deref(),
         )
         .await
         .map_err(|e| e.to_string())

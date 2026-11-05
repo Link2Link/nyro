@@ -43,12 +43,13 @@ use std::str::FromStr;
 
 use rand::Rng;
 
-use super::decision::{DecisionCandidate, RouteDecision, SkipReason};
+use super::decision::{DecisionCandidate, QuotaDecision, RouteDecision, SkipReason};
 use super::health::HealthRegistry;
 use super::latency::LatencyRegistry;
-use super::quota::ProviderQuotaRegistry;
-use super::usage::{dynamic_weight, score_provider, window_boost};
+use super::quota::{ProviderQuotaRegistry, ProviderSchedulingStatus, QuotaTierObservation};
+use super::usage::{ProviderUsageScore, dynamic_weight, score_provider, window_boost};
 use crate::db::models::{ModelBackend, ModelBalance};
+use crate::quota_buckets::QuotaBucket;
 
 // ── SelectedTarget ────────────────────────────────────────────────────────────
 
@@ -98,6 +99,7 @@ impl RoutingStrategy for WeightedStrategy {
                 weight: None,
                 share: None,
                 score: Some(serde_json::json!({ "static_weight": target.weight })),
+                quota: None,
                 skipped: Some(SkipReason::weight_zero()),
             });
         }
@@ -118,6 +120,7 @@ impl RoutingStrategy for WeightedStrategy {
                     None
                 },
                 score: Some(serde_json::json!({ "static_weight": target.weight })),
+                quota: None,
                 skipped: None,
             });
         }
@@ -157,6 +160,7 @@ impl RoutingStrategy for PriorityStrategy {
                         "group": group_priority,
                         "in_group_rank": in_group + 1,
                     })),
+                    quota: None,
                     skipped: None,
                 });
                 ordered.push(to_selected(target));
@@ -219,6 +223,7 @@ impl RoutingStrategy for LatencyStrategy {
                 weight: None,
                 share: None,
                 score: Some(score),
+                quota: None,
                 skipped: None,
             });
         }
@@ -228,26 +233,58 @@ impl RoutingStrategy for LatencyStrategy {
 
 // ── Usage ─────────────────────────────────────────────────────────────────────
 
-/// Orders provider groups by upstream quota headroom. Every scored provider
-/// competes in a single pool whose weight is the cube of the required
-/// acceleration on its largest main window (monthly, else weekly, else
-/// five-hour) — rate = remaining quota % / remaining time % of that window —
-/// scaled by [`window_boost`]: shorter windows waste unspent quota far more
-/// often per year and recover from early exhaustion sooner, so they safely
-/// absorb a larger share of the traffic.
-/// Providers without a canonical window form an equal-weight fallback pool;
-/// providers whose exhausted included window is covered by a prepaid reserve
-/// (Devin's extra-usage balance) come after both pools — traffic there costs
-/// real money, so they are a last resort regardless of the remaining windows;
-/// quota-blocked rows stay last so the dispatcher keeps its exhausted 503.
+/// Orders only this route's targets by their applicable quota allowances.
+/// Included quota precedes unknown fallback, then prepaid reserve, then blocked
+/// rows. Within each pool, a provider gets ONE outer mass: the maximum eligible
+/// bucket weight, never the sum. Independent bucket groups are then shuffled by
+/// their own pacing weights; aliases sharing a bucket use static row weights.
+/// This preserves the legacy provider lottery without allowing duplicate rows,
+/// unrelated unknown mappings, or blocked sibling buckets to inflate its mass.
+/// Blocked rows stay in the retry list so the dispatcher keeps its precise 503.
 pub struct UsageStrategy;
 
-struct ProviderTargetGroup<'a> {
-    provider_id: &'a str,
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum UsagePool {
+    Included,
+    Unknown,
+    Reserve,
+    Blocked,
+}
+
+/// A signature is identity, not utilization: equal percentages never merge
+/// unrelated allowances. Unknown scoped models stay distinct controlled probes;
+/// legacy provider-only observations retain their single shared group.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum QuotaChoice {
+    Bucket {
+        scope: String,
+        bucket: String,
+        constraints: Vec<String>,
+    },
+    UnknownModel(String),
+    Legacy,
+}
+
+struct QuotaTargetGroup<'a> {
+    choice: QuotaChoice,
     targets: Vec<&'a ModelBackend>,
-    score: Option<super::usage::ProviderUsageScore>,
-    schedulable: bool,
-    on_reserve: bool,
+    score: Option<ProviderUsageScore>,
+    pool: UsagePool,
+    weight: f64,
+}
+
+struct ProviderTargetGroup<'a> {
+    groups: Vec<QuotaTargetGroup<'a>>,
+}
+
+impl ProviderTargetGroup<'_> {
+    fn mass(&self, pool: UsagePool) -> Option<f64> {
+        self.groups
+            .iter()
+            .filter(|group| group.pool == pool)
+            .map(|group| group.weight)
+            .reduce(f64::max)
+    }
 }
 
 impl RoutingStrategy for UsageStrategy {
@@ -258,7 +295,6 @@ impl RoutingStrategy for UsageStrategy {
         quota: &ProviderQuotaRegistry,
         decision: &mut RouteDecision,
     ) -> Vec<SelectedTarget> {
-        // Match weighted balance semantics: zero-weight rows do not participate.
         for target in targets.iter().filter(|target| target.weight <= 0) {
             decision.candidates.push(DecisionCandidate {
                 provider: target.provider_id.clone(),
@@ -268,147 +304,217 @@ impl RoutingStrategy for UsageStrategy {
                 weight: None,
                 share: None,
                 score: None,
+                quota: None,
                 skipped: Some(SkipReason::weight_zero()),
             });
         }
 
-        let mut indexes: HashMap<&str, usize> = HashMap::new();
-        let mut groups: Vec<ProviderTargetGroup<'_>> = Vec::new();
-        for target in targets.iter().filter(|target| target.weight > 0) {
-            if let Some(index) = indexes.get(target.provider_id.as_str()).copied() {
-                groups[index].targets.push(target);
-                continue;
-            }
-            let index = groups.len();
-            indexes.insert(target.provider_id.as_str(), index);
-            groups.push(ProviderTargetGroup {
-                provider_id: target.provider_id.as_str(),
-                targets: vec![target],
-                score: None,
-                schedulable: false,
-                on_reserve: false,
-            });
-        }
-
         let now = chrono::Utc::now();
-        for group in &mut groups {
-            group.schedulable = quota.is_schedulable(group.provider_id);
-            group.on_reserve = quota.is_on_reserve(group.provider_id);
-            group.score = score_provider(&quota.tier_snapshot(group.provider_id), now);
+        let mut indexes: HashMap<&str, usize> = HashMap::new();
+        let mut providers: Vec<ProviderTargetGroup<'_>> = Vec::new();
+        for target in targets.iter().filter(|target| target.weight > 0) {
+            let index = *indexes
+                .entry(target.provider_id.as_str())
+                .or_insert_with(|| {
+                    providers.push(ProviderTargetGroup { groups: Vec::new() });
+                    providers.len() - 1
+                });
+            let buckets = quota.bucket_snapshot(&target.provider_id);
+            let bucket = quota.model_snapshot(&target.provider_id, &target.model);
+            let choice = match &bucket {
+                Some(bucket) => {
+                    let mut constraints = bucket.constraint_ids.clone();
+                    constraints.sort();
+                    constraints.dedup();
+                    QuotaChoice::Bucket {
+                        scope: bucket.scope_id.clone(),
+                        bucket: bucket.id.clone(),
+                        constraints,
+                    }
+                }
+                None if !buckets.is_empty() => QuotaChoice::UnknownModel(target.model.clone()),
+                None => QuotaChoice::Legacy,
+            };
+            let score = match &bucket {
+                Some(bucket) => score_bucket_choice(bucket, &buckets, now),
+                None if !buckets.is_empty() => None,
+                None => score_provider(&quota.model_tiers(&target.provider_id, &target.model), now),
+            };
+            let pool = if !quota.is_model_schedulable(&target.provider_id, &target.model) {
+                UsagePool::Blocked
+            } else if buckets.is_empty() && quota.is_on_reserve(&target.provider_id) {
+                UsagePool::Reserve
+            } else if score.is_some_and(|score| score.rate.is_finite() && score.rate > 0.0) {
+                UsagePool::Included
+            } else {
+                UsagePool::Unknown
+            };
+            let weight = match pool {
+                UsagePool::Included => score.map(usage_weight).unwrap_or(0.0),
+                UsagePool::Unknown | UsagePool::Reserve => 1.0,
+                UsagePool::Blocked => 0.0,
+            };
+            let groups = &mut providers[index].groups;
+            // Pool is part of grouping: an exact-model cooldown must not gate
+            // a healthy alias even when both consume the same allowance.
+            if let Some(group) = groups
+                .iter_mut()
+                .find(|group| group.choice == choice && group.pool == pool)
+            {
+                group.targets.push(target);
+            } else {
+                groups.push(QuotaTargetGroup {
+                    choice,
+                    targets: vec![target],
+                    score,
+                    pool,
+                    weight,
+                });
+            }
         }
 
-        let mut scored: Vec<(&ProviderTargetGroup<'_>, f64)> = Vec::new();
-        // Unknown and zero-rate providers get one equal provider-level fallback
-        // mass; static target weights only choose within that provider. Duplicate
-        // rows therefore never amplify a provider's cross-provider probability.
-        let mut fallback: Vec<(&ProviderTargetGroup<'_>, f64)> = Vec::new();
-        // Exhausted included windows covered by a prepaid reserve: ranked after
-        // every pool that still has included quota or unknown (possibly free)
-        // capacity, whatever the other windows still hold.
-        let mut reserve: Vec<(&ProviderTargetGroup<'_>, f64)> = Vec::new();
-        let mut inactive: Vec<(
-            &ProviderTargetGroup<'_>,
-            Option<super::usage::ProviderUsageScore>,
-        )> = Vec::new();
-
-        for group in &groups {
-            if !group.schedulable {
-                inactive.push((group, group.score));
+        let mut ordered = Vec::new();
+        let mut rank = 0;
+        // Separate global passes prevent a provider's unknown/reserve siblings
+        // jumping ahead of another provider's still-included quota.
+        for pool in [
+            UsagePool::Included,
+            UsagePool::Unknown,
+            UsagePool::Reserve,
+            UsagePool::Blocked,
+        ] {
+            if pool == UsagePool::Blocked {
+                // No lottery mass at all for blocked groups. Retain them only
+                // for dispatcher's precise exhaustion response and diagnostics.
+                for provider in &providers {
+                    for group in provider.groups.iter().filter(|group| group.pool == pool) {
+                        for target in weighted_shuffle(&group.targets) {
+                            rank += 1;
+                            let scheduling =
+                                quota.model_scheduling(&target.provider_id, &target.model);
+                            let mut candidate = usage_candidate(
+                                target,
+                                group.score,
+                                None,
+                                None,
+                                Some(rank),
+                                Some(SkipReason::quota(
+                                    &scheduling.blocking_tiers,
+                                    scheduling.reason.as_deref(),
+                                )),
+                            );
+                            candidate.score.get_or_insert_with(|| serde_json::json!({}))["state"] =
+                                serde_json::json!("blocked");
+                            decision.candidates.push(candidate);
+                            ordered.push(to_selected(target));
+                        }
+                    }
+                }
                 continue;
             }
-            if group.on_reserve {
-                reserve.push((group, 1.0));
-                continue;
-            }
-            match group.score {
-                Some(score) if score.rate.is_finite() && score.rate > 0.0 => scored.push((
-                    group,
-                    dynamic_weight(score.rate) * window_boost(score.window),
-                )),
-                Some(_) | None => fallback.push((group, 1.0)),
-            }
-        }
-
-        let scored_total: f64 = scored.iter().map(|(_, w)| *w).sum();
-        let fallback_total: f64 = fallback.iter().map(|(_, w)| *w).sum();
-        let reserve_total: f64 = reserve.iter().map(|(_, w)| *w).sum();
-
-        let mut ordered: Vec<&ModelBackend> = Vec::new();
-        let mut rank = 0_usize;
-        // Scored pool first, shuffled by rate³.
-        for (group, weight) in weighted_shuffle_pairs_by(&scored) {
-            if let Some(score) = group.score {
-                for target in weighted_shuffle(&group.targets) {
-                    rank += 1;
-                    decision.candidates.push(usage_candidate(
-                        target,
-                        Some(score),
-                        Some(weight),
-                        share_of(weight, scored_total),
-                        Some(rank),
-                        None,
-                    ));
-                    ordered.push(target);
+            let provider_weights = providers
+                .iter()
+                .filter_map(|provider| provider.mass(pool).map(|mass| (provider, mass)))
+                .collect::<Vec<_>>();
+            let provider_total: f64 = provider_weights.iter().map(|(_, weight)| weight).sum();
+            for (provider, outer_weight) in weighted_shuffle_pairs_by(&provider_weights) {
+                let group_weights = provider
+                    .groups
+                    .iter()
+                    .filter(|group| group.pool == pool)
+                    .map(|group| (group, group.weight))
+                    .collect::<Vec<_>>();
+                let group_total: f64 = group_weights.iter().map(|(_, weight)| weight).sum();
+                for (group, group_weight) in weighted_shuffle_pairs_by(&group_weights) {
+                    let static_total: f64 = group
+                        .targets
+                        .iter()
+                        .map(|target| target.weight as f64)
+                        .sum();
+                    for target in weighted_shuffle(&group.targets) {
+                        rank += 1;
+                        let mut candidate = usage_candidate(
+                            target,
+                            group.score,
+                            Some(outer_weight),
+                            share_of(outer_weight, provider_total),
+                            Some(rank),
+                            None,
+                        );
+                        let score = candidate.score.get_or_insert_with(|| serde_json::json!({}));
+                        score["state"] = serde_json::json!(match pool {
+                            UsagePool::Included => "included",
+                            UsagePool::Unknown => "unknown_quota",
+                            UsagePool::Reserve => "reserve",
+                            UsagePool::Blocked => "blocked",
+                        });
+                        score["bucket_weight"] = serde_json::json!(group_weight);
+                        score["bucket_share"] =
+                            serde_json::json!(share_of(group_weight, group_total));
+                        score["static_weight"] = serde_json::json!(target.weight);
+                        score["target_share"] =
+                            serde_json::json!(share_of(target.weight as f64, static_total));
+                        decision.candidates.push(candidate);
+                        ordered.push(to_selected(target));
+                    }
                 }
             }
         }
-        // Equal-weight fallback pool (no usable quota window).
-        for (group, weight) in weighted_shuffle_pairs_by(&fallback) {
-            for target in weighted_shuffle(&group.targets) {
-                rank += 1;
-                decision.candidates.push(DecisionCandidate {
-                    provider: target.provider_id.clone(),
-                    provider_name: None,
-                    target: target.model.clone(),
-                    rank: Some(rank),
-                    weight: Some(weight),
-                    share: share_of(weight, fallback_total),
-                    score: Some(serde_json::json!({ "state": "unknown_quota" })),
-                    skipped: None,
-                });
-                ordered.push(target);
-            }
-        }
-        // Prepaid-reserve pool: still schedulable, but only after everything
-        // that has included quota or unknown capacity.
-        for (group, weight) in weighted_shuffle_pairs_by(&reserve) {
-            for target in weighted_shuffle(&group.targets) {
-                rank += 1;
-                decision.candidates.push(DecisionCandidate {
-                    provider: target.provider_id.clone(),
-                    provider_name: None,
-                    target: target.model.clone(),
-                    rank: Some(rank),
-                    weight: Some(weight),
-                    share: share_of(weight, reserve_total),
-                    score: Some(serde_json::json!({ "state": "reserve" })),
-                    skipped: None,
-                });
-                ordered.push(target);
-            }
-        }
-        // Keep quota-blocked rows in the retry list so the dispatcher preserves
-        // its precise "all providers exhausted" 503 outcome.
-        for (group, score) in inactive {
-            let scheduling = quota.snapshot(group.provider_id);
-            let skipped =
-                SkipReason::quota(&scheduling.blocking_tiers, scheduling.reason.as_deref());
-            for target in weighted_shuffle(&group.targets) {
-                rank += 1;
-                decision.candidates.push(usage_candidate(
-                    target,
-                    score,
-                    None,
-                    None,
-                    Some(rank),
-                    Some(skipped.clone()),
-                ));
-                ordered.push(target);
-            }
-        }
-
-        ordered.into_iter().map(to_selected).collect()
+        ordered
     }
+}
+
+fn usage_weight(score: ProviderUsageScore) -> f64 {
+    dynamic_weight(score.rate) * window_boost(score.window)
+}
+
+/// Each required allowance scores its own largest main window. Shared groups
+/// cap effective pacing instead of being treated as alternative capacity, even
+/// when their governing window differs from the primary bucket's window.
+fn score_bucket_choice(
+    bucket: &QuotaBucket,
+    buckets: &[QuotaBucket],
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<ProviderUsageScore> {
+    let mut effective = score_bucket(bucket, now)?;
+    for id in &bucket.constraint_ids {
+        let constraint = buckets
+            .iter()
+            .find(|constraint| constraint.id == *id && constraint.scope_id == bucket.scope_id)?;
+        // Copied raw window references belong to the primary allowance;
+        // scoring them again would replace its largest-window policy with an
+        // unintended minimum across windows. Only an additional shared budget
+        // is an independent required allowance that caps effective pacing.
+        if constraint.binding.status != "shared_constraint" {
+            continue;
+        }
+        let score = score_bucket(constraint, now)?;
+        if usage_weight(score) < usage_weight(effective) {
+            effective = score;
+        }
+    }
+    Some(effective)
+}
+
+fn score_bucket(
+    bucket: &QuotaBucket,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<ProviderUsageScore> {
+    // Catalog observations do not establish canonical window duration, even
+    // when an upstream display label happens to resemble a canonical name.
+    if bucket.source == "catalog" {
+        return None;
+    }
+    let tiers = bucket
+        .tiers
+        .iter()
+        .map(|tier| QuotaTierObservation {
+            name: tier.name.clone(),
+            used_percent: tier.used_percent,
+            resets_at: tier.resets_at.clone(),
+        })
+        .collect::<Vec<_>>();
+    score_provider(&tiers, now)
 }
 
 fn usage_candidate(
@@ -439,6 +545,7 @@ fn usage_candidate(
         weight,
         share,
         score: score_json,
+        quota: None,
         skipped,
     }
 }
@@ -523,29 +630,106 @@ impl TargetSelector {
                 weight: None,
                 share: None,
                 score: Some(serde_json::json!({ "state": "fallback" })),
+                quota: None,
                 skipped: None,
             });
             ordered.push(to_selected(target));
         }
         for candidate in &mut decision.candidates {
-            if candidate.skipped.is_some() || candidate.rank.is_none() {
-                continue;
+            let evidence = quota_decision(quota, &candidate.provider, &candidate.target);
+            if candidate.skipped.is_none() && candidate.rank.is_some() {
+                if evidence.scheduling.status == ProviderSchedulingStatus::QuotaExhausted {
+                    candidate.skipped = Some(SkipReason::quota(
+                        &evidence.scheduling.blocking_tiers,
+                        evidence.scheduling.reason.as_deref(),
+                    ));
+                } else if let Some(secs) =
+                    health.open_model_secs(&candidate.provider, &candidate.target)
+                {
+                    candidate.skipped = Some(SkipReason::circuit(secs));
+                }
             }
-            if !quota.is_schedulable(&candidate.provider) {
-                let scheduling = quota.snapshot(&candidate.provider);
-                candidate.skipped = Some(SkipReason::quota(
-                    &scheduling.blocking_tiers,
-                    scheduling.reason.as_deref(),
-                ));
-            } else if let Some(secs) = health.open_provider_secs(&candidate.provider) {
-                candidate.skipped = Some(SkipReason::circuit(secs));
-            }
+            candidate.quota = Some(evidence);
         }
         (ordered, decision)
     }
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+fn quota_decision(quota: &ProviderQuotaRegistry, provider: &str, model: &str) -> QuotaDecision {
+    let buckets = quota.bucket_snapshot(provider);
+    let bucket = quota.model_snapshot(provider, model);
+    let scheduling = quota.model_scheduling(provider, model);
+    let blocked = scheduling.status == ProviderSchedulingStatus::QuotaExhausted;
+    let mut blocking_constraint_ids = Vec::new();
+    // Include conflicting bindings too: a known blocked conflict must not be
+    // presented as a harmless unknown or as a provider-wide sibling block.
+    for primary in buckets
+        .iter()
+        .filter(|bucket| bucket.is_primary() && bucket.models.iter().any(|id| id == model))
+    {
+        if primary.tiers.iter().any(|tier| tier.used_percent >= 100.0) {
+            blocking_constraint_ids.push(primary.id.clone());
+        }
+        for constraint in buckets.iter().filter(|constraint| {
+            constraint.scope_id == primary.scope_id
+                && primary.constraint_ids.contains(&constraint.id)
+        }) {
+            if constraint.scheduling.status == ProviderSchedulingStatus::QuotaExhausted {
+                blocking_constraint_ids.push(constraint.id.clone());
+            }
+        }
+    }
+    blocking_constraint_ids.sort();
+    blocking_constraint_ids.dedup();
+    let blocker_scope = blocked.then(|| {
+        match scheduling.reason.as_deref() {
+            Some("account_unavailable") => "provider",
+            Some("model_cooldown") => "model",
+            Some("shared_constraint") => "shared_constraint",
+            _ if bucket.is_some() => "bucket",
+            _ if buckets.is_empty() => "provider",
+            _ => "model",
+        }
+        .to_string()
+    });
+    let mut constraint_ids = bucket
+        .as_ref()
+        .map(|bucket| bucket.constraint_ids.clone())
+        .unwrap_or_default();
+    constraint_ids.sort();
+    constraint_ids.dedup();
+    QuotaDecision {
+        bucket_id: bucket.as_ref().map(|bucket| bucket.id.clone()),
+        scope_id: bucket.as_ref().map(|bucket| bucket.scope_id.clone()),
+        constraint_ids,
+        binding_status: bucket
+            .as_ref()
+            .map(|bucket| bucket.binding.status.clone())
+            .unwrap_or_else(|| {
+                if buckets.is_empty() {
+                    "legacy"
+                } else if buckets
+                    .iter()
+                    .any(|bucket| bucket.is_primary() && bucket.models.iter().any(|id| id == model))
+                {
+                    "conflict"
+                } else {
+                    "unresolved"
+                }
+                .to_string()
+            }),
+        binding_source: bucket.as_ref().map(|bucket| bucket.binding.source.clone()),
+        revision: bucket.as_ref().map(|bucket| bucket.binding.revision),
+        source: bucket.as_ref().map(|bucket| bucket.source.clone()),
+        queried_at: bucket.as_ref().map(|bucket| bucket.queried_at.clone()),
+        stale: bucket.as_ref().map(|bucket| bucket.stale),
+        scheduling,
+        blocker_scope,
+        blocking_constraint_ids,
+    }
+}
 
 #[inline]
 fn to_selected(t: &ModelBackend) -> SelectedTarget {
@@ -604,7 +788,9 @@ fn weighted_shuffle_by_rng<T: Copy, R: Rng + ?Sized>(items: &[(T, f64)], rng: &m
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::router::quota::QuotaTierObservation;
+    use crate::admin::ProviderUsageTier;
+    use crate::quota_buckets::QuotaBucketBinding;
+    use crate::router::quota::ProviderScheduling;
     use rand::SeedableRng;
     use std::time::Duration;
 
@@ -630,6 +816,39 @@ mod tests {
 
     fn ordered_models(ordered: &[SelectedTarget]) -> Vec<String> {
         ordered.iter().map(|t| t.model.clone()).collect()
+    }
+
+    fn bucket(id: &str, models: &[&str], window: &str, used: f64) -> QuotaBucket {
+        QuotaBucket {
+            id: id.to_string(),
+            scope_id: "owner-scope".to_string(),
+            label: id.to_string(),
+            models: models.iter().map(|model| (*model).to_string()).collect(),
+            binding: QuotaBucketBinding {
+                status: "resolved".to_string(),
+                source: "configured".to_string(),
+                revision: 7,
+            },
+            tiers: vec![ProviderUsageTier {
+                name: window.to_string(),
+                used_percent: used,
+                resets_at: None,
+            }],
+            constraint_ids: Vec::new(),
+            source: "enforced_summary".to_string(),
+            queried_at: chrono::Utc::now().to_rfc3339(),
+            stale: false,
+            scheduling: ProviderScheduling::default(),
+            api_price: None,
+        }
+    }
+
+    fn candidate<'a>(decision: &'a RouteDecision, model: &str) -> &'a DecisionCandidate {
+        decision
+            .candidates
+            .iter()
+            .find(|candidate| candidate.target == model)
+            .unwrap()
     }
 
     #[test]
@@ -1563,15 +1782,339 @@ mod tests {
     }
 
     #[test]
+    fn scoped_bucket_admission_and_trace_do_not_block_sibling_model() {
+        let quota = ProviderQuotaRegistry::new();
+        let mut flash = bucket("flash-bucket", &["flash"], "weekly_limit", 20.0);
+        flash.tiers.push(ProviderUsageTier {
+            name: "five_hour".to_string(),
+            used_percent: 100.0,
+            resets_at: None,
+        });
+        quota.observe_buckets(
+            "google",
+            &[
+                flash,
+                bucket("argon-bucket", &["argon"], "weekly_limit", 30.0),
+            ],
+            None,
+        );
+        let targets = vec![
+            backend("1", "google", "flash", 100),
+            backend("2", "google", "argon", 100),
+        ];
+
+        for balance in ["usage", "weighted", "priority", "latency"] {
+            let (ordered, decision) = TargetSelector::select_ordered_traced(
+                balance,
+                &targets,
+                &LatencyRegistry::new(),
+                &quota,
+                &HealthRegistry::new(),
+            );
+            if balance == "usage" {
+                assert_eq!(ordered_models(&ordered), vec!["argon", "flash"]);
+            }
+            assert_eq!(
+                ordered.len(),
+                2,
+                "blocked rows remain for dispatcher diagnostics"
+            );
+            let flash = candidate(&decision, "flash");
+            assert_eq!(
+                flash.skipped.as_ref().unwrap().window.as_deref(),
+                Some("five_hour")
+            );
+            let evidence = flash.quota.as_ref().unwrap();
+            assert_eq!(evidence.bucket_id.as_deref(), Some("flash-bucket"));
+            assert_eq!(evidence.blocking_constraint_ids, vec!["flash-bucket"]);
+            assert_eq!(evidence.blocker_scope.as_deref(), Some("bucket"));
+            assert_eq!(evidence.revision, Some(7));
+            assert!(candidate(&decision, "argon").skipped.is_none());
+            assert_eq!(
+                candidate(&decision, "argon")
+                    .quota
+                    .as_ref()
+                    .unwrap()
+                    .bucket_id
+                    .as_deref(),
+                Some("argon-bucket")
+            );
+        }
+    }
+
+    #[test]
+    fn scoped_usage_uses_own_bucket_weights_and_one_max_provider_mass() {
+        let quota = ProviderQuotaRegistry::new();
+        quota.observe_buckets(
+            "a",
+            &[
+                bucket("fast-bucket", &["fast", "fast-alias"], "weekly_limit", 20.0),
+                bucket("slow-bucket", &["slow"], "weekly_limit", 60.0),
+            ],
+            None,
+        );
+        quota.observe_buckets(
+            "b",
+            &[bucket("peer-bucket", &["peer"], "weekly_limit", 20.0)],
+            None,
+        );
+        let targets = vec![
+            backend("1", "a", "fast", 90),
+            backend("2", "a", "fast-alias", 10),
+            backend("3", "a", "slow", 100),
+            backend("4", "b", "peer", 100),
+        ];
+        let (_, decision) = TargetSelector::select_ordered_traced(
+            "usage",
+            &targets,
+            &LatencyRegistry::new(),
+            &quota,
+            &HealthRegistry::new(),
+        );
+        let fast = candidate(&decision, "fast");
+        let alias = candidate(&decision, "fast-alias");
+        let slow = candidate(&decision, "slow");
+        assert_eq!(fast.score.as_ref().unwrap()["remaining_quota_pct"], 80.0);
+        assert_eq!(slow.score.as_ref().unwrap()["remaining_quota_pct"], 40.0);
+        assert_eq!(
+            fast.share,
+            Some(0.5),
+            "aliases and second bucket add no outer tickets"
+        );
+        assert_eq!(slow.share, Some(0.5));
+        assert_eq!(
+            fast.weight, slow.weight,
+            "reported outer mass is max, not own or summed mass"
+        );
+        assert_eq!(fast.score.as_ref().unwrap()["bucket_share"], 0.8889);
+        assert_eq!(slow.score.as_ref().unwrap()["bucket_share"], 0.1111);
+        assert_eq!(fast.score.as_ref().unwrap()["target_share"], 0.9);
+        assert_eq!(alias.score.as_ref().unwrap()["target_share"], 0.1);
+
+        let mut a_first = 0;
+        let mut fast_bucket_first = 0;
+        let mut fast_row_first = 0;
+        let samples = 4_000;
+        for _ in 0..samples {
+            let ordered =
+                TargetSelector::select_ordered("usage", &targets, &LatencyRegistry::new(), &quota);
+            if ordered[0].provider_id == "a" {
+                a_first += 1;
+                if ordered[0].model != "slow" {
+                    fast_bucket_first += 1;
+                    if ordered[0].model == "fast" {
+                        fast_row_first += 1;
+                    }
+                }
+            }
+        }
+        assert!((a_first as f64 / samples as f64 - 0.5).abs() < 0.04);
+        assert!((fast_bucket_first as f64 / a_first as f64 - 8.0 / 9.0).abs() < 0.04);
+        assert!((fast_row_first as f64 / fast_bucket_first as f64 - 0.9).abs() < 0.04);
+    }
+
+    #[test]
+    fn unrelated_unknown_and_unrouted_buckets_never_boost_known_mass() {
+        let quota = ProviderQuotaRegistry::new();
+        quota.observe_buckets(
+            "a",
+            &[
+                bucket("low", &["known"], "weekly_limit", 90.0),
+                bucket("unused-healthy", &["not-in-route"], "weekly_limit", 0.0),
+            ],
+            None,
+        );
+        quota.observe_buckets(
+            "b",
+            &[bucket("peer", &["peer"], "weekly_limit", 90.0)],
+            None,
+        );
+        let targets = vec![
+            backend("1", "a", "known", 100),
+            backend("2", "a", "unmapped", 100),
+            backend("3", "b", "peer", 100),
+        ];
+        let (ordered, decision) = TargetSelector::select_ordered_traced(
+            "usage",
+            &targets,
+            &LatencyRegistry::new(),
+            &quota,
+            &HealthRegistry::new(),
+        );
+        assert_eq!(ordered.last().unwrap().model, "unmapped");
+        assert_eq!(candidate(&decision, "known").share, Some(0.5));
+        assert!(candidate(&decision, "known").weight.unwrap() < 0.01);
+        assert_eq!(
+            candidate(&decision, "unmapped").score.as_ref().unwrap()["state"],
+            "unknown_quota"
+        );
+    }
+
+    #[test]
+    fn shared_allowance_caps_pacing_across_different_governing_windows() {
+        let quota = ProviderQuotaRegistry::new();
+        let mut primary = bucket("primary", &["model"], "weekly_limit", 0.0);
+        primary.constraint_ids.push("shared".to_string());
+        let mut shared = bucket("shared", &[], "five_hour", 90.0);
+        shared.binding.status = "shared_constraint".to_string();
+        quota.observe_buckets("a", &[primary, shared], None);
+        let targets = vec![backend("1", "a", "model", 100)];
+        let (_, decision) = TargetSelector::select_ordered_traced(
+            "usage",
+            &targets,
+            &LatencyRegistry::new(),
+            &quota,
+            &HealthRegistry::new(),
+        );
+        let score = candidate(&decision, "model").score.as_ref().unwrap();
+        assert_eq!(score["window"], "five_hour");
+        assert_eq!(score["remaining_quota_pct"], 10.0);
+        assert!((score["bucket_weight"].as_f64().unwrap() - 0.004).abs() < 1e-9);
+    }
+
+    #[test]
+    fn raw_window_references_preserve_largest_primary_scoring_window() {
+        let quota = ProviderQuotaRegistry::new();
+        let mut primary = bucket("primary", &["model"], "weekly_limit", 20.0);
+        primary.tiers.push(ProviderUsageTier {
+            name: "five_hour".to_string(),
+            used_percent: 99.0,
+            resets_at: None,
+        });
+        primary.constraint_ids.push("raw-five-hour".to_string());
+        let mut raw = bucket("raw-five-hour", &[], "five_hour", 99.0);
+        raw.binding.status = "window_constraint".to_string();
+        quota.observe_buckets("a", &[primary, raw], None);
+        let (_, decision) = TargetSelector::select_ordered_traced(
+            "usage",
+            &[backend("1", "a", "model", 100)],
+            &LatencyRegistry::new(),
+            &quota,
+            &HealthRegistry::new(),
+        );
+        assert_eq!(
+            candidate(&decision, "model").score.as_ref().unwrap()["window"],
+            "weekly_limit"
+        );
+    }
+
+    #[test]
+    fn shared_blocker_trace_identifies_constraint_without_blocking_unbound_sibling() {
+        let quota = ProviderQuotaRegistry::new();
+        let mut primary = bucket("primary", &["model"], "weekly_limit", 20.0);
+        primary.constraint_ids.push("shared".to_string());
+        let mut shared = bucket("shared", &[], "five_hour", 100.0);
+        shared.binding.status = "shared_constraint".to_string();
+        quota.observe_buckets(
+            "a",
+            &[
+                primary,
+                shared,
+                bucket("sibling", &["sibling"], "weekly_limit", 20.0),
+            ],
+            None,
+        );
+        let (_, decision) = TargetSelector::select_ordered_traced(
+            "priority",
+            &[
+                backend("1", "a", "model", 100),
+                backend("2", "a", "sibling", 100),
+            ],
+            &LatencyRegistry::new(),
+            &quota,
+            &HealthRegistry::new(),
+        );
+        let evidence = candidate(&decision, "model").quota.as_ref().unwrap();
+        assert_eq!(evidence.blocker_scope.as_deref(), Some("shared_constraint"));
+        assert_eq!(evidence.blocking_constraint_ids, vec!["shared"]);
+        assert!(candidate(&decision, "sibling").skipped.is_none());
+    }
+
+    #[test]
+    fn catalog_percentage_does_not_invent_canonical_duration() {
+        let quota = ProviderQuotaRegistry::new();
+        let mut catalog = bucket("catalog", &["model"], "weekly_limit", 0.0);
+        catalog.source = "catalog".to_string();
+        quota.observe_buckets("a", &[catalog], None);
+        let (_, decision) = TargetSelector::select_ordered_traced(
+            "usage",
+            &[backend("1", "a", "model", 100)],
+            &LatencyRegistry::new(),
+            &quota,
+            &HealthRegistry::new(),
+        );
+        let candidate = candidate(&decision, "model");
+        assert_eq!(candidate.score.as_ref().unwrap()["state"], "unknown_quota");
+        assert!(candidate.score.as_ref().unwrap().get("rate").is_none());
+    }
+
+    #[test]
+    fn unknown_required_allowance_does_not_borrow_primary_score() {
+        let quota = ProviderQuotaRegistry::new();
+        let mut primary = bucket("primary", &["model"], "weekly_limit", 20.0);
+        primary.constraint_ids.push("shared".to_string());
+        let mut shared = bucket("shared", &[], "catalog_remaining", 20.0);
+        shared.binding.status = "shared_constraint".to_string();
+        quota.observe_buckets("a", &[primary, shared], None);
+        let (_, decision) = TargetSelector::select_ordered_traced(
+            "usage",
+            &[backend("1", "a", "model", 100)],
+            &LatencyRegistry::new(),
+            &quota,
+            &HealthRegistry::new(),
+        );
+        let candidate = candidate(&decision, "model");
+        assert_eq!(candidate.score.as_ref().unwrap()["state"], "unknown_quota");
+        assert!(candidate.score.as_ref().unwrap().get("rate").is_none());
+        assert!(candidate.skipped.is_none());
+    }
+
+    #[test]
+    fn exact_model_cooldown_splits_aliases_without_blocking_shared_bucket() {
+        let quota = ProviderQuotaRegistry::new();
+        quota.observe_buckets(
+            "a",
+            &[bucket(
+                "shared",
+                &["flash", "flash-alias"],
+                "weekly_limit",
+                20.0,
+            )],
+            None,
+        );
+        quota.record_model_rejection("a", "flash", Some(30));
+        let targets = vec![
+            backend("1", "a", "flash", 100),
+            backend("2", "a", "flash-alias", 100),
+        ];
+        let (ordered, decision) = TargetSelector::select_ordered_traced(
+            "usage",
+            &targets,
+            &LatencyRegistry::new(),
+            &quota,
+            &HealthRegistry::new(),
+        );
+        assert_eq!(ordered_models(&ordered), vec!["flash-alias", "flash"]);
+        assert!(candidate(&decision, "flash-alias").skipped.is_none());
+        let flash = candidate(&decision, "flash").quota.as_ref().unwrap();
+        assert_eq!(flash.scheduling.reason.as_deref(), Some("model_cooldown"));
+        assert_eq!(flash.blocker_scope.as_deref(), Some("model"));
+    }
+
+    #[test]
     fn traced_selection_annotates_circuit_open_on_other_strategies() {
         let health = std::sync::Arc::new(HealthRegistry::new());
         for _ in 0..3 {
             health
-                .try_acquire("b:openai-compatible/chat-completions/v1:m")
+                .try_acquire("b:openai-compatible/chat-completions/v1:b1")
                 .unwrap()
                 .failure();
         }
-        let targets = vec![backend("1", "a", "a1", 50), backend("2", "b", "b1", 50)];
+        let targets = vec![
+            backend("1", "a", "a1", 50),
+            backend("2", "b", "b1", 50),
+            backend("3", "b", "healthy-sibling", 50),
+        ];
 
         let (ordered, decision) = TargetSelector::select_ordered_traced(
             "weighted",
@@ -1581,11 +2124,12 @@ mod tests {
             &health,
         );
 
-        assert_eq!(ordered.len(), 2);
+        assert_eq!(ordered.len(), 3);
+        assert!(candidate(&decision, "healthy-sibling").skipped.is_none());
         let b = decision
             .candidates
             .iter()
-            .find(|c| c.provider == "b")
+            .find(|c| c.target == "b1")
             .unwrap();
         let skip = b.skipped.as_ref().unwrap();
         assert_eq!(skip.reason, "circuit_open");

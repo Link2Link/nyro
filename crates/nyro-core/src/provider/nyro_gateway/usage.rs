@@ -22,7 +22,7 @@ use super::nyro_build_url;
 use crate::router::quota::QuotaTierObservation;
 
 pub mod pool_quota;
-use pool_quota::AnonymousPoolQuota;
+pub mod public_usage;
 
 /// Remote route serving the forwarded usage report.
 pub const USAGE_PATH: &str = "/v1/nyro/usage";
@@ -91,23 +91,111 @@ pub(crate) async fn fetch_forwarded_usage(
 }
 
 fn sanitize_forwarded_usage(report: &mut Value) {
-    if let Some(providers) = report.get_mut("providers").and_then(Value::as_array_mut) {
-        for provider in providers {
-            if let Some(usage) = provider.get_mut("usage").and_then(Value::as_object_mut) {
-                usage.remove("upstream");
-                usage.remove("account_pool");
-                // Never relay an untyped nested pool payload: drop private or
-                // unknown fields at every level, and omit malformed summaries.
-                // Old reports without pool_quota remain unchanged.
-                if let Some(raw) = usage.remove("pool_quota")
-                    && let Ok(quota) = serde_json::from_value::<AnonymousPoolQuota>(raw)
-                    && let Ok(safe) = serde_json::to_value(quota)
-                {
-                    usage.insert("pool_quota".into(), safe);
-                }
-            }
-        }
+    public_usage::sanitize(report);
+}
+
+/// Route-admission capability is explicit. Legacy reports do not establish
+/// foreign model aliases and must never be guessed from provider membership.
+/// Each returned bucket binds ONE exact remote route, containing the remote's
+/// OR aggregation of only that route's configured alternatives.
+pub fn forwarded_route_buckets(
+    provider_id: &str,
+    report: &Value,
+) -> Vec<crate::quota_buckets::QuotaBucket> {
+    use crate::admin::{ProviderScheduling, ProviderSchedulingStatus};
+    use crate::quota_buckets::{QuotaBucket, QuotaBucketBinding, opaque_quota_id};
+    use std::collections::{BTreeMap, BTreeSet};
+    if !report
+        .get("capabilities")
+        .and_then(Value::as_array)
+        .is_some_and(|capabilities| {
+            capabilities
+                .iter()
+                .any(|value| value.as_str() == Some("route_scheduling"))
+        })
+    {
+        return Vec::new();
     }
+    let queried_at = report
+        .get("generated_at")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let mut routes: BTreeMap<&str, Vec<ProviderScheduling>> = BTreeMap::new();
+    for row in report
+        .get("route_scheduling")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let Some(route) = row
+            .get("route")
+            .and_then(Value::as_str)
+            .filter(|route| !route.trim().is_empty())
+        else {
+            continue;
+        };
+        let Some(raw) = row.get("scheduling") else {
+            continue;
+        };
+        let status = match raw.get("status").and_then(Value::as_str) {
+            Some("eligible") => ProviderSchedulingStatus::Eligible,
+            Some("quota_exhausted") => ProviderSchedulingStatus::QuotaExhausted,
+            _ => continue,
+        };
+        routes.entry(route).or_default().push(ProviderScheduling {
+            status,
+            reason: raw.get("reason").and_then(Value::as_str).map(str::to_owned),
+            blocking_tiers: raw
+                .get("blocking_tiers")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect(),
+            reset_at: raw
+                .get("reset_at")
+                .and_then(Value::as_str)
+                .filter(|raw| DateTime::parse_from_rfc3339(raw).is_ok())
+                .map(str::to_owned),
+            next_check_at: raw
+                .get("next_check_at")
+                .and_then(Value::as_str)
+                .filter(|raw| DateTime::parse_from_rfc3339(raw).is_ok())
+                .map(str::to_owned),
+        });
+    }
+    routes
+        .into_iter()
+        .filter_map(|(route, states)| {
+            let scheduling = states.first()?.clone();
+            // Contradictory duplicate route reports are unresolved, never first wins.
+            if states.iter().any(|state| state != &scheduling) {
+                return None;
+            }
+            let unresolved = scheduling.reason.as_deref() == Some("unknown_mapping");
+            Some(QuotaBucket {
+                id: opaque_quota_id("forwarded_route_v1", &[provider_id, route]),
+                scope_id: opaque_quota_id("forwarded_scope_v1", &[provider_id]),
+                label: route.to_owned(),
+                models: vec![route.to_owned()],
+                binding: QuotaBucketBinding {
+                    status: if unresolved { "unresolved" } else { "resolved" }.into(),
+                    source: "forwarded_route_v1".into(),
+                    revision: 1,
+                },
+                tiers: Vec::new(),
+                constraint_ids: Vec::new(),
+                source: "forwarded_route".into(),
+                queried_at: queried_at.to_owned(),
+                stale: false,
+                scheduling,
+                api_price: None,
+            })
+        })
+        .collect()
 }
 
 fn is_paused(provider: &Value) -> bool {
@@ -314,6 +402,113 @@ mod tests {
             );
             assert!(!report.to_string().contains("PRIVATE"));
         }
+    }
+
+    #[test]
+    fn route_capability_preserves_foreign_aliases_without_unrelated_healthy_buckets() {
+        let report = json!({
+            "object": "nyro.usage", "version": 2, "generated_at": "2026-11-05T08:00:00Z",
+            "capabilities": ["route_scheduling", "quota_bucket_projection"],
+            "providers": [
+                {"name": "Flash", "routes": ["foreign-flash"], "status": "ok", "usage": {"scheduling": {"status":"quota_exhausted"}}},
+                {"name": "Argon", "routes": ["foreign-argon"], "status": "ok", "usage": {"scheduling": {"status":"eligible"}}}
+            ],
+            "route_scheduling": [
+                {"route": "foreign-flash", "scheduling": {"status": "quota_exhausted", "reason": "remote_route_exhausted", "blocking_tiers":["five_hour"], "reset_at":"2026-11-05T10:00:00Z"}},
+                {"route": "foreign-argon", "scheduling": {"status": "eligible"}}
+            ]
+        });
+        let buckets = forwarded_route_buckets("relay", &report);
+        assert_eq!(buckets.len(), 2);
+        let flash = buckets
+            .iter()
+            .find(|bucket| bucket.models == ["foreign-flash"])
+            .unwrap();
+        assert_eq!(
+            flash.scheduling.status,
+            crate::admin::ProviderSchedulingStatus::QuotaExhausted
+        );
+        assert!(
+            flash.tiers.is_empty(),
+            "never invent quota percentages for a route OR aggregation"
+        );
+        assert!(flash.api_price.is_none());
+        assert!(
+            !upstream_scheduling_observation(&report)
+                .iter()
+                .any(|tier| tier.used_percent == 100.0)
+        );
+        let mut renamed = report.clone();
+        renamed["providers"][0]["name"] = json!("Renamed");
+        renamed["route_scheduling"][0]["scheduling"]["reset_at"] = json!("2030-01-01T00:00:00Z");
+        assert_eq!(
+            flash.id,
+            forwarded_route_buckets("relay", &renamed)
+                .iter()
+                .find(|bucket| bucket.models == ["foreign-flash"])
+                .unwrap()
+                .id
+        );
+        let mut legacy = report.clone();
+        legacy.as_object_mut().unwrap().remove("capabilities");
+        assert!(forwarded_route_buckets("relay", &legacy).is_empty());
+        let mut contradictory = report;
+        contradictory["route_scheduling"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"route":"foreign-flash","scheduling":{"status":"eligible"}}));
+        assert_eq!(forwarded_route_buckets("relay", &contradictory).len(), 1);
+    }
+
+    #[test]
+    fn allowlist_recursively_drops_admin_fields_and_untyped_future_payloads() {
+        let mut report = json!({
+            "object":"nyro.usage", "version":2, "api_price":{"secret":"PRIVATE"},
+            "capabilities":["route_scheduling"],
+            "providers":[{"id":"opaque", "name":"Google · Flash", "routes":["flash"], "status":"ok",
+                "account_id":"PRIVATE", "usage_entry":{"kind":"quota_bucket","bucket_ref":"opaque","account_id":"PRIVATE"},
+                "usage":{"provider_id":"opaque", "tiers":[{"name":"five_hour","used_percent":100,"api_price":{"secret":"PRIVATE"}}],
+                    "scheduling":{"status":"quota_exhausted","account_id":"PRIVATE","blocking_tiers":["five_hour"]},
+                    "api_price":{"secret":"PRIVATE"}, "quota_buckets":[{"models":["PRIVATE"],"api_price":{"secret":"PRIVATE"}}],
+                    "account_pool":{"account_id":"PRIVATE"}, "upstream":{"providers":[{"name":"PRIVATE"}]},
+                    "future":{"owner_id":"PRIVATE"}}}],
+            "route_scheduling":[{"route":"flash","project_id":"PRIVATE","scheduling":{"status":"quota_exhausted","api_price":{"secret":"PRIVATE"}}}]
+        });
+        sanitize_forwarded_usage(&mut report);
+        let text = report.to_string();
+        for forbidden in [
+            "PRIVATE",
+            "api_price",
+            "account_id",
+            "project_id",
+            "owner_id",
+            "quota_buckets",
+            "upstream",
+            "future",
+        ] {
+            assert!(!text.contains(forbidden), "leaked {forbidden}");
+        }
+        assert_eq!(
+            report["providers"][0]["usage"]["tiers"][0]["used_percent"],
+            100
+        );
+        assert_eq!(forwarded_route_buckets("relay", &report).len(), 1);
+    }
+
+    #[test]
+    fn receiver_keeps_money_permissions_and_row_identity_consistent() {
+        let mut report = json!({"object":"nyro.usage", "redacted":["balances","spends"],
+        "providers":[{"id":"stable-bucket", "status":"ok", "usage": {
+            "provider_id":"wrong-parent", "balances":[{"currency":"USD","total":999}],
+            "spends":[{"name":"today","currency":"USD","amount":99}]
+        }}]});
+        sanitize_forwarded_usage(&mut report);
+        assert_eq!(
+            report["providers"][0]["usage"]["provider_id"],
+            "stable-bucket"
+        );
+        assert_eq!(report["providers"][0]["usage"]["balances"], json!([]));
+        assert_eq!(report["providers"][0]["usage"]["spends"], json!([]));
     }
 
     #[test]

@@ -1533,6 +1533,9 @@ impl LogStore for MysqlLogStore {
     }
 
     async fn query(&self, query: LogQuery) -> anyhow::Result<LogPage> {
+        if query.quota_bucket.is_some() {
+            return crate::storage::provider_usage::query_quota_logs(self, query).await;
+        }
         let mut count_sql = String::from("SELECT COUNT(*) AS total FROM request_logs WHERE 1=1");
         // List query skips heavy body/header columns (NULL placeholders preserve struct layout).
         let mut data_sql = String::from(
@@ -1545,7 +1548,7 @@ impl LogStore for MysqlLogStore {
              CAST(NULL AS CHAR) AS upstream_response_headers, CAST(NULL AS CHAR) AS upstream_response_body, \
              upstream_status_code, client_status_code, \
              latency_total_ms, latency_upstream_ms, \
-             input_tokens, output_tokens, COALESCE(cache_read_tokens, 0) AS cache_read_tokens, COALESCE(reasoning_tokens, 0) AS reasoning_tokens, \
+             COALESCE(input_tokens, 0) AS input_tokens, COALESCE(output_tokens, 0) AS output_tokens, COALESCE(cache_read_tokens, 0) AS cache_read_tokens, COALESCE(reasoning_tokens, 0) AS reasoning_tokens, \
              COALESCE(is_stream, 0) AS is_stream, stream_chunks_count, stream_first_chunk_ms, \
              performance_metadata_version, upstream_effort_status, upstream_effort_raw, upstream_effort_tier, request_completion, completion_reason, upstream_response_mode, performance_upstream_ms, performance_first_chunk_ms, performance_completed_at, \
              CAST(client_request_id AS CHAR CHARACTER SET utf8mb4) AS client_request_id, attempt_index, outcome_version, \
@@ -1627,7 +1630,7 @@ impl LogStore for MysqlLogStore {
             bind_values.push(before.to_string());
         }
 
-        data_sql.push_str(" ORDER BY created_at DESC LIMIT ? OFFSET ?");
+        data_sql.push_str(" ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?");
 
         let mut count_query = sqlx::query_scalar::<_, i64>(&count_sql);
         let mut data_query = sqlx::query_as::<_, RequestLog>(&data_sql);
@@ -1656,7 +1659,7 @@ impl LogStore for MysqlLogStore {
              upstream_response_headers, upstream_response_body, \
              upstream_status_code, client_status_code, \
              latency_total_ms, latency_upstream_ms, \
-             input_tokens, output_tokens, COALESCE(cache_read_tokens, 0) AS cache_read_tokens, COALESCE(reasoning_tokens, 0) AS reasoning_tokens, \
+             COALESCE(input_tokens, 0) AS input_tokens, COALESCE(output_tokens, 0) AS output_tokens, COALESCE(cache_read_tokens, 0) AS cache_read_tokens, COALESCE(reasoning_tokens, 0) AS reasoning_tokens, \
              COALESCE(is_stream, 0) AS is_stream, stream_chunks_count, stream_first_chunk_ms, \
              performance_metadata_version, upstream_effort_status, upstream_effort_raw, upstream_effort_tier, request_completion, completion_reason, upstream_response_mode, performance_upstream_ms, performance_first_chunk_ms, performance_completed_at, \
              CAST(client_request_id AS CHAR CHARACTER SET utf8mb4) AS client_request_id, attempt_index, outcome_version, \
@@ -1951,6 +1954,60 @@ impl LogStore for MysqlLogStore {
             usage.add(row);
         }
         Ok(usage.finish())
+    }
+
+    async fn provider_quota_token_usage_with_periods(
+        &self,
+        provider_id: &str,
+        now: i64,
+        provider_period: Option<(i64, i64)>,
+        bucket_periods: &std::collections::HashMap<
+            (String, String),
+            crate::storage::provider_usage::ProviderQuotaPeriod,
+        >,
+    ) -> anyhow::Result<crate::storage::provider_usage::ProviderQuotaUsage> {
+        use crate::storage::provider_usage::{QuotaUsageAccumulator, QuotaUsageRow};
+        let mut rows = sqlx::query_as::<_, QuotaUsageRow>(
+            "SELECT created_at, performance_completed_at, route_decision, upstream_model, CAST(input_tokens AS SIGNED) AS input_tokens, \
+             CAST(output_tokens AS SIGNED) AS output_tokens, CAST(cache_read_tokens AS SIGNED) AS cache_read_tokens \
+             FROM request_logs WHERE provider_id = ? AND BINARY provider_id = BINARY ? AND created_at <= ?",
+        ).bind(provider_id).bind(provider_id).bind(now).fetch(&self.pool);
+        let mut usage =
+            QuotaUsageAccumulator::new(provider_id, now, provider_period, bucket_periods);
+        while let Some(row) = rows.try_next().await? {
+            usage.add(row);
+        }
+        Ok(usage.finish())
+    }
+
+    async fn provider_quota_usage_detail(
+        &self,
+        provider_id: &str,
+        start_at: i64,
+        end_at: i64,
+        quota_bucket: &str,
+        quota_scope: Option<&str>,
+    ) -> anyhow::Result<crate::storage::provider_usage::ProviderQuotaUsageDetail> {
+        use crate::storage::provider_usage::{QuotaDetailAccumulator, QuotaDetailRow};
+        let mut rows = sqlx::query_as::<_, QuotaDetailRow>(
+            "SELECT created_at, performance_completed_at, route_decision, upstream_model, CAST(input_tokens AS SIGNED) AS input_tokens, \
+             CAST(output_tokens AS SIGNED) AS output_tokens, CAST(cache_read_tokens AS SIGNED) AS cache_read_tokens, CAST(reasoning_tokens AS SIGNED) AS reasoning_tokens, \
+             latency_total_ms, latency_upstream_ms, stream_first_chunk_ms, client_status_code, upstream_status_code, outcome_version, CAST(attempt_outcome AS CHAR CHARACTER SET utf8mb4) AS attempt_outcome \
+             FROM request_logs WHERE provider_id = ? AND BINARY provider_id = BINARY ? AND created_at >= ? AND created_at <= ?",
+        ).bind(provider_id).bind(provider_id).bind(start_at).bind(end_at).fetch(&self.pool);
+        let periods = std::collections::HashMap::new();
+        let mut detail = QuotaDetailAccumulator::new(
+            provider_id,
+            start_at,
+            end_at,
+            quota_bucket,
+            quota_scope,
+            &periods,
+        );
+        while let Some(row) = rows.try_next().await? {
+            detail.add(row);
+        }
+        Ok(detail.finish())
     }
 
     async fn account_token_usage_with_periods(

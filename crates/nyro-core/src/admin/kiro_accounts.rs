@@ -338,6 +338,7 @@ impl AdminService {
             _ => Some("Mixed".into()),
         };
         ProviderUsage {
+            quota_buckets: Vec::new(),
             provider_id: view.provider_id.clone(),
             kind: "kiro_plan".into(),
             site: "global".into(),

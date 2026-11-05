@@ -25,7 +25,10 @@ use futures::stream::{self, StreamExt};
 use super::usage::{
     LIST_USAGE_CONCURRENCY, ProviderUsage, ProviderUsageQueryStatus, provider_usage_monitorable,
 };
+use super::usage_publication::{bucket_tiers_conflict, bucket_usage, effective_bucket_scheduling};
 use super::*;
+use crate::provider::nyro_gateway::usage::public_usage::PublicProviderUsage;
+use crate::quota_buckets::opaque_quota_id;
 
 /// Reuse window for forwarded snapshots. Downstream monitors poll every five
 /// minutes, so one remote serves any number of them with at most one vendor
@@ -49,6 +52,11 @@ impl UsageSnapshotCache {
         // This cache serves proxy forwarding, not admin statistics. Never retain
         // local log prices here, even if an enriched admin snapshot is supplied.
         usage.api_price = None;
+        usage.account_pool = None;
+        usage.upstream = None;
+        for bucket in &mut usage.quota_buckets {
+            bucket.api_price = None;
+        }
         self.entries
             .write()
             .unwrap()
@@ -107,7 +115,15 @@ pub struct ForwardedProviderUsage {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub usage: Option<ProviderUsage>,
+    pub usage: Option<PublicProviderUsage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage_entry: Option<super::usage_publication::PublishedUsageEntry>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ForwardedRouteScheduling {
+    pub route: String,
+    pub scheduling: ProviderScheduling,
 }
 
 /// `GET /v1/nyro/usage` response body.
@@ -121,6 +137,8 @@ pub struct ForwardedUsageReport {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub redacted: Vec<&'static str>,
     pub providers: Vec<ForwardedProviderUsage>,
+    pub capabilities: Vec<&'static str>,
+    pub route_scheduling: Vec<ForwardedRouteScheduling>,
 }
 
 fn truncate_error(error: &str) -> String {
@@ -144,33 +162,30 @@ impl AdminService {
             cache
                 .models
                 .iter()
-                .filter(|model| access.can_route(model) && !model.name.trim().is_empty())
+                .filter(|model| {
+                    model.is_enabled && access.can_route(model) && !model.name.trim().is_empty()
+                })
                 .map(|model| {
                     (
                         model.id.clone(),
                         model.name.trim().to_string(),
-                        model.target_provider.clone(),
-                        model
-                            .targets
-                            .iter()
-                            .map(|target| target.provider_id.clone())
-                            .collect::<Vec<_>>(),
+                        model.balance.clone(),
+                        (model.target_provider.clone(), model.target_model.clone()),
+                        model.targets.clone(),
                     )
                 })
                 .collect::<Vec<_>>()
         };
-        let mut routes_by_provider: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-        for (model_id, route, primary, cached_targets) in visible_routes {
+        let mut routes_by_provider: BTreeMap<String, BTreeMap<String, BTreeSet<String>>> =
+            BTreeMap::new();
+        for (model_id, route, balance, primary, cached_targets) in visible_routes {
             // The SQL route snapshot carries only the primary provider; every
             // other target (weighted peers, fallbacks) lives in the backend
             // store. Resolve them the way the dispatcher does, so a provider
             // that only backs a route as fallback is still reported.
             let stored_targets = match self.gw.storage.model_backends() {
                 Some(store) => match store.list_backends_by_model(&model_id).await {
-                    Ok(backends) => backends
-                        .into_iter()
-                        .map(|backend| backend.provider_id)
-                        .collect(),
+                    Ok(backends) => backends,
                     Err(error) => {
                         tracing::warn!(%error, route, "usage forwarding could not load route backends");
                         Vec::new()
@@ -178,19 +193,50 @@ impl AdminService {
                 },
                 None => Vec::new(),
             };
-            let provider_ids = stored_targets
+            // Stored rows are authoritative when present; do not accidentally
+            // retain a stale cached primary as another healthy alternative.
+            let targets = if !stored_targets.is_empty() {
+                stored_targets
+            } else if !cached_targets.is_empty() {
+                cached_targets
+            } else if !primary.0.trim().is_empty() {
+                vec![ModelBackend {
+                    id: String::new(),
+                    model_id: model_id.clone(),
+                    provider_id: primary.0,
+                    model: primary.1,
+                    weight: 100,
+                    priority: 1,
+                    is_fallback: false,
+                    created_at: String::new(),
+                }]
+            } else {
+                Vec::new()
+            };
+            // Mirror selector's static eligibility before exposing an OR
+            // alternative. Priority/latency use weight only for ordering (or
+            // ignore it); weighted/usage omit nonpositive regular rows. Fallback
+            // rows bypass those strategies and remain eligible at any weight.
+            for target in targets
                 .into_iter()
-                .chain(cached_targets)
-                .chain(std::iter::once(primary));
-            for provider_id in provider_ids {
-                let provider_id = provider_id.trim();
+                .filter(|target| forwarded_target_enabled(&balance, target))
+            {
+                let provider_id = target.provider_id.trim();
+                let backend_model = target.model;
                 if provider_id.is_empty() {
                     continue;
                 }
+                let backend_model = if backend_model.is_empty() || backend_model == "*" {
+                    route.clone()
+                } else {
+                    backend_model
+                };
                 routes_by_provider
                     .entry(provider_id.to_string())
                     .or_default()
-                    .insert(route.clone());
+                    .entry(route.clone())
+                    .or_default()
+                    .insert(backend_model);
             }
         }
 
@@ -206,7 +252,7 @@ impl AdminService {
             })
             .collect::<Vec<_>>();
         let include_money = access.privileged;
-        let mut providers = stream::iter(candidates)
+        let entries = stream::iter(candidates)
             .map(|(provider, routes)| {
                 let admin = self.clone();
                 async move {
@@ -218,11 +264,26 @@ impl AdminService {
             .buffer_unordered(LIST_USAGE_CONCURRENCY)
             .collect::<Vec<_>>()
             .await;
+        let mut providers = Vec::new();
+        let mut route_choices: BTreeMap<String, Vec<Option<ProviderScheduling>>> = BTreeMap::new();
+        for (rows, states) in entries {
+            providers.extend(rows);
+            for (route, states) in states {
+                route_choices.entry(route).or_default().extend(states);
+            }
+        }
         providers.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.id.cmp(&b.id)));
+        let route_scheduling = route_choices
+            .into_iter()
+            .map(|(route, choices)| ForwardedRouteScheduling {
+                route,
+                scheduling: alternative_scheduling(&choices),
+            })
+            .collect();
 
         Ok(ForwardedUsageReport {
             object: crate::provider::nyro_gateway::usage::REPORT_OBJECT,
-            version: 1,
+            version: 2,
             generated_at: Utc::now().to_rfc3339(),
             redacted: if include_money {
                 Vec::new()
@@ -230,15 +291,20 @@ impl AdminService {
                 vec!["balances", "spends"]
             },
             providers,
+            capabilities: vec!["quota_bucket_projection", "route_scheduling"],
+            route_scheduling,
         })
     }
 
     async fn forwarded_provider_entry(
         &self,
         provider: Provider,
-        routes: BTreeSet<String>,
+        routes: BTreeMap<String, BTreeSet<String>>,
         include_money: bool,
-    ) -> ForwardedProviderUsage {
+    ) -> (
+        Vec<ForwardedProviderUsage>,
+        BTreeMap<String, Vec<Option<ProviderScheduling>>>,
+    ) {
         let mut entry = ForwardedProviderUsage {
             id: provider.id.clone(),
             name: provider.name.clone(),
@@ -248,16 +314,23 @@ impl AdminService {
                 .map(str::trim)
                 .find(|value| !value.is_empty())
                 .map(str::to_ascii_lowercase),
-            routes: routes.into_iter().collect(),
+            routes: routes.keys().cloned().collect(),
             status: ProviderUsageQueryStatus::Unsupported,
             error: None,
             usage: None,
+            usage_entry: None,
+        };
+        let unknown = || {
+            routes
+                .iter()
+                .map(|(route, models)| (route.clone(), vec![None; models.len()]))
+                .collect()
         };
         // Chain guard: never call out to another Nyro from this endpoint.
         if crate::provider::nyro_gateway::is_nyro_gateway(&provider)
             || !provider_usage_monitorable(self, &provider).await
         {
-            return entry;
+            return (vec![entry], unknown());
         }
         let usage = match self
             .gw
@@ -269,32 +342,237 @@ impl AdminService {
         };
         match usage {
             Ok(mut usage) => {
-                // pool_quota is an independent anonymous display DTO. Keep it
-                // for every caller while removing admin-only identity/config.
-                usage.account_pool = None;
-                usage.api_price = None;
-                usage.upstream = None;
-                if !include_money {
-                    usage.balances.clear();
-                    usage.spends.clear();
+                // Cache age must not hide a newer owner/auth/shared denial from
+                // older readers that only inspect each flat primary row.
+                let current = self.gw.quota_registry.bucket_snapshot(&provider.id);
+                for bucket in &mut usage.quota_buckets {
+                    if let Some(latest) = current
+                        .iter()
+                        .find(|latest| latest.id == bucket.id && latest.scope_id == bucket.scope_id)
+                        && latest.scheduling.status == ProviderSchedulingStatus::QuotaExhausted
+                    {
+                        bucket.scheduling = latest.scheduling.clone();
+                    }
                 }
-                entry.status = ProviderUsageQueryStatus::Ok;
-                entry.usage = Some(usage);
+                let owner = self.gw.quota_registry.snapshot(&provider.id);
+                if matches!(
+                    owner.reason.as_deref(),
+                    Some(
+                        "account_unavailable"
+                            | "no_available_account"
+                            | "auth_error"
+                            | "authentication_failed"
+                    )
+                ) {
+                    usage.is_available = Some(false);
+                    usage.scheduling = owner;
+                }
+                let (rows, mut states) =
+                    project_forwarded_entry(entry, &usage, &routes, include_money);
+                // Include runtime auth/model cooldown fences that may have
+                // arrived after this cached quota observation. Model identity
+                // is the same concrete target used by route collection.
+                for (route, models) in &routes {
+                    if let Some(choices) = states.get_mut(route) {
+                        for (choice, model) in choices.iter_mut().zip(models) {
+                            if !self
+                                .gw
+                                .quota_registry
+                                .is_model_schedulable(&provider.id, model)
+                                && choice.as_ref().is_none_or(|state| {
+                                    state.status != ProviderSchedulingStatus::QuotaExhausted
+                                })
+                            {
+                                *choice = Some(ProviderScheduling {
+                                    status: ProviderSchedulingStatus::QuotaExhausted,
+                                    reason: Some("model_unavailable".into()),
+                                    ..Default::default()
+                                });
+                            }
+                        }
+                    }
+                }
+                (rows, states)
             }
             Err(error) => {
+                tracing::warn!(%error, provider_id = %provider.id, "usage forwarding query failed");
                 entry.status = ProviderUsageQueryStatus::Error;
-                entry.error = Some(truncate_error(&error.to_string()));
+                // Vendor errors can contain raw account/project identifiers or
+                // request URLs. Keep details in the local admin/log boundary.
+                entry.error = Some(truncate_error(
+                    "Usage query failed; contact the gateway administrator",
+                ));
+                (vec![entry], unknown())
             }
         }
-        entry
     }
+}
+
+fn forwarded_target_enabled(balance: &str, target: &ModelBackend) -> bool {
+    let balance = balance.parse::<ModelBalance>().unwrap_or_default();
+    target.is_fallback
+        || !matches!(balance, ModelBalance::Weighted | ModelBalance::Usage)
+        || target.weight > 0
+}
+
+/// Only configured alternatives for this exact visible route participate (OR).
+/// An unresolved target remains unknown/eligible-for-probing; it is never backed
+/// by an unrelated healthy sibling's quota evidence.
+fn alternative_scheduling(choices: &[Option<ProviderScheduling>]) -> ProviderScheduling {
+    if choices
+        .iter()
+        .flatten()
+        .any(|state| state.status == ProviderSchedulingStatus::Eligible)
+    {
+        return ProviderScheduling::default();
+    }
+    if choices.is_empty() || choices.iter().any(Option::is_none) {
+        return ProviderScheduling {
+            reason: Some("unknown_mapping".into()),
+            ..Default::default()
+        };
+    }
+    let mut state = ProviderScheduling {
+        status: ProviderSchedulingStatus::QuotaExhausted,
+        reason: Some("remote_route_exhausted".into()),
+        ..Default::default()
+    };
+    state.blocking_tiers = choices
+        .iter()
+        .flatten()
+        .flat_map(|state| state.blocking_tiers.iter().cloned())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    // OR alternatives recover when any one recovers. Unknown reset stays open.
+    state.reset_at = choices
+        .iter()
+        .flatten()
+        .map(|state| {
+            state
+                .reset_at
+                .as_deref()
+                .and_then(|raw| DateTime::parse_from_rfc3339(raw).ok())
+        })
+        .collect::<Option<Vec<_>>>()
+        .and_then(|resets| resets.into_iter().min())
+        .map(|time| time.to_rfc3339());
+    state
+}
+
+fn project_forwarded_entry(
+    mut entry: ForwardedProviderUsage,
+    usage: &ProviderUsage,
+    routes: &BTreeMap<String, BTreeSet<String>>,
+    include_money: bool,
+) -> (
+    Vec<ForwardedProviderUsage>,
+    BTreeMap<String, Vec<Option<ProviderScheduling>>>,
+) {
+    let primary = usage
+        .quota_buckets
+        .iter()
+        .filter(|bucket| bucket.is_primary())
+        .collect::<Vec<_>>();
+    if primary.is_empty() && usage.quota_buckets.is_empty() {
+        entry.status = ProviderUsageQueryStatus::Ok;
+        entry.usage = Some(PublicProviderUsage::from_usage(usage, include_money, false));
+        let states = routes
+            .iter()
+            .map(|(route, models)| {
+                (
+                    route.clone(),
+                    models
+                        .iter()
+                        .map(|_| Some(usage.scheduling.clone()))
+                        .collect(),
+                )
+            })
+            .collect();
+        return (vec![entry], states);
+    }
+    let mut visible: BTreeMap<usize, BTreeSet<String>> = BTreeMap::new();
+    let mut unresolved = BTreeSet::new();
+    let mut states = BTreeMap::new();
+    for (route, models) in routes {
+        let mut choices = Vec::new();
+        for model in models {
+            let matching = primary
+                .iter()
+                .enumerate()
+                .filter(|(_, bucket)| {
+                    bucket.binds_model(model)
+                        && bucket.source != "catalog"
+                        && !bucket_tiers_conflict(&bucket.tiers)
+                })
+                .collect::<Vec<_>>();
+            if let [(index, bucket)] = matching.as_slice() {
+                visible.entry(*index).or_default().insert(route.clone());
+                choices.push(Some(effective_bucket_scheduling(usage, bucket)));
+            } else {
+                unresolved.insert(route.clone());
+                // Preserve explicit owner/auth or shared/global denial, but do
+                // not borrow a sibling bucket as a model mapping.
+                choices.push(
+                    (usage.is_available == Some(false)).then(|| ProviderScheduling {
+                        status: ProviderSchedulingStatus::QuotaExhausted,
+                        reason: Some("account_unavailable".into()),
+                        ..Default::default()
+                    }),
+                );
+            }
+        }
+        states.insert(route.clone(), choices);
+    }
+    let mut rows = Vec::new();
+    for (index, routes) in visible {
+        let bucket = primary[index];
+        let projected = bucket_usage(usage, bucket);
+        let mut row = entry.clone();
+        row.id = projected.provider_id.clone();
+        row.name = format!("{} · {}", entry.name, bucket.label);
+        row.routes = routes.into_iter().collect();
+        row.status = ProviderUsageQueryStatus::Ok;
+        row.usage = Some(PublicProviderUsage::from_usage(
+            &projected,
+            false,
+            bucket.stale,
+        ));
+        row.usage_entry = Some(super::usage_publication::PublishedUsageEntry {
+            kind: "quota_bucket",
+            source_provider_ref: opaque_quota_id("forwarded_provider_v1", &[&entry.id]),
+            bucket_ref: opaque_quota_id(
+                "forwarded_bucket_v1",
+                &[&entry.id, &bucket.scope_id, &bucket.id],
+            ),
+            binding_status: bucket.binding.status.clone(),
+            stale: bucket.stale,
+        });
+        rows.push(row);
+    }
+    if !unresolved.is_empty() {
+        // One generic diagnostic, no guessed children, hidden labels or model
+        // membership. Not an ordinary healthy quota supplier for older peers.
+        entry.id = opaque_quota_id("forwarded_unresolved_v1", &[&entry.id]);
+        entry.routes = unresolved.into_iter().collect();
+        entry.status = ProviderUsageQueryStatus::Error;
+        entry.error = Some("Quota association unavailable for this route".into());
+        entry.usage = None;
+        rows.push(entry);
+    }
+    (rows, states)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::GatewayConfig;
-    use crate::router::quota::{ProviderScheduling, ProviderSchedulingStatus};
+    use crate::provider::nyro_gateway::usage::{
+        forwarded_route_buckets, upstream_scheduling_observation,
+    };
+    use crate::router::quota::{
+        ProviderQuotaRegistry, ProviderScheduling, ProviderSchedulingStatus,
+    };
 
     async fn gateway(dir: &tempfile::TempDir) -> Gateway {
         let config = GatewayConfig {
@@ -402,6 +680,7 @@ mod tests {
             account_pool: None,
             pool_quota: None,
             upstream: Some(serde_json::json!({"providers": []})),
+            quota_buckets: Vec::new(),
         }
     }
 
@@ -492,8 +771,9 @@ mod tests {
         let usage = deepseek.usage.as_ref().unwrap();
         assert_eq!(usage.balances.len(), 1);
         assert_eq!(usage.spends.len(), 1);
-        assert!(usage.upstream.is_none(), "forwarding is one hop deep");
-        assert!(usage.account_pool.is_none());
+        let wire = serde_json::to_value(usage).unwrap();
+        assert!(wire.get("upstream").is_none(), "forwarding is one hop deep");
+        assert!(wire.get("account_pool").is_none());
 
         // The chained Nyro is reported, never queried (it points at TEST-NET).
         let edge = &report.providers[1];
@@ -711,6 +991,13 @@ mod tests {
             period_tier: None,
             used_percent: None,
             estimated_capacity: None,
+            all_time_coverage: None,
+            period_coverage: None,
+            estimated_capacity_partial: None,
+            unassigned: None,
+            unassigned_coverage: None,
+            retained_buckets: Vec::new(),
+            models: Vec::new(),
         }
     }
 
@@ -749,13 +1036,420 @@ mod tests {
                 .iter()
                 .find(|entry| entry.id == f.deepseek)
                 .unwrap();
-            assert!(entry.usage.as_ref().unwrap().api_price.is_none());
             assert!(
                 serde_json::to_value(entry).unwrap()["usage"]
                     .get("api_price")
                     .is_none()
             );
         }
+    }
+
+    fn bucket(id: &str, model: &str, paused: bool) -> crate::quota_buckets::QuotaBucket {
+        crate::quota_buckets::QuotaBucket {
+            id: id.into(),
+            scope_id: "opaque-scope".into(),
+            label: id.into(),
+            models: vec![model.into()],
+            binding: crate::quota_buckets::QuotaBucketBinding {
+                status: "resolved".into(),
+                source: "official".into(),
+                revision: 1,
+            },
+            tiers: vec![ProviderUsageTier {
+                name: "five_hour".into(),
+                used_percent: if paused { 100.0 } else { 10.0 },
+                resets_at: None,
+            }],
+            constraint_ids: Vec::new(),
+            source: "enforced_summary".into(),
+            queried_at: "2026-11-05T08:00:00Z".into(),
+            stale: false,
+            scheduling: ProviderScheduling {
+                status: if paused {
+                    ProviderSchedulingStatus::QuotaExhausted
+                } else {
+                    ProviderSchedulingStatus::Eligible
+                },
+                ..Default::default()
+            },
+            api_price: Some(admin_price()),
+        }
+    }
+
+    #[tokio::test]
+    async fn bucket_routes_use_exact_backend_models_and_do_not_expose_hidden_siblings() {
+        let dir = tempfile::tempdir().unwrap();
+        let gw = gateway(&dir).await;
+        let provider_id = provider(
+            &gw,
+            "Google",
+            Some("deepseek"),
+            "https://api.deepseek.com",
+            true,
+        )
+        .await;
+        let mut usage = snapshot(&provider_id, false);
+        usage.quota_buckets = vec![
+            bucket("Flash", "flash-wire", true),
+            bucket("PRIVATE-Argon", "argon-wire", false),
+        ];
+        gw.usage_snapshots.store(&usage);
+        let mut public_routes = Vec::new();
+        for (name, model, enable_auth) in [
+            ("flash-public", "flash-wire", false),
+            ("flash-alias", "flash-wire", false),
+            ("argon-secret", "argon-wire", true),
+        ] {
+            let id = gw
+                .admin()
+                .create_model(CreateModel {
+                    name: name.into(),
+                    balance: Some("priority".into()),
+                    target_provider: provider_id.clone(),
+                    target_model: model.into(),
+                    targets: Vec::new(),
+                    enable_auth: Some(enable_auth),
+                    enable_payload: Some(false),
+                    force_max_reasoning: None,
+                    vision_shim: None,
+                })
+                .await
+                .unwrap()
+                .id;
+            if !enable_auth {
+                public_routes.push(id);
+            }
+        }
+        let report = gw
+            .admin()
+            .forwarded_provider_usage(&RouteAccess::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            report.providers.len(),
+            1,
+            "same bucket behind two routes emitted once"
+        );
+        let row = &report.providers[0];
+        assert_eq!(row.name, "Google · Flash");
+        assert_eq!(row.routes, ["flash-alias", "flash-public"]);
+        assert_eq!(row.id, row.usage.as_ref().unwrap().provider_id);
+        assert_eq!(
+            row.usage.as_ref().unwrap().scheduling.status,
+            ProviderSchedulingStatus::QuotaExhausted
+        );
+        assert!(
+            report
+                .route_scheduling
+                .iter()
+                .all(|route| route.scheduling.status == ProviderSchedulingStatus::QuotaExhausted)
+        );
+        let wire = serde_json::to_value(&report).unwrap();
+        for forbidden in [
+            "PRIVATE-Argon",
+            "argon-wire",
+            "flash-wire",
+            "api_price",
+            "scope_id",
+            "quota_buckets",
+            "account_pool",
+        ] {
+            assert!(!wire.to_string().contains(forbidden), "leaked {forbidden}");
+        }
+        // Display labels, reset/utilization changes, and a now-hidden sibling
+        // never change the composite DSH key of the visible bucket.
+        usage.quota_buckets[0].label = "Renamed Flash".into();
+        usage.quota_buckets[0].tiers[0].used_percent = 99.0;
+        usage.quota_buckets.pop();
+        gw.usage_snapshots.store(&usage);
+        let renamed = gw
+            .admin()
+            .forwarded_provider_usage(&RouteAccess::default())
+            .await
+            .unwrap();
+        assert_eq!(row.id, renamed.providers[0].id);
+        // Offline two-hop contract: downstream backend aliases are the remote
+        // virtual routes, not Flash's hidden wire model or a healthy sibling.
+        let ali_registry = ProviderQuotaRegistry::new();
+        let remote_wire = serde_json::to_value(&report).unwrap();
+        ali_registry.observe_buckets(
+            "ali-relay",
+            &forwarded_route_buckets("ali-relay", &remote_wire),
+            None,
+        );
+        assert!(!ali_registry.is_model_schedulable("ali-relay", "flash-public"));
+        assert!(!ali_registry.is_model_schedulable("ali-relay", "flash-alias"));
+        assert!(ali_registry.is_model_schedulable("ali-relay", "unconfigured-other-route"));
+        let legacy = upstream_scheduling_observation(&remote_wire);
+        assert_eq!(
+            legacy.len(),
+            1,
+            "every visible primary blocked keeps old reader safe"
+        );
+    }
+
+    #[tokio::test]
+    async fn forwarding_excludes_zero_weight_regular_rows_only_for_weighted_and_usage_routes() {
+        let dir = tempfile::tempdir().unwrap();
+        let gw = gateway(&dir).await;
+        let id = provider(
+            &gw,
+            "Google",
+            Some("deepseek"),
+            "https://api.deepseek.com",
+            true,
+        )
+        .await;
+        let mut usage = snapshot(&id, false);
+        usage.quota_buckets = vec![
+            bucket("Flash", "flash-wire", true),
+            bucket("Argon", "argon-wire", false),
+        ];
+        gw.usage_snapshots.store(&usage);
+        for (name, balance, argon_weight, is_fallback) in [
+            ("weighted-zero", "weighted", 0, false),
+            ("usage-zero", "usage", 0, false),
+            ("priority-zero", "priority", 0, false),
+            ("latency-zero", "latency", 0, false),
+            ("weighted-fallback-zero", "weighted", 0, true),
+            ("usage-fallback-zero", "usage", 0, true),
+        ] {
+            let target = |model: &str, weight, priority, is_fallback| CreateModelBackend {
+                provider_id: id.clone(),
+                model: model.into(),
+                weight: Some(weight),
+                priority: Some(priority),
+                is_fallback: Some(is_fallback),
+            };
+            gw.admin()
+                .create_model(CreateModel {
+                    name: name.into(),
+                    balance: Some(balance.into()),
+                    target_provider: String::new(),
+                    target_model: String::new(),
+                    targets: vec![
+                        target("flash-wire", 100, 1, false),
+                        target("argon-wire", argon_weight, 2, is_fallback),
+                    ],
+                    enable_auth: Some(false),
+                    enable_payload: Some(false),
+                    force_max_reasoning: None,
+                    vision_shim: None,
+                })
+                .await
+                .unwrap();
+        }
+        let report = gw
+            .admin()
+            .forwarded_provider_usage(&RouteAccess::default())
+            .await
+            .unwrap();
+        let state = |route: &str| {
+            report
+                .route_scheduling
+                .iter()
+                .find(|row| row.route == route)
+                .unwrap()
+                .scheduling
+                .status
+        };
+        for blocked in ["weighted-zero", "usage-zero"] {
+            assert_eq!(
+                state(blocked),
+                ProviderSchedulingStatus::QuotaExhausted,
+                "{blocked} must not borrow Argon's excluded row"
+            );
+        }
+        for routable in [
+            "priority-zero",
+            "latency-zero",
+            "weighted-fallback-zero",
+            "usage-fallback-zero",
+        ] {
+            assert_eq!(
+                state(routable),
+                ProviderSchedulingStatus::Eligible,
+                "{routable} retains the selector's zero-weight alternatives"
+            );
+        }
+        let argon = report
+            .providers
+            .iter()
+            .find(|row| row.name == "Google · Argon")
+            .unwrap();
+        assert_eq!(
+            argon.routes,
+            [
+                "latency-zero",
+                "priority-zero",
+                "usage-fallback-zero",
+                "weighted-fallback-zero"
+            ]
+        );
+        let registry = ProviderQuotaRegistry::new();
+        registry.observe_buckets(
+            "relay",
+            &forwarded_route_buckets("relay", &serde_json::to_value(&report).unwrap()),
+            None,
+        );
+        assert!(!registry.is_model_schedulable("relay", "weighted-zero"));
+        assert!(!registry.is_model_schedulable("relay", "usage-zero"));
+        assert!(registry.is_model_schedulable("relay", "priority-zero"));
+    }
+
+    #[test]
+    fn static_target_eligibility_matches_selector_for_cached_and_legacy_modes() {
+        let target = |weight, is_fallback| ModelBackend {
+            id: String::new(),
+            model_id: "route".into(),
+            provider_id: "p".into(),
+            model: "m".into(),
+            weight,
+            priority: 1,
+            is_fallback,
+            created_at: String::new(),
+        };
+        for balance in ["weighted", "usage", " USAGE ", "invalid-defaults-weighted"] {
+            assert!(!forwarded_target_enabled(balance, &target(0, false)));
+            assert!(!forwarded_target_enabled(balance, &target(-1, false)));
+            assert!(forwarded_target_enabled(balance, &target(100, false)));
+            assert!(forwarded_target_enabled(balance, &target(0, true)));
+        }
+        for balance in ["priority", "latency"] {
+            assert!(forwarded_target_enabled(balance, &target(0, false)));
+            assert!(forwarded_target_enabled(balance, &target(-1, false)));
+        }
+    }
+
+    #[test]
+    fn unknown_binding_never_borrows_parent_routes_or_hidden_labels() {
+        let mut usage = snapshot("parent", false);
+        usage.quota_buckets = vec![bucket("PRIVATE-Hidden", "private-model", false)];
+        let entry = ForwardedProviderUsage {
+            id: "parent".into(),
+            name: "Google".into(),
+            vendor: None,
+            routes: vec!["visible".into()],
+            status: ProviderUsageQueryStatus::Ok,
+            error: None,
+            usage: None,
+            usage_entry: None,
+        };
+        let (rows, states) = project_forwarded_entry(
+            entry,
+            &usage,
+            &BTreeMap::from([("visible".into(), BTreeSet::from(["unknown-backend".into()]))]),
+            false,
+        );
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].status, ProviderUsageQueryStatus::Error);
+        assert!(rows[0].usage.is_none());
+        assert!(states["visible"][0].is_none());
+        assert!(!serde_json::to_string(&rows).unwrap().contains("PRIVATE"));
+    }
+
+    #[test]
+    fn catalog_only_routes_publish_one_diagnostic_and_unknown_admission() {
+        let mut usage = snapshot("p", false);
+        usage.quota_buckets = vec![
+            bucket("Flash low", "flash-low", false),
+            bucket("Flash high", "flash-high", false),
+        ];
+        for bucket in &mut usage.quota_buckets {
+            bucket.source = "catalog".into();
+            bucket.binding.source = "catalog_exact_model_v1".into();
+            bucket.scheduling.reason = Some("unknown_mapping".into());
+        }
+        let entry = ForwardedProviderUsage {
+            id: "p".into(),
+            name: "Google".into(),
+            vendor: None,
+            routes: vec!["flash".into()],
+            status: ProviderUsageQueryStatus::Ok,
+            error: None,
+            usage: None,
+            usage_entry: None,
+        };
+        let (rows, states) = project_forwarded_entry(
+            entry,
+            &usage,
+            &BTreeMap::from([(
+                "flash".into(),
+                BTreeSet::from(["flash-low".into(), "flash-high".into()]),
+            )]),
+            false,
+        );
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].status, ProviderUsageQueryStatus::Error);
+        assert!(rows[0].usage.is_none());
+        assert_eq!(
+            alternative_scheduling(&states["flash"]).reason.as_deref(),
+            Some("unknown_mapping")
+        );
+        assert!(!serde_json::to_string(&rows).unwrap().contains("Flash low"));
+    }
+
+    #[test]
+    fn route_alternatives_are_or_and_shared_constraints_are_not_suppliers() {
+        let blocked = ProviderScheduling {
+            status: ProviderSchedulingStatus::QuotaExhausted,
+            ..Default::default()
+        };
+        assert_eq!(
+            alternative_scheduling(&[Some(blocked.clone())]).status,
+            ProviderSchedulingStatus::QuotaExhausted
+        );
+        assert_eq!(
+            alternative_scheduling(&[Some(blocked.clone()), Some(ProviderScheduling::default())])
+                .status,
+            ProviderSchedulingStatus::Eligible
+        );
+        assert_eq!(
+            alternative_scheduling(&[Some(blocked), None]).status,
+            ProviderSchedulingStatus::Eligible
+        );
+        let mut usage = snapshot("p", false);
+        usage.quota_buckets = vec![
+            bucket("Flash", "flash", false),
+            bucket("Argon", "argon", false),
+        ];
+        let mut shared = bucket("Global", "", true);
+        shared.binding.status = "shared_constraint".into();
+        shared.models.clear();
+        for bucket in &mut usage.quota_buckets {
+            bucket.constraint_ids.push(shared.id.clone());
+        }
+        usage.quota_buckets.push(shared);
+        let entry = ForwardedProviderUsage {
+            id: "p".into(),
+            name: "Google".into(),
+            vendor: None,
+            routes: vec!["flash".into(), "argon".into()],
+            status: ProviderUsageQueryStatus::Ok,
+            error: None,
+            usage: None,
+            usage_entry: None,
+        };
+        let (rows, _) = project_forwarded_entry(
+            entry,
+            &usage,
+            &BTreeMap::from([
+                ("flash".into(), BTreeSet::from(["flash".into()])),
+                ("argon".into(), BTreeSet::from(["argon".into()])),
+            ]),
+            true,
+        );
+        assert_eq!(rows.len(), 2);
+        assert!(
+            rows.iter()
+                .all(|row| row.usage.as_ref().unwrap().scheduling.status
+                    == ProviderSchedulingStatus::QuotaExhausted)
+        );
+        assert!(
+            rows.iter()
+                .all(|row| row.usage.as_ref().unwrap().balances.is_empty())
+        );
+        assert!(!serde_json::to_string(&rows).unwrap().contains("api_price"));
     }
 
     #[test]

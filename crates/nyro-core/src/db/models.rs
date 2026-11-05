@@ -852,6 +852,12 @@ pub struct LogQuery {
     /// Legacy alias for `upstream_model`. Ignored when `upstream_model` is set.
     pub model: Option<String>,
     pub upstream_model: Option<String>,
+    /// Immutable primary bucket ID, or `unassigned` for historical/invalid attribution.
+    #[serde(default)]
+    pub quota_bucket: Option<String>,
+    /// Optional exact opaque owner scope for a bucket filter.
+    #[serde(default)]
+    pub quota_scope: Option<String>,
     pub status_min: Option<i32>,
     pub status_max: Option<i32>,
     pub api_key: Option<String>,

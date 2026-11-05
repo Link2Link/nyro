@@ -46,6 +46,9 @@ import type {
   ProviderModelUsageStats,
   ProviderStats,
   ProviderUsageDetail,
+  ProviderUsage,
+  QuotaBucket,
+  QuotaBucketFilter,
   RequestLog,
 } from "@/lib/types";
 import { cn } from "@/lib/utils";
@@ -77,6 +80,9 @@ export interface ProviderUsageDialogProps {
   onOpenChange: (open: boolean) => void;
   initialRange?: StatsRange;
   initialProviderId?: string | null;
+  initialQuotaFilter?: QuotaBucketFilter;
+  /** Reuse the card snapshot when opening a bucket, without a per-bucket query. */
+  quotaBuckets?: QuotaBucket[];
 }
 
 const PAGE_SIZE = 10;
@@ -92,6 +98,8 @@ export function ProviderUsageDialog({
   onOpenChange,
   initialRange,
   initialProviderId,
+  initialQuotaFilter,
+  quotaBuckets,
 }: ProviderUsageDialogProps) {
   const { locale } = useLocale();
   const zh = locale === "zh-CN";
@@ -105,6 +113,7 @@ export function ProviderUsageDialog({
   const [status, setStatus] = useState<StatusFilter>("all");
   const [outcome, setOutcome] = useState("all");
   const [model, setModel] = useState<string | null>(null);
+  const [quotaFilter, setQuotaFilter] = useState<QuotaBucketFilter>(() => initialQuotaFilter ?? {});
   const [page, setPage] = useState(0);
   const [selectedLog, setSelectedLog] = useState<RequestLog | null>(null);
 
@@ -117,12 +126,13 @@ export function ProviderUsageDialog({
       setStatus("all");
       setOutcome("all");
       setModel(null);
+      setQuotaFilter(initialQuotaFilter ?? {});
       setPage(0);
       setSelectedLog(null);
       defaultSelectionMade.current = initialProviderId != null;
     }
     previousOpen.current = open;
-  }, [open, initialRange, initialProviderId]);
+  }, [open, initialRange, initialProviderId, initialQuotaFilter]);
 
   const list = useQuery<ProviderStats[]>({
     queryKey: ["provider-usage-list", rangeKey(range)],
@@ -154,10 +164,20 @@ export function ProviderUsageDialog({
     }
   }, [open, list.data, selectedId]);
 
+  const usage = useQuery<ProviderUsage>({
+    queryKey: ["provider-usage", selectedId],
+    queryFn: () => backend("get_provider_usage", { id: selectedId! }),
+    enabled: open && !!selectedId,
+    staleTime: 60_000,
+    retry: false,
+  });
+  const buckets = selectedId === initialProviderId && quotaBuckets ? quotaBuckets : usage.data?.quota_buckets ?? [];
+
   const detail = useQuery<ProviderUsageDetail>({
-    queryKey: ["provider-usage-detail", selectedId, rangeKey(range)],
+    queryKey: ["provider-usage-detail", selectedId, rangeKey(range), quotaFilter],
     queryFn: () =>
-      backend("get_provider_usage_detail", { id: selectedId!, ...rangeArgs(range) }),
+      backend("get_provider_usage_detail", { id: selectedId!, ...rangeArgs(range),
+        quotaBucket: quotaFilter.quota_bucket, quotaScope: quotaFilter.quota_scope }),
     enabled: open && !!selectedId,
     refetchInterval:
       open && selectedId ? (tab === "requests" ? 5_000 : 30_000) : false,
@@ -169,6 +189,7 @@ export function ProviderUsageDialog({
       offset: page * PAGE_SIZE,
       provider: selectedId ?? undefined,
       upstream_model: model ?? undefined,
+      ...quotaFilter,
       after: detail.data?.start_at,
       before: detail.data?.end_at,
       ...outcomeQuery(outcome),
@@ -183,7 +204,7 @@ export function ProviderUsageDialog({
     }
     if (status === "400+") query.status_min = 400;
     return query;
-  }, [page, selectedId, model, detail.data?.start_at, detail.data?.end_at, status, outcome]);
+  }, [page, selectedId, model, detail.data?.start_at, detail.data?.end_at, status, outcome, quotaFilter]);
 
   const logs = useQuery<LogPage>({
     queryKey: ["provider-usage-logs", logFilter],
@@ -267,6 +288,7 @@ export function ProviderUsageDialog({
                   onValueChange={(value) => {
                     setSelectedId(value);
                     defaultSelectionMade.current = true;
+                    setQuotaFilter({});
                     setModel(null);
                     setPage(0);
                   }}
@@ -335,6 +357,13 @@ export function ProviderUsageDialog({
               </div>
             </div>
           </DialogHeader>
+          {(buckets.some((bucket) => !["shared_constraint", "window_constraint"].includes(bucket.binding.status)) || quotaFilter.quota_bucket) && <div className="shrink-0 border-b border-slate-200 px-4 py-3 sm:px-6">
+            <QuotaBucketFilters buckets={buckets} value={quotaFilter} isZh={zh} onChange={(next) => {
+              setQuotaFilter(next);
+              setModel(null);
+              setPage(0);
+            }} />
+          </div>}
           <Tabs
             value={tab}
             onValueChange={(value) => setTab(value as Tab)}
@@ -429,6 +458,30 @@ export function ProviderUsageDialog({
       />
     </>
   );
+}
+
+/** Both overview and paginated attempts consume this exact backend attribution selection. */
+export function QuotaBucketFilters({ buckets, value, onChange, isZh = false }: {
+  buckets: QuotaBucket[]; value: QuotaBucketFilter; onChange: (value: QuotaBucketFilter) => void; isZh?: boolean;
+}) {
+  const options: { key: string; label: string; filter: QuotaBucketFilter }[] = [
+    { key: "all", label: isZh ? "全部" : "All", filter: {} as QuotaBucketFilter },
+    ...buckets.filter((bucket) => !["shared_constraint", "window_constraint"].includes(bucket.binding.status)).map((bucket) => ({
+      key: JSON.stringify([bucket.scope_id, bucket.id]), label: bucket.label,
+      filter: { quota_bucket: bucket.id, quota_scope: bucket.scope_id },
+    })),
+    ...(value.quota_bucket && value.quota_bucket !== "unassigned" && !buckets.some((bucket) => bucket.id === value.quota_bucket && bucket.scope_id === value.quota_scope)
+      ? [{ key: "retained-selection", label: isZh ? "历史配额桶" : "Retained bucket", filter: value }] : []),
+    { key: "unassigned", label: isZh ? "未归属" : "Unassigned", filter: { quota_bucket: "unassigned" } },
+  ];
+  return <div role="group" aria-label={isZh ? "按配额桶筛选" : "Filter by quota bucket"} className="flex flex-wrap gap-1.5">
+    {options.map((option) => {
+      const active = value.quota_bucket === option.filter.quota_bucket && value.quota_scope === option.filter.quota_scope;
+      return <button type="button" key={option.key} aria-pressed={active} onClick={() => onChange(option.filter)}
+        className={cn("cursor-pointer rounded-lg border px-3 py-1.5 text-xs font-medium transition-colors focus-visible:ring-2 focus-visible:ring-ring",
+          active ? "border-blue-200 bg-blue-50 text-blue-700" : "border-slate-200 text-slate-500 hover:bg-slate-50")}>{option.label}</button>;
+    })}
+  </div>;
 }
 
 function QueryState({

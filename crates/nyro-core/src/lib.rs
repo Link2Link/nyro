@@ -11,6 +11,7 @@ pub mod plugin;
 pub mod protocol;
 pub mod provider;
 pub mod proxy;
+pub mod quota_buckets;
 pub mod router;
 pub mod storage;
 pub mod update;
@@ -205,6 +206,65 @@ impl Gateway {
         let health_registry = Arc::new(HealthRegistry::new());
         let latency_registry = Arc::new(LatencyRegistry::new());
         let quota_registry = Arc::new(ProviderQuotaRegistry::new());
+        // Restore owner-scoped last-good enforcement before any request can be
+        // served. A process restart is not evidence that exhausted quota reset.
+        let startup_settings: HashMap<String, String> =
+            storage.settings().list_all().await?.into_iter().collect();
+        for (key, value) in &startup_settings {
+            let Some(provider_id) = key.strip_prefix("quota_bucket_fence.") else {
+                continue;
+            };
+            if value.trim().is_empty() || value == "[]" {
+                continue;
+            }
+            let Some(provider) = storage.providers().get(provider_id).await? else {
+                continue;
+            };
+            if !provider::google::antigravity::is_google_antigravity(&provider)
+                && !provider::google::gemini_cli::is_google_gemini_cli(&provider)
+            {
+                continue;
+            }
+            let Some(oauth) = storage.oauth_credentials().get(provider_id).await? else {
+                continue;
+            };
+            let credential = auth::types::StoredCredential {
+                subject_id: oauth.subject_id.clone(),
+                meta: serde_json::from_str(&oauth.meta).unwrap_or(serde_json::Value::Null),
+                ..Default::default()
+            };
+            let legacy_owner = startup_settings.get(&format!("quota_bucket_owner.{provider_id}"));
+            let Some(owner) =
+                quota_buckets::google_quota_owner_id(&credential, legacy_owner.map(String::as_str))
+            else {
+                continue;
+            };
+            let Ok(project) =
+                provider::google::antigravity::code_assist_project_id(Some(&credential))
+            else {
+                continue;
+            };
+            let authority = if provider::google::gemini_cli::is_google_gemini_cli(&provider) {
+                "google_code_assist"
+            } else {
+                "google_antigravity"
+            };
+            let scope =
+                quota_buckets::google_quota_scope_id(provider_id, authority, &owner, &project);
+            match serde_json::from_str::<Vec<quota_buckets::PersistentQuotaBucketFence>>(value) {
+                Ok(fences) => {
+                    let current: Vec<_> = fences
+                        .into_iter()
+                        .filter(|fence| fence.scope_id == scope)
+                        .collect();
+                    quota_registry.restore_bucket_fences(provider_id, &current);
+                }
+                Err(_) => tracing::warn!(
+                    provider_id,
+                    "invalid stored quota fence; scheduling requires refreshed evidence"
+                ),
+            }
+        }
         let mimo_sessions = Arc::new(MimoSessionCache::new());
         let ollama_capability_cache = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
 

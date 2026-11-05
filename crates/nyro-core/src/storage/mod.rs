@@ -3,7 +3,7 @@ pub mod memory;
 pub mod mysql;
 mod oauth;
 pub mod postgres;
-mod provider_usage;
+pub mod provider_usage;
 pub mod sql;
 pub mod sqlite;
 pub mod traits;

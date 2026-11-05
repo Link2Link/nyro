@@ -6,6 +6,22 @@ use chrono::{DateTime, Utc};
 use serde::Serialize;
 use tokio::sync::{Mutex, Notify};
 
+use crate::quota_buckets::QuotaBucket;
+
+/// Captured before network I/O; invalidation/removal fences late responses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BucketRefreshFence(u64);
+
+#[derive(Default)]
+struct ScopedBuckets {
+    generation: u64,
+    scope_id: Option<String>,
+    buckets: Vec<QuotaBucket>,
+    unavailable: bool,
+    /// Generic 429 is a temporary exact-model throttle, never quota recovery.
+    cooldowns: HashMap<String, Instant>,
+}
+
 const NORMAL_REFRESH_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const EXHAUSTED_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 /// Recheck cadence while exhausted included windows are being covered by a
@@ -65,6 +81,7 @@ struct ProviderQuotaState {
 
 pub struct ProviderQuotaRegistry {
     states: RwLock<HashMap<String, ProviderQuotaState>>,
+    scoped: RwLock<HashMap<String, ScopedBuckets>>,
     refresh_locks: StdMutex<HashMap<String, Arc<Mutex<()>>>>,
     refresh_notify: Notify,
 }
@@ -79,9 +96,626 @@ impl ProviderQuotaRegistry {
     pub fn new() -> Self {
         Self {
             states: RwLock::new(HashMap::new()),
+            scoped: RwLock::new(HashMap::new()),
             refresh_locks: StdMutex::new(HashMap::new()),
             refresh_notify: Notify::new(),
         }
+    }
+
+    /// Capture before starting discovery/summary I/O. An invalidation or owner
+    /// replacement makes publication with this fence a no-op.
+    pub fn bucket_refresh_fence(&self, provider_id: &str) -> BucketRefreshFence {
+        let mut scoped = self.scoped.write().unwrap();
+        BucketRefreshFence(scoped.entry(provider_id.to_owned()).or_default().generation)
+    }
+
+    /// Revalidate an attempt's captured owner/mapping generation immediately
+    /// before dispatch. A cold provider still has a generation tombstone.
+    pub fn bucket_fence_is_current(&self, provider_id: &str, fence: &BucketRefreshFence) -> bool {
+        self.scoped
+            .read()
+            .unwrap()
+            .get(provider_id)
+            .is_some_and(|state| state.generation == fence.0)
+    }
+
+    pub fn observe_buckets_fenced(
+        &self,
+        provider_id: &str,
+        buckets: &[QuotaBucket],
+        is_available: Option<bool>,
+        fence: BucketRefreshFence,
+    ) -> (Vec<QuotaBucket>, ProviderScheduling) {
+        self.observe_buckets_inner(provider_id, buckets, is_available, Some(fence), false)
+    }
+
+    pub fn observe_buckets(
+        &self,
+        provider_id: &str,
+        buckets: &[QuotaBucket],
+        is_available: Option<bool>,
+    ) -> (Vec<QuotaBucket>, ProviderScheduling) {
+        self.observe_buckets_inner(provider_id, buckets, is_available, None, false)
+    }
+
+    fn observe_buckets_inner(
+        &self,
+        provider_id: &str,
+        buckets: &[QuotaBucket],
+        is_available: Option<bool>,
+        fence: Option<BucketRefreshFence>,
+        replace_mapping: bool,
+    ) -> (Vec<QuotaBucket>, ProviderScheduling) {
+        let mut scoped = self.scoped.write().unwrap();
+        let state = scoped.entry(provider_id.to_owned()).or_default();
+        if replace_mapping {
+            state
+                .buckets
+                .retain(|bucket| bucket.binding.source != "configured");
+            let refs: Vec<String> = state
+                .buckets
+                .iter()
+                .filter(|bucket| bucket.is_resolved())
+                .flat_map(|bucket| bucket.constraint_ids.iter().cloned())
+                .collect();
+            for bucket in &mut state.buckets {
+                if bucket.binding.status == "window_constraint" && !refs.contains(&bucket.id) {
+                    bucket.binding.status = "unresolved".to_owned();
+                }
+            }
+            state.generation = state.generation.wrapping_add(1);
+        }
+        if fence.is_some_and(|fence| fence.0 != state.generation) {
+            return (effective_buckets(state), self.snapshot(provider_id));
+        }
+        if let Some(scope) = buckets.first().map(|bucket| &bucket.scope_id) {
+            // Mixed owners are not a meaningful observation of this provider.
+            if buckets.iter().any(|bucket| &bucket.scope_id != scope) {
+                return (effective_buckets(state), self.snapshot(provider_id));
+            }
+            if state.scope_id.as_ref() != Some(scope) {
+                if state.scope_id.is_some() {
+                    state.buckets.clear();
+                    state.cooldowns.clear();
+                    state.unavailable = false;
+                }
+                // First discovery also establishes an owner where requests may
+                // have captured an earlier unknown generation.
+                state.generation = state.generation.wrapping_add(1);
+            }
+            state.scope_id = Some(scope.clone());
+        }
+        if let Some(available) = is_available {
+            state.unavailable = !available;
+        }
+        if buckets.iter().any(|bucket| bucket.source != "unknown") {
+            state.buckets.retain(|bucket| bucket.source != "unknown");
+        }
+        // Absence/partial failure is not deletion. Preserve independently timed
+        // last-good constraints and mark them stale before merging successes.
+        for bucket in &mut state.buckets {
+            bucket.stale = true;
+        }
+        for incoming in buckets {
+            let mut incoming = incoming.clone();
+            incoming.models.sort();
+            incoming.models.dedup();
+            // A catalog may discover models but cannot replace an enforced
+            // primary or clear its exhausted fence through a new resource ID.
+            if incoming.source == "catalog" {
+                incoming.models.retain(|model| {
+                    !state
+                        .buckets
+                        .iter()
+                        .any(|old| old.source != "catalog" && old.binds_model(model))
+                        && !buckets
+                            .iter()
+                            .any(|new| new.source != "catalog" && new.binds_model(model))
+                });
+                if incoming.models.is_empty() && incoming.binding.status == "resolved" {
+                    continue;
+                }
+            } else if incoming.is_resolved() {
+                for old in &mut state.buckets {
+                    if old.source == "catalog" {
+                        old.models.retain(|model| !incoming.models.contains(model));
+                    }
+                }
+            }
+            if let Some(old) = state.buckets.iter_mut().find(|old| old.id == incoming.id) {
+                let older = match (
+                    parse_reset_at(&incoming.queried_at),
+                    parse_reset_at(&old.queried_at),
+                ) {
+                    (Some(new), Some(old)) => new < old,
+                    _ => false,
+                };
+                if older || source_rank(&incoming.source) < source_rank(&old.source) {
+                    continue;
+                }
+                // Discovery can succeed partially. Omitting a known member of
+                // this SAME owner/resource is not authoritative retirement.
+                // Explicit configuration replacement has its own atomic path.
+                if incoming.binding.source != "configured" && old.binding.source != "configured" {
+                    for model in &old.models {
+                        if !incoming.models.contains(model) {
+                            incoming.models.push(model.clone());
+                            incoming.stale = true;
+                        }
+                    }
+                    incoming.models.sort();
+                }
+                if old.binding.status == "window_constraint"
+                    && incoming.binding.status == "unresolved"
+                {
+                    incoming.binding = old.binding.clone();
+                    incoming.models = old.models.clone();
+                }
+                // A missing/invalid tier does not prove recovery. Fresh values
+                // for the SAME constraint/window may clear that window only.
+                let mut tiers = old.tiers.clone();
+                if old
+                    .tiers
+                    .iter()
+                    .any(|old| !incoming.tiers.iter().any(|new| new.name == old.name))
+                {
+                    incoming.stale = true;
+                }
+                // A partial refresh cannot detach an older applicable block.
+                for id in &old.constraint_ids {
+                    if !incoming.constraint_ids.contains(id) {
+                        incoming.constraint_ids.push(id.clone());
+                    }
+                }
+                for tier in incoming
+                    .tiers
+                    .iter()
+                    .filter(|tier| tier.used_percent.is_finite())
+                {
+                    if let Some(old) = tiers.iter_mut().find(|old| old.name == tier.name) {
+                        if (incoming.stale || incoming.binding.source == "conflicting_official_v1")
+                            && old.used_percent >= 100.0
+                            && tier.used_percent < 100.0
+                        {
+                            continue;
+                        }
+                        *old = tier.clone();
+                    } else {
+                        tiers.push(tier.clone());
+                    }
+                }
+                incoming.tiers = tiers;
+                *old = incoming;
+            } else {
+                state.buckets.push(incoming);
+            }
+        }
+        state.buckets.retain(|bucket| {
+            bucket.source != "catalog" || !bucket.models.is_empty() || !bucket.is_resolved()
+        });
+        // Conflicting primary bindings are visible as conflicts, not selected
+        // by vector order. A conflict with exhaustion must still fail closed.
+        let mut counts = HashMap::<String, usize>::new();
+        for bucket in state.buckets.iter().filter(|bucket| {
+            bucket.is_primary() && matches!(bucket.binding.status.as_str(), "resolved" | "conflict")
+        }) {
+            for model in &bucket.models {
+                *counts.entry(model.clone()).or_default() += 1;
+            }
+        }
+        for bucket in &mut state.buckets {
+            if bucket.is_primary()
+                && matches!(bucket.binding.status.as_str(), "resolved" | "conflict")
+                && bucket
+                    .models
+                    .iter()
+                    .any(|model| counts.get(model).copied().unwrap_or(0) > 1)
+            {
+                bucket.binding.status = "conflict".to_owned();
+            } else if bucket.binding.status == "conflict"
+                && !bucket.models.is_empty()
+                && bucket.binding.source != "conflicting_official_v1"
+            {
+                bucket.binding.status = "resolved".to_owned();
+            }
+        }
+        let effective = effective_buckets(state);
+        // Generic throttles are not provider-wide quota exhaustion, even if
+        // every currently mapped model happens to be cooling down.
+        let quota_only: Vec<_> = effective
+            .iter()
+            .cloned()
+            .map(|mut bucket| {
+                if bucket.scheduling.reason.as_deref() == Some("model_cooldown") {
+                    bucket.scheduling = schedule_bucket(&bucket, state.unavailable);
+                }
+                bucket
+            })
+            .collect();
+        let summary = bucket_summary(&quota_only, state.unavailable);
+        let fast_recheck = effective.iter().any(|bucket| {
+            bucket.stale || bucket.scheduling.status == ProviderSchedulingStatus::QuotaExhausted
+        });
+        let delay = if fast_recheck {
+            EXHAUSTED_REFRESH_INTERVAL
+        } else {
+            NORMAL_REFRESH_INTERVAL
+        };
+        let mut summary = summary;
+        summary.next_check_at = Some(iso_after(Utc::now(), delay));
+        self.states.write().unwrap().insert(
+            provider_id.to_owned(),
+            ProviderQuotaState {
+                scheduling: summary.clone(),
+                // Alternatives have no additive/provider-wide percentage.
+                tiers: Vec::new(),
+                on_reserve: false,
+                next_check: Instant::now() + delay,
+                consecutive_failures: 0,
+            },
+        );
+        (effective, summary)
+    }
+
+    pub fn persistent_bucket_fences(
+        &self,
+        provider_id: &str,
+    ) -> Vec<crate::quota_buckets::PersistentQuotaBucketFence> {
+        self.bucket_snapshot(provider_id)
+            .into_iter()
+            .filter(|bucket| bucket.source == "enforced_summary")
+            .map(|bucket| crate::quota_buckets::PersistentQuotaBucketFence {
+                id: bucket.id,
+                scope_id: bucket.scope_id,
+                label: bucket.label,
+                models: bucket.models,
+                binding: bucket.binding,
+                tiers: bucket
+                    .tiers
+                    .into_iter()
+                    .map(|tier| crate::quota_buckets::PersistentQuotaTier {
+                        name: tier.name,
+                        used_percent: tier.used_percent,
+                        resets_at: tier.resets_at,
+                    })
+                    .collect(),
+                constraint_ids: bucket.constraint_ids,
+                source: bucket.source,
+                queried_at: bucket.queried_at,
+            })
+            .collect()
+    }
+
+    /// Startup-only restore. Expired reset timestamps do not erase a known
+    /// exhaustion; the first same-owner authoritative refresh proves recovery.
+    pub fn restore_bucket_fences(
+        &self,
+        provider_id: &str,
+        fences: &[crate::quota_buckets::PersistentQuotaBucketFence],
+    ) {
+        let buckets: Vec<_> = fences
+            .iter()
+            .filter(|fence| {
+                fence.source == "enforced_summary"
+                    && !fence.id.is_empty()
+                    && !fence.scope_id.is_empty()
+                    && fence.tiers.iter().all(|tier| tier.used_percent.is_finite())
+            })
+            .map(|fence| QuotaBucket {
+                id: fence.id.clone(),
+                scope_id: fence.scope_id.clone(),
+                label: fence.label.clone(),
+                models: fence.models.clone(),
+                binding: fence.binding.clone(),
+                tiers: fence
+                    .tiers
+                    .iter()
+                    .map(|tier| crate::admin::ProviderUsageTier {
+                        name: tier.name.clone(),
+                        used_percent: tier.used_percent,
+                        resets_at: tier.resets_at.clone(),
+                    })
+                    .collect(),
+                constraint_ids: fence.constraint_ids.clone(),
+                source: fence.source.clone(),
+                queried_at: fence.queried_at.clone(),
+                stale: true,
+                scheduling: ProviderScheduling::default(),
+                api_price: None,
+            })
+            .collect();
+        self.observe_buckets(provider_id, &buckets, None);
+        self.request_refresh(provider_id);
+    }
+
+    /// Discovered resources suitable for validating a replacement operator
+    /// mapping, without feeding old configured aggregates back into itself.
+    pub fn raw_bucket_snapshot(&self, provider_id: &str) -> Vec<QuotaBucket> {
+        let mut buckets = self.bucket_snapshot(provider_id);
+        buckets.retain(|bucket| bucket.binding.source != "configured");
+        let official_refs: Vec<String> = buckets
+            .iter()
+            .filter(|bucket| bucket.is_resolved())
+            .flat_map(|bucket| bucket.constraint_ids.iter().cloned())
+            .collect();
+        for bucket in &mut buckets {
+            if bucket.binding.status == "window_constraint" && !official_refs.contains(&bucket.id) {
+                bucket.binding.status = "unresolved".to_owned();
+            }
+        }
+        buckets
+    }
+
+    /// Replace mapping only, not owner evidence or temporary rejection fences.
+    pub fn replace_bucket_mapping(
+        &self,
+        provider_id: &str,
+        configured: &[QuotaBucket],
+    ) -> (Vec<QuotaBucket>, ProviderScheduling) {
+        self.observe_buckets_inner(provider_id, configured, None, None, true)
+    }
+
+    pub fn bucket_snapshot(&self, provider_id: &str) -> Vec<QuotaBucket> {
+        self.scoped
+            .read()
+            .unwrap()
+            .get(provider_id)
+            .map(effective_buckets)
+            .unwrap_or_default()
+    }
+
+    /// Unique exact primary binding only. Shared constraints are folded into
+    /// effective scheduling, never appended as duplicate display windows.
+    pub fn model_snapshot(&self, provider_id: &str, model: &str) -> Option<QuotaBucket> {
+        let buckets = self.bucket_snapshot(provider_id);
+        let mut matches = buckets
+            .into_iter()
+            .filter(|bucket| bucket.binds_model(model));
+        let first = matches.next()?;
+        matches.next().is_none().then_some(first)
+    }
+
+    pub fn is_model_schedulable(&self, provider_id: &str, model: &str) -> bool {
+        let scoped = self.scoped.read().unwrap();
+        let Some(state) = scoped.get(provider_id) else {
+            return self.is_schedulable(provider_id);
+        };
+        if state.unavailable
+            || state
+                .cooldowns
+                .get(model)
+                .is_some_and(|until| *until > Instant::now())
+        {
+            return false;
+        }
+        if state.buckets.is_empty() {
+            return self.is_schedulable(provider_id);
+        }
+        let buckets = effective_buckets(state);
+        if buckets.iter().any(|bucket| {
+            bucket.is_global_constraint()
+                && bucket.scheduling.status == ProviderSchedulingStatus::QuotaExhausted
+        }) {
+            return false;
+        }
+        let matches: Vec<_> = buckets
+            .iter()
+            .filter(|bucket| bucket.is_primary() && bucket.models.iter().any(|id| id == model))
+            .collect();
+        // Unknown exact bindings remain controlled probes; a known blocked
+        // conflicting binding must not be bypassed as "unknown".
+        !matches
+            .iter()
+            .any(|bucket| bucket.scheduling.status == ProviderSchedulingStatus::QuotaExhausted)
+    }
+
+    pub fn model_scheduling(&self, provider_id: &str, model: &str) -> ProviderScheduling {
+        let scoped = self.scoped.read().unwrap();
+        let Some(state) = scoped.get(provider_id) else {
+            return self.snapshot(provider_id);
+        };
+        if state.unavailable {
+            return ProviderScheduling {
+                status: ProviderSchedulingStatus::QuotaExhausted,
+                reason: Some("account_unavailable".to_owned()),
+                ..Default::default()
+            };
+        }
+        if let Some(until) = state
+            .cooldowns
+            .get(model)
+            .filter(|until| **until > Instant::now())
+        {
+            return ProviderScheduling {
+                status: ProviderSchedulingStatus::QuotaExhausted,
+                reason: Some("model_cooldown".to_owned()),
+                next_check_at: Some(iso_after(
+                    Utc::now(),
+                    until.saturating_duration_since(Instant::now()),
+                )),
+                ..Default::default()
+            };
+        }
+        if state.buckets.is_empty() {
+            return self.snapshot(provider_id);
+        }
+        let effective = effective_buckets(state);
+        if let Some(global) = effective.iter().find(|bucket| {
+            bucket.is_global_constraint()
+                && bucket.scheduling.status == ProviderSchedulingStatus::QuotaExhausted
+        }) {
+            let mut scheduling = global.scheduling.clone();
+            scheduling.reason = Some("shared_constraint".to_owned());
+            return scheduling;
+        }
+        if let Some(blocked) = effective.iter().find(|bucket| {
+            bucket.is_primary()
+                && bucket.models.iter().any(|id| id == model)
+                && bucket.scheduling.status == ProviderSchedulingStatus::QuotaExhausted
+        }) {
+            return blocked.scheduling.clone();
+        }
+        let matches: Vec<_> = effective
+            .iter()
+            .filter(|bucket| bucket.binds_model(model))
+            .collect();
+        if matches.len() == 1 {
+            return matches[0].scheduling.clone();
+        }
+        ProviderScheduling {
+            reason: Some(
+                if effective
+                    .iter()
+                    .any(|bucket| bucket.models.iter().any(|id| id == model))
+                {
+                    "conflicting_binding"
+                } else {
+                    "unknown_mapping"
+                }
+                .to_owned(),
+            ),
+            ..Default::default()
+        }
+    }
+
+    pub fn model_tiers(&self, provider_id: &str, model: &str) -> Vec<QuotaTierObservation> {
+        if let Some(bucket) = self.model_snapshot(provider_id, model) {
+            let mut tiers: Vec<_> = bucket
+                .tiers
+                .iter()
+                .map(|tier| QuotaTierObservation {
+                    name: tier.name.clone(),
+                    used_percent: tier.used_percent,
+                    resets_at: tier.resets_at.clone(),
+                })
+                .collect();
+            // Shared scoring windows cap, not add capacity. Keep the tightest
+            // same-name constraint only in this internal scoring projection.
+            for shared in self
+                .bucket_snapshot(provider_id)
+                .iter()
+                .filter(|shared| bucket.constraint_ids.contains(&shared.id))
+            {
+                for tier in &shared.tiers {
+                    if let Some(old) = tiers.iter_mut().find(|old| old.name == tier.name) {
+                        if tier.used_percent > old.used_percent {
+                            old.used_percent = tier.used_percent;
+                            old.resets_at = tier.resets_at.clone();
+                        }
+                    } else {
+                        tiers.push(QuotaTierObservation {
+                            name: tier.name.clone(),
+                            used_percent: tier.used_percent,
+                            resets_at: tier.resets_at.clone(),
+                        });
+                    }
+                }
+            }
+            return tiers;
+        }
+        self.tier_snapshot(provider_id)
+    }
+
+    /// Trusted adapter-only feedback for an already-known opaque enforced
+    /// resource. No vendor error text guessing is performed here. Persist via
+    /// persistent_bucket_fences after a successful mutation. Bumping generation
+    /// prevents any refresh started before this rejection from clearing it.
+    pub fn record_constraint_rejection_fenced(
+        &self,
+        provider_id: &str,
+        constraint_id: &str,
+        fence: &BucketRefreshFence,
+    ) -> Option<ProviderScheduling> {
+        let mut scoped = self.scoped.write().unwrap();
+        let state = scoped.get_mut(provider_id)?;
+        if state.generation != fence.0 {
+            return None;
+        }
+        let constraint = state.buckets.iter_mut().find(|bucket| {
+            bucket.id == constraint_id
+                && bucket.source == "enforced_summary"
+                && matches!(
+                    bucket.binding.status.as_str(),
+                    "window_constraint" | "shared_constraint"
+                )
+                && !bucket.tiers.is_empty()
+        })?;
+        for tier in &mut constraint.tiers {
+            tier.used_percent = 100.0;
+        }
+        constraint.queried_at = Utc::now().to_rfc3339();
+        constraint.stale = false;
+        state.generation = state.generation.wrapping_add(1);
+        let effective = effective_buckets(state);
+        let mut summary = bucket_summary(&effective, state.unavailable);
+        summary.next_check_at = Some(Utc::now().to_rfc3339());
+        self.states.write().unwrap().insert(
+            provider_id.to_owned(),
+            ProviderQuotaState {
+                scheduling: summary.clone(),
+                tiers: Vec::new(),
+                on_reserve: false,
+                next_check: Instant::now(),
+                consecutive_failures: 0,
+            },
+        );
+        drop(scoped);
+        self.refresh_notify.notify_one();
+        Some(summary)
+    }
+
+    /// Unknown 429s are narrow, bounded throttles. Refreshes cannot clear an
+    /// unexpired cooldown, and a cooldown never exhausts sibling buckets.
+    pub fn record_model_rejection(
+        &self,
+        provider_id: &str,
+        model: &str,
+        retry_after_secs: Option<u64>,
+    ) -> ProviderScheduling {
+        self.record_model_rejection_inner(provider_id, model, retry_after_secs, None)
+            .expect("unfenced rejection is always current")
+    }
+
+    /// Late responses from a replaced owner/mapping must not cool down its
+    /// successor. Validation and mutation share one lock; None means discarded.
+    pub fn record_model_rejection_fenced(
+        &self,
+        provider_id: &str,
+        model: &str,
+        retry_after_secs: Option<u64>,
+        fence: &BucketRefreshFence,
+    ) -> Option<ProviderScheduling> {
+        self.record_model_rejection_inner(provider_id, model, retry_after_secs, Some(fence))
+    }
+
+    fn record_model_rejection_inner(
+        &self,
+        provider_id: &str,
+        model: &str,
+        retry_after_secs: Option<u64>,
+        fence: Option<&BucketRefreshFence>,
+    ) -> Option<ProviderScheduling> {
+        let delay = Duration::from_secs(retry_after_secs.unwrap_or(30).clamp(1, 300));
+        let mut scoped = self.scoped.write().unwrap();
+        let state = scoped.entry(provider_id.to_owned()).or_default();
+        if fence.is_some_and(|fence| fence.0 != state.generation) {
+            return None;
+        }
+        let until = Instant::now() + delay;
+        state
+            .cooldowns
+            .entry(model.to_owned())
+            .and_modify(|old| *old = (*old).max(until))
+            .or_insert(until);
+        drop(scoped);
+        self.request_refresh(provider_id);
+        Some(ProviderScheduling {
+            status: ProviderSchedulingStatus::QuotaExhausted,
+            reason: Some("model_cooldown".to_owned()),
+            blocking_tiers: Vec::new(),
+            reset_at: None,
+            next_check_at: Some(iso_after(Utc::now(), delay)),
+        })
     }
 
     pub fn is_schedulable(&self, provider_id: &str) -> bool {
@@ -281,6 +915,11 @@ impl ProviderQuotaRegistry {
     }
 
     pub fn record_query_failure(&self, provider_id: &str) -> ProviderScheduling {
+        if let Some(scoped) = self.scoped.write().unwrap().get_mut(provider_id) {
+            for bucket in &mut scoped.buckets {
+                bucket.stale = true;
+            }
+        }
         let mut states = self.states.write().unwrap();
         let state = states
             .entry(provider_id.to_string())
@@ -336,11 +975,25 @@ impl ProviderQuotaRegistry {
     }
 
     pub fn invalidate(&self, provider_id: &str) {
+        self.reset_bucket_scope(provider_id);
         self.states.write().unwrap().remove(provider_id);
         self.request_refresh(provider_id);
     }
 
+    fn reset_bucket_scope(&self, provider_id: &str) {
+        let mut scoped = self.scoped.write().unwrap();
+        let state = scoped.entry(provider_id.to_owned()).or_default();
+        let generation = state.generation.wrapping_add(1);
+        *state = ScopedBuckets {
+            generation,
+            ..Default::default()
+        };
+    }
+
     pub fn remove(&self, provider_id: &str) {
+        // Keep a generation tombstone so old in-flight results cannot resurrect
+        // removed owner observations, even if the provider ID is later reused.
+        self.reset_bucket_scope(provider_id);
         self.states.write().unwrap().remove(provider_id);
         self.refresh_locks.lock().unwrap().remove(provider_id);
     }
@@ -359,6 +1012,178 @@ impl ProviderQuotaRegistry {
     }
 }
 
+fn source_rank(source: &str) -> u8 {
+    match source {
+        "enforced_summary" | "configured" | "forwarded_route" => 2,
+        "catalog" => 1,
+        _ => 0,
+    }
+}
+
+fn schedule_bucket(bucket: &QuotaBucket, unavailable: bool) -> ProviderScheduling {
+    let blocking: Vec<_> = bucket
+        .tiers
+        .iter()
+        .filter(|tier| tier.used_percent >= 100.0)
+        .collect();
+    // Forwarded buckets already include account/global admission evidence.
+    let upstream_block = bucket.source == "forwarded_route"
+        && bucket.scheduling.status == ProviderSchedulingStatus::QuotaExhausted;
+    let source_conflict = bucket.binding.source == "conflicting_official_v1";
+    let exhausted = unavailable || !blocking.is_empty() || upstream_block || source_conflict;
+    ProviderScheduling {
+        status: if exhausted {
+            ProviderSchedulingStatus::QuotaExhausted
+        } else {
+            ProviderSchedulingStatus::Eligible
+        },
+        reason: if unavailable {
+            Some("account_unavailable".to_owned())
+        } else if upstream_block {
+            bucket.scheduling.reason.clone()
+        } else if source_conflict {
+            Some("conflicting_binding".to_owned())
+        } else if exhausted {
+            Some("usage_limit".to_owned())
+        } else if bucket.source == "catalog" {
+            Some("unknown_mapping".to_owned())
+        } else if bucket.stale {
+            Some("stale_observation".to_owned())
+        } else if !bucket.is_resolved() {
+            Some("unresolved_binding".to_owned())
+        } else {
+            None
+        },
+        blocking_tiers: if upstream_block {
+            bucket.scheduling.blocking_tiers.clone()
+        } else {
+            blocking.iter().map(|tier| tier.name.clone()).collect()
+        },
+        reset_at: blocking
+            .iter()
+            .map(|tier| tier.resets_at.as_deref().and_then(parse_reset_at))
+            .collect::<Option<Vec<_>>>()
+            .and_then(|resets| resets.into_iter().max())
+            .map(|reset| reset.to_rfc3339()),
+        next_check_at: None,
+    }
+}
+
+fn effective_buckets(state: &ScopedBuckets) -> Vec<QuotaBucket> {
+    let mut buckets = state.buckets.clone();
+    let globals: Vec<_> = buckets
+        .iter()
+        .filter(|bucket| bucket.is_global_constraint())
+        .map(|bucket| bucket.id.clone())
+        .collect();
+    for bucket in buckets.iter_mut().filter(|bucket| bucket.is_primary()) {
+        for id in &globals {
+            if !bucket.constraint_ids.contains(id) {
+                bucket.constraint_ids.push(id.clone());
+            }
+        }
+    }
+    // A discovery outage may still refresh identified enforced resources.
+    // Recompose retained mappings from their exact window resource refs, never
+    // from matching labels or percentages. Global refs are admission-only.
+    for bucket in &mut buckets {
+        if bucket.is_primary() {
+            let ids = bucket.constraint_ids.clone();
+            for resource in state.buckets.iter().filter(|resource| {
+                ids.contains(&resource.id) && resource.binding.status != "shared_constraint"
+            }) {
+                for tier in &resource.tiers {
+                    if let Some(old) = bucket.tiers.iter_mut().find(|old| old.name == tier.name) {
+                        *old = tier.clone();
+                    }
+                }
+            }
+        }
+        bucket.scheduling = schedule_bucket(bucket, state.unavailable);
+    }
+    let shared = buckets.clone();
+    for bucket in &mut buckets {
+        let ids = bucket.constraint_ids.clone();
+        for constraint in shared
+            .iter()
+            .filter(|constraint| ids.contains(&constraint.id))
+        {
+            if constraint.binding.status == "window_constraint"
+                && bucket.binding.status == "window_constraint"
+            {
+                continue;
+            }
+            if constraint.scheduling.status == ProviderSchedulingStatus::QuotaExhausted {
+                bucket.scheduling.status = ProviderSchedulingStatus::QuotaExhausted;
+                bucket.scheduling.reason = Some("shared_constraint".to_owned());
+                for name in &constraint.scheduling.blocking_tiers {
+                    if !bucket.scheduling.blocking_tiers.contains(name) {
+                        bucket.scheduling.blocking_tiers.push(name.clone());
+                    }
+                }
+                bucket.scheduling.reset_at = None;
+            }
+        }
+        if bucket.scheduling.status == ProviderSchedulingStatus::Eligible
+            && !bucket.models.is_empty()
+            && bucket.models.iter().all(|model| {
+                state
+                    .cooldowns
+                    .get(model)
+                    .is_some_and(|until| *until > Instant::now())
+            })
+        {
+            bucket.scheduling.status = ProviderSchedulingStatus::QuotaExhausted;
+            bucket.scheduling.reason = Some("model_cooldown".to_owned());
+        }
+    }
+    buckets
+}
+
+fn bucket_summary(buckets: &[QuotaBucket], unavailable: bool) -> ProviderScheduling {
+    let primary: Vec<_> = buckets
+        .iter()
+        .filter(|bucket| bucket.is_primary())
+        .collect();
+    let unknown = primary.iter().any(|bucket| !bucket.is_resolved());
+    let all_blocked = !primary.is_empty()
+        && !unknown
+        && primary
+            .iter()
+            .all(|bucket| bucket.scheduling.status == ProviderSchedulingStatus::QuotaExhausted);
+    let any_blocked = primary
+        .iter()
+        .any(|bucket| bucket.scheduling.status == ProviderSchedulingStatus::QuotaExhausted);
+    ProviderScheduling {
+        status: if unavailable || all_blocked {
+            ProviderSchedulingStatus::QuotaExhausted
+        } else {
+            ProviderSchedulingStatus::Eligible
+        },
+        reason: if unavailable {
+            Some("account_unavailable".to_owned())
+        } else if all_blocked {
+            Some("usage_limit".to_owned())
+        } else if any_blocked {
+            Some("partially_available".to_owned())
+        } else if unknown || primary.is_empty() {
+            Some("unknown_mapping".to_owned())
+        } else {
+            None
+        },
+        blocking_tiers: if all_blocked {
+            primary
+                .iter()
+                .flat_map(|bucket| bucket.scheduling.blocking_tiers.iter().cloned())
+                .collect()
+        } else {
+            Vec::new()
+        },
+        reset_at: None,
+        next_check_at: None,
+    }
+}
+
 fn parse_reset_at(value: &str) -> Option<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(value)
         .ok()
@@ -374,6 +1199,388 @@ fn iso_after(now: DateTime<Utc>, delay: Duration) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn bucket(id: &str, model: &str, five_hour: f64, weekly: f64) -> QuotaBucket {
+        QuotaBucket {
+            id: id.to_owned(),
+            scope_id: "owner".to_owned(),
+            label: model.to_owned(),
+            models: vec![model.to_owned()],
+            binding: crate::quota_buckets::QuotaBucketBinding {
+                status: "resolved".to_owned(),
+                source: "official".to_owned(),
+                revision: 1,
+            },
+            tiers: vec![
+                crate::admin::ProviderUsageTier {
+                    name: "five_hour".to_owned(),
+                    used_percent: five_hour,
+                    resets_at: None,
+                },
+                crate::admin::ProviderUsageTier {
+                    name: "weekly_limit".to_owned(),
+                    used_percent: weekly,
+                    resets_at: None,
+                },
+            ],
+            constraint_ids: Vec::new(),
+            source: "enforced_summary".to_owned(),
+            queried_at: "2030-01-01T00:00:00Z".to_owned(),
+            stale: false,
+            scheduling: ProviderScheduling::default(),
+            api_price: None,
+        }
+    }
+
+    #[test]
+    fn scoped_windows_are_and_sibling_buckets_are_independent() {
+        let registry = ProviderQuotaRegistry::new();
+        let (buckets, summary) = registry.observe_buckets(
+            "p",
+            &[
+                bucket("flash", "gemini-3.8-flash", 100.0, 20.0),
+                bucket("argon", "gemini-4-argon", 5.0, 30.0),
+            ],
+            Some(true),
+        );
+        assert_eq!(buckets.len(), 2);
+        assert!(!registry.is_model_schedulable("p", "gemini-3.8-flash"));
+        assert!(registry.is_model_schedulable("p", "gemini-4-argon"));
+        assert_eq!(summary.reason.as_deref(), Some("partially_available"));
+        assert!(registry.is_schedulable("p"));
+        registry.observe_buckets("p", &[bucket("argon", "gemini-4-argon", 5.0, 100.0)], None);
+        assert!(!registry.is_model_schedulable("p", "gemini-4-argon"));
+        assert!(!registry.is_schedulable("p"));
+    }
+
+    #[test]
+    fn shared_global_blocks_every_bound_bucket_without_duplicate_display_tiers() {
+        let registry = ProviderQuotaRegistry::new();
+        let mut flash = bucket("flash", "flash", 10.0, 20.0);
+        let mut argon = bucket("argon", "argon", 10.0, 20.0);
+        let mut global = bucket("global", "", 100.0, 0.0);
+        global.binding.status = "shared_constraint".to_owned();
+        global.models.clear();
+        flash.constraint_ids.push(global.id.clone());
+        argon.constraint_ids.push(global.id.clone());
+        registry.observe_buckets("p", &[flash, argon, global], None);
+        assert!(!registry.is_model_schedulable("p", "flash"));
+        assert!(!registry.is_model_schedulable("p", "argon"));
+        assert_eq!(
+            registry.model_snapshot("p", "flash").unwrap().tiers.len(),
+            2
+        );
+        assert_eq!(
+            registry.model_scheduling("p", "argon").reason.as_deref(),
+            Some("shared_constraint")
+        );
+    }
+
+    #[test]
+    fn shared_constraint_only_gates_explicitly_referenced_models() {
+        let registry = ProviderQuotaRegistry::new();
+        let mut flash = bucket("flash", "flash", 10.0, 20.0);
+        let argon = bucket("argon", "argon", 10.0, 20.0);
+        let mut shared = bucket("shared", "", 100.0, 0.0);
+        shared.binding.status = "shared_constraint".to_owned();
+        shared.models.clear();
+        flash.constraint_ids.push(shared.id.clone());
+        registry.observe_buckets("p", &[flash, argon, shared], None);
+        assert!(!registry.is_model_schedulable("p", "flash"));
+        assert!(registry.is_model_schedulable("p", "argon"));
+        assert!(registry.is_model_schedulable("p", "unknown-model"));
+        assert_eq!(
+            registry.model_scheduling("p", "flash").reason.as_deref(),
+            Some("shared_constraint")
+        );
+        assert_eq!(
+            registry.model_scheduling("p", "argon").status,
+            ProviderSchedulingStatus::Eligible
+        );
+    }
+
+    #[test]
+    fn catalog_and_partial_refresh_cannot_clear_enforced_exhaustion() {
+        let registry = ProviderQuotaRegistry::new();
+        registry.observe_buckets(
+            "p",
+            &[
+                bucket("flash", "flash", 100.0, 20.0),
+                bucket("argon", "argon", 10.0, 20.0),
+            ],
+            None,
+        );
+        let mut catalog = bucket("catalog-flash", "flash", 0.0, 0.0);
+        catalog.source = "catalog".to_owned();
+        registry.observe_buckets("p", &[catalog, bucket("argon", "argon", 20.0, 30.0)], None);
+        assert!(!registry.is_model_schedulable("p", "flash"));
+        assert!(registry.model_snapshot("p", "flash").unwrap().stale);
+        assert!(registry.is_model_schedulable("p", "argon"));
+        let mut partial = bucket("flash", "flash", 0.0, 10.0);
+        partial.tiers.retain(|tier| tier.name == "weekly_limit");
+        registry.observe_buckets("p", &[partial], None);
+        assert!(!registry.is_model_schedulable("p", "flash"));
+        registry.observe_buckets("p", &[bucket("flash", "flash", 10.0, 10.0)], None);
+        assert!(registry.is_model_schedulable("p", "flash"));
+    }
+
+    #[test]
+    fn unknown_mapping_does_not_hide_known_block_or_exhaust_provider() {
+        let registry = ProviderQuotaRegistry::new();
+        let mut unknown = bucket("unknown", "", 100.0, 100.0);
+        unknown.models.clear();
+        unknown.binding.status = "unresolved".to_owned();
+        registry.observe_buckets("p", &[bucket("flash", "flash", 100.0, 20.0), unknown], None);
+        assert!(!registry.is_model_schedulable("p", "flash"));
+        assert!(registry.is_model_schedulable("p", "new-model"));
+        assert!(registry.is_schedulable("p"));
+    }
+
+    #[test]
+    fn model_rejection_is_narrow_temporary_and_survives_refresh() {
+        let registry = ProviderQuotaRegistry::new();
+        registry.observe_buckets(
+            "p",
+            &[
+                bucket("flash", "flash", 1.0, 2.0),
+                bucket("argon", "argon", 1.0, 2.0),
+            ],
+            None,
+        );
+        registry.record_model_rejection("p", "flash", Some(30));
+        registry.observe_buckets("p", &[bucket("flash", "flash", 0.0, 0.0)], None);
+        assert!(!registry.is_model_schedulable("p", "flash"));
+        assert!(registry.is_model_schedulable("p", "argon"));
+        assert!(registry.is_schedulable("p"));
+        registry
+            .scoped
+            .write()
+            .unwrap()
+            .get_mut("p")
+            .unwrap()
+            .cooldowns
+            .insert("flash".to_owned(), Instant::now() - Duration::from_secs(1));
+        assert!(registry.is_model_schedulable("p", "flash"));
+    }
+
+    #[test]
+    fn invalidate_and_owner_generation_fence_late_refreshes() {
+        let registry = ProviderQuotaRegistry::new();
+        let old = registry.bucket_refresh_fence("p");
+        registry.invalidate("p");
+        registry.observe_buckets_fenced("p", &[bucket("old", "flash", 100.0, 20.0)], None, old);
+        assert!(registry.bucket_snapshot("p").is_empty());
+        let old = registry.bucket_refresh_fence("p");
+        registry.observe_buckets("p", &[bucket("first", "flash", 100.0, 20.0)], None);
+        let mut new_owner = bucket("new", "argon", 5.0, 10.0);
+        new_owner.scope_id = "different-owner".to_owned();
+        registry.observe_buckets("p", &[new_owner], None);
+        registry.observe_buckets_fenced("p", &[bucket("old", "flash", 100.0, 20.0)], None, old);
+        assert!(registry.model_snapshot("p", "flash").is_none());
+        assert!(registry.model_snapshot("p", "argon").is_some());
+    }
+
+    #[test]
+    fn partial_member_discovery_preserves_same_resource_exhausted_binding() {
+        let registry = ProviderQuotaRegistry::new();
+        let mut first = bucket("group-g", "flash-low", 100.0, 20.0);
+        first.models.push("flash-high".to_owned());
+        registry.observe_buckets("p", &[first], None);
+        let partial = bucket("group-g", "flash-low", 100.0, 20.0);
+        registry.observe_buckets("p", &[partial], None);
+        assert!(!registry.is_model_schedulable("p", "flash-high"));
+        assert!(registry.model_snapshot("p", "flash-high").is_some());
+        assert!(registry.model_snapshot("p", "flash-high").unwrap().stale);
+    }
+
+    #[test]
+    fn trusted_constraint_rejection_fences_old_refresh_and_only_known_scope() {
+        let registry = ProviderQuotaRegistry::new();
+        let mut flash = bucket("flash", "flash", 10.0, 20.0);
+        flash.constraint_ids = vec!["flash-five".to_owned(), "flash-week".to_owned()];
+        let mut five = bucket("flash-five", "", 10.0, 20.0);
+        five.binding.status = "window_constraint".to_owned();
+        five.models.clear();
+        five.tiers.retain(|tier| tier.name == "five_hour");
+        let mut week = bucket("flash-week", "", 10.0, 20.0);
+        week.binding.status = "window_constraint".to_owned();
+        week.models.clear();
+        week.tiers.retain(|tier| tier.name == "weekly_limit");
+        registry.observe_buckets(
+            "p",
+            &[flash, five, week, bucket("argon", "argon", 10.0, 20.0)],
+            None,
+        );
+        let fence = registry.bucket_refresh_fence("p");
+        assert!(
+            registry
+                .record_constraint_rejection_fenced("p", "unknown-raw-id", &fence)
+                .is_none()
+        );
+        assert!(
+            registry
+                .record_constraint_rejection_fenced("p", "flash", &fence)
+                .is_none()
+        );
+        assert!(registry.is_model_schedulable("p", "flash"));
+        assert!(
+            registry
+                .record_constraint_rejection_fenced("p", "flash-five", &fence)
+                .is_some()
+        );
+        let snapshot = registry.model_snapshot("p", "flash").unwrap();
+        assert_eq!(
+            snapshot
+                .tiers
+                .iter()
+                .find(|tier| tier.name == "five_hour")
+                .unwrap()
+                .used_percent,
+            100.0
+        );
+        assert_eq!(
+            snapshot
+                .tiers
+                .iter()
+                .find(|tier| tier.name == "weekly_limit")
+                .unwrap()
+                .used_percent,
+            20.0
+        );
+        assert!(!registry.is_model_schedulable("p", "flash"));
+        assert!(registry.is_model_schedulable("p", "argon"));
+        registry.observe_buckets_fenced("p", &[bucket("flash", "flash", 0.0, 0.0)], None, fence);
+        assert!(!registry.is_model_schedulable("p", "flash"));
+    }
+
+    #[test]
+    fn captured_attempt_fence_rejects_late_owner_feedback() {
+        let registry = ProviderQuotaRegistry::new();
+        registry.observe_buckets("p", &[bucket("a", "flash", 10.0, 20.0)], None);
+        let owner_a = registry.bucket_refresh_fence("p");
+        assert!(registry.bucket_fence_is_current("p", &owner_a));
+        registry.invalidate("p");
+        let mut replacement = bucket("b", "flash", 5.0, 10.0);
+        replacement.scope_id = "owner-b".to_owned();
+        registry.observe_buckets("p", &[replacement], None);
+        assert!(!registry.bucket_fence_is_current("p", &owner_a));
+        assert!(
+            registry
+                .record_model_rejection_fenced("p", "flash", Some(30), &owner_a)
+                .is_none()
+        );
+        assert!(registry.is_model_schedulable("p", "flash"));
+        let owner_b = registry.bucket_refresh_fence("p");
+        assert!(
+            registry
+                .record_model_rejection_fenced("p", "flash", Some(30), &owner_b)
+                .is_some()
+        );
+        assert!(!registry.is_model_schedulable("p", "flash"));
+    }
+
+    #[test]
+    fn cold_attempt_fence_is_invalid_after_first_owner_discovery() {
+        let registry = ProviderQuotaRegistry::new();
+        let unknown = registry.bucket_refresh_fence("p");
+        assert!(registry.bucket_fence_is_current("p", &unknown));
+        registry.observe_buckets("p", &[bucket("first", "flash", 10.0, 20.0)], None);
+        assert!(!registry.bucket_fence_is_current("p", &unknown));
+        assert!(
+            registry
+                .record_model_rejection_fenced("p", "flash", Some(30), &unknown)
+                .is_none()
+        );
+        assert!(registry.is_model_schedulable("p", "flash"));
+    }
+
+    #[test]
+    fn mapping_generation_and_removal_fence_existing_attempts() {
+        let registry = ProviderQuotaRegistry::new();
+        registry.observe_buckets("p", &[bucket("first", "flash", 10.0, 20.0)], None);
+        let before_mapping = registry.bucket_refresh_fence("p");
+        registry.replace_bucket_mapping("p", &registry.raw_bucket_snapshot("p"));
+        assert!(!registry.bucket_fence_is_current("p", &before_mapping));
+        let before_remove = registry.bucket_refresh_fence("p");
+        registry.remove("p");
+        assert!(!registry.bucket_fence_is_current("p", &before_remove));
+        assert!(
+            registry
+                .record_model_rejection_fenced("p", "flash", None, &before_remove)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn persisted_enforcement_survives_restart_and_expired_reset() {
+        let before = ProviderQuotaRegistry::new();
+        let mut flash = bucket("flash", "flash", 100.0, 20.0);
+        flash.tiers[0].resets_at = Some("2020-01-01T00:00:00Z".to_owned());
+        before.observe_buckets("p", &[flash], None);
+        let serialized = serde_json::to_string(&before.persistent_bucket_fences("p")).unwrap();
+        let fences: Vec<crate::quota_buckets::PersistentQuotaBucketFence> =
+            serde_json::from_str(&serialized).unwrap();
+        let after = ProviderQuotaRegistry::new();
+        after.restore_bucket_fences("p", &fences);
+        assert!(!after.is_model_schedulable("p", "flash"));
+        assert!(after.bucket_snapshot("p")[0].stale);
+        assert!(after.is_due("p"));
+        after.observe_buckets("p", &[bucket("flash", "flash", 10.0, 20.0)], None);
+        assert!(after.is_model_schedulable("p", "flash"));
+    }
+
+    #[test]
+    fn global_evidence_gates_unknown_model_without_guessing_membership() {
+        let registry = ProviderQuotaRegistry::new();
+        let mut global = bucket("global", "", 100.0, 0.0);
+        global.binding.status = "shared_constraint".to_owned();
+        global.models.clear();
+        global.binding.source = "official_all_models_v1".to_owned();
+        registry.observe_buckets("p", &[global], None);
+        assert!(!registry.is_model_schedulable("p", "new-model"));
+        assert_eq!(
+            registry
+                .model_scheduling("p", "new-model")
+                .reason
+                .as_deref(),
+            Some("shared_constraint")
+        );
+    }
+
+    #[test]
+    fn forwarded_route_keeps_authoritative_gate_without_fake_quota_tiers() {
+        let registry = ProviderQuotaRegistry::new();
+        let mut flash = bucket("remote-flash", "remote-route-flash", 0.0, 0.0);
+        flash.source = "forwarded_route".to_owned();
+        flash.tiers.clear();
+        flash.scheduling.status = ProviderSchedulingStatus::QuotaExhausted;
+        flash.scheduling.reason = Some("usage_limit".to_owned());
+        registry.observe_buckets("relay", &[flash], None);
+        assert!(!registry.is_model_schedulable("relay", "remote-route-flash"));
+        let mut recovered = bucket("remote-flash", "remote-route-flash", 0.0, 0.0);
+        recovered.source = "forwarded_route".to_owned();
+        recovered.tiers.clear();
+        registry.observe_buckets("relay", &[recovered], None);
+        assert!(registry.is_model_schedulable("relay", "remote-route-flash"));
+    }
+
+    #[test]
+    fn stale_summary_cannot_claim_authoritative_recovery() {
+        let registry = ProviderQuotaRegistry::new();
+        registry.observe_buckets("p", &[bucket("flash", "flash", 100.0, 20.0)], None);
+        let mut stale = bucket("flash", "flash", 10.0, 10.0);
+        stale.stale = true;
+        registry.observe_buckets("p", &[stale], None);
+        assert!(!registry.is_model_schedulable("p", "flash"));
+    }
+
+    #[test]
+    fn model_methods_fall_back_to_unchanged_legacy_provider_state() {
+        let registry = ProviderQuotaRegistry::new();
+        registry.observe("legacy", &[tier("five_hour", 100.0, None)], None);
+        assert!(!registry.is_model_schedulable("legacy", "anything"));
+        assert_eq!(registry.model_tiers("legacy", "anything").len(), 1);
+    }
 
     fn tier(name: &str, used_percent: f64, resets_at: Option<&str>) -> QuotaTierObservation {
         QuotaTierObservation {

@@ -4,7 +4,7 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { LocaleProvider } from "../lib/i18n";
 import type { Provider, ProviderApiPriceStats, ProviderUsage } from "../lib/types";
-import { ProviderUsageFooter } from "./provider-usage";
+import { GroupUsageSummary, ProviderUsageFooter } from "./provider-usage";
 
 const now = Date.parse("2030-01-01T00:00:00Z");
 const provider: Provider = {
@@ -332,6 +332,30 @@ test("cached usage retains visible refresh failures, stale state and quota pause
   match(html, /Stale/);
   match(html, /aria-valuenow="100"/);
   doesNotMatch(html, /<details|<summary/);
+});
+
+test("structured buckets replace parent bars and prices while empty buckets retain legacy cards", () => {
+  const currentProvider = googleProviders[0];
+  const original = googleUsage(currentProvider);
+  const bucket = { id: "flash", scope_id: "scope", label: "Gemini Flash", models: ["gemini-3.8-flash"],
+    binding: { status: "resolved", source: "configured", revision: 1 }, tiers: original.tiers, constraint_ids: [],
+    source: "enforced_summary", queried_at: original.queried_at, stale: false,
+    scheduling: { status: "eligible" as const, blocking_tiers: [] }, api_price: apiPrice };
+  const html = render({ ...original, quota_buckets: [bucket, { ...bucket, id: "argon", label: "Gemini Argon", models: ["gemini-4-argon"] }] }, undefined, currentProvider);
+  equal((html.match(/data-quota-bucket=/g) ?? []).length, 2);
+  equal((html.match(/role="progressbar"/g) ?? []).length, 4);
+  equal((html.match(/data-api-price="all_time"/g) ?? []).length, 3);
+  equal((html.match(/data-api-price="period"/g) ?? []).length, 2);
+  match(html, /data-quota-availability="available"/);
+  match(html, /Model bindings|Bucket details/);
+  const client = new QueryClient();
+  client.setQueryData(["provider-usage", currentProvider.id], { ...original, quota_buckets: [bucket] });
+  try {
+    const group = renderToStaticMarkup(<QueryClientProvider client={client}><LocaleProvider><GroupUsageSummary providers={[currentProvider]} /></LocaleProvider></QueryClientProvider>);
+    match(group, /data-quota-availability="available"/);
+    doesNotMatch(group, /Peak used|progressbar|%/);
+  } finally { client.clear(); }
+  equal(render({ ...original, quota_buckets: [] }, undefined, currentProvider), render(original, undefined, currentProvider));
 });
 
 const upstreamUsage = (over: Partial<ProviderUsage>): ProviderUsage => ({ ...base, provider_id: "remote", ...over });

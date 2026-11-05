@@ -365,6 +365,7 @@ impl AdminService {
             Vec::new()
         };
         ProviderUsage {
+            quota_buckets: Vec::new(),
             provider_id: view.provider_id.clone(),
             kind: "claude_code_plan".into(),
             site: "global".into(),

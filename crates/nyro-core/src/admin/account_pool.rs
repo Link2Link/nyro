@@ -1326,6 +1326,7 @@ impl AdminService {
             });
         }
         ProviderUsage {
+            quota_buckets: Vec::new(),
             provider_id: view.provider_id.clone(),
             kind: "devin_plan".into(),
             site: "global".into(),

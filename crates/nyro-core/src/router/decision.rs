@@ -8,6 +8,35 @@
 
 use serde::Serialize;
 
+use super::quota::ProviderScheduling;
+
+/// Scoped quota evidence captured for a concrete backend model. Deliberately
+/// excludes prices, credentials, and unrelated bucket model membership.
+#[derive(Debug, Clone, Serialize)]
+pub struct QuotaDecision {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bucket_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scope_id: Option<String>,
+    pub constraint_ids: Vec<String>,
+    pub binding_status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub binding_source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub revision: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub queried_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stale: Option<bool>,
+    pub scheduling: ProviderScheduling,
+    /// `provider`, `model`, `bucket`, or `shared_constraint` when blocked.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub blocker_scope: Option<String>,
+    pub blocking_constraint_ids: Vec<String>,
+}
+
 /// Why a configured candidate did not (or would not) receive traffic.
 pub(crate) const SKIP_WEIGHT_ZERO: &str = "weight_zero";
 pub(crate) const SKIP_QUOTA_EXHAUSTED: &str = "quota_exhausted";
@@ -48,6 +77,9 @@ pub struct DecisionCandidate {
     /// Strategy-specific scoring detail.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub score: Option<serde_json::Value>,
+    /// Exact-model quota binding and admission evidence, shared by all balances.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quota: Option<QuotaDecision>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub skipped: Option<SkipReason>,
 }
@@ -165,6 +197,7 @@ mod tests {
             weight: None,
             share: None,
             score: None,
+            quota: None,
             skipped: None,
         }
     }

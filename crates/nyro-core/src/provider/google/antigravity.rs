@@ -354,6 +354,9 @@ pub(crate) struct AvailableModel {
     pub quota_remaining: Option<f64>,
     /// ISO-8601 reset timestamp of the quota window, when reported.
     pub quota_resets_at: Option<String>,
+    /// Optional actual resource associations; display labels are not IDs.
+    pub quota_bucket_id: Option<String>,
+    pub quota_group_id: Option<String>,
 }
 
 /// Per-account dynamic model discovery: `v1internal:fetchAvailableModels`
@@ -423,6 +426,12 @@ pub(crate) fn parse_available_models_detailed(payload: &Value) -> Vec<AvailableM
                     .map(str::trim)
                     .filter(|value| !value.is_empty())
                     .map(ToString::to_string),
+                quota_bucket_id: quota
+                    .and_then(|q| q.get("bucketId"))
+                    .and_then(nonempty_json_string),
+                quota_group_id: quota
+                    .and_then(|q| q.get("quotaGroupId").or_else(|| q.get("groupId")))
+                    .and_then(nonempty_json_string),
             }
         })
         .filter(|model| !model.id.is_empty())
@@ -440,6 +449,12 @@ pub(crate) fn parse_available_models_detailed(payload: &Value) -> Vec<AvailableM
 pub(crate) struct QuotaSummaryBucket {
     /// Owning group's display name, when reported (e.g. a model family).
     pub group: Option<String>,
+    /// Explicit group resource identity, distinct from its mutable label.
+    pub group_id: Option<String>,
+    /// Actual optional model membership supplied by the response.
+    pub model_ids: Vec<String>,
+    /// Only true for an explicit scope declaration, never inferred from labels.
+    pub applies_to_all_models: bool,
     /// Bucket display name, when reported (takes naming priority).
     pub display_name: Option<String>,
     /// Stable bucket identifier, when reported.
@@ -499,6 +514,37 @@ pub(crate) async fn retrieve_user_quota_summary(
     Err(last_error.unwrap_or_else(|| anyhow::anyhow!("retrieveUserQuotaSummary failed")))
 }
 
+fn nonempty_json_string(value: &Value) -> Option<String> {
+    value
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
+
+/// Read only explicit model-ID fields. Unknown schema is deliberately unbound;
+/// a displayName or a percentage is never promoted to model membership.
+fn explicit_quota_models(value: &Value) -> Vec<String> {
+    let mut models = Vec::new();
+    for key in ["modelIds", "models"] {
+        if let Some(entries) = value.get(key).and_then(Value::as_array) {
+            for entry in entries {
+                if let Some(id) = nonempty_json_string(entry)
+                    .or_else(|| entry.get("modelId").and_then(nonempty_json_string))
+                {
+                    models.push(id);
+                }
+            }
+        }
+    }
+    if let Some(model) = value.get("modelId").and_then(nonempty_json_string) {
+        models.push(model);
+    }
+    models.sort();
+    models.dedup();
+    models
+}
+
 /// Response shape: `{ groups: [ { displayName, buckets: [ { bucketId,
 /// window, remainingFraction, resetTime, displayName } ] } ] }` (validated
 /// against Antigravity-Manager's deserialization). Buckets without a
@@ -523,8 +569,23 @@ pub(crate) fn parse_quota_summary_buckets(payload: &Value) -> Vec<QuotaSummaryBu
                     .get("remainingFraction")
                     .and_then(Value::as_f64)?
                     .clamp(0.0, 1.0);
+                let bucket_models = explicit_quota_models(bucket);
                 Some(QuotaSummaryBucket {
                     group: group_name.clone(),
+                    group_id: group
+                        .get("groupId")
+                        .or_else(|| group.get("quotaGroupId"))
+                        .and_then(nonempty_json_string),
+                    model_ids: if bucket_models.is_empty() {
+                        explicit_quota_models(group)
+                    } else {
+                        bucket_models
+                    },
+                    applies_to_all_models: bucket
+                        .get("appliesToAllModels")
+                        .or_else(|| group.get("appliesToAllModels"))
+                        .and_then(Value::as_bool)
+                        == Some(true),
                     display_name: non_empty(bucket.get("displayName").and_then(Value::as_str)),
                     bucket_id: non_empty(bucket.get("bucketId").and_then(Value::as_str)),
                     window: non_empty(bucket.get("window").and_then(Value::as_str)),
@@ -1537,6 +1598,35 @@ mod tests {
             !forces_upstream_stream(&provider),
             "default channel keeps non-stream upstream"
         );
+    }
+
+    #[test]
+    fn quota_parser_preserves_explicit_membership_without_label_guesses() {
+        let payload = json!({"groups": [
+            {"groupId": "flash-budget", "displayName": "Gemini", "modelIds": ["gemini-3.8-flash-high", "gemini-3.8-flash-low"],
+             "buckets": [{"bucketId": "flash-five-hour", "window": "FIVE_HOURS", "remainingFraction": 0.0}]},
+            {"displayName": "Gemini", "buckets": [{"bucketId": "argon-week", "modelIds": ["gemini-4-argon"], "window": "WEEKLY", "remainingFraction": 0.8}]},
+            {"displayName": "All models", "appliesToAllModels": true,
+             "buckets": [{"bucketId": "global", "window": "WEEKLY", "remainingFraction": 0.4}]},
+            {"displayName": "Gemini", "buckets": [{"bucketId": "unknown", "window": "FIVE_HOURS", "remainingFraction": 0.8}]}
+        ]});
+        let buckets = parse_quota_summary_buckets(&payload);
+        assert_eq!(buckets.len(), 4);
+        assert_eq!(buckets[0].group_id.as_deref(), Some("flash-budget"));
+        assert_eq!(
+            buckets[0].model_ids,
+            vec!["gemini-3.8-flash-high", "gemini-3.8-flash-low"]
+        );
+        assert_eq!(buckets[1].model_ids, vec!["gemini-4-argon"]);
+        assert!(buckets[2].applies_to_all_models);
+        assert!(buckets[3].model_ids.is_empty());
+        assert!(!buckets[3].applies_to_all_models);
+        let models = parse_available_models_detailed(&json!({"models": {
+            "gemini-4-argon-high": {"quotaInfo": {"bucketId": "argon-week", "quotaGroupId": "argon-budget", "remainingFraction": 0.8}}
+        }}));
+        assert_eq!(models[0].id, "gemini-4-argon-high");
+        assert_eq!(models[0].quota_bucket_id.as_deref(), Some("argon-week"));
+        assert_eq!(models[0].quota_group_id.as_deref(), Some("argon-budget"));
     }
 
     #[test]

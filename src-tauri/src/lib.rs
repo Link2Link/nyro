@@ -89,6 +89,8 @@ pub fn run() {
             commands::get_model_capabilities,
             commands::get_provider_usage,
             commands::list_provider_usage,
+            commands::get_provider_quota_buckets_config,
+            commands::set_provider_quota_buckets_config,
             commands::init_oauth_session,
             commands::get_oauth_session_status,
             commands::cancel_oauth_session,
