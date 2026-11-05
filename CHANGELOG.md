@@ -4,6 +4,18 @@ All notable changes to Nyro will be documented in this file.
 
 ---
 
+## v2.1.33
+
+> Released on 2026-11-05
+
+#### Fixes
+
+- **Google subscription quota associations**: versioned adapter rules now associate the observed `gemini-5h` and `gemini-weekly` resources with discovered Flash 3.8 effort variants, and complete supported Gemini 4 Argon family labels with discovered Argon variants. Third-party pools and generic labels are not treated as first-party bindings; explicit official selectors retain precedence, while contradictory selectors and malformed observations remain fail-closed. The dedicated Argon allowance does not inherit unproven Gemini-pool constraints.
+- **Five-hour compatibility and fence recovery**: normalize the observed `5h` window to the canonical five-hour tier for display, pacing and cycle pricing without changing existing resource hash inputs or operator references. Restored and live same-resource Google fences merge the known alias conservatively: only fresh valid same-owner observations prove recovery; stale, invalid or older data cannot erase exhausted windows. Adapter parent IDs remain stable as additional discovered effort variants appear.
+- **Usage query outcomes and status clarity**: fresh valid catalog measurements are now successful usage observations rather than erroneous unavailable rows, and retain their catalog usage bars in bulk publication and authorized forwarding. The WebUI distinguishes Usage updated / Quota binding pending from confirmed availability, stale data, refresh failure, account unavailability and quota exhaustion. Unknown-duration observations still do not establish a fixed cycle or capacity estimate; failed published rows omit success payloads. Added parser, resource mapping, persisted-fence, query-contract and bilingual frontend regressions. No database migration or automatic deployment is included.
+
+---
+
 ## v2.1.32
 
 > Released on 2026-11-05

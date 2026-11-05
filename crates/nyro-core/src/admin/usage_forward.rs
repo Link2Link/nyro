@@ -25,7 +25,9 @@ use futures::stream::{self, StreamExt};
 use super::usage::{
     LIST_USAGE_CONCURRENCY, ProviderUsage, ProviderUsageQueryStatus, provider_usage_monitorable,
 };
-use super::usage_publication::{bucket_tiers_conflict, bucket_usage, effective_bucket_scheduling};
+use super::usage_publication::{
+    bucket_tiers_conflict, bucket_usage, effective_bucket_scheduling, google_bucket_query_succeeded,
+};
 use super::*;
 use crate::provider::nyro_gateway::usage::public_usage::PublicProviderUsage;
 use crate::quota_buckets::{google_display_buckets, opaque_quota_id};
@@ -642,18 +644,20 @@ fn project_forwarded_entry(
         row.id = projected.provider_id.clone();
         row.name = format!("{} · {}", entry.name, bucket.label);
         row.routes = routes.into_iter().collect();
-        let known = bucket.is_resolved() && !bucket_tiers_conflict(&bucket.tiers);
-        row.status = if known {
+        let query_succeeded = if usage.kind == "google_subscription" {
+            google_bucket_query_succeeded(&display, bucket)
+        } else {
+            bucket.is_resolved() && !bucket_tiers_conflict(&bucket.tiers)
+        };
+        row.status = if query_succeeded {
             ProviderUsageQueryStatus::Ok
         } else {
             ProviderUsageQueryStatus::Error
         };
-        row.error = (!known).then(|| "Model-family quota observation is incomplete".into());
-        row.usage = Some(PublicProviderUsage::from_usage(
-            &projected,
-            false,
-            bucket.stale,
-        ));
+        row.error =
+            (!query_succeeded).then(|| "No fresh valid model-family usage observation".into());
+        row.usage = query_succeeded
+            .then(|| PublicProviderUsage::from_usage(&projected, false, bucket.stale));
         row.usage_entry = Some(super::usage_publication::PublishedUsageEntry {
             kind: "quota_bucket",
             source_provider_ref: opaque_quota_id("forwarded_provider_v1", &[&entry.id]),
@@ -1286,6 +1290,7 @@ mod tests {
         flash.scheduling = hidden.scheduling.clone();
         let mut child = bucket("raw-child", "gemini-4-argon-high", true);
         child.binding.status = "window_constraint".into();
+        usage.queried_at = flash.queried_at.clone();
         usage.quota_buckets = vec![flash, hidden, child];
         let entry = ForwardedProviderUsage {
             id: "google".into(),
@@ -1329,6 +1334,7 @@ mod tests {
         source.source = "catalog".into();
         source.tiers[0].name = "catalog".into();
         source.binding.source = "catalog_exact_model_v1".into();
+        usage.queried_at = source.queried_at.clone();
         usage.quota_buckets = vec![source];
         let entry = ForwardedProviderUsage {
             id: "google".into(),
@@ -1346,9 +1352,23 @@ mod tests {
         )]);
         let (rows, states) = project_forwarded_entry(entry, &usage, &routes, false);
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].status, ProviderUsageQueryStatus::Error);
-        assert!(rows[0].usage.as_ref().unwrap().tiers.is_empty());
-        assert!(states["flash"][0].is_none());
+        assert_eq!(rows[0].status, ProviderUsageQueryStatus::Ok);
+        assert!(rows[0].error.is_none());
+        let observed = rows[0].usage.as_ref().unwrap();
+        assert_eq!(observed.tiers.len(), 1);
+        assert_eq!(observed.tiers[0].name, "catalog");
+        assert_eq!(
+            rows[0].usage_entry.as_ref().unwrap().binding_status,
+            "unresolved"
+        );
+        assert_eq!(
+            observed.scheduling.reason.as_deref(),
+            Some("unknown_mapping")
+        );
+        assert!(
+            states["flash"][0].is_none(),
+            "query success is not routing-admission evidence"
+        );
     }
 
     #[tokio::test]

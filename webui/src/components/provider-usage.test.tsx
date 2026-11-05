@@ -378,6 +378,63 @@ test("Google family snapshots replace parent quota while footer and group share 
   }
 });
 
+const catalogFamily = (id: string, label: string, used: number): QuotaBucket => ({
+  id, scope_id: "google-owner", label, models: [label], source: "google_family_display_v1",
+  binding: { status: "unresolved", source: "google_family_display_v1", revision: 1 },
+  queried_at: new Date(now).toISOString(), stale: false, constraint_ids: [],
+  tiers: [{ name: "catalog", used_percent: used }],
+  scheduling: { status: "eligible", reason: "unknown_mapping", blocking_tiers: [] },
+});
+
+test("Google footer distinguishes fresh observed usage from confirmed availability and visible refresh failures", () => {
+  const currentProvider = googleProviders[0];
+  const usage: ProviderUsage = { ...base, provider_id: currentProvider.id, kind: "google_subscription",
+    quota_buckets: [catalogFamily("family-flash", "gemini-3.8-flash", 0), catalogFamily("family-argon", "gemini-4-argon", 3.8)],
+  };
+  const fresh = render(usage, undefined, currentProvider);
+  match(fresh, /data-quota-availability="observed"[^]*Usage updated · 2\/2/);
+  equal((fresh.match(/data-bucket-status="observed"/g) ?? []).length, 2);
+  equal((fresh.match(/Quota binding pending confirmation/g) ?? []).length, 2);
+  match(fresh, /Model catalog usage/);
+  match(fresh, /aria-valuenow="0"/);
+  doesNotMatch(fresh, /Usage query failed|data-quota-availability="available"|data-bucket-status="available"|Unavailable/);
+  const failed = render(usage, new Error("Temporary Google refresh failure"), currentProvider);
+  match(failed, /role="alert"[^]*Usage query failed: Temporary Google refresh failure/);
+  match(failed, /Refresh failed/);
+  match(failed, /Stale/);
+  equal((failed.match(/role="progressbar"/g) ?? []).length, 2);
+  doesNotMatch(failed, /data-quota-availability="observed"|data-bucket-status="observed"|Usage updated/);
+  const aged = render({ ...usage, quota_buckets: usage.quota_buckets!.map((bucket) => ({ ...bucket,
+    queried_at: new Date(now - 5 * 60_000).toISOString() })) }, undefined, currentProvider);
+  match(aged, /data-quota-availability="unknown"[^]*Stale/);
+  doesNotMatch(aged, /Usage updated|Usage query failed/);
+  const unavailable = render({ ...usage, is_available: false }, undefined, currentProvider);
+  match(unavailable, /data-quota-availability="unavailable"[^]*Account unavailable/);
+  doesNotMatch(unavailable, /data-quota-availability="observed"|Usage updated/);
+});
+
+test("Google card and folded group use the real-provider usage cache, never the synthetic published ID", () => {
+  const currentProvider = googleProviders[0];
+  const real: ProviderUsage = { ...base, provider_id: currentProvider.id, kind: "google_subscription",
+    quota_buckets: [catalogFamily("family-flash", "gemini-3.8-flash", 0), catalogFamily("family-argon", "gemini-4-argon", 3.8)],
+  };
+  const client = new QueryClient();
+  const originalNow = Date.now;
+  Date.now = () => now;
+  client.setQueryData(["provider-usage", currentProvider.id], real);
+  client.setQueryData(["provider-usage", "qb_published_family_id"], { ...real, quota_buckets: [],
+    scheduling: { status: "quota_exhausted", reason: "account_unavailable", blocking_tiers: [] } });
+  try {
+    const html = renderToStaticMarkup(<QueryClientProvider client={client}><LocaleProvider>
+      <ProviderUsageFooter provider={currentProvider} /><GroupUsageSummary providers={[currentProvider]} />
+    </LocaleProvider></QueryClientProvider>);
+    equal((html.match(/data-quota-availability="observed"/g) ?? []).length, 2);
+    equal((html.match(/Usage updated · 2\/2/g) ?? []).length, 2);
+    doesNotMatch(html, /Account unavailable|No quota observations/);
+    equal(client.getQueryCache().findAll({ queryKey: ["provider-usage"] }).length, 2);
+  } finally { Date.now = originalNow; client.clear(); }
+});
+
 test("non-Google bucket cards and empty snapshots retain the legacy presentation", () => {
   const raw: QuotaBucket = { id: "raw-model", scope_id: "scope", label: "Other provider model", models: ["model-high"],
     binding: { status: "resolved", source: "configured", revision: 1 }, tiers: priceUsage.tiers, constraint_ids: [],

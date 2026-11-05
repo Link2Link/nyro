@@ -290,3 +290,118 @@ test("same Google family and raw IDs in different scopes keep cards, prices and 
   match(cards[1], /data-quota-detail="\[&quot;owner-b&quot;,&quot;raw-flash&quot;\]"/);
   doesNotMatch(cards[1], /\$184\.20|owner-a/);
 });
+
+const observedFamily = (base: QuotaBucket, used = 0): QuotaBucket => ({
+  ...base, binding: { ...base.binding, status: "unresolved" },
+  scheduling: { status: "eligible", reason: "unknown_mapping", blocking_tiers: [] },
+  tiers: [{ name: "catalog", used_percent: used, resets_at: null }],
+  api_price: base.api_price ? { ...base.api_price, period: null, period_start: null, period_end: null,
+    period_tier: null, used_percent: null, estimated_capacity: null } : null,
+});
+
+const availability = (buckets: QuotaBucket[], isZh = false, stale = false, owner?: ProviderUsage) => renderToStaticMarkup(
+  <QuotaBucketAvailability buckets={buckets} now={now} expectedCount={2} isZh={isZh} stale={stale} owner={owner} />);
+
+test("fresh Google catalog observations are updated in both languages, never resolved availability or guessed cycles", () => {
+  for (const locale of ["en-US", "zh-CN"] as const) {
+    const zh = locale === "zh-CN";
+    const quota_buckets = [observedFamily(familyFlash), observedFamily(familyArgon, 3.8)];
+    const before = JSON.stringify(quota_buckets);
+    const summary = availability(quota_buckets, zh);
+    match(summary, /data-quota-availability="observed"/);
+    match(summary, zh ? /用量已更新 · 2\/2/ : /Usage updated · 2\/2/);
+    doesNotMatch(summary, /bg-emerald|Available|可用|Unknown|未知/);
+    const html = render({ ...googleUsage, quota_buckets }, false, locale);
+    for (const card of articles(html)) {
+      match(card, /data-bucket-status="observed"/);
+      match(withoutDetails(card), zh ? /配额绑定待确认/ : /Quota binding pending confirmation/);
+      match(withoutDetails(card), zh ? /模型目录用量/ : /Model catalog usage/);
+      match(card, zh ? /用量周期未知/ : /usage window is unknown/);
+      match(card, zh ? /绑定待确认/ : /Binding unresolved/);
+      doesNotMatch(card, /data-bucket-status="available"|≈ \$/);
+    }
+    match(html, /aria-valuenow="0"/);
+    match(html, /aria-valuenow="3.8"/);
+    equal(values(articles(html)[0]).join(","), "$184.20,—,—");
+    equal(values(articles(html)[1]).join(","), "$246.80,—,—");
+    equal(JSON.stringify(quota_buckets), before, "observation UI must not mutate binding or scheduling");
+  }
+});
+
+test("mixed healthy and observed Google families keep availability and observation coverage counts separate", () => {
+  const catalog = observedFamily(familyFlash, 0.83);
+  const summary = availability([catalog, familyArgon]);
+  match(summary, /data-quota-availability="partial"/);
+  match(summary, /Partially available · 1\/2 · Usage updated · 2\/2/);
+  doesNotMatch(summary, /Partially available · 2\/2|data-quota-availability="available"/);
+  match(availability([catalog]), /Usage updated · 1\/2/);
+  match(availability([catalog], true), /用量已更新 · 1\/2/);
+  match(availability([catalog, { ...familyArgon, scope_id: "other-owner" }]), /data-quota-availability="unknown"/);
+});
+
+test("Google observation success requires fresh bounded measurements and server family provenance", () => {
+  const catalog = observedFamily(familyArgon, 12);
+  for (const invalid of [null, NaN, Infinity, -1, 100.1]) {
+    const bucket = { ...catalog, tiers: [{ name: "catalog", used_percent: invalid as number }] };
+    match(availability([bucket]), /data-quota-availability="unknown"/);
+    doesNotMatch(availability([bucket]), /Usage updated/);
+  }
+  for (const bucket of [{ ...catalog, tiers: [] }, { ...catalog, models: [] },
+    { ...catalog, binding: { ...catalog.binding, status: "conflict" } },
+    { ...catalog, scheduling: { ...catalog.scheduling, reason: "conflicting_binding" } },
+    { ...catalog, queried_at: "invalid" }, { ...catalog, stale: true },
+    { ...catalog, queried_at: new Date(now - 5 * 60_000).toISOString() }]) {
+    match(availability([bucket]), /data-quota-availability="unknown"/);
+    doesNotMatch(availability([bucket]), /Usage updated/);
+  }
+  const rawCatalog = { ...catalog, source: "catalog", binding: { ...catalog.binding, source: "catalog_exact_model_v1" } };
+  doesNotMatch(availability([rawCatalog]), /Usage updated/);
+  doesNotMatch(availability([]), /Usage updated/);
+});
+
+test("stale and refresh-failed Google observations keep measurements visible without a success badge", () => {
+  const catalog = observedFamily(familyArgon, 12);
+  for (const stale of [false, true]) {
+    const bucket = stale ? catalog : { ...catalog, stale: true };
+    const html = render({ ...googleUsage, quota_buckets: [bucket] }, stale);
+    match(html, /data-bucket-status="unknown"/);
+    match(withoutDetails(html), stale ? /Refresh failed/ : /Stale/);
+    match(html, /aria-valuenow="12"/);
+    match(html, /Last observation retained/);
+    doesNotMatch(html, /Usage updated|Quota binding pending confirmation|≈ \$/);
+    match(availability([bucket], false, stale), stale ? /Refresh failed/ : /Stale/);
+  }
+});
+
+test("validated Google resource and named-family binding sources have readable English and Chinese diagnostics", () => {
+  for (const [source, en, zh] of [
+    ["google_subscription_resources_v1", "Validated Google subscription resources", "已验证 Google 订阅资源"],
+    ["google_named_family_v1", "Validated Google named family", "已验证 Google 命名模型族"],
+  ]) {
+    const bucket: QuotaBucket = { ...argon, binding: { ...argon.binding, source } };
+    ok(render({ ...usage, quota_buckets: [bucket] }).includes(en));
+    ok(render({ ...usage, quota_buckets: [bucket] }, false, "zh-CN").includes(zh));
+  }
+});
+
+test("Google catalog measurements never hide confirmed quota stops or account authentication failures", () => {
+  const catalog = observedFamily(familyArgon, 100);
+  match(availability([catalog]), /data-quota-availability="observed"/);
+  const blocked: QuotaBucket = { ...catalog, scheduling: { status: "quota_exhausted", reason: "usage_limit", blocking_tiers: ["five_hour"] } };
+  const blockedCard = articles(render({ ...googleUsage, quota_buckets: [blocked] }))[0];
+  match(blockedCard, /data-bucket-status="exhausted"/);
+  match(blockedCard, /Quota exhausted, routing paused/);
+  doesNotMatch(blockedCard, /Usage updated|Quota binding pending confirmation/);
+  for (const reason of ["account_unavailable", "auth_error", "authentication_failed", "auth_required"]) {
+    const unavailable: QuotaBucket = { ...catalog, scheduling: { status: "quota_exhausted", reason, blocking_tiers: [] } };
+    const card = articles(render({ ...googleUsage, quota_buckets: [unavailable] }))[0];
+    match(card, /data-bucket-status="unavailable"/);
+    match(card, /Account unavailable/);
+    doesNotMatch(card, /Usage updated|Quota exhausted, routing paused/);
+  }
+  const unavailableOwner: ProviderUsage = { ...googleUsage, is_available: false, quota_buckets: [catalog] };
+  match(articles(render(unavailableOwner))[0], /data-bucket-status="unavailable"/);
+  match(availability([catalog], false, false, unavailableOwner), /data-quota-availability="unavailable"/);
+  const mixed = availability([observedFamily(familyFlash), blocked]);
+  match(mixed, /Usage updated · 1\/2 · Paused 1/);
+});

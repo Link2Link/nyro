@@ -419,7 +419,7 @@ export function ProviderUsageFooter({ provider }: { provider: Provider }) {
         <div className="flex flex-wrap items-center gap-2 text-xs font-medium text-slate-500">
           <span>{title}</span>
           {hasBuckets && <QuotaBucketAvailability buckets={shown!.quota_buckets!} stale={Boolean(error)} isZh={isZh} now={now}
-            expectedCount={shown?.kind === "google_subscription" ? 2 : undefined} />}
+            expectedCount={shown?.kind === "google_subscription" ? 2 : undefined} owner={shown} />}
           {shown?.level && (
             <span className="rounded bg-slate-100 px-1.5 py-0.5 text-[10px] font-semibold uppercase text-slate-600">
               {shown.level}
@@ -572,7 +572,7 @@ export function GroupUsageSummary({ providers }: { providers: Provider[] }) {
   );
   const bucketMembers = tracked.flatMap((provider, i) => {
     const usage = queries[i]?.data;
-    return usage && hasStructuredQuotaBuckets(usage) ? [{ provider, buckets: usage.quota_buckets ?? [],
+    return usage && hasStructuredQuotaBuckets(usage) ? [{ provider, usage, buckets: usage.quota_buckets ?? [],
       expectedCount: usage.kind === "google_subscription" ? 2 : undefined, failed: Boolean(queries[i]?.error) }] : [];
   });
   const money = (n: number) => (Number.isFinite(n) ? n.toFixed(2) : "?");
@@ -582,9 +582,9 @@ export function GroupUsageSummary({ providers }: { providers: Provider[] }) {
 
   return (
     <span className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1 text-xs text-slate-600" title={detail || undefined}>
-      {bucketMembers.map(({ provider, buckets, expectedCount, failed }) => <span key={provider.id} className="inline-flex items-center gap-1.5">
+      {bucketMembers.map(({ provider, usage, buckets, expectedCount, failed }) => <span key={provider.id} className="inline-flex items-center gap-1.5">
         {tracked.length > 1 && <span className="max-w-32 truncate">{provider.name}</span>}
-        <QuotaBucketAvailability buckets={buckets} stale={failed} isZh={isZh} expectedCount={expectedCount} now={now} />
+        <QuotaBucketAvailability buckets={buckets} stale={failed} isZh={isZh} expectedCount={expectedCount} now={now} owner={usage} />
         {failed && <AlertCircle className="h-3 w-3 text-amber-700" aria-label={isZh ? "用量查询失败" : "Usage query failed"} />}
       </span>)}
       {summary.peak ? (
