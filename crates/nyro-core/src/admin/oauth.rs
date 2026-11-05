@@ -1373,6 +1373,28 @@ impl AdminService {
             oauth_cred.driver_key.clone()
         };
 
+        // Refresh the Hub version BEFORE the driver snapshots its User-Agent
+        // into RuntimeBinding. Unknown fixture drivers and Gemini CLI must not
+        // contact the Antigravity updater merely because of provider labels.
+        let driver = auth::build_driver(&driver_key);
+        if crate::provider::google::antigravity::is_google_antigravity(provider)
+            && driver
+                .as_ref()
+                .is_some_and(|driver| driver.metadata().key == "google")
+            && crate::provider::google::antigravity::antigravity_version_needs_refresh()
+        {
+            match self.gw.http_client_for_provider(provider.use_proxy).await {
+                Ok(client) => {
+                    crate::provider::google::antigravity::refresh_antigravity_version(&client)
+                        .await;
+                }
+                Err(error) => {
+                    // Client-version discovery is best-effort, never an OAuth
+                    // authentication failure when a proxy is unavailable.
+                    tracing::debug!(%error, "could not prepare Antigravity Hub version refresh");
+                }
+            }
+        }
         let credential = stored_credential_from_oauth(&oauth_cred, &driver_key);
         let access_token = credential
             .access_token
@@ -1382,7 +1404,7 @@ impl AdminService {
             .to_string();
 
         if !access_token.is_empty() && !is_expired_at(credential.expires_at.as_deref()) {
-            let binding = if let Some(driver) = auth::build_driver(&driver_key) {
+            let binding = if let Some(driver) = driver.as_ref() {
                 driver.bind_runtime(provider, &credential)?
             } else {
                 RuntimeBinding::default()
@@ -1404,7 +1426,7 @@ impl AdminService {
             anyhow::bail!("provider oauth refresh token is missing; reauthentication required");
         }
 
-        let Some(driver) = auth::build_driver(&driver_key) else {
+        let Some(driver) = driver else {
             anyhow::bail!("no auth driver found for key: {driver_key}");
         };
 

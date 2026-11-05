@@ -4,6 +4,18 @@ Nyro 的所有重要变更均记录在此文件中。
 
 ---
 
+## v2.1.28
+
+> 发布于 2026-11-05
+
+#### 修复
+
+- **Antigravity Hub 客户端兼容**：Google AI Pro OAuth 请求从旧 IDE 格式切换为 Hub User-Agent 产品族，回退版本更新为 2.29.0，并使用匹配的 darwin-arm64 构建元数据。已知 changelist 仅附加到精确对应版本，未知新版本不借用其他构建标识。Hub 版本在 OAuth 请求及 runtime 请求头绑定前准备，避免同轮模型测试继续携带刷新前的身份。本次更新 Gemini 4 Argon 客户端兼容，不改模型 ID，也不在真实复测前宣称账号访问已恢复。
+- **版本刷新有界且渠道隔离**：成功 manifest 版本六小时过期，失败冷却十分钟，并发调用共用一次刷新；取消刷新不会使缓存卡死，低于回退版本的 manifest 不采用。共享模型目录传输不再刷新 Hub 更新源，Gemini CLI 与测试 driver 保持隔离；原有端点、Project 和模型别名行为不变。
+- **修复下游 Nyro 调用 Google 订阅空回复**：最终 channel URL 重写现在保留实际上游流式模式，不再被非流式客户端标志覆盖。Antigravity 和 Gemini CLI 请求保持 `streamGenerateContent?alt=sse`，聚合正文及用量后向下游模型测试返回可读 Anthropic JSON，避免误走可能无输出的 `generateContent` action。新增离线 Hub 身份与缓存、双渠道聚合及完整两跳管理端探测回归；无需数据库迁移。
+
+---
+
 ## v2.1.27
 
 > 发布于 2026-11-05

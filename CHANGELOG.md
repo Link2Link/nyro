@@ -4,6 +4,18 @@ All notable changes to Nyro will be documented in this file.
 
 ---
 
+## v2.1.28
+
+> Released on 2026-11-05
+
+#### Fixes
+
+- **Antigravity Hub client compatibility**: Google AI Pro OAuth requests now use the Hub User-Agent family instead of the legacy IDE format, with a 2.29.0 fallback and matching darwin-arm64 build metadata. Known changelists are attached only to their exact releases; unknown newer versions do not reuse another build's identifier. The Hub version is prepared before OAuth requests and runtime header binding, so the same model-probe run no longer keeps a pre-refresh identity. This updates Gemini 4 Argon client compatibility without changing its model ID or claiming account-level availability before a live retest.
+- **Bounded, channel-isolated version refresh**: successful manifest versions expire after six hours, failures use a ten-minute cooldown, concurrent callers share one refresh, and cancelled refreshes cannot leave the cache stuck. Manifests below the fallback version are rejected. Shared catalog transport no longer refreshes the Hub feed, keeping Gemini CLI and fixture drivers isolated; existing endpoint, project and model-alias behavior is unchanged.
+- **Google subscription replies through downstream Nyro**: the final channel URL canonicalizer now retains the effective upstream streaming mode instead of overwriting it with a non-stream client's flag. Antigravity and Gemini CLI requests therefore keep `streamGenerateContent?alt=sse`, aggregate the returned text and usage, and return readable Anthropic JSON to downstream model probes rather than accidentally calling the empty-output-prone `generateContent` action. Added offline Hub identity/cache, both-channel aggregation and complete two-hop admin-probe regressions. No database migration is required.
+
+---
+
 ## v2.1.27
 
 > Released on 2026-11-05

@@ -206,6 +206,11 @@ impl GoogleSubscriptionDriver {
         params: &[(&str, &str)],
     ) -> Result<GoogleTokenResponse> {
         let driver_label = self.metadata_key();
+        if self.channel == GoogleSubscriptionChannel::Antigravity {
+            // Prepare the Hub identity before token exchange, project bootstrap,
+            // and catalog discovery construct any User-Agent headers.
+            crate::provider::google::antigravity::refresh_antigravity_version(client).await;
+        }
         let response = client
             .post(token_url)
             .header("Content-Type", "application/x-www-form-urlencoded")
@@ -1096,14 +1101,11 @@ mod tests {
             binding.extra_headers.get("authorization").unwrap(),
             "Bearer ya29.token"
         );
-        // Tests never run the manifest refresh, so the version is exactly
-        // the fallback constant (live refresh would only raise it).
+        // Hub version, platform and changelist must describe the same release;
+        // the old IDE-style `antigravity/<version> windows/amd64` is not Hub.
         assert_eq!(
             binding.extra_headers.get("user-agent").unwrap(),
-            &format!(
-                "antigravity/{} windows/amd64",
-                crate::provider::google::antigravity::ANTIGRAVITY_FALLBACK_VERSION
-            )
+            "antigravity/hub/2.29.0 (aidev_client; os_type=darwin; arch=arm64; cl=1013060670)"
         );
         assert_eq!(
             binding.extra_headers.get("x-goog-api-client").unwrap(),
