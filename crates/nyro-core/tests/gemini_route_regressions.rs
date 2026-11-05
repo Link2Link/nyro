@@ -955,6 +955,178 @@ fn native_gemini_schedule_one_of_replay_preserves_both_branches() -> anyhow::Res
     Ok(())
 }
 
+/// Sanitized task-board schema only: no production conversation or tool input.
+fn task_board_parameters() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "permission": {
+                "description": "Permission level for the task; an empty value leaves it unchanged.",
+                "oneOf": [
+                    {"type": "string", "enum": ["read-only", "workspace-write", "danger-full-access"]},
+                    {"type": "string", "const": ""}
+                ]
+            }
+        },
+        "required": ["permission"],
+        "additionalProperties": false
+    })
+}
+
+fn task_board_request(stream: bool, parameters: Value) -> Value {
+    // Preserve the sanitized 59-tool request shape without copying unrelated
+    // production schemas or any original prompt data.
+    let mut tools: Vec<Value> = (0..58)
+        .map(|index| {
+            json!({"type": "function", "function": {
+                "name": format!("local_tool_{index}"),
+                "parameters": {"type": "object", "properties": {"text": {"type": "string"}}}
+            }})
+        })
+        .collect();
+    tools.push(json!({"type": "function", "function": {
+        "name": "task_board_update", "parameters": parameters
+    }}));
+    json!({
+        "model": CLIENT_MODEL,
+        "stream": stream,
+        "messages": [{"role": "user", "content": "Check the task-board tool schema."}],
+        "tools": tools
+    })
+}
+
+fn assert_permission_enum_schema(body: &Value, expected_permission: Value) {
+    let declarations = body["tools"][0]["functionDeclarations"]
+        .as_array()
+        .expect("Gemini function declarations");
+    assert_eq!(
+        declarations.len(),
+        59,
+        "tools must not be silently dropped: {body}"
+    );
+    let declaration = declarations
+        .iter()
+        .find(|tool| tool["name"] == "task_board_update")
+        .expect("task-board tool survives lowering");
+    assert_eq!(
+        declaration["parameters"],
+        json!({
+            "type": "object",
+            "properties": {"permission": expected_permission},
+            "required": ["permission"]
+        }),
+        "finite oneOf must become a native enum without losing siblings: {declaration}"
+    );
+    let permission = &declaration["parameters"]["properties"]["permission"];
+    for keyword in ["oneOf", "const", "anyOf"] {
+        assert!(
+            permission.get(keyword).is_none(),
+            "unexpected {keyword}: {permission}"
+        );
+    }
+    assert!(declaration.get("parametersJsonSchema").is_none());
+}
+
+fn permission_enum_route(stream: bool, constrain_parent: bool) -> anyhow::Result<()> {
+    let mut fixture = Fixture::new(
+        "google",
+        if stream {
+            Reply::StreamText
+        } else {
+            Reply::Text
+        },
+    )?;
+    let mut parameters = task_board_parameters();
+    let mut expected_permission = json!({
+        "type": "string",
+        "description": parameters["properties"]["permission"]["description"],
+        "enum": ["read-only", "workspace-write", "danger-full-access", ""]
+    });
+    if constrain_parent {
+        // Sibling enum is a conjunct, not another alternative to append or
+        // overwrite. Keep the parent's restriction and default after merging.
+        parameters["properties"]["permission"]["enum"] = json!(["workspace-write", ""]);
+        parameters["properties"]["permission"]["default"] = json!("");
+        expected_permission["enum"] = json!(["workspace-write", ""]);
+        expected_permission["default"] = json!("");
+    }
+    runtime()?.block_on(async {
+        let _server = fixture.start()?;
+        let wire = dispatch(
+            &fixture.gateway,
+            OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1,
+            task_board_request(stream, parameters),
+        )
+        .await?;
+        let seen = fixture.only_request();
+        let action = if stream {
+            "streamGenerateContent"
+        } else {
+            "generateContent"
+        };
+        assert_eq!(
+            seen.uri.path(),
+            format!("/v1beta/models/{UPSTREAM_MODEL}:{action}")
+        );
+        assert!(
+            seen.uri
+                .query()
+                .unwrap_or_default()
+                .contains("key=local-fake-token")
+        );
+        assert_permission_enum_schema(&seen.body, expected_permission);
+        if stream {
+            assert!(seen.uri.query().unwrap_or_default().contains("alt=sse"));
+            let events: Vec<Value> = wire
+                .lines()
+                .filter_map(|line| line.strip_prefix("data: "))
+                .filter(|data| *data != "[DONE]")
+                .map(serde_json::from_str)
+                .collect::<Result<_, _>>()?;
+            assert!(
+                events.iter().all(|event| event.get("error").is_none()),
+                "stream failed: {wire}"
+            );
+            let text: String = events
+                .iter()
+                .filter_map(|event| event["choices"][0]["delta"]["content"].as_str())
+                .collect();
+            assert_eq!(text, "local reply", "missing streamed completion: {wire}");
+            assert!(
+                events
+                    .iter()
+                    .any(|event| event["choices"][0]["finish_reason"] == "stop"),
+                "missing stream finish: {wire}"
+            );
+            assert!(
+                wire.contains("data: [DONE]"),
+                "missing stream terminal: {wire}"
+            );
+        } else {
+            let response: Value = serde_json::from_str(&wire)?;
+            assert!(response.get("error").is_none(), "completion failed: {wire}");
+            assert_eq!(response["choices"][0]["message"]["content"], "local reply");
+            assert_eq!(response["choices"][0]["finish_reason"], "stop");
+        }
+        Ok(())
+    })
+}
+
+#[test]
+fn chat_to_gemini_permission_enum_and_empty_const_streams() -> anyhow::Result<()> {
+    permission_enum_route(true, false)
+}
+
+#[test]
+fn chat_to_gemini_permission_enum_and_empty_const_buffers() -> anyhow::Result<()> {
+    permission_enum_route(false, false)
+}
+
+#[test]
+fn chat_to_gemini_permission_one_of_preserves_parent_enum_constraint() -> anyhow::Result<()> {
+    permission_enum_route(false, true)
+}
+
 async fn capture_relay_request(
     State(seen): State<Arc<Mutex<Vec<Value>>>>,
     request: Request,
@@ -1059,41 +1231,115 @@ fn nyro_to_nyro_schedule_one_of_replay_reaches_native_gemini() -> anyhow::Result
 #[test]
 fn native_gemini_unsupported_schema_is_typed_422_without_contacting_upstream() -> anyhow::Result<()>
 {
-    let mut fixture = Fixture::new("google", Reply::Text)?;
-    runtime()?.block_on(async {
-        let _server = fixture.start()?;
-        let mut body = chat_request(false);
-        // The same composition is accepted by the ordinary Anthropic compat
-        // test, but native lowering must reject rather than silently drop it.
-        body["tools"][0]["function"]["parameters"] = json!({
-            "type": "object",
-            "properties": {"city": {"oneOf": [{"type": "number"}, {"type": "integer"}]}}
-        });
-        let (status, wire) = dispatch_outcome(
-            &fixture.gateway,
-            OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1,
-            body,
-        )
-        .await?;
-        assert_eq!(
-            status,
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "native schema rejection lost its status: {wire}"
-        );
-        assert!(
-            wire.contains("NYRO_PROTOCOL_LOSSY_REJECTED"),
-            "native schema rejection lost its type: {wire}"
-        );
-        assert!(
-            wire.contains("city") && wire.contains("oneOf"),
-            "schema rejection lost its path/reason: {wire}"
-        );
-        assert!(
-            fixture.upstream.seen.lock().unwrap().is_empty(),
-            "native rejection must precede upstream HTTP"
-        );
-        Ok(())
-    })
+    let cases = [
+        // The ordinary Anthropic compat route accepts this rich composition,
+        // but native lowering must still reject overlapping number/integer.
+        (
+            "overlapping types",
+            json!({
+                "oneOf": [{"type": "number"}, {"type": "integer"}]
+            }),
+            "oneOf",
+        ),
+        (
+            "overlapping finite enums",
+            json!({
+                "oneOf": [
+                    {"type": "string", "enum": ["read-only", "workspace-write"]},
+                    {"type": "string", "enum": ["workspace-write", "danger-full-access"]}
+                ]
+            }),
+            "oneOf",
+        ),
+        (
+            "enum overlaps empty const",
+            json!({
+                "oneOf": [
+                    {"type": "string", "enum": ["read-only", ""]},
+                    {"type": "string", "const": ""}
+                ]
+            }),
+            "oneOf",
+        ),
+        (
+            "nullable branches",
+            json!({
+                "oneOf": [
+                    {"type": "string", "enum": ["read-only", "workspace-write"], "nullable": true},
+                    {"type": "string", "enum": ["danger-full-access", ""], "nullable": true}
+                ]
+            }),
+            "nullable",
+        ),
+        (
+            "nullable parent",
+            json!({
+                "nullable": true,
+                "oneOf": [
+                    {"type": "string", "enum": ["read-only", "workspace-write"]},
+                    {"type": "string", "const": ""}
+                ]
+            }),
+            "nullable",
+        ),
+        (
+            "differing constraints",
+            json!({
+                "oneOf": [
+                    {"type": "string", "enum": ["read-only", "workspace-write"], "minLength": 1},
+                    {"type": "string", "const": "", "minLength": 0}
+                ]
+            }),
+            "oneOf",
+        ),
+        (
+            "differing annotations",
+            json!({
+                "oneOf": [
+                    {"type": "string", "enum": ["read-only", "workspace-write"], "description": "Named permission"},
+                    {"type": "string", "const": "", "description": "Unchanged permission"}
+                ]
+            }),
+            "oneOf",
+        ),
+    ];
+    for (case, permission, reason) in cases {
+        for stream in [false, true] {
+            let mut fixture = Fixture::new("google", Reply::Text)?;
+            let mut parameters = task_board_parameters();
+            parameters["properties"]["permission"] = permission.clone();
+            runtime()?.block_on(async {
+                let _server = fixture.start()?;
+                let (status, wire) = dispatch_outcome(
+                    &fixture.gateway,
+                    OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1,
+                    task_board_request(stream, parameters),
+                )
+                .await?;
+                assert_eq!(
+                    status,
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "{case} (stream={stream}) lost its rejection status: {wire}"
+                );
+                let response: Value = serde_json::from_str(&wire)?;
+                assert_eq!(
+                    response["error"]["type"], "NYRO_PROTOCOL_LOSSY_REJECTED",
+                    "{case} lost its rejection type: {wire}"
+                );
+                assert!(
+                    wire.contains("permission") && wire.contains(reason),
+                    "{case} lost its schema path/reason: {wire}"
+                );
+                assert_eq!(
+                    fixture.request_count(),
+                    0,
+                    "{case} must reject before upstream HTTP"
+                );
+                Ok::<_, anyhow::Error>(())
+            })?;
+        }
+    }
+    Ok(())
 }
 
 #[test]
@@ -1115,6 +1361,11 @@ fn default_gemini_passthrough_preserves_raw_schema_without_native_cleanup() -> a
                     "additionalProperties": false,
                     "x-client-schema": {"keep": true}
                 }
+            }, {
+                "name": "task_board_update",
+                // Gemini ingress retains the original oneOf/const; only a
+                // cross-protocol native request needs finite-enum lowering.
+                "parameters": task_board_parameters()
             }]}],
             "toolConfig": {"functionCallingConfig": {"mode": "AUTO"}},
             "cachedContent": "cachedContents/local-only"

@@ -4,6 +4,18 @@ All notable changes to Nyro will be documented in this file.
 
 ---
 
+## v2.1.29
+
+> Released on 2026-11-05
+
+#### Fixes
+
+- **Gemini finite-enum `oneOf` tool parameters**: native Gemini conversion now merges `oneOf` alternatives that are explicit string enums or string constants with pairwise-disjoint value domains into a single native `enum`, fixing the HTTP 422 `NYRO_PROTOCOL_LOSSY_REJECTED` of tools such as `task_board_update`, whose `permission` accepts a three-value enum or an empty string. Previously such branches were rejected because their explicit types both say `string`, so the type-disjointness proof could not apply and the request never reached Google.
+- **Lossless and conservative lowering**: every branch is fully lowered first (const normalization, local `$ref` resolution, nested unions, depth and node budgets), duplicate values within one branch follow enum set semantics while cross-branch overlap, differing residual constraints or annotations, and unsafe `nullable` alternatives are still rejected. First-occurrence value order, parent enum intersection, descriptions, defaults and the existing disjoint-type `anyOf` fallback are unchanged.
+- **Regression coverage**: added a sanitized 59-tool production-shaped replay through the real dispatcher and a local HTTP upstream in streaming and buffered modes, asserting the native parameters enum (including the empty string), all 59 declarations, and successful completions; seven unsafe compositions return the typed 422 with zero upstream requests in both modes. Unit tests cover reversed branch order, use-site reference narrowing, duplicate-heavy budgets, all 49 small two-branch domain combinations, and exact depth/node boundaries. No database migration is required.
+
+---
+
 ## v2.1.28
 
 > Released on 2026-11-05
