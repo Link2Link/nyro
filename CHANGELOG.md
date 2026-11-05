@@ -4,6 +4,18 @@ All notable changes to Nyro will be documented in this file.
 
 ---
 
+## v2.1.27
+
+> Released on 2026-11-05
+
+#### Fixes
+
+- **Google Gemini subscription API prices**: Google AI Pro / Code Assist provider cards using Antigravity or Gemini CLI OAuth now show Total API price, Current-cycle API price and Estimated cycle API capacity below their quota bars, matching the existing coding-plan and Codex summaries. Retained attempts reuse current Google API base-model references or explicit manual prices; effort variants keep their matching base price, and missing newer-model references remain unpriced rather than borrowing an older model's rate.
+- **Conservative Google cycle estimates**: identified weekly quota takes precedence; an identified five-hour window is used only when no weekly window is reported. Catalog-only Gemini shared pools, feature quotas and unknown-duration windows are not guessed into a cycle. Zero usage can retain current-cycle totals but never produces a capacity estimate; expired, stale, mismatched or unpriced data is not projected. The shared summary also rejects leftover capacity values without a valid priced cycle sample, while keeping explicitly priced zero valid.
+- **Coverage and isolation**: added bilingual card, quota-parser-to-pricing, reference-price, retention and forwarding regressions for both Google OAuth channels. Statistics remain admin-only, use retained gateway logs rather than actual subscription billing, and do not change quota observation, credentials or routing. No database migration is required.
+
+---
+
 ## v2.1.26
 
 > Released on 2026-11-05

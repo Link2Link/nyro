@@ -122,7 +122,8 @@ export function isKiroOverage(usage?: Pick<ProviderUsage, "kind" | "scheduling" 
 
 /** Provider-level API-equivalent totals are currently emitted for these plan backends only. */
 export function providerApiPriceSupported(kind: string | undefined): boolean {
-  return kind === "glm_coding_plan" || kind === "minimax_coding_plan" || kind === "grok_plan" || kind === "openai_codex";
+  return kind === "glm_coding_plan" || kind === "minimax_coding_plan" || kind === "grok_plan" || kind === "openai_codex"
+    || kind === "google_subscription";
 }
 
 export function providerUsageTitle(kind: string | undefined, isZh: boolean): string {

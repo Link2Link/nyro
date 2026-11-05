@@ -253,6 +253,58 @@ fn popular_models_through_proxies_and_oauth_require_official_base_match() {
 }
 
 #[test]
+fn google_subscription_effort_variants_use_official_api_prices_without_guessing_versions() {
+    let (_dir, catalog) = catalog(json!({
+        "google": {"models": {
+            "gemini-3.8-flash": {"id": "gemini-3.8-flash", "cost": {"input": 2, "output": 8, "cache_read": 0.5}}
+        }},
+        "reseller": {"models": {
+            "gemini-3.8-flash": {"id": "gemini-3.8-flash", "cost": {"input": 99, "output": 99}},
+            "gemini-3.9-flash": {"id": "gemini-3.9-flash", "cost": {"input": 99, "output": 99}}
+        }}
+    }));
+    for channel in ["antigravity", "gemini-cli"] {
+        let mut p = provider(Some("google"));
+        p.preset_key = Some("google".into());
+        p.channel = Some(channel.into());
+        p.auth_mode = "oauth".into();
+        p.protocol = "google-gemini/generate-content/v1beta".into();
+        p.base_url = "https://cloudcode-pa.googleapis.com".into();
+        for model in [
+            "gemini-3.8-flash",
+            "gemini-3.8-flash-high",
+            "gemini-3.8-flash-tiered",
+            "google/gemini-3.8-flash-low",
+        ] {
+            let pricing = resolve_pricing(Some(&catalog), &p, model).unwrap();
+            assert_eq!(pricing.provider, "google");
+            assert_eq!(pricing.model, "gemini-3.8-flash");
+            assert_eq!(pricing.input, 2.0);
+            assert_eq!(pricing.output, 8.0);
+            assert_eq!(pricing.cache_read, Some(0.5));
+            assert_eq!(
+                pricing
+                    .cost(&row(1_000_000, 250_000, 500_000))
+                    .unwrap()
+                    .total_cost,
+                5.625,
+                "{channel}: {model} must not double-count cached input"
+            );
+        }
+        for model in [
+            "gemini-3.9-flash",
+            "gemini-3.80-flash",
+            "gemini-3.8-flashish",
+        ] {
+            assert!(
+                resolve_pricing(Some(&catalog), &p, model).is_none(),
+                "{channel}: missing official version must stay unpriced: {model}"
+            );
+        }
+    }
+}
+
+#[test]
 fn subscription_zero_placeholders_use_api_base_references_or_remain_unpriced() {
     let (_dir, catalog) = catalog(json!({
         "alibaba-coding-plan": {"models": {

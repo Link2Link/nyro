@@ -35,7 +35,11 @@ struct PricePeriod<'a> {
 fn supported(kind: &str) -> bool {
     matches!(
         kind,
-        "glm_coding_plan" | "minimax_coding_plan" | "grok_plan" | "openai_codex"
+        "glm_coding_plan"
+            | "minimax_coding_plan"
+            | "grok_plan"
+            | "openai_codex"
+            | "google_subscription"
     )
 }
 
