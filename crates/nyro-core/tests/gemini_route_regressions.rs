@@ -1018,12 +1018,31 @@ fn assert_permission_enum_schema(body: &Value, expected_permission: Value) {
         "finite oneOf must become a native enum without losing siblings: {declaration}"
     );
     let permission = &declaration["parameters"]["properties"]["permission"];
-    for keyword in ["oneOf", "const", "anyOf"] {
+    for keyword in ["oneOf", "const"] {
         assert!(
             permission.get(keyword).is_none(),
             "unexpected {keyword}: {permission}"
         );
     }
+    // Google rejects empty enum members with 400 INVALID_ARGUMENT
+    // (`enum[i]: cannot be empty`, incident 109a83f1): none may survive
+    // anywhere on the native wire, in this tool or any other.
+    fn assert_no_empty_enum(value: &Value) {
+        match value {
+            Value::Array(arr) => arr.iter().for_each(assert_no_empty_enum),
+            Value::Object(map) => {
+                if let Some(Value::Array(members)) = map.get("enum") {
+                    assert!(
+                        !members.iter().any(|m| m.as_str() == Some("")),
+                        "empty enum member on the wire: {value}"
+                    );
+                }
+                map.values().for_each(assert_no_empty_enum);
+            }
+            _ => {}
+        }
+    }
+    assert_no_empty_enum(body);
     assert!(declaration.get("parametersJsonSchema").is_none());
 }
 
@@ -1037,17 +1056,25 @@ fn permission_enum_route(stream: bool, constrain_parent: bool) -> anyhow::Result
         },
     )?;
     let mut parameters = task_board_parameters();
+    // The empty string cannot travel in a native enum (Google rejects it),
+    // so the lowered union encodes it as a `pattern: "^$"` anyOf branch.
     let mut expected_permission = json!({
         "type": "string",
         "description": parameters["properties"]["permission"]["description"],
-        "enum": ["read-only", "workspace-write", "danger-full-access", ""]
+        "anyOf": [
+            {"type": "string", "enum": ["read-only", "workspace-write", "danger-full-access"]},
+            {"type": "string", "pattern": "^$"}
+        ]
     });
     if constrain_parent {
         // Sibling enum is a conjunct, not another alternative to append or
         // overwrite. Keep the parent's restriction and default after merging.
         parameters["properties"]["permission"]["enum"] = json!(["workspace-write", ""]);
         parameters["properties"]["permission"]["default"] = json!("");
-        expected_permission["enum"] = json!(["workspace-write", ""]);
+        expected_permission["anyOf"] = json!([
+            {"type": "string", "enum": ["workspace-write"]},
+            {"type": "string", "pattern": "^$"}
+        ]);
         expected_permission["default"] = json!("");
     }
     runtime()?.block_on(async {
