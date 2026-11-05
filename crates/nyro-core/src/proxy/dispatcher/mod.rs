@@ -1889,7 +1889,10 @@ async fn dispatch_pipeline_inner(
             match runtime_quota_scope.as_ref() {
                 Some(scope) => known.iter().all(|bucket| &bucket.scope_id == scope),
                 None if crate::provider::google::antigravity::is_google_antigravity(&provider)
-                    || crate::provider::google::gemini_cli::is_google_gemini_cli(&provider) => known.is_empty(),
+                    || crate::provider::google::gemini_cli::is_google_gemini_cli(&provider) =>
+                {
+                    known.is_empty()
+                }
                 None => true,
             }
         };
