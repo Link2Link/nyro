@@ -4,6 +4,17 @@ Nyro 的所有重要变更均记录在此文件中。
 
 ---
 
+## v2.1.35
+
+> 发布于 2026-11-10
+
+#### 修复
+
+- **Fable 5.2 的 Claude Code 版本声明**（#24）：OAuth 推理及管理端模型探测生成的请求，现统一在 User-Agent 与 billing `cc_version` 中使用 Claude Code `2.1.321`。这是经 Fable 5.2 Messages 请求实测的窄范围身份升级，保留原有 SDK/runtime 默认值、beta 组装、请求整形、TLS 传输及账号调度逻辑。原生 Claude Code 客户端继续使用独立的 `2.1.x` / patch ≥ 280 Header 保留范围，不因生成请求版本提高而被改写。
+- **Fable 5.2 目录与回归保障**（#24）：内置 Claude Code 订阅目录新增 `claude-fable-5-2`，同时保留 Fable 5.1 和旧模型。新增请求整形及账号级 loopback 回归，覆盖 `who are u`、UA/billing 版本一致、最终线上字节的 CCH、模型 ID 不变，以及 Fable 5.2 不自动注入 fallback；继续覆盖所选健康/拒绝账号、原生流式、旧客户端身份及供应商元数据快照。目录条目不等同账号具备该模型权益。无需数据库迁移，不含自动部署。
+
+---
+
 ## v2.1.34
 
 > 发布于 2026-11-06

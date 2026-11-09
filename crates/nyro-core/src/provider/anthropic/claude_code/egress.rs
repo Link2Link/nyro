@@ -279,11 +279,11 @@ pub(crate) fn prepare(
                 out.insert(name.clone(), value.clone());
             }
         }
-        let current =
-            header_str(&out, "user-agent").is_some_and(profile::caller_user_agent_is_current);
-        if !current {
-            // An older (or unparseable) client would advertise a software
-            // profile this gateway has not measured; send the baseline.
+        let compatible =
+            header_str(&out, "user-agent").is_some_and(profile::caller_user_agent_is_compatible);
+        if !compatible {
+            // Outside the independently supported native version range, use
+            // the generated profile rather than unvalidated caller headers.
             cli_profile_headers(&mut out, count_tokens, false);
         }
         cli_profile_headers(&mut out, count_tokens, true);
@@ -525,12 +525,65 @@ mod tests {
     }
 
     #[test]
+    fn fable_52_generated_requests_use_verified_identity_without_fallback() {
+        for stream in [false, true] {
+            let mut body = json!({
+                "model": "claude-fable-5-2",
+                "max_tokens": 1024,
+                "messages": [{"role": "user", "content": "who are u"}]
+            });
+            if stream {
+                body["stream"] = json!(true);
+            }
+            let (url, headers, hook) = run(&HeaderMap::new(), &mut body);
+            assert!(!hook.native);
+            assert_eq!(url, "https://api.anthropic.com/v1/messages?beta=true");
+            assert_eq!(headers["user-agent"], "claude-cli/2.1.321 (external, cli)");
+            assert_eq!(headers["x-stainless-package-version"], "0.112.1");
+            assert_eq!(body["model"], "claude-fable-5-2");
+            assert_eq!(body["max_tokens"], 1024);
+            assert_eq!(
+                body.get("stream").and_then(Value::as_bool),
+                stream.then_some(true)
+            );
+            assert!(body.get("fallbacks").is_none());
+            assert!(body.get("thinking").is_none());
+            assert!(body.get("output_config").is_none());
+            assert_eq!(body["system"].as_array().unwrap().len(), 2);
+            assert_eq!(body["messages"][0]["content"][1]["text"], "who are u");
+            // Preserve the exact beta set exercised by the successful live probe.
+            assert_eq!(
+                headers["anthropic-beta"],
+                "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,\
+                 redact-thinking-2026-02-12,thinking-token-count-2026-05-13,\
+                 context-management-2025-06-27,prompt-caching-scope-2026-01-05,\
+                 mid-conversation-system-2026-04-07,mid-conversation-tool-changes-2026-07-01,\
+                 effort-2025-11-24,extended-cache-ttl-2025-04-11"
+            );
+            let unsigned = serde_json::to_vec(&body).unwrap();
+            let expected = cch::sign_body(&unsigned).unwrap();
+            let signed = hook.finalize_request_body(Bytes::from(unsigned));
+            assert_eq!(signed.as_ref(), expected.as_slice());
+            let signed: Value = serde_json::from_slice(&signed).unwrap();
+            let billing = signed["system"][0]["text"].as_str().unwrap();
+            assert!(billing.starts_with("x-anthropic-billing-header: cc_version=2.1.321."));
+            assert!(!billing.contains("cch=00000;"));
+        }
+    }
+
+    #[test]
     fn native_claude_code_keeps_its_identity_and_body() {
+        for version in ["2.1.280", "2.1.290", "2.1.312", "2.1.321", "2.1.322"] {
+            check_native_claude_code_identity(version);
+        }
+    }
+
+    fn check_native_claude_code_identity(version: &str) {
         let session = "8f14e45f-ceea-4672-9b8e-3c1c1a0e4a1d";
         let mut incoming = HeaderMap::new();
         incoming.insert(
             "user-agent",
-            HeaderValue::from_static("claude-cli/2.1.290 (external, cli)"),
+            HeaderValue::from_str(&format!("claude-cli/{version} (external, cli)")).unwrap(),
         );
         incoming.insert("x-app", HeaderValue::from_static("cli"));
         incoming.insert(
@@ -550,7 +603,7 @@ mod tests {
         let mut body = json!({
             "model": "claude-opus-4-7",
             "system": [
-                {"type": "text", "text": "x-anthropic-billing-header: cc_version=2.1.290.abc; cc_entrypoint=cli;"},
+                {"type": "text", "text": format!("x-anthropic-billing-header: cc_version={version}.abc; cc_entrypoint=cli;")},
                 {"type": "text", "text": "You are Claude Code, Anthropic's official CLI for Claude.", "cache_control": {"type": "ephemeral"}},
                 {"type": "text", "text": "Long native prompt"}
             ],
@@ -561,7 +614,10 @@ mod tests {
         let (_, headers, hook) = run(&incoming, &mut body);
 
         assert!(hook.native);
-        assert_eq!(headers["user-agent"], "claude-cli/2.1.290 (external, cli)");
+        assert_eq!(
+            headers["user-agent"].to_str().unwrap(),
+            format!("claude-cli/{version} (external, cli)")
+        );
         assert_eq!(headers["x-stainless-package-version"], "0.113.0");
         assert_eq!(headers[identity::SESSION_HEADER], session);
         assert_eq!(
@@ -569,6 +625,12 @@ mod tests {
             "claude-code-20250219,oauth-2025-04-20,context-1m-2025-08-07,interleaved-thinking-2025-05-14,extended-cache-ttl-2025-04-11"
         );
         // Body stays native: system untouched apart from the cch placeholder.
+        assert_eq!(
+            body["system"][0]["text"],
+            format!(
+                "x-anthropic-billing-header: cc_version={version}.abc; cc_entrypoint=cli; cch=00000;"
+            )
+        );
         assert_eq!(body["system"][2]["text"], "Long native prompt");
         assert_eq!(body["tools"][0]["name"], "Bash");
         assert!(

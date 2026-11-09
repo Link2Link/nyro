@@ -1,8 +1,9 @@
 //! Request-body rewriting for the Claude Code OAuth channel.
 //!
 //! A caller that is not genuine Claude Code is "cloaked" into the measured
-//! Claude Code 2.1.280 Messages shape before it reaches Anthropic with the
-//! subscription token. Ported from CLIProxyAPI `applyCloakingInternal` and the
+//! Claude Code 2.1.280 Messages shape with the generated CLI identity from
+//! `profile` before it reaches Anthropic with the subscription token.
+//! Ported from CLIProxyAPI `applyCloakingInternal` and the
 //! surrounding body steps of `ClaudeExecutor.Execute`:
 //!
 //! 1. `system` becomes `[billing header, Claude Code identity]`; the caller's
@@ -1100,7 +1101,7 @@ mod tests {
 
         let billing = body["system"][0]["text"].as_str().unwrap();
         assert!(
-            billing.starts_with("x-anthropic-billing-header: cc_version=2.1.280."),
+            billing.starts_with("x-anthropic-billing-header: cc_version=2.1.321."),
             "{billing}"
         );
         assert!(
