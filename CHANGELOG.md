@@ -4,6 +4,17 @@ All notable changes to Nyro will be documented in this file.
 
 ---
 
+## v2.1.35
+
+> Released on 2026-11-10
+
+#### Fixes
+
+- **Claude Code identity for Fable 5.2**: generated OAuth inference and admin model-probe requests now use Claude Code `2.1.321` consistently in the User-Agent and billing `cc_version`. This is a narrowly scoped identity upgrade verified by a Fable 5.2 Messages request; existing SDK/runtime defaults, beta assembly, request-shaping rules, TLS transport and account scheduling remain unchanged. Native Claude Code clients keep the independently supported `2.1.x` / patch ≥ 280 header-preservation range instead of being rewritten merely because the generated identity advanced.
+- **Fable 5.2 discovery and regression coverage**: add `claude-fable-5-2` to the built-in Claude Code subscription catalog while retaining Fable 5.1 and older models. Added request-shaping and account-scoped loopback checks for `who are u`, matching UA/billing versions, CCH over final wire bytes, unchanged model IDs and no injected Fable 5.2 fallback; healthy/rejected selected accounts, native streaming, older client identities and provider metadata snapshots remain covered. Catalog membership does not imply account-specific entitlement. No database migration or automatic deployment is included.
+
+---
+
 ## v2.1.34
 
 > Released on 2026-11-06

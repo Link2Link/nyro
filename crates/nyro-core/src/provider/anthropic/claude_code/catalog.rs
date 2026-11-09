@@ -10,16 +10,17 @@
 //! Refresh [`STATIC_MODELS`] when a new Claude Code release changes its `cc`
 //! picker (`model_selector_config` entry `id:"cc"` in the CLI binary).
 
-/// Claude Code 2.1.312's built-in `cc` picker (main section first, then
-/// overflow), followed by the older dated ids CLIProxyAPI keeps so existing
-/// routes stay discoverable. Newest first.
+/// Based on Claude Code 2.1.312's `cc` picker, with Fable 5.2 promoted after
+/// its 2.1.321 release. Retain Fable 5.1 and older dated ids for existing routes;
+/// catalog membership is not proof of account-specific model access.
 pub(crate) const STATIC_MODELS: &[&str] = &[
     // cc picker — main
     "claude-opus-5-5",
     "claude-sonnet-5-5",
-    "claude-fable-5-1",
+    "claude-fable-5-2",
     "claude-haiku-5-5",
-    // cc picker — overflow
+    // previous picker entries and overflow
+    "claude-fable-5-1",
     "claude-opus-5",
     "claude-sonnet-5",
     "claude-fable-5",
@@ -49,10 +50,12 @@ mod tests {
             &[
                 "claude-opus-5-5",
                 "claude-sonnet-5-5",
-                "claude-fable-5-1",
+                "claude-fable-5-2",
                 "claude-haiku-5-5"
             ]
         );
+        assert!(STATIC_MODELS.contains(&"claude-fable-5-1"));
+        assert!(STATIC_MODELS.contains(&"claude-fable-5"));
         let mut seen = std::collections::HashSet::new();
         assert!(
             STATIC_MODELS.iter().all(|m| seen.insert(*m)),

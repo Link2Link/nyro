@@ -1,17 +1,21 @@
 //! Claude Code CLI wire profile: request predicates, native-client detection
 //! and per-request `anthropic-beta` assembly.
 //!
-//! Values mirror CLIProxyAPI's measured Claude Code 2.1.280 baseline
-//! (`helps/claude_device_profile.go`, `claudeCodeCLIBetas`). Bump them
-//! together, and only after measuring a new Claude Code release.
+//! Body/beta rules and SDK defaults retain CLIProxyAPI's measured 2.1.280
+//! profile. The generated CLI identity is 2.1.321: a version-only upgrade was
+//! verified with a Fable 5.2 Messages probe. This is not a wholesale 2.1.321
+//! wire-profile port; preserve native clients independently of this identity.
 
 use std::collections::HashSet;
 
 use reqwest::header::HeaderMap;
 use serde_json::Value;
 
-pub(crate) const CLI_VERSION: &str = "2.1.280";
-pub(crate) const CLI_USER_AGENT: &str = "claude-cli/2.1.280 (external, cli)";
+pub(crate) const CLI_VERSION: &str = "2.1.321";
+pub(crate) const CLI_USER_AGENT: &str = "claude-cli/2.1.321 (external, cli)";
+// Raising the generated identity must not rewrite previously supported native
+// clients with a newer header profile while preserving their older bodies.
+const NATIVE_CLI_VERSION_FLOOR: (u32, u32, u32) = (2, 1, 280);
 pub(crate) const STAINLESS_PACKAGE_VERSION: &str = "0.112.1";
 pub(crate) const STAINLESS_RUNTIME_VERSION: &str = "v26.3.0";
 pub(crate) const STAINLESS_OS: &str = "MacOS";
@@ -660,15 +664,13 @@ pub(crate) fn parse_cli_user_agent(ua: &str) -> Option<(u32, u32, u32, String)> 
     Some((major, minor, patch, entrypoint))
 }
 
-/// Whether a caller UA is a Claude Code release at or above the baseline in
-/// the same major/minor line, so its measured identity may be kept.
-pub(crate) fn caller_user_agent_is_current(ua: &str) -> bool {
+/// Whether a caller UA is in the supported native release range. This floor
+/// is independent of the generated CLI identity used for non-native requests.
+pub(crate) fn caller_user_agent_is_compatible(ua: &str) -> bool {
     let Some((major, minor, patch, _)) = parse_cli_user_agent(ua) else {
         return false;
     };
-    let Some((b_major, b_minor, b_patch, _)) = parse_cli_user_agent(CLI_USER_AGENT) else {
-        return false;
-    };
+    let (b_major, b_minor, b_patch) = NATIVE_CLI_VERSION_FLOOR;
     major == b_major && minor == b_minor && patch >= b_patch
 }
 
@@ -814,15 +816,38 @@ mod tests {
         );
         assert!(parse_cli_user_agent("claude-cli/1.0.98 (external, cli)").is_some());
         assert!(parse_cli_user_agent("curl/8.0").is_none());
-        assert!(caller_user_agent_is_current(
+        assert!(caller_user_agent_is_compatible(
             "claude-cli/2.1.290 (external, cli)"
         ));
-        assert!(!caller_user_agent_is_current(
+        assert!(!caller_user_agent_is_compatible(
             "claude-cli/2.1.100 (external, cli)"
         ));
-        assert!(!caller_user_agent_is_current(
+        assert!(!caller_user_agent_is_compatible(
             "claude-cli/2.2.0 (external, cli)"
         ));
+    }
+
+    #[test]
+    fn generated_identity_and_native_compatibility_are_independent() {
+        assert_eq!(CLI_VERSION, "2.1.321");
+        assert_eq!(
+            CLI_USER_AGENT,
+            format!("claude-cli/{CLI_VERSION} (external, cli)")
+        );
+        for version in ["2.1.280", "2.1.290", "2.1.312", "2.1.321", "2.1.322"] {
+            assert!(
+                caller_user_agent_is_compatible(&format!("claude-cli/{version} (external, cli)")),
+                "{version}"
+            );
+        }
+        for ua in [
+            "claude-cli/2.1.279 (external, cli)",
+            "claude-cli/2.2.0 (external, cli)",
+            "claude-cli/3.1.321 (external, cli)",
+            "curl/8.0",
+        ] {
+            assert!(!caller_user_agent_is_compatible(ua), "{ua}");
+        }
     }
 
     #[test]

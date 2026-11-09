@@ -25,6 +25,8 @@ const UPSTREAM_MODEL: &str = "claude-opus-5";
 const ACCOUNT_UUID: &str = "1b4e28ba-2fa1-11d2-883f-0016d3cca427";
 /// The fixture answers this model with Anthropic's `credits_required` 429.
 const CREDITS_MODEL: &str = "claude-fable-5-1";
+const FABLE_MODEL: &str = "claude-fable-5-2";
+const FABLE_REPLY: &str = "I am Claude Fable 5.2 (claude-fable-5-2).";
 
 #[derive(Debug, Clone)]
 struct Captured {
@@ -130,6 +132,23 @@ async fn start_upstream() -> (String, Arc<Mutex<Vec<Captured>>>) {
                     let response = format!(
                         "HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{refusal}",
                         refusal.len()
+                    );
+                    sink.lock().unwrap().push(request);
+                    let _ = socket.write_all(response.as_bytes()).await;
+                    let _ = socket.shutdown().await;
+                    return;
+                }
+                // Synthetic model identity reply for the account-scoped admin probe.
+                if body["model"] == FABLE_MODEL {
+                    let message = json!({
+                        "id":"msg_fable","type":"message","role":"assistant","model":FABLE_MODEL,
+                        "content":[{"type":"text","text":FABLE_REPLY}],
+                        "stop_reason":"end_turn","usage":{"input_tokens":5,"output_tokens":12}
+                    })
+                    .to_string();
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{message}",
+                        message.len()
                     );
                     sink.lock().unwrap().push(request);
                     let _ = socket.write_all(response.as_bytes()).await;
@@ -372,7 +391,7 @@ async fn third_party_anthropic_client_is_cloaked_signed_and_restored() {
     );
     assert_eq!(
         request.header("user-agent"),
-        Some("claude-cli/2.1.280 (external, cli)")
+        Some("claude-cli/2.1.321 (external, cli)")
     );
     assert_eq!(request.header("x-app"), Some("cli"));
     assert_eq!(request.header("x-stainless-lang"), Some("js"));
@@ -393,7 +412,7 @@ async fn third_party_anthropic_client_is_cloaked_signed_and_restored() {
         sent["system"][0]["text"]
             .as_str()
             .unwrap()
-            .starts_with("x-anthropic-billing-header: cc_version=2.1.280.")
+            .starts_with("x-anthropic-billing-header: cc_version=2.1.321.")
     );
     assert_eq!(
         sent["system"][1]["text"],
@@ -617,12 +636,13 @@ async fn model_discovery_returns_the_built_in_claude_code_catalog() {
         gw.admin().test_provider_models(&id).await.unwrap(),
     ] {
         assert_eq!(
-            &models[..4],
+            &models[..5],
             &[
                 "claude-opus-5-5",
                 "claude-sonnet-5-5",
-                "claude-fable-5-1",
-                "claude-haiku-5-5"
+                "claude-fable-5-2",
+                "claude-haiku-5-5",
+                "claude-fable-5-1"
             ],
             "{models:?}"
         );
@@ -862,7 +882,7 @@ async fn setup_pool(
 }
 
 #[tokio::test]
-async fn claude_model_probe_uses_selected_account_and_never_falls_back() {
+async fn claude_fable_5_2_model_probe_uses_selected_account_and_never_falls_back() {
     let (url, captured) = start_upstream().await;
     let (_dir, gw, id) = setup_pool(&url, "pool-auth-rejected", 3).await;
     let accounts = gw
@@ -885,8 +905,8 @@ async fn claude_model_probe_uses_selected_account_and_never_falls_back() {
             .admin()
             .probe_provider_models_with_account(
                 &id,
-                Some(vec![UPSTREAM_MODEL.into()]),
-                Some("Say selected account".into()),
+                Some(vec![FABLE_MODEL.into()]),
+                Some("who are u".into()),
                 Some(account.account_id.clone()),
             )
             .await
@@ -900,11 +920,22 @@ async fn claude_model_probe_uses_selected_account_and_never_falls_back() {
             Some(account.label.as_str())
         );
         assert_eq!(outcome.results.len(), 1);
-        assert_eq!(
-            outcome.results[0].success, expected_success,
-            "{:?}",
-            outcome.results
-        );
+        let result = &outcome.results[0];
+        assert_eq!(result.model, FABLE_MODEL);
+        assert_eq!(result.success, expected_success, "{result:?}");
+        if expected_success {
+            assert!(result.error.is_none(), "{result:?}");
+            assert_eq!(result.reply.as_deref(), Some(FABLE_REPLY));
+        } else {
+            assert!(result.reply.is_none(), "{result:?}");
+            assert_eq!(
+                result.error.as_deref(),
+                Some(
+                    "Selected account authentication or model access was rejected; reauthorize it or verify model access"
+                ),
+                "account-scoped probes must retain the existing safe error classification"
+            );
+        }
         let requests = captured.lock().unwrap();
         let calls: Vec<_> = requests
             .iter()
@@ -915,8 +946,42 @@ async fn claude_model_probe_uses_selected_account_and_never_falls_back() {
             calls[0].header("authorization"),
             Some(format!("Bearer {}", account.access_token).as_str())
         );
-        assert!(cch::verify_body(&calls[0].raw_body));
-        assert!(calls[0].body().to_string().contains("Say selected account"));
+        let request = calls[0];
+        assert!(request.line.starts_with("POST /v1/messages?beta=true "));
+        let user_agent = request.header("user-agent").unwrap();
+        assert_eq!(user_agent, "claude-cli/2.1.321 (external, cli)");
+        let sent = request.body();
+        assert_eq!(sent["model"], FABLE_MODEL, "no model substitution");
+        assert_eq!(sent["max_tokens"], 1024);
+        assert!(sent.get("fallbacks").is_none(), "{sent}");
+        assert!(sent.get("fallback_credit_token").is_none(), "{sent}");
+        assert_eq!(sent["messages"][0]["role"], "user");
+        assert!(
+            sent["messages"][0]["content"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|block| block["type"] == "text" && block["text"] == "who are u"),
+            "{sent}"
+        );
+        let billing = sent["system"][0]["text"].as_str().unwrap();
+        let version = user_agent
+            .strip_prefix("claude-cli/")
+            .unwrap()
+            .split_once(' ')
+            .unwrap()
+            .0;
+        assert!(
+            billing.starts_with(&format!(
+                "x-anthropic-billing-header: cc_version={version}."
+            )),
+            "billing version must match the emitted CLI UA: {billing}"
+        );
+        // Verify the bytes read from the socket, not a re-serialized JSON value.
+        assert!(
+            cch::verify_body(&request.raw_body),
+            "cch must attest the final Fable 5.2 probe wire bytes"
+        );
         let serialized = serde_json::to_string(&outcome).unwrap();
         assert!(!serialized.contains("pool-healthy") && !serialized.contains("pool-auth-rejected"));
     }
@@ -924,7 +989,7 @@ async fn claude_model_probe_uses_selected_account_and_never_falls_back() {
     // Claude pool rather than silently selecting an arbitrary account.
     assert!(
         gw.admin()
-            .probe_provider_models_with_prompt(&id, Some(vec![UPSTREAM_MODEL.into()]), None)
+            .probe_provider_models_with_prompt(&id, Some(vec![FABLE_MODEL.into()]), None)
             .await
             .is_err()
     );

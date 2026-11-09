@@ -519,7 +519,7 @@ mod tests {
         );
         assert_eq!(
             binding.extra_headers.get("user-agent").unwrap(),
-            "claude-cli/2.1.280 (external, cli)"
+            "claude-cli/2.1.321 (external, cli)"
         );
         assert_eq!(binding.extra_headers.get("x-app").unwrap(), "cli");
         assert!(!binding.extra_headers.contains_key("origin"));
@@ -544,6 +544,7 @@ mod tests {
         );
         for expected in [
             "claude-sonnet-5-5",
+            "claude-fable-5-2",
             "claude-fable-5-1",
             "claude-haiku-5-5",
             "claude-opus-4-8",
