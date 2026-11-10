@@ -114,6 +114,9 @@ pub struct ProviderAccountView {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub claude_usage: Option<ClaudeUsage>,
     pub observed_at: Option<i64>,
+    /// Mandatory Claude usage admission deadline; not an observation timestamp.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage_refresh_available_at: Option<i64>,
     pub stale: bool,
     pub updated_at: String,
 }
@@ -371,6 +374,7 @@ fn safe_account(
         reserve_usd: state.usage.as_ref().and_then(|u| u.overage_usd),
         kiro_usage: None,
         claude_usage: None,
+        usage_refresh_available_at: None,
         observed_at: state.observed_at,
         stale: is_stale(&state),
         updated_at: account.updated_at.clone(),
@@ -723,7 +727,7 @@ impl AdminService {
             config.is_some() || accounts.len() <= 1,
             "AMBIGUOUS_ACCOUNT: an unconfigured provider cannot select among multiple accounts"
         );
-        let view = pool_view_with_kind(
+        let mut view = pool_view_with_kind(
             id,
             config,
             &accounts,
@@ -735,6 +739,13 @@ impl AdminService {
                 "devin"
             },
         );
+        if is_claude_provider(&provider) {
+            for (row, account) in view.accounts.iter_mut().zip(&accounts) {
+                row.usage_refresh_available_at = self
+                    .claude_usage_refresh_deadline(&provider, account)
+                    .await?;
+            }
+        }
         self.publish_pool_scheduling(&view, &accounts);
         Ok(view)
     }
@@ -962,12 +973,17 @@ impl AdminService {
                 .context("Claude auth driver missing")?
                 .bind_runtime(provider, &credential)?;
             let usage = crate::provider::anthropic::claude_code::usage::fetch_usage_with_plan(
+                &self.gw,
                 &client,
                 binding
                     .base_url_override
                     .as_deref()
                     .unwrap_or(&provider.base_url),
                 token.trim(),
+                &credential,
+                previous
+                    .as_ref()
+                    .and_then(|a| ClaudeAccountState::parse(&a.account_state).observed_at),
                 target.account_id.as_deref().unwrap_or(&session.id),
             )
             .await?;
@@ -1186,6 +1202,16 @@ impl AdminService {
             return Err(conflict());
         }
         if current.account_state != before.account_state {
+            if is_claude_account(&current) {
+                let provider = self.account_pool_provider(id).await?;
+                return self
+                    .claude_account_with_refresh_deadline(
+                        &provider,
+                        &current,
+                        self.provider_pool_config(id).await?.as_ref(),
+                    )
+                    .await;
+            }
             // Join a completed concurrent observation rather than immediately
             // issuing the same expensive status RPC again.
             return Ok(safe_account(

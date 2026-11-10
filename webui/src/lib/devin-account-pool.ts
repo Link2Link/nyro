@@ -56,6 +56,8 @@ export interface ProviderAccountView {
   reserve_usd: number | null;
   kiro_usage?: KiroUsage | null;
   claude_usage?: ClaudeUsage | null;
+  /** Claude only: backend-authoritative next allowed usage refresh attempt (epoch milliseconds). */
+  usage_refresh_available_at?: number | null;
   observed_at: number | null;
   stale: boolean;
   updated_at: string;

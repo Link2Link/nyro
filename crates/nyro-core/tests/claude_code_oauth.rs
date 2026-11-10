@@ -507,8 +507,17 @@ async fn subscription_usage_reads_the_claude_code_usage_endpoint() {
         "{}",
         profile.line
     );
-    // Cached: a second refresh re-reads usage but not the profile.
+    // Cached: neither usage nor profile may be re-read within ten minutes.
     gw.admin().get_provider_usage(&id).await.unwrap();
+    assert_eq!(
+        captured
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| r.line.starts_with("GET /api/oauth/usage "))
+            .count(),
+        1
+    );
     let profile_calls = captured
         .lock()
         .unwrap()

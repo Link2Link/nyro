@@ -61,6 +61,7 @@ pub(super) fn safe_kiro_account(
         // Typed usage contains no credentials or opaque upstream diagnostics.
         kiro_usage: state.usage,
         claude_usage: None,
+        usage_refresh_available_at: None,
         observed_at: state.observed_at,
         stale: state.usage_stale
             || state
@@ -511,6 +512,7 @@ mod tests {
             kiro_usage: usage,
             claude_usage: None,
             observed_at: Some(Utc::now().timestamp_millis()),
+            usage_refresh_available_at: None,
             stale: false,
             updated_at: String::new(),
         }

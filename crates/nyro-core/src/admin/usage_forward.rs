@@ -981,6 +981,7 @@ mod tests {
                 kiro_usage: None,
                 claude_usage: None,
                 observed_at: None,
+                usage_refresh_available_at: None,
                 stale: true,
                 updated_at: String::new(),
             }],

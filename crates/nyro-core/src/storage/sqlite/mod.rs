@@ -1098,6 +1098,36 @@ impl SettingsStore for SqliteSettingsStore {
         Ok(())
     }
 
+    async fn compare_and_set(
+        &self,
+        key: &str,
+        expected: Option<&str>,
+        value: &str,
+    ) -> anyhow::Result<bool> {
+        let result = match expected {
+            Some(expected) => {
+                sqlx::query(
+                    "UPDATE settings SET value = ?, updated_at = datetime('now') WHERE name = ? AND value = ?",
+                )
+                .bind(value)
+                .bind(key)
+                .bind(expected)
+                .execute(&self.pool)
+                .await?
+            }
+            None => {
+                sqlx::query(
+                    "INSERT INTO settings (name, value, updated_at) VALUES (?, ?, datetime('now')) ON CONFLICT(name) DO NOTHING",
+                )
+                .bind(key)
+                .bind(value)
+                .execute(&self.pool)
+                .await?
+            }
+        };
+        Ok(result.rows_affected() == 1)
+    }
+
     async fn list_all(&self) -> anyhow::Result<Vec<(String, String)>> {
         Ok(
             sqlx::query_as::<_, (String, String)>("SELECT name, value FROM settings")

@@ -1130,6 +1130,36 @@ impl SettingsStore for PostgresSettingsStore {
         Ok(())
     }
 
+    async fn compare_and_set(
+        &self,
+        key: &str,
+        expected: Option<&str>,
+        value: &str,
+    ) -> anyhow::Result<bool> {
+        let result = match expected {
+            Some(expected) => {
+                sqlx::query(
+                    "UPDATE settings SET value = $1, updated_at = CURRENT_TIMESTAMP WHERE name = $2 AND value = $3",
+                )
+                .bind(value)
+                .bind(key)
+                .bind(expected)
+                .execute(&self.pool)
+                .await?
+            }
+            None => {
+                sqlx::query(
+                    "INSERT INTO settings (name, value, updated_at) VALUES ($1, $2, CURRENT_TIMESTAMP) ON CONFLICT(name) DO NOTHING",
+                )
+                .bind(key)
+                .bind(value)
+                .execute(&self.pool)
+                .await?
+            }
+        };
+        Ok(result.rows_affected() == 1)
+    }
+
     async fn list_all(&self) -> anyhow::Result<Vec<(String, String)>> {
         Ok(
             sqlx::query_as::<_, (String, String)>("SELECT name, value FROM settings")

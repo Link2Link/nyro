@@ -100,6 +100,103 @@ test("disconnected Claude records retain stats but disallow account mutations", 
   doesNotMatch(html, /role="progressbar"/);
 });
 
+test("Claude refresh honors the backend deadline boundary without blocking other actions", (t) => {
+  const deadline = Date.parse("2030-01-01T00:10:00Z");
+  const value = { ...pool, accounts: [{ ...account, stale: true, usage_refresh_available_at: deadline }] };
+  let now = deadline - 1;
+  t.mock.method(Date, "now", () => now);
+  for (const time of [deadline - 1, deadline, deadline + 1]) {
+    now = time;
+    const html = panel(value);
+    const refresh = html.match(/<button[^>]*>Refresh usage<\/button>/)?.[0] ?? "";
+    match(refresh, /Refresh usage/);
+    equal(refresh.includes('disabled=""'), time < deadline);
+    if (time < deadline) {
+      match(html, /Usage refresh cooldown/);
+      match(html, /Next refresh: <time dateTime="2030-01-01T00:10:00.000Z"/);
+    } else {
+      match(html, /Usage refresh can be attempted now/);
+      doesNotMatch(html, /Usage refresh cooldown|Next refresh:/);
+    }
+    for (const label of ["Re-authorize", "Disable", "Remove"]) {
+      const button = html.match(new RegExp(`<button[^>]*>${label}</button>`))?.[0] ?? "";
+      match(button, new RegExp(label));
+      doesNotMatch(button, /disabled=""/);
+    }
+    for (const label of ["Account label", "Account priority"]) {
+      const input = html.match(new RegExp(`<input[^>]*aria-label="${label}"[^>]*>`))?.[0] ?? "";
+      match(input, new RegExp(label));
+      doesNotMatch(input, /disabled=""/);
+    }
+    match(html, /Stale \/ unknown/);
+    match(html, /dateTime="2030-01-01T00:00:00.000Z"/);
+    match(html, /Used 37.5%/);
+    doesNotMatch(html, />Observed</);
+  }
+});
+
+test("Claude cooldown uses the attempt deadline, not observation freshness, and is account-scoped", (t) => {
+  const now = Date.parse("2030-01-01T01:00:00Z");
+  t.mock.method(Date, "now", () => now);
+  const html = panel({ ...pool, accounts: [
+    { ...account, stale: true, usage_refresh_available_at: now + 60_000 },
+    { ...account, account_id: "account-b", observed_at: now, usage_refresh_available_at: now },
+  ] });
+  const refreshButtons = html.match(/<button[^>]*>Refresh usage<\/button>/g) ?? [];
+  equal(refreshButtons.length, 2);
+  match(refreshButtons[0], /disabled=""/);
+  doesNotMatch(refreshButtons[1], /disabled=""/);
+});
+
+test("Claude missing or invalid cooldown metadata never invents a deadline from observed_at", (t) => {
+  const now = Date.parse("2030-01-01T00:00:00Z");
+  t.mock.method(Date, "now", () => now);
+  for (const deadline of [undefined, null, NaN, Infinity, 8_640_000_000_000_001]) {
+    const html = panel({ ...pool, accounts: [{ ...account, observed_at: now, usage_refresh_available_at: deadline }] });
+    const refresh = html.match(/<button[^>]*>Refresh usage<\/button>/)?.[0] ?? "";
+    match(refresh, /Refresh usage/);
+    doesNotMatch(refresh, /disabled=""/);
+    match(html, /No refresh cooldown reported; backend limits still apply/);
+    doesNotMatch(html, /Usage refresh cooldown|Next refresh:|Invalid Date|NaN|Infinity/);
+  }
+});
+
+test("Claude cooldown policy and next refresh are bilingual without making unknown usage fresh", (t) => {
+  t.mock.method(Date, "now", () => Date.parse("2030-01-01T00:00:00Z"));
+  for (const isZh of [false, true]) {
+    const html = renderToStaticMarkup(<ClaudeAccountUsage account={{ ...account, claude_usage: null,
+      stale: true, observed_at: null, usage_refresh_available_at: Date.parse("2030-01-01T00:10:00Z"),
+    }} isZh={isZh} />);
+    match(html, isZh ? /固定 10 分钟最小尝试间隔，由后端强制执行（失败也计入）/ : /fixed 10-minute minimum between attempts, enforced by the backend \(including failures\)/);
+    match(html, isZh ? /用量刷新冷却中/ : /Usage refresh cooldown/);
+    match(html, isZh ? /下次可刷新/ : /Next refresh/);
+    match(html, /dateTime="2030-01-01T00:10:00.000Z"/);
+    match(html, isZh ? /用量未知/ : /Usage unknown/);
+    match(html, isZh ? /旧数据 \/ 未知/ : /Stale \/ unknown/);
+    doesNotMatch(html, /progressbar|>Observed<|已观察|Used 0/);
+  }
+});
+
+test("Claude manual pool refresh stays enabled during cooldown and explains cached returns", (t) => {
+  const now = Date.parse("2030-01-01T00:00:00Z");
+  t.mock.method(Date, "now", () => now);
+  const value = { ...pool, accounts: [{ ...account, usage_refresh_available_at: now + 600_000 }] };
+  for (const card of [false, true]) {
+    const html = panel(value, card);
+    const refresh = html.match(/<button[^>]*>(?:(?!<\/button>)[\s\S])*Refresh pool usage<\/button>/)?.[0]
+      ?? html.match(/<button[^>]*aria-label="Refresh pool usage"[^>]*>/)?.[0] ?? "";
+    match(refresh, /Refresh pool usage/);
+    doesNotMatch(refresh, /disabled=""/);
+    match(html, /at least 10 minutes between usage refresh attempts per account/);
+    match(html, /Pool refresh returns cached data, if any, for accounts in cooldown/);
+    match(html, /neither bypasses the limit nor makes cached data fresh/);
+  }
+  const zh = renderToStaticMarkup(<ClaudePoolSummary pool={value} isZh onRefresh={() => {}} />);
+  match(zh, /后端强制每个账号至少间隔 10 分钟/);
+  match(zh, /冷却中的账号返回缓存数据（若有）/);
+  match(zh, /不会绕过限制，也不表示缓存已更新/);
+});
+
 const weightedWindow: PoolQuotaWindow = {
   total_units: 26, total_accounts: 3, capacity_complete: true, known_accounts: 3,
   known_remaining_units: 22.5, used_units: 3.5, remaining_units: 22.5,
@@ -122,7 +219,7 @@ test("Claude collapsed card shows compact weighted usage without management deta
     equal((html.match(/role="progressbar"/g) ?? []).length, 2);
     match(html, /aria-busy="true"/);
     match(html, /disabled=""/);
-    doesNotMatch(html, /data-claude-pool-plans|Weighted estimate|加权估算|Pro-equivalent|Pro 等价|Known usage|有效用量|Next reset|最近重置|Disabled|已停用|accounts ·|个账号/);
+    doesNotMatch(html, /data-claude-pool-plans|Weighted estimate|加权估算|Pro-equivalent|Pro 等价|Known usage|有效用量|Next reset|最近重置|Disabled|已停用|accounts ·|\d+ 个账号/);
   }
   const html = panel(weightedPool, true);
   match(html, /aria-label="Refresh pool usage"/);

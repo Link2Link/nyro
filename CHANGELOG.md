@@ -4,6 +4,18 @@ All notable changes to Nyro will be documented in this file.
 
 ---
 
+## v2.1.37
+
+> Released on 2026-11-11
+
+#### Fixes
+
+- **Mandatory Claude Code usage cooldown** (#26): enforce a fixed 10-minute minimum between upstream usage-query attempts for each stable account identity and origin. Manual account/pool refreshes, background monitoring, forwarded/legacy usage, connection checks and login verification share the same backend gate. Failures and cancellations consume the interval; repeated clicks return existing account data without contacting upstream, extending cooldown, advancing observation time or clearing quota/authentication protections. Normal inference and OAuth token renewal are unaffected.
+- **Durable admission and safe identity handling** (#26): reserve cooldowns atomically in existing settings storage before sending, preserving admission across restarts and concurrent workers sharing storage. Keep subject-only identity across token renewal; credentials without stable identity share a conservative origin-wide gate. Protect internal deadlines against generic settings/import overrides, including case, accent and control-character aliases; public setting identifiers are now printable ASCII without spaces, while values remain Unicode-capable. Independent databases do not coordinate limits. No database schema migration or automatic deployment is included.
+- **Cooldown visibility and regression coverage** (#26): show the next allowed refresh time and disable the individual refresh button during cooldown; explain cached pool refreshes in both languages. Claude observation freshness covers 10 minutes plus a 60-second monitor/request allowance, while explicit failures remain stale. Preserve legacy fetch errors, disconnected-account management and reauthorization verification until a real post-publication query. Added deadline, concurrency, persistence, failure/cancellation, HTTP-count, ready-session, identity, backup and frontend regressions.
+
+---
+
 ## v2.1.36
 
 > Released on 2026-11-10

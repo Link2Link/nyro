@@ -23,7 +23,11 @@ use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 
 const ORDINARY_KEY: &str = "quota_backup_test_note";
 const ORDINARY_VALUE: &str = "Portable ordinary setting";
-const PRIVATE_PREFIXES: [&str; 3] = [
+const PRIVATE_PREFIXES: [&str; 7] = [
+    "claude_\u{0}usage_cooldown.",
+    "claude_usage_cooldown.",
+    "CLAUDE_USAGE_COOLDOWN.",
+    "claudé_usage_cooldown.",
     "quota_bucket_owner.",
     "quota_bucket_fence.",
     "quota_buckets.",
@@ -282,7 +286,14 @@ fn generic_setting_writes_cannot_bypass_quota_identity_or_binding_validation() -
         let gateway = sqlite_gateway(gateway).await?;
         let provider_id = seed_configuration(&gateway).await?;
         let admin = gateway.admin();
-        for prefix in ["quota_bucket_owner.", "quota_bucket_fence."] {
+        for prefix in [
+            "quota_bucket_owner.",
+            "quota_bucket_fence.",
+            "claude_usage_cooldown.",
+            "CLAUDE_USAGE_COOLDOWN.",
+            "claudé_usage_cooldown.",
+            "claude_\u{0}usage_cooldown.",
+        ] {
             let key = format!("{prefix}{provider_id}");
             gateway
                 .storage
