@@ -1144,6 +1144,45 @@ impl SettingsStore for MysqlSettingsStore {
         Ok(())
     }
 
+    async fn compare_and_set(
+        &self,
+        key: &str,
+        expected: Option<&str>,
+        value: &str,
+    ) -> anyhow::Result<bool> {
+        match expected {
+            Some(expected) => {
+                // Settings use a case-insensitive collation; compare values byte-for-byte.
+                let result = sqlx::query(
+                    "UPDATE settings SET value = ?, updated_at = NOW() WHERE name = ? AND CAST(value AS BINARY) = CAST(? AS BINARY)",
+                )
+                .bind(value)
+                .bind(key)
+                .bind(expected)
+                .execute(&self.pool)
+                .await?;
+                // SQLx enables CLIENT_FOUND_ROWS, so a matching no-op is also successful.
+                Ok(result.rows_affected() == 1)
+            }
+            None => {
+                // Do not use INSERT IGNORE (it also suppresses errors unrelated to conflicts)
+                // or a no-op upsert (CLIENT_FOUND_ROWS reports conflicts as matched rows).
+                match sqlx::query(
+                    "INSERT INTO settings (name, value, updated_at) VALUES (?, ?, NOW())",
+                )
+                .bind(key)
+                .bind(value)
+                .execute(&self.pool)
+                .await
+                {
+                    Ok(result) => Ok(result.rows_affected() == 1),
+                    Err(sqlx::Error::Database(error)) if error.is_unique_violation() => Ok(false),
+                    Err(error) => Err(error.into()),
+                }
+            }
+        }
+    }
+
     async fn list_all(&self) -> anyhow::Result<Vec<(String, String)>> {
         Ok(
             sqlx::query_as::<_, (String, String)>("SELECT name, value FROM settings")

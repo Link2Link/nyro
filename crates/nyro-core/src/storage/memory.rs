@@ -240,6 +240,25 @@ impl SettingsStore for MemoryStorage {
         Ok(())
     }
 
+    async fn compare_and_set(
+        &self,
+        key: &str,
+        expected: Option<&str>,
+        value: &str,
+    ) -> anyhow::Result<bool> {
+        let mut settings = self.settings.write().await;
+        match settings.iter_mut().find(|(k, _)| k == key) {
+            Some(entry) if expected == Some(entry.1.as_str()) => {
+                entry.1 = value.to_string();
+            }
+            None if expected.is_none() => {
+                settings.push((key.to_string(), value.to_string()));
+            }
+            _ => return Ok(false),
+        }
+        Ok(true)
+    }
+
     async fn list_all(&self) -> anyhow::Result<Vec<(String, String)>> {
         Ok(self.settings.read().await.clone())
     }

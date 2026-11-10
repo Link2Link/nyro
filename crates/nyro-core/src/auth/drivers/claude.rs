@@ -122,6 +122,9 @@ impl ClaudeOAuthDriver {
     /// Keep `account` / `organization` from the stored credential when a
     /// refresh response omits them: the stored meta is replaced wholesale.
     fn carry_identity_meta(bundle: &mut CredentialBundle, previous: &StoredCredential) {
+        if bundle.subject_id.is_none() {
+            bundle.subject_id = previous.subject_id.clone();
+        }
         let Some(previous) = previous.meta.as_object() else {
             return;
         };
@@ -488,6 +491,30 @@ mod tests {
             fresh.raw["account"]["uuid"],
             "2b4e28ba-2fa1-11d2-883f-0016d3cca427"
         );
+    }
+
+    #[test]
+    fn refresh_preserves_subject_only_identity_and_usage_cooldown_key() {
+        let previous = StoredCredential {
+            subject_id: Some("subject-only".into()),
+            ..Default::default()
+        };
+        let mut bundle = ClaudeOAuthDriver::normalize_token_response(
+            r#"{"access_token":"rotated","expires_in":3600}"#,
+            Some("ref"),
+            ClaudeOAuthDriver::claude_code_config().unwrap(),
+        )
+        .unwrap();
+        ClaudeOAuthDriver::carry_identity_meta(&mut bundle, &previous);
+        assert_eq!(bundle.subject_id, previous.subject_id);
+        let refreshed = StoredCredential {
+            subject_id: bundle.subject_id,
+            meta: bundle.raw,
+            access_token: bundle.access_token,
+            ..Default::default()
+        };
+        use crate::provider::anthropic::claude_code::usage_throttle::key;
+        assert_eq!(key("", &previous).unwrap(), key("", &refreshed).unwrap());
     }
 
     #[test]

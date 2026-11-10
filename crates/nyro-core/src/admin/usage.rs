@@ -2776,9 +2776,32 @@ impl AdminService {
     ) -> anyhow::Result<ProviderUsage> {
         let provider = self.get_provider(id).await?;
         if crate::provider::devin::is_devin(&provider)
-            || ((crate::provider::kiro::is_kiro(&provider) || is_claude_provider(&provider))
+            || is_claude_provider(&provider)
+            || (crate::provider::kiro::is_kiro(&provider)
                 && self.provider_pool_config(id).await?.is_some())
         {
+            if is_claude_provider(&provider) && self.provider_pool_config(id).await?.is_none() {
+                let accounts = self
+                    .gw
+                    .storage
+                    .oauth_credentials()
+                    .list_accounts(id)
+                    .await?;
+                anyhow::ensure!(
+                    !accounts.is_empty(),
+                    "Claude subscription usage query requires an authorized account"
+                );
+                anyhow::ensure!(
+                    accounts.len() == 1,
+                    "AMBIGUOUS_ACCOUNT: configure the account pool before refreshing multiple accounts"
+                );
+                // Legacy single-account queries share saved observations and the
+                // gate, but still surface a real fetch error instead of swallowing it.
+                self.refresh_provider_account_usage(id, &accounts[0].account_id)
+                    .await?;
+                let view = self.get_provider_account_pool(id).await?;
+                return Ok(self.account_pool_provider_usage(view));
+            }
             let view = self
                 .refresh_account_pool_usage(id, matches!(mode, UsageQueryMode::GuardOnly))
                 .await?;
@@ -3377,7 +3400,15 @@ impl AdminService {
                 let base_url = runtime.binding.base_url_override.as_deref().unwrap_or("");
                 let token = runtime.access_token.trim();
                 let usage = crate::provider::anthropic::claude_code::usage::fetch_usage(
-                    &client, base_url, token,
+                    &self.gw,
+                    &client,
+                    base_url,
+                    token,
+                    runtime
+                        .credential
+                        .as_ref()
+                        .context("Claude credential missing")?,
+                    None,
                 )
                 .await?;
                 // Plan badge (Pro / Max 5x / Max 20x …), cached per account:

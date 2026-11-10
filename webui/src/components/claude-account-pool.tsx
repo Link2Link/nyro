@@ -38,10 +38,17 @@ function useInvalidatePool(providerId: string) {
   ]);
 }
 
+function usageRefreshAvailableAt(account: ProviderAccountView): number | null {
+  const deadline = account.usage_refresh_available_at;
+  return deadline != null && Number.isFinite(new Date(deadline).getTime()) ? deadline : null;
+}
+
 /** Raw per-account windows remain available alongside weighted pool estimates. */
 export function ClaudeAccountUsage({ account, isZh }: { account: ProviderAccountView; isZh: boolean }) {
   const now = useUsageClock();
   const windows = account.claude_usage?.windows ?? [];
+  const refreshAvailableAt = usageRefreshAvailableAt(account);
+  const coolingDown = refreshAvailableAt != null && now < refreshAvailableAt;
   return <div className="min-w-48 space-y-2 text-xs">
     {!windows.length && <p className="text-slate-500">{isZh ? "用量未知" : "Usage unknown"}</p>}
     {windows.map((window, index) => {
@@ -60,6 +67,14 @@ export function ClaudeAccountUsage({ account, isZh }: { account: ProviderAccount
     })}
     <p className={account.stale ? "text-amber-700" : "text-slate-400"}>{account.stale ? (isZh ? "旧数据 / 未知" : "Stale / unknown") : (isZh ? "已观察" : "Observed")}</p>
     {account.observed_at != null && Number.isFinite(new Date(account.observed_at).getTime()) && <time className="text-[10px] text-slate-400" dateTime={new Date(account.observed_at).toISOString()}>{new Date(account.observed_at).toLocaleString()}</time>}
+    <p className="text-[10px] text-slate-500">{isZh
+      ? "用量刷新采用固定 10 分钟最小尝试间隔，由后端强制执行（失败也计入）。"
+      : "Usage refresh has a fixed 10-minute minimum between attempts, enforced by the backend (including failures)."}</p>
+    <p className={coolingDown ? "text-amber-700" : "text-slate-500"}>{coolingDown
+      ? (isZh ? "用量刷新冷却中" : "Usage refresh cooldown")
+      : refreshAvailableAt != null ? (isZh ? "现在可尝试刷新用量" : "Usage refresh can be attempted now")
+      : (isZh ? "未报告刷新冷却时间；后端限制仍然适用。" : "No refresh cooldown reported; backend limits still apply.")}</p>
+    {coolingDown && <p className="text-[10px] text-slate-500">{isZh ? "下次可刷新" : "Next refresh"}: <time dateTime={new Date(refreshAvailableAt).toISOString()}>{new Date(refreshAvailableAt).toLocaleString()}</time></p>}
   </div>;
 }
 
@@ -135,6 +150,9 @@ export function ClaudePoolSummary({ pool, isZh, detailed = false, onRefresh, ref
       {(pool.quota.claude_windows ?? []).map(({ name, quota }) => <ClaudePoolWindow key={name} name={name} quota={quota} pace={claudePoolSteadyPacePercent(pool, name, now)} isZh={isZh} detailed={detailed} />)}
     </div>
     {!pool.quota.claude_windows?.length && <p className="text-slate-500">{isZh ? "账号池用量未知，请刷新用量。" : "Pool usage unknown; refresh usage to load it."}</p>}
+    {(detailed || onRefresh) && <p className="text-[10px] text-slate-500">{isZh
+      ? "后端强制每个账号至少间隔 10 分钟才可再次尝试刷新用量。刷新全池会为冷却中的账号返回缓存数据（若有），不会绕过限制，也不表示缓存已更新。"
+      : "The backend enforces at least 10 minutes between usage refresh attempts per account. Pool refresh returns cached data, if any, for accounts in cooldown; it neither bypasses the limit nor makes cached data fresh."}</p>}
     {detailed && <p className="text-[10px] text-slate-500">{isZh
       ? "按 Pro / Max 5× / Max 20× 加权：5 小时 1 / 5 / 20，每周 1 / 5 / 10（估算）。未知或未识别套餐默认按 Pro（1）计算。仅统计已启用且未断开的账号，含额度耗尽账号；不代表当前可调度额度。模型专属窗口请展开管理账号查看。"
       : "Weights for Pro / Max 5× / Max 20×: 5h 1 / 5 / 20; weekly 1 / 5 / 10 (estimated). Unknown or unrecognized plans default to Pro (1). Includes enabled, non-disconnected accounts, including exhausted accounts; not currently routable capacity. Open Manage accounts for model-specific windows."}</p>}
@@ -147,6 +165,9 @@ function AccountRow({ account, pending, canLogin, usageSummary, onUpdate, onLogi
 }) {
   const [label, setLabel] = useState(account.label);
   const [priority, setPriority] = useState(account.priority);
+  const now = useUsageClock();
+  const refreshAvailableAt = usageRefreshAvailableAt(account);
+  const coolingDown = refreshAvailableAt != null && now < refreshAvailableAt;
   const changed = label !== account.label || priority !== account.priority;
   const disconnected = account.status === "disconnected";
   const unsafeLabel = looksLikeCredential(label);
@@ -164,7 +185,7 @@ function AccountRow({ account, pending, canLogin, usageSummary, onUpdate, onLogi
     <td className="space-y-1 p-2"><p>{accountStateLabel(account.status, isZh)}</p><p className="text-slate-500">{accountStateLabel(account.scheduling, isZh)}</p><p>{account.is_enabled ? (isZh ? "已启用" : "Enabled") : (isZh ? "已停用" : "Disabled")}</p></td>
     <td className="p-2"><ClaudeAccountUsage account={account} isZh={isZh} /></td>
     <td className="min-w-36 p-2"><div className="flex flex-wrap gap-1">
-      <Button type="button" variant="secondary" disabled={pending || disconnected} onClick={onRefresh}>{isZh ? "刷新用量" : "Refresh usage"}</Button>
+      <Button type="button" variant="secondary" disabled={pending || disconnected || coolingDown} onClick={onRefresh}>{isZh ? "刷新用量" : "Refresh usage"}</Button>
       <Button type="button" variant="secondary" disabled={pending || disconnected || !canLogin} onClick={onLogin}>{isZh ? "重新授权" : "Re-authorize"}</Button>
       <Button type="button" variant="secondary" disabled={pending || disconnected} onClick={() => onUpdate({ is_enabled: !account.is_enabled })}>{account.is_enabled ? (isZh ? "停用" : "Disable") : (isZh ? "启用" : "Enable")}</Button>
       <Button type="button" variant="secondary" disabled={pending || disconnected} onClick={onRemove}>{isZh ? "移除" : "Remove"}</Button>

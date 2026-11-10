@@ -131,6 +131,18 @@ pub trait ModelBackendStore: Send + Sync {
 pub trait SettingsStore: Send + Sync {
     async fn get(&self, key: &str) -> anyhow::Result<Option<String>>;
     async fn set(&self, key: &str, value: &str) -> anyhow::Result<()>;
+    /// Atomically write `value` only if the current value exactly matches `expected`.
+    /// `None` requires an absent key; `Some` requires an existing, matching value.
+    /// Returns whether the comparison matched, including a same-value write.
+    /// Implementations must not emulate this with a separate get followed by set.
+    async fn compare_and_set(
+        &self,
+        _key: &str,
+        _expected: Option<&str>,
+        _value: &str,
+    ) -> anyhow::Result<bool> {
+        anyhow::bail!("atomic settings compare-and-set is not supported by this storage")
+    }
     async fn list_all(&self) -> anyhow::Result<Vec<(String, String)>>;
 }
 

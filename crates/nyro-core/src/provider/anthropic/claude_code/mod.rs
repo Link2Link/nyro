@@ -15,6 +15,7 @@ pub(crate) mod identity;
 pub(crate) mod profile;
 pub(crate) mod tool_alias;
 pub(crate) mod usage;
+pub(crate) mod usage_throttle;
 
 use reqwest::header::HeaderMap;
 

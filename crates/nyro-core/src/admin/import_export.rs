@@ -127,9 +127,8 @@ impl AdminService {
             settings: settings
                 .into_iter()
                 .filter(|(key, _)| {
-                    !key.starts_with("provider_account_fence:")
-                        && !key.starts_with("quota_bucket_owner.")
-                        && !key.starts_with("quota_bucket_fence.")
+                    super::settings::valid_setting_identifier(key)
+                        && !super::settings::internal_setting_key(key)
                         && !key.starts_with("quota_buckets.")
                         && key
                             .strip_prefix(super::account_pool::POOL_SETTING_PREFIX)
@@ -362,9 +361,8 @@ impl AdminService {
             // Runtime entitlement identity and live discovered-resource bindings
             // are not portable configuration. Imported providers get new IDs and
             // must rediscover/rebind rather than inherit another owner's fences.
-            if key.starts_with("provider_account_fence:")
-                || key.starts_with("quota_bucket_owner.")
-                || key.starts_with("quota_bucket_fence.")
+            if !super::settings::valid_setting_identifier(key)
+                || super::settings::internal_setting_key(key)
                 || key.starts_with("quota_buckets.")
             {
                 continue;

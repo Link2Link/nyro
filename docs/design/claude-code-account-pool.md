@@ -23,6 +23,16 @@ Removing an account clears its credentials but keeps an internal disconnected re
 
 Claude settings always submit `reserve_policy = "disabled"`; there is no paid-reserve switch. Upstream `extra_usage` data does not prove usable paid capacity, so it must not enable automatic paid fallback. This is **not a billing hard limit**: users who require no additional spending must also disable extra usage upstream.
 
+## Mandatory ten-minute usage query interval
+
+Claude Code usage queries have a fixed **600-second minimum interval per upstream account and origin**, enforced immediately before the HTTP request. Manual single-account/pool refreshes, background monitoring, 429-triggered queries, legacy provider usage, forwarding, connection checks and login verification share the same gate. Failures and cancelled requests also consume the slot; clicking again does not extend the cooldown or contact the upstream.
+
+The deadline is atomically reserved in internal settings before sending, so restarts and concurrent workers sharing the same storage cannot issue duplicate queries. Stable upstream account UUIDs (or known subjects) survive token rotation and duplicate provider registrations. Credentials without a stable identity conservatively share an origin-wide gate. Separate installations with independent databases cannot coordinate these limits. Internal deadlines are not configurable through generic settings or portable backups; no database schema migration is required.
+
+During cooldown, account usage refresh returns the saved view, without advancing observation time, clearing errors/refusals or treating cached data as proof of recovery. The optional account field `usage_refresh_available_at` is the backend admission deadline in epoch milliseconds. The UI disables the account refresh button until that deadline and explains that pool refresh returns cached data for cooling-down members. Connection/login checks report cooldown instead of inventing a successful fresh probe. Reauthorization that needs a post-publication quota check remains protected until a real query is admitted.
+
+Claude display freshness lasts 10 minutes plus a 60-second monitor/request allowance; explicit refresh failures still mark data stale immediately. This is not quota-reset grace: expired quota cycles and exhaustion protections remain unchanged. API-token refresh and normal inference traffic are not subject to this usage-query interval. Existing successful observations seed the first cooldown after upgrading; older versions’ unrecorded failed attempts cannot be reconstructed.
+
 ## Usage contract and presentation
 
 The shared public account DTO adds this optional field:

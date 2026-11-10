@@ -246,22 +246,37 @@ pub(crate) async fn fetch_plan(
 /// Account usage refresh and login share the same best-effort profile lookup.
 /// Never copy a previous plan when the current profile cannot be resolved.
 pub(crate) async fn fetch_usage_with_plan(
+    gw: &crate::Gateway,
     client: &reqwest::Client,
     api_base_url: &str,
     access_token: &str,
+    credential: &crate::auth::types::StoredCredential,
+    prior_observed_at: Option<i64>,
     account_identity: &str,
 ) -> anyhow::Result<ClaudeUsage> {
-    let mut usage = fetch_usage(client, api_base_url, access_token).await?;
+    let mut usage = fetch_usage(
+        gw,
+        client,
+        api_base_url,
+        access_token,
+        credential,
+        prior_observed_at,
+    )
+    .await?;
     usage.plan = fetch_plan(client, api_base_url, access_token, account_identity).await;
     Ok(usage)
 }
 
 /// Fetch and parse the subscription usage for one OAuth access token.
 pub(crate) async fn fetch_usage(
+    gw: &crate::Gateway,
     client: &reqwest::Client,
     api_base_url: &str,
     access_token: &str,
+    credential: &crate::auth::types::StoredCredential,
+    prior_observed_at: Option<i64>,
 ) -> anyhow::Result<ClaudeUsage> {
+    super::usage_throttle::reserve(gw, api_base_url, credential, prior_observed_at).await?;
     let base = api_base_url.trim().trim_end_matches('/');
     let base = if base.is_empty() {
         "https://api.anthropic.com"
@@ -312,6 +327,16 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    async fn gateway() -> crate::Gateway {
+        crate::Gateway::from_storage(
+            crate::config::GatewayConfig::default(),
+            std::sync::Arc::new(crate::storage::MemoryStorage::new(vec![], vec![], vec![])),
+        )
+        .await
+        .unwrap()
+        .0
+    }
+
     #[tokio::test]
     async fn usage_http_errors_are_sanitized_and_only_401_means_auth_rejection() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -325,15 +350,31 @@ mod tests {
                 let body = "PRIVATE-UPSTREAM-ACCESS-TOKEN";
                 socket.write_all(format!("HTTP/1.1 {status} Error\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
             });
+            let gw = gateway().await;
             let error = fetch_usage(
+                &gw,
                 &reqwest::Client::new(),
                 &format!("http://{address}"),
                 "SECRET-TOKEN",
+                &Default::default(),
+                None,
             )
             .await
             .unwrap_err()
             .to_string();
             task.await.unwrap();
+            // The listener is gone: a failed query still consumes the interval.
+            let repeat = fetch_usage(
+                &gw,
+                &reqwest::Client::new(),
+                &format!("http://{address}"),
+                "SECRET-TOKEN",
+                &Default::default(),
+                None,
+            )
+            .await
+            .unwrap_err();
+            assert!(repeat.is::<super::super::usage_throttle::Cooldown>());
             assert!(
                 !error.contains("PRIVATE")
                     && !error.contains("SECRET")
@@ -344,6 +385,51 @@ mod tests {
                 status == 401
             );
         }
+    }
+
+    #[tokio::test]
+    async fn cancelled_usage_query_keeps_its_reservation() {
+        use tokio::io::AsyncReadExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let (started, received) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut bytes = [0u8; 4096];
+            socket.read(&mut bytes).await.unwrap();
+            started.send(()).unwrap();
+            std::future::pending::<()>().await;
+        });
+        let gw = gateway().await;
+        let cloned = gw.clone();
+        let url = base.clone();
+        let caller = tokio::spawn(async move {
+            fetch_usage(
+                &cloned,
+                &reqwest::Client::new(),
+                &url,
+                "SECRET",
+                &Default::default(),
+                None,
+            )
+            .await
+        });
+        received.await.unwrap();
+        caller.abort();
+        assert!(caller.await.unwrap_err().is_cancelled());
+        let error = fetch_usage(
+            &gw,
+            &reqwest::Client::new(),
+            &base,
+            "SECRET",
+            &Default::default(),
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.is::<super::super::usage_throttle::Cooldown>());
+        server.abort();
+        assert!(server.await.unwrap_err().is_cancelled());
     }
 
     #[test]
@@ -401,9 +487,18 @@ mod tests {
             ("token-max", Some("max 20x")),
             ("token-failed", None),
         ] {
-            let usage = fetch_usage_with_plan(&client, &base, token, "same-provider")
-                .await
-                .unwrap();
+            let gw = gateway().await;
+            let usage = fetch_usage_with_plan(
+                &gw,
+                &client,
+                &base,
+                token,
+                &Default::default(),
+                None,
+                "same-provider",
+            )
+            .await
+            .unwrap();
             assert_eq!(usage.plan.as_deref(), expected);
             assert_eq!(usage.windows.len(), 2);
         }

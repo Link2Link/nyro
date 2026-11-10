@@ -1,6 +1,7 @@
 //! Claude Code observations behind the shared OAuth account administration API.
 use super::*;
 use crate::provider::account_pool::ClaudeAccountState;
+use crate::provider::anthropic::claude_code::usage_throttle;
 use crate::router::quota::QuotaTierObservation;
 
 pub(super) fn is_claude_provider(provider: &Provider) -> bool {
@@ -59,11 +60,12 @@ pub(super) fn safe_claude_account(
         reserve_usd: None,
         kiro_usage: None,
         claude_usage: state.usage,
+        usage_refresh_available_at: None,
         observed_at: state.observed_at,
         stale: state.usage_stale
-            || state
-                .observed_at
-                .is_none_or(|at| Utc::now().timestamp_millis().saturating_sub(at) > 300_000),
+            || state.observed_at.is_none_or(|at| {
+                Utc::now().timestamp_millis().saturating_sub(at) > usage_throttle::FRESHNESS_MS
+            }),
         updated_at: account.updated_at.clone(),
     }
 }
@@ -262,6 +264,42 @@ pub(super) fn claude_usage_observations(usage: &ClaudeUsage) -> Vec<QuotaTierObs
 }
 
 impl AdminService {
+    pub(super) async fn claude_usage_refresh_deadline(
+        &self,
+        _provider: &Provider,
+        account: &OAuthCredential,
+    ) -> anyhow::Result<Option<i64>> {
+        let credential = stored_credential_from_oauth(account, "claude-code");
+        // Reading cooldown metadata must not require working credentials (removed
+        // accounts and refreshable credentials can have an empty access token).
+        // Match ClaudeOAuthDriver's resource-url/default-origin selection only.
+        let base = credential
+            .resource_url
+            .as_deref()
+            .filter(|url| !url.trim().is_empty())
+            .unwrap_or("https://api.anthropic.com");
+        usage_throttle::next_refresh_at(
+            &self.gw,
+            base,
+            &credential,
+            ClaudeAccountState::parse(&account.account_state).observed_at,
+        )
+        .await
+    }
+
+    pub(super) async fn claude_account_with_refresh_deadline(
+        &self,
+        provider: &Provider,
+        account: &OAuthCredential,
+        config: Option<&DevinPoolConfig>,
+    ) -> anyhow::Result<ProviderAccountView> {
+        let mut view = safe_claude_account(account, config);
+        view.usage_refresh_available_at = self
+            .claude_usage_refresh_deadline(provider, account)
+            .await?;
+        Ok(view)
+    }
+
     pub(super) async fn refresh_claude_account_usage_locked(
         &self,
         provider: &Provider,
@@ -273,6 +311,18 @@ impl AdminService {
             .get_account(&provider.id, account_id)
             .await?
             .context("account not found")?;
+        // Manual, bulk and background requests share the same admission ledger.
+        // A cache hit does not refresh credentials, publish usage, clear refusals,
+        // move observed_at, or turn an earlier failure into a successful probe.
+        if self
+            .claude_usage_refresh_deadline(provider, &before)
+            .await?
+            .is_some_and(|at| at > Utc::now().timestamp_millis())
+        {
+            return self
+                .claude_account_with_refresh_deadline(provider, &before, config)
+                .await;
+        }
         let account = self.refresh_claude_pool_account(provider, &before).await?;
         let runtime = self
             .resolve_provider_account_runtime(provider, &account)
@@ -280,7 +330,9 @@ impl AdminService {
         let client = self.gw.http_client_for_provider(provider.use_proxy).await?;
         let mut next = ClaudeAccountState::parse(&account.account_state);
         let permit = super::account_pool::STATUS_CONCURRENCY.acquire().await?;
+        let credential = stored_credential_from_oauth(&account, "claude-code");
         let result = crate::provider::anthropic::claude_code::usage::fetch_usage_with_plan(
+            &self.gw,
             &client,
             runtime
                 .binding
@@ -288,6 +340,8 @@ impl AdminService {
                 .as_deref()
                 .unwrap_or(&provider.base_url),
             runtime.access_token.trim(),
+            &credential,
+            next.observed_at,
             &account.account_id,
         )
         .await;
@@ -296,6 +350,16 @@ impl AdminService {
             Ok(usage) => {
                 apply_claude_usage_snapshot(&mut next, usage);
                 None
+            }
+            Err(error) if error.is::<usage_throttle::Cooldown>() => {
+                // Another entry point or replica reserved the slot after precheck.
+                let current = store
+                    .get_account(&provider.id, account_id)
+                    .await?
+                    .context("account not found")?;
+                return self
+                    .claude_account_with_refresh_deadline(provider, &current, config)
+                    .await;
             }
             Err(error) => {
                 next.usage_stale = true;
@@ -344,7 +408,8 @@ impl AdminService {
         if let Some(error) = result_error {
             return Err(error);
         }
-        Ok(safe_claude_account(&updated, config))
+        self.claude_account_with_refresh_deadline(provider, &updated, config)
+            .await
     }
 
     pub(super) fn claude_account_pool_provider_usage(
@@ -384,7 +449,14 @@ impl AdminService {
             provider_id: view.provider_id.clone(),
             kind: "claude_code_plan".into(),
             site: "global".into(),
-            level: None,
+            level: if members.len() == 1 {
+                members[0]
+                    .claude_usage
+                    .as_ref()
+                    .and_then(|u| u.plan.clone())
+            } else {
+                None
+            },
             tiers,
             balances: Vec::new(),
             spends: Vec::new(),
@@ -677,6 +749,7 @@ mod tests {
                         driver_key: "claude-code".into(),
                         scheme: "oauth_auth_code_pkce".into(),
                         access_token: token.into(),
+                        subject_id: Some(token.into()),
                         resource_url: Some(base.clone()),
                         expires_at: Some((Utc::now() + chrono::Duration::hours(1)).to_rfc3339()),
                         ..Default::default()
@@ -686,7 +759,8 @@ mod tests {
                 .unwrap();
             let mut old = usage(30.0, 40.0);
             old.plan = Some("max 20x".into());
-            let state = authenticated_claude_state(old, None);
+            let mut state = authenticated_claude_state(old, None);
+            state.observed_at = Some(Utc::now().timestamp_millis() - usage_throttle::INTERVAL_MS);
             assert!(
                 store
                     .compare_account_state(
@@ -719,6 +793,361 @@ mod tests {
             );
         }
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn claude_usage_cooldown_blocks_manual_bulk_legacy_probe_and_preserves_refusals() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let hits = Arc::new(AtomicUsize::new(0));
+        let count = hits.clone();
+        let server = tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = [0u8; 4096];
+                let n = socket.read(&mut request).await.unwrap();
+                let request = String::from_utf8_lossy(&request[..n]);
+                let body = if request.starts_with("GET /api/oauth/usage ") {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    serde_json::json!({"five_hour":{"utilization":27},"seven_day":{"utilization":34}})
+                } else {
+                    serde_json::json!({"organization":{"organization_type":"claude_pro"}})
+                }.to_string();
+                socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
+            }
+        });
+        let gw = gateway().await;
+        let admin = gw.admin();
+        let store = gw.storage.oauth_credentials();
+        let record = store
+            .create_account(
+                "claude-pool",
+                "throttle",
+                UpsertOAuthCredential {
+                    driver_key: "claude-code".into(),
+                    scheme: "oauth_auth_code_pkce".into(),
+                    access_token: "SECRET".into(),
+                    subject_id: Some("same-upstream-account".into()),
+                    resource_url: Some(base.clone()),
+                    expires_at: Some((Utc::now() + chrono::Duration::hours(1)).to_rfc3339()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        // No configured pool: the legacy provider API must share the account gate.
+        let first = admin.get_provider_usage("claude-pool").await.unwrap();
+        assert_eq!(first.level.as_deref(), Some("pro"));
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        let before = store
+            .get_account("claude-pool", &record.account_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let at = ClaudeAccountState::parse(&before.account_state).observed_at;
+        let manual = admin
+            .refresh_provider_account_usage("claude-pool", &record.account_id)
+            .await
+            .unwrap();
+        assert!(manual.usage_refresh_available_at.unwrap() > Utc::now().timestamp_millis());
+        assert!(!manual.stale);
+        admin
+            .refresh_provider_account_pool_usage("claude-pool")
+            .await
+            .unwrap();
+        admin
+            .refresh_account_pool_usage("claude-pool", true)
+            .await
+            .unwrap();
+        admin.get_provider_usage("claude-pool").await.unwrap();
+        let tested = admin
+            .test_pool_account_connections(&provider())
+            .await
+            .unwrap();
+        assert!(!tested.success); // A cache hit must not masquerade as authenticated connectivity.
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            store
+                .get_account("claude-pool", &record.account_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .account_state,
+            before.account_state
+        );
+        // A refusal arriving after that last success must survive cached refreshes.
+        let mut refused = ClaudeAccountState::parse(&before.account_state);
+        refused.hard_quota = true;
+        refused.hard_quota_reason = Some("reauthorization_verification".into());
+        refused.auth_invalid = true;
+        refused.usage_stale = true;
+        refused.rejection_revision = 9;
+        let raw = serde_json::to_string(&refused).unwrap();
+        assert!(
+            store
+                .compare_account_state(
+                    "claude-pool",
+                    &record.account_id,
+                    before.status_version,
+                    &before.account_state,
+                    &raw
+                )
+                .await
+                .unwrap()
+        );
+        let cached = admin
+            .refresh_provider_account_usage("claude-pool", &record.account_id)
+            .await
+            .unwrap();
+        assert!(cached.stale);
+        assert_eq!(cached.observed_at, at);
+        assert_eq!(
+            store
+                .get_account("claude-pool", &record.account_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .account_state,
+            raw
+        );
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        server.abort();
+        assert!(server.await.unwrap_err().is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn claude_reauthorization_cooldown_preserves_ready_session_and_prior_account() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let gw = gateway().await;
+        let admin = gw.admin();
+        admin
+            .configure_provider_account_pool("claude-pool", DevinPoolConfig::default())
+            .await
+            .unwrap();
+        let account = add(&gw, "reauth-cooldown").await;
+        let init = admin
+            .init_provider_account_session(
+                "claude-pool",
+                Some(&account.account_id),
+                Some(account.status_version),
+            )
+            .await
+            .unwrap();
+        let bundle = CredentialBundle {
+            access_token: Some("NEW-SECRET".into()),
+            refresh_token: Some("NEW-REFRESH".into()),
+            subject_id: account.subject_id.clone(),
+            resource_url: Some(base.clone()),
+            expires_at: Some((Utc::now() + chrono::Duration::hours(1)).to_rfc3339()),
+            ..Default::default()
+        };
+        admin
+            .update_auth_session_record(
+                &init.session_id,
+                UpdateAuthSession {
+                    status: Some("ready".into()),
+                    result_json: Some(serde_json::to_string(&bundle).unwrap()),
+                    expires_at: bundle.expires_at.clone(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let credential =
+            stored_credential_from_bundle("claude-code", "oauth_auth_code_pkce", &bundle);
+        usage_throttle::reserve(&gw, &base, &credential, None)
+            .await
+            .unwrap();
+        let error = admin
+            .bind_provider_account("claude-pool", &init.session_id, None)
+            .await
+            .unwrap_err();
+        assert!(error.is::<usage_throttle::Cooldown>());
+        let saved = gw
+            .storage
+            .oauth_credentials()
+            .get_account("claude-pool", &account.account_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved.status_version, account.status_version);
+        assert_eq!(saved.access_token, account.access_token);
+        assert_eq!(saved.account_state, account.account_state);
+        assert_eq!(
+            admin
+                .get_auth_session_record(&init.session_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "ready"
+        );
+        // Expire only the synthetic test reservation; no production bypass exists.
+        gw.storage
+            .settings()
+            .set(&usage_throttle::key(&base, &credential).unwrap(), "0")
+            .await
+            .unwrap();
+        let server = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut bytes = [0u8; 4096];
+                let n = socket.read(&mut bytes).await.unwrap();
+                let request = String::from_utf8_lossy(&bytes[..n]);
+                let body = if request.starts_with("GET /api/oauth/usage ") {
+                    serde_json::json!({"five_hour":{"utilization":10},"seven_day":{"utilization":20}})
+                } else { serde_json::json!({"organization":{"organization_type":"claude_pro"}}) }.to_string();
+                socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
+            }
+        });
+        let rebound = admin
+            .bind_provider_account("claude-pool", &init.session_id, None)
+            .await
+            .unwrap();
+        server.await.unwrap();
+        assert!(rebound.status_version > account.status_version);
+        assert!(
+            admin
+                .get_auth_session_record(&init.session_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let saved = gw
+            .storage
+            .oauth_credentials()
+            .get_account("claude-pool", &account.account_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let state = ClaudeAccountState::parse(&saved.account_state);
+        assert!(state.hard_quota);
+        assert_eq!(
+            state.hard_quota_reason.as_deref(),
+            Some("reauthorization_verification")
+        );
+        assert!(rebound.usage_refresh_available_at.unwrap() > Utc::now().timestamp_millis());
+    }
+
+    #[tokio::test]
+    async fn claude_failed_usage_is_throttled_and_legacy_error_is_reported() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut bytes = [0u8; 4096];
+            socket.read(&mut bytes).await.unwrap();
+            socket.write_all(b"HTTP/1.1 429 Too Many Requests\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}").await.unwrap();
+        });
+        let gw = gateway().await;
+        let admin = gw.admin();
+        let store = gw.storage.oauth_credentials();
+        let account = store
+            .create_account(
+                "claude-pool",
+                "failure",
+                UpsertOAuthCredential {
+                    driver_key: "claude-code".into(),
+                    scheme: "oauth_auth_code_pkce".into(),
+                    access_token: "SECRET".into(),
+                    resource_url: Some(base),
+                    expires_at: Some((Utc::now() + chrono::Duration::hours(1)).to_rfc3339()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            admin
+                .get_provider_usage("claude-pool")
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("HTTP 429")
+        );
+        server.await.unwrap(); // All later calls must work without this upstream.
+        let saved = store
+            .get_account("claude-pool", &account.account_id)
+            .await
+            .unwrap()
+            .unwrap();
+        for _ in 0..3 {
+            let view = admin
+                .refresh_provider_account_usage("claude-pool", &account.account_id)
+                .await
+                .unwrap();
+            assert!(view.stale);
+            assert!(view.observed_at.is_none());
+            assert!(view.usage_refresh_available_at.unwrap() > Utc::now().timestamp_millis());
+        }
+        assert_eq!(
+            store
+                .get_account("claude-pool", &account.account_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .account_state,
+            saved.account_state
+        );
+    }
+
+    #[tokio::test]
+    async fn claude_cooldown_metadata_does_not_require_live_credentials() {
+        let gw = gateway().await;
+        let admin = gw.admin();
+        admin
+            .configure_provider_account_pool("claude-pool", DevinPoolConfig::default())
+            .await
+            .unwrap();
+        let a = add(&gw, "removed").await;
+        let b = add(&gw, "remaining").await;
+        let mut empty = b.clone();
+        empty.access_token.clear();
+        assert!(
+            admin
+                .claude_usage_refresh_deadline(&provider(), &empty)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        admin
+            .disconnect_provider_account("claude-pool", &a.account_id, a.status_version)
+            .await
+            .unwrap();
+        let pool = admin
+            .get_provider_account_pool("claude-pool")
+            .await
+            .unwrap();
+        assert!(
+            pool.accounts
+                .iter()
+                .any(|row| row.account_id == b.account_id)
+        );
+    }
+
+    #[tokio::test]
+    async fn claude_usage_freshness_covers_ten_minutes_without_hiding_errors() {
+        let gw = gateway().await;
+        let mut account = add(&gw, "freshness").await;
+        let mut state = authenticated_claude_state(usage(27.0, 34.0), None);
+        state.observed_at = Some(Utc::now().timestamp_millis() - 9 * 60_000);
+        account.account_state = serde_json::to_string(&state).unwrap();
+        assert!(!safe_claude_account(&account, None).stale);
+        state.usage_stale = true;
+        account.account_state = serde_json::to_string(&state).unwrap();
+        assert!(safe_claude_account(&account, None).stale);
+        state.usage_stale = false;
+        state.observed_at = Some(Utc::now().timestamp_millis() - usage_throttle::FRESHNESS_MS - 1);
+        account.account_state = serde_json::to_string(&state).unwrap();
+        assert!(safe_claude_account(&account, None).stale);
     }
 
     #[test]

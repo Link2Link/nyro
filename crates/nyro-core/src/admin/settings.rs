@@ -3,6 +3,26 @@ use super::*;
 /// Settings key used to signal config changes to other replicas.
 pub const CONFIG_EPOCH_KEY: &str = "config_epoch";
 
+/// Public setting names use ASCII identifiers. MySQL's case/accent-insensitive
+/// name collation must not let an alternate spelling overwrite an internal gate.
+pub(super) fn valid_setting_identifier(key: &str) -> bool {
+    !key.is_empty() && key.bytes().all(|b| b.is_ascii_graphic())
+}
+
+pub(super) fn internal_setting_key(key: &str) -> bool {
+    [
+        "claude_usage_cooldown.",
+        "provider_account_fence:",
+        "quota_bucket_owner.",
+        "quota_bucket_fence.",
+    ]
+    .iter()
+    .any(|prefix| {
+        key.get(..prefix.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+    })
+}
+
 impl AdminService {
     // ── Settings ──
 
@@ -12,9 +32,11 @@ impl AdminService {
 
     pub async fn set_setting(&self, key: &str, value: &str) -> anyhow::Result<()> {
         anyhow::ensure!(
-            !key.starts_with("provider_account_fence:")
-                && !key.starts_with("quota_bucket_owner.")
-                && !key.starts_with("quota_bucket_fence."),
+            valid_setting_identifier(key),
+            "Setting identifiers must be printable ASCII without spaces; values may contain Unicode"
+        );
+        anyhow::ensure!(
+            !internal_setting_key(key),
             "Account and quota identity fences are internal settings"
         );
         if let Some(provider_id) = key.strip_prefix("quota_buckets.") {

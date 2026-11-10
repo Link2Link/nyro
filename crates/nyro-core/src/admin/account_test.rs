@@ -61,6 +61,7 @@ impl AdminService {
                         .http_client_for_provider(provider.use_proxy)
                         .await?;
                     crate::provider::anthropic::claude_code::usage::fetch_usage(
+                        &admin.gw,
                         &client,
                         runtime
                             .binding
@@ -68,6 +69,11 @@ impl AdminService {
                             .as_deref()
                             .unwrap_or(&provider.base_url),
                         &runtime.access_token,
+                        &stored_credential_from_oauth(&account, "claude-code"),
+                        crate::provider::account_pool::ClaudeAccountState::parse(
+                            &account.account_state,
+                        )
+                        .observed_at,
                     )
                     .await
                     .map(|_| ())
