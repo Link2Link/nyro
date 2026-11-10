@@ -211,6 +211,21 @@ pub(super) fn apply_claude_usage_snapshot(state: &mut ClaudeAccountState, mut us
     if let Some(previous) = &state.usage {
         for old in &previous.windows {
             if !usage.windows.iter().any(|new| new.name == old.name) {
+                // Optional model limits can disappear or be renamed upstream.
+                // Retaining a healthy old model window would make every later
+                // complete primary snapshot stale and suppress account estimates.
+                // A real refusal can postdate its last percentage, so never prune
+                // missing evidence while that refusal still needs verification.
+                let quota_refusal = state.hard_quota
+                    && state.hard_quota_reason.as_deref() != Some("reauthorization_verification");
+                if primary_complete
+                    && !quota_refusal
+                    && old.name.starts_with("feature:")
+                    && !old.name.starts_with("feature:oauth_apps:")
+                    && (0.0..100.0).contains(&old.used_percent)
+                {
+                    continue;
+                }
                 // Absence is unknown, never proof that a spent window recovered.
                 usage.windows.push(old.clone());
                 complete = false;
@@ -716,6 +731,186 @@ mod tests {
         assert_eq!(login.usage.unwrap().plan, None);
         apply_claude_usage_snapshot(&mut state, fresh);
         assert_eq!(state.usage.unwrap().plan, None);
+    }
+
+    fn model_scoped_usage(model: Option<(&str, f64)>) -> ClaudeUsage {
+        crate::provider::anthropic::claude_code::usage::parse_usage(&serde_json::json!({
+            "five_hour": {"utilization": 27, "resets_at": "2030-01-01T05:00:00Z"},
+            "seven_day": {"utilization": 34, "resets_at": "2030-01-07T00:00:00Z"},
+            "limits": model.map(|(name, percent)| vec![serde_json::json!({
+                "group": "weekly", "percent": percent, "resets_at": "2030-01-07T00:00:00Z",
+                "scope": {"model": {"display_name": name}}
+            })]).unwrap_or_default()
+        }))
+    }
+
+    #[tokio::test]
+    async fn claude_optional_model_window_changes_keep_refreshed_account_and_pool_fresh() {
+        let gw = gateway().await;
+        let mut account = add(&gw, "optional-model-window").await;
+        for (old_model, new_model) in [
+            (None, Some(("Fable", 6.0))),
+            (Some(("Fable", 6.0)), None),
+            (Some(("Sonnet", 0.0)), Some(("Fable", 6.0))),
+            (Some(("Fable", 99.0)), Some(("Sonnet", 4.0))),
+        ] {
+            let mut state = ClaudeAccountState {
+                usage: Some(model_scoped_usage(old_model)),
+                observed_at: Some(42),
+                usage_stale: true, // Also repair persisted false-stale snapshots.
+                ..Default::default()
+            };
+            let fresh = model_scoped_usage(new_model);
+            apply_claude_usage_snapshot(&mut state, fresh.clone());
+            assert!(!state.usage_stale, "{old_model:?} -> {new_model:?}");
+            assert!(state.observed_at.unwrap() > 42);
+            assert_eq!(state.usage, Some(fresh.clone())); // No phantom historical model windows.
+            apply_claude_usage_snapshot(&mut state, fresh.clone());
+            assert!(!state.usage_stale); // Repeated omission cannot get stuck stale.
+            assert_eq!(state.usage, Some(fresh));
+            account.account_state = serde_json::to_string(&state).unwrap();
+            let view = safe_claude_account(&account, None);
+            assert!(!view.stale);
+            assert_eq!(view.scheduling, "included");
+            for (name, used, remaining) in [("five_hour", 27.0, 0.73), ("weekly_limit", 34.0, 0.66)]
+            {
+                let quota = aggregate_claude_window(&[&view], name);
+                assert!(!quota.stale);
+                assert_eq!(quota.known_accounts, 1);
+                assert_eq!(quota.total_units, 1);
+                assert!((quota.used_percent.unwrap() - used).abs() < 1e-9);
+                assert!((quota.remaining_units.unwrap() - remaining).abs() < 1e-9);
+            }
+        }
+    }
+
+    #[test]
+    fn claude_missing_spent_invalid_or_global_windows_remain_stale_without_hard_quota() {
+        for (name, percent) in [
+            ("feature:fable:weekly_limit", 100.0),
+            ("feature:fable:weekly_limit", 101.0),
+            ("feature:fable:weekly_limit", -1.0),
+            ("feature:fable:weekly_limit", f64::NAN),
+            ("feature:fable:weekly_limit", f64::INFINITY),
+            ("feature:fable:weekly_limit", f64::NEG_INFINITY),
+            ("unknown_global_window", 6.0),
+            ("feature:oauth_apps:weekly_limit", 6.0),
+            ("feature:oauth_apps:weekly_limit", 100.0),
+        ] {
+            let mut previous = model_scoped_usage(Some(("Fable", 6.0)));
+            previous.windows[2].name = name.into();
+            previous.windows[2].used_percent = percent;
+            let mut state = ClaudeAccountState {
+                usage: Some(previous),
+                observed_at: Some(42),
+                auth_invalid: true,
+                rejection_revision: 7,
+                ..Default::default()
+            };
+            apply_claude_usage_snapshot(&mut state, model_scoped_usage(None));
+            assert!(state.usage_stale && state.auth_invalid);
+            assert!(!state.hard_quota);
+            assert_eq!(state.observed_at, Some(42));
+            assert_eq!(state.rejection_revision, 7);
+            assert!(
+                state
+                    .usage
+                    .as_ref()
+                    .unwrap()
+                    .windows
+                    .iter()
+                    .any(|w| w.name == name)
+            );
+            assert_eq!(
+                state.cost_class_for_model(&DevinPoolConfig::default(), Some("claude-fable-5")),
+                None
+            );
+        }
+        // A model-specific exhausted window must stay blocked even without a
+        // provider-wide hard-quota flag and even after its old reset deadline.
+        let mut previous = model_scoped_usage(Some(("Fable", 100.0)));
+        previous.windows[2].resets_at = Some("2020-01-01T00:00:00Z".into());
+        let mut state = authenticated_claude_state(previous, None);
+        apply_claude_usage_snapshot(&mut state, model_scoped_usage(None));
+        assert!(state.usage_stale);
+        assert_eq!(
+            state.cost_class_for_model(&DevinPoolConfig::default(), Some("claude-fable-5")),
+            None
+        );
+        assert_eq!(
+            state.cost_class_for_model(&DevinPoolConfig::default(), Some("claude-sonnet-4")),
+            Some(0)
+        );
+        apply_claude_usage_snapshot(&mut state, model_scoped_usage(Some(("Fable", 6.0))));
+        assert!(!state.usage_stale);
+        assert_eq!(
+            state.cost_class_for_model(&DevinPoolConfig::default(), Some("claude-fable-5")),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn claude_missing_model_window_cannot_clear_a_newer_quota_refusal() {
+        for reason in [
+            None,
+            Some("weekly_quota"),
+            Some("quota_reauthorization_verification"),
+        ] {
+            let mut state = ClaudeAccountState {
+                usage: Some(model_scoped_usage(Some(("Fable", 6.0)))),
+                observed_at: Some(42),
+                hard_quota: true,
+                hard_quota_reason: reason.map(str::to_owned),
+                rejection_revision: 7,
+                ..Default::default()
+            };
+            apply_claude_usage_snapshot(&mut state, model_scoped_usage(None));
+            assert!(state.usage_stale && state.hard_quota);
+            assert_eq!(state.observed_at, Some(42));
+            assert_eq!(state.hard_quota_reason.as_deref(), reason);
+            assert_eq!(state.rejection_revision, 7);
+            assert_eq!(state.usage.as_ref().unwrap().windows.len(), 3);
+            apply_claude_usage_snapshot(&mut state, model_scoped_usage(Some(("Fable", 6.0))));
+            assert!(!state.usage_stale && !state.hard_quota);
+            assert_eq!(state.rejection_revision, 7);
+        }
+    }
+
+    #[test]
+    fn claude_relogin_keeps_optional_history_until_successful_usage_probe() {
+        let previous = ClaudeAccountState {
+            usage: Some(model_scoped_usage(Some(("Fable", 6.0)))),
+            observed_at: Some(42),
+            ..Default::default()
+        };
+        let mut state = authenticated_claude_state(model_scoped_usage(None), Some(&previous));
+        assert!(state.usage_stale && state.hard_quota);
+        assert_eq!(state.observed_at, Some(42));
+        assert_eq!(
+            state.hard_quota_reason.as_deref(),
+            Some("reauthorization_verification")
+        );
+        apply_claude_usage_snapshot(&mut state, model_scoped_usage(None));
+        assert!(!state.usage_stale && !state.hard_quota);
+        assert!(state.observed_at.unwrap() > 42);
+        assert_eq!(state.usage.unwrap().windows.len(), 2);
+    }
+
+    #[test]
+    fn claude_missing_primary_windows_preserve_optional_observations() {
+        for missing in ["five_hour", "weekly_limit"] {
+            let mut state = ClaudeAccountState {
+                usage: Some(model_scoped_usage(Some(("Fable", 6.0)))),
+                observed_at: Some(42),
+                ..Default::default()
+            };
+            let mut partial = model_scoped_usage(None);
+            partial.windows.retain(|w| w.name != missing);
+            apply_claude_usage_snapshot(&mut state, partial);
+            assert!(state.usage_stale);
+            assert_eq!(state.observed_at, Some(42));
+            assert_eq!(state.usage.unwrap().windows.len(), 3);
+        }
     }
 
     #[test]

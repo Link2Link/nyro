@@ -162,6 +162,26 @@ test("estimated capacity appears below the current cycle and projects price only
   }
 });
 
+test("Claude Fable weekly windows never replace the main weekly projection or bypass stale protection", () => {
+  const reset = new Date(periodEnd).toISOString();
+  const s = { ...stats, period: { ...priced, equivalent_costs: [{ currency: "USD", total_cost: 78.28, priced_request_count: 3 }] } };
+  for (const locale of ["en-US", "zh-CN"] as const) {
+    for (const fable of [[], [{ name: "feature:fable:weekly_limit", used_percent: 6, resets_at: reset }]]) {
+      const account = { ...estimateAccount, claude_usage: { windows: [
+        { name: "five_hour", used_percent: 27, resets_at: reset },
+        { name: "weekly_limit", used_percent: 34, resets_at: reset },
+        ...fable,
+      ] } };
+      const overrides = { account, kind: "claude_code" as const, locale };
+      const html = render(s, overrides);
+      equal(estimateValue(html), "≈ $230.24");
+      match(html, locale === "zh-CN" ? /用于估算的已用比例：34%/ : /Used for projection: 34%/);
+      equal(estimateValue(render(s, { ...overrides, account: { ...account, stale: true } })), "—");
+      equal(estimateValue(render(s, { ...overrides, error: true })), "—");
+    }
+  }
+});
+
 test("estimated prices preserve mixed currencies, partial-price warnings, tiny amounts and priced zero", () => {
   const s = { ...stats, period: { ...priced, unpriced_request_count: 1, equivalent_costs: [
     { currency: "USD", total_cost: 1, priced_request_count: 1 },
