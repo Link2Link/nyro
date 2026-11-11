@@ -3414,15 +3414,14 @@ impl AdminService {
                 // Plan badge (Pro / Max 5x / Max 20x …), cached per account:
                 // the account UUID survives token refreshes, and a re-login
                 // to another account changes it.
-                let account = runtime
-                    .credential
-                    .as_ref()
-                    .and_then(|credential| credential.meta.pointer("/account/uuid"))
-                    .and_then(Value::as_str)
-                    .unwrap_or_default();
-                let plan_key = format!("{}:{account}", provider.id);
                 let level = crate::provider::anthropic::claude_code::usage::fetch_plan(
-                    &client, base_url, token, &plan_key,
+                    &client,
+                    base_url,
+                    token,
+                    runtime
+                        .credential
+                        .as_ref()
+                        .context("Claude credential missing")?,
                 )
                 .await;
                 let tiers = usage

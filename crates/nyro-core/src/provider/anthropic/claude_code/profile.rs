@@ -1,26 +1,56 @@
 //! Claude Code CLI wire profile: request predicates, native-client detection
 //! and per-request `anthropic-beta` assembly.
 //!
-//! Body/beta rules and SDK defaults retain CLIProxyAPI's measured 2.1.280
-//! profile. The generated CLI identity is 2.1.321: a version-only upgrade was
-//! verified with a Fable 5.2 Messages probe. This is not a wholesale 2.1.321
-//! wire-profile port; preserve native clients independently of this identity.
+//! Generated identity and body-derived betas follow CLIProxyAPI's measured
+//! 2.1.321 profile (b4e7dbd2 and its current capability gates). Native clients
+//! retain their own identity and beta ordering independently of this profile.
 
 use std::collections::HashSet;
 
 use reqwest::header::HeaderMap;
 use serde_json::Value;
 
-pub(crate) const CLI_VERSION: &str = "2.1.321";
-pub(crate) const CLI_USER_AGENT: &str = "claude-cli/2.1.321 (external, cli)";
+/// A generated client is one measured profile, never independently bumped
+/// CLI, SDK and runtime defaults. Native compatibility is deliberately separate.
+struct GeneratedProfile {
+    cli_version: &'static str,
+    user_agent: &'static str,
+    package_version: &'static str,
+    runtime_version: &'static str,
+    os: &'static str,
+    arch: &'static str,
+    timeout: &'static str,
+}
+
+// concat! requires a literal: bind the billing version and UA to that same input.
+macro_rules! generated_profile {
+    ($cli:literal, $sdk:literal, $runtime:literal) => {
+        GeneratedProfile {
+            cli_version: $cli,
+            user_agent: concat!("claude-cli/", $cli, " (external, cli)"),
+            package_version: $sdk,
+            runtime_version: $runtime,
+            os: "MacOS",
+            arch: "arm64",
+            timeout: "600",
+        }
+    };
+}
+
+const GENERATED_PROFILE: GeneratedProfile = generated_profile!("2.1.321", "0.128.0", "v26.12.1");
+
+// Keep the aliases used by egress, billing and usage requests.
+pub(crate) const CLI_VERSION: &str = GENERATED_PROFILE.cli_version;
+pub(crate) const CLI_USER_AGENT: &str = GENERATED_PROFILE.user_agent;
+pub(crate) const STAINLESS_PACKAGE_VERSION: &str = GENERATED_PROFILE.package_version;
+pub(crate) const STAINLESS_RUNTIME_VERSION: &str = GENERATED_PROFILE.runtime_version;
+pub(crate) const STAINLESS_OS: &str = GENERATED_PROFILE.os;
+pub(crate) const STAINLESS_ARCH: &str = GENERATED_PROFILE.arch;
+pub(crate) const STAINLESS_TIMEOUT: &str = GENERATED_PROFILE.timeout;
+
 // Raising the generated identity must not rewrite previously supported native
 // clients with a newer header profile while preserving their older bodies.
 const NATIVE_CLI_VERSION_FLOOR: (u32, u32, u32) = (2, 1, 280);
-pub(crate) const STAINLESS_PACKAGE_VERSION: &str = "0.112.1";
-pub(crate) const STAINLESS_RUNTIME_VERSION: &str = "v26.3.0";
-pub(crate) const STAINLESS_OS: &str = "MacOS";
-pub(crate) const STAINLESS_ARCH: &str = "arm64";
-pub(crate) const STAINLESS_TIMEOUT: &str = "600";
 
 pub(crate) const CLAUDE_CODE_BETA: &str = "claude-code-20250219";
 pub(crate) const OAUTH_BETA: &str = "oauth-2025-04-20";
@@ -48,12 +78,13 @@ const EXTENDED_CACHE_TTL_BETA: &str = "extended-cache-ttl-2025-04-11";
 const PROMPT_CACHING_EVICT_BETA: &str = "prompt-caching-evict-2026-05-12";
 const CACHE_DIAGNOSIS_BETA: &str = "cache-diagnosis-2026-04-07";
 const TOKEN_COUNTING_BETA: &str = "token-counting-2024-11-01";
+const THINKING_TOKEN_COUNT_BETA: &str = "thinking-token-count-2026-05-13";
+const MESSAGE_THREADS_BETA: &str = "message-threads-2026-08-12";
 
 /// Betas the `cli` entrypoint sends on every Messages request, in wire order.
 const CLI_CONSTANT_BETAS: &[&str] = &[
     "interleaved-thinking-2025-05-14",
     REDACT_THINKING_BETA,
-    "thinking-token-count-2026-05-13",
     "context-management-2025-06-27",
     "prompt-caching-scope-2026-01-05",
 ];
@@ -88,8 +119,9 @@ const MANAGED_BETAS: &[&str] = &[
     CACHE_DIAGNOSIS_BETA,
     REDACT_THINKING_BETA,
     AFK_MODE_BETA,
+    THINKING_TOKEN_COUNT_BETA,
+    MESSAGE_THREADS_BETA,
     "interleaved-thinking-2025-05-14",
-    "thinking-token-count-2026-05-13",
     "context-management-2025-06-27",
     "prompt-caching-scope-2026-01-05",
 ];
@@ -165,16 +197,37 @@ fn is_fable_51(model: &str) -> bool {
         })
 }
 
+fn is_fable_52(model: &str) -> bool {
+    model_is(model, "claude-fable-5-2") || model_is(model, "claude-fable-5.2")
+}
+
+fn is_haiku_55(model: &str) -> bool {
+    model_is(model, "claude-haiku-5-5") || model_is(model, "claude-haiku-5.5")
+}
+
 fn uses_progress_display(model: &str) -> bool {
-    is_opus_55(model) || is_fable_51(model) || is_sonnet_5(model) || is_sonnet_55(model)
+    is_opus_55(model)
+        || is_fable_51(model)
+        || is_fable_52(model)
+        || is_sonnet_5(model)
+        || is_sonnet_55(model)
+        || is_haiku_55(model)
 }
 
 fn has_per_turn_effort(model: &str) -> bool {
-    is_opus_55(model) || model.starts_with("claude-fable-5-1")
+    is_opus_55(model)
+        || model.starts_with("claude-fable-5-1")
+        || is_fable_52(model)
+        || is_sonnet_55(model)
+        || is_haiku_55(model)
 }
 
 fn has_per_turn_timing(model: &str) -> bool {
-    has_per_turn_effort(model) || model.starts_with("claude-mythos-5-1")
+    !is_haiku_55(model)
+        && (has_per_turn_effort(model)
+            || model.starts_with("claude-mythos-5-1")
+            || model.starts_with("claude-mythos-5-2")
+            || model.starts_with("claude-mythos-5.2"))
 }
 
 /// Whether the target model has no mid-conversation `role: system` slot.
@@ -319,24 +372,28 @@ pub(crate) fn is_subagent(headers: &HeaderMap, body: &Value) -> bool {
     }
 }
 
-/// Whether any `cache_control` block asks for the 1h TTL.
-pub(crate) fn has_1h_ttl(value: &Value) -> bool {
-    match value {
-        Value::Object(map) => {
-            map.get("cache_control")
-                .and_then(|cc| cc.get("ttl"))
-                .and_then(Value::as_str)
-                == Some("1h")
-                || map.values().any(has_1h_ttl)
-        }
-        Value::Array(items) => items.iter().any(has_1h_ttl),
-        _ => false,
-    }
+/// Inspect only API cache locations, not schemas, tool inputs/results, metadata,
+/// or arbitrary nested objects that happen to contain a cache_control key.
+pub(crate) fn has_1h_ttl(body: &Value) -> bool {
+    let one_hour = |value: &Value| str_at(value, "/cache_control/ttl") == "1h";
+    one_hour(body)
+        || tools(body).iter().any(one_hour)
+        || body
+            .get("system")
+            .and_then(Value::as_array)
+            .is_some_and(|blocks| blocks.iter().any(one_hour))
+        || messages(body).iter().any(|message| {
+            message
+                .get("content")
+                .and_then(Value::as_array)
+                .is_some_and(|blocks| blocks.iter().any(one_hour))
+        })
 }
 
 fn supports_effort(body: &Value) -> bool {
+    let model = canonical_model(body);
     !is_probe_or_helper(body)
-        && !canonical_model(body).contains("haiku")
+        && (!model.contains("haiku") || is_haiku_55(&model))
         && thinking_type(body) != "disabled"
 }
 
@@ -424,16 +481,20 @@ impl BetaList {
     }
 }
 
-/// The per-request beta baseline Claude Code 2.1.280 sends (`claudeCodeCLIBetas`).
+/// The per-request beta baseline Claude Code 2.1.321 sends (`claudeCodeCLIBetas`).
 fn cli_betas(body: &Value, requested: &HashSet<String>, oauth: bool) -> BetaList {
     let req = |beta: &str| requested.contains(beta);
     let model = canonical_model(body);
     let legacy = uses_legacy_system_reminder(body);
     let probe = is_probe_or_helper(body);
+    let quota_probe = is_probe(body);
+    let claude_code_after_scope = is_haiku_55(&model);
     let thinking = thinking_type(body);
     let mut betas = BetaList::default();
 
-    betas.push(CLAUDE_CODE_BETA);
+    if !quota_probe && !claude_code_after_scope {
+        betas.push(CLAUDE_CODE_BETA);
+    }
     if oauth {
         betas.push(OAUTH_BETA);
     }
@@ -447,11 +508,16 @@ fn cli_betas(body: &Value, requested: &HashSet<String>, oauth: bool) -> BetaList
         }
         betas.push(beta);
     }
+    if !quota_probe && claude_code_after_scope {
+        betas.push(CLAUDE_CODE_BETA);
+    }
     let per_turn_control = req(PER_TURN_CONTROL_BETA) || has_per_turn_effort(&model);
     let per_turn_timing = req(PER_TURN_TIMING_BETA)
         || (has_per_turn_timing(&model) && has_per_turn_timing_body(body));
     if !legacy {
-        betas.push(MID_CONV_SYSTEM_BETA);
+        if req(MID_CONV_SYSTEM_BETA) {
+            betas.push(MID_CONV_SYSTEM_BETA);
+        }
         if per_turn_control {
             betas.push(PER_TURN_CONTROL_BETA);
         }
@@ -475,6 +541,9 @@ fn cli_betas(body: &Value, requested: &HashSet<String>, oauth: bool) -> BetaList
     if req(ADVISOR_TOOL_BETA) || has_advisor_tool(body) {
         betas.push(ADVISOR_TOOL_BETA);
     }
+    if !quota_probe || req(THINKING_TOKEN_COUNT_BETA) {
+        betas.push(THINKING_TOKEN_COUNT_BETA);
+    }
     if req(ADVANCED_TOOL_USE_BETA) || uses_advanced_tool_use(body) {
         betas.push(ADVANCED_TOOL_USE_BETA);
     }
@@ -484,11 +553,11 @@ fn cli_betas(body: &Value, requested: &HashSet<String>, oauth: bool) -> BetaList
     if !legacy && clear_at {
         betas.push(MID_CONV_CLEAR_AT_BETA);
     }
-    if req(DANGEROUS_TOOL_USE_BETA) || body.get("safeguards").is_some() {
-        betas.push(DANGEROUS_TOOL_USE_BETA);
-    }
     if supports_effort(body) {
         betas.push(EFFORT_BETA);
+    }
+    if req(DANGEROUS_TOOL_USE_BETA) || body.get("safeguards").is_some() {
+        betas.push(DANGEROUS_TOOL_USE_BETA);
     }
     let has_fallbacks = body.get("fallbacks").is_some();
     if !probe && (req(SERVER_SIDE_FALLBACK_BETA) || has_fallbacks) {
@@ -540,6 +609,9 @@ fn cli_betas(body: &Value, requested: &HashSet<String>, oauth: bool) -> BetaList
     }
     if body.get("diagnostics").is_some_and(Value::is_object) {
         betas.push(CACHE_DIAGNOSIS_BETA);
+    }
+    if req(MESSAGE_THREADS_BETA) || body.get("thread").is_some_and(Value::is_object) {
+        betas.push(MESSAGE_THREADS_BETA);
     }
     betas
 }
@@ -625,6 +697,62 @@ pub(crate) fn native_betas(
     }
     apply_post_filters(&mut betas, body, headers);
     betas.join()
+}
+
+// ── Generated profile validation ─────────────────────────────────────────────
+
+/// Validate the known generated wire shape after all non-native body/header
+/// shaping. Callers must not use this as native-client detection or validation:
+/// native releases, entrypoints and device profiles remain caller-owned.
+/// Errors name only the inconsistent field, never header values or body text.
+pub(crate) fn validate_generated_profile(
+    headers: &HeaderMap,
+    body: &Value,
+    count_tokens: bool,
+) -> Result<(), String> {
+    for (name, expected) in [
+        ("user-agent", CLI_USER_AGENT),
+        ("x-stainless-package-version", STAINLESS_PACKAGE_VERSION),
+        ("x-stainless-runtime-version", STAINLESS_RUNTIME_VERSION),
+        ("x-stainless-runtime", "node"),
+        ("x-stainless-lang", "js"),
+        ("x-stainless-os", STAINLESS_OS),
+        ("x-stainless-arch", STAINLESS_ARCH),
+    ] {
+        let mut values = headers.get_all(name).iter();
+        if values.next().and_then(|value| value.to_str().ok()) != Some(expected)
+            || values.next().is_some()
+        {
+            return Err(format!("generated Claude Code profile mismatch: {name}"));
+        }
+    }
+    if count_tokens {
+        return Ok(());
+    }
+
+    // Cloaking owns this first text block. Do not recursively inspect user
+    // prompts, schemas or tool results that may quote a billing header.
+    let billing = body
+        .pointer("/system/0")
+        .filter(|block| str_at(block, "/type") == "text")
+        .and_then(|block| block.get("text"))
+        .and_then(Value::as_str)
+        .and_then(|text| text.strip_prefix(super::cch::BILLING_HEADER_PREFIX))
+        .ok_or_else(|| "generated Claude Code profile missing billing header".to_string())?;
+    let mut versions = billing
+        .split(';')
+        .filter_map(|field| field.trim().strip_prefix("cc_version="));
+    let version = versions.next();
+    let matches_profile = version
+        .and_then(|value| value.strip_prefix(CLI_VERSION))
+        .and_then(|suffix| suffix.strip_prefix('.'))
+        .is_some_and(|fingerprint| {
+            fingerprint.len() == 3 && fingerprint.bytes().all(|byte| byte.is_ascii_hexdigit())
+        });
+    if !matches_profile || versions.next().is_some() {
+        return Err("generated Claude Code profile mismatch: billing cc_version".to_string());
+    }
+    Ok(())
 }
 
 // ── Native client detection ──────────────────────────────────────────────────
@@ -724,6 +852,225 @@ mod tests {
     use reqwest::header::HeaderValue;
     use serde_json::json;
 
+    // Native 2.1.321 main-thread captures from CLIProxyAPI, 2026-11-09.
+    const CAPTURE_2321_MAIN_BETAS: &str = "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,\
+         context-management-2025-06-27,prompt-caching-scope-2026-01-05,per-turn-control-2026-07-01,\
+         mid-conversation-tool-changes-2026-07-01,inline-tools-2026-09-15,advisor-tool-2026-03-01,\
+         thinking-token-count-2026-05-13,advanced-tool-use-2025-11-20,mid-conversation-system-clear-at-2026-08-21,\
+         effort-2025-11-24,dangerous-tool-use-2026-09-03,thinking-binding-controls-2026-08-01,\
+         thinking-display-updates-2026-08-18,afk-mode-2026-01-31,extended-cache-ttl-2025-04-11,\
+         cache-diagnosis-2026-04-07,message-threads-2026-08-12";
+
+    fn capture_2321_main_body(model: &str, display: &str) -> Value {
+        json!({
+            "model": model,
+            "max_tokens": 128000,
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "say ok"}]},
+                {"role": "system", "content": [
+                    {"type": "text", "text": "tools changed"},
+                    {"type": "tool_addition", "tool": {"type": "tool_definition", "definition": {
+                        "name": "mcp__docs__guide", "input_schema": {"type": "object"}
+                    }}}
+                ]}
+            ],
+            "system": [
+                {"type": "text", "text": "You are Claude Code, Anthropic's official CLI for Claude."},
+                {"type": "text", "text": "prompt", "cache_control": {
+                    "type": "ephemeral", "ttl": "1h", "scope": "global"
+                }}
+            ],
+            "tools": [
+                {"name": "Read", "input_schema": {"type": "object"}},
+                {"name": "DeferredToolPlaceholder", "input_schema": {"type": "object"}, "defer_loading": true},
+                {"type": "advisor_20260301", "name": "advisor", "model": "claude-opus-5-5", "defer_loading": true}
+            ],
+            "thinking": {"type": "adaptive", "display": display},
+            "safeguards": {"type": "dangerous_tool_use"},
+            "output_config": {"effort": "medium"},
+            "thread": {"type": "create"},
+            "diagnostics": {"previous_message_id": null}
+        })
+    }
+
+    #[test]
+    fn generated_betas_match_claude_code_2321_captures() {
+        for (model, display) in [
+            ("claude-fable-5-2", "updates"),
+            ("claude-fable-5-1", "updates"),
+            ("claude-opus-5-5", "updates"),
+            ("claude-sonnet-5-5", "updates"),
+            ("claude-haiku-5-5", "updates"),
+            ("claude-fable-5-2", "omitted"),
+        ] {
+            let body = capture_2321_main_body(model, display);
+            let mut expected = CAPTURE_2321_MAIN_BETAS.to_string();
+            if model == "claude-haiku-5-5" {
+                expected = expected.replacen("claude-code-20250219,", "", 1).replacen(
+                    "prompt-caching-scope-2026-01-05,",
+                    "prompt-caching-scope-2026-01-05,claude-code-20250219,",
+                    1,
+                );
+            }
+            if display == "omitted" {
+                expected = expected.replace("thinking-display-updates-2026-08-18,", "");
+            }
+            let requested = split_betas(&expected);
+            let headers = HeaderMap::new();
+            assert_eq!(
+                cloaked_betas(&body, &requested, &[], true, true, &headers),
+                expected,
+                "{model} / {display} requested header betas"
+            );
+            assert_eq!(
+                cloaked_betas(&body, &[], &requested, true, true, &headers),
+                expected,
+                "{model} / {display} requested body betas"
+            );
+            assert_eq!(
+                cloaked_betas(&body, &[], &[], true, true, &headers),
+                expected.replace("afk-mode-2026-01-31,", ""),
+                "{model} / {display} inferred from body"
+            );
+        }
+    }
+
+    #[test]
+    fn quota_probe_capture_omits_claude_code_and_thinking_token_count() {
+        let body = json!({"model": "claude-haiku-4-5-20251001", "max_tokens": 1,
+            "messages": [{"role": "user", "content": "quota"}]});
+        let expected = "oauth-2025-04-20,interleaved-thinking-2025-05-14,\
+            redact-thinking-2026-02-12,context-management-2025-06-27,prompt-caching-scope-2026-01-05";
+        let headers = HeaderMap::new();
+        assert_eq!(
+            cloaked_betas(&body, &[], &[], true, true, &headers),
+            expected
+        );
+        assert_eq!(
+            cloaked_betas(&body, &split_betas(expected), &[], true, true, &headers),
+            expected
+        );
+        let requested = vec![CLAUDE_CODE_BETA.into(), THINKING_TOKEN_COUNT_BETA.into()];
+        assert_eq!(
+            cloaked_betas(&body, &requested, &[], true, true, &headers),
+            format!("{expected},{THINKING_TOKEN_COUNT_BETA}")
+        );
+        let helper = json!({"model": "claude-haiku-4-5-20251001", "max_tokens": 64,
+            "system": "Return a short title", "messages": [{"role": "user", "content": "session"}]});
+        let betas = cloaked_betas(&helper, &[], &[], true, true, &headers);
+        assert!(betas.starts_with(CLAUDE_CODE_BETA));
+        assert!(betas.contains(THINKING_TOKEN_COUNT_BETA));
+        assert!(!betas.contains(EXTENDED_CACHE_TTL_BETA));
+    }
+
+    #[test]
+    fn mid_conversation_system_and_threads_require_capabilities() {
+        let mut body = json!({"model": "claude-fable-5-2",
+            "messages": [{"role": "system", "content": "new instructions"}]});
+        let headers = HeaderMap::new();
+        let betas = cloaked_betas(&body, &[], &[], true, true, &headers);
+        assert!(!betas.contains(MID_CONV_SYSTEM_BETA));
+        assert!(!betas.contains(MESSAGE_THREADS_BETA));
+        let requested = vec![MID_CONV_SYSTEM_BETA.into(), MESSAGE_THREADS_BETA.into()];
+        let betas = cloaked_betas(&body, &requested, &[], true, true, &headers);
+        assert!(betas.contains(MID_CONV_SYSTEM_BETA));
+        assert!(betas.ends_with(MESSAGE_THREADS_BETA));
+        body["model"] = json!("claude-haiku-4-5");
+        assert!(
+            !cloaked_betas(&body, &requested, &[], true, true, &headers)
+                .contains(MID_CONV_SYSTEM_BETA)
+        );
+        for thread in [
+            json!(null),
+            json!("create"),
+            json!([]),
+            json!({"type": "create"}),
+        ] {
+            body["thread"] = thread.clone();
+            assert_eq!(
+                cloaked_betas(&body, &[], &[], true, true, &headers).contains(MESSAGE_THREADS_BETA),
+                thread.is_object()
+            );
+        }
+    }
+
+    #[test]
+    fn per_turn_timing_matches_2321_catalog_and_body_gates() {
+        for (model, timing) in [
+            ("claude-fable-5-2", true),
+            ("provider/CLAUDE-FABLE-5-2[1m]", true),
+            ("claude-fable-5.2-20261101", true),
+            ("claude-fable-5-1", true),
+            ("claude-opus-5-5", true),
+            ("claude-sonnet-5-5", true),
+            ("claude-mythos-5-2", true),
+            ("claude-mythos-5.2", true),
+            ("claude-haiku-5-5", false),
+            ("claude-haiku-5.5", false),
+            ("claude-fable-5", false),
+            ("claude-fable-5-20", false),
+        ] {
+            let mut body = json!({"model": model});
+            let headers = HeaderMap::new();
+            assert!(
+                !cloaked_betas(&body, &[], &[], true, true, &headers)
+                    .contains(PER_TURN_TIMING_BETA)
+            );
+            body["output_config"] = json!({"timing": {"type": "enabled"}});
+            assert_eq!(
+                cloaked_betas(&body, &[], &[], true, true, &headers).contains(PER_TURN_TIMING_BETA),
+                timing,
+                "{model}"
+            );
+            body.as_object_mut().unwrap().remove("output_config");
+            body["messages"] = json!([{"role": "user", "content": "hi", "output_config": {"timing": {"type": "enabled"}}}]);
+            assert_eq!(
+                cloaked_betas(&body, &[], &[], true, true, &headers).contains(PER_TURN_TIMING_BETA),
+                timing,
+                "{model}"
+            );
+            assert!(
+                cloaked_betas(
+                    &body,
+                    &[PER_TURN_TIMING_BETA.into()],
+                    &[],
+                    true,
+                    true,
+                    &headers
+                )
+                .contains(PER_TURN_TIMING_BETA)
+            );
+        }
+    }
+
+    #[test]
+    fn haiku_55_effort_and_progress_gates_do_not_extend_to_older_haiku() {
+        for (model, supported) in [
+            ("claude-haiku-5-5", true),
+            ("provider/claude-haiku-5.5[1m]", true),
+            ("claude-haiku-5-5-20261101", true),
+            ("claude-haiku-4-5", false),
+            ("claude-haiku-5-50", false),
+        ] {
+            let mut body = json!({"model": model, "thinking": {"type": "adaptive"}});
+            let headers = HeaderMap::new();
+            let betas = cloaked_betas(&body, &[], &[], true, true, &headers);
+            for beta in [
+                EFFORT_BETA,
+                PER_TURN_CONTROL_BETA,
+                MID_CONV_CLEAR_AT_BETA,
+                THINKING_BINDING_BETA,
+            ] {
+                assert_eq!(betas.contains(beta), supported, "{model}: {beta}");
+            }
+            body["thinking"]["type"] = json!("disabled");
+            assert!(
+                !cloaked_betas(&body, &[EFFORT_BETA.into()], &[], true, true, &headers)
+                    .contains(EFFORT_BETA)
+            );
+        }
+    }
+
     #[test]
     fn oauth_opus5_baseline_matches_cliproxyapi() {
         let body = json!({"model": "claude-opus-5"});
@@ -731,10 +1078,9 @@ mod tests {
         assert_eq!(
             betas,
             "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,\
-             redact-thinking-2026-02-12,thinking-token-count-2026-05-13,\
-             context-management-2025-06-27,prompt-caching-scope-2026-01-05,\
-             mid-conversation-system-2026-04-07,mid-conversation-tool-changes-2026-07-01,\
-             effort-2025-11-24,extended-cache-ttl-2025-04-11"
+             redact-thinking-2026-02-12,context-management-2025-06-27,\
+             prompt-caching-scope-2026-01-05,mid-conversation-tool-changes-2026-07-01,\
+             thinking-token-count-2026-05-13,effort-2025-11-24,extended-cache-ttl-2025-04-11"
         );
     }
 
@@ -806,6 +1152,212 @@ mod tests {
     }
 
     #[test]
+    fn one_hour_ttl_scans_only_api_cache_positions() {
+        let cache = json!({"type": "ephemeral", "ttl": "1h"});
+        for body in [
+            json!({"cache_control": cache}),
+            json!({"tools": [{"name": "Read", "cache_control": cache}]}),
+            json!({"system": [{"type": "text", "text": "prompt", "cache_control": cache}]}),
+            json!({"messages": [{"role": "user", "content": [
+                {"type": "text", "text": "hi", "cache_control": cache}
+            ]}]}),
+            json!({"messages": [{"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t", "content": "result", "cache_control": cache}
+            ]}]}),
+        ] {
+            assert!(has_1h_ttl(&body));
+        }
+        for body in [
+            json!({"tools": [{"input_schema": {"cache_control": cache}}]}),
+            json!({"tools": [{"input_examples": [{"cache_control": cache}]}]}),
+            json!({"system": [{"type": "text", "extra": {"cache_control": cache}}]}),
+            json!({"messages": [{"cache_control": cache, "content": "hi"}]}),
+            json!({"messages": [{"role": "assistant", "content": [
+                {"type": "tool_use", "input": {"cache_control": cache}}
+            ]}]}),
+            json!({"messages": [{"role": "user", "content": [
+                {"type": "tool_result", "content": [{"type": "text", "text": "nested", "cache_control": cache}]}
+            ]}]}),
+            json!({"messages": [{"role": "system", "content": [
+                {"type": "tool_addition", "tool": {"definition": {"cache_control": cache}}}
+            ]}]}),
+            json!({"output_config": {"format": {"schema": {"cache_control": cache}}}}),
+            json!({"metadata": {"cache_control": cache}}),
+            json!({"extra": {"cache_control": cache}}),
+            json!({"cache_control": {"ttl": "5m"}}),
+            json!({"cache_control": {"ttl": 3600}}),
+            json!({"system": {"cache_control": cache}}),
+            json!({"messages": [{"content": {"cache_control": cache}}]}),
+            json!(null),
+        ] {
+            assert!(!has_1h_ttl(&body));
+        }
+    }
+
+    #[test]
+    fn subagent_extended_ttl_ignores_nested_payload_cache_keys() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-claude-code-agent-id",
+            HeaderValue::from_static("agent-1"),
+        );
+        let mut body = json!({"model": "claude-fable-5-2", "tools": [{
+            "name": "Read", "input_schema": {"cache_control": {"ttl": "1h"}}
+        }], "messages": [{"role": "user", "content": [
+            {"type": "tool_result", "content": [{"cache_control": {"ttl": "1h"}}]}
+        ]}]});
+        let caller = vec![CLAUDE_CODE_BETA.into(), EXTENDED_CACHE_TTL_BETA.into()];
+        assert!(
+            !cloaked_betas(&body, &caller, &[], true, true, &headers)
+                .contains(EXTENDED_CACHE_TTL_BETA)
+        );
+        assert!(!native_betas(&body, &caller, true, &headers).contains(EXTENDED_CACHE_TTL_BETA));
+        body["messages"][0]["content"][0]["cache_control"] =
+            json!({"type": "ephemeral", "ttl": "1h"});
+        assert!(
+            cloaked_betas(&body, &caller, &[], true, true, &headers)
+                .contains(EXTENDED_CACHE_TTL_BETA)
+        );
+        assert!(native_betas(&body, &caller, true, &headers).contains(EXTENDED_CACHE_TTL_BETA));
+    }
+
+    fn generated_headers() -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        for (name, value) in [
+            ("user-agent", CLI_USER_AGENT),
+            ("x-stainless-package-version", STAINLESS_PACKAGE_VERSION),
+            ("x-stainless-runtime-version", STAINLESS_RUNTIME_VERSION),
+            ("x-stainless-runtime", "node"),
+            ("x-stainless-lang", "js"),
+            ("x-stainless-os", STAINLESS_OS),
+            ("x-stainless-arch", STAINLESS_ARCH),
+        ] {
+            headers.insert(name, HeaderValue::from_static(value));
+        }
+        headers
+    }
+
+    fn generated_body() -> Value {
+        json!({"model": "claude-fable-5-2", "system": [{"type": "text", "text": format!(
+            "x-anthropic-billing-header: cc_version={CLI_VERSION}.20d; cc_entrypoint=cli; cch=00000;"
+        )}]})
+    }
+
+    #[test]
+    fn generated_profile_validator_accepts_messages_and_count_tokens() {
+        let headers = generated_headers();
+        assert_eq!(
+            validate_generated_profile(&headers, &generated_body(), false),
+            Ok(())
+        );
+        assert_eq!(
+            validate_generated_profile(
+                &headers,
+                &json!({"model": "claude-fable-5-2", "messages": []}),
+                true
+            ),
+            Ok(())
+        );
+        // Count-token payloads need no billing, including a quoted older identity.
+        assert_eq!(
+            validate_generated_profile(
+                &headers,
+                &json!({"system": "cc_version=2.1.280.abc"}),
+                true
+            ),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn generated_profile_validator_rejects_header_drift_without_values() {
+        let body = generated_body();
+        for (name, drift) in [
+            ("user-agent", "claude-cli/2.1.280 (external, cli)"),
+            ("x-stainless-package-version", "0.112.1"),
+            ("x-stainless-runtime-version", "v26.3.0"),
+            ("x-stainless-runtime", "bun"),
+            ("x-stainless-lang", "python"),
+            ("x-stainless-os", "Linux"),
+            ("x-stainless-arch", "x64"),
+        ] {
+            for count_tokens in [false, true] {
+                let mut headers = generated_headers();
+                headers.insert(name, HeaderValue::from_static(drift));
+                headers.insert(
+                    "authorization",
+                    HeaderValue::from_static("Bearer secret-token"),
+                );
+                assert_eq!(
+                    validate_generated_profile(&headers, &body, count_tokens),
+                    Err(format!("generated Claude Code profile mismatch: {name}"))
+                );
+                headers.remove(name);
+                assert!(validate_generated_profile(&headers, &body, count_tokens).is_err());
+                let mut headers = generated_headers();
+                headers.append(name, HeaderValue::from_static("secret-value"));
+                assert!(validate_generated_profile(&headers, &body, count_tokens).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn generated_profile_validator_checks_only_generated_billing_slot() {
+        let headers = generated_headers();
+        for version in [
+            "2.1.280.20d",
+            "2.1.321",
+            "2.1.3210.20d",
+            "2.1.321.zzz",
+            "2.1.321.20d.secret",
+            "2.1.321.20d; cc_version=2.1.280.abc",
+        ] {
+            let body = json!({"system": [{"type": "text", "text": format!(
+                "x-anthropic-billing-header: cc_version={version}; cc_entrypoint=cli; secret-body"
+            )}]});
+            assert_eq!(
+                validate_generated_profile(&headers, &body, false),
+                Err("generated Claude Code profile mismatch: billing cc_version".to_string())
+            );
+        }
+        let billing = generated_body()["system"][0].clone();
+        for body in [
+            json!({}),
+            json!({"system": "x-anthropic-billing-header: cc_version=2.1.321.20d;"}),
+            json!({"system": [{"type": "image", "text": billing["text"]}]}),
+            json!({"system": [{"type": "text", "text": "prompt"}, billing]}),
+            json!({"messages": [{"role": "user", "content": [billing]}]}),
+            json!({"tools": [{"input_schema": billing}]}),
+        ] {
+            assert_eq!(
+                validate_generated_profile(&headers, &body, false),
+                Err("generated Claude Code profile missing billing header".to_string())
+            );
+        }
+        let mut body = generated_body();
+        body["messages"] = json!([{"role": "user", "content": [{"type": "text", "text":
+            "x-anthropic-billing-header: cc_version=2.1.280.abc; secret-body"}]}]);
+        body["system"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"type": "text", "text":
+            "example: x-anthropic-billing-header: cc_version=2.1.280.abc;"}));
+        assert_eq!(validate_generated_profile(&headers, &body, false), Ok(()));
+    }
+
+    #[test]
+    fn native_betas_preserve_original_order_without_generated_baseline() {
+        let body = json!({"model": "claude-fable-5-2", "thread": {"type": "create"}});
+        let caller = split_betas(
+            "custom-native-beta,claude-code-20250219,mid-conversation-system-2026-04-07,effort-2025-11-24",
+        );
+        assert_eq!(
+            native_betas(&body, &caller, false, &HeaderMap::new()),
+            caller.join(",")
+        );
+    }
+
+    #[test]
     fn user_agent_parsing() {
         assert_eq!(
             parse_cli_user_agent("claude-cli/2.1.281 (external, sdk-cli)"),
@@ -830,6 +1382,10 @@ mod tests {
     #[test]
     fn generated_identity_and_native_compatibility_are_independent() {
         assert_eq!(CLI_VERSION, "2.1.321");
+        assert_eq!(STAINLESS_PACKAGE_VERSION, "0.128.0");
+        assert_eq!(STAINLESS_RUNTIME_VERSION, "v26.12.1");
+        assert_eq!(STAINLESS_OS, "MacOS");
+        assert_eq!(STAINLESS_ARCH, "arm64");
         assert_eq!(
             CLI_USER_AGENT,
             format!("claude-cli/{CLI_VERSION} (external, cli)")

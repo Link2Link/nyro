@@ -17,6 +17,7 @@ import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { AccountPoolSettings } from "@/components/devin-pool-settings";
 import { ClaudeAccountLogin } from "@/components/claude-account-login";
 import { ProviderUsageFooter } from "@/components/provider-usage";
+import { ClaudeQuotaObservationView } from "@/components/claude-quota-observation";
 import { UsageProgress } from "@/components/usage-progress";
 import { PoolRefreshButton } from "@/components/pool-refresh-button";
 import { AccountUsageSummary } from "@/components/account-usage-summary";
@@ -50,6 +51,8 @@ export function ClaudeAccountUsage({ account, isZh }: { account: ProviderAccount
   const refreshAvailableAt = usageRefreshAvailableAt(account);
   const coolingDown = refreshAvailableAt != null && now < refreshAvailableAt;
   return <div className="min-w-48 space-y-2 text-xs">
+    <div className="space-y-2" data-claude-full-usage>
+    <h4 className="font-medium text-slate-600">{isZh ? "完整用量快照" : "Full usage snapshot"}</h4>
     {!windows.length && <p className="text-slate-500">{isZh ? "用量未知" : "Usage unknown"}</p>}
     {windows.map((window, index) => {
       const valid = Number.isFinite(window.used_percent) && window.used_percent >= 0;
@@ -67,9 +70,11 @@ export function ClaudeAccountUsage({ account, isZh }: { account: ProviderAccount
     })}
     <p className={account.stale ? "text-amber-700" : "text-slate-400"}>{account.stale ? (isZh ? "旧数据 / 未知" : "Stale / unknown") : (isZh ? "已观察" : "Observed")}</p>
     {account.observed_at != null && Number.isFinite(new Date(account.observed_at).getTime()) && <time className="text-[10px] text-slate-400" dateTime={new Date(account.observed_at).toISOString()}>{new Date(account.observed_at).toLocaleString()}</time>}
+    </div>
+    <ClaudeQuotaObservationView account={account} isZh={isZh} />
     <p className="text-[10px] text-slate-500">{isZh
-      ? "用量刷新采用固定 10 分钟最小尝试间隔，由后端强制执行（失败也计入）。"
-      : "Usage refresh has a fixed 10-minute minimum between attempts, enforced by the backend (including failures)."}</p>
+      ? "主动用量刷新至少间隔 10 分钟，由后端强制执行（失败也计入）；退避可能延长等待。推理响应头的被动观测可独立更新。"
+      : "Active usage refresh attempts are at least 10 minutes apart, enforced by the backend (including failures); backoff may extend the wait. Passive inference-header observations can update independently."}</p>
     <p className={coolingDown ? "text-amber-700" : "text-slate-500"}>{coolingDown
       ? (isZh ? "用量刷新冷却中" : "Usage refresh cooldown")
       : refreshAvailableAt != null ? (isZh ? "现在可尝试刷新用量" : "Usage refresh can be attempted now")
@@ -151,8 +156,8 @@ export function ClaudePoolSummary({ pool, isZh, detailed = false, onRefresh, ref
     </div>
     {!pool.quota.claude_windows?.length && <p className="text-slate-500">{isZh ? "账号池用量未知，请刷新用量。" : "Pool usage unknown; refresh usage to load it."}</p>}
     {(detailed || onRefresh) && <p className="text-[10px] text-slate-500">{isZh
-      ? "后端强制每个账号至少间隔 10 分钟才可再次尝试刷新用量。刷新全池会为冷却中的账号返回缓存数据（若有），不会绕过限制，也不表示缓存已更新。"
-      : "The backend enforces at least 10 minutes between usage refresh attempts per account. Pool refresh returns cached data, if any, for accounts in cooldown; it neither bypasses the limit nor makes cached data fresh."}</p>}
+      ? "后端强制每个账号的主动用量刷新至少间隔 10 分钟；退避可能延长等待。推理响应头的被动观测可独立更新，但不参与账号池汇总。刷新全池会为冷却中的账号返回缓存数据（若有），不会绕过限制，也不表示缓存已更新。"
+      : "The backend enforces at least 10 minutes between active usage refresh attempts per account; backoff may extend the wait. Passive inference-header observations can update independently but do not contribute to pool totals. Pool refresh returns cached data, if any, for accounts in cooldown; it neither bypasses the limit nor makes cached data fresh."}</p>}
     {detailed && <p className="text-[10px] text-slate-500">{isZh
       ? "按 Pro / Max 5× / Max 20× 加权：5 小时 1 / 5 / 20，每周 1 / 5 / 10（估算）。未知或未识别套餐默认按 Pro（1）计算。仅统计已启用且未断开的账号，含额度耗尽账号；不代表当前可调度额度。模型专属窗口请展开管理账号查看。"
       : "Weights for Pro / Max 5× / Max 20×: 5h 1 / 5 / 20; weekly 1 / 5 / 10 (estimated). Unknown or unrecognized plans default to Pro (1). Includes enabled, non-disconnected accounts, including exhausted accounts; not currently routable capacity. Open Manage accounts for model-specific windows."}</p>}
@@ -274,7 +279,7 @@ export function ClaudeAccountPoolCard({ provider }: { provider: Provider }) {
     {query.data?.config ? <ClaudePoolSummary pool={query.data} isZh={isZh}
       onRefresh={() => refresh.mutate()} refreshing={refresh.isPending} />
     : query.data ? <>
-      <ProviderUsageFooter provider={provider} />
+      <ProviderUsageFooter provider={provider} claudeAccount={query.data.accounts.length === 1 ? query.data.accounts[0] : undefined} />
       <p className="text-xs text-amber-700">{isZh ? "保存账号池调度设置即可添加更多 Claude 账号；原单账号仍可使用和重新授权。" : "Save pool scheduling settings to add more Claude accounts; the legacy account can still be used and re-authorized."}</p>
     </> : <p className="text-xs text-slate-500">{query.error ? localizeBackendErrorMessage(query.error, isZh) : (isZh ? "读取账号池…" : "Loading account pool…")}</p>}
     {refresh.error && <p role="alert" className="text-xs text-red-600">

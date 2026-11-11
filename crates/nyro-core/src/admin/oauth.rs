@@ -1290,12 +1290,14 @@ impl AdminService {
                     access_token,
                     binding,
                     credential: None,
+                    claude_observation_account: None,
                 });
             }
             return Ok(ResolvedProviderRuntime {
                 access_token: api_key,
                 binding: RuntimeBinding::default(),
                 credential: None,
+                claude_observation_account: None,
             });
         }
 
@@ -1425,6 +1427,7 @@ impl AdminService {
                 access_token,
                 binding,
                 credential: Some(credential.clone()),
+                claude_observation_account: None,
             });
         }
 
@@ -1468,6 +1471,7 @@ impl AdminService {
                         access_token: refreshed_token,
                         binding,
                         credential: Some(cred),
+                        claude_observation_account: None,
                     });
                 }
                 if refreshed.status == "error" {
@@ -1511,6 +1515,7 @@ impl AdminService {
             access_token: new_access_token,
             binding: driver.bind_runtime(&refreshed_provider, &refreshed_credential)?,
             credential: Some(refreshed_credential),
+            claude_observation_account: None,
         })
     }
 

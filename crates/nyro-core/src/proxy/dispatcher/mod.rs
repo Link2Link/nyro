@@ -1802,46 +1802,56 @@ async fn dispatch_pipeline_inner(
         // official CLI (native callers keep their own identity) once every
         // request path has produced its body. The wire hook then signs the
         // exact bytes sent and restores aliased tool names in the response.
-        let client =
-            if crate::provider::anthropic::claude_code::egress::is_claude_code_channel(&provider)
-                && egress.protocol == crate::protocol::ids::Protocol::AnthropicMessages
-            {
-                // Identity fallback/tool aliases must stay account-scoped even
-                // when OAuth did not return an upstream account UUID. Never
-                // mutate the routing/storage Provider or the shared token.
-                let mut identity_provider = provider.clone();
-                if let Some(account) = &pool_account {
-                    identity_provider.id =
-                        format!("{}:{}", provider.id, account.credential.account_id);
+        let client = if crate::provider::anthropic::claude_code::egress::is_claude_code_channel(
+            &provider,
+        ) && egress.protocol == crate::protocol::ids::Protocol::AnthropicMessages
+        {
+            // Identity fallback/tool aliases must stay account-scoped even
+            // when OAuth did not return an upstream account UUID. Never
+            // mutate the routing/storage Provider or the shared token.
+            let mut identity_provider = provider.clone();
+            if let Some(account) = &pool_account {
+                identity_provider.id = format!("{}:{}", provider.id, account.credential.account_id);
+            }
+            match claude_code_egress(
+                &identity_provider,
+                provider_runtime.credential.as_ref(),
+                &headers,
+                auth_key.id.as_deref().unwrap_or_default(),
+                &mut outbound.url,
+                &mut outbound.headers,
+                &mut prepared_native_body,
+                &mut prepared_compat,
+            ) {
+                Ok(hook) => {
+                    ctx.trace(
+                        "claude_code",
+                        if hook.native {
+                            "client=native"
+                        } else {
+                            "client=cloaked"
+                        },
+                    );
+                    let client = client.with_egress_hook(Some(hook.into_hook()));
+                    // Pin observations to the credential that actually signed this
+                    // attempt, including the legacy single-account channel.
+                    let observer = provider_runtime.claude_observation_account.as_ref()
+                            .filter(|account| account.access_token.trim() == provider_runtime.access_token.trim())
+                            .and_then(|account| {
+                                crate::provider::anthropic::claude_code::quota_observation::ClaudeQuotaObserver::new(
+                                    gw.clone(), account, &outbound.url,
+                                )
+                            })
+                            .map(|observer| std::sync::Arc::new(observer) as std::sync::Arc<dyn crate::proxy::client::ResponseObserver>);
+                    client.with_response_observer(observer)
                 }
-                match claude_code_egress(
-                    &identity_provider,
-                    provider_runtime.credential.as_ref(),
-                    &headers,
-                    auth_key.id.as_deref().unwrap_or_default(),
-                    &mut outbound.url,
-                    &mut outbound.headers,
-                    &mut prepared_native_body,
-                    &mut prepared_compat,
-                ) {
-                    Ok(hook) => {
-                        ctx.trace(
-                            "claude_code",
-                            if hook.native {
-                                "client=native"
-                            } else {
-                                "client=cloaked"
-                            },
-                        );
-                        client.with_egress_hook(Some(hook.into_hook()))
-                    }
-                    Err(error) => {
-                        return error_response(400, &error.to_string());
-                    }
+                Err(error) => {
+                    return error_response(400, &error.to_string());
                 }
-            } else {
-                client
-            };
+            }
+        } else {
+            client
+        };
         // Admission uses the final encoded model, after vendor tier rewriting
         // and conversion. An IR/client hint must not authorize a different
         // bucket than the bytes that will actually be dispatched.

@@ -21,7 +21,8 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::profile;
+use super::{profile, usage_throttle};
+use crate::auth::types::StoredCredential;
 
 const USAGE_PATH: &str = "/api/oauth/usage";
 
@@ -143,12 +144,57 @@ pub(crate) fn parse_usage(body: &Value) -> ClaudeUsage {
 }
 
 const PROFILE_PATH: &str = "/api/oauth/profile";
-/// The plan almost never changes and the account endpoints throttle hard,
-/// so a resolved plan is reused for an hour per credential.
-const PLAN_TTL: std::time::Duration = std::time::Duration::from_secs(3600);
+const PLAN_TTL_MS: i64 = 6 * 60 * 60_000;
+const PLAN_NEGATIVE_TTL_MS: i64 = 10 * 60_000;
+const PLAN_CACHE_CAPACITY: usize = 256;
 
-type PlanCache =
-    std::sync::Mutex<std::collections::HashMap<String, (std::time::Instant, Option<String>)>>;
+#[derive(Default)]
+struct PlanEntry {
+    expires_at: i64,
+    plan: Option<String>,
+}
+
+type PlanSlot = std::sync::Arc<tokio::sync::Mutex<PlanEntry>>;
+
+#[derive(Default)]
+struct PlanCache {
+    entries: std::collections::HashMap<String, PlanSlot>,
+}
+
+impl PlanCache {
+    fn slot(&mut self, key: String, now: i64) -> Option<PlanSlot> {
+        // Active slots (including queued followers) are never evicted, so cache
+        // pressure cannot split a singleflight into two upstream requests.
+        self.entries.retain(|_, slot| {
+            std::sync::Arc::strong_count(slot) > 1
+                || slot.try_lock().map_or(true, |entry| entry.expires_at > now)
+        });
+        if let Some(slot) = self.entries.get(&key) {
+            return Some(slot.clone());
+        }
+        if self.entries.len() >= PLAN_CACHE_CAPACITY {
+            // Evict only expired entries (above). Dropping an unexpired negative
+            // entry would let cache pressure bypass its upstream Retry-After.
+            return None;
+        }
+        let slot = std::sync::Arc::new(tokio::sync::Mutex::new(PlanEntry::default()));
+        self.entries.insert(key, slot.clone());
+        Some(slot)
+    }
+}
+
+fn plan_cache_key(base: &str, token: &str, credential: &StoredCredential) -> Option<String> {
+    use sha2::{Digest, Sha256};
+    let origin = usage_throttle::origin(base).ok()?;
+    // Known accounts survive access-token rotation and duplicate provider IDs.
+    // Unknown accounts must NOT share profile/entitlement results with each other.
+    let identity = usage_throttle::account_identity(credential);
+    let owner = identity
+        .map(str::to_owned)
+        .unwrap_or_else(|| hex::encode(Sha256::digest(token.as_bytes())));
+    let scope = serde_json::to_vec(&(origin, identity.is_some(), owner)).ok()?;
+    Some(hex::encode(Sha256::digest(scope)))
+}
 
 /// Plan badge from `/api/oauth/profile`, using Claude Code's own mapping
 /// (`organization_type`: `claude_max` → max, `claude_pro` → pro, `claude_team`
@@ -184,34 +230,41 @@ pub(crate) fn parse_plan(profile: &Value) -> Option<String> {
     Some(max.to_string())
 }
 
-fn plan_cache() -> &'static PlanCache {
-    static CACHE: std::sync::OnceLock<PlanCache> = std::sync::OnceLock::new();
+fn plan_cache() -> &'static std::sync::Mutex<PlanCache> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<PlanCache>> = std::sync::OnceLock::new();
     CACHE.get_or_init(Default::default)
 }
 
-/// The account's plan badge, cached per credential. Best effort: any failure
-/// yields `None` and never fails the usage query (failures are not cached).
+fn plan_expiry(now: i64, success: bool, retry_after: Option<i64>) -> i64 {
+    now.saturating_add(if success {
+        PLAN_TTL_MS
+    } else {
+        PLAN_NEGATIVE_TTL_MS
+    })
+    .max(retry_after.unwrap_or(0))
+}
+
+/// Best effort profile lookup: six-hour success cache, ten-minute negative cache
+/// (or a longer Retry-After). A bounded, per-account singleflight is shared by all
+/// callers; unlike usage admission, unknown account results are token-isolated.
 pub(crate) async fn fetch_plan(
     client: &reqwest::Client,
     api_base_url: &str,
     access_token: &str,
-    cache_key: &str,
+    credential: &StoredCredential,
 ) -> Option<String> {
-    // Scope even legacy provider-level callers to the exact credential and origin.
-    // A replaced login must not inherit another account's cached entitlement.
-    use sha2::{Digest, Sha256};
-    let cache_key = hex::encode(Sha256::digest(
-        serde_json::to_vec(&(cache_key, api_base_url, access_token)).unwrap(),
-    ));
-    let cached = plan_cache()
-        .lock()
-        .ok()
-        .and_then(|cache| cache.get(&cache_key).cloned());
-    if let Some((at, plan)) = cached
-        && at.elapsed() < PLAN_TTL
-    {
-        return plan;
+    let key = plan_cache_key(api_base_url, access_token, credential)?;
+    let now = chrono::Utc::now().timestamp_millis();
+    let slot = plan_cache().lock().ok()?.slot(key, now)?;
+    let mut entry = slot.lock().await;
+    let now = chrono::Utc::now().timestamp_millis();
+    if entry.expires_at > now {
+        return entry.plan.clone();
     }
+    // Reserve a negative result before HTTP: cancellation also suppresses a
+    // request stampede. Followers only hold the per-key async lock, not the map.
+    entry.plan = None;
+    entry.expires_at = plan_expiry(now, false, None);
     let base = api_base_url.trim().trim_end_matches('/');
     let base = if base.is_empty() {
         "https://api.anthropic.com"
@@ -228,19 +281,17 @@ pub(crate) async fn fetch_plan(
         .send()
         .await
         .ok()?;
+    let now = chrono::Utc::now().timestamp_millis();
+    let retry_after = usage_throttle::retry_after_at(response.headers(), now);
+    entry.expires_at = plan_expiry(now, false, retry_after);
     if !response.status().is_success() {
         tracing::debug!(status = %response.status(), "claude-code: oauth profile unavailable");
         return None;
     }
     let body: Value = response.json().await.ok()?;
-    let plan = parse_plan(&body);
-    if let Ok(mut cache) = plan_cache().lock() {
-        cache.insert(
-            cache_key.to_string(),
-            (std::time::Instant::now(), plan.clone()),
-        );
-    }
-    plan
+    entry.plan = parse_plan(&body);
+    entry.expires_at = plan_expiry(chrono::Utc::now().timestamp_millis(), true, retry_after);
+    entry.plan.clone()
 }
 
 /// Account usage refresh and login share the same best-effort profile lookup.
@@ -252,7 +303,7 @@ pub(crate) async fn fetch_usage_with_plan(
     access_token: &str,
     credential: &crate::auth::types::StoredCredential,
     prior_observed_at: Option<i64>,
-    account_identity: &str,
+    _account_identity: &str,
 ) -> anyhow::Result<ClaudeUsage> {
     let mut usage = fetch_usage(
         gw,
@@ -263,8 +314,72 @@ pub(crate) async fn fetch_usage_with_plan(
         prior_observed_at,
     )
     .await?;
-    usage.plan = fetch_plan(client, api_base_url, access_token, account_identity).await;
+    usage.plan = fetch_plan(client, api_base_url, access_token, credential).await;
     Ok(usage)
+}
+
+/// Sanitized management-facing failure. In particular, retain the historical
+/// 401 prefix for callers that still classify authentication by its string.
+#[derive(Debug, thiserror::Error)]
+#[error("{message}")]
+pub(crate) struct UsageError {
+    pub status: Option<u16>,
+    pub retry_after: Option<i64>,
+    message: String,
+}
+
+impl UsageError {
+    fn http(status: u16, retry_after: Option<i64>) -> Self {
+        let message = match status {
+            401 => {
+                "Claude authentication failed (HTTP 401); re-authorize this provider".to_string()
+            }
+            403 => "Claude usage access denied (HTTP 403); verify account permissions".to_string(),
+            429 => "Claude usage endpoint is rate limited (HTTP 429); retry later".to_string(),
+            _ => format!("Claude usage query failed (HTTP {status})"),
+        };
+        Self {
+            status: Some(status),
+            retry_after,
+            message,
+        }
+    }
+
+    fn transport(message: &str, retry_after: Option<i64>) -> Self {
+        Self {
+            status: None,
+            retry_after,
+            message: message.to_string(),
+        }
+    }
+}
+
+async fn record_failure(
+    gw: &crate::Gateway,
+    base: &str,
+    credential: &StoredCredential,
+    attempt: i64,
+    error: &UsageError,
+) {
+    let failure = error
+        .status
+        .map(usage_throttle::Failure::from_status)
+        .unwrap_or(usage_throttle::Failure::Transient);
+    if usage_throttle::record(
+        gw,
+        base,
+        credential,
+        attempt,
+        usage_throttle::Outcome::Failure(failure),
+        error.retry_after,
+    )
+    .await
+    .is_err()
+    {
+        // The mandatory reservation is already durable. Do not replace a typed
+        // HTTP 401 with a storage error, or log storage details/credentials.
+        tracing::warn!("claude-code: failed to persist usage backoff; reservation remains active");
+    }
 }
 
 /// Fetch and parse the subscription usage for one OAuth access token.
@@ -276,7 +391,7 @@ pub(crate) async fn fetch_usage(
     credential: &crate::auth::types::StoredCredential,
     prior_observed_at: Option<i64>,
 ) -> anyhow::Result<ClaudeUsage> {
-    super::usage_throttle::reserve(gw, api_base_url, credential, prior_observed_at).await?;
+    let attempt = usage_throttle::reserve(gw, api_base_url, credential, prior_observed_at).await?;
     let base = api_base_url.trim().trim_end_matches('/');
     let base = if base.is_empty() {
         "https://api.anthropic.com"
@@ -291,34 +406,68 @@ pub(crate) async fn fetch_usage(
         .header("user-agent", profile::CLI_USER_AGENT)
         .timeout(std::time::Duration::from_secs(15))
         .send()
-        .await
-        .map_err(|_| {
-            anyhow::anyhow!("Claude usage request failed; verify proxy/network settings")
-        })?;
-    let status = response.status();
-    let raw = response
-        .bytes()
-        .await
-        .map_err(|_| anyhow::anyhow!("Failed to read Claude usage response"))?;
-    if !status.is_success() {
-        // Usage errors reach management APIs: never include raw upstream bodies,
-        // request URLs or credentials in diagnostics. A bare 403 may be policy
-        // or scope denial, not proof that the credential was revoked.
-        match status {
-            reqwest::StatusCode::UNAUTHORIZED => {
-                anyhow::bail!("Claude authentication failed (HTTP 401); re-authorize this provider")
-            }
-            reqwest::StatusCode::FORBIDDEN => {
-                anyhow::bail!("Claude usage access denied (HTTP 403); verify account permissions")
-            }
-            reqwest::StatusCode::TOO_MANY_REQUESTS => {
-                anyhow::bail!("Claude usage endpoint is rate limited (HTTP 429); retry later")
-            }
-            _ => anyhow::bail!("Claude usage query failed (HTTP {})", status.as_u16()),
+        .await;
+    let response = match response {
+        Ok(response) => response,
+        Err(_) => {
+            let error = UsageError::transport(
+                "Claude usage request failed; verify proxy/network settings",
+                None,
+            );
+            record_failure(gw, api_base_url, credential, attempt, &error).await;
+            return Err(error.into());
         }
+    };
+    // Status and Retry-After are authoritative even if the body is truncated,
+    // stalls indefinitely, or contains private data. Never read an error body.
+    let status = response.status();
+    let retry_after =
+        usage_throttle::retry_after_at(response.headers(), chrono::Utc::now().timestamp_millis());
+    if !status.is_success() {
+        let error = UsageError::http(status.as_u16(), retry_after);
+        record_failure(gw, api_base_url, credential, attempt, &error).await;
+        return Err(error.into());
     }
-    let body: Value = serde_json::from_slice(&raw)
-        .map_err(|_| anyhow::anyhow!("Invalid Claude usage response"))?;
+    if retry_after.is_some() {
+        usage_throttle::record(
+            gw,
+            api_base_url,
+            credential,
+            attempt,
+            usage_throttle::Outcome::Headers,
+            retry_after,
+        )
+        .await?;
+    }
+    let raw = match response.bytes().await {
+        Ok(raw) => raw,
+        Err(_) => {
+            let error = UsageError::transport("Failed to read Claude usage response", retry_after);
+            record_failure(gw, api_base_url, credential, attempt, &error).await;
+            return Err(error.into());
+        }
+    };
+    let body: Value = match serde_json::from_slice(&raw) {
+        Ok(body) => body,
+        Err(_) => {
+            let error = UsageError::transport("Invalid Claude usage response", retry_after);
+            record_failure(gw, api_base_url, credential, attempt, &error).await;
+            return Err(error.into());
+        }
+    };
+    let recorded = usage_throttle::record(
+        gw,
+        api_base_url,
+        credential,
+        attempt,
+        usage_throttle::Outcome::Success,
+        retry_after,
+    )
+    .await?;
+    anyhow::ensure!(
+        recorded.is_some(),
+        "Claude usage attempt was superseded; cached usage is unchanged"
+    );
     Ok(parse_usage(&body))
 }
 
@@ -335,6 +484,209 @@ mod tests {
         .await
         .unwrap()
         .0
+    }
+
+    fn credential(id: &str) -> StoredCredential {
+        StoredCredential {
+            meta: json!({"account": {"uuid": id}}),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn plan_cache_scopes_stable_accounts_origins_and_unknown_tokens() {
+        let a = credential("a");
+        assert_eq!(
+            plan_cache_key("https://API.ANTHROPIC.COM:443/v1", "old", &a),
+            plan_cache_key("https://api.anthropic.com", "rotated", &a)
+        );
+        assert_ne!(
+            plan_cache_key("", "same", &a),
+            plan_cache_key("", "same", &credential("b"))
+        );
+        assert_ne!(
+            plan_cache_key("http://127.0.0.1:1", "same", &a),
+            plan_cache_key("http://127.0.0.1:2", "same", &a)
+        );
+        assert_ne!(
+            plan_cache_key("", "first", &Default::default()),
+            plan_cache_key("", "second", &Default::default())
+        );
+        let subject = StoredCredential {
+            subject_id: Some("a".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            plan_cache_key("", "rotated", &subject),
+            plan_cache_key("", "original", &a)
+        );
+        assert!(
+            !plan_cache_key("", "SECRET", &Default::default())
+                .unwrap()
+                .contains("SECRET")
+        );
+    }
+
+    #[test]
+    fn plan_cache_expiration_capacity_and_active_singleflight_are_bounded() {
+        let now = 1_800_000_000_000;
+        assert_eq!(plan_expiry(now, true, None), now + 6 * 60 * 60_000);
+        assert_eq!(plan_expiry(now, false, None), now + 10 * 60_000);
+        assert_eq!(
+            plan_expiry(now, false, Some(now + 60_000)),
+            now + 10 * 60_000
+        );
+        let hint = now + 24 * 60 * 60_000;
+        assert_eq!(plan_expiry(now, false, Some(hint)), hint);
+        let mut cache = PlanCache::default();
+        for index in 0..PLAN_CACHE_CAPACITY {
+            let slot = cache.slot(index.to_string(), now).unwrap();
+            slot.try_lock().unwrap().expires_at = hint;
+        }
+        assert_eq!(cache.entries.len(), PLAN_CACHE_CAPACITY);
+        assert!(cache.slot("overflow".into(), now).is_none());
+        let active = cache.slot("0".into(), now).unwrap();
+        active.try_lock().unwrap().expires_at = now;
+        assert!(cache.slot("overflow".into(), now).is_none());
+        assert!(std::sync::Arc::ptr_eq(
+            &active,
+            &cache.slot("0".into(), now).unwrap()
+        ));
+        drop(active);
+        assert!(cache.slot("overflow".into(), now).is_some());
+        assert_eq!(cache.entries.len(), PLAN_CACHE_CAPACITY);
+        drop(cache.slot("at-expiry".into(), hint).unwrap());
+        assert!(cache.entries.len() < PLAN_CACHE_CAPACITY);
+    }
+
+    #[tokio::test]
+    async fn profile_singleflight_caches_success_failure_and_retry_after() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for status in [200, 401, 403, 429, 503] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            let count = std::sync::Arc::new(AtomicUsize::new(0));
+            let seen = count.clone();
+            let (stop, stopped) = tokio::sync::oneshot::channel();
+            let server = tokio::spawn(async move {
+                tokio::pin!(stopped);
+                loop {
+                    let socket = tokio::select! {
+                        socket = listener.accept() => socket.unwrap().0,
+                        _ = &mut stopped => break,
+                    };
+                    let mut socket = socket;
+                    let mut request = [0u8; 4096];
+                    socket.read(&mut request).await.unwrap();
+                    seen.fetch_add(1, Ordering::SeqCst);
+                    let body = r#"{"organization":{"organization_type":"claude_pro"}}"#;
+                    let response = format!(
+                        "HTTP/1.1 {status} Response\r\nContent-Length: {}\r\nRetry-After: 86400\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                }
+            });
+            let client = reqwest::Client::new();
+            let owner = credential(&format!("singleflight-{status}"));
+            let before = chrono::Utc::now().timestamp_millis();
+            let expected = if status == 200 { Some("pro") } else { None };
+            let (a, b, c) = tokio::join!(
+                fetch_plan(&client, &base, "token", &owner),
+                fetch_plan(&client, &base, "rotated", &owner),
+                fetch_plan(&client, &base, "duplicate-provider", &owner),
+            );
+            assert_eq!(a.as_deref(), expected);
+            assert_eq!(b.as_deref(), expected);
+            assert_eq!(c.as_deref(), expected);
+            assert_eq!(
+                fetch_plan(&client, &base, "rotated-again", &owner)
+                    .await
+                    .as_deref(),
+                expected
+            );
+            let key = plan_cache_key(&base, "ignored-known-token", &owner).unwrap();
+            let slot = plan_cache()
+                .lock()
+                .unwrap()
+                .entries
+                .get(&key)
+                .unwrap()
+                .clone();
+            assert!(slot.lock().await.expires_at >= before + 86_400_000);
+            assert_eq!(count.load(Ordering::SeqCst), 1);
+            stop.send(()).unwrap();
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn usage_headers_persist_retry_after_without_waiting_for_error_body() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for status in [401, 403, 429, 503] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = [0u8; 4096];
+                socket.read(&mut request).await.unwrap();
+                socket.write_all(format!("HTTP/1.1 {status} Error\r\nContent-Length: 9999\r\nRetry-After: 86400\r\n\r\n").as_bytes()).await.unwrap();
+                std::future::pending::<()>().await;
+            });
+            let gw = gateway().await;
+            let owner = credential("header-first");
+            let before = chrono::Utc::now().timestamp_millis();
+            let error = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                fetch_usage(&gw, &reqwest::Client::new(), &base, "SECRET", &owner, None),
+            )
+            .await
+            .expect("must not wait for an error body")
+            .unwrap_err();
+            let error = error.downcast_ref::<UsageError>().unwrap();
+            assert_eq!(error.status, Some(status));
+            assert!(error.retry_after.unwrap() >= before + 86_400_000);
+            assert!(
+                usage_throttle::next_refresh_at(&gw, &base, &owner, None)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    >= error.retry_after.unwrap()
+            );
+            server.abort();
+            assert!(server.await.unwrap_err().is_cancelled());
+        }
+    }
+
+    #[tokio::test]
+    async fn successful_or_truncated_body_never_loses_retry_after_header() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for truncated in [false, true] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = [0u8; 4096];
+                socket.read(&mut request).await.unwrap();
+                let length = if truncated { 9999 } else { 2 };
+                socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {length}\r\nRetry-After: 86400\r\nConnection: close\r\n\r\n{{}}").as_bytes()).await.unwrap();
+            });
+            let gw = gateway().await;
+            let owner = credential("success-hint");
+            let before = chrono::Utc::now().timestamp_millis();
+            let result =
+                fetch_usage(&gw, &reqwest::Client::new(), &base, "SECRET", &owner, None).await;
+            assert_eq!(result.is_err(), truncated);
+            assert!(
+                usage_throttle::next_refresh_at(&gw, &base, &owner, None)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    >= before + 86_400_000
+            );
+            server.await.unwrap();
+        }
     }
 
     #[tokio::test]
@@ -505,7 +857,7 @@ mod tests {
         task.await.unwrap();
         // The server is gone: a same-credential hit still resolves from cache.
         assert_eq!(
-            fetch_plan(&client, &base, "token-pro", "same-provider")
+            fetch_plan(&client, &base, "token-pro", &Default::default())
                 .await
                 .as_deref(),
             Some("pro")

@@ -143,6 +143,14 @@ impl KiroAccountState {
 #[serde(default)]
 pub(crate) struct ClaudeAccountState {
     pub usage: Option<super::anthropic::claude_code::usage::ClaudeUsage>,
+    /// Inference-header observations only; never routing or full-usage evidence.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub passive_usage:
+        Option<super::anthropic::claude_code::quota_observation::ClaudeQuotaObservation>,
+    /// Persist ordering separately so public quota observations cannot expose it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub passive_usage_order:
+        Option<super::anthropic::claude_code::quota_observation::ClaudeQuotaObservationOrder>,
     pub observed_at: Option<i64>,
     pub usage_stale: bool,
     pub auth_invalid: bool,

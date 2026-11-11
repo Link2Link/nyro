@@ -144,6 +144,9 @@ pub(crate) struct ResolvedProviderRuntime {
     /// OAuth-backed. Threaded into `ProviderCtx` so vendor hooks can read
     /// channel metadata (e.g. google/antigravity's companion project id).
     pub credential: Option<crate::auth::types::StoredCredential>,
+    /// Immutable account/generation used to bind Claude inference observations.
+    /// Never reconstruct this from a provider lookup after runtime resolution.
+    pub claude_observation_account: Option<OAuthCredential>,
 }
 
 impl AdminService {

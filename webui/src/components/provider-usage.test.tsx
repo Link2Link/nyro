@@ -1,8 +1,9 @@
-import { doesNotMatch, equal, match } from "node:assert/strict";
+import { doesNotMatch, equal, match, rejects } from "node:assert/strict";
 import { test } from "node:test";
 import { renderToStaticMarkup } from "react-dom/server";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { LocaleProvider } from "../lib/i18n";
+import type { AccountPoolView, ProviderAccountView } from "../lib/devin-account-pool";
 import type { Provider, ProviderApiPriceStats, ProviderUsage, QuotaBucket } from "../lib/types";
 import { GroupUsageSummary, ProviderUsageFooter } from "./provider-usage";
 
@@ -33,6 +34,142 @@ function render(usage: ProviderUsage, error?: Error, currentProvider: Provider =
     client.clear();
   }
 }
+
+const claudeProvider: Provider = { ...provider, id: "claude", vendor: "anthropic", channel: "claude-code", auth_mode: "oauth", base_url: "https://api.anthropic.com" };
+const claudeAccount: ProviderAccountView = {
+  account_id: "legacy", provider_id: "claude", label: "Legacy", is_enabled: true, priority: 0,
+  status: "connected", status_version: 1, verified_plan: null, identity_verified: true,
+  scheduling: "included", daily: null, weekly: null, reserve_usd: null,
+  observed_at: now - 8 * 60_000, stale: true, updated_at: "",
+  claude_usage: { windows: [{ name: "five_hour", used_percent: 38, resets_at: "2030-01-01T05:00:00Z" }] },
+};
+const claudePool: AccountPoolView = {
+  kind: "claude_code", provider_id: "claude", config: null, accounts: [claudeAccount],
+  quota: { daily: null, weekly: null, estimated: false }, readiness: "eligible",
+  counts: { total: 1, accounting: 1, available: 1, included: 1, reserve: 0, pro: 0, max: 0, unclassified: 1,
+    unknown: 0, disabled: 0, disconnected: 0, auth_required: 0, quota_exhausted: 0, plan_mismatch: 0, plan_unverified: 0 },
+};
+const claudeUsage: ProviderUsage = { ...base, provider_id: "claude", kind: "claude_code_plan", account_pool: claudePool,
+  tiers: claudeAccount.claude_usage!.windows };
+
+test("Claude singleton freshness uses nested full observation and stale flag, never freshly served queried_at", () => {
+  const html = render(claudeUsage, undefined, claudeProvider);
+  match(html, /Stale/); match(html, /8m ago/);
+  match(html, /dateTime="2029-12-31T23:52:00.000Z"/);
+  doesNotMatch(html, /Updated|just now|dateTime="2030-01-01T00:00:00.000Z"/);
+  const backendFresh = render({ ...claudeUsage, account_pool: { ...claudePool,
+    accounts: [{ ...claudeAccount, stale: false }],
+  } }, undefined, claudeProvider);
+  match(backendFresh, /Observed/); match(backendFresh, /8m ago/);
+  doesNotMatch(backendFresh, /Stale|Updated|just now/);
+  const backendStale = render({ ...claudeUsage, account_pool: { ...claudePool,
+    accounts: [{ ...claudeAccount, observed_at: now, stale: true }],
+  } }, undefined, claudeProvider);
+  match(backendStale, /Stale/); doesNotMatch(backendStale, /Observed|Updated/);
+});
+
+test("Claude full observations age beyond the backend polling interval even if cached stale is false", () => {
+  for (const age of [660_000, 660_001]) {
+    const html = render({ ...claudeUsage, account_pool: { ...claudePool,
+      accounts: [{ ...claudeAccount, observed_at: now - age, stale: false }],
+    } }, undefined, claudeProvider);
+    equal(html.includes("Stale"), age > 660_000);
+    equal(html.includes("Observed"), age <= 660_000);
+    match(html, /11m ago/);
+  }
+});
+
+test("Claude singleton missing and invalid full timestamps stay unknown instead of falling back to served time", () => {
+  for (const observed_at of [null, 0, -1, NaN, Infinity, 8_640_000_000_000_001, now + 60_001]) {
+    const html = render({ ...claudeUsage, account_pool: { ...claudePool,
+      accounts: [{ ...claudeAccount, observed_at, stale: false }],
+    } }, undefined, claudeProvider);
+    match(html, /Stale/); match(html, /time unknown/);
+    doesNotMatch(html, /Updated|Observed|just now|NaN|Infinity|Invalid Date|dateTime=/);
+  }
+  for (const account_pool of [undefined, null, { ...claudePool, accounts: [] },
+    { ...claudePool, accounts: [claudeAccount, { ...claudeAccount, account_id: "other" }] }]) {
+    const html = render({ ...claudeUsage, account_pool }, undefined, claudeProvider);
+    match(html, /Stale/); match(html, /time unknown/);
+    doesNotMatch(html, /Updated|just now/);
+  }
+});
+
+test("Claude singleton partial data never refreshes full freshness or replaces full tier bars", () => {
+  for (const observed_at of [now, claudeAccount.observed_at! - 60_000]) {
+    const html = render({ ...claudeUsage, account_pool: { ...claudePool, accounts: [{ ...claudeAccount,
+      claude_quota_observation: { windows: [{ name: "five_hour", used_percent: null, status: "rejected",
+        resets_at: "2030-01-01T06:00:00Z", observed_at, source: "inference_header" }] },
+    }] } }, undefined, claudeProvider);
+    match(html, /Stale/); match(html, /8m ago/);
+    match(html, /Inference response quota \(partial\)/); match(html, /inference_header/);
+    match(html, /Status: rejected/); match(html, /Usage percentage unknown/);
+    match(html, /aria-valuenow="38"/);
+    equal((html.match(/role="progressbar"/g) ?? []).length, 1);
+    doesNotMatch(html, /aria-valuenow="0"|aria-valuenow="100"|Updated/);
+    if (observed_at < claudeAccount.observed_at!) match(html, /Older than the full usage snapshot/);
+  }
+  const failed = render({ ...claudeUsage, account_pool: { ...claudePool,
+    accounts: [{ ...claudeAccount, observed_at: now, stale: false }],
+  } }, new Error("Claude upstream refresh failed"), claudeProvider);
+  match(failed, /Usage query failed: Claude upstream refresh failed/); match(failed, /Stale/);
+  doesNotMatch(failed, /Updated|Observed/);
+});
+
+test("local passive polling cannot advance full freshness or outrank a newer footer snapshot", (t) => {
+  t.mock.method(Date, "now", () => now);
+  const client = new QueryClient();
+  client.setQueryData(["provider-usage", "claude"], { ...claudeUsage, account_pool: { ...claudePool,
+    accounts: [{ ...claudeAccount, observed_at: now - 60_000, stale: true }],
+  } });
+  try {
+    for (const observed_at of [now - 3 * 60_000, now]) {
+      const localAccount = { ...claudeAccount, stale: false, observed_at,
+        claude_quota_observation: { windows: [{ name: "five_hour", used_percent: 5, status: "allowed", resets_at: null,
+          observed_at: now - 2 * 60_000, source: "inference_header" as const }] },
+      };
+      const html = renderToStaticMarkup(<QueryClientProvider client={client}><LocaleProvider>
+        <ProviderUsageFooter provider={claudeProvider} claudeAccount={localAccount} />
+      </LocaleProvider></QueryClientProvider>);
+      match(html, /Stale/); match(html, /1m ago/);
+      match(html, /Older than the full usage snapshot/);
+      match(html, /Used 5.0%/); match(html, /aria-valuenow="38"/);
+      equal((html.match(/role="progressbar"/g) ?? []).length, 1);
+      doesNotMatch(html, /Updated|just now|3m ago|aria-valuenow="5"/);
+    }
+  } finally { client.clear(); }
+});
+
+test("Claude footer and folded group do not retry a failed usage attempt into cooldown-cache success", async () => {
+  for (const folded of [false, true]) {
+    const client = new QueryClient();
+    try {
+      renderToStaticMarkup(<QueryClientProvider client={client}><LocaleProvider>
+        {folded ? <GroupUsageSummary providers={[claudeProvider]} /> : <ProviderUsageFooter provider={claudeProvider} />}
+      </LocaleProvider></QueryClientProvider>);
+      const query = client.getQueryCache().find({ queryKey: ["provider-usage", claudeProvider.id] })!;
+      equal(query.options.retry, false);
+      let attempts = 0;
+      await rejects(query.fetch({ ...query.options, retryDelay: 0, queryFn: async () => {
+        if (++attempts === 1) throw new Error("First upstream failure");
+        return claudeUsage; // Backend cooldown would serve unchanged cached usage.
+      } }), /First upstream failure/);
+      equal(attempts, 1);
+      equal(query.state.status, "error");
+      equal(query.state.data, undefined);
+    } finally { client.clear(); }
+  }
+});
+
+test("non-Claude usage keeps its existing retry policy", () => {
+  const client = new QueryClient();
+  try {
+    renderToStaticMarkup(<QueryClientProvider client={client}><LocaleProvider>
+      <ProviderUsageFooter provider={provider} />
+    </LocaleProvider></QueryClientProvider>);
+    equal(client.getQueryCache().find({ queryKey: ["provider-usage", provider.id] })!.options.retry, 1);
+  } finally { client.clear(); }
+});
 
 test("provider usage always renders every full tier and pace marker without disclosure", () => {
   const html = render({ ...base, tiers: [

@@ -4,6 +4,28 @@ All notable changes to Nyro will be documented in this file.
 
 ---
 
+## v2.1.39
+
+> Released on 2026-11-11
+
+#### Features
+
+- **Passive Claude quota observations** (#28): capture five-hour and weekly quota headers when normal inference responses arrive, including streaming and cross-protocol requests, without extra usage API calls. Store partial percentages, status, reset times and observation timestamps separately from full usage; missing fields stay unknown. Bind observations to the exact account generation and upstream origin, fence late responses and newer rejections, and preserve authentication/quota protections. The UI labels partial, stale and expired observations separately; pool totals still use full snapshots.
+
+#### Improvements
+
+- **Coherent Claude Code request profile** (#28): align generated requests on CLI `2.1.321`, Stainless SDK `0.128.0` and runtime `v26.12.1`, with one source for UA/billing versions, request-derived beta ordering and final read-only consistency checks. Preserve the independent native-client compatibility range and ordinary Anthropic API-key behavior; token counting keeps its own internal shaping policy, without adding a public endpoint.
+- **Durable usage-query backoff and profile caching** (#28): retain the shared-storage 600-second minimum between active usage attempts and add persisted, attempt-fenced failure backoff with bounded positive jitter. Honor delta-seconds and HTTP-date `Retry-After` without shortening upstream deadlines; distinguish 429, transient failures, permissions and authentication. Cache profile results by stable account/origin across token rotation, with six-hour positive caching, bounded singleflight and negative caching that respects longer retry hints.
+
+#### Fixes
+
+- **Claude cache-control normalization** (#28): materialize top-level cache markers onto eligible blocks, account for every real cache position and thread-reserved breakpoint, and normalize mixed five-minute/one-hour TTL ordering. Preserve explicit caller cache policy, apply separate probe/subagent behavior and reject invalid final combinations locally instead of retrying another account. Tool schemas and nested tool-result data are not mistaken for cache controls.
+- **Honest freshness and concurrent publication** (#28): cached Claude usage no longer appears newly observed; legacy single-account cards use the real full-snapshot timestamp and stale state, and automatic UI retry cannot hide an error behind a cooldown cache hit. Passive updates do not suppress due active refreshes or invalidate their publication merely by changing observation fields; authoritative changes still fence the update.
+- **Upgrade compatibility** (#28): usage cooldown rows are upgraded from integer deadlines to a versioned JSON ledger. Older binaries cannot read the new format; do not mix pre-v2.1.39 nodes on the same database or directly downgrade after new queries have written it. Plan rollback using a pre-upgrade backup or a controlled deadline-preserving conversion, never by clearing active cooldowns.
+- **Regression coverage and scope** (#28): add parser, state-race, restart/backoff, cache, loopback dispatcher, streaming-header and bilingual UI regressions. No database schema migration, production deployment, account-safety guarantee or live upstream compatibility claim is included; activity-aware polling and a shared cross-provider full-usage cache remain out of scope.
+
+---
+
 ## v2.1.38
 
 > Released on 2026-11-11

@@ -167,7 +167,9 @@ test("Claude cooldown policy and next refresh are bilingual without making unkno
     const html = renderToStaticMarkup(<ClaudeAccountUsage account={{ ...account, claude_usage: null,
       stale: true, observed_at: null, usage_refresh_available_at: Date.parse("2030-01-01T00:10:00Z"),
     }} isZh={isZh} />);
-    match(html, isZh ? /固定 10 分钟最小尝试间隔，由后端强制执行（失败也计入）/ : /fixed 10-minute minimum between attempts, enforced by the backend \(including failures\)/);
+    match(html, isZh ? /主动用量刷新至少间隔 10 分钟，由后端强制执行（失败也计入）/ : /Active usage refresh attempts are at least 10 minutes apart, enforced by the backend \(including failures\)/);
+    match(html, isZh ? /退避可能延长等待/ : /backoff may extend the wait/);
+    match(html, isZh ? /被动观测可独立更新/ : /Passive inference-header observations can update independently/);
     match(html, isZh ? /用量刷新冷却中/ : /Usage refresh cooldown/);
     match(html, isZh ? /下次可刷新/ : /Next refresh/);
     match(html, /dateTime="2030-01-01T00:10:00.000Z"/);
@@ -187,14 +189,155 @@ test("Claude manual pool refresh stays enabled during cooldown and explains cach
       ?? html.match(/<button[^>]*aria-label="Refresh pool usage"[^>]*>/)?.[0] ?? "";
     match(refresh, /Refresh pool usage/);
     doesNotMatch(refresh, /disabled=""/);
-    match(html, /at least 10 minutes between usage refresh attempts per account/);
+    match(html, /at least 10 minutes between active usage refresh attempts per account/);
     match(html, /Pool refresh returns cached data, if any, for accounts in cooldown/);
     match(html, /neither bypasses the limit nor makes cached data fresh/);
   }
   const zh = renderToStaticMarkup(<ClaudePoolSummary pool={value} isZh onRefresh={() => {}} />);
-  match(zh, /后端强制每个账号至少间隔 10 分钟/);
+  match(zh, /后端强制每个账号的主动用量刷新至少间隔 10 分钟/);
   match(zh, /冷却中的账号返回缓存数据（若有）/);
   match(zh, /不会绕过限制，也不表示缓存已更新/);
+});
+
+const passiveWindow = {
+  name: "five_hour", used_percent: 82.5, status: "allowed_warning", resets_at: "2030-01-01T06:00:00Z",
+  observed_at: Date.parse("2030-01-01T00:02:00Z"), source: "inference_header" as const,
+};
+const partialSection = (html: string) => html.match(/<section[^>]*data-claude-quota-observation[^>]*>[\s\S]*?<\/section>/)?.[0] ?? "";
+
+test("partial Claude headers remain separate from stale full usage, with source and per-window time in both languages", (t) => {
+  t.mock.method(Date, "now", () => Date.parse("2030-01-01T00:04:00Z"));
+  const subject = { ...account, stale: true, claude_quota_observation: { windows: [passiveWindow,
+    { ...passiveWindow, name: "weekly_limit", observed_at: passiveWindow.observed_at + 60_000 },
+  ] } };
+  const original = structuredClone(subject);
+  for (const isZh of [false, true]) {
+    const html = renderToStaticMarkup(<ClaudeAccountUsage account={subject} isZh={isZh} />);
+    const partial = partialSection(html);
+    match(partial, isZh ? /推理响应配额（部分观测）/ : /Inference response quota \(partial\)/);
+    match(partial, isZh ? /来源：推理响应头/ : /Source: inference response headers/);
+    match(partial, /inference_header/);
+    match(partial, isZh ? /状态: allowed_warning/ : /Status: allowed_warning/);
+    match(partial, isZh ? /不替代完整用量快照，也不参与账号池汇总/ : /does not replace full usage or contribute to pool totals/);
+    match(partial, /dateTime="2030-01-01T00:02:00.000Z"/);
+    match(partial, /dateTime="2030-01-01T00:03:00.000Z"/);
+    match(partial, isZh ? /晚于完整用量快照/ : /Newer than the full usage snapshot/);
+    const full = html.slice(0, html.indexOf(partial));
+    match(full, isZh ? /完整用量快照/ : /Full usage snapshot/);
+    match(full, isZh ? /旧数据 \/ 未知/ : /Stale \/ unknown/);
+    match(full, /dateTime="2030-01-01T00:00:00.000Z"/);
+    match(full, isZh ? /已用 37.5%/ : /Used 37.5%/);
+    doesNotMatch(full, /82.5%|00:02:00/);
+    deepEqual(subject, original);
+  }
+});
+
+test("older passive Claude observations are explicitly subordinate to a newer full snapshot without a green progress bar", (t) => {
+  t.mock.method(Date, "now", () => Date.parse("2030-01-01T00:04:00Z"));
+  for (const isZh of [false, true]) {
+    const html = renderToStaticMarkup(<ClaudeAccountUsage account={{ ...account,
+      claude_quota_observation: { windows: [{ ...passiveWindow, used_percent: 5, observed_at: account.observed_at! - 1 }] },
+    }} isZh={isZh} />);
+    const partial = partialSection(html);
+    match(partial, /data-older-than-full="true"/);
+    match(partial, isZh ? /早于完整用量快照；以较新的完整快照为准/ : /Older than the full usage snapshot; prefer the newer full snapshot/);
+    match(partial, isZh ? /已用 5.0%/ : /Used 5.0%/);
+    doesNotMatch(partial, /progressbar|text-emerald|Newer than|晚于完整/);
+    equal((html.match(/role="progressbar"/g) ?? []).length, 4);
+  }
+});
+
+test("legacy Claude card displays current local pool observations without another upstream usage query", (t) => {
+  const now = Date.parse("2030-01-01T00:04:00Z");
+  t.mock.method(Date, "now", () => now);
+  const current = { ...account, stale: true, claude_quota_observation: { windows: [passiveWindow] } };
+  const html = panel({ ...pool, config: null, accounts: [current] }, true, undefined, (client) => {
+    equal(client.getQueryCache().findAll({ queryKey: ["provider-account-pool"] }).length, 1);
+    const usage = client.getQueryCache().findAll({ queryKey: ["provider-usage"] });
+    equal(usage.length, 1);
+    equal((usage[0].options as { refetchInterval?: number }).refetchInterval, 300_000);
+  });
+  match(html, /Inference response quota \(partial\)/);
+  match(html, /dateTime="2030-01-01T00:02:00.000Z"/);
+  match(html, /Used 82.5%/);
+  equal((html.match(/data-claude-quota-observation/g) ?? []).length, 1);
+});
+
+test("Claude status-only and invalid partial percentages never fabricate zero or infer usage from status", (t) => {
+  t.mock.method(Date, "now", () => Date.parse("2030-01-01T00:04:00Z"));
+  for (const used_percent of [null, NaN, Infinity, -1, 101]) {
+    for (const status of [null, "allowed", "rejected", "100", "allowed_warning"]) {
+      const html = renderToStaticMarkup(<ClaudeAccountUsage account={{ ...account, claude_usage: null,
+        observed_at: null, stale: true, claude_quota_observation: { windows: [{ ...passiveWindow, used_percent, status }] },
+      }} isZh={false} />);
+      const partial = partialSection(html);
+      match(partial, /Usage percentage unknown/);
+      match(partial, new RegExp("Status: " + (status ?? "Unknown")));
+      doesNotMatch(html, /progressbar|Used [\d.]+%|NaN|Infinity/);
+      match(html, /Stale \/ unknown/);
+    }
+  }
+  const zero = partialSection(renderToStaticMarkup(<ClaudeAccountUsage account={{ ...account,
+    claude_quota_observation: { windows: [{ ...passiveWindow, used_percent: 0, status: null }] },
+  }} isZh={false} />));
+  match(zero, /Used 0.0%/); match(zero, /aria-valuenow="0"/); match(zero, /Status: Unknown/);
+});
+
+test("partial reset-only data never borrows an old full percentage or full reset timestamp", (t) => {
+  t.mock.method(Date, "now", () => Date.parse("2030-01-01T00:04:00Z"));
+  const partial = partialSection(renderToStaticMarkup(<ClaudeAccountUsage account={{ ...account,
+    claude_quota_observation: { windows: [{ ...passiveWindow, used_percent: null },
+      { ...passiveWindow, name: "weekly_limit", resets_at: null },
+    ] },
+  }} isZh={false} />));
+  const fiveHour = partial.split('data-claude-observation-window="five_hour"')[1].split('data-claude-observation-window="weekly_limit"')[0];
+  match(fiveHour, /Usage percentage unknown/); match(fiveHour, /dateTime="2030-01-01T06:00:00Z"/);
+  doesNotMatch(fiveHour, /progressbar|Used 37.5%|dateTime="2030-01-01T05:00:00Z"/);
+  const weekly = partial.split('data-claude-observation-window="weekly_limit"')[1];
+  match(weekly, /Used 82.5%/); match(weekly, /Reset time unknown/);
+  doesNotMatch(weekly, /2030-01-07/);
+});
+
+test("absent or empty passive observations preserve older backend rendering and invalid dates stay unknown", (t) => {
+  t.mock.method(Date, "now", () => Date.parse("2030-01-01T00:04:00Z"));
+  for (const claude_quota_observation of [undefined, null, { windows: [] }]) {
+    const html = renderToStaticMarkup(<ClaudeAccountUsage account={{ ...account, claude_quota_observation }} isZh={false} />);
+    equal(partialSection(html), "");
+    equal((html.match(/role="progressbar"/g) ?? []).length, 4);
+  }
+  for (const observed_at of [0, -1, NaN, Infinity, 8_640_000_000_000_001, Date.parse("2030-01-01T00:05:00.001Z")]) {
+    const partial = partialSection(renderToStaticMarkup(<ClaudeAccountUsage account={{ ...account,
+      claude_quota_observation: { windows: [{ ...passiveWindow, observed_at, resets_at: "invalid", status: "<script>alert(1)</script>" }] },
+    }} isZh={false} />));
+    match(partial, /Observed at: time unknown/); match(partial, /Reset time unknown/);
+    match(partial, /&lt;script&gt;/);
+    doesNotMatch(partial, /NaN|Infinity|Invalid Date|<script>|Older than|Newer than/);
+  }
+});
+
+test("aged and expired partial observations retain recorded values without active progress or inferred reset zero", (t) => {
+  const now = Date.parse("2030-01-01T01:00:00Z");
+  t.mock.method(Date, "now", () => now);
+  for (const isZh of [false, true]) {
+    for (const [observed_at, resets_at, stale, expired] of [
+      [now - 660_000, new Date(now + 1).toISOString(), false, false],
+      [now - 660_001, new Date(now + 1).toISOString(), true, false],
+      [now, new Date(now).toISOString(), false, true],
+      [now - 660_001, new Date(now - 1).toISOString(), true, true],
+      [now + 60_000, null, false, false],
+      [now + 60_001, null, true, false],
+    ] as const) {
+      const partial = partialSection(renderToStaticMarkup(<ClaudeAccountUsage account={{ ...account,
+        claude_quota_observation: { windows: [{ ...passiveWindow, observed_at, resets_at }] },
+      }} isZh={isZh} />));
+      match(partial, isZh ? /已用 82.5%/ : /Used 82.5%/);
+      equal(partial.includes('role="progressbar"'), !stale && !expired);
+      equal(partial.includes(isZh ? "旧数据 / 观测时间未知" : "Stale / observation time unknown"), stale);
+      equal(partial.includes(isZh ? "窗口已过期" : "Expired window"), expired);
+      doesNotMatch(partial, /Used 0|已用 0|aria-valuenow="0"/);
+      if (observed_at <= now + 60_000) match(partial, new RegExp(new Date(observed_at).toISOString().replace(".", "\\.")));
+    }
+  }
 });
 
 const weightedWindow: PoolQuotaWindow = {
@@ -208,6 +351,17 @@ const weightedPool: AccountPoolView = { ...pool, quota: { ...pool.quota, estimat
   { name: "weekly_limit", quota: { ...weightedWindow, total_units: 16, used_units: 2.5, remaining_units: 13.5,
     known_remaining_units: 13.5, used_percent: 15.625, remaining_percent: 84.375 } },
 ] } };
+
+test("passive percentages never change Claude pool totals or weighted pace", () => {
+  const withPassive = { ...weightedPool, accounts: weightedPool.accounts.map((a) => ({ ...a,
+    claude_quota_observation: { windows: [{ ...passiveWindow, used_percent: 100 }] },
+  })) };
+  equal(panel(withPassive, true), panel(weightedPool, true));
+  const unknown = panel({ ...pool, accounts: [{ ...account, claude_usage: null,
+    claude_quota_observation: { windows: [passiveWindow] },
+  }] }, true);
+  match(unknown, /Pool usage unknown/); doesNotMatch(unknown, /82.5%|progressbar/);
+});
 
 test("Claude collapsed card shows compact weighted usage without management details", () => {
   for (const isZh of [false, true]) {
