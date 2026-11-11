@@ -382,6 +382,24 @@ const THINKING_MANDATORY_MODELS: &[&str] = &["glm-5.3", "glm-5.3-flash"];
 const CLAUDE_55_ADAPTIVE_ONLY_MODELS: &[&str] =
     &["claude-sonnet-5-5", "claude-opus-5-5", "claude-haiku-5-5"];
 
+/// Claude「关闭思考」方言登记表（能力对齐 CLIProxyAPI registry）。边界规则同
+/// THINKING_MANDATORY_MODELS：`claude-fable-5` 覆盖 fable-5 / 5-1 / 5-2 及
+/// `[1m]`、日期后缀变体。opus-5-5 线上实测拒绝 disabled（VPS 请求
+/// 7007578d）；sonnet-5-5 的关闭形态是 between_tools；haiku-5-5 仍接受
+/// disabled，不登记。
+const CLAUDE_NO_DISABLE_MODELS: &[&str] = &["claude-opus-5-5", "claude-fable-5"];
+const CLAUDE_BETWEEN_TOOLS_DISABLE_MODELS: &[&str] = &["claude-sonnet-5-5"];
+
+fn claude_thinking_off_mode(body_model: &str) -> Option<super::effort_policy::ClaudeThinkingOff> {
+    if matches_registered_model(body_model, CLAUDE_NO_DISABLE_MODELS) {
+        Some(super::effort_policy::ClaudeThinkingOff::AdaptiveLow)
+    } else if matches_registered_model(body_model, CLAUDE_BETWEEN_TOOLS_DISABLE_MODELS) {
+        Some(super::effort_policy::ClaudeThinkingOff::BetweenTools)
+    } else {
+        None
+    }
+}
+
 fn matches_registered_model(model: &str, prefixes: &[&str]) -> bool {
     let model = model.trim();
     prefixes.iter().any(|prefix| {
@@ -444,6 +462,11 @@ pub(crate) fn apply_vendor_effort_policy(body: &mut Value, provider: &Provider) 
     // CLIProxyAPI 语义改写为 adaptive + output_config.effort（预算阈值
     // 换算档位，display 保留）。模型级约束，与下方 vendor 方言链正交，
     // 先于链执行以免被任何分支短路。
+    // 关闭思考意图先按模型方言改写（disabled / enabled+0 预算），再交给
+    // 5.5 的 enabled→adaptive 改写；两者处理的形态互不重叠。
+    if let Some(mode) = claude_thinking_off_mode(&body_model) {
+        super::effort_policy::rewrite_claude_thinking_off(body, mode);
+    }
     if is_claude_55_model(&body_model) {
         super::effort_policy::rewrite_legacy_claude55_thinking(body);
     }
@@ -3666,6 +3689,64 @@ mod tests {
             assert_eq!(claude["thinking"]["display"], "summarized");
             assert_eq!(claude["output_config"]["effort"], "max");
         }
+    }
+
+    #[test]
+    fn claude_thinking_off_follows_each_model_dialect() {
+        let provider = provider_with_vendor("local-test-only", Some("anthropic"));
+        let off = |model: &str| {
+            let mut body = serde_json::json!({
+                "model": model, "max_tokens": 64, "thinking": {"type": "disabled"}
+            });
+            apply_vendor_effort_policy(&mut body, &provider);
+            body
+        };
+        // 线上 400（VPS 7007578d）的模型及同能力家族：最低档自适应、隐藏思考。
+        for model in [
+            "claude-opus-5-5",
+            "claude-opus-5-5[1m]",
+            "claude-opus-5-5-20261001",
+            "claude-fable-5",
+            "claude-fable-5-1",
+            "claude-fable-5-2",
+        ] {
+            let body = off(model);
+            assert_eq!(
+                body["thinking"],
+                serde_json::json!({"type": "adaptive", "display": "omitted"}),
+                "{model}"
+            );
+            assert_eq!(body["output_config"]["effort"], "low", "{model}");
+        }
+        let sonnet = off("claude-sonnet-5-5");
+        assert_eq!(
+            sonnet["thinking"],
+            serde_json::json!({"type": "between_tools"})
+        );
+        assert!(sonnet.get("output_config").is_none());
+        // 仍接受 disabled 的模型保持原样；相似名称不误命中。
+        for model in [
+            "claude-haiku-5-5",
+            "claude-opus-5",
+            "claude-opus-4-8",
+            "claude-sonnet-5",
+            "claude-opus-5-55",
+        ] {
+            let body = off(model);
+            assert_eq!(
+                body["thinking"],
+                serde_json::json!({"type": "disabled"}),
+                "{model}"
+            );
+            assert!(body.get("output_config").is_none(), "{model}");
+        }
+        // 正预算的 enabled 仍走 5.5 的 enabled→adaptive 改写。
+        let mut active = serde_json::json!({
+            "model": "claude-opus-5-5", "thinking": {"type": "enabled", "budget_tokens": 16384}
+        });
+        apply_vendor_effort_policy(&mut active, &provider);
+        assert_eq!(active["thinking"]["type"], "adaptive");
+        assert_eq!(active["output_config"]["effort"], "max");
     }
 
     #[tokio::test]
