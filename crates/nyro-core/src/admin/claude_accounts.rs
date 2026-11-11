@@ -59,8 +59,7 @@ pub(super) fn safe_claude_account(
         weekly: None,
         reserve_usd: None,
         kiro_usage: None,
-        claude_usage: state.usage,
-        claude_quota_observation: state.passive_usage,
+        claude_usage: state.effective_usage(),
         usage_refresh_available_at: None,
         observed_at: state.observed_at,
         stale: state.usage_stale
@@ -69,6 +68,43 @@ pub(super) fn safe_claude_account(
             }),
         updated_at: account.updated_at.clone(),
     }
+}
+
+/// Header-sourced windows carry their own observation time; full-query windows
+/// share the account's full-snapshot freshness (including refresh failures).
+pub(super) fn claude_window_fresh(
+    account: &ProviderAccountView,
+    window: &crate::provider::anthropic::claude_code::usage::UsageWindow,
+    now_ms: i64,
+) -> bool {
+    match window.source.as_deref() {
+        Some(crate::provider::account_pool::CLAUDE_SOURCE_INFERENCE_HEADER) => {
+            window.observed_at.is_some_and(|at| {
+                at > 0
+                    && at <= now_ms.saturating_add(60_000)
+                    && now_ms.saturating_sub(at) <= usage_throttle::FRESHNESS_MS
+            })
+        }
+        _ => !account.stale,
+    }
+}
+
+/// Displayed primary windows are only as fresh as the older of the two.
+fn claude_primary_observed_at(account: &ProviderAccountView) -> Option<i64> {
+    let usage = account.claude_usage.as_ref()?;
+    crate::provider::account_pool::CLAUDE_HEADER_WINDOWS
+        .iter()
+        .map(|name| {
+            usage
+                .windows
+                .iter()
+                .find(|window| window.name == *name)?
+                .observed_at
+                .filter(|at| *at > 0)
+        })
+        .collect::<Option<Vec<_>>>()?
+        .into_iter()
+        .min()
 }
 
 /// Plan-relative estimates, deliberately separate from scheduling observations.
@@ -98,7 +134,7 @@ pub(super) fn aggregate_claude_window(
         .iter()
         .filter_map(|a| {
             let units = capacity(a)?;
-            if a.stale || a.scheduling == "auth_required" {
+            if a.scheduling == "auth_required" {
                 return None;
             }
             let mut matches = a
@@ -111,6 +147,7 @@ pub(super) fn aggregate_claude_window(
             if matches.next().is_some()
                 || !window.used_percent.is_finite()
                 || !(0.0..=100.0).contains(&window.used_percent)
+                || !claude_window_fresh(a, window, now.timestamp_millis())
             {
                 return None;
             }
@@ -499,14 +536,15 @@ impl AdminService {
         } else {
             Vec::new()
         };
-        // Serving a cached view is not a new upstream observation. For a pool,
-        // use the oldest member observation; any unknown member stays unknown.
+        // Serving a cached view is not a new upstream observation. Each member
+        // contributes the older of its two primary windows (full query or a
+        // newer header); any unknown member keeps the whole time unknown.
         let queried_at = if members.is_empty() {
             String::new()
         } else {
             members
                 .iter()
-                .map(|account| account.observed_at.filter(|at| *at > 0))
+                .map(|account| claude_primary_observed_at(account))
                 .collect::<Option<Vec<_>>>()
                 .and_then(|times| times.into_iter().min())
                 .and_then(chrono::DateTime::<Utc>::from_timestamp_millis)
@@ -699,6 +737,23 @@ mod tests {
                 .is_empty()
         );
         let old = 1800000000000i64;
+        let window = |name: &str, at: Option<i64>, source: &str| {
+            crate::provider::anthropic::claude_code::usage::UsageWindow {
+                name: name.into(),
+                used_percent: 10.0,
+                resets_at: None,
+                source: Some(source.into()),
+                observed_at: at,
+            }
+        };
+        // A newer five-hour header cannot make an older weekly value look fresh.
+        view.accounts[0].claude_usage = Some(ClaudeUsage {
+            windows: vec![
+                window("five_hour", Some(old + 60_000), "inference_header"),
+                window("weekly_limit", Some(old), "usage_api"),
+            ],
+            plan: None,
+        });
         view.accounts[0].observed_at = Some(old);
         view.accounts[0].stale = true;
         let report = admin.claude_account_pool_provider_usage(view.clone());
@@ -711,7 +766,7 @@ mod tests {
         assert!(report.account_pool.unwrap().accounts[0].stale);
         let mut unknown = view.accounts[0].clone();
         unknown.account_id = format!("{}-unknown", account.account_id);
-        unknown.observed_at = None;
+        unknown.claude_usage.as_mut().unwrap().windows[1].observed_at = None;
         view.accounts.push(unknown);
         assert!(
             admin
@@ -1358,6 +1413,97 @@ mod tests {
         state.observed_at = Some(Utc::now().timestamp_millis() - usage_throttle::FRESHNESS_MS - 1);
         account.account_state = serde_json::to_string(&state).unwrap();
         assert!(safe_claude_account(&account, None).stale);
+    }
+
+    #[tokio::test]
+    async fn header_windows_feed_display_and_pool_totals_with_their_own_freshness() {
+        use crate::provider::anthropic::claude_code::quota_observation::{
+            ClaudeQuotaObservation, ClaudeQuotaWindowObservation,
+        };
+        let gw = gateway().await;
+        let mut account = add(&gw, "header-merge").await;
+        let now = Utc::now().timestamp_millis();
+        let header = |name: &str, used: f64, reset: &str, at: i64| ClaudeQuotaWindowObservation {
+            name: name.into(),
+            used_percent: Some(used),
+            status: Some("allowed".into()),
+            resets_at: Some(reset.into()),
+            observed_at: at,
+            source: "inference_header".into(),
+        };
+        let mut state = authenticated_claude_state(usage(27.0, 34.0), None);
+        // A failed full refresh is stale, but fresh same-cycle headers stay usable.
+        state.usage_stale = true;
+        state.observed_at = Some(now - 20 * 60_000);
+        state.passive_usage = Some(ClaudeQuotaObservation {
+            windows: vec![
+                header("five_hour", 50.0, "2030-01-01T05:00:00Z", now - 1_000),
+                header("weekly_limit", 40.0, "2030-01-07T00:00:00Z", now - 1_000),
+            ],
+        });
+        account.account_state = serde_json::to_string(&state).unwrap();
+        let view = safe_claude_account(&account, None);
+        assert!(
+            view.stale,
+            "full-query freshness is still reported separately"
+        );
+        let windows = &view.claude_usage.as_ref().unwrap().windows;
+        assert_eq!(
+            (windows[0].name.as_str(), windows[0].used_percent),
+            ("five_hour", 50.0)
+        );
+        assert_eq!(windows[0].source.as_deref(), Some("inference_header"));
+        assert_eq!(
+            (windows[1].name.as_str(), windows[1].used_percent),
+            ("weekly_limit", 40.0)
+        );
+        assert!(
+            windows[2..]
+                .iter()
+                .all(|w| w.source.as_deref() == Some("usage_api"))
+        );
+        let public = serde_json::to_value(&view).unwrap();
+        assert!(
+            public.get("claude_quota_observation").is_none(),
+            "no duplicate partial block"
+        );
+        assert!(!public.to_string().contains("passive_usage"));
+        for (name, used) in [("five_hour", 50.0), ("weekly_limit", 40.0)] {
+            let quota = aggregate_claude_window(&[&view], name);
+            assert!(!quota.stale, "{name}");
+            assert!((quota.used_percent.unwrap() - used).abs() < 1e-9, "{name}");
+        }
+        let report = gw
+            .admin()
+            .claude_account_pool_provider_usage(AccountPoolView {
+                accounts: vec![view.clone()],
+                ..gw.admin()
+                    .get_provider_account_pool("claude-pool")
+                    .await
+                    .unwrap()
+            });
+        assert_eq!(report.tiers[0].used_percent, 50.0);
+        assert_eq!(
+            chrono::DateTime::parse_from_rfc3339(&report.queried_at)
+                .unwrap()
+                .timestamp_millis(),
+            now - 1_000
+        );
+
+        // Old headers still win over an older full query, but stop counting as fresh.
+        let old = now - usage_throttle::FRESHNESS_MS - 1;
+        state.passive_usage = Some(ClaudeQuotaObservation {
+            windows: vec![
+                header("five_hour", 50.0, "2030-01-01T05:00:00Z", old),
+                header("weekly_limit", 40.0, "2030-01-07T00:00:00Z", old),
+            ],
+        });
+        account.account_state = serde_json::to_string(&state).unwrap();
+        let view = safe_claude_account(&account, None);
+        for name in ["five_hour", "weekly_limit"] {
+            let quota = aggregate_claude_window(&[&view], name);
+            assert!(quota.stale && quota.known_accounts == 0, "{name}");
+        }
     }
 
     #[test]

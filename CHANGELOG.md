@@ -4,6 +4,25 @@ All notable changes to Nyro will be documented in this file.
 
 ---
 
+## v2.1.40
+
+> Released on 2026-11-12
+
+#### Improvements
+
+- **Merged Claude usage windows** (#29): inference-header quota observations now update the five-hour and weekly rows directly instead of appearing in a separate partial block. A header value replaces the full-query value only when it is newer and belongs to the same or a later quota cycle; older-cycle values and status-only headers never replace percentages. Every window reports its `source` (`usage_api` or `inference_header`) and its own `observed_at`; model-specific windows and the plan still come from full queries. Pool weighted totals and singleton provider tiers use the same effective windows with per-window freshness, and `queried_at` reflects the older of the two primary windows.
+- **Concise Claude provider cards** (#29): one row per window (name, progress bar, percentage, short reset time), one freshness line in the header, source and observation time in tooltips, a short stale mark only where needed, and long refresh-policy paragraphs moved into button tooltips or a collapsible line. The account panel shows a single “next refresh” line only while cooling down.
+
+#### Fixes
+
+- **Header evidence only tightens scheduling** (#29): a newer same-cycle header reporting `rejected` or 100% usage pauses the account until that window resets or a newer full query supersedes it. A header never relaxes an exhausted full snapshot, and routing weights still use full queries.
+
+#### Compatibility
+
+- The account-view field `claude_quota_observation` introduced in v2.1.39 is removed; use the per-window `source` / `observed_at` on `claude_usage` instead. Stored state, the usage-query ledger and upgrade/rollback notes from v2.1.39 are unchanged; no schema migration is required. The pool steady-pace marker and account cost estimate still follow whole-account full-query freshness and stay hidden while that query is stale.
+
+---
+
 ## v2.1.39
 
 > Released on 2026-11-11

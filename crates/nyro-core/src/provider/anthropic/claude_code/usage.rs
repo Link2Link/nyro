@@ -33,6 +33,13 @@ pub struct UsageWindow {
     pub name: String,
     pub used_percent: f64,
     pub resets_at: Option<String>,
+    /// Presentation only, never persisted by usage refreshes: `usage_api` for a
+    /// full usage query, `inference_header` for a newer same-cycle header value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    /// Presentation only: when this window value was observed (epoch ms).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_at: Option<i64>,
 }
 
 /// Parsed `/api/oauth/usage`.
@@ -61,6 +68,8 @@ fn window(bucket: Option<&Value>, name: String) -> Option<UsageWindow> {
         name,
         used_percent: used.clamp(0.0, 100.0),
         resets_at,
+        source: None,
+        observed_at: None,
     })
 }
 
@@ -135,6 +144,8 @@ pub(crate) fn parse_usage(body: &Value) -> ClaudeUsage {
                 .get("resets_at")
                 .and_then(Value::as_str)
                 .map(str::to_string),
+            source: None,
+            observed_at: None,
         });
     }
     ClaudeUsage {

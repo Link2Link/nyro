@@ -6,7 +6,8 @@ import { localizeBackendErrorMessage } from "@/lib/backend-error";
 import { isKiroOverage, nyroUpstreamView, providerApiPriceSupported, providerUsagePause, providerUsageSupported, providerUsageTitle, summarizeGroupUsage, tierLabel } from "@/lib/provider-usage";
 import { isDevinProvider, isKiroProvider } from "@/lib/native-provider";
 import { isClaudeCodeOAuthProvider } from "@/lib/claude-account-pool";
-import { ClaudeQuotaObservationView } from "@/components/claude-quota-observation";
+import { claudeAccountWindowViews, claudeMainObservedAt, claudeMainStale, claudeWindowView, newerClaudeAccount, validObservedAt } from "@/lib/claude-usage-windows";
+import { ClaudeUsageWindowRows } from "@/components/claude-usage-windows";
 import { useLocale } from "@/lib/i18n";
 import { accountStateLabel, poolQuotaWindows, type AccountPoolView, type ProviderAccountView } from "@/lib/devin-account-pool";
 import { countdownStr, poolSteadyPacePercent, steadyPacePercent, utilizationBarClass, utilizationColor } from "@/lib/usage-pace";
@@ -413,24 +414,23 @@ export function ProviderUsageFooter({ provider, claudeAccount: currentClaudeAcco
   const errorMessage = error ? localizeBackendErrorMessage(error, isZh) : "";
 
   const claudeSingleton = (shown?.kind === "claude_code_plan" || Boolean(currentClaudeAccount)) && !shown?.account_pool?.config;
-  // The card already polls the local pool every minute; reuse it for passive
-  // updates without increasing active upstream usage requests.
-  const claudeAccount = claudeSingleton && shown?.account_pool?.accounts.length === 1
-    ? shown.account_pool.accounts[0] : undefined;
-  // Only the passive block uses the local view: full freshness must stay tied
-  // to the same nested account snapshot that produced the displayed tier bars.
-  const partialAccount = claudeSingleton ? currentClaudeAccount ?? claudeAccount : undefined;
-  // Older backends may use queried_at as serving time rather than observation time.
-  // Passive headers have their own timestamps and never renew this full snapshot.
-  const observedAt = claudeAccount?.observed_at;
-  const timestampMs = claudeSingleton
-    ? observedAt != null ? new Date(observedAt).getTime() : NaN
+  // The card polls the local pool every minute (no upstream request), while the
+  // usage response nests its own read; show whichever read is more recent.
+  const claudeAccount = claudeSingleton ? newerClaudeAccount(currentClaudeAccount,
+    shown?.account_pool?.accounts.length === 1 ? shown.account_pool.accounts[0] : undefined, now) : undefined;
+  // A failed usage query is a failed full query: full-query windows go stale,
+  // response-header windows keep their own timestamps.
+  const claudeViews = !claudeSingleton ? null : claudeAccount
+    ? claudeAccountWindowViews({ ...claudeAccount, stale: claudeAccount.stale || Boolean(error) }, now)
+    : (shown?.tiers ?? []).map((tier) => ({ ...claudeWindowView({ ...tier, resets_at: tier.resets_at ?? null },
+      { stale: Boolean(error), observed_at: shown?.queried_at ? Date.parse(shown.queried_at) : null }, now), source: null }));
+  // Older of the 5h/weekly observations, matching the backend's queried_at.
+  const timestampMs = claudeViews ? claudeMainObservedAt(claudeViews) ?? NaN
     : shown?.queried_at ? Date.parse(shown.queried_at) : NaN;
-  const hasTimestamp = Number.isFinite(timestampMs)
-    && (!claudeSingleton || (timestampMs > 0 && timestampMs <= now + 60_000));
+  const hasTimestamp = claudeViews ? validObservedAt(timestampMs, now) != null : Number.isFinite(timestampMs);
   const timestamp = hasTimestamp ? new Date(timestampMs).toISOString() : undefined;
-  const stale = Boolean(shown && (error || !hasTimestamp
-    || (claudeSingleton ? claudeAccount?.stale !== false || now - timestampMs > 660_000 : now - timestampMs >= 5 * 60 * 1000)));
+  const stale = claudeViews ? claudeMainStale(claudeViews)
+    : Boolean(shown && (error || !hasTimestamp || now - timestampMs >= 5 * 60 * 1000));
 
   return (
     <div className="mt-3 space-y-2 rounded-xl border border-slate-200/70 bg-white/40 px-3 py-2.5">
@@ -448,10 +448,18 @@ export function ProviderUsageFooter({ provider, claudeAccount: currentClaudeAcco
         <div className="flex flex-wrap items-center gap-2">
           {hasBuckets && <button type="button" className="cursor-pointer text-[10px] font-medium text-sky-700 hover:underline"
             onClick={(event) => { event.stopPropagation(); setBindingEditorOpen(true); }}>{isZh ? "模型绑定" : "Model bindings"}</button>}
-          {shown && (
+          {claudeViews ? (
+            <span className={`flex items-center gap-1 text-[10px] ${stale ? "text-amber-700" : "text-slate-400"}`}
+              title={hasTimestamp ? new Date(timestampMs).toLocaleString() : undefined} data-claude-freshness={stale ? "stale" : "fresh"}>
+              <Clock className="h-3 w-3" />
+              {stale && (isZh ? "旧数据" : "Stale")}
+              {stale && hasTimestamp && " · "}
+              {hasTimestamp && <time dateTime={timestamp}>{formatRelativeTime(timestamp!, now, isZh)}</time>}
+            </span>
+          ) : shown && (
             <span className={`flex items-center gap-1 text-[10px] ${stale ? "text-amber-700" : "text-slate-400"}`} title={timestamp}>
               <Clock className="h-3 w-3" />
-              {stale ? (isZh ? "旧数据" : "Stale") : claudeSingleton ? (isZh ? "已观察" : "Observed") : (isZh ? "更新于" : "Updated")} {" "}
+              {stale ? (isZh ? "旧数据" : "Stale") : (isZh ? "更新于" : "Updated")} {" "}
               {hasTimestamp ? <time dateTime={timestamp}>{formatRelativeTime(timestamp!, now, isZh)}</time> : (isZh ? "时间未知" : "time unknown")}
             </span>
           )}
@@ -515,7 +523,9 @@ export function ProviderUsageFooter({ provider, claudeAccount: currentClaudeAcco
         <ProviderQuotaBuckets usage={shown} now={now} stale={Boolean(error)} loading={isFetching} locale={locale} onDetails={setDetailFilter} />
       ) : shown?.upstream ? (
         <NyroUpstreamUsagePanel report={shown.upstream} isZh={isZh} now={now} />
-      ) : shown && (shown.tiers.length > 0 || balances.length > 0 || (shown.spends?.length ?? 0) > 0) ? (
+      ) : claudeViews?.length ? (
+        <ClaudeUsageWindowRows views={claudeViews} now={now} isZh={isZh} markMainStale={false} />
+      ) : !claudeViews && shown && (shown.tiers.length > 0 || balances.length > 0 || (shown.spends?.length ?? 0) > 0) ? (
         <div className="flex flex-col gap-1.5">
           {/* Tier order is owned by the gateway API (canonical window order:
               5h → daily → weekly → monthly → …), so every consumer shows the
@@ -547,8 +557,6 @@ export function ProviderUsageFooter({ provider, claudeAccount: currentClaudeAcco
       ) : (
         <p className="text-xs text-slate-400">{isZh ? "暂无用量数据" : "No usage data"}</p>
       )}
-      {partialAccount && <ClaudeQuotaObservationView account={partialAccount} isZh={isZh}
-        fullSnapshotObservedAt={claudeAccount?.claude_usage ? claudeAccount.observed_at : null} />}
       {!hasBuckets && shown && providerApiPriceSupported(shown.kind) && <ProviderApiPriceSummary
         usage={shown} now={now} stale={stale} loading={isFetching} locale={locale} />}
       {bindingEditorOpen && <ProviderQuotaBucketEditor providerId={provider.id} buckets={(shown?.quota_buckets ?? []).filter((bucket) => !isGoogleFamilyDisplayBucket(bucket))}

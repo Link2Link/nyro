@@ -173,7 +173,100 @@ impl ClaudeAccountState {
             usage.windows.iter().any(|window| {
                 claude_window_applies(&window.name, model) && window.used_percent >= 100.0
             })
+        }) || self.header_exhausted(chrono::Utc::now().timestamp_millis())
+    }
+
+    /// A primary-window header observation newer than the full snapshot and in
+    /// the same or a later quota cycle. Older-cycle values never replace it.
+    fn newer_header_window(
+        &self,
+        name: &str,
+    ) -> Option<&super::anthropic::claude_code::quota_observation::ClaudeQuotaWindowObservation>
+    {
+        let header = self
+            .passive_usage
+            .as_ref()?
+            .windows
+            .iter()
+            .find(|window| window.name == name)?;
+        if self
+            .observed_at
+            .is_some_and(|full| header.observed_at <= full)
+        {
+            return None;
+        }
+        let full_reset = self
+            .usage
+            .as_ref()
+            .and_then(|usage| usage.windows.iter().find(|window| window.name == name))
+            .and_then(|window| claude_reset_ms(window.resets_at.as_deref()));
+        if let (Some(full), Some(observed)) =
+            (full_reset, claude_reset_ms(header.resets_at.as_deref()))
+            && observed < full.saturating_sub(CLAUDE_SAME_CYCLE_SKEW_MS)
+        {
+            return None;
+        }
+        Some(header)
+    }
+
+    /// Header evidence may only make admission stricter. A newer rejected or
+    /// fully used primary window pauses the account until its reported reset;
+    /// it never relaxes an exhausted full snapshot.
+    fn header_exhausted(&self, now_ms: i64) -> bool {
+        CLAUDE_HEADER_WINDOWS.iter().any(|name| {
+            self.newer_header_window(name).is_some_and(|window| {
+                (window.status.as_deref() == Some("rejected")
+                    || window.used_percent.is_some_and(|used| used >= 100.0))
+                    && claude_reset_ms(window.resets_at.as_deref())
+                        .is_none_or(|reset| reset > now_ms)
+            })
         })
+    }
+
+    /// Display and pool-estimate view: the full snapshot, with each primary
+    /// window replaced by a newer same-or-later-cycle header percentage. Every
+    /// window carries its source and observation time. Never persisted, never
+    /// a routing observation, and never used to clear a refusal.
+    pub fn effective_usage(&self) -> Option<super::anthropic::claude_code::usage::ClaudeUsage> {
+        use super::anthropic::claude_code::usage::UsageWindow;
+        let mut usage = self.usage.clone().unwrap_or_default();
+        for window in &mut usage.windows {
+            window.source = Some(CLAUDE_SOURCE_USAGE_API.into());
+            window.observed_at = self.observed_at;
+        }
+        for (rank, name) in CLAUDE_HEADER_WINDOWS.iter().enumerate() {
+            let Some(header) = self.newer_header_window(name) else {
+                continue;
+            };
+            let Some(used) = header
+                .used_percent
+                .filter(|used| used.is_finite() && (0.0..=100.0).contains(used))
+            else {
+                continue;
+            };
+            let merged = UsageWindow {
+                name: (*name).into(),
+                used_percent: used,
+                resets_at: header.resets_at.clone(),
+                source: Some(CLAUDE_SOURCE_INFERENCE_HEADER.into()),
+                observed_at: Some(header.observed_at),
+            };
+            match usage.windows.iter().position(|window| window.name == *name) {
+                Some(index) => usage.windows[index] = merged,
+                None => {
+                    // Keep the canonical five-hour → weekly → model order.
+                    let at = usage
+                        .windows
+                        .iter()
+                        .take_while(|window| {
+                            CLAUDE_HEADER_WINDOWS[..rank].contains(&window.name.as_str())
+                        })
+                        .count();
+                    usage.windows.insert(at, merged);
+                }
+            }
+        }
+        (self.usage.is_some() || !usage.windows.is_empty()).then_some(usage)
     }
 
     pub fn usage_complete(&self) -> bool {
@@ -223,6 +316,20 @@ impl ClaudeAccountState {
         }
         Some(if self.usage_complete() { 0 } else { 1 })
     }
+}
+
+/// Windows reported both by full usage queries and by inference headers.
+pub(crate) const CLAUDE_HEADER_WINDOWS: [&str; 2] = ["five_hour", "weekly_limit"];
+pub(crate) const CLAUDE_SOURCE_USAGE_API: &str = "usage_api";
+pub(crate) const CLAUDE_SOURCE_INFERENCE_HEADER: &str = "inference_header";
+/// Header and usage-API resets for one cycle differ only by rounding; adjacent
+/// cycles are hours or days apart.
+const CLAUDE_SAME_CYCLE_SKEW_MS: i64 = 120_000;
+
+fn claude_reset_ms(raw: Option<&str>) -> Option<i64> {
+    chrono::DateTime::parse_from_rfc3339(raw?.trim())
+        .ok()
+        .map(|at| at.timestamp_millis())
 }
 
 /// Feature windows are model scoped; oauth_apps applies to this OAuth channel.
@@ -762,6 +869,217 @@ mod tests {
         (chrono::Utc::now() + chrono::Duration::hours(hours)).to_rfc3339()
     }
 
+    fn header(
+        name: &str,
+        used: Option<f64>,
+        status: Option<&str>,
+        reset: Option<String>,
+        observed_at: i64,
+    ) -> super::super::anthropic::claude_code::quota_observation::ClaudeQuotaWindowObservation {
+        super::super::anthropic::claude_code::quota_observation::ClaudeQuotaWindowObservation {
+            name: name.into(),
+            used_percent: used,
+            status: status.map(Into::into),
+            resets_at: reset,
+            observed_at,
+            source: "inference_header".into(),
+        }
+    }
+
+    fn headers(
+        windows: Vec<
+            super::super::anthropic::claude_code::quota_observation::ClaudeQuotaWindowObservation,
+        >,
+    ) -> Option<super::super::anthropic::claude_code::quota_observation::ClaudeQuotaObservation>
+    {
+        Some(
+            super::super::anthropic::claude_code::quota_observation::ClaudeQuotaObservation {
+                windows,
+            },
+        )
+    }
+
+    #[test]
+    fn claude_effective_usage_prefers_newer_same_cycle_header_windows() {
+        let five_reset = future_reset(3);
+        let weekly_reset = future_reset(48);
+        let full_at = 1_800_000_000_000;
+        let mut state = ClaudeAccountState {
+            usage: Some(super::super::anthropic::claude_code::usage::parse_usage(
+                &serde_json::json!({
+                    "five_hour": {"utilization": 30, "resets_at": five_reset},
+                    "seven_day": {"utilization": 20, "resets_at": weekly_reset},
+                    "seven_day_sonnet": {"utilization": 10, "resets_at": weekly_reset},
+                }),
+            )),
+            observed_at: Some(full_at),
+            ..Default::default()
+        };
+        // Same cycle with a reformatted reset replaces; an older weekly cycle does not.
+        let same_cycle = chrono::DateTime::parse_from_rfc3339(&five_reset)
+            .unwrap()
+            .with_timezone(&chrono::Utc)
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string();
+        let older_cycle = (chrono::DateTime::parse_from_rfc3339(&weekly_reset).unwrap()
+            - chrono::Duration::days(7))
+        .to_rfc3339();
+        state.passive_usage = headers(vec![
+            header(
+                "five_hour",
+                Some(55.0),
+                Some("allowed"),
+                Some(same_cycle.clone()),
+                full_at + 1_000,
+            ),
+            header(
+                "weekly_limit",
+                Some(5.0),
+                Some("allowed"),
+                Some(older_cycle),
+                full_at + 1_000,
+            ),
+        ]);
+        let effective = state.effective_usage().unwrap();
+        let names: Vec<_> = effective.windows.iter().map(|w| w.name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["five_hour", "weekly_limit", "feature:sonnet:weekly_limit"]
+        );
+        assert_eq!(effective.windows[0].used_percent, 55.0);
+        assert_eq!(
+            effective.windows[0].resets_at.as_deref(),
+            Some(same_cycle.as_str())
+        );
+        assert_eq!(
+            effective.windows[0].source.as_deref(),
+            Some(CLAUDE_SOURCE_INFERENCE_HEADER)
+        );
+        assert_eq!(effective.windows[0].observed_at, Some(full_at + 1_000));
+        assert_eq!(effective.windows[1].used_percent, 20.0);
+        assert_eq!(
+            effective.windows[1].source.as_deref(),
+            Some(CLAUDE_SOURCE_USAGE_API)
+        );
+        assert_eq!(effective.windows[1].observed_at, Some(full_at));
+        assert_eq!(
+            effective.windows[2].source.as_deref(),
+            Some(CLAUDE_SOURCE_USAGE_API)
+        );
+        // Presentation metadata is never persisted with the stored snapshot.
+        let stored = serde_json::to_value(&state).unwrap();
+        assert!(stored["usage"]["windows"][0].get("source").is_none());
+        assert!(stored["usage"]["windows"][0].get("observed_at").is_none());
+
+        // An older header, or a status without a percentage, keeps the full value.
+        state.passive_usage = headers(vec![
+            header("five_hour", Some(90.0), None, Some(same_cycle), full_at - 1),
+            header(
+                "weekly_limit",
+                None,
+                Some("allowed_warning"),
+                None,
+                full_at + 1,
+            ),
+        ]);
+        let effective = state.effective_usage().unwrap();
+        assert_eq!(effective.windows[0].used_percent, 30.0);
+        assert_eq!(effective.windows[1].used_percent, 20.0);
+
+        // Without a full snapshot, header windows appear in canonical order.
+        let only_headers = ClaudeAccountState {
+            passive_usage: headers(vec![
+                header("weekly_limit", Some(26.0), Some("allowed"), None, full_at),
+                header("five_hour", Some(0.0), Some("allowed"), None, full_at),
+            ]),
+            ..Default::default()
+        };
+        let effective = only_headers.effective_usage().unwrap();
+        let names: Vec<_> = effective.windows.iter().map(|w| w.name.as_str()).collect();
+        assert_eq!(names, ["five_hour", "weekly_limit"]);
+        assert!(ClaudeAccountState::default().effective_usage().is_none());
+    }
+
+    #[test]
+    fn claude_header_exhaustion_only_tightens_admission() {
+        let config = config();
+        let full_at = 1_800_000_000_000;
+        let base = |five_hour: f64| ClaudeAccountState {
+            usage: Some(super::super::anthropic::claude_code::usage::parse_usage(
+                &serde_json::json!({
+                    "five_hour": {"utilization": five_hour, "resets_at": future_reset(3)},
+                    "seven_day": {"utilization": 20, "resets_at": future_reset(48)},
+                }),
+            )),
+            observed_at: Some(full_at),
+            ..Default::default()
+        };
+        let mut state = base(30.0);
+        assert_eq!(state.cost_class(&config), Some(0));
+        state.passive_usage = headers(vec![header(
+            "five_hour",
+            Some(0.0),
+            Some("rejected"),
+            Some(future_reset(3)),
+            full_at + 1,
+        )]);
+        assert_eq!(
+            state.cost_class(&config),
+            None,
+            "a newer rejection pauses admission"
+        );
+        state.passive_usage = headers(vec![header(
+            "weekly_limit",
+            Some(100.0),
+            Some("allowed"),
+            None,
+            full_at + 1,
+        )]);
+        assert_eq!(
+            state.cost_class(&config),
+            None,
+            "a fully used window pauses admission"
+        );
+        state.passive_usage = headers(vec![header(
+            "five_hour",
+            Some(100.0),
+            Some("rejected"),
+            Some((chrono::Utc::now() - chrono::Duration::minutes(1)).to_rfc3339()),
+            full_at + 1,
+        )]);
+        assert_eq!(
+            state.cost_class(&config),
+            Some(0),
+            "a header pause ends at its own reset"
+        );
+        state.passive_usage = headers(vec![header(
+            "five_hour",
+            Some(100.0),
+            Some("rejected"),
+            Some(future_reset(3)),
+            full_at - 1,
+        )]);
+        assert_eq!(
+            state.cost_class(&config),
+            Some(0),
+            "older headers are superseded by the full query"
+        );
+        // A lower newer header never relaxes an exhausted full snapshot.
+        let mut exhausted = base(100.0);
+        exhausted.passive_usage = headers(vec![header(
+            "five_hour",
+            Some(10.0),
+            Some("allowed"),
+            Some(future_reset(3)),
+            full_at + 1,
+        )]);
+        assert_eq!(exhausted.cost_class(&config), None);
+        assert_eq!(
+            exhausted.effective_usage().unwrap().windows[0].used_percent,
+            10.0
+        );
+    }
+
     fn account_ids(accounts: &[OAuthCredential]) -> Vec<&str> {
         accounts.iter().map(|a| a.account_id.as_str()).collect()
     }
@@ -784,6 +1102,8 @@ mod tests {
                     name: "feature:sonnet:weekly_limit".into(),
                     used_percent: 10.0,
                     resets_at: Some(future_reset(1)),
+                    source: None,
+                    observed_at: None,
                 });
         });
         mutate_claude(&mut accounts[1], |state| state.observed_at = Some(1));
@@ -937,6 +1257,8 @@ mod tests {
                     name: "feature:opus:weekly_limit".into(),
                     used_percent: 100.0,
                     resets_at: Some(future_reset(1)),
+                    source: None,
+                    observed_at: None,
                 },
             )
         });
