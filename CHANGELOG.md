@@ -4,6 +4,16 @@ All notable changes to Nyro will be documented in this file.
 
 ---
 
+## v2.1.41
+
+> Released on 2026-11-12
+
+#### Fixes
+
+- **Claude thinking-off requests on adaptive-only models**: requests that turn thinking off (`thinking.type: disabled`, or `enabled` with `budget_tokens: 0`) are now rewritten into the form each model accepts instead of being forwarded verbatim. `claude-opus-5-5` and the `claude-fable-5` family cannot disable thinking, so they fall back to `thinking: {type: adaptive, display: omitted}` with `output_config.effort: low`; `claude-sonnet-5-5` uses a bare `thinking: {type: between_tools}` without effort; `claude-haiku-5-5` and models that still accept `disabled` are unchanged. This fixes the upstream 400 `"thinking.type.disabled" is not supported for this model` seen when non-native clients (for example title helpers) asked Opus 5.5 to skip thinking. The rewrite runs in the shared effort policy, so Anthropic passthrough, cross-protocol and streaming requests are all covered; capability rules follow CLIProxyAPI ad9e456d.
+
+---
+
 ## v2.1.40
 
 > Released on 2026-11-12

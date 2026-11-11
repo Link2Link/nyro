@@ -142,6 +142,23 @@ async fn start_upstream_with_quota(quota_headers: bool) -> (String, Arc<Mutex<Ve
                     let _ = socket.shutdown().await;
                     return;
                 }
+                // Anthropic's thinking-off contract (live 400, VPS request 7007578d):
+                // these models reject an explicit {"type":"disabled"}.
+                if body["thinking"]["type"] == "disabled"
+                    && (body["model"] == "claude-opus-5-5" || body["model"] == "claude-sonnet-5-5")
+                {
+                    let error = json!({"type": "error", "error": {"type": "invalid_request_error",
+                        "message": "\"thinking.type.disabled\" is not supported for this model. Use \"thinking.type.adaptive\" and \"output_config.effort\" to control thinking behavior."}})
+                    .to_string();
+                    let response = format!(
+                        "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{error}",
+                        error.len()
+                    );
+                    sink.lock().unwrap().push(request);
+                    let _ = socket.write_all(response.as_bytes()).await;
+                    let _ = socket.shutdown().await;
+                    return;
+                }
                 // Synthetic model identity reply for the account-scoped admin probe.
                 if body["model"] == FABLE_MODEL {
                     let message = json!({
@@ -1080,6 +1097,66 @@ async fn inference_quota_headers_update_selected_account_without_usage_query() {
                     usage_before
                 );
                 assert!(!public.to_string().contains("passive_usage"));
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn thinking_off_requests_use_each_claude_models_accepted_form() {
+    // Shape of the live failure (VPS 7007578d): a third-party title helper
+    // asked claude-opus-5-5 for max_tokens 64 with thinking disabled.
+    for (target, expected_thinking, expected_effort) in [
+        (
+            "claude-opus-5-5",
+            json!({"type": "adaptive", "display": "omitted"}),
+            Some("low"),
+        ),
+        ("claude-sonnet-5-5", json!({"type": "between_tools"}), None),
+        ("claude-haiku-5-5", json!({"type": "disabled"}), None),
+    ] {
+        for streaming in [false, true] {
+            let (url, captured) = start_upstream().await;
+            let (_dir, gw) = setup(&url).await;
+            let models = gw.admin().list_models().await.unwrap();
+            let model = models.iter().find(|m| m.name == MODEL).unwrap();
+            gw.admin()
+                .update_model(
+                    &model.id,
+                    nyro_core::db::models::UpdateModel {
+                        target_model: Some(target.into()),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            let (status, wire) = dispatch(
+                &gw,
+                ANTHROPIC_MESSAGES_2023_06_01,
+                "/v1/messages",
+                HeaderMap::new(),
+                json!({
+                    "model": MODEL, "max_tokens": 64, "stream": streaming,
+                    "thinking": {"type": "disabled"},
+                    "system": [{"type": "text", "text": "Summarize the conversation as a short label."}],
+                    "messages": [{"role": "user", "content": [{"type": "text", "text": "hello"}]}]
+                }),
+            )
+            .await;
+            assert_eq!(status, 200, "{target} stream={streaming}: {wire}");
+            let request = only_request(&captured);
+            let sent = request.body();
+            assert_eq!(sent["model"], target);
+            assert_eq!(sent["thinking"], expected_thinking, "{target}");
+            assert_eq!(
+                sent.pointer("/output_config/effort")
+                    .and_then(Value::as_str),
+                expected_effort,
+                "{target}"
+            );
+            if expected_effort.is_some() {
+                let betas = request.header("anthropic-beta").unwrap();
+                assert!(betas.contains("effort-2025-11-24"), "{betas}");
             }
         }
     }

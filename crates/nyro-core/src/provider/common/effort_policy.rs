@@ -50,6 +50,11 @@
 //! between_tools; omit thinking or use one of those modes`）。防御按
 //! CLIProxyAPI 的自动转换语义改写：`enabled`+budget → `adaptive`+
 //! `output_config.effort`（预算阈值换算档位），`display` 兄弟键保留。
+//!
+//! 关闭思考（`disabled` 或 `enabled`+0 预算）同样按模型方言改写：
+//! opus-5-5 / fable-5.x 不支持关闭（线上 400，VPS 请求 7007578d），退回
+//! `adaptive`+`display: omitted`+`output_config.effort=low`；sonnet-5-5 的
+//! 关闭形态是裸 `between_tools`；haiku-5-5 等仍接受 `disabled`。
 
 use serde_json::Value;
 
@@ -344,10 +349,167 @@ pub(crate) fn rewrite_legacy_claude55_thinking(body: &mut Value) {
     }
 }
 
+/// Claude 模型「关闭思考」的上游形态（能力表对齐 CLIProxyAPI ad9e456d 与其
+/// registry：opus-5-5 / fable-5.x 的 zero_allowed=false，sonnet-5-5 的
+/// disable_type=between_tools，haiku-5-5 等仍接受 disabled）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ClaudeThinkingOff {
+    /// 不支持关闭：退回最低档自适应思考，思考内容不展示。线上 400（VPS，
+    /// 请求 7007578d，claude-opus-5-5）："thinking.type.disabled" is not
+    /// supported for this model. Use "thinking.type.adaptive" and
+    /// "output_config.effort" to control thinking behavior.
+    AdaptiveLow,
+    /// 关闭形态为 `between_tools`，不接受 display/budget 等附加字段，也不
+    /// 接受 `output_config.effort`。
+    BetweenTools,
+}
+
+/// 把客户端的关闭思考意图改写为模型接受的形态。关闭意图 =
+/// `thinking.type=disabled`，或 `enabled` 且 `budget_tokens=0`（CPA 同语义）。
+/// 其余形态（enabled+正预算、adaptive、between_tools、缺失）原样放行，交给
+/// 后续 5.5 改写处理；非对象 body 为 no-op。返回是否发生改写。
+pub(crate) fn rewrite_claude_thinking_off(body: &mut Value, mode: ClaudeThinkingOff) -> bool {
+    let Some(object) = body.as_object_mut() else {
+        return false;
+    };
+    let off_intent = object
+        .get("thinking")
+        .and_then(Value::as_object)
+        .is_some_and(|thinking| {
+            match thinking
+                .get("type")
+                .and_then(Value::as_str)
+                .map(|kind| kind.trim().to_ascii_lowercase())
+                .as_deref()
+            {
+                Some("disabled") => true,
+                Some("enabled") => thinking.get("budget_tokens").and_then(Value::as_i64) == Some(0),
+                _ => false,
+            }
+        });
+    if !off_intent {
+        return false;
+    }
+    match mode {
+        ClaudeThinkingOff::AdaptiveLow => {
+            object.insert(
+                "thinking".to_string(),
+                serde_json::json!({"type": "adaptive", "display": "omitted"}),
+            );
+            let entry = object
+                .entry("output_config".to_string())
+                .or_insert_with(|| Value::Object(serde_json::Map::new()));
+            if !entry.is_object() {
+                *entry = Value::Object(serde_json::Map::new());
+            }
+            if let Some(output_config) = entry.as_object_mut() {
+                output_config.insert("effort".to_string(), Value::String("low".to_string()));
+            }
+        }
+        ClaudeThinkingOff::BetweenTools => {
+            object.insert(
+                "thinking".to_string(),
+                serde_json::json!({"type": "between_tools"}),
+            );
+            let now_empty = object
+                .get_mut("output_config")
+                .and_then(Value::as_object_mut)
+                .is_some_and(|output_config| {
+                    output_config.remove("effort");
+                    output_config.is_empty()
+                });
+            if now_empty {
+                object.remove("output_config");
+            }
+        }
+    }
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn claude_thinking_off_falls_back_to_hidden_low_adaptive() {
+        // 线上原始请求形态（VPS 7007578d）：disabled 被 opus-5-5 400 拒绝。
+        for thinking in [
+            json!({"type": "disabled"}),
+            json!({"type": " Disabled ", "budget_tokens": 8000, "display": "summarized",
+                   "block_binding": {"prefix_mismatch_behavior": "drop_block"}}),
+            json!({"type": "enabled", "budget_tokens": 0, "display": "summarized"}),
+        ] {
+            let mut body = json!({
+                "model": "claude-opus-5-5", "max_tokens": 64, "thinking": thinking,
+                "output_config": {"effort": "max", "format": {"type": "json_schema"}}
+            });
+            assert!(rewrite_claude_thinking_off(
+                &mut body,
+                ClaudeThinkingOff::AdaptiveLow
+            ));
+            assert_eq!(
+                body["thinking"],
+                json!({"type": "adaptive", "display": "omitted"})
+            );
+            assert_eq!(body["output_config"]["effort"], "low");
+            assert_eq!(body["output_config"]["format"]["type"], "json_schema");
+            assert_eq!(
+                body["max_tokens"], 64,
+                "token floor stays with the pipeline"
+            );
+        }
+        let mut no_config = json!({"thinking": {"type": "disabled"}});
+        rewrite_claude_thinking_off(&mut no_config, ClaudeThinkingOff::AdaptiveLow);
+        assert_eq!(no_config["output_config"], json!({"effort": "low"}));
+    }
+
+    #[test]
+    fn claude_thinking_off_uses_bare_between_tools_without_effort() {
+        let mut body = json!({
+            "thinking": {"type": "disabled", "display": "summarized", "budget_tokens": 8000},
+            "output_config": {"effort": "xhigh"}
+        });
+        assert!(rewrite_claude_thinking_off(
+            &mut body,
+            ClaudeThinkingOff::BetweenTools
+        ));
+        assert_eq!(body["thinking"], json!({"type": "between_tools"}));
+        assert!(
+            body.get("output_config").is_none(),
+            "empty output_config is dropped"
+        );
+        let mut keeps_format = json!({
+            "thinking": {"type": "enabled", "budget_tokens": 0},
+            "output_config": {"effort": "low", "format": {"type": "json_schema"}}
+        });
+        rewrite_claude_thinking_off(&mut keeps_format, ClaudeThinkingOff::BetweenTools);
+        assert_eq!(
+            keeps_format["output_config"],
+            json!({"format": {"type": "json_schema"}})
+        );
+    }
+
+    #[test]
+    fn claude_thinking_off_leaves_active_or_absent_thinking_untouched() {
+        for mode in [
+            ClaudeThinkingOff::AdaptiveLow,
+            ClaudeThinkingOff::BetweenTools,
+        ] {
+            for body in [
+                json!({"thinking": {"type": "enabled", "budget_tokens": 4096}}),
+                json!({"thinking": {"type": "adaptive"}, "output_config": {"effort": "high"}}),
+                json!({"thinking": {"type": "between_tools"}}),
+                json!({"thinking": {"type": "enabled"}}),
+                json!({"model": "claude-opus-5-5"}),
+                json!("not an object"),
+            ] {
+                let mut rewritten = body.clone();
+                assert!(!rewrite_claude_thinking_off(&mut rewritten, mode));
+                assert_eq!(rewritten, body);
+            }
+        }
+    }
 
     #[test]
     fn enum_upstream_rewrites_off_misspellings_to_none() {
