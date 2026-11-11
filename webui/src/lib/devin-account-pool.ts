@@ -34,22 +34,21 @@ export interface KiroUsage {
   items: KiroUsageItem[];
 }
 
-/** Actual upstream Claude subscription windows and independently detected plan. */
-export interface ClaudeUsage {
-  plan?: string | null;
-  windows: { name: string; used_percent: number; resets_at: string | null }[];
+/** One effective Claude window: full-query value or a newer same-cycle response-header value. */
+export interface ClaudeUsageWindow {
+  name: string;
+  used_percent: number;
+  resets_at: string | null;
+  /** Missing means `usage_api` (full usage query). */
+  source?: "usage_api" | "inference_header" | null;
+  /** When this window value was observed (epoch ms); missing falls back to the account's `observed_at`. */
+  observed_at?: number | null;
 }
 
-/** Partial passive observations; never replace a full Claude usage snapshot. */
-export interface ClaudeQuotaObservation {
-  windows: {
-    name: string;
-    used_percent: number | null;
-    status: string | null;
-    resets_at: string | null;
-    observed_at: number;
-    source: "inference_header";
-  }[];
+/** Effective upstream Claude subscription windows and independently detected plan. */
+export interface ClaudeUsage {
+  plan?: string | null;
+  windows: ClaudeUsageWindow[];
 }
 
 export interface ProviderAccountView {
@@ -68,10 +67,11 @@ export interface ProviderAccountView {
   reserve_usd: number | null;
   kiro_usage?: KiroUsage | null;
   claude_usage?: ClaudeUsage | null;
-  claude_quota_observation?: ClaudeQuotaObservation | null;
   /** Claude only: backend-authoritative next allowed usage refresh attempt (epoch milliseconds). */
   usage_refresh_available_at?: number | null;
+  /** Claude: last full usage query only; header-updated windows carry their own `observed_at`. */
   observed_at: number | null;
+  /** Claude: the full usage query failed or is older than 660 seconds. */
   stale: boolean;
   updated_at: string;
 }

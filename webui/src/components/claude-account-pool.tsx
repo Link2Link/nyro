@@ -7,7 +7,8 @@ import { useLocale } from "@/lib/i18n";
 import { useUsageClock } from "@/lib/use-usage-clock";
 import { looksLikeCredential } from "@/lib/kiro-pool-usage";
 import { tierLabel } from "@/lib/provider-usage";
-import { claudePoolSteadyPacePercent, steadyPacePercent, utilizationColor } from "@/lib/usage-pace";
+import { claudePoolSteadyPacePercent, utilizationColor } from "@/lib/usage-pace";
+import { claudeAccountWindowViews, shortLocalTime } from "@/lib/claude-usage-windows";
 import { accountStateLabel, canReauthorizeLegacyProvider, type AccountPoolView, type OAuthAccountUpdate, type PoolQuotaWindow, type ProviderAccountView } from "@/lib/devin-account-pool";
 import type { Provider } from "@/lib/types";
 import type { OAuthSessionIntent } from "@/lib/use-oauth-session";
@@ -17,7 +18,7 @@ import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { AccountPoolSettings } from "@/components/devin-pool-settings";
 import { ClaudeAccountLogin } from "@/components/claude-account-login";
 import { ProviderUsageFooter } from "@/components/provider-usage";
-import { ClaudeQuotaObservationView } from "@/components/claude-quota-observation";
+import { ClaudeUsageWindowRows } from "@/components/claude-usage-windows";
 import { UsageProgress } from "@/components/usage-progress";
 import { PoolRefreshButton } from "@/components/pool-refresh-button";
 import { AccountUsageSummary } from "@/components/account-usage-summary";
@@ -44,42 +45,24 @@ function usageRefreshAvailableAt(account: ProviderAccountView): number | null {
   return deadline != null && Number.isFinite(new Date(deadline).getTime()) ? deadline : null;
 }
 
-/** Raw per-account windows remain available alongside weighted pool estimates. */
+/** Hover text for manual refresh actions; the backend enforces the interval. */
+function refreshPolicyHint(isZh: boolean, pool: boolean): string {
+  return pool
+    ? (isZh ? "每个账号至少间隔 10 分钟刷新；冷却中的账号返回缓存数据" : "Each account refreshes at most every 10 min; accounts in cooldown return cached data")
+    : (isZh ? "每个账号至少间隔 10 分钟刷新（失败也计入）" : "At most once every 10 min per account (failures included)");
+}
+
+/** Compact effective windows; provenance lives in hover text. */
 export function ClaudeAccountUsage({ account, isZh }: { account: ProviderAccountView; isZh: boolean }) {
   const now = useUsageClock();
-  const windows = account.claude_usage?.windows ?? [];
+  const views = claudeAccountWindowViews(account, now);
   const refreshAvailableAt = usageRefreshAvailableAt(account);
   const coolingDown = refreshAvailableAt != null && now < refreshAvailableAt;
-  return <div className="min-w-48 space-y-2 text-xs">
-    <div className="space-y-2" data-claude-full-usage>
-    <h4 className="font-medium text-slate-600">{isZh ? "完整用量快照" : "Full usage snapshot"}</h4>
-    {!windows.length && <p className="text-slate-500">{isZh ? "用量未知" : "Usage unknown"}</p>}
-    {windows.map((window, index) => {
-      const valid = Number.isFinite(window.used_percent) && window.used_percent >= 0;
-      const label = tierLabel(window.name, isZh);
-      const reset = window.resets_at && Number.isFinite(Date.parse(window.resets_at)) ? window.resets_at : null;
-      return <div key={`${window.name}:${index}`} className="space-y-1">
-        <p className="font-medium text-slate-600">{label}</p>
-        {valid ? <>
-          <p className={`tabular-nums ${utilizationColor(window.used_percent)}`}>{isZh ? "已用" : "Used"} {window.used_percent.toFixed(1)}%</p>
-          <UsageProgress usedPercent={window.used_percent} pacePercent={steadyPacePercent(window, now)} label={`${label} ${isZh ? "已用额度" : "used quota"}`} isZh={isZh} />
-        </> : <p className="text-slate-500">{isZh ? "用量未知" : "Usage unknown"}</p>}
-        {reset ? <p className="text-[10px] text-slate-500">{isZh ? "重置" : "Resets"}: <time dateTime={reset}>{new Date(reset).toLocaleString()}</time></p>
-          : <p className="text-[10px] text-slate-400">{isZh ? "重置时间未知" : "Reset time unknown"}</p>}
-      </div>;
-    })}
-    <p className={account.stale ? "text-amber-700" : "text-slate-400"}>{account.stale ? (isZh ? "旧数据 / 未知" : "Stale / unknown") : (isZh ? "已观察" : "Observed")}</p>
-    {account.observed_at != null && Number.isFinite(new Date(account.observed_at).getTime()) && <time className="text-[10px] text-slate-400" dateTime={new Date(account.observed_at).toISOString()}>{new Date(account.observed_at).toLocaleString()}</time>}
-    </div>
-    <ClaudeQuotaObservationView account={account} isZh={isZh} />
-    <p className="text-[10px] text-slate-500">{isZh
-      ? "主动用量刷新至少间隔 10 分钟，由后端强制执行（失败也计入）；退避可能延长等待。推理响应头的被动观测可独立更新。"
-      : "Active usage refresh attempts are at least 10 minutes apart, enforced by the backend (including failures); backoff may extend the wait. Passive inference-header observations can update independently."}</p>
-    <p className={coolingDown ? "text-amber-700" : "text-slate-500"}>{coolingDown
-      ? (isZh ? "用量刷新冷却中" : "Usage refresh cooldown")
-      : refreshAvailableAt != null ? (isZh ? "现在可尝试刷新用量" : "Usage refresh can be attempted now")
-      : (isZh ? "未报告刷新冷却时间；后端限制仍然适用。" : "No refresh cooldown reported; backend limits still apply.")}</p>
-    {coolingDown && <p className="text-[10px] text-slate-500">{isZh ? "下次可刷新" : "Next refresh"}: <time dateTime={new Date(refreshAvailableAt).toISOString()}>{new Date(refreshAvailableAt).toLocaleString()}</time></p>}
+  return <div className="min-w-64 space-y-1.5 text-xs" data-claude-account-usage>
+    {views.length ? <ClaudeUsageWindowRows views={views} now={now} isZh={isZh} markMainStale />
+      : <p className="text-slate-500">{isZh ? "用量未知" : "Usage unknown"}</p>}
+    {coolingDown && <p className="text-[10px] text-slate-500" data-claude-refresh-cooldown>{isZh ? "下次可刷新" : "Next refresh"}{" "}
+      <time dateTime={new Date(refreshAvailableAt).toISOString()} title={new Date(refreshAvailableAt).toLocaleString()}>{shortLocalTime(refreshAvailableAt, now)}</time></p>}
   </div>;
 }
 
@@ -141,7 +124,7 @@ export function ClaudePoolSummary({ pool, isZh, detailed = false, onRefresh, ref
     planCounts.set(plan, (planCounts.get(plan) ?? 0) + 1);
   }
   return <div className={`relative space-y-1 rounded-lg border border-slate-200/70 bg-white/40 px-3 py-2 text-xs text-slate-600 ${onRefresh ? "pr-10" : ""}`}>
-    {onRefresh && <PoolRefreshButton onRefresh={onRefresh} refreshing={refreshing} isZh={isZh} />}
+    {onRefresh && <PoolRefreshButton onRefresh={onRefresh} refreshing={refreshing} isZh={isZh} hint={refreshPolicyHint(isZh, true)} />}
     {detailed && <>
     <p>{isZh ? `${pool.counts.total} 个账号 · ${pool.counts.available} 个可用` : `${pool.counts.total} accounts · ${pool.counts.available} available`} · {accountStateLabel(pool.readiness, isZh)}</p>
     <p>{isZh ? `已停用 ${pool.counts.disabled} · 已断开 ${pool.counts.disconnected} · 需要登录 ${pool.counts.auth_required} · 额度耗尽 ${pool.counts.quota_exhausted}` : `Disabled ${pool.counts.disabled} · Disconnected ${pool.counts.disconnected} · Needs login ${pool.counts.auth_required} · Quota exhausted ${pool.counts.quota_exhausted}`}</p>
@@ -155,12 +138,12 @@ export function ClaudePoolSummary({ pool, isZh, detailed = false, onRefresh, ref
       {(pool.quota.claude_windows ?? []).map(({ name, quota }) => <ClaudePoolWindow key={name} name={name} quota={quota} pace={claudePoolSteadyPacePercent(pool, name, now)} isZh={isZh} detailed={detailed} />)}
     </div>
     {!pool.quota.claude_windows?.length && <p className="text-slate-500">{isZh ? "账号池用量未知，请刷新用量。" : "Pool usage unknown; refresh usage to load it."}</p>}
-    {(detailed || onRefresh) && <p className="text-[10px] text-slate-500">{isZh
-      ? "后端强制每个账号的主动用量刷新至少间隔 10 分钟；退避可能延长等待。推理响应头的被动观测可独立更新，但不参与账号池汇总。刷新全池会为冷却中的账号返回缓存数据（若有），不会绕过限制，也不表示缓存已更新。"
-      : "The backend enforces at least 10 minutes between active usage refresh attempts per account; backoff may extend the wait. Passive inference-header observations can update independently but do not contribute to pool totals. Pool refresh returns cached data, if any, for accounts in cooldown; it neither bypasses the limit nor makes cached data fresh."}</p>}
-    {detailed && <p className="text-[10px] text-slate-500">{isZh
-      ? "按 Pro / Max 5× / Max 20× 加权：5 小时 1 / 5 / 20，每周 1 / 5 / 10（估算）。未知或未识别套餐默认按 Pro（1）计算。仅统计已启用且未断开的账号，含额度耗尽账号；不代表当前可调度额度。模型专属窗口请展开管理账号查看。"
-      : "Weights for Pro / Max 5× / Max 20×: 5h 1 / 5 / 20; weekly 1 / 5 / 10 (estimated). Unknown or unrecognized plans default to Pro (1). Includes enabled, non-disconnected accounts, including exhausted accounts; not currently routable capacity. Open Manage accounts for model-specific windows."}</p>}
+    {detailed && <details className="text-[10px] text-slate-500" data-claude-pool-weights>
+      <summary className="cursor-pointer">{isZh ? "权重 Pro / Max 5× / Max 20×：5 小时 1 / 5 / 20，每周 1 / 5 / 10（估算）" : "Weights Pro / Max 5× / Max 20×: 5h 1 / 5 / 20, weekly 1 / 5 / 10 (estimated)"}</summary>
+      <p className="pt-1">{isZh
+        ? "未知或未识别套餐按 Pro（1）计算；仅统计已启用且未断开的账号（含额度耗尽），不代表当前可调度额度。模型专属窗口见各账号。"
+        : "Unknown or unrecognized plans count as Pro (1). Includes enabled, non-disconnected accounts (including exhausted ones); not currently routable capacity. Model-specific windows are listed per account."}</p>
+    </details>}
   </div>;
 }
 
@@ -190,7 +173,7 @@ function AccountRow({ account, pending, canLogin, usageSummary, onUpdate, onLogi
     <td className="space-y-1 p-2"><p>{accountStateLabel(account.status, isZh)}</p><p className="text-slate-500">{accountStateLabel(account.scheduling, isZh)}</p><p>{account.is_enabled ? (isZh ? "已启用" : "Enabled") : (isZh ? "已停用" : "Disabled")}</p></td>
     <td className="p-2"><ClaudeAccountUsage account={account} isZh={isZh} /></td>
     <td className="min-w-36 p-2"><div className="flex flex-wrap gap-1">
-      <Button type="button" variant="secondary" disabled={pending || disconnected || coolingDown} onClick={onRefresh}>{isZh ? "刷新用量" : "Refresh usage"}</Button>
+      <Button type="button" variant="secondary" disabled={pending || disconnected || coolingDown} onClick={onRefresh} title={refreshPolicyHint(isZh, false)}>{isZh ? "刷新用量" : "Refresh usage"}</Button>
       <Button type="button" variant="secondary" disabled={pending || disconnected || !canLogin} onClick={onLogin}>{isZh ? "重新授权" : "Re-authorize"}</Button>
       <Button type="button" variant="secondary" disabled={pending || disconnected} onClick={() => onUpdate({ is_enabled: !account.is_enabled })}>{account.is_enabled ? (isZh ? "停用" : "Disable") : (isZh ? "启用" : "Enable")}</Button>
       <Button type="button" variant="secondary" disabled={pending || disconnected} onClick={onRemove}>{isZh ? "移除" : "Remove"}</Button>
@@ -235,7 +218,7 @@ export function ClaudeAccountPoolPanel({ provider }: { provider: Provider }) {
         setLogin({ intent: { kind: "reauthorize_legacy_provider", providerId: provider.id, useProxy: provider.use_proxy }, label: "" });
       }}>{isZh ? "原单账号重新授权" : "Re-authorize legacy account"}</Button>}
       <Button type="button" disabled={!pool.config || pending} onClick={() => { mutation.reset(); setLogin({ intent: { kind: "add_account", providerId: provider.id }, label: "" }); }}>{isZh ? "添加账号" : "Add account"}</Button>
-      <Button type="button" variant="secondary" disabled={pending} onClick={() => act("refresh_provider_account_pool_usage")}><RefreshCw className={`mr-1 h-3 w-3 ${mutation.isPending ? "animate-spin" : ""}`} />{isZh ? "刷新全池用量" : "Refresh pool usage"}</Button>
+      <Button type="button" variant="secondary" disabled={pending} onClick={() => act("refresh_provider_account_pool_usage")} title={refreshPolicyHint(isZh, true)}><RefreshCw className={`mr-1 h-3 w-3 ${mutation.isPending ? "animate-spin" : ""}`} />{isZh ? "刷新全池用量" : "Refresh pool usage"}</Button>
     </div>
     {login && <ClaudeAccountLogin key={login.intent.kind === "reauthorize_account" ? `${login.intent.accountId}:${login.intent.expectedVersion}` : `${login.intent.kind}:${login.intent.providerId}`}
       intent={login.intent} initialLabel={login.label} onCancel={() => setLogin(null)} onBound={() => { setLogin(null); void invalidate(); }} />}
@@ -278,14 +261,17 @@ export function ClaudeAccountPoolCard({ provider }: { provider: Provider }) {
     {/* Core aggregates each window using its own subscription capacity weights. */}
     {query.data?.config ? <ClaudePoolSummary pool={query.data} isZh={isZh}
       onRefresh={() => refresh.mutate()} refreshing={refresh.isPending} />
-    : query.data ? <>
-      <ProviderUsageFooter provider={provider} claudeAccount={query.data.accounts.length === 1 ? query.data.accounts[0] : undefined} />
-      <p className="text-xs text-amber-700">{isZh ? "保存账号池调度设置即可添加更多 Claude 账号；原单账号仍可使用和重新授权。" : "Save pool scheduling settings to add more Claude accounts; the legacy account can still be used and re-authorized."}</p>
-    </> : <p className="text-xs text-slate-500">{query.error ? localizeBackendErrorMessage(query.error, isZh) : (isZh ? "读取账号池…" : "Loading account pool…")}</p>}
+    : query.data ? <ProviderUsageFooter provider={provider} claudeAccount={query.data.accounts.length === 1 ? query.data.accounts[0] : undefined} />
+    : <p className="text-xs text-slate-500">{query.error ? localizeBackendErrorMessage(query.error, isZh) : (isZh ? "读取账号池…" : "Loading account pool…")}</p>}
     {refresh.error && <p role="alert" className="text-xs text-red-600">
       {isZh ? "用量刷新失败" : "Usage refresh failed"}: {localizeBackendErrorMessage(refresh.error, isZh)}
     </p>}
-    <Button type="button" variant="secondary" onClick={() => setOpen(!open)} aria-expanded={open}>{open ? (isZh ? "收起账号" : "Hide accounts") : (isZh ? "管理账号" : "Manage accounts")}</Button>
+    <div className="flex flex-wrap items-center gap-2">
+      <Button type="button" variant="secondary" onClick={() => setOpen(!open)} aria-expanded={open}>{open ? (isZh ? "收起账号" : "Hide accounts") : (isZh ? "管理账号" : "Manage accounts")}</Button>
+      {query.data && !query.data.config && !open && <span className="text-[11px] text-slate-500" data-claude-add-accounts-hint
+        title={isZh ? "在其中保存账号池调度设置即可添加；当前账号仍可使用和重新授权。" : "Save pool scheduling settings there to add accounts; the current account keeps working and can be re-authorized."}>
+        {isZh ? "去“管理账号”可添加更多账号" : "Add more accounts in Manage accounts"}</span>}
+    </div>
     {open && <ClaudeAccountPoolPanel provider={provider} />}
   </div>;
 }

@@ -18,16 +18,16 @@ const base: ProviderUsage = {
   is_available: true, queried_at: new Date(now).toISOString(),
 };
 
-function render(usage: ProviderUsage, error?: Error, currentProvider: Provider = provider): string {
+function render(usage: ProviderUsage | undefined, error?: Error, currentProvider: Provider = provider, claudeAccount?: ProviderAccountView): string {
   const originalNow = Date.now;
   Date.now = () => now;
   const client = new QueryClient();
   const key = ["provider-usage", currentProvider.id];
-  client.setQueryData(key, usage);
+  if (usage) client.setQueryData(key, usage);
   if (error) client.getQueryCache().find({ queryKey: key })!.setState({ status: "error", error });
   try {
     return renderToStaticMarkup(<QueryClientProvider client={client}><LocaleProvider>
-      <ProviderUsageFooter provider={currentProvider} />
+      <ProviderUsageFooter provider={currentProvider} claudeAccount={claudeAccount} />
     </LocaleProvider></QueryClientProvider>);
   } finally {
     Date.now = originalNow;
@@ -41,7 +41,10 @@ const claudeAccount: ProviderAccountView = {
   status: "connected", status_version: 1, verified_plan: null, identity_verified: true,
   scheduling: "included", daily: null, weekly: null, reserve_usd: null,
   observed_at: now - 8 * 60_000, stale: true, updated_at: "",
-  claude_usage: { windows: [{ name: "five_hour", used_percent: 38, resets_at: "2030-01-01T05:00:00Z" }] },
+  claude_usage: { windows: [
+    { name: "five_hour", used_percent: 38, resets_at: "2030-01-01T05:00:00Z" },
+    { name: "weekly_limit", used_percent: 21, resets_at: "2030-01-05T00:00:00Z" },
+  ] },
 };
 const claudePool: AccountPoolView = {
   kind: "claude_code", provider_id: "claude", config: null, accounts: [claudeAccount],
@@ -50,94 +53,137 @@ const claudePool: AccountPoolView = {
     unknown: 0, disabled: 0, disconnected: 0, auth_required: 0, quota_exhausted: 0, plan_mismatch: 0, plan_unverified: 0 },
 };
 const claudeUsage: ProviderUsage = { ...base, provider_id: "claude", kind: "claude_code_plan", account_pool: claudePool,
-  tiers: claudeAccount.claude_usage!.windows };
+  tiers: claudeAccount.claude_usage!.windows, queried_at: new Date(claudeAccount.observed_at!).toISOString() };
+const withAccount = (account: Partial<ProviderAccountView>): ProviderUsage => ({ ...claudeUsage,
+  account_pool: { ...claudePool, accounts: [{ ...claudeAccount, ...account }] } });
+const headerWindow = (name: string, used_percent: number, observed_at: number, resets_at: string | null = null) =>
+  ({ name, used_percent, resets_at, source: "inference_header" as const, observed_at });
+/** Header freshness label only; rows carry their own reset <time> elements. */
+const freshness = (html: string) => html.match(/<span[^>]*data-claude-freshness="[^"]*"[^>]*>[\s\S]*?<\/span>/)?.[0] ?? "";
+const pad = (value: number) => String(value).padStart(2, "0");
+function localClock(epochMs: number): string {
+  const date = new Date(epochMs);
+  const time = `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
+  return date.toDateString() === new Date(now).toDateString() ? time : `${date.getMonth() + 1}/${date.getDate()} ${time}`;
+}
+const rowOf = (html: string, name: string) => html.split(`data-claude-window="${name}"`)[1]?.split("data-claude-window=")[0] ?? "";
 
-test("Claude singleton freshness uses nested full observation and stale flag, never freshly served queried_at", () => {
+test("Claude singleton time is the older main-window observation and staleness follows the full query", () => {
   const html = render(claudeUsage, undefined, claudeProvider);
-  match(html, /Stale/); match(html, /8m ago/);
-  match(html, /dateTime="2029-12-31T23:52:00.000Z"/);
-  doesNotMatch(html, /Updated|just now|dateTime="2030-01-01T00:00:00.000Z"/);
-  const backendFresh = render({ ...claudeUsage, account_pool: { ...claudePool,
-    accounts: [{ ...claudeAccount, stale: false }],
-  } }, undefined, claudeProvider);
-  match(backendFresh, /Observed/); match(backendFresh, /8m ago/);
-  doesNotMatch(backendFresh, /Stale|Updated|just now/);
-  const backendStale = render({ ...claudeUsage, account_pool: { ...claudePool,
-    accounts: [{ ...claudeAccount, observed_at: now, stale: true }],
-  } }, undefined, claudeProvider);
-  match(backendStale, /Stale/); doesNotMatch(backendStale, /Observed|Updated/);
+  const header = freshness(html);
+  match(header, /data-claude-freshness="stale"/); match(header, />Stale · <time dateTime="2029-12-31T23:52:00.000Z">8m ago<\/time>/);
+  doesNotMatch(html, /Updated|Observed|just now/);
+  const fresh = freshness(render(withAccount({ stale: false }), undefined, claudeProvider));
+  match(fresh, /data-claude-freshness="fresh"/); match(fresh, />8m ago</);
+  doesNotMatch(fresh, /Stale|Updated|Observed/);
+  const failedFull = freshness(render(withAccount({ observed_at: now, stale: true }), undefined, claudeProvider));
+  match(failedFull, /Stale · <time[^>]*>just now</);
+  // Different main-window times: the older one is shown, as the backend's queried_at.
+  const mixed = freshness(render(withAccount({ stale: true, claude_usage: { windows: [
+    headerWindow("five_hour", 38, now - 60_000), headerWindow("weekly_limit", 21, now - 3 * 60_000),
+  ] } }), undefined, claudeProvider));
+  match(mixed, /data-claude-freshness="fresh"/); match(mixed, />3m ago</);
 });
 
-test("Claude full observations age beyond the backend polling interval even if cached stale is false", () => {
+test("Claude full-query windows age beyond 660 seconds even if cached stale is false", () => {
   for (const age of [660_000, 660_001]) {
-    const html = render({ ...claudeUsage, account_pool: { ...claudePool,
-      accounts: [{ ...claudeAccount, observed_at: now - age, stale: false }],
-    } }, undefined, claudeProvider);
-    equal(html.includes("Stale"), age > 660_000);
-    equal(html.includes("Observed"), age <= 660_000);
-    match(html, /11m ago/);
+    const header = freshness(render(withAccount({ observed_at: now - age, stale: false }), undefined, claudeProvider));
+    equal(header.includes("Stale"), age > 660_000);
+    match(header, /11m ago/);
   }
 });
 
-test("Claude singleton missing and invalid full timestamps stay unknown instead of falling back to served time", () => {
+test("Claude missing main windows or invalid times show Stale without inventing a time", () => {
   for (const observed_at of [null, 0, -1, NaN, Infinity, 8_640_000_000_000_001, now + 60_001]) {
-    const html = render({ ...claudeUsage, account_pool: { ...claudePool,
-      accounts: [{ ...claudeAccount, observed_at, stale: false }],
-    } }, undefined, claudeProvider);
-    match(html, /Stale/); match(html, /time unknown/);
-    doesNotMatch(html, /Updated|Observed|just now|NaN|Infinity|Invalid Date|dateTime=/);
+    const html = render(withAccount({ observed_at, stale: false }), undefined, claudeProvider);
+    const header = freshness(html);
+    match(header, />Stale</);
+    doesNotMatch(header, /<time|ago|just now/);
+    doesNotMatch(html, /Updated|Observed|NaN|Infinity|Invalid Date/);
   }
+  for (const windows of [[], [claudeAccount.claude_usage!.windows[0]], [claudeAccount.claude_usage!.windows[1]]]) {
+    const header = freshness(render(withAccount({ observed_at: now, stale: false, claude_usage: { windows } }), undefined, claudeProvider));
+    match(header, />Stale</); doesNotMatch(header, /<time/);
+  }
+  // Without a usable account the response tiers and backend observation time are used.
   for (const account_pool of [undefined, null, { ...claudePool, accounts: [] },
     { ...claudePool, accounts: [claudeAccount, { ...claudeAccount, account_id: "other" }] }]) {
     const html = render({ ...claudeUsage, account_pool }, undefined, claudeProvider);
-    match(html, /Stale/); match(html, /time unknown/);
-    doesNotMatch(html, /Updated|just now/);
+    match(freshness(html), /data-claude-freshness="fresh"[^>]*>[\s\S]*>8m ago</);
+    equal((html.match(/role="progressbar"/g) ?? []).length, 2);
+    doesNotMatch(html, /data-claude-source|Full query|From chat responses/);
+    const unknown = freshness(render({ ...claudeUsage, account_pool, queried_at: "" }, undefined, claudeProvider));
+    match(unknown, />Stale</); doesNotMatch(unknown, /<time/);
   }
 });
 
-test("Claude singleton partial data never refreshes full freshness or replaces full tier bars", () => {
-  for (const observed_at of [now, claudeAccount.observed_at! - 60_000]) {
-    const html = render({ ...claudeUsage, account_pool: { ...claudePool, accounts: [{ ...claudeAccount,
-      claude_quota_observation: { windows: [{ name: "five_hour", used_percent: null, status: "rejected",
-        resets_at: "2030-01-01T06:00:00Z", observed_at, source: "inference_header" }] },
-    }] } }, undefined, claudeProvider);
-    match(html, /Stale/); match(html, /8m ago/);
-    match(html, /Inference response quota \(partial\)/); match(html, /inference_header/);
-    match(html, /Status: rejected/); match(html, /Usage percentage unknown/);
-    match(html, /aria-valuenow="38"/);
-    equal((html.match(/role="progressbar"/g) ?? []).length, 1);
-    doesNotMatch(html, /aria-valuenow="0"|aria-valuenow="100"|Updated/);
-    if (observed_at < claudeAccount.observed_at!) match(html, /Older than the full usage snapshot/);
-  }
-  const failed = render({ ...claudeUsage, account_pool: { ...claudePool,
-    accounts: [{ ...claudeAccount, observed_at: now, stale: false }],
-  } }, new Error("Claude upstream refresh failed"), claudeProvider);
-  match(failed, /Usage query failed: Claude upstream refresh failed/); match(failed, /Stale/);
-  doesNotMatch(failed, /Updated|Observed/);
+test("Claude response-header main windows stay fresh when the full query is stale and name their source on hover", () => {
+  const html = render(withAccount({ stale: true, observed_at: now - 30 * 60_000, claude_usage: { windows: [
+    headerWindow("five_hour", 82.5, now - 2 * 60_000, "2030-01-01T05:00:00Z"),
+    headerWindow("weekly_limit", 21, now - 60_000, "2030-01-05T00:00:00Z"),
+    { name: "feature:sonnet:weekly_limit", used_percent: 4, resets_at: null },
+  ] } }), undefined, claudeProvider);
+  match(freshness(html), /data-claude-freshness="fresh"/); match(freshness(html), />2m ago</);
+  const five = rowOf(html, "five_hour");
+  match(five, new RegExp(`title="From chat responses · ${localClock(now - 2 * 60_000)}"`));
+  match(five, /aria-valuenow="82.5"/); match(five, />82.5%</);
+  match(rowOf(html, "feature:sonnet:weekly_limit"), new RegExp(`title="Full query · ${localClock(now - 30 * 60_000)}"`));
+  equal((html.match(/data-claude-window=/g) ?? []).length, 3);
+  equal((html.match(/role="progressbar"/g) ?? []).length, 3);
+  doesNotMatch(html, /data-claude-quota-observation|\(partial\)|Status:|Source:|inference_header<|Older than|Newer than|aria-valuenow="38"/);
 });
 
-test("local passive polling cannot advance full freshness or outrank a newer footer snapshot", (t) => {
-  t.mock.method(Date, "now", () => now);
-  const client = new QueryClient();
-  client.setQueryData(["provider-usage", "claude"], { ...claudeUsage, account_pool: { ...claudePool,
-    accounts: [{ ...claudeAccount, observed_at: now - 60_000, stale: true }],
-  } });
-  try {
-    for (const observed_at of [now - 3 * 60_000, now]) {
-      const localAccount = { ...claudeAccount, stale: false, observed_at,
-        claude_quota_observation: { windows: [{ name: "five_hour", used_percent: 5, status: "allowed", resets_at: null,
-          observed_at: now - 2 * 60_000, source: "inference_header" as const }] },
-      };
-      const html = renderToStaticMarkup(<QueryClientProvider client={client}><LocaleProvider>
-        <ProviderUsageFooter provider={claudeProvider} claudeAccount={localAccount} />
-      </LocaleProvider></QueryClientProvider>);
-      match(html, /Stale/); match(html, /1m ago/);
-      match(html, /Older than the full usage snapshot/);
-      match(html, /Used 5.0%/); match(html, /aria-valuenow="38"/);
-      equal((html.match(/role="progressbar"/g) ?? []).length, 1);
-      doesNotMatch(html, /Updated|just now|3m ago|aria-valuenow="5"/);
-    }
-  } finally { client.clear(); }
+test("Claude footer marks only stale model windows; stale or expired main windows switch the header to Stale", () => {
+  const fresh = render(withAccount({ stale: false, observed_at: now - 60_000, claude_usage: { windows: [
+    ...claudeAccount.claude_usage!.windows,
+    headerWindow("feature:fable:weekly_limit", 6, now - 20 * 60_000),
+  ] } }), undefined, claudeProvider);
+  match(freshness(fresh), /data-claude-freshness="fresh"/);
+  equal((fresh.match(/data-claude-stale-mark/g) ?? []).length, 1);
+  match(rowOf(fresh, "feature:fable:weekly_limit"), /data-claude-stale-mark[^>]*>Stale</);
+  const staleWeekly = render(withAccount({ stale: true, claude_usage: { windows: [
+    headerWindow("five_hour", 38, now - 60_000), headerWindow("weekly_limit", 21, now - 20 * 60_000),
+  ] } }), undefined, claudeProvider);
+  match(freshness(staleWeekly), />Stale · <time[^>]*>20m ago</);
+  doesNotMatch(staleWeekly, /data-claude-stale-mark/);
+  const expired = render(withAccount({ stale: false, observed_at: now - 60_000, claude_usage: { windows: [
+    { name: "five_hour", used_percent: 64, resets_at: new Date(now - 1).toISOString() },
+    claudeAccount.claude_usage!.windows[1],
+  ] } }), undefined, claudeProvider);
+  match(freshness(expired), />Stale · /);
+  match(rowOf(expired, "five_hour"), />64%</);
+  doesNotMatch(rowOf(expired, "five_hour"), /progressbar|>0%</);
+  equal((expired.match(/role="progressbar"/g) ?? []).length, 1);
+});
+
+test("a failed Claude usage query stays visible, marks full-query windows stale and keeps fresher header windows", () => {
+  const failed = render(withAccount({ observed_at: now, stale: false }), new Error("Claude upstream refresh failed"), claudeProvider);
+  match(failed, /role="alert"[\s\S]*Usage query failed: Claude upstream refresh failed/);
+  match(freshness(failed), />Stale · /);
+  const headers = render(withAccount({ stale: false, claude_usage: { windows: [
+    headerWindow("five_hour", 38, now - 60_000), headerWindow("weekly_limit", 21, now - 60_000),
+  ] } }), new Error("Claude upstream refresh failed"), claudeProvider);
+  match(headers, /Usage query failed: Claude upstream refresh failed/);
+  match(freshness(headers), /data-claude-freshness="fresh"[^>]*>[\s\S]*>1m ago</);
+});
+
+test("Claude footer shows the more recent of the local pool read and the nested usage read", () => {
+  const nested = withAccount({ observed_at: now - 60_000, stale: false });
+  const reads: [ProviderAccountView, string][] = [
+    [{ ...claudeAccount, observed_at: now - 3 * 60_000, stale: false }, "1m ago"],
+    [{ ...claudeAccount, observed_at: now, stale: false }, "just now"],
+    [{ ...claudeAccount, observed_at: now - 3 * 60_000, stale: true, claude_usage: { windows: [
+      headerWindow("five_hour", 5, now), headerWindow("weekly_limit", 6, now),
+    ] } }, "just now"],
+  ];
+  for (const [local, expected] of reads) {
+    const html = render(nested, undefined, claudeProvider, local);
+    match(freshness(html), new RegExp(`data-claude-freshness="fresh"[^>]*>[\\s\\S]*>${expected}<`));
+  }
+  // Before the usage query has data, the local account still renders compact rows.
+  const localOnly = render(undefined, undefined, claudeProvider, { ...claudeAccount, observed_at: now, stale: false });
+  equal((localOnly.match(/data-claude-window=/g) ?? []).length, 2);
+  match(freshness(localOnly), />just now</);
 });
 
 test("Claude footer and folded group do not retry a failed usage attempt into cooldown-cache success", async () => {

@@ -201,8 +201,9 @@ async fn start_upstream_with_quota(quota_headers: bool) -> (String, Arc<Mutex<Ve
                     )
                 };
                 let response = if quota_headers {
-                    let reset = chrono::Utc::now().timestamp() + 3600;
-                    response.replacen("\r\n\r\n", &format!("\r\nanthropic-ratelimit-unified-5h-utilization: 0.63\r\nanthropic-ratelimit-unified-5h-status: allowed_warning\r\nanthropic-ratelimit-unified-5h-reset: {reset}\r\nanthropic-ratelimit-unified-7d-status: allowed\r\n\r\n"), 1)
+                    // The mocked full snapshot uses far-future resets; omit the
+                    // header reset so both describe the same quota cycle.
+                    response.replacen("\r\n\r\n", "\r\nanthropic-ratelimit-unified-5h-utilization: 0.63\r\nanthropic-ratelimit-unified-5h-status: allowed_warning\r\nanthropic-ratelimit-unified-7d-status: allowed\r\n\r\n", 1)
                 } else {
                     response
                 };
@@ -1012,9 +1013,13 @@ async fn inference_quota_headers_update_selected_account_without_usage_query() {
                     .find(|a| a.account_id == selected.account_id)
                     .unwrap();
                 let public = serde_json::to_value(selected_view).unwrap();
-                let windows = public["claude_quota_observation"]["windows"]
-                    .as_array()
-                    .unwrap();
+                assert!(
+                    public.get("claude_quota_observation").is_none(),
+                    "no duplicate block"
+                );
+                // The header replaces the five-hour value in place; a status-only
+                // weekly header leaves the full-query percentage untouched.
+                let windows = public["claude_usage"]["windows"].as_array().unwrap();
                 let five = windows.iter().find(|w| w["name"] == "five_hour").unwrap();
                 assert_eq!(five["used_percent"], 63.0);
                 assert_eq!(five["source"], "inference_header");
@@ -1022,25 +1027,48 @@ async fn inference_quota_headers_update_selected_account_without_usage_query() {
                     .iter()
                     .find(|w| w["name"] == "weekly_limit")
                     .unwrap();
-                assert!(week["used_percent"].is_null(), "status is not a percentage");
-                assert_eq!(week["status"], "allowed");
+                assert_eq!(week["used_percent"], 18.0, "status is not a percentage");
+                assert_eq!(week["source"], "usage_api");
                 for account in &after.accounts {
                     let old = before
                         .accounts
                         .iter()
                         .find(|a| a.account_id == account.account_id)
                         .unwrap();
+                    // The full query itself did not advance.
                     assert_eq!(account.observed_at, old.observed_at);
-                    assert_eq!(account.claude_usage, old.claude_usage);
                     assert_eq!(account.stale, old.stale);
                     if account.account_id != selected.account_id {
-                        assert!(
-                            serde_json::to_value(account)
-                                .unwrap()
-                                .get("claude_quota_observation")
-                                .is_none()
-                        );
+                        assert_eq!(account.claude_usage, old.claude_usage, "no sibling update");
                     }
+                }
+                let five_hour_pool = after
+                    .quota
+                    .claude_windows
+                    .iter()
+                    .find(|w| w.name == "five_hour")
+                    .unwrap();
+                // Pool totals use the same effective window (Max 20x five-hour
+                // weight 20). The second pooled account shares the upstream
+                // identity's query gate, so it still has no usage of its own.
+                let quota = &five_hour_pool.quota;
+                assert_eq!(quota.known_accounts, 1, "{quota:?}");
+                assert!(
+                    (quota.known_remaining_units - 0.37 * 20.0).abs() < 1e-9,
+                    "{quota:?}"
+                );
+                if !pooled {
+                    assert!(
+                        quota
+                            .used_percent
+                            .is_some_and(|used| (used - 63.0).abs() < 1e-9)
+                    );
+                }
+                if !pooled {
+                    // The cooldown serves the cached view, now carrying the header value.
+                    let report = gw.admin().get_provider_usage(&id).await.unwrap();
+                    assert_eq!(report.tiers[0].name, "five_hour");
+                    assert_eq!(report.tiers[0].used_percent, 63.0);
                 }
                 assert_eq!(
                     captured
@@ -1051,7 +1079,7 @@ async fn inference_quota_headers_update_selected_account_without_usage_query() {
                         .count(),
                     usage_before
                 );
-                assert!(!public.to_string().contains("passive_usage_order"));
+                assert!(!public.to_string().contains("passive_usage"));
             }
         }
     }

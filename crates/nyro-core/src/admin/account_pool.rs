@@ -111,12 +111,11 @@ pub struct ProviderAccountView {
     pub reserve_usd: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub kiro_usage: Option<KiroUsage>,
+    /// Claude: effective windows. Each window carries `source` (`usage_api` or a
+    /// newer same-cycle `inference_header`) and its own `observed_at`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub claude_usage: Option<ClaudeUsage>,
-    /// Partial inference-header evidence, never an authoritative full usage refresh.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub claude_quota_observation:
-        Option<crate::provider::anthropic::claude_code::quota_observation::ClaudeQuotaObservation>,
+    /// Claude: time of the last full usage query, not of header observations.
     pub observed_at: Option<i64>,
     /// Mandatory Claude usage admission deadline; not an observation timestamp.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -378,7 +377,6 @@ fn safe_account(
         reserve_usd: state.usage.as_ref().and_then(|u| u.overage_usd),
         kiro_usage: None,
         claude_usage: None,
-        claude_quota_observation: None,
         usage_refresh_available_at: None,
         observed_at: state.observed_at,
         stale: is_stale(&state),
