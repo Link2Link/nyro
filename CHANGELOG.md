@@ -10,12 +10,12 @@ All notable changes to Nyro will be documented in this file.
 
 #### Improvements
 
-- **Merged Claude usage windows**: inference-header quota observations now update the five-hour and weekly rows directly instead of appearing in a separate partial block. A header value replaces the full-query value only when it is newer and belongs to the same or a later quota cycle; older-cycle values and status-only headers never replace percentages. Every window reports its `source` (`usage_api` or `inference_header`) and its own `observed_at`; model-specific windows and the plan still come from full queries. Pool weighted totals and singleton provider tiers use the same effective windows with per-window freshness, and `queried_at` reflects the older of the two primary windows.
-- **Concise Claude provider cards**: one row per window (name, progress bar, percentage, short reset time), one freshness line in the header, source and observation time in tooltips, a short stale mark only where needed, and long refresh-policy paragraphs moved into button tooltips or a collapsible line. The account panel shows a single “next refresh” line only while cooling down.
+- **Merged Claude usage windows** (#29): inference-header quota observations now update the five-hour and weekly rows directly instead of appearing in a separate partial block. A header value replaces the full-query value only when it is newer and belongs to the same or a later quota cycle; older-cycle values and status-only headers never replace percentages. Every window reports its `source` (`usage_api` or `inference_header`) and its own `observed_at`; model-specific windows and the plan still come from full queries. Pool weighted totals and singleton provider tiers use the same effective windows with per-window freshness, and `queried_at` reflects the older of the two primary windows.
+- **Concise Claude provider cards** (#29): one row per window (name, progress bar, percentage, short reset time), one freshness line in the header, source and observation time in tooltips, a short stale mark only where needed, and long refresh-policy paragraphs moved into button tooltips or a collapsible line. The account panel shows a single “next refresh” line only while cooling down.
 
 #### Fixes
 
-- **Header evidence only tightens scheduling**: a newer same-cycle header reporting `rejected` or 100% usage pauses the account until that window resets or a newer full query supersedes it. A header never relaxes an exhausted full snapshot, and routing weights still use full queries.
+- **Header evidence only tightens scheduling** (#29): a newer same-cycle header reporting `rejected` or 100% usage pauses the account until that window resets or a newer full query supersedes it. A header never relaxes an exhausted full snapshot, and routing weights still use full queries.
 
 #### Compatibility
 
