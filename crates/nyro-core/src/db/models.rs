@@ -1674,6 +1674,9 @@ pub struct ModelApiKeyUsageStats {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TestResult {
     pub success: bool,
+    /// No current connectivity verdict when all eligible accounts are deferred.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skipped_reason: Option<String>,
     pub latency_ms: u64,
     pub model: Option<String>,
     pub error: Option<String>,
@@ -1692,6 +1695,9 @@ pub struct AccountTestResult {
     pub latency_ms: u64,
     pub error: Option<String>,
     pub skipped_reason: Option<String>,
+    /// Earliest permitted new probe in epoch milliseconds; not a successful check.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_at: Option<i64>,
     pub tested_at: String,
 }
 

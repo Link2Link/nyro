@@ -9,7 +9,7 @@ import { copyToClipboard } from "@/lib/utils";
 import { providerUsageSupported } from "@/lib/provider-usage";
 import { OAuthProgress, OAuthSessionRemaining, OAuthSessionError, DevinLoginNotice, KiroLoginNotice } from "@/components/oauth-session-status";
 import { localizeBackendErrorMessage } from "@/lib/backend-error";
-import { formatAccountTestLogs, formatProviderModelListLog, normalizeCachedProviderTestResult, providerTestError } from "@/lib/provider-test";
+import { formatAccountTestLogs, formatProviderModelListLog, formatProviderTestSkip, isProviderTestSkipped, mergeProviderTestVerdict, normalizeCachedProviderTestResult, providerTestError, providerTestStatus } from "@/lib/provider-test";
 import { invalidateModelRatings } from "@/lib/use-model-ratings";
 import type {
   Provider,
@@ -887,7 +887,7 @@ function loadProviderTestResults(): Record<string, TestResult> {
     const normalized: Record<string, TestResult> = {};
     for (const [id, value] of Object.entries(parsed)) {
       const result = normalizeCachedProviderTestResult(value);
-      if (result) normalized[id] = result;
+      if (result && !isProviderTestSkipped(result)) normalized[id] = result;
     }
     return normalized;
   } catch {
@@ -928,6 +928,8 @@ export default function ProvidersPage() {
   const [modelProbeResults, setModelProbeResults] =
     useState<Record<string, ProviderModelProbeRecord>>(loadModelProbeResults);
   const [testResult, setTestResult] = useState<Record<string, TestResult>>(loadProviderTestResults);
+  // Current runs can be skipped/incomplete without overwriting the persisted verdict.
+  const [currentTestResult, setCurrentTestResult] = useState<Record<string, TestResult>>({});
   const [testDialogOpen, setTestDialogOpen] = useState(false);
   const [testLogs, setTestLogs] = useState<TestLogEntry[]>([]);
   const [isTestRunning, setIsTestRunning] = useState(false);
@@ -1330,22 +1332,24 @@ export default function ProvidersPage() {
     setTestLogs([]);
     setTestDialogOpen(true);
     setIsTestRunning(true);
-    setTestResult((prev) => {
+    setCurrentTestResult((prev) => {
       const next = { ...prev };
       delete next[provider.id];
       return next;
     });
 
     let connectivityResult: TestResult | undefined;
-    const finish = (result: TestResult, finalMessage: string, level: "success" | "error") => {
+    const finish = (result: TestResult, finalMessage: string, level: "info" | "success" | "error") => {
       if (isCanceled()) return;
       appendTestLog(level, finalMessage);
       // Preserve per-account diagnostics in every outcome, including a later catalog error.
-      setTestResult((prev) => ({ ...prev, [provider.id]: {
+      const completed = {
         ...result,
         endpoints: connectivityResult?.endpoints,
         accounts: connectivityResult?.accounts,
-      } }));
+      };
+      setCurrentTestResult((prev) => ({ ...prev, [provider.id]: completed }));
+      setTestResult((prev) => mergeProviderTestVerdict(prev, provider.id, completed));
       void qc.invalidateQueries({ queryKey: ["providers"] });
       setIsTestRunning(false);
       setTestingId(null);
@@ -1390,6 +1394,11 @@ export default function ProvidersPage() {
       formatAccountTestLogs(connectivity.accounts, isZh).forEach(({ level, message }) => {
         appendTestLog(level, message);
       });
+
+      if (isProviderTestSkipped(connectivity)) {
+        finish(connectivity, formatProviderTestSkip(connectivity, isZh), "info");
+        return; // A skip is not a successful connectivity check; do not discover models.
+      }
 
       if (!connectivity.success) {
         const reason = providerTestError(connectivity.error, isZh);
@@ -2791,7 +2800,7 @@ export default function ProvidersPage() {
             const editing = group.providers.some((p) => p.id === editingId);
             const standalone = isStandaloneGroup(group);
             const expanded = standalone || searchingProviders || editing || isGroupExpanded(group, expandedGroups);
-            const issues = group.providers.filter((p) => providerNeedsAttention(p, testResult[p.id]));
+            const issues = group.providers.filter((p) => providerNeedsAttention(p, currentTestResult[p.id], testResult[p.id]));
             const rows = group.providers.filter((p) => group.matches.includes(p) || p.id === editingId);
             return <ProviderGroup key={group.key} group={group} expanded={expanded} standalone={standalone}
               summary={<GroupUsageSummary providers={group.providers} />} searching={searchingProviders}
@@ -2799,9 +2808,9 @@ export default function ProvidersPage() {
               onToggle={() => setExpandedGroups((current) => ({ ...current, [group.key]: !expanded }))}
               onShowIssues={() => { if (issues[0]) revealProvider(issues[0]); }}>
           {rows.map((p) => {
-            const tr = testResult[p.id];
+            const tr = currentTestResult[p.id] ?? testResult[p.id];
             const status = tr
-              ? (tr.success ? "success" : "failed")
+              ? providerTestStatus(tr)
               : p.last_test_success === true
                 ? "success"
                 : p.last_test_success === false
@@ -4120,7 +4129,9 @@ export default function ProvidersPage() {
                             {isZh ? "已禁用" : "Disabled"}
                           </Badge>
                         )}
-                        {status === "success" ? (
+                        {status === "skipped" && tr ? (
+                          <span className="text-xs text-slate-500">{formatProviderTestSkip(tr, isZh)}</span>
+                        ) : status === "success" ? (
                           <CheckCircle
                             className="h-3.5 w-3.5 text-green-500"
                             aria-label={isZh ? "最近测试成功" : "Last test passed"}

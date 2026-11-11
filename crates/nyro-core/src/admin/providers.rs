@@ -2417,6 +2417,7 @@ impl AdminService {
                 error: Some("Base URL is empty".to_string()),
                 endpoints: Vec::new(),
                 accounts: Vec::new(),
+                skipped_reason: None,
             }
         } else {
             let mut failures: Vec<String> = Vec::new();
@@ -2451,6 +2452,7 @@ impl AdminService {
                     error: None,
                     endpoints: Vec::new(),
                     accounts: Vec::new(),
+                    skipped_reason: None,
                 }
             } else {
                 TestResult {
@@ -2463,6 +2465,7 @@ impl AdminService {
                     )),
                     endpoints: Vec::new(),
                     accounts: Vec::new(),
+                    skipped_reason: None,
                 }
             }
         };
@@ -2490,6 +2493,7 @@ impl AdminService {
                 error: Some("Adaptive provider has no enabled protocol endpoints".to_string()),
                 endpoints: Vec::new(),
                 accounts: Vec::new(),
+                skipped_reason: None,
             });
         }
 
@@ -2541,6 +2545,7 @@ impl AdminService {
             }),
             endpoints: endpoint_results,
             accounts: Vec::new(),
+            skipped_reason: None,
         })
     }
 
@@ -3354,6 +3359,17 @@ impl AdminService {
         provider_id: &str,
         result: &TestResult,
     ) -> anyhow::Result<()> {
+        // A deferred account is not new failure evidence. Preserve the prior
+        // verdict if cooldown prevented a full negative pool assessment.
+        if result.skipped_reason.is_some()
+            || (!result.success
+                && result
+                    .accounts
+                    .iter()
+                    .any(|account| account.skipped_reason.as_deref() == Some("usage_cooldown")))
+        {
+            return Ok(());
+        }
         self.gw
             .storage
             .providers()

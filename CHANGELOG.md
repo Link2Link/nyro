@@ -4,6 +4,18 @@ All notable changes to Nyro will be documented in this file.
 
 ---
 
+## v2.1.38
+
+> Released on 2026-11-11
+
+#### Fixes
+
+- **Claude connectivity checks during usage cooldown** (#27): report accounts blocked by the mandatory ten-minute usage gate as skipped, with a retry deadline, rather than as failed account/network checks. If no account was tested, the overall result is neutral with no error; it never claims a cached successful probe. Cooldown is checked before token/runtime work, and a concurrent admission denial is handled the same way. The ten-minute limit, real HTTP/authentication error handling and normal inference remain unchanged.
+- **Preserved test verdicts and clear UI feedback** (#27): skipped checks and incomplete negative pool checks with cooling-down accounts no longer overwrite the previous provider test verdict/time or browser cache. The bilingual UI shows skipped accounts and retry times, counts them separately from tested failures, and stops before model discovery when no connectivity test ran. Actual mixed-account failures stay visible; a genuinely successful tested account can still establish pool connectivity. Legacy unstructured failure records are not guessed or rewritten.
+- **Regression coverage** (#27): added backend aggregation/serialization checks, real SQLite public-API tests for three skipped accounts, unchanged credentials/quota state/deadlines, mixed real 401 failures and later 200 success, plus frontend status, cache, attention and page-flow tests. No database migration or automatic deployment is included.
+
+---
+
 ## v2.1.37
 
 > Released on 2026-11-11
