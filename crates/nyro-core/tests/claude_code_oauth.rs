@@ -50,6 +50,10 @@ impl Captured {
 /// Anthropic fixture: answers with a `tool_use` that calls the first declared
 /// tool by whatever (aliased) name the request used.
 async fn start_upstream() -> (String, Arc<Mutex<Vec<Captured>>>) {
+    start_upstream_with_quota(false).await
+}
+
+async fn start_upstream_with_quota(quota_headers: bool) -> (String, Arc<Mutex<Vec<Captured>>>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     let captured = Arc::new(Mutex::new(Vec::new()));
@@ -195,6 +199,12 @@ async fn start_upstream() -> (String, Arc<Mutex<Vec<Captured>>>) {
                         "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{message}",
                         message.len()
                     )
+                };
+                let response = if quota_headers {
+                    let reset = chrono::Utc::now().timestamp() + 3600;
+                    response.replacen("\r\n\r\n", &format!("\r\nanthropic-ratelimit-unified-5h-utilization: 0.63\r\nanthropic-ratelimit-unified-5h-status: allowed_warning\r\nanthropic-ratelimit-unified-5h-reset: {reset}\r\nanthropic-ratelimit-unified-7d-status: allowed\r\n\r\n"), 1)
+                } else {
+                    response
                 };
                 let _ = socket.write_all(response.as_bytes()).await;
                 let _ = socket.shutdown().await;
@@ -832,6 +842,219 @@ async fn openai_client_through_ir_gets_original_tool_names_back() {
     assert!(cch::verify_body(&request.raw_body));
     assert!(wire.contains("\"get_weather\""), "{wire}");
     assert!(!wire.contains("mcp__"), "{wire}");
+}
+
+fn cache_markers(body: &Value) -> Vec<&Value> {
+    let mut markers = Vec::new();
+    for section in ["tools", "system"] {
+        if let Some(blocks) = body.get(section).and_then(Value::as_array) {
+            markers.extend(blocks.iter().filter_map(|block| block.get("cache_control")));
+        }
+    }
+    if let Some(messages) = body.get("messages").and_then(Value::as_array) {
+        for message in messages {
+            if let Some(blocks) = message.get("content").and_then(Value::as_array) {
+                markers.extend(blocks.iter().filter_map(|block| block.get("cache_control")));
+            }
+        }
+    }
+    if let Some(marker) = body.get("cache_control") {
+        markers.push(marker);
+    }
+    markers
+}
+
+#[tokio::test]
+async fn cloaked_top_level_cache_is_normalized_on_single_and_tool_result_turns() {
+    for streaming in [false, true] {
+        for continuation in [false, true] {
+            let (url, captured) = start_upstream().await;
+            let (_dir, gw) = setup(&url).await;
+            let mut body = json!({
+                "model": MODEL, "max_tokens": 128, "stream": streaming,
+                "cache_control": {"type":"ephemeral","ttl":"1h"},
+                "system": [{"type":"text","text":"Keep the caller instructions."}],
+                "tools": [{"name":"bash","input_schema":{"type":"object"}}],
+                "messages": [{"role":"user","content":"list files"}]
+            });
+            if continuation {
+                body["messages"].as_array_mut().unwrap().extend([
+                    json!({"role":"assistant","content":[{"type":"tool_use","id":"tool_1","name":"bash","input":{}}]}),
+                    json!({"role":"user","content":[{"type":"tool_result","tool_use_id":"tool_1","content":"file.txt"}]}),
+                ]);
+                body["thread"] = json!({"type":"create"});
+            }
+            let (status, wire) = dispatch(
+                &gw,
+                ANTHROPIC_MESSAGES_2023_06_01,
+                "/v1/messages",
+                HeaderMap::new(),
+                body,
+            )
+            .await;
+            assert_eq!(status, 200, "{wire}");
+            let request = only_request(&captured);
+            assert_eq!(
+                request.header("x-stainless-package-version"),
+                Some("0.128.0")
+            );
+            assert_eq!(
+                request.header("x-stainless-runtime-version"),
+                Some("v26.12.1")
+            );
+            let sent = request.body();
+            assert!(sent.get("cache_control").is_none(), "{sent}");
+            let markers = cache_markers(&sent);
+            assert!(!markers.is_empty());
+            assert!(markers.len() <= if continuation { 3 } else { 4 }, "{sent}");
+            assert!(markers.iter().all(|marker| marker["ttl"] == "1h"), "{sent}");
+            let betas = request.header("anthropic-beta").unwrap();
+            assert!(betas.contains("extended-cache-ttl-2025-04-11"), "{betas}");
+            if continuation {
+                assert!(betas.contains("message-threads-2026-08-12"), "{betas}");
+                assert!(sent["messages"].as_array().unwrap().iter().any(|message| {
+                    message["content"].as_array().is_some_and(|blocks| {
+                        blocks.iter().any(|block| {
+                            block["type"] == "tool_result" && block["content"] == "file.txt"
+                        })
+                    })
+                }));
+            }
+            assert!(cch::verify_body(&request.raw_body));
+        }
+    }
+}
+
+#[tokio::test]
+async fn explicit_invalid_cache_is_rejected_locally_without_upstream_retry() {
+    for streaming in [false, true] {
+        let (url, captured) = start_upstream().await;
+        // Multiple eligible accounts must not turn a local request error into failover.
+        let (_dir, gw, _) = setup_pool(&url, "pool-selected", 2).await;
+        let body = json!({
+            "model": MODEL, "max_tokens": 128, "stream": streaming,
+            "prompt_cache_options": {"mode":"explicit"},
+            "cache_control": {"type":"ephemeral","ttl":"30m"},
+            "messages": [{"role":"user","content":"private-request-text"}]
+        });
+        let (status, wire) = dispatch(
+            &gw,
+            ANTHROPIC_MESSAGES_2023_06_01,
+            "/v1/messages",
+            HeaderMap::new(),
+            body,
+        )
+        .await;
+        assert_eq!(status, 400, "{wire}");
+        assert!(wire.contains("cache_control"), "{wire}");
+        assert!(
+            !wire.contains("private-request-text") && !wire.contains("sk-ant-oat"),
+            "{wire}"
+        );
+        assert!(
+            captured
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|request| !request.line.starts_with("POST /v1/messages"))
+        );
+    }
+}
+
+#[tokio::test]
+async fn inference_quota_headers_update_selected_account_without_usage_query() {
+    for pooled in [false, true] {
+        for streaming in [false, true] {
+            for ingress in [
+                ANTHROPIC_MESSAGES_2023_06_01,
+                OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1,
+            ] {
+                let (url, captured) = start_upstream_with_quota(true).await;
+                let (_dir, gw, id) = if pooled {
+                    setup_pool(&url, "pool-selected", 2).await
+                } else {
+                    let (dir, gw) = setup(&url).await;
+                    let id = provider_id(&gw).await;
+                    (dir, gw, id)
+                };
+                // Warm the full snapshot and durable gate before inference. Headers
+                // must update independently without advancing that full observation.
+                gw.admin().get_provider_usage(&id).await.unwrap();
+                let before = gw.admin().get_provider_account_pool(&id).await.unwrap();
+                let usage_before = captured
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|r| r.line.starts_with("GET /api/oauth/usage "))
+                    .count();
+                let (status, wire) = dispatch(&gw, ingress, "/v1/messages", HeaderMap::new(), json!({
+                    "model":MODEL,"max_tokens":64,"stream":streaming,"messages":[{"role":"user","content":"hello"}]
+                })).await;
+                assert_eq!(status, 200, "{wire}");
+                let request = only_request(&captured);
+                let accounts = gw
+                    .storage
+                    .oauth_credentials()
+                    .list_accounts(&id)
+                    .await
+                    .unwrap();
+                let selected = accounts
+                    .iter()
+                    .find(|a| {
+                        request.header("authorization")
+                            == Some(format!("Bearer {}", a.access_token).as_str())
+                    })
+                    .unwrap();
+                let after = gw.admin().get_provider_account_pool(&id).await.unwrap();
+                let selected_view = after
+                    .accounts
+                    .iter()
+                    .find(|a| a.account_id == selected.account_id)
+                    .unwrap();
+                let public = serde_json::to_value(selected_view).unwrap();
+                let windows = public["claude_quota_observation"]["windows"]
+                    .as_array()
+                    .unwrap();
+                let five = windows.iter().find(|w| w["name"] == "five_hour").unwrap();
+                assert_eq!(five["used_percent"], 63.0);
+                assert_eq!(five["source"], "inference_header");
+                let week = windows
+                    .iter()
+                    .find(|w| w["name"] == "weekly_limit")
+                    .unwrap();
+                assert!(week["used_percent"].is_null(), "status is not a percentage");
+                assert_eq!(week["status"], "allowed");
+                for account in &after.accounts {
+                    let old = before
+                        .accounts
+                        .iter()
+                        .find(|a| a.account_id == account.account_id)
+                        .unwrap();
+                    assert_eq!(account.observed_at, old.observed_at);
+                    assert_eq!(account.claude_usage, old.claude_usage);
+                    assert_eq!(account.stale, old.stale);
+                    if account.account_id != selected.account_id {
+                        assert!(
+                            serde_json::to_value(account)
+                                .unwrap()
+                                .get("claude_quota_observation")
+                                .is_none()
+                        );
+                    }
+                }
+                assert_eq!(
+                    captured
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .filter(|r| r.line.starts_with("GET /api/oauth/usage "))
+                        .count(),
+                    usage_before
+                );
+                assert!(!public.to_string().contains("passive_usage_order"));
+            }
+        }
+    }
 }
 
 async fn setup_pool(

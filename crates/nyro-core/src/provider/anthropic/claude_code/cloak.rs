@@ -1,7 +1,7 @@
 //! Request-body rewriting for the Claude Code OAuth channel.
 //!
 //! A caller that is not genuine Claude Code is "cloaked" into the measured
-//! Claude Code 2.1.280 Messages shape with the generated CLI identity from
+//! Claude Code Messages shape with the generated CLI identity from
 //! `profile` before it reaches Anthropic with the subscription token.
 //! Ported from CLIProxyAPI `applyCloakingInternal` and the
 //! surrounding body steps of `ClaudeExecutor.Execute`:
@@ -42,6 +42,14 @@ fn ephemeral() -> Value {
 fn text_block(text: &str, cache: bool) -> Value {
     let mut block = json!({"type": "text", "text": text});
     if cache {
+        block["cache_control"] = ephemeral();
+    }
+    block
+}
+
+/// Add only synthetic defaults; never replace a caller marker or its TTL.
+fn with_default_cache(mut block: Value, auto_cache: bool) -> Value {
+    if auto_cache && block.get("cache_control").is_none_or(Value::is_null) {
         block["cache_control"] = ephemeral();
     }
     block
@@ -200,12 +208,15 @@ pub(crate) fn fallback_billing_header(body: &Value, entrypoint: &str, subagent: 
 
 /// Collect the caller's system text, dropping Claude Code attribution and
 /// identity blocks. Non-text blocks cannot live in any system slot.
-fn collect_caller_system(system: Option<&Value>) -> Result<Vec<String>, String> {
+fn collect_caller_system(system: Option<&Value>) -> Result<Vec<Value>, String> {
     let keep =
         |text: &str| !text.trim().is_empty() && !is_billing_text(text) && !is_identity_text(text);
     match system {
         None | Some(Value::Null) => Ok(Vec::new()),
-        Some(Value::String(text)) => Ok(keep(text).then(|| text.clone()).into_iter().collect()),
+        Some(Value::String(text)) => Ok(keep(text)
+            .then(|| text_block(text, false))
+            .into_iter()
+            .collect()),
         Some(Value::Array(blocks)) => {
             let mut out = Vec::new();
             for (idx, block) in blocks.iter().enumerate() {
@@ -224,7 +235,7 @@ fn collect_caller_system(system: Option<&Value>) -> Result<Vec<String>, String> 
                 }
                 let text = str_of(block, "text");
                 if keep(text) {
-                    out.push(text.to_string());
+                    out.push(block.clone());
                 }
             }
             Ok(out)
@@ -277,7 +288,7 @@ fn content_text(content: Option<&Value>) -> String {
 
 /// Insert caller system blocks as `role: system` turns right after the
 /// conversation's leading user run (idempotent across retries/replays).
-fn insert_mid_conversation_system(body: &mut Value, blocks: &[String]) {
+fn insert_mid_conversation_system(body: &mut Value, blocks: &[Value], auto_cache: bool) {
     let Some(first_user) = first_user_index(body) else {
         return;
     };
@@ -299,24 +310,25 @@ fn insert_mid_conversation_system(body: &mut Value, blocks: &[String]) {
         insert_at += 1;
     }
     let already = messages.len() - insert_at >= blocks.len()
-        && blocks.iter().enumerate().all(|(i, text)| {
+        && blocks.iter().enumerate().all(|(i, block)| {
             let message = &messages[insert_at + i];
-            str_of(message, "role") == "system" && content_text(message.get("content")) == *text
+            str_of(message, "role") == "system"
+                && content_text(message.get("content")) == str_of(block, "text")
         });
     if already {
         return;
     }
-    for (offset, text) in blocks.iter().enumerate() {
+    for (offset, block) in blocks.iter().enumerate() {
         messages.insert(
             insert_at + offset,
-            json!({"role": "system", "content": [text_block(text, true)]}),
+            json!({"role": "system", "content": [with_default_cache(block.clone(), auto_cache)]}),
         );
     }
 }
 
 /// Legacy models: caller system text becomes `<system-reminder>` blocks in the
 /// first user turn (after any leading `tool_result` blocks).
-fn prepend_system_reminders(body: &mut Value, blocks: &[String]) {
+fn prepend_system_reminders(body: &mut Value, blocks: &[Value]) {
     let Some(first_user) = first_user_index(body) else {
         return;
     };
@@ -329,13 +341,15 @@ fn prepend_system_reminders(body: &mut Value, blocks: &[String]) {
                 .map(|p| str_of(p, "text").to_string())
                 .collect();
             let mut reminders = Vec::new();
-            for text in blocks {
-                let reminder = caller_system_reminder(text);
+            for block in blocks {
+                let reminder = caller_system_reminder(str_of(block, "text"));
                 if let Some(pos) = existing.iter().position(|e| *e == reminder) {
                     existing.remove(pos);
                     continue;
                 }
-                reminders.push(text_block(&reminder, false));
+                let mut relocated = block.clone();
+                relocated["text"] = json!(reminder);
+                reminders.push(relocated);
             }
             let insert_at = parts
                 .iter()
@@ -349,7 +363,11 @@ fn prepend_system_reminders(body: &mut Value, blocks: &[String]) {
             let original = std::mem::take(text);
             let mut parts: Vec<Value> = blocks
                 .iter()
-                .map(|t| text_block(&caller_system_reminder(t), false))
+                .map(|block| {
+                    let mut relocated = block.clone();
+                    relocated["text"] = json!(caller_system_reminder(str_of(block, "text")));
+                    relocated
+                })
                 .collect();
             parts.push(text_block(&original, false));
             *content = Value::Array(parts);
@@ -360,11 +378,11 @@ fn prepend_system_reminders(body: &mut Value, blocks: &[String]) {
 
 /// Put the `currentDate` reminder first in the first user turn and mark the
 /// first real user text as a cache breakpoint (`injectClaudeCodeCurrentDate`).
-fn inject_current_date(body: &mut Value, date: &str) {
+fn inject_current_date(body: &mut Value, date: &str, auto_cache: bool) {
     let Some(first_user) = first_user_index(body) else {
         return;
     };
-    let date_block = text_block(&date_reminder(date), false);
+    let mut date_block = text_block(&date_reminder(date), false);
     let content = &mut body["messages"][first_user]["content"];
     match content {
         Value::String(text) => {
@@ -376,16 +394,31 @@ fn inject_current_date(body: &mut Value, date: &str) {
                     .trim_start_matches('\n')
                     .to_string();
             }
-            let cache = !user_text.trim().is_empty();
+            let cache = auto_cache && !user_text.trim().is_empty();
             *content = Value::Array(vec![date_block, text_block(&user_text, cache)]);
         }
         Value::Array(parts) => {
-            parts.retain(|p| !(str_of(p, "type") == "text" && is_date_reminder(str_of(p, "text"))));
-            if let Some(target) = parts.iter_mut().find(|p| {
-                let text = str_of(p, "text");
-                str_of(p, "type") == "text" && !is_context_reminder(text) && !text.trim().is_empty()
+            // A refreshed reminder must not erase an explicit caller breakpoint.
+            if let Some(cc) = parts.iter().find_map(|p| {
+                (str_of(p, "type") == "text" && is_date_reminder(str_of(p, "text")))
+                    .then(|| p.get("cache_control"))
+                    .flatten()
+                    .filter(|cc| !cc.is_null())
             }) {
-                target["cache_control"] = ephemeral();
+                date_block["cache_control"] = cc.clone();
+            }
+            parts.retain(|p| !(str_of(p, "type") == "text" && is_date_reminder(str_of(p, "text"))));
+            if auto_cache
+                && let Some(target) = parts.iter_mut().find(|p| {
+                    let text = str_of(p, "text");
+                    str_of(p, "type") == "text"
+                        && !is_context_reminder(text)
+                        && !text.trim().is_empty()
+                })
+            {
+                if target.get("cache_control").is_none_or(Value::is_null) {
+                    target["cache_control"] = ephemeral();
+                }
             }
             let insert_at = parts
                 .iter()
@@ -631,41 +664,113 @@ pub(crate) fn apply_preserved_thinking_binding(body: &mut Value) {
 
 // ── cache_control layout ─────────────────────────────────────────────────────
 
-/// Visit every block that can carry `cache_control`, in Anthropic's
-/// evaluation order (tools → system → messages).
-fn for_each_cache_host(body: &mut Value, mut visit: impl FnMut(&mut Value)) {
-    if let Some(tools) = body.get_mut("tools").and_then(Value::as_array_mut) {
-        tools.iter_mut().for_each(&mut visit);
-    }
-    if let Some(system) = body.get_mut("system").and_then(Value::as_array_mut) {
-        system.iter_mut().for_each(&mut visit);
-    }
-    if let Some(messages) = messages_mut(body) {
-        for message in messages {
-            if let Some(content) = message.get_mut("content").and_then(Value::as_array_mut) {
-                content.iter_mut().for_each(&mut visit);
+/// The only protocol cache hosts, in evaluation order. Never descend into tool
+/// schemas, tool inputs/results, metadata, or arbitrary same-named fields.
+/// Paths point to hosts (the empty path is the request itself).
+fn cache_host_paths(body: &Value) -> Vec<String> {
+    let mut paths = Vec::new();
+    for section in ["tools", "system"] {
+        if let Some(items) = body.get(section).and_then(Value::as_array) {
+            for (idx, item) in items.iter().enumerate() {
+                if item.get("cache_control").is_some() {
+                    paths.push(format!("/{section}/{idx}"));
+                }
             }
+        }
+    }
+    if let Some(messages) = body.get("messages").and_then(Value::as_array) {
+        for (msg_idx, message) in messages.iter().enumerate() {
+            if let Some(blocks) = message.get("content").and_then(Value::as_array) {
+                for (idx, block) in blocks.iter().enumerate() {
+                    if block.get("cache_control").is_some() {
+                        paths.push(format!("/messages/{msg_idx}/content/{idx}"));
+                    }
+                }
+            }
+        }
+    }
+    if body.get("cache_control").is_some() {
+        paths.push(String::new());
+    }
+    paths
+}
+
+fn for_each_cache_host(body: &mut Value, mut visit: impl FnMut(&mut Value)) {
+    for path in cache_host_paths(body) {
+        if let Some(host) = body.pointer_mut(&path) {
+            visit(host);
         }
     }
 }
 
 fn count_cache_controls(body: &Value) -> usize {
-    let count = |items: Option<&Value>| {
-        items.and_then(Value::as_array).map_or(0, |items| {
-            items
-                .iter()
-                .filter(|item| valid_cache_control(item.get("cache_control")))
-                .count()
+    cache_host_paths(body)
+        .iter()
+        .filter(|path| {
+            valid_cache_control(
+                body.pointer(path)
+                    .and_then(|host| host.get("cache_control")),
+            )
         })
-    };
-    count(body.get("tools"))
-        + count(body.get("system"))
-        + body
-            .get("messages")
-            .and_then(Value::as_array)
-            .map_or(0, |messages| {
-                messages.iter().map(|m| count(m.get("content"))).sum()
-            })
+        .count()
+}
+
+fn cache_breakpoint_budget(body: &Value) -> usize {
+    MAX_CACHE_BREAKPOINTS - usize::from(body.get("thread").is_some_and(|t| !t.is_null()))
+}
+
+/// Internal caller policy; do not forward prompt_cache_options upstream.
+pub(crate) fn is_explicit_cache_mode(body: &Value) -> bool {
+    body.pointer("/prompt_cache_options/mode")
+        .and_then(Value::as_str)
+        .is_some_and(|mode| mode.trim().eq_ignore_ascii_case("explicit"))
+}
+
+/// Read-only final-wire validation. Errors contain protocol paths, never values
+/// or request content. Null cache_control is treated as no breakpoint.
+pub(crate) fn validate_cache_controls(body: &Value) -> Result<(), String> {
+    let mut count = 0;
+    let mut seen_5m = false;
+    let budget = cache_breakpoint_budget(body);
+    for host_path in cache_host_paths(body) {
+        let cc = &body.pointer(&host_path).expect("existing cache host")["cache_control"];
+        if cc.is_null() {
+            continue;
+        }
+        let path = if host_path.is_empty() {
+            "cache_control".to_string()
+        } else {
+            format!(
+                "{}.cache_control",
+                host_path.trim_start_matches('/').replace('/', ".")
+            )
+        };
+        if !cc.is_object() {
+            return Err(format!("{path}: expected an object"));
+        }
+        if !valid_cache_control(Some(cc)) {
+            return Err(format!("{path}.type: expected 'ephemeral'"));
+        }
+        let is_1h = match cc.get("ttl") {
+            None => false,
+            Some(Value::String(ttl)) if ttl == "5m" => false,
+            Some(Value::String(ttl)) if ttl == "1h" => true,
+            Some(_) => return Err(format!("{path}.ttl: expected '5m' or '1h'")),
+        };
+        count += 1;
+        if count > budget {
+            return Err(format!(
+                "{path}: exceeds the {budget}-breakpoint cache budget"
+            ));
+        }
+        if is_1h && seen_5m {
+            return Err(format!(
+                "{path}.ttl: 1h cannot follow a 5m cache breakpoint"
+            ));
+        }
+        seen_5m |= !is_1h;
+    }
+    Ok(())
 }
 
 fn system_block_hosts_cache(block: &Value) -> bool {
@@ -707,9 +812,102 @@ fn eligible_for_rolling_cache(message: &Value) -> bool {
     }
 }
 
+/// CPA conflict rule: a detailed existing marker wins; a bare ephemeral
+/// marker may inherit a more specific top-level marker (TTL, scope, etc.).
+fn apply_top_cache_control(host: &mut Value, top: &Value) {
+    let bare = |cc: &Value| {
+        valid_cache_control(Some(cc)) && cc.as_object().is_some_and(|obj| obj.len() == 1)
+    };
+    let existing = host.get("cache_control");
+    if !valid_cache_control(existing) || existing.is_some_and(|cc| bare(cc) && !bare(top)) {
+        host["cache_control"] = top.clone();
+    }
+}
+
+/// Materialize automatic prompt caching at the last eligible message, then
+/// top-level system, then non-deferred tool. Return whether it landed in messages
+/// so ensure does not add a second rolling breakpoint. An unplaceable/invalid
+/// top-level marker stays visible to the budget, TTL passes and final validator.
+fn materialize_top_cache_control(body: &mut Value) -> bool {
+    let Some(top) = body
+        .get("cache_control")
+        .filter(|cc| valid_cache_control(Some(cc)))
+        .cloned()
+    else {
+        return false;
+    };
+    let mut in_messages = false;
+    if let Some(messages) = messages_mut(body) {
+        let eligible = messages.iter().rposition(|m| {
+            matches!(str_of(m, "role"), "user" | "assistant") && eligible_for_rolling_cache(m)
+        });
+        if let Some(mut target) = eligible {
+            if let Some(last) = messages.last()
+                && str_of(last, "role") == "system"
+                && last
+                    .get("content")
+                    .and_then(Value::as_str)
+                    .is_some_and(|t| !t.trim().is_empty())
+            {
+                target = messages.len() - 1;
+            }
+            let message = &mut messages[target];
+            if let Some(text) = message.get("content").and_then(Value::as_str) {
+                let mut block = text_block(text, false);
+                block["cache_control"] = top.clone();
+                message["content"] = json!([block]);
+                in_messages = true;
+            } else if let Some(idx) = last_cacheable_content_index(message) {
+                apply_top_cache_control(&mut message["content"][idx], &top);
+                in_messages = true;
+            }
+        }
+    }
+    let mut materialized = in_messages;
+    if !materialized {
+        match body.get_mut("system") {
+            Some(Value::Array(blocks)) => {
+                if let Some(last) = blocks
+                    .iter_mut()
+                    .rev()
+                    .find(|b| system_block_hosts_cache(b))
+                {
+                    apply_top_cache_control(last, &top);
+                    materialized = true;
+                }
+            }
+            Some(system @ Value::String(_)) => {
+                if let Some(text) = system.as_str().filter(|t| !t.trim().is_empty()) {
+                    let mut block = text_block(text, false);
+                    block["cache_control"] = top.clone();
+                    *system = json!([block]);
+                    materialized = true;
+                }
+            }
+            _ => {}
+        }
+    }
+    if !materialized
+        && let Some(tools) = body.get_mut("tools").and_then(Value::as_array_mut)
+        && let Some(last) = tools.iter_mut().rev().find(|tool| {
+            tool.is_object() && tool.get("defer_loading").and_then(Value::as_bool) != Some(true)
+        })
+    {
+        apply_top_cache_control(last, &top);
+        materialized = true;
+    }
+    if materialized {
+        body.as_object_mut()
+            .expect("request object")
+            .remove("cache_control");
+    }
+    in_messages
+}
+
 /// Default breakpoints for cloaked traffic (`ensureCacheControl`): the last
 /// system block, plus the native rolling breakpoint on the latest eligible turn.
 fn ensure_cache_control(body: &mut Value) {
+    let materialized_in_messages = materialize_top_cache_control(body);
     let has_cacheable_system = match body.get("system") {
         Some(Value::Array(blocks)) => blocks.iter().any(system_block_hosts_cache),
         Some(Value::String(text)) => !text.trim().is_empty(),
@@ -720,10 +918,9 @@ fn ensure_cache_control(body: &mut Value) {
         && !tools
             .iter()
             .any(|t| valid_cache_control(t.get("cache_control")))
-        && let Some(last) = tools
-            .iter_mut()
-            .rev()
-            .find(|t| t.get("defer_loading").and_then(Value::as_bool) != Some(true))
+        && let Some(last) = tools.iter_mut().rev().find(|t| {
+            t.is_object() && t.get("defer_loading").and_then(Value::as_bool) != Some(true)
+        })
     {
         last["cache_control"] = ephemeral();
     }
@@ -739,6 +936,14 @@ fn ensure_cache_control(body: &mut Value) {
         last["cache_control"] = ephemeral();
     }
 
+    if let Some(system @ Value::String(_)) = body.get_mut("system")
+        && let Some(text) = system.as_str().filter(|t| !t.trim().is_empty())
+    {
+        *system = json!([text_block(text, true)]);
+    }
+    if materialized_in_messages {
+        return;
+    }
     let Some(messages) = messages_mut(body) else {
         return;
     };
@@ -786,70 +991,48 @@ fn ensure_cache_control(body: &mut Value) {
     }
 }
 
-/// Drop excess breakpoints (`enforceCacheControlLimit`): earlier system and
-/// tool markers first (keeping the last of each), then message markers
-/// earliest-first, then the remaining system and tool markers.
+/// Drop excess breakpoints using CPA's value-based priority, not evaluation
+/// order: early system, early tools, messages, last system/tool, finally top.
+/// Discovery still shares the tools → system → messages → top traversal.
 pub(crate) fn enforce_cache_control_limit(body: &mut Value) {
-    let mut max = MAX_CACHE_BREAKPOINTS;
-    if body.get("thread").is_some_and(|t| !t.is_null()) {
-        max -= 1;
+    let mut tools = Vec::new();
+    let mut system = Vec::new();
+    let mut messages = Vec::new();
+    let mut top = Vec::new();
+    for path in cache_host_paths(body) {
+        if !valid_cache_control(
+            body.pointer(&path)
+                .and_then(|host| host.get("cache_control")),
+        ) {
+            continue;
+        }
+        if path.starts_with("/tools/") {
+            tools.push(path);
+        } else if path.starts_with("/system/") {
+            system.push(path);
+        } else if path.is_empty() {
+            top.push(path);
+        } else {
+            messages.push(path);
+        }
     }
     let total = count_cache_controls(body);
-    if total <= max {
-        return;
-    }
-    let mut excess = total - max;
-    let strip_section = |items: Option<&mut Vec<Value>>, keep_last: bool, excess: &mut usize| {
-        let Some(items) = items else {
-            return;
-        };
-        let last = items
-            .iter()
-            .rposition(|item| valid_cache_control(item.get("cache_control")));
-        for (idx, item) in items.iter_mut().enumerate() {
-            if *excess == 0 {
-                return;
-            }
-            if keep_last && Some(idx) == last {
-                continue;
-            }
-            if valid_cache_control(item.get("cache_control"))
-                && let Some(obj) = item.as_object_mut()
-            {
-                obj.remove("cache_control");
-                *excess -= 1;
-            }
-        }
-    };
-    strip_section(
-        body.get_mut("system").and_then(Value::as_array_mut),
-        true,
-        &mut excess,
-    );
-    strip_section(
-        body.get_mut("tools").and_then(Value::as_array_mut),
-        true,
-        &mut excess,
-    );
-    if let Some(messages) = messages_mut(body) {
-        for message in messages {
-            strip_section(
-                message.get_mut("content").and_then(Value::as_array_mut),
-                false,
-                &mut excess,
-            );
+    let excess = total.saturating_sub(cache_breakpoint_budget(body));
+    let early_system = &system[..system.len().saturating_sub(1)];
+    let early_tools = &tools[..tools.len().saturating_sub(1)];
+    for path in early_system
+        .iter()
+        .chain(early_tools)
+        .chain(&messages)
+        .chain(system.last())
+        .chain(tools.last())
+        .chain(&top)
+        .take(excess)
+    {
+        if let Some(host) = body.pointer_mut(path).and_then(Value::as_object_mut) {
+            host.remove("cache_control");
         }
     }
-    strip_section(
-        body.get_mut("system").and_then(Value::as_array_mut),
-        false,
-        &mut excess,
-    );
-    strip_section(
-        body.get_mut("tools").and_then(Value::as_array_mut),
-        false,
-        &mut excess,
-    );
 }
 
 /// Upgrade every marker without a ttl to the 1h pool the OAuth CLI uses.
@@ -871,6 +1054,9 @@ fn strip_cache_ttl(body: &mut Value) {
         if let Some(cc) = block
             .get_mut("cache_control")
             .and_then(Value::as_object_mut)
+            // Preserve malformed caller TTLs for the final validator rather
+            // than silently laundering them into a valid 5m marker.
+            && matches!(cc.get("ttl").and_then(Value::as_str), Some("1h" | "5m"))
         {
             cc.remove("ttl");
         }
@@ -912,6 +1098,15 @@ pub(crate) struct CloakContext<'a> {
 
 /// Rewrite a non-Claude-Code request into the Claude Code CLI shape.
 pub(crate) fn cloak(body: &mut Value, ctx: &CloakContext<'_>) -> Result<(), String> {
+    let explicit_cache = is_explicit_cache_mode(body);
+    // Snapshot caller intent before cloak adds defaults or relocates system.
+    let requested_1h = cache_host_paths(body).iter().any(|path| {
+        body.pointer(path)
+            .and_then(|host| host.get("cache_control"))
+            .is_some_and(|cc| {
+                valid_cache_control(Some(cc)) && cc.get("ttl").and_then(Value::as_str) == Some("1h")
+            })
+    });
     let caller_system = collect_caller_system(body.get("system"))?;
     if let Some(obj) = body.as_object_mut() {
         obj.remove("prompt_cache_options");
@@ -934,7 +1129,7 @@ pub(crate) fn cloak(body: &mut Value, ctx: &CloakContext<'_>) -> Result<(), Stri
     );
     let mut system = vec![
         text_block(&billing, false),
-        text_block(CLAUDE_CODE_IDENTITY, true),
+        text_block(CLAUDE_CODE_IDENTITY, !explicit_cache),
     ];
     if is_fable_51_model(&model) && !probe {
         system.push(text_block(FABLE_REPORTING_OUTCOMES, false));
@@ -942,15 +1137,20 @@ pub(crate) fn cloak(body: &mut Value, ctx: &CloakContext<'_>) -> Result<(), Stri
 
     if !caller_system.is_empty() {
         if history_has_advisor(body) {
-            system.extend(caller_system.iter().map(|text| text_block(text, true)));
+            system.extend(
+                caller_system
+                    .iter()
+                    .cloned()
+                    .map(|block| with_default_cache(block, !explicit_cache)),
+            );
         } else if profile::uses_legacy_system_reminder(body) {
             prepend_system_reminders(body, &caller_system);
         } else {
-            insert_mid_conversation_system(body, &caller_system);
+            insert_mid_conversation_system(body, &caller_system, !explicit_cache);
         }
     }
     body["system"] = Value::Array(system);
-    inject_current_date(body, ctx.date);
+    inject_current_date(body, ctx.date, !explicit_cache);
 
     if !probe && body.get("fallbacks").is_none() {
         if is_opus_55(&model) {
@@ -979,14 +1179,18 @@ pub(crate) fn cloak(body: &mut Value, ctx: &CloakContext<'_>) -> Result<(), Stri
     }
     normalize_sampling(body, false);
 
-    ensure_cache_control(body);
-    enforce_cache_control_limit(body);
-    if !probe && !ctx.subagent {
-        upgrade_cache_ttl(body);
-    } else {
-        strip_cache_ttl(body);
+    if !explicit_cache {
+        ensure_cache_control(body);
     }
-    normalize_cache_ttl_order(body);
+    enforce_cache_control_limit(body);
+    if !explicit_cache {
+        if !probe && (!ctx.subagent || requested_1h) {
+            upgrade_cache_ttl(body);
+        } else {
+            strip_cache_ttl(body);
+        }
+        normalize_cache_ttl_order(body);
+    }
     sanitize_web_search_domains(body);
     apply_preserved_thinking_binding(body);
     Ok(())
@@ -995,7 +1199,12 @@ pub(crate) fn cloak(body: &mut Value, ctx: &CloakContext<'_>) -> Result<(), Stri
 /// count_tokens counterpart of the cloak's system handling: the caller's
 /// system text is placed where the Messages path places it, and no Claude
 /// Code blocks are installed (native count_tokens carries no system).
-pub(crate) fn relocate_caller_system_for_count(body: &mut Value, system: Option<&Value>) {
+/// Count shaping may have already removed internal options; accept its snapshot.
+pub(crate) fn relocate_caller_system_for_count_with_cache_mode(
+    body: &mut Value,
+    system: Option<&Value>,
+    explicit_cache: bool,
+) {
     let Ok(blocks) = collect_caller_system(system) else {
         return;
     };
@@ -1003,11 +1212,16 @@ pub(crate) fn relocate_caller_system_for_count(body: &mut Value, system: Option<
         return;
     }
     if history_has_advisor(body) {
-        body["system"] = Value::Array(blocks.iter().map(|t| text_block(t, true)).collect());
+        body["system"] = Value::Array(
+            blocks
+                .into_iter()
+                .map(|block| with_default_cache(block, !explicit_cache))
+                .collect(),
+        );
     } else if profile::uses_legacy_system_reminder(body) {
         prepend_system_reminders(body, &blocks);
     } else {
-        insert_mid_conversation_system(body, &blocks);
+        insert_mid_conversation_system(body, &blocks, !explicit_cache);
     }
 }
 
@@ -1195,6 +1409,500 @@ mod tests {
                 .unwrap_err()
                 .contains("system.0.type")
         );
+    }
+
+    fn cache_markers(body: &Value) -> Vec<Value> {
+        cache_host_paths(body)
+            .into_iter()
+            .filter_map(|path| {
+                body.pointer(&path)
+                    .and_then(|host| host.get("cache_control"))
+                    .filter(|cc| !cc.is_null())
+                    .cloned()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn top_cache_materializes_and_merges_using_cpa_rules() {
+        for top in [
+            ephemeral(),
+            json!({"type":"ephemeral","ttl":"1h","scope":"global"}),
+        ] {
+            for existing in [
+                Value::Null,
+                ephemeral(),
+                json!({"type":"ephemeral","ttl":"5m"}),
+                json!({"type":"ephemeral","scope":"global"}),
+            ] {
+                let mut body = json!({
+                    "cache_control": top,
+                    "messages": [{"role":"user","content":[
+                        {"type":"text","text":"first","cache_control":{"type":"ephemeral"}},
+                        {"type":"text","text":"last","cache_control":existing}
+                    ]}]
+                });
+                let expected = if !valid_cache_control(Some(&existing)) || existing == ephemeral() {
+                    top.clone()
+                } else {
+                    existing.clone()
+                };
+                assert!(materialize_top_cache_control(&mut body));
+                assert!(body.get("cache_control").is_none());
+                assert_eq!(body["messages"][0]["content"][1]["cache_control"], expected);
+                assert_eq!(body["messages"][0]["content"][0]["text"], "first");
+                assert_eq!(body["messages"][0]["content"][1]["text"], "last");
+                let once = body.clone();
+                assert!(!materialize_top_cache_control(&mut body));
+                ensure_cache_control(&mut body);
+                assert_eq!(body, once);
+            }
+        }
+    }
+
+    #[test]
+    fn top_cache_uses_message_system_then_non_deferred_tool_fallbacks() {
+        let cases = [
+            (
+                json!({"messages":[{"role":"user","content":"keep me"}]}),
+                "/messages/0/content/0",
+            ),
+            (
+                json!({"system":"system text","tools":[{"name":"unused"}]}),
+                "/system/0",
+            ),
+            (
+                json!({"system":[{"type":"text","text":"system text"},{"type":"text","text":" "}]}),
+                "/system/0",
+            ),
+            (
+                json!({"system":[],"tools":[{"name":"eligible"},{"name":"deferred","defer_loading":true}]}),
+                "/tools/0",
+            ),
+            (
+                json!({"system":" ","tools":[{"name":"eligible"},{"name":"deferred","defer_loading":true}]}),
+                "/tools/0",
+            ),
+        ];
+        for (mut body, target) in cases {
+            body["cache_control"] = json!({"type":"ephemeral","ttl":"1h","scope":"global"});
+            ensure_cache_control(&mut body);
+            assert!(body.get("cache_control").is_none());
+            assert_eq!(body.pointer(target).unwrap()["cache_control"]["ttl"], "1h");
+            assert_eq!(count_cache_controls(&body), 1);
+            let once = body.clone();
+            ensure_cache_control(&mut body);
+            assert_eq!(body, once);
+        }
+        let mut unplaceable = json!({"cache_control":{"type":"ephemeral"},"tools":[{"name":"deferred","defer_loading":true}]});
+        ensure_cache_control(&mut unplaceable);
+        assert_eq!(count_cache_controls(&unplaceable), 1);
+        assert_eq!(unplaceable["cache_control"], ephemeral());
+        upgrade_cache_ttl(&mut unplaceable);
+        assert_eq!(unplaceable["cache_control"]["ttl"], "1h");
+        strip_cache_ttl(&mut unplaceable);
+        assert_eq!(unplaceable["cache_control"], ephemeral());
+    }
+
+    #[test]
+    fn cache_selection_skips_assistant_trailing_thinking_without_losing_blocks() {
+        for thinking in [
+            json!({"type":"thinking","thinking":"reason","signature":"sig"}),
+            json!({"type":"redacted_thinking","data":"opaque"}),
+        ] {
+            let mut body = json!({"cache_control":{"type":"ephemeral","ttl":"1h"}, "messages":[
+                {"role":"user","content":"question"},
+                {"role":"assistant","content":[{"type":"text","text":"partial"},thinking,{"type":"text","text":" "}]}
+            ]});
+            let assistant = body["messages"][1].clone();
+            ensure_cache_control(&mut body);
+            assert_eq!(
+                body["messages"][0]["content"][0]["cache_control"]["ttl"],
+                "1h"
+            );
+            assert_eq!(body["messages"][1], assistant);
+            assert_eq!(count_cache_controls(&body), 1);
+            let once = body.clone();
+            ensure_cache_control(&mut body);
+            assert_eq!(body, once);
+        }
+        let mut final_system = json!({"cache_control":{"type":"ephemeral","ttl":"1h"}, "messages":[
+            {"role":"user","content":"question"},{"role":"system","content":"final instructions"}
+        ]});
+        ensure_cache_control(&mut final_system);
+        assert_eq!(final_system["messages"][0]["content"], "question");
+        assert_eq!(
+            final_system["messages"][1]["content"][0]["text"],
+            "final instructions"
+        );
+        assert_eq!(
+            final_system["messages"][1]["content"][0]["cache_control"]["ttl"],
+            "1h"
+        );
+    }
+
+    #[test]
+    fn limit_counts_top_and_thread_and_keeps_cpa_priority() {
+        for thread in [Value::Null, json!({"id":"thread"})] {
+            let mut body = json!({
+                "thread":thread, "cache_control":{"type":"ephemeral"},
+                "tools":[{"name":"early","cache_control":{"type":"ephemeral"}},{"name":"last","cache_control":{"type":"ephemeral"}}],
+                "system":[{"type":"text","text":"early","cache_control":{"type":"ephemeral"}},{"type":"text","text":"last","cache_control":{"type":"ephemeral"}}],
+                "messages":[{"role":"user","content":[{"type":"text","text":"early","cache_control":{"type":"ephemeral"}},{"type":"text","text":"recent","cache_control":{"type":"ephemeral"}}]}]
+            });
+            assert_eq!(count_cache_controls(&body), 7);
+            enforce_cache_control_limit(&mut body);
+            assert_eq!(
+                count_cache_controls(&body),
+                if thread.is_null() { 4 } else { 3 }
+            );
+            assert!(body["tools"][0].get("cache_control").is_none());
+            assert!(body["system"][0].get("cache_control").is_none());
+            assert!(
+                body["messages"][0]["content"][0]
+                    .get("cache_control")
+                    .is_none()
+            );
+            assert_eq!(
+                body["messages"][0]["content"][1]
+                    .get("cache_control")
+                    .is_some(),
+                thread.is_null()
+            );
+            assert_eq!(body["cache_control"], ephemeral());
+            assert_eq!(body["tools"][1]["cache_control"], ephemeral());
+            assert_eq!(body["system"][1]["cache_control"], ephemeral());
+            validate_cache_controls(&body).unwrap();
+            let once = body.clone();
+            enforce_cache_control_limit(&mut body);
+            assert_eq!(body, once);
+        }
+    }
+
+    #[test]
+    fn cache_traversal_and_ttl_passes_use_only_real_hosts_in_wire_order() {
+        let mut body = json!({
+            "cache_control":{"type":"ephemeral","ttl":"1h"},
+            "tools":[{"name":"t","cache_control":{"type":"ephemeral"},"input_schema":{"cache_control":{"type":"secret-invalid","ttl":"1h"}}}],
+            "system":[{"type":"text","text":"s","cache_control":{"type":"ephemeral","ttl":"5m"}}],
+            "messages":[{"role":"user","cache_control":{"type":"message-is-not-a-host"},"content":[{"type":"tool_result","tool_use_id":"id","cache_control":{"type":"ephemeral","ttl":"1h"},"content":[{"cache_control":{"type":"secret-invalid","ttl":"1h"}}]}]}],
+            "metadata":{"cache_control":{"type":"secret-invalid","ttl":"1h"}}
+        });
+        let nested_schema = body["tools"][0]["input_schema"].clone();
+        let nested_result = body["messages"][0]["content"][0]["content"].clone();
+        assert_eq!(
+            cache_host_paths(&body),
+            vec!["/tools/0", "/system/0", "/messages/0/content/0", ""]
+        );
+        assert_eq!(count_cache_controls(&body), 4);
+        upgrade_cache_ttl(&mut body);
+        assert_eq!(body["tools"][0]["cache_control"]["ttl"], "1h");
+        assert_eq!(body["system"][0]["cache_control"]["ttl"], "5m");
+        normalize_cache_ttl_order(&mut body);
+        assert!(
+            body["messages"][0]["content"][0]["cache_control"]
+                .get("ttl")
+                .is_none()
+        );
+        assert!(body["cache_control"].get("ttl").is_none());
+        validate_cache_controls(&body).unwrap();
+        let once = body.clone();
+        normalize_cache_ttl_order(&mut body);
+        assert_eq!(body, once);
+        strip_cache_ttl(&mut body);
+        assert!(
+            cache_markers(&body)
+                .iter()
+                .all(|cc| cc.get("ttl").is_none())
+        );
+        assert_eq!(body["tools"][0]["input_schema"], nested_schema);
+        assert_eq!(body["messages"][0]["content"][0]["content"], nested_result);
+        assert_eq!(body["metadata"]["cache_control"]["ttl"], "1h");
+        validate_cache_controls(&body).unwrap();
+    }
+
+    #[test]
+    fn cache_validation_is_read_only_precise_and_does_not_leak_values() {
+        for (marker, suffix) in [
+            (json!("secret-body"), ""),
+            (json!({}), ".type"),
+            (json!({"type":"secret-body"}), ".type"),
+            (json!({"type":"ephemeral","ttl":"secret-body"}), ".ttl"),
+            (json!({"type":"ephemeral","ttl":null}), ".ttl"),
+            (json!({"type":"ephemeral","ttl":5}), ".ttl"),
+        ] {
+            for (mut body, host, error_path) in [
+                (json!({}), "", "cache_control"),
+                (
+                    json!({"tools":[{"name":"secret-body"}]}),
+                    "/tools/0",
+                    "tools.0.cache_control",
+                ),
+                (
+                    json!({"system":[{"type":"text","text":"secret-body"}]}),
+                    "/system/0",
+                    "system.0.cache_control",
+                ),
+                (
+                    json!({"messages":[{"role":"user","content":[{"type":"text","text":"secret-body"}]}]}),
+                    "/messages/0/content/0",
+                    "messages.0.content.0.cache_control",
+                ),
+            ] {
+                body.pointer_mut(host).unwrap()["cache_control"] = marker.clone();
+                let before = body.clone();
+                let error = validate_cache_controls(&body).unwrap_err();
+                assert!(
+                    error.starts_with(&format!("{error_path}{suffix}:")),
+                    "{error}"
+                );
+                assert!(!error.contains("secret-body"));
+                assert_eq!(body, before);
+            }
+        }
+        validate_cache_controls(&json!({"cache_control":null,"tools":[{"cache_control":null}]}))
+            .unwrap();
+        let order = json!({"tools":[{"cache_control":{"type":"ephemeral"}}],"cache_control":{"type":"ephemeral","ttl":"1h"}});
+        assert!(
+            validate_cache_controls(&order)
+                .unwrap_err()
+                .starts_with("cache_control.ttl:")
+        );
+        let budget = json!({"thread":{},"tools":[{"cache_control":{"type":"ephemeral"}},{"cache_control":{"type":"ephemeral"}},{"cache_control":{"type":"ephemeral"}}],"cache_control":{"type":"ephemeral"}});
+        assert!(
+            validate_cache_controls(&budget)
+                .unwrap_err()
+                .starts_with("cache_control: exceeds the 3-breakpoint")
+        );
+    }
+
+    #[test]
+    fn full_cloak_materializes_top_and_preserves_target_explicit_five_minutes() {
+        for top in [ephemeral(), json!({"type":"ephemeral","ttl":"1h"})] {
+            for target_ttl in [None, Some("5m")] {
+                let mut body = json!({"model":"claude-opus-5","cache_control":top,"system":"rules","messages":[{"role":"user","content":[{"type":"text","text":"question"}]}]});
+                if let Some(ttl) = target_ttl {
+                    body["messages"][0]["content"][0]["cache_control"] =
+                        json!({"type":"ephemeral","ttl":ttl});
+                }
+                cloak(&mut body, &ctx()).unwrap();
+                assert!(body.get("cache_control").is_none());
+                assert_eq!(body["messages"][0]["content"][1]["text"], "question");
+                assert_eq!(
+                    body["messages"][0]["content"][1]["cache_control"]["ttl"],
+                    target_ttl.unwrap_or("1h")
+                );
+                assert_eq!(body["messages"][1]["content"][0]["text"], "rules");
+                validate_cache_controls(&body).unwrap();
+                let once = body.clone();
+                cloak(&mut body, &ctx()).unwrap();
+                assert_eq!(body, once);
+            }
+        }
+    }
+
+    #[test]
+    fn explicit_mode_never_invents_cache_and_preserves_relocated_markers() {
+        for model in ["claude-opus-5", "claude-sonnet-4-5-20250929"] {
+            for has_marker in [false, true] {
+                let mut body = json!({"model":model,"prompt_cache_options":{"mode":"  ExPlIcIt\n"},"system":[{"type":"text","text":"caller rules"}],"messages":[{"role":"user","content":"question"}]});
+                let cc = json!({"type":"ephemeral","ttl":"1h","scope":"global"});
+                if has_marker {
+                    body["system"][0]["cache_control"] = cc.clone();
+                }
+                assert!(is_explicit_cache_mode(&body));
+                cloak(&mut body, &ctx()).unwrap();
+                assert!(body.get("prompt_cache_options").is_none());
+                assert_eq!(
+                    cache_markers(&body),
+                    if has_marker { vec![cc.clone()] } else { vec![] }
+                );
+                assert!(body["system"][1].get("cache_control").is_none());
+                assert!(body["messages"].to_string().contains("caller rules"));
+                validate_cache_controls(&body).unwrap();
+            }
+        }
+        for mode in [
+            Value::Null,
+            json!(true),
+            json!("implicit"),
+            json!("explicitly"),
+        ] {
+            assert!(!is_explicit_cache_mode(
+                &json!({"prompt_cache_options":{"mode":mode}})
+            ));
+        }
+    }
+
+    #[test]
+    fn explicit_cloak_keeps_top_and_ttls_but_still_enforces_thread_budget() {
+        let mut body = json!({"model":"claude-opus-5","thread":{},"prompt_cache_options":{"mode":"explicit"},"cache_control":{"type":"ephemeral","ttl":"1h"},"tools":[{"name":"t","cache_control":{"type":"ephemeral","ttl":"5m"}}],"messages":[{"role":"user","content":[
+            {"type":"text","text":"a","cache_control":{"type":"ephemeral","ttl":"1h"}},
+            {"type":"text","text":"b","cache_control":{"type":"ephemeral"}},
+            {"type":"text","text":"c","cache_control":{"type":"ephemeral","ttl":"1h"}}
+        ]}]});
+        cloak(&mut body, &ctx()).unwrap();
+        assert_eq!(count_cache_controls(&body), 3);
+        assert_eq!(body["cache_control"]["ttl"], "1h");
+        assert_eq!(body["tools"][0]["cache_control"]["ttl"], "5m");
+        assert_eq!(
+            body["messages"][0]["content"][3]["cache_control"]["ttl"],
+            "1h"
+        );
+        assert!(
+            body["messages"][0]["content"][1]
+                .get("cache_control")
+                .is_none()
+        );
+        assert!(
+            body["messages"][0]["content"][2]
+                .get("cache_control")
+                .is_none()
+        );
+        // Explicit mode deliberately leaves ordering invalid for the final validator.
+        assert!(
+            validate_cache_controls(&body)
+                .unwrap_err()
+                .starts_with("messages.0.content.3.cache_control.ttl:")
+        );
+    }
+
+    #[test]
+    fn count_relocation_explicit_mode_preserves_only_user_breakpoints() {
+        for model in ["claude-opus-5", "claude-sonnet-4-5-20250929"] {
+            for marker in [
+                Value::Null,
+                json!({"type":"ephemeral","ttl":"5m","scope":"global"}),
+            ] {
+                let system = json!([{"type":"text","text":"rules","cache_control":marker}]);
+                let mut body =
+                    json!({"model":model,"messages":[{"role":"user","content":"question"}]});
+                relocate_caller_system_for_count_with_cache_mode(&mut body, Some(&system), true);
+                assert_eq!(
+                    cache_markers(&body),
+                    if marker.is_null() {
+                        vec![]
+                    } else {
+                        vec![marker.clone()]
+                    }
+                );
+                let once = body.clone();
+                relocate_caller_system_for_count_with_cache_mode(&mut body, Some(&system), true);
+                assert_eq!(body, once);
+            }
+        }
+    }
+
+    #[test]
+    fn subagent_requires_real_incoming_one_hour_marker_and_probe_stays_short() {
+        for top in [false, true] {
+            for request_1h in [false, true] {
+                let mut body = json!({"model":"claude-opus-5","system":"rules","tools":[{"name":"t","input_schema":{"cache_control":{"type":"ephemeral","ttl":"1h"}}}],"messages":[{"role":"user","content":[{"type":"text","text":"question"}]}]});
+                if request_1h {
+                    if top {
+                        body["cache_control"] = json!({"type":"ephemeral","ttl":"1h"});
+                    } else {
+                        body["messages"][0]["content"][0]["cache_control"] =
+                            json!({"type":"ephemeral","ttl":"1h"});
+                    }
+                }
+                let mut context = ctx();
+                context.subagent = true;
+                cloak(&mut body, &context).unwrap();
+                assert!(
+                    cache_markers(&body)
+                        .iter()
+                        .all(|cc| (cc.get("ttl").and_then(Value::as_str) == Some("1h"))
+                            == request_1h)
+                );
+                assert_eq!(
+                    body["tools"][0]["input_schema"]["cache_control"]["ttl"],
+                    "1h"
+                );
+                validate_cache_controls(&body).unwrap();
+            }
+        }
+        for explicit in [false, true] {
+            let mut body = json!({"model":"claude-opus-5","max_tokens":1,"cache_control":{"type":"ephemeral","ttl":"1h"},"messages":[{"role":"user","content":"quota"}]});
+            if explicit {
+                body["prompt_cache_options"] = json!({"mode":"explicit"});
+            }
+            assert!(profile::is_probe_or_helper(&body));
+            cloak(&mut body, &ctx()).unwrap();
+            assert!(
+                cache_markers(&body)
+                    .iter()
+                    .all(|cc| (cc.get("ttl").and_then(Value::as_str) == Some("1h")) == explicit)
+            );
+            assert_eq!(body.get("cache_control").is_some(), explicit);
+            validate_cache_controls(&body).unwrap();
+        }
+    }
+
+    #[test]
+    fn malformed_ttl_survives_auto_cloak_for_final_validation() {
+        for subagent in [false, true] {
+            for probe in [false, true] {
+                let mut body = json!({"model":"claude-opus-5","messages":[{"role":"user","content":[{"type":"text","text":"Hi","cache_control":{"type":"ephemeral","ttl":"private-invalid-ttl"}}]}]});
+                if probe {
+                    body["max_tokens"] = json!(1);
+                }
+                let mut context = ctx();
+                context.subagent = subagent;
+                cloak(&mut body, &context).unwrap();
+                assert_eq!(
+                    body["messages"][0]["content"][1]["cache_control"]["ttl"],
+                    "private-invalid-ttl"
+                );
+                let error = validate_cache_controls(&body).unwrap_err();
+                assert!(error.starts_with("messages.0.content.1.cache_control.ttl:"));
+                assert!(!error.contains("private-invalid-ttl"));
+            }
+        }
+    }
+
+    #[test]
+    fn explicit_advisor_and_date_refresh_keep_existing_markers_without_defaults() {
+        let cc = json!({"type":"ephemeral","ttl":"1h","scope":"global"});
+        let mut body = json!({"model":"claude-opus-5","prompt_cache_options":{"mode":"explicit"},"system":[{"type":"text","text":"rules","cache_control":cc}],"messages":[{"role":"user","content":[
+            {"type":"text","text":date_reminder("2000-01-01"),"cache_control":cc},
+            {"type":"text","text":"question"}
+        ]},{"role":"assistant","content":[{"type":"advisor_tool_result","content":"opaque"}]}]});
+        cloak(&mut body, &ctx()).unwrap();
+        assert_eq!(cache_markers(&body), vec![cc.clone(), cc.clone()]);
+        assert_eq!(body["system"][2]["text"], "rules");
+        assert_eq!(body["system"][2]["cache_control"], cc);
+        assert_eq!(
+            body["messages"][0]["content"][0]["text"],
+            date_reminder(ctx().date)
+        );
+        assert_eq!(body["messages"][0]["content"][0]["cache_control"], cc);
+        assert_eq!(body["messages"][0]["content"][1]["text"], "question");
+        assert!(
+            body["messages"][0]["content"][1]
+                .get("cache_control")
+                .is_none()
+        );
+        assert_eq!(body["messages"][1]["content"][0]["content"], "opaque");
+        validate_cache_controls(&body).unwrap();
+    }
+
+    #[test]
+    fn full_cloak_respects_thread_budget_with_materialized_top_marker() {
+        let mut body = json!({"model":"claude-opus-5","thread":{},"cache_control":{"type":"ephemeral","ttl":"1h"},"system":[{"type":"text","text":"rules one"},{"type":"text","text":"rules two"}],"messages":[{"role":"user","content":"question"},{"role":"assistant","content":"answer"},{"role":"user","content":"followup"}]});
+        cloak(&mut body, &ctx()).unwrap();
+        assert_eq!(count_cache_controls(&body), 3);
+        assert!(body.get("cache_control").is_none());
+        assert_eq!(
+            body["messages"][4]["content"][0]["cache_control"]["ttl"],
+            "1h"
+        );
+        assert_eq!(body["messages"][0]["content"][1]["text"], "question");
+        assert_eq!(body["messages"][1]["content"][0]["text"], "rules one");
+        assert_eq!(body["messages"][2]["content"][0]["text"], "rules two");
+        assert_eq!(body["messages"][3]["content"], "answer");
+        assert_eq!(body["messages"][4]["content"][0]["text"], "followup");
+        validate_cache_controls(&body).unwrap();
     }
 
     #[test]

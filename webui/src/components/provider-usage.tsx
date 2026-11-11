@@ -5,8 +5,10 @@ import { backend } from "@/lib/backend";
 import { localizeBackendErrorMessage } from "@/lib/backend-error";
 import { isKiroOverage, nyroUpstreamView, providerApiPriceSupported, providerUsagePause, providerUsageSupported, providerUsageTitle, summarizeGroupUsage, tierLabel } from "@/lib/provider-usage";
 import { isDevinProvider, isKiroProvider } from "@/lib/native-provider";
+import { isClaudeCodeOAuthProvider } from "@/lib/claude-account-pool";
+import { ClaudeQuotaObservationView } from "@/components/claude-quota-observation";
 import { useLocale } from "@/lib/i18n";
-import { accountStateLabel, poolQuotaWindows, type AccountPoolView } from "@/lib/devin-account-pool";
+import { accountStateLabel, poolQuotaWindows, type AccountPoolView, type ProviderAccountView } from "@/lib/devin-account-pool";
 import { countdownStr, poolSteadyPacePercent, steadyPacePercent, utilizationBarClass, utilizationColor } from "@/lib/usage-pace";
 import { useUsageClock } from "@/lib/use-usage-clock";
 import { UsageProgress } from "@/components/usage-progress";
@@ -346,7 +348,9 @@ function providerUsageQuery(provider: Provider) {
     // cc-switch polls the current provider every 5 minutes.
     refetchInterval: 5 * 60 * 1000,
     staleTime: 60 * 1000,
-    retry: 1,
+    // A failed Claude attempt starts backend cooldown. A retry could return
+    // unchanged cached usage and incorrectly clear the original error.
+    retry: isClaudeCodeOAuthProvider(provider) ? false : 1,
     refetchOnWindowFocus: false,
   };
 }
@@ -354,7 +358,7 @@ function providerUsageQuery(provider: Provider) {
 const arkKeysConfigured = (credentials?: ProviderUsageCredentials | null) =>
   Boolean(credentials?.access_key?.trim() && credentials?.secret_key?.trim());
 
-export function ProviderUsageFooter({ provider }: { provider: Provider }) {
+export function ProviderUsageFooter({ provider, claudeAccount: currentClaudeAccount }: { provider: Provider; claudeAccount?: ProviderAccountView }) {
   const { locale } = useLocale();
   const isZh = locale === "zh-CN";
   const [now, setNow] = useState(() => Date.now());
@@ -408,10 +412,25 @@ export function ProviderUsageFooter({ provider }: { provider: Provider }) {
   const title = providerUsageTitle(shown?.kind, isZh);
   const errorMessage = error ? localizeBackendErrorMessage(error, isZh) : "";
 
-  const queriedAt = shown?.queried_at;
-  const queriedAtMs = queriedAt ? Date.parse(queriedAt) : NaN;
-  const hasTimestamp = Number.isFinite(queriedAtMs);
-  const stale = Boolean(shown && (error || !hasTimestamp || now - queriedAtMs >= 5 * 60 * 1000));
+  const claudeSingleton = (shown?.kind === "claude_code_plan" || Boolean(currentClaudeAccount)) && !shown?.account_pool?.config;
+  // The card already polls the local pool every minute; reuse it for passive
+  // updates without increasing active upstream usage requests.
+  const claudeAccount = claudeSingleton && shown?.account_pool?.accounts.length === 1
+    ? shown.account_pool.accounts[0] : undefined;
+  // Only the passive block uses the local view: full freshness must stay tied
+  // to the same nested account snapshot that produced the displayed tier bars.
+  const partialAccount = claudeSingleton ? currentClaudeAccount ?? claudeAccount : undefined;
+  // Older backends may use queried_at as serving time rather than observation time.
+  // Passive headers have their own timestamps and never renew this full snapshot.
+  const observedAt = claudeAccount?.observed_at;
+  const timestampMs = claudeSingleton
+    ? observedAt != null ? new Date(observedAt).getTime() : NaN
+    : shown?.queried_at ? Date.parse(shown.queried_at) : NaN;
+  const hasTimestamp = Number.isFinite(timestampMs)
+    && (!claudeSingleton || (timestampMs > 0 && timestampMs <= now + 60_000));
+  const timestamp = hasTimestamp ? new Date(timestampMs).toISOString() : undefined;
+  const stale = Boolean(shown && (error || !hasTimestamp
+    || (claudeSingleton ? claudeAccount?.stale !== false || now - timestampMs > 660_000 : now - timestampMs >= 5 * 60 * 1000)));
 
   return (
     <div className="mt-3 space-y-2 rounded-xl border border-slate-200/70 bg-white/40 px-3 py-2.5">
@@ -430,10 +449,10 @@ export function ProviderUsageFooter({ provider }: { provider: Provider }) {
           {hasBuckets && <button type="button" className="cursor-pointer text-[10px] font-medium text-sky-700 hover:underline"
             onClick={(event) => { event.stopPropagation(); setBindingEditorOpen(true); }}>{isZh ? "模型绑定" : "Model bindings"}</button>}
           {shown && (
-            <span className={`flex items-center gap-1 text-[10px] ${stale ? "text-amber-700" : "text-slate-400"}`} title={queriedAt}>
+            <span className={`flex items-center gap-1 text-[10px] ${stale ? "text-amber-700" : "text-slate-400"}`} title={timestamp}>
               <Clock className="h-3 w-3" />
-              {stale ? (isZh ? "旧数据" : "Stale") : (isZh ? "更新于" : "Updated")} {" "}
-              {hasTimestamp ? <time dateTime={queriedAt}>{formatRelativeTime(queriedAt!, now, isZh)}</time> : (isZh ? "时间未知" : "time unknown")}
+              {stale ? (isZh ? "旧数据" : "Stale") : claudeSingleton ? (isZh ? "已观察" : "Observed") : (isZh ? "更新于" : "Updated")} {" "}
+              {hasTimestamp ? <time dateTime={timestamp}>{formatRelativeTime(timestamp!, now, isZh)}</time> : (isZh ? "时间未知" : "time unknown")}
             </span>
           )}
           <button
@@ -528,6 +547,8 @@ export function ProviderUsageFooter({ provider }: { provider: Provider }) {
       ) : (
         <p className="text-xs text-slate-400">{isZh ? "暂无用量数据" : "No usage data"}</p>
       )}
+      {partialAccount && <ClaudeQuotaObservationView account={partialAccount} isZh={isZh}
+        fullSnapshotObservedAt={claudeAccount?.claude_usage ? claudeAccount.observed_at : null} />}
       {!hasBuckets && shown && providerApiPriceSupported(shown.kind) && <ProviderApiPriceSummary
         usage={shown} now={now} stale={stale} loading={isFetching} locale={locale} />}
       {bindingEditorOpen && <ProviderQuotaBucketEditor providerId={provider.id} buckets={(shown?.quota_buckets ?? []).filter((bucket) => !isGoogleFamilyDisplayBucket(bucket))}

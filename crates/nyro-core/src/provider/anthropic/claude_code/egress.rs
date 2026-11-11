@@ -91,7 +91,7 @@ impl ClaudeCodeWireHook {
     }
 }
 
-/// A request the channel refuses before sending (always the caller's fault).
+/// A request rejected locally before sending because its final shape is invalid.
 #[derive(Debug, thiserror::Error)]
 #[error("invalid_request_error: {0}")]
 pub(crate) struct InvalidRequest(pub String);
@@ -184,8 +184,8 @@ fn cli_profile_headers(headers: &mut HeaderMap, count_tokens: bool, only_missing
     }
 }
 
-/// count_tokens keeps Claude Code's measured shape: model, messages, tools.
-fn shape_count_tokens(body: &mut Value, native: bool) {
+/// count_tokens keeps its own shape, including any caller-owned cache controls.
+fn shape_count_tokens(body: &mut Value, native: bool, explicit_cache: bool) {
     let Some(obj) = body.as_object_mut() else {
         return;
     };
@@ -196,10 +196,15 @@ fn shape_count_tokens(body: &mut Value, native: bool) {
         return;
     }
     let system = obj.remove("system");
-    obj.retain(|key, _| matches!(key.as_str(), "model" | "messages" | "tools"));
-    // Count the caller's system prompt where the Messages path will put it,
-    // never in the system slot (`relocateClaudeSystemPromptForCountTokens`).
-    cloak::relocate_caller_system_for_count(body, system.as_ref());
+    obj.retain(|key, _| {
+        matches!(
+            key.as_str(),
+            "model" | "messages" | "tools" | "cache_control"
+        )
+    });
+    // Preserve caller cache controls, but never run the Messages auto-placement
+    // or one-hour upgrade on the count endpoint.
+    cloak::relocate_caller_system_for_count_with_cache_mode(body, system.as_ref(), explicit_cache);
 }
 
 /// Shape `headers`, `url` and `body` for the Claude Code OAuth upstream.
@@ -229,14 +234,17 @@ pub(crate) fn prepare(
     let session = identity::session_uuid(input.incoming, body, native);
 
     let body_betas = cloak::take_body_betas(body);
-    if let Some(obj) = body.as_object_mut() {
-        obj.remove("prompt_cache_options");
-    }
+    // Capture the caller-owned mode before any shaping removes internal fields.
+    let explicit_cache = cloak::is_explicit_cache_mode(body);
     let subagent = profile::is_subagent(input.incoming, body);
 
     let mut aliases = ToolAliasMap::default();
     if count_tokens {
-        shape_count_tokens(body, native);
+        shape_count_tokens(body, native, explicit_cache);
+        cloak::enforce_cache_control_limit(body);
+        if !explicit_cache {
+            cloak::normalize_cache_ttl_order(body);
+        }
         if !native {
             aliases = tool_alias::alias_request_tools(body, &alias_secret(input));
         }
@@ -244,7 +252,9 @@ pub(crate) fn prepare(
         cloak::normalize_sampling(body, true);
         cloak::disable_thinking_if_tool_choice_forced(body);
         cloak::enforce_cache_control_limit(body);
-        cloak::normalize_cache_ttl_order(body);
+        if !explicit_cache {
+            cloak::normalize_cache_ttl_order(body);
+        }
         cloak::sanitize_web_search_domains(body);
         cloak::apply_preserved_thinking_binding(body);
         identity::apply_user_id(body, &device, &account, &session, true);
@@ -259,6 +269,10 @@ pub(crate) fn prepare(
         cloak::cloak(body, &ctx).map_err(InvalidRequest)?;
         aliases = tool_alias::alias_request_tools(body, &alias_secret(input));
         identity::apply_user_id(body, &device, &account, &session, false);
+    }
+
+    if let Some(obj) = body.as_object_mut() {
+        obj.remove("prompt_cache_options");
     }
 
     // ── Headers ──────────────────────────────────────────────────────────────
@@ -333,10 +347,36 @@ pub(crate) fn prepare(
     if let Some(api_key) = api_key {
         out.insert(HeaderName::from_static("x-api-key"), api_key);
     }
+    // This is the final semantic boundary after caller/provider overrides and
+    // channel shaping. Validation is read-only; the transport only signs bytes.
+    // Native callers retain their independently supported version/body contract.
+    if !native {
+        validate_generated_request(&out, body, count_tokens)?;
+    }
     *headers = out;
     *url = with_beta_query(url);
 
     Ok(ClaudeCodeWireHook { aliases, native })
+}
+
+fn validate_generated_request(
+    headers: &HeaderMap,
+    body: &Value,
+    count_tokens: bool,
+) -> Result<(), InvalidRequest> {
+    profile::validate_generated_profile(headers, body, count_tokens).map_err(InvalidRequest)?;
+    cloak::validate_cache_controls(body).map_err(InvalidRequest)?;
+    if !count_tokens
+        && profile::has_1h_ttl(body)
+        && !incoming_betas(headers)
+            .iter()
+            .any(|beta| beta == "extended-cache-ttl-2025-04-11")
+    {
+        return Err(InvalidRequest(
+            "cache_control.ttl: one-hour caching requires the extended-cache-ttl beta for this request type".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn count_tokens_betas(native: bool, caller: &[String], oauth: bool, body: &Value) -> String {
@@ -525,7 +565,7 @@ mod tests {
     }
 
     #[test]
-    fn fable_52_generated_requests_use_verified_identity_without_fallback() {
+    fn fable_52_generated_requests_use_coherent_profile_without_fallback() {
         for stream in [false, true] {
             let mut body = json!({
                 "model": "claude-fable-5-2",
@@ -539,7 +579,8 @@ mod tests {
             assert!(!hook.native);
             assert_eq!(url, "https://api.anthropic.com/v1/messages?beta=true");
             assert_eq!(headers["user-agent"], "claude-cli/2.1.321 (external, cli)");
-            assert_eq!(headers["x-stainless-package-version"], "0.112.1");
+            assert_eq!(headers["x-stainless-package-version"], "0.128.0");
+            assert_eq!(headers["x-stainless-runtime-version"], "v26.12.1");
             assert_eq!(body["model"], "claude-fable-5-2");
             assert_eq!(body["max_tokens"], 1024);
             assert_eq!(
@@ -551,14 +592,15 @@ mod tests {
             assert!(body.get("output_config").is_none());
             assert_eq!(body["system"].as_array().unwrap().len(), 2);
             assert_eq!(body["messages"][0]["content"][1]["text"], "who are u");
-            // Preserve the exact beta set exercised by the successful live probe.
+            // The generated profile follows the measured 2.1.321 capability ordering.
             assert_eq!(
                 headers["anthropic-beta"],
                 "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,\
-                 redact-thinking-2026-02-12,thinking-token-count-2026-05-13,\
-                 context-management-2025-06-27,prompt-caching-scope-2026-01-05,\
-                 mid-conversation-system-2026-04-07,mid-conversation-tool-changes-2026-07-01,\
-                 effort-2025-11-24,extended-cache-ttl-2025-04-11"
+                 redact-thinking-2026-02-12,context-management-2025-06-27,\
+                 prompt-caching-scope-2026-01-05,per-turn-control-2026-07-01,\
+                 mid-conversation-tool-changes-2026-07-01,thinking-token-count-2026-05-13,\
+                 mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,\
+                 extended-cache-ttl-2025-04-11"
             );
             let unsigned = serde_json::to_vec(&body).unwrap();
             let expected = cch::sign_body(&unsigned).unwrap();
@@ -648,6 +690,212 @@ mod tests {
         assert_eq!(rebound["session_id"], session);
         assert_ne!(rebound["device_id"], "c".repeat(64));
         assert!(!hook.rewrites_response());
+    }
+
+    #[test]
+    fn generated_request_validation_is_read_only_and_rejects_late_drift() {
+        let mut body =
+            json!({"model":"claude-opus-5","messages":[{"role":"user","content":"hello"}]});
+        let (_, headers, _) = run(&HeaderMap::new(), &mut body);
+        let original = body.clone();
+        validate_generated_request(&headers, &body, false).unwrap();
+        assert_eq!(body, original);
+
+        let mut drifted_headers = headers.clone();
+        drifted_headers.insert(
+            "x-stainless-package-version",
+            HeaderValue::from_static("0.112.1"),
+        );
+        assert!(validate_generated_request(&drifted_headers, &body, false).is_err());
+        assert_eq!(body, original);
+
+        let mut drifted_body = body.clone();
+        drifted_body["cache_control"] = json!({"type":"ephemeral","ttl":"30m"});
+        let before = drifted_body.clone();
+        let error = validate_generated_request(&headers, &drifted_body, false).unwrap_err();
+        assert!(error.to_string().contains("cache_control"));
+        assert_eq!(drifted_body, before);
+
+        let mut missing_beta = headers;
+        missing_beta.insert(
+            "anthropic-beta",
+            HeaderValue::from_static("oauth-2025-04-20"),
+        );
+        assert!(
+            validate_generated_request(&missing_beta, &body, false)
+                .unwrap_err()
+                .to_string()
+                .contains("extended-cache-ttl")
+        );
+    }
+
+    #[test]
+    fn explicit_cache_mode_is_consumed_after_shaping_without_synthetic_markers() {
+        let mut body = json!({
+            "model":"claude-opus-5",
+            "prompt_cache_options":{"mode":" Explicit "},
+            "cache_control":{"type":"ephemeral","ttl":"5m"},
+            "messages":[{"role":"user","content":"hello"}]
+        });
+        let (_, _, hook) = run(&HeaderMap::new(), &mut body);
+        assert!(!hook.native);
+        assert!(body.get("prompt_cache_options").is_none());
+        assert_eq!(
+            body["cache_control"],
+            json!({"type":"ephemeral","ttl":"5m"})
+        );
+        assert!(
+            body["system"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|b| b.get("cache_control").is_none())
+        );
+        for message in body["messages"].as_array().unwrap() {
+            if let Some(blocks) = message["content"].as_array() {
+                assert!(blocks.iter().all(|b| b.get("cache_control").is_none()));
+            }
+        }
+    }
+
+    #[test]
+    fn count_tokens_preserves_top_level_cache_without_materialization_or_upgrade() {
+        for explicit in [false, true] {
+            let provider = provider();
+            let credential = credential();
+            let incoming = HeaderMap::new();
+            let input = EgressInput {
+                provider: &provider,
+                credential: Some(&credential),
+                incoming: &incoming,
+                caller_scope: "test",
+                date: "2026-11-11",
+            };
+            let mut body = json!({"model":"claude-opus-5","cache_control":{"type":"ephemeral"},"messages":[{"role":"user","content":"hello"}]});
+            if explicit {
+                body["prompt_cache_options"] = json!({"mode":"explicit"});
+            }
+            let mut url = "https://api.anthropic.com/v1/messages/count_tokens".to_string();
+            let mut headers = outbound_headers();
+            let hook = prepare(&input, &mut url, &mut headers, &mut body).unwrap();
+            assert!(!hook.native);
+            assert_eq!(body["cache_control"], json!({"type":"ephemeral"}));
+            assert_eq!(body["messages"][0]["content"], "hello");
+            assert!(body.get("system").is_none());
+            assert!(body.get("metadata").is_none());
+            assert!(body.get("prompt_cache_options").is_none());
+            assert!(
+                !headers["anthropic-beta"]
+                    .to_str()
+                    .unwrap()
+                    .contains("extended-cache-ttl")
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_conflicting_cache_order_fails_without_automatic_ttl_rewrite() {
+        let provider = provider();
+        let credential = credential();
+        let incoming = HeaderMap::new();
+        let input = EgressInput {
+            provider: &provider,
+            credential: Some(&credential),
+            incoming: &incoming,
+            caller_scope: "test",
+            date: "2026-11-11",
+        };
+        let mut body = json!({
+            "model":"claude-opus-5", "prompt_cache_options":{"mode":"explicit"},
+            "tools":[{"name":"run","input_schema":{"type":"object"},"cache_control":{"type":"ephemeral","ttl":"5m"}}],
+            "messages":[{"role":"user","content":[{"type":"text","text":"hello","cache_control":{"type":"ephemeral","ttl":"1h"}}]}]
+        });
+        let mut url = "https://api.anthropic.com/v1/messages".to_string();
+        let mut headers = outbound_headers();
+        let error = prepare(&input, &mut url, &mut headers, &mut body).unwrap_err();
+        assert!(error.to_string().contains("cache_control"));
+        assert!(
+            body["messages"][0]["content"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|b| b.pointer("/cache_control/ttl") == Some(&json!("1h")))
+        );
+    }
+
+    #[test]
+    fn subagent_ttl_and_beta_are_derived_from_real_cache_markers() {
+        for one_hour in [false, true] {
+            let mut incoming = HeaderMap::new();
+            incoming.insert(
+                "x-claude-code-agent-id",
+                HeaderValue::from_static("child-1"),
+            );
+            let mut body = json!({
+                "model":"claude-opus-5", "messages":[{"role":"user","content":"hello"}],
+                "tools":[{"name":"run","input_schema":{"type":"object","default":{"cache_control":{"type":"ephemeral","ttl":"1h"}}}}]
+            });
+            if one_hour {
+                body["cache_control"] = json!({"type":"ephemeral","ttl":"1h"});
+            }
+            let (_, headers, _) = run(&incoming, &mut body);
+            assert_eq!(profile::has_1h_ttl(&body), one_hour);
+            assert_eq!(
+                headers["anthropic-beta"]
+                    .to_str()
+                    .unwrap()
+                    .contains("extended-cache-ttl"),
+                one_hour
+            );
+            assert_eq!(
+                body["tools"][0]["input_schema"]["default"]["cache_control"]["ttl"],
+                "1h"
+            );
+        }
+    }
+
+    #[test]
+    fn probe_drops_automatic_one_hour_cache_but_rejects_conflicting_explicit_mode() {
+        let mut automatic = json!({"model":"claude-haiku-4-5-20251001","max_tokens":1,"cache_control":{"type":"ephemeral","ttl":"1h"},"messages":[{"role":"user","content":"quota"}]});
+        let (_, headers, _) = run(&HeaderMap::new(), &mut automatic);
+        assert!(!profile::has_1h_ttl(&automatic));
+        assert!(
+            !headers["anthropic-beta"]
+                .to_str()
+                .unwrap()
+                .contains("extended-cache-ttl")
+        );
+        assert!(
+            !headers["anthropic-beta"]
+                .to_str()
+                .unwrap()
+                .contains("claude-code-20250219")
+        );
+
+        let provider = provider();
+        let credential = credential();
+        let incoming = HeaderMap::new();
+        let input = EgressInput {
+            provider: &provider,
+            credential: Some(&credential),
+            incoming: &incoming,
+            caller_scope: "test",
+            date: "2026-11-11",
+        };
+        let mut body = json!({"model":"claude-haiku-4-5-20251001","max_tokens":1,"prompt_cache_options":{"mode":"explicit"},"cache_control":{"type":"ephemeral","ttl":"1h"},"messages":[{"role":"user","content":"quota"}]});
+        let mut url = "https://api.anthropic.com/v1/messages".to_string();
+        let mut headers = outbound_headers();
+        let error = prepare(&input, &mut url, &mut headers, &mut body).unwrap_err();
+        assert!(error.to_string().contains("extended-cache-ttl"));
+        assert_eq!(body["cache_control"]["ttl"], "1h");
+    }
+
+    #[test]
+    fn plain_anthropic_api_key_is_not_a_claude_code_channel() {
+        let mut provider = provider();
+        provider.channel = None;
+        provider.auth_mode = "api_key".into();
+        assert!(!is_claude_code_channel(&provider));
     }
 
     #[test]

@@ -113,6 +113,10 @@ pub struct ProviderAccountView {
     pub kiro_usage: Option<KiroUsage>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub claude_usage: Option<ClaudeUsage>,
+    /// Partial inference-header evidence, never an authoritative full usage refresh.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub claude_quota_observation:
+        Option<crate::provider::anthropic::claude_code::quota_observation::ClaudeQuotaObservation>,
     pub observed_at: Option<i64>,
     /// Mandatory Claude usage admission deadline; not an observation timestamp.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -374,6 +378,7 @@ fn safe_account(
         reserve_usd: state.usage.as_ref().and_then(|u| u.overage_usd),
         kiro_usage: None,
         claude_usage: None,
+        claude_quota_observation: None,
         usage_refresh_available_at: None,
         observed_at: state.observed_at,
         stale: is_stale(&state),
@@ -1175,6 +1180,7 @@ impl AdminService {
             access_token,
             binding: driver.bind_runtime(provider, &credential)?,
             credential: Some(credential),
+            claude_observation_account: claude.then(|| account.clone()),
         })
     }
     pub async fn refresh_provider_account_usage(
@@ -1201,7 +1207,12 @@ impl AdminService {
         if current.status_version != before.status_version {
             return Err(conflict());
         }
-        if current.account_state != before.account_state {
+        // Passive inference headers are not a completed full usage refresh.
+        let authoritative_changed = current.account_state != before.account_state
+            && (!is_claude_account(&current)
+                || claude_authoritative_state(&current.account_state)?
+                    != claude_authoritative_state(&before.account_state)?);
+        if authoritative_changed {
             if is_claude_account(&current) {
                 let provider = self.account_pool_provider(id).await?;
                 return self

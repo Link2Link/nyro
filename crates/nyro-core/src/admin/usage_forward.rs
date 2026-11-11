@@ -980,6 +980,7 @@ mod tests {
                 reserve_usd: Some(123.0),
                 kiro_usage: None,
                 claude_usage: None,
+                claude_quota_observation: None,
                 observed_at: None,
                 usage_refresh_available_at: None,
                 stale: true,

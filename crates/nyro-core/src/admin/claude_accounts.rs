@@ -60,6 +60,7 @@ pub(super) fn safe_claude_account(
         reserve_usd: None,
         kiro_usage: None,
         claude_usage: state.usage,
+        claude_quota_observation: state.passive_usage,
         usage_refresh_available_at: None,
         observed_at: state.observed_at,
         stale: state.usage_stale
@@ -263,6 +264,71 @@ pub(super) fn claude_usage_observations(usage: &ClaudeUsage) -> Vec<QuotaTierObs
         .collect()
 }
 
+pub(super) fn claude_authoritative_state(raw: &str) -> anyhow::Result<Value> {
+    let mut value: Value = serde_json::from_str(raw)?;
+    if let Some(object) = value.as_object_mut() {
+        // Old rows omit default fields; passive serialization may materialize
+        // them without changing authoritative state. Preserve unknown fields.
+        if let Value::Object(defaults) = serde_json::to_value(ClaudeAccountState::default())? {
+            for (key, default) in defaults {
+                object.entry(key).or_insert(default);
+            }
+        }
+        object.remove("passive_usage");
+        object.remove("passive_usage_order");
+    }
+    Ok(value)
+}
+// Only observational header changes may be rebased over an active query. A
+// rejection, reauthorization or other authoritative state change still fences it.
+async fn publish_claude_usage_state(
+    gw: &Gateway,
+    account: &OAuthCredential,
+    next: ClaudeAccountState,
+) -> anyhow::Result<(String, ClaudeAccountState)> {
+    let original = claude_authoritative_state(&account.account_state)?;
+    let mut expected = account.account_state.clone();
+    let mut value = serde_json::to_value(&next)?;
+    let store = gw.storage.oauth_credentials();
+    for _ in 0..4 {
+        let raw = serde_json::to_string(&value)?;
+        if store
+            .compare_account_state(
+                &account.provider_id,
+                &account.account_id,
+                account.status_version,
+                &expected,
+                &raw,
+            )
+            .await?
+        {
+            return Ok((raw, serde_json::from_value(value)?));
+        }
+        let current = store
+            .get_account(&account.provider_id, &account.account_id)
+            .await?
+            .context("account not found")?;
+        anyhow::ensure!(
+            current.status_version == account.status_version
+                && claude_authoritative_state(&current.account_state)? == original,
+            "ACCOUNT_VERSION_CONFLICT: account changed during usage query"
+        );
+        let current_value: Value = serde_json::from_str(&current.account_state)?;
+        let object = value
+            .as_object_mut()
+            .context("Invalid Claude account state")?;
+        for key in ["passive_usage", "passive_usage_order"] {
+            if let Some(passive) = current_value.get(key) {
+                object.insert(key.into(), passive.clone());
+            } else {
+                object.remove(key);
+            }
+        }
+        expected = current.account_state;
+    }
+    anyhow::bail!("ACCOUNT_VERSION_CONFLICT: account observations changed during usage query")
+}
+
 impl AdminService {
     pub(super) async fn claude_usage_refresh_deadline(
         &self,
@@ -364,27 +430,16 @@ impl AdminService {
             Err(error) => {
                 next.usage_stale = true;
                 if error
-                    .to_string()
-                    .starts_with("Claude authentication failed (HTTP 401")
+                    .downcast_ref::<crate::provider::anthropic::claude_code::usage::UsageError>()
+                    .is_some_and(|error| error.status == Some(401))
                 {
                     next.auth_invalid = true;
                 }
                 Some(error)
             }
         };
-        let raw = serde_json::to_string(&next)?;
-        anyhow::ensure!(
-            store
-                .compare_account_state(
-                    &provider.id,
-                    account_id,
-                    account.status_version,
-                    &account.account_state,
-                    &raw
-                )
-                .await?,
-            "ACCOUNT_VERSION_CONFLICT: account changed during usage query"
-        );
+        let (raw, published) = publish_claude_usage_state(&self.gw, &account, next).await?;
+        let next = published;
         let mut updated = account;
         updated.account_state = raw;
         if result_error.is_some() || next.usage_stale {
@@ -444,6 +499,20 @@ impl AdminService {
         } else {
             Vec::new()
         };
+        // Serving a cached view is not a new upstream observation. For a pool,
+        // use the oldest member observation; any unknown member stays unknown.
+        let queried_at = if members.is_empty() {
+            String::new()
+        } else {
+            members
+                .iter()
+                .map(|account| account.observed_at.filter(|at| *at > 0))
+                .collect::<Option<Vec<_>>>()
+                .and_then(|times| times.into_iter().min())
+                .and_then(chrono::DateTime::<Utc>::from_timestamp_millis)
+                .map(|at| at.to_rfc3339())
+                .unwrap_or_default()
+        };
         ProviderUsage {
             quota_buckets: Vec::new(),
             provider_id: view.provider_id.clone(),
@@ -462,7 +531,7 @@ impl AdminService {
             spends: Vec::new(),
             is_available: Some(view.counts.available > 0),
             scheduling: self.gw.quota_registry.snapshot(&view.provider_id),
-            queried_at: Utc::now().to_rfc3339(),
+            queried_at,
             api_price: None,
             pool_quota: Some((&view.quota).into()),
             account_pool: Some(view),
@@ -522,6 +591,136 @@ mod tests {
             .await
             .unwrap()
     }
+    #[test]
+    fn passive_updates_are_not_completed_usage_refreshes() {
+        let before = "{}";
+        let mut passive = serde_json::to_value(ClaudeAccountState::default()).unwrap();
+        passive["passive_usage"] = serde_json::json!({"windows":[]});
+        passive["passive_usage_order"] = serde_json::json!({"five_hour":null});
+        assert_eq!(
+            claude_authoritative_state(before).unwrap(),
+            claude_authoritative_state(&passive.to_string()).unwrap()
+        );
+        passive["rejection_revision"] = serde_json::json!(1);
+        assert_ne!(
+            claude_authoritative_state(before).unwrap(),
+            claude_authoritative_state(&passive.to_string()).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn active_usage_publication_rebases_only_passive_observation_changes() {
+        let gw = gateway().await;
+        let account = add(&gw, "observation-race").await;
+        let store = gw.storage.oauth_credentials();
+        let mut observed: Value =
+            serde_json::to_value(ClaudeAccountState::parse(&account.account_state)).unwrap();
+        observed["passive_usage"] = serde_json::json!({"windows":[{
+            "name":"five_hour","used_percent":63.0,"status":"allowed",
+            "resets_at":null,"observed_at":1800000000000i64,"source":"inference_header"
+        }]});
+        assert!(
+            store
+                .compare_account_state(
+                    &account.provider_id,
+                    &account.account_id,
+                    account.status_version,
+                    &account.account_state,
+                    &observed.to_string()
+                )
+                .await
+                .unwrap()
+        );
+        let next = ClaudeAccountState {
+            usage: Some(usage(10.0, 20.0)),
+            observed_at: Some(1800000000001),
+            ..Default::default()
+        };
+        let (raw, published) = publish_claude_usage_state(&gw, &account, next)
+            .await
+            .unwrap();
+        assert_eq!(published.observed_at, Some(1800000000001));
+        assert_eq!(
+            serde_json::from_str::<Value>(&raw).unwrap()["passive_usage"],
+            observed["passive_usage"]
+        );
+        let current = store
+            .get_account(&account.provider_id, &account.account_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut rejected = ClaudeAccountState::parse(&current.account_state);
+        rejected.hard_quota = true;
+        rejected.rejection_revision += 1;
+        assert!(
+            store
+                .compare_account_state(
+                    &current.provider_id,
+                    &current.account_id,
+                    current.status_version,
+                    &current.account_state,
+                    &serde_json::to_string(&rejected).unwrap()
+                )
+                .await
+                .unwrap()
+        );
+        assert!(
+            publish_claude_usage_state(&gw, &current, published)
+                .await
+                .is_err()
+        );
+        assert!(
+            ClaudeAccountState::parse(
+                &store
+                    .get_account(&account.provider_id, &account.account_id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .account_state
+            )
+            .hard_quota
+        );
+    }
+
+    #[tokio::test]
+    async fn cached_provider_usage_keeps_real_observation_time_and_unknown_time() {
+        let gw = gateway().await;
+        let account = add(&gw, "cached-time").await;
+        let admin = gw.admin();
+        let mut view = admin
+            .get_provider_account_pool("claude-pool")
+            .await
+            .unwrap();
+        assert_eq!(view.accounts.len(), 1);
+        assert!(
+            admin
+                .claude_account_pool_provider_usage(view.clone())
+                .queried_at
+                .is_empty()
+        );
+        let old = 1800000000000i64;
+        view.accounts[0].observed_at = Some(old);
+        view.accounts[0].stale = true;
+        let report = admin.claude_account_pool_provider_usage(view.clone());
+        assert_eq!(
+            chrono::DateTime::parse_from_rfc3339(&report.queried_at)
+                .unwrap()
+                .timestamp_millis(),
+            old
+        );
+        assert!(report.account_pool.unwrap().accounts[0].stale);
+        let mut unknown = view.accounts[0].clone();
+        unknown.account_id = format!("{}-unknown", account.account_id);
+        unknown.observed_at = None;
+        view.accounts.push(unknown);
+        assert!(
+            admin
+                .claude_account_pool_provider_usage(view)
+                .queried_at
+                .is_empty()
+        );
+    }
+
     #[tokio::test]
     async fn claude_pool_dto_has_real_windows_without_devin_units_or_credentials() {
         let gw = gateway().await;
@@ -1397,6 +1596,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(runtime.access_token, "SECRET-a");
+        let pinned = runtime.claude_observation_account.as_ref().unwrap();
+        assert_eq!(pinned.account_id, a.account_id);
+        assert_eq!(pinned.status_version, a.status_version);
         assert_eq!(
             runtime
                 .binding
@@ -1419,6 +1621,14 @@ mod tests {
             .await
             .unwrap();
         assert!(updated.status_version > a.status_version);
+        assert_eq!(
+            runtime
+                .claude_observation_account
+                .as_ref()
+                .unwrap()
+                .status_version,
+            a.status_version
+        );
         assert!(
             !gw.storage
                 .oauth_credentials()

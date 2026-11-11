@@ -40,6 +40,18 @@ export interface ClaudeUsage {
   windows: { name: string; used_percent: number; resets_at: string | null }[];
 }
 
+/** Partial passive observations; never replace a full Claude usage snapshot. */
+export interface ClaudeQuotaObservation {
+  windows: {
+    name: string;
+    used_percent: number | null;
+    status: string | null;
+    resets_at: string | null;
+    observed_at: number;
+    source: "inference_header";
+  }[];
+}
+
 export interface ProviderAccountView {
   account_id: string;
   provider_id: string;
@@ -56,6 +68,7 @@ export interface ProviderAccountView {
   reserve_usd: number | null;
   kiro_usage?: KiroUsage | null;
   claude_usage?: ClaudeUsage | null;
+  claude_quota_observation?: ClaudeQuotaObservation | null;
   /** Claude only: backend-authoritative next allowed usage refresh attempt (epoch milliseconds). */
   usage_refresh_available_at?: number | null;
   observed_at: number | null;

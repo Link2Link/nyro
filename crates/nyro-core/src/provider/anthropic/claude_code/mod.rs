@@ -13,6 +13,7 @@ pub(crate) mod egress;
 pub(crate) mod errors;
 pub(crate) mod identity;
 pub(crate) mod profile;
+pub(crate) mod quota_observation;
 pub(crate) mod tool_alias;
 pub(crate) mod usage;
 pub(crate) mod usage_throttle;

@@ -24,6 +24,13 @@ pub const MAX_UPSTREAM_RESPONSE_BODY_BYTES: usize = 128 * 1024 * 1024;
 
 mod egress_hook;
 pub(crate) use egress_hook::EgressHook;
+
+/// Observe upstream headers before any body consumer or downstream response.
+/// Implementations must not mutate the response or issue extra upstream requests.
+#[async_trait::async_trait]
+pub(crate) trait ResponseObserver: Send + Sync {
+    async fn observe_response_headers(&self, status: u16, headers: &HeaderMap, response_url: &str);
+}
 use egress_hook::RewriteStream;
 
 #[derive(Clone)]
@@ -39,6 +46,7 @@ pub struct ProxyClient {
     /// restoration). Applied at this single send boundary so every request
     /// path — passthrough, IR encode, raw-wire compat — gets it.
     egress_hook: Option<std::sync::Arc<dyn EgressHook>>,
+    response_observer: Option<std::sync::Arc<dyn ResponseObserver>>,
 }
 
 pub struct ObservedResponse {
@@ -118,12 +126,21 @@ impl ProxyClient {
             deadline: Deadline::never(),
             connect_retries: 0,
             egress_hook: None,
+            response_observer: None,
         }
     }
 
     /// Install a provider-owned last-mile hook for every call on this client.
     pub(crate) fn with_egress_hook(mut self, hook: Option<std::sync::Arc<dyn EgressHook>>) -> Self {
         self.egress_hook = hook;
+        self
+    }
+
+    pub(crate) fn with_response_observer(
+        mut self,
+        observer: Option<std::sync::Arc<dyn ResponseObserver>>,
+    ) -> Self {
+        self.response_observer = observer;
         self
     }
 
@@ -323,15 +340,33 @@ impl ProxyClient {
                 }
             }
         };
+        let headers_at = tokio::time::Instant::now();
         if let Some(attempt) = &self.performance {
             attempt.response(response.status().as_u16(), response.headers());
+        }
+        if let Some(observer) = &self.response_observer {
+            // A slow/unavailable observation store must not stall inference.
+            // Await here so even an SSE body that never ends can publish headers.
+            if tokio::time::timeout(
+                std::time::Duration::from_millis(250),
+                observer.observe_response_headers(
+                    response.status().as_u16(),
+                    response.headers(),
+                    response.url().as_str(),
+                ),
+            )
+            .await
+            .is_err()
+            {
+                tracing::debug!("upstream quota header observation timed out");
+            }
         }
         Ok(ObservedResponse {
             response,
             performance: self.performance.clone(),
             timeouts: self.timeouts,
             deadline: self.deadline.clone(),
-            headers_at: tokio::time::Instant::now(),
+            headers_at,
             egress_hook: self.egress_hook.clone(),
         })
     }
@@ -415,6 +450,46 @@ mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::sync::oneshot;
+
+    #[tokio::test]
+    async fn response_observer_runs_before_stream_body_is_available() {
+        struct Observer(std::sync::atomic::AtomicBool);
+        #[async_trait::async_trait]
+        impl ResponseObserver for Observer {
+            async fn observe_response_headers(&self, status: u16, headers: &HeaderMap, _: &str) {
+                assert_eq!(status, 200);
+                assert_eq!(
+                    headers["anthropic-ratelimit-unified-5h-utilization"],
+                    "0.42"
+                );
+                self.0.store(true, std::sync::atomic::Ordering::Release);
+            }
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/v1/messages", listener.local_addr().unwrap());
+        let (release_tx, release_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            read_request(&mut socket).await;
+            socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 2\r\nanthropic-ratelimit-unified-5h-utilization: 0.42\r\n\r\n").await.unwrap();
+            release_rx.await.unwrap();
+            socket.write_all(b"ok").await.unwrap();
+        });
+        let observer = std::sync::Arc::new(Observer(std::sync::atomic::AtomicBool::new(false)));
+        let client =
+            ProxyClient::new(reqwest::Client::new()).with_response_observer(Some(observer.clone()));
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            client.call_stream_raw(&url, HeaderMap::new(), Bytes::from_static(b"{}")),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(observer.0.load(std::sync::atomic::Ordering::Acquire));
+        release_tx.send(()).unwrap();
+        assert_eq!(response.bytes().await.unwrap(), Bytes::from_static(b"ok"));
+        server.await.unwrap();
+    }
 
     async fn serve_once(response: &[u8]) -> (String, oneshot::Receiver<Vec<u8>>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
