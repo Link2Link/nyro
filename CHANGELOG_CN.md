@@ -10,7 +10,7 @@ Nyro 的所有重要变更均记录在此文件中。
 
 #### 修复
 
-- **自适应思考模型的关闭思考请求**：关闭思考的请求（`thinking.type: disabled`，或 `enabled` 且 `budget_tokens: 0`）现在按各模型接受的形态改写，不再原样转发。`claude-opus-5-5` 和 `claude-fable-5` 系列不能关闭思考，退回 `thinking: {type: adaptive, display: omitted}` 加 `output_config.effort: low`；`claude-sonnet-5-5` 使用不带 effort 的 `thinking: {type: between_tools}`；`claude-haiku-5-5` 等仍支持 `disabled` 的模型保持不变。修复了非原生客户端（例如生成会话标题的请求）要求 Opus 5.5 不思考时，上游返回 400 `"thinking.type.disabled" is not supported for this model` 的问题。改写位于共用的思考参数策略中，Anthropic 直通、跨协议及流式请求均已覆盖；模型能力规则参照 CLIProxyAPI ad9e456d。
+- **自适应思考模型的关闭思考请求**（#30）：关闭思考的请求（`thinking.type: disabled`，或 `enabled` 且 `budget_tokens: 0`）现在按各模型接受的形态改写，不再原样转发。`claude-opus-5-5` 和 `claude-fable-5` 系列不能关闭思考，退回 `thinking: {type: adaptive, display: omitted}` 加 `output_config.effort: low`；`claude-sonnet-5-5` 使用不带 effort 的 `thinking: {type: between_tools}`；`claude-haiku-5-5` 等仍支持 `disabled` 的模型保持不变。修复了非原生客户端（例如生成会话标题的请求）要求 Opus 5.5 不思考时，上游返回 400 `"thinking.type.disabled" is not supported for this model` 的问题。改写位于共用的思考参数策略中，Anthropic 直通、跨协议及流式请求均已覆盖；模型能力规则参照 CLIProxyAPI ad9e456d。
 
 ---
 
