@@ -1,4 +1,5 @@
 import type { Provider, ProviderPreset, TestResult } from "./types";
+import { isProviderTestSkipped } from "./provider-test";
 
 export const PROVIDER_GROUP_STORAGE_KEY = "nyro.provider-groups.v1";
 
@@ -48,8 +49,10 @@ export function groupProviders(
   return [...groups.values()];
 }
 
-export function providerNeedsAttention(provider: Provider, result?: TestResult): boolean {
-  return (result ? !result.success : provider.last_test_success === false)
+export function providerNeedsAttention(provider: Provider, result?: TestResult, previous?: TestResult): boolean {
+  // A skipped run adds no new health verdict, but must not hide a known failure.
+  const verdict = result && !isProviderTestSkipped(result) ? result : previous;
+  return (verdict && !isProviderTestSkipped(verdict) ? !verdict.success : provider.last_test_success === false)
     || (provider.auth_mode === "oauth" && Boolean(provider.oauth_status)
       && ["not_connected", "unavailable", "quota_exhausted", "error", "disconnected"].includes(provider.oauth_status!));
 }

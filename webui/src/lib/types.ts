@@ -570,7 +570,9 @@ export interface TestResult {
   success: boolean;
   latency_ms: number;
   model?: string;
-  error?: string;
+  error?: string | null;
+  /** usage_cooldown: no accounts were tested; neither a pass nor a failure. */
+  skipped_reason?: string | null;
   endpoints?: EndpointTestResult[];
   /** Per-account connectivity only; absent in older results. Not a quota or model-access check. */
   accounts?: AccountTestResult[];
@@ -583,8 +585,10 @@ export interface AccountTestResult {
   latency_ms: number;
   /** Safe diagnostic text only; never credentials or raw upstream responses. */
   error?: string | null;
-  /** disabled | disconnected | account_changed: skipped, not a failed probe. */
+  /** disabled | disconnected | account_changed | usage_cooldown: skipped, not a failed probe. */
   skipped_reason?: string | null;
+  /** Earliest usage retry time, in epoch milliseconds, for cooldown skips. */
+  retry_at?: number | null;
   tested_at: string;
 }
 

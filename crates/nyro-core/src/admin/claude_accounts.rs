@@ -870,6 +870,17 @@ mod tests {
             .await
             .unwrap();
         assert!(!tested.success); // A cache hit must not masquerade as authenticated connectivity.
+        assert!(tested.error.is_none());
+        assert_eq!(tested.skipped_reason.as_deref(), Some("usage_cooldown"));
+        assert_eq!(
+            tested.accounts[0].skipped_reason.as_deref(),
+            Some("usage_cooldown")
+        );
+        assert_eq!(
+            tested.accounts[0].retry_at,
+            manual.usage_refresh_available_at
+        );
+        assert!(tested.accounts[0].error.is_none());
         assert_eq!(hits.load(Ordering::SeqCst), 1);
         assert_eq!(
             store

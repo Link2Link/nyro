@@ -87,3 +87,16 @@ test("attention counts failed tests and OAuth issues, never infers health from e
   equal(providerNeedsAttention(provider("pending", { auth_mode: "oauth", oauth_status: "pending" })), false);
   equal(providerNeedsAttention(provider("connected", { auth_mode: "oauth", oauth_status: "connected" })), false);
 });
+
+test("skipped checks add no attention but preserve known failures and OAuth issues", () => {
+  const skipped = { success: false, latency_ms: 0, error: null, skipped_reason: "usage_cooldown" };
+  equal(providerNeedsAttention(provider("new"), skipped), false);
+  equal(providerNeedsAttention(provider("passed", { last_test_success: true }), skipped), false);
+  equal(providerNeedsAttention(provider("failed", { last_test_success: false }), skipped), true);
+  equal(providerNeedsAttention(provider("new"), skipped, { success: true, latency_ms: 42 }), false);
+  equal(providerNeedsAttention(provider("new"), skipped, { success: false, latency_ms: 0, error: "Prior real error" }), true);
+  equal(providerNeedsAttention(provider("failed", { last_test_success: false }), skipped, { success: true, latency_ms: 42 }), false);
+  equal(providerNeedsAttention(provider("oauth", { auth_mode: "oauth", oauth_status: "error" }), skipped), true);
+  equal(providerNeedsAttention(provider("passed"), { success: false, latency_ms: 42, error: "Real mixed failure" }, { success: true, latency_ms: 42 }), true);
+  equal(providerNeedsAttention(provider("failed"), { success: true, latency_ms: 42 }), false);
+});

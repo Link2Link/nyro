@@ -2,6 +2,7 @@
 //! non-generating status RPC; they neither spend chat quota nor claim that a
 //! particular model is usable. A pool succeeds when any enabled account passes.
 use super::*;
+use crate::provider::anthropic::claude_code::usage_throttle::Cooldown;
 use futures::{StreamExt, stream};
 use std::future::Future;
 
@@ -42,6 +43,26 @@ impl AdminService {
                     .await?;
                 if !same_generation(current.as_ref(), &account) {
                     return Ok(ProbeOutcome::Changed);
+                }
+                // Admission deferral is not failed connectivity. Avoid even token
+                // refresh/runtime resolution while the usage probe is prohibited.
+                if claude
+                    && let Some(retry_at) = admin
+                        .claude_usage_refresh_deadline(&provider, &account)
+                        .await?
+                    && retry_at > Utc::now().timestamp_millis()
+                {
+                    let current = admin
+                        .gw
+                        .storage
+                        .oauth_credentials()
+                        .get_account(&provider.id, &account.account_id)
+                        .await?;
+                    return Ok(if same_generation(current.as_ref(), &account) {
+                        ProbeOutcome::Cooldown { retry_at }
+                    } else {
+                        ProbeOutcome::Changed
+                    });
                 }
                 let account = if kiro {
                     admin.refresh_kiro_pool_account(&provider, &account).await?
@@ -107,7 +128,12 @@ impl AdminService {
                 if !same_generation(current.as_ref(), &account) {
                     return Ok(ProbeOutcome::Changed);
                 }
-                outcome.map(|()| ProbeOutcome::Connected)
+                match outcome {
+                    Err(error) if error.is::<Cooldown>() => Ok(ProbeOutcome::Cooldown {
+                        retry_at: error.downcast_ref::<Cooldown>().unwrap().next_refresh_at,
+                    }),
+                    result => result.map(|()| ProbeOutcome::Connected),
+                }
             }
         })
         .await;
@@ -134,6 +160,7 @@ fn same_generation(current: Option<&OAuthCredential>, tested: &OAuthCredential) 
 enum ProbeOutcome {
     Connected,
     Changed,
+    Cooldown { retry_at: i64 },
 }
 
 /// The injected operation is the production account/runtime/status sequence;
@@ -155,6 +182,7 @@ where
                 latency_ms: 0,
                 error: None,
                 skipped_reason: None,
+                retry_at: None,
                 tested_at: Utc::now().to_rfc3339(),
             };
             if account.status == "disconnected" {
@@ -168,6 +196,10 @@ where
                     Ok(Ok(ProbeOutcome::Connected)) => result.success = true,
                     Ok(Ok(ProbeOutcome::Changed)) => {
                         result.skipped_reason = Some("account_changed".into())
+                    }
+                    Ok(Ok(ProbeOutcome::Cooldown { retry_at })) => {
+                        result.skipped_reason = Some("usage_cooldown".into());
+                        result.retry_at = Some(retry_at);
                     }
                     Ok(Err(error)) => result.error = Some(safe_probe_error(&error)),
                     Err(_) => result.error = Some("Devin connectivity check timed out".into()),
@@ -183,7 +215,14 @@ where
     results.sort_by_key(|(index, _)| *index);
     let accounts: Vec<_> = results.into_iter().map(|(_, account)| account).collect();
     let success = accounts.iter().any(|account| account.success);
-    let error = if success {
+    let skipped_reason = (accounts
+        .iter()
+        .all(|account| account.skipped_reason.is_some())
+        && accounts
+            .iter()
+            .any(|account| account.skipped_reason.as_deref() == Some("usage_cooldown")))
+    .then(|| "usage_cooldown".to_owned());
+    let error = if success || skipped_reason.is_some() {
         None
     } else if accounts.is_empty() {
         Some("No Devin accounts are connected".into())
@@ -199,6 +238,7 @@ where
     };
     TestResult {
         success,
+        skipped_reason,
         latency_ms: started.elapsed().as_millis() as u64,
         model: None,
         error,
@@ -336,6 +376,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cooldown_accounts_are_skipped_without_connectivity_errors_or_success() {
+        let retry_at = 1_800_000_600_000;
+        let mut disabled = account("disabled");
+        disabled.is_enabled = false;
+        let result = probe_accounts(vec![account("one"), disabled, account("two")], |_| async {
+            Ok(ProbeOutcome::Cooldown { retry_at })
+        })
+        .await;
+        assert!(!result.success);
+        assert!(result.error.is_none());
+        assert_eq!(result.skipped_reason.as_deref(), Some("usage_cooldown"));
+        for index in [0, 2] {
+            let row = &result.accounts[index];
+            assert!(!row.success && row.error.is_none());
+            assert_eq!(row.skipped_reason.as_deref(), Some("usage_cooldown"));
+            assert_eq!(row.retry_at, Some(retry_at));
+        }
+        assert_eq!(
+            result.accounts[1].skipped_reason.as_deref(),
+            Some("disabled")
+        );
+        assert!(result.accounts[1].retry_at.is_none());
+        let wire = serde_json::to_value(&result).unwrap();
+        assert_eq!(wire["skipped_reason"], "usage_cooldown");
+        assert_eq!(wire["accounts"][0]["retry_at"], retry_at);
+        let decoded: TestResult = serde_json::from_value(wire).unwrap();
+        assert_eq!(decoded.accounts[2].retry_at, Some(retry_at));
+    }
+
+    #[tokio::test]
+    async fn cooldown_does_not_mask_real_failures_or_fabricate_passes_in_mixed_pool() {
+        for succeeds in [false, true] {
+            let result = probe_accounts(
+                vec![account("cooling"), account("tested")],
+                |a| async move {
+                    if a.account_id == "cooling" {
+                        Ok(ProbeOutcome::Cooldown {
+                            retry_at: 1_800_000_600_000,
+                        })
+                    } else if succeeds {
+                        Ok(ProbeOutcome::Connected)
+                    } else {
+                        anyhow::bail!("Claude authentication failed (HTTP 401); SECRET")
+                    }
+                },
+            )
+            .await;
+            assert_eq!(result.success, succeeds);
+            assert!(result.skipped_reason.is_none());
+            assert_eq!(result.error.is_none(), succeeds);
+            assert_eq!(
+                result.accounts[0].skipped_reason.as_deref(),
+                Some("usage_cooldown")
+            );
+            assert!(result.accounts[0].error.is_none());
+            assert!(result.accounts[1].skipped_reason.is_none());
+            assert!(result.accounts[1].retry_at.is_none());
+            if !succeeds {
+                assert_eq!(
+                    result.accounts[1].error.as_deref(),
+                    Some("Devin account authentication was rejected; sign in again")
+                );
+                assert!(!serde_json::to_string(&result).unwrap().contains("SECRET"));
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn concurrency_is_bounded_and_output_order_is_stable() {
         let active = Arc::new(AtomicUsize::new(0));
         let peak = Arc::new(AtomicUsize::new(0));
@@ -377,5 +485,12 @@ mod tests {
         )
         .unwrap();
         assert!(legacy.accounts.is_empty());
+        assert!(legacy.skipped_reason.is_none());
+        let legacy_account: AccountTestResult = serde_json::from_value(serde_json::json!({
+            "account_id":"a", "label":"A", "success":true, "latency_ms":1,
+            "error":null, "skipped_reason":null, "tested_at":"2030-01-01T00:00:00Z"
+        }))
+        .unwrap();
+        assert!(legacy_account.retry_at.is_none());
     }
 }

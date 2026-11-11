@@ -7,6 +7,48 @@ export type ProviderTestLog = {
   message: string;
 };
 
+/** A skip never overrides a real probe or error, even in a stale/malformed cache. */
+export function isProviderTestSkipped(result: TestResult): boolean {
+  return Boolean(result.skipped_reason) && !result.success && !result.error
+    && !result.accounts?.some((account) => !account.skipped_reason)
+    && !result.endpoints?.length;
+}
+
+export function providerTestStatus(result: TestResult): "success" | "failed" | "skipped" {
+  return isProviderTestSkipped(result) ? "skipped" : result.success ? "success" : "failed";
+}
+
+/** Incomplete cooldown runs must not replace the last actual verdict in localStorage. */
+export function mergeProviderTestVerdict(
+  previous: Record<string, TestResult>, id: string, result: TestResult,
+): Record<string, TestResult> {
+  const incomplete = !result.success
+    && result.accounts?.some((account) => account.skipped_reason === "usage_cooldown")
+    && !result.accounts.some((account) => !account.skipped_reason && account.success);
+  return isProviderTestSkipped(result) || incomplete ? previous : { ...previous, [id]: result };
+}
+
+function usageCooldownReason(retryAt: number | null | undefined, isZh: boolean): string {
+  const reason = isZh ? "用量查询冷却中" : "Usage cooldown";
+  const retry = typeof retryAt === "number" && Number.isFinite(retryAt) ? new Date(retryAt) : null;
+  if (!retry || !Number.isFinite(retry.getTime())) {
+    return isZh ? `${reason}，请稍后重试` : `${reason}; retry later`;
+  }
+  const time = retry.toLocaleString(isZh ? "zh-CN" : "en-US", { timeZoneName: "short" });
+  return isZh ? `${reason}；可重试时间：${time}` : `${reason}; retry after ${time}`;
+}
+
+export function formatProviderTestSkip(result: TestResult, isZh = false): string {
+  const retryTimes = (result.accounts ?? [])
+    .filter((account) => account.skipped_reason === "usage_cooldown")
+    .map((account) => account.retry_at)
+    .filter((time): time is number => typeof time === "number" && Number.isFinite(new Date(time).getTime()));
+  const reason = result.skipped_reason === "usage_cooldown"
+    ? usageCooldownReason(retryTimes.length ? Math.min(...retryTimes) : undefined, isZh)
+    : (isZh ? "未执行连通性检查" : "Connectivity check not performed");
+  return isZh ? `↷ 连通性检查已跳过：${reason}` : `↷ Connectivity check skipped: ${reason}`;
+}
+
 export function providerTestError(error: string | null | undefined, isZh = false): string {
   switch (error) {
     case "Devin account is not authorized; sign in again":
@@ -43,6 +85,9 @@ export function formatAccountTestLogs(accounts?: AccountTestResult[], isZh = fal
       skipped += 1;
       let reason: string;
       switch (account.skipped_reason) {
+        case "usage_cooldown":
+          reason = usageCooldownReason(account.retry_at, isZh);
+          break;
         case "disabled":
           reason = isZh ? "已禁用" : "Disabled";
           break;
@@ -92,7 +137,8 @@ export function normalizeCachedProviderTestResult(value: unknown): TestResult | 
     success: result.success,
     latency_ms: Number.isFinite(result.latency_ms) ? result.latency_ms : 0,
     model: typeof result.model === "string" ? result.model : undefined,
-    error: typeof result.error === "string" ? result.error : undefined,
+    error: typeof result.error === "string" || result.error === null ? result.error : undefined,
+    skipped_reason: typeof result.skipped_reason === "string" ? result.skipped_reason : undefined,
     endpoints: Array.isArray(result.endpoints) ? result.endpoints : undefined,
     accounts: Array.isArray(result.accounts) ? result.accounts : undefined,
   };
