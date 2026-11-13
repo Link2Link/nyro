@@ -392,10 +392,22 @@ pub(crate) async fn fetch_available_models(
     Ok(parse_available_models_detailed(&parsed))
 }
 
+/// Catalog rows the backend lists but refuses to serve to this account: an
+/// explicit `disabled: true` marker (the IDE renders it "Unavailable") or the
+/// `<model>-disabled` placeholder id that stands in for a model outside the
+/// account's plan (observed: `gemini-4-argon-disabled` on Google AI Pro
+/// trial/promotional plans). Both answer 404 NOT_FOUND on the inference
+/// surface, so they are never callable models.
+fn is_disabled_catalog_entry(id: &str, info: &Value) -> bool {
+    info.get("disabled").and_then(Value::as_bool) == Some(true)
+        || id.trim().to_ascii_lowercase().ends_with("-disabled")
+}
+
 /// Same payload → per-model entries with quota state
 /// (`quotaInfo.remainingFraction` / `quotaInfo.resetTime`, best-effort).
 /// Ids listed in `deprecatedModelIds` are dropped — upstream itself marks
-/// them dead (they 404 on the inference surface).
+/// them dead (they 404 on the inference surface) — and so are disabled
+/// placeholders (see `is_disabled_catalog_entry`).
 pub(crate) fn parse_available_models_detailed(payload: &Value) -> Vec<AvailableModel> {
     let Some(models) = payload.get("models").and_then(Value::as_object) else {
         return Vec::new();
@@ -413,6 +425,7 @@ pub(crate) fn parse_available_models_detailed(payload: &Value) -> Vec<AvailableM
     let mut entries: Vec<AvailableModel> = models
         .iter()
         .filter(|(id, _)| !deprecated.iter().any(|dead| dead == *id))
+        .filter(|(id, info)| !is_disabled_catalog_entry(id, info))
         .map(|(id, info)| {
             let quota = info.get("quotaInfo").filter(|q| q.is_object());
             AvailableModel {
@@ -1852,6 +1865,45 @@ mod tests {
         // Deprecated entries are dropped even though upstream still lists
         // them in `models` (they 404 on the inference surface).
         assert_eq!(ids, vec!["gemini-3.8-flash-high".to_string()]);
+    }
+
+    #[test]
+    fn parse_available_models_detailed_drops_disabled_placeholders() {
+        // Shape observed on a Google AI Pro promotional account: the plan
+        // excludes Argon, so the catalog carries a disabled placeholder that
+        // answers 404 NOT_FOUND instead of the servable tier ids.
+        let payload = json!({
+            "models": {
+                "gemini-4-argon-disabled": {
+                    "displayName": "Gemini 4 Argon",
+                    "disabled": true,
+                    "tagTitle": "Unavailable",
+                    "quotaInfo": {"remainingFraction": 1.0}
+                },
+                // Either signal alone is enough.
+                "Gemini-5-Preview-DISABLED": {},
+                "claude-opus-6": {"disabled": true},
+                // Explicitly enabled / malformed markers keep the row.
+                "gemini-3.8-flash-high": {"disabled": false},
+                "gemini-3.8-flash-low": {"disabled": "true"},
+                "claude-sonnet-4-6": {},
+                // Only the suffix counts, not the word anywhere in the id.
+                "gemini-disabled-preview": {},
+            }
+        });
+        let ids: Vec<String> = parse_available_models_detailed(&payload)
+            .into_iter()
+            .map(|model| model.id)
+            .collect();
+        assert_eq!(
+            ids,
+            vec![
+                "claude-sonnet-4-6".to_string(),
+                "gemini-3.8-flash-high".to_string(),
+                "gemini-3.8-flash-low".to_string(),
+                "gemini-disabled-preview".to_string(),
+            ]
+        );
     }
 
     #[test]

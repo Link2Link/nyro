@@ -317,6 +317,27 @@ fn google_subscription_probe_models(
         .collect()
 }
 
+/// Explains a 404 from a Google subscription surface (antigravity /
+/// gemini-cli). Google answers the same bare NOT_FOUND for a retired id and
+/// for a model the account's plan does not include, so the upstream message
+/// alone never says why an advertised model fails.
+fn google_subscription_not_found_hint(
+    suite: crate::protocol::ids::Protocol,
+    channel: Option<&str>,
+    status: u16,
+) -> Option<&'static str> {
+    let subscription_channel = channel.map(str::trim).is_some_and(|channel| {
+        channel.eq_ignore_ascii_case("antigravity") || channel.eq_ignore_ascii_case("gemini-cli")
+    });
+    (status == 404 && suite == crate::protocol::ids::Protocol::GoogleGemini && subscription_channel)
+        .then_some(
+            " — Google answers NOT_FOUND both for retired model ids and for models \
+             outside this account's plan (Google AI Pro trial/student promotional \
+             plans, for example, exclude Gemini 4 Argon and Claude 5.5). Check the \
+             model id and the account's subscription plan.",
+        )
+}
+
 /// Probe one model with a single minimal request carrying `prompt` (30s timeout).
 #[allow(clippy::too_many_arguments)]
 async fn probe_single_model(
@@ -420,6 +441,10 @@ async fn probe_single_model(
                     .to_string()
             } else if status.as_u16() == 429 {
                 " — rate limited by the upstream; retry after the reset time.".to_string()
+            } else if let Some(hint) =
+                google_subscription_not_found_hint(suite, channel, status.as_u16())
+            {
+                hint.to_string()
             } else {
                 String::new()
             };
@@ -1352,6 +1377,35 @@ mod probe_routing_tests {
         ANTHROPIC_MESSAGES_2023_06_01, OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1, OPENAI_RESPONSES_V1,
         Protocol, ProtocolId,
     };
+
+    #[test]
+    fn google_subscription_not_found_hint_scopes_to_subscription_404s() {
+        let gemini = Protocol::GoogleGemini;
+        for channel in ["antigravity", "gemini-cli", " Antigravity "] {
+            let hint = google_subscription_not_found_hint(gemini, Some(channel), 404)
+                .unwrap_or_else(|| panic!("{channel} 404 must carry the hint"));
+            assert!(hint.contains("outside this account's plan"), "{hint}");
+            assert!(hint.contains("Gemini 4 Argon and Claude 5.5"), "{hint}");
+        }
+        // Other statuses keep their own hints (or none).
+        for status in [400, 403, 429, 500] {
+            assert!(
+                google_subscription_not_found_hint(gemini, Some("antigravity"), status).is_none()
+            );
+        }
+        // API-key Gemini and non-Gemini suites: a 404 means something else.
+        for channel in [None, Some("default"), Some("")] {
+            assert!(google_subscription_not_found_hint(gemini, channel, 404).is_none());
+        }
+        assert!(
+            google_subscription_not_found_hint(
+                Protocol::AnthropicMessages,
+                Some("antigravity"),
+                404
+            )
+            .is_none()
+        );
+    }
 
     #[test]
     fn google_subscription_probes_resolve_public_names_to_default_wire_tiers() {

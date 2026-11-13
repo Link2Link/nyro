@@ -1,6 +1,7 @@
 //! Non-stream Anthropic requests must retain Google subscription upstream SSE.
 //! Real dispatcher, synthetic credentials and loopback-only HTTP; no discovery,
 //! OAuth refresh, official manifest, or Gateway background task is allowed out.
+//! The same fixture also covers admin probe diagnostics for these channels.
 
 use std::{
     future::Future,
@@ -67,6 +68,24 @@ async fn upstream(State(seen): State<Requests>, uri: Uri, Json(body): Json<Value
     (
         [("content-type", "text/event-stream")],
         format!("data: {first}\n\ndata: {last}\n\n"),
+    )
+        .into_response()
+}
+
+/// Google's reply for a model outside the account's plan (and for retired ids).
+async fn not_found_upstream(
+    State(seen): State<Requests>,
+    uri: Uri,
+    Json(body): Json<Value>,
+) -> Response {
+    seen.lock().unwrap().push(Seen { uri, body });
+    (
+        StatusCode::NOT_FOUND,
+        Json(json!({"error": {
+            "code": 404,
+            "message": "Requested entity was not found.",
+            "status": "NOT_FOUND"
+        }})),
     )
         .into_response()
 }
@@ -408,4 +427,64 @@ fn admin_anthropic_probe_through_remote_nyro_aggregates_google_subscription_sse(
         assert!(google_request.body["request"].get("stream").is_none());
         Ok(())
     })
+}
+
+/// A plan-excluded model (observed: Gemini 4 Argon / Claude 5.5 on a Google AI
+/// Pro promotional account) answers a bare 404 NOT_FOUND; the probe result must
+/// keep Google's message and explain the likely entitlement cause.
+fn admin_probe_explains_google_subscription_not_found(channel: &str) -> anyhow::Result<()> {
+    const PLAN_EXCLUDED_MODEL: &str = "gemini-4-argon";
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+    listener.set_nonblocking(true)?;
+    let base_url = format!("http://{}", listener.local_addr()?);
+    let gateway = offline_gateway(channel, &base_url)?;
+    runtime()?.block_on(async move {
+        let seen = Requests::default();
+        let app = Router::new()
+            .route("/*path", post(not_found_upstream))
+            .with_state(seen.clone());
+        let listener = tokio::net::TcpListener::from_std(listener)?;
+        let _server = AbortOnDrop(tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        }));
+        bind_fixture_credential(&gateway).await?;
+        let outcome = tokio::time::timeout(
+            TIMEOUT,
+            gateway.admin().probe_provider_models(
+                "local-subscription",
+                Some(vec![PLAN_EXCLUDED_MODEL.into()]),
+            ),
+        )
+        .await??;
+        assert_eq!(outcome.results.len(), 1);
+        let result = &outcome.results[0];
+        assert_eq!(result.model, PLAN_EXCLUDED_MODEL);
+        assert!(!result.success, "{result:?}");
+        let error = result
+            .error
+            .as_deref()
+            .expect("failed probe carries an error");
+        assert!(error.starts_with("HTTP 404 Not Found: "), "{error}");
+        assert!(error.contains("Requested entity was not found."), "{error}");
+        assert!(error.contains("outside this account's plan"), "{error}");
+        let requests = seen.lock().unwrap();
+        assert_eq!(requests.len(), 1, "exactly one upstream call: {requests:?}");
+        assert_eq!(
+            requests[0].uri.path_and_query().unwrap().as_str(),
+            "/v1internal:streamGenerateContent?alt=sse"
+        );
+        assert_eq!(requests[0].body["model"], PLAN_EXCLUDED_MODEL);
+        assert_eq!(requests[0].body["project"], "fixture-project");
+        Ok(())
+    })
+}
+
+#[test]
+fn admin_probe_explains_antigravity_not_found() -> anyhow::Result<()> {
+    admin_probe_explains_google_subscription_not_found("antigravity")
+}
+
+#[test]
+fn admin_probe_explains_gemini_cli_not_found() -> anyhow::Result<()> {
+    admin_probe_explains_google_subscription_not_found("gemini-cli")
 }
