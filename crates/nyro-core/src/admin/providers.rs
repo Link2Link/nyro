@@ -4155,8 +4155,17 @@ mod probe_reply_tests {
         assert_eq!(headers.get(AUTHORIZATION).unwrap(), "Bearer ya29.probe");
         assert_eq!(body["model"], "gemini-2.5-pro");
         assert_eq!(body["project"], "cloudaicompanion-9");
-        assert!(body["request"]["contents"].is_array());
-        assert!(body["request"]["systemInstruction"]["parts"].is_array());
+        // Antigravity carries the probe's system text as a leading user turn,
+        // exactly like dispatch (systemInstruction is classified upstream).
+        assert!(body["request"].get("systemInstruction").is_none());
+        assert_eq!(
+            body["request"]["contents"][0]["parts"][0]["text"],
+            "You are a helpful AI assistant."
+        );
+        assert_eq!(
+            body["request"]["contents"][1]["parts"][0]["text"],
+            DEFAULT_MODEL_PROBE_PROMPT
+        );
     }
 
     #[tokio::test]

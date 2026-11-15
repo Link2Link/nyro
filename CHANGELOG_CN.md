@@ -4,6 +4,21 @@ Nyro 的所有重要变更均记录在此文件中。
 
 ---
 
+## v2.1.43
+
+> 发布于 2026-11-16
+
+#### 修复
+
+- **Antigravity 系统提示词不再触发 429**（#32）：Google Antigravity 会审查 `systemInstruction`，第三方 Agent 身份（例如 “You are an AI agent powered by DeepSeek Harness.” 或 Claude Code 身份）放在系统提示词里时，所有模型都返回不带细节的 `429 RESOURCE_EXHAUSTED`，同样的文字放在用户消息里则能正常服务。Antigravity 渠道现在始终把系统提示词作为第一条用户消息发送。2026-11-15 用真实的 DeepSeek Harness 请求实测：Gemini 4 Hydrogen、Gemini 3.8 Flash、Gemini 4 Argon 均返回 200，多轮工具调用（含并行调用和指定 `tool_choice`）、思考签名、隐式前缀缓存和指令遵循均不受影响。Gemini CLI 渠道不变。并非万无一失：Codex CLI 身份放在任何位置都会被拒。
+- **不带细节的 Google 429 不再把模型锁 30 秒**（#32）：这种 429（没有 RetryInfo、ErrorInfo 或额度相关文字）现在只让当次请求失败并刷新用量，不再冷却模型，也不计入供应商健康失败。此前一次内容拒绝会让该档位的所有请求在 30 秒内被本地 `503` 拦截。带结构化信息的 Google 429 仍会冷却模型，且有 `retryDelay` / `quotaResetDelay` 时按上游给出的时长冷却。
+- **被额度拦截时说明原因**（#32）：所有路由目标都被额度准入跳过时，客户端收到 `503 NYRO_QUOTA_UNAVAILABLE`，说明白名单内的原因（额度窗口耗尽、限流后模型冷却中、共享约束、账号不可用），已知时附带 `Retry-After` 响应头，不再是笼统的 “provider is unavailable”。
+- **Gemini 工具调用以 `tool_use` 交给 Anthropic 客户端**（#32）：Gemini 以 `STOP` 结束工具调用回合；现在只要有工具调用，Anthropic 响应的 `stop_reason` 就是 `tool_use`（截断、拒绝等原因仍优先），流式和非流式均如此。附在函数调用上的 `thoughtSignature` 不再在工具块的编号上另开思考块，消除了内容块事件编号重叠、开始与结束不匹配的问题。
+- **OpenAI Responses 非流式不再丢失工具调用**（#32）：在 Google 订阅渠道上，聚合后的工具调用会从 `output` 中丢失，原因是 Gemini 用量元数据被当成了一个不透明输出项。现在元数据保存为响应元数据，输出项列表始终包含工具调用，并补回缺失的推理内容；Gemini 格式的非流式响应和缓存回放也一并修复。
+- **测试稳定性**（#32）：本地测试上游忽略后台模型目录请求，此前这些请求会偶尔占用预设回复，导致 `gemini_malformed_retry` 随机失败。
+
+---
+
 ## v2.1.42
 
 > 发布于 2026-11-15

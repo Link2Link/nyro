@@ -21,6 +21,23 @@ impl ResponseEncoder for ResponsesResponseFormatter {
         let mut output_text = String::new();
 
         if let Some(items) = &resp.items {
+            // An item graph synthesized from another protocol may omit facts
+            // that live only in the convenience fields; never drop them.
+            let has_reasoning = items
+                .iter()
+                .any(|item| matches!(item, ResponseItem::Thinking { .. }));
+            if !has_reasoning
+                && let Some(reasoning) = resp
+                    .reasoning_content
+                    .as_deref()
+                    .filter(|text| !text.trim().is_empty())
+            {
+                output.push(serde_json::json!({
+                    "type": "reasoning",
+                    "id": format!("rs_{}", Uuid::new_v4().simple()),
+                    "summary": [{"type": "summary_text", "text": reasoning}]
+                }));
+            }
             for item in items {
                 match item {
                     ResponseItem::Thinking { text } => {
@@ -73,6 +90,21 @@ impl ResponseEncoder for ResponsesResponseFormatter {
                     _ => {}
                 }
             }
+            let emitted: std::collections::HashSet<&str> = items
+                .iter()
+                .filter_map(|item| match item {
+                    ResponseItem::FunctionCall { call_id, .. }
+                    | ResponseItem::CustomToolCall { call_id, .. } => Some(call_id.as_str()),
+                    _ => None,
+                })
+                .collect();
+            for tc in resp
+                .tool_calls
+                .iter()
+                .filter(|tc| !emitted.contains(tc.id.as_str()))
+            {
+                output.push(tool_call_item(tc));
+            }
         } else {
             if let Some(reasoning) = &resp.reasoning_content {
                 output.push(serde_json::json!({
@@ -85,26 +117,7 @@ impl ResponseEncoder for ResponsesResponseFormatter {
                 }));
             }
             for tc in &resp.tool_calls {
-                let mut item = match tc.kind {
-                    ToolCallKind::Function => serde_json::json!({
-                        "type": "function_call",
-                        "id": format!("fc_{}", Uuid::new_v4().simple()),
-                        "call_id": tc.id,
-                        "name": tc.name,
-                        "arguments": tc.arguments,
-                        "status": "completed"
-                    }),
-                    ToolCallKind::Custom => serde_json::json!({
-                        "type": "custom_tool_call",
-                        "id": format!("ctc_{}", Uuid::new_v4().simple()),
-                        "call_id": tc.id,
-                        "name": tc.name,
-                        "input": tc.arguments,
-                        "status": "completed"
-                    }),
-                };
-                insert_optional_namespace(&mut item, tc.namespace.as_deref());
-                output.push(item);
+                output.push(tool_call_item(tc));
             }
             output_text.push_str(&resp.content);
         }
@@ -137,6 +150,29 @@ impl ResponseEncoder for ResponsesResponseFormatter {
             }
         })
     }
+}
+
+fn tool_call_item(tc: &crate::protocol::ir::request::ToolCall) -> Value {
+    let mut item = match tc.kind {
+        ToolCallKind::Function => serde_json::json!({
+            "type": "function_call",
+            "id": format!("fc_{}", Uuid::new_v4().simple()),
+            "call_id": tc.id,
+            "name": tc.name,
+            "arguments": tc.arguments,
+            "status": "completed"
+        }),
+        ToolCallKind::Custom => serde_json::json!({
+            "type": "custom_tool_call",
+            "id": format!("ctc_{}", Uuid::new_v4().simple()),
+            "call_id": tc.id,
+            "name": tc.name,
+            "input": tc.arguments,
+            "status": "completed"
+        }),
+    };
+    insert_optional_namespace(&mut item, tc.namespace.as_deref());
+    item
 }
 
 fn insert_optional_namespace(value: &mut Value, namespace: Option<&str>) {

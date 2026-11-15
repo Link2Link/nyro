@@ -2,7 +2,8 @@
 //! Real dispatcher, synthetic credentials and loopback-only HTTP; no discovery,
 //! OAuth refresh, official manifest, or Gateway background task is allowed out.
 //! Admin probes serve their catalog request on an explicit loopback-only route.
-//! The same fixture also covers admin probe diagnostics for these channels.
+//! The same fixture also covers admin probe diagnostics for these channels,
+//! Antigravity system-prompt relocation and detail-free 429 scoping.
 
 use std::{
     future::Future,
@@ -724,4 +725,380 @@ fn admin_probe_explains_antigravity_not_found() -> anyhow::Result<()> {
 #[test]
 fn admin_probe_explains_gemini_cli_not_found() -> anyhow::Result<()> {
     admin_probe_explains_google_subscription_not_found("gemini-cli")
+}
+
+/// Scripted Antigravity upstream: records every inference body and answers with
+/// the next scripted reply (`opaque` / `retry` 429s, otherwise SSE success).
+async fn scripted_upstream(
+    State((seen, script)): State<(Requests, Arc<Mutex<Vec<&'static str>>>)>,
+    uri: Uri,
+    Json(body): Json<Value>,
+) -> Response {
+    // The 429 path triggers a best-effort quota refresh; its catalog call
+    // lands here too. Keep it out of the inference script and fail it.
+    if uri.path() != "/v1internal:streamGenerateContent" {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
+    seen.lock().unwrap().push(Seen {
+        uri: uri.clone(),
+        body: body.clone(),
+    });
+    let next = {
+        let mut script = script.lock().unwrap();
+        if script.is_empty() {
+            "ok"
+        } else {
+            script.remove(0)
+        }
+    };
+    match next {
+        // The exact detail-free refusal Antigravity returned on 2026-11-15
+        // for a third-party agent identity in systemInstruction.
+        "opaque" => (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(json!({"error": {
+                "code": 429,
+                "message": "Resource has been exhausted (e.g. check quota).",
+                "status": "RESOURCE_EXHAUSTED"
+            }})),
+        )
+            .into_response(),
+        "retry" => (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(json!({"error": {
+                "code": 429,
+                "message": "Resource has been exhausted (e.g. check quota).",
+                "status": "RESOURCE_EXHAUSTED",
+                "details": [
+                    {"@type": "type.googleapis.com/google.rpc.ErrorInfo", "reason": "RATE_LIMIT_EXCEEDED"},
+                    {"@type": "type.googleapis.com/google.rpc.RetryInfo", "retryDelay": "30s"}
+                ]
+            }})),
+        )
+            .into_response(),
+        _ => upstream(State(Requests::default()), uri, Json(body)).await,
+    }
+}
+
+#[test]
+fn antigravity_relocates_system_prompt_and_scopes_detail_free_429_to_one_request()
+-> anyhow::Result<()> {
+    use nyro_core::admin::ProviderUsageTier;
+    use nyro_core::quota_buckets::{QuotaBucket, QuotaBucketBinding};
+    use nyro_core::router::quota::ProviderScheduling;
+    const SYSTEM: &str = "You are an AI agent powered by DeepSeek Harness.";
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+    listener.set_nonblocking(true)?;
+    let base_url = format!("http://{}", listener.local_addr()?);
+    let gateway = offline_gateway("antigravity", &base_url)?;
+    runtime()?.block_on(async move {
+        let seen = Requests::default();
+        let script = Arc::new(Mutex::new(vec!["opaque", "ok", "retry"]));
+        let app = Router::new()
+            .route("/*path", post(scripted_upstream))
+            .with_state((seen.clone(), script.clone()));
+        let listener = tokio::net::TcpListener::from_std(listener)?;
+        let _server = AbortOnDrop(tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        }));
+        bind_fixture_credential(&gateway).await?;
+        // Admission only trusts buckets of the credential's own owner scope.
+        gateway
+            .storage
+            .settings()
+            .set("quota_bucket_owner.local-subscription", "fixture-owner")
+            .await?;
+        let scope_id = nyro_core::quota_buckets::google_quota_scope_id(
+            "local-subscription",
+            "google_antigravity",
+            "fixture-owner",
+            "fixture-project",
+        );
+        // A resolved enforced bucket: the legacy path would cool the model down.
+        let reset = (chrono::Utc::now() + chrono::Duration::hours(4)).to_rfc3339();
+        gateway.quota_registry.observe_buckets(
+            "local-subscription",
+            &[QuotaBucket {
+                id: "gemini-models".into(),
+                scope_id,
+                label: "Gemini Models".into(),
+                models: vec![UPSTREAM_MODEL.into()],
+                binding: QuotaBucketBinding {
+                    status: "resolved".into(),
+                    source: "official".into(),
+                    revision: 1,
+                },
+                tiers: vec![ProviderUsageTier {
+                    name: "five_hour".into(),
+                    used_percent: 1.0,
+                    resets_at: Some(reset),
+                }],
+                constraint_ids: vec![],
+                source: "enforced_summary".into(),
+                queried_at: chrono::Utc::now().to_rfc3339(),
+                stale: false,
+                scheduling: ProviderScheduling::default(),
+                api_price: None,
+            }],
+            Some(true),
+        );
+        let send = |gateway: Gateway| async move {
+            let body = json!({
+                "model": CLIENT_MODEL,
+                "messages": [
+                    {"role": "system", "content": SYSTEM},
+                    {"role": "user", "content": "hi"}
+                ],
+            });
+            let ingress = OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1;
+            let request = ingress
+                .handler()
+                .make_request_decoder()
+                .decode_request(body.clone())?;
+            let response = tokio::time::timeout(
+                TIMEOUT,
+                dispatch_pipeline(
+                    gateway,
+                    HeaderMap::new(),
+                    RawEnvelope::new(
+                        Some(body),
+                        Default::default(),
+                        "POST",
+                        "/v1/chat/completions",
+                    ),
+                    request,
+                    ingress,
+                    RequestContext::new(ingress, TIMEOUT),
+                ),
+            )
+            .await?;
+            let status = response.status();
+            let headers = response.headers().clone();
+            let bytes = to_bytes(response.into_body(), 1024 * 1024).await?;
+            anyhow::Ok((status, headers, serde_json::from_slice::<Value>(&bytes)?))
+        };
+
+        // 1. The system prompt rides a leading user turn, never systemInstruction.
+        let (status, _, body) = send(gateway.clone()).await?;
+        assert_eq!(
+            status,
+            StatusCode::TOO_MANY_REQUESTS,
+            "{body} seen={:?}",
+            seen.lock().unwrap().len()
+        );
+        {
+            let requests = seen.lock().unwrap();
+            assert_eq!(requests.len(), 1);
+            let inner = &requests[0].body["request"];
+            assert!(inner.get("systemInstruction").is_none(), "{inner}");
+            assert_eq!(inner["contents"][0]["role"], "user");
+            assert_eq!(inner["contents"][0]["parts"][0]["text"], SYSTEM);
+            assert_eq!(inner["contents"][1]["parts"][0]["text"], "hi");
+        }
+        // 2. A detail-free 429 is request-scoped: no local cooldown, so the
+        //    very next request reaches Google again and succeeds.
+        assert!(
+            gateway
+                .quota_registry
+                .is_model_schedulable("local-subscription", UPSTREAM_MODEL)
+        );
+        let (status, _, body) = send(gateway.clone()).await?;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(seen.lock().unwrap().len(), 2);
+
+        // 3. A structured RetryInfo 429 still cools the wire model down, and the
+        //    blocked request now explains why and when to retry.
+        let (status, _, _) = send(gateway.clone()).await?;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert!(
+            !gateway
+                .quota_registry
+                .is_model_schedulable("local-subscription", UPSTREAM_MODEL)
+        );
+        let (status, headers, body) = send(gateway.clone()).await?;
+        assert_eq!(
+            seen.lock().unwrap().len(),
+            3,
+            "blocked locally, not sent upstream"
+        );
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        assert_eq!(body["error"]["type"], "NYRO_QUOTA_UNAVAILABLE", "{body}");
+        let message = body["error"]["message"].as_str().unwrap();
+        assert!(
+            message.contains("cooling down after a rate-limit response"),
+            "{message}"
+        );
+        assert!(message.contains("retry after"), "{message}");
+        assert!(!message.contains("RESOURCE_EXHAUSTED"), "{message}");
+        let retry_after: u64 = headers["retry-after"].to_str()?.parse()?;
+        assert!((1..=30).contains(&retry_after), "{retry_after}");
+        Ok(())
+    })
+}
+
+/// Replays one recorded-shape Antigravity tool turn: two parallel calls, the
+/// first carrying a thoughtSignature, finishReason STOP and usage metadata.
+async fn tool_turn_upstream(uri: Uri) -> Response {
+    if uri.path() != "/v1internal:streamGenerateContent" {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
+    let turn = json!({"response": {
+        "candidates": [{"content": {"role": "model", "parts": [
+            {"functionCall": {"name": "read_file", "args": {"path": "main.py"}}, "thoughtSignature": "c2lnbmF0dXJl"},
+            {"functionCall": {"name": "read_file", "args": {"path": "utils.py"}}}
+        ]}, "finishReason": "STOP"}],
+        "usageMetadata": {"promptTokenCount": 10, "candidatesTokenCount": 5, "totalTokenCount": 15},
+        "modelVersion": "gemini-4-hydrogen"
+    }});
+    (
+        [("content-type", "text/event-stream")],
+        format!("data: {turn}\r\n\r\n"),
+    )
+        .into_response()
+}
+
+#[test]
+fn antigravity_tool_turns_reach_anthropic_and_responses_clients_intact() -> anyhow::Result<()> {
+    for (ingress, stream) in [
+        (ANTHROPIC_MESSAGES_2023_06_01, true),
+        (ANTHROPIC_MESSAGES_2023_06_01, false),
+        (OPENAI_RESPONSES_V1, false),
+        (OPENAI_RESPONSES_V1, true),
+        (OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1, false),
+    ] {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        listener.set_nonblocking(true)?;
+        let base_url = format!("http://{}", listener.local_addr()?);
+        let gateway = offline_gateway("antigravity", &base_url)?;
+        let wire = runtime()?.block_on(async move {
+            let app = Router::new().route("/*path", post(tool_turn_upstream));
+            let listener = tokio::net::TcpListener::from_std(listener)?;
+            let _server = AbortOnDrop(tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            }));
+            bind_fixture_credential(&gateway).await?;
+            let schema = json!({"type": "object", "properties": {"path": {"type": "string"}}});
+            let (body, path) = if ingress == ANTHROPIC_MESSAGES_2023_06_01 {
+                (
+                    json!({"model": CLIENT_MODEL, "max_tokens": 1024, "stream": stream,
+                        "messages": [{"role": "user", "content": "read both files"}],
+                        "tools": [{"name": "read_file", "input_schema": schema}]}),
+                    "/v1/messages",
+                )
+            } else if ingress == OPENAI_RESPONSES_V1 {
+                (
+                    json!({"model": CLIENT_MODEL, "stream": stream, "input": "read both files",
+                        "tools": [{"type": "function", "name": "read_file", "parameters": schema}]}),
+                    "/v1/responses",
+                )
+            } else {
+                (
+                    json!({"model": CLIENT_MODEL, "stream": stream,
+                        "messages": [{"role": "user", "content": "read both files"}],
+                        "tools": [{"type": "function", "function": {"name": "read_file", "parameters": schema}}]}),
+                    "/v1/chat/completions",
+                )
+            };
+            let request = ingress
+                .handler()
+                .make_request_decoder()
+                .decode_request(body.clone())?;
+            let response = tokio::time::timeout(
+                TIMEOUT,
+                dispatch_pipeline(
+                    gateway,
+                    HeaderMap::new(),
+                    RawEnvelope::new(Some(body), Default::default(), "POST", path),
+                    request,
+                    ingress,
+                    RequestContext::new(ingress, TIMEOUT),
+                ),
+            )
+            .await?;
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = to_bytes(response.into_body(), 1024 * 1024).await?;
+            anyhow::Ok(String::from_utf8(bytes.to_vec())?)
+        })?;
+        let label = format!("{ingress} stream={stream}");
+        let frames = || {
+            wire.lines()
+                .filter_map(|line| line.strip_prefix("data:"))
+                .filter_map(|data| serde_json::from_str::<Value>(data.trim()).ok())
+                .collect::<Vec<_>>()
+        };
+        if ingress == ANTHROPIC_MESSAGES_2023_06_01 && stream {
+            let frames = frames();
+            let mut open: Option<u64> = None;
+            let mut tools = Vec::new();
+            for frame in &frames {
+                let index = frame.get("index").and_then(Value::as_u64);
+                match frame["type"].as_str() {
+                    Some("content_block_start") => {
+                        assert!(open.is_none(), "{label}: overlapping blocks: {wire}");
+                        open = index;
+                        tools.push(frame["content_block"]["name"].clone());
+                    }
+                    Some("content_block_delta") => assert_eq!(index, open, "{label}: {wire}"),
+                    Some("content_block_stop") => {
+                        assert_eq!(index, open, "{label}: {wire}");
+                        open = None;
+                    }
+                    _ => {}
+                }
+            }
+            assert_eq!(tools, vec!["read_file", "read_file"], "{label}: {wire}");
+            let stop = frames
+                .iter()
+                .find(|f| f["type"] == "message_delta")
+                .unwrap();
+            assert_eq!(stop["delta"]["stop_reason"], "tool_use", "{label}");
+        } else if ingress == ANTHROPIC_MESSAGES_2023_06_01 {
+            let body: Value = serde_json::from_str(&wire)?;
+            assert_eq!(body["stop_reason"], "tool_use", "{label}: {body}");
+            let inputs: Vec<&Value> = body["content"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|block| block["type"] == "tool_use")
+                .map(|block| &block["input"])
+                .collect();
+            assert_eq!(
+                inputs,
+                vec![&json!({"path": "main.py"}), &json!({"path": "utils.py"})]
+            );
+        } else if ingress == OPENAI_RESPONSES_V1 {
+            let output = if stream {
+                frames()
+                    .into_iter()
+                    .find(|frame| frame["type"] == "response.completed")
+                    .map(|frame| frame["response"]["output"].clone())
+                    .expect("response.completed")
+            } else {
+                serde_json::from_str::<Value>(&wire)?["output"].clone()
+            };
+            let calls: Vec<&str> = output
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|item| item["type"] == "function_call")
+                .map(|item| item["arguments"].as_str().unwrap())
+                .collect();
+            assert_eq!(
+                calls,
+                vec![r#"{"path":"main.py"}"#, r#"{"path":"utils.py"}"#],
+                "{label}: {wire}"
+            );
+        } else {
+            let body: Value = serde_json::from_str(&wire)?;
+            assert_eq!(body["choices"][0]["finish_reason"], "tool_calls");
+            assert_eq!(
+                body["choices"][0]["message"]["tool_calls"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                2
+            );
+        }
+    }
+    Ok(())
 }

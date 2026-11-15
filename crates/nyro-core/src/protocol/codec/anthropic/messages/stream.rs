@@ -111,6 +111,22 @@ impl ResponseDecoder for AnthropicResponseParser {
 
 // ── Non-streaming response formatter ──
 
+/// Map an IR stop reason to Anthropic's vocabulary. Upstreams such as Gemini
+/// finish a tool-calling turn with a plain `STOP`; an Anthropic client must
+/// still see `tool_use` or its agent loop treats the turn as final (mirrors the
+/// OpenAI formatter's `tool_calls` override). Truncation/refusal reasons win.
+fn anthropic_stop_reason(reason: Option<&str>, has_tool_use: bool) -> Option<&str> {
+    let mapped = reason.map(|r| match r {
+        "stop" => "end_turn",
+        "tool_calls" => "tool_use",
+        other => other,
+    });
+    match mapped {
+        None | Some("end_turn") if has_tool_use => Some("tool_use"),
+        other => other,
+    }
+}
+
 pub struct AnthropicResponseFormatter;
 
 impl ResponseEncoder for AnthropicResponseFormatter {
@@ -156,11 +172,8 @@ impl ResponseEncoder for AnthropicResponseFormatter {
             }));
         }
 
-        let stop_reason = resp.stop_reason.as_deref().map(|r| match r {
-            "stop" => "end_turn",
-            "tool_calls" => "tool_use",
-            other => other,
-        });
+        let stop_reason =
+            anthropic_stop_reason(resp.stop_reason.as_deref(), !resp.tool_calls.is_empty());
 
         let mut usage = serde_json::json!({
             "input_tokens": resp.usage.prompt_tokens,
@@ -398,6 +411,7 @@ pub struct AnthropicStreamFormatter {
     in_thinking_block: bool,
     in_text_block: bool,
     in_tool_block: bool,
+    saw_tool_use: bool,
     message_started: bool,
 }
 
@@ -417,6 +431,7 @@ impl AnthropicStreamFormatter {
             in_thinking_block: false,
             in_text_block: false,
             in_tool_block: false,
+            saw_tool_use: false,
             message_started: false,
         }
     }
@@ -485,6 +500,17 @@ impl StreamResponseEncoder for AnthropicStreamFormatter {
                     ));
                 }
                 AiStreamDelta::ThinkingSignature(signature) => {
+                    // Gemini attaches `thoughtSignature` to the functionCall
+                    // part itself. A tool_use block cannot carry a signature,
+                    // and opening a thinking block here reused the open tool
+                    // block's index (two blocks at one index, a stop for an
+                    // index never started). Drop it, exactly like the
+                    // non-streaming formatter; nyro's Gemini encoder never
+                    // replays client signatures (the bypass sentinel covers
+                    // multi-turn function calls).
+                    if self.in_tool_block {
+                        continue;
+                    }
                     self.ensure_message_start(&mut events);
                     self.close_text_block_if_open(&mut events);
                     if !self.in_thinking_block {
@@ -560,6 +586,7 @@ impl StreamResponseEncoder for AnthropicStreamFormatter {
                         block_start.to_string(),
                     ));
                     self.in_tool_block = true;
+                    self.saw_tool_use = true;
                 }
                 AiStreamDelta::ToolCallDelta {
                     index: _,
@@ -583,11 +610,9 @@ impl StreamResponseEncoder for AnthropicStreamFormatter {
                     self.close_thinking_block_if_open(&mut events);
                     self.close_text_block_if_open(&mut events);
                     self.close_tool_block_if_open(&mut events);
-                    let anthropic_reason = match stop_reason.as_str() {
-                        "stop" => "end_turn",
-                        "tool_calls" => "tool_use",
-                        other => other,
-                    };
+                    let anthropic_reason =
+                        anthropic_stop_reason(Some(stop_reason.as_str()), self.saw_tool_use)
+                            .unwrap_or("end_turn");
                     let mut usage = serde_json::json!({
                         "input_tokens": self.usage.prompt_tokens,
                         "output_tokens": self.usage.completion_tokens
@@ -1036,6 +1061,109 @@ mod tests {
             }
         });
         assert_eq!(signature, Some("abc123"));
+    }
+
+    /// Gemini finishes tool turns with STOP and signs the functionCall part.
+    #[test]
+    fn gemini_tool_turn_streams_as_valid_anthropic_tool_use() {
+        let mut formatter = AnthropicStreamFormatter::new();
+        let mut events = formatter.format_deltas(&[
+            AiStreamDelta::MessageStart {
+                id: "gen-1".to_string(),
+                model: "gemini-4-hydrogen".to_string(),
+            },
+            AiStreamDelta::ToolCallStart {
+                index: 0,
+                id: "call_a".to_string(),
+                name: "read_file".to_string(),
+                namespace: None,
+                kind: crate::protocol::ir::ToolCallKind::Function,
+            },
+            AiStreamDelta::ToolCallDelta {
+                index: 0,
+                arguments: r#"{"path":"main.py"}"#.to_string(),
+            },
+            AiStreamDelta::ThinkingSignature("c2ln".to_string()),
+            AiStreamDelta::ToolCallStart {
+                index: 1,
+                id: "call_b".to_string(),
+                name: "read_file".to_string(),
+                namespace: None,
+                kind: crate::protocol::ir::ToolCallKind::Function,
+            },
+            AiStreamDelta::ToolCallDelta {
+                index: 1,
+                arguments: r#"{"path":"utils.py"}"#.to_string(),
+            },
+            AiStreamDelta::Done {
+                stop_reason: "stop".to_string(),
+            },
+        ]);
+        events.extend(formatter.format_done());
+        let frames: Vec<Value> = events
+            .iter()
+            .filter_map(|event| serde_json::from_str::<Value>(&event.data).ok())
+            .collect();
+        // Every block index is started once, then stopped once, in order.
+        let mut open: Option<u64> = None;
+        let mut started = Vec::new();
+        for frame in &frames {
+            let index = frame.get("index").and_then(Value::as_u64);
+            match frame["type"].as_str() {
+                Some("content_block_start") => {
+                    assert!(open.is_none(), "nested block start: {frames:?}");
+                    assert_eq!(frame["content_block"]["type"], "tool_use", "{frame}");
+                    open = index;
+                    started.push(index.unwrap());
+                }
+                Some("content_block_delta") => assert_eq!(index, open, "{frame}"),
+                Some("content_block_stop") => {
+                    assert_eq!(index, open, "{frame}");
+                    open = None;
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(started, vec![0, 1]);
+        assert!(
+            !frames
+                .iter()
+                .any(|frame| frame["delta"]["type"] == "signature_delta")
+        );
+        let stop = frames
+            .iter()
+            .find(|frame| frame["type"] == "message_delta")
+            .unwrap();
+        assert_eq!(stop["delta"]["stop_reason"], "tool_use");
+    }
+
+    #[test]
+    fn stop_reason_becomes_tool_use_only_for_finished_tool_turns() {
+        assert_eq!(anthropic_stop_reason(Some("stop"), true), Some("tool_use"));
+        assert_eq!(anthropic_stop_reason(None, true), Some("tool_use"));
+        assert_eq!(anthropic_stop_reason(Some("stop"), false), Some("end_turn"));
+        assert_eq!(
+            anthropic_stop_reason(Some("tool_calls"), false),
+            Some("tool_use")
+        );
+        // Truncation keeps its own reason even with partial tool calls.
+        assert_eq!(
+            anthropic_stop_reason(Some("max_tokens"), true),
+            Some("max_tokens")
+        );
+        let mut resp = AiResponse::new("gen-1", "gemini-4-hydrogen");
+        resp.stop_reason = Some("stop".into());
+        resp.tool_calls
+            .push(crate::protocol::ir::request::ToolCall {
+                id: "call_a".into(),
+                name: "read_file".into(),
+                namespace: None,
+                kind: crate::protocol::ir::ToolCallKind::Function,
+                arguments: r#"{"path":"main.py"}"#.into(),
+            });
+        let out = AnthropicResponseFormatter.format_response(&resp);
+        assert_eq!(out["stop_reason"], "tool_use");
+        assert_eq!(out["content"][0]["type"], "tool_use");
     }
 
     #[test]

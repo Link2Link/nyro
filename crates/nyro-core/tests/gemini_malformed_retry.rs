@@ -224,6 +224,12 @@ async fn scripted_upstream(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    // Background Antigravity catalog discovery (`fetchAvailableModels`) uses
+    // the provider base URL too; it is not an inference attempt, so it must
+    // neither consume the script, count as a call, nor fire the cancel hook.
+    if !uri.path().to_ascii_lowercase().contains("generatecontent") {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
     state
         .requests
         .lock()

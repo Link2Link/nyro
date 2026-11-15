@@ -89,7 +89,7 @@ fn classification(error: &GatewayError) -> (&'static str, &'static str, &'static
             "request_model_not_found",
             "Request construction could not resolve the model before upstream dispatch.",
         ),
-        GatewayError::ProviderUnavailable { .. } => (
+        GatewayError::ProviderUnavailable { .. } | GatewayError::QuotaUnavailable { .. } => (
             "failed",
             "request_provider_unavailable",
             "Request construction found an unavailable provider before upstream dispatch.",

@@ -34,6 +34,7 @@ Auth 与 admin 写入相同格式。Admin 在异步获取**之前**读取 connec
 - 同一账号、prod host：目录不含 Hydrogen，Hydrogen 推理返回 429。这正是目录发现必须跟随 daily 推理 host 的原因。
 - 配额：Hydrogen 调用消耗 `gemini-5h` / `gemini-weekly`（“Gemini Models”，与 3.8 Flash 共用）；Argon 调用只消耗 `gemini-argon-wtu-weekly`。
 - 未开通账号：只有 `gemini-4-{argon,hydrogen,carbon}-disabled` 占位，档位 ID 返回 404。
+- 系统提示词审查：`systemInstruction` 中出现第三方 Agent 身份（“You are an AI agent powered by DeepSeek Harness.”、Claude Code 身份）时，所有模型都返回不带细节的 429 `RESOURCE_EXHAUSTED`；同样文字放在首条 user 消息中可正常服务。因此 nyro 在该渠道始终改写 `systemInstruction`，且不带细节的 429 不再冷却模型。并非万无一失：Codex CLI 身份放在任何位置都会被拒。
 
 ## Probe 诊断
 

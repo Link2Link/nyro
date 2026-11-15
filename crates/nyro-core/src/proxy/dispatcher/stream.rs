@@ -181,7 +181,7 @@ pub(super) async fn handle_stream(
         )
             .into_response();
         response.headers_mut().extend(response_metadata);
-        super::mark_entitlement_refusal(&mut response, status, &err_body);
+        super::mark_upstream_error(&mut response, status, &err_body);
         return response;
     }
 
