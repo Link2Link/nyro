@@ -4,6 +4,30 @@ Nyro 的所有重要变更均记录在此文件中。
 
 ---
 
+## v2.1.42
+
+> 发布于 2026-11-15
+
+#### 新功能
+
+- **Google AI Pro 订阅支持 Gemini 4 Hydrogen**：Antigravity 渠道的内置目录加入 `gemini-4-hydrogen-{low,medium,high,xhigh}` 与 `gemini-4-argon-{low,medium,high}`。Google 对这两个系列只提供档位 ID（裸 ID 返回 404），因此 `gemini-4-hydrogen` / `gemini-4-argon` 改为虚拟别名，按请求自身的思考强度解析：`low` / `minimal` / 关闭思考 → `-low`，`medium` → `-medium`，`high` → `-high`，`xhigh` / `max` 在 Hydrogen 上 → `-xhigh`（Argon、Gemini 3.8 Flash 与 Claude 5.5 降级为 `-high`），未携带思考指令 → `-medium`。显式档位 ID 仍原样发送。已于 2026-11-15 用 Google AI Pro 账号实测：各档位均返回 200；未开通 Gemini 4 的账号只列出 `-disabled` 占位。
+- **Hydrogen 与 Argon 用量卡片**：Hydrogen 与 Gemini 3.8 Flash 共用 “Gemini Models” 额度池（`gemini-5h` / `gemini-weekly`），Argon 保留独立的周额度。用量视图与批量用量发布因此显示一张 `gemini-4-hydrogen` 卡片（共享池，Flash 与 Hydrogen 合计）和一张 `gemini-4-argon` 卡片；没有 Hydrogen 的账号仍显示 `gemini-3.8-flash`。共享卡片沿用原有不透明 ID，已发布用量条目与已保留请求的归属不变；Hydrogen 的准入与 Flash 同池耗尽联动。Hydrogen 暂无参考价格，显示为未计价而非免费。
+
+#### 改进
+
+- **Google 模型目录跟随推理端点**：Antigravity 的 `fetchAvailableModels` 改用与推理相同的 host（默认 `daily-cloudcode-pa`，显式配置的供应商或凭据端点优先），不再固定查询 prod（prod 目录不含 Hydrogen）。目录快照绑定端点、项目、完整 User-Agent 与凭据令牌指纹，端点、客户端标识或令牌变化后不会复用旧的动态 ID。格式错误的响应不会覆盖上次成功的快照，合法的空目录则会替换。OAuth 刷新与管理端发现在代际 CAS 下写入同一格式。
+- **OAuth 刷新安全**：令牌刷新在有时限的独立任务中执行，在所有存储后端经现有行/代际 CAS 发布，并禁用重定向与传输层重试。HTTP 429 持久化遵循 `Retry-After` 的截止时间（1 秒–1 小时，默认 60 秒），所有刷新入口都会遵守；明确的 OAuth 拒绝需要重新授权；结果未知的 Codex 刷新会被隔离，不再自动重放。无需数据库迁移。
+- **Claude 实际服务模型诊断**：请求日志在 `payload_metadata.response_model` 中记录 Anthropic 实际服务的模型（含服务端降级证据），不覆盖请求模型或路由模型，关闭请求体记录时同样可用。
+
+#### 修复
+
+- **不再自动注入 Claude 跨模型降级**：Claude Code 请求不再自动添加 `fallbacks`（Opus 5.5 → Opus 4.8、Fable 5.1 → Opus 5）；调用方显式传入的 `fallbacks` 保持不变。
+- **Gemini 零输出重试**：除 `MALFORMED_FUNCTION_CALL` 外，以 `UNEXPECTED_TOOL_CALL` 或 `MALFORMED_RESPONSE` 结束的空响应现在也会在任何内容到达客户端前判定本次尝试失败，并重放同一目标一次，之后再故障转移（参照 CLIProxyAPI #7513）。带有任何输出的结束仍正常透传。
+- **Gemini 流结束顺序**：`finishReason` 在干净 EOF 之前只是暂定，仅含用量的尾帧会先送达客户端，再发出唯一的结束事件；完全没有 `finishReason` 就结束的流按错误处理。
+- **Google 订阅不可用模型**：标记 `disabled` 的目录条目和 `<模型>-disabled` 占位不再作为可调用模型提供；订阅渠道的 404 探测改为列出可能原因（模型 ID、端点/项目、客户端版本、账号资格），不再断言套餐不支持。
+
+---
+
 ## v2.1.41
 
 > 发布于 2026-11-12

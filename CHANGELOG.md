@@ -4,6 +4,30 @@ All notable changes to Nyro will be documented in this file.
 
 ---
 
+## v2.1.42
+
+> Released on 2026-11-15
+
+#### Features
+
+- **Gemini 4 Hydrogen on Google AI Pro subscriptions**: the Antigravity channel's curated catalog now carries `gemini-4-hydrogen-{low,medium,high,xhigh}` and `gemini-4-argon-{low,medium,high}`. Google serves only tier ids for both families (the bare ids answer 404), so `gemini-4-hydrogen` / `gemini-4-argon` are now virtual aliases resolved from the request's own reasoning effort: `low` / `minimal` / thinking off → `-low`, `medium` → `-medium`, `high` → `-high`, `xhigh` / `max` → `-xhigh` on Hydrogen (Argon, Gemini 3.8 Flash and Claude 5.5 fall back to `-high`), and no directive → `-medium`. Explicit tier ids are still sent as-is. Verified live on 2026-11-15 from a Google AI Pro account: every tier returned 200; accounts outside the Gemini 4 plan only list `-disabled` placeholders.
+- **Hydrogen and Argon usage cards**: Hydrogen draws from the same "Gemini Models" allowance (`gemini-5h` / `gemini-weekly`) as Gemini 3.8 Flash, while Argon keeps its own weekly bucket. The usage view and bulk usage publication therefore show one `gemini-4-hydrogen` card (the shared pool, Flash and Hydrogen combined) and one `gemini-4-argon` card; accounts without Hydrogen keep the `gemini-3.8-flash` label. The shared card keeps its existing opaque ID, so published usage entries and retained request attribution are unchanged, and Hydrogen admission follows the same pool exhaustion as Flash. Hydrogen has no reference price yet and shows as unpriced, not free.
+
+#### Improvements
+
+- **Google catalog follows the inference endpoint**: Antigravity `fetchAvailableModels` now uses the same host as inference (`daily-cloudcode-pa` by default; explicit provider or credential endpoints win) instead of always querying prod, whose catalog omits Hydrogen. Catalog snapshots are bound to endpoint, project, full User-Agent and a credential-token fingerprint, so a changed endpoint, client identity or token never reuses stale dynamic ids. Malformed responses never overwrite the last good snapshot, while a valid empty catalog does. OAuth refresh and admin discovery write the same format under a generation CAS.
+- **OAuth refresh safety**: token refreshes run in a bounded detached task, publish through the existing row/generation CAS on every storage backend, and disable redirects and transport retries. HTTP 429 persists a `Retry-After`-aware deadline (1 s–1 h, default 60 s) that every refresh entry point honours; an explicit OAuth refusal requires reauthorization; a Codex refresh whose outcome is unknown is quarantined instead of replayed. No schema migration is required.
+- **Claude serving-model diagnostics**: request logs record the model Anthropic actually served in `payload_metadata.response_model` (including server-side fallback evidence), without overwriting the requested or routed model and even when payload recording is disabled.
+
+#### Fixes
+
+- **No automatic Claude cross-model fallbacks**: the Claude Code profile no longer injects `fallbacks` (Opus 5.5 → Opus 4.8, Fable 5.1 → Opus 5); callers that supply `fallbacks` explicitly keep them.
+- **Gemini zero-output retries**: besides `MALFORMED_FUNCTION_CALL`, empty responses ending in `UNEXPECTED_TOOL_CALL` or `MALFORMED_RESPONSE` now fail the attempt before anything reaches the client and replay the same target once, then fail over (following CLIProxyAPI #7513). Terminals that carry any output still pass through.
+- **Gemini stream termination**: a `finishReason` is provisional until clean EOF, so usage-only tail frames reach the client before the single terminal event; a stream that ends without any `finishReason` is reported as an error.
+- **Unavailable Google subscription models**: catalog entries marked `disabled` and `<model>-disabled` placeholders are no longer offered as callable models, and a subscription 404 probe now lists the possible causes (model id, endpoint/project, client version, account eligibility) instead of asserting a plan exclusion.
+
+---
+
 ## v2.1.41
 
 > Released on 2026-11-12
