@@ -935,3 +935,170 @@ fn antigravity_relocates_system_prompt_and_scopes_detail_free_429_to_one_request
         Ok(())
     })
 }
+
+/// Replays one recorded-shape Antigravity tool turn: two parallel calls, the
+/// first carrying a thoughtSignature, finishReason STOP and usage metadata.
+async fn tool_turn_upstream(uri: Uri) -> Response {
+    if uri.path() != "/v1internal:streamGenerateContent" {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
+    let turn = json!({"response": {
+        "candidates": [{"content": {"role": "model", "parts": [
+            {"functionCall": {"name": "read_file", "args": {"path": "main.py"}}, "thoughtSignature": "c2lnbmF0dXJl"},
+            {"functionCall": {"name": "read_file", "args": {"path": "utils.py"}}}
+        ]}, "finishReason": "STOP"}],
+        "usageMetadata": {"promptTokenCount": 10, "candidatesTokenCount": 5, "totalTokenCount": 15},
+        "modelVersion": "gemini-4-hydrogen"
+    }});
+    (
+        [("content-type", "text/event-stream")],
+        format!("data: {turn}\r\n\r\n"),
+    )
+        .into_response()
+}
+
+#[test]
+fn antigravity_tool_turns_reach_anthropic_and_responses_clients_intact() -> anyhow::Result<()> {
+    for (ingress, stream) in [
+        (ANTHROPIC_MESSAGES_2023_06_01, true),
+        (ANTHROPIC_MESSAGES_2023_06_01, false),
+        (OPENAI_RESPONSES_V1, false),
+        (OPENAI_RESPONSES_V1, true),
+        (OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1, false),
+    ] {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        listener.set_nonblocking(true)?;
+        let base_url = format!("http://{}", listener.local_addr()?);
+        let gateway = offline_gateway("antigravity", &base_url)?;
+        let wire = runtime()?.block_on(async move {
+            let app = Router::new().route("/*path", post(tool_turn_upstream));
+            let listener = tokio::net::TcpListener::from_std(listener)?;
+            let _server = AbortOnDrop(tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            }));
+            bind_fixture_credential(&gateway).await?;
+            let schema = json!({"type": "object", "properties": {"path": {"type": "string"}}});
+            let (body, path) = if ingress == ANTHROPIC_MESSAGES_2023_06_01 {
+                (
+                    json!({"model": CLIENT_MODEL, "max_tokens": 1024, "stream": stream,
+                        "messages": [{"role": "user", "content": "read both files"}],
+                        "tools": [{"name": "read_file", "input_schema": schema}]}),
+                    "/v1/messages",
+                )
+            } else if ingress == OPENAI_RESPONSES_V1 {
+                (
+                    json!({"model": CLIENT_MODEL, "stream": stream, "input": "read both files",
+                        "tools": [{"type": "function", "name": "read_file", "parameters": schema}]}),
+                    "/v1/responses",
+                )
+            } else {
+                (
+                    json!({"model": CLIENT_MODEL, "stream": stream,
+                        "messages": [{"role": "user", "content": "read both files"}],
+                        "tools": [{"type": "function", "function": {"name": "read_file", "parameters": schema}}]}),
+                    "/v1/chat/completions",
+                )
+            };
+            let request = ingress
+                .handler()
+                .make_request_decoder()
+                .decode_request(body.clone())?;
+            let response = tokio::time::timeout(
+                TIMEOUT,
+                dispatch_pipeline(
+                    gateway,
+                    HeaderMap::new(),
+                    RawEnvelope::new(Some(body), Default::default(), "POST", path),
+                    request,
+                    ingress,
+                    RequestContext::new(ingress, TIMEOUT),
+                ),
+            )
+            .await?;
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = to_bytes(response.into_body(), 1024 * 1024).await?;
+            anyhow::Ok(String::from_utf8(bytes.to_vec())?)
+        })?;
+        let label = format!("{ingress} stream={stream}");
+        let frames = || {
+            wire.lines()
+                .filter_map(|line| line.strip_prefix("data:"))
+                .filter_map(|data| serde_json::from_str::<Value>(data.trim()).ok())
+                .collect::<Vec<_>>()
+        };
+        if ingress == ANTHROPIC_MESSAGES_2023_06_01 && stream {
+            let frames = frames();
+            let mut open: Option<u64> = None;
+            let mut tools = Vec::new();
+            for frame in &frames {
+                let index = frame.get("index").and_then(Value::as_u64);
+                match frame["type"].as_str() {
+                    Some("content_block_start") => {
+                        assert!(open.is_none(), "{label}: overlapping blocks: {wire}");
+                        open = index;
+                        tools.push(frame["content_block"]["name"].clone());
+                    }
+                    Some("content_block_delta") => assert_eq!(index, open, "{label}: {wire}"),
+                    Some("content_block_stop") => {
+                        assert_eq!(index, open, "{label}: {wire}");
+                        open = None;
+                    }
+                    _ => {}
+                }
+            }
+            assert_eq!(tools, vec!["read_file", "read_file"], "{label}: {wire}");
+            let stop = frames
+                .iter()
+                .find(|f| f["type"] == "message_delta")
+                .unwrap();
+            assert_eq!(stop["delta"]["stop_reason"], "tool_use", "{label}");
+        } else if ingress == ANTHROPIC_MESSAGES_2023_06_01 {
+            let body: Value = serde_json::from_str(&wire)?;
+            assert_eq!(body["stop_reason"], "tool_use", "{label}: {body}");
+            let inputs: Vec<&Value> = body["content"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|block| block["type"] == "tool_use")
+                .map(|block| &block["input"])
+                .collect();
+            assert_eq!(
+                inputs,
+                vec![&json!({"path": "main.py"}), &json!({"path": "utils.py"})]
+            );
+        } else if ingress == OPENAI_RESPONSES_V1 {
+            let output = if stream {
+                frames()
+                    .into_iter()
+                    .find(|frame| frame["type"] == "response.completed")
+                    .map(|frame| frame["response"]["output"].clone())
+                    .expect("response.completed")
+            } else {
+                serde_json::from_str::<Value>(&wire)?["output"].clone()
+            };
+            let calls: Vec<&str> = output
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|item| item["type"] == "function_call")
+                .map(|item| item["arguments"].as_str().unwrap())
+                .collect();
+            assert_eq!(
+                calls,
+                vec![r#"{"path":"main.py"}"#, r#"{"path":"utils.py"}"#],
+                "{label}: {wire}"
+            );
+        } else {
+            let body: Value = serde_json::from_str(&wire)?;
+            assert_eq!(body["choices"][0]["finish_reason"], "tool_calls");
+            assert_eq!(
+                body["choices"][0]["message"]["tool_calls"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                2
+            );
+        }
+    }
+    Ok(())
+}
