@@ -309,15 +309,140 @@ pub(crate) fn antigravity_user_agent() -> String {
     hub_user_agent_for_version(&antigravity_version())
 }
 
-/// Inference base URL for the antigravity channel. Consumer (Google AI
-/// Pro/Ultra) credentials must send `generateContent`/`streamGenerateContent`
-/// to the **daily** host — the prod host parks them in the free consumer
-/// pool (`aicode-consumers` project) where every mainline model is
-/// tier-gated to 429 RESOURCE_EXHAUSTED. Control-plane calls
-/// (`loadCodeAssist`) stay on prod. Validated by CLIProxyAPI
-/// (`resolveAntigravityRequestBaseURL` defaults consumer credentials to
-/// daily) and sub2api (paid plan_type → daily endpoint).
+/// Default inference and catalog host for the Antigravity channel, matching
+/// CLIProxyAPI's daily catalog policy. Explicit endpoint bindings take priority.
+/// This routing default does not establish account entitlement or explain an
+/// upstream 404/429. Onboarding control-plane calls retain their own policy.
 pub(crate) const ANTIGRAVITY_INFERENCE_BASE_URL: &str = "https://daily-cloudcode-pa.googleapis.com";
+
+pub(crate) const GOOGLE_SUBSCRIPTION_PROD_BASE_URL: &str = "https://cloudcode-pa.googleapis.com";
+
+/// One policy for inference and catalog discovery. The historical prod preset
+/// is not an explicit Antigravity override. A credential opt-in can select prod;
+/// a non-default provider URL is an explicit configured endpoint.
+pub(crate) struct SubscriptionEndpoint {
+    pub base_url: String,
+    pub source: &'static str,
+}
+
+pub(crate) fn subscription_endpoint(
+    provider: &Provider,
+    credential: Option<&crate::auth::StoredCredential>,
+) -> SubscriptionEndpoint {
+    if let Some(endpoint) = credential
+        .and_then(|credential| credential.meta.get("subscription_endpoint"))
+        .and_then(nonempty_json_string)
+    {
+        return SubscriptionEndpoint {
+            base_url: endpoint.trim_end_matches('/').into(),
+            source: "credential_override",
+        };
+    }
+    let configured = provider.base_url.trim().trim_end_matches('/');
+    if !configured.is_empty() && configured != GOOGLE_SUBSCRIPTION_PROD_BASE_URL {
+        return SubscriptionEndpoint {
+            base_url: configured.into(),
+            source: "provider_config",
+        };
+    }
+    let (base_url, source) = if is_antigravity_channel(provider) {
+        (ANTIGRAVITY_INFERENCE_BASE_URL, "antigravity_default_daily")
+    } else {
+        (GOOGLE_SUBSCRIPTION_PROD_BASE_URL, "gemini_cli_default_prod")
+    };
+    SubscriptionEndpoint {
+        base_url: base_url.into(),
+        source,
+    }
+}
+
+/// Provenance is stored beside IDs, never mixed into the model list. Binding to
+/// the token fingerprint is deliberately conservative on refresh; an old-token
+/// snapshot is unknown until discovery succeeds again. No secret is persisted.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct CatalogSource {
+    schema_version: u32,
+    pub endpoint: String,
+    pub project_id: String,
+    pub user_agent: String,
+    credential_fingerprint: String,
+}
+
+impl CatalogSource {
+    pub(crate) fn new(
+        endpoint: &str,
+        project_id: &str,
+        user_agent: &str,
+        access_token: &str,
+    ) -> Self {
+        Self {
+            schema_version: 1,
+            endpoint: endpoint.trim().trim_end_matches('/').into(),
+            project_id: project_id.trim().into(),
+            user_agent: user_agent.trim().into(),
+            credential_fingerprint: format!("{:x}", Sha256::digest(access_token.trim().as_bytes())),
+        }
+    }
+}
+
+pub(crate) fn catalog_source_for_runtime(
+    provider: &Provider,
+    credential: &crate::auth::StoredCredential,
+    binding: &crate::auth::RuntimeBinding,
+) -> Result<CatalogSource> {
+    let endpoint = binding
+        .base_url_override
+        .as_deref()
+        .map(str::trim)
+        .filter(|url| !url.is_empty())
+        .map(ToString::to_string)
+        .unwrap_or_else(|| subscription_endpoint(provider, Some(credential)).base_url);
+    let user_agent = binding
+        .extra_headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("user-agent"))
+        .map(|(_, value)| value.clone())
+        .unwrap_or_else(|| {
+            if is_google_antigravity(provider) {
+                antigravity_user_agent()
+            } else {
+                super::gemini_cli::GEMINI_CLI_USER_AGENT.into()
+            }
+        });
+    let project_id = code_assist_project_id(Some(credential))?;
+    let token = credential
+        .access_token
+        .as_deref()
+        .unwrap_or_default()
+        .trim();
+    anyhow::ensure!(
+        !token.is_empty(),
+        "Google subscription access token unavailable"
+    );
+    Ok(CatalogSource::new(
+        &endpoint,
+        &project_id,
+        &user_agent,
+        token,
+    ))
+}
+
+pub(crate) fn write_catalog_snapshot(
+    meta: &mut serde_json::Map<String, Value>,
+    ids: &[String],
+    source: &CatalogSource,
+) {
+    let mut ids: Vec<String> = ids
+        .iter()
+        .map(|id| id.trim().to_string())
+        .filter(|id| !id.is_empty())
+        .collect();
+    ids.sort();
+    ids.dedup();
+    // A successful empty catalog replaces old IDs. Failure must not call this.
+    meta.insert("subscription_models".into(), json!(ids));
+    meta.insert("subscription_models_source".into(), json!(source));
+}
 
 /// True when the provider row is the google/antigravity OAuth channel.
 pub(crate) fn is_antigravity_channel(provider: &Provider) -> bool {
@@ -369,11 +494,17 @@ pub(crate) async fn fetch_available_models(
     access_token: &str,
     project_id: &str,
     user_agent: &str,
+    base_url: &str,
 ) -> Result<Vec<AvailableModel>> {
     // Pure shared transport: callers prepare their channel's identity first.
     // Refreshing here would send an already-bound stale UA and make Gemini CLI
     // unnecessarily query the Antigravity Hub manifest.
-    let endpoint = "https://cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels";
+    let base_url = base_url.trim().trim_end_matches('/');
+    anyhow::ensure!(
+        !base_url.is_empty(),
+        "Google subscription catalog endpoint unavailable"
+    );
+    let endpoint = format!("{base_url}/v1internal:fetchAvailableModels");
     let response = client
         .post(endpoint)
         .header("Authorization", format!("Bearer {access_token}"))
@@ -381,14 +512,25 @@ pub(crate) async fn fetch_available_models(
         .header("Accept", "*/*")
         .header("User-Agent", user_agent)
         .json(&json!({ "project": project_id }))
+        .timeout(Duration::from_secs(20))
         .send()
         .await?;
     let status = response.status();
     let body = response.text().await.unwrap_or_default();
     if !status.is_success() {
-        anyhow::bail!("antigravity fetchAvailableModels failed: HTTP {status}: {body}");
+        anyhow::bail!("Google subscription fetchAvailableModels failed: HTTP {status}");
     }
     let parsed: Value = serde_json::from_str(&body)?;
+    let models = parsed
+        .get("models")
+        .and_then(Value::as_object)
+        .ok_or_else(|| anyhow::anyhow!("Google subscription catalog response has no model map"))?;
+    anyhow::ensure!(
+        models
+            .iter()
+            .all(|(id, info)| !id.trim().is_empty() && info.is_object()),
+        "Google subscription catalog contains an invalid model entry"
+    );
     Ok(parse_available_models_detailed(&parsed))
 }
 
@@ -779,20 +921,28 @@ pub(crate) fn resolve_tiered_model(
 /// Account model-catalog snapshot stashed in the credential meta by the auth
 /// driver (exchange/refresh); drives the catalog-gated tier rewrite.
 pub(crate) fn credential_catalog_snapshot(
+    provider: &Provider,
     credential: Option<&crate::auth::types::StoredCredential>,
-) -> Vec<String> {
+) -> Option<Vec<String>> {
+    let credential = credential?;
+    let expected = catalog_source_for_runtime(provider, credential, &Default::default()).ok()?;
+    let source: CatalogSource =
+        serde_json::from_value(credential.meta.get("subscription_models_source")?.clone()).ok()?;
+    if source != expected {
+        return None;
+    }
     credential
-        .and_then(|cred| cred.meta.get("subscription_models"))
-        .and_then(Value::as_array)
-        .map(|ids| {
-            ids.iter()
-                .filter_map(Value::as_str)
+        .meta
+        .get("subscription_models")?
+        .as_array()?
+        .iter()
+        .map(|id| {
+            id.as_str()
                 .map(str::trim)
                 .filter(|id| !id.is_empty())
                 .map(ToString::to_string)
-                .collect()
         })
-        .unwrap_or_default()
+        .collect()
 }
 
 /// Raw wire catalog used by dispatch and probes, never the collapsed public
@@ -812,7 +962,7 @@ pub(crate) fn subscription_model_catalog(
     } else {
         return Vec::new();
     };
-    let mut catalog = credential_catalog_snapshot(credential);
+    let mut catalog = credential_catalog_snapshot(provider, credential).unwrap_or_default();
     catalog.extend(
         curated
             .iter()
@@ -1230,6 +1380,163 @@ pub(crate) fn build_v1internal_url(base_url: &str, codec_path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn catalog_endpoint_policy_preserves_defaults_and_explicit_binding() {
+        for (channel, expected) in [
+            ("antigravity", ANTIGRAVITY_INFERENCE_BASE_URL),
+            ("gemini-cli", GOOGLE_SUBSCRIPTION_PROD_BASE_URL),
+        ] {
+            let (mut provider, _) = google_provider(channel, "gemini-future");
+            provider.base_url = GOOGLE_SUBSCRIPTION_PROD_BASE_URL.into();
+            assert_eq!(subscription_endpoint(&provider, None).base_url, expected);
+            provider.base_url = "http://127.0.0.1:12345/custom/".into();
+            assert_eq!(
+                subscription_endpoint(&provider, None).base_url,
+                "http://127.0.0.1:12345/custom"
+            );
+            let binding = crate::auth::RuntimeBinding {
+                base_url_override: Some("http://127.0.0.1:23456/runtime/".into()),
+                extra_headers: [("User-Agent".into(), "bound-ua/9".into())].into(),
+                ..Default::default()
+            };
+            let credential = crate::auth::StoredCredential {
+                access_token: Some("fixture-token".into()),
+                meta: json!({"project_id":"fixture-project"}),
+                ..Default::default()
+            };
+            let source = catalog_source_for_runtime(&provider, &credential, &binding).unwrap();
+            assert_eq!(source.endpoint, "http://127.0.0.1:23456/runtime");
+            assert_eq!(source.user_agent, "bound-ua/9");
+        }
+        let (provider, _) = google_provider("antigravity", "gemini-future");
+        let credential = crate::auth::StoredCredential {
+            meta: json!({"subscription_endpoint": GOOGLE_SUBSCRIPTION_PROD_BASE_URL}),
+            ..Default::default()
+        };
+        let endpoint = subscription_endpoint(&provider, Some(&credential));
+        assert_eq!(endpoint.base_url, GOOGLE_SUBSCRIPTION_PROD_BASE_URL);
+        assert_eq!(endpoint.source, "credential_override");
+    }
+
+    #[test]
+    fn catalog_snapshot_rejects_unbound_or_changed_context_and_keeps_curated() {
+        let (mut provider, _) = google_provider("antigravity", "gemini-future");
+        let mut credential = crate::auth::StoredCredential {
+            access_token: Some("fixture-token".into()),
+            meta: json!({"project_id":"fixture-project", "subscription_models":["gemini-future-high"]}),
+            ..Default::default()
+        };
+        assert!(credential_catalog_snapshot(&provider, Some(&credential)).is_none());
+        let source =
+            catalog_source_for_runtime(&provider, &credential, &Default::default()).unwrap();
+        write_catalog_snapshot(
+            credential.meta.as_object_mut().unwrap(),
+            &["gemini-future-high".into()],
+            &source,
+        );
+        assert_eq!(
+            credential_catalog_snapshot(&provider, Some(&credential)),
+            Some(vec!["gemini-future-high".into()])
+        );
+        for key in ["project_id", "subscription_endpoint"] {
+            let mut changed = credential.clone();
+            changed.meta[key] = json!("https://changed.invalid");
+            assert!(
+                credential_catalog_snapshot(&provider, Some(&changed)).is_none(),
+                "{key}"
+            );
+        }
+        let mut rotated = credential.clone();
+        rotated.access_token = Some("new-token".into());
+        assert!(credential_catalog_snapshot(&provider, Some(&rotated)).is_none());
+        let mut stale_ua = credential.clone();
+        stale_ua.meta["subscription_models_source"]["user_agent"] = json!("old-client/1");
+        assert!(credential_catalog_snapshot(&provider, Some(&stale_ua)).is_none());
+        provider.base_url = "http://127.0.0.1:23456".into();
+        assert!(credential_catalog_snapshot(&provider, Some(&credential)).is_none());
+        let catalog = subscription_model_catalog(&provider, Some(&credential));
+        assert!(!catalog.contains(&"gemini-future-high".into()));
+        assert!(catalog.contains(&"claude-opus-5-5-medium".into()));
+    }
+
+    #[test]
+    fn catalog_snapshot_successful_empty_replaces_previous_ids() {
+        let (provider, _) = google_provider("antigravity", "gemini-future");
+        let mut credential = crate::auth::StoredCredential {
+            access_token: Some("fixture-token".into()),
+            meta: json!({"project_id":"fixture-project"}),
+            ..Default::default()
+        };
+        let source =
+            catalog_source_for_runtime(&provider, &credential, &Default::default()).unwrap();
+        write_catalog_snapshot(
+            credential.meta.as_object_mut().unwrap(),
+            &["gemini-future-high".into()],
+            &source,
+        );
+        write_catalog_snapshot(credential.meta.as_object_mut().unwrap(), &[], &source);
+        assert_eq!(
+            credential_catalog_snapshot(&provider, Some(&credential)),
+            Some(Vec::new())
+        );
+        assert!(
+            subscription_model_catalog(&provider, Some(&credential))
+                .contains(&"gemini-3.8-flash-tiered".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn catalog_fetch_uses_explicit_endpoint_and_distinguishes_empty_from_failure() {
+        use axum::{Json, Router, extract::State, http::StatusCode, routing::post};
+        for (payload, status, success) in [
+            (json!({"models":{}}), StatusCode::OK, true),
+            (
+                json!({"models":{"gemini-fixture":{}}}),
+                StatusCode::OK,
+                true,
+            ),
+            (json!({}), StatusCode::OK, false),
+            (json!({"models":[]}), StatusCode::OK, false),
+            (json!({"models":{"":{}}}), StatusCode::OK, false),
+            (json!({"error":"NOT_FOUND"}), StatusCode::NOT_FOUND, false),
+        ] {
+            let app = Router::new()
+                .route(
+                    "/custom/v1internal:fetchAvailableModels",
+                    post(
+                        |State((payload, status)): State<(Value, StatusCode)>,
+                         headers: axum::http::HeaderMap,
+                         Json(body): Json<Value>| async move {
+                            assert_eq!(headers["authorization"], "Bearer fixture-token");
+                            assert_eq!(headers["user-agent"], "fixture-ua/7");
+                            assert_eq!(body, json!({"project":"fixture-project"}));
+                            (status, Json(payload))
+                        },
+                    ),
+                )
+                .with_state((payload.clone(), status));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let base_url = format!("http://{}/custom/", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let result = fetch_available_models(
+                &reqwest::Client::builder().no_proxy().build().unwrap(),
+                "fixture-token",
+                "fixture-project",
+                "fixture-ua/7",
+                &base_url,
+            )
+            .await;
+            server.abort();
+            assert_eq!(result.is_ok(), success, "{payload}: {result:?}");
+            if success {
+                assert_eq!(
+                    result.unwrap().is_empty(),
+                    payload["models"].as_object().unwrap().is_empty()
+                );
+            }
+        }
+    }
 
     #[test]
     fn hub_manifest_version_parses_semver_from_updater_feed() {
@@ -2016,12 +2323,20 @@ mod tests {
 
     #[test]
     fn subscription_model_catalog_keeps_wire_ids_and_channel_specific_fallbacks() {
-        let credential = crate::auth::types::StoredCredential {
-            meta: json!({"subscription_models": ["gemini-3.8-flash-high", "gemini-future-high"]}),
+        let mut credential = crate::auth::types::StoredCredential {
+            access_token: Some("fixture-token".into()),
+            meta: json!({"project_id": "fixture-project"}),
             ..Default::default()
         };
         for channel in ["antigravity", "gemini-cli"] {
             let (provider, _) = google_provider(channel, "gemini-3.8-flash");
+            let source =
+                catalog_source_for_runtime(&provider, &credential, &Default::default()).unwrap();
+            write_catalog_snapshot(
+                credential.meta.as_object_mut().unwrap(),
+                &["gemini-3.8-flash-high".into(), "gemini-future-high".into()],
+                &source,
+            );
             let raw = subscription_model_catalog(&provider, Some(&credential));
             assert!(raw.iter().any(|id| id == "gemini-future-high"));
             assert!(raw.iter().any(|id| id == "gemini-3.8-flash-high"));

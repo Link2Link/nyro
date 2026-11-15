@@ -16,6 +16,20 @@ Anthropic 的 `claude-code` 通道在 `egress::prepare` 处理非原生客户端
 
 Beta 根据处理后的请求体、模型、凭据和请求类别推导。配额探测不等于普通 Messages；thread 对象关联 thread beta；一小时 Messages 缓存标记必须匹配 extended-cache beta。Token 计数保持自己的 beta 列表，不套用 Messages 缓存策略。未知 beta 的转发延续现有网关策略。
 
+## 跨模型回退与实际服务模型诊断
+
+Cloak 不再为 Opus 5.5 或 Fable 5.1 自动注入服务端回退模型。调用方必须在上游 Messages 请求中显式提供 `fallbacks` 才表示选择启用；已有调用方值原样保留，不替换为默认列表。不新增全局开关、供应商配置或数据库字段。探测/辅助请求及已确认原生请求保持现有处理方式。这些控制不保证上游一定使用所选模型；诊断记录上游实际报告的服务模型。
+
+三类模型身份保持独立：
+
+- `client_model`：调用方请求的模型或别名。
+- `upstream_model`：路由选定、用于路由与配额归属的模型；服务端回退不能覆盖它。
+- `payload_metadata.response_model`：原始上游响应证据，例如 `{"served_model":"claude-opus-4-8","source":"usage.iterations.fallback_message.model"}`。
+
+对于 Anthropic 出站协议，共享 performance 观察器读取响应 `model` / `message.model`、fallback 内容块的 `content_block.to.model`（或非流式 fallback 内容），以及 `usage.iterations` 中最后一个有效的 `fallback_message` 模型。明确的回退证据优先于起始模型。观察发生在原生透传、IR 转换、raw-wire compat 转换之前，覆盖流式与非流式响应；不改写客户端响应中的 model 字段。
+
+该诊断复用现有 JSON 元数据，无 schema 变更，关闭 payload 记录时仍可保留。缺失或非法证据不使用路由模型补齐。模型标识最多 128 字节；观察复用现有有界 wire 解析器，因此超限或不可解析的响应可能没有实际服务模型证据。
+
 ## 缓存规范化
 
 非原生 Messages 的自动模式依次处理：
@@ -47,6 +61,7 @@ Nyro 当前通道改写位于通用 payload/Header 准备**之后**，不是 CLI
 
 ```bash
 cargo test -p nyro-core --lib provider::anthropic::claude_code
+cargo test -p nyro-core --lib claude_response_model
 cargo test -p nyro-core --test claude_code_oauth
 cargo check -p nyro-core
 ```

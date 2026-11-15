@@ -166,7 +166,17 @@ pub struct GoogleStreamParser {
     previous_was_cr: bool,
     first: bool,
     function_calls: CompleteFunctionCalls,
-    failed: bool,
+    state: GoogleStreamState,
+}
+
+// A finishReason ends generation, not necessarily the wire stream: usage may
+// follow in separate frames. Retain only the first terminal reason, never an
+// unbounded queue of terminal chunks, and forward content/usage as it arrives.
+enum GoogleStreamState {
+    Reading,
+    PendingTerminal(String),
+    Finished,
+    Failed,
 }
 
 /// Native Gemini complete-call events only: no inferred identity by name, part
@@ -191,7 +201,7 @@ impl GoogleStreamParser {
             previous_was_cr: false,
             first: true,
             function_calls: CompleteFunctionCalls::default(),
-            failed: false,
+            state: GoogleStreamState::Reading,
         }
     }
 
@@ -212,20 +222,31 @@ impl GoogleStreamParser {
                 format!("Invalid Gemini stream JSON: {error}"),
             )),
         };
-        if let Err(error) = result {
-            // Dispatcher consumers may only inspect successful decoder results.
-            // Emit an explicit IR error, and never let subsequent STOP/EOF turn
-            // a conflicting or incomplete functionCall into a successful call.
-            deltas.push(AiStreamDelta::StreamError { error });
-            self.failed = true;
-            self.buffer.clear();
-        }
+        let error = match result {
+            Ok(Some(reason)) => {
+                if matches!(self.state, GoogleStreamState::Reading) {
+                    self.state = GoogleStreamState::PendingTerminal(reason);
+                }
+                return;
+            }
+            Ok(None) => return,
+            Err(error) => error,
+        };
+        // Dispatcher consumers may only inspect successful decoder results.
+        // Emit an explicit IR error, and never let subsequent STOP/EOF turn
+        // a conflicting or incomplete functionCall into a successful call.
+        deltas.push(AiStreamDelta::StreamError { error });
+        self.state = GoogleStreamState::Failed;
+        self.buffer.clear();
     }
 }
 
 impl StreamResponseDecoder for GoogleStreamParser {
     fn parse_chunk(&mut self, raw: &str) -> Result<Vec<AiStreamDelta>> {
-        if self.failed {
+        if matches!(
+            self.state,
+            GoogleStreamState::Finished | GoogleStreamState::Failed
+        ) {
             return Ok(vec![]);
         }
         // SSE accepts LF, CRLF, and CR line endings. Normalize incrementally:
@@ -251,7 +272,10 @@ impl StreamResponseDecoder for GoogleStreamParser {
                 if let Some(data) = line.strip_prefix("data:") {
                     saw_sse_data = true;
                     self.parse_data(data.trim(), &mut deltas);
-                    if self.failed {
+                    if matches!(
+                        self.state,
+                        GoogleStreamState::Finished | GoogleStreamState::Failed
+                    ) {
                         return Ok(deltas);
                     }
                 }
@@ -261,7 +285,10 @@ impl StreamResponseDecoder for GoogleStreamParser {
             // comments or event-only blocks as malformed JSON payloads.
             if !saw_sse_data && block.trim_start().starts_with(['{', '[']) {
                 self.parse_data(block.trim(), &mut deltas);
-                if self.failed {
+                if matches!(
+                    self.state,
+                    GoogleStreamState::Finished | GoogleStreamState::Failed
+                ) {
                     return Ok(deltas);
                 }
             }
@@ -271,13 +298,45 @@ impl StreamResponseDecoder for GoogleStreamParser {
     }
 
     fn finish(&mut self) -> Result<Vec<AiStreamDelta>> {
-        if self.buffer.trim().is_empty() {
+        if matches!(
+            self.state,
+            GoogleStreamState::Finished | GoogleStreamState::Failed
+        ) {
             return Ok(vec![]);
         }
-        let remaining = std::mem::take(&mut self.buffer);
-        // `remaining` is already normalized, not a continuation of the wire.
-        self.previous_was_cr = false;
-        self.parse_chunk(&format!("{remaining}\n\n"))
+        let mut deltas = Vec::new();
+        if !self.buffer.trim().is_empty() {
+            let remaining = std::mem::take(&mut self.buffer);
+            // The remaining text is normalized, not a continuation of the wire.
+            self.previous_was_cr = false;
+            deltas.extend(self.parse_chunk(&format!("{remaining}\n\n"))?);
+        }
+        if matches!(self.state, GoogleStreamState::Failed) {
+            return Ok(deltas);
+        }
+
+        // Only clean transport EOF may finalize a pending terminal. Callers must
+        // not invoke finish() after a read error. Gemini has no mandatory [DONE]
+        // sentinel, and even finish + usage can precede a newer usage snapshot.
+        match std::mem::replace(&mut self.state, GoogleStreamState::Finished) {
+            GoogleStreamState::PendingTerminal(stop_reason) => {
+                deltas.push(AiStreamDelta::Done { stop_reason });
+            }
+            GoogleStreamState::Reading => {
+                // Strict policy: complete tool arguments alone do not prove that
+                // generation finished. Empty/content/usage-only EOF is failure.
+                self.state = GoogleStreamState::Failed;
+                deltas.push(AiStreamDelta::StreamError {
+                    error: AiError::new(
+                        AiErrorKind::UnexpectedEof,
+                        "Gemini stream ended without a finishReason",
+                    ),
+                });
+            }
+            GoogleStreamState::Finished | GoogleStreamState::Failed => {}
+        }
+        self.buffer.clear();
+        Ok(deltas)
     }
 }
 
@@ -292,7 +351,7 @@ fn parse_gemini_chunk(
     deltas: &mut Vec<AiStreamDelta>,
     first: &mut bool,
     function_calls: &mut CompleteFunctionCalls,
-) -> std::result::Result<(), AiError> {
+) -> std::result::Result<Option<String>, AiError> {
     if *first {
         *first = false;
         let model = chunk
@@ -453,20 +512,18 @@ fn parse_gemini_chunk(
         });
     }
 
-    if let Some(reason) = candidate
+    Ok(candidate
         .and_then(|c| c.get("finishReason"))
         .and_then(|v| v.as_str())
-    {
-        let normalized = match reason {
-            "STOP" => "stop",
-            "MAX_TOKENS" => "length",
-            other => other,
-        };
-        deltas.push(AiStreamDelta::Done {
-            stop_reason: normalized.to_string(),
-        });
-    }
-    Ok(())
+        .filter(|reason| !reason.trim().is_empty())
+        .map(|reason| {
+            match reason {
+                "STOP" => "stop",
+                "MAX_TOKENS" => "length",
+                other => other,
+            }
+            .to_string()
+        }))
 }
 
 // ── Stream formatter (deltas → Gemini SSE) ──
@@ -561,6 +618,21 @@ impl StreamResponseEncoder for GoogleStreamFormatter {
                         .get("__google_response_metadata")
                         .and_then(Value::as_object)
                     {
+                        // Usage snapshots evolve across frames, unlike stable
+                        // response metadata. New fields replace old values while
+                        // omitted counters/details remain available at Done.
+                        if let Some(latest) =
+                            metadata.get("usageMetadata").and_then(Value::as_object)
+                        {
+                            let mut usage = self
+                                .response_metadata
+                                .remove("usageMetadata")
+                                .and_then(|value| value.as_object().cloned())
+                                .unwrap_or_default();
+                            usage.extend(latest.clone());
+                            self.response_metadata
+                                .insert("usageMetadata".into(), Value::Object(usage));
+                        }
                         merge_json_object(&mut self.response_metadata, metadata);
                         continue;
                     }
@@ -1104,7 +1176,8 @@ mod tests {
         );
 
         let mut parser = GoogleStreamParser::new();
-        let deltas = parser.parse_chunk(raw).unwrap();
+        let mut deltas = parser.parse_chunk(raw).unwrap();
+        deltas.extend(parser.finish().unwrap());
         let mut formatter = GoogleStreamFormatter::new();
         let events = formatter.format_deltas(&deltas);
 
@@ -1159,7 +1232,8 @@ mod tests {
         let raw = format!("data: {chunk}\n\n");
 
         let mut parser = GoogleStreamParser::new();
-        let deltas = parser.parse_chunk(&raw).unwrap();
+        let mut deltas = parser.parse_chunk(&raw).unwrap();
+        deltas.extend(parser.finish().unwrap());
         let mut formatter = GoogleStreamFormatter::new();
         let events = formatter.format_deltas(&deltas);
 
@@ -1204,6 +1278,7 @@ mod tests {
                 let mut deltas = parser.parse_chunk(&raw[..split]).unwrap();
                 deltas.extend(parser.parse_chunk("").unwrap());
                 deltas.extend(parser.parse_chunk(&raw[split..]).unwrap());
+                deltas.extend(parser.finish().unwrap());
                 assert!(parser.finish().unwrap().is_empty());
                 assert_eq!(
                     deltas
@@ -1239,7 +1314,8 @@ mod tests {
             let raw = format!(
                 "event: message{newline}data: {{}}{newline}: comment{newline}data: {{\"candidates\":[{{\"finishReason\":\"STOP\"}}]}}{newline}{newline}"
             );
-            let deltas = parser.parse_chunk(&raw).unwrap();
+            let mut deltas = parser.parse_chunk(&raw).unwrap();
+            deltas.extend(parser.finish().unwrap());
             assert_eq!(
                 deltas
                     .iter()
@@ -1269,7 +1345,10 @@ mod tests {
             [AiStreamDelta::MessageStart { .. }]
         ));
         assert!(parser.parse_chunk("\n").unwrap().is_empty());
-        assert!(parser.finish().unwrap().is_empty());
+        assert!(matches!(
+            parser.finish().unwrap().as_slice(),
+            [AiStreamDelta::StreamError { error }] if error.kind == AiErrorKind::UnexpectedEof
+        ));
     }
 
     #[test]
@@ -1290,6 +1369,7 @@ mod tests {
                     .unwrap(),
             );
         }
+        deltas.extend(parser.finish().unwrap());
         assert!(parser.finish().unwrap().is_empty());
         assert_eq!(deltas.iter().filter(|d| matches!(d, AiStreamDelta::ToolCallStart { id, name, .. } if id == "call-1" && name == "read_file")).count(), 1);
         assert_eq!(

@@ -491,6 +491,64 @@ mod tests {
     }
 
     #[test]
+    fn server_side_fallback_requires_explicit_caller_opt_in() {
+        for model in ["claude-opus-5-5", "claude-fable-5-1", "claude-fable-5-2"] {
+            for stream in [false, true] {
+                for mode in ["cloaked", "native", "probe"] {
+                    for fallbacks in [
+                        None,
+                        Some(json!([])),
+                        Some(json!(null)),
+                        Some(json!([{"model": "claude-sonnet-5", "custom": "keep"}])),
+                    ] {
+                        let mut incoming = HeaderMap::new();
+                        let mut body = json!({
+                            "model": model,
+                            "stream": stream,
+                            "max_tokens": if mode == "probe" { 1 } else { 1024 },
+                            "messages": [{"role": "user", "content": if mode == "probe" { "probe" } else { "hello" }}]
+                        });
+                        if mode == "native" {
+                            incoming.insert(
+                                "user-agent",
+                                HeaderValue::from_static("claude-cli/2.1.321 (external, cli)"),
+                            );
+                            incoming.insert("x-app", HeaderValue::from_static("cli"));
+                            incoming.insert(
+                                "anthropic-beta",
+                                HeaderValue::from_static("claude-code-20250219"),
+                            );
+                            body["metadata"] = json!({"user_id": json!({"device_id": "c".repeat(64), "account_uuid": "", "session_id": "8f14e45f-ceea-4672-9b8e-3c1c1a0e4a1d"}).to_string()});
+                            body["system"] = json!([
+                                {"type": "text", "text": "x-anthropic-billing-header: cc_version=2.1.321.abc; cc_entrypoint=cli;"},
+                                {"type": "text", "text": "You are Claude Code, Anthropic's official CLI for Claude."}
+                            ]);
+                        }
+                        if let Some(value) = &fallbacks {
+                            body["fallbacks"] = value.clone();
+                        }
+                        assert_eq!(profile::is_probe_or_helper(&body), mode == "probe");
+                        let (_, _, hook) = run(&incoming, &mut body);
+                        assert_eq!(hook.native, mode == "native");
+                        assert_eq!(
+                            body.get("fallbacks"),
+                            fallbacks.as_ref(),
+                            "{model}/{mode}/stream={stream}"
+                        );
+                        assert_eq!(body["model"], model);
+                        assert_eq!(body["stream"], stream);
+                        // The final byte-signing boundary must not add or replace fallbacks either.
+                        let signed = hook
+                            .finalize_request_body(Bytes::from(serde_json::to_vec(&body).unwrap()));
+                        let signed: Value = serde_json::from_slice(&signed).unwrap();
+                        assert_eq!(signed.get("fallbacks"), fallbacks.as_ref());
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn third_party_caller_gets_full_cli_profile() {
         let mut incoming = HeaderMap::new();
         incoming.insert(

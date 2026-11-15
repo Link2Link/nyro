@@ -580,7 +580,39 @@ async fn assert_stale_recovery(
         cursor_row.last_error.as_deref(),
         Some(oauth::STALE_REFRESH_ERROR)
     );
-    assert_eq!(oauth.get(legacy).await?.unwrap().status, "connected");
+    let quarantined = oauth.get(legacy).await?.unwrap();
+    assert_eq!(quarantined.status, "error");
+    assert_eq!(
+        quarantined.last_error.as_deref(),
+        Some(crate::auth::refresh_state::OUTCOME_UNKNOWN_MESSAGE)
+    );
+    assert!(
+        oauth
+            .try_begin_refresh(legacy, quarantined.status_version)
+            .await?
+            .is_none()
+    );
+    assert!(
+        oauth
+            .complete_refresh(legacy, quarantined.status_version - 1, credential("late"))
+            .await?
+            .is_none()
+    );
+    assert!(
+        !oauth
+            .fail_refresh(legacy, quarantined.status_version - 1, "late")
+            .await?
+    );
+    let rebound = oauth.upsert(legacy, credential("reauthorized")).await?;
+    assert_eq!(rebound.status, "connected");
+    assert_eq!(rebound.last_error, None);
+    assert!(rebound.status_version > quarantined.status_version);
+    assert!(
+        oauth
+            .try_begin_refresh(legacy, rebound.status_version)
+            .await?
+            .is_some()
+    );
     assert!(
         oauth
             .complete_refresh(
@@ -598,6 +630,621 @@ async fn assert_stale_recovery(
     );
     oauth.delete(cursor).await?;
     oauth.delete(legacy).await?;
+    Ok(())
+}
+
+async fn exercise_refresh_retry_barriers(
+    oauth: &dyn OAuthCredentialStore,
+    single: &str,
+    pool: &str,
+) -> anyhow::Result<()> {
+    use crate::auth::refresh_state::{REFRESH_RETRY_AT_KEY, with_retry_at};
+
+    let original = serde_json::json!({"project_id": "keep", "nested": {"keep": true}});
+    let retry_meta = with_retry_at(&original, chrono::Utc::now() + chrono::Duration::hours(1));
+    let blocked_message = "OAuth refresh is temporarily unavailable; try again later";
+    let with_meta = |token: &str| UpsertOAuthCredential {
+        meta: Some(retry_meta.to_string()),
+        ..credential(token)
+    };
+    // New authorization must discard a caller's stale retry barrier, not its other metadata.
+    let initial = oauth.upsert(single, with_meta("initial")).await?;
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&initial.meta)?,
+        original
+    );
+    let lease = oauth
+        .try_begin_refresh(single, initial.status_version)
+        .await?
+        .unwrap();
+    assert!(
+        oauth
+            .fail_refresh_with_policy(
+                single,
+                lease.status_version,
+                "temporarily unavailable",
+                false,
+                Some(retry_meta.to_string())
+            )
+            .await?
+    );
+    let blocked = oauth.get(single).await?.unwrap();
+    let snapshot = serde_json::to_value(&blocked)?;
+    assert_eq!(blocked.status, "connected");
+    assert_eq!(blocked.meta, retry_meta.to_string());
+    assert_eq!(
+        oauth
+            .try_begin_refresh(single, blocked.status_version)
+            .await
+            .unwrap_err()
+            .to_string(),
+        blocked_message
+    );
+    assert_eq!(
+        oauth
+            .try_begin_account_refresh(single, &blocked.account_id, blocked.status_version)
+            .await
+            .unwrap_err()
+            .to_string(),
+        blocked_message
+    );
+    // CAS and account identity rejection still take precedence over retry metadata.
+    assert!(
+        oauth
+            .try_begin_refresh(single, lease.status_version)
+            .await?
+            .is_none()
+    );
+    assert!(
+        oauth
+            .try_begin_account_refresh(single, &blocked.account_id, lease.status_version)
+            .await?
+            .is_none()
+    );
+    assert!(
+        oauth
+            .try_begin_account_refresh(pool, &blocked.account_id, blocked.status_version)
+            .await?
+            .is_none()
+    );
+    assert!(
+        oauth
+            .complete_refresh(single, lease.status_version, credential("late"))
+            .await?
+            .is_none()
+    );
+    assert_eq!(
+        serde_json::to_value(oauth.get(single).await?.unwrap())?,
+        snapshot
+    );
+
+    // Failed authorization compensation must restore, not erase, an older barrier.
+    let published = oauth.upsert(single, credential("failed-bind")).await?;
+    assert!(
+        oauth
+            .restore_if_version(single, published.status_version, Some(with_meta("initial")))
+            .await?
+    );
+    let restored = oauth.get(single).await?.unwrap();
+    assert_eq!(restored.meta, retry_meta.to_string());
+    assert_eq!(
+        oauth
+            .try_begin_refresh(single, restored.status_version)
+            .await
+            .unwrap_err()
+            .to_string(),
+        blocked_message
+    );
+
+    let rebound = oauth.upsert(single, with_meta("reauthorized")).await?;
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&rebound.meta)?,
+        original
+    );
+    let lease = oauth
+        .try_begin_account_refresh(single, &rebound.account_id, rebound.status_version)
+        .await?
+        .unwrap();
+    let completed = oauth
+        .complete_account_refresh(
+            single,
+            &rebound.account_id,
+            lease.status_version,
+            with_meta("fresh"),
+        )
+        .await?
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&completed.meta)?,
+        original
+    );
+    // Expired deadlines permit refresh; a completion without new metadata also clears them.
+    let expired = with_retry_at(&original, chrono::Utc::now() - chrono::Duration::seconds(1));
+    let lease = oauth
+        .try_begin_refresh(single, completed.status_version)
+        .await?
+        .unwrap();
+    assert!(
+        oauth
+            .fail_account_refresh_with_policy(
+                single,
+                &lease.account_id,
+                lease.status_version,
+                "retryable",
+                false,
+                Some(expired.to_string())
+            )
+            .await?
+    );
+    let retry = oauth.get(single).await?.unwrap();
+    let lease = oauth
+        .try_begin_refresh(single, retry.status_version)
+        .await?
+        .unwrap();
+    let completed = oauth
+        .complete_refresh(
+            single,
+            lease.status_version,
+            UpsertOAuthCredential {
+                meta: None,
+                ..credential("expired-barrier-cleared")
+            },
+        )
+        .await?
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&completed.meta)?,
+        original
+    );
+
+    let a = oauth
+        .create_account(pool, "A", kiro_credential("account-a"))
+        .await?;
+    let b = oauth
+        .create_account(pool, "B", kiro_credential("account-b"))
+        .await?;
+    let state = r#"{"quota":{"remaining":7}}"#;
+    assert!(
+        oauth
+            .compare_account_state(pool, &a.account_id, a.status_version, "{}", state)
+            .await?
+    );
+    let lease = oauth
+        .try_begin_account_refresh(pool, &a.account_id, a.status_version)
+        .await?
+        .unwrap();
+    assert!(
+        oauth
+            .fail_account_refresh_with_policy(
+                pool,
+                &a.account_id,
+                lease.status_version,
+                "retryable",
+                false,
+                Some(retry_meta.to_string())
+            )
+            .await?
+    );
+    let blocked = oauth.get_account(pool, &a.account_id).await?.unwrap();
+    assert_eq!(blocked.account_state, state);
+    assert_eq!(
+        oauth
+            .try_begin_account_refresh(pool, &a.account_id, blocked.status_version)
+            .await
+            .unwrap_err()
+            .to_string(),
+        blocked_message
+    );
+    assert!(
+        oauth
+            .try_begin_refresh(pool, blocked.status_version)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("AMBIGUOUS_ACCOUNT")
+    );
+    assert!(
+        oauth
+            .update_meta_if_version(pool, blocked.status_version, "{}")
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("AMBIGUOUS_ACCOUNT")
+    );
+    // A retry barrier belongs to one credential; an unrelated sibling may refresh.
+    let sibling = oauth
+        .try_begin_account_refresh(pool, &b.account_id, b.status_version)
+        .await?
+        .unwrap();
+    let sibling = oauth
+        .complete_account_refresh(
+            pool,
+            &b.account_id,
+            sibling.status_version,
+            kiro_credential("account-b-fresh"),
+        )
+        .await?
+        .unwrap();
+    assert_eq!(sibling.status, "connected");
+    assert_eq!(
+        oauth.get_account(pool, &a.account_id).await?.unwrap().meta,
+        blocked.meta
+    );
+    assert!(
+        oauth
+            .complete_account_refresh(
+                pool,
+                &a.account_id,
+                lease.status_version,
+                kiro_credential("late")
+            )
+            .await?
+            .is_none()
+    );
+    let rebound = oauth
+        .replace_account(
+            pool,
+            &a.account_id,
+            blocked.status_version,
+            UpsertOAuthCredential {
+                meta: Some(retry_meta.to_string()),
+                ..kiro_credential("account-a-reauthorized")
+            },
+        )
+        .await?
+        .unwrap();
+    let meta: serde_json::Value = serde_json::from_str(&rebound.meta)?;
+    assert!(meta.get(REFRESH_RETRY_AT_KEY).is_none());
+    assert_eq!(meta, original);
+    assert!(
+        oauth
+            .try_begin_account_refresh(pool, &a.account_id, rebound.status_version)
+            .await?
+            .is_some()
+    );
+    oauth
+        .disconnect_account(pool, &a.account_id, rebound.status_version + 1)
+        .await?;
+    oauth
+        .disconnect_account(pool, &b.account_id, sibling.status_version)
+        .await?;
+    oauth.delete(single).await?;
+    Ok(())
+}
+
+async fn exercise_refresh_publication_receipts(
+    oauth: &dyn OAuthCredentialStore,
+    provider: &str,
+) -> anyhow::Result<()> {
+    use crate::auth::refresh_state::REFRESH_PUBLICATION_ID_KEY;
+
+    let original = serde_json::json!({"account_id": "identity", "keep": "metadata"});
+    let mut meta = original.clone();
+    meta[REFRESH_PUBLICATION_ID_KEY] = "synthetic-publication-id".into();
+    let input = UpsertOAuthCredential {
+        meta: Some(meta.to_string()),
+        ..credential("same-access-token")
+    };
+    let initial = oauth.upsert(provider, input.clone()).await?;
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&initial.meta)?,
+        original
+    );
+    let lease = oauth
+        .try_begin_refresh(provider, initial.status_version)
+        .await?
+        .unwrap();
+    let published = oauth
+        .complete_refresh(provider, lease.status_version, input.clone())
+        .await?
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&published.meta)?,
+        meta
+    );
+    // The exact same access/refresh tokens must not make a new bind look like a receipt.
+    let rebound = oauth.upsert(provider, input.clone()).await?;
+    assert_eq!(rebound.access_token, published.access_token);
+    assert_eq!(rebound.refresh_token, published.refresh_token);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&rebound.meta)?,
+        original
+    );
+    assert!(
+        oauth
+            .restore_if_version(provider, rebound.status_version, Some(input.clone()))
+            .await?
+    );
+    let restored = oauth.get(provider).await?.unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&restored.meta)?,
+        meta
+    );
+    let replaced = oauth
+        .replace_account(
+            provider,
+            &restored.account_id,
+            restored.status_version,
+            input.clone(),
+        )
+        .await?
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&replaced.meta)?,
+        original
+    );
+    let lease = oauth
+        .try_begin_account_refresh(provider, &replaced.account_id, replaced.status_version)
+        .await?
+        .unwrap();
+    let published = oauth
+        .complete_account_refresh(
+            provider,
+            &replaced.account_id,
+            lease.status_version,
+            input.clone(),
+        )
+        .await?
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&published.meta)?,
+        meta
+    );
+    oauth.delete(provider).await?;
+    let created = oauth
+        .create_account(provider, "New authorization", input)
+        .await?;
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&created.meta)?,
+        original
+    );
+    oauth.delete(provider).await?;
+    Ok(())
+}
+
+async fn exercise_metadata_only_cas(
+    oauth: &dyn OAuthCredentialStore,
+    provider: &str,
+) -> anyhow::Result<()> {
+    let initial = oauth.upsert(provider, credential("initial")).await?;
+    let lease = oauth
+        .try_begin_refresh(provider, initial.status_version)
+        .await?
+        .unwrap();
+    let completed = oauth
+        .complete_refresh(provider, lease.status_version, credential("fresh"))
+        .await?
+        .unwrap();
+    let row = oauth
+        .update_account(
+            provider,
+            &completed.account_id,
+            completed.status_version,
+            OAuthAccountUpdate {
+                label: Some("Keep label".into()),
+                priority: Some(7),
+                is_enabled: Some(false),
+            },
+        )
+        .await?
+        .unwrap();
+    let state = r#"{"quota":{"remaining":42}}"#;
+    assert!(
+        oauth
+            .compare_account_state(provider, &row.account_id, row.status_version, "{}", state)
+            .await?
+    );
+    let row = oauth.get(provider).await?.unwrap();
+    for invalid in [
+        "[]".to_string(),
+        "null".to_string(),
+        "invalid-secret".to_string(),
+        format!(r#"{{"large":"{}"}}"#, "x".repeat(65536)),
+    ] {
+        let error = oauth
+            .update_meta_if_version(provider, row.status_version, &invalid)
+            .await
+            .unwrap_err();
+        assert!(!error.to_string().contains("invalid-secret"));
+    }
+    assert!(
+        oauth
+            .update_meta_if_version(provider, row.status_version - 1, "invalid")
+            .await?
+            .is_none()
+    );
+    let meta = r#"{"project_id":"discovered","cache":{"ready":true}}"#;
+    let updated = oauth
+        .update_meta_if_version(provider, row.status_version, meta)
+        .await?
+        .unwrap();
+    let mut expected = row.clone();
+    expected.meta = meta.into();
+    expected.status_version += 1;
+    assert_eq!(
+        serde_json::to_value(&updated)?,
+        serde_json::to_value(&expected)?
+    );
+    assert!(
+        oauth
+            .update_meta_if_version(provider, row.status_version, "{}")
+            .await?
+            .is_none()
+    );
+    assert!(
+        oauth
+            .try_begin_refresh(provider, row.status_version)
+            .await?
+            .is_none()
+    );
+    let lease = oauth
+        .try_begin_refresh(provider, updated.status_version)
+        .await?
+        .unwrap();
+    assert!(
+        oauth
+            .update_meta_if_version(provider, lease.status_version, "{}")
+            .await?
+            .is_none()
+    );
+    assert_eq!(
+        serde_json::to_value(oauth.get(provider).await?.unwrap())?,
+        serde_json::to_value(&lease)?
+    );
+    assert!(
+        oauth
+            .fail_refresh_with_policy(
+                provider,
+                lease.status_version,
+                "reauth_required",
+                true,
+                None
+            )
+            .await?
+    );
+    let error = oauth.get(provider).await?.unwrap();
+    assert!(
+        oauth
+            .update_meta_if_version(provider, error.status_version, "{}")
+            .await?
+            .is_none()
+    );
+    oauth.delete(provider).await?;
+    assert!(
+        oauth
+            .update_meta_if_version(provider, error.status_version + 1, "{}")
+            .await?
+            .is_none()
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn memory_oauth_retry_barrier_and_metadata_cas() -> anyhow::Result<()> {
+    let storage = MemoryStorage::new(
+        vec![
+            account_provider("single", "openai"),
+            account_provider("pool", "kiro"),
+        ],
+        vec![],
+        vec![],
+    );
+    exercise_refresh_retry_barriers(storage.oauth_credentials(), "single", "pool").await?;
+    exercise_metadata_only_cas(storage.oauth_credentials(), "single").await?;
+    exercise_refresh_publication_receipts(storage.oauth_credentials(), "single").await
+}
+
+#[tokio::test]
+async fn sqlite_oauth_retry_barrier_and_metadata_cas() -> anyhow::Result<()> {
+    let directory = tempfile::tempdir()?;
+    let pool = crate::db::init_pool(directory.path()).await?;
+    crate::db::migrate(&pool).await?;
+    let storage = SqliteStorage::from_pool(pool.clone());
+    let single = create_pool_test_provider(&storage, "openai").await?;
+    let multi = create_pool_test_provider(&storage, "kiro").await?;
+    exercise_refresh_retry_barriers(storage.oauth_credentials(), &single, &multi).await?;
+    exercise_metadata_only_cas(storage.oauth_credentials(), &single).await?;
+    exercise_refresh_publication_receipts(storage.oauth_credentials(), &single).await?;
+    storage.providers().delete(&single).await?;
+    storage.providers().delete(&multi).await?;
+    pool.close().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn sqlite_oauth_stale_codex_aliases_require_reauthorization() -> anyhow::Result<()> {
+    use crate::auth::refresh_state::OUTCOME_UNKNOWN_MESSAGE;
+
+    let directory = tempfile::tempdir()?;
+    let pool = crate::db::init_pool(directory.path()).await?;
+    crate::db::migrate(&pool).await?;
+    let storage = SqliteStorage::from_pool(pool.clone());
+    let provider = create_pool_test_provider(&storage, "openai").await?;
+    let oauth = storage.oauth_credentials();
+    for driver in [
+        "codex",
+        "openai",
+        "openai-oauth",
+        "openai_oauth",
+        "codex-cli",
+        " CoDeX ",
+        " OPENAI-OAUTH ",
+        "\tOPENAI\n",
+        "\r\n\tCoDeX-ClI\u{000B}\u{000C} ",
+    ] {
+        let input = UpsertOAuthCredential {
+            driver_key: driver.into(),
+            ..credential("old")
+        };
+        let initial = oauth.upsert(&provider, input.clone()).await?;
+        let lease = oauth
+            .try_begin_account_refresh(&provider, &initial.account_id, initial.status_version)
+            .await?
+            .unwrap();
+        sqlx::query("UPDATE provider_oauth_credentials SET updated_at = '2000-01-01 00:00:00' WHERE account_id = ?")
+            .bind(&initial.account_id).execute(&pool).await?;
+        assert_eq!(
+            oauth
+                .recover_stale_refreshing(Duration::from_secs(60))
+                .await?,
+            1
+        );
+        let row = oauth.get(&provider).await?.unwrap();
+        assert_eq!(row.status, "error", "driver {driver}");
+        assert_eq!(row.last_error.as_deref(), Some(OUTCOME_UNKNOWN_MESSAGE));
+        assert_eq!(row.status_version, lease.status_version + 1);
+        assert_eq!(row.access_token, "old");
+        assert!(
+            oauth
+                .try_begin_refresh(&provider, row.status_version)
+                .await?
+                .is_none()
+        );
+        assert!(
+            oauth
+                .try_begin_account_refresh(&provider, &row.account_id, row.status_version)
+                .await?
+                .is_none()
+        );
+        assert!(
+            oauth
+                .complete_account_refresh(
+                    &provider,
+                    &row.account_id,
+                    lease.status_version,
+                    input.clone()
+                )
+                .await?
+                .is_none()
+        );
+        assert!(
+            !oauth
+                .fail_account_refresh_with_policy(
+                    &provider,
+                    &row.account_id,
+                    lease.status_version,
+                    "late",
+                    false,
+                    None
+                )
+                .await?
+        );
+        let rebound = oauth
+            .replace_account(&provider, &row.account_id, row.status_version, input)
+            .await?
+            .unwrap();
+        assert_eq!(rebound.status, "connected");
+        assert_eq!(rebound.last_error, None);
+        assert!(
+            oauth
+                .try_begin_refresh(&provider, rebound.status_version)
+                .await?
+                .is_some()
+        );
+        oauth.delete(&provider).await?;
+    }
+    storage.providers().delete(&provider).await?;
+    pool.close().await;
     Ok(())
 }
 

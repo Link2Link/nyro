@@ -743,6 +743,18 @@ impl OAuthCredentialStore for MemoryOAuthCredentialStore {
             .await?
             .is_some())
     }
+    async fn update_meta_if_version(
+        &self,
+        provider_id: &str,
+        expected_version: i32,
+        meta: &str,
+    ) -> anyhow::Result<Option<OAuthCredential>> {
+        self.mutate(
+            provider_id,
+            crate::storage::oauth::Mutation::UpdateMeta(expected_version, meta),
+        )
+        .await
+    }
     async fn delete(&self, provider_id: &str) -> anyhow::Result<()> {
         self.mutate(provider_id, crate::storage::oauth::Mutation::Delete)
             .await?;
@@ -873,8 +885,22 @@ impl OAuthCredentialStore for MemoryOAuthCredentialStore {
                 && super::oauth::parse_timestamp(&cred.updated_at)
                     .is_some_and(|updated| i128::from(updated.timestamp()) < cutoff)
             {
-                cred.status = "connected".to_string();
-                cred.last_error = Some(super::oauth::STALE_REFRESH_ERROR.to_string());
+                let outcome_unknown =
+                    crate::auth::normalize_driver_key(&cred.driver_key) == "codex";
+                cred.status = if outcome_unknown {
+                    "error"
+                } else {
+                    "connected"
+                }
+                .to_string();
+                cred.last_error = Some(
+                    if outcome_unknown {
+                        crate::auth::refresh_state::OUTCOME_UNKNOWN_MESSAGE
+                    } else {
+                        super::oauth::STALE_REFRESH_ERROR
+                    }
+                    .to_string(),
+                );
                 cred.status_version += 1;
                 cred.updated_at = now.format("%Y-%m-%d %H:%M:%S").to_string();
                 count += 1;
@@ -895,7 +921,7 @@ mod oauth_time_tests {
             credentials: RwLock::new(std::collections::HashMap::new()),
         };
         for (provider, driver) in [
-            ("old-a", "codex"),
+            ("old-a", "cursor"),
             ("old-codex", "codex"),
             ("fresh", "codex"),
         ] {
@@ -941,7 +967,24 @@ mod oauth_time_tests {
             Some(super::super::oauth::STALE_REFRESH_ERROR)
         );
         assert_eq!(recovered.status_version, 2);
-        assert_eq!(store.get("old-codex").await?.unwrap().status, "connected");
+        let quarantined = store.get("old-codex").await?.unwrap();
+        assert_eq!(quarantined.status, "error");
+        assert_eq!(
+            quarantined.last_error.as_deref(),
+            Some(crate::auth::refresh_state::OUTCOME_UNKNOWN_MESSAGE)
+        );
+        assert!(
+            store
+                .try_begin_refresh("old-codex", quarantined.status_version)
+                .await?
+                .is_none()
+        );
+        assert!(
+            store
+                .complete_refresh("old-codex", 1, UpsertOAuthCredential::default())
+                .await?
+                .is_none()
+        );
         assert_eq!(store.get("fresh").await?.unwrap().status, "refreshing");
         assert!(!store.fail_refresh("old-a", 1, "late").await?);
         assert!(
@@ -959,6 +1002,97 @@ mod oauth_time_tests {
         assert_eq!(tombstone.meta, "{}");
         assert_eq!(tombstone.subject_id, None);
         assert_eq!(tombstone.refresh_token, None);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stale_codex_aliases_require_reauthorization() -> anyhow::Result<()> {
+        let store = MemoryOAuthCredentialStore {
+            providers: Arc::new(RwLock::new(Vec::new())),
+            credentials: RwLock::new(std::collections::HashMap::new()),
+        };
+        for driver in [
+            "codex",
+            "openai",
+            "openai-oauth",
+            "openai_oauth",
+            "codex-cli",
+            " CoDeX ",
+            " OPENAI-OAUTH ",
+            "\tOPENAI\n",
+            "\r\n\tCoDeX-ClI\u{000B}\u{000C} ",
+        ] {
+            let input = UpsertOAuthCredential {
+                driver_key: driver.into(),
+                access_token: "old".into(),
+                ..Default::default()
+            };
+            let initial = store.upsert("alias", input.clone()).await?;
+            let lease = store
+                .try_begin_account_refresh("alias", &initial.account_id, initial.status_version)
+                .await?
+                .unwrap();
+            store
+                .credentials
+                .write()
+                .await
+                .get_mut(&initial.account_id)
+                .unwrap()
+                .updated_at = "2000-01-01 00:00:00".into();
+            assert_eq!(
+                store
+                    .recover_stale_refreshing(Duration::from_secs(60))
+                    .await?,
+                1
+            );
+            let row = store.get("alias").await?.unwrap();
+            assert_eq!(row.status, "error", "driver {driver}");
+            assert_eq!(
+                row.last_error.as_deref(),
+                Some(crate::auth::refresh_state::OUTCOME_UNKNOWN_MESSAGE)
+            );
+            assert_eq!(row.status_version, lease.status_version + 1);
+            assert_eq!(row.access_token, "old");
+            assert!(
+                store
+                    .try_begin_account_refresh("alias", &row.account_id, row.status_version)
+                    .await?
+                    .is_none()
+            );
+            assert!(
+                store
+                    .complete_account_refresh(
+                        "alias",
+                        &row.account_id,
+                        lease.status_version,
+                        input.clone()
+                    )
+                    .await?
+                    .is_none()
+            );
+            assert!(
+                !store
+                    .fail_account_refresh_with_policy(
+                        "alias",
+                        &row.account_id,
+                        lease.status_version,
+                        "late",
+                        false,
+                        None
+                    )
+                    .await?
+            );
+            let rebound = store.upsert("alias", input).await?;
+            assert_eq!(rebound.status, "connected");
+            assert_eq!(rebound.last_error, None);
+            assert!(
+                store
+                    .try_begin_refresh("alias", rebound.status_version)
+                    .await?
+                    .is_some()
+            );
+            store.delete("alias").await?;
+        }
         Ok(())
     }
 

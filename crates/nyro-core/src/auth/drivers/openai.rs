@@ -13,6 +13,7 @@ use super::shared::{
     generate_code_verifier, generate_state, parse_oauth_callback, parse_session_state,
     required_http_client, validate_callback_state,
 };
+use crate::auth::refresh::{RefreshFailure, send_refresh_request};
 use crate::auth::types::{
     AuthDriver, AuthDriverMetadata, AuthExchangeInput, AuthScheme, AuthSession, CreateAuthSession,
     CredentialBundle, ExchangeAuthContext, RefreshAuthContext, RuntimeBinding, StartAuthContext,
@@ -394,16 +395,16 @@ impl AuthDriver for OpenAIOAuthDriver {
         credential: &StoredCredential,
         ctx: RefreshAuthContext,
     ) -> Result<CredentialBundle> {
-        let config = Self::codex_config()?;
+        let config = Self::codex_config().map_err(|_| RefreshFailure::PreSend)?;
         let refresh_token = credential
             .refresh_token
             .as_deref()
             .map(str::trim)
             .filter(|value| !value.is_empty())
-            .ok_or_else(|| anyhow!("openai oauth refresh token is missing"))?;
-        let client = required_http_client(ctx.http_client)?;
+            .ok_or(RefreshFailure::PreSend)?;
+        let client = ctx.http_client.ok_or(RefreshFailure::PreSend)?;
 
-        let response = Self::apply_auth_identity(client.post(config.oauth.token_url))
+        let request = Self::apply_auth_identity(client.post(config.oauth.token_url))
             .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
             .header(ACCEPT, "application/json")
             .form(&[
@@ -411,25 +412,18 @@ impl AuthDriver for OpenAIOAuthDriver {
                 ("client_id", config.oauth.client_id),
                 ("refresh_token", refresh_token),
                 ("scope", CODEX_REFRESH_SCOPE),
-            ])
-            .send()
-            .await
-            .context("refresh openai oauth token")?;
+            ]);
 
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        if !status.is_success() {
-            let detail = Self::parse_error(&body).unwrap_or(body);
-            bail!("openai oauth token refresh failed: HTTP {status} {detail}");
-        }
-
-        Self::normalize_token_response(
-            &body,
-            Some(refresh_token),
-            Some(&credential.scopes),
-            Some(&credential.meta),
-            config.runtime,
-        )
+        Ok(send_refresh_request(request, |body| {
+            Self::normalize_token_response(
+                body,
+                Some(refresh_token),
+                Some(&credential.scopes),
+                Some(&credential.meta),
+                config.runtime,
+            )
+        })
+        .await?)
     }
 
     fn bind_runtime(
@@ -496,6 +490,65 @@ mod tests {
             "header.{}.signature",
             URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload).unwrap())
         )
+    }
+
+    #[tokio::test]
+    async fn refresh_http_preserves_identity_scopes_and_rotated_tokens() {
+        let config = OpenAIOAuthDriver::codex_config().unwrap();
+        let old_scopes = vec!["openid".to_string(), "profile".to_string()];
+        let old_meta = json!({"chatgpt_account_id": "account-old", "email": "old@example.com"});
+        let (request, server) = crate::auth::refresh::tests::response(
+            200,
+            "",
+            br#"{"access_token":"secret-new-access","refresh_token":"secret-new-refresh"}"#,
+        )
+        .await;
+        let bundle = send_refresh_request(request, |body| {
+            OpenAIOAuthDriver::normalize_token_response(
+                body,
+                Some("secret-old-refresh"),
+                Some(&old_scopes),
+                Some(&old_meta),
+                config.runtime,
+            )
+        })
+        .await
+        .unwrap();
+        server.await.unwrap();
+        assert_eq!(bundle.access_token.as_deref(), Some("secret-new-access"));
+        assert_eq!(bundle.refresh_token.as_deref(), Some("secret-new-refresh"));
+        assert_eq!(bundle.scopes, old_scopes);
+        assert_eq!(bundle.subject_id.as_deref(), Some("account-old"));
+        assert_eq!(bundle.raw["email"], "old@example.com");
+        assert!(!bundle.raw.to_string().contains("secret-"));
+    }
+
+    #[tokio::test]
+    async fn refresh_http_missing_token_and_malformed_fields_are_unknown() {
+        let config = OpenAIOAuthDriver::codex_config().unwrap();
+        for body in [
+            r#"{"refresh_token":"secret-rotated"}"#,
+            r#"{"access_token":" "}"#,
+            r#"{"access_token":"secret-access","expires_in":"secret-invalid"}"#,
+            "{secret-malformed",
+        ] {
+            let (request, server) =
+                crate::auth::refresh::tests::response(200, "", body.as_bytes()).await;
+            let error = send_refresh_request(request, |body| {
+                OpenAIOAuthDriver::normalize_token_response(
+                    body,
+                    Some("secret-old-refresh"),
+                    None,
+                    None,
+                    config.runtime,
+                )
+            })
+            .await
+            .unwrap_err();
+            server.await.unwrap();
+            assert_eq!(error, RefreshFailure::OutcomeUnknown { stage: "decode" });
+            crate::auth::refresh::tests::assert_sanitized(&error);
+        }
     }
 
     #[test]

@@ -3491,12 +3491,13 @@ impl AdminService {
                 })?;
                 let project_id =
                     crate::provider::google::antigravity::code_assist_project_id(Some(credential))?;
-                let user_agent =
-                    if crate::provider::google::gemini_cli::is_google_gemini_cli(&provider) {
-                        crate::provider::google::gemini_cli::GEMINI_CLI_USER_AGENT.to_string()
-                    } else {
-                        crate::provider::google::antigravity::antigravity_user_agent()
-                    };
+                let catalog_source =
+                    crate::provider::google::antigravity::catalog_source_for_runtime(
+                        &provider,
+                        credential,
+                        &runtime.binding,
+                    )?;
+                let user_agent = &catalog_source.user_agent;
                 let client = self.gw.http_client_for_provider(provider.use_proxy).await?;
                 // Independent failures: discovery must never prevent a valid
                 // enforced summary, nor replace stronger last-good evidence.
@@ -3505,13 +3506,14 @@ impl AdminService {
                         &client,
                         runtime.access_token.trim(),
                         &project_id,
-                        &user_agent,
+                        user_agent,
+                        &catalog_source.endpoint,
                     ),
                     crate::provider::google::antigravity::retrieve_user_quota_summary(
                         &client,
                         runtime.access_token.trim(),
                         &project_id,
-                        &user_agent,
+                        user_agent,
                     ),
                 );
                 let summary_ok = summary.as_ref().is_ok_and(|summary| !summary.is_empty());

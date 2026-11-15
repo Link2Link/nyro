@@ -520,6 +520,15 @@ pub trait OAuthCredentialStore: Send + Sync {
         expected_version: i32,
         previous: Option<UpsertOAuthCredential>,
     ) -> anyhow::Result<bool>;
+    /// Update only metadata on the singleton connected generation, advancing its
+    /// version without resetting account state or refresh timestamps. Rejects stale
+    /// or refreshing rows. Metadata must be a JSON object of at most 64 KiB.
+    async fn update_meta_if_version(
+        &self,
+        provider_id: &str,
+        expected_version: i32,
+        meta: &str,
+    ) -> anyhow::Result<Option<OAuthCredential>>;
     /// Remove credentials from the public view and scrub all secret/account data.
     /// Stores retain a disconnected version fence until the provider is deleted,
     /// so logout followed by rebind cannot reuse a previous refresh generation.
@@ -563,7 +572,9 @@ pub trait OAuthCredentialStore: Send + Sync {
     ) -> anyhow::Result<bool>;
     /// Connected credentials with a known expiry at or before now + before.
     async fn list_expiring(&self, before: Duration) -> anyhow::Result<Vec<OAuthCredential>>;
-    /// Fence refreshes older than timeout and return them to retryable connected.
+    /// Fence refreshes older than timeout. Codex/OpenAI aliases become terminal
+    /// error because the upstream token rotation outcome is unknown; other
+    /// drivers return to retryable connected.
     async fn recover_stale_refreshing(&self, timeout: Duration) -> anyhow::Result<u64>;
 }
 

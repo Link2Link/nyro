@@ -16,6 +16,20 @@ Non-native callers cannot override individual generated identity headers through
 
 Betas are derived from the shaped request, model, credential, and request category. Quota probes differ from normal Messages; thread objects request the thread beta; one-hour Messages cache markers require the extended-cache beta. Token counting retains its own beta list and does not acquire the Messages cache policy. Unknown beta forwarding retains the existing gateway policy.
 
+## Cross-model fallback and serving-model diagnostics
+
+The cloak no longer injects automatic server-side fallbacks for Opus 5.5 or Fable 5.1. A caller must explicitly supply `fallbacks` in the upstream Messages request to opt in; existing caller values are preserved rather than replaced. No global switch, provider setting, or database field is added. Probe/helper and confirmed native request handling retain their existing behavior. These controls do not promise that an upstream will honor the selected model; diagnostics record what it reports serving.
+
+Model identities remain separate:
+
+- `client_model`: the requested model or alias.
+- `upstream_model`: the routed model used for route/quota attribution; a server-side fallback must not overwrite it.
+- `payload_metadata.response_model`: original-wire evidence shaped as `{"served_model":"claude-opus-4-8","source":"usage.iterations.fallback_message.model"}`.
+
+For Anthropic egress, the shared performance observer reads response `model` / `message.model`, fallback `content_block.to.model` (or buffered fallback content), and the last valid `usage.iterations` entry of type `fallback_message`. Explicit fallback evidence takes precedence over the starting model. This works before native passthrough, IR conversion, or raw-wire compatibility conversion, for streaming and buffered responses. It does not rewrite client response model fields.
+
+The diagnostic uses existing JSON metadata, requires no schema change, and remains available when payload recording is disabled. Missing or invalid evidence is not filled from the route. Model identifiers are limited to 128 bytes; observation shares the existing bounded wire parser, so oversized or unparseable payloads may not yield serving-model evidence.
+
 ## Cache normalization
 
 For non-native Messages in automatic mode:
@@ -47,6 +61,7 @@ Nyro channel shaping is **after** generic payload/header preparation; this is no
 
 ```bash
 cargo test -p nyro-core --lib provider::anthropic::claude_code
+cargo test -p nyro-core --lib claude_response_model
 cargo test -p nyro-core --test claude_code_oauth
 cargo check -p nyro-core
 ```

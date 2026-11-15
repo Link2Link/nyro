@@ -467,6 +467,19 @@ impl Gateway {
         builder.build().map_err(Into::into)
     }
 
+    /// OAuth refresh grants may rotate on receipt. Disable redirects and all
+    /// transport retries so a connect failure can be classified as pre-send.
+    pub(crate) async fn oauth_refresh_http_client(
+        &self,
+        use_proxy: bool,
+    ) -> anyhow::Result<reqwest::Client> {
+        self.redirectless_client_builder(use_proxy, false)
+            .await?
+            .retry(reqwest::retry::never())
+            .build()
+            .map_err(Into::into)
+    }
+
     async fn redirectless_client_builder(
         &self,
         use_proxy: bool,

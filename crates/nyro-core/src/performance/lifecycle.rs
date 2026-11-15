@@ -205,8 +205,11 @@ impl Attempt {
         vendor: Option<&str>,
         egress: crate::protocol::ids::ProtocolId,
     ) {
-        self.0.lock().unwrap().terminal.allow_chat_eof = vendor == Some("minimax")
+        let mut s = self.0.lock().unwrap();
+        s.terminal.allow_chat_eof = vendor == Some("minimax")
             && egress == crate::protocol::ids::OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1;
+        s.terminal.response_model =
+            (egress == crate::protocol::ids::ANTHROPIC_MESSAGES_2023_06_01).then(Default::default);
     }
     /// Select native binary observation before sending any upstream bytes.
     /// Idempotent, and intentionally not inferred from response payloads/IR.
@@ -751,6 +754,16 @@ impl State {
                 }
             }
         }
+        // Refresh from original wire evidence after merging builder snapshots.
+        // Never replace entry.upstream_model: quota/routing attribution belongs
+        // to the selected backend, not a server-side fallback serving model.
+        if let Some(model) = &self.terminal.response_model {
+            if let Some(metadata) = model.metadata() {
+                self.diagnostic.payload_metadata["response_model"] = metadata;
+            } else if let Some(metadata) = self.diagnostic.payload_metadata.as_object_mut() {
+                metadata.remove("response_model");
+            }
+        }
         entry.performance = self.metadata.clone();
         entry.diagnostic = self.diagnostic.clone();
         self.sent = true;
@@ -964,6 +977,126 @@ mod tests {
     async fn frame(body: &mut Body) -> Option<Result<Frame<Bytes>, axum::Error>> {
         futures::future::poll_fn(|cx| Pin::new(&mut *body).poll_frame(cx)).await
     }
+    #[tokio::test]
+    async fn claude_response_model_diagnostic_keeps_requested_routed_and_served_independent() {
+        use crate::protocol::ids::ANTHROPIC_MESSAGES_2023_06_01;
+
+        let start = json!({"type": "message_start", "message": {"model": "claude-opus-5-5"}});
+        let fallback = json!({"type": "content_block_start", "content_block": {
+            "type": "fallback", "to": {"model": "claude-opus-4-8"}
+        }});
+        let iterations = json!([
+            {"type": "message", "model": "claude-opus-5-5"},
+            {"type": "fallback_message", "model": "claude-opus-4-8"}
+        ]);
+        let delta = json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"},
+            "usage": {"iterations": iterations}});
+        let sse = format!(
+            "data: {start}\n\ndata: {fallback}\n\ndata: {delta}\n\ndata: {{\"type\":\"message_stop\"}}\n\n"
+        );
+        let buffered =
+            json!({"type": "message", "model": "claude-opus-5-5", "stop_reason": "end_turn",
+            "usage": {"iterations": iterations}})
+            .to_string();
+
+        // All dispatch modes observe the original bytes before passthrough,
+        // IR conversion, raw-wire compat conversion, or buffered SSE assembly.
+        for client_protocol in ["anthropic-messages", "openai-chat"] {
+            for (is_stream, upstream) in [(true, &sse), (false, &buffered), (false, &sse)] {
+                for chunk_size in [1, 17, upstream.len()] {
+                    let (a, g, mut rx) = setup();
+                    a.configure_terminal(Some("anthropic"), ANTHROPIC_MESSAGES_2023_06_01);
+                    a.response(200, &reqwest::header::HeaderMap::new());
+                    let mut log = entry();
+                    log.client_protocol = client_protocol.into();
+                    log.upstream_protocol = "anthropic-messages".into();
+                    log.client_model = "requested-alias".into();
+                    log.upstream_model = "claude-opus-5-5".into();
+                    log.is_stream = is_stream;
+                    log.enable_payload = Some(false);
+                    // A stale builder snapshot must not overwrite later wire evidence.
+                    log.diagnostic.payload_metadata["response_model"] =
+                        json!({"served_model": "stale"});
+                    for chunk in upstream.as_bytes().chunks(chunk_size) {
+                        a.chunk(chunk);
+                    }
+                    a.eof();
+                    a.log(log);
+                    let delivered = if client_protocol == "anthropic-messages" {
+                        upstream.clone()
+                    } else {
+                        json!({"model": "client-facing-alias", "choices": []}).to_string()
+                    };
+                    let body = a.wrap(Response::new(Body::from(delivered.clone())));
+                    a.select_final(1);
+                    let bytes = axum::body::to_bytes(body.into_body(), usize::MAX)
+                        .await
+                        .unwrap();
+                    assert_eq!(bytes.as_ref(), delivered.as_bytes());
+                    g.finish();
+                    drop(g);
+                    let log = rx.recv().await.unwrap();
+                    assert_eq!(log.client_model, "requested-alias");
+                    assert_eq!(log.upstream_model, "claude-opus-5-5");
+                    assert_eq!(
+                        log.diagnostic.payload_metadata["response_model"],
+                        json!({
+                            "served_model": "claude-opus-4-8",
+                            "source": "usage.iterations.fallback_message.model"
+                        })
+                    );
+                    assert_eq!(log.performance.completion, "completed");
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn claude_response_model_diagnostic_is_egress_scoped_and_never_inferred_from_route() {
+        use crate::protocol::ids::{
+            ANTHROPIC_MESSAGES_2023_06_01, OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1,
+        };
+
+        for (egress, body, expected) in [
+            (
+                ANTHROPIC_MESSAGES_2023_06_01,
+                json!({"type": "message", "model": "claude-opus-4-8", "stop_reason": "end_turn"}),
+                Some("claude-opus-4-8"),
+            ),
+            (
+                ANTHROPIC_MESSAGES_2023_06_01,
+                json!({"type": "message", "stop_reason": "end_turn"}),
+                None,
+            ),
+            (
+                OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1,
+                json!({"type": "message", "model": "not-claude-evidence", "stop_reason": "end_turn"}),
+                None,
+            ),
+        ] {
+            let (a, g, mut rx) = setup();
+            a.configure_terminal(Some("anthropic"), egress);
+            a.chunk(body.to_string().as_bytes());
+            a.eof();
+            let mut log = entry();
+            log.upstream_model = "routed-model".into();
+            a.log(log);
+            let body = a.wrap(Response::new(Body::from("unchanged")));
+            a.select_final(1);
+            let _ = axum::body::to_bytes(body.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            g.finish();
+            drop(g);
+            let log = rx.recv().await.unwrap();
+            assert_eq!(log.upstream_model, "routed-model");
+            assert_eq!(
+                log.diagnostic.payload_metadata["response_model"]["served_model"].as_str(),
+                expected
+            );
+        }
+    }
+
     #[test]
     fn native_capture_hashes_exact_binary_in_constant_space() {
         let data: Vec<u8> = (0..=255).cycle().take(2 * 1024 * 1024 + 7).collect();

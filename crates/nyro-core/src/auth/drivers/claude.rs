@@ -10,6 +10,7 @@ use super::shared::{
     generate_code_verifier, generate_state, parse_oauth_callback, parse_session_state,
     required_http_client, validate_callback_state,
 };
+use crate::auth::refresh::{RefreshFailure, send_refresh_request};
 use crate::auth::types::{
     AuthDriver, AuthDriverMetadata, AuthExchangeInput, AuthScheme, AuthSession, CreateAuthSession,
     CredentialBundle, ExchangeAuthContext, RefreshAuthContext, RuntimeBinding, StartAuthContext,
@@ -285,14 +286,14 @@ impl AuthDriver for ClaudeOAuthDriver {
         credential: &StoredCredential,
         ctx: RefreshAuthContext,
     ) -> Result<CredentialBundle> {
-        let config = Self::claude_code_config()?;
+        let config = Self::claude_code_config().map_err(|_| RefreshFailure::PreSend)?;
         let refresh_token = credential
             .refresh_token
             .as_deref()
             .map(str::trim)
             .filter(|value| !value.is_empty())
-            .ok_or_else(|| anyhow!("claude oauth refresh token is missing"))?;
-        let client = required_http_client(ctx.http_client)?;
+            .ok_or(RefreshFailure::PreSend)?;
+        let client = ctx.http_client.ok_or(RefreshFailure::PreSend)?;
 
         let token_body = serde_json::json!({
             "grant_type": "refresh_token",
@@ -308,21 +309,14 @@ impl AuthDriver for ClaudeOAuthDriver {
             request = request.header(key, value);
         }
 
-        let response = request
-            .json(&token_body)
-            .send()
-            .await
-            .context("refresh claude oauth token")?;
-
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        if !status.is_success() {
-            let detail = Self::parse_error(&body).unwrap_or(body);
-            bail!("claude oauth token refresh failed: HTTP {status} {detail}");
-        }
-
-        let mut bundle = Self::normalize_token_response(&body, Some(refresh_token), config)?;
+        let mut bundle = send_refresh_request(request.json(&token_body), |body| {
+            Self::normalize_token_response(body, Some(refresh_token), config)
+        })
+        .await?;
         Self::carry_identity_meta(&mut bundle, credential);
+        if bundle.scopes.is_empty() {
+            bundle.scopes = credential.scopes.clone();
+        }
         Ok(bundle)
     }
 
@@ -425,6 +419,53 @@ mod tests {
             is_enabled: true,
             created_at: String::new(),
             updated_at: String::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn refresh_http_missing_token_and_malformed_fields_are_unknown() {
+        let config = ClaudeOAuthDriver::claude_code_config().unwrap();
+        for body in [
+            r#"{"refresh_token":"secret-rotated"}"#,
+            r#"{"access_token":" "}"#,
+            r#"{"access_token":"secret-access","expires_in":"secret-invalid"}"#,
+            "{secret-malformed",
+        ] {
+            let (request, server) =
+                crate::auth::refresh::tests::response(200, "", body.as_bytes()).await;
+            let error = send_refresh_request(request, |body| {
+                ClaudeOAuthDriver::normalize_token_response(
+                    body,
+                    Some("secret-old-refresh"),
+                    config,
+                )
+            })
+            .await
+            .unwrap_err();
+            server.await.unwrap();
+            assert_eq!(error, RefreshFailure::OutcomeUnknown { stage: "decode" });
+            crate::auth::refresh::tests::assert_sanitized(&error);
+        }
+    }
+
+    #[tokio::test]
+    async fn refresh_local_configuration_failure_is_typed_pre_send() {
+        for credential in [
+            StoredCredential::default(),
+            StoredCredential {
+                refresh_token: Some("secret-old-refresh".into()),
+                ..Default::default()
+            },
+        ] {
+            let error = ClaudeOAuthDriver
+                .refresh(&credential, RefreshAuthContext::default())
+                .await
+                .unwrap_err();
+            assert_eq!(
+                error.downcast_ref::<RefreshFailure>(),
+                Some(&RefreshFailure::PreSend)
+            );
+            assert!(!format!("{error:?}").contains("secret"));
         }
     }
 
