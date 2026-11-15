@@ -10,18 +10,61 @@ use crate::router::quota::{ProviderScheduling, ProviderSchedulingStatus};
 
 pub const GOOGLE_FAMILY_DISPLAY_SOURCE: &str = "google_family_display_v1";
 
+/// Pool key of the shared "Gemini Models" allowance (`gemini-5h` /
+/// `gemini-weekly`). It is a historical identity component of the opaque
+/// primary/display IDs that request attribution and published usage entries
+/// reference, so it keeps its original Flash value — never rename it. The card
+/// label is chosen separately (see [`google_display_label`]).
+pub const GOOGLE_GEMINI_MODELS_POOL: &str = "gemini-3.8-flash";
+
+/// Usage-only family whitelist: (display family, enforced quota pool), in
+/// headline priority. Verified 2026-11-15 on a Google AI Pro account: Gemini 4
+/// Hydrogen calls drew down `gemini-5h` / `gemini-weekly` exactly like Gemini
+/// 3.8 Flash, while Gemini 4 Argon consumed only its dedicated weekly bucket.
+const GOOGLE_DISPLAY_FAMILIES: &[(&str, &str)] = &[
+    ("gemini-4-hydrogen", GOOGLE_GEMINI_MODELS_POOL),
+    ("gemini-3.8-flash", GOOGLE_GEMINI_MODELS_POOL),
+    ("gemini-4-argon", "gemini-4-argon"),
+];
+
 /// This usage-only whitelist does not rewrite callable models or pricing IDs.
 pub fn google_display_family(model: &str) -> Option<&'static str> {
-    ["gemini-3.8-flash", "gemini-4-argon"]
-        .into_iter()
+    GOOGLE_DISPLAY_FAMILIES
+        .iter()
+        .map(|(family, _)| *family)
         .find(|base| {
             model.strip_prefix(*base).is_some_and(|suffix| {
                 matches!(
                     suffix,
-                    "" | "-extra-low" | "-low" | "-medium" | "-high" | "-tiered"
+                    "" | "-extra-low" | "-low" | "-medium" | "-high" | "-xhigh" | "-tiered"
                 )
             })
         })
+}
+
+/// Enforced quota pool of a whitelisted model: Hydrogen and Flash share the
+/// Gemini Models allowance, Argon has its own.
+pub fn google_display_pool(model: &str) -> Option<&'static str> {
+    let family = google_display_family(model)?;
+    GOOGLE_DISPLAY_FAMILIES
+        .iter()
+        .find(|(candidate, _)| *candidate == family)
+        .map(|(_, pool)| *pool)
+}
+
+/// Card label for one pool: the highest-priority family the account actually
+/// serves (Hydrogen over Flash). Accounts without Hydrogen keep the Flash label.
+pub fn google_display_label<'a>(pool: &'a str, models: &[String]) -> &'a str {
+    GOOGLE_DISPLAY_FAMILIES
+        .iter()
+        .filter(|(_, candidate)| *candidate == pool)
+        .map(|(family, _)| *family)
+        .find(|family| {
+            models
+                .iter()
+                .any(|model| google_display_family(model) == Some(*family))
+        })
+        .unwrap_or(pool)
 }
 
 pub fn is_google_display_bucket(bucket: &QuotaBucket) -> bool {
@@ -29,7 +72,7 @@ pub fn is_google_display_bucket(bucket: &QuotaBucket) -> bool {
         && bucket.binding.source == GOOGLE_FAMILY_DISPLAY_SOURCE
 }
 
-/// Two known families per owner at most; all original resources remain sidecars.
+/// Two known pools per owner at most; all original resources remain sidecars.
 /// Unknown/generic labels never establish membership or a healthy family. Already
 /// projected responses are returned unchanged, not recursively grouped.
 pub fn google_display_buckets(buckets: &[QuotaBucket]) -> Vec<QuotaBucket> {
@@ -38,20 +81,20 @@ pub fn google_display_buckets(buckets: &[QuotaBucket]) -> Vec<QuotaBucket> {
     }
     let mut groups: BTreeMap<(&str, &str), Vec<&QuotaBucket>> = BTreeMap::new();
     for bucket in buckets.iter().filter(|bucket| bucket.is_primary()) {
-        let families: BTreeSet<_> = bucket
+        let pools: BTreeSet<_> = bucket
             .models
             .iter()
-            .filter_map(|id| google_display_family(id))
+            .filter_map(|id| google_display_pool(id))
             .collect();
-        for family in families {
+        for pool in pools {
             groups
-                .entry((&bucket.scope_id, family))
+                .entry((&bucket.scope_id, pool))
                 .or_default()
                 .push(bucket);
         }
     }
     let mut result = Vec::new();
-    for ((scope, family), mut sources) in groups {
+    for ((scope, pool), mut sources) in groups {
         sources.sort_by(|a, b| a.id.cmp(&b.id));
         let duplicate_conflict = sources
             .windows(2)
@@ -100,6 +143,14 @@ pub fn google_display_buckets(buckets: &[QuotaBucket]) -> Vec<QuotaBucket> {
                         tier.used_percent.is_finite() && (0.0..=100.0).contains(&tier.used_percent)
                     })
             });
+        let models: Vec<String> = sources
+            .iter()
+            .flat_map(|bucket| &bucket.models)
+            .filter(|model| google_display_pool(model) == Some(pool))
+            .cloned()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
         let tiers = display_tiers(&sources);
         let allow_period = resolved
             && sources.iter().all(|bucket| {
@@ -117,17 +168,10 @@ pub fn google_display_buckets(buckets: &[QuotaBucket]) -> Vec<QuotaBucket> {
                         && bucket.tiers.iter().all(|tier| tiers.contains(tier))
                 });
         result.push(QuotaBucket {
-            id: opaque_quota_id(GOOGLE_FAMILY_DISPLAY_SOURCE, &[scope, family]),
+            id: opaque_quota_id(GOOGLE_FAMILY_DISPLAY_SOURCE, &[scope, pool]),
             scope_id: scope.to_owned(),
-            label: family.to_owned(),
-            models: sources
-                .iter()
-                .flat_map(|bucket| &bucket.models)
-                .filter(|model| google_display_family(model) == Some(family))
-                .cloned()
-                .collect::<BTreeSet<_>>()
-                .into_iter()
-                .collect(),
+            label: google_display_label(pool, &models).to_owned(),
+            models,
             binding: QuotaBucketBinding {
                 status: if resolved { "resolved" } else { "unresolved" }.to_owned(),
                 source: GOOGLE_FAMILY_DISPLAY_SOURCE.to_owned(),
@@ -145,7 +189,7 @@ pub fn google_display_buckets(buckets: &[QuotaBucket]) -> Vec<QuotaBucket> {
             stale,
             scheduling: display_scheduling(&applicable, resolved),
             api_price: (!duplicate_conflict)
-                .then(|| display_price(&sources, family, allow_period))
+                .then(|| display_price(&sources, pool, allow_period))
                 .flatten(),
         });
     }
@@ -329,7 +373,7 @@ macro_rules! for_field {
 
 fn display_price(
     sources: &[&QuotaBucket],
-    family: &str,
+    pool: &str,
     allow_period: bool,
 ) -> Option<ProviderApiPriceStats> {
     let unique: BTreeMap<_, _> = sources
@@ -346,11 +390,11 @@ fn display_price(
         let pure = source
             .models
             .iter()
-            .all(|id| google_display_family(id) == Some(family))
+            .all(|id| google_display_pool(id) == Some(pool))
             && part
                 .models
                 .iter()
-                .all(|row| google_display_family(&row.model) == Some(family));
+                .all(|row| google_display_pool(&row.model) == Some(pool));
         preserve_period &= pure;
         if !pure {
             // Current model membership cannot assign historical mixed attempts.
@@ -358,7 +402,7 @@ fn display_price(
                 return None;
             }
             part.models
-                .retain(|row| google_display_family(&row.model) == Some(family));
+                .retain(|row| google_display_pool(&row.model) == Some(pool));
             part.all_time = empty_totals();
             let mut coverage = part.all_time_coverage.take().unwrap_or_default();
             let _ = std::mem::take(&mut coverage);
@@ -429,6 +473,7 @@ mod tests {
 
     const FLASH: &str = "gemini-3.8-flash";
     const ARGON: &str = "gemini-4-argon";
+    const HYDROGEN: &str = "gemini-4-hydrogen";
 
     fn bucket(id: &str, model: &str, used: f64) -> QuotaBucket {
         QuotaBucket {
@@ -496,9 +541,17 @@ mod tests {
     }
 
     #[test]
-    fn exact_two_families_accept_all_known_tiers_not_lookalikes() {
-        for base in [FLASH, ARGON] {
-            for suffix in ["", "-low", "-medium", "-high", "-extra-low", "-tiered"] {
+    fn exact_families_accept_all_known_tiers_not_lookalikes() {
+        for base in [FLASH, ARGON, HYDROGEN] {
+            for suffix in [
+                "",
+                "-low",
+                "-medium",
+                "-high",
+                "-xhigh",
+                "-extra-low",
+                "-tiered",
+            ] {
                 assert_eq!(
                     google_display_family(&format!("{base}{suffix}")),
                     Some(base)
@@ -509,7 +562,7 @@ mod tests {
                 "-max",
                 "-minimal",
                 "-none",
-                "-xhigh",
+                "-xxhigh",
                 "-high-extra",
                 "-image-high",
                 "-preview",
@@ -524,6 +577,8 @@ mod tests {
             "gemini-4-argon-high ",
             "xgemini-4-argon",
             "gemini-4.1-argon",
+            "gemini-4-hydrogenx",
+            "Gemini 4 Hydrogen",
             "gemini-3.8-flashlight",
             "claude-opus-5-5-high",
         ] {
@@ -798,5 +853,39 @@ mod tests {
         assert!(groups(&[a.clone(), b.clone()])[0].api_price.is_none());
         b.api_price = None;
         assert!(groups(&[a, b])[0].api_price.is_none());
+    }
+
+    #[test]
+    fn hydrogen_and_flash_share_one_gemini_pool_card_headlined_by_hydrogen() {
+        assert_eq!(
+            google_display_pool("gemini-4-hydrogen-xhigh"),
+            Some(GOOGLE_GEMINI_MODELS_POOL)
+        );
+        assert_eq!(
+            google_display_pool("gemini-3.8-flash-low"),
+            Some(GOOGLE_GEMINI_MODELS_POOL)
+        );
+        assert_eq!(google_display_pool("gemini-4-argon-low"), Some(ARGON));
+        let mut gemini = bucket("gemini-models", "gemini-3.8-flash-high", 12.0);
+        gemini.models = vec![
+            "gemini-3.8-flash-high".into(),
+            "gemini-3.8-flash-tiered".into(),
+            "gemini-4-hydrogen-low".into(),
+            "gemini-4-hydrogen-xhigh".into(),
+        ];
+        let argon = bucket("argon-weekly", "gemini-4-argon-medium", 3.0);
+        let flash_only = groups(&[bucket("gemini-models", "gemini-3.8-flash-high", 12.0)]);
+        let output = groups(&[gemini, argon]);
+        // Exactly two cards: the shared Gemini Models pool and Argon.
+        let mut labels: Vec<_> = output.iter().map(|card| card.label.as_str()).collect();
+        labels.sort();
+        assert_eq!(labels, vec![ARGON, HYDROGEN]);
+        let hydrogen = output.iter().find(|card| card.label == HYDROGEN).unwrap();
+        assert_eq!(hydrogen.models.len(), 4);
+        assert_eq!(hydrogen.tiers[0].used_percent, 12.0);
+        // Accounts without Hydrogen keep the Flash headline, and the opaque
+        // card identity survives the relabel (published entries stay stable).
+        assert_eq!(flash_only[0].label, FLASH);
+        assert_eq!(flash_only[0].id, hydrogen.id);
     }
 }

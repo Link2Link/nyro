@@ -1,5 +1,7 @@
 use super::*;
 
+#[cfg(test)]
+mod google_catalog_tests;
 mod model_probe_accounts;
 pub use model_probe_accounts::{ModelProbeAccountError, normalize_probe_account_id};
 
@@ -295,15 +297,28 @@ re-login the provider to re-run onboarding"
 fn google_subscription_probe_models(
     provider: &Provider,
     credential: Option<&crate::auth::types::StoredCredential>,
-    fresh_catalog: &[crate::provider::google::antigravity::AvailableModel],
+    fresh_catalog: Option<&[crate::provider::google::antigravity::AvailableModel]>,
     models: &[String],
 ) -> std::collections::HashMap<String, String> {
-    let mut catalog =
-        crate::provider::google::antigravity::subscription_model_catalog(provider, credential);
+    // A successful fresh catalog (including empty) replaces dynamic evidence;
+    // only a failed fetch may reuse a matching last-good snapshot.
+    let mut catalog = crate::provider::google::antigravity::subscription_model_catalog(
+        provider,
+        if fresh_catalog.is_some() {
+            None
+        } else {
+            credential
+        },
+    );
     if catalog.is_empty() {
         return Default::default();
     }
-    catalog.extend(fresh_catalog.iter().map(|entry| entry.id.clone()));
+    catalog.extend(
+        fresh_catalog
+            .into_iter()
+            .flatten()
+            .map(|entry| entry.id.clone()),
+    );
     models
         .iter()
         .filter_map(|model| {
@@ -315,6 +330,25 @@ fn google_subscription_probe_models(
             .map(|wire_model| (model.clone(), wire_model))
         })
         .collect()
+}
+
+/// A bare Google subscription NOT_FOUND does not distinguish model availability,
+/// endpoint/project selection, client identity, or account eligibility.
+fn google_subscription_not_found_hint(
+    suite: crate::protocol::ids::Protocol,
+    channel: Option<&str>,
+    status: u16,
+) -> Option<&'static str> {
+    let subscription_channel = channel.map(str::trim).is_some_and(|channel| {
+        channel.eq_ignore_ascii_case("antigravity") || channel.eq_ignore_ascii_case("gemini-cli")
+    });
+    (status == 404 && suite == crate::protocol::ids::Protocol::GoogleGemini && subscription_channel)
+        .then_some(
+            " — Google NOT_FOUND has several possible causes: an unavailable model id, \
+             endpoint/project mismatch, client version, or account eligibility. A 404 \
+             alone does not establish subscription entitlement; check the wire model, \
+             endpoint and current account catalog.",
+        )
 }
 
 /// Probe one model with a single minimal request carrying `prompt` (30s timeout).
@@ -412,14 +446,16 @@ async fn probe_single_model(
             } else if status.as_u16() == 429
                 && suite == crate::protocol::ids::Protocol::GoogleGemini
             {
-                " — quota/entitlement gate: if the quota readout shows plenty \
-                 remaining, this account's subscription tier does not include \
-                 the model (Google returns RESOURCE_EXHAUSTED for tier-gated \
-                 models too); otherwise the per-model quota window is spent \
-                 and resets automatically."
+                " — Google RESOURCE_EXHAUSTED may indicate quota exhaustion, \
+                 rate limiting, endpoint/project mismatch, or account eligibility. \
+                 A catalog quota readout alone does not establish the cause."
                     .to_string()
             } else if status.as_u16() == 429 {
                 " — rate limited by the upstream; retry after the reset time.".to_string()
+            } else if let Some(hint) =
+                google_subscription_not_found_hint(suite, channel, status.as_u16())
+            {
+                hint.to_string()
             } else {
                 String::new()
             };
@@ -1354,6 +1390,37 @@ mod probe_routing_tests {
     };
 
     #[test]
+    fn google_subscription_not_found_hint_scopes_to_subscription_404s() {
+        let gemini = Protocol::GoogleGemini;
+        for channel in ["antigravity", "gemini-cli", " Antigravity "] {
+            let hint = google_subscription_not_found_hint(gemini, Some(channel), 404)
+                .unwrap_or_else(|| panic!("{channel} 404 must carry the hint"));
+            assert!(hint.contains("possible causes"), "{hint}");
+            assert!(hint.contains("endpoint"), "{hint}");
+            assert!(hint.contains("does not establish"), "{hint}");
+            assert!(!hint.contains("exclude Gemini"), "{hint}");
+        }
+        // Other statuses keep their own hints (or none).
+        for status in [400, 403, 429, 500] {
+            assert!(
+                google_subscription_not_found_hint(gemini, Some("antigravity"), status).is_none()
+            );
+        }
+        // API-key Gemini and non-Gemini suites: a 404 means something else.
+        for channel in [None, Some("default"), Some("")] {
+            assert!(google_subscription_not_found_hint(gemini, channel, 404).is_none());
+        }
+        assert!(
+            google_subscription_not_found_hint(
+                Protocol::AnthropicMessages,
+                Some("antigravity"),
+                404
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
     fn google_subscription_probes_resolve_public_names_to_default_wire_tiers() {
         let mut provider = provider();
         provider.vendor = Some("google".into());
@@ -1364,16 +1431,22 @@ mod probe_routing_tests {
             "gemini-3.8-flash",
             "claude-opus-5-5-high",
             "gemini-4-argon",
+            "gemini-4-hydrogen",
+            "gemini-4-hydrogen-xhigh",
+            "gemini-2.5-flash",
         ]
         .into_iter()
         .map(str::to_string)
         .collect();
-        let resolved = google_subscription_probe_models(&provider, None, &[], &models);
-        assert_eq!(resolved.len(), 3);
+        let resolved = google_subscription_probe_models(&provider, None, None, &models);
+        assert_eq!(resolved.len(), 5);
         for (model, wire_model) in [
             ("claude-opus-5-5", "claude-opus-5-5-medium"),
             ("claude-sonnet-5-5", "claude-sonnet-5-5-medium"),
             ("gemini-3.8-flash", "gemini-3.8-flash-tiered"),
+            // Bare Gemini 4 ids 404 upstream; probes use the default tier.
+            ("gemini-4-argon", "gemini-4-argon-medium"),
+            ("gemini-4-hydrogen", "gemini-4-hydrogen-medium"),
         ] {
             assert_eq!(resolved.get(model).map(String::as_str), Some(wire_model));
             let (_, _, body) = build_gemini_model_probe_request(
@@ -1391,9 +1464,45 @@ mod probe_routing_tests {
         }
         // Exact tier selections and unrelated families need no translation.
         assert!(!resolved.contains_key("claude-opus-5-5-high"));
-        assert!(!resolved.contains_key("gemini-4-argon"));
+        assert!(!resolved.contains_key("gemini-4-hydrogen-xhigh"));
+        assert!(!resolved.contains_key("gemini-2.5-flash"));
         provider.channel = Some("default".into());
-        assert!(google_subscription_probe_models(&provider, None, &[], &models).is_empty());
+        assert!(google_subscription_probe_models(&provider, None, None, &models).is_empty());
+    }
+
+    #[test]
+    fn google_subscription_probe_empty_catalog_replaces_old_dynamic_ids_not_manual_models() {
+        use crate::provider::google::antigravity::{
+            catalog_source_for_runtime, write_catalog_snapshot,
+        };
+        let mut provider = provider();
+        provider.vendor = Some("google".into());
+        provider.channel = Some("gemini-cli".into());
+        let mut credential = crate::auth::StoredCredential {
+            access_token: Some("fixture-token".into()),
+            meta: serde_json::json!({"project_id":"fixture-project"}),
+            ..Default::default()
+        };
+        let source =
+            catalog_source_for_runtime(&provider, &credential, &Default::default()).unwrap();
+        write_catalog_snapshot(
+            credential.meta.as_object_mut().unwrap(),
+            &["gemini-3.5-flash-medium".into()],
+            &source,
+        );
+        let models = vec!["gemini-3.5-flash".into(), "manual-model".into()];
+        let failed = google_subscription_probe_models(&provider, Some(&credential), None, &models);
+        assert_eq!(
+            failed.get("gemini-3.5-flash").map(String::as_str),
+            Some("gemini-3.5-flash-medium")
+        );
+        let empty =
+            google_subscription_probe_models(&provider, Some(&credential), Some(&[]), &models);
+        assert!(!empty.contains_key("gemini-3.5-flash"));
+        assert!(
+            !empty.contains_key("manual-model"),
+            "manual models remain unchanged, never denied"
+        );
     }
 
     #[test]
@@ -1408,7 +1517,8 @@ mod probe_routing_tests {
             ..Default::default()
         };
         assert!(
-            google_subscription_probe_models(&provider, Some(&credential), &[], &models).is_empty()
+            google_subscription_probe_models(&provider, Some(&credential), None, &models)
+                .is_empty()
         );
         let fresh = vec![AvailableModel {
             id: "claude-opus-5-5-medium".into(),
@@ -1418,7 +1528,7 @@ mod probe_routing_tests {
             quota_group_id: None,
         }];
         let resolved =
-            google_subscription_probe_models(&provider, Some(&credential), &fresh, &models);
+            google_subscription_probe_models(&provider, Some(&credential), Some(&fresh), &models);
         let wire_model = &resolved[&models[0]];
         assert_eq!(wire_model, "claude-opus-5-5-medium");
         let quota = fresh.iter().find(|entry| &entry.id == wire_model).unwrap();
@@ -1431,7 +1541,7 @@ mod probe_routing_tests {
         // A same-named channel on another vendor must not inherit this dialect.
         provider.vendor = Some("custom".into());
         assert!(
-            google_subscription_probe_models(&provider, Some(&credential), &fresh, &models)
+            google_subscription_probe_models(&provider, Some(&credential), Some(&fresh), &models)
                 .is_empty()
         );
     }
@@ -2643,142 +2753,112 @@ impl AdminService {
         runtime: Option<&ResolvedProviderRuntime>,
         require_catalog: bool,
     ) -> anyhow::Result<Option<Vec<crate::provider::google::antigravity::AvailableModel>>> {
-        // Per-account discovery applies to both Google subscription channels
-        // (antigravity + gemini-cli); the client fingerprint differs.
+        use crate::provider::google::antigravity::{
+            catalog_source_for_runtime, fetch_available_models,
+        };
         let is_antigravity = crate::provider::google::antigravity::is_google_antigravity(provider);
         let is_gemini_cli = crate::provider::google::gemini_cli::is_google_gemini_cli(provider);
         if !is_antigravity && !is_gemini_cli {
             return Ok(None);
         }
-        let channel_label = if is_antigravity {
-            "antigravity"
-        } else {
-            "gemini-cli"
-        };
-        let user_agent = if is_antigravity {
-            crate::provider::google::antigravity::antigravity_user_agent()
-        } else {
-            crate::provider::google::gemini_cli::GEMINI_CLI_USER_AGENT.to_string()
-        };
         let discovery = async {
             let runtime = runtime.context("Google subscription runtime unavailable")?;
             let credential = runtime
                 .credential
                 .as_ref()
                 .context("Google subscription credential unavailable")?;
-            let project_id =
-                crate::provider::google::antigravity::code_assist_project_id(Some(credential))?;
+            let source = catalog_source_for_runtime(provider, credential, &runtime.binding)?;
             let token = runtime.access_token.trim();
             anyhow::ensure!(
-                !token.is_empty(),
-                "Google subscription access token unavailable"
+                !token.is_empty()
+                    && credential.access_token.as_deref().map(str::trim) == Some(token),
+                "Google subscription runtime credential mismatch"
             );
+            // Capture the real connected generation BEFORE HTTP. A later token
+            // refresh, logout/rebind or competing snapshot write defeats the CAS.
+            // If runtime is already stale, discovery can still report its result
+            // but must not install it into another credential's metadata.
+            let expected = self
+                .gw
+                .storage
+                .oauth_credentials()
+                .get(&provider.id)
+                .await
+                .ok()
+                .flatten()
+                .filter(|row| {
+                    row.status == "connected"
+                        && row.access_token.trim() == token
+                        && serde_json::from_str::<Value>(&row.meta).ok().as_ref()
+                            == Some(&credential.meta)
+                });
             let client = self.gw.http_client_for_provider(provider.use_proxy).await?;
-            crate::provider::google::antigravity::fetch_available_models(
+            let models = fetch_available_models(
                 &client,
                 token,
-                &project_id,
-                &user_agent,
+                &source.project_id,
+                &source.user_agent,
+                &source.endpoint,
             )
-            .await
+            .await?;
+            if let Some(expected) = expected {
+                let ids = models
+                    .iter()
+                    .map(|model| model.id.clone())
+                    .collect::<Vec<_>>();
+                self.persist_subscription_catalog_snapshot(provider, &expected, &ids, &source)
+                    .await;
+            }
+            Ok::<_, anyhow::Error>(models)
         }
         .await;
         match discovery {
-            Ok(models) if require_catalog || !models.is_empty() => {
-                // Self-heal the dispatch-side catalog snapshot: the effort→tier
-                // rewrite reads `subscription_models` from the credential meta,
-                // and that snapshot otherwise only lands on a token refresh.
-                let ids: Vec<String> = models.iter().map(|model| model.id.clone()).collect();
-                self.persist_subscription_catalog_snapshot(provider, &ids)
-                    .await;
-                Ok(Some(models))
-            }
-            Ok(_) => Ok(None),
+            // Some([]) is a successful empty discovery, NOT an outage or a
+            // statement that curated/manual models are forbidden.
+            Ok(models) => Ok(Some(models)),
             Err(_) if require_catalog => {
                 anyhow::bail!("Google subscription model catalog could not be loaded")
             }
             Err(error) => {
-                tracing::warn!(
-                    %error,
-                    provider = %provider.id,
-                    "{channel_label} fetchAvailableModels failed; falling back to the static model list"
-                );
+                tracing::warn!(%error, provider = %provider.id,
+                    "Google subscription catalog failed; retaining curated models");
                 Ok(None)
             }
         }
     }
 
-    /// Best-effort write of the discovered Google subscription catalog into
-    /// the credential meta (`subscription_models`) so the pipeline effort→tier
-    /// rewrite is armed without waiting for the next token refresh. Covers
-    /// both subscription channels (antigravity + gemini-cli — the rewrite
-    /// reads the same snapshot on either). Skips unchanged snapshots and
-    /// never disturbs an in-flight refresh.
-    async fn persist_subscription_catalog_snapshot(&self, provider: &Provider, ids: &[String]) {
-        if !crate::provider::google::antigravity::is_google_antigravity(provider)
-            && !crate::provider::google::gemini_cli::is_google_gemini_cli(provider)
+    /// Best-effort, metadata-only generation CAS. Never upsert tokens or acquire
+    /// a refresh lease for a catalog observation; account state must survive.
+    async fn persist_subscription_catalog_snapshot(
+        &self,
+        provider: &Provider,
+        expected: &OAuthCredential,
+        ids: &[String],
+        source: &crate::provider::google::antigravity::CatalogSource,
+    ) {
+        let Ok(mut meta) = serde_json::from_str::<serde_json::Map<String, Value>>(&expected.meta)
+        else {
+            return;
+        };
+        let old_meta = meta.clone();
+        crate::provider::google::antigravity::write_catalog_snapshot(&mut meta, ids, source);
+        if meta == old_meta {
+            return;
+        }
+        let meta = Value::Object(meta).to_string();
+        match self
+            .gw
+            .storage
+            .oauth_credentials()
+            .update_meta_if_version(&provider.id, expected.status_version, &meta)
+            .await
         {
-            return;
-        }
-        let mut snapshot: Vec<String> = ids
-            .iter()
-            .map(|id| id.trim().to_string())
-            .filter(|id| !id.is_empty())
-            .collect();
-        snapshot.sort();
-        snapshot.dedup();
-        if snapshot.is_empty() {
-            return;
-        }
-        let store = self.gw.storage.oauth_credentials();
-        let Ok(Some(existing)) = store.get(&provider.id).await else {
-            return;
-        };
-        // Never race an in-flight refresh (its CAS would be invalidated).
-        if existing.status != "connected" {
-            return;
-        }
-        let mut meta: serde_json::Map<String, Value> =
-            serde_json::from_str(&existing.meta).unwrap_or_default();
-        let current: Vec<String> = meta
-            .get("subscription_models")
-            .and_then(Value::as_array)
-            .map(|entries| {
-                entries
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .map(str::to_string)
-                    .collect()
-            })
-            .unwrap_or_default();
-        if current == snapshot {
-            return;
-        }
-        meta.insert(
-            "subscription_models".to_string(),
-            Value::Array(snapshot.into_iter().map(Value::String).collect()),
-        );
-        let input = crate::db::models::UpsertOAuthCredential {
-            driver_key: existing.driver_key.clone(),
-            scheme: existing.scheme.clone(),
-            access_token: existing.access_token.clone(),
-            refresh_token: existing.refresh_token.clone(),
-            expires_at: existing.expires_at.clone(),
-            resource_url: existing.resource_url.clone(),
-            subject_id: existing.subject_id.clone(),
-            scopes: Some(existing.scopes.clone()),
-            meta: Some(Value::Object(meta).to_string()),
-        };
-        match store.upsert(&provider.id, input).await {
-            Ok(_) => tracing::debug!(
-                provider = %provider.id,
-                "google subscription catalog snapshot persisted for tier rewrites"
-            ),
-            Err(error) => tracing::warn!(
-                %error,
-                provider = %provider.id,
-                "failed to persist google subscription catalog snapshot"
-            ),
+            Ok(Some(_)) => tracing::debug!(provider = %provider.id,
+                "Google subscription catalog snapshot persisted"),
+            Ok(None) => tracing::debug!(provider = %provider.id,
+                "Discarded catalog snapshot from a stale credential generation"),
+            Err(error) => tracing::warn!(%error, provider = %provider.id,
+                "Failed to persist Google subscription catalog snapshot"),
         }
     }
 
@@ -2878,21 +2958,37 @@ impl AdminService {
                 });
         // Per-model quota state from the subscription catalog (best-effort,
         // fetched before `runtime` is consumed by probe-target resolution):
-        // on Google subscription channels a 429 almost always means that
-        // model's quota window is exhausted, and the catalog says exactly
-        // how much is left and when it resets.
+        // this is diagnostic quota evidence, not a definitive explanation
+        // of a 404/429 or proof of subscription entitlement.
         let subscription_quotas = self
             .google_subscription_catalog(&provider, runtime.as_ref(), false)
-            .await?
-            .unwrap_or_default();
+            .await?;
         let subscription_probe_models = google_subscription_probe_models(
             &provider,
             runtime
                 .as_ref()
                 .and_then(|runtime| runtime.credential.as_ref()),
-            &subscription_quotas,
+            subscription_quotas.as_deref(),
             &models,
         );
+        let google_endpoint_source =
+            crate::provider::google::antigravity::forces_upstream_stream(&provider).then(|| {
+                let credential = runtime
+                    .as_ref()
+                    .and_then(|runtime| runtime.credential.as_ref());
+                let endpoint = crate::provider::google::antigravity::subscription_endpoint(
+                    &provider, credential,
+                );
+                if runtime
+                    .as_ref()
+                    .and_then(|runtime| runtime.binding.base_url_override.as_deref())
+                    .is_some_and(|bound| bound.trim().trim_end_matches('/') != endpoint.base_url)
+                {
+                    "runtime_binding"
+                } else {
+                    endpoint.source
+                }
+            });
         let (suite_raw, base_url, api_key, auth_scheme, runtime_headers) = if provider.is_adaptive()
         {
             let enabled: Vec<&ProviderProtocolEndpoint> = provider
@@ -3086,6 +3182,13 @@ impl AdminService {
                     claude_code_probe.as_deref(),
                 )
                 .await;
+                if let Some(endpoint_source) = google_endpoint_source {
+                    tracing::debug!(client_model = %model, wire_model = %wire_model, endpoint_source,
+                        success = result.success, "Google model probe routing diagnostics");
+                    if let Some(error) = &mut result.error {
+                        error.push_str(&format!(" [Google probe: model={model}; wire_model={wire_model}; endpoint_source={endpoint_source}]"));
+                    }
+                }
                 result.model = model;
                 result
             }
@@ -3095,7 +3198,7 @@ impl AdminService {
             .collect()
             .await;
         results.sort_by(|a, b| a.model.cmp(&b.model));
-        if !subscription_quotas.is_empty() {
+        if let Some(subscription_quotas) = subscription_quotas {
             for result in &mut results {
                 let wire_model = subscription_probe_models
                     .get(&result.model)

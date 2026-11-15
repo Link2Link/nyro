@@ -54,6 +54,13 @@ async fn start_upstream() -> (String, Arc<Mutex<Vec<Captured>>>) {
 }
 
 async fn start_upstream_with_quota(quota_headers: bool) -> (String, Arc<Mutex<Vec<Captured>>>) {
+    start_upstream_fixture(quota_headers, false).await
+}
+
+async fn start_upstream_fixture(
+    quota_headers: bool,
+    fallback: bool,
+) -> (String, Arc<Mutex<Vec<Captured>>>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     let captured = Arc::new(Mutex::new(Vec::new()));
@@ -182,7 +189,45 @@ async fn start_upstream_with_quota(quota_headers: bool) -> (String, Arc<Mutex<Ve
                     .unwrap_or("none")
                     .to_string();
                 let stream = body["stream"].as_bool().unwrap_or(false);
-                let response = if stream {
+                let response = if fallback {
+                    let start_model = body["model"].as_str().unwrap();
+                    let served_model = "claude-opus-4-8";
+                    let usage = json!({"input_tokens": 5, "output_tokens": 3, "iterations": [
+                        {"type": "message", "model": start_model},
+                        {"type": "fallback_message", "model": served_model}
+                    ]});
+                    let (mime, wire) = if stream {
+                        let events = [
+                            json!({"type":"message_start","message":{"id":"msg_fb","type":"message","role":"assistant","model":start_model,"content":[],"usage":{"input_tokens":5,"output_tokens":0}}}),
+                            json!({"type":"content_block_start","index":0,"content_block":{"type":"fallback","from":{"model":start_model},"to":{"model":served_model}}}),
+                            json!({"type":"content_block_stop","index":0}),
+                            json!({"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}),
+                            json!({"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"fallback reply"}}),
+                            json!({"type":"content_block_stop","index":1}),
+                            json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":usage}),
+                            json!({"type":"message_stop"}),
+                        ];
+                        (
+                            "text/event-stream",
+                            events
+                                .iter()
+                                .map(|event| {
+                                    format!(
+                                        "event: {}\ndata: {event}\n\n",
+                                        event["type"].as_str().unwrap()
+                                    )
+                                })
+                                .collect::<String>(),
+                        )
+                    } else {
+                        ("application/json", json!({"id":"msg_fb","type":"message","role":"assistant","model":start_model,
+                            "content":[{"type":"text","text":"fallback reply"}],"stop_reason":"end_turn","usage":usage}).to_string())
+                    };
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: {mime}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{wire}",
+                        wire.len()
+                    )
+                } else if stream {
                     let events = [
                         json!({"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","model":UPSTREAM_MODEL,"content":[],"stop_reason":null,"usage":{"input_tokens":5,"output_tokens":0}}}),
                         json!({"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_1","name":tool,"input":{}}}),
@@ -268,6 +313,18 @@ async fn read_request(socket: &mut tokio::net::TcpStream) -> anyhow::Result<Capt
 }
 
 async fn setup(upstream: &str) -> (tempfile::TempDir, Gateway) {
+    let (dir, gw, logs) = setup_with_logs(upstream).await;
+    std::mem::forget(logs);
+    (dir, gw)
+}
+
+async fn setup_with_logs(
+    upstream: &str,
+) -> (
+    tempfile::TempDir,
+    Gateway,
+    tokio::sync::mpsc::Receiver<nyro_core::logging::LogEntry>,
+) {
     let dir = tempfile::tempdir().unwrap();
     let config = GatewayConfig {
         data_dir: dir.path().into(),
@@ -275,8 +332,7 @@ async fn setup(upstream: &str) -> (tempfile::TempDir, Gateway) {
         ..Default::default()
     };
     let storage = Arc::new(SqliteStorage::from_config(&config).await.unwrap());
-    let (gw, _logs) = Gateway::from_storage(config, storage).await.unwrap();
-    std::mem::forget(_logs);
+    let (gw, logs) = Gateway::from_storage(config, storage).await.unwrap();
     let provider = gw
         .admin()
         .create_provider(CreateProvider {
@@ -331,7 +387,7 @@ async fn setup(upstream: &str) -> (tempfile::TempDir, Gateway) {
         })
         .await
         .unwrap();
-    (dir, gw)
+    (dir, gw, logs)
 }
 
 async fn dispatch(
@@ -377,6 +433,103 @@ fn only_request(captured: &Arc<Mutex<Vec<Captured>>>) -> Captured {
         .collect();
     assert_eq!(inference.len(), 1, "exactly one upstream inference call");
     inference[0].clone()
+}
+
+#[tokio::test]
+async fn claude_fallback_served_model_diagnostics_preserve_route_across_dispatch_modes() {
+    for (ingress, path, strategy) in [
+        (
+            ANTHROPIC_MESSAGES_2023_06_01,
+            "/v1/messages",
+            "pass_through",
+        ),
+        (
+            OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1,
+            "/v1/chat/completions",
+            "native_ir",
+        ),
+        (OPENAI_RESPONSES_V1, "/v1/responses", "raw_wire_compat"),
+    ] {
+        for stream in [false, true] {
+            let (url, captured) = start_upstream_fixture(false, true).await;
+            let (_dir, gw, mut logs) = setup_with_logs(&url).await;
+            let models = gw.admin().list_models().await.unwrap();
+            let model = models.iter().find(|m| m.name == MODEL).unwrap();
+            gw.admin()
+                .update_model(
+                    &model.id,
+                    nyro_core::db::models::UpdateModel {
+                        target_model: Some("claude-opus-5-5".into()),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            let mut body = if ingress == OPENAI_RESPONSES_V1 {
+                json!({"model": MODEL, "stream": stream, "input": "hello"})
+            } else {
+                json!({"model": MODEL, "stream": stream, "max_tokens": 64,
+                    "messages": [{"role": "user", "content": "hello"}]})
+            };
+            // Explicit native fallbacks survive shaping; other cases prove the
+            // gateway adds none, even if an upstream unexpectedly falls back.
+            if ingress == ANTHROPIC_MESSAGES_2023_06_01 {
+                body["fallbacks"] = json!([{"model": "claude-opus-4-8"}]);
+            }
+            let request = ingress
+                .handler()
+                .make_request_decoder()
+                .decode_request(body.clone())
+                .unwrap();
+            let ctx = RequestContext::without_total_timeout(ingress);
+            let trace = ctx.trace.clone();
+            let response = dispatch_pipeline(
+                gw.clone(),
+                HeaderMap::new(),
+                RawEnvelope::new(Some(body), Default::default(), "POST", path),
+                request,
+                ingress,
+                ctx,
+            )
+            .await;
+            let status = response.status();
+            let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+                .await
+                .unwrap();
+            let wire = String::from_utf8(bytes.to_vec()).unwrap();
+            assert_eq!(status, 200, "{strategy}/stream={stream}: {wire}");
+            assert!(wire.contains("fallback reply"), "{wire}");
+            assert!(
+                trace
+                    .snapshot()
+                    .iter()
+                    .any(|event| event.tag == "conversion"
+                        && event.detail.contains(&format!("strategy={strategy};"))),
+                "{:?}",
+                trace.snapshot()
+            );
+            let sent = only_request(&captured).body();
+            assert_eq!(sent["model"], "claude-opus-5-5");
+            if ingress == ANTHROPIC_MESSAGES_2023_06_01 {
+                assert_eq!(sent["fallbacks"], json!([{"model": "claude-opus-4-8"}]));
+            } else {
+                assert!(sent.get("fallbacks").is_none(), "{sent}");
+            }
+            let log = tokio::time::timeout(Duration::from_secs(3), logs.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(log.client_model, MODEL);
+            assert_eq!(log.upstream_model, "claude-opus-5-5");
+            assert_eq!(log.enable_payload, Some(false));
+            assert_eq!(
+                log.diagnostic.payload_metadata["response_model"],
+                json!({
+                    "served_model": "claude-opus-4-8", "source": "usage.iterations.fallback_message.model"
+                })
+            );
+        }
+    }
 }
 
 #[tokio::test]

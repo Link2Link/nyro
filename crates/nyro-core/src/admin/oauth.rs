@@ -931,6 +931,10 @@ impl AdminService {
             .get(&provider.id)
             .await?
             .ok_or_else(|| anyhow::anyhow!("provider oauth credential not found"))?;
+        anyhow::ensure!(
+            oauth_cred.status != "error",
+            "OAuth credential is unavailable; sign in again before refreshing"
+        );
         let oauth_store = self.gw.storage.oauth_credentials();
         let Some(refresh_lock) = oauth_store
             .try_begin_refresh(&provider.id, oauth_cred.status_version)
@@ -940,17 +944,10 @@ impl AdminService {
         };
 
         let credential = stored_credential_from_oauth(&oauth_cred, &driver_key);
-        let bundle = self
-            .refresh_locked_credential(&provider, &credential, &refresh_lock, driver.as_ref())
+        self.refresh_locked_credential(&provider, &credential, &refresh_lock, driver.clone())
             .await?;
-        let refreshed_credential = stored_credential_from_bundle(
-            &driver_key,
-            refreshed_scheme(driver.as_ref(), &credential),
-            &bundle,
-        );
-        let refreshed_provider = self
-            .sync_provider_runtime_fields(&provider, &refreshed_credential)
-            .await?;
+        // Refresh only credentials. Never overwrite an operator edit or revive a
+        // disabled provider from the configuration snapshot taken before HTTP.
         self.bump_config_epoch().await?;
         // Reconnecting by refreshing the same subscriber token is not quota
         // recovery. Keep scoped enforcement until a new authoritative query.
@@ -965,12 +962,7 @@ impl AdminService {
             self.gw.quota_registry.request_refresh(&provider.id);
         }
 
-        Ok(build_provider_oauth_status(
-            &refreshed_provider,
-            &driver_key,
-            Some(AuthBindingStatus::Connected.as_str().to_string()),
-            None,
-        ))
+        self.get_provider_oauth_status(id).await
     }
 
     pub async fn logout_provider_oauth(&self, id: &str) -> anyhow::Result<ProviderOAuthStatusData> {
@@ -1369,7 +1361,7 @@ impl AdminService {
         // the credential (`upsert`/`complete_refresh` restore `connected`).
         if oauth_cred.status == "error" {
             anyhow::bail!(
-                "provider oauth credential was revoked ({})",
+                "provider oauth credential is unavailable ({})",
                 oauth_cred
                     .last_error
                     .as_deref()
@@ -1491,17 +1483,33 @@ impl AdminService {
         };
 
         let bundle = self
-            .refresh_locked_credential(provider, &credential, &refresh_lock, driver.as_ref())
+            .refresh_locked_credential(provider, &credential, &refresh_lock, driver.clone())
             .await?;
         let refreshed_credential = stored_credential_from_bundle(
             &driver_key,
             refreshed_scheme(driver.as_ref(), &credential),
             &bundle,
         );
-        let refreshed_provider = self
-            .sync_provider_runtime_fields(provider, &refreshed_credential)
-            .await?;
         self.bump_config_epoch().await?;
+        let refreshed_provider = self.get_provider(&provider.id).await?;
+        let current = oauth_store
+            .get_account(&provider.id, &refresh_lock.account_id)
+            .await?
+            .context("OAuth credential disappeared after refresh")?;
+        anyhow::ensure!(
+            current.status == "connected"
+                && current.access_token == bundle.access_token.as_deref().unwrap_or_default()
+                && serde_json::from_str::<Value>(&current.meta)
+                    .ok()
+                    .and_then(|meta| meta
+                        .get(crate::auth::refresh_state::REFRESH_PUBLICATION_ID_KEY)
+                        .cloned())
+                    == bundle
+                        .raw
+                        .get(crate::auth::refresh_state::REFRESH_PUBLICATION_ID_KEY)
+                        .cloned(),
+            "OAuth refresh result was superseded by newer credentials"
+        );
         let new_access_token = bundle
             .access_token
             .as_deref()
@@ -1614,7 +1622,7 @@ impl AdminService {
             .try_begin_account_refresh(&provider.id, &current.account_id, current.status_version)
             .await?
         {
-            self.refresh_locked_credential(provider, &credential, &lease, driver.as_ref())
+            self.refresh_locked_credential(provider, &credential, &lease, driver.clone())
                 .await?;
             self.bump_config_epoch().await?;
         } else {
@@ -1761,23 +1769,38 @@ impl AdminService {
         Ok(refreshed)
     }
 
-    /// All refresh entry points share validation, total network deadline,
-    /// failure classification, and versioned publication. Runtime fields are
-    /// changed only after this succeeds, never before the token CAS.
+    /// Keep grant consumption and publication alive when the caller disconnects.
     async fn refresh_locked_credential(
         &self,
         provider: &Provider,
         credential: &StoredCredential,
         lease: &OAuthCredential,
-        driver: &dyn auth::AuthDriver,
+        driver: Arc<dyn auth::AuthDriver>,
     ) -> anyhow::Result<CredentialBundle> {
-        // Include error persistence in the hard 30-second budget.
-        tokio::time::timeout(
-            std::time::Duration::from_secs(30),
-            self.refresh_locked_credential_inner(provider, credential, lease, driver),
-        )
+        let admin = self.clone();
+        let provider = provider.clone();
+        let credential = credential.clone();
+        let lease = lease.clone();
+        tokio::spawn(async move {
+            tokio::time::timeout(
+                Duration::from_secs(45),
+                admin.refresh_locked_credential_inner(
+                    &provider,
+                    &credential,
+                    &lease,
+                    driver.as_ref(),
+                ),
+            )
+            .await
+            .unwrap_or_else(|_| {
+                Err(crate::auth::refresh::RefreshFailure::OutcomeUnknown {
+                    stage: "refresh deadline",
+                }
+                .into())
+            })
+        })
         .await
-        .unwrap_or_else(|_| Err(anyhow::anyhow!("OAuth refresh deadline exceeded")))
+        .map_err(|_| anyhow::anyhow!(crate::auth::refresh_state::OUTCOME_UNKNOWN_MESSAGE))?
     }
 
     async fn refresh_locked_credential_inner(
@@ -1787,8 +1810,16 @@ impl AdminService {
         lease: &OAuthCredential,
         driver: &dyn auth::AuthDriver,
     ) -> anyhow::Result<CredentialBundle> {
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(25);
+        use crate::auth::refresh::RefreshFailure;
         let store = self.gw.storage.oauth_credentials();
+        // Do not consume a grant superseded before this detached task could run.
+        let current = store.get_account(&provider.id, &lease.account_id).await?;
+        anyhow::ensure!(
+            current.as_ref().is_some_and(
+                |row| row.status == "refreshing" && row.status_version == lease.status_version
+            ),
+            "OAuth refresh lease was superseded"
+        );
         let operation = async {
             if credential
                 .refresh_token
@@ -1797,22 +1828,19 @@ impl AdminService {
             {
                 anyhow::bail!("provider oauth refresh token is missing; reauthentication required");
             }
-            let client = if matches!(driver.metadata().key, "devin" | "kiro") {
-                self.gw.devin_http_client(provider.use_proxy, false).await?
-            } else {
-                self.gw.http_client_for_provider(provider.use_proxy).await?
-            };
-            let mut bundle = driver
-                .refresh(
-                    credential,
-                    RefreshAuthContext {
-                        use_proxy: provider.use_proxy,
-                        http_client: Some(client),
-                        ..Default::default()
-                    },
-                )
-                .await?;
-            // Drivers may omit an unchanged refresh token, never erase it.
+            let client = self
+                .gw
+                .oauth_refresh_http_client(provider.use_proxy)
+                .await
+                .map_err(|_| RefreshFailure::PreSend)?;
+            let mut bundle = driver.refresh(credential, RefreshAuthContext {
+                use_proxy: provider.use_proxy,
+                http_client: Some(client),
+                metadata: if matches!(driver.metadata().key, "google" | "google-gemini-cli") {
+                    serde_json::json!({"google_subscription_endpoint":
+                        crate::provider::google::antigravity::subscription_endpoint(provider, Some(credential)).base_url})
+                } else { Value::Null },
+            }).await?;
             if bundle
                 .refresh_token
                 .as_deref()
@@ -1826,21 +1854,33 @@ impl AdminService {
                 .is_none_or(|token| token.trim().is_empty())
                 || is_expired_at(bundle.expires_at.as_deref())
             {
-                anyhow::bail!("OAuth refresh returned an invalid credential");
+                return Err(RefreshFailure::OutcomeUnknown {
+                    stage: "invalid credential",
+                }
+                .into());
             }
+            crate::auth::refresh_state::clear_retry_at(&mut bundle.raw);
             let candidate = stored_credential_from_bundle(
                 driver.metadata().key,
                 refreshed_scheme(driver, credential),
                 &bundle,
             );
-            // Validate binding before persisting or making the new token visible.
-            driver.bind_runtime(provider, &candidate)?;
+            driver.bind_runtime(provider, &candidate).map_err(|_| {
+                RefreshFailure::OutcomeUnknown {
+                    stage: "runtime binding",
+                }
+            })?;
             Ok(bundle)
         };
-        let result = tokio::time::timeout_at(deadline, operation)
+        let result = tokio::time::timeout(Duration::from_secs(25), operation)
             .await
-            .unwrap_or_else(|_| Err(anyhow::anyhow!("OAuth refresh deadline exceeded")));
-        let bundle = match result {
+            .unwrap_or_else(|_| {
+                Err(RefreshFailure::OutcomeUnknown {
+                    stage: "token deadline",
+                }
+                .into())
+            });
+        let mut bundle = match result {
             Ok(bundle) => bundle,
             Err(error) => {
                 let (terminal, meta, message) = refresh_failure_policy(credential, &error);
@@ -1850,7 +1890,11 @@ impl AdminService {
                             &provider.id,
                             &lease.account_id,
                             lease.status_version,
-                            "Account credential refresh failed",
+                            if error.downcast_ref::<RefreshFailure>().is_some() {
+                                &message
+                            } else {
+                                "Account credential refresh failed"
+                            },
                             terminal,
                             meta,
                         )
@@ -1869,38 +1913,95 @@ impl AdminService {
                 return Err(error);
             }
         };
+        if !bundle.raw.is_object() {
+            bundle.raw = serde_json::json!({});
+        }
+        bundle.raw[crate::auth::refresh_state::REFRESH_PUBLICATION_ID_KEY] =
+            Value::String(uuid::Uuid::new_v4().to_string());
         let input = upsert_credential_from_bundle(
             driver.metadata().key,
             refreshed_scheme(driver, credential),
             &bundle,
         );
-        let publish = async {
+        // Publication has its own budget. Retry only this CAS and the same
+        // rotated bundle, never the token HTTP request. The row is the receipt.
+        for _ in 0..3 {
+            let publish = async {
+                if crate::provider::account_pool::supports_pool(provider) {
+                    store
+                        .complete_account_refresh(
+                            &provider.id,
+                            &lease.account_id,
+                            lease.status_version,
+                            input.clone(),
+                        )
+                        .await
+                } else {
+                    store
+                        .complete_refresh(&provider.id, lease.status_version, input.clone())
+                        .await
+                }
+            };
+            let result = tokio::time::timeout(Duration::from_secs(3), publish).await;
+            if matches!(result, Ok(Ok(Some(_)))) {
+                return Ok(bundle);
+            }
+            // A write may have committed despite an acknowledgement loss.
+            if let Ok(Ok(Some(row))) = tokio::time::timeout(
+                Duration::from_secs(1),
+                store.get_account(&provider.id, &lease.account_id),
+            )
+            .await
+            {
+                if row.status == "connected"
+                    && lease.status_version.checked_add(1) == Some(row.status_version)
+                    && row.access_token == input.access_token
+                    && row.refresh_token == input.refresh_token
+                    && row.driver_key == input.driver_key
+                    && row.scheme == input.scheme
+                    && row.subject_id == input.subject_id
+                    && row.resource_url == input.resource_url
+                    && Some(row.meta.as_str()) == input.meta.as_deref()
+                    && Some(row.scopes.as_str()) == input.scopes.as_deref()
+                {
+                    return Ok(bundle);
+                }
+                if row.status != "refreshing" || row.status_version != lease.status_version {
+                    anyhow::bail!("OAuth refresh result was superseded by newer credentials");
+                }
+            }
+        }
+        // A crash before this write is safe for Codex too: every store quarantines
+        // stale refreshing generations instead of resetting them to connected.
+        let error = RefreshFailure::OutcomeUnknown {
+            stage: "credential publication",
+        };
+        let _ = tokio::time::timeout(Duration::from_secs(2), async {
             if crate::provider::account_pool::supports_pool(provider) {
                 store
-                    .complete_account_refresh(
+                    .fail_account_refresh_with_policy(
                         &provider.id,
                         &lease.account_id,
                         lease.status_version,
-                        input,
+                        crate::auth::refresh_state::OUTCOME_UNKNOWN_MESSAGE,
+                        true,
+                        None,
                     )
                     .await
             } else {
                 store
-                    .complete_refresh(&provider.id, lease.status_version, input)
+                    .fail_refresh_with_policy(
+                        &provider.id,
+                        lease.status_version,
+                        crate::auth::refresh_state::OUTCOME_UNKNOWN_MESSAGE,
+                        true,
+                        None,
+                    )
                     .await
             }
-        };
-        match tokio::time::timeout_at(deadline, publish)
-            .await
-            .unwrap_or_else(|_| {
-                Err(anyhow::anyhow!(
-                    "OAuth refresh publication deadline exceeded"
-                ))
-            }) {
-            Ok(Some(_)) => Ok(bundle),
-            Ok(None) => anyhow::bail!("OAuth refresh result was superseded by newer credentials"),
-            Err(error) => Err(error),
-        }
+        })
+        .await;
+        Err(error.into())
     }
 
     /// Proactively refresh an OAuth credential that is approaching expiry.
@@ -1937,15 +2038,7 @@ impl AdminService {
             return Ok(());
         };
 
-        let bundle = self
-            .refresh_locked_credential(provider, &credential, &refresh_lock, driver.as_ref())
-            .await?;
-        let refreshed_credential = stored_credential_from_bundle(
-            &driver_key,
-            refreshed_scheme(driver.as_ref(), &credential),
-            &bundle,
-        );
-        self.sync_provider_runtime_fields(provider, &refreshed_credential)
+        self.refresh_locked_credential(provider, &credential, &refresh_lock, driver.clone())
             .await?;
         self.bump_config_epoch().await?;
         Ok(())
@@ -1976,10 +2069,36 @@ const TERMINAL_REFRESH_MARKERS: &[&str] = &[
 ];
 
 fn refresh_failure_policy(
-    _credential: &StoredCredential,
+    credential: &StoredCredential,
     error: &anyhow::Error,
 ) -> (bool, Option<String>, String) {
+    use crate::auth::{refresh::RefreshFailure, refresh_state};
+    if let Some(failure) = error.downcast_ref::<RefreshFailure>() {
+        return match failure {
+            RefreshFailure::PreSend => (false, None, failure.to_string()),
+            RefreshFailure::RateLimited { retry_at } => (
+                false,
+                Some(refresh_state::with_retry_at(&credential.meta, *retry_at).to_string()),
+                failure.to_string(),
+            ),
+            RefreshFailure::Rejected { .. } => (true, None, failure.to_string()),
+            RefreshFailure::OutcomeUnknown { .. } => (
+                auth::normalize_driver_key(&credential.driver_key) == "codex",
+                None,
+                failure.to_string(),
+            ),
+        };
+    }
     let message = error.to_string();
+    // Codex may have consumed a rotating grant. An unclassified error is not
+    // permission to replay it; explicit pre-send / refusal types above are.
+    if auth::normalize_driver_key(&credential.driver_key) == "codex" {
+        return (
+            true,
+            None,
+            refresh_state::OUTCOME_UNKNOWN_MESSAGE.to_string(),
+        );
+    }
     let terminal = TERMINAL_REFRESH_MARKERS.iter().any(|m| message.contains(m));
     (terminal, None, message)
 }
@@ -2130,6 +2249,9 @@ mod legacy_bind_fence_tests {
 }
 
 #[cfg(test)]
+mod refresh_safety_tests;
+
+#[cfg(test)]
 mod lifecycle_tests {
     use super::*;
     async fn gateway() -> anyhow::Result<Gateway> {
@@ -2228,7 +2350,10 @@ mod lifecycle_tests {
             Err(error) => error,
             Ok(_) => panic!("terminal credential must not resolve"),
         };
-        assert!(error.to_string().contains("revoked"), "{error}");
+        assert!(
+            error.to_string().contains("credential is unavailable"),
+            "{error}"
+        );
 
         // Re-authorization (device login / re-import) restores routing.
         store.upsert(&provider.id, fresh("ACCESS-2")).await?;
@@ -2919,9 +3044,9 @@ mod kiro_account_refresh_tests {
                     &provider,
                     &stored_credential_from_oauth(&a, "claude-code"),
                     &lease,
-                    &ClaudeRefreshFixture {
+                    Arc::new(ClaudeRefreshFixture {
                         reject: mode == "reject",
-                    },
+                    }),
                 )
                 .await;
             assert_eq!(result.is_ok(), mode == "success");
@@ -3036,7 +3161,7 @@ mod kiro_account_refresh_tests {
                 &p,
                 &stored_credential_from_oauth(&a, "kiro"),
                 &lease,
-                &RefreshFixture { reject: false },
+                Arc::new(RefreshFixture { reject: false }),
             )
             .await
             .unwrap();
@@ -3071,7 +3196,7 @@ mod kiro_account_refresh_tests {
                     &p,
                     &stored_credential_from_oauth(&a, "kiro"),
                     &lease,
-                    &RefreshFixture { reject: true }
+                    Arc::new(RefreshFixture { reject: true })
                 )
                 .await
                 .is_err()
@@ -3112,7 +3237,7 @@ mod kiro_account_refresh_tests {
                     &p,
                     &stored_credential_from_oauth(&a, "kiro"),
                     &lease,
-                    &RefreshFixture { reject: false }
+                    Arc::new(RefreshFixture { reject: false })
                 )
                 .await
                 .is_err()

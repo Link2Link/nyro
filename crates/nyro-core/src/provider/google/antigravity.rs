@@ -46,13 +46,21 @@ pub(crate) const ANTIGRAVITY_STATIC_MODELS: &[&str] = &[
     "gemini-3.8-flash-medium",
     "gemini-3.8-flash-low",
     "gemini-3.8-flash-tiered",
-    // Gemini 4 Argon (rolled out 2026-10-13 to AI Pro/Ultra subscribers).
-    // The bare id is served as-is; `-high` is the only tier variant the
-    // account catalog advertises so far (mirrors the fetched CLIProxyAPI
-    // registry). Google gates Argon behind a current-generation client —
-    // the versioned User-Agent above must stay fresh for these to route.
-    "gemini-4-argon",
+    // Gemini 4 Hydrogen / Argon (verified 2026-11-15 on a Google AI Pro
+    // account through the daily host): only tier ids are served — the bare
+    // `gemini-4-hydrogen` / `gemini-4-argon` ids answer 404, so both stay
+    // routable as virtual aliases (see `apply_tier_model_rewrite`). Hydrogen
+    // additionally serves `-xhigh`. The prod host neither lists Hydrogen nor
+    // serves it (429), and accounts outside the plan only see
+    // `<family>-disabled` placeholders. Google gates these behind a
+    // current-generation client — the versioned User-Agent must stay fresh.
+    "gemini-4-hydrogen-xhigh",
+    "gemini-4-hydrogen-high",
+    "gemini-4-hydrogen-medium",
+    "gemini-4-hydrogen-low",
     "gemini-4-argon-high",
+    "gemini-4-argon-medium",
+    "gemini-4-argon-low",
     // Claude 5.5 reasoning tiers (verified 2026-10-04 by direct probes):
     // callable on the inference surface but NOT yet listed by the per-account
     // `fetchAvailableModels` catalog, so the curated list must carry them or
@@ -309,15 +317,140 @@ pub(crate) fn antigravity_user_agent() -> String {
     hub_user_agent_for_version(&antigravity_version())
 }
 
-/// Inference base URL for the antigravity channel. Consumer (Google AI
-/// Pro/Ultra) credentials must send `generateContent`/`streamGenerateContent`
-/// to the **daily** host — the prod host parks them in the free consumer
-/// pool (`aicode-consumers` project) where every mainline model is
-/// tier-gated to 429 RESOURCE_EXHAUSTED. Control-plane calls
-/// (`loadCodeAssist`) stay on prod. Validated by CLIProxyAPI
-/// (`resolveAntigravityRequestBaseURL` defaults consumer credentials to
-/// daily) and sub2api (paid plan_type → daily endpoint).
+/// Default inference and catalog host for the Antigravity channel, matching
+/// CLIProxyAPI's daily catalog policy. Explicit endpoint bindings take priority.
+/// This routing default does not establish account entitlement or explain an
+/// upstream 404/429. Onboarding control-plane calls retain their own policy.
 pub(crate) const ANTIGRAVITY_INFERENCE_BASE_URL: &str = "https://daily-cloudcode-pa.googleapis.com";
+
+pub(crate) const GOOGLE_SUBSCRIPTION_PROD_BASE_URL: &str = "https://cloudcode-pa.googleapis.com";
+
+/// One policy for inference and catalog discovery. The historical prod preset
+/// is not an explicit Antigravity override. A credential opt-in can select prod;
+/// a non-default provider URL is an explicit configured endpoint.
+pub(crate) struct SubscriptionEndpoint {
+    pub base_url: String,
+    pub source: &'static str,
+}
+
+pub(crate) fn subscription_endpoint(
+    provider: &Provider,
+    credential: Option<&crate::auth::StoredCredential>,
+) -> SubscriptionEndpoint {
+    if let Some(endpoint) = credential
+        .and_then(|credential| credential.meta.get("subscription_endpoint"))
+        .and_then(nonempty_json_string)
+    {
+        return SubscriptionEndpoint {
+            base_url: endpoint.trim_end_matches('/').into(),
+            source: "credential_override",
+        };
+    }
+    let configured = provider.base_url.trim().trim_end_matches('/');
+    if !configured.is_empty() && configured != GOOGLE_SUBSCRIPTION_PROD_BASE_URL {
+        return SubscriptionEndpoint {
+            base_url: configured.into(),
+            source: "provider_config",
+        };
+    }
+    let (base_url, source) = if is_antigravity_channel(provider) {
+        (ANTIGRAVITY_INFERENCE_BASE_URL, "antigravity_default_daily")
+    } else {
+        (GOOGLE_SUBSCRIPTION_PROD_BASE_URL, "gemini_cli_default_prod")
+    };
+    SubscriptionEndpoint {
+        base_url: base_url.into(),
+        source,
+    }
+}
+
+/// Provenance is stored beside IDs, never mixed into the model list. Binding to
+/// the token fingerprint is deliberately conservative on refresh; an old-token
+/// snapshot is unknown until discovery succeeds again. No secret is persisted.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct CatalogSource {
+    schema_version: u32,
+    pub endpoint: String,
+    pub project_id: String,
+    pub user_agent: String,
+    credential_fingerprint: String,
+}
+
+impl CatalogSource {
+    pub(crate) fn new(
+        endpoint: &str,
+        project_id: &str,
+        user_agent: &str,
+        access_token: &str,
+    ) -> Self {
+        Self {
+            schema_version: 1,
+            endpoint: endpoint.trim().trim_end_matches('/').into(),
+            project_id: project_id.trim().into(),
+            user_agent: user_agent.trim().into(),
+            credential_fingerprint: format!("{:x}", Sha256::digest(access_token.trim().as_bytes())),
+        }
+    }
+}
+
+pub(crate) fn catalog_source_for_runtime(
+    provider: &Provider,
+    credential: &crate::auth::StoredCredential,
+    binding: &crate::auth::RuntimeBinding,
+) -> Result<CatalogSource> {
+    let endpoint = binding
+        .base_url_override
+        .as_deref()
+        .map(str::trim)
+        .filter(|url| !url.is_empty())
+        .map(ToString::to_string)
+        .unwrap_or_else(|| subscription_endpoint(provider, Some(credential)).base_url);
+    let user_agent = binding
+        .extra_headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("user-agent"))
+        .map(|(_, value)| value.clone())
+        .unwrap_or_else(|| {
+            if is_google_antigravity(provider) {
+                antigravity_user_agent()
+            } else {
+                super::gemini_cli::GEMINI_CLI_USER_AGENT.into()
+            }
+        });
+    let project_id = code_assist_project_id(Some(credential))?;
+    let token = credential
+        .access_token
+        .as_deref()
+        .unwrap_or_default()
+        .trim();
+    anyhow::ensure!(
+        !token.is_empty(),
+        "Google subscription access token unavailable"
+    );
+    Ok(CatalogSource::new(
+        &endpoint,
+        &project_id,
+        &user_agent,
+        token,
+    ))
+}
+
+pub(crate) fn write_catalog_snapshot(
+    meta: &mut serde_json::Map<String, Value>,
+    ids: &[String],
+    source: &CatalogSource,
+) {
+    let mut ids: Vec<String> = ids
+        .iter()
+        .map(|id| id.trim().to_string())
+        .filter(|id| !id.is_empty())
+        .collect();
+    ids.sort();
+    ids.dedup();
+    // A successful empty catalog replaces old IDs. Failure must not call this.
+    meta.insert("subscription_models".into(), json!(ids));
+    meta.insert("subscription_models_source".into(), json!(source));
+}
 
 /// True when the provider row is the google/antigravity OAuth channel.
 pub(crate) fn is_antigravity_channel(provider: &Provider) -> bool {
@@ -369,11 +502,17 @@ pub(crate) async fn fetch_available_models(
     access_token: &str,
     project_id: &str,
     user_agent: &str,
+    base_url: &str,
 ) -> Result<Vec<AvailableModel>> {
     // Pure shared transport: callers prepare their channel's identity first.
     // Refreshing here would send an already-bound stale UA and make Gemini CLI
     // unnecessarily query the Antigravity Hub manifest.
-    let endpoint = "https://cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels";
+    let base_url = base_url.trim().trim_end_matches('/');
+    anyhow::ensure!(
+        !base_url.is_empty(),
+        "Google subscription catalog endpoint unavailable"
+    );
+    let endpoint = format!("{base_url}/v1internal:fetchAvailableModels");
     let response = client
         .post(endpoint)
         .header("Authorization", format!("Bearer {access_token}"))
@@ -381,21 +520,44 @@ pub(crate) async fn fetch_available_models(
         .header("Accept", "*/*")
         .header("User-Agent", user_agent)
         .json(&json!({ "project": project_id }))
+        .timeout(Duration::from_secs(20))
         .send()
         .await?;
     let status = response.status();
     let body = response.text().await.unwrap_or_default();
     if !status.is_success() {
-        anyhow::bail!("antigravity fetchAvailableModels failed: HTTP {status}: {body}");
+        anyhow::bail!("Google subscription fetchAvailableModels failed: HTTP {status}");
     }
     let parsed: Value = serde_json::from_str(&body)?;
+    let models = parsed
+        .get("models")
+        .and_then(Value::as_object)
+        .ok_or_else(|| anyhow::anyhow!("Google subscription catalog response has no model map"))?;
+    anyhow::ensure!(
+        models
+            .iter()
+            .all(|(id, info)| !id.trim().is_empty() && info.is_object()),
+        "Google subscription catalog contains an invalid model entry"
+    );
     Ok(parse_available_models_detailed(&parsed))
+}
+
+/// Catalog rows the backend lists but refuses to serve to this account: an
+/// explicit `disabled: true` marker (the IDE renders it "Unavailable") or the
+/// `<model>-disabled` placeholder id that stands in for a model outside the
+/// account's plan (observed: `gemini-4-argon-disabled` on Google AI Pro
+/// trial/promotional plans). Both answer 404 NOT_FOUND on the inference
+/// surface, so they are never callable models.
+fn is_disabled_catalog_entry(id: &str, info: &Value) -> bool {
+    info.get("disabled").and_then(Value::as_bool) == Some(true)
+        || id.trim().to_ascii_lowercase().ends_with("-disabled")
 }
 
 /// Same payload → per-model entries with quota state
 /// (`quotaInfo.remainingFraction` / `quotaInfo.resetTime`, best-effort).
 /// Ids listed in `deprecatedModelIds` are dropped — upstream itself marks
-/// them dead (they 404 on the inference surface).
+/// them dead (they 404 on the inference surface) — and so are disabled
+/// placeholders (see `is_disabled_catalog_entry`).
 pub(crate) fn parse_available_models_detailed(payload: &Value) -> Vec<AvailableModel> {
     let Some(models) = payload.get("models").and_then(Value::as_object) else {
         return Vec::new();
@@ -413,6 +575,7 @@ pub(crate) fn parse_available_models_detailed(payload: &Value) -> Vec<AvailableM
     let mut entries: Vec<AvailableModel> = models
         .iter()
         .filter(|(id, _)| !deprecated.iter().any(|dead| dead == *id))
+        .filter(|(id, info)| !is_disabled_catalog_entry(id, info))
         .map(|(id, info)| {
             let quota = info.get("quotaInfo").filter(|q| q.is_object());
             AvailableModel {
@@ -646,12 +809,25 @@ pub(crate) fn parse_quota_summary_buckets(payload: &Value) -> Vec<QuotaSummaryBu
 }
 
 /// Tier suffixes the antigravity surface bakes into model ids.
-const TIER_SUFFIXES: &[&str] = &["-extra-low", "-tiered", "-medium", "-high", "-low"];
+const TIER_SUFFIXES: &[&str] = &[
+    "-extra-low",
+    "-tiered",
+    "-medium",
+    "-xhigh",
+    "-high",
+    "-low",
+];
 
 /// These families expose one public model name; reasoning selects the wire id.
-/// Do not strip suffixes globally: other families (e.g. Argon) serve a real
-/// bare id as well as independently selectable tier variants.
-const UNIFIED_TIER_MODELS: &[&str] = &["claude-opus-5-5", "claude-sonnet-5-5", "gemini-3.8-flash"];
+/// Do not strip suffixes globally: other families may serve a real bare id as
+/// well as independently selectable tier variants.
+const UNIFIED_TIER_MODELS: &[&str] = &[
+    "claude-opus-5-5",
+    "claude-sonnet-5-5",
+    "gemini-3.8-flash",
+    "gemini-4-argon",
+    "gemini-4-hydrogen",
+];
 
 fn unified_tier_base(model: &str) -> Option<&'static str> {
     UNIFIED_TIER_MODELS.iter().copied().find(|base| {
@@ -674,7 +850,8 @@ pub(crate) fn is_tier_suffixed(model: &str) -> bool {
 /// * `minimal` → `-extra-low`
 /// * `low` → `-low`
 /// * `medium` → `-medium`
-/// * `high` / `xhigh` / `max` → `-high`
+/// * `high` → `-high`
+/// * `xhigh` / `max` → `-xhigh` where served (Gemini 4 Hydrogen), else `-high`
 /// * token budgets map by magnitude — as an effort variant or the bare
 ///   `budget_tokens` field (Anthropic `thinking` / Gemini `thinkingBudget`)
 /// * no reasoning directive → `-tiered` when served (Gemini), otherwise `-medium`
@@ -684,6 +861,7 @@ fn tier_ladder(reasoning: &crate::protocol::ir::ReasoningConfig) -> &'static [&'
     const LOW: &[&str] = &["-low", "-extra-low"];
     const MEDIUM: &[&str] = &["-medium", "-low", "-high"];
     const HIGH: &[&str] = &["-high", "-medium", "-low"];
+    const XHIGH: &[&str] = &["-xhigh", "-high", "-medium", "-low"];
     const TIERED: &[&str] = &["-tiered", "-medium"];
     // A thinking budget: an explicit `Budget` effort variant, or the bare
     // `budget_tokens` field when no qualitative effort was expressed
@@ -719,7 +897,8 @@ fn tier_ladder(reasoning: &crate::protocol::ir::ReasoningConfig) -> &'static [&'
         Some(Minimal) => EXTRA_LOW,
         Some(Low) => LOW,
         Some(Medium) => MEDIUM,
-        Some(High | Xhigh | Max) => HIGH,
+        Some(High) => HIGH,
+        Some(Xhigh | Max) => XHIGH,
         // No reasoning directive at all — thinking merely on without a level,
         // or a request that says nothing about reasoning (`ReasoningConfig::
         // default()` across every ingress decoder) — uses the family default:
@@ -766,20 +945,28 @@ pub(crate) fn resolve_tiered_model(
 /// Account model-catalog snapshot stashed in the credential meta by the auth
 /// driver (exchange/refresh); drives the catalog-gated tier rewrite.
 pub(crate) fn credential_catalog_snapshot(
+    provider: &Provider,
     credential: Option<&crate::auth::types::StoredCredential>,
-) -> Vec<String> {
+) -> Option<Vec<String>> {
+    let credential = credential?;
+    let expected = catalog_source_for_runtime(provider, credential, &Default::default()).ok()?;
+    let source: CatalogSource =
+        serde_json::from_value(credential.meta.get("subscription_models_source")?.clone()).ok()?;
+    if source != expected {
+        return None;
+    }
     credential
-        .and_then(|cred| cred.meta.get("subscription_models"))
-        .and_then(Value::as_array)
-        .map(|ids| {
-            ids.iter()
-                .filter_map(Value::as_str)
+        .meta
+        .get("subscription_models")?
+        .as_array()?
+        .iter()
+        .map(|id| {
+            id.as_str()
                 .map(str::trim)
                 .filter(|id| !id.is_empty())
                 .map(ToString::to_string)
-                .collect()
         })
-        .unwrap_or_default()
+        .collect()
 }
 
 /// Raw wire catalog used by dispatch and probes, never the collapsed public
@@ -799,7 +986,7 @@ pub(crate) fn subscription_model_catalog(
     } else {
         return Vec::new();
     };
-    let mut catalog = credential_catalog_snapshot(credential);
+    let mut catalog = credential_catalog_snapshot(provider, credential).unwrap_or_default();
     catalog.extend(
         curated
             .iter()
@@ -815,7 +1002,8 @@ pub(crate) fn subscription_model_catalog(
 /// (pipeline step, runs after `post_encode`; applies to BOTH subscription
 /// channels). Gemini and the unified Claude families resolve against the raw
 /// channel catalog. Without an effort, Gemini 3.8 Flash uses `-tiered`, while
-/// Claude 5.5 has no adaptive tier and falls back to `-medium`.
+/// Claude 5.5 and Gemini 4 Argon/Hydrogen have no adaptive tier and fall back
+/// to `-medium`.
 /// The inner `thinkingConfig` is dropped whenever the model id carries the
 /// tier (the id is the effort on this surface).
 pub(crate) fn apply_tier_model_rewrite(
@@ -1219,6 +1407,163 @@ mod tests {
     use super::*;
 
     #[test]
+    fn catalog_endpoint_policy_preserves_defaults_and_explicit_binding() {
+        for (channel, expected) in [
+            ("antigravity", ANTIGRAVITY_INFERENCE_BASE_URL),
+            ("gemini-cli", GOOGLE_SUBSCRIPTION_PROD_BASE_URL),
+        ] {
+            let (mut provider, _) = google_provider(channel, "gemini-future");
+            provider.base_url = GOOGLE_SUBSCRIPTION_PROD_BASE_URL.into();
+            assert_eq!(subscription_endpoint(&provider, None).base_url, expected);
+            provider.base_url = "http://127.0.0.1:12345/custom/".into();
+            assert_eq!(
+                subscription_endpoint(&provider, None).base_url,
+                "http://127.0.0.1:12345/custom"
+            );
+            let binding = crate::auth::RuntimeBinding {
+                base_url_override: Some("http://127.0.0.1:23456/runtime/".into()),
+                extra_headers: [("User-Agent".into(), "bound-ua/9".into())].into(),
+                ..Default::default()
+            };
+            let credential = crate::auth::StoredCredential {
+                access_token: Some("fixture-token".into()),
+                meta: json!({"project_id":"fixture-project"}),
+                ..Default::default()
+            };
+            let source = catalog_source_for_runtime(&provider, &credential, &binding).unwrap();
+            assert_eq!(source.endpoint, "http://127.0.0.1:23456/runtime");
+            assert_eq!(source.user_agent, "bound-ua/9");
+        }
+        let (provider, _) = google_provider("antigravity", "gemini-future");
+        let credential = crate::auth::StoredCredential {
+            meta: json!({"subscription_endpoint": GOOGLE_SUBSCRIPTION_PROD_BASE_URL}),
+            ..Default::default()
+        };
+        let endpoint = subscription_endpoint(&provider, Some(&credential));
+        assert_eq!(endpoint.base_url, GOOGLE_SUBSCRIPTION_PROD_BASE_URL);
+        assert_eq!(endpoint.source, "credential_override");
+    }
+
+    #[test]
+    fn catalog_snapshot_rejects_unbound_or_changed_context_and_keeps_curated() {
+        let (mut provider, _) = google_provider("antigravity", "gemini-future");
+        let mut credential = crate::auth::StoredCredential {
+            access_token: Some("fixture-token".into()),
+            meta: json!({"project_id":"fixture-project", "subscription_models":["gemini-future-high"]}),
+            ..Default::default()
+        };
+        assert!(credential_catalog_snapshot(&provider, Some(&credential)).is_none());
+        let source =
+            catalog_source_for_runtime(&provider, &credential, &Default::default()).unwrap();
+        write_catalog_snapshot(
+            credential.meta.as_object_mut().unwrap(),
+            &["gemini-future-high".into()],
+            &source,
+        );
+        assert_eq!(
+            credential_catalog_snapshot(&provider, Some(&credential)),
+            Some(vec!["gemini-future-high".into()])
+        );
+        for key in ["project_id", "subscription_endpoint"] {
+            let mut changed = credential.clone();
+            changed.meta[key] = json!("https://changed.invalid");
+            assert!(
+                credential_catalog_snapshot(&provider, Some(&changed)).is_none(),
+                "{key}"
+            );
+        }
+        let mut rotated = credential.clone();
+        rotated.access_token = Some("new-token".into());
+        assert!(credential_catalog_snapshot(&provider, Some(&rotated)).is_none());
+        let mut stale_ua = credential.clone();
+        stale_ua.meta["subscription_models_source"]["user_agent"] = json!("old-client/1");
+        assert!(credential_catalog_snapshot(&provider, Some(&stale_ua)).is_none());
+        provider.base_url = "http://127.0.0.1:23456".into();
+        assert!(credential_catalog_snapshot(&provider, Some(&credential)).is_none());
+        let catalog = subscription_model_catalog(&provider, Some(&credential));
+        assert!(!catalog.contains(&"gemini-future-high".into()));
+        assert!(catalog.contains(&"claude-opus-5-5-medium".into()));
+    }
+
+    #[test]
+    fn catalog_snapshot_successful_empty_replaces_previous_ids() {
+        let (provider, _) = google_provider("antigravity", "gemini-future");
+        let mut credential = crate::auth::StoredCredential {
+            access_token: Some("fixture-token".into()),
+            meta: json!({"project_id":"fixture-project"}),
+            ..Default::default()
+        };
+        let source =
+            catalog_source_for_runtime(&provider, &credential, &Default::default()).unwrap();
+        write_catalog_snapshot(
+            credential.meta.as_object_mut().unwrap(),
+            &["gemini-future-high".into()],
+            &source,
+        );
+        write_catalog_snapshot(credential.meta.as_object_mut().unwrap(), &[], &source);
+        assert_eq!(
+            credential_catalog_snapshot(&provider, Some(&credential)),
+            Some(Vec::new())
+        );
+        assert!(
+            subscription_model_catalog(&provider, Some(&credential))
+                .contains(&"gemini-3.8-flash-tiered".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn catalog_fetch_uses_explicit_endpoint_and_distinguishes_empty_from_failure() {
+        use axum::{Json, Router, extract::State, http::StatusCode, routing::post};
+        for (payload, status, success) in [
+            (json!({"models":{}}), StatusCode::OK, true),
+            (
+                json!({"models":{"gemini-fixture":{}}}),
+                StatusCode::OK,
+                true,
+            ),
+            (json!({}), StatusCode::OK, false),
+            (json!({"models":[]}), StatusCode::OK, false),
+            (json!({"models":{"":{}}}), StatusCode::OK, false),
+            (json!({"error":"NOT_FOUND"}), StatusCode::NOT_FOUND, false),
+        ] {
+            let app = Router::new()
+                .route(
+                    "/custom/v1internal:fetchAvailableModels",
+                    post(
+                        |State((payload, status)): State<(Value, StatusCode)>,
+                         headers: axum::http::HeaderMap,
+                         Json(body): Json<Value>| async move {
+                            assert_eq!(headers["authorization"], "Bearer fixture-token");
+                            assert_eq!(headers["user-agent"], "fixture-ua/7");
+                            assert_eq!(body, json!({"project":"fixture-project"}));
+                            (status, Json(payload))
+                        },
+                    ),
+                )
+                .with_state((payload.clone(), status));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let base_url = format!("http://{}/custom/", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let result = fetch_available_models(
+                &reqwest::Client::builder().no_proxy().build().unwrap(),
+                "fixture-token",
+                "fixture-project",
+                "fixture-ua/7",
+                &base_url,
+            )
+            .await;
+            server.abort();
+            assert_eq!(result.is_ok(), success, "{payload}: {result:?}");
+            if success {
+                assert_eq!(
+                    result.unwrap().is_empty(),
+                    payload["models"].as_object().unwrap().is_empty()
+                );
+            }
+        }
+    }
+
+    #[test]
     fn hub_manifest_version_parses_semver_from_updater_feed() {
         let feed = concat!(
             "version: 2.24.0\n",
@@ -1419,68 +1764,108 @@ mod tests {
     }
 
     #[test]
-    fn static_models_carry_gemini_4_argon() {
-        // Argon rides the subscription surface (rolled out 2026-10-13 to
-        // AI Pro/Ultra); the bare id plus the one advertised tier variant
-        // must survive discovery even when the dynamic catalog is stale.
-        assert!(ANTIGRAVITY_STATIC_MODELS.contains(&"gemini-4-argon"));
-        assert!(ANTIGRAVITY_STATIC_MODELS.contains(&"gemini-4-argon-high"));
-        // And it is not filtered as unavailable/usage noise anywhere.
-        assert!(!is_unavailable_subscription_model("gemini-4-argon"));
-        assert!(!is_unavailable_subscription_model("gemini-4-argon-high"));
+    fn static_models_carry_gemini_4_tier_variants_only() {
+        // Verified 2026-11-15 (Google AI Pro, daily host): every tier answers
+        // 200 while the bare family ids answer 404, so the curated fallback
+        // carries tier ids only and the bare ids stay virtual aliases.
+        for id in [
+            "gemini-4-hydrogen-xhigh",
+            "gemini-4-hydrogen-high",
+            "gemini-4-hydrogen-medium",
+            "gemini-4-hydrogen-low",
+            "gemini-4-argon-high",
+            "gemini-4-argon-medium",
+            "gemini-4-argon-low",
+        ] {
+            assert!(ANTIGRAVITY_STATIC_MODELS.contains(&id), "{id}");
+            assert!(!is_unavailable_subscription_model(id), "{id}");
+            assert!(is_tier_suffixed(id), "{id}");
+        }
+        for bare in ["gemini-4-hydrogen", "gemini-4-argon"] {
+            assert!(!ANTIGRAVITY_STATIC_MODELS.contains(&bare), "{bare}");
+            assert!(!is_tier_suffixed(bare), "{bare}");
+            assert_eq!(unified_tier_base(&format!("{bare}-xhigh")), Some(bare));
+        }
     }
 
     #[test]
-    fn argon_respects_catalog_gated_tier_rewrite() {
-        // Bare id served as-is (mirrors the fetched CLIProxyAPI registry)
-        // → never rewritten, whatever the effort.
-        let served: Vec<String> = ["gemini-4-argon", "gemini-4-argon-high"]
+    fn gemini_4_families_map_effort_onto_served_tiers() {
+        use crate::protocol::ir::ReasoningEffort::{High, Low, Max, Medium, Minimal, Xhigh};
+        let catalog: Vec<String> = ANTIGRAVITY_STATIC_MODELS
             .iter()
-            .map(|id| id.to_string())
+            .map(|id| (*id).to_string())
             .collect();
-        assert_eq!(
-            resolve_tiered_model(
-                "gemini-4-argon",
-                &reasoning(Some(crate::protocol::ir::ReasoningEffort::High)),
-                &served
-            ),
-            None
+        let pick = |model: &str, effort: crate::protocol::ir::ReasoningEffort| {
+            resolve_tiered_model(model, &reasoning(Some(effort)), &catalog)
+        };
+        for (effort, hydrogen, argon) in [
+            (Low, "low", "low"),
+            (Minimal, "low", "low"),
+            (crate::protocol::ir::ReasoningEffort::None, "low", "low"),
+            (Medium, "medium", "medium"),
+            (High, "high", "high"),
+            // Only Hydrogen serves -xhigh; Argon degrades to its top tier.
+            (Xhigh, "xhigh", "high"),
+            (Max, "xhigh", "high"),
+        ] {
+            assert_eq!(
+                pick("gemini-4-hydrogen", effort.clone()),
+                Some(format!("gemini-4-hydrogen-{hydrogen}")),
+                "{effort:?}"
+            );
+            assert_eq!(
+                pick("gemini-4-argon", effort.clone()),
+                Some(format!("gemini-4-argon-{argon}")),
+                "{effort:?}"
+            );
+        }
+        // No adaptive tier on either family: no directive → -medium (the
+        // account catalog's defaultAgentModelId is gemini-4-argon-medium).
+        for family in ["gemini-4-hydrogen", "gemini-4-argon"] {
+            assert_eq!(
+                resolve_tiered_model(family, &Default::default(), &catalog),
+                Some(format!("{family}-medium"))
+            );
+        }
+        // Explicit tier ids are never re-mapped, including -xhigh.
+        assert!(
+            resolve_tiered_model("gemini-4-hydrogen-xhigh", &reasoning(Some(Low)), &catalog)
+                .is_none()
         );
-        // Explicit tier id → caller's choice, never rewritten either.
-        assert_eq!(
-            resolve_tiered_model("gemini-4-argon-high", &reasoning(None), &served),
-            None
+        assert!(
+            resolve_tiered_model("gemini-4-argon-low", &reasoning(Some(Max)), &catalog).is_none()
         );
-        // If the account catalog only exposes `-high` while the bare id is
-        // absent (early rollout accounts), a high-effort request lands on
-        // it via the HIGH ladder.
-        let high_only: Vec<String> = ["gemini-4-argon-high"]
-            .iter()
-            .map(|id| id.to_string())
-            .collect();
+        // Flash and Claude keep -high for xhigh/max: they serve no -xhigh.
         assert_eq!(
-            resolve_tiered_model(
-                "gemini-4-argon",
-                &reasoning(Some(crate::protocol::ir::ReasoningEffort::High)),
-                &high_only
-            )
-            .as_deref(),
-            Some("gemini-4-argon-high")
-        );
-        // Lower efforts never get force-upgraded to a higher tier: their
-        // ladders do not include `-high`, so the rewrite fails safe and the
-        // bare id is sent as-is for upstream to answer honestly.
-        assert_eq!(
-            resolve_tiered_model(
-                "gemini-4-argon",
-                &reasoning(Some(crate::protocol::ir::ReasoningEffort::Low)),
-                &high_only
-            ),
-            None
+            pick("gemini-3.8-flash", Max).as_deref(),
+            Some("gemini-3.8-flash-high")
         );
         assert_eq!(
-            resolve_tiered_model("gemini-4-argon", &reasoning(None), &high_only),
-            None
+            pick("claude-opus-5-5", Xhigh).as_deref(),
+            Some("claude-opus-5-5-high")
+        );
+    }
+
+    #[test]
+    fn gemini_4_bare_aliases_resolve_before_discovery_and_rewrite_the_envelope() {
+        // Curated unified tiers back the bare alias even without a snapshot.
+        let (provider, mut body) = google_provider("antigravity", "gemini-4-hydrogen");
+        let catalog = subscription_model_catalog(&provider, None);
+        assert!(catalog.iter().any(|id| id == "gemini-4-hydrogen-xhigh"));
+        assert!(!catalog.iter().any(|id| id == "gemini-4-hydrogen"));
+        body["request"]["generationConfig"] = json!({"thinkingConfig": {"thinkingLevel": "high"}});
+        apply_tier_model_rewrite(
+            &provider,
+            None,
+            &reasoning(Some(crate::protocol::ir::ReasoningEffort::Xhigh)),
+            &mut body,
+        );
+        assert_eq!(body["model"], "gemini-4-hydrogen-xhigh");
+        // The id carries the effort; the inner thinking config is dropped.
+        assert!(
+            body["request"]["generationConfig"]
+                .get("thinkingConfig")
+                .is_none()
         );
     }
 
@@ -1855,6 +2240,45 @@ mod tests {
     }
 
     #[test]
+    fn parse_available_models_detailed_drops_disabled_placeholders() {
+        // Shape observed on a Google AI Pro promotional account: the plan
+        // excludes Argon, so the catalog carries a disabled placeholder that
+        // answers 404 NOT_FOUND instead of the servable tier ids.
+        let payload = json!({
+            "models": {
+                "gemini-4-argon-disabled": {
+                    "displayName": "Gemini 4 Argon",
+                    "disabled": true,
+                    "tagTitle": "Unavailable",
+                    "quotaInfo": {"remainingFraction": 1.0}
+                },
+                // Either signal alone is enough.
+                "Gemini-5-Preview-DISABLED": {},
+                "claude-opus-6": {"disabled": true},
+                // Explicitly enabled / malformed markers keep the row.
+                "gemini-3.8-flash-high": {"disabled": false},
+                "gemini-3.8-flash-low": {"disabled": "true"},
+                "claude-sonnet-4-6": {},
+                // Only the suffix counts, not the word anywhere in the id.
+                "gemini-disabled-preview": {},
+            }
+        });
+        let ids: Vec<String> = parse_available_models_detailed(&payload)
+            .into_iter()
+            .map(|model| model.id)
+            .collect();
+        assert_eq!(
+            ids,
+            vec![
+                "claude-sonnet-4-6".to_string(),
+                "gemini-3.8-flash-high".to_string(),
+                "gemini-3.8-flash-low".to_string(),
+                "gemini-disabled-preview".to_string(),
+            ]
+        );
+    }
+
+    #[test]
     fn unavailable_models_match_curated_and_chat_noise() {
         for model in [
             "gemini-2.5-flash-image",
@@ -1949,10 +2373,10 @@ mod tests {
                     "gemini-3.8-flash",
                     "gemini-3.8-flash-image-high",
                     "gemini-4-argon",
-                    "gemini-4-argon-high",
+                    "gemini-4-hydrogen",
                     "gpt-oss-120b-medium",
                 ],
-                "{channel} must collapse only the three exact families"
+                "{channel} must collapse only the exact unified families"
             );
         }
         let (mut provider, _) = google_provider("default", "gemini-3.8-flash");
@@ -1964,12 +2388,20 @@ mod tests {
 
     #[test]
     fn subscription_model_catalog_keeps_wire_ids_and_channel_specific_fallbacks() {
-        let credential = crate::auth::types::StoredCredential {
-            meta: json!({"subscription_models": ["gemini-3.8-flash-high", "gemini-future-high"]}),
+        let mut credential = crate::auth::types::StoredCredential {
+            access_token: Some("fixture-token".into()),
+            meta: json!({"project_id": "fixture-project"}),
             ..Default::default()
         };
         for channel in ["antigravity", "gemini-cli"] {
             let (provider, _) = google_provider(channel, "gemini-3.8-flash");
+            let source =
+                catalog_source_for_runtime(&provider, &credential, &Default::default()).unwrap();
+            write_catalog_snapshot(
+                credential.meta.as_object_mut().unwrap(),
+                &["gemini-3.8-flash-high".into(), "gemini-future-high".into()],
+                &source,
+            );
             let raw = subscription_model_catalog(&provider, Some(&credential));
             assert!(raw.iter().any(|id| id == "gemini-future-high"));
             assert!(raw.iter().any(|id| id == "gemini-3.8-flash-high"));

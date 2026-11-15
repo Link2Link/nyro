@@ -1152,13 +1152,8 @@ pub(crate) fn cloak(body: &mut Value, ctx: &CloakContext<'_>) -> Result<(), Stri
     body["system"] = Value::Array(system);
     inject_current_date(body, ctx.date, !explicit_cache);
 
-    if !probe && body.get("fallbacks").is_none() {
-        if is_opus_55(&model) {
-            body["fallbacks"] = json!([{"model": "claude-opus-4-8"}]);
-        } else if is_fable_51_model(&model) {
-            body["fallbacks"] = json!([{"model": "claude-opus-5"}]);
-        }
-    }
+    // Cross-model fallback is caller opt-in only. Preserve explicit fallbacks,
+    // but never synthesize a downgrade merely to imitate the CLI profile.
     if !probe
         && body.pointer("/thinking/display").is_none()
         && uses_progress_display(&model)

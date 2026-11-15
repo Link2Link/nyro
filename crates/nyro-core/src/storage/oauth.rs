@@ -51,6 +51,7 @@ pub(super) fn singleton(rows: &[OAuthCredential]) -> anyhow::Result<Option<OAuth
 pub(super) enum Mutation<'a> {
     Upsert(&'a UpsertOAuthCredential),
     Restore(i32, Option<&'a UpsertOAuthCredential>),
+    UpdateMeta(i32, &'a str),
     Delete,
     BeginRefresh(i32),
     CompleteRefresh(i32, &'a UpsertOAuthCredential),
@@ -288,6 +289,7 @@ pub(super) fn mutate(
                 if matches!(
                     action,
                     Mutation::Restore(..)
+                        | Mutation::UpdateMeta(..)
                         | Mutation::BeginRefresh(..)
                         | Mutation::CompleteRefresh(..)
                         | Mutation::FailRefresh(..)
@@ -322,7 +324,10 @@ pub(super) fn mutate(
     };
     let old_version = row.status_version;
     // Observation writes do not renew the age of an in-flight refresh lease.
-    if !matches!(action, Mutation::CompareState(..)) {
+    if !matches!(
+        action,
+        Mutation::CompareState(..) | Mutation::UpdateMeta(..)
+    ) {
         row.updated_at = now;
     }
     match action {
@@ -359,11 +364,23 @@ pub(super) fn mutate(
                 scrub(&mut row);
             }
         }
+        Mutation::UpdateMeta(version, meta) => {
+            if row.status != "connected" || old_version != *version {
+                return Ok(None);
+            }
+            anyhow::ensure!(meta.len() <= 65536, "OAuth metadata is too large");
+            let value: serde_json::Value = serde_json::from_str(meta)
+                .map_err(|_| anyhow::anyhow!("OAuth metadata must be a JSON object"))?;
+            anyhow::ensure!(value.is_object(), "OAuth metadata must be a JSON object");
+            row.meta = (*meta).into();
+        }
         Mutation::Delete | Mutation::Disconnect(_, _) => scrub(&mut row),
         Mutation::BeginRefresh(version) | Mutation::BeginAccountRefresh(_, version) => {
             if row.status != "connected" || old_version != *version {
                 return Ok(None);
             }
+            let meta = serde_json::from_str(&row.meta).unwrap_or(serde_json::Value::Null);
+            crate::auth::refresh_state::ensure_refresh_allowed(&meta, chrono::Utc::now())?;
             row.status = "refreshing".into();
         }
         Mutation::CompleteRefresh(version, input)
@@ -406,6 +423,38 @@ pub(super) fn mutate(
             anyhow::ensure!(value.is_object(), "Account state must be a JSON object");
             row.account_state = (*new_state).into();
             return Ok(Some(row));
+        }
+    }
+    if matches!(
+        action,
+        Mutation::Create(..)
+            | Mutation::Upsert(..)
+            | Mutation::Replace(..)
+            | Mutation::CompleteRefresh(..)
+            | Mutation::CompleteAccountRefresh(..)
+    ) {
+        // Refresh success removes its retry barrier but keeps its publication receipt.
+        // A new authorization cannot carry that receipt into a different generation.
+        // Compensation restores prior metadata verbatim, including barrier and receipt.
+        if let Ok(mut meta) = serde_json::from_str::<serde_json::Value>(&row.meta) {
+            let clear_publication = matches!(
+                action,
+                Mutation::Create(..) | Mutation::Upsert(..) | Mutation::Replace(..)
+            );
+            if meta
+                .get(crate::auth::refresh_state::REFRESH_RETRY_AT_KEY)
+                .is_some()
+                || clear_publication
+                    && meta
+                        .get(crate::auth::refresh_state::REFRESH_PUBLICATION_ID_KEY)
+                        .is_some()
+            {
+                crate::auth::refresh_state::clear_retry_at(&mut meta);
+                if clear_publication {
+                    crate::auth::refresh_state::clear_publication_id(&mut meta);
+                }
+                row.meta = meta.to_string();
+            }
         }
     }
     row.status_version = row

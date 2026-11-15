@@ -1,5 +1,6 @@
 //! Strict, payload-independent performance evidence. Historical rows never prove delivery.
 mod lifecycle;
+mod response_model;
 pub(crate) use lifecycle::{Attempt, ProducerGuard};
 
 /// Evidence verified by the native upstream wire parser, never by an IR Done
@@ -240,6 +241,8 @@ pub(crate) struct Terminal {
     // Only selected from the configured upstream vendor + egress protocol,
     // never inferred from a model name or response body.
     allow_chat_eof: bool,
+    // Enabled only for the routed Anthropic egress; shares bounded wire framing.
+    response_model: Option<response_model::ClaudeResponseModel>,
     finished: bool,
 }
 impl Terminal {
@@ -334,6 +337,9 @@ impl Terminal {
                 self.json(v);
             }
             return;
+        }
+        if let Some(model) = self.response_model.as_mut() {
+            model.observe(value);
         }
         if value.get("error").is_some_and(|e| !e.is_null()) {
             self.reason("error");

@@ -68,7 +68,7 @@ const GEMINI_CLI_CLIENT_SECRET: &str = "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";
 const GOOGLE_USERINFO_URL: &str = "https://www.googleapis.com/oauth2/v2/userinfo";
 
 /// Code Assist control-plane host for antigravity onboarding. Inference
-/// always hits prod; the Antigravity IDE onboardUser uses the daily- host.
+/// defaults to daily; the Antigravity IDE onboardUser also uses that host.
 /// The Gemini CLI onboardUser stays on the prod host (sub2api behavior).
 const ANTIGRAVITY_DAILY_API_BASE_URL: &str = "https://daily-cloudcode-pa.googleapis.com";
 
@@ -77,6 +77,10 @@ const SESSION_TTL_SECONDS: i64 = 10 * 60;
 /// onboardUser polling: attempts × delay (mirrors CLIProxyAPI / sub2api).
 const ONBOARD_MAX_ATTEMPTS: usize = 5;
 const ONBOARD_POLL_DELAY_MS: u64 = 2_000;
+// Leave headroom under the parent's 25-second refresh deadline. Only refresh
+// uses these budgets; first-login exchange keeps its onboarding behavior.
+const REFRESH_TOKEN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+const REFRESH_ENRICHMENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Which Google subscription surface a driver instance talks to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -253,6 +257,8 @@ impl GoogleSubscriptionDriver {
                 "tier_id",
                 "tier_ineligible",
                 "subscription_models",
+                "subscription_models_source",
+                "subscription_endpoint",
             ] {
                 if let Some(value) = prior.get(key).filter(|v| !v.is_null()) {
                     meta.insert(key.to_string(), value.clone());
@@ -461,6 +467,71 @@ impl GoogleSubscriptionDriver {
         Ok((project, tier_summary))
     }
 
+    /// Once token refresh succeeds, optional project/catalog requests cannot
+    /// invalidate that success. One shared budget bounds both phases; a missing
+    /// project remains an explicit request-time diagnostic, not a lost token.
+    async fn enrich_refresh_bundle(
+        &self,
+        client: &reqwest::Client,
+        config: &SubscriptionConfig,
+        bundle: &mut CredentialBundle,
+        runtime_endpoint: Option<&str>,
+    ) {
+        let enrichment = async {
+            let has_project_id = bundle
+                .raw
+                .get("project_id")
+                .and_then(Value::as_str)
+                .is_some_and(|value| !value.trim().is_empty());
+            let access_token = bundle.access_token.clone().unwrap_or_default();
+            if !has_project_id {
+                let (project_id, tier_summary) = self
+                    .resolve_project_id(client, config, &access_token, Some(&bundle.raw))
+                    .await?;
+                if let Some(meta) = bundle.raw.as_object_mut() {
+                    meta.insert("project_id".into(), Value::String(project_id));
+                    if let Some(tier) = effective_tier_id(&tier_summary) {
+                        meta.insert("tier_id".into(), Value::String(tier));
+                    }
+                    if let Some(note) = ineligible_tier_note(&tier_summary) {
+                        meta.insert("tier_ineligible".into(), Value::String(note));
+                    }
+                }
+            }
+            if let Some(project_id) = bundle
+                .raw
+                .get("project_id")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToString::to_string)
+                && let Some(meta) = bundle.raw.as_object_mut()
+            {
+                self.attach_catalog_snapshot(
+                    client,
+                    &access_token,
+                    &project_id,
+                    runtime_endpoint,
+                    meta,
+                )
+                .await;
+            }
+            Ok::<(), anyhow::Error>(())
+        };
+        match tokio::time::timeout(REFRESH_ENRICHMENT_TIMEOUT, enrichment).await {
+            Ok(Ok(())) => {}
+            // Do not log raw upstream payloads or credentials for best-effort work.
+            Ok(Err(_)) => tracing::debug!(
+                driver = self.metadata_key(),
+                "Google refresh enrichment failed; preserving successful token bundle"
+            ),
+            Err(_) => tracing::debug!(
+                driver = self.metadata_key(),
+                "Google refresh enrichment timed out; preserving successful token bundle"
+            ),
+        }
+    }
+
     /// Best-effort account catalog snapshot into the credential meta; powers
     /// the antigravity effort→tier model rewrite (`subscription_models`).
     /// Never fails the calling flow; keeps the prior snapshot on error.
@@ -469,28 +540,37 @@ impl GoogleSubscriptionDriver {
         client: &reqwest::Client,
         access_token: &str,
         project_id: &str,
+        runtime_endpoint: Option<&str>,
         meta: &mut serde_json::Map<String, Value>,
     ) {
-        if self.channel != GoogleSubscriptionChannel::Antigravity {
-            return;
-        }
-        let Ok(models) = crate::provider::google::antigravity::fetch_available_models(
+        use crate::provider::google::antigravity::{
+            ANTIGRAVITY_INFERENCE_BASE_URL, CatalogSource, GOOGLE_SUBSCRIPTION_PROD_BASE_URL,
+            fetch_available_models, write_catalog_snapshot,
+        };
+        // Auth contexts have no provider row yet. Use the same channel default
+        // or explicit credential opt-in; admin discovery uses the bound runtime.
+        let endpoint = runtime_endpoint
+            .or_else(|| meta.get("subscription_endpoint").and_then(Value::as_str))
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or(match self.channel {
+                GoogleSubscriptionChannel::Antigravity => ANTIGRAVITY_INFERENCE_BASE_URL,
+                GoogleSubscriptionChannel::GeminiCli => GOOGLE_SUBSCRIPTION_PROD_BASE_URL,
+            });
+        let source = CatalogSource::new(endpoint, project_id, &self.user_agent(), access_token);
+        let Ok(models) = fetch_available_models(
             client,
             access_token,
             project_id,
-            &self.user_agent(),
+            &source.user_agent,
+            &source.endpoint,
         )
         .await
         else {
             return;
         };
-        let ids: Vec<Value> = models
-            .into_iter()
-            .map(|model| Value::String(model.id))
-            .collect();
-        if !ids.is_empty() {
-            meta.insert("subscription_models".to_string(), Value::Array(ids));
-        }
+        let ids = models.into_iter().map(|model| model.id).collect::<Vec<_>>();
+        write_catalog_snapshot(meta, &ids, &source);
     }
 }
 
@@ -732,7 +812,7 @@ impl AuthDriver for GoogleSubscriptionDriver {
             if let Some(note) = ineligible_tier_note(&tier_summary) {
                 meta.insert("tier_ineligible".to_string(), Value::String(note));
             }
-            self.attach_catalog_snapshot(&client, &access_token, &project_id, meta)
+            self.attach_catalog_snapshot(&client, &access_token, &project_id, None, meta)
                 .await;
         }
 
@@ -754,8 +834,9 @@ impl AuthDriver for GoogleSubscriptionDriver {
             .ok_or_else(|| anyhow!("{driver_label} refresh token is missing"))?;
         let client = required_http_client(ctx.http_client)?;
 
-        let token = self
-            .token_request(
+        let token = tokio::time::timeout(
+            REFRESH_TOKEN_TIMEOUT,
+            self.token_request(
                 &client,
                 config.oauth.token_url,
                 &[
@@ -764,61 +845,32 @@ impl AuthDriver for GoogleSubscriptionDriver {
                     ("client_id", config.oauth.client_id),
                     ("client_secret", self.client_secret()),
                 ],
-            )
-            .await?;
+            ),
+        )
+        .await
+        .map_err(|_| anyhow!("{driver_label} token refresh timed out"))??;
 
         let mut bundle = Self::build_bundle(token, Some(&credential.meta), &config)?;
         if bundle.refresh_token.is_none() {
             bundle.refresh_token = Some(refresh_token.to_string());
         }
 
-        // The project id is required at request time; if prior metadata lost
-        // it (e.g. credential written by an older build), recover it now.
-        let has_project_id = bundle
-            .raw
-            .get("project_id")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .is_some_and(|value| !value.is_empty());
-        if !has_project_id {
-            let access_token = bundle.access_token.clone().unwrap_or_default();
-            let (project_id, tier_summary) = self
-                .resolve_project_id(&client, &config, &access_token, Some(&credential.meta))
-                .await?;
-            if let Some(meta) = bundle.raw.as_object_mut() {
-                meta.insert("project_id".to_string(), Value::String(project_id));
-                if let Some(tier) = effective_tier_id(&tier_summary) {
-                    meta.insert("tier_id".to_string(), Value::String(tier));
-                }
-                if let Some(note) = ineligible_tier_note(&tier_summary) {
-                    meta.insert("tier_ineligible".to_string(), Value::String(note));
-                }
-            }
-        }
-
-        // Refresh the account catalog snapshot (powers effort→tier model
-        // rewrites); best-effort — the prior snapshot survives on failure.
-        if let Some(project_id) = bundle
-            .raw
-            .get("project_id")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(ToString::to_string)
-        {
-            let token = bundle.access_token.clone().unwrap_or_default();
-            if let Some(meta) = bundle.raw.as_object_mut() {
-                self.attach_catalog_snapshot(&client, &token, &project_id, meta)
-                    .await;
-            }
-        }
+        self.enrich_refresh_bundle(
+            &client,
+            &config,
+            &mut bundle,
+            ctx.metadata
+                .get("google_subscription_endpoint")
+                .and_then(Value::as_str),
+        )
+        .await;
 
         Ok(bundle)
     }
 
     fn bind_runtime(
         &self,
-        _provider: &Provider,
+        provider: &Provider,
         credential: &StoredCredential,
     ) -> Result<RuntimeBinding> {
         let config = self.channel_config()?;
@@ -862,18 +914,11 @@ impl AuthDriver for GoogleSubscriptionDriver {
         // dynamic catalog and the static list take priority over it.
         let models_source_override = Some("ai://models.dev/google".to_string());
 
-        // Inference host: consumer (Google AI Pro/Ultra) credentials on the
-        // antigravity channel MUST hit the daily host — the prod host parks
-        // them in the free consumer pool where mainline models are
-        // tier-gated to 429. Control-plane calls in this driver
-        // (`load_code_assist`) keep using the channel's prod api_base_url.
-        // The gemini-cli channel (GCP Code Assist) stays on prod.
-        let inference_base_url = match self.channel {
-            GoogleSubscriptionChannel::Antigravity => {
-                crate::provider::google::antigravity::ANTIGRAVITY_INFERENCE_BASE_URL
-            }
-            GoogleSubscriptionChannel::GeminiCli => config.api_base_url,
-        };
+        // Catalog and inference share the same endpoint policy. Onboarding
+        // control-plane calls keep their separate host selection.
+        let inference_base_url =
+            crate::provider::google::antigravity::subscription_endpoint(provider, Some(credential))
+                .base_url;
 
         Ok(RuntimeBinding {
             base_url_override: Some(inference_base_url.to_string()),
@@ -922,6 +967,266 @@ mod tests {
             meta: json!({"project_id": "cloudaicompanion-123"}),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn google_catalog_runtime_honors_explicit_endpoint_without_changing_legacy_default() {
+        for (channel, driver, expected) in [
+            (
+                "antigravity",
+                GoogleSubscriptionDriver::ANTIGRAVITY,
+                crate::provider::google::antigravity::ANTIGRAVITY_INFERENCE_BASE_URL,
+            ),
+            (
+                "gemini-cli",
+                GoogleSubscriptionDriver::GEMINI_CLI,
+                "https://cloudcode-pa.googleapis.com",
+            ),
+        ] {
+            let mut provider = test_provider(channel);
+            provider.base_url = "https://cloudcode-pa.googleapis.com".into();
+            let mut credential = stored_credential();
+            assert_eq!(
+                driver
+                    .bind_runtime(&provider, &credential)
+                    .unwrap()
+                    .base_url_override
+                    .as_deref(),
+                Some(expected)
+            );
+            provider.base_url = "http://127.0.0.1:12345/custom/".into();
+            assert_eq!(
+                driver
+                    .bind_runtime(&provider, &credential)
+                    .unwrap()
+                    .base_url_override
+                    .as_deref(),
+                Some("http://127.0.0.1:12345/custom")
+            );
+            credential.meta["subscription_endpoint"] = json!("https://cloudcode-pa.googleapis.com");
+            assert_eq!(
+                driver
+                    .bind_runtime(&provider, &credential)
+                    .unwrap()
+                    .base_url_override
+                    .as_deref(),
+                Some("https://cloudcode-pa.googleapis.com")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn google_catalog_auth_snapshot_matches_admin_source_and_empty_failure_semantics() {
+        use crate::provider::google::antigravity::{
+            catalog_source_for_runtime, write_catalog_snapshot,
+        };
+        for (channel, driver) in [
+            ("antigravity", GoogleSubscriptionDriver::ANTIGRAVITY),
+            ("gemini-cli", GoogleSubscriptionDriver::GEMINI_CLI),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = format!("http://{}", listener.local_addr().unwrap());
+            let app = axum::Router::new().route(
+                "/v1internal:fetchAvailableModels",
+                axum::routing::post(|axum::Json(body): axum::Json<Value>| async move {
+                    if body["project"] == "failure" {
+                        (axum::http::StatusCode::NOT_FOUND, axum::Json(json!({})))
+                    } else {
+                        (axum::http::StatusCode::OK, axum::Json(json!({"models":{}})))
+                    }
+                }),
+            );
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let client = reqwest::Client::builder().no_proxy().build().unwrap();
+            let mut provider = test_provider(channel);
+            provider.base_url = endpoint.clone();
+            let mut credential = stored_credential();
+            let binding = driver.bind_runtime(&provider, &credential).unwrap();
+            let source = catalog_source_for_runtime(&provider, &credential, &binding).unwrap();
+            write_catalog_snapshot(
+                credential.meta.as_object_mut().unwrap(),
+                &["prior-model".into()],
+                &source,
+            );
+            let mut meta = credential.meta.as_object().unwrap().clone();
+            driver
+                .attach_catalog_snapshot(
+                    &client,
+                    "ya29.token",
+                    "failure",
+                    Some(&endpoint),
+                    &mut meta,
+                )
+                .await;
+            assert_eq!(
+                meta,
+                credential.meta.as_object().unwrap().clone(),
+                "failure must retain prior source without relabeling"
+            );
+            driver
+                .attach_catalog_snapshot(
+                    &client,
+                    "ya29.token",
+                    "cloudaicompanion-123",
+                    Some(&endpoint),
+                    &mut meta,
+                )
+                .await;
+            server.abort();
+            write_catalog_snapshot(credential.meta.as_object_mut().unwrap(), &[], &source);
+            assert_eq!(
+                meta,
+                credential.meta.as_object().unwrap().clone(),
+                "auth and admin use identical snapshot format"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn google_catalog_refresh_enrichment_timeout_preserves_successful_tokens() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let captured = calls.clone();
+        let app = axum::Router::new().route(
+            "/v1internal:fetchAvailableModels",
+            axum::routing::post(
+                move |headers: axum::http::HeaderMap, axum::Json(body): axum::Json<Value>| {
+                    let calls = captured.clone();
+                    async move {
+                        assert_eq!(headers["authorization"], "Bearer newly-rotated-access");
+                        assert_eq!(body["project"], "fixture-project");
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        // Never answer: only the production enrichment budget can
+                        // finish this flow, before the parent's 25-second deadline.
+                        std::future::pending::<axum::Json<Value>>().await
+                    }
+                },
+            ),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let driver = GoogleSubscriptionDriver::GEMINI_CLI;
+        let config = driver.channel_config().unwrap();
+        let prior = json!({"project_id":"fixture-project", "subscription_models":["prior-model"],
+            "subscription_models_source":{"credential_fingerprint":"prior-token"}});
+        let mut bundle = GoogleSubscriptionDriver::build_bundle(
+            GoogleTokenResponse {
+                access_token: Some("newly-rotated-access".into()),
+                refresh_token: Some("newly-rotated-refresh".into()),
+                expires_in: Some(3600),
+                scope: None,
+            },
+            Some(&prior),
+            &config,
+        )
+        .unwrap();
+        let expected = serde_json::to_value(&bundle).unwrap();
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let completed = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            driver.enrich_refresh_bundle(&client, &config, &mut bundle, Some(&endpoint)),
+        )
+        .await;
+        server.abort();
+        assert!(
+            completed.is_ok(),
+            "optional catalog must not consume the parent refresh deadline"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            serde_json::to_value(&bundle).unwrap(),
+            expected,
+            "a slow catalog cannot discard the successful token bundle or relabel the prior source"
+        );
+        assert_eq!(REFRESH_TOKEN_TIMEOUT, std::time::Duration::from_secs(20));
+        assert_eq!(
+            REFRESH_ENRICHMENT_TIMEOUT,
+            std::time::Duration::from_secs(2)
+        );
+        assert!(
+            REFRESH_TOKEN_TIMEOUT + REFRESH_ENRICHMENT_TIMEOUT < std::time::Duration::from_secs(25)
+        );
+    }
+
+    #[tokio::test]
+    async fn google_catalog_refresh_project_recovery_failure_preserves_successful_tokens() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let captured = calls.clone();
+        let app = axum::Router::new().fallback(move || {
+            captured.fetch_add(1, Ordering::SeqCst);
+            async { axum::http::StatusCode::SERVICE_UNAVAILABLE }
+        });
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        // All requests, even a mistaken endpoint, terminate on the fixture.
+        // The helper skips token/Hub preparation entirely.
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .proxy(reqwest::Proxy::all(&endpoint).unwrap())
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+        let driver = GoogleSubscriptionDriver::GEMINI_CLI;
+        let mut config = driver.channel_config().unwrap();
+        config.api_base_url = "http://project-fixture.invalid";
+        let mut bundle = GoogleSubscriptionDriver::build_bundle(
+            GoogleTokenResponse {
+                access_token: Some("newly-rotated-access".into()),
+                refresh_token: Some("newly-rotated-refresh".into()),
+                expires_in: Some(3600),
+                scope: None,
+            },
+            None,
+            &config,
+        )
+        .unwrap();
+        let expected = serde_json::to_value(&bundle).unwrap();
+        driver
+            .enrich_refresh_bundle(&client, &config, &mut bundle, Some(&endpoint))
+            .await;
+        server.abort();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(serde_json::to_value(&bundle).unwrap(), expected);
+        assert!(
+            bundle.raw.get("project_id").is_none(),
+            "missing project remains diagnostic, not a failed token refresh"
+        );
+    }
+
+    #[test]
+    fn google_catalog_refresh_does_not_relabel_prior_snapshot_for_new_token() {
+        let config = GoogleSubscriptionDriver::ANTIGRAVITY
+            .channel_config()
+            .unwrap();
+        let prior = json!({"project_id":"fixture-project", "subscription_endpoint":"https://override.invalid", "subscription_models":["old"], "subscription_models_source":{"credential_fingerprint":"old"}});
+        let bundle = GoogleSubscriptionDriver::build_bundle(
+            GoogleTokenResponse {
+                access_token: Some("new-token".into()),
+                refresh_token: None,
+                expires_in: None,
+                scope: None,
+            },
+            Some(&prior),
+            &config,
+        )
+        .unwrap();
+        assert_eq!(
+            bundle.raw["subscription_endpoint"],
+            prior["subscription_endpoint"]
+        );
+        assert_eq!(
+            bundle.raw["subscription_models_source"],
+            prior["subscription_models_source"]
+        );
     }
 
     #[test]
@@ -1126,12 +1431,14 @@ mod tests {
             Some("ai://models.dev/google")
         );
         let models = binding.static_models_override.unwrap();
-        // Active catalog generations only: 3.8 flash tiers and Argon.
+        // Active catalog generations only: 3.8 flash tiers and Gemini 4.
         assert!(models.iter().any(|m| m == "gemini-3.8-flash-high"));
         assert!(models.iter().any(|m| m == "gemini-3.8-flash-tiered"));
-        // Gemini 4 Argon rides the subscription surface as of 2026-10.
-        assert!(models.iter().any(|m| m == "gemini-4-argon"));
+        // Gemini 4 Argon / Hydrogen serve tier ids only (bare ids 404).
         assert!(models.iter().any(|m| m == "gemini-4-argon-high"));
+        assert!(models.iter().any(|m| m == "gemini-4-hydrogen-xhigh"));
+        assert!(!models.iter().any(|m| m == "gemini-4-argon"));
+        assert!(!models.iter().any(|m| m == "gemini-4-hydrogen"));
         // Retired lines stay out of the fallback list — dynamic discovery
         // resurfaces them per-account when still served.
         assert!(!models.iter().any(|m| *m == "gemini-2.5-pro"));

@@ -46,10 +46,20 @@ const MAX_BUFFERED_DELTAS: usize = 2048;
 
 /// Whitelist of terminations that are known transient sampling glitches when
 /// they arrive with zero payload: one replay may recover before target
-/// failover. Deliberately narrow — SAFETY, RECITATION and
-/// every other finish reason keep today's pass-through behavior.
+/// failover. Besides MALFORMED_FUNCTION_CALL, Gemini 4 (Hydrogen) traffic on
+/// the Code Assist surface also ends zero-output turns with
+/// UNEXPECTED_TOOL_CALL / MALFORMED_RESPONSE (CLIProxyAPI #7513 handles the
+/// same three). Deliberately narrow — SAFETY, RECITATION and every other
+/// finish reason keep today's pass-through behavior, and a terminal that
+/// carries any payload is never replayed.
 pub(super) fn is_transient_stream_terminal(stop_reason: &str) -> bool {
-    stop_reason.eq_ignore_ascii_case("malformed_function_call")
+    [
+        "malformed_function_call",
+        "unexpected_tool_call",
+        "malformed_response",
+    ]
+    .iter()
+    .any(|reason| stop_reason.eq_ignore_ascii_case(reason))
 }
 
 /// Whether one decoded delta carries actual model output. Message framing,
@@ -562,27 +572,38 @@ mod tests {
 
     #[tokio::test]
     async fn eof_only_malformed_terminal_is_rejected_before_commit() {
-        let result = probe_eof(Ok(vec![
-            AiStreamDelta::ThinkingSignature("signature-only".into()),
-            AiStreamDelta::Usage(Usage {
-                prompt_tokens: 10,
-                completion_tokens: 3,
-                ..Usage::default()
-            }),
-            done("MALFORMED_FUNCTION_CALL"),
-        ]))
-        .await;
-        let ProbeOutcome::TransientZeroPayload(failure) = result else {
-            panic!("EOF terminal must fail before committing");
-        };
-        assert_eq!(failure.stop_reason, "MALFORMED_FUNCTION_CALL");
-        assert_eq!(failure.usage.prompt_tokens, 10);
-        assert_eq!(failure.usage.completion_tokens, 3);
+        for reason in [
+            "MALFORMED_FUNCTION_CALL",
+            "UNEXPECTED_TOOL_CALL",
+            "MALFORMED_RESPONSE",
+        ] {
+            let result = probe_eof(Ok(vec![
+                AiStreamDelta::ThinkingSignature("signature-only".into()),
+                AiStreamDelta::Usage(Usage {
+                    prompt_tokens: 10,
+                    completion_tokens: 3,
+                    ..Usage::default()
+                }),
+                done(reason),
+            ]))
+            .await;
+            let ProbeOutcome::TransientZeroPayload(failure) = result else {
+                panic!("EOF {reason} terminal must fail before committing");
+            };
+            assert_eq!(failure.stop_reason, reason);
+            assert_eq!(failure.usage.prompt_tokens, 10);
+            assert_eq!(failure.usage.completion_tokens, 3);
+        }
     }
 
     #[tokio::test]
     async fn eof_payload_and_normal_terminals_are_replayed_once() {
-        for reason in ["stop", "SAFETY", "MALFORMED_FUNCTION_CALL"] {
+        for reason in [
+            "stop",
+            "SAFETY",
+            "MALFORMED_FUNCTION_CALL",
+            "UNEXPECTED_TOOL_CALL",
+        ] {
             let result = probe_eof(Ok(vec![
                 AiStreamDelta::TextDelta("answer".into()),
                 done(reason),
@@ -637,6 +658,8 @@ mod tests {
         assert!(is_transient_stream_terminal("malformed_function_call"));
         assert!(is_transient_stream_terminal("MALFORMED_FUNCTION_CALL"));
         assert!(is_transient_stream_terminal("Malformed_Function_Call"));
+        assert!(is_transient_stream_terminal("UNEXPECTED_TOOL_CALL"));
+        assert!(is_transient_stream_terminal("MALFORMED_RESPONSE"));
         // Everything else — including neighbouring Google finish reasons —
         // must keep the pass-through behavior.
         for reason in [
@@ -648,6 +671,9 @@ mod tests {
             "error",
             "malformed_function",
             "malformed_function_calls",
+            "unexpected_tool_calls",
+            "malformed",
+            "TOO_MANY_TOOL_CALLS",
             "",
         ] {
             assert!(

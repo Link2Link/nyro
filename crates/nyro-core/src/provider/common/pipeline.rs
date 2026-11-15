@@ -1625,7 +1625,14 @@ mod tests {
                     credential.driver_key = "google-gemini-cli".into();
                 }
                 if let Some(snapshot) = snapshot {
-                    credential.meta["subscription_models"] = snapshot.clone();
+                    use crate::provider::google::antigravity::{
+                        catalog_source_for_runtime, write_catalog_snapshot,
+                    };
+                    let source =
+                        catalog_source_for_runtime(&provider, &credential, &Default::default())
+                            .unwrap();
+                    let ids: Vec<String> = serde_json::from_value(snapshot.clone()).unwrap();
+                    write_catalog_snapshot(credential.meta.as_object_mut().unwrap(), &ids, &source);
                 }
                 for (model, default_suffix) in [
                     ("claude-opus-5-5", "medium"),

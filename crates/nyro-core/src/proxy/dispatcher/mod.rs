@@ -2247,14 +2247,14 @@ async fn dispatch_pipeline_inner(
                 let reason = if compat_replay {
                     "upstream_read_error_before_first_event"
                 } else {
-                    "malformed_function_call"
+                    "zero_output_terminal"
                 };
                 ctx.trace(
                     "retry",
                     if compat_replay {
                         "Grok transport read failed before a complete event; replaying the stateless request once"
                     } else {
-                        "MALFORMED_FUNCTION_CALL without output; replaying the same target once"
+                        "Gemini zero-output terminal (MALFORMED_FUNCTION_CALL / UNEXPECTED_TOOL_CALL / MALFORMED_RESPONSE); replaying the same target once"
                     },
                 );
                 tracing::info!(

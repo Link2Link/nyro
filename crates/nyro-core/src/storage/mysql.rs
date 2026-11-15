@@ -251,29 +251,39 @@ impl MysqlOAuthCredentialStore {
             action,
         )?;
         if let Some(row) = &row {
-            sqlx::query("INSERT INTO provider_oauth_credentials (account_id, provider_id, label, is_enabled, priority, account_state, driver_key, scheme, access_token, refresh_token, expires_at, resource_url, subject_id, scopes, meta, status, status_version, last_error, last_refresh_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON DUPLICATE KEY UPDATE label=VALUES(label), is_enabled=VALUES(is_enabled), priority=VALUES(priority), account_state=VALUES(account_state), driver_key=VALUES(driver_key), scheme=VALUES(scheme), access_token=VALUES(access_token), refresh_token=VALUES(refresh_token), expires_at=VALUES(expires_at), resource_url=VALUES(resource_url), subject_id=VALUES(subject_id), scopes=VALUES(scopes), meta=VALUES(meta), status=VALUES(status), status_version=VALUES(status_version), last_error=VALUES(last_error), last_refresh_at=VALUES(last_refresh_at), updated_at=VALUES(updated_at)")
-            .bind(&row.account_id)
-            .bind(&row.provider_id)
-            .bind(&row.label)
-            .bind(row.is_enabled)
-            .bind(row.priority)
-            .bind(&row.account_state)
-            .bind(&row.driver_key)
-            .bind(&row.scheme)
-            .bind(&row.access_token)
-            .bind(&row.refresh_token)
-            .bind(crate::storage::oauth::mysql_expiry(row.expires_at.as_deref())?)
-            .bind(&row.resource_url)
-            .bind(&row.subject_id)
-            .bind(&row.scopes)
-            .bind(&row.meta)
-            .bind(&row.status)
-            .bind(row.status_version)
-            .bind(&row.last_error)
-            .bind(&row.last_refresh_at)
-            .bind(&row.created_at)
-            .bind(&row.updated_at)
-            .execute(&mut *tx).await?;
+            if matches!(action, crate::storage::oauth::Mutation::UpdateMeta(..)) {
+                // Metadata observations must not rewrite tokens, account state or timestamps.
+                sqlx::query("UPDATE provider_oauth_credentials SET meta = ?, status_version = ?, updated_at = updated_at WHERE account_id = ?")
+                    .bind(&row.meta)
+                    .bind(row.status_version)
+                    .bind(&row.account_id)
+                    .execute(&mut *tx)
+                    .await?;
+            } else {
+                sqlx::query("INSERT INTO provider_oauth_credentials (account_id, provider_id, label, is_enabled, priority, account_state, driver_key, scheme, access_token, refresh_token, expires_at, resource_url, subject_id, scopes, meta, status, status_version, last_error, last_refresh_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON DUPLICATE KEY UPDATE label=VALUES(label), is_enabled=VALUES(is_enabled), priority=VALUES(priority), account_state=VALUES(account_state), driver_key=VALUES(driver_key), scheme=VALUES(scheme), access_token=VALUES(access_token), refresh_token=VALUES(refresh_token), expires_at=VALUES(expires_at), resource_url=VALUES(resource_url), subject_id=VALUES(subject_id), scopes=VALUES(scopes), meta=VALUES(meta), status=VALUES(status), status_version=VALUES(status_version), last_error=VALUES(last_error), last_refresh_at=VALUES(last_refresh_at), updated_at=VALUES(updated_at)")
+                .bind(&row.account_id)
+                .bind(&row.provider_id)
+                .bind(&row.label)
+                .bind(row.is_enabled)
+                .bind(row.priority)
+                .bind(&row.account_state)
+                .bind(&row.driver_key)
+                .bind(&row.scheme)
+                .bind(&row.access_token)
+                .bind(&row.refresh_token)
+                .bind(crate::storage::oauth::mysql_expiry(row.expires_at.as_deref())?)
+                .bind(&row.resource_url)
+                .bind(&row.subject_id)
+                .bind(&row.scopes)
+                .bind(&row.meta)
+                .bind(&row.status)
+                .bind(row.status_version)
+                .bind(&row.last_error)
+                .bind(&row.last_refresh_at)
+                .bind(&row.created_at)
+                .bind(&row.updated_at)
+                .execute(&mut *tx).await?;
+            }
         }
         // Read back the exact SQL representation while retaining row locks.
         let row = if let Some(row) = row {
@@ -408,6 +418,18 @@ impl OAuthCredentialStore for MysqlOAuthCredentialStore {
             .await?
             .is_some())
     }
+    async fn update_meta_if_version(
+        &self,
+        provider_id: &str,
+        expected_version: i32,
+        meta: &str,
+    ) -> anyhow::Result<Option<OAuthCredential>> {
+        self.mutate(
+            provider_id,
+            crate::storage::oauth::Mutation::UpdateMeta(expected_version, meta),
+        )
+        .await
+    }
     async fn delete(&self, provider_id: &str) -> anyhow::Result<()> {
         self.mutate(provider_id, crate::storage::oauth::Mutation::Delete)
             .await?;
@@ -521,10 +543,13 @@ impl OAuthCredentialStore for MysqlOAuthCredentialStore {
     }
 
     async fn recover_stale_refreshing(&self, timeout: Duration) -> anyhow::Result<u64> {
+        // Match Rust normalization for ASCII whitespace at the edges. Mapping
+        // controls to spaces (rather than deleting them) keeps internal whitespace invalid.
         let seconds = i64::try_from(timeout.as_secs()).unwrap_or(i64::MAX);
         let result = sqlx::query(
-            "UPDATE provider_oauth_credentials SET status='connected', last_error=?, status_version=status_version+1, updated_at=NOW() WHERE status='refreshing' AND updated_at + INTERVAL ? SECOND < NOW()",
+            "UPDATE provider_oauth_credentials SET status=CASE WHEN LOWER(TRIM(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(driver_key, CHAR(9), ' '), CHAR(10), ' '), CHAR(11), ' '), CHAR(12), ' '), CHAR(13), ' '))) IN ('codex', 'openai', 'openai-oauth', 'openai_oauth', 'codex-cli') THEN 'error' ELSE 'connected' END, last_error=CASE WHEN LOWER(TRIM(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(driver_key, CHAR(9), ' '), CHAR(10), ' '), CHAR(11), ' '), CHAR(12), ' '), CHAR(13), ' '))) IN ('codex', 'openai', 'openai-oauth', 'openai_oauth', 'codex-cli') THEN ? ELSE ? END, status_version=status_version+1, updated_at=NOW() WHERE status='refreshing' AND updated_at + INTERVAL ? SECOND < NOW()",
         )
+        .bind(crate::auth::refresh_state::OUTCOME_UNKNOWN_MESSAGE)
         .bind(crate::storage::oauth::STALE_REFRESH_ERROR)
         .bind(seconds)
         .execute(&self.pool)
