@@ -124,7 +124,7 @@ pub(super) async fn handle_non_stream(
         )
             .into_response();
         response.headers_mut().extend(response_metadata);
-        super::mark_entitlement_refusal(&mut response, status, &resp);
+        super::mark_upstream_error(&mut response, status, &resp);
         return response;
     }
 
@@ -1317,7 +1317,7 @@ pub(super) async fn handle_non_stream_via_upstream_stream(
             Json(&err_body),
         )
             .into_response();
-        super::mark_entitlement_refusal(&mut response, status, &err_body);
+        super::mark_upstream_error(&mut response, status, &err_body);
         return response;
     }
 

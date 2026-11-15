@@ -171,6 +171,13 @@ pub enum GatewayError {
     /// The requested provider is not registered or is misconfigured.
     ProviderUnavailable { provider: String, reason: String },
 
+    /// Every route target was skipped by a scoped quota/admission gate.
+    /// `detail` is gateway-built from allowlisted reasons, never upstream text.
+    QuotaUnavailable {
+        detail: String,
+        retry_after_secs: Option<u64>,
+    },
+
     /// An unexpected internal error. Use sparingly; prefer a specific variant.
     Internal { source: anyhow::Error },
 }
@@ -195,7 +202,9 @@ impl GatewayError {
             GatewayError::ClientCancelled => {
                 StatusCode::from_u16(499).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR)
             }
-            GatewayError::ProviderUnavailable { .. } => StatusCode::SERVICE_UNAVAILABLE,
+            GatewayError::ProviderUnavailable { .. } | GatewayError::QuotaUnavailable { .. } => {
+                StatusCode::SERVICE_UNAVAILABLE
+            }
             GatewayError::Internal { .. } => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -217,6 +226,7 @@ impl GatewayError {
             GatewayError::StreamParseError { .. } => "NYRO_STREAM_PARSE_ERROR",
             GatewayError::ClientCancelled => "NYRO_CLIENT_CANCELLED",
             GatewayError::ProviderUnavailable { .. } => "NYRO_SERVICE_UNAVAILABLE",
+            GatewayError::QuotaUnavailable { .. } => "NYRO_QUOTA_UNAVAILABLE",
             GatewayError::Internal { .. } => "NYRO_INTERNAL_ERROR",
         }
     }
@@ -290,6 +300,7 @@ impl GatewayError {
             GatewayError::ProviderUnavailable { provider, reason } => {
                 format!("provider {provider} unavailable: {reason}")
             }
+            GatewayError::QuotaUnavailable { detail, .. } => detail.clone(),
             GatewayError::Internal { source } => {
                 format!("internal error: {source}")
             }
@@ -333,6 +344,16 @@ impl GatewayError {
         let mut response =
             (status, Json(serde_json::json!({ "error": error_obj }))).into_response();
         response.extensions_mut().insert(RenderedGatewayError);
+        if let Self::QuotaUnavailable {
+            retry_after_secs: Some(seconds),
+            ..
+        } = self
+        {
+            response.headers_mut().insert(
+                axum::http::header::RETRY_AFTER,
+                axum::http::HeaderValue::from(*seconds),
+            );
+        }
         if let Self::AccountUpstream { failure, .. } = self {
             response.extensions_mut().insert(*failure);
         }

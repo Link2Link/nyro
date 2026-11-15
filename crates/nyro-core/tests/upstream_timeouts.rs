@@ -241,6 +241,14 @@ async fn serve(
 ) -> anyhow::Result<()> {
     socket.set_nodelay(true)?;
     let request = read_request(&mut socket).await?;
+    // Background Antigravity catalog discovery (`fetchAvailableModels`) uses
+    // the provider base URL too; it is not an inference attempt.
+    if request.line.contains("fetchAvailableModels") {
+        socket
+            .write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            .await?;
+        return Ok(());
+    }
     calls.fetch_add(1, Ordering::SeqCst);
     requests.lock().unwrap().push(request);
     if !matches!(reply, Reply::NoHeaders) {

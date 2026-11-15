@@ -116,8 +116,188 @@ struct LocalHealthNeutral;
 #[derive(Clone, Copy, Debug)]
 pub(super) struct EntitlementRefusal;
 
-/// Tag an upstream error response that is an entitlement refusal.
-pub(super) fn mark_entitlement_refusal(response: &mut Response, status: u16, body: &Value) {
+/// Google `RESOURCE_EXHAUSTED` evidence carried by an upstream 429 body.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum GoogleRateLimit {
+    /// No structured details or quota wording. Antigravity also uses
+    /// this exact shape to refuse request content (verified 2026-11-15: a
+    /// third-party agent identity in the system prompt), so it is treated as
+    /// request-scoped: no model cooldown and no provider-health failure. The
+    /// quota summary refresh still runs, so real exhaustion is still observed.
+    Opaque,
+    /// Structured exhaustion or throttling, with the upstream retry delay when
+    /// one is given (RetryInfo or ErrorInfo `quotaResetDelay`).
+    Structured { retry_after_secs: Option<u64> },
+}
+
+/// Classify a Google 429 body; `None` for any other vendor's error shape.
+pub(super) fn google_rate_limit(status: u16, body: &Value) -> Option<GoogleRateLimit> {
+    let error = body.get("error").filter(|_| status == 429)?;
+    let google_status = error.get("status").and_then(Value::as_str)?;
+    if !google_status.eq_ignore_ascii_case("RESOURCE_EXHAUSTED") {
+        return None;
+    }
+    let details = error
+        .get("details")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let detail_type = |detail: &Value, suffix: &str| {
+        detail
+            .get("@type")
+            .and_then(Value::as_str)
+            .is_some_and(|kind| kind.ends_with(suffix))
+    };
+    let retry_after_secs = details
+        .iter()
+        .filter(|detail| detail_type(detail, "google.rpc.RetryInfo"))
+        .find_map(|detail| detail.get("retryDelay").and_then(Value::as_str))
+        .or_else(|| {
+            details
+                .iter()
+                .filter(|detail| detail_type(detail, "google.rpc.ErrorInfo"))
+                .find_map(|detail| detail.pointer("/metadata/quotaResetDelay")?.as_str())
+        })
+        .and_then(parse_google_duration_secs);
+    // Any structured detail (ErrorInfo reason, QuotaFailure, RetryInfo) is
+    // quota evidence; only a completely bare body is opaque.
+    let has_detail = details.iter().any(|detail| detail.get("@type").is_some());
+    let quota_wording = error
+        .get("message")
+        .and_then(Value::as_str)
+        .map(str::to_ascii_lowercase)
+        .is_some_and(|message| {
+            message.contains("quota exhausted") || message.contains("quota_exhausted")
+        });
+    if retry_after_secs.is_none() && !has_detail && !quota_wording {
+        return Some(GoogleRateLimit::Opaque);
+    }
+    Some(GoogleRateLimit::Structured { retry_after_secs })
+}
+
+/// Google protobuf durations (`"12s"`, `"0.5s"`, `"1h2m3.5s"`, `"250ms"`),
+/// rounded up to whole seconds (at least one).
+fn parse_google_duration_secs(raw: &str) -> Option<u64> {
+    let mut rest = raw.trim();
+    let mut total = 0f64;
+    let mut matched = false;
+    while !rest.is_empty() {
+        let digits = rest
+            .find(|c: char| !(c.is_ascii_digit() || c == '.'))
+            .unwrap_or(rest.len());
+        let value: f64 = rest[..digits].parse().ok()?;
+        rest = &rest[digits..];
+        let (scale, unit_len) = if rest.starts_with("ms") {
+            (0.001, 2)
+        } else if rest.starts_with('h') {
+            (3600.0, 1)
+        } else if rest.starts_with('m') {
+            (60.0, 1)
+        } else if rest.starts_with('s') {
+            (1.0, 1)
+        } else {
+            return None;
+        };
+        total += value * scale;
+        rest = &rest[unit_len..];
+        matched = true;
+    }
+    (matched && total.is_finite() && total >= 0.0).then(|| (total.ceil() as u64).max(1))
+}
+
+/// Client-safe reasons why every route target was skipped by quota admission.
+/// Built only from allowlisted scheduling reasons and canonical window names.
+#[derive(Default)]
+struct QuotaSkips {
+    reasons: std::collections::BTreeSet<String>,
+    retry_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+impl QuotaSkips {
+    fn note(&mut self, scheduling: &crate::router::quota::ProviderScheduling) {
+        let parse = |value: Option<&String>| {
+            value
+                .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+                .map(|value| value.with_timezone(&chrono::Utc))
+        };
+        let (reason, when) = match scheduling.reason.as_deref() {
+            Some("model_cooldown") => (
+                "the upstream model is cooling down after a rate-limit response".to_owned(),
+                parse(scheduling.next_check_at.as_ref()),
+            ),
+            Some("account_unavailable") => (
+                "the upstream account is unavailable".to_owned(),
+                parse(scheduling.next_check_at.as_ref()),
+            ),
+            Some("shared_constraint") => (
+                "a shared upstream quota is exhausted".to_owned(),
+                parse(scheduling.reset_at.as_ref()).or(parse(scheduling.next_check_at.as_ref())),
+            ),
+            _ if !scheduling.blocking_tiers.is_empty() => {
+                let windows: Vec<&str> = scheduling
+                    .blocking_tiers
+                    .iter()
+                    .map(String::as_str)
+                    .filter(|name| {
+                        name.len() <= 64
+                            && name
+                                .chars()
+                                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | ':' | '-'))
+                    })
+                    .collect();
+                (
+                    if windows.is_empty() {
+                        "an upstream quota window is exhausted".to_owned()
+                    } else {
+                        format!("upstream quota exhausted ({})", windows.join(", "))
+                    },
+                    parse(scheduling.reset_at.as_ref())
+                        .or(parse(scheduling.next_check_at.as_ref())),
+                )
+            }
+            _ => (
+                "upstream quota admission is unavailable".to_owned(),
+                parse(scheduling.reset_at.as_ref()).or(parse(scheduling.next_check_at.as_ref())),
+            ),
+        };
+        self.reasons.insert(reason);
+        if let Some(when) = when {
+            self.retry_at = Some(self.retry_at.map_or(when, |old| old.min(when)));
+        }
+    }
+
+    fn note_scope_changed(&mut self) {
+        self.reasons
+            .insert("the upstream account changed while the request was prepared".to_owned());
+    }
+
+    fn into_error(self) -> GatewayError {
+        let retry_after_secs = self
+            .retry_at
+            .map(|when| (when - chrono::Utc::now()).num_seconds())
+            .filter(|seconds| *seconds > 0)
+            .map(|seconds| seconds as u64);
+        let mut detail = String::from("all route targets are temporarily unavailable");
+        if !self.reasons.is_empty() {
+            detail.push_str(": ");
+            detail.push_str(&self.reasons.into_iter().collect::<Vec<_>>().join("; "));
+        }
+        if let Some(when) = self.retry_at.filter(|_| retry_after_secs.is_some()) {
+            detail.push_str(&format!(
+                "; retry after {}",
+                when.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+            ));
+        }
+        GatewayError::QuotaUnavailable {
+            detail,
+            retry_after_secs,
+        }
+    }
+}
+
+/// Tag an upstream error response with request-scoped refusal evidence:
+/// Anthropic entitlement/account refusals and Google 429 classification.
+pub(super) fn mark_upstream_error(response: &mut Response, status: u16, body: &Value) {
     if let Some(failure) =
         crate::provider::anthropic::claude_code::errors::account_refusal(status, body)
     {
@@ -127,6 +307,12 @@ pub(super) fn mark_entitlement_refusal(response: &mut Response, status: u16, bod
     {
         response.extensions_mut().insert(LocalHealthNeutral);
         response.extensions_mut().insert(EntitlementRefusal);
+    }
+    if let Some(evidence) = google_rate_limit(status, body) {
+        if evidence == GoogleRateLimit::Opaque {
+            response.extensions_mut().insert(LocalHealthNeutral);
+        }
+        response.extensions_mut().insert(evidence);
     }
 }
 
@@ -691,6 +877,7 @@ async fn dispatch_pipeline_inner(
 
     let target_count = ordered_targets.len();
     let mut quota_skipped = 0_usize;
+    let mut quota_skips = QuotaSkips::default();
     let mut last_response: Option<Response> = None;
     // Key-pool fan-out: a multi-key provider contributes one queue entry per
     // eligible key (priority order). Each entry is one dispatch attempt, so
@@ -746,6 +933,10 @@ async fn dispatch_pipeline_inner(
             .is_model_schedulable(&target.provider_id, &target.model)
         {
             quota_skipped += 1;
+            quota_skips.note(
+                &gw.quota_registry
+                    .model_scheduling(&target.provider_id, &target.model),
+            );
             skip_key_siblings!();
             continue;
         }
@@ -1929,6 +2120,17 @@ async fn dispatch_pipeline_inner(
                 .is_model_schedulable(&provider.id, &quota_wire_model)
         {
             quota_skipped += 1;
+            if gw
+                .quota_registry
+                .is_model_schedulable(&provider.id, &quota_wire_model)
+            {
+                quota_skips.note_scope_changed();
+            } else {
+                quota_skips.note(
+                    &gw.quota_registry
+                        .model_scheduling(&provider.id, &quota_wire_model),
+                );
+            }
             health_permit.neutral();
             ctx.trace(
                 "quota",
@@ -2200,14 +2402,24 @@ async fn dispatch_pipeline_inner(
             // windows; re-reading usage would only add load to a 429-prone
             // usage endpoint.
             if status == 429 && response.extensions().get::<EntitlementRefusal>().is_none() {
-                let retry_after = response
+                let header_retry_after = response
                     .headers()
                     .get(reqwest::header::RETRY_AFTER)
                     .and_then(|value| value.to_str().ok())
                     .and_then(|value| value.parse::<u64>().ok());
-                // An opaque 429 is a narrow model/owner throttle, not proof of
+                let google = response.extensions().get::<GoogleRateLimit>().copied();
+                let retry_after = header_retry_after.or(match google {
+                    Some(GoogleRateLimit::Structured { retry_after_secs }) => retry_after_secs,
+                    _ => None,
+                });
+                // A detail-free Google 429 may be a content refusal of this
+                // one request: cooling the model down would turn it into a
+                // local outage for every caller (CLIProxyAPI "soft retry").
+                let request_scoped =
+                    header_retry_after.is_none() && google == Some(GoogleRateLimit::Opaque);
+                // Otherwise it is a narrow model/owner throttle, not proof of
                 // exhausted allowance for all models on this provider.
-                if !gw.quota_registry.bucket_snapshot(&provider.id).is_empty() {
+                if !request_scoped && !gw.quota_registry.bucket_snapshot(&provider.id).is_empty() {
                     gw.quota_registry.record_model_rejection_fenced(
                         &provider.id,
                         &quota_wire_model,
@@ -2367,10 +2579,9 @@ async fn dispatch_pipeline_inner(
         .status(503)
         .with_req_extras(&req_extras)
         .emit();
-        return error_response(
-            503,
-            "all route providers are temporarily unavailable due to exhausted quota",
-        );
+        // Keep the real cause (and when to retry) instead of the generic
+        // "provider is unavailable" that error_response(503) would render.
+        return quota_skips.into_error().render(None);
     }
 
     last_response.unwrap_or_else(|| {
@@ -3334,6 +3545,150 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[test]
+    fn google_429_classification_separates_opaque_refusals_from_quota_evidence() {
+        use super::{GoogleRateLimit, google_rate_limit};
+        use serde_json::json;
+        // The exact Antigravity content refusal observed on 2026-11-15.
+        let opaque = json!({"error": {"code": 429,
+            "message": "Resource has been exhausted (e.g. check quota).",
+            "status": "RESOURCE_EXHAUSTED"}});
+        assert_eq!(
+            google_rate_limit(429, &opaque),
+            Some(GoogleRateLimit::Opaque)
+        );
+        let retry = json!({"error": {"status": "RESOURCE_EXHAUSTED", "details": [
+            {"@type": "type.googleapis.com/google.rpc.ErrorInfo", "reason": "RATE_LIMIT_EXCEEDED"},
+            {"@type": "type.googleapis.com/google.rpc.RetryInfo", "retryDelay": "12.2s"}]}});
+        assert_eq!(
+            google_rate_limit(429, &retry),
+            Some(GoogleRateLimit::Structured {
+                retry_after_secs: Some(13)
+            })
+        );
+        let reset = json!({"error": {"status": "RESOURCE_EXHAUSTED", "details": [
+            {"@type": "type.googleapis.com/google.rpc.ErrorInfo", "reason": "QUOTA_EXHAUSTED",
+             "metadata": {"quotaResetDelay": "1h2m3s"}}]}});
+        assert_eq!(
+            google_rate_limit(429, &reset),
+            Some(GoogleRateLimit::Structured {
+                retry_after_secs: Some(3723)
+            })
+        );
+        for structured in [
+            json!({"error": {"status": "RESOURCE_EXHAUSTED", "details": [
+                {"@type": "type.googleapis.com/google.rpc.QuotaFailure", "violations": []}]}}),
+            json!({"error": {"status": "RESOURCE_EXHAUSTED", "message": "Quota exhausted for model"}}),
+        ] {
+            assert_eq!(
+                google_rate_limit(429, &structured),
+                Some(GoogleRateLimit::Structured {
+                    retry_after_secs: None
+                }),
+                "{structured}"
+            );
+        }
+        // Other statuses and other vendors' shapes keep the legacy path.
+        assert_eq!(google_rate_limit(503, &opaque), None);
+        assert_eq!(
+            google_rate_limit(
+                429,
+                &json!({"error": {"type": "rate_limit_error", "message": "x"}})
+            ),
+            None
+        );
+        assert_eq!(
+            google_rate_limit(429, &json!({"error": {"status": "UNAVAILABLE"}})),
+            None
+        );
+    }
+
+    #[test]
+    fn quota_skip_error_names_allowlisted_reasons_and_soonest_retry() {
+        use super::QuotaSkips;
+        use crate::error::GatewayError;
+        use crate::router::quota::{ProviderScheduling, ProviderSchedulingStatus};
+        let soon = chrono::Utc::now() + chrono::Duration::seconds(20);
+        let later = chrono::Utc::now() + chrono::Duration::hours(2);
+        let mut skips = QuotaSkips::default();
+        skips.note(&ProviderScheduling {
+            status: ProviderSchedulingStatus::QuotaExhausted,
+            reason: Some("usage_limit".into()),
+            blocking_tiers: vec!["five_hour".into(), "bad tier <script>".into()],
+            reset_at: Some(later.to_rfc3339()),
+            next_check_at: None,
+        });
+        skips.note(&ProviderScheduling {
+            status: ProviderSchedulingStatus::QuotaExhausted,
+            reason: Some("model_cooldown".into()),
+            next_check_at: Some(soon.to_rfc3339()),
+            ..Default::default()
+        });
+        let GatewayError::QuotaUnavailable {
+            detail,
+            retry_after_secs,
+        } = skips.into_error()
+        else {
+            panic!("quota skips must render as QuotaUnavailable");
+        };
+        assert!(
+            detail.contains("upstream quota exhausted (five_hour)"),
+            "{detail}"
+        );
+        assert!(!detail.contains("script"), "{detail}");
+        assert!(
+            detail.contains("cooling down after a rate-limit response"),
+            "{detail}"
+        );
+        assert!(
+            retry_after_secs.is_some_and(|secs| (1..=20).contains(&secs)),
+            "{retry_after_secs:?}"
+        );
+        // No known retry time: no Retry-After and no stale "retry after".
+        let GatewayError::QuotaUnavailable {
+            detail,
+            retry_after_secs,
+        } = QuotaSkips::default().into_error()
+        else {
+            unreachable!()
+        };
+        assert_eq!(detail, "all route targets are temporarily unavailable");
+        assert!(retry_after_secs.is_none());
+    }
+
+    #[test]
+    fn google_duration_parser_rounds_up_and_rejects_garbage() {
+        use super::parse_google_duration_secs as parse;
+        assert_eq!(parse("12s"), Some(12));
+        assert_eq!(parse("0.2s"), Some(1));
+        assert_eq!(parse("250ms"), Some(1));
+        assert_eq!(parse("2m"), Some(120));
+        assert_eq!(parse("1h0m1.5s"), Some(3602));
+        for garbage in ["", "s", "12", "12x", "-1s", "1.2.3s"] {
+            assert_eq!(parse(garbage), None, "{garbage}");
+        }
+    }
+
+    #[test]
+    fn opaque_google_429_is_health_neutral_but_structured_is_not() {
+        use super::{GoogleRateLimit, LocalHealthNeutral, mark_upstream_error};
+        use serde_json::json;
+        let opaque = json!({"error": {"code": 429, "status": "RESOURCE_EXHAUSTED",
+            "message": "Resource has been exhausted (e.g. check quota)."}});
+        let mut response = StatusCode::TOO_MANY_REQUESTS.into_response();
+        mark_upstream_error(&mut response, 429, &opaque);
+        assert!(response.extensions().get::<LocalHealthNeutral>().is_some());
+        assert_eq!(
+            response.extensions().get::<GoogleRateLimit>(),
+            Some(&GoogleRateLimit::Opaque)
+        );
+        let structured = json!({"error": {"status": "RESOURCE_EXHAUSTED", "details": [
+            {"@type": "type.googleapis.com/google.rpc.RetryInfo", "retryDelay": "5s"}]}});
+        let mut response = StatusCode::TOO_MANY_REQUESTS.into_response();
+        mark_upstream_error(&mut response, 429, &structured);
+        assert!(response.extensions().get::<LocalHealthNeutral>().is_none());
+    }
 
     // ── Example PhaseHook (validates the P1 lifecycle wiring end-to-end) ──────
     //

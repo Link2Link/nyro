@@ -34,6 +34,7 @@ Probed from the US VPS egress with Hub UA `antigravity/hub/2.32.1` on two Google
 - Same account, prod host: the catalog omits Hydrogen and Hydrogen inference answers 429. This is why catalog discovery must follow the daily inference host.
 - Quota: Hydrogen calls drew down `gemini-5h` / `gemini-weekly` ("Gemini Models", shared with 3.8 Flash); Argon calls drew down only `gemini-argon-wtu-weekly`.
 - Account outside the plan: only `gemini-4-{argon,hydrogen,carbon}-disabled` placeholders; tier ids answer 404.
+- System-prompt screening: a third-party agent identity in `systemInstruction` ("You are an AI agent powered by DeepSeek Harness.", the Claude Code identity) is answered with a detail-free 429 `RESOURCE_EXHAUSTED` on every model, while the same text as a leading user turn is served. Nyro therefore always relocates `systemInstruction` on this channel, and detail-free 429s no longer cool the model down. Not a guarantee: a Codex CLI identity is refused in either position.
 
 ## Probe diagnostics
 

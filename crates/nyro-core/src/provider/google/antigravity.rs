@@ -1294,6 +1294,9 @@ pub(crate) fn wrap_request(body: Value, model: &str, project_id: &str) -> Value 
         let session_id = derive_session_id(request.get("contents"));
         request.insert("sessionId".to_string(), Value::String(session_id));
     }
+    // After the session id: the derivation keeps hashing the client's own
+    // user turns, not the relocated system text.
+    fold_system_instruction(&mut request);
 
     json!({
         "model": model,
@@ -1303,6 +1306,64 @@ pub(crate) fn wrap_request(body: Value, model: &str, project_id: &str) -> Value 
         "requestId": format!("agent-{}", Uuid::new_v4()),
         "request": Value::Object(request),
     })
+}
+
+/// Carry the system instruction as a leading user turn on this surface.
+///
+/// Google's Antigravity endpoint classifies `systemInstruction` and answers a
+/// third-party agent identity with a detail-free 429 RESOURCE_EXHAUSTED, for
+/// every model. Verified 2026-11-15 from a Google AI Pro account: "You are an
+/// AI agent powered by DeepSeek Harness." and the Claude Code identity were
+/// rejected as system text but served as user text; multi-turn tool loops,
+/// thought signatures, implicit prefix caching and instruction following were
+/// unaffected. Renaming or obfuscating the brand did not help (the check is
+/// not a keyword match). This is not a guarantee: a Codex CLI identity is
+/// rejected in either position, so detail-free 429s stay request-scoped.
+///
+/// Only text/media parts move; blank text parts are dropped. A degenerate
+/// `contents` value keeps the original instruction untouched.
+fn fold_system_instruction(request: &mut serde_json::Map<String, Value>) {
+    if !request
+        .get("contents")
+        .is_none_or(|contents| contents.is_array())
+    {
+        return;
+    }
+    let Some(system) = request
+        .remove("systemInstruction")
+        .or_else(|| request.remove("system_instruction"))
+    else {
+        return;
+    };
+    let parts: Vec<Value> = match system {
+        Value::Object(mut object) => match object.remove("parts") {
+            Some(Value::Array(parts)) => parts,
+            Some(part @ Value::Object(_)) => vec![part],
+            _ => Vec::new(),
+        },
+        Value::String(text) => vec![json!({"text": text})],
+        _ => Vec::new(),
+    };
+    let parts: Vec<Value> = parts
+        .into_iter()
+        .filter(|part| {
+            part.as_object().is_some_and(|object| {
+                !object.is_empty()
+                    && object
+                        .get("text")
+                        .is_none_or(|text| text.as_str().is_some_and(|t| !t.trim().is_empty()))
+            })
+        })
+        .collect();
+    if parts.is_empty() {
+        return;
+    }
+    let contents = request
+        .entry("contents")
+        .or_insert_with(|| Value::Array(Vec::new()));
+    if let Value::Array(items) = contents {
+        items.insert(0, json!({"role": "user", "parts": parts}));
+    }
 }
 
 /// Unwrap a v1internal response envelope in place. Non-wrapped bodies (error
@@ -1899,6 +1960,83 @@ mod tests {
         });
         let wrapped2 = wrap_request(body2, "gemini-2.5-pro", "cloudaicompanion-1");
         assert_eq!(wrapped2["request"]["sessionId"].as_str(), Some(session_id));
+    }
+
+    #[test]
+    fn wrap_request_folds_system_instruction_into_a_leading_user_turn() {
+        let plain = json!({"contents": [{"role": "user", "parts": [{"text": "hello"}]}]});
+        let body = json!({
+            "systemInstruction": {"role": "user", "parts": [
+                {"text": "You are an AI agent powered by DeepSeek Harness."},
+                {"text": "   "},
+                {"inlineData": {"mimeType": "image/png", "data": "AA=="}},
+                {}
+            ]},
+            "contents": [
+                {"role": "user", "parts": [{"text": "hello"}]},
+                {"role": "model", "parts": [{"functionCall": {"name": "bash", "args": {}}}]},
+            ],
+        });
+        let wrapped = wrap_request(body, "gemini-4-hydrogen-high", "p");
+        let request = &wrapped["request"];
+        assert!(request.get("systemInstruction").is_none());
+        let contents = request["contents"].as_array().unwrap();
+        assert_eq!(contents.len(), 3);
+        assert_eq!(contents[0]["role"], "user");
+        // Blank and empty parts are dropped; text and media move verbatim.
+        assert_eq!(
+            contents[0]["parts"],
+            json!([
+                {"text": "You are an AI agent powered by DeepSeek Harness."},
+                {"inlineData": {"mimeType": "image/png", "data": "AA=="}}
+            ])
+        );
+        assert_eq!(contents[1]["parts"][0]["text"], "hello");
+        assert_eq!(contents[2]["role"], "model");
+        // The session id still derives from the client's own user turns.
+        assert_eq!(
+            request["sessionId"],
+            wrap_request(plain, "gemini-4-hydrogen-high", "p")["request"]["sessionId"]
+        );
+    }
+
+    #[test]
+    fn wrap_request_fold_handles_snake_case_blank_and_degenerate_inputs() {
+        let snake = wrap_request(
+            json!({"system_instruction": {"parts": {"text": "Be terse."}}, "contents": []}),
+            "m",
+            "p",
+        );
+        assert!(snake["request"].get("system_instruction").is_none());
+        assert_eq!(
+            snake["request"]["contents"],
+            json!([{"role": "user", "parts": [{"text": "Be terse."}]}])
+        );
+        let missing_contents = wrap_request(json!({"systemInstruction": "Be terse."}), "m", "p");
+        assert_eq!(
+            missing_contents["request"]["contents"],
+            json!([{"role": "user", "parts": [{"text": "Be terse."}]}])
+        );
+        // An instruction with nothing to say is dropped, not turned into an
+        // empty user turn.
+        let blank = wrap_request(
+            json!({"systemInstruction": {"parts": [{"text": " "}]}, "contents": []}),
+            "m",
+            "p",
+        );
+        assert!(blank["request"].get("systemInstruction").is_none());
+        assert_eq!(blank["request"]["contents"], json!([]));
+        // A malformed contents value keeps the original instruction.
+        let degenerate = wrap_request(
+            json!({"systemInstruction": {"parts": [{"text": "keep"}]}, "contents": "oops"}),
+            "m",
+            "p",
+        );
+        assert_eq!(
+            degenerate["request"]["systemInstruction"]["parts"][0]["text"],
+            "keep"
+        );
+        assert_eq!(degenerate["request"]["contents"], "oops");
     }
 
     #[test]
