@@ -13,13 +13,23 @@ Live owner/fence/resource mappings (`quota_bucket_owner.*`, `quota_bucket_fence.
 
 ## Google two-family presentation
 
-The usage view now folds only the confirmed `gemini-3.8-flash` and
-`gemini-4-argon` families. Bare IDs and the exact `-extra-low`, `-low`, `-medium`,
-`-high`, and `-tiered` suffixes belong to their corresponding display card;
-Argon low/medium/high are not separate cards. Unknown suffixes, lookalike model
-names and other models are not guessed into either family. At most two observed
-family cards are shown per entitlement scope; missing observations are unknown,
-not manufactured 0% / free capacity.
+The usage view folds only the confirmed `gemini-4-hydrogen`, `gemini-3.8-flash`
+and `gemini-4-argon` families into at most two pool cards per entitlement scope.
+Bare IDs and the exact `-extra-low`, `-low`, `-medium`, `-high`, `-xhigh` and
+`-tiered` suffixes belong to their corresponding card; tier variants are not
+separate cards. Unknown suffixes, lookalike model names and other models are not
+guessed into any family; missing observations are unknown, not manufactured 0% /
+free capacity.
+
+Gemini 4 Hydrogen and Gemini 3.8 Flash draw from the same "Gemini Models"
+allowance (`gemini-5h` / `gemini-weekly`): on 2026-11-15, Hydrogen calls from a
+Google AI Pro account drew that pool down while Argon's dedicated weekly bucket
+moved only with Argon calls. Their shared card is labelled `gemini-4-hydrogen`
+whenever the account's discovery serves a Hydrogen tier, otherwise
+`gemini-3.8-flash` (accounts outside the Gemini 4 plan only list
+`<family>-disabled` placeholders, which never form a card). The card keeps its
+historical opaque identity (pool key `gemini-3.8-flash`), so the relabel does not
+re-key published usage entries or retained attempt attribution.
 
 This is a read-only core projection marked `google_family_display_v1`, not a new
 quota binding. Raw model/resource observations remain unchanged in the registry,
@@ -60,7 +70,8 @@ combine `status=error` with a successful observation payload. Known exhaustion
 is a successful query with a separate blocked scheduling decision.
 
 The Google subscription adapter recognizes the exact `gemini-5h` and
-`gemini-weekly` resource IDs for discovered Flash 3.8 wire variants, and exact
+`gemini-weekly` resource IDs for discovered Flash 3.8 and Gemini 4 Hydrogen wire
+variants (one shared pool), and exact
 `Gemini 4 Argon` family labels (including their supported window labels) for
 discovered Argon variants. These are versioned association rules, not generic
 label/percentage/reset matching; `3p-5h` / `3p-weekly` never bind first-party

@@ -1431,12 +1431,14 @@ mod tests {
             Some("ai://models.dev/google")
         );
         let models = binding.static_models_override.unwrap();
-        // Active catalog generations only: 3.8 flash tiers and Argon.
+        // Active catalog generations only: 3.8 flash tiers and Gemini 4.
         assert!(models.iter().any(|m| m == "gemini-3.8-flash-high"));
         assert!(models.iter().any(|m| m == "gemini-3.8-flash-tiered"));
-        // Gemini 4 Argon rides the subscription surface as of 2026-10.
-        assert!(models.iter().any(|m| m == "gemini-4-argon"));
+        // Gemini 4 Argon / Hydrogen serve tier ids only (bare ids 404).
         assert!(models.iter().any(|m| m == "gemini-4-argon-high"));
+        assert!(models.iter().any(|m| m == "gemini-4-hydrogen-xhigh"));
+        assert!(!models.iter().any(|m| m == "gemini-4-argon"));
+        assert!(!models.iter().any(|m| m == "gemini-4-hydrogen"));
         // Retired lines stay out of the fallback list — dynamic discovery
         // resurfaces them per-account when still served.
         assert!(!models.iter().any(|m| *m == "gemini-2.5-pro"));

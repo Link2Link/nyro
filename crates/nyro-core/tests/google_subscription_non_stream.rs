@@ -626,7 +626,9 @@ fn admin_anthropic_probe_through_remote_nyro_aggregates_google_subscription_sse(
 /// model/endpoint/project/client/account causes, not assert a plan exclusion.
 /// A valid empty local catalog must not prevent probing a manual model.
 fn admin_probe_explains_google_subscription_not_found(channel: &str) -> anyhow::Result<()> {
-    const REQUESTED_MODEL: &str = "gemini-4-argon";
+    // Not a unified tier family, so the manual id reaches upstream verbatim
+    // (Gemini 4 Carbon is listed only as an Ultra placeholder on AI Pro).
+    const REQUESTED_MODEL: &str = "gemini-4-carbon";
     let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
     listener.set_nonblocking(true)?;
     let base_url = format!("http://{}", listener.local_addr()?);
@@ -692,7 +694,7 @@ fn admin_probe_explains_google_subscription_not_found(channel: &str) -> anyhow::
         assert!(!error.contains("promotional"), "{error}");
         assert!(
             error.contains(
-                "model=gemini-4-argon; wire_model=gemini-4-argon; endpoint_source=provider_config"
+                "model=gemini-4-carbon; wire_model=gemini-4-carbon; endpoint_source=provider_config"
             ),
             "{error}"
         );

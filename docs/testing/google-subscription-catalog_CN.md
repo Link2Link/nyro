@@ -26,6 +26,15 @@ Auth 与 admin 写入相同格式。Admin 在异步获取**之前**读取 connec
 
 新成功目录即使为空，也替代 probe 旧动态证据。失败可复用来源仍匹配的上次成功快照。空目录或模型未列出都不证明无权限；curated 发现条目保留，手动选择模型仍按请求探测。
 
+## 线上观察：Gemini 4 Hydrogen / Argon（2026-11-15）
+
+从美国 VPS 出口、Hub UA `antigravity/hub/2.32.1`，对两个 Google AI Pro 账号实测：
+
+- 已开通账号、daily host：目录列出 `gemini-4-hydrogen-{low,medium,high,xhigh}` 与 `gemini-4-argon-{low,medium,high}`（另有 Ultra 专属占位 `gemini-4-carbon-disabled`）。各档位 `streamGenerateContent` 均返回 200；裸 ID `gemini-4-hydrogen` / `gemini-4-argon` 返回 404。因此裸名只作虚拟别名，按推理强度解析（`xhigh`/`max` 仅在 Hydrogen 上映射 `-xhigh`；无推理指令 → `-medium`）。
+- 同一账号、prod host：目录不含 Hydrogen，Hydrogen 推理返回 429。这正是目录发现必须跟随 daily 推理 host 的原因。
+- 配额：Hydrogen 调用消耗 `gemini-5h` / `gemini-weekly`（“Gemini Models”，与 3.8 Flash 共用）；Argon 调用只消耗 `gemini-argon-wtu-weekly`。
+- 未开通账号：只有 `gemini-4-{argon,hydrogen,carbon}-disabled` 占位，档位 ID 返回 404。
+
 ## Probe 诊断
 
 现有 error 字符串附带公共模型 ID、实际 wire model ID、端点来源；运行 metadata 原有 base URL 给出实际端点。Debug 日志记录模型映射和端点来源，不记录凭据指纹或 project ID。404 提示列举模型、端点／project、客户端版本、账户资格等可能原因，不断言某套餐不可用。配额读数同样不能单独证明 429 原因。

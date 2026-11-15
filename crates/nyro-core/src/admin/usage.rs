@@ -991,6 +991,9 @@ fn google_scheduling_observation(tiers: &[ProviderUsageTier]) -> Vec<QuotaTierOb
 /// whitelist is usage-only: it never collapses callable models or strips tiers.
 /// Shared Gemini resource IDs were independently verified against Admin opaque
 /// IDs; generic Gemini/Weekly labels and third-party pools remain unbound.
+/// Returns the enforced pool key (see `google_display_pool`): the shared
+/// `gemini-5h` / `gemini-weekly` pool covers both Gemini 3.8 Flash and Gemini 4
+/// Hydrogen (verified 2026-11-15 by Hydrogen calls drawing it down).
 fn google_subscription_family(
     observation: &crate::provider::google::antigravity::QuotaSummaryBucket,
 ) -> Result<Option<(&'static str, &'static str)>, ()> {
@@ -1008,7 +1011,7 @@ fn google_subscription_family(
     }
     let resource_family = match (observation.bucket_id.as_deref(), window.as_str()) {
         (Some("gemini-5h"), "five_hour") | (Some("gemini-weekly"), "weekly_limit") => {
-            Some("gemini-3.8-flash")
+            Some(crate::quota_buckets::GOOGLE_GEMINI_MODELS_POOL)
         }
         _ => None,
     };
@@ -1021,7 +1024,10 @@ fn google_subscription_family(
     .flatten()
     {
         for (label_base, family) in [
-            ("Gemini 3.8 Flash", "gemini-3.8-flash"),
+            (
+                "Gemini 3.8 Flash",
+                crate::quota_buckets::GOOGLE_GEMINI_MODELS_POOL,
+            ),
             ("Gemini 4 Argon", "gemini-4-argon"),
         ] {
             let named = label == label_base
@@ -1117,7 +1123,7 @@ fn google_quota_buckets(
                     members = models
                         .iter()
                         .filter(|model| {
-                            crate::quota_buckets::google_display_family(&model.id) == Some(family)
+                            crate::quota_buckets::google_display_pool(&model.id) == Some(family)
                         })
                         .map(|model| model.id.clone())
                         .collect();
@@ -6653,6 +6659,103 @@ mod tests {
         );
         assert!(registry.is_model_schedulable("p", "gemini-3.8-flash-high"));
         assert!(!registry.is_model_schedulable("p", "gemini-4-argon-high"));
+    }
+
+    /// Sanitized shape observed 2026-11-15 on two Google AI Pro accounts via the
+    /// daily host: Hydrogen tiers draw down the shared Gemini Models pool
+    /// (`gemini-5h` / `gemini-weekly`) together with Flash 3.8, while Argon has
+    /// its own weekly bucket. Accounts outside the plan only see placeholders.
+    #[test]
+    fn google_gemini_models_pool_binds_hydrogen_and_displays_hydrogen_and_argon() {
+        use crate::provider::google::antigravity::{
+            parse_available_models_detailed, parse_quota_summary_buckets,
+        };
+        use crate::quota_buckets::{google_display_buckets, is_google_display_bucket};
+        let entitled = parse_available_models_detailed(&serde_json::json!({"models": {
+            "gemini-3.8-flash-high": {"quotaInfo": {"remainingFraction": 0.99}},
+            "gemini-3.8-flash-medium": {"quotaInfo": {"remainingFraction": 0.99}},
+            "gemini-3.8-flash-low": {"quotaInfo": {"remainingFraction": 0.99}},
+            "gemini-3.8-flash-tiered": {"quotaInfo": {"remainingFraction": 0.99}},
+            "gemini-4-hydrogen-xhigh": {"quotaInfo": {"remainingFraction": 0.99}},
+            "gemini-4-hydrogen-high": {"quotaInfo": {"remainingFraction": 0.99}},
+            "gemini-4-hydrogen-medium": {"quotaInfo": {"remainingFraction": 0.99}},
+            "gemini-4-hydrogen-low": {"quotaInfo": {"remainingFraction": 0.99}},
+            "gemini-4-argon-high": {"quotaInfo": {"remainingFraction": 0.98}},
+            "gemini-4-argon-medium": {"quotaInfo": {"remainingFraction": 0.98}},
+            "gemini-4-argon-low": {"quotaInfo": {"remainingFraction": 0.98}},
+            "gemini-4-carbon-disabled": {"disabled": true, "displayName": "Gemini 4 Carbon"},
+            "claude-opus-5-5-high": {"quotaInfo": {"remainingFraction": 1.0}},
+            "chat_20706": {"quotaInfo": {"remainingFraction": 1.0}}
+        }}));
+        let summary = parse_quota_summary_buckets(&serde_json::json!({"groups": [
+            {"displayName": "Gemini Models", "buckets": [
+                {"bucketId": "gemini-weekly", "displayName": "Weekly Limit Remaining", "window": "weekly", "remainingFraction": 0.9997566},
+                {"bucketId": "gemini-5h", "displayName": "Five Hour Limit Remaining", "window": "5h", "remainingFraction": 0.0}]},
+            {"displayName": "Claude and GPT models", "buckets": [
+                {"bucketId": "3p-weekly", "displayName": "Weekly Limit Remaining", "window": "weekly", "remainingFraction": 1},
+                {"bucketId": "3p-5h", "displayName": "Five Hour Limit Remaining", "window": "5h", "remainingFraction": 1}]},
+            {"displayName": "Gemini 4 Argon", "buckets": [
+                {"bucketId": "gemini-argon-wtu-weekly", "displayName": "Gemini 4 Argon Weekly Limit", "window": "weekly", "remainingFraction": 0.989436}]}
+        ]}));
+        let raw = google_quota_buckets("owner", &entitled, &summary, "2030-01-01T00:00:00Z");
+        let pool = raw
+            .iter()
+            .find(|bucket| {
+                bucket.is_resolved()
+                    && bucket
+                        .models
+                        .iter()
+                        .any(|model| model == "gemini-4-hydrogen-xhigh")
+            })
+            .unwrap();
+        assert_eq!(pool.binding.source, "google_subscription_resources_v1");
+        // Hydrogen and Flash tiers share the one pool; Argon/Claude never join.
+        assert_eq!(pool.models.len(), 8);
+        assert!(
+            pool.models
+                .iter()
+                .all(|model| model.starts_with("gemini-3.8-flash")
+                    || model.starts_with("gemini-4-hydrogen"))
+        );
+        let registry = crate::router::quota::ProviderQuotaRegistry::new();
+        registry.observe_buckets("p", &raw, Some(true));
+        for model in [
+            "gemini-4-hydrogen-xhigh",
+            "gemini-4-hydrogen-low",
+            "gemini-3.8-flash-high",
+        ] {
+            assert!(!registry.is_model_schedulable("p", model), "{model}");
+            assert_eq!(registry.model_snapshot("p", model).unwrap().id, pool.id);
+        }
+        assert!(registry.is_model_schedulable("p", "gemini-4-argon-medium"));
+        let cards = |buckets: &[QuotaBucket]| {
+            let mut labels = google_display_buckets(buckets)
+                .into_iter()
+                .filter(is_google_display_bucket)
+                .map(|bucket| bucket.label)
+                .collect::<Vec<_>>();
+            labels.sort();
+            labels
+        };
+        assert_eq!(cards(&raw), vec!["gemini-4-argon", "gemini-4-hydrogen"]);
+
+        // Same plan family without Gemini 4 entitlement: placeholders are
+        // dropped, so the shared pool keeps its Flash headline and no Argon
+        // card is fabricated.
+        let placeholders = parse_available_models_detailed(&serde_json::json!({"models": {
+            "gemini-3.8-flash-high": {"quotaInfo": {"remainingFraction": 0.99}},
+            "gemini-3.8-flash-tiered": {"quotaInfo": {"remainingFraction": 0.99}},
+            "gemini-4-argon-disabled": {"disabled": true},
+            "gemini-4-hydrogen-disabled": {"disabled": true},
+            "gemini-4-carbon-disabled": {"disabled": true}
+        }}));
+        let year = google_quota_buckets(
+            "owner",
+            &placeholders,
+            &summary[..2],
+            "2030-01-01T00:00:00Z",
+        );
+        assert_eq!(cards(&year), vec!["gemini-3.8-flash"]);
     }
 
     #[test]

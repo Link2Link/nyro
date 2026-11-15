@@ -46,13 +46,21 @@ pub(crate) const ANTIGRAVITY_STATIC_MODELS: &[&str] = &[
     "gemini-3.8-flash-medium",
     "gemini-3.8-flash-low",
     "gemini-3.8-flash-tiered",
-    // Gemini 4 Argon (rolled out 2026-10-13 to AI Pro/Ultra subscribers).
-    // The bare id is served as-is; `-high` is the only tier variant the
-    // account catalog advertises so far (mirrors the fetched CLIProxyAPI
-    // registry). Google gates Argon behind a current-generation client —
-    // the versioned User-Agent above must stay fresh for these to route.
-    "gemini-4-argon",
+    // Gemini 4 Hydrogen / Argon (verified 2026-11-15 on a Google AI Pro
+    // account through the daily host): only tier ids are served — the bare
+    // `gemini-4-hydrogen` / `gemini-4-argon` ids answer 404, so both stay
+    // routable as virtual aliases (see `apply_tier_model_rewrite`). Hydrogen
+    // additionally serves `-xhigh`. The prod host neither lists Hydrogen nor
+    // serves it (429), and accounts outside the plan only see
+    // `<family>-disabled` placeholders. Google gates these behind a
+    // current-generation client — the versioned User-Agent must stay fresh.
+    "gemini-4-hydrogen-xhigh",
+    "gemini-4-hydrogen-high",
+    "gemini-4-hydrogen-medium",
+    "gemini-4-hydrogen-low",
     "gemini-4-argon-high",
+    "gemini-4-argon-medium",
+    "gemini-4-argon-low",
     // Claude 5.5 reasoning tiers (verified 2026-10-04 by direct probes):
     // callable on the inference surface but NOT yet listed by the per-account
     // `fetchAvailableModels` catalog, so the curated list must carry them or
@@ -801,12 +809,25 @@ pub(crate) fn parse_quota_summary_buckets(payload: &Value) -> Vec<QuotaSummaryBu
 }
 
 /// Tier suffixes the antigravity surface bakes into model ids.
-const TIER_SUFFIXES: &[&str] = &["-extra-low", "-tiered", "-medium", "-high", "-low"];
+const TIER_SUFFIXES: &[&str] = &[
+    "-extra-low",
+    "-tiered",
+    "-medium",
+    "-xhigh",
+    "-high",
+    "-low",
+];
 
 /// These families expose one public model name; reasoning selects the wire id.
-/// Do not strip suffixes globally: other families (e.g. Argon) serve a real
-/// bare id as well as independently selectable tier variants.
-const UNIFIED_TIER_MODELS: &[&str] = &["claude-opus-5-5", "claude-sonnet-5-5", "gemini-3.8-flash"];
+/// Do not strip suffixes globally: other families may serve a real bare id as
+/// well as independently selectable tier variants.
+const UNIFIED_TIER_MODELS: &[&str] = &[
+    "claude-opus-5-5",
+    "claude-sonnet-5-5",
+    "gemini-3.8-flash",
+    "gemini-4-argon",
+    "gemini-4-hydrogen",
+];
 
 fn unified_tier_base(model: &str) -> Option<&'static str> {
     UNIFIED_TIER_MODELS.iter().copied().find(|base| {
@@ -829,7 +850,8 @@ pub(crate) fn is_tier_suffixed(model: &str) -> bool {
 /// * `minimal` → `-extra-low`
 /// * `low` → `-low`
 /// * `medium` → `-medium`
-/// * `high` / `xhigh` / `max` → `-high`
+/// * `high` → `-high`
+/// * `xhigh` / `max` → `-xhigh` where served (Gemini 4 Hydrogen), else `-high`
 /// * token budgets map by magnitude — as an effort variant or the bare
 ///   `budget_tokens` field (Anthropic `thinking` / Gemini `thinkingBudget`)
 /// * no reasoning directive → `-tiered` when served (Gemini), otherwise `-medium`
@@ -839,6 +861,7 @@ fn tier_ladder(reasoning: &crate::protocol::ir::ReasoningConfig) -> &'static [&'
     const LOW: &[&str] = &["-low", "-extra-low"];
     const MEDIUM: &[&str] = &["-medium", "-low", "-high"];
     const HIGH: &[&str] = &["-high", "-medium", "-low"];
+    const XHIGH: &[&str] = &["-xhigh", "-high", "-medium", "-low"];
     const TIERED: &[&str] = &["-tiered", "-medium"];
     // A thinking budget: an explicit `Budget` effort variant, or the bare
     // `budget_tokens` field when no qualitative effort was expressed
@@ -874,7 +897,8 @@ fn tier_ladder(reasoning: &crate::protocol::ir::ReasoningConfig) -> &'static [&'
         Some(Minimal) => EXTRA_LOW,
         Some(Low) => LOW,
         Some(Medium) => MEDIUM,
-        Some(High | Xhigh | Max) => HIGH,
+        Some(High) => HIGH,
+        Some(Xhigh | Max) => XHIGH,
         // No reasoning directive at all — thinking merely on without a level,
         // or a request that says nothing about reasoning (`ReasoningConfig::
         // default()` across every ingress decoder) — uses the family default:
@@ -978,7 +1002,8 @@ pub(crate) fn subscription_model_catalog(
 /// (pipeline step, runs after `post_encode`; applies to BOTH subscription
 /// channels). Gemini and the unified Claude families resolve against the raw
 /// channel catalog. Without an effort, Gemini 3.8 Flash uses `-tiered`, while
-/// Claude 5.5 has no adaptive tier and falls back to `-medium`.
+/// Claude 5.5 and Gemini 4 Argon/Hydrogen have no adaptive tier and fall back
+/// to `-medium`.
 /// The inner `thinkingConfig` is dropped whenever the model id carries the
 /// tier (the id is the effort on this surface).
 pub(crate) fn apply_tier_model_rewrite(
@@ -1739,68 +1764,108 @@ mod tests {
     }
 
     #[test]
-    fn static_models_carry_gemini_4_argon() {
-        // Argon rides the subscription surface (rolled out 2026-10-13 to
-        // AI Pro/Ultra); the bare id plus the one advertised tier variant
-        // must survive discovery even when the dynamic catalog is stale.
-        assert!(ANTIGRAVITY_STATIC_MODELS.contains(&"gemini-4-argon"));
-        assert!(ANTIGRAVITY_STATIC_MODELS.contains(&"gemini-4-argon-high"));
-        // And it is not filtered as unavailable/usage noise anywhere.
-        assert!(!is_unavailable_subscription_model("gemini-4-argon"));
-        assert!(!is_unavailable_subscription_model("gemini-4-argon-high"));
+    fn static_models_carry_gemini_4_tier_variants_only() {
+        // Verified 2026-11-15 (Google AI Pro, daily host): every tier answers
+        // 200 while the bare family ids answer 404, so the curated fallback
+        // carries tier ids only and the bare ids stay virtual aliases.
+        for id in [
+            "gemini-4-hydrogen-xhigh",
+            "gemini-4-hydrogen-high",
+            "gemini-4-hydrogen-medium",
+            "gemini-4-hydrogen-low",
+            "gemini-4-argon-high",
+            "gemini-4-argon-medium",
+            "gemini-4-argon-low",
+        ] {
+            assert!(ANTIGRAVITY_STATIC_MODELS.contains(&id), "{id}");
+            assert!(!is_unavailable_subscription_model(id), "{id}");
+            assert!(is_tier_suffixed(id), "{id}");
+        }
+        for bare in ["gemini-4-hydrogen", "gemini-4-argon"] {
+            assert!(!ANTIGRAVITY_STATIC_MODELS.contains(&bare), "{bare}");
+            assert!(!is_tier_suffixed(bare), "{bare}");
+            assert_eq!(unified_tier_base(&format!("{bare}-xhigh")), Some(bare));
+        }
     }
 
     #[test]
-    fn argon_respects_catalog_gated_tier_rewrite() {
-        // Bare id served as-is (mirrors the fetched CLIProxyAPI registry)
-        // → never rewritten, whatever the effort.
-        let served: Vec<String> = ["gemini-4-argon", "gemini-4-argon-high"]
+    fn gemini_4_families_map_effort_onto_served_tiers() {
+        use crate::protocol::ir::ReasoningEffort::{High, Low, Max, Medium, Minimal, Xhigh};
+        let catalog: Vec<String> = ANTIGRAVITY_STATIC_MODELS
             .iter()
-            .map(|id| id.to_string())
+            .map(|id| (*id).to_string())
             .collect();
-        assert_eq!(
-            resolve_tiered_model(
-                "gemini-4-argon",
-                &reasoning(Some(crate::protocol::ir::ReasoningEffort::High)),
-                &served
-            ),
-            None
+        let pick = |model: &str, effort: crate::protocol::ir::ReasoningEffort| {
+            resolve_tiered_model(model, &reasoning(Some(effort)), &catalog)
+        };
+        for (effort, hydrogen, argon) in [
+            (Low, "low", "low"),
+            (Minimal, "low", "low"),
+            (crate::protocol::ir::ReasoningEffort::None, "low", "low"),
+            (Medium, "medium", "medium"),
+            (High, "high", "high"),
+            // Only Hydrogen serves -xhigh; Argon degrades to its top tier.
+            (Xhigh, "xhigh", "high"),
+            (Max, "xhigh", "high"),
+        ] {
+            assert_eq!(
+                pick("gemini-4-hydrogen", effort.clone()),
+                Some(format!("gemini-4-hydrogen-{hydrogen}")),
+                "{effort:?}"
+            );
+            assert_eq!(
+                pick("gemini-4-argon", effort.clone()),
+                Some(format!("gemini-4-argon-{argon}")),
+                "{effort:?}"
+            );
+        }
+        // No adaptive tier on either family: no directive → -medium (the
+        // account catalog's defaultAgentModelId is gemini-4-argon-medium).
+        for family in ["gemini-4-hydrogen", "gemini-4-argon"] {
+            assert_eq!(
+                resolve_tiered_model(family, &Default::default(), &catalog),
+                Some(format!("{family}-medium"))
+            );
+        }
+        // Explicit tier ids are never re-mapped, including -xhigh.
+        assert!(
+            resolve_tiered_model("gemini-4-hydrogen-xhigh", &reasoning(Some(Low)), &catalog)
+                .is_none()
         );
-        // Explicit tier id → caller's choice, never rewritten either.
-        assert_eq!(
-            resolve_tiered_model("gemini-4-argon-high", &reasoning(None), &served),
-            None
+        assert!(
+            resolve_tiered_model("gemini-4-argon-low", &reasoning(Some(Max)), &catalog).is_none()
         );
-        // If the account catalog only exposes `-high` while the bare id is
-        // absent (early rollout accounts), a high-effort request lands on
-        // it via the HIGH ladder.
-        let high_only: Vec<String> = ["gemini-4-argon-high"]
-            .iter()
-            .map(|id| id.to_string())
-            .collect();
+        // Flash and Claude keep -high for xhigh/max: they serve no -xhigh.
         assert_eq!(
-            resolve_tiered_model(
-                "gemini-4-argon",
-                &reasoning(Some(crate::protocol::ir::ReasoningEffort::High)),
-                &high_only
-            )
-            .as_deref(),
-            Some("gemini-4-argon-high")
-        );
-        // Lower efforts never get force-upgraded to a higher tier: their
-        // ladders do not include `-high`, so the rewrite fails safe and the
-        // bare id is sent as-is for upstream to answer honestly.
-        assert_eq!(
-            resolve_tiered_model(
-                "gemini-4-argon",
-                &reasoning(Some(crate::protocol::ir::ReasoningEffort::Low)),
-                &high_only
-            ),
-            None
+            pick("gemini-3.8-flash", Max).as_deref(),
+            Some("gemini-3.8-flash-high")
         );
         assert_eq!(
-            resolve_tiered_model("gemini-4-argon", &reasoning(None), &high_only),
-            None
+            pick("claude-opus-5-5", Xhigh).as_deref(),
+            Some("claude-opus-5-5-high")
+        );
+    }
+
+    #[test]
+    fn gemini_4_bare_aliases_resolve_before_discovery_and_rewrite_the_envelope() {
+        // Curated unified tiers back the bare alias even without a snapshot.
+        let (provider, mut body) = google_provider("antigravity", "gemini-4-hydrogen");
+        let catalog = subscription_model_catalog(&provider, None);
+        assert!(catalog.iter().any(|id| id == "gemini-4-hydrogen-xhigh"));
+        assert!(!catalog.iter().any(|id| id == "gemini-4-hydrogen"));
+        body["request"]["generationConfig"] = json!({"thinkingConfig": {"thinkingLevel": "high"}});
+        apply_tier_model_rewrite(
+            &provider,
+            None,
+            &reasoning(Some(crate::protocol::ir::ReasoningEffort::Xhigh)),
+            &mut body,
+        );
+        assert_eq!(body["model"], "gemini-4-hydrogen-xhigh");
+        // The id carries the effort; the inner thinking config is dropped.
+        assert!(
+            body["request"]["generationConfig"]
+                .get("thinkingConfig")
+                .is_none()
         );
     }
 
@@ -2308,10 +2373,10 @@ mod tests {
                     "gemini-3.8-flash",
                     "gemini-3.8-flash-image-high",
                     "gemini-4-argon",
-                    "gemini-4-argon-high",
+                    "gemini-4-hydrogen",
                     "gpt-oss-120b-medium",
                 ],
-                "{channel} must collapse only the three exact families"
+                "{channel} must collapse only the exact unified families"
             );
         }
         let (mut provider, _) = google_provider("default", "gemini-3.8-flash");

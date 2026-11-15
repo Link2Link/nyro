@@ -1431,16 +1431,22 @@ mod probe_routing_tests {
             "gemini-3.8-flash",
             "claude-opus-5-5-high",
             "gemini-4-argon",
+            "gemini-4-hydrogen",
+            "gemini-4-hydrogen-xhigh",
+            "gemini-2.5-flash",
         ]
         .into_iter()
         .map(str::to_string)
         .collect();
         let resolved = google_subscription_probe_models(&provider, None, None, &models);
-        assert_eq!(resolved.len(), 3);
+        assert_eq!(resolved.len(), 5);
         for (model, wire_model) in [
             ("claude-opus-5-5", "claude-opus-5-5-medium"),
             ("claude-sonnet-5-5", "claude-sonnet-5-5-medium"),
             ("gemini-3.8-flash", "gemini-3.8-flash-tiered"),
+            // Bare Gemini 4 ids 404 upstream; probes use the default tier.
+            ("gemini-4-argon", "gemini-4-argon-medium"),
+            ("gemini-4-hydrogen", "gemini-4-hydrogen-medium"),
         ] {
             assert_eq!(resolved.get(model).map(String::as_str), Some(wire_model));
             let (_, _, body) = build_gemini_model_probe_request(
@@ -1458,7 +1464,8 @@ mod probe_routing_tests {
         }
         // Exact tier selections and unrelated families need no translation.
         assert!(!resolved.contains_key("claude-opus-5-5-high"));
-        assert!(!resolved.contains_key("gemini-4-argon"));
+        assert!(!resolved.contains_key("gemini-4-hydrogen-xhigh"));
+        assert!(!resolved.contains_key("gemini-2.5-flash"));
         provider.channel = Some("default".into());
         assert!(google_subscription_probe_models(&provider, None, None, &models).is_empty());
     }

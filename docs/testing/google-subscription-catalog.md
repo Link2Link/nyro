@@ -26,6 +26,15 @@ Auth and admin write the same snapshot format. Admin captures the connected row 
 
 Fresh successful catalogs replace old dynamic probe evidence even when empty. Failed discovery may reuse a matching last-good snapshot. Neither an empty directory nor an absent model proves lack of entitlement; curated discovery additions remain, and manual selections are still probed as requested.
 
+## Live observation: Gemini 4 Hydrogen / Argon (2026-11-15)
+
+Probed from the US VPS egress with Hub UA `antigravity/hub/2.32.1` on two Google AI Pro accounts:
+
+- Entitled account, daily host: the catalog lists `gemini-4-hydrogen-{low,medium,high,xhigh}` and `gemini-4-argon-{low,medium,high}` (plus a `gemini-4-carbon-disabled` Ultra placeholder). Every tier answered 200 on `streamGenerateContent`; the bare `gemini-4-hydrogen` / `gemini-4-argon` ids answered 404. Bare names therefore stay virtual aliases resolved by effort (`xhigh`/`max` → `-xhigh` on Hydrogen only; no directive → `-medium`).
+- Same account, prod host: the catalog omits Hydrogen and Hydrogen inference answers 429. This is why catalog discovery must follow the daily inference host.
+- Quota: Hydrogen calls drew down `gemini-5h` / `gemini-weekly` ("Gemini Models", shared with 3.8 Flash); Argon calls drew down only `gemini-argon-wtu-weekly`.
+- Account outside the plan: only `gemini-4-{argon,hydrogen,carbon}-disabled` placeholders; tier ids answer 404.
+
 ## Probe diagnostics
 
 Existing result errors include public model ID, effective wire model ID, and endpoint-source label; existing run metadata contains the actual base URL. Debug logs carry model mapping and endpoint source without the credential fingerprint or project ID. A 404 hint lists possible model, endpoint/project, client-version, and eligibility causes rather than declaring a subscription plan unsupported. Quota readouts likewise do not prove a 429 cause.
