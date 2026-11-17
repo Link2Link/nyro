@@ -1,6 +1,7 @@
-import { doesNotMatch, equal, match, ok } from "node:assert/strict";
+import { deepEqual, doesNotMatch, equal, match, ok } from "node:assert/strict";
 import { test } from "node:test";
 import { renderToStaticMarkup } from "react-dom/server";
+import { CLAUDE_USAGE_FRESH_MS } from "../lib/claude-usage-windows";
 import type { AccountUsageStats, AccountUsageTotals } from "../lib/types";
 import type { ProviderAccountView } from "../lib/devin-account-pool";
 import { AccountUsageSummary } from "./account-usage-summary";
@@ -178,6 +179,73 @@ test("Claude Fable weekly windows never replace the main weekly projection or by
       match(html, locale === "zh-CN" ? /用于估算的已用比例：34%/ : /Used for projection: 34%/);
       equal(estimateValue(render(s, { ...overrides, account: { ...account, stale: true } })), "—");
       equal(estimateValue(render(s, { ...overrides, error: true })), "—");
+    }
+  }
+});
+
+function claudeHeaderResetSample() {
+  const now = 1_794_897_254_417;
+  const period: AccountUsageTotals = {
+    total_tokens: 46_240_743, request_count: 149,
+    equivalent_costs: [{ currency: "USD", total_cost: 28.252149000000003, priced_request_count: 149 }],
+    unpriced_request_count: 0,
+  };
+  const s: AccountUsageStats = {
+    ...stats, account_id: "claude-header-reset-regression", period,
+    period_start: 1_794_441_600_985, period_end: 1_795_046_400_985,
+  };
+  const weekly = {
+    name: "weekly_limit", used_percent: 14.000000000000002, resets_at: "2026-11-19T00:00:00Z",
+    observed_at: 1_794_897_244_734, source: "inference_header" as const,
+  };
+  const account: ProviderAccountView = {
+    ...estimateAccount, account_id: s.account_id, daily: null, weekly: null,
+    observed_at: 1_794_897_177_063, stale: false, claude_usage: { windows: [weekly] },
+  };
+  return { s, account, period, weekly, now };
+}
+
+test("Claude inference-header reset rounded by 985ms renders the real weekly capacity in both locales without changing recorded totals", () => {
+  const { s, account, period, weekly, now } = claudeHeaderResetSample();
+  const original = structuredClone(s);
+  equal(s.period_end! - Date.parse(weekly.resets_at), 985);
+  for (const locale of ["en-US", "zh-CN"] as const) {
+    const html = render(s, { account, kind: "claude_code", now, locale });
+    equal(estimateValue(html), "≈ $201.80");
+    equal(values(html).join(","), "1.23M,$12.50,46.24M,$28.25");
+    ok(html.includes(period.total_tokens.toLocaleString(locale)));
+    match(html, locale === "zh-CN" ? />本周期<[\s\S]*>预估可用</ : />Current cycle<[\s\S]*>Estimated capacity</);
+    match(html, locale === "zh-CN" ? /用于估算的已用比例：14%/ : /Used for projection: 14%/);
+    match(html, locale === "zh-CN" ? /包含已用部分，并非剩余余额/ : /includes usage so far, not remaining balance/);
+    equal(s.period, period);
+    deepEqual(s, original); // The projection must not rewrite cached tokens, request counts or raw prices.
+  }
+});
+
+test("Claude inference-header estimates reject stale accounts, refresh errors, old observations and reached resets while retaining valid cycle totals in both locales", () => {
+  const { s, account, weekly, now } = claudeHeaderResetSample();
+  const original = structuredClone(s);
+  const headerReset = Date.parse(weekly.resets_at);
+  const rejected: [string, Partial<Parameters<typeof AccountUsageSummary>[0]>][] = [
+    ["stale account", { account: { ...account, stale: true } }],
+    ["refresh error", { error: true }],
+    ["old header observation", { account: { ...account, claude_usage: { windows: [
+      { ...weekly, observed_at: now - CLAUDE_USAGE_FRESH_MS - 1 },
+    ] } } }],
+    // Keep the observation fresh to isolate header expiry during the final 985ms of the recorded cycle.
+    ["header reset reached", { now: headerReset, account: { ...account, claude_usage: { windows: [
+      { ...weekly, observed_at: headerReset - 1 },
+    ] } } }],
+  ];
+  ok(headerReset < s.period_end!);
+  for (const locale of ["en-US", "zh-CN"] as const) {
+    for (const [reason, overrides] of rejected) {
+      const html = render(s, { account, kind: "claude_code", now, locale, ...overrides });
+      equal(estimateValue(html), "—", reason);
+      equal(values(html).join(","), "1.23M,$12.50,46.24M,$28.25", reason);
+      match(html, locale === "zh-CN" ? /暂无可用估算/ : /Estimate unavailable/);
+      doesNotMatch(html, /Current cycle ended|本周期已结束/);
+      deepEqual(s, original, reason);
     }
   }
 });
