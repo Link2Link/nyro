@@ -1,7 +1,7 @@
 import { deepEqual, equal, ok } from "node:assert/strict";
 import { test } from "node:test";
 import { estimateAccountUsagePrice, type AccountUsageKind } from "./account-usage-estimate";
-import type { KiroUsageItem, ProviderAccountView } from "./devin-account-pool";
+import type { ClaudeUsageWindow, KiroUsageItem, ProviderAccountView } from "./devin-account-pool";
 import type { AccountUsageStats } from "./types";
 
 const end = Date.parse("2026-11-07T11:00:00Z");
@@ -65,6 +65,100 @@ test("Claude requires exactly one matching main weekly window", () => {
   for (const selected of [[], [windows[0], windows[2]], [windows[1], windows[1]], [{ ...windows[1], resets_at: null }], [{ ...windows[1], resets_at: new Date(end + 1).toISOString() }]]) {
     equal(project({ ...account, claude_usage: { windows: selected } }, "claude_code"), null);
   }
+});
+
+function headerAccount(resetMs = end, observedAt: number | null = now): ProviderAccountView {
+  return { ...account, claude_usage: { windows: [{
+    name: "weekly_limit", used_percent: 10, resets_at: new Date(resetMs).toISOString(),
+    source: "inference_header", observed_at: observedAt,
+  }] } };
+}
+
+test("Claude header rounding projects the captured 985ms mismatch without rewriting retained totals", () => {
+  const capturedNow = 1_794_897_254_417;
+  const capturedPeriod = { total_tokens: 46_240_743, request_count: 149,
+    equivalent_costs: [{ currency: "USD", total_cost: 28.252149000000003, priced_request_count: 149 }], unpriced_request_count: 0 };
+  const capturedStats: AccountUsageStats = { account_id: "a", all_time: capturedPeriod, period: capturedPeriod,
+    period_start: 1_794_441_600_985, period_end: 1_795_046_400_985 };
+  const capturedAccount: ProviderAccountView = { ...account, observed_at: 1_794_897_177_063, claude_usage: { windows: [{
+    name: "weekly_limit", used_percent: 14.000000000000002, resets_at: "2026-11-19T00:00:00Z",
+    source: "inference_header", observed_at: 1_794_897_244_734,
+  }] } };
+  const before = structuredClone({ capturedStats, capturedAccount });
+  const result = project(capturedAccount, "claude_code", capturedStats, capturedNow);
+  ok(result);
+  equal(result.usedPercent, 14.000000000000002);
+  equal(result.costs[0].total_cost.toFixed(2), "201.80");
+  deepEqual({ capturedStats, capturedAccount }, before);
+});
+
+test("only Claude inference headers allow up to 120 seconds of same-cycle reset skew in either direction", () => {
+  for (const delta of [-120_000, -985, 0, 985, 120_000]) {
+    equal(project(headerAccount(end + delta), "claude_code")?.costs[0].total_cost.toFixed(2), "214.00", `delta=${delta}`);
+  }
+  for (const delta of [-604_800_000, -120_001, 120_001, 604_800_000]) {
+    equal(project(headerAccount(end + delta), "claude_code"), null);
+  }
+  for (const source of [undefined, null, "usage_api"] as const) {
+    const a = headerAccount(end - 985);
+    a.claude_usage!.windows[0].source = source;
+    equal(project(a, "claude_code"), null);
+    a.claude_usage!.windows[0].resets_at = reset;
+    ok(project(a, "claude_code"));
+  }
+  equal(project({ ...account, weekly: { remaining_percent: 90, resets_at: new Date(end - 985).toISOString() } }), null);
+  equal(project({ ...account, kiro_usage: { ...account.kiro_usage!, resets_at: new Date(end - 985).toISOString(),
+    items: [item(10, 100, "base", new Date(end - 985).toISOString())] } }, "kiro"), null);
+});
+
+test("Claude header estimates require both weekly intervals to be active without extending either boundary", () => {
+  for (const delta of [-120_000, -985, 0, 985, 120_000]) {
+    const headerEnd = end + delta;
+    const overlapStart = Math.max(start, headerEnd - 7 * 86_400_000);
+    const overlapEnd = Math.min(end, headerEnd);
+    for (const at of [Math.min(start, headerEnd - 7 * 86_400_000), overlapStart - 1, overlapEnd, Math.max(end, headerEnd)]) {
+      if (at < overlapStart || at >= overlapEnd) equal(project(headerAccount(headerEnd, at), "claude_code", stats, at), null);
+    }
+    for (const at of [overlapStart, overlapStart + 1, overlapEnd - 1]) {
+      ok(project(headerAccount(headerEnd, at), "claude_code", stats, at));
+    }
+  }
+});
+
+test("Claude header freshness is mandatory even when reset matches exactly and never bypasses account stale", () => {
+  for (const delta of [0, -985]) {
+    for (const observedAt of [null, 0, NaN, Infinity, now - 660_001, now + 60_001]) {
+      equal(project(headerAccount(end + delta, observedAt), "claude_code"), null);
+    }
+    const missing = headerAccount(end + delta);
+    delete missing.claude_usage!.windows[0].observed_at;
+    equal(project(missing, "claude_code"), null); // Never fall back to the full snapshot's observation time.
+    for (const observedAt of [now - 660_000, now, now + 60_000]) {
+      ok(project(headerAccount(end + delta, observedAt), "claude_code"));
+    }
+    equal(project({ ...headerAccount(end + delta), stale: true }, "claude_code"), null);
+  }
+});
+
+test("Claude header reset tolerance cannot bypass window, usage, cycle or pricing validation", () => {
+  const a = headerAccount(end - 985);
+  const weekly = a.claude_usage!.windows[0];
+  for (const windows of [[], [weekly, weekly], [{ ...weekly, name: "five_hour" }], [{ ...weekly, name: "feature:fable:weekly_limit" }]]) {
+    equal(project({ ...a, claude_usage: { windows } }, "claude_code"), null);
+  }
+  const invalid: Partial<ClaudeUsageWindow>[] = [
+    { resets_at: null }, { resets_at: "invalid" }, { resets_at: "" }, { used_percent: 0 },
+    { used_percent: -1 }, { used_percent: 101 }, { used_percent: NaN }, { used_percent: Infinity },
+  ];
+  for (const patch of invalid) {
+    equal(project({ ...a, claude_usage: { windows: [{ ...weekly, ...patch }] } }, "claude_code"), null);
+  }
+  equal(project({ ...a, account_id: "other" }, "claude_code"), null);
+  for (const s of [
+    { ...stats, period: null }, { ...stats, period_start: null }, { ...stats, period_end: null },
+    { ...stats, period: { ...totals, request_count: 0 } }, { ...stats, period: { ...totals, equivalent_costs: [] } },
+  ]) equal(project(a, "claude_code", s), null);
+  equal(project({ ...a, claude_usage: { windows: [{ ...weekly, used_percent: 100 }] } }, "claude_code")?.costs[0].total_cost, 21.4);
 });
 
 test("projections retain native currencies, fractional precision, partial pricing and explicit priced zero", () => {

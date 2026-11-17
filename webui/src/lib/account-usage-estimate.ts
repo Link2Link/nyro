@@ -1,8 +1,14 @@
 import type { AccountPoolView, ProviderAccountView } from "./devin-account-pool";
+import { claudeWindowView } from "./claude-usage-windows";
 import { kiroAccountResources } from "./kiro-pool-usage";
 import type { AccountUsageStats, EquivalentCostTotal } from "./types";
 
 export type AccountUsageKind = NonNullable<AccountPoolView["kind"]>;
+
+// Same rounding budget as CLAUDE_SAME_CYCLE_SKEW_MS in provider/account_pool.rs.
+// Unlike backend display merging, projection must reject later-cycle headers too.
+const CLAUDE_SAME_CYCLE_SKEW_MS = 120_000;
+const WEEK_MS = 7 * 86_400_000;
 
 function cycleUsedPercent(account: ProviderAccountView, kind: AccountUsageKind, end: number, now: number): number | null {
   const matchesReset = (reset: string | null | undefined) => reset != null && Date.parse(reset) === end;
@@ -14,7 +20,16 @@ function cycleUsedPercent(account: ProviderAccountView, kind: AccountUsageKind, 
   if (kind === "claude_code") {
     // Never extrapolate weekly log prices from a 5h or model-specific window.
     const windows = account.claude_usage?.windows.filter((window) => window.name === "weekly_limit") ?? [];
-    return windows.length === 1 && matchesReset(windows[0].resets_at) ? windows[0].used_percent : null;
+    if (windows.length !== 1) return null;
+    const window = windows[0];
+    if (window.source !== "inference_header") return matchesReset(window.resets_at) ? window.used_percent : null;
+    const reset = window.resets_at == null ? NaN : Date.parse(window.resets_at);
+    // Only match active overlapping weeks; tolerance must never extend either cycle
+    // or change the backend interval used to price retained logs. Exact header
+    // matches still require their own fresh observation, not the full snapshot clock.
+    return Number.isFinite(reset) && Math.abs(reset - end) <= CLAUDE_SAME_CYCLE_SKEW_MS
+      && reset - WEEK_MS <= now && now < reset && claudeWindowView(window, account, now).fresh
+      ? window.used_percent : null;
   }
   const usage = account.kiro_usage;
   if (!usage) return null;
