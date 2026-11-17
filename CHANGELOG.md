@@ -4,6 +4,16 @@ All notable changes to Nyro will be documented in this file.
 
 ---
 
+## v2.1.44
+
+> Released on 2026-11-17
+
+#### Fixes
+
+- **Claude account capacity estimates** (#33): inference-header weekly reset times now tolerate up to 120 seconds of rounding difference from the usage-API cycle, fixing missing estimates when the two sources differ by milliseconds. Both weekly intervals must be active and the header observation fresh; stale accounts and invalid pricing remain unavailable. Retained-log totals, quota scheduling and other provider types are unchanged.
+
+---
+
 ## v2.1.43
 
 > Released on 2026-11-16
