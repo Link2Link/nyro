@@ -1,6 +1,6 @@
 import type { NyroUpstreamProvider, NyroUpstreamUsage, Provider, ProviderUsage } from "./types";
 import { nativeProviderProtocol } from "./native-provider";
-import { accountStateLabel } from "./devin-account-pool";
+import { accountStateLabel, type PoolQuotaWindow } from "./devin-account-pool";
 
 export interface ProviderUsagePause {
   message: string;
@@ -209,18 +209,64 @@ export interface GroupUsageSummary {
   balances: { currency: string; total: number }[];
 }
 
-/** Worst main-window tier of one usage report. `feature:` tiers are extra
- * detail, never the routing quota, so they never drive the group summary.
- * A chained Nyro reports its upstream providers' windows instead of its own. */
+/** Anonymous windows are already aggregated by core; never infer capacity from route membership. */
+function nyroUpstreamPoolCandidates(usage?: Pick<ProviderUsage, "pool_quota"> | null): [string, PoolQuotaWindow][] {
+  const pool = usage?.pool_quota;
+  if (!pool) return [];
+  const candidates: [string, PoolQuotaWindow][] = [];
+  if (pool.daily) candidates.push(["daily", pool.daily]);
+  if (pool.weekly) candidates.push(["weekly_limit", pool.weekly]);
+  for (const window of pool.claude_windows ?? []) {
+    if ((window.name === "five_hour" || window.name === "weekly_limit") && window.quota) {
+      candidates.push([window.name, window.quota]);
+    }
+  }
+  return candidates;
+}
+
+/** Presence also includes conflicts, so an old flat tier cannot hide unknown pool usage. */
+export const nyroUpstreamPoolWindowNames = (usage?: Pick<ProviderUsage, "pool_quota"> | null) =>
+  new Set(nyroUpstreamPoolCandidates(usage).map(([name]) => name));
+
+export function nyroUpstreamPoolWindows(usage?: Pick<ProviderUsage, "pool_quota"> | null): [string, PoolQuotaWindow][] {
+  const candidates = nyroUpstreamPoolCandidates(usage);
+  return ["five_hour", "daily", "weekly_limit"].flatMap((name): [string, PoolQuotaWindow][] => {
+    const matching = candidates.filter(([key]) => key === name).map(([, quota]) => quota);
+    const first = matching[0];
+    // Conflicting duplicates are unknown, never an optimistic first/max observation.
+    if (!first || matching.some((quota) => Object.keys(first).some((field) =>
+      quota[field as keyof PoolQuotaWindow] !== first[field as keyof PoolQuotaWindow]))) return [];
+    return [[name, first]];
+  });
+}
+
+/** A partial/stale pool must not look like a fresh 0% or a smaller complete pool. */
+export function nyroUpstreamPoolUsedPercent(window: PoolQuotaWindow): number | null {
+  const used = window.used_percent;
+  return window.capacity_complete && !window.stale && Number.isFinite(window.total_units) && window.total_units > 0
+    && window.total_accounts > 0 && window.known_accounts === window.total_accounts
+    && used != null && Number.isFinite(used) && used >= 0 && used <= 100 ? used : null;
+}
+
+/** Worst main-window observation, for display only. Feature tiers never decide the summary. */
 function worstMainTier(usage: ProviderUsage): { tier: string; percent: number } | null {
   let worst: { tier: string; percent: number } | null = null;
-  const tiers = usage.upstream
-    ? usage.upstream.providers.flatMap((provider) => provider.usage?.tiers ?? [])
-    : usage.tiers;
-  for (const tier of tiers) {
-    if (tier.name.startsWith("feature:") || !Number.isFinite(tier.used_percent)) continue;
-    const percent = Math.min(Math.max(tier.used_percent, 0), 100);
-    if (!worst || percent > worst.percent) worst = { tier: tier.name, percent };
+  const observations = usage.upstream
+    ? usage.upstream.providers.flatMap((provider) => provider.status === "ok" && provider.usage ? [provider.usage] : [])
+    : [usage];
+  for (const observation of observations) {
+    const windows = nyroUpstreamPoolWindows(observation);
+    const poolNames = nyroUpstreamPoolWindowNames(observation);
+    const tiers = (observation.tiers ?? []).filter((tier) => !poolNames.has(tier.name));
+    for (const [name, window] of windows) {
+      const used = nyroUpstreamPoolUsedPercent(window);
+      if (used != null) tiers.push({ name, used_percent: used });
+    }
+    for (const tier of tiers) {
+      if (tier.name.startsWith("feature:") || !Number.isFinite(tier.used_percent)) continue;
+      const percent = Math.min(Math.max(tier.used_percent, 0), 100);
+      if (!worst || percent > worst.percent) worst = { tier: tier.name, percent };
+    }
   }
   return worst;
 }

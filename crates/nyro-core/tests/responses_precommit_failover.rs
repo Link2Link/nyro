@@ -166,7 +166,7 @@ async fn provider(gw: &Gateway, name: &str, url: &str) -> anyhow::Result<String>
             api_key: "fixture-local-secret".into(),
             auth_mode: "apikey".into(),
             use_proxy: false,
-            fast_mode: false,
+            fast_mode: Default::default(),
         })
         .await?
         .id)

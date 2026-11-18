@@ -2307,7 +2307,7 @@ mod lifecycle_tests {
                 api_key: String::new(),
                 auth_mode: "oauth".into(),
                 use_proxy: false,
-                fast_mode: false,
+                fast_mode: Default::default(),
             })
             .await?;
 
@@ -2382,7 +2382,7 @@ mod lifecycle_tests {
                 api_key: String::new(),
                 auth_mode: "oauth".into(),
                 use_proxy: false,
-                fast_mode: false,
+                fast_mode: Default::default(),
             })
             .await?;
         let store = gw.storage.oauth_credentials();

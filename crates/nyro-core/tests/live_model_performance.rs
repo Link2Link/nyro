@@ -74,7 +74,7 @@ async fn live_completion_metadata_is_diagnostic_and_performance_matches_usage() 
             api_key: "test".to_string(),
             auth_mode: "apikey".to_string(),
             use_proxy: false,
-            fast_mode: false,
+            fast_mode: Default::default(),
         })
         .await?;
     // One specific entry matches the exact model; a non-boundary prefix must not.

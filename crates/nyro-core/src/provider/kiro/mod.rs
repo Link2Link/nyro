@@ -230,7 +230,7 @@ mod tests {
             api_key: String::new(),
             auth_mode: "oauth".into(),
             use_proxy: false,
-            fast_mode: false,
+            fast_mode: Default::default(),
             last_test_success: None,
             last_test_at: None,
             is_enabled: true,

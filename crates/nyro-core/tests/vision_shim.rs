@@ -96,7 +96,7 @@ fn provider_row_with_protocol(id: &str, base_url: &str, protocol: &str) -> Provi
         api_key: "test-key".to_string(),
         auth_mode: "apikey".to_string(),
         use_proxy: false,
-        fast_mode: false,
+        fast_mode: Default::default(),
         last_test_success: None,
         last_test_at: None,
         is_enabled: true,

@@ -1,0 +1,72 @@
+{
+  "artifact": "quota-buckets-preview.html",
+  "checks": [
+    {
+      "type": "layout",
+      "width": 1440,
+      "height": 900,
+      "scrollWidth": 1440,
+      "scrollHeight": 900,
+      "overflowing": []
+    },
+    {
+      "type": "layout",
+      "width": 1600,
+      "height": 1000,
+      "scrollWidth": 1600,
+      "scrollHeight": 1000,
+      "overflowing": []
+    },
+    {
+      "type": "layout",
+      "width": 1920,
+      "height": 1080,
+      "scrollWidth": 1920,
+      "scrollHeight": 1080,
+      "overflowing": []
+    },
+    {
+      "type": "layout",
+      "width": 2048,
+      "height": 1320,
+      "scrollWidth": 2048,
+      "scrollHeight": 1320,
+      "overflowing": []
+    },
+    {
+      "type": "layout",
+      "width": 390,
+      "height": 844,
+      "scrollWidth": 375,
+      "scrollHeight": 1780,
+      "overflowing": []
+    },
+    {
+      "type": "behavior",
+      "name": "Flash exhaustion does not block Argon",
+      "passed": true
+    },
+    {
+      "type": "behavior",
+      "name": "Bucket filtering and provider cost reconciliation",
+      "passed": true
+    },
+    {
+      "type": "behavior",
+      "name": "Stale refresh preserves block and suppresses estimates",
+      "passed": true
+    },
+    {
+      "type": "behavior",
+      "name": "Theme, mapping and policy dialogs",
+      "passed": true
+    }
+  ],
+  "screenshots": [
+    "quota-buckets-desktop.png",
+    "quota-buckets-flash-exhausted.png",
+    "quota-buckets-details.png",
+    "quota-buckets-light.png"
+  ],
+  "containsDemoData": true
+}

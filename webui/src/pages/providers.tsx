@@ -2,6 +2,8 @@ import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { backend } from "@/lib/backend";
 import { oauthCompletionMode, useOAuthSession } from "@/lib/use-oauth-session";
+import { ProviderSpeedMode } from "@/components/provider-speed-mode";
+import { speedModeForChannel } from "@/lib/provider-speed-mode";
 import { KiroCredentialImport } from "@/components/kiro-credential-import";
 import { KiroLoginOptionsForm } from "@/components/kiro-login-options";
 import { kiroLoginConfigured, kiroLoginOptions } from "@/lib/kiro-login";
@@ -111,7 +113,7 @@ const emptyCreate: CreateProvider = {
   protocol_mode: "fixed",
   protocol_endpoints: [],
   use_proxy: false,
-  fast_mode: false,
+  fast_mode: "normal",
   auth_mode: "apikey",
   preset_key: "",
   channel: "",
@@ -1035,7 +1037,7 @@ export default function ProvidersPage() {
     protocol_mode: "fixed",
     protocol_endpoints: [],
     use_proxy: false,
-    fast_mode: false,
+    fast_mode: "normal",
     preset_key: "",
     channel: "",
     models_source: "",
@@ -1778,7 +1780,7 @@ export default function ProvidersPage() {
         protocol_mode: "adaptive",
         protocol_endpoints: endpoints,
         use_proxy: p.use_proxy,
-        fast_mode: Boolean(p.fast_mode),
+        fast_mode: speedModeForChannel(channel, p.fast_mode),
         preset_key: p.preset_key || presetForEdit?.id || DEFAULT_PRESET_ID,
         channel,
         models_source: p.models_source ?? "",
@@ -1805,7 +1807,7 @@ export default function ProvidersPage() {
         priority: endpoint.priority,
       })),
       use_proxy: p.use_proxy,
-      fast_mode: Boolean(p.fast_mode),
+      fast_mode: speedModeForChannel(channel, p.fast_mode),
       preset_key: p.preset_key || presetForEdit?.id || DEFAULT_PRESET_ID,
       channel,
       models_source: p.models_source ?? "",
@@ -1881,6 +1883,7 @@ export default function ProvidersPage() {
     const config = resolvePresetConfig(selectedPreset, nextProtocol, nextChannelId);
     const nextBaseUrl = config.baseUrl || protocolUrl(nextProtocol);
 
+    const channelFields = { channel: nextChannelId, fast_mode: speedModeForChannel(nextChannelId, form.fast_mode) };
     const nextSharedChannel = presetSharedKeyChannel(selectedPreset, nextChannelId);
     if (nextSharedChannel && nextAuthMode === "apikey") {
       const seeded = seedSharedKeyEndpoints(
@@ -1890,7 +1893,7 @@ export default function ProvidersPage() {
       );
       setForm((prev) => ({
         ...prev,
-        channel: nextChannelId,
+        ...channelFields,
         protocol: seeded.defaultProtocol,
         protocol_mode: "adaptive",
         protocol_endpoints: seeded.endpoints,
@@ -1915,7 +1918,7 @@ export default function ProvidersPage() {
       ) {
         return {
           ...prev,
-          channel: nextChannelId,
+          ...channelFields,
           auth_mode: nextAuthMode,
           models_source: config.modelsSource,
           static_models: config.staticModels,
@@ -1923,7 +1926,7 @@ export default function ProvidersPage() {
       }
       return {
         ...prev,
-        channel: nextChannelId,
+        ...channelFields,
         protocol: nextProtocol,
         protocol_mode: "fixed",
         protocol_endpoints: [],
@@ -1973,6 +1976,7 @@ export default function ProvidersPage() {
               vendor: preset.id === DEFAULT_PRESET_ID ? undefined : preset.id,
               preset_key: preset.id,
               channel: nextChannelId,
+              fast_mode: "normal",
               protocol: nextProtocol,
               protocol_mode: "fixed",
               protocol_endpoints: [],
@@ -2198,26 +2202,8 @@ export default function ProvidersPage() {
                   ))}
                 </ToggleGroup>
               </div>
-              {["sub2api", "codex"].includes(createChannelValue) && (
-                <div className="col-span-2 space-y-2">
-                  <div className="flex items-center justify-between rounded-lg border border-slate-200 bg-white px-3 py-2.5">
-                    <div>
-                      <span className="text-sm font-medium text-slate-800">
-                        {isZh ? "Fast 模式" : "Fast Mode"}
-                      </span>
-                      <p className="mt-1 text-xs text-slate-500">
-                        {isZh
-                          ? "开启后上游请求自动附加 service_tier=priority（OpenAI Fast mode，优先处理）。客户端显式指定 service_tier 时优先保留。"
-                          : "When enabled, upstream requests get service_tier=priority (OpenAI Fast mode, priority processing). An explicit client service_tier wins."}
-                      </p>
-                    </div>
-                    <Switch
-                      checked={Boolean(form.fast_mode)}
-                      onCheckedChange={(checked) => setForm({ ...form, fast_mode: checked })}
-                    />
-                  </div>
-                </div>
-              )}
+              <ProviderSpeedMode channel={createChannelValue} value={form.fast_mode} isZh={isZh}
+                onChange={(mode) => setForm({ ...form, fast_mode: mode })} className="col-span-2 space-y-2" />
               {createIsDevinOAuth && <>
                 <p className="col-span-2 text-xs text-slate-500">{isZh
                   ? "账号类型自动识别，无需选择套餐。Pro / Team Full Seat 和 Max 可加入同一账号池。"
@@ -2721,6 +2707,7 @@ export default function ProvidersPage() {
                     }
                     const input: CreateProvider = {
                       ...form,
+                      fast_mode: speedModeForChannel(createChannelValue, form.fast_mode),
                       protocol,
                       base_url: baseUrl,
                       api_key: adaptive ? (defaultEndpoint?.api_key ?? "") : form.api_key,
@@ -2977,6 +2964,7 @@ export default function ProvidersPage() {
                             ? (nextBaseUrl || defaultVertexBaseUrl(resolvedProtocol))
                             : nextBaseUrl;
                           setEditError(null);
+                          const channelFields = { channel: value, fast_mode: speedModeForChannel(value, editForm.fast_mode) };
                           const nextSharedChannel = presetSharedKeyChannel(editingPreset, value);
                           if (nextSharedChannel && nextAuthMode === "apikey" && !editUsesVertexServiceAccount) {
                             const seeded = seedSharedKeyEndpoints(
@@ -2986,7 +2974,7 @@ export default function ProvidersPage() {
                             );
                             setEditForm({
                               ...editForm,
-                              channel: value,
+                              ...channelFields,
                               auth_mode: nextAuthMode,
                               protocol_mode: "adaptive",
                               protocol: seeded.defaultProtocol,
@@ -3005,7 +2993,7 @@ export default function ProvidersPage() {
                           ) {
                             setEditForm({
                               ...editForm,
-                              channel: value,
+                              ...channelFields,
                               auth_mode: nextAuthMode,
                               models_source: config.modelsSource,
                               static_models: config.staticModels,
@@ -3014,7 +3002,7 @@ export default function ProvidersPage() {
                           }
                           setEditForm({
                             ...editForm,
-                            channel: value,
+                            ...channelFields,
                             protocol: resolvedProtocol,
                             protocol_mode: "fixed",
                             protocol_endpoints: [],
@@ -3935,22 +3923,8 @@ export default function ProvidersPage() {
                         </div>
                       </div>
                     )}
-                    {["sub2api", "codex"].includes(editForm.channel ?? "") && (
-                      <div className="space-y-2">
-                        <FieldLabel>{isZh ? "Fast 模式" : "Fast Mode"}</FieldLabel>
-                        <div className="flex items-center justify-between rounded-lg border border-slate-200 bg-white px-3 py-2.5">
-                          <span className="text-xs text-slate-600">
-                            {isZh
-                              ? "开启后上游请求自动附加 service_tier=priority（OpenAI Fast mode，优先处理）。客户端显式指定 service_tier 时优先保留。"
-                              : "When enabled, upstream requests get service_tier=priority (OpenAI Fast mode, priority processing). An explicit client service_tier wins."}
-                          </span>
-                          <Switch
-                            checked={Boolean(editForm.fast_mode)}
-                            onCheckedChange={(checked) => setEditForm({ ...editForm, fast_mode: checked })}
-                          />
-                        </div>
-                      </div>
-                    )}
+                    <ProviderSpeedMode channel={editForm.channel} value={editForm.fast_mode} isZh={isZh}
+                      onChange={(mode) => setEditForm({ ...editForm, fast_mode: mode })} className="space-y-2" />
                   </div>
                   <div className="flex gap-3">
                     <Button
@@ -4015,7 +3989,7 @@ export default function ProvidersPage() {
                               }))
                             : [],
                           use_proxy: Boolean(editForm.use_proxy),
-                          fast_mode: Boolean(editForm.fast_mode),
+                          fast_mode: speedModeForChannel(editForm.channel, editForm.fast_mode),
                           preset_key: editForm.preset_key || undefined,
                           channel: editForm.channel || undefined,
                           models_source: editForm.models_source ?? "",

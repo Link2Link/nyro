@@ -14,7 +14,7 @@ import type { Model, ModelRatingEntry, Provider } from "./types";
 const time = "2026-08-01T10:20:30Z";
 const provider = (id: string, name = id, is_enabled = true): Provider => ({
   id, name, is_enabled, protocol: "openai-compatible", base_url: "https://example.invalid",
-  use_proxy: false, fast_mode: false, created_at: time, updated_at: time,
+  use_proxy: false, fast_mode: "normal", created_at: time, updated_at: time,
 });
 const entry = (model_prefix: string, score: number, updated_at = time): ModelRatingEntry => ({
   model_prefix, score, updated_at,

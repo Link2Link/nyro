@@ -13,7 +13,7 @@ import { resolveProviderIconKey } from "./provider-icon-resolve";
 const time = "2026-09-08T00:00:00.000Z";
 const provider = (id: string, name = id, is_enabled = true, identity: Partial<Provider> = {}): Provider => ({
   id, name, is_enabled, protocol: "openai-compatible", base_url: "http://example.invalid",
-  use_proxy: false, fast_mode: false, created_at: time, updated_at: time, ...identity,
+  use_proxy: false, fast_mode: "normal", created_at: time, updated_at: time, ...identity,
 });const stats = (average_tps: number | null = 42.123456, valid_tps_count = 5): PerformanceStats => ({
   average_tps, valid_tps_count, selected_request_count: 10,
   first_sample_at: valid_tps_count ? 1000 : null, last_sample_at: valid_tps_count ? 2000 : null,

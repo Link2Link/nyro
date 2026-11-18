@@ -305,7 +305,7 @@ async fn responses_compat_close_case(
             api_key: "test-key".into(),
             auth_mode: "apikey".into(),
             use_proxy: false,
-            fast_mode: false,
+            fast_mode: Default::default(),
         })
         .await?
         .id;
@@ -593,7 +593,7 @@ async fn forced_stream_incomplete_reason_is_not_automatically_token_limited() ->
             api_key: "secret".into(),
             auth_mode: "apikey".into(),
             use_proxy: false,
-            fast_mode: false,
+            fast_mode: Default::default(),
         })
         .await?;
     route(&gw, "forced", p.id, "ok", vec![]).await?;
@@ -701,7 +701,7 @@ async fn provider(gw: &Gateway, url: &str) -> anyhow::Result<String> {
             api_key: "secret".into(),
             auth_mode: "apikey".into(),
             use_proxy: false,
-            fast_mode: false,
+            fast_mode: Default::default(),
         })
         .await?
         .id)

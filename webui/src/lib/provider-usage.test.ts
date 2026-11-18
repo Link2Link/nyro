@@ -1,6 +1,7 @@
 import { deepEqual, equal } from "node:assert/strict";
 import { test } from "node:test";
-import { isKiroOverage, nyroUpstreamView, providerApiPriceSupported, providerUsagePause, providerUsageSupported, providerUsageTitle, summarizeGroupUsage, tierLabel } from "./provider-usage";
+import { isKiroOverage, nyroUpstreamPoolUsedPercent, nyroUpstreamPoolWindowNames, nyroUpstreamPoolWindows, nyroUpstreamView, providerApiPriceSupported, providerUsagePause, providerUsageSupported, providerUsageTitle, summarizeGroupUsage, tierLabel } from "./provider-usage";
+import type { PoolQuotaWindow } from "./devin-account-pool";
 import type { NyroUpstreamProvider, ProviderUsage } from "./types";
 
 const kiro = { vendor: "kiro", preset_key: "kiro", channel: "ide", auth_mode: "oauth" as const, base_url: "https://q.us-east-1.amazonaws.com" };
@@ -215,4 +216,74 @@ test("group summary reads a chained Nyro's upstream windows, never its remote ba
   equal(s.peak?.percent, 72);
   const balancesOnly = summarizeGroupUsage([{ name: "edge", usage: usage({ kind: "nyro_gateway", balances: [{ currency: "CNY", total: 1 } as never], upstream: { providers: [] } }) }]);
   deepEqual(balancesOnly.balances, []);
+});
+
+const anonymousPoolWindow = (over: Partial<PoolQuotaWindow> = {}): PoolQuotaWindow => ({
+  total_units: 2, total_accounts: 2, capacity_complete: true, known_accounts: 2,
+  known_remaining_units: 0.8, used_units: 1.2, remaining_units: 0.8,
+  used_percent: 60, remaining_percent: 40, stale: false, next_reset_at: resetAt,
+  next_reset_accounts: 1, reset_mode: "staggered", ...over,
+});
+
+test("forwarded anonymous pool windows use canonical order without private account configuration", () => {
+  const fiveHour = anonymousPoolWindow({ used_percent: 40 });
+  const daily = anonymousPoolWindow({ used_percent: 60 });
+  const weekly = anonymousPoolWindow({ used_percent: 80 });
+  const remote = usage({ pool_quota: { daily, weekly, estimated: false,
+    claude_windows: [{ name: "five_hour", quota: fiveHour }, { name: "five_hour", quota: { ...fiveHour } },
+      { name: "private-future-window", quota: anonymousPoolWindow() } as never] } });
+  deepEqual(nyroUpstreamPoolWindows(remote), [["five_hour", fiveHour], ["daily", daily], ["weekly_limit", weekly]]);
+  deepEqual(nyroUpstreamPoolWindows(usage({})), []);
+  deepEqual(nyroUpstreamPoolWindows(null), []);
+});
+
+test("conflicting duplicate anonymous Claude pool windows are withheld rather than first-wins", () => {
+  const fiveHour = anonymousPoolWindow({ used_percent: 20 });
+  const weekly = anonymousPoolWindow({ used_percent: 75 });
+  const remote = usage({ pool_quota: { daily: null, weekly: null, estimated: false,
+    claude_windows: [{ name: "five_hour", quota: fiveHour },
+      { name: "five_hour", quota: { ...fiveHour, used_percent: 90 } }, { name: "weekly_limit", quota: weekly }] } });
+  deepEqual(nyroUpstreamPoolWindows(remote), [["weekly_limit", weekly]]);
+});
+
+test("anonymous pool window presence includes conflicts and same-name observations with no usage value", () => {
+  const daily = anonymousPoolWindow({ used_percent: null });
+  const remote = usage({ tiers: [{ name: "daily", used_percent: 99 }, { name: "weekly_limit", used_percent: 10 }],
+    pool_quota: { daily, weekly: anonymousPoolWindow({ used_percent: 20 }), estimated: false,
+      claude_windows: [{ name: "weekly_limit", quota: anonymousPoolWindow({ used_percent: 90 }) }] } });
+  deepEqual([...nyroUpstreamPoolWindowNames(remote)].sort(), ["daily", "weekly_limit"]);
+  deepEqual(nyroUpstreamPoolWindows(remote), [["daily", daily]]);
+  equal(summarizeGroupUsage([{ name: "edge", usage: usage({ upstream: { providers: [upstream("pool", { usage: remote })] } }) }]).peak, null);
+  deepEqual([...nyroUpstreamPoolWindowNames(usage({}))], []);
+  deepEqual([...nyroUpstreamPoolWindowNames(null)], []);
+});
+
+test("anonymous pool utilization requires complete fresh coverage and finite capacity", () => {
+  equal(nyroUpstreamPoolUsedPercent(anonymousPoolWindow()), 60);
+  for (const used_percent of [0, 100]) {
+    equal(nyroUpstreamPoolUsedPercent(anonymousPoolWindow({ used_percent })), used_percent);
+  }
+  for (const over of [
+    { capacity_complete: false }, { total_units: 0 }, { total_units: NaN }, { total_units: Infinity },
+    { total_accounts: 0 }, { known_accounts: 1 }, { known_accounts: 3 }, { stale: true },
+    { used_percent: null }, { used_percent: NaN }, { used_percent: Infinity }, { used_percent: -1 }, { used_percent: 101 },
+  ]) equal(nyroUpstreamPoolUsedPercent(anonymousPoolWindow(over)), null);
+});
+
+test("a chained Nyro summary and urgency order include real anonymous pool quota, never partial or stale numerics", () => {
+  const providers = [
+    upstream("low", { usage: usage({ pool_quota: { daily: anonymousPoolWindow({ used_percent: 10 }), weekly: null, estimated: false } }) }),
+    upstream("high", { usage: usage({ tiers: [{ name: "five_hour", used_percent: 41 }], pool_quota: {
+      daily: anonymousPoolWindow({ used_percent: 80 }), weekly: null, estimated: false } }) }),
+    upstream("partial", { usage: usage({ pool_quota: { daily: anonymousPoolWindow({ capacity_complete: false, used_percent: 99 }), weekly: null, estimated: false } }) }),
+    upstream("stale", { usage: usage({ pool_quota: { daily: anonymousPoolWindow({ stale: true, used_percent: 100 }), weekly: null, estimated: false } }) }),
+    upstream("unknown", { usage: usage({ pool_quota: { daily: anonymousPoolWindow({ used_percent: null }), weekly: null, estimated: false } }) }),
+  ];
+  const report = { providers };
+  const summary = summarizeGroupUsage([{ name: "edge", usage: usage({ kind: "nyro_gateway", upstream: report }) }]);
+  deepEqual(summary.peak, { name: "edge", tier: "daily", percent: 80 });
+  deepEqual(nyroUpstreamView(report).shown.map((provider) => provider.name), ["high", "low", "partial", "stale", "unknown"]);
+  for (const provider of providers.slice(2)) {
+    equal(summarizeGroupUsage([{ name: "edge", usage: usage({ upstream: { providers: [provider] } }) }]).peak, null);
+  }
 });

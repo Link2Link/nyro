@@ -177,7 +177,7 @@ mod tests {
             keys: vec![],
             api_key: String::new(),
             use_proxy: false,
-            fast_mode: false,
+            fast_mode: Default::default(),
             auth_mode: "apikey".to_string(),
             preset_key: None,
             channel: None,

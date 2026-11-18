@@ -72,6 +72,53 @@ pub fn resolve_preset_channel_auth_mode(
     Some(auth_mode_to_legacy(channel.auth_mode).to_string())
 }
 
+/// Speed preference for OpenAI Responses consumer channels. The integer SQL
+/// representation preserves legacy false (0) and true (1) rows; on the API
+/// and in backups the representation is always a lowercase name.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, sqlx::Type)]
+#[serde(rename_all = "lowercase")]
+#[repr(i32)]
+pub enum OpenAiSpeedMode {
+    #[default]
+    Normal = 0,
+    Fast = 1,
+    Ultrafast = 2,
+}
+
+impl OpenAiSpeedMode {
+    pub fn service_tier(self) -> Option<&'static str> {
+        match self {
+            Self::Normal => None,
+            Self::Fast => Some("fast"),
+            Self::Ultrafast => Some("ultrafast"),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for OpenAiSpeedMode {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Input {
+            Legacy(bool),
+            Mode(String),
+        }
+        match Input::deserialize(deserializer)? {
+            Input::Legacy(false) => Ok(Self::Normal),
+            Input::Legacy(true) => Ok(Self::Fast),
+            Input::Mode(mode) => match mode.as_str() {
+                "normal" => Ok(Self::Normal),
+                "fast" => Ok(Self::Fast),
+                "ultrafast" => Ok(Self::Ultrafast),
+                other => Err(serde::de::Error::unknown_variant(
+                    other,
+                    &["normal", "fast", "ultrafast"],
+                )),
+            },
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
 pub struct Provider {
     pub id: String,
@@ -100,12 +147,11 @@ pub struct Provider {
     pub auth_mode: String,
     #[serde(default)]
     pub use_proxy: bool,
-    /// Channel-specific fast-mode switch (e.g. sub2api or Codex): when enabled,
-    /// outbound OpenAI Responses requests get `service_tier: "priority"`
-    /// injected unless the client already set the field.
+    /// Inject the selected service tier for Codex/sub2api Responses requests
+    /// only when the client did not supply one.
     #[serde(default)]
     #[sqlx(default)]
-    pub fast_mode: bool,
+    pub fast_mode: OpenAiSpeedMode,
     pub last_test_success: Option<bool>,
     pub last_test_at: Option<String>,
     pub is_enabled: bool,
@@ -717,7 +763,7 @@ pub struct CreateProvider {
     #[serde(default)]
     pub use_proxy: bool,
     #[serde(default)]
-    pub fast_mode: bool,
+    pub fast_mode: OpenAiSpeedMode,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -739,7 +785,7 @@ pub struct UpdateProvider {
     pub api_key: Option<String>,
     pub auth_mode: Option<String>,
     pub use_proxy: Option<bool>,
-    pub fast_mode: Option<bool>,
+    pub fast_mode: Option<OpenAiSpeedMode>,
     pub is_enabled: Option<bool>,
 }
 
@@ -1789,7 +1835,7 @@ pub struct ExportProvider {
     #[serde(default)]
     pub use_proxy: bool,
     #[serde(default)]
-    pub fast_mode: bool,
+    pub fast_mode: OpenAiSpeedMode,
     pub is_enabled: bool,
 }
 
@@ -1876,6 +1922,43 @@ impl UpdateProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn speed_mode_reads_old_booleans_and_writes_only_canonical_names() {
+        use OpenAiSpeedMode::*;
+        use serde_json::{from_value, json, to_value};
+
+        for (old, mode, new) in [
+            (json!(false), Normal, "normal"),
+            (json!(true), Fast, "fast"),
+            (json!("ultrafast"), Ultrafast, "ultrafast"),
+        ] {
+            assert_eq!(from_value::<OpenAiSpeedMode>(old.clone()).unwrap(), mode);
+            assert_eq!(from_value::<OpenAiSpeedMode>(json!(new)).unwrap(), mode);
+            assert_eq!(to_value(mode).unwrap(), json!(new));
+            let mut backup = json!({
+                "name":"test", "protocol":"openai", "base_url":"", "api_key":"", "is_enabled":true
+            });
+            assert_eq!(
+                from_value::<ExportProvider>(backup.clone())
+                    .unwrap()
+                    .fast_mode,
+                Normal
+            );
+            backup["fast_mode"] = old;
+            let provider = from_value::<ExportProvider>(backup).unwrap();
+            assert_eq!(to_value(provider).unwrap()["fast_mode"], json!(new));
+        }
+        assert!(from_value::<OpenAiSpeedMode>(json!("priority")).is_err());
+        assert!(from_value::<OpenAiSpeedMode>(json!(1)).is_err());
+        assert_eq!(
+            from_value::<UpdateProvider>(json!({})).unwrap().fast_mode,
+            None
+        );
+        assert_eq!(Normal.service_tier(), None);
+        assert_eq!(Fast.service_tier(), Some("fast"));
+        assert_eq!(Ultrafast.service_tier(), Some("ultrafast"));
+    }
 
     #[test]
     fn key_protocol_normalizes_suite_alias_and_blank() {

@@ -266,8 +266,8 @@ pub(crate) fn resolve_raw_wire_compat(
                 UpstreamFlavor::StandardResponses
             };
             let mut profile = ConversionProfile::anthropic_to_responses(client_stream, flavor);
-            if provider.fast_mode && is_codex_consumer_channel(channel) {
-                profile.codex_fast_mode = true;
+            if is_codex_consumer_channel(channel) {
+                profile.default_service_tier = provider.fast_mode.service_tier();
             }
             profile
         }
@@ -417,7 +417,7 @@ mod tests {
             api_key: "secret".into(),
             auth_mode: "apikey".into(),
             use_proxy: false,
-            fast_mode: false,
+            fast_mode: Default::default(),
             last_test_success: None,
             last_test_at: None,
             is_enabled: true,

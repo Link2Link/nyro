@@ -259,7 +259,7 @@ async fn token_usage_admin_year_validation_current_names_and_id_fallback() -> an
             api_key: "test-only".into(),
             auth_mode: "apikey".into(),
             use_proxy: false,
-            fast_mode: false,
+            fast_mode: Default::default(),
         })
         .await?;
     let start = millis("2024-01-01T00:00:00Z");
@@ -350,7 +350,7 @@ async fn token_usage_admin_enriches_exact_and_prefix_costs_without_changing_utc_
             api_key: "test-only".into(),
             auth_mode: "apikey".into(),
             use_proxy: false,
-            fast_mode: false,
+            fast_mode: Default::default(),
         })
         .await?;
     let cases = [
@@ -590,7 +590,7 @@ async fn current_provider(storage: &SqliteStorage, name: &str) -> anyhow::Result
             api_key: "test-only".into(),
             auth_mode: "apikey".into(),
             use_proxy: false,
-            fast_mode: false,
+            fast_mode: Default::default(),
         })
         .await
 }

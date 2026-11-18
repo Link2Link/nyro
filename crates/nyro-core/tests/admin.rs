@@ -88,6 +88,53 @@ async fn system_status_public_api_shares_cache_across_admin_handles() -> anyhow:
 }
 
 #[tokio::test]
+async fn provider_speed_mode_survives_update_copy_and_backup() -> anyhow::Result<()> {
+    let gw = build_gateway().await?;
+    let admin = gw.admin();
+    let mut input = oauth_provider_input();
+    input.fast_mode = OpenAiSpeedMode::Fast;
+    let source = admin.create_provider(input).await?;
+    assert_eq!(source.fast_mode, OpenAiSpeedMode::Fast);
+    let updated = admin
+        .update_provider(
+            &source.id,
+            UpdateProvider {
+                fast_mode: Some(OpenAiSpeedMode::Ultrafast),
+                ..Default::default()
+            },
+        )
+        .await?;
+    assert_eq!(updated.fast_mode, OpenAiSpeedMode::Ultrafast);
+    let copy = admin.copy_provider(&source.id).await?;
+    assert_eq!(copy.fast_mode, OpenAiSpeedMode::Ultrafast);
+
+    let mut backup = serde_json::to_value(admin.export_config().await?)?;
+    for provider in backup["providers"].as_array_mut().unwrap() {
+        assert_eq!(provider["fast_mode"], "ultrafast");
+        if provider["name"] == copy.name {
+            // Old backups encoded the same field as a boolean.
+            provider["fast_mode"] = serde_json::json!(true);
+        }
+    }
+    let restored = build_gateway().await?;
+    restored
+        .admin()
+        .import_config(serde_json::from_value(backup)?)
+        .await?;
+    let providers = restored.admin().list_providers().await?;
+    assert_eq!(providers.len(), 2);
+    for provider in providers {
+        let expected = if provider.name == copy.name {
+            OpenAiSpeedMode::Fast
+        } else {
+            OpenAiSpeedMode::Ultrafast
+        };
+        assert_eq!(provider.fast_mode, expected);
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn copy_provider_creates_disabled_provider_with_copy_suffix() -> anyhow::Result<()> {
     let gw = build_gateway().await?;
     let original = gw
@@ -904,7 +951,7 @@ async fn sqlite_provider_endpoints_are_transactional_and_persist_test_status() -
         api_key: "sk-chat".to_string(),
         auth_mode: "apikey".to_string(),
         use_proxy: false,
-        fast_mode: false,
+        fast_mode: Default::default(),
     };
 
     let provider = gw.storage.providers().create(input.clone()).await?;
@@ -986,7 +1033,7 @@ fn oauth_provider_input() -> CreateProvider {
         api_key: String::new(),
         auth_mode: "oauth".to_string(),
         use_proxy: false,
-        fast_mode: false,
+        fast_mode: Default::default(),
     }
 }
 
@@ -1006,7 +1053,7 @@ fn api_key_provider_input(name: &str) -> CreateProvider {
         api_key: "sk-test".to_string(),
         auth_mode: "apikey".to_string(),
         use_proxy: true,
-        fast_mode: false,
+        fast_mode: Default::default(),
     }
 }
 

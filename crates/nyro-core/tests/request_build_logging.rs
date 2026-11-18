@@ -87,7 +87,7 @@ fn provider(id: &str, vendor: &str, base_url: &str) -> Provider {
         api_key: PROVIDER_TOKEN.into(),
         auth_mode: "apikey".into(),
         use_proxy: false,
-        fast_mode: false,
+        fast_mode: Default::default(),
         last_test_success: None,
         last_test_at: None,
         is_enabled: true,

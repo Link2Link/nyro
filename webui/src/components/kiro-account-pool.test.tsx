@@ -28,7 +28,7 @@ const pool: AccountPoolView = {
 };
 const provider: Provider = {
   id: "kiro", name: "Kiro", vendor: "kiro", protocol: "kiro-chat/generate-assistant-response/v1", auth_mode: "oauth",
-  base_url: "https://q.us-east-1.amazonaws.com", use_proxy: false, fast_mode: false, is_enabled: true, created_at: "", updated_at: "",
+  base_url: "https://q.us-east-1.amazonaws.com", use_proxy: false, fast_mode: "normal", is_enabled: true, created_at: "", updated_at: "",
 };
 
 function panel(value = pool, card = false, stats?: AccountUsageStats[], inspect?: (client: QueryClient) => void) {

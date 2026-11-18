@@ -19,7 +19,7 @@
 use reqwest::header::HeaderMap;
 use serde_json::Value;
 
-use crate::db::models::Provider;
+use crate::db::models::{OpenAiSpeedMode, Provider};
 use crate::error::GatewayError;
 use crate::protocol::ids::{OPENAI_RESPONSES_V1, Protocol, ProtocolId};
 use crate::provider::vendor::Vendor;
@@ -32,13 +32,8 @@ fn is_codex_consumer_channel(channel: &str) -> bool {
     channel.eq_ignore_ascii_case("codex") || channel.eq_ignore_ascii_case("sub2api")
 }
 
-/// OpenAI Responses 渠道开关「Fast 模式」：
-///
-/// 开启后，转发到上游的 OpenAI Responses 请求如果缺少 `service_tier` 字段，
-/// 就补上 `"service_tier": "priority"`（对应 OpenAI 官方 Fast mode：
-/// 优先处理、响应更快；默认值是 `auto`）。客户端显式携带的 `service_tier`
-/// 永远优先，本函数不做覆盖。当前对 OpenAI 预设的 `sub2api` 与 `codex`
-/// 渠道生效。
+/// Default a missing OpenAI Responses service tier for the Codex and sub2api
+/// channels. Normal sends no tier; an explicit client value always wins.
 pub(crate) fn maybe_inject_openai_fast_mode(
     body: &mut Value,
     provider: &Provider,
@@ -59,21 +54,18 @@ pub(crate) fn maybe_inject_openai_fast_mode(
 /// provider pipeline, such as the admin model probe.
 pub(crate) fn maybe_inject_openai_fast_mode_for_protocol(
     body: &mut Value,
-    fast_mode: bool,
+    fast_mode: OpenAiSpeedMode,
     channel: Option<&str>,
     protocol: Protocol,
 ) {
-    let is_openai_fast = fast_mode && channel.is_some_and(is_codex_consumer_channel);
-    if !is_openai_fast || protocol != Protocol::OpenAIResponses {
-        return;
-    }
-    if let Some(object) = body.as_object_mut()
-        && !object.contains_key("service_tier")
+    if protocol == Protocol::OpenAIResponses
+        && channel.is_some_and(is_codex_consumer_channel)
+        && let Some(tier) = fast_mode.service_tier()
+        && let Some(object) = body.as_object_mut()
     {
-        object.insert(
-            "service_tier".to_string(),
-            Value::String("priority".to_string()),
-        );
+        object
+            .entry("service_tier")
+            .or_insert_with(|| Value::String(tier.into()));
     }
 }
 
@@ -646,7 +638,7 @@ where
     // 确保 thinking + 最终输出都有足够空间（IR 转码路径）
     apply_max_tokens_floor(&mut body, ctx.protocol.protocol, req.reasoning.enabled);
 
-    // 5b. sub2api Fast 模式：缺 service_tier 时补 priority（IR 转码路径）
+    // 5b. Default the Responses service tier after encoding, never before.
     maybe_inject_openai_fast_mode(&mut body, ctx.provider, ctx.protocol);
     // 5c. Codex 消费级上游：剥离其拒绝的 Responses 参数（IR 转码路径）
     maybe_sanitize_codex_consumer_request(&mut body, ctx.provider);
@@ -851,7 +843,7 @@ pub async fn passthrough_run(
             crate::protocol::codec::openai::responses::normalize_function_tool_defaults(
                 &mut raw_body,
             );
-            // sub2api Fast 模式：缺 service_tier 时补 priority（Responses 直通路径）
+            // Use the same service tier default on the native Responses path.
             maybe_inject_openai_fast_mode(&mut raw_body, ctx.provider, ctx.protocol);
             // Codex 消费级上游：剥离其拒绝的 Responses 参数（Responses 直通路径）
             maybe_sanitize_codex_consumer_request(&mut raw_body, ctx.provider);
@@ -1120,7 +1112,7 @@ mod tests {
             api_key: api_key.into(),
             auth_mode: "apikey".into(),
             use_proxy: false,
-            fast_mode: false,
+            fast_mode: OpenAiSpeedMode::Normal,
             last_test_success: None,
             last_test_at: None,
             is_enabled: true,
@@ -1280,7 +1272,7 @@ mod tests {
             api_key: String::new(),
             auth_mode: "oauth".into(),
             use_proxy: false,
-            fast_mode: false,
+            fast_mode: OpenAiSpeedMode::Normal,
             last_test_success: None,
             last_test_at: None,
             is_enabled: true,
@@ -1306,7 +1298,7 @@ mod tests {
             api_key: api_key.into(),
             auth_mode: "apikey".into(),
             use_proxy: false,
-            fast_mode: false,
+            fast_mode: OpenAiSpeedMode::Normal,
             last_test_success: None,
             last_test_at: None,
             is_enabled: true,
@@ -1872,7 +1864,7 @@ mod tests {
             api_key: String::new(),
             auth_mode: "oauth".into(),
             use_proxy: false,
-            fast_mode: false,
+            fast_mode: OpenAiSpeedMode::Normal,
             last_test_success: None,
             last_test_at: None,
             is_enabled: true,
@@ -2278,9 +2270,11 @@ mod tests {
         );
     }
 
-    /// Non-streaming requests carry `usage` in the regular response body, so
-    /// there is nothing to inject — and we must not pollute the body.
-    fn provider_with_channel(api_key: &str, channel: Option<&str>, fast_mode: bool) -> Provider {
+    fn provider_with_channel(
+        api_key: &str,
+        channel: Option<&str>,
+        fast_mode: OpenAiSpeedMode,
+    ) -> Provider {
         let mut provider = provider_with_api_key(api_key);
         provider.channel = channel.map(str::to_string);
         provider.fast_mode = fast_mode;
@@ -2312,12 +2306,10 @@ mod tests {
         }
     }
 
-    /// sub2api Fast 模式的核心行为：Responses 直通请求缺 service_tier 时
-    /// 注入 "priority"（OpenAI 官方 Fast mode 语义）。
     #[tokio::test]
-    async fn passthrough_injects_service_tier_priority_for_sub2api_fast_mode() {
+    async fn passthrough_injects_fast_for_sub2api_fast_mode() {
         let gw = build_test_gateway().await;
-        let provider = provider_with_channel("sk-sub2api", Some("sub2api"), true);
+        let provider = provider_with_channel("sk-sub2api", Some("sub2api"), OpenAiSpeedMode::Fast);
         let ctx = responses_ctx(&provider, &gw);
 
         let out = passthrough_run(
@@ -2330,16 +2322,15 @@ mod tests {
         .expect("passthrough succeeds");
 
         assert_eq!(
-            out.body["service_tier"], "priority",
-            "sub2api fast mode must inject service_tier=priority",
+            out.body["service_tier"], "fast",
+            "sub2api fast mode must inject service_tier=fast",
         );
     }
 
-    /// Codex OAuth 渠道复用相同 Fast 模式语义。
     #[tokio::test]
-    async fn passthrough_injects_service_tier_priority_for_codex_fast_mode() {
+    async fn passthrough_injects_ultrafast_for_codex_ultrafast_mode() {
         let gw = build_test_gateway().await;
-        let provider = provider_with_channel("", Some("codex"), true);
+        let provider = provider_with_channel("", Some("codex"), OpenAiSpeedMode::Ultrafast);
         let ctx = responses_ctx(&provider, &gw);
 
         let out = passthrough_run(
@@ -2352,8 +2343,8 @@ mod tests {
         .expect("passthrough succeeds");
 
         assert_eq!(
-            out.body["service_tier"], "priority",
-            "codex fast mode must inject service_tier=priority",
+            out.body["service_tier"], "ultrafast",
+            "codex ultrafast mode must inject service_tier=ultrafast",
         );
     }
 
@@ -2363,7 +2354,7 @@ mod tests {
     async fn passthrough_strips_rejected_params_for_codex_consumer_channels() {
         let gw = build_test_gateway().await;
         for channel in ["codex", "sub2api"] {
-            let provider = provider_with_channel("", Some(channel), false);
+            let provider = provider_with_channel("", Some(channel), OpenAiSpeedMode::Normal);
             let ctx = responses_ctx(&provider, &gw);
 
             let out = passthrough_run(
@@ -2403,7 +2394,7 @@ mod tests {
 
     #[test]
     fn sanitize_tool_call_ids_unit_cases() {
-        let provider = provider_with_channel("", Some("codex"), false);
+        let provider = provider_with_channel("", Some("codex"), OpenAiSpeedMode::Normal);
 
         // 外来 custom_tool_call（fc_call_ 前缀）被改写为 ctc_ 前缀；
         // call_id 与 output 项均不受影响。
@@ -2456,7 +2447,7 @@ mod tests {
         });
         sanitize_codex_tool_call_ids(
             &mut body,
-            &provider_with_channel("", Some("default"), false),
+            &provider_with_channel("", Some("default"), OpenAiSpeedMode::Normal),
         );
         assert_eq!(
             body["input"][0]["id"], "fc_call_x",
@@ -2471,7 +2462,7 @@ mod tests {
         });
         sanitize_codex_tool_call_ids(
             &mut body,
-            &provider_with_channel("sk-sub2api", Some("sub2api"), false),
+            &provider_with_channel("sk-sub2api", Some("sub2api"), OpenAiSpeedMode::Normal),
         );
         assert_eq!(
             body["input"][0]["id"], "fc_call_9f8e7d",
@@ -2497,7 +2488,7 @@ mod tests {
         });
         sanitize_codex_reasoning_content(
             &mut body,
-            &provider_with_channel("", Some("default"), false),
+            &provider_with_channel("", Some("default"), OpenAiSpeedMode::Normal),
         );
         assert_eq!(
             body["input"][0]["content"].as_array().map(Vec::len),
@@ -2511,7 +2502,7 @@ mod tests {
         });
         sanitize_codex_reasoning_content(
             &mut body,
-            &provider_with_channel("sk-sub2api", Some("sub2api"), false),
+            &provider_with_channel("sk-sub2api", Some("sub2api"), OpenAiSpeedMode::Normal),
         );
         assert!(
             body["input"][0].get("content").is_none(),
@@ -2530,7 +2521,7 @@ mod tests {
         });
         sanitize_codex_reasoning_content(
             &mut body,
-            &provider_with_channel("", Some("codex"), false),
+            &provider_with_channel("", Some("codex"), OpenAiSpeedMode::Normal),
         );
         assert!(
             body["input"][0].get("content").is_some(),
@@ -2557,20 +2548,20 @@ mod tests {
         let mut body = serde_json::json!({"input": "hi"});
         sanitize_codex_reasoning_content(
             &mut body,
-            &provider_with_channel("", Some("codex"), false),
+            &provider_with_channel("", Some("codex"), OpenAiSpeedMode::Normal),
         );
         assert_eq!(body["input"], "hi");
         let mut body = serde_json::json!({"model": "m"});
         sanitize_codex_reasoning_content(
             &mut body,
-            &provider_with_channel("", Some("codex"), false),
+            &provider_with_channel("", Some("codex"), OpenAiSpeedMode::Normal),
         );
         assert_eq!(body["model"], "m");
     }
 
     #[test]
     fn sanitize_drops_unresolvable_reasoning_items_when_stateless() {
-        let provider = provider_with_channel("", Some("codex"), false);
+        let provider = provider_with_channel("", Some("codex"), OpenAiSpeedMode::Normal);
 
         // store=false：无 usable encrypted_content 的 reasoning 项整项剔除，
         // 原生项（带 encrypted_content）与非 reasoning 项保留。
@@ -2635,7 +2626,7 @@ mod tests {
         });
         sanitize_codex_reasoning_content(
             &mut body,
-            &provider_with_channel("", Some("default"), false),
+            &provider_with_channel("", Some("default"), OpenAiSpeedMode::Normal),
         );
         assert_eq!(
             body["input"].as_array().unwrap().len(),
@@ -2649,7 +2640,7 @@ mod tests {
     /// （线上请求 06fbe5e2，2026-08-27）。无状态下同样整项剔除。
     #[test]
     fn sanitize_drops_foreign_minted_reasoning_even_with_encrypted_content() {
-        let provider = provider_with_channel("", Some("codex"), false);
+        let provider = provider_with_channel("", Some("codex"), OpenAiSpeedMode::Normal);
 
         // 线上事故原样数据：UUID 方言 + 带密文 -> 剔除；时间戳方言同理；
         // 原生 64 位十六进制 ID 与无 ID 项保留；非 reasoning 项不动。
@@ -2697,7 +2688,7 @@ mod tests {
         });
         sanitize_codex_reasoning_content(
             &mut body,
-            &provider_with_channel("", Some("default"), false),
+            &provider_with_channel("", Some("default"), OpenAiSpeedMode::Normal),
         );
         assert_eq!(body["input"].as_array().unwrap().len(), 1);
 
@@ -2722,7 +2713,7 @@ mod tests {
     async fn passthrough_strips_reasoning_content_for_codex_consumer_channels() {
         let gw = build_test_gateway().await;
         for channel in ["codex", "sub2api"] {
-            let provider = provider_with_channel("", Some(channel), false);
+            let provider = provider_with_channel("", Some(channel), OpenAiSpeedMode::Normal);
             let ctx = responses_ctx(&provider, &gw);
 
             let out = passthrough_run(
@@ -2779,7 +2770,7 @@ mod tests {
     async fn passthrough_normalizes_foreign_tool_call_ids_for_codex_consumer_channels() {
         let gw = build_test_gateway().await;
         for channel in ["codex", "sub2api"] {
-            let provider = provider_with_channel("", Some(channel), false);
+            let provider = provider_with_channel("", Some(channel), OpenAiSpeedMode::Normal);
             let ctx = responses_ctx(&provider, &gw);
 
             let out = passthrough_run(
@@ -2839,7 +2830,7 @@ mod tests {
     async fn passthrough_drops_foreign_reasoning_items_for_stateless_consumer_channels() {
         let gw = build_test_gateway().await;
         for channel in ["codex", "sub2api"] {
-            let provider = provider_with_channel("", Some(channel), false);
+            let provider = provider_with_channel("", Some(channel), OpenAiSpeedMode::Normal);
             let ctx = responses_ctx(&provider, &gw);
 
             let out = passthrough_run(
@@ -2898,7 +2889,7 @@ mod tests {
     async fn passthrough_drops_foreign_minted_reasoning_for_stateless_consumer_channels() {
         let gw = build_test_gateway().await;
         for channel in ["codex", "sub2api"] {
-            let provider = provider_with_channel("", Some(channel), false);
+            let provider = provider_with_channel("", Some(channel), OpenAiSpeedMode::Normal);
             let ctx = responses_ctx(&provider, &gw);
 
             let out = passthrough_run(
@@ -2950,7 +2941,7 @@ mod tests {
     #[tokio::test]
     async fn passthrough_keeps_rejected_params_for_other_channels() {
         let gw = build_test_gateway().await;
-        let provider = provider_with_channel("sk-other", Some("default"), false);
+        let provider = provider_with_channel("sk-other", Some("default"), OpenAiSpeedMode::Normal);
         let ctx = responses_ctx(&provider, &gw);
 
         let out = passthrough_run(
@@ -2978,7 +2969,7 @@ mod tests {
     async fn build_request_strips_rejected_params_for_codex_consumer_channels() {
         let gw = build_test_gateway().await;
         for channel in ["codex", "sub2api"] {
-            let provider = provider_with_channel("", Some(channel), false);
+            let provider = provider_with_channel("", Some(channel), OpenAiSpeedMode::Normal);
             let ctx = responses_ctx(&provider, &gw);
             let mut req = minimal_chat_request();
 
@@ -3005,7 +2996,7 @@ mod tests {
     #[tokio::test]
     async fn passthrough_preserves_explicit_client_service_tier() {
         let gw = build_test_gateway().await;
-        let provider = provider_with_channel("sk-sub2api", Some("sub2api"), true);
+        let provider = provider_with_channel("sk-sub2api", Some("sub2api"), OpenAiSpeedMode::Fast);
         let ctx = responses_ctx(&provider, &gw);
 
         let out = passthrough_run(
@@ -3031,7 +3022,8 @@ mod tests {
     #[tokio::test]
     async fn passthrough_skips_service_tier_when_fast_mode_disabled() {
         let gw = build_test_gateway().await;
-        let provider = provider_with_channel("sk-sub2api", Some("sub2api"), false);
+        let provider =
+            provider_with_channel("sk-sub2api", Some("sub2api"), OpenAiSpeedMode::Normal);
         let ctx = responses_ctx(&provider, &gw);
 
         let out = passthrough_run(
@@ -3053,7 +3045,7 @@ mod tests {
     #[tokio::test]
     async fn passthrough_skips_service_tier_for_other_channels() {
         let gw = build_test_gateway().await;
-        let provider = provider_with_channel("sk-other", Some("default"), true);
+        let provider = provider_with_channel("sk-other", Some("default"), OpenAiSpeedMode::Fast);
         let ctx = responses_ctx(&provider, &gw);
 
         let out = passthrough_run(
@@ -3071,11 +3063,11 @@ mod tests {
         );
     }
 
-    /// IR 转码路径（build_request）同样注入：post_encode 之后补 priority。
+    /// IR transcodes apply the same default after the request is encoded.
     #[tokio::test]
     async fn build_request_injects_service_tier_for_sub2api_fast_mode() {
         let gw = build_test_gateway().await;
-        let provider = provider_with_channel("sk-sub2api", Some("sub2api"), true);
+        let provider = provider_with_channel("sk-sub2api", Some("sub2api"), OpenAiSpeedMode::Fast);
         let ctx = responses_ctx(&provider, &gw);
         let mut req = minimal_chat_request();
 
@@ -3084,8 +3076,8 @@ mod tests {
             .expect("build_request succeeds");
 
         assert_eq!(
-            out.body["service_tier"], "priority",
-            "IR transcode path must inject service_tier=priority for sub2api fast mode",
+            out.body["service_tier"], "fast",
+            "IR transcode path must inject service_tier=fast for sub2api fast mode",
         );
     }
 
@@ -4025,7 +4017,7 @@ mod tests {
     async fn astra_responses_passthrough_clamps_off_and_preserves_supported_tiers() {
         let gw = build_test_gateway().await;
         for channel in ["codex", "sub2api", "custom"] {
-            let provider = provider_with_channel("sk-test", Some(channel), false);
+            let provider = provider_with_channel("sk-test", Some(channel), OpenAiSpeedMode::Normal);
             let ctx = responses_ctx_model(&provider, &gw, "gpt-6-astra");
             for raw in [
                 "none", "disable", "disabled", "off", "low", "medium", "high", "xhigh", "max",

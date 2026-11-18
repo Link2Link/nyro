@@ -31,7 +31,7 @@ async fn account_usage_http_contract_auth_and_server_owned_cycles() -> anyhow::R
             api_key: String::new(),
             auth_mode: "oauth".into(),
             use_proxy: false,
-            fast_mode: false,
+            fast_mode: Default::default(),
         })
         .await?;
     let account = storage

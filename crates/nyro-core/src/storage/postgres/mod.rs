@@ -2384,9 +2384,21 @@ impl StorageBootstrap for PostgresBootstrap {
         sqlx::query("ALTER TABLE providers ADD COLUMN IF NOT EXISTS use_proxy BOOLEAN NOT NULL DEFAULT FALSE")
             .execute(self.adapter.pool())
             .await?;
-        sqlx::query("ALTER TABLE providers ADD COLUMN IF NOT EXISTS fast_mode BOOLEAN NOT NULL DEFAULT FALSE")
-            .execute(self.adapter.pool())
-            .await?;
+        // Change the boolean and its default atomically; never recast integer
+        // rows on subsequent boots (Ultrafast = 2 must survive).
+        sqlx::query(
+            "DO $$ BEGIN
+                ALTER TABLE providers ADD COLUMN IF NOT EXISTS fast_mode INTEGER NOT NULL DEFAULT 0;
+                IF EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = 'providers'::regclass
+                           AND attname = 'fast_mode' AND atttypid = 'boolean'::regtype AND NOT attisdropped) THEN
+                    ALTER TABLE providers ALTER COLUMN fast_mode DROP DEFAULT,
+                        ALTER COLUMN fast_mode TYPE INTEGER USING fast_mode::integer,
+                        ALTER COLUMN fast_mode SET DEFAULT 0;
+                END IF;
+             END $$",
+        )
+        .execute(self.adapter.pool())
+        .await?;
         sqlx::query("ALTER TABLE providers ADD COLUMN IF NOT EXISTS protocol_mode TEXT NOT NULL DEFAULT 'fixed'")
             .execute(self.adapter.pool())
             .await?;
@@ -2970,7 +2982,7 @@ fn normalize_provider_protocol_value(
 
 fn provider_select(suffix: Option<&str>) -> String {
     let mut sql = String::from(
-        "SELECT id, name, vendor, protocol, base_url, COALESCE(protocol_mode, 'fixed') AS protocol_mode, preset_key, channel, models_source, static_models, api_key, COALESCE(auth_mode, 'apikey') AS auth_mode, COALESCE(use_proxy, FALSE) AS use_proxy, COALESCE(fast_mode, FALSE) AS fast_mode, last_test_success, to_char(last_test_at AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS') AS last_test_at, COALESCE(is_enabled, TRUE) AS is_enabled, to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS') AS created_at, to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS') AS updated_at FROM providers",
+        "SELECT id, name, vendor, protocol, base_url, COALESCE(protocol_mode, 'fixed') AS protocol_mode, preset_key, channel, models_source, static_models, api_key, COALESCE(auth_mode, 'apikey') AS auth_mode, COALESCE(use_proxy, FALSE) AS use_proxy, fast_mode, last_test_success, to_char(last_test_at AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS') AS last_test_at, COALESCE(is_enabled, TRUE) AS is_enabled, to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS') AS created_at, to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS') AS updated_at FROM providers",
     );
     if let Some(suffix) = suffix {
         sql.push(' ');
@@ -3092,7 +3104,7 @@ CREATE TABLE IF NOT EXISTS providers (
     refresh_token TEXT,
     expires_at TIMESTAMPTZ,
     use_proxy BOOLEAN NOT NULL DEFAULT FALSE,
-    fast_mode BOOLEAN NOT NULL DEFAULT FALSE,
+    fast_mode INTEGER NOT NULL DEFAULT 0,
     last_test_success BOOLEAN,
     last_test_at TIMESTAMPTZ,
     is_enabled BOOLEAN DEFAULT TRUE,

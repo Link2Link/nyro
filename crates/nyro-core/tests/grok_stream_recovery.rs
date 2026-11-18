@@ -321,7 +321,7 @@ async fn provider(gw: &Gateway, url: &str) -> anyhow::Result<String> {
             api_key: "synthetic-local-only-token".into(),
             auth_mode: "apikey".into(),
             use_proxy: false,
-            fast_mode: false,
+            fast_mode: Default::default(),
         })
         .await?
         .id)

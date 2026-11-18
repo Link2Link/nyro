@@ -1,4 +1,4 @@
-//! OpenAI effort-floor regression through the real dispatcher and loopback HTTP.
+//! OpenAI effort-floor and service-tier regressions through the real dispatcher and loopback HTTP.
 //!
 //! Gateway discovery/usage/OAuth tasks are queued on an undriven, single-thread
 //! bootstrap runtime, then cancelled before the actual test runtime is driven.
@@ -26,7 +26,7 @@ use axum::{
 use nyro_core::{
     Gateway,
     config::GatewayConfig,
-    db::models::{Model, Provider},
+    db::models::{Model, OpenAiSpeedMode, Provider},
     logging::LogEntry,
     protocol::{
         ids::{
@@ -184,6 +184,7 @@ struct Case {
     channel: &'static str,
     model: &'static str,
     force_max: bool,
+    speed_mode: OpenAiSpeedMode,
 }
 impl Case {
     fn openai(route: Route) -> Self {
@@ -194,6 +195,7 @@ impl Case {
             channel: "default",
             model: SOL,
             force_max: false,
+            speed_mode: OpenAiSpeedMode::Normal,
         }
     }
 }
@@ -248,7 +250,7 @@ fn run(case: Case, body: Value, expected: Value) -> anyhow::Result<()> {
         api_key: TOKEN.into(),
         auth_mode: "apikey".into(),
         use_proxy: false,
-        fast_mode: false,
+        fast_mode: case.speed_mode,
         last_test_success: None,
         last_test_at: None,
         is_enabled: true,
@@ -556,6 +558,48 @@ fn codex_and_sub2api_channels_use_loopback_api_keys_not_oauth() -> anyhow::Resul
     }
     Ok(())
 }
+#[test]
+fn selected_speed_mode_reaches_the_upstream_without_overriding_the_client() -> anyhow::Result<()> {
+    for channel in ["codex", "sub2api"] {
+        for route in [
+            Route::Responses,
+            Route::ChatToResponses,
+            Route::AnthropicToResponses,
+        ] {
+            for (mode, client_tier, upstream_tier) in [
+                (OpenAiSpeedMode::Normal, None, None),
+                (OpenAiSpeedMode::Fast, None, Some("fast")),
+                (OpenAiSpeedMode::Ultrafast, None, Some("ultrafast")),
+                // Only OpenAI client tiers have OpenAI semantics. Anthropic's
+                // standard_only must never leak into a Responses request.
+                if matches!(route, Route::AnthropicToResponses) {
+                    (
+                        OpenAiSpeedMode::Ultrafast,
+                        Some("standard_only"),
+                        Some("ultrafast"),
+                    )
+                } else {
+                    (OpenAiSpeedMode::Ultrafast, Some("auto"), Some("auto"))
+                },
+            ] {
+                let mut case = Case::openai(route);
+                case.channel = channel;
+                case.speed_mode = mode;
+                let mut body = request(route, false, None);
+                if let Some(tier) = client_tier {
+                    body["service_tier"] = json!(tier);
+                }
+                let mut outgoing = expected(&case, &body, None);
+                if let Some(tier) = upstream_tier {
+                    outgoing["service_tier"] = json!(tier);
+                }
+                run(case, body, outgoing)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 #[test]
 fn floor_uses_actual_vendor_not_model_prefix_or_an_explicitly_stale_preset() -> anyhow::Result<()> {
     for route in [Route::Responses, Route::Chat] {

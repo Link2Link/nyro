@@ -101,7 +101,7 @@ impl Fixture {
                 api_key: String::new(),
                 auth_mode: "oauth".into(),
                 use_proxy: false,
-                fast_mode: false,
+                fast_mode: Default::default(),
             })
             .await?;
         let observed_at = Utc::now().timestamp_millis();

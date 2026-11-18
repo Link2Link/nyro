@@ -99,7 +99,7 @@ async fn seed_configuration(gateway: &Gateway) -> anyhow::Result<String> {
             api_key: "inert-offline-backup-key".into(),
             auth_mode: "apikey".into(),
             use_proxy: false,
-            fast_mode: false,
+            fast_mode: Default::default(),
         })
         .await?;
     admin

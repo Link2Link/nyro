@@ -31,7 +31,7 @@ fn make_provider(vendor: Option<&str>, channel: Option<&str>) -> Provider {
         api_key: "sk-test".into(),
         auth_mode: "apikey".into(),
         use_proxy: false,
-        fast_mode: false,
+        fast_mode: Default::default(),
         last_test_success: None,
         last_test_at: None,
         is_enabled: true,

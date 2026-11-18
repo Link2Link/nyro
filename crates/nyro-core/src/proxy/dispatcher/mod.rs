@@ -3934,7 +3934,7 @@ mod tests {
                 api_key: "sk-test".to_string(),
                 auth_mode: "apikey".to_string(),
                 use_proxy: false,
-                fast_mode: false,
+                fast_mode: Default::default(),
             })
             .await
             .expect("provider create");
@@ -4036,7 +4036,7 @@ mod tests {
                 api_key: "sk-test".to_string(),
                 auth_mode: "apikey".to_string(),
                 use_proxy: false,
-                fast_mode: false,
+                fast_mode: Default::default(),
             })
             .await
             .expect("provider create");

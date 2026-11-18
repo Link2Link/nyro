@@ -28,7 +28,7 @@ async fn fixture() -> anyhow::Result<(tempfile::TempDir, Router)> {
             api_key: "test-only".to_string(),
             auth_mode: "apikey".to_string(),
             use_proxy: false,
-            fast_mode: false,
+            fast_mode: Default::default(),
         })
         .await?;
     Ok((dir, create_router(gw, Some("test-admin".to_string()))))

@@ -51,7 +51,7 @@ CREATE TABLE `providers` (
   `refresh_token` text COLLATE utf8mb4_unicode_ci,
   `expires_at` datetime DEFAULT NULL,
   `use_proxy` tinyint(1) NOT NULL DEFAULT '0',
-  `fast_mode` tinyint(1) NOT NULL DEFAULT '0',
+  `fast_mode` int NOT NULL DEFAULT '0',
   `last_test_success` tinyint(1) DEFAULT NULL,
   `last_test_at` datetime DEFAULT NULL,
   `is_enabled` tinyint(1) DEFAULT '1',
