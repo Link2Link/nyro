@@ -4,6 +4,21 @@ All notable changes to Nyro will be documented in this file.
 
 ---
 
+## v2.1.45
+
+> Released on 2026-11-18
+
+#### Features
+
+- **OpenAI Responses speed mode**: Codex and Sub2API providers now offer Normal, Fast, and Ultrafast in both the create and edit forms. Normal leaves the request unchanged; Fast and Ultrafast add `service_tier: "fast"` or `service_tier: "ultrafast"` only when an OpenAI client has not supplied a tier. Existing settings and backups retain their preference: enabled becomes Fast, disabled becomes Normal.
+
+#### Fixes
+
+- **Actual upstream Nyro usage**: chained Nyro provider cards and folded group summaries now display the remote gateway's usage report instead of treating its per-route admission gates as accounting quotas. Empty route-only cards, local model-binding controls and unavailable API-price placeholders no longer hide the real upstream observations. Routing decisions and monetary permissions are unchanged.
+- **Anonymous account-pool quota**: forwarded daily, five-hour and weekly pool windows now show backend-owned utilization, weighted-estimate labels, observation coverage and stale/unknown states. Pool observations replace duplicate flat windows; incomplete, stale or conflicting data never becomes zero utilization or falls back to a misleading aggregate. The next member reset is labeled separately from whole-pool recovery. No account identities, new API fields or database migration are introduced.
+
+---
+
 ## v2.1.44
 
 > Released on 2026-11-17
