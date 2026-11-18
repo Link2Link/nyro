@@ -3,20 +3,20 @@ import { useQueries, useQuery } from "@tanstack/react-query";
 import { Clock, RefreshCw, AlertCircle, CirclePause } from "lucide-react";
 import { backend } from "@/lib/backend";
 import { localizeBackendErrorMessage } from "@/lib/backend-error";
-import { isKiroOverage, nyroUpstreamView, providerApiPriceSupported, providerUsagePause, providerUsageSupported, providerUsageTitle, summarizeGroupUsage, tierLabel } from "@/lib/provider-usage";
+import { isKiroOverage, nyroUpstreamPoolUsedPercent, nyroUpstreamPoolWindowNames, nyroUpstreamPoolWindows, nyroUpstreamView, providerApiPriceSupported, providerUsagePause, providerUsageSupported, providerUsageTitle, summarizeGroupUsage, tierLabel } from "@/lib/provider-usage";
 import { isDevinProvider, isKiroProvider } from "@/lib/native-provider";
 import { isClaudeCodeOAuthProvider } from "@/lib/claude-account-pool";
 import { claudeAccountWindowViews, claudeMainObservedAt, claudeMainStale, claudeWindowView, newerClaudeAccount, validObservedAt } from "@/lib/claude-usage-windows";
 import { ClaudeUsageWindowRows } from "@/components/claude-usage-windows";
 import { useLocale } from "@/lib/i18n";
-import { accountStateLabel, poolQuotaWindows, type AccountPoolView, type ProviderAccountView } from "@/lib/devin-account-pool";
+import { accountStateLabel, poolQuotaWindows, type AccountPoolView, type PoolQuotaWindow, type ProviderAccountView } from "@/lib/devin-account-pool";
 import { countdownStr, poolSteadyPacePercent, steadyPacePercent, utilizationBarClass, utilizationColor } from "@/lib/usage-pace";
 import { useUsageClock } from "@/lib/use-usage-clock";
 import { UsageProgress } from "@/components/usage-progress";
 import { PoolRefreshButton } from "@/components/pool-refresh-button";
 import { ProviderIcon } from "@/components/ui/provider-icon";
 import { ProviderApiPriceSummary } from "@/components/provider-api-price-summary";
-import { hasStructuredQuotaBuckets, isGoogleFamilyDisplayBucket } from "@/lib/quota-bucket-display";
+import { hasStructuredQuotaBuckets, isForwardedRouteBucket, isGoogleFamilyDisplayBucket } from "@/lib/quota-bucket-display";
 import { ProviderQuotaBuckets, QuotaBucketAvailability } from "@/components/provider-quota-buckets";
 import { ProviderUsageDialog } from "@/components/provider-usage-dialog";
 import { ProviderQuotaBucketEditor } from "@/components/provider-quota-bucket-editor";
@@ -227,6 +227,34 @@ export function DevinPoolUsage({ pool, detailed = false, onRefresh, refreshing =
 const NYRO_UPSTREAM_COLLAPSED = 4;
 const MAX_ROUTE_CHIPS = 4;
 
+/** Display the remote's anonymous weighted totals; the next member reset is not whole-pool recovery. */
+function NyroUpstreamPoolWindow({ name, window, estimated, isZh, now }: {
+  name: string; window: PoolQuotaWindow; estimated: boolean; isZh: boolean; now: number;
+}) {
+  const used = nyroUpstreamPoolUsedPercent(window);
+  const reset = window.next_reset_at && Number.isFinite(Date.parse(window.next_reset_at)) ? window.next_reset_at : null;
+  const countdown = countdownStr(reset, now);
+  return <div className="space-y-1.5" data-nyro-pool-window={name}>
+    <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-xs">
+      <span className="min-w-14 font-medium text-slate-500">{tierLabel(name, isZh)}</span>
+      {used != null ? <>
+        <UsageProgress usedPercent={used} isZh={isZh} weighted={estimated}
+          label={`${tierLabel(name, isZh)} ${isZh ? "账号池已用额度" : "pool used quota"}`} />
+        <span className={`shrink-0 font-semibold tabular-nums ${utilizationColor(used)}`}>{isZh ? "已用" : "Used"} {used.toFixed(1)}%</span>
+      </> : <span className="text-slate-500">{!window.capacity_complete
+        ? (isZh ? "容量尚未完整" : "Capacity incomplete") : (isZh ? "用量未知" : "Usage unknown")}</span>}
+      {window.stale && <span className="text-amber-700">{isZh ? "旧数据" : "Stale"}</span>}
+    </div>
+    <p className="text-[10px] text-slate-400">{isZh ? "用量覆盖" : "Usage coverage"}: {window.known_accounts}/{window.total_accounts} {isZh ? "账号" : "accounts"}</p>
+    {reset && <p className="text-[10px] text-slate-400">
+      {window.reset_mode === "aligned" ? (isZh ? "共同重置" : "Aligned reset") : (isZh ? "下次账号额度重置" : "Next account reset")}: {" "}
+      <time dateTime={reset} title={new Date(reset).toLocaleString()}>{countdown ?? new Date(reset).toLocaleString()}</time>
+      {" · "}{window.next_reset_accounts}/{window.total_accounts} {isZh ? "账号" : "accounts"}
+      {window.reset_mode !== "aligned" && (isZh ? "（不代表全池恢复）" : " (not necessarily the whole pool)")}
+    </p>}
+  </div>;
+}
+
 function NyroUpstreamRow({ provider, isZh, now }: { provider: NyroUpstreamProvider; isZh: boolean; now: number }) {
   const usage = provider.usage;
   const pause = usage ? providerUsagePause(usage, isZh) : null;
@@ -234,6 +262,8 @@ function NyroUpstreamRow({ provider, isZh, now }: { provider: NyroUpstreamProvid
   const balances = usage?.balances ?? [];
   const routes = provider.routes ?? [];
   const extraRoutes = routes.length - MAX_ROUTE_CHIPS;
+  const windows = nyroUpstreamPoolWindows(usage);
+  const poolNames = nyroUpstreamPoolWindowNames(usage);
   return (
     <li className="space-y-1.5 py-2 first:pt-0 last:pb-0">
       <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 text-xs">
@@ -242,6 +272,7 @@ function NyroUpstreamRow({ provider, isZh, now }: { provider: NyroUpstreamProvid
         {usage?.level && (
           <span className="rounded bg-slate-100 px-1.5 py-0.5 text-[10px] font-semibold uppercase text-slate-600">{usage.level}</span>
         )}
+        {usage?.stale && <span className="text-[10px] text-amber-700">{isZh ? "旧数据" : "Stale"}</span>}
         {pause && (
           <span className="inline-flex items-center gap-1 rounded bg-red-50 px-1.5 py-0.5 text-[10px] font-semibold text-red-600"
             title={pause.resetAt ?? undefined}>
@@ -267,8 +298,17 @@ function NyroUpstreamRow({ provider, isZh, now }: { provider: NyroUpstreamProvid
         </p>
       ) : (
         <div className="flex flex-col gap-1.5 pl-6">
+          {poolNames.size > 0 && <div className="space-y-2">
+            <p className="text-[10px] text-slate-500">{isZh ? "账号池额度" : "Account pool quota"}
+              {usage?.pool_quota?.estimated && ` · ${isZh ? "加权估算" : "Weighted estimate"}`}</p>
+            {poolNames.size > windows.length && <p className="text-[10px] text-amber-700">
+              {isZh ? "账号池观察相互冲突，用量未知" : "Conflicting account pool observations; usage unknown"}
+            </p>}
+            {windows.map(([name, window]) => <NyroUpstreamPoolWindow key={name} name={name} window={window}
+              estimated={usage?.pool_quota?.estimated ?? false} isZh={isZh} now={now} />)}
+          </div>}
           {(usage?.tiers ?? [])
-            .filter((tier) => usage?.kind !== "kiro_plan" || !tier.name.startsWith("feature:kiro:"))
+            .filter((tier) => !poolNames.has(tier.name) && (usage?.kind !== "kiro_plan" || !tier.name.startsWith("feature:kiro:")))
             .map((tier) => <TierBar key={tier.name} tier={tier} isZh={isZh} now={now} />)}
           {balances.map((balance) => (
             <BalanceRow key={balance.currency} balance={balance} isAvailable={usage?.is_available !== false} isZh={isZh}
@@ -559,10 +599,10 @@ export function ProviderUsageFooter({ provider, claudeAccount: currentClaudeAcco
       )}
       {!hasBuckets && shown && providerApiPriceSupported(shown.kind) && <ProviderApiPriceSummary
         usage={shown} now={now} stale={stale} loading={isFetching} locale={locale} />}
-      {bindingEditorOpen && <ProviderQuotaBucketEditor providerId={provider.id} buckets={(shown?.quota_buckets ?? []).filter((bucket) => !isGoogleFamilyDisplayBucket(bucket))}
+      {bindingEditorOpen && <ProviderQuotaBucketEditor providerId={provider.id} buckets={(shown?.quota_buckets ?? []).filter((bucket) => !isForwardedRouteBucket(bucket) && !isGoogleFamilyDisplayBucket(bucket))}
         open onOpenChange={setBindingEditorOpen} />}
       {detailFilter && <ProviderUsageDialog open onOpenChange={(open) => { if (!open) setDetailFilter(null); }}
-        initialProviderId={provider.id} initialQuotaFilter={detailFilter} quotaBuckets={shown?.quota_buckets?.filter((bucket) => !isGoogleFamilyDisplayBucket(bucket))} />}
+        initialProviderId={provider.id} initialQuotaFilter={detailFilter} quotaBuckets={shown?.quota_buckets?.filter((bucket) => !isForwardedRouteBucket(bucket) && !isGoogleFamilyDisplayBucket(bucket))} />}
     </div>
   );
 

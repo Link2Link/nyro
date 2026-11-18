@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { AlertCircle, ArrowUpRight, Clock } from "lucide-react";
 import type { Locale } from "@/lib/i18n";
-import { hasStructuredQuotaBuckets, isGoogleFamilyDisplayBucket, isPrimaryQuotaBucket, providerQuotaDisplayBuckets } from "@/lib/quota-bucket-display";
+import { hasStructuredQuotaBuckets, isForwardedRouteBucket, isGoogleFamilyDisplayBucket, isPrimaryQuotaBucket, providerQuotaDisplayBuckets } from "@/lib/quota-bucket-display";
 import { tierLabel, providerUsagePause } from "@/lib/provider-usage";
 import { formatTokenCount } from "@/lib/format";
 import { retainedUsagePriceDisplay } from "@/lib/token-usage";
@@ -63,7 +63,8 @@ export function QuotaBucketAvailability({ buckets, stale = false, isZh = false, 
   const [initialNow] = useState(() => Date.now());
   const observedNow = now ?? initialNow;
   const ownerUnavailable = unavailableOwner(owner);
-  const primary = buckets.filter((bucket) => isPrimaryQuotaBucket(bucket) && (expectedCount == null || isGoogleFamilyDisplayBucket(bucket)));
+  const primary = buckets.filter((bucket) => !isForwardedRouteBucket(bucket) && isPrimaryQuotaBucket(bucket)
+    && (expectedCount == null || isGoogleFamilyDisplayBucket(bucket)));
   const states = primary.map((bucket) => bucketState(bucket, bucketStale(bucket, observedNow, stale), ownerUnavailable));
   const available = states.filter((state) => state === "available").length;
   const observed = states.filter((state) => state === "observed").length;
@@ -230,7 +231,7 @@ export function ProviderQuotaBuckets({ usage, now, stale, loading, locale = "en-
   const zh = locale === "zh-CN";
   const google = usage.kind === "google_subscription";
   const buckets = providerQuotaDisplayBuckets(usage);
-  const raw = (usage.quota_buckets ?? []).filter((bucket) => !isGoogleFamilyDisplayBucket(bucket));
+  const raw = (usage.quota_buckets ?? []).filter((bucket) => !isForwardedRouteBucket(bucket) && !isGoogleFamilyDisplayBucket(bucket));
   const observations = google ? raw : raw.filter((bucket) => bucket.binding.status === "shared_constraint");
   if (!buckets.length && !observations.length && !(google && hasStructuredQuotaBuckets(usage))) return null;
   const unassigned = usage.api_price?.unassigned;

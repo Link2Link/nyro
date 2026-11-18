@@ -1,4 +1,4 @@
-import type { AccountPoolView } from "./devin-account-pool";
+import type { AccountPoolView, PoolQuotaWindow } from "./devin-account-pool";
 
 export type OpenAiSpeedMode = "normal" | "fast" | "ultrafast";
 
@@ -1148,9 +1148,21 @@ export interface ProviderUsage {
   account_pool?: AccountPoolView | null;
   /** MiniMax / GLM / Grok / OpenAI Codex / Google subscription retained-log prices; not upstream billing or routing quota. */
   api_price?: ProviderApiPriceStats | null;
+  /** Anonymous, display-only upstream account-pool totals; never routing input or account identities. */
+  pool_quota?: NyroUpstreamPoolQuota | null;
+  /** The remote explicitly marked this forwarded observation stale. */
+  stale?: boolean;
   /** Nyro preset (`nyro_gateway`): the remote Nyro's forwarded usage report. */
   upstream?: NyroUpstreamUsage | null;
   queried_at: string;
+}
+
+/** Fixed anonymous pool-quota fields from the proxy forwarding DTO (no account records). */
+export interface NyroUpstreamPoolQuota {
+  daily?: PoolQuotaWindow | null;
+  weekly?: PoolQuotaWindow | null;
+  claude_windows?: { name: "five_hour" | "weekly_limit"; quota: PoolQuotaWindow }[];
+  estimated: boolean;
 }
 
 /** One upstream provider behind the routes the Nyro preset's key can use. */

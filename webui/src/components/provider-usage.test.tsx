@@ -3,7 +3,7 @@ import { test } from "node:test";
 import { renderToStaticMarkup } from "react-dom/server";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { LocaleProvider } from "../lib/i18n";
-import type { AccountPoolView, ProviderAccountView } from "../lib/devin-account-pool";
+import type { AccountPoolView, PoolQuotaWindow, ProviderAccountView } from "../lib/devin-account-pool";
 import type { Provider, ProviderApiPriceStats, ProviderUsage, QuotaBucket } from "../lib/types";
 import { GroupUsageSummary, ProviderUsageFooter } from "./provider-usage";
 
@@ -676,4 +676,146 @@ test("all upstream providers paused pauses the chained Nyro with the first recov
       reset_at: new Date(now + 2 * 3600_000).toISOString() } });
   match(html, /Quota exhausted, routing paused · All upstream providers paused/);
   match(html, /Quota reset: 2h/);
+});
+
+const nyroProvider: Provider = { ...provider, id: "nyro-chain", name: "Edge Nyro", vendor: "nyro-gateway",
+  preset_key: "nyro-gateway", base_url: "http://remote.test:19530" };
+const forwardedRouteBuckets = (): QuotaBucket[] => Array.from({ length: 18 }, (_, index) => ({
+  id: `forwarded-route-${index}`, scope_id: "local-forwarded-scope", label: `route-only-card-${index}`,
+  models: [`remote-route-${index}`], binding: { status: "resolved", source: "forwarded_route_v1", revision: 1 },
+  source: "forwarded_route", tiers: [], constraint_ids: [], queried_at: new Date(now).toISOString(), stale: false,
+  scheduling: { status: "quota_exhausted", reason: "remote_route_exhausted", blocking_tiers: ["five_hour"] },
+}));
+const forwardedPoolWindow = (over: Partial<PoolQuotaWindow> = {}): PoolQuotaWindow => ({
+  total_units: 2, total_accounts: 2, capacity_complete: true, known_accounts: 2,
+  known_remaining_units: 0.8, used_units: 1.2, remaining_units: 0.8, used_percent: 60,
+  remaining_percent: 40, stale: false, next_reset_at: new Date(now + 3600_000).toISOString(),
+  next_reset_accounts: 1, reset_mode: "staggered", ...over,
+});
+function nyroUsage(remote: ProviderUsage): ProviderUsage {
+  return { ...base, provider_id: nyroProvider.id, kind: "nyro_gateway", quota_buckets: forwardedRouteBuckets(), upstream: {
+    object: "nyro.usage", version: 2, generated_at: new Date(now).toISOString(), providers: [
+      { id: "remote-quota", name: "Remote actual quota", vendor: "anthropic", routes: ["claude-main"], status: "ok", usage: remote },
+    ],
+  } };
+}
+function renderNyroGroup(usage: ProviderUsage): string {
+  const originalNow = Date.now;
+  Date.now = () => now;
+  const client = new QueryClient();
+  client.setQueryData(["provider-usage", nyroProvider.id], usage);
+  try {
+    return renderToStaticMarkup(<QueryClientProvider client={client}><LocaleProvider>
+      <GroupUsageSummary providers={[nyroProvider]} />
+    </LocaleProvider></QueryClientProvider>);
+  } finally { Date.now = originalNow; client.clear(); }
+}
+
+test("forwarded route-admission buckets never hide a chained Nyro's actual upstream usage", () => {
+  const value = nyroUsage(upstreamUsage({ kind: "claude_code_plan", tiers: [{ name: "five_hour", used_percent: 41 }] }));
+  const html = render(value, undefined, nyroProvider);
+  match(html, /Upstream Nyro Usage/);
+  match(html, /Remote actual quota/);
+  match(html, /Routes: claude-main/);
+  match(html, /aria-valuenow="41"/);
+  equal((html.match(/role="progressbar"/g) ?? []).length, 1);
+  doesNotMatch(html, /data-quota-bucket=|route-only-card|forwarded_route_v1|Model bindings|Retained attempts|Recorded tokens|API price|Bucket details/);
+  equal(render({ ...value, quota_buckets: undefined }, undefined, nyroProvider), html);
+});
+
+test("forwarded anonymous pool quota replaces duplicate flat windows and keeps unrelated tiers", () => {
+  const value = nyroUsage(upstreamUsage({ kind: "devin_plan", tiers: [
+    { name: "daily", used_percent: 99 }, { name: "monthly", used_percent: 18 },
+  ], pool_quota: { daily: forwardedPoolWindow(), weekly: null, estimated: false } }));
+  const html = render(value, undefined, nyroProvider);
+  match(html, /Account pool quota/);
+  match(html, /aria-valuenow="60"/);
+  match(html, /aria-valuenow="18"/);
+  equal((html.match(/role="progressbar"/g) ?? []).length, 2);
+  match(html, /Next account reset/);
+  doesNotMatch(html, /aria-valuenow="99"|Quota reset|full.pool|data-quota-bucket=|API price/);
+});
+
+test("forwarded anonymous Claude pools render five-hour and weekly quotas with honest reset labels", () => {
+  const value = nyroUsage(upstreamUsage({ kind: "claude_code_plan", tiers: [], pool_quota: {
+    daily: null, weekly: null, estimated: true, claude_windows: [
+      { name: "weekly_limit", quota: forwardedPoolWindow({ used_percent: 75, reset_mode: "aligned", next_reset_accounts: 2 }) },
+      { name: "five_hour", quota: forwardedPoolWindow({ used_percent: 40 }) },
+    ],
+  } }));
+  const html = render(value, undefined, nyroProvider);
+  match(html, /Account pool quota/);
+  match(html, /aria-valuenow="40"/);
+  match(html, /aria-valuenow="75"/);
+  match(html, /Next account reset/);
+  match(html, /Aligned reset/);
+  equal((html.match(/role="progressbar"/g) ?? []).length, 2);
+  doesNotMatch(html, /Quota reset|full.pool|API price/);
+});
+
+test("incomplete unknown and stale forwarded pool observations never invent utilization or recovery", () => {
+  for (const over of [{ capacity_complete: false, known_accounts: 1, used_percent: null },
+    { used_percent: null }, { stale: true }, { total_units: 0 }]) {
+    const window = forwardedPoolWindow(over);
+    const value = nyroUsage(upstreamUsage({ kind: "devin_plan", tiers: [], pool_quota: { daily: window, weekly: null, estimated: false } }));
+    const html = render(value, undefined, nyroProvider);
+    match(html, /Account pool quota/);
+    match(html, /Capacity incomplete|Usage unknown/);
+    match(html, /Usage coverage/);
+    match(html.replace(/<[^>]*>/g, "").replace(/\s/g, ""), new RegExp(window.known_accounts + "/" + window.total_accounts + "accounts"));
+    if (window.stale) match(html, /Stale/);
+    doesNotMatch(html, /role="progressbar"|aria-valuenow="0"|Quota reset|full.pool|NaN|Infinity/);
+  }
+});
+
+test("folded Nyro group summary uses actual upstream tiers and anonymous pool quota, not route availability", () => {
+  const remote = upstreamUsage({ kind: "devin_plan", tiers: [{ name: "five_hour", used_percent: 41 }],
+    pool_quota: { daily: forwardedPoolWindow({ used_percent: 80 }), weekly: null, estimated: false } });
+  const value = nyroUsage(remote);
+  const group = renderNyroGroup(value);
+  match(group, /Peak used/);
+  match(group, /80%/);
+  doesNotMatch(group, /data-quota-availability|route-only-card|paused/);
+  equal(renderNyroGroup({ ...value, quota_buckets: undefined }), group);
+  const unknown = renderNyroGroup(nyroUsage({ ...remote, tiers: [], pool_quota: {
+    daily: forwardedPoolWindow({ capacity_complete: false, used_percent: 100 }), weekly: null, estimated: false,
+  } }));
+  doesNotMatch(unknown, /Peak used|100%|0%|data-quota-availability/);
+});
+
+test("folded Nyro summary replaces same-name flat quota with complete or unknown anonymous pool usage", () => {
+  const remote = upstreamUsage({ kind: "devin_plan", tiers: [{ name: "daily", used_percent: 99 }],
+    pool_quota: { daily: forwardedPoolWindow({ used_percent: 60 }), weekly: null, estimated: false } });
+  const complete = renderNyroGroup(nyroUsage(remote));
+  match(complete, /Peak used/);
+  match(complete, /60%/);
+  doesNotMatch(complete, /99%|data-quota-availability/);
+  const unknown = renderNyroGroup(nyroUsage({ ...remote, tiers: [{ name: "daily", used_percent: 100 }], pool_quota: {
+    daily: forwardedPoolWindow({ used_percent: null }), weekly: null, estimated: false,
+  } }));
+  doesNotMatch(unknown, /Peak used|100%|0%|data-quota-availability/);
+});
+
+test("conflicting forwarded pool windows never revive same-name flat quota or a healthy summary", () => {
+  const value = nyroUsage(upstreamUsage({ kind: "devin_plan", tiers: [
+    { name: "daily", used_percent: 99 }, { name: "weekly_limit", used_percent: 10 },
+  ], pool_quota: { daily: forwardedPoolWindow({ used_percent: null }),
+    weekly: forwardedPoolWindow({ used_percent: 20 }), estimated: false,
+    claude_windows: [{ name: "weekly_limit", quota: forwardedPoolWindow({ used_percent: 90 }) }],
+  } }));
+  const html = render(value, undefined, nyroProvider);
+  match(html, /Account pool quota/);
+  match(html, /Conflicting account pool observations; usage unknown/);
+  match(html, /Usage unknown/);
+  doesNotMatch(html, /role="progressbar"|aria-valuenow|99%|10%|20%|90%|data-quota-availability/);
+  doesNotMatch(renderNyroGroup(value), /Peak used|99%|10%|20%|90%|data-quota-availability/);
+});
+
+test("an empty forwarded upstream scope preserves no-routes feedback despite local route-admission buckets", () => {
+  const value = { ...nyroUsage(upstreamUsage({ tiers: [] })), upstream: { providers: [] } };
+  const html = render(value, undefined, nyroProvider);
+  match(html, /Upstream Nyro Usage/);
+  match(html, /This key has no routes on the remote/);
+  doesNotMatch(html, /data-quota-bucket=|route-only-card|Model bindings|API price|Bucket details|role="progressbar"/);
+  equal(render({ ...value, quota_buckets: undefined }, undefined, nyroProvider), html);
 });
