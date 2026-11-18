@@ -2582,13 +2582,32 @@ impl StorageBootstrap for MysqlBootstrap {
             "TINYINT(1) NOT NULL DEFAULT 0",
         )
         .await?;
-        mysql_add_column_if_not_exists(
-            pool,
-            "providers",
-            "fast_mode",
-            "TINYINT(1) NOT NULL DEFAULT 0",
+        // Widen in place: no intermediate column or backfill that could leave
+        // partially converted data across MySQL's implicit DDL commits.
+        let speed_mode_type: Option<String> = sqlx::query_scalar(
+            "SELECT CAST(data_type AS CHAR(64) CHARACTER SET utf8mb4) FROM information_schema.columns
+             WHERE table_schema = DATABASE() AND table_name = 'providers' AND column_name = 'fast_mode'",
         )
+        .fetch_optional(pool)
         .await?;
+        match speed_mode_type.as_deref() {
+            None => {
+                sqlx::query(
+                    "ALTER TABLE providers ADD COLUMN fast_mode INTEGER NOT NULL DEFAULT 0",
+                )
+                .execute(pool)
+                .await?;
+            }
+            Some("tinyint") => {
+                sqlx::query(
+                    "ALTER TABLE providers MODIFY COLUMN fast_mode INTEGER NOT NULL DEFAULT 0",
+                )
+                .execute(pool)
+                .await?;
+            }
+            Some("int") => {}
+            Some(other) => anyhow::bail!("unexpected providers.fast_mode column type: {other}"),
+        }
         mysql_add_column_if_not_exists(
             pool,
             "providers",
@@ -3259,7 +3278,7 @@ fn normalize_provider_protocol_value(
 
 fn provider_select(suffix: Option<&str>) -> String {
     let mut sql = String::from(
-        "SELECT id, name, vendor, protocol, base_url, COALESCE(protocol_mode, 'fixed') AS protocol_mode, preset_key, channel, models_source, static_models, api_key, COALESCE(auth_mode, 'apikey') AS auth_mode, COALESCE(use_proxy, 0) AS use_proxy, COALESCE(fast_mode, 0) AS fast_mode, last_test_success, DATE_FORMAT(last_test_at, '%Y-%m-%d %H:%i:%S') AS last_test_at, COALESCE(is_enabled, 1) AS is_enabled, DATE_FORMAT(created_at, '%Y-%m-%d %H:%i:%S') AS created_at, DATE_FORMAT(updated_at, '%Y-%m-%d %H:%i:%S') AS updated_at FROM providers",
+        "SELECT id, name, vendor, protocol, base_url, COALESCE(protocol_mode, 'fixed') AS protocol_mode, preset_key, channel, models_source, static_models, api_key, COALESCE(auth_mode, 'apikey') AS auth_mode, COALESCE(use_proxy, 0) AS use_proxy, fast_mode, last_test_success, DATE_FORMAT(last_test_at, '%Y-%m-%d %H:%i:%S') AS last_test_at, COALESCE(is_enabled, 1) AS is_enabled, DATE_FORMAT(created_at, '%Y-%m-%d %H:%i:%S') AS created_at, DATE_FORMAT(updated_at, '%Y-%m-%d %H:%i:%S') AS updated_at FROM providers",
     );
     if let Some(suffix) = suffix {
         sql.push(' ');
@@ -3376,7 +3395,7 @@ CREATE TABLE IF NOT EXISTS providers (
     refresh_token TEXT,
     expires_at DATETIME,
     use_proxy TINYINT(1) NOT NULL DEFAULT 0,
-    fast_mode TINYINT(1) NOT NULL DEFAULT 0,
+    fast_mode INTEGER NOT NULL DEFAULT 0,
     last_test_success TINYINT(1),
     last_test_at DATETIME,
     is_enabled TINYINT(1) DEFAULT 1,

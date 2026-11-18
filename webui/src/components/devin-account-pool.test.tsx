@@ -38,7 +38,7 @@ function panel(pool: AccountPoolView, collapsed = false, stats?: AccountUsageSta
   if (stats) client.setQueryData(["provider-account-usage-stats", "devin"], stats);
   const provider: Provider = {
     id: "devin", name: "Devin", vendor: "devin", protocol: "devin-chat/get-chat-message/v1",
-    base_url: "https://api.devin.ai", use_proxy: false, fast_mode: false, is_enabled: true,
+    base_url: "https://api.devin.ai", use_proxy: false, fast_mode: "normal", is_enabled: true,
     created_at: "", updated_at: "",
   };
   try {

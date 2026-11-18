@@ -6,7 +6,7 @@ import type { Provider, ProviderPreset } from "./types";
 function provider(id: string, overrides: Partial<Provider> = {}): Provider {
   return {
     id, name: id, protocol: "openai-compatible", base_url: "https://relay.example/v1",
-    is_enabled: true, use_proxy: false, fast_mode: false, created_at: "", updated_at: "",
+    is_enabled: true, use_proxy: false, fast_mode: "normal", created_at: "", updated_at: "",
     ...overrides,
   };
 }

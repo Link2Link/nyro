@@ -340,7 +340,7 @@ async fn provider(gw: &Gateway, path: Path, url: &str) -> anyhow::Result<String>
             api_key: "local-fake-token".into(),
             auth_mode: if subscription { "oauth" } else { "apikey" }.into(),
             use_proxy: false,
-            fast_mode: false,
+            fast_mode: Default::default(),
         })
         .await?;
     if subscription {

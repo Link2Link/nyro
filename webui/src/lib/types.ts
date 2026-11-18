@@ -1,5 +1,7 @@
 import type { AccountPoolView } from "./devin-account-pool";
 
+export type OpenAiSpeedMode = "normal" | "fast" | "ultrafast";
+
 export interface Provider {
   id: string;
   name: string;
@@ -12,8 +14,8 @@ export interface Provider {
   keys?: ProviderKey[];
   api_key?: string;
   use_proxy: boolean;
-  /** OpenAI Responses 渠道（sub2api/Codex）Fast 模式：开启后上游请求自动附加 service_tier=priority。 */
-  fast_mode: boolean;
+  /** Default service tier for Responses requests on sub2api/Codex; normal leaves the request unchanged. */
+  fast_mode: OpenAiSpeedMode;
   auth_mode?: "apikey" | "oauth";
   oauth_status?: ProviderOAuthStatus;
   oauth_expires_at?: string | null;
@@ -798,7 +800,7 @@ export interface CreateProvider {
   protocol_endpoints?: CreateProviderProtocolEndpoint[];
   keys?: UpsertProviderKey[];
   use_proxy?: boolean;
-  fast_mode?: boolean;
+  fast_mode?: OpenAiSpeedMode;
   auth_mode?: "apikey" | "oauth";
   preset_key?: string;
   channel?: string;
@@ -816,7 +818,7 @@ export interface UpdateProvider {
   protocol_endpoints?: CreateProviderProtocolEndpoint[];
   keys?: UpsertProviderKey[];
   use_proxy?: boolean;
-  fast_mode?: boolean;
+  fast_mode?: OpenAiSpeedMode;
   auth_mode?: "apikey" | "oauth";
   preset_key?: string;
   channel?: string;
@@ -942,7 +944,7 @@ export interface ExportProvider {
   protocol: string;
   base_url: string;
   use_proxy: boolean;
-  fast_mode: boolean;
+  fast_mode: OpenAiSpeedMode;
   preset_key?: string | null;
   channel?: string | null;
   models_source?: string | null;

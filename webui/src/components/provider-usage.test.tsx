@@ -10,7 +10,7 @@ import { GroupUsageSummary, ProviderUsageFooter } from "./provider-usage";
 const now = Date.parse("2030-01-01T00:00:00Z");
 const provider: Provider = {
   id: "usage", name: "Usage", vendor: "zai", protocol: "openai-compatible",
-  base_url: "https://api.z.ai", use_proxy: false, fast_mode: false, is_enabled: true,
+  base_url: "https://api.z.ai", use_proxy: false, fast_mode: "normal", is_enabled: true,
   created_at: "", updated_at: "",
 };
 const base: ProviderUsage = {

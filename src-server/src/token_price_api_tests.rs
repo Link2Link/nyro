@@ -122,7 +122,7 @@ async fn token_price_http_default_reference_remains_separate_from_override() -> 
             api_key: "test".into(),
             auth_mode: "apikey".into(),
             use_proxy: false,
-            fast_mode: false,
+            fast_mode: Default::default(),
         })
         .await?;
     let url = format!(

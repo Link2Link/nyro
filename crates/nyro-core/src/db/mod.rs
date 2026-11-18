@@ -47,6 +47,8 @@ pub async fn migrate(pool: &SqlitePool) -> anyhow::Result<()> {
     ensure_provider_column(pool, "last_test_success", "INTEGER").await?;
     ensure_provider_column(pool, "last_test_at", "TEXT").await?;
     ensure_provider_column(pool, "use_proxy", "INTEGER DEFAULT 0").await?;
+    // SQLite's legacy boolean already used integers (0/1). Keep the column
+    // and its data in place: 2 now denotes Ultrafast, legacy NULL reads as 0.
     ensure_provider_column(pool, "fast_mode", "INTEGER DEFAULT 0").await?;
     ensure_provider_column(pool, "protocol_mode", "TEXT NOT NULL DEFAULT 'fixed'").await?;
     ensure_provider_protocol_endpoints_table(pool).await?;

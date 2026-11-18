@@ -110,7 +110,7 @@ fn build_model_probe_request(
     runtime_headers: &HeaderMap,
     model: &str,
     prompt: &str,
-    fast_mode: bool,
+    fast_mode: OpenAiSpeedMode,
     channel: Option<&str>,
     is_codex_oauth: bool,
     antigravity_project: Option<&str>,
@@ -363,7 +363,7 @@ async fn probe_single_model(
     model: &str,
     prompt: &str,
     protocol_id: &str,
-    fast_mode: bool,
+    fast_mode: OpenAiSpeedMode,
     channel: Option<&str>,
     is_codex_oauth: bool,
     antigravity_project: Option<&str>,
@@ -1585,7 +1585,7 @@ mod probe_routing_tests {
             api_key: "provider-key".into(),
             auth_mode: "apikey".into(),
             use_proxy: false,
-            fast_mode: false,
+            fast_mode: Default::default(),
             last_test_success: None,
             last_test_at: None,
             is_enabled: true,
@@ -1723,7 +1723,7 @@ mod probe_routing_tests {
             &runtime_headers,
             "kimi-k3",
             DEFAULT_MODEL_PROBE_PROMPT,
-            false,
+            OpenAiSpeedMode::Normal,
             None,
             false,
             None,
@@ -1809,7 +1809,7 @@ mod probe_selection_tests {
                 &HeaderMap::new(),
                 "m",
                 prompt,
-                false,
+                OpenAiSpeedMode::Normal,
                 None,
                 is_codex_oauth,
                 None,
@@ -4238,7 +4238,7 @@ mod probe_reply_tests {
                 "gemini-4-argon",
                 "hi",
                 "google-gemini",
-                false,
+                OpenAiSpeedMode::Normal,
                 Some(channel),
                 false,
                 Some("fixture-project"),
@@ -4606,7 +4606,7 @@ mod probe_reply_tests {
             &runtime_headers,
             "gpt-5-codex",
             DEFAULT_MODEL_PROBE_PROMPT,
-            true,
+            OpenAiSpeedMode::Fast,
             Some("codex"),
             true,
             None,
@@ -4628,7 +4628,7 @@ mod probe_reply_tests {
         assert_eq!(body.get("store").and_then(Value::as_bool), Some(false));
         assert_eq!(
             body.get("service_tier").and_then(Value::as_str),
-            Some("priority"),
+            Some("fast"),
             "Fast mode must be applied to Codex model probes",
         );
         assert_eq!(
@@ -4664,23 +4664,28 @@ mod probe_reply_tests {
     }
 
     #[test]
-    fn model_probe_uses_fast_mode_for_sub2api_responses() {
-        let (_, _, body) = build_model_probe_request(
-            crate::protocol::ids::Protocol::OpenAIResponses,
-            "https://example.com/v1",
-            "sk-test",
-            "bearer",
-            &HeaderMap::new(),
-            "gpt-test",
-            DEFAULT_MODEL_PROBE_PROMPT,
-            true,
-            Some("sub2api"),
-            false,
-            None,
-        )
-        .unwrap();
-
-        assert_eq!(body["service_tier"], "priority");
+    fn model_probe_uses_selected_speed_for_sub2api_responses() {
+        for (mode, expected) in [
+            (OpenAiSpeedMode::Normal, None),
+            (OpenAiSpeedMode::Fast, Some("fast")),
+            (OpenAiSpeedMode::Ultrafast, Some("ultrafast")),
+        ] {
+            let (_, _, body) = build_model_probe_request(
+                crate::protocol::ids::Protocol::OpenAIResponses,
+                "https://example.com/v1",
+                "sk-test",
+                "bearer",
+                &HeaderMap::new(),
+                "gpt-test",
+                DEFAULT_MODEL_PROBE_PROMPT,
+                mode,
+                Some("sub2api"),
+                false,
+                None,
+            )
+            .unwrap();
+            assert_eq!(body.get("service_tier").and_then(Value::as_str), expected);
+        }
     }
 
     #[test]
@@ -4688,17 +4693,17 @@ mod probe_reply_tests {
         for (protocol, fast_mode, channel) in [
             (
                 crate::protocol::ids::Protocol::OpenAIResponses,
-                false,
+                OpenAiSpeedMode::Normal,
                 Some("sub2api"),
             ),
             (
                 crate::protocol::ids::Protocol::OpenAIResponses,
-                true,
+                OpenAiSpeedMode::Ultrafast,
                 Some("default"),
             ),
             (
                 crate::protocol::ids::Protocol::OpenAICompatible,
-                true,
+                OpenAiSpeedMode::Fast,
                 Some("sub2api"),
             ),
         ] {
@@ -4719,7 +4724,7 @@ mod probe_reply_tests {
 
             assert!(
                 body.get("service_tier").is_none(),
-                "protocol={protocol:?} fast_mode={fast_mode} channel={channel:?}",
+                "protocol={protocol:?} fast_mode={fast_mode:?} channel={channel:?}",
             );
         }
     }
@@ -4738,7 +4743,7 @@ mod probe_reply_tests {
             &runtime_headers,
             "gpt-test",
             DEFAULT_MODEL_PROBE_PROMPT,
-            false,
+            OpenAiSpeedMode::Normal,
             None,
             false,
             None,
@@ -4845,7 +4850,7 @@ mod devin_admin_tests {
             models_source: None,
             static_models: None,
             use_proxy: false,
-            fast_mode: false,
+            fast_mode: Default::default(),
         }
     }
 

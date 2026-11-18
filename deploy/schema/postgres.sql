@@ -199,7 +199,7 @@ CREATE TABLE public.providers (
     refresh_token text,
     expires_at timestamp with time zone,
     use_proxy boolean DEFAULT false NOT NULL,
-    fast_mode boolean DEFAULT false NOT NULL,
+    fast_mode integer DEFAULT 0 NOT NULL,
     last_test_success boolean,
     last_test_at timestamp with time zone,
     is_enabled boolean DEFAULT true,

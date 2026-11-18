@@ -29,7 +29,7 @@ const pool: AccountPoolView = {
 };
 const provider: Provider = {
   id: "claude", name: "Claude", vendor: "anthropic", channel: "claude-code", protocol: "anthropic", auth_mode: "oauth",
-  base_url: "https://api.anthropic.com", use_proxy: false, fast_mode: false, is_enabled: true, created_at: "", updated_at: "",
+  base_url: "https://api.anthropic.com", use_proxy: false, fast_mode: "normal", is_enabled: true, created_at: "", updated_at: "",
 };
 function panel(value = pool, card = false, stats?: AccountUsageStats[], inspect?: (client: QueryClient) => void) {
   const client = new QueryClient();

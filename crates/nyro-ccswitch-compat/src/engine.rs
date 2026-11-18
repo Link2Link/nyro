@@ -196,8 +196,15 @@ impl CompatEngine {
                     ordered,
                     cache_key.as_deref(),
                     matches!(profile.upstream_flavor, UpstreamFlavor::CodexOAuthResponses),
-                    profile.codex_fast_mode,
+                    false, // The upstream port's boolean writes the legacy "priority" tier.
                 )?;
+                // Apply Nyro's default to the OpenAI wire body, not to the Anthropic
+                // ingress: the two protocols use different service_tier vocabularies.
+                if let Some(tier) = profile.default_service_tier
+                    && converted.get("service_tier").is_none()
+                {
+                    converted["service_tier"] = Value::String(tier.into());
+                }
                 reasoning_overrides.apply_responses(&mut converted);
                 if matches!(profile.upstream_flavor, UpstreamFlavor::XaiStrictResponses) {
                     let marker = Value::String("reasoning.encrypted_content".to_string());
@@ -1596,6 +1603,27 @@ mod tests {
             value["include"],
             serde_json::json!(["reasoning.encrypted_content"])
         );
+    }
+
+    #[tokio::test]
+    async fn raw_responses_tier_uses_openai_defaults_not_anthropic_tiers() {
+        for tier in [None, Some("fast"), Some("ultrafast")] {
+            let mut profile = ConversionProfile::anthropic_to_responses(
+                false,
+                crate::UpstreamFlavor::CodexOAuthResponses,
+            );
+            profile.default_service_tier = tier;
+            let body = prepared_body(
+                profile,
+                br#"{"model":"gpt-5","messages":[{"role":"user","content":"hello"}],"max_tokens":128,"service_tier":"standard_only"}"#,
+                SessionIdentity::generated("test"),
+            )
+            .await;
+            let value: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(value.get("service_tier"), tier.map(Value::from).as_ref());
+            assert_eq!(value["store"], false);
+            assert_eq!(value["stream"], true);
+        }
     }
 
     #[tokio::test]

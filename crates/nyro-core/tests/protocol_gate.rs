@@ -34,7 +34,7 @@ fn provider(protocol: &str) -> Provider {
         api_key: String::new(),
         auth_mode: "apikey".to_string(),
         use_proxy: false,
-        fast_mode: false,
+        fast_mode: Default::default(),
         last_test_success: None,
         last_test_at: None,
         is_enabled: true,

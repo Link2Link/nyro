@@ -79,7 +79,7 @@ async fn provider(storage: &SqliteStorage, url: &str) -> anyhow::Result<String> 
             api_key: String::new(),
             auth_mode: "oauth".into(),
             use_proxy: false,
-            fast_mode: false,
+            fast_mode: Default::default(),
         })
         .await?;
     storage

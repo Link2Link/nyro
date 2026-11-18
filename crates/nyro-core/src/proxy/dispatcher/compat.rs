@@ -1901,7 +1901,7 @@ mod tests {
             api_key: "secret".into(),
             auth_mode: "apikey".into(),
             use_proxy: false,
-            fast_mode: false,
+            fast_mode: Default::default(),
             last_test_success: None,
             last_test_at: None,
             is_enabled: true,
@@ -1973,25 +1973,36 @@ mod tests {
     }
 
     #[test]
-    fn enables_fast_mode_for_codex_oauth_responses() {
+    fn raw_responses_profile_only_defaults_tiers_for_consumer_channels() {
+        use crate::db::models::OpenAiSpeedMode::{Fast, Normal, Ultrafast};
         let request = request("virtual", ANTHROPIC_MESSAGES_2023_06_01);
-        let mut codex = provider("openai", "codex");
-        codex.fast_mode = true;
-        let selected = select_via_resolver(
-            ANTHROPIC_MESSAGES_2023_06_01,
-            OPENAI_RESPONSES_V1,
-            &codex,
-            "https://chatgpt.com/backend-api/codex",
-            "gpt-5",
-            false,
-            &HeaderMap::new(),
-            br#"{"model":"virtual","messages":[{"role":"user","content":"hello"}]}"#,
-            &request,
-            &request,
-        )
-        .unwrap()
-        .unwrap();
-        assert!(selected.profile.codex_fast_mode);
+        for (channel, mode, expected) in [
+            ("codex", Normal, None),
+            ("codex", Fast, Some("fast")),
+            ("sub2api", Ultrafast, Some("ultrafast")),
+            ("default", Ultrafast, None),
+        ] {
+            let mut provider = provider("openai", channel);
+            provider.fast_mode = mode;
+            let selected = select_via_resolver(
+                ANTHROPIC_MESSAGES_2023_06_01,
+                OPENAI_RESPONSES_V1,
+                &provider,
+                "https://example.com/v1",
+                "gpt-5",
+                false,
+                &HeaderMap::new(),
+                br#"{"model":"virtual","messages":[{"role":"user","content":"hello"}]}"#,
+                &request,
+                &request,
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(
+                selected.profile.default_service_tier, expected,
+                "{channel}/{mode:?}"
+            );
+        }
     }
 
     #[test]

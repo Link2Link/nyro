@@ -107,7 +107,7 @@ async fn converted_and_forced_stream_attempts_wait_for_body_eos() -> anyhow::Res
                 api_key: "test".into(),
                 auth_mode: "apikey".into(),
                 use_proxy: false,
-                fast_mode: false,
+                fast_mode: Default::default(),
             })
             .await?;
         gw.admin()

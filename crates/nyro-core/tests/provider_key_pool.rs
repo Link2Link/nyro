@@ -131,7 +131,7 @@ async fn pool_provider(
             api_key: "ignored-provider-level-key".into(),
             auth_mode: "apikey".into(),
             use_proxy: false,
-            fast_mode: false,
+            fast_mode: Default::default(),
         })
         .await?
         .id)
@@ -480,7 +480,7 @@ async fn adaptive_pool_key_covers_anthropic_egress() -> anyhow::Result<()> {
             api_key: "ignored".into(),
             auth_mode: "apikey".into(),
             use_proxy: false,
-            fast_mode: false,
+            fast_mode: Default::default(),
         })
         .await?
         .id;

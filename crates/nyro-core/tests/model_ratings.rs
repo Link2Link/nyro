@@ -45,7 +45,7 @@ fn provider(name: &str) -> CreateProvider {
         api_key: "test-only".to_string(),
         auth_mode: "apikey".to_string(),
         use_proxy: false,
-        fast_mode: false,
+        fast_mode: Default::default(),
     }
 }
 

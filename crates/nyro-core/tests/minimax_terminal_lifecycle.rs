@@ -145,7 +145,7 @@ impl Fixture {
                 api_key: "local-test-only".into(),
                 auth_mode: "apikey".into(),
                 use_proxy: false,
-                fast_mode: false,
+                fast_mode: Default::default(),
             })
             .await?;
         self.gw

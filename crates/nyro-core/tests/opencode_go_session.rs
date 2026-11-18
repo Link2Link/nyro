@@ -103,7 +103,7 @@ async fn opencode_provider(gw: &Gateway, url: &str) -> anyhow::Result<String> {
             api_key: "sk-test".into(),
             auth_mode: "apikey".into(),
             use_proxy: false,
-            fast_mode: false,
+            fast_mode: Default::default(),
         })
         .await?
         .id)
@@ -322,7 +322,7 @@ async fn other_vendors_do_not_gain_the_opencode_header() -> anyhow::Result<()> {
             api_key: "sk-test".into(),
             auth_mode: "apikey".into(),
             use_proxy: false,
-            fast_mode: false,
+            fast_mode: Default::default(),
         })
         .await?
         .id;

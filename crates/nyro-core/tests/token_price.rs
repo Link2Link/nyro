@@ -52,7 +52,7 @@ async fn provider(storage: &SqliteStorage, name: &str, url: &str) -> anyhow::Res
             api_key: "test-only".into(),
             auth_mode: "apikey".into(),
             use_proxy: false,
-            fast_mode: false,
+            fast_mode: Default::default(),
         })
         .await?
         .id)
