@@ -8,7 +8,7 @@ import { KiroCredentialImport } from "@/components/kiro-credential-import";
 import { KiroLoginOptionsForm } from "@/components/kiro-login-options";
 import { kiroLoginConfigured, kiroLoginOptions } from "@/lib/kiro-login";
 import { copyToClipboard } from "@/lib/utils";
-import { providerUsageSupported } from "@/lib/provider-usage";
+import { isSub2ApiUsageProvider, providerUsageSupported } from "@/lib/provider-usage";
 import { OAuthProgress, OAuthSessionRemaining, OAuthSessionError, DevinLoginNotice, KiroLoginNotice } from "@/components/oauth-session-status";
 import { localizeBackendErrorMessage } from "@/lib/backend-error";
 import { formatAccountTestLogs, formatProviderModelListLog, formatProviderTestSkip, isProviderTestSkipped, mergeProviderTestVerdict, normalizeCachedProviderTestResult, providerTestError, providerTestStatus } from "@/lib/provider-test";
@@ -1137,10 +1137,11 @@ export default function ProvidersPage() {
   const updateMut = useMutation({
     mutationFn: ({ id, ...input }: UpdateProvider & { id: string }) =>
       backend("update_provider", { id, input }),
-    onSuccess: () => {
+    onSuccess: (_result, { id }) => {
       setEditError(null);
       qc.invalidateQueries({ queryKey: ["providers"] });
       qc.invalidateQueries({ queryKey: ["provider-model-catalog"] });
+      void qc.invalidateQueries({ queryKey: ["provider-usage", id] });
       closeEditForm();
     },
     onError: (err: Error) => {
@@ -4198,7 +4199,11 @@ export default function ProvidersPage() {
                     </ProviderMoreActions>
                   </div>
                 </div>
-                {isDevinProvider(p) ? <DevinAccountPoolCard provider={p} /> : isKiroProvider(p) ? <KiroAccountPoolCard provider={p} /> : isClaudeCodeOAuthProvider(p) ? <ClaudeAccountPoolCard provider={p} /> : providerUsageSupported(p) && <ProviderUsageFooter provider={p} />}
+                {isSub2ApiUsageProvider(p) ? <ProviderUsageFooter provider={p} />
+                  : isDevinProvider(p) ? <DevinAccountPoolCard provider={p} />
+                  : isKiroProvider(p) ? <KiroAccountPoolCard provider={p} />
+                  : isClaudeCodeOAuthProvider(p) ? <ClaudeAccountPoolCard provider={p} />
+                  : providerUsageSupported(p) && <ProviderUsageFooter provider={p} />}
               </div>
             );
           })}

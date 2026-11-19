@@ -1,18 +1,11 @@
 import type { Locale } from "@/lib/i18n";
 import { tierLabel } from "@/lib/provider-usage";
-import { formatUsageCost, retainedUsagePriceDisplay } from "@/lib/token-usage";
-import type { EquivalentCostTotal, ProviderUsage } from "@/lib/types";
-
-function adjustedAmount(costs: EquivalentCostTotal[] | null | undefined, requests: number | undefined, locale: Locale) {
-  if (!costs) return null;
-  if (!costs.length) return requests === 0 ? formatUsageCost(0, "USD", locale) : null;
-  if (!costs.every(({ total_cost, priced_request_count }) => Number.isFinite(total_cost) && total_cost >= 0 && priced_request_count > 0)) return null;
-  return costs.map(({ total_cost, currency }) => formatUsageCost(total_cost, currency, locale)).join(" + ");
-}
+import { retainedUsagePriceDisplay } from "@/lib/token-usage";
+import type { ProviderUsage } from "@/lib/types";
 
 /** Display backend-priced retained attempts; never infer cycles or change routing quota. */
 export function ProviderApiPriceSummary({ usage, now, stale, loading, locale = "en-US", bucketLabel, scopeKey, totalOnly = false, projectionAllowed = true }: {
-  usage: Pick<ProviderUsage, "provider_id" | "kind" | "tiers" | "api_price">;
+  usage: Pick<ProviderUsage, "provider_id" | "tiers" | "api_price">;
   now: number;
   stale: boolean;
   loading: boolean;
@@ -72,22 +65,6 @@ export function ProviderApiPriceSummary({ usage, now, stale, loading, locale = "
     ? "暂无可用估算：需要有效的本周期价格及同周期用量比例（大于 0 且不超过 100%）；旧数据、周期不匹配或无参考价时不估算。"
     : "Estimate unavailable: requires a current-cycle price and matching-cycle usage above 0% and at most 100%; stale data, mismatched cycles or missing reference prices are not projected."),
   estimatePrice?.title ?? ""].filter(Boolean).join("\n");
-  const adjusted = usage.kind === "openai_codex" ? stats?.quota_adjusted : undefined;
-  const adjustedPeriod = period ? adjustedAmount(adjusted?.period, period.request_count, locale) : null;
-  const adjustedTitle = isZh
-    ? "按 Codex 套餐额度权重折算 API 参考价：普通 1×、Fast / Priority 2.5×、UltraFast 8×。未知服务等级按 1× 计入并标为部分估算。非实际账单。"
-    : "API reference prices weighted for included Codex quota: Normal 1×, Fast / Priority 2.5×, UltraFast 8×. Unknown service tiers count at 1× and are marked partial. Not a bill.";
-  const fullCycleTitle = isZh
-    ? "按同周期已用比例推算用满 100% 时的配额折算价格，包含已用部分，并非剩余余额。"
-    : "Projected quota-adjusted price for 100% of the matching cycle. Includes usage so far; not the remaining balance.";
-  const adjustedRows = adjusted ? [
-    { key: "all_time", label: isZh ? "累计" : "All time", amount: adjustedAmount(adjusted.all_time, stats?.all_time.request_count, locale), partial: adjusted.all_time_partial },
-    ...(!totalOnly ? [
-      { key: "period", label: isZh ? "本周期" : "Current cycle", amount: adjustedPeriod, partial: adjusted.period_partial },
-      { key: "estimated_capacity", label: isZh ? "预估完整周期" : "Estimated full cycle", amount: canProject && adjustedPeriod ? adjustedAmount(adjusted.estimated_capacity, undefined, locale) : null,
-        partial: adjusted.period_partial },
-    ] : []),
-  ] : [];
   const rows = [
     { key: "all_time", label: totalOnly ? (isZh ? "供应商保留日志总价格" : "Provider retained-log total") : (isZh ? "累计 API 价格" : "Total API price"), title: scope, totals: stats?.all_time },
     ...(!totalOnly ? [{ key: "period", label: isZh ? "本周期 API 价格" : "Current-cycle API price", title: periodTitle, totals: period }] : []),
@@ -112,21 +89,6 @@ export function ProviderApiPriceSummary({ usage, now, stale, loading, locale = "
         </dd>
       </div>}
     </dl>
-    {adjusted && <section className="mt-2 border-t border-slate-200/70 pt-2" title={adjustedTitle}>
-      <h4 className="mb-1 text-[10px] font-semibold text-slate-600">{isZh ? "配额折算价格" : "Quota-adjusted prices"}</h4>
-      <dl className={`grid gap-x-6 gap-y-2 ${totalOnly ? "" : "sm:grid-cols-3"}`}>
-        {adjustedRows.map(({ key, label, amount, partial }) => <div key={key} data-quota-adjusted-price={key} className="min-w-0"
-          title={key === "estimated_capacity" ? `${adjustedTitle}\n${fullCycleTitle}` : adjustedTitle}>
-          <dt className="text-[10px] font-medium text-slate-500">{label}</dt>
-          <dd className={`mt-0.5 break-words text-xs font-semibold tabular-nums ${amount == null ? "text-slate-400" : partial ? "text-amber-700" : "text-slate-700"}`}>
-            {amount == null ? (isZh ? "暂不可用" : "Unavailable") : `${key === "estimated_capacity" ? "≈ " : ""}${amount}${partial ? (isZh ? "（部分估算）" : " (partial)") : ""}`}
-          </dd>
-        </div>)}
-      </dl>
-    </section>}
-    {usage.kind === "openai_codex" && stats && !adjusted && <p className="mt-1.5 text-[10px] text-slate-400">
-      {isZh ? "配额折算价格暂不可用" : "Quota-adjusted prices unavailable"}
-    </p>}
     {totalOnly && <p className="mt-1.5 text-[10px] text-slate-400">{isZh ? "含未归属用量；不合并独立桶的周期或容量。" : "Includes unassigned usage; independent bucket cycles and capacities are not combined."}</p>}
     {!totalOnly && cycleStatus && <p role="status" className="mt-1.5 text-[10px] text-amber-700">{cycleStatus}</p>}
     {!stats && <p role="status" className="mt-1.5 text-[10px] text-slate-400">

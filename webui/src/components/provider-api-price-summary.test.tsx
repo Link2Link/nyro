@@ -75,43 +75,15 @@ const adjusted = {
 };
 const codexUsage = { ...usage, kind: "openai_codex" };
 
-test("Codex separates quota-adjusted native prices from official API prices in both locales", () => {
-  const value = updateStats({ quota_adjusted: adjusted, estimated_capacity_partial: true }, codexUsage);
-  const html = renderToStaticMarkup(<ProviderApiPriceSummary usage={value} now={now} stale={false} loading={false} />);
-  equal(values(html).join(","), "$228.79,$21.40,≈ $214.00 (partial),$240.00 + ¥15.00 (partial),$38.00,≈ $380.00");
-  match(html, />Quota-adjusted prices</);
-  match(html, />Estimated full cycle</);
-  match(html, /Unknown service tiers count at 1×/);
-  match(html, /Includes usage so far; not the remaining balance/);
-  const zh = render(updateStats({ quota_adjusted: { ...adjusted, all_time_partial: false, period_partial: true } }, codexUsage), { locale: "zh-CN" });
-  equal(values(zh).slice(3).join(","), "$240.00 + ¥15.00,$38.00（部分估算）,≈ $380.00（部分估算）");
-  match(zh, />配额折算价格</);
-  match(zh, />预估完整周期</);
-  match(zh, /未知服务等级按 1× 计入/);
-  doesNotMatch(zh, /Quota-adjusted prices|Estimated full cycle/);
-  doesNotMatch(render(updateStats({ quota_adjusted: adjusted })), /Quota-adjusted|data-quota-adjusted-price/);
-  match(render(codexUsage), /Quota-adjusted prices unavailable/);
-  equal(values(render(codexUsage)).length, 3);
-});
-
-test("Codex adjusted prices distinguish missing values, unused cycles and incomplete evidence", () => {
-  const empty = { all_time: [], all_time_partial: true };
-  equal(values(render(updateStats({ quota_adjusted: empty }, codexUsage))).slice(3).join(","), "Unavailable,Unavailable,Unavailable");
-  equal(values(render(updateStats({ all_time: zero, period: zero, quota_adjusted: { ...empty, all_time_partial: false, period: [] } }, codexUsage))).slice(3).join(","), "$0.00,$0.00,Unavailable");
-  const missing = { ...adjusted, period: null, estimated_capacity: null };
-  equal(values(render(updateStats({ quota_adjusted: missing }, codexUsage), { locale: "zh-CN" })).slice(4).join(","), "暂不可用,暂不可用");
-  const bad = { ...adjusted, period: [{ ...adjusted.period[0], total_cost: -1 }] };
-  equal(values(render(updateStats({ quota_adjusted: bad }, codexUsage))).slice(4).join(","), "Unavailable,Unavailable");
-});
-
-test("Codex adjusted projection requires a fresh matching cycle, with no cross-scope fallback", () => {
-  const value = updateStats({ quota_adjusted: adjusted }, codexUsage);
-  for (const html of [render(value, { stale: true }), render(value, { projectionAllowed: false }),
-    render({ ...value, tiers: [{ ...usage.tiers[1], used_percent: 9 }] })]) {
-    equal(values(html).slice(4).join(","), "$38.00,Unavailable");
+test("Codex shows only API prices even if the server supplies quota-adjusted estimates", () => {
+  for (const locale of ["en-US", "zh-CN"] as const) {
+    const base = updateStats({ estimated_capacity_partial: true }, codexUsage);
+    const expected = locale === "zh-CN" ? "$228.79,$21.40,≈ $214.00（部分估算）" : "$228.79,$21.40,≈ $214.00 (partial)";
+    const html = render(base, { locale });
+    equal(values(html).join(","), expected);
+    doesNotMatch(html, /配额折算价格|Quota-adjusted prices|data-quota-adjusted-price/);
+    equal(render(updateStats({ quota_adjusted: adjusted, estimated_capacity_partial: true }, codexUsage), { locale }), html);
   }
-  equal(values(render(value, { now: end })).slice(3).join(","), "$240.00 + ¥15.00 (partial),Unavailable,Unavailable");
-  equal(values(render(value, { totalOnly: true })).join(","), "$228.79,$240.00 + ¥15.00 (partial)");
 });
 
 test("Google OAuth subscription cycle tooltips cover official windows in both locales with English default", () => {

@@ -42,8 +42,8 @@ fn provider_api_price_weekly_wins_over_short_monthly_and_feature_windows() {
             (ms("2026-10-30T17:59:59+08:00"), ms(end))
         );
         assert_eq!(
-            (period.tier.name.as_str(), period.tier.used_percent),
-            ("weekly_limit", 4.0)
+            (period.tier, period.used_percent),
+            ("weekly_limit", Some(4.0))
         );
         assert!(provider_period(kind, &tiers, period.start).is_some());
         assert!(provider_period(kind, &tiers, period.start - 1).is_none());
@@ -120,7 +120,7 @@ fn provider_api_price_codex_weekly_only_and_known_five_hour_fallback() {
     let period = provider_period("openai_codex", std::slice::from_ref(&weekly), now).unwrap();
     assert_eq!(period.start, ms("2026-10-28T18:29:00+08:00"));
     assert_eq!(period.end, ms(reset));
-    assert_eq!(period.tier.used_percent, 76.0);
+    assert_eq!(period.used_percent, Some(76.0));
 
     let short = tier("five_hour", Some("2026-11-03T13:29:00+08:00"), 20.0);
     let tiers = [
@@ -129,7 +129,7 @@ fn provider_api_price_codex_weekly_only_and_known_five_hour_fallback() {
         short.clone(),
     ];
     let period = provider_period("openai_codex", &tiers, now).unwrap();
-    assert_eq!(period.tier.name, "five_hour");
+    assert_eq!(period.tier, "five_hour");
     assert_eq!(period.start, ms("2026-11-03T08:29:00+08:00"));
     assert_eq!(period.end, ms("2026-11-03T13:29:00+08:00"));
     assert!(provider_period("openai_codex", &[short.clone(), short], now).is_none());
@@ -158,7 +158,7 @@ fn provider_api_price_google_weekly_and_five_hour_require_canonical_account_wind
         provider_period("google_subscription", std::slice::from_ref(&weekly), now).unwrap();
     assert_eq!(period.start, ms("2026-10-28T18:29:00+08:00"));
     assert_eq!(period.end, ms(reset));
-    assert_eq!(period.tier.used_percent, 76.0);
+    assert_eq!(period.used_percent, Some(76.0));
 
     let short = tier("five_hour", Some("2026-11-03T13:29:00+08:00"), 20.0);
     let tiers = [
@@ -167,7 +167,7 @@ fn provider_api_price_google_weekly_and_five_hour_require_canonical_account_wind
         short.clone(),
     ];
     let period = provider_period("google_subscription", &tiers, now).unwrap();
-    assert_eq!(period.tier.name, "five_hour");
+    assert_eq!(period.tier, "five_hour");
     assert_eq!(period.start, ms("2026-11-03T08:29:00+08:00"));
     assert_eq!(period.end, ms("2026-11-03T13:29:00+08:00"));
     assert!(provider_period("google_subscription", &[short.clone(), short], now).is_none());
@@ -246,7 +246,7 @@ fn provider_api_price_five_hour_and_grok_utc_date_only_month_clamping() {
             period.end,
             reset_time("grok_plan", reset).unwrap().timestamp_millis()
         );
-        assert_eq!(period.tier.name, "monthly");
+        assert_eq!(period.tier, "monthly");
     }
     let weekly = [tier("weekly_limit", Some("2026-08-21"), 63.5)];
     let period = provider_period("grok_plan", &weekly, ms("2026-08-20T00:00:00Z")).unwrap();
@@ -1061,5 +1061,337 @@ async fn provider_api_price_all_kinds_retained_history_unknown_cycles_and_fail_o
         assert!(usage.api_price.is_none());
         assert!(serde_json::to_value(&usage)?.get("api_price").is_none());
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn sub2api_retained_prices_follow_utc_month_and_shared_cutoff() -> anyhow::Result<()> {
+    use crate::config::GatewayConfig;
+    use crate::storage::{SqliteStorage, Storage};
+    use std::sync::Arc;
+
+    let dir = tempfile::tempdir()?;
+    let config = GatewayConfig {
+        data_dir: dir.path().into(),
+        ..Default::default()
+    };
+    let storage = SqliteStorage::from_config(&config).await?;
+    let provider = storage
+        .providers()
+        .create(serde_json::from_value(json!({
+            "name": "Relay", "channel": "sub2api", "protocol": "openai-compatible",
+            "base_url": "https://relay.example.invalid/v1", "api_key": ""
+        }))?)
+        .await?;
+    let (gw, _) = Gateway::from_storage(config, Arc::new(storage.clone())).await?;
+    let admin = gw.admin();
+    for (model, currency, input_rate) in [
+        ("wire-usd", "USD", 2.0),
+        ("wire-cny", "CNY", 8.0),
+        ("client-alias", "USD", 999.0),
+    ] {
+        admin
+            .set_token_price(TokenPriceInput {
+                provider_id: provider.id.clone(),
+                model: model.into(),
+                price: Some(TokenPriceRates {
+                    currency: currency.into(),
+                    input_rate,
+                    output_rate: 8.0,
+                    cache_read_rate: Some(1.0),
+                }),
+            })
+            .await?;
+    }
+
+    let dec = ms("2025-12-01T00:00:00Z");
+    let jan = ms("2026-01-01T00:00:00Z");
+    let feb = ms("2026-02-01T00:00:00Z");
+    let known = (Some(1_000_000_i64), Some(500_000_i64), Some(250_000_i64));
+    let zero = (Some(0), Some(0), None);
+    let old_attribution = json!({"quota_attribution": {
+        "version": 1, "scope_id": "retired-owner", "bucket_id": "retired-bucket",
+        "backend_model": "client-alias", "wire_model": "wire-usd",
+        "source": "configured", "revision": 1, "dispatched_at": jan - 1
+    }})
+    .to_string();
+    for (index, (id, model, at, tokens, completed_at, attribution)) in [
+        (provider.id.as_str(), "wire-usd", dec - 1, known, None, None),
+        (&provider.id, "wire-usd", dec, known, None, None),
+        (
+            &provider.id,
+            "wire-usd",
+            dec + 1,
+            (Some(500_000), None, None),
+            None,
+            None,
+        ),
+        (&provider.id, "wire-cny", jan - 1, known, None, None),
+        (&provider.id, "wire-usd", jan - 1, zero, None, None),
+        (
+            &provider.id,
+            "wire-usd",
+            jan - 1,
+            (None, None, None),
+            None,
+            None,
+        ),
+        (&provider.id, "no-reference", jan - 1, zero, None, None),
+        (
+            &provider.id,
+            "wire-cny",
+            jan - 1,
+            known,
+            Some(jan + 1),
+            None,
+        ),
+        (
+            &provider.id,
+            "wire-usd",
+            jan,
+            known,
+            None,
+            Some(old_attribution.as_str()),
+        ),
+        (&provider.id, "wire-usd", feb, known, None, None),
+        ("another-provider", "wire-usd", dec, known, None, None),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let failed = index == 1;
+        sqlx::query(
+            "INSERT INTO request_logs (id, provider_id, client_model, upstream_model, created_at,
+             performance_completed_at, route_decision, input_tokens, output_tokens, cache_read_tokens,
+             client_request_id, attempt_index, outcome_version, attempt_outcome, upstream_status_code)
+             VALUES (?, ?, 'client-alias', ?, ?, ?, ?, ?, ?, ?, 'one-request', ?, 1, ?, ?)",
+        )
+        .bind(format!("relay-attempt-{index}"))
+        .bind(id)
+        .bind(model)
+        .bind(at)
+        .bind(completed_at)
+        .bind(attribution)
+        .bind(tokens.0)
+        .bind(tokens.1)
+        .bind(tokens.2)
+        .bind(index as i32)
+        .bind(if failed { "failed" } else { "completed" })
+        .bind(if failed { 502 } else { 200 })
+        .execute(storage.pool())
+        .await?;
+    }
+
+    let stats_at = |at| {
+        admin.sub2api_api_price_stats(
+            provider.clone(),
+            DateTime::from_timestamp_millis(at).unwrap(),
+        )
+    };
+    let costs = |totals: &AccountUsageTotals| {
+        totals
+            .equivalent_costs
+            .iter()
+            .map(|cost| {
+                (
+                    cost.currency.clone(),
+                    cost.total_cost,
+                    cost.priced_request_count,
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let december = stats_at(jan - 1).await?;
+    assert_eq!(
+        (december.period_start, december.period_end),
+        (Some(dec), Some(jan))
+    );
+    assert_eq!(december.period_tier.as_deref(), Some("calendar_month"));
+    assert_eq!(december.all_time.request_count, 7);
+    assert_eq!(december.all_time.total_tokens, 5_000_000);
+    assert_eq!(
+        costs(&december.all_time),
+        [("CNY".to_owned(), 10.25, 1), ("USD".to_owned(), 12.5, 4)]
+    );
+    let period = december.period.as_ref().unwrap();
+    assert_eq!(period.request_count, 6);
+    assert_eq!(period.total_tokens, 3_500_000);
+    assert_eq!(period.unpriced_request_count, 2);
+    assert_eq!(
+        costs(period),
+        [("CNY".to_owned(), 10.25, 1), ("USD".to_owned(), 6.75, 3)]
+    );
+    let coverage = december.period_coverage.unwrap();
+    assert_eq!(coverage.missing_usage_request_count, 2);
+    assert_eq!(coverage.priced_request_count, 4);
+    assert_eq!(coverage.unpriced_request_count, 2);
+    assert!(december.used_percent.is_none());
+    assert!(december.estimated_capacity.is_none());
+    assert!(december.quota_adjusted.is_none());
+
+    let january = stats_at(jan).await?;
+    assert_eq!(
+        (january.period_start, january.period_end),
+        (Some(jan), Some(feb))
+    );
+    assert_eq!(january.all_time.request_count, 8);
+    let period = january.period.unwrap();
+    assert_eq!((period.request_count, period.total_tokens), (1, 1_500_000));
+    assert_eq!(costs(&period), [("USD".to_owned(), 5.75, 1)]);
+
+    storage.logs().clear_all().await?;
+    let cleared = stats_at(jan).await?;
+    assert_eq!(cleared.all_time.request_count, 0);
+    assert!(cleared.all_time.equivalent_costs.is_empty());
+    assert_eq!(cleared.period.unwrap().request_count, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn sub2api_usage_is_admin_only_and_independent_of_quota_state() -> anyhow::Result<()> {
+    use crate::config::GatewayConfig;
+    use crate::storage::{SqliteStorage, Storage};
+    use std::sync::Arc;
+
+    let dir = tempfile::tempdir()?;
+    let config = GatewayConfig {
+        data_dir: dir.path().into(),
+        ..Default::default()
+    };
+    let storage = SqliteStorage::from_config(&config).await?;
+    let mut providers = Vec::new();
+    for (name, channel, base_url, vendor) in [
+        (
+            "Local relay",
+            "  SuB2ApI  ",
+            "https://relay.example.invalid/v1",
+            "openai",
+        ),
+        // The vendor URL fallback would select Codex if the full-admin path
+        // did not first consider the explicit Sub2API channel.
+        (
+            "Disabled relay",
+            "sub2api",
+            "https://chatgpt.com/backend-api/codex",
+            "openai",
+        ),
+        (
+            "Sub2API lookalike",
+            "default",
+            "https://sub2api.example.invalid/v1",
+            "openai",
+        ),
+        (
+            "Nyro relay",
+            "sub2api",
+            "https://nyro.example.invalid/v1",
+            "nyro-gateway",
+        ),
+    ] {
+        providers.push(
+            storage
+                .providers()
+                .create(serde_json::from_value(json!({
+                    "name": name, "channel": channel, "protocol": "openai-compatible",
+                    "base_url": base_url, "vendor": vendor, "api_key": ""
+                }))?)
+                .await?,
+        );
+    }
+    let [relay, disabled, lookalike, nyro] = providers.as_slice() else {
+        unreachable!()
+    };
+    storage
+        .providers()
+        .update(
+            &disabled.id,
+            UpdateProvider {
+                is_enabled: Some(false),
+                ..Default::default()
+            },
+        )
+        .await?;
+    let (gw, _) = Gateway::from_storage(config, Arc::new(storage.clone())).await?;
+    let admin = gw.admin();
+    admin
+        .create_model(serde_json::from_value(json!({
+            "name": "local-relay-model", "target_provider": relay.id, "target_model": "wire-usd",
+            "enable_auth": false
+        }))?)
+        .await?;
+    let old_scheduling = gw.quota_registry.observe(&relay.id, &[], Some(false));
+    let old_snapshot = snapshot(&relay.id, "old-vendor", 1, Vec::new());
+    gw.usage_snapshots.store(&old_snapshot);
+
+    for provider in [relay, disabled] {
+        let usage = admin.get_provider_usage(&provider.id).await?;
+        assert_eq!(usage.provider_id, provider.id);
+        assert_eq!(usage.kind, "sub2api");
+        assert!(usage.tiers.is_empty());
+        assert!(usage.quota_buckets.is_empty());
+        assert!(usage.balances.is_empty());
+        assert!(usage.spends.is_empty());
+        assert_eq!(usage.scheduling, ProviderScheduling::default());
+        assert!(usage.upstream.is_none());
+        let price = usage.api_price.unwrap();
+        let queried_at = ms(&usage.queried_at);
+        assert_eq!(price.period_tier.as_deref(), Some("calendar_month"));
+        assert!(
+            price.period_start.unwrap() <= queried_at && queried_at < price.period_end.unwrap()
+        );
+        assert_eq!(price.all_time.request_count, 0);
+        assert_eq!(price.period.unwrap().request_count, 0);
+    }
+
+    let rows = admin.list_provider_usage().await?;
+    for (provider, enabled) in [(relay, true), (disabled, false)] {
+        let row = rows
+            .iter()
+            .find(|row| row.provider_id == provider.id)
+            .unwrap();
+        assert_eq!(row.status, ProviderUsageQueryStatus::Ok);
+        assert_eq!(row.is_enabled, enabled);
+        let usage = row.usage.as_ref().unwrap();
+        assert_eq!(usage.kind, "sub2api");
+        assert!(usage.api_price.is_some());
+    }
+    let row = rows
+        .iter()
+        .find(|row| row.provider_id == lookalike.id)
+        .unwrap();
+    assert_eq!(row.status, ProviderUsageQueryStatus::Unsupported);
+    assert!(row.usage.is_none());
+    let row = rows.iter().find(|row| row.provider_id == nyro.id).unwrap();
+    assert_eq!(row.status, ProviderUsageQueryStatus::Error);
+    assert_eq!(row.error.as_deref(), Some("provider api key is empty"));
+
+    let published = published_usage_items(rows);
+    let usage = published
+        .iter()
+        .find(|row| row.provider_id == relay.id)
+        .and_then(|row| row.usage.as_ref())
+        .unwrap();
+    assert_eq!(usage.kind, "sub2api");
+    assert!(usage.api_price.is_some());
+
+    for access in [RouteAccess::default(), RouteAccess::privileged()] {
+        let report = admin.forwarded_provider_usage(&access).await?;
+        assert_eq!(report.providers.len(), 1);
+        let row = &report.providers[0];
+        assert_eq!(row.id, relay.id);
+        assert_eq!(row.status, ProviderUsageQueryStatus::Unsupported);
+        assert!(row.usage.is_none() && row.usage_entry.is_none());
+    }
+    assert_eq!(gw.quota_registry.snapshot(&relay.id), old_scheduling);
+    assert_eq!(
+        gw.quota_registry.snapshot(&disabled.id),
+        ProviderScheduling::default()
+    );
+    let max_age = Duration::from_secs(60);
+    assert_eq!(
+        gw.usage_snapshots.fresh(&relay.id, max_age),
+        Some(old_snapshot)
+    );
+    assert!(gw.usage_snapshots.fresh(&disabled.id, max_age).is_none());
     Ok(())
 }

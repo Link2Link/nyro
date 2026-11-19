@@ -1,6 +1,7 @@
 import type { NyroUpstreamProvider, NyroUpstreamUsage, Provider, ProviderUsage } from "./types";
 import { nativeProviderProtocol } from "./native-provider";
 import { accountStateLabel, type PoolQuotaWindow } from "./devin-account-pool";
+import { isNyroGatewayPreset } from "./nyro-gateway";
 
 export interface ProviderUsagePause {
   message: string;
@@ -45,11 +46,18 @@ export function providerUsagePause(
   };
 }
 
-/** Providers whose vendor has a coding-plan usage-query backend. Mirrors
+/** Sub2API has local accounting, not an upstream quota observation. */
+export function isSub2ApiUsageProvider(provider: Pick<Provider, "vendor" | "preset_key" | "channel">): boolean {
+  return provider.channel?.trim().toLowerCase() === "sub2api"
+    && ![provider.vendor, provider.preset_key].some(isNyroGatewayPreset);
+}
+
+/** Providers with an upstream usage-query backend. Mirrors
  * nyro-core `admin::usage::UsageBackend::detect`. */
 export function providerUsageSupported(
   provider: Pick<Provider, "base_url" | "vendor" | "preset_key" | "channel" | "auth_mode">,
 ): boolean {
+  if (isSub2ApiUsageProvider(provider)) return false;
   const url = provider.base_url.toLowerCase();
   const vendor = (provider.vendor ?? provider.preset_key ?? "").toLowerCase();
   const isCodexOAuth =
@@ -81,8 +89,7 @@ export function providerUsageSupported(
   // Codeium/AWS host (mirrors `UsageBackend::detect`).
   const isNativeOAuth = provider.auth_mode === "oauth" && nativeProviderProtocol(provider) !== null;
   // A chained Nyro forwards its upstream usage; its address is any host.
-  const isNyroGateway = [provider.vendor, provider.preset_key]
-    .some((value) => value?.trim().toLowerCase() === "nyro-gateway");
+  const isNyroGateway = [provider.vendor, provider.preset_key].some(isNyroGatewayPreset);
   return (
     isNyroGateway ||
     isCodexOAuth ||
@@ -127,6 +134,7 @@ export function providerApiPriceSupported(kind: string | undefined): boolean {
 }
 
 export function providerUsageTitle(kind: string | undefined, isZh: boolean): string {
+  if (kind === "sub2api") return isZh ? "Sub2API 用量" : "Sub2API Usage";
   if (kind?.endsWith("_balance")) return isZh ? "账户余额" : "Balance";
   if (kind === "openai_codex") return isZh ? "ChatGPT Codex 用量" : "ChatGPT Codex Usage";
   if (kind === "devin_plan") return isZh ? "Devin 用量" : "Devin Usage";

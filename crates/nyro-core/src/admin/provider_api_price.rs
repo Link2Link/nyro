@@ -1,21 +1,24 @@
-//! Admin-only API-equivalent prices for retained coding-plan provider attempts.
+//! Admin-only API-equivalent prices for retained provider attempts.
 //! These are estimates at current catalogue/manual rates, not upstream invoices.
 //! Unlike the permanent token-usage ledger, clearing logs reduces these totals.
 
+use chrono::Datelike;
+
+use crate::storage::provider_usage::{ProviderQuotaModelUsage, ProviderQuotaUsage};
+
 use super::*;
 
-/// Retained provider usage at current API-equivalent rates. Current-cycle bounds
-/// belong to the captured upstream observation (`ProviderUsage.queried_at`), not
-/// a calendar week, browser clock, or the five-hour bar when a weekly bar exists.
+/// Retained provider usage at current API-equivalent rates. Coding-plan periods
+/// follow the captured upstream quota window; Sub2API uses a UTC calendar month.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ProviderApiPriceStats {
     pub all_time: AccountUsageTotals,
-    /// Unknown/invalid/expired cycles are unavailable, not a zero-usage cycle.
+    /// An unknown/invalid/expired upstream cycle is unavailable, not zero usage.
     pub period: Option<AccountUsageTotals>,
-    /// Upstream-anchored [start, end) in epoch milliseconds.
+    /// Period bounds [start, end) in UTC epoch milliseconds.
     pub period_start: Option<i64>,
     pub period_end: Option<i64>,
-    /// `weekly_limit` | `five_hour` | `monthly`, only for an identified cycle.
+    /// `weekly_limit` | `five_hour` | `monthly` for quota; `calendar_month` for Sub2API.
     pub period_tier: Option<String>,
     /// Finite observed utilization (0..=100) of that same identified cycle.
     pub used_percent: Option<f64>,
@@ -86,10 +89,22 @@ pub struct RetainedQuotaBucketPriceStats {
 }
 
 #[derive(Debug, PartialEq)]
-struct PricePeriod<'a> {
+struct PricePeriod {
     start: i64,
     end: i64,
-    tier: &'a ProviderUsageTier,
+    tier: &'static str,
+    used_percent: Option<f64>,
+}
+
+fn calendar_month_period(now: DateTime<Utc>) -> Option<PricePeriod> {
+    let start = chrono::NaiveDate::from_ymd_opt(now.year(), now.month(), 1)?;
+    let end = start.checked_add_months(chrono::Months::new(1))?;
+    Some(PricePeriod {
+        start: start.and_hms_opt(0, 0, 0)?.and_utc().timestamp_millis(),
+        end: end.and_hms_opt(0, 0, 0)?.and_utc().timestamp_millis(),
+        tier: "calendar_month",
+        used_percent: None,
+    })
 }
 
 fn supported(kind: &str) -> bool {
@@ -120,11 +135,7 @@ fn reset_time(kind: &str, reset: &str) -> Option<DateTime<chrono::FixedOffset>> 
     None
 }
 
-fn provider_period<'a>(
-    kind: &str,
-    tiers: &'a [ProviderUsageTier],
-    now: i64,
-) -> Option<PricePeriod<'a>> {
+fn provider_period(kind: &str, tiers: &[ProviderUsageTier], now: i64) -> Option<PricePeriod> {
     if !supported(kind) {
         return None;
     }
@@ -153,7 +164,12 @@ fn provider_period<'a>(
     }
     .timestamp_millis();
     let end = reset.timestamp_millis();
-    (0 <= start && start <= now && now < end).then_some(PricePeriod { start, end, tier })
+    (0 <= start && start <= now && now < end).then_some(PricePeriod {
+        start,
+        end,
+        tier: name,
+        used_percent: Some(tier.used_percent),
+    })
 }
 
 fn estimate_capacity(
@@ -191,8 +207,6 @@ fn project_costs(
         })
         .collect()
 }
-
-use crate::storage::provider_usage::ProviderQuotaModelUsage;
 
 type QuotaPriceKey = (String, String);
 
@@ -330,7 +344,7 @@ fn partition_key(row: &ProviderQuotaModelUsage) -> Option<QuotaPriceKey> {
 fn price_stats(
     all: &[ProviderQuotaModelUsage],
     current: &[ProviderQuotaModelUsage],
-    period: Option<&PricePeriod<'_>>,
+    period: Option<&PricePeriod>,
     allow_capacity: bool,
     attribution_partial: bool,
 ) -> anyhow::Result<ProviderApiPriceStats> {
@@ -348,10 +362,9 @@ fn price_stats(
             .all(|cost| cost.total_cost.is_finite() && cost.total_cost >= 0.0),
         "provider API price totals overflowed"
     );
-    let used_percent = period.and_then(|period| {
-        let used = period.tier.used_percent;
-        (used.is_finite() && (0.0..=100.0).contains(&used)).then_some(used)
-    });
+    let used_percent = period
+        .and_then(|period| period.used_percent)
+        .filter(|used| used.is_finite() && (0.0..=100.0).contains(used));
     let period_coverage = period.map(|_| coverage(current));
     let estimated_capacity = allow_capacity
         .then(|| {
@@ -375,7 +388,7 @@ fn price_stats(
         period: current_totals,
         period_start: period.map(|period| period.start),
         period_end: period.map(|period| period.end),
-        period_tier: period.map(|period| period.tier.name.clone()),
+        period_tier: period.map(|period| period.tier.to_owned()),
         used_percent,
         estimated_capacity,
         quota_adjusted: None,
@@ -391,11 +404,11 @@ fn price_stats(
 
 /// Only adapters that identify fixed canonical windows can establish a period.
 /// Catalog percentages/reset timestamps alone never establish a denominator.
-fn bucket_period<'a>(
+fn bucket_period(
     kind: &str,
-    bucket: &'a crate::quota_buckets::QuotaBucket,
+    bucket: &crate::quota_buckets::QuotaBucket,
     now: i64,
-) -> Option<PricePeriod<'a>> {
+) -> Option<PricePeriod> {
     if !bucket.is_primary()
         || bucket.stale
         || !matches!(
@@ -409,6 +422,54 @@ fn bucket_period<'a>(
 }
 
 impl AdminService {
+    pub(super) async fn sub2api_api_price_stats(
+        &self,
+        provider: Provider,
+        now: DateTime<Utc>,
+    ) -> anyhow::Result<ProviderApiPriceStats> {
+        let period = calendar_month_period(now).context("UTC calendar month out of range")?;
+        // Both totals come from one provider-scoped scan. Month membership is
+        // based on emitted log time, not a historical quota bucket or reset.
+        let mut scanned = self
+            .gw
+            .storage
+            .logs()
+            .provider_quota_token_usage_with_periods(
+                &provider.id,
+                now.timestamp_millis(),
+                Some((period.start, period.end)),
+                &HashMap::new(),
+                false,
+            )
+            .await?;
+        self.price_retained_usage(provider, &mut scanned).await?;
+        price_stats(
+            &scanned.all_time,
+            &scanned.period,
+            Some(&period),
+            false,
+            false,
+        )
+    }
+
+    async fn price_retained_usage(
+        &self,
+        provider: Provider,
+        scanned: &mut ProviderQuotaUsage,
+    ) -> anyhow::Result<()> {
+        let providers = HashMap::from([(provider.id.clone(), provider)]);
+        let overrides = token_price::parse_overrides(self.gw.storage.settings().list_all().await?)?;
+        let rows = scanned.all_time.iter_mut().chain(&mut scanned.period);
+        let priced = rows
+            .filter(|row| row.fully_missing_usage_request_count == 0)
+            .flat_map(|row| {
+                std::iter::once(&mut row.usage)
+                    .chain(row.speed_tiers.iter_mut().map(|tier| &mut tier.usage))
+            });
+        token_cost::enrich_token_costs(priced, &providers, &self.gw.config.data_dir, &overrides);
+        Ok(())
+    }
+
     /// Best-effort enrichment for the full admin path only. Do not propagate
     /// storage/settings/pricing errors to quota observation or scheduling.
     pub(super) async fn enrich_provider_api_price(&self, usage: &mut ProviderUsage) {
@@ -501,16 +562,7 @@ impl AdminService {
                 codex,
             )
             .await?;
-        let providers = HashMap::from([(usage.provider_id.clone(), provider)]);
-        let overrides = token_price::parse_overrides(self.gw.storage.settings().list_all().await?)?;
-        let rows = scanned.all_time.iter_mut().chain(&mut scanned.period);
-        let priced = rows
-            .filter(|row| row.fully_missing_usage_request_count == 0)
-            .flat_map(|row| {
-                std::iter::once(&mut row.usage)
-                    .chain(row.speed_tiers.iter_mut().map(|tier| &mut tier.usage))
-            });
-        token_cost::enrich_token_costs(priced, &providers, &self.gw.config.data_dir, &overrides);
+        self.price_retained_usage(provider, &mut scanned).await?;
         let unassigned: Vec<_> = scanned
             .all_time
             .iter()

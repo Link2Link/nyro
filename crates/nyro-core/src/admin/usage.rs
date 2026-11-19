@@ -354,6 +354,16 @@ pub(crate) fn is_codex_usage_provider(provider: &Provider) -> bool {
     UsageBackend::detect(provider) == Some(UsageBackend::OpenAiCodex)
 }
 
+fn is_sub2api_accounting_provider(provider: &Provider) -> bool {
+    // An explicit Nyro relay keeps its existing usage path. Otherwise the
+    // admin accounting view follows the channel, never the URL or name.
+    !crate::provider::nyro_gateway::is_nyro_gateway(provider)
+        && provider
+            .channel
+            .as_deref()
+            .is_some_and(|channel| channel.trim().eq_ignore_ascii_case("sub2api"))
+}
+
 impl UsageBackend {
     /// Detect a backend from provider identity first, then fall back to URL
     /// matching for imported/legacy rows that predate preset + channel fields.
@@ -2692,7 +2702,8 @@ enum UsageQueryMode {
 }
 
 impl AdminService {
-    /// Query the coding-plan usage (quota) of a configured provider.
+    /// Query a configured provider's usage. Sub2API uses retained local logs
+    /// instead of querying upstream quota.
     ///
     /// Supported backends:
     /// - GLM Coding Plan (Zhipu / Z.ai personal plan):
@@ -2704,6 +2715,31 @@ impl AdminService {
     /// - Kimi For Coding: `GET https://api.kimi.com/coding/v1/usages`,
     ///   Bearer key.
     pub async fn get_provider_usage(&self, id: &str) -> anyhow::Result<ProviderUsage> {
+        let provider = self.get_provider(id).await?;
+        if is_sub2api_accounting_provider(&provider) {
+            // Do not refresh quotas or publish this local report to the
+            // snapshot cache used by forwarding.
+            let now = Utc::now();
+            let provider_id = provider.id.clone();
+            let api_price = self.sub2api_api_price_stats(provider, now).await?;
+            return Ok(ProviderUsage {
+                provider_id,
+                kind: "sub2api".into(),
+                site: "local".into(),
+                level: None,
+                tiers: Vec::new(),
+                quota_buckets: Vec::new(),
+                balances: Vec::new(),
+                spends: Vec::new(),
+                is_available: None,
+                scheduling: ProviderScheduling::default(),
+                queried_at: now.to_rfc3339(),
+                api_price: Some(api_price),
+                account_pool: None,
+                pool_quota: None,
+                upstream: None,
+            });
+        }
         let mut usage = self.provider_usage_snapshot(id).await?;
         // Price enrichment belongs only to this admin path, never GuardOnly or
         // proxy forwarding; failures cannot alter a successful quota observation.
@@ -2733,7 +2769,7 @@ impl AdminService {
 
     /// Query usage for every configured provider.
     ///
-    /// Providers without a usage backend are returned as `unsupported`.
+    /// Providers without vendor usage or local accounting are `unsupported`.
     /// Query failures are returned as `error` items so one vendor outage
     /// cannot fail the whole list. Upstream calls run concurrently with
     /// [`LIST_USAGE_CONCURRENCY`].
@@ -2742,7 +2778,9 @@ impl AdminService {
         let mut items: Vec<Option<ProviderUsageListItem>> = vec![None; providers.len()];
         let mut jobs = Vec::new();
         for (index, provider) in providers.into_iter().enumerate() {
-            if UsageBackend::detect(&provider).is_none() {
+            if !is_sub2api_accounting_provider(&provider)
+                && UsageBackend::detect(&provider).is_none()
+            {
                 items[index] = Some(ProviderUsageListItem::unsupported(&provider));
                 continue;
             }

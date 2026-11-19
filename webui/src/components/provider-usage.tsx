@@ -3,7 +3,7 @@ import { useQueries, useQuery } from "@tanstack/react-query";
 import { Clock, RefreshCw, AlertCircle, CirclePause } from "lucide-react";
 import { backend } from "@/lib/backend";
 import { localizeBackendErrorMessage } from "@/lib/backend-error";
-import { isKiroOverage, nyroUpstreamPoolUsedPercent, nyroUpstreamPoolWindowNames, nyroUpstreamPoolWindows, nyroUpstreamView, providerApiPriceSupported, providerUsagePause, providerUsageSupported, providerUsageTitle, summarizeGroupUsage, tierLabel } from "@/lib/provider-usage";
+import { isKiroOverage, isSub2ApiUsageProvider, nyroUpstreamPoolUsedPercent, nyroUpstreamPoolWindowNames, nyroUpstreamPoolWindows, nyroUpstreamView, providerApiPriceSupported, providerUsagePause, providerUsageSupported, providerUsageTitle, summarizeGroupUsage, tierLabel } from "@/lib/provider-usage";
 import { isDevinProvider, isKiroProvider } from "@/lib/native-provider";
 import { isClaudeCodeOAuthProvider } from "@/lib/claude-account-pool";
 import { claudeAccountWindowViews, claudeMainObservedAt, claudeMainStale, claudeWindowView, newerClaudeAccount, validObservedAt } from "@/lib/claude-usage-windows";
@@ -16,6 +16,7 @@ import { UsageProgress } from "@/components/usage-progress";
 import { PoolRefreshButton } from "@/components/pool-refresh-button";
 import { ProviderIcon } from "@/components/ui/provider-icon";
 import { ProviderApiPriceSummary } from "@/components/provider-api-price-summary";
+import { Sub2ApiUsageSummary } from "@/components/sub2api-usage-summary";
 import { hasStructuredQuotaBuckets, isForwardedRouteBucket, isGoogleFamilyDisplayBucket } from "@/lib/quota-bucket-display";
 import { ProviderQuotaBuckets, QuotaBucketAvailability } from "@/components/provider-quota-buckets";
 import { ProviderUsageDialog } from "@/components/provider-usage-dialog";
@@ -408,7 +409,8 @@ export function ProviderUsageFooter({ provider, claudeAccount: currentClaudeAcco
 
   // Ark usage needs Volcengine IAM AK/SK (distinct from the inference key).
   // Until they are configured the footer stays hidden — no error banner.
-  const isArk = isArkProvider(provider);
+  const localUsage = isSub2ApiUsageProvider(provider);
+  const isArk = !localUsage && isArkProvider(provider);
   const { data: arkCredentials } = useQuery<ProviderUsageCredentials | null>({
     ...arkCredentialsQuery(provider),
     enabled: isArk,
@@ -431,10 +433,10 @@ export function ProviderUsageFooter({ provider, claudeAccount: currentClaudeAcco
     return null;
   }
 
-  const shown = usage;
+  const shown = localUsage === (usage?.kind === "sub2api") ? usage : undefined;
   const balances = shown?.balances ?? [];
-  const hasBuckets = hasStructuredQuotaBuckets(shown);
-  const pause = hasBuckets ? null : providerUsagePause(shown, isZh);
+  const hasBuckets = !localUsage && hasStructuredQuotaBuckets(shown);
+  const pause = localUsage || hasBuckets ? null : providerUsagePause(shown, isZh);
   const quotaCountdown = countdownStr(pause?.resetAt);
   const blockedTierLabels = (pause?.quotaExhausted ? shown?.scheduling?.blocking_tiers ?? [] : [])
     .map((name) => tierLabel(name, isZh))
@@ -450,7 +452,7 @@ export function ProviderUsageFooter({ provider, claudeAccount: currentClaudeAcco
     !pause &&
     (shown?.tiers ?? []).some((tier) => tier.used_percent >= 100) &&
     balances.some((balance) => balance.total > 0);
-  const title = providerUsageTitle(shown?.kind, isZh);
+  const title = providerUsageTitle(localUsage ? "sub2api" : shown?.kind, isZh);
   const errorMessage = error ? localizeBackendErrorMessage(error, isZh) : "";
 
   const claudeSingleton = (shown?.kind === "claude_code_plan" || Boolean(currentClaudeAccount)) && !shown?.account_pool?.config;
@@ -554,12 +556,14 @@ export function ProviderUsageFooter({ provider, claudeAccount: currentClaudeAcco
         </div>
       )}
 
-      {!hasBuckets && shown?.is_available === false && !pause && <p className="text-xs font-medium text-red-600">{isZh ? "不可用" : "Unavailable"}</p>}
+      {!localUsage && !hasBuckets && shown?.is_available === false && !pause && <p className="text-xs font-medium text-red-600">{isZh ? "不可用" : "Unavailable"}</p>}
       {error && <div role="alert" className="flex items-center gap-1.5 text-xs text-red-500" title={errorMessage}>
         <AlertCircle className="h-3.5 w-3.5 shrink-0" />
         <span className="break-words">{isZh ? "用量查询失败" : "Usage query failed"}: {errorMessage}</span>
       </div>}
-      {hasBuckets && shown ? (
+      {localUsage ? (
+        <Sub2ApiUsageSummary stats={shown?.api_price} now={now} loading={isFetching} locale={locale} />
+      ) : hasBuckets && shown ? (
         <ProviderQuotaBuckets usage={shown} now={now} stale={Boolean(error)} loading={isFetching} locale={locale} onDetails={setDetailFilter} />
       ) : shown?.upstream ? (
         <NyroUpstreamUsagePanel report={shown.upstream} isZh={isZh} now={now} />
@@ -597,7 +601,7 @@ export function ProviderUsageFooter({ provider, claudeAccount: currentClaudeAcco
       ) : (
         <p className="text-xs text-slate-400">{isZh ? "暂无用量数据" : "No usage data"}</p>
       )}
-      {!hasBuckets && shown && providerApiPriceSupported(shown.kind) && <ProviderApiPriceSummary
+      {!localUsage && !hasBuckets && shown && providerApiPriceSupported(shown.kind) && <ProviderApiPriceSummary
         usage={shown} now={now} stale={stale} loading={isFetching} locale={locale} />}
       {bindingEditorOpen && <ProviderQuotaBucketEditor providerId={provider.id} buckets={(shown?.quota_buckets ?? []).filter((bucket) => !isForwardedRouteBucket(bucket) && !isGoogleFamilyDisplayBucket(bucket))}
         open onOpenChange={setBindingEditorOpen} />}
