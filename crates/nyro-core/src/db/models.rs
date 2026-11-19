@@ -86,10 +86,11 @@ pub enum OpenAiSpeedMode {
 }
 
 impl OpenAiSpeedMode {
+    /// Upstream wire value for Codex/Sub2API, distinct from the saved mode name.
     pub fn service_tier(self) -> Option<&'static str> {
         match self {
             Self::Normal => None,
-            Self::Fast => Some("fast"),
+            Self::Fast => Some("priority"),
             Self::Ultrafast => Some("ultrafast"),
         }
     }
@@ -1956,7 +1957,7 @@ mod tests {
             None
         );
         assert_eq!(Normal.service_tier(), None);
-        assert_eq!(Fast.service_tier(), Some("fast"));
+        assert_eq!(Fast.service_tier(), Some("priority"));
         assert_eq!(Ultrafast.service_tier(), Some("ultrafast"));
     }
 

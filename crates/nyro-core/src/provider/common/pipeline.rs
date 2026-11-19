@@ -2311,7 +2311,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn passthrough_injects_fast_for_sub2api_fast_mode() {
+    async fn passthrough_injects_priority_for_sub2api_fast_mode() {
         let gw = build_test_gateway().await;
         let provider = provider_with_channel("sk-sub2api", Some("sub2api"), OpenAiSpeedMode::Fast);
         let ctx = responses_ctx(&provider, &gw);
@@ -2326,8 +2326,8 @@ mod tests {
         .expect("passthrough succeeds");
 
         assert_eq!(
-            out.body["service_tier"], "fast",
-            "sub2api fast mode must inject service_tier=fast",
+            out.body["service_tier"], "priority",
+            "Sub2API Fast mode must send service_tier=priority",
         );
     }
 
@@ -3001,7 +3001,7 @@ mod tests {
         let gw = build_test_gateway().await;
         for (mode, expected) in [
             (OpenAiSpeedMode::Normal, "auto"),
-            (OpenAiSpeedMode::Fast, "fast"),
+            (OpenAiSpeedMode::Fast, "priority"),
             (OpenAiSpeedMode::Ultrafast, "ultrafast"),
         ] {
             let provider = provider_with_channel("sk-sub2api", Some("sub2api"), mode);
@@ -3067,7 +3067,7 @@ mod tests {
         );
     }
 
-    /// IR transcodes apply the same default after the request is encoded.
+    /// IR transcodes apply the same override after the request is encoded.
     #[tokio::test]
     async fn build_request_injects_service_tier_for_sub2api_fast_mode() {
         let gw = build_test_gateway().await;
@@ -3080,8 +3080,8 @@ mod tests {
             .expect("build_request succeeds");
 
         assert_eq!(
-            out.body["service_tier"], "fast",
-            "IR transcode path must inject service_tier=fast for sub2api fast mode",
+            out.body["service_tier"], "priority",
+            "IR transcode path must send service_tier=priority for Sub2API Fast mode",
         );
     }
 

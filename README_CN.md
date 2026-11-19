@@ -85,7 +85,7 @@ Nyro 同时提供 **桌面应用**（macOS / Windows / Linux）和 **独立服�
 - **流式响应**：完整 SSE 透传与跨协议格式转换
 - **推理内容**：支持 `<think>` 标签解析与跨协议转换
 - **OpenAI 推理档位下限**：OpenAI 供应商下所有模型（默认 API、Codex、Sub2API 渠道）在 Chat Completions、Responses 及转码请求中，将显式 `none` 推理档位改为 `low` 再发送上游；其他档位保持不变，未指定档位时不补填。这是供应商策略，不扩展到所有 OpenAI 兼容后端或 Nyro 中继。
-- **OpenAI Responses 请求速度**：对于发往 Codex 或 Sub2API 供应商的请求，普通模式既不添加也不改写 `service_tier`。即使客户端已指定档位，Fast 和 Ultrafast 也会分别将上游请求的 `service_tier` 强制设为 `fast` 和 `ultrafast`。原先已开启 Fast 的配置升级后仍为 Fast。
+- **OpenAI Responses 请求速度**：对于发往 Codex 或 Sub2API 供应商的请求，普通模式既不添加也不改写 `service_tier`。即使客户端已指定档位，Fast 和 Ultrafast 也会分别将上游请求的 `service_tier` 强制设为 `priority` 和 `ultrafast`。Fast 档的设置值仍为 `fast`，原先已开启 Fast 的配置升级后也不变。
 - **工具调用**：跨协议 tool call 与结果格式归一化
 - **路由类型**：支持 chat 和 embedding 两种路由类型
 

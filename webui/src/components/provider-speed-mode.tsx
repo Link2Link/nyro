@@ -24,8 +24,8 @@ export function ProviderSpeedMode({ channel, value = "normal", onChange, isZh, c
         <option value="ultrafast">Ultrafast</option>
       </select>
       <p id={`${id}-help`} className="text-xs text-slate-500">{isZh
-        ? "对于发往 Codex 或 Sub2API 的 OpenAI Responses 请求，普通模式既不添加也不改写 service_tier。Fast 和 Ultrafast 分别将上游请求的 service_tier 强制设为 fast 和 ultrafast，即使客户端已指定档位。"
-        : "For OpenAI Responses requests to Codex or Sub2API, Normal neither adds nor changes service_tier. Fast and Ultrafast force the upstream service_tier to fast and ultrafast, respectively, even if the client already supplied a tier."}</p>
+        ? "对于发往 Codex 或 Sub2API 的 OpenAI Responses 请求，普通模式既不添加也不改写 service_tier。Fast 和 Ultrafast 分别将上游请求的 service_tier 强制设为 priority 和 ultrafast，即使客户端已指定档位。"
+        : "For OpenAI Responses requests to Codex or Sub2API, Normal neither adds nor changes service_tier. Fast and Ultrafast force the upstream service_tier to priority and ultrafast, respectively, even if the client already supplied a tier."}</p>
     </div>
   );
 }

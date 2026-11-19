@@ -1605,7 +1605,7 @@ mod tests {
 
     #[tokio::test]
     async fn raw_responses_tier_uses_provider_override_not_anthropic_tiers() {
-        for tier in [None, Some("fast"), Some("ultrafast")] {
+        for tier in [None, Some("priority"), Some("ultrafast")] {
             let mut profile = ConversionProfile::anthropic_to_responses(
                 false,
                 crate::UpstreamFlavor::CodexOAuthResponses,
