@@ -4,6 +4,16 @@ All notable changes to Nyro will be documented in this file.
 
 ---
 
+## v2.1.48
+
+> Released on 2026-11-19
+
+#### Fixes
+
+- **Fast mode for Codex and Sub2API**: Fast now sends `service_tier: "priority"` to the upstream Responses endpoint instead of `"fast"`, which the ChatGPT Codex endpoint rejects. Existing Fast settings continue to work without reconfiguration. Normal, Ultrafast, and quota-adjusted price calculations are unchanged.
+
+---
+
 ## v2.1.47
 
 > Released on 2026-11-19

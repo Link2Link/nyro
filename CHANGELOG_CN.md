@@ -4,6 +4,16 @@ Nyro 的所有重要变更均记录在此文件中。
 
 ---
 
+## v2.1.48
+
+> 发布于 2026-11-19
+
+#### 修复
+
+- **Codex 与 Sub2API 的 Fast 档**：发往上游的 OpenAI Responses 请求改用 `service_tier: "priority"`，不再发送 ChatGPT Codex 接口拒绝的 `"fast"`。原有 Fast 设置无需重新保存；普通档、UltraFast 和配额折算规则不变。
+
+---
+
 ## v2.1.47
 
 > 发布于 2026-11-19
