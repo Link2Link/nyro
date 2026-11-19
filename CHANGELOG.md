@@ -4,6 +4,16 @@ All notable changes to Nyro will be documented in this file.
 
 ---
 
+## v2.1.46
+
+> Released on 2026-11-19
+
+#### Features
+
+- **Codex quota-adjusted prices**: Codex subscription cards now show a separate value weighted by the tier of each upstream attempt: Normal 1×, Fast 2.5×, and Ultrafast 8×. The full-cycle estimate divides the current cycle’s adjusted value by its upstream quota-used fraction. Original API-equivalent prices remain unchanged. Attempts with no reliable tier evidence count at 1× and are marked as partial estimates.
+
+---
+
 ## v2.1.45
 
 > Released on 2026-11-18
