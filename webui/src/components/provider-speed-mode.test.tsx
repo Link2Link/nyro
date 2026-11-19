@@ -29,19 +29,19 @@ test("Codex and sub2api explain tier preservation and overrides in English and C
     const en = render(channel);
     match(en, /OpenAI Responses requests to Codex or Sub2API/);
     match(en, /Normal neither adds nor changes service_tier/);
-    match(en, /Fast and Ultrafast force the upstream service_tier to fast and ultrafast, respectively, even if the client already supplied a tier/);
+    match(en, /Fast and Ultrafast force the upstream service_tier to priority and ultrafast, respectively, even if the client already supplied a tier/);
 
     const zh = render(channel, undefined, true);
     match(zh, /发往 Codex 或 Sub2API 的 OpenAI Responses 请求/);
     match(zh, /普通模式既不添加也不改写 service_tier/);
-    match(zh, /Fast 和 Ultrafast 分别将上游请求的 service_tier 强制设为 fast 和 ultrafast，即使客户端已指定档位/);
+    match(zh, /Fast 和 Ultrafast 分别将上游请求的 service_tier 强制设为 priority 和 ultrafast，即使客户端已指定档位/);
   }
 });
 
-test("new and legacy provider modes produce only canonical request strings", () => {
+test("new and legacy provider modes normalize to canonical settings, not upstream tiers", () => {
   for (const channel of ["codex", "sub2api"]) {
     for (const [saved, mode] of [[true, "fast"], [false, "normal"], [undefined, "normal"], ["normal", "normal"],
-      ["fast", "fast"], ["ultrafast", "ultrafast"], ["unexpected", "normal"]] as const) {
+      ["fast", "fast"], ["ultrafast", "ultrafast"], ["priority", "normal"], ["unexpected", "normal"]] as const) {
       equal(speedModeForChannel(channel, saved), mode);
     }
   }

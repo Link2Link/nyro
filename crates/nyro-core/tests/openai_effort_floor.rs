@@ -590,7 +590,7 @@ fn provider_speed_mode_overrides_client_tiers_on_responses_egress() -> anyhow::R
                 "default"
             };
             let cases = [
-                (OpenAiSpeedMode::Fast, Some(standard), Some("fast")),
+                (OpenAiSpeedMode::Fast, Some(standard), Some("priority")),
                 (
                     OpenAiSpeedMode::Ultrafast,
                     Some(if anthropic { standard } else { "fast" }),
@@ -602,7 +602,7 @@ fn provider_speed_mode_overrides_client_tiers_on_responses_egress() -> anyhow::R
                     (!anthropic).then_some(standard),
                 ),
                 (OpenAiSpeedMode::Normal, None, None),
-                (OpenAiSpeedMode::Fast, None, Some("fast")),
+                (OpenAiSpeedMode::Fast, None, Some("priority")),
                 (
                     OpenAiSpeedMode::Ultrafast,
                     Some(if anthropic { standard } else { "auto" }),
@@ -637,8 +637,15 @@ fn codex_routing_hint_agrees_with_provider_speed_override() -> anyhow::Result<()
             "codex",
             Route::Responses,
             OpenAiSpeedMode::Fast,
-            "fast",
-            "model=gpt-6.1-sol;tier=fast",
+            "priority",
+            "model=gpt-6.1-sol;tier=priority",
+        ),
+        (
+            "sub2api",
+            Route::Responses,
+            OpenAiSpeedMode::Fast,
+            "priority",
+            "model=gpt-6.1-sol;tier=priority",
         ),
         (
             "codex",

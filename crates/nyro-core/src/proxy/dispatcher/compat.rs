@@ -1978,7 +1978,8 @@ mod tests {
         let request = request("virtual", ANTHROPIC_MESSAGES_2023_06_01);
         for (channel, mode, expected) in [
             ("codex", Normal, None),
-            ("codex", Fast, Some("fast")),
+            ("codex", Fast, Some("priority")),
+            ("sub2api", Fast, Some("priority")),
             ("sub2api", Ultrafast, Some("ultrafast")),
             ("default", Ultrafast, None),
         ] {

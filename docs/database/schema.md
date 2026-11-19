@@ -43,7 +43,7 @@ AI 模型供应商配置（API endpoint、密钥、认证方式等）。
 | `refresh_token` | TEXT | NULL | OAuth refresh token（迁移至 oauth 表后弃用） |
 | `expires_at` | TEXT | NULL | OAuth token 过期时间（迁移至 oauth 表后弃用） |
 | `use_proxy` | INTEGER | `0` | 是否通过代理发送请求 |
-| `fast_mode` | INTEGER | `0` | Codex / sub2api 渠道的 OpenAI Responses 速度档位：`0` = `normal`（不添加也不改写 `service_tier`），`1` = `fast`，`2` = `ultrafast`。后两档强制将上游请求的 `service_tier` 设为同名值，即使客户端已指定档位。旧布尔列的 false/true 分别保留为 0/1，旧 SQLite NULL 按 0 读取；API 与备份使用小写字符串，仍接受旧布尔输入。 |
+| `fast_mode` | INTEGER | `0` | Codex / sub2api 渠道的 OpenAI Responses 速度档位：`0` = `normal`（不添加也不改写 `service_tier`），`1` = `fast`，`2` = `ultrafast`。后两档分别将上游请求的 `service_tier` 强制设为 `priority` 和 `ultrafast`，即使客户端已指定档位。旧布尔列的 false/true 分别保留为 0/1，旧 SQLite NULL 按 0 读取；API 与备份使用小写字符串，仍接受旧布尔输入。 |
 | `last_test_success` | INTEGER | NULL | 最近一次连通性测试是否成功 |
 | `last_test_at` | TEXT | NULL | 最近一次连通性测试时间 |
 | `is_enabled` | INTEGER | `1` | 是否启用 |

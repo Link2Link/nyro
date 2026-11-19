@@ -4628,8 +4628,8 @@ mod probe_reply_tests {
         assert_eq!(body.get("store").and_then(Value::as_bool), Some(false));
         assert_eq!(
             body.get("service_tier").and_then(Value::as_str),
-            Some("fast"),
-            "Fast mode must be applied to Codex model probes",
+            Some("priority"),
+            "Codex model probes must request priority for Fast mode",
         );
         assert_eq!(
             body.pointer("/input/0/content/0/type")
@@ -4667,7 +4667,7 @@ mod probe_reply_tests {
     fn model_probe_uses_selected_speed_for_sub2api_responses() {
         for (mode, expected) in [
             (OpenAiSpeedMode::Normal, None),
-            (OpenAiSpeedMode::Fast, Some("fast")),
+            (OpenAiSpeedMode::Fast, Some("priority")),
             (OpenAiSpeedMode::Ultrafast, Some("ultrafast")),
         ] {
             let (_, _, body) = build_model_probe_request(
