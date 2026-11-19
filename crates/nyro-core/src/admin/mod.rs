@@ -92,7 +92,9 @@ pub use usage::{
     ProviderUsage, ProviderUsageBalance, ProviderUsageListItem, ProviderUsageQueryStatus,
     ProviderUsageSpend, ProviderUsageTier,
 };
-pub(crate) use usage::{run_provider_usage_monitor, trigger_provider_usage_refresh};
+pub(crate) use usage::{
+    is_codex_usage_provider, run_provider_usage_monitor, trigger_provider_usage_refresh,
+};
 mod usage_forward;
 pub(crate) use usage_forward::UsageSnapshotCache;
 pub use usage_forward::{ForwardedProviderUsage, ForwardedUsageReport, RouteAccess};

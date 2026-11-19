@@ -2,7 +2,7 @@
 use std::collections::{BTreeMap, HashMap};
 
 use crate::db::models::{
-    LogPage, LogQuery, ProviderModelUsageStats, ProviderUsageDetail, TokenUsageDay,
+    LogPage, LogQuery, OpenAiSpeedMode, ProviderModelUsageStats, ProviderUsageDetail, TokenUsageDay,
 };
 
 /// Narrow streaming detail projection: no request/response payload columns.
@@ -153,7 +153,7 @@ impl<'a> QuotaDetailAccumulator<'a> {
             scope,
             summary: Default::default(),
             models: Default::default(),
-            usage: QuotaUsageAccumulator::new(provider, end, None, periods),
+            usage: QuotaUsageAccumulator::new(provider, end, None, periods, false),
         }
     }
     pub(super) fn add(&mut self, mut row: QuotaDetailRow) {
@@ -233,10 +233,21 @@ pub(super) struct QuotaUsageRow {
     pub(super) created_at: i64,
     pub(super) performance_completed_at: Option<i64>,
     pub(super) route_decision: Option<String>,
+    pub(super) payload_metadata_json: Option<String>,
     pub(super) upstream_model: Option<String>,
     pub(super) input_tokens: Option<i64>,
     pub(super) output_tokens: Option<i64>,
     pub(super) cache_read_tokens: Option<i64>,
+}
+
+/// Use a constant NULL for ordinary scans: do not fetch per-attempt metadata
+/// unless the caller needs the Codex breakdown.
+pub(super) fn tier_metadata_column(include_codex_speed_tiers: bool) -> &'static str {
+    if include_codex_speed_tiers {
+        "payload_metadata_json"
+    } else {
+        "NULL AS payload_metadata_json"
+    }
 }
 
 /// One immutable primary accounting partition and exact priced model. Absent
@@ -246,12 +257,23 @@ pub struct ProviderQuotaModelUsage {
     pub scope_id: Option<String>,
     pub bucket_id: Option<String>,
     pub usage: TokenUsageDay,
+    /// Disjoint subtotals for speed-adjusted estimates. Ordinary API prices
+    /// still use `usage` so tier boundaries cannot change cache clamping. Empty
+    /// for callers that did not request a Codex breakdown.
+    pub speed_tiers: Vec<ProviderSpeedTierUsage>,
     pub attributed_request_count: i64,
     pub inferred_request_count: i64,
     pub unassigned_request_count: i64,
     pub legacy_timestamp_request_count: i64,
     /// No input OR output evidence: must not become a priced free zero.
     pub fully_missing_usage_request_count: i64,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ProviderSpeedTierUsage {
+    /// None means unknown historical evidence, not a measured normal tier.
+    pub speed_tier: Option<OpenAiSpeedMode>,
+    pub usage: TokenUsageDay,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -286,6 +308,34 @@ fn attribution(raw: Option<&str>) -> Option<Attribution> {
         && nonempty(&item.source)
         && item.dispatched_at >= 0)
         .then_some(item)
+}
+
+/// Only the logged upstream evidence qualifies. Ignore unrelated metadata and
+/// never consult today's provider settings or load historical request bodies.
+fn codex_speed_tier(raw: Option<&str>) -> Option<OpenAiSpeedMode> {
+    #[derive(serde::Deserialize)]
+    struct Metadata<'a> {
+        #[serde(borrow)]
+        codex_service_tier: Evidence<'a>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Evidence<'a> {
+        source: &'a str,
+        value: &'a str,
+    }
+    let Metadata { codex_service_tier } = serde_json::from_str(raw?).ok()?;
+    if !matches!(
+        codex_service_tier.source,
+        "upstream_request" | "upstream_response"
+    ) {
+        return None;
+    }
+    match codex_service_tier.value {
+        "normal" => Some(OpenAiSpeedMode::Normal),
+        "fast" => Some(OpenAiSpeedMode::Fast),
+        "ultrafast" => Some(OpenAiSpeedMode::Ultrafast),
+        _ => None,
+    }
 }
 
 pub(crate) fn quota_priced_model(
@@ -446,6 +496,7 @@ pub(super) struct QuotaUsageAccumulator<'a> {
     now: i64,
     provider_period: Option<(i64, i64)>,
     periods: &'a HashMap<(String, String), crate::storage::provider_usage::ProviderQuotaPeriod>,
+    include_codex_speed_tiers: bool,
     all_time: BTreeMap<GroupKey, ProviderQuotaModelUsage>,
     current: BTreeMap<GroupKey, ProviderQuotaModelUsage>,
 }
@@ -456,12 +507,14 @@ impl<'a> QuotaUsageAccumulator<'a> {
         now: i64,
         provider_period: Option<(i64, i64)>,
         periods: &'a HashMap<(String, String), crate::storage::provider_usage::ProviderQuotaPeriod>,
+        include_codex_speed_tiers: bool,
     ) -> Self {
         Self {
             provider_id,
             now,
             provider_period,
             periods,
+            include_codex_speed_tiers,
             all_time: BTreeMap::new(),
             current: BTreeMap::new(),
         }
@@ -492,7 +545,11 @@ impl<'a> QuotaUsageAccumulator<'a> {
             model,
             row.input_tokens.is_none() && row.output_tokens.is_none(),
         );
-        Self::accumulate(&mut self.all_time, self.provider_id, &key, &row);
+        // Outer None skips subtotals. Inner None records an unknown historical tier.
+        let tier = self
+            .include_codex_speed_tiers
+            .then(|| codex_speed_tier(row.payload_metadata_json.as_deref()));
+        Self::accumulate(&mut self.all_time, self.provider_id, &key, tier, &row);
         // Legacy/provider-detail ranges filter emitted rows, exactly like logs.
         // Only per-bucket quota cycles use immutable dispatch-time membership.
         let (period, timestamp) = match self.provider_period {
@@ -513,13 +570,14 @@ impl<'a> QuotaUsageAccumulator<'a> {
             ),
         };
         if period.is_some_and(|(start, end)| start < end && start <= timestamp && timestamp < end) {
-            Self::accumulate(&mut self.current, self.provider_id, &key, &row);
+            Self::accumulate(&mut self.current, self.provider_id, &key, tier, &row);
         }
     }
     fn accumulate(
         groups: &mut BTreeMap<GroupKey, ProviderQuotaModelUsage>,
         provider: &str,
         key: &GroupKey,
+        tier: Option<Option<OpenAiSpeedMode>>,
         row: &QuotaUsageRow,
     ) {
         let usage = groups
@@ -528,6 +586,7 @@ impl<'a> QuotaUsageAccumulator<'a> {
                 scope_id: key.0.as_ref().map(|key| key.0.clone()),
                 bucket_id: key.0.as_ref().map(|key| key.1.clone()),
                 usage: empty_usage(provider, &key.1),
+                speed_tiers: Vec::new(),
                 attributed_request_count: 0,
                 inferred_request_count: 0,
                 unassigned_request_count: 0,
@@ -540,6 +599,30 @@ impl<'a> QuotaUsageAccumulator<'a> {
             row.output_tokens,
             row.cache_read_tokens,
         );
+        if let Some(tier) = tier {
+            // Keep the (at most four) evidence groups in a deterministic order.
+            let index = usage
+                .speed_tiers
+                .binary_search_by_key(&tier.map(|t| t as i32), |group| {
+                    group.speed_tier.map(|t| t as i32)
+                })
+                .unwrap_or_else(|index| {
+                    usage.speed_tiers.insert(
+                        index,
+                        ProviderSpeedTierUsage {
+                            speed_tier: tier,
+                            usage: empty_usage(provider, &key.1),
+                        },
+                    );
+                    index
+                });
+            add_tokens(
+                &mut usage.speed_tiers[index].usage,
+                row.input_tokens,
+                row.output_tokens,
+                row.cache_read_tokens,
+            );
+        }
         if key.2 {
             usage.fully_missing_usage_request_count =
                 usage.fully_missing_usage_request_count.saturating_add(1);

@@ -297,6 +297,7 @@ pub trait LogStore: Send + Sync {
             (String, String),
             crate::storage::provider_usage::ProviderQuotaPeriod,
         >,
+        include_codex_speed_tiers: bool,
     ) -> anyhow::Result<super::provider_usage::ProviderQuotaUsage>;
     /// Stream narrow provider/range metadata once, applying the same guarded
     /// immutable bucket predicate as log listing. Folds summary/model metrics

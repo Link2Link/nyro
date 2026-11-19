@@ -10,6 +10,8 @@ These are reference estimates using recorded tokens and the current automatic or
 
 ## Retention and pricing
 
+OpenAI Codex subscriptions also show a separate **quota-adjusted value** for all retained requests, the current cycle and the projected full cycle. Within each currency, multiply the base API value for each tier by Normal **1×**, Fast **2.5×**, or Ultrafast **8×**, then sum. Divide the current-cycle adjusted value by the upstream used fraction once to estimate the full cycle. These weights model included quota, not purchased credits or API billing; the original API prices and token counts do not change. The logged upstream response tier takes precedence over the final outbound request tier. Historical or unsupported tiers without usable evidence are valued at 1× and marked partial, not reconstructed from current provider settings.
+
 Totals are scoped to the exact provider ID and upstream model, without requiring account-pool attribution. Clearing or deleting request logs reduces these figures. They intentionally follow account-pool retained-log statistics, not the permanent daily token-usage ledger.
 
 USD, CNY and other native currency buckets remain separate. Missing reference prices display `—`, partial pricing displays `*` and explains the excluded attempts, and an unused cycle or explicitly priced zero displays zero. Small nonzero amounts retain the existing `<$0.01` / `<¥0.01` formatting. A runtime model catalog or a manual model price can supply prices absent from the embedded catalog; the feature never guesses a newer model's rate from an older version.
@@ -44,5 +46,6 @@ Only finite usage above 0% and at most 100%, with a priced sample from the same 
 | `period_tier` | Selected canonical quota window; otherwise `null`. |
 | `used_percent` | Finite observed usage in `[0, 100]` for that window, or `null`. |
 | `estimated_capacity` | Projected native-currency cost buckets, or `null`; request counts describe the observed priced sample, not a forecast. |
+| `quota_adjusted` | Codex only: separate `all_time`, `period` and `estimated_capacity` currency buckets, with `all_time_partial` and `period_partial` coverage flags. |
 
 A statistics/pricing failure omits the optional field without failing quota observation or changing routing eligibility. Other provider backends omit it. The quota monitor and proxy usage forwarding do not compute these prices; snapshots and forwarded responses exclude the admin-only field, including for privileged proxy keys. No new database schema or upstream credential mutation is involved.

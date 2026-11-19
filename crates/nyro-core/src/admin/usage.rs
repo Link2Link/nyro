@@ -348,6 +348,12 @@ enum UsageBackend {
     ClaudeCode,
 }
 
+/// Keep per-attempt service-tier capture aligned with the Codex usage card,
+/// including imported providers and the precedence of other structured identities.
+pub(crate) fn is_codex_usage_provider(provider: &Provider) -> bool {
+    UsageBackend::detect(provider) == Some(UsageBackend::OpenAiCodex)
+}
+
 impl UsageBackend {
     /// Detect a backend from provider identity first, then fall back to URL
     /// matching for imported/legacy rows that predate preset + channel fields.
@@ -5075,6 +5081,27 @@ mod tests {
                 "feature:spark:five_hour"
             ]
         );
+    }
+
+    #[test]
+    fn codex_service_tier_uses_usage_identity_including_imports() {
+        let proxy = "https://proxy.example.invalid/v1";
+        let codex = "https://chatgpt.com/backend-api/codex";
+        for (vendor, preset, channel, url, expected) in [
+            (None, Some(" OpenAI "), Some(" CODEX "), proxy, true),
+            (Some("codex"), None, Some("codex"), proxy, true),
+            (None, None, None, codex, true),
+            (Some("openai"), Some("other"), Some("codex"), proxy, false),
+            (Some("openai"), None, Some("sub2api"), proxy, false),
+            (Some("google"), None, Some("gemini-cli"), codex, false),
+        ] {
+            let provider = provider_for_usage(vendor, preset, channel, url);
+            assert_eq!(
+                is_codex_usage_provider(&provider),
+                expected,
+                "{vendor:?}/{preset:?}/{channel:?}/{url}"
+            );
+        }
     }
 
     #[test]

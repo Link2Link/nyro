@@ -1,4 +1,5 @@
 //! Strict, payload-independent performance evidence. Historical rows never prove delivery.
+mod codex_service_tier;
 mod lifecycle;
 mod response_model;
 pub(crate) use lifecycle::{Attempt, ProducerGuard};
@@ -243,6 +244,7 @@ pub(crate) struct Terminal {
     allow_chat_eof: bool,
     // Enabled only for the routed Anthropic egress; shares bounded wire framing.
     response_model: Option<response_model::ClaudeResponseModel>,
+    codex_service_tier: Option<codex_service_tier::CodexServiceTier>,
     finished: bool,
 }
 impl Terminal {
@@ -277,7 +279,7 @@ impl Terminal {
             return;
         }
         match serde_json::from_str::<Value>(data) {
-            Ok(value) => self.json(&value),
+            Ok(value) => self.wire_json(&value),
             Err(_) => self.invalid = true,
         }
     }
@@ -330,6 +332,12 @@ impl Terminal {
             self.completion = Some(state);
             self.reason = Some(reason.into());
         }
+    }
+    fn wire_json(&mut self, value: &Value) {
+        if let Some(tier) = self.codex_service_tier.as_mut() {
+            tier.observe_response(value, self.sse);
+        }
+        self.json(value);
     }
     fn json(&mut self, value: &Value) {
         if let Some(array) = value.as_array() {
@@ -448,7 +456,7 @@ impl Terminal {
             self.line(&buffer);
             self.event();
         } else if let Ok(value) = serde_json::from_slice::<Value>(&buffer) {
-            self.json(&value);
+            self.wire_json(&value);
         } else {
             self.invalid = true;
         }

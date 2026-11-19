@@ -2165,6 +2165,8 @@ async fn dispatch_pipeline_inner(
                 actual_model.clone(),
             ));
         }
+        let observe_codex_tier = egress == crate::protocol::ids::OPENAI_RESPONSES_V1
+            && crate::admin::is_codex_usage_provider(&provider);
         let mut same_target_retried = false;
         let mut saw_zero_payload_malformed = false;
         let (response, status, retry, health_outcome, defer_native_stream_health) = loop {
@@ -2209,6 +2211,9 @@ async fn dispatch_pipeline_inner(
                 ctx.deadline.clone(),
             );
             performance.configure_terminal(provider.vendor.as_deref(), egress);
+            if observe_codex_tier {
+                performance.observe_codex_service_tier();
+            }
             let attempt_index = ctx.extensions.get::<AttemptCount>().unwrap_or_default().0 + 1;
             ctx.extensions.insert(AttemptCount(attempt_index));
             let upstream_attempts = ctx
