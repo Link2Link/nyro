@@ -190,9 +190,9 @@ pub struct ConversionProfile {
     pub model: Option<String>,
     pub provider_id: Option<String>,
     pub cache_key: Option<String>,
-    /// Provider-selected OpenAI wire default for Anthropic → Responses.
+    /// Provider-selected OpenAI wire override for Anthropic → Responses.
     /// This is independent of the Codex OAuth request-shape constraints.
-    pub default_service_tier: Option<&'static str>,
+    pub service_tier_override: Option<&'static str>,
     pub preserve_chat_reasoning_content: bool,
     pub codex_anthropic_default_max_tokens: u64,
     pub chat_reasoning: Option<CodexChatReasoningConfig>,
@@ -327,7 +327,7 @@ impl ConversionProfile {
             model: None,
             provider_id: None,
             cache_key: None,
-            default_service_tier: None,
+            service_tier_override: None,
             preserve_chat_reasoning_content: false,
             codex_anthropic_default_max_tokens: 8192,
             chat_reasoning: None,

@@ -32,17 +32,13 @@ fn is_codex_consumer_channel(channel: &str) -> bool {
     channel.eq_ignore_ascii_case("codex") || channel.eq_ignore_ascii_case("sub2api")
 }
 
-/// Default a missing OpenAI Responses service tier for the Codex and sub2api
-/// channels. Normal sends no tier; an explicit client value always wins.
-pub(crate) fn maybe_inject_openai_fast_mode(
-    body: &mut Value,
-    provider: &Provider,
-    protocol: ProtocolId,
-) {
+/// Apply the configured speed on the OpenAI Responses wire body. Normal
+/// leaves the client tier untouched; Fast and Ultrafast override it.
+pub(crate) fn apply_openai_speed_mode(body: &mut Value, provider: &Provider, protocol: ProtocolId) {
     if protocol != OPENAI_RESPONSES_V1 {
         return;
     }
-    maybe_inject_openai_fast_mode_for_protocol(
+    apply_openai_speed_mode_for_protocol(
         body,
         provider.fast_mode,
         provider.channel.as_deref(),
@@ -50,22 +46,30 @@ pub(crate) fn maybe_inject_openai_fast_mode(
     );
 }
 
-/// Apply the same Fast mode policy to requests that are built outside the
+pub(crate) fn openai_service_tier_override(
+    fast_mode: OpenAiSpeedMode,
+    channel: Option<&str>,
+    protocol: Protocol,
+) -> Option<&'static str> {
+    if protocol == Protocol::OpenAIResponses && channel.is_some_and(is_codex_consumer_channel) {
+        fast_mode.service_tier()
+    } else {
+        None
+    }
+}
+
+/// Apply the same speed policy to requests that are built outside the
 /// provider pipeline, such as the admin model probe.
-pub(crate) fn maybe_inject_openai_fast_mode_for_protocol(
+pub(crate) fn apply_openai_speed_mode_for_protocol(
     body: &mut Value,
     fast_mode: OpenAiSpeedMode,
     channel: Option<&str>,
     protocol: Protocol,
 ) {
-    if protocol == Protocol::OpenAIResponses
-        && channel.is_some_and(is_codex_consumer_channel)
-        && let Some(tier) = fast_mode.service_tier()
+    if let Some(tier) = openai_service_tier_override(fast_mode, channel, protocol)
         && let Some(object) = body.as_object_mut()
     {
-        object
-            .entry("service_tier")
-            .or_insert_with(|| Value::String(tier.into()));
+        object.insert("service_tier".into(), Value::String(tier.into()));
     }
 }
 
@@ -638,8 +642,8 @@ where
     // 确保 thinking + 最终输出都有足够空间（IR 转码路径）
     apply_max_tokens_floor(&mut body, ctx.protocol.protocol, req.reasoning.enabled);
 
-    // 5b. Default the Responses service tier after encoding, never before.
-    maybe_inject_openai_fast_mode(&mut body, ctx.provider, ctx.protocol);
+    // 5b. Apply the Responses service tier override after encoding.
+    apply_openai_speed_mode(&mut body, ctx.provider, ctx.protocol);
     // 5c. Codex 消费级上游：剥离其拒绝的 Responses 参数（IR 转码路径）
     maybe_sanitize_codex_consumer_request(&mut body, ctx.provider);
     // 5d. Codex 消费级上游：剥离 reasoning 项的非空 content（IR 转码路径）
@@ -843,8 +847,8 @@ pub async fn passthrough_run(
             crate::protocol::codec::openai::responses::normalize_function_tool_defaults(
                 &mut raw_body,
             );
-            // Use the same service tier default on the native Responses path.
-            maybe_inject_openai_fast_mode(&mut raw_body, ctx.provider, ctx.protocol);
+            // Use the same speed override on the native Responses path.
+            apply_openai_speed_mode(&mut raw_body, ctx.provider, ctx.protocol);
             // Codex 消费级上游：剥离其拒绝的 Responses 参数（Responses 直通路径）
             maybe_sanitize_codex_consumer_request(&mut raw_body, ctx.provider);
             // Codex 消费级上游：剥离 reasoning 项的非空 content（Responses 直通路径）
@@ -2992,30 +2996,30 @@ mod tests {
         }
     }
 
-    /// 客户端显式携带的 service_tier 拥有最终决定权，Fast 模式不得覆盖。
     #[tokio::test]
-    async fn passthrough_preserves_explicit_client_service_tier() {
+    async fn passthrough_only_overrides_explicit_client_service_tier_for_speed_modes() {
         let gw = build_test_gateway().await;
-        let provider = provider_with_channel("sk-sub2api", Some("sub2api"), OpenAiSpeedMode::Fast);
-        let ctx = responses_ctx(&provider, &gw);
-
-        let out = passthrough_run(
-            &FakeApiKeyVendor,
-            serde_json::json!({
-                "model": "o3",
-                "input": "ping",
-                "service_tier": "auto",
-            }),
-            &ctx,
-            false,
-        )
-        .await
-        .expect("passthrough succeeds");
-
-        assert_eq!(
-            out.body["service_tier"], "auto",
-            "explicit client service_tier must be preserved verbatim",
-        );
+        for (mode, expected) in [
+            (OpenAiSpeedMode::Normal, "auto"),
+            (OpenAiSpeedMode::Fast, "fast"),
+            (OpenAiSpeedMode::Ultrafast, "ultrafast"),
+        ] {
+            let provider = provider_with_channel("sk-sub2api", Some("sub2api"), mode);
+            let ctx = responses_ctx(&provider, &gw);
+            let out = passthrough_run(
+                &FakeApiKeyVendor,
+                serde_json::json!({
+                    "model": "o3",
+                    "input": "ping",
+                    "service_tier": "auto",
+                }),
+                &ctx,
+                false,
+            )
+            .await
+            .expect("passthrough succeeds");
+            assert_eq!(out.body["service_tier"], expected, "{mode:?}");
+        }
     }
 
     /// Fast 模式开关关闭时不得注入任何字段。

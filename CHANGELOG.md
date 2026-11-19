@@ -4,6 +4,16 @@ All notable changes to Nyro will be documented in this file.
 
 ---
 
+## v2.1.47
+
+> Released on 2026-11-19
+
+#### Fixes
+
+- **Codex and Sub2API speed precedence**: Configured Fast and Ultrafast now override client-supplied `service_tier` on outgoing OpenAI Responses requests, while Normal leaves it unchanged. An existing Codex routing hint is synchronized with the selected tier and upstream model. Quota-adjusted prices still prefer the actual tier reported by the upstream response.
+
+---
+
 ## v2.1.46
 
 > Released on 2026-11-19

@@ -2,11 +2,40 @@
 
 use reqwest::header::HeaderMap;
 
+use crate::db::models::Provider;
+use crate::protocol::ids::{OPENAI_RESPONSES_V1, ProtocolId};
 use crate::provider::common::openai::{openai_bearer_auth_headers, openai_build_url};
+use crate::provider::common::pipeline::openai_service_tier_override;
 use crate::provider::registry::{ExtensionRegistration, VendorScope};
 use crate::provider::vendor_ext::{VendorCtx, VendorExtension};
 
 pub struct OpenAiCodexChannel;
+
+/// Keep the Codex client's optional routing hint consistent with a forced
+/// service tier and the resolved upstream model. Do not add internal headers
+/// to requests from other clients, channels or protocols.
+pub(crate) fn sync_speed_routing_hint(
+    headers: &mut HeaderMap,
+    provider: &Provider,
+    protocol: ProtocolId,
+    model: &str,
+) {
+    const HINT: &str = "x-codex-routing-hint";
+    if protocol != OPENAI_RESPONSES_V1 || !headers.contains_key(HINT) {
+        return;
+    }
+    let channel = provider.channel.as_deref();
+    let Some(tier) = openai_service_tier_override(provider.fast_mode, channel, protocol.protocol)
+    else {
+        return;
+    };
+    let hint = format!("model={model};tier={tier}");
+    if let Ok(value) = hint.parse() {
+        headers.insert(HINT, value);
+    } else {
+        headers.remove(HINT);
+    }
+}
 
 impl VendorExtension for OpenAiCodexChannel {
     fn scope(&self) -> VendorScope {
@@ -40,8 +69,6 @@ inventory::submit! {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::models::Provider;
-    use crate::protocol::ids::OPENAI_RESPONSES_V1;
 
     fn provider() -> Provider {
         Provider {

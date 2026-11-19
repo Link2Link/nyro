@@ -147,8 +147,8 @@ pub struct Provider {
     pub auth_mode: String,
     #[serde(default)]
     pub use_proxy: bool,
-    /// Inject the selected service tier for Codex/sub2api Responses requests
-    /// only when the client did not supply one.
+    /// Force the selected service tier for Codex/sub2api Responses requests.
+    /// Normal leaves the client tier untouched.
     #[serde(default)]
     #[sqlx(default)]
     pub fast_mode: OpenAiSpeedMode,

@@ -1973,7 +1973,7 @@ mod tests {
     }
 
     #[test]
-    fn raw_responses_profile_only_defaults_tiers_for_consumer_channels() {
+    fn raw_responses_profile_only_overrides_tiers_for_consumer_channels() {
         use crate::db::models::OpenAiSpeedMode::{Fast, Normal, Ultrafast};
         let request = request("virtual", ANTHROPIC_MESSAGES_2023_06_01);
         for (channel, mode, expected) in [
@@ -1999,7 +1999,7 @@ mod tests {
             .unwrap()
             .unwrap();
             assert_eq!(
-                selected.profile.default_service_tier, expected,
+                selected.profile.service_tier_override, expected,
                 "{channel}/{mode:?}"
             );
         }
