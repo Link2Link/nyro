@@ -198,11 +198,9 @@ impl CompatEngine {
                     matches!(profile.upstream_flavor, UpstreamFlavor::CodexOAuthResponses),
                     false, // The upstream port's boolean writes the legacy "priority" tier.
                 )?;
-                // Apply Nyro's default to the OpenAI wire body, not to the Anthropic
+                // Apply Nyro's override to the OpenAI wire body, not to the Anthropic
                 // ingress: the two protocols use different service_tier vocabularies.
-                if let Some(tier) = profile.default_service_tier
-                    && converted.get("service_tier").is_none()
-                {
+                if let Some(tier) = profile.service_tier_override {
                     converted["service_tier"] = Value::String(tier.into());
                 }
                 reasoning_overrides.apply_responses(&mut converted);
@@ -1606,13 +1604,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn raw_responses_tier_uses_openai_defaults_not_anthropic_tiers() {
+    async fn raw_responses_tier_uses_provider_override_not_anthropic_tiers() {
         for tier in [None, Some("fast"), Some("ultrafast")] {
             let mut profile = ConversionProfile::anthropic_to_responses(
                 false,
                 crate::UpstreamFlavor::CodexOAuthResponses,
             );
-            profile.default_service_tier = tier;
+            profile.service_tier_override = tier;
             let body = prepared_body(
                 profile,
                 br#"{"model":"gpt-5","messages":[{"role":"user","content":"hello"}],"max_tokens":128,"service_tier":"standard_only"}"#,

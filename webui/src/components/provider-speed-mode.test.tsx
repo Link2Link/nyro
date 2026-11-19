@@ -19,9 +19,22 @@ test("Codex and sub2api show the three localized options and select the saved ti
           ["normal", isZh ? "普通" : "Normal"], ["fast", "Fast"], ["ultrafast", "Ultrafast"],
         ]);
         deepEqual(options.filter(([, , selected]) => selected).map(([, value]) => value), [mode ?? "normal"]);
-        match(html, isZh ? /客户端已指定的 service_tier 不会被覆盖/ : /client-supplied service_tier is never overwritten/);
       }
     }
+  }
+});
+
+test("Codex and sub2api explain tier preservation and overrides in English and Chinese", () => {
+  for (const channel of ["codex", "sub2api"]) {
+    const en = render(channel);
+    match(en, /OpenAI Responses requests to Codex or Sub2API/);
+    match(en, /Normal neither adds nor changes service_tier/);
+    match(en, /Fast and Ultrafast force the upstream service_tier to fast and ultrafast, respectively, even if the client already supplied a tier/);
+
+    const zh = render(channel, undefined, true);
+    match(zh, /发往 Codex 或 Sub2API 的 OpenAI Responses 请求/);
+    match(zh, /普通模式既不添加也不改写 service_tier/);
+    match(zh, /Fast 和 Ultrafast 分别将上游请求的 service_tier 强制设为 fast 和 ultrafast，即使客户端已指定档位/);
   }
 });
 

@@ -630,7 +630,7 @@ pub trait Vendor: Send + Sync + 'static {
 2. `normalize_request_tool_results`
 3. `pre_encode`
 4. codec encode
-5. `post_encode`，随后是 wire 级修正子步骤：MiniMax / Google 输出 token 下限 → 5a `apply_max_tokens_floor` → 5b `maybe_inject_openai_fast_mode` → 5c–5e Codex 消费级参数 / reasoning content / 工具调用 ID 清洗 → `apply_vendor_effort_policy` → 5f `antigravity::apply_tier_model_rewrite` → 5g `antigravity::apply_thought_signature_policy`
+5. `post_encode`，随后是 wire 级修正子步骤：MiniMax / Google 输出 token 下限 → 5a `apply_max_tokens_floor` → 5b `apply_openai_speed_mode` → 5c–5e Codex 消费级参数 / reasoning content / 工具调用 ID 清洗 → `apply_vendor_effort_policy` → 5f `antigravity::apply_tier_model_rewrite` → 5g `antigravity::apply_thought_signature_policy`
 6. `auth_headers`（`disable_default_auth` 时跳过；Anthropic 协议下 Bearer 改写为 `x-api-key`；合并 encoder extra headers）
 7. `build_url` + `apply_explicit_auth_scheme`（按端点 `auth_scheme`：bearer / x-api-key / query / none）
 

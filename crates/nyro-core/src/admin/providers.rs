@@ -181,7 +181,7 @@ fn build_model_probe_request(
         }
     };
 
-    crate::provider::common::pipeline::maybe_inject_openai_fast_mode_for_protocol(
+    crate::provider::common::pipeline::apply_openai_speed_mode_for_protocol(
         &mut body, fast_mode, channel, suite,
     );
 

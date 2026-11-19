@@ -185,6 +185,7 @@ struct Case {
     model: &'static str,
     force_max: bool,
     speed_mode: OpenAiSpeedMode,
+    routing_hint: Option<(&'static str, &'static str)>,
 }
 impl Case {
     fn openai(route: Route) -> Self {
@@ -196,6 +197,7 @@ impl Case {
             model: SOL,
             force_max: false,
             speed_mode: OpenAiSpeedMode::Normal,
+            routing_hint: None,
         }
     }
 }
@@ -303,11 +305,15 @@ fn run(case: Case, body: Value, expected: Value) -> anyhow::Result<()> {
         let context = RequestContext::new(ingress, TIMEOUT);
         let trace = context.trace.clone();
         let request_id = context.request_id.clone();
+        let mut headers = HeaderMap::new();
+        if let Some((incoming, _)) = case.routing_hint {
+            headers.insert("x-codex-routing-hint", incoming.parse()?);
+        }
         let response = tokio::time::timeout(
             TIMEOUT,
             dispatch_pipeline(
                 gateway,
-                HeaderMap::new(),
+                headers,
                 RawEnvelope::new(
                     Some(body.clone()),
                     HashMap::new(),
@@ -356,6 +362,15 @@ fn run(case: Case, body: Value, expected: Value) -> anyhow::Result<()> {
         };
         assert_eq!(sent.uri.path(), expected_path);
         assert_eq!(sent.headers["authorization"], format!("Bearer {TOKEN}"));
+        assert_eq!(
+            sent.headers
+                .get("x-codex-routing-hint")
+                .map(|value| value.to_str().unwrap()),
+            case.routing_hint.map(|(_, expected)| expected),
+            "exact upstream routing hint: {:?}/{}",
+            case.route,
+            case.channel,
+        );
         assert_eq!(
             sent.body, expected,
             "exact final wire body: {:?}/{}",
@@ -559,43 +574,110 @@ fn codex_and_sub2api_channels_use_loopback_api_keys_not_oauth() -> anyhow::Resul
     Ok(())
 }
 #[test]
-fn selected_speed_mode_reaches_the_upstream_without_overriding_the_client() -> anyhow::Result<()> {
+fn provider_speed_mode_overrides_client_tiers_on_responses_egress() -> anyhow::Result<()> {
     for channel in ["codex", "sub2api"] {
         for route in [
             Route::Responses,
             Route::ChatToResponses,
             Route::AnthropicToResponses,
         ] {
-            for (mode, client_tier, upstream_tier) in [
+            // Anthropic's standard_only is a separate protocol's vocabulary;
+            // it must not leak into an OpenAI Responses request in Normal mode.
+            let anthropic = matches!(route, Route::AnthropicToResponses);
+            let standard = if anthropic {
+                "standard_only"
+            } else {
+                "default"
+            };
+            let cases = [
+                (OpenAiSpeedMode::Fast, Some(standard), Some("fast")),
+                (
+                    OpenAiSpeedMode::Ultrafast,
+                    Some(if anthropic { standard } else { "fast" }),
+                    Some("ultrafast"),
+                ),
+                (
+                    OpenAiSpeedMode::Normal,
+                    Some(standard),
+                    (!anthropic).then_some(standard),
+                ),
                 (OpenAiSpeedMode::Normal, None, None),
                 (OpenAiSpeedMode::Fast, None, Some("fast")),
-                (OpenAiSpeedMode::Ultrafast, None, Some("ultrafast")),
-                // Only OpenAI client tiers have OpenAI semantics. Anthropic's
-                // standard_only must never leak into a Responses request.
-                if matches!(route, Route::AnthropicToResponses) {
-                    (
-                        OpenAiSpeedMode::Ultrafast,
-                        Some("standard_only"),
-                        Some("ultrafast"),
-                    )
-                } else {
-                    (OpenAiSpeedMode::Ultrafast, Some("auto"), Some("auto"))
-                },
-            ] {
-                let mut case = Case::openai(route);
-                case.channel = channel;
-                case.speed_mode = mode;
-                let mut body = request(route, false, None);
-                if let Some(tier) = client_tier {
-                    body["service_tier"] = json!(tier);
+                (
+                    OpenAiSpeedMode::Ultrafast,
+                    Some(if anthropic { standard } else { "auto" }),
+                    Some("ultrafast"),
+                ),
+            ];
+            for (mode, client_tier, upstream_tier) in cases {
+                for stream in [false, true] {
+                    let mut case = Case::openai(route);
+                    case.channel = channel;
+                    case.speed_mode = mode;
+                    let mut body = request(route, stream, None);
+                    if let Some(tier) = client_tier {
+                        body["service_tier"] = json!(tier);
+                    }
+                    let mut outgoing = expected(&case, &body, None);
+                    if let Some(tier) = upstream_tier {
+                        outgoing["service_tier"] = json!(tier);
+                    }
+                    run(case, body, outgoing)?;
                 }
-                let mut outgoing = expected(&case, &body, None);
-                if let Some(tier) = upstream_tier {
-                    outgoing["service_tier"] = json!(tier);
-                }
-                run(case, body, outgoing)?;
             }
         }
+    }
+    Ok(())
+}
+
+#[test]
+fn codex_routing_hint_agrees_with_provider_speed_override() -> anyhow::Result<()> {
+    for (channel, route, mode, expected_tier, expected_hint) in [
+        (
+            "codex",
+            Route::Responses,
+            OpenAiSpeedMode::Fast,
+            "fast",
+            "model=gpt-6.1-sol;tier=fast",
+        ),
+        (
+            "codex",
+            Route::Responses,
+            OpenAiSpeedMode::Ultrafast,
+            "ultrafast",
+            "model=gpt-6.1-sol;tier=ultrafast",
+        ),
+        (
+            "codex",
+            Route::Responses,
+            OpenAiSpeedMode::Normal,
+            "default",
+            "model=effort-floor-route;tier=default",
+        ),
+        (
+            "default",
+            Route::Responses,
+            OpenAiSpeedMode::Ultrafast,
+            "default",
+            "model=effort-floor-route;tier=default",
+        ),
+        (
+            "codex",
+            Route::Chat,
+            OpenAiSpeedMode::Ultrafast,
+            "default",
+            "model=effort-floor-route;tier=default",
+        ),
+    ] {
+        let mut case = Case::openai(route);
+        case.channel = channel;
+        case.speed_mode = mode;
+        case.routing_hint = Some(("model=effort-floor-route;tier=default", expected_hint));
+        let mut body = request(route, false, None);
+        body["service_tier"] = json!("default");
+        let mut outgoing = expected(&case, &body, None);
+        outgoing["service_tier"] = json!(expected_tier);
+        run(case, body, outgoing)?;
     }
     Ok(())
 }

@@ -1851,6 +1851,13 @@ async fn dispatch_pipeline_inner(
             continue;
         }
 
+        crate::provider::openai::codex::sync_speed_routing_hint(
+            &mut outbound.headers,
+            &provider,
+            egress,
+            &transport_model,
+        );
+
         // Channel-scoped routing identity. OpenCode Go rejects every request
         // that does not carry a per-conversation `x-opencode-session` (HTTP 400
         // MissingSessionID, see `opencode_go::session`). Applied at this single

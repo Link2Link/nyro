@@ -266,9 +266,12 @@ pub(crate) fn resolve_raw_wire_compat(
                 UpstreamFlavor::StandardResponses
             };
             let mut profile = ConversionProfile::anthropic_to_responses(client_stream, flavor);
-            if is_codex_consumer_channel(channel) {
-                profile.default_service_tier = provider.fast_mode.service_tier();
-            }
+            profile.service_tier_override =
+                crate::provider::common::pipeline::openai_service_tier_override(
+                    provider.fast_mode,
+                    Some(channel),
+                    egress.protocol,
+                );
             profile
         }
         (ANTHROPIC_MESSAGES_2023_06_01, GOOGLE_GEMINI_GENERATE_CONTENT_V1BETA) => {

@@ -86,7 +86,7 @@ Nyro ships as a **desktop app** (macOS / Windows / Linux) and a **standalone ser
 - **Streaming**: full SSE passthrough and cross-protocol format conversion
 - **Reasoning**: `<think>` tag parsing and conversion across protocol boundaries
 - **OpenAI effort floor**: for every model under the OpenAI provider (default API, Codex and Sub2API channels), explicit `none` reasoning effort is sent upstream as `low` in Chat Completions and Responses, including converted requests. Other effort tiers remain unchanged, and an absent effort is not filled in. This is a provider policy, not a rule for all OpenAI-compatible backends or Nyro relays.
-- **OpenAI Responses speed**: For Codex and Sub2API providers, choose Normal (leave the request unchanged), Fast (`service_tier: "fast"`), or Ultrafast (`service_tier: "ultrafast"`). An explicit OpenAI client tier takes precedence. Existing enabled Fast switches become Fast.
+- **OpenAI Responses speed**: For requests to Codex or Sub2API providers, Normal neither adds nor changes `service_tier`. Fast and Ultrafast force the upstream request’s `service_tier` to `fast` and `ultrafast`, respectively, even if the client already supplied a tier. Existing enabled Fast switches become Fast.
 - **Tool calls**: cross-protocol tool call and result format normalization
 - **Route types**: chat and embedding routes with type-aware handling
 
