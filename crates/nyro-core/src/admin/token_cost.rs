@@ -226,13 +226,14 @@ pub(super) fn resolve_pricing(
 /// Batch enrichment; a missing/bad catalogue cannot fail token statistics.
 /// Automatic pricing requires current provider metadata. An explicit manual
 /// rule can price retained usage even after the provider has been deleted.
-pub(super) fn enrich_token_costs(
-    rows: &mut [TokenUsageDay],
+pub(super) fn enrich_token_costs<'a>(
+    rows: impl IntoIterator<Item = &'a mut TokenUsageDay>,
     providers: &HashMap<String, Provider>,
     data_dir: &Path,
     overrides: &HashMap<(String, String), TokenPriceRates>,
 ) {
-    if rows.is_empty() {
+    let mut rows = rows.into_iter().peekable();
+    if rows.peek().is_none() {
         return;
     }
     let catalog = PricingCatalog::load(data_dir).ok();

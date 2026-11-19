@@ -1112,6 +1112,7 @@ mod tests {
             period_tier: None,
             used_percent: None,
             estimated_capacity: None,
+            quota_adjusted: None,
             all_time_coverage: None,
             period_coverage: None,
             estimated_capacity_partial: None,

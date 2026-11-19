@@ -23,6 +23,9 @@ pub struct ProviderApiPriceStats {
     /// prices stay partial; priced_request_count is the observed priced sample,
     /// not a projected request count. No estimate without usage and a price.
     pub estimated_capacity: Option<Vec<EquivalentCostTotal>>,
+    /// Codex included-quota valuation only; never replaces the base API prices.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quota_adjusted: Option<QuotaAdjustedPrices>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub all_time_coverage: Option<ProviderApiPriceCoverage>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -40,6 +43,15 @@ pub struct ProviderApiPriceStats {
     pub retained_buckets: Vec<RetainedQuotaBucketPriceStats>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub models: Vec<QuotaModelPriceStats>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct QuotaAdjustedPrices {
+    pub all_time: Vec<EquivalentCostTotal>,
+    pub period: Option<Vec<EquivalentCostTotal>>,
+    pub estimated_capacity: Option<Vec<EquivalentCostTotal>>,
+    pub all_time_partial: bool,
+    pub period_partial: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
@@ -148,19 +160,21 @@ fn estimate_capacity(
     period: &AccountUsageTotals,
     used_percent: f64,
 ) -> Option<Vec<EquivalentCostTotal>> {
+    (period.request_count > 0).then(|| project_costs(&period.equivalent_costs, used_percent))?
+}
+
+fn project_costs(
+    costs: &[EquivalentCostTotal],
+    used_percent: f64,
+) -> Option<Vec<EquivalentCostTotal>> {
     if !used_percent.is_finite()
         || used_percent <= 0.0
         || used_percent > 100.0
-        || period.request_count <= 0
-        || !period
-            .equivalent_costs
-            .iter()
-            .any(|cost| cost.priced_request_count > 0)
+        || !costs.iter().any(|cost| cost.priced_request_count > 0)
     {
         return None;
     }
-    period
-        .equivalent_costs
+    costs
         .iter()
         .map(|cost| {
             if !cost.total_cost.is_finite() || cost.total_cost < 0.0 {
@@ -224,6 +238,70 @@ fn coverage(rows: &[ProviderQuotaModelUsage]) -> ProviderApiPriceCoverage {
 
 fn totals_for(rows: &[ProviderQuotaModelUsage]) -> AccountUsageTotals {
     account_usage::summarize(&rows.iter().map(|row| row.usage.clone()).collect::<Vec<_>>())
+}
+
+fn codex_adjusted_costs(
+    rows: &[ProviderQuotaModelUsage],
+) -> Option<(Vec<EquivalentCostTotal>, bool)> {
+    let mut totals = std::collections::BTreeMap::<String, EquivalentCostTotal>::new();
+    let mut partial = false;
+    for row in rows {
+        for tier in &row.speed_tiers {
+            // Historical rows without tier evidence retain their base value; never
+            // apply the provider's current mode retroactively.
+            partial |= tier.speed_tier.is_none() || tier.usage.missing_usage_count > 0;
+            let Some(cost) = &tier.usage.cost else {
+                partial = true;
+                continue;
+            };
+            let weight = match tier.speed_tier {
+                Some(OpenAiSpeedMode::Fast) => 2.5,
+                Some(OpenAiSpeedMode::Ultrafast) => 8.0,
+                Some(OpenAiSpeedMode::Normal) | None => 1.0,
+            };
+            let total =
+                totals
+                    .entry(cost.currency.clone())
+                    .or_insert_with(|| EquivalentCostTotal {
+                        currency: cost.currency.clone(),
+                        total_cost: 0.0,
+                        priced_request_count: 0,
+                    });
+            total.total_cost += cost.total_cost * weight;
+            if !total.total_cost.is_finite() {
+                return None;
+            }
+            total.priced_request_count = total
+                .priced_request_count
+                .saturating_add(tier.usage.request_count);
+        }
+    }
+    Some((totals.into_values().collect(), partial))
+}
+
+fn codex_quota_adjusted_prices(
+    all: &[ProviderQuotaModelUsage],
+    current: &[ProviderQuotaModelUsage],
+    stats: &ProviderApiPriceStats,
+) -> Option<QuotaAdjustedPrices> {
+    let (all_time, all_time_partial) = codex_adjusted_costs(all)?;
+    let (period, period_partial) = if stats.period.is_some() {
+        let (costs, partial) = codex_adjusted_costs(current)?;
+        (Some(costs), Some(partial))
+    } else {
+        (None, None)
+    };
+    let estimated_capacity = period
+        .as_ref()
+        .zip(stats.used_percent)
+        .and_then(|(costs, used)| project_costs(costs, used));
+    Some(QuotaAdjustedPrices {
+        all_time,
+        all_time_partial,
+        period,
+        period_partial,
+        estimated_capacity,
+    })
 }
 
 fn model_prices(rows: &[ProviderQuotaModelUsage]) -> Vec<QuotaModelPriceStats> {
@@ -300,6 +378,7 @@ fn price_stats(
         period_tier: period.map(|period| period.tier.name.clone()),
         used_percent,
         estimated_capacity,
+        quota_adjusted: None,
         all_time_coverage: Some(coverage(all)),
         period_coverage,
         estimated_capacity_partial,
@@ -409,6 +488,7 @@ impl AdminService {
             identified.insert(key, selected);
         }
         let provider = self.get_provider(&usage.provider_id).await?;
+        let codex = usage.kind == "openai_codex";
         let mut scanned = self
             .gw
             .storage
@@ -418,33 +498,19 @@ impl AdminService {
                 now,
                 period.as_ref().map(|period| (period.start, period.end)),
                 &periods,
+                codex,
             )
             .await?;
-        let mut priced: Vec<_> = scanned
-            .all_time
-            .iter()
-            .chain(&scanned.period)
-            .map(|row| row.usage.clone())
-            .collect();
         let providers = HashMap::from([(usage.provider_id.clone(), provider)]);
         let overrides = token_price::parse_overrides(self.gw.storage.settings().list_all().await?)?;
-        token_cost::enrich_token_costs(
-            &mut priced,
-            &providers,
-            &self.gw.config.data_dir,
-            &overrides,
-        );
-        for (row, mut priced) in scanned
-            .all_time
-            .iter_mut()
-            .chain(&mut scanned.period)
-            .zip(priced)
-        {
-            if row.fully_missing_usage_request_count > 0 {
-                priced.cost = None;
-            }
-            row.usage = priced;
-        }
+        let rows = scanned.all_time.iter_mut().chain(&mut scanned.period);
+        let priced = rows
+            .filter(|row| row.fully_missing_usage_request_count == 0)
+            .flat_map(|row| {
+                std::iter::once(&mut row.usage)
+                    .chain(row.speed_tiers.iter_mut().map(|tier| &mut tier.usage))
+            });
+        token_cost::enrich_token_costs(priced, &providers, &self.gw.config.data_dir, &overrides);
         let unassigned: Vec<_> = scanned
             .all_time
             .iter()
@@ -470,6 +536,10 @@ impl AdminService {
             true,
             false,
         )?;
+        if codex {
+            stats.quota_adjusted =
+                codex_quota_adjusted_prices(&scanned.all_time, &scanned.period, &stats);
+        }
         if !usage.quota_buckets.is_empty() || has_bucket_history {
             stats.unassigned = Some(totals_for(&unassigned));
             stats.unassigned_coverage = Some(coverage(&unassigned));

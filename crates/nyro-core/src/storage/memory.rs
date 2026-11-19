@@ -380,6 +380,7 @@ impl LogStore for MemoryStorage {
             (String, String),
             crate::storage::provider_usage::ProviderQuotaPeriod,
         >,
+        _include_codex_speed_tiers: bool,
     ) -> anyhow::Result<super::provider_usage::ProviderQuotaUsage> {
         // YAML-only memory storage never retains request logs.
         Ok(Default::default())

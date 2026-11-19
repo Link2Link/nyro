@@ -1971,14 +1971,26 @@ impl LogStore for SqliteLogStore {
             (String, String),
             crate::storage::provider_usage::ProviderQuotaPeriod,
         >,
+        include_codex_speed_tiers: bool,
     ) -> anyhow::Result<crate::storage::provider_usage::ProviderQuotaUsage> {
         use crate::storage::provider_usage::{QuotaUsageAccumulator, QuotaUsageRow};
-        let mut rows = sqlx::query_as::<_, QuotaUsageRow>(
-            "SELECT created_at, performance_completed_at, route_decision, upstream_model, input_tokens, output_tokens, cache_read_tokens \
+        let metadata =
+            crate::storage::provider_usage::tier_metadata_column(include_codex_speed_tiers);
+        let sql = format!(
+            "SELECT created_at, performance_completed_at, route_decision, {metadata}, upstream_model, input_tokens, output_tokens, cache_read_tokens \
              FROM request_logs WHERE provider_id COLLATE BINARY = ? AND created_at <= ?",
-        ).bind(provider_id).bind(now).fetch(&self.pool);
-        let mut usage =
-            QuotaUsageAccumulator::new(provider_id, now, provider_period, bucket_periods);
+        );
+        let mut rows = sqlx::query_as::<_, QuotaUsageRow>(&sql)
+            .bind(provider_id)
+            .bind(now)
+            .fetch(&self.pool);
+        let mut usage = QuotaUsageAccumulator::new(
+            provider_id,
+            now,
+            provider_period,
+            bucket_periods,
+            include_codex_speed_tiers,
+        );
         while let Some(row) = rows.try_next().await? {
             usage.add(row);
         }
@@ -1995,7 +2007,7 @@ impl LogStore for SqliteLogStore {
     ) -> anyhow::Result<crate::storage::provider_usage::ProviderQuotaUsageDetail> {
         use crate::storage::provider_usage::{QuotaDetailAccumulator, QuotaDetailRow};
         let mut rows = sqlx::query_as::<_, QuotaDetailRow>(
-            "SELECT created_at, performance_completed_at, route_decision, upstream_model, input_tokens, output_tokens, cache_read_tokens, reasoning_tokens, \
+            "SELECT created_at, performance_completed_at, route_decision, NULL AS payload_metadata_json, upstream_model, input_tokens, output_tokens, cache_read_tokens, reasoning_tokens, \
              latency_total_ms, latency_upstream_ms, stream_first_chunk_ms, client_status_code, upstream_status_code, outcome_version, attempt_outcome \
              FROM request_logs WHERE provider_id COLLATE BINARY = ? AND created_at >= ? AND created_at <= ?",
         ).bind(provider_id).bind(start_at).bind(end_at).fetch(&self.pool);

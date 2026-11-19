@@ -2,7 +2,7 @@
 //! opt-in against disposable test databases; never run against an application DB.
 use std::collections::HashMap;
 
-use nyro_core::db::models::LogQuery;
+use nyro_core::db::models::{LogQuery, OpenAiSpeedMode};
 use nyro_core::storage::provider_usage::ProviderQuotaPeriod;
 use nyro_core::storage::sql::config::SqlBackendConfig;
 use nyro_core::storage::{MysqlStorage, PostgresStorage, SqliteStorage, Storage};
@@ -14,6 +14,20 @@ struct Row {
     decision: Option<String>,
     input: Option<i32>,
     output: Option<i32>,
+}
+
+fn tier_metadata(at: i64) -> Option<String> {
+    let (value, source) = match at {
+        110 => ("fast", "client_request"), // not upstream evidence
+        111 => ("fast", "upstream_request"),
+        200 => ("ultrafast", "upstream_response"),
+        201 => ("normal", "upstream_request"),
+        202 => ("unrecognized", "upstream_response"),
+        203 => ("fast", "upstream_response"),
+        206 => return Some("{malformed".to_owned()),
+        _ => return None,
+    };
+    Some(json!({"codex_service_tier": { "value": value, "source": source }}).to_string())
 }
 
 fn rows() -> Vec<Row> {
@@ -39,8 +53,14 @@ fn rows() -> Vec<Row> {
                 }})
                 .to_string(),
             ),
-            input: (!missing).then_some(100),
-            output: (!missing).then_some(10),
+            // The ordinary API-price group clamps cache only after aggregating:
+            // the first tier's cache (40) exceeds its input, but not the group's.
+            input: (!missing).then_some(match at {
+                111 => 10,
+                200 => 190,
+                _ => 100,
+            }),
+            output: (!missing && at != 200).then_some(10),
         });
     }
     for decision in [
@@ -88,7 +108,7 @@ async fn exercise(storage: &dyn Storage, provider: &str, rows: &[Row]) -> anyhow
     ]);
     let scan = storage
         .logs()
-        .provider_quota_token_usage_with_periods(provider, 300, None, &periods)
+        .provider_quota_token_usage_with_periods(provider, 300, None, &periods, true)
         .await?;
     assert_eq!(
         scan.all_time
@@ -118,6 +138,26 @@ async fn exercise(storage: &dyn Storage, provider: &str, rows: &[Row]) -> anyhow
             .sum::<i64>(),
         0
     );
+    let raw_scan = storage
+        .logs()
+        .provider_quota_token_usage_with_periods(provider, 300, None, &periods, false)
+        .await?;
+    assert!(
+        raw_scan
+            .all_time
+            .iter()
+            .chain(&raw_scan.period)
+            .all(|row| row.speed_tiers.is_empty())
+    );
+    assert_eq!(raw_scan.all_time.len(), scan.all_time.len());
+    for (raw, with_tiers) in raw_scan.all_time.iter().zip(&scan.all_time) {
+        assert_eq!(raw.scope_id, with_tiers.scope_id);
+        assert_eq!(raw.bucket_id, with_tiers.bucket_id);
+        assert_eq!(
+            serde_json::to_value(&raw.usage)?,
+            serde_json::to_value(&with_tiers.usage)?
+        );
+    }
     let flash = scan
         .period
         .iter()
@@ -134,6 +174,56 @@ async fn exercise(storage: &dyn Storage, provider: &str, rows: &[Row]) -> anyhow
         ),
         ("wire-flash", 2, 200, 80)
     );
+    let tier_usage = |row: &nyro_core::storage::provider_usage::ProviderQuotaModelUsage| {
+        row.speed_tiers
+            .iter()
+            .map(|tier| {
+                (
+                    tier.speed_tier,
+                    tier.usage.request_count,
+                    tier.usage.input_tokens,
+                    tier.usage.output_tokens,
+                    tier.usage.cache_read_tokens,
+                    tier.usage.missing_usage_count,
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let expected_tiers = vec![
+        (Some(OpenAiSpeedMode::Fast), 1, 10, 10, 40, 0),
+        (Some(OpenAiSpeedMode::Ultrafast), 1, 190, 0, 40, 1),
+    ];
+    assert_eq!(tier_usage(flash), expected_tiers);
+    assert_eq!(flash.usage.output_tokens, 10);
+    assert_eq!(flash.usage.missing_usage_count, 1);
+    assert_eq!(flash.fully_missing_usage_request_count, 0);
+    let all_flash = scan
+        .all_time
+        .iter()
+        .find(|row| row.scope_id == flash.scope_id && row.bucket_id == flash.bucket_id)
+        .unwrap();
+    assert_eq!(
+        tier_usage(all_flash),
+        vec![
+            (None, 1, 100, 10, 40, 0),
+            (Some(OpenAiSpeedMode::Normal), 1, 100, 10, 40, 0),
+            expected_tiers[0],
+            expected_tiers[1],
+        ]
+    );
+    for row in &scan.all_time {
+        if row.bucket_id.is_none()
+            || matches!(row.scope_id.as_deref(), Some("owner-b" | "retired-owner"))
+        {
+            // Malformed JSON, unrecognized tier, and absent metadata all fall back to unknown.
+            assert_eq!(row.speed_tiers.len(), 1);
+            assert_eq!(row.speed_tiers[0].speed_tier, None);
+            assert_eq!(
+                row.speed_tiers[0].usage.request_count,
+                row.usage.request_count
+            );
+        }
+    }
     let argon = scan
         .all_time
         .iter()
@@ -145,6 +235,10 @@ async fn exercise(storage: &dyn Storage, provider: &str, rows: &[Row]) -> anyhow
             argon.fully_missing_usage_request_count
         ),
         (1, 1)
+    );
+    assert_eq!(
+        tier_usage(argon),
+        vec![(Some(OpenAiSpeedMode::Fast), 1, 0, 0, 40, 1)]
     );
     assert!(
         scan.all_time
@@ -200,6 +294,7 @@ async fn exercise(storage: &dyn Storage, provider: &str, rows: &[Row]) -> anyhow
         .provider_quota_usage_detail(provider, 111, 200, "flash", Some("owner-a"))
         .await?;
     assert_eq!(ranged.detail.request_count, 2);
+    assert!(ranged.usage.iter().all(|row| row.speed_tiers.is_empty()));
     assert_eq!(ranged.detail.total_input_tokens, 200);
     assert_eq!(ranged.detail.total_cache_read_tokens, 80);
     assert_eq!(ranged.detail.models[0].upstream_model, "wire-flash");
@@ -218,7 +313,7 @@ async fn exercise(storage: &dyn Storage, provider: &str, rows: &[Row]) -> anyhow
     storage.logs().delete_by_id(&rows[1].id).await?;
     let scan = storage
         .logs()
-        .provider_quota_token_usage_with_periods(provider, 300, None, &periods)
+        .provider_quota_token_usage_with_periods(provider, 300, None, &periods, true)
         .await?;
     assert_eq!(
         scan.all_time
@@ -239,7 +334,7 @@ async fn exercise(storage: &dyn Storage, provider: &str, rows: &[Row]) -> anyhow
     }
     let cleared = storage
         .logs()
-        .provider_quota_token_usage_with_periods(provider, 300, None, &periods)
+        .provider_quota_token_usage_with_periods(provider, 300, None, &periods, true)
         .await?;
     assert!(cleared.all_time.is_empty() && cleared.period.is_empty());
     Ok(())
@@ -256,8 +351,8 @@ async fn sqlite_retained_quota_contract() -> anyhow::Result<()> {
     let provider = uuid::Uuid::new_v4().to_string();
     let rows = rows();
     for row in &rows {
-        sqlx::query("INSERT INTO request_logs (id, provider_id, upstream_model, created_at, route_decision, input_tokens, output_tokens, cache_read_tokens) VALUES (?, ?, 'backend-alias', ?, ?, ?, ?, 40)")
-            .bind(&row.id).bind(&provider).bind(row.at).bind(&row.decision).bind(row.input).bind(row.output).execute(storage.pool()).await?;
+        sqlx::query("INSERT INTO request_logs (id, provider_id, upstream_model, created_at, route_decision, input_tokens, output_tokens, cache_read_tokens, payload_metadata_json) VALUES (?, ?, 'backend-alias', ?, ?, ?, ?, 40, ?)")
+            .bind(&row.id).bind(&provider).bind(row.at).bind(&row.decision).bind(row.input).bind(row.output).bind(tier_metadata(row.at)).execute(storage.pool()).await?;
     }
     exercise(&storage, &provider, &rows).await
 }
@@ -292,8 +387,8 @@ async fn postgres_retained_quota_contract_optional() -> anyhow::Result<()> {
     let provider = uuid::Uuid::new_v4().to_string();
     let rows = rows();
     for row in &rows {
-        sqlx::query("INSERT INTO request_logs (id, provider_id, upstream_model, created_at, route_decision, input_tokens, output_tokens, cache_read_tokens) VALUES ($1, $2, 'backend-alias', $3, $4, $5, $6, 40)")
-            .bind(&row.id).bind(&provider).bind(row.at).bind(&row.decision).bind(row.input).bind(row.output).execute(storage.pool()).await?;
+        sqlx::query("INSERT INTO request_logs (id, provider_id, upstream_model, created_at, route_decision, input_tokens, output_tokens, cache_read_tokens, payload_metadata_json) VALUES ($1, $2, 'backend-alias', $3, $4, $5, $6, 40, $7)")
+            .bind(&row.id).bind(&provider).bind(row.at).bind(&row.decision).bind(row.input).bind(row.output).bind(tier_metadata(row.at)).execute(storage.pool()).await?;
     }
     exercise(&storage, &provider, &rows).await
 }
@@ -308,8 +403,8 @@ async fn mysql_retained_quota_contract_optional() -> anyhow::Result<()> {
     let provider = uuid::Uuid::new_v4().to_string();
     let rows = rows();
     for row in &rows {
-        sqlx::query("INSERT INTO request_logs (id, provider_id, upstream_model, created_at, route_decision, input_tokens, output_tokens, cache_read_tokens) VALUES (?, ?, 'backend-alias', ?, ?, ?, ?, 40)")
-            .bind(&row.id).bind(&provider).bind(row.at).bind(&row.decision).bind(row.input).bind(row.output).execute(storage.pool()).await?;
+        sqlx::query("INSERT INTO request_logs (id, provider_id, upstream_model, created_at, route_decision, input_tokens, output_tokens, cache_read_tokens, payload_metadata_json) VALUES (?, ?, 'backend-alias', ?, ?, ?, ?, 40, ?)")
+            .bind(&row.id).bind(&provider).bind(row.at).bind(&row.decision).bind(row.input).bind(row.output).bind(tier_metadata(row.at)).execute(storage.pool()).await?;
     }
     exercise(&storage, &provider, &rows).await
 }

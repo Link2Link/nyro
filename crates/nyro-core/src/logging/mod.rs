@@ -386,6 +386,7 @@ mod tests {
             "terminal": "native_tool_handoff", "upstream_turn_ended": false,
         });
         entry.diagnostic.payload_metadata = serde_json::json!({
+            "codex_service_tier": {"value":"fast", "source":"upstream_response"},
             "usage_provenance": provenance,
             "native_stream": terminal,
             "upstream_response_body": {
@@ -394,6 +395,11 @@ mod tests {
             },
         });
         clear_payload(&mut entry);
+
+        assert_eq!(
+            entry.diagnostic.payload_metadata["codex_service_tier"],
+            serde_json::json!({"value":"fast", "source":"upstream_response"})
+        );
 
         assert_eq!(
             entry.diagnostic.payload_metadata["usage_provenance"],

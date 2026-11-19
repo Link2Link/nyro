@@ -211,6 +211,9 @@ impl Attempt {
         s.terminal.response_model =
             (egress == crate::protocol::ids::ANTHROPIC_MESSAGES_2023_06_01).then(Default::default);
     }
+    pub(crate) fn observe_codex_service_tier(&self) {
+        self.0.lock().unwrap().terminal.codex_service_tier = Some(Default::default());
+    }
     /// Select native binary observation before sending any upstream bytes.
     /// Idempotent, and intentionally not inferred from response payloads/IR.
     pub fn configure_native_stream(&self) {
@@ -361,6 +364,9 @@ impl Attempt {
             return;
         }
         s.request_capture = Some(Arc::new(capture_bytes(bytes, true)));
+        if let Some(tier) = s.terminal.codex_service_tier.as_mut() {
+            tier.observe_request(bytes);
+        }
         s.metadata = if bytes.len() <= 1024 * 1024 {
             recover_historical_effort(&String::from_utf8_lossy(bytes), None)
         } else {
@@ -764,6 +770,20 @@ impl State {
                 metadata.remove("response_model");
             }
         }
+        let reliable_response = !self.terminal.invalid
+            && self
+                .upstream_status
+                .is_some_and(|s| (200..300).contains(&s));
+        if let Some(tier) = self
+            .terminal
+            .codex_service_tier
+            .as_ref()
+            .and_then(|t| t.metadata(reliable_response))
+        {
+            self.diagnostic.payload_metadata["codex_service_tier"] = tier;
+        } else if let Some(metadata) = self.diagnostic.payload_metadata.as_object_mut() {
+            metadata.remove("codex_service_tier");
+        }
         entry.performance = self.metadata.clone();
         entry.diagnostic = self.diagnostic.clone();
         self.sent = true;
@@ -977,6 +997,91 @@ mod tests {
     async fn frame(body: &mut Body) -> Option<Result<Frame<Bytes>, axum::Error>> {
         futures::future::poll_fn(|cx| Pin::new(&mut *body).poll_frame(cx)).await
     }
+    #[tokio::test]
+    async fn codex_service_tier_stays_on_its_attempt_and_observes_original_responses() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let sse = "data: {\"type\":\"response.created\",\"response\":{\"service_tier\":\"default\"}}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"service_tier\":\"priority\"}}\n\n";
+        let buffered = r#"{"object":"response","status":"completed","service_tier":"default"}"#;
+        // Same request id, independent route/credential attempts. Include
+        // buffered clients backed by a forced upstream SSE stream.
+        for (index, (observe, status, is_stream, request, response, expected)) in [
+            (
+                true,
+                429,
+                false,
+                r#"{"service_tier":"ultrafast"}"#,
+                buffered,
+                Some(("ultrafast", "upstream_request")),
+            ),
+            (
+                true,
+                200,
+                true,
+                "{}",
+                sse,
+                Some(("fast", "upstream_response")),
+            ),
+            (
+                true,
+                200,
+                false,
+                "{}",
+                sse,
+                Some(("fast", "upstream_response")),
+            ),
+            (
+                true,
+                200,
+                false,
+                r#"{"service_tier":"fast"}"#,
+                buffered,
+                Some(("normal", "upstream_response")),
+            ),
+            (false, 200, true, "{}", sse, None),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let a = Attempt::new(tx.clone(), CancellationToken::new(), Deadline::never());
+            a.correlate("same-client-request", index as i32 + 1);
+            if observe {
+                a.observe_codex_service_tier();
+            }
+            let g = a.producer();
+            a.request(request.as_bytes());
+            a.response(status, &reqwest::header::HeaderMap::new());
+            for chunk in response.as_bytes().chunks(7) {
+                a.chunk(chunk);
+            }
+            a.eof();
+            let mut log = entry();
+            log.is_stream = is_stream;
+            // The original request/response facts, not stale builder metadata
+            // or the rewritten client body, own the persisted value.
+            log.diagnostic.payload_metadata["codex_service_tier"] = json!({"value":"stale"});
+            a.log(log);
+            let body = a
+                .wrap(Response::new(Body::from("client-facing")))
+                .into_body();
+            if status == 429 {
+                drop(body); // abandoned attempt before retry
+            } else {
+                axum::body::to_bytes(body, usize::MAX).await.unwrap();
+            }
+            g.finish();
+            drop(g);
+            let diagnostic = rx.try_recv().unwrap().diagnostic;
+            assert_eq!(diagnostic.attempt_index, Some(index as i32 + 1));
+            assert_eq!(
+                diagnostic
+                    .payload_metadata
+                    .get("codex_service_tier")
+                    .cloned(),
+                expected.map(|(value, source)| json!({"value":value,"source":source}))
+            );
+        }
+    }
+
     #[tokio::test]
     async fn claude_response_model_diagnostic_keeps_requested_routed_and_served_independent() {
         use crate::protocol::ids::ANTHROPIC_MESSAGES_2023_06_01;

@@ -366,6 +366,7 @@ fn google_display_prices_split_mixed_exact_models_without_reassigning_raw_histor
         period_tier: Some("weekly_limit".into()),
         used_percent: Some(25.0),
         estimated_capacity: Some(totals(80.0, 2, 0).equivalent_costs),
+        quota_adjusted: None,
         all_time_coverage: Some(ProviderApiPriceCoverage {
             input_tokens: 200,
             priced_request_count: 2,
@@ -461,6 +462,7 @@ fn google_display_prices_keep_hydrogen_and_flash_in_their_shared_pool() {
         period_tier: Some("five_hour".into()),
         used_percent: Some(25.0),
         estimated_capacity: None,
+        quota_adjusted: None,
         all_time_coverage: Some(ProviderApiPriceCoverage::default()),
         period_coverage: None,
         estimated_capacity_partial: None,
@@ -711,6 +713,143 @@ async fn bucket_prices_partition_history_periods_exact_prices_currencies_and_mis
             .all_time
             .request_count
             == 0)
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn provider_api_price_codex_weights_retained_tiers_without_repricing_base()
+-> anyhow::Result<()> {
+    use crate::config::GatewayConfig;
+    use crate::storage::{SqliteStorage, Storage};
+    use std::sync::Arc;
+
+    let dir = tempfile::tempdir()?;
+    let config = GatewayConfig {
+        data_dir: dir.path().into(),
+        ..Default::default()
+    };
+    let storage = SqliteStorage::from_config(&config).await?;
+    let (gw, _) = Gateway::from_storage(config, Arc::new(storage.clone())).await?;
+    let admin = gw.admin();
+    let provider = storage.providers().create(serde_json::from_value(json!({
+        "name":"codex", "protocol":"openai-responses/responses/v1", "base_url":"https://example.invalid", "api_key":"test", "fast_mode":"ultrafast"
+    }))?).await?;
+    // Each attempt costs 2 USD: 0.5M uncached at $2, 0.5M cached at $1, 0.25M output at $2.
+    admin
+        .set_token_price(TokenPriceInput {
+            provider_id: provider.id.clone(),
+            model: "test-model".into(),
+            price: Some(TokenPriceRates {
+                currency: "USD".into(),
+                input_rate: 2.0,
+                cache_read_rate: Some(1.0),
+                output_rate: 2.0,
+            }),
+        })
+        .await?;
+    let now = ms("2026-11-05T08:00:00Z");
+    let mut usage = snapshot(
+        &provider.id,
+        "openai_codex",
+        now,
+        vec![tier("weekly_limit", Some("2026-11-06T00:00:00Z"), 25.0)],
+    );
+    for (id, mode, source, at) in [
+        ("normal", Some("normal"), "upstream_request", now),
+        ("fast", Some("fast"), "upstream_response", now),
+        ("ultrafast", Some("ultrafast"), "upstream_request", now),
+        ("older", None, "", now - 7 * 86_400_000),
+        ("future", Some("ultrafast"), "upstream_response", now + 1),
+    ] {
+        let metadata = mode.map(|value| {
+            json!({"codex_service_tier": {"value":value,"source":source}}).to_string()
+        });
+        sqlx::query("INSERT INTO request_logs (id, provider_id, upstream_model, created_at, payload_metadata_json, input_tokens, output_tokens, cache_read_tokens) VALUES (?, ?, 'test-model', ?, ?, 1000000, 250000, 500000)")
+            .bind(id).bind(&provider.id).bind(at).bind(metadata).execute(storage.pool()).await?;
+    }
+    admin.enrich_provider_api_price(&mut usage).await;
+    let stats = usage.api_price.as_ref().unwrap();
+    assert_eq!(stats.all_time.equivalent_costs[0].total_cost, 8.0);
+    assert_eq!(
+        stats.period.as_ref().unwrap().equivalent_costs[0].total_cost,
+        6.0
+    );
+    assert_eq!(
+        stats.estimated_capacity.as_ref().unwrap()[0].total_cost,
+        24.0
+    );
+    let adjusted = stats.quota_adjusted.as_ref().unwrap();
+    assert_eq!(adjusted.all_time[0].total_cost, 25.0);
+    assert!(
+        adjusted.all_time_partial,
+        "legacy attempt retains its base price"
+    );
+    let current = &adjusted.period.as_ref().unwrap()[0];
+    assert_eq!(
+        (current.total_cost, current.priced_request_count),
+        (23.0, 3)
+    );
+    assert_eq!(adjusted.period_partial, Some(false));
+    assert_eq!(
+        adjusted.estimated_capacity.as_ref().unwrap()[0].total_cost,
+        92.0
+    );
+
+    // A historical request within this period changes coverage, not its base price.
+    sqlx::query("UPDATE request_logs SET created_at = ? WHERE id = 'older'")
+        .bind(now)
+        .execute(storage.pool())
+        .await?;
+    usage.tiers[0].used_percent = 0.0;
+    admin.enrich_provider_api_price(&mut usage).await;
+    let adjusted = usage
+        .api_price
+        .as_ref()
+        .unwrap()
+        .quota_adjusted
+        .as_ref()
+        .unwrap();
+    assert_eq!(adjusted.period.as_ref().unwrap()[0].total_cost, 25.0);
+    assert_eq!(adjusted.period_partial, Some(true));
+    assert!(adjusted.estimated_capacity.is_none());
+
+    sqlx::query("INSERT INTO request_logs (id, provider_id, upstream_model, created_at, payload_metadata_json, input_tokens, output_tokens) VALUES ('no-price', ?, 'no-reference', ?, ?, 1, 1), ('no-usage', ?, 'test-model', ?, ?, NULL, NULL)")
+        .bind(&provider.id).bind(now).bind(r#"{"codex_service_tier":{"value":"fast","source":"upstream_request"}}"#)
+        .bind(&provider.id).bind(now).bind(r#"{"codex_service_tier":{"value":"ultrafast","source":"upstream_response"}}"#)
+        .execute(storage.pool()).await?;
+    usage.tiers[0].used_percent = 25.0;
+    admin.enrich_provider_api_price(&mut usage).await;
+    let adjusted = usage
+        .api_price
+        .as_ref()
+        .unwrap()
+        .quota_adjusted
+        .as_ref()
+        .unwrap();
+    let projection = &adjusted.estimated_capacity.as_ref().unwrap()[0];
+    assert_eq!(
+        (projection.total_cost, projection.priced_request_count),
+        (100.0, 4)
+    );
+    assert_eq!(adjusted.period_partial, Some(true));
+
+    usage.tiers.clear();
+    admin.enrich_provider_api_price(&mut usage).await;
+    let adjusted = usage
+        .api_price
+        .as_ref()
+        .unwrap()
+        .quota_adjusted
+        .as_ref()
+        .unwrap();
+    assert!(adjusted.period.is_none() && adjusted.estimated_capacity.is_none());
+    usage.kind = "grok_plan".into();
+    admin.enrich_provider_api_price(&mut usage).await;
+    assert!(
+        serde_json::to_value(usage.api_price.unwrap())?
+            .get("quota_adjusted")
+            .is_none()
     );
     Ok(())
 }

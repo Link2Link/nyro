@@ -523,6 +523,7 @@ mod tests {
                 total_cost: cost * 5.0,
                 priced_request_count: requests,
             }]),
+            quota_adjusted: None,
             all_time_coverage: Some(Default::default()),
             period_coverage: Some(Default::default()),
             estimated_capacity_partial: Some(false),

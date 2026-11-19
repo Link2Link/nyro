@@ -386,6 +386,14 @@ export interface ProviderApiPriceStats {
   used_percent: number | null;
   /** Projected full-cycle value, including usage so far, not remaining balance. */
   estimated_capacity: EquivalentCostTotal[] | null;
+  /** Codex retained-log prices weighted by service-tier quota usage, not billed API prices. */
+  quota_adjusted?: {
+    all_time: EquivalentCostTotal[];
+    period?: EquivalentCostTotal[] | null;
+    estimated_capacity?: EquivalentCostTotal[] | null;
+    all_time_partial: boolean;
+    period_partial?: boolean | null;
+  };
   /** Provider-only retained history without reliable primary-bucket attribution. */
   unassigned?: AccountUsageTotals | null;
   all_time_coverage?: ProviderApiPriceCoverage;
