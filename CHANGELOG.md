@@ -4,6 +4,20 @@ All notable changes to Nyro will be documented in this file.
 
 ---
 
+## v2.1.49
+
+> Released on 2026-11-19
+
+#### Features
+
+- **Sub2API usage**: Provider cards now show upstream attempts, recorded tokens, and API-equivalent prices for all retained history and the current UTC calendar month. These figures come from this gateway’s logs, not the upstream bill. No quota reset or capacity estimate is shown.
+
+#### Improvements
+
+- **Codex price display**: Cards now show only total API price, current-cycle API price, and estimated cycle API capacity. The separate quota-adjusted row has been removed from the UI; its admin API field and calculation are unchanged.
+
+---
+
 ## v2.1.48
 
 > Released on 2026-11-19
