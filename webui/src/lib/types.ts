@@ -1136,7 +1136,7 @@ export interface ProviderUsage {
   provider_id: string;
   /** Query backend kind, e.g. `glm_coding_plan`. */
   kind: string;
-  /** Site the quota was read from: `cn` | `global`. */
+  /** Quota site (`cn` or `global`), or `local` for retained-only usage. */
   site: string;
   /** Plan tier reported by the upstream (e.g. `max`), when present. */
   level?: string | null;
@@ -1154,7 +1154,7 @@ export interface ProviderUsage {
   scheduling?: ProviderScheduling;
   /** Native Devin/Kiro account readiness, including legacy single-account providers. */
   account_pool?: AccountPoolView | null;
-  /** MiniMax / GLM / Grok / OpenAI Codex / Google subscription retained-log prices; not upstream billing or routing quota. */
+  /** Retained-log prices for supported plans and Sub2API; not upstream billing or routing quota. */
   api_price?: ProviderApiPriceStats | null;
   /** Anonymous, display-only upstream account-pool totals; never routing input or account identities. */
   pool_quota?: NyroUpstreamPoolQuota | null;

@@ -1,10 +1,24 @@
 import { deepEqual, equal } from "node:assert/strict";
 import { test } from "node:test";
-import { isKiroOverage, nyroUpstreamPoolUsedPercent, nyroUpstreamPoolWindowNames, nyroUpstreamPoolWindows, nyroUpstreamView, providerApiPriceSupported, providerUsagePause, providerUsageSupported, providerUsageTitle, summarizeGroupUsage, tierLabel } from "./provider-usage";
+import { isKiroOverage, isSub2ApiUsageProvider, nyroUpstreamPoolUsedPercent, nyroUpstreamPoolWindowNames, nyroUpstreamPoolWindows, nyroUpstreamView, providerApiPriceSupported, providerUsagePause, providerUsageSupported, providerUsageTitle, summarizeGroupUsage, tierLabel } from "./provider-usage";
 import type { PoolQuotaWindow } from "./devin-account-pool";
 import type { NyroUpstreamProvider, ProviderUsage } from "./types";
 
 const kiro = { vendor: "kiro", preset_key: "kiro", channel: "ide", auth_mode: "oauth" as const, base_url: "https://q.us-east-1.amazonaws.com" };
+
+test("Sub2API local accounting requires the channel and never replaces a Nyro relay", () => {
+  const sub2api = { vendor: "openai", preset_key: "openai", channel: " Sub2API ",
+    auth_mode: "apikey" as const, base_url: "https://relay.example.test" };
+  equal(isSub2ApiUsageProvider(sub2api), true);
+  equal(isSub2ApiUsageProvider({ ...sub2api, channel: "default" }), false);
+  equal(providerUsageSupported(sub2api), false);
+  equal(providerUsageSupported({ ...sub2api, base_url: "https://chatgpt.com/backend-api/codex", auth_mode: "oauth" }), false);
+  const relay = { ...sub2api, preset_key: " Nyro-Gateway " };
+  equal(isSub2ApiUsageProvider(relay), false);
+  equal(providerUsageSupported(relay), true);
+  equal(providerUsageTitle("sub2api", false), "Sub2API Usage");
+  equal(providerUsageTitle("sub2api", true), "Sub2API 用量");
+});
 
 test("Kiro usage requires OAuth identity, not an Amazon Q URL alone", () => {
   equal(providerUsageSupported(kiro), true);

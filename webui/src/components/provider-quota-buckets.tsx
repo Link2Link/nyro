@@ -127,7 +127,7 @@ function BucketCard({ usage, bucket, now, stale, loading, locale, onDetails }: {
   const totals = bucket.api_price?.all_time;
   const queriedAt = Date.parse(bucket.queried_at);
   // A scoped adapter prevents parent money/balances or unrelated tiers leaking into the summary.
-  const priceUsage = { provider_id: usage.provider_id, kind: usage.kind, tiers: bucket.tiers, api_price: bucket.api_price };
+  const priceUsage = { provider_id: usage.provider_id, tiers: bucket.tiers, api_price: bucket.api_price };
   const family = usage.kind === "google_subscription" && isGoogleFamilyDisplayBucket(bucket);
   const bindingDetails = <>
     <p className="break-words font-mono text-[10px] text-slate-500" title={bucket.models.join(", ")}>

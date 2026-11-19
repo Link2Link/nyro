@@ -81,7 +81,7 @@ test("one provider contains independently priced Flash and Argon subcards with o
   equal((html.match(/role="progressbar"/g) ?? []).length, 4);
 });
 
-test("Codex bucket prices stay scoped and the provider footer never combines cycles", () => {
+test("Codex bucket and provider footer show only their scoped API prices", () => {
   const bucket = { ...argon, id: "codex", label: "Codex", models: ["gpt-codex"], api_price: { ...argon.api_price!,
     quota_adjusted: { all_time: totals(260).equivalent_costs, period: totals(24).equivalent_costs,
       estimated_capacity: totals(80).equivalent_costs, all_time_partial: false, period_partial: true } } };
@@ -89,8 +89,9 @@ test("Codex bucket prices stay scoped and the provider footer never combines cyc
     quota_adjusted: { all_time: totals(460).equivalent_costs, period: totals(999).equivalent_costs,
       estimated_capacity: totals(9999).equivalent_costs, all_time_partial: false } } };
   const html = render(value);
-  deepEqual(values(articles(html)[0]), ["$246.80", "$18.00", "≈ $60.00", "$260.00", "$24.00 (partial)", "≈ $80.00 (partial)"]);
-  deepEqual(values(html).slice(6), ["$439.00", "$460.00"]);
+  deepEqual(values(articles(html)[0]), ["$246.80", "$18.00", "≈ $60.00"]);
+  deepEqual(values(html), ["$246.80", "$18.00", "≈ $60.00", "$439.00"]);
+  doesNotMatch(html, /Quota-adjusted prices|data-quota-adjusted-price/);
 });
 
 test("provider availability summarizes backend decisions without a combined percentage", () => {
