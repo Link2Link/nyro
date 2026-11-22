@@ -2255,7 +2255,7 @@ async fn dispatch_pipeline_inner(
         let observe_codex_tier = egress == crate::protocol::ids::OPENAI_RESPONSES_V1
             && crate::admin::is_codex_usage_provider(&provider);
         let mut same_target_retried = false;
-        let mut saw_zero_payload_malformed = false;
+        let mut saw_retryable_zero_output = false;
         let (response, status, retry, health_outcome, defer_native_stream_health) = loop {
             if !runtime_scope_matches()
                 || !gw
@@ -2479,8 +2479,8 @@ async fn dispatch_pipeline_inner(
                 response
             };
 
-            saw_zero_payload_malformed |=
-                replay_candidate && stream_probe::is_zero_payload_malformed(&response);
+            saw_retryable_zero_output |=
+                replay_candidate && stream_probe::is_retryable_zero_output(&response);
             let compat_replay = compat_replay_candidate
                 && compat::should_retry_stream_start(&response, same_target_retried, ctx);
             let replay = pool_account.is_none()
@@ -2570,7 +2570,7 @@ async fn dispatch_pipeline_inner(
                     if compat_replay {
                         "Grok transport read failed before a complete event; replaying the stateless request once"
                     } else {
-                        "Gemini zero-output terminal (MALFORMED_FUNCTION_CALL / UNEXPECTED_TOOL_CALL / MALFORMED_RESPONSE); replaying the same target once"
+                        "Gemini ended with zero output before delivery; replaying the same target once"
                     },
                 );
                 tracing::info!(
@@ -2646,7 +2646,7 @@ async fn dispatch_pipeline_inner(
             continue;
         }
         if status < 400
-            || (saw_zero_payload_malformed
+            || (saw_retryable_zero_output
                 && (ctx.cancellation.is_cancelled() || ctx.deadline.remaining().is_zero()))
         {
             return response;

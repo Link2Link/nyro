@@ -167,6 +167,90 @@ pub struct GoogleStreamParser {
     first: bool,
     function_calls: CompleteFunctionCalls,
     state: GoogleStreamState,
+    // Enabled only by the Antigravity response path. Once any frame is not
+    // a known shell, its EOF must retain normal Gemini semantics.
+    empty_shells: Option<AntigravityShells>,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("Antigravity upstream closed with zero output and no finishReason")]
+pub(crate) struct AntigravityZeroOutput(pub(crate) Usage);
+
+#[derive(Default)]
+struct AntigravityShells {
+    saw_candidate: bool,
+    usage: Usage,
+}
+
+impl AntigravityShells {
+    // Positive evidence, not absence of decoded TextDelta: unknown Gemini
+    // fields, other candidates, media, grounding and prompt blocks may carry
+    // output which the downstream codec doesn't represent.
+    fn observe(&mut self, frame: &Value) -> bool {
+        let Some(obj) = frame.as_object() else {
+            return false;
+        };
+        if !obj.keys().all(|k| {
+            matches!(
+                k.as_str(),
+                "candidates"
+                    | "usageMetadata"
+                    | "usage_metadata"
+                    | "modelVersion"
+                    | "responseId"
+                    | "createTime"
+            )
+        }) {
+            return false;
+        }
+        let usage = obj
+            .get("usageMetadata")
+            .or_else(|| obj.get("usage_metadata"));
+        if usage.is_some_and(|v| !v.is_object()) {
+            return false;
+        }
+        let candidates = match obj.get("candidates") {
+            Some(Value::Array(c)) => c.as_slice(),
+            None if usage.is_some() => &[],
+            _ => return false,
+        };
+        for candidate in candidates {
+            let Some(c) = candidate.as_object() else {
+                return false;
+            };
+            if !c.keys().all(|k| matches!(k.as_str(), "content" | "index")) {
+                return false;
+            }
+            let Some(content) = candidate["content"].as_object() else {
+                return false;
+            };
+            if !content
+                .keys()
+                .all(|k| matches!(k.as_str(), "role" | "parts"))
+                || content.get("role").is_some_and(|v| v != "model")
+            {
+                return false;
+            }
+            let Some(parts) = content.get("parts").and_then(Value::as_array) else {
+                return false;
+            };
+            if !parts.iter().all(|part| {
+                part.as_object().is_some_and(|p| {
+                    p.keys()
+                        .all(|k| matches!(k.as_str(), "text" | "thoughtSignature" | "thought"))
+                        && (p.contains_key("text") || p.contains_key("thoughtSignature"))
+                        && p.get("text").is_none_or(|v| v.as_str() == Some(""))
+                        && p.get("thoughtSignature").is_none_or(Value::is_string)
+                        && p.get("thought").is_none_or(Value::is_boolean)
+                })
+            }) {
+                return false;
+            }
+        }
+        self.saw_candidate |= !candidates.is_empty();
+        self.usage.merge_partial(&extract_gemini_usage(frame));
+        true
+    }
 }
 
 // A finishReason ends generation, not necessarily the wire stream: usage may
@@ -202,6 +286,14 @@ impl GoogleStreamParser {
             first: true,
             function_calls: CompleteFunctionCalls::default(),
             state: GoogleStreamState::Reading,
+            empty_shells: None,
+        }
+    }
+
+    pub(crate) fn for_antigravity() -> Self {
+        Self {
+            empty_shells: Some(AntigravityShells::default()),
+            ..Self::new()
         }
     }
 
@@ -211,6 +303,11 @@ impl GoogleStreamParser {
         }
         let result = match serde_json::from_str::<Value>(data) {
             Ok(chunk) => {
+                if let Some(shells) = &mut self.empty_shells
+                    && !shells.observe(&chunk)
+                {
+                    self.empty_shells = None;
+                }
                 parse_gemini_chunk(&chunk, deltas, &mut self.first, &mut self.function_calls)
             }
             Err(error) => Err(AiError::new(
@@ -326,6 +423,11 @@ impl StreamResponseDecoder for GoogleStreamParser {
                 // Strict policy: complete tool arguments alone do not prove that
                 // generation finished. Empty/content/usage-only EOF is failure.
                 self.state = GoogleStreamState::Failed;
+                if let Some(shells) = self.empty_shells.take().filter(|s| s.saw_candidate) {
+                    // Includes usage from an unterminated final data line. This
+                    // typed signal is generated only at clean transport EOF.
+                    return Err(AntigravityZeroOutput(shells.usage).into());
+                }
                 deltas.push(AiStreamDelta::StreamError {
                     error: AiError::new(
                         AiErrorKind::UnexpectedEof,
@@ -1081,6 +1183,98 @@ mod tests {
     use crate::protocol::{
         ResponseDecoder, ResponseEncoder, StreamResponseDecoder, StreamResponseEncoder,
     };
+
+    #[test]
+    fn antigravity_shell_eof_is_channel_scoped_and_requires_candidate_evidence() {
+        let part = serde_json::json!({"text":"", "thought":true, "thoughtSignature":"sig"});
+        let shell = format!(
+            "data: {}\r\n\r\n",
+            serde_json::json!({"candidates":[{"content":{"role":"model","parts":[part]}}]})
+        );
+        let usage = "data: {\"usageMetadata\":{\"promptTokenCount\":17,\"totalTokenCount\":17}}";
+        let mut ag = GoogleStreamParser::for_antigravity();
+        ag.parse_chunk(&shell).unwrap();
+        ag.parse_chunk(usage).unwrap();
+        let eof = ag.finish().unwrap_err();
+        assert_eq!(
+            eof.downcast_ref::<AntigravityZeroOutput>()
+                .unwrap()
+                .0
+                .prompt_tokens,
+            17
+        );
+        assert!(ag.finish().unwrap().is_empty());
+
+        let mut plain = GoogleStreamParser::new();
+        plain.parse_chunk(&shell).unwrap();
+        assert!(matches!(
+            plain.finish().unwrap().as_slice(),
+            [AiStreamDelta::StreamError { .. }]
+        ));
+        for wire in ["", ": heartbeat\n\n", "data: [DONE]\n\n", usage] {
+            let mut ag = GoogleStreamParser::for_antigravity();
+            ag.parse_chunk(wire).unwrap();
+            assert!(
+                ag.finish()
+                    .unwrap()
+                    .iter()
+                    .any(|d| matches!(d, AiStreamDelta::StreamError { .. }))
+            );
+        }
+    }
+
+    #[test]
+    fn antigravity_shell_eof_never_replays_visible_unknown_blocked_or_invalid_frames() {
+        let shell = "data: {\"candidates\":[{\"content\":{\"parts\":[{\"thoughtSignature\":\"sig\",\"text\":\"\"}]}}]}\n\n";
+        let candidate =
+            |part: Value| serde_json::json!({"candidates":[{"content":{"parts":[part]}}]});
+        for frame in [
+            candidate(serde_json::json!({"text":"partial"})),
+            candidate(serde_json::json!({"text":"reasoning", "thought":true})),
+            candidate(serde_json::json!({"functionCall":{"name":"search", "args":{}}})),
+            candidate(serde_json::json!({"inlineData":{"mimeType":"image/png", "data":"test"}})),
+            candidate(serde_json::json!({"futurePart":{}})),
+            serde_json::json!({"candidates":[{"groundingMetadata":{"groundingChunks":[{}]}}]}),
+            serde_json::json!({"promptFeedback":{"blockReason":"SAFETY"}}),
+            serde_json::json!({"error":{"code":429,"status":"RESOURCE_EXHAUSTED"}}),
+        ] {
+            let mut ag = GoogleStreamParser::for_antigravity();
+            // Shells on either side of real output must not rearm the predicate.
+            let mut seen = ag
+                .parse_chunk(&format!("{shell}data: {frame}\n\n{shell}"))
+                .unwrap();
+            seen.extend(ag.finish().expect("not a classified zero-output EOF"));
+            assert!(
+                seen.iter()
+                    .any(|d| matches!(d, AiStreamDelta::StreamError { .. })),
+                "{frame}"
+            );
+        }
+        let mut ag = GoogleStreamParser::for_antigravity();
+        ag.parse_chunk(&format!("{shell}data: {{\"candidates\":"))
+            .unwrap();
+        assert!(
+            ag.finish()
+                .unwrap()
+                .iter()
+                .any(|d| matches!(d, AiStreamDelta::StreamError { .. }))
+        );
+
+        let mut ag = GoogleStreamParser::for_antigravity();
+        let healthy = serde_json::json!({"candidates":[{"content":{"parts":[{"text":"answer"}]},"finishReason":"STOP"}]});
+        let mut deltas = ag
+            .parse_chunk(&format!("{shell}data: {healthy}\n\n"))
+            .unwrap();
+        deltas.extend(ag.finish().unwrap());
+        assert!(
+            deltas
+                .iter()
+                .any(|d| matches!(d, AiStreamDelta::TextDelta(s) if s == "answer"))
+        );
+        assert!(
+            matches!(deltas.last(), Some(AiStreamDelta::Done { stop_reason }) if stop_reason == "stop")
+        );
+    }
 
     #[test]
     fn parse_and_format_response_preserves_inline_data_part() {

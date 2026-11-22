@@ -1328,7 +1328,7 @@ pub(super) async fn handle_non_stream_via_upstream_stream(
         return response;
     }
 
-    let mut stream_parser = egress.handler().make_stream_response_decoder();
+    let mut stream_parser = super::streaming::upstream_decoder(call_ctx);
     let mut stream_input = super::stream::StreamInput::default();
     let mut byte_stream = resp.bytes_stream();
     let mut accumulator = StreamResponseAccumulator::default();
@@ -1434,6 +1434,10 @@ pub(super) async fn handle_non_stream_via_upstream_stream(
     let ai_deltas = match super::streaming::validate_decoded_batch(decoded) {
         Ok(deltas) => deltas,
         Err(error) => {
+            if let Some(shell) = error.downcast_ref::<crate::protocol::codec::google::gemini::stream::AntigravityZeroOutput>() {
+                let failure = super::stream_probe::TransientStreamFailure::shell_eof(shell, chunks_count, attempt_raw, attempt_start);
+                return super::stream_probe::transient_failure_response(&log, &failure, upstream_req_hdrs_str, upstream_req_body_str, upstream_hdrs_str);
+            }
             if let Some(frame) = super::streaming::upstream_status_frame(&error) {
                 if let Some(attempt) = &call_ctx.performance {
                     attempt.record_failure("failed", "upstream_error", "upstream_response", frame);
@@ -1519,7 +1523,7 @@ pub(super) async fn handle_non_stream_via_upstream_stream(
             .is_none_or(str::is_empty);
     if transient {
         let failure = super::stream_probe::TransientStreamFailure {
-            stop_reason: ai_resp.stop_reason.clone().unwrap_or_default(),
+            stop_reason: ai_resp.stop_reason.clone(),
             finish_message: super::stream_probe::extract_finish_message(&attempt_raw),
             usage: ai_resp.usage.clone(),
             chunks_count,
@@ -1527,26 +1531,16 @@ pub(super) async fn handle_non_stream_via_upstream_stream(
             latency_ms: attempt_start.elapsed().as_millis() as i64,
         };
         tracing::warn!(
-            stop_reason = %failure.stop_reason,
+            stop_reason = ?failure.stop_reason,
             "transient zero-payload aggregation terminal; failing the attempt for dispatcher retry policy"
         );
-        if let Some(attempt) = &call_ctx.performance {
-            let error = anyhow::anyhow!(super::stream_probe::transient_failure_reason(&failure));
-            attempt.record_failure(
-                "failed",
-                "upstream_error",
-                "upstream_response",
-                error.as_ref(),
-            );
-        }
-        super::stream_probe::emit_transient_failure(
+        return super::stream_probe::transient_failure_response(
             &log,
             &failure,
             upstream_req_hdrs_str,
             upstream_req_body_str,
             upstream_hdrs_str,
         );
-        return super::stream_probe::transient_terminal_error_response(&failure);
     }
 
     // ── OnResponse phase (full body) ─────────────────────────────────────────

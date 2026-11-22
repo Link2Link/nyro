@@ -15,6 +15,20 @@ use crate::plugin::phase::{HostContext, Phase, PhaseHook, PhaseHookRegistry, Res
 use crate::protocol::ir::{AiRequest, AiStreamDelta};
 use crate::proxy::context::RequestContext;
 
+pub(super) fn upstream_decoder(
+    ctx: &super::CallCtx<'_>,
+) -> Box<dyn crate::protocol::StreamResponseDecoder> {
+    if ctx.egress == crate::protocol::ids::GOOGLE_GEMINI_GENERATE_CONTENT_V1BETA
+        && crate::provider::google::antigravity::is_google_antigravity(ctx.provider)
+    {
+        Box::new(
+            crate::protocol::codec::google::gemini::stream::GoogleStreamParser::for_antigravity(),
+        )
+    } else {
+        ctx.egress.handler().make_stream_response_decoder()
+    }
+}
+
 /// Reject failed decoder batches before any call in them reaches a client or
 /// custom-tool buffer. A decoder can return Ok(StreamError) rather than Err;
 /// formatters do not necessarily understand that IR event. Treat the whole batch
