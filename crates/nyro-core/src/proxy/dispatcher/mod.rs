@@ -151,14 +151,17 @@ pub(super) fn google_rate_limit(status: u16, body: &Value) -> Option<GoogleRateL
     let retry_after_secs = details
         .iter()
         .filter(|detail| detail_type(detail, "google.rpc.RetryInfo"))
-        .find_map(|detail| detail.get("retryDelay").and_then(Value::as_str))
+        .find_map(|detail| parse_google_duration_secs(detail.get("retryDelay")?.as_str()?))
         .or_else(|| {
             details
                 .iter()
                 .filter(|detail| detail_type(detail, "google.rpc.ErrorInfo"))
-                .find_map(|detail| detail.pointer("/metadata/quotaResetDelay")?.as_str())
-        })
-        .and_then(parse_google_duration_secs);
+                .find_map(|detail| {
+                    parse_google_duration_secs(
+                        detail.pointer("/metadata/quotaResetDelay")?.as_str()?,
+                    )
+                })
+        });
     // Any structured detail (ErrorInfo reason, QuotaFailure, RetryInfo) is
     // quota evidence; only a completely bare body is opaque.
     let has_detail = details.iter().any(|detail| detail.get("@type").is_some());
@@ -176,7 +179,7 @@ pub(super) fn google_rate_limit(status: u16, body: &Value) -> Option<GoogleRateL
 }
 
 /// Google protobuf durations (`"12s"`, `"0.5s"`, `"1h2m3.5s"`, `"250ms"`),
-/// rounded up to whole seconds (at least one).
+/// rounded up to whole seconds, preserving an explicit zero.
 fn parse_google_duration_secs(raw: &str) -> Option<u64> {
     let mut rest = raw.trim();
     let mut total = 0f64;
@@ -202,7 +205,27 @@ fn parse_google_duration_secs(raw: &str) -> Option<u64> {
         rest = &rest[unit_len..];
         matched = true;
     }
-    (matched && total.is_finite() && total >= 0.0).then(|| (total.ceil() as u64).max(1))
+    (matched && total.is_finite() && total >= 0.0).then(|| total.ceil() as u64)
+}
+
+fn antigravity_header_delay(provider: &Provider, status: u16, headers: &HeaderMap) -> Option<u64> {
+    if status != 429 || !crate::provider::google::antigravity::is_google_antigravity(provider) {
+        return None;
+    }
+    retry_after_seconds(
+        headers.get(reqwest::header::RETRY_AFTER)?.to_str().ok()?,
+        chrono::Utc::now(),
+    )
+}
+
+fn retry_after_seconds(value: &str, now: chrono::DateTime<chrono::Utc>) -> Option<u64> {
+    let value = value.trim();
+    if !value.is_empty() && value.bytes().all(|c| c.is_ascii_digit()) {
+        return value.parse().ok();
+    }
+    let deadline = crate::auth::refresh::http_date(value)?;
+    // HTTP dates have one-second precision. Round the remaining wait up.
+    Some(deadline.timestamp().saturating_sub(now.timestamp()).max(0) as u64)
 }
 
 /// Client-safe reasons why every route target was skipped by quota admission.
@@ -297,7 +320,12 @@ impl QuotaSkips {
 
 /// Tag an upstream error response with request-scoped refusal evidence:
 /// Anthropic entitlement/account refusals and Google 429 classification.
-pub(super) fn mark_upstream_error(response: &mut Response, status: u16, body: &Value) {
+pub(super) fn mark_upstream_error(
+    response: &mut Response,
+    status: u16,
+    body: &Value,
+    antigravity_header_delay: Option<u64>,
+) {
     if let Some(failure) =
         crate::provider::anthropic::claude_code::errors::account_refusal(status, body)
     {
@@ -308,11 +336,55 @@ pub(super) fn mark_upstream_error(response: &mut Response, status: u16, body: &V
         response.extensions_mut().insert(LocalHealthNeutral);
         response.extensions_mut().insert(EntitlementRefusal);
     }
-    if let Some(evidence) = google_rate_limit(status, body) {
+    let body_limit = google_rate_limit(status, body);
+    let evidence = match (body_limit, antigravity_header_delay) {
+        (
+            Some(GoogleRateLimit::Structured {
+                retry_after_secs: Some(seconds),
+            }),
+            Some(_),
+        ) => Some(seconds),
+        (_, fallback) => fallback,
+    }
+    .map(|seconds| {
+        // Only forward a normalized waiting time, never arbitrary upstream headers.
+        response
+            .headers_mut()
+            .insert(reqwest::header::RETRY_AFTER, seconds.into());
+        GoogleRateLimit::Structured {
+            retry_after_secs: Some(seconds),
+        }
+    })
+    .or(body_limit);
+    if let Some(evidence) = evidence {
         if evidence == GoogleRateLimit::Opaque {
             response.extensions_mut().insert(LocalHealthNeutral);
         }
         response.extensions_mut().insert(evidence);
+    }
+}
+
+fn record_antigravity_throttle(
+    gw: &Gateway,
+    provider_id: &str,
+    model: &str,
+    fence: &crate::router::quota::BucketRefreshFence,
+    evidence: Option<GoogleRateLimit>,
+) {
+    match evidence {
+        Some(GoogleRateLimit::Structured {
+            retry_after_secs: Some(seconds),
+        }) => {
+            gw.quota_registry
+                .record_upstream_wait_fenced(provider_id, model, seconds, fence);
+        }
+        Some(GoogleRateLimit::Structured {
+            retry_after_secs: None,
+        }) if !gw.quota_registry.bucket_snapshot(provider_id).is_empty() => {
+            gw.quota_registry
+                .record_model_rejection_fenced(provider_id, model, None, fence);
+        }
+        _ => {} // No evidence of a model-wide throttle.
     }
 }
 
@@ -1793,6 +1865,14 @@ async fn dispatch_pipeline_inner(
             }
         };
 
+        crate::provider::google::antigravity::apply_ingress_session(
+            &provider,
+            provider_ctx.credential,
+            ingress,
+            &envelope,
+            &mut outbound.body,
+        );
+
         // Channel-scoped extensions own URL quirks such as ChatGPT Codex's
         // `/backend-api/codex/responses` path. The full vendor builds the
         // request body, then the resolved extension canonicalizes its URL.
@@ -2341,6 +2421,8 @@ async fn dispatch_pipeline_inner(
                         ctx,
                         &request_for_target,
                         raw_chunk_hook,
+                        crate::provider::google::antigravity::is_google_antigravity(&provider)
+                            .then_some((quota_wire_model.as_str(), quota_owner_fence)),
                     )
                     .await
                 } else if upstream_forces_stream {
@@ -2431,7 +2513,17 @@ async fn dispatch_pipeline_inner(
                     header_retry_after.is_none() && google == Some(GoogleRateLimit::Opaque);
                 // Otherwise it is a narrow model/owner throttle, not proof of
                 // exhausted allowance for all models on this provider.
-                if !request_scoped && !gw.quota_registry.bucket_snapshot(&provider.id).is_empty() {
+                if crate::provider::google::antigravity::is_google_antigravity(&provider) {
+                    record_antigravity_throttle(
+                        &gw,
+                        &provider.id,
+                        &quota_wire_model,
+                        &quota_owner_fence,
+                        google,
+                    );
+                } else if !request_scoped
+                    && !gw.quota_registry.bucket_snapshot(&provider.id).is_empty()
+                {
                     gw.quota_registry.record_model_rejection_fenced(
                         &provider.id,
                         &quota_wire_model,
@@ -2512,6 +2604,13 @@ async fn dispatch_pipeline_inner(
             HealthOutcome::Failure => health_permit.failure(),
             HealthOutcome::Neutral => health_permit.neutral(),
             HealthOutcome::Deferred => drop(health_permit),
+        }
+        if response
+            .extensions()
+            .get::<streaming::InBandUpstreamFailure>()
+            .is_some()
+        {
+            return response;
         }
         if let Some(account) = &pool_account {
             if status < 400 {
@@ -3403,17 +3502,32 @@ pub(crate) fn log_intake_rejection(gw: &Gateway, evidence: IntakeRejectionLog<'_
 
 /// Public stream failures never contain upstream URLs, bodies or source chains.
 fn stream_error_event(ingress: ProtocolId, request_id: &str, kind: &str) -> String {
+    stream_error_event_with_status(ingress, request_id, kind, 502)
+}
+
+fn stream_error_event_with_status(
+    ingress: ProtocolId,
+    request_id: &str,
+    kind: &str,
+    code: u16,
+) -> String {
     use crate::protocol::ids::*;
     let message = if kind == "timeout" {
         "The upstream response timed out."
     } else {
         "The upstream response could not be completed."
     };
-    let error = serde_json::json!({"type": kind, "failure_kind": kind, "code": 502, "message": message, "request_id": request_id});
+    let error = serde_json::json!({"type": kind, "failure_kind": kind, "code": code, "message": message, "request_id": request_id});
     if ingress == GOOGLE_GEMINI_GENERATE_CONTENT_V1BETA {
+        let status = match code {
+            401 => "UNAUTHENTICATED",
+            403 => "PERMISSION_DENIED",
+            429 => "RESOURCE_EXHAUSTED",
+            _ => "UNAVAILABLE",
+        };
         format!(
             "data: {}\n\n",
-            serde_json::json!({"error":{"code":502,"status":"UNAVAILABLE","message":format!("{message} Request ID: {request_id}"),"details":[{"failure_kind":kind,"request_id":request_id}]}})
+            serde_json::json!({"error":{"code":code,"status":status,"message":format!("{message} Request ID: {request_id}"),"details":[{"failure_kind":kind,"request_id":request_id}]}})
         )
     } else if ingress == ANTHROPIC_MESSAGES_2023_06_01 {
         format!(
@@ -3670,6 +3784,23 @@ mod tests {
     }
 
     #[test]
+    fn antigravity_retry_after_dates_round_up_and_invalid_hints_are_absent() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-11-22T04:00:00.750Z")
+            .unwrap()
+            .to_utc();
+        for (value, expected) in [
+            ("Sun, 22 Nov 2026 04:00:02 GMT", Some(2)),
+            ("Sun, 22 Nov 2026 03:59:59 GMT", Some(0)),
+            ("0", Some(0)),
+            (" 13 ", Some(13)),
+            ("-1", None),
+            ("invalid date", None),
+        ] {
+            assert_eq!(super::retry_after_seconds(value, now), expected, "{value}");
+        }
+    }
+
+    #[test]
     fn google_duration_parser_rounds_up_and_rejects_garbage() {
         use super::parse_google_duration_secs as parse;
         assert_eq!(parse("12s"), Some(12));
@@ -3689,7 +3820,7 @@ mod tests {
         let opaque = json!({"error": {"code": 429, "status": "RESOURCE_EXHAUSTED",
             "message": "Resource has been exhausted (e.g. check quota)."}});
         let mut response = StatusCode::TOO_MANY_REQUESTS.into_response();
-        mark_upstream_error(&mut response, 429, &opaque);
+        mark_upstream_error(&mut response, 429, &opaque, None);
         assert!(response.extensions().get::<LocalHealthNeutral>().is_some());
         assert_eq!(
             response.extensions().get::<GoogleRateLimit>(),
@@ -3698,7 +3829,7 @@ mod tests {
         let structured = json!({"error": {"status": "RESOURCE_EXHAUSTED", "details": [
             {"@type": "type.googleapis.com/google.rpc.RetryInfo", "retryDelay": "5s"}]}});
         let mut response = StatusCode::TOO_MANY_REQUESTS.into_response();
-        mark_upstream_error(&mut response, 429, &structured);
+        mark_upstream_error(&mut response, 429, &structured, None);
         assert!(response.extensions().get::<LocalHealthNeutral>().is_none());
     }
 

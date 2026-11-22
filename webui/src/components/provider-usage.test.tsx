@@ -570,32 +570,39 @@ test("cached usage retains visible refresh failures, stale state and quota pause
 
 test("Google family snapshots replace parent quota while footer and group share conservative family availability", () => {
   for (const currentProvider of googleProviders) {
+    const antigravity = currentProvider.channel === "antigravity";
     const original = googleUsage(currentProvider);
     const raw: QuotaBucket = { id: "raw-flash", scope_id: "scope", label: "Original Flash", models: ["gemini-3.8-flash", "gemini-3.8-flash-high"],
       binding: { status: "window_constraint", source: "configured", revision: 1 }, tiers: original.tiers, constraint_ids: [],
       source: "enforced_summary", queried_at: original.queried_at, stale: false,
       scheduling: { status: "eligible", blocking_tiers: [] }, api_price: apiPrice };
-    const flash: QuotaBucket = { ...raw, id: "display-family-flash", label: "gemini-3.8-flash", constraint_ids: [raw.id],
+    const flash: QuotaBucket = { ...raw, id: "display-family-flash", label: antigravity ? "Gemini Models" : "gemini-3.8-flash", constraint_ids: [raw.id],
       binding: { ...raw.binding, status: "resolved", source: "google_family_display_v1" }, source: "google_family_display_v1" };
-    const argon: QuotaBucket = { ...flash, id: "display-family-argon", label: "gemini-4-argon", models: ["gemini-4-argon"], constraint_ids: [] };
-    const html = render({ ...original, quota_buckets: [flash, argon, raw] }, undefined, currentProvider);
-    equal((html.match(/data-quota-bucket=/g) ?? []).length, 2);
-    equal((html.match(/role="progressbar"/g) ?? []).length, 4);
-    equal((html.match(/data-api-price="all_time"/g) ?? []).length, 3);
-    equal((html.match(/data-api-price="period"/g) ?? []).length, 2);
-    match(html, /data-quota-availability="available"[^]*Available · 2\/2/);
+    const argon: QuotaBucket = { ...flash, id: "display-family-argon", label: antigravity ? "Gemini 4 Argon" : "gemini-4-argon",
+      models: ["gemini-4-argon"], tiers: antigravity ? original.tiers.filter(tier => tier.name === "weekly_limit") : original.tiers, constraint_ids: [] };
+    const thirdParty: QuotaBucket = { ...flash, id: "display-3p", label: "Claude and GPT", models: ["claude-sonnet-4-6", "gpt-oss-120b-medium"], constraint_ids: [] };
+    const cards = antigravity ? [flash, thirdParty, argon] : [flash, argon];
+    const full = [...cards, raw];
+    const html = render({ ...original, quota_buckets: full }, undefined, currentProvider);
+    equal((html.match(/data-quota-bucket=/g) ?? []).length, cards.length);
+    equal((html.match(/role="progressbar"/g) ?? []).length, antigravity ? 5 : 4);
+    equal((html.match(/data-api-price="all_time"/g) ?? []).length, cards.length + 1);
+    equal((html.match(/data-api-price="period"/g) ?? []).length, cards.length);
+    match(html, new RegExp(`data-quota-availability="available"[^]*Available · ${cards.length}/${cards.length}`));
+    for (const card of cards) match(html, new RegExp(`>${card.label}</h3>`));
     match(html, /Model bindings|Source bucket details/);
     doesNotMatch(html, /data-quota-detail="[^">]*display-family/);
     const single = render({ ...original, quota_buckets: [flash, raw] }, undefined, currentProvider);
-    match(single, /data-quota-availability="partial"[^]*Partially available · 1\/2/);
+    match(single, new RegExp(`data-quota-availability="partial"[^]*Partially available · 1/${cards.length}`));
     const client = new QueryClient();
     const originalNow = Date.now;
     Date.now = () => now;
     try {
-      for (const quota_buckets of [[flash, raw], [raw], [], [flash, { ...argon, scope_id: "other-owner" }, raw]]) {
+      for (const quota_buckets of [full, [flash, raw], [raw], [], [flash, { ...argon, scope_id: "other-owner" }, raw]]) {
         client.setQueryData(["provider-usage", currentProvider.id], { ...original, quota_buckets });
         const group = renderToStaticMarkup(<QueryClientProvider client={client}><LocaleProvider><GroupUsageSummary providers={[currentProvider]} /></LocaleProvider></QueryClientProvider>);
-        match(group, quota_buckets[0] === flash && quota_buckets.length === 2 ? /data-quota-availability="partial"/ : /data-quota-availability="unknown"/);
+        match(group, quota_buckets === full ? new RegExp(`Available · ${cards.length}/${cards.length}`)
+          : quota_buckets[0] === flash && quota_buckets.length === 2 ? /data-quota-availability="partial"/ : /data-quota-availability="unknown"/);
         doesNotMatch(group, /Peak used|progressbar|%/);
       }
     } finally { Date.now = originalNow; client.clear(); }
@@ -626,7 +633,7 @@ test("Google footer distinguishes fresh observed usage from confirmed availabili
     quota_buckets: [catalogFamily("family-flash", "gemini-3.8-flash", 0), catalogFamily("family-argon", "gemini-4-argon", 3.8)],
   };
   const fresh = render(usage, undefined, currentProvider);
-  match(fresh, /data-quota-availability="observed"[^]*Usage updated · 2\/2/);
+  match(fresh, /data-quota-availability="observed"[^]*Usage updated · 2\/3/);
   equal((fresh.match(/data-bucket-status="observed"/g) ?? []).length, 2);
   equal((fresh.match(/Quota binding pending confirmation/g) ?? []).length, 2);
   match(fresh, /Model catalog usage/);
@@ -663,7 +670,7 @@ test("Google card and folded group use the real-provider usage cache, never the 
       <ProviderUsageFooter provider={currentProvider} /><GroupUsageSummary providers={[currentProvider]} />
     </LocaleProvider></QueryClientProvider>);
     equal((html.match(/data-quota-availability="observed"/g) ?? []).length, 2);
-    equal((html.match(/Usage updated · 2\/2/g) ?? []).length, 2);
+    equal((html.match(/Usage updated · 2\/3/g) ?? []).length, 2);
     doesNotMatch(html, /Account unavailable|No quota observations/);
     equal(client.getQueryCache().findAll({ queryKey: ["provider-usage"] }).length, 2);
   } finally { Date.now = originalNow; client.clear(); }

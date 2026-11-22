@@ -150,7 +150,7 @@ async fn downstream_cancellation_does_not_flush_an_incomplete_utf8_tail() {
         let response = handle_stream(
             ProxyClient::new(reqwest::Client::builder().no_proxy().build().unwrap()).with_performance(performance.clone()),
             &url,ReqwestHeaderMap::new(),json!({"stream":true}),&call_ctx,&extras,false,
-            ToolRoutePlan::default(),&ctx,&AiRequest::new("fixture",vec![]),Some(hook),
+            ToolRoutePlan::default(),&ctx,&AiRequest::new("fixture",vec![]),Some(hook),None,
         ).await;
         let mut body = performance.wrap(response).into_body().into_data_stream();
         dispatch_producer.finish();

@@ -6,6 +6,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use super::{QuotaBucket, QuotaBucketBinding, opaque_quota_id};
 use crate::admin::{AccountUsageTotals, ProviderApiPriceStats, ProviderUsageTier};
+use crate::auth::drivers::GoogleSubscriptionChannel;
 use crate::router::quota::{ProviderScheduling, ProviderSchedulingStatus};
 
 pub const GOOGLE_FAMILY_DISPLAY_SOURCE: &str = "google_family_display_v1";
@@ -14,57 +15,132 @@ pub const GOOGLE_FAMILY_DISPLAY_SOURCE: &str = "google_family_display_v1";
 /// `gemini-weekly`). It is a historical identity component of the opaque
 /// primary/display IDs that request attribution and published usage entries
 /// reference, so it keeps its original Flash value — never rename it. The card
-/// label is chosen separately (see [`google_display_label`]).
+/// label is chosen separately.
 pub const GOOGLE_GEMINI_MODELS_POOL: &str = "gemini-3.8-flash";
 
-/// Usage-only family whitelist: (display family, enforced quota pool), in
-/// headline priority. Verified 2026-11-15 on a Google AI Pro account: Gemini 4
-/// Hydrogen calls drew down `gemini-5h` / `gemini-weekly` exactly like Gemini
-/// 3.8 Flash, while Gemini 4 Argon consumed only its dedicated weekly bucket.
-const GOOGLE_DISPLAY_FAMILIES: &[(&str, &str)] = &[
-    ("gemini-4-hydrogen", GOOGLE_GEMINI_MODELS_POOL),
-    ("gemini-3.8-flash", GOOGLE_GEMINI_MODELS_POOL),
-    ("gemini-4-argon", "gemini-4-argon"),
-];
+pub(crate) fn google_quota_channel(channel: Option<&str>) -> GoogleSubscriptionChannel {
+    if channel.is_some_and(|id| id.trim().eq_ignore_ascii_case("antigravity")) {
+        GoogleSubscriptionChannel::Antigravity
+    } else {
+        // Do not assume the Antigravity pool contract for Code Assist or legacy rows.
+        GoogleSubscriptionChannel::GeminiCli
+    }
+}
+
+fn matches_tier_family(id: &str, family: &str) -> bool {
+    matches!(
+        id.strip_prefix(family),
+        Some("" | "-extra-low" | "-low" | "-medium" | "-high" | "-xhigh" | "-tiered")
+    )
+}
 
 /// This usage-only whitelist does not rewrite callable models or pricing IDs.
 pub fn google_display_family(model: &str) -> Option<&'static str> {
-    GOOGLE_DISPLAY_FAMILIES
-        .iter()
-        .map(|(family, _)| *family)
-        .find(|base| {
-            model.strip_prefix(*base).is_some_and(|suffix| {
-                matches!(
-                    suffix,
-                    "" | "-extra-low" | "-low" | "-medium" | "-high" | "-xhigh" | "-tiered"
+    [
+        "gemini-4-hydrogen",
+        GOOGLE_GEMINI_MODELS_POOL,
+        "gemini-4-argon",
+    ]
+    .into_iter()
+    .find(|family| matches_tier_family(model, family))
+}
+
+/// Declaration order is the order of the Antigravity usage cards.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum GoogleQuotaPool {
+    GeminiModels,
+    ClaudeAndGpt,
+    Argon,
+}
+
+impl GoogleQuotaPool {
+    pub(crate) fn key(self) -> &'static str {
+        match self {
+            Self::GeminiModels => GOOGLE_GEMINI_MODELS_POOL,
+            Self::ClaudeAndGpt => "claude-and-gpt",
+            Self::Argon => "gemini-4-argon",
+        }
+    }
+
+    // A reported pool window with no discovered members is still a reading,
+    // not a model binding. Preserve its provenance without replacing its raw ID/label.
+    pub(crate) fn unbound_window_source(self) -> &'static str {
+        match self {
+            Self::GeminiModels => "antigravity_gemini_window_v1",
+            Self::ClaudeAndGpt => "antigravity_3p_window_v1",
+            Self::Argon => "antigravity_argon_window_v1",
+        }
+    }
+
+    pub(crate) fn from_unbound_window(bucket: &QuotaBucket) -> Option<Self> {
+        if !bucket.models.is_empty()
+            || bucket.source != "enforced_summary"
+            || !matches!(
+                bucket.binding.status.as_str(),
+                "unresolved" | "window_constraint"
+            )
+        {
+            return None;
+        }
+        [Self::GeminiModels, Self::ClaudeAndGpt, Self::Argon]
+            .into_iter()
+            .find(|pool| pool.unbound_window_source() == bucket.binding.source)
+    }
+
+    fn label(self, channel: GoogleSubscriptionChannel, models: &[String]) -> &'static str {
+        if channel == GoogleSubscriptionChannel::GeminiCli {
+            if self == Self::GeminiModels
+                && models
+                    .iter()
+                    .any(|id| matches_tier_family(id, "gemini-4-hydrogen"))
+            {
+                return "gemini-4-hydrogen";
+            }
+            return self.key();
+        }
+        match self {
+            Self::GeminiModels => "Gemini Models",
+            Self::ClaudeAndGpt => "Claude and GPT",
+            Self::Argon => "Gemini 4 Argon",
+        }
+    }
+
+    pub(crate) fn for_model(channel: GoogleSubscriptionChannel, id: &str) -> Option<Self> {
+        if channel == GoogleSubscriptionChannel::Antigravity {
+            if matches_tier_family(id, "gemini-4-neon")
+                || matches!(
+                    id,
+                    "gemini-4-hydrogen-sonar"
+                        | "gemini-4-hydrogen-tiered-high"
+                        | "gemini-4-hydrogen-tiered-xhigh"
                 )
-            })
+            {
+                return Some(Self::GeminiModels);
+            }
+            if id
+                .strip_prefix("claude-")
+                .or_else(|| id.strip_prefix("gpt-"))
+                .is_some_and(|name| !name.is_empty())
+                && !id.ends_with("-disabled")
+                && !id.contains(char::is_whitespace)
+            {
+                return Some(Self::ClaudeAndGpt);
+            }
+        }
+        google_display_family(id).map(|base| {
+            if base == "gemini-4-argon" {
+                Self::Argon
+            } else {
+                Self::GeminiModels
+            }
         })
+    }
 }
 
-/// Enforced quota pool of a whitelisted model: Hydrogen and Flash share the
-/// Gemini Models allowance, Argon has its own.
+/// Original channel-neutral mapping, retained for consumers without a channel.
 pub fn google_display_pool(model: &str) -> Option<&'static str> {
-    let family = google_display_family(model)?;
-    GOOGLE_DISPLAY_FAMILIES
-        .iter()
-        .find(|(candidate, _)| *candidate == family)
-        .map(|(_, pool)| *pool)
-}
-
-/// Card label for one pool: the highest-priority family the account actually
-/// serves (Hydrogen over Flash). Accounts without Hydrogen keep the Flash label.
-pub fn google_display_label<'a>(pool: &'a str, models: &[String]) -> &'a str {
-    GOOGLE_DISPLAY_FAMILIES
-        .iter()
-        .filter(|(_, candidate)| *candidate == pool)
-        .map(|(family, _)| *family)
-        .find(|family| {
-            models
-                .iter()
-                .any(|model| google_display_family(model) == Some(*family))
-        })
-        .unwrap_or(pool)
+    GoogleQuotaPool::for_model(GoogleSubscriptionChannel::GeminiCli, model)
+        .map(GoogleQuotaPool::key)
 }
 
 pub fn is_google_display_bucket(bucket: &QuotaBucket) -> bool {
@@ -72,20 +148,29 @@ pub fn is_google_display_bucket(bucket: &QuotaBucket) -> bool {
         && bucket.binding.source == GOOGLE_FAMILY_DISPLAY_SOURCE
 }
 
-/// Two known pools per owner at most; all original resources remain sidecars.
-/// Unknown/generic labels never establish membership or a healthy family. Already
-/// projected responses are returned unchanged, not recursively grouped.
+/// Channel-less snapshots use the legacy family layout. A structured response
+/// already projected for its channel is never recursively grouped.
 pub fn google_display_buckets(buckets: &[QuotaBucket]) -> Vec<QuotaBucket> {
+    google_channel_display_buckets(GoogleSubscriptionChannel::GeminiCli, buckets)
+}
+
+pub(crate) fn google_channel_display_buckets(
+    channel: GoogleSubscriptionChannel,
+    buckets: &[QuotaBucket],
+) -> Vec<QuotaBucket> {
     if buckets.iter().any(is_google_display_bucket) {
         return buckets.to_vec();
     }
-    let mut groups: BTreeMap<(&str, &str), Vec<&QuotaBucket>> = BTreeMap::new();
+    let mut groups: BTreeMap<(&str, GoogleQuotaPool), Vec<&QuotaBucket>> = BTreeMap::new();
     for bucket in buckets.iter().filter(|bucket| bucket.is_primary()) {
-        let pools: BTreeSet<_> = bucket
+        let mut pools: BTreeSet<_> = bucket
             .models
             .iter()
-            .filter_map(|id| google_display_pool(id))
+            .filter_map(|id| GoogleQuotaPool::for_model(channel, id))
             .collect();
+        if channel == GoogleSubscriptionChannel::Antigravity {
+            pools.extend(GoogleQuotaPool::from_unbound_window(bucket));
+        }
         for pool in pools {
             groups
                 .entry((&bucket.scope_id, pool))
@@ -146,7 +231,7 @@ pub fn google_display_buckets(buckets: &[QuotaBucket]) -> Vec<QuotaBucket> {
         let models: Vec<String> = sources
             .iter()
             .flat_map(|bucket| &bucket.models)
-            .filter(|model| google_display_pool(model) == Some(pool))
+            .filter(|model| GoogleQuotaPool::for_model(channel, model) == Some(pool))
             .cloned()
             .collect::<BTreeSet<_>>()
             .into_iter()
@@ -168,9 +253,9 @@ pub fn google_display_buckets(buckets: &[QuotaBucket]) -> Vec<QuotaBucket> {
                         && bucket.tiers.iter().all(|tier| tiers.contains(tier))
                 });
         result.push(QuotaBucket {
-            id: opaque_quota_id(GOOGLE_FAMILY_DISPLAY_SOURCE, &[scope, pool]),
+            id: opaque_quota_id(GOOGLE_FAMILY_DISPLAY_SOURCE, &[scope, pool.key()]),
             scope_id: scope.to_owned(),
-            label: google_display_label(pool, &models).to_owned(),
+            label: pool.label(channel, &models).to_owned(),
             models,
             binding: QuotaBucketBinding {
                 status: if resolved { "resolved" } else { "unresolved" }.to_owned(),
@@ -189,7 +274,7 @@ pub fn google_display_buckets(buckets: &[QuotaBucket]) -> Vec<QuotaBucket> {
             stale,
             scheduling: display_scheduling(&applicable, resolved),
             api_price: (!duplicate_conflict)
-                .then(|| display_price(&sources, pool, allow_period))
+                .then(|| display_price(&sources, channel, pool, allow_period))
                 .flatten(),
         });
     }
@@ -373,7 +458,8 @@ macro_rules! for_field {
 
 fn display_price(
     sources: &[&QuotaBucket],
-    pool: &str,
+    channel: GoogleSubscriptionChannel,
+    pool: GoogleQuotaPool,
     allow_period: bool,
 ) -> Option<ProviderApiPriceStats> {
     let unique: BTreeMap<_, _> = sources
@@ -390,11 +476,11 @@ fn display_price(
         let pure = source
             .models
             .iter()
-            .all(|id| google_display_pool(id) == Some(pool))
+            .all(|id| GoogleQuotaPool::for_model(channel, id) == Some(pool))
             && part
                 .models
                 .iter()
-                .all(|row| google_display_pool(&row.model) == Some(pool));
+                .all(|row| GoogleQuotaPool::for_model(channel, &row.model) == Some(pool));
         preserve_period &= pure;
         if !pure {
             // Current model membership cannot assign historical mixed attempts.
@@ -402,7 +488,7 @@ fn display_price(
                 return None;
             }
             part.models
-                .retain(|row| google_display_pool(&row.model) == Some(pool));
+                .retain(|row| GoogleQuotaPool::for_model(channel, &row.model) == Some(pool));
             part.all_time = empty_totals();
             let mut coverage = part.all_time_coverage.take().unwrap_or_default();
             let _ = std::mem::take(&mut coverage);

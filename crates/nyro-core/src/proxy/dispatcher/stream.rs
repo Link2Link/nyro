@@ -127,6 +127,7 @@ pub(super) async fn handle_stream(
     req_ctx: &RequestContext,
     req_ir: &AiRequest,
     raw_chunk_hook: Option<StreamRawChunkHook>,
+    antigravity_quota: Option<(&str, crate::router::quota::BucketRefreshFence)>,
 ) -> Response {
     let egress = call_ctx.egress;
     let ingress = call_ctx.ingress;
@@ -163,6 +164,8 @@ pub(super) async fn handle_stream(
     };
 
     if status >= 400 {
+        let retry_after =
+            super::antigravity_header_delay(call_ctx.provider, status, resp.headers());
         let err_body: Value = resp
             .json()
             .await
@@ -181,7 +184,7 @@ pub(super) async fn handle_stream(
         )
             .into_response();
         response.headers_mut().extend(response_metadata);
-        super::mark_upstream_error(&mut response, status, &err_body);
+        super::mark_upstream_error(&mut response, status, &err_body, retry_after);
         return response;
     }
 
@@ -446,6 +449,18 @@ pub(super) async fn handle_stream(
     )
     .await;
 
+    if let ProbeOutcome::UpstreamStatus(frame) = probe {
+        if let Some(attempt) = &log.performance {
+            attempt.record_failure("failed", "upstream_error", "upstream_response", &*frame);
+        }
+        log.status(frame.status_code.unwrap_or(502))
+            .upstream_status(status as i32)
+            .error(frame.message.clone())
+            .with_upstream_request(upstream_req_hdrs_str, upstream_req_body_str)
+            .upstream_resp_headers(upstream_hdrs_str)
+            .emit();
+        return super::streaming::frame_response(&frame);
+    }
     if let ProbeOutcome::TransientZeroPayload(failure) = probe {
         // The attempt has terminally failed and nothing has reached the
         // client yet: record the failure on this attempt, emit its
@@ -501,6 +516,7 @@ pub(super) async fn handle_stream(
     // Move the log builder into the spawn.  Extract the fields we need AFTER
     // emit() consumes the builder, before passing it to the spawn.
     let log_ir = log;
+    let antigravity_quota = antigravity_quota.map(|(model, fence)| (model.to_owned(), fence));
     let act_model_ir = log_ir.upstream_model.clone();
     let upstream_hdrs_owned = upstream_hdrs_str;
 
@@ -511,6 +527,54 @@ pub(super) async fn handle_stream(
 
     tokio::spawn(async move {
         let mut accumulator = super::LogUsageAccumulator::default();
+        let decode_failure = |error: &anyhow::Error| {
+            let request_id = log_ir
+                .diagnostic
+                .client_request_id
+                .as_deref()
+                .unwrap_or_default();
+            if let Some(frame) = super::streaming::upstream_status_frame(error) {
+                let status = frame.status_code.unwrap_or(502);
+                if let Some(attempt) = &log_ir.performance {
+                    attempt.record_failure("failed", "upstream_error", "upstream_response", frame);
+                }
+                if status == 429
+                    && let Some((model, fence)) = &antigravity_quota
+                {
+                    let evidence = frame
+                        .raw
+                        .as_ref()
+                        .and_then(|body| super::google_rate_limit(status, body));
+                    super::record_antigravity_throttle(
+                        &log_ir.gw,
+                        &log_ir.provider_id,
+                        model,
+                        fence,
+                        evidence,
+                    );
+                    crate::admin::trigger_provider_usage_refresh(
+                        log_ir.gw.clone(),
+                        log_ir.provider_id.clone(),
+                    );
+                }
+                super::stream_error_event_with_status(
+                    ingress,
+                    request_id,
+                    &frame.kind.to_string(),
+                    status,
+                )
+            } else {
+                if let Some(attempt) = &log_ir.performance {
+                    attempt.record_failure(
+                        "failed",
+                        "conversion_parse_error",
+                        "response_conversion",
+                        error.as_ref(),
+                    );
+                }
+                super::stream_error_event(ingress, request_id, "conversion_parse_error")
+            }
+        };
         // Wire capture is shared in Attempt; no duplicate full log buffers.
         // Upstream-side counters start from the pre-commit probe so stream
         // metrics keep covering the whole upstream exchange.
@@ -601,23 +665,7 @@ pub(super) async fn handle_stream(
             let ai_deltas = match super::streaming::validate_decoded_batch(decoded) {
                 Ok(deltas) => deltas,
                 Err(error) => {
-                    if let Some(attempt) = &log_ir.performance {
-                        attempt.record_failure(
-                            "failed",
-                            "conversion_parse_error",
-                            "response_conversion",
-                            error.as_ref(),
-                        );
-                    }
-                    let event = super::stream_error_event(
-                        ingress,
-                        log_ir
-                            .diagnostic
-                            .client_request_id
-                            .as_deref()
-                            .unwrap_or_default(),
-                        "conversion_parse_error",
-                    );
+                    let event = decode_failure(&error);
                     if tx.send(Ok(event)).await.is_ok()
                         && let Some(attempt) = &log_ir.performance
                     {
@@ -668,23 +716,7 @@ pub(super) async fn handle_stream(
                     }
                 }
                 Err(error) => {
-                    if let Some(attempt) = &log_ir.performance {
-                        attempt.record_failure(
-                            "failed",
-                            "conversion_parse_error",
-                            "response_conversion",
-                            error.as_ref(),
-                        );
-                    }
-                    let event = super::stream_error_event(
-                        ingress,
-                        log_ir
-                            .diagnostic
-                            .client_request_id
-                            .as_deref()
-                            .unwrap_or_default(),
-                        "conversion_parse_error",
-                    );
+                    let event = decode_failure(&error);
                     if tx.send(Ok(event)).await.is_ok()
                         && let Some(attempt) = &log_ir.performance
                     {

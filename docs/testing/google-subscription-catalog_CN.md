@@ -1,6 +1,6 @@
 # Google 订阅目录策略
 
-本文仅覆盖 Google Antigravity 与 Gemini CLI 目录发现，不改变 Gemini codec、数据库 schema、开户策略或强制配额摘要端点。
+本文说明 Google 两个订阅渠道的目录发现，以及配套测试覆盖的 Antigravity 登录、会话与限流行为。
 
 ## 端点与身份
 
@@ -10,9 +10,11 @@
 - Admin 发现、probe、用量查询遵循有效运行绑定的 base URL 与 User-Agent，不静默切换主机重试。OAuth refresh 通过 context 接收有效端点；初次 OAuth exchange 使用渠道默认端点。
 - 内部 credential metadata 可保留显式 `subscription_endpoint`，这是集成细节，不是新增 UI 设置。
 
+项目发现（`loadCodeAssist`）和首次开户（`onboardUser`）共用渠道的可信控制面：Antigravity 用 daily，Gemini CLI 用 prod。自定义推理或目录地址不会改变这两个请求的目的地。即使 HTTP 返回 200，只要已完成的开户操作带有错误，就报告开户失败，而不是缺 project。诊断提示 `VALIDATION_REQUIRED` 等已知原因，不回显上游消息或签名链接。
+
 ## 快照生命周期
 
-仅刷新流程增加预算以保护已成功轮换的 token：token 准备阶段（包含可能的 Hub manifest 工作）限时 20 秒；之后可选的 project 恢复与目录发现共用 2 秒尽力预算。补充信息失败或超时仍保留成功的 token bundle；仍缺 project 时由请求阶段明确诊断。初次 OAuth exchange／开户行为不变。
+仅刷新流程增加预算以保护已成功轮换的 token：token 准备阶段（包含可能的 Hub manifest 工作）限时 20 秒；之后可选的 project 恢复与目录发现共用 2 秒尽力预算。补充信息失败或超时仍保留成功的 token bundle；仍缺 project 时由请求阶段明确诊断。这两项预算不适用于首次登录。
 
 credential metadata 同时保存 `subscription_models` 和 `subscription_models_source`。来源格式版本 1 将 ID 绑定到端点、project ID、完整 User-Agent（含版本）及 token 的 SHA-256 指纹。指纹不是 token，也不会出现在 probe 诊断中。缺来源或来源不匹配的旧快照视为未知；更换 project、端点、客户端身份或 token 后不复用其动态 ID。curated 别名与手动模型 ID 仍可使用。
 
@@ -36,11 +38,19 @@ Auth 与 admin 写入相同格式。Admin 在异步获取**之前**读取 connec
 - 未开通账号：只有 `gemini-4-{argon,hydrogen,carbon}-disabled` 占位，档位 ID 返回 404。
 - 系统提示词审查：`systemInstruction` 中出现第三方 Agent 身份（“You are an AI agent powered by DeepSeek Harness.”、Claude Code 身份）时，所有模型都返回不带细节的 429 `RESOURCE_EXHAUSTED`；同样文字放在首条 user 消息中可正常服务。因此 nyro 在该渠道始终改写 `systemInstruction`，且不带细节的 429 不再冷却模型。并非万无一失：Codex CLI 身份放在任何位置都会被拒。
 
+## Neon 目录与用量展示
+
+Antigravity 目录还报告了 `gemini-4-neon-{low,medium,high,xhigh}`。Nyro 折叠为 `gemini-4-neon`，按请求推理强度选择档位，无指令默认 `-medium`。三池用量视图将 Neon 与 Hydrogen 放在 **Gemini Models**，详见[配额桶说明](../design/quota-buckets_CN.md)。Neon 映射由离线测试覆盖，不属于上面的 11 月 15 日线上探测。
+
 ## Probe 诊断
 
 现有 error 字符串附带公共模型 ID、实际 wire model ID、端点来源；运行 metadata 原有 base URL 给出实际端点。Debug 日志记录模型映射和端点来源，不记录凭据指纹或 project ID。404 提示列举模型、端点／project、客户端版本、账户资格等可能原因，不断言某套餐不可用。配额读数同样不能单独证明 429 原因。
 
 ## 离线回归
+
+- Antigravity 保留原生 Gemini 显式传入的 `sessionId`。否则用客户端对话标识或第一段非空用户文本生成，按 provider、账号和 project 隔离。追加消息或续期 token 不会改变 ID；两个输入都没有时生成新 ID。
+- HTTP 429 优先采用响应体的结构化等待时间，再读 `Retry-After`（整数秒或 HTTP 日期）。明确给出 0 秒不新增冷却；没有配额证据的裸 `RESOURCE_EXHAUSTED` 不冷却模型。明确给出的等待只作用于当前账号代际和实际出站模型，本地保护上限为七天。
+- HTTP 200 的 Gemini 流中出现错误帧即为终态。尚未对客户端发送数据或正在聚合时返回错误响应；已开始发送时，输出客户端协议对应的错误事件，不追加成功标记，也不重放请求。
 
 工作区根目录串行执行。新增 HTTP fixture 只绑定 loopback，使用合成凭据，不访问真实 Google 端点／账户。
 
@@ -48,6 +58,9 @@ Auth 与 admin 写入相同格式。Admin 在异步获取**之前**读取 connec
 cargo test -p nyro-core google_catalog
 cargo test -p nyro-core provider::google::antigravity::tests::catalog_
 cargo test -p nyro-core google_subscription_
+cargo test -p nyro-core --lib auth::drivers::google::tests
+cargo test -p nyro-core --lib antigravity_session_is_stable
+cargo test -p nyro-core --test google_subscription_non_stream
 cargo test -p nyro-core subscription_model_catalog_keeps_wire_ids_and_channel_specific_fallbacks
 cargo check -p nyro-core
 ```

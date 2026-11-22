@@ -15,6 +15,9 @@ pub use google_display::{
     GOOGLE_FAMILY_DISPLAY_SOURCE, GOOGLE_GEMINI_MODELS_POOL, google_display_buckets,
     google_display_family, google_display_pool, is_google_display_bucket,
 };
+pub(crate) use google_display::{
+    GoogleQuotaPool, google_channel_display_buckets, google_quota_channel,
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct QuotaBucketBinding {

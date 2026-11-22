@@ -113,6 +113,9 @@ pub(super) enum ProbeOutcome {
     },
     /// The stream terminated with a whitelisted stop reason and zero payload.
     TransientZeroPayload(Box<TransientStreamFailure>),
+    /// No bytes were sent downstream. Do not replay an in-band failure as a
+    /// zero-output sampling glitch; upstream execution may already have begun.
+    UpstreamStatus(Box<crate::protocol::ir::error::AiError>),
 }
 
 /// Decode upstream chunks without consuming any downstream state until the
@@ -195,6 +198,9 @@ where
         let ai_deltas = match super::streaming::validate_decoded_batch(decoded) {
             Ok(deltas) => deltas,
             Err(error) => {
+                if let Some(frame) = super::streaming::upstream_status_frame(&error) {
+                    return ProbeOutcome::UpstreamStatus(Box::new(frame.clone()));
+                }
                 if let Some(attempt) = performance {
                     attempt.record_failure(
                         "failed",

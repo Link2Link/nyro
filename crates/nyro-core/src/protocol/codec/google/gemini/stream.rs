@@ -352,6 +352,20 @@ fn parse_gemini_chunk(
     first: &mut bool,
     function_calls: &mut CompleteFunctionCalls,
 ) -> std::result::Result<Option<String>, AiError> {
+    // Some Code Assist failures arrive inside HTTP 200, even after a candidate
+    // with finishReason. The frame is an error, not empty model metadata.
+    if let Some(error) = chunk.get("error").filter(|v| !v.is_null()) {
+        let status = error
+            .get("code")
+            .and_then(Value::as_u64)
+            .filter(|n| (400..=599).contains(n))
+            .unwrap_or(502) as u16;
+        return Err(AiError::from_status(
+            status,
+            format!("Google upstream stream failed (HTTP {status})"),
+        )
+        .with_raw(chunk.clone()));
+    }
     if *first {
         *first = false;
         let model = chunk

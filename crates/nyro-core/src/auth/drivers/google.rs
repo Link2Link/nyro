@@ -45,7 +45,7 @@ use crate::auth::types::{
 };
 use crate::db::models::Provider;
 use crate::provider::google::antigravity::{
-    X_GOOG_API_CLIENT, antigravity_user_agent, antigravity_version,
+    ANTIGRAVITY_INFERENCE_BASE_URL, X_GOOG_API_CLIENT, antigravity_user_agent, antigravity_version,
 };
 use crate::provider::google::gemini_cli::GEMINI_CLI_USER_AGENT;
 use crate::provider::{OAuthConfig, VendorRegistry};
@@ -66,11 +66,6 @@ const GEMINI_CLI_CLIENT_SECRET: &str = "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";
 
 /// Google identity endpoint (email → subject_id).
 const GOOGLE_USERINFO_URL: &str = "https://www.googleapis.com/oauth2/v2/userinfo";
-
-/// Code Assist control-plane host for antigravity onboarding. Inference
-/// defaults to daily; the Antigravity IDE onboardUser also uses that host.
-/// The Gemini CLI onboardUser stays on the prod host (sub2api behavior).
-const ANTIGRAVITY_DAILY_API_BASE_URL: &str = "https://daily-cloudcode-pa.googleapis.com";
 
 /// How long a pending login session stays valid.
 const SESSION_TTL_SECONDS: i64 = 10 * 60;
@@ -160,6 +155,7 @@ struct GoogleErrorResponse {
 struct SubscriptionConfig {
     oauth: &'static OAuthConfig,
     api_base_url: &'static str,
+    project_base_url: &'static str,
     static_models: &'static [&'static str],
 }
 
@@ -189,6 +185,12 @@ impl GoogleSubscriptionDriver {
                 anyhow!("missing oauth config for {GOOGLE_PRESET_ID}/{channel_id}")
             })?,
             api_base_url,
+            // Keep the legacy resource URL, but bind both project calls to the
+            // channel's control plane. Never send a grant to a catalog override.
+            project_base_url: match self.channel {
+                GoogleSubscriptionChannel::Antigravity => ANTIGRAVITY_INFERENCE_BASE_URL,
+                GoogleSubscriptionChannel::GeminiCli => api_base_url,
+            },
             static_models: channel.static_models,
         })
     }
@@ -335,14 +337,7 @@ impl GoogleSubscriptionDriver {
             .send()
             .await
             .with_context(|| format!("{driver_label} loadCodeAssist request"))?;
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        if !status.is_success() {
-            let detail = Self::parse_error(&body).unwrap_or(body);
-            bail!("{driver_label} loadCodeAssist failed: HTTP {status} {detail}");
-        }
-        let parsed: Value = serde_json::from_str(&body)
-            .with_context(|| format!("parse {driver_label} loadCodeAssist response"))?;
+        let parsed = code_assist_json(response, driver_label, "loadCodeAssist").await?;
         let tier_summary = json!({
             "currentTier": parsed.get("currentTier").cloned().unwrap_or(Value::Null),
             "allowedTiers": parsed.get("allowedTiers").cloned().unwrap_or(Value::Null),
@@ -362,33 +357,29 @@ impl GoogleSubscriptionDriver {
     async fn onboard_user(
         &self,
         client: &reqwest::Client,
+        base_url: &str,
         access_token: &str,
         tier_id: &str,
     ) -> Result<String> {
         let driver_label = self.metadata_key();
-        let (endpoint, body) = match self.channel {
-            GoogleSubscriptionChannel::Antigravity => (
-                format!("{ANTIGRAVITY_DAILY_API_BASE_URL}/v1internal:onboardUser"),
-                json!({
-                    "tier_id": tier_id,
-                    "metadata": {
-                        "ide_type": "ANTIGRAVITY",
-                        "ide_version": antigravity_version(),
-                        "ide_name": "antigravity",
-                    },
-                }),
-            ),
-            GoogleSubscriptionChannel::GeminiCli => (
-                "https://cloudcode-pa.googleapis.com/v1internal:onboardUser".to_string(),
-                json!({
-                    "tierId": tier_id,
-                    "metadata": {
-                        "ideType": "ANTIGRAVITY",
-                        "platform": "PLATFORM_UNSPECIFIED",
-                        "pluginType": "GEMINI",
-                    },
-                }),
-            ),
+        let endpoint = format!("{}/v1internal:onboardUser", base_url.trim_end_matches('/'));
+        let body = match self.channel {
+            GoogleSubscriptionChannel::Antigravity => json!({
+                "tier_id": tier_id,
+                "metadata": {
+                    "ide_type": "ANTIGRAVITY",
+                    "ide_version": antigravity_version(),
+                    "ide_name": "antigravity",
+                },
+            }),
+            GoogleSubscriptionChannel::GeminiCli => json!({
+                "tierId": tier_id,
+                "metadata": {
+                    "ideType": "ANTIGRAVITY",
+                    "platform": "PLATFORM_UNSPECIFIED",
+                    "pluginType": "GEMINI",
+                },
+            }),
         };
         let user_agent = self.user_agent();
         for attempt in 1..=ONBOARD_MAX_ATTEMPTS {
@@ -406,24 +397,22 @@ impl GoogleSubscriptionDriver {
                 .send()
                 .await
                 .with_context(|| format!("{driver_label} onboardUser attempt {attempt}"))?;
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            if !status.is_success() {
-                let detail = Self::parse_error(&body).unwrap_or(body);
-                bail!("{driver_label} onboardUser failed: HTTP {status} {detail}");
-            }
-            let parsed: Value = serde_json::from_str(&body)
-                .with_context(|| format!("parse {driver_label} onboardUser response"))?;
+            let parsed = code_assist_json(response, driver_label, "onboardUser").await?;
             if parsed.get("done").and_then(Value::as_bool).unwrap_or(false) {
-                if let Some(project) = parsed
-                    .get("response")
-                    .and_then(extract_project_id_from_value)
-                {
+                if let Some(error) = parsed.get("error").filter(|value| !value.is_null()) {
+                    bail!(
+                        "{driver_label} onboardUser operation failed: {}",
+                        code_assist_error(error)
+                    );
+                }
+                if let Some(project) = parsed.get("response").and_then(extract_project_id) {
                     return Ok(project);
                 }
                 bail!("{driver_label} onboardUser completed without a project id");
             }
-            tokio::time::sleep(std::time::Duration::from_millis(ONBOARD_POLL_DELAY_MS)).await;
+            if attempt < ONBOARD_MAX_ATTEMPTS {
+                tokio::time::sleep(std::time::Duration::from_millis(ONBOARD_POLL_DELAY_MS)).await;
+            }
         }
         bail!("{driver_label} onboardUser did not complete after {ONBOARD_MAX_ATTEMPTS} attempts")
     }
@@ -432,7 +421,7 @@ impl GoogleSubscriptionDriver {
     async fn resolve_project_id(
         &self,
         client: &reqwest::Client,
-        config: &SubscriptionConfig,
+        base_url: &str,
         access_token: &str,
         prior_meta: Option<&Value>,
     ) -> Result<(String, Value)> {
@@ -445,7 +434,7 @@ impl GoogleSubscriptionDriver {
             // Project already onboarded previously; reuse it. Tier info is
             // best-effort — never fail a refresh over it.
             let (_, tier_summary) = self
-                .load_code_assist(client, config.api_base_url, access_token)
+                .load_code_assist(client, base_url, access_token)
                 .await
                 .unwrap_or_else(|error| {
                     tracing::warn!(%error, "{} loadCodeAssist failed during refresh", self.metadata_key());
@@ -455,7 +444,7 @@ impl GoogleSubscriptionDriver {
         }
 
         let (project, tier_summary) = self
-            .load_code_assist(client, config.api_base_url, access_token)
+            .load_code_assist(client, base_url, access_token)
             .await?;
         if let Some(project) = project {
             return Ok((project, tier_summary));
@@ -463,7 +452,9 @@ impl GoogleSubscriptionDriver {
 
         // No companion project yet → finish onboarding with the default tier.
         let tier_id = default_tier_id(&tier_summary);
-        let project = self.onboard_user(client, access_token, &tier_id).await?;
+        let project = self
+            .onboard_user(client, base_url, access_token, &tier_id)
+            .await?;
         Ok((project, tier_summary))
     }
 
@@ -486,7 +477,12 @@ impl GoogleSubscriptionDriver {
             let access_token = bundle.access_token.clone().unwrap_or_default();
             if !has_project_id {
                 let (project_id, tier_summary) = self
-                    .resolve_project_id(client, config, &access_token, Some(&bundle.raw))
+                    .resolve_project_id(
+                        client,
+                        config.project_base_url,
+                        &access_token,
+                        Some(&bundle.raw),
+                    )
                     .await?;
                 if let Some(meta) = bundle.raw.as_object_mut() {
                     meta.insert("project_id".into(), Value::String(project_id));
@@ -574,23 +570,86 @@ impl GoogleSubscriptionDriver {
     }
 }
 
-/// cloudaicompanionProject may be a bare string or {id: …}; the same shape
-/// appears inside onboardUser's response wrapper.
-fn extract_project_id_from_value(value: &Value) -> Option<String> {
-    match value.get("cloudaicompanionProject") {
-        Some(Value::String(project)) => Some(project.trim().to_string()).filter(|p| !p.is_empty()),
-        Some(project @ Value::Object(_)) => project
-            .get("id")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|p| !p.is_empty())
-            .map(ToString::to_string),
-        _ => None,
+async fn code_assist_json(
+    mut response: reqwest::Response,
+    driver: &str,
+    action: &str,
+) -> Result<Value> {
+    let status = response.status();
+    let limit = if status.is_success() {
+        1 << 20
+    } else {
+        64 << 10
+    };
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .with_context(|| format!("{driver} {action}: HTTP {status} reading response"))?
+    {
+        if chunk.len() > limit - bytes.len() {
+            bail!("{driver} {action}: HTTP {status} response exceeds size limit");
+        }
+        bytes.extend_from_slice(&chunk);
     }
+    let parsed = serde_json::from_slice::<Value>(&bytes);
+    if !status.is_success() {
+        let detail = parsed
+            .as_ref()
+            .ok()
+            .and_then(|v| v.get("error"))
+            .map(code_assist_error)
+            .unwrap_or_default();
+        bail!("{driver} {action} failed: HTTP {status} {detail}");
+    }
+    parsed.with_context(|| format!("parse {driver} {action} response"))
+}
+
+// Operation metadata and free-text messages can contain account identifiers or
+// signed URLs. Only surface recognized reasons and numeric RPC/HTTP codes.
+fn code_assist_error(error: &Value) -> String {
+    let reason = error
+        .get("details")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|d| d["@type"] == "type.googleapis.com/google.rpc.ErrorInfo")
+        .filter_map(|d| d["reason"].as_str())
+        .find_map(|reason| match reason {
+            "VALIDATION_REQUIRED" => Some("VALIDATION_REQUIRED: verify this Google account"),
+            "TOS_VIOLATION" => Some("TOS_VIOLATION: this Google account is suspended"),
+            "QUOTA_EXHAUSTED" | "RATE_LIMIT_EXCEEDED" => Some(reason),
+            _ => None,
+        });
+    let code = error.get("code").and_then(Value::as_i64);
+    let status = error.get("status").and_then(Value::as_str).filter(|s| {
+        matches!(
+            *s,
+            "PERMISSION_DENIED" | "UNAUTHENTICATED" | "RESOURCE_EXHAUSTED" | "UNAVAILABLE"
+        )
+    });
+    let label = reason.or(status).unwrap_or(match code {
+        Some(7) => "PERMISSION_DENIED",
+        Some(16) => "UNAUTHENTICATED",
+        Some(8) => "RESOURCE_EXHAUSTED",
+        Some(14) => "UNAVAILABLE",
+        _ => "upstream operation error",
+    });
+    code.map(|code| format!("{label} (code {code})"))
+        .unwrap_or_else(|| label.to_owned())
 }
 
 fn extract_project_id(value: &Value) -> Option<String> {
-    extract_project_id_from_value(value)
+    ["cloudaicompanionProject", "projectId", "project"]
+        .iter()
+        .find_map(|key| {
+            let project = value.get(*key)?;
+            let id = project
+                .as_str()
+                .or_else(|| project.get("id")?.as_str())?
+                .trim();
+            (!id.is_empty()).then(|| id.to_owned())
+        })
 }
 
 fn default_tier_id(tier_summary: &Value) -> String {
@@ -797,7 +856,7 @@ impl AuthDriver for GoogleSubscriptionDriver {
         let access_token = bundle.access_token.clone().unwrap_or_default();
         let email = self.fetch_user_email(&client, &access_token).await?;
         let (project_id, tier_summary) = self
-            .resolve_project_id(&client, &config, &access_token, None)
+            .resolve_project_id(&client, config.project_base_url, &access_token, None)
             .await?;
         // Resolve the stable subscriber identity at first login as well as
         // refresh; otherwise quota ownership would switch from a random legacy
@@ -1177,7 +1236,7 @@ mod tests {
             .unwrap();
         let driver = GoogleSubscriptionDriver::GEMINI_CLI;
         let mut config = driver.channel_config().unwrap();
-        config.api_base_url = "http://project-fixture.invalid";
+        config.project_base_url = "http://project-fixture.invalid";
         let mut bundle = GoogleSubscriptionDriver::build_bundle(
             GoogleTokenResponse {
                 access_token: Some("newly-rotated-access".into()),
@@ -1237,6 +1296,10 @@ mod tests {
         assert!(config.oauth.authorize_url.contains("accounts.google.com"));
         assert!(config.oauth.token_url.contains("oauth2.googleapis.com"));
         assert_eq!(config.api_base_url, "https://cloudcode-pa.googleapis.com");
+        assert_eq!(
+            config.project_base_url,
+            "https://daily-cloudcode-pa.googleapis.com"
+        );
         assert!(
             config
                 .oauth
@@ -1264,6 +1327,7 @@ mod tests {
         assert!(!config.oauth.scope.contains("generative-language"));
         assert!(!config.oauth.scope.contains("drive"));
         assert_eq!(config.api_base_url, "https://cloudcode-pa.googleapis.com");
+        assert_eq!(config.project_base_url, config.api_base_url);
         assert!(
             config
                 .static_models
@@ -1324,10 +1388,54 @@ mod tests {
         assert_eq!(extract_project_id(&object_form).as_deref(), Some("proj-2"));
         let onboard = json!({"done": true, "response": {"cloudaicompanionProject": "proj-3"}});
         assert_eq!(
-            extract_project_id_from_value(onboard.get("response").unwrap()).as_deref(),
+            extract_project_id(onboard.get("response").unwrap()).as_deref(),
             Some("proj-3")
         );
         assert_eq!(extract_project_id(&json!({})), None);
+        assert_eq!(
+            extract_project_id(
+                &json!({"cloudaicompanionProject":" ","projectId":{"id":" proj-4 "}})
+            )
+            .as_deref(),
+            Some("proj-4")
+        );
+        assert_eq!(
+            extract_project_id(&json!({"project":"proj-5"})).as_deref(),
+            Some("proj-5")
+        );
+    }
+
+    #[tokio::test]
+    async fn antigravity_bootstrap_preserves_validation_error_in_successful_operation_response() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let app = axum::Router::new().fallback(|uri: axum::http::Uri, axum::Json(body): axum::Json<Value>| async move {
+                if uri.path() == "/v1internal:loadCodeAssist" {
+                    return axum::Json(json!({"allowedTiers":[{"isDefault":true,"id":"test-tier"}]}));
+                }
+                assert_eq!(uri.path(), "/v1internal:onboardUser");
+                assert_eq!(body["tier_id"], "test-tier");
+                axum::Json(json!({"done":true, "error":{"code":7, "message":"private marker", "details":[{
+                    "@type":"type.googleapis.com/google.rpc.ErrorInfo", "reason":"VALIDATION_REQUIRED",
+                    "metadata":{"validation_url":"https://example.invalid/private"}
+                }]}}))
+            });
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let error = GoogleSubscriptionDriver::ANTIGRAVITY
+            .resolve_project_id(&client, &base_url, "fixture", None)
+            .await
+            .unwrap_err()
+            .to_string();
+        server.abort();
+        assert!(
+            error.contains("onboardUser operation failed") && error.contains("VALIDATION_REQUIRED"),
+            "{error}"
+        );
+        assert!(
+            !error.contains("private") && !error.contains("project id"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -1434,11 +1542,13 @@ mod tests {
         // Active catalog generations only: 3.8 flash tiers and Gemini 4.
         assert!(models.iter().any(|m| m == "gemini-3.8-flash-high"));
         assert!(models.iter().any(|m| m == "gemini-3.8-flash-tiered"));
-        // Gemini 4 Argon / Hydrogen serve tier ids only (bare ids 404).
+        // The fallback carries tier IDs, not Nyro's bare aliases.
         assert!(models.iter().any(|m| m == "gemini-4-argon-high"));
         assert!(models.iter().any(|m| m == "gemini-4-hydrogen-xhigh"));
+        assert!(models.iter().any(|m| m == "gemini-4-neon-xhigh"));
         assert!(!models.iter().any(|m| m == "gemini-4-argon"));
         assert!(!models.iter().any(|m| m == "gemini-4-hydrogen"));
+        assert!(!models.iter().any(|m| m == "gemini-4-neon"));
         // Retired lines stay out of the fallback list — dynamic discovery
         // resurfaces them per-account when still served.
         assert!(!models.iter().any(|m| *m == "gemini-2.5-pro"));

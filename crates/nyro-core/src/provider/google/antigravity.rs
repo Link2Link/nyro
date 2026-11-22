@@ -61,6 +61,11 @@ pub(crate) const ANTIGRAVITY_STATIC_MODELS: &[&str] = &[
     "gemini-4-argon-high",
     "gemini-4-argon-medium",
     "gemini-4-argon-low",
+    // Neon tiers reported by Antigravity model discovery; keep the bare name virtual.
+    "gemini-4-neon-xhigh",
+    "gemini-4-neon-high",
+    "gemini-4-neon-medium",
+    "gemini-4-neon-low",
     // Claude 5.5 reasoning tiers (verified 2026-10-04 by direct probes):
     // callable on the inference surface but NOT yet listed by the per-account
     // `fetchAvailableModels` catalog, so the curated list must carry them or
@@ -827,6 +832,7 @@ const UNIFIED_TIER_MODELS: &[&str] = &[
     "gemini-3.8-flash",
     "gemini-4-argon",
     "gemini-4-hydrogen",
+    "gemini-4-neon",
 ];
 
 fn unified_tier_base(model: &str) -> Option<&'static str> {
@@ -1270,6 +1276,15 @@ re-login the provider to re-run onboarding"
 
 /// Wrap a standard Gemini generateContent body into the v1internal envelope.
 pub(crate) fn wrap_request(body: Value, model: &str, project_id: &str) -> Value {
+    wrap_scoped_request(body, model, project_id, project_id)
+}
+
+pub(crate) fn wrap_scoped_request(
+    body: Value,
+    model: &str,
+    project_id: &str,
+    scope: &str,
+) -> Value {
     let mut request = match body {
         Value::Object(map) => serde_json::Map::from_iter(map),
         other => {
@@ -1283,15 +1298,16 @@ pub(crate) fn wrap_request(body: Value, model: &str, project_id: &str) -> Value 
     // The internal API rejects safetySettings on this path.
     request.remove("safetySettings");
 
-    // Stable per-conversation session id, derived from the latest user turn
-    // (mirrors the Antigravity IDE's own derivation).
+    // Derive before relocating system text; later user/tool turns must not change the id.
     let has_session_id = request
         .get("sessionId")
         .and_then(Value::as_str)
         .map(str::trim)
         .is_some_and(|value| !value.is_empty());
     if !has_session_id {
-        let session_id = derive_session_id(request.get("contents"));
+        let session_id = first_user_text(request.get("contents"))
+            .map(|text| scoped_session_id(scope, "first-user-text", text))
+            .unwrap_or_else(|| format!("-{}", random_session_digits()));
         request.insert("sessionId".to_string(), Value::String(session_id));
     }
     // After the session id: the derivation keeps hashing the client's own
@@ -1416,34 +1432,67 @@ fn unwrap_stream_line(line: &str) -> String {
     rewritten
 }
 
-/// Antigravity session ids look like Google's own: a negative decimal string.
-fn derive_session_id(contents: Option<&Value>) -> String {
-    let mut hasher = Sha256::new();
-    let mut saw_user_text = false;
-    if let Some(contents) = contents.and_then(Value::as_array) {
-        for content in contents {
-            if content.get("role").and_then(Value::as_str) != Some("user") {
-                continue;
-            }
-            if let Some(parts) = content.get("parts").and_then(Value::as_array) {
-                for part in parts {
-                    if let Some(text) = part.get("text").and_then(Value::as_str) {
-                        if text.trim().is_empty() {
-                            continue;
-                        }
-                        saw_user_text = true;
-                        hasher.update(text.as_bytes());
-                    }
-                }
-            }
-        }
+fn first_user_text(contents: Option<&Value>) -> Option<&str> {
+    contents?
+        .as_array()?
+        .iter()
+        .filter(|turn| turn["role"] == "user")
+        .filter_map(|turn| turn["parts"].as_array())
+        .flatten()
+        .find_map(|part| part["text"].as_str().filter(|text| !text.trim().is_empty()))
+}
+
+pub(crate) fn session_scope(
+    provider: &Provider,
+    credential: Option<&crate::auth::StoredCredential>,
+    project: &str,
+) -> String {
+    let owner = credential
+        .and_then(|c| crate::quota_buckets::google_quota_owner_id(c, None))
+        .unwrap_or_default();
+    crate::quota_buckets::opaque_quota_id(
+        "nyro:antigravity:session-scope",
+        &[&provider.id, &owner, project],
+    )
+}
+
+fn scoped_session_id(scope: &str, kind: &str, seed: &str) -> String {
+    let mut hash = Sha256::new();
+    for part in [scope, kind, seed] {
+        hash.update((part.len() as u64).to_be_bytes());
+        hash.update(part.as_bytes());
     }
-    if !saw_user_text {
-        return format!("-{}", random_session_digits());
+    let digest = hash.finalize();
+    let n = u64::from_be_bytes(digest[..8].try_into().expect("SHA-256 prefix")) & i64::MAX as u64;
+    format!("-{}", n.max(1))
+}
+
+/// Native Gemini sessionId is a wire field; other clients' session identifiers
+/// are hints only and never leave the gateway in their original form.
+pub(crate) fn apply_ingress_session(
+    provider: &Provider,
+    credential: Option<&crate::auth::StoredCredential>,
+    ingress: crate::protocol::ids::ProtocolId,
+    raw: &crate::protocol::ir::RawEnvelope,
+    body: &mut Value,
+) {
+    if !is_google_antigravity(provider) {
+        return;
     }
-    let digest = hasher.finalize();
-    let numeric = u64::from_be_bytes(digest[..8].try_into().expect("8 bytes"));
-    format!("-{numeric}")
+    if ingress.protocol == crate::protocol::ids::Protocol::GoogleGemini
+        && let Some(id) = raw
+            .body
+            .as_ref()
+            .and_then(|v| v["sessionId"].as_str())
+            .filter(|s| !s.trim().is_empty())
+    {
+        body["request"]["sessionId"] = json!(id);
+    } else if let Some(hint) = crate::provider::account_pool::logical_session_from_envelope(raw)
+        && let Some(project) = body["project"].as_str()
+    {
+        let scope = session_scope(provider, credential, project);
+        body["request"]["sessionId"] = json!(scoped_session_id(&scope, "client-session", &hint));
+    }
 }
 
 fn random_session_digits() -> u64 {
@@ -1826,9 +1875,7 @@ mod tests {
 
     #[test]
     fn static_models_carry_gemini_4_tier_variants_only() {
-        // Verified 2026-11-15 (Google AI Pro, daily host): every tier answers
-        // 200 while the bare family ids answer 404, so the curated fallback
-        // carries tier ids only and the bare ids stay virtual aliases.
+        // These are raw catalog IDs; the bare names are virtual aliases.
         for id in [
             "gemini-4-hydrogen-xhigh",
             "gemini-4-hydrogen-high",
@@ -1837,12 +1884,16 @@ mod tests {
             "gemini-4-argon-high",
             "gemini-4-argon-medium",
             "gemini-4-argon-low",
+            "gemini-4-neon-xhigh",
+            "gemini-4-neon-high",
+            "gemini-4-neon-medium",
+            "gemini-4-neon-low",
         ] {
             assert!(ANTIGRAVITY_STATIC_MODELS.contains(&id), "{id}");
             assert!(!is_unavailable_subscription_model(id), "{id}");
             assert!(is_tier_suffixed(id), "{id}");
         }
-        for bare in ["gemini-4-hydrogen", "gemini-4-argon"] {
+        for bare in ["gemini-4-hydrogen", "gemini-4-argon", "gemini-4-neon"] {
             assert!(!ANTIGRAVITY_STATIC_MODELS.contains(&bare), "{bare}");
             assert!(!is_tier_suffixed(bare), "{bare}");
             assert_eq!(unified_tier_base(&format!("{bare}-xhigh")), Some(bare));
@@ -1859,15 +1910,20 @@ mod tests {
         let pick = |model: &str, effort: crate::protocol::ir::ReasoningEffort| {
             resolve_tiered_model(model, &reasoning(Some(effort)), &catalog)
         };
-        for (effort, hydrogen, argon) in [
-            (Low, "low", "low"),
-            (Minimal, "low", "low"),
-            (crate::protocol::ir::ReasoningEffort::None, "low", "low"),
-            (Medium, "medium", "medium"),
-            (High, "high", "high"),
-            // Only Hydrogen serves -xhigh; Argon degrades to its top tier.
-            (Xhigh, "xhigh", "high"),
-            (Max, "xhigh", "high"),
+        for (effort, hydrogen, argon, neon) in [
+            (Low, "low", "low", "low"),
+            (Minimal, "low", "low", "low"),
+            (
+                crate::protocol::ir::ReasoningEffort::None,
+                "low",
+                "low",
+                "low",
+            ),
+            (Medium, "medium", "medium", "medium"),
+            (High, "high", "high", "high"),
+            // Hydrogen and Neon serve -xhigh; Argon degrades to its top tier.
+            (Xhigh, "xhigh", "high", "xhigh"),
+            (Max, "xhigh", "high", "xhigh"),
         ] {
             assert_eq!(
                 pick("gemini-4-hydrogen", effort.clone()),
@@ -1879,10 +1935,15 @@ mod tests {
                 Some(format!("gemini-4-argon-{argon}")),
                 "{effort:?}"
             );
+            assert_eq!(
+                pick("gemini-4-neon", effort.clone()),
+                Some(format!("gemini-4-neon-{neon}")),
+                "{effort:?}"
+            );
         }
-        // No adaptive tier on either family: no directive → -medium (the
+        // No adaptive tier on these families: no directive → -medium (the
         // account catalog's defaultAgentModelId is gemini-4-argon-medium).
-        for family in ["gemini-4-hydrogen", "gemini-4-argon"] {
+        for family in ["gemini-4-hydrogen", "gemini-4-argon", "gemini-4-neon"] {
             assert_eq!(
                 resolve_tiered_model(family, &Default::default(), &catalog),
                 Some(format!("{family}-medium"))
@@ -1928,6 +1989,74 @@ mod tests {
                 .get("thinkingConfig")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn antigravity_session_is_stable_across_turns_and_refresh_but_account_scoped() {
+        use crate::auth::StoredCredential;
+        use crate::protocol::ids::{
+            GOOGLE_GEMINI_GENERATE_CONTENT_V1BETA, OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1,
+        };
+        use crate::protocol::ir::RawEnvelope;
+
+        let (provider, _) = google_provider("antigravity", "m");
+        let mut account = StoredCredential {
+            subject_id: Some("one".into()),
+            ..Default::default()
+        };
+        let scope = session_scope(&provider, Some(&account), "p");
+        account.access_token = Some("new-token".into());
+        assert_eq!(scope, session_scope(&provider, Some(&account), "p"));
+        let first =
+            json!({"role":"user","parts":[{"inlineData":{}},{"text":" "},{"text":"hello"}]});
+        let body = json!({"contents":[first]});
+        let mut wrapped = wrap_scoped_request(body.clone(), "m", "p", &scope);
+        let extended = json!({"contents":[first,{"role":"model","parts":[{"text":"reply"}]},{"role":"user","parts":[{"text":"second turn"}]}]});
+        assert_eq!(
+            wrapped["request"]["sessionId"],
+            wrap_scoped_request(extended, "m", "p", &scope)["request"]["sessionId"]
+        );
+        let other = StoredCredential {
+            subject_id: Some("two".into()),
+            ..Default::default()
+        };
+        assert_ne!(
+            wrapped["request"]["sessionId"],
+            wrap_scoped_request(body, "m", "p", &session_scope(&provider, Some(&other), "p"))["request"]
+                ["sessionId"]
+        );
+
+        let raw = RawEnvelope::new(
+            Some(json!({"sessionId":"explicit"})),
+            Default::default(),
+            "POST",
+            "/",
+        );
+        apply_ingress_session(
+            &provider,
+            Some(&account),
+            OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1,
+            &raw,
+            &mut wrapped,
+        );
+        let first_hint = wrapped["request"]["sessionId"].clone();
+        assert!(first_hint.as_str().unwrap().parse::<i64>().unwrap() < 0);
+        apply_ingress_session(
+            &provider,
+            Some(&other),
+            OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1,
+            &raw,
+            &mut wrapped,
+        );
+        assert_ne!(first_hint, wrapped["request"]["sessionId"]);
+        apply_ingress_session(
+            &provider,
+            Some(&account),
+            GOOGLE_GEMINI_GENERATE_CONTENT_V1BETA,
+            &raw,
+            &mut wrapped,
+        );
+        assert_eq!(wrapped["request"]["sessionId"], "explicit");
     }
 
     #[test]
@@ -2512,6 +2641,7 @@ mod tests {
                     "gemini-3.8-flash-image-high",
                     "gemini-4-argon",
                     "gemini-4-hydrogen",
+                    "gemini-4-neon",
                     "gpt-oss-120b-medium",
                 ],
                 "{channel} must collapse only the exact unified families"

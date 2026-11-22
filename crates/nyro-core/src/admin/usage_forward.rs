@@ -30,7 +30,7 @@ use super::usage_publication::{
 };
 use super::*;
 use crate::provider::nyro_gateway::usage::public_usage::PublicProviderUsage;
-use crate::quota_buckets::{google_display_buckets, opaque_quota_id};
+use crate::quota_buckets::{google_channel_display_buckets, google_quota_channel, opaque_quota_id};
 
 /// Reuse window for forwarded snapshots. Downstream monitors poll every five
 /// minutes, so one remote serves any number of them with at most one vendor
@@ -369,8 +369,13 @@ impl AdminService {
                     usage.is_available = Some(false);
                     usage.scheduling = owner;
                 }
-                let (rows, mut states) =
-                    project_forwarded_entry(entry, &usage, &routes, include_money);
+                let (rows, mut states) = project_forwarded_entry(
+                    entry,
+                    &usage,
+                    &routes,
+                    include_money,
+                    provider.channel.as_deref(),
+                );
                 // Include runtime auth/model cooldown fences that may have
                 // arrived after this cached quota observation. Model identity
                 // is the same concrete target used by route collection.
@@ -467,6 +472,7 @@ fn project_forwarded_entry(
     usage: &ProviderUsage,
     routes: &BTreeMap<String, BTreeSet<String>>,
     include_money: bool,
+    provider_channel: Option<&str>,
 ) -> (
     Vec<ForwardedProviderUsage>,
     BTreeMap<String, Vec<Option<ProviderScheduling>>>,
@@ -545,97 +551,99 @@ fn project_forwarded_entry(
     // authorized output rows are folded into model-family presentation cards.
     // Unrelated/hidden routes must never acquire a sibling family's allowance.
     let mut display = usage.clone();
-    let output: Vec<(crate::quota_buckets::QuotaBucket, BTreeSet<String>)> =
-        if usage.kind == "google_subscription" {
-            let mut source_ids: HashSet<_> = visible
-                .keys()
-                .map(|index| {
-                    let bucket = primary[*index];
-                    (bucket.scope_id.clone(), bucket.id.clone())
-                })
-                .collect();
-            let mut pending: Vec<_> = source_ids.iter().cloned().collect();
-            // Resource closures may contain another observed allowance; include
-            // its constraints, not its otherwise-hidden publication membership.
-            while let Some((scope, id)) = pending.pop() {
-                for resource in usage
-                    .quota_buckets
-                    .iter()
-                    .filter(|bucket| bucket.scope_id == scope && bucket.id == id)
-                {
-                    for reference in &resource.constraint_ids {
-                        let key = (scope.clone(), reference.clone());
-                        if source_ids.insert(key.clone()) {
-                            pending.push(key);
-                        }
+    let output: Vec<(crate::quota_buckets::QuotaBucket, BTreeSet<String>)> = if usage.kind
+        == "google_subscription"
+    {
+        let mut source_ids: HashSet<_> = visible
+            .keys()
+            .map(|index| {
+                let bucket = primary[*index];
+                (bucket.scope_id.clone(), bucket.id.clone())
+            })
+            .collect();
+        let mut pending: Vec<_> = source_ids.iter().cloned().collect();
+        // Resource closures may contain another observed allowance; include
+        // its constraints, not its otherwise-hidden publication membership.
+        while let Some((scope, id)) = pending.pop() {
+            for resource in usage
+                .quota_buckets
+                .iter()
+                .filter(|bucket| bucket.scope_id == scope && bucket.id == id)
+            {
+                for reference in &resource.constraint_ids {
+                    let key = (scope.clone(), reference.clone());
+                    if source_ids.insert(key.clone()) {
+                        pending.push(key);
                     }
                 }
             }
-            let visible_scopes: HashSet<_> = visible
-                .keys()
-                .map(|index| primary[*index].scope_id.as_str())
-                .collect();
-            for global in usage.quota_buckets.iter().filter(|bucket| {
-                bucket.is_global_constraint() && visible_scopes.contains(bucket.scope_id.as_str())
-            }) {
-                source_ids.insert((global.scope_id.clone(), global.id.clone()));
-            }
-            let visible_ids: HashSet<_> = visible
-                .keys()
-                .map(|index| {
-                    let source = primary[*index];
-                    (source.scope_id.clone(), source.id.clone())
-                })
-                .collect();
-            let scoped_sources: Vec<_> = usage
-                .quota_buckets
-                .iter()
-                .filter(|bucket| source_ids.contains(&(bucket.scope_id.clone(), bucket.id.clone())))
-                .cloned()
-                .map(|mut bucket| {
-                    if bucket.is_primary()
-                        && !visible_ids.contains(&(bucket.scope_id.clone(), bucket.id.clone()))
-                    {
-                        // A referenced admission resource is not authorization
-                        // to publish its unrelated model-family membership.
-                        bucket.binding.status = "window_constraint".into();
-                    }
-                    bucket
-                })
-                .collect();
-            display.quota_buckets = google_display_buckets(&scoped_sources);
-            display
-                .quota_buckets
-                .iter()
-                .filter(|bucket| bucket.is_primary())
-                .filter_map(|bucket| {
-                    let authorized = visible
-                        .iter()
-                        .filter(|(index, _)| {
-                            let source = primary[**index];
-                            source.scope_id == bucket.scope_id
-                                && source
-                                    .models
-                                    .iter()
-                                    .any(|model| bucket.models.contains(model))
+        }
+        let visible_scopes: HashSet<_> = visible
+            .keys()
+            .map(|index| primary[*index].scope_id.as_str())
+            .collect();
+        for global in usage.quota_buckets.iter().filter(|bucket| {
+            bucket.is_global_constraint() && visible_scopes.contains(bucket.scope_id.as_str())
+        }) {
+            source_ids.insert((global.scope_id.clone(), global.id.clone()));
+        }
+        let visible_ids: HashSet<_> = visible
+            .keys()
+            .map(|index| {
+                let source = primary[*index];
+                (source.scope_id.clone(), source.id.clone())
+            })
+            .collect();
+        let scoped_sources: Vec<_> = usage
+            .quota_buckets
+            .iter()
+            .filter(|bucket| source_ids.contains(&(bucket.scope_id.clone(), bucket.id.clone())))
+            .cloned()
+            .map(|mut bucket| {
+                if bucket.is_primary()
+                    && !visible_ids.contains(&(bucket.scope_id.clone(), bucket.id.clone()))
+                {
+                    // A referenced admission resource is not authorization
+                    // to publish its unrelated model-family membership.
+                    bucket.binding.status = "window_constraint".into();
+                }
+                bucket
+            })
+            .collect();
+        display.quota_buckets =
+            google_channel_display_buckets(google_quota_channel(provider_channel), &scoped_sources);
+        display
+            .quota_buckets
+            .iter()
+            .filter(|bucket| bucket.is_primary())
+            .filter_map(|bucket| {
+                let authorized = visible
+                    .iter()
+                    .filter(|(index, _)| {
+                        let source = primary[**index];
+                        source.scope_id == bucket.scope_id
+                            && source
+                                .models
+                                .iter()
+                                .any(|model| bucket.models.contains(model))
+                    })
+                    .flat_map(|(_, visible_routes)| visible_routes.iter())
+                    .filter(|route| {
+                        routes.get(*route).is_some_and(|models| {
+                            models.iter().any(|model| bucket.models.contains(model))
                         })
-                        .flat_map(|(_, visible_routes)| visible_routes.iter())
-                        .filter(|route| {
-                            routes.get(*route).is_some_and(|models| {
-                                models.iter().any(|model| bucket.models.contains(model))
-                            })
-                        })
-                        .cloned()
-                        .collect::<BTreeSet<_>>();
-                    (!authorized.is_empty()).then(|| (bucket.clone(), authorized))
-                })
-                .collect()
-        } else {
-            visible
-                .into_iter()
-                .map(|(index, routes)| (primary[index].clone(), routes))
-                .collect()
-        };
+                    })
+                    .cloned()
+                    .collect::<BTreeSet<_>>();
+                (!authorized.is_empty()).then(|| (bucket.clone(), authorized))
+            })
+            .collect()
+    } else {
+        visible
+            .into_iter()
+            .map(|(index, routes)| (primary[index].clone(), routes))
+            .collect()
+    };
     let mut rows = Vec::new();
     for (bucket, routes) in output {
         let bucket = &bucket;
@@ -1205,6 +1213,9 @@ mod tests {
         usage.quota_buckets = vec![
             bucket("flash-high", "gemini-3.8-flash-high", false),
             bucket("flash-medium", "gemini-3.8-flash-medium", false),
+            bucket("neon", "gemini-4-neon-xhigh", false),
+            bucket("claude", "claude-sonnet-4-6", false),
+            bucket("PRIVATE-gpt", "gpt-oss-120b-medium", true),
             bucket("PRIVATE-low", "gemini-3.8-flash-low", true),
             bucket("argon-low", "gemini-4-argon-low", false),
             bucket("argon-medium", "gemini-4-argon-medium", false),
@@ -1237,12 +1248,25 @@ mod tests {
                 "argon-blocked".into(),
                 BTreeSet::from(["gemini-4-argon-high".into()]),
             ),
+            (
+                "neon".into(),
+                BTreeSet::from(["gemini-4-neon-xhigh".into()]),
+            ),
+            (
+                "third-party".into(),
+                BTreeSet::from(["claude-sonnet-4-6".into()]),
+            ),
         ]);
-        let (rows, states) = project_forwarded_entry(entry.clone(), &usage, &routes, false);
-        assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].name, "Google AI Pro · gemini-3.8-flash");
-        assert_eq!(rows[0].routes, ["flash"]);
-        assert_eq!(rows[1].routes, ["argon", "argon-blocked"]);
+        let channel = Some("antigravity");
+        let (rows, states) =
+            project_forwarded_entry(entry.clone(), &usage, &routes, false, channel);
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].name, "Google AI Pro · Gemini Models");
+        assert_eq!(rows[0].routes, ["flash", "neon"]);
+        assert_eq!(rows[1].name, "Google AI Pro · Claude and GPT");
+        assert_eq!(rows[1].routes, ["third-party"]);
+        assert_eq!(rows[2].name, "Google AI Pro · Gemini 4 Argon");
+        assert_eq!(rows[2].routes, ["argon", "argon-blocked"]);
         assert_eq!(
             alternative_scheduling(&states["flash"]).status,
             ProviderSchedulingStatus::Eligible
@@ -1260,6 +1284,7 @@ mod tests {
             "PRIVATE",
             "unrelated-model",
             "flash-low",
+            "gpt-oss-120b-medium",
             "api_price",
             "scope_id",
             "quota_buckets",
@@ -1273,9 +1298,11 @@ mod tests {
         usage
             .quota_buckets
             .retain(|bucket| !bucket.label.starts_with("PRIVATE"));
-        let (again, _) = project_forwarded_entry(entry, &usage, &routes, false);
-        assert_eq!(again[0].id, rows[0].id);
-        assert_eq!(again[1].id, rows[1].id);
+        let (again, _) = project_forwarded_entry(entry, &usage, &routes, false, channel);
+        assert_eq!(
+            again.iter().map(|row| &row.id).collect::<Vec<_>>(),
+            rows.iter().map(|row| &row.id).collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -1308,7 +1335,8 @@ mod tests {
             "only-flash".into(),
             BTreeSet::from(["gemini-3.8-flash-high".into()]),
         )]);
-        let (rows, states) = project_forwarded_entry(entry, &usage, &routes, false);
+        let (rows, states) =
+            project_forwarded_entry(entry, &usage, &routes, false, Some("gemini-cli"));
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].name, "Google · gemini-3.8-flash");
         assert_eq!(rows[0].routes, ["only-flash"]);
@@ -1352,7 +1380,8 @@ mod tests {
             "flash".into(),
             BTreeSet::from(["gemini-3.8-flash-high".into()]),
         )]);
-        let (rows, states) = project_forwarded_entry(entry, &usage, &routes, false);
+        let (rows, states) =
+            project_forwarded_entry(entry, &usage, &routes, false, Some("antigravity"));
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].status, ProviderUsageQueryStatus::Ok);
         assert!(rows[0].error.is_none());
@@ -1637,6 +1666,7 @@ mod tests {
             &usage,
             &BTreeMap::from([("visible".into(), BTreeSet::from(["unknown-backend".into()]))]),
             false,
+            None,
         );
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].status, ProviderUsageQueryStatus::Error);
@@ -1675,6 +1705,7 @@ mod tests {
                 BTreeSet::from(["flash-low".into(), "flash-high".into()]),
             )]),
             false,
+            None,
         );
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].status, ProviderUsageQueryStatus::Error);
@@ -1735,6 +1766,7 @@ mod tests {
                 ("argon".into(), BTreeSet::from(["argon".into()])),
             ]),
             true,
+            None,
         );
         assert_eq!(rows.len(), 2);
         assert!(

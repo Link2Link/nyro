@@ -48,6 +48,11 @@ function formatRelativeTime(timestamp: string, now: number, isZh: boolean): stri
   return isZh ? `${Math.floor(diff / 86400)} 天前` : `${Math.floor(diff / 86400)}d ago`;
 }
 
+function expectedQuotaPools(provider: Provider, usage?: ProviderUsage) {
+  if (usage?.kind !== "google_subscription") return undefined;
+  return provider.channel?.trim().toLowerCase() === "antigravity" ? 3 : 2;
+}
+
 function TierBar({
   tier,
   isZh,
@@ -480,7 +485,7 @@ export function ProviderUsageFooter({ provider, claudeAccount: currentClaudeAcco
         <div className="flex flex-wrap items-center gap-2 text-xs font-medium text-slate-500">
           <span>{title}</span>
           {hasBuckets && <QuotaBucketAvailability buckets={shown!.quota_buckets!} stale={Boolean(error)} isZh={isZh} now={now}
-            expectedCount={shown?.kind === "google_subscription" ? 2 : undefined} owner={shown} />}
+            expectedCount={expectedQuotaPools(provider, shown)} owner={shown} />}
           {shown?.level && (
             <span className="rounded bg-slate-100 px-1.5 py-0.5 text-[10px] font-semibold uppercase text-slate-600">
               {shown.level}
@@ -646,7 +651,7 @@ export function GroupUsageSummary({ providers }: { providers: Provider[] }) {
   const bucketMembers = tracked.flatMap((provider, i) => {
     const usage = queries[i]?.data;
     return usage && hasStructuredQuotaBuckets(usage) ? [{ provider, usage, buckets: usage.quota_buckets ?? [],
-      expectedCount: usage.kind === "google_subscription" ? 2 : undefined, failed: Boolean(queries[i]?.error) }] : [];
+      expectedCount: expectedQuotaPools(provider, usage), failed: Boolean(queries[i]?.error) }] : [];
   });
   const money = (n: number) => (Number.isFinite(n) ? n.toFixed(2) : "?");
   const detail = summary.perProvider

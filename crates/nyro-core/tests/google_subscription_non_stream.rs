@@ -223,6 +223,77 @@ async fn bind_fixture_credential(gateway: &Gateway) -> anyhow::Result<()> {
     Ok(())
 }
 
+async fn fixture_chat(gateway: &Gateway, stream: bool) -> anyhow::Result<Response> {
+    let ingress = OPENAI_COMPATIBLE_CHAT_COMPLETIONS_V1;
+    let body = json!({"model":CLIENT_MODEL,"stream":stream,"messages":[{"role":"user","content":"hello"}]});
+    let ir = ingress
+        .handler()
+        .make_request_decoder()
+        .decode_request(body.clone())?;
+    Ok(tokio::time::timeout(
+        TIMEOUT,
+        dispatch_pipeline(
+            gateway.clone(),
+            HeaderMap::new(),
+            RawEnvelope::new(
+                Some(body),
+                Default::default(),
+                "POST",
+                "/v1/chat/completions",
+            ),
+            ir,
+            ingress,
+            RequestContext::new(ingress, TIMEOUT),
+        ),
+    )
+    .await?)
+}
+
+#[test]
+fn antigravity_retry_after_reaches_client_and_scheduler_on_both_request_paths() -> anyhow::Result<()>
+{
+    for stream in [false, true] {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        listener.set_nonblocking(true)?;
+        let base = format!("http://{}", listener.local_addr()?);
+        let gw = offline_gateway("antigravity", &base)?;
+        runtime()?.block_on(async move {
+            let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let count = hits.clone();
+            let app = Router::new().fallback(move |uri: Uri| {
+                let count = count.clone();
+                async move {
+                    if uri.path() != "/v1internal:streamGenerateContent" { return StatusCode::NOT_FOUND.into_response(); }
+                    let n = count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let mut error = json!({"code":429,"status":"RESOURCE_EXHAUSTED"});
+                    if n == 0 {
+                        // The body's explicit zero wins over the conflicting HTTP wait.
+                        error["details"] = json!([{ "@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"0s" }]);
+                    }
+                    (StatusCode::TOO_MANY_REQUESTS, [("retry-after","900"),("x-secret-unrelated","fixture")],Json(json!({"error":error}))).into_response()
+                }
+            });
+            let listener = tokio::net::TcpListener::from_std(listener)?;
+            let _server = AbortOnDrop(tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); }));
+            bind_fixture_credential(&gw).await?;
+            for wait in ["0", "900"] {
+                let response = fixture_chat(&gw, stream).await?;
+                assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+                assert_eq!(response.headers()["retry-after"], wait);
+                assert!(!response.headers().contains_key("x-secret-unrelated"));
+            }
+            let blocked = fixture_chat(&gw, stream).await?;
+            assert_eq!(blocked.status(), StatusCode::SERVICE_UNAVAILABLE);
+            let remaining = blocked.headers()["retry-after"].to_str()?.parse::<u64>()?;
+            assert!((890..=900).contains(&remaining), "{remaining}");
+            assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 2);
+            assert!(gw.quota_registry.is_model_schedulable("local-subscription", "sibling"));
+            anyhow::Ok(())
+        })?;
+    }
+    Ok(())
+}
+
 fn non_stream_anthropic_subscription(channel: &str) -> anyhow::Result<()> {
     let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
     listener.set_nonblocking(true)?;
@@ -315,7 +386,7 @@ fn anthropic_non_stream_gemini_cli_uses_sse_and_aggregates_reply_and_usage() -> 
     non_stream_anthropic_subscription("gemini-cli")
 }
 
-fn stream_subscription_read_error_after_finish(channel: &str) -> anyhow::Result<()> {
+fn stream_subscription_error_after_finish(channel: &str, in_band_429: bool) -> anyhow::Result<()> {
     let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
     listener.set_nonblocking(true)?;
     let base_url = format!("http://{}", listener.local_addr()?);
@@ -333,6 +404,9 @@ fn stream_subscription_read_error_after_finish(channel: &str) -> anyhow::Result<
                     move |State(seen): State<Requests>, uri: Uri, Json(body): Json<Value>| {
                         let release_error = fixture_release.clone();
                         async move {
+                            if uri.path() != "/v1internal:streamGenerateContent" {
+                                return StatusCode::NOT_FOUND.into_response();
+                            }
                             seen.lock().unwrap().push(Seen { uri, body });
                             let first = json!({"response": {
                                 "responseId": "subscription-read-error",
@@ -351,6 +425,10 @@ fn stream_subscription_read_error_after_finish(channel: &str) -> anyhow::Result<
                                 // first write. The client must observe the payload
                                 // before the upstream transport is deliberately cut.
                                 release_error.notified().await;
+                                if in_band_429 {
+                                    let frame = json!({"error":{"code":429,"message":"fixture private error","status":"RESOURCE_EXHAUSTED","details":[{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"13s"}]}});
+                                    return Ok(bytes::Bytes::from(format!("data: {frame}\n\ndata: [DONE]\n\n")));
+                                }
                                 Err::<bytes::Bytes, _>(std::io::Error::other(
                                     "fixture read failure",
                                 ))
@@ -385,7 +463,7 @@ fn stream_subscription_read_error_after_finish(channel: &str) -> anyhow::Result<
         let response = tokio::time::timeout(
             TIMEOUT,
             dispatch_pipeline(
-                gateway,
+                gateway.clone(),
                 HeaderMap::new(),
                 RawEnvelope::new(
                     Some(body),
@@ -426,7 +504,8 @@ fn stream_subscription_read_error_after_finish(channel: &str) -> anyhow::Result<
         })
         .await??;
         let wire = String::from_utf8(wire)?;
-        assert!(wire.contains("upstream_read_error"), "{channel}: {wire}");
+        let expected_type = if in_band_429 { "rate_limit_error" } else { "upstream_read_error" };
+        assert!(wire.contains(expected_type), "{channel}: {wire}");
         assert!(!wire.contains("[DONE]"), "{channel}: {wire}");
         let events: Vec<Value> = wire
             .lines()
@@ -444,7 +523,12 @@ fn stream_subscription_read_error_after_finish(channel: &str) -> anyhow::Result<
             .filter(|event| event.get("error").is_some())
             .collect();
         assert_eq!(errors.len(), 1, "{events:?}");
-        assert_eq!(errors[0]["error"]["type"], "upstream_read_error");
+        assert_eq!(errors[0]["error"]["type"], expected_type);
+        if in_band_429 {
+            assert_eq!(errors[0]["error"]["code"], 429);
+            assert!(!wire.contains("fixture private error"));
+            assert!(!gateway.quota_registry.is_model_schedulable("local-subscription", UPSTREAM_MODEL));
+        }
         assert!(
             !wire.contains("fixture read failure"),
             "raw upstream details must stay private"
@@ -464,11 +548,11 @@ fn stream_subscription_read_error_after_finish(channel: &str) -> anyhow::Result<
         assert!(row.performance.completed_at.is_none(), "{row:?}");
         assert_eq!(
             row.diagnostic.failure_kind.as_deref(),
-            Some("upstream_read_error")
+            Some(if in_band_429 { "upstream_error" } else { "upstream_read_error" })
         );
         assert_eq!(
             row.diagnostic.failure_stage.as_deref(),
-            Some("upstream_read")
+            Some(if in_band_429 { "upstream_response" } else { "upstream_read" })
         );
         assert_eq!(
             row.diagnostic
@@ -497,12 +581,58 @@ fn stream_subscription_read_error_after_finish(channel: &str) -> anyhow::Result<
 
 #[test]
 fn openai_stream_antigravity_read_error_after_finish_is_not_success() -> anyhow::Result<()> {
-    stream_subscription_read_error_after_finish("antigravity")
+    stream_subscription_error_after_finish("antigravity", false)
 }
 
 #[test]
 fn openai_stream_gemini_cli_read_error_after_finish_is_not_success() -> anyhow::Result<()> {
-    stream_subscription_read_error_after_finish("gemini-cli")
+    stream_subscription_error_after_finish("gemini-cli", false)
+}
+
+#[test]
+fn antigravity_429_after_delivered_content_cools_only_that_model_and_never_replays()
+-> anyhow::Result<()> {
+    stream_subscription_error_after_finish("antigravity", true)
+}
+
+#[test]
+fn antigravity_in_band_forbidden_before_output_returns_403_on_both_paths() -> anyhow::Result<()> {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+    listener.set_nonblocking(true)?;
+    let base = format!("http://{}", listener.local_addr()?);
+    let gateway = offline_gateway("antigravity", &base)?;
+    runtime()?.block_on(async move {
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = hits.clone();
+        let app = Router::new().fallback(move |uri: Uri| {
+            let count = count.clone();
+            async move {
+                assert_eq!(uri.path(), "/v1internal:streamGenerateContent");
+                count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let err = json!({"error":{"code":403,"message":"private details"}});
+                // EOF tail without a blank line exercises the final decoder flush.
+                (
+                    [("content-type", "text/event-stream")],
+                    format!("data: {err}"),
+                )
+            }
+        });
+        let listener = tokio::net::TcpListener::from_std(listener)?;
+        let _server = AbortOnDrop(tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap()
+        }));
+        bind_fixture_credential(&gateway).await?;
+        for stream in [false, true] {
+            let response = fixture_chat(&gateway, stream).await?;
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+            let bytes = to_bytes(response.into_body(), 1024 * 1024).await?;
+            let error = serde_json::from_slice::<Value>(&bytes)?;
+            assert_eq!(error["error"]["code"], 403);
+            assert!(!error.to_string().contains("private details"));
+        }
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 2);
+        Ok(())
+    })
 }
 
 async fn capture_relay_probe(

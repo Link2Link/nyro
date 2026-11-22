@@ -10,23 +10,29 @@
 
 运行身份/fence/实时资源映射（`quota_bucket_owner.*`、`quota_bucket_fence.*`、`quota_buckets.*`）明确不导出配置备份，导入时也跳过。恢复后的供应商须重新发现并绑定，不能把旧账号额度身份带到新配置。永久日 Token 台账不变。桶详情使用单 SQL 元数据游标聚合；分页日志仍走兼容元数据后过滤路径，高并发下可进一步优化为 snapshot/keyset 保证一致性。
 
-## Google 双模型族展示
+## Google 订阅用量池展示
 
-用量视图只折叠已确认的 `gemini-4-hydrogen`、`gemini-3.8-flash`、`gemini-4-argon` 三个模型族，每个权益作用域至多两张额度池卡片。基础 ID 及精确的 `-extra-low`、`-low`、`-medium`、`-high`、`-xhigh`、`-tiered` 后缀归入对应卡片，各档位不单独成卡。未知后缀、近似型号和其他模型不猜入任何模型族；缺少观察时保持未知，不补造 0% 或免费容量。
+Antigravity 按账号和项目展示最多三张卡，顺序与上游一致：
 
-Gemini 4 Hydrogen 与 Gemini 3.8 Flash 共用同一个 “Gemini Models” 额度池（`gemini-5h` / `gemini-weekly`）：2026-11-15 用 Google AI Pro 账号实测，Hydrogen 调用消耗该池，Argon 专用周额度只随 Argon 调用变化。账号目录中存在 Hydrogen 档位时，该共享池卡片标为 `gemini-4-hydrogen`，否则标为 `gemini-3.8-flash`（未开通 Gemini 4 的账号只列出 `<族>-disabled` 占位，不会形成卡片）。卡片沿用历史不透明 ID（池键 `gemini-3.8-flash`），改名不会改变已发布用量条目或已保留请求的归属。
+| 用量池 | 共享额度的模型 | 上游报告的窗口 |
+| --- | --- | --- |
+| Gemini Models | Gemini 4 Neon、Gemini 4 Hydrogen、Gemini 3.8 Flash | 五小时、每周 |
+| Claude and GPT | 目录中的 Claude 和 GPT 模型，包括 GPT-OSS | 五小时、每周 |
+| Gemini 4 Argon | 仅 Gemini 4 Argon | 自己的周额度 |
+
+只展示实际观察到的池和窗口。收到已识别的额度摘要、但未发现成员模型时，仍显示窗口读数，绑定保持待确认；仅有模型目录读数时不推断周期。改名不改变历史 ID：Gemini Models 沿用池键 `gemini-3.8-flash`，Argon 沿用 `gemini-4-argon`。Gemini CLI 保留现有模型族展示。
 
 这是标记为 `google_family_display_v1` 的核心只读展示投影，不是新配额绑定。注册表、转发缓存、配置编辑器、强制 fence 和不可变 attempt 归属仍保留原始模型/资源证据。结构化管理响应在原始桶计价**之后**投影，原始 ID 保留为非卡片资源。合成模型族 ID 不能用于保留日志筛选，来源详情链接使用原始 bucket + scope。前端不自行归族或合价，模型和诊断信息默认折叠；非 Google 展示不变。
 
-同窗口使用率取保守最大值，绝不求和；不同 reset 不借用某一来源的时间，族级 reset 保持未知。累计金额每个作用域来源分区只计一次，跨两族的混合来源仅按已有精确模型计价明细拆分。多来源或混合模型族无法证明同一统计周期时，本周期金额/容量保持未知；有效的单来源周期保留三项金额。供应商总计和未归属/历史记录不会复制到两张卡，也不按今日分组重分历史。
+同窗口使用率取保守最大值，绝不求和；不同 reset 不借用某一来源的时间，族级 reset 保持未知。累计金额每个作用域来源分区只计一次，跨池的混合来源仅按已有精确模型计价明细拆分。多来源或混合模型族无法证明同一统计周期时，本周期金额/容量保持未知；有效的单来源周期保留三项金额。供应商总计和未归属/历史记录不会复制到各池卡，也不按今日分组重分历史。
 
-批量发布复用这两个模型族，其他原始诊断留在结构化视图；最新目录观察明确标为“用量已更新 / 配额绑定待确认”，不作为健康独立供应商；缺失或旧观察仍为未知。代理转发先按原始桶判断**获授权的精确路由**，最后只折叠可见输出；独立的路由准入状态、隐藏兄弟模型与管理金额脱敏不变。本次展示调整不声称新增超出原始证据的跨档位准入或耗尽联动。
+批量发布复用实际观察到的池，其他原始诊断留在结构化视图；最新目录观察明确标为“用量已更新 / 配额绑定待确认”，不作为健康独立供应商；缺失或旧观察仍为未知。代理转发先按原始桶判断**获授权的精确路由**，最后只折叠可见输出；独立的路由准入状态、隐藏兄弟模型与管理金额脱敏不变。本次展示调整不声称新增超出原始证据的跨档位准入或耗尽联动。
 
 ## Google 查询结果与已验证资源关联
 
 用量请求成功与调度绑定已解析是两件事。最新且数值有效的模型目录观察以 `status=ok` 发布，保留 `catalog` 用量条，界面显示**用量已更新 / 配额绑定待确认**；不把它变成绿色准入证据、固定周期或容量估算。旧数据、无效/缺失观察和认证失败仍明确显示失败或未知。发布的 error 行不再携带成功 `usage` 载荷；已确认额度耗尽属于“查询成功，但调度暂停”，不当作上游查询故障。
 
-Google 订阅适配器使用精确的 `gemini-5h`、`gemini-weekly` 资源 ID 关联已发现的 Flash 3.8 与 Gemini 4 Hydrogen 档位（同一共享池），使用完整的 `Gemini 4 Argon` 模型族标签及受支持窗口标签关联已发现的 Argon 档位。这是带版本的关联规则，不按通用标签、相同比例或 reset 推测；`3p-5h`、`3p-weekly` 不关联第一方模型。已有官方显式选择器及目录资源引用保持优先，矛盾或结构错误保持冲突。没有额外证据时，不把 Gemini 共享池附加到 Argon 专用额度；未知资源仍未绑定，不当作免费或无限额度。
+适配器优先使用官方显式模型选择器和目录资源引用。Antigravity 的 `gemini-5h` / `gemini-weekly` 属于 Gemini Models；`3p-5h` / `3p-weekly` 属于 Claude and GPT。完整池名（包括上游的 “Claude and GPT models”）可用于识别对应窗口，“Weekly Limit Remaining” 等通用窗口标签不能证明模型归属。只绑定已发现的精确模型 ID；矛盾证据不产生健康绑定，Argon 不继承其他池的窗口。
 
 观察到的 `5h` / 标准五小时别名用于节奏和周期计算时统一规范化；原始资源 hash 仍保留修复前窗口分量，恢复同 owner 的 Google fence 后，先规范已知 tier 别名再合并。因此显式资源引用和已耗尽 fence 不失效，只有同一资源的新鲜有效观察才能证明恢复；旧、无效或更早观察不会清除耗尽。本地代码改动无需 SQL 迁移或线上配置写入。
 
@@ -91,7 +97,7 @@ Google 订阅适配器使用精确的 `gemini-5h`、`gemini-weekly` 资源 ID �
 3. 操作员显式绑定发现的资源 ID 与精确模型选择器；显示来源、生效时间和版本，拒绝冲突的主要统计归属。
 4. 无法确定时标记未解析，分别保留原始观察；不能伪造共享关系。
 
-**严禁仅凭相同剩余比例、相同 reset、宽泛 `gemini-*` 前缀、displayName 子串或价格匹配器认定调度绑定共享。** Flash 档位有证据共享时可绑定；Argon 的 bare/tier 名称仍保留实际调用/准入语义。上方双模型族白名单仅折叠只读用量卡片，不作全局后缀剥除或改写原始绑定。
+**严禁仅凭相同剩余比例、相同 reset、宽泛 `gemini-*` 前缀、displayName 子串或价格匹配器认定调度绑定共享。** Flash 档位有证据共享时可绑定；Argon 的 bare/tier 名称仍保留实际调用/准入语义。上方用量池投影仅折叠只读用量卡片，不作全局后缀剥除或改写原始绑定。
 
 本文依据用户确认的 Flash/Argon 独立关系设计，未连接线上获取官方桶 ID，也不假装现有 DTO 已能自动证明模型绑定。实施前先取得脱敏目录/summary 样本：若官方响应只有通用标签，首版使用显式可审计绑定；未绑定的桶仍可展示，但不参加错误的模型级额度推算。
 
@@ -215,15 +221,18 @@ weight = clamp(r)^3 × 原有窗口易过期加成
 ```text
 Google AI Pro                         部分模型可用
 
-Gemini Flash                         额度耗尽
+Gemini Models                         额度耗尽
   五小时    [██████████] 100%        重置 18:00
   每周      [██████░░░░]  60%        重置 周四
   保留请求 / Token：……
   累计 API 价格 $A   本周期 $B   周期容量 ≈ $C
-  适用：gemini-3.8-flash 及已确认共享档位
+  适用：Gemini 4 Neon、Hydrogen 和 Gemini 3.8 Flash
 
-Gemini Argon                         可调度
+Claude and GPT                       可调度
   五小时    [██░░░░░░░░]  20%        重置 20:00
+  每周      [█░░░░░░░░░]  10%        重置 周日
+
+Gemini 4 Argon                       可调度
   每周      [███░░░░░░░]  30%        重置 周六
   保留请求 / Token：……
   累计 API 价格 $D   本周期 $E   周期容量 ≈ $F
@@ -237,14 +246,15 @@ Gemini Argon                         可调度
 
 ## 九、对外发布：每个桶表现为独立供应商
 
-这是已确认的展示要求：Nyro 自有管理页保持“一供应商内两个子卡”；DSH 等外部用量消费者获得两个普通供应商条目：
+Nyro 管理页在同一供应商下显示实际观察到的额度池，DSH 等外部用量消费者看到每池一个只读条目，例如：
 
 ```text
-Google AI Pro Year · Flash
-  5小时  100%    每周 60%    额度耗尽
-
-Google AI Pro Year · Argon
-  5小时   18%    每周 30%    可调度
+Google AI Pro Year · Gemini Models
+  5小时 100%    每周 60%    额度耗尽
+Google AI Pro Year · Claude and GPT
+  5小时  20%    每周 10%    可调度
+Google AI Pro Year · Gemini 4 Argon
+               每周 30%    可调度
 ```
 
 这些是 **Published Usage Entry / 已发布用量条目**，不创建真实 Provider、不复制凭据、不增加路由目的地或额度容量。
@@ -262,7 +272,7 @@ Google AI Pro Year · Argon
 
 | 接口 | 返回约定 |
 | --- | --- |
-| `GET /api/v1/providers/usage`（默认，或 `?view=buckets`） | 维持 `{data:[...]}` 包装；多桶供应商展开成多个只读用量供应商行。现有 DSH 无需理解嵌套桶即可显示两张卡。 |
+| `GET /api/v1/providers/usage`（默认，或 `?view=buckets`） | 维持 `{data:[...]}` 包装；多桶供应商展开成多个只读用量供应商行。现有 DSH 无需理解嵌套桶即可显示各池卡片。 |
 | `GET /api/v1/providers/usage?view=providers` | 保留真实 provider 行与嵌套 `quota_buckets`；Nyro Web 管理在同一版显式请求该视图。 |
 | `GET /api/v1/providers/:id/usage` | 只接受真实 provider ID，返回结构化父供应商和桶。 |
 | core `list_provider_usage` / Tauri command | 仍以真实供应商为单位；HTTP 外部投影在独立服务/辅助层完成，不改内部路由身份。 |

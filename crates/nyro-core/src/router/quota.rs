@@ -707,6 +707,36 @@ impl ProviderQuotaRegistry {
         fence: Option<&BucketRefreshFence>,
     ) -> Option<ProviderScheduling> {
         let delay = Duration::from_secs(retry_after_secs.unwrap_or(30).clamp(1, 300));
+        self.record_model_wait(provider_id, model, delay, fence)
+    }
+
+    /// An explicit upstream reset is stronger evidence than a generic short
+    /// throttle. Bound hostile input to one weekly subscription window.
+    pub(crate) fn record_upstream_wait_fenced(
+        &self,
+        provider_id: &str,
+        model: &str,
+        seconds: u64,
+        fence: &BucketRefreshFence,
+    ) -> Option<ProviderScheduling> {
+        if seconds == 0 {
+            return None;
+        }
+        self.record_model_wait(
+            provider_id,
+            model,
+            Duration::from_secs(seconds.min(7 * 24 * 60 * 60)),
+            Some(fence),
+        )
+    }
+
+    fn record_model_wait(
+        &self,
+        provider_id: &str,
+        model: &str,
+        delay: Duration,
+        fence: Option<&BucketRefreshFence>,
+    ) -> Option<ProviderScheduling> {
         let mut scoped = self.scoped.write().unwrap();
         let state = scoped.entry(provider_id.to_owned()).or_default();
         if fence.is_some_and(|fence| fence.0 != state.generation) {

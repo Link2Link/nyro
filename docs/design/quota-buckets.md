@@ -11,25 +11,17 @@ Google raw structured denial-to-summary constraint identifiers have not been est
 Live owner/fence/resource mappings (`quota_bucket_owner.*`, `quota_bucket_fence.*`, `quota_buckets.*`) are intentionally excluded from configuration export and ignored on import. Restored providers must rediscover and explicitly rebind live resources; copied identifiers cannot transfer quota or owner state. The existing permanent daily usage ledger is unchanged. Filtered detail aggregation uses one scalar SQL cursor; filtered paginated logs remain a metadata postfilter compatibility path and may need snapshot/keyset optimization for high-traffic consistency.
 
 
-## Google two-family presentation
+## Google subscription pool presentation
 
-The usage view folds only the confirmed `gemini-4-hydrogen`, `gemini-3.8-flash`
-and `gemini-4-argon` families into at most two pool cards per entitlement scope.
-Bare IDs and the exact `-extra-low`, `-low`, `-medium`, `-high`, `-xhigh` and
-`-tiered` suffixes belong to their corresponding card; tier variants are not
-separate cards. Unknown suffixes, lookalike model names and other models are not
-guessed into any family; missing observations are unknown, not manufactured 0% /
-free capacity.
+Antigravity shows up to three cards per account and project, in this order:
 
-Gemini 4 Hydrogen and Gemini 3.8 Flash draw from the same "Gemini Models"
-allowance (`gemini-5h` / `gemini-weekly`): on 2026-11-15, Hydrogen calls from a
-Google AI Pro account drew that pool down while Argon's dedicated weekly bucket
-moved only with Argon calls. Their shared card is labelled `gemini-4-hydrogen`
-whenever the account's discovery serves a Hydrogen tier, otherwise
-`gemini-3.8-flash` (accounts outside the Gemini 4 plan only list
-`<family>-disabled` placeholders, which never form a card). The card keeps its
-historical opaque identity (pool key `gemini-3.8-flash`), so the relabel does not
-re-key published usage entries or retained attempt attribution.
+| Pool | Models sharing the allowance | Reported windows |
+| --- | --- | --- |
+| Gemini Models | Gemini 4 Neon, Gemini 4 Hydrogen and Gemini 3.8 Flash | Five-hour and weekly |
+| Claude and GPT | Discovered Claude and GPT models, including GPT-OSS | Five-hour and weekly |
+| Gemini 4 Argon | Gemini 4 Argon only | Its own reported weekly window |
+
+Show only observed pools and windows. An identified summary window can be shown even if discovery returns no members; the reading does not authorize a route. Catalog-only observations have unknown duration. Labels are independent of opaque IDs: the Gemini Models card keeps its historical pool key `gemini-3.8-flash`, and Argon keeps `gemini-4-argon`. Gemini CLI retains its existing family cards.
 
 This is a read-only core projection marked `google_family_display_v1`, not a new
 quota binding. Raw model/resource observations remain unchanged in the registry,
@@ -42,14 +34,14 @@ metadata collapsed by default. Non-Google presentation is unchanged.
 
 Utilization is a conservative maximum per observed window, never a sum. Different
 reset times lose their group reset rather than borrowing one source's timestamp.
-Retained prices count each scoped source partition once; a source covering both
-families is split only by its existing exact-model price breakdown. Multi-source
+Retained prices count each scoped source partition once; a source covering several
+pools is split only by its existing exact-model price breakdown. Multi-source
 or mixed-family current-cycle prices/capacity remain unknown when they cannot be
 proved to share the same accounting interval; a valid single-source cycle retains
 its three figures. Provider grand totals and unassigned/retired history are not
-copied into both cards or retroactively reassigned.
+copied into multiple cards or retroactively reassigned.
 
-Bulk publication uses these same two families and leaves unrelated raw diagnostics
+Bulk publication uses the same observed pools and leaves unrelated raw diagnostics
 in the structured view. Fresh catalog-only family observations are explicitly
 **Usage updated / Quota binding pending**, not healthy independent suppliers;
 missing or stale observations remain unknown. Proxy forwarding first evaluates each
@@ -69,17 +61,7 @@ explicit failures/unknowns. Published error rows omit `usage`; they no longer
 combine `status=error` with a successful observation payload. Known exhaustion
 is a successful query with a separate blocked scheduling decision.
 
-The Google subscription adapter recognizes the exact `gemini-5h` and
-`gemini-weekly` resource IDs for discovered Flash 3.8 and Gemini 4 Hydrogen wire
-variants (one shared pool), and exact
-`Gemini 4 Argon` family labels (including their supported window labels) for
-discovered Argon variants. These are versioned association rules, not generic
-label/percentage/reset matching; `3p-5h` / `3p-weekly` never bind first-party
-families. Existing explicit official selectors and catalog resource references
-retain precedence; contradictory or malformed selectors stay conflicts.
-Argon's dedicated allowance is not assigned extra Gemini-pool constraints without
-separate evidence. Unknown resources remain unbound rather than becoming free
-or unlimited quota.
+The adapter first honors explicit model selectors and catalog resource references. For Antigravity, `gemini-5h` / `gemini-weekly` identify the shared Gemini pool, and `3p-5h` / `3p-weekly` identify the Claude and GPT pool. Exact pool names (including the upstream spelling “Claude and GPT models”) identify supported windows; generic labels such as “Weekly Limit Remaining” do not establish membership. Associations expand only to discovered wire IDs. Conflicting associations cannot make a healthy binding, and Argon never inherits another pool's window.
 
 Observed `5h` / canonical five-hour aliases are normalized for pacing and period
 selection. The raw resource hash keeps its pre-fix window component, and restored
@@ -145,7 +127,7 @@ PreparedAdmission(logical_model, backend_model, wire_model, owner, credential_ge
 QuotaEvaluation(eligible | exhausted | unknown, blockers[], reserve, freshness, score?)
 ```
 
-`model_binding` uses exact discovered wire IDs and explicitly supported aliases. Quota identity, public model identity and API-price identity are different mappings. For example, Flash effort variants may be mapped to one verified allowance while pricing still uses their correct reference model. Argon's callable bare/tier identities remain exact for admission; the two-family presentation whitelist above only collapses their read-only usage cards and does not rewrite bindings.
+`model_binding` uses exact discovered wire IDs and explicitly supported aliases. Quota identity, public model identity and API-price identity are different mappings. For example, Flash effort variants may be mapped to one verified allowance while pricing still uses their correct reference model. Argon's callable bare/tier identities remain exact for admission; the usage projection above only collapses their read-only usage cards and does not rewrite bindings.
 
 Bucket IDs are opaque, stable within their scoped lifetime, and never derived from utilization/reset timestamps or mutable display labels. Raw account/project IDs and email addresses are not exposed as public bucket IDs. Known incompatible entitlement changes create a new scoped identity; renamed labels do not.
 
@@ -263,7 +245,7 @@ Add optional `quota_buckets` and model-aware scheduling detail to the shared cor
 
 Example is illustrative and not a live observation. Include source observations/quality and independently timestamped windows in the actual contract. `models` denotes a resolved binding, not a loosely inferred family membership. Backend labels/defaults are English with explicit Chinese UI translations.
 
-Keep one Provider card, with at most two observed family subcards per scope (`gemini-3.8-flash` / `gemini-4-argon`). Missing families are not fabricated. Model/resource metadata and exact price breakdowns are collapsed diagnostics rather than extra cards. Each observed family shows:
+Keep one Provider card, with up to three observed Antigravity pool cards per scope. Missing families are not fabricated. Model/resource metadata and exact price breakdowns are collapsed diagnostics rather than extra cards. Each observed family shows:
 
 - bound models, source/binding status and individual scheduling state;
 - its own five-hour/weekly bars, reset timestamps, stale/unknown warnings;
@@ -274,7 +256,7 @@ Provider header shows available/partially available/exhausted/unknown summary wi
 
 ### External usage projection: one bucket, one provider entry
 
-Confirmed operator requirement: external consumers must see Flash and Argon as two separate provider cards, never several indistinguishable `five_hour`/`weekly_limit` rows inside one card. This is a **Published Usage Entry**, not an extra configured Provider.
+Confirmed operator requirement: external consumers must see a separate usage card for each observed pool, never several indistinguishable `five_hour`/`weekly_limit` rows inside one card. This is a **Published Usage Entry**, not an extra configured Provider.
 
 Source audit of the active local DSH plugin confirms both paths matter:
 
@@ -297,7 +279,7 @@ The default bulk change is a deliberate enumeration-contract change, not merely 
 
 #### Identity and field rules
 
-- Example names: `Google AI Pro Year · Flash`, `Google AI Pro Year · Argon`. Put the model distinction in the title, not hidden in repeated tier labels. Keep `kind = google_subscription`, site/level and standard tier names unchanged.
+- Example names: `Google AI Pro Year · Gemini Models`, `Google AI Pro Year · Claude and GPT`, `Google AI Pro Year · Gemini 4 Argon`. Put the model distinction in the title, not hidden in repeated tier labels. Keep `kind = google_subscription`, site/level and standard tier names unchanged.
 - Every expanded entry has a stable unique opaque published ID scoped to source instance + real provider + owner/bucket identity. Never use array position, utilization, reset time or display name as identity. IDs remain stable across label/reset/token refresh; changed entitlement scope gets a new ID. For the admin bulk row, `provider_id` and `usage.provider_id` are the same published ID; the nested proxy row's `id` and `usage.provider_id` likewise agree. IDs are display/read-only, not accepted for provider mutations.
 - Add typed provenance, e.g. `usage_entry: {kind: quota_bucket, source_provider_ref, bucket_ref}`. Admin-only provenance can link to a real provider; proxy provenance is namespaced/opaque and contains no account/project identity. Clients must not regroup rows by the parent reference or display name. Plugin keys already include instance/relay context; preserve that rather than colliding same names across instances.
 - For a multi-bucket provider, replace its aggregate quota row with the bucket rows in that usage view; do **not** emit the aggregate parent plus both children. Do not split each thinking variant or each time window into another provider. Unchanged single-bucket vendors retain the legacy ID/name/row; once a provider uses bucket projection, an existing bucket keeps its published ID even if only one remains visible later.

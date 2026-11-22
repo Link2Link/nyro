@@ -28,7 +28,8 @@ function bucketState(bucket: QuotaBucket, stale: boolean, ownerUnavailable = fal
   if (ownerUnavailable || accountUnavailable(bucket.scheduling?.reason)) return "unavailable";
   if (bucket.scheduling?.status === "quota_exhausted") return "exhausted";
   if (stale) return "unknown";
-  if (isGoogleFamilyDisplayBucket(bucket) && bucket.binding.status === "unresolved" && bucket.models.length > 0
+  if (isGoogleFamilyDisplayBucket(bucket) && bucket.binding.status === "unresolved"
+    && (bucket.models.length > 0 || (bucket.constraint_ids.length > 0 && bucket.tiers.some((tier) => ["five_hour", "weekly_limit"].includes(tier.name))))
     && bucket.scheduling?.status === "eligible" && ["", "unknown_mapping", "unresolved_binding"].includes(bucket.scheduling.reason ?? "")
     && bucket.tiers.length > 0 && bucket.tiers.every((tier) => Number.isFinite(tier.used_percent)
       && tier.used_percent >= 0 && tier.used_percent <= 100)) return "observed";

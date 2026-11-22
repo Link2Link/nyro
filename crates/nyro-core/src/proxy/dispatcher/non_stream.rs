@@ -124,7 +124,12 @@ pub(super) async fn handle_non_stream(
         )
             .into_response();
         response.headers_mut().extend(response_metadata);
-        super::mark_upstream_error(&mut response, status, &resp);
+        super::mark_upstream_error(
+            &mut response,
+            status,
+            &resp,
+            super::antigravity_header_delay(call_ctx.provider, status, &upstream_headers),
+        );
         return response;
     }
 
@@ -1296,6 +1301,8 @@ pub(super) async fn handle_non_stream_via_upstream_stream(
     let upstream_hdrs_str = headers_to_json(resp.headers());
 
     if status >= 400 {
+        let retry_after =
+            super::antigravity_header_delay(call_ctx.provider, status, resp.headers());
         let err_body: Value = resp
             .json()
             .await
@@ -1317,7 +1324,7 @@ pub(super) async fn handle_non_stream_via_upstream_stream(
             Json(&err_body),
         )
             .into_response();
-        super::mark_upstream_error(&mut response, status, &err_body);
+        super::mark_upstream_error(&mut response, status, &err_body, retry_after);
         return response;
     }
 
@@ -1371,6 +1378,23 @@ pub(super) async fn handle_non_stream_via_upstream_stream(
         let ai_deltas = match super::streaming::validate_decoded_batch(decoded) {
             Ok(deltas) => deltas,
             Err(error) => {
+                if let Some(frame) = super::streaming::upstream_status_frame(&error) {
+                    if let Some(attempt) = &call_ctx.performance {
+                        attempt.record_failure(
+                            "failed",
+                            "upstream_error",
+                            "upstream_response",
+                            frame,
+                        );
+                    }
+                    log.status(frame.status_code.unwrap_or(502))
+                        .upstream_status(status as i32)
+                        .error(frame.message.clone())
+                        .with_upstream_request(upstream_req_hdrs_str, upstream_req_body_str)
+                        .upstream_resp_headers(upstream_hdrs_str)
+                        .emit();
+                    return super::streaming::frame_response(frame);
+                }
                 if let Some(attempt) = &call_ctx.performance {
                     attempt.record_failure(
                         "failed",
@@ -1410,6 +1434,18 @@ pub(super) async fn handle_non_stream_via_upstream_stream(
     let ai_deltas = match super::streaming::validate_decoded_batch(decoded) {
         Ok(deltas) => deltas,
         Err(error) => {
+            if let Some(frame) = super::streaming::upstream_status_frame(&error) {
+                if let Some(attempt) = &call_ctx.performance {
+                    attempt.record_failure("failed", "upstream_error", "upstream_response", frame);
+                }
+                log.status(frame.status_code.unwrap_or(502))
+                    .upstream_status(status as i32)
+                    .error(frame.message.clone())
+                    .with_upstream_request(upstream_req_hdrs_str, upstream_req_body_str)
+                    .upstream_resp_headers(upstream_hdrs_str)
+                    .emit();
+                return super::streaming::frame_response(frame);
+            }
             if let Some(attempt) = &call_ctx.performance {
                 attempt.record_failure(
                     "failed",

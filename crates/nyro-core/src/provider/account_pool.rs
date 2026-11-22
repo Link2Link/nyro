@@ -650,7 +650,12 @@ impl AccountPoolRegistry {
 /// Only explicit session identity is sticky; no prompt hashing, token keys or
 /// shared anonymous pseudo-session. Bound untrusted identifiers before hashing.
 pub(crate) fn logical_session(request: &AiRequest) -> Option<String> {
-    let raw = request.meta.raw.as_ref()?;
+    logical_session_from_envelope(request.meta.raw.as_ref()?)
+}
+
+pub(crate) fn logical_session_from_envelope(
+    raw: &crate::protocol::ir::RawEnvelope,
+) -> Option<String> {
     let bounded = |id: &str| {
         let id = id.trim();
         (!id.is_empty() && id.len() <= 4096).then(|| id.to_owned())

@@ -133,7 +133,7 @@ fn bounded_integer(value: &str, maximum: u64) -> Option<i64> {
     Some(value.parse::<u64>().unwrap_or(u64::MAX).min(maximum) as i64)
 }
 
-fn http_date(value: &str) -> Option<DateTime<Utc>> {
+pub(crate) fn http_date(value: &str) -> Option<DateTime<Utc>> {
     DateTime::parse_from_rfc2822(value)
         .ok()
         .map(|date| date.with_timezone(&Utc))

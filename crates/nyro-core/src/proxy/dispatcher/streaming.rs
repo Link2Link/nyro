@@ -39,6 +39,35 @@ pub(super) fn validate_decoded_batch(
     Ok(deltas)
 }
 
+/// Explicit upstream status frames differ from malformed JSON and transport
+/// EOF. Keep the upstream evidence internal; never echo its body in a stream.
+pub(super) fn upstream_status_frame(
+    error: &anyhow::Error,
+) -> Option<&crate::protocol::ir::error::AiError> {
+    let frame = error.downcast_ref::<crate::protocol::ir::error::AiError>()?;
+    frame.status_code.filter(|s| (400..=599).contains(s))?;
+    frame.raw.as_ref()?.get("error")?;
+    Some(frame)
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct InBandUpstreamFailure;
+
+pub(super) fn frame_response(
+    frame: &crate::protocol::ir::error::AiError,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let code = frame.status_code.unwrap_or(502);
+    let status =
+        axum::http::StatusCode::from_u16(code).unwrap_or(axum::http::StatusCode::BAD_GATEWAY);
+    let mut response = (status, axum::Json(serde_json::json!({"error":{"code":code,"type":frame.kind.to_string(),"message":frame.message}}))).into_response();
+    if let Some(raw) = &frame.raw {
+        super::mark_upstream_error(&mut response, code, raw, None);
+    }
+    response.extensions_mut().insert(InBandUpstreamFailure);
+    response
+}
+
 /// Native sources emit `Done` only after wire verification, but the worker may
 /// still report a trailing transport failure. Hold the terminal out of the
 /// formatter/tool bridge until source EOF; otherwise those consumers can emit a

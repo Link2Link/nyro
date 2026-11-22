@@ -444,19 +444,24 @@ fn google_display_prices_split_mixed_exact_models_without_reassigning_raw_histor
 }
 
 #[test]
-fn google_display_prices_keep_hydrogen_and_flash_in_their_shared_pool() {
-    use crate::quota_buckets::{google_display_buckets, is_google_display_bucket};
+fn google_antigravity_prices_count_each_exact_model_in_one_pool() {
+    use crate::auth::drivers::GoogleSubscriptionChannel::Antigravity;
+    use crate::quota_buckets::{google_channel_display_buckets, is_google_display_bucket};
     let now = ms("2026-11-15T22:00:00+08:00");
     let reset = "2026-11-16T03:00:00+08:00";
     let mut raw = bucket("immutable-mixed", "owner", now, reset);
-    raw.models = vec![
-        "gemini-3.8-flash-high".into(),
-        "gemini-4-argon-low".into(),
-        "gemini-4-hydrogen-high".into(),
+    let charges = [
+        ("gemini-3.8-flash-high", 10.0),
+        ("gemini-4-argon-low", 20.0),
+        ("gemini-4-hydrogen-high", 15.0),
+        ("gemini-4-neon-low", 5.0),
+        ("claude-sonnet-4-6", 8.0),
+        ("gpt-oss-120b-medium", 2.0),
     ];
+    raw.models = charges.iter().map(|(id, _)| (*id).to_string()).collect();
     let mut stats = ProviderApiPriceStats {
-        all_time: totals(45.0, 3, 0),
-        period: Some(totals(45.0, 3, 0)),
+        all_time: totals(60.0, 6, 0),
+        period: Some(totals(60.0, 6, 0)),
         period_start: Some(now - 1),
         period_end: Some(ms(reset)),
         period_tier: Some("five_hour".into()),
@@ -471,11 +476,7 @@ fn google_display_prices_keep_hydrogen_and_flash_in_their_shared_pool() {
         retained_buckets: Vec::new(),
         models: vec![],
     };
-    for (model, cost) in [
-        ("gemini-3.8-flash-high", 10.0),
-        ("gemini-4-argon-low", 20.0),
-        ("gemini-4-hydrogen-high", 15.0),
-    ] {
+    for (model, cost) in charges {
         stats.models.push(QuotaModelPriceStats {
             model: model.into(),
             all_time: totals(cost, 1, 0),
@@ -483,37 +484,23 @@ fn google_display_prices_keep_hydrogen_and_flash_in_their_shared_pool() {
         });
     }
     raw.api_price = Some(stats);
-    let projected = google_display_buckets(std::slice::from_ref(&raw));
+    let projected = google_channel_display_buckets(Antigravity, std::slice::from_ref(&raw));
     let cards = projected
         .iter()
         .filter(|bucket| is_google_display_bucket(bucket))
         .collect::<Vec<_>>();
-    // Hydrogen draws from the same Gemini Models allowance as Flash: one card,
-    // headlined by Hydrogen, carrying both exact model rows.
-    assert_eq!(cards.len(), 2);
-    let gemini = cards
-        .iter()
-        .find(|card| card.label == "gemini-4-hydrogen")
-        .unwrap();
-    let gemini_price = gemini.api_price.as_ref().unwrap();
-    assert_eq!(gemini_price.all_time.request_count, 2);
-    assert_eq!(gemini_price.all_time.equivalent_costs[0].total_cost, 25.0);
-    assert_eq!(
-        gemini_price
-            .models
-            .iter()
-            .map(|row| row.model.as_str())
-            .collect::<Vec<_>>(),
-        vec!["gemini-3.8-flash-high", "gemini-4-hydrogen-high"]
-    );
-    let argon = cards
-        .iter()
-        .find(|card| card.label == "gemini-4-argon")
-        .unwrap();
-    assert_eq!(
-        argon.api_price.as_ref().unwrap().all_time.equivalent_costs[0].total_cost,
-        20.0
-    );
+    assert_eq!(cards.len(), 3);
+    for (card, (name, count, amount)) in cards.iter().zip([
+        ("Gemini Models", 3, 30.0),
+        ("Claude and GPT", 2, 10.0),
+        ("Gemini 4 Argon", 1, 20.0),
+    ]) {
+        assert_eq!(card.label, name);
+        let price = card.api_price.as_ref().unwrap();
+        assert_eq!(price.all_time.request_count, count);
+        assert_eq!(price.all_time.equivalent_costs[0].total_cost, amount);
+        assert!(price.period.is_none()); // Mixed source has no pool-specific cycle.
+    }
 }
 
 #[tokio::test]

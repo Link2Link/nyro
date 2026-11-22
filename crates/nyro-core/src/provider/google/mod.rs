@@ -250,7 +250,9 @@ impl Vendor for GoogleVendor {
         if antigravity::is_google_antigravity(ctx.provider) {
             let project_id = antigravity::code_assist_project_id(ctx.credential)?;
             let model = ctx.actual_model.to_string();
-            *body = antigravity::wrap_request(std::mem::take(body), &model, &project_id);
+            let scope = antigravity::session_scope(ctx.provider, ctx.credential, &project_id);
+            *body =
+                antigravity::wrap_scoped_request(std::mem::take(body), &model, &project_id, &scope);
         } else if gemini_cli::is_google_gemini_cli(ctx.provider) {
             let project_id = antigravity::code_assist_project_id(ctx.credential)?;
             let model = ctx.actual_model.to_string();

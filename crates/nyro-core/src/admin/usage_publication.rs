@@ -9,7 +9,9 @@ use super::{
     AdminService, ProviderScheduling, ProviderSchedulingStatus, ProviderUsage,
     ProviderUsageListItem, ProviderUsageQueryStatus, ProviderUsageTier,
 };
-use crate::quota_buckets::{QuotaBucket, google_display_buckets, opaque_quota_id};
+use crate::quota_buckets::{
+    GoogleQuotaPool, QuotaBucket, google_display_buckets, is_google_display_bucket, opaque_quota_id,
+};
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct PublishedUsageEntry {
@@ -107,10 +109,19 @@ pub(crate) fn google_bucket_query_succeeded(usage: &ProviderUsage, bucket: &Quot
                     !tier.used_percent.is_finite() || !(0.0..=100.0).contains(&tier.used_percent)
                 }))
     });
+    // A measured window may precede discovery of its members. Only a scoped,
+    // recognized upstream pool qualifies; an empty catalog row still does not.
+    let observed = !bucket.models.is_empty()
+        || (is_google_display_bucket(bucket)
+            && usage.quota_buckets.iter().any(|raw| {
+                raw.scope_id == bucket.scope_id
+                    && bucket.constraint_ids.contains(&raw.id)
+                    && GoogleQuotaPool::from_unbound_window(raw).is_some()
+            }));
     !bucket.stale
         && fresh
         && !invalid_source
-        && !bucket.models.is_empty()
+        && observed
         && !google_observation_tiers(&bucket.tiers).is_empty()
         && !bucket_tiers_conflict(&bucket.tiers)
         && bucket
@@ -304,7 +315,7 @@ pub fn published_usage_items(
             }
             if usage.kind == "google_subscription" {
                 // Hide unrelated model/resource diagnostics in the structured
-                // view rather than adding a third ordinary usage supplier.
+                // view rather than publishing them as independent allowances.
                 return published_google_items(&item, usage);
             }
             let primary = usage
@@ -747,6 +758,42 @@ mod tests {
             rows.iter()
                 .all(|row| row.usage_entry.as_ref().unwrap().binding_status == "unresolved")
         );
+    }
+
+    #[test]
+    fn google_antigravity_publishes_pool_names_and_observed_unbound_windows() {
+        use crate::auth::drivers::GoogleSubscriptionChannel::Antigravity;
+        use crate::quota_buckets::google_channel_display_buckets;
+        let mut source = google_item();
+        let usage = source.usage.as_mut().unwrap();
+        usage
+            .quota_buckets
+            .retain(|b| !b.models[0].starts_with("claude-"));
+        let mut third_party_window = usage.quota_buckets[0].clone();
+        third_party_window.id = "third-party-resource".into();
+        third_party_window.models.clear();
+        third_party_window.binding.status = "unresolved".into();
+        third_party_window.binding.source =
+            GoogleQuotaPool::ClaudeAndGpt.unbound_window_source().into();
+        usage.quota_buckets.push(third_party_window);
+        usage.quota_buckets = google_channel_display_buckets(Antigravity, &usage.quota_buckets);
+        let rows = published_usage_items(vec![source]);
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.provider_name.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "Google Pro · Gemini Models",
+                "Google Pro · Claude and GPT",
+                "Google Pro · Gemini 4 Argon"
+            ]
+        );
+        assert_eq!(rows[1].status, ProviderUsageQueryStatus::Ok);
+        assert_eq!(
+            rows[1].usage_entry.as_ref().unwrap().binding_status,
+            "unresolved"
+        );
+        assert!(!rows[1].usage.as_ref().unwrap().tiers.is_empty());
     }
 
     #[test]
