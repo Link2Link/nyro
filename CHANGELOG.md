@@ -4,6 +4,24 @@ All notable changes to Nyro will be documented in this file.
 
 ---
 
+## v2.1.50
+
+> Released on 2026-11-22
+
+#### Features
+
+- **Antigravity three-pool usage**: Usage now shows up to three pool cards per account and project: **Gemini Models** (Gemini 4 Neon, Gemini 4 Hydrogen and Gemini 3.8 Flash), **Claude and GPT**, and **Gemini 4 Argon**. Only observed pools and windows are shown. Existing pool IDs are unchanged, so published usage entries keep their IDs.
+- **Gemini 4 Neon**: Discovered `gemini-4-neon-{low,medium,high,xhigh}` variants are presented as `gemini-4-neon`, and the request's reasoning effort selects the tier.
+
+#### Fixes
+
+- **Antigravity login**: Project discovery and first-time onboarding always use the channel's trusted control-plane endpoint, regardless of a custom inference URL. A completed onboarding operation that carries an error is now reported as a failed login rather than a missing project. Diagnostics name recognized reasons such as `VALIDATION_REQUIRED` without exposing upstream messages or signed links.
+- **Antigravity sessions**: The upstream session ID stays the same across turns and token refreshes. It is scoped to provider, account and project. An explicit native `sessionId` is still preserved.
+- **429 wait times**: A wait time in the structured error body takes priority over `Retry-After`. The wait applies only to the upstream model actually used. A bare `RESOURCE_EXHAUSTED` without quota evidence no longer triggers a model cooldown.
+- **In-stream errors**: A Gemini error frame inside an HTTP 200 stream now ends the request as an error. If output has already started, clients receive a protocol-level error event; no success marker is appended and the request is not replayed.
+
+---
+
 ## v2.1.49
 
 > Released on 2026-11-19
