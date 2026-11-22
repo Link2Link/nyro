@@ -4,6 +4,16 @@ All notable changes to Nyro will be documented in this file.
 
 ---
 
+## v2.1.51
+
+> Released on 2026-11-22
+
+#### Fixes
+
+- **Antigravity empty responses**: When an upstream stream ends cleanly after returning only empty candidate frames, such as an empty text part with a thought signature and usage, Nyro retries the same upstream at most once within the request deadline. This applies to both streaming clients and clients waiting for a single response. If all eligible attempts end this way, clients receive HTTP 502 (`upstream_zero_output`) instead of an empty HTTP 200 stream followed by a generic parse error. Text or tool calls already delivered are never replayed, and usage from the empty attempt is retained in its log.
+
+---
+
 ## v2.1.50
 
 > Released on 2026-11-22
