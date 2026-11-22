@@ -85,7 +85,8 @@ pub(super) fn stream_delta_is_payload(delta: &AiStreamDelta) -> bool {
 
 /// Evidence about one transient zero-payload upstream attempt.
 pub(super) struct TransientStreamFailure {
-    pub stop_reason: String,
+    /// None only for a clean Antigravity EOF proven by its shell-aware decoder.
+    pub stop_reason: Option<String>,
     /// Upstream `finishMessage` extracted from the raw SSE text, when present.
     pub finish_message: Option<String>,
     pub usage: Usage,
@@ -93,6 +94,32 @@ pub(super) struct TransientStreamFailure {
     /// Verbatim upstream bytes (bounded by `MAX_CAPTURE_BYTES`).
     pub raw_text: String,
     pub latency_ms: i64,
+}
+
+impl TransientStreamFailure {
+    pub(super) fn shell_eof(
+        shell: &crate::protocol::codec::google::gemini::stream::AntigravityZeroOutput,
+        chunks_count: i32,
+        raw_text: String,
+        started_at: Instant,
+    ) -> Self {
+        Self {
+            stop_reason: None,
+            finish_message: None,
+            usage: shell.0.clone(),
+            chunks_count,
+            raw_text,
+            latency_ms: started_at.elapsed().as_millis() as i64,
+        }
+    }
+
+    fn kind(&self) -> &'static str {
+        if self.stop_reason.is_none() {
+            "upstream_zero_output"
+        } else {
+            "upstream_error"
+        }
+    }
 }
 
 /// Result of the pre-commit probe over one upstream attempt.
@@ -111,7 +138,7 @@ pub(super) enum ProbeOutcome {
         chunks_count: i32,
         first_chunk_ms: Option<i64>,
     },
-    /// The stream terminated with a whitelisted stop reason and zero payload.
+    /// No output was committed; the decoder proved a retryable zero-output end.
     TransientZeroPayload(Box<TransientStreamFailure>),
     /// No bytes were sent downstream. Do not replay an in-band failure as a
     /// zero-output sampling glitch; upstream execution may already have begun.
@@ -198,6 +225,10 @@ where
         let ai_deltas = match super::streaming::validate_decoded_batch(decoded) {
             Ok(deltas) => deltas,
             Err(error) => {
+                if parser_finished && !saw_payload
+                    && let Some(shell) = error.downcast_ref::<crate::protocol::codec::google::gemini::stream::AntigravityZeroOutput>() {
+                    return ProbeOutcome::TransientZeroPayload(Box::new(TransientStreamFailure::shell_eof(shell, chunks_count, raw_text, started_at)));
+                }
                 if let Some(frame) = super::streaming::upstream_status_frame(&error) {
                     return ProbeOutcome::UpstreamStatus(Box::new(frame.clone()));
                 }
@@ -246,7 +277,7 @@ where
                 drain_capped(byte_stream, &mut raw_text, &mut chunks_count).await;
             }
             return ProbeOutcome::TransientZeroPayload(Box::new(TransientStreamFailure {
-                stop_reason,
+                stop_reason: Some(stop_reason),
                 finish_message: extract_finish_message(&raw_text),
                 usage: usage_accumulator.into_ai_response().usage,
                 chunks_count,
@@ -359,9 +390,12 @@ pub(super) fn extract_finish_message(raw: &str) -> Option<String> {
 
 /// Human-readable failure cause for diagnostics and the client error body.
 pub(super) fn transient_failure_reason(failure: &TransientStreamFailure) -> String {
+    let Some(stop_reason) = &failure.stop_reason else {
+        return "Antigravity upstream closed with zero output and no finishReason".to_string();
+    };
     let mut reason = format!(
         "upstream stream produced no payload and terminated with finish_reason={}",
-        failure.stop_reason.to_ascii_lowercase()
+        stop_reason.to_ascii_lowercase()
     );
     if let Some(message) = &failure.finish_message {
         reason.push_str(": ");
@@ -395,28 +429,15 @@ fn transient_failure_row(
         .stream_metrics(failure.chunks_count, None)
 }
 
-/// Request-log row for the attempt that terminally failed on a transient
-/// zero-payload terminal.
-///
-/// Emitted through the shared `Attempt` (which replaces its pending
-/// pre-handler entry) so the recorded failure diagnostic and the row ride
-/// together: the caller has already `record_failure`d the upstream finish
-/// reason on that attempt, and outcome ranking keeps the row classified
-/// failed / upstream_error` even if the wire observer could not confirm a
-/// terminal (MALFORMED_FUNCTION_CALL is not in its reason whitelist).
-///
-/// When no performance attempt rides the builder (direct handler invocation),
-/// the row is classified explicitly instead: emit() would otherwise inject
-/// its generic preflight "http_error" message ("rejected before upstream
-/// dispatch"), which contradicts the facts — the upstream answered HTTP 200
-/// on a long-dispatched request.
-pub(super) fn emit_transient_failure(
+/// Record the failed attempt (including upstream HTTP 200 and usage) before
+/// returning the private replay marker. Both streaming and aggregation use it.
+pub(super) fn transient_failure_response(
     log: &LogBuilder,
     failure: &TransientStreamFailure,
     upstream_request_headers: Option<String>,
     upstream_request_body: Option<String>,
     upstream_headers: Option<String>,
-) {
+) -> Response {
     let mut row = transient_failure_row(
         log,
         failure,
@@ -424,27 +445,33 @@ pub(super) fn emit_transient_failure(
         upstream_request_body,
         upstream_headers,
     );
-    if row.performance.is_none() {
+    if let Some(attempt) = &row.performance {
+        let error = anyhow::anyhow!(transient_failure_reason(failure));
+        attempt.record_failure(
+            "failed",
+            failure.kind(),
+            "upstream_response",
+            error.as_ref(),
+        );
+    } else {
         row.diagnostic.record_message(
             "failed",
-            "upstream_error",
+            failure.kind(),
             "upstream_response",
             &transient_failure_reason(failure),
         );
     }
     row.emit();
+    transient_terminal_error_response(failure)
 }
 
 /// Local-only proof that the upstream terminated with no usable payload and
 /// nothing was committed to the client. Never inferred from a status or body.
 #[derive(Clone, Copy)]
-struct MalformedZeroPayload;
+struct RetryableZeroOutput;
 
-pub(super) fn is_zero_payload_malformed(response: &Response) -> bool {
-    response
-        .extensions()
-        .get::<MalformedZeroPayload>()
-        .is_some()
+pub(super) fn is_retryable_zero_output(response: &Response) -> bool {
+    response.extensions().get::<RetryableZeroOutput>().is_some()
 }
 
 pub(super) fn should_retry_same_target(
@@ -455,26 +482,38 @@ pub(super) fn should_retry_same_target(
     !already_retried
         && !ctx.cancellation.is_cancelled()
         && !ctx.deadline.remaining().is_zero()
-        && is_zero_payload_malformed(response)
+        && is_retryable_zero_output(response)
 }
 
 /// Synthetic 502 for a target whose stream terminated transiently with zero
 /// payload. The marker permits one same-target replay before normal failover;
 /// LocalHealthNeutral keeps sampling failures out of provider health scoring.
 pub(super) fn transient_terminal_error_response(failure: &TransientStreamFailure) -> Response {
-    let mut message = format!(
-        "upstream stream produced no payload and terminated with finish_reason={}",
-        failure.stop_reason.to_ascii_lowercase()
-    );
-    if let Some(finish_message) = &failure.finish_message {
-        message.push_str("; upstream finish message: ");
-        message.push_str(finish_message);
-    }
-    let body = serde_json::json!({ "error": { "message": message } });
+    let body = match &failure.stop_reason {
+        None => {
+            serde_json::json!({"error":{"type":failure.kind(), "message":transient_failure_reason(failure)}})
+        }
+        Some(reason) => {
+            // Preserve the existing public error shape for explicit finish reasons.
+            let mut message = format!(
+                "upstream stream produced no payload and terminated with finish_reason={}",
+                reason.to_ascii_lowercase()
+            );
+            if let Some(detail) = &failure.finish_message {
+                message.push_str("; upstream finish message: ");
+                message.push_str(detail);
+            }
+            serde_json::json!({"error":{"message":message}})
+        }
+    };
     let mut response = (axum::http::StatusCode::BAD_GATEWAY, axum::Json(body)).into_response();
     response.extensions_mut().insert(super::LocalHealthNeutral);
-    if is_transient_stream_terminal(&failure.stop_reason) {
-        response.extensions_mut().insert(MalformedZeroPayload);
+    if failure
+        .stop_reason
+        .as_deref()
+        .is_none_or(is_transient_stream_terminal)
+    {
+        response.extensions_mut().insert(RetryableZeroOutput);
     }
     response
 }
@@ -500,7 +539,7 @@ mod tests {
             Duration::from_secs(30),
         );
         let mut failure = TransientStreamFailure {
-            stop_reason: "MALFORMED_FUNCTION_CALL".into(),
+            stop_reason: Some("MALFORMED_FUNCTION_CALL".into()),
             finish_message: None,
             usage: Usage::default(),
             chunks_count: 1,
@@ -517,7 +556,7 @@ mod tests {
             .extensions_mut()
             .insert(super::super::LocalHealthNeutral);
         assert!(!should_retry_same_target(&ordinary, false, &ctx));
-        failure.stop_reason = "SAFETY".into();
+        failure.stop_reason = Some("SAFETY".into());
         assert!(!should_retry_same_target(
             &transient_terminal_error_response(&failure),
             false,
@@ -596,7 +635,7 @@ mod tests {
             let ProbeOutcome::TransientZeroPayload(failure) = result else {
                 panic!("EOF {reason} terminal must fail before committing");
             };
-            assert_eq!(failure.stop_reason, reason);
+            assert_eq!(failure.stop_reason.as_deref(), Some(reason));
             assert_eq!(failure.usage.prompt_tokens, 10);
             assert_eq!(failure.usage.completion_tokens, 3);
         }

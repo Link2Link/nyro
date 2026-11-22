@@ -250,6 +250,136 @@ async fn fixture_chat(gateway: &Gateway, stream: bool) -> anyhow::Result<Respons
 }
 
 #[test]
+fn antigravity_shell_eof_recovers_before_commit_or_exhausts_to_502() -> anyhow::Result<()> {
+    // Same shape as the Hydrogen incident, with synthetic usage and signature.
+    // Omit the final SSE separator so usage in the EOF flush is not lost.
+    let shell = format!(
+        "data: {}",
+        json!({"response":{
+            "candidates":[{"content":{"role":"model","parts":[{"text":"", "thoughtSignature":"fixture-shell-signature"}]}}],
+            "usageMetadata":{"promptTokenCount":137,"cachedContentTokenCount":120,"totalTokenCount":137},
+            "modelVersion":"gemini-4-hydrogen"
+        }})
+    );
+    for stream in [true, false] {
+        for recover in [true, false] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+            listener.set_nonblocking(true)?;
+            let base = format!("http://{}", listener.local_addr()?);
+            let mut gw = offline_gateway("antigravity", &base)?;
+            let (tx, mut logs) = tokio::sync::mpsc::channel(8);
+            gw.log_tx = tx;
+            let shell = shell.clone();
+            runtime()?.block_on(async move {
+                let seen = Requests::default();
+                let hits = seen.clone();
+                let app = Router::new().fallback(move |uri: Uri, Json(body): Json<Value>| {
+                    let hits = hits.clone();
+                    let shell = shell.clone();
+                    async move {
+                        if uri.path() != "/v1internal:streamGenerateContent" {
+                            return StatusCode::NOT_FOUND.into_response();
+                        }
+                        let n = {
+                            let mut calls = hits.lock().unwrap();
+                            calls.push(Seen {
+                                uri: uri.clone(),
+                                body: body.clone(),
+                            });
+                            calls.len()
+                        };
+                        if recover && n == 2 {
+                            return upstream(State(Requests::default()), uri, Json(body)).await;
+                        }
+                        ([("content-type", "text/event-stream")], shell).into_response()
+                    }
+                });
+                let listener = tokio::net::TcpListener::from_std(listener)?;
+                let _server = AbortOnDrop(tokio::spawn(async move {
+                    axum::serve(listener, app).await.unwrap()
+                }));
+                bind_fixture_credential(&gw).await?;
+                let response = fixture_chat(&gw, stream).await?;
+                let status = response.status();
+                let bytes = tokio::time::timeout(TIMEOUT, to_bytes(response.into_body(), 1 << 20))
+                    .await??;
+                let wire = std::str::from_utf8(&bytes)?;
+                {
+                    let calls = seen.lock().unwrap();
+                    assert_eq!(calls.len(), 2, "stream={stream} recover={recover}: {wire}");
+                    assert_eq!(
+                        calls[0].body, calls[1].body,
+                        "retry must reuse the prepared request and session"
+                    );
+                }
+                assert!(!wire.contains("fixture-shell-signature"), "{wire}");
+                if recover {
+                    assert_eq!(status, StatusCode::OK);
+                    assert!(
+                        wire.contains("from subscription")
+                            && !wire.contains("conversion_parse_error"),
+                        "{wire}"
+                    );
+                    if stream {
+                        assert_eq!(wire.matches("[DONE]").count(), 1);
+                    }
+                } else {
+                    assert_eq!(
+                        status,
+                        StatusCode::BAD_GATEWAY,
+                        "must not commit an empty HTTP 200: {wire}"
+                    );
+                    assert_eq!(
+                        serde_json::from_slice::<Value>(&bytes)?["error"]["type"],
+                        "upstream_zero_output"
+                    );
+                    assert!(!wire.contains("[DONE]"));
+                }
+                let mut rows = Vec::new();
+                for _ in 0..2 {
+                    rows.push(
+                        tokio::time::timeout(TIMEOUT, logs.recv())
+                            .await?
+                            .expect("attempt row"),
+                    );
+                }
+                rows.sort_by_key(|row| row.diagnostic.attempt_index);
+                assert_eq!(
+                    rows[0].diagnostic.client_request_id,
+                    rows[1].diagnostic.client_request_id
+                );
+                for row in &rows[..if recover { 1 } else { 2 }] {
+                    assert_eq!(row.client_status_code, 502);
+                    assert_eq!(row.upstream_status_code, Some(200));
+                    assert_eq!(
+                        row.diagnostic.failure_kind.as_deref(),
+                        Some("upstream_zero_output")
+                    );
+                    assert_eq!(row.usage.prompt_tokens, 137);
+                    assert_eq!(row.usage.cache_read_tokens, Some(120));
+                    assert_eq!(row.usage.completion_tokens, 0);
+                }
+                assert_eq!(
+                    rows[1]
+                        .diagnostic
+                        .final_result
+                        .as_ref()
+                        .unwrap()
+                        .attempt_count,
+                    2
+                );
+                assert!(
+                    gw.quota_registry
+                        .is_model_schedulable("local-subscription", UPSTREAM_MODEL)
+                );
+                anyhow::Ok(())
+            })?;
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn antigravity_retry_after_reaches_client_and_scheduler_on_both_request_paths() -> anyhow::Result<()>
 {
     for stream in [false, true] {

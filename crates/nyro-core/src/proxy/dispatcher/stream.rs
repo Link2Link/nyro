@@ -433,7 +433,7 @@ pub(super) async fn handle_stream(
     // transient zero-payload terminal — the Gemini MALFORMED_FUNCTION_CALL
     // sampling glitch — fails the attempt before anything reaches the client
     // and the dispatcher can replay once before failing over to the next target.
-    let mut stream_parser = egress.handler().make_stream_response_decoder();
+    let mut stream_parser = super::streaming::upstream_decoder(call_ctx);
     let mut stream_input = StreamInput::default();
     let mut byte_stream = resp.bytes_stream();
     let probe_request_id = log.diagnostic.client_request_id.clone().unwrap_or_default();
@@ -477,26 +477,16 @@ pub(super) async fn handle_stream(
         // extending that whitelist would change classification for every
         // Google upstream — out of scope.
         tracing::warn!(
-            stop_reason = %failure.stop_reason,
+            stop_reason = ?failure.stop_reason,
             "transient zero-payload stream terminal; failing the attempt for dispatcher retry policy"
         );
-        if let Some(attempt) = &log.performance {
-            let error = anyhow::anyhow!(super::stream_probe::transient_failure_reason(&failure));
-            attempt.record_failure(
-                "failed",
-                "upstream_error",
-                "upstream_response",
-                error.as_ref(),
-            );
-        }
-        super::stream_probe::emit_transient_failure(
+        return super::stream_probe::transient_failure_response(
             &log,
             &failure,
             upstream_req_hdrs_str,
             upstream_req_body_str,
             upstream_hdrs_str,
         );
-        return super::stream_probe::transient_terminal_error_response(&failure);
     }
 
     let ProbeOutcome::Commit {
