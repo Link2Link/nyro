@@ -418,3 +418,39 @@ test("Google catalog measurements never hide confirmed quota stops or account au
   const mixed = availability([observedFamily(familyFlash), blocked]);
   match(mixed, /Usage updated · 1\/2 · Paused 1/);
 });
+
+test("quota bucket bars render steady-pace markers for canonical windows and hide them for catalog or unknown windows", () => {
+  const html = render(googleUsage, false, "en-US");
+  // familyFlash: five_hour resets in 1h (80% elapsed), weekly_limit resets in 3d (4/7 ≈ 57% elapsed)
+  // familyArgon: five_hour resets in 2h (60% elapsed), weekly_limit resets in 5d (2/7 ≈ 29% elapsed)
+  equal((html.match(/data-steady-pace-marker="account"/g) ?? []).length, 4);
+  match(html, /title="Steady pace: 80% \(even consumption over the window\)"/);
+  match(html, /title="Steady pace: 57% \(even consumption over the window\)"/);
+  match(html, /title="Steady pace: 60% \(even consumption over the window\)"/);
+  match(html, /title="Steady pace: 29% \(even consumption over the window\)"/);
+
+  const zhHtml = render(googleUsage, false, "zh-CN");
+  equal((zhHtml.match(/data-steady-pace-marker="account"/g) ?? []).length, 4);
+  match(zhHtml, /title="匀速参考线：80%（按整窗匀速使用推进）"/);
+
+  // Catalog observations and unknown/missing-reset tiers must never invent a pace marker.
+  const catalogWithReset: QuotaBucket = {
+    ...observedFamily(familyFlash, 15),
+    tiers: [{ name: "catalog", used_percent: 15, resets_at: new Date(now + 3600_000).toISOString() }],
+  };
+  const rawCatalogBucket: QuotaBucket = {
+    ...argon,
+    source: "catalog",
+    tiers: [{ name: "five_hour", used_percent: 15, resets_at: new Date(now + 3600_000).toISOString() }],
+  };
+  const missingReset: QuotaBucket = {
+    ...familyArgon,
+    tiers: [
+      { name: "weekly_limit", used_percent: 10, resets_at: null },
+      { name: "primary_window", used_percent: 20, resets_at: new Date(now + 3600_000).toISOString() },
+    ],
+  };
+  for (const bucket of [catalogWithReset, rawCatalogBucket, missingReset]) {
+    doesNotMatch(render({ ...googleUsage, quota_buckets: [bucket] }), /data-steady-pace-marker/);
+  }
+});
