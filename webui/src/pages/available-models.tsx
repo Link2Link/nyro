@@ -21,8 +21,9 @@ import {
 import { backend } from "@/lib/backend";
 import { formatDuration, formatLocalDateTime, formatTokenCount, formatTps, readAverageTpsField, tpsLegacyServerTitle, tpsMetricTitle } from "@/lib/format";
 import { useLocale } from "@/lib/i18n";
-import { longestRatingMatch, ratingDisplayState, uniqueModelIdentifiers, type RatingLoadState } from "@/lib/model-ratings";
-import { useModelRatings } from "@/lib/use-model-ratings";
+import { longestRatingMatch, uniqueModelIdentifiers, type RatingDisplayState, type RatingLoadState } from "@/lib/model-ratings";
+import { resolveEffectiveRating, type AaLookupIndex } from "@/lib/aa-rating-match";
+import { useAaRatingSync, useModelRatings } from "@/lib/use-model-ratings";
 import { ModelRatingBadge, ModelRatingClearedNotice, ModelRatingEditor, ModelRatingsFeedback, type ModelRatingEditTarget } from "@/components/model-rating";
 
 /** Probe/mapping rows stay per exact (provider, model) pair. */
@@ -383,6 +384,9 @@ function ModelRow({
   mappings,
   probe,
   entries,
+  aaAliases,
+  aaIndex,
+  aaSyncedAt,
   ratingState,
   onEditRating,
   isZh,
@@ -392,6 +396,9 @@ function ModelRow({
   mappings: string[];
   probe?: ModelProbeResult;
   entries: ModelRatingEntry[];
+  aaAliases: import("@/lib/types").AaModelAlias[];
+  aaIndex: AaLookupIndex;
+  aaSyncedAt: string | null;
   ratingState: RatingLoadState;
   onEditRating: (target: ModelRatingEditTarget) => void;
   isZh: boolean;
@@ -425,7 +432,17 @@ function ModelRow({
           </span>
         </button>
         <div><ProbeBadge result={probe} isZh={isZh} /></div>
-        <div><ModelRatingBadge state={ratingDisplayState(ratingState, model, entries)} /></div>
+        <div>{(() => {
+          if (ratingState !== "ready") return <ModelRatingBadge state={{ status: ratingState }} />;
+          const eff = resolveEffectiveRating(model, entries, aaAliases, aaIndex, aaSyncedAt);
+          const state: RatingDisplayState = eff
+            ? { status: "rated", entry: { model_prefix: eff.model_prefix, score: eff.score, updated_at: eff.updated_at } }
+            : { status: "unrated" };
+          const detailTitle = eff?.aa_entry
+            ? `${eff.aa_entry.aa_name} · ${eff.aa_entry.raw_score.toFixed(1)} (${eff.aa_entry.selected_effort})`
+            : undefined;
+          return <ModelRatingBadge state={state} source={eff?.source} detailTitle={detailTitle} />;
+        })()}</div>
         <div className="flex min-w-0 flex-wrap gap-1.5">
           {mappings.length > 0 ? mappings.map((name) => (
             <Badge key={name} variant="secondary" className="max-w-full truncate" title={name}>
@@ -475,6 +492,9 @@ function ProviderSection({
   probes,
   probeStore,
   entries,
+  aaAliases,
+  aaIndex,
+  aaSyncedAt,
   ratingState,
   onEditRating,
   isZh,
@@ -494,6 +514,9 @@ function ProviderSection({
   probes: Map<string, ModelProbeResult>;
   probeStore: ProviderModelProbeStore;
   entries: ModelRatingEntry[];
+  aaAliases: import("@/lib/types").AaModelAlias[];
+  aaIndex: AaLookupIndex;
+  aaSyncedAt: string | null;
   ratingState: RatingLoadState;
   onEditRating: (target: ModelRatingEditTarget) => void;
   isZh: boolean;
@@ -644,6 +667,9 @@ function ProviderSection({
                   mappings={mappings.get(modelKey(provider.id, model)) ?? []}
                   probe={probes.get(modelKey(provider.id, model))}
                   entries={entries}
+                  aaAliases={aaAliases}
+                  aaIndex={aaIndex}
+                  aaSyncedAt={aaSyncedAt}
                   ratingState={ratingState}
                   onEditRating={onEditRating}
                   isZh={isZh}
@@ -684,6 +710,7 @@ export default function AvailableModelsPage() {
   const [editingRating, setEditingRating] = useState<ModelRatingEditTarget | null>(null);
   const [clearedRating, setClearedRating] = useState<ModelRatingEditTarget | null>(null);
   const ratingsQuery = useModelRatings();
+  const aaSyncQuery = useAaRatingSync();
 
   const providersQuery = useQuery<Provider[]>({
     queryKey: ["providers"],
@@ -899,6 +926,9 @@ export default function AvailableModelsPage() {
                   probes={probes}
                   probeStore={probeStore}
                   entries={ratingsQuery.data ?? []}
+                  aaAliases={aaSyncQuery.data?.aliases ?? []}
+                  aaIndex={aaSyncQuery.index}
+                  aaSyncedAt={aaSyncQuery.data?.synced_at ?? null}
                   ratingState={ratingsQuery.loadState}
                   onEditRating={setEditingRating}
                   isZh={isZh}

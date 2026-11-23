@@ -1,12 +1,25 @@
+import { useMemo } from "react";
 import { useMutation, useQuery, useQueryClient, type QueryClient } from "@tanstack/react-query";
 import { backend } from "./backend";
+import { buildAaLookupIndex } from "./aa-rating-match";
 import { canonicalModelPrefix, isModelRatingEntry, readModelRatings, type RatingLoadState } from "./model-ratings";
-import type { ModelRatingEntry } from "./types";
+import type { AaSyncConfigView, AaSyncOverview, ModelRatingEntry, UpdateAaSyncConfig } from "./types";
 
 export const MODEL_RATINGS_QUERY_KEY = ["model-ratings"] as const;
+export const AA_RATING_SYNC_QUERY_KEY = ["aa-rating-sync"] as const;
 
 export function invalidateModelRatings(client: QueryClient) {
-  return client.invalidateQueries({ queryKey: MODEL_RATINGS_QUERY_KEY });
+  return Promise.all([
+    client.invalidateQueries({ queryKey: MODEL_RATINGS_QUERY_KEY }),
+    client.invalidateQueries({ queryKey: ["model-performance"] }),
+  ]);
+}
+
+export function invalidateAaRatingSync(client: QueryClient) {
+  return Promise.all([
+    client.invalidateQueries({ queryKey: AA_RATING_SYNC_QUERY_KEY }),
+    client.invalidateQueries({ queryKey: ["model-performance"] }),
+  ]);
 }
 
 /** The same unfiltered list cache is shared by every rating surface; no per-row requests. */
@@ -22,6 +35,48 @@ export function useModelRatings() {
   });
   const loadState: RatingLoadState = query.isError ? "error" : query.isSuccess ? "ready" : "loading";
   return { ...query, loadState };
+}
+
+export function useAaRatingSync() {
+  const query = useQuery<AaSyncOverview>({
+    queryKey: AA_RATING_SYNC_QUERY_KEY,
+    queryFn: () => backend<AaSyncOverview>("get_aa_rating_sync"),
+    retry: false,
+    staleTime: 30_000,
+    refetchOnWindowFocus: false,
+  });
+  const index = useMemo(
+    () => buildAaLookupIndex(query.data?.models ?? []),
+    [query.data?.models],
+  );
+  return { ...query, index };
+}
+
+export function useAaRatingSyncMutations() {
+  const client = useQueryClient();
+  const updateConfig = useMutation({
+    mutationFn: (input: UpdateAaSyncConfig) =>
+      backend<AaSyncConfigView>("update_aa_rating_sync_config", { input }),
+    onSuccess: () => invalidateAaRatingSync(client),
+  });
+  const triggerSync = useMutation({
+    mutationFn: () => backend<AaSyncOverview>("trigger_aa_rating_sync"),
+    onSuccess: (overview) => {
+      client.setQueryData(AA_RATING_SYNC_QUERY_KEY, overview);
+      return invalidateAaRatingSync(client);
+    },
+  });
+  const setAlias = useMutation({
+    mutationFn: ({ modelPrefix, aaCanonicalKey }: { modelPrefix: string; aaCanonicalKey: string }) =>
+      backend("set_aa_model_alias", { modelPrefix, input: { aa_canonical_key: aaCanonicalKey } }),
+    onSuccess: () => invalidateAaRatingSync(client),
+  });
+  const deleteAlias = useMutation({
+    mutationFn: ({ modelPrefix }: { modelPrefix: string }) =>
+      backend("delete_aa_model_alias", { modelPrefix }),
+    onSuccess: () => invalidateAaRatingSync(client),
+  });
+  return { updateConfig, triggerSync, setAlias, deleteAlias };
 }
 
 interface RatingIdentity {

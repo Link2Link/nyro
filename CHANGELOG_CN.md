@@ -4,6 +4,17 @@ Nyro 的所有重要变更均记录在此文件中。
 
 ---
 
+## v2.1.53
+
+> 发布于 2026-11-23
+
+#### 新功能
+
+- **Artificial Analysis Intelligence Index 每日自动同步**：Nyro 现支持每日自动从 Artificial Analysis v2 接口（`/api/v2/language/models/free`）同步语言模型智力分数，并严格按每个基础模型的最高推理档位（`max > xhigh > high > reasoning > medium > low > minimal > none > default`）确定该模型的固定分数。可在**模型评分**页配置 API Key（或使用 `NYRO_AA_API_KEY` 环境变量）、同步周期与立即同步，内置 CAS 租约防重复拉取、失败退避保留旧缓存及 Index 版本变更提示。
+- **多形态模型名称匹配与 AA 别名绑定**：有效评分按**手工前缀覆盖 → 用户 AA 别名绑定 → AA 自动匹配**三层优先级解析，并同步打通模型评分页、可用模型页与性能图。名称匹配统一处理大小写、连字符/点号/空格/下划线分隔（如 `claude-opus-5-5`、`claude-opus-5.5`、`Claude Opus 5.5`）、命名空间前缀、Claude 历史词序倒置、品牌版本粘连及推理/日期/渠道后缀，同时对 `mini`、`lite`、`flash`、`pro` 等独立产品档位严格隔离，避免跨型号误匹配。
+
+---
+
 ## v2.1.52
 
 > 发布于 2026-11-23

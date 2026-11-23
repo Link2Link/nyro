@@ -1,10 +1,12 @@
 use nyro_core::Gateway;
 use nyro_core::admin::{
-    AccountPoolView, CopyProviderOptions, DevinPoolConfig, ModelPerformanceResponse,
-    OAuthAccountUpdate, ProviderAccountView, ProviderOAuthStatusData, SetModelRating, SystemStatus,
-    TokenPriceConfig, TokenPriceInput,
+    AaSyncConfigView, AaSyncOverview, AccountPoolView, CopyProviderOptions, DevinPoolConfig,
+    ModelPerformanceResponse, OAuthAccountUpdate, ProviderAccountView, ProviderOAuthStatusData,
+    SetAaModelAlias, SetModelRating, SystemStatus, TokenPriceConfig, TokenPriceInput,
+    UpdateAaSyncConfig,
 };
 use nyro_core::auth::{AuthExchangeInput, AuthSessionInitData, AuthSessionStatusData};
+use nyro_core::db::AaModelAlias;
 use nyro_core::db::models::*;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -42,6 +44,57 @@ pub async fn delete_model_rating(
 ) -> Result<serde_json::Value, String> {
     gw.admin()
         .delete_model_rating(&model_prefix)
+        .await
+        .map(|()| serde_json::json!({ "ok": true }))
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn get_aa_rating_sync(gw: State<'_, Gateway>) -> Result<AaSyncOverview, String> {
+    gw.admin()
+        .get_aa_rating_sync()
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn update_aa_rating_sync_config(
+    gw: State<'_, Gateway>,
+    input: UpdateAaSyncConfig,
+) -> Result<AaSyncConfigView, String> {
+    gw.admin()
+        .update_aa_rating_sync_config(input)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn trigger_aa_rating_sync(gw: State<'_, Gateway>) -> Result<AaSyncOverview, String> {
+    gw.admin()
+        .trigger_aa_rating_sync()
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn set_aa_model_alias(
+    gw: State<'_, Gateway>,
+    model_prefix: String,
+    input: SetAaModelAlias,
+) -> Result<AaModelAlias, String> {
+    gw.admin()
+        .set_aa_alias(&model_prefix, input)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn delete_aa_model_alias(
+    gw: State<'_, Gateway>,
+    model_prefix: String,
+) -> Result<serde_json::Value, String> {
+    gw.admin()
+        .delete_aa_alias(&model_prefix)
         .await
         .map(|()| serde_json::json!({ "ok": true }))
         .map_err(|e| e.to_string())

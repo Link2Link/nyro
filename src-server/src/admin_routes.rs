@@ -8,8 +8,8 @@ use axum::{Extension, Json, Router};
 use nyro_core::Gateway;
 use nyro_core::admin::StatsRange;
 use nyro_core::admin::{
-    CopyProviderOptions, DevinPoolConfig, ModelRatingError, OAuthAccountUpdate, SetModelRating,
-    TokenPriceError, TokenPriceInput,
+    CopyProviderOptions, DevinPoolConfig, ModelRatingError, OAuthAccountUpdate, SetAaModelAlias,
+    SetModelRating, TokenPriceError, TokenPriceInput, UpdateAaSyncConfig,
 };
 use nyro_core::auth::AuthExchangeInput;
 use nyro_core::db::models::*;
@@ -115,6 +115,18 @@ pub fn create_router_with_updater(
             get(list_model_ratings_handler)
                 .put(set_model_rating_handler)
                 .delete(delete_model_rating_handler),
+        )
+        .route(
+            "/model-ratings/aa-sync",
+            get(get_aa_rating_sync_handler).put(update_aa_rating_sync_config_handler),
+        )
+        .route(
+            "/model-ratings/aa-sync/trigger",
+            post(trigger_aa_rating_sync_handler),
+        )
+        .route(
+            "/model-ratings/aa-aliases",
+            put(set_aa_model_alias_handler).delete(delete_aa_model_alias_handler),
         )
         .route("/model-performance", get(model_performance_handler))
         .route(
@@ -652,6 +664,76 @@ async fn delete_model_rating_handler(
         Err(error) => return rating_bad_request(error.body_text()),
     };
     match gw.admin().delete_model_rating(&query.prefix).await {
+        Ok(()) => Json(serde_json::json!({ "ok": true })).into_response(),
+        Err(error) => rating_error(error),
+    }
+}
+
+async fn get_aa_rating_sync_handler(State(gw): State<Gateway>) -> axum::response::Response {
+    match gw.admin().get_aa_rating_sync().await {
+        Ok(overview) => Json(serde_json::json!({ "data": overview })).into_response(),
+        Err(error) => rating_error(error),
+    }
+}
+
+async fn update_aa_rating_sync_config_handler(
+    State(gw): State<Gateway>,
+    input: Result<Json<UpdateAaSyncConfig>, axum::extract::rejection::JsonRejection>,
+) -> axum::response::Response {
+    let Json(input) = match input {
+        Ok(input) => input,
+        Err(error) => return rating_bad_request(error.body_text()),
+    };
+    match gw.admin().update_aa_rating_sync_config(input).await {
+        Ok(view) => Json(serde_json::json!({ "data": view })).into_response(),
+        Err(error) => rating_error(error),
+    }
+}
+
+async fn trigger_aa_rating_sync_handler(State(gw): State<Gateway>) -> axum::response::Response {
+    match gw.admin().trigger_aa_rating_sync().await {
+        Ok(overview) => Json(serde_json::json!({ "data": overview })).into_response(),
+        Err(error) => {
+            if error.downcast_ref::<ModelRatingError>().is_some() {
+                return rating_error(error);
+            }
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({ "error": error.to_string() })),
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn set_aa_model_alias_handler(
+    State(gw): State<Gateway>,
+    query: Result<Query<ModelRatingQuery>, axum::extract::rejection::QueryRejection>,
+    input: Result<Json<SetAaModelAlias>, axum::extract::rejection::JsonRejection>,
+) -> axum::response::Response {
+    let Query(query) = match query {
+        Ok(query) => query,
+        Err(error) => return rating_bad_request(error.body_text()),
+    };
+    let Json(input) = match input {
+        Ok(input) => input,
+        Err(error) => return rating_bad_request(error.body_text()),
+    };
+    match gw.admin().set_aa_alias(&query.prefix, input).await {
+        Ok(alias) => Json(serde_json::json!({ "data": alias })).into_response(),
+        Err(error) => rating_error(error),
+    }
+}
+
+async fn delete_aa_model_alias_handler(
+    State(gw): State<Gateway>,
+    query: Result<Query<ModelRatingQuery>, axum::extract::rejection::QueryRejection>,
+) -> axum::response::Response {
+    let Query(query) = match query {
+        Ok(query) => query,
+        Err(error) => return rating_bad_request(error.body_text()),
+    };
+    match gw.admin().delete_aa_alias(&query.prefix).await {
         Ok(()) => Json(serde_json::json!({ "ok": true })).into_response(),
         Err(error) => rating_error(error),
     }

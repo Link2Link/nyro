@@ -312,6 +312,13 @@ impl Gateway {
         }
 
         {
+            let gw_aa = gw.clone();
+            tokio::spawn(async move {
+                admin::run_aa_rating_sync_worker(gw_aa).await;
+            });
+        }
+
+        {
             let gw_refresh = gw.clone();
             tokio::spawn(async move {
                 let mut interval = tokio::time::interval(Duration::from_secs(120));
