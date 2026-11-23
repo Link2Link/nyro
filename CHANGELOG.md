@@ -4,6 +4,17 @@ All notable changes to Nyro will be documented in this file.
 
 ---
 
+## v2.1.53
+
+> Released on 2026-11-23
+
+#### Features
+
+- **Artificial Analysis Intelligence Index auto-sync**: Nyro can now sync language model intelligence scores daily from the Artificial Analysis v2 API (`/api/v2/language/models/free`), consolidating each base model to the fixed score of its highest reasoning effort tier (`max > xhigh > high > reasoning > medium > low > minimal > none > default`). Sync settings (API key or `NYRO_AA_API_KEY`, schedule interval, custom URL) and manual triggers are available from **Model Ratings**, with CAS lease protection, failure backoff, last-good snapshot retention, and index-version upgrade notices.
+- **Multi-format model name matching & AA aliases**: Effective model ratings now resolve in strict order — **manual prefix overrides → explicit AA alias bindings → automatic AA matching** — across Model Ratings, Available Models, and the Performance chart. Normalization aligns hyphen/dot/space/underscore separators, channel namespaces (`anthropic/`), routing tags (`:free`), Claude historical tier/version ordering (`claude-4-5-sonnet` ↔ `claude-sonnet-4-5`), glued brand versions (`qwen3-5` ↔ `qwen-3-5`), and effort/date/channel suffixes while protecting distinct product tiers (`mini`, `lite`, `flash`, `pro`, etc.) against false matches.
+
+---
+
 ## v2.1.52
 
 > Released on 2026-11-23
