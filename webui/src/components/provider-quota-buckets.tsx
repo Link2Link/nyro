@@ -5,7 +5,7 @@ import { hasStructuredQuotaBuckets, isForwardedRouteBucket, isGoogleFamilyDispla
 import { tierLabel, providerUsagePause } from "@/lib/provider-usage";
 import { formatTokenCount } from "@/lib/format";
 import { retainedUsagePriceDisplay } from "@/lib/token-usage";
-import { countdownStr, utilizationColor } from "@/lib/usage-pace";
+import { countdownStr, steadyPacePercent, utilizationColor } from "@/lib/usage-pace";
 import type { ProviderUsage, QuotaBucket, QuotaBucketFilter } from "@/lib/types";
 import { UsageProgress } from "@/components/usage-progress";
 import { ProviderApiPriceSummary } from "@/components/provider-api-price-summary";
@@ -181,7 +181,9 @@ function BucketCard({ usage, bucket, now, stale, loading, locale, onDetails }: {
           ? Math.min(100, Math.max(0, tier.used_percent)) : null;
         const reset = tier.resets_at ? Date.parse(tier.resets_at) : NaN;
         const countdown = countdownStr(tier.resets_at, now);
-        // Do not infer fixed-duration semantics from a reset timestamp. The backend owns the cycle.
+        // Only canonical fixed-duration tier names reported by the backend get a steady-pace marker;
+        // catalog and unknown windows stay null instead of guessing duration from resets_at.
+        const pace = bucket.source === "catalog" ? null : steadyPacePercent(tier, now);
         return <div key={JSON.stringify([bucket.scope_id, bucket.id, tier.name])} data-bucket-window={JSON.stringify([bucket.scope_id, bucket.id, tier.name])} className="space-y-1">
           <div className="flex justify-between gap-2 text-[11px]">
             <span className="font-medium text-slate-500">{bucketTierLabel(tier.name, zh)}</span>
@@ -189,7 +191,7 @@ function BucketCard({ usage, bucket, now, stale, loading, locale, onDetails }: {
               {used == null ? (zh ? "未知" : "Unknown") : `${Math.round(used)}% ${zh ? "已用" : "used"}`}
             </span>
           </div>
-          {used != null ? <UsageProgress usedPercent={used} isZh={zh} label={`${bucket.label} ${bucketTierLabel(tier.name, zh)} ${zh ? "已用额度" : "used quota"}`} />
+          {used != null ? <UsageProgress usedPercent={used} pacePercent={pace} isZh={zh} label={`${bucket.label} ${bucketTierLabel(tier.name, zh)} ${zh ? "已用额度" : "used quota"}`} />
             : <div className="h-2 rounded-full bg-slate-100" aria-label={zh ? "用量未知" : "Usage unknown"} />}
           <p className="flex items-center gap-1 text-[10px] text-slate-400">
             <Clock className="h-3 w-3" />{zh ? "重置" : "Reset"}: {Number.isFinite(reset)

@@ -4,6 +4,16 @@ All notable changes to Nyro will be documented in this file.
 
 ---
 
+## v2.1.52
+
+> Released on 2026-11-23
+
+#### Improvements
+
+- **Quota bucket steady-pace markers**: Quota bucket progress bars (such as Antigravity's three-pool cards) now display the steady-pace reference marker for canonical fixed-duration windows (`five_hour`, `daily`, `weekly_limit`, `monthly`) when a reset time is present, matching other subscription usage bars. Catalog observations and windows with unknown duration or missing reset times keep the marker hidden.
+
+---
+
 ## v2.1.51
 
 > Released on 2026-11-22
