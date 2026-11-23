@@ -15,6 +15,7 @@ pub(super) fn internal_setting_key(key: &str) -> bool {
         "provider_account_fence:",
         "quota_bucket_owner.",
         "quota_bucket_fence.",
+        "aa_rating_sync.",
     ]
     .iter()
     .any(|prefix| {

@@ -623,6 +623,60 @@ export interface SetModelRating {
   score: number;
 }
 
+export interface AaModelRatingEntry {
+  canonical_key: string;
+  aa_slug: string;
+  aa_name: string;
+  aa_creator: string;
+  selected_effort: string;
+  raw_score: number;
+  score: number;
+  release_date?: string | null;
+}
+
+export interface AaModelAlias {
+  model_prefix: string;
+  aa_canonical_key: string;
+  updated_at: string;
+}
+
+export interface AaSyncConfigView {
+  enabled: boolean;
+  has_api_key: boolean;
+  api_key_preview: string | null;
+  env_api_key_set: boolean;
+  sync_interval_hours: number;
+  api_base_url?: string | null;
+}
+
+export interface UpdateAaSyncConfig {
+  enabled?: boolean;
+  api_key?: string;
+  sync_interval_hours?: number;
+  api_base_url?: string;
+}
+
+export interface AaSyncStatus {
+  last_attempt_at: string | null;
+  last_success_at: string | null;
+  last_error: string | null;
+  index_version: string | null;
+  previous_index_version: string | null;
+  model_count: number;
+  raw_model_count: number;
+  consecutive_failures: number;
+}
+
+export interface AaSyncOverview {
+  config: AaSyncConfigView;
+  status: AaSyncStatus;
+  synced_at: string | null;
+  models: AaModelRatingEntry[];
+  aliases: AaModelAlias[];
+}
+
+export type EffectiveRatingSource = "manual" | "aa_alias" | "aa_auto";
+
 export interface ModelCapabilities {
   provider: string;
   model_id: string;

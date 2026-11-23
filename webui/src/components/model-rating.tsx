@@ -29,20 +29,35 @@ export interface ModelRatingEditTarget {
   entry: ModelRatingEntry | null;
 }
 
-export function ModelRatingBadge({ state }: { state: RatingDisplayState }) {
+export function ModelRatingBadge({
+  state,
+  source,
+  detailTitle,
+}: {
+  state: RatingDisplayState;
+  source?: "manual" | "aa_auto" | "aa_alias";
+  detailTitle?: string;
+}) {
   const { locale } = useLocale();
   const isZh = locale === "zh-CN";
   if (state.status === "rated") {
+    const isAa = source === "aa_auto" || source === "aa_alias";
+    const defaultTitle = isZh
+      ? `前缀 ${state.entry.model_prefix} · ${formatLocalDateTime(state.entry.updated_at)}`
+      : `Prefix ${state.entry.model_prefix} · ${formatLocalDateTime(state.entry.updated_at)}`;
     return (
       <Badge
-        variant="secondary"
-        className="gap-1 tabular-nums"
-        title={isZh
-          ? `前缀 ${state.entry.model_prefix} · ${formatLocalDateTime(state.entry.updated_at)}`
-          : `Prefix ${state.entry.model_prefix} · ${formatLocalDateTime(state.entry.updated_at)}`}
+        variant={isAa ? "outline" : "secondary"}
+        className={isAa ? "gap-1 border-sky-200 bg-sky-50/80 text-sky-800 tabular-nums" : "gap-1 tabular-nums"}
+        title={detailTitle ?? defaultTitle}
       >
         <span className="text-xs font-semibold">{state.entry.score}</span>
-        <span className="text-slate-400">/ 100</span>
+        <span className={isAa ? "text-sky-500/80" : "text-slate-400"}>/ 100</span>
+        {isAa && (
+          <span className="ml-0.5 rounded bg-sky-100 px-1 text-[10px] font-medium text-sky-700">
+            {source === "aa_alias" ? "AA*" : "AA"}
+          </span>
+        )}
       </Badge>
     );
   }

@@ -1,8 +1,13 @@
 pub mod model_performance;
+pub mod model_rating_match;
 pub mod model_rating_prefixes;
 pub mod models;
 pub mod tps;
 pub use model_performance::{ModelPerformanceStats, PairPerformanceStats};
+pub use model_rating_match::{
+    AaModelAlias, AaModelRatingEntry, AaRatingIndex, AaRawModel, EffectiveModelRating,
+    EffectiveRatingSource, consolidate_aa_models, normalize_model_key, resolve_effective_rating,
+};
 pub use model_rating_prefixes::ModelRatingEntry;
 
 use std::path::Path;

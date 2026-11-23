@@ -36,6 +36,7 @@ pub use account_pool::{
 };
 use claude_accounts::*;
 use kiro_accounts::*;
+mod aa_rating_sync;
 mod aliyun_sign;
 mod api_keys;
 mod auth_data;
@@ -73,6 +74,12 @@ mod volcengine_sign;
 
 pub use crate::db::models::OAuthAccountUpdate;
 pub use crate::router::quota::{ProviderScheduling, ProviderSchedulingStatus};
+pub(crate) use aa_rating_sync::run_aa_rating_sync_worker;
+pub use aa_rating_sync::{
+    AA_DEFAULT_BASE_URL, AA_DEFAULT_SYNC_INTERVAL_HOURS, AA_MAX_SYNC_INTERVAL_HOURS,
+    AA_MIN_SYNC_INTERVAL_HOURS, AaSnapshot, AaSyncConfigView, AaSyncOverview, AaSyncStatus,
+    SetAaModelAlias, UpdateAaSyncConfig,
+};
 use auth_data::*;
 use model_catalog::*;
 pub use model_catalog::{

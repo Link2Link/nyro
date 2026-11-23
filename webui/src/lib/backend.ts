@@ -208,6 +208,23 @@ function resolveHTTP(cmd: string, args?: Record<string, unknown>): HTTPMapping {
         url: `${base}/model-ratings?prefix=${encodeURIComponent(String(args?.modelPrefix ?? ""))}`,
         ...(cmd === "set_model_rating" ? { body: args?.input as Record<string, unknown> } : {}),
       };
+    case "get_aa_rating_sync":
+      return { method: "GET", url: `${base}/model-ratings/aa-sync` };
+    case "update_aa_rating_sync_config":
+      return {
+        method: "PUT",
+        url: `${base}/model-ratings/aa-sync`,
+        body: args?.input as Record<string, unknown>,
+      };
+    case "trigger_aa_rating_sync":
+      return { method: "POST", url: `${base}/model-ratings/aa-sync/trigger` };
+    case "set_aa_model_alias":
+    case "delete_aa_model_alias":
+      return {
+        method: cmd === "set_aa_model_alias" ? "PUT" : "DELETE",
+        url: `${base}/model-ratings/aa-aliases?prefix=${encodeURIComponent(String(args?.modelPrefix ?? ""))}`,
+        ...(cmd === "set_aa_model_alias" ? { body: args?.input as Record<string, unknown> } : {}),
+      };
     case "get_model_capabilities":
       return {
         method: "GET",

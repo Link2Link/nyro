@@ -2,7 +2,9 @@
 
 use super::*;
 use crate::db::model_performance::ModelPerformanceStats;
-use crate::db::model_rating_prefixes::longest_matching_entry;
+use crate::db::model_rating_match::{
+    EffectiveModelRating, EffectiveRatingSource, resolve_effective_rating,
+};
 
 /// One concrete upstream model variant inside a prefix×provider group.
 #[derive(Debug, Clone, Serialize)]
@@ -19,6 +21,14 @@ pub struct ModelPerformanceItem {
     pub provider_id: String,
     pub score: i32,
     pub score_updated_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub score_source: Option<EffectiveRatingSource>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_score: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aa_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_effort: Option<String>,
     /// Sample-weighted aggregate across this provider's matching variants.
     pub mixed: ModelPerformanceStats,
     pub variants: Vec<ModelPerformanceVariant>,
@@ -69,15 +79,18 @@ impl AdminService {
         &self,
         provider_id: Option<&str>,
     ) -> anyhow::Result<ModelPerformanceResponse> {
-        // Only prefix-matched logged pairs need statistics. Reuse the model-usage
-        // sampling and TPS rules; as_of is response time, not a time filter.
-        let entries = self.list_model_ratings().await?;
+        // Only rated logged pairs need statistics (manual > AA alias > AA auto).
+        // Reuse the model-usage sampling and TPS rules; as_of is response time.
+        let manual_entries = self.list_model_ratings().await?;
+        let aa_aliases = self.list_aa_aliases().await?;
+        let (aa_index, aa_synced_at) = self.load_aa_rating_index().await?;
         let as_of = Utc::now().timestamp_millis();
         let window_start = as_of.saturating_sub(PERFORMANCE_WINDOW_MS);
         let mut models = Vec::new();
-        if !entries.is_empty() {
-            // Group logged pairs by (matched prefix, provider); one point each.
-            let mut grouped: HashMap<(String, String), Vec<(String, String)>> = HashMap::new();
+        if !manual_entries.is_empty() || !aa_index.entries().is_empty() {
+            type PerformanceGroup = (EffectiveModelRating, Vec<(String, String)>);
+            // Group logged pairs by (effective rating key, provider); one point each.
+            let mut grouped: HashMap<(String, String), PerformanceGroup> = HashMap::new();
             for (logged_provider, logged_model) in
                 self.gw.storage.logs().distinct_logged_pairs().await?
             {
@@ -86,17 +99,24 @@ impl AdminService {
                 {
                     continue;
                 }
-                let Some(entry) = longest_matching_entry(&logged_model, &entries) else {
+                let Some(effective) = resolve_effective_rating(
+                    &logged_model,
+                    &manual_entries,
+                    &aa_aliases,
+                    &aa_index,
+                    aa_synced_at.as_deref(),
+                ) else {
                     continue;
                 };
                 grouped
-                    .entry((entry.model_prefix.clone(), logged_provider.clone()))
-                    .or_default()
+                    .entry((effective.model_prefix.clone(), logged_provider.clone()))
+                    .or_insert_with(|| (effective, Vec::new()))
+                    .1
                     .push((logged_provider, logged_model));
             }
             let pairs = grouped
                 .values()
-                .flatten()
+                .flat_map(|(_, group_pairs)| group_pairs.iter())
                 .map(|(provider, model)| (provider.clone(), model.clone()))
                 .collect::<Vec<_>>();
             let mut by_pair = HashMap::new();
@@ -114,11 +134,7 @@ impl AdminService {
                     );
                 }
             }
-            for ((model_prefix, provider), group_pairs) in grouped {
-                let entry = entries
-                    .iter()
-                    .find(|entry| entry.model_prefix == model_prefix)
-                    .expect("group key comes from an entry");
+            for ((model_prefix, provider), (effective, group_pairs)) in grouped {
                 let mut variants = Vec::with_capacity(group_pairs.len());
                 for (provider, model) in &group_pairs {
                     // Variants without any call inside the window are not plotted.
@@ -141,8 +157,12 @@ impl AdminService {
                 models.push(ModelPerformanceItem {
                     model_prefix,
                     provider_id: provider,
-                    score: entry.score,
-                    score_updated_at: entry.updated_at.clone(),
+                    score: effective.score,
+                    score_updated_at: effective.updated_at,
+                    score_source: Some(effective.source),
+                    raw_score: effective.raw_score,
+                    aa_name: effective.aa_name,
+                    selected_effort: effective.selected_effort,
                     mixed,
                     unclassified_count,
                     untrusted_count,
