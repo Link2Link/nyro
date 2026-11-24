@@ -1260,13 +1260,11 @@ mod tests {
         let channel = Some("antigravity");
         let (rows, states) =
             project_forwarded_entry(entry.clone(), &usage, &routes, false, channel);
-        assert_eq!(rows.len(), 3);
+        assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].name, "Google AI Pro · Gemini Models");
-        assert_eq!(rows[0].routes, ["flash", "neon"]);
+        assert_eq!(rows[0].routes, ["argon", "argon-blocked", "flash", "neon"]);
         assert_eq!(rows[1].name, "Google AI Pro · Claude and GPT");
         assert_eq!(rows[1].routes, ["third-party"]);
-        assert_eq!(rows[2].name, "Google AI Pro · Gemini 4 Argon");
-        assert_eq!(rows[2].routes, ["argon", "argon-blocked"]);
         assert_eq!(
             alternative_scheduling(&states["flash"]).status,
             ProviderSchedulingStatus::Eligible

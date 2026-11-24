@@ -1,6 +1,9 @@
 //! Read-only Google usage projection, never routing bindings or historical identity.
 //! Call only on a response clone, after raw-bucket pricing. Retained resource IDs
 //! are the only valid log/detail selectors; synthetic family IDs are not selectors.
+//!
+//! Antigravity currently reports Gemini 4 Argon inside the shared Gemini Models
+//! allowance. The legacy Gemini CLI projection keeps its historical Argon family.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -45,7 +48,8 @@ pub fn google_display_family(model: &str) -> Option<&'static str> {
     .find(|family| matches_tier_family(model, family))
 }
 
-/// Declaration order is the order of the Antigravity usage cards.
+/// Declaration order is the order of the Antigravity usage cards. Argon is
+/// retained only for the legacy Gemini CLI family projection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum GoogleQuotaPool {
     GeminiModels,
@@ -82,7 +86,12 @@ impl GoogleQuotaPool {
         {
             return None;
         }
-        [Self::GeminiModels, Self::ClaudeAndGpt, Self::Argon]
+        if bucket.binding.source == Self::Argon.unbound_window_source() {
+            // Older Antigravity snapshots carried a dedicated Argon window.
+            // Treat that retained observation as part of the current shared pool.
+            return Some(Self::GeminiModels);
+        }
+        [Self::GeminiModels, Self::ClaudeAndGpt]
             .into_iter()
             .find(|pool| pool.unbound_window_source() == bucket.binding.source)
     }
@@ -108,6 +117,7 @@ impl GoogleQuotaPool {
     pub(crate) fn for_model(channel: GoogleSubscriptionChannel, id: &str) -> Option<Self> {
         if channel == GoogleSubscriptionChannel::Antigravity {
             if matches_tier_family(id, "gemini-4-neon")
+                || matches_tier_family(id, "gemini-4-argon")
                 || matches!(
                     id,
                     "gemini-4-hydrogen-sonar"

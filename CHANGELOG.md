@@ -4,6 +4,17 @@ All notable changes to Nyro will be documented in this file.
 
 ---
 
+## v2.1.54
+
+> Released on 2026-11-25
+
+#### Fixes
+
+- **Antigravity shared Gemini quota**: Gemini 4 Argon usage now joins the shared Gemini Models pool, matching current Google Antigravity quota reporting and preventing duplicate Argon quota cards.
+- **Legacy quota compatibility**: Older dedicated Argon observations are folded into the shared pool when current shared windows are present, while the Gemini CLI legacy mapping remains supported.
+
+---
+
 ## v2.1.53
 
 > Released on 2026-11-23

@@ -782,11 +782,7 @@ mod tests {
             rows.iter()
                 .map(|row| row.provider_name.as_str())
                 .collect::<Vec<_>>(),
-            [
-                "Google Pro · Gemini Models",
-                "Google Pro · Claude and GPT",
-                "Google Pro · Gemini 4 Argon"
-            ]
+            ["Google Pro · Gemini Models", "Google Pro · Claude and GPT"]
         );
         assert_eq!(rows[1].status, ProviderUsageQueryStatus::Ok);
         assert_eq!(

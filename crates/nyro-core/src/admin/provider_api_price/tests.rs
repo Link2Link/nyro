@@ -489,12 +489,11 @@ fn google_antigravity_prices_count_each_exact_model_in_one_pool() {
         .iter()
         .filter(|bucket| is_google_display_bucket(bucket))
         .collect::<Vec<_>>();
-    assert_eq!(cards.len(), 3);
-    for (card, (name, count, amount)) in cards.iter().zip([
-        ("Gemini Models", 3, 30.0),
-        ("Claude and GPT", 2, 10.0),
-        ("Gemini 4 Argon", 1, 20.0),
-    ]) {
+    assert_eq!(cards.len(), 2);
+    for (card, (name, count, amount)) in cards
+        .iter()
+        .zip([("Gemini Models", 4, 50.0), ("Claude and GPT", 2, 10.0)])
+    {
         assert_eq!(card.label, name);
         let price = card.api_price.as_ref().unwrap();
         assert_eq!(price.all_time.request_count, count);

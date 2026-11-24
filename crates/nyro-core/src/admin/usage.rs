@@ -1041,7 +1041,14 @@ fn google_subscription_family(
     {
         let legacy = [
             ("Gemini 3.8 Flash", GoogleQuotaPool::GeminiModels),
-            ("Gemini 4 Argon", GoogleQuotaPool::Argon),
+            (
+                "Gemini 4 Argon",
+                if antigravity {
+                    GoogleQuotaPool::GeminiModels
+                } else {
+                    GoogleQuotaPool::Argon
+                },
+            ),
         ];
         let pools = [
             ("Gemini Models", GoogleQuotaPool::GeminiModels),
@@ -1083,6 +1090,31 @@ fn google_subscription_family(
         .or_else(|| named_family.map(|family| (family, "google_named_family_v1"))))
 }
 
+fn is_shared_antigravity_gemini_observation(
+    observation: &crate::provider::google::antigravity::QuotaSummaryBucket,
+) -> bool {
+    matches!(
+        observation.bucket_id.as_deref(),
+        Some("gemini-5h" | "gemini-weekly")
+    )
+}
+
+fn is_legacy_antigravity_argon_observation(
+    observation: &crate::provider::google::antigravity::QuotaSummaryBucket,
+) -> bool {
+    [
+        observation.group.as_deref(),
+        observation.display_name.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .any(|label| {
+        label == "Gemini 4 Argon"
+            || label.starts_with("Gemini 4 Argon Weekly Limit")
+            || label.starts_with("Gemini 4 Argon Five Hour Limit")
+    })
+}
+
 /// Preserve actual Google model/resource identity before aggregation. Equal
 /// percentages, reset times and generic labels are never binding evidence.
 fn google_quota_buckets(
@@ -1096,7 +1128,17 @@ fn google_quota_buckets(
     let mut result = Vec::new();
     let mut groups = BTreeMap::<String, Vec<usize>>::new();
     let mut global_ids = Vec::new();
+    let has_shared_antigravity_gemini_pool = channel == GoogleSubscriptionChannel::Antigravity
+        && summary.iter().any(is_shared_antigravity_gemini_observation);
     for observation in summary {
+        // Older Antigravity responses exposed a separate Argon window. Once the
+        // shared Gemini Models resource is present, that legacy observation is
+        // stale duplicate information and must not create a second primary.
+        if has_shared_antigravity_gemini_pool
+            && is_legacy_antigravity_argon_observation(observation)
+        {
+            continue;
+        }
         let mut members = observation.model_ids.clone();
         let mut binding_source = "official";
         let mut membership_conflict = observation.membership_conflict;
@@ -6659,7 +6701,7 @@ mod tests {
                 .iter()
                 .filter(|bucket| bucket.is_resolved() && bucket.source == "enforced_summary")
                 .collect();
-            assert_eq!(enforced.len(), if channel == "antigravity" { 3 } else { 2 });
+            assert_eq!(enforced.len(), 2);
             let flash = enforced
                 .iter()
                 .find(|bucket| {
@@ -6670,7 +6712,10 @@ mod tests {
                 })
                 .unwrap();
             assert_eq!(flash.binding.source, "google_subscription_resources_v1");
-            assert_eq!(flash.models.len(), 4);
+            assert_eq!(
+                flash.models.len(),
+                if channel == "antigravity" { 7 } else { 4 }
+            );
             assert_eq!(
                 flash
                     .tiers
@@ -6679,33 +6724,43 @@ mod tests {
                     .collect::<Vec<_>>(),
                 vec!["five_hour", "weekly_limit"]
             );
-            let argon = enforced
-                .iter()
-                .find(|bucket| {
-                    bucket
-                        .models
-                        .iter()
-                        .any(|model| model == "gemini-4-argon-low")
-                })
-                .unwrap();
-            assert_eq!(argon.binding.source, "google_named_family_v1");
-            assert_eq!(argon.models.len(), 3);
-            assert_eq!(argon.tiers.len(), 1);
-            assert_eq!(argon.tiers[0].name, "weekly_limit");
-            assert_eq!(argon.tiers[0].used_percent, 10.0);
-            assert!(
-                argon
-                    .constraint_ids
+            let argon = enforced.iter().find(|bucket| {
+                bucket
+                    .models
                     .iter()
-                    .all(|id| !flash.constraint_ids.contains(id))
-            );
+                    .any(|model| model == "gemini-4-argon-low")
+            });
+            if channel == "antigravity" {
+                let argon = argon.unwrap();
+                assert_eq!(argon.id, flash.id);
+                assert_eq!(argon.binding.source, "google_subscription_resources_v1");
+                assert_eq!(argon.models.len(), 7);
+                assert_eq!(argon.tiers.len(), 2);
+            } else if let Some(argon) = argon {
+                assert_eq!(argon.binding.source, "google_named_family_v1");
+                assert_eq!(argon.models.len(), 3);
+                assert_eq!(argon.tiers.len(), 1);
+                assert_eq!(argon.tiers[0].name, "weekly_limit");
+                assert_eq!(argon.tiers[0].used_percent, 10.0);
+                assert!(
+                    argon
+                        .constraint_ids
+                        .iter()
+                        .all(|id| !flash.constraint_ids.contains(id))
+                );
+            }
             let registry = crate::router::quota::ProviderQuotaRegistry::new();
             registry.observe_buckets(channel, &raw, Some(true));
             for model in &flash.models {
                 assert!(!registry.is_model_schedulable(channel, model));
             }
-            for model in &argon.models {
-                assert!(registry.is_model_schedulable(channel, model));
+            if let Some(argon) = argon {
+                for model in &argon.models {
+                    assert_eq!(
+                        registry.is_model_schedulable(channel, model),
+                        channel != "antigravity"
+                    );
+                }
             }
             assert!(registry.is_model_schedulable(channel, "gemini-3.8-flash"));
             assert!(
@@ -6731,7 +6786,7 @@ mod tests {
                         .constraint_ids
                         .iter()
                         .all(|id| !flash.constraint_ids.contains(id)
-                            && !argon.constraint_ids.contains(id))
+                            && argon.is_none_or(|argon| !argon.constraint_ids.contains(id)))
                 );
             } else {
                 assert_eq!(third_party.source, "catalog");
@@ -6755,11 +6810,11 @@ mod tests {
             Some(true),
         );
         assert!(registry.is_model_schedulable("p", "gemini-3.8-flash-high"));
-        assert!(!registry.is_model_schedulable("p", "gemini-4-argon-high"));
+        assert!(registry.is_model_schedulable("p", "gemini-4-argon-high"));
     }
 
     #[test]
-    fn google_antigravity_displays_three_scoped_pools_with_their_own_windows() {
+    fn google_antigravity_displays_shared_gemini_pool_with_argon() {
         use crate::provider::google::antigravity::{
             parse_available_models_detailed, parse_quota_summary_buckets,
         };
@@ -6814,14 +6869,13 @@ mod tests {
             })
             .unwrap();
         assert_eq!(pool.binding.source, "google_subscription_resources_v1");
-        assert_eq!(pool.models.len(), 13);
-        assert!(
-            pool.models
-                .iter()
-                .all(|model| model.starts_with("gemini-3.8-flash")
-                    || model.starts_with("gemini-4-hydrogen")
-                    || model.starts_with("gemini-4-neon"))
-        );
+        assert_eq!(pool.models.len(), 16);
+        assert!(pool.models.iter().all(|model| {
+            model.starts_with("gemini-3.8-flash")
+                || model.starts_with("gemini-4-hydrogen")
+                || model.starts_with("gemini-4-neon")
+                || model.starts_with("gemini-4-argon")
+        }));
         let registry = crate::router::quota::ProviderQuotaRegistry::new();
         registry.observe_buckets("p", &raw, Some(true));
         for model in [
@@ -6834,7 +6888,7 @@ mod tests {
             assert!(!registry.is_model_schedulable("p", model), "{model}");
             assert_eq!(registry.model_snapshot("p", model).unwrap().id, pool.id);
         }
-        assert!(registry.is_model_schedulable("p", "gemini-4-argon-medium"));
+        assert!(!registry.is_model_schedulable("p", "gemini-4-argon-medium"));
         let cards = |buckets: &[QuotaBucket]| {
             google_channel_display_buckets(Antigravity, buckets)
                 .into_iter()
@@ -6844,7 +6898,7 @@ mod tests {
         let pools = cards(&raw);
         assert_eq!(
             pools.iter().map(|b| b.label.as_str()).collect::<Vec<_>>(),
-            ["Gemini Models", "Claude and GPT", "Gemini 4 Argon"]
+            ["Gemini Models", "Claude and GPT"]
         );
         let readings = |b: &QuotaBucket| {
             b.tiers
@@ -6860,7 +6914,6 @@ mod tests {
             readings(&pools[1]),
             [("five_hour".into(), 0.0), ("weekly_limit".into(), 0.0)]
         );
-        assert_eq!(readings(&pools[2]), [("weekly_limit".into(), 1.06)]);
         assert_eq!(
             pools[1].models,
             ["claude-opus-5-5-high", "gpt-oss-120b-medium"]

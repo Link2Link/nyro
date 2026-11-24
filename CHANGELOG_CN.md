@@ -4,6 +4,17 @@ Nyro 的所有重要变更均记录在此文件中。
 
 ---
 
+## v2.1.54
+
+> 发布于 2026-11-25
+
+#### 修复
+
+- **Antigravity 共享 Gemini 配额**：Gemini 4 Argon 用量现并入共享的 Gemini Models 池，与当前 Google Antigravity 配额返回结构一致，避免重复显示 Argon 独立用量卡片。
+- **旧配额兼容**：检测到当前共享窗口时，旧版本返回的独立 Argon 观察值会并入共享池，同时保留 Gemini CLI 的旧 Argon 映射。
+
+---
+
 ## v2.1.53
 
 > 发布于 2026-11-23
