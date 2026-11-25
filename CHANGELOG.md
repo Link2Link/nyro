@@ -4,6 +4,16 @@ All notable changes to Nyro will be documented in this file.
 
 ---
 
+## v2.1.55
+
+> Released on 2026-11-25
+
+#### Fixes
+
+- **Antigravity stale Gemini pool cleanup**: Remove legacy standalone Argon quota resources before merging fresh shared Gemini Models observations, so upgraded instances no longer keep the Gemini Models card marked as old data.
+
+---
+
 ## v2.1.54
 
 > Released on 2026-11-25

@@ -138,6 +138,23 @@ impl ProviderQuotaRegistry {
         self.observe_buckets_inner(provider_id, buckets, is_available, None, false)
     }
 
+    /// Remove the pre-v2.1.54 Antigravity Argon resource before merging the
+    /// current shared Gemini Models observation. The old resource is no longer
+    /// authoritative and would otherwise keep the aggregate display bucket stale.
+    pub fn remove_legacy_antigravity_argon(&self, provider_id: &str) {
+        let mut scoped = self.scoped.write().unwrap();
+        let Some(state) = scoped.get_mut(provider_id) else {
+            return;
+        };
+        state.buckets.retain(|bucket| {
+            !(bucket.binding.source == "google_named_family_v1"
+                && bucket
+                    .models
+                    .iter()
+                    .any(|model| model.starts_with("gemini-4-argon")))
+        });
+    }
+
     fn observe_buckets_inner(
         &self,
         provider_id: &str,
@@ -1450,6 +1467,21 @@ mod tests {
         assert_eq!(snapshot.tiers.len(), 2);
         assert_eq!(snapshot.tiers[0].used_percent, 20.0);
         assert!(snapshot.tiers.iter().all(|tier| tier.name != "5h"));
+    }
+
+    #[test]
+    fn legacy_antigravity_argon_is_removed_before_shared_gemini_refresh() {
+        let registry = ProviderQuotaRegistry::new();
+        let mut legacy = bucket("argon-legacy", "gemini-4-argon-high", 10.0, 20.0);
+        legacy.binding.source = "google_named_family_v1".to_owned();
+        let shared = bucket("gemini-shared", "gemini-3.8-flash-high", 20.0, 30.0);
+        registry.observe_buckets("p", &[legacy, shared.clone()], None);
+
+        registry.remove_legacy_antigravity_argon("p");
+        let remaining = registry.bucket_snapshot("p");
+
+        assert!(!remaining.iter().any(|bucket| bucket.id == "argon-legacy"));
+        assert!(remaining.iter().any(|bucket| bucket.id == shared.id));
     }
 
     #[test]

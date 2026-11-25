@@ -2921,6 +2921,13 @@ impl AdminService {
                     || (usage.kind == UsageBackend::NyroGateway.kind()
                         && !usage.quota_buckets.is_empty()) =>
             {
+                if provider
+                    .channel
+                    .as_deref()
+                    .is_some_and(|channel| channel.eq_ignore_ascii_case("antigravity"))
+                {
+                    self.gw.quota_registry.remove_legacy_antigravity_argon(id);
+                }
                 let (buckets, scheduling) = self.gw.quota_registry.observe_buckets_fenced(
                     id,
                     &usage.quota_buckets,
