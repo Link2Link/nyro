@@ -4206,7 +4206,7 @@ mod probe_reply_tests {
                     assert_eq!(headers[AUTHORIZATION], "Bearer fixture-token");
                     if channel == "antigravity" {
                         assert_eq!(headers["user-agent"],
-                            "antigravity/hub/2.29.0 (aidev_client; os_type=darwin; arch=arm64; cl=1013060670)");
+                            "antigravity/hub/2.35.2 (aidev_client; os_type=darwin; arch=arm64; cl=1029311855)");
                         assert_eq!(body["userAgent"], "antigravity");
                     } else {
                         assert_eq!(headers["user-agent"], "GeminiCLI/0.1.5 (Windows; AMD64)");

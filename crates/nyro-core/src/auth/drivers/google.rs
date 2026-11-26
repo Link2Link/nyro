@@ -1522,7 +1522,7 @@ mod tests {
         // the old IDE-style `antigravity/<version> windows/amd64` is not Hub.
         assert_eq!(
             binding.extra_headers.get("user-agent").unwrap(),
-            "antigravity/hub/2.29.0 (aidev_client; os_type=darwin; arch=arm64; cl=1013060670)"
+            "antigravity/hub/2.35.2 (aidev_client; os_type=darwin; arch=arm64; cl=1029311855)"
         );
         assert_eq!(
             binding.extra_headers.get("x-goog-api-client").unwrap(),

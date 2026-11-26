@@ -95,10 +95,29 @@ pub(crate) const ANTIGRAVITY_OAUTH_SCOPES: &str = concat!(
 );
 
 /// Antigravity Hub release used before the manifest is fetched, after cache
-/// expiry, or when the updater is unreachable. Keep this release and its known
-/// changelist in `hub_user_agent_for_version` in sync. Reference: CLIProxyAPI
-/// f72f8bfd6a1c7d69ca371dd4a7bdf490db50c154 (2026-11-04).
-pub(crate) const ANTIGRAVITY_FALLBACK_VERSION: &str = "2.29.0";
+/// expiry, or when the updater is unreachable. Update it together with its
+/// entry in `ANTIGRAVITY_HUB_CHANGELISTS`. Reference: CLIProxyAPI
+/// 54fc8c426 (2026-11-26).
+pub(crate) const ANTIGRAVITY_FALLBACK_VERSION: &str = "2.35.2";
+
+/// Changelists belong to specific Hub releases, not to the latest manifest in
+/// general (verified upstream from official `language_server --stamp` build
+/// metadata). An unmapped release is pinned to the highest mapped
+/// (version, changelist) pair, so the User-Agent never omits `cl=` and never
+/// pairs a newer version with an older build's changelist (CLIProxyAPI
+/// f2b003035, issue #7659).
+const ANTIGRAVITY_HUB_CHANGELISTS: &[(&str, &str)] = &[
+    ("2.23.0", "998057262"),
+    ("2.24.0", "1000335682"),
+    ("2.29.0", "1013060670"),
+    ("2.32.1", "1021296516"),
+    ("2.32.2", "1022991777"),
+    ("2.33.0", "1023160026"),
+    ("2.34.0", "1026637980"),
+    ("2.35.0", "1028447422"),
+    ("2.35.1", "1029194470"),
+    ("2.35.2", "1029311855"),
+];
 /// Match the darwin-arm64 Hub manifest, not the legacy IDE/Windows identity.
 const ANTIGRAVITY_HUB_PLATFORM: &str = "aidev_client; os_type=darwin; arch=arm64";
 
@@ -277,12 +296,16 @@ pub(crate) fn parse_hub_manifest_version(body: &str) -> Option<String> {
     })
 }
 
-/// Current Antigravity client version: the live manifest value while fresh,
-/// else the fallback constant. Synchronous fast path — never blocks, never
-/// dials the network; freshness is advanced by [`refresh_antigravity_version`]
-/// from the periodic catalog/quota flows.
+/// Current Antigravity client version as reported on the wire: the live
+/// manifest value while fresh (else the fallback constant), pinned to a
+/// release with a known changelist so it always matches the User-Agent.
+/// Synchronous fast path — never blocks, never dials the network; freshness
+/// is advanced by [`refresh_antigravity_version`] from the periodic
+/// catalog/quota flows.
 pub(crate) fn antigravity_version() -> String {
-    ANTIGRAVITY_VERSION_CACHE.version()
+    resolve_hub_release(&ANTIGRAVITY_VERSION_CACHE.version())
+        .0
+        .to_string()
 }
 
 pub(crate) fn antigravity_version_needs_refresh() -> bool {
@@ -302,20 +325,29 @@ pub(crate) async fn refresh_antigravity_version(client: &reqwest::Client) {
 /// control-plane calls.
 pub(crate) const X_GOOG_API_CLIENT: &str = "gl-node/22.21.1";
 
+/// Resolve a manifest version to the (version, changelist) pair to report:
+/// the exact release when its changelist is known, otherwise the highest
+/// mapped release.
+fn resolve_hub_release(version: &str) -> (&str, &'static str) {
+    if let Some((_, changelist)) = ANTIGRAVITY_HUB_CHANGELISTS
+        .iter()
+        .find(|(mapped, _)| *mapped == version)
+    {
+        return (version, changelist);
+    }
+    ANTIGRAVITY_HUB_CHANGELISTS
+        .iter()
+        .filter_map(|&(mapped, changelist)| {
+            Some((parse_semver_triple(mapped)?, mapped, changelist))
+        })
+        .max_by_key(|(semver, _, _)| *semver)
+        .map(|(_, mapped, changelist)| (mapped, changelist))
+        .expect("antigravity Hub changelist table carries valid semver entries")
+}
+
 fn hub_user_agent_for_version(version: &str) -> String {
-    // A changelist identifies one specific Hub build. A newer manifest only
-    // supplies the version, so never attach a different release's changelist.
-    let changelist = match version {
-        "2.23.0" => Some("998057262"),
-        "2.24.0" => Some("1000335682"),
-        "2.29.0" => Some("1013060670"),
-        _ => None,
-    };
-    let metadata = match changelist {
-        Some(cl) => format!("{ANTIGRAVITY_HUB_PLATFORM}; cl={cl}"),
-        None => ANTIGRAVITY_HUB_PLATFORM.to_string(),
-    };
-    format!("antigravity/hub/{version} ({metadata})")
+    let (version, changelist) = resolve_hub_release(version);
+    format!("antigravity/hub/{version} ({ANTIGRAVITY_HUB_PLATFORM}; cl={changelist})")
 }
 
 pub(crate) fn antigravity_user_agent() -> String {
@@ -1701,14 +1733,40 @@ mod tests {
     fn antigravity_user_agent_carries_current_version_shape() {
         assert_eq!(
             antigravity_user_agent(),
-            "antigravity/hub/2.29.0 (aidev_client; os_type=darwin; arch=arm64; cl=1013060670)"
+            "antigravity/hub/2.35.2 (aidev_client; os_type=darwin; arch=arm64; cl=1029311855)"
         );
-        assert!(parse_semver_triple(&antigravity_version()).is_some());
+        assert_eq!(antigravity_version(), ANTIGRAVITY_FALLBACK_VERSION);
+        // A mapped older release keeps its own build identity.
         assert_eq!(
-            hub_user_agent_for_version("2.30.0"),
-            "antigravity/hub/2.30.0 (aidev_client; os_type=darwin; arch=arm64)"
+            hub_user_agent_for_version("2.33.0"),
+            "antigravity/hub/2.33.0 (aidev_client; os_type=darwin; arch=arm64; cl=1023160026)"
         );
-        assert!(!hub_user_agent_for_version("2.30.0").contains("cl="));
+        // Unmapped releases (gaps and newer manifests) pin to the highest
+        // mapped pair instead of dropping `cl=` or borrowing another build's.
+        for unmapped in ["2.30.0", "2.35.3", "2.36.0", "10.0.0"] {
+            assert_eq!(
+                hub_user_agent_for_version(unmapped),
+                "antigravity/hub/2.35.2 (aidev_client; os_type=darwin; arch=arm64; cl=1029311855)",
+                "{unmapped}"
+            );
+            assert_eq!(resolve_hub_release(unmapped).0, "2.35.2", "{unmapped}");
+        }
+    }
+
+    #[test]
+    fn hub_changelist_table_is_valid_and_covers_fallback() {
+        let mut seen = std::collections::HashSet::new();
+        for (version, changelist) in ANTIGRAVITY_HUB_CHANGELISTS {
+            assert!(parse_semver_triple(version).is_some(), "{version}");
+            assert!(!changelist.is_empty() && changelist.bytes().all(|b| b.is_ascii_digit()));
+            assert!(seen.insert(*version), "duplicate {version}");
+        }
+        // The fallback must be the newest mapped release, or unmapped
+        // manifests would pin to a pair newer than the fallback itself.
+        assert_eq!(
+            resolve_hub_release("0.0.0"),
+            (ANTIGRAVITY_FALLBACK_VERSION, "1029311855")
+        );
     }
 
     #[test]
@@ -1717,9 +1775,9 @@ mod tests {
         let mut state = AntigravityVersionState::new();
         assert_eq!(state.cached_or_fallback(now), ANTIGRAVITY_FALLBACK_VERSION);
         assert!(state.should_refresh(now));
-        state.version = "2.30.0".to_string();
+        state.version = "2.36.0".to_string();
         state.refreshed_at = Some(now);
-        assert_eq!(state.cached_or_fallback(now), "2.30.0");
+        assert_eq!(state.cached_or_fallback(now), "2.36.0");
         assert!(!state.should_refresh(now));
         let expired = now + ANTIGRAVITY_VERSION_TTL;
         assert_eq!(
@@ -1778,7 +1836,7 @@ mod tests {
     #[tokio::test]
     async fn hub_version_refresh_single_flight_uses_new_identity_on_first_request() {
         use std::sync::atomic::Ordering;
-        let server = hub_manifest_server("version: 2.30.0\n", axum::http::StatusCode::OK).await;
+        let server = hub_manifest_server("version: 2.36.0\n", axum::http::StatusCode::OK).await;
         let client = reqwest::Client::builder().no_proxy().build().unwrap();
         let cache = AntigravityVersionCache::new();
         let resolve = || async {
@@ -1787,14 +1845,15 @@ mod tests {
         };
         let (first, second, third) = tokio::join!(resolve(), resolve(), resolve());
         assert_eq!(server.hits.load(Ordering::SeqCst), 1);
-        assert_eq!([first, second, third], ["2.30.0", "2.30.0", "2.30.0"]);
-        assert_eq!(cache.version(), "2.30.0");
+        assert_eq!([first, second, third], ["2.36.0", "2.36.0", "2.36.0"]);
+        assert_eq!(cache.version(), "2.36.0");
         assert!(!cache.needs_refresh());
         // This is the ordering required of token/runtime binding: refresh
         // finishes before any header is constructed, not after catalog send.
+        // The unmapped live release pins to the newest known build identity.
         assert_eq!(
             hub_user_agent_for_version(&cache.version()),
-            "antigravity/hub/2.30.0 (aidev_client; os_type=darwin; arch=arm64)"
+            "antigravity/hub/2.35.2 (aidev_client; os_type=darwin; arch=arm64; cl=1029311855)"
         );
     }
 
@@ -1836,13 +1895,13 @@ mod tests {
         assert!(task.await.unwrap_err().is_cancelled());
         assert!(!cache.needs_refresh());
         assert!(cache.fetch_gate.try_lock().is_ok());
-        let retry = hub_manifest_server("version: 2.30.0\n", axum::http::StatusCode::OK).await;
+        let retry = hub_manifest_server("version: 2.36.0\n", axum::http::StatusCode::OK).await;
         cache.refresh(&client, &retry.url).await;
         assert_eq!(retry.hits.load(std::sync::atomic::Ordering::SeqCst), 0);
         cache.state.write().unwrap().last_attempt =
             Some(Instant::now() - ANTIGRAVITY_VERSION_RETRY_AFTER);
         cache.refresh(&client, &retry.url).await;
-        assert_eq!(cache.version(), "2.30.0");
+        assert_eq!(cache.version(), "2.36.0");
         assert_eq!(retry.hits.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
@@ -1850,6 +1909,7 @@ mod tests {
     async fn hub_version_refresh_failure_and_old_manifest_use_fallback_and_cooldown() {
         use std::sync::atomic::Ordering;
         for (body, status) in [
+            ("version: 2.35.1\n", axum::http::StatusCode::OK),
             ("version: 2.28.9\n", axum::http::StatusCode::OK),
             ("version: 2.9.99\n", axum::http::StatusCode::OK),
             ("version: nope\n", axum::http::StatusCode::OK),
@@ -1861,7 +1921,7 @@ mod tests {
             // Simulate an expired successful fetch, then a failed refresh.
             {
                 let mut state = cache.state.write().unwrap();
-                state.version = "2.30.0".to_string();
+                state.version = "2.36.0".to_string();
                 state.refreshed_at = Some(Instant::now() - ANTIGRAVITY_VERSION_TTL);
             }
             cache.refresh(&client, &server.url).await;
@@ -1869,7 +1929,7 @@ mod tests {
             assert_eq!(cache.version(), ANTIGRAVITY_FALLBACK_VERSION, "{body}");
             assert_eq!(server.hits.load(Ordering::SeqCst), 1);
             assert!(!cache.needs_refresh());
-            assert!(hub_user_agent_for_version(&cache.version()).contains("cl=1013060670"));
+            assert!(hub_user_agent_for_version(&cache.version()).contains("cl=1029311855"));
         }
     }
 
