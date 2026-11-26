@@ -4,6 +4,18 @@ All notable changes to Nyro will be documented in this file.
 
 ---
 
+## v2.1.56
+
+> Released on 2026-11-26
+
+#### Fixes
+
+- **Antigravity Hub client identity**: The Antigravity fallback client version moves from 2.29.0 to 2.35.2, and the verified version-to-changelist table now covers 2.32.1 through 2.35.2. A Hub manifest version without a known changelist is pinned to the newest known build instead of being sent without `cl=`, so the User-Agent and the onboarding `ide_version` always describe one real build.
+- **Suspended Google subscription accounts**: When Google answers an Antigravity or Gemini CLI request with `403` and an `ErrorInfo` reason of `TOS_VIOLATION`, the credential that was actually sent is marked as a terminal error. The current request still fails over to the next route target, later requests skip the suspended account instead of hitting it first, and reauthorizing the account restores routing. The stored error keeps only the reason and the sanitized https appeal link, never the upstream free-text message. Other 403 responses still fail over only for the current request.
+- **Claude Code background sessions**: Requests with `x-app: cli-bg` are now recognized as native Claude Code, so background sessions keep their own identity and headers instead of receiving the generated CLI profile.
+
+---
+
 ## v2.1.55
 
 > Released on 2026-11-25
